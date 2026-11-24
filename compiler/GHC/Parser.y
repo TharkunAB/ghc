@@ -5009,12 +5009,17 @@ fromTrailingN :: SrcSpanAnnN -> SrcSpanAnnA
 fromTrailingN (EpAnn anc ann cs)
     = EpAnn anc (nann_trailing ann) cs
 
+-- | Validate specificity annotations on a parsed @foreach@ binder list.
+-- Reject @InferredSpec@ braces on visible @foreach ->@ telescopes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 checkForEachBndrs :: Either TokRarrow (EpToken ".")
                   -> [LHsTyVarBndr Specificity GhcPs]
                   -> P [LHsTyVarBndr () GhcPs]
 checkForEachBndrs (Left _)  bndrs = fromSpecTyVarBndrs bndrs
 checkForEachBndrs (Right _) bndrs = pure [ L loc (b { tvb_flag = () }) | L loc b <- bndrs ]
 
+-- | Fold a non-empty @exists@ binder list right-associatively into nested 'HsTypeExists' nodes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 mkHsExistsTelescope :: Located Token
                     -> [LHsTyVarBndr Specificity GhcPs]
                     -> Either (EpToken "|") (EpToken ".")
@@ -5033,6 +5038,8 @@ mkHsExistsTelescope kw bndrs sep body = case bndrs of
       amsA' (L (comb2 b body) (XHsType (HsTypeExists (noEpTok, sep) b inner)))
     go [] = panic "mkHsExistsTelescope.go: empty"
 
+-- | Fold a non-empty @some@ binder list right-associatively into nested 'HsTypeSome' nodes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 mkHsSomeTelescope :: Located Token
                   -> [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")]
                   -> EpToken "|"

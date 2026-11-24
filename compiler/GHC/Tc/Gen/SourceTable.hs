@@ -55,7 +55,7 @@ import GHC.Data.Bag (emptyBag, isEmptyBag)
 import GHC.Data.OrdList (fromOL)
 import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config (initSimpleOpts)
-import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_IgnoreInterfacePragmas, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
+import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
 import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hsc_plugins, hugRuleInterfacesBelow, hugRulesBelow, visibleUnloadedSourceRuleHeads)
 import GHC.Driver.Plugins (pluginsWithArgs)
 import GHC.Hs
@@ -409,13 +409,12 @@ visibleSourceMethodRules env = do
     pure emptyRuleEnv { re_home_rules = home_rules, re_eps_rules = eps_rule_base eps
                       , re_visible_orphs = visible }
 
--- | Collect active non-auto rule heads that were stripped from interfaces
--- (or omitted from 'RuleEnv' by @-fignore-interface-pragmas@).
+-- | Collect active non-auto rule heads that @-fno-code@ or
+-- @-fomit-interface-pragmas@ stripped from @mi_rules@.
 unloadedSourceRuleHeads :: TcGblEnv -> TcM NameSet
 unloadedSourceRuleHeads env = do
     hsc <- getTopEnv
-    ignore_prags <- goptM Opt_IgnoreInterfacePragmas
-    liftIO $ visibleUnloadedSourceRuleHeads hsc ignore_prags
+    liftIO $ visibleUnloadedSourceRuleHeads hsc False
                (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
 
 -- | Test for a visible user rewrite on the exact Id. Every class selector

@@ -2799,6 +2799,8 @@ xFlagsDeps = concatMap makeExtensionFlags [minBound .. maxBound]
              , (NotDeprecated, FlagSpec "ExtendedLet" LangExt.ExperimentalDependentTypes nop AllModes)
              ]
 
+-- | Enable the core dependent-types extension bundle and disable list and tuple puns.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes].
 setDependentTypesBundle :: TurnOnFlag -> DynP ()
 setDependentTypesBundle False = return ()
 setDependentTypesBundle True  = do
@@ -2818,6 +2820,28 @@ setDependentTypesBundle True  = do
     , LangExt.ExplicitNamespaces
     ]
   unSetExtensionFlag LangExt.ListTuplePuns
+
+{- Note [Proposal #378 DependentTypes bundle and telescopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC Proposal #378 (Section 4.12) and GHC Proposal #102 specify one umbrella
+extension, -XDependentTypes. Enabling -XDependentTypes activates
+ExperimentalDependentTypes and the standard dependent-types extension bundle
+in setDependentTypesBundle. It also disables ListTuplePuns so that list and
+tuple syntax in types follows GHC Proposal #475. Users can re-enable
+ListTuplePuns with a later pragma or flag.
+
+MakeDynFlagsConsistent also enables Opt_WriteSourceEquations by default when
+ExperimentalDependentTypes is active. An explicit -fno-write-source-equations
+flag sets Opt_SuppressSourceEquations and overrides that default. An explicit
+-fwrite-source-equations flag sets Opt_ExplicitWriteSourceEquations.
+
+In GHC.Parser, shared-type binder groups such as (m n :: Nat) expand in source
+order across forall, foreach, exists, and some telescopes. CheckForEachBndrs
+rejects inferred brace specificity on visible foreach -> telescopes and strips
+specificity annotations on invisible foreach . telescopes. MkHsExistsTelescope
+and mkHsSomeTelescope desugar multi-binder telescopes right-associatively into
+nested HsTypeExists and HsTypeSome nodes.
+-}
 
 makeExtensionFlag :: String -> ExtensionDeprecation -> LangExt.Extension -> (Deprecation, FlagSpec LangExt.Extension)
 makeExtensionFlag name depr ext = (deprecation depr, spec)

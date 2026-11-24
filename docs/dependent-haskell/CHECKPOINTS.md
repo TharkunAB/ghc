@@ -6,6 +6,31 @@ compiler and the current queue, use the [program roadmap](ROADMAP.md#where-this-
 The [implementation log](PLAN.md) gives the specifications for the numbered
 increments.
 
+## Wave 2, Wave 3, and Proposal #378 Track A consolidation
+
+The consolidated Wave 2 + Wave 3 + Wave 4A branch extends `186670b0b9` with
+Showcase observations 628–635 and five new registered test suites
+(`NativeProposal378SyntaxAndFlags`, `NativeTypeLambdaCaptureU`,
+`NativeSameModuleClosurePlug`, `NativeRetainedPolyAndInlineGadt`, and
+`NativeLargeElimType`, plus Wave 2's `NativeIndexedForEachCtor`,
+`NativeComposedLetWhere`, and `NativeRevExplicitListO2`):
+
+- **Proposal `#378` `-XDependentTypes` bundle and telescopes**: Adds
+  `-XDependentTypes` (`NoListTuplePuns` + core dependent-types bundle),
+  `-XExistentialTypes`, `-XExtendedLet`, default `-fwrite-source-equations`,
+  Unicode `∏`, shared-type binder groups `(m n :: Nat)`, braced `{k :: a}`
+  specificity on `foreach .`, multi-binder `exists`/`some`, and `foreach`/`exists`/`some`
+  in `infixexp2`.
+- **Wave 3A & 3B**: Supports `%U` type-lambda captures (`LeibnizU`), same-module
+  `plug` and `substSingle`/`substDouble`/`substSingleU` staging, inline indexed
+  GADT constructor arguments to `foreach`, polymorphic inference under retained
+  calls, structural `Val -> Type` large eliminations, and `HaskLib` `foldr` and
+  `Matchability(..)` exports.
+- **Wave 2**: Supports indexed GADT `foreach` constructor fields and `Sigma`
+  operands, local `let`/`where` composition aliases, fresh `-fno-code` closure
+  publication with stripped-rule-head `.hi` persistence, and `-O2` Final-Core
+  `[x]` list-reverse equations.
+
 ## Wave 1: simultaneous substitution, same-module lookup, context plug, and closed-family refinement
 
 Compiler `186670b0b9` (atop `69a36b132f`) consolidates four Wave 1 lanes:
