@@ -1,9 +1,11 @@
-{-# LANGUAGE GHC2024, ExplicitNamespaces, ExperimentalDependentTypes #-}
+{-# LANGUAGE GHC2024, AllowAmbiguousTypes, ExplicitNamespaces, ExperimentalDependentTypes, Modifiers #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 
-module Client (mapLaw, zipLaw, addUnder, lengthAppendSingleton, checkAppendSingleton, checkReverse, zipMapLaw, checkZipMap, checkNat) where
+module Client (mapLaw, zipLaw, addUnder, lengthAppendSingleton, checkAppendSingleton, checkReverse, zipMapLaw, checkZipMap, checkNat, foldrPlusAppend, foldrPlusZero, checkFoldrAndMatchability) where
 
+import Data.Kind (Type)
 import qualified HaskLib as H
+import qualified HaskLib.List as HL
 import HaskLib.Nat (type (+))
 import qualified HaskLib.Nat as N
 
@@ -82,3 +84,32 @@ addUnder :: foreach (m :: H.Nat) -> foreach (n :: H.Nat) -> foreach (p :: H.Nat)
          -> H.plus m (H.plus n ('H.Succ p)) H.:~: H.plus m ('H.Succ (H.plus n p))
 addUnder m n p =
     H.cong @(H.plus m) (H.plusSucc n p :: H.plus n ('H.Succ p) H.:~: 'H.Succ (H.plus n p))
+
+-- | Exercise Matchability(..) re-export at both constructors.
+type ArrowBy (m :: H.Matchability) (a :: Type) (b :: Type) = a %m -> b
+
+matchableCong :: forall (f :: ArrowBy 'H.Matchable N.Nat N.Nat) x y.
+                 x H.:~: y -> f x H.:~: f y
+matchableCong = H.cong @f
+
+unmatchableCong :: forall (f :: ArrowBy 'H.Unmatchable N.Nat N.Nat) x y.
+                   x H.:~: y -> f x H.:~: f y
+unmatchableCong = H.cong @f
+
+-- | Checked foldr distributes over list append.
+foldrPlusAppend :: foreach (xs :: [N.Nat]) -> foreach (ys :: [N.Nat]) -> foreach (z :: N.Nat)
+                -> H.foldr N.plus z (xs ++ ys) H.:~: H.foldr N.plus (HL.foldr N.plus z ys) xs
+foldrPlusAppend [] _ _ = H.Refl
+foldrPlusAppend (x : xs) ys z = H.cong @(N.plus x) (foldrPlusAppend xs ys z)
+
+-- | Pass checked foldr directly as a retained foreach argument.
+foldrPlusZero :: foreach (xs :: [N.Nat])
+              -> N.plus (H.foldr N.plus 'N.Zero xs) 'N.Zero H.:~: H.foldr N.plus 'N.Zero xs
+foldrPlusZero xs = N.plusZero (H.foldr N.plus N.Zero xs)
+
+checkFoldrAndMatchability :: [N.Nat] -> [N.Nat] -> Bool
+checkFoldrAndMatchability xs ys =
+    case foldrPlusAppend xs ys N.Zero of
+        H.Refl -> case foldrPlusZero xs of
+            H.Refl -> case (matchableCong @'N.Succ (H.Refl @'N.Zero), unmatchableCong @(N.plus 'N.Zero) (H.Refl @'N.Zero)) of
+                (H.Refl, H.Refl) -> True

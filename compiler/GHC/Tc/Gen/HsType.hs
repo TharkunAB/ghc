@@ -20,7 +20,7 @@ module GHC.Tc.Gen.HsType (
 
         tcHsClsInstType,
         tcDefaultDeclClass, tcHsDeriv, tcDerivStrategy,
-        tcHsTypeApp, tcHsTypeAppWithSource,
+        tcHsTypeApp, tcHsTypeAppWithSource, tcCheckEmbeddedType,
         UserTypeCtxt(..),
         bindImplicitTKBndrs_Tv, bindImplicitTKBndrs_Skol,
             bindImplicitTKBndrs_Q_Tv, bindImplicitTKBndrs_Q_Skol,
@@ -120,6 +120,7 @@ import GHC.Tc.Zonk.TcType
 
 import GHC.Core.Reduction (reductionReducedType)
 import GHC.Core.Coercion (hasCoercionHole)
+import GHC.Core.Coercion.Axiom (ClosedTyFam(CTF_Abstract))
 import GHC.Core.TyCon
 import GHC.Core.ConLike
 import GHC.Core.DataCon
@@ -607,6 +608,86 @@ tcCheckExprSigType :: LHsType GhcRn -> TcKind -> TcM TcType
 tcCheckExprSigType hs_ty kind = do
   indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex hs_ty
   tc_check_lhs_type (typeLevelMode { mode_indices = indices }) hs_ty kind
+
+-- | Check a `type (...)` expression RHS for a Type-valued source equation.
+tcCheckEmbeddedType :: LHsWcType GhcRn -> TcM Type
+tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty })
+  = do { unless (null sig_wcs && hsTypeHasNoAnonWildcards hs_ty) $
+           failWithTc (TcRnRetainedQuantificationError
+             (RetainedTypeOperandContext (Just liftedTypeKind)))
+       ; indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex hs_ty
+       ; pending <- pending_source_families hs_ty
+       ; ty <- tcExtendRecEnv pending $
+               solveEqualities "tcCheckEmbeddedType" $
+               tc_check_lhs_type (typeLevelMode { mode_indices = indices })
+                                 hs_ty liftedTypeKind
+       ; liftZonkM (zonkTcType ty) }
+  where
+    pending_source_families :: LHsType GhcRn -> TcM [(Name, TyThing)]
+    pending_source_families root = do
+      gbl <- getGblEnv
+      lcl <- getLclEnv
+      let lcl_bndrs = nonDetNameEnvElts (tcl_env (tcl_lcl_ctxt lcl))
+          find_local_fun fam_name = do
+            term_occ <- sourceTableTermOcc (nameOccName fam_name)
+            listToMaybe
+              [ fun_id
+              | ATcId { tct_id = fun_id } <- lcl_bndrs
+              , let fn = idName fun_id
+              , isExternalName fn
+              , nameModule_maybe fn == nameModule_maybe fam_name
+              , nameOccName fn == term_occ ]
+          make_pending fam_name
+            | isJust (lookupTypeEnv (tcg_type_env gbl) fam_name) = pure Nothing
+            | Just fun_id <- find_local_fun fam_name = do
+                fun_ty <- liftZonkM (zonkTcType (varType fun_id))
+                mb_tc <- build_pending_family fam_name fun_ty
+                pure ((\tc -> (fam_name, ATyCon tc)) <$> mb_tc)
+            | otherwise = pure Nothing
+      catMaybes <$> mapM make_pending (uniq_names (source_family_names root))
+
+    uniq_names :: [Name] -> [Name]
+    uniq_names = go emptyNameSet
+      where
+        go _ [] = []
+        go seen (n : ns)
+          | n `elemNameSet` seen = go seen ns
+          | otherwise = n : go (extendNameSet seen n) ns
+
+    source_family_names :: Data a => a -> [Name]
+    source_family_names thing
+      | Just (L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))))
+          <- (cast thing :: Maybe (LHsType GhcRn))
+      , isSourceFamilyName name = [name]
+      | Just _ <- (cast thing :: Maybe Name) = []
+      | Just _ <- (cast thing :: Maybe Type) = []
+      | otherwise = concat (gmapQ source_family_names thing)
+
+    build_pending_family :: Name -> Type -> TcM (Maybe TyCon)
+    build_pending_family fam_name fun_ty = runMaybeT $ do
+      let (tele, tau) = splitForAllForAllTyBinders fun_ty
+      tvs <- MaybeT $ pure $ traverse (\(ma, Bndr tv vis) -> do
+               guard (ma `eqType` unmatchableDataConTy
+                      && isSpecifiedForAllTyFlag vis
+                      && isTyVar tv
+                      && tcIsLiftedTypeKind (tyVarKind tv))
+               pure tv) tele
+      let collect_arrows t
+            | Just (FTF_T_T, ma, mult, arg, rest) <- splitFunTy_maybe t
+            , ma `eqType` unmatchableDataConTy && isManyTy mult
+            = do { (args, res) <- collect_arrows rest; pure (arg : args, res) }
+            | tcIsLiftedTypeKind t = pure ([], t)
+            | otherwise = Nothing
+      (domains, res_kind) <- MaybeT $ pure (collect_arrows tau)
+      guard (not (null domains))
+      arg_tvs <- lift $ zipWithM
+                   (\i dom -> (\nm -> mkTyVar nm dom) <$> newSysName (mkTyVarOcc ("arg" ++ show i)))
+                   [1 :: Int ..] domains
+      let binders = mkNamedTyConBinders (Invisible SpecifiedSpec) tvs
+                    ++ mkAnonTyConBinders arg_tvs
+          kind = mkTyConKind binders res_kind
+      pure (mkFamilyTyCon fam_name kind binders 0 res_kind
+                          Nothing (ClosedTypeFamilyTyCon CTF_Abstract) Nothing NotInjective)
 
 {- Note [Runtime indices in expression signatures]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

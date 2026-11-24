@@ -109,6 +109,7 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Types.Name
+import GHC.Types.Name.Set ( extendNameSet )
 import GHC.Types.Id( idType )
 import GHC.Types.Var as Var
 import GHC.Types.Var.Set
@@ -123,7 +124,6 @@ import GHC.Utils.Panic
 
 import GHC.Driver.DynFlags
 
-import Data.List (foldl')
 import GHC.Data.Bag
 import GHC.Data.FastString
 import GHC.Data.Maybe (firstJusts, isJust)
@@ -173,7 +173,7 @@ matchActualFunTy
 
 matchActualFunTy herald mb_thing err_info fun_ty
   = assertPpr (isRhoTy fun_ty) (ppr fun_ty) $
-    go fun_ty
+    go 64 fun_ty
   where
     -- Does not allocate unnecessary meta variables: if the input already is
     -- a function, we just take it apart.  Not only is this efficient,
@@ -181,12 +181,13 @@ matchActualFunTy herald mb_thing err_info fun_ty
     --              (forall a. ty) -> other
     -- If allocated (fresh-meta-var1 -> fresh-meta-var2) and unified, we'd
     -- hide the forall inside a meta-variable
-    go :: TcRhoType   -- The type we're processing, perhaps after
+    go :: Int
+       -> TcRhoType   -- The type we're processing, perhaps after
                       -- expanding type synonyms
        -> TcM (TcCoercion, Type, Scaled TcSigmaTypeFRR, TcSigmaType)
-    go ty | Just ty' <- coreView ty = go ty'
+    go fuel ty | Just ty' <- coreView ty = go fuel ty'
 
-    go (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg_ty, ft_res = res_ty })
+    go _ (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg_ty, ft_res = res_ty })
       = assert (isVisibleFunArg af) $
       do { (arg_co, arg_ty) <- hasFixedRuntimeRep (FRRExpectedFunTy herald 1) arg_ty
          ; let fun_co = mkFunCo Nominal af
@@ -196,12 +197,20 @@ matchActualFunTy herald mb_thing err_info fun_ty
                           (mkReflCo Nominal res_ty)
          ; return (fun_co, ma, Scaled w arg_ty, res_ty) }
 
-    go ty@(TyVarTy tv)
+    go fuel ty@(TyVarTy tv)
       | isMetaTyVar tv
       = do { cts <- readMetaTyVar tv
            ; case cts of
-               Indirect ty' -> go ty'
+               Indirect ty' -> go fuel ty'
                Flexi        -> defer ty }
+
+    go fuel ty@(TyConApp tc args)
+      = do { mb_red <- reduceNativeFunFamily_maybe fuel tc args
+           ; case mb_red of
+               Just (fam_co, rhs) | isRhoTy rhs ->
+                 do { (inner_co, ma, arg_ty, res_ty) <- go (fuel - 1) rhs
+                    ; return (fam_co `mkTransCo` inner_co, ma, arg_ty, res_ty) }
+               _ -> addErrCtxt (mk_ctxt ty) (defer ty) }
 
        -- In all other cases we bale out into ordinary unification
        -- However unlike the meta-tyvar case, we are sure that the
@@ -218,7 +227,7 @@ matchActualFunTy herald mb_thing err_info fun_ty
        --
        -- But in that case we add specialized type into error context
        -- anyway, because it may be useful. See also #9605.
-    go ty = addErrCtxt (mk_ctxt ty) (defer ty)
+    go _ ty = addErrCtxt (mk_ctxt ty) (defer ty)
 
     ------------
     defer fun_ty
@@ -231,6 +240,29 @@ matchActualFunTy herald mb_thing err_info fun_ty
     ------------
     mk_ctxt :: TcType -> HsCtxt
     mk_ctxt _res_ty = mkFunTysMsg herald err_info
+
+reduceNativeFunFamily_maybe :: Int -> TyCon -> [TcType] -> TcM (Maybe (TcCoercion, TcType))
+reduceNativeFunFamily_maybe fuel tc args
+  | fuel > 0
+  , isTypeFamilyTyCon tc
+  , let is_source_fam = isJust (sourceTableTermOcc (nameOccName (tyConName tc)))
+        ty = mkTyConApp tc args
+  , is_source_fam || hasNativeDependentExpr (Core.Type ty)
+  = do { envs <- tcGetFamInstEnvs
+       ; args' <- liftZonkM (mapM zonkTcType args)
+       ; case reduceTyFamApp_maybe envs Nominal tc args' of
+           Just (Reduction co rhs) -> do
+             when is_source_fam $ do
+               env <- getGblEnv
+               updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName tc)
+               let ty' = mkTyConApp tc args'
+               when (isTauTy ty') $ do
+                 loc <- getCtLocM AnnOrigin (Just TypeLevel)
+                 _ <- tcRewriteFamilyAxioms loc ty'
+                 return ()
+             return (Just (co, rhs))
+           Nothing -> return Nothing }
+  | otherwise = return Nothing
 
 {- Note [matchActualFunTy error handling]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -876,16 +908,16 @@ matchExpectedFunTys herald _ctxt arity (Infer inf_res) thing_inside
        ; return (mkWpCastN co, result) }
 
 matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
-  = check arity [] top_ty
+  = check 64 arity [] top_ty
   where
-    check :: VisArity -> [ExpPatType] -> TcSigmaType -> TcM (HsWrapper, a)
+    check :: Int -> VisArity -> [ExpPatType] -> TcSigmaType -> TcM (HsWrapper, a)
     -- `check` is called only in the Check{} case
     -- It collects rev_pat_tys in reversed order
     -- n_req is the number of /visible/ arguments still needed
 
     ----------------------------
     -- See Note [Non-U forall results after value patterns].
-    check 0 rev_pat_tys ty
+    check _ 0 rev_pat_tys ty
       | non_u_invisible_forall ty
       , no_trailing_invis_pats
       = do { result <- thing_inside (reverse rev_pat_tys) (mkCheckExpType ty)
@@ -894,7 +926,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
     ----------------------------
     -- Skolemise quantifiers, both visible (up to n_req) and invisible
     -- See Note [Visible type application and abstraction] in GHC.Tc.Gen.App
-    check n_req rev_pat_tys ty
+    check fuel n_req rev_pat_tys ty
       | isSigmaTy ty                     -- An invisible quantifier at the top
         || (n_req > 0 && isForAllTy ty)  -- A visible quantifier at top, and we need it
       = do { rec { (n_req', wrap_gen, tv_nms, bndrs, given, inner_ty, prefix_implics) <- skolemiseRequired skol_info n_req ty
@@ -907,7 +939,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
            ; emitImplications prefix_implics
            ; (ev_binds, (wrap_res, result))
                   <- checkConstraints (getSkolemInfo skol_info) skol_tvs given $
-                     check n_req'
+                     check fuel n_req'
                            (reverse (map (uncurry ExpForAllPatTy) bndrs) ++ rev_pat_tys)
                            inner_ty
            ; assertPpr (not (null bndrs && null given)) (ppr ty) $
@@ -918,7 +950,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
     -- Base case: (n_req == 0): no more args
     --    The earlier skolemisation ensurs that rho_ty has no top-level invisible quantifiers
     --    If there is deep subsumption, do deep skolemisation now
-    check n_req rev_pat_tys rho_ty
+    check _ n_req rev_pat_tys rho_ty
       | n_req == 0
       = do { let pat_tys = reverse rev_pat_tys
            ; ds_flag <- getDeepSubsumptionFlag
@@ -932,14 +964,14 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
 
     ----------------------------
     -- Function types
-    check n_req rev_pat_tys (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult
-                                   , ft_arg = arg_ty, ft_res = res_ty })
+    check fuel n_req rev_pat_tys (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult
+                                        , ft_arg = arg_ty, ft_res = res_ty })
       = assert (isVisibleFunArg af) $
         do { ma_co <- unifyType Nothing unmatchableDataConTy ma
            ; let arg_pos = arity - n_req + 1   -- 1 for the first argument etc
            ; (arg_co, arg_ty_frr) <- hasFixedRuntimeRep (FRRExpectedFunTy herald arg_pos) arg_ty
            ; let scaled_arg_ty_frr = Scaled mult arg_ty_frr
-           ; (res_wrap, result) <- check (n_req - 1)
+           ; (res_wrap, result) <- check fuel (n_req - 1)
                                          (mkCheckExpFunPatTy scaled_arg_ty_frr : rev_pat_tys)
                                          res_ty
 
@@ -966,18 +998,28 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
 
     ----------------------------
     -- Type variables
-    check n_req rev_pat_tys ty@(TyVarTy tv)
+    check fuel n_req rev_pat_tys ty@(TyVarTy tv)
       | isMetaTyVar tv
       = do { cts <- readMetaTyVar tv
            ; case cts of
-               Indirect ty' -> check n_req rev_pat_tys ty'
+               Indirect ty' -> check fuel n_req rev_pat_tys ty'
                Flexi        -> defer n_req rev_pat_tys ty }
 
     ----------------------------
     -- NOW do coreView.  We didn't do it before, so that we do not unnecessarily
     -- unwrap a synonym in the returned rho_ty
-    check n_req rev_pat_tys ty
-      | Just ty' <- coreView ty = check n_req rev_pat_tys ty'
+    check fuel n_req rev_pat_tys ty
+      | Just ty' <- coreView ty = check fuel n_req rev_pat_tys ty'
+
+    check fuel n_req rev_pat_tys ty@(TyConApp tc args)
+      = do { mb_red <- reduceNativeFunFamily_maybe fuel tc args
+           ; case mb_red of
+               Just (fam_co, rhs) ->
+                 do { (inner_wrap, result) <- check (fuel - 1) n_req rev_pat_tys rhs
+                    ; return (mkWpCastN (mkSymCo fam_co) <.> inner_wrap, result) }
+               Nothing ->
+                 addErrCtxt (mkFunTysMsg herald (arity, top_ty)) $
+                 defer n_req rev_pat_tys ty }
 
        -- In all other cases we bale out into ordinary unification
        -- However unlike the meta-tyvar case, we are sure that the
@@ -994,7 +1036,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
        --
        -- But in that case we add specialized type into error context
        -- anyway, because it may be useful. See also #9605.
-    check n_req rev_pat_tys res_ty
+    check _ n_req rev_pat_tys res_ty
       = addErrCtxt (mkFunTysMsg herald (arity, top_ty))  $
         defer n_req rev_pat_tys res_ty
 
@@ -1026,6 +1068,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
     no_trailing :: MatchGroup GhcRn (LHsExpr GhcRn) -> Bool
     no_trailing (MG { mg_alts = L _ matches }) = all match_done matches
       where
+        match_done :: LMatch GhcRn (LHsExpr GhcRn) -> Bool
         match_done (L _ (Match { m_pats = L _ pats })) = case reverse pats of
           [] -> True
           pat : _ -> isVisArgLPat pat
