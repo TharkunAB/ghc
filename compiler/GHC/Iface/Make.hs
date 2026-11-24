@@ -11,6 +11,7 @@
 -- recompilation is required.
 module GHC.Iface.Make
    ( mkPartialIface
+   , mkPartialIfaceWithRuleHeads
    , mkFullIface
    , mkIfaceTc
    , mkRecompUsageInfo
@@ -28,6 +29,7 @@ import GHC.StgToCmm.Types (CmmCgInfos (..))
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Validity (ScopedSumDomainRequirement(..), scopedSumDomainRequirement)
+import GHC.Tc.Gen.SourceTable (sourceRuleOwners)
 
 import GHC.Iface.Warnings
 import GHC.Iface.Decl
@@ -56,6 +58,7 @@ import GHC.Driver.Plugins
 import GHC.Types.Id
 import GHC.Types.Fixity.Env
 import GHC.Types.ForeignStubs (ForeignStubs (NoStubs))
+import GHC.Types.InlinePragma (isNeverActive)
 import GHC.Types.SafeHaskell
 import GHC.Types.Annotations
 import GHC.Types.Name
@@ -114,7 +117,21 @@ mkPartialIface :: HscEnv
                -> [ImportUserSpec]
                -> ModGuts
                -> IO PartialModIface
-mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
+mkPartialIface hsc_env core_prog mod_details mod_summary import_decls guts =
+  mkPartialIfaceWithRuleHeads hsc_env core_prog mod_details mod_summary import_decls guts emptyNameSet
+
+-- | Variant of 'mkPartialIface' preserving typechecked source-rule heads even
+-- when interface pragmas are omitted.
+mkPartialIfaceWithRuleHeads
+  :: HscEnv
+  -> CoreProgram
+  -> ModDetails
+  -> ModSummary
+  -> [ImportUserSpec]
+  -> ModGuts
+  -> NameSet
+  -> IO PartialModIface
+mkPartialIfaceWithRuleHeads hsc_env core_prog mod_details mod_summary import_decls
   ModGuts{ mg_module       = this_mod
          , mg_hsc_src      = hsc_src
          , mg_usages       = usages
@@ -127,10 +144,11 @@ mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
          , mg_docs         = docs
          , mg_modBreaks    = modBreaks
          }
+  source_rule_owners
   = do
       self_recomp <- traverse (mkSelfRecomp hsc_env this_mod (ms_hs_hash mod_summary)) usages
       mkIface_ hsc_env this_mod core_prog hsc_src deps rdr_env import_decls fix_env warns self_trust
-                safe_mode self_recomp docs mod_details modBreaks
+                safe_mode self_recomp docs mod_details modBreaks source_rule_owners
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
 -- generator produced information.
@@ -264,6 +282,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program mb_modBreaks
                    docs
                    mod_details
                    mb_modBreaks
+                   (sourceRuleOwners (tcg_rules tc_result))
 
           mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
 
@@ -314,6 +333,7 @@ mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> Maybe Docs
          -> ModDetails
          -> Maybe ModBreaks
+         -> NameSet
          -> IO PartialModIface
 mkIface_ hsc_env
          this_mod core_prog hsc_src deps rdr_env import_decls fix_env src_warns
@@ -332,6 +352,7 @@ mkIface_ hsc_env
 --      put exactly the info into the TypeEnv that we want
 --      to expose in the interface
         modBreaks
+        source_rule_owners
   = do
     iface_rules <- traverse (coreRuleToIfaceRule hsc_env type_env) rules
     let home_unit    = hsc_home_unit hsc_env
@@ -373,10 +394,21 @@ mkIface_ hsc_env
         roots = unionNameSets (declared : mkNameSet (concatMap availNames exports)
                               : map freeNamesIfDecl decls ++ map freeNamesIfRule iface_rules)
     scoped_sum_domains <- ifaceScopedSumDomainRequirement hsc_env type_env declared roots
-    fields <- case scoped_sum_domains of
+    fields0 <- case scoped_sum_domains of
       Just DirectScopedSumDomain -> writeField scopedSumDomainField () emptyExtensibleFields
       Just ComposedScopedSumDomain -> writeField composedScopedSumDomainField () emptyExtensibleFields
       Nothing -> pure emptyExtensibleFields
+    let rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
+          source_rule_owners `unionNameSet`
+          mkNameSet [ ifRuleHead rule
+                    | rule <- iface_rules
+                    , not (ifRuleAuto rule)
+                    , not (isNeverActive (ifActivation rule)) ]
+    fields <- if null rule_heads
+      then pure fields0
+      else writeFieldWith sourceRuleHeadsField
+             (\bh -> putWithUserData QuietBinIFace NormalCompression bh rule_heads)
+             fields0
 
     pure $ emptyPartialModIface this_mod
           -- Need to record this because it depends on the -instantiated-with flag

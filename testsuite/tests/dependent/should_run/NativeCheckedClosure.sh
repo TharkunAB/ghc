@@ -445,3 +445,307 @@ ORPHAN
         exit 1
     fi
 done
+
+# Fresh -fno-code providers, unexported helper/constructor controls, and upstream
+# -fno-code / -fomit-interface-pragmas rule heads at -O0 and -O2.
+for opt in -O0 -O2; do
+    nc_dir="$work/$opt/fresh-nocode"
+    mkdir -p "$nc_dir"/{provider,reader,withheld,hidden-helper,rule-nocode,rule-omit,orphan-nocode}
+
+    # 1. Fresh -fno-code provider publishes checked closure and indexed tables.
+    cd "$nc_dir/provider"
+    cp "$inputs/NativeCheckedClosureProvider.hs" .
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+        -fwrite-source-equations -c NativeCheckedClosureProvider.hs
+    test ! -e NativeCheckedClosureProvider.o
+    "${ghc[@]}" --show-iface NativeCheckedClosureProvider.hi >provider.iface
+    grep -Fq 'CheckedClosureSourceTable T:replace' provider.iface
+    grep -Fq 'SourceTable T:markFound' provider.iface
+    if [[ $opt == -O0 ]]; then
+        grep -Fq 'SourceTable T:findMarked' provider.iface
+    fi
+
+    cd "$nc_dir/reader"
+    cp ../provider/NativeCheckedClosureProvider.hi "$inputs/NativeCheckedClosure.hs" .
+    if [[ $opt == -O0 ]]; then
+        "${ghc[@]}" "$opt" -fno-code -fwrite-interface -DCHECK_INDEXED_RECURSION -c NativeCheckedClosure.hs
+    else
+        "${ghc[@]}" "$opt" -fno-code -fwrite-interface -c NativeCheckedClosure.hs
+    fi
+    test ! -e NativeCheckedClosure.o
+    if "${ghc[@]}" "$opt" -fno-code -fforce-recomp -DWRONG_CAPTURE -c NativeCheckedClosure.hs >wrong.log 2>&1; then
+        cat wrong.log >&2
+        exit 1
+    fi
+    grep -Fq '[GHC-83865]' wrong.log
+
+    # 1b. Fresh -fno-code plug/substU provider publishes tables and HIDE_CTX withholds T:plug (GHC-70565).
+    mkdir -p "$nc_dir/plug-nocode"/{prov,cli}
+    cd "$nc_dir/plug-nocode/prov"
+    cp "$inputs/NativeCheckedPlugSubstUProvider.hs" .
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+        -fwrite-source-equations -c NativeCheckedPlugSubstUProvider.hs
+    test ! -e NativeCheckedPlugSubstUProvider.o
+    "${ghc[@]}" --show-iface NativeCheckedPlugSubstUProvider.hi >plug.iface
+    for needle in 'SourceTable T:plug' 'SourceTable T:plugS' \
+                  'CheckedClosureSourceTable T:substSingleU' \
+                  'CheckedClosureSourceTable T:renameU [extU]' \
+                  'SourceTable T:extU'; do
+        grep -Fq "$needle" plug.iface || { echo "Missing $needle in -fno-code at $opt" >&2; exit 1; }
+    done
+    cd "$nc_dir/plug-nocode/cli"
+    cp ../prov/NativeCheckedPlugSubstUProvider.hi "$inputs/NativeCheckedPlugSubstU.hs" .
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -c NativeCheckedPlugSubstU.hs
+    test ! -e NativeCheckedPlugSubstU.o
+
+    cd "$nc_dir/plug-nocode/prov"
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+        -fwrite-source-equations -fforce-recomp -DHIDE_CTX -c NativeCheckedPlugSubstUProvider.hs
+    "${ghc[@]}" --show-iface NativeCheckedPlugSubstUProvider.hi >plug-hide.iface
+    if grep -Eq 'SourceTable T:plug([^S]|$)' plug-hide.iface; then
+        echo "Unexpectedly published T:plug under -fno-code -DHIDE_CTX ($opt)" >&2
+        exit 1
+    fi
+    cd "$nc_dir/plug-nocode/cli"
+    cp ../prov/NativeCheckedPlugSubstUProvider.hi .
+    cat >HiddenCtxClient.hs <<'HCC'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module HiddenCtxClient where
+import Data.Type.Equality ((:~:)(Refl))
+import qualified NativeCheckedPlugSubstUProvider as P
+bad :: forall (n :: P.Nat) (t :: P.UTerm n). P.plug 'P.CHole t :~: t
+bad = Refl
+HCC
+    if "${ghc[@]}" "$opt" -fno-code -fforce-recomp -c HiddenCtxClient.hs >hctx.log 2>&1 ||
+       ! grep -Fq '[GHC-70566]' hctx.log; then
+        echo "Expected [GHC-70566] for HiddenCtxClient.hs ($opt):" >&2
+        cat hctx.log >&2
+        exit 1
+    fi
+    cat >HiddenCtxVarClient.hs <<'HCVC'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module HiddenCtxVarClient where
+import Data.Type.Equality ((:~:)(Refl))
+import qualified NativeCheckedPlugSubstUProvider as P
+bad :: forall (c :: P.UCtx ('P.Succ 'P.Zero) 'P.Zero) (t :: P.UTerm ('P.Succ 'P.Zero)).
+       P.plug c t :~: 'P.UVar 'P.FZ
+bad = Refl
+HCVC
+    if "${ghc[@]}" "$opt" -fno-code -fforce-recomp -c HiddenCtxVarClient.hs >hctx-var.log 2>&1 ||
+       ! grep -Fq '[GHC-70565]' hctx-var.log; then
+        echo "Expected [GHC-70565] for HiddenCtxVarClient.hs under -DHIDE_CTX ($opt):" >&2
+        cat hctx-var.log >&2
+        exit 1
+    fi
+
+    # 2. HIDE_LOOP, HIDE_MARKED, STRICT_CAPTURE withhold publication in -fno-code without .hi crashes.
+    cd "$nc_dir/withheld"
+    cp "$inputs/NativeCheckedClosureProvider.hs" .
+    for variant in STRICT_CAPTURE HIDE_LOOP; do
+        "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+            -fwrite-source-equations -fforce-recomp "-D$variant" -c NativeCheckedClosureProvider.hs
+        test ! -e NativeCheckedClosureProvider.o
+        "${ghc[@]}" --show-iface NativeCheckedClosureProvider.hi >withheld.iface
+        if grep -Eq 'CheckedClosureSourceTable T:replace|\$apply:replace' withheld.iface; then
+            echo "Unexpectedly published T:replace under -fno-code -D$variant ($opt)" >&2
+            exit 1
+        fi
+    done
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+        -fwrite-source-equations -fforce-recomp -DHIDE_MARKED -c NativeCheckedClosureProvider.hs
+    "${ghc[@]}" --show-iface NativeCheckedClosureProvider.hi >withheld.iface
+    if grep -Eq 'SourceTable T:(findMarked|markFound)' withheld.iface; then
+        echo "Unexpectedly published marked tables under -fno-code -DHIDE_MARKED ($opt)" >&2
+        exit 1
+    fi
+
+    # 3. Unexported helper in -fno-code must withhold publication and fail client with GHC-70565.
+    cd "$nc_dir/hidden-helper"
+    cat >HiddenHelperProvider.hs <<'HH'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, PolyKinds, RankNTypes #-}
+module HiddenHelperProvider
+  ( Sort(..), Scope(..), Slot(..), Expr(..), substSingle ) where
+data Sort = Nat | Arrow Sort Sort
+data Scope = Empty | Push Scope Sort
+data Slot (g :: Scope) (a :: Sort) where
+  New :: Slot (Push g a) a
+  Old :: Slot g a -> Slot (Push g b) a
+data Expr (g :: Scope) (a :: Sort) where
+  At   :: Slot g a -> Expr g a
+  Bind :: Expr (Push g a) b -> Expr g (Arrow a b)
+  Lit  :: Expr g Nat
+extendName :: (forall a. Slot g a -> Slot d a) -> (forall s. Slot (Push g b) s -> Slot (Push d b) s)
+extendName _ New = New
+extendName f (Old x) = Old (f x)
+renameExpr :: (forall a. Slot g a -> Slot d a) -> Expr g s -> Expr d s
+renameExpr f (At x) = At (f x)
+renameExpr f (Bind n) = Bind (renameExpr (extendName f) n)
+renameExpr _ Lit = Lit
+extendExpr :: (forall a. Slot g a -> Expr d a) -> (forall s. Slot (Push g b) s -> Expr (Push d b) s)
+extendExpr _ New = At New
+extendExpr f (Old x) = renameExpr Old (f x)
+walk :: (forall a. Slot g a -> Expr d a) -> Expr g s -> Expr d s
+walk f (At x) = f x
+walk f (Bind n) = Bind (walk (extendExpr f) n)
+walk _ Lit = Lit
+substSingle :: Expr (Push g a) b -> Expr g a -> Expr g b
+substSingle n w = walk (\case { New -> w; Old x -> At x }) n
+HH
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+        -fwrite-source-equations -c HiddenHelperProvider.hs
+    test ! -e HiddenHelperProvider.o
+    "${ghc[@]}" --show-iface HiddenHelperProvider.hi >hh.iface
+    if grep -Fq 'CheckedClosureSourceTable T:substSingle' hh.iface; then
+        echo "Unexpectedly published T:substSingle with hidden helpers ($opt)" >&2
+        exit 1
+    fi
+    cat >HiddenHelperClient.hs <<'HHC'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module HiddenHelperClient where
+import Data.Type.Equality ((:~:)(Refl))
+import qualified HiddenHelperProvider as P
+bad :: P.substSingle ('P.At 'P.New :: P.Expr ('P.Push 'P.Empty 'P.Nat) 'P.Nat) 'P.Lit :~: 'P.Lit
+bad = Refl
+HHC
+    if "${ghc[@]}" "$opt" -fno-code -c HiddenHelperClient.hs >hh-client.log 2>&1 ||
+       ! grep -Fq '[GHC-70565]' hh-client.log; then
+        echo "Expected [GHC-70565] for HiddenHelperClient.hs ($opt):" >&2
+        cat hh-client.log >&2
+        exit 1
+    fi
+
+    # 4. Upstream M_Rule compiled with -fno-code -fwrite-interface -fomit-interface-pragmas
+    #    (and native -fomit-interface-pragmas) must withhold substSingle at both -O0 and -O2.
+    for rule_kind in nocode omit; do
+        rdir="$nc_dir/rule-$rule_kind"
+        cd "$rdir"
+        cat >RuleClosureProvider.hs-boot <<'RBOOT'
+{-# LANGUAGE DataKinds, GADTs, PolyKinds, RankNTypes #-}
+module RuleClosureProvider
+  ( Sort(..), Scope(..), Slot(..), Expr(..), substSingle ) where
+data Sort = Nat | Arrow Sort Sort
+data Scope = Empty | Push Scope Sort
+data Slot (g :: Scope) (a :: Sort) where
+  New :: Slot (Push g a) a
+  Old :: Slot g a -> Slot (Push g b) a
+data Expr (g :: Scope) (a :: Sort) where
+  At   :: Slot g a -> Expr g a
+  Bind :: Expr (Push g a) b -> Expr g (Arrow a b)
+  Lit  :: Expr g Nat
+substSingle :: Expr (Push g a) b -> Expr g a -> Expr g b
+RBOOT
+        cat >M_Rule.hs <<'MRULE'
+{-# LANGUAGE DataKinds #-}
+{-# OPTIONS_GHC -Wno-orphans -Wno-inline-rule-shadowing #-}
+module M_Rule () where
+import {-# SOURCE #-} RuleClosureProvider
+{-# RULES "hijack" forall (n :: Expr (Push g 'Nat) 'Nat) (w :: Expr g 'Nat). substSingle n w = Lit #-}
+MRULE
+        cat >RuleClosureProvider.hs <<'RPROV'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, PolyKinds, RankNTypes #-}
+module RuleClosureProvider
+  ( Sort(..), Scope(..), Slot(..), Expr(..)
+  , extendName, renameExpr, extendExpr, walk, substSingle ) where
+import M_Rule ()
+data Sort = Nat | Arrow Sort Sort
+data Scope = Empty | Push Scope Sort
+data Slot (g :: Scope) (a :: Sort) where
+  New :: Slot (Push g a) a
+  Old :: Slot g a -> Slot (Push g b) a
+data Expr (g :: Scope) (a :: Sort) where
+  At   :: Slot g a -> Expr g a
+  Bind :: Expr (Push g a) b -> Expr g (Arrow a b)
+  Lit  :: Expr g Nat
+extendName :: (forall a. Slot g a -> Slot d a) -> (forall s. Slot (Push g b) s -> Slot (Push d b) s)
+extendName _ New = New
+extendName f (Old x) = Old (f x)
+renameExpr :: (forall a. Slot g a -> Slot d a) -> Expr g s -> Expr d s
+renameExpr f (At x) = At (f x)
+renameExpr f (Bind n) = Bind (renameExpr (extendName f) n)
+renameExpr _ Lit = Lit
+extendExpr :: (forall a. Slot g a -> Expr d a) -> (forall s. Slot (Push g b) s -> Expr (Push d b) s)
+extendExpr _ New = At New
+extendExpr f (Old x) = renameExpr Old (f x)
+walk :: (forall a. Slot g a -> Expr d a) -> Expr g s -> Expr d s
+walk f (At x) = f x
+walk f (Bind n) = Bind (walk (extendExpr f) n)
+walk _ Lit = Lit
+substSingle :: Expr (Push g a) b -> Expr g a -> Expr g b
+substSingle n w = walk (\case { New -> w; Old x -> At x }) n
+RPROV
+        cat >RuleClosureClient.hs <<'RCLI'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module RuleClosureClient where
+import Data.Type.Equality ((:~:)(Refl))
+import qualified RuleClosureProvider as P
+bad :: P.substSingle ('P.At 'P.New :: P.Expr ('P.Push 'P.Empty 'P.Nat) 'P.Nat) 'P.Lit :~: 'P.Lit
+bad = Refl
+RCLI
+        "${ghc[@]}" "$opt" -fno-code -fwrite-interface -c RuleClosureProvider.hs-boot
+        if [[ $rule_kind == nocode ]]; then
+            "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas -c M_Rule.hs
+            test ! -e M_Rule.o
+        else
+            "${ghc[@]}" "$opt" -fomit-interface-pragmas -c M_Rule.hs
+        fi
+        for prov_mode in nocode native; do
+            prov_flags=()
+            if [[ $prov_mode == nocode ]]; then prov_flags=(-fno-code -fwrite-interface); fi
+            "${ghc[@]}" "$opt" "${prov_flags[@]}" -fomit-interface-pragmas \
+                -fwrite-source-equations -fforce-recomp -c RuleClosureProvider.hs
+            "${ghc[@]}" --show-iface RuleClosureProvider.hi >rprov.iface
+            if grep -Fq 'CheckedClosureSourceTable T:substSingle' rprov.iface; then
+                echo "Unexpectedly published T:substSingle ($opt $rule_kind $prov_mode)" >&2
+                exit 1
+            fi
+            if "${ghc[@]}" "$opt" -fno-code -fforce-recomp -c RuleClosureClient.hs >rcli.log 2>&1 ||
+               ! grep -Fq '[GHC-70565]' rcli.log; then
+                echo "Expected [GHC-70565] for RuleClosureClient ($opt $rule_kind $prov_mode):" >&2
+                cat rcli.log >&2
+                exit 1
+            fi
+        done
+    done
+
+    # 5. Same-module indexed lookup importing -fno-code -fomit-interface-pragmas orphan rule
+    #    must reject with GHC-83605 at both -O0 and -O2 even without -fno-ignore-interface-pragmas.
+    cd "$nc_dir/orphan-nocode"
+    cp "$inputs/NativeLocalLookup.hs" .
+    cat >NativeLocalLookup.hs-boot <<'OBOOT'
+{-# LANGUAGE DataKinds, GADTs, KindSignatures #-}
+module NativeLocalLookup (Nat(..), Fin(..), UTerm(..), Env(..), Clos(..), lookupEnv) where
+data Nat = Zero | Succ Nat
+data Fin (n :: Nat) where
+  FZ :: Fin ('Succ n)
+  FS :: Fin n -> Fin ('Succ n)
+data UTerm (n :: Nat) where
+  UVar :: Fin n -> UTerm n
+  ULam :: UTerm ('Succ n) -> UTerm n
+  UApp :: UTerm n -> UTerm n -> UTerm n
+data Env (n :: Nat) where
+  ENil  :: Env 'Zero
+  ECons :: Clos -> Env n -> Env ('Succ n)
+data Clos where
+  MkClos :: UTerm n -> Env n -> Clos
+lookupEnv :: Env n -> Fin n -> Clos
+OBOOT
+    cat >OrphanLookupRule.hs <<'ORULE'
+{-# OPTIONS_GHC -Wno-orphans #-}
+module OrphanLookupRule () where
+import {-# SOURCE #-} NativeLocalLookup
+{-# RULES "orphan lookup hijack" forall c e. lookupEnv (ECons c e) FZ = MkClos (ULam (UVar FZ)) ENil #-}
+ORULE
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -c NativeLocalLookup.hs-boot
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fomit-interface-pragmas -c OrphanLookupRule.hs
+    for lmode in nocode native; do
+        lflags=()
+        if [[ $lmode == nocode ]]; then lflags=(-fno-code -fwrite-interface); fi
+        if "${ghc[@]}" "$opt" "${lflags[@]}" -fforce-recomp -DIMPORTED_ORPHAN_RULE \
+             -c NativeLocalLookup.hs >orphan.log 2>&1 ||
+           ! grep -Fq '[GHC-83605]' orphan.log; then
+            echo "Expected [GHC-83605] for -DIMPORTED_ORPHAN_RULE ($opt $lmode):" >&2
+            cat orphan.log >&2
+            exit 1
+        fi
+    done
+done

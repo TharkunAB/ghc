@@ -53,14 +53,16 @@ import GHC.Core.Unify (alwaysBindTv, tcMatchTys, tcUnifyTys)
 import GHC.Core.Utils (exprType, stripTicksE)
 import GHC.Driver.Config (initSimpleOpts)
 import GHC.Driver.DynFlags (GeneralFlag(Opt_Hpc), HasDynFlags(getDynFlags), pluginModNames)
+import GHC.Driver.Env (visibleSourceRuleHeads)
 import GHC.Tc.Errors.Types (RetainedQuantificationError(RetainedSourceRule), TcRnMessage(..))
 import GHC.Tc.Gen.SourceTable
   ( hasSourceMethodRule, ordinaryImport, publicCaseType, sourceEquationDatatypes
   , visibleSourceMethodRules )
 import GHC.Tc.TyCl.Build (buildDataCon, newImplicitBinder, newTyConRepName)
+import GHC.Tc.Types (tcVisibleOrphanMods)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
 import GHC.Tc.Utils.Monad
-  ( TcGblEnv(..), TcM, addErr, failIfErrsM, getGblEnv, getGlobalRdrEnv, goptM
+  ( TcGblEnv(..), TcM, addErr, failIfErrsM, getGblEnv, getGlobalRdrEnv, getTopEnv, goptM, liftIO
   , newSysName, readTcRef, setSrcSpan )
 import GHC.Tc.Utils.TcType (isTyFamFree)
 import GHC.Types.Avail (availsToNameSet)
@@ -279,8 +281,11 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
       ([], [], []) -> pure ([], [])
       (closures, indexed, lookups) -> do
         visible <- visibleSourceMethodRules env
+        rule_heads <- visibleClosureRuleHeads env
         let safe :: (Id, a, [Id]) -> Bool
-            safe (owner, _, helpers) = all (not . hasSourceMethodRule visible) (owner:helpers)
+            safe (owner, _, helpers) =
+              all (\v -> not (hasSourceMethodRule visible v)
+                      && not (idName v `elemNameSet` rule_heads)) (owner:helpers)
         checked_closures <- catMaybes <$> traverse (publish public) (filter safe closures)
         checked_indexed <- publishIndexedEntries public lookupOwner unoptimized final
                              (dependencies isExternalName) safe (filter safe indexed)
@@ -891,12 +896,20 @@ pruneUnusedIndexedLookups env = do
             (filterNameEnv (not . (`elemNameSet` families) . getName) (tcg_type_env env))
         }
 
+-- | Collect imported active non-auto rule heads visible from this module,
+-- including heads stored in stripped/no-code interfaces.
+visibleClosureRuleHeads :: TcGblEnv -> TcM NameSet
+visibleClosureRuleHeads env = do
+  hsc <- getTopEnv
+  liftIO $ visibleSourceRuleHeads hsc (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
+
 -- | Validate constructor exports, owner visibility, and imported rules for used early lookups.
 checkLocalIndexedLookupExports :: TcGblEnv -> TcM ()
 checkLocalIndexedLookupExports env = do
     let candidates = earlyIndexedLookups env
     unless (null candidates) $ do
       visible <- visibleSourceMethodRules env
+      rule_heads <- visibleClosureRuleHeads env
       let exported = availsToNameSet (tcg_exports env)
           exported_tycons = tyConsOfTypes (exportedInterfaceTypes exported (tcg_type_env env))
       for_ candidates $ \(owner, table) -> do
@@ -920,7 +933,7 @@ checkLocalIndexedLookupExports env = do
             setSrcSpan (nameSrcSpan name) $
               addErr (TcRnOpenTypeEval name Nothing reason)
           [] -> pure ()
-        when (hasSourceMethodRule visible owner) $
+        when (hasSourceMethodRule visible owner || name `elemNameSet` rule_heads) $
           setSrcSpan (nameSrcSpan name) $
             addErr (TcRnRetainedQuantificationError (RetainedSourceRule name))
 

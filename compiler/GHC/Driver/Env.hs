@@ -38,6 +38,7 @@ module GHC.Driver.Env
 
    , hugRulesBelow
    , hugRuleInterfacesBelow
+   , visibleSourceRuleHeads
    , hugInstancesBelow
    , hugAnnsBelow
    , hugCompleteSigsBelow
@@ -74,9 +75,16 @@ import GHC.Unit.Env as UnitEnv
 import GHC.Unit.External
 import GHC.Unit.Finder.Types ( FinderCache(..), KnownHomeModules )
 
+import GHC.Iface.Binary ( getWithUserData )
+import GHC.Iface.Ext.Fields ( readFieldWith, sourceRuleHeadsField )
+import GHC.Iface.Syntax ( IfaceRule(..), ifRuleAuto )
+
 import GHC.Types.Error ( emptyMessages, Messages )
+import GHC.Types.InlinePragma ( isNeverActive )
 import GHC.Types.Name
 import GHC.Types.Name.Env
+import GHC.Types.Name.Set ( NameSet, mkNameSet, unionNameSets )
+import GHC.Types.SourceFile ( HscSource, hscSourceToIsBoot )
 import GHC.Types.TyThing
 
 import GHC.Data.Maybe
@@ -88,6 +96,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Misc
 import GHC.Utils.Logger
 
+import GHC.Core ( isOrphan )
 import GHC.Core.Rules
 import GHC.Types.Annotations
 import GHC.Types.CompleteMatch
@@ -267,6 +276,42 @@ hugRulesBelow hsc_env uid mn = foldr (flip extendRuleBaseList) emptyRuleBase <$>
 hugRuleInterfacesBelow :: HscEnv -> UnitId -> ModuleNameWithIsBoot -> IO [ModIface]
 hugRuleInterfacesBelow hsc_env uid mn = concat <$>
   hugSomeThingsBelowUs (\info -> [hm_iface info]) False hsc_env uid mn
+
+-- | Collect active non-auto rule head 'Name's visible from home interfaces
+-- below the given module and from loaded external package interfaces,
+-- ignoring 'Opt_IgnoreInterfacePragmas' and reading 'sourceRuleHeadsField'.
+-- Note that 'eps_PIT' entries purge 'mi_rules' (see 'GHC.Iface.Load.loadInterface'),
+-- so only 'sourceRuleHeadsField' is read from 'eps_PIT' interfaces.
+visibleSourceRuleHeads :: HscEnv -> Module -> HscSource -> ModuleSet -> IO NameSet
+visibleSourceRuleHeads hsc_env this_mod hsc_src visible_orphs = do
+  eps <- hscEPS hsc_env
+  home_ifaces <- if isInteractiveModule this_mod
+    then concat <$> mapM interactive_ifaces (moduleSetElts visible_orphs)
+    else hugRuleInterfacesBelow hsc_env (homeUnitId (hsc_home_unit hsc_env))
+                                (GWIB (moduleName this_mod) (hscSourceToIsBoot hsc_src))
+  let eps_ifaces = moduleEnvElts (eps_PIT eps)
+  home_heads <- mapM (iface_rule_heads True) home_ifaces
+  eps_heads <- mapM (iface_rule_heads False) eps_ifaces
+  pure (unionNameSets (home_heads ++ eps_heads))
+  where
+    interactive_ifaces m = HUG.lookupHugByModule m (hsc_HUG hsc_env) >>= \case
+      Nothing -> pure []
+      Just hmi -> do
+        below <- hugRuleInterfacesBelow hsc_env (moduleUnitId m) (GWIB (moduleName m) NotBoot)
+        pure (hm_iface hmi : below)
+
+    iface_rule_heads read_raw_rules iface = do
+      let raw_heads
+            | read_raw_rules =
+                [ ifRuleHead rule
+                | rule <- mi_rules iface
+                , not (ifRuleAuto rule)
+                , not (isNeverActive (ifActivation rule))
+                , not (isOrphan (ifRuleOrph rule))
+                    || mi_module iface `elemModuleSet` visible_orphs ]
+            | otherwise = []
+      stored <- readFieldWith sourceRuleHeadsField (getWithUserData (hsc_NC hsc_env)) (mi_ext_fields iface)
+      pure (mkNameSet (raw_heads ++ concat stored))
 
 -- | Get annotations from all modules "below" this one (in the dependency
 -- sense) within the home units. If the module is @Nothing@, returns /all/

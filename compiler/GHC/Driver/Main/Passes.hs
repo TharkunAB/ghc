@@ -154,6 +154,7 @@ import GHC.Unit.Module.Status
 import GHC.Unit.Home.ModInfo
 
 import GHC.Types.CostCentre
+import GHC.Types.Avail (availsToNameSet)
 import GHC.Types.Error
 import GHC.Types.ForeignStubs
 import GHC.Types.Id
@@ -180,7 +181,7 @@ import GHC.Utils.Fingerprint ( Fingerprint )
 import GHC.Tc.Gen.SourceClosure
   ( earlyIndexedLookups, publishCheckedSourceClosures, validateEarlyIndexedLookups )
 import GHC.Tc.Gen.SourceTable (finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables,
-                               finalCoreSourceFamilies, sourceTableCallees, publishListFoldMethods,
+                               finalCoreSourceFamilies, sourceRuleOwners, sourceTableCallees, publishListFoldMethods,
                                keepCheckedMapWorkers, publishCheckedMapMethods)
 import GHC.Utils.Panic
 import GHC.Utils.Error
@@ -949,7 +950,9 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                 {-# SCC "GHC.Driver.Main.mkPartialIface" #-}
                 -- This `force` saves 2M residency in test T10370
                 -- See Note [Avoiding space leaks in toIface*] for details.
-                fmap force (mkPartialIface hsc_env (cg_binds cg_guts) details summary (tcg_import_decls tc_result) simplified_guts)
+                fmap force (mkPartialIfaceWithRuleHeads hsc_env (cg_binds cg_guts) details summary
+                              (tcg_import_decls tc_result) simplified_guts
+                              (sourceRuleOwners (tcg_rules tc_result)))
 
           return HscRecomp { hscs_guts = cg_guts,
                              hscs_mod_location = ms_location summary,
@@ -989,36 +992,61 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
       -- when the interface will not contain a Core program.
       _ -> do
         let has_early_lookups = not (null (earlyIndexedLookups tc_result))
+            want_closures = gopt Opt_WriteSourceEquations dflags &&
+                            xopt LangExt.ExperimentalDependentTypes dflags &&
+                            null (tcg_rules tc_result) &&
+                            not (gopt Opt_Hpc dflags)
         checked_tc <- case mb_desugar of
           Just guts | let has_mappers = not (null (finalCoreMappers (mg_binds guts)))
-                    , has_mappers || has_early_lookups -> do
+                    , has_mappers || has_early_lookups || (want_closures && null (mg_rules guts)) -> do
             added_plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
             let no_plugins = null added_plugins && null (pluginsWithArgs (hsc_plugins hsc_env)) &&
                              null (pluginModNames dflags)
+                can_publish_closures = want_closures && no_plugins && null (mg_rules guts)
                 retained = hasNativeDependentModuleBody (mg_binds guts) [] (mg_tcs guts)
-            non_retained_opt <- if not retained && (has_early_lookups || (has_mappers && null (mg_rules guts)))
-              then Just <$> hscSimplify' [] guts
-              else pure Nothing
-            when has_early_lookups $ do
-              lookup_opt <- if not no_plugins
-                then pure Nothing
-                else if retained
+            if not (has_mappers || has_early_lookups || can_publish_closures)
+              then pure tc_result
+              else do
+                non_retained_opt <- if not retained && (has_early_lookups || (has_mappers && null (mg_rules guts)) || can_publish_closures)
+                  then Just <$> hscSimplify' [] guts
+                  else pure Nothing
+                retained_opt <- if retained && no_plugins && (has_early_lookups || can_publish_closures)
                   then liftIO $ validateRetainedLookupBodies hsc_env guts
-                  else pure non_retained_opt
-              checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_plugins
-                (mg_rules guts ++ maybe [] mg_rules lookup_opt)
-                (mg_binds guts) (mg_binds <$> lookup_opt) Nothing
-            if has_mappers
-              then do
-                optimized <- if not (null (mg_rules guts))
-                  then pure Nothing
-                  else if retained
-                    then if no_plugins
-                           then liftIO $ validateRetainedSourceBodies hsc_env guts
-                           else pure Nothing
-                    else pure non_retained_opt
-                pure (validateSimpleSourceTables guts optimized tc_result)
-              else pure tc_result
+                  else pure Nothing
+                let active_opt = if retained then retained_opt else non_retained_opt
+                when has_early_lookups $
+                  checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_plugins
+                    (mg_rules guts ++ maybe [] mg_rules active_opt)
+                    (mg_binds guts) (mg_binds <$> active_opt) Nothing
+                checked_mappers_tc <- if has_mappers
+                  then do
+                    optimized <- if not (null (mg_rules guts))
+                      then pure Nothing
+                      else if retained
+                        then if no_plugins
+                               then liftIO $ validateRetainedSourceBodies hsc_env guts
+                               else pure Nothing
+                        else pure non_retained_opt
+                    pure (validateSimpleSourceTables guts optimized tc_result)
+                  else pure tc_result
+                case active_opt of
+                  Just opt_guts | can_publish_closures, null (mg_rules opt_guts) -> do
+                    let exported_names = availsToNameSet (tcg_exports checked_mappers_tc)
+                        keep_exported (AnId v) = idName v `elemNameSet` exported_names
+                        keep_exported _        = True
+                        exported_types = filterNameEnv keep_exported (tcg_type_env checked_mappers_tc)
+                    (_, closures) <- liftIO $
+                      initTc NoTcMPlugins hsc_env hsc_src False (mg_module guts) (tcg_top_loc checked_mappers_tc) $
+                        setGblEnv checked_mappers_tc $
+                          publishCheckedSourceClosures (mg_binds guts) (mg_binds opt_guts) exported_types
+                    pure $ case closures of
+                      Just (ids, families) | not (null ids) ->
+                        checked_mappers_tc
+                          { tcg_type_env = tcg_type_env checked_mappers_tc `plusTypeEnv`
+                                           typeEnvFromEntities ids families [] []
+                          , tcg_tcs = tcg_tcs checked_mappers_tc ++ families }
+                      _ -> checked_mappers_tc
+                  _ -> pure checked_mappers_tc
           _ -> do
             when has_early_lookups $
               checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result False
