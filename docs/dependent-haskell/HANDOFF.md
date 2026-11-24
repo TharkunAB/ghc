@@ -17,7 +17,14 @@ All compiler syntax, typechecking, promotion, and ergonomics work on this fork f
 
 ## Current checkpoint
 
-Wave 1 consolidated compiler `186670b0b9` passed full two-stage self-hosted qualification on 24 November 2026, while Wave 2 (`9a27c55688`), Wave 3, and the Proposal `#378` alignment audit are actively running. Revision `186670b0b9` (atop `69a36b132f`) integrates four verified compiler tracks and adds Showcase observations 624–627:
+Wave 2, Wave 3, and Proposal `#378` Track A are consolidated on top of the self-hosted Wave 1 compiler (`186670b0b9`), expanding the Showcase to 635 observations and 63 registered tests:
+
+- **Proposal `#378` `-XDependentTypes` bundle & telescopes (Wave 4 Track A)**: Adds single-pragma `-XDependentTypes` (enabling the core dependent-types extension bundle and setting `NoListTuplePuns`), `-XExistentialTypes` (`#473`), `-XExtendedLet` (`#523`), default-on `-fwrite-source-equations` (overridable via `-fno-write-source-equations`), shared-type binder groups `(m n :: Nat)` across `foreach`/`∏`/`forall`/`exists`/`some`, Unicode `∏` (`U+220F`), braced `{k :: a}` specificity in invisible `foreach .`, multi-binder `exists`/`some`, and `foreach`/`exists`/`some` in `infixexp2`. See the [Proposal `#378` conformance audit](PROPOSAL-378.md).
+- **Wave 3 Track A (`%U` type-lambda captures & same-module closure staging)**: Supports capturing unmatchable `%U ->` predicate variables inside inline type lambdas (`LeibnizU` symmetry) and stages same-module two-index GADT traversals (`plug`) and De Bruijn closures (`substSingle`, `substDouble`, `substSingleU`) during `tcRnModule` without module splits.
+- **Wave 3 Track B (inline GADT `foreach` args, retained-call polymorphism, `Type` large eliminations & `HaskLib`)**: Admits inline indexed GADT constructors (`CHole :: UCtx Zero Zero`) as `foreach` arguments, avoids untouchable outer unification variables under retained calls (`lamCong (comp c eq)`), promotes structural `Val -> Type` functions into closed type families, and exports `foldr` and `Matchability(..)` from `HaskLib`.
+- **Wave 2 soundness & ergonomics (`bce571b213`)**: Supports indexed GADT domains in `foreach` constructor fields and `Sigma` pairs, local `let`/`where` function composition aliases, fresh `-fno-code` closure providers with `.hi` stripped-rule-head persistence (`ghc.source-rule-heads.v1`), `-O2` Final-Core `[x]` list-reverse verification, and explicit `@Matchable`/`@Unmatchable` mismatch diagnostics.
+
+Wave 1 consolidated compiler `186670b0b9` previously passed full two-stage self-hosted qualification on 24 November 2026 (Showcase observations 624–627):
 
 - **R16 simultaneous substitution (`c942ad30b5`)**: Accepts `-O2` FloatOut lifted constructor helpers (`exts1`) without relaxing source helper checks, and publishes open `T:subst` alongside `T:exts` and `T:weakenLookup`, checking all 20 constructors of PLFH `Bisimulation.simSubst` with ordinary functions.
 - **R21 same-module indexed lookup (`75eea40500`)**: Stages `lookupEnv` for same-module mutual GADT variable rules in either declaration or clause order, enforcing exported constructor/owner visibility (`[GHC-70566]`), unused-table pruning across TH splices, and strict early-vs-final Core agreement (`R13_LookupEnvOpenEq.hs`).
@@ -163,11 +170,11 @@ Job 2996 matched the 113 book observations at native `-O0`, default
 
 ## Next compiler work
 
-1. **Wave 2 Carbon consolidation & two-stage promotion (`9a27c55688`)**: Complete Carbon review, Showcase observations 628–631, and two-stage promotion to `_build/current` for indexed GADT `foreach` constructor fields & vanilla-return `Sigma` operands (`R04_IndexedForEachCtorField.hs`), `let`/`where` composed function aliases (`R04_ComposedIsoFields.hs`), fresh `-fno-code` closure providers with `.hi` `sourceRuleHeadsField` persistence, and `-O2` Final-Core explicit-list verification (`R13_RevOpenEq.hs`) + matchability mismatch printing (`R16_AbstractRenamingInType.hs`).
-2. **Wave 3 Carbon tracks (in flight)**:
-   - Track A: R17 `%U` type-lambda capture (`R17_TypeLambdaCaptureUnmatchable.hs`) and R21/R13 same-module `plug` & `substSingle` staging (`R13_SameModulePlugOpenEq.hs`, `R21_SameModuleSubstSingleOpenEq.hs`).
-   - Track B: R03 inline GADT constructor `foreach` arguments (`R03_InlineGadtCtorForEachArg.hs`), R03 retained-call untouchable polymorphism (`R03_UntouchableRetainedCallPoly.hs`), and R06/R13 term-to-`Type` large elimination (`R13_LargeElimTermToType.hs`) + `HaskLib` `foldr` / `Matchability(..)` exports, followed by Batch 37 follow-ups (`R04_ExistentialGadtRetainedArg.hs`, `R05_NestedFinForEachCoreLint.hs`).
-3. **Wave 4 — GHC Proposal #378 Deep Alignment (prep in flight)**: Audit all differences between GHC Proposal `#378` and the fork's current syntax/semantics/pragmas, prioritizing already-implemented fork features that diverge from `#378`, followed by remaining `#378` features, delegated GHC proposals, Serokell roadmap cards, and Agda-inspired ergonomics.
+1. **Wave 2 + Wave 3 + Wave 4A two-stage promotion**: Complete self-hosted two-stage qualification (`63/63` registered tests, `635/635` Showcase observations, `234/234` compatibility, `137/138` focused, and `PLFH` native + `no-code` checks) and promote to `_build/current`.
+2. **Proposal `#378` Priority 1 follow-up tracks ([`PROPOSAL-378.md`](PROPOSAL-378.md))**:
+   - Canonical `@arg` / `@pat` overrides for invisible `foreach .` binders alongside `@{expr}` (`#378` §4.8, §4.13).
+   - Unannotated `foreach a ->` / `foreach a.` domain inference and wildcard `foreach (_ :: t) ->` binders (`#378` §4.4, §4.11).
+   - Phase-preserving `foreach (a :: Type) ->` binding (`ex5 a = the a undefined`) and unadorned type arguments (`#378` §4.7, §4.9), existential GADT constructor arguments (`R04_ExistentialGadtRetainedArg.hs`), and `-O2` `base` list-fusion rule compatibility (`R03_FunctionColumnSplit.hs`, `R13_ShuntAccumOpenEq.hs`).
 
 [Batch 37 status ledger and open reports](https://github.com/Tritlo/PLFH/blob/8756aed/content/Status.md)
 

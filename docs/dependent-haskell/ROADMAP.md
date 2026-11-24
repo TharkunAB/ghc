@@ -9,6 +9,8 @@ Every design, syntax, promotion, and typechecking decision on this fork follows 
 3. **Serokell Dependent Haskell roadmap** ([ghc.serokell.io/dh](https://ghc.serokell.io/dh)) for scope tracking and prerequisite structure.
 4. **Agda** (and *Programming Language Foundations in Agda*) for inspiration where GHC proposals do not specify a choice.
 
+The [Proposal `#378` conformance audit](PROPOSAL-378.md) maps every section of `#378` and its sister proposals (`#102`, `#242`, `#281`, `#370`, `#402`, `#425`, `#473`, `#475`, `#509`, `#523`, `#581`, `#765`) against the fork's implementation, starting with the `-XDependentTypes` umbrella extension, shared-type quantifier telescopes, Unicode `∏`, and default source-equation publication.
+
 Serokell’s roadmap has 50 cards and 67 edges. Its 2026-11-12 snapshot marks
 23 cards complete and seven proposals accepted. Twenty cards have no status
 marker. On 2026-11-22, all 50 live card IDs and status labels still
