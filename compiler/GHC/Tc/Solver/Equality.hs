@@ -1488,9 +1488,10 @@ can_eq_app :: CtEvidence       -- :: s1 t1 ~N s2 t2
 can_eq_app ev s1 t1 s2 t2
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev
   = if (m1 && m2) || s1 `tcEqType` s2 then wanted_congruence dest
-    else do { open1 <- still_open s1
-            ; open2 <- still_open s2
-            ; if (m1 || open1) && (m2 || open2)
+    else do { flex1 <- flex_head s1
+            ; flex2 <- flex_head s2
+            ; compat <- compatible_arrows
+            ; if (flex1 || flex2) && compat
               then do { deferred <- deferOpenAppEq ev
                       ; if deferred then stopWith ev "Deferred open application equality"
                                     else wanted_congruence dest }
@@ -1514,16 +1515,36 @@ can_eq_app ev s1 t1 s2 t2
   = finishCanWithIrred IrredShapeReason ev
 
   where
-    still_open fun
+    flex_head fun
       | (head_ty, _) <- tcSplitAppTys fun
       , Just f <- getTyVar_maybe head_ty
       , isTcTyVar f, isMetaTyVar f
-      , Just (ma, _, _) <- tcSplitFunTy_maybe (typeKind fun)
+      = isUnfilledMetaTyVar f
+      | otherwise = return False
+
+    arrow_matchability kind = case tcSplitFunTy_maybe kind of
+      Just (ma, _, _) -> Just ma
+      Nothing
+        | ForAllTy ma _ _ <- coreFullView kind -> Just ma
+        | otherwise -> Nothing
+
+    open_matchability kind
+      | Just k <- getTyVar_maybe (coreFullView kind)
+      , isTcTyVar k, isMetaTyVar k
+      = isUnfilledMetaTyVar k
+      | Just ma <- arrow_matchability kind
       , Just m <- getTyVar_maybe ma
       , isTcTyVar m, isMetaTyVar m
-      = do { open <- isUnfilledMetaTyVar f
-           ; if open then isUnfilledMetaTyVar m else return False }
+      = isUnfilledMetaTyVar m
       | otherwise = return False
+
+    compatible_arrows = do
+      open_m1 <- open_matchability s1k
+      open_m2 <- open_matchability s2k
+      case (arrow_matchability s1k, arrow_matchability s2k) of
+        (Just ma1, Just ma2) ->
+          return (open_m1 || open_m2 || ma1 `tcEqType` ma2)
+        _ -> return (open_m1 || open_m2)
 
     wanted_congruence dest = do { traceTcS "can_eq_app" (vcat [ text "s1:" <+> ppr s1, text "t1:" <+> ppr t1
                                      , text "s2:" <+> ppr s2, text "t2:" <+> ppr t2
@@ -2230,15 +2251,16 @@ f Bool ~ Maybe Bool with f :: Type %U -> Type can later reduce to reflexivity
 when another equality fixes f to a partial family. Decomposition would
 already have committed to the unsatisfiable equality f ~ Maybe.
 
-With an open head and open matchability, process independent receiver
-equalities and dictionaries first. Use deferOpenAppEq after rewriting
-so that the same rule applies when an equation exposes the application.
-If the head and matchability are still open, the Wanted may choose that
-head by ordinary forward congruence. For a partial application, check the
-arrow consumed by this application and the head of its spine. This is
-a choice for a metavariable. Known U heads still require rewriting or an
-independent equality. Structural comparison of arrow types through
-SelFun is valid at U.
+With an open metavariable head and compatible consumed arrow matchabilities,
+process independent receiver equalities and dictionaries first. Use
+deferOpenAppEq after rewriting so that the same rule applies when an equation
+exposes the application. If a head is still an unfilled metavariable and the
+consumed arrow matchabilities remain compatible (either still open or already
+equal, including both U), the Wanted may choose that head by ordinary forward
+congruence (rule CO_APP). Two rigid/known non-equal U heads still require
+rewriting or an independent equality, and an unfilled U head will not commit
+to a fixed M head while receiver constraints may still supply a partial family.
+Structural comparison of arrow types through SelFun is valid at U.
 
 In the first of these, why do we need Nominal equality in (t1 ~N t2)?
 See (APT3) below.
