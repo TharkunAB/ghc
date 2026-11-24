@@ -169,6 +169,9 @@ test('NativeOpenInstalledReverse',
 test('NativeLocalListAccumulator',
      [req_host_target_ghc, only_ways(['normal']), extra_files(['NativeLocalListAccumulator.hs'])],
      run_command, ['bash NativeLocalListAccumulator.sh "{compiler}" "{libdir}"'])
+test('NativeRevExplicitListO2',
+     [req_host_target_ghc, only_ways(['normal'])],
+     run_command, ['bash NativeRevExplicitListO2.sh "{compiler}" "{libdir}"'])
 
 test('NativeOpenIndexedAppend',
      [req_interp, req_rts_linker, only_ways(['normal']),

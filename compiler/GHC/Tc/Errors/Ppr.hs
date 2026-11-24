@@ -5036,7 +5036,7 @@ mismatchInvisibleBits (CouldNotDeduce { cnd_ea = mb_ea })
   = case mb_ea of
       Nothing -> Set.empty
       Just (CND_ExpectedActual _ ty1 ty2) ->
-        mayLookIdentical ty1 ty2
+        mayLookIdentical ty1 ty2 S.<> matchabilityBits ty1 ty2
 
 -- | Recover the source declaration that owns a private lifted family.
 liftedTypeOwner :: String -> Name -> Maybe String
@@ -5543,17 +5543,54 @@ shouldPprWithInvisibleBits ty1 ty2
         -- See tests T9171, T9144.
 
       , mayLookIdentical ty1 ty2
-      , Set.fromList [TypeCompare.InvisibleMatchability | isMatchabilityMismatch ty1 ty2]
+      , matchabilityBits ty1 ty2
+      , matchabilityBits exp act
       ]
 shouldPprWithInvisibleBits ty1 ty2
   eq@(KindEqOrigin act exp orig _)
   = mconcat
       [ maybe Set.empty Set.singleton $ invisibleOrigin_maybe eq
       , mayLookIdentical act exp
+      , matchabilityBits act exp
       , shouldPprWithInvisibleBits ty1 ty2 orig
       ]
 shouldPprWithInvisibleBits ty1 ty2 _ct
-  = mayLookIdentical ty1 ty2
+  = mayLookIdentical ty1 ty2 S.<> matchabilityBits ty1 ty2
+
+matchabilityBits :: Type -> Type -> Set InvisibleBit
+matchabilityBits ty1 ty2 =
+  Set.fromList [TypeCompare.InvisibleMatchability | hasMatchabilityMismatch ty1 ty2]
+
+-- | Check whether both sides have kind Matchability or differ in forall/arrow matchability.
+hasMatchabilityMismatch :: Type -> Type -> Bool
+hasMatchabilityMismatch ty1 ty2 =
+    isMatchabilityMismatch ty1 ty2 || go ty1 ty2
+  where
+    go a b | Just a' <- coreView a = go a' b
+    go a b | Just b' <- coreView b = go a b'
+    go (CastTy a _) b = go a b
+    go a (CastTy b _) = go a b
+    go (ForAllTy ma1 (Bndr tv1 vis1) body1) (ForAllTy ma2 (Bndr tv2 vis2) body2)
+      | vis1 `eqForAllVis` vis2
+      = not (ma1 `tcEqType` ma2) || go (tyVarKind tv1) (tyVarKind tv2) || go body1 body2
+    go (FunTy _ ma1 _ arg1 res1) (FunTy _ ma2 _ arg2 res2)
+      = not (ma1 `tcEqType` ma2) || go arg1 arg2 || go res1 res2
+    go (DepFunTy vis1 v1 body1) (DepFunTy vis2 v2 body2)
+      | vis1 == vis2
+      = go (varType v1) (varType v2) || go body1 body2
+    go (ExistsTy flag1 v1 body1) (ExistsTy flag2 v2 body2)
+      | flag1 == flag2
+      = go (varType v1) (varType v2) || go body1 body2
+    go (TyConApp tc1 args1) (TyConApp tc2 args2)
+      | tc1 == tc2, not (isForgetfulSynTyCon tc1)
+      = any (uncurry go) (zip args1 args2)
+    go (AppTy s1 a1) b
+      | Just (s2, a2) <- tcSplitAppTyNoView_maybe b
+      = go s1 s2 || go a1 a2
+    go a (AppTy s2 a2)
+      | Just (s1, a1) <- tcSplitAppTyNoView_maybe a
+      = go s1 s2 || go a1 a2
+    go _ _ = False
 
 -- | Check whether both sides of the mismatch have kind Matchability.
 isMatchabilityMismatch :: Type -> Type -> Bool

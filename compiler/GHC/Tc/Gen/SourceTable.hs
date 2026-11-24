@@ -45,7 +45,7 @@ import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.FVs (tyConsOfTypes)
-import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TermVarTy, CastTy))
+import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TyVarTy, TermVarTy, CastTy))
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Utils (dataConRepInstPat, exprType, findAlt, mergeAlts, stripTicksE, stripTicksTopE)
@@ -88,7 +88,7 @@ import GHC.Types.Id (globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo
                      setIdExported, setSourceMethodIds, sourceMethodAliases, sourceMethodTarget_maybe,
                      sourceMethodDFunClass)
 import GHC.Types.InlinePragma (ActivationX(ActiveAfter, ActiveBefore), PhaseNum,
-                               isNeverActive, isOpaquePragma)
+                               isDefaultInlinePragma, isNeverActive, isOpaquePragma)
 import GHC.Types.Name (Name, OccName, isExternalName, mkSourceTableOcc, mkSourceFstOcc, mkSourceSndOcc, mkInstTyCoOcc, mkTcOcc,
                        isFieldOcc, isVarOcc, mkTyVarOcc, mkVarOcc, nameModule_maybe, nameOccName, nameSrcSpan, occNameString, setOccNameSpace, sourceTableTermOcc, stableNameCmp, nameStableString, tvName, SourceProofRule, SourceProofArgs, SourceProofArg(..))
 import GHC.Core.Opt.Pipeline (pairObservationOcc, pairObservationType, scalarRecipeTableOcc)
@@ -164,7 +164,12 @@ tcLookupSourceTableIdAt first actual = do
         case dependencies of
           Nothing -> return Nothing
           Just callees -> do
-            recordSourceUses ((fun, first) : [(v, Nothing) | v <- callees])
+            build_use <- if finalCoreMapperOwner fun && isFinalSourceListTable table
+              then do
+                build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
+                fmap (\b -> [(b, Nothing)]) <$> tcLookupIdMaybe build_name
+              else pure Nothing
+            recordSourceUses ((fun, first) : [(v, Nothing) | v <- callees] ++ fromMaybe [] build_use)
             forM_ (fun : callees) $ \owner ->
               when (nameModule_maybe (idName owner) == Just (tcg_semantic_mod env)) $
                 keepAlive (idName owner)
@@ -2023,26 +2028,51 @@ sourceTableTyCons :: Bool -> LHsBinds GhcTc -> TcM [(Id, TyCon)]
 sourceTableTyCons local binds = do
     strict <- xoptM LangExt.Strict
     rules <- goptM Opt_EnableRewriteRules
+    dflags <- getDynFlags
+    env <- getGblEnv
+    let generates_code = backendGeneratesCode (backend dflags)
+    (visible_rules, local_rules, build_clean) <- if rules && generates_code
+      then do
+        visible <- visibleSourceMethodRules env
+        let local_r = sourceRuleOwners (tcg_rules env)
+        build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
+        mb_build <- tcLookupIdMaybe build_name
+        let ok = not (build_name `elemNameSet` local_r) &&
+                 maybe True (not . hasSourceMethodRule visible) mb_build
+        pure (Just visible, local_r, ok)
+      else pure (Nothing, emptyNameSet, False)
     structural <- if local && not strict
                   then fmap catMaybes $ forM binds $ \bind ->
                     runMaybeT (localStructuralTable (unLoc bind) <|> localListReverseTable bind)
                   else pure []
-    let candidates = mapMaybe (sourceRows (not rules) . unLoc) binds
-        candidate_names = mkNameSet [idName f | (f, _, _, _, _) <- candidates]
-    collect strict candidate_names structural candidates
+    let read_candidate bind = case sourceRows False bind of
+          Just row -> Just (row, False)
+          Nothing
+            | rules, generates_code, build_clean
+            , Just row@(fun, _, _, _, _) <- sourceRows True bind
+            , isDefaultInlinePragma (idInlinePragma fun)
+            , not (idName fun `elemNameSet` local_rules)
+            , maybe True (\vis -> not (hasSourceMethodRule vis fun)) visible_rules
+            -> Just (row, True)
+            | otherwise -> Nothing
+        candidates = if not rules
+          then map ((, False)) (mapMaybe (sourceRows True . unLoc) binds)
+          else mapMaybe (read_candidate . unLoc) binds
+        candidate_names = mkNameSet [idName f | ((f, _, _, _, _), _) <- candidates]
+    collect env strict visible_rules local_rules candidate_names structural candidates
   where
     local_names = extendNameSetList emptyNameSet $
       concatMap (map idName . collectHsBindBinders CollNoDictBinders . unLoc) binds
 
-    collect strict candidate_names checked pending = do
+    collect env strict visible_rules local_rules candidate_names checked pending = do
       let available = extendNameSetList emptyNameSet (map (idName . fst) checked)
-          ready (_, _, _, _, rows) = all (\f -> not (idName f `elemNameSet` candidate_names)
-                                               || idName f `elemNameSet` available)
-                                    (concatMap rowCalls rows)
+          ready ((_, _, _, _, rows), _) = all (\f -> not (idName f `elemNameSet` candidate_names)
+                                                   || idName f `elemNameSet` available)
+                                            (concatMap rowCalls rows)
           (next, later) = partition ready pending
       if null next then pure checked else do
-        tables <- catMaybes <$> traverse (certify strict checked) next
-        collect strict candidate_names (checked ++ tables) later
+        tables <- catMaybes <$> traverse (certify env strict visible_rules local_rules checked) next
+        collect env strict visible_rules local_rules candidate_names (checked ++ tables) later
 
     rowCalls (SourceRow _ _ _ _ _ rhs) = sourceCalls rhs
 
@@ -2065,16 +2095,32 @@ sourceTableTyCons local binds = do
         guard (ty `eqType` tyConKind fam)
         pure (fam, binderVars binders, args, result)
 
-    certify strict checked (fun, order, body_tvs, evidence, rows) = do
+    callee_clean visible_rules local_rules callee =
+      not (idName callee `elemNameSet` local_rules) &&
+      not (maybe False (`hasSourceMethodRule` callee) visible_rules) &&
+      (not (finalCoreMapperOwner callee) ||
+       maybe True (\vis -> isNothing (finalCoreRuleConflict vis local_rules callee)) visible_rules)
+
+    certify env strict visible_rules local_rules checked ((fun, order, body_tvs, evidence, rows), needs_final) = do
       clean <- allM emptyEvidence evidence
-      if clean then do
+      let callees = concatMap rowCalls rows
+          callees_ok = not needs_final || all (callee_clean visible_rules local_rules) callees
+      if clean && callees_ok then do
         ty <- liftZonkM (zonkTcType (varType fun))
         case checkedDomains strict order body_tvs ty rows of
           Nothing -> pure Nothing
           Just (input, carried, result) -> do
             branches <- traverse (sourceBranch (lookupCall checked) order input carried result) rows
-            traverse (fmap (setIdType fun ty,) . makeFamily (varName fun) order input carried result)
-                     (sequence branches)
+            case sequence branches of
+              Nothing -> pure Nothing
+              Just branch_builders -> do
+                table <- case if not local then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
+                  Just existing | needs_final -> pure existing
+                  _ -> makeFamily (varName fun) order input carried result branch_builders
+                let owner = if needs_final
+                      then setIdDetails (setIdType fun ty) (SourceTableId (idName fun) table FinalCoreSourceTable)
+                      else setIdType fun ty
+                pure (Just (owner, table))
       else pure Nothing
 
 -- | Publish checked case and pair equations, with their private field families.
@@ -2124,7 +2170,8 @@ sourceCaseTables nominal_owners binds = do
         isJust (partialConstructorCaseType (varType owner))
       final_candidate owner = isJust (list_case_position owner) || indexed_candidate owner ||
                               structural_candidate owner || partial_case_candidate owner
-      binary_list_candidate owner = list_case_position owner == Just 0
+      binary_list_candidate owner =
+        not (idName owner `elemNameSet` nominal_owners) && list_case_position owner == Just 0
       fold_candidate owner = (generates_code || no_code_structural) &&
                              isJust (listFoldType (varType owner))
       zip_candidate owner = generates_code && isJust (listZipWithType (varType owner))
@@ -4669,11 +4716,57 @@ isFinalCoreCaseTable table =
     isFinalCoreListCaseTable table || isTwoStructuralCaseTable table ||
     isPartialConstructorCaseTable table || isJust (booleanSelector table)
 
-isFinalCoreListCaseTable :: TyCon -> Bool
-isFinalCoreListCaseTable table =
+isFinalCoreListCaseTableBase :: TyCon -> Bool
+isFinalCoreListCaseTableBase table =
     isListFoldTable table || isListZipWithTable table ||
     isReverseWorkerTable table || isJust (reverseWrapperWorker table) ||
     isTwoListCaseTable table || isSizeListCaseTable table
+
+isFinalCoreListCaseTable :: TyCon -> Bool
+isFinalCoreListCaseTable table =
+    isFinalCoreListCaseTableBase table || isFinalSourceListTable table
+
+-- | Identify a nominal list-constructing source table certified under -O2 rules.
+isFinalSourceListTable :: TyCon -> Bool
+isFinalSourceListTable table = isJust $ do
+    _ <- sourceTableTermOcc (nameOccName (tyConName table))
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    guard (coAxiomRole axiom == Nominal)
+    guard (not (isFinalCoreListCaseTableBase table ||
+                isTwoStructuralCaseTable table ||
+                isPartialConstructorCaseTable table ||
+                isJust (booleanSelector table) ||
+                isSourceFilterGuard table))
+    guard (not (hasArrowDomain (tyConKind table)))
+    let branches = fromBranches (coAxiomBranches axiom)
+    guard (lengthAtLeast branches 2 && not (isAppendBranches table branches))
+    guard (any branchConstructsList branches)
+  where
+    hasArrowDomain ty =
+      let (_, body) = splitForAllForAllTyBinders ty
+      in go body
+      where
+        go t | Just (dom, rest) <- caseArrow t = isJust (caseArrow dom) || go rest
+             | otherwise = False
+
+    isAppendBranches fam [b1, b2]
+      | Just (_, TyVarTy v1) <- unsnoc (coAxBranchLHS b1)
+      , coAxBranchRHS b1 `eqType` mkTyVarTy v1
+      , lengthIs (coAxBranchLHS b2) (tyConArity fam)
+      = let rhs2 = coAxBranchRHS b2
+        in case splitTyConApp_maybe rhs2 of
+             Just (c, [_, _, tail_ty])
+               | c == promoteDataCon consDataCon
+               , Just (rec_fam, _) <- splitTyConApp_maybe tail_ty
+               -> rec_fam == fam
+             _ -> False
+    isAppendBranches _ _ = False
+
+    branchConstructsList branch =
+      let tcs = tyConsOfTypes [coAxBranchRHS branch]
+          cons_tc = promoteDataCon consDataCon
+          nil_tc = promoteDataCon nilDataCon
+      in any (\tc -> tc == cons_tc || tc == nil_tc) (nonDetEltsUniqSet tcs)
 
 -- | Recheck provisional list tables even when simplification dropped the owner's IdDetails.
 -- The original owner identifies tables that already have nominal authority.
@@ -4686,8 +4779,7 @@ failedFinalListTables original binds tables =
   where
     early = extendNameSetList emptyNameSet
       [tyConName table | (owner, _) <- Core.flattenBinds original
-                       , SourceTableId _ table NominalSourceTable <- [idDetails owner]
-                       , isReverseWorkerTable table]
+                       , SourceTableId _ table NominalSourceTable <- [idDetails owner]]
     bindings = Core.flattenBinds binds
 
 -- | Check the same final owner and any exact call from a reverse wrapper.
@@ -4700,17 +4792,15 @@ checkedFinalCaseTable bindings table = isJust $ do
         (_, _, _, callee) <- directListReverseWrapper owner rhs
         guard (owns worker callee)
         worker_rhs <- lookup callee bindings
-        directListReverseWorker callee worker_rhs
-      Nothing | isListFoldTable table -> directListFold owner rhs
+        () <$ directListReverseWorker callee worker_rhs
+      Nothing | isListFoldTable table -> () <$ directListFold owner rhs
               | isListZipWithTable table -> do
                   (signature, rows) <- checkedListZip (const True) owner rhs
                   guard (matchesConstructorCase table signature rows)
-                  pure (signature, rows)
               | isTwoListCaseTable table -> do
                   let check specialized = do
                         (signature, rows) <- checkedTwoListCaseWith specialized (const True) owner rhs
                         guard (matchesConstructorCase table signature rows)
-                        pure (signature, rows)
                   check Nothing <|> do
                     worker <- checkedSpecConstrWorker bindings table owner
                     check (Just worker)
@@ -4720,22 +4810,144 @@ checkedFinalCaseTable bindings table = isJust $ do
                   in do
                     (signature, rows) <- checkedBooleanConstructorCase (const True) predicate owner rhs
                     guard (matchesConstructorCase table signature (selectConstructorRows select rows))
-                    pure (signature, rows)
               | isTwoStructuralCaseTable table || isSizeListCaseTable table -> do
                   (signature, rows) <- checkedStructuralCase (const True) owner rhs
                   guard (matchesConstructorCase table signature rows)
-                  pure (signature, rows)
               | isPartialConstructorCaseTable table -> do
                   (signature, rows) <- checkedPartialConstructorCase (const True) owner rhs
                   guard (matchesConstructorCase table signature rows)
-                  pure (signature, rows)
-              | otherwise -> directListReverseWorker owner rhs
+              | isFinalSourceListTable table ->
+                  guard (matchesFinalSourceTable bindings table owner rhs)
+              | otherwise -> () <$ directListReverseWorker owner rhs
   where
     owns family value =
       let family_name = tyConName family
           owner_name = idName value
       in nameModule_maybe owner_name == nameModule_maybe family_name &&
          sourceTableTermOcc (nameOccName family_name) == Just (nameOccName owner_name)
+
+-- | Verify on post-simplifier Core that build was inlined to literal constructors
+-- matching the certified closed-family branches of the source table.
+matchesFinalSourceTable :: [(Id, Core.CoreExpr)] -> TyCon -> Id -> Core.CoreExpr -> Bool
+matchesFinalSourceTable bindings table owner rhs = isJust $ do
+    guard (exprType rhs `eqType` varType owner && varType owner `eqType` tyConKind table)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    let branches = fromBranches (coAxiomBranches axiom)
+        (invisible_bndrs, visible_bndrs) = span isInvisibleTyConBinder (tyConBinders table)
+        n_tvs = length invisible_bndrs
+        n_vals = length visible_bndrs
+        (core_bndrs, core_body0) = Core.collectBinders (stripTicksE isSourceBreakpoint rhs)
+        (core_tvs, core_vals) = splitAt n_tvs core_bndrs
+    guard (lengthIs core_tvs n_tvs && all isTyVar core_tvs &&
+           lengthIs core_vals n_vals && all isId core_vals)
+    let fam_tyvars = map binderVar invisible_bndrs
+        fam_subst = zipTvSubst fam_tyvars (mkTyVarTys core_tvs)
+    guard (eqTypes (map varType core_tvs) (map (substTy fam_subst . varType) fam_tyvars))
+    guard (eqTypes (map varType core_vals) (map (substTy fam_subst . varType . binderVar) visible_bndrs))
+    (let_env, core_body) <- pure (peelCoreAliases [] core_body0)
+    Core.Case (Core.Var scrut) case_bndr case_res alts <- pure (stripTicksE isSourceBreakpoint core_body)
+    let res_expected = substTy fam_subst (tyConResKind table)
+    guard (case_res `eqType` res_expected)
+    branch0 : _ <- pure branches
+    let (_, pat_tys0) = splitAt n_tvs (coAxBranchLHS branch0)
+    scrut_pos <- findIndex (isJust . promotedPat) pat_tys0
+    let scrut_arg = core_vals !! scrut_pos
+        carried_vals = [v | (i, v) <- zip [0..] core_vals, i /= scrut_pos]
+    guard (resolveCaseAlias let_env scrut == scrut_arg)
+    (scrut_dc0, _) <- promotedPat (pat_tys0 !! scrut_pos)
+    let scrut_tc = dataConTyCon scrut_dc0
+        alt_dcs = [dc | Core.Alt (Core.DataAlt dc) _ _ <- alts]
+    guard (lengthIs alts (length alt_dcs) && completeCase scrut_tc alt_dcs)
+    forM_ branches $ \branch -> do
+      let (fam_args, pat_tys) = splitAt n_tvs (coAxBranchLHS branch)
+      quantified <- traverse getTyVar_maybe fam_args
+      (dc, pat_args) <- promotedPat (pat_tys !! scrut_pos)
+      guard (dataConTyCon dc == scrut_tc)
+      let field_pats = drop (length (dataConUnivTyVars dc)) pat_args
+          carried_pats = [p | (i, p) <- zip [0..] pat_tys, i /= scrut_pos]
+      field_tvs <- traverse getTyVar_maybe field_pats
+      carried_tvs <- traverse getTyVar_maybe carried_pats
+      Core.Alt _ fields alt_rhs <- find (altFor dc) alts
+      guard (all isId fields && equalLength fields field_tvs && equalLength carried_vals carried_tvs)
+      let br_subst = zipTvSubst quantified (mkTyVarTys core_tvs)
+      guard (eqTypes (map varType fields) (map (substTy br_subst . varType) field_tvs))
+      guard (eqTypes (map varType carried_vals) (map (substTy br_subst . varType) carried_tvs))
+      let var_map = zip field_tvs fields ++ zip carried_tvs carried_vals
+          aliases = (case_bndr, scrut_arg) : let_env
+      guard (matchBranch [] aliases [] br_subst var_map (coAxBranchRHS branch) alt_rhs)
+  where
+    promotedPat ty = do
+      (tc, args) <- splitTyConApp_maybe ty
+      dc <- isPromotedDataCon_maybe tc
+      pure (dc, args)
+
+    altFor dc (Core.Alt (Core.DataAlt actual) _ _) = dc == actual
+    altFor _ _ = False
+
+    peelCoreAliases env (Core.Let (Core.NonRec b (Core.Var target)) rest)
+      | isId b, isId target = peelCoreAliases ((b, resolveCaseAlias env target) : env) (stripTicksE isSourceBreakpoint rest)
+    peelCoreAliases env expr = (env, expr)
+
+    matchBranch seen aliases let_env br_subst var_map expected_ty expr0 =
+      case stripTicksE isSourceBreakpoint expr0 of
+        Core.Let (Core.NonRec b bound) rest
+          | isId b, not (isUnliftedType (varType b)), not (isJoinId b)
+          -> matchBranch seen aliases ((b, bound) : let_env) br_subst var_map expected_ty rest
+        expr -> case expected_ty of
+          TyVarTy tv -> case lookup tv var_map of
+            Just target -> case expr of
+              Core.Var v -> resolveCaseAlias aliases v == target ||
+                (v `notElem` seen && maybe False (matchBranch (v : seen) aliases let_env br_subst var_map expected_ty) (lookup v let_env))
+              _ -> False
+            Nothing -> False
+          TyConApp tc args
+            | Just dc <- isPromotedDataCon_maybe tc ->
+                case expr of
+                  Core.Var v
+                    | isNothing (isDataConWorkId_maybe v)
+                    , v `notElem` seen
+                    , Just bound <- lookup v let_env <|> lookup v bindings
+                    -> matchBranch (v : seen) aliases let_env br_subst var_map expected_ty bound
+                  _ -> case Core.collectArgs expr of
+                    (Core.Var work, core_args)
+                      | isDataConWorkId_maybe work == Just dc ->
+                          let n_univ = length (dataConUnivTyVars dc)
+                              (ty_args, val_args) = splitAt n_univ core_args
+                              (exp_tys, exp_vals) = splitAt n_univ args
+                          in matchTypes br_subst exp_tys ty_args &&
+                             equalLength exp_vals val_args &&
+                             and (zipWith (matchBranch seen aliases let_env br_subst var_map) exp_vals val_args)
+                    _ -> False
+            | tc == table ->
+                case Core.collectArgs expr of
+                  (Core.Var fn, core_args)
+                    | fn == owner ->
+                        let n_inv = helperInvisibleArity table
+                            (ty_args, val_args) = splitAt n_inv core_args
+                            (exp_tys, exp_vals) = splitAt n_inv args
+                        in matchTypes br_subst exp_tys ty_args &&
+                           equalLength exp_vals val_args &&
+                           and (zipWith (matchBranch seen aliases let_env br_subst var_map) exp_vals val_args)
+                  _ -> False
+            | isJust (sourceTableTermOcc (nameOccName (tyConName tc))) ->
+                case Core.collectArgs expr of
+                  (Core.Var fn, core_args)
+                    | Just callee_fam <- sourceTableId_maybe fn
+                    , tyConName callee_fam == tyConName tc ->
+                        let n_inv = helperInvisibleArity tc
+                            (ty_args, val_args) = splitAt n_inv core_args
+                            (exp_tys, exp_vals) = splitAt n_inv args
+                        in matchTypes br_subst exp_tys ty_args &&
+                           equalLength exp_vals val_args &&
+                           and (zipWith (matchBranch seen aliases let_env br_subst var_map) exp_vals val_args)
+                  _ -> False
+          _ -> False
+
+    matchTypes br_subst exp_tys core_args =
+      let tys = [t | Core.Type t <- core_args]
+      in equalLength core_args tys &&
+         equalLength exp_tys tys &&
+         eqTypes (map (substTy br_subst) exp_tys) tys
 
 -- | Check a left-first case tree on two ordinary lists.
 checkedTwoListCase :: (TyCon -> Bool) -> Id -> Core.CoreExpr
