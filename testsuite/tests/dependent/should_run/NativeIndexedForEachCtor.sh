@@ -16,7 +16,7 @@ for opt in O0 O2; do
     "${ghc[@]}" "-$opt" -c -fno-code NativeIndexedForEachCtor.hs
     "${ghc[@]}" "-$opt" -c NativeIndexedForEachCtor.hs
     "${ghc[@]}" "-$opt" NativeIndexedForEachCtor.o ../provider/NativeIndexedForEachCtorProvider.o -o run
-    test "$(./run)" = "(True,True,True,True,True,True,True,True,True)"
+    test "$(./run)" = "(True,True,True,True,True,True,True,True,True,True)"
 done
 
 mkdir -p "$out/neg"

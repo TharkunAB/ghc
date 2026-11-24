@@ -79,18 +79,24 @@ HS
     fi
 done
 
-# 2. Job-3208 negative controls: imported or local hijackBuild must withhold T:rev.
-for scope in imported local; do
+# 2. Job-3208 negative controls: imported (normal, -fomit-interface-pragmas, -fno-code)
+#    or local hijackBuild must withhold T:rev and block consumers with GHC-83605.
+for scope in imported imported-omit imported-nocode local; do
     mkdir -p "$work/hijack-$scope"
     cd "$work/hijack-$scope"
-    if [[ "$scope" == imported ]]; then
+    if [[ "$scope" != local ]]; then
         cat > Hijack.hs <<'HS'
 {-# LANGUAGE RankNTypes #-}
 module Hijack () where
 import GHC.Exts (build)
 {-# RULES "hijackBuild" forall (g :: forall b. (a -> b -> b) -> b -> b). build g = [] #-}
 HS
-        "${ghc[@]}" -O2 -c Hijack.hs
+        case "$scope" in
+            imported)        "${ghc[@]}" -O2 -c Hijack.hs ;;
+            imported-omit)   "${ghc[@]}" -O2 -fomit-interface-pragmas -c Hijack.hs ;;
+            imported-nocode) "${ghc[@]}" -O2 -fno-code -fwrite-interface -fomit-interface-pragmas -c Hijack.hs
+                             test ! -e Hijack.o ;;
+        esac
         cat > RevHijack.hs <<'HS'
 {-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
 module RevHijack (app, rev) where
@@ -102,6 +108,17 @@ rev :: [a] -> [a]
 rev []       = []
 rev (x : xs) = app (rev xs) [x]
 HS
+        cp "$work/-O2/provider/RevOps.hi" .
+        cat > ConsumerHijack.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module ConsumerHijack where
+import Data.Type.Equality ((:~:) (Refl))
+import Hijack ()
+import RevOps (rev)
+revNil :: forall a. rev ('[] :: [a]) :~: '[]
+revNil = Refl
+HS
+        reject 83605 -O2 -c ConsumerHijack.hs
     else
         cat > RevHijack.hs <<'HS'
 {-# LANGUAGE DataKinds, ExperimentalDependentTypes, RankNTypes #-}
@@ -131,7 +148,45 @@ revNil :: forall a. rev ('[] :: [a]) :~: '[]
 revNil = Refl
 HS
     reject 70565 -O2 -c UseHijack.hs
+    if [[ "$scope" != local ]]; then
+        cat > SameModuleHijack.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module SameModuleHijack (app, rev, badStep, falso) where
+import Data.Type.Equality ((:~:) (Refl))
+import Hijack ()
+app :: [a] -> [a] -> [a]
+app []       ys = ys
+app (x : xs) ys = x : app xs ys
+rev :: [a] -> [a]
+rev []       = []
+rev (x : xs) = app (rev xs) [x]
+badStep :: foreach (x :: a) -> foreach (xs :: [a]) -> rev (x ': xs) :~: app (rev xs) '[x]
+badStep _ _ = Refl
+falso :: rev '[ 'True ] :~: '[ 'True ]
+falso = Refl
+HS
+        reject '68947|70565' -O2 -c SameModuleHijack.hs
+    fi
 done
+
+# 2b. Retained provider module (compiled via core2coreRetained) also certifies FinalCoreSourceTable T:rev.
+mkdir -p "$work/retained-provider"
+cd "$work/retained-provider"
+cat > RetainedRevOps.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+module RetainedRevOps (keepList, app, rev) where
+keepList :: foreach (xs :: [a]) -> [a]
+keepList xs = xs
+app :: [a] -> [a] -> [a]
+app []       ys = ys
+app (x : xs) ys = x : app xs ys
+rev :: [a] -> [a]
+rev []       = []
+rev (x : xs) = app (rev xs) [x]
+HS
+"${ghc[@]}" -O2 -fomit-interface-pragmas -fno-write-if-simplified-core -c RetainedRevOps.hs
+"${ghc[@]}" --show-iface RetainedRevOps.hi >retained.iface
+grep -Fq '  FinalCoreSourceTable T:rev' retained.iface
 
 # 3. INLINABLE rev (non-default inline pragma) must withhold T:rev at -O2.
 mkdir -p "$work/inlinable"
@@ -186,6 +241,21 @@ f x = x
 HS
 reject 83865 -O0 -c PlainKindMismatch.hs
 if grep -Eq 'Matchable|Unmatchable' negative.log; then
+    cat negative.log >&2
+    exit 1
+fi
+
+cat > AlphaMatchPolyMismatch.hs <<'HS'
+{-# LANGUAGE DataKinds, Modifiers, PolyKinds, RankNTypes #-}
+module AlphaMatchPolyMismatch where
+import Data.Proxy (Proxy)
+import GHC.Matchability (Matchability)
+g :: (forall (m :: Matchability) (f :: Int %m -> Bool). Proxy f)
+  -> (forall (n :: Matchability) (h :: Char %n -> Bool). Proxy h)
+g x = x
+HS
+reject '83865|18872' -O0 -c AlphaMatchPolyMismatch.hs
+if grep -Eq 'GHC\.Internal\.Types\.(M|U|Matchable|Unmatchable)' negative.log; then
     cat negative.log >&2
     exit 1
 fi

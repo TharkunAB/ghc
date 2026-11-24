@@ -79,16 +79,13 @@ module GHC.Tc.Gen.HsType (
 
 import Control.Applicative ((<|>))
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Maybe (MaybeT(..))
 
 import GHC.Prelude hiding ( head, init, last, tail )
 
-import GHC.Hs.Type (HsTypeGhcRnExt(..), isTypeLetPairOcc)
 import GHC.Hs
 import GHC.Rename.Utils
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
-import GHC.Tc.Types.BasicTypes (TcTyThing(ATcTypeLet, ATcCaseLet))
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.LclEnv
 import GHC.Tc.Types.ErrCtxt
@@ -169,7 +166,6 @@ import GHC.Utils.Panic
 import GHC.Driver.DynFlags
 import GHC.Driver.Env (hsc_units)
 import GHC.Driver.Ppr (showPpr, showSDocForUser)
-import GHC.Driver.Session (GeneralFlag(Opt_SolveConstantDicts))
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Data.FastString

@@ -3,7 +3,7 @@ module GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               sourceTableCallees, sourceTableDependencies, sourceTableTypeUses, sourceTableFamilyUse,
                               sourceTableFamilyAppUse, sourceTableReferenceUse, sourceCaseKindUse, sourceCaseVisibleArity, isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead, sourceLocalBooleanCases,
                               isFinalStructuralSource, isStructuralSourceTable, isNominalStructuralSource,
-                              visibleSourceMethodRules, hasSourceMethodRule, hasSourceMethodRuleAt,
+                              visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt,
                               sourceEquationDatatypes, publicCaseType, ordinaryImport,
                               sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod, lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods, keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt, recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers, isSourceFilterGuard,
                               OptionalSourceUses, optionalSourceUses, registerOptionalSourceUses,
@@ -55,8 +55,8 @@ import GHC.Data.Bag (emptyBag, isEmptyBag)
 import GHC.Data.OrdList (fromOL)
 import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config (initSimpleOpts)
-import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
-import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hsc_plugins, hugRuleInterfacesBelow, hugRulesBelow)
+import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_IgnoreInterfacePragmas, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
+import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hsc_plugins, hugRuleInterfacesBelow, hugRulesBelow, visibleUnloadedSourceRuleHeads)
 import GHC.Driver.Plugins (pluginsWithArgs)
 import GHC.Hs
 import {-# SOURCE #-} GHC.HsToCore.Binds (dsTopLHsBinds)
@@ -121,7 +121,7 @@ import GHC.Types.Var (Id, CoVar, idDetails, idMult, VarBndr(..), isId, isCoVar, 
 import GHC.Types.Var.Env (mkInScopeSet)
 import GHC.Types.Var.Set (elemVarSet)
 import GHC.Utils.Misc (equalLength, lengthAtLeast, lengthIs)
-import GHC.Utils.Monad (allM, anyM, whenM)
+import GHC.Utils.Monad (allM, anyM)
 import GHC.Utils.Outputable (ppr, text)
 import GHC.Utils.Panic (panic, pprPanic)
 
@@ -408,6 +408,15 @@ visibleSourceMethodRules env = do
     pure emptyRuleEnv { re_home_rules = home_rules, re_eps_rules = eps_rule_base eps
                       , re_visible_orphs = visible }
 
+-- | Collect active non-auto rule heads that were stripped from interfaces
+-- (or omitted from 'RuleEnv' by @-fignore-interface-pragmas@).
+unloadedSourceRuleHeads :: TcGblEnv -> TcM NameSet
+unloadedSourceRuleHeads env = do
+    hsc <- getTopEnv
+    ignore_prags <- goptM Opt_IgnoreInterfacePragmas
+    liftIO $ visibleUnloadedSourceRuleHeads hsc ignore_prags
+               (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
+
 -- | Test for a visible user rewrite on the exact Id. Every class selector
 -- has a built-in dictionary selection rule. That rule selects this field.
 hasSourceMethodRule :: RuleEnv -> Id -> Bool
@@ -525,7 +534,7 @@ checkedMapperRules env owner = case activeMapperRules env owner of
            , isTwoListCaseTable table
            -> isJust (checkedImportedSpecConstr env owner table rule)
     rules | Just table <- sourceTableId_maybe owner
-          , isFinalCoreCaseTable table -> null rules
+          , isFinalCoreCaseTable table || isCompositionSourceTable table -> null rules
     [] -> False
     rules -> all (\rule -> identityTraversal rule || consTraversal rule || composeTraversals rule) rules
   where
@@ -855,9 +864,9 @@ change the interpretation even if it has a different rule name.
 -}
 
 -- | Check final-Core rules and identify an introduced helper with an active rule.
-finalCoreRuleConflict :: RuleEnv -> NameSet -> Id -> Maybe RetainedQuantificationError
-finalCoreRuleConflict visible local owner
-  | idName owner `elemNameSet` local = Just fallback
+finalCoreRuleConflict :: RuleEnv -> NameSet -> NameSet -> Id -> Maybe RetainedQuantificationError
+finalCoreRuleConflict visible unloaded local owner
+  | idName owner `elemNameSet` local || idName owner `elemNameSet` unloaded = Just fallback
   | checkedMapperRules visible owner = Nothing
   | Just table <- sourceTableId_maybe owner
   , isTwoListCaseTable table || isListZipWithTable table
@@ -869,6 +878,7 @@ finalCoreRuleConflict visible local owner
         helper_conflict = find changed (build : step : concat (catMaybes dependencies))
         fold_conflict = Just (RetainedSourceRule (idName fold))
     in if idName fold `elemNameSet` local ||
+          idName fold `elemNameSet` unloaded ||
           any (\r -> usesStep step r && not (inverse r)) fold_rules
        then fold_conflict
        else case helper_conflict of
@@ -889,6 +899,7 @@ finalCoreRuleConflict visible local owner
       , (Core.Var peer, _) <- Core.collectArgs rhs
       , peer /= owner
       , not (idName peer `elemNameSet` local)
+      , not (idName peer `elemNameSet` unloaded)
       , Just table <- sourceTableId_maybe peer
       , isTwoListCaseTable table || isListZipWithTable table
       , [forward] <- activeMapperRules visible peer
@@ -897,7 +908,8 @@ finalCoreRuleConflict visible local owner
       , checkedZipInverse peer fold peer_step phase rule
       = Just [peer_step]
       | otherwise = Nothing
-    changed v = idName v `elemNameSet` local || not (null (activeMapperRules visible v))
+    changed v = idName v `elemNameSet` local || idName v `elemNameSet` unloaded ||
+                not (null (activeMapperRules visible v))
     fallback = RetainedFinalCoreRulesEnabled (idName owner)
 
 {- Note [Checked list traversal rules]
@@ -1049,8 +1061,9 @@ checkAndInstallSourceProofs env = do
     rewriting <- goptM Opt_EnableRewriteRules
     when (rewriting && not (null occurrences)) $ do
       visible <- visibleSourceMethodRules env
+      unloaded <- unloadedSourceRuleHeads env
       conflicts <- forM (reverse occurrences) $ \(_, loc, ops) -> do
-        conflict <- listToMaybe . catMaybes <$> traverse (changed visible) ops
+        conflict <- listToMaybe . catMaybes <$> traverse (changed visible unloaded) ops
         forM_ conflict $ \reason ->
           setSrcSpan loc (addErr (TcRnRetainedQuantificationError reason))
         pure conflict
@@ -1078,7 +1091,7 @@ checkAndInstallSourceProofs env = do
           types = tcg_type_env env
       pure env { tcg_type_env = extendTypeEnvWithIds types (mapMaybe proof_id (typeEnvIds types)) }
   where
-    changed visible (owner, arg, mapper, checked) = do
+    changed visible unloaded (owner, arg, mapper, checked) = do
       let relevant = filter (not . localSourceRuleApart owner checked) (tcg_rules env)
       local <- sourceRuleOwnersAtTc arg relevant
       let conflict = Just (RetainedFinalCoreRulesEnabled owner)
@@ -1089,12 +1102,13 @@ checkAndInstallSourceProofs env = do
           worker <- tcLookupIdMaybe owner
           let helper_rules = sourceRuleOwners relevant `minusNameSet` unitNameSet owner
           pure $ case worker of
-            Just v | finalCoreMapperOwner v -> finalCoreRuleConflict visible helper_rules v
+            Just v | finalCoreMapperOwner v -> finalCoreRuleConflict visible unloaded helper_rules v
             _ -> conflict
         else
           -- A newly imported rule is in the rule environment. Its head
           -- can be found even when the defining Id is private.
-          pure $ if hasSourceMethodRuleAtArgs visible arg checked (mkVanillaGlobal owner liftedTypeKind)
+          pure $ if owner `elemNameSet` unloaded ||
+                    hasSourceMethodRuleAtArgs visible arg checked (mkVanillaGlobal owner liftedTypeKind)
                  then conflict else Nothing
 
 {- Note [Opaque source proof observations]
@@ -1644,6 +1658,7 @@ changedSourceUse :: [(Id, Maybe Name)] -> TcM (Maybe RetainedQuantificationError
 changedSourceUse ops = do
     env <- getGblEnv
     visible <- visibleSourceMethodRules env
+    unloaded <- unloadedSourceRuleHeads env
     rewriting <- goptM Opt_EnableRewriteRules
     let local_rules = sourceRuleOwners (tcg_rules env)
         check [] = pure Nothing
@@ -1651,13 +1666,15 @@ changedSourceUse ops = do
           | isNominalStructuralSource v, not rewriting = check rest
           | finalCoreMapperOwner v
           = if rewriting
-            then case finalCoreRuleConflict visible local_rules v of
+            then case finalCoreRuleConflict visible unloaded local_rules v of
                    Just reason -> pure (Just reason)
                    Nothing -> check rest
             else check rest
           | otherwise = do
               local <- sourceRuleOwnersAtTc arg (tcg_rules env)
-              if idName v `elemNameSet` local || hasSourceMethodRuleAt visible arg v
+              if idName v `elemNameSet` local ||
+                 idName v `elemNameSet` unloaded ||
+                 hasSourceMethodRuleAt visible arg v
                 then pure (Just (RetainedSourceRule (idName v)))
                 else check rest
     check ops
@@ -1767,19 +1784,21 @@ checkSourceMethodUsesWithPending env = do
         setSrcSpanA (getLoc rule) (mapM_ report (nameSetElemsStable names))
       unless (isEmptyNameSet imported) $ do
         visible <- visibleSourceMethodRules env
-        uses_checked_rules <- forM (nameSetElemsStable imported) $ \name -> do
+        unloaded <- unloadedSourceRuleHeads env
+        conflicts <- forM (nameSetElemsStable imported) $ \name -> do
           v <- tcLookupId name
           let local_rules = sourceRuleOwners (tcg_rules env) `minusNameSet` unitNameSet name
               conflict
-                | uses_final_core v = finalCoreRuleConflict visible local_rules v
-                | any (\arg -> hasSourceMethodRuleAt visible arg v) (arguments name) =
+                | uses_final_core v = finalCoreRuleConflict visible unloaded local_rules v
+                | name `elemNameSet` unloaded
+                    || any (\arg -> hasSourceMethodRuleAt visible arg v) (arguments name) =
                     Just (RetainedSourceRule name)
                 | otherwise = Nothing
           forM_ conflict $ \case
             RetainedFinalCoreRulesEnabled _ -> report name
             reason -> addErr (TcRnRetainedQuantificationError reason)
-          pure (uses_final_core v && isNothing conflict)
-        when (or uses_checked_rules) $ recordCommittedHomeRules env
+          pure conflict
+        when (all isNothing conflicts) $ recordCommittedHomeRules env
 
 -- | Retain the home rule environment of an accepted proof.
 -- A private rule can change the full interface hash without changing its ABI.
@@ -2031,16 +2050,18 @@ sourceTableTyCons local binds = do
     dflags <- getDynFlags
     env <- getGblEnv
     let generates_code = backendGeneratesCode (backend dflags)
-    (visible_rules, local_rules, build_clean) <- if rules && generates_code
+    (visible_rules, unloaded_rules, local_rules, build_clean) <- if rules && generates_code
       then do
         visible <- visibleSourceMethodRules env
+        unloaded <- unloadedSourceRuleHeads env
         let local_r = sourceRuleOwners (tcg_rules env)
         build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
         mb_build <- tcLookupIdMaybe build_name
         let ok = not (build_name `elemNameSet` local_r) &&
+                 not (build_name `elemNameSet` unloaded) &&
                  maybe True (not . hasSourceMethodRule visible) mb_build
-        pure (Just visible, local_r, ok)
-      else pure (Nothing, emptyNameSet, False)
+        pure (Just visible, unloaded, local_r, ok)
+      else pure (Nothing, emptyNameSet, emptyNameSet, False)
     structural <- if local && not strict
                   then fmap catMaybes $ forM binds $ \bind ->
                     runMaybeT (localStructuralTable (unLoc bind) <|> localListReverseTable bind)
@@ -2048,10 +2069,11 @@ sourceTableTyCons local binds = do
     let read_candidate bind = case sourceRows False bind of
           Just row -> Just (row, False)
           Nothing
-            | rules, generates_code, build_clean
+            | not local, rules, generates_code, build_clean
             , Just row@(fun, _, _, _, _) <- sourceRows True bind
             , isDefaultInlinePragma (idInlinePragma fun)
             , not (idName fun `elemNameSet` local_rules)
+            , not (idName fun `elemNameSet` unloaded_rules)
             , maybe True (\vis -> not (hasSourceMethodRule vis fun)) visible_rules
             -> Just (row, True)
             | otherwise -> Nothing
@@ -2059,20 +2081,20 @@ sourceTableTyCons local binds = do
           then map ((, False)) (mapMaybe (sourceRows True . unLoc) binds)
           else mapMaybe (read_candidate . unLoc) binds
         candidate_names = mkNameSet [idName f | ((f, _, _, _, _), _) <- candidates]
-    collect env strict visible_rules local_rules candidate_names structural candidates
+    collect env strict visible_rules unloaded_rules local_rules candidate_names structural candidates
   where
     local_names = extendNameSetList emptyNameSet $
       concatMap (map idName . collectHsBindBinders CollNoDictBinders . unLoc) binds
 
-    collect env strict visible_rules local_rules candidate_names checked pending = do
+    collect env strict visible_rules unloaded_rules local_rules candidate_names checked pending = do
       let available = extendNameSetList emptyNameSet (map (idName . fst) checked)
           ready ((_, _, _, _, rows), _) = all (\f -> not (idName f `elemNameSet` candidate_names)
                                                    || idName f `elemNameSet` available)
                                             (concatMap rowCalls rows)
           (next, later) = partition ready pending
       if null next then pure checked else do
-        tables <- catMaybes <$> traverse (certify env strict visible_rules local_rules checked) next
-        collect env strict visible_rules local_rules candidate_names (checked ++ tables) later
+        tables <- catMaybes <$> traverse (certify env strict visible_rules unloaded_rules local_rules checked) next
+        collect env strict visible_rules unloaded_rules local_rules candidate_names (checked ++ tables) later
 
     rowCalls (SourceRow _ _ _ _ _ rhs) = sourceCalls rhs
 
@@ -2095,16 +2117,17 @@ sourceTableTyCons local binds = do
         guard (ty `eqType` tyConKind fam)
         pure (fam, binderVars binders, args, result)
 
-    callee_clean visible_rules local_rules callee =
+    callee_clean visible_rules unloaded_rules local_rules callee =
       not (idName callee `elemNameSet` local_rules) &&
-      not (maybe False (`hasSourceMethodRule` callee) visible_rules) &&
-      (not (finalCoreMapperOwner callee) ||
-       maybe True (\vis -> isNothing (finalCoreRuleConflict vis local_rules callee)) visible_rules)
+      (if finalCoreMapperOwner callee
+       then maybe True (\vis -> isNothing (finalCoreRuleConflict vis unloaded_rules local_rules callee)) visible_rules
+       else not (idName callee `elemNameSet` unloaded_rules) &&
+            not (maybe False (`hasSourceMethodRule` callee) visible_rules))
 
-    certify env strict visible_rules local_rules checked ((fun, order, body_tvs, evidence, rows), needs_final) = do
+    certify env strict visible_rules unloaded_rules local_rules checked ((fun, order, body_tvs, evidence, rows), needs_final) = do
       clean <- allM emptyEvidence evidence
       let callees = concatMap rowCalls rows
-          callees_ok = not needs_final || all (callee_clean visible_rules local_rules) callees
+          callees_ok = not needs_final || all (callee_clean visible_rules unloaded_rules local_rules) callees
       if clean && callees_ok then do
         ty <- liftZonkM (zonkTcType (varType fun))
         case checkedDomains strict order body_tvs ty rows of
@@ -2199,7 +2222,10 @@ sourceCaseTables nominal_owners binds = do
     then pure ([], [])
     else do
       visible <- visibleSourceMethodRules env
-      let changed owner = idName owner `elemNameSet` ruled || hasSourceMethodRule visible owner
+      unloaded <- unloadedSourceRuleHeads env
+      let changed owner = idName owner `elemNameSet` ruled
+                       || idName owner `elemNameSet` unloaded
+                       || hasSourceMethodRule visible owner
           prepare = simpleOptExpr (initSimpleOpts dflags)
       prepared <- fmap catMaybes $ forM candidates $ \(bind, owner) -> do
         let ruled_owner = changed owner
@@ -2295,6 +2321,7 @@ sourceCaseTables nominal_owners binds = do
             , isExternalName name
             , not (eligible owner)
             , not (name `elemNameSet` ruled)
+            , not (name `elemNameSet` unloaded)
             , not (hasSourceMethodRule visible owner)
             , Just _ <- constructorHelperType (varType owner)
             = fmap (owner,) <$> bindingCore bind owner
@@ -2837,6 +2864,20 @@ checkedCompositionSource owner rhs = do
     let declared = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope signature
         row = ConstructorCaseRow (map CaseField terms) (CaseApply f [CaseApply g [CaseField x]])
     pure (declared, domains, result, row)
+
+-- | Recognize a closed family table produced by 'checkedCompositionSource'.
+isCompositionSourceTable :: TyCon -> Bool
+isCompositionSourceTable table = isJust $ do
+    _ <- sourceTableTermOcc (nameOccName (tyConName table))
+    (telescope, domains, _) <- compositionSourceType (tyConKind table)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    guard (coAxiomRole axiom == Nominal)
+    [branch] <- pure (fromBranches (coAxiomBranches axiom))
+    let vars = coAxBranchTyVars branch
+    (params, [f, g, x]) <- pure (splitAt (length telescope) vars)
+    guard (lengthIs params 3 && lengthIs domains 3 && null (coAxBranchCoVars branch))
+    guard (eqTypes (coAxBranchLHS branch) (mkTyVarTys vars))
+    guard (coAxBranchRHS branch `eqType` mkAppTy (mkTyVarTy f) (mkAppTy (mkTyVarTy g) (mkTyVarTy x)))
 
 {- Note [Checked function composition]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -6173,7 +6214,7 @@ checkedStructuralSource order binding = do
           ConstructorCaseRow [left, right] <$> MaybeT (pure (visit False output))
     read_row _ _ _ _ = empty
 
-    read_pattern root domain (L _ (ConPat (ConPatTc [] [] [] evidence WpHole [])
+    read_pattern root _domain (L _ (ConPat (ConPatTc [] [] [] evidence WpHole [])
                                    (L _ (RealDataCon dc)) (PrefixCon _ pats))) = do
       guard (dataConTyCon dc == root)
       guard =<< lift (emptyEvidence evidence)

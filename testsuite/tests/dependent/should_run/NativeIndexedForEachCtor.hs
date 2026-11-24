@@ -64,4 +64,11 @@ main = do
         , checkLazySome (MkWrapSome unusedSome)
         , case mkLazyLamSigma unusedLamBody of
             Pair t _ -> case t of ULam _ -> True; _ -> False
+        , case cmpFinFZ @('Succ 'Zero) (FS (FS FZ)) of
+            CmpNeq y r -> case y of
+              FS z -> case z of
+                FZ -> case r of RemSS RemGt -> True; _ -> False
+                _ -> False
+              _ -> False
+            _ -> False
         )

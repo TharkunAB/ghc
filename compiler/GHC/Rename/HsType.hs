@@ -233,7 +233,7 @@ rnHsTypeApp ty@(HsWC { hswc_body = hs_ty })
       lifted <- if hasParsedRetainedPi raw then pure Nothing else try_lift_argument raw
       case lifted of
         Just (HsWC { hswc_body = body }, fvs) -> do
-          remember_lift
+          _ <- remember_lift
           pure (body, fvs)
         Nothing -> rnLHsType (SpliceTypeCtx raw) raw
 

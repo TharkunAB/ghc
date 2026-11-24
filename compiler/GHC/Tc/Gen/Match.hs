@@ -80,14 +80,14 @@ import qualified GHC.Core.TyCo.Subst as Subst
 import GHC.Core.Type ( coreFullView, expandTypeSynonyms, isManyTy, splitTyConApp_maybe
                      , anyFreeVarsOfType, typeKind, isNativeIndexFunctionId, isNativeOpaqueValueId
                      , isInvisibleForAllTyFlag, isNativeIndexId, nativeIndexDataConTyArgs
-                     , splitFunTy_maybe, nativeCallSpine_maybe, substTyWith )
-import GHC.Core.Coercion ( CoercionR, MCoercion(MRefl, MCo), Role(Representational), mkCoVarCo, mkCoCast, coercionType, isReflCo
+                     , splitFunTy_maybe, nativeCallSpine_maybe )
+import GHC.Core.Coercion ( CoercionR, MCoercion(MRefl, MCo), mkCoVarCo, mkCoCast, coercionType, isReflCo
                          , mkSymCo, mkSubCo, coercionKind, coercionLKind
                          , mkFunCo, mkFunResCo, mkHomoForAllCos
                          , mkTransCo, mkNomReflCo, mkRepReflCo, mkDepFunCoWithVis )
 import GHC.Core.DataCon ( DataCon, dataConCannotMatch, dataConName, dataConSourceArity, dataConTyCon, dataConUnivTyVars, dataConWorkId )
 import GHC.Core.ConLike ( ConLike(RealDataCon) )
-import GHC.Core.Predicate ( isEqClassPred, getEqPredTys_maybe, mkNomEqPred, scopedSort )
+import GHC.Core.Predicate ( getEqPredTys_maybe, mkNomEqPred )
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Utils ( applyTypeToArgs, exprType, isEmptyTy )
 -- Create chunkified tuple types for monad comprehensions
@@ -105,7 +105,6 @@ import GHC.Builtin.WiredIn.Prim
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
-import GHC.Utils.Monad (anyM, mapAccumLM)
 
 import GHC.Types.Name
 import GHC.Types.Name.Env (anyNameEnv)
@@ -113,7 +112,7 @@ import GHC.Types.Name.Reader
 import GHC.Types.Name.Set
 import GHC.Types.Unique.Set (sizeUniqSet)
 import GHC.Types.Id
-import GHC.Types.Var ( binderFlag, EvVar, DepFunTyFlag(..), ExistsTyFlag(ImplicitExists), FunTyFlag, VarBndr(Bndr), varType, tyVarKind, isId, isCoVar, isTyVar, isVisibleFunArg, isInferredForAllTyFlag )
+import GHC.Types.Var ( binderFlag, EvVar, DepFunTyFlag(..), ExistsTyFlag(ImplicitExists), VarBndr(Bndr), varType, tyVarKind, isCoVar, isTyVar, isVisibleFunArg, isInferredForAllTyFlag )
 import GHC.Types.Var.Env ( mkInScopeSetList, unitVarEnv )
 import GHC.Types.Var.Set ( mkVarSet )
 import GHC.Types.SrcLoc
@@ -1691,7 +1690,6 @@ tcRetainedMatrixMatches (first_column, first_index) (second_column, second_index
     second_cons = domain_cons second_index
     coverage_error = failWithTc (TcRnRetainedQuantificationError RetainedMatrixCoverage)
     pattern_error = failWithTc (TcRnRetainedQuantificationError RetainedMatrixPattern)
-    argument_error = failWithTc (TcRnRetainedQuantificationError RetainedConstructorArguments)
 
     row_patterns (Match { m_pats = L _ pats })
       = case (drop first_source visible, drop second_source visible) of
@@ -1862,6 +1860,7 @@ checkRetainedRows allow_value_patterns invis_pat_tys pat_tys plan rhs_ty origin 
                        , m_grhss = grhss { grhssGRHSs = fmap wrap_fallback (grhssGRHSs grhss)
                                          , grhssLocalBinds = locals } })) }
 
+    unguarded :: LGRHS GhcRn (LHsExpr GhcRn) -> Bool
     unguarded (L _ (GRHS _ guards _)) = null guards
 
     check_columns _ _ [] [] = return []

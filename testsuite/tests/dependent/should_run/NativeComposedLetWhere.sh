@@ -35,9 +35,9 @@ pack f g h k left right = MkIso @a @c to from left right
     from y = g (k y)
 HS
 
-# 1. Unmodified R04_ComposedIsoFields.hs at -O0 and -O2 -fno-enable-rewrite-rules,
-#    plus .hi readback, GHCi, and default -O2 rule-policy check.
-for opt in -O0 "-O2 -fno-enable-rewrite-rules"; do
+# 1. Unmodified R04_ComposedIsoFields.hs at -O0, -O2 -fno-enable-rewrite-rules,
+#    and default -O2, plus .hi readback and GHCi.
+for opt in -O0 "-O2 -fno-enable-rewrite-rules" -O2; do
     read -ra opt_flags <<<"$opt"
     out_dir="r04_${opt//[^a-zA-Z0-9]/_}"
     mkdir -p "$out_dir" "$out_dir/readback"
@@ -49,30 +49,24 @@ for opt in -O0 "-O2 -fno-enable-rewrite-rules"; do
     "$1" "-B$2" --show-iface "$out_dir/R04_ComposedIsoFields.hi" | grep -Fq 'pack ::'
 done
 
-# Default -O2 (with active rewrite rules) must reject FinalCoreSourceTable (.)
-# and therefore fall back to GHC-83865 on R04_ComposedIsoFields.hs.
-if "${g[@]}" -O2 "${flags[@]}" -fforce-recomp -c R04_ComposedIsoFields.hs >r04-o2def.log 2>&1; then
-    echo "R04_ComposedIsoFields unexpectedly compiled under default -O2 with active rules" >&2
-    exit 1
-fi
-grep -Fq 'error: [GHC-83865]' r04-o2def.log
-
 # GHCi type check on unmodified R04_ComposedIsoFields.hs.
 ghci_out=$("${g[@]}" -O0 R04_ComposedIsoFields.hs -e ':t pack')
 echo "$ghci_out" | grep -Fq 'Iso a c'
 
-# 2. Positive runtime + Core/STG Lint across let, where, 0-arg, 1-arg, chained, case.
-for mode in O0 O2; do
+# 2. Positive runtime + Core/STG Lint across let, where, 0-arg, 1-arg, chained, case
+#    at -O0, -O2 -fno-enable-rewrite-rules, and default -O2.
+for mode in O0 O2_norules O2; do
     mkdir -p "run_$mode"
-    if [[ $mode == O0 ]]; then
-        opt_flags=(-O0)
-    else
-        opt_flags=(-O2 -fno-enable-rewrite-rules)
-    fi
+    case $mode in
+        O0) opt_flags=(-O0) ;;
+        O2_norules) opt_flags=(-O2 -fno-enable-rewrite-rules) ;;
+        O2) opt_flags=(-O2) ;;
+    esac
     "${g[@]}" "${opt_flags[@]}" "${flags[@]}" --make -outputdir "run_$mode" \
         NativeComposedLetWhere.hs -o "run_$mode/prog"
     "./run_$mode/prog" >"run_$mode/stdout"
 done
+diff -u run_O0/stdout run_O2_norules/stdout
 diff -u run_O0/stdout run_O2/stdout
 cat run_O0/stdout
 
@@ -286,6 +280,7 @@ badRule f g h k left right = MkIso @a @c (h . f) (g . k) left right
 {-# RULES "bad compose" forall f g x. (f . g) x = f x #-}
 HS
 reject ComposeRuleDirect.hs GHC-83605 -O0 -fenable-rewrite-rules -Wno-inline-rule-shadowing
+reject ComposeRuleDirect.hs GHC-83605 -O2 -Wno-inline-rule-shadowing
 
 cat >ComposeRuleWhere.hs <<'HS'
 {-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
@@ -310,3 +305,81 @@ badRuleWhere f g h left right = MkIso @a @a to g left right
 {-# RULES "bad compose where" forall f g x. (f . g) x = f x #-}
 HS
 reject ComposeRuleWhere.hs GHC-83605 -O0 -fenable-rewrite-rules -Wno-inline-rule-shadowing
+reject ComposeRuleWhere.hs GHC-83605 -O2 -Wno-inline-rule-shadowing
+
+# 4g. Upstream -fno-code -fomit-interface-pragmas rule on (.) must also block default -O2.
+cat >OrphanComposeNoCode.hs <<'HS'
+{-# OPTIONS_GHC -Wno-orphans -Wno-inline-rule-shadowing #-}
+module OrphanComposeNoCode () where
+{-# RULES "nocode compose" forall f g x. (f . g) x = f x #-}
+HS
+"${g[@]}" -O2 -fno-code -fwrite-interface -fomit-interface-pragmas -c OrphanComposeNoCode.hs
+test ! -e OrphanComposeNoCode.o
+
+cat >ComposeImportedDirect.hs <<'HS'
+{-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+module ComposeImportedDirect where
+import Data.Type.Equality ((:~:))
+import OrphanComposeNoCode ()
+
+data Iso a b where
+  MkIso :: foreach (to :: a -> b) -> foreach (from :: b -> a)
+        -> (foreach (x :: a) -> from (to x) :~: x)
+        -> (foreach (y :: b) -> to (from y) :~: y)
+        -> Iso a b
+
+badDirect :: forall a b c. foreach (f :: a -> b) -> foreach (g :: b -> a)
+          -> foreach (h :: b -> c) -> foreach (k :: c -> b)
+          -> (foreach (x :: a) -> g (k (h (f x))) :~: x)
+          -> (foreach (y :: c) -> h (f (g (k y))) :~: y)
+          -> Iso a c
+badDirect f g h k left right = MkIso @a @c (h . f) (g . k) left right
+HS
+reject ComposeImportedDirect.hs GHC-83605 -O2
+
+cat >ComposeImportedWhere.hs <<'HS'
+{-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+module ComposeImportedWhere where
+import Data.Type.Equality ((:~:))
+import OrphanComposeNoCode ()
+
+data Iso a b where
+  MkIso :: foreach (to :: a -> b) -> foreach (from :: b -> a)
+        -> (foreach (x :: a) -> from (to x) :~: x)
+        -> (foreach (y :: b) -> to (from y) :~: y)
+        -> Iso a b
+
+badWhere :: forall a. foreach (f :: a -> a) -> foreach (g :: a -> a)
+         -> foreach (h :: a -> a)
+         -> (foreach (x :: a) -> g (h (f x)) :~: x)
+         -> (foreach (y :: a) -> h (f (g y)) :~: y)
+         -> Iso a a
+badWhere f g h left right = MkIso @a @a to g left right
+  where
+    to x = h (f x)
+HS
+reject ComposeImportedWhere.hs GHC-83605 -O2
+
+cat >ComposeImportedWhereSigned.hs <<'HS'
+{-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+module ComposeImportedWhereSigned where
+import Data.Type.Equality ((:~:))
+import OrphanComposeNoCode ()
+
+data Iso a b where
+  MkIso :: foreach (to :: a -> b) -> foreach (from :: b -> a)
+        -> (foreach (x :: a) -> from (to x) :~: x)
+        -> (foreach (y :: b) -> to (from y) :~: y)
+        -> Iso a b
+
+badWhereSigned :: forall a. foreach (f :: a -> a) -> foreach (g :: a -> a)
+               -> foreach (h :: a -> a)
+               -> (foreach (x :: a) -> g (h (f x)) :~: x)
+               -> (foreach (y :: a) -> h (f (g y)) :~: y)
+               -> Iso a a
+badWhereSigned f g h left right = MkIso @a @a to g left right
+  where
+    to :: a -> a
+    to x = h (f x)
+HS
+reject ComposeImportedWhereSigned.hs GHC-83865 -O2

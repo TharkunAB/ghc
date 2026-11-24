@@ -398,16 +398,20 @@ mkIface_ hsc_env
       Just DirectScopedSumDomain -> writeField scopedSumDomainField () emptyExtensibleFields
       Just ComposedScopedSumDomain -> writeField composedScopedSumDomainField () emptyExtensibleFields
       Nothing -> pure emptyExtensibleFields
-    let rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
-          source_rule_owners `unionNameSet`
-          mkNameSet [ ifRuleHead rule
-                    | rule <- iface_rules
-                    , not (ifRuleAuto rule)
-                    , not (isNeverActive (ifActivation rule)) ]
-    fields <- if null rule_heads
+    let iface_rule_heads = mkNameSet
+          [ ifRuleHead rule
+          | rule <- iface_rules
+          , not (ifRuleAuto rule)
+          , not (isNeverActive (ifActivation rule)) ]
+        all_rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
+          source_rule_owners `unionNameSet` iface_rule_heads
+        stripped_rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
+          source_rule_owners `minusNameSet` iface_rule_heads
+    fields <- if null all_rule_heads
       then pure fields0
       else writeFieldWith sourceRuleHeadsField
-             (\bh -> putWithUserData QuietBinIFace NormalCompression bh rule_heads)
+             (\bh -> putWithUserData QuietBinIFace NormalCompression bh
+                       (all_rule_heads, stripped_rule_heads))
              fields0
 
     pure $ emptyPartialModIface this_mod

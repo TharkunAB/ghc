@@ -1,7 +1,6 @@
 {-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
-{-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 -- | Symmetry and transitivity from the PLFH Isomorphism chapter.
-module BookIsoComposition (isoSym, isoTrans) where
+module BookIsoComposition (isoSym, isoTrans, isoTransWhere) where
 
 import BookIsomorphism (Iso(..))
 import Data.Type.Equality ((:~:), trans)
@@ -25,3 +24,15 @@ isoTrans (MkIso f g gf fg) (MkIso h k kh hk) =
     MkIso @a @c (h . f) (g . k)
         (composeLeft f g h k gf kh)
         (composeLeft k h g f hk fg)
+
+-- | Compose two isomorphisms using local where-clause function aliases.
+isoTransWhere :: forall a b c. Iso a b -> Iso b c -> Iso a c
+isoTransWhere (MkIso f g gf fg) (MkIso h k kh hk) =
+    MkIso @a @c to from
+        (composeLeft f g h k gf kh)
+        (composeLeft k h g f hk fg)
+  where
+    to :: a -> c
+    to x = h (f x)
+    from :: c -> a
+    from y = g (k y)

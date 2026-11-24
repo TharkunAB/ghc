@@ -3120,15 +3120,26 @@ checkTypeEqNoUnification ev eq_rel lhs rhs =
     given_flags :: TyEqFlags TcM (TcTyVar, TcType)
     given_flags
       -- See Note [Rigid retained indices] in GHC.Tc.Utils.Unify.
-      | TyVarLHS {} <- lhs
+      | TEFTyVar { tefTyVar_occursCheck = occ
+                 , tefTyVar_levelCheck = lvl
+                 , tefTyVar_concreteCheck = conc } <- wanted_flags
       , hasNativeDependentExpr (Type rhs)
-      = wanted_flags { tefTyVar_allowNativeGivenRhs = True
-                     , tef_fam_app = TEFA_Recurse }
-      | TyFamLHS {} <- lhs, NomEq <- eq_rel
+      = TEFTyVar { tefTyVar_occursCheck = occ
+                 , tefTyVar_levelCheck = lvl
+                 , tefTyVar_concreteCheck = conc
+                 , tefTyVar_allowNativeGivenRhs = True
+                 , tef_fam_app = TEFA_Recurse }
+      | TEFTyFam { tefTyFam_occursCheck = occ
+                 , tefTyFam_tyCon = tc
+                 , tefTyFam_args = args } <- wanted_flags
+      , NomEq <- eq_rel
       , hasNativeDependentExpr (Type rhs)
       -- See Note [Family Givens with rigid runtime indices] in GHC.Tc.Utils.Unify.
-      = wanted_flags { tefTyFam_allowRetainedIds = True
-                     , tef_fam_app = TEFA_Recurse }
+      = TEFTyFam { tefTyFam_occursCheck = occ
+                 , tefTyFam_tyCon = tc
+                 , tefTyFam_args = args
+                 , tefTyFam_allowRetainedIds = True
+                 , tef_fam_app = TEFA_Recurse }
       | otherwise
       = wanted_flags { tef_fam_app = mkTEFA_Break ev eq_rel BreakGiven }
         -- TEFA_Break used for: [G] a ~ Maybe (F a)

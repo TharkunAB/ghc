@@ -43,12 +43,10 @@ import GHC.Tc.Instance.Family ( tcGetFamInstEnvs, tcLookupDataFamInst_maybe )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Concrete  ( unifyConcrete, idConcreteTvs )
 import GHC.Tc.Utils.TcMType
-import GHC.Tc.Types.TcRef ( TcRef )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint (WantedConstraints(wc_simple), ctPred, ctEvLoc, ctEvEvId,
                                 mkNonCanonical, DelayedError(DE_SourceMethod))
-import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..), UserTypeCtxt(ExprSigCtxt, TypeAppCtxt)
-                           , ReportRedundantConstraints(NoRRC) )
+import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..), ReportRedundantConstraints(NoRRC) )
 import GHC.Tc.Types.CtLoc ( CtLoc )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType as TcType
@@ -106,7 +104,6 @@ import GHC.Data.FastString
 import Language.Haskell.Syntax.Text ( unpackHText )
 
 import GHC.Utils.Misc
-import GHC.Utils.Monad ( anyM, orM )
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
@@ -775,14 +772,16 @@ tcRetainedSpineFields expr sigma args
            ; _ <- liftMaybeT (tcCloseRuntimeScope (map getName fields) (exprCtOrigin expr) ty)
            ; return 0 }
 
-    prepare arg
-      | Just (loc, elements) <- list_fields arg
+    prepare (EValArg { ea_loc_span = span_loc, ea_arg_ty = arg_ty, ea_arg = expr_arg })
+      | L loc (ExplicitList _ elements) <- stripParensLHsExpr expr_arg
       , any opaque elements
       = do { element_ty <- newFlexiTyVarTy liftedTypeKind
            ; (elements', fields) <- mapAndUnzipM (name_field element_ty) elements
-           ; let arg' = arg { ea_arg = L loc (ExplicitList noExtField elements') }
+           ; let arg' = EValArg { ea_loc_span = span_loc
+                                , ea_arg_ty = arg_ty
+                                , ea_arg = L loc (ExplicitList noExtField elements') }
            ; return (arg', concat fields) }
-      | otherwise = return (arg, [])
+    prepare arg = return (arg, [])
 
     name_field ty rhs
       | opaque rhs
@@ -3634,14 +3633,14 @@ tcValArg do_ql pos rn_head (ERetainedArg DepFunVisible loc (Scaled mult ty) arg 
                 ; let wrapper = mkWpEvApps [EvExpr (Core.Var dict)] <.> mkWpTyApps [inst]
                       method = noLocA (mkHsWrap wrapper (mkHsVar (noLocA selector)))
                 ; return (mkHsApps method [checked_operand]) }
-           _ -> tcValArgExpr do_ql pos rn_head loc (Scaled mult checked_ty) arg
+           _ -> tcRetainedValArgExpr do_ql pos rn_head loc (Scaled mult checked_ty) arg
        ; return (ERetainedArg DepFunVisible loc noExtField
                    (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField) }
 tcValArg _ pos rn_head (ERetainedArg DepFunInvisible loc (Scaled mult ty) arg res_ty co)
   = addArgCtxt pos rn_head arg $
     do { let checked_ty = maybe ty coercionLKind co
        ; checked <- tcScalingUsage mult $
-                     traverse (\e -> tcPolyExpr e (mkCheckExpType checked_ty)) arg
+                     tcCheckRetainedPolyExpr checked_ty arg
        ; return (ERetainedArg DepFunInvisible loc noExtField
                    (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField) }
 
@@ -3782,6 +3781,95 @@ tcValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg@(L arg_loc arg)
        ; traceTc "tcValArg" $ vcat [ ppr arg'
                                    , text "}" ]
        ; return (L arg_loc arg') }
+
+-- | Check a retained operand, instantiating family-free constructor spines
+-- from the expected domain so runtime Core matches 'tcRetainedArg'.
+tcRetainedValArgExpr :: QLFlag -> Int -> (HsExpr GhcRn, SrcSpan) -> HsExprLoc
+                     -> Scaled TcSigmaTypeFRR -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc)
+tcRetainedValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg
+  = do { Scaled mult exp_arg_ty <- case do_ql of
+           DoQL -> liftZonkM $ zonkScaledTcType sc_arg_ty
+           NoQL -> return sc_arg_ty
+       ; matched <- addArgCtxt pos rn_fun_head larg $
+                    tcScalingUsage mult $
+                    tcCheckRetainedConApp exp_arg_ty larg
+       ; case matched of
+           Just checked -> return checked
+           Nothing      -> tcValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg }
+
+tcCheckRetainedPolyExpr :: TcType -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc)
+tcCheckRetainedPolyExpr expected_ty larg@(L arg_loc expr)
+  = do { matched <- tcCheckRetainedConApp expected_ty larg
+       ; case matched of
+           Just checked -> return checked
+           Nothing      -> setSrcSpanA arg_loc $
+                           L arg_loc <$> tcPolyExpr expr (mkCheckExpType expected_ty) }
+
+tcCheckRetainedConApp :: TcType -> LHsExpr GhcRn -> TcM (Maybe (LHsExpr GhcTc))
+tcCheckRetainedConApp expected_ty (L arg_loc (HsPar x inner))
+  = fmap (fmap (L arg_loc . HsPar x)) (tcCheckRetainedConApp expected_ty inner)
+tcCheckRetainedConApp expected_ty (L arg_loc expr@HsApp{})
+  = setSrcSpanA arg_loc $ runMaybeT $
+    do { (rn_fun, rn_args) <- liftMaybeT (splitHsApps expr)
+       ; guard (all plain_arg rn_args && any isHsValArg rn_args)
+       ; HsVar _ lname <- pure rn_fun
+       ; guard (isDataOcc (nameOccName (unLocWithUserRdr lname)))
+       ; RealDataCon dc <- liftMaybeT (tcLookupConLike (unLoc lname))
+       ; expected' <- liftMaybeT (liftZonkM (zonkTcType expected_ty))
+       ; guard (isJust (Core.nativeIndexedOperandSignature_maybe dc)
+                || isJust (nativeIndexDataConTyArgs expected' dc))
+       ; let sigma = idType (dataConWrapId dc)
+             (ma_tvs, body) = tcSplitForAllInvisTyVars sigma
+             tvs = map snd ma_tvs
+             (theta, tau) = tcSplitPhiTy body
+             bind_outer tv _ | tv `elem` tvs = BindMe
+                             | otherwise     = DontBindMe
+       ; guard (not (null tvs) && null theta && isEmptyNameEnv (dataConConcreteTyVars dc))
+       ; result <- MaybeT (pure (tcRetainedOrdinaryResult (count isHsValArg rn_args) tau))
+       ; guard (isFamFreeTy result && isTauTy result && isTauTy expected')
+       ; kind_subst <- MaybeT (pure (tcMatchTyX_BM bind_outer Subst.emptySubst
+                                       (typeKind result) (typeKind expected')))
+       ; subst <- MaybeT (pure (tcMatchTyX_BM bind_outer kind_subst result expected'))
+       ; let lookup_or_many tv = case Subst.lookupTyVar subst tv of
+               Just ty -> Just ty
+               Nothing | isMultiplicityTy (tyVarKind tv) -> Just ManyTy
+                       | otherwise -> Nothing
+       ; inst_tys <- MaybeT (pure (traverse lookup_or_many tvs))
+       ; guard (all noQuickLookVars (expected' : inst_tys))
+       ; let full_subst = Subst.zipTvSubst tvs inst_tys
+       ; guard (and (zipWith (\tv ty -> eqType (Subst.substTy full_subst (tyVarKind tv)) (typeKind ty))
+                             tvs inst_tys))
+       ; guard (eqType (Subst.substTy full_subst result) expected')
+       ; valid <- liftMaybeT (tcRetainedInstScope inst_tys)
+       ; guard valid
+       ; fun_lspan <- liftMaybeT (getFunSrcSpan rn_args)
+       ; let tc_fun = mkHsWrap (mkWpTyApps inst_tys) (XExpr (ConLikeTc (RealDataCon dc)))
+             body' = Subst.substTy full_subst body
+       ; checked_args <- check_args (rn_fun, fun_lspan) 1 body' rn_args
+       ; rebuilt <- liftMaybeT $ addExprCtxt expr (return (rebuildHsApps tc_fun checked_args))
+       ; return (L arg_loc rebuilt) }
+  where
+    plain_arg EValArg{} = True
+    plain_arg (EWrap EPar{}) = True
+    plain_arg (EWrap EExpand{}) = True
+    plain_arg _ = False
+
+    check_args _ _ _ [] = return []
+    check_args head_ctxt arg_pos cur_ty (EWrap (EPar x) : rest)
+      = (EWrap (EPar x) :) <$> check_args head_ctxt arg_pos cur_ty rest
+    check_args head_ctxt arg_pos cur_ty (EWrap (EExpand o c) : rest)
+      = (EWrap (EExpand o c) :) <$> check_args head_ctxt arg_pos cur_ty rest
+    check_args head_ctxt arg_pos cur_ty (EValArg { ea_loc_span = a_loc, ea_arg = a_expr } : rest)
+      | FunTy { ft_af = af, ft_mult = f_mult, ft_arg = f_dom, ft_res = f_res } <- coreFullView cur_ty
+      , isVisibleFunArg af
+      = do { checked_a <- liftMaybeT $
+               addArgCtxt arg_pos head_ctxt a_expr $
+               tcScalingUsage f_mult $
+               tcCheckRetainedPolyExpr f_dom a_expr
+           ; rest' <- check_args head_ctxt (arg_pos + 1) f_res rest
+           ; return (EValArg { ea_loc_span = a_loc, ea_arg = checked_a, ea_arg_ty = noExtField } : rest') }
+    check_args _ _ _ _ = mzero
+tcCheckRetainedConApp _ _ = return Nothing
 
 -- | Instantiate arguments in telescope order, with optional immutable choices
 -- and a retained expected result after ordinary VTA.

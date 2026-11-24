@@ -3249,6 +3249,7 @@ isConcreteTypeWith conc_tvs = go
     go (TermAppTy {})      = False
     go (TermVarTy _)       = False
     go (DepFunTy {})       = False
+    go (ExistsTy {})       = False
     go (AppTy ty1 ty2)     = go ty1 && go ty2
     go (TyConApp tc tys)   = go_tc tc tys
     go ForAllTy{}          = False

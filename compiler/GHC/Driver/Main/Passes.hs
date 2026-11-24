@@ -51,6 +51,7 @@ import GHC.Driver.Main.Hsc
       hscSimpleIface )
 
 import GHC.Driver.Plugins
+import GHC.Driver.DynFlags ( optLevelFlags )
 import GHC.Driver.Session
 import GHC.Driver.Backend
 import GHC.Driver.Env
@@ -1010,7 +1011,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                 non_retained_opt <- if not retained && (has_early_lookups || (has_mappers && null (mg_rules guts)) || can_publish_closures)
                   then Just <$> hscSimplify' [] guts
                   else pure Nothing
-                retained_opt <- if retained && no_plugins && (has_early_lookups || can_publish_closures)
+                retained_opt <- if retained && no_plugins && ((has_mappers && null (mg_rules guts)) || has_early_lookups || can_publish_closures)
                   then liftIO $ validateRetainedLookupBodies hsc_env guts
                   else pure Nothing
                 let active_opt = if retained then retained_opt else non_retained_opt
@@ -1020,13 +1021,10 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                     (mg_binds guts) (mg_binds <$> active_opt) Nothing
                 checked_mappers_tc <- if has_mappers
                   then do
-                    optimized <- if not (null (mg_rules guts))
-                      then pure Nothing
-                      else if retained
-                        then if no_plugins
-                               then liftIO $ validateRetainedSourceBodies hsc_env guts
-                               else pure Nothing
-                        else pure non_retained_opt
+                    let optimized
+                          | not (null (mg_rules guts)) = Nothing
+                          | retained = retained_opt
+                          | otherwise = non_retained_opt
                     pure (validateSimpleSourceTables guts optimized tc_result)
                   else pure tc_result
                 case active_opt of
@@ -1107,14 +1105,18 @@ validateRetainedSourceBodies env guts
 -- | Run the active optimization pipeline on a no-code retained module with early lookups.
 validateRetainedLookupBodies :: HscEnv -> ModGuts -> IO (Maybe ModGuts)
 validateRetainedLookupBodies env guts
-  | Just _ <- nativeOptLevel (hsc_dflags env)
+  | platformNcgSupported (targetPlatform dflags)
+  , Just _ <- nativeOptLevel (dflags { backend = ncgBackend })
   , null (mg_rules guts)
   , supportsNativeRuleBinds simplified
   = Just <$> core2coreRetained (hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) env)
                                (guts { mg_binds = simplified })
-  | null (mg_rules guts) = validateRetainedSourceBodies env guts
+  | not (any (\(levels, flag) -> 0 `notElem` levels && gopt flag dflags) optLevelFlags)
+  , null (mg_rules guts)
+  = validateRetainedSourceBodies env guts
   | otherwise = pure Nothing
   where
+    dflags = hsc_dflags env
     simplified = simpleOptNativeProgram (mg_binds guts)
 
 -- | Confirm that early-staged indexed lookup tables match desugared and final Core.

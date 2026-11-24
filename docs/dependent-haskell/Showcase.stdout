@@ -625,3 +625,7 @@ substitute an open callback under a lambda and weaken the outer image: Refl
 evaluate a variable against a same-module environment lookup: True
 plug an indexed context lazily and avoid capture in untyped substitution: (Refl,Refl)
 refine and transport a closed family across runtime index equalities: Just (Right (Just True))
+store an indexed GADT witness in a constructor field and a Sigma pair: (True,True)
+compose isomorphism functions through local where-clause aliases: (Refl,Refl,True,False)
+reduce plugged untyped closure and lookup equations across interfaces: (Refl,Refl)
+verify explicit-list reverse equations in Final Core under default -O2: (Refl,Refl,[False,True])

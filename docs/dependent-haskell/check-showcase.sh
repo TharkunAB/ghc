@@ -57,6 +57,46 @@ cp "$out/native/LocalDerivedAssociated.hi" \
     done
 )
 
+mkdir "$out/nocode-closure"
+(
+    cd "$out/nocode-closure"
+    "${ghc[@]}" "$native_opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
+        -fwrite-source-equations -dcore-lint -outputdir . -i "-i$docs/hasklib" "-i$examples/open-evaluation" \
+        --make -no-link "$examples/open-evaluation/BookParallel.hs" \
+        "$examples/open-evaluation/BookContextPlug.hs" \
+        "$examples/open-evaluation/BookEnvironment.hs"
+    test -z "$(find . \( -name '*.o' -o -name '*.bc' \) -print -quit)"
+    "$compiler" "-B$libdir" --show-iface BookParallel.hi | grep -Fq 'CheckedClosureSourceTable T:substSingleU'
+    "$compiler" "-B$libdir" --show-iface BookContextPlug.hi | grep -Fq 'SourceTable T:plug'
+    "$compiler" "-B$libdir" --show-iface BookEnvironment.hi | grep -Fq 'SourceTable T:lookupEnv'
+    cat >NoCodeClosureClient.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module NoCodeClosureClient where
+import Data.Type.Equality ((:~:)(Refl))
+import qualified BookContextPlug as C
+import qualified BookEnvironment as E
+import qualified BookParallel as P
+import qualified HaskLib.Nat as N
+
+plugged ::
+    P.substSingleU
+        (C.plug
+            ('C.CLam 'C.CHole)
+            ('P.UApp ('P.UVar 'P.FZ) ('P.UVar ('P.FS 'P.FZ))
+                :: P.UTerm ('N.Succ ('N.Succ ('N.Succ 'N.Zero)))))
+        ('P.UVar 'P.FZ)
+    :~: 'P.ULam ('P.UApp ('P.UVar 'P.FZ) ('P.UVar ('P.FS 'P.FZ)))
+plugged = Refl
+
+looked ::
+    E.lookupEnv ('E.ECons ('E.MkClos ('P.ULam ('P.UVar 'P.FZ)) 'E.ENil) 'E.ENil) 'P.FZ
+    :~: 'E.MkClos ('P.ULam ('P.UVar 'P.FZ)) 'E.ENil
+looked = Refl
+HS
+    "${ghc[@]}" "$native_opt" -fno-code -fwrite-interface -i -i. -dcore-lint -c NoCodeClosureClient.hs
+    test ! -e NoCodeClosureClient.o
+)
+
 if "$interactive"; then
     "${ghc[@]}" -O0 "${stripped_interfaces[@]}" "${flags[@]}" --interactive -ignore-dot-ghci -fbyte-code \
         -outputdir "$out/interactive" -hiedir "$out/interactive-hie" \

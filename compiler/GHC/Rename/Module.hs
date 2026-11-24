@@ -37,7 +37,7 @@ import GHC.Rename.Utils ( mapFvRn, bindLocalNames
                         , addNoNestedForallsContextsErr, checkInferredVars
                         , makeRnValBinds)
 import GHC.Rename.Unbound ( notInScopeErr, WhereLooking(WL_Global)
-                          , reportUnboundName, WhatLooking(WL_Anything) )
+                          , reportUnboundName )
 import GHC.Rename.Names
 
 import GHC.Tc.Errors.Types
@@ -1130,22 +1130,23 @@ liftDeclarationTypes source_heads earlier helper_suffix lift_cases named_wildcar
         copyableAlt (L _ (HsTypeCaseAlt pat _ rhs)) =
           isJust (classifyTypeCasePattern pat) && copyable rhs
 
-    innerScope site scope HsForAllTy{hst_tele = tele, hst_body = body}
+    innerScope site scope (HsForAllTy x tele body)
       | signatureSite site
       , Just locals <- forallCaptures tele
       = let lift_lambda = signatureLambdaSite site && ordinaryErasedForall tele
                           && isJust (extendLambdaForallScope scope locals) && spliceFree body
-        in Just (ForallTypeSite lift_lambda, locals, body)
+        in Just (ForallTypeSite lift_lambda, locals, body, HsForAllTy x tele)
       | site == FieldTypeSite
       , ordinaryErasedForall tele
       , Just locals <- forallCaptures tele
-      = Just (FieldTypeSite, locals, body)
-    innerScope site _ HsForEachTy{hst_bndrs = binders, hst_body = body}
+      = Just (FieldTypeSite, locals, body, HsForAllTy x tele)
+    innerScope site _ (HsForEachTy x binders body)
       | not (fieldSite site)
       , not (localLambdaSite site)
       , Just locals <- writtenCaptures binders
       , not (null locals)
-      = Just (RetainedTypeSite (map (unLoc . snd) locals ++ retainedNames site), locals, body)
+      = Just (RetainedTypeSite (map (unLoc . snd) locals ++ retainedNames site), locals, body,
+              HsForEachTy x binders)
     innerScope _ _ _ = Nothing
 
     localLambdaSite LocalLambdaTypeSite{} = True
@@ -1184,7 +1185,7 @@ liftDeclarationTypes source_heads earlier helper_suffix lift_cases named_wildcar
                 replacement = check_formation (applyAnchor site loc occ used)
             in (replacement, [((alias, (occ, Nothing)), shared, unbound)], (salt + 1, seen'))
     liftBody site owner scope (L loc quantified) (salt, seen)
-      | Just (inner, locals, body) <- innerScope site scope quantified
+      | Just (inner, locals, body, rebuild) <- innerScope site scope quantified
       , let names = map (unLoc . snd) locals
       , null (findDupsEq (==) names)
       , let (hidden, outer) = partition ((`elem` names) . unLoc . snd) scope
@@ -1196,7 +1197,7 @@ liftDeclarationTypes source_heads earlier helper_suffix lift_cases named_wildcar
             save (old, new) ty
               | unLoc new `Set.member` uses = bindTypeName new old ty
               | otherwise = ty
-            result = foldr save (L loc quantified{hst_body = body'}) saved
+            result = foldr save (L loc (rebuild body')) saved
         in (result, aliases, (next, seen))
     liftBody site owner scope (L loc (HsFunTy ann arrow arg result)) state =
       let (arg', arg_aliases, next) = liftBody site owner scope arg state

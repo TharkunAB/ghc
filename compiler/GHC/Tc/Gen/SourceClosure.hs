@@ -221,12 +221,15 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
                 guard (all ((== here) . nameModule_maybe . tyConName) [term, index])
                 pure (UntypedClosureEntry orig_u fin_u)
           shapes <- decoder <|> encoder <|> traversal <|> untyped
-          let keep_internal = case shapes of
+          let keep_helper name = case shapes of
+                IndexedEntry IndexedDecoder _ (IndexedSource _ _ _ _ (Just w) _ _)
+                  | name == idName w -> isExternalName name
                 IndexedEntry IndexedDecoder _ _ -> True
-                _ -> False
-          -- The decoder retains every helper identity. The encoder and GADT
-          -- traversal check floated type-only bodies, which can have internal Names.
-          helper_ids <- dependencies (\name -> keep_internal || isExternalName name) old actual
+                _ -> isExternalName name
+          -- The decoder retains every external helper identity, while an
+          -- internal pre-tidy worker has already had its Core tree verified.
+          -- The encoder and GADT traversal check floated type-only bodies.
+          helper_ids <- dependencies keep_helper old actual
           case shapes of
             UntypedClosureEntry _ _ -> guard (not (null helper_ids))
             _ -> pure ()
@@ -384,7 +387,9 @@ indexedSource bindings owner rhs = do
       pure (Nothing, body)
     unwrap tys fields body = do
       (Core.Var worker, args) <- pure (Core.collectArgs body)
-      guard (worker /= owner && nameModule_maybe (idName worker) == nameModule_maybe (idName owner))
+      guard (worker /= owner &&
+             (not (isExternalName (idName worker)) ||
+              nameModule_maybe (idName worker) == nameModule_maybe (idName owner)))
       let (passed_types, passed_fields) = splitAt (length tys) args
       supplied <- traverse indexedTypeArg passed_types
       guard (eqTypes supplied (mkTyVarTys tys) &&

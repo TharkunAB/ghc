@@ -85,7 +85,7 @@ import GHC.Tc.Gen.SourceClosure
   ( checkLocalIndexedLookupExports, indexedLookupType, pruneUnusedIndexedLookups
   , sourceIndexedLookupTable )
 import GHC.Tc.Gen.SourceTable (sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
-                               isStructuralSourceTable, isNominalStructuralSource, sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules,
+                               isStructuralSourceTable, isNominalStructuralSource, sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
                                hasSourceMethodRule, hasSourceMethodRuleAt, sourceLiteralWorkers, checkSourceMethodUses,
                                checkOptionalSourceUses, checkAndInstallSourceProofs,
                                sourceMapSelector, sourceTableDependencies)
@@ -750,10 +750,14 @@ installSourceMethods wanted env
         -- Load the workers before collecting rules from their interfaces.
         workers <- if null literals then pure [] else sourceLiteralWorkers
         rules <- visibleSourceMethodRules env
+        unloaded <- unloadedSourceRuleHeads env
         let local_rules = sourceRuleOwners (tcg_rules env)
-            plain v = not (idName v `elemNameSet` local_rules || hasSourceMethodRule rules v)
+            plain v = not (idName v `elemNameSet` local_rules
+                           || idName v `elemNameSet` unloaded
+                           || hasSourceMethodRule rules v)
             workers_ok = all plain workers
             plain_at (v, first) = not (idName v `elemNameSet` sourceRuleOwnersAt first (tcg_rules env)
+                                       || idName v `elemNameSet` unloaded
                                        || hasSourceMethodRuleAt rules first v)
             checked = [(dfun, pairs, literal) | (dfun, fields) <- methods, plain dfun
                       , let pairs = [(sel, target) | (sel, meth, SourceMethodAlias target) <- fields
@@ -810,9 +814,11 @@ installSourceTables tables = do
       -- Dependency lookup can load interfaces that contain rules.
       rewriting <- goptM Opt_EnableRewriteRules
       visible <- if rewriting then Just <$> visibleSourceMethodRules env else pure Nothing
+      unloaded <- if rewriting then unloadedSourceRuleHeads env else pure emptyNameSet
       used <- readTcRef (tcg_source_table_uses env)
       let ruled = sourceRuleOwners (tcg_rules env)
           changed fun = idName fun `elemNameSet` ruled
+                        || idName fun `elemNameSet` unloaded
                         || maybe False (`hasSourceMethodRule` fun) visible
       ids <- forM (zip prepared dependencies) $ \((fun, table, origin), callees) -> do
         let name = idName fun
@@ -1896,6 +1902,12 @@ invalidAbsDataSubTypes = execWriter . go
     go ty@(TermVarTy {})
       = invalid ty
     go ty@(DepFunTy {})
+      = invalid ty
+    go ty@(ExistsTy {})
+      = invalid ty
+    go ty@(DepDictTy {})
+      = invalid ty
+    go ty@(ClassAppTy {})
       = invalid ty
     go TyVarTy{}
       = ok -- We report an error at the binding site of type variables,

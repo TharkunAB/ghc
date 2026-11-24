@@ -1,8 +1,9 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
-{-# LANGUAGE PolyKinds, StandaloneKindSignatures, TypeOperators #-}
+{-# LANGUAGE DataKinds, EmptyCase, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE PolyKinds, ScopedTypeVariables, StandaloneKindSignatures, TypeApplications, TypeOperators #-}
 module NativeIndexedForEachCtorProvider
   ( Nat(..), Fin(..), UTerm(..), BetaStep(..), BetaSteps(..)
   , EvalStep(..), Wrap(..), SomeTerm(..), WrapSome(..)
+  , RemoveFin(..), CmpFin(..), cmpFinFZ
   , LamSteps, VarSteps
   , packLam, packVar, mkEvalStep
   ) where
@@ -63,3 +64,22 @@ packVar = Pair (UVar (FS FZ)) BRefl
 mkEvalStep :: forall (k :: Nat) (m :: UTerm k).
               foreach (n :: UTerm k) -> BetaSteps m n -> EvalStep m
 mkEvalStep n steps = MkStep n steps
+
+type RemoveFin :: forall (n :: Nat). Fin ('Succ n) -> Fin ('Succ n) -> Fin n -> Type
+data RemoveFin c x y where
+  RemGt :: forall {n} (y :: Fin n). RemoveFin 'FZ ('FS y) y
+  RemLt :: forall {n} (c :: Fin ('Succ n)). RemoveFin ('FS c) 'FZ 'FZ
+  RemSS :: RemoveFin c x y -> RemoveFin ('FS c) ('FS x) ('FS y)
+
+type CmpFin :: forall (n :: Nat). Fin ('Succ n) -> Fin ('Succ n) -> Type
+data CmpFin c x where
+  CmpEq  :: CmpFin c c
+  CmpNeq :: foreach (y :: Fin n) -> RemoveFin c x y -> CmpFin c x
+
+cmpFinFZ :: forall (m :: Nat).
+            foreach (x :: Fin ('Succ ('Succ m))) -> CmpFin ('FS ('FZ @m)) x
+cmpFinFZ x = case x of
+  FZ    -> CmpNeq FZ (RemLt @FZ)
+  FS x' -> case x' of
+    FZ   -> CmpEq
+    FS y -> CmpNeq (FS y) (RemSS (RemGt @y))

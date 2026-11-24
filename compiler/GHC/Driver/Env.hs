@@ -39,6 +39,7 @@ module GHC.Driver.Env
    , hugRulesBelow
    , hugRuleInterfacesBelow
    , visibleSourceRuleHeads
+   , visibleUnloadedSourceRuleHeads
    , hugInstancesBelow
    , hugAnnsBelow
    , hugCompleteSigsBelow
@@ -283,14 +284,23 @@ hugRuleInterfacesBelow hsc_env uid mn = concat <$>
 -- Note that 'eps_PIT' entries purge 'mi_rules' (see 'GHC.Iface.Load.loadInterface'),
 -- so only 'sourceRuleHeadsField' is read from 'eps_PIT' interfaces.
 visibleSourceRuleHeads :: HscEnv -> Module -> HscSource -> ModuleSet -> IO NameSet
-visibleSourceRuleHeads hsc_env this_mod hsc_src visible_orphs = do
+visibleSourceRuleHeads hsc_env =
+  visibleUnloadedSourceRuleHeads hsc_env True
+
+-- | Collect active non-auto rule head 'Name's that are not present in the
+-- loaded 'RuleEnv': when 'ignore_prags' is 'True', returns all visible rule
+-- heads; when 'ignore_prags' is 'False', returns only rule heads that were
+-- stripped from 'mi_rules' (e.g. by @-fno-code@ or @-fomit-interface-pragmas@).
+visibleUnloadedSourceRuleHeads
+  :: HscEnv -> Bool -> Module -> HscSource -> ModuleSet -> IO NameSet
+visibleUnloadedSourceRuleHeads hsc_env ignore_prags this_mod hsc_src visible_orphs = do
   eps <- hscEPS hsc_env
   home_ifaces <- if isInteractiveModule this_mod
     then concat <$> mapM interactive_ifaces (moduleSetElts visible_orphs)
     else hugRuleInterfacesBelow hsc_env (homeUnitId (hsc_home_unit hsc_env))
                                 (GWIB (moduleName this_mod) (hscSourceToIsBoot hsc_src))
   let eps_ifaces = moduleEnvElts (eps_PIT eps)
-  home_heads <- mapM (iface_rule_heads True) home_ifaces
+  home_heads <- mapM (iface_rule_heads ignore_prags) home_ifaces
   eps_heads <- mapM (iface_rule_heads False) eps_ifaces
   pure (unionNameSets (home_heads ++ eps_heads))
   where
@@ -311,7 +321,12 @@ visibleSourceRuleHeads hsc_env this_mod hsc_src visible_orphs = do
                     || mi_module iface `elemModuleSet` visible_orphs ]
             | otherwise = []
       stored <- readFieldWith sourceRuleHeadsField (getWithUserData (hsc_NC hsc_env)) (mi_ext_fields iface)
-      pure (mkNameSet (raw_heads ++ concat stored))
+      let selected = case stored of
+            Nothing -> []
+            Just (all_heads, stripped_heads)
+              | ignore_prags -> all_heads
+              | otherwise    -> stripped_heads
+      pure (mkNameSet (raw_heads ++ selected))
 
 -- | Get annotations from all modules "below" this one (in the dependency
 -- sense) within the home units. If the module is @Nothing@, returns /all/

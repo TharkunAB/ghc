@@ -191,6 +191,7 @@ import qualified BookParallel
 import qualified BookContextPlug
 import qualified BookEnvironment
 import qualified BookReverseProof
+import qualified ExplicitListReverse
 import qualified BookNaturals
 import qualified CastedConstructorGivens as TreeProof
 import qualified SumOfSizes
@@ -390,6 +391,49 @@ extendNestedStep _ _ Refl payload = payload
 transportNestedStep :: foreach (from :: Nat) -> foreach (to :: Nat)
                     -> from :~: to -> NestedStep from -> NestedStep to
 transportNestedStep _ _ Refl payload = payload
+
+-- | Store an indexed GADT witness lazily alongside its parallel reduction.
+data ParStep (m :: BookParallel.UTerm k) where
+    MkParStep :: foreach (n :: BookParallel.UTerm k) -> BookParallel.Par m n -> ParStep m
+
+-- | Package a vanilla-return untyped lambda constructor inside a dependent Sigma pair.
+packLamPar :: forall n. foreach (b :: BookParallel.UTerm ('HaskLib.Succ n))
+           -> (some (t' :: BookParallel.UTerm n) | BookParallel.Par ('BookParallel.ULam b) t')
+packLamPar b = Sigma.Pair (BookParallel.ULam b) (BookParallel.PLam (BookParallel.parRefl b))
+
+-- | Substitute an open variable after plugging a body under a context lambda.
+pluggedSubstEquation ::
+    BookParallel.substSingleU
+        (BookContextPlug.plug
+            ('BookContextPlug.CLam 'BookContextPlug.CHole)
+            ('BookParallel.UApp
+                ('BookParallel.UVar 'BookParallel.FZ)
+                ('BookParallel.UVar ('BookParallel.FS 'BookParallel.FZ))
+                :: BookParallel.UTerm ('HaskLib.Succ ('HaskLib.Succ ('HaskLib.Succ 'HaskLib.Zero)))))
+        ('BookParallel.UVar 'BookParallel.FZ)
+    :~: 'BookParallel.ULam
+            ('BookParallel.UApp
+                ('BookParallel.UVar 'BookParallel.FZ)
+                ('BookParallel.UVar ('BookParallel.FS 'BookParallel.FZ)))
+pluggedSubstEquation = Refl
+
+-- | Reduce an imported indexed environment lookup equation across module interfaces.
+importedLookupEquation ::
+    BookEnvironment.lookupEnv
+        ('BookEnvironment.ECons
+            ('BookEnvironment.MkClos ('BookParallel.ULam ('BookParallel.UVar 'BookParallel.FZ)) 'BookEnvironment.ENil)
+            'BookEnvironment.ENil)
+        'BookParallel.FZ
+    :~: 'BookEnvironment.MkClos ('BookParallel.ULam ('BookParallel.UVar 'BookParallel.FZ)) 'BookEnvironment.ENil
+importedLookupEquation = Refl
+
+-- | Reduce imported explicit-list reversal equations in a separate consumer.
+explicitRevPair :: ExplicitListReverse.rev '[ 'True, 'False ] :~: '[ 'False, 'True ]
+explicitRevPair = Refl
+
+explicitRevStep :: foreach (x :: a) -> foreach (xs :: [a])
+                -> ExplicitListReverse.rev (x ': xs) :~: ExplicitListReverse.app (ExplicitListReverse.rev xs) '[x]
+explicitRevStep _ _ = Refl
 
 -- | Return the measurement and certify that reversal preserves it.
 measureReverseLength :: forall a. foreach (measure :: [a] -> HaskLib.Size)
@@ -2289,6 +2333,26 @@ main = do
                 (extendNestedStep runtimeOne runtimeZero ps
                     (Right (openZeroStep runtimeZero pz (Just True)))))
     observe "refine and transport a closed family across runtime index equalities" refinedStep
+    let unusedTarget :: BookParallel.UTerm 'HaskLib.Zero
+        unusedTarget = error "unused target"
+        lazyStep = case MkParStep unusedTarget (error "unused par") of
+            MkParStep _ _ -> True
+        lamSigmaOk = case packLamPar @'HaskLib.Zero (BookParallel.UVar BookParallel.FZ) of
+            Sigma.Pair t step -> case t of
+                BookParallel.ULam _ -> case step of
+                    BookParallel.PLam BookParallel.PVar -> True
+                    _ -> False
+                _ -> False
+    observe "store an indexed GADT witness in a constructor field and a Sigma pair"
+        (lazyStep, lamSigmaOk)
+    case BookIsoComposition.isoTransWhere BookIso.sample (BookIsoComposition.isoSym BookIso.sample) of
+        BookIso.MkIso to from left right ->
+            observe "compose isomorphism functions through local where-clause aliases"
+                (left True, right False, to True, from False)
+    observe "reduce plugged untyped closure and lookup equations across interfaces"
+        (pluggedSubstEquation, importedLookupEquation)
+    observe "verify explicit-list reverse equations in Final Core under default -O2"
+        (explicitRevPair, explicitRevStep True [False], ExplicitListReverse.rev [True, False])
 
 -- | Complement one flag at the type level.
 type family FlipFlag (b :: Bool) :: Bool where

@@ -82,9 +82,8 @@ import GHC.Types.Basic
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Map
 import GHC.Types.Unique.Set
-import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar, isTyVar
-                     , binderFlag, binderVar, isInferredForAllTyFlag
-                     , isSpecifiedForAllTyFlag, isVisibleForAllTyFlag )
+import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar
+                     , isInferredForAllTyFlag, isSpecifiedForAllTyFlag )
 import GHC.Types.Var.Set (elemVarSet, isEmptyVarSet)
 import GHC.Types.Id
 import GHC.Types.Id.Info

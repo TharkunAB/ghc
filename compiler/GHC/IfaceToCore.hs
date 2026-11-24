@@ -78,7 +78,7 @@ import GHC.Core.Dependent
   , isRetainedVanillaDefaultMethod, hasRetainedRuleHead, supportsLocalUserRule
   , supportsErasedUserRule, supportsImportedErasedRule, supportsImportedUserRule
   , supportsNativeUserUnfolding )
-import GHC.Core.Predicate ( isEqClassPred, mkNomEqPred )
+import GHC.Core.Predicate ( mkNomEqPred )
 import GHC.Core.Opt.OccurAnal ( occurAnalyseBndrsAndExpr )
 import GHC.Core.Ppr
 
@@ -113,7 +113,6 @@ import GHC.Types.SrcLoc
 import GHC.Types.Avail
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.FM
-import GHC.Types.Unique ( hasKey )
 import GHC.Types.Unique.DSet ( mkUniqDSet, emptyUniqDSet )
 import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Types.Unique.Supply

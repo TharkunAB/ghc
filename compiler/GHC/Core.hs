@@ -41,6 +41,7 @@ module GHC.Core (
         termVar_maybe, nativeIndexFunctionVar_maybe, nativeIndexFunctionArgIndex,
         nativeLocalFunctionArgIndex, nativeIndexArgKinds,
         nativeClassSelectorTys, nativeClassSelectorIndex, nativeIndexedConArgs,
+        nativeIndexedOperandSignature_maybe,
         nativeIndexedConApp_maybe, splitNativeIndexedConApp, isNativeConstructedGadtIndex,
         nativeFamilyConHead_maybe, nativeFamilyPromotedCon_maybe,
         containsIndexedConOperand, containsGeneralIndexedConOperand, containsRetainedCharLiteral,
@@ -3194,10 +3195,15 @@ nativeIndexedOperandSignature_maybe con
   | (_, exs, eqs, [], fields, _) <- dataConFullSig con
   , let tc = dataConTyCon con
   , not (null eqs) || not (null exs)
-    || not (isNativeIndexType (mkTyConApp tc (mkTyVarTys (tyConTyVars tc))))
+    || ((any (not . tcIsLiftedTypeKind . tyVarKind) (tyConTyVars tc)
+         || any (\dc -> case dataConFullSig dc of
+                          (_, d_exs, d_eqs, _, _, _) -> not (null d_eqs) || not (null d_exs))
+                (tyConDataCons tc))
+        && not (isNativeIndexType (mkTyConApp tc (mkTyVarTys (tyConTyVars tc)))))
   , null (dataConStupidTheta con)
   , isVanillaAlgTyCon tc, isBoxedDataTyCon tc
   , not (isTypeDataCon con), null (dataConRepArgBinders con)
+  , all (\(Scaled mult ty) -> (isOneTy mult || isManyTy mult) && isNativeOpaqueValueType ty) fields
   , not (any isBanged (dataConImplBangs con))
   , dataConRepArity con == length eqs + length fields
   , all isTyVar exs
