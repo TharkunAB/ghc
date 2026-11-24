@@ -2794,6 +2794,30 @@ makeExtensionFlags ext = [ makeExtensionFlag name depr ext | (depr, name) <- ext
 
 xFlagsDeps :: [(Deprecation, FlagSpec LangExt.Extension)]
 xFlagsDeps = concatMap makeExtensionFlags [minBound .. maxBound]
+          ++ [ (NotDeprecated, FlagSpec "DependentTypes" LangExt.ExperimentalDependentTypes setDependentTypesBundle AllModes)
+             , (NotDeprecated, FlagSpec "ExistentialTypes" LangExt.ExperimentalDependentTypes nop AllModes)
+             , (NotDeprecated, FlagSpec "ExtendedLet" LangExt.ExperimentalDependentTypes nop AllModes)
+             ]
+
+setDependentTypesBundle :: TurnOnFlag -> DynP ()
+setDependentTypesBundle False = return ()
+setDependentTypesBundle True  = do
+  mapM_ setExtensionFlag
+    [ LangExt.GADTs
+    , LangExt.DataKinds
+    , LangExt.PolyKinds
+    , LangExt.TypeOperators
+    , LangExt.RankNTypes
+    , LangExt.ScopedTypeVariables
+    , LangExt.TypeApplications
+    , LangExt.TypeAbstractions
+    , LangExt.StandaloneKindSignatures
+    , LangExt.EmptyCase
+    , LangExt.Modifiers
+    , LangExt.RequiredTypeArguments
+    , LangExt.ExplicitNamespaces
+    ]
+  unSetExtensionFlag LangExt.ListTuplePuns
 
 makeExtensionFlag :: String -> ExtensionDeprecation -> LangExt.Extension -> (Deprecation, FlagSpec LangExt.Extension)
 makeExtensionFlag name depr ext = (deprecation depr, spec)
@@ -3949,6 +3973,15 @@ makeDynFlagsConsistent dflags
  | gopt Opt_InfoTableMap dflags
  , NotValid msg <- backendInfoTableMapValidity (backend dflags)
     = loop (gopt_unset dflags Opt_InfoTableMap) msg
+
+ | let want_source_eqs
+         | gopt Opt_ExplicitWriteSourceEquations dflags = True
+         | gopt Opt_SuppressSourceEquations dflags      = False
+         | otherwise = xopt LangExt.ExperimentalDependentTypes dflags
+ , gopt Opt_WriteSourceEquations dflags /= want_source_eqs
+    = let dflags' | want_source_eqs = gopt_set dflags Opt_WriteSourceEquations
+                  | otherwise       = gopt_unset dflags Opt_WriteSourceEquations
+      in makeDynFlagsConsistent dflags'
 
  | otherwise = (dflags, mempty, mempty)
     where loc = mkGeneralSrcSpan (fsLit "when making flags consistent")

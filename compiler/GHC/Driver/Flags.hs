@@ -400,12 +400,16 @@ impliedGFlags = [(Opt_DeferTypeErrors, turnOn, Opt_DeferTypedHoles)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithStack)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithFallback)
                 ,(Opt_InfoTableMap, turnOn, Opt_Ticky_AP)
+                ,(Opt_WriteSourceEquations, turnOn, Opt_ExplicitWriteSourceEquations)
+                ,(Opt_WriteSourceEquations, turnOff, Opt_SuppressSourceEquations)
                 ] ++ validHoleFitsImpliedGFlags
 
 -- | General flags that are switched on/off when other general flags are switched
 -- off
 impliedOffGFlags :: [(GeneralFlag, TurnOnFlag, GeneralFlag)]
-impliedOffGFlags = [(Opt_Strictness, turnOff, Opt_WorkerWrapper)]
+impliedOffGFlags = [(Opt_Strictness, turnOff, Opt_WorkerWrapper)
+                   ,(Opt_WriteSourceEquations, turnOn, Opt_SuppressSourceEquations)
+                   ,(Opt_WriteSourceEquations, turnOff, Opt_ExplicitWriteSourceEquations)]
 
 -- Please keep @docs/users_guide/what_glasgow_exts_does.rst@ up to date with this list.
 glasgowExtsFlags :: [LangExt.Extension]
@@ -926,6 +930,8 @@ data GeneralFlag
    | Opt_PrintExplicitMatchabilities
 
    | Opt_WriteSourceEquations
+   | Opt_ExplicitWriteSourceEquations
+   | Opt_SuppressSourceEquations
    deriving (Eq, Show, Enum)
 
 -- | The set of flags which affect optimisation for the purposes of

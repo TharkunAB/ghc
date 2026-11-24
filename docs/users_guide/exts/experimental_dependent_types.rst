@@ -3,6 +3,26 @@
 Experimental dependent types
 ============================
 
+.. extension:: DependentTypes
+    :shortdesc: Enable the GHC Proposal #378 Dependent Haskell extension bundle.
+
+    :implies: :extension:`ExperimentalDependentTypes`, :extension:`GADTs`,
+              :extension:`DataKinds`, :extension:`PolyKinds`,
+              :extension:`TypeOperators`, :extension:`RankNTypes`,
+              :extension:`ScopedTypeVariables`, :extension:`TypeApplications`,
+              :extension:`TypeAbstractions`, :extension:`StandaloneKindSignatures`,
+              :extension:`EmptyCase`, :extension:`Modifiers`,
+              :extension:`RequiredTypeArguments`, :extension:`ExplicitNamespaces`,
+              :extension:`NoListTuplePuns`
+    :since: 10.1
+    :status: Experimental
+
+    Enable Dependent Haskell (`GHC Proposal #378`_) together with its canonical
+    companion extensions and default-on source equation publication
+    (:ghc-flag:`-fwrite-source-equations`).
+
+.. _GHC Proposal #378: https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0378-dependent-type-design.rst
+
 .. extension:: ExperimentalDependentTypes
     :shortdesc: Check restricted retained algebraic quantification.
 
@@ -10,12 +30,40 @@ Experimental dependent types
     :since: 10.1
     :status: Experimental
 
-    Enable retained algebraic quantification for an internal experiment.
+    Enable retained algebraic quantification without enabling the full
+    :extension:`DependentTypes` pragma bundle (useful when preserving
+    ``ListTuplePuns`` or Haskell2010 defaults).
 
-This flag is local to the native dependent Haskell experiment.
-This extension is disabled by default. It enables ``foreach`` in types and
-checks a restricted subset of explicit value signatures. To override the
-implication, put ``NoRequiredTypeArguments`` after ``ExperimentalDependentTypes``.
+.. extension:: ExistentialTypes
+    :shortdesc: Enable first-class existential quantification.
+
+    :since: 10.1
+    :status: Experimental
+
+    Alias enabling existential quantification (``exists``) and dependent type
+    extensions.
+
+.. extension:: ExtendedLet
+    :shortdesc: Enable local let bindings in types.
+
+    :since: 10.1
+    :status: Experimental
+
+    Alias enabling ``let ... in ...`` bindings in types.
+
+Both :extension:`DependentTypes` and :extension:`ExperimentalDependentTypes` are
+disabled by default. Enabling either extension also enables
+:ghc-flag:`-fwrite-source-equations` by default unless explicitly suppressed via
+:ghc-flag:`-fno-write-source-equations`. It enables ``foreach`` (and Unicode
+``∏``, ``U+220F``, when :extension:`UnicodeSyntax` is active), ``exists``, and
+``some`` in types as well as in required type argument term syntax, and checks
+explicit dependent value signatures.
+Telescopes in ``forall``, ``foreach``, ``exists``, and ``some`` support
+shared-type binder groups such as ``foreach (m n p :: Nat) ->`` and
+``some (m n :: Nat).``, and invisible ``foreach .`` / ``exists`` telescopes
+accept brace-delimited specificity binders such as ``foreach {k :: Nat}.``.
+To override any implied extension, list its ``No...`` (or ``ListTuplePuns``)
+counterpart after ``DependentTypes``.
 The experiment uses a native dependent Core representation. The restricted
 module path supports native top-level signatures and local retained functions.
 Interfaces encode
@@ -683,9 +731,14 @@ indices, and opaque applications of a bound function. Its version is
 separate from the ordinary interface version. Regenerate older
 ``.hie`` files with this compiler before reading them.
 
-The extension implies no other extensions. In particular, it does not imply
-:extension:`KindSignatures`. The ``:: Bool`` annotation specifies the
-type of a value binder. It does not make that binder a type variable.
+:extension:`ExperimentalDependentTypes` implies :extension:`RequiredTypeArguments`
+(and enables :ghc-flag:`-fwrite-source-equations` unless
+:ghc-flag:`-fno-write-source-equations` is given), while
+:extension:`DependentTypes` additionally implies the canonical Proposal #378
+extension bundle listed above. Every implied extension can be overridden by a
+later ``No...`` or ``ListTuplePuns`` pragma. The ``:: Bool`` annotation in a
+``foreach`` binder specifies the type of a value binder; it does not make that
+binder an erased type variable.
 
 When the extension is disabled, ``foreach`` remains an ordinary identifier::
 

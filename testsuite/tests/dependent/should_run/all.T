@@ -970,3 +970,8 @@ test('NativeComposedLetWhere',
      [req_host_target_ghc, req_interp, only_ways(['normal']),
       extra_files(['NativeComposedLetWhere.hs'])],
      run_command, ['bash NativeComposedLetWhere.sh "{compiler}" "{libdir}"'])
+test('NativeProposal378SyntaxAndFlags',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeProposal378SyntaxAndFlagsProvider.hs',
+                   'NativeProposal378SyntaxAndFlags.hs'])],
+     run_command, ['bash NativeProposal378SyntaxAndFlags.sh "{compiler}" "{libdir}"'])

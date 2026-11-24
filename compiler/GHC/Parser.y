@@ -2301,14 +2301,10 @@ ctype   :: { LHsType GhcPs }
                                               HsForAllTy { hst_tele = unLoc $1
                                                          , hst_xforall = noExtField
                                                          , hst_body = $2 } }
-        | 'exists' tv_bndr_no_braces '|' ctype
-                                     {% amsA' (sLL $1 $> $
-                                          XHsType (HsTypeExists (epTok $1, Left (epTok $3)) $2 $4)) }
-        | 'exists' tv_bndr_no_braces '.' ctype
-                                     {% amsA' (sLL $1 $> $
-                                          XHsType (HsTypeExists (epTok $1, Right (epTok $3)) $2 $4)) }
-        | 'foreach' foreach_bndrs foreach_separator ctype
-                                     {% do { bndrs <- fromSpecTyVarBndrs $2
+        | 'exists' tv_bndrs1 exists_separator ctype
+                                     {% mkHsExistsTelescope $1 $2 $3 $4 }
+        | 'foreach' tv_bndrs foreach_separator ctype
+                                     {% do { bndrs <- checkForEachBndrs $3 $2
                                            ; amsA' (sLL $1 $> $
                                                HsForEachTy { hst_xforeach = (epTok $1, $3)
                                                            , hst_bndrs = bndrs
@@ -2316,10 +2312,8 @@ ctype   :: { LHsType GhcPs }
         | '\\' type_lambda_binders '->' ctype
                                      {% amsA' (sLL $1 $> $
                                           XHsType (HsTypeLambda (epTok $1, epUniTok $3) $2 $4)) }
-        | 'some' '(' tyvar '::' ctype ')' '|' ctype
-                                     {% amsA' (sLL $1 $> $ XHsType
-                                           (HsTypeSome (epTok $1, epTok $2, epUniTok $4, epTok $6, epTok $7)
-                                                       $3 $5 $8)) }
+        | 'some' some_bndrs1 some_separator ctype
+                                     {% mkHsSomeTelescope $1 $2 $3 $4 }
         | context '=>' ctype          {% acsA (comb2 $1 $>) (\loc cs -> (L loc $
                                             HsQualTy { hst_ctxt = addTrailingDarrowA $1 (epUniTok $2) cs
                                                      , hst_xqual = NoExtField
@@ -2571,13 +2565,61 @@ bar_types2    :: { [LHsType GhcPs] }  -- Two or more:  ty|ty|ty
                                              ; return (h : $3) }}
 
 tv_bndrs :: { [LHsTyVarBndr Specificity GhcPs] }
-         : tv_bndr tv_bndrs             { $1 : $2 }
+         : tv_bndr_group tv_bndrs       { $1 ++ $2 }
          | {- empty -}                  { [] }
 
--- Do not accept inferred type binders in a retained telescope.
-foreach_bndrs :: { [LHsTyVarBndr Specificity GhcPs] }
-         : tv_bndr_no_braces foreach_bndrs { $1 : $2 }
-         | {- empty -}                    { [] }
+tv_bndrs1 :: { [LHsTyVarBndr Specificity GhcPs] }
+         : tv_bndr_group tv_bndrs       { $1 ++ $2 }
+
+tv_bndr_group :: { [LHsTyVarBndr Specificity GhcPs] }
+         : tv_bndr                      { [$1] }
+         | '(' tyvar_wc tyvar_wcs1 '::' kind ')'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = SpecifiedSpec
+                         , tvb_var  = unLoc v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+         | '{' tyvar tyvars1 '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrNoKind noExtField })))
+                ($2 : $3) }
+         | '{' tyvar tyvars1 '::' kind '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+
+tyvar_wcs1 :: { [Located (HsBndrVar GhcPs)] }
+         : tyvar_wc                     { [$1] }
+         | tyvar_wc tyvar_wcs1          { $1 : $2 }
+
+tyvars1 :: { [LocatedN RdrName] }
+         : tyvar                        { [$1] }
+         | tyvar tyvars1                { $1 : $2 }
+
+exists_separator :: { Either (EpToken "|") (EpToken ".") }
+         : '|' { Left (epTok $1) }
+         | '.' { Right (epTok $1) }
+
+some_bndrs1 :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")] }
+         : some_bndr_group              { $1 }
+         | some_bndr_group some_bndrs1  { $1 ++ $2 }
+
+some_bndr_group :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")] }
+         : '(' tyvar '::' ctype ')'
+             { [(epTok $1, $2, epUniTok $3, $4, epTok $5)] }
+         | '(' tyvar tyvars1 '::' ctype ')'
+             { [ (epTok $1, v, epUniTok $4, $5, epTok $6) | v <- $2 : $3 ] }
+
+some_separator :: { EpToken "|" }
+         : '|'                          { epTok $1 }
+         | '.'                          { EpTok (EpaSpan (gl $1)) }
 
 foreach_separator :: { Either TokRarrow (EpToken ".") }
          : '->' { Left (epUniTok $1) }
@@ -3084,6 +3126,19 @@ infixexp2 :: { ECP }
                                 { ECP $
                                   unECP $2 >>= \ $2 ->
                                   mkHsForallPV (comb2 $1 $>) (unLoc $1) $2 }
+        | 'foreach' tv_bndrs foreach_separator ctype
+                                {% do { bndrs <- checkForEachBndrs $3 $2
+                                      ; ty <- amsA' (sLL $1 $> $
+                                          HsForEachTy { hst_xforeach = (epTok $1, $3)
+                                                      , hst_bndrs = bndrs
+                                                      , hst_body = $4 })
+                                      ; return $ ECP $ mkHsEmbTyPV (comb2 $1 $>) noEpTok ty } }
+        | 'exists' tv_bndrs1 exists_separator ctype
+                                {% do { ty <- mkHsExistsTelescope $1 $2 $3 $4
+                                      ; return $ ECP $ mkHsEmbTyPV (comb2 $1 $>) noEpTok ty } }
+        | 'some' some_bndrs1 some_separator ctype
+                                {% do { ty <- mkHsSomeTelescope $1 $2 $3 $4
+                                      ; return $ ECP $ mkHsEmbTyPV (comb2 $1 $>) noEpTok ty } }
 
 infixexp :: { ECP }
         : exp10 { $1 }
@@ -4222,7 +4277,6 @@ varid :: { LocatedN RdrName }
         | 'interruptible'  { sL1n $1 $! mkUnqual varName (fsLit "interruptible")}
         | 'family'         { sL1n $1 $! mkUnqual varName (fsLit "family") }
         | 'role'           { sL1n $1 $! mkUnqual varName (fsLit "role") }
-        | 'some'           { sL1n $1 $! mkUnqual varName (fsLit "some") }
         -- If this changes relative to tyvarid, update 'checkRuleTyVarBndrNames'
         -- in GHC.Parser.PostProcess
         -- See Note [Parsing explicit foralls in Rules]
@@ -4954,4 +5008,48 @@ combineHasLocs a b = combineSrcSpans (getHasLoc a) (getHasLoc b)
 fromTrailingN :: SrcSpanAnnN -> SrcSpanAnnA
 fromTrailingN (EpAnn anc ann cs)
     = EpAnn anc (nann_trailing ann) cs
+
+checkForEachBndrs :: Either TokRarrow (EpToken ".")
+                  -> [LHsTyVarBndr Specificity GhcPs]
+                  -> P [LHsTyVarBndr () GhcPs]
+checkForEachBndrs (Left _)  bndrs = fromSpecTyVarBndrs bndrs
+checkForEachBndrs (Right _) bndrs = pure [ L loc (b { tvb_flag = () }) | L loc b <- bndrs ]
+
+mkHsExistsTelescope :: Located Token
+                    -> [LHsTyVarBndr Specificity GhcPs]
+                    -> Either (EpToken "|") (EpToken ".")
+                    -> LHsType GhcPs
+                    -> P (LHsType GhcPs)
+mkHsExistsTelescope kw bndrs sep body = case bndrs of
+  [b] -> amsA' (sLL kw body (XHsType (HsTypeExists (epTok kw, sep) b body)))
+  b : rest -> do
+    inner <- go rest
+    amsA' (sLL kw body (XHsType (HsTypeExists (epTok kw, sep) b inner)))
+  [] -> panic "mkHsExistsTelescope: empty"
+  where
+    go [b] = amsA' (L (comb2 b body) (XHsType (HsTypeExists (noEpTok, sep) b body)))
+    go (b : rest) = do
+      inner <- go rest
+      amsA' (L (comb2 b body) (XHsType (HsTypeExists (noEpTok, sep) b inner)))
+    go [] = panic "mkHsExistsTelescope.go: empty"
+
+mkHsSomeTelescope :: Located Token
+                  -> [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")]
+                  -> EpToken "|"
+                  -> LHsType GhcPs
+                  -> P (LHsType GhcPs)
+mkHsSomeTelescope kw bndrs sep body = case bndrs of
+  [(lpar, v, dcol, dom, rpar)] ->
+    amsA' (sLL kw body $ XHsType (HsTypeSome (epTok kw, lpar, dcol, rpar, sep) v dom body))
+  (lpar, v, dcol, dom, rpar) : rest -> do
+    inner <- go rest
+    amsA' (sLL kw body $ XHsType (HsTypeSome (epTok kw, lpar, dcol, rpar, sep) v dom inner))
+  [] -> panic "mkHsSomeTelescope: empty"
+  where
+    go [(lpar, v, dcol, dom, rpar)] =
+      amsA' (L (comb2 v body) $ XHsType (HsTypeSome (noEpTok, lpar, dcol, rpar, sep) v dom body))
+    go ((lpar, v, dcol, dom, rpar) : rest) = do
+      inner <- go rest
+      amsA' (L (comb2 v body) $ XHsType (HsTypeSome (noEpTok, lpar, dcol, rpar, sep) v dom inner))
+    go [] = panic "mkHsSomeTelescope.go: empty"
 }
