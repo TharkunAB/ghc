@@ -67,7 +67,7 @@ import GHC.Core.Dependent ( hasNativeDependentExpr, supportsQuickLookType )
 import GHC.Core.Utils (applyTypeToArgs)
 import GHC.Core.UsageEnv
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Core.Make (rEC_CON_ERROR_ID)
+import GHC.Core.Make (rEC_CON_ERROR_ID, tYPE_ERROR_ID)
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
@@ -1289,21 +1289,36 @@ tcExpr expr@(HsEmbTy _ written) expected
   = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
        ; unless enabled $ failWith (TcRnIllegalTypeExpr TypeKeywordSyntax)
        ; case expected of
-           Check ty
-             | Just (tc, [kind, _]) <- splitTyConApp_maybe ty ->
-               do { selector <- tcLookupKnownOccId typeRepIdOcc
-                  ; let (_, _, rep) = tcSplitSigmaTy (idType selector)
-                  ; case splitTyConApp_maybe rep of
-                      Just (rep_tc, _) | tc == rep_tc ->
-                        do { arg <- tcHsTypeApp written kind
-                           ; let args = [kind, arg]
-                                 (theta, actual) = tcSplitPhiTy (piResultTys (idType selector) args)
-                           ; wrap <- instCall (exprCtOrigin expr) args theta
-                           ; let call = mkHsWrap wrap (mkHsVar (noLocA selector))
-                           ; result <- tcWrapResultMono expr call actual expected
-                           ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA result)))) }
-                      _ -> wrong_context (Just ty) }
-             | otherwise -> wrong_context (Just ty)
+           Check ty ->
+             do { ty' <- liftZonkM (zonkTcType ty)
+                ; if tcIsLiftedTypeKind ty'
+                  then do
+                    { checked_ty <- tcCheckEmbeddedType written
+                    ; tv_name <- newSysName (mkTyVarOcc "emb")
+                    ; let tv = mkTyVar tv_name liftedTypeKind
+                          err_fun = mkHsWrap (mkWpTyApps [liftedRepTy, liftedTypeKind])
+                                             (mkHsVar (noLocA tYPE_ERROR_ID))
+                          err_msg = noLocA (HsLit noExtField
+                                      (HsStringPrim NoSourceText
+                                        (bytesFS (fsLit "evaluated type expression"))))
+                          err_call = HsApp noExtField (noLocA err_fun) err_msg
+                          wrapped = XExpr (WrapExpr (WpCompose (WpTyApp checked_ty) (WpTyLam tv)) err_call)
+                    ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA wrapped)))) }
+                  else case splitTyConApp_maybe ty' of
+                    Just (tc, [kind, _]) ->
+                      do { selector <- tcLookupKnownOccId typeRepIdOcc
+                         ; let (_, _, rep) = tcSplitSigmaTy (idType selector)
+                         ; case splitTyConApp_maybe rep of
+                             Just (rep_tc, _) | tc == rep_tc ->
+                               do { arg <- tcHsTypeApp written kind
+                                  ; let args = [kind, arg]
+                                        (theta, actual) = tcSplitPhiTy (piResultTys (idType selector) args)
+                                  ; wrap <- instCall (exprCtOrigin expr) args theta
+                                  ; let call = mkHsWrap wrap (mkHsVar (noLocA selector))
+                                  ; result <- tcWrapResultMono expr call actual expected
+                                  ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA result)))) }
+                             _ -> wrong_context (Just ty) }
+                    _ -> wrong_context (Just ty) }
            Infer {} -> wrong_context Nothing }
   where
     wrong_context = failWith . TcRnRetainedQuantificationError . RetainedTypeOperandContext

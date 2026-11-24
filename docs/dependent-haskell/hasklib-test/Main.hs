@@ -1,7 +1,7 @@
 module Main where
 
 import Control.Exception (ErrorCall(..), evaluate, try)
-import Client (addUnder, checkAppendSingleton, checkNat, checkReverse, checkZipMap, mapLaw, zipLaw)
+import Client (addUnder, checkAppendSingleton, checkFoldrAndMatchability, checkNat, checkReverse, checkZipMap, mapLaw, zipLaw)
 import HaskLib
 
 -- | Use the installed list proofs from an ordinary Haskell function.
@@ -35,6 +35,7 @@ main = do
         && checkReverse [element, element]
         && checkZipMap (error "forced map callback") (error "forced zip callback") [element] [0]
         && checkNat
+        && checkFoldrAndMatchability [Zero, Succ Zero] [Succ (Succ Zero)]
         && boundWasForced
         && checkPrefix Zero tailList
         && checkPrefix (Succ tailBound) []
