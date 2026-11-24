@@ -5220,6 +5220,9 @@ tcRetainedArgWith reify domain arg
                   ; expected' <- liftZonkM (zonkTcType expected)
                   ; target <- if annotated `tcEqType` expected'
                       then return expected'
+                      else if hasScopedDictionaryType annotated || hasScopedDictionaryType expected'
+                      then failWithTc $ TcRnRetainedQuantificationError
+                             (RetainedIndexArgumentCast annotated expected')
                       else do
                         { loc_ct <- getCtLocM (lexprCtOrigin original) (Just TypeLevel)
                         ; ann_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct annotated
@@ -5892,7 +5895,16 @@ tcRetainedResultInst do_ql expected args fun sigma
        ; first <- try_inst expected
        ; case (first, do_ql, expected) of
            (Nothing, NoQL, Just rho)
-             | hasNativeDependentExpr (Core.Type rho)
+             | not (any is_type_arg args)
+             , (ma_tvs@(_:_), body) <- tcSplitForAllInvisTyVars sigma
+             , let tvs = map snd ma_tvs
+                   (_, tau) = tcSplitPhiTy body
+             , Just res_ty <- peel_visible (count isHsValArg args) tau
+             , isNothing (getTyVar_maybe res_ty)
+             , let res_fvs = tyCoVarsOfTypes [res_ty, typeKind res_ty]
+             , all (`elemVarSet` res_fvs) tvs
+             , hasNativeDependentExpr (Core.Type rho)
+             , not (hasScopedDictionaryType rho)
              , not (isFamFreeTy rho)
              , isTauTy rho || isRetainedValueType rho
              -> do { let orig = TypeEqOrigin { uo_actual = sigma, uo_expected = rho
@@ -5903,6 +5915,17 @@ tcRetainedResultInst do_ql expected args fun sigma
                      then return Nothing
                      else try_inst (Just reduced) }
            _ -> return first }
+  where
+    is_type_arg ETypeArg{} = True
+    is_type_arg _ = False
+
+    peel_visible 0 ty = Just ty
+    peel_visible n ty
+      | n > 0 = case coreFullView ty of
+          DepFunTy DepFunVisible _ res -> peel_visible (n - 1) res
+          _ | Just (_, res) <- splitVisibleFunTy_maybe ty -> peel_visible (n - 1) res
+          _ -> Nothing
+      | otherwise = Nothing
 
 -- | Choose result arguments at a site that commits to the application.
 -- See Note [Inferring the suffix of a checked split].
@@ -7023,28 +7046,28 @@ tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
       then hasNoConcreteTyVars fun && isRetainedValueType tau
       else isTauTy tau && not (isFunTy result)
   = do { expected_ty <- mapM (liftZonkM . zonkTcType) expected
-       ; expected_view <- case expected_ty of
+       ; let index_route = not complete_choices && not (null index_tvs)
+             direct_subst = result_subst expected_ty index_route native_worker tvs result
+             res_fvs = tyCoVarsOfTypes [result, typeKind result]
+       ; initial_subst <- case expected_ty of
            Just rho
-             | not equality_continuation
-             , not overapplied
+             | equality_continuation
+             -> return $ fromMaybe Subst.emptySubst
+                  (matchRetainedAppType tvs Subst.emptySubst result rho)
+           _ | overapplied -> return Subst.emptySubst
+             | any (isJust . Subst.lookupTyVar direct_subst) tvs -> return direct_subst
+           Just rho
+             | any (`elemVarSet` res_fvs) tvs
+             , isNothing (getTyVar_maybe result)
              , hasNativeDependentExpr (Core.Type rho)
+             , not (hasScopedDictionaryType rho)
              , not (isFamFreeTy rho)
              , isTauTy rho || isRetainedValueType rho
              -> do { loc <- getCtLocM (exprCtOrigin (fst rn_head)) (Just TypeLevel)
-                   ; Just . reductionReducedType <$> tcRewriteFamilyAxioms loc rho }
-           _ -> return expected_ty
-       ; let index_route = not complete_choices && not (null index_tvs)
-             initial_subst | equality_continuation
-                           , Just rho <- expected_ty
-                           = fromMaybe Subst.emptySubst
-                               (matchRetainedAppType tvs Subst.emptySubst result rho)
-                           | overapplied = Subst.emptySubst
-                           | let direct = result_subst expected_ty index_route native_worker tvs result
-                           , any (isJust . Subst.lookupTyVar direct) tvs
-                             || isNothing expected_view
-                           = direct
-                           | otherwise = result_subst expected_view index_route native_worker tvs result
-             result_anchor = any (hasNativeDependentExpr . Core.Type)
+                   ; view <- Just . reductionReducedType <$> tcRewriteFamilyAxioms loc rho
+                   ; return (result_subst view index_route native_worker tvs result) }
+           _ -> return direct_subst
+       ; let result_anchor = any (hasNativeDependentExpr . Core.Type)
                                [ty | tv <- tvs, Just ty <- [Subst.lookupTyVar initial_subst tv]]
              needed_tvs | index_route = filter (isNothing . Subst.lookupTyVar initial_subst) index_tvs
                         | otherwise = filter (isNothing . Subst.lookupTyVar initial_subst) tvs

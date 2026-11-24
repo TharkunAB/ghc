@@ -66,9 +66,10 @@ for mode in O0 O2_norules O2; do
         NativeComposedLetWhere.hs -o "run_$mode/prog"
     "./run_$mode/prog" >"run_$mode/stdout"
 done
+expected_run=$'[(True,False,True),(True,False,True),(True,False,True),(True,False,True),(True,False,True),(False,True,True),(False,True,True),(True,False,True),(True,False,True)]\n(1,1)'
+diff -u <(printf '%s\n' "$expected_run") run_O0/stdout
 diff -u run_O0/stdout run_O2_norules/stdout
 diff -u run_O0/stdout run_O2/stdout
-cat run_O0/stdout
 
 # 3. Independent non-proof composition alias must still compile under default -O2.
 cat >IndependentCompose.hs <<'HS'

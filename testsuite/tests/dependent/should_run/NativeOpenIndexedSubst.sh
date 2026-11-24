@@ -138,7 +138,7 @@ retained _ = Refl
 HS
     fi
     cp Plain.hs Syntax.hs
-    provider=(-O"$opt" -fno-omit-interface-pragmas -fexpose-all-unfoldings)
+    provider=(-O"$opt" -fno-omit-interface-pragmas -fexpose-all-unfoldings -fno-write-source-equations)
     "${hc[@]}" "${provider[@]}" -c Syntax.hs
     cp Syntax.hi ../reader/
     cd ../reader

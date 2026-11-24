@@ -17,7 +17,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Fix (mfix)
 import Data.Foldable (for_, traverse_)
-import Data.List (find, nubBy, sortBy, sortOn)
+import Data.List (find, isPrefixOf, nubBy, sortBy, sortOn)
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe, maybeToList)
 
 import GHC.Builtin.KnownKeys (patErrorIdKey)
@@ -27,18 +27,21 @@ import qualified GHC.Core as Core
 import GHC.Core.Coercion (coercionLKind, coercionRKind, coercionRole)
 import GHC.Core.Coercion.Axiom
   ( CoAxBranch, ClosedTyFam(CTF), Role(Nominal)
-  , coAxiomBranches, coAxBranchLHS, coAxBranchRHS, coAxBranchTyVars, fromBranches )
+  , coAxiomBranches, coAxiomName, coAxBranchLHS, coAxBranchRHS, coAxBranchTyVars, fromBranches )
 import GHC.Core.ConLike (ConLike(RealDataCon))
 import qualified GHC.Core.DataCon as DC
-import GHC.Core.FamInstEnv (emptyFamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch)
+import GHC.Core.Dependent (hasExistentialExpr, hasNativeDependentExpr)
+import GHC.Core.FamInstEnv (emptyFamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch, normaliseTcApp)
 import GHC.Core.FVs (exprFreeVars, exprSomeFreeVarsList)
 import GHC.Core.OpenWhnf (checkedMultiplicityCast, openDataConFieldTypes, openIndexedDataCon)
 import GHC.Core.Predicate (tyCoVarsOfTypesWellScoped)
-import GHC.Core.SimpleOpt (simpleOptExpr)
+import GHC.Core.Reduction (reductionReducedType)
+import GHC.Core.SimpleOpt (SimpleOpts, simpleOptExpr)
 import GHC.Core.Subst (extendTvSubst, mkEmptySubst, mkOpenSubst, substExpr)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.FVs (tyConsOfTypes)
-import GHC.Core.TyCo.Rep (Coercion(..), MCoercion(MRefl), Scaled(..), Type(TyVarTy), scaledThing)
+import GHC.Core.TyCo.Rep (Coercion(..), MCoercion(MRefl), Scaled(..), Type(..), scaledThing)
+import GHC.Core.TyCon.Set (TyConSet)
 import GHC.Core.TyCon
   ( FamTyConFlav(ClosedTypeFamilyTyCon), AlgTyConFlav(VanillaAlgTyCon)
   , TyCon, TyConBinder, Injectivity(NotInjective), closedFamilyTyConCoAxiom_maybe, mkAlgTyCon
@@ -146,6 +149,30 @@ data ClosureOperations = ClosureOperations (Id, Id) (Id, Id, Maybe Id)
 data FamilyInputs = FamilyInputs Id Int Kind Kind TyCon TyCon TyCon ClosureOperations
                                   DC.DataCon DC.DataCon DC.DataCon [(DC.DataCon, [Int])]
 
+-- | Simplify ordinary non-dependent Core right-hand sides before inspecting closure shapes.
+safeSimpleOptBind :: SimpleOpts -> (Id, CoreExpr) -> (Id, CoreExpr)
+safeSimpleOptBind opts (v, rhs)
+  | hasExistentialExpr rhs
+  || hasNativeDependentExpr (Core.Type (varType v))
+  || hasNativeDependentExpr rhs
+  = (v, rhs)
+  | otherwise
+  = (v, simpleOptExpr opts rhs)
+
+-- | Allocate the coercion axiom Name for a closure family, marking tables staged
+-- during typechecking so post-typechecking checks leave SourceTable entries untouched.
+mkClosureTableAxiom :: Bool -> Name -> TcM Name
+mkClosureTableAxiom False root = newImplicitBinder root mkInstTyCoOcc
+mkClosureTableAxiom True root =
+    newImplicitBinder root (mkInstTyCoOcc . mkTcOcc . ("early:" ++) . occNameString)
+
+-- | Test whether a closed family was allocated during early closure staging.
+isEarlyClosureTable :: TyCon -> Bool
+isEarlyClosureTable table
+  | Just axiom <- closedFamilyTyConCoAxiom_maybe table
+  = "D:early:" `isPrefixOf` occNameString (nameOccName (coAxiomName axiom))
+  | otherwise = False
+
 -- | Publish tables for eligible final Core bindings. The caller checks
 -- the source-equation opt-in and excludes plugins and local user rules.
 publishCheckedSourceClosures :: [CoreBind] -> [CoreBind] -> TypeEnv -> TcM ([Id], [TyCon])
@@ -158,7 +185,7 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
         imported name = isWiredInName name || ordinaryImport rdr_env name
         public = publicCaseType env exported imported
         unoptimized = inspect original_binds
-        original = [(v, simpleOptExpr opts rhs) | (v, rhs) <- unoptimized]
+        original = map (safeSimpleOptBind opts) unoptimized
         final = inspect final_binds
         inspect binds = [(v, stripTicksE breakpoint rhs) | (v, rhs) <- Core.flattenBinds binds]
         breakpoint Breakpoint{} = True
@@ -313,17 +340,17 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
         let renamings = filter safe (mapMaybe renaming_candidate closures)
             sameRename (owner, _, _) (other, _, _) = owner == other
             sameExtension (_, (ext, _), _) (_, (other, _), _) = ext == other
-        extensions <- catMaybes <$> traverse (publishRenameExtension public) (nubBy sameExtension renamings)
+        extensions <- catMaybes <$> traverse (publishRenameExtension False public) (nubBy sameExtension renamings)
         let extension_tables = [(idName ext, table) | (ext, [table]) <- extensions]
-        checked_renamings <- catMaybes <$> traverse (publishRenaming public extension_tables) (nubBy sameRename renamings)
+        checked_renamings <- catMaybes <$> traverse (publishRenaming False public extension_tables) (nubBy sameRename renamings)
         let checked_tables entries = [(idName owner, table) | (owner, [table]) <- entries]
             subst_extensions = nubBy sameRename (filter safe (mapMaybe substitution_extension closures))
             weakening_inputs = [(weakening, shape) | (_, (_, weakening, shape), _) <- subst_extensions]
-        weakenings <- catMaybes <$> traverse (publishWeakening public) (nubBy (\a b -> fst a == fst b) weakening_inputs)
-        subst_exts <- catMaybes <$> traverse (publishSubstitutionExtension public
+        weakenings <- catMaybes <$> traverse (publishWeakening False public) (nubBy (\a b -> fst a == fst b) weakening_inputs)
+        subst_exts <- catMaybes <$> traverse (publishSubstitutionExtension False public
                         (checked_tables checked_renamings) (checked_tables weakenings)) subst_extensions
         let substitutions = nubBy sameRename (filter safe (mapMaybe substitution_candidate closures))
-        checked_substs <- catMaybes <$> traverse (publishSubstitution public
+        checked_substs <- catMaybes <$> traverse (publishSubstitution False public
                             (checked_tables subst_exts)) substitutions
         checked_lookups <- catMaybes <$> traverse (publishIndexedLookup public) (filter safe lookups)
         let accepted = checked_closures ++ checked_indexed ++ extensions ++ checked_renamings ++
@@ -332,7 +359,7 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
   where
     publish public (owner, (_, shape), helpers)
       | VanillaId <- idDetails owner = do
-          generated <- allocateFamilies shape
+          generated <- allocateFamilies False shape
           pure $ do
             (root, families) <- generated
             guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
@@ -610,19 +637,19 @@ publishIndexedEntries public lookupOwner unoptimized final extDeps safe entries 
                        | (owner, IndexedEntry kind orig fin, helpers) <- entries]
         untyped_closures = [(owner, (orig, fin), helpers)
                            | (owner, UntypedClosureEntry orig fin, helpers) <- entries]
-    checked_rows <- catMaybes <$> traverse (publishIndexed public) indexed_rows
+    checked_rows <- catMaybes <$> traverse (publishIndexed False public) indexed_rows
     checked_untyped <- publishUntypedEntries public lookupOwner unoptimized final extDeps safe untyped_closures
     pure (checked_rows ++ checked_untyped)
 
 -- | Publish closed families after both compiler stages justify their rows.
-publishIndexed :: (TyCon -> Bool) -> (Id, (IndexedKind, IndexedSource, IndexedSource), [Id])
+publishIndexed :: Bool -> (TyCon -> Bool) -> (Id, (IndexedKind, IndexedSource, IndexedSource), [Id])
                -> TcM (Maybe (Id, [TyCon]))
-publishIndexed public (owner, (kind, original, final), helpers) = runMaybeT $ do
+publishIndexed is_early public (owner, (kind, original, final), helpers) = runMaybeT $ do
     let IndexedSource parameters domain carried result _ _ _ = original
         (flags, _) = splitForAllForAllTyBinders (varType owner)
     guard (length flags == length parameters)
     name <- lift (newImplicitBinder (idName owner) mkSourceTableOcc)
-    axiom <- lift (newImplicitBinder name mkInstTyCoOcc)
+    axiom <- lift (mkClosureTableAxiom is_early name)
     operands <- lift (traverse (freshVar "operand") (domain : map varType carried))
     let binders = zipWith (\(_, Bndr _ flag) -> mkNamedTyConBinder flag) flags parameters ++
                   map mkAnonTyConBinder operands
@@ -851,7 +878,7 @@ indexedLookup bindings owner rhs = do
 publishIndexedLookup :: (TyCon -> Bool) -> (Id, (IndexedLookup, IndexedLookup), [Id])
                      -> TcM (Maybe (Id, [TyCon]))
 publishIndexedLookup public (owner, (original, final), _) = runMaybeT $ do
-    table <- makeIndexedLookupTable public owner original (Just final)
+    table <- makeIndexedLookupTable False public owner original (Just final)
     pure (setIdDetails owner (SourceTableId (idName owner) table NominalSourceTable), [table])
 
 -- | Select functions whose signatures can head an early indexed lookup,
@@ -911,7 +938,7 @@ sourceEarlyClosureTables group_owners definitions = do
               | otherwise = isWiredInName name || ordinaryImport rdr_env name
             public tc = all available (tyConName tc : map DC.dataConName (tyConDataCons tc))
             unoptimized = nonDetNameEnvElts definitions
-            bindings = [(v, simpleOptExpr opts rhs) | (v, rhs) <- unoptimized]
+            bindings = map (safeSimpleOptBind opts) unoptimized
             in_group_set = mkNameSet (map idName group_owners)
             fresh_owner v = idName v `elemNameSet` in_group_set && isNothing (sourceTableId_maybe v)
             lookupDef name = fst <$> lookupNameEnv definitions name
@@ -934,7 +961,7 @@ sourceEarlyClosureTables group_owners definitions = do
             else runMaybeT $ do
               rhs <- MaybeT (pure (lookup owner bindings))
               checked <- MaybeT (pure (indexedLookup bindings owner rhs))
-              table <- makeIndexedLookupTable public owner checked Nothing
+              table <- makeIndexedLookupTable True public owner checked Nothing
               pure (setIdDetails owner (SourceTableId (idName owner) table NominalSourceTable), table)
         let lookup_done = mkNameSet (map (idName . fst) lookups)
 
@@ -947,7 +974,7 @@ sourceEarlyClosureTables group_owners definitions = do
               src <- MaybeT (pure (indexedTraversal bindings owner rhs))
               helpers <- MaybeT (pure (extDeps owner))
               MaybeT ((fmap . fmap) (\(v, tcs) -> (v, tcs, helpers))
-                        (publishIndexed public (owner, (IndexedTraversal, src, src), helpers)))
+                        (publishIndexed True public (owner, (IndexedTraversal, src, src), helpers)))
         let trav_tables = [(v, tc) | (v, tc : _, _) <- traversals]
             trav_extra_tcs = [tc | (_, _ : rest, _) <- traversals, tc <- rest]
             trav_helpers = [h | (_, _, hs) <- traversals, h <- hs]
@@ -963,7 +990,7 @@ sourceEarlyClosureTables group_owners definitions = do
               , Just helpers <- [extDeps owner]
               , not (null helpers) ]
         typed_closures <- fmap catMaybes $ for_list typed_roots $ \(owner, shape, helpers) -> do
-          generated <- allocateFamilies shape
+          generated <- allocateFamilies True shape
           pure $ do
             (root, families) <- generated
             guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
@@ -984,12 +1011,12 @@ sourceEarlyClosureTables group_owners definitions = do
             ext_cands = nubBy (\(_, (a, _), _) (_, (b, _), _) -> sameId a b)
               [ c | c@(_, (actual_ext, _), _) <- renaming_cands, fresh_owner actual_ext ]
         typed_exts <- fmap catMaybes $ for_list ext_cands $ \cand ->
-          publishRenameExtension public cand
+          publishRenameExtension True public cand
         let ext_table_map = [(idName v, tc) | (v, [tc]) <- typed_exts] ++
               [(idName v, tc) | v <- group_owners, Just tc <- [sourceTableId_maybe v]]
         typed_rens <- fmap catMaybes $ for_list
           [ c | c@(actual_ren, _, _) <- renaming_cands, fresh_owner actual_ren ] $ \cand ->
-            publishRenaming public ext_table_map cand
+            publishRenaming True public ext_table_map cand
         let ren_table_map = [(idName v, tc) | (v, [tc]) <- typed_rens] ++ ext_table_map
             subst_ext_cands = nubBy (\(a, _, _) (b, _, _) -> sameId a b)
               [ (actual_sext, (actual_ren, actual_weak, shape), helpers)
@@ -1007,11 +1034,11 @@ sourceEarlyClosureTables group_owners definitions = do
               [ (actual_weak, shape)
               | (_, (_, actual_weak, shape), _) <- subst_ext_cands
               , fresh_owner actual_weak ]
-        typed_weaks <- fmap catMaybes $ for_list weak_cands (publishWeakening public)
+        typed_weaks <- fmap catMaybes $ for_list weak_cands (publishWeakening True public)
         let weak_table_map = [(idName v, tc) | (v, [tc]) <- typed_weaks] ++ ext_table_map
         typed_sexts <- fmap catMaybes $ for_list
           [ c | c@(actual_sext, _, _) <- subst_ext_cands, fresh_owner actual_sext ] $ \cand ->
-            publishSubstitutionExtension public ren_table_map weak_table_map cand
+            publishSubstitutionExtension True public ren_table_map weak_table_map cand
         let sext_table_map = [(idName v, tc) | (v, [tc]) <- typed_sexts] ++ ext_table_map
             subst_cands = nubBy (\(a, _, _) (b, _, _) -> sameId a b)
               [ (actual_sub, (actual_sext, shape), helpers)
@@ -1026,7 +1053,7 @@ sourceEarlyClosureTables group_owners definitions = do
               , Just helpers <- [extDeps actual_sub]
               , any (sameId actual_sext) helpers ]
         typed_substs <- fmap catMaybes $ for_list subst_cands $ \cand ->
-          publishSubstitution public sext_table_map cand
+          publishSubstitution True public sext_table_map cand
 
         -- 4. Untyped scope-indexed closures & helper chains
         let typed_done = trav_done `extendNameSetList`
@@ -1041,7 +1068,7 @@ sourceEarlyClosureTables group_owners definitions = do
               , Just helpers <- [extDeps owner]
               , not (null helpers) ]
         untyped_closures <- fmap catMaybes $ for_list untyped_roots $ \(owner, shape, helpers) -> do
-          generated <- allocateUntypedFamilies shape
+          generated <- allocateUntypedFamilies True shape
           pure $ do
             (root, families) <- generated
             guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
@@ -1060,12 +1087,12 @@ sourceEarlyClosureTables group_owners definitions = do
               , any (sameId actual_ext) helpers ]
             uext_cands = nubBy (\(_, (a, _), _) (_, (b, _), _) -> sameId a b)
               [ c | c@(_, (actual_ext, _), _) <- uren_cands, fresh_owner actual_ext ]
-        untyped_exts <- fmap catMaybes $ for_list uext_cands (publishUntypedRenameExtension public)
+        untyped_exts <- fmap catMaybes $ for_list uext_cands (publishUntypedRenameExtension True public)
         let uext_table_map = [(idName v, tc) | (v, [tc]) <- untyped_exts] ++
               [(idName v, tc) | v <- group_owners, Just tc <- [sourceTableId_maybe v]]
         untyped_rens <- fmap catMaybes $ for_list
           [ c | c@(actual_ren, _, _) <- uren_cands, fresh_owner actual_ren ] $ \cand ->
-            publishUntypedRenaming public uext_table_map cand
+            publishUntypedRenaming True public uext_table_map cand
 
         let op_entries = typed_exts ++ typed_rens ++ typed_weaks ++ typed_sexts ++
                          typed_substs ++ untyped_exts ++ untyped_rens
@@ -1251,12 +1278,11 @@ earlySourceClosureEntries env =
       in [ tc | occ <- wanted, Just tc <- [lookup (mod_mb, occ) tcs_by_mod_occ] ]
     classify fun = case idDetails fun of
       CheckedClosureSourceTableId name table helpers
-        | name == idName fun -> Just (table, helpers)
+        | name == idName fun
+        , isEarlyClosureTable table -> Just (table, helpers)
       SourceTableId name table NominalSourceTable
         | name == idName fun
-        , (indexedLookupType (varType fun) && isIndexedLookupTable table) ||
-          (not (indexedLookupType (varType fun)) && earlyClosureCandidateType (varType fun))
-        -> Just (table, [])
+        , isEarlyClosureTable table -> Just (table, [])
       _ -> Nothing
 
 -- | Collect early-staged indexed lookup, traversal, and closure owners installed in the module.
@@ -1328,6 +1354,40 @@ visibleClosureRuleHeads env = do
   hsc <- getTopEnv
   liftIO $ visibleSourceRuleHeads hsc (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
 
+-- | Normalize nested early-closure family applications along an algebraic type spine.
+rewriteEarlyClosureApps :: [TyCon] -> Type -> Type
+rewriteEarlyClosureApps early_fams = go
+  where
+    go (AppTy a b) = AppTy (go a) (go b)
+    go (TyConApp tc tys)
+      | let tys' = map go tys
+      = if tc `elem` early_fams
+          then reductionReducedType (normaliseTcApp emptyFamInstEnvs Nominal tc tys')
+          else TyConApp tc tys'
+    go (FunTy af ma mult arg res) = FunTy af (go ma) (go mult) (go arg) (go res)
+    go ty = ty
+
+-- | Collect TyCons from exported interface types after normalizing early-closure calls.
+survivingEarlyExportedTyCons :: [TyCon] -> [Type] -> TyConSet
+survivingEarlyExportedTyCons [] tys = tyConsOfTypes tys
+survivingEarlyExportedTyCons early_fams tys = tyConsOfTypes (concatMap collect tys)
+  where
+    collect ty@(TyConApp tc args)
+      | tc `elem` early_fams = [rewriteEarlyClosureApps early_fams ty]
+      | otherwise = TyConApp tc [] : concatMap collect args
+    collect (TyVarTy v) = collect (varType v)
+    collect (TermAppTy f a) = collect (varType f) ++ collect a
+    collect (TermVarTy v) = collect (varType v)
+    collect (DepFunTy _ v b) = collect (varType v) ++ collect b
+    collect (AppTy a b) = collect a ++ collect b
+    collect (ForAllTy ma (Bndr v _) b) = collect ma ++ collect (varType v) ++ collect b
+    collect (FunTy _ ma mult a r) = concatMap collect [ma, mult, a, r]
+    collect (CastTy t _) = collect t
+    collect (ExistsTy _ v b) = collect (varType v) ++ collect b
+    collect (DepDictTy d b) = collect (varType d) ++ collect b
+    collect (ClassAppTy _ t1 t2 t3 t4) = concatMap collect [t1, t2, t3, t4]
+    collect _ = []
+
 -- | Validate constructor exports, owner/helper visibility, and imported rules for used early closures.
 checkLocalIndexedLookupExports :: TcGblEnv -> TcM ()
 checkLocalIndexedLookupExports env = do
@@ -1337,34 +1397,45 @@ checkLocalIndexedLookupExports env = do
       rule_heads <- visibleClosureRuleHeads env
       let exported = availsToNameSet (tcg_exports env)
           type_env = tcg_type_env env
-          exported_tycons = tyConsOfTypes (exportedInterfaceTypes exported type_env)
+          all_early_fams = [tc | (_, table, _, comps) <- candidates, tc <- table : comps]
+          exported_tycons =
+            survivingEarlyExportedTyCons all_early_fams (exportedInterfaceTypes exported type_env)
+          type_partially_exported tc =
+            tyConName tc `elemNameSet` exported ||
+            any ((`elemNameSet` exported) . DC.dataConName) (tyConDataCons tc)
           lookupId nm = case lookupTypeEnv type_env nm of
             Just (AnId v) -> Just v
             _ -> Nothing
       for_ candidates $ \(owner, table, helpers, companions) -> do
         let name = idName owner
             all_families = table : companions
-            unexported_types = sortBy stableNameCmp
-              [ tc_name
+            local_eq_types =
+              [ tc
               | tc <- sourceEquationDatatypes all_families
               , tc `notElem` all_families
-              , let tc_name = tyConName tc
-              , nameModule_maybe tc_name == Just (tcg_semantic_mod env)
+              , nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env) ]
+            unexported_types = sortBy stableNameCmp
+              [ tyConName tc
+              | tc <- local_eq_types
               , not (publicCaseType env exported (const False) tc) ]
             in_exported_iface = any (`elementOfUniqSet` exported_tycons) all_families
+            needs_public_types =
+              in_exported_iface ||
+              name `elemNameSet` exported ||
+              any type_partially_exported local_eq_types
             unexported_vals = filter (not . (`elemNameSet` exported)) (name : helpers)
         case unexported_types of
-          hidden : _ -> do
+          hidden : _ | needs_public_types -> do
             let reason = "The dependent type needs this equation. Export the constructors of "
                          ++ occNameString (nameOccName hidden) ++ " to make it available."
             setSrcSpan (nameSrcSpan name) $
               addErr (TcRnOpenTypeEval name Nothing reason)
-          [] | in_exported_iface, missing : _ <- unexported_vals -> do
+          _ | in_exported_iface, missing : _ <- unexported_vals -> do
             let reason = "The dependent type needs this equation. Export "
                          ++ occNameString (nameOccName missing) ++ " to make it available."
             setSrcSpan (nameSrcSpan name) $
               addErr (TcRnOpenTypeEval name Nothing reason)
-          [] -> pure ()
+          _ -> pure ()
         let checked_ids = owner : mapMaybe lookupId helpers
         case find (\v -> hasSourceMethodRule visible v || idName v `elemNameSet` rule_heads) checked_ids of
           Just bad ->
@@ -1405,11 +1476,27 @@ finalizeEarlyClosureTypes mb_tidy exported type_env =
     breakpoint Breakpoint{} = True
     breakpoint _ = False
     tidy = maybe [] (\bs -> [(v, stripTicksE breakpoint r) | (v, r) <- Core.flattenBinds bs]) mb_tidy
-    exported_tycons = tyConsOfTypes (exportedInterfaceTypes exported type_env)
+    tcs_by_mod_occ =
+      [ ((nameModule_maybe (tyConName tc), nameOccName (tyConName tc)), tc)
+      | ATyCon tc <- typeEnvElts type_env ]
+    companions_of v =
+      let mod_mb = nameModule_maybe (idName v)
+          occ_str = occNameString (nameOccName (idName v))
+          wanted = [mkTcOcc (p ++ occ_str) | p <- ["$closure:", "$apply:", "$lookup:"]]
+      in [ tc | occ <- wanted, Just tc <- [lookup (mod_mb, occ) tcs_by_mod_occ] ]
+    early_fams =
+      [ tc
+      | AnId v <- typeEnvElts type_env
+      , CheckedClosureSourceTableId owner table _ <- [idDetails v]
+      , owner == idName v, isEarlyClosureTable table
+      , tc <- table : companions_of v ]
+    exported_tycons =
+      survivingEarlyExportedTyCons early_fams (exportedInterfaceTypes exported type_env)
     update (AnId v)
       | CheckedClosureSourceTableId owner table helpers <- idDetails v
-      , owner == idName v =
-          if not (table `elementOfUniqSet` exported_tycons) &&
+      , owner == idName v
+      , isEarlyClosureTable table =
+          if not (any (`elementOfUniqSet` exported_tycons) (table : companions_of v)) &&
              any (not . (`elemNameSet` exported)) (owner : helpers)
             then AnId (setIdDetails v VanillaId)
             else
@@ -1438,7 +1525,7 @@ validateEarlyIndexedLookups plugins_free rules desugared_binds mb_simplified mb_
           breakpoint _ = False
           inspect binds = [(v, stripTicksE breakpoint rhs) | (v, rhs) <- Core.flattenBinds binds]
           raw_desugared = inspect desugared_binds
-          desugared = [(v, simpleOptExpr opts rhs) | (v, rhs) <- raw_desugared]
+          desugared = map (safeSimpleOptBind opts) raw_desugared
           user_rule_owner Core.Rule{Core.ru_fn = fn, Core.ru_auto = auto, Core.ru_act = act}
             | not (auto || isNeverActive act) = Just fn
           user_rule_owner _ = Nothing
@@ -1605,14 +1692,14 @@ validateEarlyIndexedLookups plugins_free rules desugared_binds mb_simplified mb_
                checkUntypedRenameExtension binds c2 c1 rhs
 
 -- | Allocate the family and check each nominal equation.
-makeIndexedLookupTable :: (TyCon -> Bool) -> Id -> IndexedLookup -> Maybe IndexedLookup
+makeIndexedLookupTable :: Bool -> (TyCon -> Bool) -> Id -> IndexedLookup -> Maybe IndexedLookup
                        -> MaybeT TcM TyCon
-makeIndexedLookupTable public owner original final = do
+makeIndexedLookupTable is_early public owner original final = do
     let IndexedLookup _ parameters domains result _ = original
         (flags, _) = splitForAllForAllTyBinders (varType owner)
     guard (length flags == length parameters)
     name <- lift (newImplicitBinder (idName owner) mkSourceTableOcc)
-    axiom <- lift (newImplicitBinder name mkInstTyCoOcc)
+    axiom <- lift (mkClosureTableAxiom is_early name)
     operands <- lift (traverse (freshVar "operand") domains)
     let binders = zipWith (\(_, Bndr _ flag) -> mkNamedTyConBinder flag) flags parameters ++
                   map mkAnonTyConBinder operands
@@ -2212,10 +2299,10 @@ injectivity for that application.
 -}
 
 -- | Emit the binder extension once, even if several traversals use it.
-publishRenameExtension :: (TyCon -> Bool) -> (Id, (Id, FamilyInputs), [Id])
+publishRenameExtension :: Bool -> (TyCon -> Bool) -> (Id, (Id, FamilyInputs), [Id])
                        -> TcM (Maybe (Id, [TyCon]))
-publishRenameExtension public (_, (owner, shape), _) =
-    publishLookupExtension public owner [] shape Nothing
+publishRenameExtension is_early public (_, (owner, shape), _) =
+    publishLookupExtension is_early public owner [] shape Nothing
 
 {- Note [Substitution with an abstract callback]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2240,8 +2327,8 @@ type abstractions floated out by the simplifier.
 -}
 
 -- | Publish a named weakening callback with the kind of its runtime owner.
-publishWeakening :: (TyCon -> Bool) -> (Id, FamilyInputs) -> TcM (Maybe (Id, [TyCon]))
-publishWeakening public (owner, FamilyInputs _ _ context sort _ ext index _ _ _ miss _) = runMaybeT $ do
+publishWeakening :: Bool -> (TyCon -> Bool) -> (Id, FamilyInputs) -> TcM (Maybe (Id, [TyCon]))
+publishWeakening is_early public (owner, FamilyInputs _ _ context sort _ ext index _ _ _ miss _) = runMaybeT $ do
     g <- lift (freshVar "g" context)
     b <- lift (freshVar "b" sort)
     a <- lift (freshVar "a" sort)
@@ -2255,20 +2342,20 @@ publishWeakening public (owner, FamilyInputs _ _ context sort _ ext index _ _ _ 
         branches = do
           output <- conAt miss result [mkTyVarTy x]
           pure [renamingBranch [gk,bk,ak,mkTyVarTy x] output]
-    publishRenamingTable public owner [] binders result (const branches)
+    publishRenamingTable is_early public owner [] binders result (const branches)
 
 -- | Use the same checked renamed result that a client sees in the type.
-publishSubstitutionExtension :: (TyCon -> Bool) -> [(Name, TyCon)] -> [(Name, TyCon)]
+publishSubstitutionExtension :: Bool -> (TyCon -> Bool) -> [(Name, TyCon)] -> [(Name, TyCon)]
                              -> (Id, (Id, Id, FamilyInputs), [Id]) -> TcM (Maybe (Id, [TyCon]))
-publishSubstitutionExtension public renamings weakenings (owner, (rename, weaken, shape), helpers)
+publishSubstitutionExtension is_early public renamings weakenings (owner, (rename, weaken, shape), helpers)
   | Just renaming <- lookup (idName rename) renamings
   , Just weakening <- lookup (idName weaken) weakenings
-  = publishLookupExtension public owner helpers shape (Just (renaming,weakening))
+  = publishLookupExtension is_early public owner helpers shape (Just (renaming,weakening))
   | otherwise = pure Nothing
 
-publishLookupExtension :: (TyCon -> Bool) -> Id -> [Id] -> FamilyInputs
+publishLookupExtension :: Bool -> (TyCon -> Bool) -> Id -> [Id] -> FamilyInputs
                        -> Maybe (TyCon, TyCon) -> TcM (Maybe (Id, [TyCon]))
-publishLookupExtension public owner helpers shape substitution = runMaybeT $ do
+publishLookupExtension is_early public owner helpers shape substitution = runMaybeT $ do
     let FamilyInputs _ _ context sort term ext index _ var hit miss _ = shape
         output = case substitution of
           Nothing -> index
@@ -2309,20 +2396,20 @@ publishLookupExtension public owner helpers shape substitution = runMaybeT $ do
           guard (typeKind fresh' `eqType` outputAt (extend dk) bk && typeKind previous' `eqType` result)
           pure [renamingBranch [gk,dk,bk,r,bk,fresh] fresh',
                 renamingBranch [gk,dk,bk,r,ak,previous] previous']
-    publishRenamingTable public owner helpers binders result (const branches)
+    publishRenamingTable is_early public owner helpers binders result (const branches)
 
-publishRenaming :: (TyCon -> Bool) -> [(Name, TyCon)] -> (Id, (Id, FamilyInputs), [Id])
+publishRenaming :: Bool -> (TyCon -> Bool) -> [(Name, TyCon)] -> (Id, (Id, FamilyInputs), [Id])
                 -> TcM (Maybe (Id, [TyCon]))
 publishRenaming = publishClosureTraversal False
 
-publishSubstitution :: (TyCon -> Bool) -> [(Name, TyCon)] -> (Id, (Id, FamilyInputs), [Id])
+publishSubstitution :: Bool -> (TyCon -> Bool) -> [(Name, TyCon)] -> (Id, (Id, FamilyInputs), [Id])
                     -> TcM (Maybe (Id, [TyCon]))
 publishSubstitution = publishClosureTraversal True
 
 -- | A traversal can extend its callback only at each field's own binders.
-publishClosureTraversal :: Bool -> (TyCon -> Bool) -> [(Name, TyCon)]
+publishClosureTraversal :: Bool -> Bool -> (TyCon -> Bool) -> [(Name, TyCon)]
                         -> (Id, (Id, FamilyInputs), [Id]) -> TcM (Maybe (Id, [TyCon]))
-publishClosureTraversal is_subst public extensions (owner, (extension, shape), helpers) = runMaybeT $ do
+publishClosureTraversal is_subst is_early public extensions (owner, (extension, shape), helpers) = runMaybeT $ do
     extend <- MaybeT (pure (lookup (idName extension) extensions))
     let FamilyInputs _ _ context sort term ext index _ var _ _ recipes = shape
         output = if is_subst then term else index
@@ -2376,7 +2463,7 @@ publishClosureTraversal is_subst public extensions (owner, (extension, shape), h
               else zipWithM (rewrite family) depths field_tys >>= conAt con (termAt dk sort_at)
             pure (renamingBranch [source,dk,sort_at,r,lhs] out)
     rows <- traverse prepare ((var,[]) : recipes)
-    publishRenamingTable public owner helpers binders result (\family -> traverse ($ family) rows)
+    publishRenamingTable is_early public owner helpers binders result (\family -> traverse ($ family) rows)
 
 -- | Preserve the exact rank-n callback type when generating a table kind.
 renamingKind :: TyCon -> TyVar -> Type -> Type -> Kind
@@ -2390,11 +2477,11 @@ closureCallbackKind index result rank g d =
 renamingBranch :: [Type] -> Type -> CoAxBranch
 renamingBranch lhs = mkBranch (tyCoVarsOfTypesWellScoped lhs) lhs
 
-publishRenamingTable :: (TyCon -> Bool) -> Id -> [Id] -> [TyConBinder] -> Kind
+publishRenamingTable :: Bool -> (TyCon -> Bool) -> Id -> [Id] -> [TyConBinder] -> Kind
                      -> (TyCon -> Maybe [CoAxBranch]) -> MaybeT TcM (Id, [TyCon])
-publishRenamingTable public owner helpers binders result rows = do
+publishRenamingTable is_early public owner helpers binders result rows = do
     root <- lift (newImplicitBinder (idName owner) mkSourceTableOcc)
-    axiom <- lift (newImplicitBinder root mkInstTyCoOcc)
+    axiom <- lift (mkClosureTableAxiom is_early root)
     let equations = rows table
         table = mkFamily root axiom binders result (fromMaybe [] equations)
         details = case helpers of
@@ -2405,8 +2492,8 @@ publishRenamingTable public owner helpers binders result rows = do
     guard (all validBranch branches && all public (sourceEquationDatatypes [table]))
     pure (setIdDetails owner details, [table])
 
-allocateFamilies :: FamilyInputs -> TcM (Maybe (TyCon, [TyCon]))
-allocateFamilies (FamilyInputs owner arity context sort term ext lookup_tycon _ var hit miss recipes) = do
+allocateFamilies :: Bool -> FamilyInputs -> TcM (Maybe (TyCon, [TyCon]))
+allocateFamilies is_early (FamilyInputs owner arity context sort term ext lookup_tycon _ var hit miss recipes) = do
     (closure, constructors) <- allocateClosure owner context sort term ext
     case constructors of
       [replace, shift, lift, replace_next] -> do
@@ -2415,7 +2502,7 @@ allocateFamilies (FamilyInputs owner arity context sort term ext lookup_tycon _ 
         apply_axiom <- newImplicitBinder apply_name mkInstTyCoOcc
         lookup_axiom <- newImplicitBinder lookup_name mkInstTyCoOcc
         root_name <- newImplicitBinder (idName owner) mkSourceTableOcc
-        root_axiom <- newImplicitBinder root_name mkInstTyCoOcc
+        root_axiom <- mkClosureTableAxiom is_early root_name
         g <- freshVar "g" context
         d <- freshVar "d" context
         a <- freshVar "a" sort
@@ -2964,14 +3051,14 @@ publishUntypedEntries public lookupOwner unoptimized final extDeps safe closures
         renamings = filter safe (mapMaybe renaming_candidate closures)
         sameRename (owner, _, _) (other, _, _) = owner == other
         sameExtension (_, (ext, _), _) (_, (other, _), _) = ext == other
-    extensions <- catMaybes <$> traverse (publishUntypedRenameExtension public) (nubBy sameExtension renamings)
+    extensions <- catMaybes <$> traverse (publishUntypedRenameExtension False public) (nubBy sameExtension renamings)
     let extension_tables = [(idName ext, table) | (ext, [table]) <- extensions]
-    checked_renamings <- catMaybes <$> traverse (publishUntypedRenaming public extension_tables) (nubBy sameRename renamings)
+    checked_renamings <- catMaybes <$> traverse (publishUntypedRenaming False public extension_tables) (nubBy sameRename renamings)
     pure (checked_closures ++ extensions ++ checked_renamings)
   where
     publish_closure (owner, (_, shape), helpers)
       | VanillaId <- idDetails owner = do
-          generated <- allocateUntypedFamilies shape
+          generated <- allocateUntypedFamilies False shape
           pure $ do
             (root, families) <- generated
             guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
@@ -2979,9 +3066,9 @@ publishUntypedEntries public lookupOwner unoptimized final extDeps safe closures
             pure (new, families)
       | otherwise = pure Nothing
 
-publishUntypedRenameExtension :: (TyCon -> Bool) -> (Id, (Id, UntypedFamilyInputs), [Id])
+publishUntypedRenameExtension :: Bool -> (TyCon -> Bool) -> (Id, (Id, UntypedFamilyInputs), [Id])
                               -> TcM (Maybe (Id, [TyCon]))
-publishUntypedRenameExtension public (_, (owner, shape), _) = runMaybeT $ do
+publishUntypedRenameExtension is_early public (_, (owner, shape), _) = runMaybeT $ do
     let UntypedFamilyInputs _ _ context _ ext index _ _ hit miss _ = shape
     g <- lift (freshVar "g" context)
     d <- lift (freshVar "d" context)
@@ -3005,11 +3092,11 @@ publishUntypedRenameExtension public (_, (owner, shape), _) = runMaybeT $ do
           previous' <- conAt miss result [mkAppTys r [x]]
           pure [renamingBranch [gk, dk, r, fresh] fresh',
                 renamingBranch [gk, dk, r, previous] previous']
-    publishRenamingTable public owner [] binders result (const branches)
+    publishRenamingTable is_early public owner [] binders result (const branches)
 
-publishUntypedRenaming :: (TyCon -> Bool) -> [(Name, TyCon)] -> (Id, (Id, UntypedFamilyInputs), [Id])
+publishUntypedRenaming :: Bool -> (TyCon -> Bool) -> [(Name, TyCon)] -> (Id, (Id, UntypedFamilyInputs), [Id])
                        -> TcM (Maybe (Id, [TyCon]))
-publishUntypedRenaming public extensions (owner, (extension, shape), helpers) = runMaybeT $ do
+publishUntypedRenaming is_early public extensions (owner, (extension, shape), helpers) = runMaybeT $ do
     extend <- MaybeT (pure (lookup (idName extension) extensions))
     let UntypedFamilyInputs _ _ context term ext index _ var _ _ recipes = shape
     g <- lift (freshVar "g" context)
@@ -3056,14 +3143,14 @@ publishUntypedRenaming public extensions (owner, (extension, shape), helpers) = 
             out <- conAt con (termAt dk) output
             pure (renamingBranch [source, dk, r, lhs] out)
     rows <- traverse prepare ((var, []) : recipes)
-    publishRenamingTable public owner helpers binders result (\family -> traverse ($ family) rows)
+    publishRenamingTable is_early public owner helpers binders result (\family -> traverse ($ family) rows)
 
 untypedRenamingKind :: TyCon -> Type -> Type -> Kind
 untypedRenamingKind index g d =
     mkVisFunTyManyU (mkTyConApp index [g]) (mkTyConApp index [d])
 
-allocateUntypedFamilies :: UntypedFamilyInputs -> TcM (Maybe (TyCon, [TyCon]))
-allocateUntypedFamilies (UntypedFamilyInputs owner arity context term ext lookup_tycon _ var hit miss recipes) = do
+allocateUntypedFamilies :: Bool -> UntypedFamilyInputs -> TcM (Maybe (TyCon, [TyCon]))
+allocateUntypedFamilies is_early (UntypedFamilyInputs owner arity context term ext lookup_tycon _ var hit miss recipes) = do
     (closure, constructors) <- allocateUntypedClosure owner context term ext
     case constructors of
       [replace, shift, lift_con, replace_next] -> do
@@ -3072,7 +3159,7 @@ allocateUntypedFamilies (UntypedFamilyInputs owner arity context term ext lookup
         apply_axiom <- newImplicitBinder apply_name mkInstTyCoOcc
         lookup_axiom <- newImplicitBinder lookup_name mkInstTyCoOcc
         root_name <- newImplicitBinder (idName owner) mkSourceTableOcc
-        root_axiom <- newImplicitBinder root_name mkInstTyCoOcc
+        root_axiom <- mkClosureTableAxiom is_early root_name
         g <- freshVar "g" context
         d <- freshVar "d" context
         let gk = mkTyVarTy g

@@ -64,7 +64,7 @@ cat >UnavailableKind.hs <<'HS'
 module UnavailableKind where
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-bad :: forall (f :: Bool -> Type). Proxy f -> Bool
+bad :: forall (f :: forall k. k -> Type). Proxy (f Bool) -> Bool
 bad _ = const True witness
   where
     witness :: Proxy ((\cell -> (f 'True, cell)) Bool)

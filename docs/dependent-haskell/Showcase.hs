@@ -192,6 +192,7 @@ import qualified BookContextPlug
 import qualified BookEnvironment
 import qualified BookReverseProof
 import qualified ExplicitListReverse
+import qualified BookWave3Proposal378 as Wave3
 import qualified BookNaturals
 import qualified CastedConstructorGivens as TreeProof
 import qualified SumOfSizes
@@ -2353,6 +2354,19 @@ main = do
         (pluggedSubstEquation, importedLookupEquation)
     observe "verify explicit-list reverse equations in Final Core under default -O2"
         (explicitRevPair, explicitRevStep True [False], ExplicitListReverse.rev [True, False])
+    observe "group retained telescopes and multi-binder sums under DependentTypes"
+        ( Wave3.plusAssocProd 1 2 3
+        , Wave3.peanoToInt Wave3.sumTwoFirst
+        , Wave3.peanoToInt Wave3.infixForEachArg )
+    observe "capture an unmatchable predicate variable inside a Leibniz symmetry lambda"
+        (Wave3.leibnizUToEq (Wave3.leibnizUSym @'True @'True (\px -> px)))
+    observe "stage same-module context plug and inline GADT congruence proofs"
+        (Wave3.sameModulePlugBeta, Wave3.inlineHoleCong @('Wave3.ULam ('Wave3.UVar 'Wave3.FZ)))
+    observe "compute function types from a term-to-Type large elimination and foldr laws"
+        ( Wave3.applyValPred (\u v -> case (u, v) of ((), ()) -> ())
+        , HaskLibClient.checkFoldrAndMatchability
+            [HaskLib.Zero, HaskLib.Succ HaskLib.Zero]
+            [HaskLib.Succ HaskLib.Zero] )
 
 -- | Complement one flag at the type level.
 type family FlipFlag (b :: Bool) :: Bool where
