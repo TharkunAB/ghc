@@ -2775,6 +2775,7 @@ localSourceTableBinders binds sigs =
       where
         check :: [LHsExpr GhcPs] -> LHsExpr GhcPs -> Bool
         check args expr = case unLoc (stripParensLHsExpr expr) of
+          HsEmbTy _ (HsWC _ ty) -> null args && check_emb_ty [] ty
           HsApp _ fun arg -> check (arg : args) fun
           OpApp _ left op right -> check (left : right : args) op
           ExplicitList _ items -> null args && all (check []) items
@@ -2805,6 +2806,48 @@ localSourceTableBinders binds sigs =
             cons op left right = variable op == Just consDataCon_RDR &&
                                  variable left == Just x && variable right == Just acc
         is_self = same_source_owner self
+
+        check_emb_ty :: [LHsType GhcPs] -> LHsType GhcPs -> Bool
+        check_emb_ty t_args (L _ t) = case t of
+          HsParTy _ inner -> check_emb_ty t_args inner
+          HsAppTy _ fun arg -> check_emb_ty (arg : t_args) fun
+          HsAppKindTy _ fun k -> check_emb_ty [] k && check_emb_ty t_args fun
+          HsKindSig _ body k -> check_emb_ty [] k && check_emb_ty t_args body
+          HsOpTy _ lhs tyop rhs
+            | Just vr <- ty_term_var tyop, is_self vr -> null t_args && check_self_ty_args [lhs, rhs]
+            | otherwise -> null t_args && check_emb_ty [] lhs && check_emb_ty [] tyop && check_emb_ty [] rhs
+          HsTyVar _ promo (L _ r)
+            | NotPromoted <- promo, Just vr <- demote_tv r, is_self vr -> check_self_ty_args t_args
+            | otherwise -> all (check_emb_ty []) t_args
+          HsFunTy _ _ a b -> null t_args && check_emb_ty [] a && check_emb_ty [] b
+          HsTupleTy _ _ tys -> null t_args && all (check_emb_ty []) tys
+          HsSumTy _ tys -> null t_args && all (check_emb_ty []) tys
+          HsListTy _ elem_ty -> null t_args && check_emb_ty [] elem_ty
+          HsExplicitListTy _ _ tys -> null t_args && all (check_emb_ty []) tys
+          HsExplicitTupleTy _ _ tys -> null t_args && all (check_emb_ty []) tys
+          HsQualTy _ (L _ (HsContext _ ctxt)) body -> null t_args && all (check_emb_ty []) ctxt && check_emb_ty [] body
+          HsForAllTy _ _ body -> null t_args && check_emb_ty [] body
+          HsTyLit{} -> null t_args
+          HsStarTy{} -> null t_args
+          _ -> False
+
+        check_self_ty_args :: [LHsType GhcPs] -> Bool
+        check_self_ty_args t_args
+          | Just operands <- traverse ty_term_var t_args
+          , (before, field : after) <- splitAt (length leading) operands
+          = map Just before == leading && field `elem` fields && map Just after == trailing
+          | otherwise = False
+
+        ty_term_var :: LHsType GhcPs -> Maybe RdrName
+        ty_term_var (L _ (HsParTy _ inner)) = ty_term_var inner
+        ty_term_var (L _ (HsTyVar _ NotPromoted (L _ r))) = demote_tv r
+        ty_term_var _ = Nothing
+
+        demote_tv (Unqual occ) | isTvOcc occ = Just (Unqual (setOccNameSpace varName occ))
+        demote_tv (Qual m occ) | isTvOcc occ = Just (Qual m (setOccNameSpace varName occ))
+        demote_tv (Orig m occ) | isTvOcc occ = Just (Orig m (setOccNameSpace varName occ))
+        demote_tv r | isVarOcc (rdrNameOcc r) = Just r
+        demote_tv _ = Nothing
 
     unparen :: LPat GhcPs -> Pat GhcPs
     unparen (L _ (ParPat _ p)) = unparen p

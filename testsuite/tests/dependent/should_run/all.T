@@ -969,3 +969,15 @@ test('NativeComposedLetWhere',
      [req_host_target_ghc, req_interp, only_ways(['normal']),
       extra_files(['NativeComposedLetWhere.hs'])],
      run_command, ['bash NativeComposedLetWhere.sh "{compiler}" "{libdir}"'])
+
+test('NativeRetainedPolyAndInlineGadt',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeRetainedPolyAndInlineGadtProvider.hs',
+                   'NativeRetainedPolyAndInlineGadt.hs'])],
+     run_command, ['bash NativeRetainedPolyAndInlineGadt.sh "{compiler}" "{libdir}"'])
+
+test('NativeLargeElimType',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeLargeElimTypeProvider.hs',
+                   'NativeLargeElimType.hs'])],
+     run_command, ['bash NativeLargeElimType.sh "{compiler}" "{libdir}"'])

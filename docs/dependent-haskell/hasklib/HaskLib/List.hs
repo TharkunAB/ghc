@@ -3,7 +3,7 @@
 
 -- | Laws for the installed Prelude functions on ordinary lists.
 module HaskLib.List
-    ( Nat(..), Size, size, plus, minSize, takeSize
+    ( Nat(..), Size, size, plus, minSize, takeSize, List.foldr
     , appendAssoc, lengthMap, lengthAppend, lengthZip, lengthZipWith, lengthZipMap, lengthMapZip, lengthReverse, lengthTakeSize
     ) where
 

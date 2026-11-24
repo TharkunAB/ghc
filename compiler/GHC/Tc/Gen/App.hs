@@ -43,12 +43,10 @@ import GHC.Tc.Instance.Family ( tcGetFamInstEnvs, tcLookupDataFamInst_maybe )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Concrete  ( unifyConcrete, idConcreteTvs )
 import GHC.Tc.Utils.TcMType
-import GHC.Tc.Types.TcRef ( TcRef )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint (WantedConstraints(wc_simple), ctPred, ctEvLoc, ctEvEvId,
                                 mkNonCanonical, DelayedError(DE_SourceMethod))
-import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..), UserTypeCtxt(ExprSigCtxt, TypeAppCtxt)
-                           , ReportRedundantConstraints(NoRRC) )
+import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..), ReportRedundantConstraints(NoRRC) )
 import GHC.Tc.Types.CtLoc ( CtLoc )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType as TcType
@@ -106,7 +104,6 @@ import GHC.Data.FastString
 import Language.Haskell.Syntax.Text ( unpackHText )
 
 import GHC.Utils.Misc
-import GHC.Utils.Monad ( anyM, orM )
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
@@ -780,7 +777,11 @@ tcRetainedSpineFields expr sigma args
       , any opaque elements
       = do { element_ty <- newFlexiTyVarTy liftedTypeKind
            ; (elements', fields) <- mapAndUnzipM (name_field element_ty) elements
-           ; let arg' = arg { ea_arg = L loc (ExplicitList noExtField elements') }
+           ; let new_list = L loc (ExplicitList noExtField elements')
+                 arg' = case arg of
+                   EValArg ctxt ty _ -> EValArg ctxt ty new_list
+                   ERetainedArg vis ctxt ty _ res co -> ERetainedArg vis ctxt ty new_list res co
+                   other -> other
            ; return (arg', concat fields) }
       | otherwise = return (arg, [])
 
@@ -2155,11 +2156,11 @@ tcRetainedQuickLookArgType arg
           bare = all bare_operand values
       guard (null theta && not (null tvs))
       guard (bare || takesDirectIndexArgument tau)
-      result <- MaybeT (pure (tcRetainedOrdinaryResult (length values) tau))
-      guard (isAlgTyConApp result)
+      result_shape <- MaybeT (pure (tcRetainedValueResultShape (length values) tau))
+      guard (isAlgTyConApp result_shape)
       let read_operand = if bare then declared else tcRetainedQuickLookArgType
       choices <- MaybeT (tcRetainedKnownValuePlan read_operand Nothing sigma values)
-      let ty = substTyWith tvs choices result
+      ty <- call_result (substTyWith tvs choices tau) values
       guard (hasNativeDependentExpr (Core.Type ty) && noQuickLookVars ty)
       valid <- liftMaybeT (tcRetainedInstScope [ty])
       guard valid
@@ -2168,6 +2169,21 @@ tcRetainedQuickLookArgType arg
   where
     (head_expr, args) = split_named [] arg
     declared = tcRetainedDeclaredArgType tcRetainedDeclaredTypeView
+
+    call_result ty [] = pure ty
+    call_result ty (operand : rest) = case coreFullView ty of
+      DepFunTy DepFunVisible binder _ -> do
+        HsVar _ vname <- pure (unLoc (stripParensLHsExpr operand))
+        ATcId { tct_id = local } <- MaybeT (tcLookupLcl_maybe (unLocWithUserRdr vname))
+        actual <- liftMaybeT (liftZonkM (zonkId local))
+        guard (all noQuickLookVars [varType actual, typeKind (varType actual), idMult actual])
+        guard ((isNativeIndexId actual || isNativeOpaqueValueId actual)
+               && isManyTy (idMult actual)
+               && varType actual `eqType` varType binder)
+        call_result (applyTypeToArgs ty [Core.Var actual]) rest
+      FunTy { ft_af = af, ft_res = result } | isVisibleFunArg af ->
+        call_result result rest
+      _ -> mzero
 
     constructor_result ty [] = pure ty
     constructor_result ty (operand : rest) = case coreFullView ty of
@@ -2209,15 +2225,28 @@ tcRetainedQuickLookArgType arg
       Just (tc, _) -> isAlgTyCon tc && not (isClassTyCon tc)
       _ -> False
 
--- | Does a value argument accept a constructor indexed by its own retained field?
+-- | Does a value argument accept a retained value or a constructor indexed by its field?
 -- See Note [Nested immutable retained applications].
 takesDirectIndexArgument :: Type -> Bool
-takesDirectIndexArgument ty
-  | Just (domain, result) <- splitVisibleFunTy_maybe ty
-  = case tcSplitTyConApp_maybe domain of
+takesDirectIndexArgument ty = case coreFullView ty of
+  DepFunTy DepFunVisible _ _ -> True
+  _ | Just (domain, result) <- splitVisibleFunTy_maybe ty ->
+    case tcSplitTyConApp_maybe domain of
       Just (tc, _) | any dataConHasRetainedResult (tyConDataCons tc) -> True
       _ -> takesDirectIndexArgument result
-  | otherwise = False
+  _ -> False
+
+-- | Peel visible ordinary and retained arguments to check for a tau result shape.
+tcRetainedValueResultShape :: Int -> Type -> Maybe Type
+tcRetainedValueResultShape 0 ty
+  | isTauTy ty = Just ty
+  | otherwise  = Nothing
+tcRetainedValueResultShape n ty
+  | n > 0 = case coreFullView ty of
+      DepFunTy DepFunVisible _ res -> tcRetainedValueResultShape (n - 1) res
+      _ | Just (_, res) <- splitVisibleFunTy_maybe ty -> tcRetainedValueResultShape (n - 1) res
+      _ -> Nothing
+  | otherwise = Nothing
 
 {- Note [Nested immutable retained applications]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2307,6 +2336,17 @@ tcRetainedConstructorArgType = collect []
       = collect [] pair
     collect [] (L _ (ExplicitList _ fields))
       = fmap (fmap mkListTy) (firstJustsM (map tcRetainedConstructorArgType fields))
+    collect [] (L loc (ExprWithTySig _ _ sig))
+      | isCompleteHsSig sig
+      , HsWC { hswc_ext = wcs, hswc_body = L _ (HsSig _ bndrs body) } <- sig
+      , null wcs, null (hsOuterTyVarNames bndrs), hsTypeHasNoAnonWildcards body
+      = setSrcSpanA loc $
+        tryTcDiscardingErrs (return Nothing) $ do
+          { ty <- tcHsSigWcType False (ExprSigCtxt NoRRC) sig
+          ; if isTauTy ty && isRetainedValueType ty && noQuickLookVars ty
+            then do { valid <- tcRetainedInstScope [ty]
+                    ; return (if valid then Just ty else Nothing) }
+            else return Nothing }
     collect args (L loc (HsVar _ lname))
       | let name = unLocWithUserRdr lname
       , isDataOcc (nameOccName name)
@@ -2315,15 +2355,22 @@ tcRetainedConstructorArgType = collect []
           ; case thing of
               AConLike (RealDataCon dc)
                 | null (dataConRepArgBinders dc)
-                , (tvs, [], [], [], fields, result) <- dataConFullSig dc
+                , let (_, _, _, theta, _, _) = dataConFullSig dc
+                      tvs = dataConUserTyVars dc
+                      fields = dataConOrigArgTys dc
+                      result = dataConOrigResTy dc
+                , null theta
                 , fields `equalLength` args
-                , isJust (nativeIndexDataConTyArgs result dc)
                 -> do { subst <- foldM (tcMatchDeclaredField tvs) Subst.emptySubst (zip fields args)
-                      ; return $ do
-                          { choices <- traverse (Subst.lookupTyVar subst) tvs
-                          ; let ty = substTyWith tvs choices result
-                          ; guard (isNativeIndexType ty)
-                          ; return ty } }
+                      ; case traverse (Subst.lookupTyVar subst) tvs of
+                          Just choices
+                            | let ty = substTyWith tvs choices result
+                            , isJust (nativeIndexDataConTyArgs ty dc)
+                              || isJust (Core.nativeIndexedConArgs dc choices)
+                            , isRetainedValueType ty && noQuickLookVars ty
+                            -> do { valid <- tcRetainedInstScope [ty]
+                                  ; return (if valid then Just ty else Nothing) }
+                          _ -> return Nothing }
               _ -> return Nothing }
     collect [] arg = tcRetainedDeclaredArgType tcRetainedDeclaredTypeView arg
     collect _ _ = return Nothing
@@ -5079,6 +5126,30 @@ tcRetainedArgWith reify domain arg
                         (RetainedIndexArgumentCast annotated expected')
                   ; (core, operand') <- resolve env expected' operand
                   ; return (core, L loc (mkExpandedLExpr expr operand')) }
+          ExprWithTySig _ operand sig
+            | isCompleteHsSig sig
+            -> do { annotated <- tcHsSigWcType False (ExprSigCtxt NoRRC) sig
+                  ; unless (isTauTy annotated) unsupported
+                  ; expected' <- liftZonkM (zonkTcType expected)
+                  ; target <- if annotated `tcEqType` expected'
+                      then return expected'
+                      else do
+                        { loc_ct <- getCtLocM (lexprCtOrigin original) (Just TypeLevel)
+                        ; ann_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct annotated
+                        ; exp_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct expected'
+                        ; if ann_view `tcEqType` exp_view
+                          then return expected'
+                          else if anyFreeVarsOfType (\v -> isTcTyVar v && isMetaTyVar v) exp_view
+                               then do { co <- unifyType Nothing ann_view exp_view
+                                       ; co' <- liftZonkM (zonkCo co)
+                                       ; unless (isReflCo co') $
+                                           failWithTc $ TcRnRetainedQuantificationError
+                                             (RetainedIndexArgumentCast annotated expected')
+                                       ; liftZonkM (zonkTcType expected') }
+                               else failWithTc $ TcRnRetainedQuantificationError
+                                      (RetainedIndexArgumentCast annotated expected') }
+                  ; (core, operand') <- resolve_with_args env target later operand
+                  ; return (core, L loc (mkExpandedLExpr expr operand')) }
           HsApp x fun arg -> do
             (core, fun', arg') <- resolve_app env expected later fun arg
             return (core, L loc (HsApp x fun' arg'))
@@ -5088,8 +5159,8 @@ tcRetainedArgWith reify domain arg
             return (core, L loc (OpApp x left' op' right'))
           ExplicitList x elements
             | Just [element_ty] <- nativeIndexDataConTyArgs expected nilDataCon
-            -> do { nil <- constructor expected nilDataCon
-                  ; cons <- constructor expected consDataCon
+            -> do { nil <- constructor expected [] nilDataCon
+                  ; cons <- constructor expected [] consDataCon
                   ; (values, elements') <- unzip <$> mapM (resolve env element_ty) elements
                   ; return (foldr (\value rest -> Core.mkApps cons [value, rest]) nil values,
                             L loc (ExplicitList x elements')) }
@@ -5099,7 +5170,7 @@ tcRetainedArgWith reify domain arg
             | isDataOcc (nameOccName (unLocWithUserRdr lname))
             -> do { con <- tcLookupConLike (unLoc lname)
                   ; case con of
-                      RealDataCon dc -> (,original) <$> constructor expected dc
+                      RealDataCon dc -> (,original) <$> constructor expected later dc
                       _ -> unsupported }
             | otherwise
             -> do { mb_id <- tcLookupIdMaybe (unLocWithUserRdr lname)
@@ -5143,25 +5214,37 @@ tcRetainedArgWith reify domain arg
             | otherwise -> unsupported
 
     -- Instantiate the erased parameters from the complete expected domain.
-    constructor expected dc = case nativeIndexDataConTyArgs expected dc of
+    constructor expected later dc = case nativeIndexDataConTyArgs expected dc of
       Just tys -> return (Core.mkTyApps (Core.Var (dataConWorkId dc)) tys)
-      Nothing -> case indexed expected of
-        Just app -> return app
-        Nothing -> do { refined <- tcRetainedDeclaredTypeView expected
-                      ; maybe unsupported return (indexed refined) }
+      Nothing -> do
+        first <- indexed expected
+        case first of
+          Just app -> return app
+          Nothing -> do { refined <- tcRetainedDeclaredTypeView expected
+                        ; if refined `eqType` expected
+                          then unsupported
+                          else maybe unsupported return =<< indexed refined }
       where
         indexed domain = do
           let tvs = dataConUserTyVars dc
+              orig_fields = dataConOrigArgTys dc
               bind tv _ | tv `elem` tvs = BindMe
                         | otherwise     = DontBindMe
-          subst <- tcMatchTyX_BM bind Subst.emptySubst (dataConOrigResTy dc) domain
-          tys <- traverse (Subst.lookupTyVar subst) tvs
-          guard (substTyWith tvs tys (dataConOrigResTy dc) `eqType` domain)
-          case Core.nativeFamilyConHead_maybe dc tys of
-            Just app -> return app
-            Nothing -> do
-              (prefix, _) <- Core.nativeIndexedConArgs dc tys
-              return (Core.mkApps (Core.Var (dataConWorkId dc)) prefix)
+          case tcMatchTyX_BM bind Subst.emptySubst (dataConOrigResTy dc) domain of
+            Nothing -> return Nothing
+            Just subst0 -> do
+              subst <- if isJust (traverse (Subst.lookupTyVar subst0) tvs)
+                          || not (orig_fields `equalLength` later)
+                       then return subst0
+                       else foldM (tcMatchDeclaredField tvs) subst0 (zip orig_fields later)
+              return $ do
+                tys <- traverse (Subst.lookupTyVar subst) tvs
+                guard (substTyWith tvs tys (dataConOrigResTy dc) `eqType` domain)
+                case Core.nativeFamilyConHead_maybe dc tys of
+                  Just app -> return app
+                  Nothing -> do
+                    (prefix, _) <- Core.nativeIndexedConArgs dc tys
+                    return (Core.mkApps (Core.Var (dataConWorkId dc)) prefix)
 
     resolve_app :: NameEnv Id -> Type -> [LHsExpr GhcRn] -> LHsExpr GhcRn -> LHsExpr GhcRn
                 -> TcM (Core.CoreExpr, LHsExpr GhcRn, LHsExpr GhcRn)
@@ -5714,10 +5797,25 @@ tcRetainedResultInst do_ql expected args fun sigma
              | hasNativeDependentExpr (Core.Type rho)
              -> Just <$> liftZonkM (zonkTcType rho)
            _ -> return expected
-       ; matched <- tcRetainedResultMatch do_ql expected args fun sigma
-       ; case matched of
-           Just _ -> return matched
-           Nothing -> tcRetainedResultCandidate do_ql expected args fun sigma }
+       ; let try_inst exp_ty = do
+               matched <- tcRetainedResultMatch do_ql exp_ty args fun sigma
+               case matched of
+                 Just _ -> return matched
+                 Nothing -> tcRetainedResultCandidate do_ql exp_ty args fun sigma
+       ; first <- try_inst expected
+       ; case (first, do_ql, expected) of
+           (Nothing, NoQL, Just rho)
+             | hasNativeDependentExpr (Core.Type rho)
+             , not (isFamFreeTy rho)
+             , isTauTy rho || isRetainedValueType rho
+             -> do { let orig = TypeEqOrigin { uo_actual = sigma, uo_expected = rho
+                                             , uo_thing = Nothing, uo_invisible = Nothing }
+                   ; loc <- getCtLocM orig (Just TypeLevel)
+                   ; reduced <- reductionReducedType <$> tcRewriteFamilyAxioms loc rho
+                   ; if reduced `eqType` rho
+                     then return Nothing
+                     else try_inst (Just reduced) }
+           _ -> return first }
 
 -- | Choose result arguments at a site that commits to the application.
 -- See Note [Inferring the suffix of a checked split].
@@ -6838,16 +6936,30 @@ tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
       then hasNoConcreteTyVars fun && isRetainedValueType tau
       else isTauTy tau && not (isFunTy result)
   = do { expected_ty <- mapM (liftZonkM . zonkTcType) expected
+       ; expected_view <- case expected_ty of
+           Just rho
+             | not equality_continuation
+             , not overapplied
+             , hasNativeDependentExpr (Core.Type rho)
+             , not (isFamFreeTy rho)
+             , isTauTy rho || isRetainedValueType rho
+             -> do { loc <- getCtLocM (exprCtOrigin (fst rn_head)) (Just TypeLevel)
+                   ; Just . reductionReducedType <$> tcRewriteFamilyAxioms loc rho }
+           _ -> return expected_ty
        ; let index_route = not complete_choices && not (null index_tvs)
              initial_subst | equality_continuation
                            , Just rho <- expected_ty
                            = fromMaybe Subst.emptySubst
                                (matchRetainedAppType tvs Subst.emptySubst result rho)
                            | overapplied = Subst.emptySubst
-                           | otherwise = result_subst expected_ty index_route native_worker tvs result
+                           | let direct = result_subst expected_ty index_route native_worker tvs result
+                           , any (isJust . Subst.lookupTyVar direct) tvs
+                             || isNothing expected_view
+                           = direct
+                           | otherwise = result_subst expected_view index_route native_worker tvs result
              result_anchor = any (hasNativeDependentExpr . Core.Type)
                                [ty | tv <- tvs, Just ty <- [Subst.lookupTyVar initial_subst tv]]
-             needed_tvs | index_route = index_tvs
+             needed_tvs | index_route = filter (isNothing . Subst.lookupTyVar initial_subst) index_tvs
                         | otherwise = filter (isNothing . Subst.lookupTyVar initial_subst) tvs
              arguments = zip3 [1..] domains value_args
        ; index_prefixes <- if index_route && hasNoConcreteTyVars fun
@@ -6998,7 +7110,8 @@ tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
       , not native_worker
       , isTauTy expected_ty
       , not index_route || hasNativeDependentExpr (Core.Type expected_ty)
-      , Just subst <- tcMatchTyX_BM (bind_outer tvs) Subst.emptySubst result expected_ty
+      , Just subst <- matchRetainedAppType tvs Subst.emptySubst result expected_ty
+                      <|> tcMatchTyX_BM (bind_outer tvs) Subst.emptySubst result expected_ty
       = subst
       | otherwise = Subst.emptySubst
 
@@ -9190,9 +9303,12 @@ quickLookArg1 pos app_lspan rn_head larg@(L _ arg) sc_arg_ty@(Scaled _ orig_arg_
                case fun of
                  HsVar{} | all isPlainQuickLookArg rn_args
                          , let (_, _, tau) = tcRetainedInstTelescope sigma
-                         , takesDirectIndexArgument tau -> do
+                               arity = count isHsValArg rn_args
+                         , takesDirectIndexArgument tau
+                         , isJust (tcRetainedValueResultShape arity tau) -> do
                    plan <- tcRetainedKnownArgPlan tcRetainedQuickLookArgType Nothing fun sigma rn_args
-                   return (maybe False (any (hasNativeDependentExpr . Core.Type)) plan)
+                   return (maybe False (\choices -> hasNativeDependentExpr (Core.Type tau)
+                                                 || any (hasNativeDependentExpr . Core.Type) choices) plan)
                  _ -> return False
            Nothing -> return False
 
