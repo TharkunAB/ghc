@@ -969,3 +969,11 @@ test('NativeComposedLetWhere',
      [req_host_target_ghc, req_interp, only_ways(['normal']),
       extra_files(['NativeComposedLetWhere.hs'])],
      run_command, ['bash NativeComposedLetWhere.sh "{compiler}" "{libdir}"'])
+test('NativeTypeLambdaCaptureU',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeTypeLambdaCaptureU.hs'])],
+     run_command, ['bash NativeTypeLambdaCaptureU.sh "{compiler}" "{libdir}"'])
+test('NativeSameModuleClosurePlug',
+     [req_host_target_ghc, req_interp, req_th, only_ways(['normal']),
+      extra_files(['NativeSameModuleClosurePlug.hs'])],
+     run_command, ['bash NativeSameModuleClosurePlug.sh "{compiler}" "{libdir}"'])

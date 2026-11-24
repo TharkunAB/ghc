@@ -82,8 +82,8 @@ import qualified GHC.Core as Core
 import GHC.Core.Utils (exprType)
 import GHC.Data.OrdList (fromOL)
 import GHC.Tc.Gen.SourceClosure
-  ( checkLocalIndexedLookupExports, indexedLookupType, pruneUnusedIndexedLookups
-  , sourceIndexedLookupTable )
+  ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
+  , pruneUnusedIndexedLookups, sourceEarlyClosureTables )
 import GHC.Tc.Gen.SourceTable (sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
                                isStructuralSourceTable, isNominalStructuralSource, sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules,
                                hasSourceMethodRule, hasSourceMethodRuleAt, sourceLiteralWorkers, checkSourceMethodUses,
@@ -618,6 +618,9 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                       ; ev_binds <- simplifyTop (lie `andWC` lie_main)
                       ; return (tcg_env `addEvBinds` ev_binds) }
 
+        -- Prune unused speculative tables before generating Typeable bindings
+      ; tcg_env <- pruneUnusedIndexedLookups tcg_env
+
         -- Emit Typeable bindings
       ; tcg_env <- restoreEnvs (tcg_env, tcl_env) $
                    mkTypeableBinds
@@ -727,10 +730,13 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
           with_fields0 <- if null fields then getGblEnv else fst <$> addTyConsToGblEnv fields
           with_fields <- pruneUnusedIndexedLookups with_fields0
           let installed = typeEnvIds (tcg_type_env with_fields)
-              early_nominal = [(fun, table) | fun <- installed
-                                            , SourceTableId _ table NominalSourceTable <- [idDetails fun]
-                                            , isNominalStructuralSource fun || sourceMapperType (idType fun) ||
-                                              indexedLookupType (idType fun)]
+              early_closures = earlyIndexedLookups with_fields
+              early_closure_owners = mkNameSet (map (idName . fst) early_closures)
+              early_nominal = early_closures ++
+                [(fun, table) | fun <- installed
+                              , not (idName fun `elemNameSet` early_closure_owners)
+                              , SourceTableId _ table NominalSourceTable <- [idDetails fun]
+                              , isNominalStructuralSource fun || sourceMapperType (idType fun)]
           setGblEnv with_fields $ do
             checkLocalRetainedWitnessExports with_fields installed
             checkLocalIndexedLookupExports with_fields
@@ -792,21 +798,30 @@ installSourceTables tables = do
               owner = case lookupTypeEnv types (idName fun) of
                         Just (AnId existing) -> existing
                         _ -> fun
+              closure_helpers = case idDetails owner of
+                        CheckedClosureSourceTableId _ _ hs -> Just hs
+                        _ -> case idDetails fun of
+                               CheckedClosureSourceTableId _ _ hs -> Just hs
+                               _ -> Nothing
               ordinary = case idDetails owner of
                            SourceTableId {} -> setIdDetails owner VanillaId
+                           CheckedClosureSourceTableId {} -> setIdDetails owner VanillaId
                            _ -> owner
               origin = case idDetails owner of
                          SourceTableId _ _ prior -> prior
                          _ -> case idDetails fun of
                                 SourceTableId _ _ proposed -> proposed
                                 _ -> NominalSourceTable
-          in (ordinary, table, origin)
+              target_details = case closure_helpers of
+                         Just hs -> CheckedClosureSourceTableId (idName fun) table hs
+                         Nothing -> SourceTableId (idName fun) table origin
+          in (ordinary, table, origin, target_details)
         prepared = map prepare tables
-        candidates = [setIdDetails fun (SourceTableId (idName fun) table origin)
-                     | (fun, table, origin) <- prepared]
+        candidates = [setIdDetails fun details
+                     | (fun, _, _, details) <- prepared]
     -- Make all checked owners available while recovering the dependency closure.
     tcExtendGlobalValEnv candidates $ do
-      dependencies <- mapM (\(_, table, _) -> sourceTableDependencies table) prepared
+      dependencies <- mapM (\(_, table, _, _) -> sourceTableDependencies table) prepared
       -- Dependency lookup can load interfaces that contain rules.
       rewriting <- goptM Opt_EnableRewriteRules
       visible <- if rewriting then Just <$> visibleSourceMethodRules env else pure Nothing
@@ -814,7 +829,7 @@ installSourceTables tables = do
       let ruled = sourceRuleOwners (tcg_rules env)
           changed fun = idName fun `elemNameSet` ruled
                         || maybe False (`hasSourceMethodRule` fun) visible
-      ids <- forM (zip prepared dependencies) $ \((fun, table, origin), callees) -> do
+      ids <- forM (zip prepared dependencies) $ \((fun, table, origin, target_details), callees) -> do
         let name = idName fun
             reject diagnostic = do
               when (tyConName table `elemNameSet` used) $
@@ -828,11 +843,11 @@ installSourceTables tables = do
                         _ -> fun : deps)
             -> reject (TcRnRetainedQuantificationError (RetainedSourceRule (idName bad)))
           Just deps -> do
-            for_ deps $ \callee ->
+            for_ (fun : deps) $ \callee ->
               when (nameIsLocalOrFrom (tcg_semantic_mod env) (idName callee)) $
                 keepAlive (idName callee)
             pure $ case idDetails fun of
-              VanillaId -> setIdDetails fun (SourceTableId name table origin)
+              VanillaId -> setIdDetails fun target_details
               _ -> fun
       tcExtendGlobalValEnv ids $
         if null new_tables then getGblEnv else fst <$> addTyConsToGblEnv new_tables
@@ -866,28 +881,52 @@ the final rule environment can withdraw that authority.
 
 -- | Check the requested constructor cases after solving their value group.
 -- See Note [Early constructor mapper equations].
-sourceTablesWithMappers :: Bool -> NameSet -> Bag EvBind -> TcGblEnv -> TcM [(Id, TyCon)]
+sourceTablesWithMappers :: Bool -> NameSet -> Bag EvBind -> TcGblEnv
+                        -> TcM ([(Id, TyCon)], [TyCon], [Id])
 sourceTablesWithMappers structural names evidence env = do
     ordinary <- sourceTablesFor structural names env
-    let in_group = [owner | bind <- tcg_binds env
+    let ordinary_owners = mkNameSet (map (idName . fst) ordinary)
+        in_group = [owner | bind <- tcg_binds env
                           , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind)
-                          , idName owner `elemNameSet` names]
-    candidates <- fmap catMaybes $ forM in_group $ \owner -> do
+                          , idName owner `elemNameSet` names
+                          , not (idName owner `elemNameSet` ordinary_owners)]
+    mapper_cands <- fmap catMaybes $ forM in_group $ \owner -> do
       ty <- liftZonkM (zonkTcType (idType owner))
-      pure ((owner, indexedLookupType ty) <$ guard (sourceMapperType ty || indexedLookupType ty))
-    cases <- forM candidates $ \(owner, indexed) ->
+      pure (owner <$ guard (sourceMapperType ty))
+    mappers <- forM mapper_cands $ \owner ->
       tryTcDiscardingErrs (pure Nothing) $ do
         let name = idName owner
-            demands = [(name, nameSrcSpan name)]
-        when indexed (checkLocalOpenDeferrals demands)
-        (definitions, _) <- localOpenDefinitions demands
+        (definitions, _) <- localOpenDefinitions [(name, nameSrcSpan name)]
                               (tcg_ev_binds env `unionBags` evidence) (tcg_binds env)
         case lookupNameEnv definitions name of
-          Just (actual, rhs) | actual == owner
-            -> if indexed then sourceIndexedLookupTable actual definitions
-                          else sourceMapperTable actual rhs
+          Just (actual, rhs) | actual == owner -> sourceMapperTable actual rhs
           _ -> pure Nothing
-    pure (ordinary ++ catMaybes cases)
+    let mapper_done = mkNameSet [idName v | Just (v, _) <- mappers]
+    closure_cands <- fmap catMaybes $ forM in_group $ \owner ->
+      if idName owner `elemNameSet` mapper_done
+        then pure Nothing
+        else do
+          ty <- liftZonkM (zonkTcType (idType owner))
+          pure (owner <$ guard (earlyClosureCandidateType ty))
+    (closures, companions, helpers) <-
+      if null closure_cands
+        then pure ([], [], [])
+        else tryTcDiscardingErrs (pure ([], [], [])) $ do
+          let demands = [(idName owner, nameSrcSpan (idName owner)) | owner <- closure_cands]
+          checkLocalOpenDeferrals demands
+          (definitions, _) <- localOpenDefinitions demands
+                                (tcg_ev_binds env `unionBags` evidence) (tcg_binds env)
+          sourceEarlyClosureTables closure_cands definitions
+    pure (ordinary ++ catMaybes mappers ++ closures, companions, helpers)
+
+installEarlyTables :: ([(Id, TyCon)], [TyCon], [Id]) -> TcM TcGblEnv
+installEarlyTables (tables, companions, helpers) = do
+    env0 <- getGblEnv
+    let missing_helpers = [h | h <- helpers, isNothing (lookupTypeEnv (tcg_type_env env0) (idName h))]
+        missing_companions = [tc | tc <- companions, isNothing (lookupTypeEnv (tcg_type_env env0) (tyConName tc))]
+    tcExtendGlobalValEnv missing_helpers $ do
+      env1 <- if null missing_companions then getGblEnv else fst <$> addTyConsToGblEnv missing_companions
+      setGblEnv env1 (installSourceTables tables)
 
 -- | Merge the finalised types and retain a source table already attached to
 -- its exact owner. A local signature can already use the table's equations.
@@ -1017,7 +1056,7 @@ tc_rn_src_decls ds
                ; enabled <- xoptM LangExt.ExperimentalDependentTypes
                ; let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rn_decls))
                ; tcg_env <- if enabled
-                            then sourceTablesWithMappers False names ev_binds1 tcg_env >>= installSourceTables
+                            then sourceTablesWithMappers False names ev_binds1 tcg_env >>= installEarlyTables
                             else return tcg_env
 
                  -- Rename the splice expression, and get its supporting decls
@@ -1897,6 +1936,12 @@ invalidAbsDataSubTypes = execWriter . go
       = invalid ty
     go ty@(DepFunTy {})
       = invalid ty
+    go ty@(ExistsTy {})
+      = invalid ty
+    go ty@(DepDictTy {})
+      = invalid ty
+    go ty@(ClassAppTy {})
+      = invalid ty
     go TyVarTy{}
       = ok -- We report an error at the binding site of type variables,
            -- e.g. in the TySyn LHS or in the forall.
@@ -2476,7 +2521,7 @@ tcTopSrcTables group = do
         restoreEnvs envs $ do
           evs <- simplifyTop wanteds
           let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds early))
-          ordinary <- sourceTablesWithMappers True names evs early_env
+          (ordinary, companions, helpers) <- sourceTablesWithMappers True names evs early_env
           let known = mkNameSet (map (tyConName . snd) ordinary)
               witness_owners = mkNameSet
                 [idName owner | bind <- tcg_binds early_env
@@ -2501,7 +2546,7 @@ tcTopSrcTables group = do
               setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
           failIfErrsM
           addTopEvBinds evs $ do
-            tables_env <- installSourceTables tables
+            tables_env <- installEarlyTables (tables, companions, helpers)
             setGblEnv tables_env $ do
               (rest_envs, _, _) <- tcTopSrcDeclGroupWithMethods False (Just deriving_info) rest
               pure rest_envs
@@ -2562,7 +2607,7 @@ sourceTableTypeDependencies env HsGroup{hs_tyclds = groups} ready uses = do
     saturated (name, Nothing)
       | name `elemNameSet` local_types = isJust (ready name)
       | Just (ATyCon tc) <- lookupTypeEnv (tcg_type_env env) name
-      = isVanillaAlgTyCon tc || (isTypeSynonymTyCon tc && isFamFreeTyCon tc)
+      = isAlgTyCon tc || (isTypeSynonymTyCon tc && isFamFreeTyCon tc)
       | Just gre <- lookupGRE_Name (tcg_rdr_env env) name
       = any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
       | otherwise = False
@@ -2571,8 +2616,11 @@ sourceTableTypeDependencies env HsGroup{hs_tyclds = groups} ready uses = do
       | Just (arity, _) <- ready name = supplied == arity
       | supplied == 0 = True
       | Just (ATyCon tc) <- lookupTypeEnv (tcg_type_env env) name
-      , isTypeSynonymTyCon tc, isFamFreeTyCon tc
+      , isAlgTyCon tc || (isTypeSynonymTyCon tc && isFamFreeTyCon tc)
       = supplied == length (tyConVisibleTyVars tc)
+      | not (name `elemNameSet` local_types)
+      , Just gre <- lookupGRE_Name (tcg_rdr_env env) name
+      = any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
       | otherwise = False
 
     dependencies name

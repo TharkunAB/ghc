@@ -1,11 +1,12 @@
 module GHC.Tc.Gen.SourceClosure
   ( publishCheckedSourceClosures
-  , indexedLookupType
+  , earlyClosureCandidateType
   , earlyIndexedLookups
   , pruneUnusedIndexedLookups
-  , sourceIndexedLookupTable
+  , sourceEarlyClosureTables
   , checkLocalIndexedLookupExports
   , validateEarlyIndexedLookups
+  , finalizeEarlyClosureTypes
   ) where
 
 import GHC.Prelude
@@ -17,7 +18,7 @@ import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Fix (mfix)
 import Data.Foldable (for_, traverse_)
 import Data.List (find, nubBy, sortBy, sortOn)
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe, maybeToList)
 
 import GHC.Builtin.KnownKeys (patErrorIdKey)
 import GHC.Builtin.WiredIn.Types (manyDataConTy, unmatchableDataConTy)
@@ -43,7 +44,7 @@ import GHC.Core.TyCon
   , TyCon, TyConBinder, Injectivity(NotInjective), closedFamilyTyConCoAxiom_maybe, mkAlgTyCon
   , mkLevPolyDataTyConRhs, mkTyConKind, mkAnonTyConBinder, mkNamedTyConBinder, mkNamedTyConBinders
   , mkFamilyTyCon, mkTyConKindWithMatchability, isAlgTyCon, isPromotedDataCon, synTyConRhs_maybe
-  , tyConDataCons, tyConKind, tyConName )
+  , tyConArity, tyConDataCons, tyConKind, tyConName, tyConRepName_maybe )
 import GHC.Core.Type
   ( Kind, getTyVar_maybe, isLiftedTypeKind, isManyTy, liftedTypeKind, lookupTyVar
   , mkAppTys, mkSpecForAllTys, mkTyConApp, mkTyVarTy, mkVisFunTyManyU
@@ -54,10 +55,11 @@ import GHC.Core.Utils (exprType, stripTicksE)
 import GHC.Driver.Config (initSimpleOpts)
 import GHC.Driver.DynFlags (GeneralFlag(Opt_Hpc), HasDynFlags(getDynFlags), pluginModNames)
 import GHC.Driver.Env (visibleSourceRuleHeads)
+import GHC.Hs.Utils (CollectFlag(CollNoDictBinders), collectHsBindBinders)
 import GHC.Tc.Errors.Types (RetainedQuantificationError(RetainedSourceRule), TcRnMessage(..))
 import GHC.Tc.Gen.SourceTable
   ( hasSourceMethodRule, ordinaryImport, publicCaseType, sourceEquationDatatypes
-  , visibleSourceMethodRules )
+  , sourceTableCallees, visibleSourceMethodRules )
 import GHC.Tc.TyCl.Build (buildDataCon, newImplicitBinder, newTyConRepName)
 import GHC.Tc.Types (tcVisibleOrphanMods)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
@@ -66,7 +68,9 @@ import GHC.Tc.Utils.Monad
   , newSysName, readTcRef, setSrcSpan )
 import GHC.Tc.Utils.TcType (isTyFamFree)
 import GHC.Types.Avail (availsToNameSet)
-import GHC.Types.Id (Id, idCoreRules, idDetails, idName, isDataConWorkId_maybe, isDataConWrapId_maybe)
+import GHC.Types.Id
+  ( Id, idCoreRules, idDetails, idName, isDataConWorkId_maybe, isDataConWrapId_maybe
+  , sourceTableId_maybe )
 import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, SourceTableId, VanillaId))
 import GHC.Types.Basic (SourceTableOrigin(NominalSourceTable))
 import GHC.Types.Id.Make (DataConBangOpts(FixedBangOpts))
@@ -75,13 +79,13 @@ import GHC.Types.Name
   ( Name, NamedThing(getName), isExternalName, isWiredInName, mkDataOcc, mkInstTyCoOcc, mkSourceTableOcc
   , mkTcOcc, mkTyVarOcc, nameModule_maybe, nameOccName, nameSrcSpan, nameStableString, occNameString
   , stableNameCmp )
-import GHC.Types.Name.Env (NameEnv, filterNameEnv, mapNameEnv, mkNameEnv, nonDetNameEnvElts)
+import GHC.Types.Name.Env (NameEnv, filterNameEnv, lookupNameEnv, mapNameEnv, mkNameEnv, nonDetNameEnvElts)
 import GHC.Types.Name.Reader (isLocalGRE, lookupGRE_Name)
-import GHC.Types.Name.Set (NameSet, elemNameSet, mkNameSet, nameSetElemsStable)
+import GHC.Types.Name.Set (NameSet, elemNameSet, extendNameSetList, mkNameSet, nameSetElemsStable)
 import GHC.Types.SourceText (SourceText(NoSourceText))
-import GHC.Types.SrcLoc (noSrcSpan)
+import GHC.Types.SrcLoc (noSrcSpan, unLoc)
 import GHC.Types.Tickish (GenTickish(Breakpoint))
-import GHC.Types.TyThing (TyThing(AConLike, ATyCon, AnId))
+import GHC.Types.TyThing (TyThing(AConLike, ATyCon, AnId), implicitTyConThings)
 import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, typeEnvElts, typeEnvIds)
 import GHC.Types.Unique (hasKey)
 import GHC.Types.Unique.Set (elementOfUniqSet)
@@ -169,6 +173,17 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
           actual <- lookupLocal owner
           VanillaId <- pure (idDetails actual)
           pure actual
+        -- Allow an already early-staged closure root to supply helper shapes
+        -- for any remaining VanillaId helpers under -fwrite-source-equations,
+        -- while never overwriting the already-staged root itself.
+        lookupClosureRoot old = do
+          let owner = idName old
+          guard (isExternalName owner && owner `elemNameSet` exported)
+          actual <- lookupLocal owner
+          case idDetails actual of
+            VanillaId -> pure actual
+            CheckedClosureSourceTableId{} -> pure actual
+            _ -> Nothing
         dependencies include old actual = do
           let helpers = nameSetElemsStable $ mkNameSet $
                 filter (\name -> name /= idName old && include name)
@@ -195,7 +210,7 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
           guard (null (exprSomeFreeVarsList (helper False) old_rhs) &&
                  null (exprSomeFreeVarsList (helper True) new_rhs))
         candidate (old, original_rhs) = do
-          actual <- lookupOwner old
+          actual <- lookupClosureRoot old
           original_shape <- familyInputs original old original_rhs
           final_rhs <- lookup actual final
           shape@(FamilyInputs _ _ _ _ term ext index _ _ _ _ _) <- familyInputs final actual final_rhs
@@ -205,32 +220,33 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
           guard (not (null helper_ids))
           pure (actual, (original_shape, shape), helper_ids)
         indexed_candidate (old, original_rhs) = do
-          actual <- lookupOwner old
-          final_rhs <- lookup actual final
-          let decoder = IndexedEntry IndexedDecoder <$> indexedSource original old original_rhs
-                                                    <*> indexedSource final actual final_rhs
-              encoder = IndexedEntry IndexedEncoder <$> indexedEncoder original old original_rhs
-                                                    <*> indexedEncoder final actual final_rhs
-              traversal = IndexedEntry IndexedTraversal <$> indexedTraversal original old original_rhs
-                                                        <*> indexedTraversal final actual final_rhs
-              untyped = do
+          let vanilla_entry = do
+                actual <- lookupOwner old
+                final_rhs <- lookup actual final
+                let decoder = IndexedEntry IndexedDecoder <$> indexedSource original old original_rhs
+                                                          <*> indexedSource final actual final_rhs
+                    encoder = IndexedEntry IndexedEncoder <$> indexedEncoder original old original_rhs
+                                                          <*> indexedEncoder final actual final_rhs
+                    traversal = IndexedEntry IndexedTraversal <$> indexedTraversal original old original_rhs
+                                                              <*> indexedTraversal final actual final_rhs
+                shapes <- decoder <|> encoder <|> traversal
+                let keep_internal = case shapes of
+                      IndexedEntry IndexedDecoder _ _ -> True
+                      _ -> False
+                helper_ids <- dependencies (\name -> keep_internal || isExternalName name) old actual
+                pure (actual, shapes, helper_ids)
+              untyped_entry = do
+                actual <- lookupClosureRoot old
+                final_rhs <- lookup actual final
                 orig_u <- untypedFamilyInputs original old original_rhs
                 fin_u@(UntypedFamilyInputs _ _ _ term _ index _ _ _ _ _) <-
                   untypedFamilyInputs final actual final_rhs
                 guard (sameUntypedShapes orig_u fin_u)
                 guard (all ((== here) . nameModule_maybe . tyConName) [term, index])
-                pure (UntypedClosureEntry orig_u fin_u)
-          shapes <- decoder <|> encoder <|> traversal <|> untyped
-          let keep_internal = case shapes of
-                IndexedEntry IndexedDecoder _ _ -> True
-                _ -> False
-          -- The decoder retains every helper identity. The encoder and GADT
-          -- traversal check floated type-only bodies, which can have internal Names.
-          helper_ids <- dependencies (\name -> keep_internal || isExternalName name) old actual
-          case shapes of
-            UntypedClosureEntry _ _ -> guard (not (null helper_ids))
-            _ -> pure ()
-          pure (actual, shapes, helper_ids)
+                helper_ids <- dependencies isExternalName old actual
+                guard (not (null helper_ids))
+                pure (actual, UntypedClosureEntry orig_u fin_u, helper_ids)
+          vanilla_entry <|> untyped_entry
         -- See Note [Renaming with an abstract callback].
         renaming_candidate (_, (original_shape, shape), _) = do
           let (rename, extend) = renamingOperations original_shape
@@ -309,13 +325,15 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
                        weakenings ++ subst_exts ++ checked_substs ++ checked_lookups
         pure (map fst accepted, concatMap snd accepted)
   where
-    publish public (owner, (_, shape), helpers) = do
-      generated <- allocateFamilies shape
-      pure $ do
-        (root, families) <- generated
-        guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
-        let new = setIdDetails owner (CheckedClosureSourceTableId (idName owner) root (map idName helpers))
-        pure (new, families)
+    publish public (owner, (_, shape), helpers)
+      | VanillaId <- idDetails owner = do
+          generated <- allocateFamilies shape
+          pure $ do
+            (root, families) <- generated
+            guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
+            let new = setIdDetails owner (CheckedClosureSourceTableId (idName owner) root (map idName helpers))
+            pure (new, families)
+      | otherwise = pure Nothing
 
 {- Note [Checked indexed reconstruction]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -829,36 +847,414 @@ publishIndexedLookup public (owner, (original, final), _) = runMaybeT $ do
     table <- makeIndexedLookupTable public owner original (Just final)
     pure (setIdDetails owner (SourceTableId (idName owner) table NominalSourceTable), [table])
 
--- | Check the solved local binding before checking the declaration that uses it.
-sourceIndexedLookupTable :: Id -> NameEnv (Id, CoreExpr) -> TcM (Maybe (Id, TyCon))
-sourceIndexedLookupTable owner definitions = do
+-- | Select functions whose signatures can head an early indexed lookup,
+-- GADT structural traversal, or scope-indexed closure chain.
+earlyClosureCandidateType :: Type -> Bool
+earlyClosureCandidateType ty =
+    indexedLookupType ty || gadtDomainType ty || gadtCallbackType ty
+  where
+    indexedDomain dom
+      | Just (tc, args@(_ : _)) <- splitTyConApp_maybe dom
+      = isAlgTyCon tc &&
+        (any (not . DC.isVanillaDataCon) (tyConDataCons tc) ||
+         any (not . isLiftedTypeKind . typeKind) args)
+      | otherwise = False
+
+    gadtDomainType t =
+      let (tvs, tau) = splitForAllTyVars t
+      in not (null tvs) && case splitFunTys tau of
+           (_, Scaled mult first : _, _) -> isManyTy mult && indexedDomain first
+           _ -> False
+
+    gadtCallbackType t =
+      let (tvs, tau) = splitForAllTyVars t
+      in not (null tvs) && case splitFunTys tau of
+           (_, [Scaled mult cb], rest) | isManyTy mult ->
+             let (_, cb_tau) = splitForAllTyVars cb
+                 (_, res_tau) = splitForAllTyVars rest
+             in case (splitFunTys cb_tau, splitFunTys res_tau) of
+                  ((_, [Scaled m1 cb_in], _), (_, [Scaled m2 dom_in], _)) ->
+                    isManyTy m1 && isManyTy m2 && indexedDomain cb_in && indexedDomain dom_in
+                  _ -> False
+           (_, [Scaled mult cb, Scaled m2 dom_in], _) | isManyTy mult && isManyTy m2 ->
+             let (_, cb_tau) = splitForAllTyVars cb
+             in case splitFunTys cb_tau of
+                  (_, [Scaled m1 cb_in], _) ->
+                    isManyTy m1 && indexedDomain cb_in && indexedDomain dom_in
+                  _ -> False
+           _ -> False
+
+-- | Stage eligible local indexed lookups, GADT traversals, and substitution
+-- chains before checking dependent declarations in the rest of the group.
+sourceEarlyClosureTables :: [Id] -> NameEnv (Id, CoreExpr)
+                         -> TcM ([(Id, TyCon)], [TyCon], [Id])
+sourceEarlyClosureTables group_owners definitions = do
     env <- getGblEnv
     dflags <- getDynFlags
     added_plugins <- readTcRef (tcg_th_coreplugins env)
-    let opts = initSimpleOpts dflags
-        rdr_env = tcg_rdr_env env
-        available name
-          | nameModule_maybe name == Just (tcg_semantic_mod env) =
-              maybe False isLocalGRE (lookupGRE_Name rdr_env name)
-          | otherwise = isWiredInName name || ordinaryImport rdr_env name
-        public tc = all available (tyConName tc : map DC.dataConName (tyConDataCons tc))
-        bindings = [(v, simpleOptExpr opts rhs) | (v, rhs) <- nonDetNameEnvElts definitions]
-    runMaybeT $ do
-      guard (null added_plugins && null (pluginModNames dflags))
-      rhs <- MaybeT (pure (lookup owner bindings))
-      checked <- MaybeT (pure (indexedLookup bindings owner rhs))
-      (owner,) <$> makeIndexedLookupTable public owner checked Nothing
+    if not (null added_plugins && null (pluginModNames dflags))
+      then pure ([], [], [])
+      else do
+        let here = Just (tcg_semantic_mod env)
+            opts = initSimpleOpts dflags
+            rdr_env = tcg_rdr_env env
+            available name
+              | nameModule_maybe name == here =
+                  maybe False isLocalGRE (lookupGRE_Name rdr_env name)
+              | otherwise = isWiredInName name || ordinaryImport rdr_env name
+            public tc = all available (tyConName tc : map DC.dataConName (tyConDataCons tc))
+            unoptimized = nonDetNameEnvElts definitions
+            bindings = [(v, simpleOptExpr opts rhs) | (v, rhs) <- unoptimized]
+            in_group_set = mkNameSet (map idName group_owners)
+            fresh_owner v = idName v `elemNameSet` in_group_set && isNothing (sourceTableId_maybe v)
+            lookupDef name = fst <$> lookupNameEnv definitions name
+            extDeps owner =
+              let names = nameSetElemsStable $ mkNameSet $
+                    filter (\n -> n /= idName owner && isExternalName n && nameModule_maybe n == here)
+                           (reachable bindings owner)
+              in traverse lookupDef names
+            isConstructorId v = isJust (isDataConWorkId_maybe v <|> isDataConWrapId_maybe v)
+            onlyCalls allowed owner = do
+              raw_rhs <- snd <$> lookupNameEnv definitions (idName owner)
+              opt_rhs <- lookup owner bindings
+              let bad v = isValueVar v && idName v `notElem` allowed && not (isConstructorId v)
+              guard (all (null . exprSomeFreeVarsList bad) [raw_rhs, opt_rhs])
 
--- | Collect early-staged indexed lookup owners currently installed in the module.
-earlyIndexedLookups :: TcGblEnv -> [(Id, TyCon)]
-earlyIndexedLookups env =
-    sortBy (\(a, _) (b, _) -> stableNameCmp (idName a) (idName b))
-      [ (fun, table)
+        -- 1. Indexed lookups (e.g. lookupEnv)
+        lookups <- fmap catMaybes $ for_list group_owners $ \owner ->
+          if not (fresh_owner owner && indexedLookupType (varType owner))
+            then pure Nothing
+            else runMaybeT $ do
+              rhs <- MaybeT (pure (lookup owner bindings))
+              checked <- MaybeT (pure (indexedLookup bindings owner rhs))
+              table <- makeIndexedLookupTable public owner checked Nothing
+              pure (setIdDetails owner (SourceTableId (idName owner) table NominalSourceTable), table)
+        let lookup_done = mkNameSet (map (idName . fst) lookups)
+
+        -- 2. GADT structural traversals (e.g. plug, plugS)
+        traversals <- fmap catMaybes $ for_list group_owners $ \owner ->
+          if not (fresh_owner owner) || idName owner `elemNameSet` lookup_done
+            then pure Nothing
+            else runMaybeT $ do
+              rhs <- MaybeT (pure (lookup owner bindings))
+              src <- MaybeT (pure (indexedTraversal bindings owner rhs))
+              helpers <- MaybeT (pure (extDeps owner))
+              MaybeT ((fmap . fmap) (\(v, tcs) -> (v, tcs, helpers))
+                        (publishIndexed public (owner, (IndexedTraversal, src, src), helpers)))
+        let trav_tables = [(v, tc) | (v, tc : _, _) <- traversals]
+            trav_extra_tcs = [tc | (_, _ : rest, _) <- traversals, tc <- rest]
+            trav_helpers = [h | (_, _, hs) <- traversals, h <- hs]
+            trav_done = lookup_done `extendNameSetList` map (idName . fst) trav_tables
+
+        -- 3. Typed substitution closures & helper chains
+        let typed_roots =
+              [ (owner, shape, helpers)
+              | owner <- group_owners
+              , fresh_owner owner, not (idName owner `elemNameSet` trav_done)
+              , Just rhs <- [lookup owner bindings]
+              , Just shape <- [familyInputs bindings owner rhs]
+              , Just helpers <- [extDeps owner]
+              , not (null helpers) ]
+        typed_closures <- fmap catMaybes $ for_list typed_roots $ \(owner, shape, helpers) -> do
+          generated <- allocateFamilies shape
+          pure $ do
+            (root, families) <- generated
+            guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
+            let new = setIdDetails owner (CheckedClosureSourceTableId (idName owner) root (map idName helpers))
+            pure (new, root, filter (/= root) families, helpers)
+        let direct_typed_shapes = map (\(_, s, _) -> s) typed_roots ++
+              directTypedOperationShapes bindings group_owners
+            sameId a b = idName a == idName b
+            renaming_cands = nubBy (\(a, _, _) (b, _, _) -> sameId a b)
+              [ (actual_ren, (actual_ext, shape), helpers)
+              | shape <- direct_typed_shapes
+              , let (ren, ext) = renamingOperations shape
+              , Just actual_ren <- [lookupDef (idName ren)]
+              , Just actual_ext <- [lookupDef (idName ext)]
+              , isJust (onlyCalls [] actual_ext)
+              , Just helpers <- [extDeps actual_ren]
+              , any (sameId actual_ext) helpers ]
+            ext_cands = nubBy (\(_, (a, _), _) (_, (b, _), _) -> sameId a b)
+              [ c | c@(_, (actual_ext, _), _) <- renaming_cands, fresh_owner actual_ext ]
+        typed_exts <- fmap catMaybes $ for_list ext_cands $ \cand ->
+          publishRenameExtension public cand
+        let ext_table_map = [(idName v, tc) | (v, [tc]) <- typed_exts] ++
+              [(idName v, tc) | v <- group_owners, Just tc <- [sourceTableId_maybe v]]
+        typed_rens <- fmap catMaybes $ for_list
+          [ c | c@(actual_ren, _, _) <- renaming_cands, fresh_owner actual_ren ] $ \cand ->
+            publishRenaming public ext_table_map cand
+        let ren_table_map = [(idName v, tc) | (v, [tc]) <- typed_rens] ++ ext_table_map
+            subst_ext_cands = nubBy (\(a, _, _) (b, _, _) -> sameId a b)
+              [ (actual_sext, (actual_ren, actual_weak, shape), helpers)
+              | shape <- direct_typed_shapes
+              , let (ren, _) = renamingOperations shape
+              , (_, sext, Just weak) <- [substitutionOperations shape]
+              , Just actual_ren <- [lookupDef (idName ren)]
+              , Just actual_sext <- [lookupDef (idName sext)]
+              , Just actual_weak <- [lookupDef (idName weak)]
+              , isJust (onlyCalls [] actual_weak)
+              , isJust (onlyCalls [idName actual_ren, idName actual_weak] actual_sext)
+              , Just helpers <- [extDeps actual_sext]
+              , all (\n -> n `elem` map idName helpers) [idName actual_ren, idName actual_weak] ]
+            weak_cands = nubBy (\a b -> sameId (fst a) (fst b))
+              [ (actual_weak, shape)
+              | (_, (_, actual_weak, shape), _) <- subst_ext_cands
+              , fresh_owner actual_weak ]
+        typed_weaks <- fmap catMaybes $ for_list weak_cands (publishWeakening public)
+        let weak_table_map = [(idName v, tc) | (v, [tc]) <- typed_weaks] ++ ext_table_map
+        typed_sexts <- fmap catMaybes $ for_list
+          [ c | c@(actual_sext, _, _) <- subst_ext_cands, fresh_owner actual_sext ] $ \cand ->
+            publishSubstitutionExtension public ren_table_map weak_table_map cand
+        let sext_table_map = [(idName v, tc) | (v, [tc]) <- typed_sexts] ++ ext_table_map
+            subst_cands = nubBy (\(a, _, _) (b, _, _) -> sameId a b)
+              [ (actual_sub, (actual_sext, shape), helpers)
+              | shape <- direct_typed_shapes
+              , let (ren, _) = renamingOperations shape
+              , (sub, sext, Just weak) <- [substitutionOperations shape]
+              , Just actual_sub <- [lookupDef (idName sub)]
+              , fresh_owner actual_sub
+              , Just actual_sext <- [lookupDef (idName sext)]
+              , let op_names = [idName actual_sub, idName ren, idName actual_sext, idName weak]
+              , isJust (onlyCalls op_names actual_sub)
+              , Just helpers <- [extDeps actual_sub]
+              , any (sameId actual_sext) helpers ]
+        typed_substs <- fmap catMaybes $ for_list subst_cands $ \cand ->
+          publishSubstitution public sext_table_map cand
+
+        -- 4. Untyped scope-indexed closures & helper chains
+        let typed_done = trav_done `extendNameSetList`
+              ([idName v | (v, _, _, _) <- typed_closures] ++
+               [idName v | (v, _) <- typed_exts ++ typed_rens ++ typed_weaks ++ typed_sexts ++ typed_substs])
+            untyped_roots =
+              [ (owner, shape, helpers)
+              | owner <- group_owners
+              , fresh_owner owner, not (idName owner `elemNameSet` typed_done)
+              , Just rhs <- [lookup owner bindings]
+              , Just shape <- [untypedFamilyInputs bindings owner rhs]
+              , Just helpers <- [extDeps owner]
+              , not (null helpers) ]
+        untyped_closures <- fmap catMaybes $ for_list untyped_roots $ \(owner, shape, helpers) -> do
+          generated <- allocateUntypedFamilies shape
+          pure $ do
+            (root, families) <- generated
+            guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
+            let new = setIdDetails owner (CheckedClosureSourceTableId (idName owner) root (map idName helpers))
+            pure (new, root, filter (/= root) families, helpers)
+        let direct_untyped_shapes = map (\(_, s, _) -> s) untyped_roots ++
+              directUntypedOperationShapes bindings group_owners
+            uren_cands = nubBy (\(a, _, _) (b, _, _) -> sameId a b)
+              [ (actual_ren, (actual_ext, shape), helpers)
+              | shape <- direct_untyped_shapes
+              , let (ren, ext) = untypedRenamingOperations shape
+              , Just actual_ren <- [lookupDef (idName ren)]
+              , Just actual_ext <- [lookupDef (idName ext)]
+              , isJust (onlyCalls [] actual_ext)
+              , Just helpers <- [extDeps actual_ren]
+              , any (sameId actual_ext) helpers ]
+            uext_cands = nubBy (\(_, (a, _), _) (_, (b, _), _) -> sameId a b)
+              [ c | c@(_, (actual_ext, _), _) <- uren_cands, fresh_owner actual_ext ]
+        untyped_exts <- fmap catMaybes $ for_list uext_cands (publishUntypedRenameExtension public)
+        let uext_table_map = [(idName v, tc) | (v, [tc]) <- untyped_exts] ++
+              [(idName v, tc) | v <- group_owners, Just tc <- [sourceTableId_maybe v]]
+        untyped_rens <- fmap catMaybes $ for_list
+          [ c | c@(actual_ren, _, _) <- uren_cands, fresh_owner actual_ren ] $ \cand ->
+            publishUntypedRenaming public uext_table_map cand
+
+        let op_entries = typed_exts ++ typed_rens ++ typed_weaks ++ typed_sexts ++
+                         typed_substs ++ untyped_exts ++ untyped_rens
+            op_tables = [(v, tc) | (v, [tc]) <- op_entries]
+            op_helpers = [ h | (v, _) <- op_entries
+                         , CheckedClosureSourceTableId _ _ hs <- [idDetails v]
+                         , nm <- hs, Just h <- [lookupDef nm] ]
+            closure_tables = [(v, r) | (v, r, _, _) <- typed_closures ++ untyped_closures]
+            closure_companions = [tc | (_, _, tcs, _) <- typed_closures ++ untyped_closures, tc <- tcs]
+            closure_helpers = [h | (_, _, _, hs) <- typed_closures ++ untyped_closures, h <- hs]
+            all_tables = lookups ++ trav_tables ++ closure_tables ++ op_tables
+            all_companions = trav_extra_tcs ++ closure_companions
+            all_helpers = nubBy (\a b -> idName a == idName b)
+                            (trav_helpers ++ closure_helpers ++ op_helpers)
+        pure (all_tables, all_companions, all_helpers)
+  where
+    for_list = flip traverse
+
+-- | Recover FamilyInputs directly from a local subst or rename operation when
+-- a declaration group uses rename/subst/ext without demanding substSingle yet.
+directTypedOperationShapes :: [(Id, CoreExpr)] -> [Id] -> [FamilyInputs]
+directTypedOperationShapes bindings candidates = mapMaybe from_subst candidates ++ mapMaybe from_rename candidates
+  where
+    from_subst subst_id = do
+      rhs <- lookup subst_id bindings
+      ([g_tv, _, a_tv], [sigma, scrutinee], traversal_case) <- function rhs
+      let context_kind = varType g_tv
+          sort_kind = varType a_tv
+      (context_tc, []) <- splitTyConApp_maybe context_kind
+      (sort_tc, []) <- splitTyConApp_maybe sort_kind
+      guard (all isAlgTyCon [context_tc, sort_tc])
+      (term, [_, _]) <- splitTyConApp_maybe (varType scrutinee)
+      (_, cb_tau) <- pure (splitForAllTyVars (varType sigma))
+      (_, [Scaled _ idx_ty], _) <- pure (splitFunTys cb_tau)
+      (index, [_, _]) <- splitTyConApp_maybe idx_ty
+      guard (all isAlgTyCon [term, index])
+      [c1, c2] <- pure (tyConDataCons index)
+      rows <- caseOn scrutinee traversal_case
+      var <- find (\con -> case [ (bs, e) | (dc, bs, e) <- rows, dc == con ] of
+                      [(bs, e)] | [field] <- filter isValueVar bs
+                                , Just checked <- branchBody bs e
+                                , Just (Core.Var use, [Core.Var x]) <- application checked
+                                -> use == sigma && x == field
+                      _ -> False) (tyConDataCons term)
+      ext_con <- findPromotedExtCon term
+      tryPair subst_id context_kind sort_kind term ext_con index sigma var rows c1 c2 <|>
+        tryPair subst_id context_kind sort_kind term ext_con index sigma var rows c2 c1
+
+    tryPair subst_id context_kind sort_kind term ext_con index sigma var rows hit miss = do
+      (ops, recipes) <- checkedTraversals bindings subst_id sigma var hit miss rows
+      pure (FamilyInputs subst_id 1 context_kind sort_kind term ext_con index ops var hit miss recipes)
+
+    from_rename rename_id = do
+      rhs <- lookup rename_id bindings
+      ([g_tv, _, a_tv], [rho, operand], renaming) <- function rhs
+      let context_kind = varType g_tv
+          sort_kind = varType a_tv
+      (context_tc, []) <- splitTyConApp_maybe context_kind
+      (sort_tc, []) <- splitTyConApp_maybe sort_kind
+      guard (all isAlgTyCon [context_tc, sort_tc])
+      (term, [_, _]) <- splitTyConApp_maybe (varType operand)
+      (_, cb_tau) <- pure (splitForAllTyVars (varType rho))
+      (_, [Scaled _ idx_ty], _) <- pure (splitFunTys cb_tau)
+      (index, [_, _]) <- splitTyConApp_maybe idx_ty
+      guard (all isAlgTyCon [term, index])
+      [c1, c2] <- pure (tyConDataCons index)
+      let constructors = tyConDataCons term
+      rows <- caseOn operand renaming
+      guard (length rows == length constructors && all lazyConstructor constructors)
+      var <- find (\con -> case [ (bs, e) | (dc, bs, e) <- rows, dc == con ] of
+                      [(bs, e)] | [orig] <- filter isValueVar bs
+                                , Just res <- branchBody bs e
+                                , Just (vh, [renamed]) <- constructorCall res
+                                , vh == con
+                                , Just (Core.Var cb, [Core.Var arg]) <- application renamed
+                                -> cb == rho && arg == orig
+                      _ -> False) constructors
+      ext_con <- findPromotedExtCon term
+      tryRename rename_id context_kind sort_kind term ext_con index rho var rows c1 c2 <|>
+        tryRename rename_id context_kind sort_kind term ext_con index rho var rows c2 c1
+
+    tryRename rename_id context_kind sort_kind term ext_con index rho var rows hit miss = do
+      lifted <- traverse (checkedRow bindings var hit miss rename_id rho)
+                         [row | row@(con, _, _) <- rows, con /= var]
+      let (recipes, exts) = unzip lifted
+          steps = concatMap concat exts
+          isRenLift (NamedLift _) = True
+          isRenLift InlinedRename = True
+          isRenLift (InlinedSubst _) = False
+      guard (all isRenLift steps)
+      ext_id <- case [v | NamedLift v <- steps] of
+        v : vs | all (== v) vs -> Just v
+        _ -> Nothing
+      ext_rhs <- lookup ext_id bindings
+      checkRenameExtension hit miss ext_rhs
+      let ops = ClosureOperations (rename_id, ext_id) (rename_id, ext_id, Nothing)
+      pure (FamilyInputs rename_id 1 context_kind sort_kind term ext_con index ops var hit miss recipes)
+
+    findPromotedExtCon term =
+      let arg_tys = [ scaledThing f
+                    | con <- tyConDataCons term
+                    , let (_, _, _, _, fs, _) = DC.dataConFullSig con
+                    , f <- fs ]
+          ext_tcs = [ ext_tc
+                    | ty <- arg_tys
+                    , Just (t, [ctx, _]) <- [splitTyConApp_maybe ty]
+                    , t == term
+                    , Just (ext_tc, [_, _]) <- [splitTyConApp_maybe ctx]
+                    , isPromotedDataCon ext_tc ]
+      in case ext_tcs of
+           tc : _ -> Just tc
+           []     -> Nothing
+
+directUntypedOperationShapes :: [(Id, CoreExpr)] -> [Id] -> [UntypedFamilyInputs]
+directUntypedOperationShapes bindings candidates = mapMaybe from_rename_u candidates
+  where
+    from_rename_u rename_id = do
+      rhs <- lookup rename_id bindings
+      ([g_tv, _], [rho, operand], renaming) <- function rhs
+      let context_kind = varType g_tv
+      (context_tc, []) <- splitTyConApp_maybe context_kind
+      guard (isAlgTyCon context_tc)
+      (term, [_]) <- splitTyConApp_maybe (varType operand)
+      (_, [Scaled _ idx_ty], _) <- pure (splitFunTys (varType rho))
+      (index, [_]) <- splitTyConApp_maybe idx_ty
+      guard (all isAlgTyCon [term, index])
+      [c1, c2] <- pure (tyConDataCons index)
+      let constructors = tyConDataCons term
+      rows <- caseOn operand renaming
+      guard (length rows == length constructors && all lazyConstructor constructors)
+      var <- find (\con -> case [ (bs, e) | (dc, bs, e) <- rows, dc == con ] of
+                      [(bs, e)] | [orig] <- filter isValueVar bs
+                                , Just res <- branchBody bs e
+                                , Just (vh, [renamed]) <- constructorCall res
+                                , vh == con
+                                , Just (Core.Var cb, [Core.Var arg]) <- application renamed
+                                -> cb == rho && arg == orig
+                      _ -> False) constructors
+      let ext_tcs = [ ext_tc
+                    | con <- constructors
+                    , let (_, _, _, _, fs, _) = DC.dataConFullSig con
+                    , f <- fs
+                    , Just (t, [ctx]) <- [splitTyConApp_maybe (scaledThing f)]
+                    , t == term
+                    , Just (ext_tc, [_]) <- [splitTyConApp_maybe ctx]
+                    , isPromotedDataCon ext_tc ]
+      ext_con <- case ext_tcs of { tc : _ -> Just tc; [] -> Nothing }
+      tryU rename_id context_kind term ext_con index rho var rows c1 c2 <|>
+        tryU rename_id context_kind term ext_con index rho var rows c2 c1
+
+    tryU rename_id context_kind term ext_con index rho var rows hit miss = do
+      lifted <- traverse (untypedCheckedRow bindings var hit miss rename_id rho)
+                         [row | row@(con, _, _) <- rows, con /= var]
+      let (recipes, exts) = unzip lifted
+          steps = concatMap concat exts
+          isRenLift (NamedLift _) = True
+          isRenLift InlinedRename = True
+          isRenLift (InlinedSubst _) = False
+      guard (all isRenLift steps)
+      ext_id <- case [v | NamedLift v <- steps] of
+        v : vs | all (== v) vs -> Just v
+        _ -> Nothing
+      ext_rhs <- lookup ext_id bindings
+      checkUntypedRenameExtension bindings hit miss ext_rhs
+      pure (UntypedFamilyInputs rename_id 1 context_kind term ext_con index (rename_id, ext_id) var hit miss recipes)
+
+-- | Full metadata of an early-staged SourceClosure entry in TcGblEnv:
+-- (owner, root family, external helper Names, companion private TyCons).
+earlySourceClosureEntries :: TcGblEnv -> [(Id, TyCon, [Name], [TyCon])]
+earlySourceClosureEntries env =
+    sortBy (\(a, _, _, _) (b, _, _, _) -> stableNameCmp (idName a) (idName b))
+      [ (fun, table, helpers, companions fun)
       | fun <- typeEnvIds (tcg_type_env env)
-      , SourceTableId name table NominalSourceTable <- [idDetails fun]
-      , name == idName fun
-      , indexedLookupType (varType fun)
-      , isIndexedLookupTable table ]
+      , Just (table, helpers) <- [classify fun] ]
+  where
+    tcs_by_mod_occ =
+      [ ((nameModule_maybe (tyConName tc), nameOccName (tyConName tc)), tc)
+      | tc <- tcg_tcs env ]
+    companions fun =
+      let mod_mb = nameModule_maybe (idName fun)
+          occ_str = occNameString (nameOccName (idName fun))
+          wanted = [mkTcOcc (p ++ occ_str) | p <- ["$closure:", "$apply:", "$lookup:"]]
+      in [ tc | occ <- wanted, Just tc <- [lookup (mod_mb, occ) tcs_by_mod_occ] ]
+    classify fun = case idDetails fun of
+      CheckedClosureSourceTableId name table helpers
+        | name == idName fun -> Just (table, helpers)
+      SourceTableId name table NominalSourceTable
+        | name == idName fun
+        , (indexedLookupType (varType fun) && isIndexedLookupTable table) ||
+          (not (indexedLookupType (varType fun)) && earlyClosureCandidateType (varType fun))
+        -> Just (table, [])
+      _ -> Nothing
+
+-- | Collect early-staged indexed lookup, traversal, and closure owners installed in the module.
+earlyIndexedLookups :: TcGblEnv -> [(Id, TyCon)]
+earlyIndexedLookups env = [(fun, table) | (fun, table, _, _) <- earlySourceClosureEntries env]
 
 isIndexedLookupTable :: TyCon -> Bool
 isIndexedLookupTable table
@@ -878,22 +1274,44 @@ isIndexedLookupTable table
       = isPromotedDataCon left_con && isPromotedDataCon right_con
       | otherwise = False
 
--- | Drop speculative early lookup tables that no dependent type referenced.
+-- | Drop speculative early lookup, traversal, and closure tables that no dependent type referenced.
 pruneUnusedIndexedLookups :: TcGblEnv -> TcM TcGblEnv
 pruneUnusedIndexedLookups env = do
-    used <- readTcRef (tcg_source_table_uses env)
-    let unused = [ (fun, table)
-                 | (fun, table) <- earlyIndexedLookups env
+    direct_used <- readTcRef (tcg_source_table_uses env)
+    let entries = earlySourceClosureEntries env
+        table_map = mkNameEnv [(tyConName table, table) | (_, table, _, _) <- entries]
+        close_uses seen [] = seen
+        close_uses seen (nm : rest)
+          | Just tc <- lookupNameEnv table_map nm
+          , Just callees <- sourceTableCallees tc
+          , let next = [tyConName c | c <- callees, not (tyConName c `elemNameSet` seen)]
+          = close_uses (extendNameSetList seen next) (next ++ rest)
+          | otherwise = close_uses seen rest
+        used = close_uses direct_used (nameSetElemsStable direct_used)
+        unused = [ entry
+                 | entry@(_, table, _, _) <- entries
                  , not (tyConName table `elemNameSet` used) ]
     if null unused then pure env else do
-      let owners = mkNameSet (map (idName . fst) unused)
-          families = mkNameSet (map (tyConName . snd) unused)
+      let owners = mkNameSet [idName fun | (fun, _, _, _) <- unused]
+          removed_tcs = [tc | (_, table, _, comps) <- unused, tc <- table : comps]
+          rep_names = mapMaybe tyConRepName_maybe $
+            removed_tcs ++ [DC.promoteDataCon dc | tc <- removed_tcs, dc <- tyConDataCons tc]
+          rep_set = mkNameSet rep_names
+          removed_names = mkNameSet $
+            map tyConName removed_tcs ++
+            map getName (concatMap implicitTyConThings removed_tcs) ++
+            rep_names
+          removed_tc_names = mkNameSet (map tyConName removed_tcs)
           clearThing (AnId v) | idName v `elemNameSet` owners = AnId (setIdDetails v VanillaId)
           clearThing thing = thing
+          keepBind bind =
+            not (any ((`elemNameSet` rep_set) . idName)
+                     (collectHsBindBinders CollNoDictBinders (unLoc bind)))
       pure env
-        { tcg_tcs = filter (not . (`elemNameSet` families) . tyConName) (tcg_tcs env)
+        { tcg_tcs = filter (not . (`elemNameSet` removed_tc_names) . tyConName) (tcg_tcs env)
+        , tcg_binds = filter keepBind (tcg_binds env)
         , tcg_type_env = mapNameEnv clearThing
-            (filterNameEnv (not . (`elemNameSet` families) . getName) (tcg_type_env env))
+            (filterNameEnv (not . (`elemNameSet` removed_names) . getName) (tcg_type_env env))
         }
 
 -- | Collect imported active non-auto rule heads visible from this module,
@@ -903,39 +1321,49 @@ visibleClosureRuleHeads env = do
   hsc <- getTopEnv
   liftIO $ visibleSourceRuleHeads hsc (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
 
--- | Validate constructor exports, owner visibility, and imported rules for used early lookups.
+-- | Validate constructor exports, owner/helper visibility, and imported rules for used early closures.
 checkLocalIndexedLookupExports :: TcGblEnv -> TcM ()
 checkLocalIndexedLookupExports env = do
-    let candidates = earlyIndexedLookups env
+    let candidates = earlySourceClosureEntries env
     unless (null candidates) $ do
       visible <- visibleSourceMethodRules env
       rule_heads <- visibleClosureRuleHeads env
       let exported = availsToNameSet (tcg_exports env)
-          exported_tycons = tyConsOfTypes (exportedInterfaceTypes exported (tcg_type_env env))
-      for_ candidates $ \(owner, table) -> do
+          type_env = tcg_type_env env
+          exported_tycons = tyConsOfTypes (exportedInterfaceTypes exported type_env)
+          lookupId nm = case lookupTypeEnv type_env nm of
+            Just (AnId v) -> Just v
+            _ -> Nothing
+      for_ candidates $ \(owner, table, helpers, companions) -> do
         let name = idName owner
+            all_families = table : companions
             unexported_types = sortBy stableNameCmp
               [ tc_name
-              | tc <- sourceEquationDatatypes [table]
+              | tc <- sourceEquationDatatypes all_families
+              , tc `notElem` all_families
               , let tc_name = tyConName tc
               , nameModule_maybe tc_name == Just (tcg_semantic_mod env)
               , not (publicCaseType env exported (const False) tc) ]
+            in_exported_iface = any (`elementOfUniqSet` exported_tycons) all_families
+            unexported_vals = filter (not . (`elemNameSet` exported)) (name : helpers)
         case unexported_types of
           hidden : _ -> do
             let reason = "The dependent type needs this equation. Export the constructors of "
                          ++ occNameString (nameOccName hidden) ++ " to make it available."
             setSrcSpan (nameSrcSpan name) $
               addErr (TcRnOpenTypeEval name Nothing reason)
-          [] | not (name `elemNameSet` exported)
-             , table `elementOfUniqSet` exported_tycons -> do
+          [] | in_exported_iface, missing : _ <- unexported_vals -> do
             let reason = "The dependent type needs this equation. Export "
-                         ++ occNameString (nameOccName name) ++ " to make it available."
+                         ++ occNameString (nameOccName missing) ++ " to make it available."
             setSrcSpan (nameSrcSpan name) $
               addErr (TcRnOpenTypeEval name Nothing reason)
           [] -> pure ()
-        when (hasSourceMethodRule visible owner || name `elemNameSet` rule_heads) $
-          setSrcSpan (nameSrcSpan name) $
-            addErr (TcRnRetainedQuantificationError (RetainedSourceRule name))
+        let checked_ids = owner : mapMaybe lookupId helpers
+        case find (\v -> hasSourceMethodRule visible v || idName v `elemNameSet` rule_heads) checked_ids of
+          Just bad ->
+            setSrcSpan (nameSrcSpan name) $
+              addErr (TcRnRetainedQuantificationError (RetainedSourceRule (idName bad)))
+          Nothing -> pure ()
 
 exportedInterfaceTypes :: NameSet -> TypeEnv -> [Type]
 exportedInterfaceTypes exported type_env = concatMap entity_types (typeEnvElts type_env)
@@ -960,12 +1388,41 @@ exportedInterfaceTypes exported type_env = concatMap entity_types (typeEnvElts t
                , ty <- data_con_types dc ]
     entity_types _ = []
 
--- | Require every early-staged lookup table to agree with desugared and final Core.
+-- | Refresh exported CheckedClosureSourceTableId helper lists after Tidy externalizes
+-- floated constructor helpers, or clear the certificate when an internal-only proof
+-- leaves helpers unexported.
+finalizeEarlyClosureTypes :: Maybe [CoreBind] -> NameSet -> TypeEnv -> TypeEnv
+finalizeEarlyClosureTypes mb_tidy exported type_env =
+    mapNameEnv update type_env
+  where
+    breakpoint Breakpoint{} = True
+    breakpoint _ = False
+    tidy = maybe [] (\bs -> [(v, stripTicksE breakpoint r) | (v, r) <- Core.flattenBinds bs]) mb_tidy
+    exported_tycons = tyConsOfTypes (exportedInterfaceTypes exported type_env)
+    update (AnId v)
+      | CheckedClosureSourceTableId owner table helpers <- idDetails v
+      , owner == idName v =
+          if not (table `elementOfUniqSet` exported_tycons) &&
+             any (not . (`elemNameSet` exported)) (owner : helpers)
+            then AnId (setIdDetails v VanillaId)
+            else
+              let floated = case find (\(x, _) -> idName x == owner) tidy of
+                    Just (actual, _) ->
+                      [ nm | nm <- reachable tidy actual
+                           , nm /= owner, isExternalName nm
+                           , nameModule_maybe nm == nameModule_maybe owner
+                           , isJust (lookupTypeEnv type_env nm) ]
+                    Nothing -> []
+                  merged = nameSetElemsStable (mkNameSet (helpers ++ floated))
+              in AnId (setIdDetails v (CheckedClosureSourceTableId owner table merged))
+    update thing = thing
+
+-- | Require every early-staged lookup, traversal, and closure table to agree with desugared and final Core.
 validateEarlyIndexedLookups :: Bool -> [CoreRule] -> [CoreBind]
                             -> Maybe [CoreBind] -> Maybe [CoreBind] -> TcM ()
 validateEarlyIndexedLookups plugins_free rules desugared_binds mb_simplified mb_tidy = do
     env <- getGblEnv
-    let candidates = earlyIndexedLookups env
+    let candidates = earlySourceClosureEntries env
     unless (null candidates) $ do
       opts <- initSimpleOpts <$> getDynFlags
       hpc <- goptM Opt_Hpc
@@ -973,46 +1430,172 @@ validateEarlyIndexedLookups plugins_free rules desugared_binds mb_simplified mb_
           breakpoint Breakpoint{} = True
           breakpoint _ = False
           inspect binds = [(v, stripTicksE breakpoint rhs) | (v, rhs) <- Core.flattenBinds binds]
-          desugared = [(v, simpleOptExpr opts rhs) | (v, rhs) <- inspect desugared_binds]
+          raw_desugared = inspect desugared_binds
+          desugared = [(v, simpleOptExpr opts rhs) | (v, rhs) <- raw_desugared]
           user_rule_owner Core.Rule{Core.ru_fn = fn, Core.ru_auto = auto, Core.ru_act = act}
             | not (auto || isNeverActive act) = Just fn
           user_rule_owner _ = Nothing
           active_rule_owners = mkNameSet (mapMaybe user_rule_owner rules)
-      for_ candidates $ \(owner, table) -> do
+      for_ candidates $ \(owner, table, helpers, companions) -> do
         let name = idName owner
-        if name `elemNameSet` active_rule_owners
-          then setSrcSpan (nameSrcSpan name) $
-                 addErr (TcRnRetainedQuantificationError (RetainedSourceRule name))
-          else do
+            watched = name : helpers
+        case find (`elemNameSet` active_rule_owners) watched of
+          Just ruled ->
+            setSrcSpan (nameSrcSpan name) $
+              addErr (TcRnRetainedQuantificationError (RetainedSourceRule ruled))
+          Nothing -> do
             ok <- fmap isJust $ runMaybeT $ do
               guard (plugins_free && not hpc)
               axiom <- MaybeT (pure (closedFamilyTyConCoAxiom_maybe table))
               let expected = fromBranches (coAxiomBranches axiom)
-              guard (length expected == 2)
-              checkStage expected table owner False desugared
+              guard (not (null expected))
               simplified <- MaybeT (pure (inspect <$> mb_simplified))
-              checkStage expected table owner True simplified
-              for_ mb_tidy $ \tidy_raw ->
-                when (name `elemNameSet` exported) $
-                  checkStage expected table owner True (inspect tidy_raw)
+              checkEntry exported expected table owner helpers companions
+                         raw_desugared desugared simplified (inspect <$> mb_tidy)
             unless ok $
               setSrcSpan (nameSrcSpan name) $
                 addErr (TcRnNoSourceTable name)
       failIfErrsM
   where
-    checkStage expected table owner check_id_rules binds = do
-      (actual, rhs) <- MaybeT $ pure $
-        find (\(v, _) -> idName v == idName owner) binds
+    noUserIdRules v =
+      all (\r -> case r of
+                   Core.BuiltinRule{} -> True
+                   _ -> Core.isAutoRule r || isNeverActive (Core.ruleActivation r))
+          (idCoreRules v)
+
+    lookupStage owner check_rules helpers binds = do
+      (actual, rhs) <- MaybeT $ pure $ find (\(v, _) -> idName v == idName owner) binds
       guard (varType actual `eqType` varType owner)
-      when check_id_rules $
-        guard (all (\r -> case r of
-                            Core.BuiltinRule{} -> True
-                            _ -> Core.isAutoRule r || isNeverActive (Core.ruleActivation r))
-                   (idCoreRules actual))
+      when check_rules $ do
+        guard (noUserIdRules actual)
+        for_ helpers $ \h -> do
+          (hv, _) <- MaybeT $ pure $ find (\(v, _) -> idName v == h) binds
+          guard (noUserIdRules hv)
+      pure (actual, rhs)
+
+    isConstructorId v = isJust (isDataConWorkId_maybe v <|> isDataConWrapId_maybe v)
+    constructorOnly expr = case constructorCall expr of
+      Just (_, args) -> all constructorOnly args
+      Nothing -> False
+    floatedConstructors exported binds v
+      | not (idName v `elemNameSet` exported)
+      , Just decl <- lookup v binds
+      , Just (_ : _, [], body) <- function decl
+      = constructorOnly body
+      | otherwise = False
+    checkOnlyCalls exported allow_floated allowed binds rhs =
+      let bad v = isValueVar v && idName v `notElem` allowed &&
+                  not (isConstructorId v) &&
+                  not (allow_floated && floatedConstructors exported binds v)
+      in guard (null (exprSomeFreeVarsList bad rhs))
+
+    checkEntry exported expected table owner helpers companions raw_desug desug simplified mb_tidy
+      | indexedLookupType (varType owner) && isIndexedLookupTable table = do
+          guard (length expected == 2)
+          checkLookup expected table owner False desug
+          checkLookup expected table owner True simplified
+          for_ mb_tidy $ \tidy ->
+            when (idName owner `elemNameSet` exported) $
+              checkLookup expected table owner True tidy
+      | not (null companions) = do
+          guard (length companions == 3 && length expected == 1)
+          (d_actual, d_rhs) <- lookupStage owner False helpers desug
+          case familyInputs desug d_actual d_rhs of
+            Just early_shape@(FamilyInputs _ arity _ _ _ _ _ _ _ _ _ _) -> do
+              guard (tyConArity table == 2 * arity + 3)
+              let checkTyped check_rules binds = do
+                    (actual, rhs) <- lookupStage owner check_rules helpers binds
+                    shape <- MaybeT (pure (familyInputs binds actual rhs))
+                    guard (sameShapes early_shape shape)
+              checkTyped True simplified
+              for_ mb_tidy $ \tidy ->
+                when (idName owner `elemNameSet` exported) $
+                  checkTyped True tidy
+            Nothing -> do
+              early_u@(UntypedFamilyInputs _ arity _ _ _ _ _ _ _ _ _) <-
+                MaybeT (pure (untypedFamilyInputs desug d_actual d_rhs))
+              guard (tyConArity table == arity + 2)
+              let checkUntyped check_rules binds = do
+                    (actual, rhs) <- lookupStage owner check_rules helpers binds
+                    shape <- MaybeT (pure (untypedFamilyInputs binds actual rhs))
+                    guard (sameUntypedShapes early_u shape)
+              checkUntyped True simplified
+              for_ mb_tidy $ \tidy ->
+                when (idName owner `elemNameSet` exported) $
+                  checkUntyped True tidy
+      | otherwise = do
+          (d_actual, d_rhs) <- lookupStage owner False helpers desug
+          case indexedTraversal desug d_actual d_rhs of
+            Just d_trav -> do
+              checkTraversal expected table owner d_trav
+              let checkTravStage binds = do
+                    (actual, rhs) <- lookupStage owner True helpers binds
+                    trav <- MaybeT (pure (indexedTraversal binds actual rhs))
+                    checkTraversal expected table actual trav
+              checkTravStage simplified
+              for_ mb_tidy $ \tidy ->
+                when (idName owner `elemNameSet` exported) $
+                  checkTravStage tidy
+            Nothing -> do
+              (_, raw_rhs) <- lookupStage owner False helpers raw_desug
+              checkOnlyCalls exported False (idName owner : helpers) raw_desug raw_rhs
+              checkOperation exported False owner helpers desug d_rhs
+              (s_actual, s_rhs) <- lookupStage owner True helpers simplified
+              checkOperation exported True s_actual helpers simplified s_rhs
+              for_ mb_tidy $ \tidy ->
+                when (idName owner `elemNameSet` exported) $ do
+                  (t_actual, t_rhs) <- lookupStage owner True helpers tidy
+                  checkOperation exported True t_actual helpers tidy t_rhs
+
+    checkLookup expected table owner check_rules binds = do
+      (actual, rhs) <- lookupStage owner check_rules [] binds
       checked <- MaybeT (pure (indexedLookup binds actual rhs))
       rows <- lookupRows table checked
       guard (length rows == length expected)
       zipWithM_ sameIndexedRow expected (map (`applyRow` table) rows)
+
+    checkTraversal expected table actual trav = do
+      rows <- indexedEquations IndexedTraversal actual table Nothing trav
+      guard (length rows == length expected)
+      zipWithM_ sameIndexedRow expected [applyRow row table | (row, _) <- rows]
+
+    checkOperation exported allow_floated actual helpers binds rhs = do
+      let allowed = idName actual : helpers
+      checkOnlyCalls exported allow_floated allowed binds rhs
+      let ok = isJust (validWeakening rhs <|> validTypedOp binds actual rhs <|> validUntypedOp binds actual rhs)
+      guard ok
+
+    validWeakening rhs = do
+      (tvs, [x], body) <- function rhs
+      (con, [Core.Var y]) <- constructorCall body
+      guard (not (null tvs) && x == y && lazyConstructor con)
+
+    validTypedOp binds actual rhs =
+      let shapes = directTypedOperationShapes binds (map fst binds)
+      in case [ () | s <- shapes
+                   , let (ren, ext) = renamingOperations s
+                         (sub, sext, mb_w) = substitutionOperations s
+                   , idName actual `elem` ([idName ren, idName ext, idName sub, idName sext] ++
+                                           maybe [] (pure . idName) mb_w) ] of
+           _ : _ -> Just ()
+           [] -> do
+             (_, arg, _) <- extensionBinders rhs
+             (idx, _) <- splitTyConApp_maybe (varType arg)
+             [c1, c2] <- pure (tyConDataCons idx)
+             checkRenameExtension c1 c2 rhs <|> checkRenameExtension c2 c1 rhs
+
+    validUntypedOp binds actual rhs =
+      let shapes = directUntypedOperationShapes binds (map fst binds)
+      in case [ () | s <- shapes
+                   , let (ren, ext) = untypedRenamingOperations s
+                   , idName actual `elem` [idName ren, idName ext] ] of
+           _ : _ -> Just ()
+           [] -> do
+             ([_, _], [_, arg], _) <- function rhs
+             (idx, [_]) <- splitTyConApp_maybe (varType arg)
+             [c1, c2] <- pure (tyConDataCons idx)
+             checkUntypedRenameExtension binds c1 c2 rhs <|>
+               checkUntypedRenameExtension binds c2 c1 rhs
 
 -- | Allocate the family and check each nominal equation.
 makeIndexedLookupTable :: (TyCon -> Bool) -> Id -> IndexedLookup -> Maybe IndexedLookup
@@ -1190,12 +1773,13 @@ substitutionOperations (FamilyInputs _ _ _ _ _ _ _ (ClosureOperations _ operatio
 
 familyInputs :: [(Id, CoreExpr)] -> Id -> CoreExpr -> Maybe FamilyInputs
 familyInputs bindings owner rhs = do
-    (context : types, body : captures, call) <- function rhs
+    (context : types, body : captures, raw_call) <- function rhs
+    let call = unwrapLocalCallbackLets raw_call
     result : rev_sorts <- pure (reverse types)
     guard (not (null captures) && length captures == length rev_sorts)
-    (Core.Var traversal, [callback, Core.Var operand]) <- application call
+    (Core.Var traversal, [raw_callback, Core.Var operand]) <- application call
     guard (operand == body)
-    ([callback_sort], [argument], lookup_body) <- function callback
+    ([callback_sort], [argument], lookup_body) <- function (betaReduceTypeApps raw_callback)
     let sorts = reverse rev_sorts
         context_kind = varType context
         sort_kind = varType result
@@ -1313,14 +1897,23 @@ checkedRow bindings var hit miss traversal callback (con, binders, rhs) = do
         | callback == original = Just []
     lifts captured = named captured <|> inlined captured
 
-    named captured = do
-        ([index], [], closure) <- function captured
-        case Core.collectArgs closure of
-          (Core.Var original, [Core.Type (TyVarTy rest)])
-            | callback == original && index == rest -> pure []
-          (Core.Var extender, [Core.Type _, Core.Type _, Core.Type _, original,
-                               Core.Type (TyVarTy rest)])
-            | index == rest -> (NamedLift extender :) <$> lifts original
+    named captured = eta_lifted <|> direct_lifted
+      where
+        eta_lifted = do
+          ([index], [], closure) <- function captured
+          case Core.collectArgs closure of
+            (Core.Var original, [Core.Type (TyVarTy rest)])
+              | callback == original && index == rest -> pure []
+            (Core.Var extender, [Core.Type _, Core.Type _, Core.Type _, original,
+                                 Core.Type (TyVarTy rest)])
+              | index == rest -> (NamedLift extender :) <$> lifts original
+            (Core.Var extender, [Core.Type _, Core.Type _, Core.Type _,
+                                 Core.Type (TyVarTy rest), original])
+              | index == rest -> (NamedLift extender :) <$> lifts original
+            _ -> Nothing
+        direct_lifted = case Core.collectArgs captured of
+          (Core.Var extender, [Core.Type _, Core.Type _, Core.Type _, original]) ->
+            (NamedLift extender :) <$> lifts original
           _ -> Nothing
 
     -- Simplification can inline one extension around the remaining callback.
@@ -1359,9 +1952,7 @@ checkedRow bindings var hit miss traversal callback (con, binders, rhs) = do
 -- Check the function used when a renaming crosses a binder.
 checkRenameExtension :: DC.DataCon -> DC.DataCon -> CoreExpr -> Maybe ()
 checkRenameExtension hit miss rhs = do
-    let (binders, body) = Core.collectBinders rhs
-    [g, d, b, capture, sort_var, argument] <- pure binders
-    guard (all isTyVar [g,d,b,sort_var] && all isValueVar [capture,argument])
+    (capture, argument, body) <- extensionBinders rhs
     rows <- caseOn argument body
     [(hit_bs, hit_rhs)] <- pure [(bs, e) | (dc, bs, e) <- rows, dc == hit]
     [(miss_bs, miss_rhs)] <- pure [(bs, e) | (dc, bs, e) <- rows, dc == miss]
@@ -1442,13 +2033,58 @@ checkedWeakening bindings miss rhs = do
           pure (Just owner)
     direct <|> named
 
+extensionBinders :: CoreExpr -> Maybe (Id, Id, CoreExpr)
+extensionBinders rhs = do
+    let (binders, body) = collectExtensionBinders [] rhs
+    case binders of
+      [t1, t2, t3, capture, t4, argument]
+        | all isTyVar [t1, t2, t3, t4] && all isValueVar [capture, argument]
+        -> pure (capture, argument, body)
+      [t1, t2, t3, t4, capture, argument]
+        | all isTyVar [t1, t2, t3, t4] && all isValueVar [capture, argument]
+        -> pure (capture, argument, body)
+      _ -> Nothing
+  where
+    collectExtensionBinders acc (Core.Lam b e) = collectExtensionBinders (b : acc) e
+    collectExtensionBinders acc (Core.Let (Core.NonRec b _) e)
+      | isLocalId b
+      , isLiftedTypeKind (typeKind (varType b))
+      , not (b `elemVarSet` exprFreeVars e)
+      = collectExtensionBinders acc e
+    collectExtensionBinders acc e = (reverse acc, e)
+
+unwrapLocalCallbackLets :: CoreExpr -> CoreExpr
+unwrapLocalCallbackLets (Core.Let (Core.NonRec b b_rhs) inner)
+  | isLocalId b, isValueVar b
+  , VanillaId <- idDetails b
+  , null (idCoreRules b)
+  , not (b `elemVarSet` exprFreeVars b_rhs)
+  = let free = exprFreeVars inner `unionVarSet` exprFreeVars b_rhs
+        sub = mkOpenSubst (mkInScopeSet free) [(b, b_rhs)]
+    in unwrapLocalCallbackLets (substExpr sub inner)
+unwrapLocalCallbackLets (Core.Lam b body) = Core.Lam b (unwrapLocalCallbackLets body)
+unwrapLocalCallbackLets (Core.App f a) = Core.App (unwrapLocalCallbackLets f) (unwrapLocalCallbackLets a)
+unwrapLocalCallbackLets expr = expr
+
+betaReduceTypeApps :: CoreExpr -> CoreExpr
+betaReduceTypeApps expr
+  | (Core.Lam b body, Core.Type ty : rest) <- collect [] (unwrapLocalCallbackLets expr)
+  , isTyVar b
+  = let free = exprFreeVars body `unionVarSet` exprFreeVars (Core.Type ty)
+        sub = extendTvSubst (mkEmptySubst (mkInScopeSet free)) b ty
+    in betaReduceTypeApps (foldl' Core.App (substExpr sub body) rest)
+  | (Core.Lam b body) <- unwrapLocalCallbackLets expr
+  = Core.Lam b (betaReduceTypeApps body)
+  | otherwise = unwrapLocalCallbackLets expr
+  where
+    collect args (Core.App f a) = collect (a : args) f
+    collect args f = (f, args)
+
 checkedExtension :: [(Id, CoreExpr)]
                  -> DC.DataCon -> DC.DataCon -> DC.DataCon
                  -> CoreExpr -> Maybe (Id, Maybe Id)
 checkedExtension bindings var hit miss rhs = do
-    let (binders, body) = Core.collectBinders rhs
-    [g, d, b, capture, sort_var, argument] <- pure binders
-    guard (all isTyVar [g,d,b,sort_var] && all isValueVar [capture,argument])
+    (capture, argument, body) <- extensionBinders rhs
     rows <- caseOn argument body
     [(hit_bs, hit_rhs)] <- pure [(bs, e) | (dc, bs, e) <- rows, dc == hit]
     [(miss_bs, miss_rhs)] <- pure [(bs, e) | (dc, bs, e) <- rows, dc == miss]
@@ -2074,11 +2710,12 @@ untypedRenamingOperations (UntypedFamilyInputs _ _ _ _ _ _ ops _ _ _ _) = ops
 
 untypedFamilyInputs :: [(Id, CoreExpr)] -> Id -> CoreExpr -> Maybe UntypedFamilyInputs
 untypedFamilyInputs bindings owner rhs = do
-    ([context], body : captures, call) <- function rhs
+    ([context], body : captures, raw_call) <- function rhs
+    let call = unwrapLocalCallbackLets raw_call
     guard (not (null captures) && exprType rhs `eqType` varType owner)
-    (Core.Var traversal, [callback, Core.Var operand]) <- application call
+    (Core.Var traversal, [raw_callback, Core.Var operand]) <- application call
     guard (operand == body)
-    ([], [argument], lookup_body) <- function callback
+    ([], [argument], lookup_body) <- function (betaReduceTypeApps raw_callback)
     let context_kind = varType context
     (context_tycon, []) <- splitTyConApp_maybe context_kind
     guard (isAlgTyCon context_tycon)
@@ -2325,13 +2962,15 @@ publishUntypedEntries public lookupOwner unoptimized final extDeps safe closures
     checked_renamings <- catMaybes <$> traverse (publishUntypedRenaming public extension_tables) (nubBy sameRename renamings)
     pure (checked_closures ++ extensions ++ checked_renamings)
   where
-    publish_closure (owner, (_, shape), helpers) = do
-      generated <- allocateUntypedFamilies shape
-      pure $ do
-        (root, families) <- generated
-        guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
-        let new = setIdDetails owner (CheckedClosureSourceTableId (idName owner) root (map idName helpers))
-        pure (new, families)
+    publish_closure (owner, (_, shape), helpers)
+      | VanillaId <- idDetails owner = do
+          generated <- allocateUntypedFamilies shape
+          pure $ do
+            (root, families) <- generated
+            guard (all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
+            let new = setIdDetails owner (CheckedClosureSourceTableId (idName owner) root (map idName helpers))
+            pure (new, families)
+      | otherwise = pure Nothing
 
 publishUntypedRenameExtension :: (TyCon -> Bool) -> (Id, (Id, UntypedFamilyInputs), [Id])
                               -> TcM (Maybe (Id, [TyCon]))
