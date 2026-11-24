@@ -72,6 +72,7 @@ module GHC.Core.Type (
         isNativeIndexDomainConversion,
         isNativeRetainedBinder, isNativeRetainedBinderType,
         isNativeRetainedField, isNativeRetainedFieldType,
+        isNativeIndexedFieldDomain,
         piResultTy, piResultTys,
         applyTysX, dropForAlls,
         mkFamilyTyConApp,
@@ -2793,7 +2794,7 @@ isNativeRetainedBinderType ty
 isNativeRetainedField :: Id -> Bool
 isNativeRetainedField v
   = isNativeOpaqueValueId v
-    && (isNativeIndexType ty || isTyVarTy ty
+    && (isNativeIndexType ty || isNativeIndexedFieldDomain ty || isTyVarTy ty
         || (noFreeVarsOfType (idMult v) && isNativeRetainedFieldFunctionType ty))
   where
     ty = varType v
@@ -2802,8 +2803,35 @@ isNativeRetainedField v
 -- See Note [Opaque algebraic retained binders].
 isNativeRetainedFieldType :: Type -> Bool
 isNativeRetainedFieldType ty
-  = isNativeIndexType ty || isNativeRetainedFieldFunctionType ty
+  = isNativeIndexType ty || isNativeIndexedFieldDomain ty
+    || isNativeRetainedFieldFunctionType ty
     || (isTyVarTy ty && isNativeOpaqueValueType ty)
+
+-- | Test whether a lifted algebraic type is a lazy indexed GADT domain
+-- eligible as a retained constructor field or result.
+-- Callers with full 'DataCon' access also enforce 'isNativeIndexedGadtCon'.
+isNativeIndexedFieldDomain :: Type -> Bool
+isNativeIndexedFieldDomain ty
+  | TyConApp tc args <- coreFullView ty
+  , isVanillaAlgTyCon tc, isBoxedDataTyCon tc
+  , not (isTypeDataTyCon tc), null (tyConStupidTheta tc)
+  , tyConArity tc == length args
+  , tcIsLiftedTypeKind (typeKind ty)
+  = all indexed_con (tyConDataCons tc)
+  | otherwise = False
+  where
+    indexed_con dc
+      | null (dataConRepArgBinders dc)
+      , (_, exs, specs, [], fields, _) <- dataConFullSig dc
+      , all isTyVar exs, null (dataConStupidTheta dc)
+      , let rep_tys = dataConRepArgTys dc
+      , rep_tys `lengthIs` (length specs + length fields)
+      , all (\(Scaled mult field_ty) ->
+               (isOneTy mult || isManyTy mult)
+               && isNativeOpaqueValueType field_ty) fields
+      , all (isNativeOpaqueValueType . scaledThing) (drop (length specs) rep_tys)
+      = length specs <= 1
+      | otherwise = False
 
 -- | Check a retained function field over closed or abstract endpoints.
 -- See Note [Abstract witness domains].

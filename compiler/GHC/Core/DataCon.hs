@@ -1440,11 +1440,43 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
         && case mb of
              Nothing -> valid_fields scope bs tys
              Just b  -> isNativeRetainedField b && isManyTy mult
+                        && valid_indexed_field ty
                         && varType b `eqType` ty
                         && not (b `elemVarSet` mkVarSet univ_tvs)
                         && not (b `elemVarSet` scope)
                         && valid_fields (extendVarSet scope b) bs tys
     valid_fields _ _ _ = False
+
+    valid_indexed_field ty
+      | isNativeIndexType ty || isTyVarTy ty = True
+      | isNativeIndexedFieldDomain ty
+      , TyConApp tc _ <- coreFullView ty
+      = all (valid_indexed_con tc) (tyConDataCons tc)
+      | otherwise = True
+
+    valid_indexed_con tc dc
+      | (_, exs, specs, [], fields, _) <- dataConFullSig dc
+      , all isTyVar exs
+      , null (dataConStupidTheta dc)
+      , dataConRepArity dc == length specs + length fields
+      , all (not . isBanged) (dataConImplBangs dc)
+      = case specs of
+          [] -> not (null exs)
+                || any (\c -> not (null (dcEqSpec c)) || not (null (dataConExTyCoVars c)))
+                       (tyConDataCons tc)
+                || (all (\c -> isVanillaDataCon c && null (dataConRepArgBinders c)
+                               && isNothing (dataConWrapId_maybe c)) (tyConDataCons tc)
+                    && not (isNativeIndexType (mkTyConApp tc (mkTyVarTys (tyConTyVars tc)))))
+          [spec] -> not (null fields) || not (null exs) || noFreeVarsOfType (eqSpecType spec)
+                    || is_diagonal dc spec
+          _ -> False
+      | otherwise = False
+
+    is_diagonal dc spec
+      | (univs, [], [_], [], [], _) <- dataConFullSig dc
+      , Just rhs <- getTyVar_maybe (eqSpecType spec)
+      = rhs /= eqSpecTyVar spec && rhs `elem` univs
+      | otherwise = False
 
     is_vanilla = null ex_tvs && null eq_spec && null theta
     str_marks' | not $ any isMarkedStrict str_marks = []
@@ -2132,13 +2164,14 @@ validRetainedResultKind (TermVarTy _) = True
 validRetainedResultKind (TyConApp tc args)
   | isPromotedDataCon tc = check_args (tyConKind tc) args
   where
-    check_args kind [] = isNativeClosedIndexType kind
+    check_args kind [] = isNativeClosedIndexType kind || isNativeIndexedFieldDomain kind
     check_args kind (arg : rest)
       | Just (_, binder, result) <- splitPiTy_maybe kind
       = case (binder, arg) of
           (Named (Bndr tv vis), _)
             | isTyVar tv, isInvisibleForAllTyFlag vis
-            , noFreeVarsOfType arg, isTauTy arg, not (hasCoercionHole arg)
+            , not (anyFreeVarsOfType (\v -> isId v || isCoVar v) arg)
+            , isTauTy arg, not (hasCoercionHole arg)
             , varType tv `eqType` typeKind arg
             -> check_args (piResultTy kind arg) rest
           (Anon (Scaled _ domain) FTF_T_T, TermVarTy field)

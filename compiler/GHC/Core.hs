@@ -48,6 +48,7 @@ module GHC.Core (
         containsRetainedNaturalLiteral, isBoxedBigNaturalLiteral,
         isNativeIndexAlt, isNativeIndexDataAlt, isNativeIndexAliasAlt, isNativeIndexAliasBinder,
         isNativeIndexedDataAlt, splitNativeIndexedDataAlt, isNativeIndexedGadtCon,
+        isNativeIndexedGadtFieldDomain, isNativeRetainedGadtFieldType,
         isNativeIndexedOrdinaryCon, isNativeOpaqueOrdinaryCon, isNativeIndexedDiagonalCon,
         splitNativeIndexedPatternEvidence, nativeIndexedCon_maybe,
 
@@ -3190,9 +3191,12 @@ nativeIndexedConArgs con params
 nativeIndexedOperandSignature_maybe :: DataCon
                                     -> Maybe ([TyCoVar], [EqSpec], [Scaled Type])
 nativeIndexedOperandSignature_maybe con
-  | (_, exs, eqs@(_ : _), [], fields, _) <- dataConFullSig con
+  | (_, exs, eqs, [], fields, _) <- dataConFullSig con
+  , let tc = dataConTyCon con
+  , not (null eqs) || not (null exs)
+    || not (isNativeIndexType (mkTyConApp tc (mkTyVarTys (tyConTyVars tc))))
   , null (dataConStupidTheta con)
-  , isVanillaAlgTyCon (dataConTyCon con), isBoxedDataTyCon (dataConTyCon con)
+  , isVanillaAlgTyCon tc, isBoxedDataTyCon tc
   , not (isTypeDataCon con), null (dataConRepArgBinders con)
   , not (any isBanged (dataConImplBangs con))
   , dataConRepArity con == length eqs + length fields
@@ -3513,8 +3517,9 @@ nativeIndexedOperandSpec_maybe con = do
   [spec] <- nativeIndexedGadtSpecs_maybe con
   case (dataConExTyCoVars con, dataConOrigArgTys con) of
     ([], []) -> Just spec
-    ([predecessor], [_, _])
-      | TyConApp successor [arg] <- coreFullView (eqSpecType spec)
+    ([predecessor], fields)
+      | fields `lengthIs` 1 || fields `lengthIs` 2
+      , TyConApp successor [arg] <- coreFullView (eqSpecType spec)
       , Just _ <- isPromotedDataCon_maybe successor
       , getTyVar_maybe arg == Just predecessor
       -> Just spec
@@ -3626,6 +3631,24 @@ splitNativeIndexedDataAlt con args
 -- | Check the ordinary GADT constructor shape supported by indexed evidence.
 isNativeIndexedGadtCon :: DataCon -> Bool
 isNativeIndexedGadtCon = isJust . nativeIndexedGadtSpecs_maybe
+
+-- | Test whether a type is an indexed GADT domain whose constructors
+-- all satisfy 'isNativeIndexedGadtCon'.
+isNativeIndexedGadtFieldDomain :: Type -> Bool
+isNativeIndexedGadtFieldDomain ty
+  | isNativeIndexedFieldDomain ty
+  , TyConApp tc _ <- coreFullView ty
+  = all isNativeIndexedGadtCon (tyConDataCons tc)
+  | otherwise = False
+
+-- | Check the domain of a retained constructor field, enforcing
+-- 'isNativeIndexedGadtCon' for indexed GADT domains.
+isNativeRetainedGadtFieldType :: Type -> Bool
+isNativeRetainedGadtFieldType ty
+  = isNativeRetainedFieldType ty
+    && (not (isNativeIndexedFieldDomain ty)
+        || isNativeIndexType ty
+        || isNativeIndexedGadtFieldDomain ty)
 
 -- | Identify the ordinary siblings that need the indexed proof representation.
 isNativeIndexedOrdinaryCon :: DataCon -> Bool

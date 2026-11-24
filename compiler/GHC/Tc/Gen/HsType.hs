@@ -764,7 +764,7 @@ tcCheckRetainedConType :: Bool
 tcCheckRetainedConType validate_domain allow_result tc_field_mult
   = go allow_result typeLevelMode
   where
-    valid_field_domain ty = not validate_domain || isNativeRetainedFieldType ty
+    valid_field_domain ty = not validate_domain || Core.isNativeRetainedGadtFieldType ty
     go allow mode (L _ (HsParTy _ body)) = go allow mode body
     go allow mode (L loc (HsForEachTy ann bndrs body))
       = setSrcSpanA loc $
@@ -806,9 +806,12 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
     result_fields ty
       | Just fields <- retainedResultFields_maybe ty
       , not validate_domain ||
-          (all (isNativeClosedIndexType . varType) fields && validRetainedResultKind ty)
+          (all (valid_result_field_domain . varType) fields && validRetainedResultKind ty)
       = Just fields
       | otherwise = Nothing
+      where
+        valid_result_field_domain fty
+          = isNativeClosedIndexType fty || Core.isNativeIndexedGadtFieldDomain fty
 
     bind_indices allow mode [] body = go allow mode body
     bind_indices allow mode (L loc bndr : rest) body

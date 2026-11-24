@@ -1400,7 +1400,9 @@ tcIfaceDataCons tycon_name tycon if_cons
                 ; when (not (null arg_binders) && not (null spec)) $
                     do { valid <- evaluateIfaceNativeDomain (ppr dc_name)
                            (validRetainedResultEqSpec univ_tvs retained_fields eq_spec
-                            && all (isNativeClosedIndexType . varType) retained_fields
+                            && all (\f -> isNativeClosedIndexType (varType f)
+                                       || isNativeIndexedGadtFieldDomain (varType f))
+                                   retained_fields
                             && all (not . anyFreeVarsOfType isId . scaledMult) arg_tys)
                        ; unless valid $
                            failIfM (text "Invalid retained result field in interface:" <+> ppr dc_name) }
@@ -1540,7 +1542,7 @@ tcIfaceDataCons tycon_name tycon if_cons
                                  (\v -> isId v && not (v `elemVarSet` scope)) field_ty)
                             && case mb of
                                  Nothing -> True
-                                 Just _  -> isManyTy mult && isNativeRetainedFieldType field_ty
+                                 Just _  -> isManyTy mult && isNativeRetainedGadtFieldType field_ty
                   ; unless valid $
                       failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
                                $$ text "Expected a lifted field with only earlier runtime indices;"
@@ -1948,11 +1950,23 @@ tcIfaceDataDomainShape binders ctxt parent cons
   , IfDataTyCon False cs <- cons
   , all ordinary cs
   = NativeDataDomain <$> mapM field (concatMap ifConArgTys cs)
+  | null binders, null ctxt, IfNoParent <- parent
+  , IfDataTyCon False cs <- cons
+  , all indexed_gadt_con cs
+  = return NativeUnknownDomain
   | otherwise = return NativeInvalidDomain
   where
     ordinary con = null (ifConUnivTvs con) && null (ifConExTCvs con)
                 && null (ifConEqSpec con) && null (ifConCtxt con)
                 && null (ifConArgBinders con)
+    indexed_gadt_con con = null (ifConCtxt con) && null (ifConArgBinders con)
+                        && all type_bndr (ifConExTCvs con)
+                        && all lazy_bang (ifConStricts con)
+                        && length (ifConEqSpec con) <= 1
+    type_bndr (IfaceTvBndr _) = True
+    type_bndr _                 = False
+    lazy_bang IfNoBang = True
+    lazy_bang _        = False
     field (mult, ty) = (,) <$> tcIfaceDomainShape mult <*> tcIfaceDomainShape ty
 
 -- | Project raw syntax without forcing a decoded Type or a referenced TyCon.

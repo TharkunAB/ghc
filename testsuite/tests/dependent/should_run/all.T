@@ -957,3 +957,8 @@ test('NativeConstrainedFamily',
 test('NativeSpecialiseZip',
      [only_ways(['normal']), extra_files(['NativeSpecialiseZipProvider.hs'])],
      multimod_compile_and_run, ['NativeSpecialiseZip', '-O2 -dcore-lint -dstg-lint'])
+
+test('NativeIndexedForEachCtor',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeIndexedForEachCtorProvider.hs', 'NativeIndexedForEachCtor.hs'])],
+     run_command, ['bash NativeIndexedForEachCtor.sh "{compiler}" "{libdir}"'])
