@@ -180,7 +180,8 @@ import GHC.Types.Var.Set
 
 import GHC.Utils.Fingerprint ( Fingerprint )
 import GHC.Tc.Gen.SourceClosure
-  ( earlyIndexedLookups, publishCheckedSourceClosures, validateEarlyIndexedLookups )
+  ( earlyIndexedLookups, finalizeEarlyClosureTypes, publishCheckedSourceClosures
+  , validateEarlyIndexedLookups )
 import GHC.Tc.Gen.SourceTable (finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables,
                                finalCoreSourceFamilies, sourceRuleOwners, sourceTableCallees, publishListFoldMethods,
                                keepCheckedMapWorkers, publishCheckedMapMethods)
@@ -911,9 +912,13 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
           let no_plugins = null plugins && null (pluginsWithArgs (hsc_plugins hsc_env)) &&
                            null (pluginModNames dflags)
+              exported_names = availsToNameSet (tcg_exports tc_result)
           checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_plugins
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
             (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
+          let checked_details = original_details
+                { md_types = finalizeEarlyClosureTypes (Just (cg_binds cg_guts)) exported_names
+                               (md_types original_details) }
 
           publication <- case publishCheckedMapMethods after_tidy tc_result (cg_binds cg_guts) of
             Nothing -> pure Nothing
@@ -922,13 +927,13 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                 setGblEnv tc_result publish
           let method_details = case publication of
                 Just (ids, families) ->
-                  let types = md_types original_details `plusTypeEnv` typeEnvFromEntities ids families [] []
+                  let types = md_types checked_details `plusTypeEnv` typeEnvFromEntities ids families [] []
                       update dfun = case lookupTypeEnv types (idName dfun) of
                         Just (AnId new) -> new
                         _ -> dfun
-                  in original_details { md_types = types
-                                      , md_insts = updateClsInstDFuns update (md_insts original_details) }
-                Nothing -> original_details
+                  in checked_details { md_types = types
+                                     , md_insts = updateClsInstDFuns update (md_insts checked_details) }
+                Nothing -> checked_details
 
           details <- if gopt Opt_WriteSourceEquations dflags &&
                         xopt LangExt.ExperimentalDependentTypes dflags &&
@@ -973,12 +978,16 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
           let no_plugins = null plugins && null (pluginsWithArgs (hsc_plugins hsc_env)) &&
                            null (pluginModNames dflags)
+              exported_names = availsToNameSet (tcg_exports tc_result)
           checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_plugins
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
             (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
+          let tc_result_final = tc_result
+                { tcg_type_env = finalizeEarlyClosureTypes (Just (cg_binds cg_guts)) exported_names
+                                   (tcg_type_env tc_result) }
 
           (iface, _details) <- liftIO $
-            hscSimpleIface hsc_env (Just $ cg_binds cg_guts) (cg_modBreaks cg_guts) tc_result summary
+            hscSimpleIface hsc_env (Just $ cg_binds cg_guts) (cg_modBreaks cg_guts) tc_result_final summary
 
           liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
@@ -1050,8 +1059,12 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
               checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result False
                 [] [] Nothing Nothing
             pure tc_result
+        let final_tc = checked_tc
+              { tcg_type_env = finalizeEarlyClosureTypes Nothing
+                                 (availsToNameSet (tcg_exports checked_tc))
+                                 (tcg_type_env checked_tc) }
         (iface, _details) <- liftIO $
-          hscSimpleIface hsc_env Nothing Nothing checked_tc summary
+          hscSimpleIface hsc_env Nothing Nothing final_tc summary
 
         liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
