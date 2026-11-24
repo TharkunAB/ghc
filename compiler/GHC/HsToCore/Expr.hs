@@ -339,11 +339,15 @@ dsExpr e@(XExpr ext_expr_tc)
                   { env <- getGblEnv
                   ; let restore (Var v) = Var (restoreSourceTableId (ds_type_env env) v)
                         restore (App f x) = App (restore f) (restore x)
+                        restore (Cast e co) = Cast (restore e) co
                         restore arg = arg
                   ; canonical <- case canonical_rhs of
                       CheckedSourceLetRhs (Just operand) -> return (restore operand)
                       _ -> pprPanic "NativeLetAlias: unrecorded proof" (ppr value $$ ppr proof)
-                  ; case retainedArgIndex canonical of
+                  ; let mb_index
+                          | isNativeIndexFunctionId value = nativeIndexFunctionArgIndex canonical
+                          | otherwise                     = retainedArgIndex canonical
+                  ; case mb_index of
                       Just index
                         | isNativeOpaqueValueId value
                         , coVarRole proof == Nominal

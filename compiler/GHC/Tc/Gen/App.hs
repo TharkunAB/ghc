@@ -14,7 +14,8 @@ module GHC.Tc.Gen.App
        , tcExprPrag
        , matchPolytypeExistsWitness, matchExactPolytypeWitness, tcPreviewQuickLookResult
        , tcImplicitOperand, tcLexicalPackageOperand
-       , tcRetainedInferableArg, tcRetainedArg, tcOptionalLetOperand ) where
+       , tcRetainedInferableArg, tcRetainedArg
+       , tcOptionalLetOperand, tcOptionalLetFunctionOperand ) where
 
 import {-# SOURCE #-} GHC.Tc.Gen.Expr( tcCheckMonoExpr, tcCheckPolyExpr, tcPolyExpr, tcInferRho )
 
@@ -37,6 +38,7 @@ import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Utils.Env ( isExistsPackName, tcLookupIdMaybe, tcLookupConLike
                         , tcLookup, tcLookupGlobal, tcLookupLcl_maybe, tcExtendIdEnv, tcExtendGeneratedIdEnv )
+import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs, tcLookupDataFamInst_maybe )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Concrete  ( unifyConcrete, idConcreteTvs )
@@ -62,7 +64,7 @@ import GHC.Core.FamInstEnv (FamInstEnvs, reduceTyFamApp_maybe)
 import GHC.Core.Make ( mkCharExpr, mkNaturalExpr )
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Utils ( applyTypeToArgs, exprType, isVacuousRetainedBinder )
-import GHC.Core.FVs ( exprFreeVarsList )
+import GHC.Core.FVs ( exprFreeVars, exprFreeVarsList )
 import GHC.Core.InstEnv ( lookupUniqueInstEnv, instanceDFunId )
 import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe )
 import GHC.Core.TyCon
@@ -79,6 +81,8 @@ import GHC.Core.Coercion.Axiom (coAxiomBranches, coAxBranchLHS, coAxBranchRHS, c
 import GHC.Builtin.WiredIn.Types ( charTy, integerTy, multiplicityTy, runtimeRepTy, nilDataCon, consDataCon, mkListTy, tupleDataCon, unmatchableDataConTy )
 import GHC.Builtin.PrimOps( tagToEnumKey )
 import GHC.Builtin.KnownKeys
+import GHC.Builtin.KnownOccs ( composeIdOcc )
+import GHC.Builtin.Modules ( gHC_INTERNAL_BASE )
 
 import GHC.Driver.DynFlags ( GeneralFlag(Opt_DeferTypeErrors), DynFlags(reductionDepth), HasDynFlags(getDynFlags) )
 import GHC.Types.TyThing ( TyThing(AnId, AConLike, ATyCon) )
@@ -108,6 +112,7 @@ import GHC.Utils.Panic
 
 import qualified GHC.LanguageExtensions as LangExt
 
+import Control.Applicative ( (<|>) )
 import Control.Monad
 import Data.Data ( Data, cast, gmapQ )
 import Data.Either ( isLeft, isRight )
@@ -4287,89 +4292,221 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
 tcOptionalLetOperand :: LHsExpr GhcTc
                      -> TcM (Maybe (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)]))
 tcOptionalLetOperand rhs = runMaybeT $ do
-    result@(operand, _, _) <- go (unLoc rhs)
-    _ <- liftMaybe (Core.retainedArgIndex operand)
+    result@(operand, _, _) <- tcOptionalLetExpr (unLoc rhs)
+    _ <- MaybeT (pure (Core.retainedArgIndex operand))
     return result
+
+-- | Recover checked function-composition alias steps from a 0-arg or 1-arg
+-- lazy local binding. Any intermediate steps are returned outermost-first.
+-- See Note [Optional typed let operands].
+tcOptionalLetFunctionOperand
+  :: Maybe Id
+  -> LHsExpr GhcTc
+  -> Type
+  -> TcM (Maybe ([(Id, LHsExpr GhcTc, Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])],
+                 (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])))
+tcOptionalLetFunctionOperand mb_param expr expected_ty = runMaybeT $ do
+    strict <- liftMaybeT (xoptM LangExt.Strict)
+    guard (not strict)
+    expected <- liftMaybeT (liftZonkM (zonkTcType expected_ty))
+    go_fun mb_param expr expected
   where
-    go :: HsExpr GhcTc
-       -> MaybeT TcM (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])
-    go expr = case expr of
-      HsPar _ body -> go (unLoc body)
-      ExprWithTySig _ body _ -> go (unLoc body)
-      XExpr (ExpandedThingTc (HSE _ body)) -> go (unLoc body)
-      XExpr (WrapExpr WpHole body) -> go body
-      XExpr (WrapExpr wrap body)
-        | Just (selector, domain, wanted) <- method_head wrap body -> do
-            domain <- liftMaybeT (liftZonkM (zonkTcType domain))
-            (sel, dfun, ev) <- method selector domain wanted
-            target_name <- liftMaybe (sourceMethodTarget_maybe dfun sel)
-            target <- MaybeT (tcLookupIdMaybe target_name) >>= certified
-            guard (varType target `tcEqType` classMethodInstTy sel [domain])
-            return (Core.Var target, [target], [(ev, dfun, sel, Just target)])
-        | otherwise -> do
-            (body', heads, guards) <- go body
-            wrapped <- type_apps wrap body'
-            return (wrapped, heads, guards)
-      HsAppType ty fun _ -> do
-        (fun', heads, guards) <- go (unLoc fun)
-        applied <- type_apps (WpTyApp ty) fun'
-        return (applied, heads, guards)
-      HsApp _ fun arg -> do
-        (fun', fun_heads, fun_guards) <- go (unLoc fun)
-        (arg', arg_heads, arg_guards) <- go (unLoc arg)
-        return (Core.App fun' arg', fun_heads ++ arg_heads, fun_guards ++ arg_guards)
-      ExplicitList element_ty elements -> do
-        element_ty <- liftMaybeT (liftZonkM (zonkTcType element_ty))
-        values <- mapM (go . unLoc) elements
-        let nil = Core.mkTyApps (Core.Var (dataConWorkId nilDataCon)) [element_ty]
-            cons = Core.mkTyApps (Core.Var (dataConWorkId consDataCon)) [element_ty]
-        return (foldr (\(value, _, _) rest -> Core.mkApps cons [value, rest]) nil values,
-                concatMap (\(_, heads, _) -> heads) values,
-                concatMap (\(_, _, guards) -> guards) values)
-      HsVar _ (L _ occurrence) -> do
-        occurrence <- liftMaybeT (liftZonkM (zonkId occurrence))
-        if not (isExternalName (getName occurrence)) && isNativeOpaqueValueId occurrence
-          then do
-            thing <- MaybeT (tcLookupLcl_maybe (getName occurrence))
-            case thing of
-              ATcId { tct_id = actual } -> do
-                actual <- liftMaybeT (liftZonkM (zonkId actual))
-                guard (actual == occurrence && isNativeOpaqueValueId actual
-                       && varType actual `tcEqType` varType occurrence)
-                return (Core.Var actual, [], [])
+    liftMaybe = MaybeT . pure
+
+    go_fun Nothing rhs expected
+      | L _ (HsLam _ LamSingle MG { mg_alts = L _ [L _ Match
+          { m_pats = L _ [pat], m_grhss = grhss }] }) <- strip_loc rhs
+      , Just param <- lazy_var_pat pat
+      , Just body <- unguardedRhs grhss
+      = go_fun (Just param) body expected
+      | otherwise = do
+          compose <- lookup_compose
+          funs <- collect_compose_chain compose rhs
+          compose_chain compose Nothing funs expected
+    go_fun (Just param) body expected = do
+      compose <- lookup_compose
+      funs <- eta_compose compose param body <|> collect_app_chain param body
+      compose_chain compose (Just param) funs expected
+
+    eta_compose compose param body
+      | HsApp _ fun arg <- unLoc (strip_loc body)
+      , HsVar _ (L _ v) <- unLoc (strip_loc arg)
+      , v == param
+      = collect_compose_chain compose fun
+      | otherwise = mzero
+
+    collect_app_chain param e = do
+      funs <- go_app e
+      guard (not (null (drop 1 funs)))
+      return funs
+      where
+        go_app expr' = case unLoc (strip_loc expr') of
+          HsApp _ fun arg -> case unLoc (strip_loc arg) of
+            HsVar _ (L _ v) | v == param -> return [fun]
+            _ -> (fun :) <$> go_app arg
+          _ -> mzero
+
+    collect_compose_chain compose e = case unLoc (strip_loc e) of
+      HsApp _ fun2 arg2
+        | HsApp _ op arg1 <- unLoc (strip_loc fun2) -> do
+            (core_op, _, methods_op) <- tcOptionalLetExpr (unLoc op)
+            guard (null methods_op)
+            case Core.collectArgs core_op of
+              (Core.Var fn, args) | fn == compose, all Core.isTypeArg args -> do
+                lefts <- collect_compose_chain compose arg1 <|> pure [arg1]
+                rights <- collect_compose_chain compose arg2 <|> pure [arg2]
+                return (lefts ++ rights)
               _ -> mzero
-          else do
-            owner <- certified occurrence
-            return (Core.Var owner, [owner], [])
-      XExpr (ConLikeTc (RealDataCon con)) -> return (Core.Var (dataConWorkId con), [], [])
-      HsOverLit _ (OverLit { ol_ext = OverLitTc { ol_rebindable = False
-                                              , ol_witness = witness
-                                              , ol_type = result_ty }
-                          , ol_val = HsIntegral literal })
-        | let n = il_value literal, n >= 0
-        , HsApp _ fun arg <- strip witness
-        , XExpr (WrapExpr wrap body) <- strip (unLoc fun)
-        , Just (selector, domain, wanted) <- method_head wrap body
-        , HsLit _ (XLit (HsInteger _ actual integer_ty)) <- strip (unLoc arg)
-        , actual == n, isIntegerTy integer_ty -> do
-            domain <- liftMaybeT (liftZonkM (zonkTcType domain))
-            result_ty <- liftMaybeT (liftZonkM (zonkTcType result_ty))
-            guard (domain `tcEqType` result_ty)
-            (sel, dfun, ev) <- method selector domain wanted
-            (zero, succ_con) <- liftMaybe (sourceLiteralCons_maybe dfun sel)
-            dflags <- liftMaybeT getDynFlags
-            guard (n <= toInteger (maxBound :: Int)
-                   && not (intGtLimit (fromInteger n) (reductionDepth dflags)))
-            let build 0 = Core.Var (dataConWorkId zero)
-                build k = Core.App (Core.Var (dataConWorkId succ_con)) (build (k - 1))
-            return (build (fromInteger n :: Int), [], [(ev, dfun, sel, Nothing)])
       _ -> mzero
 
+    lookup_compose = do
+      env <- liftMaybeT getGblEnv
+      guard (tcg_semantic_mod env /= gHC_INTERNAL_BASE)
+      compose_name <- liftMaybeT (lookupOrig gHC_INTERNAL_BASE composeIdOcc)
+      compose_raw <- MaybeT (tcLookupIdMaybe compose_name)
+      tcOptionalLetCertified compose_raw
+
+    compose_chain compose mb_param funs expected = do
+      resolved <- forM funs $ \f_expr -> do
+        (core_f, heads_f, methods_f) <- tcOptionalLetExpr (unLoc f_expr)
+        forM_ mb_param $ \param ->
+          guard (not (param `elemVarSet` exprFreeVars core_f))
+        return (f_expr, core_f, heads_f, methods_f)
+      case reverse resolved of
+        inner : outer : rest -> fold_steps compose expected [] inner outer rest
+        _ -> mzero
+
+    fold_steps compose expected acc inner outer rest = do
+      (step_rhs, canonical, owners, methods, result_ty) <- compose_pair compose outer inner
+      if null rest
+        then do
+          guard (result_ty `tcEqType` expected)
+          return (reverse acc, (canonical, owners, methods))
+        else do
+          tmp <- liftMaybeT (newSysLocalId (fsLit "compose_alias") ManyTy result_ty)
+          let step = (tmp, step_rhs, canonical, owners, methods)
+          case rest of
+            next : remaining ->
+              fold_steps compose expected (step : acc)
+                (step_rhs, Core.Var tmp, [], []) next remaining
+            [] -> mzero
+
+    compose_pair compose (orig_h, core_h, heads_h, methods_h)
+                         (orig_f, core_f, heads_f, methods_f) = do
+      h_ty <- liftMaybeT (liftZonkM (zonkTcType (exprType core_h)))
+      f_ty <- liftMaybeT (liftZonkM (zonkTcType (exprType core_f)))
+      (FTF_T_T, h_ma, h_mult, b_ty, c_ty) <- liftMaybe (splitFunTy_maybe h_ty)
+      guard (h_ma `eqType` unmatchableDataConTy && isManyTy h_mult)
+      (FTF_T_T, f_ma, f_mult, a_ty, b'_ty) <- liftMaybe (splitFunTy_maybe f_ty)
+      guard (f_ma `eqType` unmatchableDataConTy && isManyTy f_mult)
+      guard (b_ty `tcEqType` b'_ty)
+      guard (tcIsLiftedTypeKind (typeKind a_ty)
+             && tcIsLiftedTypeKind (typeKind b_ty)
+             && tcIsLiftedTypeKind (typeKind c_ty))
+      let canonical = Core.mkApps (Core.mkTyApps (Core.Var compose) [b_ty, c_ty, a_ty])
+                        [core_h, core_f]
+      index <- liftMaybe (Core.nativeIndexFunctionArgIndex canonical)
+      let result_ty = mkVisFunTyManyU a_ty c_ty
+      guard (typeKind index `tcEqType` result_ty && exprType canonical `tcEqType` result_ty)
+      let compose_wrap = WpTyApp a_ty <.> WpTyApp c_ty <.> WpTyApp b_ty
+          compose_var = noLocA (XExpr (WrapExpr compose_wrap (HsVar noExtField (noLocA compose))))
+          step_rhs = noLocA (HsApp noExtField (noLocA (HsApp noExtField compose_var orig_h)) orig_f)
+      return (step_rhs, canonical, compose : heads_h ++ heads_f, methods_h ++ methods_f, result_ty)
+
+    strip_loc :: LHsExpr GhcTc -> LHsExpr GhcTc
+    strip_loc original@(L _ e) = case e of
+      HsPar _ body -> strip_loc body
+      ExprWithTySig _ body _ -> strip_loc body
+      XExpr (ExpandedThingTc (HSE _ body)) -> strip_loc body
+      XExpr (WrapExpr WpHole body) -> strip_loc (noLocA body)
+      _ -> original
+
+    lazy_var_pat :: LPat GhcTc -> Maybe Id
+    lazy_var_pat (L _ (ParPat _ pat)) = lazy_var_pat pat
+    lazy_var_pat (L _ (VarPat _ (L _ var))) = Just var
+    lazy_var_pat _ = Nothing
+
+-- | Recover a checked Core expression and its certified dependencies from a
+-- typechecked expression without emitting constraints or usage obligations.
+tcOptionalLetExpr :: HsExpr GhcTc
+                  -> MaybeT TcM (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])
+tcOptionalLetExpr expr = case expr of
+  HsPar _ body -> tcOptionalLetExpr (unLoc body)
+  ExprWithTySig _ body _ -> tcOptionalLetExpr (unLoc body)
+  XExpr (ExpandedThingTc (HSE _ body)) -> tcOptionalLetExpr (unLoc body)
+  XExpr (WrapExpr WpHole body) -> tcOptionalLetExpr body
+  XExpr (WrapExpr wrap body)
+    | Just (selector, domain, wanted) <- method_head wrap body -> do
+        domain <- liftMaybeT (liftZonkM (zonkTcType domain))
+        (sel, dfun, ev) <- method selector domain wanted
+        target_name <- liftMaybe (sourceMethodTarget_maybe dfun sel)
+        target <- MaybeT (tcLookupIdMaybe target_name) >>= tcOptionalLetCertified
+        guard (varType target `tcEqType` classMethodInstTy sel [domain])
+        return (Core.Var target, [target], [(ev, dfun, sel, Just target)])
+    | otherwise -> do
+        (body', heads, guards) <- tcOptionalLetExpr body
+        wrapped <- type_apps wrap body'
+        return (wrapped, heads, guards)
+  HsAppType ty fun _ -> do
+    (fun', heads, guards) <- tcOptionalLetExpr (unLoc fun)
+    applied <- type_apps (WpTyApp ty) fun'
+    return (applied, heads, guards)
+  HsApp _ fun arg -> do
+    (fun', fun_heads, fun_guards) <- tcOptionalLetExpr (unLoc fun)
+    (arg', arg_heads, arg_guards) <- tcOptionalLetExpr (unLoc arg)
+    return (Core.App fun' arg', fun_heads ++ arg_heads, fun_guards ++ arg_guards)
+  ExplicitList element_ty elements -> do
+    element_ty <- liftMaybeT (liftZonkM (zonkTcType element_ty))
+    values <- mapM (tcOptionalLetExpr . unLoc) elements
+    let nil = Core.mkTyApps (Core.Var (dataConWorkId nilDataCon)) [element_ty]
+        cons = Core.mkTyApps (Core.Var (dataConWorkId consDataCon)) [element_ty]
+    return (foldr (\(value, _, _) rest -> Core.mkApps cons [value, rest]) nil values,
+            concatMap (\(_, heads, _) -> heads) values,
+            concatMap (\(_, _, guards) -> guards) values)
+  HsVar _ (L _ occurrence) -> do
+    occurrence <- liftMaybeT (liftZonkM (zonkId occurrence))
+    if not (isExternalName (getName occurrence)) && isNativeOpaqueValueId occurrence
+      then do
+        thing <- MaybeT (tcLookupLcl_maybe (getName occurrence))
+        case thing of
+          ATcId { tct_id = actual } -> do
+            actual <- liftMaybeT (liftZonkM (zonkId actual))
+            guard (actual == occurrence && isNativeOpaqueValueId actual
+                   && varType actual `tcEqType` varType occurrence)
+            return (Core.Var actual, [], [])
+          _ -> mzero
+      else do
+        owner <- tcOptionalLetCertified occurrence
+        return (Core.Var owner, [owner], [])
+  XExpr (ConLikeTc (RealDataCon con)) -> return (Core.Var (dataConWorkId con), [], [])
+  HsOverLit _ (OverLit { ol_ext = OverLitTc { ol_rebindable = False
+                                          , ol_witness = witness
+                                          , ol_type = result_ty }
+                      , ol_val = HsIntegral literal })
+    | let n = il_value literal, n >= 0
+    , HsApp _ fun arg <- strip witness
+    , XExpr (WrapExpr wrap body) <- strip (unLoc fun)
+    , Just (selector, domain, wanted) <- method_head wrap body
+    , HsLit _ (XLit (HsInteger _ actual integer_ty)) <- strip (unLoc arg)
+    , actual == n, isIntegerTy integer_ty -> do
+        domain <- liftMaybeT (liftZonkM (zonkTcType domain))
+        result_ty <- liftMaybeT (liftZonkM (zonkTcType result_ty))
+        guard (domain `tcEqType` result_ty)
+        (sel, dfun, ev) <- method selector domain wanted
+        (zero, succ_con) <- liftMaybe (sourceLiteralCons_maybe dfun sel)
+        dflags <- liftMaybeT getDynFlags
+        guard (n <= toInteger (maxBound :: Int)
+               && not (intGtLimit (fromInteger n) (reductionDepth dflags)))
+        let build 0 = Core.Var (dataConWorkId zero)
+            build k = Core.App (Core.Var (dataConWorkId succ_con)) (build (k - 1))
+        return (build (fromInteger n :: Int), [], [(ev, dfun, sel, Nothing)])
+  _ -> mzero
+  where
     strip :: HsExpr GhcTc -> HsExpr GhcTc
     strip (HsPar _ body) = strip (unLoc body)
     strip (XExpr (ExpandedThingTc (HSE _ body))) = strip (unLoc body)
     strip (XExpr (WrapExpr WpHole body)) = strip body
-    strip expr = expr
+    strip e = e
 
     method_head :: HsWrapper -> HsExpr GhcTc -> Maybe (Id, Type, EvVar)
     method_head (WpCompose (WpEvApp (EvExpr (Core.Var wanted))) (WpTyApp domain)) body
@@ -4404,15 +4541,6 @@ tcOptionalLetOperand rhs = runMaybeT $ do
              && noFreeVarsOfType (varType dfun))
       return (selector, dfun, wanted)
 
-    certified :: Id -> MaybeT TcM Id
-    certified actual = do
-      env <- liftMaybeT getGblEnv
-      owner <- liftMaybe (sourceTableOccurrence env actual)
-      _ <- liftMaybe (sourceTableId_maybe owner)
-      owner <- liftMaybeT (liftZonkM (zonkId owner))
-      guard (varType owner `tcEqType` varType actual)
-      return owner
-
     type_apps :: HsWrapper -> Core.CoreExpr -> MaybeT TcM Core.CoreExpr
     type_apps WpHole body = return body
     type_apps (WpTyApp ty) body = do
@@ -4423,6 +4551,15 @@ tcOptionalLetOperand rhs = runMaybeT $ do
 
     liftMaybe :: Maybe a -> MaybeT TcM a
     liftMaybe = MaybeT . pure
+
+tcOptionalLetCertified :: Id -> MaybeT TcM Id
+tcOptionalLetCertified actual = do
+  env <- liftMaybeT getGblEnv
+  owner <- MaybeT (pure (sourceTableOccurrence env actual))
+  _ <- MaybeT (pure (sourceTableId_maybe owner))
+  owner <- liftMaybeT (liftZonkM (zonkId owner))
+  guard (varType owner `tcEqType` varType actual)
+  return owner
 
 {- Note [Optional typed let operands]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

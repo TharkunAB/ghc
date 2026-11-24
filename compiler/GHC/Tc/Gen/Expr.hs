@@ -41,7 +41,7 @@ import GHC.Tc.Gen.SourceTable (sourceTableOccurrence, optionalSourceUses, regist
 import GHC.Tc.Gen.Bind        ( tcLocalBinds, tcNonRecLets, tcNonRecLetAtType )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Arrow
-import GHC.Tc.Gen.Match( tcBody, tcScopedRuntimeBody, tcLambdaMatches, tcCaseMatches, tcIndexedCaseMatches, tcRetainedCase
+import GHC.Tc.Gen.Match( tcBody, tcScopedRuntimeBody, tcLambdaMatches, tcExprCaseMatches, tcIndexedCaseMatches, tcRetainedCase
                        , tcRetainedCallCase, tcEmptyRetainedScrutinee
                        , tcOpenImplicitPackage, tcOpenImplicitPackageAt
                        , implicitPayloadType, matchesImplicitPayloadPat
@@ -1025,7 +1025,7 @@ tcExpr (HsCase ctxt scrut matches) res_ty
   , returnsLocal name rhs
   = do { mult <- newMultiplicityVar
        ; scrut' <- tcScalingUsage mult (tcCheckMonoExpr scrut schema)
-       ; matches' <- tcCaseMatches ctxt tcBody (Scaled mult schema) matches res_ty
+       ; matches' <- tcExprCaseMatches ctxt tcBody (Scaled mult schema) matches res_ty
        ; return (HsCase ctxt scrut' matches') }
 
 tcExpr expr@(HsCase ctxt scrut matches) res_ty
@@ -1102,7 +1102,7 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
                             , not (isNativeIndexId index), Check result <- expected
                             , anyFreeVarsOfType (== index) result ->
                                 tcIndexedCaseMatches index ctxt
-                          _ -> tcCaseMatches ctxt tcBody
+                          _ -> tcExprCaseMatches ctxt tcBody
                   ; matches' <- check_matches (Scaled mult scrut_ty) matches expected
                   ; return (HsCase ctxt scrut' matches') } }
 
@@ -1113,7 +1113,7 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
       | any (payload_alt schema) (unLoc (mg_alts matches))
       = do { result_ty <- expTypeToType expected
            ; opened <- tcOpenImplicitPackage (getLocA scrut) schema scrut' result_ty $ \payload ->
-               do { payload_matches <- tcCaseMatches ctxt tcBody
+               do { payload_matches <- tcExprCaseMatches ctxt tcBody
                         (Scaled mult (varType payload)) matches (mkCheckExpType result_ty)
                   ; return (HsCase ctxt (nlHsVar payload) payload_matches) }
            ; return (Just (preserve_origin opened)) }
@@ -1672,44 +1672,97 @@ The lazy value argument preserves Haskell sharing. See docs/dependent-haskell/RE
 -- See Note [Optional equality for an overloaded let].
 tcOptionalLet :: LHsBinds GhcTc -> TcM (LHsExpr GhcTc) -> Type -> TcM (Maybe (HsExpr GhcTc))
 tcOptionalLet checked rest expected
-  | Just (binder, rhs) <- case checked of
+  | Just (binder, rhs_kind) <- case checked of
       [L _ (XHsBindsLR (AbsBinds { abs_sig = True, abs_tvs = [], abs_ev_vars = [], abs_ev_binds = []
              , abs_exports = [ABE { abe_poly = public, abe_mono = mono, abe_wrap = WpHole
                                   , abe_prags = SpecPrags [] }], abs_binds = inner }))] ->
-          do { (value, rhs) <- binding_rhs inner
+          do { (value, rhs_kind) <- binding_rhs inner
              ; guard (value == mono && varType value `tcEqType` varType public)
-             ; return (public, rhs) }
+             ; return (public, rhs_kind) }
       _ -> binding_rhs checked
   = runMaybeT $ do
+      strict <- liftMaybeT (xoptM LangExt.Strict)
+      guard (not strict)
       initial <- liftMaybeT (liftZonkM (zonkId binder))
       let mult = idMult initial
           flexible = maybe False isMetaTyVar (getTyVar_maybe mult)
-      guard (isNativeIndexId (setIdMult initial ManyTy) && (isManyTy mult || flexible))
+          is_value = isNativeIndexId (setIdMult initial ManyTy)
+          is_fun = isNativeIndexFunctionId (setIdMult initial ManyTy)
+      guard ((is_value || is_fun) && (isManyTy mult || flexible))
       flags <- liftMaybeT getDynFlags
       guard (all (== Breakpoints) (ticks_passes (initTicksConfig flags))
              && not (sccProfilingEnabled flags))
-      (canonical, owners, methods) <- MaybeT (tcOptionalLetOperand rhs)
-      index <- MaybeT (pure (Core.retainedArgIndex canonical))
-      guard (typeKind index `tcEqType` idType initial)
+      if is_value
+        then case rhs_kind of
+          LazyValueRhs rhs -> do
+            (canonical, owners, methods) <- MaybeT (tcOptionalLetOperand rhs)
+            index <- MaybeT (pure (Core.retainedArgIndex canonical))
+            guard (typeKind index `tcEqType` idType initial)
+            step <- prepare_step initial rhs canonical index owners methods
+            liftMaybeT (tcSubMult (OccurrenceOf (idName initial)) ManyTy mult)
+            value <- liftMaybeT (liftZonkM (zonkId binder))
+            guard (isNativeIndexId value)
+            liftMaybeT (unLoc <$> emit_steps [(value, rhs, canonical, index, step)] rest)
+          LazyUnaryRhs{} -> mzero
+        else do
+          let (mb_param, target_expr, fallback_rhs) = case rhs_kind of
+                LazyValueRhs rhs -> (Nothing, rhs, rhs)
+                LazyUnaryRhs param body lam_rhs -> (Just param, body, lam_rhs)
+          (intermediates, (canonical, owners, methods)) <-
+            MaybeT (tcOptionalLetFunctionOperand mb_param target_expr (idType initial))
+          prep_intermediates <- forM intermediates $
+            \(tmp, tmp_rhs, tmp_can, tmp_owners, tmp_methods) -> do
+              tmp_index <- MaybeT (pure (Core.nativeIndexFunctionArgIndex tmp_can))
+              guard (typeKind tmp_index `tcEqType` idType tmp)
+              deps <- prepare_step tmp tmp_rhs tmp_can tmp_index tmp_owners tmp_methods
+              return (tmp, tmp_rhs, tmp_can, tmp_index, deps)
+          index <- MaybeT (pure (Core.nativeIndexFunctionArgIndex canonical))
+          guard (typeKind index `tcEqType` idType initial)
+          main_deps <- prepare_step initial fallback_rhs canonical index owners methods
+          liftMaybeT (tcSubMult (OccurrenceOf (idName initial)) ManyTy mult)
+          value <- liftMaybeT (liftZonkM (zonkId binder))
+          guard (isNativeIndexFunctionId value)
+          liftMaybeT $ unLoc <$>
+            emit_steps (prep_intermediates ++ [(value, fallback_rhs, canonical, index, main_deps)]) rest
+  | otherwise = return Nothing
+  where
+    prepare_step _ _ _ _ owners methods = do
       let uses = [(dfun, sel, target) | (_, dfun, sel, target) <- methods]
           guards = [(wanted, dfun) | (wanted, dfun, _, _) <- methods]
       dependencies <- MaybeT (optionalSourceUses owners uses)
-      liftMaybeT (tcSubMult (OccurrenceOf (idName initial)) ManyTy mult)
-      value <- liftMaybeT (liftZonkM (zonkId binder))
-      guard (isNativeIndexId value)
-      liftMaybeT $ do
-          proof <- newEvVar (mkNomEqPred (TermVarTy value) index)
-          traceTc "tcOptionalLet" (ppr value <+> dcolon <+> ppr (idType proof) $$ ppr guards)
-          (binds, body') <- setSrcSpan (nameSrcSpan (idName value)) $
-                            checkSourceLetConstraints (idName value) guards proof $
-                            tcWithSourceLetView value index rest
-          registerOptionalSourceUses binds proof dependencies
-          return (XExpr (NativeLetAlias rhs (PendingSourceLetRhs binds canonical) value proof expected (mkHsDictLet binds body')))
-  | otherwise = return Nothing
-  where
-    binding_rhs [L _ FunBind { fun_ext = (WpHole, []), fun_id = L _ binder, fun_matches = matches }]
-      | Just rhs <- lazyLetRhs matches = Just (binder, rhs)
+      return (guards, dependencies)
+
+    emit_steps [] action = action
+    emit_steps ((value, rhs, canonical, index, (guards, dependencies)) : steps) action = do
+      proof <- newEvVar (mkNomEqPred (TermVarTy value) index)
+      traceTc "tcOptionalLet" (ppr value <+> dcolon <+> ppr (idType proof) $$ ppr guards)
+      (binds, body') <- setSrcSpan (nameSrcSpan (idName value)) $
+                        checkSourceLetConstraints (idName value) guards proof $
+                        tcWithSourceLetView value index $
+                        emit_steps steps action
+      registerOptionalSourceUses binds proof dependencies
+      return (L (getLoc body') (XExpr (NativeLetAlias rhs (PendingSourceLetRhs binds canonical) value proof expected (mkHsDictLet binds body'))))
+
+    binding_rhs [L bind_loc FunBind { fun_ext = (WpHole, []), fun_id = L _ binder, fun_matches = matches }]
+      | Just rhs <- lazyLetRhs matches = Just (binder, LazyValueRhs rhs)
+      | MG { mg_alts = L alts_loc [L match_loc match] } <- matches
+      , Match { m_ctxt = FunRhs { mc_strictness = NoSrcStrict }
+              , m_pats = L _ [pat]
+              , m_grhss = grhss } <- match
+      , Just param <- lazy_var_pat pat
+      , Just body <- unguardedRhs grhss
+      = let lam_match = L match_loc (match { m_ctxt = LamAlt LamSingle })
+            lam_rhs = L bind_loc (HsLam noAnn LamSingle (matches { mg_alts = L alts_loc [lam_match] }))
+        in Just (binder, LazyUnaryRhs param body lam_rhs)
     binding_rhs _ = Nothing
+
+    lazy_var_pat (L _ (ParPat _ pat)) = lazy_var_pat pat
+    lazy_var_pat (L _ (VarPat _ (L _ var))) = Just var
+    lazy_var_pat _ = Nothing
+
+data LazyBindingRhs
+  = LazyValueRhs (LHsExpr GhcTc)
+  | LazyUnaryRhs Id (LHsExpr GhcTc) (LHsExpr GhcTc)
 
 {- Note [Repacking through a local binding]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1832,7 +1885,7 @@ tcExistsCase expr@(HsCase ctxt scrut matches)
            ; (ev_binds, body_matches) <- setSrcSpanA con_loc $
                checkConstraints origin [witness] [] $
                  tcExtendNameTyVarEnv [(n, witness) | n <- maybeToList mb_name] $
-                   tcCaseMatches ctxt tcBody (Scaled ManyTy payload_ty) payload_matches
+                   tcExprCaseMatches ctxt tcBody (Scaled ManyTy payload_ty) payload_matches
                      (mkCheckExpType result_ty)
            ; let body = noLocA (HsCase ctxt (nlHsVar payload) body_matches)
            ; return (XExpr (NativeExistsUnpack witness payload result_ty scrut'

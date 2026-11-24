@@ -16,7 +16,7 @@
 -- | Typecheck some @Matches@
 module GHC.Tc.Gen.Match
    ( tcFunBindMatches
-   , tcCaseMatches, tcIndexedCaseMatches
+   , tcCaseMatches, tcExprCaseMatches, tcIndexedCaseMatches
    , tcRetainedCase
    , tcRetainedCallCase, tcEmptyRetainedScrutinee
    , tcLambdaMatches
@@ -73,6 +73,7 @@ import GHC.Core.Multiplicity
 import GHC.Core.UsageEnv
 import GHC.Core.TyCon
 import GHC.Core ( Expr(Var, App, Type), exprToNativeIndex, isNativeIndexedGadtCon )
+import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.TyCo.Rep ( Type(DepFunTy, ExistsTy, ForAllTy, FunTy, ft_af, TermVarTy, TyConApp) )
 import GHC.Core.Subst ( extendIdSubstWithClone )
 import qualified GHC.Core.TyCo.Subst as Subst
@@ -2609,7 +2610,7 @@ tcLambdaMatches e lam_variant matches invis_pat_tys res_ty
                  Check ty | hasRetainedFunTy ty
                    -> tcRetainedMatches herald GenSigCtxt ctxt arity invis_pat_tys ty matches
                  _ -> matchExpectedFunTys herald GenSigCtxt arity res_ty $ \ pat_tys rhs_ty ->
-                        tcMatches ctxt check_body (invis_pat_tys ++ pat_tys) rhs_ty matches
+                        tcExprMatchesWithWhereFromWith check_body id ctxt (invis_pat_tys ++ pat_tys) rhs_ty matches
 
         ; return (wrapper, r) }
   where
@@ -2687,20 +2688,35 @@ tcCaseMatches :: (AnnoBody body, Outputable (body GhcTc))
 tcCaseMatches ctxt tc_body (Scaled scrut_mult scrut_ty) matches res_ty
   = tcMatches ctxt tc_body [ExpFunPatTy (Scaled scrut_mult (mkCheckExpType scrut_ty))] res_ty matches
 
+-- | Check case alternatives on expressions, exposing eligible unguarded @where@ bindings.
+tcExprCaseMatches :: HsMatchContextRn
+                  -> TcMatchAltChecker HsExpr
+                  -> Scaled TcSigmaTypeFRR
+                  -> MatchGroup GhcRn (LHsExpr GhcRn)
+                  -> ExpRhoType
+                  -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
+tcExprCaseMatches ctxt tc_body (Scaled scrut_mult scrut_ty) matches res_ty
+  = tcExprMatchesWithWhereFromWith tc_body id ctxt
+      [ExpFunPatTy (Scaled scrut_mult (mkCheckExpType scrut_ty))] res_ty matches
+
 -- | Check a dependent case on a named opaque GADT scrutinee.
 tcIndexedCaseMatches :: Id -> HsMatchContextRn -> Scaled TcSigmaTypeFRR
                      -> MatchGroup GhcRn (LHsExpr GhcRn) -> ExpRhoType
                      -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
-tcIndexedCaseMatches index ctxt (Scaled mult ty) matches res_ty =
-  tcMatchesFromWithIndex (Just (index, mkLHsWrapCo . mkSymCo)) (map unLoc) ctxt tcBody
-    [ExpFunPatTy (Scaled mult (mkCheckExpType ty))] res_ty matches
+tcIndexedCaseMatches index ctxt (Scaled mult ty) matches res_ty = do
+  prepared <- prepareUnguardedWhereMatches res_ty matches
+  tcMatchesFromWithIndex (Just (index, mkLHsWrapCo . mkSymCo))
+    (const (map unLoc (unLoc (mg_alts matches)))) ctxt tcBody
+    [ExpFunPatTy (Scaled mult (mkCheckExpType ty))] res_ty prepared
 
 -- @tcGRHSsPat@ typechecks @[GRHSs]@ that occur in a @PatMonoBind@.
 tcGRHSsPat :: Mult -> GRHSs GhcRn (LHsExpr GhcRn) -> ExpRhoType
            -> TcM (GRHSs GhcTc (LHsExpr GhcTc))
 -- Used for pattern bindings
 tcGRHSsPat mult grhss res_ty
-  = tcScalingUsage mult $ tcGRHSs PatBindRhs tcBody grhss res_ty
+  = tcScalingUsage mult $ do
+      grhss' <- prepareUnguardedWhereGRHSs res_ty grhss
+      tcGRHSs PatBindRhs tcBody grhss' res_ty
 
 {- *********************************************************************
 *                                                                      *
@@ -2737,31 +2753,52 @@ tcMatches :: (AnnoBody body, Outputable (body GhcTc))
 
 tcMatches = tcMatchesFrom id
 
--- | Reuse expression-let checking for a single unguarded equation's where bindings.
+-- | Reuse expression-let checking for eligible unguarded @where@ bindings.
 -- See Note [Unguarded where aliases].
 tcExprMatchesWithWhereFrom
   :: (Match GhcRn (LHsExpr GhcRn) -> Match GhcRn (LHsExpr GhcRn))
   -> HsMatchContextRn -> [ExpPatType] -> ExpRhoType
   -> MatchGroup GhcRn (LHsExpr GhcRn)
   -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
-tcExprMatchesWithWhereFrom source ctxt pat_tys exp_ty
-                          group@MG { mg_alts = L loc [match] }
-  = do { prepared <- prepareUnguardedWhere exp_ty match
-       ; tcMatchesFrom (const (source (unLoc match))) ctxt tcBody pat_tys exp_ty
-           (group { mg_alts = L loc [prepared] }) }
-tcExprMatchesWithWhereFrom source ctxt pat_tys exp_ty group
-  = tcMatchesFrom source ctxt tcBody pat_tys exp_ty group
+tcExprMatchesWithWhereFrom = tcExprMatchesWithWhereFromWith tcBody
+
+-- | Like 'tcExprMatchesWithWhereFrom', with a custom RHS checker.
+tcExprMatchesWithWhereFromWith
+  :: TcMatchAltChecker HsExpr
+  -> (Match GhcRn (LHsExpr GhcRn) -> Match GhcRn (LHsExpr GhcRn))
+  -> HsMatchContextRn -> [ExpPatType] -> ExpRhoType
+  -> MatchGroup GhcRn (LHsExpr GhcRn)
+  -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
+tcExprMatchesWithWhereFromWith tc_body source ctxt pat_tys exp_ty group = do
+  prepared <- prepareUnguardedWhereMatches exp_ty group
+  tcMatchesFromWithIndex Nothing (const (map (source . unLoc) (unLoc (mg_alts group))))
+    ctxt tc_body pat_tys exp_ty prepared
+
+-- | Prepare all eligible unguarded equations in a 'MatchGroup'.
+prepareUnguardedWhereMatches
+  :: ExpRhoType -> MatchGroup GhcRn (LHsExpr GhcRn)
+  -> TcM (MatchGroup GhcRn (LHsExpr GhcRn))
+prepareUnguardedWhereMatches exp_ty group@MG { mg_alts = L loc matches } = do
+  prepared <- mapM (prepareUnguardedWhere exp_ty) matches
+  return (group { mg_alts = L loc prepared })
 
 -- | Move one eligible where group into its expression RHS without changing patterns.
 -- See Note [Unguarded where aliases].
 prepareUnguardedWhere :: ExpRhoType -> LMatch GhcRn (LHsExpr GhcRn)
                      -> TcM (LMatch GhcRn (LHsExpr GhcRn))
-prepareUnguardedWhere (Check expected) original@(L match_loc match@Match
-  { m_grhss = grhss@GRHSs { grhssGRHSs = L rhs_loc (GRHS ext [] rhs) :| []
-                         , grhssLocalBinds = binds@(L binds_loc
-                             (HsValBinds _ (XValBindsLR (HsVBG groups sigs)))) } })
-  | isTauTy expected
-  , not (anyFreeVarsOfType (\v -> isTyVar v && isMetaTyVar v) expected)
+prepareUnguardedWhere exp_ty (L match_loc match) = do
+  grhss' <- prepareUnguardedWhereGRHSs exp_ty (m_grhss match)
+  return (L match_loc (match { m_grhss = grhss' }))
+
+-- | Move an eligible unguarded @where@ clause into a @let@ wrapping the single RHS.
+prepareUnguardedWhereGRHSs :: ExpRhoType -> GRHSs GhcRn (LHsExpr GhcRn)
+                          -> TcM (GRHSs GhcRn (LHsExpr GhcRn))
+prepareUnguardedWhereGRHSs (Check expected) original@GRHSs
+  { grhssGRHSs = L rhs_loc (GRHS ext [] rhs) :| []
+  , grhssLocalBinds = binds@(L binds_loc
+      (HsValBinds _ (XValBindsLR (HsVBG groups sigs)))) }
+  | hasNativeDependentExpr (Type expected)
+    || (isTauTy expected && not (anyFreeVarsOfType (\v -> isTyVar v && isMetaTyVar v) expected))
   , not (null groups), all nonrecursive_function groups, all isTypeLSig sigs
   = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
        ; strict <- xoptM LangExt.Strict
@@ -2769,14 +2806,14 @@ prepareUnguardedWhere (Check expected) original@(L match_loc match@Match
          then let body = wrapGenSpan' (combineSrcSpans (getLocA rhs) (locA binds_loc))
                           (HsLet noExtField binds rhs)
                   local = L binds_loc (EmptyLocalBinds noExtField)
-              in return (L match_loc (match { m_grhss = grhss
+              in return (original
                    { grhssGRHSs = L rhs_loc (GRHS ext [] body) :| []
-                   , grhssLocalBinds = local } }))
+                   , grhssLocalBinds = local })
          else return original }
   where
     nonrecursive_function (NonRecursive, [L _ FunBind{}]) = True
     nonrecursive_function _ = False
-prepareUnguardedWhere _ match = return match
+prepareUnguardedWhereGRHSs _ grhss = return grhss
 
 {- Note [Unguarded where aliases]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

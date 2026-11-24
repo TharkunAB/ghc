@@ -846,6 +846,25 @@ the family cache and preserve their evidence without coercion zapping.
 Axiom-only and retained-binder comparisons retain their existing scope.
 -}
 
+rewrite_source_let :: RewriteEnv -> TcType -> Role -> Id -> CoVar -> CoercionN
+                   -> RewriteM Reduction
+rewrite_source_let env ty role v proof nominal_co = do
+  liftTcS $ updTcRef (re_used_cos env) (addUnivCoDepCoVar proof)
+  let redn = downgradeRedn role Nominal (coercionRedn nominal_co)
+      rhs_env = env { re_source_lets = delVarEnv (re_source_lets env) v
+                    , re_fam_axioms_only = True }
+  withRewriteEnv (const rhs_env) (bumpReductionDepthRM ty (rewrite_reduction redn))
+
+-- | Allow expanding a checked local definition outside binder-lifting scopes.
+-- Inner Wanteds opened by 'can_eq_nc_depfun' carry their fresh binder in
+-- 're_native_binders' with an empty lifting context, so outer definitions may
+-- still unfold there without capturing the fresh binder.
+allowSourceLet :: RewriteEnv -> Id -> Bool
+allowSourceLet env v =
+  not (v `elemVarSet` re_native_binders env)
+  && case re_native_lifting env of
+       LC _ tv_env native_env -> isEmptyVarEnv tv_env && isEmptyVarEnv native_env
+
 rewrite_one :: TcType -> RewriteM Reduction
 -- Rewrite a type to get rid of type function applications, returning
 -- the new type-function-free type, and a collection of new equality
@@ -877,15 +896,21 @@ rewrite_one ty@ClassAppTy{}
 rewrite_one ty@DepDictTy{}
   = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
 
--- Nominal argument evidence gives forward congruence under the same head.
--- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
+-- Nominal argument evidence gives forward congruence under the same head,
+-- or unfolds a checked local function definition from re_source_lets.
+-- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep and
+-- Note [Rewriting checked local indices].
 rewrite_one ty@(TermAppTy f arg)
   | Just (domain, _) <- nativeIndexFunctionTys_maybe f
   , typeKind arg `eqType` domain
   = do { role <- getRole
-       ; Reduction co arg' <- setEqRel NomEq $ rewrite_one arg
-       ; return $! downgradeRedn role Nominal $
-           mkReduction (mkTermAppCo f co) (TermAppTy f arg') }
+       ; env <- getRewriteEnv
+       ; Reduction arg_co arg' <- setEqRel NomEq $ rewrite_one arg
+       ; case lookupVarEnv (re_source_lets env) f of
+           Just proof | allowSourceLet env f ->
+             rewrite_source_let env ty role f proof (mkAppCo (mkCoVarCo proof) arg_co)
+           _ -> return $! downgradeRedn role Nominal $
+                  mkReduction (mkTermAppCo f arg_co) (TermAppTy f arg') }
   | otherwise
   = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
 
@@ -898,12 +923,8 @@ rewrite_one ty@(TermVarTy v)
   = do { role <- getRole
        ; env <- getRewriteEnv
        ; case lookupVarEnv (re_source_lets env) v of
-           Just proof | isEmptyVarSet (re_native_binders env) -> do
-             { liftTcS $ updTcRef (re_used_cos env) (addUnivCoDepCoVar proof)
-             ; let redn = downgradeRedn role Nominal (coercionRedn (mkCoVarCo proof))
-             ; let rhs_env = env { re_source_lets = delVarEnv (re_source_lets env) v
-                                 , re_fam_axioms_only = True }
-             ; withRewriteEnv (const rhs_env) (bumpReductionDepthRM ty (rewrite_reduction redn)) }
+           Just proof | allowSourceLet env v ->
+             rewrite_source_let env ty role v proof (mkCoVarCo proof)
            _ -> return $! mkReflRedn role
                   (coercionLKind (liftCoSubstNative (re_native_lifting env) role v)) }
   | otherwise

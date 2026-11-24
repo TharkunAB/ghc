@@ -962,3 +962,7 @@ test('NativeIndexedForEachCtor',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeIndexedForEachCtorProvider.hs', 'NativeIndexedForEachCtor.hs'])],
      run_command, ['bash NativeIndexedForEachCtor.sh "{compiler}" "{libdir}"'])
+test('NativeComposedLetWhere',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeComposedLetWhere.hs'])],
+     run_command, ['bash NativeComposedLetWhere.sh "{compiler}" "{libdir}"'])
