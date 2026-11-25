@@ -247,9 +247,6 @@ alignInvisibleRetainedPatterns from_fun_bind invis_pat_tys indices
       , Just pat <- tyPatToRetainedPat ploc tp
       = let (more, rest) = build_retained bs ps'
         in (pat : more, rest)
-      | [] <- ps
-      = let (more, rest) = build_retained bs []
-        in (implicit_pat b : more, rest)
       | otherwise
       = let (more, rest) = build_retained bs ps
         in (implicit_pat b : more, rest)

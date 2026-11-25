@@ -392,27 +392,27 @@ hasDefaultCorePlugin p = samePluginHook (installCoreToDos p) defaultInstallCoreT
 hasDefaultLatePlugin :: Plugin -> Bool
 hasDefaultLatePlugin p = samePluginHook (latePlugin p) defaultLatePlugin
 
--- | Return 'True' when 'HscEnv' carries a plugin that overrides
--- 'installCoreToDos', or when 'DynFlags' names an unloaded plugin module.
--- See Note [Plugin hooks and Dependent Haskell pipelines].
-hasActiveCorePlugins :: HscEnv -> Bool
-hasActiveCorePlugins hsc_env =
-     any (not . hasDefaultCorePlugin . paPlugin) (pluginsWithArgs ps)
+-- | Return 'True' when 'HscEnv' carries a plugin whose hook fails @is_default@,
+-- or when 'DynFlags' names an unloaded plugin module.
+hasActivePluginHook :: (Plugin -> Bool) -> HscEnv -> Bool
+hasActivePluginHook is_default hsc_env =
+     any (not . is_default . paPlugin) (pluginsWithArgs ps)
   || any (`notElem` loaded_names) (pluginModNames (hsc_dflags hsc_env))
   where
     ps = hsc_plugins hsc_env
     loaded_names = map lpModuleName (loadedPlugins ps)
 
+-- | Return 'True' when 'HscEnv' carries a plugin that overrides
+-- 'installCoreToDos', or when 'DynFlags' names an unloaded plugin module.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+hasActiveCorePlugins :: HscEnv -> Bool
+hasActiveCorePlugins = hasActivePluginHook hasDefaultCorePlugin
+
 -- | Return 'True' when 'HscEnv' carries a plugin that overrides 'latePlugin',
 -- or when 'DynFlags' names an unloaded plugin module.
 -- See Note [Plugin hooks and Dependent Haskell pipelines].
 hasActiveLatePlugins :: HscEnv -> Bool
-hasActiveLatePlugins hsc_env =
-     any (not . hasDefaultLatePlugin . paPlugin) (pluginsWithArgs ps)
-  || any (`notElem` loaded_names) (pluginModNames (hsc_dflags hsc_env))
-  where
-    ps = hsc_plugins hsc_env
-    loaded_names = map lpModuleName (loadedPlugins ps)
+hasActiveLatePlugins = hasActivePluginHook hasDefaultLatePlugin
 
 -- | Return 'True' when a 'Plugin' keeps all ten non-hole hooks from
 -- 'defaultPlugin', overriding at most 'holeFitPlugin' and 'pluginRecompile'.
@@ -438,12 +438,7 @@ isHoleFitOnlyPlugin p =
 -- 'hsc_plugins'.
 -- See Note [Plugin hooks and Dependent Haskell pipelines].
 hasNonHoleFitPlugins :: HscEnv -> Bool
-hasNonHoleFitPlugins hsc_env =
-     any (not . isHoleFitOnlyPlugin . paPlugin) (pluginsWithArgs ps)
-  || any (`notElem` loaded_names) (pluginModNames (hsc_dflags hsc_env))
-  where
-    ps = hsc_plugins hsc_env
-    loaded_names = map lpModuleName (loadedPlugins ps)
+hasNonHoleFitPlugins = hasActivePluginHook isHoleFitOnlyPlugin
 
 {- Note [Plugin hooks and Dependent Haskell pipelines]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

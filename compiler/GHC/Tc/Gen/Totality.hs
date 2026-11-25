@@ -93,7 +93,7 @@ import GHC.Utils.Outputable
 import Control.Monad (foldM, forM_)
 import Data.List (nub, sortBy)
 import qualified Data.List.NonEmpty as NE
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 
 {- Note [Advisory structural totality report]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -254,14 +254,13 @@ collectTopBindings this_mod binds = foldr step ([], []) binds
                 ]
               new_tops = concatMap (extractInner lbind loc abs_b mono_to_abe) inner_binds
           in (new_tops ++ acc_tops, new_aliases ++ acc_aliases)
-        FunBind { fun_id = L id_loc poly }
+        FunBind { fun_id = L _ poly }
           | isUserName (idName poly)
           , not (isGeneratedSrcSpan (locA loc)) ->
-              let span_use = if isGeneratedSrcSpan (locA loc) then locA id_loc else locA loc
-                  tb = TopBinding
+              let tb = TopBinding
                     { tbPolyId    = poly
                     , tbName      = idName poly
-                    , tbSpan      = span_use
+                    , tbSpan      = locA loc
                     , tbOuterBind = lbind
                     , tbInnerBind = bind
                     }
@@ -507,9 +506,6 @@ hasUncoveredPatterns pmc_hsc_env tcg_env lbind = do
       errs  = bagToList (getErrorMessages msgs)
   pure (isNothing mb_res || not (null errs) || any isIncompleteDiag warns)
   where
-    isNothing Nothing  = True
-    isNothing (Just _) = False
-
     isIncompleteDiag :: MsgEnvelope DsMessage -> Bool
     isIncompleteDiag env = case errMsgDiagnostic env of
       DsNonExhaustivePatterns {}   -> True
@@ -536,7 +532,7 @@ evaluateBinding this_mod resolve status_env arity_env pmc_uncovered is_cyclic tb
           | pmc_uncovered ->
               (TotalityUnknown "partial or guarded equations", Nothing)
           | otherwise ->
-              case traverse (checkMatchBody this_mod resolve status_env arity_env (tbName tb))
+              case traverse (uncurry (checkGRHSsBody this_mod resolve status_env arity_env (tbName tb)))
                             match_envs of
                 Left reason -> (TotalityUnknown reason, Nothing)
                 Right call_lists ->
@@ -544,11 +540,9 @@ evaluateBinding this_mod resolve status_env arity_env pmc_uncovered is_cyclic tb
                     Left reason -> (TotalityUnknown reason, Nothing)
                     Right () ->
                       let self_calls = concat call_lists
-                      in if not is_cyclic && null self_calls
+                      in if (not is_cyclic && null self_calls) || hasDecreasingPosition param_arity self_calls
                            then (TotalityCheckedStructural, Just param_arity)
-                           else if hasDecreasingPosition param_arity self_calls
-                             then (TotalityCheckedStructural, Just param_arity)
-                             else (TotalityUnknown "non-structural recursive call", Nothing)
+                           else (TotalityUnknown "non-structural recursive call", Nothing)
     PatBind { pat_lhs = lhs, pat_rhs = grhss }
       | pmc_uncovered ->
           (TotalityUnknown "partial or guarded equations", Nothing)
@@ -671,18 +665,6 @@ checkPattern (L _ pat0) = go False pat0
     isIrrefutableVarPat (WildPat {})            = True
     isIrrefutableVarPat (ParPat _ (L _ inner))  = isIrrefutableVarPat inner
     isIrrefutableVarPat _                       = False
-
--- | Check a single equation's right-hand side and local bindings.
-checkMatchBody
-  :: Module
-  -> (Id -> Maybe Name)
-  -> NameEnv TotalityStatus
-  -> NameEnv Int
-  -> Name
-  -> (ParamEnv, GRHSs GhcTc (LHsExpr GhcTc))
-  -> Either String [SelfCall]
-checkMatchBody this_mod resolve status_env arity_env self_name (param_env, grhss) =
-  checkGRHSsBody this_mod resolve status_env arity_env self_name param_env grhss
 
 -- | Check unguarded 'GRHSs' and any local @where@ bindings.
 checkGRHSsBody
@@ -921,12 +903,8 @@ peelAppSpine lexpr = go (unLoc lexpr) []
 unwrapExprVar :: LHsExpr GhcTc -> Maybe Id
 unwrapExprVar lexpr =
   case peelAppSpine lexpr of
-    (HsVar _ (L _ v), []) | isNothingDataCon v -> Just v
-    _                                          -> Nothing
-  where
-    isNothingDataCon v = case isDataConId_maybe v of
-      Nothing -> True
-      Just _  -> False
+    (HsVar _ (L _ v), []) | isNothing (isDataConId_maybe v) -> Just v
+    _                                                       -> Nothing
 
 -- | Check whether one fixed parameter position strictly decreases at every self-call.
 hasDecreasingPosition :: Int -> [SelfCall] -> Bool
