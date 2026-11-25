@@ -1103,3 +1103,7 @@ test('NativeLinearForEachAndExtendedLet',
       extra_files(['NativeLinearForEachAndExtendedLetProvider.hs',
                    'NativeLinearForEachAndExtendedLet.hs'])],
      run_command, ['bash NativeLinearForEachAndExtendedLet.sh "{compiler}" "{libdir}"'])
+test('NativeObsEqPlugin',
+     [req_host_target_ghc, req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['NativeObsEqPlugin.hs'])],
+     run_command, ['bash NativeObsEqPlugin.sh "{compiler}" "{libdir}" "{ghc_pkg}"'])

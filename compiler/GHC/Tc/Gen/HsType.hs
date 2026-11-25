@@ -114,6 +114,7 @@ import {-# SOURCE #-} GHC.Tc.Gen.Splice (tcPrepareClosedApplication, tcPrepareCl
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Iface.Env (lookupOrig, newGlobalBinder)
+import GHC.Iface.Load (loadInterfaceForName)
 import GHC.IfaceToCore
 import GHC.Tc.Solver
 import GHC.Tc.Zonk.Type
@@ -168,13 +169,15 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.Supply
 
 import GHC.Unit.Module (Module, mkModule, mkModuleName, moduleName, moduleNameString, moduleUnit, stringToUnit, unitString)
+import GHC.Unit.Module.ModIface (mi_hash_fn)
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import GHC.Driver.DynFlags
-import GHC.Driver.Env (hsc_units)
+import GHC.Driver.Env (hsc_plugins, hsc_units)
+import GHC.Driver.Plugins (mapPlugins, tcPlugin)
 import GHC.Driver.Ppr (showPpr, showSDocForUser)
 import qualified GHC.LanguageExtensions as LangExt
 
@@ -3688,8 +3691,7 @@ tc_app_ty_external mode rn_ty exp_kind
                | isTypeLevel (mode_tyki mode), ordinary_call
                , Just (instantiated, domains, result_kind) <- instantiateOpenTypeFunction True fun
                , equalLength domains args, all is_local_open_operand args
-               -> do { result <- tcOpenTypeCall mode name instantiated result_kind (zip args domains)
-                     ; checkExpKind mode rn_ty result result_kind exp_kind }
+               -> run_open_or_uninterp fun name instantiated result_kind (zip args domains)
              (_, Just (fun, _), Just args)
                | isTypeLevel (mode_tyki mode), ordinary_call
                , all (\arg -> known_constructor arg || isOpenTypeOperand arg) args
@@ -3697,11 +3699,7 @@ tc_app_ty_external mode rn_ty exp_kind
                , Just telescope <- indexedOpenTypeFunction fun
                , let (_, inputs, _) = telescope
                , equalLength inputs args
-               -> do { observed <- tcIndexedOpenTypeCall mode fun telescope args
-                     ; case observed of
-                         Just (result, result_kind) ->
-                           checkExpKind mode rn_ty result result_kind exp_kind
-                         Nothing -> unsupported name }
+               -> run_indexed_or_uninterp fun telescope args (unsupported name)
              (_, Just (fun, _), Just [arg])
                | isTypeLevel (mode_tyki mode)
                , Just (wildcards, call_owner, pending) <- mode_pending_calls mode
@@ -3727,7 +3725,19 @@ tc_app_ty_external mode rn_ty exp_kind
                -> do { staging <- closedOperandStaging args
                      ; if isJust staging
                          then executable_call fun args
-                         else unsupported name }
+                         else uninterp_or fun (unsupported name) }
+             (mb_thing, mb_local, _)
+               | isTypeLevel (mode_tyki mode), ordinary_call
+               -> do { tc_plugins <- hasActiveTcPlugins
+                     ; if not tc_plugins
+                         then unsupported name
+                         else do
+                           mb_fun <- case (fst <$> mb_local) <|> (case mb_thing of { Just (AnId f) -> Just f; _ -> Nothing }) of
+                             Just f  -> pure (Just f)
+                             Nothing -> tcLookupIdMaybe name
+                           case mb_fun of
+                             Just fun -> uninterp_or fun (unsupported name)
+                             Nothing  -> unsupported name }
              _ -> unsupported name
            else imported_call env rdr name }
 
@@ -3813,24 +3823,32 @@ tc_app_ty_external mode rn_ty exp_kind
                          , Just (instantiated, domains, result_kind) <- instantiateOpenTypeFunction False fun
                          , equalLength domains args
                          , all isOpenTypeOperand args
-                         -> do { result <- tcOpenTypeCall mode name instantiated result_kind (zip args domains)
-                               ; checkExpKind mode rn_ty result result_kind exp_kind }
+                         -> run_open_or_uninterp fun name instantiated result_kind (zip args domains)
                          | ordinary_call
                          , all (\arg -> known_constructor arg || isOpenTypeOperand arg) args
                          , any known_constructor args, any open_indexed_operand args
                          , Just telescope <- indexedOpenTypeFunction fun
                          , let (_, inputs, _) = telescope
                          , equalLength inputs args
-                         -> do { observed <- tcIndexedOpenTypeCall mode fun telescope args
-                               ; case observed of
-                                   Just (result, result_kind) ->
-                                     checkExpKind mode rn_ty result result_kind exp_kind
-                                   Nothing -> executable_call fun args }
+                         -> run_indexed_or_uninterp fun telescope args (executable_call fun args)
                          -- See Note [Function values and executable type calls].
                          | not (null args)
                          , ordinary_call || (isQual rdr && ready_partial_call && length args == 1)
                          -> executable_call fun args
+                         | null args, ordinary_call
+                         -> uninterp_or fun (unsupported name)
                        _ -> unsupported name }
+           Nothing
+             | isTypeLevel (mode_tyki mode), ordinary_call
+             , not (null hs_args)
+             , not (nameIsLocalOrFrom (tcg_semantic_mod env) name)
+             -> do { tc_plugins <- hasActiveTcPlugins
+                   ; if not tc_plugins
+                       then unsupported name
+                       else do { thing <- tcLookupGlobal name
+                               ; case thing of
+                                   AnId fun -> uninterp_or fun (unsupported name)
+                                   _ -> unsupported name } }
            _ -> unsupported name
 
     executable_call fun args = do
@@ -3838,12 +3856,53 @@ tc_app_ty_external mode rn_ty exp_kind
       case selected of
         Just check -> check
         Nothing -> do
-          hint <- closedCallResultHint ordinary_call exp_kind
-          (result_kind, plan) <- tcPlanOrdinaryCall mode ordinary_call hint fun args
-          checkClosedCallExpectedKind rn_ty exp_kind result_kind
-          run <- prepareClosedCallResult result_kind plan
-          result <- run
-          checkExpKind mode rn_ty result result_kind exp_kind
+          tc_plugins <- if ordinary_call then hasActiveTcPlugins else pure False
+          staging <- if tc_plugins then closedOperandStaging args else pure (Just True)
+          case staging of
+            Nothing -> uninterp_or fun (run_closed_call fun args)
+            Just _
+              | tc_plugins ->
+                  tryTcDiscardingErrs
+                    (uninterp_or fun (run_closed_call fun args))
+                    (run_closed_call fun args)
+              | otherwise -> run_closed_call fun args
+
+    run_closed_call fun args = do
+      hint <- closedCallResultHint ordinary_call exp_kind
+      (result_kind, plan) <- tcPlanOrdinaryCall mode ordinary_call hint fun args
+      checkClosedCallExpectedKind rn_ty exp_kind result_kind
+      run <- prepareClosedCallResult result_kind plan
+      result <- run
+      checkExpKind mode rn_ty result result_kind exp_kind
+
+    -- See Note [Uninterpreted term applications for TcPlugins].
+    uninterp_or fun = tcUninterpretedOr mode rn_ty exp_kind (length val_args_only) fun
+
+    run_open_or_uninterp fun name instantiated result_kind arg_domains = do
+      let try_open = do
+            result <- tcOpenTypeCall mode name instantiated result_kind arg_domains
+            checkExpKind mode rn_ty result result_kind exp_kind
+      tc_plugins <- hasActiveTcPlugins
+      if not tc_plugins
+        then try_open
+        else tryTcDiscardingErrs (uninterp_or fun try_open) try_open
+
+    run_indexed_or_uninterp fun telescope args fallback = do
+      let try_indexed = do
+            observed <- tcIndexedOpenTypeCall mode fun telescope args
+            case observed of
+              Just (result, result_kind) ->
+                checkExpKind mode rn_ty result result_kind exp_kind
+              Nothing -> uninterp_or fun fallback
+      tc_plugins <- hasActiveTcPlugins
+      if not tc_plugins
+        then do
+          observed <- tcIndexedOpenTypeCall mode fun telescope args
+          case observed of
+            Just (result, result_kind) ->
+              checkExpKind mode rn_ty result result_kind exp_kind
+            Nothing -> fallback
+        else tryTcDiscardingErrs (uninterp_or fun fallback) try_indexed
     -- Keep closed calls on the executable path. A retained variable and
     -- nested applications that contain it have no closed runtime operand.
     -- See Note [Identity certificates and open unfoldings] in GHC.Tc.Gen.SourceTable.
@@ -3876,6 +3935,7 @@ tc_app_ty_external mode rn_ty exp_kind
 
     (hs_fun_ty, hs_args) = splitHsAppTys rn_ty
     value_args = traverse value_arg (filterOut is_par hs_args)
+    val_args_only = [arg | HsValArg _ arg <- hs_args]
     is_par HsArgPar{} = True
     is_par _ = False
     value_arg (HsValArg _ arg) = Just arg
@@ -3977,7 +4037,8 @@ tc_app_ty_external mode rn_ty exp_kind
              staging <- closedOperandStaging args
              if isJust staging
                then fallback_executable_call fun args
-               else failWithTc (TcRnNoSourceTable (getName fun))
+               else tcUninterpretedOr mode rn_ty exp_kind (length args) fun
+                      (failWithTc (TcRnNoSourceTable (getName fun)))
            Nothing
              | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
                  staging <- closedOperandStaging args
@@ -6880,6 +6941,186 @@ getOrCreateEtaForgetTyCon tc n_prefix flags = do
       TyConApp _ args   -> any has_matchable_arrow args
       CastTy t _        -> has_matchable_arrow t
       _                 -> False
+
+{- Note [Uninterpreted term applications for TcPlugins]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When no typechecker plugin is active (`hasActiveTcPlugins` is `False`), GHC
+accepts an open term-function application `f args` in a type only when `f` has
+a certified `SourceTable` or reduces completely through `OpenTypeEval`.
+Uncertified open applications report `TcRnNoSourceTable` (`GHC-68947`) or
+`TcRnClosedTypeEval` (`GHC-70565`). Existing negative qualification tests use
+those diagnostics when no solver plugin is loaded.
+
+When at least one `tcPlugin` is active in `hsc_plugins`, `tcHsType` keeps
+certified `SourceTable` families, `OpenTypeEval` reductions, and closed literal
+evaluation unchanged. If an ordinary term application `f args` has open
+operands and no certified reduction, and `f` has an unconstrained function type
+whose arguments and result have supported promoted kinds (excluding
+`Type`-returning large eliminations), GHC interns a deterministic equationless
+closed type family `TyCon` (`ClosedTypeFamilyTyCon (CTF Nothing)`) for `f` and
+elaborates the call as an application of that family:
+
+* When `f` belongs to the current module `M`, the family carries `Name`
+  `M.U:<occ>` in `tcName` namespace.
+* When `f` is imported from `DefMod`, GHC reuses `DefMod.U:<occ>` if `DefMod`
+  already defines that declaration in its interface. Otherwise GHC interns
+  `M.U:@<unit>:<mod>:<occ>` in `M` through `forgetMTyConCache` so `M.hi`
+  serializes the family declaration cleanly.
+
+Any `TcPlugin` (`TcPluginSolve` or `TcPluginRewrite`) can recover `f`'s term
+`Id` from `tyConName` via `lookupOrig` and `tcLookupId`, inspect or discharge
+`[W] U:f args ~# rhs`, or refute false equalities. When every active `TcPlugin`
+leaves the constraint unsolved, GHC reports an ordinary unsolved nominal
+equality constraint.
+-}
+
+hasActiveTcPlugins :: TcM Bool
+hasActiveTcPlugins = do
+  hsc_env <- getTopEnv
+  pure (not (null (catMaybes (mapPlugins (hsc_plugins hsc_env) tcPlugin))))
+
+tcUninterpretedOr :: TcTyMode -> HsType GhcRn -> ExpKind -> Int -> Id
+                  -> TcM TcType -> TcM TcType
+tcUninterpretedOr mode rn_ty exp_kind n_val_args fun fallback = do
+  tc_plugins <- hasActiveTcPlugins
+  if not tc_plugins
+    then fallback
+    else do
+      mb_ty <- tcUninterpretedTermCall mode rn_ty exp_kind n_val_args fun
+      maybe fallback pure mb_ty
+
+tcUninterpretedTermCall :: TcTyMode -> HsType GhcRn -> ExpKind -> Int -> Id
+                        -> TcM (Maybe TcType)
+tcUninterpretedTermCall mode rn_ty exp_kind n_val_args fun
+  | not (isTypeLevel (mode_tyki mode)) || n_val_args < 0
+  = pure Nothing
+  | isNothing (mode_holes mode) || isJust (mode_complete_type_arg mode)
+  , mode_complete_type_arg mode /= Just False
+  = do
+      level <- getThLevel
+      bootOrSig <- tcIsHsBootOrSig
+      explicitLevels <- xoptM LangExt.ExplicitLevelImports
+      case level of
+        Comp | not bootOrSig && not explicitLevels -> do
+          mb_tc <- getOrCreateUninterpretedTyCon fun n_val_args
+          case mb_tc of
+            Nothing -> pure Nothing
+            Just fam_tc ->
+              Just <$> tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy fam_tc)
+        _ -> pure Nothing
+  | otherwise
+  = pure Nothing
+
+getOrCreateUninterpretedTyCon :: Id -> Int -> TcM (Maybe TyCon)
+getOrCreateUninterpretedTyCon fun n_val_args = do
+  gbl <- getGblEnv
+  let orig_name = idName fun
+      cur_mod   = tcg_mod gbl
+      sem_mod   = tcg_semantic_mod gbl
+      occ_str   = occNameString (nameOccName orig_name)
+      local_occ = mkTcOcc ("U:" ++ occ_str)
+  case nameModule_maybe orig_name of
+    Nothing -> pure Nothing
+    Just def_mod
+      | def_mod == sem_mod -> intern_in_cur_mod gbl cur_mod local_occ (nameSrcSpan orig_name)
+      | otherwise -> do
+          iface <- loadInterfaceForName (text "uninterpreted term family") orig_name
+          if isJust (mi_hash_fn iface local_occ)
+            then do
+              ext_name <- lookupOrig def_mod local_occ
+              thing <- tcLookupGlobal ext_name
+              case thing of
+                ATyCon existing
+                  | check_arity existing -> pure (Just existing)
+                _ -> pure Nothing
+            else do
+              let imp_occ = mkTcOcc
+                    ("U:@" ++ unitString (moduleUnit def_mod)
+                           ++ ":" ++ moduleNameString (moduleName def_mod)
+                           ++ ":" ++ occ_str)
+              intern_in_cur_mod gbl cur_mod imp_occ noSrcSpan
+  where
+    check_arity tc =
+      let vis_count = length (filterOut isInvisibleTyConBinder (tyConBinders tc))
+      in n_val_args >= vis_count && (vis_count > 0 || n_val_args == 0)
+
+    intern_in_cur_mod gbl cur_mod occ span_loc = do
+      fam_name <- newGlobalBinder cur_mod occ Nothing span_loc
+      case lookupTypeEnv (tcg_type_env gbl) fam_name of
+        Just (ATyCon existing) ->
+          pure (if check_arity existing then Just existing else Nothing)
+        _ -> do
+          cached_map <- liftIO (readIORef forgetMTyConCache)
+          case lookupUFM cached_map cur_mod >>= (`lookupNameEnv` fam_name) of
+            Just existing ->
+              pure (if check_arity existing then Just existing else Nothing)
+            Nothing -> build_uninterp_tc cur_mod fam_name
+
+    build_uninterp_tc cur_mod fam_name = do
+      let init_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfType (varType fun)))
+      mb_invis <- peel_invis init_subst (varType fun)
+      case mb_invis of
+        Nothing -> pure Nothing
+        Just (p_tvs, rho) -> do
+          let (domains, res_kind) = peel_arrows rho
+          if n_val_args < length domains
+             || (null domains && (n_val_args > 0 || isTyVarTy res_kind))
+             || tcIsLiftedTypeKind res_kind
+             || not (tcIsLiftedTypeKind (typeKind res_kind))
+             || not (all (tcIsLiftedTypeKind . typeKind) domains)
+            then pure Nothing
+            else do
+              z_tvs <- zipWithM
+                (\i dom -> (`mkTyVar` dom) <$> newSysName (mkTyVarOcc ("arg" ++ show i)))
+                [1 :: Int ..] domains
+              let tc_binders = mkNamedTyConBinders (Invisible SpecifiedSpec) p_tvs
+                               ++ mkAnonTyConBinders z_tvs
+                  tc_kind    = mkTyConKindWithMatchability unmatchableDataConTy
+                                 tc_binders res_kind
+                  fam_tc     = mkFamilyTyCon fam_name tc_kind tc_binders 0
+                                 res_kind Nothing
+                                 (ClosedTypeFamilyTyCon (CTF Nothing))
+                                 Nothing NotInjective
+              liftIO $ atomicModifyIORef' forgetMTyConCache $ \ufm ->
+                let env0 = fromMaybe emptyNameEnv (lookupUFM ufm cur_mod)
+                    env1 = extendNameEnv env0 fam_name fam_tc
+                in (addToUFM ufm cur_mod env1, ())
+              pure (Just fam_tc)
+
+    peel_invis :: Subst.Subst -> Type -> TcM (Maybe ([TyVar], Type))
+    peel_invis subst ty =
+      case splitPiTy_maybe ty of
+        Just (_, Named (Bndr tv0 vis), rest)
+          | isInvisibleForAllTyFlag vis, isTyVar tv0 -> do
+              let ki0 = Subst.substTy subst (tyVarKind tv0)
+              if ki0 `tcEqType` runtimeRepTy then do
+                let subst' = Subst.extendTvSubstAndInScope subst tv0 liftedRepTy
+                peel_invis subst' rest
+              else if ki0 `tcEqType` levityTy then do
+                let subst' = Subst.extendTvSubstAndInScope subst tv0 liftedDataConTy
+                peel_invis subst' rest
+              else if tcIsLiftedTypeKind ki0 || tcIsLiftedTypeKind (typeKind ki0) then do
+                nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv0))))
+                let tv'    = mkTyVar nm ki0
+                    subst' = Subst.extendTvSubstAndInScope subst tv0 (mkTyVarTy tv')
+                fmap (\(tvs, r) -> (tv' : tvs, r)) <$> peel_invis subst' rest
+              else pure Nothing
+        Just (_, Anon {}, _)
+          | isInvisiblePiTyBinder_check ty -> pure Nothing
+        _ -> pure (Just ([], Subst.substTy subst ty))
+
+    isInvisiblePiTyBinder_check ty =
+      case splitPiTy_maybe ty of
+        Just (_, b, _) -> isInvisiblePiTyBinder b
+        Nothing        -> False
+
+    peel_arrows :: Type -> ([Type], Type)
+    peel_arrows ty =
+      case coreFullView ty of
+        FunTy FTF_T_T _ mult dom rest | isManyTy mult ->
+          let (doms, res) = peel_arrows rest
+          in (dom : doms, res)
+        _ -> ([], ty)
 
 ---------------------------
 
