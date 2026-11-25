@@ -1083,3 +1083,8 @@ test('NativeStandaloneConstrainedFamily',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeStandaloneConstrainedFamily.hs'])],
      run_command, ['bash NativeStandaloneConstrainedFamily.sh "{compiler}" "{libdir}"'])
+test('NativeWave10TypeCaseDotSections',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeWave10TypeCaseDotSectionsProvider.hs',
+                   'NativeWave10TypeCaseDotSections.hs'])],
+     run_command, ['bash NativeWave10TypeCaseDotSections.sh "{compiler}" "{libdir}"'])
