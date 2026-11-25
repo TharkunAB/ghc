@@ -50,15 +50,14 @@ import GHC.Types.Var.Set
 import GHC.Utils.Panic
 
 import Control.Monad (when)
-import Control.Monad.Trans.State.Strict
 import Data.Semigroup (Semigroup (..))
 
 -- | Track metadata, variable kinds, and synonyms that the scan has visited.
 data ScanState = ScanState
-    { scannedMetadata :: VarSet
-    , scannedKinds :: VarSet
-    , scannedSynonyms :: TyConSet
-    , scanMetadata :: MetadataScan
+    { scannedMetadata :: !VarSet
+    , scannedKinds :: !VarSet
+    , scannedSynonyms :: !TyConSet
+    , scanMetadata :: !MetadataScan
     , scanPurpose :: !ScanPurpose
     }
 
@@ -72,34 +71,48 @@ data ScanPurpose
 data MetadataScan = AllMetadata | StableMetadata | NoMetadata
     deriving Eq
 
+data ScanRes = ScanRes !Bool !ScanState
+
 -- | Short-circuit a structural scan when it finds a native type.
-newtype NativeScan = NativeScan {runNativeScan :: State ScanState Bool}
+newtype NativeScan = NativeScan {runNativeScan :: ScanState -> ScanRes}
 
 instance Semigroup NativeScan where
-    NativeScan left <> NativeScan right = NativeScan $ do
-        found <- left
-        if found then pure True else right
+    {-# INLINE (<>) #-}
+    NativeScan left <> NativeScan right = NativeScan $ \s ->
+        case left s of
+            r@(ScanRes True _) -> r
+            ScanRes False s'   -> right s'
 
 instance Monoid NativeScan where
-    mempty = NativeScan (pure False)
+    {-# INLINE mempty #-}
+    mempty = NativeScan (ScanRes False)
+
+scanList :: (a -> NativeScan) -> [a] -> NativeScan
+scanList f = go
+  where
+    go []       = mempty
+    go (x : xs) = NativeScan $ \s ->
+        case runNativeScan (f x) s of
+            r@(ScanRes True _) -> r
+            ScanRes False s'   -> runNativeScan (go xs) s'
 
 {- | Inspect bindings, rules, and metadata on bound identifiers.
 Read the source tag of imported unfoldings. Do not follow their templates.
 -}
 hasNativeDependentProgram :: CoreProgram -> [CoreRule] -> Bool
 hasNativeDependentProgram binds rules =
-    runScan AllMetadata (foldMap scanBind binds <> foldMap scanRule rules)
+    runScan AllMetadata (scanList scanBind binds <> scanList scanRule rules)
 
 -- | Admit structural indices, fixed call heads and abstract lifted witnesses.
 -- Local rules still use the restricted pipeline.
 supportsNativeGentle :: CoreProgram -> Bool
 supportsNativeGentle binds =
-    not (runScanFor CheckGentle AllMetadata (foldMap scanBind binds))
+    not (runScanFor CheckGentle AllMetadata (scanList scanBind binds))
 
 -- | Check the bindings and local user rules for the retained optimizer.
 supportsNativeRuleBinds :: CoreProgram -> Bool
 supportsNativeRuleBinds binds =
-    not (runScanFor CheckUserRules AllMetadata (foldMap scanBind binds))
+    not (runScanFor CheckUserRules AllMetadata (scanList scanBind binds))
 
 -- | Check the expression forms in a retained unfolding without forcing IdInfo.
 supportsNativeUserUnfolding :: CoreExpr -> Bool
@@ -116,25 +129,22 @@ supportsNativeDepFunUnfolding expr =
 supportsScopedDictionaryCore :: CoreProgram -> Bool
 supportsScopedDictionaryCore binds =
     hasScopedDictionaryProgram binds
-    && not (runScanFor CheckScopedDictionaryCore AllMetadata (foldMap scanBind binds))
+    && not (runScanFor CheckScopedDictionaryCore AllMetadata (scanList scanBind binds))
 
 -- | Check whether a function telescope binds a native dependent value or dictionary.
 hasNativeDepFunType :: Type -> Bool
-hasNativeDepFunType = go
-  where
-    go ty = case coreFullView ty of
-      DepFunTy{} -> True
-      DepDictTy{} -> True
-      ForAllTy _ _ body -> go body
-      FunTy{ft_res = res} -> go res
-      _ -> False
+hasNativeDepFunType = hasDepFunTelescope True
 
 -- | Does the rule head take a retained argument in its function telescope?
 hasRetainedRuleHead :: Id -> Bool
-hasRetainedRuleHead = go . idType
+hasRetainedRuleHead = hasDepFunTelescope False . idType
+
+hasDepFunTelescope :: Bool -> Type -> Bool
+hasDepFunTelescope include_dict = go
   where
     go ty = case coreFullView ty of
       DepFunTy{} -> True
+      DepDictTy{} -> include_dict
       ForAllTy _ _ body -> go body
       FunTy{ft_res = res} -> go res
       _ -> False
@@ -302,7 +312,7 @@ rejectNativeDependentExpr context expr =
 -- | Detect private dictionary types before preparation or interface construction.
 hasScopedDictionaryProgram :: CoreProgram -> Bool
 hasScopedDictionaryProgram binds =
-    runScanFor DetectScopedDictionaries AllMetadata (foldMap scanBind binds)
+    runScanFor DetectScopedDictionaries AllMetadata (scanList scanBind binds)
 
 -- | Detect a private dictionary form in an expression and its annotations.
 hasScopedDictionaryExpr :: CoreExpr -> Bool
@@ -334,7 +344,7 @@ remaining type, including the domain of a later binder.
 -- | Keep experimental dictionary types out of ordinary CorePrep.
 rejectScopedDictionaryProgram :: CoreProgram -> IO ()
 rejectScopedDictionaryProgram binds =
-    rejectScopedDictionaries (foldMap scanBind binds)
+    rejectScopedDictionaries (scanList scanBind binds)
 
 -- | Keep experimental dictionary applications out of interactive CorePrep.
 rejectScopedDictionaryExpr :: CoreExpr -> IO ()
@@ -351,57 +361,52 @@ runScan = runScanFor DetectNative
 
 runScanFor :: ScanPurpose -> MetadataScan -> NativeScan -> Bool
 runScanFor purpose metadata scan =
-    evalState (runNativeScan scan)
-        (ScanState emptyVarSet emptyVarSet emptyTyConSet metadata purpose)
+    case runNativeScan scan (ScanState emptyVarSet emptyVarSet emptyTyConSet metadata purpose) of
+        ScanRes found _ -> found
 
 -- | A native form qualifies for Gentle only if its children and type qualify.
 gentleForm :: NativeScan -> NativeScan
-gentleForm scan = NativeScan $ do
-    purpose <- gets scanPurpose
-    case purpose of
-        CheckGentle    -> runNativeScan scan
-        CheckUserRules -> runNativeScan scan
-        CheckDepFunUnfolding -> runNativeScan scan
-        DetectScopedDictionaries -> runNativeScan scan
-        FindScopedSelectorReceiver{} -> runNativeScan scan
-        _           -> pure True
+gentleForm scan = NativeScan $ \s ->
+    case scanPurpose s of
+        CheckGentle    -> runNativeScan scan s
+        CheckUserRules -> runNativeScan scan s
+        CheckDepFunUnfolding -> runNativeScan scan s
+        DetectScopedDictionaries -> runNativeScan scan s
+        FindScopedSelectorReceiver{} -> runNativeScan scan s
+        _           -> ScanRes True s
 
 -- | Check retained binders and operands in the scoped dictionary codec.
 dictionaryOperandForm :: NativeScan -> NativeScan
-dictionaryOperandForm children = NativeScan $ do
-    purpose <- gets scanPurpose
-    runNativeScan $ case purpose of
-      CheckScopedDictionaryCore -> children
-      _ -> gentleForm children
+dictionaryOperandForm children = NativeScan $ \s ->
+    case scanPurpose s of
+      CheckScopedDictionaryCore -> runNativeScan children s
+      _ -> runNativeScan (gentleForm children) s
 
 -- | A selector carries a receiver. A dictionary binder only scopes its body.
 scopedDictionaryForm :: Maybe Id -> NativeScan -> NativeScan
-scopedDictionaryForm receiver children = NativeScan $ do
-    purpose <- gets scanPurpose
-    case purpose of
-      CheckScopedDictionaryCore -> runNativeScan children
-      CheckDepFunUnfolding -> runNativeScan children
+scopedDictionaryForm receiver children = NativeScan $ \s ->
+    case scanPurpose s of
+      CheckScopedDictionaryCore -> runNativeScan children s
+      CheckDepFunUnfolding -> runNativeScan children s
       FindScopedSelectorReceiver target
-        | receiver /= Just target -> runNativeScan children
-      _ -> pure True
+        | receiver /= Just target -> runNativeScan children s
+      _ -> ScanRes True s
 
 -- | Exclude shape diagnostics from the scan for actual dictionary forms.
 unsupportedShape :: Bool -> NativeScan
-unsupportedShape invalid = NativeScan $ do
-    purpose <- gets scanPurpose
-    pure $ case purpose of
-      DetectScopedDictionaries -> False
-      FindScopedSelectorReceiver{} -> False
-      _ -> invalid
+unsupportedShape invalid = NativeScan $ \s ->
+    case scanPurpose s of
+      DetectScopedDictionaries -> ScanRes False s
+      FindScopedSelectorReceiver{} -> ScanRes False s
+      _ -> ScanRes invalid s
 
 -- | Detect an erased form and check its children at each supported use.
 erasedForm :: NativeScan -> NativeScan
-erasedForm children = NativeScan $ do
-    purpose <- gets scanPurpose
-    case purpose of
-        DetectNative -> pure True
-        CheckScopedDictionaryCore -> pure True
-        _ -> runNativeScan children
+erasedForm children = NativeScan $ \s ->
+    case scanPurpose s of
+        DetectNative -> ScanRes True s
+        CheckScopedDictionaryCore -> ScanRes True s
+        _ -> runNativeScan children s
 
 -- | Report an unsupported compiler operation when a scan finds a native type.
 rejectNative :: String -> Bool -> IO ()
@@ -418,19 +423,17 @@ rejectNative context found =
 -- | Inspect expression annotations. Pipeline selection also checks the source
 -- tag of imported unfoldings. The tag is available before the template.
 scanExpr :: CoreExpr -> NativeScan
-scanExpr (Var v) = scanAnnotations v <> NativeScan (do
-    purpose <- gets scanPurpose
-    metadata <- gets scanMetadata
-    pure $ case purpose of
-      DetectNative -> metadata == AllMetadata && isGlobalId v
+scanExpr (Var v) = scanAnnotations v <> NativeScan (\s ->
+    ScanRes (case scanPurpose s of
+      DetectNative -> scanMetadata s == AllMetadata && isGlobalId v
                       && isRetainedUserUnfolding (realIdUnfolding v)
-      _ -> False)
+      _ -> False) s)
 scanExpr (Lit lit) = scanType (literalType lit)
 scanExpr (App fun arg) = scanExpr fun <> scanExpr arg
 scanExpr (Lam b body) = scanBinder b <> scanExpr body
 scanExpr (Let bind body) = scanBind bind <> scanExpr body
 scanExpr (Case scrut b result alts) =
-    scanExpr scrut <> scanBinder b <> scanType result <> foldMap scanAlt alts
+    scanExpr scrut <> scanBinder b <> scanType result <> scanList scanAlt alts
 scanExpr (Pack schema witness payload) =
     erasedForm (scanType schema <> scanType witness <> scanExpr payload)
 scanExpr (Unpack witness payload package body) =
@@ -443,7 +446,7 @@ scanExpr (Coercion co) = scanCo co
 -- | Inspect binding annotations, metadata, and right-hand sides.
 scanBind :: CoreBind -> NativeScan
 scanBind (NonRec b rhs) = scanBinder b <> scanExpr rhs
-scanBind (Rec pairs) = foldMap (\(b, rhs) -> scanBinder b <> scanExpr rhs) pairs
+scanBind (Rec pairs) = scanList (\(b, rhs) -> scanBinder b <> scanExpr rhs) pairs
 
 -- | Inspect a case alternative and its binders.
 scanAlt :: CoreAlt -> NativeScan
@@ -451,7 +454,7 @@ scanAlt alt@(Alt con bs rhs)
     | isNativeIndexAliasAlt alt || isNativeIndexAlt alt = gentleForm children
     | otherwise = children
   where
-    children = scanAltCon con <> foldMap scanBinder bs <> scanExpr rhs
+    children = scanAltCon con <> scanList scanBinder bs <> scanExpr rhs
 
 -- | Inspect the type of a case alternative constructor.
 scanAltCon :: AltCon -> NativeScan
@@ -461,74 +464,68 @@ scanAltCon (DataAlt con) = scanType (dataConRepType con)
 
 -- | Inspect annotations on breakpoint variables.
 scanTick :: CoreTickish -> NativeScan
-scanTick (Breakpoint _ _ ids) = foldMap scanAnnotations ids
+scanTick (Breakpoint _ _ ids) = scanList scanAnnotations ids
 scanTick _ = mempty
 
 -- | Inspect a variable's type and multiplicity.
 scanAnnotations :: Var -> NativeScan
-scanAnnotations v = scanType (varType v) <> foldMap scanType (varMultMaybe v)
+scanAnnotations v = scanType (varType v) <> maybe mempty scanType (varMultMaybe v)
 
 -- | Inspect bound-identifier metadata once per identifier.
 scanBinder :: Var -> NativeScan
 scanBinder v =
     scanAnnotations v
         <> NativeScan
-            ( do
-                seen <- gets scannedMetadata
-                metadata <- gets scanMetadata
-                if metadata == NoMetadata || not (isNonCoVarId v) || v `elemVarSet` seen
-                    then pure False
-                    else do
-                        modify' (\s -> s{scannedMetadata = extendVarSet seen v})
-                        purpose <- gets scanPurpose
-                        let rules = idCoreRules v
-                        case purpose of
-                            CheckGentle | not (null rules) -> pure True
-                            CheckUserRules | not (all (supportsLocalUserRule v) rules) -> pure True
-                            _ -> runNativeScan (foldMap scanRule rules <> scanUnfolding (realIdUnfolding v))
+            ( \s ->
+                let seen = scannedMetadata s
+                    metadata = scanMetadata s
+                in if metadata == NoMetadata || not (isNonCoVarId v) || v `elemVarSet` seen
+                    then ScanRes False s
+                    else
+                        let !s' = s{scannedMetadata = extendVarSet seen v}
+                            rules = idCoreRules v
+                        in case scanPurpose s' of
+                            CheckGentle | not (null rules) -> ScanRes True s'
+                            CheckUserRules | not (all (supportsLocalUserRule v) rules) -> ScanRes True s'
+                            _ -> runNativeScan (scanList scanRule rules <> scanUnfolding (realIdUnfolding v)) s'
             )
 
 -- | Inspect the declarative part of a rule.
 scanRule :: CoreRule -> NativeScan
 scanRule BuiltinRule{} = mempty
 scanRule (Rule{ru_bndrs = bs, ru_args = args, ru_rhs = rhs}) =
-    foldMap scanBinder bs <> foldMap scanExpr args <> scanExpr rhs
+    scanList scanBinder bs <> scanList scanExpr args <> scanExpr rhs
 
 -- | Inspect an unfolding attached to a bound identifier.
 scanUnfolding :: Unfolding -> NativeScan
 scanUnfolding NoUnfolding = mempty
 scanUnfolding BootUnfolding = mempty
-scanUnfolding (OtherCon cons) = foldMap scanAltCon cons
+scanUnfolding (OtherCon cons) = scanList scanAltCon cons
 scanUnfolding (DFunUnfolding{df_bndrs = bs, df_con = con, df_args = args}) =
-    foldMap scanBinder bs <> scanType (dataConRepType con) <> foldMap scanExpr args
-scanUnfolding (CoreUnfolding{uf_src = src, uf_tmpl = body}) = NativeScan $ do
-    metadata <- gets scanMetadata
-    if metadata == AllMetadata || isStableSource src
-        then runNativeScan (scanExpr body)
-        else pure False
+    scanList scanBinder bs <> scanType (dataConRepType con) <> scanList scanExpr args
+scanUnfolding (CoreUnfolding{uf_src = src, uf_tmpl = body}) = NativeScan $ \s ->
+    if scanMetadata s == AllMetadata || isStableSource src
+        then runNativeScan (scanExpr body) s
+        else ScanRes False s
 
 -- | Inspect a referenced variable's annotations once.
 scanVarKind :: Var -> NativeScan
-scanVarKind v = NativeScan $ do
-    seen <- gets scannedKinds
-    if v `elemVarSet` seen
-        then pure False
-        else do
-            modify' (\s -> s{scannedKinds = extendVarSet seen v})
-            runNativeScan (scanAnnotations v)
+scanVarKind v = NativeScan $ \s ->
+    let seen = scannedKinds s
+    in if v `elemVarSet` seen
+        then ScanRes False s
+        else runNativeScan (scanAnnotations v) (s{scannedKinds = extendVarSet seen v})
 
 -- | Inspect each synonym body once. Application arguments are scanned separately.
 -- Substitution can add native forms only through those arguments.
 -- Inspect the uninstantiated body to avoid duplicating argument scans.
 scanSynonym :: TyCon -> NativeScan
 scanSynonym tc
-    | Just rhs <- synTyConRhs_maybe tc = NativeScan $ do
-        seen <- gets scannedSynonyms
-        if tc `elemTyConSet` seen
-            then pure False
-            else do
-                modify' (\s -> s{scannedSynonyms = extendTyConSet seen tc})
-                runNativeScan (scanType rhs)
+    | Just rhs <- synTyConRhs_maybe tc = NativeScan $ \s ->
+        let seen = scannedSynonyms s
+        in if tc `elemTyConSet` seen
+            then ScanRes False s
+            else runNativeScan (scanType rhs) (s{scannedSynonyms = extendTyConSet seen tc})
     | otherwise = mempty
 
 -- | Inspect syntax and synonym bodies, including unused synonym arguments.
@@ -539,7 +536,7 @@ scanType (DepDictTy dict body) =
 scanType (ClassAppTy _ inst (TermVarTy dict) arg@(TermVarTy receiver) kind) =
     scopedDictionaryForm (Just receiver) (unsupportedShape (not (isNativeClassDictionaryId dict))
                           <> scanAnnotations dict <> scanType inst <> scanType arg <> scanType kind)
-scanType ClassAppTy{} = NativeScan (pure True)
+scanType ClassAppTy{} = NativeScan (ScanRes True)
 scanType (TyVarTy tv) = scanVarKind tv
 scanType (TermVarTy v) =
     dictionaryOperandForm
@@ -551,7 +548,7 @@ scanType (ExistsTy _ binder body) = erasedForm (scanType (varType binder) <> sca
 scanType (DepFunTy _ b body) =
     dictionaryOperandForm (scanRetainedIndex b <> scanType body)
 scanType (LitTy _) = mempty
-scanType (TyConApp tc args) = foldMap scanType args <> scanSynonym tc
+scanType (TyConApp tc args) = scanList scanType args <> scanSynonym tc
 scanType (AppTy fun arg) = scanType fun <> scanType arg
 scanType (FunTy _ ma mult arg res) =
     scanType ma <> scanType arg <> scanType mult <> scanType res
@@ -563,11 +560,10 @@ scanType (CoercionTy co) = scanCo co
 -- | Apply the retained binder checks, including Note [Abstract witness domains]
 -- in GHC.Core.Type.
 scanRetainedIndex :: Var -> NativeScan
-scanRetainedIndex v = NativeScan $ do
-    purpose <- gets scanPurpose
-    runNativeScan $ case purpose of
-      FindScopedSelectorReceiver{} -> scanAnnotations v
-      _ -> unsupportedShape (not (isNativeRetainedBinder v))
+scanRetainedIndex v = NativeScan $ \s ->
+    case scanPurpose s of
+      FindScopedSelectorReceiver{} -> runNativeScan (scanAnnotations v) s
+      _ -> runNativeScan (unsupportedShape (not (isNativeRetainedBinder v))) s
 
 -- | Check the head and its annotation without examining the function body.
 scanCallHead :: Id -> NativeScan
@@ -597,21 +593,20 @@ scanCo (DepFunCo _ _ b domain body) =
           <> scanCo delta
       where
         target = coercionRKind delta
-scanCo (TermAppCo f co) = NativeScan $ do
-    purpose <- gets scanPurpose
-    case purpose of
-      CheckDepFunUnfolding -> pure True
-      _ -> runNativeScan (gentleForm (scanCallHead f <> scanCo co))
+scanCo (TermAppCo f co) = NativeScan $ \s ->
+    case scanPurpose s of
+      CheckDepFunUnfolding -> ScanRes True s
+      _ -> runNativeScan (gentleForm (scanCallHead f <> scanCo co)) s
 scanCo (Refl ty) = scanType ty
 scanCo (GRefl _ ty mco) = scanType ty <> scanMCo mco
-scanCo (TyConAppCo _ _ args) = foldMap scanCo args
+scanCo (TyConAppCo _ _ args) = scanList scanCo args
 scanCo (AppCo fun arg) = scanCo fun <> scanCo arg
 scanCo (CoVarCo cv) = scanVarKind cv
 scanCo (AxiomCo rule args)
     -- The proof binds the witness on both sides. Check its argument before
     -- optimization. See Note [Lifting under an erased existential] in GHC.Core.Coercion.
-    | isExistsCoRule rule = gentleForm (foldMap scanCo args)
-    | otherwise = foldMap scanCo args
+    | isExistsCoRule rule = gentleForm (scanList scanCo args)
+    | otherwise = scanList scanCo args
 scanCo (HoleCo hole) = scanVarKind (coHoleCoVar hole)
 scanCo (SymCo co) = scanCo co
 scanCo (TransCo left right) = scanCo left <> scanCo right
@@ -636,5 +631,5 @@ scanMCo (MCo co) = scanCo co
 scanDeps :: UnivCoDeps -> NativeScan
 scanDeps NoUnivCoDeps = mempty
 scanDeps (UnivCoDeps{ucd_cvs = cvs, ucd_holes = holes}) =
-    foldMap scanVarKind (dVarSetElems cvs)
-        <> foldMap (scanVarKind . coHoleCoVar) (uniqDSetToList holes)
+    scanList scanVarKind (dVarSetElems cvs)
+        <> scanList (scanVarKind . coHoleCoVar) (uniqDSetToList holes)

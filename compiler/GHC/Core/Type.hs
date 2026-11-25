@@ -2791,24 +2791,37 @@ retainedDataConBinderFlags dc =
 
 -- | Collect 'InferredSpec' flags of 'DepFunInvisible' binders in preorder.
 inferredRetainedBinderFlags :: Type -> [Bool]
-inferredRetainedBinderFlags = go
+inferredRetainedBinderFlags ty0 = go ty0 []
   where
-    go (DepFunTy vis b body) =
-      [isInferredRetainedBinder b | vis == DepFunInvisible]
-      ++ go (idMult b) ++ go (varType b) ++ go body
-    go (ForAllTy ma (Bndr v _) body) = go ma ++ go (varType v) ++ go body
-    go (FunTy _ ma mult arg res) = go ma ++ go mult ++ go arg ++ go res
-    go (AppTy f a) = go f ++ go a
-    go (TyConApp _ tys) = concatMap go tys
-    go (CastTy ty _) = go ty
-    go (ExistsTy _ v body) = go (varType v) ++ go body
-    go (DepDictTy v body) = go (varType v) ++ go body
-    go _ = []
+    go (DepFunTy vis b body) acc =
+      let rest = go (idMult b) (go (varType b) (go body acc))
+      in if vis == DepFunInvisible then isInferredRetainedBinder b : rest else rest
+    go (ForAllTy ma (Bndr v _) body) acc = go ma (go (varType v) (go body acc))
+    go (FunTy _ ma mult arg res) acc = go ma (go mult (go arg (go res acc)))
+    go (AppTy f a) acc = go f (go a acc)
+    go (TyConApp _ tys) acc = foldr go acc tys
+    go (CastTy ty _) acc = go ty acc
+    go (ExistsTy _ v body) acc = go (varType v) (go body acc)
+    go (DepDictTy v body) acc = go (varType v) (go body acc)
+    go _ acc = acc
 
 -- | Restore 'InferredSpec' flags onto 'DepFunInvisible' binders in preorder.
 applyInferredRetainedBinderFlags :: [Bool] -> Type -> ([Bool], Type)
 applyInferredRetainedBinderFlags flags0 ty0 = go flags0 ty0
   where
+    has_dep_fun (DepFunTy {}) = True
+    has_dep_fun (ForAllTy ma (Bndr v _) body) =
+      has_dep_fun ma || has_dep_fun (varType v) || has_dep_fun body
+    has_dep_fun (FunTy _ ma mult arg res) =
+      has_dep_fun ma || has_dep_fun mult || has_dep_fun arg || has_dep_fun res
+    has_dep_fun (AppTy f a) = has_dep_fun f || has_dep_fun a
+    has_dep_fun (TyConApp _ tys) = any has_dep_fun tys
+    has_dep_fun (CastTy ty _) = has_dep_fun ty
+    has_dep_fun (ExistsTy _ v body) = has_dep_fun (varType v) || has_dep_fun body
+    has_dep_fun (DepDictTy v body) = has_dep_fun (varType v) || has_dep_fun body
+    has_dep_fun _ = False
+
+    go flags ty | not (has_dep_fun ty) = (flags, ty)
     go flags (DepFunTy vis b body) =
       let (flags1, b_flag) = case (vis, flags) of
             (DepFunInvisible, f : fs) -> (fs, f)
@@ -2860,8 +2873,55 @@ applyInferredRetainedBinderFlags flags0 ty0 = go flags0 ty0
 
 -- | Replace occurrences of a provisional 'TermVarTy' binder inside a 'Type'.
 replaceTermVarInType :: Id -> Type -> Type -> Type
-replaceTermVarInType target replacement = go
+replaceTermVarInType target replacement ty0
+  | not (mentions ty0) = ty0
+  | otherwise          = go ty0
   where
+    mentions (TermVarTy v)             = v == target || mentions_id v
+    mentions (TermAppTy v arg)         = v == target || mentions_id v || mentions arg
+    mentions (ClassAppTy _ inst dict arg kind)
+      = mentions inst || mentions dict || mentions arg || mentions kind
+    mentions (DepFunTy _ b body)       = b /= target && (mentions_id b || mentions body)
+    mentions (DepDictTy d body)        = d /= target && (mentions_id d || mentions body)
+    mentions (ExistsTy _ v body)       = mentions (varType v) || mentions body
+    mentions (ForAllTy ma (Bndr v _) body)
+      = mentions ma || mentions (varType v) || mentions body
+    mentions (FunTy _ ma mult arg res)
+      = mentions ma || mentions mult || mentions arg || mentions res
+    mentions (AppTy f a)               = mentions f || mentions a
+    mentions (TyConApp _ tys)          = any mentions tys
+    mentions (CastTy ty co)            = mentions ty || mentions_co co
+    mentions (CoercionTy co)           = mentions_co co
+    mentions TyVarTy{}                 = False
+    mentions LitTy{}                   = False
+
+    mentions_id v = mentions (varType v) || mentions (idMult v)
+
+    mentions_mco MRefl   = False
+    mentions_mco (MCo c) = mentions_co c
+
+    mentions_co (Refl ty)              = mentions ty
+    mentions_co (GRefl _ ty mco)       = mentions ty || mentions_mco mco
+    mentions_co (TyConAppCo _ _ cos)   = any mentions_co cos
+    mentions_co (AppCo c1 c2)          = mentions_co c1 || mentions_co c2
+    mentions_co (TermAppCo v c)        = mentions_id v || mentions_co c
+    mentions_co (ForAllCo { fco_tcv = v, fco_ma = ma, fco_kind = kc, fco_body = bc })
+      = mentions (varType v) || mentions_co ma || mentions_mco kc || mentions_co bc
+    mentions_co (DepFunCo _ _ b kc bc) = mentions_id b || mentions_mco kc || mentions_co bc
+    mentions_co (FunCo _ _ _ mc wc c1 c2)
+      = mentions_co mc || mentions_co wc || mentions_co c1 || mentions_co c2
+    mentions_co (CoVarCo cv)           = mentions (varType cv)
+    mentions_co (AxiomCo _ cos)        = any mentions_co cos
+    mentions_co (UnivCo { uco_lty = t1, uco_rty = t2 }) = mentions t1 || mentions t2
+    mentions_co (SymCo c)              = mentions_co c
+    mentions_co (TransCo c1 c2)        = mentions_co c1 || mentions_co c2
+    mentions_co (SelCo _ c)            = mentions_co c
+    mentions_co (LRCo _ c)             = mentions_co c
+    mentions_co (InstCo c1 c2)         = mentions_co c1 || mentions_co c2
+    mentions_co (KindCo c)             = mentions_co c
+    mentions_co (SubCo c)              = mentions_co c
+    mentions_co HoleCo{}               = False
+
     go (TermVarTy v)
       | v == target = replacement
       | otherwise   = TermVarTy (go_id v)
@@ -2877,9 +2937,9 @@ replaceTermVarInType target replacement = go
       | d == target = DepDictTy d body
       | otherwise   = DepDictTy (go_id d) (go body)
     go (ExistsTy flag v body)
-      = ExistsTy flag (setVarType v (go (varType v))) (go body)
+      = ExistsTy flag (go_tcv v) (go body)
     go (ForAllTy ma (Bndr v flag) body)
-      = ForAllTy (go ma) (Bndr (setVarType v (go (varType v))) flag) (go body)
+      = ForAllTy (go ma) (Bndr (go_tcv v) flag) (go body)
     go (FunTy af ma mult arg res)
       = FunTy af (go ma) (go mult) (go arg) (go res)
     go (AppTy f a) = mkAppTy (go f) (go a)
@@ -2889,25 +2949,32 @@ replaceTermVarInType target replacement = go
     go ty@TyVarTy{} = ty
     go ty@LitTy{} = ty
 
-    go_id v = setIdMult (setVarType v (go (varType v))) (go (idMult v))
+    go_id v
+      | not (mentions_id v) = v
+      | otherwise           = setIdMult (setVarType v (go (varType v))) (go (idMult v))
+
+    go_tcv v
+      | not (mentions (varType v)) = v
+      | otherwise                  = setVarType v (go (varType v))
 
     go_mco MRefl = MRefl
     go_mco (MCo c) = MCo (go_co c)
 
+    go_co co | not (mentions_co co) = co
     go_co (Refl ty) = Refl (go ty)
     go_co (GRefl r ty mco) = GRefl r (go ty) (go_mco mco)
     go_co (TyConAppCo r tc cos) = TyConAppCo r tc (map go_co cos)
     go_co (AppCo c1 c2) = AppCo (go_co c1) (go_co c2)
     go_co (TermAppCo v c) = TermAppCo (go_id v) (go_co c)
     go_co (ForAllCo { fco_tcv = v, fco_visL = vl, fco_visR = vr, fco_ma = ma, fco_kind = kc, fco_body = bc })
-      = ForAllCo { fco_tcv = setVarType v (go (varType v))
+      = ForAllCo { fco_tcv = go_tcv v
                  , fco_visL = vl, fco_visR = vr
                  , fco_ma = go_co ma, fco_kind = go_mco kc, fco_body = go_co bc }
     go_co (DepFunCo vl vr b kc bc)
       = DepFunCo vl vr (go_id b) (go_mco kc) (go_co bc)
     go_co (FunCo r af1 af2 mc wc c1 c2)
       = FunCo r af1 af2 (go_co mc) (go_co wc) (go_co c1) (go_co c2)
-    go_co (CoVarCo cv) = CoVarCo (setVarType cv (go (varType cv)))
+    go_co (CoVarCo cv) = CoVarCo (go_tcv cv)
     go_co (AxiomCo ax cos) = AxiomCo ax (map go_co cos)
     go_co (UnivCo { uco_prov = p, uco_role = r, uco_lty = t1, uco_rty = t2, uco_deps = ds })
       = UnivCo { uco_prov = p, uco_role = r, uco_lty = go t1, uco_rty = go t2, uco_deps = ds }

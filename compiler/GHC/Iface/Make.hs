@@ -420,7 +420,7 @@ mkIface_ hsc_env
              fields0
     let inferred_retained =
           [ (nm, flags)
-          | thing <- typeEnvElts type_env
+          | thing <- entities
           , isExternalName (getName thing)
           , (nm, flags) <- case thing of
               AnId v -> [(getName thing, inferredRetainedBinderFlags (varType v))]

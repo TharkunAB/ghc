@@ -2686,33 +2686,45 @@ nativeSourceCallIndex expr
 -- See Note [Source calls in retained arguments].
 nativeComputedIndex :: CoreExpr -> Maybe Type
 nativeComputedIndex expr
-  | has_computation expr = snd <$> computedIndexExpr expr
+  | hasComputedIndexSyntax expr = snd <$> computedIndexExpr expr
+  | otherwise = lexicalCallCaseIndex expr
+
+hasComputedIndexSyntax :: CoreExpr -> Bool
+hasComputedIndexSyntax (Tick HpcTick{} _) = True
+hasComputedIndexSyntax (Cast body _) = hasComputedIndexSyntax body
+hasComputedIndexSyntax expr = case collectArgs expr of
+  (Var fun, args@(_ : _)) ->
+    isJust (sourceTableId_maybe fun) || any hasComputedIndexSyntax args
+  _ -> False
+
+lexicalCallCaseIndex :: CoreExpr -> Maybe Type
+lexicalCallCaseIndex expr
   | App (Var _) _ <- expr
   , Just index <- exprToNativeCaseIndex expr
   , Just{} <- nativeCallSpine_maybe index
   = Just index
   | otherwise = Nothing
-  where
-    has_computation (Tick HpcTick{} _) = True
-    has_computation (Cast body _) = has_computation body
-    has_computation expr = case collectArgs expr of
-      (Var fun, args@(_ : _)) ->
-        isJust (sourceTableId_maybe fun) || any has_computation args
-      _ -> False
 
 -- | Recover the index of an operand whose tree can stay intact until STG erasure.
 -- See Note [Naming computed retained arguments at erasure] in GHC.CoreToStg.Prep.
 nativeDeferredArgIndex :: CoreExpr -> Maybe Type
 nativeDeferredArgIndex e
+  | hasComputedIndexSyntax e
+  = case computedIndexExpr e of
+      Just (_, index) -> Just index
+      Nothing         -> deferred_fallback
   | containsIndexedOperand (\con -> isJust (nativeIndexedOperandSignature_maybe con)
                                  || isNativeDataFamilyCon con) e
   , Just (_, index) <- computedIndexExpr e
   = Just index
-  | Just index <- nativeComputedIndex e = Just index
-  | (_, args) <- collectArgs e
-  , any isValArg args
-  , Just index <- nativeSourceFunctionArgIndex e = Just index
-  | otherwise = nativeClassSelectorIndex e
+  | Just index <- lexicalCallCaseIndex e = Just index
+  | otherwise = deferred_fallback
+  where
+    deferred_fallback
+      | (_, args) <- collectArgs e
+      , any isValArg args
+      , Just index <- nativeSourceFunctionArgIndex e = Just index
+      | otherwise = nativeClassSelectorIndex e
 
 -- | Reuse structural constructor checks with checked nominal casts, without beta conversion.
 computedIndexExpr :: CoreExpr -> Maybe (CoreExpr, Type)

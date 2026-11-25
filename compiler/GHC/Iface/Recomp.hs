@@ -65,7 +65,7 @@ import GHC.Utils.Constants (debugIsOn)
 import GHC.Types.Annotations
 import GHC.Types.Avail
 import GHC.Types.Basic ( ImportLevel(..), SourceTableOrigin(FinalCoreSourceTable), TupleSort(BoxedTuple) )
-import GHC.Types.Var (VarBndr(Bndr), ForAllTyFlag(Inferred, Invisible, Required))
+import GHC.Types.Var (VarBndr(Bndr))
 import GHC.Types.TyThing (TyThing(ATyCon))
 import GHC.Types.UnresolvedImport
 import GHC.Types.Name
@@ -88,7 +88,6 @@ import GHC.Unit.Module.Deps
 
 import Control.Monad
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.State
 import Data.List (find, isPrefixOf, isSuffixOf, sortBy, sort, sortOn)
 import qualified Data.Map as Map
@@ -619,9 +618,13 @@ checkFlagHash hsc_env iface self_recomp = do
         append_fps = [append_fp, stamp_rules append_fp]
         reverse_fps = [reverse_fp, stamp_rules reverse_fp]
         source_provider = checkedSourceProvider (mi_module iface)
+        iface_decls = map snd (mi_decls iface)
+        ext_fields = getExtensibleFields (mi_ext_fields iface)
+        is_src_file = mi_hsc_src iface == HsSrcFile
+        semantic_mod = mi_semantic_module iface
+        exports = mi_exports iface
         -- See Note [Recompiling nullary closed arrow families].
-        nullary_candidate = mi_hsc_src iface == HsSrcFile &&
-                           couldInferNullaryClosedMatchability (map snd (mi_decls iface))
+        nullary_candidate = is_src_file && couldInferNullaryClosedMatchability iface_decls
         list_fps = [reverse_fp, fold_fp, fold_method_fp, monomorphic_fold_fp, guarded_pair_fp]
         nullary_base_fps = new_fp : list_fps
                         ++ [stamp fp | Just (stamp, _) <- [source_provider], fp <- list_fps]
@@ -673,7 +676,9 @@ checkFlagHash hsc_env iface self_recomp = do
           | stored_fp == retainedSignatureCaseFingerprint (stamp_rules new_fp) = (new_fp, False, False, False, False, True)
           | otherwise = (stored_fp, False, False, False, False, False)
         dflags = hsc_dflags hsc_env
-        final_possible = backendGeneratesCode (backend dflags) && couldExportCallbackCase iface
+        generates_code = backendGeneratesCode (backend dflags)
+        one_shot = isOneShot (ghcMode dflags)
+        final_possible = generates_code && couldExportCallbackCase iface
         candidates = exportedCaseDatatypes iface
         recheck reason = out_of_date_hash logger (CustomReason reason)
                            (text reason) old_fp new_fp
@@ -698,8 +703,8 @@ checkFlagHash hsc_env iface self_recomp = do
        | old_fp `elem` archived, couldInferClosedMatchability iface
          -> recheck "Compiler now infers closed-family matchability"
        | old_fp `elem` (open_matchability_fp : closed_matchability_fp : archived)
-       , backendGeneratesCode (backend dflags)
-       , mi_hsc_src iface == HsSrcFile
+       , generates_code
+       , is_src_file
        , couldExportReadbackRecipe iface
          -> recheck "Compiler now emits native pair readback recipes"
        | old_fp == open_matchability_fp
@@ -767,7 +772,7 @@ checkFlagHash hsc_env iface self_recomp = do
     ordered <- case previous of
       UpToDate
         | old_fp `notElem` (class_generations ++ [staged_fp, previous_fp, ordered_fp])
-        , mi_hsc_src iface == HsSrcFile
+        , is_src_file
         , couldExportOrderedTypeCase iface ->
             liftIO $ recheck "Compiler now checks type case constructor order"
       _ -> pure previous
@@ -775,96 +780,68 @@ checkFlagHash hsc_env iface self_recomp = do
       UpToDate | old_fp `notElem` class_generations, couldInferClassDefaultSelector iface ->
         liftIO $ recheck "Compiler now infers matchability for associated type defaults"
       _ -> pure ordered
-    let check_identity
+    let check_source_sig sig reason = do
+          candidate <- couldExportSourceDecls one_shot iface iface_decls sig
+          if candidate
+            then liftIO $ recheck reason
+            else pure UpToDate
+        check_identity
           | old_fp `notElem` [new_fp, identity_base_fp, scoped_identity_fp]
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface PolymorphicIdentity
-              if candidate
-                then liftIO $ recheck "Compiler now checks polymorphic identity equations"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig PolymorphicIdentity "Compiler now checks polymorphic identity equations"
           | otherwise = pure UpToDate
         check_guarded_filter
           | old_fp `notElem` guarded_fps
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface GuardedListFilter
-              if candidate
-                then liftIO $ recheck "Compiler now checks guarded list filters"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig GuardedListFilter "Compiler now checks guarded list filters"
           | otherwise = pure UpToDate
         check_append
           | not checked_append
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface ListAppend
-              if candidate
-                then liftIO $ recheck "Compiler now checks list append equations"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig ListAppend "Compiler now checks list append equations"
           | otherwise = pure UpToDate
         check_reverse
           | not checked_reverse
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              -- An exported accumulator worker has the same signature as append.
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface ListAppend
-              if candidate
-                then liftIO $ recheck "Compiler now checks list reverse equations"
-                else pure UpToDate
+          , generates_code, is_src_file
+          -- An exported accumulator worker has the same signature as append.
+          = check_source_sig ListAppend "Compiler now checks list reverse equations"
           | otherwise = pure UpToDate
         check_source_provider
           | isNothing provider_stamp
           , Just (_, reason) <- source_provider
-          , mi_hsc_src iface == HsSrcFile
-          , backendGeneratesCode (backend dflags) = liftIO $ recheck reason
+          , is_src_file, generates_code = liftIO $ recheck reason
           | otherwise = pure UpToDate
         check_fold
           | not checked_fold
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface ListFold
-              if candidate
-                then liftIO $ recheck "Compiler now checks right list fold equations"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig ListFold "Compiler now checks right list fold equations"
           | otherwise = pure UpToDate
         check_fold_method
           | not checked_fold_method
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface ListFoldMethod
-              if candidate
-                then liftIO $ recheck "Compiler now checks right list fold method fields"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig ListFoldMethod "Compiler now checks right list fold method fields"
           | otherwise = pure UpToDate
         check_monomorphic_fold
           | stored_fp `notElem` monomorphic_fold_fps
           , stored_fp `notElem` retained_monomorphic_fold_fps
           , stored_fp `notElem` guarded_pair_fps
           , stored_fp `notElem` retained_guarded_pair_fps
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface MonomorphicListFold
-              if candidate
-                then liftIO $ recheck "Compiler now checks monomorphic right list fold equations"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig MonomorphicListFold "Compiler now checks monomorphic right list fold equations"
           | otherwise = pure UpToDate
         check_guarded_pair
           | stored_fp `notElem` guarded_pair_fps
           , stored_fp `notElem` retained_guarded_pair_fps
-          , backendGeneratesCode (backend dflags)
-          , mi_hsc_src iface == HsSrcFile = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface GuardedListPair
-              if candidate
-                then liftIO $ recheck "Compiler now checks lazy guarded list pairs"
-                else pure UpToDate
+          , generates_code, is_src_file
+          = check_source_sig GuardedListPair "Compiler now checks lazy guarded list pairs"
           | otherwise = pure UpToDate
         check_retained_case
-          | mi_hsc_src iface == HsSrcFile = do
+          | is_src_file = do
               reviewed <- liftIO $ readField retainedCaseReviewField (mi_ext_fields iface)
               let generation = fromMaybe 0 reviewed
               candidate <- if generation >= retainedCaseReviewGeneration
                 then pure False
-                else couldExportRetainedCase generation iface (map snd (mi_decls iface))
+                else couldExportRetainedCase generation iface iface_decls
                        (mi_sr_usages self_recomp)
               if candidate
                 then liftIO $ recheck "Compiler now checks retained package case projections"
@@ -872,21 +849,13 @@ checkFlagHash hsc_env iface self_recomp = do
           | otherwise = pure UpToDate
         check_structural_case
           | checkStructuralCases dflags iface
-          , not (Map.member structuralCasesField (getExtensibleFields (mi_ext_fields iface)))
-          = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface StructuralCase
-              if candidate
-                then liftIO $ recheck "Compiler now checks cases on two structural size operands"
-                else pure UpToDate
+          , not (Map.member structuralCasesField ext_fields)
+          = check_source_sig StructuralCase "Compiler now checks cases on two structural size operands"
           | otherwise = pure UpToDate
         check_size_list_case
           | checkStructuralCases dflags iface
-          , not (Map.member sizeListCasesField (getExtensibleFields (mi_ext_fields iface)))
-          = do
-              candidate <- couldExportSourceSignature (isOneShot (ghcMode dflags)) iface SizeListCase
-              if candidate
-                then liftIO $ recheck "Compiler now checks cases on a structural size and a list"
-                else pure UpToDate
+          , not (Map.member sizeListCasesField ext_fields)
+          = check_source_sig SizeListCase "Compiler now checks cases on a structural size and a list"
           | otherwise = pure UpToDate
         check_family_uses
           | old_fp `elem` (staged_fp : class_generations) = pure UpToDate
@@ -901,39 +870,35 @@ checkFlagHash hsc_env iface self_recomp = do
           | otherwise = pure UpToDate
         check_scoped_case
           | old_fp `notElem` scoped_fps
-          , mi_hsc_src iface == HsSrcFile
+          , is_src_file
           , couldExportScopedTypeCase iface =
               liftIO $ recheck "Compiler now checks dependent type case captures"
           | otherwise = pure UpToDate
         check_binary_enum
           | old_fp `notElem` [new_fp, binary_base_fp]
-          , mi_hsc_src iface == HsSrcFile
+          , is_src_file
           , not (xopt LangExt.ExperimentalDependentTypes dflags)
           , couldExportEnumCallback 2 iface =
               liftIO $ recheck "Compiler now checks ordinary binary enumeration callbacks"
           | otherwise = pure UpToDate
         check_retained_signature
           | not shared_retained_cases
-            || not (Map.member enumCaseClosureField (getExtensibleFields (mi_ext_fields iface)))
-          , mi_hsc_src iface == HsSrcFile
-          , couldExportRetainedSignatureCase (mi_semantic_module iface)
-                                            (mi_exports iface) (map snd (mi_decls iface)) =
+            || not (Map.member enumCaseClosureField ext_fields)
+          , is_src_file
+          , couldExportRetainedSignatureCase semantic_mod exports iface_decls =
               liftIO $ recheck "Compiler now shares retained signature type cases"
           | otherwise = pure UpToDate
         check_ignored_case_fields
-          | mi_hsc_src iface == HsSrcFile
-          , not (Map.member ignoredCaseFields (getExtensibleFields (mi_ext_fields iface)))
-          , couldHaveIgnoredCaseFields (mi_semantic_module iface) (map snd (mi_decls iface))
-          , couldExportRetainedSignatureCase (mi_semantic_module iface)
-                                            (mi_exports iface) (map snd (mi_decls iface)) =
+          | is_src_file
+          , not (Map.member ignoredCaseFields ext_fields)
+          , couldHaveIgnoredCaseFields semantic_mod iface_decls
+          , couldExportRetainedSignatureCase semantic_mod exports iface_decls =
               liftIO $ recheck "Compiler now checks retained signature cases with ignored fields"
           | otherwise = pure UpToDate
         check_ordered_signature_owner
-          | mi_hsc_src iface == HsSrcFile
-          , let owner = mi_semantic_module iface
-                decls = map snd (mi_decls iface)
-          , hasUnscopedSignatureCaseNode owner decls
-          , couldExportRetainedSignatureCase owner (mi_exports iface) decls =
+          | is_src_file
+          , hasUnscopedSignatureCaseNode semantic_mod iface_decls
+          , couldExportRetainedSignatureCase semantic_mod exports iface_decls =
               liftIO $ recheck "Compiler now records owners for ordered signature cases"
           | otherwise = pure UpToDate
         check_nullary_family
@@ -941,35 +906,35 @@ checkFlagHash hsc_env iface self_recomp = do
               liftIO $ recheck "Compiler now infers matchability for nullary family results"
           | otherwise = pure UpToDate
         check_injective_kind
-          | mi_hsc_src iface == HsSrcFile
-          , not (Map.member injectiveKindResultField (getExtensibleFields (mi_ext_fields iface)))
-          , couldInferInjectiveKindResult (map snd (mi_decls iface)) =
+          | is_src_file
+          , not (Map.member injectiveKindResultField ext_fields)
+          , couldInferInjectiveKindResult iface_decls =
               liftIO $ recheck "Compiler now infers matchability for injective kind results"
           | otherwise = pure UpToDate
         check_mapping
-          | mi_hsc_src iface == HsSrcFile
-          , not (Map.member mappingField (getExtensibleFields (mi_ext_fields iface)))
-          , couldSupplyMapping (mi_exports iface) (map snd (mi_decls iface)) =
+          | is_src_file
+          , not (Map.member mappingField ext_fields)
+          , couldSupplyMapping exports iface_decls =
               liftIO $ recheck "Compiler now checks mapping workers and their instance aliases"
-          | mi_hsc_src iface == HsSrcFile
-          , not (Map.member appliedMappingField (getExtensibleFields (mi_ext_fields iface)))
-          , couldSupplyAppliedMapping (map snd (mi_decls iface)) =
+          | is_src_file
+          , not (Map.member appliedMappingField ext_fields)
+          , couldSupplyAppliedMapping iface_decls =
               liftIO $ recheck "Compiler now checks mapping methods for applied receivers"
           | otherwise = pure UpToDate
         check_liberal_synonym
           | xopt LangExt.LiberalTypeSynonyms dflags
-          , not (Map.member liberalSynonymCallbackField (getExtensibleFields (mi_ext_fields iface)))
-          , couldInferLiberalSynonymMatchability (mi_exports iface) (map snd (mi_decls iface)) =
+          , not (Map.member liberalSynonymCallbackField ext_fields)
+          , couldInferLiberalSynonymMatchability exports iface_decls =
               liftIO $ recheck "Compiler now infers matchability for liberal synonym callbacks"
           | otherwise = pure UpToDate
         check_source_proof_branches
-          | not (Map.member sourceProofBranchesField (getExtensibleFields (mi_ext_fields iface)))
-          , couldHaveUncheckedSourceProofBranches dflags (mi_hsc_src iface) (map snd (mi_decls iface)) =
+          | not (Map.member sourceProofBranchesField ext_fields)
+          , couldHaveUncheckedSourceProofBranches dflags (mi_hsc_src iface) iface_decls =
               liftIO $ recheck "Compiler now checks source proof dependencies by family branch"
           | otherwise = pure UpToDate
         check_home_rule_closures
           | checkRuleClosures dflags iface
-          , not (Map.member homeRuleClosuresField (getExtensibleFields (mi_ext_fields iface)))
+          , not (Map.member homeRuleClosuresField ext_fields)
           = do candidate <- usesFinalCoreSourceTable (mi_sr_usages self_recomp)
                if candidate
                  then liftIO $ recheck "Compiler now tracks home rule dependencies for final Core equations"
@@ -1040,11 +1005,14 @@ constructor shapes. A ground instance head can also fix an argument of
 the receiver. An imported synonym can hide those arguments.
 -}
 
+exportNameSet :: [IfaceExport] -> NameSet
+exportNameSet = mkNameSet . concatMap availNames
+
 -- | Identify modules that need a one-time check for mapping evidence.
 couldSupplyMapping :: [IfaceExport] -> [IfaceDecl] -> Bool
 couldSupplyMapping exports decls = any candidate decls
   where
-    exported = mkNameSet (concatMap availNames exports)
+    exported = exportNameSet exports
     arity = mappingTyConArity decls
 
     candidate IfaceId{ifIdDetails = details, ifName = n, ifType = ty} = case details of
@@ -1271,7 +1239,7 @@ retainedSignatureCaseFingerprint fp =
 couldExportRetainedSignatureCase :: Module -> [IfaceExport] -> [IfaceDecl] -> Bool
 couldExportRetainedSignatureCase owner exports = any candidate
   where
-    exported = mkNameSet (concatMap availNames exports)
+    exported = exportNameSet exports
     candidate decl@IfaceId{ifName = name, ifType = ty}
       | name `elemNameSet` exported = containsRetained ty
       where
@@ -1464,7 +1432,7 @@ couldExportReadbackRecipe :: ModIface -> Bool
 couldExportReadbackRecipe iface =
     mi_module iface == gHC_INTERNAL_ERR || any candidate (mi_decls iface)
   where
-    exports = mkNameSet (concatMap availNames (mi_exports iface))
+    exports = exportNameSet (mi_exports iface)
     local_data = mkNameSet [n | (_, IfaceData{ifName = n}) <- mi_decls iface]
 
     candidate (_, IfaceId{ifName = n, ifType = ty}) = n `elemNameSet` exports && outer ty
@@ -1581,7 +1549,7 @@ couldExportRetainedCase :: Word8 -> ModIface_ phase -> [IfaceDecl] -> [Usage] ->
 couldExportRetainedCase reviewed iface decls usages = anyM candidate decls
   where
     exportNames :: ModIface_ p -> NameSet
-    exportNames = mkNameSet . concatMap availNames . mi_exports
+    exportNames = exportNameSet . mi_exports
     exports = exportNames iface
     this_module = mi_semantic_module iface
 
@@ -1999,16 +1967,16 @@ exportedCaseDatatypes iface =
                <- mi_decls iface
            , not (null cons), exported name, all (exported . ifConName) cons ]
   where
-    exports = mkNameSet (concatMap availNames (mi_exports iface))
+    exports = exportNameSet (mi_exports iface)
     exported name = name `elemNameSet` exports
 
 -- | Find exported ordinary signatures that can hide the given number of enumeration arrows.
 couldExportEnumCallback :: Int -> ModIface -> Bool
 couldExportEnumCallback arity iface = any candidate (mi_decls iface)
   where
-    exports = mkNameSet (concatMap availNames (mi_exports iface))
+    exports = exportNameSet (mi_exports iface)
     exported n = n `elemNameSet` exports
-    declarations = [(n, (bndrs, cons)) | (_, IfaceData{ifName = n, ifBinders = bndrs, ifCons = cons}) <- mi_decls iface]
+    declarations = mkNameEnv [(n, (bndrs, cons)) | (_, IfaceData{ifName = n, ifBinders = bndrs, ifCons = cons}) <- mi_decls iface]
     candidate (_, IfaceId{ifName = n, ifType = ty, ifIdDetails = details}) =
       exported n && case details of
         IfSourceTableId{} -> False
@@ -2029,7 +1997,7 @@ couldExportEnumCallback arity iface = any candidate (mi_decls iface)
     enum (IfaceTupleTy BoxedTuple NotPromoted IA_Nil) = True
     enum ty@(IfaceTyConApp tc _) =
       let n = ifaceTyConName tc in
-        case lookup n declarations of
+        case lookupNameEnv declarations n of
           Just ([], IfDataTyCon False cons@(_:_)) ->
             exported n && all (\dc -> exported (ifConName dc) && null (ifConArgTys dc)) cons
           Just _ -> False
@@ -2042,7 +2010,7 @@ couldExportEnumCallback arity iface = any candidate (mi_decls iface)
     enum ty = opaque ty
 
     opaque (IfaceTyConApp tc _) =
-      let n = ifaceTyConName tc in not (isWiredInName n || n `elem` map fst declarations)
+      let n = ifaceTyConName tc in not (isWiredInName n || n `elemNameEnv` declarations)
     opaque IfaceCastTy{} = True
     opaque IfaceAppTy{} = True
     opaque _ = False
@@ -2052,7 +2020,7 @@ couldExportEnumCallback arity iface = any candidate (mi_decls iface)
 couldExportCallbackCase :: ModIface -> Bool
 couldExportCallbackCase iface = any candidate (mi_decls iface)
   where
-    exports = mkNameSet (concatMap availNames (mi_exports iface))
+    exports = exportNameSet (mi_exports iface)
     local_data = mkNameSet [n | (_, IfaceData{ifName = n}) <- mi_decls iface]
     candidate (_, IfaceId{ifIdDetails = IfSourceTableId{}}) = False
     candidate (_, IfaceId{ifName = n, ifType = ty}) = n `elemNameSet` exports && outer ty
@@ -2086,12 +2054,6 @@ data SourceSignature
   = GuardedListFilter | GuardedListPair | PolymorphicIdentity | ListAppend
   | ListFold | ListFoldMethod | MonomorphicListFold | StructuralCase | SizeListCase
 
--- | Check whether an interface signature could supply the requested equation.
--- See Note [Looking through type synonyms for checked source signatures].
-couldExportSourceSignature :: Bool -> ModIface -> SourceSignature -> IfG Bool
-couldExportSourceSignature one_shot iface signature =
-    couldExportSourceDecls one_shot iface (map snd (mi_decls iface)) signature
-
 -- | Classify declarations from either a saved or a newly built interface.
 couldExportSourceDecls :: Bool -> ModIface_ phase -> [IfaceDecl] -> SourceSignature -> IfG Bool
 couldExportSourceDecls one_shot iface declarations signature =
@@ -2099,7 +2061,7 @@ couldExportSourceDecls one_shot iface declarations signature =
       (mkModuleEnv [(this_mod, decl_index declarations)])
   where
     this_mod = mi_semantic_module iface
-    exports = mkNameSet (concatMap availNames (mi_exports iface))
+    exports = exportNameSet (mi_exports iface)
     boot_deps = mkModDeps (dep_boot_mods (mi_deps iface))
     candidate IfaceId{ifName = n, ifType = ty, ifIdDetails = details}
       | ListFoldMethod <- signature = check (fold_dictionary details)
@@ -2384,7 +2346,7 @@ couldExportPairBuilder :: ModIface -> Bool
 couldExportPairBuilder iface =
     any candidate (mi_decls iface)
   where
-    exports = mkNameSet (concatMap availNames (mi_exports iface))
+    exports = exportNameSet (mi_exports iface)
     local_data = mkNameSet [n | (_, IfaceData{ifName = n}) <- mi_decls iface]
     candidate (_, IfaceId{ifName = n, ifType = ty}) = n `elemNameSet` exports && possiblyPair False ty
     candidate _ = False
@@ -3189,23 +3151,25 @@ addFingerprints hsc_env iface0 = do
   --   - the things which can affect whether a module is recompiled
   --   - the module level annotations,
   --   - deps (home and external packages, dependent files)
-  let stamp_retained = couldExportRetainedSignatureCase (mi_semantic_module iface0)
-                        (mi_exports iface0) (mi_decls iface0)
-      stamp_ignored_case_fields = mi_hsc_src iface0 == HsSrcFile && stamp_retained &&
-          couldHaveIgnoredCaseFields (mi_semantic_module iface0) (mi_decls iface0)
-      stamp_nullary = couldInferNullaryClosedMatchability (mi_decls iface0)
-      stamp_injective_kind = mi_hsc_src iface0 == HsSrcFile &&
-                             couldInferInjectiveKindResult (mi_decls iface0)
-      stamp_mapping = mi_hsc_src iface0 == HsSrcFile &&
-                      couldSupplyMapping (mi_exports iface0) (mi_decls iface0)
-      stamp_applied_mapping = mi_hsc_src iface0 == HsSrcFile &&
-                              couldSupplyAppliedMapping (mi_decls iface0)
-      stamp_liberal = xopt LangExt.LiberalTypeSynonyms (hsc_dflags hsc_env)
-                   && couldInferLiberalSynonymMatchability (mi_exports iface0) (mi_decls iface0)
-      stamp_source_proof_branches = couldHaveUncheckedSourceProofBranches (hsc_dflags hsc_env)
-                                      (mi_hsc_src iface0) (mi_decls iface0)
+  let is_src0 = mi_hsc_src iface0 == HsSrcFile
+      decls0 = mi_decls iface0
+      exports0 = mi_exports iface0
+      semantic_mod0 = mi_semantic_module iface0
+      dflags0 = hsc_dflags hsc_env
+      ext_fields0 = getExtensibleFields (mi_ext_fields iface0)
+      stamp_retained = couldExportRetainedSignatureCase semantic_mod0 exports0 decls0
+      stamp_ignored_case_fields = is_src0 && stamp_retained &&
+          couldHaveIgnoredCaseFields semantic_mod0 decls0
+      stamp_nullary = couldInferNullaryClosedMatchability decls0
+      stamp_injective_kind = is_src0 && couldInferInjectiveKindResult decls0
+      stamp_mapping = is_src0 && couldSupplyMapping exports0 decls0
+      stamp_applied_mapping = is_src0 && couldSupplyAppliedMapping decls0
+      stamp_liberal = xopt LangExt.LiberalTypeSynonyms dflags0
+                   && couldInferLiberalSynonymMatchability exports0 decls0
+      stamp_source_proof_branches = couldHaveUncheckedSourceProofBranches dflags0
+                                      (mi_hsc_src iface0) decls0
       iface
-        | mi_hsc_src iface0 == HsSrcFile
+        | is_src0
         , Just info <- mi_self_recomp_info iface0
         , FingerprintWithValue fp flags <- mi_sr_flag_hash info
         , stamp_retained || stamp_nullary =
@@ -3221,7 +3185,7 @@ addFingerprints hsc_env iface0 = do
                          mi_deps iface0)
       checked_fields = [liberalSynonymCallbackField | stamp_liberal]
                     ++ [injectiveKindResultField | stamp_injective_kind]
-                    ++ [enumCaseClosureField | mi_hsc_src iface0 == HsSrcFile, stamp_retained]
+                    ++ [enumCaseClosureField | is_src0, stamp_retained]
                     ++ [ignoredCaseFields | stamp_ignored_case_fields]
                     ++ [mappingField | stamp_mapping]
                     ++ [appliedMappingField | stamp_applied_mapping]
@@ -3230,7 +3194,7 @@ addFingerprints hsc_env iface0 = do
                     ++ [sizeListCasesField | stamp_size_list_cases]
                     ++ [sourceProofBranchesField | stamp_source_proof_branches]
                     ++ [field | (field, _) <- scopedSumDomainFields,
-                           Map.member field (getExtensibleFields (mi_ext_fields iface0))]
+                           Map.member field ext_fields0]
       checked_hash = foldl' (\fp field -> computeFingerprint putNameLiterally (fp, field))
                             base_hash checked_fields
       reviewed_hash
