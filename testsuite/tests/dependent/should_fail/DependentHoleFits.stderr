@@ -1,0 +1,123 @@
+DependentHoleFits.hs:33:26: error: [GHC-88464]
+    • Found hole: _ :: plus n1 p :~: plus n1 p
+      Where:
+    • In an equation for ‘plusAssoc’: plusAssoc Zero _ _ = _
+    • Relevant bindings include
+        plusAssoc :: foreach (m :: Nat)
+                     -> foreach (n :: Nat)
+                        -> foreach (p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
+          (bound at DependentHoleFits.hs:33:1)
+      Constraints include m ~ Zero (from DependentHoleFits.hs:33:1-26)
+      Valid hole fits include
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @(plus n1 p)
+      Valid refinement hole fits include
+        cong (plus n1) (_ :: p :~: p)
+          where cong :: forall {a} {b} {m :: Matchability}.
+                        forall (f :: a %m -> b) ->
+                        forall (x :: a) (y :: a). (x :~: y) -> f x :~: f y
+
+DependentHoleFits.hs:34:26: error: [GHC-88464]
+    • Found hole:
+        _ :: Succ (plus (plus m1 n1) p) :~: Succ (plus m1 (plus n1 p))
+      Where:
+    • In an equation for ‘plusAssoc’: plusAssoc (Succ m) n p = _
+    • Relevant bindings include
+        m :: Nat (bound at DependentHoleFits.hs:34:17)
+        plusAssoc :: foreach (m :: Nat)
+                     -> foreach (n :: Nat)
+                        -> foreach (p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
+          (bound at DependentHoleFits.hs:33:1)
+      Constraints include m ~ Succ m1 (from DependentHoleFits.hs:34:1-26)
+      Valid hole fits include
+        cong Succ (plusAssoc m n1 p)
+          :: Succ (plus (plus m1 n1) p) :~: Succ (plus m1 (plus n1 p))
+        congSucc (plusAssoc m n1 p)
+          :: Succ (plus (plus m1 n1) p) :~: Succ (plus m1 (plus n1 p))
+      Valid refinement hole fits include
+        cong Succ (_ :: plus (plus m1 n1) p :~: plus m1 (plus n1 p))
+          where cong :: forall {a} {b} {m :: Matchability}.
+                        forall (f :: a %m -> b) ->
+                        forall (x :: a) (y :: a). (x :~: y) -> f x :~: f y
+        congSucc (_ :: plus (plus m1 n1) p :~: plus m1 (plus n1 p))
+          where congSucc :: forall (m :: Nat) (n :: Nat).
+                            (m :~: n) -> Succ m :~: Succ n
+          with congSucc @(plus (plus m1 n1) p) @(plus m1 (plus n1 p))
+
+DependentHoleFits.hs:38:23: error: [GHC-88464]
+    • Found hole: _ :: plus m4 n4 :~: plus n4 m4
+      Where:
+    • In an equation for ‘plusCommUnsplit’: plusCommUnsplit m n = _
+    • Relevant bindings include
+        n :: Nat (bound at DependentHoleFits.hs:38:19)
+        m :: Nat (bound at DependentHoleFits.hs:38:17)
+        plusCommUnsplit :: foreach (m :: Nat)
+                           -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at DependentHoleFits.hs:38:1)
+    Suggested fixes:
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘n’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+
+DependentHoleFits.hs:42:17: error: [GHC-88464]
+    • Found hole: _ :: plus m3 Zero :~: m3
+      Where:
+    • In an equation for ‘usePlusZero’: usePlusZero m = _
+    • Relevant bindings include
+        m :: Nat (bound at DependentHoleFits.hs:42:13)
+        usePlusZero :: foreach (m :: Nat) -> plus m Zero :~: m
+          (bound at DependentHoleFits.hs:42:1)
+      Valid hole fits include plusZero m :: plus m3 Zero :~: m3
+      Valid refinement hole fits include
+        plusZero (_ :: Nat)
+          where plusZero :: foreach (m :: Nat) -> plus m Zero :~: m
+
+DependentHoleFits.hs:46:12: error: [GHC-88464]
+    • Found hole: _ :: LE Zero n3
+      Where:
+    • In an equation for ‘leZero’: leZero _ = _
+    • Relevant bindings include
+        leZero :: foreach (n :: Nat) -> LE Zero n
+          (bound at DependentHoleFits.hs:46:1)
+      Valid hole fits include
+        LZ :: forall (n :: Nat). LE Zero n
+          with LZ @n3
+
+DependentHoleFits.hs:49:16: error: [GHC-88464]
+    • Found hole: _ :: LE (Succ m2) (Succ n2)
+      Where:
+    • In an equation for ‘leSucc’: leSucc m n h = _
+    • Relevant bindings include
+        h :: LE m2 n2 (bound at DependentHoleFits.hs:49:12)
+        n :: Nat (bound at DependentHoleFits.hs:49:10)
+        m :: Nat (bound at DependentHoleFits.hs:49:8)
+        leSucc :: foreach (m :: Nat)
+                  -> foreach (n :: Nat) -> LE m n -> LE (Succ m) (Succ n)
+          (bound at DependentHoleFits.hs:49:1)
+      Valid hole fits include LS h :: LE (Succ m2) (Succ n2)
+      Valid refinement hole fits include
+        LS (_ :: LE m2 n2)
+          where LS :: forall (m :: Nat) (n :: Nat).
+                      LE m n -> LE (Succ m) (Succ n)
+          with LS @m2 @n2
+
+DependentHoleFits.hs:63:19: error: [GHC-88464]
+    • Found hole: _ :: SameLen xs xs
+      Where: ‘a’ is a rigid type variable bound by
+               the type signature for:
+                 useSameLen :: forall a b.
+                               foreach (xs :: MyList a) -> MyList b -> SameLen xs xs
+               at DependentHoleFits.hs:62:1-95
+    • In an equation for ‘useSameLen’: useSameLen xs _ = _
+    • Relevant bindings include
+        xs :: MyList a (bound at DependentHoleFits.hs:63:12)
+        useSameLen :: foreach (xs :: MyList a) -> MyList b -> SameLen xs xs
+          (bound at DependentHoleFits.hs:63:1)
+      Valid hole fits include sameLenRefl xs :: SameLen xs xs
+      Valid refinement hole fits include
+        sameLenRefl (_ :: MyList a)
+          where sameLenRefl :: forall a.
+                               foreach (xs :: MyList a) -> SameLen xs xs
+          with sameLenRefl @a
+
