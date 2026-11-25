@@ -66,6 +66,7 @@ import GHC.Prelude hiding ( head, init, last, tail )
 import qualified GHC.Data.Strict as Strict
 
 import GHC.Types.Name.Reader
+import GHC.Utils.Lexeme        ( isLexCon )
 import GHC.Types.Name.Occurrence ( varName, dataName, tcClsName, tvName, occNameFS, occNameString,
                                    mkVarOccFS, emptyOccSet, elemOccSet, extendOccSet )
 import GHC.Types.UnresolvedImport ( ImportDeclOrigin(..) )
@@ -88,6 +89,7 @@ import GHC.Parser.PostProcess.Haddock
 import GHC.Parser.Lexer
 import GHC.Parser.HaddockLex
 import GHC.Parser.Annotation
+import GHC.Parser.Types        ( ExplicitNamespaceKeyword(ExplicitDataNamespace) )
 import GHC.Parser.Errors.Types
 import GHC.Parser.Errors.Ppr ()
 import GHC.Parser.String
@@ -2312,6 +2314,7 @@ ctype   :: { LHsType GhcPs }
         | '\\' type_lambda_binders '->' ctype
                                      {% amsA' (sLL $1 $> $
                                           XHsType (HsTypeLambda (epTok $1, epUniTok $3) $2 $4)) }
+        | 'data' atype               {% mkHsDataHeraldTy (comb2 $1 $>) (epTok $1) $2 }
         | 'some' some_bndrs1 some_separator ctype
                                      {% mkHsSomeTelescope $1 $2 $3 $4 }
         | context '=>' ctype          {% acsA (comb2 $1 $>) (\loc cs -> (L loc $
@@ -3075,6 +3078,11 @@ exp_gen(IEXP) :: { ECP }
 
         -- Embed types into expressions and patterns for required type arguments
         | 'type' atype             { ECP $ mkHsEmbTyPV (comb2 $1 $>) (epTok $1) $2 }
+        | 'data' aexp              {% do { requireDataHerald (epTok $1)
+                                         ; return $ ECP $
+                                             unECP $2 >>= \ inner ->
+                                             fmap markDataHeraldLoc
+                                                  (mkHsParPV (comb2 $1 inner) noEpTok inner noEpTok) } }
 
 infixexp2s :: { ECP }
 infixexp2s
@@ -5065,4 +5073,69 @@ mkHsSomeTelescope kw bndrs sep body = case bndrs of
       inner <- go rest
       amsA' (L (comb2 v body) $ XHsType (HsTypeSome (noEpTok, lpar, dcol, rpar, sep) v dom inner))
     go [] = panic "mkHsSomeTelescope.go: empty"
+
+-- | Require @-XExplicitNamespaces@ at an explicit @data@ herald keyword.
+requireDataHerald :: EpToken "data" -> P ()
+requireDataHerald data_tok = do
+  allowed <- getBit ExplicitNamespacesBit
+  unless allowed $
+    addError $ mkPlainErrorMsgEnvelope (getEpTokenSrcSpan data_tok) $
+      PsErrIllegalExplicitNamespace (ExplicitDataNamespace data_tok)
+
+-- | Rewrite a parsed type atom under an explicit @data@ herald so the renamer
+-- resolves constructors and variables in the data/value namespace first.
+-- See Note [Explicit data herald in type syntax] in GHC.Rename.HsType.
+mkHsDataHeraldTy :: SrcSpan -> EpToken "data" -> LHsType GhcPs -> P (LHsType GhcPs)
+mkHsDataHeraldTy span data_tok lty = do
+  requireDataHerald data_tok
+  let L _ rewritten = rewrite lty
+  amsA' (L (noAnnSrcSpan span) rewritten)
+  where
+    herald_ann :: EpToken "'"
+    herald_ann = EpTok (EpaDelta noSrcSpan (SameLine 1) [])
+
+    rewrite :: LHsType GhcPs -> LHsType GhcPs
+    rewrite (L l ty) = L l $ case ty of
+      HsParTy ann inner -> HsParTy ann (rewrite inner)
+      HsAppTy x f a -> HsAppTy x (rewrite f) (rewrite a)
+      HsAppKindTy x f k -> HsAppKindTy x (rewrite f) k
+      HsOpTy x lhs op rhs -> HsOpTy x (rewrite lhs) (rewrite op) (rewrite rhs)
+      HsKindSig x body k -> HsKindSig x (rewrite body) k
+      HsDocTy x body doc -> HsDocTy x (rewrite body) doc
+      HsListTy (o, c) elem_ty ->
+        HsExplicitListTy (noEpTok, o, c) IsPromoted [rewrite elem_ty]
+      HsExplicitListTy ann_list _ elems ->
+        HsExplicitListTy ann_list IsPromoted (map rewrite elems)
+      HsTupleTy (AnnParens o c) HsBoxedOrConstraintTuple elems ->
+        HsExplicitTupleTy (noEpTok, AnnParens o c) IsPromoted (map rewrite elems)
+      HsExplicitTupleTy ann_tup _ elems ->
+        HsExplicitTupleTy ann_tup IsPromoted (map rewrite elems)
+      HsTyVar ann prom (L nloc rdr)
+        | NotPromoted <- prom -> rewrite_var nloc rdr
+        | otherwise           -> HsTyVar ann prom (L nloc rdr)
+      other -> other
+
+    rewrite_var :: SrcSpanAnnN -> RdrName -> HsType GhcPs
+    rewrite_var nloc rdr
+      | rdr == nameRdrName listTyConName
+      = HsTyVar herald_ann IsPromoted (L nloc (getRdrName nilDataCon))
+      | NameAnnCommas (NameParens _ _) commas _ <- anns nloc
+      = HsTyVar herald_ann IsPromoted
+          (L nloc (getRdrName (tupleDataCon Boxed (length commas + 1))))
+      | isUnqual rdr || isQual rdr
+      = let occ = rdrNameOcc rdr
+        in if isLexCon (occNameFS occ)
+           then HsTyVar herald_ann IsPromoted (L nloc (setRdrNameSpace rdr dataName))
+           else HsTyVar herald_ann NotPromoted (L nloc (setRdrNameSpace rdr varName))
+      | otherwise
+      = HsTyVar herald_ann NotPromoted (L nloc rdr)
+
+-- | Attach a @data@-herald marker to a synthesized parenthesized expression or
+-- pattern so 'expr_to_type' skips pun-ambiguity rejection under @data@.
+-- See Note [Explicit data herald in type syntax] in GHC.Rename.HsType.
+markDataHeraldLoc :: LocatedA b -> LocatedA b
+markDataHeraldLoc (L (EpAnn anc items cs) node) =
+  L (EpAnn anc (mark : items) cs) node
+  where
+    mark = AddSemiAnn (EpTok (EpaDelta noSrcSpan (SameLine 1) []))
 }

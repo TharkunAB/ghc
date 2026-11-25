@@ -1039,3 +1039,13 @@ test('NativeTotalityReport',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeTotalityReport.hs'])],
      run_command, ['bash NativeTotalityReport.sh "{compiler}" "{libdir}"'])
+test('NativeRetainedScrutineePoly',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeRetainedScrutineePolyProvider.hs',
+                   'NativeRetainedScrutineePoly.hs'])],
+     run_command, ['bash NativeRetainedScrutineePoly.sh "{compiler}" "{libdir}"'])
+test('NativeDataHeraldInTypes',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeDataHeraldInTypesProvider.hs',
+                   'NativeDataHeraldInTypes.hs'])],
+     run_command, ['bash NativeDataHeraldInTypes.sh "{compiler}" "{libdir}"'])
