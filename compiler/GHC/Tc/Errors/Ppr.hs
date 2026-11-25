@@ -4181,17 +4181,20 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (TcHoleFit (HoleFit {..})) =
                  NameHFCand name -> text "bound at" <+> ppr (getSrcLoc name)
                  IdHFCand id_ -> text "bound at" <+> ppr (getSrcLoc id_)
 
--- | Similar to 'tcDeepSplitSigmaTy_maybe', but just cares about the binders.
+-- | Similar to 'tcDeepSplitSigmaTy_maybe', but collects only invisible
+-- 'ForAllTyBinder's while looking through function, required-forall, and
+-- retained-function binders.
 deepInvisTvBinders :: TcSigmaType -> [ForAllTyBinder]
 deepInvisTvBinders = go
   where
-    go ty | Just (_ma, _arg_ty, res_ty) <- tcSplitFunTy_maybe ty
-          = go res_ty
-          | (tvs, body) <- splitForAllForAllTyBinders ty
-          , not (null tvs)
-          = map snd tvs ++ go body
-          | otherwise
-          = []
+    go ty | Just ty' <- coreView ty = go ty'
+    go (ForAllTy _ b@(Bndr _ vis) body)
+      | isInvisibleForAllTyFlag vis = b : go body
+      | otherwise                   = go body
+    go (FunTy { ft_res = res_ty })  = go res_ty
+    go (DepFunTy _ _ body)          = go body
+    go (DepDictTy _ body)           = go body
+    go _                            = []
 
 -- | Add a "Constraints include..." message.
 --

@@ -36,7 +36,6 @@ import GHC.Tc.Types.LclEnv ( setLclEnvRdrEnv )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
-import GHC.Tc.Types.ErrCtxt ( isSigMaybe )
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.TyCl.PatSyn (patSynBuilderOcc)
 import GHC.Tc.Types.Evidence
@@ -44,11 +43,10 @@ import GHC.Tc.Types.CtLoc
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 import GHC.Core.TyCon ( TyCon, isGenerativeTyCon, isInjectiveTyCon, isAlgTyCon, isTypeFamilyTyCon
-                      , isPromotedDataCon_maybe, tyConDataCons, tyConName )
+                      , isPromotedDataCon_maybe, tyConDataCons )
 import GHC.Core.TyCo.Rep ( Type(..) )
 import GHC.Core.Type ( funTyFlagTyCon, coreFullView, splitTyConApp_maybe
-                     , isFamFreeTy, typeKind, replaceTermVarInType
-                     , filterOutInvisibleTypes )
+                     , isFamFreeTy, isForAllTy, typeKind, replaceTermVarInType )
 import GHC.Core.Coercion ( abstractNativeIndices, coercionRole )
 import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.Reduction ( Reduction(..) )
@@ -58,8 +56,7 @@ import qualified GHC.Core.TyCo.Subst as Subst
 import GHC.Core.DataCon
 import GHC.Core.PatSyn (patSynName)
 import GHC.Core.Predicate ( Pred(..), classifyPredType, eqRelRole
-                          , isIPClass
-                          , getEqPredTys_maybe )
+                          , isIPClass )
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Reader
@@ -67,15 +64,15 @@ import GHC.Builtin.Modules ( gHC_INTERNAL_ERR, gHC_INTERNAL_UNSAFE_COERCE )
 import GHC.Builtin.WiredIn.Types ( tupleDataConName, unboxedSumDataConName )
 import GHC.Types.Id
 import GHC.Types.Name.Env ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv, elemNameEnv )
-import GHC.Types.Name.Set ( extendNameSet, NameSet, emptyNameSet, elemNameSet, mkNameSet )
+import GHC.Types.Name.Set ( extendNameSet, NameSet, emptyNameSet )
 import GHC.Unit.External ( eps_PTE )
 import GHC.Unit.Module ( moduleUnit, moduleName, moduleNameString )
 import GHC.Unit.Types ( unitString )
-import GHC.Types.Var ( TyVar, mkTyVar, isVisibleFunArg, isInvisibleForAllTyFlag, DepFunTyFlag(..)
-                     , VarBndr(..), isNonCoVarId
+import GHC.Types.Var ( TyVar, mkTyVar, setTyVarKind, isVisibleFunArg, isInvisibleForAllTyFlag
+                     , DepFunTyFlag(..), VarBndr(..), isNonCoVarId
                      , tyVarKind, varType )
 import GHC.Types.Var.Set
-import GHC.Types.Var.Env
+import GHC.Types.Var.Env ( TidyEnv )
 import GHC.Types.TyThing
 import GHC.Data.Bag
 import GHC.Core.ConLike ( ConLike(..) )
@@ -87,10 +84,9 @@ import GHC.Data.Maybe
 
 import Control.Arrow ( (&&&) )
 
-import Control.Monad    ( filterM, replicateM, foldM, guard )
-import Data.Char        ( isDigit )
+import Control.Monad    ( filterM, replicateM, foldM )
 import Data.Function    ( on )
-import Data.List        ( partition, sort, sortOn, nubBy, stripPrefix, isPrefixOf )
+import Data.List        ( partition, sort, sortOn, nubBy, isPrefixOf )
 import Data.Graph       ( graphFromEdges, topSort )
 
 
@@ -651,7 +647,6 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; maxVSubs <- maxValidHoleFits <$> getDynFlags
      ; sortingAlg <- getHoleFitSortingAlg
      ; dflags <- getDynFlags
-     ; hfdc <- getHoleFitDispConfig
      ; let exts = extensionFlags dflags
            dep_exts = EnumSet.member LangExt.ExperimentalDependentTypes exts
            hole_term_ids
@@ -676,30 +671,8 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; tcg_env <- getGblEnv
      ; plugins <- readTcRef (tcg_plugins tcg_env)
      ; let hfPlugs = holeFitTcMPlugins plugins
-     ; let findVLimit = if sortingAlg > HFSNoSorting then Nothing else maxVSubs
-           implicit_dep_ref = dep_exts && isNothing (refLevelHoleFits dflags)
-           refLevel = case refLevelHoleFits dflags of
-                        Nothing | dep_exts -> Just 1
-                        mb                 -> mb
-           home_mod = tcg_mod tcg_env
-           bndr_occ (TcIdBndr b tl)           = Just (nameOccName (idName b), tl)
-           bndr_occ (TcIdBndr_ExpType nm _ tl) = Just (nameOccName nm, tl)
-           bndr_occ (TcTvBndr _ _)            = Nothing
-           all_id_bndrs = mapMaybe bndr_occ (ctl_bndrs (ctLocEnv ct_loc))
-           not_top_occs = [ occ | (occ, tl) <- all_id_bndrs, not (isTopLevel tl) ]
-           encl_occ = case reverse not_top_occs of
-                        occ : _ -> [occ]
-                        []      -> [ occ | (occ, _) : _ <- [all_id_bndrs] ]
-           sig_occs =
-             [ nameOccName fn_nm
-             | imp <- implics
-             , SigSkol uctxt _ _ <- [ic_info imp]
-             , Just fn_nm <- [isSigMaybe uctxt]
-             ]
-           self_occs = mkOccSet (sig_occs ++ encl_occ)
-           is_self_nm nm =
-             (isNothing (nameModule_maybe nm) || nameModule_maybe nm == Just home_mod)
-             && (nameOccName nm `elemOccSet` self_occs)
+           findVLimit = if sortingAlg > HFSNoSorting then Nothing else maxVSubs
+           refLevel = refLevelHoleFits dflags
            hole = TypedHole { th_relevant_cts =
                                 listToBag (relevantCtEvidence hole_ty simples)
                             , th_implics      = implics
@@ -730,7 +703,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
              | gadt_proof_hole = locals ++ globals
              | otherwise       = locals ++ syntax ++ globals
      ; cands <- foldM (flip ($)) to_check candidatePlugins
-     ; lookup_fn <- mkCachedCandLookup gadt_proof_hole implicit_dep_ref
+     ; lookup_fn <- mkCachedCandLookup gadt_proof_hole
      ; traceTc "numPlugins are:" $ ppr (length candidatePlugins)
      ; (searchDiscards, subs0) <-
         tcFilterHoleFitsWith lookup_fn findVLimit hole (hole_ty, []) cands
@@ -738,8 +711,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; tidy_sorted_subs <- sortFits sortingAlg tidy_subs
      ; (tidy_env, tidy_hole_ty) <- liftZonkM $ zonkTidyTcType tidy_env hole_ty
      -- Refinement hole fits. See Note [Valid refinement hole fits include ...]
-     ; let lcl_rdr = ctl_rdr (ctLocEnv ct_loc)
-     ; (tidy_env, rsubs, tidy_sorted_rsubs, req_step_fits) <-
+     ; (tidy_env, rsubs) <-
        if refLevel >= Just 0
        then
          do { maxRSubs <- maxRefHoleFits <$> getDynFlags
@@ -752,51 +724,27 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
             ; traceTc "ref_tys are" $ ppr ref_tys
             ; let findRLimit = if sortingAlg > HFSNoSorting then Nothing
                                                             else maxRSubs
-            ; ref_cands <-
-                if implicit_dep_ref
-                then filterImplicitRefCands lookup_fn is_self_nm implics hole_ty cands
-                else pure cands
             ; refDs :: [(Bool, [TcHoleFit])]
-                 <- mapM (flip (tcFilterHoleFitsWith lookup_fn findRLimit hole) ref_cands) ref_tys
+                 <- mapM (flip (tcFilterHoleFitsWith lookup_fn findRLimit hole) cands) ref_tys
             ; (tidy_env, tidy_rsubs :: [TcHoleFit])
                  <- liftZonkM $ zonkSubs tidy_env $ concatMap snd refDs
             ; tidy_sorted_rsubs :: [TcHoleFit] <- sortFits sortingAlg tidy_rsubs
-            ; (tidy_env, req_cong_fits) <-
-                if dep_exts && not (null refLvls)
-                then findReqCongFits lookup_fn tidy_env hfdc hole lcl_rdr hole_term_ids hole_ty cands
-                else pure (tidy_env, [])
-            ; (tidy_env, req_trans_fits) <-
-                if dep_exts && not (null refLvls)
-                then findReqTransFits lookup_fn tidy_env hfdc ct_loc hole is_self_nm
-                       lcl_rdr hole_term_ids lclBinds hole_ty cands
-                else pure (tidy_env, [])
             -- For refinement substitutions we want matches
             -- like id (_ :: t), head (_ :: [t]), asTypeOf (_ :: t),
             -- and others in that vein to appear last, since these are
             -- unlikely to be the most relevant fits.
-            ; let req_step_fits = req_cong_fits ++ req_trans_fits
-                  hasExactApp = any (tcEqType tidy_hole_ty) . hfWrap
+            ; let hasExactApp = any (tcEqType tidy_hole_ty) . hfWrap
                   exact, not_exact :: [TcHoleFit]
                   (exact, not_exact) = partition hasExactApp tidy_sorted_rsubs
-                  req_raw_rfits = [ RawHoleFit rdoc | (_, rdoc, _) <- req_step_fits ]
-                  fits :: [HoleFit] =
-                    req_raw_rfits ++ map TcHoleFit (not_exact ++ exact)
+                  fits :: [HoleFit] = map TcHoleFit (not_exact ++ exact)
             ; plugin_handled_rsubs <- foldM (\fs plug -> plug fs) fits fitPlugins
             ; let (pRDisc, exact_last_rfits) =
                     possiblyDiscard maxRSubs $ plugin_handled_rsubs
                   rDiscards = pRDisc || any fst refDs
             ; rsubs_with_docs <- addHoleFitDocs exact_last_rfits
-            ; return (tidy_env, Fits rsubs_with_docs rDiscards, tidy_sorted_rsubs, req_step_fits) }
-       else return (tidy_env, Fits [] False, [], [])
-     ; let has_non_self_direct = any (not . is_self_nm . hfName) tidy_sorted_subs
-     ; auto_fits <-
-         if dep_exts && not has_non_self_direct
-         then findDependentAutoFits lookup_fn tidy_env hfdc hole hole_ty tidy_hole_ty
-                is_self_nm lcl_rdr hole_term_ids lclBinds cands
-                tidy_sorted_subs tidy_sorted_rsubs req_step_fits
-         else pure []
-     ; let base_vfits = auto_fits ++ map TcHoleFit tidy_sorted_subs
-     ; plugin_handled_subs <- foldM (\fs plug -> plug fs) base_vfits fitPlugins
+            ; return (tidy_env, Fits rsubs_with_docs rDiscards) }
+       else return (tidy_env, Fits [] False)
+     ; plugin_handled_subs <- foldM (\fs plug -> plug fs) (map TcHoleFit tidy_sorted_subs) fitPlugins
      ; let (pVDisc, limited_subs) = possiblyDiscard maxVSubs plugin_handled_subs
            vDiscards = pVDisc || searchDiscards
      ; subs_with_docs <- addHoleFitDocs limited_subs
@@ -1076,13 +1024,14 @@ tcFilterHoleFitsWith lookup_cand limit typed_hole ht@(hole_ty, _) candidates =
       do { dep_exts <- xoptM LangExt.ExperimentalDependentTypes
          ; let n_ref = length ref_vars
                base_hole_ty = peelRefinementArrows n_ref h_ty
-         ; if | hasRequiredForAllBndr cand_ty
-              -> return Nothing
-              | dep_exts
-              , needsDepHoleCheck base_hole_ty || needsDepHoleCheck cand_ty
-                  || (n_ref >= 2 && isGadtHoleTy base_hole_ty)
+         ; if | dep_exts
+              , needsDepHoleCheck base_hole_ty
+                  || needsDepHoleCheck cand_ty
+                  || hasRequiredForAllBndr cand_ty
               -> withoutUnification fvs $
                  tcDepCheckCand hole n_ref base_hole_ty cand_ty cand_is_datacon
+              | hasRequiredForAllBndr cand_ty
+              -> return Nothing
               -- (FastHoles2) hoisted before withoutUnification to avoid
               -- scanning free variables for obviously incompatible candidates.
               | definitelyNotSubType cand_ty h_ty
@@ -1597,7 +1546,8 @@ definitelyNotSubType = go
 {- Note [Dependent hole fits and subgoal splitting]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Under `DependentTypes`, hole checking interacts with runtime index binders
-(`TermVarTy`) and retained function types (`DepFunTy`) in five ways:
+(`TermVarTy`), visible `forall a ->` binders, and retained function types
+(`DepFunTy`) in three ways:
 
 1. Local scope restoration (`withHoleLclEnv`):
    `reportUnsolved` runs outside the lexical expression environment. Restore
@@ -1606,44 +1556,25 @@ Under `DependentTypes`, hole checking interacts with runtime index binders
    when wrapping Wanted constraints inside `th_implics`.
 
 2. Immutable index instantiation (`tcDepCheckCand`):
-   Mutable unification variables cannot be assigned types containing `TermVarTy`
+   Mutable unification variables cannot bind types that contain `TermVarTy`
    (see Note [Term-variable occurrences in types] in `GHC.Tc.Utils.Unify`).
-   For candidates with outer invisible binders or `DepFunTy` binders, abstract
-   retained binders to fresh template `TyVar`s via `abstractNativeIndices`,
-   match the candidate result type against the hole type (decomposing aligned
+   For candidates or holes with native dependent forms or visible `forall a ->`
+   binders, peel invisible quantifiers, constraints, and `n_ref` visible
+   parameters (`FunTy`, `DepFunTy`, or `ForAllTy Required`), abstracting
+   retained binders to fresh template `TyVar`s via `abstractNativeIndices`.
+   Match the candidate result type against the hole type (decomposing aligned
    `DepFunTy`, `FunTy`, and `TyConApp` spines when inner type families reduce
    differently) to select immutable arguments, check well-kindedness and local
    `Id` scope, and verify the instantiated result with `tcCheckHoleFit` inside
-   `th_implics`. At refinement level 2 or higher on GADT proof holes, invisible
-   variables that bridge at least two visible subgoal parameters (such as the
-   midpoint `b` of `trans :: (a :~: b) -> (b :~: c) -> a :~: c`) instantiate to
-   fresh flexible meta-variables.
+   `th_implics`.
 
-3. Subgoal splitting via refinement hole fits:
-   When `DependentTypes` is enabled and `-frefinement-level-hole-fits` is unset,
-   default to refinement level 1 so GADT constructors, congruence helpers,
-   transitivity steps, and `foreach` lemmas expose their subgoal types as
-   refinement fits (for example `SleS (_ :: LE m n)`, `congSucc (_ :: lhs :~: rhs)`,
-   `trans (plusSuc m k) (_ :: Succ (plus m k) :~: rhs)`, and `plusZero (_ :: Nat)`).
-   Required-type-argument congruence wrappers (`findReqCongFits`) and 1-subgoal
-   transitivity steps (`findReqTransFits`) are formatted via `RawHoleFit`.
-
-4. Unrenamed source binder display (`sourceTermOcc`, `pprSourceTermId`):
-   `reportHoles` tidies `hole_ty` before `findValidHoleFits` runs, which can
-   append numeric suffixes (`n1`) to retained LHS binders when an earlier hole
-   already claimed the same `OccName`. Resolve local term `Id`s back to the
-   enclosing `LocalRdrEnv` when unique in scope so synthesized expressions use
-   the source binder names written on the equation LHS.
-
-5. Bounded 1-step auto (`findDependentAutoFits`):
-   Using at most 20 solver checks, discharge 1-step goals directly from:
-   - result-directed saturated `foreach` calls on accessible local bindings
-     (such as `plusZero m`), and
-   - 1-subgoal refinement fits whose single subgoal is solved by a local
-     binding, a nullary constructor (`Refl`, `ZleN`), or a result-directed
-     `foreach` call (such as `SleS h` and `cong Succ (plusAssoc m n p)`).
-   Recursive self-calls to an enclosing binding require at least one argument
-   to be a strict structural subterm introduced by an enclosing pattern match.
+3. General refinement levels and `-fabstract-refinement-hole-fits`:
+   `tcDepCheckCand` works uniformly at any `-frefinement-level-hole-fits=N`
+   (`N = 0, 1, 2, ...`). Ununified template variables are rejected unless they
+   are unused `foreach` value binders or `-fabstract-refinement-hole-fits`
+   (`Opt_AbstractRefHoleFits`) is active, in which case `completeDepSubst`
+   allocates fresh flexible meta-variables (for example producing
+   `trans (_ :: lhs :~: b0) (_ :: b0 :~: rhs)` at level 2).
 -}
 
 -- | Strip @n@ leading synthetic refinement arrows added by 'mkRefTy'.
@@ -1659,8 +1590,6 @@ needsDepHoleCheck :: Type -> Bool
 needsDepHoleCheck ty = hasNativeDependentExpr (Core.Type ty)
 
 -- | Does this candidate type contain a visible @forall a ->@ binder?
--- 'TcHoleFit' pretty-printing panics on 'Required' 'ForAllTy' binders, so such
--- candidates are handled via 'RawHoleFit' instead.
 hasRequiredForAllBndr :: Type -> Bool
 hasRequiredForAllBndr = go
   where
@@ -1676,14 +1605,16 @@ hasRequiredForAllBndr = go
 data DepVisParam
   = DepVisFun !Type
   | DepVisForEach !Id !TyVar !Type
+  | DepVisReqForAll !TyVar !Type
 
 depVisParamDom :: DepVisParam -> Type
-depVisParamDom (DepVisFun dom) = dom
+depVisParamDom (DepVisFun dom)         = dom
 depVisParamDom (DepVisForEach _ _ dom) = dom
+depVisParamDom (DepVisReqForAll _ dom) = dom
 
 -- | Check a candidate against a dependent hole type with @n_ref@ missing
--- visible value arguments, instantiating invisible binders and 'DepFunTy'
--- binders immutably from the expected result.
+-- visible arguments, instantiating invisible binders, visible @forall a ->@
+-- binders, and 'DepFunTy' binders immutably from the expected result.
 -- See Note [Dependent hole fits and subgoal splitting].
 tcDepCheckCand :: TypedHole
                -> Int
@@ -1717,38 +1648,33 @@ tcDepInstAndCheck :: DeepSubsumptionFlag
                   -> TcType
                   -> TcM (Maybe ([TcType], [TcType]))
 tcDepInstAndCheck ds_flag hole n_ref orig_hole_ty cand_ty =
-  do { mb_peeled <- peel_cand 0 [] [] [] [] cand_ty
+  do { mb_peeled <- peel_cand 0 [] [] [] [] [] cand_ty
      ; case mb_peeled of
          Nothing -> return Nothing
-         Just (invis_tvs, dep_pairs, theta, vis_params, res_ty) ->
+         Just (invis_tvs, bind_tvs, theta, vis_params, res_ty) ->
            if | Just tc1 <- depResHead res_ty
               , Just tc2 <- depResHead orig_hole_ty
               , tc1 /= tc2
               -> return Nothing
               | has_vis_dep res_ty /= has_vis_dep orig_hole_ty
               -> return Nothing
+              | hasRequiredForAllBndr res_ty /= hasRequiredForAllBndr orig_hole_ty
+              -> return Nothing
               | otherwise
-              -> do { let bind_tvs = invis_tvs ++ map snd dep_pairs
-                          vis_dep_set = mkVarSet [ tv | DepVisForEach _ tv _ <- vis_params ]
-                          bridging_tvs
-                            | n_ref >= 2 && isGadtHoleTy orig_hole_ty
-                            = mkVarSet
-                                [ tv
-                                | tv <- invis_tvs
-                                , count (\p -> tv `elemVarSet` tyCoVarsOfType (depVisParamDom p)) vis_params >= 2
-                                ]
-                            | otherwise
-                            = emptyVarSet
+              -> do { let vis_dep_set = mkVarSet [ tv | DepVisForEach _ tv _ <- vis_params ]
+                          used_in_rest =
+                            tyCoVarsOfTypes (res_ty : theta ++ map depVisParamDom vis_params)
                     ; case matchDepResult bind_tvs res_ty orig_hole_ty of
                         Nothing -> return Nothing
                         Just subst ->
                           do { allow_abs <- goptM Opt_AbstractRefHoleFits
-                             ; mb_full <- completeDepSubst allow_abs vis_dep_set bridging_tvs bind_tvs subst
+                             ; mb_full <- completeDepSubst allow_abs vis_dep_set used_in_rest bind_tvs subst
                              ; case mb_full of
                                  Nothing -> return Nothing
                                  Just full_subst ->
                                    do { let choices = [ Subst.substTy full_subst (mkTyVarTy tv)
-                                                      | tv <- bind_tvs ]
+                                                      | tv <- bind_tvs
+                                                      , not (tv `elemVarSet` vis_dep_set && not (tv `elemVarSet` used_in_rest)) ]
                                       ; scoped <- checkDepRuntimeScope choices
                                       ; if not scoped
                                         then return Nothing
@@ -1771,34 +1697,41 @@ tcDepInstAndCheck ds_flag hole n_ref orig_hole_ty cand_ty =
     has_vis_dep (DepFunTy DepFunVisible _ _) = True
     has_vis_dep _ = False
 
-    -- Peel invisible binders, constraints, and exactly n_ref visible parameters,
-    -- abstracting retained binders to fresh template TyVars as we go.
+    -- Peel invisible binders, constraints, and exactly n_ref visible parameters
+    -- in telescope order, abstracting retained binders to fresh template TyVars.
     peel_cand :: Int
+              -> [TyVar]
               -> [TyVar]
               -> [(Type, TyVar)]
               -> [PredType]
               -> [DepVisParam]
               -> Type
-              -> TcM (Maybe ([TyVar], [(Type, TyVar)], [PredType], [DepVisParam], Type))
-    peel_cand k invis_tvs dep_pairs theta vis_params ty
+              -> TcM (Maybe ([TyVar], [TyVar], [PredType], [DepVisParam], Type))
+    peel_cand k invis_rev bind_rev dep_pairs theta_rev vis_rev ty
       | Just ty' <- coreView ty
-      = peel_cand k invis_tvs dep_pairs theta vis_params ty'
+      = peel_cand k invis_rev bind_rev dep_pairs theta_rev vis_rev ty'
       | ForAllTy _ (Bndr tv vis) body <- ty
       , isInvisibleForAllTyFlag vis
-      = peel_cand k (invis_tvs ++ [tv]) dep_pairs theta vis_params body
+      , not (k == n_ref && isForAllTy orig_hole_ty)
+      = case abstractNativeIndices dep_pairs (tyVarKind tv) of
+          Nothing -> return Nothing
+          Just k' ->
+            let tv'   = if k' `eqType` tyVarKind tv then tv else setTyVarKind tv k'
+                body' = if k' `eqType` tyVarKind tv then body else Subst.substTyWith [tv] [mkTyVarTy tv'] body
+            in peel_cand k (tv' : invis_rev) (tv' : bind_rev) dep_pairs theta_rev vis_rev body'
       | DepFunTy DepFunInvisible bndr body <- ty
       = case abstractNativeIndices dep_pairs (varType bndr) of
           Nothing -> return Nothing
           Just dom' ->
             do { nm <- newSysName (mkTyVarOccFS (occNameFS (getOccName bndr)))
                ; let tv = mkTyVar nm dom'
-               ; peel_cand k invis_tvs (dep_pairs ++ [(TermVarTy bndr, tv)]) theta vis_params body }
+               ; peel_cand k invis_rev (tv : bind_rev) (dep_pairs ++ [(TermVarTy bndr, tv)]) theta_rev vis_rev body }
       | FunTy { ft_af = af, ft_arg = pred_ty, ft_res = body } <- ty
       , not (isVisibleFunArg af)
       = case abstractNativeIndices dep_pairs pred_ty of
           Nothing -> return Nothing
           Just pred' ->
-            peel_cand k invis_tvs dep_pairs (theta ++ [pred']) vis_params body
+            peel_cand k invis_rev bind_rev dep_pairs (pred' : theta_rev) vis_rev body
       | k < n_ref
       = case ty of
           FunTy { ft_af = af, ft_arg = arg_ty, ft_res = body }
@@ -1806,22 +1739,31 @@ tcDepInstAndCheck ds_flag hole n_ref orig_hole_ty cand_ty =
               case abstractNativeIndices dep_pairs arg_ty of
                 Nothing -> return Nothing
                 Just arg' ->
-                  peel_cand (k + 1) invis_tvs dep_pairs theta
-                    (vis_params ++ [DepVisFun arg']) body
+                  peel_cand (k + 1) invis_rev bind_rev dep_pairs theta_rev
+                    (DepVisFun arg' : vis_rev) body
           DepFunTy DepFunVisible bndr body ->
             case abstractNativeIndices dep_pairs (varType bndr) of
               Nothing -> return Nothing
               Just dom' ->
                 do { nm <- newSysName (mkTyVarOccFS (occNameFS (getOccName bndr)))
                    ; let tv = mkTyVar nm dom'
-                   ; peel_cand (k + 1) invis_tvs (dep_pairs ++ [(TermVarTy bndr, tv)]) theta
-                       (vis_params ++ [DepVisForEach bndr tv dom']) body }
+                   ; peel_cand (k + 1) invis_rev (tv : bind_rev) (dep_pairs ++ [(TermVarTy bndr, tv)]) theta_rev
+                       (DepVisForEach bndr tv dom' : vis_rev) body }
+          ForAllTy _ (Bndr tv Required) body ->
+            case abstractNativeIndices dep_pairs (tyVarKind tv) of
+              Nothing -> return Nothing
+              Just dom' ->
+                let tv'   = if dom' `eqType` tyVarKind tv then tv else setTyVarKind tv dom'
+                    body' = if dom' `eqType` tyVarKind tv then body else Subst.substTyWith [tv] [mkTyVarTy tv'] body
+                in peel_cand (k + 1) invis_rev (tv' : bind_rev) dep_pairs theta_rev
+                     (DepVisReqForAll tv' dom' : vis_rev) body'
           _ -> return Nothing
       | otherwise
       = case abstractNativeIndices dep_pairs ty of
           Nothing -> return Nothing
           Just res' ->
-            return $ Just (invis_tvs, dep_pairs, theta, vis_params, res')
+            let rest_invis = deepInvisTvVars res'
+            in return $ Just (reverse invis_rev ++ rest_invis, reverse bind_rev, reverse theta_rev, reverse vis_rev, res')
 
 depResHead :: Type -> Maybe TyCon
 depResHead ty | Just ty' <- coreView ty = depResHead ty'
@@ -1856,9 +1798,10 @@ matchDepResult bind_tvs formal_res actual_res
   | otherwise
   = Nothing
   where
+    bind_set = mkVarSet bind_tvs
     bind_fn tv _
-      | tv `elem` bind_tvs = BindMe
-      | otherwise          = DontBindMe
+      | tv `elemVarSet` bind_set = BindMe
+      | otherwise                = DontBindMe
 
     match_one subst formal actual
       | Just s1 <- tcMatchTyX_BM bind_fn subst (typeKind formal) (typeKind actual)
@@ -1900,31 +1843,42 @@ matchDepResult bind_tvs formal_res actual_res
       | otherwise
       = Nothing
 
+-- | Collect invisible 'TyVar's beneath function and retained binders.
+deepInvisTvVars :: Type -> [TyVar]
+deepInvisTvVars = go
+  where
+    go ty | Just ty' <- coreView ty = go ty'
+    go (ForAllTy _ (Bndr tv vis) body)
+      | isInvisibleForAllTyFlag vis = tv : go body
+      | otherwise                   = go body
+    go (FunTy { ft_res = res })     = go res
+    go (DepFunTy _ _ body)          = go body
+    go (DepDictTy _ body)           = go body
+    go _                            = []
+
 completeDepSubst :: Bool -> VarSet -> VarSet -> [TyVar] -> Subst.Subst -> TcM (Maybe Subst.Subst)
-completeDepSubst allow_abs vis_dep_tvs bridging_tvs tvs subst0
+completeDepSubst allow_abs vis_dep_tvs used_in_rest tvs subst0
   = go subst0 tvs
   where
+    tv_set = mkVarSet tvs
     go subst [] = return (Just subst)
     go subst (tv : rest) =
       case Subst.lookupTyVar subst tv of
         Just choice ->
           let exp_k = Subst.substTy subst (tyVarKind tv)
           in if exp_k `eqType` typeKind choice
-                && not (any (\v -> v `elemVarSet` tyCoVarsOfType choice && not (v `elemVarSet` vis_dep_tvs)) tvs)
+                && not (anyVarSet (\v -> v `elemVarSet` tv_set && not (v `elemVarSet` vis_dep_tvs)) (tyCoVarsOfType choice))
              then go (Subst.extendTvSubstAndInScope subst tv choice) rest
              else return Nothing
         Nothing
           | tv `elemVarSet` vis_dep_tvs
-          -> let k' = Subst.substTy subst (tyVarKind tv)
+          , not (tv `elemVarSet` used_in_rest)
+          -> let k'  = Subst.substTy subst (tyVarKind tv)
                  tv' = mkTyVar (getName tv) k'
              in go (Subst.extendTvSubstAndInScope subst tv (mkTyVarTy tv')) rest
-          | tv `elemVarSet` bridging_tvs
-          , let k' = Subst.substTy subst (tyVarKind tv)
-          , not (any (`elemVarSet` tyCoVarsOfType k') tvs)
-          -> do { (subst', tv') <- newMetaTyVarX subst tv
-                ; go (Subst.extendTvSubstAndInScope subst' tv (mkTyVarTy tv')) rest }
           | allow_abs
-          , not (hasNativeDependentExpr (Core.Type (Subst.substTy subst (tyVarKind tv))))
+          , let k' = Subst.substTy subst (tyVarKind tv)
+          , not (tyCoVarsOfType k' `intersectsVarSet` mkVarSet (tv : rest))
           -> do { (subst', tv') <- newMetaTyVarX subst tv
                 ; go (Subst.extendTvSubstAndInScope subst' tv (mkTyVarTy tv')) rest }
           | otherwise
@@ -1959,47 +1913,35 @@ isGadtHoleTy ty
       case dataConFullSig dc of
         (_, _, eq_spec, _, _, _) -> not (null eq_spec)
 
--- | Build a memoized candidate type lookup across level-0, refinement, and
--- auto passes. On GADT proof holes under 'ExperimentalDependentTypes', skip
+-- | Build a memoized candidate type lookup across level-0 and refinement passes.
+-- On GADT proof holes under 'ExperimentalDependentTypes', skip unloaded
 -- 'Prelude' modules unrelated to propositional equality so cold hole checks do
--- not deserialize dozens of irrelevant interfaces or run class search on
--- 'Enum', 'Read', or 'Foldable' instances of @(:~:)@.
+-- not deserialize irrelevant interfaces.
 mkCachedCandLookup :: Bool
-                   -> Bool
                    -> TcM (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-mkCachedCandLookup gadt_proof_hole implicit_dep_ref =
+mkCachedCandLookup gadt_proof_hole =
   do { cache_ref <- newTcRef (emptyNameEnv :: NameEnv (Maybe (Name, Bool, Type)))
      ; eps_pte   <- eps_PTE <$> getEps
-     ; let allow_base_mods
-             | implicit_dep_ref =
-                 [ "Data.Type.Equality"
-                 , "GHC.Internal.Data.Type.Equality"
-                 , "Data.Type.Coercion"
-                 , "GHC.Internal.Data.Type.Coercion"
-                 , "GHC.Internal.Types"
-                 ]
-             | otherwise =
-                 [ "Data.Type.Equality"
-                 , "GHC.Internal.Data.Type.Equality"
-                 , "Data.Type.Coercion"
-                 , "GHC.Internal.Data.Type.Coercion"
-                 , "GHC.Internal.Types"
-                 , "GHC.Internal.Base"
-                 ]
+     ; let allow_base_mods =
+             [ "Data.Type.Equality"
+             , "GHC.Internal.Data.Type.Equality"
+             , "Data.Type.Coercion"
+             , "GHC.Internal.Data.Type.Coercion"
+             , "GHC.Internal.Types"
+             , "GHC.Internal.Base"
+             ]
            skip_unloaded nm
              | not gadt_proof_hole = False
              | Just mod <- nameModule_maybe nm
              , let u_str   = unitString (moduleUnit mod)
                    mod_str = moduleNameString (moduleName mod)
              , "ghc-internal" `isPrefixOf` u_str || "base" `isPrefixOf` u_str
-             = if implicit_dep_ref
-               then mod_str `notElem` allow_base_mods
-               else mod_str `elem`
-                      [ "GHC.Internal.Enum", "GHC.Enum"
-                      , "Text.Read", "GHC.Read", "GHC.Internal.Read", "GHC.Internal.Text.Read"
-                      , "System.IO", "GHC.Internal.IO"
-                      ]
-                    || (not (nm `elemNameEnv` eps_pte) && mod_str `notElem` allow_base_mods)
+             = mod_str `elem`
+                 [ "GHC.Internal.Enum", "GHC.Enum"
+                 , "Text.Read", "GHC.Read", "GHC.Internal.Read", "GHC.Internal.Text.Read"
+                 , "System.IO", "GHC.Internal.IO"
+                 ]
+               || (not (nm `elemNameEnv` eps_pte) && mod_str `notElem` allow_base_mods)
              | otherwise = False
      ; return $ \cand ->
          case cand of
@@ -2017,379 +1959,6 @@ mkCachedCandLookup gadt_proof_hole implicit_dep_ref =
                      res <- lookupCandType cand
                      updTcRef cache_ref (\c -> extendNameEnv c nm res)
                      return res }
-
--- | For the implicit level-1 dependent subgoal-splitting pass, retain only
--- candidates whose 1-argument result targets the hole's head 'TyCon' (excluding
--- bare-tyvar combinators such as 'id' and unreduced self-calls).
-filterImplicitRefCands :: (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-                       -> (Name -> Bool)
-                       -> [Implication]
-                       -> TcType
-                       -> [HoleFitCandidate]
-                       -> TcM [HoleFitCandidate]
-filterImplicitRefCands lookup_fn is_self_nm implics hole_ty cands
-  | Nothing <- mb_goal_tc = pure cands
-  | otherwise = filterM keep cands
-  where
-    mb_goal_tc = depResHead hole_ty
-    has_pat_match = any is_pat_implic implics
-    is_pat_implic imp
-      | PatSkol (RealDataCon dc) _ <- ic_info imp
-      , dataConSourceArity dc > 0 = True
-      | otherwise = any is_con_eq (ic_given imp)
-    is_con_eq ev
-      | Just (_, l, r) <- getEqPredTys_maybe (varType ev)
-      = is_con_app l || is_con_app r
-      | otherwise = False
-    is_con_app t
-      | Just (tc, _) <- splitTyConApp_maybe (coreFullView t)
-      = isJust (isPromotedDataCon_maybe tc)
-      | otherwise = False
-
-    keep cand
-      | is_self_nm (getName cand) && not has_pat_match
-      = pure False
-      | otherwise
-      = tryTcDiscardingErrs (pure False) $
-        do { mb <- lookup_fn cand
-           ; pure $ case mb of
-               Nothing -> False
-               Just (_, _, ty0) ->
-                 let (_, ty1) = tcSplitForAllInvisTyVars ty0
-                     (_, ty2) = tcSplitPhiTy ty1
-                 in case coreFullView ty2 of
-                      FunTy { ft_af = af, ft_res = res } | isVisibleFunArg af ->
-                        depResHead res == mb_goal_tc
-                      DepFunTy DepFunVisible _ res ->
-                        depResHead res == mb_goal_tc
-                      _ -> False }
-
--- | Resolve a local runtime 'Id' (which 'reportHoles' may have tidied to e.g.
--- @n1@) back to its unrenamed source 'Name' in the enclosing 'LocalRdrEnv' when
--- unambiguous.
--- See Note [Dependent hole fits and subgoal splitting].
-sourceTermOcc :: LocalRdrEnv -> [Id] -> Id -> Maybe Name
-sourceTermOcc lcl_rdr term_ids v
-  | Just nm <- lookupUniqMap rdr_by_uniq (idName v)
-  = Just nm
-  | not (null base_str)
-  , base_str /= occ_str
-  , isNothing (lookupLocalRdrOcc lcl_rdr (mkVarOcc occ_str))
-  , Just nm <- lookupLocalRdrOcc lcl_rdr (mkVarOcc base_str)
-  , isValNameSpace (occNameSpace (nameOccName nm))
-  , not (nameOccName nm `elemOccSet` used_raw_occs)
-  = Just nm
-  | otherwise
-  = Nothing
-  where
-    val_rdr_names =
-      [ nm
-      | nm <- localRdrEnvElts lcl_rdr
-      , isValNameSpace (occNameSpace (nameOccName nm))
-      ]
-    rdr_by_uniq = listToUniqMap [ (nm, nm) | nm <- val_rdr_names ]
-    used_raw_occs = mkOccSet
-      [ nameOccName nm
-      | u <- term_ids
-      , Just nm <- [lookupUniqMap rdr_by_uniq (idName u)]
-      ]
-    occ = getOccName v
-    occ_str = occNameString occ
-    base_str = reverse (dropWhile isDigit (reverse occ_str))
-
-pprSourceTermId :: LocalRdrEnv -> [Id] -> Id -> SDoc
-pprSourceTermId lcl_rdr term_ids v =
-  maybe (pprPrefixOcc (getOccName v)) (pprPrefixOcc . nameOccName) (sourceTermOcc lcl_rdr term_ids v)
-
--- | Discover 1-subgoal refinement fits for Required-type-argument congruence
--- functions such as @cong :: ... forall (f :: a %m -> b) -> ... x :~: y -> f x :~: f y@.
--- Returns @(cand_name, raw_refinement_doc, (fn_prefix_doc, subgoal_ty))@.
-findReqCongFits :: (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-                -> TidyEnv
-                -> HoleFitDispConfig
-                -> TypedHole
-                -> LocalRdrEnv
-                -> [Id]
-                -> TcType
-                -> [HoleFitCandidate]
-                -> TcM (TidyEnv, [(Name, SDoc, (SDoc, TcType))])
-findReqCongFits lookup_fn tidy_env0 hfdc hole lcl_rdr hole_term_ids orig_hole_ty cands
-  | Just (_, lhs, rhs) <- splitNominalEqLike orig_hole_ty
-  , Just (f_ty, f_doc, _) <- splitCongSpine lcl_rdr hole_term_ids lhs rhs
-  = go f_ty f_doc tidy_env0 [] cands
-  where
-    hole_no_self = hole { th_hole = Nothing }
-
-    go _ _ env acc [] = return (env, reverse acc)
-    go f_ty f_doc env acc (cand : rest) =
-      tryTcDiscardingErrs (go f_ty f_doc env acc rest) $
-      do { mb_info <- lookupReqCongCand lookup_fn cand
-         ; case mb_info of
-             Nothing -> go f_ty f_doc env acc rest
-             Just (nm, cand_ty, invis1, req_tv, invis2, theta, arg_ty, res_ty)
-               | Just tc1 <- depResHead res_ty
-               , Just tc2 <- depResHead orig_hole_ty
-               , tc1 == tc2 ->
-                 do { let all_tvs = invis1 ++ [req_tv] ++ invis2
-                          s_init  = Subst.extendTvSubst Subst.emptySubst req_tv f_ty
-                    ; case matchDepResult all_tvs res_ty orig_hole_ty of
-                        Nothing -> go f_ty f_doc env acc rest
-                        Just s_match ->
-                          let s_merged = foldl' (\s tv ->
-                                case Subst.lookupTyVar s_match tv of
-                                  Just t  -> Subst.extendTvSubstAndInScope s tv t
-                                  Nothing -> s) s_init all_tvs
-                          in do
-                            { mb_full <- completeDepSubst False emptyVarSet emptyVarSet all_tvs s_merged
-                            ; case mb_full of
-                                Nothing -> go f_ty f_doc env acc rest
-                                Just full_s ->
-                                  do { let choices = [ Subst.substTy full_s (mkTyVarTy tv)
-                                                     | tv <- all_tvs ]
-                                     ; scoped <- checkDepRuntimeScope choices
-                                     ; if not scoped
-                                       then go f_ty f_doc env acc rest
-                                       else do
-                                         { let inst_res = mkPhiTy (map (Subst.substTy full_s) theta)
-                                                                  (Subst.substTy full_s res_ty)
-                                               sub_ty   = Subst.substTy full_s arg_ty
-                                         ; mb_w <- withoutUnification
-                                                     (tyCoVarsOfTypes [orig_hole_ty, cand_ty]) $
-                                                     tcCheckHoleFit Shallow hole_no_self orig_hole_ty inst_res
-                                         ; case mb_w of
-                                             Nothing -> go f_ty f_doc env acc rest
-                                             Just _  ->
-                                               do { (env1, tidy_sub) <- liftZonkM $ zonkTidyTcType env sub_ty
-                                                  ; (env2, tidy_cty) <- liftZonkM $ zonkTidyTcType env1 cand_ty
-                                                  ; let prefix_doc = pprPrefixOcc nm <+> f_doc
-                                                        hole_doc
-                                                          | showMatches hfdc = parens (text "_" <+> dcolon <+> ppr tidy_sub)
-                                                          | otherwise        = text "_"
-                                                        where_doc = ppWhen (showType hfdc) $
-                                                          nest 2 (text "where" <+> pprPrefixOcc nm <+> dcolon <+> ppr tidy_cty)
-                                                        prov_doc = ppWhen (showProv hfdc) $
-                                                          nest 2 (pprCandProvenance cand)
-                                                        rdoc = (prefix_doc <+> hole_doc) $$ where_doc $$ prov_doc
-                                                  ; go f_ty f_doc env2 ((nm, rdoc, (prefix_doc, sub_ty)) : acc) rest } } } } }
-             _ -> go f_ty f_doc env acc rest }
-findReqCongFits _ tidy_env _ _ _ _ _ _ = return (tidy_env, [])
-
--- | Discover 1-subgoal transitivity refinement fits such as
--- @trans (plusSuc m k) (_ :: Succ (plus m k) :~: rhs)@ when an in-scope
--- transitivity combinator and a saturated @foreach@ lemma rewrite the hole's
--- left-hand side @lhs@ to a distinct intermediate term @mid@.
--- See Note [Dependent hole fits and subgoal splitting].
-findReqTransFits :: (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-                 -> TidyEnv
-                 -> HoleFitDispConfig
-                 -> CtLoc
-                 -> TypedHole
-                 -> (Name -> Bool)
-                 -> LocalRdrEnv
-                 -> [Id]
-                 -> [Id]
-                 -> TcType
-                 -> [HoleFitCandidate]
-                 -> TcM (TidyEnv, [(Name, SDoc, (SDoc, TcType))])
-findReqTransFits lookup_fn tidy_env0 hfdc ct_loc hole is_self_nm
-                 lcl_rdr hole_term_ids lcl_ids orig_hole_ty cands
-  | Just (eq_tc, lhs, rhs) <- splitNominalEqLike orig_hole_ty
-  , not (lhs `eqType` rhs)
-  = do { mb_trans <- find_trans eq_tc cands
-       ; case mb_trans of
-           Nothing -> return (tidy_env0, [])
-           Just (trans_nm, trans_cand, trans_ty, mk_eq) ->
-             do { budget_ref <- newTcRef (12 :: Int)
-                ; go_lems budget_ref eq_tc lhs rhs trans_nm trans_cand trans_ty mk_eq
-                    tidy_env0 [] cands } }
-  | otherwise
-  = return (tidy_env0, [])
-  where
-    hole_no_self = hole { th_hole = Nothing }
-    auto_locals = [ v | v <- lcl_ids, not (isUnderscore (nameOccName (idName v))) ]
-    strict_subterms = holeStrictSubterms hole auto_locals
-    resolve_arg = mkDepArgResolver lcl_rdr hole_term_ids auto_locals
-    ppr_src_id = pprSourceTermId lcl_rdr hole_term_ids
-
-    find_trans :: TyCon
-               -> [HoleFitCandidate]
-               -> TcM (Maybe (Name, HoleFitCandidate, Type, Type -> Type -> Type))
-    find_trans _ [] = return Nothing
-    find_trans eq_tc (cand : rest) =
-      tryTcDiscardingErrs (find_trans eq_tc rest) $
-      do { mb_info <- lookupTransCand lookup_fn eq_tc orig_hole_ty cand
-         ; case mb_info of
-             Just info -> return (Just info)
-             Nothing   -> find_trans eq_tc rest }
-
-    go_lems _ _ _ _ _ _ _ _ env acc [] = return (env, reverse acc)
-    go_lems budget_ref eq_tc lhs rhs trans_nm trans_cand trans_ty mk_eq env acc (cand : rest)
-      | length acc >= 3 = return (env, reverse acc)
-      | otherwise =
-        tryTcDiscardingErrs
-          (go_lems budget_ref eq_tc lhs rhs trans_nm trans_cand trans_ty mk_eq env acc rest) $
-        do { mb <- lookup_fn cand
-           ; case mb of
-               Just (lem_nm, is_dc, lem_ty)
-                 | not is_dc
-                 , hasVisDepPrefix lem_ty ->
-                   do { mb_hit <- try_lem budget_ref eq_tc lhs rhs mk_eq lem_nm lem_ty
-                      ; case mb_hit of
-                          Nothing ->
-                            go_lems budget_ref eq_tc lhs rhs trans_nm trans_cand trans_ty mk_eq env acc rest
-                          Just (lem_doc, sub_ty) ->
-                            do { (env1, tidy_sub) <- liftZonkM $ zonkTidyTcType env sub_ty
-                               ; (env2, tidy_tty) <- liftZonkM $ zonkTidyTcType env1 trans_ty
-                               ; let prefix_doc = pprPrefixOcc trans_nm <+> parens lem_doc
-                                     hole_doc
-                                       | showMatches hfdc = parens (text "_" <+> dcolon <+> ppr tidy_sub)
-                                       | otherwise        = text "_"
-                                     where_doc = ppWhen (showType hfdc) $
-                                       nest 2 (text "where" <+> pprPrefixOcc trans_nm <+> dcolon <+> ppr tidy_tty)
-                                     prov_doc = ppWhen (showProv hfdc) $
-                                       nest 2 (pprCandProvenance trans_cand)
-                                     rdoc = (prefix_doc <+> hole_doc) $$ where_doc $$ prov_doc
-                               ; go_lems budget_ref eq_tc lhs rhs trans_nm trans_cand trans_ty mk_eq
-                                   env2 ((trans_nm, rdoc, (prefix_doc, sub_ty)) : acc) rest } }
-               _ -> go_lems budget_ref eq_tc lhs rhs trans_nm trans_cand trans_ty mk_eq env acc rest }
-
-    try_lem :: TcRef Int
-            -> TyCon
-            -> Type
-            -> Type
-            -> (Type -> Type -> Type)
-            -> Name
-            -> Type
-            -> TcM (Maybe (SDoc, Type))
-    try_lem budget_ref eq_tc lhs rhs mk_eq lem_nm lem_ty =
-      do { mb_p <- peelForeachCand lem_ty
-         ; case mb_p of
-             Nothing -> pure Nothing
-             Just (invis_tvs, dep_vars, lem_theta, lem_res_abs)
-               | Just (lem_tc, lem_lhs_tmpl, lem_rhs_tmpl) <- splitNominalEqLike lem_res_abs
-               , lem_tc == eq_tc ->
-                 let all_tvs = invis_tvs ++ map snd dep_vars
-                 in case matchStrictDepLhs all_tvs lem_lhs_tmpl lhs of
-                      Nothing -> pure Nothing
-                      Just s_match ->
-                        case traverse (resolve_arg s_match) dep_vars of
-                          Nothing -> pure Nothing
-                          Just arg_ids
-                            | is_self_nm lem_nm
-                            , not (any (`elemVarSet` strict_subterms) arg_ids)
-                            -> pure Nothing
-                            | otherwise ->
-                              do { let s_with_args = foldl' (\s ((_, tv), v) ->
-                                         Subst.extendTvSubstAndInScope s tv (TermVarTy v))
-                                         s_match (zip dep_vars arg_ids)
-                                 ; mb_full <- completeDepSubst False emptyVarSet emptyVarSet all_tvs s_with_args
-                                 ; case mb_full of
-                                     Nothing -> pure Nothing
-                                     Just full_s ->
-                                       do { let choices = [ Subst.substTy full_s (mkTyVarTy tv)
-                                                          | tv <- all_tvs ]
-                                          ; scoped <- checkDepRuntimeScope choices
-                                          ; if not scoped
-                                            then pure Nothing
-                                            else do
-                                              { let mid_raw = Subst.substTy full_s lem_rhs_tmpl
-                                              ; mid <- preNormalizeHoleTy True ct_loc mid_raw
-                                              ; if mid `tcEqType` lhs || mid `tcEqType` rhs
-                                                then pure Nothing
-                                                else do
-                                                  { n <- readTcRef budget_ref
-                                                  ; if n <= 0
-                                                    then pure Nothing
-                                                    else do
-                                                      { writeTcRef budget_ref (n - 1)
-                                                      ; let inst_lem_ty =
-                                                              mkPhiTy (map (Subst.substTy full_s) lem_theta)
-                                                                      (Subst.substTy full_s lem_res_abs)
-                                                            exp_lem_ty = mk_eq lhs mid
-                                                      ; mb_w <- withoutUnification
-                                                                  (tyCoVarsOfTypes [exp_lem_ty, inst_lem_ty]) $
-                                                                  tcCheckHoleFit Shallow hole_no_self exp_lem_ty inst_lem_ty
-                                                      ; pure $ case mb_w of
-                                                          Nothing -> Nothing
-                                                          Just _  ->
-                                                            let lem_doc = pprPrefixOcc lem_nm <+> sep (map ppr_src_id arg_ids)
-                                                            in Just (lem_doc, mk_eq mid rhs) } } } } }
-               | otherwise -> pure Nothing }
-
-lookupTransCand :: (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-                -> TyCon
-                -> TcType
-                -> HoleFitCandidate
-                -> TcM (Maybe (Name, HoleFitCandidate, Type, Type -> Type -> Type))
-lookupTransCand lookup_fn eq_tc orig_hole_ty cand =
-  do { mb_ty <- lookup_fn cand
-     ; return $ do
-         (nm, False, ty0) <- mb_ty
-         let (invis_b, ty1) = tcSplitForAllInvisTyVars ty0
-             invis_tvs      = map snd invis_b
-             (theta, ty2)   = tcSplitPhiTy ty1
-         guard (null theta)
-         FunTy { ft_af = af1, ft_arg = arg1_ty, ft_res = ty3 } <- pure (coreFullView ty2)
-         guard (isVisibleFunArg af1)
-         FunTy { ft_af = af2, ft_arg = arg2_ty, ft_res = res_ty } <- pure (coreFullView ty3)
-         guard (isVisibleFunArg af2 && isTauTy res_ty)
-         (tc_r, TyVarTy a_tv, TyVarTy c_tv) <- splitNominalEqLike res_ty
-         (tc_1, TyVarTy a1,   TyVarTy b1)   <- splitNominalEqLike arg1_ty
-         (tc_2, TyVarTy b2,   TyVarTy c2)   <- splitNominalEqLike arg2_ty
-         guard (tc_r == eq_tc && tc_1 == eq_tc && tc_2 == eq_tc)
-         guard (a1 == a_tv && b2 == b1 && c2 == c_tv)
-         guard (b1 /= a_tv && b1 /= c_tv && a_tv /= c_tv)
-         s_base <- matchDepResult invis_tvs res_ty orig_hole_ty
-         let mk_eq l r =
-               let s = Subst.extendTvSubstAndInScope
-                         (Subst.extendTvSubstAndInScope s_base a_tv l) c_tv r
-               in Subst.substTy s res_ty
-         pure (nm, cand, ty0, mk_eq) }
-
-matchStrictDepLhs :: [TyVar] -> Type -> Type -> Maybe Subst.Subst
-matchStrictDepLhs bind_tvs formal actual
-  | Just s <- tcMatchTyX_BM bind_fn Subst.emptySubst formal actual
-  = Just s
-  | Just (tc1, ts1) <- splitTyConApp_maybe (coreFullView formal)
-  , Just (tc2, ts2) <- splitTyConApp_maybe (coreFullView actual)
-  , tc1 == tc2
-  , isAlgTyCon tc1 || isTypeFamilyTyCon tc1 || isJust (isPromotedDataCon_maybe tc1)
-  , ts1 `equalLength` ts2
-  = foldM (\s (t1, t2) -> match_sub s t1 t2) Subst.emptySubst (zip ts1 ts2)
-  | otherwise
-  = Nothing
-  where
-    bind_fn tv _
-      | tv `elem` bind_tvs = BindMe
-      | otherwise          = DontBindMe
-
-    match_sub s t1 t2
-      | Just s1 <- tcMatchTyX_BM bind_fn s (typeKind t1) (typeKind t2)
-      , Just s2 <- tcMatchTyX_BM bind_fn s1 t1 t2
-      = Just s2
-      | Just (tc1, ts1) <- splitTyConApp_maybe (coreFullView t1)
-      , Just (tc2, ts2) <- splitTyConApp_maybe (coreFullView t2)
-      , tc1 == tc2
-      , isAlgTyCon tc1 || isTypeFamilyTyCon tc1 || isJust (isPromotedDataCon_maybe tc1)
-      , ts1 `equalLength` ts2
-      = foldM (\acc (u1, u2) -> match_sub acc u1 u2) s (zip ts1 ts2)
-      | otherwise
-      = Nothing
-
-lookupReqCongCand :: (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-                  -> HoleFitCandidate
-                  -> TcM (Maybe (Name, Type, [TyVar], TyVar, [TyVar], [PredType], Type, Type))
-lookupReqCongCand lookup_fn cand =
-  do { mb_ty <- lookup_fn cand
-     ; return $ do
-         (nm, _, ty0) <- mb_ty
-         let (invis1_b, ty1) = tcSplitForAllInvisTyVars ty0
-         ForAllTy _ (Bndr req_tv Required) ty2 <- pure (coreFullView ty1)
-         let (invis2_b, ty3) = tcSplitForAllInvisTyVars ty2
-             (theta, ty4)    = tcSplitPhiTy ty3
-         FunTy { ft_af = af, ft_arg = arg_ty, ft_res = res_ty } <- pure (coreFullView ty4)
-         guard (isVisibleFunArg af && isTauTy res_ty)
-         pure (nm, ty0, map snd invis1_b, req_tv, map snd invis2_b, theta, arg_ty, res_ty) }
 
 lookupCandType :: HoleFitCandidate -> TcM (Maybe (Name, Bool, Type))
 lookupCandType (IdHFCand i)
@@ -2416,336 +1985,3 @@ lookupCandType hfc
 isAllowedCandId :: Id -> Bool
 isAllowedCandId i =
   nameModule_maybe (idName i) `notElem` [Just gHC_INTERNAL_ERR, Just gHC_INTERNAL_UNSAFE_COERCE]
-
-pprCandProvenance :: HoleFitCandidate -> SDoc
-pprCandProvenance (GreHFCand gre)  = parens (pprNameProvenance gre)
-pprCandProvenance (NameHFCand nm)  = parens (text "bound at" <+> ppr (getSrcLoc nm))
-pprCandProvenance (IdHFCand i)     = parens (text "bound at" <+> ppr (getSrcLoc i))
-
--- | Extract the two endpoint types from an equality-like 2-index GADT such as
--- @(:~:)@ or @EqP@.
-splitNominalEqLike :: Type -> Maybe (TyCon, Type, Type)
-splitNominalEqLike ty
-  | Just (tc, args) <- splitTyConApp_maybe (coreFullView ty)
-  , isAlgTyCon tc
-  , rhs : lhs : _ <- reverse args
-  , typeKind lhs `eqType` typeKind rhs
-  = Just (tc, lhs, rhs)
-  | otherwise
-  = Nothing
-
--- | Match @F u@ against @F v@ where @F@ is either a promoted data constructor
--- (such as @Succ@) or a certified source-table function prefix (such as @plus m@).
-splitCongSpine :: LocalRdrEnv -> [Id] -> Type -> Type -> Maybe (Type, SDoc, (Type, Type))
-splitCongSpine lcl_rdr hole_term_ids lhs rhs
-  | Just (tc1, as1) <- splitTyConApp_maybe (coreFullView lhs)
-  , Just (tc2, as2) <- splitTyConApp_maybe (coreFullView rhs)
-  , tc1 == tc2
-  , u : rev_prefix1 <- reverse as1
-  , v : rev_prefix2 <- reverse as2
-  , rev_prefix1 `equalLength` rev_prefix2
-  , and (zipWith eqType rev_prefix1 rev_prefix2)
-  = let prefix_tys = reverse rev_prefix1
-        f_ty = mkTyConApp tc1 prefix_tys
-    in if | Just dc <- isPromotedDataCon_maybe tc1
-          , let vis_prefix = filterOutInvisibleTypes tc1 prefix_tys
-          , null vis_prefix
-          -> Just (f_ty, pprPrefixOcc (dataConName dc), (u, v))
-          | Just raw_occ <- sourceTableTermOcc (nameOccName (tyConName tc1))
-          , isNothing (stripPrefix "#guard:" (occNameString raw_occ))
-          , Just arg_docs <- traverse (pprSimpleTermType lcl_rdr hole_term_ids) prefix_tys
-          -> let doc = case arg_docs of
-                         [] -> pprPrefixOcc raw_occ
-                         ds -> parens (pprPrefixOcc raw_occ <+> sep ds)
-             in Just (f_ty, doc, (u, v))
-          | otherwise
-          -> Nothing
-  | otherwise
-  = Nothing
-
-pprSimpleTermType :: LocalRdrEnv -> [Id] -> Type -> Maybe SDoc
-pprSimpleTermType lcl_rdr hole_term_ids ty
-  | TermVarTy v <- coreFullView ty
-  , isNonCoVarId v
-  , not (isUnderscore (nameOccName (idName v)))
-  = Just (pprSourceTermId lcl_rdr hole_term_ids v)
-  | Just (tc, []) <- splitTyConApp_maybe (coreFullView ty)
-  , Just dc <- isPromotedDataCon_maybe tc
-  = Just (pprPrefixOcc (dataConName dc))
-  | otherwise
-  = Nothing
-
--- | Variables proven to be strict structural subterms of a matched scrutinee.
-holeStrictSubterms :: TypedHole -> [Id] -> VarSet
-holeStrictSubterms hole auto_locals = mkVarSet $
-  [ v
-  | imp <- th_implics hole
-  , ev  <- ic_given imp
-  , Just (_, lhs, rhs) <- [getEqPredTys_maybe (varType ev)]
-  , v <- subterms_from_eq lhs rhs ++ subterms_from_eq rhs lhs
-  ] ++
-  [ v
-  | imp <- th_implics hole
-  , PatSkol (RealDataCon dc) _ <- [ic_info imp]
-  , dataConSourceArity dc > 0
-  , let outer_ids = mkVarSet [ b | TcIdBndr b _ <- ctl_bndrs (ic_env imp) ]
-  , v <- auto_locals
-  , not (v `elemVarSet` outer_ids)
-  ]
-  where
-    subterms_from_eq (TermVarTy outer_v) rhs
-      | Just (tc, args) <- splitTyConApp_maybe (coreFullView rhs)
-      , isJust (isPromotedDataCon_maybe tc)
-      = [ v | v <- concatMap tyCoVarsOfTypeList args, isNonCoVarId v, v /= outer_v ]
-    subterms_from_eq _ _ = []
-
-mkDepArgResolver :: LocalRdrEnv -> [Id] -> [Id] -> Subst.Subst -> (Id, TyVar) -> Maybe Id
-mkDepArgResolver lcl_rdr hole_term_ids auto_locals =
-  \subst (_, tv) ->
-    case Subst.lookupTyVar subst tv of
-      Just (TermVarTy v)
-        | Just v' <- lookupVarEnv local_by_id v -> Just v'
-        | Just v' <- lookupOccEnv local_by_occ (getOccName v)
-        , varType v' `eqType` Subst.substTy subst (tyVarKind tv) -> Just v'
-        | Just src_nm <- sourceTermOcc lcl_rdr hole_term_ids v
-        , Just v' <- lookupOccEnv local_by_occ (nameOccName src_nm)
-        , varType v' `eqType` Subst.substTy subst (tyVarKind tv) -> Just v'
-      _ -> Nothing
-  where
-    local_by_id = mkVarEnv [ (v, v) | v <- auto_locals ]
-    local_by_occ = mkOccEnv [ (getOccName v, v) | v <- reverse auto_locals ]
-
-hasVisDepPrefix :: Type -> Bool
-hasVisDepPrefix ty =
-  let (_, b1) = tcSplitForAllInvisTyVars ty
-      (_, b2) = tcSplitPhiTy b1
-  in case coreFullView b2 of
-       DepFunTy DepFunVisible _ _ -> True
-       _ -> False
-
--- | Peel 1..4 visible 'DepFunTy' binders (plus invisible binders and class
--- constraints) into fresh template 'TyVar's for saturated @foreach@ matching.
-peelForeachCand :: Type -> TcM (Maybe ([TyVar], [(Id, TyVar)], [PredType], Type))
-peelForeachCand = go [] [] [] []
-  where
-    go invis_tvs dep_vars theta dep_pairs ty
-      | Just ty' <- coreView ty
-      = go invis_tvs dep_vars theta dep_pairs ty'
-      | ForAllTy _ (Bndr tv vis) body <- ty
-      , isInvisibleForAllTyFlag vis
-      = go (invis_tvs ++ [tv]) dep_vars theta dep_pairs body
-      | FunTy { ft_af = af, ft_arg = pred_ty, ft_res = body } <- ty
-      , not (isVisibleFunArg af)
-      = case abstractNativeIndices dep_pairs pred_ty of
-          Nothing -> pure Nothing
-          Just pred' -> go invis_tvs dep_vars (theta ++ [pred']) dep_pairs body
-      | DepFunTy DepFunVisible bndr body <- ty
-      , length dep_vars < 4
-      = case abstractNativeIndices dep_pairs (varType bndr) of
-          Nothing -> pure Nothing
-          Just dom' ->
-            do { nm <- newSysName (mkTyVarOccFS (occNameFS (getOccName bndr)))
-               ; let tv = mkTyVar nm dom'
-               ; go invis_tvs (dep_vars ++ [(bndr, tv)]) theta
-                   (dep_pairs ++ [(TermVarTy bndr, tv)]) body }
-      | not (null dep_vars)
-      , isTauTy ty
-      = case abstractNativeIndices dep_pairs ty of
-          Nothing -> pure Nothing
-          Just res' -> pure $ Just (invis_tvs, dep_vars, theta, res')
-      | otherwise
-      = pure Nothing
-
--- | Bounded 1-step dependent proof synthesis built on top of local bindings,
--- result-directed @foreach@ calls, and 1-subgoal refinement fits.
--- Strictly capped at 20 solver checks.
--- See Note [Dependent hole fits and subgoal splitting].
-findDependentAutoFits :: (HoleFitCandidate -> TcM (Maybe (Name, Bool, Type)))
-                      -> TidyEnv
-                      -> HoleFitDispConfig
-                      -> TypedHole
-                      -> TcType
-                      -> TcType
-                      -> (Name -> Bool)
-                      -> LocalRdrEnv
-                      -> [Id]
-                      -> [Id]
-                      -> [HoleFitCandidate]
-                      -> [TcHoleFit]
-                      -> [TcHoleFit]
-                      -> [(Name, SDoc, (SDoc, TcType))]
-                      -> TcM [HoleFit]
-findDependentAutoFits lookup_fn _tidy_env hfdc hole hole_ty tidy_hole_ty
-                      is_self_nm lcl_rdr hole_term_ids lcl_ids cands
-                      direct_subs rsubs req_step_fits =
-  do { budget_ref <- newTcRef (20 :: Int)
-     ; let spend_budget :: TcM Bool
-           spend_budget = do
-             n <- readTcRef budget_ref
-             if n <= 0
-               then return False
-               else writeTcRef budget_ref (n - 1) >> return True
-
-           check_goal :: Bool -> TcType -> TcType -> TcM Bool
-           check_goal is_dc goal_ty cand_ty = do
-             ok <- spend_budget
-             if not ok
-               then return False
-               else tryTcDiscardingErrs (pure False) $
-                    withoutUnification (tyCoVarsOfTypes [goal_ty, cand_ty]) $
-                    isJust <$> tcDepCheckCand (hole { th_hole = Nothing })
-                                 0 goal_ty cand_ty is_dc
-
-           -- Solve a leaf goal in 1 step (is_atom == True => needs no parens)
-           solve_leaf :: TcType -> TcM [(SDoc, Bool)]
-           solve_leaf goal_ty = do
-             -- 1. Accessible local bindings (excluding unreduced self-calls)
-             lcl_hits <- fmap catMaybes $ mapM (\v ->
-               if is_self_nm (idName v) && not (v `elemVarSet` strict_subterms)
-                 then pure Nothing
-                 else do
-                   let v_ty = idType v
-                   if depResHead v_ty /= depResHead goal_ty && isJust (depResHead v_ty) && isJust (depResHead goal_ty)
-                     then pure Nothing
-                     else do
-                       ok <- if v_ty `eqType` goal_ty
-                             then pure True
-                             else check_goal False goal_ty v_ty
-                       pure $ if ok then Just (ppr_src_id v, True) else Nothing
-               ) auto_locals
-             -- 2. Nullary / 0-arg constructors of the goal's head TyCon (e.g. Refl, ZleN)
-             con_hits <- case splitTyConApp_maybe (coreFullView goal_ty) of
-               Just (gtc, _) | isAlgTyCon gtc ->
-                 fmap catMaybes $ mapM (\dc ->
-                   let dc_nm = dataConName dc
-                   in if not (dc_nm `elemNameSet` in_scope_names)
-                         || not (null (dataConOrigArgTys dc))
-                      then pure Nothing
-                      else do
-                        ok <- check_goal True goal_ty (dataConWrapperType dc)
-                        pure $ if ok then Just (pprPrefixOcc dc_nm, True) else Nothing
-                   ) (take 4 (tyConDataCons gtc))
-               _ -> pure []
-             -- 3. Result-directed saturated foreach calls
-             foreach_hits <- solve_foreach check_goal goal_ty
-             pure (lcl_hits ++ con_hits ++ foreach_hits)
-
-     -- A. Direct saturated foreach calls for the outer hole itself
-     ; direct_foreach <- solve_foreach check_goal hole_ty
-
-     -- B. Required-type-arg congruence and transitivity step wrappers (e.g. cong Succ <subproof>)
-     ; cong_auto <- fmap concat $ mapM (\(_, _, (prefix_doc, sub_ty)) -> do
-         sub_sols <- solve_leaf sub_ty
-         pure [ prefix_doc <+> parend doc | (doc, is_atom) <- take 2 sub_sols
-              , let parend d = if is_atom then d else parens d ]
-       ) (take 4 req_step_fits)
-
-     -- C. 1-subgoal refinement fits (e.g. SleS h, LS h, congSucc (plusAssoc m n p))
-     ; let one_arg_rfits = take 6
-             [ (hfName hf, sub_ty)
-             | hf <- rsubs
-             , [sub_ty] <- [hfMatches hf]
-             , isSpecificOneArgWrapper (hfType hf)
-             ]
-     ; ref_auto <- fmap concat $ mapM (\(fn_nm, sub_ty) ->
-         let is_self = is_self_nm fn_nm
-         in if is_self && isEmptyVarSet strict_subterms
-            then pure []
-            else do
-              sub_sols <- solve_leaf sub_ty
-              pure [ pprPrefixOcc fn_nm <+> parend doc
-                   | (doc, is_atom) <- take 2 sub_sols
-                   , let parend d = if is_atom then d else parens d ]
-       ) one_arg_rfits
-
-     ; let direct_occ_strs = Set.fromList
-             [ showSDocUnsafe (pprPrefixOcc (hfName hf)) | hf <- direct_subs ]
-           all_docs = [ fst d | d <- direct_foreach ] ++ cong_auto ++ ref_auto
-           -- Deduplicate rendered suggestions while preserving order
-           dedup _ [] = []
-           dedup seen (d : ds)
-             | let key = showSDocUnsafe d
-             , key `Set.member` seen = dedup seen ds
-             | otherwise = d : dedup (Set.insert (showSDocUnsafe d) seen) ds
-           not_dup_bare d = not (showSDocUnsafe d `Set.member` direct_occ_strs)
-           unique_docs = filter not_dup_bare (dedup Set.empty all_docs)
-           format_raw doc
-             | showType hfdc = RawHoleFit (hang doc 2 (dcolon <+> ppr tidy_hole_ty))
-             | otherwise     = RawHoleFit doc
-     ; return (map format_raw (take 6 unique_docs)) }
-  where
-    in_scope_names = mkNameSet (map getName cands)
-    auto_locals = [ v | v <- lcl_ids, not (isUnderscore (nameOccName (idName v))) ]
-    strict_subterms = holeStrictSubterms hole auto_locals
-    resolve_dep_arg = mkDepArgResolver lcl_rdr hole_term_ids auto_locals
-    ppr_src_id = pprSourceTermId lcl_rdr hole_term_ids
-
-    -- Exclude degenerate bare-tyvar wrappers (id, ($), const) and visible
-    -- DepFunTy wrappers (handled with exact index matching in solve_foreach).
-    isSpecificOneArgWrapper :: Type -> Bool
-    isSpecificOneArgWrapper ty0 =
-      let (_, ty1) = tcSplitForAllInvisTyVars ty0
-          (_, ty2) = tcSplitPhiTy ty1
-      in case coreFullView ty2 of
-           FunTy { ft_af = af, ft_res = res } | isVisibleFunArg af ->
-             isJust (depResHead res)
-           _ -> False
-
-    -- Match saturated foreach functions (1..4 visible DepFunTy binders)
-    -- against goal_ty using result-directed index matching.
-    solve_foreach :: (Bool -> TcType -> TcType -> TcM Bool)
-                  -> TcType
-                  -> TcM [(SDoc, Bool)]
-    solve_foreach check_goal goal_ty
-      | not (isTauTy goal_ty) = pure []
-      | Nothing <- depResHead goal_ty = pure []
-      | otherwise = go_fe [] cands
-      where
-        go_fe acc [] = pure (reverse acc)
-        go_fe acc (cand : rest)
-          | length acc >= 3 = pure (reverse acc)
-          | otherwise =
-            tryTcDiscardingErrs (go_fe acc rest) $
-            do { mb <- lookup_fn cand
-               ; case mb of
-                   Just (fn_nm, is_dc, cand_ty)
-                     | hasVisDepPrefix cand_ty ->
-                       do { mb_hit <- try_one_fe fn_nm is_dc cand_ty
-                          ; case mb_hit of
-                              Just hit -> go_fe ((hit, False) : acc) rest
-                              Nothing  -> go_fe acc rest }
-                   _ -> go_fe acc rest }
-
-        try_one_fe :: Name -> Bool -> Type -> TcM (Maybe SDoc)
-        try_one_fe fn_nm is_dc cand_ty =
-          do { mb_p <- peelForeachCand cand_ty
-             ; case mb_p of
-                 Nothing -> pure Nothing
-                 Just (invis_tvs, dep_vars, theta, res_abs)
-                   | depResHead res_abs /= depResHead goal_ty
-                   -> pure Nothing
-                   | otherwise ->
-                     let all_tvs = invis_tvs ++ map snd dep_vars
-                     in case matchDepResult all_tvs res_abs goal_ty of
-                          Nothing -> pure Nothing
-                          Just s_match ->
-                            case traverse (resolve_dep_arg s_match) dep_vars of
-                              Nothing -> pure Nothing
-                              Just arg_ids
-                                | is_self_nm fn_nm
-                                , not (any (`elemVarSet` strict_subterms) arg_ids)
-                                -> pure Nothing
-                                | otherwise ->
-                                  do { let s_with_args = foldl' (\s ((_, tv), v) ->
-                                             Subst.extendTvSubstAndInScope s tv (TermVarTy v))
-                                             s_match (zip dep_vars arg_ids)
-                                     ; mb_full <- completeDepSubst False emptyVarSet emptyVarSet all_tvs s_with_args
-                                     ; case mb_full of
-                                         Nothing -> pure Nothing
-                                         Just full_s ->
-                                           do { let inst_ty = mkPhiTy (map (Subst.substTy full_s) theta)
-                                                                      (Subst.substTy full_s res_abs)
-                                              ; ok <- check_goal is_dc goal_ty inst_ty
-                                              ; pure $ if ok
-                                                then Just (pprPrefixOcc fn_nm <+> sep (map ppr_src_id arg_ids))
-                                                else Nothing } } }

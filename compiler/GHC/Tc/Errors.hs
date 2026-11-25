@@ -1741,13 +1741,13 @@ coercion variables.
    @ys@) cause 'tidySigSkol' to rename @foreach (xs :: [a])@ to @xs1@ when
    printing the enclosing signature.
 
-3. When 'ExperimentalDependentTypes' is active and no direct non-recursive fit
-   solves an expression hole, inspect the hole type for stuck certified
-   source-table family applications @T:f arg_1 ... arg_n@. If a constructor-
-   scrutinized argument position holds an unrefined local algebraic variable
-   @x@ that is bound in the enclosing clause or expression scope (not a
-   'DepFunTy' binder quantified inside the hole type itself), emit a
-   'DependentCaseSplitHint' suggesting a pattern match on @x@.
+3. When `DependentTypes` is active and no direct non-recursive fit solves an
+   expression hole, inspect the hole type for stuck certified source-table
+   family applications @T:f arg_1 ... arg_n@. If a constructor-scrutinized
+   argument position holds an unrefined local algebraic variable @x@ that is
+   bound in the enclosing clause or expression scope (not a 'DepFunTy' binder
+   quantified inside the hole type itself), emit a 'DependentCaseSplitHint'
+   suggesting a pattern match on @x@.
 -}
 
 -- | Release bound 'DepFunTy' binder occurrences from 'TidyOccEnv' before
@@ -1767,9 +1767,9 @@ tidyHoleSkolEnv env@(occ_env, var_env) grouped_skvs
     skol_info_tys _                    = []
 
     tidy_occ v = getOccName (fromMaybe v (lookupVarEnv var_env v))
-    avoid_fs =
-      [ occNameFS (tidy_occ tv) | (_, tvs) <- grouped_skvs, tv <- tvs ] ++
-      [ occNameFS (tidy_occ v)  | ty <- skol_tys, v <- tyCoVarsOfTypeList ty ]
+    avoid_fs = UM.listToUniqMap $
+      [ (occNameFS (tidy_occ tv), ()) | (_, tvs) <- grouped_skvs, tv <- tvs ] ++
+      [ (occNameFS (tidy_occ v),  ()) | ty <- skol_tys, v <- tyCoVarsOfTypeList ty ]
 
     dep_bndr_occs ty | Just ty' <- coreView ty = dep_bndr_occs ty'
     dep_bndr_occs (DepFunTy _ v b)   = getOccName v : dep_bndr_occs (varType v) ++ dep_bndr_occs b
@@ -1783,7 +1783,7 @@ tidyHoleSkolEnv env@(occ_env, var_env) grouped_skvs
       [ occ
       | ty <- skol_tys
       , occ <- dep_bndr_occs ty
-      , occNameFS occ `notElem` avoid_fs
+      , not (UM.elemUniqMap (occNameFS occ) avoid_fs)
       ]
 
 -- | Diagnostic hint suggesting a pattern match on a local index variable to
@@ -1820,9 +1820,9 @@ dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_t
       ]
     untidy_id v = fromMaybe v (lookupVarEnv local_bndr_env v)
 
-    bndr_occ (TcIdBndr bndr_id top_lvl)     = Just (nameOccName (idName bndr_id), top_lvl)
+    bndr_occ (TcIdBndr bndr_id top_lvl)      = Just (nameOccName (idName bndr_id), top_lvl)
     bndr_occ (TcIdBndr_ExpType nm _ top_lvl) = Just (nameOccName nm, top_lvl)
-    bndr_occ (TcTvBndr _ _)                 = Nothing
+    bndr_occ (TcTvBndr _ _)                  = Nothing
 
     all_id_bndrs = mapMaybe bndr_occ (ctl_bndrs lcl_env)
     not_top_occs = [ occ | (occ, top_lvl) <- all_id_bndrs, not (isTopLevel top_lvl) ]
@@ -1867,20 +1867,26 @@ dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_t
       raw <- sourceTableTermOcc (nameOccName (tyConName tc))
       pure $ maybe raw mkVarOcc (stripPrefix "#guard:" (occNameString raw))
 
-    scrutinized_ixs :: FamInstEnvs -> TyCon -> Int -> [Int]
-    scrutinized_ixs fam_envs tc n_args
-      | null lhs_rows = [0 .. n_args - 1]
-      | otherwise
-      = [ i
-        | i <- [0 .. n_args - 1]
-        , any (\row -> i < length row && isNothing (getTyVar_maybe (row !! i))) lhs_rows
-        ]
+    scrutinized_args :: FamInstEnvs -> TyCon -> [Type] -> [Type]
+    scrutinized_args fam_envs tc args
+      | null lhs_rows = args
+      | otherwise     = go_cols lhs_rows args
       where
         closed_rows = case closedFamilyTyConCoAxiom_maybe tc of
           Just ax -> map cab_lhs (fromBranches (coAxiomBranches ax))
           Nothing -> []
         open_rows = map fi_tys (familyInstances fam_envs tc)
         lhs_rows = closed_rows ++ open_rows
+
+        go_cols _ [] = []
+        go_cols rows (a : as)
+          | null heads = []
+          | any (isNothing . getTyVar_maybe) heads = a : rest
+          | otherwise                              = rest
+          where
+            heads = [ r  | r : _  <- rows ]
+            tails = [ rs | _ : rs <- rows ]
+            rest  = go_cols tails as
 
     unwrap_term_var :: VarSet -> Type -> Maybe Id
     unwrap_term_var bound ty
@@ -1917,8 +1923,8 @@ dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_t
                 | isTypeFamilyTyCon tc
                 , Just fun_occ <- owner_occ tc
                 = [ (v, cons, fun_occ)
-                  | i <- scrutinized_ixs fam_envs tc (length args)
-                  , Just v <- [unwrap_term_var bound (args !! i)]
+                  | arg <- scrutinized_args fam_envs tc args
+                  , Just v <- [unwrap_term_var bound arg]
                   , Just cons <- [alg_cons_of v]
                   ]
                 | otherwise = []

@@ -30,21 +30,21 @@ data LE (m :: Nat) (n :: Nat) where
   LZ :: LE Zero n
   LS :: LE m n -> LE (Succ m) (Succ n)
 
--- 1. Base case suggests Refl; recursive step suggests cong Succ (plusAssoc m n p)
---    and congSucc (plusAssoc m n p), plus subgoal-splitting refinement fits.
+-- 1. Base case suggests Refl; recursive step suggests congSucc and cong
+--    refinement hole fits.
 plusAssoc :: foreach (m n p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
 plusAssoc Zero     _ _ = _
 plusAssoc (Succ m) n p = _
 
--- 2. Unsplit equation suggests pattern-matching on 'm' to reduce 'plus'.
+-- 2. Unsplit equation suggests pattern-matching on 'm' and 'n' to reduce 'plus'.
 plusCommUnsplit :: foreach (m n :: Nat) -> plus m n :~: plus n m
 plusCommUnsplit m n = _
 
--- 3. Direct foreach lemma instantiation suggests plusZero m.
+-- 3. Foreach lemma appears as a refinement hole fit plusZero (_ :: Nat).
 usePlusZero :: foreach (m :: Nat) -> plus m Zero :~: m
 usePlusZero m = _
 
--- 4. GADT proof holes inside foreach equations suggest LZ and LS h.
+-- 4. GADT proof holes inside foreach equations suggest LZ and LS (_ :: LE m n).
 leZero :: foreach (n :: Nat) -> LE Zero n
 leZero _ = _
 
@@ -99,7 +99,8 @@ lengthRev = _
 reverseIdPointfree :: forall a. foreach (xs :: List a) -> reverse xs :~: xs
 reverseIdPointfree = _
 
--- 8. Transitivity step refinement fit on an inductive equality goal (PLFH).
+-- 8. Level-2 abstract refinement fit suggests trans (_ :: lhs :~: b) (_ :: b :~: rhs)
+--    on dependent and indexed equality goals.
 add2 :: Nat -> Nat -> Nat
 add2 Zero     n = n
 add2 (Succ m) n = Succ (add2 m n)
@@ -115,3 +116,10 @@ add2Succ (Succ m) n = congSucc (add2Succ m n)
 add2Comm :: foreach (m k :: Nat) -> add2 m k :~: add2 k m
 add2Comm m Zero     = add2Zero m
 add2Comm m (Succ k) = _
+
+data Vec a (n :: Nat) where
+  VNil  :: Vec a Zero
+  VCons :: a -> Vec a n -> Vec a (Succ n)
+
+vecEqGoal :: forall a. foreach (n :: Nat) -> foreach (u :: Vec a n) -> foreach (v :: Vec a n) -> u :~: v
+vecEqGoal _ u v = _
