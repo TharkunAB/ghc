@@ -102,7 +102,9 @@ import GHC.Types.Var.Env (emptyVarEnv, mkInScopeSetList)
 import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs
+import GHC.Builtin.Modules ( mkGhcInternalModule )
 import GHC.Builtin.Uniques ( mkBuiltinUnique )
+import GHC.Iface.Env ( lookupOrig )
 
 import GHC.Driver.Config.HsToCore.Ticks (initTicksConfig)
 import GHC.Driver.Ppr (showSDoc)
@@ -259,13 +261,14 @@ tcPolyExprCheck expr res_ty
                               ; mb_rep <- if dep
                                           then tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType rho_ty')
                                           else pure Nothing
-                              ; as_ty <- if isJust mb_rep
-                                         then isUnadornedTypeExpr e
-                                         else pure False
-                              ; if as_ty
-                                then do { wc_ty <- expr_to_type (noLocA e)
-                                        ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
-                                else tcExpr e (mkCheckExpType rho_ty') } }
+                              ; case mb_rep of
+                                  Just (rep_kind, _) -> do
+                                    { as_ty <- isUnadornedTypeExpr e
+                                    ; if as_ty
+                                      then do { wc_ty <- expr_to_type_at_kind rep_kind (noLocA e)
+                                              ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
+                                      else tcExpr e (mkCheckExpType rho_ty') }
+                                  Nothing -> tcExpr e (mkCheckExpType rho_ty') } }
         in tc_body expr
 
     -- `outer_skolemise` checks expressions that need runtime abstraction.
@@ -730,6 +733,8 @@ tcExpr e@(XExpr (HsRecSelRn{}))  res_ty = tcApp e e [] res_ty
 tcExpr e@(HsAppType {})          res_ty = tcCollectApp e res_ty
 tcExpr e@(HsAppRetained {})      res_ty = tcCollectApp e res_ty
 tcExpr e@(HsApp {})              res_ty = tcCollectApp e res_ty
+tcExpr e@(XExpr (ExpandedThingRn (HSE (ExprCtxt HsGetField{}) _))) res_ty
+                                        = tcCollectApp e res_ty
 
 -- Typecheck an occurrence of an unbound Id
 --
@@ -1093,12 +1098,20 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
                 HsVar _ (L _ index) | not dependent || isNativeIndexId index ->
                   tcRetainedCase dependent index matches expected
                 _ | dependent ->
-                  do { call_index <- checkedNativeCallIndex scrut' scrut_ty
-                     ; case call_index of
-                         Nothing -> return Nothing
-                         Just index ->
+                  do { mb_ty_case <- case unLoc (stripParensLHsExpr scrut') of
+                         HsVar _ (L _ index) ->
                            fmap (fmap preserve_origin) $
-                             tcRetainedCallCase index scrut' matches expected }
+                             tcTypeWitnessCase index scrut_ty mult matches expected
+                         _ -> pure Nothing
+                     ; case mb_ty_case of
+                         Just ty_expr -> pure (Just ty_expr)
+                         Nothing -> do
+                           { call_index <- checkedNativeCallIndex scrut' scrut_ty
+                           ; case call_index of
+                               Nothing -> return Nothing
+                               Just index ->
+                                 fmap (fmap preserve_origin) $
+                                   tcRetainedCallCase index scrut' matches expected } }
                 _ -> return Nothing
             ; case special of
                 Just expr -> return expr
@@ -1529,6 +1542,141 @@ tcExpr e res_ty
        ; case mb_hse of
            Just hse -> tcHsExpansion hse res_ty
            Nothing  -> pprPanic "tcExpr: unhandled case:" (ppr e) }
+
+{- Note [Runtime Type case refinement via eqTypeRep]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #378 §4.9 allows runtime pattern matching on a retained
+`foreach (a :: Type) ->` binder `a`, whose runtime representation is
+`a_rep :: TypeRep @Type a_tv` for a skolem type variable `a_tv :: Type`.
+
+In `case a of { Int -> e1; Bool -> e2; [Char] -> e3; _ -> def }`, `Type` is an
+open universe, so a final catch-all branch (`_` or a variable pattern) is
+mandatory. Each concrete or in-scope `Typeable` type pattern `PatTy` elaborates
+to:
+
+  case eqTypeRep @Type @Type @a_tv a_rep (type PatTy) of
+    Just HRefl -> e_i
+    Nothing    -> <next_branch>
+
+Checking `type PatTy` at `TypeRep @Type beta` reuses `instCallWithLocalTypeReps`
+so both standard `Typeable` instances and in-scope `foreach (b :: Type)` witness
+variables supply `Typeable` evidence, while matching `Just HRefl` introduces the
+nominal equality `a_tv ~ PatTy` on the right-hand side.
+-}
+
+-- | Elaborate a runtime `Type` pattern match on a `foreach (a :: Type)` witness
+-- into nested `eqTypeRep` equality checks with a required final catch-all.
+-- See Note [Runtime Type case refinement via eqTypeRep].
+tcTypeWitnessCase :: Id -> TcType -> TcType
+                  -> MatchGroup GhcRn (LHsExpr GhcRn)
+                  -> ExpRhoType
+                  -> TcM (Maybe (HsExpr GhcTc))
+tcTypeWitnessCase scrut_id scrut_ty mult matches expected = do
+  scrut_ty' <- liftZonkM (zonkTcType scrut_ty)
+  mb_rep <- tcTypeRepTarget_maybe scrut_ty'
+  case mb_rep of
+    Just (scrut_kind, target_ty)
+      | tcIsLiftedTypeKind scrut_kind
+      , Just a_tv <- getTyVar_maybe target_ty
+      , not (isMetaTyVar a_tv) -> do
+          let alts = unLoc (mg_alts matches)
+          classified <- mapM classify_alt alts
+          if not (any is_type_alt classified)
+            then pure Nothing
+            else case split_type_alts classified of
+              Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedCasePatterns)
+              Just (ty_alts, catch_match) -> do
+                tcEqMult (OccurrenceOf (idName scrut_id)) mult ManyTy
+                eq_rep_nm <- lookupOrig
+                  (mkGhcInternalModule (fsLit "GHC.Internal.Data.Typeable.Internal"))
+                  (mkVarOcc "eqTypeRep")
+                hrefl_nm <- lookupOrig
+                  (mkGhcInternalModule (fsLit "GHC.Internal.Data.Type.Equality"))
+                  (mkDataOcc "HRefl")
+                let scrut_var = genLHsVar (idName scrut_id)
+                    fallback_mg = mkMatchGroup (Generated OtherExpansion SkipPmc)
+                                    noAnn (wrapGenSpan [catch_match])
+                    fallback_expr = wrapGenSpan (HsCase CaseAlt scrut_var fallback_mg)
+                    mk_branch (pat_loc, pat_wc_ty, grhss) next_expr =
+                      let k_ty    = wrapGenSpan (XHsType (HsCoreTyRn scrut_kind))
+                          a_ty_rn = wrapGenSpan (XHsType (HsCoreTyRn target_ty))
+                          c_k1    = wrapGenSpan (HsAppType Nothing (genLHsVar eq_rep_nm) (HsWC [] k_ty))
+                          c_k2    = wrapGenSpan (HsAppType Nothing c_k1 (HsWC [] k_ty))
+                          c_a     = wrapGenSpan (HsAppType Nothing c_k2 (HsWC [] a_ty_rn))
+                          emb_arg = L pat_loc (HsEmbTy noExtField pat_wc_ty)
+                          eq_call = wrapGenSpan (HsApp noExtField
+                                      (wrapGenSpan (HsApp noExtField c_a scrut_var)) emb_arg)
+                          just_p  = genSimpleConPat justDataConName [genSimpleConPat hrefl_nm []]
+                          noth_p  = genSimpleConPat nothingDataConName []
+                          just_m  = wrapGenSpan (Match { m_ext = noExtField
+                                                       , m_ctxt = CaseAlt
+                                                       , m_pats = wrapGenSpan [just_p]
+                                                       , m_grhss = grhss })
+                          noth_m  = genSimpleMatch CaseAlt [noth_p] next_expr
+                          mg      = mkMatchGroup (Generated OtherExpansion SkipPmc)
+                                      noAnn (wrapGenSpan [just_m, noth_m])
+                      in wrapGenSpan (HsCase CaseAlt eq_call mg)
+                    expanded = foldr mk_branch fallback_expr ty_alts
+                res_ty' <- expTypeToType expected
+                Just <$> tcExpr (unLoc expanded) (mkCheckExpType res_ty')
+    _ -> pure Nothing
+  where
+    classify_alt :: LMatch GhcRn (LHsExpr GhcRn)
+                 -> TcM (Either (Maybe (LMatch GhcRn (LHsExpr GhcRn)))
+                                (SrcSpanAnnA, LHsWcType GhcRn, GRHSs GhcRn (LHsExpr GhcRn)))
+    classify_alt m@(L _ Match { m_pats = L _ [pat@(L ploc _)], m_grhss = grhss })
+      | is_catch_all pat = pure (Left (Just m))
+      | otherwise = do
+          mb_ty <- rn_pat_to_wc_type pat
+          case mb_ty of
+            Just wc_ty
+              | [L _ (GRHS _ [] _)] <- NE.toList (grhssGRHSs grhss)
+              -> pure (Right (ploc, wc_ty, grhss))
+            _ -> pure (Left Nothing)
+    classify_alt _ = pure (Left Nothing)
+
+    is_type_alt Right{} = True
+    is_type_alt Left{}  = False
+
+    is_catch_all (L _ (ParPat _ p)) = is_catch_all p
+    is_catch_all (L _ WildPat{})    = True
+    is_catch_all (L _ VarPat{})     = True
+    is_catch_all _                  = False
+
+    split_type_alts [Left (Just catch_m)] = Just ([], catch_m)
+    split_type_alts (Right ty_alt : rest@(_ : _)) = do
+      (more, catch_m) <- split_type_alts rest
+      pure (ty_alt : more, catch_m)
+    split_type_alts _ = Nothing
+
+    rn_pat_to_wc_type :: LPat GhcRn -> TcM (Maybe (LHsWcType GhcRn))
+    rn_pat_to_wc_type (L _ (EmbTyPat _ (HsTP (HsTPRn wcs _ _) hs_ty))) =
+      pure (Just (HsWC wcs hs_ty))
+    rn_pat_to_wc_type pat = fmap (HsWC []) <$> rn_pat_to_type pat
+
+    rn_pat_to_type :: LPat GhcRn -> TcM (Maybe (LHsType GhcRn))
+    rn_pat_to_type (L l pat) = case pat of
+      EmbTyPat _ (HsTP _ hs_ty) -> pure (Just hs_ty)
+      ParPat _ inner -> fmap (L l . HsParTy noAnn) <$> rn_pat_to_type inner
+      TuplePat _ ps Boxed ->
+        fmap (L l . HsTupleTy noAnn HsBoxedOrConstraintTuple) . sequence <$> mapM rn_pat_to_type ps
+      ConPat _ (L cl (WithUserRdr rdr nm)) (PrefixCon _ args)
+        | nm == dataConName unitDataCon && null args ->
+            pure (Just (L l (HsTupleTy noAnn HsBoxedOrConstraintTuple [])))
+        | otherwise -> do
+            mb_args <- sequence <$> mapM rn_pat_to_type args
+            case mb_args of
+              Nothing -> pure Nothing
+              Just args' -> do
+                cl_res <- tcLookupConLike (WithUserRdr rdr nm)
+                case cl_res of
+                  RealDataCon dc
+                    | let tc = dataConTyCon dc
+                    , occNameFS (getOccName dc) == occNameFS (getOccName tc) ->
+                        let head_ty = L (l2l cl) (HsTyVar noAnn NotPromoted (L cl (WithUserRdr rdr (tyConName tc))))
+                        in pure (Just (foldl' (\f a -> L (combineLocsA f a) (HsAppTy noExtField f a)) head_ty args'))
+                  _ -> pure Nothing
+      _ -> pure Nothing
 
 -- | Open a dot package for one local pattern binding and its body.
 -- See Note [Scope for a local erased package pattern].

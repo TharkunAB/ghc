@@ -40,7 +40,9 @@ module GHC.Core (
         isNativeIndexedCaseScrutinee,
         termVar_maybe, nativeIndexFunctionVar_maybe, nativeIndexFunctionArgIndex,
         nativeLocalFunctionArgIndex, nativeIndexArgKinds,
-        nativeClassSelectorTys, nativeClassSelectorIndex, nativeIndexedConArgs,
+        nativeClassSelectorTys, nativeClassSelectorIndex,
+        ScopedDictResolution(..), projectUniqueClassDict,
+        nativeIndexedConArgs,
         nativeIndexedOperandSignature_maybe,
         nativeIndexedConApp_maybe, splitNativeIndexedConApp, isNativeConstructedGadtIndex,
         nativeFamilyConHead_maybe, nativeFamilyPromotedCon_maybe,
@@ -121,19 +123,20 @@ import GHC.Platform
 
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare ( eqType )
-import GHC.Core.TyCo.Rep ( Type(TermVarTy, ClassAppTy, TyConApp, CastTy), Coercion(SubCo, SymCo, AppCo, AxiomCo), Scaled(..) )
+import GHC.Core.TyCo.Rep ( Type(TermVarTy, ClassAppTy, TyConApp, CastTy), Coercion(SubCo, SymCo, TransCo, AppCo, AxiomCo), Scaled(..) )
 import qualified GHC.Core.TyCo.Subst as TyCoSubst
 import GHC.Builtin.KnownKeys ( boolTyConKey, charDataConKey, naturalNSDataConKey, naturalNBDataConKey )
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
 import GHC.Core.Coercion
-import GHC.Core.Coercion.Axiom (CoAxiomRule(UnbranchedAxiom), coAxiomArity)
+import GHC.Core.Coercion.Axiom (CoAxiom, Unbranched, CoAxiomRule(UnbranchedAxiom), coAxiomArity, coAxiomTyCon)
 import GHC.Core.Rules.Config ( RuleOpts )
-import GHC.Core.Class (classMethods)
+import GHC.Core.Class (classMethods, classSCSelIds, classSCTheta, classTyVars)
 import GHC.Core.Predicate (getClassPredTys_maybe)
 import GHC.Core.DataCon
 import GHC.Core.TyCon ( TyCon, isPromotedDataCon_maybe, isVanillaAlgTyCon,
                         tyConTyVars, tyConResKind, tyConKind, tyConDataCons, tyConSingleDataCon_maybe,
-                        isBoxedDataTyCon, isTypeDataTyCon, tyConDataFamCoercion_maybe )
+                        isBoxedDataTyCon, isNewTyCon, isLiftedAlgTyCon, isTypeDataTyCon,
+                        newTyConCo_maybe, tyConDataFamCoercion_maybe )
 import GHC.Unit.Module
 
 import GHC.Types.InlinePragma
@@ -2793,15 +2796,110 @@ nativeClassSelectorTys selector inst = do
   let instantiate = TyCoSubst.substTyWith [tv] [inst]
   return (instantiate predicate, instantiate domain, instantiate result)
 
--- | Recover an opaque application to an explicit local Given and operand.
+-- | Recover an opaque application to an explicit local Given (or unique
+-- superclass projection from a local Given) and operand.
+-- See Note [Superclass projection for scoped class selectors].
 nativeClassSelectorIndex :: CoreExpr -> Maybe Type
 nativeClassSelectorIndex expr
-  | (Var selector, [Type inst, Var dict, Var arg]) <- collectArgs expr
-  , isNativeClassDictionaryId dict, isNativeOpaqueValueId arg
+  | (Var selector, [Type inst, dict_arg, Var arg]) <- collectArgs expr
+  , isNativeOpaqueValueId arg
   , Just (predicate, domain, result) <- nativeClassSelectorTys selector inst
-  , varType dict `eqType` predicate, varType arg `eqType` domain
+  , varType arg `eqType` domain
+  , Just dict <- selector_dict predicate dict_arg
   = Just (ClassAppTy selector inst (TermVarTy dict) (TermVarTy arg) result)
   | otherwise = Nothing
+  where
+    selector_dict predicate (Var dict)
+      | isNativeClassDictionaryId dict
+      = case projectUniqueClassDict predicate [dict] of
+          ScopedDirectDict d       -> Just d
+          ScopedSuperclassDict d _ -> Just d
+          _                        -> Nothing
+    selector_dict predicate dict_expr
+      | Just dict <- dict_root_maybe dict_expr
+      , isNativeClassDictionaryId dict
+      , ScopedSuperclassDict d sc_expr <- projectUniqueClassDict predicate [dict]
+      , d == dict
+      , same_sc_expr dict_expr sc_expr
+      = Just dict
+    selector_dict _ _ = Nothing
+
+    dict_root_maybe (Var d) = Just d
+    dict_root_maybe e
+      | (Var sc_sel, args) <- collectArgs e
+      , isGlobalId sc_sel
+      , (_, [inner]) <- span isTypeArg args
+      = dict_root_maybe inner
+      | otherwise = Nothing
+
+    same_sc_expr (Var d1) (Var d2)       = d1 == d2
+    same_sc_expr (Type t1) (Type t2)     = t1 `eqType` t2
+    same_sc_expr (App f1 a1) (App f2 a2) = same_sc_expr f1 f2 && same_sc_expr a1 a2
+    same_sc_expr _ _                     = False
+
+-- | Result of resolving a scoped class predicate from lexical Givens.
+-- See Note [Superclass projection for scoped class selectors].
+data ScopedDictResolution
+  = ScopedDirectDict Id
+  | ScopedSuperclassDict Id CoreExpr
+  | ScopedNoDict
+  | ScopedAmbiguousDict
+
+-- | Resolve a target class predicate from lexical Givens, preferring a unique
+-- direct dictionary and falling back to a unique superclass projection path.
+-- See Note [Superclass projection for scoped class selectors].
+projectUniqueClassDict :: Type -> [Id] -> ScopedDictResolution
+projectUniqueClassDict target_pred givens
+  = case direct of
+      [dict]    -> ScopedDirectDict dict
+      _ : _ : _ -> ScopedAmbiguousDict
+      []        -> case sc_paths of
+        [(dict, sc_expr)] -> ScopedSuperclassDict dict sc_expr
+        _ : _ : _         -> ScopedAmbiguousDict
+        []                -> ScopedNoDict
+  where
+    eligible = filter isNativeClassDictionaryId givens
+    direct   = filter (\d -> varType d `eqType` target_pred) eligible
+    sc_paths =
+      [ (d, sc_expr)
+      | d <- eligible
+      , sc_expr <- super_paths [varType d] (Var d) (varType d) ]
+
+    super_paths :: [Type] -> CoreExpr -> Type -> [CoreExpr]
+    super_paths visited dict_expr pred_ty
+      | Just (cls, tys) <- getClassPredTys_maybe pred_ty
+      , let sc_preds = map (TyCoSubst.substTyWith (classTyVars cls) tys) (classSCTheta cls)
+      = concat
+          [ let sc_expr = mkApps (Var sc_sel) (map Type tys ++ [dict_expr])
+                here    = [sc_expr | sc_pred `eqType` target_pred]
+                deeper  = super_paths (sc_pred : visited) sc_expr sc_pred
+            in here ++ deeper
+          | (sc_pred, sc_sel) <- zip sc_preds (classSCSelIds cls)
+          , isJust (getClassPredTys_maybe sc_pred)
+          , not (any (eqType sc_pred) visited) ]
+      | otherwise = []
+
+{- Note [Superclass projection for scoped class selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A scoped class selector index (for example `Tagged (choose x)` or `tagBool (choose x)`)
+needs one deterministic dictionary witness for the class predicate `Choose a`.
+
+1. A unique direct lexical Given `d :: Choose a` takes precedence (`ScopedDirectDict`).
+   Multiple direct Givens of `Choose a` report `ScopedAmbiguousDict`.
+2. When no direct Given has type `Choose a`, `projectUniqueClassDict` traverses
+   immediate and transitive class superclasses (`classSCTheta` and `classSCSelIds`)
+   of all eligible lexical Givens (for example `d_sub :: SubChoose a` where
+   `class Choose a => SubChoose a`). If one superclass selector chain produces
+   `Choose a`, `ScopedSuperclassDict` returns both `d_sub` and the projected Core
+   dictionary expression; multiple paths report `ScopedAmbiguousDict`.
+3. `GHC.Tc.Gen.HsType.tc_app_ty`, `GHC.Core.nativeClassSelectorIndex`, and
+   `GHC.Core.Lint.checkScopedSelectorShape` store the lexical dictionary variable
+   `d_sub` in `ClassAppTy` while `scopedSelectorExpr` and `tcScopedClassOperand`
+   apply the projected superclass dictionary expression in Core terms.
+4. Callers in `GHC.Tc.Gen.App` that instantiate `DepDictTy` via a superclass bind a
+   local `NOINLINE` dictionary `EvVar` so the Core argument to `DepDictTy` remains a
+   dictionary variable `Id` across `SimpleOpt`, `Simplifier`, and Core Lint.
+-}
 
 {- Note [Source calls in retained arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3295,7 +3393,8 @@ nativeFamilyConHead_maybe con tys = do
 nativeFamilyConArgs :: DataCon -> [Type] -> Maybe ([CoreExpr], [Type], Type, CoercionR)
 nativeFamilyConArgs con tys = do
   axiom <- tyConDataFamCoercion_maybe rep
-  guard (isBoxedDataTyCon rep && not (isTypeDataTyCon rep))
+  guard ((isBoxedDataTyCon rep || (isNewTyCon rep && isLiftedAlgTyCon rep))
+         && not (isTypeDataTyCon rep))
   guard (null exs && null theta && null (dataConStupidTheta con))
   guard (null (dataConRepArgBinders con) && not (any isBanged (dataConImplBangs con)))
   guard (tys `equalLength` user_tvs &&
@@ -3329,29 +3428,74 @@ nativeFamilyPromotedCon_maybe con tys fields = do
 -- | Accept the exact wrapper or its worker cast by the same family axiom.
 splitNativeFamilyConApp :: CoreExpr
                         -> Maybe (DataCon, [Type], [CoreExpr] -> CoreExpr, [CoreExpr])
-splitNativeFamilyConApp (Cast expr cast) = do
-  (Var worker, args) <- Just (collectArgs expr)
-  con <- isDataConWorkId_maybe worker
-  let univs = dataConUnivTyVars con
-      (type_args, _) = splitAt (length univs) args
-  worker_tys <- traverse family_type_arg type_args
-  guard (worker_tys `equalLength` univs)
-  tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
-  (prefix, domains, _, expected_cast) <- nativeFamilyConArgs con tys
-  let (actual, fields) = splitAt (length prefix) args
-  guard (actual `equalLength` prefix && and (zipWith sameNativeConPrefixArg actual prefix))
-  guard (fields `equalLength` domains)
-  guard (coercionRole cast == Representational &&
-         coercionLKind cast `eqType` coercionLKind expected_cast &&
-         coercionRKind cast `eqType` coercionRKind expected_cast)
-  axiom <- tyConDataFamCoercion_maybe (dataConTyCon con)
-  guard (uses_axiom (UnbranchedAxiom axiom) cast)
-  return (con, tys, \xs -> Cast (mkApps (Var worker) (actual ++ xs)) cast, fields)
+splitNativeFamilyConApp (Cast expr cast)
+  | Just result <- split_worker_cast
+  = Just result
+  | Just result <- split_newtype_cast
+  = Just result
   where
-    uses_axiom ax (AxiomCo actual cos) = actual == ax && all isReflCo cos
-    uses_axiom ax (AppCo co arg) = uses_axiom ax co && isReflCo arg
-    uses_axiom ax (SymCo co) = uses_axiom ax co
-    uses_axiom _ _ = False
+    split_worker_cast = do
+      (Var worker, args) <- Just (collectArgs expr)
+      con <- isDataConWorkId_maybe worker
+      let univs = dataConUnivTyVars con
+          (type_args, _) = splitAt (length univs) args
+      worker_tys <- traverse family_type_arg type_args
+      guard (worker_tys `equalLength` univs)
+      tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
+      (prefix, domains, _, expected_cast) <- nativeFamilyConArgs con tys
+      let (actual, fields) = splitAt (length prefix) args
+      guard (actual `equalLength` prefix && and (zipWith sameNativeConPrefixArg actual prefix))
+      guard (fields `equalLength` domains)
+      guard (coercionRole cast == Representational &&
+             coercionLKind cast `eqType` coercionLKind expected_cast &&
+             coercionRKind cast `eqType` coercionRKind expected_cast)
+      axiom <- tyConDataFamCoercion_maybe (dataConTyCon con)
+      guard (uses_axiom (UnbranchedAxiom axiom) cast)
+      return (con, tys, \xs -> Cast (mkApps (Var worker) (actual ++ xs)) cast, fields)
+
+    split_newtype_cast = do
+      TransCo nt_co fam_co <- Just cast
+      (nt_ax, worker_tys) <- sym_unbranched_axiom nt_co
+      let rep = coAxiomTyCon nt_ax
+      guard (isNewTyCon rep && isLiftedAlgTyCon rep)
+      guard (Just nt_ax == newTyConCo_maybe rep)
+      con <- tyConSingleDataCon_maybe rep
+      fam_ax <- tyConDataFamCoercion_maybe rep
+      guard (uses_axiom (UnbranchedAxiom fam_ax) fam_co)
+      let univs = dataConUnivTyVars con
+      guard (worker_tys `equalLength` univs)
+      tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
+      (_, [domain], _, expected_cast) <- nativeFamilyConArgs con tys
+      guard (coercionRole cast == Representational &&
+             coercionLKind cast `eqType` domain &&
+             coercionRKind cast `eqType` coercionRKind expected_cast)
+      return (con, tys, \case { [x] -> Cast x cast; _ -> Cast expr cast }, [expr])
+splitNativeFamilyConApp expr
+  | (Cast (Lam v (Cast (Var v') nt_co)) fun_fam_co, [arg]) <- collectArgs expr
+  , v == v'
+  , Just (nt_ax, worker_tys) <- sym_unbranched_axiom nt_co
+  , let rep = coAxiomTyCon nt_ax
+  , isNewTyCon rep && isLiftedAlgTyCon rep
+  , Just nt_ax == newTyConCo_maybe rep
+  , Just con <- tyConSingleDataCon_maybe rep
+  , Just fam_ax <- tyConDataFamCoercion_maybe rep
+  , isFunTy (coercionLKind fun_fam_co)
+  , isFunTy (coercionRKind fun_fam_co)
+  , let (_, _, arg_co, res_co) = decomposeFunCo fun_fam_co
+  , isReflCo arg_co
+  , uses_axiom (UnbranchedAxiom fam_ax) res_co
+  , let univs = dataConUnivTyVars con
+  , worker_tys `equalLength` univs
+  , Just tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
+  , Just (_, [domain], _, expected_cast) <- nativeFamilyConArgs con tys
+  , coercionRole nt_co == Representational
+  , coercionRole fun_fam_co == Representational
+  , coercionLKind nt_co `eqType` domain
+  , coercionRKind res_co `eqType` coercionRKind expected_cast
+  = Just ( con
+         , tys
+         , \case { [x] -> App (Cast (Lam v (Cast (Var v') nt_co)) fun_fam_co) x; _ -> expr }
+         , [arg] )
 splitNativeFamilyConApp expr = do
   (Var wrapper, args) <- Just (collectArgs expr)
   con <- isDataConWrapId_maybe wrapper
@@ -3360,6 +3504,18 @@ splitNativeFamilyConApp expr = do
   (_, domains, _, _) <- nativeFamilyConArgs con tys
   guard (fields `equalLength` domains)
   return (con, tys, mkApps (mkApps (Var wrapper) type_args), fields)
+
+sym_unbranched_axiom :: Coercion -> Maybe (CoAxiom Unbranched, [Type])
+sym_unbranched_axiom (SymCo (AxiomCo (UnbranchedAxiom ax) cos))
+  | all isReflCo cos
+  = Just (ax, map coercionLKind cos)
+sym_unbranched_axiom _ = Nothing
+
+uses_axiom :: CoAxiomRule -> Coercion -> Bool
+uses_axiom ax (AxiomCo actual cos) = actual == ax && all isReflCo cos
+uses_axiom ax (AppCo co arg) = uses_axiom ax co && isReflCo arg
+uses_axiom ax (SymCo co) = uses_axiom ax co
+uses_axiom _ _ = False
 
 family_type_arg :: CoreExpr -> Maybe Type
 family_type_arg (Type ty) = Just ty

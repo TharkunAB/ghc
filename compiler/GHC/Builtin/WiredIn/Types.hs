@@ -42,6 +42,7 @@ module GHC.Builtin.WiredIn.Types (
         -- * Char
         charTyCon, charDataCon,
         charTy, stringTy, charTyConName, stringTyConName,
+        charPrimLitTyCon, charPrimLitTyConName, mkCharPrimLitTy,
 
         -- * Double
         doubleTyCon, doubleDataCon, doubleTy, doubleTyConName,
@@ -307,6 +308,7 @@ wiredInTyCons = [ anyTyCon
                 , unusedTypeTyCon
                 , boolTyCon
                 , charTyCon
+                , charPrimLitTyCon
                 , stringTyCon
                 , doubleTyCon
                 , floatTyCon
@@ -379,6 +381,22 @@ charTyConName, charDataConName, intTyConName, intDataConName, stringTyConName ::
 charTyConName     = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "Char")   charTyConKey charTyCon
 charDataConName   = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "C#")     charDataConKey charDataCon
 stringTyConName   = mkWiredInTyConName   UserSyntax gHC_INTERNAL_BASE  (fsLit "String") stringTyConKey stringTyCon
+
+-- | Wired-in generative constructor name for @Char#@ type literals.
+-- See Note [Unboxed Char# and unboxed tuple promotion] in GHC.Tc.Gen.HsType.
+charPrimLitTyConName :: Name
+charPrimLitTyConName =
+  mkWiredInTyConName BuiltInSyntax gHC_TYPES (fsLit "$CharPrimLit#")
+                     charPrimLitTyConKey charPrimLitTyCon
+
+-- | Wired-in generative constructor of kind @Char -> Char#@.
+charPrimLitTyCon :: TyCon
+charPrimLitTyCon =
+  mkPrimTyCon charPrimLitTyConName (mkTemplateAnonTyConBinders [charTy]) charPrimTy [Nominal]
+
+-- | Build a primitive character type literal of kind @Char#@.
+mkCharPrimLitTy :: Char -> Type
+mkCharPrimLitTy c = TyCoRep.TyConApp charPrimLitTyCon [mkCharLitTy c]
 intTyConName      = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "Int")    intTyConKey   intTyCon
 intDataConName    = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "I#")     intDataConKey  intDataCon
 

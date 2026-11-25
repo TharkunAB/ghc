@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, MagicHash, StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators #-}
 module TuplePromotion (Selected, Refined, proof, refinementProof, pairIndex, reflected) where
 
 import Data.Type.Equality ((:~:)(Refl))
@@ -62,6 +62,6 @@ wrongCoercion = Coercion
 context :: At ('MkC 'True)
 context = At
 
-newtypeCon :: At ('MkN 'True)
+newtypeCon :: At ('MkN 3#)
 newtypeCon = At
 #endif

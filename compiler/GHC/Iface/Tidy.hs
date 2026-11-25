@@ -50,8 +50,10 @@ import GHC.Core.Unfold
 import GHC.Core.FVs
 import GHC.Core.Rules (canShareRetainedSpecRule)
 import GHC.Core.Dependent
-    ( hasExistentialExpr, hasNativeDependentExprRhs, hasNativeDependentProgram, hasRetainedRuleHead, supportsLocalUserRule
-    , hasNativeDependentUnfolding, isRetainedVanillaDefaultMethod, supportsNativeUserUnfolding )
+    ( hasExistentialExpr, hasNativeDepFunType, hasNativeDependentExprRhs
+    , hasNativeDependentProgram, hasRetainedRuleHead, supportsLocalUserRule
+    , hasNativeDependentUnfolding, isRetainedVanillaDefaultMethod
+    , supportsNativeDepFunUnfolding, supportsNativeUserUnfolding )
 import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy
 import GHC.Core.Seq         ( seqBinds )
@@ -418,6 +420,7 @@ data TidyOpts = TidyOpts
   , opt_static_ptr_opts :: !(Maybe StaticPtrOpts)
       -- ^ Options for generated static pointers, if enabled (/= Nothing).
   , opt_has_retained_core :: !Bool
+  , opt_has_scoped_dict_core :: !Bool
   , opt_check_imported_rule :: CoreRule -> IO (Maybe (Id, Bool))
   , opt_keep_auto_rules :: !Bool
   }
@@ -613,6 +616,7 @@ trimId :: Bool -> Id -> Id
 -- downstream compilations
 trimId do_trim id
   | do_trim, not (isImplicitId id)
+  , not (hasNativeDepFunType (idType id) && isStableUserUnfolding (idUnfolding id))
   = id `setIdInfo`      (vanillaIdInfo `setSourceProofRuleInfo` sourceProofRuleInfo (idInfo id))
        `setIdUnfolding` idUnfolding id
        -- We respect the final unfolding chosen by tidyTopIdInfo.
@@ -721,6 +725,11 @@ chooseExternalIds opts mod tcs binds imp_id_rules mentions_marked
   binders          = map fst $ flattenBinds binds
   binder_set       = mkVarSet binders
   rhs_env          = mkVarEnv (flattenBinds binds)
+  rec_binders      = mkVarSet [ b | Rec pairs <- binds
+                                  , is_rec_scc pairs
+                                  , (b, _) <- pairs ]
+  is_rec_scc [(b, r)] = b `elemVarSet` exprFreeVars r
+  is_rec_scc _        = True
 
   avoids   = [ getOccName name | bndr <- binders,
                                  let name = idName bndr,
@@ -761,7 +770,9 @@ chooseExternalIds opts mod tcs binds imp_id_rules mentions_marked
     | otherwise = do
       (occ_env', name') <- tidyTopName mod name_cache (Just referrer) occ_env idocc
       let
-          (new_ids, show_unfold) = addExternal opts mentions_marked (lookupVarEnv rhs_env idocc) refined_id
+          (new_ids, show_unfold) = addExternal opts mentions_marked
+                                     (refined_id `elemVarSet` rec_binders)
+                                     (lookupVarEnv rhs_env idocc) refined_id
 
                 -- 'idocc' is an *occurrence*, but we need to see the
                 -- unfolding in the *definition*; so look up in binder_set
@@ -783,8 +794,8 @@ chooseExternalIds opts mod tcs binds imp_id_rules mentions_marked
       let unfold_env' = extendVarEnv unfold_env id (name',False)
       tidy_internal ids unfold_env' occ_env'
 
-addExternal :: TidyOpts -> (CoreExpr -> Bool) -> Maybe CoreExpr -> Id -> ([Id], Bool)
-addExternal opts mentions_marked mb_rhs id
+addExternal :: TidyOpts -> (CoreExpr -> Bool) -> Bool -> Maybe CoreExpr -> Id -> ([Id], Bool)
+addExternal opts mentions_marked is_rec mb_rhs id
   | ExposeNone <- opt_expose_unfoldings opts
   , not (isCompulsoryUnfolding unfolding)
   = ([], False)  -- See Note [Always expose compulsory unfoldings]
@@ -810,11 +821,20 @@ addExternal opts mentions_marked mb_rhs id
         -- We leave the unfolding there even if there is a worker
         -- In GHCi the unfolding is used by importers
 
+    is_depfun_user src = hasNativeDepFunType (idType id) && isStableUserSource src
+
     show_unfolding (CoreUnfolding { uf_src = src, uf_tmpl = rhs
                                    , uf_guidance = guidance })
+       | opt_has_scoped_dict_core opts
+       -- See Note [Serializing native DepFunTy unfoldings].
+       = isCompulsorySource src
+         || (is_depfun_user src && not (is_rec || loop_breaker)
+             && supportsNativeDepFunUnfolding exposed_rhs)
+       | otherwise
        = (stable || profitable || explicitly_requested)
          && can_expose_body src exposed_rhs
          -- See Note [Retained Core across module boundaries]
+         -- and Note [Serializing native DepFunTy unfoldings].
        where
         -- Core Tidy regenerates non-stable templates from the binding RHS.
         exposed_rhs | isStableSource src = rhs
@@ -822,6 +842,7 @@ addExternal opts mentions_marked mb_rhs id
         -- Always expose things whose
         -- source is an inline rule
         stable = isStableSource src
+                 && (not (is_depfun_user src) || not (is_rec || loop_breaker))
         -- Good for perf as it might inline
         profitable
           | never_active = False
@@ -845,8 +866,9 @@ addExternal opts mentions_marked mb_rhs id
             ExposeNone -> False
 
     show_unfolding (DFunUnfolding { df_bndrs = bs, df_con = con, df_args = args })
-       = not (opt_has_retained_core opts)
-         || not (hasNativeDependentUnfolding body || mentions_marked body)
+       = not (opt_has_scoped_dict_core opts)
+         && (not (opt_has_retained_core opts)
+             || not (hasNativeDependentUnfolding body || mentions_marked body))
        where
          body = mkLams bs (mkApps (Var (dataConWorkId con)) args)
     show_unfolding _                  = False
@@ -855,6 +877,8 @@ addExternal opts mentions_marked mb_rhs id
       | not (opt_has_retained_core opts) = True
       | RetainedUserSrc <- src
       = not (hasExistentialExpr rhs) || supportsNativeUserUnfolding rhs
+      | is_depfun_user src
+      = not (is_rec || loop_breaker) && supportsNativeDepFunUnfolding rhs
       | otherwise
       = not (hasExistentialExpr rhs) &&
         (hasNativeDependentExprRhs (Type (idType id))
@@ -903,6 +927,37 @@ usual Tidy checks still apply to its optional unfolding.
 GHC.Iface.Syntax records a version feature with the tag. The wire check
 prevents an older reader from using the template without its pipeline check.
 The same source tag reaches --make clients through ModDetails.
+-}
+
+{- Note [Serializing native DepFunTy unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A non-recursive top-level function whose signature binds a native DepFunTy
+or DepDictTy can export an INLINE or INLINABLE template across interfaces.
+The template must pass supportsNativeDepFunUnfolding. Supported forms are
+variables, constructors, DepFunTy lambdas and applications, cases with
+checked branch evidence, casts without TermAppCo, Pack, Unpack, and scoped
+dictionaries. Recursive bindings and strong loop breakers keep no exported
+template.
+
+In a module with scoped dictionary Core, Tidy withholds unmarked and
+ordinary unfoldings and exposes only compulsory templates and eligible
+native DepFunTy user templates. trimId retains the inline pragma and arity
+of those exposed bindings so that clients can inline or specialize them.
+localiseNativeTopIndices also rewrites stable unfolding templates so that
+references to top-level native indices stay local Ids after globalising
+top-level binders.
+
+When an exported native DepFunTy user template contains Pack, Unpack, or
+scoped dictionary syntax, GHC.Iface.Make writes depFunUnfoldingField and
+GHC.Iface.Binary records the compositional retained-depfun-unfolding
+capability in the interface header. Ordinary interfaces do not write the
+field, so their bytes do not change. On import, GHC.IfaceToCore keeps
+Pack and Unpack templates on native DepFunTy declarations when the
+interface carries this capability, checks supportsNativeDepFunUnfolding,
+and lints scoped dictionary templates with lintScopedDictionaryExpr.
+Clients that call an imported DepFunTy function select the retained
+optimizer from its signature and beta-reduce the template with lazy
+runtime index demand.
 -}
 
 {- Note [Retained Core across module boundaries]
@@ -1386,9 +1441,19 @@ localiseNativeTopIndices name_cache binds = mapM localise_bind binds
            ; return (NonRec bndr' rhs') }
     localise_bind (Rec pairs) = Rec <$> mapM localise_pair pairs
 
-    localise_pair pair@(bndr, rhs)
-      | not (hasNativeDependentExprRhs rhs) = return pair
-      | null indices = return pair
+    localise_pair (bndr, rhs)
+      = do { rhs' <- localise_expr bndr rhs
+           ; bndr' <- case realIdUnfolding bndr of
+               unf@(CoreUnfolding { uf_src = src, uf_tmpl = tmpl })
+                 | isStableSource src, hasNativeDependentExprRhs tmpl -> do
+                     tmpl' <- localise_expr bndr tmpl
+                     return (bndr `setIdUnfolding` (unf { uf_tmpl = tmpl' }))
+               _ -> return bndr
+           ; return (bndr', rhs') }
+
+    localise_expr bndr expr
+      | not (hasNativeDependentExprRhs expr) = return expr
+      | null indices = return expr
       | otherwise
       = assertPpr (not (anyFreeVarsOfType (`elemVarSet` index_set) (idType bndr)))
                   (text "localiseNativeTopIndices: escaping top-level index" $$ ppr bndr) $
@@ -1398,10 +1463,10 @@ localiseNativeTopIndices name_cache binds = mapM localise_bind binds
                            (zip indices (map Var aliases))
                  alias_binds = zipWith (\index alias -> NonRec alias (Var index))
                                        indices aliases
-           ; return (bndr, mkLets alias_binds (CoreSubst.substExpr subst protected_rhs)) }
+           ; return (mkLets alias_binds (CoreSubst.substExpr subst protected_rhs)) }
       where
-        (operand_vars, protected_rhs) = protect_calls rhs
-        index_vars = operand_vars `unionVarSet` exprAnnotationFreeVars rhs
+        (operand_vars, protected_rhs) = protect_calls expr
+        index_vars = operand_vars `unionVarSet` exprAnnotationFreeVars expr
         indices = filter (\v -> v `elemVarSet` top_binders
                             && (isNativeIndexId v || isNativeIndexFunctionId v
                                 || (v `elemVarSet` index_vars

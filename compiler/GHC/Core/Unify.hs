@@ -34,7 +34,7 @@ import GHC.Core.TyCon.Env
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Compare ( eqType, eqTypes, eqTypeX, tcEqType, tcEqTyConAppArgs )
 import GHC.Core.TyCo.FVs ( tyCoVarsOfTypeList )
-import GHC.Core.TyCo.Subst   ( mkTvSubst, deepSubstTy, extendSubstInScopeSet )
+import GHC.Core.TyCo.Subst   ( mkTvSubst, deepSubstTy )
 import GHC.Core.Map.Type
 import GHC.Core.Multiplicity
 
@@ -52,8 +52,9 @@ import GHC.Data.Maybe( orElse )
 import Control.Monad
 import Data.Monoid (Any(..))
 import qualified Data.Semigroup as S
-import GHC.Builtin.WiredIn.Prim (fUNTyCon)
-import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (matchabilityTy)
+import GHC.Builtin.KnownKeys (charDataConKey, hasKey)
+import GHC.Builtin.WiredIn.Prim (fUNTyCon, charPrimTy)
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (matchabilityTy, charPrimLitTyCon)
 
 {- Note [The Core unifier]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1960,6 +1961,18 @@ unify_ty env ty1 ty2 kco
   = do { massertPpr (isInjectiveTyCon tc1 Nominal) (ppr tc1)
        ; unify_tc_app env tc1 tys1 tys2
        }
+
+  -- Decompose promoted 'C# against a CharTyLit literal.
+  | Just (tc1, [arg1]) <- mb_tc_app1
+  , tc1 `hasKey` charDataConKey
+  , LitTy (CharTyLit _) <- ty2
+  = unify_ty env arg1 (TyConApp charPrimLitTyCon [ty2]) (mkNomReflCo charPrimTy)
+
+  | Unifying <- um_unif env
+  , LitTy (CharTyLit _) <- ty1
+  , Just (tc2, [arg2]) <- mb_tc_app2
+  , tc2 `hasKey` charDataConKey
+  = unify_ty env (TyConApp charPrimLitTyCon [ty1]) arg2 (mkNomReflCo charPrimTy)
 
   where
     mb_tc_app1 = splitTyConApp_maybe ty1

@@ -4,7 +4,9 @@ module GHC.Core.Dependent (
     supportsNativeGentle,
     supportsNativeRuleBinds,
     supportsNativeUserUnfolding,
+    supportsNativeDepFunUnfolding,
     supportsScopedDictionaryCore,
+    hasNativeDepFunType,
     hasRetainedRuleHead, supportsLocalUserRule, supportsErasedUserRule,
     supportsImportedErasedRule, supportsImportedUserRule,
     supportsQuickLookType,
@@ -62,7 +64,8 @@ data ScanState = ScanState
 
 -- | Select which retained forms the scan looks for.
 data ScanPurpose
-    = DetectNative | CheckGentle | CheckUserRules | CheckErasedTypes | DetectScopedDictionaries
+    = DetectNative | CheckGentle | CheckUserRules | CheckDepFunUnfolding
+    | CheckErasedTypes | DetectScopedDictionaries
     | CheckScopedDictionaryCore | FindScopedSelectorReceiver Id
 
 -- | Select which bound-Id metadata a boundary can demand.
@@ -103,12 +106,28 @@ supportsNativeUserUnfolding :: CoreExpr -> Bool
 supportsNativeUserUnfolding expr =
     not (runScanFor CheckUserRules NoMetadata (scanExpr expr))
 
+-- | Check the expression forms in a serialized native DepFunTy unfolding.
+supportsNativeDepFunUnfolding :: CoreExpr -> Bool
+supportsNativeDepFunUnfolding expr =
+    not (runScanFor CheckDepFunUnfolding NoMetadata (scanExpr expr))
+
 -- | Admit the scoped dictionary codec and the retained binders it needs.
 -- Other retained proofs and computations still require separate validation.
 supportsScopedDictionaryCore :: CoreProgram -> Bool
 supportsScopedDictionaryCore binds =
     hasScopedDictionaryProgram binds
     && not (runScanFor CheckScopedDictionaryCore AllMetadata (foldMap scanBind binds))
+
+-- | Check whether a function telescope binds a native dependent value or dictionary.
+hasNativeDepFunType :: Type -> Bool
+hasNativeDepFunType = go
+  where
+    go ty = case coreFullView ty of
+      DepFunTy{} -> True
+      DepDictTy{} -> True
+      ForAllTy _ _ body -> go body
+      FunTy{ft_res = res} -> go res
+      _ -> False
 
 -- | Does the rule head take a retained argument in its function telescope?
 hasRetainedRuleHead :: Id -> Bool
@@ -342,6 +361,7 @@ gentleForm scan = NativeScan $ do
     case purpose of
         CheckGentle    -> runNativeScan scan
         CheckUserRules -> runNativeScan scan
+        CheckDepFunUnfolding -> runNativeScan scan
         DetectScopedDictionaries -> runNativeScan scan
         FindScopedSelectorReceiver{} -> runNativeScan scan
         _           -> pure True
@@ -360,6 +380,7 @@ scopedDictionaryForm receiver children = NativeScan $ do
     purpose <- gets scanPurpose
     case purpose of
       CheckScopedDictionaryCore -> runNativeScan children
+      CheckDepFunUnfolding -> runNativeScan children
       FindScopedSelectorReceiver target
         | receiver /= Just target -> runNativeScan children
       _ -> pure True
@@ -576,7 +597,11 @@ scanCo (DepFunCo _ _ b domain body) =
           <> scanCo delta
       where
         target = coercionRKind delta
-scanCo (TermAppCo f co) = gentleForm (scanCallHead f <> scanCo co)
+scanCo (TermAppCo f co) = NativeScan $ do
+    purpose <- gets scanPurpose
+    case purpose of
+      CheckDepFunUnfolding -> pure True
+      _ -> runNativeScan (gentleForm (scanCallHead f <> scanCo co))
 scanCo (Refl ty) = scanType ty
 scanCo (GRefl _ ty mco) = scanType ty <> scanMCo mco
 scanCo (TyConAppCo _ _ args) = foldMap scanCo args

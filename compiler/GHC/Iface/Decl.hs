@@ -192,7 +192,8 @@ tyConToIfaceDecl env tycon
     -- NOTE: Not all TyCons have `tyConTyVars` field. Forcing this when `tycon`
     -- is one of these TyCons (FunTyCon, PrimTyCon, PromotedDataCon) will cause
     -- an error.
-    if_kind        = tidyToIfaceType emptyTidyEnv $ tyConKind tycon
+    if_kind        = tidyToIfaceType emptyTidyEnv $
+                       fromMaybe (tyConKind tycon) (standaloneFamilyConstrainedKind_maybe tycon)
                      -- emptyTidyEnv: the kind as a whole is not under any binders
     (tc_env1, tc_binders) = tidyTyConBinders env (tyConBinders tycon)
     if_binders     = toIfaceForAllBndrs tc_binders

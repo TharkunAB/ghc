@@ -38,6 +38,9 @@ module GHC.Iface.Type (
         IfaceEvidence(..), IfaceEvidenceVersion, requireIfaceEvidenceVersion,
         -- Equality testing
         isIfaceLiftedTypeKind,
+        hasIfaceDepFunType,
+        hasIfaceScopedDictType,
+        hasIfaceScopedDictCo,
 
         -- Conversion from IfaceAppArgs to IfaceTypes/ForAllTyFlags
         appArgsIfaceTypes, appArgsIfaceTypesForAllTyFlags,
@@ -2308,6 +2311,11 @@ pprTyTcApp ctxt_prec tc tys =
            (IA_Arg (IfaceLitTy lit@IfaceNumTyLit{}) (IfaceForAllTyFlag Required) IA_Nil) <- tys
        -> maybeParen ctxt_prec sigPrec $ pprIfaceTyLit lit <+> dcolon <+> pprIfaceType target
 
+       | tc `ifaceTyConHasKey` charPrimLitTyConKey
+       , not debug
+       , IA_Arg (IfaceLitTy (IfaceCharTyLit c)) (IfaceForAllTyFlag Required) IA_Nil <- tys
+       -> text (show c) <> char '#'
+
        | IfaceTupleTyCon arity sort <- ifaceTyConSort info
        , not debug
        , arity == ifaceVisAppArgsLength tys
@@ -2574,14 +2582,21 @@ ppr_tuple_sum ctxt_prec sort is_promoted args =
 
     mk_name = case (sort, is_promoted) of
       (IsTuple BoxedTuple, IsPromoted) -> tupleDataConName Boxed
+      (IsTuple UnboxedTuple, IsPromoted) -> tupleDataConName Unboxed
       (IsTuple s, _) -> tupleTyConName s
       (IsSum, _) -> tyConName . sumTyCon
 
-    -- drop the RuntimeRep vars.
+    -- drop the RuntimeRep vars (and promoted element kind vars).
     -- See Note [Unboxed tuple RuntimeRep vars] in GHC.Core.TyCon
-    non_rep_tys = if strip_reps then drop arity all_tys else all_tys
+    non_rep_tys = drop stripped_prefix all_tys
 
-    arity = if strip_reps then count `div` 2 else count
+    (arity, stripped_prefix) = case (sort, is_promoted) of
+      (IsTuple UnboxedTuple, IsPromoted) ->
+        let a = count `div` 3 in (a, 2 * a)
+      _ | strip_reps ->
+        let a = count `div` 2 in (a, a)
+      _ ->
+        (count, 0)
 
     count = length all_tys
 
@@ -3159,11 +3174,88 @@ data IfaceEvidence
   | CheckedClosureSourceTableEvidence
   | IndexedDiagonalConstructorCaseEvidence
   | OpaqueOrdinaryConstructorCaseEvidence
+  | RetainedDepFunUnfoldingEvidence
   deriving (Bounded, Enum, Eq, Ord)
 
 -- | Requirements of an interface payload. See Note [Versioning retained evidence]
 -- in GHC.Iface.Binary.
 type IfaceEvidenceVersion = Set.Set IfaceEvidence
+
+-- | Check whether an interface function signature binds a native dependent value or dictionary.
+hasIfaceDepFunType :: IfaceType -> Bool
+hasIfaceDepFunType (IfaceDepFunTy {}) = True
+hasIfaceDepFunType (IfaceDepDictTy {}) = True
+hasIfaceDepFunType (IfaceForAllTy _ _ body) = hasIfaceDepFunType body
+hasIfaceDepFunType (IfaceFunTy _ _ _ _ res) = hasIfaceDepFunType res
+hasIfaceDepFunType _ = False
+
+-- | Check whether an interface type contains a scoped dictionary binder or selector.
+hasIfaceScopedDictType :: IfaceType -> Bool
+hasIfaceScopedDictType (IfaceDepDictTy {}) = True
+hasIfaceScopedDictType (IfaceClassAppTy {}) = True
+hasIfaceScopedDictType (IfaceDepFunTy _ (w, _, dom) res) =
+  hasIfaceScopedDictType w || hasIfaceScopedDictType dom || hasIfaceScopedDictType res
+hasIfaceScopedDictType (IfaceExistsTy _ (_, k) body) =
+  hasIfaceScopedDictType k || hasIfaceScopedDictType body
+hasIfaceScopedDictType (IfaceForAllTy ma (Bndr b _) body) =
+  hasIfaceScopedDictType ma || bndr_has b || hasIfaceScopedDictType body
+  where
+    bndr_has (IfaceTvBndr (_, k)) = hasIfaceScopedDictType k
+    bndr_has (IfaceIdBndr (w, _, t)) = hasIfaceScopedDictType w || hasIfaceScopedDictType t
+hasIfaceScopedDictType (IfaceFunTy _ ma w arg res) =
+  hasIfaceScopedDictType ma || hasIfaceScopedDictType w
+    || hasIfaceScopedDictType arg || hasIfaceScopedDictType res
+hasIfaceScopedDictType (IfaceAppTy f args) =
+  hasIfaceScopedDictType f || any hasIfaceScopedDictType (appArgsIfaceTypes args)
+hasIfaceScopedDictType (IfaceTyConApp _ args) =
+  any hasIfaceScopedDictType (appArgsIfaceTypes args)
+hasIfaceScopedDictType (IfaceTupleTy _ _ args) =
+  any hasIfaceScopedDictType (appArgsIfaceTypes args)
+hasIfaceScopedDictType (IfaceCastTy ty co) =
+  hasIfaceScopedDictType ty || hasIfaceScopedDictCo co
+hasIfaceScopedDictType (IfaceCoercionTy co) = hasIfaceScopedDictCo co
+hasIfaceScopedDictType (IfaceTermAppTy _ arg) = hasIfaceScopedDictType arg
+hasIfaceScopedDictType (IfaceFreeTermAppTy _ arg) = hasIfaceScopedDictType arg
+hasIfaceScopedDictType _ = False
+
+-- | Check whether an interface coercion mentions a scoped dictionary type.
+hasIfaceScopedDictCo :: IfaceCoercion -> Bool
+hasIfaceScopedDictCo (IfaceReflCo t) = hasIfaceScopedDictType t
+hasIfaceScopedDictCo (IfaceGReflCo _ t mco) =
+  hasIfaceScopedDictType t || has_mco mco
+  where
+    has_mco IfaceMRefl = False
+    has_mco (IfaceMCo c) = hasIfaceScopedDictCo c
+hasIfaceScopedDictCo (IfaceFunCo _ c1 c2 c3 c4) =
+  any hasIfaceScopedDictCo [c1, c2, c3, c4]
+hasIfaceScopedDictCo (IfaceTermAppCo _ co) = hasIfaceScopedDictCo co
+hasIfaceScopedDictCo (IfaceDepFunCo _ _ (w, _, arg) dom co) =
+  hasIfaceScopedDictType w || hasIfaceScopedDictType arg
+    || (case dom of { IfaceMRefl -> False; IfaceMCo d -> hasIfaceScopedDictCo d })
+    || hasIfaceScopedDictCo co
+hasIfaceScopedDictCo (IfaceTyConAppCo _ _ cos) = any hasIfaceScopedDictCo cos
+hasIfaceScopedDictCo (IfaceAppCo c1 c2) =
+  hasIfaceScopedDictCo c1 || hasIfaceScopedDictCo c2
+hasIfaceScopedDictCo (IfaceForAllCo b _ _ ma kind_co co) =
+  bndr_has b || hasIfaceScopedDictCo ma
+    || (case kind_co of { IfaceMRefl -> False; IfaceMCo k -> hasIfaceScopedDictCo k })
+    || hasIfaceScopedDictCo co
+  where
+    bndr_has (IfaceTvBndr (_, k)) = hasIfaceScopedDictType k
+    bndr_has (IfaceIdBndr (w, _, t)) = hasIfaceScopedDictType w || hasIfaceScopedDictType t
+hasIfaceScopedDictCo (IfaceUnivCo _ _ t1 t2 _) =
+  hasIfaceScopedDictType t1 || hasIfaceScopedDictType t2
+hasIfaceScopedDictCo (IfaceSymCo c) = hasIfaceScopedDictCo c
+hasIfaceScopedDictCo (IfaceTransCo c1 c2) =
+  hasIfaceScopedDictCo c1 || hasIfaceScopedDictCo c2
+hasIfaceScopedDictCo (IfaceSelCo _ c) = hasIfaceScopedDictCo c
+hasIfaceScopedDictCo (IfaceLRCo _ c) = hasIfaceScopedDictCo c
+hasIfaceScopedDictCo (IfaceInstCo c1 c2) =
+  hasIfaceScopedDictCo c1 || hasIfaceScopedDictCo c2
+hasIfaceScopedDictCo (IfaceKindCo c) = hasIfaceScopedDictCo c
+hasIfaceScopedDictCo (IfaceSubCo c) = hasIfaceScopedDictCo c
+hasIfaceScopedDictCo (IfaceAxiomCo _ cos) = any hasIfaceScopedDictCo cos
+hasIfaceScopedDictCo _ = False
 
 -- | Record a feature only while writing the full interface.
 requireIfaceEvidenceVersion :: WriteBinHandle -> IfaceEvidence -> IO ()

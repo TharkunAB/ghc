@@ -556,9 +556,11 @@ tcTyClGroup open_indices (TyClGroup { group_tyclds = tyclds
            do { let decl_env = mkNameEnv [ (tcdName decl, decl)
                                          | L _ decl <- tyclds ]
                     check_kisig kisig@(L _ (StandaloneKindSig _ (L _ name) _))
-                      = tcStandaloneKindSig (lookupNameEnv_NF decl_env name) kisig
-              ; kisig_env <- mkNameEnv <$> traverse check_kisig kisigs
-              ; tcTyClDecls open_indices tyclds kisig_env role_annots }
+                      = tcStandaloneKindSigWithDomain (lookupNameEnv_NF decl_env name) kisig
+              ; checked_kisigs <- traverse check_kisig kisigs
+              ; let kisig_env  = mkNameEnv [ (n, ki)  | (n, ki, _)       <- checked_kisigs ]
+                    domain_env = mkNameEnv [ (n, cki) | (n, _, Just cki) <- checked_kisigs ]
+              ; tcTyClDecls open_indices tyclds kisig_env domain_env role_annots }
        ; let tyclss = map fst tyclss_with_validity_infos
              cases = caseHelperOwners tyclss_with_validity_infos
 
@@ -624,9 +626,10 @@ tcTyClDecls
   :: OpenFamilyCandidates
   -> [LTyClDecl GhcRn]
   -> KindSigEnv
+  -> KindSigEnv
   -> RoleAnnotEnv
   -> TcM ([(TyCon, [TyFamEqnValidityInfo])], [DerivInfo], NameSet, (NameEnv (CoAxiom Branched), [TyCon]))
-tcTyClDecls open_indices tyclds kisig_env role_annots
+tcTyClDecls open_indices tyclds kisig_env domain_env role_annots
   = do {    -- Step 1: kind-check this group and returns the final
             -- (possibly-polymorphic) kind of each TyCon and Class
             -- See Note [Kind checking for type and class decls]
@@ -685,7 +688,7 @@ tcTyClDecls open_indices tyclds kisig_env role_annots
                      -- and Note [Type environment evolution]
                  tcExtendKindEnvWithTyCons tc_tycons $ do
                    let (helpers, remaining) = partition isCaseLet tyclds
-                       check = tcTyClDecl rec_case_axioms metadata roles
+                       check = tcTyClDecl rec_case_axioms domain_env metadata roles
                        checked ((tc, _), _) =
                          [(tyConName tc, ATcCaseLet (binderVars (tyConBinders tc))
                              rhs (tyConResKind tc) (Just tc))
@@ -3723,8 +3726,8 @@ The IRs are already well-equipped to handle unlifted types, and unlifted
 datatypes are just a new sub-class thereof.
 -}
 
-tcTyClDecl :: NameEnv (CoAxiom Branched) -> NameEnv SynonymMetadata -> RolesInfo -> LTyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
-tcTyClDecl case_axioms metadata roles_info (L loc decl)
+tcTyClDecl :: NameEnv (CoAxiom Branched) -> KindSigEnv -> NameEnv SynonymMetadata -> RolesInfo -> LTyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
+tcTyClDecl case_axioms domain_env metadata roles_info (L loc decl)
   | Just thing <- wiredInNameTyThing_maybe (tcdName decl)
   = case thing of -- See Note [Declarations for wired-in things]
       ATyCon tc -> return ((tc, []), wiredInDerivInfo tc decl)
@@ -3733,7 +3736,11 @@ tcTyClDecl case_axioms metadata roles_info (L loc decl)
   | otherwise
   = setSrcSpanA loc $ tcAddDeclCtxt decl $
     do { traceTc "---- tcTyClDecl ---- {" (ppr decl)
-       ; (tc_vi@(tc, _), deriv_infos) <- tcTyClDecl1 case_axioms (lookupNameEnv metadata (tcdName decl)) roles_info decl
+       ; (tc_vi@(tc, _), deriv_infos) <-
+           tcTyClDecl1 case_axioms
+             (lookupNameEnv domain_env (tcdName decl))
+             (lookupNameEnv metadata (tcdName decl))
+             roles_info decl
        ; traceTc "---- tcTyClDecl end ---- }" (ppr tc)
        ; return (tc_vi, deriv_infos) }
 
@@ -3757,27 +3764,27 @@ wiredInDerivInfo tycon decl
 wiredInDerivInfo _ _ = []
 
   -- "type family" declarations
-tcTyClDecl1 :: NameEnv (CoAxiom Branched) -> Maybe SynonymMetadata -> RolesInfo -> TyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
-tcTyClDecl1 case_axioms _ _roles_info (FamDecl { tcdFam = fd })
+tcTyClDecl1 :: NameEnv (CoAxiom Branched) -> Maybe Kind -> Maybe SynonymMetadata -> RolesInfo -> TyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
+tcTyClDecl1 case_axioms mb_domain _ _roles_info (FamDecl { tcdFam = fd })
   = fmap noDerivInfos $
-    tcFamDecl1 case_axioms Nothing fd
+    tcFamDecl1 case_axioms mb_domain Nothing fd
 
   -- "type" synonym declaration
-tcTyClDecl1 _ metadata roles_info
+tcTyClDecl1 _ _ metadata roles_info
             (SynDecl { tcdLName = L _ tc_name
                      , tcdRhs   = rhs })
   = fmap ( noDerivInfos . noEqnValidityInfos ) $
     tcTySynRhs metadata roles_info tc_name rhs
 
   -- "data/newtype" declaration
-tcTyClDecl1 _ _parent roles_info
+tcTyClDecl1 _ _ _parent roles_info
             decl@(DataDecl { tcdLName = L _ tc_name
                            , tcdDataDefn = defn })
   = assert (isNothing _parent) $
     fmap (\(tc, deriv_info) -> ((tc, []), deriv_info)) $
     tcDataDefn (tcMkDeclCtxt decl) roles_info tc_name defn
 
-tcTyClDecl1 _ _parent roles_info
+tcTyClDecl1 _ _ _parent roles_info
             (ClassDecl { tcdLName = L _ class_name
                        , tcdCtxt = hs_ctxt
                        , tcdFDs = fundeps
@@ -3928,7 +3935,7 @@ tcClassATs class_name cls ats at_defs
                                           (at_def_tycon at_def) [at_def])
                         emptyNameEnv at_defs
 
-    tc_at at = do { (fam_tc, val_infos) <- addLocM (tcFamDecl1 emptyNameEnv (Just cls)) at
+    tc_at at = do { (fam_tc, val_infos) <- addLocM (tcFamDecl1 emptyNameEnv Nothing (Just cls)) at
                   ; mapM_ (checkTyFamEqnValidityInfo fam_tc) val_infos
                   ; let at_defs = lookupNameEnv at_defs_map (at_fam_name at)
                                   `orElse` []
@@ -4117,8 +4124,8 @@ any damage is done.
 *                                                                      *
 ********************************************************************* -}
 
-tcFamDecl1 :: NameEnv (CoAxiom Branched) -> Maybe Class -> FamilyDecl GhcRn -> TcM (TyCon, [TyFamEqnValidityInfo])
-tcFamDecl1 case_axioms parent (FamilyDecl { fdInfo = fam_info
+tcFamDecl1 :: NameEnv (CoAxiom Branched) -> Maybe Kind -> Maybe Class -> FamilyDecl GhcRn -> TcM (TyCon, [TyFamEqnValidityInfo])
+tcFamDecl1 case_axioms mb_domain parent (FamilyDecl { fdInfo = fam_info
                               , fdLName = tc_lname@(L _ tc_name)
                               , fdResultSig = L _ sig
                               , fdInjectivityAnn = inj })
@@ -4159,9 +4166,13 @@ tcFamDecl1 case_axioms parent (FamilyDecl { fdInfo = fam_info
   ; let flav
           | enabled, Just _ <- parent = ConstrainedTypeFamilyTyCon
           | otherwise = OpenTypeFamilyTyCon
-        tycon = mkFamilyTyCon tc_name kind tc_bndrs 0 res_kind
+        effective_kind = fromMaybe kind mb_domain
+        is_constrained = case parent of
+          Just _  -> enabled
+          Nothing -> isJust mb_domain
+        tycon = mkFamilyTyCon tc_name effective_kind tc_bndrs 0 res_kind
                                (resultVariableName sig) flav parent inj'
-  ; when (is_boot && isConstrainedFamilyTyCon tycon) $
+  ; when (is_boot && is_constrained) $
       failWithTc $ TcRnConstrainedFamilyUnsupported tycon $
         text "Constrained associated families in hs-boot files and signatures are unsupported."
   ; return (tycon, []) }
@@ -4179,17 +4190,22 @@ tcFamDecl1 case_axioms parent (FamilyDecl { fdInfo = fam_info
 
        ; checkFamFlag tc_name -- make sure we have -XTypeFamilies
        ; checkResultSigFlag tc_name sig
+       ; is_boot <- tcIsHsBootOrSig
+       ; let effective_kind = fromMaybe kind mb_domain
 
          -- If Nothing, this is an abstract family in a hs-boot file;
          -- but eqns might be empty in the Just case as well
        ; case mb_eqns of
-           Nothing   ->
-              let tc = mkFamilyTyCon tc_name kind tc_bndrs 0 res_kind
+           Nothing   -> do
+              let tc = mkFamilyTyCon tc_name effective_kind tc_bndrs 0 res_kind
                                      (resultVariableName sig)
                                      (ClosedTypeFamilyTyCon CTF_Abstract)
                                      parent
                                      inj'
-              in return (tc, [])
+              when (is_boot && isJust mb_domain) $
+                failWithTc $ TcRnConstrainedFamilyUnsupported tc $
+                  text "Constrained type families in hs-boot files and signatures are unsupported."
+              return (tc, [])
            Just eqns -> do {
 
          -- Process the equations, creating CoAxBranches
@@ -4225,7 +4241,7 @@ tcFamDecl1 case_axioms parent (FamilyDecl { fdInfo = fam_info
               | otherwise = Just ((mkBranchedCoAxiom Nominal co_ax_name fam_tc branches)
                                   { co_ax_source_proof_rules = proof_rules })
 
-             fam_tc = mkFamilyTyCon tc_name kind tc_bndrs 0 res_kind (resultVariableName sig)
+             fam_tc = mkFamilyTyCon tc_name effective_kind tc_bndrs 0 res_kind (resultVariableName sig)
                       (ClosedTypeFamilyTyCon closed) parent inj'
 
              closed
@@ -4240,6 +4256,9 @@ tcFamDecl1 case_axioms parent (FamilyDecl { fdInfo = fam_info
          -- We check for instance validity later, when doing validity
          -- checking for the tycon. Exception: checking equations
          -- overlap done by dropDominatedAxioms
+       ; when (is_boot && isJust mb_domain) $
+           failWithTc $ TcRnConstrainedFamilyUnsupported fam_tc $
+             text "Constrained type families in hs-boot files and signatures are unsupported."
        ; return (fam_tc, axiom_validity_infos) } }
 
 -- | Maybe return a list of Bools that say whether a type family was declared
@@ -6521,6 +6540,7 @@ checkValidTyCl selectors tc
     recoverM recovery_code     $
     do { traceTc "Starting validity for tycon" (ppr tc)
        ; checkValidTyConWithSelectors selectors tc
+       ; checkStandaloneFamilyCoverage tc
        ; checkTyConConsistentWithBoot tc -- See Note [TyCon boot consistency checking]
        ; traceTc "Done validity for tycon" (ppr tc)
        ; return [tc] }

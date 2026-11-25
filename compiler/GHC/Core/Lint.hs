@@ -558,7 +558,7 @@ withScopedDictionaryLint True check = LintM $ \env lint_errs ->
 
 -- | An experimental neutral selector application held outside the Type AST.
 -- See Note [Scoped selector application prototype].
-data ScopedSelectorApp = ScopedSelectorApp Id Type Id Id Type
+data ScopedSelectorApp = ScopedSelectorApp Id Type Id CoreExpr Id Type
 
 -- | Check a direct class selector with one type argument and one value operand.
 checkScopedSelectorApp :: LintConfig -> Id -> Type -> Id -> Id -> Maybe ScopedSelectorApp
@@ -587,21 +587,25 @@ checkScopedSelectorShape scope selector inst dictionary operand
              return actual
        dict <- checked_occ isNativeClassDictionaryId dictionary
        arg <- checked_occ isNativeOpaqueValueId operand
-       guard (varType dict `eqType` instantiate predicate && varType arg `eqType` instantiate domain)
-       return (ScopedSelectorApp selector inst dict arg (instantiate result))
+       dict_expr <- case projectUniqueClassDict (instantiate predicate) [dict] of
+         ScopedDirectDict d | d == dict -> Just (Var dict)
+         ScopedSuperclassDict d sc_expr | d == dict -> Just sc_expr
+         _ -> Nothing
+       guard (varType arg `eqType` instantiate domain)
+       return (ScopedSelectorApp selector inst dict dict_expr arg (instantiate result))
 
 scopedSelectorExpr :: ScopedSelectorApp -> CoreExpr
-scopedSelectorExpr (ScopedSelectorApp selector inst dict arg _) =
-  mkApps (Var selector) [Type inst, Var dict, Var arg]
+scopedSelectorExpr (ScopedSelectorApp selector inst _ dict_expr arg _) =
+  mkApps (Var selector) [Type inst, dict_expr, Var arg]
 
 -- | Compare two neutral selector applications under a binder renaming.
 eqScopedSelectorApp :: RnEnv2 -> ScopedSelectorApp -> ScopedSelectorApp -> Bool
-eqScopedSelectorApp env (ScopedSelectorApp f a d x _) (ScopedSelectorApp g b e y _)
+eqScopedSelectorApp env (ScopedSelectorApp f a d _ x _) (ScopedSelectorApp g b e _ y _)
   = f == g && eqTypeX env a b && rnOccL env d == rnOccR env e && rnOccL env x == rnOccR env y
 
 -- | Substitute scoped variables and recheck the application and its kind.
 substScopedSelectorApp :: LintConfig -> CoreSubst.Subst -> ScopedSelectorApp -> Maybe ScopedSelectorApp
-substScopedSelectorApp cfg subst (ScopedSelectorApp selector inst dictionary operand _)
+substScopedSelectorApp cfg subst (ScopedSelectorApp selector inst dictionary _ operand _)
   = do dict <- replace dictionary
        arg <- replace operand
        checkScopedSelectorApp cfg selector (CoreSubst.substTy subst inst) dict arg
@@ -613,7 +617,7 @@ substScopedSelectorApp cfg subst (ScopedSelectorApp selector inst dictionary ope
 
 -- | Return the result kind of a checked neutral selector application.
 scopedSelectorResultKind :: ScopedSelectorApp -> Type
-scopedSelectorResultKind (ScopedSelectorApp _ _ _ _ kind) = kind
+scopedSelectorResultKind (ScopedSelectorApp _ _ _ _ _ kind) = kind
 
 {- Note [Scoped selector application prototype]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3602,6 +3606,8 @@ lint_branch ax_tc (CoAxBranch { cab_tvs = tvs, cab_cvs = cvs
                               , cab_lhs = lhs_args, cab_rhs = rhs })
   = foldr lint_pattern_binder (lintBinders LambdaBind cvs lint_body) tvs
   where
+    -- Includes Int#, Word#, and Char# closed-family field binders.
+    -- See Note [Unboxed Char# and unboxed tuple promotion] in GHC.Tc.Gen.HsType.
     lint_pattern_binder tv inside
       | ClosedTypeFamilyFlavour <- tyConFlavour ax_tc
       , isPrimFamilyPatBinder lhs_args rhs tv

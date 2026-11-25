@@ -44,7 +44,6 @@ module GHC.Linker.Loader
 where
 
 import GHC.Prelude
-import Data.Maybe (isJust)
 
 import GHC.Settings
 import GHC.Utils.Misc
@@ -82,6 +81,7 @@ import GHC.SysTools
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Env
+import GHC.Types.Name.Set (mkNameSet, elemNameSet)
 import GHC.Types.SrcLoc
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.DFM
@@ -781,6 +781,16 @@ loadDeclsWithOptionalName :: Interp -> HscEnv -> SrcSpan -> Maybe Name -> Linkab
 loadDeclsWithOptionalName interp hsc_env span optional linkable = do
     initLoaderState interp hsc_env
     modifyLoaderState interp $ \pls0 -> do
+      let bco_st = bco_loader_state pls0
+          needed_mods =
+            [ nameModule n
+            | n <- free_names
+            , isExternalName n       -- Names from other modules
+            , not (isWiredInName n)  -- Exclude wired-in names (see note below)
+            , not (n `elemNameSet` local_itbls)
+            , isNothing (lookupNameBytecodeState bco_st n)
+            , isNothing (lookupInfoTableBytecodeState bco_st n)
+            ]
       (pls, ok, links, packages) <- loadDependencies interp hsc_env pls0 span needed_mods
       when (failed ok) $
         throwGhcExceptionIO (ProgramError "could not load dependencies for decls")
@@ -798,16 +808,12 @@ loadDeclsWithOptionalName interp hsc_env span optional linkable = do
   where
     cbcs = linkableBCOs linkable
 
+    local_itbls = mkNameSet [ nm | cbc <- cbcs, (nm, _) <- bc_itbls cbc ]
+
     free_names = uniqDSetToList $
       foldl'
         (\acc cbc -> foldl' (\acc' bco -> bcoFreeNames bco `unionUniqDSets` acc') acc (bc_bcos cbc))
         emptyUniqDSet cbcs
-
-    needed_mods :: [Module]
-    needed_mods = [ nameModule n | n <- free_names,
-                    isExternalName n,       -- Names from other modules
-                    not (isWiredInName n)   -- Exclude wired-in names
-                  ]                         -- (see note below)
     -- Exclude wired-in names because we may not have read
     -- their interface files, so getLinkDeps will fail
     -- All wired-in names are in the base package, which we link

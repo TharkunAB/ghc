@@ -39,7 +39,7 @@ import GHC.Driver.Errors
 import GHC.Driver.Plugins
 import GHC.Driver.Session (safeInferOn, safeLanguageOn)
 import GHC.Driver.Main
-import GHC.Driver.Main.Passes (hscCompileCoreExprWithOptionalName)
+import GHC.Driver.Main.Passes (hscCompileCoreExprWithOptionalName, hscLoadSameModuleClosedBcos)
 import GHC.Driver.DynFlags
 import GHC.Driver.Env
 import GHC.Driver.Ppr (showPpr, showSDocForUser)
@@ -55,7 +55,6 @@ import GHC.Tc.Utils.TcType
 import GHC.Tc.Gen.Expr
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Env
-import GHC.Tc.Types.BasicTypes (TcTyThing(ATcTypeLet, ATcCaseLet))
 import GHC.Tc.Types.Origin
 import GHC.Tc.Gen.SourceTable (checkOptionalSourceUses, captureSourceMethodProof, closedSourceProofArgs)
 import GHC.Tc.Gen.OpenTypeEval (readOpenDefinition, readOpenMethodWorker)
@@ -86,7 +85,7 @@ import GHC.Core.InstEnv as InstEnv
 import GHC.Core.Utils (dataConRepInstPat, exprType, mkCast, mkLamType)
 
 import GHC.Builtin.TH
-import GHC.Builtin.Modules (gHC_INTERNAL_BASE, gHC_TYPES, mkGhcInternalModule)
+import GHC.Builtin.Modules (gHC_INTERNAL_BASE, gHC_TYPES, mkGhcInternalModule, mkInteractiveModule)
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs (eitherTyConOcc, returnIOIdOcc, toAnnotationWrapperIdOcc)
 import GHC.Builtin.WiredIn.Types
@@ -100,6 +99,7 @@ import GHC.Iface.Env (lookupOrig)
 
 import GHCi.Message
 import GHCi.RemoteTypes
+import GHC.Runtime.Context (extendInteractiveContextWithIds)
 import GHC.Runtime.Interpreter
 
 import GHC.Rename.Splice( traceSplice, SpliceInfo(..) )
@@ -135,6 +135,7 @@ import GHC.Types.Error
 import GHC.Types.Fixity as Hs
 import GHC.Types.Annotations
 import GHC.Types.Name
+import GHC.Types.Unique.DFM (emptyUDFM, plusUDFM)
 import GHC.Types.Unique.Map
 import GHC.Serialized
 
@@ -1345,7 +1346,7 @@ tcDecodeClosedCallOperand owner operand = do
     Right (value, gres)
       | exprType value `tcEqType` typeKind operand -> do
           -- Import usage depends only on the set of constructor Names.
-          addUsedGREs NoDeprecationWarnings (nonDetNameEnvElts gres)
+          addUsedGREs NoDeprecationWarnings (filter isImportedGRE (nonDetNameEnvElts gres))
           return (Just value)
       | otherwise -> return Nothing
   where
@@ -1493,11 +1494,14 @@ tcClosedCallValueShape owner kind = do
                                      , let con = closedIndexCon index] ++
             concatMap witness_field_dependencies
               [field | ClosedOpenAlternative _ _ fields <- alternatives, Just field <- fields]
+          this_mod = tcg_semantic_mod env
           used = [name | (tc, constructors) <- datatypes
-                       , name <- tyConName tc : map dataConName constructors]
+                       , name <- tyConName tc : map dataConName constructors
+                       , not (nameIsLocalOrFrom this_mod name)]
       addUsedGREs NoDeprecationWarnings
         [gre | (_, constructors) <- datatypes, con <- constructors
-             , Just gre <- [closedImportedGRE (tcg_rdr_env env) con]]
+             , Just gre <- [closedImportedGRE (tcg_rdr_env env) con]
+             , isImportedGRE gre]
       -- The parent declaration fingerprint also covers constructors that
       -- were impossible at the index, and constructors added later.
       updTcRef (tcg_evaluated_term_uses env) (`extendNameSetList` used)
@@ -1937,11 +1941,11 @@ closedIndexCoercion evidence tv (ClosedIndex ground evidence_pos path) = do
              i < length ls)
       return (mkSelCo (SelTyCon i Nominal) co)
 
--- | Find an ordinary import for this exact constructor.
+-- | Find a local or non-SOURCE imported GRE for this exact constructor.
 closedImportedGRE :: GlobalRdrEnv -> DataCon -> Maybe GlobalRdrElt
 closedImportedGRE rdr_env con = do
   gre <- lookupGRE_Name rdr_env (dataConName con)
-  guard (any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre))
+  guard (isLocalGRE gre || any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre))
   return gre
 
 -- | Execute a checked closed call through the target interpreter.
@@ -2032,7 +2036,8 @@ prepareClosedFunction fun expected = do
       "The closed call does not have the expected ordinary function type.")
   -- Even a fused call can be simplified using an imported unfolding.
   env <- getGblEnv
-  updTcRef (tcg_evaluated_term_uses env) (`extendNameSet` name)
+  unless (nameIsLocalOrFrom (tcg_semantic_mod env) name) $
+    updTcRef (tcg_evaluated_term_uses env) (`extendNameSet` name)
   return (function, method)
 
 -- | Render and interpret a complete runtime expression at a type boundary.
@@ -2073,11 +2078,31 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
     let response = render call
     unless (exprType response `tcEqType` stringTy) $
       bad "Unexpected type for the interpreter response."
-    compiled <- tryMostM $ liftIO $ case optional of
-      Nothing -> do
-        (value, links, packages) <- hscCompileCoreExpr hsc_env loc (mkCoreApp ret response)
-        pure (Just value, links, packages)
-      Just entry -> hscCompileCoreExprWithOptionalName hsc_env loc entry (mkCoreApp ret response)
+    gbl_env <- getGblEnv
+    let full_expr0 = mkCoreApp ret response
+        (local_bco_binds, full_expr) =
+          rewriteSameModuleClosedExpr (tcg_local_open_defs gbl_env) full_expr0
+        local_alg_tcs = [tc | tc <- tcg_tcs gbl_env, isAlgTyCon tc]
+        needs_local_itbls =
+          not (null local_bco_binds) ||
+          any (\v -> (isDataConWorkId v || isDataConWrapId v)
+                     && nameIsLocalOrFrom (tcg_semantic_mod gbl_env) (idName v))
+              (exprSomeFreeVarsList (const True) full_expr)
+        hsc_env_bco =
+          if null local_bco_binds
+            then hsc_env
+            else hsc_env { hsc_IC = extendInteractiveContextWithIds (hsc_IC hsc_env) (map fst local_bco_binds) }
+    compiled <- tryMostM $ liftIO $ do
+      (local_links, local_pkgs) <-
+        if needs_local_itbls
+          then hscLoadSameModuleClosedBcos hsc_env_bco loc local_alg_tcs local_bco_binds
+          else pure ([], emptyUDFM)
+      (value, links, packages) <- case optional of
+        Nothing -> do
+          (val, lks, pkgs) <- hscCompileCoreExpr hsc_env_bco loc full_expr
+          pure (Just val, lks, pkgs)
+        Just entry -> hscCompileCoreExprWithOptionalName hsc_env_bco loc entry full_expr
+      pure (value, local_links ++ links, plusUDFM local_pkgs packages)
     (value, links, packages) <- either (bad . displayException) pure compiled
     recordThNeededRuntimeDeps links packages
     forM value $ \value -> do
@@ -2288,15 +2313,93 @@ specializeClosedFunction fun expected = do
   zonked <- zonkTopLExpr typed
   core <- desugarStagedExpr zonked
   env <- getGblEnv
-  let free = exprSomeFreeVarsList (const True) core
-      unavailable v = isLocalVar v || nameIsLocalOrFrom (tcg_semantic_mod env) (getName v)
+  let this_mod = tcg_semantic_mod env
+      local_defs = tcg_local_open_defs env
+      free = exprSomeFreeVarsList (const True) core
+      local_ok v = idName v `elemNameEnv` local_defs
+                   || isDataConWorkId v || isDataConWrapId v
+      unavailable v = (isLocalVar v && not (idName v `elemNameEnv` local_defs))
+                      || (nameIsLocalOrFrom this_mod (getName v) && not (local_ok v))
   when (any unavailable free) $
     failWithTc (TcRnClosedTypeEval name
       "The specialization uses an unfinished local binding or dictionary.")
   updTcRef (tcg_evaluated_term_uses env)
-           (`extendNameSetList` [getName v | v <- free, isGlobalId v])
+           (`extendNameSetList` [ getName v
+                                | v <- free, isGlobalId v
+                                , not (nameIsLocalOrFrom this_mod (getName v)) ])
   method <- closedMethodProof env fun free
   pure (core, method)
+
+-- | Rewrite references to solved earlier same-module bindings in @tcg_local_open_defs@
+-- to deterministic interactive BCO GlobalIds, returning the transitive closure of
+-- rewritten bindings alongside the rewritten expression.
+-- See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
+rewriteSameModuleClosedExpr
+  :: NameEnv (Id, Core.CoreExpr)
+  -> Core.CoreExpr
+  -> ([(Id, Core.CoreExpr)], Core.CoreExpr)
+rewriteSameModuleClosedExpr locals expr
+  | isEmptyNameEnv locals = ([], expr)
+  | null roots            = ([], expr)
+  | otherwise             = (rewritten_binds, rewrite emptyVarSet expr)
+  where
+    roots = [ idName v
+            | v <- exprSomeFreeVarsList (const True) expr
+            , idName v `elemNameEnv` locals ]
+
+    closure :: NameSet -> [Name] -> [Name]
+    closure _ [] = []
+    closure seen (n : ns)
+      | n `elemNameSet` seen = closure seen ns
+      | Just (_, rhs) <- lookupNameEnv locals n
+      = let deps = [ idName v
+                   | v <- exprSomeFreeVarsList (const True) rhs
+                   , idName v `elemNameEnv` locals ]
+        in n : closure (extendNameSet seen n) (deps ++ ns)
+      | otherwise = closure seen ns
+
+    needed_names = closure emptyNameSet roots
+
+    bco_id :: Id -> Id
+    bco_id owner =
+      let u = idUnique owner
+          bco_mod = mkInteractiveModule ("SameModClosed_" ++ show u)
+          bco_name = mkExternalName u bco_mod (nameOccName (idName owner)) (nameSrcSpan (idName owner))
+      in mkVanillaGlobal bco_name (idType owner)
+
+    rewritten_binds =
+      [ (bco_id owner, rewrite emptyVarSet rhs)
+      | nm <- needed_names
+      , Just (owner, rhs) <- [lookupNameEnv locals nm] ]
+
+    rewrite :: VarSet -> Core.CoreExpr -> Core.CoreExpr
+    rewrite bound (Core.Var v)
+      | not (v `elemVarSet` bound)
+      , Just (owner, _) <- lookupNameEnv locals (idName v)
+      = Core.Var (bco_id owner)
+      | otherwise = Core.Var v
+    rewrite _ e@Core.Lit{} = e
+    rewrite bound (Core.App f a) = Core.App (rewrite bound f) (rewrite bound a)
+    rewrite bound (Core.Lam b body) = Core.Lam b (rewrite (extendVarSet bound b) body)
+    rewrite bound (Core.Let (Core.NonRec b rhs) body) =
+      Core.Let (Core.NonRec b (rewrite bound rhs)) (rewrite (extendVarSet bound b) body)
+    rewrite bound (Core.Let (Core.Rec prs) body) =
+      let bound' = extendVarSetList bound (map fst prs)
+      in Core.Let (Core.Rec [(b, rewrite bound' r) | (b, r) <- prs]) (rewrite bound' body)
+    rewrite bound (Core.Case scrut b ty alts) =
+      let bound_scrut = extendVarSet bound b
+          rewrite_alt (Core.Alt con bs rhs) =
+            Core.Alt con bs (rewrite (extendVarSetList bound_scrut bs) rhs)
+      in Core.Case (rewrite bound scrut) b ty (map rewrite_alt alts)
+    rewrite bound (Core.Cast e co) = Core.Cast (rewrite bound e) co
+    rewrite bound (Core.Tick t e)  = Core.Tick t (rewrite bound e)
+    rewrite bound (Core.Pack ex_ty wit_ty e) =
+      Core.Pack ex_ty wit_ty (rewrite bound e)
+    rewrite bound (Core.Unpack tv pv scrut body) =
+      Core.Unpack tv pv (rewrite bound scrut)
+        (rewrite (extendVarSetList bound [tv, pv]) body)
+    rewrite _ e@Core.Type{}        = e
+    rewrite _ e@Core.Coercion{}    = e
 
 -- | Find the concrete method selection made by ordinary specialization.
 -- Free variables describe the evidence actually present in this expression.
@@ -2637,9 +2740,16 @@ checkClosedTypeEvalStage hsc_env name = do
   let reject :: String -> TcM a
       reject = failWithTc . TcRnClosedTypeEval name
   dflags <- getDynFlags
-  iface <- loadInterfaceForName (text "closed call in a type") name
-  when (isHsBootOrSig (mi_hsc_src iface)) $
-    reject "The defining interface is a boot file or a module signature and provides no executable definition."
+  gbl_env <- getGblEnv
+  if nameIsLocalOrFrom (tcg_semantic_mod gbl_env) name
+    then do
+      boot <- tcIsHsBootOrSig
+      when boot $
+        reject "The defining interface is a boot file or a module signature and provides no executable definition."
+    else do
+      iface <- loadInterfaceForName (text "closed call in a type") name
+      when (isHsBootOrSig (mi_hsc_src iface)) $
+        reject "The defining interface is a boot file or a module signature and provides no executable definition."
   when (safeInferOn dflags) $
     recordUnsafeInfer emptyMessages
   case hsc_interp hsc_env of
@@ -2650,15 +2760,19 @@ checkClosedTypeEvalStage hsc_env name = do
 tcHasClosedCallExecutable :: Name -> TcM Bool
 tcHasClosedCallExecutable name = do
   env <- getTopEnv
+  gbl_env <- getGblEnv
   dflags <- getDynFlags
   level <- getThLevel
   boot <- tcIsHsBootOrSig
   explicit <- xoptM LangExt.ExplicitLevelImports
   case (nameModule_maybe name, hsc_interp env, level) of
     (Just mod, Just interp, Comp)
-      | not boot, not explicit, not (safeLanguageOn dflags) -> do
-          loc <- getSrcSpanM
-          liftIO $ executableDependenciesAvailable interp env loc mod
+      | not boot, not explicit, not (safeLanguageOn dflags) ->
+          if mod == tcg_semantic_mod gbl_env
+            then pure (name `elemNameEnv` tcg_local_open_defs gbl_env)
+            else do
+              loc <- getSrcSpanM
+              liftIO $ executableDependenciesAvailable interp env loc mod
     _ -> pure False
 
 -- | Check policy at the location where the call occurs.

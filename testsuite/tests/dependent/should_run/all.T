@@ -1059,3 +1059,32 @@ test('NativeParamDependentRecordUpdate',
       extra_files(['NativeParamDependentRecordUpdateProvider.hs',
                    'NativeParamDependentRecordUpdate.hs'])],
      run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
+test('NativeDepFunUnfolding',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeDepFunUnfolding.hs'])],
+     run_command, ['bash NativeDepFunUnfolding.sh "{compiler}" "{libdir}"'])
+test('NativeHomogeneousGadtBinders',
+     [req_host_target_ghc, req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['NativeHomogeneousGadtBinders.hs'])],
+     run_command, ['bash NativeHomogeneousGadtBinders.sh "{compiler}" "{libdir}"'])
+test('NativeSameModuleClosedEval',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeSameModuleClosedEval.hs'])],
+     run_command, ['bash NativeSameModuleClosedEval.sh "{compiler}" "{libdir}"'])
+test('NativeUnboxedTupleAndCharPrim',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeUnboxedTupleAndCharPrim.hs'])],
+     run_command, ['bash NativeUnboxedTupleAndCharPrim.sh "{compiler}" "{libdir}"'])
+test('NativeDataFamilyNewtypeExistential',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeDataFamilyNewtypeExistential.hs'])],
+     run_command, ['bash NativeDataFamilyNewtypeExistential.sh "{compiler}" "{libdir}"'])
+test('NativeStandaloneConstrainedFamily',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeStandaloneConstrainedFamily.hs'])],
+     run_command, ['bash NativeStandaloneConstrainedFamily.sh "{compiler}" "{libdir}"'])
+test('NativeWave10TypeCaseDotSections',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeWave10TypeCaseDotSectionsProvider.hs',
+                   'NativeWave10TypeCaseDotSections.hs'])],
+     run_command, ['bash NativeWave10TypeCaseDotSections.sh "{compiler}" "{libdir}"'])

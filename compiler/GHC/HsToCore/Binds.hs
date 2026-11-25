@@ -44,8 +44,8 @@ import GHC.HsToCore.Pmc ( addTyCs, pmcGRHSs )
 import GHC.Hs             -- lots of things
 import GHC.Core           -- lots of things
 import GHC.Core.Dependent
-  ( hasExistentialExpr, hasNativeDependentExpr, hasNativeDependentExprRhs, hasNativeDependentUnfolding
-  , isRetainedVanillaDefaultMethod, supportsNativeRuleBinds )
+  ( hasExistentialExpr, hasNativeDepFunType, hasNativeDependentExpr, hasNativeDependentExprRhs
+  , hasNativeDependentUnfolding, isRetainedVanillaDefaultMethod, supportsNativeRuleBinds )
 import GHC.Core.SimpleOpt
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
 import GHC.Core.InstEnv ( CanonicalEvidence(..) )
@@ -62,7 +62,7 @@ import GHC.Core.Coercion
 import GHC.Core.Rules
 import GHC.Core.Ppr( pprCoreBinders )
 import GHC.Core.TyCo.Compare( eqType )
-import GHC.Core.TyCo.Rep ( Type(DepFunTy) )
+import GHC.Core.TyCo.Rep ( Type(DepDictTy, DepFunTy) )
 
 import GHC.Builtin.KnownKeys( typeableClassKey )
 import GHC.Builtin.KnownOccs
@@ -508,7 +508,9 @@ makeCorePair dflags allow_worker_package pragma_name gbl_id is_default_method rh
         --     must take account of dictionaries and required type args
        = ( gbl_id `setIdUnfolding` mkInlineUnfoldingWithArity simpl_opts StableUserSrc
                                                               runtime_arity rhs
-         , if native_rhs then rhs else etaExpand runtime_arity rhs)
+         , if native_rhs || hasNativeDepFunType (idType gbl_id)
+             then rhs
+             else etaExpand runtime_arity rhs)
 
        | otherwise
        = pprTrace "makeCorePair: arity missing" (ppr gbl_id) $
@@ -563,6 +565,8 @@ findSatArity vis_arity ty = go vis_arity ty
     go ar next
       | DepFunTy vis _ res <- coreFullView next
       = step ar (vis == DepFunInvisible) True res
+      | DepDictTy _ res <- coreFullView next
+      = step ar True True res
       | Just (_, bndr, res) <- splitPiTy_maybe next
       = step ar (isInvisiblePiTyBinder bndr) (isRuntimePiTyBinder bndr) res
       | ar == 0 = 0

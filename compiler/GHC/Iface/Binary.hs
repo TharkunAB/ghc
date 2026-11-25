@@ -60,14 +60,15 @@ import GHC.Unit.Module.ModIface
 import GHC.Platform.Profile
 import GHC.Platform
 import GHC.Settings.Constants
-import GHC.Iface.Ext.Fields (getExtensibleFields, readFieldWith, writeFieldWith, deleteField)
-import GHC.Iface.Syntax (IfaceDecl(..), IfaceExport, IfaceFamTyConFlav(..), IfaceClassBody(..), IfaceAT(..), IfaceIdDetails(..))
+import GHC.Iface.Ext.Fields
+  ( depFunUnfoldingField, getExtensibleFields, readFieldWith, writeFieldWith, deleteField )
+import GHC.Iface.Syntax (IfaceDecl(..), IfaceFamTyConFlav(..), IfaceClassBody(..), IfaceAT(..), IfaceIdDetails(..))
 import GHC.Types.Basic (SourceTableOrigin(ExecutableSourceTable, FinalCoreSourceTable))
 import GHC.Iface.Type (IfaceType(..), IfaceBndr(..), IfaceAppArgs(..), IfaceTyCon(..), IfaceTyConBinder,
                        getIfaceType, putIfaceType, ifaceTypeSharedByte,
                        IfaceEvidence(..), IfaceEvidenceVersion)
 import GHC.Core.TyCon (isInferredTyConBinder, isVisibleTyConBinder)
-import GHC.Types.Var (VarBndr(..), isVisibleFunArg)
+import GHC.Types.Var (VarBndr(..), isInvisibleFunArg, isVisibleFunArg)
 
 import GHC.Data.FastMutInt
 import GHC.Data.Maybe( orElse )
@@ -378,7 +379,8 @@ evidenceSuffix requirements
     || needs NamedRetainedCallbackEvidence || needs ScopedSumDomainEvidence
     || needs ComposedScopedSumDomainEvidence || needs RetainedSiblingFieldsEvidence
     || needs RetainedNamedRecordEvidence || needs RetainedRecordParametersEvidence
-    || needs CheckedClosureSourceTableEvidence || needs OpaqueOrdinaryConstructorCaseEvidence = feature_set
+    || needs CheckedClosureSourceTableEvidence || needs OpaqueOrdinaryConstructorCaseEvidence
+    || needs RetainedDepFunUnfoldingEvidence = feature_set
   | needs RetainedDefaultEvidence
   , needs ErasedExistentialEvidence || needs ScopedSigmaEvidence || needs ImplicitExistentialEvidence
   = feature_set
@@ -455,6 +457,7 @@ legacyEvidenceSuffix RetainedNamedRecordEvidence = featureSetPrefix ++ "retained
 legacyEvidenceSuffix RetainedRecordParametersEvidence = featureSetPrefix ++ "retained-record-parameters-v1"
 legacyEvidenceSuffix CheckedClosureSourceTableEvidence = featureSetPrefix ++ "checked-closure-source-table"
 legacyEvidenceSuffix OpaqueOrdinaryConstructorCaseEvidence = featureSetPrefix ++ "opaque-ordinary-constructor-case"
+legacyEvidenceSuffix RetainedDepFunUnfoldingEvidence = featureSetPrefix ++ "retained-depfun-unfolding"
 legacyEvidenceSuffix NamedRetainedCallbackEvidence = featureSetPrefix ++ "named-retained-callback-v1"
 legacyEvidenceSuffix DepFunCoEvidence           = "-retained-depfunco-v1"
 legacyEvidenceSuffix ConstructorCaseEvidence   = "-retained-constructor-case-v1"
@@ -539,7 +542,8 @@ independentFeatures = [ ("default", RetainedDefaultEvidence)
                       , ("retained-named-record-v1", RetainedNamedRecordEvidence)
                       , ("retained-record-parameters-v1", RetainedRecordParametersEvidence)
                       , ("checked-closure-source-table", CheckedClosureSourceTableEvidence)
-                      , ("opaque-ordinary-constructor-case", OpaqueOrdinaryConstructorCaseEvidence) ]
+                      , ("opaque-ordinary-constructor-case", OpaqueOrdinaryConstructorCaseEvidence)
+                      , ("retained-depfun-unfolding", RetainedDepFunUnfoldingEvidence) ]
 
 -- | Accept the old suffixes and the canonical spelling of a new feature set.
 parseEvidenceSuffix :: String -> Maybe IfaceEvidenceVersion
@@ -676,6 +680,12 @@ constrainedFamilyIfaceVersion = show hiVersion ++ "-constrained-families-v1"
 
 hasConstrainedFamily :: IfaceDecl -> Bool
 hasConstrainedFamily IfaceFamily{ifFamFlav = IfaceConstrainedTypeFamilyTyCon} = True
+hasConstrainedFamily IfaceFamily{ifKind = kind} = iface_kind_has_constraint kind
+  where
+    iface_kind_has_constraint (IfaceForAllTy _ _ rest) = iface_kind_has_constraint rest
+    iface_kind_has_constraint (IfaceFunTy af _ _ _ rest)
+      = isInvisibleFunArg af || iface_kind_has_constraint rest
+    iface_kind_has_constraint _ = False
 hasConstrainedFamily IfaceClass{ifBody = IfConcreteClass{ifATs = ats}} =
   any (\(IfaceAT decl _) -> hasConstrainedFamily decl) ats
 hasConstrainedFamily _ = False
@@ -769,7 +779,8 @@ putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface =
               then Set.singleton HomeRuleInterfaceEvidence
               else Set.empty
           scoped_sum_version = usage_version `Set.union` Set.fromList
-            [requirement | (field, requirement) <- scopedSumDomainFields
+            [requirement | (field, requirement) <- (depFunUnfoldingField, RetainedDepFunUnfoldingEvidence)
+                                                   : scopedSumDomainFields
                          , Map.member field (getExtensibleFields fields)]
       found <- newIORef scoped_sum_version
       let notify _ required = modifyIORef' found (Set.insert required)
