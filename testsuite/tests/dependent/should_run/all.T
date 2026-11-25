@@ -265,6 +265,16 @@ test('NativeOpenTheseFmap',
                   [open_eval_dir + f for f in ['These.hs', 'TheseMapping.hs', 'OrdinaryTheseMapping.hs',
                                                'Row.hs', 'RowProof.hs']])],
      run_command, ['bash NativeOpenTheseFmap.sh "{compiler}" "{libdir}"'])
+test('NativePolyNestedDomainOpenEq',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativePolyNestedDomainOpenEqProvider.hs',
+                   'NativePolyNestedDomainOpenEq.hs'])],
+     run_command, ['bash NativePolyNestedDomainOpenEq.sh "{compiler}" "{libdir}"'])
+test('NativeMultiParamMethodOpenEq',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeMultiParamMethodOpenEqProvider.hs',
+                   'NativeMultiParamMethodOpenEq.hs'])],
+     run_command, ['bash NativeMultiParamMethodOpenEq.sh "{compiler}" "{libdir}"'])
 test('NativeOpenInstalledPair',
      [req_interp, req_rts_linker, only_ways(['normal']),
       extra_files([open_eval_dir + 'PreludePairExport.hs',
