@@ -3527,7 +3527,13 @@ tcSourceValueBinds :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
 tcSourceValueBinds group = do
     enabled <- xoptM LangExt.ExperimentalDependentTypes
     env <- getGblEnv
-    case if enabled then splitLocalSourceTables TableInTerm (tcg_dus env) group else Nothing of
+    let cur_mod = tcg_mod env
+        simple_funs = if enabled then collect_simple_funs (hs_valds group) else emptyNameEnv
+    prev_simple <- setLocalSimpleFunBinds cur_mod simple_funs
+    let restore_simple res = do
+          _ <- setLocalSimpleFunBinds cur_mod (fromMaybe emptyNameEnv prev_simple)
+          pure res
+    res <- case if enabled then splitLocalSourceTables TableInTerm (tcg_dus env) group else Nothing of
       Nothing -> check_group group
       Just (_, first, rest) -> do
         (envs@(first_env, _), wanteds) <- captureTopConstraints (check_group first)
@@ -3538,10 +3544,30 @@ tcSourceValueBinds group = do
           addTopEvBinds evs $ do
             env' <- installSourceTables tables
             setGblEnv env' (check_group rest)
+    restore_simple res
   where
     check_group :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
     check_group HsGroup{hs_valds = XValBindsLR (HsVBG binds sigs)} = tcTopBinds binds sigs
     check_group _ = panic "tcSourceValueBinds: expected renamed value bindings"
+
+    collect_simple_funs :: HsValBinds GhcRn -> NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)
+    collect_simple_funs (XValBindsLR (HsVBG binds _)) = mkNameEnv
+      [ (fn, (mb_pat, rhs))
+      | (NonRecursive, [L _ FunBind { fun_id = L _ fn, fun_ext = fvs
+                                    , fun_matches = MG { mg_alts = L _ [L _ Match
+                                        { m_pats = L _ [pat]
+                                        , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] rhs) :| []
+                                                          , grhssLocalBinds = L _ EmptyLocalBinds{} } }] } }])
+          <- binds
+      , isExternalName fn
+      , not (fn `elemNameSet` fvs)
+      , Just mb_pat <- [simple_pat (unLoc pat)] ]
+    collect_simple_funs _ = emptyNameEnv
+
+    simple_pat (ParPat _ inner) = simple_pat (unLoc inner)
+    simple_pat (VarPat _ lname) = Just (Just lname)
+    simple_pat WildPat{}        = Just Nothing
+    simple_pat _                = Nothing
 
 tcTopSrcDeclGroup :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
 tcTopSrcDeclGroup group = do
@@ -3648,11 +3674,21 @@ tcTopSrcDeclGroupWithMethods _ _ _ = panic "tcTopSrcDeclGroup: ValBindsIn"
 installForgetMTyCons :: TcGblEnv -> TcM TcGblEnv
 installForgetMTyCons env = do
   forget_tcs <- drainForgetMTyCons (tcg_mod env)
-  let new_tcs = [tc | tc <- forget_tcs
-                    , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))]
-  if null new_tcs
-    then pure env
-    else setGblEnv env (fst <$> addTyConsToGblEnv new_tcs)
+  synth_funs <- drainSynthesizedSourceFuns (tcg_mod env)
+  let synth_ids   = [fid | (fid, _, _) <- synth_funs]
+      synth_binds = [fb  | (_, fb, _)  <- synth_funs]
+      synth_tcs   = [ftc | (_, _, ftc) <- synth_funs]
+      all_cands   = forget_tcs ++ synth_tcs
+      new_tcs     = [tc | tc <- all_cands
+                        , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))]
+  env1 <- if null new_tcs
+          then pure env
+          else setGblEnv env (fst <$> addTyConsToGblEnv new_tcs)
+  if null synth_funs
+    then pure env1
+    else setGblEnv env1 $ do
+      env2 <- tcExtendGlobalValEnv synth_ids getGblEnv
+      pure (env2 `addTypecheckedBinds` [synth_binds])
 
 ---------------------------
 tcTyClsInstDecls :: Maybe [DerivInfo]  -- Nothing defers attached deriving
@@ -4119,6 +4155,7 @@ tcRnStmt hsc_env rdr_stmt
     -- The real work is done here
     ((bound_ids, tc_expr), fix_env) <- tcUserStmt rdr_stmt ;
     _ <- drainForgetMTyCons =<< getModule ;
+    _ <- drainSynthesizedSourceFuns =<< getModule ;
     zonked_expr <- zonkTopLExpr tc_expr ;
     zonked_ids  <- zonkTopBndrs bound_ids ;
     env <- getGblEnv ;

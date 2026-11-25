@@ -2187,7 +2187,7 @@ rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes
 
         table_fvs = mkNameEnv [ (b, fvs) | (_, bs) <- rn_binds
                             , L _ FunBind{fun_id = L _ b, fun_ext = fvs} <- bs ] ;
-        table_dus = mkDUs [ (unitFN table, extendNameSet (lookupNameEnv_NF table_fvs term) term)
+        table_dus = mkDUs [ (unitFN table, extendNameSet (fromMaybe emptyNameSet (lookupNameEnv table_fvs term)) term)
                           | (term, table) <- tables ] ;
         src_dus = unitOL other_def `plusDU` table_dus `plusDU` bind_dus `plusDU` usesOnly other_fvs ;
                 -- Instance decls may have occurrences of things bound in bind_dus
@@ -2691,23 +2691,49 @@ producer checks the callee's identity and the decrease of each self call.
 localSourceTableBinders :: [TyClGroup GhcPs] -> [LHsBindLR GhcRn GhcPs] -> [LSig GhcPs] -> RnM [(Name, Name)]
 localSourceTableBinders tycl_decls binds sigs = do
   strict <- xoptM LangExt.Strict
+  rdr_env <- getGlobalRdrEnv
+  let fun_names =
+        [ n | L _ FunBind{fun_id = L _ n, fun_matches = MG{mg_alts = L _ rows}} <- binds
+            , isExternalName n, nameOccName n `elemOccSet` signed
+            , all (constructor_row n False) rows ||
+              (any matches_second rows && all (constructor_row n True) rows) ||
+              all (right_constructor_row n) rows ||
+              right_structural_rows n rows ||
+              all (mapping_row n) rows ||
+              all pair_swap_row rows ||
+              (not strict && (all (poly_nested_row n) rows ||
+                              all (poly_right_nested_row n) rows ||
+                              producer_rows n rows)) ||
+              closure_wrapper_rows n rows ||
+              weakening_rows n rows ||
+              subst_map_rows n rows ||
+              sigma_combinator_rows n rows ]
+      rec_witness_names =
+        [ greName gre
+        | tg <- tycl_decls
+        , L _ DataDecl{tcdLName = L _ tc_rdr,
+                       tcdDataDefn = HsDataDefn{dd_cons = DataTypeCons False [L _ ConDeclH98
+                         { con_telescope = [], con_modifiers = []
+                         , con_args = RecCon _ (L _ (L _ (HsConDeclRecField _ [L _ (FieldOcc _ first_rdr)] first_spec) : rest@(_ : _))) }]}}
+            <- group_tyclds tg
+        , plain_rec_spec first_spec
+        , all (plain_rec_spec . cdrf_spec . unLoc) rest
+        , let witness_tv = mkRdrUnqual (setOccNameSpace tvName (rdrNameOcc (unLoc first_rdr)))
+        , all (rec_uses_witness witness_tv) rest
+        , tc_gre : _ <- [lookupGRE rdr_env (LookupRdrName tc_rdr (RelevantGREsFOS WantNormal))]
+        , gre <- lookupGRE rdr_env (LookupRdrName (unLoc first_rdr) (RelevantGREsFOS WantBoth))
+        , greParent gre == ParentIs (greName tc_gre)
+        , isExternalName (greName gre) ]
   mapM (\n -> (n,) <$> lookupOrig (nameModule n) (mkSourceTableOcc (nameOccName n)))
-    [ n | L _ FunBind{fun_id = L _ n, fun_matches = MG{mg_alts = L _ rows}} <- binds
-        , isExternalName n, nameOccName n `elemOccSet` signed
-        , all (constructor_row n False) rows ||
-          (any matches_second rows && all (constructor_row n True) rows) ||
-          all (right_constructor_row n) rows ||
-          right_structural_rows n rows ||
-          all (mapping_row n) rows ||
-          all pair_swap_row rows ||
-          (not strict && (all (poly_nested_row n) rows ||
-                          all (poly_right_nested_row n) rows ||
-                          producer_rows n rows)) ||
-          closure_wrapper_rows n rows ||
-          weakening_rows n rows ||
-          subst_map_rows n rows ||
-          sigma_combinator_rows n rows ]
+       (fun_names ++ rec_witness_names)
   where
+    plain_rec_spec CDF{cdf_bang = NoSrcStrict, cdf_unpack = NoSrcUnpack,
+                       cdf_multiplicity = HsModifiedFunArr _ [] (HsStandardArr _)} = True
+    plain_rec_spec _ = False
+
+    rec_uses_witness witness_tv (L _ (HsConDeclRecField _ [_] fld)) =
+      any ((== witness_tv) . unLoc) (extractHsTyRdrTyVars (cdf_type fld))
+    rec_uses_witness _ _ = False
     -- See Note [Reservation for pair swap equations].
     pair_swap_row (L _ Match{m_pats = L _ [pat], m_grhss = rhss})
       | TuplePat _ [first, second] Boxed <- unparen pat
@@ -3112,7 +3138,7 @@ localSourceTableBinders tycl_decls binds sigs = do
       | nameOccName self `elemOccSet` producer_signed
       , Just vars <- traverse (callback_binder . unparen) pats
       , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
-      = is_con_headed_expr rhs && poly_rhs self False [] [] vars rhs
+      = isNothing (variable rhs) && poly_rhs self False [] [] vars rhs
     producer_rows _ _ = False
 
     nested_con_fields :: Pat GhcPs -> Maybe [LPat GhcPs]
@@ -3125,18 +3151,6 @@ localSourceTableBinders tycl_decls binds sigs = do
       | plain_field p = True
       | Just subpats <- nested_con_fields (unparen p) = all nested_pat subpats
       | otherwise = False
-
-    is_con_headed_expr :: LHsExpr GhcPs -> Bool
-    is_con_headed_expr expr = case unLoc (stripParensLHsExpr expr) of
-      ExplicitTuple _ tup_args Boxed -> length tup_args /= 1 && all tup_present tup_args
-      ExplicitList{} -> True
-      _ | (hd, _) <- collect_val_apps expr
-        , Just r <- variable_allow_type_app hd
-        -> isRdrDataCon r
-        | otherwise -> False
-      where
-        tup_present Present{} = True
-        tup_present _ = False
 
     poly_rhs :: Name -> Bool -> [Maybe RdrName] -> [RdrName] -> [Maybe RdrName] -> LHsExpr GhcPs -> Bool
     poly_rhs self allow_self leading fields trailing = check []

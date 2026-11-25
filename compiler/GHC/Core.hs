@@ -3011,7 +3011,9 @@ nativeSourceFunctionArgIndex arg
   where
     apply subst (indices, ty) (binder, value) = do
       (FTF_T_T, _, mult, domain, result) <- splitFunTy_maybe ty
-      index <- retainedArgIndex value
+      index <- case nativeIndexFunctionTypeTys_maybe domain of
+        Just _  -> nativeIndexFunctionArgIndex value
+        Nothing -> retainedArgIndex value
       guard (isManyTy mult && typeKind index `eqType` domain
              && domain `eqType` TyCoSubst.substTy subst (tyVarKind binder))
       pure (index : indices, result)

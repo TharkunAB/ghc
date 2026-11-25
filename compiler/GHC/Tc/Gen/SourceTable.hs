@@ -414,10 +414,16 @@ sourceTableFamilyUseAt table first
           when (isNothing checked) $ do
             -- See Note [Legacy private source leaves].
             absent <- importedSourceOwnerAbsent table
+            env <- getGblEnv
+            let local_synth = nameModule_maybe (tyConName table) == Just (tcg_semantic_mod env)
             case sourceTableCallees table of
-              Just [] | absent, not (isSourceFilterGuard table) -> do
-                env <- getGblEnv
+              Just [] | absent, not (isSourceFilterGuard table) ->
                 updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
+              Just callees
+                | absent || local_synth
+                , Just _ <- stripPrefix "T:$depfun$" (occNameString (nameOccName (tyConName table))) -> do
+                    mapM_ (\c -> sourceTableFamilyUseAt c Nothing) callees
+                    updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
               _ -> failWithTc (TcRnRetainedQuantificationError
                                (RetainedUncheckedSourceCall (maybe (tyConName table) idName owner)))
 
@@ -6266,7 +6272,7 @@ checkedConstructorRows mode bind_aliases tail_self public witness_root helper re
           (replaced, patterns') = unzip (map replace patterns)
       guard (or replaced)
       let known'
-            | structural_right = (scrutinee, (dc, fields)) : known
+            | bind_aliases = (scrutinee, (dc, args, fields)) : known
             | otherwise = known
           checked = checkBody patterns' aliases known' Nothing body
       rows <- if partial_root
@@ -6294,7 +6300,7 @@ checkedConstructorRows mode bind_aliases tail_self public witness_root helper re
       Core.Case (Core.Var next) binder ty alternatives
         | structural_right, isNothing first_case
         , let selected = resolveCaseAlias aliases next
-        , Just (dc, fields) <- lookup selected known
+        , Just (dc, _, fields) <- lookup selected known
         , varType binder `eqType` varType next, ty `eqType` result
         , Just (Core.Alt _ actual rhs) <- find (matches_con dc) alternatives
         , all isId actual, eqTypes (map varType actual) (map varType fields) ->
@@ -6333,6 +6339,11 @@ checkedConstructorRows mode bind_aliases tail_self public witness_root helper re
         select v = let selected = resolveCaseAlias aliases v
                    in selected <$ guard (scoped selected)
         check_self = recursive patterns aliases
+        reconstruct_known u
+          | scoped u = Just (CaseField u)
+          | Just (dc, c_args, fs) <- lookup u known =
+              CaseConstructor dc c_args <$> traverse reconstruct_known fs
+          | otherwise = Nothing
         check_result (Core.Var v)
           | mode == BooleanConstructorCase
           , resolveCaseAlias aliases v == root
@@ -6340,10 +6351,11 @@ checkedConstructorRows mode bind_aliases tail_self public witness_root helper re
           , pattern@CaseConstructor{} : _ <- patterns
           = Just pattern
         check_result (Core.Var v)
-          | structural_right
-          , Just (dc, []) <- lookup (resolveCaseAlias aliases v) known
+          | bind_aliases
+          , Just (dc, c_args, fs) <- lookup (resolveCaseAlias aliases v) known
           , varType v `eqType` result
-          = Just (CaseConstructor dc [] [])
+          , Just children <- traverse reconstruct_known fs
+          = Just (CaseConstructor dc c_args children)
         check_result rhs = (guard tail_self *> check_self rhs) <|>
           checkCaseResult public public_kind helper select check_self result rhs
 
@@ -7311,7 +7323,10 @@ checkedDomains :: Bool -> LeftOrRight -> [TyVar] -> Type -> [SourceRow]
                -> Maybe (SourceInput, [Type], Type)
 checkedDomains strict order body_tvs ty rows
   | [SourceProducerRow _ vars rhs] <- rows = do
-      guard (not strict && order == CLeft && isConstructorHeadedRhs rhs)
+      let producer_rhs Construct{} = True
+          producer_rhs Call{}      = True
+          producer_rhs _           = False
+      guard (not strict && order == CLeft && producer_rhs rhs)
       let (telescope, tau) = splitForAllForAllTyBinders ty
       guard (equalLength telescope body_tvs)
       tvs <- traverse ordinary_binder telescope

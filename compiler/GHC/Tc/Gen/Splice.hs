@@ -2746,6 +2746,8 @@ checkClosedTypeEvalStage hsc_env name = do
       boot <- tcIsHsBootOrSig
       when boot $
         reject "The defining interface is a boot file or a module signature and provides no executable definition."
+      when (hasActiveCorePlugins hsc_env || hasActiveLatePlugins hsc_env) $
+        failWithTc (TcRnNoSourceTable name)
     else do
       iface <- loadInterfaceForName (text "closed call in a type") name
       when (isHsBootOrSig (mi_hsc_src iface)) $
@@ -2769,7 +2771,8 @@ tcHasClosedCallExecutable name = do
     (Just mod, Just interp, Comp)
       | not boot, not explicit, not (safeLanguageOn dflags) ->
           if mod == tcg_semantic_mod gbl_env
-            then pure (name `elemNameEnv` tcg_local_open_defs gbl_env)
+            then pure (not (hasActiveCorePlugins env || hasActiveLatePlugins env)
+                       && name `elemNameEnv` tcg_local_open_defs gbl_env)
             else do
               loc <- getSrcSpanM
               liftIO $ executableDependenciesAvailable interp env loc mod

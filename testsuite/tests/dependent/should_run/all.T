@@ -1098,3 +1098,7 @@ test('NativeAbsurdForEachCoverage',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeAbsurdForEachCoverage.hs'])],
      run_command, ['bash NativeAbsurdForEachCoverage.sh "{compiler}" "{libdir}"'])
+test('NativeDependentCompose',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeDependentCompose.hs'])],
+     run_command, ['bash NativeDependentCompose.sh "{compiler}" "{libdir}"'])
