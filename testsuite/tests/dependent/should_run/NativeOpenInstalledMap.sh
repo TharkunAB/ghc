@@ -69,7 +69,7 @@ fi
 
 # An ordinary client uses the installed map and size equations with a recursive proof.
 ordinary_size_source() {
-    sed '1s/ExperimentalDependentTypes/NoExperimentalDependentTypes/' "$src/PreludeMapLengthSize.hs"
+    sed '1s/DependentTypes/DataKinds, NoDependentTypes, TypeOperators/' "$src/PreludeMapLengthSize.hs"
 }
 mkdir "$out"/{length-source,length-client}
 cd "$out/length-source"

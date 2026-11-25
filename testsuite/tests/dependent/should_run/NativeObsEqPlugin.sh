@@ -43,6 +43,15 @@ done
 pkg_flags=(-clear-package-db -package-db "$pkg_db")
 base_ghc=("$ghc_bin" "-B$libdir" -v0 -package-env - "${pkg_flags[@]}" -fdiagnostics-color=never)
 
+run_ghc_link() {
+  local err_log="$out/ghc-link.err"
+  if ! "$@" 2>"$err_log"; then
+    cat "$err_log" >&2
+    return 1
+  fi
+  grep -Ev '^(/usr/bin/)?ld(\.[^:]*)?: warning: type and size of dynamic symbol .* are not defined$' "$err_log" >&2 || true
+}
+
 # 1. Build and register dependent-obs-eq into the temporary package DB.
 plug_lib="$out/obs-eq-lib"
 mkdir -p "$plug_lib"
@@ -66,7 +75,7 @@ ar rcs "$plug_lib/libHS${unit_id}.a" \
   "$plug_lib/Dependent/ObsEq.o" \
   "$plug_lib/Dependent/Plugin/ObsEq.o"
 
-"${base_ghc[@]}" -shared -dynamic -no-hs-main \
+run_ghc_link "${base_ghc[@]}" -shared -dynamic -no-hs-main \
   -package base -package containers -package ghc -package time \
   "-optl-Wl,-soname,$so_name" \
   "$plug_lib/Dependent/ObsEq.dyn_o" \

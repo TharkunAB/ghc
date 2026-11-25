@@ -142,7 +142,7 @@ reject() {
     fi
 }
 reject FREE 76037 'Not in scope: type variable'
-reject FREE_LAMBDA 27185 'A type lambda needs a supported position'
+reject FREE_LAMBDA 76037 'Not in scope: type variable'
 reject ANONYMOUS 27185 'A type lambda needs a supported position'
 reject NAMED 27185 'A type lambda needs a supported position'
 reject KIND '83865|25897' 'type lambda in a visible type argument'

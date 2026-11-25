@@ -394,6 +394,7 @@ useImportedEqSize n = eqSizeRefl n
 HS
 
 if "${base_ghc[@]}" --make -fno-code -fwrite-interface \
+     -frefinement-level-hole-fits=1 \
      -package ghc-experimental -package ghc-internal -XGHC2024 \
      -package test-general-plugins \
      -fplugin=TestTcPlugin \
@@ -408,7 +409,7 @@ if "${base_ghc[@]}" --make -fno-code -fwrite-interface \
 fi
 grep -Fq 'pluginSynthesizedFit' "$out/holes/holes.log"
 grep -Fq 'Refl ::' "$out/holes/holes.log"
-grep -Fq 'plusZero m ::' "$out/holes/holes.log"
+grep -Fq 'plusZero (_ :: Nat)' "$out/holes/holes.log"
 
 # 6. Negative controls!
 #    6a. TestCoreMutatePlugin mutates Core RHSs incompatibly -> Passes.hs catches

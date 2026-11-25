@@ -77,6 +77,7 @@ import Data.List (unzip4)
 import Data.List.NonEmpty ( NonEmpty(..), head, init, last, nonEmpty, scanl, tail )
 import Data.Ord
 import Data.Array
+import Data.Data (Data, cast, gmapQ)
 import GHC.Driver.Env (HscEnv)
 import Data.Foldable (toList)
 
@@ -3109,8 +3110,9 @@ rnHsUpdProjs us = do
                        , hfbPun = pun }), fv ) }
 
 -- | Rename a visible or @type@-embedded type argument, falling back to
--- 'HsTypeLambdaQuoteRn' for inline type lambdas @\@(\y -> body)@ that mention
--- source equations or runtime indices when lifting to a top-level family fails.
+-- 'HsTypeLambdaQuoteRn' for complete inline type lambdas @\@(\y -> body)@ that
+-- mention source equations or runtime indices when lifting to a top-level
+-- family fails. Wildcard-bearing type lambdas keep the lifted-position check.
 rnHsTypeAppOrQuote :: LHsWcType GhcPs
                    -> RnM (LHsWcType GhcRn, Maybe HsAppTypeSource, FreeNames)
 rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
@@ -3124,17 +3126,42 @@ rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
               addMessages msgs
               return res
             _ -> do
-              checkDupRdrNames binders
-              binders' <- traverse (\b -> L (getLoc b) <$> newLocalBndrRn b) binders
-              (HsWC _ body', fvs) <-
-                bindLocalNamesFV (map unLoc binders') $ do
-                  (wc, _, fv) <- rnHsTypeApp (HsWC noExtField body)
-                  return (wc, fv)
-              let quoted = L lam_loc (XHsType (HsTypeLambdaQuoteRn binders' body'))
-              return (HsWC [] quoted, Nothing, fvs)
+              (mb_lam, lam_msgs) <- tryTc $ do
+                checkDupRdrNames binders
+                binders' <- traverse (\b -> L (getLoc b) <$> newLocalBndrRn b) binders
+                (HsWC wcs body', fvs) <-
+                  bindLocalNamesFV (map unLoc binders') $ do
+                    (wc, _, fv) <- rnHsTypeApp (HsWC noExtField body)
+                    return (wc, fv)
+                pure (wcs, binders', body', fvs)
+              case mb_lam of
+                Just (wcs, binders', body', fvs)
+                  | not (null wcs) || has_anon_wildcard body' -> do
+                      addMessages msgs
+                      failM
+                  | otherwise -> do
+                      addMessages lam_msgs
+                      let quoted = L lam_loc (XHsType (HsTypeLambdaQuoteRn binders' body'))
+                      return (HsWC [] quoted, Nothing, fvs)
+                Nothing -> do
+                  addMessages lam_msgs
+                  failM
     _ -> rnHsTypeApp arg
   where
     peel_type_lambda :: LHsType GhcPs -> Maybe (SrcSpanAnnA, [LocatedN RdrName], LHsType GhcPs)
     peel_type_lambda (L _ (HsParTy _ inner)) = peel_type_lambda inner
     peel_type_lambda (L l (XHsType (HsTypeLambda _ bndrs rhs))) = Just (l, bndrs, rhs)
     peel_type_lambda _ = Nothing
+
+    has_anon_wildcard :: Data a => a -> Bool
+    has_anon_wildcard node
+      | Just (L _ HsWildCardTy{}) <- (cast node :: Maybe (LHsType GhcRn))
+      = True
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ ty) _))
+          <- (cast node :: Maybe (LHsType GhcRn))
+      = has_anon_wildcard ty
+      | Just (L _ HsSpliceTy{}) <- (cast node :: Maybe (LHsType GhcRn))
+      = False
+      | Just _ <- (cast node :: Maybe Name)
+      = False
+      | otherwise = or (gmapQ has_anon_wildcard node)

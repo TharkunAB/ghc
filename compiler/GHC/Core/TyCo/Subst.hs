@@ -758,9 +758,10 @@ Therefore, when 'isEmptyTCvSubst' holds, 'subst_ty' and 'subst_co' can change a
 type or coercion only if that syntax tree, a binder annotation inside it, or a
 coercion hole inside it contains a local runtime 'Id'. Checking that condition
 directly avoids allocating 'FV' closures, 'VarSet's, and deep kind traversals on
-free 'TyVar' and 'CoVar' occurrences. Using 'isEmptyTypeSubst' in
-'substTyVarBndrUsing' and 'substCoVarBndrUsing' also keeps 'TvSubstEnv' and
-'CvSubstEnv' empty across poly-kinded binders when only 'IdSubstEnv' is active.
+free 'TyVar' and 'CoVar' occurrences. 'substTyVarBndrUsing' and
+'substCoVarBndrUsing' retain 'isEmptySubst' (see Note [Keeping the substitution
+empty]) so Simplifier expression substitutions continue to visit coercions under
+kind-polymorphic binders and canonicalize 'SubCo' wrappers identically.
 -}
 
 -- | Test whether a substitution leaves the given types and coercions unchanged.
@@ -1155,7 +1156,7 @@ substTyVarBndrUsing subst_fn subst@(Subst in_scope idenv tenv cenv) old_var
     -- Assertion check that we are not capturing something in the substitution
 
     old_ki = tyVarKind old_var
-    no_kind_change = isEmptyTypeSubst subst [old_ki] [] || noFreeVarsOfType old_ki
+    no_kind_change = isEmptySubst subst || noFreeVarsOfType old_ki
                      -- See Note [Keeping the substitution empty]
                      -- and Note [Fast empty substitution check for runtime indices].
     no_change = no_kind_change && (new_var == old_var)
@@ -1185,7 +1186,7 @@ substCoVarBndrUsing subst_fn subst@(Subst in_scope idenv tenv cenv) old_var
     (Subst (in_scope `extendInScopeSet` new_var) idenv tenv new_cenv, new_var)
   where
     new_co         = mkCoVarCo new_var
-    no_kind_change = isEmptyTypeSubst subst [t1, t2] [] || noFreeVarsOfTypes [t1, t2]
+    no_kind_change = isEmptySubst subst || noFreeVarsOfTypes [t1, t2]
                      -- See Note [Keeping the substitution empty]
                      -- and Note [Fast empty substitution check for runtime indices].
     no_change      = new_var == old_var && no_kind_change
