@@ -45,7 +45,7 @@ import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.FVs (tyCoVarsOfTypeList, tyConsOfTypes)
-import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TyVarTy, TermVarTy, CastTy))
+import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TyVarTy, TermVarTy, DepFunTy, CastTy))
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Utils (dataConRepInstPat, exprType, findAlt, mergeAlts, stripTicksE, stripTicksTopE)
@@ -68,12 +68,15 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Tc.Errors.Types (RetainedQuantificationError(..), TcRnMessage(..))
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Tc.TyCl.Build (newImplicitBinder)
-import GHC.Tc.Types.ErrCtxt (HsCtxt(ExprCtxt))
+import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, tct_id))
+import GHC.Tc.Types.ErrCtxt (FunAppCtxtFunArg(..), HsCtxt(..))
 import GHC.Tc.Types.Evidence (HsWrapper(..), TcEvBinds(..), EvBindsState(..), collectHsWrapBinders, isEmptyEvBindsMap)
+import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTypeEnv)
 import GHC.Tc.Types (TcGblEnv(..), SourceRuleUses(..), tcVisibleOrphanMods)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
 import GHC.Tc.Utils.Env (tcLookupGlobal, tcLookupId, tcLookupIdMaybe, tcGetInstEnvs)
-import GHC.Tc.Utils.Monad (TcM, addErr, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getTcEvBindsMap, getTcEvBindsState,
+import GHC.Tc.Utils.Monad (TcM, addErr, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getLclEnv,
+                           getTcEvBindsMap, getTcEvBindsState,
                            checkNoErrs, getTopEnv, goptM, keepAlive, liftZonkM, newSysName, readTcRef, writeTcRef, newTcRef, setGblEnv,
                            recordHomeRuleDependencies, setSrcSpan, setSrcSpanA, updTcRef, xoptM)
 import GHC.Tc.Utils.TcType (isMetaTyVar, isTyFamFree)
@@ -249,19 +252,27 @@ sourceTableDependencies root = do
         | otherwise -> pure Nothing
       _ -> walk (unitNameSet (tyConName root)) [] [root]
   where
-    walk _ owners [] = pure (Just (reverse owners))
+    walk _ owners [] = pure (Just (nubBy (\a b -> idName a == idName b) (reverse owners)))
     walk seen owners (table : rest)
       | Just referenced <- sourceTableCallees table = do
           let wanted = [tc | tc <- referenced, not (tyConName tc `elemNameSet` seen)]
           found <- traverse sourceTableOwner wanted
           case sequence found of
             Nothing -> pure Nothing
-            Just callees ->
+            Just callees -> do
               let separate called fun =
                     not (maybe False (\source -> isFilterGuardFor source called) (sourceTableId_maybe fun))
                   new_owners = [fun | (called, fun) <- zip wanted callees, separate called fun]
-              in walk (extendNameSetList seen (map tyConName wanted))
-                      (reverse new_owners ++ owners) (wanted ++ rest)
+                  closure_helper_names =
+                    [ h | fun <- new_owners
+                        , CheckedClosureSourceTableId _ _ hs <- [idDetails fun]
+                        , h <- hs ]
+              mb_closure_helpers <- traverse tcLookupIdMaybe closure_helper_names
+              case sequence mb_closure_helpers of
+                Nothing -> pure Nothing
+                Just closure_helpers ->
+                  walk (extendNameSetList seen (map tyConName wanted))
+                       (reverse closure_helpers ++ reverse new_owners ++ owners) (wanted ++ rest)
       | otherwise = pure Nothing
 
 -- | Guard source families in a type, including families beneath synonyms.
@@ -301,7 +312,8 @@ sourceTableFamilyAppUse table args
       -- does not use an equation or publish a RULE restriction.
       env <- getGblEnv
       updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
-  | Just visible <- sourceCaseVisibleArity table <|>
+  | isNothing (indexedSourceTableVisibleArity table)
+  , Just visible <- sourceCaseVisibleArity table <|>
                       (length (dropWhile isInvisibleTyConBinder (tyConBinders table)) <$ sourcePairBuilderField table)
   , lengthIs args (tyConArity table) = do
       kinds <- liftZonkM (zonkTcTypes (take (tyConArity table - visible) args))
@@ -311,7 +323,8 @@ sourceTableFamilyAppUse table args
 -- | Check specialized kinds before running a constructor case operand.
 sourceCaseKindUse :: TyCon -> [Kind] -> TcM ()
 sourceCaseKindUse table kinds
-  | Just visible <- sourceCaseVisibleArity table
+  | isNothing (indexedSourceTableVisibleArity table)
+  , Just visible <- sourceCaseVisibleArity table
   , lengthIs kinds (tyConArity table - visible)
   = sourceTableFamilyUseAt table (groundFirstHead kinds)
   | otherwise = sourceTableFamilyUse table
@@ -1101,9 +1114,15 @@ checkAndInstallSourceProofs env = do
           -- requires the checked worker declaration.
           worker <- tcLookupIdMaybe owner
           let helper_rules = sourceRuleOwners relevant `minusNameSet` unitNameSet owner
-          pure $ case worker of
-            Just v | finalCoreMapperOwner v -> finalCoreRuleConflict visible unloaded helper_rules v
-            _ -> conflict
+          case worker of
+            Just v
+              | finalCoreMapperOwner v
+              , checked == spineStrictAppendSentinel -> do
+                  res <- checkedAppendFusionRules visible unloaded helper_rules v
+                  pure (either Just (const Nothing) res)
+              | finalCoreMapperOwner v ->
+                  pure (finalCoreRuleConflict visible unloaded helper_rules v)
+            _ -> pure conflict
         else
           -- A newly imported rule is in the rule environment. Its head
           -- can be found even when the defining Id is private.
@@ -1653,6 +1672,213 @@ optionalSourceUsePlan heads methods = do
       let owners = nubBy (\a b -> idName a == idName b) (concatMap fst checked)
       pure (owners, [(v, Nothing) | v <- owners] ++ concat checked_methods, map snd checked)
 
+{- Note [Spine-strict accumulator proofs over list append]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+List append `(++)` is not demand-equivalent under `-O2` `build`/`augment` fusion
+to its nominal two-clause recursion. With `producer cons seed = seed \`seq\` cons True seed`,
+`null (map not (build producer ++ error "ys"))` fuses and diverges, whereas
+`let mxs = map not (build producer) in null (mxs ++ map not (error "ys"))`
+evaluates to `False`. Keep `map f (xs ++ ys) :~: (map f xs ++ map f ys)` guarded
+by `GHC-83605` when rewrite rules are enabled.
+
+Let `shunt` be the certified spine-strict list accumulator
+(`shunt [] ys = ys`, `shunt (x : xs) ys = shunt xs (x : ys)`). Consider a
+top-level retained proof of type:
+  `foreach (xs :: [a]) -> foreach (ys :: [a]) -> foreach (zs :: [a])
+   -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)`
+or its symmetric orientation. When `shuntAppend xs ys zs` evaluates to `Refl`,
+the proof has already forced `xs` to a finite spine `[x_1, ..., x_k]`. The
+function `shunt` forces the entire spine of its first argument before it returns
+its second argument, and `xs`, `ys`, and `zs` each occur linearly once on each
+side:
+  1. If `ys` diverges with bottom `b`, `shunt ys (shunt xs zs)` diverges with `b`.
+     Under stock `augment` fusion, `shunt (augment g ys) zs` forces `ys` either
+     inside `g (:)` or at the end of `xs`'s finite spine, and diverges with `b`.
+  2. If `ys` converges to WHNF, `ys` is non-bottom. By parametricity with `seq`
+     for `augment` at the constructor algebra `(:)` (Johann and Voigtlander),
+     `xs ++ ys` produces the spine `x_1 : ... : x_k : ys`. Both sides agree.
+
+Admit `(++)` under `Opt_EnableRewriteRules` only inside such a top-level proof.
+Require every active rewrite rule on `(++)` and on every helper referenced by
+`(++)`'s rules (`augment`, `foldr`, `build`, and the `unpack*CString*#` workers)
+to come from `GHC.Internal.Base`, `GHC.Internal.CString`, or `GHC.Internal.List`,
+with no local or unloaded user rules. Re-check this condition after all module
+declarations and splices finish, and record the dependency in exported `IdInfo`.
+-}
+
+-- | Sentinel distinguishing a spine-strict append proof dependency from an
+-- unrestricted `Semigroup (<>)` method proof (`closedSourceProofArgs` never
+-- emits an all-`SourceProofUnknown` non-empty list, and `sourceProofArgsApart`
+-- returns `False` on `SourceProofUnknown` against every rule).
+spineStrictAppendSentinel :: SourceProofArgs
+spineStrictAppendSentinel = [SourceProofUnknown]
+
+-- | Check that `table` is the exact two-branch tail-recursive list accumulator
+-- `shunt [] ys = ys; shunt (x : xs) ys = shunt xs (x : ys)`.
+isExactShuntTable :: TyCon -> Bool
+isExactShuntTable table = isJust $ do
+    guard (isReverseWorkerTable table)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    [b_nil, b_cons] <- pure (fromBranches (coAxiomBranches axiom))
+    [a1, pat_nil, ys1] <- pure (coAxBranchLHS b_nil)
+    tv_a1 <- getTyVar_maybe a1
+    tv_ys1 <- getTyVar_maybe ys1
+    guard (mkUniqSet (coAxBranchTyVars b_nil) == mkUniqSet [tv_a1, tv_ys1] &&
+           pat_nil `eqType` mkTyConApp (promoteDataCon nilDataCon) [a1] &&
+           coAxBranchRHS b_nil `eqType` ys1)
+    [a2, pat_cons, ys2] <- pure (coAxBranchLHS b_cons)
+    tv_a2 <- getTyVar_maybe a2
+    tv_ys2 <- getTyVar_maybe ys2
+    (cons_tc1, [c_a1, x_ty, xs_ty]) <- splitTyConApp_maybe pat_cons
+    tv_x <- getTyVar_maybe x_ty
+    tv_xs <- getTyVar_maybe xs_ty
+    guard (cons_tc1 == promoteDataCon consDataCon && c_a1 `eqType` a2 &&
+           sizeUniqSet (mkUniqSet [tv_a2, tv_x, tv_xs, tv_ys2]) == 4 &&
+           mkUniqSet (coAxBranchTyVars b_cons) == mkUniqSet [tv_a2, tv_x, tv_xs, tv_ys2])
+    let expected_rhs =
+          mkTyConApp table
+            [ a2
+            , xs_ty
+            , mkTyConApp (promoteDataCon consDataCon) [a2, x_ty, ys2] ]
+    guard (coAxBranchRHS b_cons `eqType` expected_rhs)
+
+-- | Test whether `ty` has the exact spine-strict accumulator append shape
+-- `foreach xs -> foreach ys -> foreach zs -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)`
+-- (up to outer invisible `forall`s, binder permutation of `(xs, ys, zs)`, and `: ~ :` symmetry),
+-- returning the element type and certified `shunt` table TyCon when matched.
+spineStrictAppendProofType :: TyCon -> Type -> Maybe (Type, TyCon)
+spineStrictAppendProofType append_tc ty = do
+    let (_, body0) = splitForAllForAllTyBinders ty
+    (b1, body1) <- dep_vis body0
+    (b2, body2) <- dep_vis body1
+    (b3, eq_ty) <- dep_vis body2
+    guard (sizeUniqSet (mkUniqSet [b1, b2, b3]) == 3)
+    TyConApp eq_tc [eq_kind, side1, side2] <- pure (coreFullView eq_ty)
+    let eq_mod = mkGhcInternalModule (fsLit "GHC.Internal.Data.Type.Equality")
+    guard (nameModule_maybe (tyConName eq_tc) == Just eq_mod &&
+           occNameString (nameOccName (tyConName eq_tc)) == ":~:")
+    (list_tc, [elem_ty]) <- splitTyConApp_maybe eq_kind
+    guard (list_tc == listTyCon &&
+           all (\b -> varType b `eqType` mkListTy elem_ty) [b1, b2, b3])
+    shunt_tc <- match_sides [b1, b2, b3] elem_ty side1 side2 <|>
+                match_sides [b1, b2, b3] elem_ty side2 side1
+    pure (elem_ty, shunt_tc)
+  where
+    dep_vis t = case coreFullView t of
+      DepFunTy DepFunVisible b rest -> Just (b, rest)
+      _ -> Nothing
+
+    match_sides bndrs elem_ty lhs rhs = do
+      TyConApp shunt1 [e1, app_node, TermVarTy zs] <- pure (coreFullView lhs)
+      guard (isExactShuntTable shunt1 && e1 `eqType` elem_ty)
+      TyConApp app_tc [e2, TermVarTy xs, TermVarTy ys] <- pure (coreFullView app_node)
+      guard (tyConName app_tc == tyConName append_tc && e2 `eqType` elem_ty)
+      TyConApp shunt2 [e3, TermVarTy ys', inner_shunt] <- pure (coreFullView rhs)
+      TyConApp shunt3 [e4, TermVarTy xs', TermVarTy zs'] <- pure (coreFullView inner_shunt)
+      guard (shunt1 == shunt2 && shunt1 == shunt3 &&
+             all (`eqType` elem_ty) [e3, e4] &&
+             xs == xs' && ys == ys' && zs == zs' &&
+             mkUniqSet [xs, ys, zs] == mkUniqSet bndrs)
+      pure shunt1
+
+-- | Check if the current typechecking context is the RHS of a top-level binding
+-- whose signature is a spine-strict append proof over `append_owner`.
+enclosingSpineStrictAppendProof :: Id -> TcM (Maybe (Name, Id))
+enclosingSpineStrictAppendProof append_owner = do
+    append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
+    if idName append_owner /= append_name || not (finalCoreMapperOwner append_owner)
+      then pure Nothing
+      else case sourceTableId_maybe append_owner of
+        Nothing -> pure Nothing
+        Just append_tc -> do
+          lcl_env <- getLclEnv
+          env <- getGblEnv
+          let bndrs = getLclEnvBinderStack lcl_env
+              has_exp_bndr = any (\case TcIdBndr_ExpType{} -> True; _ -> False) bndrs
+              not_top_ids = reverse [b | TcIdBndr b tl <- bndrs, not (isTopLevel tl)]
+          case not_top_ids of
+            outer_bndr : inner_bndrs
+              | not has_exp_bndr
+              , Just (elem_ty, shunt_tc) <- spineStrictAppendProofType append_tc (varType outer_bndr)
+              , let allowed_local lb =
+                      varType lb `eqType` elem_ty || varType lb `eqType` mkListTy elem_ty
+              , all allowed_local inner_bndrs -> do
+                  proof_name <- lookupOrig (tcg_semantic_mod env) (nameOccName (idName outer_bndr))
+                  let valid_top_sig = case lookupNameEnv (getLclEnvTypeEnv lcl_env) proof_name of
+                        Just (ATcId { tct_id = top_id }) ->
+                          isExternalName (idName top_id) &&
+                          isJust (spineStrictAppendProofType append_tc (varType top_id))
+                        _ -> False
+                      allowed_expr (HsVar {}) = True
+                      allowed_expr (ExplicitList _ es) = all (allowed_expr . unLoc) es
+                      allowed_expr (HsPar _ e) = allowed_expr (unLoc e)
+                      allowed_expr (HsApp _ f a) = allowed_expr (unLoc f) && allowed_expr (unLoc a)
+                      allowed_expr (OpApp _ l op r) =
+                        allowed_expr (unLoc l) && allowed_expr (unLoc op) && allowed_expr (unLoc r)
+                      allowed_expr (HsCase _ scrut _) = allowed_expr (unLoc scrut)
+                      allowed_expr _ = False
+                      disallowed_ctxt (PatMonoBindsCtxt {}) = True
+                      disallowed_ctxt (UserSigCtxt {}) = True
+                      disallowed_ctxt (TypeCtxt {}) = True
+                      disallowed_ctxt (KindCtxt {}) = True
+                      disallowed_ctxt (FunAppCtxt (FunAppCtxtTy _ _) _) = True
+                      disallowed_ctxt (FunAppCtxt (FunAppCtxtExpr f a) _) =
+                        not (allowed_expr f && allowed_expr a)
+                      disallowed_ctxt (ExprCtxt e) = not (allowed_expr e)
+                      disallowed_ctxt (MatchCtxt (FunRhs { mc_fun = L _ mc_nm })) =
+                        mc_nm /= proof_name && mc_nm /= idName outer_bndr
+                      disallowed_ctxt _ = False
+                  if valid_top_sig && not (any disallowed_ctxt (getLclEnvErrCtxt lcl_env))
+                    then do
+                      mb_shunt <- sourceTableOwner shunt_tc
+                      pure ((proof_name,) <$> mb_shunt)
+                    else pure Nothing
+            _ -> pure Nothing
+
+-- | Verify that `(++)` and every helper in its active rules carry only stock
+-- `ghc-internal` list/CString rules, with no local or unloaded user rules.
+-- See Note [Spine-strict accumulator proofs over list append].
+checkedAppendFusionRules :: RuleEnv -> NameSet -> NameSet -> Id
+                         -> TcM (Either RetainedQuantificationError [Id])
+checkedAppendFusionRules visible unloaded local_rules append_owner = do
+    append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
+    build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
+    mb_build <- tcLookupIdMaybe build_name
+    let boot_mods =
+          [ gHC_INTERNAL_BASE
+          , mkGhcInternalModule (fsLit "GHC.Internal.CString")
+          , mkGhcInternalModule (fsLit "GHC.Internal.List") ]
+        is_boot_rule BuiltinRule{} = True
+        is_boot_rule r@Rule{ru_origin = orig}
+          | isAutoRule r || isNeverActive (ruleActivation r) = True
+          | otherwise = orig `elem` boot_mods
+        fallback = Left (RetainedFinalCoreRulesEnabled (idName append_owner))
+    if idName append_owner /= append_name ||
+       idName append_owner `elemNameSet` local_rules ||
+       idName append_owner `elemNameSet` unloaded
+      then pure fallback
+      else do
+        let app_rules = activeMapperRules visible append_owner
+        if null app_rules || not (all is_boot_rule app_rules)
+          then pure (Left (RetainedSourceRule (idName append_owner)))
+          else do
+            let rule_free_globals Rule{ru_bndrs = bndrs, ru_args = args, ru_rhs = rhs} =
+                  let bset = mkVarSet bndrs
+                      keep v = isId v && not (v `elemVarSet` bset) &&
+                               isExternalName (idName v) &&
+                               isNothing (isDataConId_maybe v)
+                  in concatMap (exprSomeFreeVarsList keep) (rhs : args)
+                rule_free_globals BuiltinRule{} = []
+                helpers = nubBy (\a b -> idName a == idName b) $
+                  maybeToList mb_build ++ concatMap rule_free_globals app_rules
+                bad_helper h =
+                  idName h `elemNameSet` local_rules ||
+                  idName h `elemNameSet` unloaded ||
+                  not (all is_boot_rule (getRules visible (globaliseId h)))
+            pure $ case find bad_helper helpers of
+              Just bad -> Left (RetainedSourceRule (idName bad))
+              Nothing  -> Right helpers
+
 -- | Find a currently visible rewrite that can change one selected operation.
 changedSourceUse :: [(Id, Maybe Name)] -> TcM (Maybe RetainedQuantificationError)
 changedSourceUse ops = do
@@ -1666,9 +1892,18 @@ changedSourceUse ops = do
           | isNominalStructuralSource v, not rewriting = check rest
           | finalCoreMapperOwner v
           = if rewriting
-            then case finalCoreRuleConflict visible unloaded local_rules v of
-                   Just reason -> pure (Just reason)
-                   Nothing -> check rest
+            then do
+              mb_shunt <- enclosingSpineStrictAppendProof v
+              case mb_shunt of
+                Just _ -> do
+                  res <- checkedAppendFusionRules visible unloaded local_rules v
+                  case res of
+                    Left reason -> pure (Just reason)
+                    Right _     -> check rest
+                Nothing ->
+                  case finalCoreRuleConflict visible unloaded local_rules v of
+                    Just reason -> pure (Just reason)
+                    Nothing -> check rest
             else check rest
           | otherwise = do
               local <- sourceRuleOwnersAtTc arg (tcg_rules env)
@@ -1719,7 +1954,20 @@ recordSourceUses ops = do
     changed <- changedSourceUse ops
     case changed of
       Just reason -> failWithTc (TcRnRetainedQuantificationError reason)
-      Nothing -> publishSourceUses ops
+      Nothing -> do
+        env <- getGblEnv
+        filtered <- fmap catMaybes $ forM ops $ \(v, arg) -> do
+          mb_shunt <- enclosingSpineStrictAppendProof v
+          case mb_shunt of
+            Just (proof_owner, shunt_owner) -> do
+              let deps = [ (idName v, Nothing, True, spineStrictAppendSentinel)
+                         , (idName shunt_owner, Nothing, False, []) ]
+              updTcRef (tcg_source_rule_types env) $ \state ->
+                state { sourceProofDefinitions =
+                          extendNameEnv_C (++) (sourceProofDefinitions state) proof_owner deps }
+              pure Nothing
+            Nothing -> pure (Just (v, arg))
+        unless (null filtered) (publishSourceUses filtered)
 
 -- | Use the exact dependencies visited by the open evaluator.
 -- See Note [Identity certificates and open unfoldings].
@@ -1799,6 +2047,33 @@ checkSourceMethodUsesWithPending env = do
             reason -> addErr (TcRnRetainedQuantificationError reason)
           pure conflict
         when (all isNothing conflicts) $ recordCommittedHomeRules env
+    -- Also re-verify late/splice rules on `(++)` and its fusion helpers when a
+    -- spine-strict accumulator append proof was checked in this module.
+    when rewriting $ do
+      defs <- sourceProofDefinitions <$> readTcRef (tcg_source_rule_types env)
+      append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
+      let has_spine_append =
+            any (any (\(n, _, m, c) -> n == append_name && m && c == spineStrictAppendSentinel))
+                (nonDetNameEnvElts defs)
+      when has_spine_append $ do
+        mb_append <- tcLookupIdMaybe append_name
+        forM_ mb_append $ \append_id -> do
+          visible <- visibleSourceMethodRules env
+          unloaded <- unloadedSourceRuleHeads env
+          let all_local = sourceRuleOwners (tcg_rules env)
+          res <- checkedAppendFusionRules visible unloaded all_local append_id
+          case res of
+            Left reason -> do
+              let bad_name = case reason of
+                    RetainedSourceRule n -> n
+                    RetainedFinalCoreRulesEnabled n -> n
+                    _ -> append_name
+                  matching_local = [r | r <- tcg_rules env, bad_name `elemNameSet` sourceRuleOwners [r]]
+              case matching_local of
+                r : _ -> setSrcSpanA (getLoc r) $
+                           addErr (TcRnRetainedQuantificationError (RetainedSourceRule bad_name))
+                [] -> addErr (TcRnRetainedQuantificationError reason)
+            Right _ -> recordCommittedHomeRules env
 
 -- | Retain the home rule environment of an accepted proof.
 -- A private rule can change the full interface hash without changing its ABI.
@@ -3075,7 +3350,7 @@ sourceCaseVisibleArity table
                 , let visible = length domains
                 , Just roots <- traverse (projectionBranch telescope tc visible position) branches
                 , mkUniqSet roots == mkUniqSet (tyConDataCons tc) -> Just visible
-              _ -> Nothing
+              _ -> indexedSourceTableVisibleArity table
   | otherwise = Nothing
   where
     projectionBranch telescope tc visible root branch = do
@@ -3141,6 +3416,31 @@ sourceCaseVisibleArity table
         guard (isRetainedCaseRoot domain (dataConTyCon con))
         guard (Core.nativeIndexArgKinds con parameters fields)
       pure (con, fields)
+
+-- | Return the visible value arity of a promoted scope-indexed source table
+-- (`T:renameU`, `T:shiftFin`, `T:singleSubst`, etc.) so partial applications
+-- in visible type arguments (`cong (U.renameU U.shiftFin)`) elaborate via the
+-- nominal family rather than the closed call evaluator.
+indexedSourceTableVisibleArity :: TyCon -> Maybe Int
+indexedSourceTableVisibleArity table
+  | isJust (sourceTableTermOcc (nameOccName (tyConName table)))
+  , Just axiom <- closedFamilyTyConCoAxiom_maybe table
+  , coAxiomRole axiom == Nominal
+  , not (tcIsLiftedTypeKind (tyConResKind table))
+  , Just (res_tc, _ : _) <- splitTyConApp_maybe (tyConResKind table)
+  , isAlgTyCon res_tc
+  , let binders = tyConBinders table
+        invis_tvs = [tv | b@(Bndr tv _) <- binders, isInvisibleTyConBinder b]
+        visible = length [() | Bndr _ AnonTCB <- binders]
+        is_promoted_index k =
+          not (tcIsLiftedTypeKind k) &&
+          case splitTyConApp_maybe k of
+            Just (kc, _) -> isAlgTyCon kc
+            Nothing -> False
+  , visible >= 1
+  , any (is_promoted_index . tyVarKind) invis_tvs
+  = Just visible
+  | otherwise = Nothing
 
 -- | Identify the lifted parameter telescope and result of a boxed pair case.
 pairCaseType :: Type -> Maybe ([ForAllTyBinder], TyVar, TyVar, Type)
@@ -6277,7 +6577,8 @@ sourceMatches binding = do
     funBind :: HsBind GhcTc -> Maybe (Id, [TyVar], MatchGroup GhcTc (LHsExpr GhcTc))
     funBind (FunBind { fun_ext = (wrap, []), fun_id = L _ f, fun_matches = mg })
       | (tvs, WpHole) <- collectHsWrapBinders wrap
-      , all (\tv -> isTyVar tv && tcIsLiftedTypeKind (tyVarKind tv)) tvs
+      , all (\tv -> isTyVar tv &&
+                    (tcIsLiftedTypeKind (tyVarKind tv) || isJust (ordinaryDataType (tyVarKind tv)))) tvs
       = Just (f, tvs, mg)
     funBind _ = Nothing
 
@@ -6399,12 +6700,34 @@ ordinaryArrows ty
       _ <- ordinaryDataType ty
       pure ([], ty)
 
--- | Collect ordinary data domains ending in lifted Type.
-typeResultArrows :: Type -> Maybe ([Type], Type)
-typeResultArrows ty
+-- | Check a `forall` binder of a Type-valued source equation, allowing
+-- promoted algebraic kinds (such as `Nat`) in addition to `Type`.
+embeddedTypeBinder :: (Type, ForAllTyBinder) -> Maybe TyVar
+embeddedTypeBinder (ma, Bndr tv (Invisible SpecifiedSpec))
+  | ma `eqType` unmatchableDataConTy
+  , isTyVar tv
+  , tcIsLiftedTypeKind (tyVarKind tv) || isJust (ordinaryDataType (tyVarKind tv))
+  = Just tv
+embeddedTypeBinder _ = Nothing
+
+-- | Allow any boxed lifted algebraic or GADT type (whose free type variables
+-- come from the outer `forall` telescope) as an untouched carried argument of a
+-- Type-valued source equation.
+embeddedCarriedType :: [TyVar] -> Type -> Bool
+embeddedCarriedType allowed_tvs arg
+  | tcIsLiftedTypeKind (typeKind arg)
+  , isTyFamFree arg
+  , all (`elem` allowed_tvs) (tyCoVarsOfTypeList arg)
+  , Just (tc, _) <- splitTyConApp_maybe arg
+  = isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc
+  | otherwise = False
+
+-- | Collect carried domains of a Type-valued source equation ending in `Type`.
+embeddedTypeResultArrows :: [TyVar] -> Type -> Maybe ([Type], Type)
+embeddedTypeResultArrows allowed_tvs ty
   | Just (arg, rest) <- caseArrow ty = do
-      _ <- ordinaryDataType arg
-      (args, result) <- typeResultArrows rest
+      guard (embeddedCarriedType allowed_tvs arg)
+      (args, result) <- embeddedTypeResultArrows allowed_tvs rest
       pure (arg : args, result)
   | tcIsLiftedTypeKind ty = pure ([], ty)
   | otherwise = Nothing
@@ -6413,24 +6736,11 @@ typeResultArrows ty
 typeResultHelperType :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
 typeResultHelperType ty = do
     let (telescope, tau) = splitForAllForAllTyBinders ty
-    tvs <- traverse ordinary_binder telescope
-    let allowed = mkTyVarTys tvs
-        collect t
-          | Just (arg, rest) <- caseArrow t = do
-              guard (if null tvs then isJust (ordinaryDataType arg) else caseKind allowed arg)
-              (args, res) <- collect rest
-              pure (arg : args, res)
-          | tcIsLiftedTypeKind t = pure ([], t)
-          | otherwise = Nothing
-    (inputs, output) <- collect tau
-    guard (not (null inputs))
-    pure (map snd telescope, inputs, output)
-  where
-    ordinary_binder (ma, Bndr tv (Invisible SpecifiedSpec))
-      | ma `eqType` unmatchableDataConTy
-      , isTyVar tv, tcIsLiftedTypeKind (tyVarKind tv)
-      = Just tv
-    ordinary_binder _ = Nothing
+    tvs <- traverse embeddedTypeBinder telescope
+    (first_arg, rest) <- caseArrow tau
+    guard (isJust (ordinaryDataType first_arg) || caseKind (mkTyVarTys tvs) first_arg)
+    (carried, output) <- embeddedTypeResultArrows tvs rest
+    pure (map snd telescope, first_arg : carried, output)
 
 {- Note [Source equations returning a structural list]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -6456,8 +6766,10 @@ checkedDomains :: Bool -> LeftOrRight -> [TyVar] -> Type -> [SourceRow]
                -> Maybe (SourceInput, [Type], Type)
 checkedDomains strict order body_tvs ty rows = do
     let (telescope, tau) = splitForAllForAllTyBinders ty
+        embedded_type_rows = not (null rows) && all isEmbeddedTypeRow rows
     guard (equalLength telescope body_tvs)
-    tvs <- traverse ordinary_binder telescope
+    guard (embedded_type_rows || not (any isEmbeddedTypeRow rows))
+    tvs <- traverse (if embedded_type_rows then embeddedTypeBinder else ordinary_binder) telescope
     (FTF_T_T, ma, mult, first_ty, rest_ty) <- splitFunTy_maybe tau
     guard (ma `eqType` unmatchableDataConTy && isManyTy mult)
     let homogeneous_list first carried result =
@@ -6467,18 +6779,17 @@ checkedDomains strict order body_tvs ty rows = do
           (_, first : carried, result) <- constructorHelperType ty
           guard (homogeneous_list first carried result)
           pure (carried, result)
-        embedded_type_rows = not (null rows) && all isEmbeddedTypeRow rows
         instantiate_body = substTyWith tvs (mkTyVarTys body_tvs)
-    guard (embedded_type_rows || not (any isEmbeddedTypeRow rows))
     (arg_ty, carried, final_ty) <- case order of
       CLeft -> do
         (carried, result) <- if embedded_type_rows
-          then typeResultArrows rest_ty
+          then embeddedTypeResultArrows tvs rest_ty
           else ordinaryArrows rest_ty <|> open_list
         pure (first_ty, carried, result)
       CRight -> do
-        guard (null tvs)
-        _ <- ordinaryDataType first_ty
+        if embedded_type_rows
+          then guard (embeddedCarriedType tvs first_ty)
+          else guard (null tvs && isJust (ordinaryDataType first_ty))
         (second_ty, result) <- if embedded_type_rows
           then do
             (FTF_T_T, ma2, mult2, s_ty, res_ty) <- splitFunTy_maybe rest_ty
@@ -6486,14 +6797,22 @@ checkedDomains strict order body_tvs ty rows = do
             pure (s_ty, res_ty)
           else caseArrow rest_ty
         pure (second_ty, [first_ty], result)
+    let lhs_fvs = concatMap tyCoVarsOfTypeList (arg_ty : carried)
     (domain, input) <- case tvs of
       [] -> do
         (tc, params) <- ordinaryDataType arg_ty
         pure (tc, ClosedInput arg_ty params)
+      _ | embedded_type_rows
+        , Just (tc, []) <- ordinaryDataType arg_ty -> do
+            guard (not strict && all (`elem` lhs_fvs) tvs)
+            pure (tc, PolyInput tc body_tvs [])
       _ -> do
         (tc, args) <- caseDatatype arg_ty
         params <- traverse getTyVar_maybe args
-        guard (equalLength params tvs && mkUniqSet params == mkUniqSet tvs)
+        if embedded_type_rows
+          then guard (equalLength params (nubBy (==) params) &&
+                      all (`elem` tvs) params && all (`elem` lhs_fvs) tvs)
+          else guard (equalLength params tvs && mkUniqSet params == mkUniqSet tvs)
         unless (tc == listTyCon) $ do
           guard (not strict && not (isGadtSyntaxTyCon tc) && null (tyConStupidTheta tc))
           let ordinary con = do
@@ -6506,7 +6825,7 @@ checkedDomains strict order body_tvs ty rows = do
     -- See Note [Carried arguments of a source equation].
     if embedded_type_rows then do
       guard (tcIsLiftedTypeKind final_ty)
-      guard (null carried || (null tvs && not strict))
+      guard (null carried || not strict)
     else unless (homogeneous_list arg_ty carried final_ty) $ do
       guard (null carried || (null tvs && not strict))
       (result, result_params) <- ordinaryDataType final_ty
@@ -6651,7 +6970,7 @@ freshInput (ClosedInput domain params) = pure ([], domain, params)
 freshInput (PolyInput root skolems args) = do
     vars <- forM skolems $ \sk -> do
       name <- newSysName (nameOccName (varName sk))
-      pure (mkTyVar name liftedTypeKind)
+      pure (mkTyVar name (tyVarKind sk))
     let params = map (substTyWith skolems (mkTyVarTys vars)) args
     pure (vars, mkTyConApp root params, params)
 
