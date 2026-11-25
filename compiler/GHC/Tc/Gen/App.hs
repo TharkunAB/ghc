@@ -456,6 +456,71 @@ Unify result type /before/ typechecking the args
 The latter is much better. That is why we call `checkResultTy` before `tcValArgs`.
 -}
 
+-- | Test whether an application spine element is a visible type argument.
+isETypeArg :: HsExprArg p -> Bool
+isETypeArg ETypeArg{} = True
+isETypeArg _          = False
+
+-- | Test whether an application spine element is a type, wrapper, or pragma prefix item.
+isNonValExprArg :: HsExprArg p -> Bool
+isNonValExprArg ETypeArg{} = True
+isNonValExprArg EWrap{}    = True
+isNonValExprArg EPrag{}    = True
+isNonValExprArg _          = False
+
+-- | Build a 'BindTvFun' that binds only the supplied outer template variables.
+bindOuterTvs :: [TyVar] -> BindTvFun
+bindOuterTvs [] _ _   = DontBindMe
+bindOuterTvs [v] tv _ = if tv == v then BindMe else DontBindMe
+bindOuterTvs tvs tv _ = if tv `elemVarSet` s then BindMe else DontBindMe
+  where
+    !s = mkVarSet tvs
+
+-- | Match kinds and types under 'bindOuterTvs'.
+matchOuterTyKi :: [TyVar] -> Subst.Subst -> Type -> Type -> Maybe Subst.Subst
+matchOuterTyKi tvs subst formal actual = do
+  let bind = bindOuterTvs tvs
+  s1 <- tcMatchTyX_BM bind subst (typeKind formal) (typeKind actual)
+  tcMatchTyX_BM bind s1 formal actual
+
+-- | Check that a chosen type argument has the substituted kind of its binder.
+substKindAgrees :: Subst.Subst -> TyVar -> Type -> Bool
+substKindAgrees subst tv ty = eqType (Subst.substTy subst (tyVarKind tv)) (typeKind ty)
+
+-- | Test whether 'zonkTcType' can change any node or metadata of a 'TcType'.
+-- See Note [Skipping no-op within-TC zonks] in GHC.Tc.Gen.HsType.
+canZonkChangeAppType :: TcType -> Bool
+canZonkChangeAppType = go
+  where
+    go (TyVarTy tv)           = (isTcTyVar tv && isMetaTyVar tv) || go (tyVarKind tv)
+    go (TermVarTy v)          = go_id v
+    go (TermAppTy f a)        = go_id f || go a
+    go (AppTy f a)            = go f || go a
+    go (TyConApp tc args)     = isMonoTcTyCon tc || any go args
+    go (ForAllTy ma (Bndr b _) r) = go ma || go (varType b) || go r
+    go (FunTy _ ma mult a r)  = go ma || go mult || go a || go r
+    go (LitTy _)              = False
+    go (CastTy _ _)           = True
+    go (CoercionTy _)         = True
+    go (DepFunTy _ b r)       = go_id b || go r
+    go (ExistsTy _ b r)       = go (tyVarKind b) || go r
+    go (DepDictTy b r)        = go_id b || go r
+    go (ClassAppTy s a d x k) = go_id s || go a || go d || go x || go k
+
+    go_id v = go (varType v) || go (idMult v)
+
+-- | Zonk a 'TcType' only when 'canZonkChangeAppType' holds.
+zonkAppTypeIfNeeded :: TcType -> TcM TcType
+zonkAppTypeIfNeeded ty
+  | canZonkChangeAppType ty = liftZonkM (zonkTcType ty)
+  | otherwise               = pure ty
+
+-- | Zonk an 'Id''s type and multiplicity only when 'canZonkChangeAppType' holds.
+zonkAppIdIfNeeded :: TcId -> TcM TcId
+zonkAppIdIfNeeded v
+  | canZonkChangeAppType (varType v) || canZonkChangeAppType (idMult v) = liftZonkM (zonkId v)
+  | otherwise = pure v
+
 --------------------
 tcApp :: HsExpr GhcRn        -- ^ The whole application (For error messages)
       -> HsExpr GhcRn        -- ^ The Function head
@@ -492,7 +557,7 @@ tcOrdinaryApp rn_expr rn_fun rn_args exp_res_ty
              -- See Note [Type arguments before an implicit package head].
              (type_prefix, payload_args)
                | let (prefix, rest) = span prefix_arg rn_args
-               , any type_arg prefix = (prefix, rest)
+               , any isETypeArg prefix = (prefix, rest)
                | otherwise = ([], rn_args)
        ; case implicitSpineHead fun_sigma0 of
            ExistsTy ImplicitExists _ body
@@ -509,10 +574,7 @@ tcOrdinaryApp rn_expr rn_fun rn_args exp_res_ty
            _ -> check_call tc_fun0 fun_sigma0 rn_args exp_res_ty }
   where
     prefix_arg EWrap{} = True
-    prefix_arg arg = type_arg arg
-
-    type_arg ETypeArg{} = True
-    type_arg _ = False
+    prefix_arg arg = isETypeArg arg
 
     ordinary_arg EValArg{} = True
     ordinary_arg EWrap{} = True
@@ -559,7 +621,9 @@ tcOpenMixedBarArguments fun sigma args expected check_app
 tcFindMixedBarArguments
   :: TcSigmaType -> [HsExprArg 'TcpRn] -> TcM (Maybe ([TyVar], TcRhoType, [MixedBarArg]))
 tcFindMixedBarArguments sigma args
-  | (tvs@(_:_), rho) <- tcSplitForAllInvisTyVars sigma
+  | not (null args)
+  , (tvs@(_:_), rho) <- tcSplitForAllInvisTyVars sigma
+  , has_bar_domain rho
   , let binders = map snd tvs
   , all isTyVar binders
   = runMaybeT $ do
@@ -571,6 +635,13 @@ tcFindMixedBarArguments sigma args
       return (binders, rho, spine)
   | otherwise = return Nothing
   where
+    has_bar_domain :: TcRhoType -> Bool
+    has_bar_domain ty = case coreFullView ty of
+      FunTy{ft_af = af, ft_mult = mult, ft_arg = domain, ft_res = res}
+        | isVisibleFunArg af ->
+            (isManyTy mult && isJust (barPackageSignature domain)) || has_bar_domain res
+      _ -> False
+
     mixed_spine :: TcRhoType -> [HsExprArg 'TcpRn] -> MaybeT TcM [MixedBarArg]
     mixed_spine _ [] = return []
     mixed_spine ty (arg@(EWrap EPar{}) : rest) =
@@ -901,7 +972,7 @@ tcOrdinaryAppScoped fields checked_prefix rn_expr rn_head@(rn_fun, fun_lspan) tc
               -- See Note [Quick Look for particular Ids].
               vta_cache <- case do_ql of
                 NoQL | native_app
-                     , any is_type_arg rn_args || hasRequiredTypePrefix fun_sigma
+                     , any isETypeArg rn_args || hasRequiredTypePrefix fun_sigma
                   -> Just <$> newTcRef Nothing
                 _ -> return Nothing
             ; retained_holes_ref <- newTcRef []
@@ -926,9 +997,6 @@ tcOrdinaryAppScoped fields checked_prefix rn_expr rn_head@(rn_fun, fun_lspan) tc
             ; finishAppWithScopedCache retained_holes fields (arg_cache ++ extra_cache) prepare do_ql rn_expr fun_lspan
                 source_fun tc_fun inst_args app_res_rho written_res_ty } }
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
     -- See Note [Type arguments before an implicit package head].
     source_fun
       | HsVar _ name <- rn_fun
@@ -1504,15 +1572,12 @@ tcImplicitOperandProjection sigma written operand
       guard (actual_tc == tc && supportsQuickLookType actual && noQuickLookVars actual)
       guard (not (any (`elemVarSet` tyCoVarsOfType actual) tvs))
       let in_scope = mkInScopeSet (tyCoVarsOfTypes [domain, actual])
-      subst <- tcMatchTyX_BM (bind_outer tvs) (Subst.mkEmptySubst in_scope) domain actual
+      subst <- tcMatchTyX_BM (bindOuterTvs tvs) (Subst.mkEmptySubst in_scope) domain actual
       guard (eqType (Subst.substTy subst domain) actual)
       selected <- Subst.lookupTyVar subst result_var
       case coreFullView selected of
         ExistsTy ImplicitExists _ _ -> Just ()
         _ -> Nothing
-
-    bind_outer tvs tv _ | tv `elem` tvs = BindMe
-                        | otherwise = DontBindMe
 
 -- | Find the declared shape after ordinary invisible instantiation.
 implicitSpineHead :: TcType -> TcType
@@ -1717,7 +1782,7 @@ tcExistsPack :: HsExpr GhcRn -> [HsExprArg 'TcpRn] -> ExpRhoType -> TcM (HsExpr 
 tcExistsPack rn_expr args expected
   = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
        ; unless enabled $ failWithTc (TcRnExistsPack ExistsPackExtension)
-       ; let (type_args, rest) = span is_type_arg (filter_not_parens args)
+       ; let (type_args, rest) = span isETypeArg (filter_not_parens args)
        ; case rest of
            [EValArg { ea_arg = witness }, EValArg { ea_arg = payload }] ->
              do { schema <- check_schema False [ty | ETypeArg { ea_hs_ty = ty } <- type_args]
@@ -1735,9 +1800,6 @@ tcExistsPack rn_expr args expected
                     _ -> failWithTc (TcRnExistsPack (ExistsPackInvalidSchema schema)) }
            _ -> failWithTc (TcRnExistsPack ExistsPackArguments) }
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _          = False
-
     filter_not_parens = filter $ \case
       EWrap (EPar _) -> False
       _ -> True
@@ -1820,10 +1882,9 @@ tcRetainedAppCapability :: TcSigmaType -> ExpRhoType -> [HsExprArg 'TcpRn]
 tcRetainedAppCapability sigma expected args
   = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
        ; if enabled then return True else
-    do { sigma <- liftZonkM (zonkTcType sigma)
-       ; expected <- readExpType_maybe expected
-       ; expected <- mapM (liftZonkM . zonkTcType) expected
-       ; if any (hasNativeDependentExpr . Core.Type) (sigma : maybeToList expected)
+    do { sigma' <- zonkAppTypeIfNeeded sigma
+       ; expected_ty <- readExpType_maybe expected >>= mapM zonkAppTypeIfNeeded
+       ; if any (hasNativeDependentExpr . Core.Type) (sigma' : maybeToList expected_ty)
          then return True else
     do { shapes <- mapM tcRetainedInferableArg [arg | EValArg { ea_arg = arg } <- args]
        ; return (any snd shapes) } } }
@@ -1865,22 +1926,55 @@ tcRetainedGroundApp :: Bool -> QLFlag -> ExpRhoType -> (HsExpr GhcRn, SrcSpan)
                             [HsExprArg 'TcpRn], RetainedInstPlan)
 tcRetainedGroundApp True DoQL exp_ty rn_head fun sigma args
   | known_head fun
-  = do { let (leading, rest) = span prefix_arg args
+  = do { let (leading, rest) = span isNonValExprArg args
        ; (prefix, residual, remaining) <-
-           if any type_arg leading
+           if any isETypeArg leading
            then do { (checked, ty) <- tcInstFunWithPrefix quickLookArg True [] Nothing Nothing Nothing
                                        Nothing DoQL False rn_head fun sigma leading
                    ; return (checked, ty, rest) }
            else return ([], sigma, args)
-       ; expected <- readExpType_maybe exp_ty
-       ; expected <- mapM (liftZonkM . zonkTcType) expected
-       ; residual <- liftZonkM (zonkTcType residual)
+       ; expected <- readExpType_maybe exp_ty >>= mapM zonkAppTypeIfNeeded
+       ; residual <- zonkAppTypeIfNeeded residual
        ; let keep_ql = return (prefix, DoQL, residual, remaining, Nothing)
+             native_eq_continuation =
+               case (prefix, expected, [arg | EValArg { ea_arg = arg } <- remaining]) of
+                 ([], Just rho, [first_arg, _])
+                   | not (any isETypeArg remaining)
+                   , hasNoConcreteTyVars fun
+                   , isTauTy rho
+                   , let (_, theta, tau) = tcRetainedInstTelescope residual
+                         (_, domains, result) = splitFunTys tau
+                   , null theta && isNominalEqualityContinuation domains result -> do
+                       (inferable, anchor) <- tcRetainedInferableArg first_arg
+                       return (inferable && (hasNativeDependentExpr (Core.Type rho) || anchor))
+                 _ -> return False
+             native_req_prefix =
+               case split_req_prefix False residual remaining of
+                 Just (post_sigma, post_args)
+                   | null prefix
+                   , hasNoConcreteTyVars fun
+                   , not (hasRequiredTypePrefix post_sigma)
+                   , not (any isETypeArg post_args)
+                   , let (post_tvs, post_theta, post_tau) = tcRetainedInstTelescope post_sigma
+                         (_, post_domains, post_res) = splitFunTys post_tau
+                   , not (null post_tvs)
+                   , null post_theta
+                   , all (isTauTy . scaledThing) post_domains && isTauTy post_res ->
+                       if maybe False (hasNativeDependentExpr . Core.Type) expected
+                          || hasNativeDependentExpr (Core.Type residual)
+                       then return True
+                       else any snd <$> mapM tcRetainedInferableArg
+                              [arg | EValArg { ea_arg = arg } <- post_args]
+                 _ -> return False
              declared_plan =
                do { plan <- tcRetainedKnownArgPlan declared_arg_type expected fun residual remaining
                   ; case plan of
                       Just _ -> return (prefix, NoQL, residual, remaining, plan)
-                      Nothing -> keep_ql }
+                      Nothing -> do
+                        use_no_ql <- native_eq_continuation `orM` native_req_prefix
+                        if use_no_ql
+                          then return (prefix, NoQL, residual, remaining, Nothing)
+                          else keep_ql }
        ; prefix_metadata <- retainedPrefixTypes prefix
        ; case prefix_metadata of
            Nothing -> keep_ql
@@ -1888,7 +1982,7 @@ tcRetainedGroundApp True DoQL exp_ty rn_head fun sigma args
             do { prefix_tys <- liftZonkM (zonkTcTypes prefix_tys)
                ; let tys = residual : prefix_tys ++ maybeToList expected
                ; valid_scope <- tcRetainedInstScope tys
-               ; if not (valid_scope && all no_ql_vars tys
+               ; if not (valid_scope && all noQuickLookVars tys
                          && maybe True known_result expected)
                  then keep_ql else
                  if not (any (hasNativeDependentExpr . Core.Type) tys)
@@ -1907,9 +2001,9 @@ tcRetainedGroundApp True DoQL exp_ty rn_head fun sigma args
                              || (maybe False isRankedRetainedContainer expected
                                  && isGroundRetainedCallType body_tau)
                          -> do { choices <- liftZonkM (zonkTcTypes choices)
-                               ; body <- liftZonkM (zonkTcType body)
+                               ; body <- zonkAppTypeIfNeeded body
                                ; valid_choices <- tcRetainedInstScope (body : choices)
-                               ; if valid_choices && all no_ql_vars (body : choices)
+                               ; if valid_choices && all noQuickLookVars (body : choices)
                                  then return (prefix ++ [EWrap (EHsWrap (mkWpTyApps choices))],
                                               NoQL, body, remaining, Nothing)
                                  else keep_ql }
@@ -1926,15 +2020,17 @@ tcRetainedGroundApp True DoQL exp_ty rn_head fun sigma args
     known_head HsVar{} = True
     known_head (XExpr (ConLikeTc (RealDataCon _))) = True
     known_head _ = False
-    prefix_arg ETypeArg{} = True
-    prefix_arg EPrag{} = True
-    prefix_arg EWrap{} = True
-    prefix_arg _ = False
-    type_arg ETypeArg{} = True
-    type_arg _ = False
     known_result ty = isRetainedValueType ty || isRankedRetainedContainer ty
-    no_ql_vars = not . any is_ql . tyCoVarsOfTypeList
-    is_ql v = isTcTyVar v && isQLInstTyVar v
+
+    split_req_prefix consumed ty (EWrap{} : rest_args) = split_req_prefix consumed ty rest_args
+    split_req_prefix consumed ty (EPrag{} : rest_args) = split_req_prefix consumed ty rest_args
+    split_req_prefix _ ty (EValArg{} : rest_args)
+      | (_, _, tau) <- tcRetainedInstTelescope ty
+      , Just (_, tvb, body) <- tcSplitForAllTyVarBinder_maybe tau
+      , isVisibleForAllTyFlag (binderFlag tvb)
+      = split_req_prefix True body rest_args
+    split_req_prefix True ty rest_args = Just (ty, rest_args)
+    split_req_prefix False _ _         = Nothing
 tcRetainedGroundApp _ ql _ _ _ sigma args = return ([], ql, sigma, args, Nothing)
 
 -- | Collect the types that can retain Quick Look choices in a checked prefix.
@@ -1973,12 +2069,9 @@ tcRetainedKnownArgPlan :: (LHsExpr GhcRn -> TcM (Maybe Type))
                       -> [HsExprArg 'TcpRn] -> TcM RetainedInstPlan
 tcRetainedKnownArgPlan declared expected fun sigma args
   | hasNoConcreteTyVars fun
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   = tcRetainedKnownValuePlan declared expected sigma [arg | EValArg { ea_arg = arg } <- args]
   | otherwise = return Nothing
-  where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
 
 -- | Match a known declaration and a supplied sequence of value arguments.
 tcRetainedKnownValuePlan :: (LHsExpr GhcRn -> TcM (Maybe Type))
@@ -2353,9 +2446,9 @@ tcRetainedDeclaredArgType view_type (L loc (HsVar _ lname))
     do { mb_id <- tcLookupIdMaybe (unLocWithUserRdr lname)
        ; case mb_id of
            Just var -> do
-             { ty <- liftZonkM (zonkTcType (varType var))
+             { ty <- zonkAppTypeIfNeeded (varType var)
              ; valid <- tcRetainedInstScope [ty]
-             ; let (tvs, theta, _) = tcSplitForAllInvisTyVars ty `seq` tcRetainedInstTelescope ty
+             ; let (tvs, theta, _) = tcRetainedInstTelescope ty
              ; if valid && null tvs && null theta && isRetainedValueType ty
                         && noQuickLookVars ty
                then do { view <- view_type ty
@@ -3112,11 +3205,9 @@ signature, evidence order, and final result subsumption remain unchanged.
 -- Note [Native worker argument inference].
 matchRetainedAppType :: [TyVar] -> Subst.Subst -> Type -> Type -> Maybe Subst.Subst
 matchRetainedAppType tvs subst formal actual
-  = do { subst <- tcMatchRetainedTyX_BM bind_outer subst (typeKind formal) (typeKind actual)
-       ; tcMatchRetainedTyX_BM bind_outer subst formal actual }
-  where
-    bind_outer tv _ | tv `elem` tvs = BindMe
-                   | otherwise = DontBindMe
+  = do { let bind = bindOuterTvs tvs
+       ; subst <- tcMatchRetainedTyX_BM bind subst (typeKind formal) (typeKind actual)
+       ; tcMatchRetainedTyX_BM bind subst formal actual }
 
 {- Note [Declared native argument choices]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3205,6 +3296,18 @@ its algebraic candidate fallback. Keep the actual substituted signature. Append
 its type applications after the explicit prefix. This lets a nested Refl use
 its own complete expected proof type. It does not assume that the proof holds;
 argument checking, nominal entailment and final subsumption still run.
+
+A saturated nominal equality continuation such as gcastWith or rewrite has an
+implication domain ((a ~ b) => r) -> r rather than a ground value type. When
+no VTA prefix is written, the expected result is a tau type and either the
+expected result or an inferable proof argument supplies a native anchor, switch
+from Quick Look to NoQL so tcRetainedArgInstCachedWith can infer the proof and
+check the continuation under its Given. Do the same for a required-type-prefix
+call such as cong Succ (plusSucc m n) whose post-VDQ body has tau domains and a
+native anchor, so the post-VTA argument cache can instantiate the remaining
+invisible binders. Likewise, quickLookArg1 skips Quick Look on a saturated
+DepFunTy variable or constructor head when either no invisible binders remain
+or the saturated result shape has no retained binders or indices.
 
 A failed selection keeps the checked prefix and resumes Quick Look. It never
 infers a value argument or creates an argument cache. Public tcInstFun callers
@@ -3740,11 +3843,9 @@ matchBarPackageWitnesses binders packages
   , all noQuickLookVars types
   = do { templates <- traverse barPackageSignature formals
        ; targets <- traverse barPackageSignature actuals
-       ; let bind_outer tv _ | tv `elem` binders = BindMe
-                             | otherwise = DontBindMe
-             empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes (templates ++ targets)))
+       ; let empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes (templates ++ targets)))
              actual_fvs = tyCoVarsOfTypes actuals
-       ; subst <- foldM (\s (template, target) -> tcMatchTyX_BM bind_outer s template target)
+       ; subst <- foldM (\s (template, target) -> tcMatchTyX_BM (bindOuterTvs binders) s template target)
                         empty_subst (zip templates targets)
        ; witnesses <- traverse (Subst.lookupTyVar subst) binders
        ; guard (all (`elemVarSet` actual_fvs) (tyCoVarsOfTypesList witnesses))
@@ -4165,14 +4266,10 @@ tcCheckRetainedConApp expected_ty (L arg_loc expr@HsApp{})
              (ma_tvs, body) = tcSplitForAllInvisTyVars sigma
              tvs = map snd ma_tvs
              (theta, tau) = tcSplitPhiTy body
-             bind_outer tv _ | tv `elem` tvs = BindMe
-                             | otherwise     = DontBindMe
        ; guard (not (null tvs) && null theta && isEmptyNameEnv (dataConConcreteTyVars dc))
        ; result <- MaybeT (pure (tcRetainedOrdinaryResult (count isHsValArg rn_args) tau))
        ; guard (isFamFreeTy result && isTauTy result && isTauTy expected')
-       ; kind_subst <- MaybeT (pure (tcMatchTyX_BM bind_outer Subst.emptySubst
-                                       (typeKind result) (typeKind expected')))
-       ; subst <- MaybeT (pure (tcMatchTyX_BM bind_outer kind_subst result expected'))
+       ; subst <- MaybeT (pure (matchOuterTyKi tvs Subst.emptySubst result expected'))
        ; let lookup_or_many tv = case Subst.lookupTyVar subst tv of
                Just ty -> Just ty
                Nothing | isMultiplicityTy (tyVarKind tv) -> Just ManyTy
@@ -4180,8 +4277,7 @@ tcCheckRetainedConApp expected_ty (L arg_loc expr@HsApp{})
        ; inst_tys <- MaybeT (pure (traverse lookup_or_many tvs))
        ; guard (all noQuickLookVars (expected' : inst_tys))
        ; let full_subst = Subst.zipTvSubst tvs inst_tys
-       ; guard (and (zipWith (\tv ty -> eqType (Subst.substTy full_subst (tyVarKind tv)) (typeKind ty))
-                             tvs inst_tys))
+       ; guard (and (zipWith (substKindAgrees full_subst) tvs inst_tys))
        ; guard (eqType (Subst.substTy full_subst result) expected')
        ; valid <- liftMaybeT (tcRetainedInstScope inst_tys)
        ; guard valid
@@ -4385,7 +4481,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
      = go1 plan fun_orig pos acc fun_ty args
      | otherwise
      = do { fun_ty <- case do_ql of
-              NoQL | pos > 1 || not (null acc) -> liftZonkM (zonkTcType fun_ty)
+              NoQL | pos > 1 || not (null acc) -> zonkAppTypeIfNeeded fun_ty
               _ -> return fun_ty
           ; matched <- tcRetainedResultInstWithCasts do_ql expected_rho args tc_fun fun_ty
           ; case matched of
@@ -4394,21 +4490,21 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
               Nothing -> do
                 { inferred <- case vta_cache of
                     Just ref
-                      | all is_non_value_inst_arg acc
-                      , any is_type_arg acc
-                      , not (any is_type_arg args)
+                      | all isNonValExprArg acc
+                      , any isETypeArg acc
+                      , not (any isETypeArg args)
                       , not (hasRequiredTypePrefix fun_ty)
                       , hasNoConcreteTyVars tc_fun
                       -> do { attempted <- readTcRef ref
                             ; case attempted of
                                 Just _ -> return Nothing
                                 Nothing -> do
-                                  { residual <- liftZonkM (zonkTcType fun_ty)
+                                  { residual <- zonkAppTypeIfNeeded fun_ty
                                   ; (_, residual', cache, choices) <-
                                       tcRetainedArgInstEnabled (Just (count written_type_arg acc))
                                         do_ql expected_rho
                                         rn_head args tc_fun residual
-                                  ; residual'' <- liftZonkM (zonkTcType residual')
+                                  ; residual'' <- zonkAppTypeIfNeeded residual'
                                   ; writeTcRef ref (Just cache)
                                   ; return ((, residual'') <$> choices) } }
                     _ -> return Nothing
@@ -4417,14 +4513,6 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                     Nothing -> do
                       { choices <- tcRetainedPartialResultPlan do_ql expected_rho args tc_fun fun_ty
                       ; go1 choices fun_orig pos acc fun_ty args } } }
-
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    is_non_value_inst_arg ETypeArg{} = True
-    is_non_value_inst_arg EWrap{}    = True
-    is_non_value_inst_arg EPrag{}    = True
-    is_non_value_inst_arg _          = False
 
     written_type_arg (ETypeArg { ea_loc_span = loc })
       = not (isGeneratedSrcSpan (locA loc))
@@ -4461,7 +4549,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                 _ | not prefix_only, not no_tvs
                   , DepDictTy{} <- coreFullView body2
                   -- See Note [Applying a scoped dictionary].
-                  -> do { sigma <- liftZonkM (zonkTcType fun_ty)
+                  -> do { sigma <- zonkAppTypeIfNeeded fun_ty
                         ; choice <- tcRetainedKnownArgPlan (tcRetainedDeclaredArgType pure)
                                                             Nothing tc_fun sigma args
                         ; case choice of
@@ -4471,7 +4559,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                 _ | NoQL <- do_ql, not prefix_only, pos > 1, not no_tvs
                   , DepFunTy DepFunVisible _ _ <- coreFullView body2
                   , arg@EValArg{} : _ <- args
-                  -> do { sigma <- liftZonkM (zonkTcType fun_ty)
+                  -> do { sigma <- zonkAppTypeIfNeeded fun_ty
                         ; tcRetainedKnownArgPlan (tcRetainedDeclaredArgType tcRetainedDeclaredTypeView)
                                                  Nothing tc_fun sigma [arg] }
                 _ -> return Nothing
@@ -4487,9 +4575,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                     { let (inst_tys, rest) = splitAt (length tvs) choices
                           subst = Subst.zipTvSubst (map snd tvs) inst_tys
                     ; unless (tvs `equalLength` inst_tys
-                              && and (zipWith (\tv ty ->
-                                   eqType (Subst.substTy subst (tyVarKind tv))
-                                          (typeKind ty)) (map snd tvs) inst_tys)) $
+                              && and (zipWith (substKindAgrees subst) (map snd tvs) inst_tys)) $
                         pprPanic "tcInstFun: invalid retained instantiations"
                                  (ppr tvs $$ ppr choices)
                     ; wrap <- instCall fun_orig inst_tys (substTheta subst theta)
@@ -4518,10 +4604,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
       , DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
       , isInferredRetainedBinder binder
       = if hasSpecifiedInvisibleArgument body
-        then do { reflected <- tcInstInvisibleTypeWitness fun_orig Nothing fun_ty
-                ; case reflected of
-                    Just (wrap, res) -> go plan fun_orig pos (addArgWrap wrap acc) res args
-                    Nothing -> infer_inferred_index binder body }
+        then infer_invis_retained plan fun_orig pos acc fun_ty binder body
+               (noAnnSrcSpan fun_lspan) args
         else case first_arg of
                ETypeArg { ea_hs_ty = hs_ty } ->
                  do { (_, tidy_ty) <- liftZonkM $ zonkTidyTcType emptyTidyEnv fun_ty
@@ -4535,23 +4619,6 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
         is_type_or_retained ERetainedArg{} = True
         is_type_or_retained _              = False
 
-        infer_inferred_index binder body
-          = do { let val_args = [v | EValArg { ea_arg = v } <- args]
-                     err_arg  = case val_args of
-                       v : _ -> v
-                       []    -> noLocA (fst rn_head)
-               ; InvisibleOperand operand record_usage <-
-                   addArgCtxt (pos + count written_prefix_arg acc) rn_head err_arg $
-                     do { selected <- tcInferInvisibleRetained [] binder body val_args
-                        ; case selected of
-                            Just (actual, _) -> return actual
-                            Nothing -> failWithTc (TcRnRetainedQuantificationError
-                                                    (RetainedInvisibleArgument binder)) }
-               ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
-               ; tcScalingUsage bndr_mult' record_usage
-               ; let wrap = mkWpEvApps [EvExpr operand]
-               ; go plan fun_orig pos (addArgWrap wrap acc) (applyTypeToArgs fun_ty [operand]) args }
-
     -- Proposal #378 §4.8 & §4.13: canonical @arg override for SpecifiedSpec
     -- invisible foreach binders. See Note [Visible @arg override for invisible foreach].
     go1 plan fun_orig pos acc fun_ty
@@ -4559,105 +4626,43 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
       | DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
       = case unLoc (ignoreParens (hswc_body hs_ty)) of
           HsWildCardTy{} ->
-            do { reflected <- tcInstInvisibleTypeWitness fun_orig Nothing fun_ty
-               ; case reflected of
-                   Just (wrap, res) -> go plan fun_orig pos (addArgWrap wrap acc) res rest_args
-                   Nothing ->
-                     do { let val_args = [v | EValArg { ea_arg = v } <- rest_args]
-                              err_arg  = case val_args of
-                                v : _ -> v
-                                []    -> L ctxt (fst rn_head)
-                        ; InvisibleOperand operand record_usage <-
-                            addArgCtxt (pos + count written_prefix_arg acc) rn_head err_arg $
-                              do { selected <- tcInferInvisibleRetained [] binder body val_args
-                                 ; case selected of
-                                     Just (actual, _) -> return actual
-                                     Nothing -> failWithTc (TcRnRetainedQuantificationError
-                                                             (RetainedInvisibleArgument binder)) }
-                        ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
-                        ; tcScalingUsage bndr_mult' record_usage
-                        ; let wrap = mkWpEvApps [EvExpr operand]
-                        ; go plan fun_orig pos (addArgWrap wrap acc)
-                             (applyTypeToArgs fun_ty [operand]) rest_args } }
+            infer_invis_retained plan fun_orig pos acc fun_ty binder body ctxt rest_args
           _ ->
-            do { bndr_ty <- liftZonkM (zonkTcType (varType binder))
-               ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
-               ; mb_rep <- tcTypeRepTarget_maybe bndr_ty
+            do { mb_rep <- tcTypeRepTarget_maybe (varType binder)
                ; case mb_rep of
                    Just (kind, target) ->
                      do { ty_arg <- tcHsTypeApp hs_ty kind
                         ; _ <- unifyType Nothing ty_arg target
-                        ; bndr_ty' <- liftZonkM (zonkTcType bndr_ty)
-                        ; body' <- liftZonkM (zonkTcType body)
+                        ; bndr_ty' <- zonkAppTypeIfNeeded (varType binder)
+                        ; bndr_mult' <- zonkAppTypeIfNeeded (idMult binder)
+                        ; body' <- zonkAppTypeIfNeeded body
                         ; let emb_arg = L ctxt (HsEmbTy noExtField hs_ty)
                               checked = ERetainedArg DepFunInvisible ctxt
                                           (Scaled bndr_mult' bndr_ty') emb_arg body' Nothing
                         ; go plan fun_orig pos (checked : acc) body' rest_args }
                    Nothing ->
                      do { arg <- type_to_retained_expr hs_ty
-                        ; (runtime_arg, res_ty, arg_co) <-
-                            addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
-                            if isVacuousRetainedBinder binder body
-                            then return (arg, body, Nothing)
-                            else if exprContainsHole arg
-                            then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
-                            else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
-                                    ; res <- retainedAppResult fun_ty binder operand
-                                    ; co <- retainedVariableCast operand runtime_arg
-                                    ; return (runtime_arg, res, co) }
-                        ; bndr_ty' <- zonkRetainedBinderDomain binder
-                        ; let checked = ERetainedArg DepFunInvisible ctxt
-                                          (Scaled bndr_mult' bndr_ty') runtime_arg res_ty arg_co
-                        ; go plan fun_orig pos (checked : acc) res_ty rest_args } }
+                        ; check_invis_retained_operand plan fun_orig pos acc fun_ty
+                            ctxt binder body arg rest_args } }
 
     -- See Note [Explicit invisible retained arguments].
     go1 plan fun_orig pos acc fun_ty (ERetainedArg _ loc _ arg _ _ : rest_args)
       | DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
-      = do { (runtime_arg, res_ty, arg_co) <-
-               addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
-               if isVacuousRetainedBinder binder body
-               then return (arg, body, Nothing)
-               else if exprContainsHole arg
-               then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
-               else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
-                       ; res <- retainedAppResult fun_ty binder operand
-                       ; co <- retainedVariableCast operand runtime_arg
-                       ; return (runtime_arg, res, co) }
-           ; bndr_ty' <- zonkRetainedBinderDomain binder
-           ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
-           ; let checked = ERetainedArg DepFunInvisible loc (Scaled bndr_mult' bndr_ty')
-                                        runtime_arg res_ty arg_co
-           ; go plan fun_orig pos (checked : acc) res_ty rest_args }
+      = check_invis_retained_operand plan fun_orig pos acc fun_ty loc binder body arg rest_args
       | otherwise = addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
                     failWithTc (TcRnRetainedQuantificationError (RetainedExplicitArgument fun_ty))
 
     -- See Note [Inferring an invisible retained argument].
     go1 plan fun_orig pos acc fun_ty args@(EValArg { ea_arg = first } : _)
       | DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
-      = do { reflected <- tcInstInvisibleTypeWitness fun_orig Nothing fun_ty
-           ; case reflected of
-               Just (wrap, res) -> go plan fun_orig pos (addArgWrap wrap acc) res args
-               Nothing -> infer_index binder body }
-      where
-        infer_index binder body
-          = do { InvisibleOperand operand record_usage <- addArgCtxt (pos + count written_prefix_arg acc) rn_head first $
-                   do { selected <- tcInferInvisibleRetained [] binder body
-                                      [arg | EValArg { ea_arg = arg } <- args]
-                      ; case selected of
-                          Just (actual, _) -> return actual
-                          Nothing -> failWithTc (TcRnRetainedQuantificationError
-                                                  (RetainedInvisibleArgument binder)) }
-               ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
-               ; tcScalingUsage bndr_mult' record_usage
-               ; let wrap = mkWpEvApps [EvExpr operand]
-               ; go plan fun_orig pos (addArgWrap wrap acc) (applyTypeToArgs fun_ty [operand]) args }
+      = infer_invis_retained plan fun_orig pos acc fun_ty binder body (getLoc first) args
 
     -- See Note [Applying a scoped dictionary].
     go1 plan fun_orig pos acc fun_ty args
       | DepDictTy binder _ <- coreFullView fun_ty
       , not (null args), inst_fun args Inferred
-      = do { givens <- liftZonkM . mapM zonkId =<< getLexicalGivens
-           ; predicate <- liftZonkM (zonkTcType (varType binder))
+      = do { givens <- mapM zonkAppIdIfNeeded =<< getLexicalGivens
+           ; predicate <- zonkAppTypeIfNeeded (varType binder)
            ; dict <- case Core.projectUniqueClassDict predicate givens of
                Core.ScopedDirectDict dict -> return dict
                Core.ScopedSuperclassDict _ _ ->
@@ -4717,7 +4722,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                        ; arg_co <- retainedVariableCast core_arg runtime_arg
                        ; return (runtime_arg, body_ty, arg_co) }
            ; bndr_ty' <- zonkRetainedBinderDomain binder
-           ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
+           ; bndr_mult' <- zonkAppTypeIfNeeded (idMult binder)
            ; let arg' = ERetainedArg DepFunVisible ctxt (Scaled bndr_mult' bndr_ty') runtime_arg body_ty
                                          arg_co
            ; go plan fun_orig (pos + 1) (arg' : acc) body_ty rest_args }
@@ -4812,6 +4817,45 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
            ; arg' <- look_arg do_ql arg_pos ctxt rn_head arg_prepared arg_ty'
            ; let acc' = arg' : addArgWrap (mkWpCastN fun_co) acc
            ; go plan fun_orig (pos+1) acc' res_ty' rest_args }
+
+    infer_invis_retained plan fun_orig pos acc fun_ty binder body fallback_loc next_args
+      = do { reflected <- tcInstInvisibleTypeWitness fun_orig Nothing fun_ty
+           ; case reflected of
+               Just (wrap, res) -> go plan fun_orig pos (addArgWrap wrap acc) res next_args
+               Nothing ->
+                 do { let val_args = [v | EValArg { ea_arg = v } <- next_args]
+                          err_arg  = case val_args of
+                            v : _ -> v
+                            []    -> L fallback_loc (fst rn_head)
+                    ; InvisibleOperand operand record_usage <-
+                        addArgCtxt (pos + count written_prefix_arg acc) rn_head err_arg $
+                          do { selected <- tcInferInvisibleRetained [] binder body val_args
+                             ; case selected of
+                                 Just (actual, _) -> return actual
+                                 Nothing -> failWithTc (TcRnRetainedQuantificationError
+                                                         (RetainedInvisibleArgument binder)) }
+                    ; bndr_mult' <- zonkAppTypeIfNeeded (idMult binder)
+                    ; tcScalingUsage bndr_mult' record_usage
+                    ; let wrap = mkWpEvApps [EvExpr operand]
+                    ; go plan fun_orig pos (addArgWrap wrap acc)
+                         (applyTypeToArgs fun_ty [operand]) next_args } }
+
+    check_invis_retained_operand plan fun_orig pos acc fun_ty ctxt binder body arg rest_args
+      = do { (runtime_arg, res_ty, arg_co) <-
+               addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
+               if isVacuousRetainedBinder binder body
+               then return (arg, body, Nothing)
+               else if exprContainsHole arg
+               then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
+               else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
+                       ; res <- retainedAppResult fun_ty binder operand
+                       ; co <- retainedVariableCast operand runtime_arg
+                       ; return (runtime_arg, res, co) }
+           ; bndr_ty' <- zonkRetainedBinderDomain binder
+           ; bndr_mult' <- zonkAppTypeIfNeeded (idMult binder)
+           ; let checked = ERetainedArg DepFunInvisible ctxt (Scaled bndr_mult' bndr_ty')
+                                        runtime_arg res_ty arg_co
+           ; go plan fun_orig pos (checked : acc) res_ty rest_args }
 
     -- Read only the visible domains that already follow this callback.
     receiverDomains _ _ [] = Just []
@@ -5836,11 +5880,11 @@ tcRetainedFunctionArg domain arg = setSrcSpanA (getLoc arg) $
     _
       | Just (mb_pat, body_rn) <- split_simple_lam_or_eta (unLoc (stripParensLHsExpr arg)) ->
           tcSynthesizeRetainedFunctionArg domain (getLocA arg) mb_pat body_rn
-      | HsApp{} <- unLoc (stripParensLHsExpr arg) -> do
-          mb_eta <- try_con_prefix (stripParensLHsExpr arg)
-          case mb_eta of
-            Just body_rn -> tcSynthesizeRetainedFunctionArg domain (getLocA arg) Nothing body_rn
-            Nothing      -> check_prefix
+      | HsApp{} <- unLoc (stripParensLHsExpr arg)
+      , let stripped = stripParensLHsExpr arg ->
+          if isDataConAppHead stripped
+            then tcSynthesizeRetainedFunctionArg domain (getLocA arg) Nothing stripped
+            else check_prefix
       | OpApp _ lhs op rhs <- unLoc (stripParensLHsExpr arg) -> do
           is_comp <- is_any_compose_expr op
           if is_comp
@@ -5870,18 +5914,6 @@ tcRetainedFunctionArg domain arg = setSrcSpanA (getLoc arg) $
     simple_lam_pat WildPat{}        = Just Nothing
     simple_lam_pat _                = Nothing
 
-    try_con_prefix :: LHsExpr GhcRn -> TcM (Maybe (LHsExpr GhcRn))
-    try_con_prefix expr
-      | is_data_con_app_head expr = pure (Just expr)
-      | otherwise                 = pure Nothing
-
-    is_data_con_app_head :: LHsExpr GhcRn -> Bool
-    is_data_con_app_head (L _ (HsPar _ inner))       = is_data_con_app_head inner
-    is_data_con_app_head (L _ (HsApp _ fun _))       = is_data_con_app_head fun
-    is_data_con_app_head (L _ (HsAppType _ fun _))   = is_data_con_app_head fun
-    is_data_con_app_head (L _ (HsVar _ lname))       = isDataOcc (nameOccName (unLocWithUserRdr lname))
-    is_data_con_app_head _                           = False
-
     instantiate_named owner written = do
       expected <- liftZonkM (zonkTcType domain)
       owner <- liftZonkM (zonkId owner)
@@ -5898,6 +5930,14 @@ tcRetainedFunctionArg domain arg = setSrcSpanA (getLoc arg) $
         Just index | typeKind index `tcEqType` expected -> return arg_core
         _ -> unsupported
 
+-- | Test whether an expression spine is headed by a data constructor.
+isDataConAppHead :: LHsExpr GhcRn -> Bool
+isDataConAppHead (L _ (HsPar _ inner))     = isDataConAppHead inner
+isDataConAppHead (L _ (HsApp _ fun _))     = isDataConAppHead fun
+isDataConAppHead (L _ (HsAppType _ fun _)) = isDataConAppHead fun
+isDataConAppHead (L _ (HsVar _ lname))     = isDataOcc (nameOccName (unLocWithUserRdr lname))
+isDataConAppHead _                         = False
+
 localSynthFunIdsRef :: IORef [(Module, [Id])]
 localSynthFunIdsRef = unsafePerformIO (newIORef [])
 {-# NOINLINE localSynthFunIdsRef #-}
@@ -5913,12 +5953,15 @@ recordLocalSynthFunId fid = do
 
 withLocalSynthFunIds :: TcM a -> TcM a
 withLocalSynthFunIds action = do
-  gbl <- getGblEnv
-  let cur_mod = tcg_mod gbl
   entries <- liftIO (readIORef localSynthFunIdsRef)
-  let fids = [ fid | fid <- fromMaybe [] (lookup cur_mod entries)
-                   , isNothing (lookupTypeEnv (tcg_type_env gbl) (idName fid)) ]
-  foldr tcExtendGeneratedIdEnv action fids
+  if null entries
+    then action
+    else do
+      gbl <- getGblEnv
+      let cur_mod = tcg_mod gbl
+          fids = [ fid | fid <- fromMaybe [] (lookup cur_mod entries)
+                       , isNothing (lookupTypeEnv (tcg_type_env gbl) (idName fid)) ]
+      foldr tcExtendGeneratedIdEnv action fids
 
 -- | Lower an inline composition @lhs . rhs@ passed to a @foreach (f :: a -> c)@
 -- binder to the certified 'GHC.Internal.Base.(.)' source table when the
@@ -6009,30 +6052,25 @@ tcRetainedComposeFunctionArg raw_domain loc lhs rhs = do
       _ -> infer_spine_domain out_ty expr
 
     infer_spine_codomain :: Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_spine_codomain in_ty expr = do
-      mb_sig <- fun_spine_arrow expr
-      pure $ do
-        (u_tvs, u_in, u_out) <- mb_sig
-        if null u_tvs
-          then guard (u_in `tcEqType` in_ty) >> Just u_out
-          else do
-            su <- matchRetainedAppType u_tvs Subst.emptySubst u_in in_ty
-            let out' = Subst.substTy su u_out
-            guard (not (any (`elemVarSet` tyCoVarsOfType out') u_tvs))
-            Just out'
+    infer_spine_codomain = infer_spine_side True
 
     infer_spine_domain :: Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_spine_domain out_ty expr = do
+    infer_spine_domain = infer_spine_side False
+
+    infer_spine_side :: Bool -> Type -> LHsExpr GhcRn -> TcM (Maybe Type)
+    infer_spine_side forward known_ty expr = do
       mb_sig <- fun_spine_arrow expr
       pure $ do
         (u_tvs, u_in, u_out) <- mb_sig
+        let (known_template, target_template) =
+              if forward then (u_in, u_out) else (u_out, u_in)
         if null u_tvs
-          then guard (u_out `tcEqType` out_ty) >> Just u_in
+          then guard (known_template `tcEqType` known_ty) >> Just target_template
           else do
-            su <- matchRetainedAppType u_tvs Subst.emptySubst u_out out_ty
-            let in' = Subst.substTy su u_in
-            guard (not (any (`elemVarSet` tyCoVarsOfType in') u_tvs))
-            Just in'
+            su <- matchRetainedAppType u_tvs Subst.emptySubst known_template known_ty
+            let target' = Subst.substTy su target_template
+            guard (not (any (`elemVarSet` tyCoVarsOfType target') u_tvs))
+            Just target'
 
     fun_spine_arrow :: LHsExpr GhcRn -> TcM (Maybe ([TyVar], Type, Type))
     fun_spine_arrow expr = case split_val_apps [] expr of
@@ -6100,10 +6138,10 @@ tcSynthesizeRetainedFunctionArg raw_domain loc mb_pat raw_body = do
         Just lname -> pure (getLoc lname, unLoc lname, raw_body)
         Nothing -> do
           fresh_x <- newSysName (mkVarOcc "$x")
-          let l_x = noAnnSrcSpan loc
-              app_rn = case mb_pat of
-                Nothing | is_bare_con_or_app raw_body -> nlHsApp raw_body (nlHsVar fresh_x)
-                _ -> raw_body
+          let l_x    = noAnnSrcSpan loc
+              app_rn = if isDataConAppHead raw_body
+                         then nlHsApp raw_body (nlHsVar fresh_x)
+                         else raw_body
           pure (l_x, fresh_x, app_rn)
       let x_id = mkLocalId x_name ManyTy arg_ty
       unless (isNativeOpaqueValueId x_id) unsupported
@@ -6155,12 +6193,6 @@ tcSynthesizeRetainedFunctionArg raw_domain loc mb_pat raw_body = do
   where
     unsupported :: TcM a
     unsupported = failWithTc $ TcRnRetainedQuantificationError RetainedFunctionArgument
-
-    is_bare_con_or_app (L _ (HsPar _ inner))     = is_bare_con_or_app inner
-    is_bare_con_or_app (L _ (HsApp _ fun _))     = is_bare_con_or_app fun
-    is_bare_con_or_app (L _ (HsAppType _ fun _)) = is_bare_con_or_app fun
-    is_bare_con_or_app (L _ (HsVar _ lname))     = isDataOcc (nameOccName (unLocWithUserRdr lname))
-    is_bare_con_or_app _                         = False
 
     nub_vars :: [Var] -> [Var]
     nub_vars vs = reverse (snd (foldl' (\(s, acc) v ->
@@ -7101,7 +7133,7 @@ tcRetainedResultInst do_ql expected args fun sigma
        ; first <- try_inst expected
        ; case (first, do_ql, expected) of
            (Nothing, NoQL, Just rho)
-             | not (any is_type_arg args)
+             | not (any isETypeArg args)
              , (ma_tvs@(_:_), body) <- tcSplitForAllInvisTyVars sigma
              , let tvs = map snd ma_tvs
                    (_, tau) = tcSplitPhiTy body
@@ -7141,9 +7173,6 @@ tcRetainedResultInst do_ql expected args fun sigma
                        else return Nothing }
            _ -> return first }
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
     peel_visible 0 ty = case coreFullView ty of
       DepFunTy DepFunInvisible _ res -> peel_visible 0 res
       _ -> Just ty
@@ -7174,7 +7203,7 @@ tcRetainedResultIndexCast :: QLFlag -> Maybe TcRhoType -> [HsExprArg 'TcpRn]
 tcRetainedResultIndexCast NoQL (Just expected) args fun sigma
   | XExpr (ConLikeTc (RealDataCon dc)) <- fun
   , hasNoConcreteTyVars fun
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , (binders@(_:_), body) <- tcSplitForAllInvisTyVars sigma
   , isTauTy body
   , Just result <- tcRetainedOrdinaryResult (count isHsValArg args) body
@@ -7207,9 +7236,6 @@ tcRetainedResultIndexCast NoQL (Just expected) args fun sigma
            ; co <- unifyKind Nothing (typeKind index) kind
            ; let choice = mkCastTy index co
            ; return (Subst.extendTvSubstAndInScope subst tv choice, choice) }
-
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
 tcRetainedResultIndexCast _ _ _ _ _ = return Nothing
 
 -- | Read the expected data arguments, including a checked sum payload.
@@ -7253,7 +7279,7 @@ tcRetainedResultCandidate :: QLFlag -> Maybe TcRhoType -> [HsExprArg 'TcpRn]
 tcRetainedResultCandidate NoQL (Just expected) args fun sigma
   | hasNoConcreteTyVars fun
   , hasNativeDependentExpr (Core.Type expected)
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , (ma_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let tvs = map snd ma_tvs
         (_, tau) = tcSplitPhiTy body
@@ -7266,20 +7292,11 @@ tcRetainedResultCandidate NoQL (Just expected) args fun sigma
   , Just inst_tys <- traverse (candidate candidates) tvs
   , not (any (`elemVarSet` tyCoVarsOfTypes inst_tys) tvs)
   , let subst = Subst.zipTvSubst tvs inst_tys
-  , and (zipWith (\tv ty -> eqType (Subst.substTy subst (tyVarKind tv)) (typeKind ty))
-                tvs inst_tys)
+  , and (zipWith (substKindAgrees subst) tvs inst_tys)
   = do { valid <- tcRetainedInstScope inst_tys
        ; return (if valid then Just (inst_tys, Subst.substTy subst body) else Nothing) }
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    bind_outer tvs tv _ | tv `elem` tvs = BindMe
-                        | otherwise = DontBindMe
-
-    match_pair tvs (formal, actual) = do
-      kinds <- tcMatchTyX_BM (bind_outer tvs) Subst.emptySubst (typeKind formal) (typeKind actual)
-      tcMatchTyX_BM (bind_outer tvs) kinds formal actual
+    match_pair tvs (formal, actual) = matchOuterTyKi tvs Subst.emptySubst formal actual
 
     uncast_constructor (formal, CastTy actual co)
       | coercionRole co == Nominal
@@ -7368,8 +7385,7 @@ tcRetainedResultMatch :: QLFlag -> Maybe TcRhoType -> [HsExprArg 'TcpRn]
 tcRetainedResultMatch NoQL (Just expected) args fun sigma
   | Just (tvs, body, subst, ranked_constructor) <- retainedOrdinaryResultSubst expected args fun sigma
   , Just inst_tys <- traverse (Subst.lookupTyVar subst) tvs
-  , and (zipWith (\tv ty -> eqType (Subst.substTy subst (tyVarKind tv)) (typeKind ty))
-                tvs inst_tys)
+  , and (zipWith (substKindAgrees subst) tvs inst_tys)
   = do { enabled <- if ranked_constructor then xoptM LangExt.ImpredicativeTypes else return True
        ; valid <- if enabled && (not ranked_constructor || all noQuickLookVars (expected : inst_tys))
                   then tcRetainedInstScope inst_tys
@@ -7392,7 +7408,7 @@ retainedOrdinaryResultSubst :: TcRhoType -> [HsExprArg 'TcpRn] -> HsExpr GhcTc
                             -> TcSigmaType -> Maybe ([TyVar], Type, Subst.Subst, Bool)
 retainedOrdinaryResultSubst expected args fun sigma
   | hasNativeDependentExpr (Core.Type expected)
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , (ma_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let tvs = map snd ma_tvs
   , not (null tvs)
@@ -7410,9 +7426,7 @@ retainedOrdinaryResultSubst expected args fun sigma
   , not (hasNativeDependentExpr (Core.Type body))
   = if isTauTy result
     then do
-      { kind_subst <- tcMatchTyX_BM (bind_outer tvs) Subst.emptySubst
-                                    (typeKind result) (typeKind expected)
-      ; subst <- tcMatchTyX_BM (bind_outer tvs) kind_subst result expected
+      { subst <- matchOuterTyKi tvs Subst.emptySubst result expected
       ; guard (eqType (Subst.substTy subst result) expected)
       ; Just (tvs, body, subst, ranked_constructor) }
     else do
@@ -7421,9 +7435,7 @@ retainedOrdinaryResultSubst expected args fun sigma
             inner_tvs = map snd inner_bndrs
             all_tvs   = tvs ++ inner_tvs
       ; guard (not (null inner_tvs) && isTauTy res_tau)
-      ; kind_subst <- tcMatchTyX_BM (bind_outer all_tvs) Subst.emptySubst
-                                    (typeKind res_tau) (typeKind expected)
-      ; subst_all <- tcMatchTyX_BM (bind_outer all_tvs) kind_subst res_tau expected
+      ; subst_all <- matchOuterTyKi all_tvs Subst.emptySubst res_tau expected
       ; guard (eqType (Subst.substTy subst_all res_tau) expected)
       ; inner_tys <- traverse (Subst.lookupTyVar subst_all) inner_tvs
       ; inner_sks <- traverse getTyVar_maybe inner_tys
@@ -7433,13 +7445,6 @@ retainedOrdinaryResultSubst expected args fun sigma
       ; guard (not (any (`elemVarSet` tyCoVarsOfTypes inst_tys) (inner_tvs ++ inner_sks)))
       ; Just (tvs, body, Subst.zipTvSubst tvs inst_tys, False) }
   | otherwise = Nothing
-  where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    bind_outer tvs tv _
-      | tv `elem` tvs = BindMe
-      | otherwise = DontBindMe
 
 {- Note [Partial ordinary applications at a native result type]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -7509,7 +7514,7 @@ partialGenerativeResultSubst :: TcRhoType -> [HsExprArg 'TcpRn] -> HsExpr GhcTc
                              -> TcSigmaType -> Maybe ([TyVar], Subst.Subst)
 partialGenerativeResultSubst expected args fun sigma
   | hasNativeDependentExpr (Core.Type expected)
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , (ma_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let tvs = map snd ma_tvs
   , not (null tvs)
@@ -7524,17 +7529,8 @@ partialGenerativeResultSubst expected args fun sigma
   = Just (tvs, foldl' (step_pair tvs) Subst.emptySubst (zip formals actuals))
   | otherwise = Nothing
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    bind_outer tvs tv _
-      | tv `elem` tvs = BindMe
-      | otherwise = DontBindMe
-
     step_pair tvs subst (formal, actual) =
-      fromMaybe subst $ do
-        s1 <- tcMatchTyX_BM (bind_outer tvs) subst (typeKind formal) (typeKind actual)
-        tcMatchTyX_BM (bind_outer tvs) s1 formal actual
+      fromMaybe subst (matchOuterTyKi tvs subst formal actual)
 
 -- | Validate the native choices before allocating the remaining ordinary arguments.
 retainedPartialResultChoices :: [TyVar] -> Subst.Subst -> Maybe [Type]
@@ -7607,7 +7603,7 @@ tcRetainedWorkerResultMatch :: QLFlag -> Maybe TcRhoType -> [HsExprArg 'TcpRn]
                            -> TcM (Maybe ([Type], TcSigmaType))
 tcRetainedWorkerResultMatch NoQL (Just expected) args fun sigma
   | hasNoConcreteTyVars fun
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , (ma_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let tvs = map snd ma_tvs
   , not (null tvs)
@@ -7617,22 +7613,14 @@ tcRetainedWorkerResultMatch NoQL (Just expected) args fun sigma
   , Just result <- worker_result (count isHsValArg args) tau
   , isRetainedValueType result
   , hasNativeDependentExpr (Core.Type expected) || uniform_constructor_result tvs result
-  , Just subst <- tcMatchRetainedTyX_BM (bind_outer tvs) Subst.emptySubst result expected
+  , Just subst <- tcMatchRetainedTyX_BM (bindOuterTvs tvs) Subst.emptySubst result expected
   , Just inst_tys <- traverse (Subst.lookupTyVar subst) tvs
   , not (any (`elemVarSet` tyCoVarsOfTypes inst_tys) tvs)
-  , and (zipWith (kind_agrees subst) tvs inst_tys)
+  , and (zipWith (substKindAgrees subst) tvs inst_tys)
   , eqType (Subst.substTy subst result) expected
   = do { valid <- tcRetainedInstScope inst_tys
        ; return (if valid then Just (inst_tys, Subst.substTy subst body) else Nothing) }
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    bind_outer tvs tv _
-      | tv `elem` tvs = BindMe
-      | otherwise = DontBindMe
-
-    kind_agrees subst tv ty = eqType (Subst.substTy subst (tyVarKind tv)) (typeKind ty)
     -- Sigma a p exposes both erased parameters, even when the expected
     -- Sigma type contains no runtime Id. The fields still check the index.
     uniform_constructor_result tvs result
@@ -8044,6 +8032,9 @@ tcRetainedInferableArg (L _ expr)
     -- | Exclude checking-only syntax without traversing compiler type graphs.
     simple_type :: Data a => a -> Bool
     simple_type thing
+      | Just (_ :: SrcSpanAnnA) <- cast thing = True
+      | Just (_ :: SrcSpanAnnN) <- cast thing = True
+      | Just (_ :: SrcSpan)     <- cast thing = True
       | Just ty <- (cast thing :: Maybe (HsType GhcRn))
       , not (simple_shape ty) = False
       | Just ty <- (cast thing :: Maybe Type) = isTauTy ty
@@ -8086,7 +8077,7 @@ tcRetainedDollarInst enabled (Check expected) rn_head@(HsVar _ (L _ (WithUserRdr
                     args fun@(HsVar _ (L _ dollar)) sigma
   | enabled
   , name `hasKey` dollarIdKey, dollar `hasKey` dollarIdKey
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , [lhs, rhs] <- [arg | EValArg { ea_arg = arg } <- args]
   , (ma_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let tvs = map snd ma_tvs
@@ -8094,7 +8085,7 @@ tcRetainedDollarInst enabled (Check expected) rn_head@(HsVar _ (L _ (WithUserRdr
   , (_, [_, domain], result) <- splitFunTys body
   , isTauTy body, not (hasNativeDependentExpr (Core.Type body))
   = do { result_ty <-
-           do { expected <- liftZonkM (zonkTcType expected)
+           do { expected <- zonkAppTypeIfNeeded expected
               ; if complete_result expected then return (Just expected)
                 else declared_result 1 lhs }
        ; case result_ty of
@@ -8106,17 +8097,17 @@ tcRetainedDollarInst enabled (Check expected) rn_head@(HsVar _ (L _ (WithUserRdr
            ; if not tau_domains then return (Nothing, []) else
         do { (usage, (typed_rhs, rhs_ty)) <- addArgCtxt 2 rn_head rhs $
                tcCollectingUsage (tcInferRho rhs)
-           ; rhs_ty <- liftZonkM (zonkTcType rhs_ty)
+           ; rhs_ty <- zonkAppTypeIfNeeded rhs_ty
            ; let cache = [(2, (typed_rhs, rhs_ty, usage))]
                  concrete_tvs = idConcreteTvs dollar
                  matched = do
-                   subst <- match_type tvs Subst.emptySubst result expected
-                   match_type tvs subst (scaledThing domain) rhs_ty
+                   subst <- matchOuterTyKi tvs Subst.emptySubst result expected
+                   matchOuterTyKi tvs subst (scaledThing domain) rhs_ty
            ; case matched of
                Just subst
                  | Just inst_tys <- traverse (Subst.lookupTyVar subst) tvs
                  , not (any (`elemVarSet` tyCoVarsOfTypes inst_tys) tvs)
-                 , and (zipWith (kind_agrees subst) tvs inst_tys)
+                 , and (zipWith (substKindAgrees subst) tvs inst_tys)
                  , eqType (Subst.substTy subst result) expected
                  , eqType (Subst.substTy subst (scaledThing domain)) rhs_ty
                  , isEmptyNameEnv (delListFromNameEnv concrete_tvs (map getName tvs))
@@ -8176,7 +8167,7 @@ tcRetainedDollarInst enabled (Check expected) rn_head@(HsVar _ (L _ (WithUserRdr
             -> do { mb_id <- tcLookupIdMaybe (unLocWithUserRdr lname)
                   ; case mb_id of
                       Just var | isEmptyNameEnv (idConcreteTvs var)
-                        -> do { sigma <- liftZonkM (zonkTcType (varType var))
+                        -> do { sigma <- zonkAppTypeIfNeeded (varType var)
                               ; let (ma_tvs, body) = tcSplitForAllInvisTyVars sigma
                                     tvs = map snd ma_tvs
                               ; return $ do
@@ -8188,19 +8179,6 @@ tcRetainedDollarInst enabled (Check expected) rn_head@(HsVar _ (L _ (WithUserRdr
                                   return result }
                       _ -> return Nothing }
           _ -> return Nothing
-
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    bind_outer tvs tv _
-      | tv `elem` tvs = BindMe
-      | otherwise = DontBindMe
-
-    match_type tvs subst template actual
-      = do { subst <- tcMatchTyX_BM (bind_outer tvs) subst (typeKind template) (typeKind actual)
-           ; tcMatchTyX_BM (bind_outer tvs) subst template actual }
-
-    kind_agrees subst tv ty = eqType (Subst.substTy subst (tyVarKind tv)) (typeKind ty)
 tcRetainedDollarInst _ _ _ _ _ _ = return (Nothing, [])
 
 {- Note [Immutable native dollar applications]
@@ -8518,9 +8496,9 @@ tcRetainedHigherOrderMotiveInst
   -> TcM (Maybe (HsExpr GhcTc, TcSigmaType, RetainedArgCache, RetainedInstPlan))
 tcRetainedHigherOrderMotiveInst _rn_head args fun sigma0
   | hasNoConcreteTyVars fun
-  , not (any is_type_arg args)
+  , not (any isETypeArg args)
   , values@(_ : _) <- [arg | EValArg { ea_arg = arg } <- args]
-  = do { sigma <- liftZonkM (zonkTcType sigma0)
+  = do { sigma <- zonkAppTypeIfNeeded sigma0
        ; let (tvs, theta, tau) = tcRetainedInstTelescope sigma
        ; if null tvs || not (null theta) || not (isRetainedValueType tau)
          then return Nothing
@@ -8532,9 +8510,6 @@ tcRetainedHigherOrderMotiveInst _rn_head args fun sigma0
   | otherwise
   = return Nothing
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _          = False
-
     split_motive_template :: [TyVar] -> Type -> Maybe ([Type], TyVar)
     split_motive_template = splitMotiveTemplate
 
@@ -8638,11 +8613,7 @@ tcRetainedHigherOrderMotiveInst _rn_head args fun sigma0
           { m_pats = L _ [pat]
           , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body) NE.:| []
                             , grhssLocalBinds = L _ EmptyLocalBinds{} } }] }), [])
-        | WildPat{} <- unLoc (strip_par_pat pat) -> do
-            mb_res <- tcRetainedConstructorArgType body
-            case mb_res of
-              Just _ -> pure Nothing
-              Nothing -> pure Nothing
+        | WildPat{} <- unLoc (strip_par_pat pat) -> pure Nothing
         | otherwise ->
             tryTcDiscardingErrs (pure Nothing) $ do
               ((_, (_, ty)), wanteds) <- captureConstraints $
@@ -8701,47 +8672,38 @@ tcRetainedHigherOrderMotiveInst _rn_head args fun sigma0
                   mb_id <- liftMaybeT (tcLookupIdMaybe nm)
                   case mb_id of
                     Just var | isEmptyNameEnv (idConcreteTvs var) -> do
-                      v_sigma <- liftMaybeT (liftZonkM (zonkTcType (varType var)))
+                      v_sigma <- liftMaybeT (zonkAppTypeIfNeeded (varType var))
                       let (u_tvs, u_theta, u_tau) = tcRetainedInstTelescope v_sigma
                       case coreFullView u_tau of
                         FunTy FTF_T_T _ _ u_in u_out | not (null u_tvs), null u_theta ->
                           match_poly_arrow tvs subst formal f_in f_out u_tvs u_in u_out u_tau
-                        _ | null u_tvs, null u_theta, any isMetaTyVar (tyCoVarsOfTypeList u_tau) -> do
+                        _ | null u_tvs, null u_theta, any isMetaTyVar (tyCoVarsOfTypeList u_tau)
+                          , not (any (`elemVarSet` tyCoVarsOfType f_in) tvs) -> do
                           mb_simple <- liftMaybeT (lookupLocalSimpleFunBind nm)
                           case mb_simple of
-                            Just (Just lpat, rhs_rn) | not (any (`elemVarSet` tyCoVarsOfType f_out) tvs) || not (any (`elemVarSet` tyCoVarsOfType f_in) tvs) -> do
-                              let dom_cand = if not (any (`elemVarSet` tyCoVarsOfType f_in) tvs) then Just f_in else Nothing
-                              case dom_cand of
-                                Just known_in -> do
-                                  let x_id = mkLocalId (unLoc lpat) ManyTy known_in
-                                  mb_r <- liftMaybeT $ tryTcDiscardingErrs (pure Nothing) $
-                                    tcExtendIdEnv1 (unLoc lpat) x_id (tcRetainedConstructorArgType rhs_rn)
-                                  case mb_r of
-                                    Just known_out
-                                      | let act_arrow = mkVisFunTyManyU known_in known_out
-                                      , Just subst' <- matchRetainedAppType tvs subst formal act_arrow
-                                      -> pure subst'
-                                    _ -> pure subst
-                                Nothing -> pure subst
-                            _ -> pure subst
+                            Just (Just lpat, rhs_rn) -> match_known_in_lam tvs subst formal f_in lpat rhs_rn
+                            _                        -> pure subst
                         _ -> pure subst
                     _ -> pure subst
             HsLam _ LamSingle MG { mg_alts = L _ [L _ Match
                 { m_pats = L _ [L _ (VarPat _ lpat)]
                 , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] rhs_rn) NE.:| []
                                   , grhssLocalBinds = L _ EmptyLocalBinds{} } }] }
-              | not (any (`elemVarSet` tyCoVarsOfType f_in) tvs) -> do
-                  let x_id = mkLocalId (unLoc lpat) ManyTy f_in
-                  mb_r <- liftMaybeT $ tryTcDiscardingErrs (pure Nothing) $
-                    tcExtendIdEnv1 (unLoc lpat) x_id (tcRetainedConstructorArgType rhs_rn)
-                  case mb_r of
-                    Just known_out
-                      | let act_arrow = mkVisFunTyManyU f_in known_out
-                      , Just subst' <- matchRetainedAppType tvs subst formal act_arrow
-                      -> pure subst'
-                    _ -> pure subst
+              | not (any (`elemVarSet` tyCoVarsOfType f_in) tvs) ->
+                  match_known_in_lam tvs subst formal f_in lpat rhs_rn
             _ -> pure subst
       | otherwise = pure subst
+
+    match_known_in_lam tvs subst formal known_in lpat rhs_rn = do
+      let x_id = mkLocalId (unLoc lpat) ManyTy known_in
+      mb_r <- liftMaybeT $ tryTcDiscardingErrs (pure Nothing) $
+        tcExtendIdEnv1 (unLoc lpat) x_id (tcRetainedConstructorArgType rhs_rn)
+      case mb_r of
+        Just known_out
+          | let act_arrow = mkVisFunTyManyU known_in known_out
+          , Just subst' <- matchRetainedAppType tvs subst formal act_arrow
+          -> pure subst'
+        _ -> pure subst
 
     match_poly_arrow tvs subst formal f_in f_out u_tvs u_in u_out u_tau = do
       let s_in = if not (any (`elemVarSet` tyCoVarsOfType f_in) tvs)
@@ -8785,8 +8747,7 @@ tcRetainedHigherOrderMotiveInst _rn_head args fun sigma0
           u_choices <- MaybeT (pure (traverse (Subst.lookupTyVar u_subst) u_tvs))
           guard (not (any (`elemVarSet` tyCoVarsOfTypes u_choices) u_tvs))
           let full_u = Subst.zipTvSubst u_tvs u_choices
-          guard (and (zipWith (\tv ty -> eqType (Subst.substTy full_u (tyVarKind tv)) (typeKind ty))
-                              u_tvs u_choices))
+          guard (and (zipWith (substKindAgrees full_u) u_tvs u_choices))
           valid_u <- liftMaybeT (tcRetainedInstScope (v_sigma : u_choices))
           guard valid_u
           let inst_tau = Subst.substTy full_u u_tau
@@ -9068,7 +9029,7 @@ tcRetainedArgInstCachedWith :: Bool -> Maybe Int -> QLFlag -> Maybe TcRhoType ->
                            -> [HsExprArg 'TcpRn] -> HsExpr GhcTc -> TcSigmaType
                            -> TcM (HsExpr GhcTc, TcSigmaType, RetainedArgCache, RetainedInstPlan)
 tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args fun sigma
-  | not (any is_type_arg args)
+  | not (any isETypeArg args)
   , (outer_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let (tvs, theta, tau) = tcRetainedInstTelescope sigma
         nested = length tvs /= length outer_tvs
@@ -9094,13 +9055,13 @@ tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args 
   , equality_continuation || if native_worker
       then hasNoConcreteTyVars fun && isRetainedValueType tau
       else isTauTy tau && not (isFunTy result)
-  = do { expected_ty <- mapM (liftZonkM . zonkTcType) expected
+  = do { expected_ty <- mapM zonkAppTypeIfNeeded expected
        ; seeded_res <- case expected_ty of
            Just rho | can_seed_metas, not overapplied ->
              tcUnifySigmaOrdinaryMetas tvs sigma [(result, rho)]
            _ -> return False
        ; if seeded_res
-         then do { sigma' <- liftZonkM (zonkTcType sigma)
+         then do { sigma' <- zonkAppTypeIfNeeded sigma
                  ; tcRetainedArgInstCachedWith False after_vta NoQL expected_ty rn_head args fun sigma' }
          else do
        { let index_route = not complete_choices && not (null index_tvs)
@@ -9196,7 +9157,7 @@ tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args 
                    (_, domains_cur, result_cur) = splitFunTys tau_cur
                    arguments_cur = zip3 [1..] domains_cur value_args
                    matching_arg_cur = mk_matching_arg native_worker_cur index_route_cur domains_cur
-                   match_indices_cur = tcMatchRetainedIndexArgs (bind_outer tvs_cur)
+                   match_indices_cur = tcMatchRetainedIndexArgs (bindOuterTvs tvs_cur)
                    initial_subst_cur
                      | seeded_args = result_subst expected_ty index_route_cur native_worker_cur tvs_cur result_cur
                      | otherwise   = initial_subst
@@ -9256,7 +9217,7 @@ tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args 
                      || (all isTauTy inst_tys
                          && not (any isMetaTyVar (tyCoVarsOfTypesList inst_tys))
                          && maybe False (eqType (Subst.substTy subst result_cur)) expected_ty)
-                   , and (zipWith (kind_agrees subst) tvs_cur inst_tys)
+                   , and (zipWith (substKindAgrees subst) tvs_cur inst_tys)
                    , all (\(formal, actual) -> eqType (Subst.substTy subst formal) actual) pairs
                    -> do { valid <- tcRetainedInstScope inst_tys
                          ; if valid
@@ -9267,15 +9228,6 @@ tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args 
                            else return (fun, sigma_cur, cache, Nothing) }
                  _ -> return (fun, sigma_cur, cache, Nothing) } } }
   where
-    is_type_arg ETypeArg{} = True
-    is_type_arg _ = False
-
-    bind_outer tvs tv _
-      | tv `elem` tvs = BindMe
-      | otherwise = DontBindMe
-
-    kind_agrees subst tv ty = eqType (Subst.substTy subst (tyVarKind tv)) (typeKind ty)
-
     result_subst expected index_route native_worker tvs result
       | Just expected_ty <- expected
       , native_worker
@@ -9286,16 +9238,14 @@ tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args 
       , not native_worker
       , not index_route
       , exactPackageResult tvs result expected_ty
-      , Just kinds <- tcMatchTyX_BM (bind_outer tvs) Subst.emptySubst
-                                    (typeKind result) (typeKind expected_ty)
-      , Just subst <- tcMatchTyX_BM (bind_outer tvs) kinds result expected_ty
+      , Just subst <- matchOuterTyKi tvs Subst.emptySubst result expected_ty
       = subst
       | Just expected_ty <- expected
       , not native_worker
       , isTauTy expected_ty
       , not index_route || hasNativeDependentExpr (Core.Type expected_ty)
       , Just subst <- matchRetainedAppType tvs Subst.emptySubst result expected_ty
-                      <|> tcMatchTyX_BM (bind_outer tvs) Subst.emptySubst result expected_ty
+                      <|> tcMatchTyX_BM (bindOuterTvs tvs) Subst.emptySubst result expected_ty
       = subst
       | otherwise = Subst.emptySubst
 
@@ -9650,9 +9600,7 @@ tcRetainedMatchArgs tvs = go
                            Nothing -> return Nothing }
                  | otherwise -> return Nothing }
 
-    match = tcMatchTyX_BM bind_outer
-    bind_outer tv _ | tv `elem` tvs = BindMe
-                    | otherwise = DontBindMe
+    match = tcMatchTyX_BM (bindOuterTvs tvs)
     ordinary_head ty = not (hasNativeDependentExpr (Core.Type ty))
                     && not (any (`elemVarSet` tyCoVarsOfType ty) tvs)
     meta_head ty | TyVarTy tv <- coreFullView ty = isMetaTyVar tv
@@ -9703,9 +9651,7 @@ tcRetainedCallbackArgs tvs args subst cache = go subst cache args
                 , Just selected <- matchRetainedAppType callback_tvs Subst.emptySubst formal_input input
                 , Just choices <- traverse (Subst.lookupTyVar selected) callback_tvs
                 , not (any (`elemVarSet` tyCoVarsOfTypes choices) callback_tvs)
-                , and (zipWith (\tv ty ->
-                         eqType (Subst.substTy selected (tyVarKind tv)) (typeKind ty))
-                       callback_tvs choices)
+                , and (zipWith (substKindAgrees selected) callback_tvs choices)
                 , let actual = Subst.substTy selected tau
                 , Subst.substTy selected formal_input `eqType` input
                 , all no_ql_vars (sigma : actual : input : choices)
@@ -9801,8 +9747,7 @@ tcRetainedCallbackArgs tvs args subst cache = go subst cache args
       selected <- liftMaybeT (foldM (tcMatchDeclaredField parameters) initial fields)
       choices <- MaybeT (pure (traverse (Subst.lookupTyVar selected) parameters))
       guard (not (any (`elemVarSet` tyCoVarsOfTypes choices) parameters))
-      guard (and (zipWith (\tv ty -> eqType (Subst.substTy selected (tyVarKind tv)) (typeKind ty))
-                          parameters choices))
+      guard (and (zipWith (substKindAgrees selected) parameters choices))
       let actual_input  = Subst.substTy selected formal_input
           actual_output = Subst.substTy selected formal_output
       guard (all noQuickLookVars (actual_input : actual_output : choices))
@@ -9839,17 +9784,12 @@ tcRetainedCallbackArgs tvs args subst cache = go subst cache args
 
     expose_choice subst tv
       | Just ty <- Subst.lookupTyVar subst tv
-      = do { ty <- liftZonkM (zonkTcType ty)
+      = do { ty <- zonkAppTypeIfNeeded ty
            ; let subst' = Subst.extendSubstInScopeSet subst (tyCoVarsOfType ty)
            ; return (Subst.extendTvSubst subst' tv ty) }
       | otherwise = return subst
 
-    match_type subst formal actual
-      = do { subst <- tcMatchTyX_BM bind_outer subst (typeKind formal) (typeKind actual)
-           ; tcMatchTyX_BM bind_outer subst formal actual }
-
-    bind_outer tv _ | tv `elem` tvs = BindMe
-                    | otherwise = DontBindMe
+    match_type = matchOuterTyKi tvs
 
     -- Keep parentheses and source locations on the cached lambda.
     callback :: LHsExpr GhcRn
@@ -10111,10 +10051,11 @@ rewrite of error. See Note [tcMatchTy vs tcMatchTyKi] in GHC.Core.Unify.
 -- See Note [Native index bindings during typechecking].
 tcRetainedInstScope :: [Type] -> TcM Bool
 tcRetainedInstScope tys
+  | null runtime_ids = return True
+  | otherwise
   = do { local_env <- getLclTypeEnv
        ; global_env <- tcg_type_env <$> getGblEnv
-       ; givens <- getNativeGivens
-       ; givens <- mapM (liftZonkM . zonkId) givens
+       ; givens <- mapM zonkAppIdIfNeeded =<< getNativeGivens
        ; let -- The outer Maybe distinguishes an absent binding from a
              -- present binding of the wrong sort. Only absence permits
              -- the lexical Given fallback.
@@ -10140,8 +10081,8 @@ tcRetainedInstScope tys
              valid_runtime_id v
                | isNativeClassDictionaryId v
                = do { scoped <- getLexicalGivens
-                    ; occurrence <- liftZonkM (zonkId v)
-                    ; actuals <- liftZonkM (mapM zonkId (filter (== v) scoped))
+                    ; occurrence <- zonkAppIdIfNeeded v
+                    ; actuals <- mapM zonkAppIdIfNeeded (filter (== v) scoped)
                     ; return $ case actuals of
                         [actual] -> isNativeClassDictionaryId actual
                                  && varType occurrence `eqType` varType actual
@@ -10151,16 +10092,15 @@ tcRetainedInstScope tys
                     ; return (maybe False (\binding -> binding == v
                                              && isNativeNamedOpaqueFunctionId binding
                                              && varType binding `eqType` varType v) actual) }
-               | not (isNonCoVarId v) = return True
                | otherwise
-               = do { occurrence <- liftZonkM (zonkId v)
+               = do { occurrence <- zonkAppIdIfNeeded v
                     ; case current_binding v of
                         Just (Just (lexical, binding)) ->
-                          do { binding <- liftZonkM (zonkId binding)
+                          do { binding <- zonkAppIdIfNeeded binding
                              ; return (valid_binding lexical occurrence binding) }
                         Just Nothing -> return False
                         Nothing -> do
-                          { prototypes <- mapM (liftZonkM . zonkId)
+                          { prototypes <- mapM zonkAppIdIfNeeded
                                             (filter (== v) given_prototypes)
                           ; return (not (null prototypes)
                                     && all (valid_binding True occurrence) prototypes
@@ -10169,7 +10109,9 @@ tcRetainedInstScope tys
              bad_prototype occurrence prototype
                = isNonCoVarId prototype && prototype == occurrence
                  && not (valid_binding True occurrence prototype)
-       ; and <$> mapM valid_runtime_id (tyCoVarsOfTypesList tys) }
+       ; and <$> mapM valid_runtime_id runtime_ids }
+  where
+    runtime_ids = filter isNonCoVarId (tyCoVarsOfTypesList tys)
 
 {- Note [Native index bindings during typechecking]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -10658,10 +10600,10 @@ expr_to_type earg =
           mb_p <- tcLookupLcl_maybe p_nm
           case (mb_u, mb_p) of
             (Just (ATcId { tct_id = u_id }), Just (ATyVar _ p_tv)) -> do
-              mb_rep <- tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType (varType u_id))
+              mb_rep <- tcTypeRepTarget_maybe (varType u_id)
               case mb_rep of
                 Just (_, target_ty) -> do
-                  p_ty <- liftZonkM (zonkTcType (mkTyVarTy p_tv))
+                  p_ty <- zonkAppTypeIfNeeded (mkTyVarTy p_tv)
                   pure (tcEqType target_ty p_ty)
                 Nothing -> pure False
             _ -> pure False
@@ -10768,8 +10710,7 @@ prepareTypeWitnessArg arg sc_arg_ty@(Scaled mult raw_arg_ty) res_ty = do
   if not dep
     then pure (arg, sc_arg_ty, res_ty)
     else do
-      zonked_arg <- liftZonkM (zonkTcType raw_arg_ty)
-      mb_rep <- tcTypeRepTarget_maybe zonked_arg
+      mb_rep <- tcTypeRepTarget_maybe raw_arg_ty
       case mb_rep of
         Just (kind, target)
           | anyFreeVarsOfType (\v -> isTcTyVar v && isMetaTyVar v) target ->
@@ -10777,28 +10718,27 @@ prepareTypeWitnessArg arg sc_arg_ty@(Scaled mult raw_arg_ty) res_ty = do
               L _ (HsEmbTy _ wc_ty) -> do
                 ty_arg <- tcHsTypeApp wc_ty kind
                 _ <- unifyType Nothing ty_arg target
-                arg_ty' <- liftZonkM (zonkTcType zonked_arg)
-                res_ty' <- liftZonkM (zonkTcType res_ty)
+                arg_ty' <- zonkAppTypeIfNeeded raw_arg_ty
+                res_ty' <- zonkAppTypeIfNeeded res_ty
                 pure (arg, Scaled mult arg_ty', res_ty')
               L _ (HsVar _ lname) -> do
                 let nm = unLocWithUserRdr lname
                 mb_lcl <- tcLookupLcl_maybe nm
                 case mb_lcl of
                   Just (ATcId { tct_id = v }) -> do
-                    v_ty <- liftZonkM (zonkTcType (varType v))
-                    mb_v_rep <- tcTypeRepTarget_maybe v_ty
+                    mb_v_rep <- tcTypeRepTarget_maybe (varType v)
                     case mb_v_rep of
                       Just (_, v_target) -> do
                         _ <- unifyType Nothing v_target target
-                        arg_ty' <- liftZonkM (zonkTcType zonked_arg)
-                        res_ty' <- liftZonkM (zonkTcType res_ty)
+                        arg_ty' <- zonkAppTypeIfNeeded raw_arg_ty
+                        res_ty' <- zonkAppTypeIfNeeded res_ty
                         pure (arg, Scaled mult arg_ty', res_ty')
                       Nothing -> pure (arg, sc_arg_ty, res_ty)
-                  _ -> wrap_unadorned kind target zonked_arg
-              _ -> wrap_unadorned kind target zonked_arg
+                  _ -> wrap_unadorned kind target
+              _ -> wrap_unadorned kind target
         _ -> pure (arg, sc_arg_ty, res_ty)
   where
-    wrap_unadorned kind target zonked_arg = do
+    wrap_unadorned kind target = do
       as_ty <- isUnadornedTypeExpr (unLoc arg)
       if not as_ty
         then pure (arg, sc_arg_ty, res_ty)
@@ -10806,8 +10746,8 @@ prepareTypeWitnessArg arg sc_arg_ty@(Scaled mult raw_arg_ty) res_ty = do
           wc_ty <- expr_to_type_at_kind kind arg
           ty_arg <- tcHsTypeApp wc_ty kind
           _ <- unifyType Nothing ty_arg target
-          arg_ty' <- liftZonkM (zonkTcType zonked_arg)
-          res_ty' <- liftZonkM (zonkTcType res_ty)
+          arg_ty' <- zonkAppTypeIfNeeded raw_arg_ty
+          res_ty' <- zonkAppTypeIfNeeded res_ty
           let loc = getLoc arg
               emb = L loc (mkExpandedLExpr (unLoc arg) (L loc (HsEmbTy noExtField wc_ty)))
           pure (emb, Scaled mult arg_ty', res_ty')
@@ -10818,7 +10758,7 @@ prepareTypeWitnessArg arg sc_arg_ty@(Scaled mult raw_arg_ty) res_ty = do
 expr_to_type_at_kind :: TcKind -> LHsExpr GhcRn -> TcM (LHsWcType GhcRn)
 expr_to_type_at_kind kind earg = do
   puns <- xoptM LangExt.ListTuplePuns
-  kind' <- liftZonkM (zonkTcType kind)
+  kind' <- zonkAppTypeIfNeeded kind
   HsWC wcs hs_ty0 <- expr_to_type earg
   let hs_ty = if puns && tcIsLiftedTypeKind kind'
               then pun_lifted_types hs_ty0
@@ -12038,14 +11978,19 @@ quickLookArg1 pos app_lspan rn_head larg@(L _ arg) sc_arg_ty@(Scaled _ orig_arg_
              result <- tcKnownRetainedConstructorResult rn_args fun sigma orig_arg_rho
              if isJust result then return True else
                case fun of
-                 HsVar{} | all isPlainQuickLookArg rn_args
-                         , let (_, _, tau) = tcRetainedInstTelescope sigma
-                               arity = count isHsValArg rn_args
-                         , takesDirectIndexArgument tau
-                         , isJust (tcRetainedValueResultShape arity tau) -> do
-                   plan <- tcRetainedKnownArgPlan tcRetainedQuickLookArgType Nothing fun sigma rn_args
-                   return (maybe False (\choices -> hasNativeDependentExpr (Core.Type tau)
-                                                 || any (hasNativeDependentExpr . Core.Type) choices) plan)
+                 _ | is_named_or_con fun
+                   , all isPlainQuickLookArg rn_args
+                   , let (tvs, theta, tau) = tcRetainedInstTelescope sigma
+                         arity = count isHsValArg rn_args
+                   , takesDirectIndexArgument tau
+                   , Just res_shape <- tcRetainedValueResultShape arity tau ->
+                   if null theta && hasNativeDependentExpr (Core.Type tau)
+                        && (null tvs || supportsQuickLookType res_shape)
+                     then return True
+                     else do
+                       plan <- tcRetainedKnownArgPlan tcRetainedQuickLookArgType Nothing fun sigma rn_args
+                       return (maybe False (\choices -> hasNativeDependentExpr (Core.Type tau)
+                                                     || any (hasNativeDependentExpr . Core.Type) choices) plan)
                  _ -> return False
            Nothing -> return False
 
@@ -12102,6 +12047,10 @@ quickLookArg1 pos app_lspan rn_head larg@(L _ arg) sc_arg_ty@(Scaled _ orig_arg_
                            , eaql_wanted   = wanted
                            , eaql_encl     = arg_influences_enclosing_call
                            , eaql_res_rho  = app_res_rho }) }}}
+  where
+    is_named_or_con HsVar{}                            = True
+    is_named_or_con (XExpr (ConLikeTc (RealDataCon _))) = True
+    is_named_or_con _                                  = False
 
 {- *********************************************************************
 *                                                                      *

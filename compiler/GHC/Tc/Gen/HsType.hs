@@ -3743,11 +3743,7 @@ tc_app_ty_external mode rn_ty exp_kind
   | otherwise = tc_app_ty_generic mode rn_ty exp_kind
   where
     (hs_fun_ty, hs_args) = splitHsAppTys rn_ty
-    value_args = traverse value_arg (filterOut is_par hs_args)
-    is_par HsArgPar{} = True
-    is_par _          = False
-    value_arg (HsValArg _ arg) = Just arg
-    value_arg _                = Nothing
+    value_args = hsValArgsOnly hs_args
     ordinary_call = isNothing (mode_holes mode) || isJust (mode_complete_type_arg mode)
     ready_partial_call
       | Just (_, RetrySigCalls, _) <- mode_pending_calls mode = True
@@ -4292,20 +4288,26 @@ isOpenTypeOperand = isOpenTypeOperandWith (\(WithUserRdr _ name) -> isTyVarName 
 
 -- | Find a resolved term call or a unary checked family call.
 nestedClosedCall :: LHsType GhcRn -> Maybe (SrcSpan, RdrName, Name, [LHsType GhcRn])
+isHsArgPar :: HsArg p tm ty -> Bool
+isHsArgPar HsArgPar{} = True
+isHsArgPar _          = False
+
+hsValArgsOnly :: [HsArg p tm ty] -> Maybe [tm]
+hsValArgsOnly []                    = Just []
+hsValArgsOnly (HsArgPar{} : rest)   = hsValArgsOnly rest
+hsValArgsOnly (HsValArg _ x : rest) = (x :) <$> hsValArgsOnly rest
+hsValArgsOnly _                     = Nothing
+
 nestedClosedCall arg
   | L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr rdr name))) <- head_ty
   , isExternalName name
-  , Just operands <- traverse val_arg (filterOut is_par args)
+  , Just operands <- hsValArgsOnly args
   , not (null operands)
   , isVarName name || isSourceFamilyName name
   = Just (locA loc, rdr, name, operands)
   | otherwise = Nothing
   where
     (head_ty, args) = splitHsAppTys (unLoc (ignoreParens arg))
-    is_par HsArgPar{} = True
-    is_par _ = False
-    val_arg (HsValArg _ operand) = Just operand
-    val_arg _ = Nothing
 
 -- | Recognize the internal Name selected for a checked source family.
 isSourceFamilyName :: Name -> Bool
@@ -5700,7 +5702,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
            (Just expected, TyConApp tc [])
              | hasInferredMatchability tc
              , isUnsaturatedUserFamily tc []
-             , all is_par orig_hs_args
+             , all isHsArgPar orig_hs_args
              , invisibleBndrCount expected == invisibleBndrCount (typeKind fun)
              -> unsaturatedTypeFamiliesEnabled
            _ -> pure False
@@ -5961,7 +5963,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
           | Specified <- flag
           , TypeLevel <- mode_tyki mode
           , Nothing <- mode_holes mode
-          , HsValArg{} : _ <- dropWhile is_par all_args
+          , HsValArg{} : _ <- dropWhile isHsArgPar all_args
           , substTy subst (tyVarKind tv) `tcEqType` matchabilityTy
           = do { enabled <- unsaturatedTypeFamiliesEnabled
                ; if not enabled
@@ -6043,7 +6045,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
       , isEmptyNameEnv (mode_indices mode)
       , Named (Bndr tv _) <- binder
       , isLiftedTypeKind expected
-      , HsValArg{} : _ <- dropWhile is_par args
+      , HsValArg{} : _ <- dropWhile isHsArgPar args
       , Just (_, next, _) <- tcSplitPiTy_maybe inner
       , not (isInvisiblePiTyBinder next)
       , Just kind_var <- getTyVar_maybe (piTyBinderType next)
@@ -6064,9 +6066,6 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
       HsKindSig _ field sig
         | isPrimKindAnnotation field_kind sig -> check_prim_field level field field_kind
       _ -> tc_check_lhs_type mode arg field_kind
-
-    is_par HsArgPar{} = True
-    is_par _ = False
 
     -- See Note [Omitted matchability in higher-order arguments].
     expects_promoted_callback ty
