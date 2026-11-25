@@ -1059,3 +1059,8 @@ test('NativeParamDependentRecordUpdate',
       extra_files(['NativeParamDependentRecordUpdateProvider.hs',
                    'NativeParamDependentRecordUpdate.hs'])],
      run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
+test('NativeLinearForEachAndExtendedLet',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeLinearForEachAndExtendedLetProvider.hs',
+                   'NativeLinearForEachAndExtendedLet.hs'])],
+     run_command, ['bash NativeLinearForEachAndExtendedLet.sh "{compiler}" "{libdir}"'])

@@ -23,7 +23,8 @@ module GHC.Rename.HsType (
         rnLTyVar, classifyTypeCasePattern, warnPunnedTypeSyntax, warnPunnedTyConSyntax,
 
         rnHsConDeclField, rnRetainedSigType, rnHsSigWcTypeWithSplice,
-        SignatureSpliceSite(..), isInferredForEachBndr,
+        SignatureSpliceSite(..), isInferredForEachBndr, splitForEachBndrModifiers,
+        rnWithRetainedAliases,
 
         -- Precence related stuff
         NegationHandling(..),
@@ -515,25 +516,28 @@ rnRetainedTelescope env rn_body bndrs body
            ; pure (([], body'), fvs) }
     bind_bndrs env (L lb bndr : rest)
       = setSrcSpanA lb $
-        case bndr of
-          HsTvb xb () (HsBndrVar _ (L lv rdr)) mb_kind
+        let (mods, raw_kind) = splitForEachBndrModifiers bndr
+        in case bndr of
+          HsTvb xb () (HsBndrVar _ (L lv rdr)) _
             | Just term_rdr <- retained_binder rdr ->
-            do { (mb_kind', domain_fvs) <- rn_bndr_kind mb_kind
+            do { (mods', mod_fvs) <- mapFvRn (rnModifier env) mods
+               ; (mb_kind', domain_fvs) <- rn_bndr_kind raw_kind
                ; name <- newLocalBndrRn (L lv term_rdr)
                ; let occ = setOccNameSpace tvName (rdrNameOcc rdr)
-                     bndr' = L lb (HsTvb xb () (HsBndrVar noExtField (L lv name)) mb_kind')
+                     bndr' = L lb (rebuildForEachBndr lb xb (HsBndrVar noExtField (L lv name)) mods' mb_kind')
                      env' = env{rtke_splice = rtke_splice env . (bndr' :)}
                ; ((rest', body'), body_fvs) <- bindLocalNamesFV [name] $
                    do { rdr_env <- getLocalRdrEnv
                       ; setLocalRdrEnv (extendLocalRdrEnvWithAlias rdr_env occ name) $
                           bind_bndrs env' rest }
-               ; pure ((bndr' : rest', body'), domain_fvs `plusFN` body_fvs) }
-          HsTvb xb () (HsBndrWildCard hk) mb_kind ->
-            do { (mb_kind', domain_fvs) <- rn_bndr_kind mb_kind
-               ; let bndr' = L lb (HsTvb xb () (HsBndrWildCard hk) mb_kind')
+               ; pure ((bndr' : rest', body'), plusFNs [mod_fvs, domain_fvs, body_fvs]) }
+          HsTvb xb () (HsBndrWildCard hk) _ ->
+            do { (mods', mod_fvs) <- mapFvRn (rnModifier env) mods
+               ; (mb_kind', domain_fvs) <- rn_bndr_kind raw_kind
+               ; let bndr' = L lb (rebuildForEachBndr lb xb (HsBndrWildCard hk) mods' mb_kind')
                      env' = env{rtke_splice = rtke_splice env . (bndr' :)}
                ; ((rest', body'), body_fvs) <- bind_bndrs env' rest
-               ; pure ((bndr' : rest', body'), domain_fvs `plusFN` body_fvs) }
+               ; pure ((bndr' : rest', body'), plusFNs [mod_fvs, domain_fvs, body_fvs]) }
           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedBinderNeedsName
       where
         rn_bndr_kind (HsBndrKind _ domain) = do
@@ -554,8 +558,68 @@ rnRetainedTelescope env rn_body bndrs body
 -- | Test whether an invisible @foreach@ binder was written in braces @{...}@.
 isInferredForEachBndr :: HsTyVarBndr () (GhcPass p) -> Bool
 isInferredForEachBndr b = case atv_tv (tvb_ext b) of
-  EpTok (EpaDelta _ (SameLine 1) _) -> True
+  EpTok (EpaDelta _ (SameLine n) _) -> n == 1 || n == 3 || n == 5
   _                                 -> False
+
+-- | Extract optional multiplicity modifiers and the domain kind from a @foreach@ binder.
+-- See Note [Multiplicity annotations on retained foreach binders].
+splitForEachBndrModifiers
+  :: HsTyVarBndr () (GhcPass p)
+  -> ([LHsModifier (GhcPass p)], HsBndrKind (GhcPass p))
+splitForEachBndrModifiers b = case atv_tv (tvb_ext b) of
+  EpTok (EpaDelta _ (SameLine n) _)
+    | n == 2 || n == 3
+    , HsBndrKind _ (L _ (HsFunTy _ (HsModifiedFunArr _ mods _) dom _)) <- tvb_kind b
+    -> (mods, HsBndrKind noExtField dom)
+    | n == 4 || n == 5
+    , HsBndrKind _ (L _ (HsFunTy _ (HsModifiedFunArr _ mods _) _ _)) <- tvb_kind b
+    -> (mods, HsBndrNoKind noExtField)
+  _ -> ([], tvb_kind b)
+
+-- | Rebuild a @foreach@ binder with optional renamed multiplicity modifiers.
+rebuildForEachBndr
+  :: SrcSpanAnnA
+  -> AnnTyVarBndr
+  -> HsBndrVar GhcRn
+  -> [LHsModifier GhcRn]
+  -> HsBndrKind GhcRn
+  -> HsTyVarBndr () GhcRn
+rebuildForEachBndr _ xb bvar [] mb_kind = HsTvb xb () bvar mb_kind
+rebuildForEachBndr lb xb bvar mods mb_kind =
+  HsTvb (xb { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine tag) []) })
+        () bvar (HsBndrKind noExtField payload)
+  where
+    inferred = case atv_tv xb of
+      EpTok (EpaDelta _ (SameLine n) _) -> n == 1 || n == 3 || n == 5
+      _ -> False
+    unit_ty = noLocA (HsTupleTy noAnn HsBoxedOrConstraintTuple [])
+    arr     = HsModifiedFunArr noExtField mods (HsStandardArr noExtField)
+    (tag, dom) = case mb_kind of
+      HsBndrKind _ k -> (if inferred then 3 else 2, k)
+      HsBndrNoKind _ -> (if inferred then 5 else 4, unit_ty)
+    payload = L lb (HsFunTy noExtField arr dom unit_ty)
+
+{- Note [Multiplicity annotations on retained foreach binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #378 (Section 4.4) and GraD allow multiplicity modifiers on retained
+foreach binders under -XDependentTypes and -XLinearTypes, for example:
+
+  foreach (x %1 :: a) -> b x
+  foreach (x %Many :: a) -> b x
+  foreach (x %m :: a) -> b x
+
+When a binder omits a multiplicity modifier, its runtime Id defaults to ManyTy.
+When a binder carries a modifier, tcCheckRetainedType checks the modifier with
+tc_modifiers_mult and stores the resulting Mult in the DepFunTy binder Id.
+
+Type-level occurrences of x in b x use TermVarTy and consume zero runtime
+multiplicity. Term-level occurrences of x in the function body and at call
+sites use the declared multiplicity of x.
+
+The parser stores binder modifiers inside tvb_kind and records a tag in atv_tv
+so HsTyVarBndr keeps its existing layout. Implicit quantification traverses
+tvb_kind and collects free multiplicity variables such as m above.
+-}
 
 {- Note [Retained Pi type formation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

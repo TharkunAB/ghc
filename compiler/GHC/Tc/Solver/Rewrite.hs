@@ -1394,7 +1394,7 @@ expandedProofSynonyms = go Nothing
       = go env ma1 ma2 ++ go env (varType tv1) (varType tv2)
         ++ go (Just (bind_env env t1 t2 tv1 tv2)) b1 b2
     go env t1@(DepFunTy _ v1 b1) t2@(DepFunTy _ v2 b2)
-      = go env (varType v1) (varType v2)
+      = go env (idMult v1) (idMult v2) ++ go env (varType v1) (varType v2)
         ++ go (Just (bind_env env t1 t2 v1 v2)) b1 b2
     go env t1@(ExistsTy _ tv1 b1) t2@(ExistsTy _ tv2 b2)
       = go env (varType tv1) (varType tv2)

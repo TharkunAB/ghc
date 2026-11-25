@@ -37,7 +37,6 @@ import GHC.Tc.Errors ( reportAllUnsolved )
 import GHC.Tc.Errors.Types
 import GHC.Tc.Types.Constraint ( userTypeError_maybe, mkNonCanonical, wc_simple, wc_impl, ic_wanted, ctPred )
 import GHC.Tc.Utils.TcMType (newEvVars, newWanted, newMetaTyVarsX)
-import GHC.Tc.Types.TH ( ThLevel(Comp) )
 import GHC.Tc.Utils.Env (tcLookupId, tcLookupLcl_maybe, tcExtendIdEnv)
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
@@ -72,7 +71,7 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Types.Error
 import GHC.Types.Basic   ( TypeOrKind(..), UnboxedTupleOrSum(..)
                          , unboxedTupleOrSumExtension )
-import GHC.Types.Id (isNaughtyRecordSelector)
+import GHC.Types.Id (idMult, isNaughtyRecordSelector)
 import GHC.Types.FieldLabel (flSelector)
 import GHC.Types.Name
 import GHC.Types.Name.Env
@@ -81,7 +80,7 @@ import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Var     ( Id, ExistsTyFlag(ImplicitExists), VarBndr(..)
                         , isInvisibleFunArg, isVisibleFunArg, mkTyVar, tyVarName
-                        , isId, isCoVar, varType, setVarType )
+                        , isId, setVarType )
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 import GHC.Types.TyThing ( TyThing(..) )
@@ -1416,6 +1415,7 @@ check_type ve (DepFunTy _ v body)
            failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
        ; unless (typeKind body `eqType` liftedTypeKind) $
            failWithTc $ TcRnRetainedQuantificationError (RetainedResultKind body)
+       ; check_type (ve { ve_rank = arg_rank }) (idMult v)
        ; check_type (ve { ve_rank = arg_rank }) (varType v)
        ; check_type (ve { ve_rank = res_rank
                         , ve_indices = ve_indices ve `extendVarSet` v }) body }

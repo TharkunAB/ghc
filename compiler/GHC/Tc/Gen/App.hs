@@ -2194,7 +2194,7 @@ tcRetainedQuickLookArgType arg
         actual <- liftMaybeT (liftZonkM (zonkId local))
         guard (all noQuickLookVars [varType actual, typeKind (varType actual), idMult actual])
         guard ((isNativeIndexId actual || isNativeOpaqueValueId actual)
-               && isManyTy (idMult actual)
+               && (not (isManyTy (idMult binder)) || isManyTy (idMult actual))
                && varType actual `eqType` varType binder)
         call_result (applyTypeToArgs ty [Core.Var actual]) rest
       FunTy { ft_af = af, ft_res = result } | isVisibleFunArg af ->
@@ -2221,7 +2221,7 @@ tcRetainedQuickLookArgType arg
                    guard (flexible (varType actual) || varType actual `eqType` domain)
                    guard (isManyTy (idMult actual) || isOneTy (idMult actual)
                           || flexible (idMult actual))
-                   (Core.Var checked, _) <- liftMaybeT (tcRetainedArg domain operand)
+                   (Core.Var checked, _) <- liftMaybeT (tcRetainedArgScaled (Scaled (idMult binder) domain) operand)
                    guard (checked == actual && isNativeOpaqueValueId checked)
                    pure checked
         constructor_result (applyTypeToArgs ty [Core.Var value]) rest
@@ -4475,7 +4475,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                             Just (actual, _) -> return actual
                             Nothing -> failWithTc (TcRnRetainedQuantificationError
                                                     (RetainedInvisibleArgument binder)) }
-               ; tcScalingUsage ManyTy record_usage
+               ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
+               ; tcScalingUsage bndr_mult' record_usage
                ; let wrap = mkWpEvApps [EvExpr operand]
                ; go plan fun_orig pos (addArgWrap wrap acc) (applyTypeToArgs fun_ty [operand]) args }
 
@@ -4501,12 +4502,14 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                                      Just (actual, _) -> return actual
                                      Nothing -> failWithTc (TcRnRetainedQuantificationError
                                                              (RetainedInvisibleArgument binder)) }
-                        ; tcScalingUsage ManyTy record_usage
+                        ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
+                        ; tcScalingUsage bndr_mult' record_usage
                         ; let wrap = mkWpEvApps [EvExpr operand]
                         ; go plan fun_orig pos (addArgWrap wrap acc)
                              (applyTypeToArgs fun_ty [operand]) rest_args } }
           _ ->
             do { bndr_ty <- liftZonkM (zonkTcType (varType binder))
+               ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
                ; mb_rep <- tcTypeRepTarget_maybe bndr_ty
                ; case mb_rep of
                    Just (kind, target) ->
@@ -4516,7 +4519,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                         ; body' <- liftZonkM (zonkTcType body)
                         ; let emb_arg = L ctxt (HsEmbTy noExtField hs_ty)
                               checked = ERetainedArg DepFunInvisible ctxt
-                                          (Scaled ManyTy bndr_ty') emb_arg body' Nothing
+                                          (Scaled bndr_mult' bndr_ty') emb_arg body' Nothing
                         ; go plan fun_orig pos (checked : acc) body' rest_args }
                    Nothing ->
                      do { arg <- type_to_retained_expr hs_ty
@@ -4530,7 +4533,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                                     ; return (runtime_arg, res, co) }
                         ; bndr_ty' <- zonkRetainedBinderDomain binder
                         ; let checked = ERetainedArg DepFunInvisible ctxt
-                                          (Scaled ManyTy bndr_ty') runtime_arg res_ty arg_co
+                                          (Scaled bndr_mult' bndr_ty') runtime_arg res_ty arg_co
                         ; go plan fun_orig pos (checked : acc) res_ty rest_args } }
 
     -- See Note [Explicit invisible retained arguments].
@@ -4545,7 +4548,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                        ; co <- retainedVariableCast operand runtime_arg
                        ; return (runtime_arg, res, co) }
            ; bndr_ty' <- zonkRetainedBinderDomain binder
-           ; let checked = ERetainedArg DepFunInvisible loc (Scaled ManyTy bndr_ty')
+           ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
+           ; let checked = ERetainedArg DepFunInvisible loc (Scaled bndr_mult' bndr_ty')
                                         runtime_arg res_ty arg_co
            ; go plan fun_orig pos (checked : acc) res_ty rest_args }
       | otherwise = addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
@@ -4567,7 +4571,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                           Just (actual, _) -> return actual
                           Nothing -> failWithTc (TcRnRetainedQuantificationError
                                                   (RetainedInvisibleArgument binder)) }
-               ; tcScalingUsage ManyTy record_usage
+               ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
+               ; tcScalingUsage bndr_mult' record_usage
                ; let wrap = mkWpEvApps [EvExpr operand]
                ; go plan fun_orig pos (addArgWrap wrap acc) (applyTypeToArgs fun_ty [operand]) args }
 
@@ -4632,7 +4637,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
            ; body_ty <- retainedAppResult fun_ty binder core_arg
            ; arg_co <- retainedVariableCast core_arg runtime_arg
            ; bndr_ty' <- zonkRetainedBinderDomain binder
-           ; let arg' = ERetainedArg DepFunVisible ctxt (Scaled ManyTy bndr_ty') runtime_arg body_ty
+           ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
+           ; let arg' = ERetainedArg DepFunVisible ctxt (Scaled bndr_mult' bndr_ty') runtime_arg body_ty
                                          arg_co
            ; go plan fun_orig (pos + 1) (arg' : acc) body_ty rest_args }
 
@@ -5088,7 +5094,7 @@ tcRetainedOperand :: Id -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr 
 tcRetainedOperand binder body arg = do
   result@(core_arg, _) <- if isNativeIndexFunctionId binder
     then (,arg) <$> tcRetainedFunctionArg domain arg
-    else tcRetainedArg domain arg
+    else tcRetainedArgScaled (Scaled (idMult binder) domain) arg
   case core_arg of
     Core.Var index | isNativeOpaqueValueId index -> return result
     _ | isScopedSelectorReceiver binder body -> setSrcSpanA (getLoc arg) $
@@ -5470,13 +5476,23 @@ evidence. See Note [Wildcards in retained operand domains].
 -- | Resolve a retained argument at its known domain without checking its value.
 -- See Note [Retained argument application].
 tcRetainedArg :: Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedArg = tcRetainedArgWith Core.retainedArgIndex
+tcRetainedArg domain = tcRetainedArgScaled (Scaled ManyTy domain)
+
+-- | Like 'tcRetainedArg', carrying the expected multiplicity of the retained binder.
+tcRetainedArgScaled :: Scaled Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+tcRetainedArgScaled (Scaled expected_mult domain) =
+  tcRetainedArgWithMult expected_mult Core.retainedArgIndex domain
 
 -- | Resolve the operand and check its index at the expected domain.
 -- See Note [Pre-unifying polymorphic retained domains in inference mode].
 tcRetainedArgWith :: (Core.CoreExpr -> Maybe Type) -> Type -> LHsExpr GhcRn
                   -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedArgWith reify domain arg
+tcRetainedArgWith = tcRetainedArgWithMult ManyTy
+
+-- | Resolve the operand at the expected multiplicity and domain.
+tcRetainedArgWithMult :: Mult -> (Core.CoreExpr -> Maybe Type) -> Type -> LHsExpr GhcRn
+                      -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+tcRetainedArgWithMult expected_mult reify domain arg
   = setSrcSpanA (getLoc arg) $
     do { domain <- constructor_domain domain arg
        ; result@(core_arg, _) <- resolve emptyNameEnv domain arg
@@ -5637,19 +5653,24 @@ tcRetainedArgWith reify domain arg
                                           ; liftZonkM (zonkId arg_id) }
                                   _ -> return arg_id
                               ; if isNativeOpaqueValueId (setIdMult arg_id ManyTy)
-                                then do
-                                  { let mult = idMult arg_id
-                                        flexible = case coreFullView mult of
-                                          TyVarTy tv -> isMetaTyVar tv
-                                          _ -> False
-                                  ; unless (isManyTy mult || flexible) $ failWithTc $
-                                      TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
-                                  ; tcSubMult (OccurrenceOf (getName arg_id)) ManyTy mult
-                                  ; arg_id <- liftZonkM (zonkId arg_id)
-                                  ; if isNativeOpaqueValueId arg_id
+                                then if isManyTy expected_mult
+                                  then do
+                                    { let mult = idMult arg_id
+                                          flexible = case coreFullView mult of
+                                            TyVarTy tv -> isMetaTyVar tv
+                                            _ -> False
+                                    ; unless (isManyTy mult || flexible) $ failWithTc $
+                                        TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
+                                    ; tcSubMult (OccurrenceOf (getName arg_id)) ManyTy mult
+                                    ; arg_id <- liftZonkM (zonkId arg_id)
+                                    ; if isNativeOpaqueValueId arg_id && isManyTy (idMult arg_id)
+                                      then (,original) <$> tcRetainedArgVar (lexprCtOrigin original) expected arg_id
+                                      else failWithTc $ TcRnRetainedQuantificationError
+                                             (RetainedIndexMultiplicity (idMult arg_id)) }
+                                  else if isNativeOpaqueValueId arg_id
                                     then (,original) <$> tcRetainedArgVar (lexprCtOrigin original) expected arg_id
                                     else failWithTc $ TcRnRetainedQuantificationError
-                                           (RetainedIndexMultiplicity (idMult arg_id)) }
+                                           (RetainedIndexMultiplicity (idMult arg_id))
                                 else case nameModule_maybe (getName arg_id) of
                                   Just m | isGlobalId arg_id, isInteractiveModule m ->
                                     failWithTc $ TcRnRetainedQuantificationError
@@ -8601,7 +8622,7 @@ tcRetainedInstScope tys
                          && isNativeOpaqueValueId occurrence
                          && isNativeOpaqueValueId binding))
                  && eqType (varType occurrence) (varType binding)
-                 && isManyTy (idMult occurrence) && isManyTy (idMult binding)
+                 && eqType (idMult occurrence) (idMult binding)
              valid_runtime_id v
                | isNativeClassDictionaryId v
                = do { scoped <- getLexicalGivens

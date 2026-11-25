@@ -532,6 +532,7 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1@(DepFunTy vis1 b1 _) _ ty2@(DepFunTy 
   , vis1 == vis2
   , isWanted ev
   , isNativeOpaqueValueId b1, isNativeOpaqueValueId b2
+  , idMult b1 `tcEqType` idMult b2
   , varType b1 `tcEqType` varType b2
   = can_eq_nc_depfun ev eq_rel ty1 ty2 MRefl
 
@@ -541,6 +542,7 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1@(DepFunTy vis1 b1 _) _ ty2@(DepFunTy 
   , vis1 == vis2
   , isWanted ev
   , isNativeIndexId b1, isNativeIndexId b2
+  , idMult b1 `tcEqType` idMult b2
   = do { Reduction co1 normal1 <- rewriteFamilyAxioms (ctEvLoc ev) domain1
        ; Reduction co2 normal2 <- rewriteFamilyAxioms (ctEvLoc ev) domain2
        ; if normal1 `tcEqType` normal2
@@ -1029,12 +1031,13 @@ can_eq_nc_depfun ev eq_rel ty1@(DepFunTy vis1 b1 body1) ty2@(DepFunTy vis2 b2 bo
   | vis1 == vis2
   , CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rws, ctev_loc = loc }) <- ev
   = do { b_ty <- zonkTcType (varType b1)
+       ; b_mult <- zonkTcType (idMult b1)
        ; lhs <- zonkTcType body1
        ; rhs <- zonkTcType body2
        ; domain' <- case domain of
                      MRefl -> return MRefl
                      MCo co -> MCo <$> zonkCo co
-       ; binder <- wrapTcS $ TcM.newSysLocalId (fsLit "retained") ManyTy b_ty
+       ; binder <- wrapTcS $ TcM.newSysLocalId (fsLit "retained") b_mult b_ty
        ; let in_scope = mkInScopeSet $
                           extendVarSet (tyCoVarsOfTypes [ty1,ty2]
                                         `unionVarSet` tyCoVarsOfMCo domain' `unionVarSet` tyCoVarsOfTypes [lhs,rhs,b_ty]) binder

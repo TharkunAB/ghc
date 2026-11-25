@@ -1077,7 +1077,7 @@ mkDepFunTyWithVis :: DepFunTyFlag -> Id -> Type -> Type
 mkDepFunTyWithVis vis b body
   | vis == DepFunInvisible || b `elemVarSet` tyCoVarsOfType body
   = DepFunTy vis b body
-  | otherwise = mkVisFunTyManyU (varType b) body
+  | otherwise = tcMkVisFunTy unmatchableDataConTy (idMult b) (varType b) body
 
 {- Note [Retained function visibility]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2512,7 +2512,7 @@ foldTyCo (TyCoFolder { tcf_view       = view
       = go_ty inst M.<> go_ty dict M.<> go_ty operand M.<> go_ty kind
     go_ty (DepDictTy b body) = go_ty (varType b) M.<> termbinder b (go_ty body)
     go_ty (ExistsTy _ b body) = go_ty (varType b) M.<> tycobinder b (go_ty body)
-    go_ty (DepFunTy _ b body) = go_ty (varType b) M.<> termbinder b (go_ty body)
+    go_ty (DepFunTy _ b body) = go_ty (varType b) M.<> go_ty (idMult b) M.<> termbinder b (go_ty body)
     go_ty (LitTy l)           = lit l
     go_ty (AppTy t1 t2)       = go_ty t1 M.<> go_ty t2
     go_ty (CastTy ty co)      = go_ty ty M.<> go_co co
@@ -2538,7 +2538,7 @@ foldTyCo (TyCoFolder { tcf_view       = view
     go_co (TyConAppCo ro tc args)  = lit ro M.<> lit tc M.<> go_cos args
     go_co (AppCo c1 c2)            = go_co c1 M.<> go_co c2
     go_co (TermAppCo f co)         = termvar f M.<> go_co co
-    go_co (DepFunCo _ _ b domain co) = go_ty (varType b) M.<> go_mco domain M.<> termbinder b (go_co co)
+    go_co (DepFunCo _ _ b domain co) = go_ty (varType b) M.<> go_ty (idMult b) M.<> go_mco domain M.<> termbinder b (go_co co)
     go_co (CoVarCo cv)             = covar cv
     go_co (AxiomCo ax cos)         = lit ax M.<> go_cos cos
     go_co (HoleCo hole)            = cohole hole

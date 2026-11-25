@@ -77,6 +77,7 @@ module GHC.Tc.Gen.HsType (
         tyLitFromOverloadedLit,
         tcTypeRepTarget_maybe,
         tcRetainedAmbientIndices,
+        isLocalTySynLSig, tcWithLocalTySyns,
         drainForgetMTyCons,
 
    ) where
@@ -87,7 +88,7 @@ import Control.Monad.Trans.Class (lift)
 import GHC.Prelude hiding ( head, init, last, tail )
 
 import GHC.Hs
-import GHC.Rename.HsType (isInferredForEachBndr)
+import GHC.Rename.HsType (isInferredForEachBndr, splitForEachBndrModifiers)
 import GHC.Rename.Utils
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
@@ -590,6 +591,7 @@ tcRetainedAmbientIndices invalid_reason hs_ty
                     then return Nothing
                     else do
                       { unless (not (isExternalName name)
+                                && isManyTy (idMult index)
                                 && isNativeOpaqueValueId index) invalid_index
                       ; level <- getThLevel
                       ; case level of
@@ -628,6 +630,76 @@ tcCheckExprSigType :: LHsType GhcRn -> TcKind -> TcM TcType
 tcCheckExprSigType hs_ty kind = do
   indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex hs_ty
   tc_check_lhs_type (typeLevelMode { mode_indices = indices }) hs_ty kind
+
+-- | Test whether an 'LSig' encodes a local @type@ synonym from @-XExtendedLet@.
+isLocalTySynLSig :: LSig GhcRn -> Bool
+isLocalTySynLSig (L _ (TypeSig _ [] [L _ nm] _)) = isTcClsNameSpace (nameNameSpace nm)
+isLocalTySynLSig _ = False
+
+-- | Kind-check topologically sorted local @type@ synonyms from a @let@ or @where@
+-- block and scope them in 'TcLclEnv' over the enclosed bindings and body.
+-- See Note [Local type synonyms in let and where] in GHC.Rename.Bind.
+tcWithLocalTySyns :: [LSig GhcRn] -> TcM a -> TcM a
+tcWithLocalTySyns [] thing_inside = thing_inside
+tcWithLocalTySyns (L loc (TypeSig _ [] [L _ syn_name]
+                    (HsWC { hswc_body = L _ (HsSig { sig_bndrs = HsOuterExplicit { hso_bndrs = tvbs }
+                                                   , sig_body = hs_ty }) })) : rest)
+                  thing_inside
+  = do { entry <- setSrcSpanA loc $ check_one syn_name tvbs hs_ty
+       ; updLclCtxt (tcExtendLocalTypeEnv [(syn_name, entry)]) $
+           tcWithLocalTySyns rest thing_inside }
+  where
+    check_one name [] rhs_hs =
+      do { indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex rhs_hs
+         ; let mode = typeLevelMode { mode_indices = indices }
+         ; (rhs_ty, rhs_kind) <- solveEqualities "tcWithLocalTySyns(0)" $
+                                 tc_infer_lhs_type mode rhs_hs
+         ; rhs_ty'   <- liftZonkM (zonkTcType rhs_ty)
+         ; rhs_kind' <- liftZonkM (zonkTcType rhs_kind)
+         ; pure (ATcTypeLet name rhs_ty' rhs_kind') }
+    check_one name bndrs rhs_hs =
+      do { indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex rhs_hs
+         ; skol_info <- mkSkolemInfo (TyConSkol TypeSynonymFlavour name)
+         ; let mode = typeLevelMode { mode_indices = indices }
+               invis_flags = [ case tvb_flag b of
+                                 InferredSpec  -> True
+                                 SpecifiedSpec -> False
+                             | L _ b <- bndrs ]
+         ; (tc_bndrs0, (rhs_ty0, rhs_kind0)) <-
+             solveEqualities "tcWithLocalTySyns(n)" $
+             tcExplicitTKBndrs skol_info bndrs $
+               tc_infer_lhs_type mode rhs_hs
+         ; (tc_bndrs, rhs_ty, rhs_kind) <- liftZonkM $ do
+             rhs_ty'   <- zonkTcType rhs_ty0
+             rhs_kind' <- zonkTcType rhs_kind0
+             let zonk_bndr (Bndr tv vis) = do
+                   k' <- zonkTcType (tyVarKind tv)
+                   pure (Bndr (setTyVarKind tv k') vis)
+             bndrs' <- mapM zonk_bndr tc_bndrs0
+             pure (bndrs', rhs_ty', rhs_kind')
+         ; let mk_tc_bndrs [] [] = ([], tyCoVarsOfType rhs_kind)
+               mk_tc_bndrs (Bndr tv _ : bs) (is_invis : fs) =
+                 let (rest_tcbs, fvs) = mk_tc_bndrs bs fs
+                     tcb | is_invis           = Bndr tv (NamedTCB Inferred)
+                         | tv `elemVarSet` fvs = Bndr tv (NamedTCB Required)
+                         | otherwise          = Bndr tv AnonTCB
+                     fvs' = (fvs `delVarSet` tv) `unionVarSet` tyCoVarsOfType (tyVarKind tv)
+                 in (tcb : rest_tcbs, fvs')
+               mk_tc_bndrs (Bndr tv _ : bs) [] =
+                 let (rest_tcbs, fvs) = mk_tc_bndrs bs []
+                     tcb | tv `elemVarSet` fvs = Bndr tv (NamedTCB Required)
+                         | otherwise          = Bndr tv AnonTCB
+                     fvs' = (fvs `delVarSet` tv) `unionVarSet` tyCoVarsOfType (tyVarKind tv)
+                 in (tcb : rest_tcbs, fvs')
+               mk_tc_bndrs [] (_ : _) = ([], tyCoVarsOfType rhs_kind)
+               -- Any extra implicit kind binders added by tcExplicitTKBndrs precede bndrs.
+               extra_invis = replicate (length tc_bndrs - length invis_flags) True
+               (tycon_bndrs, _) = mk_tc_bndrs tc_bndrs (extra_invis ++ invis_flags)
+               full_kind = mkTyConKind tycon_bndrs rhs_kind
+               roles     = map (const Nominal) tycon_bndrs
+               syn_tc    = buildSynTyCon name full_kind tycon_bndrs rhs_kind roles rhs_ty
+         ; pure (AGlobal (ATyCon syn_tc)) }
+tcWithLocalTySyns (_ : rest) thing_inside = tcWithLocalTySyns rest thing_inside
 
 -- | Check a `type (...)` expression RHS for a Type-valued source equation.
 tcCheckEmbeddedType :: LHsWcType GhcRn -> TcM Type
@@ -797,62 +869,71 @@ tcCheckRetainedType allow_function witness_skol = go
           = setSrcSpanA lb $
             let inferred = not visible && isInferredForEachBndr bndr
                 mark_id  = if inferred then markInferredRetainedBinder else id
+                (bndr_mods, raw_kind) = splitForEachBndrModifiers bndr
+                tc_bndr_mult = case bndr_mods of
+                  [] -> pure ManyTy
+                  _  -> do { mb_mult <- tc_modifiers_mult mode bndr_mods
+                           ; maybe (pure ManyTy) (liftZonkM . zonkTcType) mb_mult }
                 check_not_fun domain_ty =
                   when (not allow_function && isFunTy domain_ty) $
                     failWithTc $ TcRnRetainedQuantificationError $
                       if mode_complete_type_arg mode == Just False
                       then RetainedPartialTypeArgument
                       else RetainedFunctionSignature
-                mk_type_witness skol chosen_name mb_name body_ty =
+                mk_type_witness bndr_mult skol chosen_name mb_name body_ty =
                   do { tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName chosen_name)))
                      ; tv <- newSkolemTyVar skol tv_name liftedTypeKind
                      ; selector <- tcLookupKnownOccId typeRepIdOcc
                      ; let (_, rep_ty) = tcSplitPhiTy $
                              piResultTys (varType selector) [liftedTypeKind, mkTyVarTy tv]
                      ; body_ty' <- body_ty tv
-                     ; let fun_ty | visible = tcMkVisFunTy unmatchableDataConTy ManyTy rep_ty body_ty'
+                     ; let fun_ty | visible = tcMkVisFunTy unmatchableDataConTy bndr_mult rep_ty body_ty'
                                   | otherwise = mkDepFunTyWithVis DepFunInvisible
-                                                  (mark_id (mkLocalId chosen_name ManyTy rep_ty)) body_ty'
+                                                  (mark_id (mkLocalId chosen_name bndr_mult rep_ty)) body_ty'
                      ; _ <- pure mb_name
                      ; return (mkInfForAllTy unmatchableDataConTy tv fun_ty) }
-            in case bndr of
-              HsTvb _ () (HsBndrVar _ (L _ name)) (HsBndrKind _ domain) ->
-                do { domain_ty <- tcRetainedBinderDomain valid_domain mode domain
+            in case (tvb_var bndr, raw_kind) of
+              (HsBndrVar _ (L _ name), HsBndrKind _ domain) ->
+                do { bndr_mult <- tc_bndr_mult
+                   ; domain_ty <- tcRetainedBinderDomain valid_domain mode domain
                    ; case witness_skol of
                        Just skol | isLiftedTypeKind domain_ty ->
                          -- See Note [Explicit retained Type witnesses].
-                         mk_type_witness skol name (Just name) $ \tv ->
+                         mk_type_witness bndr_mult skol name (Just name) $ \tv ->
                            tcExtendNameTyVarEnv [(name, tv)] (check_bndrs mode rest)
                        _ ->
                          do { check_not_fun domain_ty
-                            ; let index = mark_id (mkLocalId name ManyTy domain_ty)
+                            ; let index = mark_id (mkLocalId name bndr_mult domain_ty)
                                   mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name index }
                             ; body_ty <- check_bndrs mode' rest
                             ; return (mkDepFunTyWithVis (hsForEachVisibility ann) index body_ty) } }
-              HsTvb _ () (HsBndrWildCard _) (HsBndrKind _ domain)
+              (HsBndrWildCard _, HsBndrKind _ domain)
                 | visible ->
-                    do { domain_ty <- tc_check_lhs_type mode domain liftedTypeKind >>= liftZonkM . zonkTcType
+                    do { bndr_mult <- tc_bndr_mult
+                       ; domain_ty <- tc_check_lhs_type mode domain liftedTypeKind >>= liftZonkM . zonkTcType
                        ; case witness_skol of
                            Just skol | isLiftedTypeKind domain_ty ->
                              do { chosen <- newSysName (mkVarOcc "_")
-                                ; mk_type_witness skol chosen Nothing $ \_ -> check_bndrs mode rest }
+                                ; mk_type_witness bndr_mult skol chosen Nothing $ \_ -> check_bndrs mode rest }
                            _ ->
                              do { body_ty <- check_bndrs mode rest
-                                ; return (tcMkVisFunTy unmatchableDataConTy ManyTy domain_ty body_ty) } }
+                                ; return (tcMkVisFunTy unmatchableDataConTy bndr_mult domain_ty body_ty) } }
                 | otherwise ->
-                    do { domain_ty <- tcRetainedBinderDomain valid_domain mode domain
+                    do { bndr_mult <- tc_bndr_mult
+                       ; domain_ty <- tcRetainedBinderDomain valid_domain mode domain
                        ; chosen <- newSysName (mkVarOcc "_")
                        ; case witness_skol of
                            Just skol | isLiftedTypeKind domain_ty ->
-                             mk_type_witness skol chosen Nothing $ \_ -> check_bndrs mode rest
+                             mk_type_witness bndr_mult skol chosen Nothing $ \_ -> check_bndrs mode rest
                            _ ->
                              do { check_not_fun domain_ty
                                 ; body_ty <- check_bndrs mode rest
-                                ; let index = mark_id (mkLocalId chosen ManyTy domain_ty)
+                                ; let index = mark_id (mkLocalId chosen bndr_mult domain_ty)
                                 ; return (mkDepFunTyWithVis DepFunInvisible index body_ty) } }
-              HsTvb _ () (HsBndrVar _ (L _ name)) (HsBndrNoKind _) ->
-                do { domain_meta <- newFlexiTyVarTy liftedTypeKind
-                   ; let temp_index = mark_id (mkLocalId name ManyTy domain_meta)
+              (HsBndrVar _ (L _ name), HsBndrNoKind _) ->
+                do { bndr_mult <- tc_bndr_mult
+                   ; domain_meta <- newFlexiTyVarTy liftedTypeKind
+                   ; let temp_index = mark_id (mkLocalId name bndr_mult domain_meta)
                          mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name temp_index }
                    ; raw_body_ty <- check_bndrs mode' rest
                    ; domain_ty0 <- liftZonkM (zonkTcType domain_meta)
@@ -866,22 +947,24 @@ tcCheckRetainedType allow_function witness_skol = go
                                                 (RetainedUnsupportedDomain ty)
                                           ; pure ty }
                    ; body_ty0 <- liftZonkM (zonkTcType raw_body_ty)
+                   ; bndr_mult' <- liftZonkM (zonkTcType bndr_mult)
                    ; case witness_skol of
                        Just skol | isLiftedTypeKind domain_ty ->
-                         mk_type_witness skol name (Just name) $ \tv ->
+                         mk_type_witness bndr_mult' skol name (Just name) $ \tv ->
                            pure (replaceTermVarInType temp_index (mkTyVarTy tv) body_ty0)
                        _ ->
                          do { check_not_fun domain_ty
-                            ; let index = mark_id (mkLocalId name ManyTy domain_ty)
+                            ; let index = mark_id (mkLocalId name bndr_mult' domain_ty)
                                   body_ty = replaceTermVarInType temp_index (TermVarTy index) body_ty0
                             ; return (mkDepFunTyWithVis (hsForEachVisibility ann) index body_ty) } }
-              HsTvb _ () (HsBndrWildCard _) (HsBndrNoKind _) ->
-                case witness_skol of
-                  Just skol ->
-                    do { chosen <- newSysName (mkVarOcc "_")
-                       ; mk_type_witness skol chosen Nothing $ \_ -> check_bndrs mode rest }
-                  Nothing ->
-                    failWithTc $ TcRnRetainedQuantificationError (RetainedUnsupportedDomain liftedTypeKind)
+              (HsBndrWildCard _, HsBndrNoKind _) ->
+                do { bndr_mult <- tc_bndr_mult
+                   ; case witness_skol of
+                       Just skol ->
+                         do { chosen <- newSysName (mkVarOcc "_")
+                            ; mk_type_witness bndr_mult skol chosen Nothing $ \_ -> check_bndrs mode rest }
+                       Nothing ->
+                         failWithTc $ TcRnRetainedQuantificationError (RetainedUnsupportedDomain liftedTypeKind) }
 
         default_unannotated_domain :: TcType -> TcM TcType
         default_unannotated_domain domain_ty0
@@ -5762,11 +5845,11 @@ mkAppTyM subst fun ki_binder arg
        ; let subst' = case ki_binder of
                         Anon {}           -> subst
                         Named (Bndr tv _) -> extendTvSubstAndInScope subst tv arg'
-       ; return (subst', mkTyConApp tc (args' ++ [arg'])) }
+       ; return (subst', expandLocalSynApp (mkTyConApp tc (args' ++ [arg']))) }
 
 
 mkAppTyM subst fun (Anon {}) arg
-   = return (subst, mk_app_ty fun arg)
+   = return (subst, expandLocalSynApp (mk_app_ty fun arg))
 
 mkAppTyM subst fun (Named (Bndr tv _)) arg
   = do { arg' <- if isTrickyTvBinder tv
@@ -5774,7 +5857,16 @@ mkAppTyM subst fun (Named (Bndr tv _)) arg
                       liftZonkM $ zonkTcType arg
                  else return     arg
        ; return ( extendTvSubstAndInScope subst tv arg'
-                , mk_app_ty fun arg' ) }
+                , expandLocalSynApp (mk_app_ty fun arg') ) }
+
+-- | Expand a saturated local @type@ synonym application immediately so no
+-- internal 'SynonymTyCon' escapes 'GHC.Tc.Gen.HsType'.
+expandLocalSynApp :: TcType -> TcType
+expandLocalSynApp ty@(TyConApp tc _)
+  | isTypeSynonymTyCon tc, isInternalName (tyConName tc)
+  , Just rhs <- coreView ty
+  = rhs
+expandLocalSynApp ty = ty
 
 mk_app_ty :: TcType -> TcType -> TcType
 -- This function just adds an ASSERT for mkAppTyM's precondition
@@ -5967,7 +6059,16 @@ checkExpectedKind mode hs_ty ty act_kind exp_kind
               , text "act_kind':" <+> ppr act_kind'
               , text "exp_kind:" <+> ppr exp_kind ]
 
-       ; let res_ty = ty `mkAppTys` new_args
+       ; let res_ty = expandLocalSynApp (ty `mkAppTys` new_args)
+       ; case res_ty of
+           TyConApp tc args
+             | isTypeSynonymTyCon tc, isInternalName (tyConName tc)
+             , args `lengthLessThan` tyConArity tc
+             -> let tc_bndrs = tyConBinders tc
+                    vis_req  = count isVisibleTyConBinder tc_bndrs
+                    vis_got  = count (isVisibleTyConBinder . fst) (zip tc_bndrs args)
+                in failWithTc (TcRnArityMismatch (ATyCon tc) vis_req vis_got)
+           _ -> pure ()
 
        ; if act_kind' `tcEqType` exp_kind
          then return res_ty  -- This is very common
@@ -6450,6 +6551,8 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
            -- An ordinary module can import a synonym for a checked computation.
            -- See Note [Source table dependency closure] in GHC.Tc.Module.
            AGlobal (ATyCon tc)
+             | isInternalName (tyConName tc)
+             -> return (mkTyConTy tc, tyConKind tc)
              | Just rhs <- synTyConRhs_maybe tc
              -> do { sourceTableTypeUses rhs
                    ; recordSourceProofAliasUse (mode_source_proof_owner mode) tc

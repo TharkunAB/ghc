@@ -1748,7 +1748,7 @@ lintValApp arg fun_ty arg_ty fun_ue arg_ue
        ; lintRetainedArgument b res_ty arg
        ; in_scope <- getInScope
        ; let subst = Subst in_scope (unitVarEnv b arg) emptyVarEnv emptyVarEnv
-       ; return (substTy subst res_ty, addUE fun_ue (scaleUE ManyTy arg_ue)) }
+       ; return (substTy subst res_ty, addUE fun_ue (scaleUE (idMult b) arg_ue)) }
     -- See Note [Linting retained constructor fields].
   | Just (_, _, w, arg_ty', res_ty') <- splitFunTy_maybe fun_ty
   = do { ensureEqTys arg_ty' arg_ty (mkAppMsg arg_ty' arg_ty arg)
@@ -2101,7 +2101,7 @@ lintCoreAlt scrut_index case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt (DataAlt 
           ; multiplicities = constructorMults con_payload_ty
           ; constructorMults ty = case coreFullView ty of
               ForAllTy _ _ body -> ManyTy : constructorMults body
-              DepFunTy _ _ body -> ManyTy : constructorMults body
+              DepFunTy _ b body -> idMult b : constructorMults body
               FunTy { ft_mult = mult, ft_res = body }
                               -> mult : constructorMults body
               _               -> [] }
@@ -2756,9 +2756,9 @@ lintApp msg lint_forall_arg lint_arrow_arg runtime_arg !orig_fun_ty all_args acc
                  = case runtime_arg of
                      Nothing -> failWithL (text "Retained runtime binder in a type application")
                      Just to_core -> do
-                       { (arg_ty, acc') <- lint_arrow_arg arg ManyTy acc
-                       ; let b' = updateIdTypeAndMult (substTy subst) b
+                       { let b' = updateIdTypeAndMult (substTy subst) b
                              -- See Note [Pending substitutions in retained applications].
+                       ; (arg_ty, acc') <- lint_arrow_arg arg (idMult b') acc
                        ; ensureEqTys (varType b') arg_ty
                            (text "Retained runtime argument has the wrong type:" <+> ppr arg)
                        ; let arg_expr = to_core arg

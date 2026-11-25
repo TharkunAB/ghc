@@ -1434,7 +1434,8 @@ collect_cand_qtvs orig_ty is_dep cur_lvl bound dvs ty
         -- The Id is rigid. Only its type can contain quantification candidates.
     go dv (DepFunTy _ v ty)
       = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
-           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` v) dv1 ty }
+           ; dv2 <- collect_cand_qtvs orig_ty True cur_lvl bound dv1 (idMult v)
+           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` v) dv2 ty }
     go dv (ExistsTy _ v ty)
       = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
            ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` v) dv1 ty }
@@ -1537,8 +1538,9 @@ collect_cand_qtvs_co orig_ty cur_lvl bound = go_co
            ; go_co dv1 co }
     go_co dv (DepFunCo _ _ v domain co)
       = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
-           ; dv2 <- go_mco dv1 domain
-           ; collect_cand_qtvs_co orig_ty cur_lvl (bound `extendVarSet` v) dv2 co }
+           ; dv2 <- collect_cand_qtvs orig_ty True cur_lvl bound dv1 (idMult v)
+           ; dv3 <- go_mco dv2 domain
+           ; collect_cand_qtvs_co orig_ty cur_lvl (bound `extendVarSet` v) dv3 co }
     go_co dv (Refl ty)               = collect_cand_qtvs orig_ty True cur_lvl bound dv ty
     go_co dv (GRefl _ ty mco)        = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv ty
                                           ; go_mco dv1 mco }

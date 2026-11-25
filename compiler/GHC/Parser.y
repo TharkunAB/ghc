@@ -1922,7 +1922,7 @@ where_inst :: { Located ((EpToken "where", AnnList)
 -- Declarations in binding groups other than classes and instances
 --
 decls   :: { Located (EpaLocation, [EpToken ";"], OrdList (LHsDecl GhcPs)) }
-        : decls ';' decl    {% if isNilOL (thdOf3 $ unLoc $1)
+        : decls ';' decl_bind {% if isNilOL (thdOf3 $ unLoc $1)
                                  then return (sLL $2 $> (glR $3, (sndOf3 $ unLoc $1) ++ (msemiA $2)
                                                         , unitOL $3))
                                  else case (thdOf3 $ unLoc $1) of
@@ -1940,8 +1940,12 @@ decls   :: { Located (EpaLocation, [EpToken ";"], OrdList (LHsDecl GhcPs)) }
                                     SnocOL hs t -> do
                                        t' <- addTrailingSemiA t (epTok $2)
                                        return (sLZ $1 $> (glEEz $1 $2, sndOf3 $ unLoc $1, snocOL hs t')) }
-        | decl                          { sL1 $1 (glR $1,  [], unitOL $1) }
+        | decl_bind                     { sL1 $1 (glR $1,  [], unitOL $1) }
         | {- empty -}                   { noLoc (noAnn, [],nilOL) }
+
+decl_bind :: { LHsDecl GhcPs }
+        : decl                  { $1 }
+        | 'type' type '=' ktype {% liftM mkTyClD (mkTySynonym (comb2 $1 $4) $2 $4 (epTok $1) (epTok $3)) }
 
 decllist :: { Located (AnnList,Located (OrdList (LHsDecl GhcPs))) }
         : '{'            decls '}'     { sLL $1 $> (AnnList AnnListBraces (ListBraces (epTok $1) (epTok $3)) (sndOf3 $ unLoc $2)
@@ -2305,7 +2309,7 @@ ctype   :: { LHsType GhcPs }
                                                          , hst_body = $2 } }
         | 'exists' tv_bndrs1 exists_separator ctype
                                      {% mkHsExistsTelescope $1 $2 $3 $4 }
-        | 'foreach' tv_bndrs foreach_separator ctype
+        | 'foreach' foreach_bndrs foreach_separator ctype
                                      {% do { bndrs <- checkForEachBndrs $3 $2
                                            ; amsA' (sLL $1 $> $
                                                HsForEachTy { hst_xforeach = (epTok $1, $3)
@@ -2627,6 +2631,58 @@ some_separator :: { EpToken "|" }
 foreach_separator :: { Either TokRarrow (EpToken ".") }
          : '->' { Left (epUniTok $1) }
          | '.'  { Right (epTok $1) }
+
+foreach_bndrs :: { [LHsTyVarBndr Specificity GhcPs] }
+         : foreach_bndr_group foreach_bndrs { $1 ++ $2 }
+         | {- empty -}                      { [] }
+
+foreach_bndr_group :: { [LHsTyVarBndr Specificity GhcPs] }
+         : foreach_bndr                     { [$1] }
+         | '(' tyvar_wc tyvar_wcs1 '::' kind ')'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = SpecifiedSpec
+                         , tvb_var  = unLoc v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+         | '(' tyvar_wc tyvar_wcs1 modifiers1 '::' kind ')'
+             {% do { hintLinear (getLoc $4)
+                   ; mapM (\v -> mkModifiedForEachBndr (getLoc v) [] [] SpecifiedSpec
+                                   (unLoc v) $4 (Just (noAnn, $6)))
+                          ($2 : $3) } }
+         | '{' tyvar tyvars1 '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrNoKind noExtField })))
+                ($2 : $3) }
+         | '{' tyvar tyvars1 '::' kind '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+
+foreach_bndr :: { LHsTyVarBndr Specificity GhcPs }
+         : tv_bndr                          { $1 }
+         | '(' tyvar_wc modifiers1 '::' kind ')'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $6] SpecifiedSpec
+                       (unLoc $2) $3 (Just (epUniTok $4, $5)) } }
+         | '(' tyvar_wc modifiers1 ')'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $4] SpecifiedSpec
+                       (unLoc $2) $3 Nothing } }
+         | '{' tyvar modifiers1 '::' kind '}'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $6] InferredSpec
+                       (HsBndrVar noExtField $2) $3 (Just (epUniTok $4, $5)) } }
+         | '{' tyvar modifiers1 '}'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $4] InferredSpec
+                       (HsBndrVar noExtField $2) $3 Nothing } }
 
 tv_bndr :: { LHsTyVarBndr Specificity GhcPs }
         : tv_bndr_no_braces             { $1 }
@@ -3134,7 +3190,7 @@ infixexp2 :: { ECP }
                                 { ECP $
                                   unECP $2 >>= \ $2 ->
                                   mkHsForallPV (comb2 $1 $>) (unLoc $1) $2 }
-        | 'foreach' tv_bndrs foreach_separator ctype
+        | 'foreach' foreach_bndrs foreach_separator ctype
                                 {% do { bndrs <- checkForEachBndrs $3 $2
                                       ; ty <- amsA' (sLL $1 $> $
                                           HsForEachTy { hst_xforeach = (epTok $1, $3)
@@ -5017,6 +5073,30 @@ fromTrailingN :: SrcSpanAnnN -> SrcSpanAnnA
 fromTrailingN (EpAnn anc ann cs)
     = EpAnn anc (nann_trailing ann) cs
 
+-- | Build a @foreach@ binder carrying multiplicity modifiers without changing
+-- the 'HsTyVarBndr' constructor layout.
+-- See Note [Multiplicity annotations on retained foreach binders] in GHC.Rename.HsType.
+mkModifiedForEachBndr :: SrcSpan
+                      -> [EpaLocation] -> [EpaLocation]
+                      -> Specificity
+                      -> HsBndrVar GhcPs
+                      -> Located [LHsModifier GhcPs]
+                      -> Maybe (TokDcolon, LHsKind GhcPs)
+                      -> P (LHsTyVarBndr Specificity GhcPs)
+mkModifiedForEachBndr span opens closes spec bvar mods mb_kind =
+  amsA' $ L (noAnnSrcSpan span) $
+    HsTvb { tvb_ext  = AnnTyVarBndr opens closes (EpTok (EpaDelta noSrcSpan (SameLine tag) [])) dcol
+          , tvb_flag = spec
+          , tvb_var  = bvar
+          , tvb_kind = HsBndrKind noExtField payload }
+  where
+    unit_ty = noLocA (HsTupleTy noAnn HsBoxedOrConstraintTuple [])
+    arr     = HsModifiedFunArr noExtField (reverse (unLoc mods)) (HsStandardArr (EpColon noAnn))
+    (tag, dcol, dom) = case mb_kind of
+      Just (dc, k) -> (if spec == InferredSpec then 3 else 2, dc, k)
+      Nothing      -> (if spec == InferredSpec then 5 else 4, noAnn, unit_ty)
+    payload = L (noAnnSrcSpan span) (HsFunTy noExtField arr dom unit_ty)
+
 -- | Validate specificity annotations on a parsed @foreach@ binder list.
 -- Reject @InferredSpec@ braces on visible @foreach ->@ telescopes, and record
 -- @InferredSpec@ in @atv_tv@ on invisible @foreach .@ binders.
@@ -5026,9 +5106,11 @@ checkForEachBndrs :: Either TokRarrow (EpToken ".")
                   -> P [LHsTyVarBndr () GhcPs]
 checkForEachBndrs (Left _)  bndrs = fromSpecTyVarBndrs bndrs
 checkForEachBndrs (Right _) bndrs = pure
-  [ L loc (b { tvb_ext  = case tvb_flag b of
-                            InferredSpec  -> (tvb_ext b) { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine 1) []) }
-                            SpecifiedSpec -> (tvb_ext b) { atv_tv = noEpTok }
+  [ L loc (b { tvb_ext  = case atv_tv (tvb_ext b) of
+                            EpTok (EpaDelta _ (SameLine n) _) | n >= 2 -> tvb_ext b
+                            _ -> case tvb_flag b of
+                              InferredSpec  -> (tvb_ext b) { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine 1) []) }
+                              SpecifiedSpec -> (tvb_ext b) { atv_tv = noEpTok }
              , tvb_flag = () })
   | L loc b <- bndrs ]
 

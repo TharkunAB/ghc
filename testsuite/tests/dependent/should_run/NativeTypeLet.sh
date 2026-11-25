@@ -348,7 +348,7 @@ cat >Disabled.hs <<'HS'
 module Disabled where
 type Bad = let b = Bool in Maybe b
 HS
-reject Disabled 3:12 29822 'requires -XExperimentalDependentTypes.'
+reject Disabled 3:12 29822 'requires -XDependentTypes'
 grep -Eq '^[[:space:]]*\|[[:space:]]*\^\^\^$' error.log
 
 cat >DisabledGroup.hs <<'HS'
@@ -356,7 +356,7 @@ cat >DisabledGroup.hs <<'HS'
 module DisabledGroup where
 type Bad = let { a = Bool; b = Maybe a } in b
 HS
-reject DisabledGroup 3:12 29822 'requires -XExperimentalDependentTypes.'
+reject DisabledGroup 3:12 29822 'requires -XDependentTypes'
 grep -Eq '^[[:space:]]*\|[[:space:]]*\^\^\^$' error.log
 
 cat >UnusedInvalid.hs <<'HS'

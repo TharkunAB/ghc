@@ -281,7 +281,11 @@ debug_ppr_ty prec (DepFunTy vis var res)
       DepFunVisible   -> sep [binder, arrow <+> body]
       DepFunInvisible -> sep [binder <> dot, body]
   where
-    binder = text "foreach" <+> parens (ppr var <+> dcolon <+> debug_ppr_ty topPrec (varType var))
+    mult_doc = case idMult var of
+      ManyTy -> empty
+      OneTy  -> text "%1"
+      m      -> char '%' <> debug_ppr_ty appPrec m
+    binder = text "foreach" <+> parens (ppr var <+> mult_doc <+> dcolon <+> debug_ppr_ty topPrec (varType var))
     body = debug_ppr_ty topPrec res
 
 debug_ppr_ty prec (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult, ft_arg = arg, ft_res = res })

@@ -17,7 +17,7 @@ module GHC.Tc.Gen.Pat
    , tcMatchPats, tcMatchPatsWithIndex
    , implicitPayloadType, matchesImplicitPayloadPat
    , bindRetainedConFields, isRetainedVarPat
-   , tcRetainedCon, retainedConPat, retainedConIndex, bindRetainedWildcard
+   , tcRetainedCon, tcRetainedConScaled, retainedConPat, retainedConIndex, bindRetainedWildcard
    , tyPatToRetainedPat
    , addDataConStupidTheta
    , zipPatsBndrs, zipConPatsBndrs
@@ -1595,8 +1595,12 @@ retainedConIndex domain con fields
 -- | Resolve an index constructor and instantiate its bare runtime field types.
 -- See Note [Parameterized retained constructor patterns].
 tcRetainedCon :: Type -> LPat GhcRn -> TcM (Maybe (DataCon, [Id]))
-tcRetainedCon domain source_pat
-  | L _ (ParPat _ pat) <- source_pat = tcRetainedCon domain pat
+tcRetainedCon domain = tcRetainedConScaled (Scaled ManyTy domain)
+
+-- | Like 'tcRetainedCon', scaling field multiplicities by the scrutinee multiplicity.
+tcRetainedConScaled :: Scaled Type -> LPat GhcRn -> TcM (Maybe (DataCon, [Id]))
+tcRetainedConScaled sdom@(Scaled scrut_mult domain) source_pat
+  | L _ (ParPat _ pat) <- source_pat = tcRetainedConScaled sdom pat
   | otherwise = case unLoc (retainedConPat source_pat) of
       ConPat { pat_con = L _ name, pat_args = PrefixCon _ pats } ->
         do { lazy_tuple <- case unLoc source_pat of
@@ -1629,9 +1633,10 @@ tcRetainedCon domain source_pat
            ; return (Just (con, fields)) }
       | otherwise = return Nothing
 
-    field (L loc (VarPat _ (L _ name))) (Scaled _ ty)
-      = setSrcSpanA loc $ return (mkLocalId name ManyTy ty)
-    field (L _ WildPat{}) (Scaled _ ty) = newSysLocalId (fsLit "_") ManyTy ty
+    field (L loc (VarPat _ (L _ name))) (Scaled fmult ty)
+      = setSrcSpanA loc $ return (mkLocalId name (mkMultMul scrut_mult fmult) ty)
+    field (L _ WildPat{}) (Scaled fmult ty)
+      = newSysLocalId (fsLit "_") (mkMultMul scrut_mult fmult) ty
     field (L loc _) _
       = setSrcSpanA loc $
         failWithTc (TcRnRetainedQuantificationError RetainedConstructorArguments)
