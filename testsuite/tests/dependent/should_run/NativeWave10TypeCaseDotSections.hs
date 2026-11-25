@@ -181,6 +181,7 @@ checkSections =
 --------------------------------------------------------------------------------
 
 data FlipBool = FlipBool Bool
+  deriving Eq
 
 instance Choose FlipBool where
   choose (FlipBool b) = not b
@@ -190,6 +191,9 @@ instance SubChoose FlipBool where
 
 instance SubSubChoose FlipBool where
   subSubLabel (FlipBool b) = if b then 20 else 30
+
+localSubTagged :: forall a. (Eq a, SubChoose a) => foreach (x :: a) -> Tagged (choose x)
+localSubTagged x = tagBool (choose x)
 
 observeSub :: SubChoose a => a -> (Bool, Int)
 observeSub x = case chooseTagged x of
@@ -207,16 +211,39 @@ observeSubSub :: SubSubChoose a => a -> (Bool, Int)
 observeSubSub x = case chooseTagged x of
   Tagged v -> (v, subSubLabel x)
 
+observeSubTaggedPoly :: forall a. SubChoose a => foreach (x :: a) -> (Bool, Int)
+observeSubTaggedPoly x = case subTagged x of
+  Tagged v -> (v, subLabel x)
+
+observeSubTaggedFromSubSub :: forall a. SubSubChoose a => foreach (x :: a) -> (Bool, Int)
+observeSubTaggedFromSubSub x = case subTagged x of
+  Tagged v -> (v, subSubLabel x)
+
+observeSubSubTagged :: forall a. SubSubChoose a => foreach (x :: a) -> Bool
+observeSubSubTagged x = case subSubTagged x of
+  Tagged v -> v
+
 checkR12Superclass :: Bool -> Bool -> Bool
 checkR12Superclass t f =
-     observeSub t == (True, 1)
-  && observeSub (FlipBool t) == (False, 2)
+  let ft = FlipBool t
+  in observeSub t == (True, 1)
+  && observeSub ft == (False, 2)
   && observeSubForeach f == False
   && observeSubForeach (FlipBool f) == True
   && observeSubDirect t == True
-  && observeSubDirect (FlipBool t) == False
+  && observeSubDirect ft == False
   && observeSubSub t == (True, 10)
   && observeSubSub (FlipBool f) == (True, 30)
+  && observeSubTaggedPoly t == (True, 1)
+  && observeSubTaggedPoly ft == (False, 2)
+  && observeSubTaggedFromSubSub f == (False, 20)
+  && observeSubTaggedFromSubSub (FlipBool f) == (True, 30)
+  && observeSubSubTagged t == True
+  && observeSubSubTagged ft == False
+  && (case subTagged t of Tagged v -> v) == True
+  && (case subTagged ft of Tagged v -> v) == False
+  && (case localSubTagged f of Tagged v -> v) == False
+  && (case localSubTagged ft of Tagged v -> v) == False
 
 main :: IO ()
 main = do

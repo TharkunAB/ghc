@@ -3923,11 +3923,11 @@ tcValArg _ _ _ (EWrap ew)          = return (EWrap ew)
 
 tcValArg do_ql pos rn_head (ERetainedArg DepFunVisible loc (Scaled mult ty) arg res_ty co)
   = do { let checked_ty = maybe ty coercionLKind co
-       ; scoped <- tcScopedClassOperand (Just res_ty) checked_ty arg
+       ; scoped <- tcScopedClassOperand checked_ty arg
        ; checked <- case scoped of
-           Just (selector, inst, dict, _, operand) ->
+           Just (selector, inst, dict_expr, _, operand) ->
              do { checked_operand <- tcValArgExpr do_ql pos rn_head loc (Scaled mult inst) operand
-                ; let wrapper = mkWpEvApps [EvExpr (Core.Var dict)] <.> mkWpTyApps [inst]
+                ; let wrapper = mkWpEvApps [EvExpr dict_expr] <.> mkWpTyApps [inst]
                       method = noLocA (mkHsWrap wrapper (mkHsVar (noLocA selector)))
                 ; return (mkHsApps method [checked_operand]) }
            _ -> tcRetainedValArgExpr do_ql pos rn_head loc (Scaled mult checked_ty) arg
@@ -4596,7 +4596,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
            ; predicate <- liftZonkM (zonkTcType (varType binder))
            ; dict <- case Core.projectUniqueClassDict predicate givens of
                Core.ScopedDirectDict dict -> return dict
-               Core.ScopedSuperclassDict _ ->
+               Core.ScopedSuperclassDict _ _ ->
                  newScopedDictWanted fun_orig predicate
                Core.ScopedNoDict | noFreeVarsOfType predicate ->
                  do { defer <- goptM Opt_DeferTypeErrors
@@ -5164,10 +5164,10 @@ tcRetainedValueOperand resolve domain arg@(L loc original)
         Just sel | Just cls <- isClassOpId_maybe sel -> do
           let unchecked :: TcM a
               unchecked = failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall name))
-          scoped <- tcScopedClassOperand Nothing domain arg
+          scoped <- tcScopedClassOperand domain arg
           case scoped of
-            Just (selector, inst, dict, index, _) ->
-              pure (Core.mkApps (Core.Var selector) [Core.Type inst, Core.Var dict, Core.Var index], arg)
+            Just (selector, inst, dict_expr, index, _) ->
+              pure (Core.mkApps (Core.Var selector) [Core.Type inst, dict_expr, Core.Var index], arg)
             Nothing -> do
               case tcSplitSigmaTy (varType sel) of
                 ([(_, tv)], [theta], rho)
@@ -5228,9 +5228,9 @@ newScopedDictWanted orig pred_ty = do
 -- projection) used in its index.
 -- See Note [Scoped Given indices] and
 -- Note [Superclass projection for scoped class selectors] in "GHC.Core".
-tcScopedClassOperand :: Maybe Type -> Type -> LHsExpr GhcRn
-                     -> TcM (Maybe (Id, Type, Id, Id, LHsExpr GhcRn))
-tcScopedClassOperand mb_res_ty result_ty call
+tcScopedClassOperand :: Type -> LHsExpr GhcRn
+                     -> TcM (Maybe (Id, Type, Core.CoreExpr, Id, LHsExpr GhcRn))
+tcScopedClassOperand result_ty call
   | HsApp _ method operand <- unLoc (stripParensLHsExpr call)
   , HsVar _ method_name <- unLoc (stripParensLHsExpr method)
   , HsVar _ operand_name <- unLoc (stripParensLHsExpr operand)
@@ -5250,37 +5250,18 @@ tcScopedClassOperand mb_res_ty result_ty call
              , inst `tcEqType` domain && result `tcEqType` result_ty ->
                case Core.projectUniqueClassDict predicate givens of
                  Core.ScopedDirectDict dict ->
-                   check_core sel inst dict index operand
-                 Core.ScopedSuperclassDict _ ->
-                   do { dict <- case mb_res_ty >>= find_class_app_dict sel inst index of
-                          Just existing -> pure existing
-                          Nothing -> newScopedDictWanted (OccurrenceOf (idName sel)) predicate
-                      ; check_core sel inst dict index operand }
+                   check_core sel inst (Core.Var dict) index operand
+                 Core.ScopedSuperclassDict _ sc_expr ->
+                   check_core sel inst sc_expr index operand
                  _ -> return Nothing
            _ -> return Nothing } }
   where
-    check_core sel inst dict index op =
-      let core = Core.mkApps (Core.Var sel) [Core.Type inst, Core.Var dict, Core.Var index]
+    check_core sel inst dict_expr index op =
+      let core = Core.mkApps (Core.Var sel) [Core.Type inst, dict_expr, Core.Var index]
       in pure $ case Core.nativeClassSelectorIndex core of
-           Just _  -> Just (sel, inst, dict, index, op)
+           Just _  -> Just (sel, inst, dict_expr, index, op)
            Nothing -> Nothing
-
-    find_class_app_dict sel inst index ty = listToMaybe (go ty)
-      where
-        go t = case coreFullView t of
-          ClassAppTy s i (TermVarTy d) (TermVarTy idx) _
-            | s == sel && i `tcEqType` inst && idx == index -> [d]
-          ClassAppTy _ i d idx k -> go i ++ go d ++ go idx ++ go k
-          TyConApp _ tys         -> concatMap go tys
-          AppTy f a              -> go f ++ go a
-          FunTy _ ma m a r       -> go ma ++ go m ++ go a ++ go r
-          ForAllTy ma (Bndr v _) b -> go ma ++ go (varType v) ++ go b
-          DepFunTy _ v b         -> go (varType v) ++ go b
-          DepDictTy v b          -> go (varType v) ++ go b
-          ExistsTy _ v b         -> go (varType v) ++ go b
-          CastTy inner _         -> go inner
-          _                      -> []
-tcScopedClassOperand _ _ _ = return Nothing
+tcScopedClassOperand _ _ = return Nothing
 
 {- Note [Scoped Given indices]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

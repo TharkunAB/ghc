@@ -3524,7 +3524,10 @@ tc_app_ty mode rn_ty exp_kind
                   case Core.nativeClassSelectorTys sel inst of
                     Just (predicate, domain, result)
                       | domain `tcEqType` inst
-                      , [dict] <- filter (\d -> varType d `tcEqType` predicate) (mode_dictionaries mode)
+                      , Just dict <- case Core.projectUniqueClassDict predicate (mode_dictionaries mode) of
+                          Core.ScopedDirectDict d       -> Just d
+                          Core.ScopedSuperclassDict d _ -> Just d
+                          _                             -> Nothing
                       , isNativeClassDictionaryId dict
                       -> checkExpKind mode rn_ty
                            (ClassAppTy sel inst (TermVarTy dict) (TermVarTy index) result) result exp_kind

@@ -20,6 +20,8 @@ module NativeWave10TypeCaseDotSectionsProvider
   , Tagged (..)
   , tagBool
   , chooseTagged
+  , subTagged
+  , subSubTagged
   ) where
 
 import Prelude hiding ((+))
@@ -100,3 +102,9 @@ tagBool b = Tagged @b b
 
 chooseTagged :: forall a. Choose a => foreach (x :: a) -> Tagged (choose x)
 chooseTagged x = tagBool (choose x)
+
+subTagged :: forall a. SubChoose a => foreach (x :: a) -> Tagged (choose x)
+subTagged x = tagBool (choose x)
+
+subSubTagged :: forall a. SubSubChoose a => foreach (x :: a) -> Tagged (choose x)
+subSubTagged x = tagBool (choose x)

@@ -71,11 +71,11 @@ for opt in -O1 -O2; do
         exit 1
     fi
 
-    # 2a. -XDependentTypes / -XExperimentalDependentTypes client
+    # 2a. -XDependentTypes client
     cd "$out/$opt/dep-client"
     cp ../provider/NativeDepFunUnfolding.hi .
     cat > DepClient.hs <<'HS'
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, ListTuplePuns, ScopedTypeVariables #-}
 module Main where
 
 import Data.Proxy (Proxy (..))

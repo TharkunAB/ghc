@@ -79,3 +79,25 @@ bad x = case chooseTagged x of
   Tagged v -> v
 HS
 reject 'GHC-83605' MissingSuper.hs
+
+# 4. Ambiguous superclass paths in a type signature must be rejected.
+cat >AmbiguousSuperSig.hs <<'HS'
+{-# LANGUAGE DependentTypes, GADTs #-}
+module AmbiguousSuperSig where
+import NativeWave10TypeCaseDotSectionsProvider
+
+badSig :: (SubChoose a, AltSubChoose a) => foreach (x :: a) -> Tagged (choose x)
+badSig x = tagBool (choose x)
+HS
+reject 'GHC-83605' AmbiguousSuperSig.hs
+
+# 5. Missing superclass evidence in a type signature must be rejected.
+cat >MissingSuperSig.hs <<'HS'
+{-# LANGUAGE DependentTypes, GADTs #-}
+module MissingSuperSig where
+import NativeWave10TypeCaseDotSectionsProvider
+
+badSig :: Eq a => foreach (x :: a) -> Tagged (choose x)
+badSig x = tagBool False
+HS
+reject 'GHC-83605' MissingSuperSig.hs

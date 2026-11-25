@@ -2796,21 +2796,52 @@ nativeClassSelectorTys selector inst = do
   let instantiate = TyCoSubst.substTyWith [tv] [inst]
   return (instantiate predicate, instantiate domain, instantiate result)
 
--- | Recover an opaque application to an explicit local Given and operand.
+-- | Recover an opaque application to an explicit local Given (or unique
+-- superclass projection from a local Given) and operand.
+-- See Note [Superclass projection for scoped class selectors].
 nativeClassSelectorIndex :: CoreExpr -> Maybe Type
 nativeClassSelectorIndex expr
-  | (Var selector, [Type inst, Var dict, Var arg]) <- collectArgs expr
-  , isNativeClassDictionaryId dict, isNativeOpaqueValueId arg
+  | (Var selector, [Type inst, dict_arg, Var arg]) <- collectArgs expr
+  , isNativeOpaqueValueId arg
   , Just (predicate, domain, result) <- nativeClassSelectorTys selector inst
-  , varType dict `eqType` predicate, varType arg `eqType` domain
+  , varType arg `eqType` domain
+  , Just dict <- selector_dict predicate dict_arg
   = Just (ClassAppTy selector inst (TermVarTy dict) (TermVarTy arg) result)
   | otherwise = Nothing
+  where
+    selector_dict predicate (Var dict)
+      | isNativeClassDictionaryId dict
+      = case projectUniqueClassDict predicate [dict] of
+          ScopedDirectDict d       -> Just d
+          ScopedSuperclassDict d _ -> Just d
+          _                        -> Nothing
+    selector_dict predicate dict_expr
+      | Just dict <- dict_root_maybe dict_expr
+      , isNativeClassDictionaryId dict
+      , ScopedSuperclassDict d sc_expr <- projectUniqueClassDict predicate [dict]
+      , d == dict
+      , same_sc_expr dict_expr sc_expr
+      = Just dict
+    selector_dict _ _ = Nothing
+
+    dict_root_maybe (Var d) = Just d
+    dict_root_maybe e
+      | (Var sc_sel, args) <- collectArgs e
+      , isGlobalId sc_sel
+      , (_, [inner]) <- span isTypeArg args
+      = dict_root_maybe inner
+      | otherwise = Nothing
+
+    same_sc_expr (Var d1) (Var d2)       = d1 == d2
+    same_sc_expr (Type t1) (Type t2)     = t1 `eqType` t2
+    same_sc_expr (App f1 a1) (App f2 a2) = same_sc_expr f1 f2 && same_sc_expr a1 a2
+    same_sc_expr _ _                     = False
 
 -- | Result of resolving a scoped class predicate from lexical Givens.
 -- See Note [Superclass projection for scoped class selectors].
 data ScopedDictResolution
   = ScopedDirectDict Id
-  | ScopedSuperclassDict CoreExpr
+  | ScopedSuperclassDict Id CoreExpr
   | ScopedNoDict
   | ScopedAmbiguousDict
 
@@ -2823,14 +2854,14 @@ projectUniqueClassDict target_pred givens
       [dict]    -> ScopedDirectDict dict
       _ : _ : _ -> ScopedAmbiguousDict
       []        -> case sc_paths of
-        [sc_expr] -> ScopedSuperclassDict sc_expr
-        _ : _ : _ -> ScopedAmbiguousDict
-        []        -> ScopedNoDict
+        [(dict, sc_expr)] -> ScopedSuperclassDict dict sc_expr
+        _ : _ : _         -> ScopedAmbiguousDict
+        []                -> ScopedNoDict
   where
     eligible = filter isNativeClassDictionaryId givens
     direct   = filter (\d -> varType d `eqType` target_pred) eligible
     sc_paths =
-      [ sc_expr
+      [ (d, sc_expr)
       | d <- eligible
       , sc_expr <- super_paths [varType d] (Var d) (varType d) ]
 
@@ -2850,24 +2881,24 @@ projectUniqueClassDict target_pred givens
 
 {- Note [Superclass projection for scoped class selectors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A scoped class selector call (for example `chooseTagged x` or `tagBool (choose x)`)
-needs a single deterministic dictionary witness for the class predicate `Choose a`.
+A scoped class selector index (for example `Tagged (choose x)` or `tagBool (choose x)`)
+needs one deterministic dictionary witness for the class predicate `Choose a`.
 
 1. A unique direct lexical Given `d :: Choose a` takes precedence (`ScopedDirectDict`).
    Multiple direct Givens of `Choose a` report `ScopedAmbiguousDict`.
 2. When no direct Given has type `Choose a`, `projectUniqueClassDict` traverses
    immediate and transitive class superclasses (`classSCTheta` and `classSCSelIds`)
    of all eligible lexical Givens (for example `d_sub :: SubChoose a` where
-   `class Choose a => SubChoose a`). If a single superclass selector chain produces
-   `Choose a`, `ScopedSuperclassDict` supplies it; multiple distinct paths report
-   `ScopedAmbiguousDict`.
-3. Callers in `GHC.Tc.Gen.App` bind a local `NOINLINE` dictionary `EvVar` for
-   `Choose a` in the enclosing implication when `ScopedSuperclassDict` succeeds.
-   That keeps the Core argument to `DepDictTy` and `ClassAppTy` a local dictionary
-   variable `Id` across `SimpleOpt`, `Simplifier`, and Core Lint.
-4. Forming `Tagged (choose x)` directly inside a type signature under `SubChoose a =>`
-   additionally requires `GHC.Tc.Gen.HsType.tc_app_ty` (and `GHC.Core.Lint`) to
-   accept a subclass dictionary binder or superclass projection in `ClassAppTy`.
+   `class Choose a => SubChoose a`). If one superclass selector chain produces
+   `Choose a`, `ScopedSuperclassDict` returns both `d_sub` and the projected Core
+   dictionary expression; multiple paths report `ScopedAmbiguousDict`.
+3. `GHC.Tc.Gen.HsType.tc_app_ty`, `GHC.Core.nativeClassSelectorIndex`, and
+   `GHC.Core.Lint.checkScopedSelectorShape` store the lexical dictionary variable
+   `d_sub` in `ClassAppTy` while `scopedSelectorExpr` and `tcScopedClassOperand`
+   apply the projected superclass dictionary expression in Core terms.
+4. Callers in `GHC.Tc.Gen.App` that instantiate `DepDictTy` via a superclass bind a
+   local `NOINLINE` dictionary `EvVar` so the Core argument to `DepDictTy` remains a
+   dictionary variable `Id` across `SimpleOpt`, `Simplifier`, and Core Lint.
 -}
 
 {- Note [Source calls in retained arguments]
