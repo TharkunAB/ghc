@@ -1063,3 +1063,7 @@ test('NativeDepFunUnfolding',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeDepFunUnfolding.hs'])],
      run_command, ['bash NativeDepFunUnfolding.sh "{compiler}" "{libdir}"'])
+test('NativeHomogeneousGadtBinders',
+     [req_host_target_ghc, req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['NativeHomogeneousGadtBinders.hs'])],
+     run_command, ['bash NativeHomogeneousGadtBinders.sh "{compiler}" "{libdir}"'])

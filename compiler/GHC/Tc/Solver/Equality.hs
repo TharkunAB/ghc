@@ -619,13 +619,13 @@ can_eq_nc ces rdr_env envs ev ReprEq ty1 ps_ty1 ty2 ps_ty2
 -- (EQNC3) Get rid of casts
 can_eq_nc ces rdr_env envs ev eq_rel (CastTy ty1 co1) _ ty2 ps_ty2
   | isNothing (canEqLHS_maybe ty2)
-  , bothRewritten ces || not (keepOpaqueCastGiven ev eq_rel ty1 co1 ty2)
-  = -- See (EIK3) in Note [Equalities with heterogeneous kinds]
+  , bothRewritten ces || not (deferHeteroCastGiven ev ty1 co1 ty2)
+  = -- See (EIK3) and (EIK5) in Note [Equalities with heterogeneous kinds]
     canEqCast ces rdr_env envs ev eq_rel NotSwapped ty1 co1 ty2 ps_ty2
 can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 (CastTy ty2 co2) _
   | isNothing (canEqLHS_maybe ty1)
-  , bothRewritten ces || not (keepOpaqueCastGiven ev eq_rel ty2 co2 ty1)
-  = -- See (EIK3) in Note [Equalities with heterogeneous kinds]
+  , bothRewritten ces || not (deferHeteroCastGiven ev ty2 co2 ty1)
+  = -- See (EIK3) and (EIK5) in Note [Equalities with heterogeneous kinds]
     canEqCast ces rdr_env envs ev eq_rel IsSwapped ty2 co2 ty1 ps_ty1
 
 ----------------------
@@ -1588,58 +1588,169 @@ canEqCast :: CanEqState
           -> TcS (StopOrContinue (Either IrredCt EqCt))
 canEqCast ces rdr_env envs ev eq_rel swapped ty1 co1 ty2 ps_ty2
   | CtGiven (GivenCt { ctev_evar = evar }) <- ev
-  , NomEq <- eq_rel
-  , TyConApp tc tys1 <- ty1
-  , let (rhs, rhs_cast) = case ty2 of
-          CastTy body co2 -> (body, MCo co2)
-          _ -> (ty2, MRefl)
-  , TyConApp tc' tys2 <- rhs
-  , tc == tc'
-  , not (isTypeFamilyTyCon tc)
-  , isInjectiveTyCon tc Nominal
-  , tys1 `equalLength` tys2
-  -- See (EIK5) in Note [Equalities with heterogeneous kinds].
+  -- See (EIK4) and (EIK5) in Note [Equalities with heterogeneous kinds].
   = do { transport <- kind_transport
        ; case transport of
            MRefl -> strip_cast
-           MCo _ -> do
-             { let loc = ctEvLoc ev
-                   cast_ty1 = mkCastTy ty1 co1
-                   pred_ty = case swapped of
-                               NotSwapped -> mkNomEqPred cast_ty1 ty2
-                               IsSwapped  -> mkNomEqPred ty2 cast_ty1
-                   parent = mkGReflRightCo Nominal ty1 co1 `mkTransCo`
-                              maybeSymCo swapped (mkCoVarCo (setVarType evar pred_ty))
-                              `mkTransCo` mkSymCo (mkGReflRightMCo Nominal rhs rhs_cast)
-                   selectors = tyConAppGivenSelectors (repeat Nominal) tys1 tys2 parent
-             ; emitSelectorGivens loc selectors
-             ; stopWith ev "Decomposed casted TyConApp Given" } }
-  | keepOpaqueCastGiven ev eq_rel ty1 co1 ty2
-  = do { emitNewGivens (mkKindEqLoc ty1 ty2 (ctEvLoc ev)) [(Nominal, co1)]
-       ; let reason | typesAreApart (typeKind ty1) (typeKind ty2) = ShapeMismatchReason
-                    | otherwise = IrredShapeReason
-       ; finishCanWithIrred reason ev }
+           MCo _
+             | isJust (canEqLHS_maybe ty1) -> strip_cast
+             | otherwise -> handle_cast_given evar }
   | otherwise = strip_cast
   where
     role = eqRelRole eq_rel
+    loc = ctEvLoc ev
+    cast_ty1 = mkCastTy ty1 co1
+    (rhs, rhs_cast) = case ty2 of
+      CastTy body co2 -> (body, MCo co2)
+      _               -> (ty2, MRefl)
+    kind_givens = (Nominal, co1) : [(Nominal, co2) | MCo co2 <- [rhs_cast]]
+
+    same_kind ka kb
+      | ka `tcEqType` kb = return True
+      | otherwise = tcEqType <$> zonkTcType ka <*> zonkTcType kb
+
+    handle_cast_given evar
+      = do { let pred_ty = case swapped of
+                             NotSwapped -> mkEqPred eq_rel cast_ty1 ty2
+                             IsSwapped  -> mkEqPred eq_rel ty2 cast_ty1
+                 parent = mkGReflRightCo role ty1 co1 `mkTransCo`
+                            maybeSymCo swapped (mkCoVarCo (setVarType evar pred_ty))
+                            `mkTransCo` mkSymCo (mkGReflRightMCo role rhs rhs_cast)
+                 k_xi1 = typeKind ty1
+                 k_xi2 = typeKind rhs
+                 ces_rw = swapCES swapped ces
+           ; same_xi_kind <- same_kind k_xi1 k_xi2
+           ; if same_xi_kind
+               then do { emitNewGivens (mkKindEqLoc ty1 rhs loc) kind_givens
+                       ; gv <- newGivenEv loc (mkEqPred eq_rel ty1 rhs, evCoercion parent)
+                       ; can_eq_nc ces_rw rdr_env envs (CtGiven gv) eq_rel ty1 ty1 rhs rhs }
+               else case (canEqLHS_maybe ty1, canEqLHS_maybe rhs) of
+                 (Just lhs1, _) ->
+                   do { kind_ev <- newGivenEv (mkKindEqLoc ty1 rhs loc)
+                                     (mkNomEqPred k_xi2 k_xi1, evCoercion (mkSymCo (mkKindCo parent)))
+                      ; emitWorkNC [CtGiven kind_ev]
+                      ; let hk = givenCtEvCoercion kind_ev
+                            xi2' = mkCastTy rhs hk
+                      ; gv <- newGivenEv loc (mkEqPred eq_rel ty1 xi2',
+                                evCoercion (parent `mkTransCo` mkGReflRightCo role rhs hk))
+                      ; canEqCanLHSHomo (CtGiven gv) eq_rel NotSwapped lhs1 ty1 xi2' xi2' }
+                 (Nothing, Just lhs2) ->
+                   do { kind_ev <- newGivenEv (mkKindEqLoc ty1 rhs loc)
+                                     (mkNomEqPred k_xi1 k_xi2, evCoercion (mkKindCo parent))
+                      ; emitWorkNC [CtGiven kind_ev]
+                      ; let hk = givenCtEvCoercion kind_ev
+                            xi1' = mkCastTy ty1 hk
+                      ; gv <- newGivenEv loc (mkEqPred eq_rel xi1' rhs,
+                                evCoercion (mkSymCo (mkGReflRightCo role ty1 hk) `mkTransCo` parent))
+                      ; canEqCanLHSHomo (CtGiven gv) eq_rel IsSwapped lhs2 rhs xi1' xi1' }
+                 (Nothing, Nothing) ->
+                   decompose_or_park ty1 rhs parent }
+
+    finish_cast_irred reason parent
+      | MCo co2 <- rhs_cast
+      = do { let c12 = co1 `mkTransCo` mkSymCo co2
+                 lhs_one_cast = mkCastTy ty1 c12
+                 co_one_cast  = mkSymCo (mkGReflRightCo role ty1 c12) `mkTransCo` parent
+           ; gv <- newGivenEv loc (mkEqPred eq_rel lhs_one_cast rhs, evCoercion co_one_cast)
+           ; finishCanWithIrred reason (CtGiven gv) }
+      | otherwise
+      = finishCanWithIrred reason ev
+
+    decompose_or_park xi1 xi2 parent
+      | FunTy { ft_af = af1 } <- coreFullView xi1
+      , FunTy { ft_af = af2 } <- coreFullView xi2
+      , af1 == af2
+      = do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+           ; emitSelectorGivens loc
+               [ (funRole role fs, mkSelCo (SelFun fs) parent)
+               | fs <- [SelMatch, SelMult, SelArg, SelRes] ]
+           ; stopWith ev "Decomposed casted FunTy Given" }
+      | Just (tc1, tys1) <- tcSplitTyConApp_maybe xi1
+      , Just (tc2, tys2) <- tcSplitTyConApp_maybe xi2
+      , not (tyConMustBeSaturated tc1 || tyConMustBeSaturated tc2)
+      = if tc1 == tc2 && tys1 `equalLength` tys2
+          then do { inerts <- getInertSet
+                  ; if canDecomposeTcApp ev eq_rel tc1 inerts
+                      then do { let selectors = tyConAppGivenSelectors
+                                                  (tyConRoleListX role tc1) tys1 tys2 parent
+                              ; when (null selectors) $
+                                  emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+                              ; emitSelectorGivens loc selectors
+                              ; stopWith ev "Decomposed casted TyConApp Given" }
+                      else do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+                              ; finish_cast_irred ReprEqReason parent } }
+          else do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+                  ; let reason
+                          | tyConSkolem tc1 || tyConSkolem tc2 = AbstractTyConReason
+                          | NomEq <- eq_rel = ShapeMismatchReason
+                          | isGenerativeTyCon tc1 role && isGenerativeTyCon tc2 role
+                          = ShapeMismatchReason
+                          | otherwise = ReprEqReason
+                  ; finish_cast_irred reason parent }
+      | NomEq <- eq_rel
+      , Just (s1, t1) <- tcSplitAppTy_maybe xi1
+      , Just (s2, t2) <- tcSplitAppTy_maybe xi2
+      = do { let s1k = typeKind s1
+                 s2k = typeKind s2
+                 m1 = isMatchableFunTy s1k
+                 m2 = isMatchableFunTy s2k
+                 mismatch = isForAllTy s1k /= isForAllTy s2k
+           ; emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+           ; if m1 && m2 && mismatch
+               then finish_cast_irred ShapeMismatchReason parent
+               else if m1 && m2
+                 then do { ev_s <- newSelectorGiven loc Nominal (mkLRCo CLeft parent) s1 s2
+                         ; ev_t <- newSelectorGiven loc Nominal (mkLRCo CRight parent) t1 t2
+                         ; emitWorkNC [CtGiven ev_t]
+                         ; startAgainWith (mkNonCanonical $ CtGiven ev_s) }
+                 else finish_cast_irred IrredShapeReason parent }
+      | otherwise
+      = do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+           ; let reason = case eq_rel of
+                   ReprEq -> ReprEqReason
+                   NomEq
+                     | isOpaqueTermIndex xi1 || isOpaqueTermIndex xi2 ->
+                         if typesAreApart (typeKind xi1) (typeKind xi2)
+                           then ShapeMismatchReason
+                           else IrredShapeReason
+                     | ForAllTy{} <- coreFullView xi1
+                     , ForAllTy{} <- coreFullView xi2 -> IrredShapeReason
+                     | opaque_cast_eq -> IrredShapeReason
+                     | otherwise -> ShapeMismatchReason
+           ; finish_cast_irred reason parent }
+      where
+        opaque_cast_eq = opaque_app xi1 || opaque_app xi2 || case (xi1, xi2) of
+          (TermAppTy f _, ty) -> call_dom f ty
+          (ty, TermAppTy f _) -> call_dom f ty
+          (TermVarTy v, ty)   -> same_dom v ty
+          (ty, TermVarTy v)   -> same_dom v ty
+          _                   -> False
+        opaque_app ty
+          | Just (hd, _) <- tcSplitAppTy_maybe ty = not (isMatchableFunTy (typeKind hd))
+          | otherwise = False
+        same_dom v ty = (isNativeRetainedBinder v && varType v `eqType` typeKind ty)
+                     || (isNativeOpaqueValueId v && not (typesAreApart (varType v) (typeKind ty)))
+        call_dom f ty = case nativeIndexFunctionTys_maybe f of
+          Just (_, res) -> typeKind ty `eqType` res
+          Nothing -> False
+
     strip_cast
       = do { traceTcS "Decomposing cast" (vcat [ ppr ev
                                                , ppr ty1 <+> text "|>" <+> ppr co1
                                                , ppr ps_ty2 ])
-           ; rhs_cast <- cast_rhs
-           ; let rhs_redn = mkGReflRightMRedn role ps_ty2 rhs_cast
-           ; case rhs_cast of
-               MCo kind_co -> emitNewGivens (mkKindEqLoc ty1 ty2 (ctEvLoc ev)) [(Nominal, kind_co)]
+           ; rhs_cast' <- cast_rhs
+           ; let rhs_redn = mkGReflRightMRedn role ps_ty2 rhs_cast'
+           ; case rhs_cast' of
+               MCo kind_co -> emitNewGivens (mkKindEqLoc ty1 ty2 loc) [(Nominal, kind_co)]
                MRefl       -> return ()
            ; new_ev <- rewriteEqEvidence ev swapped
                           (mkGReflLeftRedn role ty1 co1)
                           rhs_redn
                           emptyCoHoleSet
            ; can_eq_nc (swapCES swapped ces) rdr_env envs new_ev eq_rel
-                       ty1 ty1 (mkCastTyMCo ty2 rhs_cast) (reductionReducedType rhs_redn) }
+                       ty1 ty1 (mkCastTyMCo ty2 rhs_cast') (reductionReducedType rhs_redn) }
     cast_rhs
       | CtGiven {} <- ev
-      , NomEq <- eq_rel
       , isJust (canEqLHS_maybe ty1)
       = kind_transport
       | otherwise
@@ -1661,17 +1772,15 @@ canEqCast ces rdr_env envs ev eq_rel swapped ty1 co1 ty2 ps_ty2
           | from_kind `tcEqType` to_kind = MRefl
           | otherwise                   = MCo (mkSymCo co1)
 
--- | Keep a nominal Given that transports a rigid runtime index or its peer.
--- See Note [Opaque runtime index equalities].
-keepOpaqueCastGiven :: CtEvidence -> EqRel -> Type -> Coercion -> Type -> Bool
-keepOpaqueCastGiven (CtGiven {}) NomEq lhs co rhs
-  | CastTy {} <- rhs = False
-  | isOpaqueTermIndex lhs || isOpaqueTermIndex rhs
-  , isNothing (canEqLHS_maybe lhs)
-  = let Pair k1 k2 = coercionKind co
-        rhs_kind = typeKind rhs
-    in k2 `tcEqType` rhs_kind && not (k1 `tcEqType` rhs_kind)
-keepOpaqueCastGiven _ _ _ _ _ = False
+-- | Defer a heterogeneous casted Given until EQNC5 rewrites both endpoints.
+-- See (EIK5) in Note [Equalities with heterogeneous kinds] and
+-- Note [Opaque runtime index equalities].
+deferHeteroCastGiven :: CtEvidence -> Type -> Coercion -> Type -> Bool
+deferHeteroCastGiven (CtGiven {}) lhs co rhs
+  | isNothing (canEqLHS_maybe lhs)
+  = let Pair k1 _ = coercionKind co
+    in not (k1 `tcEqType` typeKind rhs)
+deferHeteroCastGiven _ _ _ _ = False
 
 ------------------------
 canTyConApp :: CtEvidence -> EqRel
@@ -3670,14 +3779,15 @@ Wrinkles:
      And this is an improvement regardless: because tyvars can, generally,
      unify with casted types, there's no reason to go through the work of
      stripping off the cast when the cast appears opposite a tyvar.
-(EIK4) When a nominal Given has the form (a |> co) ~# rhs and both
-     endpoints have the same kind, canEqCast can move the cast to rhs.
-     Do this when a is a canonical left-hand side. Removing the cast
-     alone would bind heterogeneous evidence before canEqCanLHSHetero
-     casts rhs back. Moving the cast keeps the new Given homogeneous.
-     This also applies when a boxed equality supplied the original Given.
-     Emit the kind Given from the cast, as canEqCanLHSHetero would
-     do after stripping it.
+(EIK4) When a Given has the form (a |> co) ~r# rhs and both endpoints have
+     the same kind, canEqCast can move the cast to rhs at Nominal or
+     Representational role. Do this when a is a canonical left-hand side.
+     Removing the cast alone would bind heterogeneous evidence before
+     canEqCanLHSHetero casts rhs back. Moving the cast keeps the new Given
+     homogeneous. This also applies when a boxed equality supplied the
+     original Given, or symmetrically when rhs carries a cast over a
+     canonical left-hand side. Emit the kind Given from the cast, as
+     canEqCanLHSHetero would do after stripping it.
 
      The shallow zonk in solveEquality can follow a filled variable in
      rhs while co still mentions that variable's old kind. If their
@@ -3685,22 +3795,18 @@ Wrinkles:
      original cast as evidence. This keeps the intermediate coercion an
      expression within the homogeneous proof (T11711).
 
-(EIK5) A nominal Given can have the form (T as |> h) ~# T bs.
-     The right endpoint can also have a cast. For example, two GADT
-     matches can cast a promoted constructor application back to the
-     original scrutinee kind on each side.
-     When T is injective, compose both transports with the Given.
-     Use the uncast equality as an expression in its selectors.
-     Removing one cast first would bind mixed-kind evidence.
-     As in (EIK4), shallow zonking can expose a constructor on one side
-     while the cast on the other side still refers to a filled variable.
-     Zonk the kinds for this check and use the original cast in the proof.
-     A selector can also have different endpoint kinds. Bind
-     its kind equality first and transport the right endpoint, as in
-     canEqCanLHSHetero. This keeps the argument Given homogeneous.
-     For example, this permits decomposition of the boxed Given
-     'Tag @k a ~~ 'Tag @Type Int without a mixed-kind binder.
-     Each recursive decomposition consumes a TyCon application.
+(EIK5) A Given can have the form (lhs |> h) ~r# rhs where lhs is not a
+     canonical left-hand side and h relates distinct kinds. Defer EQNC3
+     until EQNC5 rewrites both endpoints homogeneously and collapses
+     nested casts through mkCastRedn1. Then compose the remaining casts
+     with the Given into an uncast coercion expression without binding a
+     mixed-kind CoVar. If the rewritten inner kinds match, bind one
+     homogeneous Given. If rewriting exposes a canonical left-hand side,
+     bind its kind proof and transport the opposite endpoint. Otherwise
+     decompose injective TyConApps, compatible FunTys, and nominal
+     matchable AppTys through newSelectorGiven and emitSelectorGivens,
+     or emit the kind Given and keep a single-cast homogeneous Given
+     irreducible.
 
      An equality with same-kind endpoints can also have a selector
      with mixed-kind endpoints. A constructor can have a kind parameter,

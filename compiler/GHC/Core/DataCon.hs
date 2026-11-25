@@ -957,9 +957,7 @@ gadtKindTransport_maybe spec@(_:_:_)
     transport earlier (EqSpec tv rhs_index)
       | lhs_kind `eqType` rhs_kind
       = Just (const (mkNomEqPred lhs_index rhs_index, Nothing))
-      | let (kind_bndrs, kind_body) = splitForAllTyVars lhs_kind
-      , all (\(ma, tv) -> isTauTy ma && isTauTy (tyVarKind tv)) kind_bndrs
-      , isTauTy kind_body
+      | canLiftGadtKind lhs_kind
       , allVarSet independent (tyCoVarsOfType lhs_kind)
       , substTyWithInScope in_scope kvs rhses lhs_kind `eqType` rhs_kind
       = Just $ \lc ->
@@ -975,10 +973,37 @@ gadtKindTransport_maybe spec@(_:_:_)
         (kvs, rhses) = unzip (map eqSpecPair earlier)
         refined = mkVarSet kvs
         independent v = isTyVar v &&
-          (v `elemVarSet` refined || disjointVarSet refined (tyCoVarsOfType (tyVarKind v)))
+          (v `elemVarSet` refined || disjointVarSet refined (expandedTyVars (tyVarKind v)))
         lhs_index = mkTyVarTy tv
         lhs_kind = tyVarKind tv
         rhs_kind = typeKind rhs_index
+
+        canLiftGadtKind (TyVarTy {}) = True
+        canLiftGadtKind (LitTy {}) = True
+        canLiftGadtKind (AppTy f a) = canLiftGadtKind f && canLiftGadtKind a
+        canLiftGadtKind (TyConApp _ args) = all canLiftGadtKind args
+        canLiftGadtKind (FunTy _ ma mult arg res) =
+          canLiftGadtKind ma && canLiftGadtKind mult && canLiftGadtKind arg && canLiftGadtKind res
+        canLiftGadtKind (ForAllTy ma (Bndr b _) body) =
+          isTyVar b && canLiftGadtKind ma && canLiftGadtKind (varType b) && canLiftGadtKind body
+        canLiftGadtKind (CastTy ty co) =
+          canLiftGadtKind ty && allVarSet independent (tyCoVarsOfCo co)
+        canLiftGadtKind _ = False
+
+        expandedTyVars ty
+          | Just ty' <- coreView ty = expandedTyVars ty'
+        expandedTyVars (TyVarTy v) = unitVarSet v
+        expandedTyVars (AppTy f a) = expandedTyVars f `unionVarSet` expandedTyVars a
+        expandedTyVars (TyConApp _ args) = mapUnionVarSet expandedTyVars args
+        expandedTyVars (FunTy _ ma mult arg res) =
+          expandedTyVars ma `unionVarSet` expandedTyVars mult
+            `unionVarSet` expandedTyVars arg `unionVarSet` expandedTyVars res
+        expandedTyVars (ForAllTy ma (Bndr b _) body) =
+          expandedTyVars ma `unionVarSet` expandedTyVars (varType b)
+            `unionVarSet` delVarSet (expandedTyVars body) b
+        expandedTyVars (CastTy ty co) = expandedTyVars ty `unionVarSet` tyCoVarsOfCo co
+        expandedTyVars (CoercionTy co) = tyCoVarsOfCo co
+        expandedTyVars ty = tyCoVarsOfType ty
 gadtKindTransport_maybe _ = Nothing
 
 -- | Extend a lifting context with the original equality represented by a binder.
@@ -1067,13 +1092,13 @@ before the source context dictionaries and ordinary fields. The
 wrapper skips the remaining proof fields before applying unboxers to
 the dictionaries and fields. Pattern synonym inference restores the
 proof prefix and retains the source context evidence verbatim.
-The index kind can start with foralls that bind type variables.
-Each binder kind, matchability and the remaining body must be a monotype.
-ForAllCo relates the binder kinds with an earlier proof. The lift uses that
-proof at occurrences of the binder in the body. See Note [ForAllCo] in
-GHC.Core.TyCo.Rep.
+The index kind can contain nested type-variable foralls, arrows, and
+type constructor applications. ForAllCo relates each binder kind with an
+earlier proof and uses that proof at occurrences of the binder in the
+body. See Note [ForAllCo] in GHC.Core.TyCo.Rep.
 The free variables of the index kind must be type variables. Each variable
-must have an earlier proof in scope or a kind independent of those proofs.
+must have an earlier proof in scope or an expanded kind independent of
+those proofs.
 
 Keep the source EqSpecs for the source constructor signature and
 pattern-match oracle. The interface records the worker binders in
