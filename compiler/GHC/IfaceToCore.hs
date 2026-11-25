@@ -1496,13 +1496,13 @@ tcIfaceDataCons inferred_env tycon_name tycon if_cons
     -- Check only interface syntax here. The parent TyCon is still knot-tied.
     check_retained_shape name wrapper binders args univs users exs spec ctxt fields bangs src_bangs
       = unless (binders `equalLength` args
-                && length names == length (nub names)
+                && hasNoDups names
                 && all type_binder univs && all type_binder exs
                 && all (\(Bndr b _) -> type_binder b) users
-                && length univ_names == length (nub univ_names)
-                && length ex_names == length (nub ex_names)
+                && hasNoDups univ_names
+                && hasNoDups ex_names
                 && all (`notElem` univ_names) ex_names
-                && length user_names == length (nub user_names)
+                && hasNoDups user_names
                 && valid_result && valid_record
                 && ((null ctxt && null exs)
                     || (not wrapper && null spec && user_names == univ_names ++ ex_names))
@@ -1524,14 +1524,14 @@ tcIfaceDataCons inferred_env tycon_name tycon if_cons
           | IfDataTyCon False [_] <- if_cons
           , Just _ : rest@(_ : _) <- binders
           = all isNothing rest && not wrapper && user_names == univ_names && null exs && null ctxt
-            && null spec && fields `equalLength` args && length fields == length (nub fields)
+            && null spec && fields `equalLength` args && hasNoDups fields
           | otherwise = False
         valid_result
           | wrapper
           , not (null spec)
           = null exs && null ctxt
             && pairs `equalLength` spec
-            && length result_names == length (nub result_names)
+            && hasNoDups result_names
             && length names == length (nub result_fields)
             && all (`elem` univ_names) result_names
             && all (`elem` names) result_fields
@@ -2313,24 +2313,25 @@ tcIfaceType = go
                      Inferred -> isMatchabilityArgument arg
                      _ -> False
                _ -> return ()
+           ; let has_id = anyFreeVarsOfType isId
            ; case isPromotedDataCon_maybe tc' of
                Just con
                  -- See Note [Runtime arguments of promoted GADT constructors].
                  | let (_, _, eqs, theta, _, _) = dataConFullSig con
-                       indexed = any (anyFreeVarsOfType isId) tks' && null theta &&
+                       indexed = any has_id tks' && null theta &&
                                  (not (null eqs) || isNativeIndexedGadtCon con)
                  , not (null (dataConRepArgBinders con)) || indexed ->
                    check_iface_retained_args (ppr tc) (tyConKind tc') tks'
                  | isJust (tyConDataFamCoercion_maybe (dataConTyCon con))
                  , let (tys, fields) = splitAt (length (dataConUserTyVars con)) tks'
-                 , any (anyFreeVarsOfType isId) fields ->
+                 , any has_id fields ->
                  do { valid <- evaluateIfaceNativeDomain (ppr tc) $
                           isJust (nativeFamilyPromotedCon_maybe con tys fields)
                       ; unless valid $
                           failIfM (text "Invalid retained data family constructor fields in interface:"
                                    <+> ppr tc) }
                  | let (tys, fields) = splitAt (length (dataConUnivTyVars con)) tks'
-                 , any (anyFreeVarsOfType isId) fields ->
+                 , any has_id fields ->
                  do { valid <- evaluateIfaceNativeDomain (ppr tc) $
                           isJust (nativeIndexDataConTyArgs (mkTyConApp (dataConTyCon con) tys) con)
                           && nativeIndexArgKinds con tys fields
