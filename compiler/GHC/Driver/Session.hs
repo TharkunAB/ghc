@@ -2832,9 +2832,14 @@ tuple syntax in types follows GHC Proposal #475. Users can re-enable
 ListTuplePuns with a later pragma or flag.
 
 MakeDynFlagsConsistent also enables Opt_WriteSourceEquations by default when
-ExperimentalDependentTypes is active. An explicit -fno-write-source-equations
-flag sets Opt_SuppressSourceEquations and overrides that default. An explicit
--fwrite-source-equations flag sets Opt_ExplicitWriteSourceEquations.
+ExperimentalDependentTypes is active outside the ghc-internal home unit. When
+the home unit is ghc-internal, makeDynFlagsConsistent leaves
+Opt_WriteSourceEquations disabled by default so early boot modules do not
+request sibling ghc-internal interfaces before they exist. See
+Note [Cold ghc-internal interface lookups] in GHC.Tc.Gen.SourceTable. An
+explicit -fno-write-source-equations flag sets Opt_SuppressSourceEquations and
+overrides that default. An explicit -fwrite-source-equations flag sets
+Opt_ExplicitWriteSourceEquations.
 
 In GHC.Parser, shared-type binder groups such as (m n :: Nat) expand in source
 order across forall, foreach, exists, and some telescopes. CheckForEachBndrs
@@ -3999,9 +4004,13 @@ makeDynFlagsConsistent dflags
  , NotValid msg <- backendInfoTableMapValidity (backend dflags)
     = loop (gopt_unset dflags Opt_InfoTableMap) msg
 
- | let want_source_eqs
+ | let in_ghc_internal =
+         homeUnitId_ dflags == ghcInternalUnitId ||
+         homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
+       want_source_eqs
          | gopt Opt_ExplicitWriteSourceEquations dflags = True
          | gopt Opt_SuppressSourceEquations dflags      = False
+         | in_ghc_internal                              = False
          | otherwise = xopt LangExt.ExperimentalDependentTypes dflags
  , gopt Opt_WriteSourceEquations dflags /= want_source_eqs
     = let dflags' | want_source_eqs = gopt_set dflags Opt_WriteSourceEquations

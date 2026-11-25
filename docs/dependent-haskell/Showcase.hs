@@ -193,6 +193,7 @@ import qualified BookEnvironment
 import qualified BookReverseProof
 import qualified ExplicitListReverse
 import qualified BookWave3Proposal378 as Wave3
+import qualified BookWave8Proposal378 as Wave8
 import qualified BookNaturals
 import qualified CastedConstructorGivens as TreeProof
 import qualified SumOfSizes
@@ -2367,6 +2368,24 @@ main = do
         , HaskLibClient.checkFoldrAndMatchability
             [HaskLib.Zero, HaskLib.Succ HaskLib.Zero]
             [HaskLib.Succ HaskLib.Zero] )
+    observe "override invisible foreach binders and pass unadorned Type witnesses"
+        ( HaskLib.toListVec (Wave8.replicateInvis @(HaskLib.Succ (HaskLib.Succ HaskLib.Zero)) 'w')
+        , Wave8.theValue Int (42 :: Int)
+        , Wave8.autoNumPlus )
+    observe "match nested foreach patterns, catch-all cases, and constrained GADTs"
+        ( Wave8.classifyLen (HaskLib.Succ (HaskLib.Succ HaskLib.Zero))
+            (HaskLib.VCons 10 (HaskLib.VCons 32 HaskLib.VNil))
+        , HaskLib.toListVec (Wave8.fallbackVec (HaskLib.Succ HaskLib.Zero)
+            (HaskLib.VCons 7 HaskLib.VNil))
+        , Wave8.renderShowBox (Wave8.MkShowBox (HaskLib.Succ (HaskLib.Succ HaskLib.Zero))
+            (HaskLib.VCons True (HaskLib.VCons False HaskLib.VNil))) )
+    observe "eliminate @Pack existentials and disambiguate punned data heralds"
+        ( Wave8.showAtPack Wave8.packSample
+        , Wave8.proxyDataTag
+        , Wave8.useDataHeraldTag )
+    observe "reassociate polymorphic nested domains and project HaskLib vectors"
+        ( Wave8.assocProdRoundTrip ((True, 'k'), 9 :: Int)
+        , Wave8.haskLibSecondLookup "hi" )
 
 -- | Complement one flag at the type level.
 type family FlipFlag (b :: Bool) :: Bool where

@@ -5,7 +5,7 @@ module GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               isFinalStructuralSource, isStructuralSourceTable, isNominalStructuralSource,
                               visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt,
                               sourceEquationDatatypes, publicCaseType, ordinaryImport,
-                              sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod, lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods, keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt, recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers, isSourceFilterGuard,
+                              sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod, lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods, keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt, recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers, lookupBootModuleIdMaybe, isSourceFilterGuard,
                               OptionalSourceUses, optionalSourceUses, registerOptionalSourceUses,
                               checkOptionalSourceUses, checkSourceMethodUses,
                               withSourceProofSignature,
@@ -56,9 +56,11 @@ import GHC.Data.Bag (emptyBag, isEmptyBag)
 import GHC.Data.OrdList (fromOL)
 import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config (initSimpleOpts)
+import GHC.Driver.DynFlags (DynFlags(homeUnitId_), unitSettings)
 import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
-import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hsc_plugins, hugRuleInterfacesBelow, hugRulesBelow, visibleUnloadedSourceRuleHeads)
+import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hsc_plugins, hugRuleInterfacesBelow, hugRulesBelow, lookupIfaceByModuleHsc, visibleUnloadedSourceRuleHeads)
 import GHC.Driver.Plugins (pluginsWithArgs)
+import GHC.Settings (UnitSettings(unitSettings_ghcInternalUnitId))
 import GHC.Hs
 import {-# SOURCE #-} GHC.HsToCore.Binds (dsTopLHsBinds)
 import GHC.HsToCore.Errors.Ppr () -- Diagnostic DsMessage
@@ -114,8 +116,8 @@ import GHC.Unit.Module (Module, getModuleInstantiation, isHoleModule)
 import GHC.Unit.Module.Deps (imp_boot_mods)
 import GHC.Unit.Module.Env (lookupInstalledModuleEnv, moduleSetElts)
 import GHC.Unit.Module.ModDetails (md_rules)
-import GHC.Unit.Module.ModIface (mi_hash_fn)
-import GHC.Unit.Types (GenWithIsBoot(..), isInteractiveModule, moduleName, moduleUnitId)
+import GHC.Unit.Module.ModIface (mi_boot, mi_hash_fn)
+import GHC.Unit.Types (GenWithIsBoot(..), ghcInternalUnitId, isInteractiveModule, moduleName, moduleUnitId)
 import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, extendTypeEnvWithIds, typeEnvElts, typeEnvIds)
 import GHC.Types.TyThing (TyThing(..))
 import GHC.Types.Unique.FM (plusUFM_C)
@@ -158,6 +160,58 @@ sourceTableOccurrence env actual
 tcLookupSourceTableId :: Id -> TcM (Maybe Id)
 tcLookupSourceTableId = tcLookupSourceTableIdAt Nothing
 
+{- Note [Cold ghc-internal interface lookups]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Source-equation and optional-let checks inspect standard definitions in
+`GHC.Internal.Base`, `GHC.Internal.Data.Tuple`, and
+`GHC.Internal.Bignum.Integer` (`build`, `(++)`, `(.)`, `otherwise`, `fst`,
+`snd`, and `Integer` comparison workers). Outside `ghc-internal`, those
+interfaces already exist in the installed package database.
+
+During a cold build of `ghc-internal` itself (`homeUnitId_ dflags ==
+ghcInternalUnitId`), early modules such as `GHC.Internal.Data.Tuple` and
+`GHC.Internal.Unicode.Char.UnicodeData.Simple*CaseMapping` compile before
+`GHC.Internal.Base` and `GHC.Internal.Bignum.Integer` write their `.hi`
+files. Calling `tcLookupIdMaybe` on an unloaded sibling module triggers
+`loadInterfaceForName` and fails with `GHC-94559`.
+
+When the home unit is `ghc-internal` and `mod` is not the current semantic
+module, `isBootModuleReady` checks that a non-boot `ModIface` for `mod` is
+loaded in `lookupIfaceByModuleHsc` before `lookupBootModuleIdMaybe` calls
+`lookupOrig` and `tcLookupIdMaybe`. In addition, `makeDynFlagsConsistent`
+leaves `Opt_WriteSourceEquations` disabled by default when the home unit is
+`ghc-internal`.
+-}
+
+-- | Test whether a `ghc-internal` module can be queried without loading an
+-- unbuilt sibling interface during a cold `ghc-internal` build.
+-- See Note [Cold ghc-internal interface lookups].
+isBootModuleReady :: Module -> TcM Bool
+isBootModuleReady mod = do
+  dflags <- getDynFlags
+  env <- getGblEnv
+  let in_ghc_internal =
+        homeUnitId_ dflags == ghcInternalUnitId ||
+        homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
+  if not in_ghc_internal || tcg_semantic_mod env == mod
+    then pure True
+    else do
+      hsc_env <- getTopEnv
+      mb_iface <- liftIO (lookupIfaceByModuleHsc hsc_env mod)
+      pure $ case mb_iface of
+        Just iface -> mi_boot iface == NotBoot
+        Nothing    -> False
+
+-- | Look up a `ghc-internal` value identifier only when its defining module
+-- is ready in the current compilation environment.
+-- See Note [Cold ghc-internal interface lookups].
+lookupBootModuleIdMaybe :: Module -> OccName -> TcM (Maybe Id)
+lookupBootModuleIdMaybe mod occ = do
+  ready <- isBootModuleReady mod
+  if not ready
+    then pure Nothing
+    else lookupOrig mod occ >>= tcLookupIdMaybe
+
 -- | Filter only the exact root owner at a checked specialization.
 tcLookupSourceTableIdAt :: Maybe Name -> Id -> TcM (Maybe Id)
 tcLookupSourceTableIdAt first actual = do
@@ -169,9 +223,7 @@ tcLookupSourceTableIdAt first actual = do
           Nothing -> return Nothing
           Just callees -> do
             build_use <- if finalCoreMapperOwner fun && isFinalSourceListTable table
-              then do
-                build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
-                fmap (\b -> [(b, Nothing)]) <$> tcLookupIdMaybe build_name
+              then fmap (\b -> [(b, Nothing)]) <$> lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "build")
               else pure Nothing
             recordSourceUses ((fun, first) : [(v, Nothing) | v <- callees] ++ fromMaybe [] build_use)
             forM_ (fun : callees) $ \owner ->
@@ -1799,11 +1851,12 @@ sourceMethodOps dfun selector target =
 
 -- | The public implementations used by the standard Integer dictionaries.
 -- Guard the comparison bodies that can inline as well as their method heads.
-sourceLiteralWorkers :: TcM [Id]
-sourceLiteralWorkers = traverse (\(mod, occ) -> lookupOrig mod (mkVarOcc occ) >>= tcLookupId) $
-    (gHC_TYPES, "isTrue#") :
-    [(gHC_INTERNAL_NUM_INTEGER, occ) | occ <- ["integerLt", "integerEq", "integerSub"
-                                             , "integerLt#", "integerEq#", "integerCompare"]]
+sourceLiteralWorkers :: TcM (Maybe [Id])
+sourceLiteralWorkers = fmap sequence $
+    traverse (\(mod, occ) -> lookupBootModuleIdMaybe mod (mkVarOcc occ)) $
+      (gHC_TYPES, "isTrue#") :
+      [(gHC_INTERNAL_NUM_INTEGER, occ) | occ <- ["integerLt", "integerEq", "integerSub"
+                                               , "integerLt#", "integerEq#", "integerCompare"]]
 
 -- | Check rules on the selected conversion and its standard Integer operations.
 -- See Note [Certifying a source literal conversion] in GHC.Tc.TyCl.Instance.
@@ -1819,13 +1872,13 @@ sourceLiteralUses dfun selector = case sourceLiteralCons_maybe dfun selector of
   Nothing -> pure Nothing
   Just (zero, _) -> do
     let num_module = mkGhcInternalModule (fsLit "GHC.Internal.Num")
-        lookup_id mod occ = lookupOrig mod occ >>= tcLookupId
-    cmp <- lookup_id gHC_CLASSES (mkVarOcc "<")
-    eq <- lookup_id gHC_CLASSES eqClassOpOcc
-    sub <- lookup_id num_module minusClassOpOcc
-    otherwise_id <- lookup_id gHC_INTERNAL_BASE (mkVarOcc "otherwise")
+        lookup_id mod occ = lookupBootModuleIdMaybe mod occ
+    mb_cmp <- lookup_id gHC_CLASSES (mkVarOcc "<")
+    mb_eq <- lookup_id gHC_CLASSES eqClassOpOcc
+    mb_sub <- lookup_id num_module minusClassOpOcc
+    mb_otherwise <- lookup_id gHC_INTERNAL_BASE (mkVarOcc "otherwise")
     -- This also loads the Integer module's ground comparison dictionaries.
-    workers <- sourceLiteralWorkers
+    mb_workers <- sourceLiteralWorkers
     insts <- tcGetInstEnvs
     let integer_dict op mod = case isClassOpId_maybe op of
           Just cls | Right (inst, []) <- lookupUniqueInstEnv insts cls [integerTy]
@@ -1833,6 +1886,11 @@ sourceLiteralUses dfun selector = case sourceLiteralCons_maybe dfun selector of
                    , nameModule_maybe (idName d) == Just mod -> Just d
           _ -> Nothing
     pure $ do
+      cmp <- mb_cmp
+      eq <- mb_eq
+      sub <- mb_sub
+      otherwise_id <- mb_otherwise
+      workers <- mb_workers
       ord_d <- integer_dict cmp gHC_INTERNAL_NUM_INTEGER
       eq_d  <- integer_dict eq  gHC_INTERNAL_NUM_INTEGER
       num_d <- integer_dict sub num_module
@@ -2057,8 +2115,7 @@ checkedAppendFusionRules :: RuleEnv -> NameSet -> NameSet -> Id
                          -> TcM (Either RetainedQuantificationError [Id])
 checkedAppendFusionRules visible unloaded local_rules append_owner = do
     append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
-    build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
-    mb_build <- tcLookupIdMaybe build_name
+    mb_build <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "build")
     let boot_mods =
           [ gHC_INTERNAL_BASE
           , mkGhcInternalModule (fsLit "GHC.Internal.CString")
@@ -2271,7 +2328,7 @@ checkSourceMethodUsesWithPending env = do
             any (any (\(n, _, m, c) -> n == append_name && m && c == spineStrictAppendSentinel))
                 (nonDetNameEnvElts defs)
       when has_spine_append $ do
-        mb_append <- tcLookupIdMaybe append_name
+        mb_append <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "++")
         forM_ mb_append $ \append_id -> do
           visible <- visibleSourceMethodRules env
           unloaded <- unloadedSourceRuleHeads env
@@ -2545,9 +2602,11 @@ sourceTableTyCons local binds = do
         visible <- visibleSourceMethodRules env
         unloaded <- unloadedSourceRuleHeads env
         let local_r = sourceRuleOwners (tcg_rules env)
+        build_ready <- isBootModuleReady gHC_INTERNAL_BASE
         build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
-        mb_build <- tcLookupIdMaybe build_name
-        let ok = not (build_name `elemNameSet` local_r) &&
+        mb_build <- if build_ready then tcLookupIdMaybe build_name else pure Nothing
+        let ok = build_ready &&
+                 not (build_name `elemNameSet` local_r) &&
                  not (build_name `elemNameSet` unloaded) &&
                  maybe True (not . hasSourceMethodRule visible) mb_build
         pure (Just visible, unloaded, local_r, ok)
@@ -5311,8 +5370,9 @@ guardedListProjections list = do
     let pair = mkTyConApp (promotedTupleDataCon Boxed 2) [list, list, left, right]
         inputs = [list, list, pair]
         projection occ selected = do
-          name <- lookupOrig (mkGhcInternalModule (fsLit "GHC.Internal.Data.Tuple")) (mkVarOcc occ)
-          projected <- tcLookupIdMaybe name
+          projected <- lookupBootModuleIdMaybe
+                         (mkGhcInternalModule (fsLit "GHC.Internal.Data.Tuple"))
+                         (mkVarOcc occ)
           pure $ do
             table <- projected >>= sourceTableId_maybe
             guard (sourceCaseVisibleArity table == Just 1)

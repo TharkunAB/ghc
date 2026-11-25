@@ -754,14 +754,14 @@ installSourceMethods wanted env
       methods -> setGblEnv env $ do
         let literals = [() | (_, fields) <- methods, (_, _, SourceLiteralMethod{}) <- fields]
         -- Load the workers before collecting rules from their interfaces.
-        workers <- if null literals then pure [] else sourceLiteralWorkers
+        mb_workers <- if null literals then pure (Just []) else sourceLiteralWorkers
         rules <- visibleSourceMethodRules env
         unloaded <- unloadedSourceRuleHeads env
         let local_rules = sourceRuleOwners (tcg_rules env)
             plain v = not (idName v `elemNameSet` local_rules
                            || idName v `elemNameSet` unloaded
                            || hasSourceMethodRule rules v)
-            workers_ok = all plain workers
+            workers_ok = maybe False (all plain) mb_workers
             plain_at (v, first) = not (idName v `elemNameSet` sourceRuleOwnersAt first (tcg_rules env)
                                        || idName v `elemNameSet` unloaded
                                        || hasSourceMethodRuleAt rules first v)

@@ -17,7 +17,14 @@ All compiler syntax, typechecking, promotion, and ergonomics work on this fork f
 
 ## Current checkpoint
 
-Wave 2, Wave 3, and Proposal `#378` Track A are consolidated on top of the self-hosted Wave 1 compiler (`186670b0b9`), expanding the Showcase to 635 observations and 63 registered tests:
+Waves 4B through 8D are consolidated atop the self-hosted Wave 2–4A compiler (`ce90ccbe2e`), expanding the Showcase to 639 observations ([`BookWave8Proposal378.hs`](examples/open-evaluation/BookWave8Proposal378.hs)) and 75 registered dependent-Haskell tests:
+
+- **Proposal `#378` quantifiers, T2T lowering, and `data` herald (Waves 4B, 7A, 8C, 8D)**: Adds `@arg` and `@pat` visibility overrides on `SpecifiedSpec` invisible `foreach .` binders (skipping `InferredSpec` `{k}`), unannotated and wildcard `foreach` binders, `foreach (a :: Type) ->` with unadorned call-site type arguments, full T2T lowering for `foreach`/`∏`/`exists`/`some`, inline `some` lowering, `@Pack` existential construction and pattern matching, the explicit `data` herald in type/expression/pattern syntax (`#378` §4.3.4), and reconciled User's Guide documentation.
+- **Retained pattern matrices, constrained GADTs, and scrutinee inference (Waves 6A, 7A, 8C)**: Supports 3+ column and nested `foreach` constructor patterns, catch-all dependent `case` branches, multi-argument indexed GADT `foreach` equations (`R16_UntypedSubstOpenEq`), retained GADT constructors mixing existential `forall`, class constraints, and `foreach` fields, nominal domain casts on certified source-call Core operands (`R03_RetainedSourceCallGadtCastCoreLint`), and polymorphic `foreach` scrutinee inference (`NativeRetainedScrutineePoly`).
+- **Open evaluation, nested source domains, certified `Num` numerals, and `MTrans` (Waves 5A, 5B, 8A)**: Publishes open equations for named substitution-map helpers (`singleSubst`, `doubleSubst`), 1-index untyped substitution and sigma-combinators, `Type`-valued large eliminations with promoted algebraic `forall` binders, spine-strict `(++)` proofs at default `-O2`, certified ground `Num` type-level numerals without `FromNatural`, polymorphic nested algebraic source domains (`R13_PolyNestedDomainOpenEq`), and multi-parameter/superclass/newtype class method promotion (`NativeMultiParamMethodOpenEq`). Rank-2 `HsForAllTy` binder matchability deferral resolves `deriving-via-compile` (`138/138` focused cohort).
+- **Typed holes, `HaskLib` interop, boot `Sigma`/`Exists`, and `-freport-totality` (Waves 5B, 6B, 8B)**: Adds dependent typed-hole synthesis, subgoal splitting, and candidate pruning (`DependentHoleFits`); exports `GHC.Sigma.second` and `GHC.Exists` (`/\`, `discardEvidence`) from `base`; consolidates `HaskLib` (`Equality`, `Fin`, `List`, `Nat`, `Sigma`, `Vec`) with `Haskell2010` interop (`OrdinaryInteropClient`); adds opt-in `-freport-totality` (`GHC.Tc.Gen.Totality`); and guards cold `ghc-internal` builds against unloaded sibling boot interfaces.
+
+Wave 2, Wave 3, and Proposal `#378` Track A (`ce90ccbe2e`, `_build/current`) previously consolidated atop Wave 1 (`186670b0b9`), expanding the Showcase to 635 observations and 63 registered tests:
 
 - **Proposal `#378` `-XDependentTypes` bundle & telescopes (Wave 4 Track A)**: Adds single-pragma `-XDependentTypes` (enabling the core dependent-types extension bundle and setting `NoListTuplePuns`), `-XExistentialTypes` (`#473`), `-XExtendedLet` (`#523`), default-on `-fwrite-source-equations` (overridable via `-fno-write-source-equations`), shared-type binder groups `(m n :: Nat)` across `foreach`/`∏`/`forall`/`exists`/`some`, Unicode `∏` (`U+220F`), braced `{k :: a}` specificity in invisible `foreach .`, multi-binder `exists`/`some`, and `foreach`/`exists`/`some` in `infixexp2`. See the [Proposal `#378` conformance audit](PROPOSAL-378.md).
 - **Wave 3 Track A (`%U` type-lambda captures & same-module closure staging)**: Supports capturing unmatchable `%U ->` predicate variables inside inline type lambdas (`LeibnizU` symmetry) and stages same-module two-index GADT traversals (`plug`) and De Bruijn closures (`substSingle`, `substDouble`, `substSingleU`) during `tcRnModule` without module splits.
@@ -170,11 +177,11 @@ Job 2996 matched the 113 book observations at native `-O0`, default
 
 ## Next compiler work
 
-1. **Wave 2 + Wave 3 + Wave 4A two-stage promotion**: Complete self-hosted two-stage qualification (`63/63` registered tests, `635/635` Showcase observations, `234/234` compatibility, `137/138` focused, and `PLFH` native + `no-code` checks) and promote to `_build/current`.
-2. **Proposal `#378` Priority 1 follow-up tracks ([`PROPOSAL-378.md`](PROPOSAL-378.md))**:
-   - Canonical `@arg` / `@pat` overrides for invisible `foreach .` binders alongside `@{expr}` (`#378` §4.8, §4.13).
-   - Unannotated `foreach a ->` / `foreach a.` domain inference and wildcard `foreach (_ :: t) ->` binders (`#378` §4.4, §4.11).
-   - Phase-preserving `foreach (a :: Type) ->` binding (`ex5 a = the a undefined`) and unadorned type arguments (`#378` §4.7, §4.9), existential GADT constructor arguments (`R04_ExistentialGadtRetainedArg.hs`), and `-O2` `base` list-fusion rule compatibility (`R03_FunctionColumnSplit.hs`, `R13_ShuntAccumOpenEq.hs`).
+1. **Wave 8 two-stage self-hosted qualification (`_build/on-demand/wave8-two-stage`)**: Qualify the warm two-stage self-hosted build across all 15 qualification gates (`75/75` registered tests, `639/639` Showcase observations at `-O0`, default `-O2`, and GHCi), `234/234` compatibility cases, `138/138` focused cases, and the 25-chapter `PLFH` verification suite.
+2. **Remaining open evaluation and roadmap items**:
+   - Mutual datatype and term-to-`Type` large-elimination staging (`R13_LargeElimMutualData.hs` for `PLFH.Part3.Adequacy`).
+   - Preserving unrenamed LHS binder names in synthesized 1-step dependent hole fits when sibling `foreach` binders are unused on the LHS.
+   - Higher-order callback promotion (`R03_HigherOrderCallbackOpenEq.hs`) and observational/extensional function equality research (`ROADMAP.md`).
 
 [Batch 37 status ledger and open reports](https://github.com/Tritlo/PLFH/blob/8756aed/content/Status.md)
 

@@ -1104,20 +1104,26 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
                 Just expr -> return expr
                 Nothing -> do
                   { -- See Note [Unrestricted data family case fields].
-                    case unLoc (stripParensLHsExpr scrut') of
+                    let mb_indexed_case = case unLoc (stripParensLHsExpr scrut') of
+                          HsVar _ (L _ index)
+                            | dependent, isNativeOpaqueValueId index
+                            , not (isNativeIndexId index)
+                            , Check result <- expected
+                            , anyFreeVarsOfType (== index) result
+                            -> Just index
+                          _ -> Nothing
+                  ; case unLoc (stripParensLHsExpr scrut') of
                       HsVar _ (L _ index)
                         | dependent, isNativeOpaqueValueId index
-                        , Just (tc, _) <- splitTyConApp_maybe scrut_ty
-                        , isDataFamilyTyCon tc ->
+                        , isJust mb_indexed_case
+                          || maybe False (isDataFamilyTyCon . fst) (splitTyConApp_maybe scrut_ty) ->
                             tcEqMult (OccurrenceOf (idName index)) mult ManyTy
                       _ -> return ()
-                  ; let check_matches = case unLoc (stripParensLHsExpr scrut') of
-                          HsVar _ (L _ index) | dependent, isNativeOpaqueValueId index
-                            , not (isNativeIndexId index), Check result <- expected
-                            , anyFreeVarsOfType (== index) result ->
-                                tcIndexedCaseMatches index ctxt
-                          _ -> tcExprCaseMatches ctxt tcBody
-                  ; matches' <- check_matches (Scaled mult scrut_ty) matches expected
+                  ; matches' <- case mb_indexed_case of
+                      Just index ->
+                        tcIndexedCaseMatches index ctxt (Scaled ManyTy scrut_ty) matches expected
+                      Nothing ->
+                        tcExprCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches expected
                   ; return (HsCase ctxt scrut' matches') } }
 
     preserve_origin expr' =

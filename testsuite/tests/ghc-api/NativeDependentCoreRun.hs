@@ -7559,7 +7559,7 @@ runOrdinaryRetainedModuleChecks libdir = do
                     , "wrong :: [Int] -> PackedVec Int"
                     , "wrong xs = PackVec (sourceLength @Bool xs) (sourceVector xs)"
                     ]
-                , 83605
+                , 83865
                 , ["Expected: [Bool]", "Actual: [Int]"]
                 )
             ,

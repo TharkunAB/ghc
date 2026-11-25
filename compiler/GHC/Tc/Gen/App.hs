@@ -27,7 +27,7 @@ import GHC.Rename.Utils ( mkExpandedLExpr, wrapGenSpan )
 import GHC.Tc.Gen.Head
 import GHC.Tc.Gen.Match ( tcMatches, tcBody, tcOpenImplicitPackage, tcOpenImplicitPackageAt
                         , implicitPayloadType, tcCloseRuntimeScope )
-import GHC.Tc.Gen.SourceTable ( tcLookupSourceTableId, sourceTableOccurrence, recordSourceMethodUse, recordSourceLiteralUse )
+import GHC.Tc.Gen.SourceTable ( tcLookupSourceTableId, sourceTableOccurrence, recordSourceMethodUse, recordSourceLiteralUse, lookupBootModuleIdMaybe )
 import GHC.Tc.Gen.Sig ( isCompleteHsSig )
 import GHC.Tc.Errors.Types
 import GHC.Tc.Errors.Ppr
@@ -4327,12 +4327,13 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                                 Just _ -> return Nothing
                                 Nothing -> do
                                   { residual <- liftZonkM (zonkTcType fun_ty)
-                                  ; (_, _, cache, choices) <-
+                                  ; (_, residual', cache, choices) <-
                                       tcRetainedArgInstEnabled (Just (count written_type_arg acc))
                                         do_ql expected_rho
                                         rn_head args tc_fun residual
+                                  ; residual'' <- liftZonkM (zonkTcType residual')
                                   ; writeTcRef ref (Just cache)
-                                  ; return ((, residual) <$> choices) } }
+                                  ; return ((, residual'') <$> choices) } }
                     _ -> return Nothing
                 ; case inferred of
                     Just (choices, residual) -> go1 (Just choices) fun_orig pos acc residual args
@@ -4820,8 +4821,7 @@ tcOptionalLetFunctionOperand mb_param expr expected_ty = runMaybeT $ do
     lookup_compose = do
       env <- liftMaybeT getGblEnv
       guard (tcg_semantic_mod env /= gHC_INTERNAL_BASE)
-      compose_name <- liftMaybeT (lookupOrig gHC_INTERNAL_BASE composeIdOcc)
-      compose_raw <- MaybeT (tcLookupIdMaybe compose_name)
+      compose_raw <- MaybeT (lookupBootModuleIdMaybe gHC_INTERNAL_BASE composeIdOcc)
       tcOptionalLetCertified compose_raw
 
     compose_chain compose mb_param funs expected = do
@@ -7434,19 +7434,90 @@ tcRetainedArgInstEnabled after_vta do_ql expected rn_head args fun sigma
            NoQL ->
              do { sigma' <- liftZonkM (zonkTcType sigma)
                 ; expected' <- mapM (liftZonkM . zonkTcType) expected
-                ; tcRetainedKnownArgPlan (tcRetainedDeclaredArgType tcRetainedDeclaredTypeView)
-                                       expected' fun sigma' args }
+                ; fmap (, sigma') <$>
+                    tcRetainedKnownArgPlan (tcRetainedDeclaredArgType tcRetainedDeclaredTypeView)
+                                           expected' fun sigma' args }
            _ -> return Nothing
        ; case declared of
-           Just choices -> return (fun, sigma, [], Just choices)
+           Just (choices, sigma') -> return (fun, sigma', [], Just choices)
            Nothing -> tcRetainedArgInstCached after_vta do_ql expected rn_head args fun sigma }
+
+{- Note [Ordinary metavariables in residual native signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A leading type argument can instantiate a polymorphic helper with fresh
+ordinary TauTv metavariables. For example, in
+`cong (renameU shiftFin) (eq x)`, `renameU shiftFin` introduces a fresh
+scope metavariable `m0 :: Nat` in the residual signature
+`forall (u :: UTerm m0) (v :: UTerm m0). u :~: v -> ...`.
+Pure template matching treats `m0` as rigid and fails against an argument
+or expected result over `UTerm n`, before `checkResultTy` equates `m0` and `n`.
+
+Before rejecting cached or expected native selection, match `tvs` and
+touchable TauTv metavariables of the residual signature together across
+generative result headers and cached argument pairs. Unify a signature
+metavariable only when its candidate is a well-kinded ordinary tau type
+at or above the current TcLevel, with no native dependent syntax, no Quick Look
+variables, and no template variables. Re-zonk the residual signature once
+without re-inferring any cached value argument.
+-}
+
+-- | Unify touchable ordinary TauTv metavariables in a residual signature from
+-- matched result or cached-argument pairs without assigning native syntax.
+-- See Note [Ordinary metavariables in residual native signatures].
+tcUnifySigmaOrdinaryMetas :: [TyVar] -> TcSigmaType -> [(Type, Type)] -> TcM Bool
+tcUnifySigmaOrdinaryMetas tvs sigma pairs = do
+  lvl <- getTcLevel
+  let is_flexi v
+        | isTcTyVar v, isMetaTyVar v, not (isQLInstTyVar v)
+        , TauTv <- metaTyVarInfo v
+        = isTouchableMetaTyVar lvl v && v `notElem` tvs
+        | otherwise = False
+      metas = filter is_flexi (tyCoVarsOfTypeList sigma)
+  if null metas || null pairs
+    then return False
+    else do
+      let bad_vars = mkVarSet (tvs ++ metas)
+          bind_tv v _
+            | v `elem` tvs || v `elem` metas = BindMe
+            | otherwise = DontBindMe
+          match_pair subst (formal, actual)
+            | Just s1 <- tcMatchRetainedTyX_BM bind_tv subst (typeKind formal) (typeKind actual)
+            , Just s2 <- tcMatchRetainedTyX_BM bind_tv s1 formal actual
+            = s2
+            | Just (tc, fs) <- splitTyConApp_maybe formal
+            , Just (tc', as) <- splitTyConApp_maybe actual
+            , tc == tc', isGenerativeTyCon tc Nominal, fs `equalLength` as
+            = foldl' match_pair subst (zip fs as)
+            | otherwise = subst
+          cand_subst = foldl' match_pair Subst.emptySubst pairs
+          valid_choice meta rhs
+            = isTauTy rhs
+              && not (hasNativeDependentExpr (Core.Type rhs))
+              && noQuickLookVars rhs
+              && not (tcTypeLevel rhs `strictlyDeeperThan` lvl)
+              && not (anyFreeVarsOfType (`elemVarSet` bad_vars) rhs)
+              && eqType (Subst.substTy cand_subst (tyVarKind meta)) (typeKind rhs)
+          chosen = [ (meta, rhs)
+                   | meta <- metas
+                   , Just rhs <- [Subst.lookupTyVar cand_subst meta]
+                   , valid_choice meta rhs ]
+      forM_ chosen $ \(meta, rhs) ->
+        void (unifyType Nothing (mkTyVarTy meta) rhs)
+      return (not (null chosen))
 
 -- | Run the existing usage-cached inference after declaration selection fails.
 -- See Note [Declared retained-domain choices].
 tcRetainedArgInstCached :: Maybe Int -> QLFlag -> Maybe TcRhoType -> (HsExpr GhcRn, SrcSpan)
                        -> [HsExprArg 'TcpRn] -> HsExpr GhcTc -> TcSigmaType
                        -> TcM (HsExpr GhcTc, TcSigmaType, RetainedArgCache, RetainedInstPlan)
-tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
+tcRetainedArgInstCached = tcRetainedArgInstCachedWith True
+
+-- | Worker for 'tcRetainedArgInstCached' with a one-shot ordinary-meta seed flag.
+-- See Note [Ordinary metavariables in residual native signatures].
+tcRetainedArgInstCachedWith :: Bool -> Maybe Int -> QLFlag -> Maybe TcRhoType -> (HsExpr GhcRn, SrcSpan)
+                           -> [HsExprArg 'TcpRn] -> HsExpr GhcTc -> TcSigmaType
+                           -> TcM (HsExpr GhcTc, TcSigmaType, RetainedArgCache, RetainedInstPlan)
+tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args fun sigma
   | not (any is_type_arg args)
   , (outer_tvs, body) <- tcSplitForAllInvisTyVars sigma
   , let (tvs, theta, tau) = tcRetainedInstTelescope sigma
@@ -7474,7 +7545,15 @@ tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
       then hasNoConcreteTyVars fun && isRetainedValueType tau
       else isTauTy tau && not (isFunTy result)
   = do { expected_ty <- mapM (liftZonkM . zonkTcType) expected
-       ; let index_route = not complete_choices && not (null index_tvs)
+       ; seeded_res <- case expected_ty of
+           Just rho | can_seed_metas, not overapplied ->
+             tcUnifySigmaOrdinaryMetas tvs sigma [(result, rho)]
+           _ -> return False
+       ; if seeded_res
+         then do { sigma' <- liftZonkM (zonkTcType sigma)
+                 ; tcRetainedArgInstCachedWith False after_vta NoQL expected_ty rn_head args fun sigma' }
+         else do
+       { let index_route = not complete_choices && not (null index_tvs)
              direct_subst = result_subst expected_ty index_route native_worker tvs result
              res_fvs = tyCoVarsOfTypes [result, typeKind result]
        ; initial_subst <- case expected_ty of
@@ -7541,85 +7620,102 @@ tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
        ; case eligible of
            Nothing -> return (fun, sigma, [], Nothing)
            Just inferable -> do
-             { let domain_at pos = scaledThing (domains !! (pos-1))
-                   matching_arg (pos, entry) =
+             { let mk_matching_arg cur_native cur_index cur_domains (pos, entry) =
                      let arg = value_args !! (pos-1)
+                         dom = scaledThing (cur_domains !! (pos-1))
                      in addArgCtxt (pos + fromMaybe 0 after_vta) rn_head arg $
                         do { ty <- liftZonkM (zonkTcType (actual_type entry))
                            ; loc <- getCtLocM (lexprCtOrigin arg) (Just TypeLevel)
-                           ; view <- if not native_worker && not index_route
+                           ; view <- if not cur_native && not cur_index
                                         && hasScopedDictionaryType ty && isTauTy ty && isFamFreeTy ty
                                      then return ty
                                      else reductionReducedType <$> tcRewriteFamilyAxioms loc ty
-                           ; return (loc, (domain_at pos, callback_view (domain_at pos) view)) }
-                   match_indices = tcMatchRetainedIndexArgs (bind_outer tvs)
+                           ; return (loc, (dom, callback_view dom view)) }
              ; initial_cache <- infer_args needed_tvs inferable domains 1 args
-             ; initial_args <- mapM matching_arg initial_cache
+             ; initial_args0 <- mapM (mk_matching_arg native_worker index_route domains) initial_cache
+             ; seeded_args <- if can_seed_metas
+                              then tcUnifySigmaOrdinaryMetas tvs sigma (map snd initial_args0)
+                              else return False
+             ; sigma_cur <- if seeded_args then liftZonkM (zonkTcType sigma) else return sigma
+             ; let (_, body_cur) = tcSplitForAllInvisTyVars sigma_cur
+                   (tvs_cur, _, tau_cur) = tcRetainedInstTelescope sigma_cur
+                   index_tvs_cur = filter (isNativeIndexType . tyVarKind) tvs_cur
+                   native_worker_cur = hasNativeDependentExpr (Core.Type body_cur)
+                   complete_choices_cur = native_worker_cur || equality_continuation
+                   index_route_cur = not complete_choices_cur && not (null index_tvs_cur)
+                   (_, domains_cur, result_cur) = splitFunTys tau_cur
+                   arguments_cur = zip3 [1..] domains_cur value_args
+                   matching_arg_cur = mk_matching_arg native_worker_cur index_route_cur domains_cur
+                   match_indices_cur = tcMatchRetainedIndexArgs (bind_outer tvs_cur)
+                   initial_subst_cur
+                     | seeded_args = result_subst expected_ty index_route_cur native_worker_cur tvs_cur result_cur
+                     | otherwise   = initial_subst
+             ; initial_args <- if seeded_args then mapM matching_arg_cur initial_cache else return initial_args0
              ; let initial_pairs = map snd initial_args
                    match_worker subst = foldM (\s (formal, actual) ->
-                       matchRetainedAppType tvs s formal actual) subst initial_pairs
-             ; (matched, cache, pairs) <- if index_route
+                       matchRetainedAppType tvs_cur s formal actual) subst initial_pairs
+             ; (matched, cache, pairs) <- if index_route_cur
                  then do
-                   { first <- match_indices initial_subst initial_args
+                   { first <- match_indices_cur initial_subst_cur initial_args
                    ; case first of
                        Nothing -> return (Nothing, initial_cache, [])
                        Just (subst, views)
                          | hasNoConcreteTyVars fun ->
-                           do { let missing = filter (isNothing . Subst.lookupTyVar subst) tvs
+                           do { let missing = filter (isNothing . Subst.lookupTyVar subst) tvs_cur
                                     remaining = zipWith (\pos eligible -> eligible && isNothing (lookup pos initial_cache))
                                                         [1..] inferable
-                              ; extra_cache <- infer_args missing remaining domains 1 args
-                              ; extra_args <- mapM matching_arg extra_cache
-                              ; extra <- match_indices subst extra_args
+                              ; extra_cache <- infer_args missing remaining domains_cur 1 args
+                              ; extra_args <- mapM matching_arg_cur extra_cache
+                              ; extra <- match_indices_cur subst extra_args
                               ; let cache = initial_cache ++ extra_cache
                               ; case extra of
                                   Just (s, extra_views) | not (null index_prefixes) -> do
-                                    { (matched, cache') <- tcRetainedCallbackArgs tvs index_prefixes s cache
+                                    { (matched, cache') <- tcRetainedCallbackArgs tvs_cur index_prefixes s cache
                                     ; let new_entries = filter (\(i, _) -> isNothing (lookup i cache)) cache'
-                                    ; prefix_pairs <- mapM (fmap snd . matching_arg) new_entries
+                                    ; prefix_pairs <- mapM (fmap snd . matching_arg_cur) new_entries
                                     ; return (matched, cache', views ++ extra_views ++ prefix_pairs) }
                                   _ -> return (fst <$> extra, cache, views ++ maybe [] snd extra) }
                          | otherwise -> return (Just subst, initial_cache, views) }
                  else do
-                   { initial_match <- if complete_choices
-                       then return (case match_worker initial_subst of
+                   { initial_match <- if complete_choices_cur
+                       then return (case match_worker initial_subst_cur of
                                       Nothing -> match_worker Subst.emptySubst
                                       other -> other)
-                       else do { m <- tcRetainedMatchArgs tvs initial_subst initial_pairs
+                       else do { m <- tcRetainedMatchArgs tvs_cur initial_subst_cur initial_pairs
                                ; case m of
-                                   Nothing -> tcRetainedMatchArgs tvs Subst.emptySubst initial_pairs
+                                   Nothing -> tcRetainedMatchArgs tvs_cur Subst.emptySubst initial_pairs
                                    other -> return other }
                    ; (m, cache) <- case initial_match of
-                       Just subst | not complete_choices ->
-                         tcRetainedCallbackArgs tvs arguments subst initial_cache
+                       Just subst | not complete_choices_cur ->
+                         tcRetainedCallbackArgs tvs_cur arguments_cur subst initial_cache
                        _ -> return (initial_match, initial_cache)
-                   ; pairs <- mapM (fmap snd . matching_arg) cache
+                   ; pairs <- mapM (fmap snd . matching_arg_cur) cache
                    ; return (m, cache, pairs) }
              ; choices <- case matched of
-                            Just subst | complete_choices
-                              -> return $ do { inst_tys <- traverse (Subst.lookupTyVar subst) tvs
+                            Just subst | complete_choices_cur
+                              -> return $ do { inst_tys <- traverse (Subst.lookupTyVar subst) tvs_cur
                                              ; return (subst, inst_tys) }
-                            Just subst -> tcRetainedArgChoices index_route tvs subst
+                            Just subst -> tcRetainedArgChoices index_route_cur tvs_cur subst
                             Nothing -> return Nothing
              ; case choices of
                  Just (subst, inst_tys)
-                   | index_route || any (hasNativeDependentExpr . Core.Type) inst_tys
+                   | index_route_cur || any (hasNativeDependentExpr . Core.Type) inst_tys
                    , not nested || any (hasNativeDependentExpr . Core.Type) inst_tys
-                   , not complete_choices || not (any (`elemVarSet` tyCoVarsOfTypes inst_tys) tvs)
+                   , not complete_choices_cur || not (any (`elemVarSet` tyCoVarsOfTypes inst_tys) tvs_cur)
                    , not equality_continuation
                      || (all isTauTy inst_tys
                          && not (any isMetaTyVar (tyCoVarsOfTypesList inst_tys))
-                         && maybe False (eqType (Subst.substTy subst result)) expected_ty)
-                   , and (zipWith (kind_agrees subst) tvs inst_tys)
+                         && maybe False (eqType (Subst.substTy subst result_cur)) expected_ty)
+                   , and (zipWith (kind_agrees subst) tvs_cur inst_tys)
                    , all (\(formal, actual) -> eqType (Subst.substTy subst formal) actual) pairs
                    -> do { valid <- tcRetainedInstScope inst_tys
                          ; if valid
                            then if nested || isJust after_vta
-                                then return (fun, sigma, cache, Just inst_tys)
+                                then return (fun, sigma_cur, cache, Just inst_tys)
                                 else return (mkHsWrap (mkWpTyApps inst_tys) fun,
-                                             Subst.substTy subst body, cache, Nothing)
-                           else return (fun, sigma, cache, Nothing) }
-                 _ -> return (fun, sigma, cache, Nothing) } }
+                                             Subst.substTy subst body_cur, cache, Nothing)
+                           else return (fun, sigma_cur, cache, Nothing) }
+                 _ -> return (fun, sigma_cur, cache, Nothing) } } }
   where
     is_type_arg ETypeArg{} = True
     is_type_arg _ = False
@@ -7695,7 +7791,7 @@ tcRetainedArgInstCached after_vta NoQL expected rn_head args fun sigma
            ; return (entry ++ entries) }
     infer_args tvs inferable domains pos (_ : args)
       = infer_args tvs inferable domains pos args
-tcRetainedArgInstCached _ _ _ _ _ fun sigma = return (fun, sigma, [], Nothing)
+tcRetainedArgInstCachedWith _ _ _ _ _ _ fun sigma = return (fun, sigma, [], Nothing)
 
 -- | Recognize a function whose result comes from a nominal equality continuation.
 isNominalEqualityContinuation :: [Scaled Type] -> Type -> Bool

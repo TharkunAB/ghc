@@ -6,6 +6,57 @@ compiler and the current queue, use the [program roadmap](ROADMAP.md#where-this-
 The [implementation log](PLAN.md) gives the specifications for the numbered
 increments.
 
+## Waves 4B through 8: Proposal #378 quantifiers, typed holes, nested domains, HaskLib interop, and advisory totality
+
+The consolidated Wave 4B through Wave 8D branch extends `ce90ccbe2e` to 639
+Showcase observations ([BookWave8Proposal378](examples/open-evaluation/BookWave8Proposal378.hs))
+and 75 registered dependent-Haskell tests (adding
+`NativeProposal378Quantifiers`, `NativeBootSigmaExists`,
+`NativeAutoNumLiterals`, `NativeRetainedCastSourceCall`, `DependentHoleFits`,
+`NativeProposal378PatternsAndT2T`, `NativePolyNestedDomainOpenEq`,
+`NativeMultiParamMethodOpenEq`, `NativeHaskLibInterop`,
+`NativeTotalityReport`, `NativeRetainedScrutineePoly`, and
+`NativeDataHeraldInTypes`):
+
+- **Proposal `#378` quantifiers, T2T lowering, and explicit `data` herald**:
+  Supports `@arg` and `@pat` visibility overrides on `SpecifiedSpec` invisible
+  `foreach .` binders while skipping `InferredSpec` `{k}` binders; infers
+  unannotated and wildcard `foreach` domains; binds runtime type witnesses via
+  `foreach (a :: Type) ->` with unadorned call-site type arguments; lowers
+  `foreach`, `∏`, `exists`, and `some` in required type arguments and inline
+  `some` types; supports `@Pack` existential construction and pattern matching;
+  adds the explicit `data` herald in type, expression, and pattern syntax
+  (`#378` §4.3.4) with zero `happy --strict` conflicts; and reconciles the
+  User's Guide dependent-types documentation.
+- **Retained pattern matrices, constrained GADTs, and scrutinee inference**:
+  Supports three or more `foreach` constructor columns, nested constructor
+  patterns, catch-all dependent `case` branches, multi-argument equations over
+  indexed GADT `foreach` binders (`R16_UntypedSubstOpenEq`), retained GADT
+  constructors combining existential `forall`, class constraints, and `foreach`
+  fields, nominal domain casts on certified source-call Core operands
+  (`R03_RetainedSourceCallGadtCastCoreLint`), and polymorphic `foreach`
+  scrutinee inference (`NativeRetainedScrutineePoly`).
+- **Open evaluation, polymorphic nested domains, and class promotion**:
+  Publishes open equations for named substitution-map helpers (`singleSubst`,
+  `doubleSubst`), 1-index untyped De Bruijn substitution and sigma-combinators,
+  `Type`-valued large eliminations with promoted algebraic `forall` binders,
+  spine-strict accumulator `(++)` proofs at default `-O2`
+  (`R13_ShuntAccumOpenEq`), certified ground `Num` type-level numerals without
+  `FromNatural`, polymorphic nested algebraic source domains
+  (`R13_PolyNestedDomainOpenEq`), and multi-parameter, superclass, and newtype
+  class method promotion (`NativeMultiParamMethodOpenEq`). Deferring arrow
+  matchability under rank-2 `HsForAllTy` binder kinds also resolves the
+  upstream `MTrans` diagnostic in `deriving-via-compile` (`138/138` focused
+  cohort tests).
+- **Dependent typed holes, `HaskLib` interop, boot `Sigma`/`Exists`, and `-freport-totality`**:
+  Adds dependent typed-hole synthesis, subgoal splitting, and candidate pruning
+  (`DependentHoleFits`); exposes `GHC.Sigma.second` and `GHC.Exists` (`/\`,
+  `discardEvidence`) from `base`; consolidates `HaskLib` (`Equality`, `Fin`,
+  `List`, `Nat`, `Sigma`, `Vec`) for ordinary `Haskell2010` clients
+  (`OrdinaryInteropClient`); adds the opt-in `-freport-totality` advisory
+  structural report in `GHC.Tc.Gen.Totality`; and guards cold `ghc-internal`
+  builds against unloaded sibling boot interfaces.
+
 ## Wave 2, Wave 3, and Proposal #378 Track A consolidation
 
 The consolidated Wave 2 + Wave 3 + Wave 4A branch extends `186670b0b9` with

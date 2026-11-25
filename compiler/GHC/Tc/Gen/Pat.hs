@@ -233,7 +233,8 @@ tcMatchPats match_ctxt pats pat_tys thing_inside
 tcMatchPatsWithIndex :: Id -> HsMatchContextRn -> [LPat GhcRn] -> [ExpPatType]
                      -> (Maybe EvVar -> TcM a) -> TcM ([LPat GhcTc], a)
 tcMatchPatsWithIndex index ctxt pats pat_tys inside
-  | [L loc pat@(ConPat { pat_con = L con_loc con, pat_args = args@PrefixCon{} })] <- pats
+  | [p0] <- pats
+  , L loc pat@(ConPat { pat_con = L con_loc con, pat_args = args@PrefixCon{} }) <- strip_par p0
   , [ExpFunPatTy pat_ty] <- pat_tys
   = setSrcSpanA loc $
       do { con_like <- tcLookupConLike con
@@ -247,6 +248,8 @@ tcMatchPatsWithIndex index ctxt pats pat_tys inside
              PatSynCon{} -> ordinary }
   | otherwise = ordinary
   where
+    strip_par (L _ (ParPat _ inner)) = strip_par inner
+    strip_par other = other
     penv = PE { pe_lazy = False, pe_ctxt = LamPat ctxt, pe_orig = PatOrigin }
     ordinary = tcMatchPats ctxt pats pat_tys (inside Nothing)
 

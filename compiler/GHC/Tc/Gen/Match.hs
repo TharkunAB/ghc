@@ -458,7 +458,8 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
   , not (has_function_binder ty)
   , plain_visible_arrows arity ty
   , not (retainedCaseHasQuote matches)
-  , has_nested_retained_con_matches (retained_columns 0 ty) matches
+  , has_nested_retained_con_matches (retained_or_gadt_columns 0 ty) matches
+    || has_multi_arg_indexed_gadt_matches matches
   = do { mb_desugared <- tryDesugarNestedRetainedMatches mctxt arity matches
        ; case mb_desugared of
            Just (arg_pats, single_group) ->
@@ -545,17 +546,32 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
         | isVisibleFunArg af, isManyTy mult -> plain_visible_arrows (n - 1) body
       _ -> False
 
+    unguarded_no_invis (L _ Match { m_pats = L _ ps
+                                  , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } })
+      = all isVisArgLPat ps
+    unguarded_no_invis _ = False
+
     has_nested_retained_con_matches :: [Int] -> MatchGroup GhcRn (LHsExpr GhcRn) -> Bool
     has_nested_retained_con_matches ret_cols (MG { mg_alts = L _ rows })
       = all unguarded_no_invis rows
         && any (\r -> any isNestedRetainedConPat
                         [p | (col, p) <- zip [0 :: Int ..] (hsLMatchPats r), col `elem` ret_cols])
                rows
+
+    has_multi_arg_indexed_gadt_matches :: MatchGroup GhcRn (LHsExpr GhcRn) -> Bool
+    has_multi_arg_indexed_gadt_matches (MG { mg_alts = L _ rows })
+      = arity >= 2
+        && all unguarded_no_invis rows
+        && not (null constructor_columns)
+        && any (`elem` gadt_cols) constructor_columns
+        && all (`elem` all_ret_cols) constructor_columns
+        && not first_col_is_vanilla_retained
       where
-        unguarded_no_invis (L _ Match { m_pats = L _ ps
-                                      , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } })
-          = all isVisArgLPat ps
-        unguarded_no_invis _ = False
+        gadt_cols = indexed_gadt_columns 0 ty
+        all_ret_cols = retained_or_gadt_columns 0 ty
+        first_col_is_vanilla_retained = case coreFullView ty of
+          DepFunTy DepFunVisible b _ -> isNativeIndexId b && (0 `elem` constructor_columns)
+          _ -> False
 
     unparen (L _ (ParPat _ pat)) = unparen pat
     unparen pat = pat
@@ -578,6 +594,27 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
         | isVisibleFunArg af -> retained_columns (column + 1) body
         | otherwise -> retained_columns column body
       _ -> []
+
+    is_indexed_gadt_binder :: Id -> Bool
+    is_indexed_gadt_binder binder
+      | not (isNativeIndexId binder)
+      , Just (tc, _) <- splitTyConApp_maybe (coreFullView (varType binder))
+      = any isNativeIndexedGadtCon (tyConDataCons tc)
+      | otherwise = False
+
+    indexed_gadt_columns column sigma = case coreFullView sigma of
+      DepFunTy DepFunVisible binder body
+        | is_indexed_gadt_binder binder -> column : indexed_gadt_columns (column + 1) body
+        | otherwise -> indexed_gadt_columns (column + 1) body
+      ForAllTy _ (Bndr _ Required) body -> indexed_gadt_columns (column + 1) body
+      ForAllTy _ _ body -> indexed_gadt_columns column body
+      FunTy af _ _ _ body
+        | isVisibleFunArg af -> indexed_gadt_columns (column + 1) body
+        | otherwise -> indexed_gadt_columns column body
+      _ -> []
+
+    retained_or_gadt_columns column sigma =
+      retained_columns column sigma ++ indexed_gadt_columns column sigma
 
     -- See Note [Function-valued retained binders] in GHC.Core.Type.
     has_function_binder :: Type -> Bool
@@ -623,6 +660,13 @@ argument with an indexed GADT domain. Use one runtime variable for the
 argument and check the equations as a case on that variable. The indexed
 case checker uses each branch's actual GADT evidence and fields to refine
 the result. Keep the source equations as the context for errors.
+
+When a definition has two or more visible arguments and matches constructors
+of an indexed GADT retained binder (for example after an ordinary function
+argument in congExts _ FZ = Refl), tryDesugarNestedRetainedMatches lowers
+the unguarded clause matrix to nested case expressions over fresh argument
+variables. Each case on an indexed GADT retained binder then dispatches to
+tcIndexedCaseMatches in GHC.Tc.Gen.Expr.
 
 Use this path for one argument with real prefix constructors from its
 datatype. Keep the original branch order and their guards. The case
@@ -3193,7 +3237,7 @@ tryDesugarNestedCaseAlts is_indexed scrut_name domain_ty alts
               fb_e' <- liftMaybeT (freshenClonedExpr fb_e)
               return ([mkSimpleMatch CaseAlt (noLocA [nlWildPatName]) fb_e'], True)
             _ -> return ([], False)
-          let alts_v = [mkSimpleMatch CaseAlt (noLocA [p]) r | (p, r) <- pats_rhss] ++ extra_alt
+          let alts_v = [mkSimpleMatch CaseAlt (noLocA [strip_par p]) r | (p, r) <- pats_rhss] ++ extra_alt
               mg_v   = MG { mg_ext = (Generated OtherExpansion SkipPmc, noAnn)
                           , mg_alts = noLocA alts_v }
           return (noLocA (HsCase CaseAlt (nlHsVar v) mg_v), used_fb)
@@ -3304,7 +3348,7 @@ tryDesugarNestedRetainedMatches mctxt arity group@(MG { mg_alts = L loc rows })
               fb_e' <- liftMaybeT (freshenClonedExpr fb_e)
               return [mkSimpleMatch CaseAlt (noLocA [nlWildPatName]) fb_e']
             _ -> return []
-          let alts_v = [mkSimpleMatch CaseAlt (noLocA [p]) r | (p, r) <- pats_rhss] ++ extra
+          let alts_v = [mkSimpleMatch CaseAlt (noLocA [strip_par p]) r | (p, r) <- pats_rhss] ++ extra
               mg_v   = MG { mg_ext = (Generated OtherExpansion SkipPmc, snd (mg_ext group))
                           , mg_alts = noLocA alts_v }
           return (noLocA (HsCase CaseAlt (nlHsVar v) mg_v))

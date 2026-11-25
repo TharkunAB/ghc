@@ -7,8 +7,11 @@ module Main (main) where
 
 import Data.Kind (Type)
 import Data.Proxy (Proxy (..))
+import Data.Type.Equality ((:~:) (Refl))
 import GHC.Exists
+import GHC.Exts (U)
 import GHC.Sigma (Sigma (Pair))
+import GHC.Types (Matchability)
 import NativeProposal378PatternsAndT2TProvider
 
 --------------------------------------------------------------------------------
@@ -203,6 +206,30 @@ compositionality (CLam c)    = \eq -> lamCong (compositionality c eq)
 compositionality (CAppL c _) = \eq -> appCong (compositionality c eq) denEqRefl
 compositionality (CAppR _ c) = \eq -> appCong denEqRefl (compositionality c eq)
 
+data FinG (n :: Nat) where
+  FZG :: FinG (Succ n)
+  FSG :: FinG n -> FinG (Succ n)
+
+type family LiftFin (f :: FinG m %U -> Nat) (y :: FinG (Succ m)) :: Nat where
+  LiftFin _ FZG     = Zero
+  LiftFin f (FSG x) = plus (Succ Zero) (f x)
+
+congReq :: forall {a} {b} {m :: Matchability}.
+           forall (f :: a %m -> b) -> forall (x :: a) (y :: a).
+           x :~: y -> f x :~: f y
+congReq _ Refl = Refl
+
+eqZeroFin :: foreach (x :: FinG (Succ Zero)) -> (\_z -> Zero) x :~: (\_z -> Zero) x
+eqZeroFin FZG     = Refl
+eqZeroFin (FSG x) = case x of {}
+
+congLiftFin
+  :: forall (m :: Nat) (f1 :: FinG m %U -> Nat) (f2 :: FinG m %U -> Nat).
+     (foreach (x :: FinG m) -> f1 x :~: f2 x)
+  -> foreach (y :: FinG (Succ m)) -> LiftFin f1 y :~: LiftFin f2 y
+congLiftFin _  FZG     = Refl
+congLiftFin eq (FSG x) = congReq (plus (Succ Zero)) (eq x)
+
 testRank2Compositional :: Int
 testRank2Compositional =
   let ctx :: UCtx (Succ Zero) Zero
@@ -210,7 +237,9 @@ testRank2Compositional =
       eq0 :: DenEq (Den UVar) (Den UVar)
       eq0 = denEqRefl
       MkDen out = fst (compositionality ctx eq0 MkValW) (MkDen 5)
-  in out
+      liftOk = case congLiftFin @(Succ Zero) @(\_z -> Zero) @(\_z -> Zero) eqZeroFin (FSG FZG) of
+                 Refl -> 0
+  in out + liftOk
 
 --------------------------------------------------------------------------------
 -- 4. P1.8 Local Scoping / Partial Sigs & #473 @Pack

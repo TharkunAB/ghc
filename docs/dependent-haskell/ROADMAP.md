@@ -45,9 +45,11 @@ proofs work in native code and in default GHCi with breakpoints enabled.
 Lists now proves both inverse laws between a predicate witness and an
 existential membership at a particular position. Confluence proves
 reflexivity of parallel reduction by induction under a lambda.
-Bisimulation now preserves its relation under an arbitrary type-preserving
-renaming. The proof extends the renaming when it crosses a binder.
-Simultaneous substitution with an arbitrary function is still open.
+Bisimulation preserves its relation across all 27 reduction rules using named
+single and double substitution helpers. Substitution proves its term-level
+sigma-calculus laws over 1-index untyped renamings and substitutions, and
+Connectives checks polymorphic nested product and sum round-trip proofs.
+DeBruijn also checks its bounded evaluator over retained progress witnesses.
 R03 and R16 remain partial.
 [DeBruijn proof](examples/open-evaluation/BookBetaReduction.hs),
 [More proof](https://github.com/Tritlo/PLFH/blob/81f8c63afdb722766d5ea6a1163f7d20345105d9/clients/PLFH/Part2/MoreProgress.hs),
@@ -111,8 +113,9 @@ The expected kind also fixes the omitted matchabilities in the bare
 `Pure1 'Endo` use in `FoldrDefault_`. An unsigned `Apply` synonym can
 accept both a data constructor and a type family. R23 remains partial.
 The standalone flag now works without the umbrella. The fork also
-accepts direct partial applications of built-in arithmetic. The stock
-transformer kind synonym still needs a source migration.
+accepts direct partial applications of built-in arithmetic and defers arrow
+matchability under rank-2 `forall` binder kinds so unmodified
+`deriving-via-compile` (`MTrans`) compiles cleanly.
 Seven other upstream source programs also require matchability
 annotations on the fork. [Stock GHC comparison](roadmap/R23-unsaturated-type-families.md#unchanged-source-on-stock-ghc-and-the-fork).
 [564 arithmetic checks](CHECKPOINTS.md#built-in-arithmetic-callbacks-and-type-let-case-results).
@@ -321,9 +324,9 @@ library should make that subset useful with ordinary Haskell libraries. These lo
 
 | Task | Roadmap relation | Next result and boundary |
 | --- | --- | --- |
-| Module interoperability | R03 and R05 | Check an indexed API from a module without dependent syntax. Preserve imported types and infer relationships where supported. Use an explicit adapter when a caller cannot express the contract. |
-| Small dependent-base | R03 and R04 | Start with the existing Nat, Vec, Fin, equality and package operations. The example library provides list conversion, package elimination and the [exact-length adapter](PLAN.md#m95-check-ordinary-list-inputs-at-an-indexed-boundary). Package and module names remain provisional. |
-| Conservative totality checking | Local assurance work related to R05 | Specify the property for lazy Haskell. Start with coverage and structural recursion. Keep checked results, trusted assumptions and unknown status distinct across imports. |
+| Module interoperability | R03 and R05 | Check an indexed API from an ordinary `Haskell2010` module without dependent syntax (`OrdinaryInteropClient`). Preserve imported types, lazy projections, and explicit boundary adapters (`fromListExact`, `packListVec`, `mkFin`). |
+| Small dependent-base | R03 and R04 | `HaskLib` re-exports `Equality`, `Fin`, `List`, `Nat`, `Sigma` (`first`, `second`, `withSigma`, `Pack`), and `Vec` (`lookupVec`, `fromListExact`, `packListVec`). Package and module names remain provisional. |
+| Conservative totality checking | Local assurance work related to R05 | Opt-in `-freport-totality` (`GHC.Tc.Gen.Totality`) logs advisory `checked-structural` and `unknown` classifications from the recomputed zonked call graph and private coverage checks. Keep checked results, trusted assumptions, and unknown status distinct across imports. |
 | Observational equality | R05 research | Compare explicit equality and transport with OTT. Keep checker conversion, contextual equivalence and inverse application distinct. No new equality rule is selected. |
 
 A module flag enables source features. It does not remove imported contracts.
@@ -340,11 +343,12 @@ Use linear-base as the library and adapter reference. Use Idris and Agda as
 references for conservative totality checks and imported assumptions.
 [Design references](REFERENCES.md).
 
-The first candidate is an advisory report for covered first-order functions
-with direct structural recursion. Use the zonked source AST and the existing
-coverage checker. Recompute the complete call graph; the inference graph omits
-some signed-call edges. Unsupported recursion, callbacks and imports stay
-unknown. No checker or new totality guarantee is implemented.
+The opt-in `-freport-totality` pass emits an advisory `MCInfo` report for
+covered first-order functions with direct structural recursion. It recomputes
+the top-level call graph on the zonked `GHC.Hs` AST and runs the pattern-match
+coverage checker privately. Unsupported recursion, higher-order calls, and
+external imports report `unknown` with an explicit reason. The report does not
+change Core conversion, exit status, or module interfaces.
 
 Use LiquidHaskell's [Refinement Types For Haskell](https://simon.peytonjones.org/assets/pdfs/refinement-types-for-haskell.pdf)
 as Haskell-specific prior art. Its analysis distinguishes potentially divergent
