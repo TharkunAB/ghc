@@ -866,46 +866,126 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts=env } } x alt tvs args =
 -- See Note [Coverage of retained constructor results].
 retainedIndexCanMatch :: Nabla -> Id -> DataCon -> Bool
 retainedIndexCanMatch MkNabla{nabla_ty_st = TySt _ inert} x con
-  | not (isEmptyBag irreds)
+  | not (isEmptyBag (inert_irreds (inert_cans inert)))
   , isNativeIndexId x
   , Just _ <- nativeIndexDataConTyArgs (idType x) con
-  = all compatible irreds
+  = case retainedGivenEquiv inert of
+      Nothing -> False
+      Just (find_rep, terms) ->
+        all compatible (lookupWithDefaultVarEnv terms [] (find_rep x))
   | otherwise = True
   where
-    irreds = inert_irreds (inert_cans inert)
-    compatible irred
-      | Just (index, other) <- retainedGivenHead (irredCtPred irred)
-      , index == x
+    compatible rhs
+      | Just (tc, _) <- splitTyConApp_maybe (coreFullView rhs)
+      , Just other <- isPromotedDataCon_maybe tc
+      , Just (domain, _) <- splitTyConApp_maybe (idType x)
+      , dataConTyCon other == domain
       = con == other
       | otherwise = True
 
--- | Check that the Givens assign compatible constructor heads to each retained Id.
--- See Note [Coverage of retained constructor results].
+-- | Check that the Givens assign compatible constructor spines to equated
+-- retained Ids without strict constructor cycles.
+-- See Note [Coverage of retained constructor results] and
+-- Note [Refuting absurd foreach branches via GADT indices] in GHC.Tc.Gen.Match.
 retainedGivensCompatible :: InertSet -> Bool
-retainedGivensCompatible inert = isJust (foldlM record emptyVarEnv irreds)
+retainedGivensCompatible inert = isJust (retainedGivenEquiv inert)
+
+-- | Build the equivalence relation and promoted-constructor bindings implied
+-- by nominal irreducible Givens on retained runtime variables.
+retainedGivenEquiv :: InertSet -> Maybe (Id -> Id, VarEnv [Type])
+retainedGivenEquiv inert = do
+  (uf, terms, roots) <- go 64 emptyVarEnv emptyVarEnv [] eqs
+  guard (acyclic uf terms roots)
+  pure (findRep uf, terms)
   where
     irreds = inert_irreds (inert_cans inert)
-    record heads irred
-      | Just (index, con) <- retainedGivenHead (irredCtPred irred)
-      = case lookupVarEnv heads index of
-          Just other -> heads <$ guard (con == other)
-          Nothing    -> Just (extendVarEnv heads index con)
-      | otherwise = Just heads
+    eqs = [ (coreFullView lhs, coreFullView rhs)
+          | irred <- bagToList irreds
+          , Just (Nominal, lhs, rhs) <- [getEqPredTys_maybe (irredCtPred irred)] ]
 
--- | Find a nominal equality between a retained Id and a promoted constructor.
-retainedGivenHead :: PredType -> Maybe (Id, DataCon)
-retainedGivenHead pred_ty
-  | Just (Nominal, lhs, rhs) <- getEqPredTys_maybe pred_ty
-  = match lhs rhs <|> match rhs lhs
-  | otherwise = Nothing
-  where
-    match (TermVarTy index) rhs
-      | Just (domain, _) <- splitTyConApp_maybe (idType index)
-      , Just (tc, _) <- splitTyConApp_maybe rhs
-      , Just con <- isPromotedDataCon_maybe tc
-      , dataConTyCon con == domain
-      = Just (index, con)
-    match _ _ = Nothing
+    findRep :: VarEnv Id -> Id -> Id
+    findRep uf v = case lookupVarEnv uf v of
+      Just p | p /= v -> findRep uf p
+      _               -> v
+
+    add_root :: Id -> [Id] -> [Id]
+    add_root r rs
+      | r `elem` rs = rs
+      | otherwise   = r : rs
+
+    go :: Int -> VarEnv Id -> VarEnv [Type] -> [Id] -> [(Type, Type)]
+       -> Maybe (VarEnv Id, VarEnv [Type], [Id])
+    go _    uf terms roots [] = Just (uf, terms, roots)
+    go 0    uf terms roots _  = Just (uf, terms, roots)
+    go fuel uf terms roots ((t1, t2) : rest) =
+      case (coreFullView t1, coreFullView t2) of
+        (TermVarTy v1, TermVarTy v2) ->
+          let r1 = findRep uf v1
+              r2 = findRep uf v2
+          in if r1 == r2
+             then go fuel uf terms roots rest
+             else
+               let ts1    = lookupWithDefaultVarEnv terms [] r1
+                   ts2    = lookupWithDefaultVarEnv terms [] r2
+                   uf'    = extendVarEnv uf r1 r2
+                   terms' = extendVarEnv (delVarEnv terms r1) r2 (ts1 ++ ts2)
+                   roots' = add_root r2 (add_root r1 roots)
+                   cross  = [(a, b) | a <- ts1, b <- ts2]
+               in go (fuel - 1) uf' terms' roots' (cross ++ rest)
+        (TermVarTy v, rhs) -> bind_term fuel uf terms roots (findRep uf v) rhs rest
+        (lhs, TermVarTy v) -> bind_term fuel uf terms roots (findRep uf v) lhs rest
+        (lhs, rhs)
+          | Just (dc1, args1) <- split_promoted_con lhs
+          , Just (dc2, args2) <- split_promoted_con rhs -> do
+              guard (dc1 == dc2)
+              let sub = if args1 `equalLength` args2 then zip args1 args2 else []
+              go (fuel - 1) uf terms roots (sub ++ rest)
+          | otherwise -> go fuel uf terms roots rest
+
+    bind_term :: Int -> VarEnv Id -> VarEnv [Type] -> [Id] -> Id -> Type -> [(Type, Type)]
+              -> Maybe (VarEnv Id, VarEnv [Type], [Id])
+    bind_term fuel uf terms roots rep rhs rest
+      | Nothing <- split_promoted_con rhs
+      = go fuel uf terms roots rest
+      | otherwise =
+          let prev   = lookupWithDefaultVarEnv terms [] rep
+              terms' = extendVarEnv terms rep (rhs : prev)
+              roots' = add_root rep roots
+              pairs  = [(rhs, p) | p <- prev]
+          in go (fuel - 1) uf terms' roots' (pairs ++ rest)
+
+    split_promoted_con :: Type -> Maybe (DataCon, [Type])
+    split_promoted_con ty
+      | Just (tc, args) <- splitTyConApp_maybe ty
+      , Just dc <- isPromotedDataCon_maybe tc
+      , let arity = dataConSourceArity dc
+      , length args >= arity
+      = Just (dc, drop (length args - arity) args)
+      | otherwise = Nothing
+
+    acyclic :: VarEnv Id -> VarEnv [Type] -> [Id] -> Bool
+    acyclic uf terms roots =
+      all (\r -> let r' = findRep uf r in not (reaches_strict uf terms emptyVarSet r' r')) roots
+
+    reaches_strict :: VarEnv Id -> VarEnv [Type] -> VarSet -> Id -> Id -> Bool
+    reaches_strict uf terms visited target cur
+      | cur `elemVarSet` visited = False
+      | otherwise =
+          let visited' = extendVarSet visited cur
+              step_vars =
+                [ findRep uf v
+                | rhs <- lookupWithDefaultVarEnv terms [] cur
+                , Just (_, field_args) <- [split_promoted_con rhs]
+                , arg <- field_args
+                , v <- term_vars_under uf arg ]
+          in any (\next -> next == target || reaches_strict uf terms visited' target next) step_vars
+
+    term_vars_under :: VarEnv Id -> Type -> [Id]
+    term_vars_under uf ty = case coreFullView ty of
+      TermVarTy v -> [findRep uf v]
+      other
+        | Just (_, args) <- split_promoted_con other -> concatMap (term_vars_under uf) args
+        | otherwise -> []
 
 {- Note [Coverage of retained constructor results]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

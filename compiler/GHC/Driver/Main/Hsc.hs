@@ -177,7 +177,7 @@ checkNativeDependentModule hsc_env binds rules tycons = do
   -- A closed user rule can mention its imported retained function only
   -- through ru_fn. See Note [Rules at a retained function head].
   retained_heads <- if native_body then pure [] else
-    fmap concat $ forM [ru_fn rule | rule@Rule{ru_auto = False} <- rules] $ \name -> do
+    fmap concat $ forM [fn | Rule{ru_auto = False, ru_fn = fn} <- rules] $ \name -> do
       thing <- GHC.Driver.Env.lookupType hsc_env name
       pure [Type (idType fun) | Just (AnId fun) <- [thing], hasRetainedRuleHead fun]
   let native = native_body || not (null retained_heads)
@@ -203,8 +203,9 @@ checkNativeDependentModule hsc_env binds rules tycons = do
       reject "interface unfolding generation (use -fomit-interface-pragmas)"
     when (gopt Opt_WriteIfSimplifiedCore dflags && not (supportsScopedDictionaryCore binds)) $
       reject "Core interface serialization (use -fno-write-if-simplified-core)"
-    unless (null (pluginsWithArgs (hsc_plugins hsc_env)) && null (pluginModNames dflags)) $
-      reject "module plugins"
+    -- See Note [Plugin hooks and Dependent Haskell pipelines] in GHC.Driver.Plugins.
+    when (hasActiveLatePlugins hsc_env) $
+      reject "late plugins"
   return native
 
 -- | Detect retained Core in the checked module, including implicit constructors.

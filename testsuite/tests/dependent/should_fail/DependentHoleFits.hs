@@ -1,9 +1,11 @@
 {-# LANGUAGE DependentTypes #-}
-{-# OPTIONS_GHC -fwrite-source-equations #-}
+{-# OPTIONS_GHC -fwrite-source-equations -fno-enable-rewrite-rules #-}
 module DependentHoleFits where
 
 import Data.Type.Equality ((:~:) (Refl))
 import GHC.Exts (Matchability)
+import GHC.List (List, foldr)
+import Prelude hiding (foldr)
 
 data Nat = Zero | Succ Nat
 
@@ -61,3 +63,8 @@ sameLenRefl (Cons _ xs) = SameCons (sameLenRefl xs)
 
 useSameLen :: forall a b. foreach (xs :: MyList a) -> foreach (ys :: MyList b) -> SameLen xs xs
 useSameLen xs _ = _
+
+-- 6. Higher-order foldr goal does not loop when checking Refl as a hole fit.
+foldrPlusGoal :: foreach (x :: Nat) -> foreach (xs :: List Nat) -> foreach (z :: Nat)
+              -> foldr plus z (x : xs) :~: plus (foldr plus Zero (x : xs)) z
+foldrPlusGoal x xs z = _
