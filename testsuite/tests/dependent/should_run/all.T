@@ -1104,3 +1104,8 @@ test('NativeDependentCompose',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeDependentCompose.hs'])],
      run_command, ['bash NativeDependentCompose.sh "{compiler}" "{libdir}"'])
+test('NativeVoidAbsurdOpenEq',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeVoidAbsurdOpenEqProvider.hs',
+                   'NativeVoidAbsurdOpenEq.hs'])],
+     run_command, ['bash NativeVoidAbsurdOpenEq.sh "{compiler}" "{libdir}"'])
