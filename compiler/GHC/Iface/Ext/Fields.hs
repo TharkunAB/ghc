@@ -13,6 +13,7 @@ module GHC.Iface.Ext.Fields
    -- * Known field names
    , sourceRuleHeadsField
    , inferredRetainedBindersField
+   , depFunUnfoldingField
    )
 where
 
@@ -105,3 +106,7 @@ sourceRuleHeadsField = "ghc.source-rule-heads.v1"
 -- @foreach@ binders in exported value and type-synonym signatures.
 inferredRetainedBindersField :: FieldName
 inferredRetainedBindersField = "ghc.inferred-retained-binders.v1"
+
+-- | Extensible interface field recording checked native @DepFunTy@ user unfoldings.
+depFunUnfoldingField :: FieldName
+depFunUnfoldingField = "ghc.retained-depfun-unfolding.v1"

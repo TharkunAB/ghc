@@ -40,8 +40,8 @@ import GHC.Platform.Ways
 
 import qualified GHC.LanguageExtensions as LangExt
 
-initTidyOpts :: Bool -> HscEnv -> ModGuts -> IO TidyOpts
-initTidyOpts native hsc_env guts = do
+initTidyOpts :: Bool -> Bool -> HscEnv -> ModGuts -> IO TidyOpts
+initTidyOpts native scoped hsc_env guts = do
   let dflags = hsc_dflags hsc_env
   static_ptr_opts <- if not (xopt LangExt.StaticPointers dflags)
     then pure Nothing
@@ -51,13 +51,15 @@ initTidyOpts native hsc_env guts = do
     , opt_collect_ccs       = ways dflags `hasWay` WayProf
     , opt_unfolding_opts    = unfoldingOpts dflags
     , opt_expose_unfoldings = if | gopt Opt_OmitInterfacePragmas dflags -> ExposeNone
+                                 | scoped                               -> ExposeSome
                                  | gopt Opt_ExposeAllUnfoldings dflags  -> ExposeAll
                                  | gopt Opt_ExposeOverloadedUnfoldings dflags  -> ExposeOverloaded
                                  | otherwise                            -> ExposeSome
-    , opt_expose_rules      = not (gopt Opt_OmitInterfacePragmas dflags)
-    , opt_trim_ids          = gopt Opt_OmitInterfacePragmas dflags
+    , opt_expose_rules      = not (gopt Opt_OmitInterfacePragmas dflags || scoped)
+    , opt_trim_ids          = gopt Opt_OmitInterfacePragmas dflags || scoped
     , opt_static_ptr_opts   = static_ptr_opts
     , opt_has_retained_core = native
+    , opt_has_scoped_dict_core = scoped
     , opt_check_imported_rule = checkImportedUserRule hsc_env (mg_module guts) (mg_binds guts)
     , opt_keep_auto_rules   = gopt Opt_KeepAutoRules dflags
     }

@@ -77,10 +77,11 @@ import GHC.Core.TyCon.Set
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Dependent
-  ( hasExistentialExpr, hasNativeDependentExprRhs, hasNativeDependentUnfolding
+  ( hasExistentialExpr, hasNativeDepFunType, hasNativeDependentExprRhs
+  , hasNativeDependentUnfolding, hasScopedDictionaryExpr, hasScopedDictionaryType
   , isRetainedVanillaDefaultMethod, hasRetainedRuleHead, supportsLocalUserRule
   , supportsErasedUserRule, supportsImportedErasedRule, supportsImportedUserRule
-  , supportsNativeUserUnfolding )
+  , supportsNativeDepFunUnfolding, supportsNativeUserUnfolding )
 import GHC.Core.Predicate ( mkNomEqPred )
 import GHC.Core.Opt.OccurAnal ( occurAnalyseBndrsAndExpr )
 import GHC.Core.Ppr
@@ -1083,21 +1084,25 @@ tcIfaceDecls ignore_prags ver_decls
    = concatMapM (tc_iface_decl_fingerprint ignore_prags) ver_decls
 
 -- | Remove optional erased package templates before exposing IdInfo.
--- See Note [Erased package unfoldings].
+-- See Note [Erased package unfoldings] and
+-- Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
 ifaceDeclsForTc :: ModIface -> [(Fingerprint, IfaceDecl)]
 ifaceDeclsForTc iface
   | FullIfaceBinHandle (Strict.Just (features, _)) <- mi_hi_bytes iface
   , any (`Set.member` features) [ErasedExistentialEvidence, ImplicitExistentialEvidence]
-  = [(fingerprint, prune decl) | (fingerprint, decl) <- mi_decls iface]
+  = [(fingerprint, prune (Set.member RetainedDepFunUnfoldingEvidence features) decl)
+    | (fingerprint, decl) <- mi_decls iface]
   | otherwise = mi_decls iface
   where
-    prune decl@IfaceId { ifIdInfo = info } = decl { ifIdInfo = filter keep info }
-    prune decl = decl
+    prune allow_depfun decl@IfaceId { ifType = ty, ifIdInfo = info }
+      = decl { ifIdInfo = filter (keep (allow_depfun && hasIfaceDepFunType ty)) info }
+    prune _ decl = decl
 
-    keep (HsUnfold _ (IfCoreUnfold src _ _ rhs))
+    keep allow_depfun (HsUnfold _ (IfCoreUnfold src _ _ rhs))
       | RetainedUserSrc <- src = True
+      | allow_depfun, isStableUserSource src = True
       | otherwise = isCompulsorySource src || not (hasIfacePackageExpr rhs)
-    keep _ = True
+    keep _ _ = True
 
 {- Note [Erased package unfoldings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3416,9 +3421,13 @@ tcUnfoldingRhs source toplvl name declared_ty expr
     core_expr' <- tcIfaceExpr expr
 
     -- Keep native checks in this thunk, including for nested unfoldings.
-    -- See Note [Native dependent unfolding templates] in GHC.Core.Unfold.Make.
-    let native = hasNativeDependentExprRhs core_expr'
+    -- See Note [Native dependent unfolding templates] in GHC.Core.Unfold.Make
+    -- and Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
+    let is_depfun_user = hasNativeDepFunType declared_ty && isStableUserSource source
+        scoped_dict = hasScopedDictionaryExpr core_expr' || hasScopedDictionaryType declared_ty
+        native = hasNativeDependentExprRhs core_expr'
                  || hasNativeDependentExprRhs (Type declared_ty)
+                 || scoped_dict
                  || case source of { RetainedUserSrc -> True; _ -> False }
     -- See Note [Compulsory retained defaults] in GHC.Iface.Tidy.
     case source of
@@ -3434,6 +3443,9 @@ tcUnfoldingRhs source toplvl name declared_ty expr
                 && (not (hasExistentialExpr core_expr')
                     || (isTopLevel toplvl && supportsNativeUserUnfolding core_expr'))) $
           failIfM (text "Invalid retained user unfolding:" <+> ppr name)
+      _ | is_depfun_user ->
+        unless (isTopLevel toplvl && supportsNativeDepFunUnfolding core_expr') $
+          failIfM (text "Invalid native DepFunTy unfolding:" <+> ppr name)
       _ -> pure ()
     dflags <- getDynFlags
     -- Check for type consistency in the unfolding
@@ -3441,7 +3453,11 @@ tcUnfoldingRhs source toplvl name declared_ty expr
     when (native || (isTopLevel toplvl && gopt Opt_DoCoreLinting dflags)) $ do
         in_scope <- nonDetEltsUniqSet <$> get_in_scope
         logger   <- getLogger
-        case lintUnfolding is_compulsory (initLintConfig dflags in_scope) noSrcLoc core_expr' of
+        let cfg = initLintConfig dflags in_scope
+            mb_errs
+              | scoped_dict = lintScopedDictionaryExpr cfg core_expr' declared_ty
+              | otherwise   = lintUnfolding is_compulsory cfg noSrcLoc core_expr'
+        case mb_errs of
           Nothing   -> return ()
           Just errs
             | native -> failIfM (text "Invalid native unfolding in interface:" <+> ppr name

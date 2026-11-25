@@ -1059,3 +1059,7 @@ test('NativeParamDependentRecordUpdate',
       extra_files(['NativeParamDependentRecordUpdateProvider.hs',
                    'NativeParamDependentRecordUpdate.hs'])],
      run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
+test('NativeDepFunUnfolding',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeDepFunUnfolding.hs'])],
+     run_command, ['bash NativeDepFunUnfolding.sh "{compiler}" "{libdir}"'])

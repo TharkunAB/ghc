@@ -58,6 +58,7 @@ import GHC.Driver.Env
 import GHC.Driver.DynFlags
 import GHC.Driver.Plugins
 
+import GHC.Types.Basic (isStableUserSource)
 import GHC.Types.Id
 import GHC.Types.Var ( varType )
 import GHC.Types.Fixity.Env
@@ -431,11 +432,15 @@ mkIface_ hsc_env
                     | dc <- tyConDataCons tc ]
               _ -> []
           , or flags ]
-    fields <- if null inferred_retained
+    fields2 <- if null inferred_retained
       then pure fields1
       else writeFieldWith inferredRetainedBindersField
              (\bh -> putWithUserData QuietBinIFace NormalCompression bh inferred_retained)
              fields1
+    -- See Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
+    fields <- if any has_special_depfun_unfold decls
+      then writeField depFunUnfoldingField () fields2
+      else pure fields2
 
     pure $ emptyPartialModIface this_mod
           -- Need to record this because it depends on the -instantiated-with flag
@@ -492,6 +497,60 @@ mkIface_ hsc_env
            in IfaceTopEnv exports imports
 
      ifFamInstTcName = ifFamInstFam
+
+     has_special_depfun_unfold (IfaceId { ifType = ty, ifIdInfo = infos })
+       | hasIfaceDepFunType ty = any is_special infos
+       where
+         is_special (HsUnfold _ (IfCoreUnfold src _ _ rhs))
+           = isStableUserSource src
+             && (hasIfacePackageExpr rhs
+                 || hasIfaceScopedDictType ty
+                 || has_iface_scoped_dict_expr rhs)
+         is_special _ = False
+     has_special_depfun_unfold _ = False
+
+     has_iface_scoped_dict_expr = go_expr
+       where
+         go_expr IfaceDictApp{} = True
+         go_expr (IfaceType ty) = hasIfaceScopedDictType ty
+         go_expr (IfaceCo co) = hasIfaceScopedDictCo co
+         go_expr (IfaceTuple _ args) = any go_expr args
+         go_expr (IfaceLam (bndr, _) rhs) = go_bndr bndr || go_expr rhs
+         go_expr (IfaceApp fun arg) = go_expr fun || go_expr arg
+         go_expr (IfaceIndexedConArg _ arg) = go_expr arg
+         go_expr (IfaceRetainedCharArg arg) = go_expr arg
+         go_expr (IfaceRetainedNaturalArg arg) = go_expr arg
+         go_expr (IfaceCase scrut _ alts) =
+           go_expr scrut || any (\(IfaceAlt _ _ rhs) -> go_expr rhs) alts
+         go_expr (IfaceECase scrut ty) = go_expr scrut || hasIfaceScopedDictType ty
+         go_expr (IfaceLet binding rhs) = go_bind binding || go_expr rhs
+         go_expr (IfaceCast rhs co) = go_expr rhs || hasIfaceScopedDictCo co
+         go_expr (IfaceLitRubbish _ ty) = hasIfaceScopedDictType ty
+         go_expr (IfaceFCall _ ty) = hasIfaceScopedDictType ty
+         go_expr (IfaceTick (IfaceBreakpoint _ args) rhs) =
+           any go_expr args || go_expr rhs
+         go_expr (IfaceTick _ rhs) = go_expr rhs
+         go_expr (IfacePack s w rhs) =
+           hasIfaceScopedDictType s || hasIfaceScopedDictType w || go_expr rhs
+         go_expr (IfaceUnpack (_, k) (w, _, ty) pkg body) =
+           hasIfaceScopedDictType k || hasIfaceScopedDictType w
+             || hasIfaceScopedDictType ty || go_expr pkg || go_expr body
+         go_expr _ = False
+
+         go_bndr (IfaceTvBndr (_, k)) = hasIfaceScopedDictType k
+         go_bndr (IfaceIdBndr (w, _, ty)) =
+           hasIfaceScopedDictType w || hasIfaceScopedDictType ty
+
+         go_bind (IfaceNonRec binder rhs) = go_pair (binder, rhs)
+         go_bind (IfaceRec pairs) = any go_pair pairs
+
+         go_pair (IfLetBndr _ ty info _, rhs) =
+           hasIfaceScopedDictType ty || go_expr rhs || any go_info info
+
+         go_info (HsUnfold _ (IfCoreUnfold _ _ _ rhs)) = go_expr rhs
+         go_info (HsUnfold _ (IfDFunUnfold bs args)) =
+           any go_bndr bs || any go_expr args
+         go_info _ = False
 
 -- | Check types and re-exports for the exact generated payload families.
 ifaceScopedSumDomainRequirement
