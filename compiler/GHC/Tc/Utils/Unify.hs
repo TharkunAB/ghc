@@ -5333,9 +5333,12 @@ checkTyConApp :: Monad m
 checkTyConApp flags tc_app tc tys
   | isTypeFamilyTyCon tc
   , let arity = tyConArity tc
+  , tys `lengthAtLeast` arity
+    -- See Note [Unsaturated family applications in kick-out and RHS checks]
+    -- in GHC.Tc.Solver.InertSet.
   = if tys `lengthIs` arity
     then checkFamApp flags tc_app tc tys  -- Common case
-    else do { let (fun_args, extra_args) = splitAt (tyConArity tc) tys
+    else do { let (fun_args, extra_args) = splitAt arity tys
                   fun_app                = mkTyConApp tc fun_args
             ; fun_res   <- checkFamApp flags fun_app tc fun_args
             ; extra_res <- mapCheck (check_ty_eq_rhs flags) extra_args
@@ -5391,7 +5394,8 @@ checkFamApp flags fam_app tc tys =
   case flags of
     TEFTyFam { tefTyFam_tyCon = lhs_tc, tefTyFam_args = lhs_tys
              , tefTyFam_occursCheck = occ_prob }
-      | tcEqTyConApps lhs_tc lhs_tys tc tys
+      | tys `lengthAtLeast` length lhs_tys
+      , tcEqTyConApps lhs_tc lhs_tys tc tys
       -- There is an occurs check F ty ~ ...(F ty)...
       -- Do not recurse; see (CFA1) in Note [Family applications in canonical constraints]
       -> do_not_recurse occ_prob

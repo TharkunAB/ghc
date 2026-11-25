@@ -67,7 +67,7 @@ import qualified GHC.Core.TyCo.Rep as Rep
 import GHC.Core.TyCon
 import GHC.Core.Class( Class, classTyCon )
 import GHC.Builtin.KnownKeys( eqPrimTyConKey, heqTyConKey, eqTyConKey, coercibleTyConKey )
-import GHC.Utils.Misc       ( partitionWith )
+import GHC.Utils.Misc       ( lengthAtLeast, partitionWith )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Data.Bag
@@ -1721,10 +1721,13 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
     fr_tf_can_rewrite_ty where_to_look new_tf new_tf_args role ty
       = anyRewritableTyFamApp role can_rewrite ty
       where
+        -- See Note [Unsaturated family applications in kick-out and RHS checks].
         can_rewrite :: UnderFam -> EqRel -> TyCon -> [TcType] -> Bool
         can_rewrite is_under_famapp old_role old_tf old_tf_args
           = (where_to_look == LookEverywhere || is_under_famapp) &&
             new_role `eqCanRewrite` old_role &&
+            new_tf == old_tf &&
+            old_tf_args `lengthAtLeast` length new_tf_args &&
             tcEqTyConApps new_tf new_tf_args old_tf old_tf_args
               -- it's possible for old_tf_args to have too many. This is fine;
               -- we'll only check what we need to.
@@ -1823,6 +1826,9 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
         go (Rep.TermVarTy {})  = False
         go (Rep.TermAppTy {})  = False
         go (Rep.DepFunTy {})   = False
+        go (Rep.ExistsTy {})   = False
+        go (Rep.DepDictTy {})  = False
+        go (Rep.ClassAppTy {}) = False
         go (Rep.AppTy fun _)   = go fun
         go (Rep.CastTy ty _)   = go ty
         go (Rep.TyConApp {})   = False
@@ -1838,13 +1844,49 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
         go (Rep.TermVarTy {})     = False
         go (Rep.TermAppTy {})     = False
         go (Rep.DepFunTy {})      = False
+        go (Rep.ExistsTy {})      = False
+        go (Rep.DepDictTy {})     = False
+        go (Rep.ClassAppTy {})    = False
         go (Rep.AppTy {})         = False  -- no TyConApp to the left of an AppTy
         go (Rep.CastTy ty _)      = go ty
-        go (Rep.TyConApp tc args) = tcEqTyConApps fun_tc fun_args tc args
+        -- See Note [Unsaturated family applications in kick-out and RHS checks].
+        go (Rep.TyConApp tc args) = tc == fun_tc
+                                 && args `lengthAtLeast` length fun_args
+                                 && tcEqTyConApps fun_tc fun_args tc args
         go (Rep.LitTy {})         = False
         go (Rep.ForAllTy {})      = False
         go (Rep.FunTy {})         = False
         go (Rep.CoercionTy {})    = False
+
+{- Note [Unsaturated family applications in kick-out and RHS checks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A canonical type-family equality `TyFamLHS F lhs_args` is always saturated,
+so `length lhs_args == tyConArity F`. Under `UnsaturatedTypeFamilies` or
+`DependentTypes` (for example, when a higher-order family `T:foldr` receives
+an unsaturated family `T:plus` as `TyConApp T:plus []`), a type can contain
+`TyConApp F args` with `length args < tyConArity F`.
+
+`GHC.Tc.Solver.Rewrite.rewrite_one` reduces `TyConApp F args` only when
+`args` has at least `tyConArity F` arguments. `tcEqTyConApps` compares two
+argument lists with `zipWith`, so it returns `True` when the shorter list is
+a prefix of the longer list (including `[]`). Without an explicit length
+guard:
+
+1. `kickOutRewritableLHS` (`fr_tf_can_rewrite_ty` and `fam_at_head`) treats
+   `TyFamLHS F lhs_args` as able to rewrite an unsaturated `TyConApp F args`.
+   Rewriting leaves the unsaturated application unchanged. Two inert
+   `TyFamLHS` equalities for `F` that each mention an unsaturated `F`
+   callback then kick each other out without termination.
+2. `GHC.Tc.Utils.Unify.checkTyConApp` routes an unsaturated `TyConApp F args`
+   into `checkFamApp`. In `TEFTyFam` mode, `tcEqTyConApps` reports a false
+   occurs-check failure against `TyFamLHS F lhs_args`. In `TEFA_Break` mode,
+   `famAppBreaker` emits `F args ~ cbv`, which is not a `TyFamLHS` and
+   triggers unification again.
+
+Require `old_tf_args` to have at least `length new_tf_args` arguments in
+`fr_tf_can_rewrite_ty` and `fam_at_head`, and enter `checkFamApp` in
+`checkTyConApp` only when `tys` has at least `tyConArity tc` arguments.
+-}
 
 {- Note [kickOutRewritable]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~

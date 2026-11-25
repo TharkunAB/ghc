@@ -413,3 +413,89 @@ for opt in -O0 -O2; do
     --make "$out/Main.hs" -o "$dir/run-compose"
   "$dir/run-compose"
 done
+
+# Regression check: unsaturated source-family callbacks in kick-out and RHS checks.
+cat > "$out/ListDefsHang.hs" <<'EOF'
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE ListTuplePuns #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# OPTIONS_GHC -fwrite-source-equations #-}
+
+module ListDefsHang (Nat (..), plus, foldr) where
+
+import Prelude hiding (foldr)
+
+data Nat = Zero | Succ Nat
+
+plus :: Nat -> Nat -> Nat
+plus Zero     n = n
+plus (Succ m) n = Succ (plus m n)
+
+foldr :: (a -> b -> b) -> b -> [a] -> b
+foldr _ z []       = z
+foldr f z (x : xs) = f x (foldr f z xs)
+EOF
+
+cat > "$out/SymUnsatFamOk.hs" <<'EOF'
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE ListTuplePuns #-}
+{-# LANGUAGE TypeFamilies #-}
+
+module SymUnsatFamOk (useSymGiven) where
+
+import Data.Type.Equality ((:~:) (Refl))
+import ListDefsHang (Nat (..), foldr, plus)
+import Prelude ()
+
+useSymGiven
+  :: foreach (xs :: [Nat]) -> foreach (z :: Nat)
+  -> plus (foldr plus Zero xs) z :~: foldr plus z xs
+  -> foldr plus z xs :~: plus (foldr plus Zero xs) z
+useSymGiven _ _ Refl = Refl
+EOF
+
+cat > "$out/HangInvisibleCong.hs" <<'EOF'
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE ListTuplePuns #-}
+{-# LANGUAGE TypeFamilies #-}
+
+module HangInvisibleCong where
+
+import Data.Type.Equality ((:~:) (Refl))
+import GHC.Matchability (Matchability)
+import ListDefsHang (Nat (..), foldr, plus)
+import Prelude ()
+
+congInv :: forall {a} {b} {m :: Matchability} (f :: a %m -> b) x y. (x :~: y) -> f x :~: f y
+congInv Refl = Refl
+
+step
+  :: foreach (x :: Nat) -> foreach (xs :: [Nat]) -> foreach (z :: Nat)
+  -> foldr plus z xs :~: plus (foldr plus Zero xs) z
+  -> foldr plus z (x : xs) :~: plus (foldr plus Zero (x : xs)) z
+step x xs z ih = congInv (plus x) ih
+EOF
+
+mkdir -p "$out/hang-check"
+"${ghc[@]}" -O0 -XGHC2024 -Wall -Werror -fno-code -fwrite-interface \
+  -i "-i$out/hang-check" -outputdir "$out/hang-check" \
+  -c "$out/ListDefsHang.hs"
+"${ghc[@]}" -O0 -XGHC2024 -Wall -Werror -fno-code -fwrite-interface \
+  -i "-i$out/hang-check" -outputdir "$out/hang-check" \
+  -c "$out/SymUnsatFamOk.hs"
+
+hang_rc=0
+timeout 10 "${ghc[@]}" -O0 -XGHC2024 -fno-code -fwrite-interface \
+  -i "-i$out/hang-check" -outputdir "$out/hang-check" \
+  -c "$out/HangInvisibleCong.hs" > "$out/hang-check/err.log" 2>&1 || hang_rc=$?
+
+if [[ "$hang_rc" -eq 0 || "$hang_rc" -eq 124 ]]; then
+  echo "Expected prompt type error for HangInvisibleCong, got exit $hang_rc" >&2
+  cat "$out/hang-check/err.log" >&2
+  exit 1
+fi
+grep -q "GHC-83865" "$out/hang-check/err.log"
