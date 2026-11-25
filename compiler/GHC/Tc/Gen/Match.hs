@@ -511,6 +511,12 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
                 prepared = matches { mg_alts = L (getLoc (mg_alts matches)) [L loc match'] }
             in tcExprMatchesWithWhereFrom (const match) mctxt (invis_pat_tys ++ pat_tys) rhs_ty
                  (maybe prepared (\(prefix, indices) -> splitRetainedSuffix prefix indices prepared) boundary)
+      rows@(_ : _ : _)
+        | plain_visible_arrows arity ty
+        , not (null constructor_columns)
+        , null (filter (`elem` constructor_columns) (retained_columns 0 ty))
+        , all (variable_retained_patterns ty . filter isVisArgLPat . hsLMatchPats) rows ->
+          tcRetainedVarGroupMatches herald ctxt mctxt arity invis_pat_tys ty matches
       _ | DepFunTy DepFunVisible binder _ <- coreFullView ty ->
           do { index <- newSysLocalId (occNameFS (nameOccName (idName binder))) ManyTy (varType binder)
              ; let body_ty = applyTypeToArgs ty [Var index]
@@ -1833,6 +1839,225 @@ retainedMatrixColumns plan (MG { mg_alts = L _ rows })
     constructor_pattern pat | ConPat{} <- unLoc (retainedConPat pat) = True
     constructor_pattern _ = False
 
+-- | Check a multi-equation function or lambda whose @foreach@ columns use only
+-- variable or wildcard patterns while ordinary GADT columns discriminate.
+-- See Note [Refuting absurd foreach branches via GADT indices].
+tcRetainedVarGroupMatches
+  :: ExpectedFunTyCtxt -> UserTypeCtxt -> HsMatchContextRn
+  -> VisArity -> [ExpPatType] -> Type
+  -> MatchGroup GhcRn (LHsExpr GhcRn)
+  -> TcM (HsWrapper, MatchGroup GhcTc (LHsExpr GhcTc))
+tcRetainedVarGroupMatches herald ctxt mctxt arity invis_pat_tys ty
+                          group@(MG { mg_alts = L loc rows }) = do
+  let dep_cols = collect_dep_cols 0 arity ty
+      vis_rows = map (filter isVisArgLPat . hsLMatchPats) rows
+      col_pats = transpose vis_rows
+  shared_spec <- forM [0 .. arity - 1] $ \c ->
+    case lookup c dep_cols of
+      Nothing -> pure (Nothing, nlWildPatName)
+      Just binder -> do
+        let occ = fromMaybe (getOccName binder) $
+                    listToMaybe [ nameOccName nm
+                                | p <- fromMaybe [] (listToMaybe (drop c col_pats))
+                                , L _ (VarPat _ (L _ nm)) <- [strip_par p] ]
+        nm <- newSysName occ
+        pure (Just nm, nlVarPat nm)
+  let shared_names  = map fst shared_spec
+      template_pats = map snd shared_spec
+  prepared_rows <- forM rows $ \(L rloc rm) -> do
+    let Match { m_pats = L _ rpats } = rm
+        vis_rpats = filter isVisArgLPat rpats
+        renames = [ (old_nm, shared_nm)
+                  | (Just shared_nm, p) <- zip shared_names vis_rpats
+                  , L _ (VarPat _ (L _ old_nm)) <- [strip_par p]
+                  , old_nm /= shared_nm ]
+    unless (null renames) $
+      case retainedMatchQuotation rm of
+        Nothing -> pure ()
+        Just sp -> setSrcSpan sp $
+          failWithTc (TcRnRetainedQuantificationError RetainedConstructorQuotation)
+    let rm1@(Match { m_pats = L ploc1 rpats1 }) = renameRetainedMatch renames rm
+        rpats2 = rewrite_vis shared_names rpats1
+    pure (L rloc (rm1 { m_pats = L ploc1 rpats2 }))
+  tcRetainedVarMatches herald ctxt ty template_pats $ \pat_tys rhs_ty _ _ ->
+    tcMatchesFromWithIndex Nothing (const (map unLoc rows)) mctxt tcBody
+      (invis_pat_tys ++ pat_tys) rhs_ty (group { mg_alts = L loc prepared_rows })
+  where
+    strip_par (L _ (ParPat _ p)) = strip_par p
+    strip_par p                  = p
+
+    listToMaybe (x : _) = Just x
+    listToMaybe []      = Nothing
+
+    collect_dep_cols _ 0 _ = []
+    collect_dep_cols c n sigma = case coreFullView sigma of
+      DepFunTy DepFunVisible b body -> (c, b) : collect_dep_cols (c + 1) (n - 1) body
+      FunTy af _ mult _ body
+        | isVisibleFunArg af, isManyTy mult -> collect_dep_cols (c + 1) (n - 1) body
+      _ -> []
+
+    rewrite_vis [] ps = ps
+    rewrite_vis spec (p : ps)
+      | not (isVisArgLPat p) = p : rewrite_vis spec ps
+      | Just shared_nm : rest <- spec =
+          let p' = case strip_par p of
+                L vloc (VarPat x (L nloc _)) -> L vloc (VarPat x (L nloc shared_nm))
+                L wloc _                     -> L wloc (VarPat noExtField (noLocA shared_nm))
+          in p' : rewrite_vis rest ps
+      | Nothing : rest <- spec = p : rewrite_vis rest ps
+    rewrite_vis _ [] = []
+
+-- | Check whether an omitted @foreach@ constructor tuple is refuted either by
+-- declared equality constraints or by an uninhabited GADT/equality value
+-- column in the telescope. When an inspected value column becomes uninhabited,
+-- synthesize an absurd @Match@ whose RHS is an empty @case@ on that argument.
+-- Return @Just Nothing@ when declared equality constraints alone contradict
+-- the tuple, @Just (Just row)@ when an empty GADT value column refutes it, or
+-- @Nothing@ when the tuple remains reachable.
+-- See Note [Refuting absurd foreach branches via GADT indices].
+synthAbsurdMatrixRow
+  :: [(Int, Id, DataCon)]
+  -> [ExpPatType]
+  -> [RetainedConArg]
+  -> SrcSpanAnnA
+  -> MatchGroupAnn
+  -> [LMatch GhcRn (LHsExpr GhcRn)]
+  -> TcM (Maybe (Maybe ([(Int, Id, (DataCon, [Id]))], LMatch GhcRn (LHsExpr GhcRn))))
+synthAbsurdMatrixRow missing_cols pat_tys plan loc ext_ann matches = do
+  let con_pat dc = nlConPatName (dataConName dc)
+                     (replicate (dataConSourceArity dc) nlWildPatName)
+  mb_resolved <- fmap sequence $ forM missing_cols $ \(col_i, idx_id, dc) -> do
+    mb <- tcRetainedCon (varType idx_id) (con_pat dc)
+    pure ((col_i, idx_id,) <$> mb)
+  case mb_resolved of
+    Nothing -> pure Nothing
+    Just inst_cols -> do
+      cvs <- forM inst_cols $ \(_, idx_id, (dc, fields)) -> do
+        cv <- newEvVar (mkNomEqPred (TermVarTy idx_id)
+                                    (retainedConIndex (varType idx_id) dc fields))
+        pure (idx_id, mkCoVarCo cv)
+      let col_ids = [idx_id | (_, idx_id, _) <- inst_cols]
+          mentions_any = anyFreeVarsOfType (`elem` col_ids)
+          predicates = [varType d | RetainedConDict d <- plan, isCoverageEquality (varType d)]
+          transport_ty ty = foldM step (mkNomReflCo ty) cvs
+            where
+              step acc (idx_id, co) = do
+                next <- tcRetainedCoercion idx_id co (pSnd (coercionKind acc))
+                pure (mkTransCo acc next)
+      level <- getTcLevel
+      ambient <- filter (isCoverageEquality . varType) <$> getLexicalGivens
+      let satisfiable tys = do
+            givens <- newEvVars tys
+            tcCheckGivens (emptyInertSet level) (listToBag (ambient ++ givens))
+      dict_outcome <- if any mentions_any predicates
+        then do
+          before <- satisfiable predicates
+          case before of
+            Nothing -> pure (Left False)
+            Just outer -> do
+              specialised <- mapM (fmap (pSnd . coercionKind) . transport_ty) predicates
+              after <- satisfiable specialised
+              pure $ case after of
+                Nothing    -> Left True
+                Just local -> Right (Just (outer, local))
+        else pure (Right Nothing)
+      case dict_outcome of
+        Left True  -> pure (Just Nothing)
+        Left False -> pure Nothing
+        Right mb_inerts -> case matches of
+          [] -> pure Nothing
+          L _ first_match : _ -> do
+            mb_arg_tys <- fmap sequence (mapM read_pat_ty pat_tys)
+            case mb_arg_tys of
+              Nothing -> pure Nothing
+              Just arg_tys -> do
+                let vis_columns =
+                      zip [0 :: Int ..]
+                        [ (col_i, arg, sty)
+                        | (col_i, (arg, sty)) <- zip [0..] (zip plan arg_tys)
+                        , isRetainedSourceArg arg ]
+                    vis_rows = [filter isVisArgLPat (hsLMatchPats m) | m <- matches]
+                if not (all (`equalLength` vis_columns) vis_rows)
+                  then pure Nothing
+                  else do
+                    let inspected =
+                          [ (vis_idx, sty)
+                          | ((vis_idx, (_, RetainedConValue, Scaled _ sty)), col_pats) <-
+                              zip vis_columns (transpose vis_rows)
+                          , any strict_con_pat col_pats ]
+                    direct <- firstJustsM
+                      [ do { co <- transport_ty sty
+                           ; ct_loc <- getCtLocM PatCheckOrigin Nothing
+                           ; Reduction _ domain <- runTcSEqualities
+                               (rewriteFamilyAxioms ct_loc (pSnd (coercionKind co)))
+                           ; pure (if isEmptyTy domain then Just vis_idx else Nothing) }
+                      | (vis_idx, sty) <- inspected
+                      , mentions_any sty ]
+                    witness <- case (direct, mb_inerts) of
+                      (Just _, _) -> pure direct
+                      (Nothing, Just (outer, local)) -> firstJustsM
+                        [ do { orig <- tcNormalise outer sty
+                             ; spec <- pSnd . coercionKind <$> transport_ty sty
+                             ; ref  <- tcNormalise local spec
+                             ; pure (if not (isEmptyTy orig) && isEmptyTy ref
+                                     then Just vis_idx else Nothing) }
+                        | (vis_idx, sty) <- inspected ]
+                      (Nothing, Nothing) -> pure Nothing
+                    case witness of
+                      Nothing -> pure Nothing
+                      Just witness_vis_idx -> do
+                        imp_name <- newSysName (mkVarOcc "impossible")
+                        let inst_map = [(col_i, dc) | (col_i, _, (dc, _)) <- inst_cols]
+                        vis_pats <- forM vis_columns $ \(vis_idx, (col_i, _, Scaled mult _)) ->
+                          case lookup col_i inst_map of
+                            Just dc -> pure (con_pat dc)
+                            Nothing
+                              | vis_idx == witness_vis_idx -> pure (nlVarPat imp_name)
+                              | isManyTy mult              -> pure nlWildPatName
+                              | otherwise                  -> nlVarPat <$> newSysName (mkVarOcc "unused")
+                        let empty = MG (Generated OtherExpansion SkipPmc, ext_ann) (L loc [])
+                            rhs   = noLocA (HsCase CaseAlt (nlHsVar imp_name) empty)
+                            absurd_match = mkSimpleMatch (m_ctxt first_match) (noLocA vis_pats) rhs
+                        pure (Just (Just (inst_cols, absurd_match)))
+  where
+    read_pat_ty (ExpFunPatTy et) = Just <$> readScaledExpType et
+    read_pat_ty _                = pure Nothing
+
+    strict_con_pat :: LPat GhcRn -> Bool
+    strict_con_pat (L _ (ParPat _ p)) = strict_con_pat p
+    strict_con_pat p | ConPat{} <- unLoc (retainedConPat p) = True
+    strict_con_pat _ = False
+
+{- Note [Refuting absurd foreach branches via GADT indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a function splits two or more @foreach@ arguments (such as
+@sameVecZip :: foreach (m n :: Nat) -> Vec a m -> Vec b n -> (m :~: n) -> ...@),
+an off-diagonal constructor combination such as @('Zero, 'Succ k)@ can make a
+later GADT or propositional equality parameter uninhabited (for example
+@'Zero :~: 'Succ k@ or @SameLen 'Zero ('Succ k)@) without an explicit @~@
+constraint dictionary in the signature.
+
+'synthAbsurdMatrixRow' handles omitted constructor tuples across two-column and
+N-column @foreach@ matrices by transporting every constructor-inspected value
+argument type along the hypothetical nominal constructor proofs, reducing
+family axioms, and testing 'isEmptyTy' (directly and under any declared equality
+Givens). When an inspected value column becomes uninhabited, it synthesizes an
+equation that binds that column to a fresh variable and eliminates it with an
+empty @HsCase@ (@case impossible of {}@). 'checkRetainedRows' then typechecks
+the synthesized equation under the branch's transported @CoPat@ types so Core
+receives a well-typed strict elimination of the impossible witness and PMC sees
+all @foreach@ constructor combinations covered. Reachable omitted combinations
+continue to fail with 'RetainedMissingConstructorPair' or 'RetainedMatrixCoverage'.
+
+Symmetrically, when a multi-equation function leaves all @foreach@ arguments as
+variables or wildcards and discriminates only on later GADT arguments,
+'tcRetainedVarGroupMatches' shares one runtime @Id@ per @foreach@ binder across
+all equations, while 'GHC.HsToCore.Pmc.Solver.retainedGivenEquiv' closes
+nominal @TermVarTy@ Givens under symmetry, transitivity, constructor
+injectivity, and occurs-check cycles so PMC refutes cross-argument GADT
+impossibilities without false @-Wincomplete-patterns@ warnings.
+-}
+
 -- | Check a two-index matrix in left-to-right order.
 -- See Note [Retained constructor matrices].
 tcRetainedMatrixMatches :: (Int, Id) -> (Int, Id) -> [ExpPatType] -> [ExpPatType]
@@ -1841,57 +2066,43 @@ tcRetainedMatrixMatches :: (Int, Id) -> (Int, Id) -> [ExpPatType] -> [ExpPatType
                        -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
 tcRetainedMatrixMatches (first_column, first_index) (second_column, second_index) invis_pat_tys
                        pat_tys plan rhs_ty
-                       (MG { mg_alts = L loc matches, mg_ext = (origin, _) })
+                       (MG { mg_alts = L loc matches, mg_ext = (origin, ext_ann) })
   = setSrcSpanA loc $
     do { rows <- zipWithM constructors [1..] matches
-       ; _ <- foldM unique_row [] (zip rows matches)
+       ; unless (any has_value_pattern matches) $
+           void (foldM unique_row [] (zip rows matches))
        ; let expected = [(first, second) | first <- domain_cons first_index
                                          , second <- second_cons]
-       ; unless (any isNothing rows) $
-           forM_ (filter (\pair -> not (any (covers pair) rows)) expected) check_missing
+       ; synthesized <- if any isNothing rows
+           then pure []
+           else fmap catMaybes $
+                  forM (filter (\pair -> not (any (covers pair) rows)) expected) check_missing
        ; let columns Nothing = []
              columns (Just (first, second)) =
                (first_column, first_index, first) :
                  [(second_column, second_index, con) | con <- maybeToList second]
-       ; checkRetainedRows False invis_pat_tys pat_tys plan rhs_ty origin loc
-           (zip (map columns rows) matches) }
+       ; checkRetainedRows True invis_pat_tys pat_tys plan rhs_ty origin loc
+           (zip (map columns rows) matches ++ synthesized) }
   where
     first_source = source_column first_column
     second_source = source_column second_column
     source_column column = length (filter isRetainedSourceArg (take column plan))
+    plan_columns = retainedColumnNames plan
+    has_value_pattern (L _ (Match { m_pats = L _ pats })) =
+      or [not (isRetainedVarPat pat) | (Nothing, pat) <- zip plan_columns (filter isVisArgLPat pats)]
 
-    -- An omitted constructor pair must contradict a declared equality.
-    check_missing (one, two)
-      | any (anyFreeVarsOfType (\v -> v == first_index || v == second_index)) predicates
-      = do { level <- getTcLevel
-           ; ambient <- filter (isCoverageEquality . varType) <$> getLexicalGivens
-           ; let satisfiable tys = do
-                   givens <- newEvVars tys
-                   tcCheckGivens (emptyInertSet level) (listToBag (ambient ++ givens))
-           ; before <- satisfiable predicates
-           ; when (isNothing before) missing_pair
-           ; co1 <- hypothetical first_index one
-           ; co2 <- hypothetical second_index two
-           ; specialised <- mapM (fmap (pSnd . coercionKind) . transport_pair co1 co2) predicates
-           ; after <- satisfiable specialised
-           ; when (isJust after) missing_pair }
-      | otherwise = missing_pair
+    -- An omitted constructor pair must contradict a declared equality or
+    -- make an inspected GADT/equality value column uninhabited.
+    check_missing (one, two) = do
+      mb_res <- synthAbsurdMatrixRow
+                  [(first_column, first_index, one), (second_column, second_index, two)]
+                  pat_tys plan loc ext_ann matches
+      case mb_res of
+        Nothing     -> missing_pair
+        Just mb_row -> pure mb_row
       where
-        missing_pair :: TcM a
         missing_pair = failWithTc (TcRnRetainedQuantificationError
                          (RetainedMissingConstructorPair (dataConName one) (dataConName two)))
-        predicates = [varType d | RetainedConDict d <- plan, isCoverageEquality (varType d)]
-        hypothetical index con = do
-          let pat = nlConPatName (dataConName con) (replicate (dataConSourceArity con) nlWildPatName)
-          resolved <- tcRetainedCon (varType index) pat
-          case resolved of
-            Just row -> mkCoVarCo <$> constructor_proof index row
-            Nothing -> missing_pair
-
-    transport_pair first_co second_co ty = do
-      one <- tcRetainedCoercion first_index first_co ty
-      two <- tcRetainedCoercion second_index second_co (pSnd (coercionKind one))
-      return (mkTransCo one two)
     domain_cons index = case splitTyConApp_maybe (coreFullView (varType index)) of
       Just (tc, _) -> tyConDataCons tc
       _ -> []
@@ -1944,31 +2155,34 @@ tcRetainedMatrixMatches (first_column, first_index) (second_column, second_index
                       failWithTc (TcRnRetainedQuantificationError RetainedMatrixDuplicate) }
            ; return (row : seen) }
 
-    constructor_proof index (con, fields) =
-      newEvVar (mkNomEqPred (TermVarTy index) (retainedConIndex (varType index) con fields))
-
 -- | Check an N-column (3+) retained constructor matrix in left-to-right order.
 tcRetainedNMatrixMatches :: [(Int, Id)] -> [ExpPatType] -> [ExpPatType]
                          -> [RetainedConArg] -> ExpRhoType
                          -> MatchGroup GhcRn (LHsExpr GhcRn)
                          -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
 tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
-                         (MG { mg_alts = L loc matches, mg_ext = (origin, _) })
+                         (MG { mg_alts = L loc matches, mg_ext = (origin, ext_ann) })
   = setSrcSpanA loc $
     do { rows <- zipWithM constructors [1..] matches
-       ; _ <- foldM unique_row [] (zip rows matches)
+       ; unless (any has_value_pattern matches) $
+           void (foldM unique_row [] (zip rows matches))
        ; let expected = sequence (map (domain_cons . snd) cols)
-       ; unless (any isNothing rows) $
-           forM_ (filter (\tup -> not (any (covers tup) rows)) expected) check_missing
+       ; synthesized <- if any isNothing rows
+           then pure []
+           else fmap catMaybes $
+                  forM (filter (\tup -> not (any (covers tup) rows)) expected) check_missing
        ; let row_columns Nothing = []
              row_columns (Just cells) =
                [ (col_idx, idx_id, cell)
                | ((col_idx, idx_id), Just cell) <- zip cols cells ]
        ; checkRetainedRows True invis_pat_tys pat_tys plan rhs_ty origin loc
-           (zip (map row_columns rows) matches) }
+           (zip (map row_columns rows) matches ++ synthesized) }
   where
     source_cols = [length (filter isRetainedSourceArg (take c plan)) | (c, _) <- cols]
     col_indices = map snd cols
+    plan_columns = retainedColumnNames plan
+    has_value_pattern (L _ (Match { m_pats = L _ pats })) =
+      or [not (isRetainedVarPat pat) | (Nothing, pat) <- zip plan_columns (filter isVisArgLPat pats)]
 
     domain_cons index = case splitTyConApp_maybe (coreFullView (varType index)) of
       Just (tc, _) -> tyConDataCons tc
@@ -2031,34 +2245,13 @@ tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
                       failWithTc (TcRnRetainedQuantificationError RetainedMatrixDuplicate) }
            ; return (row : seen) }
 
-    check_missing tup
-      | any (anyFreeVarsOfType (`elem` col_indices)) predicates
-      = do { level <- getTcLevel
-           ; ambient <- filter (isCoverageEquality . varType) <$> getLexicalGivens
-           ; let satisfiable tys = do
-                   givens <- newEvVars tys
-                   tcCheckGivens (emptyInertSet level) (listToBag (ambient ++ givens))
-           ; before <- satisfiable predicates
-           ; when (isNothing before) coverage_error
-           ; cos <- zipWithM hypothetical col_indices tup
-           ; specialised <- mapM (fmap (pSnd . coercionKind) . transport_many (zip col_indices cos)) predicates
-           ; after <- satisfiable specialised
-           ; when (isJust after) coverage_error }
-      | otherwise = coverage_error
-      where
-        predicates = [varType d | RetainedConDict d <- plan, isCoverageEquality (varType d)]
-        hypothetical index con = do
-          let pat = nlConPatName (dataConName con) (replicate (dataConSourceArity con) nlWildPatName)
-          resolved <- tcRetainedCon (varType index) pat
-          case resolved of
-            Just r -> mkCoVarCo <$> newEvVar (mkNomEqPred (TermVarTy index)
-                                                (retainedConIndex (varType index) (fst r) (snd r)))
-            Nothing -> coverage_error
-        transport_many pairs ty = foldM step (mkNomReflCo ty) pairs
-          where
-            step acc (idx, co) = do
-              next <- tcRetainedCoercion idx co (pSnd (coercionKind acc))
-              return (mkTransCo acc next)
+    check_missing tup = do
+      mb_res <- synthAbsurdMatrixRow
+                  [(col_i, idx_id, dc) | ((col_i, idx_id), dc) <- zip cols tup]
+                  pat_tys plan loc ext_ann matches
+      case mb_res of
+        Nothing     -> coverage_error
+        Just mb_row -> pure mb_row
 
 -- | Refine one later retained column without moving the ordinary patterns.
 -- See Note [A later retained constructor column].
@@ -2347,7 +2540,9 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
                or [not (isRetainedVarPat pat) | (Nothing, pat) <- zip columns (filter isVisArgLPat pats)]
        -- See Note [Ordinary patterns after a retained constructor].
        ; let represented = filter (`elem` cons) domain_cons
-             missing = filter (`notElem` cons) domain_cons
+             missing
+               | null matches, isEmptyTy (varType index) = []
+               | otherwise = filter (`notElem` cons) domain_cons
        ; unless (cons `equalLength` represented || any has_value_pattern matches) coverage_error
        ; arg_tys <- mapM argument_type pat_tys
        ; let written = zip constructors matches
@@ -2738,6 +2933,7 @@ tcEmptyRetainedScrutinee scrut ty = do
   givens <- getLexicalGivens
   let retained cv = isCoVar cv && case getEqPredTys_maybe (varType cv) of
         Just (Nominal, TermVarTy v, _) -> isRetainedConstructorProof v (mkCoVarCo cv)
+        Just (Nominal, _, TermVarTy v) -> isRetainedConstructorProof v (mkSymCo (mkCoVarCo cv))
         _ -> False
   if not (any retained givens) || isEmptyTy ty then pure (scrut, ty) else do
     level <- getTcLevel

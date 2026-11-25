@@ -56,8 +56,9 @@ import GHC.Core.Type
 import GHC.Core.Unify (alwaysBindTv, tcMatchTys, tcUnifyTys)
 import GHC.Core.Utils (exprType, stripTicksE)
 import GHC.Driver.Config (initSimpleOpts)
-import GHC.Driver.DynFlags (GeneralFlag(Opt_Hpc), HasDynFlags(getDynFlags), pluginModNames)
+import GHC.Driver.DynFlags (GeneralFlag(Opt_Hpc), HasDynFlags(getDynFlags))
 import GHC.Driver.Env (visibleSourceRuleHeads)
+import GHC.Driver.Plugins (hasActiveLatePlugins)
 import GHC.Hs.Utils (CollectFlag(CollNoDictBinders), collectHsBindBinders)
 import GHC.Tc.Errors.Types (RetainedQuantificationError(RetainedSourceRule), TcRnMessage(..))
 import GHC.Tc.Gen.SourceTable
@@ -1060,8 +1061,8 @@ sourceEarlyClosureTables :: [Id] -> NameEnv (Id, CoreExpr)
 sourceEarlyClosureTables group_owners definitions = do
     env <- getGblEnv
     dflags <- getDynFlags
-    added_plugins <- readTcRef (tcg_th_coreplugins env)
-    if not (null added_plugins && null (pluginModNames dflags))
+    hsc <- getTopEnv
+    if hasActiveLatePlugins hsc
       then pure ([], [], [])
       else do
         let here = Just (tcg_semantic_mod env)

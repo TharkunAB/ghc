@@ -59,8 +59,8 @@ import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config (initSimpleOpts)
 import GHC.Driver.DynFlags (DynFlags(homeUnitId_), unitSettings)
 import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
-import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hsc_plugins, hugRuleInterfacesBelow, hugRulesBelow, lookupIfaceByModuleHsc, visibleUnloadedSourceRuleHeads)
-import GHC.Driver.Plugins (pluginsWithArgs)
+import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hugRuleInterfacesBelow, hugRulesBelow, lookupIfaceByModuleHsc, visibleUnloadedSourceRuleHeads)
+import GHC.Driver.Plugins (hasActiveLatePlugins)
 import GHC.Settings (UnitSettings(unitSettings_ghcInternalUnitId))
 import GHC.Hs
 import {-# SOURCE #-} GHC.HsToCore.Binds (dsTopLHsBinds)
@@ -2772,8 +2772,7 @@ sourceCaseTables nominal_owners binds = do
     then pure False
     else do
       hsc <- getTopEnv
-      added_plugins <- readTcRef (tcg_th_coreplugins env)
-      pure (null added_plugins && null (pluginsWithArgs (hsc_plugins hsc)))
+      pure (not (hasActiveLatePlugins hsc))
   let exported = mkNameSet (concatMap availNames (tcg_exports env))
       ruled = sourceRuleOwners (tcg_rules env)
       enum_enabled = not char_tables

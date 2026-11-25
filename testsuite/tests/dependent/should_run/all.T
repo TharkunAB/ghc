@@ -1088,3 +1088,13 @@ test('NativeWave10TypeCaseDotSections',
       extra_files(['NativeWave10TypeCaseDotSectionsProvider.hs',
                    'NativeWave10TypeCaseDotSections.hs'])],
      run_command, ['bash NativeWave10TypeCaseDotSections.sh "{compiler}" "{libdir}"'])
+test('NativePluginsGeneral',
+     [req_host_target_ghc, req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['NativePluginsGeneral.hs',
+                   '../../../../docs/dependent-haskell/hasklib',
+                   '../../../../docs/dependent-haskell/examples/open-evaluation'])],
+     run_command, ['bash NativePluginsGeneral.sh "{compiler}" "{libdir}" "{ghc_pkg}"'])
+test('NativeAbsurdForEachCoverage',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeAbsurdForEachCoverage.hs'])],
+     run_command, ['bash NativeAbsurdForEachCoverage.sh "{compiler}" "{libdir}"'])
