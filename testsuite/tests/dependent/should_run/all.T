@@ -1065,3 +1065,7 @@ test('NativePluginsGeneral',
                    '../../../../docs/dependent-haskell/hasklib',
                    '../../../../docs/dependent-haskell/examples/open-evaluation'])],
      run_command, ['bash NativePluginsGeneral.sh "{compiler}" "{libdir}" "{ghc_pkg}"'])
+test('NativeAbsurdForEachCoverage',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeAbsurdForEachCoverage.hs'])],
+     run_command, ['bash NativeAbsurdForEachCoverage.sh "{compiler}" "{libdir}"'])
