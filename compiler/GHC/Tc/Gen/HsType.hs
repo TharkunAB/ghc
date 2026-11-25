@@ -79,6 +79,11 @@ module GHC.Tc.Gen.HsType (
         tcRetainedAmbientIndices,
         isLocalTySynLSig, tcWithLocalTySyns,
         drainForgetMTyCons,
+        tcRegisterSynthesizedSourceFun,
+        tcCommitSynthesizedSourceFunBind,
+        drainSynthesizedSourceFuns,
+        setLocalSimpleFunBinds,
+        lookupLocalSimpleFunBind,
 
    ) where
 
@@ -105,7 +110,7 @@ import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(InvalidInput, UnavailableDefinit
                                openTypeFailureReason, readOpenMethodWorker)
 import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourceTableFamilyUse, sourceTableTypeUses,
                               sourceCaseKindUse, sourceTableOccurrence, sourceTableReferenceUse, indexedProjectionSource, isSourceConstructorCase, monomorphicEnumCaseArity, sourceCaseVisibleArity, sourceTableOwner, sourcePairBuilderField,
-                              isFinalCoreIdentity, isFinalStructuralSource,
+                              isFinalCoreIdentity, isFinalCoreReverseWrapper, isFinalStructuralSource,
                               lookupObservedPairField, lookupPairObserver, lookupPairRecipe, canObservePairSource,
                               lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
@@ -152,8 +157,9 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.WiredIn.Prim
 
 import GHC.Types.Literal (litValue, mkLitIntWrap, mkLitWordWrap)
-import GHC.Types.Id ( idName, isClassOpId_maybe, mkLocalId, mkSysLocalM, sourceTableId_maybe, sourceTableKeepsExecutable )
+import GHC.Types.Id ( idName, isClassOpId_maybe, isRecordSelector, mkLocalId, mkSysLocalM, setInlinePragma, sourceTableId_maybe, sourceTableKeepsExecutable )
 import GHC.Types.Id.Info ( IdDetails(SourceTableId) )
+import GHC.Types.InlinePragma ( InlineSpec(NoInline), neverInlinePragma, setInlinePragmaSpec )
 import GHC.Types.Name.Env
 import GHC.Types.Name.Reader
 import GHC.Types.Name.Set (NameSet, mkNameSet, unionNameSet, emptyNameSet, elemNameSet, extendNameSet)
@@ -3678,6 +3684,12 @@ tc_app_ty_external mode rn_ty exp_kind
              (Just (AnId fun), _, Just args)
                | Just table <- partial_source_callback fun args
                -> checked_callback table
+               | isTypeLevel (mode_tyki mode), ordinary_call
+               , isRecordSelector fun
+               , Just table <- sourceTableId_maybe fun
+               , lengthIs args 1 || equalLength args (tyConVisibleTyVars table)
+               -> do { sourceTableReferenceUse table
+                     ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
              (_, Just (fun, _), Just args)
                | isTypeLevel (mode_tyki mode), ordinary_call
                , Just table <- sourceTableOccurrence env fun >>= sourceTableId_maybe
@@ -3781,7 +3793,7 @@ tc_app_ty_external mode rn_ty exp_kind
                          , (L _ (HsTyVar _ _ (L _ (WithUserRdr _ operand))), left_args) <-
                              splitHsAppTys (unLoc (indexed_operand left))
                          , (null left_args && (indexed_variable operand || operand == getName nullary)) ||
-                           (any ((== operand) . getName) recursive &&
+                           ((any ((== operand) . getName) recursive || operand == getName fun) &&
                             any open_indexed_operand args)
                          -> do { sourceTableReferenceUse table
                                ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
@@ -3803,9 +3815,9 @@ tc_app_ty_external mode rn_ty exp_kind
                                ; updTcRef pending (TcPendingTypeCall call_span fun checked result :)
                                ; checkExpKind mode rn_ty result result_kind exp_kind }
                          | ordinary_call, [arg] <- args
-                         , isFinalCoreIdentity fun
                          , Just table <- sourceTableId_maybe fun
-                         , retained_identity_operand arg
+                         , (isFinalCoreIdentity fun && retained_identity_operand arg) ||
+                           (isFinalCoreReverseWrapper fun && open_indexed_operand arg && not (isOpenTypeOperand arg))
                          -> do { _ <- tcOpenTypeContext mode name
                                ; sourceTableReferenceUse table
                                ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
@@ -5009,7 +5021,10 @@ localFallbackFamilyOwner name
          && isNothing (lookupTypeEnv (tcg_type_env env) name)
         then do
           owner <- closedFamilyOwner name
-          pure (fst <$> lookupNameEnv (tcg_local_open_defs env) owner)
+          exec_ok <- tcHasClosedCallExecutable owner
+          pure $ if exec_ok
+            then fst <$> lookupNameEnv (tcg_local_open_defs env) owner
+            else Nothing
         else pure Nothing
 
 {- Note [Same-module closed term evaluation]
@@ -5063,6 +5078,7 @@ tcClosedCaseExecutableOwner nested rdr name args staging
   | isQual rdr || isUnqual rdr
   , Just needs_execution <- staging
   = do
+      env <- getGblEnv
       table <- tcLookupTyCon name
       let expect_eager = monomorphicEnumCaseArity (tyConKind table) == Just (length args)
           visible = filterOut isInvisibleTyConBinder (tyConBinders table)
@@ -5073,8 +5089,10 @@ tcClosedCaseExecutableOwner nested rdr name args staging
           nested_case = nested && lengthIs args 2 && sourceCaseVisibleArity table == Just 2
       owner <- if expect_eager || staged || nested_case then sourceTableOwner table else pure Nothing
       case owner of
-        Just fun | staged || (expect_eager && sourceTableKeepsExecutable fun) ||
-                             (nested_case && isFinalStructuralSource fun) -> do
+        Just fun
+          | not (nameIsLocalOrFrom (tcg_semantic_mod env) (getName fun))
+          , staged || (expect_eager && sourceTableKeepsExecutable fun) ||
+                      (nested_case && isFinalStructuralSource fun) -> do
           imported <- isClosedOrdinaryImport rdr (getName fun)
           if imported
             then do
@@ -6558,6 +6576,133 @@ drainForgetMTyCons mod_key = liftIO $
       Nothing  -> (ufm, [])
       Just env -> (delFromUFM ufm mod_key, nonDetNameEnvElts env)
 
+-- | Per-module cache of synthesized certified retained function helpers.
+synthesizedSourceFunCache :: IORef (UniqFM Module (NameEnv (Id, LHsBind GhcTc, TyCon)))
+synthesizedSourceFunCache = unsafePerformIO (newIORef emptyUFM)
+{-# NOINLINE synthesizedSourceFunCache #-}
+
+-- | Allocate a closed 1-equation source family and top-level helper 'Id' for a
+-- constructor, lambda, composition, or local 1-equation function passed to a
+-- retained @foreach (f :: a -> b)@ binder.
+tcRegisterSynthesizedSourceFun
+  :: SrcSpan -> [TyVar] -> [Id] -> Id -> Type -> Type -> TcM (Id, TyCon)
+tcRegisterSynthesizedSourceFun loc raw_tvs cap_val_ids x_id res_kind0 body_index0 = do
+  gbl <- getGblEnv
+  let cur_mod    = tcg_mod gbl
+      init_subst = Subst.mkEmptySubst $
+                     mkInScopeSet (mkVarSet (map (\v -> v :: Var) raw_tvs ++ cap_val_ids ++ [x_id]))
+  (subst1, p_tvs) <- mapAccumLM alloc_tv init_subst raw_tvs
+  (subst2, val_tvs) <- mapAccumLM alloc_val subst1 (cap_val_ids ++ [x_id])
+  let id_map = mkVarEnv [ (orig_v, mkTyVarTy val_tv)
+                        | (orig_v, val_tv) <- zip (cap_val_ids ++ [x_id]) val_tvs ]
+      subst_all ty = replace_synth_ids id_map (Subst.substTy subst2 ty)
+      res_kind' = subst_all res_kind0
+      rhs_ty'   = subst_all body_index0
+      all_tvs   = p_tvs ++ val_tvs
+  uniq <- getUniqueM
+  owner_name <- newGlobalBinder cur_mod (mkVarOcc ("$depfun$" ++ show uniq)) Nothing loc
+  fam_name   <- newGlobalBinder cur_mod (mkSourceTableOcc (nameOccName owner_name)) Nothing loc
+  ax_name    <- newImplicitBinder fam_name mkInstTyCoOcc
+  let tc_binders = mkNamedTyConBinders (Invisible SpecifiedSpec) p_tvs
+                   ++ mkAnonTyConBinders val_tvs
+      tc_kind    = mkTyConKindWithMatchability unmatchableDataConTy tc_binders res_kind'
+      branch     = mkCoAxBranch all_tvs [] [] (mkTyVarTys all_tvs) rhs_ty'
+                     (map (const Nominal) all_tvs) loc
+      fam_tc     = mkFamilyTyCon fam_name tc_kind tc_binders 0 res_kind' Nothing
+                     (ClosedTypeFamilyTyCon (CTF (Just axiom)))
+                     Nothing NotInjective
+      axiom      = mkBranchedCoAxiom Nominal ax_name fam_tc [branch]
+      mono_ty    = foldr mkVisFunTyManyU res_kind' (map tyVarKind val_tvs)
+      fun_ty     = mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- p_tvs] mono_ty
+      no_inl     = setInlinePragmaSpec neverInlinePragma NoInline
+      raw_id     = mkLocalId owner_name ManyTy fun_ty `setInlinePragma` no_inl
+      fun_id     = setIdDetails raw_id (SourceTableId owner_name fam_tc NominalSourceTable)
+  pure (fun_id, fam_tc)
+  where
+    alloc_tv subst tv0 = do
+      let ki = Subst.substTy subst (tyVarKind tv0)
+      nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv0))))
+      let tv = mkTyVar nm ki
+      pure (Subst.extendTvSubstAndInScope subst tv0 (mkTyVarTy tv), tv)
+
+    alloc_val subst v = do
+      let ki = Subst.substTy subst (varType v)
+      nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName v))))
+      pure (subst, mkTyVar nm ki)
+
+    replace_synth_ids :: VarEnv Type -> Type -> Type
+    replace_synth_ids env = go
+      where
+        go t@(TyVarTy tv)       = if isEmptyVarEnv env then t else TyVarTy (setTyVarKind tv (go (tyVarKind tv)))
+        go (TermVarTy v)        = lookupVarEnv env v `orElse` TermVarTy (setVarType v (go (varType v)))
+        go (TermAppTy f a)      = case lookupVarEnv env f of
+                                    Just f_ty -> mkAppTy f_ty (go a)
+                                    Nothing   -> TermAppTy (setVarType f (go (varType f))) (go a)
+        go (AppTy f a)          = mkAppTy (go f) (go a)
+        go (TyConApp tc as)     = mkTyConApp tc (map go as)
+        go (FunTy af ma m a r)  = FunTy af (go ma) (go m) (go a) (go r)
+        go (ForAllTy ma (Bndr b vis) r)
+          | isTyVar b = ForAllTy (go ma) (Bndr (setTyVarKind b (go (tyVarKind b))) vis) (go r)
+          | otherwise = ForAllTy (go ma) (Bndr (setVarType b (go (varType b))) vis) (go r)
+        go (DepFunTy vis b r)   = DepFunTy vis (setVarType b (go (varType b)))
+                                    (replace_synth_ids (delVarEnv env b) r)
+        go (ExistsTy vis b r)   = ExistsTy vis (setTyVarKind b (go (tyVarKind b))) (go r)
+        go (DepDictTy b r)      = DepDictTy (setVarType b (go (varType b)))
+                                    (replace_synth_ids (delVarEnv env b) r)
+        go (CastTy t co)        = CastTy (go t) co
+        go t                    = t
+
+-- | Record a checked top-level helper binding for installation at the end of
+-- the current declaration group.
+tcCommitSynthesizedSourceFunBind :: Id -> LHsBind GhcTc -> TyCon -> TcM ()
+tcCommitSynthesizedSourceFunBind fun_id bind fam_tc = do
+  gbl <- getGblEnv
+  let cur_mod = tcg_mod gbl
+  keepAlive (idName fun_id)
+  liftIO $ atomicModifyIORef' synthesizedSourceFunCache $ \ufm ->
+    let env0 = fromMaybe emptyNameEnv (lookupUFM ufm cur_mod)
+        env1 = extendNameEnv env0 (idName fun_id) (fun_id, bind, fam_tc)
+    in (addToUFM ufm cur_mod env1, ())
+
+-- | Drain and return all synthesized source function helpers for a 'Module'.
+drainSynthesizedSourceFuns :: Module -> TcM [(Id, LHsBind GhcTc, TyCon)]
+drainSynthesizedSourceFuns mod_key = liftIO $
+  atomicModifyIORef' synthesizedSourceFunCache $ \ufm ->
+    case lookupUFM ufm mod_key of
+      Nothing  -> (ufm, [])
+      Just env -> (delFromUFM ufm mod_key, nonDetNameEnvElts env)
+
+-- | Per-module cache of renamed non-recursive 1-argument unguarded top-level
+-- function bindings in the active declaration group.
+localSimpleFunBindCache :: IORef (UniqFM Module (NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)))
+localSimpleFunBindCache = unsafePerformIO (newIORef emptyUFM)
+{-# NOINLINE localSimpleFunBindCache #-}
+
+-- | Replace the active 1-argument renamed function table for a 'Module' and
+-- return the previous table so nested calls can restore it.
+setLocalSimpleFunBinds
+  :: Module
+  -> NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)
+  -> TcM (Maybe (NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)))
+setLocalSimpleFunBinds mod_key new_env = liftIO $
+  atomicModifyIORef' localSimpleFunBindCache $ \ufm ->
+    let prev = lookupUFM ufm mod_key
+        ufm' = if isEmptyNameEnv new_env
+               then delFromUFM ufm mod_key
+               else addToUFM ufm mod_key new_env
+    in (ufm', prev)
+
+-- | Look up a non-recursive 1-argument renamed function binding in the active
+-- module declaration group.
+lookupLocalSimpleFunBind :: Name -> TcM (Maybe (Maybe (LocatedN Name), LHsExpr GhcRn))
+lookupLocalSimpleFunBind nm = do
+  cur_mod <- tcg_mod <$> getGblEnv
+  if nameModule_maybe nm /= Just cur_mod
+    then pure Nothing
+    else do
+      ufm <- liftIO (readIORef localSimpleFunBindCache)
+      pure (lookupUFM ufm cur_mod >>= (`lookupNameEnv` nm))
+
 {- Note [Direct lowering of uncaptured some types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 "GHC.Rename.Module" lifts top-level @some@ declarations into closed type
@@ -6943,8 +7088,14 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
   = do { traceTc "lk1" (ppr name)
        ; pack <- isExistsPackName name
        ; when pack $ failWithTc (TcRnExistsPack ExistsPackInvalidContext)
-       ; thing <- tcLookup name
-       ; case thing of
+       ; mb_pending <- lookup_pending_local_tycon name
+       ; case mb_pending of
+           Just tc ->
+             do { when (isJust (sourceTableTermOcc (nameOccName (tyConName tc)))) $
+                    sourceTableTypeUses (mkTyConTy tc)
+                ; return (mkTyConTy tc, tyConKind tc) }
+           Nothing -> do { thing <- tcLookup name
+                         ; case thing of
            ATyVar _ tv -> return (mkTyVarTy tv, tyVarKind tv)
            ATcTypeLet _ ty kind -> return (ty, kind)
 
@@ -6984,8 +7135,28 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
                     _ -> promotionErr name FamDataConPE }
            APromotionErr err -> promotionErr name err
 
-           _  -> wrongThingErr WrongThingType thing name }
+           _  -> wrongThingErr WrongThingType thing name } }
   where
+    lookup_pending_local_tycon :: Name -> TcM (Maybe TyCon)
+    lookup_pending_local_tycon nm
+      | not (isTcClsNameSpace (nameNameSpace nm)) = pure Nothing
+      | otherwise = do
+          gbl <- getGblEnv
+          let cur_mod = tcg_mod gbl
+          if nameModule_maybe nm /= Just cur_mod
+               || isJust (lookupTypeEnv (tcg_type_env gbl) nm)
+            then pure Nothing
+            else do
+              forget_map <- liftIO (readIORef forgetMTyConCache)
+              case lookupUFM forget_map cur_mod >>= (`lookupNameEnv` nm) of
+                Just tc -> pure (Just tc)
+                Nothing -> do
+                  synth_map <- liftIO (readIORef synthesizedSourceFunCache)
+                  pure $ case lookupUFM synth_map cur_mod of
+                    Nothing  -> Nothing
+                    Just env -> listToMaybe
+                      [ ftc | (_, _, ftc) <- nonDetNameEnvElts env
+                            , tyConName ftc == nm ]
     promote_real_data_con dc
       = do { unless (null (dataConRepArgBinders dc) || dataConHasPromotedRetained dc) $
                failWithTc $ TcRnRetainedQuantificationError RetainedPackagePromotion
