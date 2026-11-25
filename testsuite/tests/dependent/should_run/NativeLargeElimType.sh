@@ -241,3 +241,127 @@ if "${ghc[@]}" -O2 -c RuleConflict.hs >rule.log 2>&1 ||
     cat rule.log >&2
     exit 1
 fi
+
+# 6. Indexed forall binders and carried GADT/existential arguments (R13_LargeElimIndexedArgs / Adequacy.logVLam).
+mkdir -p "$out/indexed-args"/{prov,cli,same,neg}
+cd "$out/indexed-args/prov"
+cat >IndexedLargeElimProv.hs <<'HS'
+{-# LANGUAGE DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, KindSignatures, ListTuplePuns #-}
+module IndexedLargeElimProv where
+
+import Data.Kind (Type)
+
+data Nat = Zero | Succ Nat
+data Fin (n :: Nat) where
+  FZ :: Fin (Succ n)
+  FS :: Fin n -> Fin (Succ n)
+data UTerm (n :: Nat) where
+  UVar :: Fin n -> UTerm n
+  ULam :: UTerm (Succ n) -> UTerm n
+  UApp :: UTerm n -> UTerm n -> UTerm n
+data Env (n :: Nat) where
+  ENil  :: Env Zero
+  ECons :: Clos -> Env n -> Env (Succ n)
+data Clos where
+  MkClos :: UTerm n -> Env n -> Clos
+data Box :: Nat -> Type where
+  MkBox :: Box n
+
+data Val = Bot | Arr Val Val | Join Val Val
+data Witness (v :: Val) (w :: Val) (e :: Env n) (b :: UTerm (Succ n)) = MkWitness
+
+logVLamBox :: forall (n :: Nat). Val -> Box n -> Type
+logVLamBox Bot        _ = type ()
+logVLamBox (Arr _ _)  _ = type Int
+logVLamBox (Join _ _) _ = type Bool
+
+logVLamAdeq :: forall (n :: Nat). Val -> Env n -> UTerm (Succ n) -> Type
+logVLamAdeq Bot        _ _ = type ()
+logVLamAdeq (Arr v w)  e b = type (Witness v w e b)
+logVLamAdeq (Join _ _) _ _ = type Bool
+
+logVLamClos :: Val -> Clos -> Type
+logVLamClos Bot        _ = type ()
+logVLamClos (Arr _ _)  _ = type Int
+logVLamClos (Join u v) c = type (logVLamClos u c, logVLamClos v c)
+HS
+cat >"$out/indexed-args/cli/IndexedLargeElimCli.hs" <<'HS'
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module IndexedLargeElimCli where
+
+import Data.Type.Equality ((:~:) (Refl))
+import IndexedLargeElimProv
+
+useBoxBot :: forall (n :: Nat) (b :: Box n). logVLamBox 'Bot b
+useBoxBot = ()
+
+useAdeqArr :: forall (n :: Nat) (v :: Val) (w :: Val) (e :: Env n) (b :: UTerm ('Succ n)).
+              logVLamAdeq ('Arr v w) e b :~: Witness v w e b
+useAdeqArr = Refl
+
+useClosBot :: forall (c :: Clos). logVLamClos 'Bot c
+useClosBot = ()
+
+useClosJoin :: forall (u :: Val) (v :: Val) (c :: Clos).
+               logVLamClos u c -> logVLamClos v c -> logVLamClos ('Join u v) c
+useClosJoin x y = (x, y)
+HS
+cat >"$out/indexed-args/same/SameModIndexedLargeElim.hs" <<'HS'
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, KindSignatures, ListTuplePuns, TypeOperators #-}
+module SameModIndexedLargeElim where
+
+import Data.Kind (Type)
+import Data.Type.Equality ((:~:) (Refl))
+
+data Nat = Zero | Succ Nat
+data Box :: Nat -> Type where
+  MkBox :: Box n
+data Clos where
+  MkClos :: Box n -> Clos
+data Val = Bot | Arr Val Val | Join Val Val
+
+logVLam :: forall (n :: Nat). Val -> Box n -> Type
+logVLam Bot        _ = type ()
+logVLam (Arr _ _)  _ = type Int
+logVLam (Join _ _) _ = type Bool
+
+logVLamClos :: Val -> Clos -> Type
+logVLamClos Bot        _ = type ()
+logVLamClos (Arr _ _)  _ = type Int
+logVLamClos (Join u v) c = type (logVLamClos u c, logVLamClos v c)
+
+sameBot :: forall (n :: Nat) (b :: Box n). logVLam 'Bot b
+sameBot = ()
+
+sameJoinClos :: forall (u :: Val) (v :: Val) (c :: Clos).
+                logVLamClos ('Join u v) c :~: (logVLamClos u c, logVLamClos v c)
+sameJoinClos = Refl
+HS
+for opt in O0 O2; do
+    cd "$out/indexed-args/prov"
+    "${ghc[@]}" "-$opt" -fforce-recomp -c IndexedLargeElimProv.hs
+    cp IndexedLargeElimProv.hi "$out/indexed-args/cli/"
+    cd "$out/indexed-args/cli"
+    "${ghc[@]}" "-$opt" -fno-code -fwrite-interface -fforce-recomp -c IndexedLargeElimCli.hs
+    "${ghc[@]}" "-$opt" -fforce-recomp -c IndexedLargeElimCli.hs
+    cd "$out/indexed-args/same"
+    "${ghc[@]}" "-$opt" -fno-code -fwrite-interface -fforce-recomp -c SameModIndexedLargeElim.hs
+    "${ghc[@]}" "-$opt" -fforce-recomp -c SameModIndexedLargeElim.hs
+done
+cd "$out/indexed-args/neg"
+cat >HiddenClosRecProv.hs <<'HS'
+{-# LANGUAGE DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, KindSignatures, ListTuplePuns #-}
+module HiddenClosRecProv (Nat(..), Clos, Val(..), logVLamClos) where
+import Data.Kind (Type)
+data Nat = Zero | Succ Nat
+data Clos where MkClos :: Nat -> Clos
+data Val = Bot | Join Val Val
+logVLamClos :: Val -> Clos -> Type
+logVLamClos Bot        _ = type ()
+logVLamClos (Join u v) c = type (logVLamClos u c, logVLamClos v c)
+HS
+if "${ghc[@]}" -O0 -c HiddenClosRecProv.hs >hidx.log 2>&1 ||
+   ! grep -Fq '[GHC-70566]' hidx.log; then
+    cat hidx.log >&2
+    exit 1
+fi

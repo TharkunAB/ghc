@@ -2060,7 +2060,7 @@ rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes
      (nonDetEltsUniqSet (tc_bndrs `unionNameSet` mkNameSet (pat_syn_bndrs ++ id_bndrs))) ;
    -- See Note [Ordering local source tables].
    dependent <- xoptM LangExt.ExperimentalDependentTypes ;
-   tables <- if dependent then localSourceTableBinders binds' sigs' else pure [] ;
+   tables <- if dependent then localSourceTableBinders tycl_decls binds' sigs' else pure [] ;
    let { table_names = map snd tables
        ; rdr_env = foldl' extendGlobalRdrEnv (tcg_rdr_env gbl_env)
                      (map (mkLocalVanillaGRE NoParent) table_names) } ;
@@ -2688,8 +2688,8 @@ producer checks the callee's identity and the decrease of each self call.
 
 -- | Allocate private names for signed function bindings with constructor rows.
 -- The producer checks the constructors and their coverage after typechecking.
-localSourceTableBinders :: [LHsBindLR GhcRn GhcPs] -> [LSig GhcPs] -> RnM [(Name, Name)]
-localSourceTableBinders binds sigs =
+localSourceTableBinders :: [TyClGroup GhcPs] -> [LHsBindLR GhcRn GhcPs] -> [LSig GhcPs] -> RnM [(Name, Name)]
+localSourceTableBinders tycl_decls binds sigs =
   mapM (\n -> (n,) <$> lookupOrig (nameModule n) (mkSourceTableOcc (nameOccName n)))
     [ n | L _ FunBind{fun_id = L _ n, fun_matches = MG{mg_alts = L _ rows}} <- binds
         , isExternalName n, nameOccName n `elemOccSet` signed
@@ -2700,7 +2700,9 @@ localSourceTableBinders binds sigs =
           all (mapping_row n) rows ||
           all pair_swap_row rows ||
           closure_wrapper_rows n rows ||
-          weakening_rows n rows ]
+          weakening_rows n rows ||
+          subst_map_rows n rows ||
+          sigma_combinator_rows n rows ]
   where
     -- See Note [Reservation for pair swap equations].
     pair_swap_row (L _ Match{m_pats = L _ [pat], m_grhss = rhss})
@@ -2712,16 +2714,22 @@ localSourceTableBinders binds sigs =
       = variable left == Just y && variable right == Just x
     pair_swap_row _ = False
 
-    closure_wrapper_rows self [L _ Match{m_pats = L _ (body_pat : cap_pats@(_:_)), m_grhss = rhss}]
-      | VarPat _ (L _ body_var) <- unparen body_pat
-      , all plain_field cap_pats
+    var_pat :: LPat GhcPs -> Maybe RdrName
+    var_pat p | VarPat _ (L _ v) <- unparen p = Just v
+              | otherwise = Nothing
+
+    closure_wrapper_rows self [L _ Match{m_pats = L _ pats@(_:_:_), m_grhss = rhss}]
+      | Just pat_vars <- traverse var_pat pats
+      , length (nub pat_vars) == length pat_vars
       , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ local_binds) <- rhss
       , (trav, [cb_expr, body_arg]) <- collect_val_apps rhs
       , Just trav_rdr <- variable_allow_type_app trav
       , not (isRdrDataCon trav_rdr), not (same_source_owner self trav_rdr)
-      , variable body_arg == Just body_var
+      , Just body_var <- variable body_arg
+      , body_var `elem` pat_vars
       = case local_binds of
-          EmptyLocalBinds{} -> callback_case_alts cb_expr
+          EmptyLocalBinds{} ->
+            callback_case_alts cb_expr || named_subst_map_call pat_vars body_var cb_expr
           HsValBinds _ (ValBinds _ entries)
             | [L _ FunBind{fun_id = L _ go_rdr, fun_matches = MG{mg_alts = L _ alts}}] <- val_binds entries
             , variable_allow_type_app cb_expr == Just go_rdr
@@ -2731,30 +2739,216 @@ localSourceTableBinders binds sigs =
           _ -> False
     closure_wrapper_rows _ _ = False
 
-    weakening_rows self [L _ Match{m_pats = L _ [pat], m_grhss = rhss}]
-      | VarPat _ (L _ x) <- unparen pat
+    named_subst_map_call pat_vars body_var expr
+      | (cb_head, cb_args@(_:_)) <- collect_val_apps expr
+      , Just cb_rdr <- variable_allow_type_app cb_head
+      , not (isRdrDataCon cb_rdr)
+      , rdrNameOcc cb_rdr `elemOccSet` subst_map_signed
+      , Just arg_vars <- traverse variable cb_args
+      , let expected_caps = [v | v <- pat_vars, v /= body_var]
+      = length arg_vars == length expected_caps &&
+        length (nub arg_vars) == length arg_vars &&
+        all (`elem` expected_caps) arg_vars
+      | otherwise = False
+
+    weakening_rows self [L _ Match{m_pats = L _ pats, m_grhss = rhss}]
+      | GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      , nameOccName self `elemOccSet` weakening_signed
+      = case pats of
+          [pat]
+            | VarPat _ (L _ x) <- unparen pat
+            , (con_expr, [arg_expr]) <- collect_val_apps rhs
+            , Just con_rdr <- variable_allow_type_app con_expr
+            , isRdrDataCon con_rdr
+            -> variable arg_expr == Just x
+          []
+            | (con_expr, []) <- collect_val_apps rhs
+            , Just con_rdr <- variable_allow_type_app con_expr
+            -> isRdrDataCon con_rdr
+          _ -> False
+    weakening_rows _ _ = False
+
+    subst_map_rows self rows
+      | not (nameOccName self `elemOccSet` subst_map_signed) = False
+      | [L _ Match{m_pats = L _ cap_pats@(_:_), m_grhss = rhss}] <- rows
+      , all plain_field cap_pats
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      = callback_case_alts rhs
+      | length rows >= 2
+      , let k = length rows - 1
+      = and (zipWith (subst_map_hit_row k) [0 .. k - 1] (take k rows)) &&
+        all (subst_map_miss_row k) (drop k rows)
+      | otherwise = False
+
+    subst_map_hit_row k depth (L _ Match{m_pats = L _ pats, m_grhss = rhss})
+      | length pats == k + 1
+      , (cap_pats, [idx_pat]) <- splitAt k pats
+      , all plain_field cap_pats
+      , nested_nullary_con_pat depth idx_pat
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      , Just v <- variable rhs
+      = v `elem` collectPatsBinders CollNoDictBinders cap_pats
+    subst_map_hit_row _ _ _ = False
+
+    subst_map_miss_row k (L _ Match{m_pats = L _ pats, m_grhss = rhss})
+      | length pats == k + 1
+      , (cap_pats, [idx_pat]) <- splitAt k pats
+      , all plain_field cap_pats
+      , Just x <- nested_var_con_pat k idx_pat
       , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
       , (con_expr, [arg_expr]) <- collect_val_apps rhs
       , Just con_rdr <- variable_allow_type_app con_expr
       , isRdrDataCon con_rdr
-      , variable arg_expr == Just x
-      = nameOccName self `elemOccSet` weakening_signed
-    weakening_rows _ _ = False
+      = variable arg_expr == Just x
+    subst_map_miss_row _ _ = False
+
+    nested_nullary_con_pat 0 p
+      | Just [] <- constructor_fields (unparen p) = True
+      | otherwise = False
+    nested_nullary_con_pat d p
+      | Just [inner] <- constructor_fields (unparen p) = nested_nullary_con_pat (d - 1) inner
+      | otherwise = False
+
+    nested_var_con_pat 0 p = var_pat p
+    nested_var_con_pat d p
+      | Just [inner] <- constructor_fields (unparen p) = nested_var_con_pat (d - 1) inner
+      | otherwise = Nothing
+
+    sigma_combinator_rows self rows
+      | not (nameOccName self `elemOccSet` sigma_comb_signed) = False
+      | [L _ Match{m_pats = L _ [p1, p2], m_grhss = rhss}] <- rows
+      , Just f_var <- var_pat p1
+      , Just x_var <- var_pat p2
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      , (con_expr, [call_expr]) <- collect_val_apps rhs
+      , Just con_rdr <- variable_allow_type_app con_expr
+      , isRdrDataCon con_rdr
+      , (fn_expr, [arg_expr]) <- collect_val_apps call_expr
+      = variable_allow_type_app fn_expr == Just f_var && variable arg_expr == Just x_var
+      | [L _ Match{m_pats = L _ [p1, p2, p3], m_grhss = rhss}] <- rows
+      , Just f_var <- var_pat p1
+      , Just g_var <- var_pat p2
+      , Just x_var <- var_pat p3
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      , (trav_expr, [cb_arg, term_arg]) <- collect_val_apps rhs
+      , Just trav_rdr <- variable_allow_type_app trav_expr
+      , not (isRdrDataCon trav_rdr), not (same_source_owner self trav_rdr)
+      , variable_allow_type_app cb_arg == Just g_var
+      , (fn_expr, [arg_expr]) <- collect_val_apps term_arg
+      = variable_allow_type_app fn_expr == Just f_var && variable arg_expr == Just x_var
+      | [L _ Match{m_pats = L _ [p1a, p2a, idx1], m_grhss = rhss1},
+         L _ Match{m_pats = L _ [p1b, p2b, idx2], m_grhss = rhss2}] <- rows
+      , all plain_field [p1a, p2a, p1b, p2b]
+      , Just [] <- constructor_fields (unparen idx1)
+      , Just [x_pat] <- constructor_fields (unparen idx2)
+      , Just x_var <- var_pat x_pat
+      , GRHSs _ (L _ (GRHS _ [] rhs1) :| []) (L _ EmptyLocalBinds{}) <- rhss1
+      , GRHSs _ (L _ (GRHS _ [] rhs2) :| []) (L _ EmptyLocalBinds{}) <- rhss2
+      , Just v_hit <- variable rhs1
+      , (cb_expr, [arg_expr]) <- collect_val_apps rhs2
+      , Just cb_var <- variable_allow_type_app cb_expr
+      , variable arg_expr == Just x_var
+      = (var_pat p1a == Just v_hit && var_pat p2b == Just cb_var) ||
+        (var_pat p2a == Just v_hit && var_pat p1b == Just cb_var)
+      | otherwise = False
+
+    local_ps_syns = mkOccEnv
+      [ (rdrNameOcc syn, (params, rhs))
+      | tg <- tycl_decls
+      , L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}
+          <- group_tyclds tg
+      , Just params <- [traverse hsLTyVarName tvbs] ]
+      where
+        hsLTyVarName b = unLoc <$> hsLTyVarLocName b
+
+    expand_ps_syn :: Int -> LHsType GhcPs -> LHsType GhcPs
+    expand_ps_syn 0 ty = ty
+    expand_ps_syn fuel ty
+      | (L _ (HsTyVar _ NotPromoted (L _ syn_rdr)), args) <- split_ty_apps ty
+      , Just (params, rhs) <- lookupOccEnv local_ps_syns (rdrNameOcc syn_rdr)
+      , length params == length args
+      = expand_ps_syn (fuel - 1) (subst_ps_ty (zip params args) rhs)
+      | otherwise = ty
+
+    subst_ps_ty :: [(RdrName, LHsType GhcPs)] -> LHsType GhcPs -> LHsType GhcPs
+    subst_ps_ty [] node = node
+    subst_ps_ty env (L loc (HsTyVar ann NotPromoted (L vloc rdr)))
+      | Just replacement <- lookup rdr env = replacement
+      | otherwise = L loc (HsTyVar ann NotPromoted (L vloc rdr))
+    subst_ps_ty env (L loc t) = L loc (gmapT (gmap_ps env) t)
+      where
+        gmap_ps :: Data d => [(RdrName, LHsType GhcPs)] -> d -> d
+        gmap_ps s d = case cast d of
+          Just lty -> fromMaybe d (cast (subst_ps_ty s lty))
+          Nothing  -> gmapT (gmap_ps s) d
 
     weakening_signed = mkOccSet
       [ rdrNameOcc n
       | L _ (TypeSig _ [] [L _ n] wc) <- sigs
       , is_weakening_sig (sig_body (unLoc (hswc_body wc))) ]
 
-    is_weakening_sig ty = case unLoc (ignoreParens ty) of
-      HsForAllTy{hst_body = body} -> is_weakening_sig body
-      HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod
-        | (L _ (HsTyVar _ NotPromoted (L _ d1)), _ : _) <- split_ty_apps dom
-        , (L _ (HsTyVar _ NotPromoted (L _ d2)), cod_first : _) <- split_ty_apps cod
-        , d1 == d2
-        , (_, _ : _) <- split_ty_apps cod_first
-        -> True
+    subst_map_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
+      , is_subst_map_sig [] (sig_body (unLoc (hswc_body wc))) ]
+
+    sigma_comb_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
+      , is_sigma_comb_sig (sig_body (unLoc (hswc_body wc))) ]
+
+    peel_ps_foralls ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
+      HsForAllTy{hst_body = body} -> peel_ps_foralls body
+      _ -> expand_ps_syn 4 ty
+
+    ps_std_arrow ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
+      HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod -> Just (dom, cod)
+      _ -> Nothing
+
+    is_weakening_sig ty = case ps_std_arrow (peel_ps_foralls ty) of
+      Just (dom, cod)
+        | (L _ (HsTyVar _ NotPromoted (L _ d1)), d1_args@(_ : _)) <- split_ty_apps (expand_ps_syn 4 dom)
+        , (L _ (HsTyVar _ NotPromoted (L _ d2)), cod_args@(cod_first : _)) <- split_ty_apps (expand_ps_syn 4 cod)
+        -> (d1 == d2 && isJust (nonEmpty (snd (split_ty_apps cod_first)))) ||
+           (d1 /= d2 && length d1_args == length cod_args)
       _ -> False
+
+    is_subst_map_sig caps ty =
+      let cur = peel_ps_foralls ty
+      in case ps_std_arrow cur of
+           Just (dom, cod)
+             | not (null caps)
+             , isNothing (ps_std_arrow (peel_ps_foralls cod))
+             , (L _ (HsTyVar _ NotPromoted (L _ idx_hd)), idx_first : _) <- split_ty_apps (expand_ps_syn 4 dom)
+             , (_, _ : _) <- split_ty_apps idx_first
+             , (L _ (HsTyVar _ NotPromoted (L _ res_hd)), _ : _) <- split_ty_apps (expand_ps_syn 4 cod)
+             -> idx_hd /= res_hd && all (== res_hd) caps
+             | (L _ (HsTyVar _ NotPromoted (L _ cap_hd)), _ : _) <- split_ty_apps (expand_ps_syn 4 dom)
+             -> is_subst_map_sig (cap_hd : caps) cod
+           _ -> False
+
+    is_sigma_comb_sig ty =
+      case ps_std_arrow (peel_ps_foralls ty) of
+        Just (a1, rest1)
+          | Just (a2, rest2) <- ps_std_arrow (peel_ps_foralls rest1) ->
+              -- ren: (Fin m -> Fin n) -> Fin m -> UTerm n
+              (is_ps_callback a1 && is_ps_indexed a2 && is_ps_indexed rest2) ||
+              case ps_std_arrow (peel_ps_foralls rest2) of
+                Just (a3, res) ->
+                  -- consSubst or seqSubst
+                  ((is_ps_indexed a1 && is_ps_callback a2) ||
+                   (is_ps_callback a1 && is_ps_indexed a2) ||
+                   (is_ps_callback a1 && is_ps_callback a2)) &&
+                  is_ps_indexed a3 && is_ps_indexed res
+                Nothing -> False
+        _ -> False
+      where
+        is_ps_indexed t
+          | (L _ (HsTyVar _ NotPromoted _), _ : _) <- split_ty_apps (peel_ps_foralls t) = True
+          | otherwise = False
+        is_ps_callback t = case ps_std_arrow (peel_ps_foralls t) of
+          Just (d, c) -> is_ps_indexed d && is_ps_indexed c
+          Nothing     -> False
 
     split_ty_apps = go []
       where
@@ -3028,14 +3222,15 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
         wanted = [ (b, f) | b <- bound_names
                           , Just f <- [lookupOccEnv used (mkSourceTableOcc (nameOccName b))]
                           , requested b f ]
-  , not (null wanted)
-  = let wanted_set = mkNameSet (map fst wanted)
-        specialised = mkNameSet [ n | L _ s <- sigs, n <- spec_name s ]
+        wanted_set = mkNameSet (map fst wanted)
+        specialised = mkNameSet [ b | L _ s <- sigs, b <- spec_name s ]
         signatures = mkNameEnv
           [ (b, deps) | L _ (TypeSig _ [] [L _ b] sig) <- sigs
-            , L _ HsSig{sig_bndrs = outer, sig_body = body} <- [dropWildCards sig]
+            , L _ HsSig{sig_bndrs = outer, sig_body = raw_body} <- [dropWildCards sig]
+            , let (body, syn_deps) = expand_rn_syn 4 raw_body
             , Just (arg, res) <- [source_arrow body]
-            , Just deps <- [worker_dependencies outer arg res] ]
+            , Just (is_idx, raw_deps) <- [worker_dependencies outer arg res]
+            , let deps = (is_idx || not (null syn_deps), syn_deps ++ raw_deps) ]
         declared = mkOccSet [ nameOccName f | f <- nameSetElemsStable (duDefs dus)
                                             , nameModule_maybe f == nameModule_maybe n ]
         candidates = [ (b, deps, values) | (_, [L _ FunBind{fun_id = L _ b, fun_ext = fvs}]) <- binds
@@ -3043,10 +3238,23 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
                      , not (b `elemNameSet` specialised), Just kinds <- [lookupNameEnv signatures b]
                      , let values = (fvs `intersectNameSet` local_values) `delFromNameSet` b
                      , Just deps <- [independent_types kinds (fvs `minusNameSet` local_values)] ]
+        candidate_set = mkNameSet [ b | (b, _, _) <- candidates ]
+        external_term_uses = unionNameSets
+          [ uses | (defs, uses) <- fromOL dus
+          , not (maybe False (nameSetAny (\d -> isJust (sourceTableTermOcc (nameOccName d))
+                                             || d `elemNameSet` candidate_set)) defs) ]
         ready = foldl' schedule emptyNameSet candidates
         schedule done (b, _, deps) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
                                    | otherwise = done
-        needed = foldr include wanted_set candidates
+        t2t_indexed_seeds = case use of
+          TableInType{} -> mkNameSet
+            [ b | (b, _, _) <- candidates
+                , b `elemNameSet` ready
+                , b `elemNameSet` external_term_uses
+                , Just (True, _) <- [lookupNameEnv signatures b] ]
+          TableInTerm -> emptyNameSet
+  , not (null wanted) || not (isEmptyNameSet t2t_indexed_seeds)
+  = let needed = foldr include (wanted_set `unionNameSet` t2t_indexed_seeds) candidates
         include (b, _, deps) rest | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSet deps rest
                                   | otherwise = rest
         early = [ (b, kinds) | (b, kinds, _) <- candidates
@@ -3096,7 +3304,11 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
               | Just (arity, cons) <- lookupNameEnv early_datatypes name =
                   Just (arity, emptyNameSet, cons)
               | otherwise = Nothing
-        needed <- typeDeps (fmap (\(arity, deps, _) -> (arity, deps)) . ready) kinds
+            extra_rhs_tcs
+              | indexed = [ (tc, Nothing)
+                          | tc <- nameSetElemsStable (fvs `intersectNameSet` local_tycon_names) ]
+              | otherwise = []
+        needed <- typeDeps (fmap (\(arity, deps, _) -> (arity, deps)) . ready) (kinds ++ extra_rhs_tcs)
         let cons = mkNameSet (concatMap (maybe [] (\(_, _, cs) -> cs) . ready)
                                         (nameSetElemsStable needed))
             allowed_local = cons `unionNameSet` needed
@@ -3159,8 +3371,19 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       | TableInType{} <- use
       , Just deps <- indexed_lookup_dependencies outer arg result
                  <|> indexed_closure_dependencies outer arg result
+                 <|> indexed_large_elim_dependencies outer arg result
       = Just (True, deps)
       | otherwise = (False,) <$> ordinary_worker_dependencies outer arg result
+
+    indexed_large_elim_dependencies outer arg result = do
+      (tvs, outer_deps) <- indexed_outer_binders outer
+      let (carried, output) = split_source_arrows result
+          is_lifted_type t = case unLoc (ignoreParens t) of
+            HsStarTy{} -> True
+            _ -> type_name t == Just liftedTypeKindTyConName
+      guard (is_lifted_type output && (not (null tvs) || not (null carried)))
+      deps <- traverse (indexed_sig_deps (mkNameSet tvs)) (arg : carried)
+      pure (outer_deps ++ concat deps)
 
     indexed_lookup_dependencies outer arg result = do
       (scope, scope_deps) <- indexed_scope_binder outer
@@ -3176,20 +3399,29 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
     indexed_closure_dependencies outer arg result = do
       (tvs, outer_deps) <- indexed_outer_binders outer
       guard (not (null tvs))
-      let traversal_or_wrapper = do
+      let item_deps bound ty =
+            indexed_sig_deps bound ty <|> do
+              (cb_tvs, dom_in, dom_out) <- callback_domain ty
+              (in_tc, _ : _) <- type_application dom_in
+              guard (is_indexed_domain_tc in_tc)
+              concat <$> traverse (indexed_sig_deps (bound `extendNameSetList` cb_tvs)) [dom_in, dom_out]
+          traversal_or_wrapper = do
             (first_tc, first_args) <- type_application arg
             guard (not (null first_args) && is_indexed_domain_tc first_tc)
             let (carried, output) = split_source_arrows result
-            deps <- traverse (indexed_sig_deps (mkNameSet tvs)) (arg : carried ++ [output])
+                bound = mkNameSet tvs
+            deps <- traverse (item_deps bound) (arg : carried ++ [output])
             pure (outer_deps ++ concat deps)
           callback_worker = do
             (cb_tvs, cb_in, cb_out) <- callback_domain arg
             (in_tc, _ : _) <- type_application cb_in
             guard (is_indexed_domain_tc in_tc)
-            (res_tvs, dom_in, dom_out) <- callback_codomain result
+            let (carried, output) = split_source_arrows result
+                bound = mkNameSet tvs
             cb_deps <- traverse (indexed_sig_deps (mkNameSet (tvs ++ cb_tvs))) [cb_in, cb_out]
-            res_deps <- traverse (indexed_sig_deps (mkNameSet (tvs ++ res_tvs))) [dom_in, dom_out]
-            pure (outer_deps ++ concat cb_deps ++ concat res_deps)
+            car_deps <- traverse (item_deps bound) carried
+            out_deps <- item_deps bound output
+            pure (outer_deps ++ concat cb_deps ++ concat car_deps ++ out_deps)
       traversal_or_wrapper <|> callback_worker
 
     is_indexed_domain_tc tc
@@ -3211,8 +3443,6 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       _ -> do
         (dom, cod) <- source_arrow ty
         pure ([], dom, cod)
-
-    callback_codomain = callback_domain
 
     indexed_outer_binders :: HsOuterSigTyVarBndrs GhcRn -> Maybe ([Name], [(Name, Maybe Int)])
     indexed_outer_binders (HsOuterImplicit names) = Just (names, [])
@@ -3340,9 +3570,52 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
     early_datatypes = mkNameEnv early_datatype_list
 
     local_tycon_names = mkNameSet [tcdName (unLoc d) | tg <- tycls, d <- group_tyclds tg]
+    local_syn_list =
+      [ (syn, (params, rhs, group_ext tg))
+      | tg <- tycls
+      , null (group_kisigs tg)
+      , [L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}]
+          <- [group_tyclds tg]
+      , Just params <- [traverse hsLTyVarNameRn tvbs]
+      , not (nameSetAny (isJust . sourceTableTermOcc . nameOccName) (group_ext tg)) ]
+      where
+        hsLTyVarNameRn b = unLoc <$> hsLTyVarLocName b
+    local_rn_syns = mkNameEnv local_syn_list
+    local_syn_names = mkNameSet (map fst local_syn_list)
+
+    expand_rn_syn :: Int -> LHsType GhcRn -> (LHsType GhcRn, [(Name, Maybe Int)])
+    expand_rn_syn 0 ty = (ty, [])
+    expand_rn_syn fuel ty = case unLoc (ignoreParens ty) of
+      HsForAllTy x tele body ->
+        let (body', deps) = expand_rn_syn fuel body
+        in (L (getLoc ty) (HsForAllTy x tele body'), deps)
+      HsFunTy x arr dom cod ->
+        let (dom', d1) = expand_rn_syn fuel dom
+            (cod', d2) = expand_rn_syn fuel cod
+        in (L (getLoc ty) (HsFunTy x arr dom' cod'), d1 ++ d2)
+      _ | Just (syn_name, args) <- type_application ty
+        , Just (params, rhs, _) <- lookupNameEnv local_rn_syns syn_name
+        , length params == length args ->
+            let (expanded, more) = expand_rn_syn (fuel - 1) (subst_rn_ty (zip params args) rhs)
+            in (expanded, (syn_name, Just (length args)) : more)
+        | otherwise -> (ty, [])
+
+    subst_rn_ty :: [(Name, LHsType GhcRn)] -> LHsType GhcRn -> LHsType GhcRn
+    subst_rn_ty [] node = node
+    subst_rn_ty env (L loc (HsTyVar ann NotPromoted (L vloc (WithUserRdr _ nm))))
+      | Just replacement <- lookup nm env = replacement
+      | otherwise = L loc (HsTyVar ann NotPromoted (L vloc (noUserRdr nm)))
+    subst_rn_ty env (L loc t) = L loc (gmapT (gmap_rn env) t)
+      where
+        gmap_rn :: Data d => [(Name, LHsType GhcRn)] -> d -> d
+        gmap_rn s d = case cast d of
+          Just lty -> fromMaybe d (cast (subst_rn_ty s lty))
+          Nothing  -> gmapT (gmap_rn s) d
+
     local_non_data_binders = mkNameSet $
       collectHsValBinders CollNoDictBinders vals ++
       [ b | tg <- tycls, L _ d <- group_tyclds tg, not (isDataDecl d)
+          , tcdName d `notElem` map fst local_syn_list
           , b <- hsTyClForeignBinders [TyClGroup emptyNameSet [noLocA d] [] [] []] [] ]
     isDataDecl DataDecl{} = True
     isDataDecl _ = False
@@ -3354,8 +3627,11 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       [ (t, (is_gadt, arity, group_ext tg, constructors))
       | tg <- tycls
       , all indexed_kisig (group_kisigs tg)
-      , Just ds <- [traverse indexed_datatype (group_tyclds tg)]
-      , (t, is_gadt, arity, constructors) <- ds ]
+      , Just ds <- [traverse (indexed_datatype (group_kisigs tg)) (group_tyclds tg)]
+      , (t, is_gadt, arity, constructors) <- ds ] ++
+      [ (syn, (False, length params, deps, []))
+      | (syn, (params, _, deps)) <- local_syn_list
+      , isEmptyNameSet (deps `intersectNameSet` (local_non_data_binders `minusNameSet` local_syn_names)) ]
     indexed_datatypes = mkNameEnv indexed_datatype_list
 
     con_owners = mkNameEnv $
@@ -3369,18 +3645,40 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
     names_in :: Data a => a -> [Name]
     names_in node = maybeToList (cast node) ++ concat (gmapQ names_in node)
 
-    indexed_datatype (L _ DataDecl
+    kind_sig_arity :: LHsKind GhcRn -> Maybe (Bool, Int)
+    kind_sig_arity ty = case unLoc (ignoreParens ty) of
+      HsForAllTy{hst_body = body} -> kind_sig_arity body
+      HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod -> do
+        guard (indexed_type dom)
+        (has_idx, k_arity) <- kind_sig_arity cod
+        let dom_idx = case unLoc (ignoreParens dom) of
+              HsStarTy{} -> False
+              _ -> type_name dom /= Just liftedTypeKindTyConName
+        pure (dom_idx || has_idx, k_arity + 1)
+      HsStarTy{} -> Just (False, 0)
+      _ | type_name ty == Just liftedTypeKindTyConName -> Just (False, 0)
+        | otherwise -> Nothing
+
+    indexed_datatype kisigs (L _ DataDecl
       { tcdLName = L _ t, tcdModifiers = [], tcdDExt = DataDeclRn{tcdFVs = fvs}
       , tcdTyVars = HsQTvs{hsq_explicit = params}
-      , tcdDataDefn = HsDataDefn{dd_ctxt = Nothing, dd_kindSig = Nothing,
+      , tcdDataDefn = HsDataDefn{dd_ctxt = Nothing, dd_kindSig = mb_ksig,
           dd_cons = DataTypeCons False cs, dd_derivs = _derivs} })
       | not (nameSetAny (isJust . sourceTableTermOcc . nameOccName) fvs)
       , isEmptyNameSet (fvs `intersectNameSet` local_non_data_binders)
+      , let mb_sak = case [ sig_body (unLoc sig)
+                          | L _ (StandaloneKindSig _ (L _ kt) sig) <- kisigs
+                          , kt == t ] of
+              s : _ -> Just s
+              []    -> Nothing
+      , Just (ksig_idx, ksig_n) <- case mb_ksig <|> mb_sak of
+          Nothing -> Just (False, 0)
+          Just ks -> kind_sig_arity ks
       , Just param_flags <- traverse indexed_parameter params
       , Just con_infos <- traverse indexed_constructor cs
-      = let is_gadt = or param_flags || any fst con_infos
-        in Just (t, is_gadt, length params, concatMap snd con_infos)
-    indexed_datatype _ = Nothing
+      = let is_gadt = ksig_idx || or param_flags || any fst con_infos
+        in Just (t, is_gadt, length params + ksig_n, concatMap snd con_infos)
+    indexed_datatype _ _ = Nothing
 
     indexed_parameter (L _ HsTvb{tvb_flag = HsBndrRequired{}, tvb_kind = kind})
       = case kind of

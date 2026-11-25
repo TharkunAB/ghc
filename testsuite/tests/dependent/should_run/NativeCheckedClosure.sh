@@ -749,3 +749,372 @@ ORULE
         fi
     done
 done
+
+# Named substitution-map helpers, forwarding wrappers (R13_SubstSingleNamedHelperOpenEq),
+# and unary untyped substitution + sigma-calculus combinators (R16_UntypedSubstOpenEq).
+for opt in -O0 -O2; do
+    ns_dir="$work/$opt/named-subst"
+    mkdir -p "$ns_dir"/{provider,reader,hidden,sigma-prov,sigma-cli}
+
+    cd "$ns_dir/provider"
+    cat >NamedSubstProvider.hs <<'HS'
+{-# LANGUAGE DataKinds, DependentTypes #-}
+module NamedSubstProvider where
+
+data Ty = TNat | TArr Ty Ty | TList Ty
+data Ctx = CEmpty | CExt Ctx Ty
+
+data Lookup (g :: Ctx) (a :: Ty) where
+  Z :: Lookup (CExt g a) a
+  S :: Lookup g a -> Lookup (CExt g b) a
+
+data Term (g :: Ctx) (a :: Ty) where
+  Var      :: Lookup g a -> Term g a
+  Lam      :: Term (CExt g a) b -> Term g (TArr a b)
+  App      :: Term g (TArr a b) -> Term g a -> Term g b
+  Zero     :: Term g TNat
+  Nil      :: Term g (TList a)
+  Cons     :: Term g a -> Term g (TList a) -> Term g (TList a)
+  CaseList :: Term g (TList a) -> Term g b -> Term (CExt (CExt g a) (TList a)) b -> Term g b
+
+weakenLookup :: forall d b a. Lookup d a -> Lookup (CExt d b) a
+weakenLookup x = S x
+
+ext :: (forall a. Lookup g a -> Lookup d a)
+    -> (forall a. Lookup (CExt g b) a -> Lookup (CExt d b) a)
+ext _ Z     = Z
+ext r (S x) = S (r x)
+
+rename :: (forall a. Lookup g a -> Lookup d a) -> Term g b -> Term d b
+rename r (Var x)          = Var (r x)
+rename r (Lam n)          = Lam (rename (ext r) n)
+rename r (App l m)        = App (rename r l) (rename r m)
+rename _ Zero             = Zero
+rename _ Nil              = Nil
+rename r (Cons x xs)      = Cons (rename r x) (rename r xs)
+rename r (CaseList l n c) = CaseList (rename r l) (rename r n) (rename (ext (ext r)) c)
+
+exts :: forall g d b.
+        (forall a. Lookup g a -> Term d a)
+     -> (forall a. Lookup (CExt g b) a -> Term (CExt d b) a)
+exts _ Z     = Var Z
+exts s (S x) = rename weakenLookup (s x)
+
+subst :: (forall a. Lookup g a -> Term d a) -> Term g b -> Term d b
+subst s (Var x)          = s x
+subst s (Lam n)          = Lam (subst (exts s) n)
+subst s (App l m)        = App (subst s l) (subst s m)
+subst _ Zero             = Zero
+subst _ Nil              = Nil
+subst s (Cons x xs)      = Cons (subst s x) (subst s xs)
+subst s (CaseList l n c) = CaseList (subst s l) (subst s n) (subst (exts (exts s)) c)
+
+singleSubst :: forall g a. Term g a -> (forall b. Lookup (CExt g a) b -> Term g b)
+singleSubst w Z     = w
+singleSubst _ (S x) = Var x
+
+substSingle :: Term (CExt g a) b -> Term g a -> Term g b
+substSingle n w = subst (singleSubst w) n
+
+substSinglePerm :: Term g a -> Term (CExt g a) b -> Term g b
+substSinglePerm w n = subst (singleSubst w) n
+
+doubleSubst :: forall g a b. Term g a -> Term g b -> (forall c. Lookup (CExt (CExt g a) b) c -> Term g c)
+doubleSubst _  vs Z         = vs
+doubleSubst v  _  (S Z)     = v
+doubleSubst _  _  (S (S x)) = Var x
+
+substDouble :: Term (CExt (CExt g a) b) c -> Term g a -> Term g b -> Term g c
+substDouble m v vs = subst (doubleSubst v vs) m
+
+doubleSubstSwapped :: forall g a b. Term g b -> Term g a -> (forall c. Lookup (CExt (CExt g a) b) c -> Term g c)
+doubleSubstSwapped vs _  Z         = vs
+doubleSubstSwapped _  v  (S Z)     = v
+doubleSubstSwapped _  _  (S (S x)) = Var x
+
+substDoubleSwapped :: Term g b -> Term g a -> Term (CExt (CExt g a) b) c -> Term g c
+substDoubleSwapped vs v m = subst (doubleSubstSwapped vs v) m
+
+idsT :: forall g a. Lookup g a -> Term g a
+idsT = Var
+
+shiftT :: forall g b a. Lookup g a -> Lookup (CExt g b) a
+shiftT = S
+
+renT :: forall g d. (forall a. Lookup g a -> Lookup d a) -> (forall a. Lookup g a -> Term d a)
+renT r x = Var (r x)
+
+consSubstT :: forall g d b. Term d b -> (forall a. Lookup g a -> Term d a)
+           -> (forall a. Lookup (CExt g b) a -> Term d a)
+consSubstT t _ Z     = t
+consSubstT _ s (S x) = s x
+
+seqSubstT :: forall g d e. (forall a. Lookup g a -> Term d a)
+          -> (forall a. Lookup d a -> Term e a)
+          -> (forall a. Lookup g a -> Term e a)
+seqSubstT p q x = subst q (p x)
+HS
+    "${ghc[@]}" "$opt" -c NamedSubstProvider.hs
+    "${ghc[@]}" --show-iface NamedSubstProvider.hi >ns.iface
+    for needle in 'SourceTable T:singleSubst' 'SourceTable T:doubleSubst' \
+                  'CheckedClosureSourceTable T:substSingle' 'CheckedClosureSourceTable T:substDouble' \
+                  'SourceTable T:idsT' 'SourceTable T:shiftT' 'SourceTable T:renT' \
+                  'SourceTable T:consSubstT' 'CheckedClosureSourceTable T:seqSubstT'; do
+        grep -Fq "$needle" ns.iface
+    done
+    if grep -Eq '\$closure:subst(Single|Double)' ns.iface; then
+        cat ns.iface >&2
+        exit 1
+    fi
+
+    cd "$ns_dir/reader"
+    cp ../provider/NamedSubstProvider.hi .
+    cat >NamedSubstClient.hs <<'HS'
+{-# LANGUAGE AllowAmbiguousTypes, CPP, DependentTypes #-}
+module NamedSubstClient where
+
+import Data.Kind (Type)
+import Data.Type.Equality ((:~:) (Refl))
+import GHC.Exts (U)
+import qualified NamedSubstProvider as M
+
+#ifdef RULE_SINGLE_SUBST
+{-# RULES "spoofSingle" forall w. M.singleSubst w M.Z = M.Zero #-}
+#endif
+#ifdef RULE_SUBST_SINGLE
+{-# RULES "spoofForward" forall n w. M.substSingle n w = M.Zero #-}
+#endif
+
+type Step :: forall (g :: M.Ctx) (a :: M.Ty). M.Term g a -> M.Term g a -> Type
+data Step m n where
+  BetaLam :: forall g a b (body :: M.Term (M.CExt g a) b) (v :: M.Term g a).
+             Step (M.App (M.Lam body) v) (M.substSingle body v)
+
+eqVarZ :: forall g a (v :: M.Term g a). M.substSingle (M.Var M.Z) v :~: v
+eqVarZ = Refl
+
+eqLamShift :: forall g a c (v :: M.Term g a).
+              M.substSingle (M.Lam (M.Var (M.S M.Z)) :: M.Term (M.CExt g a) (M.TArr c a)) v
+                :~: M.Lam (M.rename M.weakenLookup v)
+eqLamShift = Refl
+
+eqAbstractSingle :: forall g a b (n :: M.Term (M.CExt g a) b) (v :: M.Term g a).
+                    M.substSingle n v :~: M.subst (M.singleSubst v) n
+eqAbstractSingle = Refl
+
+eqAbstractSinglePerm :: forall g a b (n :: M.Term (M.CExt g a) b) (v :: M.Term g a).
+                        M.substSinglePerm v n :~: M.subst (M.singleSubst v) n
+eqAbstractSinglePerm = Refl
+
+eqAbstractDouble :: forall g a b c (m :: M.Term (M.CExt (M.CExt g a) b) c) (v :: M.Term g a) (vs :: M.Term g b).
+                    M.substDouble m v vs :~: M.subst (M.doubleSubst v vs) m
+eqAbstractDouble = Refl
+
+eqAbstractDoubleSwapped :: forall g a b c (m :: M.Term (M.CExt (M.CExt g a) b) c) (v :: M.Term g a) (vs :: M.Term g b).
+                           M.substDoubleSwapped vs v m :~: M.subst (M.doubleSubstSwapped vs v) m
+eqAbstractDoubleSwapped = Refl
+
+type Renaming g d = forall a. M.Lookup g a %U -> M.Lookup d a
+type SubstFn g d = forall a. M.Lookup g a %U -> M.Term d a
+
+eqIdsTVar :: forall g a (x :: M.Lookup g a). M.subst M.idsT (M.Var x) :~: M.Var x
+eqIdsTVar = Refl
+
+eqRenTVar :: forall g d a (r :: Renaming g d) (x :: M.Lookup g a).
+             M.subst (M.renT r) (M.Var x) :~: M.Var (r x)
+eqRenTVar = Refl
+
+eqConsTZ :: forall g d b (t :: M.Term d b) (s :: SubstFn g d).
+            M.consSubstT t s M.Z :~: t
+eqConsTZ = Refl
+
+eqSeqTVar :: forall g d e a (p :: SubstFn g d) (q :: SubstFn d e) (x :: M.Lookup g a).
+             M.subst (M.seqSubstT p q) (M.Var x) :~: M.subst q (p x)
+eqSeqTVar = Refl
+
+type SimRel :: forall g a. M.Term g a -> M.Term g a -> Type
+data SimRel m n where
+  SimVar  :: SimRel (M.Var x) (M.Var x)
+  SimLam  :: SimRel m n -> SimRel (M.Lam m) (M.Lam n)
+  SimApp  :: SimRel l l' -> SimRel m m' -> SimRel (M.App l m) (M.App l' m')
+  SimZero :: SimRel M.Zero M.Zero
+
+type Compatible :: forall g d. SubstFn g d -> SubstFn g d -> Type
+type Compatible @g @d p q = forall a. foreach (x :: M.Lookup g a) -> SimRel (p x) (q x)
+
+singleCompat :: forall g a (v :: M.Term g a) (v' :: M.Term g a).
+                SimRel v v' -> Compatible (M.singleSubst v) (M.singleSubst v')
+singleCompat sv index = case index of
+  M.Z   -> sv
+  M.S y -> SimVar @y
+HS
+    test ! -e NamedSubstProvider.o
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -c NamedSubstClient.hs
+    "${ghc[@]}" "$opt" -fforce-recomp -c NamedSubstClient.hs
+    for rflag in RULE_SINGLE_SUBST RULE_SUBST_SINGLE; do
+        if "${ghc[@]}" "$opt" -fforce-recomp -fenable-rewrite-rules -Wno-inline-rule-shadowing \
+             "-D$rflag" -c NamedSubstClient.hs >ns-rule.log 2>&1 ||
+           ! grep -Fq '[GHC-83605]' ns-rule.log; then
+            cat ns-rule.log >&2
+            exit 1
+        fi
+    done
+
+    # Unexported singleSubst must withhold T:substSingle and fail client with GHC-70565.
+    cd "$ns_dir/hidden"
+    sed 's/module NamedSubstProvider where/module NamedSubstProvider (Ty(..), Ctx(..), Lookup(..), Term(..), weakenLookup, ext, rename, exts, subst, substSingle) where/' \
+        ../provider/NamedSubstProvider.hs >NamedSubstProvider.hs
+    "${ghc[@]}" "$opt" -c NamedSubstProvider.hs
+    "${ghc[@]}" --show-iface NamedSubstProvider.hi >hidden-ns.iface
+    if grep -Fq 'CheckedClosureSourceTable T:substSingle' hidden-ns.iface; then
+        cat hidden-ns.iface >&2
+        exit 1
+    fi
+    cat >HiddenSingleClient.hs <<'HS'
+{-# LANGUAGE DataKinds, DependentTypes #-}
+module HiddenSingleClient where
+import Data.Type.Equality ((:~:)(Refl))
+import qualified NamedSubstProvider as M
+bad :: forall g a (v :: M.Term g a). M.substSingle (M.Var M.Z) v :~: v
+bad = Refl
+HS
+    if "${ghc[@]}" "$opt" -fno-code -c HiddenSingleClient.hs >hns.log 2>&1 ||
+       ! grep -Eq '\[GHC-7056[56]\]' hns.log; then
+        cat hns.log >&2
+        exit 1
+    fi
+
+    # Untyped 1-index open substitution & sigma-calculus combinators (R16_UntypedSubstOpenEq).
+    cd "$ns_dir/sigma-prov"
+    cat >UntypedSigmaProvider.hs <<'HS'
+{-# LANGUAGE DataKinds, DependentTypes, LambdaCase #-}
+module UntypedSigmaProvider where
+
+data Nat = Zero | Succ Nat
+
+data Fin (n :: Nat) where
+  FZ :: Fin (Succ n)
+  FS :: Fin n -> Fin (Succ n)
+
+data UTerm (n :: Nat) where
+  UVar :: Fin n -> UTerm n
+  ULam :: UTerm (Succ n) -> UTerm n
+  UApp :: UTerm n -> UTerm n -> UTerm n
+
+shiftFin :: Fin n -> Fin (Succ n)
+shiftFin x = FS x
+
+extU :: (Fin m -> Fin n) -> Fin (Succ m) -> Fin (Succ n)
+extU _   FZ     = FZ
+extU rho (FS x) = FS (rho x)
+
+renameU :: (Fin m -> Fin n) -> UTerm m -> UTerm n
+renameU rho (UVar x)   = UVar (rho x)
+renameU rho (ULam b)   = ULam (renameU (extU rho) b)
+renameU rho (UApp l m) = UApp (renameU rho l) (renameU rho m)
+
+extsU :: (Fin m -> UTerm n) -> Fin (Succ m) -> UTerm (Succ n)
+extsU _     FZ     = UVar FZ
+extsU sigma (FS x) = renameU shiftFin (sigma x)
+
+substU :: (Fin m -> UTerm n) -> UTerm m -> UTerm n
+substU sigma (UVar x)   = sigma x
+substU sigma (ULam b)   = ULam (substU (extsU sigma) b)
+substU sigma (UApp l m) = UApp (substU sigma l) (substU sigma m)
+
+substSingleU :: UTerm (Succ n) -> UTerm n -> UTerm n
+substSingleU b w = substU (\case { FZ -> w; FS x -> UVar x }) b
+
+type Rename m n = Fin m -> Fin n
+type Subst m n = Fin m -> UTerm n
+
+ids :: Subst m m
+ids = UVar
+
+shift :: Rename m (Succ m)
+shift = FS
+
+ren :: Rename m n -> Subst m n
+ren r x = UVar (r x)
+
+consSubst :: UTerm n -> Subst m n -> Subst (Succ m) n
+consSubst t _ FZ     = t
+consSubst _ s (FS x) = s x
+
+seqSubst :: Subst m n -> Subst n k -> Subst m k
+seqSubst p q x = substU q (p x)
+
+singleSubstU :: UTerm n -> Fin (Succ n) -> UTerm n
+singleSubstU w FZ     = w
+singleSubstU _ (FS x) = UVar x
+
+substSingleNamedU :: UTerm (Succ n) -> UTerm n -> UTerm n
+substSingleNamedU m w = substU (singleSubstU w) m
+HS
+    "${ghc[@]}" "$opt" -c UntypedSigmaProvider.hs
+    "${ghc[@]}" --show-iface UntypedSigmaProvider.hi >usig.iface
+    for fam in T:shiftFin T:extU T:renameU T:extsU T:substU T:substSingleU \
+               T:ids T:shift T:ren T:consSubst T:seqSubst T:singleSubstU T:substSingleNamedU; do
+        grep -Fq "$fam" usig.iface
+    done
+
+    cd "$ns_dir/sigma-cli"
+    cp ../sigma-prov/UntypedSigmaProvider.hi .
+    cat >UntypedSigmaClient.hs <<'HS'
+{-# LANGUAGE AllowAmbiguousTypes, DependentTypes #-}
+module UntypedSigmaClient where
+
+import Data.Type.Equality ((:~:) (Refl))
+import GHC.Exts (U)
+import GHC.Types (Matchability)
+import qualified UntypedSigmaProvider as U
+
+type SubstFn m n = U.Fin m %U -> U.UTerm n
+
+cong :: forall {a} {b} {m :: Matchability}.
+        forall (f :: a %m -> b) -> forall (x :: a) (y :: a).
+        x :~: y -> f x :~: f y
+cong _ Refl = Refl
+
+subApp :: forall m n (s :: SubstFn m n) (l :: U.UTerm m) (r :: U.UTerm m).
+          U.substU s (U.UApp l r) :~: U.UApp (U.substU s l) (U.substU s r)
+subApp = Refl
+
+subLam :: forall m n (s :: SubstFn m n) (b :: U.UTerm (U.Succ m)).
+          U.substU s (U.ULam b) :~: U.ULam (U.substU (U.extsU s) b)
+subLam = Refl
+
+extsFZ :: forall m n (s1 :: SubstFn m n) (s2 :: SubstFn m n).
+          U.extsU s1 U.FZ :~: U.extsU s2 U.FZ
+extsFZ = Refl
+
+stepFS :: forall m n (s1 :: SubstFn m n) (s2 :: SubstFn m n) (x :: U.Fin m).
+          (s1 x :~: s2 x) -> U.extsU s1 (U.FS x) :~: U.extsU s2 (U.FS x)
+stepFS eq = cong (U.renameU U.shiftFin) eq
+
+bareIdsVar :: forall m (x :: U.Fin m). U.substU U.ids (U.UVar x) :~: U.UVar x
+bareIdsVar = Refl
+
+bareShiftVar :: forall m (x :: U.Fin m). U.renameU U.shift (U.UVar x) :~: U.UVar (U.FS x)
+bareShiftVar = Refl
+
+consIdsZ :: forall n (w :: U.UTerm n). U.substU (U.consSubst w U.ids) (U.UVar U.FZ) :~: w
+consIdsZ = Refl
+
+seqVar :: forall m n k (p :: SubstFn m n) (q :: SubstFn n k) (x :: U.Fin m).
+          U.substU (U.seqSubst p q) (U.UVar x) :~: U.substU q (p x)
+seqVar = Refl
+
+namedVsSubstU :: forall n (m :: U.UTerm (U.Succ n)) (w :: U.UTerm n).
+                 U.substSingleNamedU m w :~: U.substU (U.singleSubstU w) m
+namedVsSubstU = Refl
+
+inlineShiftEq :: forall n (w :: U.UTerm n).
+                 U.substSingleU (U.ULam (U.UVar (U.FS U.FZ)) :: U.UTerm (U.Succ n)) w
+                   :~: U.ULam (U.renameU U.shiftFin w)
+inlineShiftEq = Refl
+HS
+    test ! -e UntypedSigmaProvider.o
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -c UntypedSigmaClient.hs
+    "${ghc[@]}" "$opt" -fforce-recomp -c UntypedSigmaClient.hs
+done

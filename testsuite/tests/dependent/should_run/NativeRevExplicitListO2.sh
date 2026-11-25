@@ -259,3 +259,160 @@ if grep -Eq 'GHC\.Internal\.Types\.(M|U|Matchable|Unmatchable)' negative.log; th
     cat negative.log >&2
     exit 1
 fi
+
+# 5. Spine-strict accumulator append proof at -O2 (R13_ShuntAccumOpenEq) &
+#    stock -O2 map-append fusion guard + runtime demand counterexample (R03_FunctionColumnSplit).
+mkdir -p "$work/shunt-append" "$work/map-append-guard"
+cd "$work/shunt-append"
+cat > ShuntAccumProof.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+module ShuntAccumProof (shunt, shuntAppend) where
+
+import Data.Type.Equality ((:~:) (Refl))
+
+shunt :: [a] -> [a] -> [a]
+shunt []     ys = ys
+shunt (x:xs) ys = shunt xs (x : ys)
+
+shuntAppend :: foreach (xs :: [a]) -> foreach (ys :: [a]) -> foreach (zs :: [a])
+            -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)
+shuntAppend []     _  _  = Refl
+shuntAppend (x:xs) ys zs = shuntAppend xs ys (x : zs)
+HS
+for opt in -O0 -O2; do
+    "${ghc[@]}" "$opt" -fno-code -fwrite-interface -fforce-recomp -c ShuntAccumProof.hs
+    "${ghc[@]}" "$opt" -fforce-recomp -c ShuntAccumProof.hs
+done
+"${ghc[@]}" --interactive -ignore-dot-ghci ShuntAccumProof.hs \
+    -e 'print (shuntAppend [True, False] [True] [])' >shunt-ghci.out
+grep -Fxq 'Refl' shunt-ghci.out
+
+cat > ShuntConsumer.hs <<'HS'
+{-# LANGUAGE CPP, DataKinds, GADTs, RankNTypes, TypeOperators #-}
+{-# OPTIONS_GHC -Wno-inline-rule-shadowing #-}
+module Main where
+
+import Data.Type.Equality ((:~:) (Refl))
+import GHC.Exts (augment)
+import ShuntAccumProof (shunt, shuntAppend)
+
+#ifdef HIJACK_AUGMENT
+{-# RULES "spoofAugment" forall a. forall (g :: forall b. (a -> b -> b) -> b -> b) ys. augment g ys = ys #-}
+#endif
+
+checkShunt :: [Bool] -> [Bool] -> [Bool] -> Bool
+checkShunt xs ys zs = case shuntAppend xs ys zs of
+  Refl -> shunt (xs ++ ys) zs == shunt ys (shunt xs zs)
+
+main :: IO ()
+main = if checkShunt [True, False] [False] [True] then pure () else error "bad"
+HS
+"${ghc[@]}" -O2 -c ShuntConsumer.hs
+"${ghc[@]}" -O2 ShuntConsumer.o ShuntAccumProof.o -o shunt-run
+./shunt-run
+reject 83605 -O2 -DHIJACK_AUGMENT -fforce-recomp -c ShuntConsumer.hs
+
+for rule_body in \
+    'forall xs ys. (++) xs ys = ys' \
+    'forall xs ys. shunt xs ys = ys' \
+    'forall a. forall (g :: forall b. (a -> b -> b) -> b -> b) ys. augment g ys = ys' \
+    'forall k z xs. GHC.Base.foldr k z xs = z' \
+    'forall a. forall (g :: forall b. (a -> b -> b) -> b -> b). build g = []'; do
+    cat > SpoofShunt.hs <<HS
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes, TypeOperators #-}
+{-# OPTIONS_GHC -Wno-inline-rule-shadowing #-}
+module SpoofShunt where
+import Data.Type.Equality ((:~:) (Refl))
+import qualified GHC.Base
+import GHC.Exts (augment, build)
+shunt :: [a] -> [a] -> [a]
+shunt []     ys = ys
+shunt (x:xs) ys = shunt xs (x : ys)
+{-# RULES "spoof" $rule_body #-}
+shuntAppend :: foreach (xs :: [a]) -> foreach (ys :: [a]) -> foreach (zs :: [a])
+            -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)
+shuntAppend []     _  _  = Refl
+shuntAppend (x:xs) ys zs = shuntAppend xs ys (x : zs)
+HS
+    reject 83605 -O2 -fforce-recomp -c SpoofShunt.hs
+done
+
+cat > SmuggledWhere.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+module SmuggledWhere where
+import Data.Type.Equality ((:~:) (Refl))
+shunt :: [a] -> [a] -> [a]
+shunt []     ys = ys
+shunt (x:xs) ys = shunt xs (x : ys)
+shuntAppend :: foreach (xs :: [Bool]) -> foreach (ys :: [Bool]) -> foreach (zs :: [Bool])
+            -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)
+shuntAppend []     ys _  = bad ([] :: [Bool]) ys `seq` Refl
+  where
+    bad :: foreach (us :: [Bool]) -> foreach (vs :: [Bool])
+        -> map not (us ++ vs) :~: (map not us ++ map not vs)
+    bad []     _ = Refl
+    bad (_:us) v = case bad us v of Refl -> Refl
+shuntAppend (x:xs) ys zs = shuntAppend xs ys (x : zs)
+HS
+reject 83605 -O2 -fforce-recomp -c SmuggledWhere.hs
+
+cat > SmuggledExprSig.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+module SmuggledExprSig where
+import Data.Type.Equality ((:~:) (Refl))
+shunt :: [a] -> [a] -> [a]
+shunt []     ys = ys
+shunt (x:xs) ys = shunt xs (x : ys)
+shuntAppend :: foreach (xs :: [Bool]) -> foreach (ys :: [Bool]) -> foreach (zs :: [Bool])
+            -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)
+shuntAppend []     ys _  = const Refl (Refl :: (('[] :: [Bool]) ++ ys) :~: ys)
+shuntAppend (x:xs) ys zs = shuntAppend xs ys (x : zs)
+HS
+reject 83605 -O2 -fforce-recomp -c SmuggledExprSig.hs
+
+cd "$work/map-append-guard"
+cat > MapAppendGuard.hs <<'HS'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+module MapAppendGuard (mapAppendEq) where
+import Data.Type.Equality ((:~:) (Refl), gcastWith)
+mapAppendEq :: forall a b. foreach (f :: a -> b) -> foreach (xs :: [a]) -> foreach (ys :: [a])
+            -> map f (xs ++ ys) :~: (map f xs ++ map f ys)
+mapAppendEq _ []       _  = Refl
+mapAppendEq f (_ : xs) ys = gcastWith (mapAppendEq f xs ys) Refl
+HS
+"${ghc[@]}" -O0 -fforce-recomp -c MapAppendGuard.hs
+"${ghc[@]}" -O2 -fno-enable-rewrite-rules -fforce-recomp -c MapAppendGuard.hs
+reject 83605 -O2 -fforce-recomp -c MapAppendGuard.hs
+
+cat > MapAppendFusionCounterexample.hs <<'HS'
+{-# LANGUAGE RankNTypes #-}
+module Main where
+import Control.Exception (ErrorCall(..), evaluate, try)
+import GHC.Exts (build)
+
+{-# INLINE producer #-}
+producer :: (Bool -> b -> b) -> b -> b
+producer cons seed = seed `seq` cons True seed
+
+{-# NOINLINE observeFusedLHS #-}
+observeFusedLHS :: [Bool] -> Bool
+observeFusedLHS ys = null (map not (build producer ++ ys))
+
+{-# NOINLINE observeSeparateRHS #-}
+observeSeparateRHS :: [Bool] -> (Bool, Bool)
+observeSeparateRHS ys =
+  let mxs = map not (build producer)
+  in (null mxs, null (mxs ++ map not ys))
+
+main :: IO ()
+main = do
+  if build producer /= [True] then error "unexpected xs" else pure ()
+  lhs <- try (evaluate (observeFusedLHS (error "ys"))) :: IO (Either ErrorCall Bool)
+  rhs <- evaluate (observeSeparateRHS (error "ys"))
+  case (lhs, rhs) of
+    (Left _, (False, False)) -> pure ()
+    other -> error ("Unexpected outcome: " ++ show other)
+HS
+"${ghc[@]}" -O2 -c MapAppendFusionCounterexample.hs
+"${ghc[@]}" -O2 MapAppendFusionCounterexample.o -o fusion-counterexample
+./fusion-counterexample
