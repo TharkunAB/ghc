@@ -1,13 +1,12 @@
 .. _experimental-dependent-types:
 
-Experimental dependent types
-============================
+Dependent types
+===============
 
 .. extension:: DependentTypes
     :shortdesc: Enable the GHC Proposal #378 Dependent Haskell extension bundle.
 
-    :implies: :extension:`ExperimentalDependentTypes`,
-              :extension:`ExistentialTypes`, :extension:`ExtendedLet`,
+    :implies: :extension:`ExistentialTypes`, :extension:`ExtendedLet`,
               :extension:`GADTs`, :extension:`DataKinds`,
               :extension:`PolyKinds`, :extension:`TypeOperators`,
               :extension:`RankNTypes`, :extension:`ScopedTypeVariables`,
@@ -26,18 +25,6 @@ Experimental dependent types
 .. _GHC Proposal #473: https://github.com/ghc-proposals/ghc-proposals/pull/473
 .. _GHC Proposal #523: https://github.com/ghc-proposals/ghc-proposals/pull/523
 
-.. extension:: ExperimentalDependentTypes
-    :shortdesc: Check restricted retained algebraic quantification.
-
-    :implies: :extension:`RequiredTypeArguments`
-    :since: 10.1
-    :status: Experimental
-
-    Compatibility alias that enables dependent quantification and default-on
-    :ghc-flag:`-fwrite-source-equations` without enabling the full
-    :extension:`DependentTypes` extension bundle. Use this alias to keep
-    :extension:`ListTuplePuns` or language-edition defaults active.
-
 .. extension:: ExistentialTypes
     :shortdesc: Enable first-class existential quantification.
 
@@ -46,26 +33,37 @@ Experimental dependent types
     :status: Experimental
 
     Enable first-class existential quantification (``exists``,
-    `GHC Proposal #473`_). In this compiler, the flag acts as an alias for
-    :extension:`ExperimentalDependentTypes`.
+    `GHC Proposal #473`_).
 
 .. extension:: ExtendedLet
-    :shortdesc: Enable local let bindings in types.
+    :shortdesc: Enable local let bindings in types and local type synonyms in terms.
 
     :implies: :extension:`RequiredTypeArguments`
     :since: 10.1
     :status: Experimental
 
-    Enable local ``let ... in ...`` bindings in types (`GHC Proposal #523`_).
-    In this compiler, the flag acts as an alias for
-    :extension:`ExperimentalDependentTypes`.
+    Enable local ``let ... in ...`` bindings in types and nonrecursive local
+    ``type`` synonyms inside term-level ``let`` and ``where`` blocks
+    (`GHC Proposal #523`_).
 
-GHC disables :extension:`DependentTypes` and
-:extension:`ExperimentalDependentTypes` by default. Enabling either extension
-turns on :ghc-flag:`-fwrite-source-equations` by default. Pass
-:ghc-flag:`-fno-write-source-equations` to disable source-equation
-publication. Place a ``No...`` flag or pragma (or :extension:`ListTuplePuns`)
-after :extension:`DependentTypes` to override any implied extension.
+.. extension:: ExperimentalDependentTypes
+    :shortdesc: Legacy compatibility alias for dependent quantification.
+
+    :implies: :extension:`RequiredTypeArguments`
+    :since: 10.1
+    :status: Deprecated
+
+    Legacy compatibility alias that enables dependent quantification without
+    the full :extension:`DependentTypes` extension bundle. New code should
+    enable :extension:`DependentTypes` (adding :extension:`ListTuplePuns` after
+    :extension:`DependentTypes` when list or tuple type puns are desired).
+
+GHC disables :extension:`DependentTypes` by default. Enabling
+:extension:`DependentTypes` turns on :ghc-flag:`-fwrite-source-equations` by
+default. Pass :ghc-flag:`-fno-write-source-equations` to disable
+source-equation publication. Place a ``No...`` flag or pragma (or
+:extension:`ListTuplePuns`) after :extension:`DependentTypes` to override any
+implied extension.
 
 These extensions enable ``foreach``, ``exists``, and ``some`` in types and in
 required type argument positions. With :extension:`UnicodeSyntax`, ``∏``
@@ -84,8 +82,7 @@ Local definitions and functions in types
 A type synonym can name an intermediate type with ``let``, select a
 type by matching a constructor, or partially apply a type lambda::
 
-    {-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers #-}
-    {-# LANGUAGE StandaloneKindSignatures, TypeFamilies #-}
+    {-# LANGUAGE DependentTypes, TypeFamilies #-}
     module SurfaceGuide (PairUp, Payload, ByType, WithError, Result) where
     import Data.Kind (Type)
     import GHC.Exts (U)
@@ -113,7 +110,7 @@ A closed type family can use ``case`` on the right-hand side of an
 equation. In this example, a local binding computes a default width.
 A second case selects that width or an explicit override::
 
-    {-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeFamilies #-}
+    {-# LANGUAGE DependentTypes, TypeFamilies #-}
     module WidthGuide where
     import GHC.TypeNats (Nat)
 
@@ -166,8 +163,40 @@ large elimination without a separate ``type family`` declaration::
 
 Each equation right-hand side writes its result type with the ``type`` herald.
 GHC synthesizes a promoted closed type family for type-level calls such as
-``valPred v``. Multi-argument functions (``Val -> Val -> Type``) and
-polymorphic list eliminations (``forall a. [a] -> Type``) follow the same rule.
+``valPred v``. Multi-argument functions (``Val -> Val -> Type``), polymorphic
+list eliminations (``forall a. [a] -> Type``), and functions mutually recursive
+with datatypes follow the same rule.
+
+With :extension:`DependentTypes` or :extension:`ExtendedLet`
+(`GHC Proposal #523`_), term-level ``let`` and ``where`` blocks can also declare
+nonrecursive local ``type`` synonyms, including synonyms that mention enclosing
+``foreach`` runtime binders::
+
+    {-# LANGUAGE DependentTypes #-}
+    module LocalTypeSynonym where
+
+    data Nat = Zero | Succ Nat
+    data Vec a (n :: Nat) where
+      VNil  :: Vec a Zero
+      VCons :: a -> Vec a n -> Vec a (Succ n)
+
+    headSum :: foreach (n :: Nat) -> (Int, Int) -> Vec Int n -> Int
+    headSum n (u, v) tailVec =
+      let type PairOf a = (a, a)
+          pair :: PairOf Int
+          pair = (u, v)
+          combined :: LocalVec Int
+          combined = VCons (fst pair + snd pair) tailVec
+      in case combined of
+           VCons total _ -> total
+      where
+        type LocalVec b = Vec b (Succ n)
+
+Type families under :extension:`DependentTypes` also support promoted primitive
+``Char#`` literals (such as ``'C# 'a'#`` under :extension:`MagicHash`), promoted
+unboxed tuples ``(# a, b #)`` (under :extension:`UnboxedTuples`), and
+standalone open type families with class constraints in their kind signatures
+(such as ``type ItemOf :: HasItem c => c -> Type``).
 
 Retained pairs and erased lengths
 ---------------------------------
@@ -220,10 +249,11 @@ shared-type binder groups, and dot or bar delimiters:
       packedInt :: exists a | (a, a -> String)
       packedInt = Pack @Int (42, show)
 
-- ``GHC.Exists`` also exports ``(/\)`` (constructor ``MkCPair``,
-  ``infixr 2 /\``) to pair a constraint dictionary with a value, as in
-  ``exists a. Show a /\ a``, and ``discardEvidence :: (c /\ a) -> a`` to drop
-  the stored dictionary.
+- ``GHC.Exists`` (`GHC Proposal #473`_) exports ``Exists``
+  (``type Exists p = exists x | p x``), ``Pack``, ``(/\)`` (constructor
+  ``MkCPair``, ``infixr 2 /\``), ``discardEvidence :: (c /\ a) -> a``,
+  ``withEvidence :: (c /\ a) -> (c => a -> r) -> r``, ``Witness(Witness)`` for
+  erased witness tokens, ``withExists``, ``mapExists``, and ``uncurryExists``.
 - ``some (m n :: Nat) | Pair2 (Vec a m) (Vec a n)`` and
   ``some (m n :: Nat). Pair2 (Vec a m) (Vec a n)`` desugar right-associatively
   to nested ``Sigma`` pairs. GHC accepts ``some`` in any type position,
@@ -232,6 +262,9 @@ shared-type binder groups, and dot or bar delimiters:
 - ``GHC.Sigma`` exports ``Sigma(Pair)``, ``first :: Sigma a p -> a``,
   ``second :: foreach (p :: Sigma a b) -> b (first p)``, and
   ``withSigma :: Sigma a p -> (foreach (x :: a) -> p x -> r) -> r``.
+- With :extension:`OverloadedRecordDot`, dot projection ``r.field`` resolves
+  dependent record selectors and ``GHC.Sigma`` projections (``pkg.first`` and
+  ``pkg.second``) when a field's result type depends on earlier fields of ``r``.
 
 Both the producer and an ordinary client can
 compile at ``-O1``, including through a separately compiled interface.
@@ -245,7 +278,7 @@ Natural numerals in vector indices
 
 When a closed lifted Peano datatype defines a ground ``Num`` instance with
 the certified three-guard ``fromInteger`` method under
-:extension:`DependentTypes` or :extension:`ExperimentalDependentTypes`, GHC
+:extension:`DependentTypes`, GHC
 automatically promotes nonnegative type-level numerals at that kind without
 requiring a separate ``FromNatural`` instance.
 
@@ -266,7 +299,7 @@ for the index kind::
     type instance FromNatural Nat n = ToPeano n
 
 This definition of ``ToPeano`` requires :extension:`UndecidableInstances`.
-In a module with :extension:`ExperimentalDependentTypes`, a numeral in
+In a module with :extension:`DependentTypes`, a numeral in
 ``Vec a 3`` now has the expected kind ``Nat``. The checked instance
 determines its value. When GHC infers the kind of a numeral, or expects
 ``GHC.TypeNats.Nat``, the ordinary built-in literal rules apply.
@@ -456,7 +489,7 @@ type binder named ``length`` takes precedence.
 GHC uses a published character equation for ``toUpper`` and executes
 ``isDigit``, ``sum``, ``reverse`` and ``odd`` in the following examples::
 
-    {-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+    {-# LANGUAGE DependentTypes, ListTuplePuns #-}
     import qualified Data.Char
     import Data.Type.Equality ((:~:)(Refl))
 
@@ -507,8 +540,9 @@ the list fixes the container to ``[]`` and the element type to
 ``Natural``. GHC uses ordinary instance resolution for ``Foldable []`` and
 ``Num Natural``. Each type parameter must be determined by the input.
 A missing or ambiguous instance causes a type error at the call, even if
-the module enables :ghc-flag:`-fdefer-type-errors`. An instance defined
-in the module currently being compiled cannot supply executable code.
+the module enables :ghc-flag:`-fdefer-type-errors`. Pure recursive functions defined earlier in the same module (such as
+``fibClosed :: Natural -> Natural``) can also be evaluated on closed arguments
+in later type signatures within that module.
 
 With :extension:`TypeApplications`, the expression
 ``charVal (Proxy @(Data.Char.toUpper 'x'))`` reflects the result as a
@@ -542,7 +576,7 @@ is a rigid type variable. For example, this definition checks because
 reducing the ordinary Prelude function ``id`` returns the type variable
 ``a`` unchanged::
 
-    {-# LANGUAGE ExperimentalDependentTypes, ScopedTypeVariables #-}
+    {-# LANGUAGE DependentTypes #-}
 
     x :: forall a. Num a => id a
     x = 42
@@ -589,7 +623,7 @@ A second module can use that function in a signature::
        => Proxy c -> Char
     p3 _ = charVal (Proxy @uc)
 
-Enable :extension:`ExperimentalDependentTypes` in those two modules.
+Enable :extension:`DependentTypes` in those two modules.
 A client with the extension switched off can call ``p3 (Proxy @'x')``
 and get ``'X'``. Calling it at ``'!'`` returns ``'!'``. The producer's
 interface carries the checked equations even with
@@ -604,7 +638,7 @@ signature above lets an ordinary client reflect the Unicode mapping.
 For a class method, the current implementation accepts a concrete
 instance of a one-parameter class. The method must return its class
 parameter and name a checked function as its complete definition.
-The producer enables :extension:`ExperimentalDependentTypes` to
+The producer enables :extension:`DependentTypes` to
 publish this information. A client reads it from the completed
 interface. Within the instance module, use ``plus n m`` directly.
 An abstract ``Num Nat`` dictionary passed to the client
@@ -672,13 +706,42 @@ expressions in the static subset as well as ``(type T)``::
     sample :: (Int, Maybe Char)
     sample = (ex5 Int 42, ex5 (Maybe Char) (Just 'z'))
 
+Inside the body of a ``foreach (a :: Type) ->`` function, ``case`` expressions
+can match the runtime ``Type`` witness directly using unadorned type patterns
+and a catch-all branch::
+
+    describeType :: foreach (a :: Type) -> Maybe a
+    describeType a = case a of
+      Int    -> Just 12
+      Bool   -> Just True
+      [Char] -> Just "ok"
+      _      -> Nothing
+
+Required type arguments (``T2T``) also accept left and right operator sections,
+including sections that capture enclosing ``foreach`` runtime binders::
+
+    congRightPlus :: forall (m :: Nat) (n :: Nat).
+                     foreach (p :: Nat) -> m :~: n -> (m + p) :~: (n + p)
+    congRightPlus p eq = cong (+ p) eq
+
+With :extension:`LinearTypes`, ``foreach`` binders accept explicit linear and
+multiplicity-polymorphic annotations ``foreach (x %1 :: a) ->`` and
+``foreach (x %m :: a) ->``::
+
+    dupInTypeLinear :: foreach (n %1 :: Nat) -> Proxy '(n, n) -> Nat
+    dupInTypeLinear n Proxy = n
+
+Type-level occurrences of ``n`` are erased and do not consume runtime
+multiplicity; term-level occurrences of ``n`` must satisfy the declared
+multiplicity ``%1`` or ``%m``.
+
 Retained arguments
 ------------------
 
 The syntax retains a value argument whose identity can occur in the
 result type. For example::
 
-    {-# LANGUAGE ExperimentalDependentTypes #-}
+    {-# LANGUAGE DependentTypes #-}
 
     keep :: foreach (b :: Bool) -> Select b -> Select b
     keep _ x = x
@@ -703,7 +766,7 @@ next prompt::
     [True,True]
 
 A multiline declaration group between ``:{`` and ``:}`` works as well.
-Use ``:seti -XExperimentalDependentTypes`` to enable the syntax at the
+Use ``:seti -XDependentTypes`` to enable the syntax at the
 prompt. A length obtained from IO can be bound in the same expression
 that applies the retained function, as in
 ``do { n <- readIORef ref; print (toList (fill n)) }``.
@@ -723,7 +786,7 @@ result type. A consumer can therefore receive the selected value::
 
 The domain can also be a user-defined closed algebraic type::
 
-    {-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeApplications, TypeFamilies #-}
+    {-# LANGUAGE DependentTypes, TypeFamilies #-}
 
     data Nat = Z | S Nat
 
@@ -862,7 +925,7 @@ unreduced; ordinary forall binder kinds normalize at nominal role.
 Dependent typed holes and advisory totality
 -------------------------------------------
 
-Under :extension:`DependentTypes` or :extension:`ExperimentalDependentTypes`,
+Under :extension:`DependentTypes`,
 typed holes (see :ref:`typed-holes`) inspect local ``foreach`` runtime indices,
 local ``let`` and ``where`` bindings, and GADT equality Givens:
 
@@ -873,9 +936,13 @@ local ``let`` and ``where`` bindings, and GADT equality Givens:
   :ghc-flag:`-frefinement-level-hole-fits=⟨n⟩`) and split a goal into typed
   subgoals through ``foreach`` functions and required-type-argument congruence
   wrappers such as ``cong Succ (_ :: plus (plus m n) p :~: plus m (plus n p))``.
+- Point-free ``foreach`` holes (such as ``lengthRev = _``) match polymorphic and
+  monomorphic ``foreach`` candidates even when inner type families reduce
+  differently on each side.
 - When a hole type contains a stuck promoted function application on an unsplit
-  variable, GHC suggests pattern-matching on that variable and lists its
-  constructors under ``Suggested fixes``.
+  local variable bound in the enclosing clause or expression, GHC suggests
+  pattern-matching on that variable and lists its constructors under
+  ``Suggested fixes``.
 
 Dependent Haskell does not require termination by default. Authors who want
 local structural termination feedback can enable :ghc-flag:`-freport-totality`.
@@ -911,48 +978,72 @@ local structural termination feedback can enable :ghc-flag:`-freport-totality`.
 Source equations, build options, and reserved syntax
 ----------------------------------------------------
 
-:extension:`DependentTypes` and :extension:`ExperimentalDependentTypes` (along
-with :extension:`ExistentialTypes` and :extension:`ExtendedLet`) enable
-:ghc-flag:`-fwrite-source-equations` by default. Pass
-:ghc-flag:`-fno-write-source-equations` to disable source-equation publication
-for a module. An ordinary module without dependent extensions can pass
-:ghc-flag:`-fwrite-source-equations` to publish checked equations for
-downstream dependent clients. GHC stages checked source equations and closure
-tables in dependency order within the defining module and across ``.hi``
-interfaces (including with :ghc-flag:`-fno-code` and
+:extension:`DependentTypes` (along with :extension:`ExistentialTypes` and
+:extension:`ExtendedLet`) enables :ghc-flag:`-fwrite-source-equations` by
+default. Pass :ghc-flag:`-fno-write-source-equations` to disable
+source-equation publication for a module. An ordinary module without dependent
+extensions can pass :ghc-flag:`-fwrite-source-equations` to publish checked
+equations for downstream dependent clients. GHC stages checked source equations
+and closure tables in dependency order within the defining module and across
+``.hi`` interfaces (including with :ghc-flag:`-fno-code` and
 :ghc-flag:`-fwrite-interface`).
 
-For modules with native retained definitions, pass
-``-fomit-interface-pragmas -fno-write-if-simplified-core`` when writing
-interfaces. The native dependent Core pipeline runs Core Lint and STG Lint.
-GHCi can interpret dependent modules in memory or load compiled bytecode. GHC
-does not support native-containing ``INLINE``, ``INLINABLE``, or class-default
-unfoldings, profiling, module plugins, or JavaScript code generation.
-Spine-strict list proofs over certified ``base`` operations and existential
-packages compile with optimization enabled.
+The native dependent Core pipeline runs Core Lint and STG Lint, serializes
+validated ``INLINE`` and ``INLINABLE`` ``DepFunTy`` unfoldings across ``.hi``
+interfaces, and supports optimization on spine-strict list proofs and
+existential packages. GHCi can interpret dependent modules in memory or load
+compiled bytecode.
+
+Standard GHC plugins (:ghc-flag:`-fplugin=⟨module⟩`) work with
+:extension:`DependentTypes`: source, renamer, splice, driver, interface,
+typechecker (``tcPlugin``), defaulting, and hole-fit plugins run normally, and
+``installCoreToDos`` Core-to-Core passes execute under Dependent Core Lint
+before post-optimization source-equation verification. Only active
+``latePlugin`` hooks, profiling, and JavaScript code generation reject native
+dependent Core.
 
 Use libraries and packages built with a matching compiler. The configured
 compiler at this revision is ``10.1.20261115.1``. Its ordinary interface
-version is ``100120261115168``.
+version is ``100120261115168``. With :ghc-flag:`-fwrite-ide-info`, ``.hie``
+files also record retained binder visibilities, runtime index references, and
+opaque call indices.
 
-With :ghc-flag:`-fwrite-ide-info`, an extended interface file also records
-the visibility and type of a retained binder, references to runtime
-indices, and opaque applications of a bound function. Its version is
-separate from the ordinary interface version. Regenerate older
-``.hie`` files with this compiler before reading them.
+Standard library (``dependent-base``)
+-------------------------------------
 
-:extension:`ExperimentalDependentTypes`, :extension:`ExistentialTypes`, and
-:extension:`ExtendedLet` imply :extension:`RequiredTypeArguments` and enable
+The standalone `dependent-base <https://github.com/TharkunAB/dependent-base>`_
+package provides the standard library for Dependent Haskell, modeled on
+``linear-base``. It reuses GHC ``base`` runtime datatypes directly without
+wrapper allocation or data copying and exports:
+
+- ``Prelude.Dependent`` and ``Data.Function.Dependent`` (including dependent
+  ``(.)`` and ``($)``),
+- ``Data.Nat.Dependent``, ``Data.Fin.Dependent``, ``Data.Vec.Dependent``,
+  ``Data.List.Dependent``, and ``Data.List.Dependent.All``,
+- ``Data.{Bool,Maybe,Either,Tuple,Sigma,Exists}.Dependent``,
+- ``Data.Type.Equality.Dependent`` (visible ``cong``, ``subst``, ``rewrite``,
+  ``Inspect``, and ASCII equational reasoning),
+- ``Data.Decision`` (``Dec``, ``DecEq``, and Boolean reflection), and
+- ``Data.{List,Nat,Vec}.Dependent.Properties``.
+
+Ordinary ``Haskell2010`` and ``GHC2024`` modules can import ``dependent-base``
+interfaces without enabling :extension:`DependentTypes`.
+
+Implied extensions and reserved keywords
+----------------------------------------
+
+:extension:`ExistentialTypes` and :extension:`ExtendedLet` imply
+:extension:`RequiredTypeArguments` and enable
 :ghc-flag:`-fwrite-source-equations` unless
 :ghc-flag:`-fno-write-source-equations` is given. :extension:`DependentTypes`
-implies :extension:`ExperimentalDependentTypes`, :extension:`ExistentialTypes`,
-:extension:`ExtendedLet`, :extension:`GADTs` (which implies
-:extension:`GADTSyntax` and :extension:`MonoLocalBinds`),
-:extension:`DataKinds`, :extension:`PolyKinds`, :extension:`TypeOperators`,
-:extension:`RankNTypes` (which implies :extension:`ExplicitForAll`),
-:extension:`ScopedTypeVariables`, :extension:`TypeApplications`,
-:extension:`TypeAbstractions`, :extension:`StandaloneKindSignatures` (which
-disables :extension:`CUSKs`), :extension:`EmptyCase`, :extension:`Modifiers`,
+implies :extension:`ExistentialTypes`, :extension:`ExtendedLet`,
+:extension:`GADTs` (which implies :extension:`GADTSyntax` and
+:extension:`MonoLocalBinds`), :extension:`DataKinds`, :extension:`PolyKinds`,
+:extension:`TypeOperators`, :extension:`RankNTypes` (which implies
+:extension:`ExplicitForAll`), :extension:`ScopedTypeVariables`,
+:extension:`TypeApplications`, :extension:`TypeAbstractions`,
+:extension:`StandaloneKindSignatures` (which disables :extension:`CUSKs`),
+:extension:`EmptyCase`, :extension:`Modifiers`,
 :extension:`RequiredTypeArguments`, :extension:`ExplicitNamespaces`, and
 :extension:`NoListTuplePuns`. A later ``No...`` or :extension:`ListTuplePuns`
 flag or pragma overrides any implied extension.
@@ -963,8 +1054,8 @@ remain ordinary identifiers::
     foreach :: a -> a
     foreach x = x
 
-When :extension:`DependentTypes`, :extension:`ExperimentalDependentTypes`,
-:extension:`ExistentialTypes`, or :extension:`ExtendedLet` is enabled, GHC
-reserves ``foreach``, ``exists``, and ``some`` as keywords (and reserves ``∏``
-when :extension:`UnicodeSyntax` is also enabled). Programs that use these names
-as identifiers must leave the dependent extensions disabled.
+When :extension:`DependentTypes`, :extension:`ExistentialTypes`, or
+:extension:`ExtendedLet` is enabled, GHC reserves ``foreach``, ``exists``, and
+``some`` as keywords (and reserves ``∏`` when :extension:`UnicodeSyntax` is
+also enabled). Programs that use these names as identifiers must leave the
+dependent extensions disabled.

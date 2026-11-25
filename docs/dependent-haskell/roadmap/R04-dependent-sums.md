@@ -9,7 +9,7 @@ An erased existential can hide an index without providing its value.
 
 ## Functions stored with their inverse laws
 
-The [published isomorphism example](https://github.com/Tritlo/ghc/commit/34582bce5489634e15d9fc16a53d37b19dcc58e5)
+The [published isomorphism example](https://github.com/TharkunAB/ghc/commit/34582bce5489634e15d9fc16a53d37b19dcc58e5)
 stores a function in each direction and a proof of each round trip over
 arbitrary lifted types. A separately compiled reader exchanges all four
 fields to construct the reverse isomorphism. Swapping only the functions

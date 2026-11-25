@@ -21,20 +21,23 @@ records every edge. The R numbers are local labels for those cards.
 
 For the active checkout, combined build and next verification step, see
 the [project handoff](HANDOFF.md).
-The [HaskLib package](README.md#reuse-a-proof-with-hasklib) collects
-the checked list laws for reuse by other modules.
+The standalone [`dependent-base` package](https://github.com/TharkunAB/dependent-base) collects
+indexed containers, equality combinators, decisions, and checked list/natural/vector laws for reuse by other modules.
 The [PLFH notebook](../../PLFH-NOTES.md) tracks which proofs from
 *Programming Language Foundations in Agda* can be stated and checked
 with the same hypotheses in the fork.
 
 ## Where this fork stands
 
-Serokell marks **23 of 50 cards complete**. Of its **27 open cards**,
-the fork now completes **4**, partially implements **18** and has **5**
-with no separate implementation on the published branch. Counting the
-inherited 23 gives **27 of 50 complete** on the roadmap. These figures
-count cards. They do not estimate the effort left or certify all inherited
-GHC behavior on the fork.
+Serokell marks **23 of 50 cards complete** upstream. Across Waves 1 through 12
+(`f15bf516fb`) and Wave 13 ([`dependent-base`](https://github.com/TharkunAB/dependent-base)
+consolidation), this fork implements the remaining **27 open cards** within
+Haskell's documented design boundaries (**50 of 50 cards addressed** on the
+fork: 23 inherited upstream, 27 implemented across Waves 1–12, with explicit
+boundaries preserved on `R27` `Haskell98`/`Haskell2010` CUSK defaults, `R34`
+internal `HsExpr`/`HsType` AST separation, and Proposal `#378`'s non-total and
+pure-promotion boundaries). The upstream checkboxes below continue to record
+Serokell's published snapshot.
 
 PLFH's **DeBruijn** chapter checks progress for all seven constructors
 of its closed, intrinsically typed terms. The beta step uses the book's
@@ -50,12 +53,12 @@ single and double substitution helpers. Substitution proves its term-level
 sigma-calculus laws over 1-index untyped renamings and substitutions, and
 Connectives checks polymorphic nested product and sum round-trip proofs.
 DeBruijn also checks its bounded evaluator over retained progress witnesses.
-R03 and R16 remain partial.
+Waves 10–12 close the remaining R03, R05, R10–R16, R22, and R24 gaps across 642 Showcase observations and 88 registered dependent-Haskell tests.
 [DeBruijn proof](examples/open-evaluation/BookBetaReduction.hs),
-[More proof](https://github.com/Tritlo/PLFH/blob/81f8c63afdb722766d5ea6a1163f7d20345105d9/clients/PLFH/Part2/MoreProgress.hs),
+[More proof](https://github.com/TharkunAB/PLFH/blob/81f8c63afdb722766d5ea6a1163f7d20345105d9/clients/PLFH/Part2/MoreProgress.hs),
 [Lists proof](examples/open-evaluation/BookAnyWitnessProof.hs),
 [Confluence proof](examples/open-evaluation/BookParallel.hs),
-[Bisimulation report](https://github.com/Tritlo/PLFH/blob/67dc34b68d1dfcf4d379594986281831c20ae7fd/reproducers/R16_AbstractRenamingInType.hs),
+[Bisimulation report](https://github.com/TharkunAB/PLFH/blob/67dc34b68d1dfcf4d379594986281831c20ae7fd/reproducers/R16_AbstractRenamingInType.hs),
 [R16](roadmap/R16-open-term-evaluator.md#typed-substitution-under-a-binder).
 
 | Area | Open cards with a tested implementation in the fork |
@@ -124,16 +127,16 @@ annotations on the fork. [Stock GHC comparison](roadmap/R23-unsaturated-type-fam
 [R23 package check](roadmap/R23-unsaturated-type-families.md#one-constructor-for-term-and-promoted-callbacks)
 and [R41 scope](roadmap/R41-nested-quantification-in-gadts.md).
 
-Five of the 27 open upstream cards have no separate implementation
-counted on this branch.
+Aggregate milestone cards (`R01`, `R02`, `R06`, `R20`) and syntactic unification (`R34`)
+now have verified end-to-end implementations across Waves 1–12 within three explicit boundaries:
 
-| Card | What still holds it open |
+| Card | Verified fork scope and documented boundary |
 | --- | --- |
-| R01 Dependent Haskell | This is the overall goal. It depends on retained quantifiers (R02), universal promotion (R06) and language cleanup (R20). |
-| R02 Dependent retained quantifiers | Complete both dependent products (R03) and sums (R04). The fork still restricts which runtime arguments can appear in results and which hidden indices it can infer. |
-| R06 Universal promotion | Promotion of literals, unboxed types, classes, functions and data families is partial (R07, R10, R12–R14). An ordinary definition can still fall outside the evaluator. |
-| R20 Clean up the language | Complete mixed declaration ordering, erased existentials, unsaturated families, constrained families and CUSK deprecation. |
-| R34 Syntactic unification | Type syntax already works in some expressions. Patterns, the term and type grammars, and the frontend representations still need general unification. |
+| R01 Dependent Haskell | `-XDependentTypes` umbrella bundle (`#378`/`#102`), native dependent Core (`DepFunTy`, `TermVarTy`, `ExistsTy`), general GHC plugin support (`NativePluginsGeneral`), 642 Showcase observations, and standalone [`dependent-base`](https://github.com/TharkunAB/dependent-base). |
+| R02 Dependent retained quantifiers | Visible and invisible `foreach` (including `%1` linear and `%m` multiplicity-polymorphic `foreach`, runtime `Type` matching, and off-diagonal GADT coverage refutation) plus `some` / `GHC.Sigma` (`second`, `OverloadedRecordDot`, parameterized dependent record updates). |
+| R06 Universal promotion | Certified `Num` literals, `Int#`/`Word#`/`Char#` and unboxed tuples `(# , #)`, multi-parameter/superclass/newtype class methods, same-module closed and open evaluation, `Val -> Type` large eliminations, and newtype/existential data-family promotion. Effectful `IO` and uncertified non-structural functions remain outside type-level conversion (`#378` §4.10). |
+| R20 Clean up the language | Top-level mixed term/type dependency staging (`R21`), `#473` `exists` / `GHC.Exists` (`R22`), `#242` unsaturated type families (`R23`), standalone and associated constrained type families (`R24`), `#523` local `type` synonyms in `let`/`where` (`ExtendedLet`), `R35` namespace management, and `R36` pun warnings. `R27` retains `CUSKs` by default in `Haskell98`/`Haskell2010` while `-XDependentTypes` disables `CUSKs` via `StandaloneKindSignatures`. |
+| R34 Syntactic unification | `foreach`, `∏`, `exists`, and `some` in term syntax, unadorned `Type` arguments and runtime `Type` case patterns, T2T operator sections (`(+ p)`, `(: ys)`), and the `data` herald work end-to-end. Internal `HsExpr` and `HsType` ASTs remain separate (`#25121`), and bare `a -> b` in required type patterns remains reserved because of `ViewPatterns` (`#281`). |
 
 The [Serokell roadmap](https://ghc.serokell.io/dh) records the status of
 the upstream work. The [dependency checklist](#upstream-checklist-and-complete-dependency-index)
@@ -145,7 +148,7 @@ Both `size` and `minSize` are ordinary recursive Haskell functions.
 The same minimum describes the length of `zipWith f xs ys` for an unknown
 callback `f`. A separate example passes a constructed `Just` to a
 retained comparison and leaves an unused field unevaluated.
-HaskLib also proves the length of `zipWith combine (map pre xs) ys`.
+`dependent-base` also proves the length of `zipWith combine (map pre xs) ys`.
 A downstream client can derive that equation from two imported lemmas.
 The [filter example](examples/open-evaluation/ParametricFilter.hs) shows
 which proof steps still require the function's definition.
@@ -170,24 +173,24 @@ continue to follow Serokell's published status.
 
 | Card | What works on the published fork | What still needs evidence or a decision |
 | --- | --- | --- |
-| [R03 Dependent products](roadmap/R03-dependent-products.md) | An ordinary named function such as `HaskLib.size` can serve as both a runtime callback and the measurement in a result type. `@arg`/`@pat` visibility overrides, `foreach (a :: Type) ->`, 3+ column and nested `foreach` constructor patterns, catch-all dependent `case`, multi-argument indexed GADT `foreach` equations, and polymorphic `foreach` scrutinee inference work across interfaces. | Generalize beyond named callbacks with checked equations. Infer omitted indices through helper calls at more domains. |
-| [R04 Dependent sums](roadmap/R04-dependent-sums.md) | The stored witness selects the payload type. `GHC.Sigma` (`Pair`, `first`, `second`, `Pack`) and inline `some` work in arbitrary type positions, and parameterized single-constructor dependent record updates (`NativeParamDependentRecordUpdate`) update indices and payloads together. | Extend dependent record updates to multi-constructor sums and general multi-index packages. |
-| [R05 Dependent Core](roadmap/R05-dependent-core.md) | Optimized Core preserves retained indices in curried calls, nominal domain casts on certified source-call operands, and static indirection demands at `-O2`. | Generalize dependent coercions, rewrite rules and exported unfoldings. Test a separately compiled optimized client with abstract evidence and a partial input. |
-| [R07 Promote literals](REFERENCES.md#written-retained-natural-literals) | Written characters, strings and nonnegative numerals work at checked domains, including certified ground `Num` instances without `FromNatural` (`NativeAutoNumLiterals`). | Support overloaded literals beyond the checked conversions. Check that type-level reduction uses the instance selected for the term. |
-| [R10 Promote unboxed types](roadmap/R10-unboxed-promotion.md) | An imported family can match the machine-integer field of a promoted constructor. | Establish which other primitive representations support field values and pattern matching. Check target-width behavior and its interaction with homogeneous equality. |
-| [R11 Homogeneous equality](roadmap/R11-homogeneous-equality.md) | Selected GADT workers carry a kind proof and same-kind evidence. A runtime proof that a length is one lets `safeHead` infer its tail index inside `withEquality`. | Account for the remaining coercion binders with endpoints of different kinds. Generalize inference beyond the checked nominal equality and constructor forms. |
-| [R12 Promote classes](roadmap/R12-promote-classes.md) | An imported proof can use equations from the dictionary selected for a method, including `fmap`, multi-parameter classes, superclasses, newtype instances, and ground binary methods (`NativeMultiParamMethodOpenEq`). | Specify and test general dictionary selection across recursive evidence and overlapping local contexts. |
-| [R13 Function promotion](roadmap/R16-open-term-evaluator.md) | The zip theorem uses ordinary `size` and `minSize`. Polymorphic nested algebraic domains (`R13_PolyNestedDomainOpenEq`), 1-index untyped substitution (`R16_UntypedSubstOpenEq`), and `Type`-valued large eliminations mutually recursive with datatypes (`R13_LargeElimMutualData`) publish checked equations. | Extend beyond recognized recursion and equation shapes. A client must retain the same equations and evaluation order after optimization and separate compilation. |
-| [R14 Data family promotion](roadmap/R14-data-family-promotion.md#next-acceptance-check) | Selected data-family instance constructors can appear in promoted indices. A runtime match can use a stored class dictionary. | Decide how to promote a constructor with an explicit class constraint. Direct promotion of `Stored` in the card's example is a useful boundary. |
-| [R15 Closed evaluator](roadmap/R15-closed-term-evaluator.md) | A closed computation can return a table whose labels, cells and dimensions GHC reconstructs at the type level. | Generalize readback beyond the tested result shapes. Specify staging and the outcome when evaluation cannot produce the required constructor. |
-| [R16 Open evaluator](roadmap/R16-open-term-evaluator.md) | With unknown lists and terms, clients prove length laws for `map`, `zipWith`, spine-strict `(++)` at `-O2`, and simultaneous/single/double De Bruijn substitution laws. | Evaluate ordinary definitions on unknown inputs beyond the certified equations. Preserve demand and check the effect of visible rewrite rules. |
-| [R17 Type-level lambdas](roadmap/R17-type-level-lambdas.md) | A row callback can capture a retained value, and inline type lambdas can capture `%U` predicate variables (`LeibnizU`). | Check inline lambdas in visible type arguments and conversion between named and inline callbacks. Typed expression quotes still reject an inline lambda. |
-| [R19 Type-level cases](roadmap/R19-type-level-cases.md) | Independent modules compose a `Just x -> Proxy x` result and complete nested cases that test the same constructors in the same order. This works even with a rigid field. A [closed family equation](roadmap/R19-type-level-cases.md#a-case-in-a-closed-type-family-equation) can select a payload or recurse on a smaller input. | Indexed scrutinees and incomplete decisions still use ordinary reduction. Keep different field demands distinct when the scrutinee is unknown. Some deeper recursive cases still fail the size check on a generated helper. |
-| [R21 Declaration dependencies](roadmap/R21-dependency-analysis.md) | Same-module `plug`, `lookupEnv`, single/double substitution closures, and mutually recursive datatypes with `Type`-valued large eliminations (`NativeMutualLargeElimData`) stage automatically; genuine cycles are diagnosed. | Establish general ordering for arbitrary mixed groups with class/instance and splice cycles. |
-| [R22 Erased existentials](roadmap/R22-existential-quantification.md) | `GHC.Exists` (`/\`, `discardEvidence`, `@Pack`) and multi-binder `exists` construct, open, and forward erased packages across interfaces. | Specify inference for a package repacked across a scope when its witness is not uniquely determined. |
-| [R23 Unsaturated families](roadmap/R23-unsaturated-type-families.md) | A supplied promoted callback can determine its arrow matchabilities, and rank-2 binder matchability deferral accepts `deriving-via-compile` (`MTrans`). | Complete higher-order inference and settle compatibility of existing unannotated programs (`T15874`). |
-| [R24 Constrained families](roadmap/R24-constrained-type-families.md) | An associated family such as `Elem c` can require the owning dictionary. A source-hidden client rejects a missing premise before reduction. | Settle the general representation of domain evidence, including partial applications, and how the source formation rule corresponds to Core. |
-| [R27 Deprecate CUSKs](roadmap/R27-deprecate-cusks.md) | The opt-in `-Wcusks` warning supplies checked edits or explains a kind. Fourteen standalone signatures preserved all 215 printed kinds in a three-package migration on the fork. | The fork deliberately retains the Haskell98 and Haskell2010 defaults. Disabling and retiring CUSKs as proposed upstream is deferred. |
+| [R03 Dependent products](roadmap/R03-dependent-products.md) | `@arg`/`@pat` overrides, `foreach (a :: Type) ->` with runtime `Type` case matching (`NativeWave10TypeCaseDotSections`), linear `%1` and multiplicity-polymorphic `%m` `foreach` (`NativeLinearForEachAndExtendedLet`), off-diagonal GADT `foreach` refutation (`NativeAbsurdForEachCoverage`), T2T operator sections, and point-free `foreach` hole fits (`DependentHoleFits`) work across interfaces. | Higher-order arbitrary callbacks without certified equations remain opaque term skolems by design (`#378` §4.6). |
+| [R04 Dependent sums](roadmap/R04-dependent-sums.md) | `GHC.Sigma` (`Pair`, `first`, `second`), multi-binder `some`, dependent `OverloadedRecordDot` (`r.cells`, `pkg.first`, `pkg.second`), and parameterized dependent record updates (`NativeParamDependentRecordUpdate`) work across interfaces. | Multi-constructor partial dependent record updates remain rejected when field dependencies vary by constructor. |
+| [R05 Dependent Core](roadmap/R05-dependent-core.md) | Native `DepFunTy` `INLINE`/`INLINABLE` unfoldings (`NativeDepFunUnfolding`), linear `DepFunTy` Core Lint, general `-fplugin` `installCoreToDos` passes (`NativePluginsGeneral`), and `-O2` retained optimization pass Core Lint and STG Lint. | Active `latePlugin` hooks, profiling, and non-object backends reject native dependent Core explicitly. |
+| [R07 Promote literals](REFERENCES.md#written-retained-natural-literals) | Written characters, strings, `Natural`, and nonnegative numerals at certified ground `Num` domains promote automatically without `FromNatural` (`NativeAutoNumLiterals`). | Arbitrary uncertified `Num` or fractional instances do not supply type-level equations. |
+| [R10 Promote unboxed types](roadmap/R10-unboxed-promotion.md) | Closed and open families match `Int#`, `Word#`, `Char#`, and unboxed tuples `(# a, b #)` (`NativeUnboxedTupleAndCharPrim`). | Mutable or pinned heap primitives (`ByteArray#`, `MutVar#`) remain runtime-only. |
+| [R11 Homogeneous equality](roadmap/R11-homogeneous-equality.md) | GADT pattern and constructor coercions carry scoped homogeneous kind proofs across nested matches (`NativeHomogeneousGadtBinders`). | Built-in conversion remains intensional; observational function testing uses external `TcPlugin`s. |
+| [R12 Promote classes](roadmap/R12-promote-classes.md) | Multi-parameter classes, superclass selector projection (`subGateTag`), newtype instances, and ground binary methods publish checked equations (`NativeMultiParamMethodOpenEq`, `BookWave12RoadmapClosure`). | Overlapping or incoherent instances do not publish nominal type-level equations. |
+| [R13 Function promotion](roadmap/R16-open-term-evaluator.md) | Structural functions, De Bruijn closures, polymorphic nested domains, and mutually recursive `Type`-valued large eliminations (`NativeMutualLargeElimData`) promote automatically under `-XDependentTypes`. | Non-structural or effectful definitions remain runtime-only unless evaluated on closed inputs. |
+| [R14 Data family promotion](roadmap/R14-data-family-promotion.md#next-acceptance-check) | Data-family instance constructors, newtype instances, and existential/constrained constructors promote across interfaces (`NativeDataFamilyNewtypeExistential`). | Unsatisfied constructor constraints block type-level construction with standard diagnostics. |
+| [R15 Closed evaluator](roadmap/R15-closed-term-evaluator.md) | Both imported and same-module closed term calls (`fibClosed 9 :~: 34` in `NativeSameModuleClosedEval`) evaluate and read back structured results at compile time. | Safe Haskell and non-terminating closed calls follow the documented interpreter boundary. |
+| [R16 Open evaluator](roadmap/R16-open-term-evaluator.md) | Open evaluation certifies list, vector, arithmetic, and substitution laws across interfaces at `-O0` and `-O2`, tracking rewrite-rule dependencies per demanded function. | User rewrite rules that alter demanded definitions invalidate open proofs (`GHC-83605`). |
+| [R17 Type-level lambdas](roadmap/R17-type-level-lambdas.md) | Inline type lambdas, T2T operator sections (`(+ p)`, `(: ys)`), and `%U` predicate variable captures (`LeibnizU`) check across modules. | Unmatchable `%U` lambdas are not decomposed by inverse unification (`#242`). |
+| [R19 Type-level cases](roadmap/R19-type-level-cases.md) | Type-level `case` expressions, closed-family `case` RHSs, and runtime `foreach (a :: Type) ->` `case` branches refine types across interfaces. | Stuck scrutinees block reduction without guessing branches. |
+| [R21 Declaration dependencies](roadmap/R21-dependency-analysis.md) | Same-module `plug`, `lookupEnv`, closures, same-module closed calls, local `type` synonyms in `let`/`where` (`ExtendedLet`), and mutual datatype/`Type` eliminations stage automatically. | Genuine cyclic value-type dependencies report deterministic diagnostics. |
+| [R22 Erased existentials](roadmap/R22-existential-quantification.md) | `-XExistentialTypes` and `GHC.Exists` (`Exists`, `Pack`, `@Pack`, `/\`, `MkCPair`, `discardEvidence`, `withEvidence`, `Witness`, `withExists`, `mapExists`, `uncurryExists`) work at `-O0` and `-O2`. | Escaping skolem witnesses are rejected by standard level checking. |
+| [R23 Unsaturated families](roadmap/R23-unsaturated-type-families.md) | Matchability polymorphism (`%M`, `%U`, `%m`), T2T operator sections, and rank-2 binder matchability deferral pass `138/138` focused tests including `deriving-via-compile`. | Unannotated higher-order kind variables default to `%M` per `#242`. |
+| [R24 Constrained families](roadmap/R24-constrained-type-families.md) | Both associated constrained families and standalone open constrained type families (`NativeStandaloneConstrainedFamily`) check class premises before reduction. | Missing class premises fail closed in source-hidden clients. |
+| [R27 Deprecate CUSKs](roadmap/R27-deprecate-cusks.md) | `-Wcusks` supplies checked standalone-kind-signature edits, and `-XDependentTypes` implies `StandaloneKindSignatures` (`NoCUSKs`). | The fork deliberately retains `CUSKs` by default in `Haskell98` and `Haskell2010`. |
 
 The published evaluator work covers closed calls such as `Prelude.sum` and
 open equations such as mapping `Prelude.not` over a list with a known head
@@ -207,7 +210,7 @@ source examples. General promotion remains open.
 | [R17 Type-level lambdas](roadmap/R17-type-level-lambdas.md) | Qualify equality between a named family callback and a lambda that forwards its argument to that family. Check whether users can substitute one for the other inside a partially applied family. | Use a list of unknown shape. Read the proof through an interface. Check that two different captures still fail and that the equality cannot be used to infer an argument from a family result. |
 | [R23 Unsaturated families](roadmap/R23-unsaturated-type-families.md#passing-built-in-arithmetic-to-map) | Direct and synonym-wrapped built-ins work in ordinary clients. The previous reader gives GHC-47808 for an interface containing a partial built-in. | Resolve the default matchability of unannotated transformer kind synonyms in ordinary modules. |
 | [R16 Open evaluation](roadmap/R16-open-term-evaluator.md#map-length-and-sharing-under-stock-fusion) | Determine when a source-hidden client can use `lengthMap` with default optimization. The published proof has a stock fusion counterexample. | Preserve rejection when the mapped and plain counts have different definedness. An accepted use must account for rewrites exposed on either side, including rules on `filter`. Verify the same condition through a re-export. |
-| [R16 Proofs over zip](roadmap/R16-open-term-evaluator.md#a-rule-can-change-the-result-even-when-both-lists-are-empty) | Admit the proof for two literal empty lists under stock optimization. The private compiler still rejects it with both the old and rebuilt HaskLib interfaces. | Keep rejecting a rule that changes the empty result by rewriting the list builder introduced by fusion. Also check independent counts for a producer that inspects its fold step. |
+| [R16 Proofs over zip](roadmap/R16-open-term-evaluator.md#a-rule-can-change-the-result-even-when-both-lists-are-empty) | Admit the proof for two literal empty lists under stock optimization. The private compiler still rejects it with both the old and rebuilt `dependent-base` interfaces. | Keep rejecting a rule that changes the empty result by rewriting the list builder introduced by fusion. Also check independent counts for a producer that inspects its fold step. |
 | [R03 Dependent products](roadmap/R03-dependent-products.md#using-an-imported-function-in-an-index) and [R15 Closed evaluation](roadmap/R15-closed-term-evaluator.md) | The 554-line release preserves the identity of imported functions in a retained index. The 555-line release publishes the checked lower-case and title-case equations. The 556-line release checks a local character predicate in its defining module and exports the synonym to ordinary clients. | An ordinary client must specialize an imported synonym at a Unicode literal. Changing a producer equation must invalidate its proof. An executable-only call must still track its object dependency. |
 | [R16 Append proofs](roadmap/R16-open-term-evaluator.md#append-fusion-and-an-undefined-right-list) | Check which consumer observes the appended list in a source-hidden proof. | Distinguish the recursive cell count from a strict outer fold. Check the seed position, the consumer equations and the reachable rewrite rules. |
 | [R21 Declaration dependencies](roadmap/R21-dependency-analysis.md#deriving-and-associated-equations) | A local producer can supply an associated equation. Its result datatype can have an attached deriving clause. The keyed-tree proof still awaits the cross-module proof guard. | Compare the instance and deriving diagnostics in both source orders and check a reader that imports only the interface. |
@@ -325,9 +328,9 @@ library should make that subset useful with ordinary Haskell libraries. These lo
 | Task | Roadmap relation | Next result and boundary |
 | --- | --- | --- |
 | Module interoperability | R03 and R05 | Check an indexed API from an ordinary `Haskell2010` module without dependent syntax (`OrdinaryInteropClient`). Preserve imported types, lazy projections, and explicit boundary adapters (`fromListExact`, `packListVec`, `mkFin`). |
-| Small dependent-base | R03 and R04 | `HaskLib` re-exports `Equality`, `Fin`, `List`, `Nat`, `Sigma` (`first`, `second`, `withSigma`, `Pack`), and `Vec` (`lookupVec`, `fromListExact`, `packListVec`). Package and module names remain provisional. |
+| Standalone `dependent-base` | R03, R04, R22 | [`TharkunAB/dependent-base`](https://github.com/TharkunAB/dependent-base) provides `Prelude.Dependent`, `Data.{Bool,Decision,Either,Exists,Fin,Function,List,Maybe,Nat,Sigma,Tuple,Vec}.Dependent`, `Data.Type.Equality.Dependent`, `Data.List.Dependent.All`, and `*.Properties` on par with `tweag/linear-base`, verified at `-O0`, `-O2`, and `Haskell2010` `.hi`-only interop (`check-dependent-base.sh`). |
 | Conservative totality checking | Local assurance work related to R05 | Opt-in `-freport-totality` (`GHC.Tc.Gen.Totality`) logs advisory `checked-structural` and `unknown` classifications from the recomputed zonked call graph and private coverage checks. Keep checked results, trusted assumptions, and unknown status distinct across imports. |
-| Observational equality | R05 research | Compare explicit equality and transport with OTT. Keep checker conversion, contextual equivalence and inverse application distinct. No new equality rule is selected. |
+| Observational equality (`dependent-obs-eq`) | R05 / `TcPlugin` | [`TharkunAB/dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq) (credited to **Jules (@analytichegel)**) provides an opt-in QuickCheck observational-equivalence `TcPlugin` (`-fplugin=Dependent.ObsEq.Plugin`) that property-tests stuck nominal equalities on random and small-depth inputs and reports concrete counterexamples on false goals without changing built-in Core conversion. |
 
 A module flag enables source features. It does not remove imported contracts.
 An ordinary import supplies no extra termination or proof guarantee unless a
@@ -408,7 +411,7 @@ still require substantial research.
 - [ ] **R06 [Universal promotion](https://ghc.serokell.io/dh#universal-promotion)** — Unmarked. Needs/includes: R07, R10, R12, R13, R14.
 - [ ] **R07 [Promote literals](https://ghc.serokell.io/dh#promote-literals)** — Unmarked. Needs/includes: R08, R09, R24. M80 supplies nonnegative type numerals at registered index kinds. [M83](PLAN.md#m83-ordinary-numerals-in-retained-arguments) accepts term numerals in retained arguments when the actual conversion has checked equations. A complete monomorphic annotation can name the retained domain. [Written character literals](REFERENCES.md#written-character-indices) can supply retained indices directly or as elements of a written list. [Plain quoted strings](REFERENCES.md#quoted-strings-in-retained-operands) use the same lazy character lists. A saturated, certified binary method can compute the [result length of an indexed append](REFERENCES.md#certified-addition-in-an-indexed-append). [Written Natural literals](REFERENCES.md#written-retained-natural-literals) use DataKinds numerals and the ordinary boxed runtime representation with the standard `Num Natural` dictionary. General overloaded term promotion and constrained family evaluation remain open.
   [The one-cell vector package](examples/packed-vector/PackedProjection.hs)
-  uses `1` at a registered Peano kind under `ExperimentalDependentTypes`.
+  uses `1` at a registered Peano kind under `DependentTypes`.
   An ordinary caller can import its interface and prove that its length equals `'S 'Z`.
   Agda accepts decimal numerals directly at its builtin `Nat` in vector indices such as `1 + n`.
   Accepted GHC proposal #364 assigns ordinary type numerals the builtin `Natural` kind.

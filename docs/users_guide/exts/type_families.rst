@@ -126,10 +126,10 @@ its second argument, so GHC can reduce the addition::
     addOne :: Map ((+) 1) '[2, 3, 4] :~: '[3, 4, 5]
     addOne = Refl
 
-:extension:`ExperimentalDependentTypes` also permits partial applications
-through its existing checks. It has independent implications. In
-particular, ``NoUnsaturatedTypeFamilies`` disables the standalone flag
-while the umbrella continues to permit these applications.
+:extension:`DependentTypes` implies :extension:`UnsaturatedTypeFamilies`
+and permits partial applications through the same matchability checks.
+In particular, ``NoUnsaturatedTypeFamilies`` disables partial type-family
+applications selectively even when :extension:`DependentTypes` is enabled.
 
 .. _data-families:
 

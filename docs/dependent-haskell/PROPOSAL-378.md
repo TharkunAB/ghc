@@ -1,7 +1,8 @@
-# GHC Proposal #378 Deep Audit & Wave 4+ Implementation Plan
+# GHC Proposal #378 Deep Audit & Wave 4–13 Closure Record
 
-**Target branch:** `dependent-haskell` (`/home/tritlo/Code/ghc`)  
-**Audited baseline:** Normal compiler `844f309834` + Wave 1 (`69a36b132f`) + Wave 2 Lane 1 (`03b7bb9a00`) · PLFH Batch 37 (`8756aed`, 21/25 chapters `Checked`, 38/38 fixed regressions, 14 open reproducers)  
+**Target branch:** `dependent-haskell` (`https://github.com/TharkunAB/ghc`)  
+**Current status (Wave 13):** All Priority 1 (`P1.1`–`P1.13`), Priority 2 (`R01`–`R50` within Haskell's non-strict design boundaries), and Priority 3 (`P3.1`–`P3.8`) deliverables audited below are **implemented and verified** through Wave 12 (`f15bf516fb`, 642 Showcase observations, 88 registered dependent-Haskell tests, `234/234` compatibility, `138/138` focused, `100/100` PLFH) and Wave 13 (standalone [`dependent-base`](https://github.com/TharkunAB/dependent-base) migration and PiTA `#9` point-free `foreach` typed-hole fits). Three explicit boundaries remain documented by design: `R27` retains `CUSKs` by default in `Haskell98`/`Haskell2010` while `-XDependentTypes` implies `StandaloneKindSignatures` (`NoCUSKs`); `R34` implements surface types-in-terms, T2T operator sections, and the `data` herald while keeping `HsExpr` and `HsType` separate internal AST types (`#25121`); and type-level promotion certifies structural/pure definitions without assuming totality or promoting arbitrary `IO`/effectful code (`#378` §4.10, §4.13).  
+**Original audited baseline:** Normal compiler `844f309834` + Wave 1 (`69a36b132f`) + Wave 2 Lane 1 (`03b7bb9a00`) · PLFH Batch 37 (`8756aed`, 21/25 chapters `Checked`, 38/38 fixed regressions, 14 open reproducers)  
 **Primary specification:** [GHC Proposal #378 — *Design for Dependent Types*](https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0378-dependent-type-design.rst) (accepted 2021-05-26, master revision, all 1,376 lines audited)  
 **Cross-checked specifications:** GHC Proposals `#81`, `#99`, `#102`, `#106`, `#126`/`#291`, `#155`, `#242`, `#270`, `#274`, `#281` (amended by `#626`), `#282`/`#583`, `#287`, `#364`, `#370`, `#387`, `#402`, `#425`, `#448`, `#473`, `#475`, `#509`, `#523`, `#547`, `#581`, `#765`; [Serokell Dependent Haskell Roadmap](https://ghc.serokell.io/dh) (`R01`–`R50`); Agda 2.8.0 & PLFA `dev`.
 

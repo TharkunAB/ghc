@@ -467,7 +467,7 @@ per result argument and keeps full ordinary subsumption. The algorithms differ.
 
 ## Ordinary callers of retained APIs
 
-Explicit dependent source syntax requires ExperimentalDependentTypes. An
+Explicit dependent source syntax requires `DependentTypes`. An
 imported native type retains its contract in a module without that extension.
 M68 selects the existing application helpers from the source flag or an
 available native type. Inspect the zonked head and expected types. Reuse the
@@ -1271,7 +1271,7 @@ source subset. Unsupported source constructs must produce located errors before
 other internal guards. Keep binder-domain, unsupported-index, coverage,
 and branch-result errors at their respective source locations.
 
-With `ExperimentalDependentTypes`, a checked source `case n of ...` can reuse
+With `DependentTypes`, a checked source `case n of ...` can reuse
 this rule. Abstract the expected result over a fresh index. Generalize each
 referenced local whose type depends on `n` as a later argument. For example,
 `xs :: Vec a n` becomes an argument of type `Vec a j` under the fresh index `j`.
@@ -3044,3 +3044,46 @@ For an evaluated local function, an ordinary ground type such as
 `Maybe Bool` can be a symbolic operand of kind `Type`. Readback can
 return its original type. A strict case cannot ask for a runtime
 inhabitant of that type. [Local family equations](roadmap/R21-dependency-analysis.md#m152-independent-local-producers-for-type-instances).
+
+## Waves 10–12 Core and pipeline extensions
+
+Waves 10 through 12 complete the native dependent Core pipeline across six
+areas while keeping Dependent Core Lint and STG Lint active on every pass:
+
+1. **Serialized `DepFunTy` `INLINE` and `INLINABLE` unfoldings (`R05`, Wave 10).**
+   `supportsNativeDepFunUnfolding` in `GHC.Core.Dependent` validates native
+   `DepFunTy` unfolding templates before interface serialization and inlining.
+   Exported `INLINE` and `INLINABLE` retained functions round-trip across `.hi`
+   files and specialize cleanly at call sites (`NativeDepFunUnfolding`).
+2. **Homogeneous GADT coercion binders (`R11`, Wave 10).**
+   GADT pattern matching and constructor wrapper elaboration bind homogeneous
+   coercion variables whose kind coercions stay in scope across nested matches
+   (`NativeHomogeneousGadtBinders`).
+3. **Promoted `Char#`, unboxed tuples, superclass `ClassAppTy`, and standalone constrained families (`R10`, `R12`, `R14`, `R24`, Wave 10).**
+   Closed and open type families match promoted primitive `Char#` literals and
+   unboxed tuple constructors `(# a, b #)` (`NativeUnboxedTupleAndCharPrim`),
+   project superclass dictionaries in `ClassAppTy` indices, promote newtype and
+   existential data-family instances (`NativeDataFamilyNewtypeExistential`),
+   and check standalone open type families with class constraints
+   (`NativeStandaloneConstrainedFamily`).
+4. **Runtime `Type` case matching (`R03`, Wave 10).**
+   Pattern matching on a `foreach (a :: Type) ->` binder lowers unadorned type
+   patterns (`Int -> ...`, `[Char] -> ...`, `_ -> ...`) against the runtime
+   `TypeRep` witness and introduces nominal type refinement in each branch
+   (`NativeWave10TypeCaseDotSections`).
+5. **General GHC plugin pipeline compatibility (Wave 11A).**
+   `GHC.Driver.Plugins` distinguishes default `NOINLINE` plugin hooks from
+   active overrides (`hasActiveCorePlugins`, `hasActiveLatePlugins`,
+   `isHoleFitOnlyPlugin`). Source, renamer, splice, typechecker (`tcPlugin`),
+   defaulting, interface, and hole-fit plugins run normally alongside
+   source-equation publication and native dependent Core. `installCoreToDos`
+   passes run inside `core2coreRetained` under Dependent Core Lint before
+   post-optimization source-equation validators check `cg_binds`; only active
+   `latePlugin` hooks withhold unchecked source equations and reject native
+   dependent Core (`NativePluginsGeneral`).
+6. **Linear and multiplicity-polymorphic `DepFunTy` binders (`R03`/`R05`, Wave 12).**
+   `DepFunTy` binders preserve explicit multiplicity annotations (`%1` and
+   `%m`) through typechecking, Core Lint linearity checking, and erasure:
+   type-level index occurrences of a retained binder consume zero runtime
+   multiplicity while term-level occurrences obey linear usage checking
+   (`NativeLinearForEachAndExtendedLet`).

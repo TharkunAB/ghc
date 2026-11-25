@@ -2,11 +2,11 @@
 
 Build *Programming Language Foundations in Haskell* (PLFH) as a yardstick for this fork’s Dependent Haskell implementation. Follow *Programming Language Foundations in Agda*, edition 19.08. For each theorem, ask whether a Haskell programmer can state it and prove it with the same hypotheses. A small example that the fork cannot express is a valuable result.
 
-Gemini 4 Neon owns the book and its proofs. Work in `/home/tritlo/Code/PLFH`. Edit chapters under `content/` and keep the theorem ledger in `content/Status.md`. The compiler team owns GHC and HaskLib in `/home/tritlo/Code/ghc` on `dependent-haskell`. The book's extraction script copies the Haskell modules and reproducing examples into that checkout. [Book repository](https://github.com/Tritlo/PLFH) · [Extraction and replay instructions](https://github.com/Tritlo/PLFH#quick-start)
+Gemini 4 Neon owns the book and its proofs. Work in `/home/tritlo/Code/PLFH`. Edit chapters under `content/` and keep the theorem ledger in `content/Status.md`. The compiler team owns GHC and HaskLib in `/home/tritlo/Code/ghc` on `dependent-haskell`. The book's extraction script copies the Haskell modules and reproducing examples into that checkout. [Book repository](https://github.com/TharkunAB/PLFH) · [Extraction and replay instructions](https://github.com/TharkunAB/PLFH#quick-start)
 
 Read `/home/tritlo/Code/ghc/PLFH-NOTES.md` before starting and after each verified batch. Write to that same file from either checkout. Give the theorem, a minimal example, the compiler revision, the replay command and the diagnostic. The compiler team replies under the entry. Rerun the original example when a fix is available. [Shared notebook](../../../PLFH-NOTES.md)
 
-In batch 24, **Properties** checks substitution typing and preservation. **DeBruijn** checks progress for all seven constructors of a closed intrinsically typed term. **More** extends the language with products, sums and lists. Its list case substitutes two values. Check the book's ledger and the latest compiler reply before choosing another theorem. [Batch 24 ledger](https://github.com/Tritlo/PLFH/blob/2fd9b9a5a832bcb4ef91f2c6bd69e703bb084c7f/content/Status.md)
+In batch 24, **Properties** checks substitution typing and preservation. **DeBruijn** checks progress for all seven constructors of a closed intrinsically typed term. **More** extends the language with products, sums and lists. Its list case substitutes two values. Check the book's ledger and the latest compiler reply before choosing another theorem. [Batch 24 ledger](https://github.com/TharkunAB/PLFH/blob/2fd9b9a5a832bcb4ef91f2c6bd69e703bb084c7f/content/Status.md)
 
 ## Original acceptance example
 

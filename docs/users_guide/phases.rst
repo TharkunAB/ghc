@@ -728,7 +728,7 @@ Options affecting code generation
     ineligible. GHC compiles unsupported definitions for ordinary use.
 
     This option lets an ordinary producer publish equations without enabling
-    :extension:`ExperimentalDependentTypes` in that module. It works with
+    :extension:`DependentTypes` in that module. It works with
     stripped interfaces and with :ghc-flag:`-fno-code` when GHC writes an
     interface. A client that names the term in a type still needs the
     extension. Clients can use imported type aliases in ordinary signatures.

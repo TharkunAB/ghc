@@ -11,7 +11,7 @@ subtraction and its laws. The Properties chapter supplies preservation.
 [PLFH starting prompt](plfh/PROMPT.md),
 [edition 22.08 sources](https://github.com/plfa/plfa.github.io/tree/e2d545f3df0db4d4206c5448735665abde02d81f)
 and [Properties](https://plfa.github.io/22.08/Properties/).
-[PLFH edition change](https://github.com/Tritlo/PLFH/commit/85f90be),
+[PLFH edition change](https://github.com/TharkunAB/PLFH/commit/85f90be),
 [Naturals](https://plfa.github.io/Naturals/) and [Induction](https://plfa.github.io/Induction/).
 
 In the Agda proof, each beta rule uses the substitution operation
@@ -55,14 +55,14 @@ a comparison implementation. External solvers remain later work.
   equations for `times` and `pow`.
   [Haskell definitions and proofs](examples/open-evaluation/BookNaturals.hs).
   [Agda Naturals](https://plfa.github.io/Naturals/),
-  [PLFH Induction](https://github.com/Tritlo/PLFH/blob/49903d04bdde2b140a763c16cca23768a9f8dd08/content/part1/Induction.md).
+  [PLFH Induction](https://github.com/TharkunAB/PLFH/blob/49903d04bdde2b140a763c16cca23768a9f8dd08/content/part1/Induction.md).
 - **Dependent patterns.** PLFA DeBruijn defines progress by matching a
   closed, intrinsically typed term. The fork checks the value-classification
   part in a Haskell `case` and in function equations using the GADT constructor's
   equality evidence. A Haskell guard can fall through to the next equation.
   Inspecting a lambda leaves its body unevaluated.
   [Agda progress](https://plfa.github.io/DeBruijn/#progress),
-  [PLFH DeBruijn](https://github.com/Tritlo/PLFH/blob/49903d04bdde2b140a763c16cca23768a9f8dd08/content/part2/DeBruijn.md).
+  [PLFH DeBruijn](https://github.com/TharkunAB/PLFH/blob/49903d04bdde2b140a763c16cca23768a9f8dd08/content/part2/DeBruijn.md).
 - **Substitution under a binder.** PLFA extends the substitution when it
   enters a lambda. A free variable in the replacement must still refer to
   the outer context. The compiler regression checks the shift on PLFH's
@@ -75,7 +75,7 @@ a comparison implementation. External solvers remain later work.
   step names the ordinary Haskell `substSingle`. The provider is adapted
   from PLFH under CC BY 4.0, based on PLFA by Philip Wadler, Wen Kokke
   and Jeremy G. Siek.
-  [PLFH source](https://github.com/Tritlo/PLFH/blob/246574dca2182bff387a8e20e61273216849714b/content/part2/DeBruijn.md),
+  [PLFH source](https://github.com/TharkunAB/PLFH/blob/246574dca2182bff387a8e20e61273216849714b/content/part2/DeBruijn.md),
   [license](https://creativecommons.org/licenses/by/4.0/),
   [Agda DeBruijn](https://plfa.github.io/DeBruijn/),
   [Haskell proof](examples/open-evaluation/BookBetaReduction.hs).
@@ -104,7 +104,7 @@ a comparison implementation. External solvers remain later work.
   Exchanging them changes its equality even though the result still has
   the right type. [Haskell proof](examples/open-evaluation/BookBetaReduction.hs),
   [PLFA More, Single and double substitution](https://plfa.github.io/More/#single-and-double-substitution),
-  [PLFH batch 25 reproducer](https://github.com/Tritlo/PLFH/blob/69042437df9b44a099e44e1e53c981045cf0ee29/reproducers/ReproOpsDoubleSubst.hs).
+  [PLFH batch 25 reproducer](https://github.com/TharkunAB/PLFH/blob/69042437df9b44a099e44e1e53c981045cf0ee29/reproducers/ReproOpsDoubleSubst.hs).
 - **Representing a checked callback.** Danvy and Nielsen describe
   defunctionalization with constructors for captured values. The fork
   uses private constructors for replacement, shifting, and lifting a
@@ -119,7 +119,7 @@ a comparison implementation. External solvers remain later work.
   both functions and both proofs. Exchanging only the functions fails
   even when the endpoints have the same type.
   [Agda Isomorphism](https://plfa.github.io/Isomorphism/),
-  [PLFH reproducer](https://github.com/Tritlo/PLFH/blob/0fd43f5353c4c3ae7670bac668ff2abe8f3c67ea/reproducers/R04_PolyFunctionFieldInIso.hs).
+  [PLFH reproducer](https://github.com/TharkunAB/PLFH/blob/0fd43f5353c4c3ae7670bac668ff2abe8f3c67ea/reproducers/R04_PolyFunctionFieldInIso.hs).
 - **Reflexivity of isomorphism.** PLFA uses identity in both directions.
   Each round trip computes to its input. The Haskell chapter uses Prelude
   `id` and the same pointwise proof. It disables rewrite rules in the
@@ -183,7 +183,7 @@ a comparison implementation. External solvers remain later work.
   alias of a bottom-valued proof must still raise the original exception.
   [Agda implicit arguments](https://agda.readthedocs.io/en/latest/language/implicit-arguments.html),
   [GHC proposal 287](https://ghc-proposals.readthedocs.io/en/latest/proposals/0287-simplify-subsumption.html),
-  [PLFH alias](https://github.com/Tritlo/PLFH/blob/49903d04bdde2b140a763c16cca23768a9f8dd08/reproducers/R04_EtaAliasForEachFunctionBinder.hs).
+  [PLFH alias](https://github.com/TharkunAB/PLFH/blob/49903d04bdde2b140a763c16cca23768a9f8dd08/reproducers/R04_EtaAliasForEachFunctionBinder.hs).
 
 ## References by roadmap feature
 
@@ -6214,9 +6214,9 @@ An undefined bound is demanded even when the list is empty. The
 compiler checks that recursive calls use the original operands or
 their recursive fields, and that at least one operand decreases.
 [Agda standard library, Data.List.Properties](https://agda.github.io/agda-stdlib/v2.3/Data.List.Properties.html),
-[ordinary Haskell definition](hasklib/HaskLib/List/Prefix.hs),
-[HaskLib induction](hasklib/HaskLib/List.hs) and
-[demand tests](hasklib-test/Main.hs).
+[`Data.List.Dependent`](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent.hs),
+[`Data.List.Dependent.Properties`](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent/Properties.hs), and
+[`dependent-base` demand tests](https://github.com/TharkunAB/dependent-base/blob/main/test/Main.hs).
 
 ### Parametricity and the list length laws
 
@@ -6226,10 +6226,10 @@ function at related inputs. In a total parametric language, a function
 the function that always returns an empty list satisfy that law. The
 signature does not determine which list length `r` returns. Similarly,
 an implementation with the type of `zipWith` can always return `[]`.
-HaskLib proves the shorter-length law by induction on the actual
+`dependent-base` proves the shorter-length law by induction on the actual
 implementation's equations.
 [Wadler, *Theorems for free!*](https://doi.org/10.1145/99370.99404) and
-[HaskLib list laws](hasklib/HaskLib/List.hs).
+[`dependent-base` list laws](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent/Properties.hs).
 
 In lazy Haskell, `seq` can observe whether an argument is defined.
 For example, define `r [] = []` and `r (x:xs) = seq x (x:xs)`.
@@ -6238,33 +6238,33 @@ With `h = const True` and `xs = [undefined]`, evaluating
 Johann and Voigtländer give a relational interpretation for a calculus
 with recursion, algebraic types and `seq`. Each free theorem must
 carry the applicable conditions on its relations. The fork checks the
-provider's Core or typed clauses for the HaskLib list proofs.
+provider's Core or typed clauses for the `dependent-base` list proofs.
 [Johann and Voigtländer, *Free Theorems in the Presence of seq*](https://janis-voigtlaender.eu/JV04.html)
 and [paper notes](papers/README.md#free-theorems-and-seq-popl-2004).
 
-HaskLib groups public lemmas by subject. Agda's standard library puts
+`dependent-base` groups public lemmas by subject. Agda's standard library puts
 these list results in `Data.List.Properties`. Lean's mathlib collects
 reusable theorems in an importable library with subject modules.
 [Agda list properties](https://agda.github.io/agda-stdlib/v2.3/Data.List.Properties.html)
 and [Lean mathlib](https://github.com/leanprover-community/mathlib4).
 
 Agda's natural-number properties prove right identity for addition and
-the equation for a successor on the right. `HaskLib.Size` follows the
+the equation for a successor on the right. `Data.Nat.Dependent.Properties` follows the
 same induction on the left operand of its Peano addition. Its client
 uses both lemmas with the append-length theorem to count a list with
 one new element.
 [Agda natural-number properties](https://agda.github.io/agda-stdlib/v2.3/Data.Nat.Properties.html),
-[HaskLib.Size](hasklib/HaskLib/Size.hs) and [client](hasklib-test/Client.hs).
+[`Data.Nat.Dependent.Properties`](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/Nat/Dependent/Properties.hs), and [`dependent-base` client](https://github.com/TharkunAB/dependent-base/blob/main/test/DependentClient.hs).
 
-The HaskLib reverse proof follows Agda's accumulator-length invariant.
+The `dependent-base` reverse proof follows Agda's accumulator-length invariant.
 Moving one element to the accumulator uses right successor. Starting
 the worker with an empty accumulator then uses right identity.
-HaskLib composes these equalities with `Data.Type.Equality.trans`.
+`dependent-base` composes these equalities with `Data.Type.Equality.trans`.
 The public theorem mentions the ordinary `reverse` function. Only its
 implementation imports `GHC.Internal.List.reverseOnto`, the worker
 whose equations the fork has checked.
 [Agda list properties](https://agda.github.io/agda-stdlib/v2.4/Data.List.Properties.html#length-reverse)
-and [HaskLib implementation](hasklib/HaskLib/List.hs).
+and [`dependent-base` implementation](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent/Properties.hs).
 
 ### Filter naturality in the presence of seq
 
@@ -6311,7 +6311,7 @@ for the corresponding step under `Succ`.
 [Agda `cong` and `trans`](https://agda.github.io/agda-stdlib/v2.4/Relation.Binary.PropositionalEquality.Core.html),
 [Agda equality reasoning example](https://agda.github.io/agda-stdlib/v2.4/Relation.Binary.PropositionalEquality.html),
 [base equality operations](../../libraries/ghc-internal/src/GHC/Internal/Data/Type/Equality.hs),
-and [HaskLib client](hasklib-test/Client.hs).
+and [`dependent-base` client](https://github.com/TharkunAB/dependent-base/blob/main/test/DependentClient.hs).
 
 GHC's `QualifiedDo` can sequence equality witnesses through an ordinary
 qualified `(>>)` defined as `gcastWith`. The alias uses the same
@@ -7334,7 +7334,7 @@ input cases and their shared scope index in original and optimized Core.
 A consumer can then state the same variable rule against the compiled
 interface. See `Note [Checked lookup over two indexed operands]`.
 [PLFA BigStep](https://plfa.github.io/BigStep/#big-step-evaluation),
-[book implementation](https://github.com/Tritlo/PLFH/blob/21dff64b26b9e447d7dfc9b99717933e897ca716/hs/PLFH/Part2/BigStep.hs),
+[book implementation](https://github.com/TharkunAB/PLFH/blob/21dff64b26b9e447d7dfc9b99717933e897ca716/hs/PLFH/Part2/BigStep.hs),
 [verifier](../../compiler/GHC/Tc/Gen/SourceClosure.hs).
 
 PLFA eliminates a reflexive equality proof by matching on its
@@ -7623,9 +7623,9 @@ the callback result in the head, and length ignores that field.
 [Agda's length-map proof](https://agda.github.io/agda-stdlib/v1.1/Data.List.Properties.html)
 and [Haskell 2010 PreludeList](https://www.haskell.org/onlinereport/haskell2010/haskellch9.html).
 
-HaskLib writes that successor step as `congSucc (lengthMap f xs)`.
+`dependent-base` writes that successor step as `congSucc (lengthMap f xs)`.
 Its append proof uses the same lemma on the left tail.
-[HaskLib list proofs](hasklib/HaskLib/List.hs).
+[`dependent-base` list proofs](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent/Properties.hs).
 
 The R16 proof applies the installed map equation and then matches
 the recursive `Refl` to lift the equality through successor.
@@ -7896,7 +7896,7 @@ the source equation to establish a length must account for rules on
 the introduced builder as well as on the source functions.
 [Agda rewrite rules](https://agda.readthedocs.io/en/v2.8.0/language/rewriting.html#general-shape-of-rewrite-rules),
 [GHC rule semantics](../users_guide/exts/rewrite_rules.rst),
-[the fork's specialiser fix](https://github.com/Tritlo/ghc/commit/bc3798ad63) and
+[the fork's specialiser fix](https://github.com/TharkunAB/ghc/commit/bc3798ad63) and
 [the stock and fork measurements](roadmap/R16-open-term-evaluator.md#a-rule-can-change-the-result-even-when-both-lists-are-empty).
 
 ### Append fusion with a strict producer
@@ -8970,43 +8970,60 @@ family call. Job 2074 checked a two-equation example with
 ### Rewriting with propositional equality
 
 Agda's `rewrite` clause checks its right-hand side after matching the
-given equality proof on `refl`. HaskLib uses the same name for an
-expression-level operation. `rewrite proof body` passes GHC's nominal
-equality to the body using `Data.Type.Equality.gcastWith`. The body can
+given equality proof on `refl`. `Data.Type.Equality.Dependent` in
+[`dependent-base`](https://github.com/TharkunAB/dependent-base) uses the same
+name for an expression-level operation. `rewrite proof body` passes GHC's
+nominal equality to the body using `Data.Type.Equality.gcastWith`. The body can
 return another proof or an ordinary value.
 [Agda rewrite](https://agda.readthedocs.io/en/v2.8.0/language/with-abstraction.html#rewrite)
-and [HaskLib](hasklib/HaskLib.hs).
+and [`dependent-base`](https://github.com/TharkunAB/dependent-base).
 
-### Natural-number notation in HaskLib
+### Natural-number notation in `dependent-base`
 
 In Agda, a numeral has the built-in natural-number type by default.
 An instance of `Number` supplies `fromNat` for overloaded literals.
-HaskLib uses the fork's existing `FromNatural` family when a type
-expression expects its Peano `Nat`. In `plus 2 3 :~: 5`, all three
-literals have kind `Nat`. With `import HaskLib.Nat (type (+))`, the
-infix type operator forwards to that same `plus`. Induction still
-matches `Zero` and `Succ n`.
+`Data.Nat.Dependent` in [`dependent-base`](https://github.com/TharkunAB/dependent-base)
+supplies a certified ground `Num Nat` instance so type expressions expecting
+Peano `Nat` promote nonnegative literals automatically under `-XDependentTypes`.
+In `plus 2 3 :~: 5`, all three literals have kind `Nat`. With
+`import Data.Nat.Dependent (type (+))`, the infix type operator forwards to
+that same `plus`. Induction matches `Zero` and `Succ n`.
 
 In a Haskell expression, `Num Nat` supplies `fromInteger` and
 addition. A numeral that also appears in a retained result type uses
-the checked conversion of that same dictionary. The packed-vector
-experiment established the zero and successor checks. HaskLib uses
-the same conversion for its own datatype.
-[Agda literal overloading](https://agda.readthedocs.io/en/v2.8.0/language/literal-overloading.html#natural-numbers),
-[the fork's type-level conversion](../../libraries/ghc-internal/src/GHC/Internal/TypeNats.hs),
-and [HaskLib.Nat](hasklib/HaskLib/Nat.hs).
+the checked conversion of that same dictionary.
+[Agda literal overloading](https://agda.readthedocs.io/en/v2.8.0/language/literal-overloading.html#natural-numbers)
+and [`dependent-base`](https://github.com/TharkunAB/dependent-base).
 
 ### Boolean equality on structural sizes
 
 Agda's Boolean equality on natural numbers compares the constructors.
-Two successors call the same function on their predecessors. HaskLib's
-`eqSize` uses this definition for finite sizes. Its proof `eqSizeRefl`
-uses induction on the runtime input. The R13 source-equation checker
-accepts a Boolean result for this two-operand recursion. Each recursive
+Two successors call the same function on their predecessors. `Data.Nat.Dependent`
+in [`dependent-base`](https://github.com/TharkunAB/dependent-base) defines
+`eqSize` (and `eqNat`) for finite sizes, and `Data.Nat.Dependent.Properties`
+proves `eqSizeRefl` by induction on the runtime input. The R13 source-equation
+checker accepts a Boolean result for this two-operand recursion. Each recursive
 argument must stay in its own column and at least one must decrease.
 The checked case tree preserves which operand the program evaluates.
 [Agda.Builtin.Nat](https://github.com/agda/agda/blob/v2.8.0/src/data/lib/prim/Agda/Builtin/Nat.agda#L37-L42)
-and [HaskLib.Size](hasklib/HaskLib/Size.hs).
+and [`dependent-base`](https://github.com/TharkunAB/dependent-base).
+
+### Observational equality via QuickCheck `TcPlugin` (`dependent-obs-eq`)
+
+Built-in Core conversion in GHC intentionally excludes extensional function
+eta-laws and untested inductive conjectures (`ROADMAP.md`, `CORE.md`). For
+interactive exploration and external proof prototyping, **Jules
+(@analytichegel)** designed the QuickCheck-backed observational-equivalence
+typechecker plugin pattern implemented in
+[`dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq). Enabled
+explicitly per module via `-fplugin=Dependent.ObsEq.Plugin`, the plugin
+intercepts stuck nominal Wanted equalities over promoted source-table functions
+and open `TermVarTy` indices, tests candidate equations across bounded random
+and small-depth inputs before discharging them with plugin-tagged `UnivCo`
+provenance, and refutes false goals with concrete counterexample diagnostics
+while keeping built-in Core conversion sound and unchanged.
+[`dependent-obs-eq` repository](https://github.com/TharkunAB/dependent-obs-eq)
+and [Altenkirch, McBride, and Swierstra, *Observational Equality, Now!*](https://dl.acm.org/doi/10.1145/1292597.1292608).
 
 ### Composing kind casts in nested GADT matches
 

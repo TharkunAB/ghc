@@ -857,7 +857,7 @@ Job 3070 checked the order of two replacements of the same type and
 rejected the well-kinded swap. [Showcase proof](../examples/open-evaluation/BookBetaReduction.hs),
 [compiler regression](../../../testsuite/tests/dependent/should_run/NativeCheckedClosureDouble.hs),
 [PLFA More, Single and double substitution](https://plfa.github.io/More/#single-and-double-substitution),
-[original book report](https://github.com/Tritlo/PLFH/blob/69042437df9b44a099e44e1e53c981045cf0ee29/reproducers/R13_DoubleBinderSubstClosure.hs).
+[original book report](https://github.com/TharkunAB/PLFH/blob/69042437df9b44a099e44e1e53c981045cf0ee29/reproducers/R13_DoubleBinderSubstClosure.hs).
 
 Default GHCi can retain a lifted local binding only so the debugger
 can display it. At `0b2ad262df`, the verifier skips such a binding

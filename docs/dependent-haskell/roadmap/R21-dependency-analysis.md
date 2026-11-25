@@ -24,8 +24,8 @@ Writing `x : []` preserved the singleton and the provider's equations.
 The optimized reader still needed the equations for the append helper.
 Changing declaration order left both results unchanged. The chapter
 checks its list proofs with rewrite rules disabled.
-[Chapter](https://github.com/Tritlo/PLFH/blob/67dc34b68d1dfcf4d379594986281831c20ae7fd/content/part1/Lists.md),
-[reverse report](https://github.com/Tritlo/PLFH/blob/67dc34b68d1dfcf4d379594986281831c20ae7fd/reproducers/R13_RevOpenEq.hs).
+[Chapter](https://github.com/TharkunAB/PLFH/blob/67dc34b68d1dfcf4d379594986281831c20ae7fd/content/part1/Lists.md),
+[reverse report](https://github.com/TharkunAB/PLFH/blob/67dc34b68d1dfcf4d379594986281831c20ae7fd/reproducers/R13_RevOpenEq.hs).
 
 ## M126 source check
 
@@ -504,7 +504,7 @@ and [proposal #378 on lexical scoping](https://ghc-proposals.readthedocs.io/en/l
 
 ### A tree with two type parameters
 
-[Compiler `3c380131ae`](https://github.com/Tritlo/ghc/commit/3c380131aec0954c2a2cae17abeea46fb0ab40ca)
+[Compiler `3c380131ae`](https://github.com/TharkunAB/ghc/commit/3c380131aec0954c2a2cae17abeea46fb0ab40ca)
 checks the proof below in one declaration group and through a compiled
 interface. The test maps leaf values and preserves branch keys. PLFA's
 tree-map exercise also permits a function that maps branch values. Jobs

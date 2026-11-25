@@ -38,8 +38,7 @@ The following syntax is stolen:
        single: exists
        single: some
 
-    Reserved by :extension:`DependentTypes`,
-    :extension:`ExperimentalDependentTypes`, :extension:`ExistentialTypes`, and
+    Reserved by :extension:`DependentTypes`, :extension:`ExistentialTypes`, and
     :extension:`ExtendedLet`. They remain ordinary identifiers when these
     extensions are disabled.
 

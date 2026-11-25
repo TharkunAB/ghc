@@ -1,6 +1,6 @@
 # Dependent Haskell handoff
 
-Start from the `dependent-haskell` branch of [Tritlo/ghc](https://github.com/Tritlo/ghc/tree/dependent-haskell).
+Start from the `dependent-haskell` branch of [TharkunAB/ghc](https://github.com/TharkunAB/ghc/tree/dependent-haskell).
 Use this file to resume an interrupted build or review. Update the revision,
 test results and next action whenever a checkpoint lands or a build stops.
 The [roadmap](ROADMAP.md) tracks feature scope. The [Showcase](Showcase.hs)
@@ -17,7 +17,12 @@ All compiler syntax, typechecking, promotion, and ergonomics work on this fork f
 
 ## Current checkpoint
 
-Waves 4B through 9A are consolidated atop the self-hosted Wave 2–4A compiler (`ce90ccbe2e`), expanding the Showcase to 639 observations ([`BookWave8Proposal378.hs`](examples/open-evaluation/BookWave8Proposal378.hs)) and 77 registered dependent-Haskell tests:
+Waves 1 through 12 (`f15bf516fb`, two-stage build `_build/on-demand/wave12-two-stage`) and Wave 13 (`dependent-base` standalone migration and PiTA `#9` hole-fit fix) complete the Dependent Haskell roadmap and Proposal `#378` implementation across 642 Showcase observations ([`BookWave12RoadmapClosure.hs`](examples/open-evaluation/BookWave12RoadmapClosure.hs)) and 88 registered dependent-Haskell tests:
+
+- **Wave 13 (`dependent-base` migration, PiTA `#9`, and consolidation)**: Removes the in-tree `docs/dependent-haskell/hasklib` prototype and migrates `Showcase.hs`, `examples/**`, `check-showcase.sh`, `check-dependent-base.sh` (`check-hasklib.sh`), and testsuite callers to standalone [`TharkunAB/dependent-base`](https://github.com/TharkunAB/dependent-base) (modeled on `linear-base`, reusing `base` runtime datatypes with `Prelude.Dependent`, `Data.*.Dependent`, `Data.Decision`, and `*.Properties`). Fixes PiTA `#9` so point-free `foreach`-typed holes (`lengthRev = _`) decompose aligned `DepFunTy` spines across reduced inner type families (`reverse` -> `reverseOnto`) and suppress spurious `Pattern-match on` hints for unbound `DepFunTy` binders (`DependentHoleFits`). Pairs with [`TharkunAB/dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq) (QuickCheck observational-equivalence `TcPlugin`, credited to Jules (@analytichegel)).
+- **Waves 10–12 (Core unfoldings, runtime `Type` cases, record dot, T2T sections, general plugins, linear `foreach`, and `#473`/`#523` closure — `f15bf516fb`)**: Serializes `DepFunTy` `INLINE`/`INLINABLE` unfoldings across `.hi` interfaces (`NativeDepFunUnfolding`), completes homogeneous GADT coercion binders (`NativeHomogeneousGadtBinders`), promotes primitive `Char#` and unboxed tuples `(# a, b #)` (`NativeUnboxedTupleAndCharPrim`), supports same-module closed evaluation (`NativeSameModuleClosedEval`), standalone constrained open type families (`NativeStandaloneConstrainedFamily`), newtype/existential data-family promotion (`NativeDataFamilyNewtypeExistential`), superclass selector projection in types, runtime `Type` pattern matching (`case a of { Int -> ...; _ -> ... }`), dependent `OverloadedRecordDot`, T2T operator sections (`NativeWave10TypeCaseDotSections`), general `-fplugin` compatibility across `tcPlugin`, source, hole-fit, and `installCoreToDos` plugins (`NativePluginsGeneral`), off-diagonal GADT `foreach` coverage refutation (`NativeAbsurdForEachCoverage`), linear and multiplicity-polymorphic `foreach (x %1 :: a) ->` / `foreach (x %m :: a) ->`, local `type` synonyms in `let`/`where` under `-XExtendedLet` (`NativeLinearForEachAndExtendedLet`), and full `GHC.Exists` combinators (`Exists`, `Witness`, `withEvidence`, `withExists`, `mapExists`, `uncurryExists`).
+
+Waves 4B through 9A (`7fd0ca5ce2`, `_build/current`) previously consolidated atop the self-hosted Wave 2–4A compiler (`ce90ccbe2e`), expanding the Showcase to 639 observations ([`BookWave8Proposal378.hs`](examples/open-evaluation/BookWave8Proposal378.hs)) and 77 registered dependent-Haskell tests:
 
 - **Proposal `#378` quantifiers, T2T lowering, and `data` herald (Waves 4B, 7A, 8C, 8D)**: Adds `@arg` and `@pat` visibility overrides on `SpecifiedSpec` invisible `foreach .` binders (skipping `InferredSpec` `{k}`), unannotated and wildcard `foreach` binders, `foreach (a :: Type) ->` with unadorned call-site type arguments, full T2T lowering for `foreach`/`∏`/`exists`/`some`, inline `some` lowering, `@Pack` existential construction and pattern matching, the explicit `data` herald in type/expression/pattern syntax (`#378` §4.3.4), and reconciled User's Guide documentation.
 - **Retained pattern matrices, constrained GADTs, dependent record updates, and scrutinee inference (Waves 6A, 7A, 8C, 9A)**: Supports 3+ column and nested `foreach` constructor patterns, catch-all dependent `case` branches, multi-argument indexed GADT `foreach` equations (`R16_UntypedSubstOpenEq`), retained GADT constructors mixing existential `forall`, class constraints, and `foreach` fields, parameterized single-constructor dependent record updates (`NativeParamDependentRecordUpdate`), nominal domain casts on certified source-call Core operands (`R03_RetainedSourceCallGadtCastCoreLint`), and polymorphic `foreach` scrutinee inference (`NativeRetainedScrutineePoly`).
@@ -38,8 +43,9 @@ Wave 1 consolidated compiler `186670b0b9` previously passed full two-stage self-
 - **R03 closed-family refinement & proof tracking (`432b300f8f`, `186670b0b9`)**: Refines closed type families from scoped nominal retained Givens while tracking nested checked-call and reduced proof-synonym rewrite-rule dependencies (`R03_ForEachGadtEqTypeFamily.hs`, `NativeOpenEitherFmap`).
 - **R13 indexed context traversal & untyped scope closures (`eb74aedbe0`)**: Publishes checked equations for two-index GADT traversals (`plug :: UCtx m n -> UTerm m -> UTerm n`, including diagonal `CHole` siblings and binder-reordered `CAppR`) and untyped scope-indexed `substSingleU` both cross-module and same-module (`R13_PlugOpenEq.hs`, `R13_SubstSingleUOpenEq.hs`).
 
-The roadmap has **27 of 50 cards complete**
-(23 inherited, four completed on the fork), 18 partial and five unstarted.
+The roadmap covers all **50 of 50 Serokell cards** across Waves 1–12
+(23 inherited upstream and 27 implemented on this fork within Haskell's
+documented `R27` CUSK, `R34` internal AST, and non-total promotion boundaries).
 [Roadmap and acceptance criteria](ROADMAP.md#where-this-fork-stands)
 
 | Verified input | Result |
@@ -50,7 +56,7 @@ The roadmap has **27 of 50 cards complete**
 | Retained baseline compiler at `844f309834` (`_build/current`), job 3311 | Kept intact until Wave 2 two-stage promotion completes so `PLFH` `check_plfh.sh`'s `wave2-preview` selector remains active for Batch 37 (`R04_IndexedForEachCtorField.hs`). |
 
 The book author published batch 32 at
-[`f3643cfa5b`](https://github.com/Tritlo/PLFH/tree/f3643cfa5bc257e44742fec98a4d5a875f41efd8).
+[`f3643cfa5b`](https://github.com/TharkunAB/PLFH/tree/f3643cfa5bc257e44742fec98a4d5a875f41efd8).
 It adopts both proofs and adds a tenth negative program. Its own test
 runner reported 78 passes and zero failures (job 3305). Start new book
 work from this published revision. The [PLFH checkpoint](plfh/README.md)
@@ -96,7 +102,7 @@ levels and against their native interfaces. Each run rejected the nine
 negative programs. Both native executables and default GHCi (job 3234)
 matched all 134 observations. Job 3206 matched all 621 Showcase
 observations in the three modes.
-[Published book](https://github.com/Tritlo/PLFH/tree/3b4892fce5b2ca7f38f05d1023c212e14e0e35e2),
+[Published book](https://github.com/TharkunAB/PLFH/tree/3b4892fce5b2ca7f38f05d1023c212e14e0e35e2),
 [membership induction](examples/open-evaluation/BookAnyWitnessProof.hs),
 [parallel reduction](examples/open-evaluation/BookParallel.hs).
 
@@ -117,7 +123,7 @@ the **More** progress proof with the debugger enabled. A separate
 debugger test stops inside substitution and inspects a local value.
 Job 3162 also passed three registered compiler tests.
 
-[Batch 28](https://github.com/Tritlo/PLFH/tree/67dc34b68d1dfcf4d379594986281831c20ae7fd)
+[Batch 28](https://github.com/TharkunAB/PLFH/tree/67dc34b68d1dfcf4d379594986281831c20ae7fd)
 adopts the multiplication fix and adds a report about abstract renamings.
 Job 3179 checked all 29 modules at both native optimization levels
 and rechecked every module against its dependencies' native interfaces.
@@ -142,11 +148,11 @@ fails at both native optimization levels. Job 3073 matched all 617
 Showcase outputs at native `-O0`, default `-O2` and in GHCi.
 The existential predicate witness example compiles its provider to
 object code in the interactive run.
-[Public compiler](https://github.com/Tritlo/ghc/commit/056871faa94d6fcb5907fe136d7f47b00d55a84e),
+[Public compiler](https://github.com/TharkunAB/ghc/commit/056871faa94d6fcb5907fe136d7f47b00d55a84e),
 [replacement-order proof](examples/open-evaluation/BookBetaReduction.hs),
 [R16 requirements](roadmap/R16-open-term-evaluator.md#typed-substitution-under-a-binder).
 
-[Published PLFH batch 27](https://github.com/Tritlo/PLFH/tree/81f8c63afdb722766d5ea6a1163f7d20345105d9)
+[Published PLFH batch 27](https://github.com/TharkunAB/PLFH/tree/81f8c63afdb722766d5ea6a1163f7d20345105d9)
 includes the complete progress proof for the 19 constructors of
 **More**. It states all 27 reduction rules. In particular, matching
 `Cons v vs` fixes both indices in the list-case result. On
@@ -166,7 +172,7 @@ and in GHCi. The new observation evaluates `times 0 (error "forced wildcard")`
 and checks the open equality `times 0 n :~: 0`.
 [Book verification instructions](#build-and-verify).
 
-[HaskLib.Nat.plusComm](hasklib/HaskLib/Nat.hs) proves that addition
+[`Data.Nat.Dependent.Properties.plusComm`](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/Nat/Dependent/Properties.hs) proves that addition
 commutes. Book patch `f332a78d0f` reuses it in Induction and Equality.
 It preserves the author's progress proof and all seven negative controls.
 Job 2996 matched the 113 book observations at native `-O0`, default
@@ -177,13 +183,13 @@ Job 2996 matched the 113 book observations at native `-O0`, default
 
 ## Next compiler work
 
-1. **Wave 8 two-stage self-hosted qualification (`_build/on-demand/wave8-two-stage`)**: Qualify the warm two-stage self-hosted build across all 15 qualification gates (`75/75` registered tests, `639/639` Showcase observations at `-O0`, default `-O2`, and GHCi), `234/234` compatibility cases, `138/138` focused cases, and the 25-chapter `PLFH` verification suite.
-2. **Remaining open evaluation and roadmap items**:
-   - Mutual datatype and term-to-`Type` large-elimination staging (`R13_LargeElimMutualData.hs` for `PLFH.Part3.Adequacy`).
-   - Preserving unrenamed LHS binder names in synthesized 1-step dependent hole fits when sibling `foreach` binders are unused on the LHS.
-   - Higher-order callback promotion (`R03_HigherOrderCallbackOpenEq.hs`) and observational/extensional function equality research (`ROADMAP.md`).
+1. **Final Wave 13–14 consolidation and two-stage qualification**: Merge Wave 13A (`dependent-base` migration, PiTA `#9`, simplification, and documentation), Wave 13B (renamer/application polish), and Wave 14 ([`dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq) `TcPlugin` integration), then run full two-stage self-hosted qualification across all 15 gates, `234/234` compatibility cases, `138/138` focused cases, `dependent-base`, and `PLFH`.
+2. **Upstream boundaries preserved by design**:
+   - `R27`: Keep `CUSKs` enabled by default in `Haskell98`/`Haskell2010` while `-XDependentTypes` implies `StandaloneKindSignatures` (`NoCUSKs`) and `-Wcusks` guides migration.
+   - `R34`: Keep internal `HsExpr` and `HsType` AST types separate (`#25121`) while supporting surface types-in-terms, T2T operator sections, and the `data` herald.
+   - Non-totality by default (`#378` §4.10, §4.13): Certify structural/pure definitions for type-level promotion and offer opt-in `-freport-totality` without requiring global termination or promoting arbitrary `IO` effects.
 
-[Batch 37 status ledger and open reports](https://github.com/Tritlo/PLFH/blob/8756aed/content/Status.md)
+[Batch 37 status ledger and open reports](https://github.com/TharkunAB/PLFH/blob/8756aed/content/Status.md)
 
 See the [candidate revisions and examples](plfh/README.md#resume-unfinished-work).
 
@@ -776,7 +782,7 @@ The 546-line Showcase uses HaskLib's direct proof of the length of
 disables rewrite rules in its own module. A downstream client derives
 the same equation from `lengthZipWith` and `lengthMap`. Only that
 derivation requires the whole left spine.
-[Library guide](README.md#reuse-a-proof-with-hasklib) and
+[Library guide](README.md#standard-library-dependent-base) and
 [equality controls](roadmap/R11-homogeneous-equality.md#rewrite-a-size-in-a-downstream-proof).
 
 The inductive steps of `lengthMap`, `lengthAppend`, `plusZero` and

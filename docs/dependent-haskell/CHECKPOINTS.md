@@ -164,7 +164,7 @@ and their runtime behavior on lazy payloads. Job 2661 checked the
 registered regression. Extending the early reservation to arbitrary tuple
 functions broke valid projection and reconstruction examples. The
 compiler restricts early reservation to the checked permutation.
-[Compiler and regression](https://github.com/Tritlo/ghc/commit/da06279b7a4ba86fef478e3f988297ebd3306fd2).
+[Compiler and regression](https://github.com/TharkunAB/ghc/commit/da06279b7a4ba86fef478e3f988297ebd3306fd2).
 
 The [605th through 607th examples](Showcase.hs) exercise these laws.
 Job 2674 matched all 607 expected lines at native `-O0`, default `-O2`
@@ -201,7 +201,7 @@ its inverse in the 604-observation Showcase at native `-O0`, default
 function, a false proof, a strict worker, an ignored bottom callback
 and an active rewrite rule.
 
-Job 2603 checked the unchanged [batch 14 book](https://github.com/Tritlo/PLFH/tree/d343521eb54eb18aca970b302adb3583f98f3111)
+Job 2603 checked the unchanged [batch 14 book](https://github.com/TharkunAB/PLFH/tree/d343521eb54eb18aca970b302adb3583f98f3111)
 on the composition compiler. Job 2597 ran the same inputs on the
 preceding compiler. The four book builds and all 74 original report
 outcomes agreed. At `-O0`, 23 of 37 reports compiled. At default `-O2`,
@@ -215,7 +215,7 @@ Job 2600 passed all 56 checks on the patched book.
 
 ## Nested Soundness patterns and identity isomorphisms
 
-The [R11 fix](https://github.com/Tritlo/ghc/commit/3326acd9b1fea98090eb5e8f3f89b5a85e44d849)
+The [R11 fix](https://github.com/TharkunAB/ghc/commit/3326acd9b1fea98090eb5e8f3f89b5a85e44d849)
 keeps the original cast when projecting equality evidence from a nested
 GADT pattern. Job 2561 compiled the Soundness chapter with its environment
 pattern inlined at both optimization levels. An intentionally wrong field
@@ -248,8 +248,8 @@ neutral function body remains open.
 
 ## Polymorphic proofs from the published book
 
-Job 2505 checked [PLFH `0fd43f5`](https://github.com/Tritlo/PLFH/tree/0fd43f5353c4c3ae7670bac668ff2abe8f3c67ea)
-with [compiler `34582bce54`](https://github.com/Tritlo/ghc/commit/34582bce5489634e15d9fc16a53d37b19dcc58e5).
+Job 2505 checked [PLFH `0fd43f5`](https://github.com/TharkunAB/PLFH/tree/0fd43f5353c4c3ae7670bac668ff2abe8f3c67ea)
+with [compiler `34582bce54`](https://github.com/TharkunAB/ghc/commit/34582bce5489634e15d9fc16a53d37b19dcc58e5).
 In four fresh builds, all 27 modules passed the interface audit. Both
 native executables passed 66 observations. Each build rejected all five
 negative programs with the expected diagnostics. Fresh no-code builds
@@ -281,11 +281,11 @@ Job 2510 ran the same [isomorphism definition](examples/open-evaluation/BookIsom
 in the registered interface test and the Showcase. Both native optimization
 levels and GHCi matched all 602 observations. The reader converted a Boolean
 to a bit and evaluated both proofs. The regression still rejected swapped
-proofs. [Published example](https://github.com/Tritlo/ghc/commit/f6aff88d4040111518f1d148aaf0be20c01f009d).
+proofs. [Published example](https://github.com/TharkunAB/ghc/commit/f6aff88d4040111518f1d148aaf0be20c01f009d).
 
 ## Exponentiation and keyed trees
 
-The [ordinary exponentiation fix](https://github.com/Tritlo/ghc/commit/1f873969e589e84b632e5d0304399ab4d2c997e3)
+The [ordinary exponentiation fix](https://github.com/TharkunAB/ghc/commit/1f873969e589e84b632e5d0304399ab4d2c997e3)
 checks three PLFH laws through compiled Naturals and Induction interfaces.
 For example, the book can state the following law about its own functions.
 
@@ -300,21 +300,21 @@ undefined base to zero returned one. Job 2433 checked 27 book modules with
 the preservation and subtraction patches in four configurations. Of 29 original
 reports, 17 compiled at `-O0` and 16 at default `-O2`.
 
-The [R21 fix](https://github.com/Tritlo/ghc/commit/3c380131aec0954c2a2cae17abeea46fb0ab40ca)
+The [R21 fix](https://github.com/TharkunAB/ghc/commit/3c380131aec0954c2a2cae17abeea46fb0ab40ca)
 checks `nodes (mapValues f t) :~: nodes t` for a tree with independent key
 and value types. Jobs 2436–2438 tested four declaration and splice
 arrangements at both optimization levels and an independent proof through
 interfaces. Crossed key types and a wrong branch count still failed.
 The combined compiler passed the PLFH subtraction and exponentiation checks.
 
-Job 2441 checked the [De Bruijn value-classification change](https://github.com/Tritlo/ghc/commit/2e4fbb752a2fca6d9d4ac4b7901e2aa07b3c1534)
+Job 2441 checked the [De Bruijn value-classification change](https://github.com/TharkunAB/ghc/commit/2e4fbb752a2fca6d9d4ac4b7901e2aa07b3c1534)
 on the exponentiation build. An ordinary client checked the chapter's value
 classifier at both optimization levels and observed that inspecting a lambda
 leaves its body unevaluated. The separate equation-form example remains open.
 
 ## Truncated subtraction in the Induction chapter
 
-The [published compiler](https://github.com/Tritlo/ghc/commit/63e2f0974b174dc86bef79c3a84d1d76fea3dadf)
+The [published compiler](https://github.com/TharkunAB/ghc/commit/63e2f0974b174dc86bef79c3a84d1d76fea3dadf)
 checks the following PLFH exercises with the ordinary `monus` from Naturals.
 
 ```haskell
@@ -343,7 +343,7 @@ of the Showcase at native `-O0`, default `-O2`, and in GHCi.
 
 ## One-step preservation with same-module substitution
 
-The [published compiler revision](https://github.com/Tritlo/ghc/commit/692eae077896a00384fecf15a3d5d92d828a6415)
+The [published compiler revision](https://github.com/TharkunAB/ghc/commit/692eae077896a00384fecf15a3d5d92d828a6415)
 checks these declarations from the PLFH Lambda and Properties chapters.
 
 ```haskell
@@ -378,7 +378,7 @@ The [handoff](HANDOFF.md#current-checkpoint) records the separate two-stage buil
 
 ### Nested equality evidence and the PLFH reproducer corpus
 
-The [fix at `9cc4065fab`](https://github.com/Tritlo/ghc/commit/9cc4065fab4f2f106859b39daa9bdad23f00f0fd)
+The [fix at `9cc4065fab`](https://github.com/TharkunAB/ghc/commit/9cc4065fab4f2f106859b39daa9bdad23f00f0fd)
 keeps equality evidence that an inner dependent case uses. On the earlier
 revision, Core Lint reported a variable out of scope in the Denotational
 chapter's nested `subInvDist`. Job 2389 checked the proof at both optimization
@@ -764,7 +764,7 @@ is in `r17-normal-568-20261123/review/qualified.pass`.
 Compiler `687b465aad` checks the three source equations of the ordinary
 list function `takeSize`. The proof in a separate module recurses on the
 smaller bound and list tail. An installed client can import it from
-`HaskLib`. [Proof](hasklib/HaskLib/List.hs) and [producer](hasklib/HaskLib/List/Prefix.hs).
+`HaskLib` (migrated to [`dependent-base`](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent/Properties.hs)).
 
 ```haskell
 lengthTakeSize :: forall a. foreach (n :: Size) -> foreach (xs :: [a])
@@ -777,7 +777,7 @@ passed. Cabal built and tested the source distribution offline. Two
 independent clients used the installed package. The demand checks cover
 a zero bound with an undefined list and a finite prefix of an infinite
 list. Even for an empty list the producer must inspect the bound first.
-[Package checks](hasklib-test/Main.hs).
+[Package checks](https://github.com/TharkunAB/dependent-base/blob/main/test/Main.hs).
 
 All 234 compatibility cases passed (231 normal test registrations and
 three GHCi registrations). The focused suite passed 137 of 138. The
@@ -1575,7 +1575,7 @@ proof at `-O0` and `-O2`. The client uses those two lemmas and
 `lengthAppend` without repeating their induction. Job `577` loaded
 the new public module and matched all 545 lines in stage 2 native
 code and GHCi.
-[Arithmetic lemmas](hasklib/HaskLib/Size.hs) and [consumer proof](hasklib-test/Client.hs).
+[Arithmetic lemmas](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/Nat/Dependent/Properties.hs) and [consumer proof](https://github.com/TharkunAB/dependent-base/blob/main/test/DependentClient.hs).
 
 Job `581` installed the source distribution with `lengthReverse` and
 ran its package test. A separate module used the theorem with only
@@ -1583,7 +1583,7 @@ ran its package test. A separate module used the theorem with only
 evaluated the list spine and left the elements unevaluated. Job `595`
 ran the 545-line Showcase with the public theorem on an IO-supplied list
 at both native optimization levels and in stage 2 GHCi.
-[Reverse proof](hasklib/HaskLib/List.hs).
+[Reverse proof](https://github.com/TharkunAB/dependent-base/blob/main/src/Data/List/Dependent/Properties.hs).
 
 ## An ordinary minimum in the zip length proof
 
@@ -7845,7 +7845,7 @@ See [the contract](CORE.md#multi-constructor-retained-package-patterns),
 ## M51: function-valued retained package fields
 
 The checkpoint is independently audited and published at
-[b92d3f1595](https://github.com/tritlo/ghc/commit/b92d3f1595fa9a2341f683dfd4f0c7ed66b906a6).
+[b92d3f1595](https://github.com/TharkunAB/ghc/commit/b92d3f1595fa9a2341f683dfd4f0c7ed66b906a6).
 This later status update changes documentation only. The maintained
 [Showcase.hs](Showcase.hs) includes the `functionFields` group.
 
