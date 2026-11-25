@@ -175,7 +175,12 @@ is nonempty before it can use a function that requires a successor length.
 
 The dot form infers package introduction and elimination. The bar form
 (``exists (n :: Nat) | Vec a n``) uses explicit ``Pack`` expressions and
-patterns from ``GHC.Exists``. Both the producer and an ordinary client can
+patterns from ``GHC.Exists``. ``GHC.Exists`` also provides ``(/\)``
+(``MkCPair``) to pair a constraint dictionary with a payload, as in
+``exists a. Show a /\ a``, and ``discardEvidence`` to drop the stored
+dictionary. ``GHC.Sigma`` exports ``Sigma(Pair)``, ``first``, ``second``
+(``foreach (p :: Sigma a b) -> b (first p)``), and ``withSigma``.
+Both the producer and an ordinary client can
 compile at ``-O1``, including through a separately compiled interface.
 Two uses of the same unrestricted local package can share a witness in
 one application. Two independently filtered vectors have independent lengths.
@@ -185,8 +190,14 @@ GHC can compile that transport at ``-O1``.
 Natural numerals in vector indices
 ----------------------------------
 
-A library can give its index type an interpretation for nonnegative type
-numerals. Import ``FromNatural`` from ``GHC.TypeNats.Experimental`` in the
+When a closed lifted Peano datatype defines a ground ``Num`` instance with
+the certified three-guard ``fromInteger`` method under
+:extension:`DependentTypes` or :extension:`ExperimentalDependentTypes`, GHC
+automatically promotes nonnegative type-level numerals at that kind without
+requiring a separate ``FromNatural`` instance.
+
+A library can also supply an explicit ``FromNatural`` instance for custom
+index types. Import ``FromNatural`` from ``GHC.TypeNats.Experimental`` in the
 package ``ghc-experimental``. Define an instance for the index kind. For
 example, these declarations register a Peano kind::
 

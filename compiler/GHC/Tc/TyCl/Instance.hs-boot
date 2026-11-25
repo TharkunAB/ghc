@@ -5,12 +5,15 @@
 
 module GHC.Tc.TyCl.Instance ( tcInstDecls1 ) where
 
+import GHC.Prelude ( Maybe )
 import GHC.Hs
 import GHC.Tc.Types
 import GHC.Tc.Utils.Env( InstInfo )
 import GHC.Tc.Deriv
+import GHC.Types.Name.Set ( NameSet )
 
 -- We need this because of the mutual recursion
 -- between GHC.Tc.TyCl and GHC.Tc.TyCl.Instance
-tcInstDecls1 :: [LInstDecl GhcRn]
+tcInstDecls1 :: Maybe NameSet
+             -> [LInstDecl GhcRn]
              -> TcM (TcGblEnv, [InstInfo GhcRn], [DerivInfo], ThBindEnv)

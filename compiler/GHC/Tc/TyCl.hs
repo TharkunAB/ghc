@@ -34,9 +34,7 @@ import GHC.Driver.Config.HsToCore
 
 import GHC.Hs
 import qualified GHC.Hs.Decls as HsDecls
-import GHC.Hs.Type (HsTypeGhcRnExt(HsTypeCaseAliasRn))
 
-import GHC.Tc.Types.BasicTypes (TcTyThing(ATcCaseLet))
 import GHC.Tc.Errors.Types
 import GHC.Tc.TyCl.Build
 import GHC.Tc.Solver( pushLevelAndSolveEqualities, pushLevelAndSolveEqualitiesX
@@ -65,6 +63,7 @@ import GHC.Tc.Types.LclEnv
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 
+import GHC.Builtin.Modules ( gHC_INTERNAL_TYPENATS )
 import GHC.Builtin.WiredIn.Types ( oneDataConTy, unitTy, makeRecoveryTyCon
                                , boolTy, promotedTrueDataCon, promotedFalseDataCon
                                , manyDataConTy, matchableDataConTy, unmatchableDataConTy, matchabilityTy
@@ -79,7 +78,6 @@ import GHC.Core.Coercion
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep   -- for checkValidRoles
 import GHC.Core.TyCo.Subst (extendSubstInScopeSetFromSource)
-import GHC.Core.TyCo.FVs (tyCoVarsOfTypesList)
 import GHC.Core.TyCo.Ppr( pprTyVars )
 import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
@@ -609,7 +607,7 @@ tcTyClGroup open_indices (TyClGroup { group_tyclds = tyclds
            -- Step 4: check instance declarations
        ; (gbl_env', inst_info, datafam_deriv_info, th_bndrs') <-
          setGblEnv gbl_env $
-         tcInstDecls1 instds
+         tcInstDecls1 (explicit_from_natural open_indices) instds
 
        ; let deriv_info = datafam_deriv_info ++ data_deriv_info
        ; let gbl_env'' = gbl_env'
@@ -1598,6 +1596,8 @@ a term signature. Preserve any written matchability on the RHS.
 type SynonymMetadata = [(Name, [Type])]
 
 -- | Add the still-unconstrained RHS indices to the inferred prefix.
+-- See Note [Inferred synonym matchability] and
+-- Note [Inferred matchability for ordinary kind-arrow synonyms].
 inferArrowIndices :: NameEnv SynonymMetadata -> [LTyClDecl GhcRn]
                   -> PolyTcTyCon -> TcM (PolyTcTyCon, Maybe SynonymMetadata)
 inferArrowIndices metadata decls tc
@@ -1624,6 +1624,17 @@ inferArrowIndices metadata decls tc
   , any (matchabilityArrow . caseAliasBody . feqn_rhs . unLoc) eqns = do
       ma <- newFlexiTyVar matchabilityTy
       pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
+  | isLiftedTypeKind (tyConResKind tc)
+  , tyConArity tc == 0
+  , null (tyConBinders tc)
+  , [SynDecl { tcdRhs = rhs }] <- [d | L _ d <- decls, tcdName d == tyConName tc]
+  , legacyKindArrowTree rhs = do
+      unsat <- unsaturatedTypeFamiliesEnabled
+      if unsat
+        then pure (tc, Nothing)
+        else do
+          ma <- newFlexiTyVar matchabilityTy
+          pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
   | otherwise = pure (tc, Nothing)
   where
     prefix [] = tc
@@ -1631,6 +1642,44 @@ inferArrowIndices metadata decls tc
       (foldr (\v -> mkForAllTy unmatchableDataConTy (Bndr v Inferred)) (tyConKind tc) indices)
       (mkNamedTyConBinders Inferred indices ++ tyConBinders tc)
       0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc)
+
+-- | Recognize a tree of bare arrows whose leaves are lifted Type.
+-- See Note [Inferred matchability for ordinary kind-arrow synonyms].
+legacyKindArrowTree :: LHsType GhcRn -> Bool
+legacyKindArrowTree rhs = matchabilityArrow rhs && go rhs
+  where
+    go ty
+      | L _ (HsFunTy _ _ domain result) <- ignoreParens ty
+      , matchabilityArrow ty
+      = go domain && go result
+      | otherwise = case unLoc (ignoreParens ty) of
+          HsStarTy{} -> True
+          HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> name == liftedTypeKindTyConName
+          _ -> False
+
+{- Note [Inferred matchability for ordinary kind-arrow synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In ordinary Haskell modules (where neither UnsaturatedTypeFamilies nor
+ExperimentalDependentTypes is enabled), programs often declare nullary
+higher-order kind synonyms using bare arrows, such as:
+
+  type MTrans = (Type -> Type) -> (Type -> Type)
+
+Proposal #242 defaults bare arrows on a synonym RHS to Unmatchable (U)
+when unsaturation is active. In an ordinary module, fixing MTrans to U
+rejects standard class and datatype kind signatures such as
+`class LiftingMonad (trans :: MTrans)` and `newtype ComposeT :: MTrans -> MTrans`.
+Conversely, fixing MTrans unconditionally to Matchable (M) would reject an
+ordinary runtime function signature whose type is `Type -> Type`.
+
+Give an unannotated nullary synonym whose RHS is a tree of bare arrows over
+Type one inferred Matchability binder, just as `inferArrowIndices` already
+does for a nullary closed family equation. `tcCheckMatchabilitySynRhs`
+applies that binder to every bare arrow in the tree. Kind-level uses then
+select M and type-level uses select U. Modules that enable
+UnsaturatedTypeFamilies or ExperimentalDependentTypes retain Proposal #242's
+fixed U default on synonym RHSs.
+-}
 
 -- | Select results whose constructor shape is independent of matchability.
 -- See Note [Inferred injective kind family results].
@@ -1704,6 +1753,7 @@ Using one selector for both positions wrongly equates them at a rigid k.
 data OpenFamilyCandidates = OpenFamilyCandidates
   { arrow_candidates :: NameSet
   , result_aliases :: NameEnv Name
+  , explicit_from_natural :: Maybe NameSet
   }
 
 -- | Collect local family heads that need an inferred result selector.
@@ -1715,7 +1765,27 @@ openFamilyMatchabilityCandidates groups =
     (mkNameEnv [(family, head_name) | (family, rhs) <- equations_rhs,
                  Just head_name <- [lookupNameEnv result_heads family],
                  kindHead rhs == Just head_name])
+    explicit_from_nat
   where
+    all_equations = concatMap groupEquations groups
+    nullary_syns = mkNameEnv
+      [ (name, target)
+      | tg <- groups
+      , L _ SynDecl{tcdLName = L _ name, tcdTyVars = HsQTvs{hsq_explicit = []}, tcdRhs = rhs} <- group_tyclds tg
+      , Just target <- [kindHead rhs] ]
+    resolve_syn :: Int -> Name -> Name
+    resolve_syn 0 n = n
+    resolve_syn k n = case lookupNameEnv nullary_syns n of
+      Just next | next /= n -> resolve_syn (k - 1) next
+      _ -> n
+    explicit_from_nat = fmap unionNameSets $ sequence
+      [ case [pat | HsValArg _ pat <- pats] of
+          pat1 : _ | Just tc_name <- kindHead pat1, isTyConName tc_name ->
+            Just (mkNameSet [tc_name, resolve_syn 8 tc_name])
+          _ -> Nothing
+      | FamEqn{feqn_tycon = L _ family, feqn_pats = pats} <- all_equations
+      , nameOccName family == mkTcOcc "FromNatural"
+      , nameModule_maybe family == Just gHC_INTERNAL_TYPENATS ]
     declarations = [fam | tg <- groups, L _ decl <- group_tyclds tg, fam <- families decl]
     local_open_families = mkNameSet
       [unLoc name | FamilyDecl{fdInfo = OpenTypeFamily{}, fdLName = name,
@@ -5529,6 +5599,7 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs res_kind tag_map
 
        ; return (NE.singleton dc) }
   where
+    invis_bndrs :: HsForAllTelescope GhcRn -> [LHsTyVarBndr Specificity GhcRn]
     invis_bndrs HsForAllInvis{hsf_invis_bndrs = bndrs} = bndrs
     invis_bndrs HsForAllVis{} = pprPanic "tcConDecl: visible H98 group" empty
     invis_bndr (Bndr tv (Invisible spec)) = Bndr tv spec
@@ -5779,7 +5850,7 @@ checkRetainedConShape new_or_data telescope args res_ty
                  && plain_prefix args) $
            failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration }
   where
-    has_context (L _ (HsGadtContext ctxt)) = not (null (hsc_ctxt (unLoc ctxt)))
+    has_context (L _ (HsGadtContext (L _ (HsContext _ ctxt)))) = not (null ctxt)
     has_context _ = False
 
     is_forall (L _ HsGadtForAll{}) = True
@@ -7569,6 +7640,13 @@ checkValidRoles tc
     check_ty_roles env _ (ExistsTy _ v body)
       = check_ty_roles env Nominal (varType v)
       >> check_ty_roles (extendVarEnv env v Nominal) Nominal body
+
+    check_ty_roles env role (DepDictTy d body)
+      = check_ty_roles env Nominal (varType d)
+      >> check_ty_roles (extendVarEnv env d Nominal) role body
+
+    check_ty_roles env _ (ClassAppTy sel inst dict operand kind)
+      = mapM_ (check_ty_roles env Nominal) [varType sel, inst, dict, operand, kind]
 
     check_ty_roles env role (TyVarTy tv)
       = case lookupVarEnv env tv of
