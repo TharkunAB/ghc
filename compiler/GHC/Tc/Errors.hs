@@ -25,6 +25,7 @@ import GHC.Tc.Instance.Typeable (kindIsTypeable)
 import GHC.Tc.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Errors.Types
+import GHC.Tc.Errors.Hole.FitTypes ( HoleFit (..), hfName )
 import GHC.Tc.Errors.Ppr
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.CtLoc
@@ -34,7 +35,7 @@ import GHC.Tc.Zonk.Type
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 import GHC.Tc.Types.Origin
-import GHC.Tc.Types.ErrCtxt( redundantConstraintsSpan )
+import GHC.Tc.Types.ErrCtxt( redundantConstraintsSpan, isSigMaybe )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Instance.Family
 import GHC.Tc.Utils.Instantiate
@@ -61,6 +62,8 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Core.PatSyn (PatSyn)
 import GHC.Core.Predicate
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep ( Type (..) )
+import GHC.Core.Coercion.Axiom ( coAxiomBranches, fromBranches, cab_lhs )
 import GHC.Core.Class (className)
 import GHC.Core.ConLike (isExistentialRecordField, ConLike (..))
 import GHC.Core.Coercion
@@ -70,6 +73,7 @@ import GHC.Core.TyCo.Tidy
 import GHC.Core.TyCo.FVs
 
 import GHC.Core.InstEnv
+import GHC.Core.FamInstEnv ( familyInstances, FamInst (fi_tys) )
 import GHC.Core.TyCon
 
 import GHC.Utils.Error  (diagReasonSeverity, deferredTypeErrorMessage )
@@ -93,7 +97,7 @@ import Data.Function      ( on )
 import Data.Functor.Classes ( liftCompare )
 import Data.IntSet        ( IntSet )
 import qualified Data.IntSet as IntSet
-import Data.List          ( partition, union, sort, sortBy )
+import Data.List          ( partition, union, sort, sortBy, stripPrefix )
 import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import Data.Ord           ( comparing )
@@ -1680,16 +1684,18 @@ mkHoleError lcl_name_cache tidy_simples ctxt
        ; (grouped_skvs, other_tvs) <- liftZonkM $ zonkAndGroupSkolTvs hole_ty
        ; let reason | ExprHole _ <- sort = cec_expr_holes ctxt
                     | otherwise          = cec_type_holes ctxt
-             err  = SolverReportWithCtxt ctxt
+             ctxt_skol = ctxt { cec_tidy = tidyHoleSkolEnv (cec_tidy ctxt) grouped_skvs }
+             err  = SolverReportWithCtxt ctxt_skol
                   $ ReportHoleError hole
                   $ HoleError sort other_tvs grouped_skvs
              supp =    [ SupplementaryBindings rel_binds ]
                     ++ [ SupplementaryCts      cts | cts <- maybeToList (NE.nonEmpty relevant_cts) ]
                     ++ [ SupplementaryHoleFits hole_fits ]
 
-       ; maybeAddDeferredBindings hole (SolverReport err supp noHints)
+       ; maybe_split_hints <- dependentHoleHints ctxt lcl_env hole hole_fits
+       ; maybeAddDeferredBindings hole (SolverReport err supp maybe_split_hints)
        ; let msg = TcRnSolverReport err reason
-       ; mkErrorReport lcl_env msg (Just ctxt) supp noHints
+       ; mkErrorReport lcl_env msg (Just ctxt) supp maybe_split_hints
        }
 
   where
@@ -1697,6 +1703,7 @@ mkHoleError lcl_name_cache tidy_simples ctxt
 
 -- | For all the skolem type variables in a type, zonk the skolem info and group together
 -- all the type variables with the same origin.
+-- See Note [Term variables in hole diagnostics].
 zonkAndGroupSkolTvs :: Type -> ZonkM ([(SkolemInfoAnon, [TcTyVar])], [TcTyVar])
 zonkAndGroupSkolTvs hole_ty = do
   zonked_info <- mapM zonk_skolem_info skolem_list
@@ -1705,7 +1712,7 @@ zonkAndGroupSkolTvs hole_ty = do
     zonk_skolem_info (sk, tv) =
       do { sk <- zonkSkolemInfoAnon $ getSkolemInfo sk
          ; return (sk, fst <$> tv) }
-    tvs = tyCoVarsOfTypeList hole_ty
+    tvs = filter (not . isNonCoVarId) $ tyCoVarsOfTypeList hole_ty
     (skol_tvs, other_tvs) = partition (isTcTyVar <&&> isSkolemTyVar) tvs
 
     group_skolems :: UM.UniqMap SkolemInfo ([(TcTyVar, Int)])
@@ -1715,6 +1722,210 @@ zonkAndGroupSkolTvs hole_ty = do
 
     skolem_list = sortBy (comparing (sort . map snd . snd))
                 $ UM.nonDetUniqMapToList group_skolems
+
+{- Note [Term variables in hole diagnostics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A dependent hole type can contain runtime index occurrences via 'TermVarTy'.
+'tyCoVarsOfTypeList' collects these local runtime 'Id's alongside type and
+coercion variables.
+
+1. Exclude non-coercion 'Id's in 'zonkAndGroupSkolTvs'. 'HoleError' expects
+   'other_tvs' to contain only 'TyVar's and 'CoVar's. Leaving runtime 'Id's in
+   'other_tvs' misclassifies them as coercion variables under
+   '-fprint-explicit-coercions'.
+
+2. Release bound 'DepFunTy' binder occurrences from 'TidyOccEnv' before
+   tidying hole skolem origins ('tidyHoleSkolEnv') when those occurrences do not
+   collide with free variables or rigid type variables of the skolem info.
+   Otherwise free 'TermVarTy' occurrences from the hole type (such as @xs@ and
+   @ys@) cause 'tidySigSkol' to rename @foreach (xs :: [a])@ to @xs1@ when
+   printing the enclosing signature.
+
+3. When 'ExperimentalDependentTypes' is active and no direct non-recursive fit
+   solves an expression hole, inspect the hole type for stuck certified
+   source-table family applications @T:f arg_1 ... arg_n@. If a constructor-
+   scrutinized argument position holds an unrefined local algebraic variable
+   @x@, emit a 'DependentCaseSplitHint' suggesting a pattern match on @x@.
+-}
+
+-- | Release bound 'DepFunTy' binder occurrences from 'TidyOccEnv' before
+-- tidying hole skolem origins unless they collide with free variables or
+-- rigid type variables of the skolem info.
+-- See Note [Term variables in hole diagnostics].
+tidyHoleSkolEnv :: TidyEnv -> [(SkolemInfoAnon, [TcTyVar])] -> TidyEnv
+tidyHoleSkolEnv env@(occ_env, var_env) grouped_skvs
+  | null releasable = env
+  | otherwise       = (delTidyOccEnvList occ_env releasable, var_env)
+  where
+    skol_tys = [ ty | (info, _) <- grouped_skvs, ty <- skol_info_tys info ]
+    skol_info_tys (SigSkol _ ty _)     = [ty]
+    skol_info_tys (DerivSkol ty)       = [ty]
+    skol_info_tys (InferSkol ids)      = map snd ids
+    skol_info_tys (UnifyForAllSkol ty) = [ty]
+    skol_info_tys _                    = []
+
+    tidy_occ v = getOccName (fromMaybe v (lookupVarEnv var_env v))
+    avoid_fs =
+      [ occNameFS (tidy_occ tv) | (_, tvs) <- grouped_skvs, tv <- tvs ] ++
+      [ occNameFS (tidy_occ v)  | ty <- skol_tys, v <- tyCoVarsOfTypeList ty ]
+
+    dep_bndr_occs ty | Just ty' <- coreView ty = dep_bndr_occs ty'
+    dep_bndr_occs (DepFunTy _ v b)   = getOccName v : dep_bndr_occs (varType v) ++ dep_bndr_occs b
+    dep_bndr_occs (DepDictTy v b)    = dep_bndr_occs (varType v) ++ dep_bndr_occs b
+    dep_bndr_occs (ForAllTy ma _ b)  = dep_bndr_occs ma ++ dep_bndr_occs b
+    dep_bndr_occs (FunTy _ ma w a r) = dep_bndr_occs ma ++ dep_bndr_occs w ++ dep_bndr_occs a ++ dep_bndr_occs r
+    dep_bndr_occs (ExistsTy _ v b)   = dep_bndr_occs (varType v) ++ dep_bndr_occs b
+    dep_bndr_occs _                  = []
+
+    releasable =
+      [ occ
+      | ty <- skol_tys
+      , occ <- dep_bndr_occs ty
+      , occNameFS occ `notElem` avoid_fs
+      ]
+
+-- | Diagnostic hint suggesting a pattern match on a local index variable to
+-- reduce a stuck source-table type family in a hole type.
+data DependentCaseSplitHint = DependentCaseSplitHint !Name ![DataCon] !OccName
+
+instance Outputable DependentCaseSplitHint where
+  ppr (DependentCaseSplitHint var_nm data_cons fun_occ)
+    = text "Pattern-match on" <+> quotes (ppr var_nm)
+        <+> parens (text "constructors:"
+                    <+> pprWithCommas (quotes . ppr . dataConName) (take 4 data_cons))
+        <+> text "to reduce" <+> quotes (ppr fun_occ) <> dot
+
+-- | Build case-split hints for stuck source-table families in an unsolved
+-- dependent expression hole.
+-- See Note [Term variables in hole diagnostics].
+dependentHoleHints :: SolverReportErrCtxt -> CtLocEnv -> Hole -> ValidHoleFits -> TcM [GhcHint]
+dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_ty })
+                   (ValidHoleFits { holeFits = Fits direct_fits _ })
+  = do { dep_exts <- xoptM LangExt.ExperimentalDependentTypes
+       ; home_mod <- tcg_mod <$> getGblEnv
+       ; if not dep_exts || has_direct_fit home_mod
+         then return noHints
+         else do
+           { fam_envs <- tcGetFamInstEnvs
+           ; let candidates = nubOrdBy cmp_cand (collect_stuck fam_envs hole_ty)
+           ; return [ UnknownHint (DependentCaseSplitHint (idName (untidy_id v)) cons occ)
+                    | (v, cons, occ) <- take 3 candidates ] } }
+  where
+    untidy_env = mkVarEnv [ (b, b) | TcIdBndr b _ <- ctl_bndrs lcl_env ]
+    untidy_id v = fromMaybe v (lookupVarEnv untidy_env v)
+
+    bndr_occ (TcIdBndr bndr_id top_lvl)     = Just (nameOccName (idName bndr_id), top_lvl)
+    bndr_occ (TcIdBndr_ExpType nm _ top_lvl) = Just (nameOccName nm, top_lvl)
+    bndr_occ (TcTvBndr _ _)                 = Nothing
+
+    all_id_bndrs = mapMaybe bndr_occ (ctl_bndrs lcl_env)
+    not_top_occs = [ occ | (occ, top_lvl) <- all_id_bndrs, not (isTopLevel top_lvl) ]
+    encl_occ = case reverse not_top_occs of
+                 occ : _ -> [occ]
+                 []      -> [ occ | (occ, _) : _ <- [all_id_bndrs] ]
+    sig_occs =
+      [ nameOccName fn_nm
+      | imp <- cec_encl ctxt
+      , SigSkol uctxt _ _ <- [ic_info imp]
+      , Just fn_nm <- [isSigMaybe uctxt]
+      ]
+    self_occs = mkOccSet (sig_occs ++ encl_occ)
+
+    is_self_nm home_mod nm =
+      (isNothing (nameModule_maybe nm) || nameModule_maybe nm == Just home_mod)
+      && (nameOccName nm `elemOccSet` self_occs)
+
+    has_direct_fit home_mod = any (not . is_self_fit home_mod) direct_fits
+    is_self_fit home_mod (TcHoleFit hf) = is_self_nm home_mod (hfName hf)
+    is_self_fit _        (RawHoleFit _) = False
+
+    refined_vars = mkVarSet
+      [ v
+      | imp <- cec_encl ctxt
+      , ev <- ic_given imp
+      , Just (_, lhs, rhs) <- [getEqPredTys_maybe (varType ev)]
+      , v <- refined_side lhs rhs ++ refined_side rhs lhs
+      ]
+
+    refined_side (TermVarTy v) rhs
+      | Just (tc, _) <- splitTyConApp_maybe rhs
+      , isJust (isPromotedDataCon_maybe tc)
+      = [v]
+    refined_side _ _ = []
+
+    cmp_cand (v1, _, o1) (v2, _, o2)
+      = stableNameCmp (idName v1) (idName v2) Semi.<> compare o1 o2
+
+    owner_occ :: TyCon -> Maybe OccName
+    owner_occ tc = do
+      raw <- sourceTableTermOcc (nameOccName (tyConName tc))
+      pure $ maybe raw mkVarOcc (stripPrefix "#guard:" (occNameString raw))
+
+    scrutinized_ixs :: FamInstEnvs -> TyCon -> Int -> [Int]
+    scrutinized_ixs fam_envs tc n_args
+      | null lhs_rows = [0 .. n_args - 1]
+      | otherwise
+      = [ i
+        | i <- [0 .. n_args - 1]
+        , any (\row -> i < length row && isNothing (getTyVar_maybe (row !! i))) lhs_rows
+        ]
+      where
+        closed_rows = case closedFamilyTyConCoAxiom_maybe tc of
+          Just ax -> map cab_lhs (fromBranches (coAxiomBranches ax))
+          Nothing -> []
+        open_rows = map fi_tys (familyInstances fam_envs tc)
+        lhs_rows = closed_rows ++ open_rows
+
+    unwrap_term_var :: Type -> Maybe Id
+    unwrap_term_var ty
+      | Just ty' <- coreView ty = unwrap_term_var ty'
+    unwrap_term_var (CastTy ty _) = unwrap_term_var ty
+    unwrap_term_var (TermVarTy v)
+      | isNonCoVarId v
+      , not (isGlobalId v)
+      , not (isUnderscore (nameOccName (idName v)))
+      , not (v `elemVarSet` refined_vars)
+      = Just v
+    unwrap_term_var _ = Nothing
+
+    alg_cons_of :: Id -> Maybe [DataCon]
+    alg_cons_of v
+      | Just (tc, _) <- tcSplitTyConApp_maybe (varType v)
+      , isAlgTyCon tc
+      , not (isNewTyCon tc)
+      , not (isAbstractTyCon tc)
+      , let cons = tyConDataCons tc
+      , not (null cons)
+      = Just cons
+      | otherwise = Nothing
+
+    collect_stuck :: FamInstEnvs -> Type -> [(Id, [DataCon], OccName)]
+    collect_stuck fam_envs = go
+      where
+        go ty | Just ty' <- coreView ty = go ty'
+        go (TyConApp tc args) =
+          let inner = concatMap go args
+              here
+                | isTypeFamilyTyCon tc
+                , Just fun_occ <- owner_occ tc
+                = [ (v, cons, fun_occ)
+                  | i <- scrutinized_ixs fam_envs tc (length args)
+                  , Just v <- [unwrap_term_var (args !! i)]
+                  , Just cons <- [alg_cons_of v]
+                  ]
+                | otherwise = []
+          in inner ++ here
+        go (AppTy t1 t2) = go t1 ++ go t2
+        go (FunTy _ ma w t1 t2) = go ma ++ go w ++ go t1 ++ go t2
+        go (ForAllTy ma _ b) = go ma ++ go b
+        go (DepFunTy _ v b) = go (varType v) ++ go b
+        go (DepDictTy v b) = go (varType v) ++ go b
+        go (ExistsTy _ v b) = go (varType v) ++ go b
+        go (TermAppTy _ a) = go a
+        go (ClassAppTy _ i d o k) = go i ++ go d ++ go o ++ go k
+        go (CastTy t _) = go t
+        go _ = []
+dependentHoleHints _ _ _ _ = return noHints
 
 {- Note [Adding deferred bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
