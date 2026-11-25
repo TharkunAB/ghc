@@ -8,6 +8,7 @@
 module GHC.Tc.Validity (
   Rank(..), UserTypeCtxt(..), checkValidType, checkValidMonoType,
   checkValidTheta, checkConstrainedSignature, checkAssociatedFamilyCoverage,
+  checkStandaloneFamilyCoverage,
   checkValidInstance, checkValidInstHead, validDerivPred,
   checkTySynRhs, checkEscapingKind,
   checkValidCoAxiom, checkValidCoAxBranch,
@@ -37,7 +38,6 @@ import GHC.Tc.Errors ( reportAllUnsolved )
 import GHC.Tc.Errors.Types
 import GHC.Tc.Types.Constraint ( userTypeError_maybe, mkNonCanonical, wc_simple, wc_impl, ic_wanted, ctPred )
 import GHC.Tc.Utils.TcMType (newEvVars, newWanted, newMetaTyVarsX)
-import GHC.Tc.Types.TH ( ThLevel(Comp) )
 import GHC.Tc.Utils.Env (tcLookupId, tcLookupLcl_maybe, tcExtendIdEnv)
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
@@ -81,7 +81,7 @@ import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Var     ( Id, ExistsTyFlag(ImplicitExists), VarBndr(..)
                         , isInvisibleFunArg, isVisibleFunArg, mkTyVar, tyVarName
-                        , isId, isCoVar, varType, setVarType )
+                        , isId, setVarType )
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 import GHC.Types.TyThing ( TyThing(..) )
@@ -604,6 +604,8 @@ familyDomainPrefix n sig
 -- See Note [Associated family domain arguments].
 associatedFamilyDomain :: TyCon -> [Type] -> Either SDoc (Int, PredType)
 associatedFamilyDomain fam args
+  | Just ckind <- standaloneFamilyConstrainedKind_maybe fam
+  = standaloneFamilyDomain fam ckind args
   | Just cls <- tyConAssoc_maybe fam >>= tyConClass_maybe
   = let formals = classTyVars cls
         family_vars = tyConTyVars fam
@@ -628,6 +630,72 @@ associatedFamilyDomain fam args
         [ text "Supply" <+> pprWithCommas (quotes . ppr) (if null omitted then unknown else omitted)
         , text "to determine the instance of" <+> quotes (ppr (className cls)) <> dot ]
   | otherwise = Left (text "The family declaration has no associated class.")
+
+-- | Split the canonical constrained kind of a standalone constrained family
+-- into its aligned family binders, inferred fundep binders, and premises.
+splitStandaloneConstrainedKind :: TyCon -> Kind -> ([TyVar], ThetaType)
+splitStandaloneConstrainedKind fam ckind =
+  let family_vars = tyConTyVars fam
+      (outer_tvs, inner) = split_n (length family_vars) ckind
+      (hidden_raw, phi)  = tcSplitForAllInvisTyVars inner
+      (theta_raw, _)     = tcSplitPhiTy phi
+      base_subst = zipTvSubst outer_tvs (mkTyVarTys family_vars)
+      (subst', hidden_tvs) = substTyVarBndrs base_subst (map snd hidden_raw)
+      theta = substTheta subst' theta_raw
+  in (hidden_tvs, theta)
+  where
+    split_n 0 ty = ([], ty)
+    split_n n (ForAllTy _ (Bndr tv _) rest) =
+      let (tvs, body) = split_n (n - 1) rest in (tv : tvs, body)
+    split_n n (FunTy _ _ _ arg_k rest) =
+      let dummy = mkTyVar (mkSysTvName (mkAlphaTyVarUnique n) (fsLit "_anon")) arg_k
+          (tvs, body) = split_n (n - 1) rest
+      in (dummy : tvs, body)
+    split_n _ ty = ([], ty)
+
+-- | Instantiate a standalone constrained family's domain predicate at a call site.
+standaloneFamilyDomain :: TyCon -> Kind -> [Type] -> Either SDoc (Int, PredType)
+standaloneFamilyDomain fam ckind args =
+  let family_vars = tyConTyVars fam
+      (hidden_tvs, theta) = splitStandaloneConstrainedKind fam ckind
+      needed_vars = closeOverKinds (tyCoVarsOfTypes theta `unionVarSet` tyCoVarsOfTypes (map tyVarKind hidden_tvs))
+      formals = [v | v <- family_vars, v `elemVarSet` needed_vars]
+      supplied = zip family_vars args
+      actuals = mkVarEnv supplied
+      omitted = [v | v <- formals, not (v `elemVarEnv` actuals)]
+      known = closeOverKinds (mkVarSet (map fst supplied))
+      fixed = closeWrtFunDeps theta known
+      unknown = [h | h <- hidden_tvs, not (h `elemVarSet` fixed)]
+  in if not (null omitted && null unknown)
+     then Left $ sep
+       [ text "Supply" <+> pprWithCommas (quotes . ppr) (if null omitted then unknown else omitted)
+       , text "to determine the constraint context of" <+> quotes (ppr (tyConName fam)) <> dot ]
+     else
+       let in_scope = mkInScopeSet (tyCoVarsOfTypes (args ++ theta))
+           subst0 = mkTvSubst in_scope actuals
+           (subst1, hidden_inst) = substTyVarBndrs subst0 hidden_tvs
+           theta_inst = substTheta subst1 theta
+           predicate = case theta_inst of
+             [single] -> single
+             many     -> mkConstraintTupleTy many
+       in Right (length hidden_inst,
+                 mkInfForAllTys [(unmatchableDataConTy, h) | h <- hidden_inst] predicate)
+
+-- | Verify that any omitted variables in a standalone constrained family's
+-- context are determined via functional dependencies by the family's arguments.
+checkStandaloneFamilyCoverage :: TyCon -> TcM ()
+checkStandaloneFamilyCoverage fam
+  | Just ckind <- standaloneFamilyConstrainedKind_maybe fam
+  , let (hidden_tvs, theta) = splitStandaloneConstrainedKind fam ckind
+        known = closeOverKinds (mkVarSet (tyConTyVars fam))
+        fixed = closeWrtFunDeps theta known
+        missing = [h | h <- hidden_tvs, not (h `elemVarSet` fixed)]
+  , not (null missing)
+  = setSrcSpan (getSrcSpan fam) $
+    failWithTc $ TcRnConstrainedFamilyUnsupported fam $
+      hang (text "Missing class parameters in the family declaration")
+           2 (pprWithCommas ppr missing)
+  | otherwise = pure ()
 
 -- | Check the owner after GHC has built the class and its superclasses.
 -- See Note [Associated family domain arguments].

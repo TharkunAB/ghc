@@ -3602,6 +3602,8 @@ lint_branch ax_tc (CoAxBranch { cab_tvs = tvs, cab_cvs = cvs
                               , cab_lhs = lhs_args, cab_rhs = rhs })
   = foldr lint_pattern_binder (lintBinders LambdaBind cvs lint_body) tvs
   where
+    -- Includes Int#, Word#, and Char# closed-family field binders.
+    -- See Note [Unboxed Char# and unboxed tuple promotion] in GHC.Tc.Gen.HsType.
     lint_pattern_binder tv inside
       | ClosedTypeFamilyFlavour <- tyConFlavour ax_tc
       , isPrimFamilyPatBinder lhs_args rhs tv

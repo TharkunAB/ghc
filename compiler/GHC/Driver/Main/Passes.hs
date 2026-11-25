@@ -16,6 +16,7 @@ module GHC.Driver.Main.Passes
       hscCompileCoreExpr'
     , hscCompileCoreExpr
     , hscCompileCoreExprWithOptionalName
+    , hscLoadSameModuleClosedBcos
 
     -- * Running passes separately
     , hscRecompStatus
@@ -111,7 +112,8 @@ import GHC.Core.Dependent ( hasExistentialExpr, hasNativeDependentExpr, rejectNa
                           , supportsNativeGentle, supportsNativeRuleBinds, supportsLocalUserRule )
 import GHC.Core.Lint ( endScopedDictionaryPassIO )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
-import GHC.Core.TyCon (tyConName)
+import GHC.Core.TyCon (TyCon, tyConName, tyConDataCons, isBoxedDataTyCon, isTypeDataTyCon)
+import GHC.Core.DataCon (dataConName)
 import GHC.Core.Tidy           ( tidyExpr )
 import GHC.Core.Utils          ( exprType )
 import GHC.Core.Opt.Pipeline
@@ -2099,6 +2101,100 @@ compileCoreExpr hsc_env srcspan optional ds_expr = do
         value <- lookupFromLoadedEnv interp (idName binding_id)
         pure (Just (expectJust value), links, packages)
       else pure (Nothing, links, packages)
+
+-- | Byte-compile and cache uncached same-module top-level bindings and local
+-- algebraic datatype info tables in the active interpreter for closed type
+-- evaluation. See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
+hscLoadSameModuleClosedBcos
+  :: HscEnv
+  -> SrcSpan
+  -> [TyCon]
+  -> [(Id, CoreExpr)]
+  -> IO ([LinkableUsage], PkgsLoaded)
+hscLoadSameModuleClosedBcos hsc_env srcspan tycons binds = do
+  let interp = hscInterp hsc_env
+  initLoaderState interp hsc_env
+  pls <- getLoaderState interp
+  let bco_st = maybe emptyBytecodeLoaderState bco_loader_state pls
+      missing_tycons =
+        [ tc
+        | tc <- tycons
+        , isBoxedDataTyCon tc && not (isTypeDataTyCon tc)
+        , any (\dc -> isNothing (lookupInfoTableBytecodeState bco_st (dataConName dc)))
+              (tyConDataCons tc)
+        ]
+      missing_binds =
+        [ (v, rhs)
+        | (v, rhs) <- binds
+        , isNothing (lookupNameBytecodeState bco_st (idName v))
+        ]
+  if null missing_tycons && null missing_binds
+    then pure ([], emptyUDFM)
+    else do
+      let missing_names = map (idName . fst) missing_binds
+          localise_id v
+            | idName v `elem` missing_names = mkExportedVanillaId (idName v) (idType v)
+            | otherwise                     = v
+          localise_expr (GHC.Core.Var v)    = GHC.Core.Var (localise_id v)
+          localise_expr e@Lit{}             = e
+          localise_expr (App f a)           = App (localise_expr f) (localise_expr a)
+          localise_expr (Lam b body)        = Lam b (localise_expr body)
+          localise_expr (Let (NonRec b r) body) =
+            Let (NonRec b (localise_expr r)) (localise_expr body)
+          localise_expr (Let (Rec prs) body) =
+            Let (Rec [(b, localise_expr r) | (b, r) <- prs]) (localise_expr body)
+          localise_expr (Case s b ty alts)  =
+            Case (localise_expr s) b ty [Alt c bs (localise_expr r) | Alt c bs r <- alts]
+          localise_expr (Cast e co)         = Cast (localise_expr e) co
+          localise_expr (Tick t e)          = Tick t (localise_expr e)
+          localise_expr (Pack ex_ty wit_ty e) =
+            Pack ex_ty wit_ty (localise_expr e)
+          localise_expr (Unpack tv pv s body) =
+            Unpack tv pv (localise_expr s) (localise_expr body)
+          localise_expr e@Type{}            = e
+          localise_expr e@Coercion{}        = e
+          localised_binds = [ (localise_id v, localise_expr rhs) | (v, rhs) <- missing_binds ]
+          native = any (hasNativeDependentExpr . snd) localised_binds
+          dflags = nativeCodeGenFlags native (hsc_dflags hsc_env)
+          logger = hsc_logger hsc_env
+          ic = hsc_IC hsc_env
+          unit_env = hsc_unit_env hsc_env
+          simplify_expr_opts = initSimplifyExprOpts dflags ic
+      simplified <- forM localised_binds $ \(v, rhs) -> do
+        simpl_rhs <- if hasNativeDependentExpr rhs
+          then pure (if hasExistentialExpr rhs then rhs else simpleOptNativeExpr rhs)
+          else simplifyExpr logger (ue_eps unit_env) simplify_expr_opts rhs
+        pure (v, simpl_rhs)
+      let tidy_occ_env = initTidyOccEnv (map (occName . fst) simplified)
+          tidy_env     = mkEmptyTidyEnv tidy_occ_env
+          tidied       = [ (v, tidyExpr tidy_env rhs) | (v, rhs) <- simplified ]
+      cp_cfg <- initCorePrepConfigFor native hsc_env
+      prepd <- forM tidied $ \(v, rhs) -> do
+        prepd_rhs <- corePrepExpr logger cp_cfg rhs
+        pure (v, prepd_rhs)
+      u <- uniqFromTag BcoTag
+      let this_mod = mkInteractiveModule ("SameModClosed_" ++ show u)
+          this_loc = OsPathModLocation
+            { ml_hs_file_ospath       = Nothing
+            , ml_hi_file_ospath       = panic "hscLoadSameModuleClosedBcos:ml_hi_file_ospath"
+            , ml_obj_file_ospath      = panic "hscLoadSameModuleClosedBcos:ml_obj_file_ospath"
+            , ml_dyn_obj_file_ospath  = panic "hscLoadSameModuleClosedBcos:ml_dyn_obj_file_ospath"
+            , ml_dyn_hi_file_ospath   = panic "hscLoadSameModuleClosedBcos:ml_dyn_hi_file_ospath"
+            , ml_hie_file_ospath      = panic "hscLoadSameModuleClosedBcos:ml_hie_file_ospath"
+            , ml_bytecode_file_ospath = panic "hscLoadSameModuleClosedBcos:ml_bytecode_file_ospath"
+            }
+          core_binds = if null prepd then [] else [Rec prepd]
+      (stg_binds_with_deps, _, _, _) <-
+        myCoreToStg logger dflags (interactiveInScope ic) True this_mod this_loc core_binds
+      let (stg_binds, _) = unzip stg_binds_with_deps
+      case interp of
+        Interp { interpInstance = ExternalInterp (ExtJS _) } ->
+          throwGhcExceptionIO (ProgramError "Same-module closed type evaluation is not supported on the JS external interpreter.")
+        _ -> do
+          bcos <- byteCodeGen hsc_env this_mod stg_binds missing_tycons Nothing [] Strict.Nothing
+          bco_time <- getCurrentTime
+          mbc <- ByteCode.mkModuleByteCode this_mod bcos []
+          loadDecls interp hsc_env srcspan (Linkable bco_time this_mod (NE.singleton (DotGBC mbc)))
 
 
 

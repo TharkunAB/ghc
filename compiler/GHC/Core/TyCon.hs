@@ -63,6 +63,7 @@ module GHC.Core.TyCon(
         isFamilyTyCon, isOpenFamilyTyCon, famTyConHasInjectivity,
         isTypeFamilyTyCon, isDataFamilyTyCon,
         isOpenTypeFamilyTyCon, isConstrainedFamilyTyCon,
+        standaloneFamilyConstrainedKind_maybe,
         closedTypeFamily_maybe,
         builtInClosedTyFamTyCon_maybe,
         closedFamilyTyConCoAxiom_maybe, closedFamilyScope_maybe,
@@ -158,7 +159,7 @@ import {-# SOURCE #-} GHC.Core.DataCon
    , dataConTyCon, dataConFullSig
    , isUnboxedSumDataCon, isTypeDataCon )
 import {-# SOURCE #-} GHC.Core.Type
-   ( isLiftedTypeKind )
+   ( isLiftedTypeKind, hasConstraintPremise )
 import GHC.Builtin.Uniques
   ( tyConRepNameUnique
   , dataConTyRepNameUnique )
@@ -2331,11 +2332,31 @@ mkFamilyTyCon :: Name
               -> Maybe Name -> FamTyConFlav
               -> Maybe Class -> Injectivity -> TyCon
 mkFamilyTyCon name kind binders nb_eta res_kind resVar flav parent inj
-  = mkTyCon name kind binders nb_eta res_kind (constRoles binders Nominal) $
-    FamilyTyCon { famTcResVar  = resVar
-                , famTcFlav    = flav
-                , famTcParent  = classTyCon <$> parent
-                , famTcInj     = inj }
+  = mkTyCon name effective_kind binders nb_eta res_kind (constRoles binders Nominal) $
+    FamilyTyCon { famTcResVar = resVar
+                , famTcFlav   = flav
+                , famTcParent = effective_parent
+                , famTcInj    = inj }
+  where
+    -- Do not force flav here because forkM axiom knots in GHC.IfaceToCore
+    -- inspect tyConKind before flav is ready.
+    is_standalone_constrained =
+      isNothing parent && hasConstraintPremise kind
+
+    effective_kind
+      | is_standalone_constrained
+      = mkTyConKindWithMatchability unmatchableDataConTy binders res_kind
+      | otherwise
+      = kind
+
+    effective_parent = case parent of
+      Just cls -> Just (classTyCon cls)
+      Nothing
+        | is_standalone_constrained -> Just domain_carrier
+        | otherwise                 -> Nothing
+
+    domain_carrier =
+      mkSynonymTyCon name kind [] constraintKind [] kind Nothing False False False False
 
 -- | Create a promoted data constructor 'TyCon'
 -- Somewhat dodgily, we give it the same Name
@@ -2634,9 +2655,18 @@ isOpenTypeFamilyTyCon (TyCon { tyConDetails = details })
   | FamilyTyCon {famTcFlav = ConstrainedTypeFamilyTyCon } <- details = True
   | otherwise                                                 = False
 
+-- | Return the canonical constrained kind of a standalone constrained type
+-- family, if any.
+standaloneFamilyConstrainedKind_maybe :: TyCon -> Maybe Kind
+standaloneFamilyConstrainedKind_maybe (TyCon { tyConDetails = FamilyTyCon { famTcParent = Just tc } })
+  | not (isClassTyCon tc)
+  = synTyConRhs_maybe tc
+standaloneFamilyConstrainedKind_maybe _ = Nothing
+
 isConstrainedFamilyTyCon :: TyCon -> Bool
 isConstrainedFamilyTyCon tc
   | Just ConstrainedTypeFamilyTyCon <- famTyConFlav_maybe tc = True
+  | isJust (standaloneFamilyConstrainedKind_maybe tc) = True
   | otherwise = False
 
 -- | Is this the 'TyCon' of a closed type family?
@@ -2872,7 +2902,7 @@ isImplicitTyCon (TyCon { tyConName = name, tyConDetails = details }) = go detail
     go (PromotedDataCon {}) = True
     go (SynonymTyCon {})    = False
     go (TcTyCon {})         = False
-    go (FamilyTyCon { famTcParent = parent }) = isJust parent
+    go (FamilyTyCon { famTcParent = parent }) = maybe False isClassTyCon parent
     go (AlgTyCon { algTcRhs = rhs })
        | TupleTyCon {} <- rhs = isWiredInName name
        | SumTyCon {} <- rhs   = True
@@ -3325,11 +3355,12 @@ tyConFlavour (TyCon { tyConDetails = details })
                   AbstractTyCon {}   -> AbstractTypeFlavour
 
   | FamilyTyCon { famTcFlav = flav, famTcParent = parent } <- details
+  , let assoc_parent = parent >>= \tc -> if isClassTyCon tc then Just tc else Nothing
   = case flav of
-      DataFamilyTyCon{}       -> OpenFamilyFlavour (IAmData DataType) parent
-      OpenTypeFamilyTyCon     -> OpenFamilyFlavour IAmType parent
-      ConstrainedTypeFamilyTyCon -> OpenFamilyFlavour IAmType parent
-      ClosedTypeFamilyTyCon{} -> ClosedTypeFamilyFlavour
+      DataFamilyTyCon{}          -> OpenFamilyFlavour (IAmData DataType) assoc_parent
+      OpenTypeFamilyTyCon        -> OpenFamilyFlavour IAmType assoc_parent
+      ConstrainedTypeFamilyTyCon -> OpenFamilyFlavour IAmType assoc_parent
+      ClosedTypeFamilyTyCon{}    -> ClosedTypeFamilyFlavour
 
   | SynonymTyCon {} <- details                  = TypeSynonymFlavour
   | PrimTyCon {} <- details                     = BuiltInTypeFlavour

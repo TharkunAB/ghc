@@ -68,7 +68,7 @@ import GHC.Iface.Type (IfaceType(..), IfaceBndr(..), IfaceAppArgs(..), IfaceTyCo
                        getIfaceType, putIfaceType, ifaceTypeSharedByte,
                        IfaceEvidence(..), IfaceEvidenceVersion)
 import GHC.Core.TyCon (isInferredTyConBinder, isVisibleTyConBinder)
-import GHC.Types.Var (VarBndr(..), isVisibleFunArg)
+import GHC.Types.Var (VarBndr(..), isInvisibleFunArg, isVisibleFunArg)
 
 import GHC.Data.FastMutInt
 import GHC.Data.Maybe( orElse )
@@ -680,6 +680,12 @@ constrainedFamilyIfaceVersion = show hiVersion ++ "-constrained-families-v1"
 
 hasConstrainedFamily :: IfaceDecl -> Bool
 hasConstrainedFamily IfaceFamily{ifFamFlav = IfaceConstrainedTypeFamilyTyCon} = True
+hasConstrainedFamily IfaceFamily{ifKind = kind} = iface_kind_has_constraint kind
+  where
+    iface_kind_has_constraint (IfaceForAllTy _ _ rest) = iface_kind_has_constraint rest
+    iface_kind_has_constraint (IfaceFunTy af _ _ _ rest)
+      = isInvisibleFunArg af || iface_kind_has_constraint rest
+    iface_kind_has_constraint _ = False
 hasConstrainedFamily IfaceClass{ifBody = IfConcreteClass{ifATs = ats}} =
   any (\(IfaceAT decl _) -> hasConstrainedFamily decl) ats
 hasConstrainedFamily _ = False

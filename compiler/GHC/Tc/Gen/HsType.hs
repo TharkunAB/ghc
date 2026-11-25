@@ -15,7 +15,7 @@ module GHC.Tc.Gen.HsType (
         kcClassSigType, tcClassSigType,
         tcHsSigType, tcHsSigWcType,
         tcHsPartialSigType, PendingSigCalls(..),
-        tcStandaloneKindSig,
+        tcStandaloneKindSig, tcStandaloneKindSigWithDomain,
         funsSigCtxt, addSigCtxt, pprSigCtxt,
 
         tcHsClsInstType,
@@ -146,6 +146,7 @@ import GHC.Builtin( allNameStrings )
 import GHC.Builtin.Modules (gHC_INTERNAL_TYPENATS)
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs (typeRepIdOcc)
+import GHC.Builtin.Uniques (mkAlphaTyVarUnique)
 import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.WiredIn.Prim
 
@@ -1329,13 +1330,150 @@ top level of a signature.
 -- Does validity checking and zonking.
 tcStandaloneKindSig :: TyClDecl GhcRn
                     -> LStandaloneKindSig GhcRn -> TcM (Name, Kind)
-tcStandaloneKindSig decl (L _ (StandaloneKindSig _ (L _ name) ksig))
+tcStandaloneKindSig decl ksig = do
+  (name, pure_kind, _) <- tcStandaloneKindSigWithDomain decl ksig
+  return (name, pure_kind)
+
+-- | Check a standalone kind signature and extract an optional canonical
+-- constrained kind for top-level open or closed type families under
+-- @ExperimentalDependentTypes@.
+tcStandaloneKindSigWithDomain :: TyClDecl GhcRn
+                              -> LStandaloneKindSig GhcRn
+                              -> TcM (Name, Kind, Maybe Kind)
+tcStandaloneKindSigWithDomain decl (L _ (StandaloneKindSig _ (L _ name) ksig))
   = addSigCtxt ctxt (UserLHsSigType ksig) $
-    do { kind <- tc_top_lhs_type_x (Just decl) KindLevel ctxt ksig
-       ; checkValidType ctxt kind
-       ; return (name, kind) }
+    do { raw_kind <- tc_top_lhs_type_x (Just decl) KindLevel ctxt ksig
+       ; edt <- xoptM LangExt.ExperimentalDependentTypes
+       ; case if edt && is_top_type_family decl
+                then splitStandaloneFamilyConstrainedKind decl raw_kind
+                else Nothing of
+           Just (pure_kind, theta, ckind)
+             | not (any isEqPred theta) -> do
+                 checkValidType ctxt pure_kind
+                 checkValidTheta SigmaCtxt theta
+                 return (name, pure_kind, Just ckind)
+           _ -> do
+             checkValidType ctxt raw_kind
+             return (name, raw_kind, Nothing) }
   where
    ctxt = StandaloneKindSigCtxt name
+   is_top_type_family (FamDecl _ FamilyDecl{fdInfo = OpenTypeFamily{}})   = True
+   is_top_type_family (FamDecl _ FamilyDecl{fdInfo = ClosedTypeFamily{}}) = True
+   is_top_type_family _ = False
+
+-- | Split top-level class premises out of a type family's standalone kind
+-- signature, rewriting term-style @Collects c => c -> ...@ arguments into
+-- visible @forall c ->@ binders and building a canonical constrained kind.
+splitStandaloneFamilyConstrainedKind
+  :: TyClDecl GhcRn -> Kind -> Maybe (Kind, ThetaType, Kind)
+splitStandaloneFamilyConstrainedKind decl raw_kind
+  | null theta = Nothing
+  | otherwise  = Just (pure_kind, theta, canonical_kind)
+  where
+    HsQTvs { hsq_explicit = hs_bndrs } = tyClDeclTyVars decl
+    vis_hs_bndrs = [b | L _ b@(HsTvb _ HsBndrRequired{} _ _) <- hs_bndrs]
+
+    split_pis ty
+      | Just (ma, bndr, rest) <- splitPiTy_maybe ty
+      = let (pis, res) = split_pis rest in ((ma, bndr) : pis, res)
+      | otherwise = ([], ty)
+
+    (all_pis, res_kind) = split_pis raw_kind
+    is_constraint_pi (_, Anon _ af) = isInvisibleFunArg af
+    is_constraint_pi _              = False
+
+    theta   = [pred_ty | (_, Anon (Scaled _ pred_ty) af) <- all_pis, isInvisibleFunArg af]
+    val_pis = filter (not . is_constraint_pi) all_pis
+    theta_fvs = tyCoVarsOfTypes theta
+
+    invis_candidates =
+      [ tv
+      | (_, Named (Bndr tv vis)) <- val_pis
+      , isInvisibleForAllTyFlag vis
+      , tv `elemVarSet` theta_fvs ]
+
+    vis_pis = [b | (_, b) <- val_pis, not (isInvisiblePiTyBinder b)]
+
+    promoted_tvs = mkVarSet
+      [ tv
+      | tv <- invis_candidates
+      , [vis_idx] <- [anon_positions tv]
+      , not (tv `elemVarSet` other_fvs tv vis_idx)
+      , not (has_explicit_hs_kind vis_idx) ]
+
+    anon_positions tv =
+      [ i
+      | (i, Anon (Scaled _ arg_ty) af) <- zip [0 :: Int ..] vis_pis
+      , isVisibleFunArg af
+      , Just v <- [getTyVar_maybe arg_ty]
+      , v == tv ]
+
+    other_fvs tv vis_idx =
+      let vis_other_fvs = unionVarSets
+            [ pi_fvs b
+            | (i, b) <- zip [0 :: Int ..] vis_pis
+            , i /= vis_idx ]
+          invis_other_fvs = unionVarSets
+            [ tyCoVarsOfType (tyVarKind v)
+            | (_, Named (Bndr v vis)) <- val_pis
+            , isInvisibleForAllTyFlag vis
+            , v /= tv ]
+      in vis_other_fvs `unionVarSet` invis_other_fvs `unionVarSet` tyCoVarsOfType res_kind
+
+    pi_fvs (Named (Bndr v _))       = tyCoVarsOfType (tyVarKind v)
+    pi_fvs (Anon (Scaled m ty) _)   = tyCoVarsOfType m `unionVarSet` tyCoVarsOfType ty
+
+    has_explicit_hs_kind vis_idx =
+      case drop vis_idx vis_hs_bndrs of
+        HsTvb _ _ _ HsBndrKind{} : _ -> True
+        _ -> False
+
+    val_pis1 = mapMaybe rewrite_pi val_pis
+    rewrite_pi (_, Named (Bndr tv vis))
+      | isInvisibleForAllTyFlag vis, tv `elemVarSet` promoted_tvs
+      = Nothing
+    rewrite_pi (ma, Anon (Scaled _ arg_ty) af)
+      | isVisibleFunArg af
+      , Just tv <- getTyVar_maybe arg_ty
+      , tv `elemVarSet` promoted_tvs
+      = Just (ma, Named (Bndr tv Required))
+    rewrite_pi pair = Just pair
+
+    explicit_invis_hs =
+      any (\(L _ (HsTvb _ flag _ _)) -> case flag of
+               HsBndrRequired{}  -> False
+               HsBndrInvisible{} -> True) hs_bndrs
+
+    (kept_pis, hidden_tvs) = partition_pis val_pis1
+    partition_pis [] = ([], [])
+    partition_pis ((_, Named (Bndr tv vis)) : rest)
+      | isInvisibleForAllTyFlag vis
+      , not explicit_invis_hs
+      , let (rest_kept, rest_hidden) = partition_pis rest
+            used_later = tyCoVarsOfType res_kind `unionVarSet`
+                         unionVarSets (map (pi_fvs . snd) rest_kept)
+      , not (tv `elemVarSet` used_later)
+      = (rest_kept, tv : rest_hidden)
+    partition_pis (p : rest) =
+      let (rest_kept, rest_hidden) = partition_pis rest
+      in (p : rest_kept, rest_hidden)
+
+    mk_pi (ma, Named b) rest = ForAllTy ma b rest
+    mk_pi (ma, Anon (Scaled m arg_ty) af) rest = FunTy af ma m arg_ty rest
+
+    pure_kind = foldr mk_pi res_kind kept_pis
+
+    inner_constrained =
+      mkInfForAllTys [(unmatchableDataConTy, h) | h <- hidden_tvs]
+                     (tcMkDFunPhiTy theta res_kind)
+
+    mk_canonical (i, (ma, Named b)) rest =
+      let _ = i in ForAllTy ma b rest
+    mk_canonical (i, (ma, Anon (Scaled _ arg_k) _)) rest =
+      let anon_tv = mkTyVar (mkSysTvName (mkAlphaTyVarUnique (i + 1)) (fsLit "_anon")) arg_k
+      in ForAllTy ma (Bndr anon_tv Required) rest
+
+    canonical_kind = foldr mk_canonical inner_constrained (zip [0 :: Int ..] kept_pis)
 
 tcTopLHsType :: UserTypeCtxt -> LHsSigType GhcRn -> TcM Type
 tcTopLHsType ctxt lsig_ty
@@ -1504,19 +1642,24 @@ declKindPrefix decl = go hs_bndrs
       | otherwise = []
     go hs_bndrs@(hs_bndr : rest) kind
       | Just (ma, bndr, body) <- splitPiTy_maybe kind
-      , let vis = case bndr of
-                    Named (Bndr _ vis) -> NamedTCB vis
-                    Anon{} -> AnonTCB
-      = if zippableTyConBinder vis (hsTyVarBndrFlag (unLoc hs_bndr))
-        then (ma,bndr) : go rest body
-        else if skippableTyConBinder vis
-             then (ma,bndr) : go hs_bndrs body
-             else [] -- The header matcher reports incompatible visibility.
+      = case bndr of
+          Anon _ af | isInvisibleFunArg af -> go hs_bndrs body
+          _ ->
+            let vis = case bndr of
+                        Named (Bndr _ vis) -> NamedTCB vis
+                        Anon{} -> AnonTCB
+            in if zippableTyConBinder vis (hsTyVarBndrFlag (unLoc hs_bndr))
+               then (ma,bndr) : go rest body
+               else if skippableTyConBinder vis
+                    then (ma,bndr) : go hs_bndrs body
+                    else [] -- The header matcher reports incompatible visibility.
       | otherwise = [] -- The header matcher reports missing binders.
 
     eta_prefix kind
       | Just (ma, bndr, body) <- splitPiTy_maybe kind
-      = (ma,bndr) : eta_prefix body
+      = case bndr of
+          Anon _ af | isInvisibleFunArg af -> eta_prefix body
+          _ -> (ma,bndr) : eta_prefix body
       | otherwise = []
 
 -- | Default unresolved local arrow metadata before kind generalization.
@@ -2593,6 +2736,12 @@ tc_hs_lit_ty mode rn_ty (HsString _ s) exp_kind
 tc_hs_lit_ty mode rn_ty (HsChar _ c) exp_kind
   = do checkWiredInTyCon charTyCon
        checkExpKind mode rn_ty (mkCharLitTy c) charTy exp_kind
+tc_hs_lit_ty mode rn_ty lit@(HsCharPrim _ c) exp_kind
+  = do { native <- xoptM LangExt.ExperimentalDependentTypes
+       ; if native
+           then do { checkWiredInTyCon charTyCon
+                   ; checkExpKind mode rn_ty (mkCharPrimLitTy c) charPrimTy exp_kind }
+           else failWithTc (TcRnUnpromotableLit lit) }
 tc_hs_lit_ty mode rn_ty lit exp_kind
   | Just (mk_prim_lit, kind) <- prim_lit lit
   = do { native <- xoptM LangExt.ExperimentalDependentTypes
@@ -2705,8 +2854,89 @@ tc_hs_tuple_ty rn_ty mode HsBoxedOrConstraintTuple hs_tys exp_kind
                           | ((L loc hs_ty),ty,kind) <- zip3 hs_tys tys kinds ]
 
        ; finish_tuple mode rn_ty tup_sort tys' (map (const arg_kind) tys') exp_kind }
+tc_hs_tuple_ty rn_ty mode HsUnboxedTuple tys exp_kind
+  | isTypeLevel (mode_tyki mode)
+  = do { edt <- xoptM LangExt.ExperimentalDependentTypes
+       ; ubx <- xoptM LangExt.UnboxedTuples
+       ; if edt && ubx
+           then tc_promoted_or_unboxed_tuple rn_ty mode tys exp_kind
+           else tc_tuple rn_ty mode UnboxedTuple tys exp_kind }
 tc_hs_tuple_ty rn_ty mode HsUnboxedTuple tys exp_kind =
     tc_tuple rn_ty mode UnboxedTuple tys exp_kind
+
+-- | Elaborate @(# t1, ..., tn #)@ as a promoted unboxed tuple value when the
+-- expected kind is @(# k1, ..., kn #)@ or when all inferred elements are
+-- promoted values of lifted kinds. Fall back to the unboxed tuple type form
+-- otherwise. See Note [Unboxed Char# and unboxed tuple promotion].
+tc_promoted_or_unboxed_tuple
+  :: HsType GhcRn -> TcTyMode -> [LHsType GhcRn] -> TcKind -> TcM TcType
+tc_promoted_or_unboxed_tuple rn_ty mode tys exp_kind = do
+  exp_kind' <- liftZonkM (zonkTcType exp_kind)
+  case tcSplitTyConApp_maybe exp_kind' of
+    Just (tc, kind_args)
+      | isUnboxedTupleTyCon tc
+      , let tup_arity = tyConArity tc `div` 2
+      , arity == tup_arity
+      -> do { checkTupSize arity
+            ; let (rep_tys, elem_kinds) = splitAt tup_arity kind_args
+                  reps = replicate arity liftedRepTy
+            ; zipWithM_ (\hs_ty rep_ty ->
+                discardResult $
+                  unifyKind (Just (HsTypeRnThing (unLoc hs_ty))) rep_ty liftedRepTy)
+                tys rep_tys
+            ; tau_tys <- zipWithM (tc_check_lhs_type mode) tys elem_kinds
+            ; let prom_tc  = promotedTupleDataCon Unboxed arity
+                  prom_ty  = mkTyConApp prom_tc (reps ++ elem_kinds ++ tau_tys)
+                  act_kind = mkTyConApp tc (reps ++ elem_kinds)
+            ; checkExpectedKind mode rn_ty prom_ty act_kind exp_kind }
+    _ | Just tv <- getTyVar_maybe exp_kind'
+      , isMetaTyVar tv
+      , arity > 0
+      -> do { (tau_tys, tau_kinds) <- mapAndUnzipM (tc_infer_lhs_type mode) tys
+            ; tau_kinds' <- liftZonkM (mapM zonkTcType tau_kinds)
+            ; if all is_promoted_lifted_elem_kind tau_kinds'
+                then do { checkTupSize arity
+                        ; let reps     = replicate arity liftedRepTy
+                              prom_tc  = promotedTupleDataCon Unboxed arity
+                              tup_tc   = tupleTyCon Unboxed arity
+                              prom_ty  = mkTyConApp prom_tc (reps ++ tau_kinds' ++ tau_tys)
+                              act_kind = mkTyConApp tup_tc (reps ++ tau_kinds')
+                        ; checkExpectedKind mode rn_ty prom_ty act_kind exp_kind }
+                else finish_tuple mode rn_ty UnboxedTuple tau_tys tau_kinds' exp_kind }
+    _ -> tc_tuple rn_ty mode UnboxedTuple tys exp_kind
+  where
+    arity = length tys
+    is_promoted_lifted_elem_kind k =
+      isNothing (kindRep_maybe k) && tcIsLiftedTypeKind (typeKind k)
+
+{- Note [Unboxed Char# and unboxed tuple promotion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under ExperimentalDependentTypes (and DependentTypes), GHC extends DataKinds
+promotion to two unboxed value forms:
+
+1. Primitive character literals and C# pattern binders:
+   * A type-level primitive character literal such as 'a'# elaborates to
+     mkCharPrimLitTy 'a' (TyConApp charPrimLitTyCon [LitTy (CharTyLit 'a')])
+     of kind Char#. Because charPrimLitTyCon is a wired-in generative nominal
+     PrimTyCon, 'C# 'a'# :: Char unifies and proves apartness in closed type
+     families without adding a new IfaceTyLit tag.
+   * Closed type family patterns may match 'C# c, 'C# _, and 'C# (c :: Char#)
+     using the scope-restricted primitive pattern-binder judgment in
+     Note [Primitive family pattern binders] in GHC.Core.Type.
+
+2. Promoted unboxed tuples at lifted element kinds (when UnboxedTuples is
+   enabled):
+   * At KindLevel, (# a, b #) defaults element kinds to Type (liftedRepTy) and
+     tc_fun_type_x permits lifted unboxed tuple kinds (# a, b #) on either side
+     of a kind arrow (for example, type FstU :: (# a, b #) -> a and
+     type SwapU :: (# a, b #) -> (# b, a #)).
+   * At TypeLevel, (# x, y #) (punned) and '(# x, y #) (explicitly ticked)
+     elaborate to promotedTupleDataCon Unboxed arity with RuntimeRep arguments
+     fixed to LiftedRep, yielding kind (# a, b #). When the expected kind is an
+     unconstrained metavariable, (# t1, t2 #) promotes only when every element
+     has a value kind k :: Type (keeping (# Int, Bool #) as an unboxed tuple
+     type).
+-}
 
 {-
 Note [Kind-checking explicit lists]
@@ -3079,8 +3309,19 @@ tc_fun_type_x check type_level_ma mode mult ty1 ty2 exp_kind = case mode_tyki mo
                       (tcMkVisFunTy ma (fromMaybe manyDataConTy mult') ty1' ty2')
                       liftedTypeKind exp_kind }
   KindLevel ->  -- no representation polymorphism in kinds. yet.
-    do { ty1'  <- check ty1 liftedTypeKind
-       ; ty2'  <- check ty2 liftedTypeKind
+    do { edt <- xoptM LangExt.ExperimentalDependentTypes
+       ; ubx <- xoptM LangExt.UnboxedTuples
+       ; (ty1', ty2') <-
+           if edt && ubx
+             then do { arg_k <- newOpenTypeKind
+                     ; res_k <- newOpenTypeKind
+                     ; t1 <- check ty1 arg_k
+                     ; t2 <- check ty2 res_k
+                     ; check_kind_fun_endpoint ty1 t1 arg_k
+                     ; check_kind_fun_endpoint ty2 t2 res_k
+                     ; pure (t1, t2) }
+             else (,) <$> check ty1 liftedTypeKind
+                      <*> check ty2 liftedTypeKind
        ; (mult', explicit_ma) <- tc_arrow_modifiers mode mult
        ; ma <- case explicit_ma of
                  Just ma -> pure ma
@@ -3089,6 +3330,21 @@ tc_fun_type_x check type_level_ma mode mult ty1 ty2 exp_kind = case mode_tyki mo
        ; checkExpKind mode (HsFunTy noExtField mult ty1 ty2)
                       (tcMkVisFunTy ma (fromMaybe manyDataConTy mult') ty1' ty2')
                       liftedTypeKind exp_kind }
+  where
+    -- Admit (# a, b #) with lifted element kinds as a kind-arrow endpoint.
+    -- See Note [Unboxed Char# and unboxed tuple promotion].
+    check_kind_fun_endpoint hs_end end_ty end_kind = do
+      end_ty' <- liftZonkM (zonkTcType end_ty)
+      unless (is_lifted_ubx_tuple end_ty') $
+        discardResult $
+          unifyKind (Just (HsTypeRnThing (unLoc hs_end))) end_kind liftedTypeKind
+
+    is_lifted_ubx_tuple ty
+      | Just (tc, args) <- tcSplitTyConApp_maybe ty
+      , isUnboxedTupleTyCon tc
+      , let reps = take (tyConArity tc `div` 2) args
+      = all (`tcEqType` liftedRepTy) reps
+      | otherwise = False
 
 {- Note [Skolem escape and forall-types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3139,9 +3395,14 @@ tupKindSort_maybe k
 
 tc_tuple :: HsType GhcRn -> TcTyMode -> TupleSort -> [LHsType GhcRn] -> TcKind -> TcM TcType
 tc_tuple rn_ty mode tup_sort tys exp_kind
-  = do { arg_kinds <- case tup_sort of
+  = do { edt <- xoptM LangExt.ExperimentalDependentTypes
+       ; arg_kinds <- case tup_sort of
            BoxedTuple      -> return (replicate arity liftedTypeKind)
-           UnboxedTuple    -> replicateM arity newOpenTypeKind
+           UnboxedTuple
+             | KindLevel <- mode_tyki mode, edt
+             -> return (replicate arity liftedTypeKind)
+             | otherwise
+             -> replicateM arity newOpenTypeKind
            ConstraintTuple -> return (replicate arity constraintKind)
        ; tau_tys <- zipWithM (tc_check_lhs_type mode) tys arg_kinds
        ; finish_tuple mode rn_ty tup_sort tau_tys arg_kinds exp_kind }
@@ -3354,12 +3615,30 @@ tc_app_ty_external mode rn_ty exp_kind
                      ; case observed of
                          Just (result, result_kind) ->
                            checkExpKind mode rn_ty result result_kind exp_kind
-                         Nothing -> unsupported name }
-             (_, Just _, Just [arg])
-               | isTypeLevel (mode_tyki mode), ordinary_call
-               , isJust (closedCallLiteralKind arg)
-               -> failWithTc (TcRnClosedTypeEval name
-                    "Closed type evaluation requires an imported definition. This function belongs to the module being compiled.")
+                         Nothing -> executable_call fun args }
+             (_, Just (fun, _), Just [arg])
+               | isTypeLevel (mode_tyki mode)
+               , Just (wildcards, call_owner, pending) <- mode_pending_calls mode
+               , Just (owner_level, HM_Sig) <- mode_holes mode
+               , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ operand))) <- ignoreParens arg
+               , Just _ <- lookupNameEnv wildcards operand
+               -> do { (domain, result_kind) <- tcClosedCallKinds Nothing name (varType fun) arg RetryClosedOperand
+                     ; tcCheckClosedCallContext name
+                     ; case call_owner of
+                         RetrySigCalls -> return ()
+                         RejectSigCalls -> failWithTc (TcRnClosedTypeEval name
+                           ("This binding group has a pattern binding with an explicit multiplicity. " ++
+                            "Give the binding that uses this call a complete type signature."))
+                     ; checked <- tc_check_lhs_type mode arg domain
+                     ; result <- setTcLevel owner_level (newFlexiTyVarTy result_kind)
+                     ; call_span <- getSrcSpanM
+                     ; updTcRef pending (TcPendingTypeCall call_span fun checked result :)
+                     ; checkExpKind mode rn_ty result result_kind exp_kind }
+             (_, Just (fun, _), Just args)
+               | isTypeLevel (mode_tyki mode)
+               , not (null args)
+               , ordinary_call || (ready_partial_call && length args == 1)
+               -> executable_call fun args
              _ -> unsupported name
            else imported_call env rdr name }
 
@@ -3602,27 +3881,40 @@ tc_app_ty_external mode rn_ty exp_kind
   , Just args <- traverse value_arg (filterOut is_par hs_args)
   , not (null args)
   , isTypeLevel (mode_tyki mode)
-  , ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call)
-  = do { staging <- closedOperandStaging args
-       ; executable <- tcClosedCaseExecutableOwner False rdr name args staging
-       ; case executable of
-           Just owner -> run loc (\hint -> tcPlanExecutableCase mode ordinary_call hint owner args)
+  , ordinary_call || (lengthIs args 1 && ready_partial_call)
+  = do { fallback <- localFallbackFamilyOwner name
+       ; case fallback of
+           Just fun -> setSrcSpanA loc (fallback_executable_call fun args)
            Nothing
-             | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args
-             -> do { table <- tcLookupTyCon name
-                   ; checkOpenCallbackInterfaces table args
-                   ; mapM_ checkNominalCallback args
-                   ; tc_app_ty_generic mode rn_ty exp_kind }
-             | ordinary_call, any nominalCallback args
-             -> do { mapM_ checkNominalCallback args
-                   ; tc_app_ty_generic mode rn_ty exp_kind }
-             | ordinary_call, staging == Just True
-             -> do { table <- tcLookupTyCon name
-                   ; if supportsClosedFamilyTree table args
-                       then run loc (\hint -> tcPlanClosedTree mode True hint (CheckClosedCase table) args)
-                       else tc_app_ty_generic mode rn_ty exp_kind }
-           Nothing -> tc_app_ty_generic mode rn_ty exp_kind }
+             | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
+                 staging <- closedOperandStaging args
+                 executable <- tcClosedCaseExecutableOwner False rdr name args staging
+                 case executable of
+                   Just owner -> run loc (\hint -> tcPlanExecutableCase mode ordinary_call hint owner args)
+                   Nothing
+                     | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args
+                     -> do { table <- tcLookupTyCon name
+                           ; checkOpenCallbackInterfaces table args
+                           ; mapM_ checkNominalCallback args
+                           ; tc_app_ty_generic mode rn_ty exp_kind }
+                     | ordinary_call, any nominalCallback args
+                     -> do { mapM_ checkNominalCallback args
+                           ; tc_app_ty_generic mode rn_ty exp_kind }
+                     | ordinary_call, staging == Just True
+                     -> do { table <- tcLookupTyCon name
+                           ; if supportsClosedFamilyTree table args
+                               then run loc (\hint -> tcPlanClosedTree mode True hint (CheckClosedCase table) args)
+                               else tc_app_ty_generic mode rn_ty exp_kind }
+                   Nothing -> tc_app_ty_generic mode rn_ty exp_kind
+             | otherwise -> tc_app_ty_generic mode rn_ty exp_kind }
   where
+    fallback_executable_call fun args = do
+      hint <- closedCallResultHint ordinary_call exp_kind
+      (result_kind, plan) <- tcPlanOrdinaryCall mode ordinary_call hint fun args
+      checkClosedCallExpectedKind rn_ty exp_kind result_kind
+      run_plan <- prepareClosedCallResult result_kind plan
+      result <- run_plan
+      checkExpKind mode rn_ty result result_kind exp_kind
     (hs_fun_ty, hs_args) = splitHsAppTys rn_ty
     is_par HsArgPar{} = True
     is_par _ = False
@@ -4235,26 +4527,35 @@ tcPlanClosedTree mode ordinary hint root arguments = do
       | Just (loc, rdr, child, args) <- nestedClosedCall arg
       , isSourceFamilyName child, ordinary
       = setSrcSpan loc $ do
-          staging <- closedOperandStaging args
-          table <- tcLookupTyCon child
-          if admissibleFamilyOperands args staging && supportsClosedFamilyTree table args
-            then do
-              executable <- tcClosedCaseExecutableOwner True rdr child args staging
-              case executable of
-                Just fun -> collect False fun (Just expected) args
-                Nothing -> collect_family table (Just expected) args
-            else return (ClosedBoundary arg expected)
+          fallback <- localFallbackFamilyOwner child
+          case fallback of
+            Just fun
+              | any bare_empty args -> return (ClosedBoundary arg expected)
+              | otherwise           -> collect False fun (Just expected) args
+            Nothing -> do
+              staging <- closedOperandStaging args
+              table <- tcLookupTyCon child
+              if admissibleFamilyOperands args staging && supportsClosedFamilyTree table args
+                then do
+                  executable <- tcClosedCaseExecutableOwner True rdr child args staging
+                  case executable of
+                    Just fun -> collect False fun (Just expected) args
+                    Nothing -> collect_family table (Just expected) args
+                else return (ClosedBoundary arg expected)
       | Just (loc, _, child, args) <- nestedClosedCall arg
       = if isSourceFamilyName child || any bare_empty args
           then return (ClosedBoundary arg expected)
           else setSrcSpan loc $ do
             env <- getGblEnv
-            when (nameIsLocalOrFrom (tcg_semantic_mod env) child) $
-              failWithTc (TcRnNoSourceTable child)
-            thing <- tcLookupGlobal child
-            case thing of
-              AnId fun -> collect False fun (Just expected) args
-              _ -> failWithTc (TcRnNoSourceTable child)
+            if nameIsLocalOrFrom (tcg_semantic_mod env) child
+              then case lookupNameEnv (tcg_local_open_defs env) child of
+                     Just (fun, _) -> collect False fun (Just expected) args
+                     Nothing       -> failWithTc (TcRnNoSourceTable child)
+              else do
+                thing <- tcLookupGlobal child
+                case thing of
+                  AnId fun -> collect False fun (Just expected) args
+                  _ -> failWithTc (TcRnNoSourceTable child)
       | otherwise = setSrcSpanA (getLoc arg) $ do
           eligible <- if closedConstructorLiteral arg
                         then pure True
@@ -4561,28 +4862,77 @@ tcPlanClosedHead :: TcTyMode -> Bool -> Maybe Kind -> RdrName -> Name
                  -> [LHsType GhcRn] -> TcM (Kind, ClosedCallValue)
 tcPlanClosedHead mode ordinary_call hint rdr name args
   | isSourceFamilyName name = do
-      staging <- closedOperandStaging args
-      executable <- tcClosedCaseExecutableOwner True rdr name args staging
-      case executable of
-        Just owner -> tcPlanExecutableCase mode ordinary_call hint owner args
+      fallback <- localFallbackFamilyOwner name
+      case fallback of
+        Just fun -> tcPlanOrdinaryCall mode ordinary_call hint fun args
         Nothing -> do
-          table <- tcLookupTyCon name
-          if ordinary_call && admissibleFamilyOperands args staging && supportsClosedFamilyTree table args
-            then tcPlanClosedTree mode ordinary_call hint (ReduceClosedCase table) args
-            else case args of
-              [arg] -> do
-                loc <- getSrcSpanM
-                (kind, run) <- tcPlanSourceFamilyCall mode ordinary_call name arg
-                return (kind, ClosedFamilyValue loc run)
-              _ -> failWithTc (TcRnNoSourceTable name)
+          staging <- closedOperandStaging args
+          executable <- tcClosedCaseExecutableOwner True rdr name args staging
+          case executable of
+            Just owner -> tcPlanExecutableCase mode ordinary_call hint owner args
+            Nothing -> do
+              table <- tcLookupTyCon name
+              if ordinary_call && admissibleFamilyOperands args staging && supportsClosedFamilyTree table args
+                then tcPlanClosedTree mode ordinary_call hint (ReduceClosedCase table) args
+                else case args of
+                  [arg] -> do
+                    loc <- getSrcSpanM
+                    (kind, run) <- tcPlanSourceFamilyCall mode ordinary_call name arg
+                    return (kind, ClosedFamilyValue loc run)
+                  _ -> failWithTc (TcRnNoSourceTable name)
   | otherwise = do
       env <- getGblEnv
-      when (nameIsLocalOrFrom (tcg_semantic_mod env) name) $
-        failWithTc (TcRnNoSourceTable name)
-      thing <- tcLookupGlobal name
-      case thing of
-        AnId fun -> tcPlanOrdinaryCall mode ordinary_call hint fun args
-        _ -> failWithTc (TcRnNoSourceTable name)
+      if nameIsLocalOrFrom (tcg_semantic_mod env) name
+        then case lookupNameEnv (tcg_local_open_defs env) name of
+               Just (fun, _) -> tcPlanOrdinaryCall mode ordinary_call hint fun args
+               Nothing       -> failWithTc (TcRnNoSourceTable name)
+        else do
+          thing <- tcLookupGlobal name
+          case thing of
+            AnId fun -> tcPlanOrdinaryCall mode ordinary_call hint fun args
+            _ -> failWithTc (TcRnNoSourceTable name)
+
+-- | Resolve a local @T:f@ family occurrence when @f@ did not produce a source
+-- table and instead fell back to @tcg_local_open_defs@ for closed evaluation.
+-- See Note [Same-module closed term evaluation].
+localFallbackFamilyOwner :: Name -> TcM (Maybe Id)
+localFallbackFamilyOwner name
+  | not (isSourceFamilyName name) = pure Nothing
+  | otherwise = do
+      env <- getGblEnv
+      if nameIsLocalOrFrom (tcg_semantic_mod env) name
+         && isNothing (lookupTypeEnv (tcg_type_env env) name)
+        then do
+          owner <- closedFamilyOwner name
+          pure (fst <$> lookupNameEnv (tcg_local_open_defs env) owner)
+        else pure Nothing
+
+{- Note [Same-module closed term evaluation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an earlier R21-scheduled top-level value binding group in the current
+module is referenced in a later type signature or declaration on concrete
+closed arguments (and either did not reserve a SourceTable or did not produce
+one), GHC evaluates the closed call in-module via the interpreter just like an
+imported closed call:
+
+1. Staging and fallback (GHC.Rename.Env, GHC.Tc.Module):
+   * Lookup in ordinary type-application and callback positions records local
+     value demands in tcg_local_open_demands.
+   * tcLocalOpenGroup and tcTopSrcTablesWith typecheck, solve, zonk (including
+     top-level EvBinds), and desugar the earlier binding group into
+     tcg_local_open_defs.
+
+2. Bytecode caching and execution (GHC.Tc.Gen.Splice, GHC.Driver.Main.Passes):
+   * Before hscCompileCoreExpr executes the closed call's IO String wrapper,
+     rewriteSameModuleClosedExpr rewrites references to solved bindings in
+     tcg_local_open_defs to deterministic interactive BCO GlobalIds.
+   * hscLoadSameModuleClosedBcos compiles any uncached bindings (plus info
+     tables for earlier local algebraic datatypes in tcg_tcs) once via
+     byteCodeGen + loadDecls into the active interpreter's bco_loader_state.
+     Because the BCOs live in interactive in-memory modules and local info
+     tables are already registered in bco_loader_state, execution works under
+     -fno-code and never loads a stale on-disk .o file for the current module.
+-}
 
 -- | Share the input and result kind constraints of a saturated constructor case.
 -- Use the same tree when the producer becomes available to the linker.
@@ -4655,38 +5005,52 @@ checkNominalCallback arg
   | Just (loc, rdr, name) <- bareClosedCallback arg, isSourceFamilyName name
   = setSrcSpan loc $ do
       fun <- tcClosedCallback rdr name
-      table <- tcLookupTyCon name
-      owner <- sourceTableOwner table
-      unless (owner == Just fun) $
-        failWithTc (TcRnNoSourceTable (getName fun))
+      fallback <- localFallbackFamilyOwner name
+      when (isNothing fallback) $ do
+        table <- tcLookupTyCon name
+        owner <- sourceTableOwner table
+        unless (owner == Just fun) $
+          failWithTc (TcRnNoSourceTable (getName fun))
   | otherwise = return ()
 
--- | Select the exact imported term, including re-exports of a certified owner.
+-- | Select the exact imported or earlier same-module term, including re-exports
+-- of a certified owner.
 tcClosedCallback :: RdrName -> Name -> TcM Id
 tcClosedCallback rdr name = do
   owner <- closedFamilyOwner name
   imported <- isClosedOrdinaryImport rdr owner
   unless imported $ failWithTc (TcRnClosedTypeEval owner
     "A closed callback needs an ordinary non-SOURCE import.")
-  thing <- tcLookupGlobal owner
-  case thing of
-    AnId fun -> return fun
-    _ -> failWithTc (TcRnNoSourceTable owner)
+  env <- getGblEnv
+  if nameIsLocalOrFrom (tcg_semantic_mod env) owner
+    then case lookupNameEnv (tcg_local_open_defs env) owner of
+           Just (fun, _) -> return fun
+           Nothing -> case lookupTypeEnv (tcg_type_env env) owner of
+             Just (AnId fun) -> return fun
+             _ -> failWithTc (TcRnNoSourceTable owner)
+    else do
+      thing <- tcLookupGlobal owner
+      case thing of
+        AnId fun -> return fun
+        _ -> failWithTc (TcRnNoSourceTable owner)
 
 -- | Check that the written name permits nominal or executable use of the exact term.
--- Accept a local binding only when an earlier declaration group already certified
--- its source table in @tcg_type_env@.
+-- Accept a local binding when an earlier declaration group certified its source
+-- table in @tcg_type_env@ or solved its Core definition in @tcg_local_open_defs@.
 isClosedOrdinaryImport :: RdrName -> Name -> TcM Bool
 isClosedOrdinaryImport rdr name = do
   env <- getGblEnv
   rdr_env <- getGlobalRdrEnv
   let occurrence = nameOccName name
+       -- Preserve optional module qualifier on the written RdrName.
       term_rdr = case isQual_maybe rdr of
         Just (qualifier, _) -> mkRdrQual qualifier occurrence
         Nothing -> mkRdrUnqual occurrence
-      local_certified = case lookupTypeEnv (tcg_type_env env) name of
-        Just (AnId fun) -> isJust (sourceTableId_maybe fun)
-        _ -> False
+      local_certified =
+        name `elemNameEnv` tcg_local_open_defs env ||
+        case lookupTypeEnv (tcg_type_env env) name of
+          Just (AnId fun) -> isJust (sourceTableId_maybe fun)
+          _ -> False
       imported gre = greName gre == name &&
                      (any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre) ||
                       (isLocalGRE gre && local_certified))
@@ -4927,17 +5291,22 @@ closedConstructorSyntax allow_literals arg = case unLoc (ignoreParens arg) of
 closedConstructorAlias :: LHsType GhcRn -> TcM Bool
 closedConstructorAlias = fmap isJust . closedConstructorAliasRhs
 
--- | Retrieve the checked expansion of a bare imported nullary synonym.
+-- | Retrieve the checked expansion of a bare imported or earlier same-module
+-- nullary synonym.
 closedConstructorAliasRhs :: LHsType GhcRn -> TcM (Maybe Type)
 closedConstructorAliasRhs arg
   | L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ name))) <- ignoreParens arg
   , isExternalName name, isTyConName name = do
-      this_mod <- tcg_semantic_mod <$> getGblEnv
-      if nameIsLocalOrFrom this_mod name then return Nothing else do
-        thing <- tcLookupGlobal name
-        return $ case thing of
-          ATyCon tc | tyConArity tc == 0 -> synTyConRhs_maybe tc
+      env <- getGblEnv
+      if nameIsLocalOrFrom (tcg_semantic_mod env) name
+        then return $ case lookupTypeEnv (tcg_type_env env) name of
+          Just (ATyCon tc) | tyConArity tc == 0 -> synTyConRhs_maybe tc
           _ -> Nothing
+        else do
+          thing <- tcLookupGlobal name
+          return $ case thing of
+            ATyCon tc | tyConArity tc == 0 -> synTyConRhs_maybe tc
+            _ -> Nothing
   | otherwise = return Nothing
 
 -- | Check the literal at the declared input kind and build its runtime value.
@@ -6463,19 +6832,7 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
              -> return (mkTyConTy tc, tyConKind tc)
 
            AGlobal (AConLike (RealDataCon dc))
-             -> do { unless (null (dataConRepArgBinders dc) || dataConHasPromotedRetained dc) $
-                       failWithTc $ TcRnRetainedQuantificationError RetainedPackagePromotion
-                   ; when (isDataFamInstTyCon (dataConTyCon dc)) $
-                       do { enabled <- xoptM LangExt.ExperimentalDependentTypes
-                          ; unless (enabled && canPromoteDataFamilyCon dc) $
-                              promotionErr name FamDataConPE }
-                   ; let (_, _, _, theta, _, _) = dataConFullSig dc
-                   ; traceTc "tcTyVar" (ppr dc <+> ppr theta)
-                     -- promotionErr: Note [No constraints in kinds] in GHC.Tc.Validity
-                   ; unless (null theta) $
-                     promotionErr name (ConstrainedDataConPE theta)
-                   ; let tc = promoteDataCon dc
-                   ; return (mkTyConApp tc [], tyConKind tc) }
+             -> promote_real_data_con dc
 
            AGlobal AnId{}    -> promotionErr name TermVariablePE
            ATcId { tct_id = v } ->
@@ -6486,18 +6843,54 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
                 ; case mb_rep of
                     Just (kind, ty) -> return (ty, kind)
                     Nothing         -> promotionErr name TermVariablePE }
+           APromotionErr FamDataConPE ->
+             do { gbl_env <- getGblEnv
+                ; case lookupTypeEnv (tcg_type_env gbl_env) name of
+                    Just (AConLike (RealDataCon dc)) -> promote_real_data_con dc
+                    _ -> promotionErr name FamDataConPE }
            APromotionErr err -> promotionErr name err
 
            _  -> wrongThingErr WrongThingType thing name }
+  where
+    promote_real_data_con dc
+      = do { unless (null (dataConRepArgBinders dc) || dataConHasPromotedRetained dc) $
+               failWithTc $ TcRnRetainedQuantificationError RetainedPackagePromotion
+           ; when (isDataFamInstTyCon (dataConTyCon dc)) $
+               do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+                  ; unless (enabled && canPromoteDataFamilyCon dc) $
+                      promotionErr name FamDataConPE }
+           ; let (_, _, _, theta, _, _) = dataConFullSig dc
+           ; traceTc "tcTyVar" (ppr dc <+> ppr theta)
+             -- promotionErr: Note [No constraints in kinds] in GHC.Tc.Validity
+           ; unless (null theta) $
+             promotionErr name (ConstrainedDataConPE theta)
+           ; let tc = promoteDataCon dc
+           ; case tyConTuple_maybe (dataConTyCon dc) of
+               Just UnboxedTuple -> do
+                 ubx <- xoptM LangExt.UnboxedTuples
+                 unless ubx $
+                   failWithTc $
+                     TcRnUnboxedTupleOrSumTypeFuncArg UnboxedTupleType (mkTyConTy tc)
+                 edt <- xoptM LangExt.ExperimentalDependentTypes
+                 if edt
+                   then do
+                     let arity = dataConSourceArity dc
+                         reps = replicate arity liftedRepTy
+                         (rr_bndrs, rest_bndrs) = splitAt arity (tyConBinders tc)
+                         subst = zipTvSubst (binderVars rr_bndrs) reps
+                         inst_kind = Subst.substTy subst (mkTyConKind rest_bndrs (tyConResKind tc))
+                     return (mkTyConApp tc reps, inst_kind)
+                   else return (mkTyConApp tc [], tyConKind tc)
+               _ -> return (mkTyConApp tc [], tyConKind tc) }
 
--- | Admit finished lifted constructors with no stored context or existentials.
+-- | Admit finished lifted data or newtype family instance constructors with
+-- no written class context (erased existential type binders are permitted).
 -- See Note [Promoting a simple data family instance constructor].
 canPromoteDataFamilyCon :: DataCon -> Bool
 canPromoteDataFamilyCon dc =
-  null exs && null theta
+  all isTyVar exs && null theta
   && null (dataConStupidTheta dc)
   && null (dataConRepArgBinders dc)
-  && not (isNewTyCon (dataConTyCon dc))
   && isLiftedTypeKind (typeKind (dataConOrigResTy dc))
   && all (isLiftedTypeKind . typeKind . scaledThing) fields
   where

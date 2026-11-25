@@ -1,7 +1,8 @@
-{-# LANGUAGE DataKinds, GADTs, PolyKinds, TypeFamilies #-}
+{-# LANGUAGE DataKinds, GADTs, MagicHash, PolyKinds, TypeFamilies, UnliftedNewtypes #-}
 module TupleProvider (Tuple(Tup0, Tup1, Tup2), At(..), fields, C(MkC, Refines), N(MkN)) where
 
 import Data.Kind (Type)
+import GHC.Exts (Int#, RuntimeRep(IntRep), TYPE)
 
 data family Tuple :: k
 data instance Tuple = Tup0
@@ -18,5 +19,5 @@ data instance C (a, b) where
     MkC :: Show b => b -> C (a, b)
     Refines :: C (Int, b)
 
-data family N a
-newtype instance N Int = MkN Bool
+data family N a :: TYPE IntRep
+newtype instance N Int = MkN Int#

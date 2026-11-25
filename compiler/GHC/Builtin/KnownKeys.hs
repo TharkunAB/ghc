@@ -705,6 +705,9 @@ jsvalTyConKey = mkPreludeTyConUnique 418
 
 exceptionContextTyConKey = mkPreludeTyConUnique 420
 
+charPrimLitTyConKey :: KnownKey
+charPrimLitTyConKey = mkPreludeTyConUnique 421
+
 unsafeUnpackJSStringUtf8ShShKey  = mkPreludeMiscIdUnique 805
 
 {-

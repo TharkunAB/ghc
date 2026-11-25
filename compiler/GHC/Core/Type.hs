@@ -65,6 +65,7 @@ module GHC.Core.Type (
         mkPiTysM, mkPiTysU,
         isNativeIndexId, isNativeIndexType, isNativeClosedIndexType, nativeIndexDataConTyArgs,
         primFamilyPatFieldKind, isPrimFamilyPatBinderKind, isPrimFamilyPatBinder,
+        hasConstraintPremise,
         isNativeIndexFunctionId, nativeIndexFunctionTys_maybe,
         isNativeNamedOpaqueFunctionId,
         nativeIndexFunctionTypeTys_maybe, nativeCallSpine_maybe,
@@ -396,7 +397,13 @@ coreView :: Type -> Maybe Type
 --
 -- By being non-recursive and inlined, this case analysis gets efficiently
 -- joined onto the case analysis that the caller is already doing
-coreView (TyConApp tc tys) = expandSynTyConApp_maybe tc tys
+coreView (TyConApp tc tys)
+  | Just rhs <- expandSynTyConApp_maybe tc tys = Just rhs
+  | tc `hasKey` charDataConKey
+  , [arg] <- tys
+  , TyConApp prim_tc [lit@(LitTy (CharTyLit _))] <- coreFullView arg
+  , prim_tc `hasKey` charPrimLitTyConKey
+  = Just lit
 coreView _                 = Nothing
 -- See Note [Inlining coreView].
 {-# INLINE coreView #-}
@@ -407,7 +414,7 @@ coreFullView, core_full_view :: Type -> Type
 --     core_full_view is the recursive one
 -- See Note [Inlining coreView].
 coreFullView ty@(TyConApp tc _)
-  | isTypeSynonymTyCon tc = core_full_view ty
+  | isTypeSynonymTyCon tc || tc `hasKey` charDataConKey = core_full_view ty
 coreFullView ty = ty
 {-# INLINE coreFullView #-}
 
@@ -2682,11 +2689,11 @@ isNativeStructuralFunctionType ty
 
 {- Note [Primitive family pattern binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A closed type family equation can match the field of promoted I# or W#.
-It binds an erased Int# or Word# index only in the matching immediate
+A closed type family equation can match the field of promoted I#, W#, or C#.
+It binds an erased Int#, Word#, or Char# index only in the matching immediate
 constructor field. The binder cannot occur in the right-hand side.
 These rules permit matching a known constructor application and leave a
-neutral Int or Word stuck.
+neutral Int, Word, or Char stuck.
 
 The axiom binds the variable without introducing a ForAllTy. The ordinary
 FORALL1 rule and runtime index readback keep their existing scope. See
@@ -2699,11 +2706,22 @@ primFamilyPatFieldKind :: Name -> Maybe Kind
 primFamilyPatFieldKind con
   | con `hasKey` intDataConKey  = Just intPrimTy
   | con `hasKey` wordDataConKey = Just wordPrimTy
+  | con `hasKey` charDataConKey = Just charPrimTy
   | otherwise = Nothing
 
 -- | Test the kinds that require the closed-family field scope check.
 isPrimFamilyPatBinderKind :: Kind -> Bool
-isPrimFamilyPatBinderKind kind = kind `eqType` intPrimTy || kind `eqType` wordPrimTy
+isPrimFamilyPatBinderKind kind
+  = kind `eqType` intPrimTy
+    || kind `eqType` wordPrimTy
+    || kind `eqType` charPrimTy
+
+-- | Test whether a kind has an invisible constraint arrow along its Pi spine.
+hasConstraintPremise :: Type -> Bool
+hasConstraintPremise (ForAllTy _ _ rest) = hasConstraintPremise rest
+hasConstraintPremise (FunTy af _ _ _ rest)
+  = isInvisibleFunArg af || hasConstraintPremise rest
+hasConstraintPremise _ = False
 
 -- | Check the scope of a raw field variable in a closed family axiom.
 isPrimFamilyPatBinder :: [Type] -> Type -> TyVar -> Bool
