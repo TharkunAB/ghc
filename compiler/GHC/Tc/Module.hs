@@ -716,7 +716,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
       ; setGblEnv tcg_env' $ do
           let binds = tcg_binds tcg_env'
           tables <- if tables_enabled || write_equations
-                    then sourceTableTyCons False binds else pure []
+                    then sourceTableTyCons False True binds else pure []
           -- Keep complete source equations ahead of partial final-Core
           -- equations for the same owner.
           let nominal_owners = if tables_enabled
@@ -865,7 +865,7 @@ installSourceTables tables = do
 
 -- | Check only the bindings in the declaration group that is now in scope.
 sourceTablesFor :: Bool -> NameSet -> TcGblEnv -> TcM [(Id, TyCon)]
-sourceTablesFor structural names env = sourceTableTyCons structural (filter requested (tcg_binds env))
+sourceTablesFor structural names env = sourceTableTyCons structural False (filter requested (tcg_binds env))
   where
     requested bind = any ((`elemNameSet` names) . idName)
                          (collectHsBindBinders CollNoDictBinders (unLoc bind))

@@ -5771,6 +5771,7 @@ tcRetainedArgWith reify domain arg
       = (formal, tcRetainedConstructorArgTypeWith pure Nothing arg) : declared_operands expected result args
     declared_operands expected result []
       | not (isFunTy result)
+      , isTyFamFree result
       = [(result, known_expected expected)]
     declared_operands _ _ _ = []
 

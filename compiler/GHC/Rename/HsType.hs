@@ -1286,8 +1286,9 @@ rnHsTyKi env (XHsType (HsTypeSome _ binder domain body)) = do
             nm <- newLocalBndrRn (L b_loc (setRdrNameSpace rdr tvName))
             res <- bindLocalNamesFV [nm] (rnLHsTyKi env body)
             pure (nm, res)
+      some_span <- getSrcSpanM
       let sigma_ty = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr sigma_name)))
-          lam_ty   = L (l2l b_loc) (XHsType (HsTypeLambdaQuoteRn [L b_loc bndr_name] body'))
+          lam_ty   = L (noAnnSrcSpan some_span) (XHsType (HsTypeLambdaQuoteRn [L b_loc bndr_name] body'))
       pure ( HsAppTy noExtField (noLocA (HsAppTy noExtField sigma_ty domain')) lam_ty
            , plusFNs [dom_fvs, body_fvs, unitFN sigma_name] )
 

@@ -2602,8 +2602,9 @@ carried pattern restriction before the solved clauses are available.
 -}
 
 -- | Derive closed families after solving the group's top-level constraints.
-sourceTableTyCons :: Bool -> LHsBinds GhcTc -> TcM [(Id, TyCon)]
-sourceTableTyCons local binds = do
+-- Pass @True@ for @final_exports@ only after @rnExports@ has populated @tcg_exports@.
+sourceTableTyCons :: Bool -> Bool -> LHsBinds GhcTc -> TcM [(Id, TyCon)]
+sourceTableTyCons local final_exports binds = do
     strict <- xoptM LangExt.Strict
     rules <- goptM Opt_EnableRewriteRules
     dflags <- getDynFlags
@@ -2630,7 +2631,7 @@ sourceTableTyCons local binds = do
     let read_candidate bind = case sourceRows False bind of
           Just row -> Just (row, False)
           Nothing
-            | not local, rules, generates_code, build_clean
+            | final_exports, rules, generates_code, build_clean
             , Just row@(fun, _, _, _, _) <- sourceRows True bind
             , isDefaultInlinePragma (idInlinePragma fun)
             , not (idName fun `elemNameSet` local_rules)
@@ -2739,15 +2740,15 @@ sourceTableTyCons local binds = do
             case sequence branches of
               Nothing -> pure Nothing
               Just branch_builders -> do
-                table <- case if not local then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
+                table <- case if final_exports then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
                   Just existing -> pure existing
                   _ -> makeFamily (varName fun) order input carried result branch_builders
                 let exported = availsToNameSet (tcg_exports env)
-                if not local && tcIsLiftedTypeKind result
+                if final_exports && tcIsLiftedTypeKind result
                    && (not (idName fun `elemNameSet` exported)
                        || not (null (unexportedLargeElimTypes env exported table)))
                   then pure Nothing
-                  else if not local && not (tcIsLiftedTypeKind result)
+                  else if final_exports && not (tcIsLiftedTypeKind result)
                           && not (public_table_types env exported table)
                   then pure Nothing
                   else do
@@ -4027,7 +4028,7 @@ directRetainedWitnessType ty =
     monomorphicRetainedWitnessType ty <|> do
       signature@(ConstructorCaseType _ tc args [domain] 0 result) <- constructorCaseType ty
       [con] <- pure (tyConDataCons tc)
-      guard (isRetainedCaseRoot domain tc)
+      guard (isJust (getTyVar_maybe result) && isRetainedCaseRoot domain tc)
       witness : _ <- pure (dataConOrigArgTys con)
       let inst = substTyWith (dataConUnivTyVars con) args
       guard (result `eqType` inst (scaledThing witness))

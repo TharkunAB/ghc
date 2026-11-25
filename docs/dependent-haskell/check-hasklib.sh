@@ -11,6 +11,8 @@ compiler=$1
 libdir=$2
 
 docs=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+open_eval="$docs/examples/open-evaluation"
+[[ -d "$open_eval" ]] || open_eval="$docs/open-evaluation"
 out=$(mktemp -d)
 trap 'rm -rf -- "$out"' EXIT
 
@@ -22,7 +24,7 @@ for opt in -O0 -O2; do
 
     # 1. Compile all HaskLib library modules into a clean interface/object directory.
     "${ghc[@]}" "$opt" -XGHC2024 \
-        -i "-i$docs/hasklib" "-i$docs/examples/open-evaluation" \
+        -i "-i$docs/hasklib" "-i$open_eval" \
         -outputdir "$dir/lib" --make -no-link \
         "$docs/hasklib/HaskLib.hs" \
         "$docs/hasklib/HaskLib/Equality.hs" \
@@ -44,7 +46,7 @@ for opt in -O0 -O2; do
 
     # 3. Build and run the full HaskLib test suite (dependent Client + Haskell2010 OrdinaryInteropClient + Main).
     "${ghc[@]}" "$opt" -XGHC2024 \
-        -i "-i$docs/hasklib" "-i$docs/examples/open-evaluation" "-i$docs/hasklib-test" \
+        -i "-i$docs/hasklib" "-i$open_eval" "-i$docs/hasklib-test" \
         -outputdir "$dir/test" --make "$docs/hasklib-test/Main.hs" -o "$dir/run-hasklib"
     "$dir/run-hasklib" >"$dir/stdout"
 done
