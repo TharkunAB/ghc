@@ -2345,45 +2345,45 @@ rewriteSameModuleClosedExpr locals expr
   | null roots            = ([], [], expr)
   | otherwise             = (local_bco_names, rewritten_binds, rewrite emptyVarSet expr)
   where
-    roots = [ idName v
-            | v <- exprSomeFreeVarsList (const True) expr
-            , idName v `elemNameEnv` locals ]
+    free_local_names e =
+      [ idName v
+      | v <- exprSomeFreeVarsList (const True) e
+      , idName v `elemNameEnv` locals ]
 
-    closure :: NameSet -> [Name] -> [Name]
+    roots = free_local_names expr
+
+    closure :: NameSet -> [Name] -> [(Id, Core.CoreExpr)]
     closure _ [] = []
     closure seen (n : ns)
       | n `elemNameSet` seen = closure seen ns
-      | Just (_, rhs) <- lookupNameEnv locals n
-      = let deps = [ idName v
-                   | v <- exprSomeFreeVarsList (const True) rhs
-                   , idName v `elemNameEnv` locals ]
-        in n : closure (extendNameSet seen n) (deps ++ ns)
+      | Just entry@(_, rhs) <- lookupNameEnv locals n
+      = entry : closure (extendNameSet seen n) (free_local_names rhs ++ ns)
       | otherwise = closure seen ns
 
-    needed_names = closure emptyNameSet roots
-
-    bco_id :: Id -> Id
-    bco_id owner =
+    mk_bco_id :: Id -> Id
+    mk_bco_id owner =
       let u = idUnique owner
           bco_mod = mkInteractiveModule ("SameModClosed_" ++ show u)
           bco_name = mkExternalName u bco_mod (nameOccName (idName owner)) (nameSrcSpan (idName owner))
       in mkVanillaGlobal bco_name (idType owner)
 
-    local_bco_names =
-      [ idName owner
-      | nm <- needed_names
-      , Just (owner, _) <- [lookupNameEnv locals nm] ]
+    needed_bcos =
+      [ (owner, mk_bco_id owner, rhs)
+      | (owner, rhs) <- closure emptyNameSet roots ]
+
+    bco_env = mkNameEnv [ (idName owner, bco) | (owner, bco, _) <- needed_bcos ]
+
+    local_bco_names = [ idName owner | (owner, _, _) <- needed_bcos ]
 
     rewritten_binds =
-      [ (bco_id owner, rewrite emptyVarSet rhs)
-      | nm <- needed_names
-      , Just (owner, rhs) <- [lookupNameEnv locals nm] ]
+      [ (bco, rewrite emptyVarSet rhs)
+      | (_, bco, rhs) <- needed_bcos ]
 
     rewrite :: VarSet -> Core.CoreExpr -> Core.CoreExpr
     rewrite bound (Core.Var v)
       | not (v `elemVarSet` bound)
-      , Just (owner, _) <- lookupNameEnv locals (idName v)
-      = Core.Var (bco_id owner)
+      , Just bco <- lookupNameEnv bco_env (idName v)
+      = Core.Var bco
       | otherwise = Core.Var v
     rewrite _ e@Core.Lit{} = e
     rewrite bound (Core.App f a) = Core.App (rewrite bound f) (rewrite bound a)

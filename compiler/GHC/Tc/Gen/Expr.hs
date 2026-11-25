@@ -259,7 +259,7 @@ tcPolyExprCheck expr res_ty
                          ; inner_skolemise ds_flag rho_ty $ \rho_ty' ->
                            do { dep <- xoptM LangExt.ExperimentalDependentTypes
                               ; mb_rep <- if dep
-                                          then tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType rho_ty')
+                                          then tcTypeRepTarget_maybe rho_ty'
                                           else pure Nothing
                               ; case mb_rep of
                                   Just (rep_kind, _) -> do
@@ -1575,8 +1575,7 @@ tcTypeWitnessCase :: Id -> TcType -> TcType
                   -> ExpRhoType
                   -> TcM (Maybe (HsExpr GhcTc))
 tcTypeWitnessCase scrut_id scrut_ty mult matches expected = do
-  scrut_ty' <- liftZonkM (zonkTcType scrut_ty)
-  mb_rep <- tcTypeRepTarget_maybe scrut_ty'
+  mb_rep <- tcTypeRepTarget_maybe scrut_ty
   case mb_rep of
     Just (scrut_kind, target_ty)
       | tcIsLiftedTypeKind scrut_kind
@@ -1776,8 +1775,7 @@ tcNativeLet :: HsExpr GhcRn -> LHsLocalBinds GhcRn -> LHsExpr GhcRn -> Type
 tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) body expected
   | not (null groups), all isTypeLSig sigs
   , Just bindings <- traverse nonrec_fun groups
-  = let (syn_sigs, val_sigs) = partition isLocalTySynLSig sigs
-    in tcWithLocalTySyns syn_sigs $
+  = tcWithLocalTySyns syn_sigs $
     do { direct <- case (bindings, val_sigs) of
            ([L _ FunBind { fun_id = name, fun_matches = matches }], [])
              | Just rhs <- lazyLetRhs matches -> named_argument name rhs
@@ -1788,13 +1786,13 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
              { expr <- foldr check_binding (tcMonoLExpr body (Check expected)) bindings
              ; return (Just (mkExpandedExprTc original (unLoc expr))) } }
   where
-    (_, val_sigs_only) = partition isLocalTySynLSig sigs
+    (syn_sigs, val_sigs) = partition isLocalTySynLSig sigs
 
     nonrec_fun (NonRecursive, [binding@(L _ FunBind{})]) = Just binding
     nonrec_fun _ = Nothing
 
     sigs_for :: Name -> [LSig GhcRn]
-    sigs_for target = mapMaybe narrow val_sigs_only
+    sigs_for target = mapMaybe narrow val_sigs
       where
         narrow (L s_loc (TypeSig x mods names wc_ty))
           | let matching = [l_nm | l_nm@(L _ nm) <- names, nm == target]
@@ -3256,11 +3254,13 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
                  ]
         ; return (ds_expr, ds_res_ty, RecordUpdCtxt relevant_cons upd_fld_names ex_tvs) }
 
--- | Expand payload updates at the receiver's stored witness.
--- See Note [Updating a retained record payload].
-expandRetainedRecordUpd :: DataCon -> Id -> [(Name, TcType, LHsExpr GhcRn)] -> LHsExpr GhcRn
-                        -> TcM (HsExpr GhcRn, TcType, HsCtxt)
-expandRetainedRecordUpd con receiver replacements record_expr = do
+-- | Build constructor patterns and rebuilt field arguments for a retained
+-- record payload update.
+mkRetainedRecordUpdFields
+  :: DataCon
+  -> [(Name, TcType, LHsExpr GhcRn)]
+  -> TcM ([Name], [TcType], [LHsExpr GhcRn], [Name], [LPat GhcRn], [LHsExpr GhcRn])
+mkRetainedRecordUpdFields con replacements = do
     let (fields, payload_types, values) = unzip3 replacements
     names <- mapM (newSysName . nameOccName) fields
     let updated = mkNameEnv (zip fields names)
@@ -3270,6 +3270,15 @@ expandRetainedRecordUpd con receiver replacements record_expr = do
             name <- newSysName (nameOccName (flSelector fld))
             pure (genVarPat name, genLHsVar name)
     (pats, args) <- mapAndUnzipM field_arg (dataConFieldLabels con)
+    pure (fields, payload_types, values, names, pats, args)
+
+-- | Expand payload updates at the receiver's stored witness.
+-- See Note [Updating a retained record payload].
+expandRetainedRecordUpd :: DataCon -> Id -> [(Name, TcType, LHsExpr GhcRn)] -> LHsExpr GhcRn
+                        -> TcM (HsExpr GhcRn, TcType, HsCtxt)
+expandRetainedRecordUpd con receiver replacements record_expr = do
+    (fields, payload_types, values, names, pats, args) <-
+      mkRetainedRecordUpdFields con replacements
     let con_name = dataConName con
         result_ty = idType receiver
         signature = mkDepFunTy receiver (mkVisFunTysManyU payload_types result_ty)
@@ -3312,15 +3321,8 @@ expandParamRetainedRecordUpd con payload_types witness_field payload_fields fiel
     replacements <- case traverse resolve_field fields of
       Just rs -> pure rs
       Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
-    let (upd_fields, upd_payload_tys, values) = unzip3 replacements
-    names <- mapM (newSysName . nameOccName) upd_fields
-    let updated = mkNameEnv (zip upd_fields names)
-        field_arg fld = case lookupNameEnv updated (flSelector fld) of
-          Just name -> pure (genWildPat, genLHsVar name)
-          Nothing -> do
-            name <- newSysName (nameOccName (flSelector fld))
-            pure (genVarPat name, genLHsVar name)
-    (pats, args) <- mapAndUnzipM field_arg (dataConFieldLabels con)
+    (upd_fields, upd_payload_tys, values, names, pats, args) <-
+      mkRetainedRecordUpdFields con replacements
     let con_name = dataConName con
         signature = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
                       mkDepFunTy receiver (mkVisFunTysManyU upd_payload_tys out_record_ty)
@@ -3403,7 +3405,8 @@ closeUnivKinds univ_tvs = go
 -- See Note [Parameterized retained record updates].
 instantiateRetainedRecordUnivs :: [TyVar] -> TyCoVarSet -> TcM ([TyVar], [TyVar], Subst, [TcType])
 instantiateRetainedRecordUnivs univ_tvs pinned_tvs = do
-    (_, in_tvs) <- foldM alloc_in (mkEmptySubst (mkInScopeSetList univ_tvs), []) univ_tvs
+    (_, rev_in_tvs) <- foldM alloc_in (mkEmptySubst (mkInScopeSetList univ_tvs), []) univ_tvs
+    let in_tvs = reverse rev_in_tvs
     (out_subst, out_tys, extra_out_tvs) <-
       foldM alloc_out (mkEmptySubst (mkInScopeSetList (univ_tvs ++ in_tvs)), [], [])
             (zip univ_tvs in_tvs)
@@ -3412,7 +3415,7 @@ instantiateRetainedRecordUnivs univ_tvs pinned_tvs = do
     alloc_in (sub, acc) tv = do
       nm <- newSysName (nameOccName (getName tv))
       let tv' = mkTyVar nm (substTy sub (tyVarKind tv))
-      pure (extendTvSubst sub tv (mkTyVarTy tv'), acc ++ [tv'])
+      pure (extendTvSubst sub tv (mkTyVarTy tv'), tv' : acc)
 
     alloc_out (sub, tys, extras) (orig_tv, in_tv)
       | orig_tv `elemVarSet` pinned_tvs =
@@ -3807,7 +3810,7 @@ checkMissingFields con_like rbinds arg_tys
 instCallWithLocalTypeReps :: HsExpr GhcRn -> LHsWcType GhcRn -> TcType
                           -> [TcType] -> TcThetaType -> TcM HsWrapper
 instCallWithLocalTypeReps expr written arg args theta = do
-  reps <- collect_reps emptyUniqSet (collect_names (hswc_body written))
+  reps <- collect_reps emptyUniqSet emptyUniqSet (collect_names (hswc_body written))
   arg_zonked <- liftZonkM (zonkTcType arg)
   let rep_tv_set = mkVarSet [ tv | (_, _, t) <- reps, Just tv <- [getTyVar_maybe t] ]
       free_tvs   = filter isTyVar (tyCoVarsOfTypeList arg_zonked)
@@ -3865,28 +3868,35 @@ instCallWithLocalTypeReps expr written arg args theta = do
       CastTy t _  -> has_non_typeable_form t
       _           -> False
     collect_names :: Data a => a -> [Name]
-    collect_names x =
-      [ unwrapUserRdr w | Just (w :: WithUserRdr Name) <- [cast x] ]
-      ++ concat (gmapQ collect_names x)
+    collect_names x
+      | Just (w :: WithUserRdr Name) <- cast x = [unwrapUserRdr w]
+      | Just (_ :: SrcSpanAnnA)      <- cast x = []
+      | Just (_ :: SrcSpanAnnN)      <- cast x = []
+      | Just (_ :: SrcSpan)          <- cast x = []
+      | Just (_ :: Type)             <- cast x = []
+      | Just (_ :: Name)             <- cast x = []
+      | otherwise = concat (gmapQ collect_names x)
 
-    collect_reps :: UniqSet Id -> [Name] -> TcM [(Id, TcKind, TcType)]
-    collect_reps _ [] = pure []
-    collect_reps seen (nm : nms) = do
-      mb_cand <- lookup_rep nm
-      case mb_cand of
-        Just (v_id, v_kind, v_ty)
-          | not (v_id `elementOfUniqSet` seen) -> do
-              rest <- collect_reps (addOneToUniqSet seen v_id) nms
-              pure ((v_id, v_kind, v_ty) : rest)
-        _ -> collect_reps seen nms
+    collect_reps :: UniqSet Name -> UniqSet Id -> [Name] -> TcM [(Id, TcKind, TcType)]
+    collect_reps _ _ [] = pure []
+    collect_reps seen_nms seen_ids (nm : nms)
+      | nm `elementOfUniqSet` seen_nms = collect_reps seen_nms seen_ids nms
+      | otherwise = do
+          let seen_nms' = addOneToUniqSet seen_nms nm
+          mb_cand <- lookup_rep nm
+          case mb_cand of
+            Just (v_id, v_kind, v_ty)
+              | not (v_id `elementOfUniqSet` seen_ids) -> do
+                  rest <- collect_reps seen_nms' (addOneToUniqSet seen_ids v_id) nms
+                  pure ((v_id, v_kind, v_ty) : rest)
+            _ -> collect_reps seen_nms' seen_ids nms
 
     lookup_rep :: Name -> TcM (Maybe (Id, TcKind, TcType))
     lookup_rep nm = do
       mb_lcl <- tcLookupLcl_maybe nm
       case mb_lcl of
         Just (ATcId { tct_id = v_id }) -> do
-          v_ty_full <- liftZonkM (zonkTcType (varType v_id))
-          mb_rep <- tcTypeRepTarget_maybe v_ty_full
+          mb_rep <- tcTypeRepTarget_maybe (varType v_id)
           pure $ fmap (\(k, t) -> (v_id, k, t)) mb_rep
         Just (ATyVar _ tv) -> do
           lcl_rdr <- getLocalRdrEnv
@@ -3896,8 +3906,7 @@ instCallWithLocalTypeReps expr written arg args theta = do
               mb_term <- tcLookupLcl_maybe term_nm
               case mb_term of
                 Just (ATcId { tct_id = v_id }) -> do
-                  v_ty_full <- liftZonkM (zonkTcType (varType v_id))
-                  mb_rep <- tcTypeRepTarget_maybe v_ty_full
+                  mb_rep <- tcTypeRepTarget_maybe (varType v_id)
                   case mb_rep of
                     Just (k, t) -> do
                       tv_ty <- liftZonkM (zonkTcType (mkTyVarTy tv))

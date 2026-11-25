@@ -600,6 +600,20 @@ familyDomainPrefix n sig
       = let (tvs, theta, body) = written_prefix rest in (tvs, pred_ty : theta, body)
     written_prefix rest = ([], [], rest)
 
+-- | Format an undetermined-parameter diagnostic for a constrained family call.
+undeterminedFamilyDomainErr :: [TyVar] -> [TyVar] -> String -> Name -> SDoc
+undeterminedFamilyDomainErr omitted unknown what owner =
+  sep [ text "Supply" <+> pprWithCommas (quotes . ppr) (if null omitted then unknown else omitted)
+      , text ("to determine the " ++ what ++ " of") <+> quotes (ppr owner) <> dot ]
+
+-- | Fail when a constrained family declaration leaves context parameters undetermined.
+failMissingFamilyParameters :: TyCon -> [TyVar] -> TcM ()
+failMissingFamilyParameters fam missing =
+  setSrcSpan (getSrcSpan fam) $
+  failWithTc $ TcRnConstrainedFamilyUnsupported fam $
+    hang (text "Missing class parameters in the family declaration")
+         2 (pprWithCommas ppr missing)
+
 -- | Recover the owner predicate from the supplied family arguments.
 -- See Note [Associated family domain arguments].
 associatedFamilyDomain :: TyCon -> [Type] -> Either SDoc (Int, PredType)
@@ -626,9 +640,7 @@ associatedFamilyDomain fam args
       Nothing | null omitted, null unknown ->
         let (hidden, predicate) = infer (mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes args))) formals
         in Right (length hidden, mkInfForAllTys hidden predicate)
-      _ -> Left $ sep
-        [ text "Supply" <+> pprWithCommas (quotes . ppr) (if null omitted then unknown else omitted)
-        , text "to determine the instance of" <+> quotes (ppr (className cls)) <> dot ]
+      _ -> Left (undeterminedFamilyDomainErr omitted unknown "instance" (className cls))
   | otherwise = Left (text "The family declaration has no associated class.")
 
 -- | Split the canonical constrained kind of a standalone constrained family
@@ -667,9 +679,7 @@ standaloneFamilyDomain fam ckind args =
       fixed = closeWrtFunDeps theta known
       unknown = [h | h <- hidden_tvs, not (h `elemVarSet` fixed)]
   in if not (null omitted && null unknown)
-     then Left $ sep
-       [ text "Supply" <+> pprWithCommas (quotes . ppr) (if null omitted then unknown else omitted)
-       , text "to determine the constraint context of" <+> quotes (ppr (tyConName fam)) <> dot ]
+     then Left (undeterminedFamilyDomainErr omitted unknown "constraint context" (tyConName fam))
      else
        let in_scope = mkInScopeSet (tyCoVarsOfTypes (args ++ theta))
            subst0 = mkTvSubst in_scope actuals
@@ -691,10 +701,7 @@ checkStandaloneFamilyCoverage fam
         fixed = closeWrtFunDeps theta known
         missing = [h | h <- hidden_tvs, not (h `elemVarSet` fixed)]
   , not (null missing)
-  = setSrcSpan (getSrcSpan fam) $
-    failWithTc $ TcRnConstrainedFamilyUnsupported fam $
-      hang (text "Missing class parameters in the family declaration")
-           2 (pprWithCommas ppr missing)
+  = failMissingFamilyParameters fam missing
   | otherwise = pure ()
 
 -- | Check the owner after GHC has built the class and its superclasses.
@@ -704,10 +711,7 @@ checkAssociatedFamilyCoverage cls fam
   | isConstrainedFamilyTyCon fam
   , let missing = undeterminedFamilyParameters cls (tyConTyVars fam)
   , not (null missing)
-  = setSrcSpan (getSrcSpan fam) $
-    failWithTc $ TcRnConstrainedFamilyUnsupported fam $
-      hang (text "Missing class parameters in the family declaration")
-           2 (pprWithCommas ppr missing)
+  = failMissingFamilyParameters fam missing
   | otherwise = pure ()
 
 -- | Find owner parameters that the supplied family arguments do not determine.
@@ -1759,8 +1763,13 @@ reportWrittenPartialFamily tc args = do
 
     walk :: Data a => a -> [Maybe SrcSpan]
     walk node
-      | Just ty <- cast node = walkType ty
-      | otherwise = concat (gmapQ walk node)
+      | Just ty <- cast node              = walkType ty
+      | Just (_ :: SrcSpanAnnA) <- cast node = []
+      | Just (_ :: SrcSpanAnnN) <- cast node = []
+      | Just (_ :: SrcSpan)     <- cast node = []
+      | Just (_ :: Name)        <- cast node = []
+      | Just (_ :: Type)        <- cast node = []
+      | otherwise                         = concat (gmapQ walk node)
 
     walkType :: LHsType GhcRn -> [Maybe SrcSpan]
     walkType (L _ (HsParTy _ ty)) = walkType ty
@@ -4337,29 +4346,20 @@ Historical note: this test used to be called reportFloatingKvs.
 
 -- | Check a list of binders to see if they make a valid telescope.
 -- See Note [Bad TyCon telescopes]
-type TelescopeAcc
-      = ( TyVarSet   -- Bound earlier in the telescope
-        , Bool       -- At least one binder occurred (in a kind) before
-                     -- it was bound in the telescope.  E.g.
-        )            --    T :: forall (a::k) k. blah
-
 checkTyConTelescope :: TyCon -> TcM ()
 checkTyConTelescope tc
-  | bad_scope
+  | has_bad_scope emptyVarSet (tyConBinders tc)
   = -- See "Ill-scoped binders" in Note [Bad TyCon telescopes]
     addErr $ TcRnBadTyConTelescope tc
 
   | otherwise
   = return ()
   where
-    tcbs = tyConBinders tc
-
-    (_, bad_scope) = foldl add_one (emptyVarSet, False) tcbs
-
-    add_one :: TelescopeAcc -> TyConBinder -> TelescopeAcc
-    add_one (bound, bad_scope) tcb
-      = ( bound `extendVarSet` tv
-        , bad_scope || not (isEmptyVarSet (fkvs `minusVarSet` bound)) )
+    has_bad_scope :: TyVarSet -> [TyConBinder] -> Bool
+    has_bad_scope !_ [] = False
+    has_bad_scope !bound (tcb : rest)
+      | not (isEmptyVarSet (fkvs `minusVarSet` bound)) = True
+      | otherwise = has_bad_scope (bound `extendVarSet` tv) rest
       where
-        tv = binderVar tcb
+        tv   = binderVar tcb
         fkvs = tyCoVarsOfType (tyVarKind tv)

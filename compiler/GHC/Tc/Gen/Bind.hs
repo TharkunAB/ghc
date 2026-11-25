@@ -56,8 +56,8 @@ import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Multiplicity
 import GHC.Core.FamInstEnv( normaliseType )
 import GHC.Core.Class   ( Class )
-import GHC.Core.Coercion( mkSymCo )
-import GHC.Core.Type (mkStrLitTy, mkCastTy, coreFullView, isFamFreeTy)
+import GHC.Core.Coercion( hasCoercionHole, mkSymCo )
+import GHC.Core.Type (anyFreeVarsOfType, mkStrLitTy, mkCastTy, coreFullView, isFamFreeTy)
 import GHC.Core.TyCo.Rep (Type(ExistsTy))
 import GHC.Core.TyCo.Ppr( pprTyVars )
 import GHC.Core.TyCo.Tidy( tidyOpenTypeX )
@@ -1105,16 +1105,15 @@ chooseInferredQuantifiers residual inferred_theta tau_tvs qtvs
     --            (c) it is mentioned in the kind of a retained qtv (#22065)
     --            (d) it is mentioned in a retained binder's matchability
     choose_qtv psig_bndr_map tv (free_tvs, qtvs)
-       | Just psig_bndr <- lookupVarEnv psig_bndr_map tv
-       = (free_tvs', psig_bndr : qtvs)
+       | Just psig_bndr@(ma, _) <- lookupVarEnv psig_bndr_map tv
+       = (free_tvs `unionVarSet` tyCoVarsOfType (tyVarKind tv)
+                   `unionVarSet` tyCoVarsOfType ma,
+          psig_bndr : qtvs)
        | tv `elemVarSet` free_tvs
-       = (free_tvs', (unmatchableDataConTy, mkTyVarBinder InferredSpec tv) : qtvs)
+       = (free_tvs `unionVarSet` tyCoVarsOfType (tyVarKind tv),
+          (unmatchableDataConTy, mkTyVarBinder InferredSpec tv) : qtvs)
        | otherwise  -- Do not pick it
        = (free_tvs, qtvs)
-       where
-         free_tvs' = free_tvs `unionVarSet` tyCoVarsOfType (tyVarKind tv)
-                              `unionVarSet` maybe emptyVarSet (tyCoVarsOfType . fst)
-                                              (lookupVarEnv psig_bndr_map tv)
 
     choose_psig_context :: VarSet -> TcThetaType -> Maybe TcType
                         -> TcM (VarSet, TcThetaType)
@@ -1341,14 +1340,22 @@ data MonoBindInfo = MBI { mbi_poly_name :: Name
 -- See Note [Inference of retained types].
 checkInferredRetainedTypes :: (TcType -> Bool) -> [MonoBindInfo] -> TcM ()
 checkInferredRetainedTypes local_value infos
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
-       ; when enabled $ mapM_ check_info infos }
+  | all has_complete_sig infos = return ()
+  | otherwise = do
+      enabled <- xoptM LangExt.ExperimentalDependentTypes
+      when enabled $ mapM_ check_info infos
   where
-    check_info (MBI { mbi_sig = Just (TISI { sig_inst_sig = TcCompleteSig{} }) })
-      = return ()
+    has_complete_sig (MBI { mbi_sig = Just (TISI { sig_inst_sig = TcCompleteSig{} }) }) = True
+    has_complete_sig _ = False
+
+    check_info info
+      | has_complete_sig info = return ()
     check_info info@(MBI { mbi_poly_name = name, mbi_mono_id = mono_id })
       = setSrcSpan (nameSrcSpan name) $
-        do { ty <- liftZonkM $ zonkTcType (idType mono_id)
+        do { let raw_ty = idType mono_id
+           ; ty <- if anyFreeVarsOfType isMetaTyVar raw_ty || hasCoercionHole raw_ty
+                   then liftZonkM (zonkTcType raw_ty)
+                   else pure raw_ty
            ; when (hasNativeDependentExpr (Type ty) && not (closed_package ty)) $
                if local_value ty && isNothing (mbi_sig info) && scoped_type ty
                then checkValidType (InfSigCtxt name) ty
