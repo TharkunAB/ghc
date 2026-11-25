@@ -1,7 +1,8 @@
-{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE DependentTypes, StandaloneKindSignatures #-}
 {-# OPTIONS_GHC -fwrite-source-equations -fno-enable-rewrite-rules #-}
 module DependentHoleFits where
 
+import Data.Kind (Type)
 import Data.Type.Equality ((:~:) (Refl), trans)
 import GHC.Exts (Matchability)
 import qualified GHC.Internal.List as InternalList
@@ -123,3 +124,56 @@ data Vec a (n :: Nat) where
 
 vecEqGoal :: forall a. foreach (n :: Nat) -> foreach (u :: Vec a n) -> foreach (v :: Vec a n) -> u :~: v
 vecEqGoal _ u v = _
+
+-- 9. Multi-clause equation with a variable pattern before an indexed GADT
+--    foreach argument keeps 'eq' in Relevant bindings and refinement fits,
+--    and uses source names in the enclosing case context (PiTA #10).
+data Fin (n :: Nat) where
+  FZ :: Fin (Succ n)
+  FS :: Fin n -> Fin (Succ n)
+
+data UTerm (n :: Nat) where
+  UVar :: Fin n -> UTerm n
+  ULam :: UTerm (Succ n) -> UTerm n
+  UApp :: UTerm n -> UTerm n -> UTerm n
+
+shiftFin :: Fin m -> Fin (Succ m)
+shiftFin x = FS x
+
+extU :: (Fin m -> Fin n) -> Fin (Succ m) -> Fin (Succ n)
+extU _   FZ     = FZ
+extU rho (FS x) = FS (rho x)
+
+renameU :: (Fin m -> Fin n) -> UTerm m -> UTerm n
+renameU rho (UVar x)   = UVar (rho x)
+renameU rho (ULam b)   = ULam (renameU (extU rho) b)
+renameU rho (UApp l r) = UApp (renameU rho l) (renameU rho r)
+
+extsU :: (Fin m -> UTerm n) -> Fin (Succ m) -> UTerm (Succ n)
+extsU _     FZ     = UVar FZ
+extsU sigma (FS x) = renameU shiftFin (sigma x)
+
+substU :: (Fin m -> UTerm n) -> UTerm m -> UTerm n
+substU sigma (UVar x)   = sigma x
+substU sigma (ULam b)   = ULam (substU (extsU sigma) b)
+substU sigma (UApp l r) = UApp (substU sigma l) (substU sigma r)
+
+type Subst (m :: Nat) (n :: Nat) = Fin m -> UTerm n
+type SubEq :: forall (m :: Nat) (n :: Nat). Subst m n -> Subst m n -> Type
+type SubEq @m @n s1 s2 = foreach (x :: Fin m) -> s1 x :~: s2 x
+
+congExts :: forall m n (s1 :: Subst m n) (s2 :: Subst m n).
+            SubEq @m @n s1 s2 -> SubEq @(Succ m) @(Succ n) (extsU s1) (extsU s2)
+congExts _  FZ     = Refl
+congExts eq (FS x) = cong (renameU shiftFin) (eq x)
+
+congSubst :: forall m n (s1 :: Subst m n) (s2 :: Subst m n).
+             SubEq @m @n s1 s2
+          -> foreach (t :: UTerm m) -> substU s1 t :~: substU s2 t
+congSubst eq (UVar x)   = _
+congSubst eq (ULam b)   =
+  case congSubst @(Succ m) @(Succ n) @(extsU s1) @(extsU s2) (congExts @m @n @s1 @s2 eq) b of
+    Refl -> Refl
+congSubst eq (UApp l r) =
+  case (congSubst @m @n @s1 @s2 eq l, congSubst @m @n @s1 @s2 eq r) of
+    (Refl, Refl) -> Refl

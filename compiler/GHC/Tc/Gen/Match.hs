@@ -130,7 +130,7 @@ import Control.Arrow ( second )
 import Data.Foldable (toList)
 import Data.List (find, nub, nubBy, partition, transpose, zipWith4)
 import Data.List.NonEmpty (NonEmpty (..))
-import Data.Maybe (mapMaybe, maybeToList)
+import Data.Maybe (listToMaybe, mapMaybe)
 
 import qualified GHC.LanguageExtensions as LangExt
 
@@ -457,7 +457,7 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
   , not (retainedCaseHasQuote matches)
   , has_nested_retained_con_matches (retained_or_gadt_columns 0 ty) matches
     || has_multi_arg_indexed_gadt_matches matches
-  = do { mb_desugared <- tryDesugarNestedRetainedMatches mctxt arity matches
+  = do { mb_desugared <- tryDesugarNestedRetainedMatches mctxt arity ty matches
        ; case mb_desugared of
            Just (arg_pats, single_group) ->
              tcRetainedVarMatches herald ctxt ty arg_pats $ \pat_tys rhs_ty boundary names ->
@@ -487,12 +487,8 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
                (idx_col, RetainedConIndex idx) : _ | isNativeIndexId idx -> Just (idx_col, idx)
                _ -> Nothing
        ; case traverse lookup_col cols of
-           Just [first_col, second_col] ->
-             do { checked <- tcRetainedMatrixMatches first_col second_col
-                               invis_pat_tys pat_tys plan rhs_ty matches
-                ; return (wrap, checked) }
-           Just many_cols@(_ : _ : _ : _) ->
-             do { checked <- tcRetainedNMatrixMatches many_cols
+           Just mat_cols@(_ : _ : _) ->
+             do { checked <- tcRetainedMatrixMatches mat_cols
                                invis_pat_tys pat_tys plan rhs_ty matches
                 ; return (wrap, checked) }
            _ -> function_pattern_error }
@@ -587,17 +583,6 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
       , any constructor_pat pats ]
     visible_rows = map (filter isVisArgLPat . hsLMatchPats) (unLoc (mg_alts matches))
 
-    retained_columns column sigma = case coreFullView sigma of
-      DepFunTy DepFunVisible binder body
-        | isNativeIndexId binder -> column : retained_columns (column + 1) body
-        | otherwise -> retained_columns (column + 1) body
-      ForAllTy _ (Bndr _ Required) body -> retained_columns (column + 1) body
-      ForAllTy _ _ body -> retained_columns column body
-      FunTy af _ _ _ body
-        | isVisibleFunArg af -> retained_columns (column + 1) body
-        | otherwise -> retained_columns column body
-      _ -> []
-
     is_indexed_gadt_binder :: Id -> Bool
     is_indexed_gadt_binder binder
       | not (isNativeIndexId binder)
@@ -605,19 +590,22 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
       = any isNativeIndexedGadtCon (tyConDataCons tc)
       | otherwise = False
 
-    indexed_gadt_columns column sigma = case coreFullView sigma of
+    matching_dep_columns :: (Id -> Bool) -> Int -> Type -> [Int]
+    matching_dep_columns keep column sigma = case coreFullView sigma of
       DepFunTy DepFunVisible binder body
-        | is_indexed_gadt_binder binder -> column : indexed_gadt_columns (column + 1) body
-        | otherwise -> indexed_gadt_columns (column + 1) body
-      ForAllTy _ (Bndr _ Required) body -> indexed_gadt_columns (column + 1) body
-      ForAllTy _ _ body -> indexed_gadt_columns column body
+        | keep binder -> column : matching_dep_columns keep (column + 1) body
+        | otherwise   -> matching_dep_columns keep (column + 1) body
+      ForAllTy _ (Bndr _ Required) body -> matching_dep_columns keep (column + 1) body
+      ForAllTy _ _ body                 -> matching_dep_columns keep column body
       FunTy af _ _ _ body
-        | isVisibleFunArg af -> indexed_gadt_columns (column + 1) body
-        | otherwise -> indexed_gadt_columns column body
+        | isVisibleFunArg af -> matching_dep_columns keep (column + 1) body
+        | otherwise          -> matching_dep_columns keep column body
       _ -> []
 
-    retained_or_gadt_columns column sigma =
-      retained_columns column sigma ++ indexed_gadt_columns column sigma
+    retained_columns     = matching_dep_columns isNativeIndexId
+    indexed_gadt_columns = matching_dep_columns is_indexed_gadt_binder
+    retained_or_gadt_columns =
+      matching_dep_columns (\b -> isNativeIndexId b || is_indexed_gadt_binder b)
 
     -- See Note [Function-valued retained binders] in GHC.Core.Type.
     has_function_binder :: Type -> Bool
@@ -1883,9 +1871,6 @@ tcRetainedVarGroupMatches herald ctxt mctxt arity invis_pat_tys ty
     strip_par (L _ (ParPat _ p)) = strip_par p
     strip_par p                  = p
 
-    listToMaybe (x : _) = Just x
-    listToMaybe []      = Nothing
-
     collect_dep_cols _ 0 _ = []
     collect_dep_cols c n sigma = case coreFullView sigma of
       DepFunTy DepFunVisible b body -> (c, b) : collect_dep_cols (c + 1) (n - 1) body
@@ -2055,115 +2040,19 @@ injectivity, and occurs-check cycles so PMC refutes cross-argument GADT
 impossibilities without false @-Wincomplete-patterns@ warnings.
 -}
 
--- | Check a two-index matrix in left-to-right order.
+-- | Check a multi-column (2+) retained constructor matrix in left-to-right order.
 -- See Note [Retained constructor matrices].
-tcRetainedMatrixMatches :: (Int, Id) -> (Int, Id) -> [ExpPatType] -> [ExpPatType]
-                       -> [RetainedConArg] -> ExpRhoType
-                       -> MatchGroup GhcRn (LHsExpr GhcRn)
-                       -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
-tcRetainedMatrixMatches (first_column, first_index) (second_column, second_index) invis_pat_tys
-                       pat_tys plan rhs_ty
-                       (MG { mg_alts = L loc matches, mg_ext = (origin, ext_ann) })
+tcRetainedMatrixMatches :: [(Int, Id)] -> [ExpPatType] -> [ExpPatType]
+                        -> [RetainedConArg] -> ExpRhoType
+                        -> MatchGroup GhcRn (LHsExpr GhcRn)
+                        -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
+tcRetainedMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
+                        (MG { mg_alts = L loc matches, mg_ext = (origin, ext_ann) })
   = setSrcSpanA loc $
     do { rows <- zipWithM constructors [1..] matches
        ; unless (any has_value_pattern matches) $
            void (foldM unique_row [] (zip rows matches))
-       ; let expected = [(first, second) | first <- domain_cons first_index
-                                         , second <- second_cons]
-       ; synthesized <- if any isNothing rows
-           then pure []
-           else fmap catMaybes $
-                  forM (filter (\pair -> not (any (covers pair) rows)) expected) check_missing
-       ; let columns Nothing = []
-             columns (Just (first, second)) =
-               (first_column, first_index, first) :
-                 [(second_column, second_index, con) | con <- maybeToList second]
-       ; checkRetainedRows True invis_pat_tys pat_tys plan rhs_ty origin loc
-           (zip (map columns rows) matches ++ synthesized) }
-  where
-    first_source = source_column first_column
-    second_source = source_column second_column
-    source_column column = length (filter isRetainedSourceArg (take column plan))
-    plan_columns = retainedColumnNames plan
-    has_value_pattern (L _ (Match { m_pats = L _ pats })) =
-      or [not (isRetainedVarPat pat) | (Nothing, pat) <- zip plan_columns (filter isVisArgLPat pats)]
-
-    -- An omitted constructor pair must contradict a declared equality or
-    -- make an inspected GADT/equality value column uninhabited.
-    check_missing (one, two) = do
-      mb_res <- synthAbsurdMatrixRow
-                  [(first_column, first_index, one), (second_column, second_index, two)]
-                  pat_tys plan loc ext_ann matches
-      case mb_res of
-        Nothing     -> missing_pair
-        Just mb_row -> pure mb_row
-      where
-        missing_pair = failWithTc (TcRnRetainedQuantificationError
-                         (RetainedMissingConstructorPair (dataConName one) (dataConName two)))
-    domain_cons index = case splitTyConApp_maybe (coreFullView (varType index)) of
-      Just (tc, _) -> tyConDataCons tc
-      _ -> []
-    second_cons = domain_cons second_index
-    coverage_error = failWithTc (TcRnRetainedQuantificationError RetainedMatrixCoverage)
-    pattern_error = failWithTc (TcRnRetainedQuantificationError RetainedMatrixPattern)
-
-    row_patterns (Match { m_pats = L _ pats })
-      = case (drop first_source visible, drop second_source visible) of
-          (first : _, second : _) -> return (first, second)
-          _ -> pattern_error
-      where
-        visible = filter isVisArgLPat pats
-
-    constructors position (L match_loc match@(Match
-      { m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } }))
-      = setSrcSpanA match_loc $
-        do { (first, second) <- row_patterns match
-           ; if fallback_pattern first && fallback_pattern second
-             then do { unless (position == length matches) $
-                         setSrcSpanA (getLoc first) $
-                           failWithTc (TcRnRetainedQuantificationError RetainedMatrixFallback)
-                     ; return Nothing }
-             else do { one <- resolve first_index first
-                     ; two <- if fallback_pattern second
-                              then return Nothing else Just <$> resolve second_index second
-                     ; return (Just (one, two)) } }
-    constructors _ (L match_loc _) = setSrcSpanA match_loc coverage_error
-
-    fallback_pattern :: LPat GhcRn -> Bool
-    fallback_pattern (L _ VarPat{}) = True
-    fallback_pattern (L _ WildPat{}) = True
-    fallback_pattern _ = False
-
-    resolve index pat = setSrcSpanA (getLoc pat) $
-      do { con <- tcRetainedCon (varType index) pat
-         ; maybe pattern_error return con }
-
-    covers _ Nothing = True
-    covers (first, second) (Just ((con, _), later)) =
-      first == con && maybe True ((== second) . fst) later
-
-    unique_row seen (Nothing, _) = return seen
-    unique_row seen (row@(Just (first, second)), L match_loc match)
-      = setSrcSpanA match_loc $
-        do { let seconds = maybe second_cons (pure . fst) second
-           ; when (all (\con -> any (covers (fst first, con)) seen) seconds) $
-               do { (_, pat) <- row_patterns match
-                  ; setSrcSpanA (getLoc pat) $
-                      failWithTc (TcRnRetainedQuantificationError RetainedMatrixDuplicate) }
-           ; return (row : seen) }
-
--- | Check an N-column (3+) retained constructor matrix in left-to-right order.
-tcRetainedNMatrixMatches :: [(Int, Id)] -> [ExpPatType] -> [ExpPatType]
-                         -> [RetainedConArg] -> ExpRhoType
-                         -> MatchGroup GhcRn (LHsExpr GhcRn)
-                         -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
-tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
-                         (MG { mg_alts = L loc matches, mg_ext = (origin, ext_ann) })
-  = setSrcSpanA loc $
-    do { rows <- zipWithM constructors [1..] matches
-       ; unless (any has_value_pattern matches) $
-           void (foldM unique_row [] (zip rows matches))
-       ; let expected = sequence (map (domain_cons . snd) cols)
+       ; let expected = mapM (domain_cons . snd) cols
        ; synthesized <- if any isNothing rows
            then pure []
            else fmap catMaybes $
@@ -2175,6 +2064,7 @@ tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
        ; checkRetainedRows True invis_pat_tys pat_tys plan rhs_ty origin loc
            (zip (map row_columns rows) matches ++ synthesized) }
   where
+    is_two_col  = lengthIs cols 2
     source_cols = [length (filter isRetainedSourceArg (take c plan)) | (c, _) <- cols]
     col_indices = map snd cols
     plan_columns = retainedColumnNames plan
@@ -2194,11 +2084,9 @@ tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
         Nothing -> pattern_error
       where
         visible = filter isVisArgLPat pats
-        listToMaybe (x : _) = Just x
-        listToMaybe []      = Nothing
 
     fallback_pattern :: LPat GhcRn -> Bool
-    fallback_pattern (L _ (ParPat _ p)) = fallback_pattern p
+    fallback_pattern (L _ (ParPat _ p)) | not is_two_col = fallback_pattern p
     fallback_pattern (L _ VarPat{})     = True
     fallback_pattern (L _ WildPat{})    = True
     fallback_pattern _                  = False
@@ -2218,10 +2106,17 @@ tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
                              failWithTc (TcRnRetainedQuantificationError RetainedMatrixFallback)
                            [] -> coverage_error
                      ; return Nothing }
-             else Just <$> zipWithM (\idx p -> if fallback_pattern p
-                                               then return Nothing
-                                               else Just <$> resolve idx p)
-                                    col_indices ps }
+             else case (col_indices, ps) of
+               ([first_idx, second_idx], [first_p, second_p]) ->
+                 do { one <- resolve first_idx first_p
+                    ; two <- if fallback_pattern second_p
+                             then return Nothing
+                             else Just <$> resolve second_idx second_p
+                    ; return (Just [Just one, two]) }
+               _ -> Just <$> zipWithM (\idx p -> if fallback_pattern p
+                                                 then return Nothing
+                                                 else Just <$> resolve idx p)
+                                      col_indices ps }
     constructors _ (L match_loc _) = setSrcSpanA match_loc coverage_error
 
     covers _ Nothing = True
@@ -2237,17 +2132,25 @@ tcRetainedNMatrixMatches cols invis_pat_tys pat_tys plan rhs_ty
            ; when (not (null covered_by_row)
                    && all (\tup -> any (covers tup) seen) covered_by_row) $
                do { ps <- row_patterns match
-                  ; let dup_loc = maybe match_loc getLoc (find (not . fallback_pattern) (reverse ps))
+                  ; let dup_loc
+                          | [_, second_p] <- ps = getLoc second_p
+                          | otherwise = maybe match_loc getLoc (find (not . fallback_pattern) (reverse ps))
                   ; setSrcSpanA dup_loc $
                       failWithTc (TcRnRetainedQuantificationError RetainedMatrixDuplicate) }
            ; return (row : seen) }
 
+    -- An omitted constructor tuple must contradict a declared equality or
+    -- make an inspected GADT/equality value column uninhabited.
     check_missing tup = do
       mb_res <- synthAbsurdMatrixRow
                   [(col_i, idx_id, dc) | ((col_i, idx_id), dc) <- zip cols tup]
                   pat_tys plan loc ext_ann matches
       case mb_res of
-        Nothing     -> coverage_error
+        Nothing
+          | [one, two] <- tup ->
+              failWithTc (TcRnRetainedQuantificationError
+                (RetainedMissingConstructorPair (dataConName one) (dataConName two)))
+          | otherwise -> coverage_error
         Just mb_row -> pure mb_row
 
 -- | Refine one later retained column without moving the ordinary patterns.
@@ -2498,12 +2401,9 @@ tcRetainedConMatches :: Id -> [ExpPatType] -> [ExpPatType] -> [RetainedConArg] -
                     -> TcM (MatchGroup GhcTc (LHsExpr GhcTc))
 tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
                     group@(MG { mg_alts = L loc matches, mg_ext = (origin, _) })
-  | [(second_column, second)] <- matrix_columns
-  , not split_final
-  = tcRetainedMatrixMatches (0, index) (second_column + 1, second) invis_pat_tys
-      (mkCheckExpFunPatTy (Scaled (idMult index) (varType index)) : pat_tys) all_arguments rhs_ty group
-  | later@(_ : _ : _) <- matrix_columns
-  = tcRetainedNMatrixMatches ((0, index) : [(col + 1, idx) | (col, idx) <- later]) invis_pat_tys
+  | later@(_ : _) <- matrix_columns
+  , not (lengthIs later 1 && split_final)
+  = tcRetainedMatrixMatches ((0, index) : [(col + 1, idx) | (col, idx) <- later]) invis_pat_tys
       (mkCheckExpFunPatTy (Scaled (idMult index) (varType index)) : pat_tys) all_arguments rhs_ty group
   | has_one_col_fallback
   = setSrcSpanA loc $
@@ -3491,25 +3391,100 @@ tryDesugarNestedCaseAlts is_indexed scrut_name domain_ty alts
       in return (all (`elem` present) all_cons)
 
 -- | Desugar nested constructor patterns in @foreach@ function equations or
--- lambdas into fresh argument variables over a nested @case@ tree.
+-- lambdas into outer argument variables over a nested @case@ tree.
+--
+-- When every equation binds a variable pattern with the same 'OccName' in a
+-- variable-only column, allocate an 'Internal' 'Name' at the first pattern's
+-- location so the source binder stays in 'LocalRdrEnv' and 'RelevantBindings'
+-- at typed holes without altering its polymorphic or retained type. Otherwise
+-- derive the 'System' scrutinee 'OccName' from the first 'VarPat' or enclosing
+-- 'DepFunTy' binder, and bind per-row 'VarPat' aliases around hole RHSs when
+-- the column type is a non-dependent rho-type.
 tryDesugarNestedRetainedMatches
-  :: HsMatchContextRn -> VisArity
+  :: HsMatchContextRn -> VisArity -> Type
   -> MatchGroup GhcRn (LHsExpr GhcRn)
   -> TcM (Maybe ([LPat GhcRn], MatchGroup GhcRn (LHsExpr GhcRn)))
-tryDesugarNestedRetainedMatches mctxt arity group@(MG { mg_alts = L loc rows })
+tryDesugarNestedRetainedMatches mctxt arity ty group@(MG { mg_alts = L loc rows })
   | arity >= 1
   , Just parsed <- traverse parse_row rows
   = runMaybeT $ do
-      arg_names <- liftMaybeT $ mapM (\i -> newSysName (mkVarOcc ("ret_arg_" ++ show (i :: Int))))
-                                     [1 .. arity]
-      body <- build_cols arg_names parsed Nothing
-      let arg_pats = map nlVarPat arg_names
+      let col_pats_by_c = transpose (map (map strip_par . fst) parsed)
+          row_holes     = map (has_hole . snd) parsed
+          ty_infos      = col_ty_infos arity ty
+      arg_specs <- liftMaybeT $
+        zipWith3M choose_col_name [1 .. arity] col_pats_by_c ty_infos
+      body <- build_cols arg_specs (zip parsed row_holes) Nothing
+      let arg_pats = map (nlVarPat . fst) arg_specs
           outer    = mkSimpleMatch mctxt (L loc arg_pats) body
       return (arg_pats, group { mg_alts = L loc [outer] })
   | otherwise = return Nothing
   where
     strip_par (L _ (ParPat _ p)) = strip_par p
     strip_par p = p
+
+    has_hole :: Data a => a -> Bool
+    has_hole thing
+      | Just (HsHole {}) <- (cast thing :: Maybe (HsExpr GhcRn)) = True
+      | Just _ <- (cast thing :: Maybe Name)    = False
+      | Just _ <- (cast thing :: Maybe NameSet) = False
+      | Just _ <- (cast thing :: Maybe Type)    = False
+      | otherwise = or (gmapQ has_hole thing)
+
+    col_ty_infos :: Int -> Type -> [(Maybe OccName, Bool, Maybe Type)]
+    col_ty_infos 0 _ = []
+    col_ty_infos n sigma = case coreFullView sigma of
+      DepFunTy DepFunVisible b body ->
+        (Just (getOccName b), True, Just (varType b)) : col_ty_infos (n - 1) body
+      ForAllTy _ (Bndr tv Required) body ->
+        (Just (getOccName tv), False, Nothing) : col_ty_infos (n - 1) body
+      ForAllTy _ _ body ->
+        col_ty_infos n body
+      FunTy af _ _ arg_ty body
+        | isVisibleFunArg af ->
+            (Nothing, False, Just arg_ty) : col_ty_infos (n - 1) body
+        | otherwise ->
+            col_ty_infos n body
+      _ -> replicate n (Nothing, False, Nothing)
+
+    choose_col_name
+      :: Int
+      -> [LPat GhcRn]
+      -> (Maybe OccName, Bool, Maybe Type)
+      -> TcM (Name, Bool)
+    choose_col_name idx col_pats (mb_dep_occ, is_dep_bndr, mb_col_ty)
+      | all isRetainedVarPat col_pats
+      , (first_loc, first_nm) : rest_vars <- var_locs
+      , let first_occ = nameOccName first_nm
+      , all ((== first_occ) . nameOccName . snd) rest_vars
+      = do { u <- newUnique
+           ; return (mkInternalName u first_occ (locA first_loc), False) }
+      | otherwise
+      = do { u <- newUnique
+           ; return (mkInternalName u fallback_occ generatedSrcSpan, can_case_alias) }
+      where
+        var_locs = [ (nloc, nm) | L _ (VarPat _ (L nloc nm)) <- col_pats ]
+        fallback_occ = case var_locs of
+          (_, nm) : _ -> nameOccName nm
+          []          -> fromMaybe (mkVarOcc ("arg_" ++ show idx)) mb_dep_occ
+        can_case_alias =
+          not is_dep_bndr && maybe False (not . isSigmaTy) mb_col_ty
+
+    choose_sub_name :: Int -> [LPat GhcRn] -> TcM (Name, Bool)
+    choose_sub_name idx sub_col
+      | all (isRetainedVarPat . strip_par) sub_col
+      , (first_loc, first_nm) : rest_vars <- var_locs
+      , let first_occ = nameOccName first_nm
+      , all ((== first_occ) . nameOccName . snd) rest_vars
+      = do { u <- newUnique
+           ; return (mkInternalName u first_occ (locA first_loc), False) }
+      | otherwise
+      = do { u <- newUnique
+           ; return (mkInternalName u fallback_occ generatedSrcSpan, False) }
+      where
+        var_locs = [ (nloc, nm) | L _ (VarPat _ (L nloc nm)) <- map strip_par sub_col ]
+        fallback_occ = case var_locs of
+          (_, nm) : _ -> nameOccName nm
+          []          -> mkVarOcc ("sub_" ++ show idx)
 
     parse_row (L _ Match { m_pats = L _ pats
                          , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] rhs) :| []
@@ -3521,17 +3496,32 @@ tryDesugarNestedRetainedMatches mctxt arity group@(MG { mg_alts = L loc rows })
         in Just (pats, full_rhs)
     parse_row _ = Nothing
 
-    build_cols [] ((_, rhs) : _) _ = return rhs
+    bind_hole_alias :: Name -> Bool -> Bool -> LPat GhcRn -> LHsExpr GhcRn -> LHsExpr GhcRn
+    bind_hole_alias v can_alias row_has_hole pat rhs
+      | isGeneratedSrcSpan (nameSrcSpan v)
+      , can_alias
+      , row_has_hole
+      , L ploc (VarPat x lnm) <- strip_par pat
+      = let alt  = mkSimpleMatch CaseAlt (noLocA [L ploc (VarPat x lnm)]) rhs
+            mg_a = MG { mg_ext = (Generated OtherExpansion SkipPmc, snd (mg_ext group))
+                      , mg_alts = noLocA [alt] }
+        in noLocA (HsCase CaseAlt (nlHsVar v) mg_a)
+      | otherwise
+      = rhs
+
+    build_cols [] (((_, rhs), _) : _) _ = return rhs
     build_cols [] [] _ = mzero
-    build_cols (v : vs) cur_rows mb_fb
-      | all (isRetainedVarPat . strip_par . head . fst) cur_rows
-      = let step (p : ps, rhs) = case unLoc (strip_par p) of
-              VarPat _ (L _ old) -> (renameRetainedMatch [(old, v)] ps, renameRetainedMatch [(old, v)] rhs)
-              _                  -> (ps, rhs)
-            step ([], rhs) = ([], rhs)
+    build_cols ((v, can_alias) : vs) cur_rows mb_fb
+      | all (isRetainedVarPat . strip_par . head . fst . fst) cur_rows
+      = let step ((p : ps, rhs), rh) = case unLoc (strip_par p) of
+              VarPat _ (L _ old) ->
+                let rhs' = bind_hole_alias v can_alias rh p (renameRetainedMatch [(old, v)] rhs)
+                in ((renameRetainedMatch [(old, v)] ps, rhs'), rh)
+              _ -> ((ps, rhs), rh)
+            step (([], rhs), rh) = (([], rhs), rh)
         in build_cols vs (map step cur_rows) mb_fb
       | null vs = do
-          let pats_rhss = [(head ps, rhs) | (ps@(_ : _), rhs) <- cur_rows]
+          let pats_rhss = [(head ps, rhs) | ((ps@(_ : _), rhs), _) <- cur_rows]
               has_fb = case reverse pats_rhss of
                 (lp, _) : _ -> isRetainedVarPat (strip_par lp)
                 []          -> False
@@ -3547,10 +3537,10 @@ tryDesugarNestedRetainedMatches mctxt arity group@(MG { mg_alts = L loc rows })
           return (noLocA (HsCase CaseAlt (nlHsVar v) mg_v))
       | otherwise = do
           let (init_r, mb_local_fb) = case reverse cur_rows of
-                (ps, rhs) : rev_rest
+                ((ps, rhs), _) : rev_rest
                   | not (null rev_rest), all (isRetainedVarPat . strip_par) ps ->
                       let pairs = [ (old, tgt)
-                                  | (p, tgt) <- zip ps (v : vs)
+                                  | (p, (tgt, _)) <- zip ps ((v, can_alias) : vs)
                                   , VarPat _ (L _ old) <- [unLoc (strip_par p)] ]
                       in (reverse rev_rest, Just (renameRetainedMatch pairs rhs))
                 _ -> (cur_rows, mb_fb)
@@ -3567,11 +3557,11 @@ tryDesugarNestedRetainedMatches mctxt arity group@(MG { mg_alts = L loc rows })
                         , mg_alts = noLocA (alts_v ++ extra) }
           return (noLocA (HsCase CaseAlt (nlHsVar v) mg_v))
 
-    resolve_head (p : ps, rhs)
+    resolve_head ((p : ps, rhs), rh)
       | ConPat { pat_con = cname, pat_args = PrefixCon _ subs } <- unLoc (strip_par (retainedConPat p))
       = do { cl <- liftMaybeT (tcLookupConLike (unLoc cname))
            ; case cl of
-               RealDataCon dc -> return (dc, (cname, subs, ps, rhs))
+               RealDataCon dc -> return (dc, (cname, subs, ps, rhs, rh))
                _              -> mzero }
     resolve_head _ = mzero
 
@@ -3580,17 +3570,17 @@ tryDesugarNestedRetainedMatches mctxt arity group@(MG { mg_alts = L loc rows })
       let (same, others) = partition ((== dc) . fst) rest
       in (dc, r :| map snd same) : group_cons others
 
-    build_group vs mb_fb (_, (cname, subs1, rest1, rhs1) :| more)
+    build_group vs mb_fb (_, (cname, subs1, rest1, rhs1, rh1) :| more)
       | null more && all (isRetainedVarPat . strip_par) subs1
-      = do { body <- build_cols vs [(rest1, rhs1)] mb_fb
+      = do { body <- build_cols vs [((rest1, rhs1), rh1)] mb_fb
            ; let cpat = noLocA (ConPat noExtField cname (PrefixCon noExtField subs1))
            ; return (mkSimpleMatch CaseAlt (noLocA [cpat]) body) }
       | otherwise = do
-          sub_vs <- liftMaybeT $ mapM (\i -> newSysName (mkVarOcc ("sub_" ++ show (i :: Int))))
-                                      [1 .. length subs1]
-          let all_r = (subs1 ++ rest1, rhs1) : [ (s ++ r, e) | (_, s, r, e) <- more ]
-          body <- build_cols (sub_vs ++ vs) all_r mb_fb
-          let cpat = noLocA (ConPat noExtField cname (PrefixCon noExtField (map nlVarPat sub_vs)))
+          let sub_cols = transpose (subs1 : [s | (_, s, _, _, _) <- more])
+          sub_specs <- liftMaybeT $ zipWithM choose_sub_name [1 .. length subs1] sub_cols
+          let all_r = ((subs1 ++ rest1, rhs1), rh1) : [ ((s ++ r, e), rh) | (_, s, r, e, rh) <- more ]
+          body <- build_cols (sub_specs ++ vs) all_r mb_fb
+          let cpat = noLocA (ConPat noExtField cname (PrefixCon noExtField (map (nlVarPat . fst) sub_specs)))
           return (mkSimpleMatch CaseAlt (noLocA [cpat]) body)
 
     pats_exhaust ps = do

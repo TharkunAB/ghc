@@ -1808,6 +1808,15 @@ matchDepResult bind_tvs formal_res actual_res
       , Just s2 <- tcMatchTyX_BM bind_fn s1 formal actual
       = Just s2
       | AppTy f_tmpl x_tmpl <- coreFullView formal
+      , AppTy f_act x_act <- coreFullView actual
+      , Just s1 <- match_one subst f_tmpl f_act
+      , Just s2 <- match_one s1 x_tmpl x_act
+      = Just s2
+      | TermAppTy f1 x_tmpl <- coreFullView formal
+      , TermAppTy f2 x_act <- coreFullView actual
+      , f1 == f2
+      = match_one subst x_tmpl x_act
+      | AppTy f_tmpl x_tmpl <- coreFullView formal
       , Just (con, args) <- splitTyConApp_maybe (coreFullView actual)
       , last_a : rev_prefix <- reverse args
       , let prefix = mkTyConApp con (reverse rev_prefix)
@@ -1834,6 +1843,14 @@ matchDepResult bind_tvs formal_res actual_res
       , af1 == af2
       = let rest = fromMaybe [(res1, res2)] (decomp_pairs res1 res2)
         in Just ((arg1, arg2) : rest)
+      | AppTy f1 x1 <- coreFullView formal
+      , AppTy f2 x2 <- coreFullView actual
+      = Just (fromMaybe [(f1, f2)] (decomp_pairs f1 f2)
+              ++ fromMaybe [(x1, x2)] (decomp_pairs x1 x2))
+      | TermAppTy f1 x1 <- coreFullView formal
+      , TermAppTy f2 x2 <- coreFullView actual
+      , f1 == f2
+      = Just (fromMaybe [(x1, x2)] (decomp_pairs x1 x2))
       | Just (tc1, ts1) <- splitTyConApp_maybe (coreFullView formal)
       , Just (tc2, ts2) <- splitTyConApp_maybe (coreFullView actual)
       , tc1 == tc2
