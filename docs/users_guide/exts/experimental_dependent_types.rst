@@ -6,22 +6,25 @@ Experimental dependent types
 .. extension:: DependentTypes
     :shortdesc: Enable the GHC Proposal #378 Dependent Haskell extension bundle.
 
-    :implies: :extension:`ExperimentalDependentTypes`, :extension:`GADTs`,
-              :extension:`DataKinds`, :extension:`PolyKinds`,
-              :extension:`TypeOperators`, :extension:`RankNTypes`,
-              :extension:`ScopedTypeVariables`, :extension:`TypeApplications`,
-              :extension:`TypeAbstractions`, :extension:`StandaloneKindSignatures`,
-              :extension:`EmptyCase`, :extension:`Modifiers`,
-              :extension:`RequiredTypeArguments`, :extension:`ExplicitNamespaces`,
-              :extension:`NoListTuplePuns`
+    :implies: :extension:`ExperimentalDependentTypes`,
+              :extension:`ExistentialTypes`, :extension:`ExtendedLet`,
+              :extension:`GADTs`, :extension:`DataKinds`,
+              :extension:`PolyKinds`, :extension:`TypeOperators`,
+              :extension:`RankNTypes`, :extension:`ScopedTypeVariables`,
+              :extension:`TypeApplications`, :extension:`TypeAbstractions`,
+              :extension:`StandaloneKindSignatures`, :extension:`EmptyCase`,
+              :extension:`Modifiers`, :extension:`RequiredTypeArguments`,
+              :extension:`ExplicitNamespaces`, :extension:`NoListTuplePuns`
     :since: 10.1
     :status: Experimental
 
-    Enable Dependent Haskell (`GHC Proposal #378`_) together with its canonical
-    companion extensions and default-on source equation publication
-    (:ghc-flag:`-fwrite-source-equations`).
+    Enable Dependent Haskell (`GHC Proposal #378`_) and its companion
+    extensions. Enabling this extension also enables
+    :ghc-flag:`-fwrite-source-equations` by default.
 
 .. _GHC Proposal #378: https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0378-dependent-type-design.rst
+.. _GHC Proposal #473: https://github.com/ghc-proposals/ghc-proposals/pull/473
+.. _GHC Proposal #523: https://github.com/ghc-proposals/ghc-proposals/pull/523
 
 .. extension:: ExperimentalDependentTypes
     :shortdesc: Check restricted retained algebraic quantification.
@@ -30,45 +33,50 @@ Experimental dependent types
     :since: 10.1
     :status: Experimental
 
-    Enable retained algebraic quantification without enabling the full
-    :extension:`DependentTypes` pragma bundle (useful when preserving
-    ``ListTuplePuns`` or Haskell2010 defaults).
+    Compatibility alias that enables dependent quantification and default-on
+    :ghc-flag:`-fwrite-source-equations` without enabling the full
+    :extension:`DependentTypes` extension bundle. Use this alias to keep
+    :extension:`ListTuplePuns` or language-edition defaults active.
 
 .. extension:: ExistentialTypes
     :shortdesc: Enable first-class existential quantification.
 
+    :implies: :extension:`RequiredTypeArguments`
     :since: 10.1
     :status: Experimental
 
-    Alias enabling existential quantification (``exists``) and dependent type
-    extensions.
+    Enable first-class existential quantification (``exists``,
+    `GHC Proposal #473`_). In this compiler, the flag acts as an alias for
+    :extension:`ExperimentalDependentTypes`.
 
 .. extension:: ExtendedLet
     :shortdesc: Enable local let bindings in types.
 
+    :implies: :extension:`RequiredTypeArguments`
     :since: 10.1
     :status: Experimental
 
-    Alias enabling ``let ... in ...`` bindings in types.
+    Enable local ``let ... in ...`` bindings in types (`GHC Proposal #523`_).
+    In this compiler, the flag acts as an alias for
+    :extension:`ExperimentalDependentTypes`.
 
-Both :extension:`DependentTypes` and :extension:`ExperimentalDependentTypes` are
-disabled by default. Enabling either extension also enables
-:ghc-flag:`-fwrite-source-equations` by default unless explicitly suppressed via
-:ghc-flag:`-fno-write-source-equations`. It enables ``foreach`` (and Unicode
-``∏``, ``U+220F``, when :extension:`UnicodeSyntax` is active), ``exists``, and
-``some`` in types as well as in required type argument term syntax, and checks
-explicit dependent value signatures.
-Telescopes in ``forall``, ``foreach``, ``exists``, and ``some`` support
-shared-type binder groups such as ``foreach (m n p :: Nat) ->`` and
-``some (m n :: Nat).``, and invisible ``foreach .`` / ``exists`` telescopes
-accept brace-delimited specificity binders such as ``foreach {k :: Nat}.``.
-To override any implied extension, list its ``No...`` (or ``ListTuplePuns``)
-counterpart after ``DependentTypes``.
-The experiment uses a native dependent Core representation. The restricted
-module path supports native top-level signatures and local retained functions.
-Interfaces encode
-retained binders with scoped local Id names. GHCi can load these modules as
-interpreted source and keep local declarations between commands.
+GHC disables :extension:`DependentTypes` and
+:extension:`ExperimentalDependentTypes` by default. Enabling either extension
+turns on :ghc-flag:`-fwrite-source-equations` by default. Pass
+:ghc-flag:`-fno-write-source-equations` to disable source-equation
+publication. Place a ``No...`` flag or pragma (or :extension:`ListTuplePuns`)
+after :extension:`DependentTypes` to override any implied extension.
+
+These extensions enable ``foreach``, ``exists``, and ``some`` in types and in
+required type argument positions. With :extension:`UnicodeSyntax`, ``∏``
+(``U+220F``) is an alias for ``foreach``. Telescopes in ``forall``,
+``foreach``, ``exists``, and ``some`` accept shared-type binder groups such as
+``(m n p :: Nat)`` and ``{m n p :: Nat}``.
+
+GHC compiles dependent definitions to a native dependent Core representation.
+Module interfaces record retained binders with scoped local identifier names.
+GHCi loads dependent modules as interpreted source and preserves local
+declarations across commands.
 
 Local definitions and functions in types
 ----------------------------------------
@@ -139,6 +147,28 @@ it up in the type namespace. A promotion tick always selects a data
 constructor. A synonym used as a pattern must still have a constructor
 head after expansion.
 
+A term function whose result type is ``Type`` (from ``Data.Kind``) defines a
+large elimination without a separate ``type family`` declaration::
+
+    {-# LANGUAGE DependentTypes #-}
+    module LargeElim where
+    import Data.Kind (Type)
+
+    data Val = Bot | Arr Val Val
+
+    valPred :: Val -> Type
+    valPred Bot       = type ()
+    valPred (Arr a b) = type (valPred a -> valPred b)
+
+    defaultVal :: foreach (v :: Val) -> valPred v
+    defaultVal Bot       = ()
+    defaultVal (Arr _ b) = \_ -> defaultVal b
+
+Each equation right-hand side writes its result type with the ``type`` herald.
+GHC synthesizes a promoted closed type family for type-level calls such as
+``valPred v``. Multi-argument functions (``Val -> Val -> Type``) and
+polymorphic list eliminations (``forall a. [a] -> Type``) follow the same rule.
+
 Retained pairs and erased lengths
 ---------------------------------
 
@@ -147,15 +177,14 @@ second component can mention the first. An existential can instead hide
 a type index chosen by the producer. For example, a vector filter chooses
 its result length after it checks the elements::
 
-    {-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
-    {-# OPTIONS_GHC -O0 #-}
+    {-# LANGUAGE DependentTypes #-}
     module Filter where
     import GHC.Sigma (Sigma(Pair))
 
     data Nat = Z | S Nat
     data Vec a (n :: Nat) where
-      Nil  :: Vec a 'Z
-      Cons :: a -> Vec a n -> Vec a ('S n)
+      Nil  :: Vec a Z
+      Cons :: a -> Vec a n -> Vec a (S n)
 
     type Filtered a = exists (n :: Nat). Vec a n
 
@@ -173,13 +202,37 @@ and packs the new cell at its successor. Reading the first passing cell
 can leave the tail unevaluated. The caller must establish that the result
 is nonempty before it can use a function that requires a successor length.
 
-The dot form infers package introduction and elimination. The bar form
-(``exists (n :: Nat) | Vec a n``) uses explicit ``Pack`` expressions and
-patterns from ``GHC.Exists``. ``GHC.Exists`` also provides ``(/\)``
-(``MkCPair``) to pair a constraint dictionary with a payload, as in
-``exists a. Show a /\ a``, and ``discardEvidence`` to drop the stored
-dictionary. ``GHC.Sigma`` exports ``Sigma(Pair)``, ``first``, ``second``
-(``foreach (p :: Sigma a b) -> b (first p)``), and ``withSigma``.
+Both ``exists`` (enabled by :extension:`ExistentialTypes` or
+:extension:`DependentTypes`) and ``some`` accept multi-binder telescopes,
+shared-type binder groups, and dot or bar delimiters:
+
+- ``exists (m n :: Nat). Pair2 (Vec a m) (Vec a n)`` and
+  ``exists {k} (x :: k). Proxy x`` infer package introduction and elimination.
+- ``exists (m n :: Nat) | Pair2 (Vec a m) (Vec a n)`` uses explicit ``Pack``
+  construction and pattern matching from ``GHC.Exists``.
+- ``Pack @w payload`` supplies or binds an explicit witness type ``w`` in
+  expressions and patterns (including ``Pack @_ payload``) for both the bar
+  form and the dot form::
+
+      showPacked :: (exists a | (a, a -> String)) -> String
+      showPacked (Pack @a (x, render)) = render (x :: a)
+
+      packedInt :: exists a | (a, a -> String)
+      packedInt = Pack @Int (42, show)
+
+- ``GHC.Exists`` also exports ``(/\)`` (constructor ``MkCPair``,
+  ``infixr 2 /\``) to pair a constraint dictionary with a value, as in
+  ``exists a. Show a /\ a``, and ``discardEvidence :: (c /\ a) -> a`` to drop
+  the stored dictionary.
+- ``some (m n :: Nat) | Pair2 (Vec a m) (Vec a n)`` and
+  ``some (m n :: Nat). Pair2 (Vec a m) (Vec a n)`` desugar right-associatively
+  to nested ``Sigma`` pairs. GHC accepts ``some`` in any type position,
+  including function signatures, GADT fields, local ``let`` signatures,
+  expression type annotations, and required type arguments.
+- ``GHC.Sigma`` exports ``Sigma(Pair)``, ``first :: Sigma a p -> a``,
+  ``second :: foreach (p :: Sigma a b) -> b (first p)``, and
+  ``withSigma :: Sigma a p -> (foreach (x :: a) -> p x -> r) -> r``.
+
 Both the producer and an ordinary client can
 compile at ``-O1``, including through a separately compiled interface.
 Two uses of the same unrestricted local package can share a witness in
@@ -196,10 +249,10 @@ the certified three-guard ``fromInteger`` method under
 automatically promotes nonnegative type-level numerals at that kind without
 requiring a separate ``FromNatural`` instance.
 
-A library can also supply an explicit ``FromNatural`` instance for custom
-index types. Import ``FromNatural`` from ``GHC.TypeNats.Experimental`` in the
-package ``ghc-experimental``. Define an instance for the index kind. For
-example, these declarations register a Peano kind::
+A library can also supply an explicit ``FromNatural`` fallback instance when no
+certified ``Num`` instance is in scope. Import ``FromNatural`` from
+``GHC.TypeNats.Experimental`` in ``ghc-experimental`` and define an instance
+for the index kind::
 
     import GHC.TypeNats.Experimental (FromNatural)
     import qualified GHC.TypeNats as TN
@@ -325,6 +378,27 @@ A different dictionary can still supply the ordinary runtime operation.
 If the body needs the index equality, the compiler also checks rewrite
 rules that can affect the selected method.
 
+Nonrecursive local ``let`` and ``where`` bindings also unfold lazy unary
+function compositions in the static subset::
+
+    packIso :: forall a b c.
+               foreach (f :: a -> b) (g :: b -> a)
+                       (h :: b -> c) (k :: c -> b)
+            -> (foreach (x :: a) -> g (k (h (f x))) :~: x)
+            -> (foreach (y :: c) -> h (f (g (k y))) :~: y)
+            -> Iso a c
+    packIso f g h k left right = MkIso @a @c to from left right
+      where
+        to x = h (f x)
+        from = g . k
+
+GHC unfolds ``to`` and ``from`` in dependent types across ``let`` blocks and
+single-clause or multi-clause ``where`` blocks. GHC also unfolds ``where``
+bindings on ``case`` branches when no guard binds a referenced variable. GHC
+accepts signed and unsigned definitions, point-free ``h . f``, lambda
+``\x -> h (f x)``, and chained compositions ``p . h . f``. Runtime evaluation
+remains lazy. Recursive local functions remain opaque term skolems.
+
 The vector library's ``Num Nat`` instance also supplies checked equations
 for ``fromInteger``. A caller can use those equations at a retained
 argument, including inside an addition::
@@ -340,11 +414,12 @@ first guards against ``n < 0``, returns the zero constructor for
 ``n == 0``, and otherwise applies the successor constructor to
 ``fromInteger (n - 1)``. Both guards use the standard ``Integer``
 operations. The instance module publishes the constructors in its
-interface. Use retained numerals in a client of that module. Each
-successor counts against ``-freduction-depth``.
+interface. Each successor counts against ``-freduction-depth``.
 The ordinary solver must select the checked dictionary at the literal.
-A result signature still uses ``FromNatural``. GHC checks
-that the two interpretations agree when it checks the result type.
+Result signatures use the certified ``Num`` conversion directly. If no
+certified ``Num`` instance is in scope, GHC falls back to an explicit
+``FromNatural`` instance. When both instances are in scope, GHC checks that the
+two interpretations agree.
 
 A consumer can infer the tail of a vector produced by another call::
 
@@ -535,6 +610,68 @@ interface. Within the instance module, use ``plus n m`` directly.
 An abstract ``Num Nat`` dictionary passed to the client
 cannot establish the addition equations.
 
+Quantifiers, telescopes, and visibility
+---------------------------------------
+
+Dependent Haskell provides four explicit quantifiers alongside ``c =>`` and
+``t1 -> t2``:
+
+- ``forall a.``: erased at runtime and invisible at call sites.
+- ``forall a ->``: erased at runtime and visible (required) at call sites.
+- ``foreach a.``: retained at runtime and invisible at call sites.
+- ``foreach a ->``: retained at runtime and visible (required) at call sites.
+
+Telescope binders in ``foreach`` follow the same syntactic rules as ``forall``:
+
+- Shared-type binder groups ``(m n p :: Nat)`` and ``{m n p :: Nat}`` expand in
+  source order across ``forall``, ``foreach``, ``exists``, and ``some``.
+- Unannotated binders ``foreach a ->``, ``foreach m n.``, and ``foreach {n}.``
+  infer their domain type from uses in the body.
+- Wildcard binders ``foreach (_ :: t1) -> t2`` and ``foreach _ -> t2`` require
+  call arguments in the static subset without binding a name in ``t2``.
+- With :extension:`UnicodeSyntax`, ``∏`` (``U+220F``) stands for ``foreach`` in
+  both ``∏ (n :: Nat) ->`` and ``∏ (n :: Nat).``.
+- Required type arguments accept ``foreach``, ``∏``, ``exists``, and ``some``
+  directly in term syntax without a ``type`` herald.
+
+Invisible ``foreach (n :: Nat).`` binders have specified visibility by default.
+Callers can omit the argument for inference or pass an explicit override with
+``@arg``. Equations and lambdas can bind or pattern-match specified invisible
+retained arguments with ``@pat``, or omit ``@pat`` to keep the signature binder
+name in scope::
+
+    {-# LANGUAGE DependentTypes #-}
+
+    vReplicateImplicit :: forall {a}. foreach (n :: Nat). a -> Vec a n
+    vReplicateImplicit @Zero     _ = VNil
+    vReplicateImplicit @(Succ k) x = VCons x (vReplicateImplicit @k x)
+
+    quickLength :: forall a. foreach (n :: Nat). Vec a n -> Nat
+    quickLength @_ @n _ = n
+
+    skipInferred :: forall a. foreach {m :: Nat}. foreach (n :: Nat).
+                    Vec a m -> Vec a n -> (Nat, Nat)
+    skipInferred @_ @n _ _ = (m, n)
+
+Brace-delimited ``foreach {m :: Nat}.`` binders have inferred specificity.
+Explicit ``@arg`` call overrides and ``@pat`` equation patterns skip ``{...}``
+binders. GHC still accepts legacy ``@{expr}`` call syntax as a compatibility
+alias for ``@arg`` on invisible ``foreach .`` parameters.
+
+When a retained binder has kind ``Type``, the bound name stays in scope as a
+type variable in type positions and required type arguments. At runtime, GHC
+passes ``Typeable`` evidence for that binder. Call sites accept unadorned type
+expressions in the static subset as well as ``(type T)``::
+
+    the :: forall (a :: Type) -> a -> a
+    the _ x = x
+
+    ex5 :: foreach (a :: Type) -> a -> a
+    ex5 a x = the a (x :: a)
+
+    sample :: (Int, Maybe Char)
+    sample = (ex5 Int 42, ex5 (Maybe Char) (Just 'z'))
+
 Retained arguments
 ------------------
 
@@ -625,22 +762,26 @@ The input Nat remains a runtime value. ``headNative`` does not inspect its
 Nat argument. ``appendNative`` uses its vector arguments to select equations.
 Nat constructor indices use ordinary DataKinds promotion.
 
-The current subset requires a complete value signature. It permits outer
-erased ``forall`` binders and multiple annotated retained binders. The domain
-must be a closed, lifted, first-order algebraic type. Parameterised domains,
-newtypes, existential or constrained constructors, unboxed fields, and
-constructor wrappers remain unsupported.
+Dependent definitions require an explicit value signature. Signatures allow
+outer and inner erased ``forall`` binders, visible and invisible ``foreach``
+binders, unannotated and wildcard ``foreach`` binders, ``Type`` domains,
+function domains, and lifted algebraic or indexed GADT domains. GHC rejects
+newtype and unboxed ``foreach`` domains. Retained GADT constructors support
+existential ``forall`` binders, class and equality constraints, and visible or
+invisible ``foreach`` fields (such as
+``MkT :: forall a -> foreach (n :: Nat) -> Vec a n -> T``).
 
-One variable equation can bind the complete retained telescope and match an
-ordinary GADT payload, as in ``headNative``. An equation with a complete signature
-can also stop before the remaining retained arguments, as in
-``appendAfterSuccessor``.
-Unsigned aliases of retained functions still require a complete signature and
-report GHC-83605. Constructor equations split one
-leading retained index. Each constructor of that index must occur in an
-unguarded equation. Later ordinary arguments can distinguish equations
-for the same retained constructor. GHC checks the ordinary patterns for
-coverage and redundancy using the usual pattern warnings. This adapter
+One variable equation can bind the retained telescope and match an ordinary
+GADT payload, as in ``headNative``. An equation with a complete signature can
+also stop before the remaining retained arguments, as in
+``appendAfterSuccessor``. Unsigned aliases of retained functions require a
+complete signature and report GHC-83605.
+
+Constructor equations can match one or more ``foreach`` columns, including
+nested constructor patterns (such as ``S (S k)``) and catch-all ``_`` fallback
+rows. Later ordinary arguments can distinguish equations for the same retained
+constructors. GHC checks pattern coverage and redundancy with the standard
+warnings. GHC rejects guards on retained constructor equations. This adapter
 checks a list against a requested length::
 
     fromListExact :: foreach (n :: Nat) -> [a] -> Maybe (Vec a n)
@@ -649,43 +790,38 @@ checks a list against a requested length::
     fromListExact (S _) [] = Nothing
     fromListExact (S n) (x : xs) = VCons x <$> fromListExact n xs
 
-In each equation, matching the leading constructor refines dependent
-argument and result types for that equation alone. Retained constructor
-fields and later retained variables accept variable and wildcard patterns.
-The arguments must have unrestricted multiplicity. The result must have
-lifted kind, and the outer match wrapper must be identity. Ordinary rank
-restrictions still apply.
-An erased ``forall`` inside a retained binder's scope remains unsupported.
-Index-dependent constraints are limited to reflexive
-Boolean equalities. Quick Look inference and optimisation pragmas for retained
-functions remain restricted. Dedicated rejection checks report GHC-83605.
-Ordinary payload mismatches use the existing type error. Unsupported type
-positions report GHC-43582.
+In each equation, matching a retained constructor refines dependent argument
+and result types (including rank-2 ``forall`` payloads and results) for that
+equation. Dedicated rejection checks report GHC-83605. Ordinary payload
+mismatches use the standard type error. Unsupported type positions report
+GHC-43582.
 
-Source ``case`` expressions can refine a named local retained index when the
-result type is checked. The rule also refines referenced local values whose
-types depend on that index. It requires one unguarded branch per constructor
-and accepts variables or wildcards for its fields. The result must have lifted kind. Parentheses around
-the scrutinee are accepted. Generalized locals require unrestricted
-multiplicities. Guards, defaults, nested constructor patterns,
-Template Haskell quotations, and general motive inference remain unsupported.
-The case inspects its index even when the result is a function. Captured payloads
-remain lazy until the selected branch uses them.
+Source ``case`` expressions refine a named local retained index when GHC checks
+the result type. The match also refines referenced local values whose types
+depend on that index. Dependent ``case`` branches accept flat and nested
+constructor patterns and catch-all ``_`` fallback rows. GHC rejects guards and
+Template Haskell quotations in dependent ``case`` expressions and does not
+infer general motives. The case inspects its index even when the result is a
+function. Captured payloads remain lazy until the selected branch uses them.
 
-Calls can pass constructor arguments with fields, including ``S n`` and
-``S (S n)``. These calls do not force ``n`` to check its index. CorePrep checks
-transport of later payloads and the result when it names a constructor argument.
-Transport through a remaining retained function is supported when its closed
-algebraic domain and unrestricted multiplicity stay unchanged. This includes
-partial applications such as ``appendNative @Int (S n)``. Later applications
-retain the original index relationships. Structural Pi unification,
-normalization with ambient Given evidence or plugins,
-changed domains or multiplicities, and dependent erased binder kinds remain
-unsupported. Strict wildcard matching on a partial function with named indices
-preserves ordinary forcing behavior. It does not force an
-unused index or the function body. An empty match on a function type remains
-non-exhaustive. Producers and consumers that use local names must use the same
-named index. The checker does not equate a name with its definition.
+Calls accept constructor arguments with fields (including ``S n``, ``S (S n)``,
+and indexed or existential GADT constructors), annotated expressions, local
+names, and checked source calls. These calls do not force ``n`` to check its
+index. Partial applications such as ``appendNative @Int (S n)`` preserve index
+relationships across remaining arguments. GHC does not perform structural
+``foreach`` unification, normalization with ambient Given evidence or plugins,
+or function eta conversion. Strict wildcard matching on a partial function with
+named indices preserves ordinary forcing behavior. It does not force an unused
+index or the function body. An empty match on a function type remains
+non-exhaustive.
+
+Function parameters and ``case``-bound variables used in types act as rigid
+term skolems unless pattern matching refines them. Nonrecursive local ``let``
+and ``where`` bindings in the static subset (including checked arithmetic,
+constructors, and lazy unary function compositions) unfold to their defining
+expressions in dependent types. Recursive local bindings and bindings outside
+the static subset remain opaque skolems. Producers and consumers of opaque
+local bindings must share the same named variable.
 
 Global type-family equations can normalize beneath a retained binder with an
 unchanged closed algebraic domain and unrestricted multiplicity. Complete
@@ -723,14 +859,77 @@ function or assign a type meta-variable. Family axioms reduce at nominal and
 representational roles. Existing phantom normalization leaves family heads
 unreduced; ordinary forall binder kinds normalize at nominal role.
 
-Use ``-O0 -fomit-interface-pragmas -fno-write-if-simplified-core`` for
-object code and bytecode. The restricted module pipeline forces Core Lint
-and STG Lint. GHCi can interpret a module in memory. A no-link build can
-also write bytecode for a later GHCi session. Profiling, module plugins,
-JavaScript code generation, and optimized module options remain unsupported.
-Native-containing ``INLINE``, ``INLINABLE``, and class-default unfoldings also
-remain unsupported. Their current builders run ordinary optimization during
-desugaring.
+Dependent typed holes and advisory totality
+-------------------------------------------
+
+Under :extension:`DependentTypes` or :extension:`ExperimentalDependentTypes`,
+typed holes (see :ref:`typed-holes`) inspect local ``foreach`` runtime indices,
+local ``let`` and ``where`` bindings, and GADT equality Givens:
+
+- Valid hole fits instantiate polymorphic constructors (such as ``Refl``),
+  GADT constructors, and ``foreach`` lemmas at runtime term indices, including
+  bounded one-step local closure such as ``cong Succ (plusAssoc m n p)``.
+- Refinement hole fits default to level 1 (see
+  :ghc-flag:`-frefinement-level-hole-fits=⟨n⟩`) and split a goal into typed
+  subgoals through ``foreach`` functions and required-type-argument congruence
+  wrappers such as ``cong Succ (_ :: plus (plus m n) p :~: plus m (plus n p))``.
+- When a hole type contains a stuck promoted function application on an unsplit
+  variable, GHC suggests pattern-matching on that variable and lists its
+  constructors under ``Suggested fixes``.
+
+Dependent Haskell does not require termination by default. Authors who want
+local structural termination feedback can enable :ghc-flag:`-freport-totality`.
+
+.. ghc-flag:: -freport-totality
+    :shortdesc: Emit an advisory structural totality report for top-level bindings.
+    :type: dynamic
+    :reverse: -fno-report-totality
+    :category: verbosity
+
+    :default: off
+    :since: 10.1
+
+    Inspect zonked top-level value bindings and emit one informational
+    ``totality: <name>: <status>`` diagnostic per binding. The report is
+    advisory: it never fails compilation under :ghc-flag:`-Werror`, and it does
+    not alter Core conversion, optimization, or ``.hi`` interface files.
+
+    GHC recomputes the top-level call graph across signed and unsigned bindings.
+    GHC checks pattern-match coverage privately without requiring
+    :ghc-flag:`-Wincomplete-patterns`. GHC classifies each binding into one of
+    two categories:
+
+    - ``checked-structural``: exhaustive unguarded equations over closed,
+      strictly positive first-order algebraic types, calling only
+      ``checked-structural`` local functions, with direct self-recursion on a
+      strict constructor subterm in one fixed parameter position.
+    - ``unknown (<reason>)``: non-certified forms, reporting the blocking
+      reason (such as ``non-structural recursive call``, ``mutual recursion``,
+      ``partial or guarded equations``, ``higher-order call``,
+      ``imports external function``, or ``calls non-total local function``).
+
+Source equations, build options, and reserved syntax
+----------------------------------------------------
+
+:extension:`DependentTypes` and :extension:`ExperimentalDependentTypes` (along
+with :extension:`ExistentialTypes` and :extension:`ExtendedLet`) enable
+:ghc-flag:`-fwrite-source-equations` by default. Pass
+:ghc-flag:`-fno-write-source-equations` to disable source-equation publication
+for a module. An ordinary module without dependent extensions can pass
+:ghc-flag:`-fwrite-source-equations` to publish checked equations for
+downstream dependent clients. GHC stages checked source equations and closure
+tables in dependency order within the defining module and across ``.hi``
+interfaces (including with :ghc-flag:`-fno-code` and
+:ghc-flag:`-fwrite-interface`).
+
+For modules with native retained definitions, pass
+``-fomit-interface-pragmas -fno-write-if-simplified-core`` when writing
+interfaces. The native dependent Core pipeline runs Core Lint and STG Lint.
+GHCi can interpret dependent modules in memory or load compiled bytecode. GHC
+does not support native-containing ``INLINE``, ``INLINABLE``, or class-default
+unfoldings, profiling, module plugins, or JavaScript code generation.
+Spine-strict list proofs over certified ``base`` operations and existential
+packages compile with optimization enabled.
 
 Use libraries and packages built with a matching compiler. The configured
 compiler at this revision is ``10.1.20261115.1``. Its ordinary interface
@@ -742,21 +941,30 @@ indices, and opaque applications of a bound function. Its version is
 separate from the ordinary interface version. Regenerate older
 ``.hie`` files with this compiler before reading them.
 
-:extension:`ExperimentalDependentTypes` implies :extension:`RequiredTypeArguments`
-(and enables :ghc-flag:`-fwrite-source-equations` unless
-:ghc-flag:`-fno-write-source-equations` is given), while
-:extension:`DependentTypes` additionally implies the canonical Proposal #378
-extension bundle listed above. Every implied extension can be overridden by a
-later ``No...`` or ``ListTuplePuns`` pragma. The ``:: Bool`` annotation in a
-``foreach`` binder specifies the type of a value binder; it does not make that
-binder an erased type variable.
+:extension:`ExperimentalDependentTypes`, :extension:`ExistentialTypes`, and
+:extension:`ExtendedLet` imply :extension:`RequiredTypeArguments` and enable
+:ghc-flag:`-fwrite-source-equations` unless
+:ghc-flag:`-fno-write-source-equations` is given. :extension:`DependentTypes`
+implies :extension:`ExperimentalDependentTypes`, :extension:`ExistentialTypes`,
+:extension:`ExtendedLet`, :extension:`GADTs` (which implies
+:extension:`GADTSyntax` and :extension:`MonoLocalBinds`),
+:extension:`DataKinds`, :extension:`PolyKinds`, :extension:`TypeOperators`,
+:extension:`RankNTypes` (which implies :extension:`ExplicitForAll`),
+:extension:`ScopedTypeVariables`, :extension:`TypeApplications`,
+:extension:`TypeAbstractions`, :extension:`StandaloneKindSignatures` (which
+disables :extension:`CUSKs`), :extension:`EmptyCase`, :extension:`Modifiers`,
+:extension:`RequiredTypeArguments`, :extension:`ExplicitNamespaces`, and
+:extension:`NoListTuplePuns`. A later ``No...`` or :extension:`ListTuplePuns`
+flag or pragma overrides any implied extension.
 
-When the extension is disabled, ``foreach`` remains an ordinary identifier::
+When these extensions are disabled, ``foreach``, ``exists``, and ``some``
+remain ordinary identifiers::
 
     foreach :: a -> a
     foreach x = x
 
-When the extension is enabled, ``foreach`` is a reserved keyword. Programs that
-use it as an identifier must leave the extension disabled. The extension does
-not enable general dependent Haskell, native module unfoldings, or the
-ordinary optimizer for dependent Core.
+When :extension:`DependentTypes`, :extension:`ExperimentalDependentTypes`,
+:extension:`ExistentialTypes`, or :extension:`ExtendedLet` is enabled, GHC
+reserves ``foreach``, ``exists``, and ``some`` as keywords (and reserves ``∏``
+when :extension:`UnicodeSyntax` is also enabled). Programs that use these names
+as identifiers must leave the dependent extensions disabled.
