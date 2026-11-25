@@ -30,3 +30,6 @@ isMatchableFunTy :: Type -> Bool
 
 -- | Build an arrow from the actual argument and result sorts.
 mkFunctionType :: HasDebugCallStack => Type -> Type -> Type -> Type -> Type
+
+-- | Test whether a kind has a constraint premise along its Pi spine.
+hasConstraintPremise :: Type -> Bool

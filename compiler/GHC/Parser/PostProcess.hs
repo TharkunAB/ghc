@@ -3809,9 +3809,12 @@ punsIfElse enabled disabled = do
 -- This is used in Parser.y to guard rules that require punning.
 requireLTPuns :: PsErrPunDetails -> Located a -> Located b -> P ()
 requireLTPuns err start end =
-  unlessM punsAllowed $ do
+  unlessM allowed $ do
     addError (mkPlainErrorMsgEnvelope loc (PsErrInvalidPun err))
   where
+    allowed = case err of
+      PEP_TupleSyntaxType -> (||) <$> punsAllowed <*> getBit ExperimentalDependentTypesBit
+      _                   -> punsAllowed
     loc = (combineSrcSpans (getLoc start) (getLoc end))
 
 -- | Call a parser with a span and its comments given by a start and end token.

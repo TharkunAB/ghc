@@ -1059,3 +1059,19 @@ test('NativeParamDependentRecordUpdate',
       extra_files(['NativeParamDependentRecordUpdateProvider.hs',
                    'NativeParamDependentRecordUpdate.hs'])],
      run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
+test('NativeSameModuleClosedEval',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeSameModuleClosedEval.hs'])],
+     run_command, ['bash NativeSameModuleClosedEval.sh "{compiler}" "{libdir}"'])
+test('NativeUnboxedTupleAndCharPrim',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeUnboxedTupleAndCharPrim.hs'])],
+     run_command, ['bash NativeUnboxedTupleAndCharPrim.sh "{compiler}" "{libdir}"'])
+test('NativeDataFamilyNewtypeExistential',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeDataFamilyNewtypeExistential.hs'])],
+     run_command, ['bash NativeDataFamilyNewtypeExistential.sh "{compiler}" "{libdir}"'])
+test('NativeStandaloneConstrainedFamily',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeStandaloneConstrainedFamily.hs'])],
+     run_command, ['bash NativeStandaloneConstrainedFamily.sh "{compiler}" "{libdir}"'])

@@ -94,7 +94,7 @@ import GHC.Types.Unique
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.Set
-import GHC.Types.TyThing ( TyThing(AnId), tyThingGREInfo )
+import GHC.Types.TyThing ( tyThingGREInfo )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name
 import GHC.Types.Name.Set
@@ -1283,15 +1283,19 @@ lookupTypeOcc position rdr_name
                             ; addUsedGRE AllDeprecationWarnings gre
                             ; return gre }
                     else case level of
-                      Comp | TypeApplicationHead{} <- position
-                           , isQual term_rdr || open_operands
-                           , isLocalGRE gre, not explicit_levels
+                      Comp | isLocalGRE gre, not explicit_levels
                            , isLexVarId (occNameFS (greOccName gre))
-                           , nameModule_maybe name == Just this_mod
-                           , Just ref <- demands ->
-                        do { loc <- getSrcSpanM
-                           ; updTcRef ref ((name, loc) :)
-                           ; return gre }
+                           , nameModule_maybe name == Just this_mod ->
+                        case demands of
+                          Just ref -> do
+                            loc <- getSrcSpanM
+                            updTcRef ref ((name, loc) :)
+                            return gre
+                          Nothing -> do
+                            local_defs <- tcg_local_open_defs <$> getGblEnv
+                            if name `elemNameEnv` local_defs
+                              then return gre
+                              else failWithTc (TcRnNoSourceTable name)
                       _ -> failWithTc (TcRnNoSourceTable name) }
         (gre, _) : rest
           | any (isJust . snd) candidates -> do

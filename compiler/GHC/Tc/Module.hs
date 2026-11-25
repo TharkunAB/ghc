@@ -75,11 +75,13 @@ import GHC.Tc.Gen.Bind
 import GHC.Tc.Gen.Default
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Sig( isCompleteHsSig, tcRules )
-import {-# SOURCE #-} GHC.HsToCore.Binds (dsTopLHsBinds)
+import {-# SOURCE #-} GHC.HsToCore.Binds (dsHsWrapper, dsTopLHsBinds)
 import GHC.HsToCore.Monad (initDsTc)
-import GHC.Core (CoreExpr)
+import GHC.Core (CoreExpr, flattenBinds)
 import qualified GHC.Core as Core
+import GHC.Core.FVs (exprSomeFreeVarsList)
 import GHC.Core.Utils (exprType)
+import GHC.Builtin.WiredIn.Types (unitDataConId)
 import GHC.Data.OrdList (fromOL)
 import GHC.Tc.Gen.SourceClosure
   ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
@@ -2572,15 +2574,43 @@ tcTopSrcTablesWith prev_deriv group = do
               let tables = ordinary ++ cases
                   found = mkNameSet (map (tyConName . snd) tables)
                   used_in_early = mkNameSet (localUses (mkNameSet (map snd needed)) early)
+              has_interp <- isJust . hsc_interp <$> getTopEnv
+              defer_on <- or <$> sequence
+                [ goptM Opt_DeferTypeErrors
+                , goptM Opt_DeferTypedHoles
+                , goptM Opt_DeferOutOfScopeVariables ]
+              let fallback_demands =
+                    [ (term, nameSrcSpan term)
+                    | (term, family) <- needed
+                    , term `elemNameSet` early_names
+                    , not (family `elemNameSet` found)
+                    , not (family `elemNameSet` used_in_early) ]
+                  all_early_demands =
+                    [ (nm, nameSrcSpan nm) | nm <- nameSetElemsStable early_names ]
               for_ needed $ \(term, family) ->
-                when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
+                when (family `elemNameSet` used_in_early
+                      || (term `elemNameSet` early_names
+                          && not (family `elemNameSet` found)
+                          && not has_interp)) $
                   unless (family `elemNameSet` found) $
                     setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+              when (not (null fallback_demands) && defer_on) $
+                checkLocalOpenDeferrals fallback_demands
               failIfErrsM
+              local_defs <-
+                if not (null fallback_demands)
+                  then localOpenDefinitions fallback_demands
+                         (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+                  else if has_interp && not defer_on
+                    then tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                           (localOpenDefinitions all_early_demands
+                             (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
+                    else pure (emptyNameEnv, emptyNameEnv)
               addTopEvBinds evs $ do
                 tables_env <- installEarlyTables (tables, companions, helpers)
                 setGblEnv tables_env $
-                  tcTopSrcTablesWith (prev_deriv ++ deriving_info) rest
+                  withLocalOpenDefinitions local_defs $
+                    tcTopSrcTablesWith (prev_deriv ++ deriving_info) rest
 
 -- | One mutually recursive stage of local types and a Type-valued source equation.
 -- See Note [Staging mutually recursive large eliminations].
@@ -3075,6 +3105,24 @@ tcLocalOpenGroup demands group@HsGroup
   , hs_tyclds = tycls
   , hs_derivds = standalone, hs_defds = defaults } finish
   = do
+      let returns_type_sig seen_arrow ty = case unLoc (ignoreParens ty) of
+            HsForAllTy{hst_body = inner} -> returns_type_sig seen_arrow inner
+            HsFunTy _ _ _ cod -> returns_type_sig True cod
+            HsStarTy{} -> seen_arrow
+            HsTyVar _ _ (L _ (WithUserRdr _ nm)) ->
+              seen_arrow && isLiftedTypeKindTyConName nm
+            _ -> False
+          large_elim_owners = mkNameSet
+            [ unLoc lnm
+            | L _ (TypeSig _ _ ns wc) <- sigs
+            , let L _ HsSig{sig_body = body} = hswc_body wc
+            , returns_type_sig False body
+            , lnm <- ns ]
+          failed_large_elims =
+            nameSetElemsStable (mkNameSet (map fst demands) `intersectNameSet` large_elim_owners)
+      for_ failed_large_elims $ \term ->
+        setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+      failIfErrsM
       instances <- traverse (instance_group . snd) early_instances
       for_ late $ \(_, inst) ->
         when (hasSplice inst) $
@@ -3372,15 +3420,29 @@ localOpenDefinitions demands evidence binds = do
         definition_names = unionNameSets (map fst relevant_binds)
     when (any hasPendingTypedSplice relevant) $
       rejectLocalOpen demands "This earlier definition contains a pending typed splice."
-    (_, _, zonked, _, _, _, _) <- zonkTopDecls evidence relevant [] [] [] []
-    (messages, proposal) <- initDsTc (dsTopLHsBinds (concatMap singleExport zonked))
+    (_, zonked_ev_binds, zonked, _, _, _, _) <- zonkTopDecls evidence relevant [] [] [] []
+    let collect_lets (Core.Let b e) = let (bs, body) = collect_lets e in (b : bs, body)
+        collect_lets e              = ([], e)
+    (messages, proposal) <- initDsTc $
+      dsHsWrapper (WpLet (EvBinds zonked_ev_binds)) $ \wrap_ev -> do
+        core_prs <- dsTopLHsBinds (concatMap singleExport zonked)
+        let (ev_core_binds, _) = collect_lets (wrap_ev (Core.Var unitDataConId))
+        return (flattenBinds ev_core_binds ++ fromOL core_prs)
     let owners = mkNameEnv (concatMap monoOwners zonked)
-        definitions = mkNameEnv
+        all_pairs =
           [ (idName owner, (owner, rhs))
-          | core <- maybeToList proposal, not (errorsFound messages)
-          , (owner, rhs) <- fromOL core
-          , idName owner `elemNameSet` definition_names
+          | pairs <- maybeToList proposal, not (errorsFound messages)
+          , (owner, rhs) <- pairs
           , exprType rhs `eqType` idType owner ]
+        all_map = mkNameEnv all_pairs
+        pair_deps nm = pure $ case lookupNameEnv all_map nm of
+          Just (_, rhs) ->
+            mkNameSet [ idName v | v <- exprSomeFreeVarsList (const True) rhs
+                                 , idName v `elemNameEnv` all_map ]
+          Nothing -> emptyNameSet
+    reachable <- closeLocalNames pair_deps emptyNameSet
+                   [ nm | nm <- nameSetElemsStable definition_names, nm `elemNameEnv` all_map ]
+    let definitions = filterNameEnv (\(owner, _) -> idName owner `elemNameSet` reachable) all_map
         missing = filter (not . (`elemNameEnv` definitions) . fst) demands
     unless (null missing) $
       rejectLocalOpen missing "No checked Core definition is available for this call."

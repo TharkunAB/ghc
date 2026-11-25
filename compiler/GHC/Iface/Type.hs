@@ -2308,6 +2308,11 @@ pprTyTcApp ctxt_prec tc tys =
            (IA_Arg (IfaceLitTy lit@IfaceNumTyLit{}) (IfaceForAllTyFlag Required) IA_Nil) <- tys
        -> maybeParen ctxt_prec sigPrec $ pprIfaceTyLit lit <+> dcolon <+> pprIfaceType target
 
+       | tc `ifaceTyConHasKey` charPrimLitTyConKey
+       , not debug
+       , IA_Arg (IfaceLitTy (IfaceCharTyLit c)) (IfaceForAllTyFlag Required) IA_Nil <- tys
+       -> text (show c) <> char '#'
+
        | IfaceTupleTyCon arity sort <- ifaceTyConSort info
        , not debug
        , arity == ifaceVisAppArgsLength tys
@@ -2574,14 +2579,21 @@ ppr_tuple_sum ctxt_prec sort is_promoted args =
 
     mk_name = case (sort, is_promoted) of
       (IsTuple BoxedTuple, IsPromoted) -> tupleDataConName Boxed
+      (IsTuple UnboxedTuple, IsPromoted) -> tupleDataConName Unboxed
       (IsTuple s, _) -> tupleTyConName s
       (IsSum, _) -> tyConName . sumTyCon
 
-    -- drop the RuntimeRep vars.
+    -- drop the RuntimeRep vars (and promoted element kind vars).
     -- See Note [Unboxed tuple RuntimeRep vars] in GHC.Core.TyCon
-    non_rep_tys = if strip_reps then drop arity all_tys else all_tys
+    non_rep_tys = drop stripped_prefix all_tys
 
-    arity = if strip_reps then count `div` 2 else count
+    (arity, stripped_prefix) = case (sort, is_promoted) of
+      (IsTuple UnboxedTuple, IsPromoted) ->
+        let a = count `div` 3 in (a, 2 * a)
+      _ | strip_reps ->
+        let a = count `div` 2 in (a, a)
+      _ ->
+        (count, 0)
 
     count = length all_tys
 

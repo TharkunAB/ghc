@@ -528,9 +528,26 @@ size xs = fromIntegral (length xs)
 SOURCE
 "${ghc[@]}" -c NativeLocalOpenStale.hs
 test -s NativeLocalOpenStale.o
-cat >> NativeLocalOpenStale.hs <<'SOURCE'
+cat > NativeLocalOpenStale.hs <<'SOURCE'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+module NativeLocalOpenStale where
+import Data.Type.Equality ((:~:)(Refl))
+import Numeric.Natural (Natural)
+size :: [Natural] -> Natural
+size xs = fromIntegral (length xs) + 1
+proof :: NativeLocalOpenStale.size '[1,2] :~: 3
+proof = Refl
+SOURCE
+"${ghc[@]}" -fno-code NativeLocalOpenStale.hs
+cat > NativeLocalOpenStale.hs <<'SOURCE'
+{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+module NativeLocalOpenStale where
+import Data.Type.Equality ((:~:)(Refl))
+import Numeric.Natural (Natural)
+size :: [Natural] -> Natural
+size xs = fromIntegral (length xs) + 1
 proof :: NativeLocalOpenStale.size '[1,2] :~: 2
 proof = Refl
 SOURCE
-expect_rejection NativeLocalOpenStale 7 '\[GHC-70565\]' \
-    'Closed type evaluation requires an imported definition.'
+expect_rejection NativeLocalOpenStale 8 '\[GHC-83865\]' \
+    "Couldn't match type"

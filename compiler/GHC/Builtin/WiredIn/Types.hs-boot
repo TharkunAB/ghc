@@ -10,6 +10,7 @@ import {-# SOURCE #-} GHC.Types.Name (Name)
 listTyCon :: TyCon
 typeSymbolKind :: Type
 charTy :: Type
+charPrimLitTyCon :: TyCon
 boolTy :: Type
 mkBoxedTupleTy :: [Type] -> Type
 

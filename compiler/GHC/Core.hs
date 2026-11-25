@@ -121,19 +121,20 @@ import GHC.Platform
 
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare ( eqType )
-import GHC.Core.TyCo.Rep ( Type(TermVarTy, ClassAppTy, TyConApp, CastTy), Coercion(SubCo, SymCo, AppCo, AxiomCo), Scaled(..) )
+import GHC.Core.TyCo.Rep ( Type(TermVarTy, ClassAppTy, TyConApp, CastTy), Coercion(SubCo, SymCo, TransCo, AppCo, AxiomCo), Scaled(..) )
 import qualified GHC.Core.TyCo.Subst as TyCoSubst
 import GHC.Builtin.KnownKeys ( boolTyConKey, charDataConKey, naturalNSDataConKey, naturalNBDataConKey )
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
 import GHC.Core.Coercion
-import GHC.Core.Coercion.Axiom (CoAxiomRule(UnbranchedAxiom), coAxiomArity)
+import GHC.Core.Coercion.Axiom (CoAxiom, Unbranched, CoAxiomRule(UnbranchedAxiom), coAxiomArity, coAxiomTyCon)
 import GHC.Core.Rules.Config ( RuleOpts )
 import GHC.Core.Class (classMethods)
 import GHC.Core.Predicate (getClassPredTys_maybe)
 import GHC.Core.DataCon
 import GHC.Core.TyCon ( TyCon, isPromotedDataCon_maybe, isVanillaAlgTyCon,
                         tyConTyVars, tyConResKind, tyConKind, tyConDataCons, tyConSingleDataCon_maybe,
-                        isBoxedDataTyCon, isTypeDataTyCon, tyConDataFamCoercion_maybe )
+                        isBoxedDataTyCon, isNewTyCon, isLiftedAlgTyCon, isTypeDataTyCon,
+                        newTyConCo_maybe, tyConDataFamCoercion_maybe )
 import GHC.Unit.Module
 
 import GHC.Types.InlinePragma
@@ -3295,7 +3296,8 @@ nativeFamilyConHead_maybe con tys = do
 nativeFamilyConArgs :: DataCon -> [Type] -> Maybe ([CoreExpr], [Type], Type, CoercionR)
 nativeFamilyConArgs con tys = do
   axiom <- tyConDataFamCoercion_maybe rep
-  guard (isBoxedDataTyCon rep && not (isTypeDataTyCon rep))
+  guard ((isBoxedDataTyCon rep || (isNewTyCon rep && isLiftedAlgTyCon rep))
+         && not (isTypeDataTyCon rep))
   guard (null exs && null theta && null (dataConStupidTheta con))
   guard (null (dataConRepArgBinders con) && not (any isBanged (dataConImplBangs con)))
   guard (tys `equalLength` user_tvs &&
@@ -3329,29 +3331,74 @@ nativeFamilyPromotedCon_maybe con tys fields = do
 -- | Accept the exact wrapper or its worker cast by the same family axiom.
 splitNativeFamilyConApp :: CoreExpr
                         -> Maybe (DataCon, [Type], [CoreExpr] -> CoreExpr, [CoreExpr])
-splitNativeFamilyConApp (Cast expr cast) = do
-  (Var worker, args) <- Just (collectArgs expr)
-  con <- isDataConWorkId_maybe worker
-  let univs = dataConUnivTyVars con
-      (type_args, _) = splitAt (length univs) args
-  worker_tys <- traverse family_type_arg type_args
-  guard (worker_tys `equalLength` univs)
-  tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
-  (prefix, domains, _, expected_cast) <- nativeFamilyConArgs con tys
-  let (actual, fields) = splitAt (length prefix) args
-  guard (actual `equalLength` prefix && and (zipWith sameNativeConPrefixArg actual prefix))
-  guard (fields `equalLength` domains)
-  guard (coercionRole cast == Representational &&
-         coercionLKind cast `eqType` coercionLKind expected_cast &&
-         coercionRKind cast `eqType` coercionRKind expected_cast)
-  axiom <- tyConDataFamCoercion_maybe (dataConTyCon con)
-  guard (uses_axiom (UnbranchedAxiom axiom) cast)
-  return (con, tys, \xs -> Cast (mkApps (Var worker) (actual ++ xs)) cast, fields)
+splitNativeFamilyConApp (Cast expr cast)
+  | Just result <- split_worker_cast
+  = Just result
+  | Just result <- split_newtype_cast
+  = Just result
   where
-    uses_axiom ax (AxiomCo actual cos) = actual == ax && all isReflCo cos
-    uses_axiom ax (AppCo co arg) = uses_axiom ax co && isReflCo arg
-    uses_axiom ax (SymCo co) = uses_axiom ax co
-    uses_axiom _ _ = False
+    split_worker_cast = do
+      (Var worker, args) <- Just (collectArgs expr)
+      con <- isDataConWorkId_maybe worker
+      let univs = dataConUnivTyVars con
+          (type_args, _) = splitAt (length univs) args
+      worker_tys <- traverse family_type_arg type_args
+      guard (worker_tys `equalLength` univs)
+      tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
+      (prefix, domains, _, expected_cast) <- nativeFamilyConArgs con tys
+      let (actual, fields) = splitAt (length prefix) args
+      guard (actual `equalLength` prefix && and (zipWith sameNativeConPrefixArg actual prefix))
+      guard (fields `equalLength` domains)
+      guard (coercionRole cast == Representational &&
+             coercionLKind cast `eqType` coercionLKind expected_cast &&
+             coercionRKind cast `eqType` coercionRKind expected_cast)
+      axiom <- tyConDataFamCoercion_maybe (dataConTyCon con)
+      guard (uses_axiom (UnbranchedAxiom axiom) cast)
+      return (con, tys, \xs -> Cast (mkApps (Var worker) (actual ++ xs)) cast, fields)
+
+    split_newtype_cast = do
+      TransCo nt_co fam_co <- Just cast
+      (nt_ax, worker_tys) <- sym_unbranched_axiom nt_co
+      let rep = coAxiomTyCon nt_ax
+      guard (isNewTyCon rep && isLiftedAlgTyCon rep)
+      guard (Just nt_ax == newTyConCo_maybe rep)
+      con <- tyConSingleDataCon_maybe rep
+      fam_ax <- tyConDataFamCoercion_maybe rep
+      guard (uses_axiom (UnbranchedAxiom fam_ax) fam_co)
+      let univs = dataConUnivTyVars con
+      guard (worker_tys `equalLength` univs)
+      tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
+      (_, [domain], _, expected_cast) <- nativeFamilyConArgs con tys
+      guard (coercionRole cast == Representational &&
+             coercionLKind cast `eqType` domain &&
+             coercionRKind cast `eqType` coercionRKind expected_cast)
+      return (con, tys, \case { [x] -> Cast x cast; _ -> Cast expr cast }, [expr])
+splitNativeFamilyConApp expr
+  | (Cast (Lam v (Cast (Var v') nt_co)) fun_fam_co, [arg]) <- collectArgs expr
+  , v == v'
+  , Just (nt_ax, worker_tys) <- sym_unbranched_axiom nt_co
+  , let rep = coAxiomTyCon nt_ax
+  , isNewTyCon rep && isLiftedAlgTyCon rep
+  , Just nt_ax == newTyConCo_maybe rep
+  , Just con <- tyConSingleDataCon_maybe rep
+  , Just fam_ax <- tyConDataFamCoercion_maybe rep
+  , isFunTy (coercionLKind fun_fam_co)
+  , isFunTy (coercionRKind fun_fam_co)
+  , let (_, _, arg_co, res_co) = decomposeFunCo fun_fam_co
+  , isReflCo arg_co
+  , uses_axiom (UnbranchedAxiom fam_ax) res_co
+  , let univs = dataConUnivTyVars con
+  , worker_tys `equalLength` univs
+  , Just tys <- traverse (`lookup` zip univs worker_tys) (dataConUserTyVars con)
+  , Just (_, [domain], _, expected_cast) <- nativeFamilyConArgs con tys
+  , coercionRole nt_co == Representational
+  , coercionRole fun_fam_co == Representational
+  , coercionLKind nt_co `eqType` domain
+  , coercionRKind res_co `eqType` coercionRKind expected_cast
+  = Just ( con
+         , tys
+         , \case { [x] -> App (Cast (Lam v (Cast (Var v') nt_co)) fun_fam_co) x; _ -> expr }
+         , [arg] )
 splitNativeFamilyConApp expr = do
   (Var wrapper, args) <- Just (collectArgs expr)
   con <- isDataConWrapId_maybe wrapper
@@ -3360,6 +3407,18 @@ splitNativeFamilyConApp expr = do
   (_, domains, _, _) <- nativeFamilyConArgs con tys
   guard (fields `equalLength` domains)
   return (con, tys, mkApps (mkApps (Var wrapper) type_args), fields)
+
+sym_unbranched_axiom :: Coercion -> Maybe (CoAxiom Unbranched, [Type])
+sym_unbranched_axiom (SymCo (AxiomCo (UnbranchedAxiom ax) cos))
+  | all isReflCo cos
+  = Just (ax, map coercionLKind cos)
+sym_unbranched_axiom _ = Nothing
+
+uses_axiom :: CoAxiomRule -> Coercion -> Bool
+uses_axiom ax (AxiomCo actual cos) = actual == ax && all isReflCo cos
+uses_axiom ax (AppCo co arg) = uses_axiom ax co && isReflCo arg
+uses_axiom ax (SymCo co) = uses_axiom ax co
+uses_axiom _ _ = False
 
 family_type_arg :: CoreExpr -> Maybe Type
 family_type_arg (Type ty) = Just ty
