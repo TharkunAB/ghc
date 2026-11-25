@@ -46,10 +46,11 @@ RetainedAppHoles.hs:38:59: error: [GHC-88464]
                          -> foreach (n :: Nat) -> plus m n :~: plus n m
           (bound at RetainedAppHoles.hs:37:1)
       Constraints include n ~ Succ k1 (from RetainedAppHoles.hs:38:1-60)
-      Valid hole fits include
-        plusCommStep2 m k :: plus m2 k1 :~: plus k1 m2
-        namedAndSignedHoles m k :: plus m2 k1 :~: plus k1 m2
-        plusCommOk m k :: plus m2 k1 :~: plus k1 m2
+    Suggested fixes:
+      • Pattern-match on ‘k’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
 
 RetainedAppHoles.hs:43:35: error: [GHC-88464]
     • Found hole: _ :: plus m3 (Succ k2) :~: Succ x0
@@ -103,9 +104,6 @@ RetainedAppHoles.hs:48:64: error: [GHC-88464]
         Zero :: Nat
         k :: Nat
         m :: Nat
-      Valid refinement hole fits include
-        Succ (_ :: Nat)
-          where Succ :: Nat -> Nat
 
 RetainedAppHoles.hs:48:66: error: [GHC-88464]
     • Found hole: _ :: Nat
@@ -124,9 +122,6 @@ RetainedAppHoles.hs:48:66: error: [GHC-88464]
         Zero :: Nat
         k :: Nat
         m :: Nat
-      Valid refinement hole fits include
-        Succ (_ :: Nat)
-          where Succ :: Nat -> Nat
 
 RetainedAppHoles.hs:52:38: error: [GHC-88464]
     • Found hole: _first :: Nat
@@ -145,9 +140,6 @@ RetainedAppHoles.hs:52:38: error: [GHC-88464]
         Zero :: Nat
         m :: Nat
         n :: Nat
-      Valid refinement hole fits include
-        Succ (_ :: Nat)
-          where Succ :: Nat -> Nat
 
 RetainedAppHoles.hs:52:46: error: [GHC-88464]
     • Found hole: _ :: Nat
@@ -165,9 +157,6 @@ RetainedAppHoles.hs:52:46: error: [GHC-88464]
         Zero :: Nat
         m :: Nat
         n :: Nat
-      Valid refinement hole fits include
-        Succ (_ :: Nat)
-          where Succ :: Nat -> Nat
 
 RetainedAppHoles.hs:56:41: error: [GHC-88464]
     • Found hole: _ :: Nat
@@ -182,9 +171,6 @@ RetainedAppHoles.hs:56:41: error: [GHC-88464]
       Valid hole fits include
         Zero :: Nat
         m :: Nat
-      Valid refinement hole fits include
-        Succ (_ :: Nat)
-          where Succ :: Nat -> Nat
 
 RetainedAppHoles.hs:63:28: error: [GHC-88464]
     • Found hole: _ :: Nat
@@ -198,7 +184,4 @@ RetainedAppHoles.hs:63:28: error: [GHC-88464]
       Valid hole fits include
         Zero :: Nat
         m :: Nat
-      Valid refinement hole fits include
-        Succ (_ :: Nat)
-          where Succ :: Nat -> Nat
 

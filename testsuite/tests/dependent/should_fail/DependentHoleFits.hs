@@ -1,7 +1,8 @@
-{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE DependentTypes, StandaloneKindSignatures #-}
 {-# OPTIONS_GHC -fwrite-source-equations -fno-enable-rewrite-rules #-}
 module DependentHoleFits where
 
+import Data.Kind (Type)
 import Data.Type.Equality ((:~:) (Refl), trans)
 import GHC.Exts (Matchability)
 import qualified GHC.Internal.List as InternalList
@@ -30,21 +31,21 @@ data LE (m :: Nat) (n :: Nat) where
   LZ :: LE Zero n
   LS :: LE m n -> LE (Succ m) (Succ n)
 
--- 1. Base case suggests Refl; recursive step suggests cong Succ (plusAssoc m n p)
---    and congSucc (plusAssoc m n p), plus subgoal-splitting refinement fits.
+-- 1. Base case suggests Refl; recursive step suggests congSucc and cong
+--    refinement hole fits.
 plusAssoc :: foreach (m n p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
 plusAssoc Zero     _ _ = _
 plusAssoc (Succ m) n p = _
 
--- 2. Unsplit equation suggests pattern-matching on 'm' to reduce 'plus'.
+-- 2. Unsplit equation suggests pattern-matching on 'm' and 'n' to reduce 'plus'.
 plusCommUnsplit :: foreach (m n :: Nat) -> plus m n :~: plus n m
 plusCommUnsplit m n = _
 
--- 3. Direct foreach lemma instantiation suggests plusZero m.
+-- 3. Foreach lemma appears as a refinement hole fit plusZero (_ :: Nat).
 usePlusZero :: foreach (m :: Nat) -> plus m Zero :~: m
 usePlusZero m = _
 
--- 4. GADT proof holes inside foreach equations suggest LZ and LS h.
+-- 4. GADT proof holes inside foreach equations suggest LZ and LS (_ :: LE m n).
 leZero :: foreach (n :: Nat) -> LE Zero n
 leZero _ = _
 
@@ -99,7 +100,8 @@ lengthRev = _
 reverseIdPointfree :: forall a. foreach (xs :: List a) -> reverse xs :~: xs
 reverseIdPointfree = _
 
--- 8. Transitivity step refinement fit on an inductive equality goal (PLFH).
+-- 8. Level-2 abstract refinement fit suggests trans (_ :: lhs :~: b) (_ :: b :~: rhs)
+--    on dependent and indexed equality goals.
 add2 :: Nat -> Nat -> Nat
 add2 Zero     n = n
 add2 (Succ m) n = Succ (add2 m n)
@@ -115,3 +117,63 @@ add2Succ (Succ m) n = congSucc (add2Succ m n)
 add2Comm :: foreach (m k :: Nat) -> add2 m k :~: add2 k m
 add2Comm m Zero     = add2Zero m
 add2Comm m (Succ k) = _
+
+data Vec a (n :: Nat) where
+  VNil  :: Vec a Zero
+  VCons :: a -> Vec a n -> Vec a (Succ n)
+
+vecEqGoal :: forall a. foreach (n :: Nat) -> foreach (u :: Vec a n) -> foreach (v :: Vec a n) -> u :~: v
+vecEqGoal _ u v = _
+
+-- 9. Multi-clause equation with a variable pattern before an indexed GADT
+--    foreach argument keeps 'eq' in Relevant bindings and refinement fits,
+--    and uses source names in the enclosing case context (PiTA #10).
+data Fin (n :: Nat) where
+  FZ :: Fin (Succ n)
+  FS :: Fin n -> Fin (Succ n)
+
+data UTerm (n :: Nat) where
+  UVar :: Fin n -> UTerm n
+  ULam :: UTerm (Succ n) -> UTerm n
+  UApp :: UTerm n -> UTerm n -> UTerm n
+
+shiftFin :: Fin m -> Fin (Succ m)
+shiftFin x = FS x
+
+extU :: (Fin m -> Fin n) -> Fin (Succ m) -> Fin (Succ n)
+extU _   FZ     = FZ
+extU rho (FS x) = FS (rho x)
+
+renameU :: (Fin m -> Fin n) -> UTerm m -> UTerm n
+renameU rho (UVar x)   = UVar (rho x)
+renameU rho (ULam b)   = ULam (renameU (extU rho) b)
+renameU rho (UApp l r) = UApp (renameU rho l) (renameU rho r)
+
+extsU :: (Fin m -> UTerm n) -> Fin (Succ m) -> UTerm (Succ n)
+extsU _     FZ     = UVar FZ
+extsU sigma (FS x) = renameU shiftFin (sigma x)
+
+substU :: (Fin m -> UTerm n) -> UTerm m -> UTerm n
+substU sigma (UVar x)   = sigma x
+substU sigma (ULam b)   = ULam (substU (extsU sigma) b)
+substU sigma (UApp l r) = UApp (substU sigma l) (substU sigma r)
+
+type Subst (m :: Nat) (n :: Nat) = Fin m -> UTerm n
+type SubEq :: forall (m :: Nat) (n :: Nat). Subst m n -> Subst m n -> Type
+type SubEq @m @n s1 s2 = foreach (x :: Fin m) -> s1 x :~: s2 x
+
+congExts :: forall m n (s1 :: Subst m n) (s2 :: Subst m n).
+            SubEq @m @n s1 s2 -> SubEq @(Succ m) @(Succ n) (extsU s1) (extsU s2)
+congExts _  FZ     = Refl
+congExts eq (FS x) = cong (renameU shiftFin) (eq x)
+
+congSubst :: forall m n (s1 :: Subst m n) (s2 :: Subst m n).
+             SubEq @m @n s1 s2
+          -> foreach (t :: UTerm m) -> substU s1 t :~: substU s2 t
+congSubst eq (UVar x)   = _
+congSubst eq (ULam b)   =
+  case congSubst @(Succ m) @(Succ n) @(extsU s1) @(extsU s2) (congExts @m @n @s1 @s2 eq) b of
+    Refl -> Refl
+congSubst eq (UApp l r) =
+  case (congSubst @m @n @s1 @s2 eq l, congSubst @m @n @s1 @s2 eq r) of
+    (Refl, Refl) -> Refl

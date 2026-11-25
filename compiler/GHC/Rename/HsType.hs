@@ -555,11 +555,15 @@ rnRetainedTelescope env rn_body bndrs body
       | otherwise
       = Nothing
 
--- | Test whether an invisible @foreach@ binder was written in braces @{...}@.
-isInferredForEachBndr :: HsTyVarBndr () (GhcPass p) -> Bool
-isInferredForEachBndr b = case atv_tv (tvb_ext b) of
+-- | Test whether an invisible @foreach@ binder annotation was written in braces @{...}@.
+isInferredForEachAnn :: AnnTyVarBndr -> Bool
+isInferredForEachAnn xb = case atv_tv xb of
   EpTok (EpaDelta _ (SameLine n) _) -> n == 1 || n == 3 || n == 5
   _                                 -> False
+
+-- | Test whether an invisible @foreach@ binder was written in braces @{...}@.
+isInferredForEachBndr :: HsTyVarBndr () (GhcPass p) -> Bool
+isInferredForEachBndr = isInferredForEachAnn . tvb_ext
 
 -- | Extract optional multiplicity modifiers and the domain kind from a @foreach@ binder.
 -- See Note [Multiplicity annotations on retained foreach binders].
@@ -589,9 +593,7 @@ rebuildForEachBndr lb xb bvar mods mb_kind =
   HsTvb (xb { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine tag) []) })
         () bvar (HsBndrKind noExtField payload)
   where
-    inferred = case atv_tv xb of
-      EpTok (EpaDelta _ (SameLine n) _) -> n == 1 || n == 3 || n == 5
-      _ -> False
+    inferred = isInferredForEachAnn xb
     unit_ty = noLocA (HsTupleTy noAnn HsBoxedOrConstraintTuple [])
     arr     = HsModifiedFunArr noExtField mods (HsStandardArr noExtField)
     (tag, dom) = case mb_kind of
@@ -3137,6 +3139,7 @@ filterInScopeNonClass cls_tvs tvc envs = filterOut (in_scope_non_class . unLoc)
 -- the environment's LocalRdrEnv. Note that this includes named wildcards,
 -- which look like perfectly ordinary type variables at this point.
 filterInScopeM :: FreeKiTyVars -> RnM FreeKiTyVars
+filterInScopeM [] = return []
 filterInScopeM vars
   = do { tvc <- getTermVariableCapture
        ; envs <- getRdrEnvs
@@ -3145,6 +3148,7 @@ filterInScopeM vars
 -- | Like 'filterInScopeM', but keep parent class variables intact.
 -- Used with associated types. See Note [Class variables and filterInScope]
 filterInScopeNonClassM :: [Name] -> FreeKiTyVars -> RnM FreeKiTyVars
+filterInScopeNonClassM _ [] = return []
 filterInScopeNonClassM cls_tvs vars
   = do { tvc <- getTermVariableCapture
        ; envs <- getRdrEnvs
@@ -3153,6 +3157,7 @@ filterInScopeNonClassM cls_tvs vars
 -- | Collect implicit constructor binders after resolving names in both namespaces.
 -- See Note [Implicit quantification in dependent constructor signatures].
 filterGadtConTyVars :: ConDecl GhcPs -> FreeKiTyVars -> RnM FreeKiTyVars
+filterGadtConTyVars _ [] = return []
 filterGadtConTyVars decl vars = do
   dependent <- xoptM LangExt.ExperimentalDependentTypes
   if dependent
@@ -3215,6 +3220,7 @@ ExperimentalDependentTypes keep the usual GADT implicit binders.
 -- Keep the earlier implicit binding for a newly certified identity.
 -- See Note [Names of finite source functions] in GHC.Rename.Env.
 filterSourceTableNames :: (GlobalRdrEnv, LocalRdrEnv) -> FreeKiTyVars -> RnM FreeKiTyVars
+filterSourceTableNames _ [] = return []
 filterSourceTableNames envs@(_, lcl) vars = do
   experimental <- xoptM LangExt.ExperimentalDependentTypes
   if experimental then filterM implicit vars else return vars

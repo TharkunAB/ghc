@@ -875,31 +875,11 @@ can_eq_nc _ _rdr_env _envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
   = do { traceTcS "can_eq_nc catch-all case" (ppr ps_ty1 $$ ppr ps_ty2)
        ; case eq_rel of -- See Note [Unsolved equalities]
             ReprEq -> finishCanWithIrred ReprEqReason ev
-            NomEq | opaque_index_equality -> finishCanWithIrred IrredShapeReason ev
+            NomEq | isOpaqueIndexEquality (isGiven ev) ty1 ty2
+                  -> finishCanWithIrred IrredShapeReason ev
                   | otherwise -> finishCanWithIrred ShapeMismatchReason ev }
           -- No need to call canEqSoftFailure/canEqHardFailure because they
           -- rewrite, and the types involved here are already rewritten
-  where
-    -- See Note [Opaque runtime index equalities].
-    opaque_index_equality = opaque_application ty1 || opaque_application ty2 || case (ty1, ty2) of
-      (TermAppTy f _, ty) -> call_domain f ty
-      (ty, TermAppTy f _) -> call_domain f ty
-      (TermVarTy v, ty) -> same_domain v ty
-      (ty, TermVarTy v) -> same_domain v ty
-      _ -> False
-
-    opaque_application ty
-      | Just (head, _) <- tcSplitAppTy_maybe ty
-      = not (isMatchableFunTy (typeKind head))
-      | otherwise = False
-    same_domain v ty = (isNativeRetainedBinder v && domain `eqType` kind)
-                    || (isGiven ev && isNativeOpaqueValueId v && not (typesAreApart domain kind))
-      where
-        domain = varType v
-        kind = typeKind ty
-    call_domain f ty = case nativeIndexFunctionTys_maybe f of
-      Just (_, result) -> typeKind ty `eqType` result
-      Nothing -> False
 
 {- Note [Congruence for generated type lambdas]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -957,6 +937,31 @@ Use the synonym-expanded operands from EQNC1. Zonk before checking
 scope, occurrence and kind. Other equalities follow the normal rewriting
 order. See Note [Prevent unification with type families] in GHC.Tc.Utils.Unify.
 -}
+
+-- | Test whether an unrewritable equality involves an unmatchable
+-- application or a runtime index that must stay 'IrredShapeReason'.
+-- See Note [Opaque runtime index equalities].
+isOpaqueIndexEquality :: Bool -> Type -> Type -> Bool
+isOpaqueIndexEquality allow_apart_opaque ty1 ty2 =
+  opaque_app ty1 || opaque_app ty2 || case (ty1, ty2) of
+    (TermAppTy f _, ty) -> call_domain f ty
+    (ty, TermAppTy f _) -> call_domain f ty
+    (TermVarTy v, ty)   -> same_domain v ty
+    (ty, TermVarTy v)   -> same_domain v ty
+    _                   -> False
+  where
+    opaque_app ty
+      | Just (hd, _) <- tcSplitAppTy_maybe ty = not (isMatchableFunTy (typeKind hd))
+      | otherwise = False
+    same_domain v ty =
+      (isNativeRetainedBinder v && domain `eqType` kind)
+      || (allow_apart_opaque && isNativeOpaqueValueId v && not (typesAreApart domain kind))
+      where
+        domain = varType v
+        kind   = typeKind ty
+    call_domain f ty = case nativeIndexFunctionTys_maybe f of
+      Just (_, result) -> typeKind ty `eqType` result
+      Nothing          -> False
 
 {- Note [Opaque runtime index equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1718,24 +1723,9 @@ canEqCast ces rdr_env envs ev eq_rel swapped ty1 co1 ty2 ps_ty2
                            else IrredShapeReason
                      | ForAllTy{} <- coreFullView xi1
                      , ForAllTy{} <- coreFullView xi2 -> IrredShapeReason
-                     | opaque_cast_eq -> IrredShapeReason
+                     | isOpaqueIndexEquality True xi1 xi2 -> IrredShapeReason
                      | otherwise -> ShapeMismatchReason
            ; finish_cast_irred reason parent }
-      where
-        opaque_cast_eq = opaque_app xi1 || opaque_app xi2 || case (xi1, xi2) of
-          (TermAppTy f _, ty) -> call_dom f ty
-          (ty, TermAppTy f _) -> call_dom f ty
-          (TermVarTy v, ty)   -> same_dom v ty
-          (ty, TermVarTy v)   -> same_dom v ty
-          _                   -> False
-        opaque_app ty
-          | Just (hd, _) <- tcSplitAppTy_maybe ty = not (isMatchableFunTy (typeKind hd))
-          | otherwise = False
-        same_dom v ty = (isNativeRetainedBinder v && varType v `eqType` typeKind ty)
-                     || (isNativeOpaqueValueId v && not (typesAreApart (varType v) (typeKind ty)))
-        call_dom f ty = case nativeIndexFunctionTys_maybe f of
-          Just (_, res) -> typeKind ty `eqType` res
-          Nothing -> False
 
     strip_cast
       = do { traceTcS "Decomposing cast" (vcat [ ppr ev
@@ -3421,7 +3411,7 @@ finishCanWithIrred reason ev
 -- definitional equality of the complete types.
 saturatedSourceHead :: TyCon -> [Type] -> Bool
 saturatedSourceHead tc args =
-  isTypeFamilyTyCon tc && length args == tyConArity tc
+  isTypeFamilyTyCon tc && lengthIs args (tyConArity tc)
     && isJust (sourceTableTermOcc (nameOccName (tyConName tc)))
 
 -- | Recognize a complete application of a family with checked branches.
@@ -3600,37 +3590,38 @@ tryRetainedFamilyEquality ev lhs rhs
 -- See Note [Prefer a direct local definition].
 trySourceLetEquality :: CtEvidence -> EqRel -> Type -> Type -> TcS (Maybe Coercion)
 trySourceLetEquality ev eq_rel lhs rhs
-  | isWanted ev, is_index lhs || is_index rhs = do
-      native_binders <- getNativeBinderScope
-      if not (isEmptyVarSet native_binders) then return Nothing else do
-        definitions <- getSourceLetScope
-        let candidate ty = case coreFullView ty of
-              TermVarTy value
-                | Just proof <- lookupVarEnv definitions value
-                , coVarRole proof == Nominal
-                , coVarLType proof `tcEqType` ty -> Just proof
-              _ -> Nothing
-            attempt Nothing _ = return Nothing
-            attempt (Just proof) other
-              | coVarRType proof `tcEqType` other = return (Just (mkCoVarCo proof))
-              | otherwise = do
-                  Reduction rhs_co rhs' <- rewriteFamilyAxioms (ctEvLoc ev) (coVarRType proof)
-                  Reduction other_co other' <- rewriteFamilyAxioms (ctEvLoc ev) other
-                  return $ if rhs' `tcEqType` other'
-                    then Just (mkCoVarCo proof `mkTransCo` rhs_co `mkTransCo` mkSymCo other_co)
-                    else Nothing
-            at_role co = case eq_rel of
-              NomEq -> co
-              ReprEq -> mkSubCo co
-        forward <- attempt (candidate lhs) rhs
-        case forward of
-          Just co -> return (Just (at_role co))
-          Nothing -> fmap (fmap (at_role . mkSymCo)) (attempt (candidate rhs) lhs)
+  | isWanted ev = do
+      definitions <- getSourceLetScope
+      if isEmptyVarEnv definitions
+        then return Nothing
+        else do
+          native_binders <- getNativeBinderScope
+          if not (isEmptyVarSet native_binders)
+            then return Nothing
+            else do
+              let candidate ty = case coreFullView ty of
+                    TermVarTy value
+                      | Just proof <- lookupVarEnv definitions value
+                      , coVarRole proof == Nominal
+                      , coVarLType proof `tcEqType` ty -> Just proof
+                    _ -> Nothing
+                  attempt Nothing _ = return Nothing
+                  attempt (Just proof) other
+                    | coVarRType proof `tcEqType` other = return (Just (mkCoVarCo proof))
+                    | otherwise = do
+                        Reduction rhs_co rhs' <- rewriteFamilyAxioms (ctEvLoc ev) (coVarRType proof)
+                        Reduction other_co other' <- rewriteFamilyAxioms (ctEvLoc ev) other
+                        return $ if rhs' `tcEqType` other'
+                          then Just (mkCoVarCo proof `mkTransCo` rhs_co `mkTransCo` mkSymCo other_co)
+                          else Nothing
+                  at_role co = case eq_rel of
+                    NomEq -> co
+                    ReprEq -> mkSubCo co
+              forward <- attempt (candidate lhs) rhs
+              case forward of
+                Just co -> return (Just (at_role co))
+                Nothing -> fmap (fmap (at_role . mkSymCo)) (attempt (candidate rhs) lhs)
   | otherwise = return Nothing
-  where
-    is_index ty = case coreFullView ty of
-      TermVarTy{} -> True
-      _ -> False
 
 {- Note [Prefer a direct local definition]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

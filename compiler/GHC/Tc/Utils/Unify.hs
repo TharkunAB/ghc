@@ -245,9 +245,9 @@ reduceNativeFunFamily_maybe :: Int -> TyCon -> [TcType] -> TcM (Maybe (TcCoercio
 reduceNativeFunFamily_maybe fuel tc args
   | fuel > 0
   , isTypeFamilyTyCon tc
+  , args `lengthAtLeast` tyConArity tc
   , let is_source_fam = isJust (sourceTableTermOcc (nameOccName (tyConName tc)))
-        ty = mkTyConApp tc args
-  , is_source_fam || hasNativeDependentExpr (Core.Type ty)
+  , is_source_fam || hasNativeDependentExpr (Core.Type (mkTyConApp tc args))
   = do { envs <- tcGetFamInstEnvs
        ; args' <- liftZonkM (mapM zonkTcType args)
        ; case reduceTyFamApp_maybe envs Nominal tc args' of

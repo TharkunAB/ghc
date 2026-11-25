@@ -302,12 +302,12 @@ liftTypeLambdas lift_lambdas sigma group = do
 
     liftRhs _ scoped owner captures (L loc (HsKindSig ann body kind)) salt
       | lift_lambdas
-      , L _ HsForAllTy{} <- stripParens kind
+      , L _ HsForAllTy{} <- ignoreParens kind
       , closedSpliceFreeKind kind
       , Just capture_kinds <- traverse (closedCaptureKind . fst) captures
-      , L lam_loc (XHsType (HsTypeLambda _ vars rhs)) <- stripParens body
+      , L lam_loc (XHsType (HsTypeLambda _ vars rhs)) <- ignoreParens body
       , (_, result) <- collectLambdas salt vars rhs
-      , L _ (XHsType HsTypeCase{}) <- stripParens result
+      , L _ (XHsType HsTypeCase{}) <- ignoreParens result
       = let (body', families, next) =
                 liftLambdaRhs scoped Nothing owner captures lam_loc vars rhs salt
                   (Just (foldr nlHsFunTy kind capture_kinds))
@@ -454,8 +454,8 @@ liftTypeLambdas lift_lambdas sigma group = do
           occ = lambdaOcc owner_occ salt sum_scope
           name = L (getLoc owner) (mkRdrUnqual occ)
           equations
-            | L _ (XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) <- stripParens body
-            , L _ (HsTyVar _ NotPromoted scrut) <- stripParens scrutinee
+            | L _ (XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) <- ignoreParens body
+            , L _ (HsTyVar _ NotPromoted scrut) <- ignoreParens scrutinee
             , [selected] <- [i | (i, (_, v)) <- zip [0 :: Int ..] equation_scope
                                , sameBinder v scrut]
             , selected >= length captures
@@ -525,13 +525,10 @@ liftTypeLambdas lift_lambdas sigma group = do
     -- closure is just a partial application of the same family.
     collectLambdas salt vars body
       | not (hasDuplicates vars)
-      , L _ (XHsType (HsTypeLambda _ more inner)) <- stripParens body
+      , L _ (XHsType (HsTypeLambda _ more inner)) <- ignoreParens body
       , not (hasDuplicates more)
       = collectLambdas salt (zipWith (hideEarlier more salt) [0..] vars ++ more) inner
       | otherwise = (vars, body)
-
-    stripParens (L _ (HsParTy _ body)) = stripParens body
-    stripParens ty = ty
 
     sameBinder a b = unLoc a == unLoc b
     hasDuplicates = not . null . findDupsEq sameBinder
@@ -560,7 +557,9 @@ liftTypeLambdas lift_lambdas sigma group = do
           | otherwise = original
     capture _ = Nothing
 
-    typeName n = L (l2l (getLoc n)) (HsTyVar noAnn NotPromoted n)
+-- | Wrap a located 'RdrName' as an unpromoted 'HsTyVar'.
+typeName :: LocatedN RdrName -> LHsType GhcPs
+typeName n = L (l2l (getLoc n)) (HsTyVar noAnn NotPromoted n)
 
 -- | Form a required parameter for a lifted type expression.
 liftedTypeVarBinder :: LocatedN RdrName -> LHsTyVarBndr (HsBndrVis GhcPs) GhcPs
@@ -1293,8 +1292,6 @@ liftDeclarationTypes source_heads earlier helper_suffix lift_cases named_wildcar
         Just (_, []) -> null (extractHsTyRdrTyVars rhs)
         _ -> False
 
-    typeName n = L (l2l (getLoc n)) (HsTyVar noAnn NotPromoted n)
-
 -- | Check the type forms allowed in a lambda body with no inner binders.
 ordinaryLambdaBody :: LHsType GhcPs -> Bool
 ordinaryLambdaBody (L _ ty) = case ty of
@@ -1851,8 +1848,6 @@ liftTypeCases group =
     extendForall names binder@(_, name, _) = do
       mentions <- captureKindNames binder
       extendForallNames names (unLoc name) mentions
-
-    typeName n = L (l2l (getLoc n)) (HsTyVar noAnn NotPromoted n)
 
     checkAlt (L loc (HsTypeCaseAlt pat _ rhs)) = do
       (pat', bound) <- classifyTypeCasePattern pat
@@ -2882,7 +2877,7 @@ localSourceTableBinders tycl_decls binds sigs = do
         (var_pat p2a == Just v_hit && var_pat p1b == Just cb_var)
       | otherwise = False
 
-    local_ps_syns = mkOccEnv
+    local_ps_syn_list =
       [ (rdrNameOcc syn, (params, rhs))
       | tg <- tycl_decls
       , L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}
@@ -2890,10 +2885,12 @@ localSourceTableBinders tycl_decls binds sigs = do
       , Just params <- [traverse hsLTyVarName tvbs] ]
       where
         hsLTyVarName b = unLoc <$> hsLTyVarLocName b
+    local_ps_syns = mkOccEnv local_ps_syn_list
 
     expand_ps_syn :: Int -> LHsType GhcPs -> LHsType GhcPs
     expand_ps_syn 0 ty = ty
     expand_ps_syn fuel ty
+      | null local_ps_syn_list = ty
       | (L _ (HsTyVar _ NotPromoted (L _ syn_rdr)), args) <- split_ty_apps ty
       , Just (params, rhs) <- lookupOccEnv local_ps_syns (rdrNameOcc syn_rdr)
       , length params == length args
@@ -2937,12 +2934,14 @@ localSourceTableBinders tycl_decls binds sigs = do
       | L _ (TypeSig _ [] [L _ n] wc) <- sigs
       , is_producer_sig (sig_body (unLoc (hswc_body wc))) ]
 
-    peel_plain_ps_foralls ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
-      HsForAllTy{hst_tele = HsForAllInvis{hsf_matchability = Nothing, hsf_invis_bndrs = bndrs}, hst_body = body}
-        | all plain_ps_bndr bndrs -> peel_plain_ps_foralls body
-      HsForAllTy{} -> Nothing
-      HsQualTy{} -> Nothing
-      _ -> Just (expand_ps_syn 4 ty)
+    peel_plain_ps_foralls ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsForAllTy{hst_tele = HsForAllInvis{hsf_matchability = Nothing, hsf_invis_bndrs = bndrs}, hst_body = body}
+             | all plain_ps_bndr bndrs -> peel_plain_ps_foralls body
+           HsForAllTy{} -> Nothing
+           HsQualTy{} -> Nothing
+           _ -> Just expanded
       where
         plain_ps_bndr (L _ (HsTvb _ SpecifiedSpec (HsBndrVar _ _) kind)) =
           case kind of
@@ -2957,12 +2956,14 @@ localSourceTableBinders tycl_decls binds sigs = do
       Just (dom, cod) -> do
         (doms, res) <- split_ps_std_arrows cod
         pure (dom : doms, res)
-      Nothing -> case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
-        HsFunTy{} -> Nothing
-        HsQualTy{} -> Nothing
-        HsForAllTy{} -> Nothing
-        HsForEachTy{} -> Nothing
-        _ -> Just ([], expand_ps_syn 4 ty)
+      Nothing ->
+        let expanded = expand_ps_syn 4 ty
+        in case unLoc (ignoreParens expanded) of
+             HsFunTy{} -> Nothing
+             HsQualTy{} -> Nothing
+             HsForAllTy{} -> Nothing
+             HsForEachTy{} -> Nothing
+             _ -> Just ([], expanded)
 
     is_ps_tyvar ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
       HsTyVar _ NotPromoted (L _ r) -> isRdrTyVar r
@@ -3018,9 +3019,11 @@ localSourceTableBinders tycl_decls binds sigs = do
       (doms@(_ : _), res) <- split_ps_std_arrows tau
       guard (all is_ps_poly_source_ty (res : doms) && is_ps_con_headed_ty res)
 
-    peel_ps_foralls ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
-      HsForAllTy{hst_body = body} -> peel_ps_foralls body
-      _ -> expand_ps_syn 4 ty
+    peel_ps_foralls ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsForAllTy{hst_body = body} -> peel_ps_foralls body
+           _ -> expanded
 
     ps_std_arrow ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
       HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod -> Just (dom, cod)
@@ -3038,14 +3041,16 @@ localSourceTableBinders tycl_decls binds sigs = do
       let cur = peel_ps_foralls ty
       in case ps_std_arrow cur of
            Just (dom, cod)
-             | not (null caps)
-             , isNothing (ps_std_arrow (peel_ps_foralls cod))
-             , (L _ (HsTyVar _ NotPromoted (L _ idx_hd)), idx_first : _) <- split_ty_apps (expand_ps_syn 4 dom)
-             , (_, _ : _) <- split_ty_apps idx_first
-             , (L _ (HsTyVar _ NotPromoted (L _ res_hd)), _ : _) <- split_ty_apps (expand_ps_syn 4 cod)
-             -> idx_hd /= res_hd && all (== res_hd) caps
-             | (L _ (HsTyVar _ NotPromoted (L _ cap_hd)), _ : _) <- split_ty_apps (expand_ps_syn 4 dom)
-             -> is_subst_map_sig (cap_hd : caps) cod
+             | let dom_apps = split_ty_apps (expand_ps_syn 4 dom)
+             -> if | not (null caps)
+                   , isNothing (ps_std_arrow (peel_ps_foralls cod))
+                   , (L _ (HsTyVar _ NotPromoted (L _ idx_hd)), idx_first : _) <- dom_apps
+                   , (_, _ : _) <- split_ty_apps idx_first
+                   , (L _ (HsTyVar _ NotPromoted (L _ res_hd)), _ : _) <- split_ty_apps (expand_ps_syn 4 cod)
+                   -> idx_hd /= res_hd && all (== res_hd) caps
+                   | (L _ (HsTyVar _ NotPromoted (L _ cap_hd)), _ : _) <- dom_apps
+                   -> is_subst_map_sig (cap_hd : caps) cod
+                   | otherwise -> False
            _ -> False
 
     is_sigma_comb_sig ty =
@@ -3824,7 +3829,9 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
 
     expand_rn_syn :: Int -> LHsType GhcRn -> (LHsType GhcRn, [(Name, Maybe Int)])
     expand_rn_syn 0 ty = (ty, [])
-    expand_rn_syn fuel ty = case unLoc (ignoreParens ty) of
+    expand_rn_syn fuel ty
+      | isEmptyNameEnv local_rn_syns = (ty, [])
+      | otherwise = case unLoc (ignoreParens ty) of
       HsForAllTy x tele body ->
         let (body', deps) = expand_rn_syn fuel body
         in (L (getLoc ty) (HsForAllTy x tele body'), deps)

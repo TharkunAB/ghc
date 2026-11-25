@@ -692,7 +692,8 @@ tc_pat scaled_exp_pat_ty@(Scaled w_pat exp_pat_ty) penv ps_pat thing_inside =
 
     VarPat x (L l name) -> do
       { (wrap, id) <- tcPatBndr penv name scaled_exp_pat_ty
-      ; let extend | isSystemName name, name == idName id = tcExtendGeneratedIdEnv id
+      ; let extend | (isSystemName name || isGeneratedSrcSpan (nameSrcSpan name))
+                   , name == idName id = tcExtendGeneratedIdEnv id
                    | otherwise = tcExtendIdEnv1 name id
             -- Generated patterns have no source binder to report.
             -- See Note [Wildcard retained binders] in GHC.Tc.Gen.Match.
@@ -1906,23 +1907,14 @@ tcRetainedDataConPat (L con_span _) con pat_ty_scaled penv arg_pats thing_inside
       = do { info <- tcRetainedCon (varType idx) inner_pat
            ; (index_con, fields) <- maybe bad_pattern return info
            ; let constructor_index = retainedConIndex (varType idx) index_con fields
-                 field_pat = bindRetainedConFields fields inner_pat
-                 source_pat = case mb_alias of
-                   Just alias -> L (getLoc inner_pat) (AsPat noExtField alias field_pat)
-                   Nothing -> field_pat
+                 source_pat = wrap_source_pat (bindRetainedConFields fields inner_pat)
            ; cv <- newEvVar (mkNomEqPred (TermVarTy idx) constructor_index)
-           ; (ev_binds, (pat', res)) <-
+           ; (ev_binds, (L loc checked, res)) <-
                checkConstraints (PatSkol (RealDataCon index_con) match_ctxt) [] [cv] $
                  tcConArg parent_con penv
                    (pos, source_pat, Scaled ManyTy (varType idx)) $
                    cont [(idx, mkCoVarCo cv, isJust mb_alias)]
-           ; let L loc checked = pat'
-                 with_proof = add_proof cv ev_binds checked
-                 indexed_pat = case mb_alias of
-                   Just _ -> with_proof
-                   Nothing -> AsPat noExtField (L (noAnnSrcSpan generatedSrcSpan) idx)
-                                    (L loc with_proof)
-           ; return (L loc indexed_pat, res) }
+           ; return (finish_indexed_pat loc cv ev_binds checked, res) }
       | otherwise
       = case unLoc (retainedConPat (strip_par_pat inner_pat)) of
           ConPat { pat_con = L _ cname, pat_args = PrefixCon x raw_subs } ->
@@ -1938,10 +1930,7 @@ tcRetainedDataConPat (L con_span _) con pat_ty_scaled penv arg_pats thing_inside
                                 shallow_subs = [spat | (_, spat, _) <- prepped]
                                 nested_tasks = [(i, sub_as, fid, sub_in)
                                                | (i, (fid, _, Just (sub_as, sub_in))) <- zip [0 :: Int ..] prepped]
-                                shallow_con = rebuild_par_con inner_pat cname x shallow_subs
-                                source_pat = case mb_alias of
-                                  Just alias -> L (getLoc inner_pat) (AsPat noExtField alias shallow_con)
-                                  Nothing -> shallow_con
+                                source_pat = wrap_source_pat (rebuild_par_con inner_pat cname x shallow_subs)
                                 constructor_index = retainedConIndex (varType idx) index_con fields
                           ; cv <- newEvVar (mkNomEqPred (TermVarTy idx) constructor_index)
                           ; let run_nested [] acc_refs = ([],) <$> cont acc_refs
@@ -1951,19 +1940,13 @@ tcRetainedDataConPat (L con_span _) con pat_ty_scaled penv arg_pats thing_inside
                                            sub_as fid sub_in $ \sub_refs ->
                                              run_nested more (acc_refs ++ sub_refs)
                                      ; return ((slot, sub_tc) : rest_tc, r) }
-                          ; (ev_binds, (pat', (nested_checked, res))) <-
+                          ; (ev_binds, (L loc checked0, (nested_checked, res))) <-
                               checkConstraints (PatSkol (RealDataCon index_con) match_ctxt) [] [cv] $
                                 tcConArg parent_con penv
                                   (pos, source_pat, Scaled ManyTy (varType idx)) $
                                   run_nested nested_tasks [(idx, mkCoVarCo cv, isJust mb_alias)]
-                          ; let L loc checked0 = pat'
-                                checked1 = splice_nested nested_checked checked0
-                                with_proof = add_proof cv ev_binds checked1
-                                indexed_pat = case mb_alias of
-                                  Just _ -> with_proof
-                                  Nothing -> AsPat noExtField (L (noAnnSrcSpan generatedSrcSpan) idx)
-                                                   (L loc with_proof)
-                          ; return (L loc indexed_pat, res) }
+                          ; let checked1 = splice_nested nested_checked checked0
+                          ; return (finish_indexed_pat loc cv ev_binds checked1, res) }
                    _ -> bad_pattern }
           _ -> bad_pattern
       where
@@ -1971,8 +1954,17 @@ tcRetainedDataConPat (L con_span _) con pat_ty_scaled penv arg_pats thing_inside
           LamPat mc -> mc
           LetPat{}  -> PatBindRhs
 
-        strip_par_pat (L _ (ParPat _ p)) = strip_par_pat p
-        strip_par_pat p = p
+        wrap_source_pat pat = case mb_alias of
+          Just alias -> L (getLoc inner_pat) (AsPat noExtField alias pat)
+          Nothing    -> pat
+
+        finish_indexed_pat loc cv ev_binds checked =
+          let with_proof  = add_proof cv ev_binds checked
+              indexed_pat = case mb_alias of
+                Just _  -> with_proof
+                Nothing -> AsPat noExtField (L (noAnnSrcSpan generatedSrcSpan) idx)
+                                 (L loc with_proof)
+          in L loc indexed_pat
 
         has_nested_subpats p =
           case unLoc (retainedConPat (strip_par_pat p)) of
@@ -2014,6 +2006,9 @@ tcRetainedDataConPat (L con_span _) con pat_ty_scaled penv arg_pats thing_inside
           in pat { pat_args = PrefixCon x (zipWith replace_slot [0 :: Int ..] subs) }
         splice_nested _ pat = pat
 
+    strip_par_pat (L _ (ParPat _ p)) = strip_par_pat p
+    strip_par_pat p = p
+
     bind_retained_field :: (LPat GhcRn -> LPat GhcRn) -> LPat GhcRn
                         -> TcM (Maybe (Name, LPat GhcRn))
     bind_retained_field wrap (L loc (ParPat x inner)) =
@@ -2027,12 +2022,11 @@ tcRetainedDataConPat (L con_span _) con pat_ty_scaled penv arg_pats thing_inside
          ; return (Just (name, wrap (bindRetainedWildcard name pat))) }
     bind_retained_field _ _ = return Nothing
 
-    retained_field_as_pat (L _ (ParPat _ pat)) = retained_field_as_pat pat
-    retained_field_as_pat (L _ (AsPat _ alias pat)) = Just (alias, pat)
-    retained_field_as_pat _ = Nothing
+    retained_field_as_pat pat
+      | AsPat _ alias inner <- unLoc (strip_par_pat pat) = Just (alias, inner)
+      | otherwise = Nothing
 
-    bind_only (L _ (ParPat _ pat)) = bind_only pat
-    bind_only pat = isRetainedVarPat pat
+    bind_only = isRetainedVarPat . strip_par_pat
 
     refine_type _ [] ty = return (mkNomReflCo ty)
     refine_type keep_index ((index, branch_co, source_alias) : rest) ty

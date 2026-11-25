@@ -61,7 +61,7 @@ import GHC.Types.Name
   )
 import GHC.Types.Name.Env (NameEnv, extendNameEnv, extendNameEnvList, lookupNameEnv, mkNameEnv)
 import GHC.Types.Name.Ppr (mkNamePprCtx)
-import GHC.Types.Name.Set (NameSet, elemNameSet, mkNameSet)
+import GHC.Types.Name.Set (NameSet, elemNameSet, emptyNameSet, extendNameSet, mkNameSet)
 import GHC.Types.SrcLoc
   ( GenLocated (..)
   , SrcSpan (..)
@@ -91,7 +91,7 @@ import GHC.Utils.Outputable
   )
 
 import Control.Monad (foldM, forM_)
-import Data.List (nub, sortBy)
+import Data.List (sortBy)
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe (isJust, isNothing)
 
@@ -324,132 +324,138 @@ resolveTopCallee this_mod top_set alias_env v
 
 -- | Collect all canonical top-level callees referenced inside a binding body.
 bindingCallees :: (Id -> Maybe Name) -> HsBind GhcTc -> [Name]
-bindingCallees resolve bind = nub (goBind bind)
+bindingCallees resolve bind = dedup emptyNameSet (goBind bind [])
   where
-    goBind :: HsBind GhcTc -> [Name]
-    goBind (FunBind { fun_matches = mg }) = goMatchGroup mg
-    goBind (PatBind { pat_lhs = p, pat_rhs = grhss }) = goLPat p ++ goGRHSs grhss
-    goBind (VarBind { var_rhs = rhs }) = goLExpr rhs
-    goBind (XHsBindsLR (AbsBinds { abs_binds = bs })) = concatMap (goBind . unLoc) bs
-    goBind (PatSynBind {}) = []
+    dedup :: NameSet -> [Name] -> [Name]
+    dedup _ [] = []
+    dedup seen (nm : nms)
+      | nm `elemNameSet` seen = dedup seen nms
+      | otherwise             = nm : dedup (extendNameSet seen nm) nms
 
-    goMatchGroup :: MatchGroup GhcTc (LHsExpr GhcTc) -> [Name]
-    goMatchGroup (MG { mg_alts = L _ alts }) = concatMap (goMatch . unLoc) alts
+    goBind :: HsBind GhcTc -> [Name] -> [Name]
+    goBind (FunBind { fun_matches = mg }) acc = goMatchGroup mg acc
+    goBind (PatBind { pat_lhs = p, pat_rhs = grhss }) acc = goLPat p (goGRHSs grhss acc)
+    goBind (VarBind { var_rhs = rhs }) acc = goLExpr rhs acc
+    goBind (XHsBindsLR (AbsBinds { abs_binds = bs })) acc = foldr (goBind . unLoc) acc bs
+    goBind (PatSynBind {}) acc = acc
 
-    goMatch :: Match GhcTc (LHsExpr GhcTc) -> [Name]
-    goMatch (Match { m_pats = L _ pats, m_grhss = grhss }) =
-      concatMap goLPat pats ++ goGRHSs grhss
+    goMatchGroup :: MatchGroup GhcTc (LHsExpr GhcTc) -> [Name] -> [Name]
+    goMatchGroup (MG { mg_alts = L _ alts }) acc = foldr (goMatch . unLoc) acc alts
 
-    goGRHSs :: GRHSs GhcTc (LHsExpr GhcTc) -> [Name]
-    goGRHSs (GRHSs { grhssGRHSs = grhss, grhssLocalBinds = L _ lbinds }) =
-      concatMap (goGRHS . unLoc) (NE.toList grhss) ++ goLocalBinds lbinds
+    goMatch :: Match GhcTc (LHsExpr GhcTc) -> [Name] -> [Name]
+    goMatch (Match { m_pats = L _ pats, m_grhss = grhss }) acc =
+      foldr goLPat (goGRHSs grhss acc) pats
 
-    goGRHS :: GRHS GhcTc (LHsExpr GhcTc) -> [Name]
-    goGRHS (GRHS _ guards body) = concatMap (goStmt . unLoc) guards ++ goLExpr body
+    goGRHSs :: GRHSs GhcTc (LHsExpr GhcTc) -> [Name] -> [Name]
+    goGRHSs (GRHSs { grhssGRHSs = grhss, grhssLocalBinds = L _ lbinds }) acc =
+      foldr (goGRHS . unLoc) (goLocalBinds lbinds acc) (NE.toList grhss)
 
-    goLocalBinds :: HsLocalBinds GhcTc -> [Name]
-    goLocalBinds (HsValBinds _ (ValBinds _ vbs)) =
-      concatMap (goBind . unLoc) (val_binds vbs)
-    goLocalBinds (HsValBinds _ (XValBindsLR (HsVBG grps _))) =
-      concatMap (\(_, bs) -> concatMap (goBind . unLoc) bs) grps
-    goLocalBinds (HsIPBinds _ (IPBinds _ ip_binds)) =
-      concatMap (\(L _ (IPBind _ _ e)) -> goLExpr e) ip_binds
-    goLocalBinds (EmptyLocalBinds _) = []
+    goGRHS :: GRHS GhcTc (LHsExpr GhcTc) -> [Name] -> [Name]
+    goGRHS (GRHS _ guards body) acc = foldr (goStmt . unLoc) (goLExpr body acc) guards
 
-    goStmt :: ExprStmt GhcTc -> [Name]
-    goStmt (LastStmt _ body _ _) = goLExpr body
-    goStmt (BindStmt _ pat rhs)  = goLPat pat ++ goLExpr rhs
-    goStmt (BodyStmt _ body _ _) = goLExpr body
-    goStmt (LetStmt _ (L _ lbs)) = goLocalBinds lbs
-    goStmt (ParStmt _ blocks _ _) =
-      concatMap (\(ParStmtBlock _ stmts _ _) -> concatMap (goStmt . unLoc) stmts) blocks
-    goStmt (TransStmt { trS_stmts = stmts, trS_using = u, trS_by = mb_by }) =
-      concatMap (goStmt . unLoc) stmts ++ goLExpr u ++ maybe [] goLExpr mb_by
-    goStmt (RecStmt { recS_stmts = L _ stmts }) = concatMap (goStmt . unLoc) stmts
-    goStmt (XStmtLR (ApplicativeStmt _ args _)) =
-      concatMap (\(_, arg) -> goAppArg arg) args
+    goLocalBinds :: HsLocalBinds GhcTc -> [Name] -> [Name]
+    goLocalBinds (HsValBinds _ (ValBinds _ vbs)) acc =
+      foldr (goBind . unLoc) acc (val_binds vbs)
+    goLocalBinds (HsValBinds _ (XValBindsLR (HsVBG grps _))) acc =
+      foldr (\(_, bs) a -> foldr (goBind . unLoc) a bs) acc grps
+    goLocalBinds (HsIPBinds _ (IPBinds _ ip_binds)) acc =
+      foldr (\(L _ (IPBind _ _ e)) -> goLExpr e) acc ip_binds
+    goLocalBinds (EmptyLocalBinds _) acc = acc
 
-    goAppArg :: ApplicativeArg GhcTc -> [Name]
-    goAppArg (ApplicativeArgOne _ pat expr _) = goLPat pat ++ goLExpr expr
-    goAppArg (ApplicativeArgMany _ stmts ret pat _) =
-      concatMap (goStmt . unLoc) stmts ++ goExpr ret ++ goLPat pat
+    goStmt :: ExprStmt GhcTc -> [Name] -> [Name]
+    goStmt (LastStmt _ body _ _) acc = goLExpr body acc
+    goStmt (BindStmt _ pat rhs)  acc = goLPat pat (goLExpr rhs acc)
+    goStmt (BodyStmt _ body _ _) acc = goLExpr body acc
+    goStmt (LetStmt _ (L _ lbs)) acc = goLocalBinds lbs acc
+    goStmt (ParStmt _ blocks _ _) acc =
+      foldr (\(ParStmtBlock _ stmts _ _) a -> foldr (goStmt . unLoc) a stmts) acc blocks
+    goStmt (TransStmt { trS_stmts = stmts, trS_using = u, trS_by = mb_by }) acc =
+      foldr (goStmt . unLoc) (goLExpr u (maybe acc (`goLExpr` acc) mb_by)) stmts
+    goStmt (RecStmt { recS_stmts = L _ stmts }) acc = foldr (goStmt . unLoc) acc stmts
+    goStmt (XStmtLR (ApplicativeStmt _ args _)) acc =
+      foldr (\(_, arg) -> goAppArg arg) acc args
 
-    goLPat :: LPat GhcTc -> [Name]
+    goAppArg :: ApplicativeArg GhcTc -> [Name] -> [Name]
+    goAppArg (ApplicativeArgOne _ pat expr _) acc = goLPat pat (goLExpr expr acc)
+    goAppArg (ApplicativeArgMany _ stmts ret pat _) acc =
+      foldr (goStmt . unLoc) (goExpr ret (goLPat pat acc)) stmts
+
+    goLPat :: LPat GhcTc -> [Name] -> [Name]
     goLPat (L _ pat) = goPat pat
 
-    goPat :: Pat GhcTc -> [Name]
-    goPat (ParPat _ p)        = goLPat p
-    goPat (LazyPat _ p)       = goLPat p
-    goPat (BangPat _ p)       = goLPat p
-    goPat (AsPat _ _ p)       = goLPat p
-    goPat (SigPat _ p _)      = goLPat p
-    goPat (ModifiedPat _ _ p) = goLPat p
-    goPat (ListPat _ ps)      = concatMap goLPat ps
-    goPat (TuplePat _ ps _)   = concatMap goLPat ps
-    goPat (SumPat _ p _ _)    = goLPat p
-    goPat (OrPat _ ps)        = concatMap goLPat (NE.toList ps)
-    goPat (ViewPat _ e p)     = goLExpr e ++ goLPat p
-    goPat (ConPat { pat_args = details }) =
-      concatMap goLPat (conPatArgs details)
-    goPat (XPat (CoPat _ inner _))          = goPat inner
-    goPat (XPat (ExpansionPat _ expanded))  = goPat expanded
-    goPat (XPat (NativeExistsPat _ _ _ _ inner)) = goPat inner
-    goPat _ = []
+    goPat :: Pat GhcTc -> [Name] -> [Name]
+    goPat (ParPat _ p)        acc = goLPat p acc
+    goPat (LazyPat _ p)       acc = goLPat p acc
+    goPat (BangPat _ p)       acc = goLPat p acc
+    goPat (AsPat _ _ p)       acc = goLPat p acc
+    goPat (SigPat _ p _)      acc = goLPat p acc
+    goPat (ModifiedPat _ _ p) acc = goLPat p acc
+    goPat (ListPat _ ps)      acc = foldr goLPat acc ps
+    goPat (TuplePat _ ps _)   acc = foldr goLPat acc ps
+    goPat (SumPat _ p _ _)    acc = goLPat p acc
+    goPat (OrPat _ ps)        acc = foldr goLPat acc (NE.toList ps)
+    goPat (ViewPat _ e p)     acc = goLExpr e (goLPat p acc)
+    goPat (ConPat { pat_args = details }) acc =
+      foldr goLPat acc (conPatArgs details)
+    goPat (XPat (CoPat _ inner _))          acc = goPat inner acc
+    goPat (XPat (ExpansionPat _ expanded))  acc = goPat expanded acc
+    goPat (XPat (NativeExistsPat _ _ _ _ inner)) acc = goPat inner acc
+    goPat _ acc = acc
 
-    goLExpr :: LHsExpr GhcTc -> [Name]
+    goLExpr :: LHsExpr GhcTc -> [Name] -> [Name]
     goLExpr (L _ e) = goExpr e
 
-    goExpr :: HsExpr GhcTc -> [Name]
-    goExpr (HsVar _ (L _ v))
-      | Just target <- resolve v = [target]
-      | otherwise                = []
-    goExpr (HsLam _ _ mg)            = goMatchGroup mg
-    goExpr (HsApp _ f a)             = goLExpr f ++ goLExpr a
-    goExpr (HsAppType _ f _)         = goLExpr f
-    goExpr (HsAppRetained _ f a)     = goLExpr f ++ goLExpr a
-    goExpr (NegApp _ e _)            = goLExpr e
-    goExpr (HsPar _ e)               = goLExpr e
-    goExpr (ExplicitTuple _ args _)  = concatMap goTupArg args
-    goExpr (ExplicitSum _ _ _ e)     = goLExpr e
-    goExpr (HsCase _ s mg)           = goLExpr s ++ goMatchGroup mg
-    goExpr (HsIf _ c t f)            = goLExpr c ++ goLExpr t ++ goLExpr f
-    goExpr (HsMultiIf _ grhss)       = concatMap (goGRHS . unLoc) (NE.toList grhss)
-    goExpr (HsLet _ (L _ lbs) body)  = goLocalBinds lbs ++ goLExpr body
-    goExpr (HsDo _ _ (L _ stmts))    = concatMap (goStmt . unLoc) stmts
-    goExpr (ExplicitList _ es)       = concatMap goLExpr es
-    goExpr (RecordCon { rcon_flds = HsRecFields { rec_flds = flds } }) =
-      concatMap (\(L _ fb) -> goLExpr (hfbRHS fb)) flds
-    goExpr (ExprWithTySig _ e _)     = goLExpr e
-    goExpr (ArithSeq _ _ info)       = goArithSeq info
-    goExpr (HsStatic _ e)            = goLExpr e
-    goExpr (HsPragE _ _ e)           = goLExpr e
-    goExpr (HsProc _ p _)            = goLPat p
-    goExpr (XExpr xexpr)             = goXXExpr xexpr
-    goExpr _                         = []
+    goExpr :: HsExpr GhcTc -> [Name] -> [Name]
+    goExpr (HsVar _ (L _ v)) acc
+      | Just target <- resolve v     = target : acc
+      | otherwise                    = acc
+    goExpr (HsLam _ _ mg)            acc = goMatchGroup mg acc
+    goExpr (HsApp _ f a)             acc = goLExpr f (goLExpr a acc)
+    goExpr (HsAppType _ f _)         acc = goLExpr f acc
+    goExpr (HsAppRetained _ f a)     acc = goLExpr f (goLExpr a acc)
+    goExpr (NegApp _ e _)            acc = goLExpr e acc
+    goExpr (HsPar _ e)               acc = goLExpr e acc
+    goExpr (ExplicitTuple _ args _)  acc = foldr goTupArg acc args
+    goExpr (ExplicitSum _ _ _ e)     acc = goLExpr e acc
+    goExpr (HsCase _ s mg)           acc = goLExpr s (goMatchGroup mg acc)
+    goExpr (HsIf _ c t f)            acc = goLExpr c (goLExpr t (goLExpr f acc))
+    goExpr (HsMultiIf _ grhss)       acc = foldr (goGRHS . unLoc) acc (NE.toList grhss)
+    goExpr (HsLet _ (L _ lbs) body)  acc = goLocalBinds lbs (goLExpr body acc)
+    goExpr (HsDo _ _ (L _ stmts))    acc = foldr (goStmt . unLoc) acc stmts
+    goExpr (ExplicitList _ es)       acc = foldr goLExpr acc es
+    goExpr (RecordCon { rcon_flds = HsRecFields { rec_flds = flds } }) acc =
+      foldr (\(L _ fb) -> goLExpr (hfbRHS fb)) acc flds
+    goExpr (ExprWithTySig _ e _)     acc = goLExpr e acc
+    goExpr (ArithSeq _ _ info)       acc = goArithSeq info acc
+    goExpr (HsStatic _ e)            acc = goLExpr e acc
+    goExpr (HsPragE _ _ e)           acc = goLExpr e acc
+    goExpr (HsProc _ p _)            acc = goLPat p acc
+    goExpr (XExpr xexpr)             acc = goXXExpr xexpr acc
+    goExpr _                         acc = acc
 
-    goTupArg :: HsTupArg GhcTc -> [Name]
-    goTupArg (Present _ e) = goLExpr e
-    goTupArg (Missing _)   = []
+    goTupArg :: HsTupArg GhcTc -> [Name] -> [Name]
+    goTupArg (Present _ e) acc = goLExpr e acc
+    goTupArg (Missing _)   acc = acc
 
-    goArithSeq :: ArithSeqInfo GhcTc -> [Name]
-    goArithSeq (From e1)           = goLExpr e1
-    goArithSeq (FromThen e1 e2)    = goLExpr e1 ++ goLExpr e2
-    goArithSeq (FromTo e1 e2)      = goLExpr e1 ++ goLExpr e2
-    goArithSeq (FromThenTo a b c)  = goLExpr a ++ goLExpr b ++ goLExpr c
+    goArithSeq :: ArithSeqInfo GhcTc -> [Name] -> [Name]
+    goArithSeq (From e1)          acc = goLExpr e1 acc
+    goArithSeq (FromThen e1 e2)   acc = goLExpr e1 (goLExpr e2 acc)
+    goArithSeq (FromTo e1 e2)     acc = goLExpr e1 (goLExpr e2 acc)
+    goArithSeq (FromThenTo a b c) acc = goLExpr a (goLExpr b (goLExpr c acc))
 
-    goXXExpr :: XXExprGhcTc -> [Name]
-    goXXExpr (WrapExpr _ e)                     = goExpr e
-    goXXExpr (ExpandedThingTc (HSE _ e))        = goLExpr e
-    goXXExpr (NativeExistsPack _ _ e)           = goLExpr e
-    goXXExpr (NativeExistsUnpack _ _ _ p body)  = goLExpr p ++ goLExpr body
-    goXXExpr (NativeCaseAlias s _ _ _ body)     = goLExpr s ++ goLExpr body
-    goXXExpr (NativeLetAlias r _ _ _ _ body)    = goLExpr r ++ goLExpr body
-    goXXExpr (HsTick _ e)                       = goLExpr e
-    goXXExpr (HsBinTick _ _ e)                  = goLExpr e
-    goXXExpr (HsRecSelTc (FieldOcc _ (L _ sel)))
-      | Just target <- resolve sel              = [target]
-      | otherwise                               = []
-    goXXExpr (ConLikeTc _)                      = []
+    goXXExpr :: XXExprGhcTc -> [Name] -> [Name]
+    goXXExpr (WrapExpr _ e)                    acc = goExpr e acc
+    goXXExpr (ExpandedThingTc (HSE _ e))       acc = goLExpr e acc
+    goXXExpr (NativeExistsPack _ _ e)          acc = goLExpr e acc
+    goXXExpr (NativeExistsUnpack _ _ _ p body) acc = goLExpr p (goLExpr body acc)
+    goXXExpr (NativeCaseAlias s _ _ _ body)    acc = goLExpr s (goLExpr body acc)
+    goXXExpr (NativeLetAlias r _ _ _ _ body)   acc = goLExpr r (goLExpr body acc)
+    goXXExpr (HsTick _ e)                      acc = goLExpr e acc
+    goXXExpr (HsBinTick _ _ e)                 acc = goLExpr e acc
+    goXXExpr (HsRecSelTc (FieldOcc _ (L _ sel))) acc
+      | Just target <- resolve sel                 = target : acc
+      | otherwise                                  = acc
+    goXXExpr (ConLikeTc _)                     acc = acc
 
 -- | Extract sub-patterns from constructor pattern details.
 conPatArgs :: HsConPatDetails GhcTc -> [LPat GhcTc]
@@ -600,6 +606,10 @@ isPredVarPat (L _ pat0) = go pat0
 checkPattern :: LPat GhcTc -> Either String (VarSet, VarSet)
 checkPattern (L _ pat0) = go False pat0
   where
+    insertBinder :: Bool -> Id -> (VarSet, VarSet) -> (VarSet, VarSet)
+    insertBinder True  v (eqs, subs) = (eqs, extendVarSet subs v)
+    insertBinder False v (eqs, subs) = (extendVarSet eqs v, subs)
+
     go :: Bool -> Pat GhcTc -> Either String (VarSet, VarSet)
     go under_con pat = case pat of
       WildPat _ ->
@@ -607,10 +617,8 @@ checkPattern (L _ pat0) = go False pat0
       VarPat _ (L _ v)
         | isPredTy (varType v) ->
             Right (emptyVarSet, emptyVarSet)
-        | under_con ->
-            Right (emptyVarSet, extendVarSet emptyVarSet v)
         | otherwise ->
-            Right (extendVarSet emptyVarSet v, emptyVarSet)
+            Right (insertBinder under_con v (emptyVarSet, emptyVarSet))
       ParPat _ (L _ p) ->
         go under_con p
       BangPat _ (L _ p) ->
@@ -622,11 +630,8 @@ checkPattern (L _ pat0) = go False pat0
       LazyPat _ (L _ p)
         | isIrrefutableVarPat p -> go under_con p
         | otherwise             -> Left "partial or guarded equations"
-      AsPat _ (L _ v) (L _ p) -> do
-        (eqs, subs) <- go under_con p
-        if under_con
-          then Right (eqs, extendVarSet subs v)
-          else Right (extendVarSet eqs v, subs)
+      AsPat _ (L _ v) (L _ p) ->
+        insertBinder under_con v <$> go under_con p
       TuplePat _ ps Boxed -> do
         parts <- traverse (\(L _ p) -> go under_con p) ps
         Right (unionVarSets (map fst parts), unionVarSets (map snd parts))
@@ -649,11 +654,8 @@ checkPattern (L _ pat0) = go False pat0
         go under_con inner
       XPat (ExpansionPat _ inner) ->
         go under_con inner
-      XPat (NativeExistsPat _ _ payload _ inner) -> do
-        (eqs, subs) <- go under_con inner
-        if under_con
-          then Right (eqs, extendVarSet subs payload)
-          else Right (extendVarSet eqs payload, subs)
+      XPat (NativeExistsPat _ _ payload _ inner) ->
+        insertBinder under_con payload <$> go under_con inner
       InvisPat {} ->
         Right (emptyVarSet, emptyVarSet)
       EmbTyPat {} ->
@@ -857,30 +859,36 @@ checkExpr this_mod resolve status_env arity_env self_name param_env lexpr =
           checkGRHSsBody this_mod resolve status_env arity_env self_name param_env' grhss
         _ -> Left "partial or guarded equations"
 
+-- | Map a per-parameter update across both parallel lists of a 'ParamEnv'.
+mapParamEnv :: ((VarSet, VarSet) -> (VarSet, VarSet)) -> ParamEnv -> ParamEnv
+mapParamEnv step (ParamEnv eq_list sub_list) =
+  let (eq_list', sub_list') = unzip (zipWith (curry step) eq_list sub_list)
+  in ParamEnv eq_list' sub_list'
+
 -- | Propagate parameter equality and strict subterm sets across a @case@ alternative.
 refineCaseEnv :: Maybe Id -> VarSet -> VarSet -> ParamEnv -> ParamEnv
 refineCaseEnv Nothing _ _ env = env
-refineCaseEnv (Just scrut_var) pat_eqs pat_subs (ParamEnv eq_list sub_list) =
-  let step (eqs, subs)
-        | scrut_var `elemVarSet` subs =
-            (eqs, subs `unionVarSet` pat_eqs `unionVarSet` pat_subs)
-        | scrut_var `elemVarSet` eqs =
-            (eqs `unionVarSet` pat_eqs, subs `unionVarSet` pat_subs)
-        | otherwise =
-            (eqs, subs)
-      (eq_list', sub_list') = unzip (map step (zip eq_list sub_list))
-  in ParamEnv eq_list' sub_list'
+refineCaseEnv (Just scrut_var) pat_eqs pat_subs env =
+  mapParamEnv step env
+  where
+    step (eqs, subs)
+      | scrut_var `elemVarSet` subs =
+          (eqs, subs `unionVarSet` pat_eqs `unionVarSet` pat_subs)
+      | scrut_var `elemVarSet` eqs =
+          (eqs `unionVarSet` pat_eqs, subs `unionVarSet` pat_subs)
+      | otherwise =
+          (eqs, subs)
 
 -- | Propagate parameter equality and subterm sets across a local variable alias.
 extendAliasEnv :: Maybe Id -> Id -> ParamEnv -> ParamEnv
 extendAliasEnv Nothing _ env = env
-extendAliasEnv (Just src) dst (ParamEnv eq_list sub_list) =
-  let step (eqs, subs) =
-        ( if src `elemVarSet` eqs then extendVarSet eqs dst else eqs
-        , if src `elemVarSet` subs then extendVarSet subs dst else subs
-        )
-      (eq_list', sub_list') = unzip (map step (zip eq_list sub_list))
-  in ParamEnv eq_list' sub_list'
+extendAliasEnv (Just src) dst env =
+  mapParamEnv step env
+  where
+    step (eqs, subs) =
+      ( if src `elemVarSet` eqs then extendVarSet eqs dst else eqs
+      , if src `elemVarSet` subs then extendVarSet subs dst else subs
+      )
 
 -- | Peel wrappers and collect runtime value arguments in left-to-right call order.
 peelAppSpine :: LHsExpr GhcTc -> (HsExpr GhcTc, [LHsExpr GhcTc])
@@ -996,7 +1004,6 @@ isClosedPositiveAlgTyCon tc =
 -- | Check that 'tc' never occurs to the left of an arrow or under a type variable.
 strictlyPositiveIn :: TyCon -> Type -> Bool
 strictlyPositiveIn target ty0 = case coreFullView ty0 of
-  FunTy FTF_T_T _ _ a b -> not (mentionsTyCon target a) && strictlyPositiveIn target b
   FunTy _ _ _ a b       -> not (mentionsTyCon target a) && strictlyPositiveIn target b
   DepFunTy _ bndr b     -> not (mentionsTyCon target (varType bndr)) && strictlyPositiveIn target b
   ForAllTy _ _ b        -> strictlyPositiveIn target b
