@@ -3,6 +3,7 @@ module GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               sourceTableCallees, sourceTableDependencies, sourceTableTypeUses, sourceTableFamilyUse,
                               sourceTableFamilyAppUse, sourceTableReferenceUse, sourceCaseKindUse, sourceCaseVisibleArity, isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead, sourceLocalBooleanCases,
                               isFinalStructuralSource, isStructuralSourceTable, isNominalStructuralSource,
+                              isLargeElimTable, rebuildSourceFamilyWith,
                               visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt,
                               sourceEquationDatatypes, publicCaseType, ordinaryImport,
                               sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod, lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods, keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt, recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers, lookupBootModuleIdMaybe, isSourceFilterGuard,
@@ -26,9 +27,9 @@ import GHC.Core.CharCase
 import GHC.Core.OpenWhnf (openDataConFieldTypes)
 import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe, isPredTy, mkClassPred)
 import GHC.Core.Rules (RuleEnv(..), emptyRuleBase, emptyRuleEnv, extendRuleBaseList, getRules)
-import GHC.Core.Coercion (abstractNativeIndices, coercionLKind, coercionRKind, coercionRole, hasCoercionHole, mkNomReflCo, mkSymCo, mkTyConAppCo)
-import GHC.Core.Coercion.Axiom (ClosedTyFam(..), CoAxBranch, coAxiomBranches, coAxiomRole,
-                                coAxBranchCoVars, coAxBranchLHS, coAxBranchRHS, coAxBranchRoles, coAxBranchTyVars,
+import GHC.Core.Coercion (abstractNativeIndices, coercionLKind, coercionRKind, coercionRole, hasCoercionHole, mkCoVarCo, mkNomReflCo, mkSymCo, mkTyConAppCo)
+import GHC.Core.Coercion.Axiom (ClosedTyFam(..), CoAxBranch, coAxiomBranches, coAxiomName, coAxiomRole,
+                                coAxBranchCoVars, coAxBranchLHS, coAxBranchRHS, coAxBranchRoles, coAxBranchSpan, coAxBranchTyVars,
                                 fromBranches)
 import GHC.Core.ConLike (ConLike(..))
 import GHC.Core.DataCon
@@ -71,7 +72,7 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Tc.Errors.Types (RetainedQuantificationError(..), TcRnMessage(..))
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Tc.TyCl.Build (newImplicitBinder)
-import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, tct_id))
+import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, ATcTyCon, tct_id))
 import GHC.Tc.Types.ErrCtxt (FunAppCtxtFunArg(..), HsCtxt(..))
 import GHC.Tc.Types.Evidence (HsWrapper(..), TcEvBinds(..), EvBindsState(..), collectHsWrapBinders, isEmptyEvBindsMap)
 import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTypeEnv)
@@ -342,13 +343,19 @@ sourceTableReferenceUse :: TyCon -> TcM ()
 sourceTableReferenceUse table = record_or_use table Nothing
 
 record_or_use :: TyCon -> Maybe [Type] -> TcM ()
-record_or_use table args = do
-    owner <- sourceTableOwner table
-    case owner of
-      Just fun | finalCoreMapperOwner fun -> do
-        env <- getGblEnv
-        updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
-      _ -> maybe (sourceTableFamilyUse table) (sourceTableFamilyAppUse table) args
+record_or_use table args
+  | isTcTyCon table = pure ()
+  | otherwise = do
+      lcl <- getLclEnvTypeEnv <$> getLclEnv
+      case lookupNameEnv lcl (tyConName table) of
+        Just (ATcTyCon _) -> pure ()
+        _ -> do
+          owner <- sourceTableOwner table
+          case owner of
+            Just fun | finalCoreMapperOwner fun -> do
+              env <- getGblEnv
+              updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
+            _ -> maybe (sourceTableFamilyUse table) (sourceTableFamilyAppUse table) args
 
 -- | Check a source family when its axiom supplies type equality evidence.
 -- See Note [Source family evidence uses].
@@ -394,20 +401,25 @@ groundFirstHead _ = Nothing
 -- | Check the exact owner and record its dependency with the available precision.
 sourceTableFamilyUseAt :: TyCon -> Maybe Name -> TcM ()
 sourceTableFamilyUseAt table first
+  | isTcTyCon table = pure ()
   | isNothing (sourceTableTermOcc (nameOccName (tyConName table))) = pure ()
   | Just (ClosedTypeFamilyTyCon CTF_Abstract) <- famTyConFlav_maybe table = pure ()
   | otherwise = do
-      owner <- sourceTableOwner table
-      checked <- maybe (pure Nothing) (tcLookupSourceTableIdAt first) owner
-      when (isNothing checked) $ do
-        -- See Note [Legacy private source leaves].
-        absent <- importedSourceOwnerAbsent table
-        case sourceTableCallees table of
-          Just [] | absent, not (isSourceFilterGuard table) -> do
-            env <- getGblEnv
-            updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
-          _ -> failWithTc (TcRnRetainedQuantificationError
-                           (RetainedUncheckedSourceCall (maybe (tyConName table) idName owner)))
+      lcl <- getLclEnvTypeEnv <$> getLclEnv
+      case lookupNameEnv lcl (tyConName table) of
+        Just (ATcTyCon _) -> pure ()
+        _ -> do
+          owner <- sourceTableOwner table
+          checked <- maybe (pure Nothing) (tcLookupSourceTableIdAt first) owner
+          when (isNothing checked) $ do
+            -- See Note [Legacy private source leaves].
+            absent <- importedSourceOwnerAbsent table
+            case sourceTableCallees table of
+              Just [] | absent, not (isSourceFilterGuard table) -> do
+                env <- getGblEnv
+                updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName table)
+              _ -> failWithTc (TcRnRetainedQuantificationError
+                               (RetainedUncheckedSourceCall (maybe (tyConName table) idName owner)))
 
 {- Note [Source family evidence uses]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -7800,9 +7812,15 @@ sourceBranchCheckRhs owner_name order skolem_vars callees quantified binders ins
                   Just real_table -> do
                     guard (length mapped_tys == tyConArity real_table)
                     pure (mkTyConApp real_table mapped_tys)
-                  Nothing -> do
-                    guard (not (is_pending_source_tc tc))
-                    pure (mkTyConApp tc mapped_tys)
+                  Nothing
+                    | isTypeSynonymTyCon tc
+                    , Just expanded <- coreView (mkTyConApp tc mapped_tys)
+                    , any (\t -> is_self_tc t || is_pending_source_tc t)
+                          (nonDetEltsUniqSet (tyConsOfTypes [expanded])) ->
+                        map_ty expanded
+                    | otherwise -> do
+                        guard (not (is_pending_source_tc tc))
+                        pure (mkTyConApp tc mapped_tys)
             , tcm_tcapp_co = \_ role tc mapped_cos -> do
                 guard (not (is_self_tc tc))
                 guard (not (is_pending_source_tc tc))
@@ -7886,3 +7904,41 @@ buildSourceFamily name ax_name binders res_kind branches =
                    (ClosedTypeFamilyTyCon (CTF (Just axiom))) Nothing NotInjective
         axiom = mkBranchedCoAxiom Nominal ax_name fam_tc (map ($ fam_tc) branches)
     in fam_tc
+
+-- | Rebuild a certified closed source family, substituting knot-tied mutual TyCons in branch RHSs.
+-- See Note [Staging mutually recursive large eliminations] in GHC.Tc.Module.
+rebuildSourceFamilyWith :: (TyCon -> TyCon) -> TyCon -> TyCon
+rebuildSourceFamilyWith subst_tc table
+  | Just ax <- closedFamilyTyConCoAxiom_maybe table
+  = let name = tyConName table
+        ax_name = coAxiomName ax
+        binders = tyConBinders table
+        res_kind = tyConResKind table
+        branch_builders =
+          [ \fam -> mkCoAxBranch
+              (coAxBranchTyVars br)
+              []
+              (coAxBranchCoVars br)
+              (coAxBranchLHS br)
+              (map_rhs fam (coAxBranchRHS br))
+              (coAxBranchRoles br)
+              (coAxBranchSpan br)
+          | br <- fromBranches (coAxiomBranches ax) ]
+    in buildSourceFamily name ax_name binders res_kind branch_builders
+  | otherwise = pprPanic "rebuildSourceFamilyWith: expected closed family" (ppr table)
+  where
+    map_rhs fam =
+      let subst t
+            | tyConName t == tyConName table = fam
+            | otherwise = subst_tc t
+          (map_ty, _, _, _) = mapTyCo TyCoMapper
+            { tcm_tyvar = pure . mkTyVarTy
+            , tcm_termvar = pure . TermVarTy
+            , tcm_termbinder = \v k -> k v
+            , tcm_covar = pure . mkCoVarCo
+            , tcm_hole = pprPanic "rebuildSourceFamilyWith: coercion hole" . ppr
+            , tcm_tycobinder = \tv _ k -> k tv
+            , tcm_tcapp_ty = \_ tc tys -> Identity (TyConApp (subst tc) tys)
+            , tcm_tcapp_co = \_ role tc cos -> Identity (mkTyConAppCo role (subst tc) cos)
+            }
+      in runIdentity . map_ty

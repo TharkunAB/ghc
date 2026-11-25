@@ -1049,3 +1049,8 @@ test('NativeDataHeraldInTypes',
       extra_files(['NativeDataHeraldInTypesProvider.hs',
                    'NativeDataHeraldInTypes.hs'])],
      run_command, ['bash NativeDataHeraldInTypes.sh "{compiler}" "{libdir}"'])
+test('NativeMutualLargeElimData',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeMutualLargeElimDataProvider.hs',
+                   'NativeMutualLargeElimData.hs'])],
+     run_command, ['bash NativeMutualLargeElimData.sh "{compiler}" "{libdir}"'])

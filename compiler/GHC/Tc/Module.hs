@@ -85,7 +85,9 @@ import GHC.Tc.Gen.SourceClosure
   ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
   , pruneUnusedIndexedLookups, sourceEarlyClosureTables )
 import GHC.Tc.Gen.SourceTable (sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
-                               isStructuralSourceTable, isNominalStructuralSource, sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
+                               isStructuralSourceTable, isNominalStructuralSource, isLargeElimTable, rebuildSourceFamilyWith,
+                               sourceTableFamilyUse,
+                               sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
                                hasSourceMethodRule, hasSourceMethodRuleAt, sourceLiteralWorkers, checkSourceMethodUses,
                                checkOptionalSourceUses, checkAndInstallSourceProofs,
                                sourceMapSelector, sourceTableDependencies)
@@ -735,8 +737,11 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
               early_nominal = early_closures ++
                 [(fun, table) | fun <- installed
                               , not (idName fun `elemNameSet` early_closure_owners)
+                              , not (idName fun `elemNameSet` nominal_owners)
                               , SourceTableId _ table NominalSourceTable <- [idDetails fun]
-                              , isNominalStructuralSource fun || sourceMapperType (idType fun)]
+                              , isNominalStructuralSource fun
+                                || isLargeElimTable table
+                                || sourceMapperType (idType fun)]
           setGblEnv with_fields $ do
             checkLocalRetainedWitnessExports with_fields installed
             checkLocalIndexedLookupExports with_fields
@@ -2514,48 +2519,403 @@ constraints differently. Use the ordinary declaration order in that case.
 -}
 
 tcTopSrcTables :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
-tcTopSrcTables group = do
+tcTopSrcTables = tcTopSrcTablesWith []
+
+-- | Stage non-mutual and mutual local source tables while accumulating deferred deriving.
+-- See Note [Deriving for early source tables] and
+-- Note [Staging mutually recursive large eliminations].
+tcTopSrcTablesWith :: [DerivInfo] -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcTablesWith prev_deriv group = do
     enabled <- xoptM LangExt.ExperimentalDependentTypes
     env <- getGblEnv
     let use = TableInType (sourceTableTypeDependencies env group)
+        finish g = do
+          (envs, _, _) <- tcTopSrcDeclGroupWithMethods False (Just prev_deriv) g
+          pure envs
     case if enabled then splitLocalSourceTables use (tcg_dus env) group else Nothing of
-      Nothing -> tcTopSrcDeclGroup group
+      Nothing -> finish group
       Just (needed, early, rest) -> do
-        -- See Note [Deriving for early source tables].
-        ((envs@(early_env, _), _, deriving_info), wanteds) <- captureTopConstraints $
-          tcTopSrcDeclGroupWithMethods False Nothing early
-        restoreEnvs envs $ do
-          evs <- simplifyTop wanteds
-          let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds early))
-          (ordinary, companions, helpers) <- sourceTablesWithMappers True names evs early_env
-          let known = mkNameSet (map (tyConName . snd) ordinary)
-              witness_owners = mkNameSet
-                [idName owner | bind <- tcg_binds early_env
-                              , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind)
-                              , idName owner `elemNameSet` names
-                              , isMonomorphicRetainedWitness owner]
-              witnesses = [(term, nameSrcSpan term)
-                          | (term, family) <- needed, not (family `elemNameSet` known)
-                          , term `elemNameSet` witness_owners]
-          cases <- if null witnesses then pure [] else do
-            -- See Note [Scheduling a retained witness projection].
-            checkLocalOpenDeferrals witnesses
-            failIfErrsM
-            (cores, _) <- localOpenDefinitions witnesses (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
-            let wanted_names = mkNameSet (map fst witnesses)
-                selected (owner, _) = idName owner `elemNameSet` wanted_names
-            sourceRetainedWitnessTables (filterNameEnv selected cores)
-          let tables = ordinary ++ cases
-              found = mkNameSet (map (tyConName . snd) tables)
-          for_ needed $ \(term, family) ->
-            unless (family `elemNameSet` found) $
-              setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+        let early_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds early))
+        if isEmptyNameSet early_names
+          then case splitMutualLargeElim env needed group of
+                 Just stage -> tcMutualLargeElimStage prev_deriv stage
+                 Nothing -> do
+                   for_ needed $ \(term, family) ->
+                     unless (family `elemNameEnv` tcg_type_env env) $
+                       setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+                   failIfErrsM
+                   finish group
+          else do
+            -- See Note [Deriving for early source tables].
+            ((envs@(early_env, _), _, deriving_info), wanteds) <- captureTopConstraints $
+              tcTopSrcDeclGroupWithMethods False Nothing early
+            restoreEnvs envs $ do
+              evs <- simplifyTop wanteds
+              (ordinary, companions, helpers) <- sourceTablesWithMappers True early_names evs early_env
+              let known = mkNameSet (map (tyConName . snd) ordinary)
+                  witness_owners = mkNameSet
+                    [idName owner | bind <- tcg_binds early_env
+                                  , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind)
+                                  , idName owner `elemNameSet` early_names
+                                  , isMonomorphicRetainedWitness owner]
+                  witnesses = [(term, nameSrcSpan term)
+                              | (term, family) <- needed, not (family `elemNameSet` known)
+                              , term `elemNameSet` witness_owners]
+              cases <- if null witnesses then pure [] else do
+                -- See Note [Scheduling a retained witness projection].
+                checkLocalOpenDeferrals witnesses
+                failIfErrsM
+                (cores, _) <- localOpenDefinitions witnesses (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+                let wanted_names = mkNameSet (map fst witnesses)
+                    selected (owner, _) = idName owner `elemNameSet` wanted_names
+                sourceRetainedWitnessTables (filterNameEnv selected cores)
+              let tables = ordinary ++ cases
+                  found = mkNameSet (map (tyConName . snd) tables)
+                  used_in_early = mkNameSet (localUses (mkNameSet (map snd needed)) early)
+              for_ needed $ \(term, family) ->
+                when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
+                  unless (family `elemNameSet` found) $
+                    setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+              failIfErrsM
+              addTopEvBinds evs $ do
+                tables_env <- installEarlyTables (tables, companions, helpers)
+                setGblEnv tables_env $
+                  tcTopSrcTablesWith (prev_deriv ++ deriving_info) rest
+
+-- | One mutually recursive stage of local types and a Type-valued source equation.
+-- See Note [Staging mutually recursive large eliminations].
+data MutualLargeElimStage = MutualLargeElimStage
+  { mles_term         :: Name
+  , mles_family       :: Name
+  , mles_sig_loc      :: SrcSpanAnnA
+  , mles_sig          :: LHsSigWcType GhcRn
+  , mles_pre_tycls    :: [TyClGroup GhcRn]
+  , mles_mutual_tycls :: [TyClGroup GhcRn]
+  , mles_binds        :: [(RecFlag, LHsBinds GhcRn)]
+  , mles_sigs         :: [LSig GhcRn]
+  , mles_rest         :: HsGroup GhcRn
+  }
+
+{- Note [Staging mutually recursive large eliminations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A logical relation can eliminate an earlier datatype into Type while a
+mutual datatype stores that relation in a constructor field:
+
+  data Val = Bot | Arr Val Val | Join Val Val
+  data HaltsV (v :: Val) where
+    MkHaltsV :: logVLam v -> HaltsV v
+  newtype LogArr (v :: Val) (w :: Val) =
+    MkLogArr { runLogArr :: HaltsV v -> HaltsV w }
+  logVLam :: Val -> Type
+  logVLam Bot        = type ()
+  logVLam (Arr v w)  = type (LogArr v w)
+  logVLam (Join u v) = type (logVLam u, logVLam v)
+
+This cycle is well-founded at the kind level when two conditions hold:
+1. Every type in the signature of logVLam is an earlier declaration.
+2. Every datatype or synonym in the mutual cycle has a header kind that
+   depends only on earlier declarations, not on logVLam.
+
+splitMutualLargeElim selects one such stage when no non-mutual early
+source table is ready. First, tcMutualLargeElimStage checks any
+prerequisite TyClGroups (such as Val). Second, it checks the explicit
+signature of logVLam to build an abstract closed family placeholder
+(CTF_Abstract) and a TcTyCon of the same kind. Third, it runs a trial
+pass over the mutual TyClGroups and logVLam under CTF_Abstract with no
+lazy thunks, and certifies the closed equations of logVLam. If equation
+certification fails, GHC reports GHC-68947 and stops before publishing
+any table. Fourth, it runs fixM over the mutual TyClGroups with the
+final closed family rebuilt to point to the knot-tied mutual TyCons, and
+checks logVLam once against those final TyCons before installing the
+table and recursing on the rest of the declaration group.
+-}
+
+-- | Identify a mutually recursive stage between local types and a Type-valued function.
+-- See Note [Staging mutually recursive large eliminations].
+splitMutualLargeElim :: TcGblEnv -> [(Name, Name)] -> HsGroup GhcRn -> Maybe MutualLargeElimStage
+splitMutualLargeElim env needed group@HsGroup
+  { hs_valds = XValBindsLR (HsVBG binds sigs)
+  , hs_tyclds = tycls }
+  = listToMaybe (mapMaybe try_candidate needed)
+  where
+    value_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds group))
+    sigs_by_owner = signaturesByOwner sigs
+    indexed_tgs =
+      [ (idx, orig_idx, tg { group_instds = [] })
+      | (orig_idx, tg) <- zip [0 :: Int ..] tycls
+      , not (null (group_tyclds tg))
+      , let idx = orig_idx ]
+    all_tg_binders = mkNameSet
+      [ b | (_, _, tg) <- indexed_tgs, b <- hsTyClForeignBinders [tg] [] ]
+    binder_to_tg = mkNameEnv
+      [ (b, orig_idx)
+      | (_, orig_idx, tg) <- indexed_tgs
+      , b <- hsTyClForeignBinders [tg] [] ]
+    tg_map = M.fromList [(orig_idx, tg) | (_, orig_idx, tg) <- indexed_tgs]
+
+    tg_direct_deps :: Int -> [Int]
+    tg_direct_deps idx = case M.lookup idx tg_map of
+      Nothing -> []
+      Just tg ->
+        let raw = nameSetElemsStable (group_ext tg)
+                  ++ localUses all_tg_binders (group_tyclds tg, group_kisigs tg)
+        in [ j | nm <- raw, Just j <- [lookupNameEnv binder_to_tg nm], j /= idx ]
+
+    close_tgs :: S.Set Int -> [Int] -> S.Set Int
+    close_tgs = foldl' visit
+      where
+        visit seen i
+          | S.member i seen = seen
+          | otherwise = foldl' visit (S.insert i seen) (tg_direct_deps i)
+
+    reaches :: (Int -> Bool) -> Int -> Bool
+    reaches p start = any p (S.toList (close_tgs S.empty [start]))
+
+    try_candidate :: (Name, Name) -> Maybe MutualLargeElimStage
+    try_candidate (term, fam_name) = do
+      guard (not (fam_name `elemNameEnv` tcg_type_env env))
+      fb@FunBind{fun_matches = MG{mg_alts = L _ alts}, fun_ext = fvs} <- find_singleton_bind term
+      guard (not (hasSplice fb) && not (null alts) && all is_emb_ty_match alts)
+      (sig_loc, sig_wc) <- find_large_elim_sig term
+      let other_values = value_names `delFromNameSet` term
+          other_tables = mkNameSet
+            [ f | (_, f) <- needed, f /= fam_name, not (f `elemNameEnv` tcg_type_env env) ]
+          unfinished = other_values `unionNameSet` other_tables
+      guard (isEmptyNameSet (fvs `intersectNameSet` other_values))
+      guard (all (\n -> n == fam_name || n `elemNameEnv` tcg_type_env env)
+                 [ n | n <- nameSetElemsStable fvs
+                     , isJust (sourceTableTermOcc (nameOccName n))
+                     , nameModule_maybe n == nameModule_maybe term ])
+      guard (null (localUses (unfinished `extendNameSet` fam_name) sig_wc))
+      let uses_self idx = case M.lookup idx tg_map of
+            Nothing -> False
+            Just tg -> not (null (localUses (unitNameSet fam_name) (group_tyclds tg, group_kisigs tg)))
+          depends_on_self = S.fromList
+            [ idx | (_, idx, _) <- indexed_tgs, reaches uses_self idx ]
+          sig_roots = [ j | nm <- localUses all_tg_binders sig_wc
+                          , Just j <- [lookupNameEnv binder_to_tg nm] ]
+          sig_tgs = close_tgs S.empty sig_roots
+      guard (S.null (S.intersection sig_tgs depends_on_self))
+      let rhs_roots = [ j | nm <- nameSetElemsStable fvs
+                          , Just j <- [lookupNameEnv binder_to_tg nm] ]
+          all_tgs = close_tgs sig_tgs rhs_roots
+          (mutual_set, pre_set) = S.partition (`S.member` depends_on_self) all_tgs
+      guard (not (S.null mutual_set))
+      guard (all (valid_pre_tg unfinished) (S.toList pre_set))
+      guard (all (valid_mutual_tg unfinished fam_name) (S.toList mutual_set))
+      let pre_tycls    = [ tg | (_, idx, tg) <- indexed_tgs, S.member idx pre_set ]
+          mutual_tycls = [ tg | (_, idx, tg) <- indexed_tgs, S.member idx mutual_set ]
+          moved_set    = S.union pre_set mutual_set
+          rest_tycls   = mapMaybe (keep_rest_tg moved_set) (zip [0 :: Int ..] tycls)
+          unit_term    = unitNameSet term
+          (m_binds, r_binds) = partition (any (selectedBind unit_term) . snd) binds
+          (m_sigs, r_sigs)   = splitSignatures unit_term sigs
+          rest_group = group { hs_valds = XValBindsLR (HsVBG r_binds r_sigs)
+                             , hs_tyclds = rest_tycls }
+      pure MutualLargeElimStage
+        { mles_term         = term
+        , mles_family       = fam_name
+        , mles_sig_loc      = sig_loc
+        , mles_sig          = sig_wc
+        , mles_pre_tycls    = pre_tycls
+        , mles_mutual_tycls = mutual_tycls
+        , mles_binds        = m_binds
+        , mles_sigs         = m_sigs
+        , mles_rest         = rest_group
+        }
+
+    find_singleton_bind :: Name -> Maybe (HsBind GhcRn)
+    find_singleton_bind target = listToMaybe
+      [ fb
+      | (_, [L _ fb@FunBind{fun_id = L _ b}]) <- binds
+      , b == target ]
+
+    is_emb_ty_match :: LMatch GhcRn (LHsExpr GhcRn) -> Bool
+    is_emb_ty_match (L _ Match{m_pats = L _ (_ : _), m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})})
+      | HsEmbTy{} <- unLoc (stripParensLHsExpr rhs) = True
+    is_emb_ty_match _ = False
+
+    find_large_elim_sig :: Name -> Maybe (SrcSpanAnnA, LHsSigWcType GhcRn)
+    find_large_elim_sig target = do
+      owner_sigs <- lookupNameEnv sigs_by_owner target
+      guard (all allowed_owner_sig owner_sigs)
+      [(sig_loc, sig_wc)] <- pure
+        [ (loc, wc)
+        | L loc (TypeSig _ [] ns wc) <- sigs
+        , any ((== target) . unLoc) ns ]
+      guard (isCompleteHsSig sig_wc && not (hasSplice sig_wc))
+      let L _ HsSig{sig_body = body} = hswc_body sig_wc
+      guard (has_arrow_to_type False body)
+      pure (sig_loc, sig_wc)
+      where
+        allowed_owner_sig TypeSig{}   = True
+        allowed_owner_sig InlineSig{} = True
+        allowed_owner_sig SCCFunSig{} = True
+        allowed_owner_sig _           = False
+
+        has_arrow_to_type seen_arrow ty = case unLoc (ignoreParens ty) of
+          HsForAllTy{hst_body = inner} -> has_arrow_to_type seen_arrow inner
+          HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) _ cod ->
+            has_arrow_to_type True cod
+          HsStarTy{} -> seen_arrow
+          HsTyVar _ _ (L _ (WithUserRdr _ nm)) ->
+            seen_arrow && isLiftedTypeKindTyConName nm
+          _ -> False
+
+    valid_pre_tg :: NameSet -> Int -> Bool
+    valid_pre_tg unfinished idx = case M.lookup idx tg_map of
+      Nothing -> False
+      Just tg ->
+        let decls = (group_tyclds tg, group_kisigs tg)
+        in not (hasSplice decls)
+           && null (localUses unfinished decls)
+           && all (ordinary_pre_decl . unLoc) (group_tyclds tg)
+      where
+        ordinary_pre_decl SynDecl{}   = True
+        ordinary_pre_decl FamDecl{}   = True
+        ordinary_pre_decl DataDecl{}  = True
+        ordinary_pre_decl ClassDecl{} = True
+        ordinary_pre_decl _           = False
+
+    valid_mutual_tg :: NameSet -> Name -> Int -> Bool
+    valid_mutual_tg unfinished fam_name idx = case M.lookup idx tg_map of
+      Nothing -> False
+      Just tg ->
+        let decls = (group_tyclds tg, group_kisigs tg)
+            unit_fam = unitNameSet fam_name
+        in not (hasSplice decls)
+           && null (localUses unfinished decls)
+           && null (localUses unit_fam (group_kisigs tg))
+           && all (valid_mutual_decl unit_fam . unLoc) (group_tyclds tg)
+
+    valid_mutual_decl :: NameSet -> TyClDecl GhcRn -> Bool
+    valid_mutual_decl unit_fam DataDecl{tcdTyVars = tvs, tcdDataDefn = HsDataDefn{dd_ctxt = ctxt, dd_kindSig = ksig, dd_cons = cons}}
+      | valid_cons cons
+      = null (localUses unit_fam (tvs, ctxt, ksig))
+      where
+        valid_cons (DataTypeCons False _) = True
+        valid_cons NewTypeCon{}           = True
+        valid_cons _                      = False
+    valid_mutual_decl unit_fam SynDecl{tcdTyVars = tvs}
+      = null (localUses unit_fam tvs)
+    valid_mutual_decl _ _ = False
+
+    keep_rest_tg :: S.Set Int -> (Int, TyClGroup GhcRn) -> Maybe (TyClGroup GhcRn)
+    keep_rest_tg moved_set (idx, tg)
+      | not (S.member idx moved_set) = Just tg
+      | null (group_instds tg)       = Nothing
+      | otherwise                    = Just tg { group_tyclds = [], group_kisigs = [], group_roles = [] }
+splitMutualLargeElim _ _ _ = Nothing
+
+-- | Typecheck one mutually recursive large-elimination stage and continue on the remainder.
+-- See Note [Staging mutually recursive large eliminations].
+tcMutualLargeElimStage :: [DerivInfo] -> MutualLargeElimStage -> TcM (TcGblEnv, TcLclEnv)
+tcMutualLargeElimStage prev_deriv MutualLargeElimStage
+  { mles_term         = term
+  , mles_family       = fam_name
+  , mles_sig_loc      = sig_loc
+  , mles_sig          = sig_wc
+  , mles_pre_tycls    = pre_tycls
+  , mles_mutual_tycls = mutual_tycls
+  , mles_binds        = mutual_binds
+  , mles_sigs         = mutual_sigs
+  , mles_rest         = rest_group }
+  = do
+      (env_pre, th_pre, deriv_pre, evs_pre) <- if null pre_tycls
+        then do
+          e <- getGblEnv
+          pure (e, emptyNameEnv, [], emptyBag)
+        else do
+          ((e_pre, _, th_p, _, d_pre), wanteds_pre) <-
+            captureTopConstraints (tcTyClsInstDecls Nothing pre_tycls [] [] [])
+          evs_p <- setGblEnv e_pre (simplifyTop wanteds_pre)
           failIfErrsM
-          addTopEvBinds evs $ do
-            tables_env <- installEarlyTables (tables, companions, helpers)
-            setGblEnv tables_env $ do
-              (rest_envs, _, _) <- tcTopSrcDeclGroupWithMethods False (Just deriving_info) rest
-              pure rest_envs
+          pure (e_pre, th_p, d_pre, evs_p)
+
+      updLclCtxt (\lcl -> lcl { tcl_th_bndrs = th_pre `plusNameEnv` tcl_th_bndrs lcl }) $
+        setGblEnv env_pre $
+        addTopEvBinds evs_pre $ do
+          sig_ty <- setSrcSpanA sig_loc (tcHsSigWcType True (FunSigCtxt term NoRRC) sig_wc)
+          failIfErrsM
+          mb_hdr <- buildPendingLargeElimHeader fam_name sig_ty
+          (abstract_fam, tc_fam) <- case mb_hdr of
+            Just hdr -> pure hdr
+            Nothing -> do
+              setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+              failM
+
+          let with_abstract e = e { tcg_type_env = extendTypeEnv (tcg_type_env e) (ATyCon abstract_fam) }
+          -- Phase A: validate mutual declarations and certify equations under CTF_Abstract.
+          table_A <- checkNoErrs $ do
+            (phaseA_env, wanteds_A) <-
+              setGblEnv (with_abstract env_pre) $
+              captureTopConstraints $ do
+                (ty_env_A, _, th_A, _, _) <- tcTyClsInstDecls Nothing mutual_tycls [] [] []
+                updLclCtxt (\lcl -> lcl { tcl_th_bndrs = th_A `plusNameEnv` tcl_th_bndrs lcl }) $
+                  setGblEnv ty_env_A $
+                  fst <$> tcTopBinds mutual_binds mutual_sigs
+            setGblEnv phaseA_env $ do
+              _ <- simplifyTop wanteds_A
+              failIfErrsM
+              certified <- sourceTablesFor True (unitNameSet term) phaseA_env
+              case [tbl | (owner, tbl) <- certified, idName owner == term] of
+                tbl : _ -> pure tbl
+                [] -> do
+                  setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+                  failM
+
+          -- Phase B: knot-tie mutual TyCons with the rebuilt closed family, then check the term once.
+          let mutual_tc_names = mkNameSet [tcdName (unLoc d) | tg <- mutual_tycls, d <- group_tyclds tg]
+              mutual_dc_names = mkNameSet
+                [ b | tg <- mutual_tycls, b <- hsTyClForeignBinders [tg] [], isDataConName b ]
+          ((ty_env_B, th_B, deriv_mutual, final_fam), ty_wanteds_B) <-
+            captureTopConstraints $
+            fixM $ \ ~(rec_ty_env, _, _, _) -> do
+              let rec_types = tcg_type_env rec_ty_env
+                  subst_tc tc
+                    | tyConName tc `elemNameSet` mutual_tc_names =
+                        case lookupTypeEnv rec_types (tyConName tc) of
+                          Just (ATyCon tc') -> tc'
+                          _ -> tc
+                    | Just dc <- isPromotedDataCon_maybe tc
+                    , dataConName dc `elemNameSet` mutual_dc_names =
+                        case lookupTypeEnv rec_types (dataConName dc) of
+                          Just (AConLike (RealDataCon dc')) -> promoteDataCon dc'
+                          _ -> tc
+                    | otherwise = tc
+                  fam_B = rebuildSourceFamilyWith subst_tc table_A
+                  start_env = env_pre { tcg_type_env = extendTypeEnv (tcg_type_env env_pre) (ATyCon fam_B) }
+              (checked_ty_env, _, th_bndrs_B, _, derivs_B) <-
+                setGblEnv start_env $
+                tcExtendKindEnvList [(fam_name, ATcTyCon tc_fam)] $
+                tcTyClsInstDecls Nothing mutual_tycls [] [] []
+              pure (checked_ty_env, th_bndrs_B, derivs_B, fam_B)
+
+          updLclCtxt (\lcl -> lcl { tcl_th_bndrs = th_B `plusNameEnv` tcl_th_bndrs lcl }) $
+            setGblEnv ty_env_B $ do
+              ty_evs_B <- simplifyTop ty_wanteds_B
+              failIfErrsM
+              addTopEvBinds ty_evs_B $ do
+                ((val_env_B, val_lcl_B), val_wanteds_B) <-
+                  setGblEnv (with_abstract ty_env_B) $
+                  captureTopConstraints $
+                  tcTopBinds mutual_binds mutual_sigs
+                restoreEnvs (val_env_B, val_lcl_B) $ do
+                  val_evs_B <- simplifyTop val_wanteds_B
+                  certified_B <- sourceTablesFor True (unitNameSet term) val_env_B
+                  owner_B <- case [owner | (owner, _) <- certified_B, idName owner == term] of
+                    owner : _ -> pure owner
+                    [] -> do
+                      setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+                      failM
+                  failIfErrsM
+                  let clean_val_env = val_env_B { tcg_type_env = delFromNameEnv (tcg_type_env val_env_B) fam_name }
+                  addTopEvBinds val_evs_B $
+                    setGblEnv clean_val_env $ do
+                      tables_env <- installEarlyTables ([(owner_B, final_fam)], [], [])
+                      setGblEnv tables_env $ do
+                        sourceTableFamilyUse final_fam
+                        tcTopSrcTablesWith (prev_deriv ++ deriv_pre ++ deriv_mutual) rest_group
 
 {- Note [Scheduling a retained witness projection]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

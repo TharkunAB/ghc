@@ -21,6 +21,7 @@ module GHC.Tc.Gen.HsType (
         tcHsClsInstType,
         tcDefaultDeclClass, tcHsDeriv, tcDerivStrategy,
         tcHsTypeApp, tcHsTypeAppWithSource, tcCheckEmbeddedType,
+        buildPendingLargeElimHeader,
         UserTypeCtxt(..),
         bindImplicitTKBndrs_Tv, bindImplicitTKBndrs_Skol,
             bindImplicitTKBndrs_Q_Tv, bindImplicitTKBndrs_Q_Skol,
@@ -683,31 +684,40 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty })
       | otherwise = concat (gmapQ source_family_names thing)
 
     build_pending_family :: Name -> Type -> TcM (Maybe TyCon)
-    build_pending_family fam_name fun_ty = runMaybeT $ do
-      let (tele, tau) = splitForAllForAllTyBinders fun_ty
-      tvs <- MaybeT $ pure $ traverse (\(ma, Bndr tv vis) -> do
-               guard (ma `eqType` unmatchableDataConTy
-                      && isSpecifiedForAllTyFlag vis
-                      && isTyVar tv
-                      && (tcIsLiftedTypeKind (tyVarKind tv)
-                          || maybe False (isAlgTyCon . fst) (splitTyConApp_maybe (tyVarKind tv))))
-               pure tv) tele
-      let collect_arrows t
-            | Just (FTF_T_T, ma, mult, arg, rest) <- splitFunTy_maybe t
-            , ma `eqType` unmatchableDataConTy && isManyTy mult
-            = do { (args, res) <- collect_arrows rest; pure (arg : args, res) }
-            | tcIsLiftedTypeKind t = pure ([], t)
-            | otherwise = Nothing
-      (domains, res_kind) <- MaybeT $ pure (collect_arrows tau)
-      guard (not (null domains))
-      arg_tvs <- lift $ zipWithM
-                   (\i dom -> (\nm -> mkTyVar nm dom) <$> newSysName (mkTyVarOcc ("arg" ++ show i)))
-                   [1 :: Int ..] domains
-      let binders = mkNamedTyConBinders (Invisible SpecifiedSpec) tvs
-                    ++ mkAnonTyConBinders arg_tvs
-          kind = mkTyConKind binders res_kind
-      pure (mkFamilyTyCon fam_name kind binders 0 res_kind
-                          Nothing (ClosedTypeFamilyTyCon CTF_Abstract) Nothing NotInjective)
+    build_pending_family fam_name fun_ty =
+      fmap fst <$> buildPendingLargeElimHeader fam_name fun_ty
+
+-- | Build an abstract placeholder family and TcTyCon from a Type-valued signature.
+-- See Note [Staging mutually recursive large eliminations] in GHC.Tc.Module.
+buildPendingLargeElimHeader :: Name -> Type -> TcM (Maybe (TyCon, TcTyCon))
+buildPendingLargeElimHeader fam_name fun_ty = runMaybeT $ do
+  let (tele, tau) = splitForAllForAllTyBinders fun_ty
+  tvs <- MaybeT $ pure $ traverse (\(ma, Bndr tv vis) -> do
+           guard (ma `eqType` unmatchableDataConTy
+                  && isSpecifiedForAllTyFlag vis
+                  && isTyVar tv
+                  && (tcIsLiftedTypeKind (tyVarKind tv)
+                      || maybe False (isAlgTyCon . fst) (splitTyConApp_maybe (tyVarKind tv))))
+           pure tv) tele
+  let collect_arrows t
+        | Just (FTF_T_T, ma, mult, arg, rest) <- splitFunTy_maybe t
+        , ma `eqType` unmatchableDataConTy && isManyTy mult
+        = do { (args, res) <- collect_arrows rest; pure (arg : args, res) }
+        | tcIsLiftedTypeKind t = pure ([], t)
+        | otherwise = Nothing
+  (domains, res_kind) <- MaybeT $ pure (collect_arrows tau)
+  guard (not (null domains))
+  arg_tvs <- lift $ zipWithM
+               (\i dom -> (\nm -> mkTyVar nm dom) <$> newSysName (mkTyVarOcc ("arg" ++ show i)))
+               [1 :: Int ..] domains
+  let binders = mkNamedTyConBinders (Invisible SpecifiedSpec) tvs
+                ++ mkAnonTyConBinders arg_tvs
+      kind = mkTyConKindWithMatchability unmatchableDataConTy binders res_kind
+      abstract_tc = mkFamilyTyCon fam_name kind binders 0 res_kind
+                      Nothing (ClosedTypeFamilyTyCon CTF_Abstract) Nothing NotInjective
+      tc_fam = mkTcTyCon fam_name kind binders 0 res_kind
+                 noTcTyConScopedTyVars False ClosedTypeFamilyFlavour
+  pure (abstract_tc, tc_fam)
 
 {- Note [Runtime indices in expression signatures]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
