@@ -217,15 +217,26 @@ cat > BoxMod.hs <<'HS'
 module BoxMod where
 import Data.Kind (Type)
 import GHC.Matchability (U)
-type Box :: (forall x. @U Maybe x %U-> Maybe x) -> Type
-data Box f
+type RKindU = forall x. @U Maybe x %U-> Maybe x
+type BoxU :: RKindU -> Type
+data BoxU f
+type BoxM :: (forall x. Maybe x -> Maybe x) -> Type
+data BoxM f
 HS
 "${ghc[@]}" -O0 -c BoxMod.hs
+cat > MatchKindDeferOk.hs <<'HS'
+{-# LANGUAGE PolyKinds, RankNTypes #-}
+module MatchKindDeferOk where
+import BoxMod (BoxU)
+foo :: forall (r :: forall x. Maybe x -> Maybe x). BoxU r -> ()
+foo _ = ()
+HS
+"${ghc[@]}" -O0 -c MatchKindDeferOk.hs
 cat > MatchKindMismatch.hs <<'HS'
 {-# LANGUAGE PolyKinds, RankNTypes #-}
 module MatchKindMismatch where
-import BoxMod (Box)
-foo :: forall (r :: forall x. Maybe x -> Maybe x). Box r -> ()
+import BoxMod (BoxM, RKindU)
+foo :: forall (r :: RKindU). BoxM r -> ()
 foo _ = ()
 HS
 reject 83865 -O0 -c MatchKindMismatch.hs

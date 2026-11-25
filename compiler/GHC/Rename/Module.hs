@@ -3499,6 +3499,12 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       , mkNameSet params == mkNameSet new_params, mkNameSet vars == mkNameSet params
       = Just (maybe [] (\name -> [(name, Nothing)]) root)
       | TableInType{} <- use
+      , Just vars@(_ : _) <- retained_outer_vars outer
+      , Just (root, params) <- parameter_domain arg
+      , mkNameSet params == mkNameSet vars
+      , Just v <- parameter_name result, v `elem` vars
+      = Just (maybe [] (\name -> [(name, Nothing)]) root)
+      | TableInType{} <- use
       , Just (from, to) <- source_arrow arg
       , Just (domain, codomain) <- source_arrow result
       , Just vars <- outer_vars outer
@@ -3718,7 +3724,7 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       HsStarTy{} -> True
       _ -> False
 
-    early_constructors t [] [con] [] | Just c <- retained_constructor t con = Just [c]
+    early_constructors t params [con] [] | Just c <- retained_constructor t params con = Just [c]
     early_constructors t [] cs _ = concat <$> traverse (prefix_con t) cs
     early_constructors t params cs [] = do
       field_type <- independent_field_type t params
@@ -3746,28 +3752,69 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       | all (plain_constructor_field field_type) fields = Just c
     parameterized_con _ _ = Nothing
 
-    retained_constructor t (L _ ConDeclGADT
+    retained_outer_vars :: HsOuterSigTyVarBndrs GhcRn -> Maybe [Name]
+    retained_outer_vars (HsOuterImplicit names) = Just names
+    retained_outer_vars (HsOuterExplicit _ Nothing binders) =
+      retained_param_binders (const True) binders
+    retained_outer_vars _ = Nothing
+
+    retained_param_binders :: (flag -> Bool) -> [LHsTyVarBndr flag GhcRn] -> Maybe [Name]
+    retained_param_binders ok_flag = go []
+      where
+        go seen [] = Just (reverse seen)
+        go seen (L _ (HsTvb _ flag (HsBndrVar _ (L _ name)) kind) : rest)
+          | ok_flag flag
+          , retained_binder_kind seen kind
+          = go (name : seen) rest
+        go _ _ = Nothing
+
+    retained_binder_kind :: [Name] -> HsBndrKind GhcRn -> Bool
+    retained_binder_kind seen kind = case kind of
+      HsBndrNoKind{} -> True
+      HsBndrKind _ k -> retained_kind_expr seen k
+
+    retained_kind_expr :: [Name] -> LHsType GhcRn -> Bool
+    retained_kind_expr seen ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsFunTy _ (HsModifiedFunArr _ _ HsStandardArr{}) dom cod ->
+        retained_kind_expr seen dom && retained_kind_expr seen cod
+      HsAppTy _ fun arg ->
+        retained_kind_expr seen fun && retained_kind_expr seen arg
+      HsTyVar _ _ (L _ (WithUserRdr _ name)) ->
+        name `elem` seen || isDataConName name || isJust (type_name ty)
+      _ -> False
+
+    is_req_bndr :: HsBndrVis GhcRn -> Bool
+    is_req_bndr HsBndrRequired{} = True
+    is_req_bndr _ = False
+
+    retained_constructor t params (L _ ConDeclGADT
       { con_names = L _ c :| [], con_modifiers = [], con_telescope = []
-      , con_outer_bndrs = L _ (HsOuterImplicit []), con_g_args = PrefixConGADT _ []
+      , con_outer_bndrs = L _ outer, con_g_args = PrefixConGADT _ []
       , con_res_ty = sig })
-      | HsForEachTy _ [L _ (HsTvb _ () (HsBndrVar _ (L _ witness)) (HsBndrKind _ domain))] body
+      | Just param_vars <- retained_param_binders is_req_bndr params
+      , Just con_vars <- retained_outer_vars outer
+      , length con_vars == length param_vars
+      , HsForEachTy _ [L _ (HsTvb _ () (HsBndrVar _ (L _ witness)) (HsBndrKind _ domain))] body
           <- unLoc (ignoreParens sig)
-      , isJust (type_name domain)
+      , isJust (type_name domain) || maybe False (`elem` con_vars) (parameter_name domain)
       , HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) field result <- unLoc (ignoreParens body)
-      , retained_field_type witness field
-      , retained_payloads t witness result
+      , retained_field_type con_vars witness field
+      , retained_payloads t con_vars witness result
       = Just c
-    retained_constructor _ _ = Nothing
+    retained_constructor _ _ _ = Nothing
 
-    retained_payloads t witness ty
+    retained_payloads t con_vars witness ty
       | HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) field result <- unLoc (ignoreParens ty)
-      = retained_field_type witness field && retained_payloads t witness result
-      | otherwise = type_name ty == Just t
+      = retained_field_type con_vars witness field && retained_payloads t con_vars witness result
+      | Just (root, args) <- type_application ty
+      = root == t && traverse parameter_name args == Just con_vars
+      | otherwise = False
 
-    retained_field_type witness ty = case unLoc (ignoreParens ty) of
-      HsAppTy _ fun arg -> retained_field_type witness fun && retained_field_type witness arg
+    retained_field_type con_vars witness ty = case unLoc (ignoreParens ty) of
+      HsAppTy _ fun arg -> retained_field_type con_vars witness fun && retained_field_type con_vars witness arg
       HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) ->
-        name == witness || isJust (type_name ty)
+        name == witness || name `elem` con_vars || isJust (type_name ty)
       _ -> False
 
     -- See Note [Ordinary constructors in GADT syntax] in GHC.Tc.Gen.SourceTable.

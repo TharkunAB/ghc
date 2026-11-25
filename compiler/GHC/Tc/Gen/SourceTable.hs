@@ -2864,7 +2864,8 @@ checkLocalRetainedWitnessExports env owners = do
     forM_ owners $ \owner ->
       case sourceTableId_maybe owner of
         Just table
-          | Just (con, _) <- retainedWitnessType (varType owner)
+          | Just (con, _) <- directRetainedWitnessType (varType owner)
+                             <|> retainedWitnessType (varType owner)
           , let tc = dataConTyCon con
           , nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env)
           , not (publicCaseType env exported (const False) tc) -> do
@@ -3011,7 +3012,7 @@ sourceEquationDatatypes tables =
 
 -- | The early witness path only considers signatures accepted by this rule.
 isMonomorphicRetainedWitness :: Id -> Bool
-isMonomorphicRetainedWitness = isJust . monomorphicRetainedWitnessType . varType
+isMonomorphicRetainedWitness = isJust . directRetainedWitnessType . varType
 
 -- | Require the case datatype and all of its constructors to be visible.
 publicCaseType :: TcGblEnv -> NameSet -> (Name -> Bool) -> TyCon -> Bool
@@ -3662,6 +3663,20 @@ constructorCaseType tau = do
     domainParameter fixed ty
       | ty `eqType` liftedTypeKind || any (eqType ty) fixed = Just Nothing
       | otherwise = Just <$> getTyVar_maybe ty
+
+-- | Check the signature of a direct witness projection from a monomorphic or
+-- polymorphic single-constructor retained package (such as @GHC.Sigma.first@).
+-- See Note [Retained field kinds in source equations].
+directRetainedWitnessType :: Type -> Maybe (DataCon, ConstructorCaseType)
+directRetainedWitnessType ty =
+    monomorphicRetainedWitnessType ty <|> do
+      signature@(ConstructorCaseType _ tc args [domain] 0 result) <- constructorCaseType ty
+      [con] <- pure (tyConDataCons tc)
+      guard (isRetainedCaseRoot domain tc)
+      witness : _ <- pure (dataConOrigArgTys con)
+      let inst = substTyWith (dataConUnivTyVars con) args
+      guard (result `eqType` inst (scaledThing witness))
+      pure (con, signature)
 
 -- | Check the signature of a direct witness projection from a nullary package.
 -- See Note [Retained field kinds in source equations].
@@ -5765,7 +5780,7 @@ checkedConstructorCaseWith mode specialized visible helper owner rhs = do
         public_domain ty = case caseArrow ty of
           Just (input, output) -> all (casePublicKind public kinds) [input, output]
           Nothing -> casePublicKind public kinds ty
-        witness_root = fst <$> monomorphicRetainedWitnessType rhs_type
+        witness_root = fst <$> directRetainedWitnessType rhs_type
         result_kind
           | isJust witness_root = caseKind kinds result
           | otherwise = public_domain result
@@ -5782,7 +5797,7 @@ checkedConstructorCaseWith mode specialized visible helper owner rhs = do
                                   public witness_root helper recursive kinds result
                                   (map CaseField terms) scrutinee body
     forM_ witness_root $ \con -> do
-      [ConstructorCaseRow [CaseConstructor actual [] (CaseField witness : payloads)]
+      [ConstructorCaseRow [CaseConstructor actual _ (CaseField witness : payloads)]
                           (CaseField value)] <- pure rows
       guard (actual == con && value == witness && all is_field payloads)
     -- The patterns use types from the Core binders. Use the same telescope
@@ -5795,7 +5810,7 @@ checkedConstructorCaseWith mode specialized visible helper owner rhs = do
     is_field _ = False
 
     signature_type ty = case mode of
-      CompleteConstructorCase -> constructorCaseType ty <|> (snd <$> monomorphicRetainedWitnessType ty)
+      CompleteConstructorCase -> constructorCaseType ty <|> (snd <$> directRetainedWitnessType ty)
       RightStructuralConstructorCase -> do
         signature@(ConstructorCaseType binders root args domains _ result) <- constructorCaseType ty
         guard (isTwoStructuralCase signature)

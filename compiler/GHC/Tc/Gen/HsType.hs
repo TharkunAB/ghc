@@ -682,7 +682,8 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty })
                guard (ma `eqType` unmatchableDataConTy
                       && isSpecifiedForAllTyFlag vis
                       && isTyVar tv
-                      && tcIsLiftedTypeKind (tyVarKind tv))
+                      && (tcIsLiftedTypeKind (tyVarKind tv)
+                          || maybe False (isAlgTyCon . fst) (splitTyConApp_maybe (tyVarKind tv))))
                pure tv) tele
       let collect_arrows t
             | Just (FTF_T_T, ma, mult, arg, rest) <- splitFunTy_maybe t
@@ -4643,16 +4644,23 @@ tcClosedCallback rdr name = do
     AnId fun -> return fun
     _ -> failWithTc (TcRnNoSourceTable owner)
 
--- | Check that the written name permits executable use of the exact term.
+-- | Check that the written name permits nominal or executable use of the exact term.
+-- Accept a local binding only when an earlier declaration group already certified
+-- its source table in @tcg_type_env@.
 isClosedOrdinaryImport :: RdrName -> Name -> TcM Bool
 isClosedOrdinaryImport rdr name = do
+  env <- getGblEnv
   rdr_env <- getGlobalRdrEnv
   let occurrence = nameOccName name
       term_rdr = case isQual_maybe rdr of
         Just (qualifier, _) -> mkRdrQual qualifier occurrence
         Nothing -> mkRdrUnqual occurrence
+      local_certified = case lookupTypeEnv (tcg_type_env env) name of
+        Just (AnId fun) -> isJust (sourceTableId_maybe fun)
+        _ -> False
       imported gre = greName gre == name &&
-                     any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
+                     (any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre) ||
+                      (isLocalGRE gre && local_certified))
   return (any imported (lookupGRE rdr_env (LookupRdrName term_rdr (RelevantGREsFOS WantNormal))))
 
 -- | A checked family inside an ordinary tree can also have two literal operands.

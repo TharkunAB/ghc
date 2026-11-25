@@ -6202,7 +6202,9 @@ pprHoleError ctxt (Hole { hole_ty, hole_occ}) (HoleError sort other_tvs hole_sko
       | otherwise
       = pprType hole_ty <+> dcolon <+> pprKind hole_kind
 
-    tyvars = tyCoVarsOfTypeList hole_ty
+    -- Filter out retained term-variable indices so holes with only foreach
+    -- binders in scope do not print an empty "Where:" header.
+    tyvars = filter (not . isNonCoVarId) (tyCoVarsOfTypeList hole_ty)
     tyvars_msg = ppUnless (null tyvars) $
                  text "Where:" <+> (vcat (map loc_msg other_tvs)
                                     $$ pprSkols ctxt hole_skol_info)

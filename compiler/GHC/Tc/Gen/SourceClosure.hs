@@ -2552,7 +2552,13 @@ extensionBinders rhs = do
       = collectExtensionBinders acc e
     collectExtensionBinders acc e = (reverse acc, e)
 
+-- | Inline non-recursive local callback bindings in ordinary non-dependent Core.
+-- Leave existential and native dependent expressions untouched so @substTy@
+-- never substitutes an uncertified value into a retained type index.
 unwrapLocalCallbackLets :: CoreExpr -> CoreExpr
+unwrapLocalCallbackLets expr
+  | hasExistentialExpr expr || hasNativeDependentExpr expr
+  = expr
 unwrapLocalCallbackLets (Core.Let (Core.NonRec b b_rhs) inner)
   | isLocalId b, isValueVar b
   , VanillaId <- idDetails b
@@ -2568,6 +2574,8 @@ unwrapLocalCallbackLets expr = expr
 
 betaReduceTypeApps :: CoreExpr -> CoreExpr
 betaReduceTypeApps expr
+  | hasExistentialExpr expr || hasNativeDependentExpr expr
+  = expr
   | (Core.Lam b body, Core.Type ty : rest) <- collect [] (unwrapLocalCallbackLets expr)
   , isTyVar b
   = let free = exprFreeVars body `unionVarSet` exprFreeVars (Core.Type ty)
@@ -4420,7 +4428,7 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
           in_k = mkTyConApp index [mk_t]
           out_k = mkTyConApp term [nk_t]
           outer_tys = mkTyVarTys fresh_outer
-      r_var <- lift (freshVar "r" (untypedRenamingKind index mk_t nk_t))
+      r_var <- lift (freshVar (pickFresh1 fresh_outer "r") (untypedRenamingKind index mk_t nk_t))
       x_var <- lift (freshVar "x" in_k)
       let r = mkTyVarTy r_var
           x = mkTyVarTy x_var
@@ -4443,7 +4451,7 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
           outer_tys = mkTyVarTys fresh_outer
           inner_tys = mkTyVarTys fresh_inner
       rank <- lift (freshVar "a" (varType b_tv))
-      r_var <- lift (freshVar "r" (renamingKind index rank gk dk))
+      r_var <- lift (freshVar (pickFresh1 (rank : fresh_all) "r") (renamingKind index rank gk dk))
       x_var <- lift (freshVar "x" in_k)
       let r = mkTyVarTy r_var
           x = mkTyVarTy x_var
@@ -4465,7 +4473,7 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
           out_k = mkTyConApp term [nk_t]
           outer_tys = mkTyVarTys fresh_outer
       t_var <- lift (freshVar "t" out_k)
-      p_var <- lift (freshVar "p" (untypedCallbackKind index term mk_t nk_t))
+      p_var <- lift (freshVar (pickFresh1 fresh_outer "p") (untypedCallbackKind index term mk_t nk_t))
       in_var <- lift (freshVar "input" dom_k)
       x_var <- lift (freshVar "x" (mkTyConApp index [mk_t]))
       let val_bndrs = if swapped then [p_var, t_var] else [t_var, p_var]
@@ -4495,7 +4503,7 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
           out_k = mkTyConApp term [dk, ck]
       rank <- lift (freshVar "b" (varType c_tv))
       t_var <- lift (freshVar "t" (mkTyConApp term [dk, ak]))
-      p_var <- lift (freshVar "p" (closureCallbackKind index term rank gk dk))
+      p_var <- lift (freshVar (pickFresh1 (rank : fresh_all) "p") (closureCallbackKind index term rank gk dk))
       in_var <- lift (freshVar "input" dom_k)
       x_var <- lift (freshVar "x" (mkTyConApp index [gk, ck]))
       let val_bndrs = if swapped then [p_var, t_var] else [t_var, p_var]
@@ -4529,8 +4537,9 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
           in_k = mkTyConApp index [mk_t]
           out_k = mkTyConApp term [kk_t]
           outer_tys = mkTyVarTys fresh_outer
-      p_var <- lift (freshVar "p" (untypedCallbackKind index term mk_t nk_t))
-      q_var <- lift (freshVar "q" (untypedCallbackKind index term nk_t kk_t))
+          (p_nm, q_nm) = pickFresh2 fresh_outer
+      p_var <- lift (freshVar p_nm (untypedCallbackKind index term mk_t nk_t))
+      q_var <- lift (freshVar q_nm (untypedCallbackKind index term nk_t kk_t))
       x_var <- lift (freshVar "x" in_k)
       let p = mkTyVarTy p_var
           q = mkTyVarTy q_var
@@ -4558,8 +4567,9 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
           inner_tys = mkTyVarTys fresh_inner
       rank1 <- lift (freshVar "a" (varType c_tv))
       rank2 <- lift (freshVar "b" (varType c_tv))
-      p_var <- lift (freshVar "p" (closureCallbackKind index term rank1 gk dk))
-      q_var <- lift (freshVar "q" (closureCallbackKind index term rank2 dk ek))
+      let (p_nm, q_nm) = pickFresh2 (rank1 : rank2 : fresh_all)
+      p_var <- lift (freshVar p_nm (closureCallbackKind index term rank1 gk dk))
+      q_var <- lift (freshVar q_nm (closureCallbackKind index term rank2 dk ek))
       x_var <- lift (freshVar "x" in_k)
       let p = mkTyVarTy p_var
           q = mkTyVarTy q_var
@@ -4575,6 +4585,23 @@ publishSigmaComb is_early public resolveTable (owner, spec, helpers) = runMaybeT
       publishRenamingTable is_early public owner helpers binders out_k (const branches)
 
     _ -> MaybeT (pure Nothing)
+  where
+    pickFresh1 :: [TyVar] -> String -> String
+    pickFresh1 taken preferred =
+      case filter (`notElem` used) (preferred : ["p", "q", "r", "f", "g", "h"]) of
+        c : _ -> c
+        []    -> preferred
+      where
+        used = map (occNameString . nameOccName . getName) taken
+
+    pickFresh2 :: [TyVar] -> (String, String)
+    pickFresh2 taken =
+      let c1 = pickFresh1 taken "p"
+          used = c1 : map (occNameString . nameOccName . getName) taken
+          c2 = case filter (`notElem` used) ["q", "r", "f", "g", "h", "p"] of
+                 c : _ -> c
+                 []    -> "q"
+      in (c1, c2)
 
 -- | Certified forwarding wrapper (`substSingle`, `substDouble`, `substSingleU`),
 -- recording: `(is_typed, trav_id, map_id, core_tvs, map_ty_args, (body_param_idx, cap_param_indices))`.

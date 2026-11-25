@@ -1,6 +1,5 @@
 DependentHoleFits.hs:33:26: error: [GHC-88464]
     • Found hole: _ :: plus n1 p :~: plus n1 p
-      Where:
     • In an equation for ‘plusAssoc’: plusAssoc Zero _ _ = _
     • Relevant bindings include
         plusAssoc :: foreach (m :: Nat)
@@ -20,7 +19,6 @@ DependentHoleFits.hs:33:26: error: [GHC-88464]
 DependentHoleFits.hs:34:26: error: [GHC-88464]
     • Found hole:
         _ :: Succ (plus (plus m1 n1) p) :~: Succ (plus m1 (plus n1 p))
-      Where:
     • In an equation for ‘plusAssoc’: plusAssoc (Succ m) n p = _
     • Relevant bindings include
         m :: Nat (bound at DependentHoleFits.hs:34:17)
@@ -46,7 +44,6 @@ DependentHoleFits.hs:34:26: error: [GHC-88464]
 
 DependentHoleFits.hs:38:23: error: [GHC-88464]
     • Found hole: _ :: plus m4 n4 :~: plus n4 m4
-      Where:
     • In an equation for ‘plusCommUnsplit’: plusCommUnsplit m n = _
     • Relevant bindings include
         n :: Nat (bound at DependentHoleFits.hs:38:19)
@@ -62,7 +59,6 @@ DependentHoleFits.hs:38:23: error: [GHC-88464]
 
 DependentHoleFits.hs:42:17: error: [GHC-88464]
     • Found hole: _ :: plus m3 Zero :~: m3
-      Where:
     • In an equation for ‘usePlusZero’: usePlusZero m = _
     • Relevant bindings include
         m :: Nat (bound at DependentHoleFits.hs:42:13)
@@ -75,7 +71,6 @@ DependentHoleFits.hs:42:17: error: [GHC-88464]
 
 DependentHoleFits.hs:46:12: error: [GHC-88464]
     • Found hole: _ :: LE Zero n3
-      Where:
     • In an equation for ‘leZero’: leZero _ = _
     • Relevant bindings include
         leZero :: foreach (n :: Nat) -> LE Zero n
@@ -86,7 +81,6 @@ DependentHoleFits.hs:46:12: error: [GHC-88464]
 
 DependentHoleFits.hs:49:16: error: [GHC-88464]
     • Found hole: _ :: LE (Succ m2) (Succ n2)
-      Where:
     • In an equation for ‘leSucc’: leSucc m n h = _
     • Relevant bindings include
         h :: LE m2 n2 (bound at DependentHoleFits.hs:49:12)
