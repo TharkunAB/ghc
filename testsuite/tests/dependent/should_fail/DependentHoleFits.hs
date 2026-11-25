@@ -2,8 +2,9 @@
 {-# OPTIONS_GHC -fwrite-source-equations -fno-enable-rewrite-rules #-}
 module DependentHoleFits where
 
-import Data.Type.Equality ((:~:) (Refl))
+import Data.Type.Equality ((:~:) (Refl), trans)
 import GHC.Exts (Matchability)
+import qualified GHC.Internal.List as InternalList
 import GHC.List (List, foldr)
 import Prelude hiding (foldr)
 
@@ -68,3 +69,49 @@ useSameLen xs _ = _
 foldrPlusGoal :: foreach (x :: Nat) -> foreach (xs :: List Nat) -> foreach (z :: Nat)
               -> foldr plus z (x : xs) :~: plus (foldr plus Zero (x : xs)) z
 foldrPlusGoal x xs z = _
+
+-- 7. Point-free foreach holes suggest matching foreach functions (even when
+--    one side reduces reverse to reverseOnto) and do not suggest pattern-
+--    matching on unbound DepFunTy binders.
+size :: forall a. List a -> Nat
+size []       = Zero
+size (_ : xs) = Succ (size xs)
+
+plusSucc :: foreach (m n :: Nat) -> plus m (Succ n) :~: Succ (plus m n)
+plusSucc Zero     _ = Refl
+plusSucc (Succ m) n = congSucc (plusSucc m n)
+
+lengthReverseOnto :: forall a. foreach (xs :: List a) -> foreach (acc :: List a)
+                  -> size (InternalList.reverseOnto xs acc) :~: plus (size xs) (size acc)
+lengthReverseOnto []       _   = Refl
+lengthReverseOnto (x : xs) acc =
+  case lengthReverseOnto xs (x : acc) of
+    Refl -> plusSucc (size xs) (size acc)
+
+lengthReverse :: forall a. foreach (xs :: List a) -> size (reverse xs) :~: size xs
+lengthReverse xs =
+  case lengthReverseOnto xs [] of
+    Refl -> plusZero (size xs)
+
+lengthRev :: forall a. foreach (xs :: List a) -> size (reverse xs) :~: size xs
+lengthRev = _
+
+reverseIdPointfree :: forall a. foreach (xs :: List a) -> reverse xs :~: xs
+reverseIdPointfree = _
+
+-- 8. Transitivity step refinement fit on an inductive equality goal (PLFH).
+add2 :: Nat -> Nat -> Nat
+add2 Zero     n = n
+add2 (Succ m) n = Succ (add2 m n)
+
+add2Zero :: foreach (m :: Nat) -> add2 m Zero :~: m
+add2Zero Zero     = Refl
+add2Zero (Succ m) = congSucc (add2Zero m)
+
+add2Succ :: foreach (m n :: Nat) -> add2 m (Succ n) :~: Succ (add2 m n)
+add2Succ Zero     _ = Refl
+add2Succ (Succ m) n = congSucc (add2Succ m n)
+
+add2Comm :: foreach (m k :: Nat) -> add2 m k :~: add2 k m
+add2Comm m Zero     = add2Zero m
+add2Comm m (Succ k) = _

@@ -1745,7 +1745,9 @@ coercion variables.
    solves an expression hole, inspect the hole type for stuck certified
    source-table family applications @T:f arg_1 ... arg_n@. If a constructor-
    scrutinized argument position holds an unrefined local algebraic variable
-   @x@, emit a 'DependentCaseSplitHint' suggesting a pattern match on @x@.
+   @x@ that is bound in the enclosing clause or expression scope (not a
+   'DepFunTy' binder quantified inside the hole type itself), emit a
+   'DependentCaseSplitHint' suggesting a pattern match on @x@.
 -}
 
 -- | Release bound 'DepFunTy' binder occurrences from 'TidyOccEnv' before
@@ -1811,8 +1813,12 @@ dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_t
            ; return [ UnknownHint (DependentCaseSplitHint (idName (untidy_id v)) cons occ)
                     | (v, cons, occ) <- take 3 candidates ] } }
   where
-    untidy_env = mkVarEnv [ (b, b) | TcIdBndr b _ <- ctl_bndrs lcl_env ]
-    untidy_id v = fromMaybe v (lookupVarEnv untidy_env v)
+    local_bndr_env = mkVarEnv
+      [ (b, b)
+      | TcIdBndr b top_lvl <- ctl_bndrs lcl_env
+      , not (isTopLevel top_lvl)
+      ]
+    untidy_id v = fromMaybe v (lookupVarEnv local_bndr_env v)
 
     bndr_occ (TcIdBndr bndr_id top_lvl)     = Just (nameOccName (idName bndr_id), top_lvl)
     bndr_occ (TcIdBndr_ExpType nm _ top_lvl) = Just (nameOccName nm, top_lvl)
@@ -1876,17 +1882,19 @@ dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_t
         open_rows = map fi_tys (familyInstances fam_envs tc)
         lhs_rows = closed_rows ++ open_rows
 
-    unwrap_term_var :: Type -> Maybe Id
-    unwrap_term_var ty
-      | Just ty' <- coreView ty = unwrap_term_var ty'
-    unwrap_term_var (CastTy ty _) = unwrap_term_var ty
-    unwrap_term_var (TermVarTy v)
+    unwrap_term_var :: VarSet -> Type -> Maybe Id
+    unwrap_term_var bound ty
+      | Just ty' <- coreView ty = unwrap_term_var bound ty'
+    unwrap_term_var bound (CastTy ty _) = unwrap_term_var bound ty
+    unwrap_term_var bound (TermVarTy v)
       | isNonCoVarId v
       , not (isGlobalId v)
+      , v `elemVarEnv` local_bndr_env
+      , not (v `elemVarSet` bound)
       , not (isUnderscore (nameOccName (idName v)))
       , not (v `elemVarSet` refined_vars)
       = Just v
-    unwrap_term_var _ = Nothing
+    unwrap_term_var _ _ = Nothing
 
     alg_cons_of :: Id -> Maybe [DataCon]
     alg_cons_of v
@@ -1900,31 +1908,31 @@ dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_t
       | otherwise = Nothing
 
     collect_stuck :: FamInstEnvs -> Type -> [(Id, [DataCon], OccName)]
-    collect_stuck fam_envs = go
+    collect_stuck fam_envs = go emptyVarSet
       where
-        go ty | Just ty' <- coreView ty = go ty'
-        go (TyConApp tc args) =
-          let inner = concatMap go args
+        go bound ty | Just ty' <- coreView ty = go bound ty'
+        go bound (TyConApp tc args) =
+          let inner = concatMap (go bound) args
               here
                 | isTypeFamilyTyCon tc
                 , Just fun_occ <- owner_occ tc
                 = [ (v, cons, fun_occ)
                   | i <- scrutinized_ixs fam_envs tc (length args)
-                  , Just v <- [unwrap_term_var (args !! i)]
+                  , Just v <- [unwrap_term_var bound (args !! i)]
                   , Just cons <- [alg_cons_of v]
                   ]
                 | otherwise = []
           in inner ++ here
-        go (AppTy t1 t2) = go t1 ++ go t2
-        go (FunTy _ ma w t1 t2) = go ma ++ go w ++ go t1 ++ go t2
-        go (ForAllTy ma _ b) = go ma ++ go b
-        go (DepFunTy _ v b) = go (varType v) ++ go b
-        go (DepDictTy v b) = go (varType v) ++ go b
-        go (ExistsTy _ v b) = go (varType v) ++ go b
-        go (TermAppTy _ a) = go a
-        go (ClassAppTy _ i d o k) = go i ++ go d ++ go o ++ go k
-        go (CastTy t _) = go t
-        go _ = []
+        go bound (AppTy t1 t2) = go bound t1 ++ go bound t2
+        go bound (FunTy _ ma w t1 t2) = go bound ma ++ go bound w ++ go bound t1 ++ go bound t2
+        go bound (ForAllTy ma _ b) = go bound ma ++ go bound b
+        go bound (DepFunTy _ v b) = go bound (varType v) ++ go (extendVarSet bound v) b
+        go bound (DepDictTy v b) = go bound (varType v) ++ go (extendVarSet bound v) b
+        go bound (ExistsTy _ v b) = go bound (varType v) ++ go (extendVarSet bound v) b
+        go bound (TermAppTy _ a) = go bound a
+        go bound (ClassAppTy _ i d o k) = go bound i ++ go bound d ++ go bound o ++ go bound k
+        go bound (CastTy t _) = go bound t
+        go _ _ = []
 dependentHoleHints _ _ _ _ = return noHints
 
 {- Note [Adding deferred bindings]
