@@ -1134,10 +1134,11 @@ instance Diagnostic TcRnMessage where
            text "Record syntax is illegal here:" <+> ppr ty
 
     TcRnTypeLambdaDisabled
-      -> mkSimpleDecorated $ text "Type lambdas require -XExperimentalDependentTypes."
+      -> mkSimpleDecorated $ text "Type lambdas require -XDependentTypes."
     TcRnTypeLetDisabled
       -> mkSimpleDecorated $ text "A type-level" <+> quotes (text "let")
-                              <+> text "requires -XExperimentalDependentTypes."
+                              <+> text "or local" <+> quotes (text "type")
+                              <+> text "synonym requires -XDependentTypes or -XExtendedLet."
     TcRnTypeLetInvalidConstructor con
       -> mkSimpleDecorated $
            text "The data constructor" <+> quotes (ppr con)
@@ -1145,7 +1146,7 @@ instance Diagnostic TcRnMessage where
            $$ text "A type let pattern requires the sole constructor of a regular data type."
     TcRnTypeCaseDisabled
       -> mkSimpleDecorated $ text "A type-level" <+> quotes (text "case")
-                              <+> text "requires -XExperimentalDependentTypes."
+                              <+> text "requires -XDependentTypes."
     TcRnTypeCasePattern Nothing
       -> mkSimpleDecorated $ text "Expected a constructor pattern, a variable, or a wildcard. Each pattern variable must be distinct."
     TcRnTypeCasePattern (Just pat)
@@ -1161,7 +1162,7 @@ instance Diagnostic TcRnMessage where
                                   2 (text "This binder has kind" <+> quotes (ppr kind) <> dot)
     TcRnExistsPack problem -> mkSimpleDecorated $ case problem of
       ExistsPackExtension ->
-        text "GHC.Exists.Pack requires -XExperimentalDependentTypes."
+        text "GHC.Exists.Pack requires -XDependentTypes or -XExistentialTypes."
       ExistsPackArguments ->
         text "Apply GHC.Exists.Pack to a required type witness and a payload."
       ExistsPackMissingSchema ->
@@ -3660,7 +3661,7 @@ instance Diagnostic TcRnMessage where
     TcRnRetainedQuantificationNotImplemented{}
       -> noHints
     TcRnRetainedQuantificationError RetainedArgumentExtension
-      -> [suggestExtension LangExt.ExperimentalDependentTypes]
+      -> [UnknownHint (text "Perhaps you intended to use the" <+> quotes (text "DependentTypes") <+> text "extension")]
     TcRnRetainedQuantificationError{}
       -> noHints
     TcRnInvalidRecordField{}

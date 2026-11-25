@@ -57,7 +57,7 @@ import GHC.Core.Multiplicity
 import GHC.Core.FamInstEnv( normaliseType )
 import GHC.Core.Class   ( Class )
 import GHC.Core.Coercion( mkSymCo )
-import GHC.Core.Type (mkStrLitTy, mkCastTy, coreFullView, isFamFreeTy, noFreeVarsOfType)
+import GHC.Core.Type (mkStrLitTy, mkCastTy, coreFullView, isFamFreeTy)
 import GHC.Core.TyCo.Rep (Type(ExistsTy))
 import GHC.Core.TyCo.Ppr( pprTyVars )
 import GHC.Core.TyCo.Tidy( tidyOpenTypeX )
@@ -90,6 +90,7 @@ import GHC.Data.Maybe
 
 import Control.Monad
 import Data.Foldable (find, traverse_)
+import Data.List (partition)
 
 {-
 ************************************************************************
@@ -227,8 +228,10 @@ tcLocalBinds (EmptyLocalBinds x) thing_inside
         ; return (EmptyLocalBinds x, thing) }
 
 tcLocalBinds (HsValBinds x (XValBindsLR (HsVBG grps sigs))) thing_inside
-  = do  { (grps', thing) <- tcValBinds NotTopLevel grps sigs thing_inside
-        ; return (HsValBinds x (XValBindsLR (HsVBG grps' sigs)), thing) }
+  = do  { let (syn_sigs, val_sigs) = partition isLocalTySynLSig sigs
+        ; (grps', thing) <- tcWithLocalTySyns syn_sigs $
+                            tcValBinds NotTopLevel grps val_sigs thing_inside
+        ; return (HsValBinds x (XValBindsLR (HsVBG grps' val_sigs)), thing) }
 tcLocalBinds (HsValBinds _ (ValBinds {})) _ = panic "tcLocalBinds"
 
 tcLocalBinds (HsIPBinds x (IPBinds _ ip_binds)) thing_inside

@@ -538,6 +538,9 @@ inline_generic_eq_type_x syn_flag mult_flag mb_env
                             (Just (initRnEnv t1 t2)) t1 t2
               Just env
                 -> go (varType v1) (varType v2)
+                   && (case mult_flag of
+                         RespectMultiplicities -> go (idMult v1) (idMult v2)
+                         IgnoreMultiplicities  -> True)
                    && generic_eq_type_x syn_flag mult_flag
                         (Just (rnBndr2 env v1 v2)) body1 body2
 
@@ -861,6 +864,7 @@ nonDetCmpTypeX env orig_t1 orig_t2 =
         `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
     go env (DepFunTy vis1 v1 t1) (DepFunTy vis2 v2 t2)
       = liftOrdering (compare vis1 vis2)
+        `thenCmpTy` go env (idMult v1) (idMult v2)
         `thenCmpTy` go env (varType v1) (varType v2)
         `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
     go env (ForAllTy ma1 (Bndr tv1 vis1) t1) (ForAllTy ma2 (Bndr tv2 vis2) t2)
@@ -1081,8 +1085,10 @@ mayLookIdentical orig_ty1 orig_ty2
 
     go env _top (DepFunTy vis1 v1 ty1) (DepFunTy vis2 v2 ty2)
       | vis1 == vis2
-      = (&&) <$> go env False (varType v1) (varType v2)
-             <*> go (rnBndr2 env v1 v2) False ty1 ty2
+      = (\m k b -> m && k && b)
+          <$> go env False (idMult v1) (idMult v2)
+          <*> go env False (varType v1) (varType v2)
+          <*> go (rnBndr2 env v1 v2) False ty1 ty2
       | otherwise = return False
 
     go _   _   (LitTy lit1)    (LitTy lit2)    = return $ lit1 == lit2

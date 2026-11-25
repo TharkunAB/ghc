@@ -523,7 +523,28 @@ cvBindsAndSigsOnly :: OrdList (LHsDecl GhcPs)
 -- associated type declarations. They might also contain Haddock comments.
 cvBindsAndSigsOnly fb = do
   fb' <- cvBindsAndSigs fb
-  return (fmap wrapValBind fb')
+  return (fmap wrapValBindPs fb')
+
+-- | Wrap a parsed local declaration, encoding local @type@ synonyms under
+-- @-XExtendedLet@ as @tcClsName@-headed 'TypeSig' entries for 'GHC.Rename.Bind'.
+wrapValBindPs :: LHsDecl GhcPs -> ValBind GhcPs GhcPs
+wrapValBindPs (L l (TyClD _ (SynDecl { tcdLName = tc
+                                     , tcdTyVars = HsQTvs _ tvbs
+                                     , tcdFixity = fixity
+                                     , tcdRhs = rhs })))
+  = VbSig $ L l $ TypeSig (AnnSig noAnn fixity_tag Nothing) [] [tc]
+      (mkHsWildCardBndrs (L l (mkHsExplicitSigType noAnn spec_tvbs rhs)))
+  where
+    fixity_tag = case fixity of
+      Infix  -> Just (EpTok (EpaDelta noSrcSpan (SameLine 1) []))
+      Prefix -> Nothing
+    spec_tvbs =
+      [ L bl (HsTvb xb spec bvar bkind)
+      | L bl (HsTvb xb bvis bvar bkind) <- tvbs
+      , let spec = case bvis of
+              HsBndrRequired _  -> SpecifiedSpec
+              HsBndrInvisible _ -> InferredSpec ]
+wrapValBindPs d = wrapValBind d
 
 wrapValBind :: LHsDecl (GhcPass p) -> ValBind (GhcPass p) (GhcPass p)
 wrapValBind (L l (ValD _ b)) = VbBind (L l b)

@@ -1874,10 +1874,12 @@ tcSubTypeAmbiguity ctxt ty
       = check_equality actual expected
       | DepFunTy DepFunVisible a _ <- coreFullView actual
       , DepFunTy DepFunVisible e _ <- coreFullView expected
-      = do { domain_co <- unifyType Nothing (varType a) (varType e)
+      = do { _ <- unifyType Nothing (idMult a) (idMult e)
+           ; domain_co <- unifyType Nothing (varType a) (varType e)
            ; ad <- liftZonkM $ zonkTcType (varType a)
            ; ed <- liftZonkM $ zonkTcType (varType e)
-           ; fresh <- newSysLocalId (getOccFS e) ManyTy ed
+           ; em <- liftZonkM $ zonkTcType (idMult e)
+           ; fresh <- newSysLocalId (getOccFS e) em ed
            ; co <- liftZonkM $ zonkCo domain_co
            ; let arg = Core.Var fresh
                  actual_arg
@@ -2082,8 +2084,13 @@ unify_retained_rho unify actual expected
   , isNativeOpaqueValueId b_a, isNativeOpaqueValueId b_e
   , let domain_a = varType b_a
         domain_e = varType b_e
-  , not (domain_a `tcEqType` domain_e)
-  = do { _ <- unify domain_a domain_e
+        mult_a   = idMult b_a
+        mult_e   = idMult b_e
+  , not (domain_a `tcEqType` domain_e) || not (mult_a `tcEqType` mult_e)
+  = do { when (not (mult_a `tcEqType` mult_e)) $
+           void (unify mult_a mult_e)
+       ; when (not (domain_a `tcEqType` domain_e)) $
+           void (unify domain_a domain_e)
        ; actual' <- liftZonkM (zonkTcType actual)
        ; expected' <- liftZonkM (zonkTcType expected)
        ; unify actual' expected' }
@@ -2665,9 +2672,10 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
     go1 ty_a@(DepFunTy DepFunVisible b_a _) ty_e@(DepFunTy DepFunVisible b_e res_e)
       | DeepSub <- ds_depth
       , isNativeIndexId b_a, isNativeIndexId b_e
+      , idMult b_a `tcEqType` idMult b_e
       , varType b_a `tcEqType` varType b_e
       , (_, _ : _, _) <- tcSplitSigmaTy res_e
-      = do { b <- newSysLocalId (fsLit "retained") ManyTy (varType b_e)
+      = do { b <- newSysLocalId (fsLit "retained") (idMult b_e) (varType b_e)
            ; let open ty = applyTypeToArgs ty [Core.Var b]
            ; wrap <- tcExtendIdEnv [b] $
                tc_sub_type_ds (tc_fun, Result pos) (Deep DeepSub) unify inst_orig ctxt

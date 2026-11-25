@@ -123,7 +123,7 @@ import GHC.Data.FastString (bytesFS, fastStringToShortText, fsLit, mkFastString)
 
 import Control.Monad
 import Data.Data (Data, cast, gmapQ)
-import Data.List (transpose)
+import Data.List (partition, transpose)
 import qualified Data.List.NonEmpty as NE
 
 import qualified GHC.LanguageExtensions as LangExt
@@ -1773,7 +1773,9 @@ tcNativeLet :: HsExpr GhcRn -> LHsLocalBinds GhcRn -> LHsExpr GhcRn -> Type
 tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) body expected
   | not (null groups), all isTypeLSig sigs
   , Just bindings <- traverse nonrec_fun groups
-  = do { direct <- case (bindings, sigs) of
+  = let (syn_sigs, val_sigs) = partition isLocalTySynLSig sigs
+    in tcWithLocalTySyns syn_sigs $
+    do { direct <- case (bindings, val_sigs) of
            ([L _ FunBind { fun_id = name, fun_matches = matches }], [])
              | Just rhs <- lazyLetRhs matches -> named_argument name rhs
            _ -> return Nothing
@@ -1783,11 +1785,13 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
              { expr <- foldr check_binding (tcMonoLExpr body (Check expected)) bindings
              ; return (Just (mkExpandedExprTc original (unLoc expr))) } }
   where
+    (_, val_sigs_only) = partition isLocalTySynLSig sigs
+
     nonrec_fun (NonRecursive, [binding@(L _ FunBind{})]) = Just binding
     nonrec_fun _ = Nothing
 
     sigs_for :: Name -> [LSig GhcRn]
-    sigs_for target = mapMaybe narrow sigs
+    sigs_for target = mapMaybe narrow val_sigs_only
       where
         narrow (L s_loc (TypeSig x mods names wc_ty))
           | let matching = [l_nm | l_nm@(L _ nm) <- names, nm == target]

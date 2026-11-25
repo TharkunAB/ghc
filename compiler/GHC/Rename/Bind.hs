@@ -48,8 +48,8 @@ import GHC.Driver.DynFlags
 
 import GHC.Data.BooleanFormula ( bfTraverse )
 import GHC.Data.FastString     ( FastString )
-import GHC.Data.Graph.Directed ( SCC(..) )
-import GHC.Data.Maybe          ( isNothing, orElse, mapMaybe )
+import GHC.Data.Graph.Directed ( Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq )
+import GHC.Data.Maybe          ( isJust, isNothing, orElse, mapMaybe )
 import GHC.Data.OrdList
 import GHC.Data.List.SetOps    ( findDupsEq )
 import GHC.Data.FastString (mkFastStringShortText)
@@ -65,7 +65,8 @@ import GHC.Types.Name.Reader
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Basic         ( RecFlag(..), TypeOrKind(..), VisArity )
-import GHC.Types.Var           ( DepFunTyFlag(..) )
+import GHC.Types.Unique        ( getUnique )
+import GHC.Types.Var           ( DepFunTyFlag(..), Specificity(..) )
 
 import GHC.Types.CompleteMatch
 import GHC.Types.Hint ( SigLike(..) )
@@ -82,6 +83,7 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
 import Data.Data          ( Data, cast, gmapQ )
+import Data.Either        ( partitionEithers )
 import Data.List          ( partition )
 import Data.List.NonEmpty ( NonEmpty(..) )
 
@@ -433,6 +435,38 @@ rnLocalValBindsAndThen
   :: HsValBinds GhcPs
   -> (HsValBinds GhcRn -> FreeNames -> RnM (result, FreeNames))
   -> RnM (result, FreeNames)
+rnLocalValBindsAndThen (ValBinds x vbinds) thing_inside
+  | (local_syns@((first_syn_loc, _, _, _, _) : _), ordinary_vbinds)
+      <- partitionEithers (map splitLocalTySynVb vbinds)
+  = do  { enabled <- xoptM LangExt.ExperimentalDependentTypes
+        ; unless enabled $
+            setSrcSpanA first_syn_loc $ failWithTc TcRnTypeLetDisabled
+        ; let ordinary_binds = ValBinds x ordinary_vbinds
+              sigs = val_sigs ordinary_vbinds
+        ; new_fixities <- makeMiniFixityEnv [ L loc sig
+                                            | L loc (FixSig _ sig) <- sigs ]
+        ; (bound_names, (binds_lhs, sigs_ps)) <- rnLocalValBindsLHS new_fixities ordinary_binds
+        ; syn_names <- mapM (\(_, _, tc, _, _) -> newLocalBndrRn tc) local_syns
+        ; envs <- getRdrEnvs
+        ; checkDupAndShadowedNames envs syn_names
+        ; bindLocalNamesFV bound_names              $
+          addLocalFixities new_fixities bound_names $
+          bindLocalNamesFV syn_names                $ do
+        { let bound_set = mkNameSet bound_names
+        ; (syn_sigs_rn, syn_fvs) <- rnLocalTySyns bound_set (zip syn_names local_syns)
+        ; let new_lhs :: HsValBindsLR GhcRn GhcPs =
+                ValBinds noExtField (map VbBind binds_lhs ++ map VbSig sigs_ps)
+        ; (XValBindsLR (HsVBG anal_binds val_sigs_rn), dus) <-
+            rnLocalValBindsRHS bound_set new_lhs
+        ; let combined_binds = XValBindsLR (HsVBG anal_binds (syn_sigs_rn ++ val_sigs_rn))
+        ; (result, result_fvs) <- thing_inside combined_binds (allUses dus `plusFN` syn_fvs)
+        ; let real_uses = findUses dus result_fvs
+              rec_uses = hsValBindsImplicits (XValBindsLR (HsVBG anal_binds val_sigs_rn))
+              implicit_uses = mkNameSet $ concatMap (concatMap implFlBndr_binders . snd) rec_uses
+        ; mapM_ (\(loc, ns) -> checkUnusedRecordWildcard loc real_uses (Just ns)) rec_uses
+        ; warnUnusedLocalBinds bound_names (real_uses `unionNameSet` implicit_uses)
+        ; let all_uses = allUses dus `plusFN` syn_fvs `plusFN` result_fvs
+        ; return (result, all_uses) }}
 rnLocalValBindsAndThen binds@(ValBinds _ vbinds) thing_inside
  = do   { let sigs = val_sigs vbinds
              -- (A) Create the local fixity environment
@@ -491,6 +525,117 @@ rnLocalValBindsAndThen binds@(ValBinds _ vbinds) thing_inside
                 -- by the bindLocalNamesFV call above
 
 rnLocalValBindsAndThen bs _ = pprPanic "rnLocalValBindsAndThen" (ppr bs)
+
+-- | Separate a parsed local @type@ synonym from ordinary value bindings and signatures.
+-- See Note [Local type synonyms in let and where].
+splitLocalTySynVb
+  :: ValBind GhcPs GhcPs
+  -> Either (SrcSpanAnnA, LexicalFixity, LocatedN RdrName, [LHsTyVarBndr Specificity GhcPs], LHsType GhcPs)
+            (ValBind GhcPs GhcPs)
+splitLocalTySynVb
+  (VbSig (L loc (TypeSig ann [] [tc]
+                  (HsWC _ (L _ (HsSig _ (HsOuterExplicit { hso_bndrs = tvbs }) rhs))))))
+  | isTcClsNameSpace (rdrNameSpace (unLoc tc))
+  = let fixity = if isJust (asPattern ann) then Infix else Prefix
+    in Left (loc, fixity, tc, tvbs, rhs)
+splitLocalTySynVb other = Right other
+
+-- | Rename local @type@ synonyms in a @let@ or @where@ block, reject cycles,
+-- and return topologically ordered 'LSig' entries for 'tcWithLocalTySyns'.
+-- See Note [Local type synonyms in let and where].
+rnLocalTySyns
+  :: NameSet
+  -> [(Name, (SrcSpanAnnA, LexicalFixity, LocatedN RdrName, [LHsTyVarBndr Specificity GhcPs], LHsType GhcPs))]
+  -> RnM ([LSig GhcRn], FreeNames)
+rnLocalTySyns bound_set items = do
+  entries <- mapM rn_one items
+  let syn_name_set = mkNameSet (map fst items)
+      nodes =
+        [ DigraphNode (sig_rn, decl_rn) (getUnique nm)
+            [ getUnique u | u <- nonDetEltsUniqSet fvs, u `elemNameSet` syn_name_set ]
+        | (nm, sig_rn, decl_rn, fvs) <- entries ]
+      sccs = stronglyConnCompFromEdgedVerticesUniq nodes
+  case [ cyc | CyclicSCC cyc <- sccs ] of
+    (((_, L cyc_loc _) : _) : _) ->
+      let cyc_decls = concat [ map snd c | CyclicSCC c <- sccs ]
+      in setSrcSpanA cyc_loc $
+           failWithTc $ TcRnTypeSynonymCycle (map Right cyc_decls)
+    _ ->
+      let ordered = [ sig_rn | AcyclicSCC (sig_rn, _) <- sccs ]
+          total_fvs = plusFNs [ fvs | (_, _, _, fvs) <- entries ]
+      in pure (ordered, total_fvs)
+  where
+    rn_one (syn_name, (loc, fixity, tc_rdr@(L tc_loc _), spec_tvbs, rhs_ps)) = setSrcSpanA loc $ do
+      let bndr_rdrs =
+            [ rdr
+            | L _ (HsTvb _ _ (HsBndrVar _ (L _ rdr)) _) <- spec_tvbs ]
+          bndr_kinds_ps =
+            [ k
+            | L _ (HsTvb _ _ _ (HsBndrKind _ k)) <- spec_tvbs ]
+      raw_all_fvs <- filterInScopeM (extractHsTysRdrTyVars (rhs_ps : bndr_kinds_ps) [])
+      let alias_candidates = [ v | v <- raw_all_fvs, unLoc v `notElem` bndr_rdrs ]
+      rnWithRetainedAliases bound_set RetainedPartialSignature alias_candidates rhs_ps $ do
+        raw_bndr_fvs <- filterInScopeM (nubN (extractHsTysRdrTyVars bndr_kinds_ps []))
+        let bndr_k_rdrs = [ v | v <- raw_bndr_fvs, unLoc v `notElem` bndr_rdrs ]
+        bndr_k_names <- mapM (newTyVarNameRn Nothing) bndr_k_rdrs
+        let doc = TySynCtx tc_rdr
+        ((spec_tvbs_rn, rhs_rn), syn_fvs) <-
+          bindLocalNamesFV bndr_k_names $
+            bindLHsTyVarBndrs doc WarnUnusedForalls Nothing spec_tvbs $ \tvbs_rn -> do
+              (rhs', fvs) <- rnLHsType doc rhs_ps
+              pure ((tvbs_rn, rhs'), fvs)
+        let kvs_tvbs =
+              [ noLocA (HsTvb noAnn InferredSpec
+                         (HsBndrVar noExtField (noLocA kv))
+                         (HsBndrNoKind noExtField))
+              | kv <- bndr_k_names ]
+            vis_tvbs_rn =
+              [ L bl (HsTvb xb bvis bvar bkind)
+              | L bl (HsTvb xb spec bvar bkind) <- spec_tvbs_rn
+              , let bvis = case spec of
+                      SpecifiedSpec -> HsBndrRequired noExtField
+                      InferredSpec  -> HsBndrInvisible noExtField ]
+            outer_rn = HsOuterExplicit
+              { hso_xexplicit    = noExtField
+              , hso_bndrs        = kvs_tvbs ++ spec_tvbs_rn
+              , hso_matchability = Nothing }
+            wc_sig  = HsWC [] (L loc (HsSig noExtField outer_rn rhs_rn))
+            sig_rn  = L loc (TypeSig noAnn [] [L tc_loc syn_name] wc_sig)
+            decl_rn = L loc $ SynDecl
+              { tcdSExt   = syn_fvs
+              , tcdLName  = L tc_loc syn_name
+              , tcdTyVars = HsQTvs bndr_k_names vis_tvbs_rn
+              , tcdFixity = fixity
+              , tcdRhs    = rhs_rn }
+        pure (syn_name, sig_rn, decl_rn, syn_fvs)
+
+{- Note [Local type synonyms in let and where]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #523 (-XExtendedLet, implied by -XDependentTypes) allows non-recursive
+type synonym declarations inside term-level let and where binding groups:
+
+  let type PairOf a = (a, a)
+      x :: PairOf Int
+      x = (1, 2)
+  in fst x
+
+The parser accepts `type lhs = rhs` in `decls` and wraps each declaration as a
+tcClsName-headed TypeSig so ValBind and HsLocalBinds keep their existing layouts.
+In rnLocalValBindsAndThen:
+
+1. Check that -XExtendedLet (implied by -XDependentTypes) is active.
+2. Allocate fresh local Names for all local type synonyms in the group, check
+   for duplicates and shadowing, and scope those Names over the group's type
+   synonyms, value signatures, value bindings, and body.
+3. Rename each synonym RHS with aliases for enclosing runtime indices and reject
+   self-recursive or mutually recursive synonyms via TcRnTypeSynonymCycle.
+4. Emit topologically sorted entries to tcWithLocalTySyns in GHC.Tc.Gen.HsType.
+
+During typechecking, nullary synonyms bind ATcTypeLet directly in TcLclEnv, and
+parameterized synonyms build an internal SynonymTyCon that mkAppTyM expands
+immediately upon saturation. No local TyCon escapes GHC.Tc.Gen.HsType into Core
+or interface files, and undersaturated uses report TcRnArityMismatch.
+-}
 
 
 ---------------------

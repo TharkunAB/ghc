@@ -72,7 +72,7 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Types.Error
 import GHC.Types.Basic   ( TypeOrKind(..), UnboxedTupleOrSum(..)
                          , unboxedTupleOrSumExtension )
-import GHC.Types.Id (isNaughtyRecordSelector)
+import GHC.Types.Id (idMult, isNaughtyRecordSelector)
 import GHC.Types.FieldLabel (flSelector)
 import GHC.Types.Name
 import GHC.Types.Name.Env
@@ -1484,6 +1484,7 @@ check_type ve (DepFunTy _ v body)
            failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
        ; unless (typeKind body `eqType` liftedTypeKind) $
            failWithTc $ TcRnRetainedQuantificationError (RetainedResultKind body)
+       ; check_type (ve { ve_rank = arg_rank }) (idMult v)
        ; check_type (ve { ve_rank = arg_rank }) (varType v)
        ; check_type (ve { ve_rank = res_rank
                         , ve_indices = ve_indices ve `extendVarSet` v }) body }

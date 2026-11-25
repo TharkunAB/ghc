@@ -448,7 +448,7 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
              check_case _ result = do
                index <- tcLookupId name
                tcEmitBindingUsage (singleUsageUE index)
-               cases <- tcIndexedCaseMatches index CaseAlt (Scaled ManyTy (varType index))
+               cases <- tcIndexedCaseMatches index CaseAlt (Scaled (idMult index) (varType index))
                           (matches { mg_alts = L loc alternatives }) result
                return (L loc (HsCase CaseAlt (nlHsVar index) cases))
        ; tcRetainedVarMatches herald ctxt ty [pat] $ \pat_tys rhs_ty _ _ ->
@@ -518,7 +518,7 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
         , all (variable_retained_patterns ty . filter isVisArgLPat . hsLMatchPats) rows ->
           tcRetainedVarGroupMatches herald ctxt mctxt arity invis_pat_tys ty matches
       _ | DepFunTy DepFunVisible binder _ <- coreFullView ty ->
-          do { index <- newSysLocalId (occNameFS (nameOccName (idName binder))) ManyTy (varType binder)
+          do { index <- newSysLocalId (occNameFS (nameOccName (idName binder))) (idMult binder) (varType binder)
              ; let body_ty = applyTypeToArgs ty [Var index]
              ; (wrap, (pat_tys, argument_plan, rhs_ty)) <-
                  tcRetainedConArgs herald ctxt (arity - 1) body_ty
@@ -1495,8 +1495,8 @@ tcRetainedVarMatches herald ctxt initial_ty source_pats = go [] initial_ty initi
                VarPat _ (L _ name) -> return name
                WildPat{} -> newSysName (getOccName binder)
                _ -> failWithTc (TcRnRetainedQuantificationError RetainedVariablePattern)
-           ; let index = mkLocalId name ManyTy (varType binder)
-                 pat_ty = mkCheckExpFunPatTy (Scaled ManyTy (varType binder))
+           ; let index = mkLocalId name (idMult binder) (varType binder)
+                 pat_ty = mkCheckExpFunPatTy (Scaled (idMult binder) (varType binder))
            ; (wrap, result) <- go ((pat_ty, Just name) : acc)
                                   (applyTypeToArgs ty [Var index]) pats thing_inside
            ; return (liftRetainedLambdaWrap index wrap, result) }
@@ -1719,8 +1719,8 @@ tcRetainedConArgs herald ctxt = go [] []
       = failWithTc (TcRnRetainedQuantificationError RetainedResultWrapper)
       | DepFunTy DepFunVisible binder _ <- coreFullView ty
       = do { name <- newSysName (nameOccName (idName binder))
-           ; let index = mkLocalId name ManyTy (varType binder)
-                 pat_ty = mkCheckExpFunPatTy (Scaled ManyTy (varType binder))
+           ; let index = mkLocalId name (idMult binder) (varType binder)
+                 pat_ty = mkCheckExpFunPatTy (Scaled (idMult binder) (varType binder))
            ; (wrap, result) <- go (pat_ty : acc) (RetainedConIndex index : argument_plan) (n-1)
                                   (applyTypeToArgs ty [Var index])
            ; return (liftRetainedLambdaWrap index wrap, result) }
@@ -2504,10 +2504,10 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
   | [(second_column, second)] <- matrix_columns
   , not split_final
   = tcRetainedMatrixMatches (0, index) (second_column + 1, second) invis_pat_tys
-      (mkCheckExpFunPatTy (Scaled ManyTy (varType index)) : pat_tys) all_arguments rhs_ty group
+      (mkCheckExpFunPatTy (Scaled (idMult index) (varType index)) : pat_tys) all_arguments rhs_ty group
   | later@(_ : _ : _) <- matrix_columns
   = tcRetainedNMatrixMatches ((0, index) : [(col + 1, idx) | (col, idx) <- later]) invis_pat_tys
-      (mkCheckExpFunPatTy (Scaled ManyTy (varType index)) : pat_tys) all_arguments rhs_ty group
+      (mkCheckExpFunPatTy (Scaled (idMult index) (varType index)) : pat_tys) all_arguments rhs_ty group
   | has_one_col_fallback
   = setSrcSpanA loc $
     do { let init_matches = init matches
@@ -2525,7 +2525,7 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
                && (length cons /= length (nub cons) || length cons == length domain_cons)) $
            failWithTc (TcRnRetainedQuantificationError RetainedMatrixDuplicate)
        ; checkRetainedRows True invis_pat_tys
-           (mkCheckExpFunPatTy (Scaled ManyTy (varType index)) : pat_tys)
+           (mkCheckExpFunPatTy (Scaled (idMult index) (varType index)) : pat_tys)
            all_arguments rhs_ty origin loc
            ([([(0, index, c)], m) | (c, m) <- zip init_cons init_matches] ++ [([], fb_match)]) }
   | otherwise
@@ -2558,7 +2558,7 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
        ; if null matches
          then empty_matches arg_tys result_ty
          else return (MG { mg_alts = L loc checked
-                         , mg_ext = MatchGroupTc (Scaled ManyTy (varType index) : arg_tys) result_ty origin }) }
+                         , mg_ext = MatchGroupTc (Scaled (idMult index) (varType index) : arg_tys) result_ty origin }) }
   where
     matrix_columns = retainedMatrixColumns argument_plan group
     all_arguments = RetainedConIndex index : argument_plan
@@ -2685,7 +2685,7 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
       | L _ first : _ <- matches
       = do { let con_pat = nlConPatName (dataConName con)
                              (replicate (dataConSourceArity con) nlWildPatName)
-           ; resolved <- tcRetainedCon (varType index) con_pat
+           ; resolved <- tcRetainedConScaled (Scaled (idMult index) (varType index)) con_pat
            ; (dc, fields) <- maybe (missing_equation con) return resolved
            ; eq <- newEvVar (mkNomEqPred (TermVarTy index)
                                          (retainedConIndex (varType index) dc fields))
@@ -2758,7 +2758,7 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
                                  RetainedConDict dict -> return dict
                                  RetainedConIndex shared -> return shared)
                              argument_plan arg_tys
-           ; let index_ty = Scaled ManyTy (varType index)
+           ; let index_ty = Scaled (idMult index) (varType index)
                  empty_case = MG { mg_alts = L loc []
                                  , mg_ext = MatchGroupTc [index_ty] result_ty origin }
                  rhs = L (noAnnSrcSpan (locA loc))
@@ -2773,7 +2773,7 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
       | split_final || is_unguarded grhss
       = setSrcSpanA match_loc $
         case filter isVisArgLPat pats of
-          pat : _ -> do { mb_con <- tcRetainedCon (varType index) pat
+          pat : _ -> do { mb_con <- tcRetainedConScaled (Scaled (idMult index) (varType index)) pat
                         ; maybe coverage_error return mb_con }
           _ -> coverage_error
     constructor (L match_loc _) = setSrcSpanA match_loc coverage_error
@@ -2809,7 +2809,7 @@ tcRetainedConMatches index invis_pat_tys pat_tys argument_plan rhs_ty
                                      _ -> ty))
                                  argument_plan arg_tys arg_cos
                  refined_args = map mkCheckExpFunPatTy refined_domains
-                 index_arg = mkCheckExpFunPatTy (Scaled ManyTy (varType index))
+                 index_arg = mkCheckExpFunPatTy (Scaled (idMult index) (varType index))
                  renamed = renameRetainedMatch names match
                  prepare = insertRetainedDictionaries all_arguments . retainedConPats [(0, fields)]
                          . bindRetainedWildcards (retainedColumnNames all_arguments)

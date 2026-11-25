@@ -1098,3 +1098,8 @@ test('NativeAbsurdForEachCoverage',
      [req_host_target_ghc, only_ways(['normal']),
       extra_files(['NativeAbsurdForEachCoverage.hs'])],
      run_command, ['bash NativeAbsurdForEachCoverage.sh "{compiler}" "{libdir}"'])
+test('NativeLinearForEachAndExtendedLet',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeLinearForEachAndExtendedLetProvider.hs',
+                   'NativeLinearForEachAndExtendedLet.hs'])],
+     run_command, ['bash NativeLinearForEachAndExtendedLet.sh "{compiler}" "{libdir}"'])

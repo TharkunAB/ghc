@@ -2093,7 +2093,7 @@ nativeDomainShapePossible use shape = go emptyTyConSet emptyTyConSet use shape
     go _ _ _ NativeInvalidDomain = False
     go _ aliases mode (NativePiDomain mult arg res)
       = function_use mode
-        && go emptyTyConSet aliases NativeManyMultUse mult
+        && go emptyTyConSet aliases NativeFieldMultUse mult
         && go emptyTyConSet aliases (function_endpoint_use mode) arg
         && go emptyTyConSet aliases (function_endpoint_use mode) res
     go seen _ mode (NativeDataDomain fields)
@@ -2277,7 +2277,7 @@ tcIfaceType = go
            ; domain_shape <- tcIfaceDomainShape domain
            ; precheckIfaceNativeDomain
                (text "Invalid retained binder in interface:" <+> ppr name)
-               (nativeDomainShapePossible NativeManyMultUse mult_shape
+               (nativeDomainShapePossible NativeFieldMultUse mult_shape
                 && nativeDomainShapePossible NativeOpaqueUse domain_shape)
            ; bindIfaceId bndr $ \ v ->
         do { precheckIfaceNativeDomain
@@ -2286,7 +2286,7 @@ tcIfaceType = go
            ; valid <- evaluateIfaceNativeDomain (ppr name) (isNativeOpaqueValueId v)
            ; unless valid $
                failIfM (text "Invalid retained binder in interface:" <+> ppr v
-                        $$ text "Expected a local identifier with multiplicity Many"
+                        $$ text "Expected a local identifier with a valid multiplicity"
                         $$ text "at a lifted value type."
                         $$ text "Actual type:" <+> ppr (varType v)
                         $$ text "Actual multiplicity:" <+> ppr (idMult v))

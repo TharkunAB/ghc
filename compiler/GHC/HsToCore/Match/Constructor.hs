@@ -497,7 +497,7 @@ matchOneConLike scrut vars ty (eqn1 :| eqns)   -- All eqns for a single construc
     retained_fields _ [] = return []
     retained_fields ty (L _ pat : pats)
       = case coreFullView ty of
-          DepFunTy{} -> select ManyTy
+          DepFunTy _ b _ -> select (mkMultMul mult (idMult b))
           FunTy { ft_mult = w } -> select (mkMultMul mult w)
           _ -> package_error
       where

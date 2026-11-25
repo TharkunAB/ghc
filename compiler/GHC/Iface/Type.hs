@@ -1507,13 +1507,18 @@ ppr_ty ctxt_prec (IfaceClassAppTy method inst dict arg)
   = maybeParen ctxt_prec appPrec $
     ppr method <+> (char '@' <> ppr_ty appPrec inst)
                <+> ppr_ty appPrec dict <+> ppr_ty appPrec arg
-ppr_ty ctxt_prec (IfaceDepFunTy vis (_, var, arg) res)
+ppr_ty ctxt_prec (IfaceDepFunTy vis (mult, var, arg) res)
   = maybeParen ctxt_prec funPrec $
     case vis of
       DepFunVisible   -> sep [binder, arrow <+> body]
       DepFunInvisible -> sep [binder <> dot, body]
   where
-    binder = text "foreach" <+> parens (ppr var <+> dcolon <+> ppr_ty_nested arg)
+    mult_doc = case mult of
+      IfaceTyConApp tc IA_Nil
+        | tc `ifaceTyConHasKey` manyDataConKey -> empty
+        | tc `ifaceTyConHasKey` oneDataConKey  -> text "%1"
+      _ -> char '%' <> pprPrecIfaceType appPrec mult
+    binder = text "foreach" <+> parens (ppr var <+> mult_doc <+> dcolon <+> ppr_ty_nested arg)
     body = ppr_ty_nested res
 ppr_ty ctxt_prec (IfaceTyConApp tc tys) = pprTyTcApp ctxt_prec tc tys
 ppr_ty ctxt_prec (IfaceTupleTy i p tys) = ppr_tuple ctxt_prec i p tys -- always fully saturated

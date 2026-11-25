@@ -2741,14 +2741,15 @@ isPrimFamilyPatBinder pats rhs var
 isNativeOpaqueValueType :: Type -> Bool
 isNativeOpaqueValueType = tcIsLiftedTypeKind . typeKind
 
--- | Test the metadata of an opaque local unrestricted runtime value.
+-- | Test the metadata of an opaque local runtime value.
 -- The caller must check its actual lexical binding.
 -- See Note [Opaque runtime index values].
 isNativeOpaqueValueId :: Id -> Bool
 isNativeOpaqueValueId v
   = isLocalId v && not (isCoVar v)
     && not (isJoinIdDetails (idDetails v))
-    && isManyTy (idMult v) && isNativeOpaqueValueType (varType v)
+    && isMultiplicityTy (typeKind (idMult v))
+    && isNativeOpaqueValueType (varType v)
 
 -- | A local unrestricted class dictionary eligible for a dependent binder.
 isNativeClassDictionaryId :: Id -> Bool
