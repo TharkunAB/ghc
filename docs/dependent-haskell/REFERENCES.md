@@ -9008,22 +9008,42 @@ The checked case tree preserves which operand the program evaluates.
 [Agda.Builtin.Nat](https://github.com/agda/agda/blob/v2.8.0/src/data/lib/prim/Agda/Builtin/Nat.agda#L37-L42)
 and [`dependent-base`](https://github.com/TharkunAB/dependent-base).
 
-### Observational equality via QuickCheck `TcPlugin` (`dependent-obs-eq`)
+### Companion ecosystem (`dependent-base`, `dependent-obs-eq`, and `dependent-proof-search`)
 
-Built-in Core conversion in GHC intentionally excludes extensional function
-eta-laws and untested inductive conjectures (`ROADMAP.md`, `CORE.md`). For
-interactive exploration and external proof prototyping, **Jules
-(@analytichegel)** designed the QuickCheck-backed observational-equivalence
-typechecker plugin pattern implemented in
-[`dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq). Enabled
-explicitly per module via `-fplugin=Dependent.ObsEq.Plugin`, the plugin
-intercepts stuck nominal Wanted equalities over promoted source-table functions
-and open `TermVarTy` indices, tests candidate equations across bounded random
-and small-depth inputs before discharging them with plugin-tagged `UnivCo`
-provenance, and refutes false goals with concrete counterexample diagnostics
-while keeping built-in Core conversion sound and unchanged.
-[`dependent-obs-eq` repository](https://github.com/TharkunAB/dependent-obs-eq)
-and [Altenkirch, McBride, and Swierstra, *Observational Equality, Now!*](https://dl.acm.org/doi/10.1145/1292597.1292608).
+Three standalone repositories build atop the `-XDependentTypes` compiler surface:
+
+- **Standard library ([`dependent-base`](https://github.com/TharkunAB/dependent-base)).**
+  Modeled on [`tweag/linear-base`](https://github.com/tweag/linear-base),
+  `dependent-base` reuses GHC `base` runtime datatypes directly and provides
+  `Prelude.Dependent`, `Data.{Bool,Decision,Either,Exists,Fin,Function,List,Maybe,Nat,Sigma,Tuple,Vec}.Dependent`,
+  `Data.Type.Equality.Dependent`, `Data.List.Dependent.All`, and `*.Properties`.
+- **Observational equality via QuickCheck `TcPlugin` ([`dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq)).**
+  Built-in Core conversion in GHC intentionally excludes extensional function
+  eta-laws and untested inductive conjectures (`ROADMAP.md`, `CORE.md`). For
+  interactive exploration and external proof prototyping, **Jules
+  (@analytichegel)** designed the QuickCheck-backed observational-equivalence
+  typechecker plugin pattern implemented in
+  [`dependent-obs-eq`](https://github.com/TharkunAB/dependent-obs-eq). Enabled
+  explicitly per module via `-fplugin=Dependent.Plugin.ObsEq`, the plugin
+  elaborates uncertified term calls in types through deterministic equationless
+  `U:f` families (`GHC.Tc.Gen.HsType`), evaluates open expressions over total
+  and partial (`ObsBottom`) inputs up to configurable Kleene depth with
+  microsecond timeouts, shrinks falsifying inputs to minimal counterexamples,
+  and discharges explicit `obsEq`/`obsEqWith`/`obsEqGen` witnesses while keeping
+  built-in Core conversion sound and unchanged.
+  [`dependent-obs-eq` repository](https://github.com/TharkunAB/dependent-obs-eq)
+  and [Altenkirch, McBride, and Swierstra, *Observational Equality, Now!*](https://dl.acm.org/doi/10.1145/1292597.1292608).
+- **Hole-fit proof search ([`dependent-proof-search`](https://github.com/TharkunAB/dependent-proof-search)).**
+  `GHC.Tc.Errors.Hole` provides general dependent `foreach` (`DepFunTy`)
+  instantiation, refinement hole-fit checking at GHC's standard
+  `-frefinement-level-hole-fits` setting, and source-binder rendering without
+  hardcoding library combinators or proof search in the compiler. Standalone
+  [`dependent-proof-search`](https://github.com/TharkunAB/dependent-proof-search)
+  (`-fplugin=Dependent.Plugin.ProofSearch`) implements congruence/transitivity
+  subgoal refinements and bounded backward-chaining proof synthesis atop GHC's
+  `HoleFitPlugin` interface, pre-normalizing open family redexes and checking
+  every candidate through the constraint solver without mutating unification
+  state.
 
 ### Composing kind casts in nested GADT matches
 

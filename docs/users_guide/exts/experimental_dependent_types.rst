@@ -930,12 +930,14 @@ typed holes (see :ref:`typed-holes`) inspect local ``foreach`` runtime indices,
 local ``let`` and ``where`` bindings, and GADT equality Givens:
 
 - Valid hole fits instantiate polymorphic constructors (such as ``Refl``),
-  GADT constructors, and ``foreach`` lemmas at runtime term indices, including
-  bounded one-step local closure such as ``cong Succ (plusAssoc m n p)``.
-- Refinement hole fits default to level 1 (see
-  :ghc-flag:`-frefinement-level-hole-fits=⟨n⟩`) and split a goal into typed
-  subgoals through ``foreach`` functions and required-type-argument congruence
-  wrappers such as ``cong Succ (_ :: plus (plus m n) p :~: plus m (plus n p))``.
+  GADT constructors, and ``foreach`` lemmas at in-scope runtime term indices.
+- When refinement hole fits are enabled via
+  :ghc-flag:`-frefinement-level-hole-fits=⟨n⟩` (and
+  :ghc-flag:`-fabstract-refinement-hole-fits`), GHC splits a goal into typed
+  subgoals through ``foreach`` functions, GADT constructors, and visible
+  required-type-argument functions. Congruence/transitivity subgoal refinements
+  and bounded backward-chaining proof synthesis are provided externally through
+  GHC's ``HoleFitPlugin`` interface (such as ``dependent-proof-search``).
 - Point-free ``foreach`` holes (such as ``lengthRev = _``) match polymorphic and
   monomorphic ``foreach`` candidates even when inner type families reduce
   differently on each side.
