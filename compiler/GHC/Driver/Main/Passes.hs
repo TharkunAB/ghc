@@ -1904,10 +1904,9 @@ hscTidy hsc_env guts = do
   when native $
     end_pass alwaysQualify CoreDesugarOpt (mg_binds guts) (mg_rules guts)
 
-  -- See Note [Private dictionary programs].
-  let tidy_env | scoped = hscUpdateFlags (`gopt_set` Opt_OmitInterfacePragmas) hsc_env
-               | otherwise = hsc_env
-  opts <- initTidyOpts native tidy_env guts
+  -- See Note [Private dictionary programs] and
+  -- Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
+  opts <- initTidyOpts native scoped hsc_env guts
   (cgguts, details) <- withTiming logger
     (text "CoreTidy"<+>brackets (ppr this_mod))
     (const ())
