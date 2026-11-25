@@ -46,6 +46,7 @@ import GHC.Tc.Utils.Monad
   , getGblEnv, setEnvs
   )
 import GHC.Tc.Module ( runTcInteractive )
+import GHC.Tc.Gen.Totality ( reportModuleTotality )
 
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare( eqType )
@@ -228,6 +229,10 @@ deSugar hsc_env
         -- things into the in-scope set before simplifying; so we get no unfolding for F#!
 
         ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugar ds_binds ds_rules_for_imps
+
+        ; if gopt Opt_ReportTotality dflags && not (isHsBootOrSig hsc_src)
+            then reportModuleTotality hsc_env tcg_env
+            else return ()
 
         ; let pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
               home_unit     = hsc_home_unit hsc_env

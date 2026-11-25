@@ -1028,3 +1028,14 @@ test('NativeProposal378PatternsAndT2T',
       extra_files(['NativeProposal378PatternsAndT2TProvider.hs',
                    'NativeProposal378PatternsAndT2T.hs'])],
      run_command, ['bash NativeProposal378PatternsAndT2T.sh "{compiler}" "{libdir}"'])
+test('NativeHaskLibInterop',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['../../../../docs/dependent-haskell/check-hasklib.sh',
+                   '../../../../docs/dependent-haskell/hasklib',
+                   '../../../../docs/dependent-haskell/hasklib-test',
+                   '../../../../docs/dependent-haskell/examples/open-evaluation'])],
+     run_command, ['bash NativeHaskLibInterop.sh "{compiler}" "{libdir}"'])
+test('NativeTotalityReport',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeTotalityReport.hs'])],
+     run_command, ['bash NativeTotalityReport.sh "{compiler}" "{libdir}"'])

@@ -932,6 +932,7 @@ data GeneralFlag
    | Opt_WriteSourceEquations
    | Opt_ExplicitWriteSourceEquations
    | Opt_SuppressSourceEquations
+   | Opt_ReportTotality
    deriving (Eq, Show, Enum)
 
 -- | The set of flags which affect optimisation for the purposes of

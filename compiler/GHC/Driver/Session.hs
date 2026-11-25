@@ -2627,6 +2627,7 @@ fFlagsDeps = [
   flagSpec "write-interface"                  Opt_WriteInterface,
   flagSpec "write-if-simplified-core"         Opt_WriteIfSimplifiedCore,
   flagSpec "write-source-equations"           Opt_WriteSourceEquations,
+  flagSpec "report-totality"                  Opt_ReportTotality,
   flagSpec "write-if-self-recomp"             Opt_WriteSelfRecompInfo,
   flagSpec "write-if-self-recomp-flags"       Opt_WriteSelfRecompFlags,
   flagSpec "write-ide-info"                   Opt_WriteHie,

@@ -868,6 +868,7 @@ Library
         GHC.Tc.Gen.SourceClosure
         GHC.Tc.Gen.SourceTable
         GHC.Tc.Gen.Splice
+        GHC.Tc.Gen.Totality
         GHC.Tc.Instance.Class
         GHC.Tc.Instance.Family
         GHC.Tc.Instance.FunDeps
