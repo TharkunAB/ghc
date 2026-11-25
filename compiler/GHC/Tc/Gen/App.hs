@@ -4315,7 +4315,9 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
            ; case cts of
                 Indirect fun_ty' -> go plan fun_orig pos acc fun_ty' args
                 Flexi            -> go1 plan fun_orig pos acc fun_ty  args }
-     | isJust plan
+     | Just (_ : _) <- plan
+     = go1 plan fun_orig pos acc fun_ty args
+     | Just [] <- plan, pos == 1
      = go1 plan fun_orig pos acc fun_ty args
      | otherwise
      = do { matched <- tcRetainedResultInstWithCasts do_ql expected_rho args tc_fun fun_ty

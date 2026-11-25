@@ -2384,7 +2384,7 @@ main = do
         , Wave8.proxyDataTag
         , Wave8.useDataHeraldTag )
     observe "reassociate polymorphic nested domains and project HaskLib vectors"
-        ( Wave8.assocProdRoundTrip ((True, 'k'), 9 :: Int)
+        ( Wave8.assocProdRoundTrip ((True, 'k'), 2 :: Wave8.Peano)
         , Wave8.haskLibSecondLookup "hi" )
 
 -- | Complement one flag at the type level.

@@ -6,17 +6,18 @@ compiler and the current queue, use the [program roadmap](ROADMAP.md#where-this-
 The [implementation log](PLAN.md) gives the specifications for the numbered
 increments.
 
-## Waves 4B through 8: Proposal #378 quantifiers, typed holes, nested domains, HaskLib interop, and advisory totality
+## Waves 4B through 9A: Proposal #378 quantifiers, typed holes, nested domains, mutual large eliminations, dependent record updates, HaskLib interop, and advisory totality
 
-The consolidated Wave 4B through Wave 8D branch extends `ce90ccbe2e` to 639
+The consolidated Wave 4B through Wave 9A branch extends `ce90ccbe2e` to 639
 Showcase observations ([BookWave8Proposal378](examples/open-evaluation/BookWave8Proposal378.hs))
-and 75 registered dependent-Haskell tests (adding
+and 77 registered dependent-Haskell tests (adding
 `NativeProposal378Quantifiers`, `NativeBootSigmaExists`,
 `NativeAutoNumLiterals`, `NativeRetainedCastSourceCall`, `DependentHoleFits`,
 `NativeProposal378PatternsAndT2T`, `NativePolyNestedDomainOpenEq`,
 `NativeMultiParamMethodOpenEq`, `NativeHaskLibInterop`,
-`NativeTotalityReport`, `NativeRetainedScrutineePoly`, and
-`NativeDataHeraldInTypes`):
+`NativeTotalityReport`, `NativeRetainedScrutineePoly`,
+`NativeDataHeraldInTypes`, `NativeMutualLargeElimData`, and
+`NativeParamDependentRecordUpdate`):
 
 - **Proposal `#378` quantifiers, T2T lowering, and explicit `data` herald**:
   Supports `@arg` and `@pat` visibility overrides on `SpecifiedSpec` invisible
@@ -36,15 +37,18 @@ and 75 registered dependent-Haskell tests (adding
   fields, nominal domain casts on certified source-call Core operands
   (`R03_RetainedSourceCallGadtCastCoreLint`), and polymorphic `foreach`
   scrutinee inference (`NativeRetainedScrutineePoly`).
-- **Open evaluation, polymorphic nested domains, and class promotion**:
+- **Open evaluation, polymorphic nested domains, mutual large eliminations, dependent record updates, and class promotion**:
   Publishes open equations for named substitution-map helpers (`singleSubst`,
   `doubleSubst`), 1-index untyped De Bruijn substitution and sigma-combinators,
   `Type`-valued large eliminations with promoted algebraic `forall` binders,
-  spine-strict accumulator `(++)` proofs at default `-O2`
-  (`R13_ShuntAccumOpenEq`), certified ground `Num` type-level numerals without
-  `FromNatural`, polymorphic nested algebraic source domains
-  (`R13_PolyNestedDomainOpenEq`), and multi-parameter, superclass, and newtype
-  class method promotion (`NativeMultiParamMethodOpenEq`). Deferring arrow
+  mutually recursive datatypes and `Type`-valued large eliminations via staged
+  `CTF_Abstract` trial checking and `fixM` knot-tying (`R13_LargeElimMutualData`,
+  `NativeMutualLargeElimData`), parameterized single-constructor dependent record
+  updates (`NativeParamDependentRecordUpdate`), spine-strict accumulator `(++)`
+  proofs at default `-O2` (`R13_ShuntAccumOpenEq`), certified ground `Num`
+  type-level numerals without `FromNatural`, polymorphic nested algebraic source
+  domains (`R13_PolyNestedDomainOpenEq`), and multi-parameter, superclass, and
+  newtype class method promotion (`NativeMultiParamMethodOpenEq`). Deferring arrow
   matchability under rank-2 `HsForAllTy` binder kinds also resolves the
   upstream `MTrans` diagnostic in `deriving-via-compile` (`138/138` focused
   cohort tests).

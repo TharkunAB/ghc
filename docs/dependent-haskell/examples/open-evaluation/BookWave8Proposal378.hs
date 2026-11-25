@@ -29,14 +29,13 @@ import Control.Exception (ArithException (Underflow), throw)
 import Data.Kind (Type)
 import Data.Proxy (Proxy (Proxy))
 import Data.Type.Equality ((:~:) (Refl))
+import GHC.Exists
 import HaskLib
   ( Fin (FS, FZ)
   , Nat (Succ, Zero)
-  , Sigma (Pair)
   , Vec (VCons, VNil)
   , lookupVec
   , packListVec
-  , pattern Pack
   , second
   , toListVec
   )
@@ -159,5 +158,3 @@ haskLibSecondLookup xs =
       elems  = toListVec (second packed)
       sample = VCons 'p' (VCons 'q' (VCons 'r' VNil))
   in (elems, lookupVec (FS FZ) sample)
-  where
-    _keepPair = Pair Zero VNil

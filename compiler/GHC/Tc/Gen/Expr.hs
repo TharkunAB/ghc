@@ -1645,6 +1645,9 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
           | let matching = [l_nm | l_nm@(L _ nm) <- names, nm == target]
           , not (null matching)
           = Just (L s_loc (TypeSig x mods matching wc_ty))
+        narrow s@(L _ (XSig (IdSig ident)))
+          | idName ident == target
+          = Just s
         narrow _ = Nothing
 
     check_binding :: LHsBind GhcRn -> TcM (LHsExpr GhcTc) -> TcM (LHsExpr GhcTc)
