@@ -74,7 +74,7 @@ import GHC.Tc.Utils.TcType (isTyFamFree)
 import GHC.Types.Avail (availsToNameSet)
 import GHC.Types.Id
   ( Id, idCoreRules, idDetails, idName, isDataConWorkId_maybe, isDataConWrapId_maybe
-  , sourceTableId_maybe )
+  , setIdExported, sourceTableId_maybe )
 import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, SourceTableId, VanillaId))
 import GHC.Types.Basic (SourceTableOrigin(NominalSourceTable))
 import GHC.Types.Id.Make (DataConBangOpts(FixedBangOpts))
@@ -1772,7 +1772,7 @@ exportedInterfaceTypes exported type_env = concatMap entity_types (typeEnvElts t
 -- leaves helpers unexported.
 finalizeEarlyClosureTypes :: Maybe [CoreBind] -> NameSet -> TypeEnv -> TypeEnv
 finalizeEarlyClosureTypes mb_tidy exported type_env =
-    mapNameEnv update type_env
+    mapNameEnv (mark_nocode_helper . update) type_env
   where
     breakpoint Breakpoint{} = True
     breakpoint _ = False
@@ -1791,8 +1791,37 @@ finalizeEarlyClosureTypes mb_tidy exported type_env =
       , CheckedClosureSourceTableId owner table _ <- [idDetails v]
       , owner == idName v, isEarlyClosureTable table
       , tc <- table : companions_of v ]
+    iface_tycons = tyConsOfTypes (exportedInterfaceTypes exported type_env)
     exported_tycons =
       survivingEarlyExportedTyCons early_fams (exportedInterfaceTypes exported type_env)
+    root_tables =
+      [ table
+      | AnId v <- typeEnvElts type_env
+      , idName v `elemNameSet` exported
+      , Just table <- [sourceTableId_maybe v] ] ++
+      [ tc
+      | ATyCon tc <- typeEnvElts type_env
+      , tc `elementOfUniqSet` iface_tycons ]
+    close_callees seen [] = seen
+    close_callees seen (tc : rest)
+      | tyConName tc `elemNameSet` seen = close_callees seen rest
+      | otherwise =
+          let kids = fromMaybe [] (sourceTableCallees tc)
+          in close_callees (extendNameSetList seen [tyConName tc]) (kids ++ rest)
+    reachable_tables = close_callees (mkNameSet []) root_tables
+    closure_helper_ids = mkNameSet
+      [ h
+      | AnId v <- typeEnvElts type_env
+      , CheckedClosureSourceTableId owner table helpers <- [idDetails v]
+      , owner == idName v
+      , idName v `elemNameSet` exported || any (`elementOfUniqSet` exported_tycons) (table : companions_of v)
+      , h <- helpers ]
+    mark_nocode_helper (AnId v)
+      | isNothing mb_tidy
+      , idName v `elemNameSet` closure_helper_ids ||
+        maybe False ((`elemNameSet` reachable_tables) . tyConName) (sourceTableId_maybe v)
+      = AnId (setIdExported v)
+    mark_nocode_helper thing = thing
     update (AnId v)
       | CheckedClosureSourceTableId owner table helpers <- idDetails v
       , owner == idName v

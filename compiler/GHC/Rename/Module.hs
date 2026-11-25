@@ -2689,7 +2689,8 @@ producer checks the callee's identity and the decrease of each self call.
 -- | Allocate private names for signed function bindings with constructor rows.
 -- The producer checks the constructors and their coverage after typechecking.
 localSourceTableBinders :: [TyClGroup GhcPs] -> [LHsBindLR GhcRn GhcPs] -> [LSig GhcPs] -> RnM [(Name, Name)]
-localSourceTableBinders tycl_decls binds sigs =
+localSourceTableBinders tycl_decls binds sigs = do
+  strict <- xoptM LangExt.Strict
   mapM (\n -> (n,) <$> lookupOrig (nameModule n) (mkSourceTableOcc (nameOccName n)))
     [ n | L _ FunBind{fun_id = L _ n, fun_matches = MG{mg_alts = L _ rows}} <- binds
         , isExternalName n, nameOccName n `elemOccSet` signed
@@ -2699,6 +2700,9 @@ localSourceTableBinders tycl_decls binds sigs =
           right_structural_rows n rows ||
           all (mapping_row n) rows ||
           all pair_swap_row rows ||
+          (not strict && (all (poly_nested_row n) rows ||
+                          all (poly_right_nested_row n) rows ||
+                          producer_rows n rows)) ||
           closure_wrapper_rows n rows ||
           weakening_rows n rows ||
           subst_map_rows n rows ||
@@ -2897,6 +2901,97 @@ localSourceTableBinders tycl_decls binds sigs =
       | L _ (TypeSig _ [] [L _ n] wc) <- sigs
       , is_sigma_comb_sig (sig_body (unLoc (hswc_body wc))) ]
 
+    poly_nested_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
+      , is_poly_nested_sig (sig_body (unLoc (hswc_body wc))) ]
+
+    producer_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
+      , is_producer_sig (sig_body (unLoc (hswc_body wc))) ]
+
+    peel_plain_ps_foralls ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
+      HsForAllTy{hst_tele = HsForAllInvis{hsf_matchability = Nothing, hsf_invis_bndrs = bndrs}, hst_body = body}
+        | all plain_ps_bndr bndrs -> peel_plain_ps_foralls body
+      HsForAllTy{} -> Nothing
+      HsQualTy{} -> Nothing
+      _ -> Just (expand_ps_syn 4 ty)
+      where
+        plain_ps_bndr (L _ (HsTvb _ SpecifiedSpec (HsBndrVar _ _) kind)) =
+          case kind of
+            HsBndrNoKind{} -> True
+            HsBndrKind _ k -> case unLoc (ignoreParens k) of
+              HsStarTy{} -> True
+              HsTyVar _ NotPromoted (L _ r) -> occNameString (rdrNameOcc r) == "Type"
+              _ -> False
+        plain_ps_bndr _ = False
+
+    split_ps_std_arrows ty = case ps_std_arrow ty of
+      Just (dom, cod) -> do
+        (doms, res) <- split_ps_std_arrows cod
+        pure (dom : doms, res)
+      Nothing -> case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
+        HsFunTy{} -> Nothing
+        HsQualTy{} -> Nothing
+        HsForAllTy{} -> Nothing
+        HsForEachTy{} -> Nothing
+        _ -> Just ([], expand_ps_syn 4 ty)
+
+    is_ps_tyvar ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
+      HsTyVar _ NotPromoted (L _ r) -> isRdrTyVar r
+      _ -> False
+
+    is_ps_tycon r = isTcOcc (rdrNameOcc r) && not (isRdrTyVar r)
+
+    is_ps_poly_source_ty ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsTupleTy _ HsBoxedOrConstraintTuple elems -> all is_ps_poly_source_ty elems
+           HsListTy _ elem_ty -> is_ps_poly_source_ty elem_ty
+           _ | (L _ (HsTyVar _ NotPromoted (L _ hd)), args) <- split_ty_apps expanded
+             , '#' `notElem` occNameString (rdrNameOcc hd)
+             -> all is_ps_poly_source_ty args
+             | otherwise -> False
+
+    is_ps_con_headed_ty ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsTupleTy _ HsBoxedOrConstraintTuple _ -> True
+           HsListTy{} -> True
+           _ | (L _ (HsTyVar _ NotPromoted (L _ hd)), _) <- split_ty_apps expanded
+             -> is_ps_tycon hd && '#' `notElem` occNameString (rdrNameOcc hd)
+             | otherwise -> False
+
+    is_ps_nested_domain k dom res =
+      let expanded = expand_ps_syn 4 dom
+      in case unLoc (ignoreParens expanded) of
+           HsTupleTy _ HsBoxedOrConstraintTuple elems ->
+             length elems /= 2 || k >= 2 || any (not . is_ps_tyvar) elems || is_ps_tyvar res
+           HsListTy _ elem_ty -> not (is_ps_tyvar elem_ty)
+           _ | (L _ (HsTyVar _ NotPromoted (L _ hd)), args@(_ : _)) <- split_ty_apps expanded
+             , is_ps_tycon hd
+             -> k >= 2 || any (not . is_ps_tyvar) args
+             | (L _ (HsTyVar _ NotPromoted (L _ hd)), []) <- split_ty_apps expanded
+             , is_ps_tycon hd
+             -> k >= 2 || is_ps_con_headed_ty res
+             | otherwise -> False
+
+    is_poly_nested_sig raw_ty = isJust $ do
+      tau <- peel_plain_ps_foralls raw_ty
+      (doms@(first_dom : _), res) <- split_ps_std_arrows tau
+      guard (all is_ps_poly_source_ty (res : doms))
+      let k = length doms
+          right_ok = case doms of
+            [_, second_dom] -> is_ps_nested_domain k second_dom res
+            _ -> False
+      guard (is_ps_nested_domain k first_dom res || right_ok)
+
+    is_producer_sig raw_ty = isJust $ do
+      tau <- peel_plain_ps_foralls raw_ty
+      (doms@(_ : _), res) <- split_ps_std_arrows tau
+      guard (all is_ps_poly_source_ty (res : doms) && is_ps_con_headed_ty res)
+
     peel_ps_foralls ty = case unLoc (ignoreParens (expand_ps_syn 4 ty)) of
       HsForAllTy{hst_body = body} -> peel_ps_foralls body
       _ -> expand_ps_syn 4 ty
@@ -2988,6 +3083,86 @@ localSourceTableBinders tycl_decls binds sigs =
     local_sig_for _ _ = False
 
     signed = mkOccSet [ rdrNameOcc n | L _ (TypeSig _ [] [L _ n] _) <- sigs ]
+    local_fun_occs = mkOccSet [ nameOccName n | L _ FunBind{fun_id = L _ n} <- binds ]
+
+    poly_nested_row :: Name -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    poly_nested_row self (L _ Match{m_pats = L _ (pat : rest), m_grhss = rhss})
+      | nameOccName self `elemOccSet` poly_nested_signed
+      , Just subpats <- nested_con_fields (unparen pat)
+      , all nested_pat subpats
+      , Just carried <- traverse (callback_binder . unparen) rest
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      , let has_nested = any (isJust . nested_con_fields . unparen) subpats
+      = poly_rhs self (not has_nested) [] (collectPatsBinders CollNoDictBinders [pat]) carried rhs
+    poly_nested_row _ _ = False
+
+    poly_right_nested_row :: Name -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    poly_right_nested_row self (L _ Match{m_pats = L _ [left, right], m_grhss = rhss})
+      | nameOccName self `elemOccSet` poly_nested_signed
+      , Just carried <- callback_binder (unparen left)
+      , Just subpats <- nested_con_fields (unparen right)
+      , all nested_pat subpats
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      , let has_nested = any (isJust . nested_con_fields . unparen) subpats
+      = poly_rhs self (not has_nested) [carried] (collectPatsBinders CollNoDictBinders [right]) [] rhs
+    poly_right_nested_row _ _ = False
+
+    producer_rows :: Name -> [LMatch GhcPs (LHsExpr GhcPs)] -> Bool
+    producer_rows self [L _ Match{m_pats = L _ pats@(_ : _), m_grhss = rhss}]
+      | nameOccName self `elemOccSet` producer_signed
+      , Just vars <- traverse (callback_binder . unparen) pats
+      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
+      = is_con_headed_expr rhs && poly_rhs self False [] [] vars rhs
+    producer_rows _ _ = False
+
+    nested_con_fields :: Pat GhcPs -> Maybe [LPat GhcPs]
+    nested_con_fields (TuplePat _ fields Boxed)
+      | length fields /= 1 = Just fields
+    nested_con_fields p = constructor_fields p
+
+    nested_pat :: LPat GhcPs -> Bool
+    nested_pat p
+      | plain_field p = True
+      | Just subpats <- nested_con_fields (unparen p) = all nested_pat subpats
+      | otherwise = False
+
+    is_con_headed_expr :: LHsExpr GhcPs -> Bool
+    is_con_headed_expr expr = case unLoc (stripParensLHsExpr expr) of
+      ExplicitTuple _ tup_args Boxed -> length tup_args /= 1 && all tup_present tup_args
+      ExplicitList{} -> True
+      _ | (hd, _) <- collect_val_apps expr
+        , Just r <- variable_allow_type_app hd
+        -> isRdrDataCon r
+        | otherwise -> False
+      where
+        tup_present Present{} = True
+        tup_present _ = False
+
+    poly_rhs :: Name -> Bool -> [Maybe RdrName] -> [RdrName] -> [Maybe RdrName] -> LHsExpr GhcPs -> Bool
+    poly_rhs self allow_self leading fields trailing = check []
+      where
+        is_self = same_source_owner self
+        allowed_callee r =
+          let occ = rdrNameOcc r
+          in isVarOcc occ && not (isSymOcc occ) &&
+             (not (occ `elemOccSet` local_fun_occs) || occ `elemOccSet` signed)
+        check :: [LHsExpr GhcPs] -> LHsExpr GhcPs -> Bool
+        check args expr = case unLoc (stripParensLHsExpr expr) of
+          HsApp _ fun arg -> check (arg : args) fun
+          OpApp _ left op right -> check (left : right : args) op
+          ExplicitTuple _ tup_args Boxed ->
+            null args && length tup_args /= 1 &&
+            all (\case Present _ e -> check [] e; _ -> False) tup_args
+          ExplicitList _ items -> null args && all (check []) items
+          HsAppType _ fun _ -> check args fun
+          HsVar _ (L _ r)
+            | isRdrDataCon r -> all (check []) args
+            | r `elem` fields || Just r `elem` leading || Just r `elem` trailing -> null args
+            | allow_self, is_self r, Just operands <- traverse variable args
+            , (before, field : after) <- splitAt (length leading) operands
+            -> map Just before == leading && field `elem` fields && map Just after == trailing
+            | not (is_self r), not (null args), allowed_callee r -> all (check []) args
+          _ -> False
     constructor_row :: Name -> Bool -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
     constructor_row self structural (L _ Match{m_pats = L _ (pat : rest), m_grhss = rhss})
       | Just fields <- constructor_fields (unparen pat)
@@ -3088,6 +3263,9 @@ localSourceTableBinders tycl_decls binds sigs =
           HsEmbTy _ (HsWC _ ty) -> null args && check_emb_ty [] ty
           HsApp _ fun arg -> check (arg : args) fun
           OpApp _ left op right -> check (left : right : args) op
+          ExplicitTuple _ tup_args Boxed ->
+            null args && length tup_args /= 1 &&
+            all (\case Present _ e -> check [] e; _ -> False) tup_args
           ExplicitList _ items -> null args && all (check []) items
           HsAppType _ fun _ -> case unLoc (stripParensLHsExpr fun) of
                 HsAppType{} -> check args fun
@@ -3243,9 +3421,12 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
           [ uses | (defs, uses) <- fromOL dus
           , not (maybe False (nameSetAny (\d -> isJust (sourceTableTermOcc (nameOccName d))
                                              || d `elemNameSet` candidate_set)) defs) ]
-        ready = foldl' schedule emptyNameSet candidates
         schedule done (b, _, deps) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
                                    | otherwise = done
+        close_ready done =
+          let done' = foldl' schedule done candidates
+          in if isEmptyNameSet (done' `minusNameSet` done) then done else close_ready done'
+        ready = close_ready emptyNameSet
         t2t_indexed_seeds = case use of
           TableInType{} -> mkNameSet
             [ b | (b, _, _) <- candidates
@@ -3254,9 +3435,12 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
                 , Just (True, _) <- [lookupNameEnv signatures b] ]
           TableInTerm -> emptyNameSet
   , not (null wanted) || not (isEmptyNameSet t2t_indexed_seeds)
-  = let needed = foldr include (wanted_set `unionNameSet` t2t_indexed_seeds) candidates
-        include (b, _, deps) rest | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSet deps rest
+  = let include (b, _, deps) rest | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSet deps rest
                                   | otherwise = rest
+        close_needed acc =
+          let acc' = foldr include acc candidates
+          in if isEmptyNameSet (acc' `minusNameSet` acc) then acc else close_needed acc'
+        needed = close_needed (wanted_set `unionNameSet` t2t_indexed_seeds)
         early = [ (b, kinds) | (b, kinds, _) <- candidates
                              , b `elemNameSet` ready, b `elemNameSet` needed ]
         early_names = mkNameSet (map fst early)
@@ -3330,10 +3514,31 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
     -- Count only the written visible arguments. The typechecker verifies the
     -- arity of the synonym and each dependency before moving the declarations.
     type_dependencies :: LHsType GhcRn -> Maybe [(Name, Maybe Int)]
-    type_dependencies ty = do
-        (name, args) <- type_application ty
-        nested <- traverse type_dependencies args
-        pure ((name, Just (length args)) : concat nested)
+    type_dependencies ty = case unLoc (ignoreParens ty) of
+      HsTupleTy _ HsBoxedOrConstraintTuple elems ->
+        concat <$> traverse type_dependencies elems
+      _ | Just elem_ty <- list_element ty ->
+            type_dependencies elem_ty
+        | otherwise -> do
+            (name, args) <- type_application ty
+            nested <- traverse type_dependencies args
+            pure ((name, Just (length args)) : concat nested)
+
+    poly_sig_deps :: NameSet -> LHsType GhcRn -> Maybe [(Name, Maybe Int)]
+    poly_sig_deps bound ty = case unLoc (ignoreParens ty) of
+      HsTupleTy _ HsBoxedOrConstraintTuple elems ->
+        concat <$> traverse (poly_sig_deps bound) elems
+      _ | Just elem_ty <- list_element ty ->
+            poly_sig_deps bound elem_ty
+        | Just v <- parameter_name ty, v `elemNameSet` bound ->
+            Just []
+        | otherwise -> do
+            (name, args) <- type_application ty
+            case lookupNameEnv early_datatypes name of
+              Just (arity, _) -> guard (arity == length args)
+              Nothing -> pure ()
+            nested <- traverse (poly_sig_deps bound) args
+            pure ((name, Just (length args)) : concat nested)
 
     domain_dependencies :: HsOuterSigTyVarBndrs GhcRn -> LHsType GhcRn -> Maybe [(Name, Maybe Int)]
     domain_dependencies outer ty = case outer_vars outer of
@@ -3499,6 +3704,12 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       , mkNameSet params == mkNameSet new_params, mkNameSet vars == mkNameSet params
       = Just (maybe [] (\name -> [(name, Nothing)]) root)
       | TableInType{} <- use
+      , Just vars@(_ : _) <- retained_outer_vars outer
+      , Just (root, params) <- parameter_domain arg
+      , mkNameSet params == mkNameSet vars
+      , Just v <- parameter_name result, v `elem` vars
+      = Just (maybe [] (\name -> [(name, Nothing)]) root)
+      | TableInType{} <- use
       , Just (from, to) <- source_arrow arg
       , Just (domain, codomain) <- source_arrow result
       , Just vars <- outer_vars outer
@@ -3510,6 +3721,12 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       , map (\v -> if v == a then b else v) params == params'
       , mkNameSet vars == mkNameSet (b : params)
       = Just (maybe [] (\name -> [(name, Nothing)]) root)
+      | TableInType{} <- use
+      , Just vars <- outer_vars outer
+      , let (carried, output) = split_source_arrows result
+            bound = mkNameSet vars
+      , Just deps <- traverse (poly_sig_deps bound) (arg : carried ++ [output])
+      = Just (concat deps)
       | otherwise = (++) <$> domain_dependencies outer arg <*> result_dependencies outer result
 
     source_arrow :: LHsType GhcRn -> Maybe (LHsType GhcRn, LHsType GhcRn)
@@ -3718,22 +3935,23 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       HsStarTy{} -> True
       _ -> False
 
-    early_constructors t [] [con] [] | Just c <- retained_constructor t con = Just [c]
+    early_constructors t params [con] [] | Just c <- retained_constructor t params con = Just [c]
     early_constructors t [] cs _ = concat <$> traverse (prefix_con t) cs
-    early_constructors t params cs [] = do
+    early_constructors t params cs _ = do
       field_type <- independent_field_type t params
       traverse (parameterized_con field_type) cs
-    early_constructors _ _ _ _ = Nothing
 
     independent_field_type t params = do
       vars <- traverse regular_parameter params
       pure (field vars)
       where
-        field vars ty
-          | Just parameter <- parameter_name ty, parameter `elem` vars = True
-          | Just (root, args) <- type_application ty
-          = root == t && traverse parameter_name args == Just vars
-          | otherwise = False
+        field vars ty = case unLoc (ignoreParens ty) of
+          HsTupleTy _ HsBoxedOrConstraintTuple elems -> all (field vars) elems
+          _ | Just elem_ty <- list_element ty -> field vars elem_ty
+            | Just parameter <- parameter_name ty, parameter `elem` vars -> True
+            | Just (root, args) <- type_application ty ->
+                root == t && traverse parameter_name args == Just vars
+            | otherwise -> False
 
         regular_parameter
           (L _ (HsTvb _ HsBndrRequired{} (HsBndrVar _ (L _ name)) kind))
@@ -3746,28 +3964,69 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       | all (plain_constructor_field field_type) fields = Just c
     parameterized_con _ _ = Nothing
 
-    retained_constructor t (L _ ConDeclGADT
+    retained_outer_vars :: HsOuterSigTyVarBndrs GhcRn -> Maybe [Name]
+    retained_outer_vars (HsOuterImplicit names) = Just names
+    retained_outer_vars (HsOuterExplicit _ Nothing binders) =
+      retained_param_binders (const True) binders
+    retained_outer_vars _ = Nothing
+
+    retained_param_binders :: (flag -> Bool) -> [LHsTyVarBndr flag GhcRn] -> Maybe [Name]
+    retained_param_binders ok_flag = go []
+      where
+        go seen [] = Just (reverse seen)
+        go seen (L _ (HsTvb _ flag (HsBndrVar _ (L _ name)) kind) : rest)
+          | ok_flag flag
+          , retained_binder_kind seen kind
+          = go (name : seen) rest
+        go _ _ = Nothing
+
+    retained_binder_kind :: [Name] -> HsBndrKind GhcRn -> Bool
+    retained_binder_kind seen kind = case kind of
+      HsBndrNoKind{} -> True
+      HsBndrKind _ k -> retained_kind_expr seen k
+
+    retained_kind_expr :: [Name] -> LHsType GhcRn -> Bool
+    retained_kind_expr seen ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsFunTy _ (HsModifiedFunArr _ _ HsStandardArr{}) dom cod ->
+        retained_kind_expr seen dom && retained_kind_expr seen cod
+      HsAppTy _ fun arg ->
+        retained_kind_expr seen fun && retained_kind_expr seen arg
+      HsTyVar _ _ (L _ (WithUserRdr _ name)) ->
+        name `elem` seen || isDataConName name || isJust (type_name ty)
+      _ -> False
+
+    is_req_bndr :: HsBndrVis GhcRn -> Bool
+    is_req_bndr HsBndrRequired{} = True
+    is_req_bndr _ = False
+
+    retained_constructor t params (L _ ConDeclGADT
       { con_names = L _ c :| [], con_modifiers = [], con_telescope = []
-      , con_outer_bndrs = L _ (HsOuterImplicit []), con_g_args = PrefixConGADT _ []
+      , con_outer_bndrs = L _ outer, con_g_args = PrefixConGADT _ []
       , con_res_ty = sig })
-      | HsForEachTy _ [L _ (HsTvb _ () (HsBndrVar _ (L _ witness)) (HsBndrKind _ domain))] body
+      | Just param_vars <- retained_param_binders is_req_bndr params
+      , Just con_vars <- retained_outer_vars outer
+      , length con_vars == length param_vars
+      , HsForEachTy _ [L _ (HsTvb _ () (HsBndrVar _ (L _ witness)) (HsBndrKind _ domain))] body
           <- unLoc (ignoreParens sig)
-      , isJust (type_name domain)
+      , isJust (type_name domain) || maybe False (`elem` con_vars) (parameter_name domain)
       , HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) field result <- unLoc (ignoreParens body)
-      , retained_field_type witness field
-      , retained_payloads t witness result
+      , retained_field_type con_vars witness field
+      , retained_payloads t con_vars witness result
       = Just c
-    retained_constructor _ _ = Nothing
+    retained_constructor _ _ _ = Nothing
 
-    retained_payloads t witness ty
+    retained_payloads t con_vars witness ty
       | HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) field result <- unLoc (ignoreParens ty)
-      = retained_field_type witness field && retained_payloads t witness result
-      | otherwise = type_name ty == Just t
+      = retained_field_type con_vars witness field && retained_payloads t con_vars witness result
+      | Just (root, args) <- type_application ty
+      = root == t && traverse parameter_name args == Just con_vars
+      | otherwise = False
 
-    retained_field_type witness ty = case unLoc (ignoreParens ty) of
-      HsAppTy _ fun arg -> retained_field_type witness fun && retained_field_type witness arg
+    retained_field_type con_vars witness ty = case unLoc (ignoreParens ty) of
+      HsAppTy _ fun arg -> retained_field_type con_vars witness fun && retained_field_type con_vars witness arg
       HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) ->
-        name == witness || isJust (type_name ty)
+        name == witness || name `elem` con_vars || isJust (type_name ty)
       _ -> False
 
     -- See Note [Ordinary constructors in GADT syntax] in GHC.Tc.Gen.SourceTable.
