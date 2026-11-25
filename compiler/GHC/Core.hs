@@ -2671,10 +2671,13 @@ exprToNativeIndex expr = snd <$> normaliseNativeIndexExpr expr
 -- See Note [Source calls in retained arguments].
 nativeSourceCallIndex :: CoreExpr -> Maybe Type
 nativeSourceCallIndex expr
-  | (Var fun, _ : _) <- collectArgs expr
+  | (Var fun, _ : _) <- collectArgs (strip_casts expr)
   , Just _ <- sourceTableId_maybe fun
   = snd <$> computedIndexExpr expr
   | otherwise = Nothing
+  where
+    strip_casts (Cast body _) = strip_casts body
+    strip_casts body = body
 
 -- | Compute a checked source call, retained constructor tree, or lexical call index.
 -- See Note [Source calls in retained arguments].
@@ -2688,6 +2691,7 @@ nativeComputedIndex expr
   | otherwise = Nothing
   where
     has_computation (Tick HpcTick{} _) = True
+    has_computation (Cast body _) = has_computation body
     has_computation expr = case collectArgs expr of
       (Var fun, args@(_ : _)) ->
         isJust (sourceTableId_maybe fun) || any has_computation args
@@ -2707,13 +2711,20 @@ nativeDeferredArgIndex e
   , Just index <- nativeSourceFunctionArgIndex e = Just index
   | otherwise = nativeClassSelectorIndex e
 
--- | Reuse structural constructor checks without enabling beta or cast conversion.
+-- | Reuse structural constructor checks with checked nominal casts, without beta conversion.
 computedIndexExpr :: CoreExpr -> Maybe (CoreExpr, Type)
 computedIndexExpr = nativeIndexExprWith False extra
   where
     extra (Tick tick@HpcTick{} body) = do
       (body', index) <- computedIndexExpr body
       return (Tick tick body', index)
+    extra (Cast body co)
+      | Just delta <- nativeIndexCastCo_maybe co
+      , coercionRole delta == Nominal
+      , Just (source, _) <- nativeIndexCastDomains delta
+      = do { (body', index) <- computedIndexExpr body
+           ; guard (sameNativeIndexDomain source (typeKind index))
+           ; return (Cast body' (SubCo delta), mkCastTy index delta) }
     extra expr
       | (Var fun, args@(_:_)) <- collectArgs expr
       , Just family <- sourceTableId_maybe fun
@@ -2810,13 +2821,15 @@ The original Core expression keeps the same erased arguments for lowering.
 
 An operand is a local variable, a saturated certified source call, or a
 saturated ordinary constructor whose fields are themselves operands. Check
-every call's actual Id, arity and domains. Keep beta and cast conversions
-disabled in this recursive grammar. The root can be a constructor over a
-call. Coverage ticks can also wrap a checked operand. They do not change its
-index. Keep their runtime placement. Require a source call or coverage tick
-so the structural normalizer keeps its own policy and precedence. CorePrep
-substitutes variables in the checked tree without evaluating or duplicating
-a field.
+every call's actual Id, arity and domains. Keep beta conversion disabled in
+this recursive grammar. A checked nominal domain cast can wrap an operand or
+the call result; recover its nominal proof with nativeIndexCastCo_maybe and
+build the casted index with mkCastTy. See Note [Nominal native index casts].
+The root can be a constructor over a call. Coverage ticks can also wrap a
+checked operand. They do not change its index. Keep their runtime placement.
+Require a source call or coverage tick so the structural normalizer keeps its
+own policy and precedence. CorePrep substitutes variables and casts in the
+checked tree without evaluating or duplicating a field.
 
 For proof (f x), the function f can be lexical. The case index reader can
 identify the same call without inspecting the function. Require a unary

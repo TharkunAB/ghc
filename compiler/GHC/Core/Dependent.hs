@@ -25,7 +25,7 @@ import GHC.Core
 import GHC.Core.FVs (orphNamesOfExprs)
 import GHC.Core.Class (classOpItems)
 import GHC.Core.Predicate (getClassPredTys_maybe)
-import GHC.Core.Type (coreFullView, isNativeIndexType, isNativeIndexFunctionId
+import GHC.Core.Type (coreFullView, isNativeRetainedBinderType, isNativeIndexFunctionId
                      , isNativeNamedOpaqueFunctionId
                      , isNativeClassDictionaryId, isNativeOpaqueValueId
                      , isNativeRetainedBinder, isNativeIndexDomainConversion
@@ -558,8 +558,8 @@ The domain proof of a DepFunCo is nominal even if the complete coercion
 is representational. The result type uses the backward nominal conversion.
 See Note [Retained dependent function coercions] in GHC.Core.TyCo.Rep.
 Do not admit a representational-only domain proof or change its role.
-Check each endpoint against the structural or fixed-function index
-contract. Check the original proof and scoped body separately.
+Check each endpoint against the retained binder contract. Check the
+original proof and scoped body separately.
 -}
 
 -- | Inspect coercion annotations and dependencies.
@@ -572,7 +572,7 @@ scanCo (DepFunCo _ _ b domain body) =
         unsupportedShape (not (coercionRole delta == Nominal
                             && coercionLKind delta `eqType` varType b
                             && isNativeIndexDomainConversion (varType b) target
-                            && (isNativeIndexType target || isNativeIndexFunctionId b)))
+                            && isNativeRetainedBinderType target))
           <> scanCo delta
       where
         target = coercionRKind delta
