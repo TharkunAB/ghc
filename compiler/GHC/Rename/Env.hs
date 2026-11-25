@@ -76,8 +76,9 @@ import GHC.Parser.PostProcess ( setRdrNameSpace )
 import GHC.Rename.Unbound
 import GHC.Rename.Utils
 
+import GHC.Builtin.KnownOccs ( composeIdOcc )
 import GHC.Builtin.WiredIn.Types
-import GHC.Builtin.Modules( rOOT_MAIN )
+import GHC.Builtin.Modules( gHC_INTERNAL_BASE, rOOT_MAIN )
 import GHC.Builtin( knownKeyOccMap )
 
 import GHC.Unit.Module
@@ -85,7 +86,10 @@ import GHC.Unit.Module.ModIface
 
 import GHC.Core.ConLike
 import GHC.Core.DataCon
+import GHC.Core.TyCo.Compare ( eqType )
+import GHC.Core.TyCo.Rep ( Type(..), FunTyFlag(FTF_T_T), DepFunTyFlag(DepFunVisible) )
 import GHC.Core.TyCon
+import GHC.Core.Type ( binderVars, coreFullView, getTyVar_maybe, isManyTy, mkTyVarTy, splitForAllInvisTyBinders, tcIsLiftedTypeKind, tyVarKind, varType )
 
 import GHC.Driver.Env
 import GHC.Driver.Session
@@ -1347,9 +1351,12 @@ lookupSourceTables :: Bool -> (GlobalRdrEnv, LocalRdrEnv) -> RdrName
                       -> RnM [(GlobalRdrElt, Maybe Name)]
 lookupSourceTables legacy_identity (gbl, lcl) term_rdr
   | isJust (lookupLocalRdrEnv lcl term_rdr) = return []
-  | otherwise = mapM candidate $
-      lookupGRE gbl (LookupRdrName term_rdr (RelevantGREsFOS WantNormal))
+  | otherwise = mapM candidate gres
   where
+    normal_gres = lookupGRE gbl (LookupRdrName term_rdr (RelevantGREsFOS WantNormal))
+    gres
+      | null normal_gres = lookupGRE gbl (LookupRdrName term_rdr (RelevantGREsFOS WantBoth))
+      | otherwise        = normal_gres
     candidate gre = (gre,) <$> table (greName gre)
 
     table term
@@ -1378,10 +1385,50 @@ lookupSourceTables legacy_identity (gbl, lcl) term_rdr
                     AnId v | legacy_identity && isFinalCoreIdentity v -> Nothing
                            | isJust (indexedProjectionSource v) -> Nothing
                     _ -> Just name
-                else do
-                  updTcRef (tcg_source_table_uses env) (`extendNameSet` name)
-                  return Nothing
+                else if term_occ == composeIdOcc && tcg_semantic_mod env /= gHC_INTERNAL_BASE
+                  then do
+                    thing <- tcLookupGlobal term
+                    case thing of
+                      AnId v | is_dep_compose_type (varType v) -> do
+                        base_term <- lookupOrig gHC_INTERNAL_BASE composeIdOcc
+                        base_iface <- loadInterfaceForName (text "dependent composition") base_term
+                        let base_occ = mkSourceTableOcc composeIdOcc
+                        if isJust (mi_hash_fn base_iface base_occ)
+                          then Just <$> lookupOrig gHC_INTERNAL_BASE base_occ
+                          else return Nothing
+                      _ -> do
+                        updTcRef (tcg_source_table_uses env) (`extendNameSet` name)
+                        return Nothing
+                  else do
+                    updTcRef (tcg_source_table_uses env) (`extendNameSet` name)
+                    return Nothing
       | otherwise = return Nothing
+
+    is_dep_compose_type sigma
+      | let (bndrs, tau) = splitForAllInvisTyBinders sigma
+            tvs = binderVars (map snd bndrs)
+      , length tvs `elem` [3, 4]
+      , FunTy FTF_T_T ma1 mult1 arg1 rest1 <- coreFullView tau
+      , ma1 `eqType` unmatchableDataConTy, isManyTy mult1
+      , DepFunTy DepFunVisible y_id (AppTy c_head1 (TermVarTy y_occ)) <- coreFullView arg1
+      , y_occ == y_id
+      , Just b_tv <- getTyVar_maybe (varType y_id), b_tv `elem` tvs
+      , tcIsLiftedTypeKind (tyVarKind b_tv)
+      , Just c_tv <- getTyVar_maybe c_head1, c_tv `elem` tvs
+      , DepFunTy DepFunVisible f_id rest2 <- coreFullView rest1
+      , FunTy FTF_T_T ma_f mult_f a_ty b_ty' <- coreFullView (varType f_id)
+      , ma_f `eqType` unmatchableDataConTy, isManyTy mult_f
+      , b_ty' `eqType` mkTyVarTy b_tv
+      , Just a_tv <- getTyVar_maybe a_ty, a_tv `elem` tvs
+      , tcIsLiftedTypeKind (tyVarKind a_tv)
+      , a_tv /= b_tv, a_tv /= c_tv, b_tv /= c_tv
+      , DepFunTy DepFunVisible x_id (AppTy c_head2 (TermAppTy f_occ (TermVarTy x_occ))) <- coreFullView rest2
+      , varType x_id `eqType` a_ty
+      , getTyVar_maybe c_head2 == Just c_tv
+      , f_occ == f_id, x_occ == x_id
+      = True
+      | otherwise
+      = False
 
 {- Note [Names of finite source functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

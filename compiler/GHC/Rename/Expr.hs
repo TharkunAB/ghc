@@ -388,7 +388,7 @@ rnExpr (HsAppType _ fun arg)
   = do { type_app <- xoptM LangExt.TypeApplications
        ; unless type_app $ addErr $ typeAppErr TypeLevel $ hswc_body arg
        ; (fun',fvFun) <- rnLExpr fun
-       ; (arg', original, fvArg) <- rnHsTypeApp arg
+       ; (arg', original, fvArg) <- rnHsTypeAppOrQuote arg
        ; return (HsAppType original fun' arg', fvFun `plusFN` fvArg) }
 
 rnExpr (HsAppRetained _ fun arg)
@@ -616,7 +616,7 @@ rnExpr (ArithSeq _ _ seq)
             return (ArithSeq noExtField Nothing new_seq, fvs) }
 
 rnExpr (HsEmbTy tok ty)
-  = do { (ty', _, fvs) <- rnHsTypeApp ty
+  = do { (ty', _, fvs) <- rnHsTypeAppOrQuote ty
        ; if tok == noAnn
            then checkTypeSyntaxExtension ForallTelescopeSyntax
            else checkTypeSyntaxExtension TypeKeywordSyntax
@@ -3107,3 +3107,34 @@ rnHsUpdProjs us = do
                        , hfbLHS = fmap rnFieldLabelStrings fs
                        , hfbRHS = arg
                        , hfbPun = pun }), fv ) }
+
+-- | Rename a visible or @type@-embedded type argument, falling back to
+-- 'HsTypeLambdaQuoteRn' for inline type lambdas @\@(\y -> body)@ that mention
+-- source equations or runtime indices when lifting to a top-level family fails.
+rnHsTypeAppOrQuote :: LHsWcType GhcPs
+                   -> RnM (LHsWcType GhcRn, Maybe HsAppTypeSource, FreeNames)
+rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
+  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  level <- getThLevel
+  case (experimental, level, peel_type_lambda hs_ty) of
+    (True, Comp, Just (lam_loc, binders, body)) -> do
+          (mb_ok, msgs) <- tryTc (rnHsTypeApp arg)
+          case mb_ok of
+            Just res | not (errorsFound msgs) -> do
+              addMessages msgs
+              return res
+            _ -> do
+              checkDupRdrNames binders
+              binders' <- traverse (\b -> L (getLoc b) <$> newLocalBndrRn b) binders
+              (HsWC _ body', fvs) <-
+                bindLocalNamesFV (map unLoc binders') $ do
+                  (wc, _, fv) <- rnHsTypeApp (HsWC noExtField body)
+                  return (wc, fv)
+              let quoted = L lam_loc (XHsType (HsTypeLambdaQuoteRn binders' body'))
+              return (HsWC [] quoted, Nothing, fvs)
+    _ -> rnHsTypeApp arg
+  where
+    peel_type_lambda :: LHsType GhcPs -> Maybe (SrcSpanAnnA, [LocatedN RdrName], LHsType GhcPs)
+    peel_type_lambda (L _ (HsParTy _ inner)) = peel_type_lambda inner
+    peel_type_lambda (L l (XHsType (HsTypeLambda _ bndrs rhs))) = Just (l, bndrs, rhs)
+    peel_type_lambda _ = Nothing
