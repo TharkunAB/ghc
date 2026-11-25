@@ -79,6 +79,7 @@ import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Unique.Supply
 import GHC.Types.Unique
+import GHC.Types.Unique.DSet ( isEmptyUniqDSet, uniqDSetToList )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 
@@ -745,14 +746,103 @@ checkValidSubst subst@(Subst in_scope ids tenv cenv) tys cos a
   tysCosFVsInScope = needInScope `varSetInScope` in_scope
 
 
+{- Note [Fast empty substitution check for runtime indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Ordinary types ignore 'IdSubstEnv'. When 'TvSubstEnv' and 'CvSubstEnv' are
+empty, 'substTyVar' and 'substCoVar' return free type and coercion variables
+unchanged without inspecting their kinds. By 'Note [The substitution invariant]',
+any in-scope type or coercion variable whose kind changed at its binder is
+already in 'TvSubstEnv' or 'CvSubstEnv'.
+
+Therefore, when 'isEmptyTCvSubst' holds, 'subst_ty' and 'subst_co' can change a
+type or coercion only if that syntax tree, a binder annotation inside it, or a
+coercion hole inside it contains a local runtime 'Id'. Checking that condition
+directly avoids allocating 'FV' closures, 'VarSet's, and deep kind traversals on
+free 'TyVar' and 'CoVar' occurrences. Using 'isEmptyTypeSubst' in
+'substTyVarBndrUsing' and 'substCoVarBndrUsing' also keeps 'TvSubstEnv' and
+'CvSubstEnv' empty across poly-kinded binders when only 'IdSubstEnv' is active.
+-}
+
 -- | Test whether a substitution leaves the given types and coercions unchanged.
--- Ordinary types still ignore expression substitutions. Runtime indices cannot.
+-- Ordinary types ignore expression substitutions; runtime indices use them.
+-- See Note [Fast empty substitution check for runtime indices].
 isEmptyTypeSubst :: Subst -> [Type] -> [Coercion] -> Bool
 isEmptyTypeSubst subst@(Subst _ ids _ _) tys cos
   = isEmptyTCvSubst subst
     && (isEmptyVarEnv ids
-        || not (any (anyFreeVarsOfType isNonCoVarId) tys
-                || any (anyFreeVarsOfCo isNonCoVarId) cos))
+        || not (hasRuntimeIdTys tys || hasRuntimeIdCos cos))
+
+isEmptyScaledTypeSubst :: Subst -> [Scaled Type] -> Bool
+isEmptyScaledTypeSubst subst@(Subst _ ids _ _) scaled_tys
+  = isEmptyTCvSubst subst
+    && (isEmptyVarEnv ids || not (go scaled_tys))
+  where
+    go [] = False
+    go (Scaled m t : rest) = hasRuntimeIdTy m || hasRuntimeIdTy t || go rest
+
+hasRuntimeIdTys :: [Type] -> Bool
+hasRuntimeIdTys []       = False
+hasRuntimeIdTys (t : ts) = hasRuntimeIdTy t || hasRuntimeIdTys ts
+
+hasRuntimeIdCos :: [Coercion] -> Bool
+hasRuntimeIdCos []       = False
+hasRuntimeIdCos (c : cs) = hasRuntimeIdCo c || hasRuntimeIdCos cs
+
+hasRuntimeIdTy :: Type -> Bool
+hasRuntimeIdTy (TyVarTy _)               = False
+hasRuntimeIdTy (LitTy _)                 = False
+hasRuntimeIdTy (TermVarTy v)             = not (isGlobalId v)
+hasRuntimeIdTy (TermAppTy f arg)         = not (isGlobalId f) || hasRuntimeIdTy arg
+hasRuntimeIdTy (DepFunTy {})             = True
+hasRuntimeIdTy (DepDictTy {})            = True
+hasRuntimeIdTy (ClassAppTy {})           = True
+hasRuntimeIdTy (ExistsTy _ b body)       = hasRuntimeIdTy (varType b) || hasRuntimeIdTy body
+hasRuntimeIdTy (AppTy t1 t2)             = hasRuntimeIdTy t1 || hasRuntimeIdTy t2
+hasRuntimeIdTy (TyConApp _ tys)          = hasRuntimeIdTys tys
+hasRuntimeIdTy (FunTy _ ma w arg res)    = hasRuntimeIdTy ma || hasRuntimeIdTy w
+                                           || hasRuntimeIdTy arg || hasRuntimeIdTy res
+hasRuntimeIdTy (ForAllTy ma (Bndr v _) body)
+                                         = hasRuntimeIdTy ma || hasRuntimeIdTy (varType v)
+                                           || hasRuntimeIdTy body
+hasRuntimeIdTy (CastTy ty co)            = hasRuntimeIdTy ty || hasRuntimeIdCo co
+hasRuntimeIdTy (CoercionTy co)           = hasRuntimeIdCo co
+
+hasRuntimeIdMCo :: MCoercion -> Bool
+hasRuntimeIdMCo MRefl    = False
+hasRuntimeIdMCo (MCo co) = hasRuntimeIdCo co
+
+hasRuntimeIdDeps :: UnivCoDeps -> Bool
+hasRuntimeIdDeps NoUnivCoDeps = False
+hasRuntimeIdDeps (UnivCoDeps { ucd_holes = holes })
+  | isEmptyUniqDSet holes = False
+  | otherwise = any (hasRuntimeIdTy . varType . coHoleCoVar) (uniqDSetToList holes)
+
+hasRuntimeIdCo :: Coercion -> Bool
+hasRuntimeIdCo (Refl ty)                 = hasRuntimeIdTy ty
+hasRuntimeIdCo (GRefl _ ty mco)          = hasRuntimeIdTy ty || hasRuntimeIdMCo mco
+hasRuntimeIdCo (TyConAppCo _ _ cos)      = hasRuntimeIdCos cos
+hasRuntimeIdCo (AppCo c1 c2)             = hasRuntimeIdCo c1 || hasRuntimeIdCo c2
+hasRuntimeIdCo (TermAppCo f co)          = not (isGlobalId f) || hasRuntimeIdCo co
+hasRuntimeIdCo (DepFunCo {})             = True
+hasRuntimeIdCo (ForAllCo { fco_tcv = tcv, fco_ma = ma, fco_kind = kind_co, fco_body = co })
+                                         = hasRuntimeIdCo ma || hasRuntimeIdMCo kind_co
+                                           || hasRuntimeIdTy (varType tcv) || hasRuntimeIdCo co
+hasRuntimeIdCo (FunCo { fco_ma = cm, fco_mult = cw, fco_arg = c1, fco_res = c2 })
+                                         = hasRuntimeIdCo cm || hasRuntimeIdCo cw
+                                           || hasRuntimeIdCo c1 || hasRuntimeIdCo c2
+hasRuntimeIdCo (CoVarCo _)               = False
+hasRuntimeIdCo (HoleCo h)                = hasRuntimeIdTy (varType (coHoleCoVar h))
+hasRuntimeIdCo (AxiomCo _ cos)           = hasRuntimeIdCos cos
+hasRuntimeIdCo (UnivCo { uco_lty = t1, uco_rty = t2, uco_deps = deps })
+                                         = hasRuntimeIdTy t1 || hasRuntimeIdTy t2
+                                           || hasRuntimeIdDeps deps
+hasRuntimeIdCo (SymCo co)                = hasRuntimeIdCo co
+hasRuntimeIdCo (TransCo c1 c2)           = hasRuntimeIdCo c1 || hasRuntimeIdCo c2
+hasRuntimeIdCo (SelCo _ co)              = hasRuntimeIdCo co
+hasRuntimeIdCo (LRCo _ co)               = hasRuntimeIdCo co
+hasRuntimeIdCo (InstCo c1 c2)            = hasRuntimeIdCo c1 || hasRuntimeIdCo c2
+hasRuntimeIdCo (KindCo co)               = hasRuntimeIdCo co
+hasRuntimeIdCo (SubCo co)                = hasRuntimeIdCo co
 
 -- | Substitute within a 'Type'. The substitution must satisfy
 -- Note [The substitution invariant].
@@ -788,7 +878,7 @@ substTys subst tys
 
 substScaledTys :: HasDebugCallStack => Subst -> [Scaled Type] -> [Scaled Type]
 substScaledTys subst scaled_tys
-  | isEmptyTypeSubst subst (map scaledMult scaled_tys ++ map scaledThing scaled_tys) [] = scaled_tys
+  | isEmptyScaledTypeSubst subst scaled_tys = scaled_tys
   | otherwise = checkValidSubst subst (map scaledMult scaled_tys ++ map scaledThing scaled_tys) [] $
                 map (mapScaledType (subst_ty subst)) scaled_tys
 
@@ -804,7 +894,7 @@ substTysUnchecked subst tys
 
 substScaledTysUnchecked :: Subst -> [Scaled Type] -> [Scaled Type]
 substScaledTysUnchecked subst tys
-                 | isEmptyTypeSubst subst (map scaledMult tys ++ map scaledThing tys) [] = tys
+                 | isEmptyScaledTypeSubst subst tys = tys
                  | otherwise             = map (mapScaledType (subst_ty subst)) tys
 
 -- | Substitute within a 'ThetaType'
@@ -918,7 +1008,8 @@ substNativeIndexBndrUsing
 substNativeIndexBndrUsing subst_ty subst@(Subst in_scope ids tvs cvs) old
   = (Subst (extendInScopeSet in_scope new) ids' tvs cvs, new)
   where
-    old' | noFreeVarsOfType (varType old), noFreeVarsOfType (idMult old) = old
+    old' | isEmptyTypeSubst subst [varType old, idMult old] [] = old
+         | noFreeVarsOfType (varType old), noFreeVarsOfType (idMult old) = old
          | otherwise = updateIdTypeAndMult (subst_ty subst) old
     new = uniqAway in_scope old'
     ids' | new == old = delVarEnv ids old
@@ -1064,8 +1155,9 @@ substTyVarBndrUsing subst_fn subst@(Subst in_scope idenv tenv cenv) old_var
     -- Assertion check that we are not capturing something in the substitution
 
     old_ki = tyVarKind old_var
-    no_kind_change = isEmptySubst subst || noFreeVarsOfType old_ki
-                     -- See Note [Keeping the substitution empty].
+    no_kind_change = isEmptyTypeSubst subst [old_ki] [] || noFreeVarsOfType old_ki
+                     -- See Note [Keeping the substitution empty]
+                     -- and Note [Fast empty substitution check for runtime indices].
     no_change = no_kind_change && (new_var == old_var)
         -- no_change means that the new_var is identical in
         -- all respects to the old_var (same unique, same kind)
@@ -1093,8 +1185,9 @@ substCoVarBndrUsing subst_fn subst@(Subst in_scope idenv tenv cenv) old_var
     (Subst (in_scope `extendInScopeSet` new_var) idenv tenv new_cenv, new_var)
   where
     new_co         = mkCoVarCo new_var
-    no_kind_change = isEmptySubst subst || noFreeVarsOfTypes [t1, t2]
-                     -- See Note [Keeping the substitution empty].
+    no_kind_change = isEmptyTypeSubst subst [t1, t2] [] || noFreeVarsOfTypes [t1, t2]
+                     -- See Note [Keeping the substitution empty]
+                     -- and Note [Fast empty substitution check for runtime indices].
     no_change      = new_var == old_var && no_kind_change
 
     new_cenv | no_change = delVarEnv cenv old_var
