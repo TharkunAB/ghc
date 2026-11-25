@@ -465,17 +465,19 @@ tidyProgram opts (ModGuts { mg_module           = mod
                (ppr bndr)
         _ -> pure ()
     let heads = mkNameEnv [(idName b, b) | b <- bindersOfBinds trimmed_binds]
-    forM_ trimmed_rules $ \ rule -> unless (isAutoRule rule) $ do
-      checked <- case lookupNameEnv heads (ru_fn rule) of
-        Just fun -> pure (Just (fun, supportsLocalUserRule fun rule))
-        Nothing -> opt_check_imported_rule opts rule
-      let refers_to_marked = mentionsRetainedUserRule mentions_marked rule
-      when (refers_to_marked ||
-            ((maybe False (hasRetainedRuleHead . fst) checked || hasNativeDependentProgram [] [rule])
-             && not (maybe False snd checked))) $
-        throwGhcExceptionIO $ PprProgramError
-          "Cannot export a rewrite rule that contains retained Core."
-          (ppr rule)
+    forM_ trimmed_rules $ \case
+      rule@(Rule { ru_fn = fn }) | not (isAutoRule rule) -> do
+        checked <- case lookupNameEnv heads fn of
+          Just fun -> pure (Just (fun, supportsLocalUserRule fun rule))
+          Nothing -> opt_check_imported_rule opts rule
+        let refers_to_marked = mentionsRetainedUserRule mentions_marked rule
+        when (refers_to_marked ||
+              ((maybe False (hasRetainedRuleHead . fst) checked || hasNativeDependentProgram [] [rule])
+               && not (maybe False snd checked))) $
+          throwGhcExceptionIO $ PprProgramError
+            "Cannot export a rewrite rule that contains retained Core."
+            (ppr rule)
+      _ -> pure ()
 
   local_index_binds <- localiseNativeTopIndices (opt_name_cache opts) trimmed_binds
   (tidy_env, tidy_binds) <- tidyTopBinds unfold_env boot_exports tidy_occ_env local_index_binds
@@ -1235,10 +1237,11 @@ findExternalRules opts mod binds imp_id_rules unfold_env mentions_marked
       , mentionsRetainedUserRule mentions_marked rule
       = False
       | opt_has_retained_core opts
+      , Rule { ru_origin = origin, ru_fn = fn } <- rule
       , isAutoRule rule
       , hasNativeDependentProgram [] [rule]
-      = ru_origin rule == mod
-        && maybe False (`canShareRetainedSpecRule` rule) (lookupNameEnv heads (ru_fn rule))
+      = origin == mod
+        && maybe False (`canShareRetainedSpecRule` rule) (lookupNameEnv heads fn)
       | otherwise = True
     heads = mkNameEnv [(idName id, id) | id <- bindersOfBinds binds]
 
@@ -1446,6 +1449,7 @@ localiseNativeTopIndices name_cache binds = mapM localise_bind binds
       , args `lengthIs` tyConArity family
       = mkApps (Var (globaliseId owner)) (map protect_operand args)
     protect_operand (App fun arg) = App (protect_operand fun) (protect_operand arg)
+    protect_operand (Cast body co) = Cast (protect_operand body) co
     protect_operand (Tick tick body) = Tick tick (protect_operand body)
     protect_operand expr = expr
 
