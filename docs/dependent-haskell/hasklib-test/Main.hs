@@ -1,8 +1,9 @@
 module Main where
 
 import Control.Exception (ErrorCall(..), evaluate, try)
-import Client (addUnder, checkAppendSingleton, checkFoldrAndMatchability, checkNat, checkReverse, checkZipMap, mapLaw, zipLaw)
+import Client (addUnder, checkAppendSingleton, checkFoldrAndMatchability, checkNat, checkPublicSurface, checkReverse, checkZipMap, mapLaw, zipLaw)
 import HaskLib
+import OrdinaryInteropClient (checkOrdinaryInterop)
 
 -- | Use the installed list proofs from an ordinary Haskell function.
 check :: (Bool -> Bool) -> (Bool -> Bool -> Bool) -> [Bool] -> [Bool] -> Bool
@@ -26,7 +27,10 @@ main = do
         element = error "forced an append element"
         tailList = error "forced the list beyond the bound"
         tailBound = error "forced the bound beyond the list"
-    if check not bad [True, False] [False]
+    interopOk <- checkOrdinaryInterop
+    if interopOk
+        && checkPublicSurface
+        && check not bad [True, False] [False]
         && check not bad [] (error "forced right list")
         && (case addUnder Zero (Succ Zero) Zero of Refl -> True)
         && checkAppendSingleton [] element

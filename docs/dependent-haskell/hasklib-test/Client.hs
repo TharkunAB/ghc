@@ -1,7 +1,7 @@
-{-# LANGUAGE GHC2024, AllowAmbiguousTypes, ExplicitNamespaces, ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE GHC2024, AllowAmbiguousTypes, ExplicitNamespaces, ExperimentalDependentTypes, Modifiers, RequiredTypeArguments #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 
-module Client (mapLaw, zipLaw, addUnder, lengthAppendSingleton, checkAppendSingleton, checkReverse, zipMapLaw, checkZipMap, checkNat, foldrPlusAppend, foldrPlusZero, checkFoldrAndMatchability) where
+module Client (mapLaw, zipLaw, addUnder, lengthAppendSingleton, checkAppendSingleton, checkReverse, zipMapLaw, checkZipMap, checkNat, foldrPlusAppend, foldrPlusZero, checkFoldrAndMatchability, checkPublicSurface) where
 
 import Data.Kind (Type)
 import qualified HaskLib as H
@@ -113,3 +113,32 @@ checkFoldrAndMatchability xs ys =
         H.Refl -> case foldrPlusZero xs of
             H.Refl -> case (matchableCong @'N.Succ (H.Refl @'N.Zero), unmatchableCong @(N.plus 'N.Zero) (H.Refl @'N.Zero)) of
                 (H.Refl, H.Refl) -> True
+
+-- | Exercise M, U, Pack, Sigma, Vec, Fin, and heterogeneous equality from HaskLib.
+type MatchArrow (a :: Type) (b :: Type) = a %H.M -> b
+type UnmatchArrow (a :: Type) (b :: Type) = a %H.U -> b
+type ErasedVec a = exists (n :: H.Nat) | H.Vec a n
+
+packSampleVec :: ErasedVec Char
+packSampleVec = H.Pack (type ('H.Succ 'H.Zero)) (H.VCons 'z' H.VNil)
+
+readErasedVec :: ErasedVec Char -> [Char]
+readErasedVec pkg = case pkg of
+    H.Pack (type _) v -> H.toListVec v
+
+checkPublicSurface :: Bool
+checkPublicSurface =
+    let congM :: forall (f :: MatchArrow N.Nat N.Nat). 'N.Zero H.:~: 'N.Zero -> f 'N.Zero H.:~: f 'N.Zero
+        congM = H.cong @f
+        congU :: forall (f :: UnmatchArrow N.Nat N.Nat). 'N.Zero H.:~: 'N.Zero -> f 'N.Zero H.:~: f 'N.Zero
+        congU = H.cong @f
+        vec2  = H.VCons 'p' (H.VCons 'q' H.VNil)
+        sig   = H.Pair (H.Succ (H.Succ H.Zero)) vec2 :: H.SomeVec Char
+        het   = H.HRefl :: 'N.Zero H.:~~: 'N.Zero
+    in case (H.sym (congM @'N.Succ H.Refl), congU @(N.plus 'N.Zero) H.Refl, het) of
+        (H.Refl, H.Refl, H.HRefl) ->
+            readErasedVec packSampleVec == "z"
+                && H.lookupVec H.FZ vec2 == 'p'
+                && H.lookupVec (H.FS H.FZ) vec2 == 'q'
+                && H.natToInt (H.first sig) == 2
+                && H.toListVec (H.second sig) == "pq"

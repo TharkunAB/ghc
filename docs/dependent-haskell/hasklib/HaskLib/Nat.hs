@@ -2,7 +2,7 @@
 {-# LANGUAGE DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, Modifiers, TypeOperators #-}
 
 -- | Peano naturals and their arithmetic laws.
-module HaskLib.Nat (Nat(..), eqSize, eqSizeRefl, plus, type (+), plusZero, plusSucc, plusComm, congSucc, congFirst) where
+module HaskLib.Nat (Nat(..), eqSize, eqSizeRefl, natToInt, plus, type (+), plusZero, plusSucc, plusComm, plusAssoc, congSucc, congFirst) where
 
 import Data.Type.Equality ((:~:)(Refl), trans)
 import GHC.Exts (U)
@@ -42,3 +42,14 @@ congFirst Refl = Refl
 eqSizeRefl :: foreach (n :: Nat) -> eqSize n n :~: 'True
 eqSizeRefl Zero     = Refl
 eqSizeRefl (Succ n) = eqSizeRefl n
+
+-- | Addition of Peano naturals is associative.
+plusAssoc :: foreach (m :: Nat) -> foreach (n :: Nat) -> foreach (p :: Nat)
+          -> plus (plus m n) p :~: plus m (plus n p)
+plusAssoc Zero     _ _ = Refl
+plusAssoc (Succ m) n p = congSucc (plusAssoc m n p)
+
+-- | Convert a finite Peano natural to an ordinary machine integer.
+natToInt :: Nat -> Int
+natToInt Zero     = 0
+natToInt (Succ n) = 1 + natToInt n

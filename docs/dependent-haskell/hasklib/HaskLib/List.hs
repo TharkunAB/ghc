@@ -3,8 +3,9 @@
 
 -- | Laws for the installed Prelude functions on ordinary lists.
 module HaskLib.List
-    ( Nat(..), Size, size, plus, minSize, takeSize, List.foldr
-    , appendAssoc, lengthMap, lengthAppend, lengthZip, lengthZipWith, lengthZipMap, lengthMapZip, lengthReverse, lengthTakeSize
+    ( Nat(..), Size, size, plus, minSize, takeSize
+    , map, zip, append, List.foldr
+    , appendAssoc, lengthMap, lengthAppend, lengthAppendList, lengthZip, lengthZipWith, lengthZipMap, lengthMapZip, lengthReverse, lengthTakeSize
     ) where
 
 import Data.Type.Equality ((:~:)(Refl), trans)
@@ -13,7 +14,18 @@ import HaskLib.List.Prefix (takeSize)
 import HaskLib.Nat (Nat(..), congSucc, plus, plusSucc, plusZero)
 import Prelude ((++), map, reverse, zip)
 import PreludeMapLengthSize (Size, minSize, size)
-import PreludeZipRuntime (lengthZip, lengthZipMap, lengthZipWith)
+import PreludeZipRuntime (lengthZip, lengthZipWith, lengthZipMap)
+
+-- | Append two lists by structural recursion on the first list.
+append :: [a] -> [a] -> [a]
+append []       ys = ys
+append (x : xs) ys = x : append xs ys
+
+-- | The length of 'append' is the sum of the input lengths.
+lengthAppendList :: forall a. foreach (xs :: [a]) -> foreach (ys :: [a])
+                 -> size (append xs ys) :~: plus (size xs) (size ys)
+lengthAppendList []       _  = Refl
+lengthAppendList (_ : xs) ys = congSucc (lengthAppendList xs ys)
 
 -- | Appending three lists gives the same result with either grouping.
 appendAssoc :: foreach (xs :: [a]) -> foreach (ys :: [a]) -> foreach (zs :: [a])
