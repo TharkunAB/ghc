@@ -993,3 +993,13 @@ test('NativeLargeElimType',
       extra_files(['NativeLargeElimTypeProvider.hs',
                    'NativeLargeElimType.hs'])],
      run_command, ['bash NativeLargeElimType.sh "{compiler}" "{libdir}"'])
+test('NativeBootSigmaExists',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeBootSigmaExistsProvider.hs',
+                   'NativeBootSigmaExists.hs'])],
+     run_command, ['bash NativeBootSigmaExists.sh "{compiler}" "{libdir}"'])
+test('NativeAutoNumLiterals',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeAutoNumLiteralsProvider.hs',
+                   'NativeAutoNumLiterals.hs'])],
+     run_command, ['bash NativeAutoNumLiterals.sh "{compiler}" "{libdir}"'])

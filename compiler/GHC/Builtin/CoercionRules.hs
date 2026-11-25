@@ -6,18 +6,21 @@ module GHC.Builtin.CoercionRules
   , proveBoxedPairProjection, proveScopedSigmaClosure, proveScopedLambdaClosure
   , proveScopedLambdaEta
   , proveScopedConstructorCase
+  , fromNaturalNumRule, proveFromNaturalNum
   ) where
 
 import GHC.Prelude
 
+import GHC.Builtin.Modules (gHC_INTERNAL_TYPENATS)
 import GHC.Builtin.WiredIn.TypeLits (typeNatCoAxiomRules)
 import GHC.Builtin.WiredIn.Types (promotedTupleDataCon, tupleTyCon)
 import GHC.Core.Coercion (existsCoRule, matchableAppProjectionRule, mkNomReflCo, mkSymCo)
 import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
-  ( DataCon, dataConName, dataConTyCon, dataConUnivTyVars, dataConInstOrigArgTys
+  ( DataCon, HsImplBang(..), dataConImplBangs, dataConName, dataConOrigArgTys, dataConTyCon
+  , dataConUnivTyVars, dataConInstOrigArgTys
   , dataConSourceArity, dataConRepArgBinders, isVanillaDataCon )
-import GHC.Core.TyCo.Rep (Coercion(AxiomCo), Type(TyVarTy, TyConApp), scaledThing)
+import GHC.Core.TyCo.Rep (Coercion(AxiomCo), Scaled(..), Type(TyVarTy, TyConApp), scaledThing)
 import GHC.Core.TyCo.Compare
   (eqType, eqTypeX, eqTypes, eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures)
 import GHC.Core.TyCon
@@ -25,11 +28,11 @@ import GHC.Core.Type
 import GHC.Data.FastString
 import GHC.Data.Pair
 import GHC.Types.Basic (Boxity(Boxed), LeftOrRight(..))
-import GHC.Types.Var (ExistsTyFlag(..), TyVar)
+import GHC.Types.Var (ExistsTyFlag(..))
 import GHC.Types.Var.Env (emptyInScopeSet, mkRnEnv2)
 import GHC.Types.Var.Set
 import GHC.Types.Name (Name, nameModule_maybe, nameOccName, stableNameCmp)
-import GHC.Types.Name.Occurrence (occNameString, sourceTableTermOcc)
+import GHC.Types.Name.Occurrence (mkTcOcc, occNameString, sourceTableTermOcc)
 import GHC.Types.Unique.FM (UniqFM, addToUFM)
 
 import GHC.Utils.Encoding (zEncodeString)
@@ -54,7 +57,60 @@ builtInCoAxiomRules =
       , (scopedEnumCaseName, scopedEnumCaseRule)
       , (scopedConstructorCaseName, scopedConstructorCaseRule)
       , (scopedCaseResultName, scopedCaseResultRule)
-      , (scopedOrderedCaseName, scopedOrderedCaseRule) ]
+      , (scopedOrderedCaseName, scopedOrderedCaseRule)
+      , (fromNaturalNumName, fromNaturalNumRule) ]
+
+fromNaturalNumName :: FastString
+fromNaturalNumName = fsLit "FromNaturalNum"
+
+-- | Built-in nominal reduction step for FromNatural on a certified Peano type.
+fromNaturalNumRule :: CoAxiomRule
+fromNaturalNumRule = BuiltInEqRule fromNaturalNumName proves
+  where
+    proves [Pair lhs _, Pair rhs result]
+      | validFromNaturalNumStep lhs rhs = Just (Pair lhs result)
+    proves _ = Nothing
+
+-- | Produce nominal evidence for one FromNatural step from a certified Num instance.
+proveFromNaturalNum :: Type -> Type -> Maybe Coercion
+proveFromNaturalNum lhs rhs
+  | validFromNaturalNumStep lhs rhs
+  = Just (AxiomCo fromNaturalNumRule [mkNomReflCo lhs, mkNomReflCo rhs])
+  | otherwise = Nothing
+
+validFromNaturalNumStep :: Type -> Type -> Bool
+validFromNaturalNumStep lhs rhs
+  | Just (fam_tc, [target, lit_ty]) <- splitTyConApp_maybe lhs
+  , nameOccName (tyConName fam_tc) == mkTcOcc "FromNatural"
+  , nameModule_maybe (tyConName fam_tc) == Just gHC_INTERNAL_TYPENATS
+  , Just k <- isNumLitTy lit_ty
+  , k >= 0
+  , Just (tc, []) <- splitTyConApp_maybe target
+  , isNativeIndexType target
+  , not (isGadtSyntaxTyCon tc)
+  , [c1, c2] <- tyConDataCons tc
+  , Just (con_tc, con_args) <- splitTyConApp_maybe rhs
+  , Just con <- isPromotedDataCon_maybe con_tc
+  , let other = if con == c1 then c2 else c1
+  , con == c1 || con == c2
+  = if k == 0
+      then null con_args
+           && null (dataConOrigArgTys con)
+           && is_unary_peano tc other
+      else case con_args of
+             [arg_ty] ->
+               is_unary_peano tc con
+               && null (dataConOrigArgTys other)
+               && arg_ty `eqType` mkTyConApp fam_tc [target, mkNumLitTy (k - 1)]
+             _ -> False
+  | otherwise = False
+  where
+    is_unary_peano tc succ_con
+      | [Scaled _ field] <- dataConOrigArgTys succ_con
+      , [HsLazy] <- dataConImplBangs succ_con
+      , Just (field_tc, []) <- splitTyConApp_maybe field
+      = field_tc == tc
+      | otherwise = False
 
 scopedSigmaClosureRule, scopedLambdaClosureRule, scopedLambdaEtaRule :: CoAxiomRule
 scopedSigmaClosureRule = scopedClosureRule scopedSigmaClosureName eqScopedSigmaClosures

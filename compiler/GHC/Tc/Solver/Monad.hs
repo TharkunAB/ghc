@@ -128,14 +128,15 @@ import GHC.Driver.Env
 import qualified GHC.Tc.Utils.Instantiate as TcM
 import GHC.Core.InstEnv
 import GHC.Tc.Instance.Family as FamInst
-import GHC.Tc.Gen.SourceTable (sourceTableFamilyAppUse)
+import GHC.Tc.Gen.SourceTable (recordSourceLiteralUse, sourceTableFamilyAppUse)
 import GHC.Core.FamInstEnv
 
 import qualified GHC.Tc.Utils.Monad    as TcM
 import qualified GHC.Tc.Utils.TcMType  as TcM
 import qualified GHC.Tc.Instance.Class as TcM( matchGlobalInst, ClsInstResult(..) )
 import qualified GHC.Tc.Utils.Env      as TcM
-       ( tcGetDefaultTys, tcLookupKnownKeyId, tcLookupKnownKeyTyCon )
+       ( tcGetDefaultTys, tcLookupIdMaybe, tcLookupKnownKeyId, tcLookupKnownKeyTyCon )
+import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Zonk.Monad ( ZonkM )
 import qualified GHC.Tc.Zonk.TcType  as TcM
 
@@ -158,12 +159,15 @@ import GHC.Tc.Types.Origin
 import GHC.Tc.Types.CtLoc
 import GHC.Tc.Types.Constraint
 
+import GHC.Builtin.CoercionRules ( proveFromNaturalNum )
 import GHC.Builtin.KnownKeys ( callStackTyConKey, exceptionContextTyConKey )
+import GHC.Builtin.KnownOccs ( fromIntegerClassOpOcc )
+import GHC.Builtin.Modules ( gHC_INTERNAL_TYPENATS, mkGhcInternalModule )
 import GHC.Builtin.WiredIn.Types ( heqDataCon )
 
 import GHC.Core ( Expr(Var,Coercion), Alt(..), AltCon(DataAlt) )
+import GHC.Core.DataCon ( promoteDataCon )
 import GHC.Core.Make ( mkWildCase )
-import GHC.Core.Multiplicity ( unrestricted )
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep as Rep
 import GHC.Core.TyCo.Tidy
@@ -173,6 +177,8 @@ import GHC.Core.Predicate
 import GHC.Core.Reduction
 import GHC.Core.Class
 import GHC.Core.TyCon
+import GHC.Data.FastString ( fsLit )
+import Data.Maybe ( fromMaybe )
 import GHC.Core.Unify (typesAreApart)
 
 import GHC.LanguageExtensions as LangExt
@@ -2400,11 +2406,10 @@ matchFamTcM :: TyCon -> [Type] -> TcM (Maybe ReductionN)
 -- Given (F tys) return (ty, co), where co :: F tys ~N ty
 matchFamTcM tycon args
   = do { fam_envs <- FamInst.tcGetFamInstEnvs
-       ; let match_fam_result
-              = reduceTyFamApp_maybe fam_envs Nominal tycon args
-       ; case match_fam_result of
-           Just _ -> sourceTableFamilyAppUse tycon args
-           Nothing -> return ()
+       ; match_fam_result <- case reduceTyFamApp_maybe fam_envs Nominal tycon args of
+           Just redn -> do { sourceTableFamilyAppUse tycon args
+                           ; return (Just redn) }
+           Nothing   -> matchCertifiedFromNatural tycon args
        ; TcM.traceTc "matchFamTcM" $
          vcat [ text "Matching:" <+> ppr (mkTyConApp tycon args)
               , ppr_res match_fam_result ]
@@ -2415,6 +2420,43 @@ matchFamTcM tycon args
       = hang (text "Match succeeded:")
           2 (vcat [ text "Rewrites to:" <+> ppr ty
                   , text "Coercion:" <+> ppr co ])
+
+-- | Reduce FromNatural at a concrete literal using a certified ground Num
+-- dictionary when no explicit FromNatural family instance matches.
+matchCertifiedFromNatural :: TyCon -> [Type] -> TcM (Maybe ReductionN)
+matchCertifiedFromNatural tycon args@[target, lit_ty]
+  | nameOccName (tyConName tycon) == mkTcOcc "FromNatural"
+  , nameModule_maybe (tyConName tycon) == Just gHC_INTERNAL_TYPENATS
+  , Just k <- isNumLitTy lit_ty
+  , k >= 0
+  , noFreeVarsOfType target
+  = do { enabled <- TcM.xoptM LangExt.ExperimentalDependentTypes
+       ; if not enabled then return Nothing else
+         do { let num_mod = mkGhcInternalModule (fsLit "GHC.Internal.Num")
+            ; from_int <- lookupOrig num_mod fromIntegerClassOpOcc
+            ; mb_sel <- TcM.tcLookupIdMaybe from_int
+            ; case mb_sel >>= (\sel -> (sel,) <$> isClassOpId_maybe sel) of
+                Nothing -> return Nothing
+                Just (sel, num_cls) ->
+                  do { inst_envs <- TcM.tcGetInstEnvs
+                     ; case lookupUniqueInstEnv inst_envs num_cls [target] of
+                         Right (inst, []) ->
+                           do { let raw_dfun = instanceDFunId inst
+                              ; dfun <- fromMaybe raw_dfun <$> TcM.tcLookupIdMaybe (getName raw_dfun)
+                              ; case sourceLiteralCons_maybe dfun sel of
+                                  Just (zero_con, succ_con) ->
+                                    do { recordSourceLiteralUse dfun sel
+                                       ; let lhs_ty = mkTyConApp tycon args
+                                             rhs_ty
+                                               | k == 0
+                                               = mkTyConApp (promoteDataCon zero_con) []
+                                               | otherwise
+                                               = mkTyConApp (promoteDataCon succ_con)
+                                                   [mkTyConApp tycon [target, mkNumLitTy (k - 1)]]
+                                       ; return (flip mkReduction rhs_ty <$> proveFromNaturalNum lhs_ty rhs_ty) }
+                                  Nothing -> return Nothing }
+                         _ -> return Nothing } } }
+matchCertifiedFromNatural _ _ = return Nothing
 
 solverDepthError :: CtLoc -> TcType -> TcM a
 solverDepthError loc ty

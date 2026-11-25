@@ -47,13 +47,16 @@ import GHC.Tc.Instance.Family
 
 import GHC.Tc.Deriv
 import GHC.Tc.Utils.Env
+import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Types.Evidence
 
-import GHC.Builtin.KnownKeys ( unsatisfiableIdKey )
+import GHC.Builtin.KnownKeys ( numClassKey, unsatisfiableIdKey )
+import GHC.Types.Unique ( hasKey )
 import GHC.Builtin.KnownOccs ( eqClassOpOcc, fromIntegerClassOpOcc, minusClassOpOcc )
-import GHC.Builtin.Modules ( gHC_CLASSES, gHC_INTERNAL_BASE, gHC_INTERNAL_NUM_INTEGER, mkGhcInternalModule )
+import GHC.Builtin.Modules ( gHC_CLASSES, gHC_INTERNAL_BASE, gHC_INTERNAL_NUM_INTEGER, gHC_INTERNAL_TYPENATS, mkGhcInternalModule )
+import GHC.Builtin.WiredIn.TypeLits ( typeNatSubTyCon )
 
 import GHC.Core        ( Expr(..), mkVarApps )
 import GHC.Core.Make   ( nO_METHOD_BINDING_ERROR_ID )
@@ -69,7 +72,7 @@ import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
 import GHC.Core.ConLike
 import GHC.Core.Class
-import GHC.Builtin.WiredIn.Types ( integerTy, integerTyConName, matchableDataConTy, unmatchableDataConTy )
+import GHC.Builtin.WiredIn.Types ( integerTy, integerTyConName, matchableDataConTy, naturalTy, unmatchableDataConTy )
 
 import GHC.Types.Var as Var
 import GHC.Types.Var.Env
@@ -82,9 +85,11 @@ import GHC.Types.InlinePragma
 import GHC.Types.SourceFile
 import GHC.Types.SourceText
 import GHC.Types.Name
+import GHC.Types.Name.Reader ( WithUserRdr(..) )
 import GHC.Types.Name.Set
 import GHC.Types.TypeEnv (lookupTypeEnv)
 import GHC.Types.SrcLoc
+import GHC.Unit.Types ( Module )
 
 import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
@@ -103,7 +108,7 @@ import qualified GHC.LanguageExtensions as LangExt
 import Control.Monad
 import Data.Tuple
 import GHC.Data.Maybe
-import Data.List( mapAccumL )
+import Data.List( find, mapAccumL )
 import Data.List.NonEmpty (NonEmpty(..))
 
 
@@ -407,24 +412,29 @@ Gather up the instance declarations from their various sources
 -}
 
 tcInstDecls1    -- Deal with both source-code and imported instance decls
-   :: [LInstDecl GhcRn]         -- Source code instance decls
+   :: Maybe NameSet             -- Explicit FromNatural targets across all TyClGroups
+   -> [LInstDecl GhcRn]         -- Source code instance decls
    -> TcM (TcGblEnv,            -- The full inst env
            [InstInfo GhcRn],    -- Source-code instance decls to process;
                                 -- contains all dfuns for this module
            [DerivInfo],         -- From data family instances
            ThBindEnv)           -- TH binding levels
 
-tcInstDecls1 inst_decls
+tcInstDecls1 mb_explicit_from_nat inst_decls
   = do {    -- Do class and family instance declarations
        ; stuff <- mapAndRecoverM tcLocalInstDecl inst_decls
 
        ; let (local_infos_s, fam_insts_s, datafam_deriv_infos) = unzip3 stuff
-             fam_insts   = concat fam_insts_s
+             fam_insts0  = concat fam_insts_s
              local_infos = concat local_infos_s
+
+       ; (auto_helpers, auto_fam_insts) <-
+           synthesizeCertifiedFromNatural mb_explicit_from_nat local_infos fam_insts0
+       ; let fam_insts = fam_insts0 ++ auto_fam_insts
 
        ; (gbl_env, th_bndrs) <-
            addClsInsts local_infos $
-           addFamInsts fam_insts
+           addFamInstsWithHelpers auto_helpers fam_insts
 
        ; return ( gbl_env
                 , local_infos
@@ -450,14 +460,14 @@ addClsInsts :: [InstInfo GhcRn] -> TcM a -> TcM a
 addClsInsts infos thing_inside
   = tcExtendLocalInstEnv (map iSpec infos) thing_inside
 
-addFamInsts :: [FamInst] -> TcM (TcGblEnv, ThBindEnv)
+addFamInstsWithHelpers :: [TyCon] -> [FamInst] -> TcM (TcGblEnv, ThBindEnv)
 -- Extend (a) the family instance envt
---        (b) the type envt with stuff from data type decls
-addFamInsts fam_insts
+--        (b) the type envt with stuff from data type decls and helper families
+addFamInstsWithHelpers helper_tycons fam_insts
   = tcExtendLocalFamInstEnv fam_insts $
     tcExtendGlobalEnv axioms $
     do { traceTc "addFamInsts" (pprFamInsts fam_insts)
-       ; (gbl_env, th_bndrs) <- addTyConsToGblEnv data_rep_tycons
+       ; (gbl_env, th_bndrs) <- addTyConsToGblEnv (data_rep_tycons ++ helper_tycons)
                     -- NB: this does not add the data family instance axioms;
                     -- those are added separately above.
        ; return (gbl_env, th_bndrs)
@@ -466,6 +476,153 @@ addFamInsts fam_insts
     axioms = map (ACoAxiom . toBranchedAxiom . famInstAxiom) fam_insts
     data_rep_tycons = famInstsRepTyCons fam_insts
       -- The representation tycons for data family instance declarations.
+
+{- Note [Automatic FromNatural synthesis for certified Num instances]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under ExperimentalDependentTypes (and DependentTypes), a Peano datatype with
+a ground Num instance whose fromInteger method follows the certified 3-guard
+zero/successor definition can interpret type-level numerals directly without
+a separate `type instance FromNatural T n = ...` declaration.
+
+During tcInstDecls1, inspect local ground Num instances before checking value
+signatures. When an instance has the certified Peano fromInteger shape and no
+imported or local FromNatural equation overlaps with `FromNatural T n`,
+synthesize a closed 2-branch helper family `$fromNatural:dfun` together with
+`type instance FromNatural T n = $fromNatural:dfun n`. Modules that already
+declare an explicit FromNatural instance keep their user-written equation
+unchanged.
+-}
+
+-- | Synthesize default FromNatural equations for certified ground Num instances
+-- when no explicit FromNatural equation already covers the target type.
+-- See Note [Automatic FromNatural synthesis for certified Num instances].
+synthesizeCertifiedFromNatural :: Maybe NameSet -> [InstInfo GhcRn] -> [FamInst] -> TcM ([TyCon], [FamInst])
+synthesizeCertifiedFromNatural Nothing _ _ = pure ([], [])
+synthesizeCertifiedFromNatural (Just excluded_targets) local_infos explicit_fams = do
+  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  rebindable   <- xoptM LangExt.RebindableSyntax
+  hs_src       <- tcHscSource
+  case hs_src of
+    HsSrcFile
+      | experimental, not rebindable
+      , candidates@(_ : _) <- mapMaybe (candidate excluded_targets) local_infos -> do
+          from_nat_name <- lookupOrig gHC_INTERNAL_TYPENATS (mkTcOcc "FromNatural")
+          from_nat_tc   <- tcLookupTyCon from_nat_name
+          (eps_env, local_env0) <- tcGetFamInstEnvs
+          let step (helpers, acc_fams) (ispec, target, zero_con, succ_con) = do
+                n_name <- newSysName (mkTyVarOcc "n")
+                let n_tv     = mkTyVar n_name naturalTy
+                    binders  = mkAnonTyConBinders [n_tv]
+                    dfun_id  = instanceDFunId ispec
+                    inst_loc = getSrcSpan dfun_id
+                helper_name    <- newImplicitBinder (getName dfun_id)
+                                    (\occ -> mkTcOcc ("$fromNatural:" ++ occNameString occ))
+                helper_ax_name <- newImplicitBinder helper_name mkInstTyCoOcc
+                let zero_ty  = mkTyConApp (promoteDataCon zero_con) []
+                    pred_ty  = mkTyConApp typeNatSubTyCon [mkTyVarTy n_tv, mkNumLitTy 1]
+                    branch0  = mkCoAxBranch [] [] [] [mkNumLitTy 0] zero_ty [] inst_loc
+                    branch1 fam =
+                      mkCoAxBranch [n_tv] [] [] [mkTyVarTy n_tv]
+                        (mkTyConApp (promoteDataCon succ_con) [mkTyConApp fam [pred_ty]])
+                        [Nominal] inst_loc
+                    helper_kind = mkTyConKindWithMatchability unmatchableDataConTy binders target
+                    helper_tc   = mkFamilyTyCon helper_name helper_kind binders 0 target Nothing
+                                    (ClosedTypeFamilyTyCon (CTF (Just helper_ax))) Nothing NotInjective
+                    helper_ax   = mkBranchedCoAxiom Nominal helper_ax_name helper_tc
+                                    [branch0, branch1 helper_tc]
+                ax_name <- newFamInstAxiomName (L (noAnnSrcSpan inst_loc) from_nat_name)
+                             [[target, mkTyVarTy n_tv]]
+                let single_ax = mkSingleCoAxiom Nominal ax_name [n_tv] [] [] from_nat_tc
+                                  [target, mkTyVarTy n_tv] (mkTyConApp helper_tc [mkTyVarTy n_tv])
+                (subst, tvs') <- freshenTyVarBndrs [n_tv]
+                let lhs'     = substTys subst [target, mkTyVarTy n_tv]
+                    rhs'     = substTy  subst (mkTyConApp helper_tc [mkTyVarTy n_tv])
+                    fam_inst = mkLocalFamInst SynFamilyInst single_ax tvs' [] lhs' rhs'
+                    combined = (eps_env, extendFamInstEnvList local_env0 (explicit_fams ++ acc_fams))
+                if null (lookupFamInstEnvConflicts combined fam_inst)
+                  then pure (helpers ++ [helper_tc], acc_fams ++ [fam_inst])
+                  else pure (helpers, acc_fams)
+          foldM step ([], []) candidates
+    _ -> pure ([], [])
+  where
+    num_module = mkGhcInternalModule (fsLit "GHC.Internal.Num")
+
+    candidate :: NameSet -> InstInfo GhcRn -> Maybe (ClsInst, Type, DataCon, DataCon)
+    candidate excluded InstInfo{iSpec = ispec, iBinds = InstBindings{ib_binds = binds, ib_derived = False}} = do
+      (cls, [target]) <- getClassPredTys_maybe (idType (instanceDFunId ispec))
+      guard (cls `hasKey` numClassKey && noFreeVarsOfType target)
+      (tc, []) <- splitTyConApp_maybe target
+      guard (not (tyConName tc `elemNameSet` excluded))
+      guard (isNativeIndexType target && not (isGadtSyntaxTyCon tc))
+      sel_id <- find (\m -> getOccName m == fromIntegerClassOpOcc
+                         && nameModule_maybe (idName m) == Just num_module)
+                     (classMethods cls)
+      (zero_con, succ_con) <- renamedSourceLiteralCons (idName sel_id) tc binds
+      pure (ispec, target, zero_con, succ_con)
+    candidate _ _ = Nothing
+
+    renamedSourceLiteralCons :: Name -> TyCon -> LHsBinds GhcRn -> Maybe (DataCon, DataCon)
+    renamedSourceLiteralCons sel_name tc binds = do
+      [c1, c2] <- pure (tyConDataCons tc)
+      (L _ FunBind{fun_matches = MG{mg_alts = L _ [L _ match]}}, _, _)
+        <- findMethodBind sel_name binds emptyPragEnv
+      Match{m_pats = L _ [pat],
+            m_grhss = GRHSs _ (negative :| [zero_grhs, positive]) (L _ EmptyLocalBinds{})} <- pure match
+      n <- var_pat pat
+      (lt_test, _)      <- guarded negative
+      (eq_test, z_rhs)  <- guarded zero_grhs
+      (pos_test, s_rhs) <- guarded positive
+      guard (binary_rn n gHC_CLASSES (mkVarOcc "<") 0 lt_test)
+      guard (binary_rn n gHC_CLASSES eqClassOpOcc 0 eq_test)
+      oth <- var_expr pos_test
+      guard (getOccName oth == mkVarOcc "otherwise" && nameModule_maybe oth == Just gHC_INTERNAL_BASE)
+      z_name <- var_expr z_rhs
+      HsApp _ succ_e rec_e <- pure (strip_parens s_rhs)
+      s_name <- var_expr succ_e
+      HsApp _ conv_e sub_e <- pure (strip_parens rec_e)
+      conv <- var_expr conv_e
+      guard (conv == sel_name)
+      guard (binary_rn n num_module minusClassOpOcc 1 sub_e)
+      let (zero_con, succ_con) = if z_name == dataConName c1 then (c1, c2) else (c2, c1)
+      guard (z_name == dataConName zero_con && s_name == dataConName succ_con)
+      guard (null (dataConOrigArgTys zero_con))
+      [Scaled _ field] <- pure (dataConOrigArgTys succ_con)
+      [HsLazy] <- pure (dataConImplBangs succ_con)
+      (field_tc, []) <- splitTyConApp_maybe field
+      guard (field_tc == tc)
+      pure (zero_con, succ_con)
+
+    var_pat :: LPat GhcRn -> Maybe Name
+    var_pat (L _ (ParPat _ p)) = var_pat p
+    var_pat (L _ (VarPat _ (L _ n))) = Just n
+    var_pat _ = Nothing
+
+    guarded :: LGRHS GhcRn (LHsExpr GhcRn) -> Maybe (LHsExpr GhcRn, LHsExpr GhcRn)
+    guarded (L _ (GRHS _ [L _ (BodyStmt _ test _ _)] rhs)) = Just (test, rhs)
+    guarded _ = Nothing
+
+    strip_parens :: LHsExpr GhcRn -> HsExpr GhcRn
+    strip_parens (L _ (HsPar _ e)) = strip_parens e
+    strip_parens (L _ e) = e
+
+    var_expr :: LHsExpr GhcRn -> Maybe Name
+    var_expr e
+      | HsVar _ (L _ (WithUserRdr _ name)) <- strip_parens e = Just name
+      | otherwise = Nothing
+
+    binary_rn :: Name -> Module -> OccName -> Integer -> LHsExpr GhcRn -> Bool
+    binary_rn n mod occ k e = isJust $ do
+      (lhs, op_e, arg) <- case strip_parens e of
+        OpApp _ l op r -> Just (l, op, r)
+        HsApp _ l r
+          | HsApp _ op l' <- strip_parens l -> Just (l', op, r)
+        _ -> Nothing
+      x <- var_expr lhs
+      guard (x == n)
+      op <- var_expr op_e
+      guard (getOccName op == occ && nameModule_maybe op == Just mod)
+      HsOverLit _ (OverLit _ (HsIntegral lit)) <- pure (strip_parens arg)
+      guard (not (il_neg lit) && il_value lit == k)
 
 {-
 Note [Deriving inside TH brackets]
