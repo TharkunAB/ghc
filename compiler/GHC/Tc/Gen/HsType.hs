@@ -74,6 +74,8 @@ module GHC.Tc.Gen.HsType (
 
         -- Utils
         tyLitFromOverloadedLit,
+        tcTypeRepTarget_maybe,
+        drainForgetMTyCons,
 
    ) where
 
@@ -83,6 +85,7 @@ import Control.Monad.Trans.Class (lift)
 import GHC.Prelude hiding ( head, init, last, tail )
 
 import GHC.Hs
+import GHC.Rename.HsType (isInferredForEachBndr)
 import GHC.Rename.Utils
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
@@ -107,7 +110,7 @@ import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
 import {-# SOURCE #-} GHC.Tc.Gen.Splice (tcPrepareClosedApplication, tcPrepareClosedFunctionValue, tcPrepareClosedResult, tcPrepareClosedObservation, tcCheckClosedCallContext, tcPreflightClosedCall, tcDecodeClosedCallOperand, tcHasClosedCallExecutable)
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
-import GHC.Iface.Env (lookupOrig)
+import GHC.Iface.Env (lookupOrig, newGlobalBinder)
 import GHC.IfaceToCore
 import GHC.Tc.Solver
 import GHC.Tc.Zonk.Type
@@ -120,12 +123,14 @@ import GHC.Tc.Zonk.TcType
 
 import GHC.Core.Reduction (reductionReducedType)
 import GHC.Core.Coercion (hasCoercionHole)
-import GHC.Core.Coercion.Axiom (ClosedTyFam(CTF_Abstract))
+import GHC.Core.Coercion.Axiom (ClosedTyFam(CTF, CTF_Abstract))
 import GHC.Core.TyCon
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Class
-import GHC.Core.FamInstEnv (familyNameInstances, famInstTyCon, lookupFamInstEnv, fim_instance, reduceTyFamApp_maybe)
+import GHC.Core.FamInstEnv (familyNameInstances, famInstTyCon, lookupFamInstEnv, fim_instance,
+                            mkBranchedCoAxiom, mkCoAxBranch, reduceTyFamApp_maybe)
+import GHC.Tc.TyCl.Build (newImplicitBinder)
 import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.Predicate ( getClassPredTys_maybe, isCTupleClass )
@@ -158,7 +163,7 @@ import GHC.Types.SrcLoc
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Supply
 
-import GHC.Unit.Module (mkModule, mkModuleName, moduleName, moduleNameString, moduleUnit, stringToUnit, unitString)
+import GHC.Unit.Module (Module, mkModule, mkModuleName, moduleName, moduleNameString, moduleUnit, stringToUnit, unitString)
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
@@ -182,7 +187,9 @@ import qualified Data.List.NonEmpty as NE
 import Data.List ( intercalate, isPrefixOf, mapAccumL )
 import Control.Monad
 import Data.Data (Data, cast, gmapQ)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Tuple( swap )
+import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 
 {-
@@ -576,14 +583,19 @@ tcRetainedAmbientIndices invalid_reason hs_ty
              Just ATyVar{} -> return Nothing
              Just (ATcId { tct_id = index }) ->
                do { index <- liftZonkM (zonkId index)
-                  ; unless (not (isExternalName name)
-                            && isNativeOpaqueValueId index) invalid_index
-                  ; level <- getThLevel
-                  ; case level of
-                      Comp -> return ()
-                      _ -> failWithTc $ TcRnRetainedQuantificationError RetainedStaging
-                  ; return (Just (name, index)) }
-             _ -> invalid_index }
+                  ; mb_rep <- tcTypeRepTarget_maybe (varType index)
+                  ; if isJust mb_rep
+                    then return Nothing
+                    else do
+                      { unless (not (isExternalName name)
+                                && isNativeOpaqueValueId index) invalid_index
+                      ; level <- getThLevel
+                      ; case level of
+                          Comp -> return ()
+                          _ -> failWithTc $ TcRnRetainedQuantificationError RetainedStaging
+                      ; return (Just (name, index)) } }
+             _ | isTyVarName name -> return Nothing
+               | otherwise -> invalid_index }
     invalid_index :: TcM a
     invalid_index = failWithTc $ TcRnRetainedQuantificationError invalid_reason
 
@@ -593,7 +605,7 @@ tcRetainedAmbientIndices invalid_reason hs_ty
     ambient_names thing
       | Just (L loc (HsTyVar _ _ (L _ (WithUserRdr _ name))))
           <- (cast thing :: Maybe (LHsType GhcRn))
-      , isVarName name
+      , isVarName name || isTyVarName name
       , not (isExternalName name) = [(locA loc, name)]
       | Just (L _ (HsForEachTy _ bndrs _)) <- (cast thing :: Maybe (LHsType GhcRn))
       = let bound = mapMaybe hsLTyVarName bndrs
@@ -765,34 +777,105 @@ tcCheckRetainedType allow_function witness_skol = go
         check_bndrs mode [] = go mode body liftedTypeKind
         check_bndrs mode (L lb bndr : rest)
           = setSrcSpanA lb $
-            case bndr of
+            let inferred = not visible && isInferredForEachBndr bndr
+                mark_id  = if inferred then markInferredRetainedBinder else id
+                check_not_fun domain_ty =
+                  when (not allow_function && isFunTy domain_ty) $
+                    failWithTc $ TcRnRetainedQuantificationError $
+                      if mode_complete_type_arg mode == Just False
+                      then RetainedPartialTypeArgument
+                      else RetainedFunctionSignature
+                mk_type_witness skol chosen_name mb_name body_ty =
+                  do { tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName chosen_name)))
+                     ; tv <- newSkolemTyVar skol tv_name liftedTypeKind
+                     ; selector <- tcLookupKnownOccId typeRepIdOcc
+                     ; let (_, rep_ty) = tcSplitPhiTy $
+                             piResultTys (varType selector) [liftedTypeKind, mkTyVarTy tv]
+                     ; body_ty' <- body_ty tv
+                     ; let fun_ty | visible = tcMkVisFunTy unmatchableDataConTy ManyTy rep_ty body_ty'
+                                  | otherwise = mkDepFunTyWithVis DepFunInvisible
+                                                  (mark_id (mkLocalId chosen_name ManyTy rep_ty)) body_ty'
+                     ; _ <- pure mb_name
+                     ; return (mkInfForAllTy unmatchableDataConTy tv fun_ty) }
+            in case bndr of
               HsTvb _ () (HsBndrVar _ (L _ name)) (HsBndrKind _ domain) ->
                 do { domain_ty <- tcRetainedBinderDomain valid_domain mode domain
                    ; case witness_skol of
                        Just skol | isLiftedTypeKind domain_ty ->
                          -- See Note [Explicit retained Type witnesses].
-                         do { tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName name)))
-                            ; tv <- newSkolemTyVar skol tv_name liftedTypeKind
-                            ; selector <- tcLookupKnownOccId typeRepIdOcc
-                            ; let (_, rep_ty) = tcSplitPhiTy $
-                                    piResultTys (varType selector) [liftedTypeKind, mkTyVarTy tv]
-                            ; body_ty <- tcExtendNameTyVarEnv [(name, tv)] $
-                                           check_bndrs mode rest
-                            ; let fun_ty | visible = tcMkVisFunTy unmatchableDataConTy ManyTy rep_ty body_ty
-                                         | otherwise = mkDepFunTyWithVis DepFunInvisible
-                                                         (mkLocalId name ManyTy rep_ty) body_ty
-                            ; return (mkInfForAllTy unmatchableDataConTy tv fun_ty) }
+                         mk_type_witness skol name (Just name) $ \tv ->
+                           tcExtendNameTyVarEnv [(name, tv)] (check_bndrs mode rest)
                        _ ->
-                         do { when (not allow_function && isFunTy domain_ty) $
-                                failWithTc $ TcRnRetainedQuantificationError $
-                                  if mode_complete_type_arg mode == Just False
-                                  then RetainedPartialTypeArgument
-                                  else RetainedFunctionSignature
-                            ; let index = mkLocalId name ManyTy domain_ty
+                         do { check_not_fun domain_ty
+                            ; let index = mark_id (mkLocalId name ManyTy domain_ty)
                                   mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name index }
                             ; body_ty <- check_bndrs mode' rest
                             ; return (mkDepFunTyWithVis (hsForEachVisibility ann) index body_ty) } }
-              _ -> failWithTc $ TcRnRetainedQuantificationError RetainedBinderCount
+              HsTvb _ () (HsBndrWildCard _) (HsBndrKind _ domain)
+                | visible ->
+                    do { domain_ty <- tc_check_lhs_type mode domain liftedTypeKind >>= liftZonkM . zonkTcType
+                       ; case witness_skol of
+                           Just skol | isLiftedTypeKind domain_ty ->
+                             do { chosen <- newSysName (mkVarOcc "_")
+                                ; mk_type_witness skol chosen Nothing $ \_ -> check_bndrs mode rest }
+                           _ ->
+                             do { body_ty <- check_bndrs mode rest
+                                ; return (tcMkVisFunTy unmatchableDataConTy ManyTy domain_ty body_ty) } }
+                | otherwise ->
+                    do { domain_ty <- tcRetainedBinderDomain valid_domain mode domain
+                       ; chosen <- newSysName (mkVarOcc "_")
+                       ; case witness_skol of
+                           Just skol | isLiftedTypeKind domain_ty ->
+                             mk_type_witness skol chosen Nothing $ \_ -> check_bndrs mode rest
+                           _ ->
+                             do { check_not_fun domain_ty
+                                ; body_ty <- check_bndrs mode rest
+                                ; let index = mark_id (mkLocalId chosen ManyTy domain_ty)
+                                ; return (mkDepFunTyWithVis DepFunInvisible index body_ty) } }
+              HsTvb _ () (HsBndrVar _ (L _ name)) (HsBndrNoKind _) ->
+                do { domain_meta <- newFlexiTyVarTy liftedTypeKind
+                   ; let temp_index = mark_id (mkLocalId name ManyTy domain_meta)
+                         mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name temp_index }
+                   ; raw_body_ty <- check_bndrs mode' rest
+                   ; domain_ty0 <- liftZonkM (zonkTcType domain_meta)
+                   ; domain_ty1 <- default_unannotated_domain domain_ty0
+                   ; domain_ty <- if valid_domain domain_ty1
+                                  then pure domain_ty1
+                                  else do { ty <- inferRetainedCallbackKinds
+                                                    (L lb (HsTyVar noAnn NotPromoted (noLocA (noUserRdr name)))) domain_ty1
+                                          ; unless (valid_domain ty) $
+                                              failWithTc $ TcRnRetainedQuantificationError
+                                                (RetainedUnsupportedDomain ty)
+                                          ; pure ty }
+                   ; body_ty0 <- liftZonkM (zonkTcType raw_body_ty)
+                   ; case witness_skol of
+                       Just skol | isLiftedTypeKind domain_ty ->
+                         mk_type_witness skol name (Just name) $ \tv ->
+                           pure (replaceTermVarInType temp_index (mkTyVarTy tv) body_ty0)
+                       _ ->
+                         do { check_not_fun domain_ty
+                            ; let index = mark_id (mkLocalId name ManyTy domain_ty)
+                                  body_ty = replaceTermVarInType temp_index (TermVarTy index) body_ty0
+                            ; return (mkDepFunTyWithVis (hsForEachVisibility ann) index body_ty) } }
+              HsTvb _ () (HsBndrWildCard _) (HsBndrNoKind _) ->
+                case witness_skol of
+                  Just skol ->
+                    do { chosen <- newSysName (mkVarOcc "_")
+                       ; mk_type_witness skol chosen Nothing $ \_ -> check_bndrs mode rest }
+                  Nothing ->
+                    failWithTc $ TcRnRetainedQuantificationError (RetainedUnsupportedDomain liftedTypeKind)
+
+        default_unannotated_domain :: TcType -> TcM TcType
+        default_unannotated_domain domain_ty0
+          | Just tv <- getTyVar_maybe domain_ty0
+          , isTcTyVar tv && isMetaTyVar tv
+          = do { liftZonkM (writeMetaTyVar tv liftedTypeKind); pure liftedTypeKind }
+          | Just (tc, [arg]) <- tcSplitTyConApp_maybe domain_ty0
+          , tc == tYPETyCon
+          , Just r_tv <- getTyVar_maybe arg
+          , isTcTyVar r_tv && isMetaTyVar r_tv
+          = do { liftZonkM (writeMetaTyVar r_tv liftedRepTy); pure liftedTypeKind }
+          | otherwise = pure domain_ty0
 
         visible = hsForEachVisibility ann == DepFunVisible
         valid_domain ty = isNativeRetainedBinderType ty
@@ -899,6 +982,22 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
                ; let index = mkLocalId name ManyTy domain_ty
                      mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name index }
                ; (binders, body_ty) <- bind_indices allow mode' rest body
+               ; return (Just index : binders, mkDepFunTy index body_ty) }
+          HsTvb _ () (HsBndrWildCard _) (HsBndrKind _ domain) ->
+            do { domain_ty <- tc_check_lhs_type mode domain liftedTypeKind
+               ; (binders, body_ty) <- bind_indices allow mode rest body
+               ; return (Nothing : binders, tcMkVisFunTy unmatchableDataConTy ManyTy domain_ty body_ty) }
+          HsTvb _ () (HsBndrVar _ (L _ name)) (HsBndrNoKind _) ->
+            do { domain_meta <- newFlexiTyVarTy liftedTypeKind
+               ; let temp_index = mkLocalId name ManyTy domain_meta
+                     mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name temp_index }
+               ; (binders, raw_body_ty) <- bind_indices allow mode' rest body
+               ; domain_ty <- liftZonkM (zonkTcType domain_meta)
+               ; unless (valid_field_domain domain_ty) $
+                   failWithTc $ TcRnRetainedQuantificationError (RetainedUnsupportedDomain domain_ty)
+               ; body_ty0 <- liftZonkM (zonkTcType raw_body_ty)
+               ; let index = mkLocalId name ManyTy domain_ty
+                     body_ty = replaceTermVarInType temp_index (TermVarTy index) body_ty0
                ; return (Just index : binders, mkDepFunTy index body_ty) }
           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedBinderCount
 
@@ -5835,11 +5934,17 @@ checkExpectedKind mode hs_ty ty act_kind exp_kind
 
        ; if act_kind' `tcEqType` exp_kind
          then return res_ty  -- This is very common
-         else do { co_k <- unifyTypeAndEmit KindLevel origin act_kind' exp_kind
-                 ; traceTc "checkExpectedKind" (vcat [ ppr act_kind
-                                                     , ppr exp_kind
-                                                     , ppr co_k ])
-                ; return (res_ty `mkCastTy` co_k) } }
+         else do { mb_forget <- case mode_holes mode of
+                     Just (_, HM_VTA) -> tcForgetMatchabilityArrows origin res_ty act_kind' exp_kind
+                     _                -> pure Nothing
+                 ; case mb_forget of
+                     Just forgotten -> return forgotten
+                     Nothing ->
+                       do { co_k <- unifyTypeAndEmit KindLevel origin act_kind' exp_kind
+                          ; traceTc "checkExpectedKind" (vcat [ ppr act_kind
+                                                              , ppr exp_kind
+                                                              , ppr co_k ])
+                          ; return (res_ty `mkCastTy` co_k) } } }
     where
       -- We need to make sure that both kinds have the same number of implicit
       -- foralls and constraints out front. If the actual kind has more, instantiate
@@ -5863,6 +5968,209 @@ checkExpKind _mode _rn_ty ty ki (Infer cell) = do
   -- See Note [Do not always instantiate eagerly in types]
   co <- fillInferResultNoInst ki cell
   pure (ty `mkCastTy` co)
+
+{- Note [Matchability forgetfulness in visible type applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In Kiss et al. (ICFP 2019, "Higher-Order Type-Level Programming in Haskell"),
+every matchable type constructor f :: k1 %M -> k2 can be eta-expanded to an
+unmatchable type function (\x -> f x) :: k1 %U -> k2. Forgetting Matchable
+drops generativity and injectivity assumptions without inventing new ones,
+whereas converting (k1 %U -> k2) to (k1 %M -> k2) is unsound and remains
+rejected.
+
+When a visible type argument (@ty or required type argument) supplies a
+partially-applied matchable type constructor tc args whose actual kind has
+concrete Matchable arrows where the expected kind has concrete Unmatchable
+arrows (for example @(EqP x) for p :: a %U -> Type in Leibniz equality),
+tcForgetMatchabilityArrows wraps the application in a module-local 1-equation
+first-order closed type family specialized to tc's prefix binders:
+
+  type family $eta$EqP$2$M (a :: Type) (x :: a) (z :: a) :: Type where
+    $eta$EqP$2$M a x z = EqP @a x z
+
+Partially applied to [a, x], $eta$EqP$2$M has kind a %U -> Type with no
+higher-order Matchable binder in the module interface, and saturating it at z
+reduces to EqP @a x z via a closed family axiom. Do not trigger when either
+matchability is an unfilled metavariable or when any arrow requires U -> M.
+-}
+
+-- | Extract @(kind, ty)@ when a type is @TypeRep \@kind ty@.
+tcTypeRepTarget_maybe :: TcType -> TcM (Maybe (TcKind, TcType))
+tcTypeRepTarget_maybe ty
+  | Just (tc, [kind, target]) <- tcSplitTyConApp_maybe ty
+  , occNameFS (nameOccName (tyConName tc)) == fsLit "TypeRep"
+  = do { selector <- tcLookupKnownOccId typeRepIdOcc
+       ; let (_, rep) = tcSplitPhiTy (piResultTys (varType selector) [kind, target])
+       ; pure $ case tcSplitTyConApp_maybe rep of
+           Just (rep_tc, _) | tc == rep_tc -> Just (kind, target)
+           _                               -> Nothing }
+  | otherwise = pure Nothing
+
+-- | Per-module cache of synthesized matchability-forgetfulness family 'TyCon's.
+forgetMTyConCache :: IORef (UniqFM Module (NameEnv TyCon))
+forgetMTyConCache = unsafePerformIO (newIORef emptyUFM)
+{-# NOINLINE forgetMTyConCache #-}
+
+-- | Drain and return all synthesized matchability-forgetfulness 'TyCon's
+-- recorded for the given 'Module'.
+drainForgetMTyCons :: Module -> TcM [TyCon]
+drainForgetMTyCons mod_key = liftIO $
+  atomicModifyIORef' forgetMTyConCache $ \ufm ->
+    case lookupUFM ufm mod_key of
+      Nothing  -> (ufm, [])
+      Just env -> (delFromUFM ufm mod_key, nonDetNameEnvElts env)
+
+-- | Adapt a visible type argument from matchable arrows to unmatchable arrows
+-- via a closed 1-equation eta-expansion family.
+-- See Note [Matchability forgetfulness in visible type applications].
+tcForgetMatchabilityArrows :: CtOrigin -> TcType -> TcKind -> TcKind -> TcM (Maybe TcType)
+tcForgetMatchabilityArrows origin res_ty act_kind0 exp_kind0 = do
+  dep <- xoptM LangExt.ExperimentalDependentTypes
+  if not dep
+    then pure Nothing
+    else do
+      act_k <- liftZonkM (zonkTcType act_kind0)
+      exp_k <- liftZonkM (zonkTcType exp_kind0)
+      case (tcSplitTyConApp_maybe res_ty, plan_forget act_k exp_k) of
+        (Just (tc, tc_args), Just (flags, _doms, _final_res))
+          | or flags -> do
+              mb_eta_tc <- getOrCreateEtaForgetTyCon tc (length tc_args) flags
+              case mb_eta_tc of
+                Just eta_tc -> do
+                  let eta_app = mkTyConApp eta_tc tc_args
+                  co_k <- unifyTypeAndEmit KindLevel origin (typeKind eta_app) exp_kind0
+                  pure (Just (eta_app `mkCastTy` co_k))
+                Nothing -> pure Nothing
+        _ -> pure Nothing
+  where
+    forget_step ma_a ma_e
+      | ma_a `tcEqType` matchableDataConTy && ma_e `tcEqType` unmatchableDataConTy
+      = Just True
+      | ma_a `tcEqType` unmatchableDataConTy && ma_e `tcEqType` unmatchableDataConTy
+      = Just False
+      | otherwise = Nothing
+
+    has_unsound_u_to_m ak ek
+      | FunTy FTF_T_T ma_a _ dom_a res_a <- coreFullView ak
+      , FunTy FTF_T_T ma_e _ dom_e res_e <- coreFullView ek
+      = (ma_a `tcEqType` unmatchableDataConTy && ma_e `tcEqType` matchableDataConTy)
+        || has_unsound_u_to_m dom_a dom_e
+        || has_unsound_u_to_m res_a res_e
+      | otherwise = False
+
+    plan_forget :: TcKind -> TcKind -> Maybe ([Bool], [TcKind], TcKind)
+    plan_forget ak ek
+      | FunTy FTF_T_T ma_a mult_a _dom_a res_a <- coreFullView ak
+      , FunTy FTF_T_T ma_e mult_e dom_e  res_e <- coreFullView ek
+      , isManyTy mult_a, isManyTy mult_e
+      , Just step_forgets <- forget_step ma_a ma_e
+      = case plan_forget res_a res_e of
+          Just (more_flags, more_doms, final_res)
+            | or more_flags
+            -> Just (step_forgets : more_flags, dom_e : more_doms, final_res)
+          _ | step_forgets
+            , not (has_unsound_u_to_m res_a res_e)
+            -> Just ([True], [dom_e], res_e)
+            | otherwise
+            -> Nothing
+      | otherwise = Nothing
+
+getOrCreateEtaForgetTyCon :: TyCon -> Int -> [Bool] -> TcM (Maybe TyCon)
+getOrCreateEtaForgetTyCon tc n_prefix flags = do
+  gbl <- getGblEnv
+  let cur_mod = tcg_mod gbl
+      pat_str = map (\b -> if b then 'M' else 'U') flags
+      tc_str  = occNameString (nameOccName (tyConName tc))
+                ++ "_" ++ show (getUnique tc)
+      occ     = mkTcOcc ("$eta$" ++ tc_str ++ "$" ++ show n_prefix ++ "$" ++ pat_str)
+  fam_name <- newGlobalBinder cur_mod occ Nothing noSrcSpan
+  case lookupTypeEnv (tcg_type_env gbl) fam_name of
+    Just (ATyCon existing) -> pure (Just existing)
+    _ -> do
+      cached_map <- liftIO (readIORef forgetMTyConCache)
+      case lookupUFM cached_map cur_mod >>= (`lookupNameEnv` fam_name) of
+        Just existing -> pure (Just existing)
+        Nothing -> do
+          let init_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfType (tyConKind tc)))
+          mb_prefix <- peel_prefix n_prefix init_subst (tyConKind tc)
+          case mb_prefix of
+            Nothing -> pure Nothing
+            Just (p_tvs, rem_kind) -> do
+              mb_eta <- peel_eta (length flags) rem_kind
+              case mb_eta of
+                Nothing -> pure Nothing
+                Just (z_tvs, final_res_kind) -> do
+                  let all_tvs = p_tvs ++ z_tvs
+                      valid_kinds =
+                        tcIsLiftedTypeKind (typeKind final_res_kind)
+                        && all (tcIsLiftedTypeKind . typeKind . tyVarKind) all_tvs
+                        && not (any (has_matchable_arrow . tyVarKind) all_tvs)
+                  if not valid_kinds
+                    then pure Nothing
+                    else do
+                      ax_name <- newImplicitBinder fam_name mkInstTyCoOcc
+                      let tc_binders = mkNamedTyConBinders (Invisible SpecifiedSpec) p_tvs
+                                       ++ mkAnonTyConBinders z_tvs
+                          tc_kind    = mkTyConKindWithMatchability unmatchableDataConTy
+                                         tc_binders final_res_kind
+                          lhs_pats   = mkTyVarTys all_tvs
+                          rhs_ty     = mkTyConApp tc (mkTyVarTys all_tvs)
+                          branch     = mkCoAxBranch all_tvs [] [] lhs_pats rhs_ty
+                                         (map (const Nominal) all_tvs) noSrcSpan
+                          fam_tc     = mkFamilyTyCon fam_name tc_kind tc_binders 0
+                                         final_res_kind Nothing
+                                         (ClosedTypeFamilyTyCon (CTF (Just axiom)))
+                                         Nothing NotInjective
+                          axiom      = mkBranchedCoAxiom Nominal ax_name fam_tc [branch]
+                      liftIO $ atomicModifyIORef' forgetMTyConCache $ \ufm ->
+                        let env0 = fromMaybe emptyNameEnv (lookupUFM ufm cur_mod)
+                            env1 = extendNameEnv env0 fam_name fam_tc
+                        in (addToUFM ufm cur_mod env1, ())
+                      pure (Just fam_tc)
+  where
+    peel_prefix :: Int -> Subst.Subst -> Kind -> TcM (Maybe ([TyVar], Kind))
+    peel_prefix 0 subst k = pure (Just ([], Subst.substTy subst k))
+    peel_prefix n subst k =
+      case splitPiTy_maybe k of
+        Just (_, Named (Bndr tv0 _), rest_k)
+          | isTyVar tv0 -> do
+              let ki' = Subst.substTy subst (tyVarKind tv0)
+              nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv0))))
+              let tv'    = mkTyVar nm ki'
+                  subst' = Subst.extendTvSubstAndInScope subst tv0 (mkTyVarTy tv')
+              mb <- peel_prefix (n - 1) subst' rest_k
+              pure ((\(tvs, rk) -> (tv' : tvs, rk)) <$> mb)
+        Just (_, Anon (Scaled mult dom0) af, rest_k)
+          | af == FTF_T_T, isManyTy mult -> do
+              let dom' = Subst.substTy subst dom0
+              nm <- newSysName (mkTyVarOcc "p")
+              let tv' = mkTyVar nm dom'
+              mb <- peel_prefix (n - 1) subst rest_k
+              pure ((\(tvs, rk) -> (tv' : tvs, rk)) <$> mb)
+        _ -> pure Nothing
+
+    peel_eta :: Int -> Kind -> TcM (Maybe ([TyVar], Kind))
+    peel_eta 0 k = pure (Just ([], k))
+    peel_eta m k =
+      case coreFullView k of
+        FunTy FTF_T_T _ mult dom rest_k | isManyTy mult -> do
+          nm <- newSysName (mkTyVarOcc "z")
+          let tv' = mkTyVar nm dom
+          mb <- peel_eta (m - 1) rest_k
+          pure ((\(tvs, rk) -> (tv' : tvs, rk)) <$> mb)
+        _ -> pure Nothing
+
+    has_matchable_arrow :: Type -> Bool
+    has_matchable_arrow ty = case coreFullView ty of
+      FunTy _ ma _ a r  -> ma `eqType` matchableDataConTy
+                           || has_matchable_arrow a || has_matchable_arrow r
+      ForAllTy ma b r   -> ma `eqType` matchableDataConTy
+                           || has_matchable_arrow (varType (binderVar b))
+                           || has_matchable_arrow r
+      AppTy f a         -> has_matchable_arrow f || has_matchable_arrow a
+      TyConApp _ args   -> any has_matchable_arrow args
+      CastTy t _        -> has_matchable_arrow t
+      _                 -> False
 
 ---------------------------
 
@@ -5962,7 +6270,14 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
                    ; return (mkTyConApp tc [], tyConKind tc) }
 
            AGlobal AnId{}    -> promotionErr name TermVariablePE
-           ATcId{}           -> promotionErr name TermVariablePE
+           ATcId { tct_id = v } ->
+             do { dep <- xoptM LangExt.ExperimentalDependentTypes
+                ; mb_rep <- if dep
+                            then tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType (varType v))
+                            else pure Nothing
+                ; case mb_rep of
+                    Just (kind, ty) -> return (ty, kind)
+                    Nothing         -> promotionErr name TermVariablePE }
            APromotionErr err -> promotionErr name err
 
            _  -> wrongThingErr WrongThingType thing name }
@@ -7628,13 +7943,12 @@ bindExplicitTKBndrsX skol_mode@(SM { sm_parent = check_parent, sm_kind = ctxt_ki
     tc_hs_bndr_kind _    (HsBndrNoKind _)    = newExpectedKind ctxt_kind
     tc_hs_bndr_kind name (HsBndrKind _ kind)
       = do { checked <- tc_lhs_kind_sig tc_ki_mode (TyVarBndrKindCtxt name) kind
-           ; case checked of
-               FunTy{} | sig_kind_arrows ->
-                 do { owner <- tcl_kind_arrow_defaults <$> getLclEnv
-                    ; case owner of
-                        Just (defaults, _) -> defer_kind_arrows defaults kind checked
-                        Nothing -> pure checked }
-               _ -> pure checked }
+           ; if sig_kind_arrows && (isFunTy checked || isForAllTy checked)
+             then do { owner <- tcl_kind_arrow_defaults <$> getLclEnv
+                     ; case owner of
+                         Just (defaults, _) -> defer_kind_arrows defaults kind checked
+                         Nothing            -> pure checked }
+             else pure checked }
 
     defer_kind_arrows defaults hs_kind checked
       | L _ (HsFunTy _ arrow domain result) <- ignoreParens hs_kind
@@ -7648,7 +7962,35 @@ bindExplicitTKBndrsX skol_mode@(SM { sm_parent = check_parent, sm_kind = ctxt_ki
            ; domain_ty' <- defer_kind_arrows defaults domain domain_ty
            ; result_ty' <- defer_kind_arrows defaults result result_ty
            ; pure (FunTy flag ma' mult domain_ty' result_ty') }
+      | L _ (HsForAllTy _ tele body) <- ignoreParens hs_kind
+      , let (mb_ma, tele_len) = case tele of
+              HsForAllInvis _ m bs -> (m, length bs)
+              HsForAllVis   _ m bs -> (m, length bs)
+            total_hs_foralls = tele_len + count_hs_forall_bndrs (ignoreParens body)
+            (all_core_foralls, after_foralls) = splitForAllForAllTyBinders checked
+            extra_prefix = max 0 (length all_core_foralls - total_hs_foralls)
+      , length all_core_foralls >= extra_prefix + tele_len
+      = do { let (prefix_bndrs, rest0) = splitAt extra_prefix all_core_foralls
+                 (tele_bndrs,   rest1) = splitAt tele_len rest0
+                 inner_ty              = foldr (\(m, b) r -> ForAllTy m b r) after_foralls rest1
+           ; ma_override <- case mb_ma of
+               Nothing -> do { v <- newFlexiTyVar matchabilityTy
+                             ; updTcRef defaults ((v, KindLevel) :)
+                             ; pure (Just (mkTyVarTy v)) }
+               Just _  -> pure Nothing
+           ; inner_ty' <- defer_kind_arrows defaults body inner_ty
+           ; let rebuild (orig_ma, tvb) r = ForAllTy (fromMaybe orig_ma ma_override) tvb r
+           ; pure (foldr (\(m, b) r -> ForAllTy m b r)
+                         (foldr rebuild inner_ty' tele_bndrs)
+                         prefix_bndrs) }
       | otherwise = pure checked
+
+    count_hs_forall_bndrs (L _ (HsForAllTy _ tele body)) =
+      (case tele of
+         HsForAllInvis _ _ bs -> length bs
+         HsForAllVis   _ _ bs -> length bs)
+      + count_hs_forall_bndrs (ignoreParens body)
+    count_hs_forall_bndrs _ = 0
 
     -- Check the HsBndrKind against the kind of the parent type variable,
     -- e.g. the following is rejected:

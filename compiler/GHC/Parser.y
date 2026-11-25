@@ -2607,11 +2607,11 @@ exists_separator :: { Either (EpToken "|") (EpToken ".") }
          : '|' { Left (epTok $1) }
          | '.' { Right (epTok $1) }
 
-some_bndrs1 :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")] }
+some_bndrs1 :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "\8759", LHsType GhcPs, EpToken ")")] }
          : some_bndr_group              { $1 }
          | some_bndr_group some_bndrs1  { $1 ++ $2 }
 
-some_bndr_group :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")] }
+some_bndr_group :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "\8759", LHsType GhcPs, EpToken ")")] }
          : '(' tyvar '::' ctype ')'
              { [(epTok $1, $2, epUniTok $3, $4, epTok $5)] }
          | '(' tyvar tyvars1 '::' ctype ')'
@@ -5009,12 +5009,23 @@ fromTrailingN :: SrcSpanAnnN -> SrcSpanAnnA
 fromTrailingN (EpAnn anc ann cs)
     = EpAnn anc (nann_trailing ann) cs
 
+-- | Validate specificity annotations on a parsed @foreach@ binder list.
+-- Reject @InferredSpec@ braces on visible @foreach ->@ telescopes, and record
+-- @InferredSpec@ in @atv_tv@ on invisible @foreach .@ binders.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 checkForEachBndrs :: Either TokRarrow (EpToken ".")
                   -> [LHsTyVarBndr Specificity GhcPs]
                   -> P [LHsTyVarBndr () GhcPs]
 checkForEachBndrs (Left _)  bndrs = fromSpecTyVarBndrs bndrs
-checkForEachBndrs (Right _) bndrs = pure [ L loc (b { tvb_flag = () }) | L loc b <- bndrs ]
+checkForEachBndrs (Right _) bndrs = pure
+  [ L loc (b { tvb_ext  = case tvb_flag b of
+                            InferredSpec  -> (tvb_ext b) { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine 1) []) }
+                            SpecifiedSpec -> (tvb_ext b) { atv_tv = noEpTok }
+             , tvb_flag = () })
+  | L loc b <- bndrs ]
 
+-- | Fold a non-empty @exists@ binder list right-associatively into nested 'HsTypeExists' nodes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 mkHsExistsTelescope :: Located Token
                     -> [LHsTyVarBndr Specificity GhcPs]
                     -> Either (EpToken "|") (EpToken ".")
@@ -5033,8 +5044,10 @@ mkHsExistsTelescope kw bndrs sep body = case bndrs of
       amsA' (L (comb2 b body) (XHsType (HsTypeExists (noEpTok, sep) b inner)))
     go [] = panic "mkHsExistsTelescope.go: empty"
 
+-- | Fold a non-empty @some@ binder list right-associatively into nested 'HsTypeSome' nodes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 mkHsSomeTelescope :: Located Token
-                  -> [(EpToken "(", LocatedN RdrName, EpUniToken "::" "∷", LHsType GhcPs, EpToken ")")]
+                  -> [(EpToken "(", LocatedN RdrName, EpUniToken "::" "\8759", LHsType GhcPs, EpToken ")")]
                   -> EpToken "|"
                   -> LHsType GhcPs
                   -> P (LHsType GhcPs)

@@ -9,4 +9,6 @@ coVarDetails :: IdDetails
 isCoVarDetails :: IdDetails -> Bool
 isJoinIdDetails :: IdDetails -> Bool
 pprIdDetails :: IdDetails -> SDoc
+inferredRetainedIdInfo :: IdInfo -> Bool
+setInferredRetainedIdInfo :: Bool -> IdInfo -> IdInfo
 

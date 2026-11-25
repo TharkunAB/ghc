@@ -33,11 +33,14 @@ import GHC.Prelude
 import GHC.ByteCode.Types
 
 import GHC.Driver.Session
+import GHC.Driver.Env ( hsc_NC )
 import GHC.Driver.Config.Core.Lint ( initLintConfig )
 
 import GHC.Builtin.CoercionRules (builtInCoAxiomRules)
 import GHC.Builtin.WiredIn.Types
 
+import GHC.Iface.Binary ( getWithUserData )
+import GHC.Iface.Ext.Fields ( inferredRetainedBindersField, readFieldWith )
 import GHC.Iface.Syntax
 import GHC.Iface.Load
 import GHC.Iface.Env
@@ -1063,7 +1066,14 @@ mk_top_id (IfLclTopBndr raw_name iface_type info details) = do
 
 -- | Read declarations, omitting optional templates outside the supported subset.
 tcIfaceDeclsFromIface :: Bool -> ModIface -> IfL [(Name, TyThing)]
-tcIfaceDeclsFromIface ignore_prags = tcIfaceDecls ignore_prags . ifaceDeclsForTc
+tcIfaceDeclsFromIface ignore_prags iface = do
+  hsc_env <- getTopEnv
+  mb_inferred <- liftIO $
+    readFieldWith inferredRetainedBindersField
+      (getWithUserData (hsc_NC hsc_env))
+      (mi_ext_fields iface)
+  let inferred_env = maybe emptyNameEnv mkNameEnv mb_inferred
+  concatMapM (tc_iface_decl_with_inferred inferred_env ignore_prags) (ifaceDeclsForTc iface)
 
 tcIfaceDecls :: Bool
           -> [(Fingerprint, IfaceDecl)]
@@ -1109,12 +1119,29 @@ tc_iface_decl_fingerprint :: Bool                    -- Don't load pragmas into 
           -> (Fingerprint, IfaceDecl)
           -> IfL [(Name,TyThing)]   -- The list can be poked eagerly, but the
                                     -- TyThings are forkM'd thunks
-tc_iface_decl_fingerprint ignore_prags (_version, decl)
+tc_iface_decl_fingerprint = tc_iface_decl_with_inferred emptyNameEnv
+
+tc_iface_decl_with_inferred :: NameEnv [Bool]
+          -> Bool
+          -> (Fingerprint, IfaceDecl)
+          -> IfL [(Name,TyThing)]
+tc_iface_decl_with_inferred inferred_env ignore_prags (_version, decl)
   = do  {       -- Populate the name cache with final versions of all
                 -- the names associated with the decl
           let !main_name = ifName decl
                 -- Force this field access, as `main_name` thunk will otherwise
                 -- be retained in the thunk created by `forkM`.
+              restore_inferred nm thing0
+                | Just flags <- lookupNameEnv inferred_env nm
+                = case thing0 of
+                    AnId v ->
+                      AnId (setVarType v (snd (applyInferredRetainedBinderFlags flags (varType v))))
+                    ATyCon tc | Just rhs <- synTyConRhs_maybe tc ->
+                      let rhs' = snd (applyInferredRetainedBinderFlags flags rhs)
+                      in ATyCon (buildSynTyCon (tyConName tc) (tyConKind tc) (tyConBinders tc)
+                                               (tyConResKind tc) (tyConRoles tc) rhs')
+                    _ -> thing0
+                | otherwise = thing0
 
         -- Typecheck the thing, lazily
         -- NB. Firstly, the laziness is there in case we never need the
@@ -1124,7 +1151,8 @@ tc_iface_decl_fingerprint ignore_prags (_version, decl)
         -- which includes its nameParent.
 
         ; thing <- forkM doc $ do { bumpDeclStats main_name
-                                  ; tcIfaceDecl ignore_prags decl }
+                                  ; thing0 <- tcIfaceDecl ignore_prags decl
+                                  ; return (restore_inferred main_name thing0) }
 
         -- Populate the type environment with the implicitTyThings too.
         --

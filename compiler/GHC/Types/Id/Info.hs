@@ -26,6 +26,7 @@ module GHC.Types.Id.Info (
         IdInfo,         -- Abstract
         vanillaIdInfo, noCafIdInfo,
         sourceProofRuleInfo, setSourceProofRuleInfo,
+        inferredRetainedIdInfo, setInferredRetainedIdInfo,
 
         -- ** The OneShotInfo type
         OneShotInfo(..),
@@ -558,7 +559,7 @@ data IdInfo
 --
 -- - Bit   0   (1):  OneShotInfo
 -- - Bit   1   (1):  CafInfo
--- - Bit   2   (1):  unused
+-- - Bit   2   (1):  InferredSpec flag on invisible retained DepFunTy binders
 -- - Bits  3-32(30): Call Arity info
 -- - Bits 33-62(30): Arity info
 --
@@ -574,6 +575,9 @@ bitfieldGetOneShotInfo (BitField bits) =
 bitfieldGetCafInfo :: BitField -> CafInfo
 bitfieldGetCafInfo (BitField bits) =
     if testBit bits 1 then NoCafRefs else MayHaveCafRefs
+
+bitfieldGetInferredRetained :: BitField -> Bool
+bitfieldGetInferredRetained (BitField bits) = testBit bits 2
 
 bitfieldGetCallArityInfo :: BitField -> ArityInfo
 bitfieldGetCallArityInfo (BitField bits) =
@@ -594,6 +598,10 @@ bitfieldSetCafInfo info (BitField bits) =
     case info of
       MayHaveCafRefs -> BitField (clearBit bits 1)
       NoCafRefs -> BitField (setBit bits 1)
+
+bitfieldSetInferredRetained :: Bool -> BitField -> BitField
+bitfieldSetInferredRetained flag (BitField bits) =
+    if flag then BitField (setBit bits 2) else BitField (clearBit bits 2)
 
 bitfieldSetCallArityInfo :: ArityInfo -> BitField -> BitField
 bitfieldSetCallArityInfo info bf@(BitField bits) =
@@ -705,6 +713,15 @@ setCprSigInfo info cpr = cpr `seq` info { cprSigInfo = cpr }
 -- | Retain the dependencies of checked source evidence on this export.
 setSourceProofRuleInfo :: IdInfo -> [SourceProofRule] -> IdInfo
 setSourceProofRuleInfo info deps = info { sourceProofRuleInfo = deps }
+
+-- | Test whether an invisible retained 'DepFunTy' binder has 'InferredSpec'.
+inferredRetainedIdInfo :: IdInfo -> Bool
+inferredRetainedIdInfo = bitfieldGetInferredRetained . bitfield
+
+-- | Record whether an invisible retained 'DepFunTy' binder has 'InferredSpec'.
+setInferredRetainedIdInfo :: Bool -> IdInfo -> IdInfo
+setInferredRetainedIdInfo flag info =
+    info { bitfield = bitfieldSetInferredRetained flag (bitfield info) }
 
 -- | Basic 'IdInfo' that carries no useful information whatsoever
 vanillaIdInfo :: IdInfo

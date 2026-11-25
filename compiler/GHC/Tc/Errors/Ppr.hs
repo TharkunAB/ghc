@@ -3765,7 +3765,7 @@ pprRetainedQuantificationError reason = case reason of
     text "Invisible retained arguments are not supported in constructor signatures."
   RetainedInvisibleArgument binder ->
     vcat [ text "Cannot infer the invisible retained argument" <+> quotes (ppr binder)
-         , text "Supply an argument with" <+> quotes (text "@{...}")
+         , text "Supply an argument with" <+> quotes (text "@...")
            <+> text "or use a later value argument whose type determines a runtime value of type"
            <+> ppr (varType binder) <> dot ]
   RetainedArgumentExtension ->

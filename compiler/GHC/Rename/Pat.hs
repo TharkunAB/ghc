@@ -518,6 +518,16 @@ rnLArgPatAndThen mk = wrapSrcSpanCps rnArgPatAndThen where
     tp' <- rnHsTyPat HsTypePatCtx tp
     liftCps $ unlessXOptM LangExt.TypeAbstractions $
       addErr (TcRnIllegalInvisibleTypePattern tp' InvisPatWithoutFlag)
+    let ex_tvs = hstp_exp_tvs (hstp_ext tp') ++ hstp_imp_tvs (hstp_ext tp')
+    liftCpsWithCont $ \k -> do
+      dep <- xoptM LangExt.ExperimentalDependentTypes
+      if dep && not (null ex_tvs)
+        then do
+          rdr_env <- getLocalRdrEnv
+          let rdr_env' = foldl' (\e tv -> extendLocalRdrEnvWithAlias e (setOccNameSpace varName (nameOccName tv)) tv)
+                                rdr_env ex_tvs
+          setLocalRdrEnv rdr_env' (k ())
+        else k ()
     pure (InvisPat spec tp')
   rnArgPatAndThen p = rnPatAndThen mk p
 

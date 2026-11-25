@@ -67,7 +67,7 @@ import GHC.Core.Dependent ( hasNativeDependentExpr, supportsQuickLookType )
 import GHC.Core.Utils (applyTypeToArgs)
 import GHC.Core.UsageEnv
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Core.Make (rEC_CON_ERROR_ID, tYPE_ERROR_ID)
+import GHC.Core.Make (mkCoreConApps, rEC_CON_ERROR_ID, tYPE_ERROR_ID)
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
@@ -84,7 +84,7 @@ import GHC.Types.Unique.Map
 import GHC.Types.Unique.Set
 import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar
                      , isInferredForAllTyFlag, isSpecifiedForAllTyFlag )
-import GHC.Types.Var.Set (elemVarSet, isEmptyVarSet)
+import GHC.Types.Var.Set (elemVarSet, isEmptyVarSet, mkVarSet)
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name
@@ -111,11 +111,13 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
+import GHC.Data.Bag (listToBag, unionBags)
 import GHC.Data.List.SetOps
 import GHC.Data.Maybe
 import GHC.Data.FastString (bytesFS, fastStringToShortText, fsLit, mkFastString)
 
 import Control.Monad
+import Data.Data (Data, cast, gmapQ)
 import Data.List (transpose)
 import qualified Data.List.NonEmpty as NE
 
@@ -250,7 +252,17 @@ tcPolyExprCheck expr res_ty
           -- before handing off to tcExpr
           tc_body e = do { ds_flag <- getDeepSubsumptionFlag
                          ; inner_skolemise ds_flag rho_ty $ \rho_ty' ->
-                           tcExpr e (mkCheckExpType rho_ty') }
+                           do { dep <- xoptM LangExt.ExperimentalDependentTypes
+                              ; mb_rep <- if dep
+                                          then tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType rho_ty')
+                                          else pure Nothing
+                              ; as_ty <- if isJust mb_rep
+                                         then isUnadornedTypeExpr e
+                                         else pure False
+                              ; if as_ty
+                                then do { wc_ty <- expr_to_type (noLocA e)
+                                        ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
+                                else tcExpr e (mkCheckExpType rho_ty') } }
         in tc_body expr
 
     -- `outer_skolemise` checks expressions that need runtime abstraction.
@@ -1313,7 +1325,7 @@ tcExpr expr@(HsEmbTy _ written) expected
                                do { arg <- tcHsTypeApp written kind
                                   ; let args = [kind, arg]
                                         (theta, actual) = tcSplitPhiTy (piResultTys (idType selector) args)
-                                  ; wrap <- instCall (exprCtOrigin expr) args theta
+                                  ; wrap <- instCallWithLocalTypeReps expr written arg args theta
                                   ; let call = mkHsWrap wrap (mkHsVar (noLocA selector))
                                   ; result <- tcWrapResultMono expr call actual expected
                                   ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA result)))) }
@@ -1330,9 +1342,13 @@ tcExpr (HsStar _)         _ = failWith (TcRnIllegalTypeExpr StarKindSyntax)
 {- Note [Reflecting a checked type operand]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In an expression checked against TypeRep t, ExperimentalDependentTypes
-allows (type t) to supply the runtime witness. Check the written type at
-the expected kind and instantiate the same selector as typeRep. This
-requires Typeable t, including when t is an abstract type variable.
+allows (type t) and unadorned type arguments to supply the runtime witness.
+Check the written type at the expected kind and instantiate the same selector
+as typeRep. This requires Typeable t. When the written type references a local
+TypeRep witness variable (for example from `foreach (a :: Type)`), wrap that
+witness in Typeable's single-method dictionary so compound type arguments such
+as `ex5 (Maybe a)` resolve without forcing unused witnesses. An erased forall
+binder has no local TypeRep value, so `(type a)` still requires Typeable a.
 Identify TypeRep from the selector's result so that aliases work and a
 locally declared type with the same name keeps its ordinary meaning.
 
@@ -3415,3 +3431,77 @@ checkMissingFields con_like rbinds arg_tys
     field_strs = conLikeImplBangs con_like
 
     fl `elemField` flds = any (\ fl' -> flSelector fl == fl') flds
+
+-- | Instantiate a reflected 'TypeRep' selector call, supplying 'Typeable'
+-- evidence from any local @TypeRep@ witness variables referenced in @written@.
+-- See Note [Reflecting a checked type operand].
+instCallWithLocalTypeReps :: HsExpr GhcRn -> LHsWcType GhcRn -> TcType
+                          -> [TcType] -> TcThetaType -> TcM HsWrapper
+instCallWithLocalTypeReps expr written arg args theta = do
+  reps <- collect_reps emptyUniqSet (collect_names (hswc_body written))
+  if null reps
+    then instCall (exprCtOrigin expr) args theta
+    else do
+      mapM_ (\(v_id, _, _) -> tcEmitBindingUsage (singleUsageUE v_id)) reps
+      typeableClass <- tcLookupKnownKeyClass typeableClassKey
+      let cls_tc = classTyCon typeableClass
+          dc     = tyConSingleDataCon cls_tc
+      givens <- newEvVars [ mkTyConApp cls_tc [v_kind, v_ty]
+                          | (_, v_kind, v_ty) <- reps ]
+      (ev_binds, wrap) <- checkConstraints (UnifyForAllSkol arg) [] givens $
+                            instCall (exprCtOrigin expr) args theta
+      let given_binds =
+            [ mkGivenEvBind g
+                (EvExpr (mkCoreConApps dc [Core.Type v_kind, Core.Type v_ty, Core.Var v_id]))
+            | (g, (v_id, v_kind, v_ty)) <- zip givens reps ]
+      ev_binds' <- case ev_binds of
+        TcEvBinds binds -> do
+          mapM_ (addTcEvBind binds) given_binds
+          addNeededEvIds binds (mkVarSet givens)
+          pure ev_binds
+        EvBinds binds ->
+          pure (EvBinds (listToBag given_binds `unionBags` binds))
+      pure (mkWpLet ev_binds' <.> wrap)
+  where
+    collect_names :: Data a => a -> [Name]
+    collect_names x =
+      [ unwrapUserRdr w | Just (w :: WithUserRdr Name) <- [cast x] ]
+      ++ concat (gmapQ collect_names x)
+
+    collect_reps :: UniqSet Id -> [Name] -> TcM [(Id, TcKind, TcType)]
+    collect_reps _ [] = pure []
+    collect_reps seen (nm : nms) = do
+      mb_cand <- lookup_rep nm
+      case mb_cand of
+        Just (v_id, v_kind, v_ty)
+          | not (v_id `elementOfUniqSet` seen) -> do
+              rest <- collect_reps (addOneToUniqSet seen v_id) nms
+              pure ((v_id, v_kind, v_ty) : rest)
+        _ -> collect_reps seen nms
+
+    lookup_rep :: Name -> TcM (Maybe (Id, TcKind, TcType))
+    lookup_rep nm = do
+      mb_lcl <- tcLookupLcl_maybe nm
+      case mb_lcl of
+        Just (ATcId { tct_id = v_id }) -> do
+          v_ty_full <- liftZonkM (zonkTcType (varType v_id))
+          mb_rep <- tcTypeRepTarget_maybe v_ty_full
+          pure $ fmap (\(k, t) -> (v_id, k, t)) mb_rep
+        Just (ATyVar _ tv) -> do
+          lcl_rdr <- getLocalRdrEnv
+          let term_rdr = mkRdrUnqual (setOccNameSpace varName (nameOccName nm))
+          case lookupLocalRdrEnv lcl_rdr term_rdr of
+            Just term_nm -> do
+              mb_term <- tcLookupLcl_maybe term_nm
+              case mb_term of
+                Just (ATcId { tct_id = v_id }) -> do
+                  v_ty_full <- liftZonkM (zonkTcType (varType v_id))
+                  mb_rep <- tcTypeRepTarget_maybe v_ty_full
+                  case mb_rep of
+                    Just (k, t) -> do
+                      tv_ty <- liftZonkM (zonkTcType (mkTyVarTy tv))
+                      pure $ if tcEqType t tv_ty then Just (v_id, k, t) else Nothing
+                    Nothing -> pure Nothing
+                _ -> pure Nothing
+            Nothing -> pure Nothing
+        _ -> pure Nothing

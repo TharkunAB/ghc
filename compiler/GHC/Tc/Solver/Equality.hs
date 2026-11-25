@@ -2825,30 +2825,35 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
     then finish_with_swapping
     else finish_without_swapping
 
-  | TyFamLHS _fun_tc1 fun_args1 <- lhs1
-  , TyFamLHS _fun_tc2 fun_args2 <- lhs2
-  -- Don't decompose, but maybe re-orient
-  = do { traceTcS "canEqCanLHS2 two type families" (ppr lhs1 $$ ppr lhs2)
-       ; tclvl <- getTcLevel
-       ; let tvs1 = tyCoVarsOfTypes fun_args1
-             tvs2 = tyCoVarsOfTypes fun_args2
+  | TyFamLHS fun_tc1 fun_args1 <- lhs1
+  , TyFamLHS fun_tc2 fun_args2 <- lhs2
+  -- Don't decompose Givens, but unify a touchable argument on a stuck
+  -- source-table Wanted when that makes both sides identical, or re-orient.
+  = do { mb_solved <- tryUnifyStuckSourceFamWanted ev eq_rel mco fun_tc1 fun_args1 fun_tc2 fun_args2
+       ; case mb_solved of
+           Just solved -> return solved
+           Nothing -> do
+             { traceTcS "canEqCanLHS2 two type families" (ppr lhs1 $$ ppr lhs2)
+             ; tclvl <- getTcLevel
+             ; let tvs1 = tyCoVarsOfTypes fun_args1
+                   tvs2 = tyCoVarsOfTypes fun_args2
 
-             -- See Note [Orienting TyFamLHS/TyFamLHS]
-             swap_for_size = typesSize fun_args2 > typesSize fun_args1
+                   -- See Note [Orienting TyFamLHS/TyFamLHS]
+                   swap_for_size = typesSize fun_args2 > typesSize fun_args1
 
-             -- See Note [Orienting TyFamLHS/TyFamLHS]
-             meta_tv_lhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs1
-             meta_tv_rhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs2
-             swap_for_rewriting = meta_tv_rhs && not meta_tv_lhs
-                                  -- See Note [Put touchable variables on the left]
-                                  -- This second check is just to avoid unfruitful swapping
+                   -- See Note [Orienting TyFamLHS/TyFamLHS]
+                   meta_tv_lhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs1
+                   meta_tv_rhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs2
+                   swap_for_rewriting = meta_tv_rhs && not meta_tv_lhs
+                                        -- See Note [Put touchable variables on the left]
+                                        -- This second check is just to avoid unfruitful swapping
 
-         -- It's important that we don't flip-flop (#T24134)
-         -- So swap_for_rewriting "wins", and we only try swap_for_size
-         -- if swap_for_rewriting doesn't care either way
-       ; if swap_for_rewriting || (meta_tv_lhs == meta_tv_rhs && swap_for_size)
-         then finish_with_swapping
-         else finish_without_swapping }
+               -- It's important that we don't flip-flop (#T24134)
+               -- So swap_for_rewriting "wins", and we only try swap_for_size
+               -- if swap_for_rewriting doesn't care either way
+             ; if swap_for_rewriting || (meta_tv_lhs == meta_tv_rhs && swap_for_size)
+               then finish_with_swapping
+               else finish_without_swapping } }
   where
     sym_mco = mkSymMCo mco
     role    = eqRelRole eq_rel
@@ -2868,6 +2873,110 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
                  lhs2_redn = mkGReflLeftMRedn  role lhs2_ty mco
            ; new_ev <-rewriteEqEvidence ev swapped lhs1_redn lhs2_redn emptyCoHoleSet
            ; canEqCanLHSFinish new_ev eq_rel IsSwapped lhs2 (ps_xi1 `mkCastTyMCo` sym_mco) }
+
+{- Note [Unifying touchable arguments of stuck source-table Wanteds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose a source-table family T:rename is applied to an abstract rigid skolem
+argument m :: Term g a on both sides of a nominal Wanted equality:
+
+  [W] co :: T:rename g d a r0 m ~#N T:rename g d a (T:ext g d b r) m
+
+Neither side can reduce because m is a universally quantified skolem. Decomposing
+a Given equality of this form would be unsound because T:rename is not injective
+(for example T:rename f Zero = Zero = T:rename g Zero). For a Wanted equality,
+however, unifying the touchable unification variable r0 := T:ext g d b r makes
+both sides syntactically identical and solves co by Refl with no new axioms.
+
+Require:
+1. A Wanted nominal equality with MRefl kind coercion and empty rewriter set.
+2. The same source-table family TyCon (T:f) on both sides.
+3. At least one paired argument slot holding the same rigid skolem TyVar.
+4. Every non-equal paired argument slot has a bare touchable MetaTyVar on one
+   side whose candidate RHS has identical kind and passes simpleUnifyCheck /
+   checkTyEqRhs with a reflexive reduction.
+5. Substituting those bindings makes the two TyConApps equal via eqType.
+-}
+
+-- | Unify touchable unification variables in a stuck source-table Wanted
+-- equality when doing so makes both family applications identical (`Refl`).
+-- See Note [Unifying touchable arguments of stuck source-table Wanteds].
+tryUnifyStuckSourceFamWanted
+  :: CtEvidence -> EqRel -> MCoercion
+  -> TyCon -> [TcType] -> TyCon -> [TcType]
+  -> TcS (Maybe (StopOrContinue (Either IrredCt EqCt)))
+tryUnifyStuckSourceFamWanted ev eq_rel mco fun_tc1 args1 fun_tc2 args2
+  | CtWanted wev <- ev
+  , NomEq <- eq_rel
+  , MRefl <- mco
+  , wantedCtHasNoRewriters wev
+  , fun_tc1 == fun_tc2
+  , isJust (sourceTableTermOcc (nameOccName (tyConName fun_tc1)))
+  , args1 `equalLength` args2
+  , any same_rigid_skolem (zip args1 args2)
+  , Just raw_pairs <- collect_mismatches [] (zip args1 args2)
+  , not (null raw_pairs)
+  , let pair_tvs = mkVarSet (map fst raw_pairs)
+  , not (any (\(_, rhs) -> anyFreeVarsOfType (`elemVarSet` pair_tvs) rhs) raw_pairs)
+  = do { given_eq_lvl <- getInnermostGivenEqLevel
+       ; checked <- check_all given_eq_lvl emptyBag raw_pairs
+       ; case checked of
+           Just work ->
+             let tvs       = map fst raw_pairs
+                 rhss      = map snd raw_pairs
+                 subst_ty  = substTyWith tvs rhss
+                 final_lhs = mkTyConApp fun_tc1 (map subst_ty args1)
+                 final_rhs = mkTyConApp fun_tc2 (map subst_ty args2)
+             in if final_lhs `eqType` final_rhs
+                then do { emitWork work
+                        ; mapM_ (uncurry unifyTyVar) raw_pairs
+                        ; setEqIfWanted ev (mkReflCPH NomEq final_lhs)
+                        ; kickOutAfterUnification pair_tvs
+                        ; return (Just (Stop ev (text "Solved stuck source-family Wanted by unification"))) }
+                else return Nothing
+           Nothing -> return Nothing }
+  | otherwise
+  = return Nothing
+  where
+    same_rigid_skolem (a1, a2)
+      | Just v1 <- getTyVar_maybe a1
+      , Just v2 <- getTyVar_maybe a2
+      = v1 == v2 && isTcTyVar v1 && isSkolemTyVar v1
+      | otherwise = False
+
+    pick_pair (a1, a2)
+      | Just tv <- getTyVar_maybe a1
+      , mightPossiblyUnify ev eq_rel tv
+      , typeKind a1 `eqType` typeKind a2
+      = Just (tv, a2)
+      | Just tv <- getTyVar_maybe a2
+      , mightPossiblyUnify ev eq_rel tv
+      , typeKind a2 `eqType` typeKind a1
+      = Just (tv, a1)
+      | otherwise = Nothing
+
+    collect_mismatches acc [] = Just (reverse acc)
+    collect_mismatches acc ((a1, a2) : rest)
+      | a1 `tcEqType` a2 = collect_mismatches acc rest
+      | Just (tv, rhs) <- pick_pair (a1, a2) =
+          case lookup tv acc of
+            Nothing -> collect_mismatches ((tv, rhs) : acc) rest
+            Just prev_rhs
+              | prev_rhs `tcEqType` rhs -> collect_mismatches acc rest
+              | otherwise               -> Nothing
+      | otherwise = Nothing
+
+    check_all _ work [] = return (Just work)
+    check_all given_eq_lvl work ((tv, rhs) : rest) =
+      case simpleUnifyCheck UC_Solver given_eq_lvl tv rhs of
+        SUC_CannotUnify -> return Nothing
+        SUC_CanUnify    -> check_all given_eq_lvl work rest
+        SUC_NotSure     -> do
+          let flags = unifyingLHSMetaTyVar_TEFTask ev tv
+          res <- wrapTcS (checkTyEqRhs flags rhs)
+          case res of
+            PuOK cts rhs_redn | isReflRedn rhs_redn ->
+              check_all given_eq_lvl (work `unionBags` cts) rest
+            _ -> return Nothing
 
 
 {- Note [Orienting TyVarLHS/TyFamLHS]
