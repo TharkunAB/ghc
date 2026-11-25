@@ -3702,30 +3702,30 @@ type LintLevel = Int
 -- If you edit this type, you may need to update the GHC formalism
 -- See Note [GHC Formalism]
 data LintEnv
-  = LE { le_scoped_dictionaries :: Bool
-       , le_flags    :: LintFlags       -- Linting the result of this pass
+  = LE { le_scoped_dictionaries :: !Bool
+       , le_flags    :: !LintFlags      -- Linting the result of this pass
        , le_loc      :: [LintLocInfo]   -- Locations
-       , le_level    :: LintLevel
-       , le_in_scope :: InScopeSet
+       , le_level    :: !LintLevel
+       , le_in_scope :: !InScopeSet
 
-       , le_vars     :: VarEnv (Var, LintLevel)
+       , le_vars     :: !(VarEnv (Var, LintLevel))
                      -- Maps a Var (i.e. its unique) to its binding Var and level
                      -- /All/ in-scope variables are here (term variables,
                      --    type variables, and coercion variables)
                      -- So the domain is the same as the le_in_scope in-scope set
                      -- Used at an occurrence of the Var
 
-       , le_joins :: UniqMap Id JoinOcc
+       , le_joins :: !(UniqMap Id JoinOcc)
            -- ^ Join points in scope that are valid
            -- See Note [Join points]
 
-       , le_ue_aliases :: NameEnv UsageEnv
+       , le_ue_aliases :: !(NameEnv UsageEnv)
              -- See Note [Linting linearity]
              -- Assigns usage environments to the alias-like binders,
              -- as found in non-recursive lets.
 
-       , le_platform   :: Platform         -- ^ Target platform
-       , le_diagOpts   :: DiagOpts         -- ^ Target platform
+       , le_platform   :: !Platform        -- ^ Target platform
+       , le_diagOpts   :: !DiagOpts        -- ^ Target platform
        }
 
 data LintFlags
@@ -4180,7 +4180,7 @@ addInScopeId id thing_inside
             , le_in_scope = in_scope `extendInScopeSet` id
             , le_joins = valid_joins', le_ue_aliases = aliases' }
       where
-        level1 = level + 1
+        !level1 = level + 1
 
         in_vars' = extendVarEnv id_vars id (id, level1)
         aliases' = delFromNameEnv aliases (idName id)
@@ -4198,7 +4198,7 @@ addInScopeTyCoVar :: TyCoVar -> LintM a -> LintM a
 addInScopeTyCoVar tcv thing_inside
   = LintM $ \ env@(LE { le_level = level, le_vars = in_vars
                       , le_in_scope = in_scope }) errs ->
-    let level' = level + 1
+    let !level' = level + 1
         env' = env { le_level = level'
                    , le_in_scope = in_scope `extendInScopeSet` tcv
                    , le_vars = extendVarEnv in_vars tcv (tcv, level') }
