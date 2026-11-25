@@ -80,7 +80,7 @@ import qualified GHC.Core.TyCo.Subst as Subst
 import GHC.Core.Type ( coreFullView, expandTypeSynonyms, isManyTy, splitTyConApp_maybe
                      , anyFreeVarsOfType, typeKind, isNativeIndexFunctionId, isNativeOpaqueValueId
                      , isInvisibleForAllTyFlag, isNativeIndexId, nativeIndexDataConTyArgs
-                     , splitFunTy_maybe, nativeCallSpine_maybe )
+                     , splitFunTy_maybe, nativeCallSpine_maybe, isInferredRetainedBinder )
 import GHC.Core.Coercion ( CoercionR, MCoercion(MRefl, MCo), mkCoVarCo, mkCoCast, coercionType, isReflCo
                          , mkSymCo, mkSubCo, coercionKind, coercionLKind
                          , mkFunCo, mkFunResCo, mkHomoForAllCos
@@ -112,7 +112,7 @@ import GHC.Types.Name.Reader
 import GHC.Types.Name.Set
 import GHC.Types.Unique.Set (sizeUniqSet)
 import GHC.Types.Id
-import GHC.Types.Var ( binderFlag, EvVar, DepFunTyFlag(..), ExistsTyFlag(ImplicitExists), VarBndr(Bndr), varType, tyVarKind, isCoVar, isTyVar, isVisibleFunArg, isInferredForAllTyFlag )
+import GHC.Types.Var ( binderFlag, EvVar, DepFunTyFlag(..), ExistsTyFlag(ImplicitExists), Specificity(SpecifiedSpec), VarBndr(Bndr), varType, tyVarKind, isCoVar, isTyVar, isVisibleFunArg, isInferredForAllTyFlag )
 import GHC.Types.Var.Env ( mkInScopeSetList, unitVarEnv )
 import GHC.Types.Var.Set ( mkVarSet )
 import GHC.Types.SrcLoc
@@ -163,9 +163,10 @@ tcFunBindMatches ctxt fun_name mult source_matches invis_pat_tys source_exp_ty
           source_arity <- checkArgCounts source_matches
         ; let (visibility_wrap, matches, exp_ty, arity)
                 | Check ty <- source_exp_ty
+                , not (rhs_has_invis_lam source_matches)
                 , (indices@(_:_), co) <- exposeInvisibleRetained ty
                 = ( mkWpCastR co
-                  , source_matches { mg_alts = fmap (map (addInvisibleRetainedPatterns indices)) (mg_alts source_matches) }
+                  , source_matches { mg_alts = fmap (map (alignInvisibleRetainedPatterns True invis_pat_tys indices)) (mg_alts source_matches) }
                   , mkCheckExpType (coercionLKind co)
                   , source_arity + length indices )
                 | otherwise = (idHsWrapper, source_matches, source_exp_ty, source_arity)
@@ -182,7 +183,8 @@ tcFunBindMatches ctxt fun_name mult source_matches invis_pat_tys source_exp_ty
 
         ; (wrap_fun, r)
              <- case exp_ty of
-                  Check ty | hasRetainedFunTy ty
+                  Check ty | not (rhs_has_invis_lam source_matches)
+                           , hasRetainedFunTy ty
                     -> tcScalingUsage mult $
                        tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
                   _ -> matchExpectedFunTys herald ctxt arity exp_ty tc_matches
@@ -190,6 +192,16 @@ tcFunBindMatches ctxt fun_name mult source_matches invis_pat_tys source_exp_ty
         ; return (visibility_wrap <.> wrap_fun, r) }
   where
     mctxt  = mkPrefixFunRhs (noLocA fun_name) noAnn
+
+    rhs_has_invis_lam (MG { mg_alts = L _ [L _ Match { m_pats = L _ []
+                                                     , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body) :| [] } }] })
+      | L _ (HsLam _ _ (MG { mg_alts = L _ (L _ Match { m_pats = L _ (L _ InvisPat{} : _) } : _) }))
+          <- unparen_expr body
+      = True
+    rhs_has_invis_lam _ = False
+
+    unparen_expr (L _ (HsPar _ inner)) = unparen_expr inner
+    unparen_expr e                     = e
 
 -- | Expose leading implicit runtime binders and preserve their scope in the cast.
 exposeInvisibleRetained :: Type -> ([Id], CoercionR)
@@ -200,13 +212,96 @@ exposeInvisibleRetained ty
        , mkDepFunCoWithVis DepFunVisible DepFunInvisible binder MRefl co )
   | otherwise = ([], mkRepReflCo ty)
 
--- | Place generated runtime patterns after the written erased prefix.
-addInvisibleRetainedPatterns :: [Id] -> LMatch GhcRn body -> LMatch GhcRn body
-addInvisibleRetainedPatterns indices (L loc match@Match { m_pats = L pat_loc pats })
-  = L loc (match { m_pats = L pat_loc (erased ++ generated ++ values) })
+-- | Align written @\@pat@ abstractions with 'SpecifiedSpec' invisible retained
+-- binders and insert implicit runtime patterns for omitted or 'InferredSpec'
+-- binders. See Note [Invisible retained definition patterns].
+alignInvisibleRetainedPatterns :: Bool -> [ExpPatType] -> [Id]
+                               -> LMatch GhcRn body -> LMatch GhcRn body
+alignInvisibleRetainedPatterns from_fun_bind invis_pat_tys indices
+                               (L loc match@Match { m_pats = L pat_loc pats })
+  = L loc (match { m_pats = L pat_loc (erased_invis ++ retained_pats ++ leftover_invis ++ values) })
   where
-    (erased, values) = span (not . isVisArgLPat) pats
-    generated = map (noLocA . VarPat noExtField . noLocA . idName) indices
+    (leading_invis, values) = span (not . isVisArgLPat) pats
+    (erased_invis, rem_invis) = split_erased invis_pat_tys leading_invis
+    (retained_pats, leftover_invis) = build_retained indices rem_invis
+
+    split_erased [] ps = ([], ps)
+    split_erased (ExpForAllPatTy _ (Bndr _ (Invisible spec)) : ptys)
+                 (p@(L _ (InvisPat pat_spec _)) : ps)
+      | pat_spec == spec
+      = let (taken, rest) = split_erased ptys ps
+        in (p : taken, rest)
+    split_erased (_ : ptys) ps = split_erased ptys ps
+
+    implicit_pat b
+      | from_fun_bind = noLocA (VarPat noExtField (noLocA (idName b)))
+      | otherwise     = noLocA (WildPat noExtField)
+
+    build_retained [] ps = ([], ps)
+    build_retained (b : bs) ps
+      | isInferredRetainedBinder b
+      = let (more, rest) = build_retained bs ps
+        in (implicit_pat b : more, rest)
+      | L ploc (InvisPat SpecifiedSpec tp) : ps' <- ps
+      , Just pat <- tyPatToRetainedPat ploc tp
+      = let (more, rest) = build_retained bs ps'
+        in (pat : more, rest)
+      | [] <- ps
+      = let (more, rest) = build_retained bs []
+        in (implicit_pat b : more, rest)
+      | otherwise
+      = let (more, rest) = build_retained bs ps
+        in (implicit_pat b : more, rest)
+
+-- | Convert a renamed @\@pat@ ('HsTyPat') into the corresponding runtime pattern
+-- for a 'SpecifiedSpec' invisible @foreach@ binder.
+tyPatToRetainedPat :: SrcSpanAnnA -> HsTyPat GhcRn -> Maybe (LPat GhcRn)
+tyPatToRetainedPat outer_loc (HsTP _ body) = go_ty outer_loc body
+  where
+    go_ty :: SrcSpanAnnA -> LHsType GhcRn -> Maybe (LPat GhcRn)
+    go_ty ploc (L _ (HsParTy _ inner)) =
+      L ploc . ParPat noExtField <$> go_ty (getLoc inner) inner
+    go_ty ploc (L _ (HsKindSig _ inner _)) =
+      go_ty ploc inner
+    go_ty ploc (L _ (HsWildCardTy _)) =
+      Just (L ploc (WildPat noExtField))
+    go_ty _ (L l (HsTyVar _ _ (L lv (WithUserRdr rdr nm))))
+      | isTyVarName nm =
+          let var_nm = mkInternalName (nameUnique nm)
+                         (setOccNameSpace varName (nameOccName nm))
+                         (nameSrcSpan nm)
+          in Just (L l (VarPat noExtField (L lv var_nm)))
+      | isVarName nm =
+          Just (L l (VarPat noExtField (L lv nm)))
+      | isDataOcc (nameOccName nm) =
+          Just (L l (ConPat noExtField (L lv (WithUserRdr rdr nm)) (PrefixCon noExtField [])))
+      | otherwise = Nothing
+    go_ty _ (L l (HsOpTy _ lhs (L _ (HsTyVar _ _ (L lo (WithUserRdr rdr nm)))) rhs))
+      | isDataOcc (nameOccName nm) = do
+          lhs' <- go_ty (getLoc lhs) lhs
+          rhs' <- go_ty (getLoc rhs) rhs
+          Just (L l (ConPat noExtField (L lo (WithUserRdr rdr nm)) (PrefixCon noExtField [lhs', rhs'])))
+    go_ty ploc ty
+      | Just (L lc (WithUserRdr rdr nm), args) <- split_con_app ty []
+      , isDataOcc (nameOccName nm) = do
+          args' <- mapM (\a -> go_ty (getLoc a) a) args
+          Just (L ploc (ConPat noExtField (L lc (WithUserRdr rdr nm)) (PrefixCon noExtField args')))
+    go_ty _ (L l (HsExplicitListTy _ _ tys)) = do
+      pats <- mapM (\a -> go_ty (getLoc a) a) tys
+      let nil_p = L l (ConPat noExtField (noLocA (noUserRdr (dataConName nilDataCon))) (PrefixCon noExtField []))
+          cons_p a acc = L l (ConPat noExtField (noLocA (noUserRdr (dataConName consDataCon))) (PrefixCon noExtField [a, acc]))
+      Just (foldr cons_p nil_p pats)
+    go_ty _ (L l (HsExplicitTupleTy _ _ tys)) = do
+      pats <- mapM (\a -> go_ty (getLoc a) a) tys
+      Just (L l (TuplePat noExtField pats Boxed))
+    go_ty _ _ = Nothing
+
+    split_con_app (L _ (HsAppTy _ f a)) acc     = split_con_app f (a : acc)
+    split_con_app (L _ (HsAppKindTy _ f _)) acc = split_con_app f acc
+    split_con_app (L _ (HsParTy _ inner)) acc   = split_con_app inner acc
+    split_con_app (L _ (HsTyVar _ _ lname)) acc
+      | not (null acc) = Just (lname, acc)
+    split_con_app _ _ = Nothing
 
 -- | Check the original equations beneath lazy openings of known package columns.
 -- See Note [Implicit existential function patterns].
@@ -1319,9 +1414,11 @@ tcRetainedVarMatches herald ctxt initial_ty source_pats = go [] initial_ty initi
            ; return (mkWpCastR co <.> wrap, result) }
 
     expose_suffix ty
+      | (indices@(_:_), co) <- exposeInvisibleRetained ty
+      = (indices, co)
       | ForAllTy ma binder body <- coreFullView ty
-      , isInferredForAllTyFlag (binderFlag binder)
-      , (indices@(_:_), co) <- exposeInvisibleRetained body
+      , isInvisibleForAllTyFlag (binderFlag binder)
+      , (indices@(_:_), co) <- expose_suffix body
       = (indices, mkHomoForAllCos [(mkNomReflCo ma, binder)] co)
       | otherwise = ([], mkRepReflCo ty)
 
@@ -1432,7 +1529,7 @@ splitRetainedSuffix prefix indices group@(MG { mg_alts = L loc [L match_loc matc
     (before, after) = split_prefix prefix pats
     inner = match { m_ctxt = LamAlt LamSingle, m_pats = L pats_loc after }
     lambda = L match_loc (HsLam noAnn LamSingle
-               (MG { mg_alts = L loc [addInvisibleRetainedPatterns indices (L match_loc inner)]
+               (MG { mg_alts = L loc [alignInvisibleRetainedPatterns True [] indices (L match_loc inner)]
                    , mg_ext = ext }))
     outer = match { m_pats = L pats_loc before
                   , m_grhss = unguardedGRHSs (locA match_loc) lambda noAnn }
@@ -2600,9 +2697,24 @@ tcLambdaMatches :: HsExpr GhcRn -> HsLamVariant
                 -> [ExpPatType]  -- Already skolemised
                 -> ExpSigmaType  -- NB can be a sigma-type
                 -> TcM (HsWrapper, MatchGroup GhcTc (LHsExpr GhcTc))
-tcLambdaMatches e lam_variant matches invis_pat_tys res_ty
-  =  do { arity <- checkArgCounts matches
+tcLambdaMatches e lam_variant source_matches invis_pat_tys source_res_ty
+  =  do { source_arity <- checkArgCounts source_matches
             -- Check argument counts since this is also used for \cases
+        ; let (visibility_wrap, matches, res_ty, arity)
+                | Check ty <- source_res_ty
+                , (indices@(_:_), co) <- exposeInvisibleRetained ty
+                = ( mkWpCastR co
+                  , source_matches { mg_alts = fmap (map (alignInvisibleRetainedPatterns False invis_pat_tys indices)) (mg_alts source_matches) }
+                  , mkCheckExpType (coercionLKind co)
+                  , source_arity + length indices )
+                | otherwise = (idHsWrapper, source_matches, source_res_ty, source_arity)
+              check_body
+                | LamSingle <- lam_variant
+                , [L _ Match { m_pats = L _ pats
+                             , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } }]
+                    <- unLoc (mg_alts matches)
+                = tcScopedRuntimeBody (collectPatsBinders CollNoDictBinders pats)
+                | otherwise = tcBody
 
         ; (wrapper, r)
             <- case res_ty of
@@ -2611,16 +2723,8 @@ tcLambdaMatches e lam_variant matches invis_pat_tys res_ty
                  _ -> matchExpectedFunTys herald GenSigCtxt arity res_ty $ \ pat_tys rhs_ty ->
                         tcExprMatchesWithWhereFromWith check_body id ctxt (invis_pat_tys ++ pat_tys) rhs_ty matches
 
-        ; return (wrapper, r) }
+        ; return (visibility_wrap <.> wrapper, r) }
   where
-    check_body
-      | LamSingle <- lam_variant
-      , [L _ Match { m_pats = L _ pats
-                   , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } }]
-          <- unLoc (mg_alts matches)
-      = tcScopedRuntimeBody (collectPatsBinders CollNoDictBinders pats)
-      | otherwise = tcBody
-
     ctxt   = LamAlt lam_variant
     herald = ExpectedFunTyLam lam_variant e
              -- See Note [Herald for matchExpectedFunTys] in GHC.Tc.Utils.Unify

@@ -23,7 +23,7 @@ module GHC.Rename.HsType (
         rnLTyVar, classifyTypeCasePattern, warnPunnedTypeSyntax, warnPunnedTyConSyntax,
 
         rnHsConDeclField, rnRetainedSigType, rnHsSigWcTypeWithSplice,
-        SignatureSpliceSite(..),
+        SignatureSpliceSite(..), isInferredForEachBndr,
 
         -- Precence related stuff
         NegationHandling(..),
@@ -504,22 +504,31 @@ rnRetainedTelescope env rn_body bndrs body
     bind_bndrs env (L lb bndr : rest)
       = setSrcSpanA lb $
         case bndr of
-          HsTvb xb () (HsBndrVar _ (L lv rdr)) (HsBndrKind _ domain)
+          HsTvb xb () (HsBndrVar _ (L lv rdr)) mb_kind
             | Just term_rdr <- retained_binder rdr ->
-            do { (domain', domain_fvs) <- rnLHsTyKi env domain
+            do { (mb_kind', domain_fvs) <- rn_bndr_kind mb_kind
                ; name <- newLocalBndrRn (L lv term_rdr)
                ; let occ = setOccNameSpace tvName (rdrNameOcc rdr)
-                     bndr' = L lb (HsTvb xb () (HsBndrVar noExtField (L lv name))
-                                              (HsBndrKind noExtField domain'))
+                     bndr' = L lb (HsTvb xb () (HsBndrVar noExtField (L lv name)) mb_kind')
                      env' = env{rtke_splice = rtke_splice env . (bndr' :)}
                ; ((rest', body'), body_fvs) <- bindLocalNamesFV [name] $
                    do { rdr_env <- getLocalRdrEnv
                       ; setLocalRdrEnv (extendLocalRdrEnvWithAlias rdr_env occ name) $
                           bind_bndrs env' rest }
                ; pure ((bndr' : rest', body'), domain_fvs `plusFN` body_fvs) }
-          HsTvb _ _ HsBndrWildCard{} _ ->
-            failWithTc $ TcRnRetainedQuantificationError RetainedBinderNeedsName
-          _ -> failWithTc $ TcRnRetainedQuantificationError RetainedBinderNeedsType
+          HsTvb xb () (HsBndrWildCard hk) mb_kind ->
+            do { (mb_kind', domain_fvs) <- rn_bndr_kind mb_kind
+               ; let bndr' = L lb (HsTvb xb () (HsBndrWildCard hk) mb_kind')
+                     env' = env{rtke_splice = rtke_splice env . (bndr' :)}
+               ; ((rest', body'), body_fvs) <- bind_bndrs env' rest
+               ; pure ((bndr' : rest', body'), domain_fvs `plusFN` body_fvs) }
+          _ -> failWithTc $ TcRnRetainedQuantificationError RetainedBinderNeedsName
+      where
+        rn_bndr_kind (HsBndrKind _ domain) = do
+          (domain', domain_fvs) <- rnLHsTyKi env domain
+          pure (HsBndrKind noExtField domain', domain_fvs)
+        rn_bndr_kind (HsBndrNoKind _) =
+          pure (HsBndrNoKind noExtField, emptyFNs)
 
     retained_binder (Unqual occ) = Just (mkRdrUnqual (setOccNameSpace varName occ))
     retained_binder rdr
@@ -529,6 +538,12 @@ rnRetainedTelescope env rn_body bndrs body
       = Just rdr
       | otherwise
       = Nothing
+
+-- | Test whether an invisible @foreach@ binder was written in braces @{...}@.
+isInferredForEachBndr :: HsTyVarBndr () (GhcPass p) -> Bool
+isInferredForEachBndr b = case atv_tv (tvb_ext b) of
+  EpTok (EpaDelta _ (SameLine 1) _) -> True
+  _                                 -> False
 
 {- Note [Retained Pi type formation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

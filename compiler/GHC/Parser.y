@@ -5010,13 +5010,19 @@ fromTrailingN (EpAnn anc ann cs)
     = EpAnn anc (nann_trailing ann) cs
 
 -- | Validate specificity annotations on a parsed @foreach@ binder list.
--- Reject @InferredSpec@ braces on visible @foreach ->@ telescopes.
+-- Reject @InferredSpec@ braces on visible @foreach ->@ telescopes, and record
+-- @InferredSpec@ in @atv_tv@ on invisible @foreach .@ binders.
 -- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
 checkForEachBndrs :: Either TokRarrow (EpToken ".")
                   -> [LHsTyVarBndr Specificity GhcPs]
                   -> P [LHsTyVarBndr () GhcPs]
 checkForEachBndrs (Left _)  bndrs = fromSpecTyVarBndrs bndrs
-checkForEachBndrs (Right _) bndrs = pure [ L loc (b { tvb_flag = () }) | L loc b <- bndrs ]
+checkForEachBndrs (Right _) bndrs = pure
+  [ L loc (b { tvb_ext  = case tvb_flag b of
+                            InferredSpec  -> (tvb_ext b) { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine 1) []) }
+                            SpecifiedSpec -> (tvb_ext b) { atv_tv = noEpTok }
+             , tvb_flag = () })
+  | L loc b <- bndrs ]
 
 -- | Fold a non-empty @exists@ binder list right-associatively into nested 'HsTypeExists' nodes.
 -- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.

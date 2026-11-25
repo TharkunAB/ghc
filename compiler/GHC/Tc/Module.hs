@@ -2764,7 +2764,8 @@ tcLocalOpenGroup demands group@HsGroup
               Just (classes, infos) -> restoreEnvs rest_envs $ do
                 bindings <- tcInstDecls2 classes infos
                 (env, lcl) <- getEnvs
-                finish (env { tcg_binds = tcg_binds env ++ bindings }, lcl)
+                env' <- installForgetMTyCons (env { tcg_binds = tcg_binds env ++ bindings })
+                finish (env', lcl)
   where
     group_names = mkNameSet (hsGroupBinders group)
     value_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds group))
@@ -3216,10 +3217,20 @@ tcTopSrcDeclGroupWithMethods defer_methods previous_deriving group@(HsGroup { hs
         -- See Note [Newtype constructor usage in foreign declarations]
         addUsedGREs NoDeprecationWarnings (bagToList fo_gres) ;
 
-        return ((tcg_env', tcl_env), pending_methods, deferred_deriving)
+        tcg_env'' <- installForgetMTyCons tcg_env' ;
+        return ((tcg_env'', tcl_env), pending_methods, deferred_deriving)
     }}}}}
 
 tcTopSrcDeclGroupWithMethods _ _ _ = panic "tcTopSrcDeclGroup: ValBindsIn"
+
+installForgetMTyCons :: TcGblEnv -> TcM TcGblEnv
+installForgetMTyCons env = do
+  forget_tcs <- drainForgetMTyCons (tcg_mod env)
+  let new_tcs = [tc | tc <- forget_tcs
+                    , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))]
+  if null new_tcs
+    then pure env
+    else setGblEnv env (fst <$> addTyConsToGblEnv new_tcs)
 
 ---------------------------
 tcTyClsInstDecls :: Maybe [DerivInfo]  -- Nothing defers attached deriving
@@ -3685,6 +3696,7 @@ tcRnStmt hsc_env rdr_stmt
 
     -- The real work is done here
     ((bound_ids, tc_expr), fix_env) <- tcUserStmt rdr_stmt ;
+    _ <- drainForgetMTyCons =<< getModule ;
     zonked_expr <- zonkTopLExpr tc_expr ;
     zonked_ids  <- zonkTopBndrs bound_ids ;
     env <- getGblEnv ;

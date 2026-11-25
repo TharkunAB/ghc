@@ -993,3 +993,8 @@ test('NativeLargeElimType',
       extra_files(['NativeLargeElimTypeProvider.hs',
                    'NativeLargeElimType.hs'])],
      run_command, ['bash NativeLargeElimType.sh "{compiler}" "{libdir}"'])
+test('NativeProposal378Quantifiers',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeProposal378QuantifiersProvider.hs',
+                   'NativeProposal378Quantifiers.hs'])],
+     run_command, ['bash NativeProposal378Quantifiers.sh "{compiler}" "{libdir}"'])

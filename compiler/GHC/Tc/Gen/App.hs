@@ -15,7 +15,8 @@ module GHC.Tc.Gen.App
        , matchPolytypeExistsWitness, matchExactPolytypeWitness, tcPreviewQuickLookResult
        , tcImplicitOperand, tcLexicalPackageOperand
        , tcRetainedInferableArg, tcRetainedArg
-       , tcOptionalLetOperand, tcOptionalLetFunctionOperand ) where
+       , tcOptionalLetOperand, tcOptionalLetFunctionOperand
+       , expr_to_type, isUnadornedTypeExpr ) where
 
 import {-# SOURCE #-} GHC.Tc.Gen.Expr( tcCheckMonoExpr, tcCheckPolyExpr, tcPolyExpr, tcInferRho )
 
@@ -36,7 +37,7 @@ import GHC.Tc.Solver.Monad ( bumpReductionDepthTcM )
 import GHC.Tc.Validity ( checkConstrainedSignature )
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Instantiate
-import GHC.Tc.Utils.Env ( isExistsPackName, tcLookupIdMaybe, tcLookupConLike
+import GHC.Tc.Utils.Env ( isExistsPackName, tcLookupIdMaybe, tcLookupConLike, tcLookupKnownOccId
                         , tcLookup, tcLookupGlobal, tcLookupLcl_maybe, tcExtendIdEnv, tcExtendGeneratedIdEnv )
 import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs, tcLookupDataFamInst_maybe )
@@ -79,7 +80,7 @@ import GHC.Core.Coercion.Axiom (coAxiomBranches, coAxBranchLHS, coAxBranchRHS, c
 import GHC.Builtin.WiredIn.Types ( charTy, integerTy, multiplicityTy, runtimeRepTy, nilDataCon, consDataCon, mkListTy, tupleDataCon, unmatchableDataConTy )
 import GHC.Builtin.PrimOps( tagToEnumKey )
 import GHC.Builtin.KnownKeys
-import GHC.Builtin.KnownOccs ( composeIdOcc )
+import GHC.Builtin.KnownOccs ( composeIdOcc, fromIntegerClassOpOcc )
 import GHC.Builtin.Modules ( gHC_INTERNAL_BASE )
 
 import GHC.Driver.DynFlags ( GeneralFlag(Opt_DeferTypeErrors), DynFlags(reductionDepth), HasDynFlags(getDynFlags) )
@@ -4202,6 +4203,99 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                 -- Going around again means we deal easily with
                 -- nested  forall a. Eq a => forall b. Show b => blah
 
+    -- Skip InferredSpec invisible foreach binders ({k :: a}) when a later
+    -- SpecifiedSpec invisible binder is targeted by @arg or @{arg}.
+    go1 plan fun_orig pos acc fun_ty args@(first_arg : _)
+      | is_type_or_retained first_arg
+      , DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
+      , isInferredRetainedBinder binder
+      = if hasSpecifiedInvisibleArgument body
+        then do { reflected <- tcInstInvisibleTypeWitness fun_orig Nothing fun_ty
+                ; case reflected of
+                    Just (wrap, res) -> go plan fun_orig pos (addArgWrap wrap acc) res args
+                    Nothing -> infer_inferred_index binder body }
+        else case first_arg of
+               ETypeArg { ea_hs_ty = hs_ty } ->
+                 do { (_, tidy_ty) <- liftZonkM $ zonkTidyTcType emptyTidyEnv fun_ty
+                    ; failWith $ TcRnInvalidTypeApplication tidy_ty hs_ty }
+               ERetainedArg _ _ _ arg _ _ ->
+                 addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
+                   failWithTc (TcRnRetainedQuantificationError (RetainedExplicitArgument fun_ty))
+               _ -> pprPanic "tcInstFun: impossible arg" (ppr first_arg)
+      where
+        is_type_or_retained ETypeArg{}     = True
+        is_type_or_retained ERetainedArg{} = True
+        is_type_or_retained _              = False
+
+        infer_inferred_index binder body
+          = do { let val_args = [v | EValArg { ea_arg = v } <- args]
+                     err_arg  = case val_args of
+                       v : _ -> v
+                       []    -> noLocA (fst rn_head)
+               ; InvisibleOperand operand record_usage <-
+                   addArgCtxt (pos + count written_prefix_arg acc) rn_head err_arg $
+                     do { selected <- tcInferInvisibleRetained [] binder body val_args
+                        ; case selected of
+                            Just (actual, _) -> return actual
+                            Nothing -> failWithTc (TcRnRetainedQuantificationError
+                                                    (RetainedInvisibleArgument binder)) }
+               ; tcScalingUsage ManyTy record_usage
+               ; let wrap = mkWpEvApps [EvExpr operand]
+               ; go plan fun_orig pos (addArgWrap wrap acc) (applyTypeToArgs fun_ty [operand]) args }
+
+    -- Proposal #378 §4.8 & §4.13: canonical @arg override for SpecifiedSpec
+    -- invisible foreach binders. See Note [Visible @arg override for invisible foreach].
+    go1 plan fun_orig pos acc fun_ty
+        (ETypeArg { ea_loc_span = ctxt, ea_hs_ty = hs_ty } : rest_args)
+      | DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
+      = case unLoc (ignoreParens (hswc_body hs_ty)) of
+          HsWildCardTy{} ->
+            do { reflected <- tcInstInvisibleTypeWitness fun_orig Nothing fun_ty
+               ; case reflected of
+                   Just (wrap, res) -> go plan fun_orig pos (addArgWrap wrap acc) res rest_args
+                   Nothing ->
+                     do { let val_args = [v | EValArg { ea_arg = v } <- rest_args]
+                              err_arg  = case val_args of
+                                v : _ -> v
+                                []    -> L ctxt (fst rn_head)
+                        ; InvisibleOperand operand record_usage <-
+                            addArgCtxt (pos + count written_prefix_arg acc) rn_head err_arg $
+                              do { selected <- tcInferInvisibleRetained [] binder body val_args
+                                 ; case selected of
+                                     Just (actual, _) -> return actual
+                                     Nothing -> failWithTc (TcRnRetainedQuantificationError
+                                                             (RetainedInvisibleArgument binder)) }
+                        ; tcScalingUsage ManyTy record_usage
+                        ; let wrap = mkWpEvApps [EvExpr operand]
+                        ; go plan fun_orig pos (addArgWrap wrap acc)
+                             (applyTypeToArgs fun_ty [operand]) rest_args } }
+          _ ->
+            do { bndr_ty <- liftZonkM (zonkTcType (varType binder))
+               ; mb_rep <- tcTypeRepTarget_maybe bndr_ty
+               ; case mb_rep of
+                   Just (kind, target) ->
+                     do { ty_arg <- tcHsTypeApp hs_ty kind
+                        ; _ <- unifyType Nothing ty_arg target
+                        ; bndr_ty' <- liftZonkM (zonkTcType bndr_ty)
+                        ; body' <- liftZonkM (zonkTcType body)
+                        ; let emb_arg = L ctxt (HsEmbTy noExtField hs_ty)
+                              checked = ERetainedArg DepFunInvisible ctxt
+                                          (Scaled ManyTy bndr_ty') emb_arg body' Nothing
+                        ; go plan fun_orig pos (checked : acc) body' rest_args }
+                   Nothing ->
+                     do { arg <- type_to_retained_expr hs_ty
+                        ; (runtime_arg, res_ty, arg_co) <-
+                            addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
+                            if isVacuousRetainedBinder binder body
+                            then return (arg, body, Nothing)
+                            else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
+                                    ; res <- retainedAppResult fun_ty binder operand
+                                    ; co <- retainedVariableCast operand runtime_arg
+                                    ; return (runtime_arg, res, co) }
+                        ; let checked = ERetainedArg DepFunInvisible ctxt
+                                          (Scaled ManyTy (varType binder)) runtime_arg res_ty arg_co
+                        ; go plan fun_orig pos (checked : acc) res_ty rest_args } }
+
     -- See Note [Explicit invisible retained arguments].
     go1 plan fun_orig pos acc fun_ty (ERetainedArg _ loc _ arg _ _ : rest_args)
       | DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
@@ -4388,9 +4482,11 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                  seedClassReceiver DoQL rn_head ((arg_pos, arg, scaledThing arg_ty) : domains)
                _ -> return False
            ; arg_ty <- if selected then liftZonkM (zonkScaledTcType arg_ty) else return arg_ty
-           ; arg' <- look_arg do_ql arg_pos ctxt rn_head arg arg_ty
+           ; (arg_prepared, arg_ty', res_ty') <-
+               prepareTypeWitnessArg arg arg_ty res_ty
+           ; arg' <- look_arg do_ql arg_pos ctxt rn_head arg_prepared arg_ty'
            ; let acc' = arg' : addArgWrap (mkWpCastN fun_co) acc
-           ; go plan fun_orig (pos+1) acc' res_ty rest_args }
+           ; go plan fun_orig (pos+1) acc' res_ty' rest_args }
 
     -- Read only the visible domains that already follow this callback.
     receiverDomains _ _ [] = Just []
@@ -8491,12 +8587,33 @@ expr_to_type earg =
       | isTermVarOrFieldNameSpace (rdrNameSpace rdr)
       , Just promoted_rdr <- promoteRdrName rdr
       = do { envs <- getRdrEnvs
-           ; whenIsJust (lookup_rdr envs rdr) $ \unpromoted ->
-             whenIsJust (lookup_rdr envs promoted_rdr) $ \promoted ->
-               addErrAt (locA l) $
-               TcRnIllegalPunnedVarOccInTypeArgument { illegalPunTermName = unpromoted
-                                                     , illegalPunTypeName = promoted } }
+           ; whenIsJust (lookup_rdr envs rdr) $ \unpromoted@(ResolvedNameInfo _ _ u_nm) ->
+             whenIsJust (lookup_rdr envs promoted_rdr) $ \promoted@(ResolvedNameInfo _ _ p_nm) ->
+               unless (u_nm == p_nm) $
+               do { same_witness <- is_same_retained_type_witness u_nm p_nm
+                  ; unless same_witness $
+                      addErrAt (locA l) $
+                      TcRnIllegalPunnedVarOccInTypeArgument { illegalPunTermName = unpromoted
+                                                            , illegalPunTypeName = promoted } } }
       | otherwise = return ()
+
+    is_same_retained_type_witness :: Name -> Name -> TcM Bool
+    is_same_retained_type_witness u_nm p_nm = do
+      dep <- xoptM LangExt.ExperimentalDependentTypes
+      if not dep
+        then pure False
+        else do
+          mb_u <- tcLookupLcl_maybe u_nm
+          mb_p <- tcLookupLcl_maybe p_nm
+          case (mb_u, mb_p) of
+            (Just (ATcId { tct_id = u_id }), Just (ATyVar _ p_tv)) -> do
+              mb_rep <- tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType (varType u_id))
+              case mb_rep of
+                Just (_, target_ty) -> do
+                  p_ty <- liftZonkM (zonkTcType (mkTyVarTy p_tv))
+                  pure (tcEqType target_ty p_ty)
+                Nothing -> pure False
+            _ -> pure False
 
     lookup_rdr :: (GlobalRdrEnv, LocalRdrEnv) -> RdrName -> Maybe ResolvedNameInfo
     lookup_rdr (gbl_env, lcl_env) rdr
@@ -8518,6 +8635,187 @@ expr_to_type earg =
     illegal_implicit_tvs tvs
       = do { mapM_ (addErr . TcRnIllegalImplicitTyVarInTypeArgument . nameRdrName) tvs
            ; failM }
+
+{- Note [Visible @arg override for invisible foreach]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #378 §4.8 and §4.13 use standard @arg syntax at call sites to supply
+an explicit value for a SpecifiedSpec invisible foreach binder, while skipping
+InferredSpec {k :: a} binders just like forall {k}. Legacy @{arg} syntax stays
+available for compatibility.
+
+When @arg instantiates a retained term binder, type_to_retained_expr translates
+the renamed HsWcType back into a renamed HsExpr before passing it to
+tcRetainedOperand. A source-table family name T:f is mapped back to its
+underlying function f so @(f x) checks identically to @{f x}.
+
+For foreach (a :: Type) -> ..., Proposal #378 §4.9 allows unadorned type
+arguments in term syntax such as ex5 Int 3 and idDep Nat Zero. When an ordinary
+argument has expected type TypeRep @k target, prepareTypeWitnessArg resolves
+the type argument eagerly during tcInstFun so later dependent foreach (x :: a)
+binders in the same application see the instantiated domain immediately.
+-}
+
+-- | Test whether a function type still has a SpecifiedSpec invisible binder
+-- after any leading InferredSpec binders or dictionaries.
+hasSpecifiedInvisibleArgument :: Type -> Bool
+hasSpecifiedInvisibleArgument ty = case coreFullView ty of
+  ForAllTy _ (Bndr _ vis) body
+    | isSpecifiedForAllTyFlag vis -> True
+    | isInferredForAllTyFlag vis  -> hasSpecifiedInvisibleArgument body
+    | otherwise                   -> False
+  FunTy { ft_af = af, ft_res = body }
+    | not (isVisibleFunArg af)    -> hasSpecifiedInvisibleArgument body
+    | otherwise                   -> False
+  DepDictTy _ body                -> hasSpecifiedInvisibleArgument body
+  DepFunTy DepFunInvisible b body
+    | isInferredRetainedBinder b  -> hasSpecifiedInvisibleArgument body
+    | otherwise                   -> True
+  _                               -> False
+
+-- | Eagerly resolve a type witness argument at @TypeRep \@k target@ so later
+-- dependent binders in the same call see @target@ immediately.
+prepareTypeWitnessArg :: LHsExpr GhcRn -> Scaled TcType -> TcType
+                      -> TcM (LHsExpr GhcRn, Scaled TcType, TcType)
+prepareTypeWitnessArg arg sc_arg_ty@(Scaled mult raw_arg_ty) res_ty = do
+  dep <- xoptM LangExt.ExperimentalDependentTypes
+  if not dep
+    then pure (arg, sc_arg_ty, res_ty)
+    else do
+      zonked_arg <- liftZonkM (zonkTcType raw_arg_ty)
+      mb_rep <- tcTypeRepTarget_maybe zonked_arg
+      case mb_rep of
+        Just (kind, target)
+          | anyFreeVarsOfType (\v -> isTcTyVar v && isMetaTyVar v) target ->
+            case stripParensLHsExpr arg of
+              L _ (HsEmbTy _ wc_ty) -> do
+                ty_arg <- tcHsTypeApp wc_ty kind
+                _ <- unifyType Nothing ty_arg target
+                arg_ty' <- liftZonkM (zonkTcType zonked_arg)
+                res_ty' <- liftZonkM (zonkTcType res_ty)
+                pure (arg, Scaled mult arg_ty', res_ty')
+              L _ (HsVar _ lname) -> do
+                let nm = unLocWithUserRdr lname
+                mb_lcl <- tcLookupLcl_maybe nm
+                case mb_lcl of
+                  Just (ATcId { tct_id = v }) -> do
+                    v_ty <- liftZonkM (zonkTcType (varType v))
+                    mb_v_rep <- tcTypeRepTarget_maybe v_ty
+                    case mb_v_rep of
+                      Just (_, v_target) -> do
+                        _ <- unifyType Nothing v_target target
+                        arg_ty' <- liftZonkM (zonkTcType zonked_arg)
+                        res_ty' <- liftZonkM (zonkTcType res_ty)
+                        pure (arg, Scaled mult arg_ty', res_ty')
+                      Nothing -> pure (arg, sc_arg_ty, res_ty)
+                  _ -> wrap_unadorned kind target zonked_arg
+              _ -> wrap_unadorned kind target zonked_arg
+        _ -> pure (arg, sc_arg_ty, res_ty)
+  where
+    wrap_unadorned kind target zonked_arg = do
+      as_ty <- isUnadornedTypeExpr (unLoc arg)
+      if not as_ty
+        then pure (arg, sc_arg_ty, res_ty)
+        else do
+          wc_ty <- expr_to_type arg
+          ty_arg <- tcHsTypeApp wc_ty kind
+          _ <- unifyType Nothing ty_arg target
+          arg_ty' <- liftZonkM (zonkTcType zonked_arg)
+          res_ty' <- liftZonkM (zonkTcType res_ty)
+          let loc = getLoc arg
+              emb = L loc (mkExpandedLExpr (unLoc arg) (L loc (HsEmbTy noExtField wc_ty)))
+          pure (emb, Scaled mult arg_ty', res_ty')
+
+-- | Test whether a renamed expression denotes an unadorned type argument
+-- suitable for a @foreach (a :: Type) ->@ parameter.
+isUnadornedTypeExpr :: HsExpr GhcRn -> TcM Bool
+isUnadornedTypeExpr expr = case expr of
+  HsPar _ (L _ inner) -> isUnadornedTypeExpr inner
+  HsFunArr{} -> pure True
+  HsForAll{} -> pure True
+  HsQual{}   -> pure True
+  HsStar{}   -> pure True
+  ExplicitTuple _ [] Boxed -> pure True
+  ExprWithTySig _ (L _ inner) _ -> isUnadornedTypeExpr inner
+  HsApp _ (L _ f) _     -> isUnadornedTypeExpr f
+  HsAppType _ (L _ f) _ -> isUnadornedTypeExpr f
+  OpApp _ _ (L _ op) _  -> isUnadornedTypeExpr op
+  HsVar _ lname -> do
+    let nm = unLocWithUserRdr lname
+    mb_lcl <- tcLookupLcl_maybe nm
+    case mb_lcl of
+      Just ATyVar{}       -> pure True
+      Just ATcTypeLet{}   -> pure True
+      Just ATcId{}        -> pure False
+      Just _              -> pure True
+      Nothing
+        | isExternalName nm -> do
+            thing <- tcLookupGlobal nm
+            pure $ case thing of
+              ATyCon{} -> True
+              _        -> False
+        | otherwise -> pure (isTyVarName nm || isTcClsNameSpace (occNameSpace (nameOccName nm)))
+  XExpr (ExpandedThingRn (HSE (ExprCtxt orig) _)) -> isUnadornedTypeExpr orig
+  _ -> pure False
+
+-- | Convert a visible @\@arg@ type argument into a retained term expression.
+type_to_retained_expr :: LHsWcType GhcRn -> TcM (LHsExpr GhcRn)
+type_to_retained_expr wc_ty = do
+  let body = hswc_body wc_ty
+  unless (null (hswc_ext wc_ty)) $
+    failWithTc (TcRnRetainedQuantificationError RetainedPartialTypeArgument)
+  go body
+  where
+    go :: LHsType GhcRn -> TcM (LHsExpr GhcRn)
+    go (L l (HsParTy _ t)) = L l . HsPar noExtField <$> go t
+    go (L _ (HsKindSig _ t _)) = go t
+    go (L l (HsSpliceTy (HsUntypedSpliceTop _ t) _)) = setSrcSpanA l (go t)
+    go (L l (HsTyVar _ _ (L lv (WithUserRdr rdr nm)))) = do
+      nm' <- resolve_term_name nm
+      pure (L l (HsVar noExtField (L lv (WithUserRdr rdr nm'))))
+    go (L l (HsAppTy _ f a)) = do
+      f' <- go f
+      a' <- go a
+      pure (L l (HsApp noExtField f' a'))
+    go (L l (HsAppKindTy _ f k)) = do
+      f' <- go f
+      pure (L l (HsAppType Nothing f' (HsWC [] k)))
+    go (L l (HsOpTy _ lhs op rhs)) = do
+      lhs' <- go lhs
+      op'  <- go op
+      rhs' <- go rhs
+      pure (L l (HsApp noExtField (L l (HsApp noExtField op' lhs')) rhs'))
+    go (L l (HsTyLit _ lit)) = case lit of
+      HsNatural _ il -> do
+        from_id <- tcLookupKnownOccId fromIntegerClassOpOcc
+        let from_fun = L (noAnnSrcSpan (locA l)) (idName from_id)
+            over_rn  = OverLitRn { ol_rebindable = False, ol_from_fun = from_fun }
+        pure (L l (HsOverLit noExtField (OverLit over_rn (HsIntegral il))))
+      HsChar src c   -> pure (L l (HsLit noExtField (HsChar src c)))
+      HsString src s -> pure (L l (HsLit noExtField (HsString src s)))
+      _ -> failWithTc (TcRnInvalidTypeApplication liftedTypeKind wc_ty)
+    go (L l (HsExplicitListTy _ _ tys)) = do
+      es <- mapM go tys
+      pure (L l (ExplicitList noExtField es))
+    go (L l (HsExplicitTupleTy _ _ tys)) = do
+      es <- mapM go tys
+      pure (L l (ExplicitTuple noExtField [Present noExtField e | e <- es] Boxed))
+    go (L l _) = setSrcSpanA l $
+      failWithTc (TcRnRetainedQuantificationError RetainedPartialTypeArgument)
+
+    resolve_term_name :: Name -> TcM Name
+    resolve_term_name nm
+      | isExternalName nm
+      , Just term_occ <- sourceTableTermOcc (nameOccName nm)
+      , Just mod_nm <- nameModule_maybe nm
+      = lookupOrig mod_nm term_occ
+      | not (isExternalName nm)
+      , isTyVarName nm
+      = do { mb <- tcLookupLcl_maybe nm
+           ; pure $ case mb of
+               Just (ATcId { tct_id = v }) -> idName v
+               _ -> nm }
+      | otherwise
+      = pure nm
 
 {- Note [RequiredTypeArguments and the T2T mapping]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

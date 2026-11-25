@@ -47,6 +47,8 @@ import GHC.Core.Coercion.Axiom
 import GHC.Core.Dependent (hasNativeDependentProgram, hasRetainedRuleHead)
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
+import GHC.Core.TyCon ( synTyConRhs_maybe )
+import GHC.Core.Type ( inferredRetainedBinderFlags )
 import GHC.Core.Ppr
 import GHC.Core.RoughMap ( RoughMatchTc(..) )
 
@@ -56,6 +58,7 @@ import GHC.Driver.DynFlags
 import GHC.Driver.Plugins
 
 import GHC.Types.Id
+import GHC.Types.Var ( varType )
 import GHC.Types.Fixity.Env
 import GHC.Types.ForeignStubs (ForeignStubs (NoStubs))
 import GHC.Types.InlinePragma (isNeverActive)
@@ -407,12 +410,27 @@ mkIface_ hsc_env
           source_rule_owners `unionNameSet` iface_rule_heads
         stripped_rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
           source_rule_owners `minusNameSet` iface_rule_heads
-    fields <- if null all_rule_heads
+    fields1 <- if null all_rule_heads
       then pure fields0
       else writeFieldWith sourceRuleHeadsField
              (\bh -> putWithUserData QuietBinIFace NormalCompression bh
                        (all_rule_heads, stripped_rule_heads))
              fields0
+    let inferred_retained =
+          [ (getName thing, flags)
+          | thing <- typeEnvElts type_env
+          , isExternalName (getName thing)
+          , Just ty <- [case thing of
+                          AnId v -> Just (varType v)
+                          ATyCon tc | Just rhs <- synTyConRhs_maybe tc -> Just rhs
+                          _ -> Nothing]
+          , let flags = inferredRetainedBinderFlags ty
+          , or flags ]
+    fields <- if null inferred_retained
+      then pure fields1
+      else writeFieldWith inferredRetainedBindersField
+             (\bh -> putWithUserData QuietBinIFace NormalCompression bh inferred_retained)
+             fields1
 
     pure $ emptyPartialModIface this_mod
           -- Need to record this because it depends on the -instantiated-with flag

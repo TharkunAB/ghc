@@ -69,6 +69,9 @@ module GHC.Core.Type (
         isNativeNamedOpaqueFunctionId,
         nativeIndexFunctionTypeTys_maybe, nativeCallSpine_maybe,
         isNativeOpaqueValueId, isNativeOpaqueValueType, isNativeClassDictionaryId,
+        markInferredRetainedBinder, isInferredRetainedBinder,
+        inferredRetainedBinderFlags, applyInferredRetainedBinderFlags,
+        replaceTermVarInType,
         isNativeIndexDomainConversion,
         isNativeRetainedBinder, isNativeRetainedBinderType,
         isNativeRetainedField, isNativeRetainedFieldType,
@@ -259,7 +262,8 @@ import {-# SOURCE #-} GHC.Core.Coercion
 
 -- friends:
 import GHC.Types.Var
-import {-# SOURCE #-} GHC.Types.Id.Info (isJoinIdDetails)
+import {-# SOURCE #-} GHC.Types.Id.Info
+   ( isJoinIdDetails, inferredRetainedIdInfo, setInferredRetainedIdInfo )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 
@@ -2733,6 +2737,146 @@ isNativeClassDictionaryId v
     && case coreFullView (varType v) of
          TyConApp tc _ -> isJust (tyConClass_maybe tc)
          _ -> False
+
+-- | Mark an invisible retained @foreach {x}.@ binder with 'InferredSpec'.
+--
+-- Store the specificity bit in 'IdInfo' rather than 'ExportFlag' so Core Lint
+-- accepts nested 'DepFunTy' binders without treating them as exported Ids.
+markInferredRetainedBinder :: Id -> Id
+markInferredRetainedBinder v =
+  lazySetIdInfo v (setInferredRetainedIdInfo True (idInfo v))
+
+-- | Test whether an invisible retained @foreach@ binder has 'InferredSpec'.
+isInferredRetainedBinder :: Id -> Bool
+isInferredRetainedBinder = inferredRetainedIdInfo . idInfo
+
+-- | Collect 'InferredSpec' flags of 'DepFunInvisible' binders in preorder.
+inferredRetainedBinderFlags :: Type -> [Bool]
+inferredRetainedBinderFlags = go
+  where
+    go (DepFunTy vis b body) =
+      [isInferredRetainedBinder b | vis == DepFunInvisible]
+      ++ go (varType b) ++ go body
+    go (ForAllTy ma (Bndr v _) body) = go ma ++ go (varType v) ++ go body
+    go (FunTy _ ma mult arg res) = go ma ++ go mult ++ go arg ++ go res
+    go (AppTy f a) = go f ++ go a
+    go (TyConApp _ tys) = concatMap go tys
+    go (CastTy ty _) = go ty
+    go (ExistsTy _ v body) = go (varType v) ++ go body
+    go (DepDictTy v body) = go (varType v) ++ go body
+    go _ = []
+
+-- | Restore 'InferredSpec' flags onto 'DepFunInvisible' binders in preorder.
+applyInferredRetainedBinderFlags :: [Bool] -> Type -> ([Bool], Type)
+applyInferredRetainedBinderFlags flags0 ty0 = go flags0 ty0
+  where
+    go flags (DepFunTy vis b body) =
+      let (flags1, b_flag) = case (vis, flags) of
+            (DepFunInvisible, f : fs) -> (fs, f)
+            _                         -> (flags, False)
+          (flags2, dom')  = go flags1 (varType b)
+          b' = (if b_flag then markInferredRetainedBinder else setIdNotExported)
+                 (setVarType b dom')
+          body0 = if dom' `eqType` varType b then body else replaceTermVarInType b (TermVarTy b') body
+          (flags3, body') = go flags2 body0
+      in (flags3, DepFunTy vis b' body')
+    go flags (ForAllTy ma (Bndr v vis) body) =
+      let (flags1, ma')   = go flags ma
+          (flags2, kind') = go flags1 (varType v)
+          v'              = setVarType v kind'
+          (flags3, body') = go flags2 body
+      in (flags3, ForAllTy ma' (Bndr v' vis) body')
+    go flags (FunTy af ma mult arg res) =
+      let (flags1, ma')   = go flags ma
+          (flags2, mult') = go flags1 mult
+          (flags3, arg')  = go flags2 arg
+          (flags4, res')  = go flags3 res
+      in (flags4, FunTy af ma' mult' arg' res')
+    go flags (AppTy f a) =
+      let (flags1, f') = go flags f
+          (flags2, a') = go flags1 a
+      in (flags2, AppTy f' a')
+    go flags (TyConApp tc tys) =
+      let step fl [] = (fl, [])
+          step fl (t : ts) = let (fl1, t') = go fl t
+                                 (fl2, ts') = step fl1 ts
+                             in (fl2, t' : ts')
+          (flags', tys') = step flags tys
+      in (flags', TyConApp tc tys')
+    go flags (CastTy ty co) =
+      let (flags', ty') = go flags ty
+      in (flags', CastTy ty' co)
+    go flags (ExistsTy ex v body) =
+      let (flags1, k')    = go flags (varType v)
+          (flags2, body') = go flags1 body
+      in (flags2, ExistsTy ex (setVarType v k') body')
+    go flags (DepDictTy v body) =
+      let (flags1, d')    = go flags (varType v)
+          (flags2, body') = go flags1 body
+      in (flags2, DepDictTy (setVarType v d') body')
+    go flags ty = (flags, ty)
+
+-- | Replace occurrences of a provisional 'TermVarTy' binder inside a 'Type'.
+replaceTermVarInType :: Id -> Type -> Type -> Type
+replaceTermVarInType target replacement = go
+  where
+    go (TermVarTy v)
+      | v == target = replacement
+      | otherwise   = TermVarTy (go_id v)
+    go (TermAppTy v arg)
+      | v == target = mkAppTy replacement (go arg)
+      | otherwise   = TermAppTy (go_id v) (go arg)
+    go (ClassAppTy sel inst dict arg kind)
+      = ClassAppTy sel (go inst) (go dict) (go arg) (go kind)
+    go (DepFunTy vis b body)
+      | b == target = DepFunTy vis b body
+      | otherwise   = mkDepFunTyWithVis vis (go_id b) (go body)
+    go (DepDictTy d body)
+      | d == target = DepDictTy d body
+      | otherwise   = DepDictTy (go_id d) (go body)
+    go (ExistsTy flag v body)
+      = ExistsTy flag (setVarType v (go (varType v))) (go body)
+    go (ForAllTy ma (Bndr v flag) body)
+      = ForAllTy (go ma) (Bndr (setVarType v (go (varType v))) flag) (go body)
+    go (FunTy af ma mult arg res)
+      = FunTy af (go ma) (go mult) (go arg) (go res)
+    go (AppTy f a) = mkAppTy (go f) (go a)
+    go (TyConApp tc tys) = mkTyConApp tc (map go tys)
+    go (CastTy ty co) = mkCastTy (go ty) (go_co co)
+    go (CoercionTy co) = CoercionTy (go_co co)
+    go ty@TyVarTy{} = ty
+    go ty@LitTy{} = ty
+
+    go_id v = setVarType v (go (varType v))
+
+    go_mco MRefl = MRefl
+    go_mco (MCo c) = MCo (go_co c)
+
+    go_co (Refl ty) = Refl (go ty)
+    go_co (GRefl r ty mco) = GRefl r (go ty) (go_mco mco)
+    go_co (TyConAppCo r tc cos) = TyConAppCo r tc (map go_co cos)
+    go_co (AppCo c1 c2) = AppCo (go_co c1) (go_co c2)
+    go_co (TermAppCo v c) = TermAppCo (go_id v) (go_co c)
+    go_co (ForAllCo { fco_tcv = v, fco_visL = vl, fco_visR = vr, fco_ma = ma, fco_kind = kc, fco_body = bc })
+      = ForAllCo { fco_tcv = setVarType v (go (varType v))
+                 , fco_visL = vl, fco_visR = vr
+                 , fco_ma = go_co ma, fco_kind = go_mco kc, fco_body = go_co bc }
+    go_co (DepFunCo vl vr b kc bc)
+      = DepFunCo vl vr (go_id b) (go_mco kc) (go_co bc)
+    go_co (FunCo r af1 af2 mc wc c1 c2)
+      = FunCo r af1 af2 (go_co mc) (go_co wc) (go_co c1) (go_co c2)
+    go_co (CoVarCo cv) = CoVarCo (setVarType cv (go (varType cv)))
+    go_co (AxiomCo ax cos) = AxiomCo ax (map go_co cos)
+    go_co (UnivCo { uco_prov = p, uco_role = r, uco_lty = t1, uco_rty = t2, uco_deps = ds })
+      = UnivCo { uco_prov = p, uco_role = r, uco_lty = go t1, uco_rty = go t2, uco_deps = ds }
+    go_co (SymCo c) = SymCo (go_co c)
+    go_co (TransCo c1 c2) = TransCo (go_co c1) (go_co c2)
+    go_co (SelCo s c) = SelCo s (go_co c)
+    go_co (LRCo lr c) = LRCo lr (go_co c)
+    go_co (InstCo c1 c2) = InstCo (go_co c1) (go_co c2)
+    go_co (KindCo c) = KindCo (go_co c)
+    go_co (SubCo c) = SubCo (go_co c)
+    go_co c@HoleCo{} = c
 
 -- | Check nominal index-conversion endpoints without checking the evidence.
 -- Eligible native function heads retain their complete fixed type.
