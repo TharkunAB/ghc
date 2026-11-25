@@ -3168,6 +3168,10 @@ localSourceTableBinders tycl_decls binds sigs = do
             null args && length tup_args /= 1 &&
             all (\case Present _ e -> check [] e; _ -> False) tup_args
           ExplicitList _ items -> null args && all (check []) items
+          HsCase _ scrut MG{mg_alts = L _ []}
+            | null args
+            , Just r <- variable scrut
+            -> r `elem` fields || Just r `elem` leading || Just r `elem` trailing
           HsAppType _ fun _ -> check args fun
           HsVar _ (L _ r)
             | isRdrDataCon r -> all (check []) args
@@ -3281,6 +3285,10 @@ localSourceTableBinders tycl_decls binds sigs = do
             null args && length tup_args /= 1 &&
             all (\case Present _ e -> check [] e; _ -> False) tup_args
           ExplicitList _ items -> null args && all (check []) items
+          HsCase _ scrut MG{mg_alts = L _ []}
+            | null args
+            , Just r <- variable scrut
+            -> r `elem` fields || Just r `elem` leading || Just r `elem` trailing
           HsAppType _ fun _ -> case unLoc (stripParensLHsExpr fun) of
                 HsAppType{} -> check args fun
                 HsVar _ (L _ r) | is_self r -> check args fun

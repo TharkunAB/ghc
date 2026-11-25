@@ -49,6 +49,7 @@ import GHC.Tc.Types.Constraint (WantedConstraints(wc_simple), isEmptyWC, CtEvide
                                 ctPred, ctEvLoc, ctEvEvId, mkWantedCt,
                                 mkNonCanonical, DelayedError(DE_SourceMethod))
 import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..), ReportRedundantConstraints(NoRRC) )
+import GHC.Tc.Types.LclEnv ( getLclEnvBinderStack, getLclEnvTypeEnv )
 import GHC.Tc.Types.CtLoc ( CtLoc )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType as TcType
@@ -56,7 +57,7 @@ import GHC.Tc.Zonk.TcType
 
 import GHC.Core.Class ( Class, classTyVars )
 import GHC.Core.ConLike ( ConLike(..) )
-import GHC.Core.DataCon ( DataCon, dataConConcreteTyVars, dataConFullSig, dataConName, isNewDataCon, isVanillaDataCon, dataConOrigArgTys, dataConOrigResTy, dataConSourceArity, dataConHasRetainedResult, dataConRepArgBinders, dataConTyCon, dataConUserTyVars, dataConWorkId, dataConWrapId )
+import GHC.Core.DataCon ( DataCon, dataConConcreteTyVars, dataConFullSig, dataConName, isNewDataCon, isVanillaDataCon, dataConOrigArgTys, dataConOrigResTy, dataConSourceArity, dataConHasRetainedResult, dataConRepArgBinders, dataConTyCon, dataConUnivTyVars, dataConUserTyVars, dataConWorkId, dataConWrapId )
 import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr, hasScopedDictionaryType
                           , isScopedSelectorReceiver, supportsQuickLookType )
@@ -66,7 +67,7 @@ import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Utils ( applyTypeToArgs, exprType, isVacuousRetainedBinder )
 import GHC.Core.FVs ( exprFreeVars, exprFreeVarsList )
 import GHC.Core.InstEnv ( lookupUniqueInstEnv, instanceDFunId )
-import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe )
+import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe, mkNomEqPred )
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs
@@ -84,7 +85,7 @@ import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs ( composeIdOcc, fromIntegerClassOpOcc )
 import GHC.Builtin.Modules ( gHC_INTERNAL_BASE )
 
-import GHC.Driver.DynFlags ( GeneralFlag(Opt_DeferTypeErrors), DynFlags(reductionDepth), HasDynFlags(getDynFlags) )
+import GHC.Driver.DynFlags ( GeneralFlag(Opt_DeferTypeErrors, Opt_DeferTypedHoles, Opt_DeferOutOfScopeVariables), DynFlags(reductionDepth), HasDynFlags(getDynFlags) )
 import GHC.Types.TyThing ( TyThing(AnId, AConLike, ATyCon) )
 import GHC.Types.Basic ( RecFlag(NonRecursive), TypeOrKind(TypeLevel), IntWithInf, intGtLimit )
 import GHC.Types.TypeEnv ( lookupTypeEnv )
@@ -98,6 +99,8 @@ import GHC.Types.Var.FV
 import GHC.Types.Name
 import GHC.Unit.Types ( Module, isInteractiveModule )
 import GHC.Types.Name.Env
+import GHC.Types.Name.Set ( elemNameSet, mkNameSet )
+import GHC.Types.Unique ( getKey )
 import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
 import GHC.Types.SourceText ( SourceText(NoSourceText) )
@@ -120,7 +123,7 @@ import Data.Data ( Data, cast, gmapQ )
 import Data.Either ( isLeft, isRight )
 import Data.Function
 import Data.IORef ( atomicModifyIORef', newIORef, readIORef )
-import Data.List ( mapAccumL )
+import Data.List ( find, mapAccumL, sortOn )
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
 import Data.Semigroup
@@ -688,7 +691,7 @@ tcRuleAppPrefix (L loc expr) = context $
      ; (checked_fun, sigma) <- tcInferAppHead head_ctxt
      ; let check prefix residual remaining = case break looks_like_type_arg remaining of
              (values, ty_arg : rest) -> CheckRulePrefix $ context $
-               do { (checked, sigma') <- tcInstFunWithPrefix quickLookArg True prefix Nothing Nothing Nothing
+               do { (checked, sigma') <- tcInstFunWithPrefix quickLookArg True prefix Nothing Nothing Nothing Nothing
                                           NoQL False head_ctxt checked_fun residual (values ++ [ty_arg])
                   ; return (sigma', check checked sigma' rest) }
              _ -> FinishRuleApp $ context $
@@ -901,13 +904,16 @@ tcOrdinaryAppScoped fields checked_prefix rn_expr rn_head@(rn_fun, fun_lspan) tc
                      , any is_type_arg rn_args || hasRequiredTypePrefix fun_sigma
                   -> Just <$> newTcRef Nothing
                 _ -> return Nothing
+            ; retained_holes_ref <- newTcRef []
             ; let instantiate =
-                    tcInstFunWithPrefix quickLookArg False (checked_prefix ++ prefix) vta_cache expected_rho inst_plan
+                    tcInstFunWithPrefix quickLookArg False (checked_prefix ++ prefix)
+                      (Just retained_holes_ref) vta_cache expected_rho inst_plan
                       do_ql inst_final rn_head tc_fun fun_sigma remaining_args
             ; ((inst_args, app_res_rho), emit_wanteds) <- case do_ql of
                 NoQL -> (, return ()) <$> instantiate
                 DoQL -> do { (instantiated, wanted) <- captureConstraints instantiate
                            ; return (instantiated, emitConstraints wanted) }
+            ; retained_holes <- readTcRef retained_holes_ref
             ; extra_cache <- case vta_cache of
                 Nothing -> return []
                 Just ref -> fromMaybe [] <$> readTcRef ref
@@ -917,7 +923,7 @@ tcOrdinaryAppScoped fields checked_prefix rn_expr rn_head@(rn_fun, fun_lspan) tc
                     case (do_ql, exp_res_ty) of
                       (DoQL, Check exp_rho) -> quickLookResultType app_res_rho exp_rho
                       _                    -> return ()
-            ; finishAppWithScopedCache fields (arg_cache ++ extra_cache) prepare do_ql rn_expr fun_lspan
+            ; finishAppWithScopedCache retained_holes fields (arg_cache ++ extra_cache) prepare do_ql rn_expr fun_lspan
                 source_fun tc_fun inst_args app_res_rho written_res_ty } }
   where
     is_type_arg ETypeArg{} = True
@@ -1862,7 +1868,7 @@ tcRetainedGroundApp True DoQL exp_ty rn_head fun sigma args
   = do { let (leading, rest) = span prefix_arg args
        ; (prefix, residual, remaining) <-
            if any type_arg leading
-           then do { (checked, ty) <- tcInstFunWithPrefix quickLookArg True [] Nothing Nothing
+           then do { (checked, ty) <- tcInstFunWithPrefix quickLookArg True [] Nothing Nothing Nothing
                                        Nothing DoQL False rn_head fun sigma leading
                    ; return (checked, ty, rest) }
            else return ([], sigma, args)
@@ -3386,18 +3392,18 @@ finishApp :: TcM ()                 -- Saved constraints and result Quick Look
           -> TcM (HsExpr GhcTc)
 -- Instantiation and Quick Look are done.  Now do typechecking,
 -- of both the result type and the arguments, before rebuilding.
-finishApp = finishAppWithScopedCache [] []
+finishApp = finishAppWithScopedCache [] [] []
 
 -- | Finish an application below any generated runtime field bindings.
 -- See Note [Opening a package found by Quick Look].
-finishAppWithScopedCache :: [Name] -> RetainedArgCache -> TcM () -> QLFlag
+finishAppWithScopedCache :: [TcTyVar] -> [Name] -> RetainedArgCache -> TcM () -> QLFlag
                          -> HsExpr GhcRn -> SrcSpan -> HsExpr GhcRn -> HsExpr GhcTc
                          -> [HsExprArg 'TcpInst] -> TcRhoType -> ExpRhoType
                          -> TcM (HsExpr GhcTc)
-finishAppWithScopedCache fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun inst_args
+finishAppWithScopedCache retained_holes fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun inst_args
                         app_res_rho exp_res_ty
   | DoQL <- do_ql
-  , null fields, null cache
+  , null retained_holes, null fields, null cache
   , [arg@EValArgQL{eaql_loc_span = loc, eaql_arg_ty = scaled@(Scaled mult domain)
                   , eaql_larg = original, eaql_res_rho = actual}]
        <- filter (not . wrapper) inst_args
@@ -3419,14 +3425,14 @@ finishAppWithScopedCache fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fu
                           ; let replace EValArgQL{} = EValArg loc scaled original
                                 replace arg = arg
                                 payload_cache = [(1, (nlHsVar payload, varType payload, zeroUE))]
-                          ; finishAppBody fields payload_cache prepare do_ql rn_expr fun_loc rn_fun
+                          ; finishAppBody [] fields payload_cache prepare do_ql rn_expr fun_loc rn_fun
                               tc_fun (map replace inst_args) app_res_rho (mkCheckExpType result_ty) } }
            _ -> ordinary }
   | otherwise = ordinary
   where
     wrapper EWrap{} = True
     wrapper _ = False
-    ordinary = finishAppBody fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun
+    ordinary = finishAppBody retained_holes fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun
                              inst_args app_res_rho exp_res_ty
 
 {- Note [Opening a package found by Quick Look]
@@ -3455,11 +3461,11 @@ cache. In particular, do not enable Quick Look on any additional calls.
 -}
 
 -- | Check the instantiated result and arguments, then rebuild the call.
-finishAppBody :: [Name] -> RetainedArgCache -> TcM () -> QLFlag
+finishAppBody :: [TcTyVar] -> [Name] -> RetainedArgCache -> TcM () -> QLFlag
               -> HsExpr GhcRn -> SrcSpan -> HsExpr GhcRn -> HsExpr GhcTc
               -> [HsExprArg 'TcpInst] -> TcRhoType -> ExpRhoType
               -> TcM (HsExpr GhcTc)
-finishAppBody fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun inst_args
+finishAppBody retained_holes fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun inst_args
               app_res_rho exp_res_ty
   = withLocalSynthFunIds $
     do { prepare
@@ -3487,13 +3493,21 @@ finishAppBody fields cache prepare do_ql rn_expr fun_loc rn_fun tc_fun inst_args
 
          -- Step 5: subsumption check against the expected type
          -- See Note [Unify with expected type before typechecking arguments]
-       ; branch_co <- case (do_ql, result_expected) of
-           (NoQL, Check expected)
-             | isTauTy expected, not (anyFreeVarsOfType (const True) expected)
-             -> tcRetainedResultCoercion inst_args app_res_rho
-           _ -> return (mkNomReflCo app_res_rho)
-       ; res_wrap <- checkResultTy rn_expr (tc_fun, fun_loc) inst_args
-                                   (coercionRKind branch_co) result_expected
+         -- and Note [Typed holes in retained applications].
+       ; (app_res_rho, inst_args, mb_hole_wrap) <-
+           tcResolveRetainedHoleResult rn_expr do_ql retained_holes inst_args
+                                       app_res_rho result_expected
+       ; (branch_co, res_wrap) <- case mb_hole_wrap of
+           Just hole_wrap -> return (mkNomReflCo app_res_rho, hole_wrap)
+           Nothing -> do
+             { b_co <- case (do_ql, result_expected) of
+                 (NoQL, Check expected)
+                   | isTauTy expected, not (anyFreeVarsOfType (const True) expected)
+                   -> tcRetainedResultCoercion inst_args app_res_rho
+                 _ -> return (mkNomReflCo app_res_rho)
+             ; r_wrap <- checkResultTy rn_expr (tc_fun, fun_loc) inst_args
+                                       (coercionRKind b_co) result_expected
+             ; return (b_co, r_wrap) }
 
          -- Step 6: Typecheck the arguments
        ; case do_ql of
@@ -4065,7 +4079,8 @@ tcInstFun = tcInstFunWithExpected Nothing Nothing
 tcValArgExpr :: QLFlag -> Int -> (HsExpr GhcRn, SrcSpan) -> HsExprLoc
              -> Scaled TcSigmaTypeFRR -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc)
 tcValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg@(L arg_loc arg)
-  = addArgCtxt pos rn_fun_head larg $
+  = tcWithRetainedHoleScope larg $
+    addArgCtxt pos rn_fun_head larg $
     do { -- Crucial step: expose QL results before checking exp_arg_ty
          -- So far as the paper is concerned, this step applies
          -- the poly-substitution Theta, learned by QL, so that we
@@ -4126,7 +4141,8 @@ tcRetainedValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg
 
 tcCheckRetainedPolyExpr :: TcType -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc)
 tcCheckRetainedPolyExpr expected_ty larg@(L arg_loc expr)
-  = do { matched <- tcCheckRetainedConApp expected_ty larg
+  = tcWithRetainedHoleScope larg $
+    do { matched <- tcCheckRetainedConApp expected_ty larg
        ; case matched of
            Just checked -> return checked
            Nothing      -> setSrcSpanA arg_loc $
@@ -4255,19 +4271,20 @@ tcInstFunWithExpectedCache :: Maybe (TcRef (Maybe RetainedArgCache))
                           -> (HsExpr GhcRn, SrcSpan) -> HsExpr GhcTc
                           -> TcSigmaType -> [HsExprArg 'TcpRn]
                           -> TcM ([HsExprArg 'TcpInst], TcSigmaType)
-tcInstFunWithExpectedCache = tcInstFunWithPrefix quickLookArg False []
+tcInstFunWithExpectedCache = tcInstFunWithPrefix quickLookArg False [] Nothing
 
 -- | Resume instantiation after a checked prefix, or check that prefix only.
 -- A prefix-only call stops before instantiating the result. Retained RULEs
 -- may include value operands before a written type argument.
 -- See Note [Ground retained applications].
 tcInstFunWithPrefix :: QuickLookArg -> Bool -> [HsExprArg 'TcpInst]
+                    -> Maybe (TcRef [TcTyVar])
                     -> Maybe (TcRef (Maybe RetainedArgCache))
                     -> Maybe TcRhoType -> RetainedInstPlan -> QLFlag -> Bool
                     -> (HsExpr GhcRn, SrcSpan) -> HsExpr GhcTc
                     -> TcSigmaType -> [HsExprArg 'TcpRn]
                     -> TcM ([HsExprArg 'TcpInst], TcSigmaType)
-tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan do_ql inst_final
+tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache expected_rho inst_plan do_ql inst_final
                     rn_head@(_, fun_lspan) tc_fun fun_sigma rn_args
   = do { lvl <- getTcLevel
        ; traceTc "tcInstFun" (vcat [ text "tc_fun" <+> ppr tc_fun
@@ -4367,7 +4384,10 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
      | Just [] <- plan, pos == 1
      = go1 plan fun_orig pos acc fun_ty args
      | otherwise
-     = do { matched <- tcRetainedResultInstWithCasts do_ql expected_rho args tc_fun fun_ty
+     = do { fun_ty <- case do_ql of
+              NoQL | pos > 1 || not (null acc) -> liftZonkM (zonkTcType fun_ty)
+              _ -> return fun_ty
+          ; matched <- tcRetainedResultInstWithCasts do_ql expected_rho args tc_fun fun_ty
           ; case matched of
               Just (inst_tys, body)
                 -> go plan fun_orig pos (addArgWrap (mkWpTyApps inst_tys) acc) body args
@@ -4579,6 +4599,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                             addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
                             if isVacuousRetainedBinder binder body
                             then return (arg, body, Nothing)
+                            else if exprContainsHole arg
+                            then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
                             else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
                                     ; res <- retainedAppResult fun_ty binder operand
                                     ; co <- retainedVariableCast operand runtime_arg
@@ -4595,6 +4617,8 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
                addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
                if isVacuousRetainedBinder binder body
                then return (arg, body, Nothing)
+               else if exprContainsHole arg
+               then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
                else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
                        ; res <- retainedAppResult fun_ty binder operand
                        ; co <- retainedVariableCast operand runtime_arg
@@ -4680,13 +4704,18 @@ tcInstFunWithPrefix look_arg prefix_only prefix vta_cache expected_rho inst_plan
       | otherwise
       = return (reverse acc, fun_ty)
 
-    -- See Note [Retained argument application].
+    -- See Note [Retained argument application] and
+    -- Note [Typed holes in retained applications].
     go1 plan fun_orig pos acc fun_ty
         (EValArg { ea_arg = arg, ea_loc_span = ctxt } : rest_args)
       | DepFunTy DepFunVisible binder body <- coreFullView fun_ty
-      = do { (core_arg, runtime_arg) <- tcRetainedOperand binder body arg
-           ; body_ty <- retainedAppResult fun_ty binder core_arg
-           ; arg_co <- retainedVariableCast core_arg runtime_arg
+      = do { (runtime_arg, body_ty, arg_co) <-
+               if exprContainsHole arg
+               then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
+               else do { (core_arg, runtime_arg) <- tcRetainedOperand binder body arg
+                       ; body_ty <- retainedAppResult fun_ty binder core_arg
+                       ; arg_co <- retainedVariableCast core_arg runtime_arg
+                       ; return (runtime_arg, body_ty, arg_co) }
            ; bndr_ty' <- zonkRetainedBinderDomain binder
            ; bndr_mult' <- liftZonkM (zonkTcType (idMult binder))
            ; let arg' = ERetainedArg DepFunVisible ctxt (Scaled bndr_mult' bndr_ty') runtime_arg body_ty
@@ -5166,6 +5195,316 @@ that the scrutinee has already fixed. Zonk the predicates before comparing
 them. Keep the original evidence Id and reject competing lexical Givens
 before asking the ordinary solver for a ground instance.
 -}
+
+{- Note [Typed holes in retained applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interactive proof development places typed holes inside retained applications:
+
+1. Direct retained holes: `plusComm _ _` passes a hole expression (`_`, `_x`,
+   `(_ :: Nat)`, or `Succ _`) to a `foreach (x :: D) ->` binder. The expression
+   has no closed or runtime index, so `tcRetainedOperand` cannot build a Core
+   index for it. When deferred hole errors are disabled, allocate a fresh
+   meta-variable `h :: D` for the retained binder, substitute `h` for
+   `TermVarTy binder` in the residual body via `replaceTermVarInType`, and emit
+   `ERetainedArg`. Step 6 then checks the hole expression at `D` and reports
+   `[GHC-88464]` with the local value environment and valid hole fits. When
+   `-fdefer-typed-holes`, `-fdefer-type-errors`, or
+   `-fdefer-out-of-scope-variables` is active, keep rejecting non-vacuous
+   retained holes with `[GHC-83605]` so Core desugaring never places an
+   unresolved hole dictionary in a dependent `Core.App`.
+
+   In Step 5 (`tcResolveRetainedHoleResult`), match the instantiated result
+   type structurally against the expected type (including identical type-family
+   applications such as `T:plus h1 h2` against `T:plus m k`) to substitute any
+   determined `h` with in-scope retained indices. If an unfilled `h` still
+   blocks a family subterm while the outer generative skeleton matches the
+   expected type, unify the `h`-free subterms and suppress the redundant
+   result-mismatch constraint so `[GHC-88464]` is reported cleanly.
+
+2. Enclosing ordinary applications with hole-bearing operands:
+   * Skip pre-inferring arguments that contain an expression hole in
+     `tcRetainedArgInstCachedWith` (`infer_args`). Pre-inferring `cong Succ _`
+     before `trans` supplies its expected type allocates premature fresh
+     meta-variables that conflict with the native expected result.
+   * Zonk `fun_ty` before post-prefix result matching in `tcInstFunWithPrefix`
+     so assignments made by `ITVDQ` (such as `Succ` fixing `a := Nat` in
+     `cong Succ _`) are visible to `tcRetainedResultInstWithCasts` and
+     `tcRetainedPartialResultPlan`.
+   * Allow `tcRetainedArgChoices` and `tcRetainedPartialResultPlan` to allocate
+     fresh meta-variables for undetermined parameters whose substituted kind is
+     any native-free tau kind (such as `Nat` in `trans _ _` or `trans _ (cong Succ _)`),
+     preserving the known native endpoints from the expected result.
+-}
+
+-- | Test whether any flag that defers typed holes or unbound variables to
+-- runtime is enabled.
+anyDeferHoleFlags :: TcM Bool
+anyDeferHoleFlags =
+  or <$> sequence [ goptM Opt_DeferTypedHoles
+                  , goptM Opt_DeferTypeErrors
+                  , goptM Opt_DeferOutOfScopeVariables ]
+
+-- | Expose user-named retained pattern binders on the 'TcBinderStack' while
+-- typechecking a hole-bearing argument so hole diagnostics report them in
+-- relevant bindings and valid hole fits.
+-- See Note [Typed holes in retained applications].
+tcWithRetainedHoleScope :: LHsExpr GhcRn -> TcM a -> TcM a
+tcWithRetainedHoleScope larg thing_inside
+  | not (exprContainsHole larg) = thing_inside
+  | otherwise = do
+      err_ctxts <- getErrCtxt
+      case [ unLoc (m_pats m) | MatchInCtxt m <- err_ctxts ] of
+        match_pats : _ -> do
+          lcl_env <- getLclEnv
+          givens <- getNativeGivens
+          let type_env = getLclEnvTypeEnv lcl_env
+              stack_names = mkNameSet [ idName b | TcIdBndr b _ <- getLclEnvBinderStack lcl_env ]
+              refined_ids = mkVarSet
+                [ v
+                | cv <- givens
+                , isCoVar cv
+                , Just (_, lhs, rhs) <- [getEqPredTys_maybe (varType cv)]
+                , v <- maybeToList (termVar_maybe lhs) ++ maybeToList (termVar_maybe rhs) ]
+              sys_ids = sortOn (getKey . getUnique)
+                [ b
+                | ATcId { tct_id = b } <- nonDetNameEnvElts type_env
+                , isSystemName (idName b)
+                , not (isUnderscore (nameOccName (idName b)))
+                , isNativeOpaqueValueId b || isNativeIndexFunctionId b
+                , not (idName b `elemNameSet` stack_names)
+                , not (b `elemVarSet` refined_ids) ]
+              missing_pat_nms =
+                [ nm
+                | p <- filter isVisArgLPat match_pats
+                , Just nm <- [plain_var_pat p]
+                , not (isSystemName nm)
+                , not (isUnderscore (nameOccName nm))
+                , not (nm `elemNameEnv` type_env) ]
+              paired
+                | equalLength missing_pat_nms sys_ids
+                = zip missing_pat_nms sys_ids
+                | otherwise
+                = [ (nm, b)
+                  | nm <- missing_pat_nms
+                  , Just b <- [find (\s -> nameOccName (idName s) == nameOccName nm) sys_ids] ]
+              restored =
+                [ setVarName b (mkInternalName (getUnique b) (nameOccName nm) (nameSrcSpan nm))
+                | (nm, b) <- paired ]
+          if null restored
+            then thing_inside
+            else tcExtendIdEnv restored thing_inside
+        [] -> thing_inside
+  where
+    termVar_maybe (TermVarTy v) = Just v
+    termVar_maybe _             = Nothing
+
+    plain_var_pat (L _ (ParPat _ inner))   = plain_var_pat inner
+    plain_var_pat (L _ (BangPat _ inner))  = plain_var_pat inner
+    plain_var_pat (L _ (LazyPat _ inner))  = plain_var_pat inner
+    plain_var_pat (L _ (VarPat _ (L _ n))) = Just n
+    plain_var_pat _                        = Nothing
+
+-- | Test whether a renamed value argument contains an expression hole (`_` or
+-- an unbound `_x` / variable hole) outside embedded type arguments.
+-- See Note [Typed holes in retained applications].
+exprContainsHole :: LHsExpr GhcRn -> Bool
+exprContainsHole (L _ expr) = case expr of
+  HsHole _ -> True
+  HsPar _ inner -> exprContainsHole inner
+  HsPragE _ _ inner -> exprContainsHole inner
+  ExprWithTySig _ inner _ -> exprContainsHole inner
+  HsApp _ fun arg -> exprContainsHole fun || exprContainsHole arg
+  HsAppType _ fun _ -> exprContainsHole fun
+  OpApp _ lhs op rhs -> exprContainsHole lhs || exprContainsHole op || exprContainsHole rhs
+  NegApp _ inner _ -> exprContainsHole inner
+  SectionL _ lhs op -> exprContainsHole lhs || exprContainsHole op
+  SectionR _ op rhs -> exprContainsHole op || exprContainsHole rhs
+  ExplicitTuple _ args _ -> any (\case Present _ e -> exprContainsHole e; _ -> False) args
+  ExplicitList _ items -> any exprContainsHole items
+  XExpr (ExpandedThingRn (HSE { hse_exp = inner })) -> exprContainsHole inner
+  _ -> False
+
+-- | Substitute a fresh placeholder meta-variable for a non-vacuous retained
+-- binder when its argument contains a typed hole and hole deferral is off.
+-- See Note [Typed holes in retained applications].
+tcRetainedHoleOperand :: Maybe (TcRef [TcTyVar]) -> Type -> Id -> Type -> LHsExpr GhcRn
+                      -> TcM (LHsExpr GhcRn, Type, Maybe CoercionN)
+tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
+  | isVacuousRetainedBinder binder body
+  = return (arg, body, Nothing)
+  | otherwise
+  = do { defer_holes <- anyDeferHoleFlags
+       ; if defer_holes
+         then do { (core_arg, runtime_arg) <- tcRetainedOperand binder body arg
+                 ; res <- retainedAppResult fun_ty binder operand_of_core
+                 ; co <- retainedVariableCast core_arg runtime_arg
+                 ; return (runtime_arg, res, co) }
+         else do { tcPreUnifyRetainedHoleCon binder arg
+                 ; fun_ty' <- liftZonkM (zonkTcType fun_ty)
+                 ; (binder', body') <- case coreFullView fun_ty' of
+                     DepFunTy _ b res -> return (b, res)
+                     _ -> do { dom' <- liftZonkM (zonkTcType (varType binder))
+                             ; res' <- liftZonkM (zonkTcType body)
+                             ; return (setVarType binder dom', res') }
+                 ; hole_tv <- newFlexiTyVar (varType binder')
+                 ; forM_ retained_holes_ref $ \ref ->
+                     updTcRef ref (hole_tv :)
+                 ; let res_ty = replaceTermVarInType binder' (mkTyVarTy hole_tv) body'
+                 ; return (arg, res_ty, Nothing) } }
+  where
+    operand_of_core = panic "tcRetainedHoleOperand: unreachable after tcRetainedOperand"
+
+-- | Pre-unify flexible meta-variables in a retained binder's domain when the
+-- hole-bearing argument is headed by a known data constructor (e.g. `Succ _`).
+tcPreUnifyRetainedHoleCon :: Id -> LHsExpr GhcRn -> TcM ()
+tcPreUnifyRetainedHoleCon binder arg
+  | anyFreeVarsOfType (\v -> isTcTyVar v && isMetaTyVar v) (varType binder)
+  = do { (rn_fun, rn_args) <- splitHsApps (unLoc (stripParensLHsExpr arg))
+       ; case rn_fun of
+           HsVar _ lname
+             | isDataOcc (nameOccName (unLocWithUserRdr lname))
+             , any isHsValArg rn_args -> do
+                 con <- tcLookupConLike (unLoc lname)
+                 case con of
+                   RealDataCon dc
+                     | null (dataConRepArgBinders dc)
+                     , count isHsValArg rn_args == dataConSourceArity dc -> do
+                         (subst, _) <- newMetaTyVars (dataConUnivTyVars dc)
+                         let res_ty = Subst.substTy subst (dataConOrigResTy dc)
+                         when (typeKind res_ty `tcEqType` typeKind (varType binder)) $
+                           void (unifyType Nothing res_ty (varType binder))
+                   _ -> return ()
+           _ -> return () }
+  | otherwise = return ()
+
+-- | Resolve placeholder hole variables in an application's result type against
+-- the expected result type and suppress cascading mismatch errors on stuck
+-- hole-dependent family subterms.
+-- See Note [Typed holes in retained applications].
+tcResolveRetainedHoleResult
+  :: HsExpr GhcRn -> QLFlag -> [TcTyVar] -> [HsExprArg 'TcpInst]
+  -> TcRhoType -> ExpRhoType
+  -> TcM (TcRhoType, [HsExprArg 'TcpInst], Maybe HsWrapper)
+tcResolveRetainedHoleResult rn_expr NoQL retained_holes inst_args app_res_rho (Check expected)
+  | not (null retained_holes)
+  = do { actual0 <- liftZonkM (zonkTcType app_res_rho)
+       ; expected0 <- liftZonkM (zonkTcType expected)
+       ; let hole_set = mkVarSet retained_holes
+             raw_map0 = matchRetainedHoleVars hole_set Map.empty actual0 expected0
+             missing0 = [ tv | tv <- retained_holes
+                             , tv `elemVarSet` tyCoVarsOfType actual0
+                             , not (Map.member tv raw_map0) ]
+       ; raw_map <- if null missing0 || (isFamFreeTy actual0 && isFamFreeTy expected0)
+                    then return raw_map0
+                    else do
+                      { loc <- getCtLocM (exprCtOrigin rn_expr) (Just TypeLevel)
+                      ; actual_red <- reductionReducedType <$> tcRewriteFamilyAxioms loc actual0
+                      ; expected_red <- reductionReducedType <$> tcRewriteFamilyAxioms loc expected0
+                      ; return (matchRetainedHoleVars hole_set raw_map0 actual_red expected_red) }
+       ; let in_scope = mkInScopeSet (tyCoVarsOfTypes (actual0 : expected0 : Map.elems raw_map))
+             step_subst subst tv = case Map.lookup tv raw_map of
+               Just ty
+                 | not (tv `elemVarSet` tyCoVarsOfType ty)
+                 , noQuickLookVars ty
+                 , typeKind ty `eqType` Subst.substTy subst (tyVarKind tv) -> do
+                     ok <- tcRetainedInstScope [ty]
+                     return $ if ok
+                              then Subst.extendTvSubstAndInScope subst tv ty
+                              else subst
+               _ -> return subst
+       ; subst <- foldM step_subst (Subst.mkEmptySubst in_scope) (reverse retained_holes)
+       ; let actual1 = Subst.substTy subst actual0
+             inst_args1 = substInstArgHoles subst inst_args
+             still_has_hole = anyFreeVarsOfType (`elemVarSet` hole_set) actual1
+       ; defer_holes <- anyDeferHoleFlags
+       ; if still_has_hole && not defer_holes && isTauTy expected0
+            && compatibleHoleSkeleton hole_set actual1 expected0
+         then do { unifyNonHoleSubterms hole_set actual1 expected0
+                 ; co_hole <- newCoercionHole (mkNomEqPred actual1 expected0)
+                 ; return (actual1, inst_args1, Just (mkWpCastN (mkHoleCo co_hole))) }
+         else return (actual1, inst_args1, Nothing) }
+tcResolveRetainedHoleResult _ _ _ inst_args app_res_rho _
+  = return (app_res_rho, inst_args, Nothing)
+
+-- | Match placeholder hole variables structurally, including arguments of
+-- identical type-family heads.
+matchRetainedHoleVars :: VarSet -> Map.Map TcTyVar Type -> Type -> Type -> Map.Map TcTyVar Type
+matchRetainedHoleVars hole_set acc formal actual
+  | Just tv <- getTyVar_maybe formal
+  , tv `elemVarSet` hole_set
+  = case Map.lookup tv acc of
+      Nothing -> Map.insert tv actual acc
+      Just prev | prev `eqType` actual -> acc
+                | otherwise -> acc
+  | Just (tc1, as1) <- tcSplitTyConApp_maybe formal
+  , Just (tc2, as2) <- tcSplitTyConApp_maybe actual
+  , tc1 == tc2, equalLength as1 as2
+  = foldl' (\m (f, a) -> matchRetainedHoleVars hole_set m f a) acc (zip as1 as2)
+  | FunTy af1 ma1 _ d1 r1 <- coreFullView formal
+  , FunTy af2 ma2 _ d2 r2 <- coreFullView actual
+  , af1 == af2, eqType ma1 ma2
+  = let acc1 = matchRetainedHoleVars hole_set acc d1 d2
+    in matchRetainedHoleVars hole_set acc1 r1 r2
+  | Just (f1, a1) <- tcSplitAppTyNoView_maybe formal
+  , Just (f2, a2) <- tcSplitAppTyNoView_maybe actual
+  = let acc1 = matchRetainedHoleVars hole_set acc f1 f2
+    in matchRetainedHoleVars hole_set acc1 a1 a2
+  | otherwise = acc
+
+-- | Apply a resolved retained-hole substitution to instantiated call arguments.
+substInstArgHoles :: Subst.Subst -> [HsExprArg 'TcpInst] -> [HsExprArg 'TcpInst]
+substInstArgHoles subst = map subst_arg
+  where
+    subst_scaled (Scaled m t) = Scaled (Subst.substTy subst m) (Subst.substTy subst t)
+    subst_arg (EValArg loc ty arg) = EValArg loc (subst_scaled ty) arg
+    subst_arg (ERetainedArg vis loc ty arg res_ty co) =
+      ERetainedArg vis loc (subst_scaled ty) arg (Subst.substTy subst res_ty) co
+    subst_arg arg@ETypeArg{ ea_ty_arg = ty } = arg { ea_ty_arg = Subst.substTy subst ty }
+    subst_arg arg@EValArgQL{ eaql_arg_ty = ty, eaql_args = inner, eaql_res_rho = rho } =
+      arg { eaql_arg_ty = subst_scaled ty
+          , eaql_args = substInstArgHoles subst inner
+          , eaql_res_rho = Subst.substTy subst rho }
+    subst_arg arg = arg
+
+-- | Check that every outer generative 'TyCon' in 'actual' agrees with
+-- 'expected', allowing differences only under hole-dependent subterms.
+compatibleHoleSkeleton :: VarSet -> Type -> Type -> Bool
+compatibleHoleSkeleton hole_set actual expected
+  | not (anyFreeVarsOfType (`elemVarSet` hole_set) actual) = True
+  | Just tv <- getTyVar_maybe actual, tv `elemVarSet` hole_set = True
+  | Just (tc1, _) <- tcSplitTyConApp_maybe actual
+  , isTypeFamilyTyCon tc1 = True
+  | Just (tc1, as1) <- tcSplitTyConApp_maybe actual
+  , isGenerativeTyCon tc1 Nominal
+  = case tcSplitTyConApp_maybe expected of
+      Just (tc2, as2) ->
+        tc1 == tc2 && equalLength as1 as2
+        && and (zipWith (compatibleHoleSkeleton hole_set) as1 as2)
+      Nothing -> False
+  | FunTy af1 ma1 _ d1 r1 <- coreFullView actual
+  , FunTy af2 ma2 _ d2 r2 <- coreFullView expected
+  = af1 == af2 && eqType ma1 ma2
+    && compatibleHoleSkeleton hole_set d1 d2
+    && compatibleHoleSkeleton hole_set r1 r2
+  | otherwise = True
+
+-- | Unify sibling subterms that do not mention any unfilled retained-hole
+-- placeholder variable.
+unifyNonHoleSubterms :: VarSet -> Type -> Type -> TcM ()
+unifyNonHoleSubterms hole_set actual expected
+  | not (anyFreeVarsOfType (`elemVarSet` hole_set) actual)
+  = when (typeKind actual `tcEqType` typeKind expected) $
+      void (unifyType Nothing actual expected)
+  | Just (tc1, as1) <- tcSplitTyConApp_maybe actual
+  , Just (tc2, as2) <- tcSplitTyConApp_maybe expected
+  , tc1 == tc2, isGenerativeTyCon tc1 Nominal, equalLength as1 as2
+  = zipWithM_ (unifyNonHoleSubterms hole_set) as1 as2
+  | FunTy af1 ma1 _ d1 r1 <- coreFullView actual
+  , FunTy af2 ma2 _ d2 r2 <- coreFullView expected
+  , af1 == af2, eqType ma1 ma2
+  = do { unifyNonHoleSubterms hole_set d1 d2
+       ; unifyNonHoleSubterms hole_set r1 r2 }
+  | otherwise = return ()
 
 -- | Resolve the index at the binder's checked scalar or function domain.
 tcRetainedOperand :: Id -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
@@ -7123,31 +7462,84 @@ original head, argument multiplicities, constraints and final subsumption.
 -}
 
 -- | Keep exact native choices and infer the remaining ordinary parameters.
--- See Note [Partial ordinary applications at a native result type].
+-- See Note [Partial ordinary applications at a native result type] and
+-- Note [Typed holes in retained applications].
 tcRetainedPartialResultPlan :: QLFlag -> Maybe TcRhoType -> [HsExprArg 'TcpRn]
                             -> HsExpr GhcTc -> TcSigmaType -> TcM RetainedInstPlan
 tcRetainedPartialResultPlan NoQL (Just expected) args fun sigma
   | HsVar{} <- fun
   , hasNoConcreteTyVars fun
-  , isFunTy expected
   , hasNativeDependentExpr (Core.Type expected)
   , any isHsValArg args
   = runMaybeT $ do
-      expected <- liftMaybeT (liftZonkM (zonkTcType expected))
-      guard (isTauTy expected)
-      -- A stored impredicative field needs all its choices from the checked result.
-      (tvs, _, subst, False) <- MaybeT (pure (retainedOrdinaryResultSubst expected args fun sigma))
-      selected <- MaybeT (pure (retainedPartialResultChoices tvs subst))
-      guard (noQuickLookVars expected)
+      expected0 <- liftMaybeT (liftZonkM (zonkTcType expected))
+      guard (isTauTy expected0 && noQuickLookVars expected0
+             && not (hasScopedDictionaryType expected0))
+      let try_target rho = do
+            (tvs, subst) <- candidate_subst rho
+            selected <- retainedPartialResultChoices tvs subst
+            pure (tvs, subst, selected)
+      (tvs, subst, selected) <- case try_target expected0 of
+        Just hit -> pure hit
+        Nothing
+          | not (isFamFreeTy expected0) -> do
+              let orig = TypeEqOrigin { uo_actual = sigma, uo_expected = expected0
+                                      , uo_thing = Nothing, uo_invisible = Nothing }
+              loc <- liftMaybeT (getCtLocM orig (Just TypeLevel))
+              reduced <- liftMaybeT (reductionReducedType <$> tcRewriteFamilyAxioms loc expected0)
+              guard (not (reduced `eqType` expected0) && isTauTy reduced
+                     && noQuickLookVars reduced && not (hasScopedDictionaryType reduced))
+              MaybeT (pure (try_target reduced))
+          | otherwise -> mzero
       scoped <- liftMaybeT (tcRetainedInstScope selected)
       guard scoped
       snd <$> MaybeT (tcRetainedArgChoices False tvs subst)
+  where
+    candidate_subst rho
+      | Just (tvs, _, subst, False) <- retainedOrdinaryResultSubst rho args fun sigma
+      = Just (tvs, subst)
+      | otherwise
+      = partialGenerativeResultSubst rho args fun sigma
 tcRetainedPartialResultPlan _ _ _ _ _ = return Nothing
+
+-- | Match independent positions of a generative result type constructor when
+-- another position contains an unsolved metavariable (for example, `cong Succ _`
+-- checked against `b0 :~: Succ (plus k m)` inside `trans _ (cong Succ _)`).
+partialGenerativeResultSubst :: TcRhoType -> [HsExprArg 'TcpRn] -> HsExpr GhcTc
+                             -> TcSigmaType -> Maybe ([TyVar], Subst.Subst)
+partialGenerativeResultSubst expected args fun sigma
+  | hasNativeDependentExpr (Core.Type expected)
+  , not (any is_type_arg args)
+  , (ma_tvs, body) <- tcSplitForAllInvisTyVars sigma
+  , let tvs = map snd ma_tvs
+  , not (null tvs)
+  , let (theta, tau) = tcSplitPhiTy body
+  , null theta || hasNoConcreteTyVars fun
+  , not (hasNativeDependentExpr (Core.Type body))
+  , Just result <- peelOrdinaryArrows (count isHsValArg args) tau
+  , isTauTy result, isTauTy expected
+  , Just (tc1, formals) <- splitTyConApp_maybe result
+  , Just (tc2, actuals) <- splitTyConApp_maybe expected
+  , tc1 == tc2, isGenerativeTyCon tc1 Nominal, equalLength formals actuals
+  = Just (tvs, foldl' (step_pair tvs) Subst.emptySubst (zip formals actuals))
+  | otherwise = Nothing
+  where
+    is_type_arg ETypeArg{} = True
+    is_type_arg _ = False
+
+    bind_outer tvs tv _
+      | tv `elem` tvs = BindMe
+      | otherwise = DontBindMe
+
+    step_pair tvs subst (formal, actual) =
+      fromMaybe subst $ do
+        s1 <- tcMatchTyX_BM (bind_outer tvs) subst (typeKind formal) (typeKind actual)
+        tcMatchTyX_BM (bind_outer tvs) s1 formal actual
 
 -- | Validate the native choices before allocating the remaining ordinary arguments.
 retainedPartialResultChoices :: [TyVar] -> Subst.Subst -> Maybe [Type]
 retainedPartialResultChoices tvs subst
-  | not (null pending), all ((`eqType` liftedTypeKind) . kind) pending
+  | not (null pending), all valid_pending_kind pending
   , any (hasNativeDependentExpr . Core.Type) selected
   , not (any (`elemVarSet` tyCoVarsOfTypes (selected ++ map kind tvs)) tvs)
   , and [kind tv `eqType` typeKind ty | (tv, Just ty) <- choices]
@@ -7159,6 +7551,9 @@ retainedPartialResultChoices tvs subst
     selected = [ty | (_, Just ty) <- choices]
     pending = [tv | (tv, Nothing) <- choices]
     kind tv = Subst.substTy subst (tyVarKind tv)
+    valid_pending_kind tv =
+      let k = kind tv
+      in isTauTy k && not (hasNativeDependentExpr (Core.Type k)) && noQuickLookVars k
 
 -- | Recognize a package expected at one invisible result parameter.
 -- See Note [Exact expected existential packages].
@@ -8933,7 +9328,8 @@ tcRetainedArgInstCachedWith can_seed_metas after_vta NoQL expected rn_head args 
     infer_args _ _ _ _ [] = return []
     infer_args tvs (inferable : rest) (domain : domains) pos
                (EValArg { ea_arg = arg } : args)
-      = do { entry <- if inferable && any (`elemVarSet` tyCoVarsOfType (scaledThing domain)) tvs
+      = do { entry <- if inferable && not (exprContainsHole arg)
+                         && any (`elemVarSet` tyCoVarsOfType (scaledThing domain)) tvs
                       then do { defer <- case expected of
                                    Just _  -> tcRetainedNeedsExpected arg
                                    Nothing -> return False
@@ -9637,7 +10033,9 @@ tcRetainedArgChoices index_route tvs subst
     go subst choices [] = return (Just (subst, reverse choices))
     go subst choices (tv : tvs)
       | Just ty <- Subst.lookupTyVar subst tv = go subst (ty : choices) tvs
-      | isNativeIndexType (Subst.substTy subst (tyVarKind tv)) = return Nothing
+      | let k = Subst.substTy subst (tyVarKind tv)
+      , not (isTauTy k && not (hasNativeDependentExpr (Core.Type k)) && noQuickLookVars k)
+      = return Nothing
       | otherwise = do { (subst, tv) <- newMetaTyVarX subst tv
                        ; go subst (mkTyVarTy tv : choices) tvs }
 
@@ -11371,7 +11769,7 @@ tcPreviewQuickLookResult rhs =
       guard (fixed sigma)
       loc <- liftMaybeT (getFunSrcSpan args)
       snd <$> liftMaybeT
-        (tcInstFunWithPrefix preview_arg False [] Nothing Nothing Nothing
+        (tcInstFunWithPrefix preview_arg False [] Nothing Nothing Nothing Nothing
           DoQL True (rn_fun, loc) tc_fun sigma args)
 
     preview_head :: HsExpr GhcRn -> MaybeT TcM (HsExpr GhcTc, TcSigmaType)

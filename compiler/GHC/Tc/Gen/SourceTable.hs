@@ -2696,10 +2696,18 @@ sourceTableTyCons local final_exports binds = do
         fam <- table
         (binders, args, result) <- constructorHelperType ty <|>
           (\(inputs, output) -> ([], inputs, output)) <$> ordinaryArrows ty <|>
-          typeResultHelperType ty
+          typeResultHelperType ty <|>
+          polyHelperType ty
         guard (not (null args) && length binders + length args == tyConArity fam)
         guard (ty `eqType` tyConKind fam)
         pure (fam, binderVars binders, args, result)
+
+    polyHelperType ty = do
+      let (telescope, tau) = splitForAllForAllTyBinders ty
+      binders <- traverse ordinaryCaseBinder telescope
+      guard (all (tcIsLiftedTypeKind . tyVarKind . binderVar) binders)
+      (inputs, output) <- polySourceArrows (binderVars binders) tau
+      pure (binders, inputs, output)
 
     callee_clean visible_rules unloaded_rules local_rules callee =
       not (idName callee `elemNameSet` local_rules) &&
@@ -2745,23 +2753,27 @@ sourceTableTyCons local final_exports binds = do
             branches <- traverse (sourceBranch (lookupCall checked) (varName fun) (embeddedLocalCalls fun rows) order input carried result) rows
             case sequence branches of
               Nothing -> pure Nothing
-              Just branch_builders -> do
-                table <- case if final_exports then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
-                  Just existing -> pure existing
-                  _ -> makeFamily (varName fun) order input carried result branch_builders
-                let exported = availsToNameSet (tcg_exports env)
-                if final_exports && tcIsLiftedTypeKind result
-                   && (not (idName fun `elemNameSet` exported)
-                       || not (null (unexportedLargeElimTypes env exported table)))
-                  then pure Nothing
-                  else if final_exports && not (tcIsLiftedTypeKind result)
-                          && not (public_table_types env exported table)
-                  then pure Nothing
-                  else do
-                    let owner = if needs_final
-                          then setIdDetails (setIdType fun ty) (SourceTableId (idName fun) table FinalCoreSourceTable)
-                          else setIdType fun ty
-                    pure (Just (owner, table))
+              Just maybe_builders ->
+                let branch_builders = catMaybes maybe_builders
+                in if null branch_builders
+                   then pure Nothing
+                   else do
+                     table <- case if final_exports then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
+                       Just existing -> pure existing
+                       _ -> makeFamily (varName fun) order input carried result branch_builders
+                     let exported = availsToNameSet (tcg_exports env)
+                     if final_exports && tcIsLiftedTypeKind result
+                        && (not (idName fun `elemNameSet` exported)
+                            || not (null (unexportedLargeElimTypes env exported table)))
+                       then pure Nothing
+                       else if final_exports && not (tcIsLiftedTypeKind result)
+                               && not (public_table_types env exported table)
+                       then pure Nothing
+                       else do
+                         let owner = if needs_final
+                               then setIdDetails (setIdType fun ty) (SourceTableId (idName fun) table FinalCoreSourceTable)
+                               else setIdType fun ty
+                         pure (Just (owner, table))
       else pure Nothing
 
 -- | Publish checked case and pair equations, with their private field families.
@@ -4187,6 +4199,17 @@ caseDatatype ty = do
     (tc, args) <- splitTyConApp_maybe ty
     guard (isVanillaAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
            lengthIs args (tyConArity tc) && not (null (tyConDataCons tc)))
+    pure (tc, args)
+
+-- | Read a saturated boxed algebraic datatype with zero data constructors
+-- (such as 'Data.Void.Void').
+-- See Note [Empty-case branches in source equations].
+emptyCaseDatatype :: Type -> Maybe (TyCon, [Type])
+emptyCaseDatatype ty = do
+    (tc, args) <- splitTyConApp_maybe ty
+    guard (isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
+           not (isAbstractTyCon tc) && null (tyConStupidTheta tc) &&
+           lengthIs args (tyConArity tc) && null (tyConDataCons tc))
     pure (tc, args)
 
 -- | Kinds expressible using lifted parameters and ordinary boxed datatypes.
@@ -6966,9 +6989,35 @@ data SourceRow
   = SourceRow SrcSpan DataCon [Type] [SourcePat] [Maybe Id] SourceRhs
   | SourceProducerRow SrcSpan [Maybe Id] SourceRhs
 
+{- Note [Empty-case branches in source equations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A total source function over a sum datatype can have an uninhabited constructor
+branch whose field has a zero-constructor boxed algebraic datatype such as
+`Data.Void.Void`:
+
+    sumZeroRTo :: Either a Void -> a
+    sumZeroRTo (Left x)  = x
+    sumZeroRTo (Right v) = case v of {}
+
+or `sumZeroRTo (Right v) = absurd v`.
+
+In lazy Haskell evaluation, `sumZeroRTo (Right undefined)` diverges because
+`case v of {}` forces `v`. Therefore `T:sumZeroRTo` must emit no axiom branch
+for `'Right v`, leaving `T:sumZeroRTo ('Right v)` stuck while publishing the
+checked equation `T:sumZeroRTo ('Left x) = x` for the inhabited constructor.
+
+Certify an `AbsurdField v` branch only when:
+1. All constructors of the scrutinized datatype are covered in the source
+   pattern matrix, with at least one inhabited non-absurd branch.
+2. The scrutinized variable `v` is bound by that row's pattern or carried
+   binders, and its instantiated type satisfies `emptyCaseDatatype` (a concrete,
+   non-abstract boxed lifted algebraic datatype with zero data constructors).
+-}
+
 -- | The expression forms allowed in one source equation.
 data SourceRhs = Field Id | Construct DataCon [SourceRhs] | Recur [Type] Id
                | Call Id [Type] [SourceRhs] | EmbeddedType Type
+               | AbsurdField Id
 
 -- | Collect non-self calls, including calls inside operands.
 sourceCalls :: SourceRhs -> [Id]
@@ -6977,6 +7026,12 @@ sourceCalls (Construct _ args) = concatMap sourceCalls args
 sourceCalls (Recur _ _) = []
 sourceCalls (Call fun _ args) = fun : concatMap sourceCalls args
 sourceCalls (EmbeddedType _) = []
+sourceCalls (AbsurdField _) = []
+
+-- | Test whether a row refutes an uninhabited field via an empty case or 'absurd'.
+isAbsurdSourceRow :: SourceRow -> Bool
+isAbsurdSourceRow (SourceRow _ _ _ _ _ AbsurdField{}) = True
+isAbsurdSourceRow _ = False
 
 -- | Test whether a row returns an embedded type via @type@.
 isEmbeddedTypeRow :: SourceRow -> Bool
@@ -7338,11 +7393,12 @@ checkedDomains strict order body_tvs ty rows
       pure (ProducerInput body_tvs, map instantiate_body args, instantiate_body final_ty)
   | otherwise = do
       let (telescope, tau) = splitForAllForAllTyBinders ty
-          embedded_type_rows = not (null rows) && all isEmbeddedTypeRow rows
+          non_absurd_rows = filter (not . isAbsurdSourceRow) rows
+          embedded_type_rows = not (null non_absurd_rows) && all isEmbeddedTypeRow non_absurd_rows
           has_nested_pats = any isNestedSourcePatRow rows
-      guard (not (null rows) && not (any isProducerSourceRow rows))
+      guard (not (null non_absurd_rows) && not (any isProducerSourceRow rows))
       guard (equalLength telescope body_tvs)
-      guard (embedded_type_rows || not (any isEmbeddedTypeRow rows))
+      guard (embedded_type_rows || not (any isEmbeddedTypeRow non_absurd_rows))
       guard (not (embedded_type_rows && has_nested_pats))
       tvs <- traverse (if embedded_type_rows then embeddedTypeBinder else ordinary_binder) telescope
       (FTF_T_T, ma, mult, first_ty, rest_ty) <- splitFunTy_maybe tau
@@ -7376,9 +7432,13 @@ checkedDomains strict order body_tvs ty rows
           pure (second_ty, [first_ty], result)
       let lhs_fvs = concatMap tyCoVarsOfTypeList (arg_ty : carried)
       (domain, input) <- case tvs of
-        [] -> do
-          (tc, params) <- ordinaryDataType arg_ty
-          pure (tc, ClosedInput arg_ty params)
+        [] | Just (tc, params) <- ordinaryDataType arg_ty ->
+             pure (tc, ClosedInput arg_ty params)
+           | not strict
+           , Just (tc, args) <- caseDatatype arg_ty
+           , polySourceType [] arg_ty ->
+             pure (tc, ClosedInput arg_ty args)
+           | otherwise -> empty
         _ | embedded_type_rows
           , Just (tc, []) <- ordinaryDataType arg_ty -> do
               guard (not strict && all (`elem` lhs_fvs) tvs)
@@ -7413,12 +7473,14 @@ checkedDomains strict order body_tvs ty rows
         guard (null carried || not strict)
         guard (not has_nested_pats || not strict)
         if null tvs
-          then do
-            (result, result_params) <- ordinaryDataType final_ty
-            guard (null result_params ||
-                   (result == listTyCon && null carried &&
-                    eqTypes result_params [arg_ty] && isStructuralSize domain arg_ty) ||
-                   (not strict && polySourceArgType [] final_ty))
+          then case ordinaryDataType final_ty of
+            Just (result, result_params) ->
+              guard (null result_params ||
+                     (result == listTyCon && null carried &&
+                      eqTypes result_params [arg_ty] && isStructuralSize domain arg_ty) ||
+                     (not strict && polySourceArgType [] final_ty))
+            Nothing ->
+              guard (not strict && polySourceArgType [] final_ty)
           else guard (not strict && polySourceArgType tvs final_ty)
       if has_nested_pats
         then do
@@ -7561,6 +7623,7 @@ sourceRhs bracket_lists order self carried = go []
     go :: [HsExpr GhcTc] -> HsExpr GhcTc -> Maybe SourceRhs
     go args (HsPar _ e)   = go args (unLoc e)
     go args (HsApp _ f x) = go (unLoc x : args) (unLoc f)
+    go args (XExpr (WrapExpr WpHole e)) = go args e
     go args (XExpr (ExpandedThingTc (HSE (ExprCtxt (OpApp{})) expansion))) =
       go args (unLoc expansion)
     go args (XExpr (ExpandedThingTc (HSE (ExprCtxt (ExplicitTuple{})) expansion))) =
@@ -7568,6 +7631,9 @@ sourceRhs bracket_lists order self carried = go []
     go [] (XExpr (ExpandedThingTc (HSE (ExprCtxt (HsEmbTy{}))
             (L _ (XExpr (WrapExpr (WpCompose (WpTyApp emb_ty) (WpTyLam _)) _)))))) =
       Just (EmbeddedType emb_ty)
+    go [] (HsCase _ scrut (MG { mg_alts = L _ [] }))
+      | Just v <- variable (unLoc scrut)
+      = Just (AbsurdField v)
     go args (XExpr (WrapExpr wrap con@(XExpr (ConLikeTc (RealDataCon _)))))
       | isJust (typeApps wrap) = go args con
     go args (XExpr (ConLikeTc (RealDataCon con))) = Construct con <$> traverse (go []) args
@@ -7579,11 +7645,21 @@ sourceRhs bracket_lists order self carried = go []
       foldr (\x xs -> Construct consDataCon [x, xs]) (Construct nilDataCon [])
         <$> traverse (go [] . unLoc) items
     go [] (HsVar _ (L _ v)) = Just (Field v)
+    go [arg] expr
+      | Just (f, [_]) <- appliedHead expr
+      , isBaseAbsurdId f
+      , Just v <- variable arg
+      = Just (AbsurdField v)
     go args expr
       | Just (f, tys) <- appliedHead expr, self f = call tys args
       | Just (f, tys) <- appliedHead expr, isExternalName (idName f) =
           Call f tys <$> traverse (go []) args
     go _ _ = Nothing
+
+    isBaseAbsurdId :: Id -> Bool
+    isBaseAbsurdId f =
+      nameModule_maybe (idName f) == Just gHC_INTERNAL_BASE &&
+      occNameString (nameOccName (idName f)) == "absurd"
 
     appliedHead :: HsExpr GhcTc -> Maybe (Id, [Type])
     appliedHead (HsPar _ e) = appliedHead (unLoc e)
@@ -7636,9 +7712,11 @@ instantiateInput (PolyInput _ skolems _) vars = substTyWith skolems (mkTyVarTys 
 instantiateInput (ProducerInput skolems) vars = substTyWith skolems (mkTyVarTys vars)
 
 -- | Check a branch before supplying the family at its recursive calls.
+-- An uninhabited empty-case branch validates and returns @Just Nothing@.
+-- See Note [Empty-case branches in source equations].
 sourceBranch :: (Id -> TcM (Maybe (TyCon, [TyVar], [Type], Type)))
              -> Name -> [Id] -> LeftOrRight -> SourceInput -> [Type] -> Type -> SourceRow
-             -> TcM (Maybe (TyCon -> CoAxBranch))
+             -> TcM (Maybe (Maybe (TyCon -> CoAxBranch)))
 sourceBranch lookup_call owner_name extra_callees order input carried_types result (SourceProducerRow loc vars output) = do
     var_tys <- liftZonkM (traverse (traverse (zonkTcType . varType)) vars)
     checked_output <- runMaybeT (checkCalls output)
@@ -7661,8 +7739,8 @@ sourceBranch lookup_call owner_name extra_callees order input carried_types resu
         guard (all isTyFamFree patterns)
         rhs <- check_rhs checked_callees quantified binders instantiate liftedTypeKind family_args
                          [] carried_scope (instantiate result) =<< checked_output
-        pure (\fam -> mkCoAxBranch binders [] [] patterns (rhs fam)
-                        (map (const Nominal) binders) loc)
+        pure (Just (\fam -> mkCoAxBranch binders [] [] patterns (rhs fam)
+                              (map (const Nominal) binders) loc))
     else pure Nothing
   where
     (call_args, skolem_vars) = case input of
@@ -7702,10 +7780,18 @@ sourceBranch lookup_call owner_name extra_callees order input carried_types resu
             binders = quantified ++ tvs ++ carried_tvs
             carried_scope = zip carried carried_tvs
         guard (all isTyFamFree patterns)
-        rhs <- check_rhs checked_callees quantified binders instantiate domain family_args
-                         fields_scope carried_scope (instantiate result) =<< checked_output
-        pure (\fam -> mkCoAxBranch binders [] [] patterns (rhs fam)
-                        (map (const Nominal) binders) loc)
+        valid_rhs <- checked_output
+        case valid_rhs of
+          AbsurdField v -> do
+            tv <- lookup (Just v) (fields_scope ++ carried_scope)
+            guard (instantiate (varType v) `eqType` tyVarKind tv)
+            guard (isJust (emptyCaseDatatype (tyVarKind tv)))
+            pure Nothing
+          _ -> do
+            rhs <- check_rhs checked_callees quantified binders instantiate domain family_args
+                             fields_scope carried_scope (instantiate result) valid_rhs
+            pure (Just (\fam -> mkCoAxBranch binders [] [] patterns (rhs fam)
+                                  (map (const Nominal) binders) loc))
     else pure Nothing
   where
     (call_args, pattern_args, skolem_vars) = case input of
@@ -7754,6 +7840,7 @@ sourceBranchCheckCalls call_args = checkCalls
       pure recur
     checkCalls (EmbeddedType raw_ty) =
       EmbeddedType <$> lift (liftZonkM (zonkTcType raw_ty))
+    checkCalls absurd_rhs@AbsurdField{} = pure absurd_rhs
 
 -- | Allocate a fresh type variable representing one pattern or carried binder.
 sourceBranchFieldVar :: Maybe Id -> Type -> TcM TyVar
@@ -7888,6 +7975,7 @@ sourceBranchCheckRhs owner_name order skolem_vars callees quantified binders ins
         guard (equalLength args arg_tys && specialize res_ty `eqType` expected)
         children <- zipWithM go (map specialize arg_tys) args
         pure (\fam -> mkTyConApp table (actual_tys ++ [child fam | child <- children]))
+      AbsurdField _ -> Nothing
 
 -- | Give the table the representation of a closed, non-injective family.
 makeFamily :: Name -> LeftOrRight -> SourceInput -> [Type] -> Type -> [TyCon -> CoAxBranch] -> TcM TyCon
