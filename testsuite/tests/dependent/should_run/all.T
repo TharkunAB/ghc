@@ -1059,3 +1059,8 @@ test('NativeParamDependentRecordUpdate',
       extra_files(['NativeParamDependentRecordUpdateProvider.hs',
                    'NativeParamDependentRecordUpdate.hs'])],
      run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
+test('NativeWave10TypeCaseDotSections',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeWave10TypeCaseDotSectionsProvider.hs',
+                   'NativeWave10TypeCaseDotSections.hs'])],
+     run_command, ['bash NativeWave10TypeCaseDotSections.sh "{compiler}" "{libdir}"'])
