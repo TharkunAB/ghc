@@ -1059,3 +1059,9 @@ test('NativeParamDependentRecordUpdate',
       extra_files(['NativeParamDependentRecordUpdateProvider.hs',
                    'NativeParamDependentRecordUpdate.hs'])],
      run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
+test('NativePluginsGeneral',
+     [req_host_target_ghc, req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['NativePluginsGeneral.hs',
+                   '../../../../docs/dependent-haskell/hasklib',
+                   '../../../../docs/dependent-haskell/examples/open-evaluation'])],
+     run_command, ['bash NativePluginsGeneral.sh "{compiler}" "{libdir}" "{ghc_pkg}"'])
