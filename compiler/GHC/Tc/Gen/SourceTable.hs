@@ -225,6 +225,14 @@ recordSourceTableUses env names =
     updTcRef (tcg_source_table_uses env) $ \uses ->
       let !uses' = extendNameSetList uses names in uses'
 
+-- | Allocate a fresh system 'TyVar' with the given occurrence string and kind.
+freshSysTyVar :: String -> Kind -> TcM TyVar
+freshSysTyVar occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
+
+-- | Extract 'Type' arguments from a prefix of 'Core.Type' expressions.
+coreTypeArgs :: [Core.CoreExpr] -> Maybe [Type]
+coreTypeArgs = traverse (\case Core.Type ty -> Just ty; _ -> Nothing)
+
 -- | Filter only the exact root owner at a checked specialization.
 tcLookupSourceTableIdAt :: Maybe Name -> Id -> TcM (Maybe Id)
 tcLookupSourceTableIdAt first actual = do
@@ -453,7 +461,7 @@ See NativeOpenMap for the changed-clause and matching-rule tests.
 
 An imported value can have a generated source family in its type. A caller
 can reduce this family without spelling a source function or enabling
-ExperimentalDependentTypes. Check the family owner and its callees when
+-XDependentTypes. Check the family owner and its callees when
 the solver uses a family reduction. Check only the active family head.
 A type in an unused argument does not establish a use of that argument's
 axiom. Cache and plugin reductions need the same check.
@@ -1574,7 +1582,7 @@ dictionarySlotsMulti cls pred_args expr
   , con == tyConSingleDataCon (classTyCon cls)
   , let (ty_args, fields) = splitAt (length pred_args) args
         selectors = classAllSelIds cls
-  , Just applied <- traverse (\case Core.Type ty -> Just ty; _ -> Nothing) ty_args
+  , Just applied <- coreTypeArgs ty_args
   , eqTypes applied pred_args
   , lengthIs fields (length selectors)
   = Just (zip selectors fields)
@@ -1746,7 +1754,7 @@ checkedMapWorkers supply env binds
     checkMapSlot cls pred_args binders (selector, field) slot_supply = do
       guard (sourceMapSelector selector)
       (Core.Var worker, args) <- pure (Core.collectArgs (stripTicksTopE isSourceBreakpoint field))
-      types <- traverse (\case Core.Type ty -> Just ty; _ -> Nothing) args
+      types <- coreTypeArgs args
       guard (eqTypes types (mkTyVarTys binders))
       (owner, rhs) <- lookupNameEnv owners (idName worker)
       guard (not (idName owner `elemNameSet` exported) &&
@@ -3529,7 +3537,7 @@ publishSourceCharacter owner result rows fallback = do
   let loc = nameSrcSpan (idName owner)
       literal (input, value) _ =
         mkCoAxBranch [] [] [] [mkCharLitTy input] value [] loc
-  var <- flip mkTyVar charTy <$> newSysName (mkTyVarOcc "c")
+  var <- freshSysTyVar "c" charTy
   let ty = mkTyVarTy var
       default_branch _ = mkCoAxBranch [var] [] [] [ty] (fallback ty) [Nominal] loc
   table <- makeFamily (idName owner) CLeft (ClosedInput charTy []) [] (mkTyConTy result)
@@ -4532,8 +4540,8 @@ publishIndexedProjection owner projection@(IndexedProjection telescope (left, ri
     families <- tcGetFamInstEnvs
     case projectionResultCoercion families right_kind result_kind of
       Just cast | typeKind constructor `eqType` left_kind -> do
-        carried <- fresh "carried" right_kind
-        operands <- mapM (fresh "arg" . instantiate) [left, right]
+        carried <- freshSysTyVar "carried" right_kind
+        operands <- mapM (freshSysTyVar "arg" . instantiate) [left, right]
         let vars = branch_params ++ [carried]
             right_pat = mkTyVarTy carried
             branch _ = mkCoAxBranch vars [] [] (hidden ++ [constructor, right_pat])
@@ -4545,7 +4553,6 @@ publishIndexedProjection owner projection@(IndexedProjection telescope (left, ri
       _ -> pure Nothing
   where
     term = idName owner
-    fresh occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
 
 -- | Prove the result kind nominally, with at most one family step per index.
 projectionResultCoercion :: FamInstEnvs -> Kind -> Kind -> Maybe Coercion
@@ -4618,7 +4625,7 @@ checkIndexedRecursion owner parameters slot core_types carried alts (IndexedRecu
     let (types, terms) = splitAt (length parameters) arguments
         expected = [mkTyVarTy (if v == slot then predecessor else core_v)
                    | (v, core_v) <- zip parameters core_types]
-    actual <- traverse (\case Core.Type ty -> Just ty; _ -> Nothing) types
+    actual <- coreTypeArgs types
     [Core.Var tail_arg, Core.Var carried_arg] <- pure terms
     guard (self == owner && eqTypes actual expected && tail_arg == tl && carried_arg == carried)
 
@@ -4660,7 +4667,7 @@ publishIndexedRecursion :: FamInstEnvs -> IndexedProjection -> [TyVar]
 publishIndexedRecursion families projection@(IndexedProjection telescope (left, right) result _ slot _ _)
                         parameters instantiate carried
                         row@(IndexedRecursion con predecessor index args head_kind) = do
-    p <- fresh "predecessor" (instantiate (varType slot))
+    p <- freshSysTyVar "predecessor" (instantiate (varType slot))
     let p_ty = mkTyVarTy p
         specialized = instantiate . substTyWith [predecessor] [p_ty]
         selected_index = specialized index
@@ -4669,8 +4676,8 @@ publishIndexedRecursion families projection@(IndexedProjection telescope (left, 
         hidden = map branch_arg (binderVars telescope)
         specialize = substTyWith (binderVars telescope) hidden
         tail_kind = specialize (substTyWith [slot] [p_ty] left)
-    hd <- fresh "head" (specialize (specialized head_kind))
-    tl <- fresh "tail" tail_kind
+    hd <- freshSysTyVar "head" (specialize (specialized head_kind))
+    tl <- freshSysTyVar "tail" tail_kind
     pure $ do
       (recur_args, result_args, rebuilt_kind) <- indexedRecursionResult projection row hidden p_ty
       cast <- projectionResultCoercion families rebuilt_kind (specialize result)
@@ -4686,8 +4693,6 @@ publishIndexedRecursion families projection@(IndexedProjection telescope (left, 
             rhs = mkTyConApp constructor (result_args ++ [h, call])
         in mkCoAxBranch vars [] [] (hidden ++ [pat, ys]) (mkCastTy rhs cast)
                         (map (const Nominal) vars) (nameSrcSpan (tyConName family))
-  where
-    fresh occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
 
 -- | Read the exact private family and the constructor heads it checks.
 indexedProjectionSource :: Id -> Maybe (TyCon, [DataCon])
@@ -5252,7 +5257,7 @@ directGuardedList prepare owner original = do
     let recurse value = do
           (Core.Var f, args) <- pure (Core.collectArgs value)
           let (kind_args', value_args) = splitAt (length types) args
-          kinds <- traverse (\case Core.Type ty -> Just ty; _ -> Nothing) kind_args'
+          kinds <- coreTypeArgs kind_args'
           [Core.Var callback, Core.Var tail_arg] <- pure value_args
           guard (f == owner && eqTypes kinds kind_args && callback == p && tail_arg == xs)
         branch (Core.Var v)
@@ -5471,7 +5476,7 @@ guardedListProjections list = do
     second <- projection "snd" right
     pure ((,) <$> first <*> second)
   where
-    fresh_field = mkTyVarTy . flip mkTyVar list <$> newSysName (mkTyVarOcc "field")
+    fresh_field = mkTyVarTy <$> freshSysTyVar "field" list
 
 -- | Publish two families for the two tests in a guarded cons equation.
 publishGuardedList :: Id -> ConstructorCaseType -> GuardedListBranches -> TcM (Maybe (TyCon, TyCon))
@@ -5498,11 +5503,11 @@ publishGuardedListWith owner
         list = instantiate list_domain
         result_kind = instantiate result
         loc = nameSrcSpan term
-    operands <- mapM (fresh "arg") [pred_kind, instantiate list_domain]
-    guard_operands <- mapM (fresh "arg") [boolTy, pred_kind, el, list]
-    p <- fresh "predicate" pred_kind
-    x <- fresh "head" el
-    xs <- fresh "tail" list
+    operands <- mapM (freshSysTyVar "arg") [pred_kind, instantiate list_domain]
+    guard_operands <- mapM (freshSysTyVar "arg") [boolTy, pred_kind, el, list]
+    p <- freshSysTyVar "predicate" pred_kind
+    x <- freshSysTyVar "head" el
+    xs <- freshSysTyVar "tail" list
     root_name <- newImplicitBinder term mkSourceTableOcc
     root_axiom <- newImplicitBinder root_name mkInstTyCoOcc
     guard_name <- newImplicitBinder term filterGuardOcc
@@ -5540,7 +5545,6 @@ publishGuardedListWith owner
     pure (spine, select)
   where
     term = idName owner
-    fresh occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
 publishGuardedListWith _ _ _ = panic "publishGuardedListWith: invalid checked signature"
 
 -- | Interpret a checked result using the head and tail of the matched cons.
@@ -5990,9 +5994,9 @@ publishBooleanSelector :: Id -> Type -> TcM TyCon
 publishBooleanSelector owner result = do
     let term = idName owner
         loc = nameSrcSpan term
-    binders <- traverse (uncurry fresh) [("test", boolTy), ("no", result), ("yes", result)]
-    no <- fresh "no" result
-    yes <- fresh "yes" result
+    binders <- traverse (uncurry freshSysTyVar) [("test", boolTy), ("no", result), ("yes", result)]
+    no <- freshSysTyVar "no" result
+    yes <- freshSysTyVar "yes" result
     name <- newImplicitBinder term filterGuardOcc
     axiom <- newImplicitBinder name mkInstTyCoOcc
     let choose con selected _ =
@@ -6000,8 +6004,6 @@ publishBooleanSelector owner result = do
                         (mkTyVarTy selected) [Nominal, Nominal] loc
     pure (buildSourceFamily name axiom (mkAnonTyConBinders binders) result
                             [choose falseDataCon no, choose trueDataCon yes])
-  where
-    fresh occ ty = flip mkTyVar ty <$> newSysName (mkTyVarOcc occ)
 
 selectConstructorRows :: TyCon -> [ConstructorCaseRow] -> [ConstructorCaseRow]
 selectConstructorRows select = map select_row
@@ -6275,7 +6277,7 @@ checkedConstructorCaseWith mode specialized visible helper owner rhs = do
       guard (callee == owner)
       let (kind_args, operands) = splitAt (length telescope) arguments
           expected = [mkTyVarTy v | Bndr v _ <- telescope]
-      types <- traverse (\case Core.Type ty -> Just ty; _ -> Nothing) kind_args
+      types <- coreTypeArgs kind_args
       guard (eqTypes types expected)
       fields <- traverse (\case Core.Var v -> Just (resolveCaseAlias aliases v); _ -> Nothing) operands
       guard (equalLength terms fields)
@@ -6545,7 +6547,7 @@ publishConstructorRows owner telescope domains result rows = do
     (renaming, quantifiers) <- freshenTyVarBndrs (binderVars telescope)
     let kind_binders = zipWith mkNamedTyConBinder (map binderFlag telescope) quantifiers
         instantiate = substTyUnchecked renaming . expandTypeSynonyms
-    operands <- mapM (fresh "arg" . instantiate) domains
+    operands <- mapM (freshSysTyVar "arg" . instantiate) domains
     branches <- forM rows $ \(ConstructorCaseRow patterns result_value) -> do
       (lhs, scoped) <- publishPatterns instantiate [] patterns
       let fields = reverse scoped
@@ -6557,8 +6559,6 @@ publishConstructorRows owner telescope domains result rows = do
     makeSourceFamily (idName owner) (kind_binders ++ mkAnonTyConBinders operands)
                      (instantiate result) branches
   where
-    fresh occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
-
     -- See Note [Retained field kinds in source equations].
     publishPatterns _ scoped [] = pure ([], scoped)
     publishPatterns instantiate scoped (pattern : patterns) = do
@@ -6574,7 +6574,7 @@ publishConstructorRows owner telescope domains result rows = do
             | Just abstracted <- abstractNativeIndices indices kind
             , not (anyFreeVarsOfType isId abstracted) = abstracted
             | otherwise = panic "publishConstructorCase: unchecked field kind"
-      field <- fresh "field" checked_kind
+      field <- freshSysTyVar "field" checked_kind
       pure (mkTyVarTy field, (ident, field) : scoped)
     publishPattern instantiate scoped (CaseConstructor dc parameters children) = do
       (fields, scoped') <- publishPatterns instantiate scoped children
@@ -6712,7 +6712,7 @@ checkedPairBuilder owner rhs = do
         | (Core.Var worker, args) <- Core.collectArgs expr
         , Just dc <- isDataConWorkId_maybe worker
         , let (ty_args, val_args) = splitAt (length (dataConUnivTyVars dc)) args
-        , Just inst_tys <- traverse (\case Core.Type t -> Just t; _ -> Nothing) ty_args
+        , Just inst_tys <- coreTypeArgs ty_args
         , isJust (openDataConFieldTypes dc inst_tys)
         = all purePairField val_args
         | otherwise = False
@@ -6724,7 +6724,7 @@ checkedPairBuilder owner rhs = do
     let parameters = zipWith (\v (Bndr _ vis) -> Bndr v (NamedTCB vis)) types signature
         name = idName owner
         copiedPair known side opaque_kind occ = do
-          args <- forM domains $ \ty -> flip mkTyVar ty <$> newSysName (mkTyVarOcc "arg")
+          args <- forM domains (freshSysTyVar "arg")
           let binders = parameters ++ mkAnonTyConBinders args
               vars = types ++ args
               lhs = mkTyVarTys vars
@@ -6742,7 +6742,7 @@ checkedPairBuilder owner rhs = do
       (Just v, Nothing) | not (complete_poly_pair y) -> copiedPair v CLeft right mkSourceSndOcc
       (Nothing, Just v) | not (complete_poly_pair x) -> copiedPair v CRight left mkSourceFstOcc
       _ | Just _ <- pairObservationType (varType owner) -> do
-            key <- flip mkTyVar typeSymbolKind <$> newSysName (mkTyVarOcc "observation")
+            key <- freshSysTyVar "observation" typeSymbolKind
             let binders = mkAnonTyConBinders [key]
             first <- emptyPairField name (mkObservedFieldOcc CRight) binders left
             second <- emptyPairField name (mkObservedFieldOcc CLeft) binders right
@@ -6954,9 +6954,9 @@ publishPairCase owner (PairCase telescope first second selected) = do
         pair_kind a b = mkTyConApp (tupleTyCon Boxed 2) [a, b]
         promoted_pair ka kb a b =
           mkTyConApp (promotedTupleDataCon Boxed 2) [ka, kb, a, b]
-    pair <- fresh_var "p" (pair_kind first_kind second_kind)
-    x <- fresh_var "a" first_kind
-    y <- fresh_var "b" second_kind
+    pair <- freshSysTyVar "p" (pair_kind first_kind second_kind)
+    x <- freshSysTyVar "a" first_kind
+    y <- freshSysTyVar "b" second_kind
     let binders = kind_binders ++ mkAnonTyConBinders [pair]
         field FirstField  = (first_kind, mkTyVarTy x)
         field SecondField = (second_kind, mkTyVarTy y)
@@ -6971,8 +6971,6 @@ publishPairCase owner (PairCase telescope first second selected) = do
         branch _ = mkCoAxBranch clause_binders [] [] args rhs
                        (map (const Nominal) clause_binders) (nameSrcSpan (idName owner))
     makeSourceFamily (idName owner) binders result [branch]
-  where
-    fresh_var occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
 
 {- Note [Checked pair cases]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -6982,7 +6980,7 @@ The family and its axiom belong to that module. A dependent client can
 keep a call on an unknown pair in its interface. A later client can
 reduce the application when the pair constructor becomes known. Ordinary
 term uses keep the original Id. The dependent client's renamer selects
-the family only when ExperimentalDependentTypes is enabled there.
+the family only when -XDependentTypes is enabled there.
 The two bound field types become kind parameters in that equation.
 A homogeneous term type shares one kind parameter but still introduces
 two independent fields. The actual case determines which fields go into the equation. Returning the exact alternative binder requires no
@@ -8048,12 +8046,10 @@ makeFamily fun order input carried_types result branches = do
         visible_tys = case input of
           ProducerInput{} -> map instantiate carried_types
           _ -> sourceOperandOrder order (domain : map instantiate carried_types)
-    args <- zipWithM argVar ("x" : "y" : map (("arg" ++) . show) [3 :: Int ..]) visible_tys
+    args <- zipWithM freshSysTyVar ("x" : "y" : map (("arg" ++) . show) [3 :: Int ..]) visible_tys
     let binders = mkNamedTyConBinders (Invisible SpecifiedSpec) quantified ++
                   mkAnonTyConBinders args
     makeSourceFamily fun binders (instantiate result) branches
-  where
-    argVar occ ty = do { n <- newSysName (mkTyVarOcc occ); pure (mkTyVar n ty) }
 
 -- | Build a nominal closed family from an explicit telescope and result kind.
 makeSourceFamily :: Name -> [TyConBinder] -> Kind -> [TyCon -> CoAxBranch] -> TcM TyCon
