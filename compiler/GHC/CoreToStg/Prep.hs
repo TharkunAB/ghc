@@ -989,7 +989,7 @@ cpeBodyF env (Case scrut bndr ty alts)
   | cp_allowNativeDependent (cpe_config env)
   , any (\alt -> isNativeIndexAlt alt || isNativeIndexAliasAlt alt) alts
   , Just {} <- exprToNativeCaseIndex scrut
-  , Just prepare <- prepareNativeCaseScrutinee ty scrut
+  , Just prepare <- prepareNativeCaseScrutinee (cp_platform (cpe_config env)) ty scrut
   = do { (scrut', co, wrap) <- prepare
        ; alts' <- mapM (transportNativeCaseAlt bndr co) alts
        ; cpeBodyF env (wrap (Case scrut' bndr ty alts')) }
@@ -1235,7 +1235,7 @@ nameNativeConstructorArgs platform expr
            ; let prepared_arg
                    | isReflCo domain_co = arg
                    | otherwise = Cast arg (SubCo (mkSymCo domain_co))
-           ; (atom, naming_co, wrap_arg) <- nameNativeIndexArg (exprType expr) prepared_arg
+           ; (atom, naming_co, wrap_arg) <- nameNativeIndexArg platform (exprType expr) prepared_arg
            ; marker <- mkSysLocalM (fsLit "retained_template") ManyTy (varType index)
            ; let marker_co = mkTransCo naming_co
                     (mkGReflRightCo Nominal (coercionRKind naming_co) domain_co)
@@ -1274,13 +1274,13 @@ nameNativeConstructorArgs platform expr
 
 -- | Name a scalar index and prove its prepared-to-original equality.
 -- The wrapper evaluates constructor WHNFs, but does not evaluate their fields.
-nameNativeIndexArg :: Type -> CoreExpr
+nameNativeIndexArg :: Platform -> Type -> CoreExpr
                    -> UniqSM (CoreExpr, CoercionN, CoreExpr -> CoreExpr)
-nameNativeIndexArg result_ty arg
+nameNativeIndexArg platform result_ty arg
   | Just (normal, index) <- normaliseNativeIndexExpr arg
   = case normal of
       Cast inner (SubCo delta)
-        -> do { (atom, proof, wrap) <- nameNativeIndexArg result_ty inner
+        -> do { (atom, proof, wrap) <- nameNativeIndexArg platform result_ty inner
               ; return (Cast atom (SubCo delta), castNativeIndexCo delta proof, wrap) }
       _ -> name_constructor normal index
   | otherwise = nativeIndexTransportError "an unsupported retained argument"
@@ -1293,7 +1293,7 @@ nameNativeIndexArg result_ty arg
       | Just (con, tys, build, fields) <- nativeConFields_maybe normal
       , not (null fields) || isNativeConstructedGadtIndex index
       = do { (scrut, field_co, wrap_fields) <-
-                 nameNativeConFields result_ty con tys build fields
+                 nameNativeConFields platform result_ty con tys build fields
            ; assertPpr (coercionRKind field_co `eqType` index) (ppr field_co $$ ppr arg) $
                 name_value normal scrut field_co wrap_fields }
       | (Var _, args) <- collectArgs normal, all isTypeArg args
@@ -1338,10 +1338,38 @@ nativeConFields_maybe expr
       | otherwise = Nothing
 
 -- | Name constructor fields and lift their equalities through the constructor.
-nameNativeConFields :: Type -> DataCon -> [Type] -> ([CoreArg] -> CoreExpr) -> [CoreArg]
+-- See Note [Naming fields of a dependent case scrutinee].
+nameNativeConFields :: Platform -> Type -> DataCon -> [Type] -> ([CoreArg] -> CoreExpr) -> [CoreArg]
                     -> UniqSM (CoreExpr, CoercionN, CoreExpr -> CoreExpr)
-nameNativeConFields result_ty con tys build fields
-  = do { named <- mapM (nameNativeIndexArg result_ty) fields
+nameNativeConFields platform result_ty con tys build (witness_field : payload_fields)
+  | Just (witness, payloads) <- promotedRetainedFields con
+  , payloads `equalLength` payload_fields
+  = do { (witness_atom, witness_co, wrap_witness) <-
+           nameNativeIndexArg platform result_ty witness_field
+       ; let univs = dataConUnivTyVars con
+             inst = substTyWith univs tys
+       ; marker <- mkSysLocalM (fsLit "retained_template") ManyTy (inst (varType witness))
+       ; let name_payload (payload_fn, field) = do
+               domain_co <- liftNativeIndexTransport platform
+                              "a retained constructor field"
+                              [(marker, witness_co)]
+                              (inst (payload_fn (TermVarTy marker)))
+               let prepared_field
+                     | isReflCo domain_co = field
+                     | otherwise = Cast field (SubCo (mkSymCo domain_co))
+               (atom, naming_co, wrap_field) <-
+                 nameNativeIndexArg platform result_ty prepared_field
+               let field_co = mkTransCo naming_co
+                     (mkGReflRightCo Nominal (coercionRKind naming_co) domain_co)
+               return (atom, field_co, wrap_field)
+       ; named_payloads <- mapM name_payload (zip payloads payload_fields)
+       ; let named = (witness_atom, witness_co, wrap_witness) : named_payloads
+             scrut = build [atom | (atom, _, _) <- named]
+             co = mkTyConAppCo Nominal (promoteDataCon con)
+                    (map mkNomReflCo tys ++ [field_co | (_, field_co, _) <- named])
+       ; return (scrut, co, foldr (.) id [wrap | (_, _, wrap) <- named]) }
+nameNativeConFields platform result_ty con tys build fields
+  = do { named <- mapM (nameNativeIndexArg platform result_ty) fields
        ; let scrut = build [atom | (atom, _, _) <- named]
              co = mkTyConAppCo Nominal (promoteDataCon con)
                     (map mkNomReflCo tys ++ [field_co | (_, field_co, _) <- named])
@@ -1349,20 +1377,20 @@ nameNativeConFields result_ty con tys build fields
 
 -- | Prepare a scrutinee whose branch proofs refer to its original index.
 -- See Note [Naming fields of a dependent case scrutinee].
-prepareNativeCaseScrutinee :: Type -> CoreExpr
+prepareNativeCaseScrutinee :: Platform -> Type -> CoreExpr
                            -> Maybe (UniqSM (CoreExpr, CoercionN, CoreExpr -> CoreExpr))
-prepareNativeCaseScrutinee ty (App (Var fun) arg)
+prepareNativeCaseScrutinee platform ty (App (Var fun) arg)
   | isNativeIndexFunctionId fun, not (exprIsTrivial arg)
-  = Just $ do { (atom, co, wrap) <- nameNativeIndexArg ty arg
+  = Just $ do { (atom, co, wrap) <- nameNativeIndexArg platform ty arg
               ; return (App (Var fun) atom, mkTermAppCo fun co, wrap) }
-prepareNativeCaseScrutinee ty scrut
+prepareNativeCaseScrutinee platform ty scrut
   | Just (True, prepare) <- prepare_call scrut
   = Just prepare
   | Just (con, tys, build, fields) <- nativeConFields_maybe scrut
   , any (not . exprIsTrivial) fields
   , Just index <- exprToNativeCaseIndex scrut
   , Nothing <- isNumLitTy index
-  = Just (nameNativeConFields ty con tys build fields)
+  = Just (nameNativeConFields platform ty con tys build fields)
   | otherwise = Nothing
   where
     prepare_call (App fun arg)
@@ -1371,7 +1399,7 @@ prepareNativeCaseScrutinee ty scrut
       = let name_arg = not (exprIsTrivial arg)
         in Just (names || name_arg, do
            (fun', fun_co, wrap_fun) <- prepare
-           (arg', arg_co, wrap_arg) <- if name_arg then nameNativeIndexArg ty arg
+           (arg', arg_co, wrap_arg) <- if name_arg then nameNativeIndexArg platform ty arg
                                       else pure (arg, mkNomReflCo index, id)
            pure (App fun' arg', mkAppCo fun_co arg_co, wrap_fun . wrap_arg))
     prepare_call (Cast prefix@App{} co)
@@ -1432,6 +1460,13 @@ the parent parameters, existentials, and nominal result evidence. The
 wrapper takes the constructor's user type arguments. Keep the actual
 prefix when rebuilding the expression. Use the promoted constructor's
 user type arguments when lifting the field equalities.
+
+A retained constructor binds its first field in the types of its remaining
+fields. Naming that first field changes its index from the original term to
+the prepared witness atom. Lift that witness equality through each payload
+domain, cast each payload field back to the prepared domain before naming it,
+and compose the resulting naming equality with GRefl on the right. See
+Note [Naming later retained domains].
 
 See Note [Retained constructor arguments in CorePrep].
 -}

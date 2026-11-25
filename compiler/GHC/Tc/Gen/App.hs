@@ -2158,23 +2158,25 @@ tcRetainedQuickLookArgType arg
       guard (isAlgTyConApp result && noQuickLookVars result)
       guard =<< liftMaybeT (tcRetainedInstScope [result])
       return result
-  | L _ (HsVar _ lname) <- head_expr
+  | Just name <- named_head head_expr
   , values@(_ : _) <- args
-  , let name = unLocWithUserRdr lname
-  , not (isDataOcc (nameOccName name))
   = runMaybeT $ do
       fun <- MaybeT (tcLookupIdMaybe name)
       guard (isEmptyNameEnv (idConcreteTvs fun))
       sigma <- liftMaybeT (liftZonkM (zonkTcType (varType fun)))
       let (tvs, theta, tau) = tcRetainedInstTelescope sigma
           bare = all bare_operand values
-      guard (null theta && not (null tvs))
+      guard (null theta && (not (null tvs) || takesDirectIndexArgument tau))
       guard (bare || takesDirectIndexArgument tau)
       result_shape <- MaybeT (pure (tcRetainedValueResultShape (length values) tau))
       guard (isAlgTyConApp result_shape)
       let read_operand = if bare then declared else tcRetainedQuickLookArgType
-      choices <- MaybeT (tcRetainedKnownValuePlan read_operand Nothing sigma values)
-      ty <- call_result (substTyWith tvs choices tau) values
+      inst_tau <- if null tvs
+        then pure tau
+        else do
+          choices <- MaybeT (tcRetainedKnownValuePlan read_operand Nothing sigma values)
+          pure (substTyWith tvs choices tau)
+      ty <- call_result inst_tau values
       guard (hasNativeDependentExpr (Core.Type ty) && noQuickLookVars ty)
       valid <- liftMaybeT (tcRetainedInstScope [ty])
       guard valid
@@ -2230,6 +2232,12 @@ tcRetainedQuickLookArgType arg
     split_named values (L _ (HsPar _ inner)) = split_named values inner
     split_named values (L _ (HsApp _ fun value)) = split_named (value : values) fun
     split_named values fun = (fun, values)
+
+    named_head (L _ (HsVar _ lname))
+      | let n = unLocWithUserRdr lname
+      , not (isDataOcc (nameOccName n)) = Just n
+    named_head (L _ (XExpr (HsRecSelRn field))) = Just (unLoc (foLabel field))
+    named_head _ = Nothing
 
     bare_operand operand = case unLoc (stripParensLHsExpr operand) of
       HsVar{} -> True
@@ -5733,9 +5741,10 @@ tcRetainedArgWith reify domain arg
                      case certified of
                        Just v -> do { core <- instantiate_source expected v written (arg : later)
                                     ; pure (core, fun) }
-                       _ -> setSrcSpanA (getLoc fun) $ case unLoc fun of
-                              XExpr (HsRecSelRn{}) -> unsupported
-                              _ -> failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall n))
+                       _ -> setSrcSpanA (getLoc fun) $
+                              if is_rec_sel fun
+                              then unsupported
+                              else failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall n))
                Nothing -> resolve_with_args env expected (arg : later) fun
            ; (app, arg') <- apply env core_fun arg
            ; return (app, fun', arg') }
@@ -5810,6 +5819,11 @@ tcRetainedArgWith reify domain arg
     unsupported :: TcM a
     unsupported = failWithTc (TcRnRetainedQuantificationError RetainedIndexExpression)
 
+    is_rec_sel (L _ (HsPar _ inner)) = is_rec_sel inner
+    is_rec_sel (L _ (HsAppType _ inner _)) = is_rec_sel inner
+    is_rec_sel (L _ (XExpr (HsRecSelRn{}))) = True
+    is_rec_sel _ = False
+
 -- | Split a written source head into its name and visible type arguments.
 -- See Note [Erased arguments of certified source operands].
 retainedSourceHead :: LHsExpr GhcRn -> Maybe (Name, [LHsWcType GhcRn])
@@ -5820,6 +5834,7 @@ retainedSourceHead = go []
     go written (L _ (HsVar _ name))
       | let n = unLocWithUserRdr name
       , not (isDataOcc (nameOccName n)) = Just (n, written)
+    go written (L _ (XExpr (HsRecSelRn field))) = Just (unLoc (foLabel field), written)
     go _ _ = Nothing
 
 -- | Check a written type without inferring an earlier erased argument.

@@ -86,7 +86,7 @@ import GHC.Types.Unique.Map
 import GHC.Types.Unique.Set
 import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar
                      , isInferredForAllTyFlag, isSpecifiedForAllTyFlag )
-import GHC.Types.Var.Set (elemVarSet, isEmptyVarSet, mkVarSet)
+import GHC.Types.Var.Set (TyCoVarSet, elemVarSet, isEmptyVarSet, mkVarSet, sizeVarSet, unionVarSet)
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name
@@ -97,7 +97,7 @@ import GHC.Types.SourceText (SourceText(NoSourceText))
 import GHC.Types.Literal (Literal(LitString))
 import GHC.Types.SrcLoc
 
-import GHC.Types.Var.Env (emptyVarEnv)
+import GHC.Types.Var.Env (emptyVarEnv, mkInScopeSetList)
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.KnownKeys
@@ -2919,13 +2919,20 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
        ; case (relevant_cons, zip sel_ids rbinds) of
            (RealDataCon con NE.:| [], _)
              | let tc = dataConTyCon con
-             , tyConArity tc == 0
              , [_] <- tyConDataCons tc
              , Just (witness, payload_types) <- promotedRetainedFields con
              , witness_field : payload_fields <- dataConFieldLabels con
              , Just witness_bind <- lookupNameEnv supplied (flSelector witness_field)
              -> expandRetainedWitnessUpd con witness payload_types witness_field payload_fields
-                  witness_bind supplied record_expr (map idName sel_ids)
+                  witness_bind supplied record_expr (map idName sel_ids) res_ty
+           (RealDataCon con NE.:| [], fields@(_ : _))
+             | let tc = dataConTyCon con
+             , [_] <- tyConDataCons tc
+             , Just (_witness, payload_types) <- promotedRetainedFields con
+             , witness_field : payload_fields <- dataConFieldLabels con
+             , not (flSelector witness_field `elemNameEnv` supplied)
+             -> expandParamRetainedRecordUpd con payload_types witness_field payload_fields
+                  fields supplied record_expr res_ty
            (RealDataCon con NE.:| [], fields@((first, _) : _))
              | retained_record relevant_con
              , DepFunTy DepFunVisible receiver _ <- coreFullView (idType first)
@@ -3113,15 +3120,75 @@ expandRetainedRecordUpd con receiver replacements record_expr = do
                   (genHsApps con_name args) (record_expr : values)
     pure (expanded, result_ty, RecordUpdCtxt (RealDataCon con NE.:| []) fields [])
 
+-- | Expand payload updates at the receiver's stored witness for nullary or parameterized records.
+-- See Note [Updating a retained record payload] and
+-- Note [Parameterized retained record updates].
+expandParamRetainedRecordUpd :: DataCon -> [Type -> Type] -> FieldLabel -> [FieldLabel]
+                             -> [(Id, LHsRecUpdField GhcTc GhcRn)]
+                             -> NameEnv (LHsRecUpdField GhcTc GhcRn)
+                             -> LHsExpr GhcRn -> ExpRhoType
+                             -> TcM (HsExpr GhcRn, TcType, HsCtxt)
+expandParamRetainedRecordUpd con payload_types witness_field payload_fields fields supplied record_expr res_ty = do
+    witness_sel <- tcLookupId (flSelector witness_field)
+    witness_table <- case sourceTableId_maybe witness_sel of
+      Just tbl -> pure tbl
+      Nothing  -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
+    let tc = dataConTyCon con
+        (univ_tvs, _, _, _, Scaled _ witness_orig_ty : payload_orig_tys, _) = dataConFullSig con
+        untouched_tys = witness_orig_ty :
+          [ scaledThing orig_ty
+          | (pf, orig_ty) <- zip payload_fields payload_orig_tys
+          , not (flSelector pf `elemNameEnv` supplied) ]
+        pinned_tvs = closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys)
+    (in_tvs, extra_out_tvs, out_subst, out_tys) <- instantiateRetainedRecordUnivs univ_tvs pinned_tvs
+    let in_record_ty  = mkTyConApp tc (mkTyVarTys in_tvs)
+        out_record_ty = mkTyConApp tc out_tys
+    receiver <- mkSysLocalM (fsLit "record") ManyTy in_record_ty
+    let witness_index = mkTyConApp witness_table (mkTyVarTys in_tvs ++ [TermVarTy receiver])
+        field_ty_env = mkNameEnv
+          [ (flSelector pf, substTy out_subst (builder witness_index))
+          | (pf, builder) <- zip payload_fields payload_types ]
+        resolve_field (sel, L _ field) = do
+          ty <- lookupNameEnv field_ty_env (idName sel)
+          pure (idName sel, ty, hfbRHS field)
+    replacements <- case traverse resolve_field fields of
+      Just rs -> pure rs
+      Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
+    let (upd_fields, upd_payload_tys, values) = unzip3 replacements
+    names <- mapM (newSysName . nameOccName) upd_fields
+    let updated = mkNameEnv (zip upd_fields names)
+        field_arg fld = case lookupNameEnv updated (flSelector fld) of
+          Just name -> pure (genWildPat, genLHsVar name)
+          Nothing -> do
+            name <- newSysName (nameOccName (flSelector fld))
+            pure (genVarPat name, genLHsVar name)
+    (pats, args) <- mapAndUnzipM field_arg (dataConFieldLabels con)
+    let con_name = dataConName con
+        signature = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
+                      mkDepFunTy receiver (mkVisFunTysManyU upd_payload_tys out_record_ty)
+    ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
+    expanded <- genRetainedRecordUpd signature
+                  (genSimpleConPat con_name pats : map genVarPat names)
+                  (genHsApps con_name args) (record_expr : values)
+    pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) upd_fields [])
+
 -- | Check every replacement payload at the new witness.
--- See Note [Replacing a retained record witness].
+-- See Note [Replacing a retained record witness] and
+-- Note [Parameterized retained record updates].
 expandRetainedWitnessUpd :: DataCon -> Id -> [Type -> Type] -> FieldLabel -> [FieldLabel]
                          -> LHsRecUpdField GhcTc GhcRn -> NameEnv (LHsRecUpdField GhcTc GhcRn)
-                         -> LHsExpr GhcRn -> [Name]
+                         -> LHsExpr GhcRn -> [Name] -> ExpRhoType
                          -> TcM (HsExpr GhcRn, TcType, HsCtxt)
-expandRetainedWitnessUpd con witness payload_types witness_field payload_fields witness_bind supplied record_expr updated = do
-    let fields = [(field, lookupNameEnv supplied (flSelector field)) | field <- payload_fields]
+expandRetainedWitnessUpd con witness payload_types witness_field payload_fields witness_bind supplied record_expr updated res_ty = do
+    let tc = dataConTyCon con
+        (univ_tvs, _, _, _, Scaled _ witness_orig_ty : payload_orig_tys, _) = dataConFullSig con
+        fields = [(field, lookupNameEnv supplied (flSelector field)) | field <- payload_fields]
         missing = [flLabel field | (field, Nothing) <- fields]
+        untouched_tys =
+          [witness_orig_ty | not (null missing)] ++
+          [ scaledThing orig_ty
+          | ((_, Nothing), orig_ty) <- zip fields payload_orig_tys ]
+        pinned_tvs = closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys)
         payload_value (_, Just binding) = hfbRHS (unLoc binding)
         payload_value (field, Nothing) = wrapGenSpan (genHsApps (flSelector field) [record_expr])
         payload_pat name (_, Just _) = genVarPat name
@@ -3129,7 +3196,7 @@ expandRetainedWitnessUpd con witness payload_types witness_field payload_fields 
         con_name = dataConName con
         written = hfbRHS (unLoc witness_bind)
         witness_label = flLabel witness_field
-        result_ty = mkTyConTy (dataConTyCon con)
+    (in_tvs, extra_out_tvs, out_subst, out_tys) <- instantiateRetainedRecordUnivs univ_tvs pinned_tvs
     witness_value <- if null missing then pure written else do
       reusable <- checkRetainedRecordWitness (idType witness) witness_field record_expr written
       case reusable of
@@ -3139,14 +3206,65 @@ expandRetainedWitnessUpd con witness payload_types witness_field payload_fields 
             (RetainedRecordUpdateWitness con_name witness_label missing))
     witness_name <- newSysName (nameOccName (flSelector witness_field))
     names <- mapM (newSysName . nameOccName . flSelector) payload_fields
-    let old_pat = genSimpleConPat con_name (replicate (1 + length names) genWildPat)
-        signature = mkVisFunTyManyU result_ty $
-          mkDepFunTy witness (mkVisFunTysManyU [ty (TermVarTy witness) | ty <- payload_types] result_ty)
+    let in_record_ty  = mkTyConApp tc (mkTyVarTys in_tvs)
+        out_record_ty = mkTyConApp tc out_tys
+        witness' = setIdType witness (substTy out_subst (idType witness))
+        old_pat = genSimpleConPat con_name (replicate (1 + length names) genWildPat)
+        signature = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
+          mkVisFunTyManyU in_record_ty $
+          mkDepFunTy witness'
+            (mkVisFunTysManyU [substTy out_subst (ty (TermVarTy witness')) | ty <- payload_types] out_record_ty)
         arguments = record_expr : witness_value : map payload_value fields
         patterns = old_pat : genVarPat witness_name : zipWith payload_pat names fields
+    ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
     expanded <- genRetainedRecordUpd signature patterns
                   (genHsApps con_name (map genLHsVar (witness_name : names))) arguments
-    pure (expanded, result_ty, RecordUpdCtxt (RealDataCon con NE.:| []) updated [])
+    pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) updated [])
+
+-- | Use a matching expected result type directly when available; otherwise allocate metavariables.
+retainedRecordUpdResTy :: TyCon -> [TyVar] -> ExpRhoType -> TcM TcType
+retainedRecordUpdResTy tc univ_tvs res_ty = do
+    mb_exp <- readExpType_maybe res_ty
+    case mb_exp >>= tcSplitTyConApp_maybe of
+      Just (exp_tc, exp_args) | exp_tc == tc, equalLength exp_args univ_tvs ->
+        pure (mkTyConApp tc exp_args)
+      _ -> do
+        (_, meta_out_tvs) <- newMetaTyVars univ_tvs
+        pure (mkTyConApp tc (mkTyVarTys meta_out_tvs))
+
+-- | Close a set of universal record type variables over their kinds.
+closeUnivKinds :: [TyVar] -> TyCoVarSet -> TyCoVarSet
+closeUnivKinds univ_tvs = go
+  where
+    go s =
+      let s' = s `unionVarSet` tyCoVarsOfTypes [tyVarKind tv | tv <- univ_tvs, tv `elemVarSet` s]
+      in if sizeVarSet s' == sizeVarSet s then s else go s'
+
+-- | Allocate input and output universal binders for a retained record update.
+-- Pinned type parameters share their input binder; unpinned parameters receive fresh output binders.
+-- See Note [Parameterized retained record updates].
+instantiateRetainedRecordUnivs :: [TyVar] -> TyCoVarSet -> TcM ([TyVar], [TyVar], Subst, [TcType])
+instantiateRetainedRecordUnivs univ_tvs pinned_tvs = do
+    (_, in_tvs) <- foldM alloc_in (mkEmptySubst (mkInScopeSetList univ_tvs), []) univ_tvs
+    (out_subst, out_tys, extra_out_tvs) <-
+      foldM alloc_out (mkEmptySubst (mkInScopeSetList (univ_tvs ++ in_tvs)), [], [])
+            (zip univ_tvs in_tvs)
+    pure (in_tvs, reverse extra_out_tvs, out_subst, reverse out_tys)
+  where
+    alloc_in (sub, acc) tv = do
+      nm <- newSysName (nameOccName (getName tv))
+      let tv' = mkTyVar nm (substTy sub (tyVarKind tv))
+      pure (extendTvSubst sub tv (mkTyVarTy tv'), acc ++ [tv'])
+
+    alloc_out (sub, tys, extras) (orig_tv, in_tv)
+      | orig_tv `elemVarSet` pinned_tvs =
+          let ty = mkTyVarTy in_tv
+          in pure (extendTvSubst sub orig_tv ty, ty : tys, extras)
+      | otherwise = do
+          nm <- newSysName (nameOccName (getName orig_tv))
+          let out_tv = mkTyVar nm (substTy sub (tyVarKind orig_tv))
+              ty = mkTyVarTy out_tv
+          pure (extendTvSubst sub orig_tv ty, ty : tys, out_tv : extras)
 
 -- | Check a written witness projection before reusing an omitted payload.
 -- See Note [Replacing a retained record witness].
@@ -3155,7 +3273,7 @@ checkRetainedRecordWitness :: TcType -> FieldLabel -> LHsExpr GhcRn -> LHsExpr G
 checkRetainedRecordWitness domain field record_expr written
   | HsVar{} <- unLoc (stripParensLHsExpr record_expr)
   , HsApp _ selector _ <- unLoc (stripParensLHsExpr written)
-  , XExpr (HsRecSelRn occurrence) <- unLoc (stripParensLHsExpr selector)
+  , Just occurrence <- rec_sel_head selector
   , let field_name = flSelector field
   , unLoc (foLabel occurrence) == field_name
   = tryTcDiscardingErrs (pure Nothing) $ runMaybeT $ do
@@ -3173,6 +3291,11 @@ checkRetainedRecordWitness domain field record_expr written
       guard (old_index `tcEqType` new_index || any matches givens)
       pure value
   | otherwise = pure Nothing
+  where
+    rec_sel_head e = case unLoc (stripParensLHsExpr e) of
+      XExpr (HsRecSelRn occ) -> Just occ
+      HsAppType _ inner _    -> rec_sel_head inner
+      _                      -> Nothing
 
 -- | Apply a generated updater with its checked retained signature.
 genRetainedRecordUpd :: TcType -> [LPat GhcRn] -> HsExpr GhcRn -> [LHsExpr GhcRn]
@@ -3229,6 +3352,28 @@ at its new type through ordinary argument checking. Use a lazy pattern
 for an omitted field, including under Strict. Restrict the receiver to
 a variable so the old projections share the original record. If this
 check cannot reuse the old fields, report them at the written witness.
+-}
+
+{- Note [Parameterized retained record updates]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A single-constructor retained record can have universal type parameters:
+
+  data Columns a = Columns { storedLength :: Nat, cells :: Vec a storedLength }
+
+Quantify the generated local updater over fresh input binders for all
+universal parameters. If a universal parameter occurs in an omitted
+field (including the witness field when the update omits the witness),
+pin its output type to the input binder. Give every remaining universal
+parameter a fresh output binder so the update can change that parameter
+consistently across all updated fields:
+
+  update :: forall a b. foreach (r :: Columns a)
+         -> Vec b (storedLength r) -> Columns b
+  update (Columns n _) xs = Columns n xs
+
+Instantiate the expected result type with fresh metavariables, as in
+Note [Unifying result types in tcRecordUpd], so the call site unifies
+both the receiver parameters and the updated result parameters.
 -}
 
 

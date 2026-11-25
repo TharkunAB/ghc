@@ -1054,3 +1054,8 @@ test('NativeMutualLargeElimData',
       extra_files(['NativeMutualLargeElimDataProvider.hs',
                    'NativeMutualLargeElimData.hs'])],
      run_command, ['bash NativeMutualLargeElimData.sh "{compiler}" "{libdir}"'])
+test('NativeParamDependentRecordUpdate',
+     [req_host_target_ghc, req_interp, only_ways(['normal']),
+      extra_files(['NativeParamDependentRecordUpdateProvider.hs',
+                   'NativeParamDependentRecordUpdate.hs'])],
+     run_command, ['bash NativeParamDependentRecordUpdate.sh "{compiler}" "{libdir}"'])
