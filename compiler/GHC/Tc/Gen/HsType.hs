@@ -162,7 +162,7 @@ import GHC.Types.Id.Info ( IdDetails(SourceTableId) )
 import GHC.Types.InlinePragma ( InlineSpec(NoInline), neverInlinePragma, setInlinePragmaSpec )
 import GHC.Types.Name.Env
 import GHC.Types.Name.Reader
-import GHC.Types.Name.Set (NameSet, mkNameSet, unionNameSet, emptyNameSet, elemNameSet, extendNameSet)
+import GHC.Types.Name.Set (NameSet, mkNameSet, unionNameSet, emptyNameSet, isEmptyNameSet, elemNameSet, extendNameSet)
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Name
@@ -577,6 +577,63 @@ tc_lhs_sig_type retained_sig skol_info full_hs_ty@(L loc (HsSig { sig_bndrs = hs
       = do { (tidy_env2, exp_kind) <- zonkTidyTcType tidy_env exp_kind
            ; return (tidy_env2, UninfTyCtx_Sig exp_kind full_hs_ty) }
 
+{- Note [Skipping no-op within-TC zonks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'zonkTcType' maps over the entire type and rebuilds every non-nullary
+application in 'ZonkM', even when the type contains no mutable 'MetaTv's,
+no coercions or coercion holes, and no 'MonoTcTyCon's. During dependent
+typechecking, ambient runtime index types and closed kinds are inspected
+repeatedly. 'canZonkChangeType' performs an allocation-free pure scan and
+skips 'liftZonkM' when zonking is an exact identity.
+-}
+
+-- | Test whether 'zonkTcType' can change any node or metadata of a 'TcType'.
+-- See Note [Skipping no-op within-TC zonks].
+canZonkChangeType :: TcType -> Bool
+canZonkChangeType = go
+  where
+    go (TyVarTy tv)           = (isTcTyVar tv && isMetaTyVar tv) || go (tyVarKind tv)
+    go (TermVarTy v)          = go_id v
+    go (TermAppTy f a)        = go_id f || go a
+    go (AppTy f a)            = go f || go a
+    go (TyConApp tc args)     = isMonoTcTyCon tc || any go args
+    go (ForAllTy ma (Bndr b _) r) = go ma || go (varType b) || go r
+    go (FunTy _ ma mult a r)  = go ma || go mult || go a || go r
+    go (LitTy _)              = False
+    go (CastTy _ _)           = True
+    go (CoercionTy _)         = True
+    go (DepFunTy _ b r)       = go_id b || go r
+    go (ExistsTy _ b r)       = go (tyVarKind b) || go r
+    go (DepDictTy b r)        = go_id b || go r
+    go (ClassAppTy s a d x k) = go_id s || go a || go d || go x || go k
+
+    go_id v = go (varType v) || go (idMult v)
+
+-- | Zonk a 'TcType' only when it contains mutable metavariables, coercions,
+-- or a 'MonoTcTyCon'. See Note [Skipping no-op within-TC zonks].
+zonkTcTypeIfNeeded :: TcType -> TcM TcType
+zonkTcTypeIfNeeded ty
+  | canZonkChangeType ty = liftZonkM (zonkTcType ty)
+  | otherwise            = pure ty
+
+-- | Zonk an 'Id''s type and multiplicity only when 'canZonkChangeType' holds.
+-- See Note [Skipping no-op within-TC zonks].
+zonkIdIfNeeded :: TcId -> TcM TcId
+zonkIdIfNeeded v
+  | canZonkChangeType (varType v) || canZonkChangeType (idMult v) = liftZonkM (zonkId v)
+  | otherwise = pure v
+
+-- | Test whether a generic AST field is an ExactPrint or core leaf that
+-- cannot contain renamed surface types or identifiers.
+isAstLeafAnnotation :: Data a => a -> Bool
+isAstLeafAnnotation thing
+  | Just (_ :: SrcSpanAnnA) <- cast thing = True
+  | Just (_ :: SrcSpanAnnN) <- cast thing = True
+  | Just (_ :: SrcSpan)     <- cast thing = True
+  | Just (_ :: Name)        <- cast thing = True
+  | Just (_ :: Type)        <- cast thing = True
+  | otherwise                             = False
+
 -- | Resolve free runtime Names to their existing lexical index Ids.
 -- See Note [Local runtime indices in signatures] and
 -- Note [Runtime indices in visible type arguments] in GHC.Rename.HsType.
@@ -584,15 +641,22 @@ tcRetainedAmbientIndices :: RetainedQuantificationError -> LHsType GhcRn -> TcM 
 tcRetainedAmbientIndices invalid_reason hs_ty
   = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
        ; if experimental
-         then mkNameEnv . catMaybes <$> mapM check_index (ambient_names hs_ty)
+         then case dedup_ambient emptyNameSet (ambient_names hs_ty) of
+                []         -> return emptyNameEnv
+                candidates -> mkNameEnv . catMaybes <$> mapM check_index candidates
          else return emptyNameEnv }
   where
+    dedup_ambient _ [] = []
+    dedup_ambient seen (item@(_, name) : rest)
+      | name `elemNameSet` seen = dedup_ambient seen rest
+      | otherwise               = item : dedup_ambient (extendNameSet seen name) rest
+
     check_index (span, name) = setSrcSpan span $
       do { thing <- tcLookupLcl_maybe name
          ; case thing of
              Just ATyVar{} -> return Nothing
              Just (ATcId { tct_id = index }) ->
-               do { index <- liftZonkM (zonkId index)
+               do { index <- zonkIdIfNeeded index
                   ; mb_rep <- tcTypeRepTarget_maybe (varType index)
                   ; if isJust mb_rep
                     then return Nothing
@@ -614,22 +678,23 @@ tcRetainedAmbientIndices invalid_reason hs_ty
     -- Imported source calls are handled by tc_app_ty.
     ambient_names :: Data a => a -> [(SrcSpan, Name)]
     ambient_names thing
+      | isAstLeafAnnotation thing = []
       | Just (L loc (HsTyVar _ _ (L _ (WithUserRdr _ name))))
           <- (cast thing :: Maybe (LHsType GhcRn))
       , isVarName name || isTyVarName name
       , not (isExternalName name) = [(locA loc, name)]
       | Just (L _ (HsForEachTy _ bndrs _)) <- (cast thing :: Maybe (LHsType GhcRn))
-      = let bound = mapMaybe hsLTyVarName bndrs
-        in filter (\(_, name) -> name `notElem` bound) (concat (gmapQ ambient_names thing))
+      = drop_bound (mkNameSet (mapMaybe hsLTyVarName bndrs)) thing
       | Just (L _ (XHsType (HsTypeExistsRn _ bndr _))) <- (cast thing :: Maybe (LHsType GhcRn))
-      = let bound = maybeToList (hsLTyVarName bndr)
-        in filter (\(_, name) -> name `notElem` bound) (concat (gmapQ ambient_names thing))
+      = drop_bound (mkNameSet (maybeToList (hsLTyVarName bndr))) thing
       | Just (L _ (XHsType (HsTypeLambdaQuoteRn bndrs _))) <- (cast thing :: Maybe (LHsType GhcRn))
-      = let bound = map unLoc bndrs
-        in filter (\(_, name) -> name `notElem` bound) (concat (gmapQ ambient_names thing))
-      | Just _ <- (cast thing :: Maybe Name) = []
-      | Just _ <- (cast thing :: Maybe Type) = []
+      = drop_bound (mkNameSet (map unLoc bndrs)) thing
       | otherwise = concat (gmapQ ambient_names thing)
+
+    drop_bound bound node
+      | isEmptyNameSet bound = concat (gmapQ ambient_names node)
+      | otherwise = filter (\(_, name) -> not (name `elemNameSet` bound))
+                           (concat (gmapQ ambient_names node))
 
 -- | Check an expression annotation with the runtime indices already in scope.
 -- See Note [Runtime indices in expression signatures].
@@ -755,11 +820,10 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty })
 
     source_family_names :: Data a => a -> [Name]
     source_family_names thing
+      | isAstLeafAnnotation thing = []
       | Just (L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))))
           <- (cast thing :: Maybe (LHsType GhcRn))
       , isSourceFamilyName name = [name]
-      | Just _ <- (cast thing :: Maybe Name) = []
-      | Just _ <- (cast thing :: Maybe Type) = []
       | otherwise = concat (gmapQ source_family_names thing)
 
     build_pending_family :: Name -> Type -> TcM (Maybe TyCon)
@@ -887,7 +951,7 @@ tcCheckRetainedType allow_function witness_skol = go
                       if mode_complete_type_arg mode == Just False
                       then RetainedPartialTypeArgument
                       else RetainedFunctionSignature
-                mk_type_witness bndr_mult skol chosen_name mb_name body_ty =
+                mk_type_witness bndr_mult skol chosen_name body_ty =
                   do { tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName chosen_name)))
                      ; tv <- newSkolemTyVar skol tv_name liftedTypeKind
                      ; selector <- tcLookupKnownOccId typeRepIdOcc
@@ -897,7 +961,6 @@ tcCheckRetainedType allow_function witness_skol = go
                      ; let fun_ty | visible = tcMkVisFunTy unmatchableDataConTy bndr_mult rep_ty body_ty'
                                   | otherwise = mkDepFunTyWithVis DepFunInvisible
                                                   (mark_id (mkLocalId chosen_name bndr_mult rep_ty)) body_ty'
-                     ; _ <- pure mb_name
                      ; return (mkInfForAllTy unmatchableDataConTy tv fun_ty) }
             in case (tvb_var bndr, raw_kind) of
               (HsBndrVar _ (L _ name), HsBndrKind _ domain) ->
@@ -906,7 +969,7 @@ tcCheckRetainedType allow_function witness_skol = go
                    ; case witness_skol of
                        Just skol | isLiftedTypeKind domain_ty ->
                          -- See Note [Explicit retained Type witnesses].
-                         mk_type_witness bndr_mult skol name (Just name) $ \tv ->
+                         mk_type_witness bndr_mult skol name $ \tv ->
                            tcExtendNameTyVarEnv [(name, tv)] (check_bndrs mode rest)
                        _ ->
                          do { check_not_fun domain_ty
@@ -917,11 +980,11 @@ tcCheckRetainedType allow_function witness_skol = go
               (HsBndrWildCard _, HsBndrKind _ domain)
                 | visible ->
                     do { bndr_mult <- tc_bndr_mult
-                       ; domain_ty <- tc_check_lhs_type mode domain liftedTypeKind >>= liftZonkM . zonkTcType
+                       ; domain_ty <- tc_check_lhs_type mode domain liftedTypeKind >>= zonkTcTypeIfNeeded
                        ; case witness_skol of
                            Just skol | isLiftedTypeKind domain_ty ->
                              do { chosen <- newSysName (mkVarOcc "_")
-                                ; mk_type_witness bndr_mult skol chosen Nothing $ \_ -> check_bndrs mode rest }
+                                ; mk_type_witness bndr_mult skol chosen $ \_ -> check_bndrs mode rest }
                            _ ->
                              do { body_ty <- check_bndrs mode rest
                                 ; return (tcMkVisFunTy unmatchableDataConTy bndr_mult domain_ty body_ty) } }
@@ -931,7 +994,7 @@ tcCheckRetainedType allow_function witness_skol = go
                        ; chosen <- newSysName (mkVarOcc "_")
                        ; case witness_skol of
                            Just skol | isLiftedTypeKind domain_ty ->
-                             mk_type_witness bndr_mult skol chosen Nothing $ \_ -> check_bndrs mode rest
+                             mk_type_witness bndr_mult skol chosen $ \_ -> check_bndrs mode rest
                            _ ->
                              do { check_not_fun domain_ty
                                 ; body_ty <- check_bndrs mode rest
@@ -957,7 +1020,7 @@ tcCheckRetainedType allow_function witness_skol = go
                    ; bndr_mult' <- liftZonkM (zonkTcType bndr_mult)
                    ; case witness_skol of
                        Just skol | isLiftedTypeKind domain_ty ->
-                         mk_type_witness bndr_mult' skol name (Just name) $ \tv ->
+                         mk_type_witness bndr_mult' skol name $ \tv ->
                            pure (replaceTermVarInType temp_index (mkTyVarTy tv) body_ty0)
                        _ ->
                          do { check_not_fun domain_ty
@@ -969,7 +1032,7 @@ tcCheckRetainedType allow_function witness_skol = go
                    ; case witness_skol of
                        Just skol ->
                          do { chosen <- newSysName (mkVarOcc "_")
-                            ; mk_type_witness bndr_mult skol chosen Nothing $ \_ -> check_bndrs mode rest }
+                            ; mk_type_witness bndr_mult skol chosen $ \_ -> check_bndrs mode rest }
                        Nothing ->
                          failWithTc $ TcRnRetainedQuantificationError (RetainedUnsupportedDomain liftedTypeKind) }
 
@@ -1556,8 +1619,7 @@ splitStandaloneFamilyConstrainedKind decl raw_kind
       mkInfForAllTys [(unmatchableDataConTy, h) | h <- hidden_tvs]
                      (tcMkDFunPhiTy theta res_kind)
 
-    mk_canonical (i, (ma, Named b)) rest =
-      let _ = i in ForAllTy ma b rest
+    mk_canonical (_, (ma, Named b)) rest = ForAllTy ma b rest
     mk_canonical (i, (ma, Anon (Scaled _ arg_k) _)) rest =
       let anon_tv = mkTyVar (mkSysTvName (mkAlphaTyVarUnique (i + 1)) (fsLit "_anon")) arg_k
       in ForAllTy ma (Bndr anon_tv Required) rest
@@ -3669,12 +3731,29 @@ tc_app_ty_runtime_head mode rn_ty exp_kind head_id
 tc_app_ty_external :: TcTyMode -> HsType GhcRn -> ExpKind -> TcM TcType
 tc_app_ty_external mode rn_ty exp_kind
   | L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr rdr name))) <- hs_fun_ty
-  , isVarName name
-  , isExternalName name
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
-       ; if enabled then setSrcSpanA loc (source_call rdr name)
-                    else tc_app_ty_generic mode rn_ty exp_kind }
+  = if isVarName name && isExternalName name
+      then do
+        enabled <- xoptM LangExt.ExperimentalDependentTypes
+        if enabled
+          then setSrcSpanA loc (source_call rdr name)
+          else tc_app_ty_generic mode rn_ty exp_kind
+      else if isSourceFamilyName name
+      then source_family_call loc rdr name
+      else tc_app_ty_generic mode rn_ty exp_kind
+  | otherwise = tc_app_ty_generic mode rn_ty exp_kind
   where
+    (hs_fun_ty, hs_args) = splitHsAppTys rn_ty
+    value_args = traverse value_arg (filterOut is_par hs_args)
+    is_par HsArgPar{} = True
+    is_par _          = False
+    value_arg (HsValArg _ arg) = Just arg
+    value_arg _                = Nothing
+    ordinary_call = isNothing (mode_holes mode) || isJust (mode_complete_type_arg mode)
+    ready_partial_call
+      | Just (_, RetrySigCalls, _) <- mode_pending_calls mode = True
+      | otherwise = False
+    unsupported = failWithTc . TcRnNoSourceTable
+
     -- See Note [Captured term names in ordinary types].
     source_call rdr name =
       do { env <- getGblEnv
@@ -3688,60 +3767,120 @@ tc_app_ty_external mode rn_ty exp_kind
                , isRecordSelector fun
                , Just table <- sourceTableId_maybe fun
                , lengthIs args 1 || equalLength args (tyConVisibleTyVars table)
-               -> do { sourceTableReferenceUse table
-                     ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
+               -> use_source_table table
              (_, Just (fun, _), Just args)
                | isTypeLevel (mode_tyki mode), ordinary_call
                , Just table <- sourceTableOccurrence env fun >>= sourceTableId_maybe
                , lengthIs args 1 || equalLength args (tyConVisibleTyVars table)
-               -> do { sourceTableReferenceUse table
-                     ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
-             (_, Just (fun, _), Just args)
+               -> use_source_table table
                | isTypeLevel (mode_tyki mode), ordinary_call
                , Just (instantiated, domains, result_kind) <- instantiateOpenTypeFunction True fun
                , equalLength domains args, all is_local_open_operand args
-               -> do { result <- tcOpenTypeCall mode name instantiated result_kind (zip args domains)
-                     ; checkExpKind mode rn_ty result result_kind exp_kind }
-             (_, Just (fun, _), Just args)
-               | isTypeLevel (mode_tyki mode), ordinary_call
-               , all (\arg -> known_constructor arg || isOpenTypeOperand arg) args
-               , any known_constructor args, any open_indexed_operand args
-               , Just telescope <- indexedOpenTypeFunction fun
-               , let (_, inputs, _) = telescope
-               , equalLength inputs args
-               -> do { observed <- tcIndexedOpenTypeCall mode fun telescope args
-                     ; case observed of
-                         Just (result, result_kind) ->
-                           checkExpKind mode rn_ty result result_kind exp_kind
-                         Nothing -> unsupported name }
-             (_, Just (fun, _), Just [arg])
+               -> run_open_call name instantiated result_kind (zip args domains)
                | isTypeLevel (mode_tyki mode)
-               , Just (wildcards, call_owner, pending) <- mode_pending_calls mode
-               , Just (owner_level, HM_Sig) <- mode_holes mode
-               , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ operand))) <- ignoreParens arg
-               , Just _ <- lookupNameEnv wildcards operand
-               -> do { (domain, result_kind) <- tcClosedCallKinds Nothing name (varType fun) arg RetryClosedOperand
-                     ; tcCheckClosedCallContext name
-                     ; case call_owner of
-                         RetrySigCalls -> return ()
-                         RejectSigCalls -> failWithTc (TcRnClosedTypeEval name
-                           ("This binding group has a pattern binding with an explicit multiplicity. " ++
-                            "Give the binding that uses this call a complete type signature."))
-                     ; checked <- tc_check_lhs_type mode arg domain
-                     ; result <- setTcLevel owner_level (newFlexiTyVarTy result_kind)
-                     ; call_span <- getSrcSpanM
-                     ; updTcRef pending (TcPendingTypeCall call_span fun checked result :)
-                     ; checkExpKind mode rn_ty result result_kind exp_kind }
+               , Just indexed_check <- try_indexed_open_call fun args (unsupported name)
+               -> indexed_check
+             (_, Just (fun, _), Just [arg])
+               | Just defer <- defer_pending_call name fun arg
+               -> defer
              (_, Just (fun, _), Just args)
                | isTypeLevel (mode_tyki mode)
                , not (null args)
-               , ordinary_call || (ready_partial_call && length args == 1)
+               , ordinary_call || (ready_partial_call && lengthIs args 1)
                -> do { staging <- closedOperandStaging args
                      ; if isJust staging
                          then executable_call fun args
                          else unsupported name }
              _ -> unsupported name
            else imported_call env rdr name }
+
+    source_family_call loc rdr name
+      | Just args <- value_args
+      , not (null args)
+      , isTypeLevel (mode_tyki mode)
+      , ordinary_call || (lengthIs args 1 && ready_partial_call)
+      = do { fallback <- localFallbackFamilyOwner name
+           ; case fallback of
+               Just fun -> setSrcSpanA loc $ do
+                 staging <- closedOperandStaging args
+                 if isJust staging
+                   then run_closed_plan (\hint -> tcPlanOrdinaryCall mode ordinary_call hint fun args)
+                   else failWithTc (TcRnNoSourceTable (getName fun))
+               Nothing
+                 | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
+                     staging <- closedOperandStaging args
+                     executable <- tcClosedCaseExecutableOwner False rdr name args staging
+                     case executable of
+                       Just owner -> setSrcSpanA loc $
+                         run_closed_plan (\hint -> tcPlanExecutableCase mode ordinary_call hint owner args)
+                       Nothing
+                         | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args
+                         -> do { table <- tcLookupTyCon name
+                               ; checkOpenCallbackInterfaces table args
+                               ; mapM_ checkNominalCallback args
+                               ; tc_app_ty_generic mode rn_ty exp_kind }
+                         | ordinary_call, any nominalCallback args
+                         -> do { mapM_ checkNominalCallback args
+                               ; tc_app_ty_generic mode rn_ty exp_kind }
+                         | ordinary_call, staging == Just True
+                         -> do { table <- tcLookupTyCon name
+                               ; if supportsClosedFamilyTree table args
+                                   then setSrcSpanA loc $
+                                          run_closed_plan (\hint -> tcPlanClosedTree mode True hint (CheckClosedCase table) args)
+                                   else tc_app_ty_generic mode rn_ty exp_kind }
+                       Nothing -> tc_app_ty_generic mode rn_ty exp_kind
+                 | otherwise -> tc_app_ty_generic mode rn_ty exp_kind }
+      | otherwise = tc_app_ty_generic mode rn_ty exp_kind
+
+    use_source_table table = do
+      sourceTableReferenceUse table
+      tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table)
+
+    run_open_call name instantiated result_kind domain_args = do
+      result <- tcOpenTypeCall mode name instantiated result_kind domain_args
+      checkExpKind mode rn_ty result result_kind exp_kind
+
+    try_indexed_open_call fun args on_miss
+      | ordinary_call
+      , all (\arg -> known_constructor arg || isOpenTypeOperand arg) args
+      , any known_constructor args, any open_indexed_operand args
+      , Just telescope@(_, inputs, _) <- indexedOpenTypeFunction fun
+      , equalLength inputs args
+      = Just $ do
+          observed <- tcIndexedOpenTypeCall mode fun telescope args
+          case observed of
+            Just (result, result_kind) -> checkExpKind mode rn_ty result result_kind exp_kind
+            Nothing                    -> on_miss
+      | otherwise = Nothing
+
+    defer_pending_call name fun arg
+      | isTypeLevel (mode_tyki mode)
+      , Just (wildcards, call_owner, pending) <- mode_pending_calls mode
+      , Just (owner_level, HM_Sig) <- mode_holes mode
+      , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ operand))) <- ignoreParens arg
+      , Just _ <- lookupNameEnv wildcards operand
+      = Just $ do
+          (domain, result_kind) <- tcClosedCallKinds Nothing name (varType fun) arg RetryClosedOperand
+          tcCheckClosedCallContext name
+          case call_owner of
+            RetrySigCalls  -> return ()
+            RejectSigCalls -> failWithTc (TcRnClosedTypeEval name
+              ("This binding group has a pattern binding with an explicit multiplicity. " ++
+               "Give the binding that uses this call a complete type signature."))
+          checked <- tc_check_lhs_type mode arg domain
+          result <- setTcLevel owner_level (newFlexiTyVarTy result_kind)
+          call_span <- getSrcSpanM
+          updTcRef pending (TcPendingTypeCall call_span fun checked result :)
+          checkExpKind mode rn_ty result result_kind exp_kind
+      | otherwise = Nothing
+
+    run_closed_plan plan = do
+      hint <- closedCallResultHint ordinary_call exp_kind
+      (kind, value) <- plan hint
+      checkClosedCallExpectedKind rn_ty exp_kind kind
+      observe <- prepareClosedCallResult kind value
+      result <- observe
+      checkExpKind mode rn_ty result kind exp_kind
 
     partial_source_callback fun args
       | isTypeLevel (mode_tyki mode), isJust (mode_complete_type_arg mode)
@@ -3795,52 +3934,26 @@ tc_app_ty_external mode rn_ty exp_kind
                          , (null left_args && (indexed_variable operand || operand == getName nullary)) ||
                            ((any ((== operand) . getName) recursive || operand == getName fun) &&
                             any open_indexed_operand args)
-                         -> do { sourceTableReferenceUse table
-                               ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
+                         -> use_source_table table
                          | [arg] <- args, isQual rdr
-                         , Just (wildcards, call_owner, pending) <- mode_pending_calls mode
-                         , Just (owner_level, HM_Sig) <- mode_holes mode
-                         , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ operand))) <- ignoreParens arg
-                         , Just _ <- lookupNameEnv wildcards operand
-                         -> do { (domain, result_kind) <- tcClosedCallKinds Nothing name (varType fun) arg RetryClosedOperand
-                               ; tcCheckClosedCallContext name
-                               ; case call_owner of
-                                   RetrySigCalls -> return ()
-                                   RejectSigCalls -> failWithTc (TcRnClosedTypeEval name
-                                     ("This binding group has a pattern binding with an explicit multiplicity. " ++
-                                      "Give the binding that uses this call a complete type signature."))
-                               ; checked <- tc_check_lhs_type mode arg domain
-                               ; result <- setTcLevel owner_level (newFlexiTyVarTy result_kind)
-                               ; call_span <- getSrcSpanM
-                               ; updTcRef pending (TcPendingTypeCall call_span fun checked result :)
-                               ; checkExpKind mode rn_ty result result_kind exp_kind }
+                         , Just defer <- defer_pending_call name fun arg
+                         -> defer
                          | ordinary_call, [arg] <- args
                          , Just table <- sourceTableId_maybe fun
                          , (isFinalCoreIdentity fun && retained_identity_operand arg) ||
                            (isFinalCoreReverseWrapper fun && open_indexed_operand arg && not (isOpenTypeOperand arg))
                          -> do { _ <- tcOpenTypeContext mode name
-                               ; sourceTableReferenceUse table
-                               ; tc_app_ty_with_head mode rn_ty exp_kind (mkTyConTy table) }
+                               ; use_source_table table }
                          | ordinary_call
                          , Just (instantiated, domains, result_kind) <- instantiateOpenTypeFunction False fun
                          , equalLength domains args
                          , all isOpenTypeOperand args
-                         -> do { result <- tcOpenTypeCall mode name instantiated result_kind (zip args domains)
-                               ; checkExpKind mode rn_ty result result_kind exp_kind }
-                         | ordinary_call
-                         , all (\arg -> known_constructor arg || isOpenTypeOperand arg) args
-                         , any known_constructor args, any open_indexed_operand args
-                         , Just telescope <- indexedOpenTypeFunction fun
-                         , let (_, inputs, _) = telescope
-                         , equalLength inputs args
-                         -> do { observed <- tcIndexedOpenTypeCall mode fun telescope args
-                               ; case observed of
-                                   Just (result, result_kind) ->
-                                     checkExpKind mode rn_ty result result_kind exp_kind
-                                   Nothing -> executable_call fun args }
+                         -> run_open_call name instantiated result_kind (zip args domains)
+                         | Just indexed_check <- try_indexed_open_call fun args (executable_call fun args)
+                         -> indexed_check
                          -- See Note [Function values and executable type calls].
                          | not (null args)
-                         , ordinary_call || (isQual rdr && ready_partial_call && length args == 1)
+                         , ordinary_call || (isQual rdr && ready_partial_call && lengthIs args 1)
                          -> executable_call fun args
                        _ -> unsupported name }
            _ -> unsupported name
@@ -3849,13 +3962,8 @@ tc_app_ty_external mode rn_ty exp_kind
       selected <- if ordinary_call then checkedClassMethod fun args else pure Nothing
       case selected of
         Just check -> check
-        Nothing -> do
-          hint <- closedCallResultHint ordinary_call exp_kind
-          (result_kind, plan) <- tcPlanOrdinaryCall mode ordinary_call hint fun args
-          checkClosedCallExpectedKind rn_ty exp_kind result_kind
-          run <- prepareClosedCallResult result_kind plan
-          result <- run
-          checkExpKind mode rn_ty result result_kind exp_kind
+        Nothing    -> run_closed_plan (\hint -> tcPlanOrdinaryCall mode ordinary_call hint fun args)
+
     -- Keep closed calls on the executable path. A retained variable and
     -- nested applications that contain it have no closed runtime operand.
     -- See Note [Identity certificates and open unfoldings] in GHC.Tc.Gen.SourceTable.
@@ -3886,22 +3994,11 @@ tc_app_ty_external mode rn_ty exp_kind
       L _ (HsKindSig _ operand _) -> indexed_operand operand
       operand -> operand
 
-    (hs_fun_ty, hs_args) = splitHsAppTys rn_ty
-    value_args = traverse value_arg (filterOut is_par hs_args)
-    is_par HsArgPar{} = True
-    is_par _ = False
-    value_arg (HsValArg _ arg) = Just arg
-    value_arg _ = Nothing
-    ordinary_call = isNothing (mode_holes mode) || isJust (mode_complete_type_arg mode)
-    ready_partial_call
-      | Just (_, RetrySigCalls, _) <- mode_pending_calls mode = True
-      | otherwise = False
-    unsupported = failWithTc . TcRnNoSourceTable
     checkedClassMethod fun args@[_, _, receiver]
       | Just _ <- isClassOpId_maybe fun
       , any isOpenTypeOperand args = do
           (_, kind) <- tc_infer_lhs_type mode receiver
-          actual <- liftZonkM (zonkTcType kind)
+          actual <- zonkTcTypeIfNeeded kind
           case splitTyConApp_maybe actual of
             Just (tc, [_]) | tc == listTyCon ->
               fmap (checkTableMethod fun) <$> lookupSourceContainerMethod fun (mkTyConTy tc)
@@ -3910,7 +4007,7 @@ tc_app_ty_external mode rn_ty exp_kind
       | sourceMapSelector fun, any open_mapping_operand args
       , Just cls <- isClassOpId_maybe fun = do
           (receiver, kind) <- tc_infer_lhs_type mode right
-          actual <- liftZonkM (zonkTcType kind)
+          actual <- zonkTcTypeIfNeeded kind
           case splitAppTy_maybe actual of
             Just (domain, _) -> do
               table <- lookupSourceCheckedMapMethod cls fun domain
@@ -3928,7 +4025,7 @@ tc_app_ty_external mode rn_ty exp_kind
             Nothing -> pure Nothing
       | Just _ <- isClassOpId_maybe fun
       , Just domain <- retainedDomain left <|> retainedDomain right
-      = do actual <- liftZonkM (zonkTcType domain)
+      = do actual <- zonkTcTypeIfNeeded domain
            fmap (checkTableMethod fun) <$> lookupSourceBinaryMethod fun actual
     checkedClassMethod _ _ = pure Nothing
 
@@ -3954,12 +4051,12 @@ tc_app_ty_external mode rn_ty exp_kind
       worker <- readOpenMethodWorker dfun fun >>= either (reportOpenTypeFailure name) pure
       recordSourceMethodUse dfun fun worker
       (callback, _) <- tc_infer_lhs_type mode left
-      checked_callback <- liftZonkM (zonkTcType callback)
-      checked_receiver <- liftZonkM (zonkTcType receiver)
-      case instantiateOpenMethod worker (typeKind checked_callback) (typeKind checked_receiver) of
+      checked_cb <- zonkTcTypeIfNeeded callback
+      checked_receiver <- zonkTcTypeIfNeeded receiver
+      case instantiateOpenMethod worker (typeKind checked_cb) (typeKind checked_receiver) of
         Nothing -> reportOpenTypeFailure name InvalidInput
         Just (method, result_kind) -> do
-          observed <- tcObserveOpenTypeCall local False method result_kind [checked_callback, checked_receiver]
+          observed <- tcObserveOpenTypeCall local False method result_kind [checked_cb, checked_receiver]
           result <- either (reportOpenTypeFailure name) pure observed
           checkExpKind mode rn_ty result result_kind exp_kind
 
@@ -3976,67 +4073,6 @@ tc_app_ty_external mode rn_ty exp_kind
       , isNativeOpaqueValueId index
       = Just (varType index)
       | otherwise = Nothing
-tc_app_ty_external mode rn_ty exp_kind
-  | L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr rdr name))) <- hs_fun_ty
-  , isSourceFamilyName name
-  , Just args <- traverse value_arg (filterOut is_par hs_args)
-  , not (null args)
-  , isTypeLevel (mode_tyki mode)
-  , ordinary_call || (lengthIs args 1 && ready_partial_call)
-  = do { fallback <- localFallbackFamilyOwner name
-       ; case fallback of
-           Just fun -> setSrcSpanA loc $ do
-             staging <- closedOperandStaging args
-             if isJust staging
-               then fallback_executable_call fun args
-               else failWithTc (TcRnNoSourceTable (getName fun))
-           Nothing
-             | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
-                 staging <- closedOperandStaging args
-                 executable <- tcClosedCaseExecutableOwner False rdr name args staging
-                 case executable of
-                   Just owner -> run loc (\hint -> tcPlanExecutableCase mode ordinary_call hint owner args)
-                   Nothing
-                     | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args
-                     -> do { table <- tcLookupTyCon name
-                           ; checkOpenCallbackInterfaces table args
-                           ; mapM_ checkNominalCallback args
-                           ; tc_app_ty_generic mode rn_ty exp_kind }
-                     | ordinary_call, any nominalCallback args
-                     -> do { mapM_ checkNominalCallback args
-                           ; tc_app_ty_generic mode rn_ty exp_kind }
-                     | ordinary_call, staging == Just True
-                     -> do { table <- tcLookupTyCon name
-                           ; if supportsClosedFamilyTree table args
-                               then run loc (\hint -> tcPlanClosedTree mode True hint (CheckClosedCase table) args)
-                               else tc_app_ty_generic mode rn_ty exp_kind }
-                   Nothing -> tc_app_ty_generic mode rn_ty exp_kind
-             | otherwise -> tc_app_ty_generic mode rn_ty exp_kind }
-  where
-    fallback_executable_call fun args = do
-      hint <- closedCallResultHint ordinary_call exp_kind
-      (result_kind, plan) <- tcPlanOrdinaryCall mode ordinary_call hint fun args
-      checkClosedCallExpectedKind rn_ty exp_kind result_kind
-      run_plan <- prepareClosedCallResult result_kind plan
-      result <- run_plan
-      checkExpKind mode rn_ty result result_kind exp_kind
-    (hs_fun_ty, hs_args) = splitHsAppTys rn_ty
-    is_par HsArgPar{} = True
-    is_par _ = False
-    value_arg (HsValArg _ arg) = Just arg
-    value_arg _ = Nothing
-    ordinary_call = isNothing (mode_holes mode) || isJust (mode_complete_type_arg mode)
-    ready_partial_call
-      | Just (_, RetrySigCalls, _) <- mode_pending_calls mode = True
-      | otherwise = False
-    run loc plan = setSrcSpanA loc $ do
-      hint <- closedCallResultHint ordinary_call exp_kind
-      (kind, value) <- plan hint
-      checkClosedCallExpectedKind rn_ty exp_kind kind
-      observe <- prepareClosedCallResult kind value
-      result <- observe
-      checkExpKind mode rn_ty result kind exp_kind
-tc_app_ty_external mode rn_ty exp_kind = tc_app_ty_generic mode rn_ty exp_kind
 
 {- Note [Captured term names in ordinary types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4180,7 +4216,7 @@ tcIndexedOpenTypeCall mode fun (tvs, domains, result) args = do
     if anyVarSet isMetaTyVar (tyCoVarsOfTypes checked)
       then return Nothing
       else do
-        let applied = foldl Core.App (Core.Var fun) (map Core.Type checked)
+        let applied = foldl' Core.App (Core.Var fun) (map Core.Type checked)
         observed <- tcObserveOpenTypeCall local True applied kind checked_operands
         case observed of
           Left InvalidInput -> return Nothing
@@ -5798,7 +5834,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
         -- next binder is invisible; need to instantiate it
         | Named (Bndr kv flag) <- ki_binder
         , isInvisibleForAllTyFlag flag   -- ForAllTy with Inferred or Specified
-         -> if mentions_index arg
+         -> if not (isEmptyNameEnv (mode_indices mode)) && mentions_index arg
             then do { (arg_ty, arg_kind) <- case checked_arg of
                         Just checked -> return checked
                         Nothing ->
@@ -6082,11 +6118,10 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
     -- See Note [Immutable native kind arguments].
     mentions_index :: Data a => a -> Bool
     mentions_index thing
+      | isAstLeafAnnotation thing = False
       | Just (L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))))
           <- (cast thing :: Maybe (LHsType GhcRn))
       = isJust (lookupNameEnv (mode_indices mode) name)
-      | Just _ <- (cast thing :: Maybe Name) = False
-      | Just _ <- (cast thing :: Maybe Type) = False
       | otherwise = or (gmapQ mentions_index thing)
 
     -- Match complete invisible choices from an actual native kind.
@@ -6550,17 +6585,67 @@ reduces to EqP @a x z via a closed family axiom. Do not trigger when either
 matchability is an unfilled metavariable or when any arrow requires U -> M.
 -}
 
--- | Extract @(kind, ty)@ when a type is @TypeRep \@kind ty@.
+-- | Extract @(kind, ty)@ when a type is @TypeRep \@kind ty@, peeling outer
+-- synonyms, casts, and filled metavariables without zonking unrelated types.
 tcTypeRepTarget_maybe :: TcType -> TcM (Maybe (TcKind, TcType))
-tcTypeRepTarget_maybe ty
-  | Just (tc, [kind, target]) <- tcSplitTyConApp_maybe ty
-  , occNameFS (nameOccName (tyConName tc)) == fsLit "TypeRep"
-  = do { selector <- tcLookupKnownOccId typeRepIdOcc
-       ; let (_, rep) = tcSplitPhiTy (piResultTys (varType selector) [kind, target])
-       ; pure $ case tcSplitTyConApp_maybe rep of
-           Just (rep_tc, _) | tc == rep_tc -> Just (kind, target)
-           _                               -> Nothing }
-  | otherwise = pure Nothing
+tcTypeRepTarget_maybe ty0 = do
+  mb_app <- split_head [] ty0
+  case mb_app of
+    Just (tc, [raw_kind, raw_target]) -> do
+      selector <- tcLookupKnownOccId typeRepIdOcc
+      kind   <- zonkTcTypeIfNeeded raw_kind
+      target <- zonkTcTypeIfNeeded raw_target
+      let (_, rep) = tcSplitPhiTy (piResultTys (varType selector) [kind, target])
+      pure $ case tcSplitTyConApp_maybe rep of
+        Just (rep_tc, _) | tc == rep_tc -> Just (kind, target)
+        _                               -> Nothing
+    _ -> pure Nothing
+  where
+    split_head :: [TcType] -> TcType -> TcM (Maybe (TyCon, [TcType]))
+    split_head args ty
+      | Just ty' <- coreView ty = split_head args ty'
+    split_head args (CastTy ty _) = split_head args ty
+    split_head args (AppTy fun arg) = split_head (arg : args) fun
+    split_head args (TyVarTy tv)
+      | isTcTyVar tv, isMetaTyVar tv = do
+          cts <- readMetaTyVar tv
+          case cts of
+            Indirect ty' -> split_head args ty'
+            Flexi        -> pure Nothing
+      | otherwise = pure Nothing
+    split_head args (TyConApp tc tc_args)
+      | not (null args)
+      , Just ty' <- coreView (mkTyConApp tc (tc_args ++ args))
+      = split_head [] ty'
+      | occNameFS (nameOccName (tyConName tc)) == fsLit "TypeRep"
+      = pure (Just (tc, tc_args ++ args))
+    split_head _ _ = pure Nothing
+
+-- | Substitute 'Type' replacements for captured runtime 'Id' occurrences,
+-- converting 'TermAppTy' heads when replaced and updating remaining variable
+-- kinds and multiplicities.
+replaceTypeTermIds :: VarEnv Type -> Type -> Type
+replaceTypeTermIds env
+  | isEmptyVarEnv env = id
+  | otherwise         = go
+  where
+    go (TyVarTy tv)       = TyVarTy (setTyVarKind tv (go (tyVarKind tv)))
+    go (TermVarTy v)      = lookupVarEnv env v `orElse` TermVarTy (updateIdTypeAndMult go v)
+    go (TermAppTy f a)    = case lookupVarEnv env f of
+                              Just f_ty -> mkAppTy f_ty (go a)
+                              Nothing   -> TermAppTy (updateIdTypeAndMult go f) (go a)
+    go (AppTy f a)        = mkAppTy (go f) (go a)
+    go (TyConApp tc args) = mkTyConApp tc (map go args)
+    go (FunTy af ma m a r) = FunTy af (go ma) (go m) (go a) (go r)
+    go (ForAllTy ma (Bndr b vis) r) =
+      ForAllTy (go ma) (Bndr (updateVarType go b) vis) (go r)
+    go (DepFunTy vis b r) = DepFunTy vis (updateIdTypeAndMult go b)
+                              (replaceTypeTermIds (delVarEnv env b) r)
+    go (ExistsTy vis b r) = ExistsTy vis (setTyVarKind b (go (tyVarKind b))) (go r)
+    go (DepDictTy b r)    = DepDictTy (updateIdTypeAndMult go b)
+                              (replaceTypeTermIds (delVarEnv env b) r)
+    go (CastTy t co)      = CastTy (go t) co
+    go t                  = t
 
 -- | Per-module cache of synthesized matchability-forgetfulness family 'TyCon's.
 forgetMTyConCache :: IORef (UniqFM Module (NameEnv TyCon))
@@ -6595,7 +6680,7 @@ tcRegisterSynthesizedSourceFun loc raw_tvs cap_val_ids x_id res_kind0 body_index
   (subst2, val_tvs) <- mapAccumLM alloc_val subst1 (cap_val_ids ++ [x_id])
   let id_map = mkVarEnv [ (orig_v, mkTyVarTy val_tv)
                         | (orig_v, val_tv) <- zip (cap_val_ids ++ [x_id]) val_tvs ]
-      subst_all ty = replace_synth_ids id_map (Subst.substTy subst2 ty)
+      subst_all ty = replaceTypeTermIds id_map (Subst.substTy subst2 ty)
       res_kind' = subst_all res_kind0
       rhs_ty'   = subst_all body_index0
       all_tvs   = p_tvs ++ val_tvs
@@ -6629,28 +6714,6 @@ tcRegisterSynthesizedSourceFun loc raw_tvs cap_val_ids x_id res_kind0 body_index
       let ki = Subst.substTy subst (varType v)
       nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName v))))
       pure (subst, mkTyVar nm ki)
-
-    replace_synth_ids :: VarEnv Type -> Type -> Type
-    replace_synth_ids env = go
-      where
-        go t@(TyVarTy tv)       = if isEmptyVarEnv env then t else TyVarTy (setTyVarKind tv (go (tyVarKind tv)))
-        go (TermVarTy v)        = lookupVarEnv env v `orElse` TermVarTy (setVarType v (go (varType v)))
-        go (TermAppTy f a)      = case lookupVarEnv env f of
-                                    Just f_ty -> mkAppTy f_ty (go a)
-                                    Nothing   -> TermAppTy (setVarType f (go (varType f))) (go a)
-        go (AppTy f a)          = mkAppTy (go f) (go a)
-        go (TyConApp tc as)     = mkTyConApp tc (map go as)
-        go (FunTy af ma m a r)  = FunTy af (go ma) (go m) (go a) (go r)
-        go (ForAllTy ma (Bndr b vis) r)
-          | isTyVar b = ForAllTy (go ma) (Bndr (setTyVarKind b (go (tyVarKind b))) vis) (go r)
-          | otherwise = ForAllTy (go ma) (Bndr (setVarType b (go (varType b))) vis) (go r)
-        go (DepFunTy vis b r)   = DepFunTy vis (setVarType b (go (varType b)))
-                                    (replace_synth_ids (delVarEnv env b) r)
-        go (ExistsTy vis b r)   = ExistsTy vis (setTyVarKind b (go (tyVarKind b))) (go r)
-        go (DepDictTy b r)      = DepDictTy (setVarType b (go (varType b)))
-                                    (replace_synth_ids (delVarEnv env b) r)
-        go (CastTy t co)        = CastTy (go t) co
-        go t                    = t
 
 -- | Record a checked top-level helper binding for installation at the end of
 -- the current declaration group.
@@ -6761,7 +6824,7 @@ tcInlineSomeLambda mode src binders body exp_kind = do
   let p_tvs        = map fst p_pairs
       id_map       = mkVarEnv [ (orig_v, mkTyVarTy p_tv)
                               | (p_tv, orig_v) <- p_pairs, isId orig_v ]
-      subst_all ty = replace_ids id_map (Subst.substTy subst2 ty)
+      subst_all ty = replaceTypeTermIds id_map (Subst.substTy subst2 ty)
       res_kind'    = subst_all res_kind
       rhs_ty'      = subst_all body_ty
       all_tvs      = p_tvs ++ z_tvs
@@ -6850,29 +6913,6 @@ tcInlineSomeLambda mode src binders body exp_kind = do
       let tv     = mkTyVar nm (Subst.substTy subst dk)
           subst' = Subst.extendTvSubstAndInScope subst skol_tv (mkTyVarTy tv)
       pure (subst', tv)
-
-    replace_ids :: VarEnv Type -> Type -> Type
-    replace_ids env = go
-      where
-        go (TermVarTy v)
-          | Just replacement <- lookupVarEnv env v = replacement
-          | otherwise = TermVarTy (updateIdTypeAndMult go v)
-        go (TermAppTy f a) = TermAppTy f (go a)
-        go (TyVarTy tv) = TyVarTy (setVarType tv (go (varType tv)))
-        go (AppTy f a) = mkAppTy (go f) (go a)
-        go (TyConApp tc args) = mkTyConApp tc (map go args)
-        go (ForAllTy ma (Bndr v vis) r) =
-          ForAllTy (go ma) (Bndr (updateVarType go v) vis) (go r)
-        go (FunTy af ma mult a r) =
-          FunTy af (go ma) (go mult) (go a) (go r)
-        go (DepFunTy vis b r) =
-          DepFunTy vis (updateIdTypeAndMult go b) (go r)
-        go (ExistsTy fl v r) =
-          ExistsTy fl (setVarType v (go (varType v))) (go r)
-        go (DepDictTy v r) =
-          DepDictTy (updateIdTypeAndMult go v) (go r)
-        go (CastTy t co) = CastTy (go t) co
-        go ty = ty
 
 -- | Adapt a visible type argument from matchable arrows to unmatchable arrows
 -- via a closed 1-equation eta-expansion family.
@@ -7123,7 +7163,7 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
            ATcId { tct_id = v } ->
              do { dep <- xoptM LangExt.ExperimentalDependentTypes
                 ; mb_rep <- if dep
-                            then tcTypeRepTarget_maybe =<< liftZonkM (zonkTcType (varType v))
+                            then tcTypeRepTarget_maybe (varType v)
                             else pure Nothing
                 ; case mb_rep of
                     Just (kind, ty) -> return (ty, kind)
