@@ -1,9 +1,10 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 -- | Correctness of list reversal with an accumulator.
 module BookReverseProof (shunt, shuntReverse, checkShuntReverse) where
 
-import HaskLib (appendAssoc, (:~:)(Refl))
+import Data.List.Dependent.Properties (appendAssoc)
+import Data.Type.Equality ((:~:)(Refl))
 
 -- | Append each head to the reversed tail.
 rev :: [a] -> [a]

@@ -2,8 +2,9 @@
 module MapZipFusionCounts (producer, mapper, report) where
 
 import Control.Exception (ErrorCall, evaluate, try)
+import Data.List.Dependent (size)
+import Data.Nat.Dependent (Nat(..), minSize)
 import GHC.Exts (build)
-import HaskLib (Nat(..), minSize, size)
 
 -- | Inspect the first application of the supplied list constructor.
 {-# NOINLINE producer #-}

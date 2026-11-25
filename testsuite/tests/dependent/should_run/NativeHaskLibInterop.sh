@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export LC_ALL=C.UTF-8
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 trap 'echo "NativeHaskLibInterop.sh failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
-if [[ -f check-hasklib.sh ]]; then
+if [[ -f check-dependent-base.sh ]]; then
+    exec bash check-dependent-base.sh "$1" "$2"
+elif [[ -f check-hasklib.sh ]]; then
     exec bash check-hasklib.sh "$1" "$2"
 else
-    here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-    exec bash "$here/../../../../docs/dependent-haskell/check-hasklib.sh" "$1" "$2"
+    exec bash "$here/../../../../docs/dependent-haskell/check-dependent-base.sh" "$1" "$2"
 fi

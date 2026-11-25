@@ -1,12 +1,12 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers #-}
-{-# LANGUAGE PolyKinds, RequiredTypeArguments, TypeOperators #-}
+{-# LANGUAGE DependentTypes #-}
 -- | Congruence with a required type argument from the PLFH Induction chapter.
 module BookCongruence (plusAssoc, plusComm, addUnder, underInc, powerAddZero) where
 
 import BookNaturals (Bin, inc, pow)
+import Data.Nat.Dependent (Nat(..), plus)
+import Data.Nat.Dependent.Properties (plusSucc, plusZero)
 import Data.Type.Equality ((:~:)(Refl), trans)
 import GHC.Types (Matchability)
-import HaskLib.Nat (Nat(..), plus, plusSucc, plusZero)
 
 -- | Apply the same function to both sides of an equality.
 congVis :: forall {a} {b} {m :: Matchability}.

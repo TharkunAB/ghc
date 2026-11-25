@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, PolyKinds, StandaloneKindSignatures #-}
+{-# LANGUAGE DependentTypes, LambdaCase #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 -- | Untyped terms, substitution and congruence of parallel reduction in PLFH Confluence.
 -- Adapted from PLFH under CC BY 4.0. See REFERENCES.md.
@@ -6,7 +6,7 @@ module BookParallel (Fin(..), UTerm(..), Par(..), parRefl,
                      extU, renameU, extsU, substU, substSingleU) where
 
 import Data.Kind (Type)
-import HaskLib.Nat (Nat(..))
+import Data.Nat.Dependent (Nat(..))
 
 -- | A variable in a context with the given number of entries.
 data Fin (n :: Nat) where

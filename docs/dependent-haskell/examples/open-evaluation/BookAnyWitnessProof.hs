@@ -1,9 +1,8 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, NoListTuplePuns, ScopedTypeVariables, TypeOperators #-}
+{-# LANGUAGE DependentTypes #-}
 module BookAnyWitnessProof (Evidence(..), packHeadPreservesProof, decodeThere, membershipRoundTrip) where
 
-import Data.Type.Equality ((:~:)(Refl))
+import Data.Type.Equality.Dependent ((:~:)(Refl), rewrite)
 import GHC.Types (List)
-import HaskLib (rewrite)
 import BookAnyWitness
 
 -- | The promoted result contains the same proof for every payload.

@@ -11,11 +11,7 @@ fi
 
 src=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$src/../../../.." && pwd)
-if [[ -d "$src/hasklib" ]]; then
-  hasklib_dir="$src/hasklib"
-else
-  hasklib_dir="$repo_root/docs/dependent-haskell/hasklib"
-fi
+dep_base_src="${DEPENDENT_BASE_DIR:-/home/tritlo/Code/dependent-base}/src"
 if [[ -d "$src/open-evaluation" ]]; then
   open_eval_dir="$src/open-evaluation"
 else
@@ -269,7 +265,7 @@ EOF
 
 export LD_LIBRARY_PATH="$plug_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# 3. Shared multi-module Dependent Haskell program (using HaskLib.Nat + local
+# 3. Shared multi-module Dependent Haskell program (using Data.Nat.Dependent + local
 #    SourceTable + SourceClosure substSingle + native DepFunTy foreach proofs)
 mkdir -p "$out/prog-src"
 cat > "$out/prog-src/DepProg.hs" <<'HS'
@@ -277,7 +273,8 @@ cat > "$out/prog-src/DepProg.hs" <<'HS'
 module Main (main) where
 
 import Data.Type.Equality ((:~:) (Refl))
-import HaskLib.Nat (Nat(..), eqSize, eqSizeRefl, natToInt, plus, plusZero)
+import Data.Nat.Dependent (Nat(..), eqSize, natToInt, plus)
+import Data.Nat.Dependent.Properties (eqSizeRefl, plusZero)
 import Prelude (Bool(..), Eq(..), IO, error, pure)
 
 data Ty = TNat | TArr Ty Ty
@@ -335,15 +332,15 @@ for plug in TestTcPlugin TestSourcePlugin TestHoleFitPlugin TestCoreInspectPlugi
   "${base_ghc[@]}" --make -fno-code -fwrite-interface \
     -package ghc-experimental -package ghc-internal -XGHC2024 \
     -package test-general-plugins "-fplugin=$plug" "-fplugin-opt=$plug:$trace_file" \
-    -i -i"$hasklib_dir" -i"$open_eval_dir" -i"$nc_dir" \
+    -i -i"$dep_base_src" -i"$open_eval_dir" -i"$nc_dir" \
     -odir "$nc_dir/build" -hidir "$nc_dir/build" \
     "$nc_dir/DepProg.hs"
 
   case "$plug" in
     TestTcPlugin)          grep -Fq 'tc-init' "$trace_file" ;;
     TestSourcePlugin)      grep -Fq 'parsed:DepProg' "$trace_file"
-                           grep -Fq 'typechecked:HaskLib.Nat' "$trace_file" ;;
-    TestCoreInspectPlugin) grep -Fq 'core:HaskLib.Nat:' "$trace_file"
+                           grep -Fq 'typechecked:Data.Nat.Dependent' "$trace_file" ;;
+    TestCoreInspectPlugin) grep -Fq 'core:Data.Nat.Dependent:' "$trace_file"
                            grep -Fq 'core:DepProg:' "$trace_file" ;;
   esac
 
@@ -356,7 +353,7 @@ for plug in TestTcPlugin TestSourcePlugin TestHoleFitPlugin TestCoreInspectPlugi
     "${base_ghc[@]}" "$opt" -dynamic --make -dcore-lint -dstg-lint \
       -package ghc-experimental -package ghc-internal -XGHC2024 \
       -package test-general-plugins "-fplugin=$plug" "-fplugin-opt=$plug:$cg_trace" \
-      -i -i"$hasklib_dir" -i"$open_eval_dir" -i"$out/prog-src" \
+      -i -i"$dep_base_src" -i"$open_eval_dir" -i"$out/prog-src" \
       -odir "$cg_dir/build" -hidir "$cg_dir/build" \
       "$out/prog-src/DepProg.hs" -o "$cg_dir/dep-prog"
     "$cg_dir/dep-prog"
@@ -364,8 +361,8 @@ for plug in TestTcPlugin TestSourcePlugin TestHoleFitPlugin TestCoreInspectPlugi
     case "$plug" in
       TestTcPlugin)          grep -Fq 'tc-init' "$cg_trace" ;;
       TestSourcePlugin)      grep -Fq 'parsed:Main' "$cg_trace"
-                             grep -Fq 'typechecked:HaskLib.Nat' "$cg_trace" ;;
-      TestCoreInspectPlugin) grep -Fq 'core:HaskLib.Nat:' "$cg_trace"
+                             grep -Fq 'typechecked:Data.Nat.Dependent' "$cg_trace" ;;
+      TestCoreInspectPlugin) grep -Fq 'core:Data.Nat.Dependent:' "$cg_trace"
                              grep -Fq 'core:Main:' "$cg_trace" ;;
     esac
   done
@@ -379,7 +376,8 @@ cat > "$out/holes/ProofWithHoles.hs" <<'HS'
 module ProofWithHoles where
 
 import Data.Type.Equality ((:~:) (Refl))
-import HaskLib.Nat (Nat(..), eqSize, eqSizeRefl, plus, plusZero)
+import Data.Nat.Dependent (Nat(..), eqSize, plus)
+import Data.Nat.Dependent.Properties (eqSizeRefl, plusZero)
 
 localDouble :: Nat -> Nat
 localDouble Zero     = Zero
@@ -402,7 +400,7 @@ if "${base_ghc[@]}" --make -fno-code -fwrite-interface \
      -fplugin=TestSourcePlugin \
      -fplugin=TestHoleFitPlugin \
      -fplugin=TestCoreInspectPlugin \
-     -i -i"$hasklib_dir" -i"$open_eval_dir" -i"$out/holes" \
+     -i -i"$dep_base_src" -i"$open_eval_dir" -i"$out/holes" \
      -odir "$out/holes/build" -hidir "$out/holes/build" \
      "$out/holes/ProofWithHoles.hs" >"$out/holes/holes.log" 2>&1; then
   echo "Expected typed-hole failure in ProofWithHoles.hs" >&2

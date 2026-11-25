@@ -1,9 +1,9 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DependentTypes #-}
 module SumOfSizes (plusExists) where
 
+import Data.Nat.Dependent (Nat, plus)
 import Data.Type.Equality ((:~:)(Refl))
 import GHC.Sigma (Sigma(Pair))
-import HaskLib.Nat (Nat, plus)
 
 -- | Return the sum of two runtime sizes with its equality proof.
 plusExists :: foreach (m :: Nat) -> foreach (n :: Nat)

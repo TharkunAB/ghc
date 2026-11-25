@@ -1,10 +1,11 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 
 -- | Two computations from the Lists and Denotational chapters of PLFA.
 module BookCalculations (downFrom, lengthDownFrom, Value(..), dom, domJoin) where
 
-import HaskLib (rewrite, size, (:~:)(Refl))
-import HaskLib.Nat (Nat(..))
+import Data.List.Dependent (size)
+import Data.Nat.Dependent (Nat(..))
+import Data.Type.Equality.Dependent (rewrite, (:~:)(Refl))
 
 -- | List each smaller natural in descending order.
 downFrom :: Nat -> [Nat]

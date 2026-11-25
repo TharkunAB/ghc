@@ -1,10 +1,10 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DependentTypes #-}
 -- | Symmetry and transitivity from the PLFH Isomorphism chapter.
 module BookIsoComposition (isoSym, isoTrans, isoTransWhere) where
 
 import BookIsomorphism (Iso(..))
 import Data.Type.Equality ((:~:), trans)
-import HaskLib (cong)
+import Data.Type.Equality.Dependent (cong)
 
 -- | Reverse an isomorphism by exchanging the functions and their proofs.
 isoSym :: Iso a b -> Iso b a
@@ -16,7 +16,7 @@ composeLeft :: foreach (f :: a -> b) -> foreach (g :: b -> a)
             -> (foreach (x :: a) -> g (f x) :~: x)
             -> (foreach (y :: b) -> k (h y) :~: y)
             -> foreach (x :: a) -> g (k (h (f x))) :~: x
-composeLeft f g _ _ gf kh x = trans (cong @g (kh (f x))) (gf x)
+composeLeft f g _ _ gf kh x = trans (cong g (kh (f x))) (gf x)
 
 -- | Compose two isomorphisms and their round-trip proofs.
 isoTrans :: forall a b c. Iso a b -> Iso b c -> Iso a c

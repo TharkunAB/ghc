@@ -1,8 +1,8 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll, GADTs #-}
+{-# LANGUAGE DependentTypes #-}
 -- | The fixed-point reduction from the PLFH Lambda chapter.
 module BookLambdaUnfold (Term(..), substTerm, Step(..), unwrapVariable) where
 
-import HaskLib.Nat (Nat(..))
+import Data.Nat.Dependent (Nat(..))
 
 -- | A term in the variable and fixed-point fragment.
 data Term = Var Nat | TMu Nat Term

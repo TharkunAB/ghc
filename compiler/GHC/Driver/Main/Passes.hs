@@ -109,12 +109,13 @@ import qualified GHC.ByteCode.Serialize as ByteCode
 import GHC.Core
 import GHC.Core.Dependent ( hasExistentialExpr, hasNativeDependentExpr, rejectNativeDependentExpr
                           , hasScopedDictionaryProgram, supportsScopedDictionaryCore
-                          , supportsNativeGentle, supportsNativeRuleBinds, supportsLocalUserRule )
+                          , supportsNativeGentle, supportsNativeRuleBinds, supportsLocalUserRule
+                          , supportsNativeUserUnfolding )
 import GHC.Core.Lint ( endScopedDictionaryPassIO )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
 import GHC.Core.TyCon (TyCon, tyConName, tyConDataCons, isBoxedDataTyCon, isTypeDataTyCon)
 import GHC.Core.DataCon (dataConName)
-import GHC.Core.FVs            ( exprSomeFreeVarsList )
+import GHC.Core.FVs            ( exprSomeFreeVarsList, mkRuleInfo )
 import GHC.Core.Tidy           ( tidyExpr )
 import GHC.Core.Utils          ( exprType )
 import GHC.Core.Opt.Pipeline
@@ -1869,7 +1870,8 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
               optimized <- core2coreRetainedWithPluginMutations mb_mut_ref lint_env result
               endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
               when (hasActiveCorePlugins lint_env) $
-                check_binds_supported supportsNativeRuleBinds level (mg_binds optimized)
+                check_binds_supported supportsNativeRuleBinds level
+                  (stripSupportedAutoRules (mg_binds optimized))
               return optimized
             Nothing | null rules && supportsNativeGentle simplified -> do
               gentle <- simplifyRetainedGentle lint_env result
@@ -1888,6 +1890,40 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
                   return optimized
               | otherwise -> return result
         else {-# SCC "Core2Core" #-} core2coreWithPluginMutations mb_mut_ref hsc_env_with_plugins ds_result
+
+-- | Strip compiler-generated @ru_auto@ rules (such as 'SpecConstr' and
+-- 'Specialise' rules added during 'core2coreRetained') whose expressions satisfy
+-- 'supportsNativeUserUnfolding' before running the post-plugin 'supportsNativeRuleBinds'
+-- check. User or plugin rules (@ru_auto = False@) and unsupported @ru_auto@
+-- rules remain attached so unsupported forms are still diagnosed.
+stripSupportedAutoRules :: CoreProgram -> CoreProgram
+stripSupportedAutoRules = map strip_bind
+  where
+    is_supported_auto (Rule { ru_auto = True, ru_bndrs = bs, ru_args = args, ru_rhs = rhs }) =
+      all (supportsNativeUserUnfolding . mkLams bs) (rhs : args)
+    is_supported_auto _ = False
+
+    strip_id b
+      | isId b
+      , let rules = idCoreRules b
+      , not (null rules)
+      = setIdSpecialisation b (mkRuleInfo (filter (not . is_supported_auto) rules))
+      | otherwise = b
+
+    strip_bind (NonRec b rhs) = NonRec (strip_id b) (strip_expr rhs)
+    strip_bind (Rec pairs)    = Rec [ (strip_id b, strip_expr rhs) | (b, rhs) <- pairs ]
+
+    strip_expr (App f a)          = App (strip_expr f) (strip_expr a)
+    strip_expr (Lam b e)          = Lam (strip_id b) (strip_expr e)
+    strip_expr (Let bind body)    = Let (strip_bind bind) (strip_expr body)
+    strip_expr (Case s b ty alts) = Case (strip_expr s) (strip_id b) ty
+                                      [ Alt con (map strip_id bs) (strip_expr rhs)
+                                      | Alt con bs rhs <- alts ]
+    strip_expr (Cast e co)        = Cast (strip_expr e) co
+    strip_expr (Tick t e)         = Tick t (strip_expr e)
+    strip_expr (Unpack w p pkg e) = Unpack w (strip_id p) (strip_expr pkg) (strip_expr e)
+    strip_expr (Pack s w e)       = Pack s w (strip_expr e)
+    strip_expr e                  = e
 
 -- | Run one retained Gentle iteration and simplify the resulting RHSs.
 -- See Note [Retained Core in the Gentle simplifier].

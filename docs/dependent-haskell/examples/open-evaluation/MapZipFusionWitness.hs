@@ -2,8 +2,9 @@
 module MapZipFusionWitness (main) where
 
 import Control.Exception (ErrorCall, evaluate, try)
+import Data.List.Dependent.Properties (lengthMapZip)
+import Data.Type.Equality ((:~:)(Refl))
 import GHC.Exts (build)
-import HaskLib (lengthMapZip, (:~:)(Refl))
 import MapZipFusionCounts (mapper, producer, report)
 
 -- | Observe whether the installed law returns its equality constructor.

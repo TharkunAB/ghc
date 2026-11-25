@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, StandaloneKindSignatures #-}
+{-# LANGUAGE DependentTypes #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 -- | Environment lookup from the PLFH BigStep chapter. Adapted under CC BY 4.0.
 module BookEnvironment (Env(..), Clos(..), EnvLookup(..), EvalBig(..),
@@ -6,7 +6,7 @@ module BookEnvironment (Env(..), Clos(..), EnvLookup(..), EvalBig(..),
 
 import BookParallel (Fin(..), UTerm(..))
 import Data.Kind (Type)
-import HaskLib.Nat (Nat(..))
+import Data.Nat.Dependent (Nat(..))
 
 -- | A closure pairs a term with the environment for its free variables.
 data Clos where

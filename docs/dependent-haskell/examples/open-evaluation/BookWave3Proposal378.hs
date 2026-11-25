@@ -1,6 +1,8 @@
-{-# LANGUAGE DependentTypes, UnicodeSyntax, UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes, DependentTypes, ListTuplePuns, UnicodeSyntax, UndecidableInstances #-}
+{-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 -- | Proposal #378 umbrella syntax, %U type-lambda captures, same-module
--- context/closure staging, inline GADT foreach arguments, and Type large eliminations.
+-- context/closure staging, inline GADT foreach arguments, Type large eliminations,
+-- and dependent-base list/foldr/matchability laws.
 module BookWave3Proposal378
   ( SumTwo
   , peanoToInt
@@ -25,14 +27,20 @@ module BookWave3Proposal378
   , Val (..)
   , valPred
   , applyValPred
+  , addUnder
+  , zipMapLaw
+  , checkFoldrAndMatchability
   ) where
 
 import Data.Kind (Type)
-import Data.Type.Equality ((:~:) (Refl))
-import GHC.Exts (U)
+import qualified Data.List.Dependent as DepList
+import qualified Data.List.Dependent.Properties as DepListProps
+import Data.Nat.Dependent (Nat (..), minSize, plus)
+import Data.Nat.Dependent.Properties (congFirst, congSucc, plusSucc, plusZero)
+import Data.Type.Equality.Dependent ((:~:) (Refl), Matchability (..), U, cong, trans)
 import GHC.Sigma (Sigma (Pair))
 import GHC.Tuple (Unit)
-import HaskLib.Nat (Nat (..), congSucc, plus)
+import Prelude hiding (foldr)
 
 -- | Convert a Peano natural to a machine integer for runtime display.
 peanoToInt :: Nat -> Int
@@ -154,3 +162,41 @@ valPred (Arr a b) = type (valPred a -> valPred b)
 -- | Apply a value whose function type is computed by valPred.
 applyValPred :: valPred (Arr Bot (Arr Bot Bot)) -> Unit
 applyValPred f = f () ()
+
+-- | Move a successor through an inner addition under a fixed left operand.
+addUnder :: foreach (m n p :: Nat) -> plus m (plus n ('Succ p)) :~: plus m ('Succ (plus n p))
+addUnder m n p =
+  cong (plus m) (plusSucc n p :: plus n ('Succ p) :~: 'Succ (plus n p))
+
+-- | Compose lengthZipWith and lengthMap using trans and congFirst.
+zipMapLaw :: forall a b c d. foreach (pre :: a -> b) -> foreach (combine :: b -> c -> d)
+          -> foreach (xs :: [a]) -> foreach (ys :: [c])
+          -> DepList.size (zipWith combine (map pre xs) ys) :~: minSize (DepList.size xs) (DepList.size ys)
+zipMapLaw pre combine xs ys =
+  DepListProps.lengthZipWith combine (map pre xs) ys
+    `trans` congFirst @minSize @(DepList.size ys) (DepListProps.lengthMap pre xs)
+
+type ArrowBy (m :: Matchability) (a :: Type) (b :: Type) = a %m -> b
+
+matchableCong :: forall (f :: ArrowBy 'Matchable Nat Nat) x y. x :~: y -> f x :~: f y
+matchableCong = cong f
+
+unmatchableCong :: forall (f :: ArrowBy 'Unmatchable Nat Nat) x y. x :~: y -> f x :~: f y
+unmatchableCong = cong f
+
+foldrPlusAppend :: foreach (xs ys :: [Nat]) -> foreach (z :: Nat)
+                -> DepList.foldr plus z (xs ++ ys) :~: DepList.foldr plus (DepList.foldr plus z ys) xs
+foldrPlusAppend []       _  _ = Refl
+foldrPlusAppend (x : xs) ys z = cong (plus x) (foldrPlusAppend xs ys z)
+
+foldrPlusZero :: foreach (xs :: [Nat])
+              -> plus (DepList.foldr plus 'Zero xs) 'Zero :~: DepList.foldr plus 'Zero xs
+foldrPlusZero xs = plusZero (DepList.foldr plus Zero xs)
+
+-- | Exercise checked foldr laws and both Matchability constructors.
+checkFoldrAndMatchability :: [Nat] -> [Nat] -> Bool
+checkFoldrAndMatchability xs ys =
+  case foldrPlusAppend xs ys Zero of
+    Refl -> case foldrPlusZero xs of
+      Refl -> case (matchableCong @'Succ (Refl @'Zero), unmatchableCong @(plus 'Zero) (Refl @'Zero)) of
+        (Refl, Refl) -> True

@@ -2,7 +2,7 @@
 {-# LANGUAGE RankNTypes, ScopedTypeVariables, TypeAbstractions, TypeApplications #-}
 -- | Executable Wave 4B through Wave 8 examples for Proposal #378 quantifiers,
 -- certified Num numerals, nested foreach patterns, retained GADTs, @Pack,
--- explicit data heralds, polymorphic nested source domains, and HaskLib interop.
+-- explicit data heralds, polymorphic nested source domains, and dependent-base interop.
 module BookWave8Proposal378
   ( Peano (..)
   , plusPeano
@@ -22,23 +22,18 @@ module BookWave8Proposal378
   , assocProdTo
   , assocProdFrom
   , assocProdRoundTrip
-  , haskLibSecondLookup
+  , dependentBaseSecondLookup
   ) where
 
 import Control.Exception (ArithException (Underflow), throw)
+import Data.Fin.Dependent (Fin (FS, FZ))
 import Data.Kind (Type)
+import Data.Nat.Dependent (Nat (Succ, Zero))
 import Data.Proxy (Proxy (Proxy))
+import Data.Sigma.Dependent (second)
 import Data.Type.Equality ((:~:) (Refl))
+import Data.Vec.Dependent (Vec (VCons, VNil), lookupVec, packListVec, toListVec)
 import GHC.Exists
-import HaskLib
-  ( Fin (FS, FZ)
-  , Nat (Succ, Zero)
-  , Vec (VCons, VNil)
-  , lookupVec
-  , packListVec
-  , second
-  , toListVec
-  )
 
 -- | User-defined Peano natural with certified ground Num numeral promotion.
 data Peano = PZero | PSucc Peano
@@ -151,9 +146,9 @@ assocProdFrom (x, p) = assocPairL p x
 assocProdRoundTrip :: foreach (p :: ((a, b), c)) -> assocProdFrom (assocProdTo p) :~: p
 assocProdRoundTrip ((_, _), _) = Refl
 
--- | Project a packed vector with HaskLib.second and index into a 3-vector with lookupVec.
-haskLibSecondLookup :: [Char] -> (String, Char)
-haskLibSecondLookup xs =
+-- | Project a packed vector with Data.Sigma.Dependent.second and index into a 3-vector with lookupVec.
+dependentBaseSecondLookup :: [Char] -> (String, Char)
+dependentBaseSecondLookup xs =
   let packed = packListVec xs
       elems  = toListVec (second packed)
       sample = VCons 'p' (VCons 'q' (VCons 'r' VNil))

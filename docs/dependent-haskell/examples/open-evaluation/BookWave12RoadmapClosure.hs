@@ -41,26 +41,21 @@ module BookWave12RoadmapClosure
 
 import Data.Char (toUpper)
 import Data.Kind (Type)
+import Data.Nat.Dependent (Nat (Succ, Zero), natToInt)
 import Data.Proxy (Proxy (Proxy))
-import Data.Type.Equality ((:~:) (Refl))
-import GHC.Exts (Char (C#))
-import GHC.Sigma (first, second)
-import HaskLib
+import Data.Type.Equality.Dependent ((:~:) (Refl), Matchability)
+import Data.Vec.Dependent (Vec (VCons, VNil), mapVec, packListVec, toListVec)
+import GHC.Exists
   ( Exists
-  , Matchability
-  , Nat (Succ, Zero)
-  , Vec (VCons, VNil)
   , Witness (Witness)
   , mapExists
-  , mapVec
-  , natToInt
-  , packListVec
-  , toListVec
   , withEvidence
   , withExists
   , data Pack
   , type (/\) (MkCPair)
   )
+import GHC.Exts (Char (C#))
+import GHC.Sigma (first, second)
 import Numeric.Natural (Natural)
 import qualified PackedVecLibrary as PV
 import ParamColumns (Columns (Columns), cells, storedLength)

@@ -26,12 +26,71 @@ done
 
 docs=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 examples=$docs/examples
+dep_base=${DEPENDENT_BASE_DIR:-/home/tritlo/Code/dependent-base}
 out=$(mktemp -d)
 trap 'rm -rf -- "$out"' EXIT
 
-ghc=("$compiler" "-B$libdir" -v0 -package-env - -fexternal-interpreter)
+ghc_pkg="$(dirname "$compiler")/ghc-pkg"
+if [[ ! -x "$ghc_pkg" ]]; then
+    ghc_pkg="$(realpath "$libdir")/../bin/ghc-pkg"
+fi
+version=$("$compiler" "-B$libdir" --numeric-version)
+db_unit="dependent-base-0.1.0.0-inplace"
+db_lib="$out/dep-base"
+pkg_db="$out/pkg.conf.d"
+mkdir -p "$db_lib" "$pkg_db"
+for conf in "$libdir/package.conf.d"/*.conf; do
+    sed "s|\${pkgroot}|$libdir|g" "$conf" > "$pkg_db/$(basename "$conf")"
+done
+"$ghc_pkg" --package-db "$pkg_db" recache >/dev/null
+
+mapfile -t db_srcs < <(find "$dep_base/src" -name '*.hs' | sort)
+"$compiler" "-B$libdir" -v0 -package-env - -clear-package-db -package-db "$pkg_db" \
+    "$native_opt" "${native_interfaces[@]}" -dcore-lint -dstg-lint \
+    -XGHC2024 -this-unit-id "$db_unit" \
+    -package base -package ghc-experimental -package ghc-internal \
+    -dynamic-too -i "-i$dep_base/src" \
+    -odir "$db_lib" -hidir "$db_lib" \
+    --make -no-link "${db_srcs[@]}"
+
+mapfile -t db_objs < <(find "$db_lib" -name '*.o' | sort)
+ar rcs "$db_lib/libHS${db_unit}.a" "${db_objs[@]}"
+
+mapfile -t db_dyn_objs < <(find "$db_lib" -name '*.dyn_o' | sort)
+"$compiler" "-B$libdir" -v0 -package-env - -clear-package-db -package-db "$pkg_db" \
+    -shared -dynamic -no-hs-main \
+    -package base -package ghc-experimental -package ghc-internal \
+    "-optl-Wl,-soname,libHS${db_unit}-ghc${version}.so" \
+    "${db_dyn_objs[@]}" -o "$db_lib/libHS${db_unit}-ghc${version}.so"
+
+base_id=$("$ghc_pkg" --package-db "$pkg_db" field base id --simple-output | head -n1)
+exp_id=$("$ghc_pkg" --package-db "$pkg_db" field ghc-experimental id --simple-output | head -n1)
+int_id=$("$ghc_pkg" --package-db "$pkg_db" field ghc-internal id --simple-output | head -n1)
+exposed_mods=$(cd "$dep_base/src" && find Data Prelude -name '*.hs' ! -path '*/Internal.hs' | sed 's|/|.|g; s|\.hs$||' | sort | tr '\n' ' ')
+other_mods=$(cd "$dep_base/src" && find Data -path '*/Internal.hs' | sed 's|/|.|g; s|\.hs$||' | sort | tr '\n' ' ')
+
+cat <<EOF | "$ghc_pkg" --package-db "$pkg_db" register - >/dev/null
+name: dependent-base
+version: 0.1.0.0
+id: $db_unit
+key: $db_unit
+exposed: True
+exposed-modules: $exposed_mods
+hidden-modules: $other_mods
+import-dirs: $db_lib
+library-dirs: $db_lib
+dynamic-library-dirs: $db_lib
+hs-libraries: HS${db_unit}
+depends: $base_id $exp_id $int_id
+EOF
+
+export LD_LIBRARY_PATH="$db_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+ghc=("$compiler" "-B$libdir" -v0 -package-env - -fexternal-interpreter
+     -clear-package-db -package-db "$pkg_db"
+     -package base -package ghc-experimental -package ghc-internal -package dependent-base)
 flags=(-dcore-lint -dstg-lint -fwrite-ide-info -Werror=inaccessible-code
-     -i "-i$docs/hasklib" "-i$docs/hasklib-test" "-i$examples/packed-vector" "-i$examples/qualified-pi"
+     -i "-i$examples/packed-vector" "-i$examples/qualified-pi"
      "-i$examples/closed-evaluation" "-i$examples/open-evaluation"
      "-i$examples/erased-existentials" "-i$examples/r11-heq-pair")
 
@@ -61,7 +120,7 @@ mkdir "$out/nocode-closure"
 (
     cd "$out/nocode-closure"
     "${ghc[@]}" "$native_opt" -fno-code -fwrite-interface -fomit-interface-pragmas \
-        -fwrite-source-equations -dcore-lint -outputdir . -i "-i$docs/hasklib" "-i$examples/open-evaluation" \
+        -fwrite-source-equations -dcore-lint -outputdir . -i "-i$examples/open-evaluation" \
         --make -no-link "$examples/open-evaluation/BookParallel.hs" \
         "$examples/open-evaluation/BookContextPlug.hs" \
         "$examples/open-evaluation/BookEnvironment.hs"
@@ -70,13 +129,13 @@ mkdir "$out/nocode-closure"
     "$compiler" "-B$libdir" --show-iface BookContextPlug.hi | grep -Fq 'SourceTable T:plug'
     "$compiler" "-B$libdir" --show-iface BookEnvironment.hi | grep -Fq 'SourceTable T:lookupEnv'
     cat >NoCodeClosureClient.hs <<'HS'
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DependentTypes #-}
 module NoCodeClosureClient where
 import Data.Type.Equality ((:~:)(Refl))
 import qualified BookContextPlug as C
 import qualified BookEnvironment as E
 import qualified BookParallel as P
-import qualified HaskLib.Nat as N
+import qualified Data.Nat.Dependent as N
 
 plugged ::
     P.substSingleU

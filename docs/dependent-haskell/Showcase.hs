@@ -1,4 +1,5 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE ListTuplePuns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE EmptyDataDecls #-}
@@ -174,7 +175,19 @@ import qualified RowProof
 import qualified OrdinaryFamilyBranches
 import qualified PreludeFoldrProof
 import qualified PreludeZipProof
-import qualified HaskLib
+import qualified Data.List.Dependent as DepBase (size, takeSize)
+import qualified Data.List.Dependent.Properties as DepBase
+    ( lengthMapZip
+    , lengthReverse
+    , lengthTakeSize
+    , lengthZip
+    , lengthZipMap
+    , lengthZipWith
+    )
+import qualified Data.Nat.Dependent as DepBase (Nat (..), Size, eqSize)
+import qualified Data.Nat.Dependent.Properties as DepBase (eqSizeRefl)
+import qualified Data.Type.Equality.Dependent as DepBase (rewrite)
+import qualified Data.Vec.Dependent as DepBase (Vec (..), toListVec)
 import qualified BookCalculations as Book
 import qualified BookIsomorphism as BookIso
 import qualified BookIsoRefl
@@ -198,7 +211,6 @@ import qualified BookWave12RoadmapClosure as Wave12
 import qualified BookNaturals
 import qualified CastedConstructorGivens as TreeProof
 import qualified SumOfSizes
-import qualified Client as HaskLibClient
 import qualified PreludeZipWithLengthProof
 import qualified PreludeZipWithProof
 import qualified PreludeFilterLengthProof
@@ -285,6 +297,7 @@ Run from the repository root with this fork's matching compiler and libraries:
   mkdir -p _build/showcase
   _build/stage1/bin/ghc --make -O0 -fomit-interface-pragmas \
     -fno-write-if-simplified-core -dcore-lint -dstg-lint \
+    -i/home/tritlo/Code/dependent-base/src \
     -idocs/dependent-haskell/examples/packed-vector \
     -idocs/dependent-haskell/examples/qualified-pi \
     -idocs/dependent-haskell/examples/closed-evaluation \
@@ -332,18 +345,18 @@ observe :: (Show a) => String -> a -> IO ()
 observe label value = putStrLn (label ++ ": " ++ show value)
 
 -- | Subtracting any natural from zero gives zero.
-zeroMonus :: foreach (n :: HaskLib.Nat) -> BookNaturals.monus 'HaskLib.Zero n :~: 'HaskLib.Zero
-zeroMonus HaskLib.Zero     = Refl
-zeroMonus (HaskLib.Succ _) = Refl
+zeroMonus :: foreach (n :: DepBase.Nat) -> BookNaturals.monus 'DepBase.Zero n :~: 'DepBase.Zero
+zeroMonus DepBase.Zero     = Refl
+zeroMonus (DepBase.Succ _) = Refl
 
 -- | Raising the exponent by one multiplies by the same base.
-powSuccessor :: foreach (m :: HaskLib.Nat) -> foreach (n :: HaskLib.Nat)
-             -> BookNaturals.pow m ('HaskLib.Succ n)
+powSuccessor :: foreach (m :: DepBase.Nat) -> foreach (n :: DepBase.Nat)
+             -> BookNaturals.pow m ('DepBase.Succ n)
                 :~: BookNaturals.times m (BookNaturals.pow m n)
 powSuccessor _ _ = Refl
 
 -- | Multiplication by zero ignores its second argument.
-timesZeroLeft :: foreach (n :: HaskLib.Nat) -> BookNaturals.times 0 n :~: 0
+timesZeroLeft :: foreach (n :: DepBase.Nat) -> BookNaturals.times 0 n :~: 0
 timesZeroLeft _ = Refl
 
 -- | The ordinary lookup returns the closure identified by the evidence.
@@ -370,7 +383,7 @@ plugCong c p eq = case c of
 untypedCaptureAvoided ::
     BookParallel.substSingleU
         (BookParallel.ULam (BookParallel.UVar (BookParallel.FS BookParallel.FZ))
-            :: BookParallel.UTerm ('HaskLib.Succ ('HaskLib.Succ 'HaskLib.Zero)))
+            :: BookParallel.UTerm ('DepBase.Succ ('DepBase.Succ 'DepBase.Zero)))
         (BookParallel.UVar BookParallel.FZ)
     :~: BookParallel.ULam (BookParallel.UVar (BookParallel.FS BookParallel.FZ))
 untypedCaptureAvoided = Refl
@@ -400,7 +413,7 @@ data ParStep (m :: BookParallel.UTerm k) where
     MkParStep :: foreach (n :: BookParallel.UTerm k) -> BookParallel.Par m n -> ParStep m
 
 -- | Package a vanilla-return untyped lambda constructor inside a dependent Sigma pair.
-packLamPar :: forall n. foreach (b :: BookParallel.UTerm ('HaskLib.Succ n))
+packLamPar :: forall n. foreach (b :: BookParallel.UTerm ('DepBase.Succ n))
            -> (some (t' :: BookParallel.UTerm n) | BookParallel.Par ('BookParallel.ULam b) t')
 packLamPar b = Sigma.Pair (BookParallel.ULam b) (BookParallel.PLam (BookParallel.parRefl b))
 
@@ -412,7 +425,7 @@ pluggedSubstEquation ::
             ('BookParallel.UApp
                 ('BookParallel.UVar 'BookParallel.FZ)
                 ('BookParallel.UVar ('BookParallel.FS 'BookParallel.FZ))
-                :: BookParallel.UTerm ('HaskLib.Succ ('HaskLib.Succ ('HaskLib.Succ 'HaskLib.Zero)))))
+                :: BookParallel.UTerm ('DepBase.Succ ('DepBase.Succ ('DepBase.Succ 'DepBase.Zero)))))
         ('BookParallel.UVar 'BookParallel.FZ)
     :~: 'BookParallel.ULam
             ('BookParallel.UApp
@@ -439,12 +452,12 @@ explicitRevStep :: foreach (x :: a) -> foreach (xs :: [a])
 explicitRevStep _ _ = Refl
 
 -- | Return the measurement and certify that reversal preserves it.
-measureReverseLength :: forall a. foreach (measure :: [a] -> HaskLib.Size)
+measureReverseLength :: forall a. foreach (measure :: [a] -> DepBase.Size)
                      -> foreach (xs :: [a])
-                     -> measure xs :~: HaskLib.size xs
-                     -> (HaskLib.Size, HaskLib.size (reverse xs) :~: measure xs)
+                     -> measure xs :~: DepBase.size xs
+                     -> (DepBase.Size, DepBase.size (reverse xs) :~: measure xs)
 measureReverseLength measure xs agrees =
-    case agrees of Refl -> (measure xs, HaskLib.lengthReverse xs)
+    case agrees of Refl -> (measure xs, DepBase.lengthReverse xs)
 
 -- | Check that the demanded value raises its original error.
 expectError :: String -> String -> IO a -> IO ()
@@ -2078,22 +2091,22 @@ main = do
     putStrLn ("prove that folding a mapped list composes the step: " ++ PreludeFoldrProof.showFoldMap)
     reverseInput <- newIORef [error "forced reverse element", False] >>= readIORef
     observe "prove that reverse preserves list length"
-        (HaskLib.lengthReverse reverseInput, HaskLib.size (reverse reverseInput))
+        (DepBase.lengthReverse reverseInput, DepBase.size (reverse reverseInput))
     observe "pass size as a callback and check the reversed list length"
-        (case measureReverseLength HaskLib.size reverseInput Refl of
+        (case measureReverseLength DepBase.size reverseInput Refl of
              (n, Refl) -> n)
-    prefixBound <- newIORef (1 :: HaskLib.Nat) >>= readIORef
+    prefixBound <- newIORef (1 :: DepBase.Nat) >>= readIORef
     observe "apply the same partially applied addition to equal sizes"
-        (HaskLibClient.addUnder prefixBound prefixBound HaskLib.Zero)
-    count <- newIORef (3 :: HaskLib.Nat) >>= readIORef
+        (Wave3.addUnder prefixBound prefixBound DepBase.Zero)
+    count <- newIORef (3 :: DepBase.Nat) >>= readIORef
     observe "prove the length of a countdown"
         (Book.downFrom count, Book.lengthDownFrom count)
     observe "subtract a runtime natural from zero"
         (BookNaturals.monus 0 count, zeroMonus count)
     observe "raise three to the fourth power and prove the successor equation"
-        (HaskLib.eqSize (BookNaturals.pow count 4) 81, powSuccessor count 3)
+        (DepBase.eqSize (BookNaturals.pow count 4) 81, powSuccessor count 3)
     observe "multiply zero by an unevaluated argument and prove the open equation"
-        (HaskLib.eqSize (BookNaturals.times 0 (error "forced wildcard")) 0, timesZeroLeft count)
+        (DepBase.eqSize (BookNaturals.times 0 (error "forced wildcard")) 0, timesZeroLeft count)
     observe "check powers and truncated subtraction where they are defined"
         (BookNaturals.threePowFour, BookNaturals.threeMonusTwo, BookNaturals.twoMonusThree)
     observe "lift equality under successor and partially applied addition"
@@ -2130,7 +2143,7 @@ main = do
         secondMember = BookAnyWitness.There firstMember
     observe "round trip the same occurrence and predicate proof"
         (BookAnyWitnessProof.membershipRoundTrip @(BookAnyWitness.EvidenceBit False) secondMember)
-    let identity :: BookParallel.UTerm HaskLib.Zero
+    let identity :: BookParallel.UTerm DepBase.Zero
         identity = BookParallel.ULam (BookParallel.UVar BookParallel.FZ)
     application <- newIORef (BookParallel.UApp identity identity) >>= readIORef
     observe "prove reflexivity of parallel reduction under both lambdas"
@@ -2138,7 +2151,7 @@ main = do
            BookParallel.PApp (BookParallel.PLam BookParallel.PVar) (BookParallel.PLam BookParallel.PVar) -> True
            _ -> False)
     observe "sum two lists with the right-fold append proof"
-        (HaskLib.eqSize (BookFoldProof.checkedSum [1, 2] [3, 4]) 10)
+        (DepBase.eqSize (BookFoldProof.checkedSum [1, 2] [3, 4]) 10)
     case BookIso.sample of
         BookIso.MkIso to from fromTo toFrom ->
             observe "convert a Boolean to a bit and check both inverse laws"
@@ -2165,7 +2178,7 @@ main = do
     let arrow = Book.Arrow Book.Bottom (error "forced the arrow output")
     observe "take the domain of a join of function values"
         (Book.dom (Book.Join arrow Book.Bottom), Book.domJoin arrow Book.Bottom)
-    observe "compare a runtime size with itself" (HaskLib.eqSize prefixBound prefixBound, HaskLib.eqSizeRefl prefixBound)
+    observe "compare a runtime size with itself" (DepBase.eqSize prefixBound prefixBound, DepBase.eqSizeRefl prefixBound)
     let treeProof = TreeProof.Both TreeProof.Here (TreeProof.Both TreeProof.Here TreeProof.Here)
         relation = TreeProof.Branches TreeProof.Same (TreeProof.Branches TreeProof.Same TreeProof.Same)
     case TreeProof.preserve relation treeProof of
@@ -2175,7 +2188,7 @@ main = do
         Sigma.Pair k Refl -> observe "read the sum with its equality proof" k
     prefixInput <- newIORef (True : error "forced the list beyond the prefix") >>= readIORef
     observe "take a runtime-bounded prefix and prove its length"
-        (HaskLib.takeSize prefixBound prefixInput, HaskLib.lengthTakeSize prefixBound prefixInput)
+        (DepBase.takeSize prefixBound prefixInput, DepBase.lengthTakeSize prefixBound prefixInput)
     putStrLn ("prove that map distributes over append: "
               ++ PreludeMapAppendProof.showPreludeMapAppend)
     putStrLn ("prove that two maps compose on a finite list: "
@@ -2280,7 +2293,7 @@ main = do
     observe "zip two lists and prove their result length with an ordinary minimum"
         ( zip zipLeft zipRight
         , PreludeZipProof.firstPair
-        , HaskLib.lengthZip zipLeft zipRight
+        , DepBase.lengthZip zipLeft zipRight
         , PreludeZipWithLengthProof.shorterRight
         )
     zipCallback <- newIORef (&&) >>= readIORef
@@ -2288,18 +2301,18 @@ main = do
         unusedCallback = error "lengthZipWith forced its callback"
     observe "zipWith a runtime callback and prove the result length"
         ( zipWith zipCallback zipLeft zipRight
-        , HaskLib.lengthZipWith zipCallback zipLeft zipRight
-        , HaskLib.lengthZipWith unusedCallback zipLeft zipRight
+        , DepBase.lengthZipWith zipCallback zipLeft zipRight
+        , DepBase.lengthZipWith unusedCallback zipLeft zipRight
         )
     let mapPair :: (Bool, Bool) -> Bool
         mapPair = Prelude.uncurry unusedCallback
     observe "prove the length after mapping over zipped pairs"
-        (HaskLib.lengthMapZip mapPair zipLeft zipRight)
+        (DepBase.lengthMapZip mapPair zipLeft zipRight)
     beforeZip <- newIORef not >>= readIORef
     observe "prove map and zipWith length directly and with trans and congFirst"
         ( zipWith zipCallback (map beforeZip zipLeft) zipRight
-        , HaskLib.lengthZipMap beforeZip zipCallback zipLeft zipRight
-        , HaskLibClient.zipMapLaw beforeZip zipCallback zipLeft zipRight
+        , DepBase.lengthZipMap beforeZip zipCallback zipLeft zipRight
+        , Wave3.zipMapLaw beforeZip zipCallback zipLeft zipRight
         )
     observe "use the Prelude.zipWith cons equation with both tails unevaluated"
         PreludeZipWithProof.firstPair
@@ -2336,11 +2349,11 @@ main = do
                 (extendNestedStep runtimeOne runtimeZero ps
                     (Right (openZeroStep runtimeZero pz (Just True)))))
     observe "refine and transport a closed family across runtime index equalities" refinedStep
-    let unusedTarget :: BookParallel.UTerm 'HaskLib.Zero
+    let unusedTarget :: BookParallel.UTerm 'DepBase.Zero
         unusedTarget = error "unused target"
         lazyStep = case MkParStep unusedTarget (error "unused par") of
             MkParStep _ _ -> True
-        lamSigmaOk = case packLamPar @'HaskLib.Zero (BookParallel.UVar BookParallel.FZ) of
+        lamSigmaOk = case packLamPar @'DepBase.Zero (BookParallel.UVar BookParallel.FZ) of
             Sigma.Pair t step -> case t of
                 BookParallel.ULam _ -> case step of
                     BookParallel.PLam BookParallel.PVar -> True
@@ -2366,29 +2379,29 @@ main = do
         (Wave3.sameModulePlugBeta, Wave3.inlineHoleCong @('Wave3.ULam ('Wave3.UVar 'Wave3.FZ)))
     observe "compute function types from a term-to-Type large elimination and foldr laws"
         ( Wave3.applyValPred (\u v -> case (u, v) of ((), ()) -> ())
-        , HaskLibClient.checkFoldrAndMatchability
-            [HaskLib.Zero, HaskLib.Succ HaskLib.Zero]
-            [HaskLib.Succ HaskLib.Zero] )
+        , Wave3.checkFoldrAndMatchability
+            [DepBase.Zero, DepBase.Succ DepBase.Zero]
+            [DepBase.Succ DepBase.Zero] )
     observe "override invisible foreach binders and pass unadorned Type witnesses"
-        ( HaskLib.toListVec (Wave8.replicateInvis @(HaskLib.Succ (HaskLib.Succ HaskLib.Zero)) 'w')
+        ( DepBase.toListVec (Wave8.replicateInvis @(DepBase.Succ (DepBase.Succ DepBase.Zero)) 'w')
         , Wave8.theValue Int (42 :: Int)
         , Wave8.autoNumPlus )
     observe "match nested foreach patterns, catch-all cases, and constrained GADTs"
-        ( Wave8.classifyLen (HaskLib.Succ (HaskLib.Succ HaskLib.Zero))
-            (HaskLib.VCons 10 (HaskLib.VCons 32 HaskLib.VNil))
-        , HaskLib.toListVec (Wave8.fallbackVec (HaskLib.Succ HaskLib.Zero)
-            (HaskLib.VCons 7 HaskLib.VNil))
-        , Wave8.renderShowBox (Wave8.MkShowBox (HaskLib.Succ (HaskLib.Succ HaskLib.Zero))
-            (HaskLib.VCons True (HaskLib.VCons False HaskLib.VNil))) )
+        ( Wave8.classifyLen (DepBase.Succ (DepBase.Succ DepBase.Zero))
+            (DepBase.VCons 10 (DepBase.VCons 32 DepBase.VNil))
+        , DepBase.toListVec (Wave8.fallbackVec (DepBase.Succ DepBase.Zero)
+            (DepBase.VCons 7 DepBase.VNil))
+        , Wave8.renderShowBox (Wave8.MkShowBox (DepBase.Succ (DepBase.Succ DepBase.Zero))
+            (DepBase.VCons True (DepBase.VCons False DepBase.VNil))) )
     observe "eliminate @Pack existentials and disambiguate punned data heralds"
         ( Wave8.showAtPack Wave8.packSample
         , Wave8.proxyDataTag
         , Wave8.useDataHeraldTag )
-    observe "reassociate polymorphic nested domains and project HaskLib vectors"
+    observe "reassociate polymorphic nested domains and project dependent-base vectors"
         ( Wave8.assocProdRoundTrip ((True, 'k'), 2 :: Wave8.Peano)
-        , Wave8.haskLibSecondLookup "hi" )
+        , Wave8.dependentBaseSecondLookup "hi" )
     observe "inline DepFunTy unfoldings, promoted Char# and (# , #), and closed fib"
-        ( HaskLib.toListVec (Wave12.inlConsVec (HaskLib.Succ HaskLib.Zero) 9 (HaskLib.VCons 4 HaskLib.VNil))
+        ( DepBase.toListVec (Wave12.inlConsVec (DepBase.Succ DepBase.Zero) 9 (DepBase.VCons 4 DepBase.VNil))
         , (Wave12.primCharRefl, Wave12.unboxedSwapRefl)
         , (Wave12.sameModuleFibProof, Wave12.standaloneItemProof) )
     observe "match runtime Type witnesses, dependent record dot, and superclass selectors"
@@ -2396,7 +2409,7 @@ main = do
         , Wave12.checkDependentDot "ab"
         , Wave12.observeSubGate True )
     observe "apply T2T operator sections, GHC.Exists combinators, linear foreach, and local type"
-        ( (Wave12.congRightPlus @(HaskLib.Succ HaskLib.Zero) @(HaskLib.Succ HaskLib.Zero) (HaskLib.Succ HaskLib.Zero) Refl, Wave12.congRightCons @Char @'x' @'x' @'[ 'y' ] Refl)
+        ( (Wave12.congRightPlus @(DepBase.Succ DepBase.Zero) @(DepBase.Succ DepBase.Zero) (DepBase.Succ DepBase.Zero) Refl, Wave12.congRightCons @Char @'x' @'x' @'[ 'y' ] Refl)
         , Wave12.upperExistsVec
         , (Wave12.checkLinearAndRefute, Wave12.localTypeSynCheck) )
 
@@ -2595,7 +2608,7 @@ oneCellHead extent =
         count = 1 + extent
     in case sameNat count (S Z) of
          Just proof ->
-             HaskLib.rewrite proof (Just (safeHead (replicateNative count 'x')))
+             DepBase.rewrite proof (Just (safeHead (replicateNative count 'x')))
          Nothing -> Nothing
 
 -- | Return equality with the empty constructor after inspecting the vector.

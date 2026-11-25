@@ -1,11 +1,11 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DependentTypes #-}
 
 -- | Natural number operations used by the PLFH Induction chapter.
 module BookNaturals (monus, times, pow, threePowFour, threeMonusTwo, twoMonusThree,
                      Bin(..), inc) where
 
+import Data.Nat.Dependent (Nat(..), plus)
 import Data.Type.Equality ((:~:)(Refl))
-import HaskLib.Nat (Nat(..), plus)
 
 -- | Subtract natural numbers, stopping at zero.
 monus :: Nat -> Nat -> Nat
