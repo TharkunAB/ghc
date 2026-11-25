@@ -2974,7 +2974,7 @@ localSourceTableBinders tycl_decls binds sigs = do
              -> k >= 2 || any (not . is_ps_tyvar) args
              | (L _ (HsTyVar _ NotPromoted (L _ hd)), []) <- split_ty_apps expanded
              , is_ps_tycon hd
-             -> k >= 2 || is_ps_con_headed_ty res
+             -> k >= 2
              | otherwise -> False
 
     is_poly_nested_sig raw_ty = isJust $ do
