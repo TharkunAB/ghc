@@ -1079,7 +1079,9 @@ rnHsTyKi env (HsQualTy { hst_ctxt = lctxt, hst_body = tau })
                           , hst_body =  tau' }
                 , fvs1 `plusFN` fvs2) }
 
-rnHsTyKi env tv@(HsTyVar _ ip name) = rnHsTyVar lookupTypeOccRn env tv ip name
+rnHsTyKi env tv@(HsTyVar ann ip name)
+  | isDataHeraldTyVar ann = rnHsDataHeraldTyVar DataHeraldBare env tv name
+  | otherwise             = rnHsTyVar lookupTypeOccRn env tv ip name
 
 rnHsTyKi env ty@(HsOpTy _ ty1 tyop ty2)
   = setSrcSpan (getLocA tyop) $
@@ -1461,17 +1463,19 @@ throw an error accordingly.
 rnHsAppTy :: RnTyKiEnv -> (Bool, Bool) -> LHsType GhcPs -> LHsType GhcPs -> RnM (HsType GhcRn, FreeNames)
 rnHsAppTy env (eligible, has_sym) fun arg = do
   dependent <- xoptM LangExt.ExperimentalDependentTypes
-  let parsed_open = isOpenTypeOperandWith isRdrTyVar (isDataOcc . rdrNameOcc) arg
+  let parsed_var rdr = isRdrTyVar rdr || isVarOcc (rdrNameOcc rdr)
+      parsed_open = isOpenTypeOperandWith parsed_var (isDataOcc . rdrNameOcc) arg
       parsed_closed_con = isClosedConOperand (isDataOcc . rdrNameOcc) arg
   checked_arg <- if dependent && eligible && not parsed_open && not parsed_closed_con
-                   && maybe False (isRdrTyVar . unLoc) (hsTyGetAppHead_maybe fun)
-                   && (isOpenTypeOperandWith isRdrTyVar possible_constructor arg
+                   && maybe False (parsed_var . unLoc) (hsTyGetAppHead_maybe fun)
+                   && (isOpenTypeOperandWith parsed_var possible_constructor arg
                        || isClosedConOperand possible_constructor arg)
                  then Just <$> checkNoErrs (rnLHsTyKi env arg)
                  else pure Nothing
-  let (arg_ok, arg_sym) = case checked_arg of
+  let renamed_var n = isTyVarName n || (isVarName n && not (isExternalName n))
+      (arg_ok, arg_sym) = case checked_arg of
         Just (ty, _) ->
-          let sym = isOpenTypeOperandWith (isTyVarName . unwrapUserRdr) (isDataConName . unwrapUserRdr) ty
+          let sym = isOpenTypeOperandWith (renamed_var . unwrapUserRdr) (isDataConName . unwrapUserRdr) ty
               con = isClosedConOperand (isDataConName . unwrapUserRdr) ty
           in (sym || con, sym)
         Nothing -> (parsed_open || parsed_closed_con, parsed_open)
@@ -1506,8 +1510,10 @@ rnHsAppTy env (eligible, has_sym) fun arg = do
     sourceCallHead _ = False
 
     rn_operand :: LHsType GhcPs -> RnM (LHsType GhcRn, FreeNames)
-    rn_operand (L l tv@(HsTyVar _ NotPromoted name)) = setSrcSpanA l $ do
-      (tv', fvs) <- rnHsTyVar lookupTypeCallOperandRn env tv NotPromoted name
+    rn_operand (L l tv@(HsTyVar ann NotPromoted name)) = setSrcSpanA l $ do
+      (tv', fvs) <- if isDataHeraldTyVar ann
+                    then rnHsDataHeraldTyVar DataHeraldCallOperand env tv name
+                    else rnHsTyVar lookupTypeCallOperandRn env tv NotPromoted name
       return (L l tv', fvs)
     rn_operand (L l (HsParTy _ ty)) = do
       (ty', fvs) <- rn_operand ty
@@ -1537,8 +1543,10 @@ already uses the ordinary operand renamer in either case.
 
 -- | Carry the operand test to the head of a parenthesized application.
 rnLHsAppHead :: RnTyKiEnv -> (Bool, Bool) -> LHsType GhcPs -> RnM (LHsType GhcRn, FreeNames)
-rnLHsAppHead env (eligible, has_sym) (L l tv@(HsTyVar _ ip name)) = setSrcSpanA l $ do
-  (tv', fvs) <- rnHsTyVar (lookupTypeAppHeadRn (eligible && has_sym)) env tv ip name
+rnLHsAppHead env (eligible, has_sym) (L l tv@(HsTyVar ann ip name)) = setSrcSpanA l $ do
+  (tv', fvs) <- if isDataHeraldTyVar ann
+                then rnHsDataHeraldTyVar (DataHeraldAppHead (eligible && has_sym)) env tv name
+                else rnHsTyVar (lookupTypeAppHeadRn (eligible && has_sym)) env tv ip name
   return (L l tv', fvs)
 rnLHsAppHead env state (L l (HsAppTy _ fun arg)) = setSrcSpanA l $ do
   (ty', fvs) <- rnHsAppTy env state fun arg
@@ -1547,6 +1555,98 @@ rnLHsAppHead env state (L l (HsParTy _ ty)) = do
   (ty', fvs) <- rnLHsAppHead env state ty
   return (L l (HsParTy noAnn ty'), fvs)
 rnLHsAppHead env _ ty = rnLHsTyKi env ty
+
+-- | Syntactic role of an identifier inside an explicit @data@ herald in a type.
+-- See Note [Explicit data herald in type syntax].
+data DataHeraldPosition
+  = DataHeraldBare
+  | DataHeraldAppHead !Bool
+  | DataHeraldCallOperand
+
+-- | Test whether a parsed 'HsTyVar' was marked by an explicit @data@ herald.
+-- See Note [Explicit data herald in type syntax].
+isDataHeraldTyVar :: EpToken "'" -> Bool
+isDataHeraldTyVar (EpTok (EpaDelta _ (SameLine 1) _)) = True
+isDataHeraldTyVar _                                   = False
+
+-- | Rename an 'HsTyVar' inside an explicit @data@ herald, looking up in the
+-- data/value namespace before falling back to the type namespace.
+-- See Note [Explicit data herald in type syntax].
+rnHsDataHeraldTyVar :: DataHeraldPosition -> RnTyKiEnv -> HsType GhcPs
+                    -> LocatedN RdrName -> RnM (HsType GhcRn, FreeNames)
+rnHsDataHeraldTyVar pos env tv (L loc rdr_name) = do
+  gre <- lookupDataHeraldOcc pos rdr_name
+  let ip' = if isDataConName (greName gre) then IsPromoted else NotPromoted
+  rnHsTyVar (const (pure gre)) env tv ip' (L loc rdr_name)
+
+-- | Resolve an occurrence under @data@ in @dataName@/@varName@ first, falling
+-- back to @tcName@/@tvName@ when no value or data binding is in scope.
+-- See Note [Explicit data herald in type syntax].
+lookupDataHeraldOcc :: DataHeraldPosition -> RdrName -> RnM GlobalRdrElt
+lookupDataHeraldOcc pos rdr_name
+  | Just _ <- rdrNameExactName_maybe rdr_name
+  = lookupTypeOccRn rdr_name
+  | isDataOcc occ
+  = do { mb_data <- lookupOccRn_maybe rdr_name
+       ; case mb_data of
+           Just gre -> return gre
+           Nothing  -> fallback_type (setRdrNameSpace rdr_name tcName) }
+  | otherwise
+  = do { (gbl_env, lcl_env) <- getRdrEnvs
+       ; if elemLocalRdrEnv rdr_name lcl_env
+         then do { mb_lcl <- lookupOccRn_maybe rdr_name
+                 ; case mb_lcl of
+                     Just gre -> return gre
+                     Nothing  -> fallback_type ty_rdr }
+         else do { let gbl_vals = lookupGRE gbl_env
+                                    (LookupRdrName rdr_name (RelevantGREsFOS WantNormal))
+                 ; if null gbl_vals
+                   then fallback_type ty_rdr
+                   else setLocalRdrEnv (minusLocalRdrEnvList lcl_env [ty_occ]) $
+                        updGblEnv (\g -> g { tcg_rdr_env = delFromOccEnv (tcg_rdr_env g) ty_occ }) $
+                        fallback_type ty_rdr } }
+  where
+    occ    = rdrNameOcc rdr_name
+    ty_ns  = if isLexVarSym (occNameFS occ) then tcName else tvName
+    ty_rdr = setRdrNameSpace rdr_name ty_ns
+    ty_occ = rdrNameOcc ty_rdr
+
+    fallback_type rdr = case pos of
+      DataHeraldBare         -> lookupTypeOccRn rdr
+      DataHeraldAppHead open -> lookupTypeAppHeadRn open rdr
+      DataHeraldCallOperand  -> lookupTypeCallOperandRn rdr
+
+{- Note [Explicit data herald in type syntax]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC Proposal #378 §4.3.4 defines `data` as the namespace herald dual to `type`.
+Under `-XExplicitNamespaces` (implied by `-XDependentTypes`), `data <atype>` in
+type syntax and `data <aexp>` in expression and pattern syntax switch name
+resolution to the value and data-constructor namespaces first:
+
+* For a constructor or constructor operator (`True`, `Zero`, `T`, `(:)`), the
+  parser places the `RdrName` in `srcDataName` and records the `data`-herald
+  marker in `XTyVar`. `lookupDataHeraldOcc` looks up `srcDataName` first and
+  falls back to `tcName` only when no data constructor of that name is in scope.
+  Therefore `Proxy T` selects the type `T :: Type` for `data T = T`, while
+  `Proxy (data T)` selects the promoted constructor `'T :: T` without a tick.
+
+* For a variable or variable operator (`x`, `rev`, `(++)`), the parser places
+  the `RdrName` in `varName`. `lookupDataHeraldOcc` checks `LocalRdrEnv` at
+  `varName` first (selecting a term binder `x` even when an enclosing `forall x.`
+  is in scope), then resolves top-level or imported promoted functions in
+  `GlobalRdrEnv` while hiding competing `tvName` and `tcName` entries, and
+  finally falls back to `tvName` or `tcName` when `varName` is unbound.
+
+* List and boxed tuple syntax inside `data` (`data []`, `data [x]`, `data ()`,
+  `data (x, y)`) denotes promoted list and tuple constructors regardless of
+  `ListTuplePuns`. Explicit `:: kind` and `@kind` subtrees return to type
+  syntax, so `Proxy (data (T :: T))` checks `'T` at type `T`.
+
+* Because the programmer wrote an explicit `data` herald, `rnHsTyVar`,
+  `rnHsTyOp`, and `expr_to_type` suppress `-Wpun-uses`,
+  `-Wunticked-promoted-constructors`, and T2T pun-ambiguity errors inside the
+  guarded subtree.
+-}
 
 -- | Warn about written list and boxed tuple type syntax.
 warnPunnedTypeSyntax :: HsType GhcPs -> RnM ()
@@ -1578,7 +1678,10 @@ rnHsTyVar lookup_occ env tv ip (L loc rdr_name)
            -- Any type variable at the kind level is illegal without the use
            -- of PolyKinds (see #14710)
        ; gre <- lookup_occ rdr_name
-       ; unless (isPromoted ip) $ do
+       ; let from_data_herald = case tv of
+               HsTyVar ann _ _ -> isDataHeraldTyVar ann
+               _               -> False
+       ; unless (isPromoted ip || from_data_herald) $ do
            warnPunUse (L loc rdr_name) gre
            warnPunnedTyConSyntax (L loc rdr_name) (greName gre)
        ; checkNamedWildCard env (greName gre)
@@ -1608,22 +1711,28 @@ rnHsTyOp :: RnTyKiEnv -> HsType GhcPs -> LHsType GhcPs
          -> RnM (LHsType GhcRn, FreeNames)
 rnHsTyOp env overall_ty tyop
   | L l (HsTyVar ann prom (L loc op)) <- tyop
-  = do { let open_operands
+  = do { let parsed_var rdr = isRdrTyVar rdr || isVarOcc (rdrNameOcc rdr)
+             open_operands
                  | isLexVarSym (occNameFS (rdrNameOcc op))
                  , HsOpTy _ left _ right <- overall_ty
-                 = any (isOpenTypeOperandWith isRdrTyVar (isDataOcc . rdrNameOcc)) [left, right]
+                 = any (isOpenTypeOperandWith parsed_var (isDataOcc . rdrNameOcc)) [left, right]
                  | otherwise = False
-       ; opgre <- lookupTypeAppHeadRn open_operands op
-       ; unless (isPromoted prom) $
-           warnPunUse (L loc op) opgre
-       ; checkNamedWildCard env (greName opgre)
+             from_data_herald = isDataHeraldTyVar ann
+       ; opgre <- if from_data_herald
+                  then lookupDataHeraldOcc (DataHeraldAppHead open_operands) op
+                  else lookupTypeAppHeadRn open_operands op
        ; let opName = greName opgre
+             prom' | from_data_herald = if isDataConName opName then IsPromoted else NotPromoted
+                   | otherwise        = prom
+       ; unless (isPromoted prom' || from_data_herald) $
+           warnPunUse (L loc op) opgre
+       ; checkNamedWildCard env opName
        ; unlessXOptM LangExt.TypeOperators $
            if opName `hasKey` eqTyConKey -- See [eqTyCon (~) compatibility fallback] in GHC.Rename.Env
            then addDiagnostic TcRnTypeEqualityRequiresOperators
            else addErr $ TcRnIllegalTypeOperator (ppr overall_ty) op
-       ; checkPromotedDataConName env overall_ty Infix prom opName
-       ; let tyop' = L l (HsTyVar ann prom (L loc (WithUserRdr op opName)))
+       ; checkPromotedDataConName env overall_ty Infix prom' opName
+       ; let tyop' = L l (HsTyVar noAnn prom' (L loc (WithUserRdr op opName)))
        ; return (tyop', unitFN opName) }
   | otherwise
   = rnLHsTyKi env tyop
