@@ -19,7 +19,7 @@ import Control.Monad.Trans.Except (runExceptT, throwE)
 import GHC.Builtin.WiredIn.Types (liftedTypeKind, manyDataConTy, mkBoxedTupleTy,
                                   promotedTupleDataCon, tupleTyCon, unmatchableDataConTy)
 import GHC.Core.Class (classAllSelIds)
-import GHC.Core (CoreExpr, Expr(..))
+import GHC.Core (CoreExpr, Expr(..), mkApps)
 import GHC.Core.Coercion (mkSubCo)
 import GHC.Core.Reduction (Reduction(..))
 import GHC.Core.DataCon (DataCon, dataConName, dataConTyCon, dataConUserTyVars, dataConWorkId)
@@ -56,7 +56,7 @@ import GHC.Types.Name.Set (NameSet, emptyNameSet, isEmptyNameSet, mkNameSet, nam
 import GHC.Types.SourceFile (isHsBootOrSig)
 import GHC.Types.Var (TyVar, ForAllTyFlag(Invisible), VarBndr(..), isGlobalId, isTcTyVar, isTyVar,
                       tcTyVarDetails, tyVarKind, varName)
-import GHC.Types.Var.Env (emptyVarEnv, extendVarEnv, lookupVarEnv)
+import GHC.Types.Var.Env (VarEnv, emptyVarEnv, extendVarEnv, lookupVarEnv)
 import GHC.Core.OpenWhnf
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.ModInfo (hm_iface)
@@ -65,6 +65,7 @@ import GHC.Unit.Module (GenWithIsBoot(..), InstalledModule, IsBootInterface(..),
                         moduleUnit, toUnitId)
 import GHC.Unit.Module.Deps (imp_boot_mods)
 import GHC.Unit.Module.ModIface (ModIface, mi_decls, mi_hsc_src, mi_semantic_module)
+import GHC.Utils.Misc (equalLength)
 import GHC.Utils.Outputable (text)
 
 -- | An open application did not produce a checked source type.
@@ -84,6 +85,9 @@ data OpenArgument
   | OpenPair TyVar TyVar
   | OpenConstructor DataCon [CoreExpr] [OpenArgument]
 
+-- | Symbol table mapping rigid skolems to Core operand Ids and back to source types.
+data OperandState = OperandState !(VarEnv Id) !(VarEnv Type)
+
 -- | Apply the instantiated function to symbolic operands of the checked kind.
 observeOpenType :: Bool -- ^ Permit opaque ground types for a checked local definition.
                 -> Bool -- ^ Check known indexed constructor cases.
@@ -94,11 +98,11 @@ observeOpenType local_call indexed instantiated result_kind operands
       depth <- reductionDepth <$> lift getDynFlags
       let limit | indexed = min depth (mkIntWithInf 2048)
                 | otherwise = depth
-      ((_, origins), revArgs) <- lift $
-        foldM buildArgument ((emptyVarEnv, emptyVarEnv), []) args
+      (OperandState _ origins, revArgs) <- lift $
+        foldM buildArgument (OperandState emptyVarEnv emptyVarEnv, []) args
       let coreArgs = reverse revArgs
           expected = foldr (mkVisFunTyManyU . exprType) result_kind coreArgs
-          application = foldl App instantiated coreArgs
+          application = mkApps instantiated coreArgs
       if exprType instantiated `tcEqType` expected
          && exprType application `tcEqType` result_kind
         then do
@@ -106,17 +110,23 @@ observeOpenType local_call indexed instantiated result_kind operands
           uses <- lift (newTcRef emptyNameEnv)
           env <- lift getGblEnv
           let locals = tcg_local_open_defs env
-              record name first = lift (updTcRef uses $ \seen ->
-                extendNameEnv_C combine seen name (name, maybe emptyNameSet unitNameSet first))
+              record name first = lift $ updTcRef uses $ \seen ->
+                let !entry = (name, maybe emptyNameSet unitNameSet first)
+                    !seen' = extendNameEnv_C combine seen name entry
+                in seen'
               combine new@(name, kinds) old@(_, old_kinds)
                 | isEmptyNameSet kinds = new
                 | isEmptyNameSet old_kinds = old
-                | otherwise = (name, kinds `unionNameSet` old_kinds)
+                | otherwise =
+                    let !merged = kinds `unionNameSet` old_kinds
+                    in (name, merged)
               local v = case lookupNameEnv (tcg_local_open_owners env) (idName v) of
                 Nothing -> pure ()
                 Just owner -> record (idName owner) Nothing
-              remember v rhs = lift (updTcRef definitions (\cache -> extendVarEnv cache v rhs)) >>
-                               pure (Just rhs)
+              remember v rhs = do
+                lift $ updTcRef definitions $ \cache ->
+                  let !cache' = extendVarEnv cache v rhs in cache'
+                pure (Just rhs)
               obtain v first_type = do
                 known <- lift (readTcRef definitions)
                 result <- case lookupVarEnv known v of
@@ -169,13 +179,17 @@ observeOpenType local_call indexed instantiated result_kind operands
       = isLiftedTypeKind (typeKind (tyVarKind skolem))
       | otherwise = False
 
+    kindsMatch tys expected =
+      equalLength tys expected &&
+      and (zipWith (\t exp_k -> typeKind t `tcEqType` exp_k) tys expected)
+
     checkedOperand ty
       | (head_ty, args) <- splitAppTysNoView ty
       , Just skolem <- getTyVar_maybe head_ty, rigid skolem
       = OpenRigid skolem <$> checkArgs (tyVarKind skolem) args
       | Just (tuple, [ka, kb, a, b]) <- splitTyConApp_maybe ty
       , tuple == promotedTupleDataCon Boxed 2
-      , all (`tcEqType` liftedTypeKind) [ka, kb]
+      , ka `tcEqType` liftedTypeKind, kb `tcEqType` liftedTypeKind
       , Just x <- getTyVar_maybe a, rigid x
       , Just y <- getTyVar_maybe b, rigid y
       , tyVarKind x `tcEqType` ka, tyVarKind y `tcEqType` kb
@@ -186,17 +200,16 @@ observeOpenType local_call indexed instantiated result_kind operands
       , parent == dataConTyCon con
       , Just field_types <- openDataConFieldTypes con parameters
       , let (prefix, fields) = splitAt (length parameters) args
-      , length prefix == length parameters, length fields == length field_types
+      , equalLength prefix parameters
       , and (zipWith tcEqType prefix parameters)
-      , and (zipWith tcEqType (map typeKind fields) field_types)
+      , kindsMatch fields field_types
       = OpenConstructor con (map Type parameters) <$> traverse checkedOperand fields
       | indexed
       , Just (promoted, args) <- splitTyConApp_maybe ty
       , Just con <- isPromotedDataCon_maybe promoted
       , let (source, fields) = splitAt (length (dataConUserTyVars con)) args
       , Just (worker, proofs, field_types) <- openIndexedDataCon con (typeKind ty) source
-      , length fields == length field_types
-      , and (zipWith tcEqType (map typeKind fields) field_types)
+      , kindsMatch fields field_types
       = OpenConstructor con (map Type worker ++ map Coercion proofs) <$> traverse checkedOperand fields
       | local_call, isLiftedTypeKind (typeKind ty)
       , noFreeVarsOfType ty, isTyFamFree ty
@@ -211,32 +224,33 @@ observeOpenType local_call indexed instantiated result_kind operands
       guard (ma `tcEqType` unmatchableDataConTy && isManyTy mult && typeKind arg `tcEqType` domain)
       (:) <$> checkedOperand arg <*> checkArgs result rest
 
-    buildArgument (state, args) operand = do
-      (state', arg) <- buildOperand state operand
+    buildArgument (!state, args) operand = do
+      (!state', arg) <- buildOperand state operand
       pure (state', arg : args)
 
     buildOperand state (OpenRigid skolem args) = do
       (state', head_expr) <- symbolFor state skolem
       (final, revArgs) <- foldM buildArgument (state', []) args
-      pure (final, foldl App head_expr (reverse revArgs))
+      pure (final, mkApps head_expr (reverse revArgs))
     -- See Note [Ground type operands of local calls].
-    buildOperand (symbols, origins) (OpenGroundType ty) = do
+    buildOperand (OperandState symbols origins) (OpenGroundType ty) = do
       symbol <- freshSymbol liftedTypeKind
-      pure ((symbols, extendVarEnv origins symbol ty), Var symbol)
+      pure (OperandState symbols (extendVarEnv origins symbol ty), Var symbol)
     buildOperand state (OpenPair x y) = do
       (state', first) <- symbolFor state x
       (state'', second) <- symbolFor state' y
       pure (state'', mkCoreBoxedTuple [first, second])
     buildOperand state (OpenConstructor con erased fields) = do
       (state', revFields) <- foldM buildArgument (state, []) fields
-      pure (state', foldl App (Var (dataConWorkId con)) (erased ++ reverse revFields))
+      pure (state', mkApps (Var (dataConWorkId con)) (erased ++ reverse revFields))
 
-    symbolFor state@(symbols, origins) skolem =
+    symbolFor state@(OperandState symbols origins) skolem =
       case lookupVarEnv symbols skolem of
         Just symbol -> pure (state, Var symbol)
         Nothing -> do
           symbol <- freshSymbol (tyVarKind skolem)
-          pure ((extendVarEnv symbols skolem symbol, extendVarEnv origins symbol (mkTyVarTy skolem)),
+          pure (OperandState (extendVarEnv symbols skolem symbol)
+                             (extendVarEnv origins symbol (mkTyVarTy skolem)),
                 Var symbol)
 
     freshSymbol kind = do
@@ -272,7 +286,7 @@ openPairKind = mkBoxedTupleTy [liftedTypeKind, liftedTypeKind]
 instantiateOpenTypeFunction :: Bool -> Id -> Maybe (CoreExpr, [Kind], Kind)
 instantiateOpenTypeFunction local_families function
   | not (null binders), all liftedUniversal binders
-  = do let instantiated = foldl (\expr _ -> App expr (Type liftedTypeKind)) (Var function) binders
+  = do let instantiated = foldl' (\expr _ -> App expr (Type liftedTypeKind)) (Var function) binders
        (checked, (domains, result)) <- case termKinds body of
          Just kinds -> Just (instantiated, kinds)
          Nothing | local_families -> do
@@ -286,32 +300,27 @@ instantiateOpenTypeFunction local_families function
   | otherwise = Nothing
   where
     (binders, body) = splitForAllForAllTyBinders (idType function)
-    bound ty = any (\(_, Bndr v _) -> ty `tcEqType` mkTyVarTy v) binders
-    domainKind ty
+    binder_tys = [mkTyVarTy v | (_, Bndr v _) <- binders]
+    bound ty = any (tcEqType ty) binder_tys
+    domainKind allow_tuples ty
       | bound ty = Just liftedTypeKind
-      | Just (tuple, [a,b]) <- splitTyConApp_maybe ty
+      | Just (tuple, [a, b]) <- splitTyConApp_maybe ty
       , tuple == tupleTyCon Boxed 2
       , bound a, bound b = Just openPairKind
       | Just (con, parameters) <- splitTyConApp_maybe ty
       , isBoxedDataTyCon con
+      , allow_tuples || not (isTupleTyCon con)
       , all bound parameters
-      = Just (mkTyConApp con (map (const liftedTypeKind) parameters))
+      = Just (mkTyConApp con (liftedTypeKind <$ parameters))
       | otherwise = Nothing
     termKinds ty
       | Just (FTF_T_T, matchability, multiplicity, domain, result) <- splitFunTy_maybe ty
       , matchability `tcEqType` unmatchableDataConTy
       , isManyTy multiplicity = do
-          input <- domainKind domain
+          input <- domainKind True domain
           (inputs, output) <- termKinds result
           pure (input : inputs, output)
-      | bound ty = Just ([], liftedTypeKind)
-      | Just (tuple, [a,b]) <- splitTyConApp_maybe ty
-      , tuple == tupleTyCon Boxed 2
-      , bound a, bound b = Just ([], openPairKind)
-      | Just (con, parameters) <- splitTyConApp_maybe ty
-      , isBoxedDataTyCon con, not (isTupleTyCon con), all bound parameters
-      = Just ([], mkTyConApp con (map (const liftedTypeKind) parameters))
-      | otherwise = Nothing
+      | otherwise = ([],) <$> domainKind False ty
 
 -- | Instantiate a selected binary method using the kinds of both operands.
 instantiateOpenMethod :: Id -> Kind -> Kind -> Maybe (CoreExpr, Kind)
@@ -323,7 +332,7 @@ instantiateOpenMethod worker left right = do
     subst <- tcMatchTys [callback, receiver] [left, right]
     args <- traverse (\(_, Bndr v _) -> lookupTyVar subst v) binders
     guard (all (isLiftedTypeKind . typeKind) args)
-    let method = foldl App (Var worker) (map Type args)
+    let method = mkApps (Var worker) (map Type args)
         result_kind = substTy subst result
     guard (exprType method `tcEqType` mkVisFunTyManyU left (mkVisFunTyManyU right result_kind))
     pure (method, result_kind)
@@ -365,7 +374,7 @@ readOpenMethodWorker dfun selector = do
         | Just (cls, [domain]) <- getClassPredTys_maybe (idType dfun)
         , let selectors = classAllSelIds cls
         , [parameter : fields] <- [ops | HsUnfold _ (IfDFunUnfold [] ops) <- items]
-        , length selectors == length fields
+        , equalLength selectors fields
         , Just field@IfaceExt{} <- lookup selector (zip selectors fields)
         -> do
           args <- readOpenIfaceExpr mod (traverse tcIfaceExpr [parameter, field])

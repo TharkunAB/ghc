@@ -2,7 +2,7 @@
 {-# LANGUAGE MultiWayIf #-}
 
 {-# OPTIONS_GHC -fprof-auto-top #-}
-{-# OPTIONS_GHC -Wwarn=x-internalPprMessages #-}
+{-# OPTIONS_GHC -Wno-x-internalPprMessages #-}
 
 -------------------------------------------------------------------------------
 -- | Aspects of GHC.Driver.Main dealing with running particular passes.
@@ -1025,41 +1025,36 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                             null (tcg_rules tc_result) &&
                             not (gopt Opt_Hpc dflags)
         checked_tc <- case mb_desugar of
-          Just guts | let has_mappers = not (null (finalCoreMappers (mg_binds guts)))
-                    , has_mappers || has_early_lookups || has_local_eval_plugins || (want_closures && null (mg_rules guts)) -> do
-            let added_plugins = added_plugins0
-                can_publish_closures = want_closures && no_late_plugins && null (mg_rules guts)
-                retained = hasNativeDependentModuleBody (mg_binds guts) [] (mg_tcs guts)
-            if not (has_mappers || has_early_lookups || has_local_eval_plugins || can_publish_closures)
-              then pure tc_result
-              else do
-                non_retained_opt <- if not retained && (has_early_lookups || has_local_eval_plugins || (has_mappers && null (mg_rules guts)) || can_publish_closures)
-                  then Just <$> hscSimplifyWithPluginMutations mb_mut_ref added_plugins guts
-                  else pure Nothing
-                retained_opt <- if retained && no_late_plugins && ((has_mappers && null (mg_rules guts)) || has_early_lookups || has_local_eval_plugins || can_publish_closures)
-                  then do
-                    hsc_env_p <- if null added_plugins
-                      then pure hsc_env
-                      else liftIO $ initializePlugins $
-                             hscUpdateFlags (\df -> foldr addPluginModuleName df added_plugins) hsc_env
-                    liftIO $ validateRetainedLookupBodies mb_mut_ref hsc_env_p guts
-                  else pure Nothing
+          Just guts
+            | let no_rules = null (mg_rules guts)
+                  can_publish_closures = want_closures && no_late_plugins && no_rules
+                  has_mappers = not (null (finalCoreMappers (mg_binds guts)))
+            , has_mappers || has_early_lookups || has_local_eval_plugins || can_publish_closures -> do
+                let retained = hasNativeDependentModuleBody (mg_binds guts) [] (mg_tcs guts)
+                    need_opt = has_early_lookups || has_local_eval_plugins ||
+                               (has_mappers && no_rules) || can_publish_closures
+                active_opt <- if not need_opt
+                  then pure Nothing
+                  else if not retained
+                    then Just <$> hscSimplifyWithPluginMutations mb_mut_ref added_plugins0 guts
+                    else if no_late_plugins
+                      then do
+                        hsc_env_p <- if null added_plugins0
+                          then pure hsc_env
+                          else liftIO $ initializePlugins $
+                                 hscUpdateFlags (\df -> foldr addPluginModuleName df added_plugins0) hsc_env
+                        liftIO $ validateRetainedLookupBodies mb_mut_ref hsc_env_p guts
+                      else pure Nothing
                 mutated_names <- read_plugin_mutations
                 checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
                   no_late_plugins local_eval_terms (mg_binds guts) mutated_names
-                let active_opt = if retained then retained_opt else non_retained_opt
                 when has_early_lookups $
                   checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
                     (mg_rules guts ++ maybe [] mg_rules active_opt)
                     (mg_binds guts) (mg_binds <$> active_opt) Nothing
-                checked_mappers_tc <- if has_mappers
-                  then do
-                    let optimized
-                          | not (null (mg_rules guts)) = Nothing
-                          | retained = retained_opt
-                          | otherwise = non_retained_opt
-                    pure (validateSimpleSourceTables guts optimized tc_result)
-                  else pure tc_result
+                let checked_mappers_tc
+                      | has_mappers = validateSimpleSourceTables guts (if no_rules then active_opt else Nothing) tc_result
+                      | otherwise   = tc_result
                 case active_opt of
                   Just opt_guts | can_publish_closures, null (mg_rules opt_guts) -> do
                     let exported_names = availsToNameSet (tcg_exports checked_mappers_tc)
@@ -1188,22 +1183,21 @@ checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts
   | null local_eval_terms = pure ()
   | no_late_plugins && isEmptyNameSet mutated_names = pure ()
   | otherwise = do
-      let bind_map = mkNameEnv [ (idName b, rhs) | (b, rhs) <- flattenBinds desugared_binds ]
-          reachable :: NameSet -> [Name] -> NameSet
-          reachable seen [] = seen
-          reachable seen (n : ns)
-            | n `elemNameSet` seen = reachable seen ns
-            | Just rhs <- lookupNameEnv bind_map n
-            = let deps = [ idName v
-                         | v <- exprSomeFreeVarsList isId rhs
-                         , idName v `elemNameEnv` bind_map ]
-              in reachable (extendNameSet seen n) (deps ++ ns)
-            | otherwise = reachable (extendNameSet seen n) ns
-          invalidated owner_nm =
-            not no_late_plugins ||
-            any (`elemNameSet` mutated_names)
-                (nameSetElemsStable (reachable emptyNameSet [owner_nm]))
-          bad_owners = filter invalidated local_eval_terms
+      let bad_owners
+            | not no_late_plugins = local_eval_terms
+            | otherwise =
+                let bind_map = mkNameEnv [ (idName b, rhs) | (b, rhs) <- flattenBinds desugared_binds ]
+                    reachesMutated !_ [] = False
+                    reachesMutated !seen (n : ns)
+                      | n `elemNameSet` mutated_names = True
+                      | n `elemNameSet` seen = reachesMutated seen ns
+                      | Just rhs <- lookupNameEnv bind_map n =
+                          let deps = [ idName v
+                                     | v <- exprSomeFreeVarsList isId rhs
+                                     , idName v `elemNameEnv` bind_map ]
+                          in reachesMutated (extendNameSet seen n) (deps ++ ns)
+                      | otherwise = reachesMutated (extendNameSet seen n) ns
+                in filter (reachesMutated emptyNameSet . (: [])) local_eval_terms
       unless (null bad_owners) $ do
         (msgs, _) <- liftIO $
           initTc NoTcMPlugins hsc_env hsc_src False (tcg_mod tc_result) (tcg_top_loc tc_result) $
@@ -1794,6 +1788,12 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
                     $ hscUpdateFlags (\dflags -> foldr addPluginModuleName dflags plugins)
                       hsc_env
     liftIO $ do
+      let throw_driver env loc message =
+            throwOneError (initSourceErrorContext (hsc_dflags env)) $
+              mkPlainErrorMsgEnvelope loc (GhcDriverMessage message)
+          binder_loc module_loc b =
+            let src = nameSrcSpan (idName b)
+            in if isGoodSrcSpan src then src else module_loc
       native <- checkNativeDependentModule hsc_env_with_plugins (mg_binds ds_result) (mg_rules ds_result) (mg_tcs ds_result)
       -- See Note [Private dictionary programs].
       if native && hasScopedDictionaryProgram (mg_binds ds_result)
@@ -1803,25 +1803,21 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
               env = hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) hsc_env_with_plugins
               finish = endScopedDictionaryPassIO (hsc_logger env)
                 . initEndPassConfig (hsc_dflags env) (interactiveInScope (hsc_IC env)) alwaysQualify
-          unless (null rules && all (null . idCoreRules . fst) (flattenBinds binds)) $
+              module_loc = mg_loc ds_result
+          unless (null rules && all (all (null . idCoreRules) . bindersOf) binds) $
             throwGhcExceptionIO (Sorry "Private dependent dictionaries do not support Core rules.")
           finish CoreDesugar binds rules
           let simplified = simpleOptNativeProgram binds
           finish CoreDesugarOpt simplified rules
           let result = ds_result { mg_binds = simplified }
               report_bad level binds' =
-                let report loc message =
-                      throwOneError (initSourceErrorContext (hsc_dflags env)) $
-                        mkPlainErrorMsgEnvelope loc (GhcDriverMessage message)
-                    module_loc = mg_loc ds_result
-                in case [b | (b, rhs) <- flattenBinds binds'
-                           , not (supportsScopedDictionaryCore [NonRec b rhs]
-                                  || not (hasScopedDictionaryProgram [NonRec b rhs]))] of
-                     b : _ ->
-                       let src = nameSrcSpan (idName b)
-                       in report (if isGoodSrcSpan src then src else module_loc)
-                                 (DriverUnsupportedRetainedBinding (Just (getOccName b)) level)
-                     [] -> report module_loc (DriverUnsupportedRetainedBinding Nothing level)
+                case [b | (b, rhs) <- flattenBinds binds'
+                        , hasScopedDictionaryProgram [NonRec b rhs]
+                        , not (supportsScopedDictionaryCore [NonRec b rhs])] of
+                  b : _ -> throw_driver env (binder_loc module_loc b)
+                             (DriverUnsupportedRetainedBinding (Just (getOccName b)) level)
+                  []    -> throw_driver env module_loc
+                             (DriverUnsupportedRetainedBinding Nothing level)
           optimized <- case nativeOptLevel (hsc_dflags env) of
             Just _ -> core2coreRetainedWithPluginMutations mb_mut_ref env result
             Nothing
@@ -1831,7 +1827,7 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
             finish CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
             when (hasScopedDictionaryProgram (mg_binds optimized)
                   && not (supportsScopedDictionaryCore (mg_binds optimized))) $
-              report_bad (maybe 0 id (nativeOptLevel (hsc_dflags env))) (mg_binds optimized)
+              report_bad (fromMaybe 0 (nativeOptLevel (hsc_dflags env))) (mg_binds optimized)
           return optimized
       else if native
         then do
@@ -1839,20 +1835,17 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
               name_ppr_ctx = alwaysQualify
               binds = mg_binds ds_result
               rules = mg_rules ds_result
-              report loc message =
-                throwOneError (initSourceErrorContext (hsc_dflags lint_env)) $
-                  mkPlainErrorMsgEnvelope loc (GhcDriverMessage message)
+              report = throw_driver lint_env
               module_loc = mg_loc ds_result
               check_binds_supported pred_fn level candidate_binds =
                 unless (pred_fn candidate_binds) $
                   case [b | (b, rhs) <- flattenBinds candidate_binds,
                             not (pred_fn [NonRec b rhs])] of
                     b : _ -> do
-                      let src = nameSrcSpan (idName b)
-                          message = case filter (not . supportsLocalUserRule b) (idCoreRules b) of
+                      let message = case filter (not . supportsLocalUserRule b) (idCoreRules b) of
                             rule : _ -> DriverUnsupportedRetainedRule (ru_name rule) level
                             [] -> DriverUnsupportedRetainedBinding (Just (getOccName b)) level
-                      report (if isGoodSrcSpan src then src else module_loc) message
+                      report (binder_loc module_loc b) message
                     [] -> report module_loc (DriverUnsupportedRetainedBinding Nothing level)
           -- Desugaring can bind a GADT's existential with a type let.
           -- See Note [Substituting type-lets] in GHC.Core.Lint.SubstTypeLets.
@@ -2286,10 +2279,11 @@ hscLoadSameModuleClosedBcos hsc_env srcspan tycons binds = do
   if null missing_tycons && null missing_binds
     then pure ([], emptyUDFM)
     else do
-      let missing_names = map (idName . fst) missing_binds
-          localise_id v
-            | idName v `elem` missing_names = mkExportedVanillaId (idName v) (idType v)
-            | otherwise                     = v
+      let localised_ids = mkNameEnv
+            [ (nm, mkExportedVanillaId nm (idType v))
+            | (v, _) <- missing_binds
+            , let nm = idName v ]
+          localise_id v = fromMaybe v (lookupNameEnv localised_ids (idName v))
           localise_expr (GHC.Core.Var v)    = GHC.Core.Var (localise_id v)
           localise_expr e@Lit{}             = e
           localise_expr (App f a)           = App (localise_expr f) (localise_expr a)
@@ -2308,15 +2302,19 @@ hscLoadSameModuleClosedBcos hsc_env srcspan tycons binds = do
             Unpack tv pv (localise_expr s) (localise_expr body)
           localise_expr e@Type{}            = e
           localise_expr e@Coercion{}        = e
-          localised_binds = [ (localise_id v, localise_expr rhs) | (v, rhs) <- missing_binds ]
-          native = any (hasNativeDependentExpr . snd) localised_binds
+          localised_binds =
+            [ (localise_id v, rhs', is_native)
+            | (v, rhs) <- missing_binds
+            , let rhs' = localise_expr rhs
+                  !is_native = hasNativeDependentExpr rhs' ]
+          native = any (\(_, _, is_nat) -> is_nat) localised_binds
           dflags = nativeCodeGenFlags native (hsc_dflags hsc_env)
           logger = hsc_logger hsc_env
           ic = hsc_IC hsc_env
           unit_env = hsc_unit_env hsc_env
           simplify_expr_opts = initSimplifyExprOpts dflags ic
-      simplified <- forM localised_binds $ \(v, rhs) -> do
-        simpl_rhs <- if hasNativeDependentExpr rhs
+      simplified <- forM localised_binds $ \(v, rhs, is_native) -> do
+        simpl_rhs <- if is_native
           then pure (if hasExistentialExpr rhs then rhs else simpleOptNativeExpr rhs)
           else simplifyExpr logger (ue_eps unit_env) simplify_expr_opts rhs
         pure (v, simpl_rhs)
