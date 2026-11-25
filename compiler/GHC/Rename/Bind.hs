@@ -383,18 +383,25 @@ addLocalSigBindDeps
   -> [LSig GhcRn]
   -> [(LHsBind GhcRn, [Name], Uses)]
   -> [(LHsBind GhcRn, [Name], Uses)]
-addLocalSigBindDeps bound_names sigs = map add_deps
+addLocalSigBindDeps _ [] binds = binds
+addLocalSigBindDeps bound_names sigs binds
+  | isEmptyNameSet bound_names || isEmptyNameEnv sig_env = binds
+  | otherwise = map add_deps binds
   where
     sig_env = mkHsSigEnv get_sig sigs
     get_sig (L _ (TypeSig _ _ names sig_ty)) =
-      Just (names, intersectNameSet bound_names (mkNameSet (collect_names sig_ty)))
+      let deps = intersectNameSet bound_names (mkNameSet (collect_names sig_ty []))
+      in if isEmptyNameSet deps then Nothing else Just (names, deps)
     get_sig _ = Nothing
 
-    collect_names :: Data a => a -> [Name]
-    collect_names x
-      | Just (WithUserRdr _ nm) <- (cast x :: Maybe (WithUserRdr Name)) = [nm]
-      | Just nm <- (cast x :: Maybe Name) = [nm]
-      | otherwise = concat (gmapQ collect_names x)
+    collect_names :: Data a => a -> [Name] -> [Name]
+    collect_names x acc
+      | Just (WithUserRdr _ nm) <- (cast x :: Maybe (WithUserRdr Name)) = nm : acc
+      | Just nm <- (cast x :: Maybe Name) = nm : acc
+      | Just _  <- (cast x :: Maybe SrcSpanAnnA) = acc
+      | Just _  <- (cast x :: Maybe SrcSpan) = acc
+      | Just _  <- (cast x :: Maybe RdrName) = acc
+      | otherwise = foldr ($) acc (gmapQ collect_names x)
 
     add_deps entry@(L loc bind, defs, uses)
       | isEmptyNameSet extra = entry
