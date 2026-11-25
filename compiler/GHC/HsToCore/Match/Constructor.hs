@@ -24,8 +24,10 @@ import GHC.Core.ConLike
 import GHC.Core.Coercion ( MCoercion(..), coercionLKind, mkUnbranchedAxInstCo )
 import GHC.Core.DataCon ( DataCon, dataConRepType, dataConTyCon, dataConTag
                        , dataConRepArgBinders, dataConRepArity, dataConContextFieldCount
-                       , dataConHasRetainedResult, dataConSourceArity )
-import GHC.Core.Type ( coreFullView, isManyTy, isNativeIndexType, mkTyConApp, piResultTys, splitInvisPiTys )
+                       , dataConHasRetainedResult, dataConSourceArity
+                       , dataConUnivTyVars, dataConUserTyVarBinders )
+import GHC.Core.Type ( binderVar, coreFullView, isManyTy, isNativeIndexType
+                     , piResultTys, splitInvisPiTys, substTyVar )
 import GHC.Core.TyCon ( isNewTyCon, newTyConCo, tyConDataCons )
 import GHC.Core.FVs ( exprFreeVars )
 import qualified GHC.Core.Subst as Subst
@@ -42,7 +44,7 @@ import GHC.Core.Utils ( applyTypeToArgs )
 import GHC.Core.Make ( mkCoreLets )
 import GHC.Utils.Misc
 import GHC.Types.Id
-import GHC.Types.Var ( Var, isCoVar, isTyVar, updateVarType, varType )
+import GHC.Types.Var ( isCoVar, isTyVar, updateVarType, varType )
 import GHC.Types.Var.Env ( mkInScopeSetList )
 import GHC.Types.Var.Set ( mapVarSet, nonDetStrictFoldVarSet )
 import GHC.Types.Name.Env
@@ -131,7 +133,7 @@ matchConFamily (var :| vars) ty groups@(group1 :| other_groups)
   = if isManyTy (matchIdMult var) && not (matchInLinearPackage var)
     then do { results <- mapM match_retained_row (join groups)
             ; return (foldr1 combineMatchResults results) }
-    else putSrcSpanDsA (getLoc (eqn_pat (NE.head rows))) $
+    else putSrcSpanDsA (eqnPatLoc (NE.head rows)) $
            failWithDs DsLinearRetainedPackageRows
 
   | otherwise
@@ -348,6 +350,11 @@ Ordinary GADT constructors keep the existing shared-field path: the native
 index-domain predicate excludes their existentials and equality constraints.
 -}
 
+-- | Extract the source location of the leading pattern in an 'EquationInfoNE'.
+eqnPatLoc :: EquationInfoNE -> SrcSpanAnnA
+eqnPatLoc (EqnMatch { eqn_pat = p }) = getLoc p
+eqnPatLoc _                          = noAnn
+
 matchOneConLike :: MatchId
                 -> [MatchId]
                 -> Type
@@ -356,10 +363,15 @@ matchOneConLike :: MatchId
 matchOneConLike scrut vars ty (eqn1 :| eqns)   -- All eqns for a single constructor
   = do  { retained_vars <- case con1 of
             RealDataCon con | not (null (dataConRepArgBinders con)) ->
-              putSrcSpanDsA (getLoc (eqn_pat eqn1)) $
+              putSrcSpanDsA (eqnPatLoc eqn1) $
                   case args1 of
                     PrefixCon _ pats ->
-                      let (_, _, fields) = splitInvisPiTys (piResultTys (dataConRepType con) arg_tys)
+                      let rep_ty_args
+                            | dataConHasRetainedResult con = arg_tys
+                            | let subst = zipTvSubst (dataConUnivTyVars con ++ ex_tvs)
+                                                     (arg_tys ++ mkTyVarTys tvs1)
+                            = [substTyVar subst (binderVar b) | b <- dataConUserTyVarBinders con]
+                          (_, _, fields) = splitInvisPiTys (piResultTys (dataConRepType con) rep_ty_args)
                       in Just <$> retained_fields fields pats
                     _ -> package_error
             _ -> return Nothing

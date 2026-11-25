@@ -53,8 +53,10 @@ import {-# SOURCE #-} GHC.Rename.Splice( rnSpliceType, rnSpliceTypeWith,
 
 import GHC.Core.TyCo.FVs ( tyCoVarsOfTypeList )
 import GHC.Core.TyCon    ( isKindName )
+import GHC.Driver.DynFlags ( baseUnitId, getDynFlags )
 import GHC.Driver.Flags
 import GHC.Data.List.SetOps (findDupsEq)
+import GHC.Iface.Env     ( lookupOrig )
 import GHC.Parser.PostProcess (setRdrNameSpace)
 
 import GHC.Hs
@@ -88,7 +90,8 @@ import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs
 import GHC.Builtin.WiredIn.Types( listTyConName, oneDataConName )
 
-import GHC.Unit.Module ( getModule )
+import GHC.Unit.Module ( getModule, mkModule, mkModuleName )
+import GHC.Unit.Types  ( GenUnit(RealUnit), Definite(Definite) )
 
 import GHC.Utils.Lexeme (isLexVarSym)
 import GHC.Utils.Misc
@@ -287,9 +290,18 @@ rnWithRetainedAliases bound_names partial_error free_vars syntax action
               ; case level of
                   Comp -> return ()
                   _ -> failWithTc $ TcRnRetainedQuantificationError RetainedStaging
+              ; partial_sigs <- xoptM LangExt.PartialTypeSignatures
               ; (wildcards, _) <- partition_nwcs free_vars
-              ; case retainedWildcardSpan syntax `mplus`
-                     (getLocA <$> listToMaybe wildcards) of
+              ; let allow_partial = case partial_error of
+                      RetainedPartialSignature -> not (hasParsedRetainedPi syntax)
+                      _ -> False
+                    bad_anon
+                      | allow_partial && partial_sigs = Nothing
+                      | otherwise = retainedWildcardSpan syntax
+                    bad_named
+                      | allow_partial && named_wildcards = Nothing
+                      | otherwise = getLocA <$> listToMaybe wildcards
+              ; case bad_anon `mplus` bad_named of
                   Nothing -> return ()
                   Just loc -> setSrcSpan loc $
                     failWithTc $ TcRnRetainedQuantificationError partial_error }
@@ -1242,8 +1254,40 @@ rnHsTyKi env (XHsType (HsTypeLambdaCheck binders body helper)) = do
   pure (XHsType (HsTypeLambdaCheckRn binders' body' helper'),
         body_fvs `plusFN` helper_fvs)
 
-rnHsTyKi _ (XHsType HsTypeSome{}) =
-  failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
+-- Lower uncaptured @some (x :: A) | B@ (and @.@) directly to @Sigma A (\x -> B)@
+-- when top-level family lifting in "GHC.Rename.Module" did not rewrite it.
+-- See Note [Direct lowering of uncaptured some types] in GHC.Tc.Gen.HsType.
+rnHsTyKi env (XHsType (HsTypeSome _ binder domain body)) = do
+  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  unless (experimental && not (isRnKindLevel env)) $
+    failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
+  level <- getThLevel
+  case level of
+    Comp -> lower_some
+    UntypedBrack{} -> lower_some
+    _ -> failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
+  where
+    lower_some = do
+      dflags <- getDynFlags
+      let sigma_mod = mkModule (RealUnit (Definite (baseUnitId dflags))) (mkModuleName "GHC.Sigma")
+      sigma_name <- lookupOrig sigma_mod (mkTcOcc "Sigma")
+      (domain', dom_fvs) <- rnLHsTyKi env domain
+      let rdr = unLoc binder
+          b_loc = getLoc binder
+      (bndr_name, (body', body_fvs)) <-
+        if isUnderscore (rdrNameOcc rdr)
+          then do
+            nm <- newSysName (mkTyVarOcc "_")
+            res <- rnLHsTyKi env body
+            pure (nm, res)
+          else do
+            nm <- newLocalBndrRn (L b_loc (setRdrNameSpace rdr tvName))
+            res <- bindLocalNamesFV [nm] (rnLHsTyKi env body)
+            pure (nm, res)
+      let sigma_ty = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr sigma_name)))
+          lam_ty   = L (l2l b_loc) (XHsType (HsTypeLambdaQuoteRn [L b_loc bndr_name] body'))
+      pure ( HsAppTy noExtField (noLocA (HsAppTy noExtField sigma_ty domain')) lam_ty
+           , plusFNs [dom_fvs, body_fvs, unitFN sigma_name] )
 
 -- A bare case pattern prefers a data constructor, as before. Resolve it
 -- after the declaration group is in scope. If the data name is absent,

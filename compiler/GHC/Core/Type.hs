@@ -70,6 +70,8 @@ module GHC.Core.Type (
         nativeIndexFunctionTypeTys_maybe, nativeCallSpine_maybe,
         isNativeOpaqueValueId, isNativeOpaqueValueType, isNativeClassDictionaryId,
         markInferredRetainedBinder, isInferredRetainedBinder,
+        markInvisibleRetainedBinder, isInvisibleRetainedBinder,
+        retainedDataConBinderFlags,
         inferredRetainedBinderFlags, applyInferredRetainedBinderFlags,
         replaceTermVarInType,
         isNativeIndexDomainConversion,
@@ -263,7 +265,8 @@ import {-# SOURCE #-} GHC.Core.Coercion
 -- friends:
 import GHC.Types.Var
 import {-# SOURCE #-} GHC.Types.Id.Info
-   ( isJoinIdDetails, inferredRetainedIdInfo, setInferredRetainedIdInfo )
+   ( isJoinIdDetails, inferredRetainedIdInfo, setInferredRetainedIdInfo
+   , invisibleRetainedIdInfo, setInvisibleRetainedIdInfo )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 
@@ -2749,6 +2752,23 @@ markInferredRetainedBinder v =
 -- | Test whether an invisible retained @foreach@ binder has 'InferredSpec'.
 isInferredRetainedBinder :: Id -> Bool
 isInferredRetainedBinder = inferredRetainedIdInfo . idInfo
+
+-- | Mark a retained constructor field binder with 'DepFunInvisible'.
+markInvisibleRetainedBinder :: Id -> Id
+markInvisibleRetainedBinder v =
+  lazySetIdInfo v (setInvisibleRetainedIdInfo True (idInfo v))
+
+-- | Test whether a retained constructor field binder has 'DepFunInvisible'.
+isInvisibleRetainedBinder :: Id -> Bool
+isInvisibleRetainedBinder = invisibleRetainedIdInfo . idInfo
+
+-- | Encode '(isInvisibleRetainedBinder, isInferredRetainedBinder)' pairs for
+-- each retained constructor field so interface files preserve visibility and
+-- specificity across separate compilation.
+retainedDataConBinderFlags :: DataCon -> [Bool]
+retainedDataConBinderFlags dc =
+  concat [ [isInvisibleRetainedBinder b, isInferredRetainedBinder b]
+         | Just b <- dataConRepArgBinders dc ]
 
 -- | Collect 'InferredSpec' flags of 'DepFunInvisible' binders in preorder.
 inferredRetainedBinderFlags :: Type -> [Bool]

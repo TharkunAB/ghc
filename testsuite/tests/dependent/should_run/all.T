@@ -1013,3 +1013,8 @@ test('NativeAutoNumLiterals',
       extra_files(['NativeAutoNumLiteralsProvider.hs',
                    'NativeAutoNumLiterals.hs'])],
      run_command, ['bash NativeAutoNumLiterals.sh "{compiler}" "{libdir}"'])
+test('NativeProposal378PatternsAndT2T',
+     [req_host_target_ghc, only_ways(['normal']),
+      extra_files(['NativeProposal378PatternsAndT2TProvider.hs',
+                   'NativeProposal378PatternsAndT2T.hs'])],
+     run_command, ['bash NativeProposal378PatternsAndT2T.sh "{compiler}" "{libdir}"'])

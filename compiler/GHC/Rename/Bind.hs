@@ -81,6 +81,7 @@ import GHC.Utils.Panic
 import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
+import Data.Data          ( Data, cast, gmapQ )
 import Data.List          ( partition )
 import Data.List.NonEmpty ( NonEmpty(..) )
 
@@ -347,8 +348,11 @@ rnValBindsRHSWith rename_type ctxt (ValBinds _ vbinds)
        ; let localCompletePrags = localCompletePragmas sigs'
        ; updGblEnv (\gblEnv -> gblEnv { tcg_complete_matches = tcg_complete_matches gblEnv ++ localCompletePrags
                                       , tcg_complete_match_env = tcg_complete_match_env gblEnv ++ localCompletePrags }) $
-    do { binds_w_dus <- mapM (rnLBind (mkScopedSigBndrs sigs')) mbinds
-       ; let !(anal_binds, anal_dus) = depAnalBinds binds_w_dus
+    do { binds_w_dus0 <- mapM (rnLBind (mkScopedSigBndrs sigs')) mbinds
+       ; let binds_w_dus = case ctxt of
+               LocalBindCtxt bound_names -> addLocalSigBindDeps bound_names sigs' binds_w_dus0
+               _                         -> binds_w_dus0
+             !(anal_binds, anal_dus) = depAnalBinds binds_w_dus
 
        ; let patsyn_fvs = foldr (unionNameSet . psb_ext) emptyNameSet $
                           getPatSynBinds anal_binds
@@ -368,6 +372,45 @@ rnValBindsRHSWith rename_type ctxt (ValBinds _ vbinds)
         ; return (XValBindsLR (HsVBG anal_binds sigs'), valbind'_dus) } }
 
 rnValBindsRHSWith _ _ b = pprPanic "rnValBindsRHS" (ppr b)
+
+-- | Record dependencies from a local binding's type signature to earlier local
+-- value bindings in the same @let@/@where@ block so 'depAnalBinds' orders index
+-- bindings ahead of signatures that reference them.
+addLocalSigBindDeps
+  :: NameSet
+  -> [LSig GhcRn]
+  -> [(LHsBind GhcRn, [Name], Uses)]
+  -> [(LHsBind GhcRn, [Name], Uses)]
+addLocalSigBindDeps bound_names sigs = map add_deps
+  where
+    sig_env = mkHsSigEnv get_sig sigs
+    get_sig (L _ (TypeSig _ _ names sig_ty)) =
+      Just (names, intersectNameSet bound_names (mkNameSet (collect_names sig_ty)))
+    get_sig _ = Nothing
+
+    collect_names :: Data a => a -> [Name]
+    collect_names x
+      | Just (WithUserRdr _ nm) <- (cast x :: Maybe (WithUserRdr Name)) = [nm]
+      | Just nm <- (cast x :: Maybe Name) = [nm]
+      | otherwise = concat (gmapQ collect_names x)
+
+    add_deps entry@(L loc bind, defs, uses)
+      | isEmptyNameSet extra = entry
+      | otherwise =
+          let uses' = uses `unionNameSet` extra
+              bind' = case bind of
+                FunBind { fun_ext = fvs } ->
+                  let fvs' = fvs `unionNameSet` extra
+                  in fvs' `seq` bind { fun_ext = fvs' }
+                PatBind { pat_ext = fvs } ->
+                  let fvs' = fvs `unionNameSet` extra
+                  in fvs' `seq` bind { pat_ext = fvs' }
+                other -> other
+          in uses' `seq` (L loc bind', defs, uses')
+      where
+        extra = minusNameSet
+                  (unionNameSets [lookupNameEnv sig_env d `orElse` emptyNameSet | d <- defs])
+                  (mkNameSet defs)
 
 -- Wrapper for local binds
 --
@@ -1129,7 +1172,12 @@ renameValueSig rename_type ctxt sig@(TypeSig _ mods vs ty)
         ; let doc = TypeSigCtx vs
         ; retained <- xoptM LangExt.ExperimentalDependentTypes
         ; (new_ty, fvs) <- case ctxt of
-            LocalBindCtxt bound_names | retained -> rnLocalHsSigWcType bound_names doc ty
+            LocalBindCtxt bound_names | retained ->
+              let own_names = mkNameSet (map unLoc new_vs)
+                  sig_has_foreach = hsHasForEachTy (unLoc (sig_body (unLoc (hswc_body ty))))
+                  excluded = own_names `unionNameSet`
+                             (if sig_has_foreach then bound_names else emptyNameSet)
+              in rnLocalHsSigWcType excluded doc ty
             _ -> rename_type doc ty
         ; (mods', mods_fvs) <- rnModifiersContext doc mods
         ; return (TypeSig noAnn mods' new_vs new_ty, fvs `plusFN` mods_fvs) }

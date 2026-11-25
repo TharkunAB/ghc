@@ -92,6 +92,7 @@ import GHC.Types.Name
 import GHC.Builtin.KnownKeys
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
 import GHC.Core.Predicate
+import {-# SOURCE #-} GHC.Types.Id.Info ( invisibleRetainedIdInfo )
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
@@ -1382,9 +1383,9 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
   where
     valid_retained_args
       = arg_binders `equalLength` orig_arg_tys
-        && null ex_tvs && validRetainedConTheta theta && null stupid_theta
-        && (null theta || case source_order of
-              LegacyConOrder 0 -> null eq_spec
+        && all isTyVar ex_tvs && validRetainedConTheta theta && null stupid_theta
+        && (case source_order of
+              LegacyConOrder 0 -> null eq_spec || (null ex_tvs && null theta)
               _ -> False)
         && valid_record && isVanillaAlgTyCon rep_tycon
         && not (isTypeDataTyCon rep_tycon)
@@ -1399,7 +1400,7 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
       | Just _ : rest@(_ : _) <- arg_binders
       = all isNothing rest && fields `equalLength` orig_arg_tys
         && all (\tv -> varType tv `eqType` liftedTypeKind) univ_tvs
-        && map binderVar user_tvbs == univ_tvs && null eq_spec && null theta
+        && map binderVar user_tvbs == univ_tvs && null ex_tvs && null eq_spec && null theta
       | otherwise = False
 
     valid_result
@@ -1419,14 +1420,17 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
         result_subst = mkTvSubstPrs (map eqSpecPair eq_spec)
 
     valid_universals
-      = (null theta || user_tvs == univ_tvs)
-        && all isTyVar univ_tvs && all isTyVar user_tvs
+      = ((null theta && null ex_tvs) || (null eq_spec && user_tvs == univ_tvs ++ ex_tvs))
+        && all isTyVar univ_tvs && all isTyVar ex_tvs && all isTyVar user_tvs
         && sizeVarSet univ_set == length univ_tvs
+        && sizeVarSet ex_set == length ex_tvs
+        && disjointVarSet univ_set ex_set
         && sizeVarSet (mkVarSet user_tvs) == length user_tvs
         && checkDataConTyVars con
       where
         user_tvs = binderVars user_tvbs
         univ_set = mkVarSet univ_tvs
+        ex_set   = mkVarSet ex_tvs
 
     lazy_src (HsSrcBang _ unpack strict)
       = not (isSrcUnpacked unpack) && not (isSrcStrict strict)
@@ -1442,7 +1446,7 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
              Just b  -> isNativeRetainedField b && isManyTy mult
                         && valid_indexed_field ty
                         && varType b `eqType` ty
-                        && not (b `elemVarSet` mkVarSet univ_tvs)
+                        && not (b `elemVarSet` mkVarSet (univ_tvs ++ ex_tvs))
                         && not (b `elemVarSet` scope)
                         && valid_fields (extendVarSet scope b) bs tys
     valid_fields _ _ _ = False
@@ -1521,6 +1525,12 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
       | NoDataConRep <- rep, not (name `hasKey` heqDataConKey)
       = dataConWrapperTypeUnchecked con
         -- With no wrapper, the worker usually has the user-facing type.
+      | not (null arg_binders)
+      = mkInfForAllTys [(unmatchableDataConTy, tv) | tv <- univ_tvs] $
+        mkTyCoInvForAllTys [(unmatchableDataConTy, tv) | tv <- ex_tvs] $
+        mkInvisFunTys theta $
+        mkRetainedArgTys arg_binders orig_arg_tys $
+        mkTyConApp rep_tycon (mkTyVarTys univ_tvs)
       | otherwise
       = mkInfForAllTys [(unmatchableDataConTy, tv) | tv <- univ_tvs] $
         mkTyCoInvForAllTys [(unmatchableDataConTy, tv) | tv <- ex_tvs] $
@@ -1893,10 +1903,13 @@ dataConSourceArity (MkData { dcSourceArity = arity }) = arity
 
 -- | Number of visible arguments of the data constructor
 dataConVisArity :: DataCon -> VisArity
-dataConVisArity (MkData { dcUserTyVarBinders = tvbs, dcSourceArity = arity })
+dataConVisArity (MkData { dcUserTyVarBinders = tvbs
+                        , dcOrigArgBinders = arg_binders
+                        , dcSourceArity = arity })
   = n_of_required_ty_args + n_of_val_args
   where
-    n_of_val_args         = arity
+    n_of_invis_retained   = count (maybe False (invisibleRetainedIdInfo . idInfo)) arg_binders
+    n_of_val_args         = arity - n_of_invis_retained
     n_of_required_ty_args = count isVisibleForAllTyBinder tvbs
 
 -- | Gives the number of value arguments (including zero-width coercions)
@@ -2046,7 +2059,6 @@ dataConWrapperType :: DataCon -> Type
 -- mentions the family tycon, not the internal one.
 dataConWrapperType con
   | not (con `hasKey` heqDataConKey)
-  , null (dataConRepArgBinders con) || dataConHasRetainedResult con
   = dataConWrapperTypeUnchecked con
   | otherwise = dataConRepType con
 
@@ -2254,7 +2266,9 @@ mkRetainedArgTys [] args res = mkScaledFunTysU args res
 mkRetainedArgTys (mb : bs) (arg : args) res
   = case mb of
       Nothing -> mkScaledFunTysU [arg] body
-      Just b  -> mkDepFunTy b body
+      Just b  -> mkDepFunTyWithVis
+                   (if invisibleRetainedIdInfo (idInfo b) then DepFunInvisible else DepFunVisible)
+                   b body
   where
     body = mkRetainedArgTys bs args res
 mkRetainedArgTys _ _ _ = panic "mkRetainedArgTys: misaligned telescope"
@@ -2274,17 +2288,17 @@ field-type thunk. See Note [Retained constructor fields in interfaces] in
 GHC.Iface.Syntax. The ordinary constructor path keeps its existing laziness.
 
 The ordinary retained package has no wrapper. Its user quantifiers name
-exactly the universal type variables, with no duplicates. A retained result
-uses a wrapper and its own EqSpec. See Note [Retained constructor result
-equality].
+the universal and existential type variables in order, with no duplicates.
+A retained result uses a wrapper and its own EqSpec, with no existential
+binders or class context. See Note [Retained constructor result equality].
 
-Neither form permits existential binders,
+Neither form permits
 data families, newtypes, type data, strict fields, or unpacked fields.
 The parent and all fields are lifted. A named field has a checked
 domain and multiplicity Many. Its Id must be fresh. Only earlier retained
 fields can occur free in a field type. Rebuild the worker and wrapper types
-with DepFunTy at each dependent field. Each runtime field remains an ordinary
-lazy constructor payload slot.
+with DepFunTy (preserving DepFunVisible or DepFunInvisible) at each dependent
+field. Each runtime field remains an ordinary lazy constructor payload slot.
 See Note [Retained constructor equality contexts].
 
 A retained package can have record fields and ordinary lifted type
@@ -2322,18 +2336,18 @@ Haskell. See docs/dependent-haskell/REFERENCES.md for the pinned provenance.
 
 Note [Retained constructor equality contexts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An explicit boxed (~) context is a prefix of lazy dictionary fields in the
-worker. The dictionary is an ordinary Id. Its nominal coercion superclass
-has endpoints of the same kind. Keep the constructor wrapper-free. Core
-case alternatives bind the dictionaries before the source fields. Only the
-source fields have retained binder metadata.
+An explicit class context (including boxed (~)) is a prefix of lazy dictionary
+fields in the worker. Each dictionary is an ordinary Id. Keep the constructor
+wrapper-free. Core case alternatives bind existential type variables and
+dictionaries before the source fields. Only the source fields have retained
+binder metadata.
 
 The context precedes every retained binder. Its scope contains only the
-constructor type parameters. Require the user quantifiers to follow the
-datatype parameter order so the constructor worker and its case alternatives
-instantiate the same dictionary types. Pattern checking supplies the prefix
-as local Givens. The coverage checker uses their predicates separately from
-the constructor's source fields.
+constructor's universal and existential type variables. Require the user
+quantifiers to follow the universal-then-existential order so the constructor
+worker and its case alternatives instantiate the same dictionary types. Pattern
+checking supplies the prefix as local Givens. The coverage checker uses their
+predicates separately from the constructor's source fields.
 
 Neither promotion nor EqSpec refinement uses this representation. Both
 would need a separate rule for the retained field telescope.
@@ -2447,11 +2461,7 @@ dataConOtherTheta dc = dcOtherTheta dc
 -- | The supported explicit context of a retained constructor.
 -- See Note [Retained constructor equality contexts].
 validRetainedConTheta :: ThetaType -> Bool
-validRetainedConTheta = all is_boxed_equality
-  where
-    is_boxed_equality pred_ty
-      | Just (tc, [_, _, _]) <- splitTyConApp_maybe pred_ty = tc `hasKey` eqTyConKey
-      | otherwise = False
+validRetainedConTheta = all isClassPred
 
 -- | Returns the arg types of the worker, including *all* non-dependent
 -- evidence, after any flattening has been done and without substituting for

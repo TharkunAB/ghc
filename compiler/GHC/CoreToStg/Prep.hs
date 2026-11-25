@@ -71,7 +71,7 @@ import GHC.Types.Id.Info
 import GHC.Types.Basic
 import GHC.Types.Name   ( OccName, NamedThing(..), isInternalName, mkSystemName )
 import GHC.Types.Name.Occurrence (occNameString, mkTyVarOccFS)
-import GHC.Types.Var.Env ( mkInScopeSet, mkVarEnv, emptyVarEnv, lookupVarEnv, delVarEnv )
+import GHC.Types.Var.Env ( mkInScopeSet, mkVarEnv, emptyVarEnv )
 import GHC.Types.Var.Set ( unionVarSet, unionVarSets, extendVarSetList )
 import GHC.Types.Literal
 import GHC.Types.Tickish
@@ -311,7 +311,10 @@ deFloatTop must also preserve bindings that occur only in native type
 indices. Ordinary occurrence analysis does not count these runtime Ids.
 It can delete their bindings and leave an index out of scope. The native
 path therefore skips occurAnalyseExpr_Prep. corePrepExpr does not call
-deFloatTop and needs no corresponding change.
+deFloatTop and needs no corresponding change. When a retained trivial
+alias floats to top level, reset its demand to topDmd in mkNonRecFloat.
+Top-level static indirections have no entry info table and cannot use a
+local SingleEntry demand.
 
 This restriction preserves lazy bindings. Agda's application and runtime
 irrelevance rules do not justify forcing a Haskell runtime index. See
@@ -667,14 +670,13 @@ cpeBind top_lvl env (NonRec bndr rhs)
                      -- See Note [Opaque call arguments in CorePrep].
                      && (not (cp_allowNativeDependent (cpe_config env))
                          || native_rhs_ok bndr1 rhs1)
+             (new_float, bndr2) = mkNonRecFloat env lev bndr1 rhs1
              env2    | triv_rhs  = extendCorePrepEnvExpr env1 bndr rhs1
-                     | otherwise = env1
+                     | otherwise = extendCorePrepEnv env bndr bndr2
              floats1 | triv_rhs, isInternalName (idName bndr)
                      = floats
                      | otherwise
                      = snocFloat floats new_float
-
-             (new_float, _bndr2) = mkNonRecFloat env lev bndr1 rhs1
 
        ; return (env2, floats1, Nothing) }
   where
@@ -3021,8 +3023,11 @@ mkNonRecFloat env lev bndr rhs
       -- See Note [Speculative evaluation], Very Nasty Wrinkle
 
     -- See Note [Pin evaluatedness on floats]
-    bndr' | is_hnf    = bndr `setIdUnfolding` evaldUnfolding
-          | otherwise = bndr
+    -- See Note [CorePrep for retained dependent programs].
+    bndr0 | TopLvlFloatable <- info, exprIsTrivial rhs = setIdDemandInfo bndr topDmd
+          | otherwise                                  = bndr
+    bndr' | is_hnf    = bndr0 `setIdUnfolding` evaldUnfolding
+          | otherwise = bndr0
 
 -- | Wrap floats around an expression
 wrapBinds :: Floats -> CpeBody -> CpeBody

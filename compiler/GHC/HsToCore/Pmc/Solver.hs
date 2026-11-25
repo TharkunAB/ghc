@@ -45,14 +45,13 @@ import GHC.Utils.Panic
 import GHC.Data.Bag
 
 import GHC.Types.CompleteMatch
-import GHC.Types.Unique ( hasKey )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.SDFM
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Reader (lookupGRE_Name, GlobalRdrEnv)
-import GHC.Types.Var         (EvVar, isId)
+import GHC.Types.Var         (EvVar)
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Unique.Supply
@@ -1730,17 +1729,20 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
       let gammas = substTheta sigma_ex (eqSpecPreds eq_spec ++ thetas)
       -- (4) Instantiate fresh term variables as arguments to the constructor
       let field_tys' = substTys sigma_ex $ map scaledThing field_tys
-      (provided, arg_ids) <- case con of
+      (ex_tvs_ct, provided, arg_ids) <- case con of
         RealDataCon dc | not (null (dataConRepArgBinders dc)) -> do
           -- See Note [Retained package fields in PMC].
           uniqs <- getUniquesM
           let inst_tys = map (substTyVar sigma_univ) (dataConUnivTyVars dc)
-              (_, fields) = dataConRepInstPat uniqs ManyTy dc inst_tys
+              (ex_bndrs, fields) = dataConRepInstPat uniqs ManyTy dc inst_tys
+              subst_rep = zipTvSubst (dataConUnivTyVars dc ++ ex_tvs)
+                                     (inst_tys ++ mkTyVarTys ex_bndrs)
+              gammas_rep = substTheta subst_rep (eqSpecPreds eq_spec ++ thetas)
           if dataConHasRetainedResult dc
             then let (values, evidence) = splitAt (dataConSourceArity dc) fields
-                 in pure (map varType evidence, values)
-            else pure (gammas, drop (length thetas) fields)
-        _ -> (gammas,) <$> mapM mkPmId field_tys'
+                 in pure (ex_bndrs, map varType evidence, values)
+            else pure (ex_bndrs, gammas_rep, drop (length thetas) fields)
+        _ -> (ex_tvs, gammas,) <$> mapM mkPmId field_tys'
       tracePm (hdr "(cts)") $ vcat
         [ ppr x <+> dcolon <+> ppr match_ty
         , text "In WHNF:" <+> ppr (isSourceTypeInWHNF match_ty) <+> ppr norm_match_ty
@@ -1754,7 +1756,7 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
         -- Case (2) of Note [Strict fields and variables of unlifted type]
         let alt = PmAltConLike con
         let branching_factor = length $ filterUnliftedFields alt arg_ids
-        let ct = PhiConCt x alt ex_tvs provided arg_ids
+        let ct = PhiConCt x alt ex_tvs_ct provided arg_ids
         nabla1 <- traceWhenFailPm (hdr "(ct unsatisfiable) }") (ppr ct) $
                   addPhiTmCt nabla ct
         -- See Note [Fuel for the inhabitation test]

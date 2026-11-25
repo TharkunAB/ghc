@@ -582,7 +582,10 @@ rnExpr (RecordUpd { rupd_expr = L l expr, rupd_flds = rbinds })
 
 
 rnExpr (ExprWithTySig _ expr pty)
-  = do  { (pty', fvTy) <- rnScopedHsSigWcType ExprWithTySigCtx pty
+  = do  { retained <- xoptM LangExt.ExperimentalDependentTypes
+        ; (pty', fvTy) <- if retained
+                          then rnLocalHsSigWcType emptyNameSet ExprWithTySigCtx pty
+                          else rnScopedHsSigWcType ExprWithTySigCtx pty
         ; let scoped = hsWcScopedTvs pty'
         ; (expr', fvExpr) <- bindSigTyVarsFV scoped $
                              withWrittenSignatureKinds (signatureWrittenKinds scoped (hswc_body pty')) $
@@ -609,9 +612,11 @@ rnExpr (ArithSeq _ _ seq)
            else
             return (ArithSeq noExtField Nothing new_seq, fvs) }
 
-rnExpr (HsEmbTy _ ty)
-  = do { (ty', fvs) <- rnHsWcType HsTypeCtx ty
-       ; checkTypeSyntaxExtension TypeKeywordSyntax
+rnExpr (HsEmbTy tok ty)
+  = do { (ty', _, fvs) <- rnHsTypeApp ty
+       ; if tok == noAnn
+           then checkTypeSyntaxExtension ForallTelescopeSyntax
+           else checkTypeSyntaxExtension TypeKeywordSyntax
        ; return (HsEmbTy noExtField ty', fvs) }
 
 rnExpr (HsStar x)

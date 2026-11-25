@@ -39,6 +39,7 @@ import GHC.Tc.Gen.Head
 import GHC.Tc.Gen.Do
 import GHC.Tc.Gen.SourceTable (sourceTableOccurrence, optionalSourceUses, registerOptionalSourceUses)
 import GHC.Tc.Gen.Bind        ( tcLocalBinds, tcNonRecLets, tcNonRecLetAtType )
+import GHC.Tc.Gen.Sig         ( isCompleteHsSig )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Arrow
 import GHC.Tc.Gen.Match( tcBody, tcScopedRuntimeBody, tcLambdaMatches, tcExprCaseMatches, tcIndexedCaseMatches, tcRetainedCase
@@ -56,6 +57,7 @@ import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic, hasFixedRuntimeRep )
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Utils.Env
+import GHC.Tc.Types.ErrCtxt ( ReportRedundantConstraints(NoRRC) )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.CtLoc ( CtLoc )
 import GHC.Tc.Types.Evidence
@@ -67,14 +69,14 @@ import GHC.Core.Dependent ( hasNativeDependentExpr, supportsQuickLookType )
 import GHC.Core.Utils (applyTypeToArgs)
 import GHC.Core.UsageEnv
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Core.Make (mkCoreConApps, rEC_CON_ERROR_ID, tYPE_ERROR_ID)
+import GHC.Core.Make (mkCoreApps, mkCoreConApps, rEC_CON_ERROR_ID, tYPE_ERROR_ID)
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.TyCo.Rep (Type(DepFunTy, ExistsTy, ForAllTy, TermVarTy, TyConApp))
+import GHC.Core.TyCo.Rep (Type(AppTy, CastTy, DepFunTy, ExistsTy, ForAllTy, FunTy, TermAppTy, TermVarTy, TyConApp))
 import GHC.Core.Coercion
 import GHC.Core.Predicate( decomposeIPPred, getEqPredTys_maybe, mkNomEqPred )
 
@@ -92,6 +94,7 @@ import GHC.Types.Name.Env
 import GHC.Types.Name.Reader
 import GHC.Types.Name.Set (extendNameSet)
 import GHC.Types.SourceText (SourceText(NoSourceText))
+import GHC.Types.Literal (Literal(LitString))
 import GHC.Types.SrcLoc
 
 import GHC.Types.Var.Env (emptyVarEnv)
@@ -1333,7 +1336,14 @@ tcExpr expr@(HsEmbTy _ written) expected
                     _ -> wrong_context (Just ty) }
            Infer {} -> wrong_context Nothing }
   where
-    wrong_context = failWith . TcRnRetainedQuantificationError . RetainedTypeOperandContext
+    is_unadorned_infixexp2 = case unLoc (hswc_body written) of
+      HsForEachTy{} -> True
+      XHsType HsTypeExistsRn{} -> True
+      HsAppTy{} -> True
+      _ -> False
+    wrong_context mb_ty
+      | is_unadorned_infixexp2 = failWith (TcRnUnexpectedTypeSyntaxInTerms ForallTelescopeSyntax)
+      | otherwise = failWith (TcRnRetainedQuantificationError (RetainedTypeOperandContext mb_ty))
 tcExpr (HsQual _ _ _)     _ = failWith (TcRnIllegalTypeExpr ContextArrowSyntax)
 tcExpr (HsForAll _ _ _)   _ = failWith (TcRnIllegalTypeExpr ForallTelescopeSyntax)
 tcExpr (HsFunArr _ _ _ _) _ = failWith (TcRnIllegalTypeExpr FunctionArrowSyntax)
@@ -1616,11 +1626,46 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
        ; case direct of
            Just expr -> return (Just (mkExpandedExprTc original expr))
            Nothing -> do
-             { expr <- tcNonRecLets bindings sigs check_group (tcMonoLExpr body (Check expected))
+             { expr <- foldr check_binding (tcMonoLExpr body (Check expected)) bindings
              ; return (Just (mkExpandedExprTc original (unLoc expr))) } }
   where
     nonrec_fun (NonRecursive, [binding@(L _ FunBind{})]) = Just binding
     nonrec_fun _ = Nothing
+
+    sigs_for :: Name -> [LSig GhcRn]
+    sigs_for target = mapMaybe narrow sigs
+      where
+        narrow (L s_loc (TypeSig x mods names wc_ty))
+          | let matching = [l_nm | l_nm@(L _ nm) <- names, nm == target]
+          , not (null matching)
+          = Just (L s_loc (TypeSig x mods matching wc_ty))
+        narrow _ = Nothing
+
+    check_binding :: LHsBind GhcRn -> TcM (LHsExpr GhcTc) -> TcM (LHsExpr GhcTc)
+    check_binding binding@(L _ FunBind { fun_id = L _ name }) rest
+      | [L s_loc (TypeSig _ [] [_] wc_ty)] <- b_sigs
+      , not (isCompleteHsSig wc_ty)
+      , HsWC { hswc_body = L _ (HsSig { sig_bndrs = bndrs, sig_body = sig_body }) } <- wc_ty
+      , null (hsOuterTyVarNames bndrs)
+      , (Nothing, _) <- splitLHsQualTy sig_body
+      = do { ambient <- tcRetainedAmbientIndices RetainedLocalSignatureIndex sig_body
+           ; if isEmptyNameEnv ambient
+             then tcNonRecLets [binding] b_sigs check_group rest
+             else do
+               { (wcs, wcx, tv_prs, theta, tau, calls) <-
+                   setSrcSpanA s_loc $
+                     tcHsPartialSigType RejectSigCalls (FunSigCtxt name NoRRC) wc_ty
+               ; if isNothing wcx && null tv_prs && null theta && null calls
+                 then do
+                   { (checked, body') <- tcExtendNameTyVarEnv wcs $
+                                           tcNonRecLetAtType name tau binding rest
+                   ; let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
+                   ; return (L (getLoc body') (HsLet noExtField (L loc binds) body')) }
+                 else tcNonRecLets [binding] b_sigs check_group rest } }
+      | otherwise = tcNonRecLets [binding] b_sigs check_group rest
+      where
+        b_sigs = sigs_for name
+    check_binding binding rest = tcNonRecLets [binding] [] check_group rest
 
     check_group checked rest = do
       refined <- tcOptionalLet checked rest expected
@@ -1702,14 +1747,14 @@ The lazy value argument preserves Haskell sharing. See docs/dependent-haskell/RE
 -- See Note [Optional equality for an overloaded let].
 tcOptionalLet :: LHsBinds GhcTc -> TcM (LHsExpr GhcTc) -> Type -> TcM (Maybe (HsExpr GhcTc))
 tcOptionalLet checked rest expected
-  | Just (binder, rhs_kind) <- case checked of
-      [L _ (XHsBindsLR (AbsBinds { abs_sig = True, abs_tvs = [], abs_ev_vars = [], abs_ev_binds = []
+  | Just (binder, ev_binds, rhs_kind) <- case checked of
+      [L _ (XHsBindsLR (AbsBinds { abs_tvs = [], abs_ev_vars = [], abs_ev_binds = evs
              , abs_exports = [ABE { abe_poly = public, abe_mono = mono, abe_wrap = WpHole
                                   , abe_prags = SpecPrags [] }], abs_binds = inner }))] ->
           do { (value, rhs_kind) <- binding_rhs inner
              ; guard (value == mono && varType value `tcEqType` varType public)
-             ; return (public, rhs_kind) }
-      _ -> binding_rhs checked
+             ; return (public, evs, rhs_kind) }
+      _ -> (\(b, rk) -> (b, [], rk)) <$> binding_rhs checked
   = runMaybeT $ do
       strict <- liftMaybeT (xoptM LangExt.Strict)
       guard (not strict)
@@ -1732,7 +1777,7 @@ tcOptionalLet checked rest expected
             liftMaybeT (tcSubMult (OccurrenceOf (idName initial)) ManyTy mult)
             value <- liftMaybeT (liftZonkM (zonkId binder))
             guard (isNativeIndexId value)
-            liftMaybeT (unLoc <$> emit_steps [(value, rhs, canonical, index, step)] rest)
+            liftMaybeT (unLoc <$> emit_steps [(value, foldr mkHsDictLet rhs ev_binds, canonical, index, step)] rest)
           LazyUnaryRhs{} -> mzero
         else do
           let (mb_param, target_expr, fallback_rhs) = case rhs_kind of
@@ -1753,7 +1798,7 @@ tcOptionalLet checked rest expected
           value <- liftMaybeT (liftZonkM (zonkId binder))
           guard (isNativeIndexFunctionId value)
           liftMaybeT $ unLoc <$>
-            emit_steps (prep_intermediates ++ [(value, fallback_rhs, canonical, index, main_deps)]) rest
+            emit_steps (prep_intermediates ++ [(value, foldr mkHsDictLet fallback_rhs ev_binds, canonical, index, main_deps)]) rest
   | otherwise = return Nothing
   where
     prepare_step _ _ _ _ owners methods = do
@@ -1815,10 +1860,14 @@ keep their ordinary checking rules. See R22 in the dependent Haskell roadmap.
 
 {- Note [Signed and grouped local indices]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Check all written type signatures before checking the dependency-sorted
-nonrecursive bindings. Check a binding before entering the implication for
-its remaining siblings and body. Thus a later RHS may use an earlier alias
-without making that equality available in its own definition.
+Check each dependency-sorted nonrecursive binding together with its own
+written type signatures before entering the implication for its remaining
+siblings and body. Thus a later local signature or RHS may reference an
+earlier local index binding without making that equality available in the
+index binding's own definition. When a monomorphic partial signature
+references an earlier local index, check its RHS directly at the partial
+tau type with tcNonRecLetAtType so wildcard metavariables unify in the
+enclosing scope without generalising a retained type.
 
 tcPolyCheck represents a complete signature by an AbsBinds with one export.
 The body uses the public Id. Its checked RHS binds a fresh inner Id. Read
@@ -1874,35 +1923,46 @@ tcExistsCase expr@(HsCase ctxt scrut matches)
                  | EmbTyPat _ HsTP{ hstp_ext = HsTPRn [] [] [name], hstp_body = witness_ty }
                      <- strip_pat witness_pat
                  , HsTyVar{} <- unLoc (ignoreParens witness_ty)
-                 -> open_pack con_loc con (Just name) payload_pat
-                 | wildcard_witness (strip_pat witness_pat)
-                 -> open_pack con_loc con Nothing payload_pat
+                 -> open_pack False con_loc con (Just name) payload_pat
+                 | InvisPat SpecifiedSpec HsTP{ hstp_ext = HsTPRn [] [] [name], hstp_body = witness_ty }
+                     <- strip_pat witness_pat
+                 , HsTyVar{} <- unLoc (ignoreParens witness_ty)
+                 -> open_pack True con_loc con (Just name) payload_pat
+                 | Just is_at <- wildcard_witness (strip_pat witness_pat)
+                 -> open_pack is_at con_loc con Nothing payload_pat
                  | otherwise -> setSrcSpanA (getLoc witness_pat) $
                                   failWithTc (TcRnExistsPack ExistsPackInvalidContext)
                _ -> failWithTc (TcRnExistsPack ExistsPackInvalidContext) }
 
-    wildcard_witness :: Pat GhcRn -> Bool
-    wildcard_witness WildPat{} = True
+    wildcard_witness :: Pat GhcRn -> Maybe Bool
+    wildcard_witness WildPat{} = Just False
     wildcard_witness (EmbTyPat _ HsTP{ hstp_body = ty })
       | HsWildCardTy (HoleVar (L _ hole)) <- unLoc (ignoreParens ty)
-      = hole == unnamedHoleRdrName
-    wildcard_witness _ = False
+      , hole == unnamedHoleRdrName
+      = Just False
+    wildcard_witness (InvisPat SpecifiedSpec HsTP{ hstp_body = ty })
+      | HsWildCardTy (HoleVar (L _ hole)) <- unLoc (ignoreParens ty)
+      , hole == unnamedHoleRdrName
+      = Just True
+    wildcard_witness _ = Nothing
 
-    open_pack con_loc con mb_name payload_pat
+    open_pack is_at con_loc con mb_name payload_pat
       = do { (scrut', scrut_ty) <- tcScalingUsage ManyTy $ tcInferRhoFRR FRRCase scrut
            ; schema <- liftZonkM (zonkTcType scrut_ty)
            ; result_ty <- expTypeToType expected
-           ; let open_bar = open_explicit con_loc con mb_name payload_pat result_ty
+           ; let open_bar = open_explicit is_at con_loc con mb_name payload_pat result_ty
            ; opened <- case coreFullView schema of
                ExistsTy ImplicitExists _ inner
-                 | ExistsTy ExplicitExists _ _ <- implicitPayloadType inner
+                 | not is_at
+                 , ExistsTy ExplicitExists _ _ <- implicitPayloadType inner
                  -> tcOpenImplicitPackage (getLocA scrut) schema scrut' result_ty $ \bar ->
                       open_bar (nlHsVar bar) (varType bar)
                _ -> open_bar scrut' schema
            ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA opened)))) }
 
-    open_explicit con_loc con mb_name payload_pat result_ty scrut' schema
-      | ExistsTy ExplicitExists binder inner <- coreFullView schema
+    open_explicit is_at con_loc con mb_name payload_pat result_ty scrut' schema
+      | ExistsTy ex_flag binder inner <- coreFullView schema
+      , ex_flag == ExplicitExists || is_at
       = do { con_like <- RealDataCon <$> tcLookupDataCon con
            ; let origin = PatSkol con_like ctxt
            ; skol_info <- mkSkolemInfo origin
@@ -3439,30 +3499,62 @@ instCallWithLocalTypeReps :: HsExpr GhcRn -> LHsWcType GhcRn -> TcType
                           -> [TcType] -> TcThetaType -> TcM HsWrapper
 instCallWithLocalTypeReps expr written arg args theta = do
   reps <- collect_reps emptyUniqSet (collect_names (hswc_body written))
-  if null reps
+  arg_zonked <- liftZonkM (zonkTcType arg)
+  let rep_tv_set = mkVarSet [ tv | (_, _, t) <- reps, Just tv <- [getTyVar_maybe t] ]
+      free_tvs   = filter isTyVar (tyCoVarsOfTypeList arg_zonked)
+      needs_lazy_rep = has_non_typeable_form arg_zonked
+                       && all (`elemVarSet` rep_tv_set) free_tvs
+  if null reps && not needs_lazy_rep
     then instCall (exprCtOrigin expr) args theta
     else do
       mapM_ (\(v_id, _, _) -> tcEmitBindingUsage (singleUsageUE v_id)) reps
       typeableClass <- tcLookupKnownKeyClass typeableClassKey
+      selector <- tcLookupKnownOccId typeRepIdOcc
       let cls_tc = classTyCon typeableClass
           dc     = tyConSingleDataCon cls_tc
+      extra_given <- if needs_lazy_rep
+        then do
+          arg_kind <- liftZonkM (zonkTcType (typeKind arg_zonked))
+          let (_, rep_ty) = tcSplitPhiTy $
+                piResultTys (idType selector) [arg_kind, arg_zonked]
+              err_expr = mkCoreApps (Core.Var tYPE_ERROR_ID)
+                           [ Core.Type liftedRepTy
+                           , Core.Type rep_ty
+                           , Core.Lit (LitString (bytesFS (fsLit "TypeRep is not available for quantified or family type"))) ]
+          g <- newEvVar (mkTyConApp cls_tc [arg_kind, arg_zonked])
+          pure [(g, mkGivenEvBind g (EvExpr (mkCoreConApps dc [Core.Type arg_kind, Core.Type arg_zonked, err_expr])))]
+        else pure []
       givens <- newEvVars [ mkTyConApp cls_tc [v_kind, v_ty]
                           | (_, v_kind, v_ty) <- reps ]
-      (ev_binds, wrap) <- checkConstraints (UnifyForAllSkol arg) [] givens $
+      let all_givens = map fst extra_given ++ givens
+      (ev_binds, wrap) <- checkConstraints (UnifyForAllSkol arg) [] all_givens $
                             instCall (exprCtOrigin expr) args theta
       let given_binds =
+            map snd extra_given ++
             [ mkGivenEvBind g
                 (EvExpr (mkCoreConApps dc [Core.Type v_kind, Core.Type v_ty, Core.Var v_id]))
             | (g, (v_id, v_kind, v_ty)) <- zip givens reps ]
       ev_binds' <- case ev_binds of
         TcEvBinds binds -> do
           mapM_ (addTcEvBind binds) given_binds
-          addNeededEvIds binds (mkVarSet givens)
+          addNeededEvIds binds (mkVarSet all_givens)
           pure ev_binds
         EvBinds binds ->
           pure (EvBinds (listToBag given_binds `unionBags` binds))
       pure (mkWpLet ev_binds' <.> wrap)
   where
+    has_non_typeable_form :: Type -> Bool
+    has_non_typeable_form ty = case coreFullView ty of
+      DepFunTy{}  -> True
+      ExistsTy{}  -> True
+      ForAllTy{}  -> True
+      TermVarTy{} -> True
+      TermAppTy{} -> True
+      TyConApp tc tys -> isTypeFamilyTyCon tc || any has_non_typeable_form tys
+      AppTy f a   -> has_non_typeable_form f || has_non_typeable_form a
+      FunTy _ ma mult a r -> any has_non_typeable_form [ma, mult, a, r]
+      CastTy t _  -> has_non_typeable_form t
+      _           -> False
     collect_names :: Data a => a -> [Name]
     collect_names x =
       [ unwrapUserRdr w | Just (w :: WithUserRdr Name) <- [cast x] ]

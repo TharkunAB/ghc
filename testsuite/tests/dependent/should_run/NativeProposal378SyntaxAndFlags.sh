@@ -89,7 +89,7 @@ HS
 cd "$work/-O0/neg"
 cp "$work/-O0/native/NativeProposal378SyntaxAndFlagsProvider.hi" .
 
-# 6a. 'some' in infixexp2 parses cleanly without parse error (reaching renamer GHC-83605):
+# 6a. 'some' in infixexp2 lowers cleanly via T2T, while unadorned foreach in a value expression is rejected:
 cat >SomeInInfixExp2.hs <<'HS'
 {-# LANGUAGE DependentTypes #-}
 module SomeInInfixExp2 where
@@ -101,11 +101,19 @@ w _ = "ok"
 x :: List Char
 x = w (some (m n :: Nat). Pair2 (Vec Int m) (Vec Int n))
 HS
-if "${ghc[@]}" -O0 -fno-code -c SomeInInfixExp2.hs >some-exp.log 2>&1; then
-    cat some-exp.log >&2
+"${ghc[@]}" -O0 -fno-code -c SomeInInfixExp2.hs
+
+cat >BadForEachInValueExpr.hs <<'HS'
+{-# LANGUAGE DependentTypes #-}
+module BadForEachInValueExpr where
+import NativeProposal378SyntaxAndFlagsProvider (Nat, Vec)
+x = (foreach (n :: Nat) -> Vec Int n)
+HS
+if "${ghc[@]}" -O0 -fno-code -c BadForEachInValueExpr.hs >foreach-val.log 2>&1; then
+    cat foreach-val.log >&2
     exit 1
 fi
-grep -Fq '[GHC-83605]' some-exp.log
+grep -Fq '[GHC-31244]' foreach-val.log
 
 # 6b. Braced specificity in visible foreach -> is rejected at parse time:
 cat >BadVisBraces.hs <<'HS'

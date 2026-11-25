@@ -5873,7 +5873,7 @@ splitRetainedConFields :: [Maybe Id] -> Type -> ([Scaled Type], Type)
 splitRetainedConFields [] ty = ([], ty)
 splitRetainedConFields (mb : rest) ty
   = case (mb, coreFullView ty) of
-      (Just b, DepFunTy DepFunVisible b' body)
+      (Just b, DepFunTy _ b' body)
         | b == b' -> add (Scaled ManyTy (varType b)) body
       (_, FunTy { ft_mult = mult, ft_arg = arg, ft_res = body })
         -> add (Scaled mult arg) body
@@ -5906,10 +5906,12 @@ checkValidDataCon after the parent TyCon is available.
 Kind inference checks domain kinds without inspecting unfinished datatype
 constructor graphs. Final checking validates the fixed native index domain.
 Erased outer quantifiers keep their ordinary GADT scope. The retained Ids
-are fields. An ordinary retained package has no EqSpec. A retained result
-gets one EqSpec per result argument that uses a retained field.
+are fields. An ordinary retained package has no EqSpec and can carry erased
+existential binders and class contexts. A retained result gets one EqSpec per
+result argument that uses a retained field, with no existential binders or
+class contexts.
 See Note [Retained constructor result equality] in GHC.Core.DataCon.
-Neither form permits existentials, contexts, records, strict fields, or newtypes.
+Neither form permits strict fields or newtypes.
 Reject StrictData rather than changing its field evaluation rules.
 See Note [Retained constructor field telescopes] in GHC.Core.DataCon and
 Note [Source retained signatures] in GHC.Tc.Gen.HsType.
@@ -6819,6 +6821,7 @@ checkValidDataCon dflags existential_ok tc con
 
         ; unless (null (dataConRepArgBinders con)) $
           do { let univ_tvs = dataConUnivTyVars con
+                   ex_tvs   = dataConExTyCoVars con
                    user_tvs = binderVars (dataConUserTyVarBinders con)
                    (_, _, eq_spec, theta, _, _) = dataConFullSig con
                    retained_fields = [field | Just field <- dataConRepArgBinders con]
@@ -6826,9 +6829,10 @@ checkValidDataCon dflags existential_ok tc con
                      validRetainedResultEqSpec univ_tvs retained_fields eq_spec
              ; unless (isBoxedDataTyCon tc && isLiftedAlgTyCon tc
                        && isVanillaAlgTyCon tc && not (isTypeDataTyCon tc)
-                       && null (dataConExTyCoVars con)
+                       && all isTyVar ex_tvs
                        && validRetainedConTheta theta
-                       && (null theta || (null eq_spec && user_tvs == univ_tvs))
+                       && ((null theta && null ex_tvs)
+                           || (null eq_spec && user_tvs == univ_tvs ++ ex_tvs))
                        && valid_eq_spec && checkDataConTyVars con
                        && sizeVarSet (mkVarSet user_tvs) == length user_tvs) $
                  failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration

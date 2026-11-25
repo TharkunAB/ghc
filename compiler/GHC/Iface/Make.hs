@@ -47,8 +47,9 @@ import GHC.Core.Coercion.Axiom
 import GHC.Core.Dependent (hasNativeDependentProgram, hasRetainedRuleHead)
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Core.TyCon ( synTyConRhs_maybe )
-import GHC.Core.Type ( inferredRetainedBinderFlags )
+import GHC.Core.DataCon ( dataConName )
+import GHC.Core.TyCon ( synTyConRhs_maybe, tyConDataCons )
+import GHC.Core.Type ( inferredRetainedBinderFlags, retainedDataConBinderFlags )
 import GHC.Core.Ppr
 import GHC.Core.RoughMap ( RoughMatchTc(..) )
 
@@ -417,14 +418,18 @@ mkIface_ hsc_env
                        (all_rule_heads, stripped_rule_heads))
              fields0
     let inferred_retained =
-          [ (getName thing, flags)
+          [ (nm, flags)
           | thing <- typeEnvElts type_env
           , isExternalName (getName thing)
-          , Just ty <- [case thing of
-                          AnId v -> Just (varType v)
-                          ATyCon tc | Just rhs <- synTyConRhs_maybe tc -> Just rhs
-                          _ -> Nothing]
-          , let flags = inferredRetainedBinderFlags ty
+          , (nm, flags) <- case thing of
+              AnId v -> [(getName thing, inferredRetainedBinderFlags (varType v))]
+              ATyCon tc
+                | Just rhs <- synTyConRhs_maybe tc ->
+                    [(getName thing, inferredRetainedBinderFlags rhs)]
+                | otherwise ->
+                    [ (dataConName dc, retainedDataConBinderFlags dc)
+                    | dc <- tyConDataCons tc ]
+              _ -> []
           , or flags ]
     fields <- if null inferred_retained
       then pure fields1

@@ -720,13 +720,14 @@ the forkM stuff.
 tcIfaceDecl :: Bool     -- ^ True <=> discard IdInfo on IfaceId bindings
             -> IfaceDecl
             -> IfL TyThing
-tcIfaceDecl = tc_iface_decl Nothing
+tcIfaceDecl = tc_iface_decl emptyNameEnv Nothing
 
-tc_iface_decl :: Maybe Class  -- ^ For associated type/data family declarations
+tc_iface_decl :: NameEnv [Bool]
+              -> Maybe Class  -- ^ For associated type/data family declarations
               -> Bool         -- ^ True <=> discard IdInfo on IfaceId bindings
               -> IfaceDecl
               -> IfL TyThing
-tc_iface_decl _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
+tc_iface_decl _ _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
                                        ifIdDetails = raw_details, ifIdInfo = info,
                                        ifIdSourceProofRules = deps })
   = do  { ty <- tcIfaceType iface_type
@@ -739,7 +740,7 @@ tc_iface_decl _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
         ; let checked_info = if null rules then info else setSourceProofRuleInfo info rules
         ; return (AnId (mkGlobalId details name ty checked_info)) }
 
-tc_iface_decl _ _
+tc_iface_decl inferred_env _ _
   (IfaceData {ifName = tc_name,
               ifKind = kind,
               ifCType = cType,
@@ -762,7 +763,7 @@ tc_iface_decl _ _
        ; kind' <- tcIfaceType kind
        ; shape <- tcIfaceDataDomainShape binders ctxt mb_parent rdr_cons
        ; tycon <- fixM $ \ tycon -> do
-               { cons <- tcIfaceDataCons tc_name tycon rdr_cons
+               { cons <- tcIfaceDataCons inferred_env tc_name tycon rdr_cons
                ; bindIfaceTyConBinders_AT binders $ \ binders' ->
             do { res_kind' <- tcIfaceType res_kind
                ; when has_retained $ unless (res_kind' `eqType` liftedTypeKind) $
@@ -790,7 +791,7 @@ tc_iface_decl _ _
            ; lhs_tys <- tcIfaceAppArgs arg_tys
            ; return (DataFamInstTyCon ax fam_tc lhs_tys) }
 
-tc_iface_decl _ _
+tc_iface_decl _ _ _
   (IfaceSynonym {ifName = tc_name,
                  ifKind = kind,
                  ifRoles = roles,
@@ -820,7 +821,7 @@ tc_iface_decl _ _
    where
      mk_doc n = text "Type synonym" <+> ppr n
 
-tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
+tc_iface_decl _ parent _ (IfaceFamily {ifName = tc_name,
                                      ifKind = kind,
                                      ifFamFlav = fam_flav,
                                      ifBinders = binders,
@@ -863,7 +864,7 @@ tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
           pprPanic "tc_iface_decl" $
             text "IfaceBuiltInClosedTyFamTyCon in interface file"
 
-tc_iface_decl _parent _ignore_prags
+tc_iface_decl _ _parent _ignore_prags
             (IfaceClass {ifName = tc_name,
                          ifKind = kind,
                          ifRoles = roles,
@@ -876,7 +877,7 @@ tc_iface_decl _parent _ignore_prags
        ; cls  <- buildAbstractClass tc_name kind' binders' roles fds
        ; return (ATyCon (classTyCon cls)) } }
 
-tc_iface_decl _parent ignore_prags
+tc_iface_decl inferred_env _parent ignore_prags
             (IfaceClass {ifName = tc_name,
                          ifKind = kind,
                          ifRoles = roles,
@@ -932,7 +933,7 @@ tc_iface_decl _parent ignore_prags
              ; return (Just (GenericDM (noSrcSpan, ty'))) }
 
    tc_at cls (IfaceAT tc_decl if_def)
-     = do ATyCon tc <- tc_iface_decl (Just cls) ignore_prags tc_decl
+     = do ATyCon tc <- tc_iface_decl inferred_env (Just cls) ignore_prags tc_decl
           mb_def <- case if_def of
                       Nothing  -> return Nothing
                       Just def -> forkM (mk_at_doc tc)                 $
@@ -954,7 +955,7 @@ tc_iface_decl _parent ignore_prags
    mk_at_doc tc = text "Associated type" <+> ppr tc
    mk_op_doc op_name op_ty = text "Class op" <+> sep [ppr op_name, ppr op_ty]
 
-tc_iface_decl _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
+tc_iface_decl _ _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
                               , ifAxBranches = branches, ifAxSourceSpans = spans
                               , ifAxSourceProofRules = deps, ifRole = role })
   = do { tc_tycon    <- tcIfaceTyCon tc
@@ -971,7 +972,7 @@ tc_iface_decl _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
                       { co_ax_source_proof_rules = rules }
        ; return (ACoAxiom axiom) }
 
-tc_iface_decl _ _ (IfacePatSyn{ ifName = name
+tc_iface_decl _ _ _ (IfacePatSyn{ ifName = name
                               , ifPatMatcher = if_matcher
                               , ifPatBuilder = if_builder
                               , ifPatIsInfix = is_infix
@@ -1151,7 +1152,7 @@ tc_iface_decl_with_inferred inferred_env ignore_prags (_version, decl)
         -- which includes its nameParent.
 
         ; thing <- forkM doc $ do { bumpDeclStats main_name
-                                  ; thing0 <- tcIfaceDecl ignore_prags decl
+                                  ; thing0 <- tc_iface_decl inferred_env Nothing ignore_prags decl
                                   ; return (restore_inferred main_name thing0) }
 
         -- Populate the type environment with the implicitTyThings too.
@@ -1269,8 +1270,8 @@ tc_ax_branch loc (IfaceAxBranch { ifaxbTyVars = tv_bndrs
                          , cab_overlaps = placeHolderOverlaps
                          , cab_incomps  = placeHolderIncomps }) }
 
-tcIfaceDataCons :: Name -> TyCon -> IfaceConDecls -> IfL AlgTyConRhs
-tcIfaceDataCons tycon_name tycon if_cons
+tcIfaceDataCons :: NameEnv [Bool] -> Name -> TyCon -> IfaceConDecls -> IfL AlgTyConRhs
+tcIfaceDataCons inferred_env tycon_name tycon if_cons
   = case if_cons of
         IfAbstractTyCon
           -> return AbstractTyCon
@@ -1355,7 +1356,7 @@ tcIfaceDataCons tycon_name tycon if_cons
        bindDataConBinders   ex_bndrs   $ \ ex_tvs  ->
      do { traceIf (text "Start interface-file tc_con_decl" <+> ppr dc_name)
         ; unless (null arg_binders) $
-            forM_ [(kind, tv) | (IfaceTvBndr (_, kind), tv) <- zip univ_bndrs univ_tvs] $
+            forM_ [(kind, tv) | (IfaceTvBndr (_, kind), tv) <- zip (univ_bndrs ++ ex_bndrs) (univ_tvs ++ ex_tvs)] $
               \(kind, tv) -> do
               { declared_kind <- tcIfaceType kind
               ; unless (declared_kind `eqType` varType tv) $
@@ -1415,7 +1416,8 @@ tcIfaceDataCons tycon_name tycon if_cons
                                          _ -> check_prefix_scope (concatMap (\(Scaled mult ty) -> [mult, ty]) tys)
                                      ; return tys }
                             ; return ([], arg_tys) }
-                    else tc_retained_args dc_name emptyVarSet arg_binders args
+                    else tc_retained_args dc_name (fromMaybe [] (lookupNameEnv inferred_env dc_name))
+                                          emptyVarSet arg_binders args
                 ; when (not (null arg_binders) && not (null lbl_names)) $
                     do { valid <- evaluateIfaceNativeDomain (ppr dc_name)
                            (all (\tv -> varType tv `eqType` liftedTypeKind) univ_tvs
@@ -1490,42 +1492,47 @@ tcIfaceDataCons tycon_name tycon if_cons
     check_retained_shape name wrapper binders args univs users exs spec ctxt fields bangs src_bangs
       = unless (binders `equalLength` args
                 && length names == length (nub names)
-                && all type_binder univs && all (\(Bndr b _) -> type_binder b) users
+                && all type_binder univs && all type_binder exs
+                && all (\(Bndr b _) -> type_binder b) users
                 && length univ_names == length (nub univ_names)
+                && length ex_names == length (nub ex_names)
+                && all (`notElem` univ_names) ex_names
                 && length user_names == length (nub user_names)
-                && valid_result && null exs && valid_record
-                && (null ctxt || (not wrapper && null spec && user_names == univ_names))
+                && valid_result && valid_record
+                && ((null ctxt && null exs)
+                    || (not wrapper && null spec && user_names == univ_names ++ ex_names))
                 && ordinary_data
                 && (null bangs || bangs `equalLength` args)
                 && all lazy_bang bangs
                 && (null src_bangs || src_bangs `equalLength` args)
                 && all lazy_src_bang src_bangs) $
           failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
-                   $$ text "Expected aligned distinct field names and a lazy data constructor"
-                   $$ text "without existential fields."
-                   $$ text "User type binders must match the universal binders outside the result equalities.")
+                   $$ text "Expected aligned distinct field names and a lazy data constructor."
+                   $$ text "User type binders must match the universal and existential binders outside the result equalities.")
       where
         names = [n | Just n <- binders]
         univ_names = map ifaceBndrName univs
+        ex_names = map ifaceBndrName exs
         user_names = [ifaceBndrName b | Bndr b _ <- users]
         valid_record
           | null fields = True
           | IfDataTyCon False [_] <- if_cons
           , Just _ : rest@(_ : _) <- binders
-          = all isNothing rest && not wrapper && user_names == univ_names && null ctxt
+          = all isNothing rest && not wrapper && user_names == univ_names && null exs && null ctxt
             && null spec && fields `equalLength` args && length fields == length (nub fields)
           | otherwise = False
         valid_result
           | wrapper
           , not (null spec)
-          = pairs `equalLength` spec
+          = null exs && null ctxt
+            && pairs `equalLength` spec
             && length result_names == length (nub result_names)
             && length names == length (nub result_fields)
             && all (`elem` univ_names) result_names
             && all (`elem` names) result_fields
             && matching_users (filter (`notElem` result_names) univ_names)
           | otherwise
-          = not wrapper && null spec && matching_users univ_names
+          = not wrapper && null spec && matching_users (univ_names ++ ex_names)
           where
             pairs = [(lhs, retained) | (lhs, rhs) <- spec
                                      , Just retained <- [fields_in_result rhs]]
@@ -1550,8 +1557,8 @@ tcIfaceDataCons tycon_name tycon if_cons
 
     -- Allocate the lexical binder skeleton before forcing its domain.
     -- See Note [Importing retained constructor field telescopes].
-    tc_retained_args _ _ [] [] = return ([], [])
-    tc_retained_args name scope (mb : bs) ((w, ty) : args)
+    tc_retained_args _ _ _ [] [] = return ([], [])
+    tc_retained_args name flags scope (mb : bs) ((w, ty) : args)
       = do { ~(mult, field_ty) <- forkM (mk_doc name <+> text "retained field") $
                do { when (isJust mb) $
                       do { mult_shape <- tcIfaceDomainShape w
@@ -1577,15 +1584,21 @@ tcIfaceDataCons tycon_name tycon if_cons
                   ; return (mult, field_ty) }
            ; case mb of
                Nothing -> do
-                 { ~(rest, fields) <- tc_retained_args name scope bs args
+                 { ~(rest, fields) <- tc_retained_args name flags scope bs args
                  ; return (Nothing : rest, Scaled mult field_ty : fields) }
                Just fs -> do
                  { field_name <- newIfaceName (mkVarOccFS (ifLclNameFS fs))
-                 ; let field = mkLocalId field_name ManyTy field_ty
+                 ; let (is_invis, is_inf, flags') = case flags of
+                         f1 : f2 : more -> (f1, f2, more)
+                         [f1]           -> (f1, False, [])
+                         []             -> (False, False, [])
+                       mark_field = (if is_inf then markInferredRetainedBinder else id)
+                                  . (if is_invis then markInvisibleRetainedBinder else id)
+                       field = mark_field (mkLocalId field_name ManyTy field_ty)
                  ; ~(rest, fields) <- extendIfaceIdEnv [field] $
-                     tc_retained_args name (extendVarSet scope field) bs args
+                     tc_retained_args name flags' (extendVarSet scope field) bs args
                  ; return (Just field : rest, Scaled mult field_ty : fields) } }
-    tc_retained_args name _ _ _
+    tc_retained_args name _ _ _ _
       = failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
                    $$ text "Field names and argument types are not aligned.")
 

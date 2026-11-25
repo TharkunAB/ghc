@@ -4409,10 +4409,10 @@ simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
       | not forall_ok, isInvisibleFunArg af = True
       | otherwise                           = rhs_is_bad ma || rhs_is_bad w || rhs_is_bad a || rhs_is_bad r
 
-    rhs_is_bad (TyConApp tc tys)
+    rhs_is_bad ty@(TyConApp tc tys)
       | lhs_tv_is_concrete, not (isConcreteTyCon tc) = True
       | not forall_ok, not (isTauTyCon tc)           = True
-      | not fam_ok,    not (isFamFreeTyCon tc)       = True
+      | not fam_ok,    not (isFamFreeTyCon tc || is_unsat_scoped_fam_or_syn tc tys ty) = True
       | otherwise                                    = any rhs_is_bad tys
 
     rhs_is_bad (ForAllTy ma (Bndr tv _) ty)
@@ -4426,6 +4426,14 @@ simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
     rhs_is_bad (CastTy ty co)   = co_is_bad co || rhs_is_bad ty
     rhs_is_bad (CoercionTy co)  = co_is_bad co
     rhs_is_bad (LitTy {})       = False
+
+    -- An unsaturated scoped closed family (or a synonym over one) represents
+    -- a codomain closure. It does not reduce before it receives its binder
+    -- argument. Unify it on the fly. See Note [Prevent unification with type families].
+    is_unsat_scoped_fam_or_syn tc tys ty
+      | Just _ <- closedFamilyScope_maybe tc = tys `lengthLessThan` tyConArity tc
+      | isTypeSynonymTyCon tc, Just ty' <- coreView ty = not (rhs_is_bad ty')
+      | otherwise = False
 
     -- Coercions: see Note [Occurs check and coercions]
     co_is_bad co = anyFreeVarsOfCo rhs_tcv_is_bad co

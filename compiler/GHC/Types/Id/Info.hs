@@ -27,6 +27,7 @@ module GHC.Types.Id.Info (
         vanillaIdInfo, noCafIdInfo,
         sourceProofRuleInfo, setSourceProofRuleInfo,
         inferredRetainedIdInfo, setInferredRetainedIdInfo,
+        invisibleRetainedIdInfo, setInvisibleRetainedIdInfo,
 
         -- ** The OneShotInfo type
         OneShotInfo(..),
@@ -562,6 +563,7 @@ data IdInfo
 -- - Bit   2   (1):  InferredSpec flag on invisible retained DepFunTy binders
 -- - Bits  3-32(30): Call Arity info
 -- - Bits 33-62(30): Arity info
+-- - Bit  63   (1):  DepFunInvisible flag on retained DataCon field binders
 --
 newtype BitField = BitField Word64
 
@@ -578,6 +580,9 @@ bitfieldGetCafInfo (BitField bits) =
 
 bitfieldGetInferredRetained :: BitField -> Bool
 bitfieldGetInferredRetained (BitField bits) = testBit bits 2
+
+bitfieldGetInvisibleRetained :: BitField -> Bool
+bitfieldGetInvisibleRetained (BitField bits) = testBit bits 63
 
 bitfieldGetCallArityInfo :: BitField -> ArityInfo
 bitfieldGetCallArityInfo (BitField bits) =
@@ -602,6 +607,10 @@ bitfieldSetCafInfo info (BitField bits) =
 bitfieldSetInferredRetained :: Bool -> BitField -> BitField
 bitfieldSetInferredRetained flag (BitField bits) =
     if flag then BitField (setBit bits 2) else BitField (clearBit bits 2)
+
+bitfieldSetInvisibleRetained :: Bool -> BitField -> BitField
+bitfieldSetInvisibleRetained flag (BitField bits) =
+    if flag then BitField (setBit bits 63) else BitField (clearBit bits 63)
 
 bitfieldSetCallArityInfo :: ArityInfo -> BitField -> BitField
 bitfieldSetCallArityInfo info bf@(BitField bits) =
@@ -722,6 +731,15 @@ inferredRetainedIdInfo = bitfieldGetInferredRetained . bitfield
 setInferredRetainedIdInfo :: Bool -> IdInfo -> IdInfo
 setInferredRetainedIdInfo flag info =
     info { bitfield = bitfieldSetInferredRetained flag (bitfield info) }
+
+-- | Test whether a retained constructor field binder has 'DepFunInvisible' visibility.
+invisibleRetainedIdInfo :: IdInfo -> Bool
+invisibleRetainedIdInfo = bitfieldGetInvisibleRetained . bitfield
+
+-- | Record whether a retained constructor field binder has 'DepFunInvisible' visibility.
+setInvisibleRetainedIdInfo :: Bool -> IdInfo -> IdInfo
+setInvisibleRetainedIdInfo flag info =
+    info { bitfield = bitfieldSetInvisibleRetained flag (bitfield info) }
 
 -- | Basic 'IdInfo' that carries no useful information whatsoever
 vanillaIdInfo :: IdInfo

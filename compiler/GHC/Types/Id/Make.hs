@@ -750,6 +750,16 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
                      -- Reuse the retained Id in the result and in reflexivity.
                      -- See Note [Retained constructor result equality] in GHC.Core.DataCon.
                      ; return (args, mkCoApps (mkVarApps initial_wrap_app args) refls) }
+             else if not (null (dataConRepArgBinders data_con))
+               then do { let mb_binders = replicate (length (stupid_theta ++ theta)) Nothing
+                                          ++ dataConRepArgBinders data_con
+                       ; args <- sequence
+                           [ maybe (newLocal (fsLit "conrep") ty) pure mb
+                           | (mb, ty) <- zipEqual mb_binders wrap_arg_tys ]
+                       ; let explicit_args = dropList stupid_theta args
+                       ; body <- mk_rep_app (explicit_args `zip` dropList eq_tys unboxers)
+                                            (mkCoApps initial_wrap_app refls)
+                       ; return (args, body) }
              else do { args <- mapM (newLocal (fsLit "conrep")) wrap_arg_tys
                      ; let explicit_args = dropList stupid_theta args
                      ; body <- case explicit_args of
