@@ -3701,7 +3701,7 @@ tc_app_ty_external mode rn_ty exp_kind
                      ; case observed of
                          Just (result, result_kind) ->
                            checkExpKind mode rn_ty result result_kind exp_kind
-                         Nothing -> executable_call fun args }
+                         Nothing -> unsupported name }
              (_, Just (fun, _), Just [arg])
                | isTypeLevel (mode_tyki mode)
                , Just (wildcards, call_owner, pending) <- mode_pending_calls mode
@@ -3724,7 +3724,10 @@ tc_app_ty_external mode rn_ty exp_kind
                | isTypeLevel (mode_tyki mode)
                , not (null args)
                , ordinary_call || (ready_partial_call && length args == 1)
-               -> executable_call fun args
+               -> do { staging <- closedOperandStaging args
+                     ; if isJust staging
+                         then executable_call fun args
+                         else unsupported name }
              _ -> unsupported name
            else imported_call env rdr name }
 
@@ -3970,7 +3973,11 @@ tc_app_ty_external mode rn_ty exp_kind
   , ordinary_call || (lengthIs args 1 && ready_partial_call)
   = do { fallback <- localFallbackFamilyOwner name
        ; case fallback of
-           Just fun -> setSrcSpanA loc (fallback_executable_call fun args)
+           Just fun -> setSrcSpanA loc $ do
+             staging <- closedOperandStaging args
+             if isJust staging
+               then fallback_executable_call fun args
+               else failWithTc (TcRnNoSourceTable (getName fun))
            Nothing
              | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
                  staging <- closedOperandStaging args
@@ -4615,9 +4622,13 @@ tcPlanClosedTree mode ordinary hint root arguments = do
       = setSrcSpan loc $ do
           fallback <- localFallbackFamilyOwner child
           case fallback of
-            Just fun
-              | any bare_empty args -> return (ClosedBoundary arg expected)
-              | otherwise           -> collect False fun (Just expected) args
+            Just fun -> do
+              staging <- closedOperandStaging args
+              if isJust staging
+                then if any bare_empty args
+                       then return (ClosedBoundary arg expected)
+                       else collect False fun (Just expected) args
+                else failWithTc (TcRnNoSourceTable (getName fun))
             Nothing -> do
               staging <- closedOperandStaging args
               table <- tcLookupTyCon child
@@ -4950,7 +4961,11 @@ tcPlanClosedHead mode ordinary_call hint rdr name args
   | isSourceFamilyName name = do
       fallback <- localFallbackFamilyOwner name
       case fallback of
-        Just fun -> tcPlanOrdinaryCall mode ordinary_call hint fun args
+        Just fun -> do
+          staging <- closedOperandStaging args
+          if isJust staging
+            then tcPlanOrdinaryCall mode ordinary_call hint fun args
+            else failWithTc (TcRnNoSourceTable (getName fun))
         Nothing -> do
           staging <- closedOperandStaging args
           executable <- tcClosedCaseExecutableOwner True rdr name args staging
@@ -4970,7 +4985,11 @@ tcPlanClosedHead mode ordinary_call hint rdr name args
       env <- getGblEnv
       if nameIsLocalOrFrom (tcg_semantic_mod env) name
         then case lookupNameEnv (tcg_local_open_defs env) name of
-               Just (fun, _) -> tcPlanOrdinaryCall mode ordinary_call hint fun args
+               Just (fun, _) -> do
+                 staging <- closedOperandStaging args
+                 if isJust staging
+                   then tcPlanOrdinaryCall mode ordinary_call hint fun args
+                   else failWithTc (TcRnNoSourceTable name)
                Nothing       -> failWithTc (TcRnNoSourceTable name)
         else do
           thing <- tcLookupGlobal name
@@ -5001,23 +5020,32 @@ closed arguments (and either did not reserve a SourceTable or did not produce
 one), GHC evaluates the closed call in-module via the interpreter just like an
 imported closed call:
 
-1. Staging and fallback (GHC.Rename.Env, GHC.Tc.Module):
+1. Staging and open-vs-closed fallback (GHC.Rename.Env, GHC.Tc.Module, GHC.Tc.Gen.HsType):
    * Lookup in ordinary type-application and callback positions records local
      value demands in tcg_local_open_demands.
    * tcLocalOpenGroup and tcTopSrcTablesWith typecheck, solve, zonk (including
      top-level EvBinds), and desugar the earlier binding group into
      tcg_local_open_defs.
+   * Only closed operand trees (accepted by closedOperandStaging) enter the
+     same-module closed evaluator. When a local binding lacks a certified
+     SourceTable and an application contains open type variables or runtime
+     indices, GHC reports TcRnNoSourceTable (GHC-68947).
 
-2. Bytecode caching and execution (GHC.Tc.Gen.Splice, GHC.Driver.Main.Passes):
+2. Bytecode caching and post-plugin validation (GHC.Tc.Gen.Splice, GHC.Driver.Main.Passes):
    * Before hscCompileCoreExpr executes the closed call's IO String wrapper,
      rewriteSameModuleClosedExpr rewrites references to solved bindings in
-     tcg_local_open_defs to deterministic interactive BCO GlobalIds.
+     tcg_local_open_defs to deterministic interactive BCO GlobalIds and records
+     the evaluated local binding names in tcg_evaluated_term_uses.
    * hscLoadSameModuleClosedBcos compiles any uncached bindings (plus info
      tables for earlier local algebraic datatypes in tcg_tcs) once via
      byteCodeGen + loadDecls into the active interpreter's bco_loader_state.
      Because the BCOs live in interactive in-memory modules and local info
      tables are already registered in bco_loader_state, execution works under
      -fno-code and never loads a stale on-disk .o file for the current module.
+   * GHC.Core.Opt.Pipeline tracks top-level bindings mutated by CoreDoPluginPass,
+     and GHC.Driver.Main.Passes rejects the module with TcRnNoSourceTable when
+     an active CoreDoPluginPass mutates a local binding evaluated in types (or
+     when an active latePlugin is installed).
 -}
 
 -- | Share the input and result kind constraints of a saturated constructor case.

@@ -6,7 +6,18 @@
 
 {-# LANGUAGE CPP #-}
 
-module GHC.Core.Opt.Pipeline ( core2core, core2coreRetained, runRetainedCorePluginPasses, simplifyExpr, pairObservationOcc, pairObservationType, scalarRecipeTableOcc ) where
+module GHC.Core.Opt.Pipeline
+  ( core2core
+  , core2coreWithPluginMutations
+  , core2coreRetained
+  , core2coreRetainedWithPluginMutations
+  , runRetainedCorePluginPasses
+  , runRetainedCorePluginPassesWithPluginMutations
+  , simplifyExpr
+  , pairObservationOcc
+  , pairObservationType
+  , scalarRecipeTableOcc
+  ) where
 
 import GHC.Prelude
 
@@ -46,6 +57,7 @@ import GHC.Types.Var (Var, VarBndr(Bndr))
 import GHC.Types.Var.Set (emptyVarSet, elemVarSet, extendVarSet)
 import GHC.Core.Dependent
 import GHC.Core.Lint ( endScopedDictionaryPassIO )
+import GHC.Core.Map.Expr ( eqCoreExpr )
 import GHC.Core.SimpleOpt (simpleOptNativeProgram, simpleOptPgm)
 import GHC.Core.Opt.CSE  ( cseProgramWithMode )
 import GHC.Core.Rules   ( RuleBase, ruleCheckProgram, getRules )
@@ -88,11 +100,14 @@ import GHC.Types.Tickish ( tickishIsCode )
 import GHC.Types.Var.Env ( mkRnEnv2, emptyInScopeSet, mkVarEnv, lookupVarEnv )
 import GHC.Types.InlinePragma ( CompilerPhase(..), neverInlinePragma )
 import GHC.Types.Demand ( zapDmdEnvSig )
+import GHC.Types.Name.Env ( mkNameEnv, lookupNameEnv )
 import GHC.Types.Name.Ppr
+import GHC.Types.Name.Set ( NameSet, mkNameSet, unionNameSet )
 import GHC.Types.Unique.Supply ( UniqueTag(..) )
 
 import Control.Monad
 import Control.Monad.Trans.Maybe (MaybeT(..))
+import Data.IORef ( IORef, modifyIORef' )
 import Data.Maybe (catMaybes, isJust)
 import GHC.Unit.Module
 
@@ -111,25 +126,37 @@ simplifyExpr logger euc opts expr = do
   Simplify.simplifyExpr logger euc opts expr
 
 core2core :: HscEnv -> ModGuts -> IO ModGuts
-core2core = core2coreFor OrdinaryCore
+core2core = core2coreWithPluginMutations Nothing
+
+-- | Run the standard Core optimizer while recording top-level bindings mutated by 'CoreDoPluginPass'.
+core2coreWithPluginMutations :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO ModGuts
+core2coreWithPluginMutations mb_mut_ref = core2coreFor mb_mut_ref OrdinaryCore
 
 -- | Run the standard optimizer for a module that passed the retained gate.
 core2coreRetained :: HscEnv -> ModGuts -> IO ModGuts
-core2coreRetained = core2coreFor RetainedCore
+core2coreRetained = core2coreRetainedWithPluginMutations Nothing
+
+-- | Run the retained Core optimizer while recording top-level bindings mutated by 'CoreDoPluginPass'.
+core2coreRetainedWithPluginMutations :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO ModGuts
+core2coreRetainedWithPluginMutations mb_mut_ref = core2coreFor mb_mut_ref RetainedCore
 
 -- | Run Core-to-Core plugin passes installed on an @-O0@ retained module.
 -- See Note [Plugin hooks and Dependent Haskell pipelines] in GHC.Driver.Plugins.
 runRetainedCorePluginPasses :: HscEnv -> ModGuts -> IO ModGuts
-runRetainedCorePluginPasses hsc_env guts@(ModGuts { mg_module  = mod
-                                                  , mg_loc     = loc
-                                                  , mg_rdr_env = rdr_env })
+runRetainedCorePluginPasses = runRetainedCorePluginPassesWithPluginMutations Nothing
+
+-- | Run @-O0@ retained Core plugin passes while recording mutated top-level bindings.
+runRetainedCorePluginPassesWithPluginMutations :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO ModGuts
+runRetainedCorePluginPassesWithPluginMutations mb_mut_ref hsc_env guts@(ModGuts { mg_module  = mod
+                                                                                , mg_loc     = loc
+                                                                                , mg_rdr_env = rdr_env })
   = do { hpt_rule_base <- hugRulesBelow hsc_env (moduleUnitId mod)
                             (GWIB { gwib_mod = moduleName mod, gwib_isBoot = NotBoot })
        ; (guts2, _) <- runCoreM hsc_env hpt_rule_base SimplTag mod name_ppr_ctx loc $
                          do { hsc_env' <- getHscEnv
                             ; raw_passes <- withPlugins (hsc_plugins hsc_env') installCoreToDos []
                             ; let passes = foldr adaptRetainedPass [] raw_passes
-                            ; optimized <- runCorePasses RetainedCore passes guts
+                            ; optimized <- runCorePasses mb_mut_ref RetainedCore passes guts
                             ; pure (optimized { mg_binds = simpleOptNativeProgram (mg_binds optimized) }) }
        ; return guts2 }
   where
@@ -149,8 +176,8 @@ adaptRetainedPass (CoreDoPasses ps) rest =
   CoreDoPasses (foldr adaptRetainedPass [] ps) : rest
 adaptRetainedPass pass rest = pass : rest
 
-core2coreFor :: SimplCoreMode -> HscEnv -> ModGuts -> IO ModGuts
-core2coreFor mode hsc_env guts@(ModGuts { mg_module  = mod
+core2coreFor :: Maybe (IORef NameSet) -> SimplCoreMode -> HscEnv -> ModGuts -> IO ModGuts
+core2coreFor mb_mut_ref mode hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_loc     = loc
                                 , mg_rdr_env = rdr_env })
   = do { hpt_rule_base <- home_pkg_rules
@@ -165,7 +192,7 @@ core2coreFor mode hsc_env guts@(ModGuts { mg_module  = mod
                               ; let all_passes = case mode of
                                       OrdinaryCore -> raw_passes
                                       RetainedCore -> foldr adaptRetainedPass [] raw_passes
-                              ; optimized <- runCorePasses mode all_passes guts
+                              ; optimized <- runCorePasses mb_mut_ref mode all_passes guts
                               ; let final
                                       | RetainedCore <- mode
                                       = optimized { mg_binds = simpleOptNativeProgram (mg_binds optimized) }
@@ -679,8 +706,27 @@ This extra run of the simplifier has a cost, but this is only with -O2.
 ************************************************************************
 -}
 
-runCorePasses :: SimplCoreMode -> [CoreToDo] -> ModGuts -> CoreM ModGuts
-runCorePasses mode passes guts
+-- | Collect top-level binder names mutated or given new user rules by a 'CoreDoPluginPass'.
+pluginMutatedBinders :: ModGuts -> ModGuts -> NameSet
+pluginMutatedBinders before_guts after_guts =
+  let strip_non_code = stripTicksE (not . tickishIsCode)
+      before_flat = flattenBinds (mg_binds before_guts)
+      after_map   = mkNameEnv [ (idName b, (b, rhs)) | (b, rhs) <- flattenBinds (mg_binds after_guts) ]
+      unchanged (b_old, rhs_old)
+        | Just (b_new, rhs_new) <- lookupNameEnv after_map (idName b_old)
+        = idType b_old `eqType` idType b_new &&
+          eqCoreExpr (strip_non_code rhs_old) (strip_non_code rhs_new)
+        | otherwise = False
+      mutated_binds = [ idName b_old | pair@(b_old, _) <- before_flat, not (unchanged pair) ]
+      before_rule_cnt = length (mg_rules before_guts)
+      added_rule_heads =
+        [ fn
+        | length (mg_rules after_guts) /= before_rule_cnt
+        , Rule { ru_auto = False, ru_fn = fn } <- mg_rules after_guts ]
+  in mkNameSet (mutated_binds ++ added_rule_heads)
+
+runCorePasses :: Maybe (IORef NameSet) -> SimplCoreMode -> [CoreToDo] -> ModGuts -> CoreM ModGuts
+runCorePasses mb_mut_ref mode passes guts
   = do { when (mode == OrdinaryCore) $ liftIO $
            rejectNativeDependentProgram "the Core optimization pipeline" (mg_binds guts) (mg_rules guts)
        ; foldM do_pass guts passes }
@@ -691,10 +737,14 @@ runCorePasses mode passes guts
       logger <- getLogger
       withTiming logger (ppr pass <+> brackets (ppr mod))
                    (const ()) $ do
-            guts' <- lintAnnots (ppr pass) (doCorePassFor mode pass) guts
+            guts' <- lintAnnots (ppr pass) (doCorePassFor mb_mut_ref mode pass) guts
             case pass of
-              CoreDoPluginPass{} | mode == OrdinaryCore -> liftIO $
-                rejectNativeDependentProgram "the output of a Core plugin" (mg_binds guts') (mg_rules guts')
+              CoreDoPluginPass{} -> liftIO $ do
+                when (mode == OrdinaryCore) $
+                  rejectNativeDependentProgram "the output of a Core plugin" (mg_binds guts') (mg_rules guts')
+                case mb_mut_ref of
+                  Just mut_ref -> modifyIORef' mut_ref (`unionNameSet` pluginMutatedBinders guts guts')
+                  Nothing      -> pure ()
               _ -> pure ()
             if mode == RetainedCore && hasScopedDictionaryProgram (mg_binds guts')
               then do
@@ -708,8 +758,8 @@ runCorePasses mode passes guts
 
     mod = mg_module guts
 
-doCorePassFor :: SimplCoreMode -> CoreToDo -> ModGuts -> CoreM ModGuts
-doCorePassFor core_mode pass guts = do
+doCorePassFor :: Maybe (IORef NameSet) -> SimplCoreMode -> CoreToDo -> ModGuts -> CoreM ModGuts
+doCorePassFor mb_mut_ref core_mode pass guts = do
   logger    <- getLogger
   hsc_env   <- getHscEnv
   dflags    <- getDynFlags
@@ -788,7 +838,7 @@ doCorePassFor core_mode pass guts = do
     CoreDoRuleCheck phase pat -> {-# SCC "RuleCheck" #-}
                                  ruleCheckPass phase pat guts
     CoreDoNothing             -> return guts
-    CoreDoPasses passes       -> runCorePasses core_mode passes guts
+    CoreDoPasses passes       -> runCorePasses mb_mut_ref core_mode passes guts
 
     CoreDoPluginPass _ p      -> {-# SCC "Plugin" #-} p guts
 

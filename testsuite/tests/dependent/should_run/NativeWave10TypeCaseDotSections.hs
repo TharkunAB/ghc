@@ -12,6 +12,7 @@ import Control.Monad (unless)
 import Data.Char (toUpper)
 import Data.Kind (Type)
 import Data.Type.Equality ((:~:) (Refl))
+import GHC.Exists (data Pack)
 import GHC.Sigma (Sigma (Pair), first)
 import GHC.Sigma.Projection (second)
 import GHC.Types (Matchability)
@@ -56,6 +57,20 @@ unitOnlyTypeCase a = case a of
   () -> Just ()
   _  -> Nothing
 
+data PunBox where
+  PunBox :: forall a -> a -> (a -> Int) -> PunBox
+
+openPunBoxAndPack :: PunBox -> (exists x | (x, x -> Int)) -> Int
+openPunBoxAndPack pb pkg =
+  let n1 = case pb of
+        PunBox (type a) (v :: a) f -> f v
+      n2 = case pkg of
+        Pack (type b) pair -> case pair of (w, g) -> g (w :: b)
+  in n1 P.+ n2
+
+samplePackPair :: exists x | (x, x -> Int)
+samplePackPair = Pack (type Int) (20, (P.+ 7))
+
 checkTypeCase :: Bool
 checkTypeCase =
      defaultVal Int == Just 0
@@ -76,6 +91,7 @@ checkTypeCase =
   && invisTypeCase @Char == Nothing
   && unitOnlyTypeCase () == Just ()
   && unitOnlyTypeCase Int == Nothing
+  && openPunBoxAndPack (PunBox (type Int) 10 (P.+ 5)) samplePackPair == 42
 
 --------------------------------------------------------------------------------
 -- 2. Proposal #282 + R04: Dependent `OverloadedRecordDot`

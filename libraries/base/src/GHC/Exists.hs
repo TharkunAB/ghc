@@ -11,6 +11,7 @@ combinators for erased existential packages (GHC Proposal #473).
 enabled.
 -}
 module GHC.Exists (
+  Exists,
   pattern Pack,
   type (/\) (..),
   discardEvidence,
@@ -21,10 +22,14 @@ module GHC.Exists (
   uncurryExists,
 ) where
 
-import GHC.Internal.Types (Constraint, Type, U)
+import GHC.Internal.Types (Constraint, Matchability, Type)
 #if __GLASGOW_HASKELL__ >= 1001
 import qualified GHC.Essentials as Rebindable
 #endif
+
+-- | An erased existential package parameterized by its witness predicate.
+type Exists :: forall {k} {m :: Matchability}. (k %m -> Type) -> Type
+type Exists p = exists x | p x
 
 -- This declaration gives Pack a constructor name for ordinary import and
 -- export processing. Its type is private and its constructor is not used
@@ -54,7 +59,7 @@ data Witness a where
 -- | Open an explicit existential package and pass its erased witness and
 -- payload to a continuation.
 withExists
-  :: forall {k} (p :: k %U -> Type) r.
+  :: forall {k} {m :: Matchability} (p :: k %m -> Type) r.
      (exists (x :: k) | p x)
   -> (forall (x :: k) -> p x -> r)
   -> r
@@ -64,7 +69,8 @@ withExists pkg k = case pkg of
 -- | Transform the payload of an explicit existential package at the same
 -- erased witness.
 mapExists
-  :: forall {k} (p :: k %U -> Type) (q :: k %U -> Type).
+  :: forall {k} {mp :: Matchability} {mq :: Matchability}
+            (p :: k %mp -> Type) (q :: k %mq -> Type).
      (forall (x :: k) -> p x -> q x)
   -> (exists (x :: k) | p x)
   -> (exists (x :: k) | q x)
@@ -74,7 +80,8 @@ mapExists f pkg = case pkg of
 -- | Open a nested two-witness explicit existential package and pass both
 -- erased witnesses and the payload to a continuation.
 uncurryExists
-  :: forall {k1} {k2} (p :: k1 %U -> k2 %U -> Type) r.
+  :: forall {k1} {k2} {m1 :: Matchability} {m2 :: Matchability}
+            (p :: k1 %m1 -> k2 %m2 -> Type) r.
      (exists (x :: k1) (y :: k2) | p x y)
   -> (forall (x :: k1) (y :: k2) -> p x y -> r)
   -> r

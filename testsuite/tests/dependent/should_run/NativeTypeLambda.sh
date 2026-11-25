@@ -499,7 +499,7 @@ type Bad = (\x -> x)
 HS
 if "${g[@]}" -c Disabled.hs >disabled.log 2>&1 ||
    ! grep -Eq '^Disabled[.]hs:3:13: error: \[GHC-27184\]' disabled.log ||
-   ! grep -Fq 'Type lambdas require -XExperimentalDependentTypes' disabled.log; then
+   ! grep -Fq 'Type lambdas require -XDependentTypes' disabled.log; then
     cat disabled.log >&2
     exit 1
 fi

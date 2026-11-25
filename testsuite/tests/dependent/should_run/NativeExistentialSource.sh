@@ -123,7 +123,7 @@ for bad in Escape Scope WrongWitnessKind WitnessTerm WrongPayload MissingSchema 
     WitnessTerm) expected='Illegal term-level use of the type variable' ;;
     MissingSchema) expected='needs an explicit existential type when' ;;
     WrongSchema) expected='The available type is' ;;
-    WithoutExtension) expected='requires -XExperimentalDependentTypes' ;;
+    WithoutExtension) expected='requires -XDependentTypes' ;;
     RecordMarker) expected='explicit existential application or a sole case alternative' ;;
     OverSat) expected='Apply GHC.Exists.Pack to a required type witness and a payload' ;;
   esac

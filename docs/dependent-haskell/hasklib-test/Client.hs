@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, AllowAmbiguousTypes, ExplicitNamespaces, ExperimentalDependentTypes, Modifiers, RequiredTypeArguments #-}
+{-# LANGUAGE GHC2024, AllowAmbiguousTypes, DependentTypes, ListTuplePuns #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 
 module Client (mapLaw, zipLaw, addUnder, lengthAppendSingleton, checkAppendSingleton, checkReverse, zipMapLaw, checkZipMap, checkNat, foldrPlusAppend, foldrPlusZero, checkFoldrAndMatchability, checkPublicSurface) where
@@ -117,14 +117,13 @@ checkFoldrAndMatchability xs ys =
 -- | Exercise M, U, Pack, Sigma, Vec, Fin, and heterogeneous equality from HaskLib.
 type MatchArrow (a :: Type) (b :: Type) = a %H.M -> b
 type UnmatchArrow (a :: Type) (b :: Type) = a %H.U -> b
-type ErasedVec a = exists (n :: H.Nat) | H.Vec a n
+type ErasedVec a = H.Exists (H.Vec a)
 
 packSampleVec :: ErasedVec Char
 packSampleVec = H.Pack (type ('H.Succ 'H.Zero)) (H.VCons 'z' H.VNil)
 
 readErasedVec :: ErasedVec Char -> [Char]
-readErasedVec pkg = case pkg of
-    H.Pack (type _) v -> H.toListVec v
+readErasedVec pkg = H.withExists pkg (\_ v -> H.toListVec v)
 
 checkPublicSurface :: Bool
 checkPublicSurface =
@@ -135,9 +134,17 @@ checkPublicSurface =
         vec2  = H.VCons 'p' (H.VCons 'q' H.VNil)
         sig   = H.Pair (H.Succ (H.Succ H.Zero)) vec2 :: H.SomeVec Char
         het   = H.HRefl :: 'N.Zero H.:~~: 'N.Zero
+        mapped :: ErasedVec String
+        mapped = H.mapExists (\_ v -> H.mapVec (: []) v) packSampleVec
+        evPair = H.MkCPair (17 :: Int) :: Show Int H./\ Int
+        witOk  = case H.Witness @Bool of H.Witness -> True
     in case (H.sym (congM @'N.Succ H.Refl), congU @(N.plus 'N.Zero) H.Refl, het) of
         (H.Refl, H.Refl, H.HRefl) ->
             readErasedVec packSampleVec == "z"
+                && H.withExists mapped (\_ v -> H.toListVec v) == ["z"]
+                && H.withEvidence evPair show == "17"
+                && H.discardEvidence evPair == 17
+                && witOk
                 && H.lookupVec H.FZ vec2 == 'p'
                 && H.lookupVec (H.FS H.FZ) vec2 == 'q'
                 && H.natToInt (H.first sig) == 2

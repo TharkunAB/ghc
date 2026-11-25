@@ -194,6 +194,7 @@ import qualified BookReverseProof
 import qualified ExplicitListReverse
 import qualified BookWave3Proposal378 as Wave3
 import qualified BookWave8Proposal378 as Wave8
+import qualified BookWave12RoadmapClosure as Wave12
 import qualified BookNaturals
 import qualified CastedConstructorGivens as TreeProof
 import qualified SumOfSizes
@@ -2386,6 +2387,18 @@ main = do
     observe "reassociate polymorphic nested domains and project HaskLib vectors"
         ( Wave8.assocProdRoundTrip ((True, 'k'), 2 :: Wave8.Peano)
         , Wave8.haskLibSecondLookup "hi" )
+    observe "inline DepFunTy unfoldings, promoted Char# and (# , #), and closed fib"
+        ( HaskLib.toListVec (Wave12.inlConsVec (HaskLib.Succ HaskLib.Zero) 9 (HaskLib.VCons 4 HaskLib.VNil))
+        , (Wave12.primCharRefl, Wave12.unboxedSwapRefl)
+        , (Wave12.sameModuleFibProof, Wave12.standaloneItemProof) )
+    observe "match runtime Type witnesses, dependent record dot, and superclass selectors"
+        ( (Wave12.describeType Int, Wave12.describeType [Char], Wave12.describeType Double)
+        , Wave12.checkDependentDot "ab"
+        , Wave12.observeSubGate True )
+    observe "apply T2T operator sections, GHC.Exists combinators, linear foreach, and local type"
+        ( (Wave12.congRightPlus @(HaskLib.Succ HaskLib.Zero) @(HaskLib.Succ HaskLib.Zero) (HaskLib.Succ HaskLib.Zero) Refl, Wave12.congRightCons @Char @'x' @'x' @'[ 'y' ] Refl)
+        , Wave12.upperExistsVec
+        , (Wave12.checkLinearAndRefute, Wave12.localTypeSynCheck) )
 
 -- | Complement one flag at the type level.
 type family FlipFlag (b :: Bool) :: Bool where

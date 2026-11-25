@@ -2579,33 +2579,19 @@ tcTopSrcTablesWith prev_deriv group = do
                 [ goptM Opt_DeferTypeErrors
                 , goptM Opt_DeferTypedHoles
                 , goptM Opt_DeferOutOfScopeVariables ]
-              let fallback_demands =
-                    [ (term, nameSrcSpan term)
-                    | (term, family) <- needed
-                    , term `elemNameSet` early_names
-                    , not (family `elemNameSet` found)
-                    , not (family `elemNameSet` used_in_early) ]
-                  all_early_demands =
+              let all_early_demands =
                     [ (nm, nameSrcSpan nm) | nm <- nameSetElemsStable early_names ]
               for_ needed $ \(term, family) ->
-                when (family `elemNameSet` used_in_early
-                      || (term `elemNameSet` early_names
-                          && not (family `elemNameSet` found)
-                          && not has_interp)) $
+                when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
                   unless (family `elemNameSet` found) $
                     setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
-              when (not (null fallback_demands) && defer_on) $
-                checkLocalOpenDeferrals fallback_demands
               failIfErrsM
               local_defs <-
-                if not (null fallback_demands)
-                  then localOpenDefinitions fallback_demands
-                         (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
-                  else if has_interp && not defer_on
-                    then tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
-                           (localOpenDefinitions all_early_demands
-                             (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
-                    else pure (emptyNameEnv, emptyNameEnv)
+                if has_interp && not defer_on
+                  then tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                         (localOpenDefinitions all_early_demands
+                           (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
+                  else pure (emptyNameEnv, emptyNameEnv)
               addTopEvBinds evs $ do
                 tables_env <- installEarlyTables (tables, companions, helpers)
                 setGblEnv tables_env $

@@ -762,12 +762,18 @@ Proposal #378 §4.9 allows runtime pattern matching `case a of` on a retained
 Because the parser builds `ConPat` and `ListPat` in the data constructor
 namespace, `lookupConCps` would reject `Int`, `Bool`, `Char`, or `Maybe` before
 the typechecker sees `a :: TypeRep a_tv`. When `-XExperimentalDependentTypes` is
-active, the scrutinee is a local variable, and at least one branch contains an
-explicit `EmbTyPat` or a `ConPat` head in scope in the type namespace rather
+active, the scrutinee is a local variable, and at least one branch contains a
+top-level `EmbTyPat` or a `ConPat` head in scope in the type namespace rather
 than the data namespace, `rnTypeCaseMatchesMaybe` translates each non-catch-all
 pattern into `HsType GhcPs` and renames it via `rnHsTypeApp` into `EmbTyPat`.
 In-scope type variables (such as `b` in `Maybe b ->`) resolve to their outer
 bindings instead of fresh pattern binders.
+
+Do not classify a `ConPat` whose head is absent from the type namespace (such as
+`GHC.Exists.Pack`) or that carries a nested `EmbTyPat` argument (such as
+`Pack (type x) payload` or `MkBox (type a) x` under `TypeAbstractions`) as a
+runtime `Type` pattern. Those patterns are ordinary or existential term patterns
+that bind fresh type and value variables over their right-hand sides.
 -}
 
 -- | Rename `case` alternatives as embedded type patterns when scrutinizing a
@@ -792,24 +798,31 @@ rnTypeCaseMatchesMaybe scrut matches@(MG { mg_alts = L lm alts, mg_ext = (origin
     _ -> pure Nothing
   where
     is_definite_type_alt :: LMatch GhcPs (LHsExpr GhcPs) -> RnM Bool
-    is_definite_type_alt (L _ Match { m_pats = L _ [pat] }) = is_definite_type_pat pat
+    is_definite_type_alt (L _ Match { m_pats = L _ [pat] }) = is_definite_top_type_pat pat
     is_definite_type_alt _ = pure False
 
-    is_definite_type_pat :: LPat GhcPs -> RnM Bool
-    is_definite_type_pat (L _ pat) = case pat of
-      ParPat _ inner -> is_definite_type_pat inner
-      EmbTyPat{} -> pure True
+    is_definite_top_type_pat :: LPat GhcPs -> RnM Bool
+    is_definite_top_type_pat (L _ (ParPat _ inner)) = is_definite_top_type_pat inner
+    is_definite_top_type_pat (L _ EmbTyPat{})       = pure True
+    is_definite_top_type_pat pat                    = is_definite_inner_type_pat pat
+
+    is_definite_inner_type_pat :: LPat GhcPs -> RnM Bool
+    is_definite_inner_type_pat (L _ pat) = case pat of
+      ParPat _ inner -> is_definite_inner_type_pat inner
+      EmbTyPat{} -> pure False
       ConPat _ (L _ rdr) details -> do
         mb_dc <- lookupOccRn_maybe rdr
-        is_tycon <- case (mb_dc, promoteRdrName rdr) of
-          (Nothing, Just tc_rdr) -> isJust <$> lookupOccRn_maybe tc_rdr
-          _                      -> pure False
-        if is_tycon
-          then pure True
-          else anyM is_definite_type_pat (hsConPatArgs details)
-      ListPat _ ps -> anyM is_definite_type_pat ps
-      TuplePat _ ps Boxed -> anyM is_definite_type_pat ps
-      SigPat _ inner _ -> is_definite_type_pat inner
+        has_tycon <- case promoteRdrName rdr of
+          Just tc_rdr -> isJust <$> lookupOccRn_maybe tc_rdr
+          Nothing     -> pure False
+        if not has_tycon
+          then pure False
+          else if isNothing mb_dc
+            then pure True
+            else anyM is_definite_inner_type_pat (hsConPatArgs details)
+      ListPat _ [p] -> is_definite_inner_type_pat p
+      TuplePat _ ps Boxed -> anyM is_definite_inner_type_pat ps
+      SigPat _ inner _ -> is_definite_inner_type_pat inner
       _ -> pure False
 
     is_catch_all_pat :: LPat GhcPs -> Bool
@@ -820,7 +833,7 @@ rnTypeCaseMatchesMaybe scrut matches@(MG { mg_alts = L lm alts, mg_ext = (origin
 
     valid_alt_shape :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
     valid_alt_shape (L _ Match { m_pats = L _ [pat] }) =
-      is_catch_all_pat pat || isJust (patToHsTypePs pat)
+      is_catch_all_pat pat || isJust (patToHsTypeTopPs pat)
     valid_alt_shape _ = False
 
     rn_alt :: LMatch GhcPs (LHsExpr GhcPs) -> RnM (LMatch GhcRn (LHsExpr GhcRn), FreeNames)
@@ -829,7 +842,7 @@ rnTypeCaseMatchesMaybe scrut matches@(MG { mg_alts = L lm alts, mg_ext = (origin
           (MG { mg_alts = L _ [m'] }, fvs) <-
             rnMatchGroup CaseAlt rnLExpr (matches { mg_alts = L lm [m] })
           pure (m', fvs)
-      | Just hs_ty <- patToHsTypePs pat = do
+      | Just hs_ty <- patToHsTypeTopPs pat = do
           (HsWC wcs hs_ty', _, pat_fvs) <- setSrcSpanA ploc $ rnHsTypeApp (HsWC noExtField hs_ty)
           let pat' = L ploc (EmbTyPat noExtField (HsTP (HsTPRn wcs [] []) hs_ty'))
           (grhss', rhs_fvs) <- setSrcSpanA mloc $ rnGRHSs CaseAlt rnLExpr grhss
@@ -840,10 +853,15 @@ rnTypeCaseMatchesMaybe scrut matches@(MG { mg_alts = L lm alts, mg_ext = (origin
                , pat_fvs `plusFN` rhs_fvs )
     rn_alt m = pprPanic "rnTypeCaseMatchesMaybe" (ppr m)
 
--- | Convert a parsed case pattern into the corresponding surface type.
+-- | Convert a top-level runtime `Type` case pattern into a surface type.
+patToHsTypeTopPs :: LPat GhcPs -> Maybe (LHsType GhcPs)
+patToHsTypeTopPs (L l (ParPat _ inner))     = L l . HsParTy noAnn <$> patToHsTypeTopPs inner
+patToHsTypeTopPs (L _ (EmbTyPat _ (HsTP _ t))) = Just t
+patToHsTypeTopPs pat                        = patToHsTypePs pat
+
+-- | Convert a nested runtime `Type` case subpattern into a surface type.
 patToHsTypePs :: LPat GhcPs -> Maybe (LHsType GhcPs)
 patToHsTypePs (L l pat) = case pat of
-  EmbTyPat _ (HsTP _ t) -> Just t
   ParPat _ inner -> L l . HsParTy noAnn <$> patToHsTypePs inner
   VarPat _ (L vl rdr) ->
     let tv_rdr = fromMaybe rdr (promoteRdrName rdr)

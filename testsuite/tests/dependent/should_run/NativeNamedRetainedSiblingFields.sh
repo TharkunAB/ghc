@@ -375,7 +375,7 @@ import PackedVecLibrary (Nat(..), Vec)
 wrong :: NamedColumns -> Vec Bool 'Z
 wrong p = p.namedFlags
 HS
-    reject 'GHC-39999' BadSelection.hs
+    reject 'GHC-(39999|83865)' BadSelection.hs
 
     cat > BadUpdate.hs <<'HS'
 module BadUpdate where

@@ -1653,9 +1653,10 @@ already uses the ordinary operand renamer in either case.
 -- | Carry the operand test to the head of a parenthesized application.
 rnLHsAppHead :: RnTyKiEnv -> (Bool, Bool) -> LHsType GhcPs -> RnM (LHsType GhcRn, FreeNames)
 rnLHsAppHead env (eligible, has_sym) (L l tv@(HsTyVar ann ip name)) = setSrcSpanA l $ do
+  let allow_closed = allowLocalClosedHead env
   (tv', fvs) <- if isDataHeraldTyVar ann
-                then rnHsDataHeraldTyVar (DataHeraldAppHead (eligible && has_sym)) env tv name
-                else rnHsTyVar (lookupTypeAppHeadRn (eligible && has_sym)) env tv ip name
+                then rnHsDataHeraldTyVar (DataHeraldAppHead (eligible && has_sym) allow_closed) env tv name
+                else rnHsTyVar (lookupTypeAppHeadRn (eligible && has_sym) allow_closed) env tv ip name
   return (L l tv', fvs)
 rnLHsAppHead env state (L l (HsAppTy _ fun arg)) = setSrcSpanA l $ do
   (ty', fvs) <- rnHsAppTy env state fun arg
@@ -1665,11 +1666,18 @@ rnLHsAppHead env state (L l (HsParTy _ ty)) = do
   return (L l (HsParTy noAnn ty'), fvs)
 rnLHsAppHead env _ ty = rnLHsTyKi env ty
 
+-- | Permit unqualified local closed evaluation outside type synonym declarations,
+-- preserving open-only unqualified lookup in @type Syn = ...@.
+allowLocalClosedHead :: RnTyKiEnv -> Bool
+allowLocalClosedHead env = case rtke_ctxt env of
+  TySynCtx{} -> False
+  _          -> True
+
 -- | Syntactic role of an identifier inside an explicit @data@ herald in a type.
 -- See Note [Explicit data herald in type syntax].
 data DataHeraldPosition
   = DataHeraldBare
-  | DataHeraldAppHead !Bool
+  | DataHeraldAppHead !Bool !Bool
   | DataHeraldCallOperand
 
 -- | Test whether a parsed 'HsTyVar' was marked by an explicit @data@ herald.
@@ -1721,9 +1729,9 @@ lookupDataHeraldOcc pos rdr_name
     ty_occ = rdrNameOcc ty_rdr
 
     fallback_type rdr = case pos of
-      DataHeraldBare         -> lookupTypeOccRn rdr
-      DataHeraldAppHead open -> lookupTypeAppHeadRn open rdr
-      DataHeraldCallOperand  -> lookupTypeCallOperandRn rdr
+      DataHeraldBare                     -> lookupTypeOccRn rdr
+      DataHeraldAppHead open allow_close -> lookupTypeAppHeadRn open allow_close rdr
+      DataHeraldCallOperand              -> lookupTypeCallOperandRn rdr
 
 {- Note [Explicit data herald in type syntax]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1827,9 +1835,10 @@ rnHsTyOp env overall_ty tyop
                  = any (isOpenTypeOperandWith parsed_var (isDataOcc . rdrNameOcc)) [left, right]
                  | otherwise = False
              from_data_herald = isDataHeraldTyVar ann
+             allow_closed = allowLocalClosedHead env
        ; opgre <- if from_data_herald
-                  then lookupDataHeraldOcc (DataHeraldAppHead open_operands) op
-                  else lookupTypeAppHeadRn open_operands op
+                  then lookupDataHeraldOcc (DataHeraldAppHead open_operands allow_closed) op
+                  else lookupTypeAppHeadRn open_operands allow_closed op
        ; let opName = greName opgre
              prom' | from_data_herald = if isDataConName opName then IsPromoted else NotPromoted
                    | otherwise        = prom

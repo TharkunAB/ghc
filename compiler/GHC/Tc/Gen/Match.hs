@@ -1927,7 +1927,7 @@ synthAbsurdMatrixRow missing_cols pat_tys plan loc ext_ann matches = do
   let con_pat dc = nlConPatName (dataConName dc)
                      (replicate (dataConSourceArity dc) nlWildPatName)
   mb_resolved <- fmap sequence $ forM missing_cols $ \(col_i, idx_id, dc) -> do
-    mb <- tcRetainedCon (varType idx_id) (con_pat dc)
+    mb <- tcRetainedConScaled (Scaled (idMult idx_id) (varType idx_id)) (con_pat dc)
     pure ((col_i, idx_id,) <$> mb)
   case mb_resolved of
     Nothing -> pure Nothing

@@ -114,6 +114,7 @@ import GHC.Core.Lint ( endScopedDictionaryPassIO )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
 import GHC.Core.TyCon (TyCon, tyConName, tyConDataCons, isBoxedDataTyCon, isTypeDataTyCon)
 import GHC.Core.DataCon (dataConName)
+import GHC.Core.FVs            ( exprSomeFreeVarsList )
 import GHC.Core.Tidy           ( tidyExpr )
 import GHC.Core.Utils          ( exprType )
 import GHC.Core.Opt.Pipeline
@@ -135,6 +136,7 @@ import GHC.Parser.Errors.Types
 import GHC.Parser
 import GHC.Parser.Lexer as Lexer
 
+import GHC.Tc.Errors.Types (TcRnMessage(TcRnNoSourceTable))
 import GHC.Tc.Module
 import GHC.Tc.Utils.Monad
 
@@ -163,8 +165,8 @@ import GHC.Types.ForeignStubs
 import GHC.Types.Id
 import GHC.Types.Id.Info (IdDetails(VanillaId))
 import GHC.Types.Var (setIdDetails)
-import GHC.Types.Name.Env (filterNameEnv, mapNameEnv)
-import GHC.Types.Name.Set (NameSet, mkNameSet, elemNameSet, extendNameSetList, isEmptyNameSet)
+import GHC.Types.Name.Env (elemNameEnv, filterNameEnv, lookupNameEnv, mapNameEnv, mkNameEnv)
+import GHC.Types.Name.Set (NameSet, emptyNameSet, mkNameSet, elemNameSet, extendNameSet, extendNameSetList, isEmptyNameSet, nameSetElemsStable)
 import GHC.Types.IPE
 import GHC.Types.Name
 import GHC.Types.Name.Ppr
@@ -899,11 +901,17 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
   -- Simplify, if appropriate, and (whether we simplified or not) generate an
   -- interface file.
+  local_eval_terms <- liftIO $ localEvaluatedTermUses tc_result
+  mb_mut_ref <- if null local_eval_terms
+    then pure Nothing
+    else Just <$> liftIO (newIORef emptyNameSet)
+  let read_plugin_mutations = maybe (pure emptyNameSet) (liftIO . readIORef) mb_mut_ref
   case mb_desugar of
       -- Just cause we desugared doesn't mean we are generating code, see above.
       Just desugared_guts | backendGeneratesCode bcknd -> do
           plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
-          optimized <- hscSimplify' plugins desugared_guts
+          optimized <- hscSimplifyWithPluginMutations mb_mut_ref plugins desugared_guts
+          mutated_names <- read_plugin_mutations
           (before_tidy, after_tidy) <- splitUniqSupply <$> liftIO (mkSplitUniqSupply HscTag)
           let checked = keepValidatedSourceMappers desugared_guts optimized
               simplified_guts = checked { mg_binds = keepCheckedMapWorkers before_tidy tc_result $
@@ -914,6 +922,8 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
           let no_late_plugins = not (hasActiveLatePlugins hsc_env)
               exported_names = availsToNameSet (tcg_exports tc_result)
+          checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
+            no_late_plugins local_eval_terms (mg_binds desugared_guts) mutated_names
           checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
             (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
@@ -972,12 +982,15 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
           -- in order to inline data con wrappers but we honour whatever level of simplificication the
           -- user requested. See #22008 for some discussion.
           plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
-          simplified_guts <- hscSimplify' plugins desugared_guts
+          simplified_guts <- hscSimplifyWithPluginMutations mb_mut_ref plugins desugared_guts
+          mutated_names <- read_plugin_mutations
           (cg_guts, _) <-
               liftIO $ hscTidy hsc_env simplified_guts
 
           let no_late_plugins = not (hasActiveLatePlugins hsc_env)
               exported_names = availsToNameSet (tcg_exports tc_result)
+          checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
+            no_late_plugins local_eval_terms (mg_binds desugared_guts) mutated_names
           checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
             (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
@@ -1000,32 +1013,39 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
       -- Check a provisional source equation against optimized Core even
       -- when the interface will not contain a Core program.
       _ -> do
-        let has_early_lookups = not (null (earlyIndexedLookups tc_result))
+        added_plugins0 <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
+        let no_late_plugins = not (hasActiveLatePlugins hsc_env)
+            has_early_lookups = not (null (earlyIndexedLookups tc_result))
+            has_local_eval_plugins =
+              not (null local_eval_terms) &&
+              (hasActiveCorePlugins hsc_env || not (null added_plugins0) || not no_late_plugins)
             want_closures = gopt Opt_WriteSourceEquations dflags &&
                             xopt LangExt.ExperimentalDependentTypes dflags &&
                             null (tcg_rules tc_result) &&
                             not (gopt Opt_Hpc dflags)
         checked_tc <- case mb_desugar of
           Just guts | let has_mappers = not (null (finalCoreMappers (mg_binds guts)))
-                    , has_mappers || has_early_lookups || (want_closures && null (mg_rules guts)) -> do
-            added_plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
-            let no_late_plugins = not (hasActiveLatePlugins hsc_env)
+                    , has_mappers || has_early_lookups || has_local_eval_plugins || (want_closures && null (mg_rules guts)) -> do
+            let added_plugins = added_plugins0
                 can_publish_closures = want_closures && no_late_plugins && null (mg_rules guts)
                 retained = hasNativeDependentModuleBody (mg_binds guts) [] (mg_tcs guts)
-            if not (has_mappers || has_early_lookups || can_publish_closures)
+            if not (has_mappers || has_early_lookups || has_local_eval_plugins || can_publish_closures)
               then pure tc_result
               else do
-                non_retained_opt <- if not retained && (has_early_lookups || (has_mappers && null (mg_rules guts)) || can_publish_closures)
-                  then Just <$> hscSimplify' added_plugins guts
+                non_retained_opt <- if not retained && (has_early_lookups || has_local_eval_plugins || (has_mappers && null (mg_rules guts)) || can_publish_closures)
+                  then Just <$> hscSimplifyWithPluginMutations mb_mut_ref added_plugins guts
                   else pure Nothing
-                retained_opt <- if retained && no_late_plugins && ((has_mappers && null (mg_rules guts)) || has_early_lookups || can_publish_closures)
+                retained_opt <- if retained && no_late_plugins && ((has_mappers && null (mg_rules guts)) || has_early_lookups || has_local_eval_plugins || can_publish_closures)
                   then do
                     hsc_env_p <- if null added_plugins
                       then pure hsc_env
                       else liftIO $ initializePlugins $
                              hscUpdateFlags (\df -> foldr addPluginModuleName df added_plugins) hsc_env
-                    liftIO $ validateRetainedLookupBodies hsc_env_p guts
+                    liftIO $ validateRetainedLookupBodies mb_mut_ref hsc_env_p guts
                   else pure Nothing
+                mutated_names <- read_plugin_mutations
+                checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
+                  no_late_plugins local_eval_terms (mg_binds guts) mutated_names
                 let active_opt = if retained then retained_opt else non_retained_opt
                 when has_early_lookups $
                   checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
@@ -1058,6 +1078,8 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                       _ -> checked_mappers_tc
                   _ -> pure checked_mappers_tc
           _ -> do
+            checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
+              no_late_plugins local_eval_terms [] emptyNameSet
             when has_early_lookups $
               checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result False
                 [] [] Nothing Nothing
@@ -1108,12 +1130,12 @@ validateSimpleSourceTables original final env
 
 -- | Prepare a checked retained body for equation validation without a backend.
 -- See Note [Final Core source equations] in GHC.Tc.Gen.SourceTable.
-validateRetainedSourceBodies :: HscEnv -> ModGuts -> IO (Maybe ModGuts)
-validateRetainedSourceBodies env guts
+validateRetainedSourceBodies :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO (Maybe ModGuts)
+validateRetainedSourceBodies mb_mut_ref env guts
   | supportsNativeGentle simplified = do
       gentle <- simplifyRetainedGentle lint_env (guts { mg_binds = simplified })
       after_plugins <- if hasActiveCorePlugins lint_env
-        then runRetainedCorePluginPasses lint_env gentle
+        then runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env gentle
         else pure gentle
       pure $ if supportsNativeGentle (mg_binds after_plugins)
              then Just after_plugins
@@ -1125,21 +1147,70 @@ validateRetainedSourceBodies env guts
       (\df -> gopt_set (gopt_unset df Opt_EnableRewriteRules) Opt_DoCoreLinting) env
 
 -- | Run the active optimization pipeline on a no-code retained module with early lookups.
-validateRetainedLookupBodies :: HscEnv -> ModGuts -> IO (Maybe ModGuts)
-validateRetainedLookupBodies env guts
+validateRetainedLookupBodies :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO (Maybe ModGuts)
+validateRetainedLookupBodies mb_mut_ref env guts
   | platformNcgSupported (targetPlatform dflags)
   , Just _ <- nativeOptLevel (dflags { backend = ncgBackend })
   , null (mg_rules guts)
   , supportsNativeRuleBinds simplified
-  = Just <$> core2coreRetained (hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) env)
+  = Just <$> core2coreRetainedWithPluginMutations mb_mut_ref
+                               (hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) env)
                                (guts { mg_binds = simplified })
   | not (any (\(levels, flag) -> 0 `notElem` levels && gopt flag dflags) optLevelFlags)
   , null (mg_rules guts)
-  = validateRetainedSourceBodies env guts
+  = validateRetainedSourceBodies mb_mut_ref env guts
   | otherwise = pure Nothing
   where
     dflags = hsc_dflags env
     simplified = simpleOptNativeProgram (mg_binds guts)
+
+-- | Extract local value bindings from 'tcg_evaluated_term_uses' that were
+-- evaluated at compile time during typechecking.
+localEvaluatedTermUses :: TcGblEnv -> IO [Name]
+localEvaluatedTermUses tc_result = do
+  eval_uses <- readIORef (tcg_evaluated_term_uses tc_result)
+  let this_mod = tcg_semantic_mod tc_result
+  pure [ nm
+       | nm <- nameSetElemsStable eval_uses
+       , nameIsLocalOrFrom this_mod nm
+       , isVarName nm ]
+
+-- | Reject same-module evaluated bindings when a 'latePlugin' is active or when
+-- a 'CoreDoPluginPass' mutated the binding or one of its local helpers.
+-- See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
+checkLocalEvaluatedPluginMutations
+  :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts
+  -> TcGblEnv -> Bool -> [Name] -> [CoreBind] -> NameSet -> Hsc ()
+checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts
+                                   tc_result no_late_plugins local_eval_terms
+                                   desugared_binds mutated_names
+  | null local_eval_terms = pure ()
+  | no_late_plugins && isEmptyNameSet mutated_names = pure ()
+  | otherwise = do
+      let bind_map = mkNameEnv [ (idName b, rhs) | (b, rhs) <- flattenBinds desugared_binds ]
+          reachable :: NameSet -> [Name] -> NameSet
+          reachable seen [] = seen
+          reachable seen (n : ns)
+            | n `elemNameSet` seen = reachable seen ns
+            | Just rhs <- lookupNameEnv bind_map n
+            = let deps = [ idName v
+                         | v <- exprSomeFreeVarsList isId rhs
+                         , idName v `elemNameEnv` bind_map ]
+              in reachable (extendNameSet seen n) (deps ++ ns)
+            | otherwise = reachable (extendNameSet seen n) ns
+          invalidated owner_nm =
+            not no_late_plugins ||
+            any (`elemNameSet` mutated_names)
+                (nameSetElemsStable (reachable emptyNameSet [owner_nm]))
+          bad_owners = filter invalidated local_eval_terms
+      unless (null bad_owners) $ do
+        (msgs, _) <- liftIO $
+          initTc NoTcMPlugins hsc_env hsc_src False (tcg_mod tc_result) (tcg_top_loc tc_result) $
+            setGblEnv tc_result $ do
+              forM_ bad_owners $ \nm ->
+                setSrcSpan (nameSrcSpan nm) (addErr (TcRnNoSourceTable nm))
+              failIfErrsM
+        liftIO $ printOrThrowDiagnostics logger print_config diag_opts (GhcTcRnMessage <$> msgs)
 
 -- | Confirm that early-staged indexed lookup tables match desugared and final Core.
 checkEarlyIndexedLookups :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts
@@ -1709,7 +1780,12 @@ hscSimplify hsc_env plugins modguts =
 -- | Run Core2Core simplifier. The list of String is a list of (Core) plugin
 -- module names added via TH (cf 'addCorePlugin').
 hscSimplify' :: [String] -> ModGuts -> Hsc ModGuts
-hscSimplify' plugins ds_result = do
+hscSimplify' = hscSimplifyWithPluginMutations Nothing
+
+-- | Run Core2Core simplifier while optionally recording top-level bindings
+-- mutated by 'CoreDoPluginPass'.
+hscSimplifyWithPluginMutations :: Maybe (IORef NameSet) -> [String] -> ModGuts -> Hsc ModGuts
+hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
     hsc_env <- getHscEnv
     hsc_env_with_plugins <- if null plugins -- fast path
         then return hsc_env
@@ -1746,9 +1822,9 @@ hscSimplify' plugins ds_result = do
                                  (DriverUnsupportedRetainedBinding (Just (getOccName b)) level)
                      [] -> report module_loc (DriverUnsupportedRetainedBinding Nothing level)
           optimized <- case nativeOptLevel (hsc_dflags env) of
-            Just _ -> core2coreRetained env result
+            Just _ -> core2coreRetainedWithPluginMutations mb_mut_ref env result
             Nothing
-              | hasActiveCorePlugins env -> runRetainedCorePluginPasses env result
+              | hasActiveCorePlugins env -> runRetainedCorePluginPassesWithPluginMutations mb_mut_ref env result
               | otherwise                -> return result
           when (hasActiveCorePlugins env) $ do
             finish CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
@@ -1790,7 +1866,7 @@ hscSimplify' plugins ds_result = do
                 unless allowed $
                   report module_loc (DriverUnsupportedRetainedRule (ru_name rule) level)
               check_binds_supported supportsNativeRuleBinds level simplified
-              optimized <- core2coreRetained lint_env result
+              optimized <- core2coreRetainedWithPluginMutations mb_mut_ref lint_env result
               endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
               when (hasActiveCorePlugins lint_env) $
                 check_binds_supported supportsNativeRuleBinds level (mg_binds optimized)
@@ -1800,18 +1876,18 @@ hscSimplify' plugins ds_result = do
               endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds gentle) rules
               if hasActiveCorePlugins lint_env
                 then do
-                  optimized <- runRetainedCorePluginPasses lint_env gentle
+                  optimized <- runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env gentle
                   endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
                   check_binds_supported supportsNativeGentle 0 (mg_binds optimized)
                   return optimized
                 else return gentle
             Nothing
               | hasActiveCorePlugins lint_env -> do
-                  optimized <- runRetainedCorePluginPasses lint_env result
+                  optimized <- runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env result
                   endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
                   return optimized
               | otherwise -> return result
-        else {-# SCC "Core2Core" #-} core2core hsc_env_with_plugins ds_result
+        else {-# SCC "Core2Core" #-} core2coreWithPluginMutations mb_mut_ref hsc_env_with_plugins ds_result
 
 -- | Run one retained Gentle iteration and simplify the resulting RHSs.
 -- See Note [Retained Core in the Gentle simplifier].

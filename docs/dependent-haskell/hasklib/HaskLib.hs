@@ -5,6 +5,7 @@
 module HaskLib
     ( module HaskLib.List
     , module HaskLib.Equality
+    , module HaskLib.Exists
     , module HaskLib.Fin
     , module HaskLib.Sigma
     , module HaskLib.Vec
@@ -20,6 +21,7 @@ module HaskLib
     ) where
 
 import HaskLib.Equality
+import HaskLib.Exists
 import HaskLib.Fin
 import HaskLib.List
 import HaskLib.Nat

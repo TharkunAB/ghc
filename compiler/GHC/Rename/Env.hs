@@ -1198,16 +1198,19 @@ lookupTypeOccRn :: RdrName -> RnM GlobalRdrElt
 lookupTypeOccRn = lookupTypeOcc BareTypeOccurrence
 
 -- | Look up a name used as the head of a type application.
--- The flag says whether its operands have the syntax of open inputs.
-lookupTypeAppHeadRn :: Bool -> RdrName -> RnM GlobalRdrElt
-lookupTypeAppHeadRn = lookupTypeOcc . TypeApplicationHead
+-- The first flag says whether its operands have the syntax of open inputs;
+-- the second says whether the enclosing context permits unqualified local
+-- closed evaluation without a certified source table.
+lookupTypeAppHeadRn :: Bool -> Bool -> RdrName -> RnM GlobalRdrElt
+lookupTypeAppHeadRn open allow_local_closed =
+  lookupTypeOcc (TypeApplicationHead open allow_local_closed)
 
 -- | Look up a possible callback in an ordinary source call operand.
 lookupTypeCallOperandRn :: RdrName -> RnM GlobalRdrElt
 lookupTypeCallOperandRn = lookupTypeOcc TypeCallOperand
 
 -- | Restrict ordinary function lookup to source call heads and operands.
-data TypeOccurrence = BareTypeOccurrence | TypeApplicationHead Bool | TypeCallOperand
+data TypeOccurrence = BareTypeOccurrence | TypeApplicationHead Bool Bool | TypeCallOperand
 
 -- See Note [Demotion] and Note [Names of finite source functions].
 lookupTypeOcc :: TypeOccurrence -> RdrName -> RnM GlobalRdrElt
@@ -1236,8 +1239,8 @@ lookupTypeOcc position rdr_name
       | otherwise = demoteRdrNameTv rdr
 
     ordinaryPosition BareTypeOccurrence = Nothing
-    ordinaryPosition (TypeApplicationHead open) = Just open
-    ordinaryPosition TypeCallOperand = Just False
+    ordinaryPosition (TypeApplicationHead open allow_closed) = Just (open, allow_closed)
+    ordinaryPosition TypeCallOperand = Just (False, True)
 
     lookup_table term_rdr = do
       envs <- getRdrEnvs
@@ -1246,7 +1249,7 @@ lookupTypeOcc position rdr_name
             _ -> False
       candidates0 <- lookupSourceTables legacy_identity envs term_rdr
       candidates <- case position of
-        TypeApplicationHead False -> mapM preserveClosedReverse candidates0
+        TypeApplicationHead False _ -> mapM preserveClosedReverse candidates0
         _ -> pure candidates0
       case candidates of
         [(gre, Just table)] -> do
@@ -1263,7 +1266,7 @@ lookupTypeOcc position rdr_name
           -> do { addUsedGRE AllDeprecationWarnings gre
                 ; return gre }
         [(gre, Nothing)]
-          | Just open_operands <- ordinaryPosition position
+          | Just (open_operands, allow_local_closed) <- ordinaryPosition position
           , isVarOcc (greOccName gre)
           -> do { this_mod <- tcg_semantic_mod <$> getGblEnv
                 ; level <- getThLevel
@@ -1283,7 +1286,8 @@ lookupTypeOcc position rdr_name
                             ; addUsedGRE AllDeprecationWarnings gre
                             ; return gre }
                     else case level of
-                      Comp | isLocalGRE gre, not explicit_levels
+                      Comp | allow_local_closed || isQual term_rdr || open_operands
+                           , isLocalGRE gre, not explicit_levels
                            , isLexVarId (occNameFS (greOccName gre))
                            , nameModule_maybe name == Just this_mod ->
                         case demands of

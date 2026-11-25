@@ -1127,14 +1127,17 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
                           _ -> Nothing
                   ; case unLoc (stripParensLHsExpr scrut') of
                       HsVar _ (L _ index)
-                        | dependent, isNativeOpaqueValueId index
+                        | dependent, isNativeOpaqueValueId index, isManyTy (idMult index)
                         , isJust mb_indexed_case
                           || maybe False (isDataFamilyTyCon . fst) (splitTyConApp_maybe scrut_ty) ->
                             tcEqMult (OccurrenceOf (idName index)) mult ManyTy
+                      HsVar _ (L _ index)
+                        | Just _ <- mb_indexed_case ->
+                            tcEqMult (OccurrenceOf (idName index)) mult (idMult index)
                       _ -> return ()
                   ; matches' <- case mb_indexed_case of
                       Just index ->
-                        tcIndexedCaseMatches index ctxt (Scaled ManyTy scrut_ty) matches expected
+                        tcIndexedCaseMatches index ctxt (Scaled (idMult index) scrut_ty) matches expected
                       Nothing ->
                         tcExprCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches expected
                   ; return (HsCase ctxt scrut' matches') } }

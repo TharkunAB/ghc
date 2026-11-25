@@ -2795,7 +2795,7 @@ inferredRetainedBinderFlags = go
   where
     go (DepFunTy vis b body) =
       [isInferredRetainedBinder b | vis == DepFunInvisible]
-      ++ go (varType b) ++ go body
+      ++ go (idMult b) ++ go (varType b) ++ go body
     go (ForAllTy ma (Bndr v _) body) = go ma ++ go (varType v) ++ go body
     go (FunTy _ ma mult arg res) = go ma ++ go mult ++ go arg ++ go res
     go (AppTy f a) = go f ++ go a
@@ -2813,12 +2813,15 @@ applyInferredRetainedBinderFlags flags0 ty0 = go flags0 ty0
       let (flags1, b_flag) = case (vis, flags) of
             (DepFunInvisible, f : fs) -> (fs, f)
             _                         -> (flags, False)
-          (flags2, dom')  = go flags1 (varType b)
+          (flags2, mult') = go flags1 (idMult b)
+          (flags3, dom')  = go flags2 (varType b)
           b' = (if b_flag then markInferredRetainedBinder else setIdNotExported)
-                 (setVarType b dom')
-          body0 = if dom' `eqType` varType b then body else replaceTermVarInType b (TermVarTy b') body
-          (flags3, body') = go flags2 body0
-      in (flags3, DepFunTy vis b' body')
+                 (setIdMult (setVarType b dom') mult')
+          body0 = if dom' `eqType` varType b && mult' `eqType` idMult b
+                  then body
+                  else replaceTermVarInType b (TermVarTy b') body
+          (flags4, body') = go flags3 body0
+      in (flags4, DepFunTy vis b' body')
     go flags (ForAllTy ma (Bndr v vis) body) =
       let (flags1, ma')   = go flags ma
           (flags2, kind') = go flags1 (varType v)
@@ -2886,7 +2889,7 @@ replaceTermVarInType target replacement = go
     go ty@TyVarTy{} = ty
     go ty@LitTy{} = ty
 
-    go_id v = setVarType v (go (varType v))
+    go_id v = setIdMult (setVarType v (go (varType v))) (go (idMult v))
 
     go_mco MRefl = MRefl
     go_mco (MCo c) = MCo (go_co c)

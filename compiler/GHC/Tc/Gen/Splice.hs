@@ -2080,7 +2080,7 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
       bad "Unexpected type for the interpreter response."
     gbl_env <- getGblEnv
     let full_expr0 = mkCoreApp ret response
-        (local_bco_binds, full_expr) =
+        (local_bco_names, local_bco_binds, full_expr) =
           rewriteSameModuleClosedExpr (tcg_local_open_defs gbl_env) full_expr0
         local_alg_tcs = [tc | tc <- tcg_tcs gbl_env, isAlgTyCon tc]
         needs_local_itbls =
@@ -2092,6 +2092,8 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
           if null local_bco_binds
             then hsc_env
             else hsc_env { hsc_IC = extendInteractiveContextWithIds (hsc_IC hsc_env) (map fst local_bco_binds) }
+    unless (null local_bco_names) $
+      updTcRef (tcg_evaluated_term_uses gbl_env) (`extendNameSetList` local_bco_names)
     compiled <- tryMostM $ liftIO $ do
       (local_links, local_pkgs) <-
         if needs_local_itbls
@@ -2332,16 +2334,16 @@ specializeClosedFunction fun expected = do
 
 -- | Rewrite references to solved earlier same-module bindings in @tcg_local_open_defs@
 -- to deterministic interactive BCO GlobalIds, returning the transitive closure of
--- rewritten bindings alongside the rewritten expression.
+-- evaluated local binding names and rewritten bindings alongside the rewritten expression.
 -- See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
 rewriteSameModuleClosedExpr
   :: NameEnv (Id, Core.CoreExpr)
   -> Core.CoreExpr
-  -> ([(Id, Core.CoreExpr)], Core.CoreExpr)
+  -> ([Name], [(Id, Core.CoreExpr)], Core.CoreExpr)
 rewriteSameModuleClosedExpr locals expr
-  | isEmptyNameEnv locals = ([], expr)
-  | null roots            = ([], expr)
-  | otherwise             = (rewritten_binds, rewrite emptyVarSet expr)
+  | isEmptyNameEnv locals = ([], [], expr)
+  | null roots            = ([], [], expr)
+  | otherwise             = (local_bco_names, rewritten_binds, rewrite emptyVarSet expr)
   where
     roots = [ idName v
             | v <- exprSomeFreeVarsList (const True) expr
@@ -2366,6 +2368,11 @@ rewriteSameModuleClosedExpr locals expr
           bco_mod = mkInteractiveModule ("SameModClosed_" ++ show u)
           bco_name = mkExternalName u bco_mod (nameOccName (idName owner)) (nameSrcSpan (idName owner))
       in mkVanillaGlobal bco_name (idType owner)
+
+    local_bco_names =
+      [ idName owner
+      | nm <- needed_names
+      , Just (owner, _) <- [lookupNameEnv locals nm] ]
 
     rewritten_binds =
       [ (bco_id owner, rewrite emptyVarSet rhs)

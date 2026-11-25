@@ -12,6 +12,7 @@ library
   exposed-modules:
     HaskLib
     HaskLib.Equality
+    HaskLib.Exists
     HaskLib.Fin
     HaskLib.List
     HaskLib.Nat
