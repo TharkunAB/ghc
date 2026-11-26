@@ -379,13 +379,16 @@ data RewriteEnv
           --
           -- See Note [Computing coercion dependencies] in GHC.Tc.Solver.Rewrite.
 
-       , re_source_proof_family :: !(TcRef Bool)
-          -- ^ A checked branch or private source family may contribute
-          -- to this rewrite. See Note [Committing checked source family branches]
+       , re_source_proof :: !(Maybe (TcRef (Bool, [(CoAxiomRule, TcCoercion, Name, [SourceProofRule])])))
+          -- ^ Active source-proof tracking for nominal Wanteds when dependent
+          -- constructs are active; 'Nothing' during ordinary rewriting.
+          -- See Note [Committing checked source family branches]
           -- in GHC.Tc.Solver.Rewrite.
 
-       , re_source_proof_synonyms :: !(Maybe (TcRef [(CoAxiomRule, TcCoercion, Name, [SourceProofRule])]))
-          -- ^ Selected private family axioms and their enclosing synonyms.
+       , re_evidence_path :: ![(EqRel, TcType)]
+          -- ^ Family evidence already used on the current rewrite path.
+          -- See Note [Mixed-flavour family rewrite cycles]
+          -- in GHC.Tc.Solver.Rewrite.
 
        , re_native_lifting :: !LiftingContext
           -- ^ Source runtime binder relations in the common rewriting prefix.
@@ -438,9 +441,12 @@ data IfGblEnv
         -- We need the module name so we can test when it's appropriate
         -- to look in this env.
         -- See Note [Tying the knot] in GHC.IfaceToCore
-        if_rec_types :: KnotVars (IfG TypeEnv)
+        if_rec_types :: KnotVars (IfG TypeEnv),
                 -- Allows a read effect, so it can be in a mutable
                 -- variable; c.f. handling the external package type env
+
+        if_has_dep_imports :: !(Maybe (TcRef Bool))
+                -- Records whether any loaded interface contains dependent constructs.
     }
 
 data IfLclEnv
@@ -650,6 +656,9 @@ data TcGblEnv
           -- ^ INVARIANT: all these GREs were imported; that is,
           -- they all have a non-empty gre_imp field.
         tcg_keep      :: TcRef NameSet,
+
+        tcg_has_dep_imports :: !(TcRef Bool),
+          -- ^ @True@ once an imported interface with dependent constructs is loaded.
 
         tcg_source_table_uses :: TcRef NameSet,
           -- ^ Type Names record missing imported tables and tables used by retained

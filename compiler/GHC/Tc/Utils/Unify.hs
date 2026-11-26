@@ -322,8 +322,12 @@ matchActualFunTys herald ct_orig n_val_args_wanted top_ty
                Just res_co -> return $ mkWpCastR $
                  mkFunCoNoFTF Representational (mkNomReflCo ma)
                    (mkNomReflCo arg1_mult) (mkRepReflCo arg1_ty_frr) res_co
-               Nothing -> do
-                 { ma_co <- unifyType Nothing ma unmatchableDataConTy
+               Nothing
+                 | isClosedUnmatchableTy ma
+                 -> return $ mkWpFun idHsWrapper wrap_res
+                               (EqMultCo $ mkNomReflCo arg1_mult, arg1_ty_frr) res_ty
+                 | otherwise -> do
+                 { ma_co <- unifyUnmatchableLeft ma
                  ; let input_co = mkArrowMatchabilityCo [ma_co] [scaled_arg1_ty_frr] res_ty1
                        output_co = mkArrowMatchabilityCo [mkSymCo ma_co] [scaled_arg1_ty_frr] res_ty
                  ; return $ mkWpCastN output_co
@@ -331,6 +335,22 @@ matchActualFunTys herald ct_orig n_val_args_wanted top_ty
                              (EqMultCo $ mkNomReflCo arg1_mult, arg1_ty_frr) res_ty
                        <.> mkWpCastN input_co }
            ; return (wrap_fun2 <.> mkWpCastN co1, ma:mas, scaled_arg1_ty_frr:arg_tys, res_ty) }
+
+isClosedUnmatchableTy :: TcType -> Bool
+isClosedUnmatchableTy (TyConApp tc []) = tc == unmatchableDataConTyCon
+isClosedUnmatchableTy _                = False
+{-# INLINE isClosedUnmatchableTy #-}
+
+unifyUnmatchableLeft, unifyUnmatchableRight :: TcType -> TcM TcCoercionN
+unifyUnmatchableLeft ma
+  | isClosedUnmatchableTy ma = return (mkNomReflCo unmatchableDataConTy)
+  | otherwise                = unifyType Nothing ma unmatchableDataConTy
+{-# INLINE unifyUnmatchableLeft #-}
+
+unifyUnmatchableRight ma
+  | isClosedUnmatchableTy ma = return (mkNomReflCo unmatchableDataConTy)
+  | otherwise                = unifyType Nothing unmatchableDataConTy ma
+{-# INLINE unifyUnmatchableRight #-}
 
 {-
 ************************************************************************
@@ -967,7 +987,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
     check fuel n_req rev_pat_tys (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult
                                         , ft_arg = arg_ty, ft_res = res_ty })
       = assert (isVisibleFunArg af) $
-        do { ma_co <- unifyType Nothing unmatchableDataConTy ma
+        do { ma_co <- unifyUnmatchableRight ma
            ; let arg_pos = arity - n_req + 1   -- 1 for the first argument etc
            ; (arg_co, arg_ty_frr) <- hasFixedRuntimeRep (FRRExpectedFunTy herald arg_pos) arg_ty
            ; let scaled_arg_ty_frr = Scaled mult arg_ty_frr
@@ -2812,8 +2832,8 @@ mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_ma act_mult act_arg act_res exp
   = -- We need a full WpFun, with the eta-expansion that it entails
     -- And hence we must add fixed-runtime-rep checks so that the eta-expansion is OK
     -- See Note [Representation-polymorphism checking during subtyping]
-    do { act_ma_co <- unifyType Nothing act_ma unmatchableDataConTy
-       ; exp_ma_co <- unifyType Nothing unmatchableDataConTy exp_ma
+    do { act_ma_co <- unifyUnmatchableLeft act_ma
+       ; exp_ma_co <- unifyUnmatchableRight exp_ma
        ; (exp_arg_co, exp_arg_frr)  <- hasFixedRuntimeRep (frr_ctxt True ) exp_arg
        ; (act_arg_co, _act_arg_frr) <- hasFixedRuntimeRep (frr_ctxt False) act_arg
        -- exp_arg_frr, act_arg_frr :: Type   have fixed runtime-reps
@@ -2885,7 +2905,7 @@ deeplySkolemise skol_info ty
       | Just (mas, arg_tys, bndrs, theta, ty') <- tcDeepSplitSigmaTy_maybe ty
       = do { let arg_tys' = substScaledTys subst arg_tys
                  mas' = substTys subst mas
-           ; ma_cos <- mapM (\ma -> unifyType Nothing ma unmatchableDataConTy) mas'
+           ; ma_cos <- mapM unifyUnmatchableLeft mas'
            ; ids1 <- newSysLocalIds (fsLit "dk") arg_tys'
            ; (subst', bndrs1) <- tcInstSkolTyVarBndrsX skol_info subst bndrs
            ; ev_vars1         <- newEvVars (substTheta subst' theta)
@@ -2932,7 +2952,7 @@ deeplyInstantiate orig ty
            ; let arg_tys' = substScaledTys subst' arg_tys
                  mas' = substTys subst' mas
                  theta'   = substTheta subst' theta
-           ; ma_cos <- mapM (\ma -> unifyType Nothing ma unmatchableDataConTy) mas'
+           ; ma_cos <- mapM unifyUnmatchableLeft mas'
            ; ids1 <- newSysLocalIds (fsLit "di") arg_tys'
            ; wrap1 <- instCall orig (mkTyVarTys tvs') theta'
            ; (wrap2, rho2) <- go subst' rho
@@ -3427,8 +3447,18 @@ uType env@(UE { u_role = role }) orig_ty1 orig_ty2
        (FunTy { ft_af = af2, ft_ma = ma2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
       | isVisibleFunArg af1  -- Do not attempt (c => t); just defer
       , af1 == af2           -- Important!  See #21530
-      = do { co_ma <- uType (env { u_role = funRole role SelMatch }) ma1 ma2
-           ; co_w <- uType (env { u_role = funRole role SelMult }) w1   w2
+      = do { co_ma <- case (ma1, ma2) of
+               (TyConApp tc1 [], TyConApp tc2 [])
+                 | tc1 == tc2
+                 , tc1 == unmatchableDataConTyCon || tc1 == matchableDataConTyCon
+                 -> return $ mkReflCo (funRole role SelMatch) ma1
+               _ -> uType (env { u_role = funRole role SelMatch }) ma1 ma2
+           ; co_w <- case (w1, w2) of
+               (TyConApp tc1 [], TyConApp tc2 [])
+                 | tc1 == tc2
+                 , tc1 == manyDataConTyCon || tc1 == oneDataConTyCon
+                 -> return $ mkReflCo (funRole role SelMult) w1
+               _ -> uType (env { u_role = funRole role SelMult }) w1 w2
            ; co_l <- uType (env { u_role = funRole role SelArg })  arg1 arg2
            ; co_r <- uType (env { u_role = funRole role SelRes })  res1 res2
            ; return $ mkNakedFunCo role af1 co_ma co_w co_l co_r }

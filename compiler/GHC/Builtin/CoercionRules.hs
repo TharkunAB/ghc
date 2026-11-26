@@ -5,7 +5,7 @@ module GHC.Builtin.CoercionRules
   , boxedPairReconstructionRule
   , proveBoxedPairProjection, proveScopedSigmaClosure, proveScopedLambdaClosure
   , proveScopedLambdaEta
-  , proveScopedConstructorCase
+  , proveScopedCaseTree
   , fromNaturalNumRule, proveFromNaturalNum
   ) where
 
@@ -19,7 +19,7 @@ import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
   ( DataCon, HsImplBang(..), dataConImplBangs, dataConName, dataConOrigArgTys, dataConTyCon
   , dataConUnivTyVars, dataConInstOrigArgTys
-  , dataConSourceArity, dataConRepArgBinders, isVanillaDataCon )
+  , dataConRepArgBinders, isVanillaDataCon )
 import GHC.Core.TyCo.Rep (Coercion(AxiomCo), Scaled(..), Type(TyVarTy, TyConApp), scaledThing)
 import GHC.Core.TyCo.Compare
   (eqType, eqTypeX, eqTypes, eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures)
@@ -54,10 +54,7 @@ builtInCoAxiomRules =
       , (scopedSigmaClosureName, scopedSigmaClosureRule)
       , (scopedLambdaClosureName, scopedLambdaClosureRule)
       , (scopedLambdaEtaName, scopedLambdaEtaRule)
-      , (scopedEnumCaseName, scopedEnumCaseRule)
-      , (scopedConstructorCaseName, scopedConstructorCaseRule)
-      , (scopedCaseResultName, scopedCaseResultRule)
-      , (scopedOrderedCaseName, scopedOrderedCaseRule)
+      , (scopedCaseTreeName, scopedCaseTreeRule)
       , (fromNaturalNumName, fromNaturalNumRule) ]
 
 fromNaturalNumName :: FastString
@@ -112,26 +109,11 @@ validFromNaturalNumStep lhs rhs
       = field_tc == tc
       | otherwise = False
 
-scopedSigmaClosureRule, scopedLambdaClosureRule, scopedLambdaEtaRule :: CoAxiomRule
+scopedSigmaClosureRule, scopedLambdaClosureRule, scopedLambdaEtaRule, scopedCaseTreeRule :: CoAxiomRule
 scopedSigmaClosureRule = scopedClosureRule scopedSigmaClosureName eqScopedSigmaClosures
 scopedLambdaClosureRule = scopedClosureRule scopedLambdaClosureName eqScopedLambdaClosures
 scopedLambdaEtaRule = scopedClosureRule scopedLambdaEtaName eqScopedLambdaEta
-
--- | The least interface requirement for this checked case equality.
-data ScopedCaseProof = EnumerationCases | IgnoredFieldCases | ScopedResultCases
-  deriving Eq
-
-scopedEnumCaseRule, scopedConstructorCaseRule, scopedCaseResultRule :: CoAxiomRule
-scopedEnumCaseRule = scopedClosureRule scopedEnumCaseName (eqScopedCasesUsing EnumerationCases)
-scopedConstructorCaseRule = scopedClosureRule scopedConstructorCaseName (eqScopedCasesUsing IgnoredFieldCases)
-scopedCaseResultRule = scopedClosureRule scopedCaseResultName (eqScopedCasesUsing ScopedResultCases)
-
-scopedOrderedCaseRule :: CoAxiomRule
-scopedOrderedCaseRule = scopedClosureRule scopedOrderedCaseName eqOrderedCases
-
-eqScopedCasesUsing :: ScopedCaseProof -> Type -> Type -> Bool
-eqScopedCasesUsing proof lhs rhs =
-  checkedScopedCases lhs rhs == Just proof
+scopedCaseTreeRule = scopedClosureRule scopedCaseTreeName eqScopedCaseTrees
 
 scopedClosureRule :: FastString -> (Type -> Type -> Bool) -> CoAxiomRule
 scopedClosureRule name equal = BuiltInEqRule name proves
@@ -220,106 +202,12 @@ eqScopedLambdaEta lhs rhs
   = eqTypes (substTysWith captures args prefix) expected
   | otherwise = False
 
--- | Produce nominal evidence for equal retained constructor cases.
-proveScopedConstructorCase :: Type -> Type -> Maybe Coercion
-proveScopedConstructorCase lhs rhs = do
-  rule <- case checkedScopedCases lhs rhs of
-    Just EnumerationCases -> Just scopedEnumCaseRule
-    Just IgnoredFieldCases -> Just scopedConstructorCaseRule
-    Just ScopedResultCases -> Just scopedCaseResultRule
-    Nothing | eqOrderedCases lhs rhs -> Just scopedOrderedCaseRule
-    Nothing -> Nothing
-  pure (AxiomCo rule [mkNomReflCo lhs, mkNomReflCo rhs])
-
--- | Check complete constructor cases and select the evidence that they require.
--- See Note [Equality of retained constructor cases].
-checkedScopedCases :: Type -> Type -> Maybe ScopedCaseProof
-checkedScopedCases lhs rhs
-  | Just (tc1, as1) <- splitTyConApp_maybe lhs
-  , Just (tc2, as2) <- splitTyConApp_maybe rhs
-  , tc1 /= tc2
-  , isSignatureCase tc1, isSignatureCase tc2
-  , as1 `lengthIs` tyConArity tc1, as2 `lengthIs` tyConArity tc2
-  , tyConKind tc1 `eqType` tyConKind tc2
-  , as1 `eqTypes` as2
-  , Just (fields1, rows1) <- checked_rows tc1
-  , Just (fields2, rows2) <- checked_rows tc2
-  , fields1 == fields2, equalLength rows1 rows2
-  = do
-      scoped <- or <$> zipWithM same_row rows1 rows2
-      pure $ if scoped then ScopedResultCases
-             else if fields1 then IgnoredFieldCases
-             else EnumerationCases
+-- | Produce nominal evidence for equal retained constructor case trees.
+proveScopedCaseTree :: Type -> Type -> Maybe Coercion
+proveScopedCaseTree lhs rhs
+  | eqScopedCaseTrees lhs rhs
+  = Just (AxiomCo scopedCaseTreeRule [mkNomReflCo lhs, mkNomReflCo rhs])
   | otherwise = Nothing
-  where
-    checked_rows tc = do
-      guard (isLiftedTypeKind (tyConResKind tc))
-      NotInjective <- pure (tyConInjectivityInfo tc)
-      let kinds = map (tyVarKind . binderVar) (tyConBinders tc)
-      guard (all (isEmptyVarSet . tyCoVarsOfType) kinds)
-      (captures, scrutinee_kind) <- snocView kinds
-      (parent, parent_args) <- splitTyConAppNoView_maybe scrutinee_kind
-      let enumeration = null parent_args && isEnumerationTyCon parent
-      guard (enumeration || (isVanillaAlgTyCon parent && isBoxedDataTyCon parent
-                             && not (isGadtSyntaxTyCon parent)
-                             && null (tyConStupidTheta parent)
-                             && isLiftedTypeKind (typeKind scrutinee_kind)))
-      guard (parent_args `lengthIs` tyConArity parent)
-      constructors <- tyConDataCons_maybe parent
-      ax <- closedFamilyTyConCoAxiom_maybe tc
-      guard (coAxiomTyCon ax == tc && coAxiomRole ax == Nominal)
-      guard (null (co_ax_source_proof_rules ax))
-      let branches = fromBranches (coAxiomBranches ax)
-      guard (equalLength branches constructors)
-      let fields_of = checked_fields enumeration parent_args scrutinee_kind
-      rows <- traverse (checked_row parent captures fields_of) branches
-      let sorted_rows = sortBy (compare_names (dataConName . fst)) rows
-      guard (map fst sorted_rows == sortBy (compare_names dataConName) constructors)
-      -- Keep the old wire format for cases which the old checker accepts.
-      guard (enumeration || any ((> 0) . dataConSourceArity) constructors)
-      pure (not enumeration, sorted_rows)
-
-    checked_row parent captures fields_of branch = do
-      guard (null (cab_cvs branch) && null (cab_eta_tvs branch))
-      guard (equalLength (cab_roles branch) (cab_tvs branch) && all (== Nominal) (cab_roles branch))
-      (parameters, pattern_ty) <- snocView (cab_lhs branch)
-      vars <- traverse plain_var parameters
-      guard (map tyVarKind vars `eqTypes` captures)
-      (pattern_tc, arguments) <- splitTyConAppNoView_maybe pattern_ty
-      con <- isPromotedDataCon_maybe pattern_tc
-      guard (dataConTyCon con == parent)
-      fields <- fields_of con pattern_tc arguments pattern_ty
-      let all_vars = vars ++ fields
-          bound = mkVarSet (cab_tvs branch)
-      guard (all_vars `equalLength` cab_tvs branch)
-      guard (sizeVarSet bound == length all_vars && all (`elemVarSet` bound) all_vars)
-      guard (sizeVarSet (mkVarSet all_vars) == length all_vars)
-      let result = cab_rhs branch
-      guard (tyCoVarsOfType result `subVarSet` bound)
-      pure (con, (all_vars, result))
-
-    same_row (con1, (vars1, result1)) (con2, (vars2, result2)) = do
-      guard (con1 == con2)
-      case (bare_result result1, bare_result result2) of
-        (Just tycon1, Just tycon2) -> do
-          guard (tycon1 == tycon2)
-          pure False
-        _ -> do
-          env <- eqVarBndrs (mkRnEnv2 emptyInScopeSet) vars1 vars2
-          guard (eqTypeX env result1 result2)
-          pure True
-
-    bare_result ty = do
-      (result, []) <- splitTyConAppNoView_maybe ty
-      guard (isAlgTyCon result && isLiftedTypeKind (tyConKind result))
-      pure result
-
-    checked_fields True _ _ _ _ [] _ = Just []
-    checked_fields True _ _ _ _ _ _ = Nothing
-    checked_fields False parent_args scrutinee_kind con pattern_tc arguments pattern_ty =
-      checkedCaseFields parent_args scrutinee_kind con pattern_tc arguments pattern_ty
-
-    compare_names get_name a b = stableNameCmp (get_name a) (get_name b)
 
 -- | Recover the owner of a checked retained signature case.
 signatureCaseOwner :: TyCon -> Maybe Name
@@ -355,11 +243,11 @@ checkedCaseFields parent_args scrutinee_kind con pattern_tc arguments pattern_ty
   guard (map tyVarKind vars `eqTypes` field_kinds)
   pure vars
 
--- | The owner and exact generated prefix for the nodes of one ordered case.
-type OrderedCaseScope = (Name, String)
+-- | The owner and exact generated prefix for the nodes of one case tree.
+type CaseTreeScope = (Name, String)
 
-orderedCaseScope :: TyCon -> Maybe OrderedCaseScope
-orderedCaseScope tc = do
+caseTreeScope :: TyCon -> Maybe CaseTreeScope
+caseTreeScope tc = do
   owner <- signatureCaseOwner tc
   let prefix = "$case-node:" ++ occNameString (nameOccName owner) ++ ":"
   if isSignatureCase tc
@@ -370,15 +258,15 @@ orderedCaseScope tc = do
       guard (not (null root) && not (null number) && all isDigit number)
       pure (owner, prefix ++ root ++ ".")
 
--- | Check the two decision trees for the same saturated applications.
--- See Note [Equality of ordered retained case trees].
-eqOrderedCases :: Type -> Type -> Bool
-eqOrderedCases lhs rhs
+-- | Check two case decision trees at the same saturated applications.
+-- See Note [Equality of retained case trees].
+eqScopedCaseTrees :: Type -> Type -> Bool
+eqScopedCaseTrees lhs rhs
   | Just (tc1, as1) <- splitTyConApp_maybe lhs
   , Just (tc2, as2) <- splitTyConApp_maybe rhs
   , tc1 /= tc2
-  , Just left <- orderedCaseScope tc1
-  , Just right <- orderedCaseScope tc2
+  , Just left <- caseTreeScope tc1
+  , Just right <- caseTreeScope tc2
   , isSignatureCase tc1 == isSignatureCase tc2
   , as1 `lengthIs` tyConArity tc1, as2 `lengthIs` tyConArity tc2
   , as1 `eqTypes` as2
@@ -397,12 +285,9 @@ eqOrderedCases lhs rhs
     same_node left right seen tc1 tc2 = do
       guard (not (any (\(a, b) -> a == tc1 || b == tc2) seen))
       guard (tyConKind tc1 `eqType` tyConKind tc2)
-      rows1 <- checkedOrderedRows tc1
-      rows2 <- checkedOrderedRows tc2
+      rows1 <- checkedCaseRows tc1
+      rows2 <- checkedCaseRows tc2
       guard (equalLength rows1 rows2)
-      -- Leave flat signature roots to their existing checker.
-      guard (not (isSignatureCase tc1) || any (has_child left) rows1)
-      guard (not (isSignatureCase tc2) || any (has_child right) rows2)
       let has_same_rhs env a b =
             case (owned_rhs left a, owned_rhs right b) of
               (Just (child1, args1), Just (child2, args2)) -> do
@@ -416,14 +301,9 @@ eqOrderedCases lhs rhs
             has_same_rhs env a b
       zipWithM_ same_row rows1 rows2
 
-    has_child scope (_, _, rhs) =
-      case owned_rhs scope rhs of
-        Just _ -> True
-        Nothing -> False
-
 -- | Recheck that a generated node is an exhaustive constructor test or a leaf.
-checkedOrderedRows :: TyCon -> Maybe [(Maybe (Int, DataCon), [TyVar], Type)]
-checkedOrderedRows tc = do
+checkedCaseRows :: TyCon -> Maybe [(Maybe (Int, DataCon), [TyVar], Type)]
+checkedCaseRows tc = do
   guard (isLiftedTypeKind (tyConResKind tc))
   NotInjective <- pure (tyConInjectivityInfo tc)
   let kinds = map (tyVarKind . binderVar) (tyConBinders tc)
@@ -437,10 +317,12 @@ checkedOrderedRows tc = do
     (Just (slot, first), _, _) : _ -> do
       let parent = dataConTyCon first
           tests = [ c | (Just (i, c), _, _) <- rows, i == slot, dataConTyCon c == parent ]
-          ordered = sortBy (\a b -> stableNameCmp (dataConName a) (dataConName b))
+          cmp_con a b = stableNameCmp (dataConName a) (dataConName b)
+          cmp_row (Just (_, a), _, _) (Just (_, b), _, _) = cmp_con a b
+          cmp_row _ _ = EQ
       constructors <- tyConDataCons_maybe parent
-      guard (equalLength rows tests && ordered tests == ordered constructors)
-      pure rows
+      guard (equalLength rows tests && sortBy cmp_con tests == sortBy cmp_con constructors)
+      pure (sortBy cmp_row rows)
     _ -> Nothing
   where
     checked_row kinds branch = do
@@ -468,80 +350,32 @@ checkedOrderedRows tc = do
           pure (Nothing, [var])
       | otherwise = do
           (parent, args) <- splitTyConAppNoView_maybe kind
-          guard (isVanillaAlgTyCon parent && isBoxedDataTyCon parent && not (isGadtSyntaxTyCon parent))
-          guard (null (tyConStupidTheta parent) && args `lengthIs` tyConArity parent)
+          let enumeration = null args && isEnumerationTyCon parent
+          guard (enumeration
+                 || (isVanillaAlgTyCon parent && isBoxedDataTyCon parent
+                     && not (isGadtSyntaxTyCon parent)
+                     && null (tyConStupidTheta parent)
+                     && isLiftedTypeKind (typeKind kind)
+                     && args `lengthIs` tyConArity parent))
           (promoted, fields) <- splitTyConAppNoView_maybe pat
           con <- isPromotedDataCon_maybe promoted
           guard (dataConTyCon con == parent)
-          vars <- checkedCaseFields args kind con promoted fields pat
+          vars <- if enumeration
+                  then guard (null fields) >> pure []
+                  else checkedCaseFields args kind con promoted fields pat
           pure (Just con, vars)
 
-{- Note [Equality of ordered retained case trees]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The ordered case builder emits a closed family per decision. Keep the
-signature-case owner on the root and its nodes. Compare the emitted
-decisions in order. Exchanging two disjoint source rows can change
-which field the case forces first. A wildcard can also cover a branch
-without forcing another field. Keep the tested column and the actual
-arguments passed to each child.
+{- Note [Equality of retained case trees]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The case builder emits a closed family for each decision node and records
+the signature-case owner on the root and its nodes. Compare the emitted
+decisions in order and retain the tested column and child arguments.
 
-Each checked decision has exactly one constructor column. All of its
-rows test distinct constructors of the same ordinary datatype and
-cover every constructor. A leaf has one variable-only row. Pair the
-variables by pattern position and compare the result under those
-binders. Follow only saturated child calls under the exact generated
-prefix and owner. Require the same finite shape on both sides and
-reject a repeated node on either path. A user family or an unrelated
-case can occur in a leaf, where it keeps its ordinary nominal identity.
-
-Rewriting can expose a child before equality solving, for example
-when the outer Maybe constructor is known. Its generated prefix
-still identifies its tree. Match the same saturated inputs, even
-when a later field remains unknown. This cannot select a result for
-either side. It only transports the equality between the two trees.
-
-The original case rules still compare flat signature roots. Old home
-interfaces can contain unscoped decision nodes. Recheck those
-providers to record the owner. An old installed interface still
-supports ordinary reduction and needs a rebuild to supply the owner.
-The existing scoped family format carries that owner. Only a stored
-proof that uses ScopedOrderedCase requires the new interface marker.
--}
-
-{- Note [Equality of retained constructor cases]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The checker records the signature-case owner from the renamed source
-rows. Each family retains its ordinary reduction axioms. The additional
-nominal rule can compare two such families with the same scrutinee when
-ordinary rewriting leaves their applications stuck.
-
-Read the immutable axioms on demand. Require one exhaustive split over
-the same unindexed datatype. Each row has unrelated capture variables
-and one exact constructor pattern. Its fields may each bind a distinct
-variable. Require a regular boxed datatype and ordinary constructors
-when a row binds a field. Check that the constructor parameters match the
-scrutinee kind and that each field variable has the instantiated field
-kind. Distinct exact constructors establish disjointness. Do not force
-the pairwise overlap caches.
-
-Compare bare algebraic results by constructor identity as before.
-For another result, check that its free variables are bound by the
-row. Pair the capture binders in application order and the fields in
-constructor order. Check their kinds with eqVarBndrs and compare the
-results with eqTypeX. The order in cab_tvs need not be the pattern
-order. In particular, two fields with the same kind are still distinct
-positions.
-
-Keep ScopedEnumCase for proofs the original nullary checker accepts
-and ScopedConstructorCase for the original ignored-field proofs.
-Use ScopedCaseResult when comparison needs the scoped result rule.
-The distinct name and interface feature let old readers reject only a
-stored proof that requires the new rule.
-
-Recheck this shape when reading the coercion. A substitution can make
-the scrutinee known to both families. The same row then reduces on both
-sides, so the proof remains valid.
-See Note [Equality of ordered retained case trees] for nested cases.
+Each decision node has either one variable-only leaf row or one constructor
+column whose rows test distinct constructors of the same datatype and cover
+all constructors. Pair pattern variables by position with eqVarBndrs and
+compare branch results with eqTypeX. Follow saturated child calls under the
+same owner and generated node prefix, rejecting cycles on either path.
 -}
 
 {- Note [Strict boxed pair composition]

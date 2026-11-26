@@ -826,19 +826,22 @@ tcRetainedCase dependent index matches@(MG { mg_alts = L loc alternatives }) (Ch
     depends = anyFreeVarsOfType (== index)
 
     use_application
-      = do { worker_in_scope <- anyNameEnv retained_worker <$> getLclTypeEnv
-           ; if not worker_in_scope || not (dependent || isNativeIndexId index)
+      = do { has_dep <- if dependent then return True else tcHasDepImports
+           ; if not has_dep || not (dependent || isNativeIndexId index)
              then return False
-             else do { complete <- completeRetainedCaseRows (varType index) alternatives
-                     ; known <- if complete
-                                then hasRetainedApplication known_local_app matches
-                                else return False
-                     ; if not known || retainedCaseHasQuote matches
+             else do { worker_in_scope <- anyNameEnv retained_worker <$> getLclTypeEnv
+                     ; if not worker_in_scope
                        then return False
-                       else if dependent
-                            then return True
-                            else (&&) <$> (null <$> dependent_captures [])
-                                      <*> (null <$> dependent_givens) } }
+                       else do { complete <- completeRetainedCaseRows (varType index) alternatives
+                               ; known <- if complete
+                                          then hasRetainedApplication known_local_app matches
+                                          else return False
+                               ; if not known || retainedCaseHasQuote matches
+                                 then return False
+                                 else if dependent
+                                      then return True
+                                      else (&&) <$> (null <$> dependent_captures [])
+                                                <*> (null <$> dependent_givens) } } }
 
     retained_worker (ATcId { tct_id = worker })
       | DepFunTy DepFunVisible binder body <- coreFullView (varType worker)

@@ -561,8 +561,9 @@ mkDsEnvs :: UnitEnv -> Module -> GlobalRdrEnv -> TypeEnv -> FamInstEnv
 mkDsEnvs unit_env mod rdr_env type_env fam_inst_env tcm_plugins ptc msg_var
          cc_st_var statics_var next_wrapper_num known_key_maps_var
          complete_matches
-  = let if_genv = IfGblEnv { if_doc       = text "mkDsEnvs"
-                           , if_rec_types = KnotVars [mod] knot_var_fun }
+  = let if_genv = IfGblEnv { if_doc             = text "mkDsEnvs"
+                           , if_rec_types       = KnotVars [mod] knot_var_fun
+                           , if_has_dep_imports = Nothing }
                   -- Failing tests here are `ghci` and `T11985` if you get this wrong.
                   -- This is very very "at a distance" because the reason for this check
                   -- is that the type_env in interactive mode is the smushed together
