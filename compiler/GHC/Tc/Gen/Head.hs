@@ -191,7 +191,8 @@ data HsExprArg (p :: TcPass) where -- See Note [HsExprArg]
                   , ea_arg_ty       :: !(XEVAType p)
                   , ea_arg          :: LHsExpr (GhcPass (XPass p))
                   , ea_retained_res :: !(XCheckedType p)
-                  , ea_retained_co  :: !(XRetainedCo p) }
+                  , ea_retained_co  :: !(XRetainedCo p)
+                  , ea_retained_tc  :: !(XRetainedTc p) }
                -> HsExprArg p
 
   EPrag :: HsExprLoc -> (HsPragE (GhcPass (XPass p))) -> HsExprArg p
@@ -208,6 +209,10 @@ type family XEVAType (p :: TcPass) where   -- Value arguments
 type family XRetainedCo (p :: TcPass) where
   XRetainedCo 'TcpInst = Maybe CoercionN
   XRetainedCo _        = NoExtField
+
+type family XRetainedTc (p :: TcPass) where
+  XRetainedTc 'TcpInst = Maybe (LHsExpr GhcTc, UsageEnv)
+  XRetainedTc _        = NoExtField
 
 data QLFlag = DoQL | NoQL
 
@@ -325,7 +330,7 @@ splitHsApps e = go e []
     go (HsPragE _ p (L l fun))    args = go fun (EPrag      l p   : args)
     go (HsAppType source (L l fun) ty) args = go fun (mkETypeArg l source ty : args)
     go (HsAppRetained _ (L l fun) arg) args
-      = go fun (ERetainedArg DepFunInvisible l noExtField arg noExtField noExtField : args)
+      = go fun (ERetainedArg DepFunInvisible l noExtField arg noExtField noExtField noExtField : args)
     go (HsApp _ (L l fun) arg)    args = go fun (mkEValArg  l arg : args)
     go fun args = do { mb_hse <- tcExpand fun
                      ; case mb_hse of

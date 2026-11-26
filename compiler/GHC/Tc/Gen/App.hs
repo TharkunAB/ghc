@@ -15,6 +15,7 @@ module GHC.Tc.Gen.App
        , matchPolytypeExistsWitness, matchExactPolytypeWitness, tcPreviewQuickLookResult
        , tcImplicitOperand, tcLexicalPackageOperand
        , tcRetainedInferableArg, tcRetainedArg
+       , RetainedCoreMode(..), tcExprToRetainedCore
        , tcOptionalLetOperand, tcOptionalLetFunctionOperand
        , expr_to_type, expr_to_type_at_kind, isUnadornedTypeExpr ) where
 
@@ -33,12 +34,13 @@ import GHC.Tc.Errors.Types
 import GHC.Tc.Errors.Ppr
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Solver ( tcRewriteFamilyAxioms )
-import GHC.Tc.Solver.Monad ( bumpReductionDepthTcM )
+import GHC.Tc.Solver.Monad ( bumpReductionDepthTcM, matchFamTcM )
 import GHC.Tc.Validity ( checkConstrainedSignature )
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Utils.Env ( isExistsPackName, tcLookupIdMaybe, tcLookupConLike, tcLookupKnownOccId
-                        , tcLookup, tcLookupGlobal, tcLookupLcl_maybe, tcExtendIdEnv, tcExtendIdEnv1, tcExtendGeneratedIdEnv )
+                        , tcLookup, tcLookupGlobal, tcLookupLcl_maybe
+                        , tcExtendIdEnv, tcExtendIdEnv1, tcExtendGeneratedIdEnv )
 import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs, tcLookupDataFamInst, tcLookupDataFamInst_maybe )
 import GHC.Tc.Gen.HsType
@@ -62,12 +64,13 @@ import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr, hasScopedDictionaryType
                           , isScopedSelectorReceiver, supportsQuickLookType )
 import GHC.Core.FamInstEnv (FamInstEnvs, reduceTyFamApp_maybe)
-import GHC.Core.Make ( mkCharExpr, mkNaturalExpr )
+import GHC.Core.Make ( mkCharExpr, mkCoreTup, mkNaturalExpr )
+import GHC.Core.Multiplicity ( mkMultMul )
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Utils ( applyTypeToArgs, exprType, isVacuousRetainedBinder )
 import GHC.Core.FVs ( exprFreeVars, exprFreeVarsList )
 import GHC.Core.InstEnv ( lookupUniqueInstEnv, instanceDFunId )
-import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe, isEqPred, mkNomEqPred )
+import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe, mkNomEqPred )
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs
@@ -87,7 +90,8 @@ import GHC.Builtin.Modules ( gHC_INTERNAL_BASE )
 
 import GHC.Driver.DynFlags ( GeneralFlag(Opt_DeferTypeErrors, Opt_DeferTypedHoles, Opt_DeferOutOfScopeVariables), DynFlags(reductionDepth), HasDynFlags(getDynFlags) )
 import GHC.Types.TyThing ( TyThing(AnId, AConLike, ATyCon) )
-import GHC.Types.Basic ( RecFlag(NonRecursive), TypeOrKind(TypeLevel), IntWithInf, intGtLimit )
+import GHC.Types.Basic ( RecFlag(NonRecursive), TypeOrKind(TypeLevel), IntWithInf, intGtLimit
+                       , Origin(Generated), GenReason(OtherExpansion), DoPmc(SkipPmc) )
 import GHC.Types.TypeEnv ( lookupTypeEnv )
 import GHC.Types.Var
 import GHC.Types.Id ( idName, idType, isRecordSelector, mkLocalId, isClassOpId_maybe, isDFunId, realIdUnfolding, recordSelectorTyCon_maybe, setInlinePragma, sourceTableId_maybe, sourceMethodTarget_maybe, sourceLiteralCons_maybe )
@@ -97,7 +101,7 @@ import GHC.Types.FieldLabel ( FieldLabel(flSelector) )
 import GHC.Types.Var.Set ( VarSet, IdSet, elemVarSet, emptyVarSet, extendVarSet, isEmptyVarSet, mkVarSet, sizeVarSet )
 import GHC.Types.Var.FV
 import GHC.Types.Name
-import GHC.Unit.Types ( Module, isInteractiveModule )
+import GHC.Unit.Types ( isInteractiveModule )
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set ( elemNameSet, mkNameSet )
 import GHC.Types.Unique ( getKey )
@@ -122,12 +126,10 @@ import Control.Monad
 import Data.Data ( Data, cast, gmapQ )
 import Data.Either ( isLeft, isRight )
 import Data.Function
-import Data.IORef ( atomicModifyIORef', newIORef, readIORef )
 import Data.List ( find, mapAccumL, sortOn )
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
 import Data.Semigroup
-import System.IO.Unsafe ( unsafePerformIO )
 
 import GHC.Prelude
 
@@ -2341,7 +2343,7 @@ tcRetainedQuickLookArgType arg
                    guard (flexible (varType actual) || varType actual `eqType` domain)
                    guard (isManyTy (idMult actual) || isOneTy (idMult actual)
                           || flexible (idMult actual))
-                   (Core.Var checked, _) <- liftMaybeT (tcRetainedArgScaled (Scaled (idMult binder) domain) operand)
+                   (Core.Var checked, _, _) <- liftMaybeT (tcRetainedArgScaled (Scaled (idMult binder) domain) operand)
                    guard (checked == actual && isNativeOpaqueValueId checked)
                    pure checked
         constructor_result (applyTypeToArgs ty [Core.Var value]) rest
@@ -2498,13 +2500,6 @@ tcRetainedPolyVarArgType (L loc (HsVar _ lname))
            Nothing -> return Nothing }
 tcRetainedPolyVarArgType _ = return Nothing
 
--- | Use the ordinary constructor application for a complete boxed pair.
--- See Note [Erased parameters of a retained constructor argument].
-retainedPairApplication :: HsExpr GhcRn -> Maybe (LHsExpr GhcRn)
-retainedPairApplication (ExplicitTuple _ [Present _ first, Present _ second] Boxed)
-  = Just (nlHsApps (dataConName (tupleDataCon Boxed 2)) [first, second])
-retainedPairApplication _ = Nothing
-
 -- | Read a visible retained argument's type from its constructor fields or
 -- saturated certified source calls.
 -- See Note [Erased parameters of a retained constructor argument] and
@@ -2524,8 +2519,8 @@ tcRetainedConstructorArgTypeWith view mb_exp = collect []
     collect args (L _ (XExpr (ExpandedThingRn (HSE _ fun)))) = collect args fun
     collect args (L _ (HsApp _ fun arg)) = collect (arg : args) fun
     collect [] (L _ (OpApp _ lhs op rhs)) = collect [lhs, rhs] op
-    collect [] (L _ expr) | Just pair <- retainedPairApplication expr
-      = collect [] pair
+    collect [] (L _ (ExplicitTuple _ [Present _ first, Present _ second] Boxed))
+      = collect [first, second] (nlHsVar (dataConName (tupleDataCon Boxed 2)))
     collect [] (L _ (ExplicitList _ fields))
       = fmap (fmap mkListTy) (firstJustsM (map (tcRetainedConstructorArgTypeWith view Nothing) fields))
     collect [] (L loc (ExprWithTySig _ _ sig))
@@ -3633,7 +3628,7 @@ tcRetainedResultCoercion args ty
        ; if null indices then return (mkNomReflCo ty)
          else tcRetainedTypeCoercion (`elem` indices) ty }
   where
-    index_arg (ERetainedArg DepFunVisible _ _ arg _ _)
+    index_arg (ERetainedArg { ea_retained_vis = DepFunVisible, ea_arg = arg })
       | HsVar _ name <- unLoc (stripParensLHsExpr arg)
       = tcLookupIdMaybe (unLocWithUserRdr name)
     index_arg _ = return Nothing
@@ -4085,25 +4080,24 @@ tcValArg _ _ _ (ETypeArg l hty source ty) = return (ETypeArg l hty source ty)
 tcValArg _ _ _ (EWrap (EHsWrap w)) = return (EWrap (EHsWrap w))
 tcValArg _ _ _ (EWrap ew)          = return (EWrap ew)
 
-tcValArg do_ql pos rn_head (ERetainedArg DepFunVisible loc (Scaled mult ty) arg res_ty co)
+tcValArg _ _ _ (ERetainedArg vis loc (Scaled mult _) _ res_ty co (Just (checked, arg_ue)))
+  = do { tcScalingUsage mult (tcEmitBindingUsage arg_ue)
+       ; return (ERetainedArg vis loc noExtField
+                   (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField noExtField) }
+tcValArg do_ql pos rn_head (ERetainedArg DepFunVisible loc (Scaled mult ty) arg res_ty co Nothing)
   = do { let checked_ty = maybe ty coercionLKind co
-       ; scoped <- tcScopedClassOperand checked_ty arg
-       ; checked <- case scoped of
-           Just (selector, inst, dict_expr, _, operand) ->
-             do { checked_operand <- tcValArgExpr do_ql pos rn_head loc (Scaled mult inst) operand
-                ; let wrapper = mkWpEvApps [EvExpr dict_expr] <.> mkWpTyApps [inst]
-                      method = noLocA (mkHsWrap wrapper (mkHsVar (noLocA selector)))
-                ; return (mkHsApps method [checked_operand]) }
-           _ -> tcRetainedValArgExpr do_ql pos rn_head loc (Scaled mult checked_ty) arg
+       ; checked <- tcValArgExpr do_ql pos rn_head loc (Scaled mult checked_ty) arg
        ; return (ERetainedArg DepFunVisible loc noExtField
-                   (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField) }
-tcValArg _ pos rn_head (ERetainedArg DepFunInvisible loc (Scaled mult ty) arg res_ty co)
+                   (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField noExtField) }
+tcValArg _ pos rn_head (ERetainedArg DepFunInvisible loc (Scaled mult ty) arg res_ty co Nothing)
   = addArgCtxt pos rn_head arg $
     do { let checked_ty = maybe ty coercionLKind co
        ; checked <- tcScalingUsage mult $
-                     tcCheckRetainedPolyExpr checked_ty arg
+                      tcWithRetainedHoleScope arg $
+                      setSrcSpanA (getLoc arg) $
+                      L (getLoc arg) <$> tcPolyExpr (unLoc arg) (mkCheckExpType checked_ty)
        ; return (ERetainedArg DepFunInvisible loc noExtField
-                   (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField) }
+                   (maybe checked (`mkLHsWrapCo` checked) co) res_ty noExtField noExtField) }
 
 tcValArg do_ql pos rn_head (EValArg loc ty arg)
   = EValArg loc noExtField <$> tcValArgExpr do_ql pos rn_head loc ty arg
@@ -4243,91 +4237,6 @@ tcValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg@(L arg_loc arg)
        ; traceTc "tcValArg" $ vcat [ ppr arg'
                                    , text "}" ]
        ; return (L arg_loc arg') }
-
--- | Check a retained operand, instantiating family-free constructor spines
--- from the expected domain so runtime Core matches 'tcRetainedArg'.
-tcRetainedValArgExpr :: QLFlag -> Int -> (HsExpr GhcRn, SrcSpan) -> HsExprLoc
-                     -> Scaled TcSigmaTypeFRR -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc)
-tcRetainedValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg
-  = do { Scaled mult exp_arg_ty <- case do_ql of
-           DoQL -> liftZonkM $ zonkScaledTcType sc_arg_ty
-           NoQL -> return sc_arg_ty
-       ; matched <- addArgCtxt pos rn_fun_head larg $
-                    tcScalingUsage mult $
-                    tcCheckRetainedConApp exp_arg_ty larg
-       ; case matched of
-           Just checked -> return checked
-           Nothing      -> tcValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg }
-
-tcCheckRetainedPolyExpr :: TcType -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc)
-tcCheckRetainedPolyExpr expected_ty larg@(L arg_loc expr)
-  = tcWithRetainedHoleScope larg $
-    do { matched <- tcCheckRetainedConApp expected_ty larg
-       ; case matched of
-           Just checked -> return checked
-           Nothing      -> setSrcSpanA arg_loc $
-                           L arg_loc <$> tcPolyExpr expr (mkCheckExpType expected_ty) }
-
-tcCheckRetainedConApp :: TcType -> LHsExpr GhcRn -> TcM (Maybe (LHsExpr GhcTc))
-tcCheckRetainedConApp expected_ty (L arg_loc (HsPar x inner))
-  = fmap (fmap (L arg_loc . HsPar x)) (tcCheckRetainedConApp expected_ty inner)
-tcCheckRetainedConApp expected_ty (L arg_loc expr@HsApp{})
-  = setSrcSpanA arg_loc $ runMaybeT $
-    do { (rn_fun, rn_args) <- liftMaybeT (splitHsApps expr)
-       ; guard (all plain_arg rn_args && any isHsValArg rn_args)
-       ; HsVar _ lname <- pure rn_fun
-       ; guard (isDataOcc (nameOccName (unLocWithUserRdr lname)))
-       ; RealDataCon dc <- liftMaybeT (tcLookupConLike (unLoc lname))
-       ; expected' <- liftMaybeT (liftZonkM (zonkTcType expected_ty))
-       ; guard (isJust (Core.nativeIndexedOperandSignature_maybe dc)
-                || isJust (nativeIndexDataConTyArgs expected' dc))
-       ; let sigma = idType (dataConWrapId dc)
-             (ma_tvs, body) = tcSplitForAllInvisTyVars sigma
-             tvs = map snd ma_tvs
-             (theta, tau) = tcSplitPhiTy body
-       ; guard (not (null tvs) && null theta && isEmptyNameEnv (dataConConcreteTyVars dc))
-       ; result <- MaybeT (pure (tcRetainedOrdinaryResult (count isHsValArg rn_args) tau))
-       ; guard (isFamFreeTy result && isTauTy result && isTauTy expected')
-       ; subst <- MaybeT (pure (matchOuterTyKi tvs Subst.emptySubst result expected'))
-       ; let lookup_or_many tv = case Subst.lookupTyVar subst tv of
-               Just ty -> Just ty
-               Nothing | isMultiplicityTy (tyVarKind tv) -> Just ManyTy
-                       | otherwise -> Nothing
-       ; inst_tys <- MaybeT (pure (traverse lookup_or_many tvs))
-       ; guard (all noQuickLookVars (expected' : inst_tys))
-       ; let full_subst = Subst.zipTvSubst tvs inst_tys
-       ; guard (and (zipWith (substKindAgrees full_subst) tvs inst_tys))
-       ; guard (eqType (Subst.substTy full_subst result) expected')
-       ; valid <- liftMaybeT (tcRetainedInstScope inst_tys)
-       ; guard valid
-       ; fun_lspan <- liftMaybeT (getFunSrcSpan rn_args)
-       ; let tc_fun = mkHsWrap (mkWpTyApps inst_tys) (XExpr (ConLikeTc (RealDataCon dc)))
-             body' = Subst.substTy full_subst body
-       ; checked_args <- check_args (rn_fun, fun_lspan) 1 body' rn_args
-       ; rebuilt <- liftMaybeT $ addExprCtxt expr (return (rebuildHsApps tc_fun checked_args))
-       ; return (L arg_loc rebuilt) }
-  where
-    plain_arg EValArg{} = True
-    plain_arg (EWrap EPar{}) = True
-    plain_arg (EWrap EExpand{}) = True
-    plain_arg _ = False
-
-    check_args _ _ _ [] = return []
-    check_args head_ctxt arg_pos cur_ty (EWrap (EPar x) : rest)
-      = (EWrap (EPar x) :) <$> check_args head_ctxt arg_pos cur_ty rest
-    check_args head_ctxt arg_pos cur_ty (EWrap (EExpand o c) : rest)
-      = (EWrap (EExpand o c) :) <$> check_args head_ctxt arg_pos cur_ty rest
-    check_args head_ctxt arg_pos cur_ty (EValArg { ea_loc_span = a_loc, ea_arg = a_expr } : rest)
-      | FunTy { ft_af = af, ft_mult = f_mult, ft_arg = f_dom, ft_res = f_res } <- coreFullView cur_ty
-      , isVisibleFunArg af
-      = do { checked_a <- liftMaybeT $
-               addArgCtxt arg_pos head_ctxt a_expr $
-               tcScalingUsage f_mult $
-               tcCheckRetainedPolyExpr f_dom a_expr
-           ; rest' <- check_args head_ctxt (arg_pos + 1) f_res rest
-           ; return (EValArg { ea_loc_span = a_loc, ea_arg = checked_a, ea_arg_ty = noExtField } : rest') }
-    check_args _ _ _ _ = mzero
-tcCheckRetainedConApp _ _ = return Nothing
 
 -- | Instantiate arguments in telescope order, with optional immutable choices
 -- and a retained expected result after ordinary VTA.
@@ -4629,7 +4538,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                ETypeArg { ea_hs_ty = hs_ty } ->
                  do { (_, tidy_ty) <- liftZonkM $ zonkTidyTcType emptyTidyEnv fun_ty
                     ; failWith $ TcRnInvalidTypeApplication tidy_ty hs_ty }
-               ERetainedArg _ _ _ arg _ _ ->
+               ERetainedArg { ea_arg = arg } ->
                  addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
                    failWithTc (TcRnRetainedQuantificationError (RetainedExplicitArgument fun_ty))
                _ -> pprPanic "tcInstFun: impossible arg" (ppr first_arg)
@@ -4657,7 +4566,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                         ; body' <- zonkAppTypeIfNeeded body
                         ; let emb_arg = L ctxt (HsEmbTy noExtField hs_ty)
                               checked = ERetainedArg DepFunInvisible ctxt
-                                          (Scaled bndr_mult' bndr_ty') emb_arg body' Nothing
+                                          (Scaled bndr_mult' bndr_ty') emb_arg body' Nothing Nothing
                         ; go plan fun_orig pos (checked : acc) body' rest_args }
                    Nothing ->
                      do { arg <- type_to_retained_expr hs_ty
@@ -4665,7 +4574,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                             ctxt binder body arg rest_args } }
 
     -- See Note [Explicit invisible retained arguments].
-    go1 plan fun_orig pos acc fun_ty (ERetainedArg _ loc _ arg _ _ : rest_args)
+    go1 plan fun_orig pos acc fun_ty (ERetainedArg { ea_loc_span = loc, ea_arg = arg } : rest_args)
       | DepFunTy DepFunInvisible binder body <- coreFullView fun_ty
       = check_invis_retained_operand plan fun_orig pos acc fun_ty loc binder body arg rest_args
       | otherwise = addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
@@ -4733,17 +4642,17 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
     go1 plan fun_orig pos acc fun_ty
         (EValArg { ea_arg = arg, ea_loc_span = ctxt } : rest_args)
       | DepFunTy DepFunVisible binder body <- coreFullView fun_ty
-      = do { (runtime_arg, body_ty, arg_co) <-
+      = do { (runtime_arg, body_ty, arg_co, mb_tc) <-
                if exprContainsHole arg
-               then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
-               else do { (core_arg, runtime_arg) <- tcRetainedOperand binder body arg
-                       ; body_ty <- retainedAppResult fun_ty binder core_arg
-                       ; arg_co <- retainedVariableCast core_arg runtime_arg
-                       ; return (runtime_arg, body_ty, arg_co) }
+               then do { (r_arg, b_ty, a_co) <- tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
+                       ; return (r_arg, b_ty, a_co, Nothing) }
+               else do { (core_arg, checked_tc, arg_ue) <- tcRetainedOperand binder body arg
+                       ; b_ty <- retainedAppResult fun_ty binder core_arg
+                       ; return (arg, b_ty, Nothing, Just (checked_tc, arg_ue)) }
            ; bndr_ty' <- zonkRetainedBinderDomain binder
            ; bndr_mult' <- zonkAppTypeIfNeeded (idMult binder)
            ; let arg' = ERetainedArg DepFunVisible ctxt (Scaled bndr_mult' bndr_ty') runtime_arg body_ty
-                                         arg_co
+                                         arg_co mb_tc
            ; go plan fun_orig (pos + 1) (arg' : acc) body_ty rest_args }
 
     -- Rule ITVDQ from the GHC Proposal #281
@@ -4860,20 +4769,20 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                          (applyTypeToArgs fun_ty [operand]) next_args } }
 
     check_invis_retained_operand plan fun_orig pos acc fun_ty ctxt binder body arg rest_args
-      = do { (runtime_arg, res_ty, arg_co) <-
+      = do { (runtime_arg, res_ty, arg_co, mb_tc) <-
                addArgCtxt (pos + count written_prefix_arg acc) rn_head arg $
                if isVacuousRetainedBinder binder body
-               then return (arg, body, Nothing)
+               then return (arg, body, Nothing, Nothing)
                else if exprContainsHole arg
-               then tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
-               else do { (operand, runtime_arg) <- tcRetainedOperand binder body arg
+               then do { (r_arg, b_ty, a_co) <- tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
+                       ; return (r_arg, b_ty, a_co, Nothing) }
+               else do { (operand, checked_tc, arg_ue) <- tcRetainedOperand binder body arg
                        ; res <- retainedAppResult fun_ty binder operand
-                       ; co <- retainedVariableCast operand runtime_arg
-                       ; return (runtime_arg, res, co) }
+                       ; return (arg, res, Nothing, Just (checked_tc, arg_ue)) }
            ; bndr_ty' <- zonkRetainedBinderDomain binder
            ; bndr_mult' <- zonkAppTypeIfNeeded (idMult binder)
            ; let checked = ERetainedArg DepFunInvisible ctxt (Scaled bndr_mult' bndr_ty')
-                                        runtime_arg res_ty arg_co
+                                        runtime_arg res_ty arg_co mb_tc
            ; go plan fun_orig pos (checked : acc) res_ty rest_args }
 
     -- Read only the visible domains that already follow this callback.
@@ -4905,12 +4814,345 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
            _ -> ExpectedFunTyArg (HsExprTcThing tc_fun) arg
 
 
+-- | Mode for extracting a 'Core.CoreExpr' from a checked 'LHsExpr' 'GhcTc'.
+data RetainedCoreMode
+  = RCM_RetainedArg
+  | RCM_OptionalLet
+  | RCM_CaseCallArg !(NameEnv Id)
+
+-- | Recover a 'Core.CoreExpr', its certified source-table owners, and any
+-- dictionary method guards from an already-typechecked expression without
+-- emitting constraints or linearity usages.
+--
+-- See Note [Optional typed let operands],
+-- Note [Checked source call arguments] in "GHC.Tc.Gen.Expr",
+-- Note [Signed source call beta] in "GHC.Tc.Gen.Expr", and
+-- Note [Cases on a cast callback result] in "GHC.Tc.Gen.Expr".
+tcExprToRetainedCore
+  :: RetainedCoreMode
+  -> LHsExpr GhcTc
+  -> TcM (Maybe (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)]))
+tcExprToRetainedCore mode0 lexpr0 = runMaybeT (go mode0 lexpr0)
+  where
+    is_case RCM_CaseCallArg{} = True
+    is_case _                 = False
+
+    liftMaybe :: Maybe a -> MaybeT TcM a
+    liftMaybe = MaybeT . pure
+
+    go :: RetainedCoreMode
+       -> LHsExpr GhcTc
+       -> MaybeT TcM (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])
+    go mode (L _ expr) = case expr of
+      HsPar _ body -> go mode body
+      XExpr (ExpandedThingTc (HSE _ body)) -> go mode body
+      XExpr (WrapExpr WpHole body) -> go mode (noLocA body)
+      XExpr (WrapExpr (WpSubType w) body)
+        | not (is_case mode) -> go mode (noLocA (XExpr (WrapExpr w body)))
+      ExprWithTySig _ body _
+        | not (is_case mode) -> go mode body
+      XExpr (WrapExpr wrap body)
+        | RCM_OptionalLet <- mode
+        , Just (selector, domain, wanted) <- method_head wrap body -> do
+            domain' <- liftMaybeT (liftZonkM (zonkTcType domain))
+            (sel, dfun, ev) <- method selector domain' wanted
+            target_name <- liftMaybe (sourceMethodTarget_maybe dfun sel)
+            target <- MaybeT (tcLookupIdMaybe target_name) >>= tcOptionalLetCertified
+            guard (varType target `tcEqType` classMethodInstTy sel [domain'])
+            return (Core.Var target, [target], [(ev, dfun, sel, Just target)])
+        | RCM_RetainedArg <- mode
+        , Just (sel, inst, dict_expr) <- scoped_dict_head wrap body -> do
+            sel'  <- liftMaybeT (liftZonkM (zonkId sel))
+            inst' <- liftMaybeT (liftZonkM (zonkTcType inst))
+            return (Core.mkApps (Core.Var sel') [Core.Type inst', dict_expr], [], [])
+        | otherwise -> do
+            (body', heads, guards) <- go mode (noLocA body)
+            wrapped <- apply_wrap mode wrap body'
+            return (wrapped, heads, guards)
+      HsAppType ty fun _
+        | not (is_case mode) -> do
+            (fun', heads, guards) <- go mode fun
+            ty' <- liftMaybeT (liftZonkM (zonkTcType ty))
+            return (Core.App fun' (Core.Type ty'), heads, guards)
+      HsAppRetained _ fun arg
+        | RCM_RetainedArg <- mode -> do
+            (fun', fh, fg) <- go mode fun
+            (arg', ah, ag) <- go mode arg
+            return (Core.App fun' arg', fh ++ ah, fg ++ ag)
+      HsApp _ fun arg
+        | RCM_CaseCallArg bound <- mode
+        , ExprWithTySig _ inner signature <- unLoc (strip_checked fun)
+        , Just domain_name <- simple_signature signature ->
+            (, [], []) <$> checked_beta bound domain_name inner arg
+        | RCM_RetainedArg <- mode
+        , HsLam _ LamSingle MG
+            { mg_alts = L _ [L _ Match
+                { m_pats = L _ [L _ (VarPat _ (L _ bndr_id))]
+                , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body) NE.:| []
+                                  , grhssLocalBinds = L _ EmptyLocalBinds{} } }] }
+            <- unLoc (strip_checked fun) -> do
+            bndr' <- liftMaybeT (liftZonkM (zonkId bndr_id))
+            (body', bh, bg) <- go mode body
+            (arg', ah, ag)  <- go mode arg
+            return (Core.App (Core.Lam bndr' body') arg', bh ++ ah, bg ++ ag)
+        | otherwise -> do
+            (fun', fh, fg) <- go_fun mode fun
+            (arg', ah, ag) <- go mode arg
+            return (Core.App fun' arg', fh ++ ah, fg ++ ag)
+      ExplicitList element_ty elements -> do
+        element_ty' <- liftMaybeT (liftZonkM (zonkTcType element_ty))
+        values <- mapM (go mode) elements
+        let nil = Core.mkConApp nilDataCon [Core.Type element_ty']
+            cons (val, _, _) rest = Core.mkConApp consDataCon [Core.Type element_ty', val, rest]
+        return (foldr cons nil values,
+                concatMap (\(_, h, _) -> h) values,
+                concatMap (\(_, _, g) -> g) values)
+      ExplicitTuple _ tup_args Boxed
+        | RCM_RetainedArg <- mode
+        , Just es <- tupArgsPresent_maybe tup_args -> do
+            values <- mapM (go mode) es
+            return (mkCoreTup [v | (v, _, _) <- values],
+                    concatMap (\(_, h, _) -> h) values,
+                    concatMap (\(_, _, g) -> g) values)
+      HsVar _ (L _ v) -> case mode of
+        RCM_CaseCallArg bound -> do
+          let actual = fromMaybe v (lookupNameEnv bound (idName v))
+          guard (isNativeOpaqueValueId actual)
+          return (Core.Var actual, [], [])
+        RCM_OptionalLet -> do
+          occ <- liftMaybeT (liftZonkM (zonkId v))
+          if not (isExternalName (getName occ)) && isNativeOpaqueValueId occ
+            then do
+              thing <- MaybeT (tcLookupLcl_maybe (getName occ))
+              case thing of
+                ATcId { tct_id = actual } -> do
+                  actual' <- liftMaybeT (liftZonkM (zonkId actual))
+                  guard (actual' == occ && isNativeOpaqueValueId actual'
+                         && varType actual' `tcEqType` varType occ)
+                  return (Core.Var actual', [], [])
+                _ -> mzero
+            else do
+              owner <- tcOptionalLetCertified occ
+              return (Core.Var owner, [owner], [])
+        RCM_RetainedArg -> do
+          occ <- liftMaybeT (liftZonkM (zonkId v))
+          if not (isExternalName (getName occ))
+            then do
+              guard (isNativeOpaqueValueId occ || isNativeIndexFunctionId occ)
+              return (Core.Var occ, [], [])
+            else do
+              mb_owner <- liftMaybeT (tcLookupSourceTableId occ)
+              case mb_owner of
+                Just owner -> do
+                  owner' <- liftMaybeT (liftZonkM (zonkId owner))
+                  guard (varType owner' `tcEqType` varType occ)
+                  return (Core.Var owner', [owner'], [])
+                Nothing
+                  | isNativeOpaqueValueId occ || isNativeNamedOpaqueFunctionId occ ->
+                      return (Core.Var occ, [], [])
+                  | otherwise -> mzero
+      XExpr (HsRecSelTc FieldOcc{foLabel = L _ sel_id}) -> case mode of
+        RCM_OptionalLet -> do
+          owner <- tcOptionalLetCertified sel_id
+          return (Core.Var owner, [owner], [])
+        RCM_RetainedArg -> do
+          sel' <- liftMaybeT (liftZonkM (zonkId sel_id))
+          owner <- MaybeT (tcLookupSourceTableId sel')
+          owner' <- liftMaybeT (liftZonkM (zonkId owner))
+          guard (varType owner' `tcEqType` varType sel')
+          return (Core.Var owner', [owner'], [])
+        RCM_CaseCallArg{} -> mzero
+      XExpr (ConLikeTc (RealDataCon con)) -> case mode of
+        RCM_OptionalLet -> return (Core.Var (dataConWorkId con), [], [])
+        _               -> return (Core.Var (dataConWrapId con), [], [])
+      HsLit _ (HsChar _ c)
+        | RCM_RetainedArg <- mode -> return (mkCharExpr c, [], [])
+      HsLit _ (HsNatural _ il)
+        | RCM_RetainedArg <- mode -> do
+            platform <- liftMaybeT getPlatform
+            return (mkNaturalExpr platform (il_value il), [], [])
+      HsOverLit _ (OverLit { ol_ext = OverLitTc { ol_rebindable = False
+                                                , ol_witness = witness
+                                                , ol_type = result_ty }
+                           , ol_val = HsIntegral literal })
+        | RCM_OptionalLet <- mode
+        , let n = il_value literal, n >= 0
+        , HsApp _ fun arg <- strip witness
+        , XExpr (WrapExpr wrap body) <- strip (unLoc fun)
+        , Just (selector, domain, wanted) <- method_head wrap body
+        , HsLit _ (XLit (HsInteger _ actual integer_ty)) <- strip (unLoc arg)
+        , actual == n, isIntegerTy integer_ty -> do
+            domain' <- liftMaybeT (liftZonkM (zonkTcType domain))
+            result_ty' <- liftMaybeT (liftZonkM (zonkTcType result_ty))
+            guard (domain' `tcEqType` result_ty')
+            (sel, dfun, ev) <- method selector domain' wanted
+            (zero, succ_con) <- liftMaybe (sourceLiteralCons_maybe dfun sel)
+            dflags <- liftMaybeT getDynFlags
+            guard (n <= toInteger (maxBound :: Int)
+                   && not (intGtLimit (fromInteger n) (reductionDepth dflags)))
+            let build 0 = Core.Var (dataConWorkId zero)
+                build k = Core.App (Core.Var (dataConWorkId succ_con)) (build (k - 1))
+            return (build (fromInteger n :: Int), [], [(ev, dfun, sel, Nothing)])
+      _ -> mzero
+
+    go_fun :: RetainedCoreMode
+           -> LHsExpr GhcTc
+           -> MaybeT TcM (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])
+    go_fun mode@(RCM_CaseCallArg _) fun
+      | XExpr (WrapExpr (WpCast co) inner) <- unLoc (stripParensLHsExpr fun) = do
+          (prefix@Core.App{}, fh, fg) <- go mode (noLocA inner)
+          index <- liftMaybe (Core.exprToNativeCaseIndex prefix)
+          checked <- liftMaybeT (liftZonkM (mapNativeIndexCastCoM zonkCo co))
+          let source = coercionLKind checked
+              target = coercionRKind checked
+          guard (coercionRole checked == Representational && typeKind index `eqType` source)
+          case setNominalRole_maybe Representational checked of
+            Just _ | isJust (nativeIndexFunctionTypeTys_maybe target) ->
+              return (Core.Cast prefix checked, fh, fg)
+            _ -> do
+              loc <- liftMaybeT (getCtLocM PatCheckOrigin Nothing)
+              delta <- MaybeT (tryTcDiscardingErrs (pure Nothing) $
+                               runMaybeT (expose_arrow loc source))
+              let arrow = coercionRKind delta
+              _ <- liftMaybeT (unifyType Nothing arrow target)
+              target' <- liftMaybeT (liftZonkM (zonkTcType target))
+              guard (target' `eqType` arrow)
+              return (Core.Cast prefix (mkSubCo delta), fh, fg)
+    go_fun mode fun = go mode fun
+
+    expose_arrow :: CtLoc -> TcType -> MaybeT TcM CoercionN
+    expose_arrow loc ty = do
+      (family, args) <- liftMaybe (tcSplitTyConApp_maybe ty)
+      guard (isTypeFamilyTyCon family && not (isConstrainedFamilyTyCon family))
+      Reduction step rhs <- MaybeT (matchFamTcM family args)
+      loc' <- liftMaybeT (bumpReductionDepthTcM loc ty)
+      if isJust (nativeIndexFunctionTypeTys_maybe rhs)
+        then pure step
+        else mkTransCo step <$> expose_arrow loc' rhs
+
+    apply_wrap :: RetainedCoreMode -> HsWrapper -> Core.CoreExpr -> MaybeT TcM Core.CoreExpr
+    apply_wrap _ WpHole body = return body
+    apply_wrap mode (WpSubType w) body
+      | not (is_case mode) = apply_wrap mode w body
+    apply_wrap mode (WpCompose outer inner) body =
+      apply_wrap mode inner body >>= apply_wrap mode outer
+    apply_wrap mode (WpTyApp ty) body = do
+      ty' <- liftMaybeT (liftZonkM (zonkTcType ty))
+      case mode of
+        RCM_RetainedArg -> guard (noQuickLookVars ty')
+        _               -> return ()
+      return (Core.App body (Core.Type ty'))
+    apply_wrap RCM_RetainedArg (WpEvApp (EvExpr (Core.Coercion co))) body = do
+      co' <- liftMaybeT (liftZonkM (zonkCo co))
+      guard (not (hasCoercionHole (CoercionTy co')))
+      return (Core.App body (Core.Coercion co'))
+    apply_wrap RCM_RetainedArg (WpCast co) body = do
+      co' <- liftMaybeT (liftZonkM (mapNativeIndexCastCoM zonkCo co))
+      if isReflCo co'
+        then return body
+        else case nativeIndexCastCo_maybe co' of
+               Just delta -> return (Core.Cast body (SubCo delta))
+               Nothing    -> mzero
+    apply_wrap _ _ _ = mzero
+
+    strip :: HsExpr GhcTc -> HsExpr GhcTc
+    strip (HsPar _ body) = strip (unLoc body)
+    strip (XExpr (ExpandedThingTc (HSE _ body))) = strip (unLoc body)
+    strip (XExpr (WrapExpr WpHole body)) = strip body
+    strip e = e
+
+    strip_checked :: LHsExpr GhcTc -> LHsExpr GhcTc
+    strip_checked e = case unLoc (stripParensLHsExpr e) of
+      XExpr (WrapExpr WpHole inner) -> strip_checked (noLocA inner)
+      XExpr (ExpandedThingTc (HSE _ inner)) -> strip_checked inner
+      _ -> stripParensLHsExpr e
+
+    scoped_dict_head :: HsWrapper -> HsExpr GhcTc -> Maybe (Id, Type, Core.CoreExpr)
+    scoped_dict_head (WpCompose (WpEvApp (EvExpr dict_expr)) (WpTyApp inst)) body
+      | HsVar _ (L _ sel) <- strip body
+      , isJust (isClassOpId_maybe sel)
+      = Just (sel, inst, dict_expr)
+    scoped_dict_head _ _ = Nothing
+
+    method_head :: HsWrapper -> HsExpr GhcTc -> Maybe (Id, Type, EvVar)
+    method_head (WpCompose (WpEvApp (EvExpr (Core.Var wanted))) (WpTyApp domain)) body
+      | HsVar _ (L _ selector) <- strip body = Just (selector, domain, wanted)
+    method_head (WpEvApp (EvExpr (Core.Var wanted))) body
+      | HsAppType domain fun _ <- strip body
+      , HsVar _ (L _ selector) <- strip (unLoc fun) = Just (selector, domain, wanted)
+    method_head _ _ = Nothing
+
+    method :: Id -> Type -> EvVar -> MaybeT TcM (Id, Id, EvVar)
+    method selector0 domain0 wanted0 = do
+      selector <- liftMaybeT (liftZonkM (zonkId selector0))
+      domain <- liftMaybeT (liftZonkM (zonkTcType domain0))
+      wanted <- liftMaybeT (liftZonkM (zonkId wanted0))
+      cls <- liftMaybe (isClassOpId_maybe selector)
+      case tcSplitSigmaTy (varType selector) of
+        ([(_, tv)], [theta], rho)
+          | let (_, _, result) = splitFunTys rho
+          , result `tcEqType` mkTyVarTy tv
+          , theta `tcEqType` mkClassPred cls [mkTyVarTy tv]
+          , noFreeVarsOfType domain, typeKind domain `tcEqType` tyVarKind tv
+          , varType wanted `tcEqType` mkClassPred cls [domain] -> return ()
+        _ -> mzero
+      insts <- liftMaybeT tcGetInstEnvs
+      dfun_name <- case lookupUniqueInstEnv insts cls [domain] of
+        Right (inst, []) -> return (getName (instanceDFunId inst))
+        _ -> mzero
+      env <- liftMaybeT getGblEnv
+      guard (not (nameIsLocalOrFrom (tcg_semantic_mod env) dfun_name))
+      dfun <- MaybeT (tcLookupIdMaybe dfun_name)
+      guard (isDFunId dfun && varType dfun `tcEqType` varType wanted
+             && noFreeVarsOfType (varType dfun))
+      return (selector, dfun, wanted)
+
+    simple_signature :: LHsSigWcType GhcRn -> Maybe Name
+    simple_signature (HsWC { hswc_ext = []
+                           , hswc_body = L _ HsSig
+                               { sig_bndrs = HsOuterImplicit { hso_ximplicit = [] }
+                               , sig_body = signature } })
+      | HsFunTy _ (HsModifiedFunArr _ [] (HsStandardArr _)) arg res <- strip_type signature
+      , HsTyVar _ NotPromoted (L _ (WithUserRdr _ arg_name)) <- strip_type arg
+      , HsTyVar _ NotPromoted (L _ (WithUserRdr _ res_name)) <- strip_type res
+      , arg_name == res_name
+      = Just arg_name
+    simple_signature _ = Nothing
+
+    strip_type :: LHsType GhcRn -> HsType GhcRn
+    strip_type (L _ (HsParTy _ ty)) = strip_type ty
+    strip_type (L _ ty) = ty
+
+    checked_beta :: NameEnv Id -> Name -> LHsExpr GhcTc -> LHsExpr GhcTc -> MaybeT TcM Core.CoreExpr
+    checked_beta bound domain_name inner arg
+      | HsLam _ LamSingle MG
+          { mg_ext = MatchGroupTc { mg_arg_tys = [pat_ty], mg_res_ty = result_ty }
+          , mg_alts = L _ [L _ Match
+              { m_pats = L _ [L _ (VarPat _ (L _ binder))]
+              , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body) NE.:| []
+                                , grhssLocalBinds = L _ EmptyLocalBinds{} } }] }
+          <- unLoc (strip_checked inner) = do
+          strict <- liftMaybeT (xoptM LangExt.Strict)
+          guard (not strict)
+          (actual, argument, result) <- liftMaybeT $ liftZonkM $
+            (,,) <$> zonkId binder <*> zonkScaledTcType pat_ty <*> zonkTcType result_ty
+          guard (isManyTy (idMult actual) && isManyTy (scaledMult argument)
+                 && isNativeIndexId actual
+                 && eqType (idType actual) (scaledThing argument)
+                 && eqType (idType actual) result)
+          (tc, []) <- liftMaybe (splitTyConApp_maybe (coreFullView (idType actual)))
+          guard (tyConName tc == domain_name)
+          (core_body, _, _) <- go (RCM_CaseCallArg (extendNameEnv bound (idName actual) actual)) body
+          (core_arg, _, _)  <- go (RCM_CaseCallArg bound) arg
+          return (Core.App (Core.Lam actual core_body) core_arg)
+      | otherwise = mzero
+
 -- | Recover an optional alias operand from its already checked RHS.
 -- See Note [Optional typed let operands].
 tcOptionalLetOperand :: LHsExpr GhcTc
                      -> TcM (Maybe (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)]))
 tcOptionalLetOperand rhs = runMaybeT $ do
-    result@(operand, _, _) <- tcOptionalLetExpr (unLoc rhs)
+    result@(operand, _, _) <- MaybeT (tcExprToRetainedCore RCM_OptionalLet rhs)
     _ <- MaybeT (pure (Core.retainedArgIndex operand))
     return result
 
@@ -4967,21 +5209,21 @@ tcOptionalLetFunctionOperand mb_param expr expected_ty = runMaybeT $ do
     collect_compose_chain compose e = case unLoc (strip_loc e) of
       HsApp _ fun2 arg2
         | HsApp _ op arg1 <- unLoc (strip_loc fun2) -> do
-            is_comp <- is_compose_operator compose (unLoc (strip_loc op))
+            is_comp <- is_compose_operator compose op
             guard is_comp
             lefts <- collect_compose_chain compose arg1 <|> pure [arg1]
             rights <- collect_compose_chain compose arg2 <|> pure [arg2]
             return (lefts ++ rights)
       _ -> mzero
 
-    is_compose_operator compose expr =
-      (do { (core_op, _, methods_op) <- tcOptionalLetExpr expr
+    is_compose_operator compose op =
+      (do { (core_op, _, methods_op) <- MaybeT (tcExprToRetainedCore RCM_OptionalLet op)
           ; guard (null methods_op)
           ; case Core.collectArgs core_op of
               (Core.Var fn, args) | fn == compose, all Core.isTypeArg args -> pure True
               _ -> mzero })
       <|>
-      (do { dep_fn <- liftMaybe (peel_dep_compose_var expr)
+      (do { dep_fn <- liftMaybe (peel_dep_compose_var (unLoc op))
           ; guard (isDependentComposeId dep_fn)
           ; pure True })
 
@@ -5010,7 +5252,7 @@ tcOptionalLetFunctionOperand mb_param expr expected_ty = runMaybeT $ do
 
     compose_chain compose mb_param funs expected = do
       resolved <- forM funs $ \f_expr -> do
-        (core_f, heads_f, methods_f) <- tcOptionalLetExpr (unLoc f_expr)
+        (core_f, heads_f, methods_f) <- MaybeT (tcExprToRetainedCore RCM_OptionalLet f_expr)
         forM_ mb_param $ \param ->
           guard (not (param `elemVarSet` exprFreeVars core_f))
         return (f_expr, core_f, heads_f, methods_f)
@@ -5067,132 +5309,6 @@ tcOptionalLetFunctionOperand mb_param expr expected_ty = runMaybeT $ do
     lazy_var_pat (L _ (ParPat _ pat)) = lazy_var_pat pat
     lazy_var_pat (L _ (VarPat _ (L _ var))) = Just var
     lazy_var_pat _ = Nothing
-
--- | Recover a checked Core expression and its certified dependencies from a
--- typechecked expression without emitting constraints or usage obligations.
-tcOptionalLetExpr :: HsExpr GhcTc
-                  -> MaybeT TcM (Core.CoreExpr, [Id], [(EvVar, Id, Id, Maybe Id)])
-tcOptionalLetExpr expr = case expr of
-  HsPar _ body -> tcOptionalLetExpr (unLoc body)
-  ExprWithTySig _ body _ -> tcOptionalLetExpr (unLoc body)
-  XExpr (ExpandedThingTc (HSE _ body)) -> tcOptionalLetExpr (unLoc body)
-  XExpr (WrapExpr WpHole body) -> tcOptionalLetExpr body
-  XExpr (WrapExpr wrap body)
-    | Just (selector, domain, wanted) <- method_head wrap body -> do
-        domain <- liftMaybeT (liftZonkM (zonkTcType domain))
-        (sel, dfun, ev) <- method selector domain wanted
-        target_name <- liftMaybe (sourceMethodTarget_maybe dfun sel)
-        target <- MaybeT (tcLookupIdMaybe target_name) >>= tcOptionalLetCertified
-        guard (varType target `tcEqType` classMethodInstTy sel [domain])
-        return (Core.Var target, [target], [(ev, dfun, sel, Just target)])
-    | otherwise -> do
-        (body', heads, guards) <- tcOptionalLetExpr body
-        wrapped <- type_apps wrap body'
-        return (wrapped, heads, guards)
-  HsAppType ty fun _ -> do
-    (fun', heads, guards) <- tcOptionalLetExpr (unLoc fun)
-    applied <- type_apps (WpTyApp ty) fun'
-    return (applied, heads, guards)
-  HsApp _ fun arg -> do
-    (fun', fun_heads, fun_guards) <- tcOptionalLetExpr (unLoc fun)
-    (arg', arg_heads, arg_guards) <- tcOptionalLetExpr (unLoc arg)
-    return (Core.App fun' arg', fun_heads ++ arg_heads, fun_guards ++ arg_guards)
-  ExplicitList element_ty elements -> do
-    element_ty <- liftMaybeT (liftZonkM (zonkTcType element_ty))
-    values <- mapM (tcOptionalLetExpr . unLoc) elements
-    let nil = Core.mkTyApps (Core.Var (dataConWorkId nilDataCon)) [element_ty]
-        cons = Core.mkTyApps (Core.Var (dataConWorkId consDataCon)) [element_ty]
-    return (foldr (\(value, _, _) rest -> Core.mkApps cons [value, rest]) nil values,
-            concatMap (\(_, heads, _) -> heads) values,
-            concatMap (\(_, _, guards) -> guards) values)
-  HsVar _ (L _ occurrence) -> do
-    occurrence <- liftMaybeT (liftZonkM (zonkId occurrence))
-    if not (isExternalName (getName occurrence)) && isNativeOpaqueValueId occurrence
-      then do
-        thing <- MaybeT (tcLookupLcl_maybe (getName occurrence))
-        case thing of
-          ATcId { tct_id = actual } -> do
-            actual <- liftMaybeT (liftZonkM (zonkId actual))
-            guard (actual == occurrence && isNativeOpaqueValueId actual
-                   && varType actual `tcEqType` varType occurrence)
-            return (Core.Var actual, [], [])
-          _ -> mzero
-      else do
-        owner <- tcOptionalLetCertified occurrence
-        return (Core.Var owner, [owner], [])
-  XExpr (ConLikeTc (RealDataCon con)) -> return (Core.Var (dataConWorkId con), [], [])
-  HsOverLit _ (OverLit { ol_ext = OverLitTc { ol_rebindable = False
-                                          , ol_witness = witness
-                                          , ol_type = result_ty }
-                      , ol_val = HsIntegral literal })
-    | let n = il_value literal, n >= 0
-    , HsApp _ fun arg <- strip witness
-    , XExpr (WrapExpr wrap body) <- strip (unLoc fun)
-    , Just (selector, domain, wanted) <- method_head wrap body
-    , HsLit _ (XLit (HsInteger _ actual integer_ty)) <- strip (unLoc arg)
-    , actual == n, isIntegerTy integer_ty -> do
-        domain <- liftMaybeT (liftZonkM (zonkTcType domain))
-        result_ty <- liftMaybeT (liftZonkM (zonkTcType result_ty))
-        guard (domain `tcEqType` result_ty)
-        (sel, dfun, ev) <- method selector domain wanted
-        (zero, succ_con) <- liftMaybe (sourceLiteralCons_maybe dfun sel)
-        dflags <- liftMaybeT getDynFlags
-        guard (n <= toInteger (maxBound :: Int)
-               && not (intGtLimit (fromInteger n) (reductionDepth dflags)))
-        let build 0 = Core.Var (dataConWorkId zero)
-            build k = Core.App (Core.Var (dataConWorkId succ_con)) (build (k - 1))
-        return (build (fromInteger n :: Int), [], [(ev, dfun, sel, Nothing)])
-  _ -> mzero
-  where
-    strip :: HsExpr GhcTc -> HsExpr GhcTc
-    strip (HsPar _ body) = strip (unLoc body)
-    strip (XExpr (ExpandedThingTc (HSE _ body))) = strip (unLoc body)
-    strip (XExpr (WrapExpr WpHole body)) = strip body
-    strip e = e
-
-    method_head :: HsWrapper -> HsExpr GhcTc -> Maybe (Id, Type, EvVar)
-    method_head (WpCompose (WpEvApp (EvExpr (Core.Var wanted))) (WpTyApp domain)) body
-      | HsVar _ (L _ selector) <- strip body = Just (selector, domain, wanted)
-    method_head (WpEvApp (EvExpr (Core.Var wanted))) body
-      | HsAppType domain fun _ <- strip body
-      , HsVar _ (L _ selector) <- strip (unLoc fun) = Just (selector, domain, wanted)
-    method_head _ _ = Nothing
-
-    method :: Id -> Type -> EvVar -> MaybeT TcM (Id, Id, EvVar)
-    method selector domain wanted = do
-      selector <- liftMaybeT (liftZonkM (zonkId selector))
-      domain <- liftMaybeT (liftZonkM (zonkTcType domain))
-      wanted <- liftMaybeT (liftZonkM (zonkId wanted))
-      cls <- liftMaybe (isClassOpId_maybe selector)
-      case tcSplitSigmaTy (varType selector) of
-        ([(_, tv)], [theta], rho)
-          | let (_, _, result) = splitFunTys rho
-          , result `tcEqType` mkTyVarTy tv
-          , theta `tcEqType` mkClassPred cls [mkTyVarTy tv]
-          , noFreeVarsOfType domain, typeKind domain `tcEqType` tyVarKind tv
-          , varType wanted `tcEqType` mkClassPred cls [domain] -> return ()
-        _ -> mzero
-      insts <- liftMaybeT tcGetInstEnvs
-      dfun_name <- case lookupUniqueInstEnv insts cls [domain] of
-        Right (inst, []) -> return (getName (instanceDFunId inst))
-        _ -> mzero
-      env <- liftMaybeT getGblEnv
-      guard (not (nameIsLocalOrFrom (tcg_semantic_mod env) dfun_name))
-      dfun <- MaybeT (tcLookupIdMaybe dfun_name)
-      guard (isDFunId dfun && varType dfun `tcEqType` varType wanted
-             && noFreeVarsOfType (varType dfun))
-      return (selector, dfun, wanted)
-
-    type_apps :: HsWrapper -> Core.CoreExpr -> MaybeT TcM Core.CoreExpr
-    type_apps WpHole body = return body
-    type_apps (WpTyApp ty) body = do
-      ty <- liftMaybeT (liftZonkM (zonkTcType ty))
-      return (Core.App body (Core.Type ty))
-    type_apps (WpCompose outer inner) body = type_apps inner body >>= type_apps outer
-    type_apps _ _ = mzero
-
-    liftMaybe :: Maybe a -> MaybeT TcM a
-    liftMaybe = MaybeT . pure
 
 tcOptionalLetCertified :: Id -> MaybeT TcM Id
 tcOptionalLetCertified actual = do
@@ -5398,10 +5514,9 @@ tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
   | otherwise
   = do { defer_holes <- anyDeferHoleFlags
        ; if defer_holes
-         then do { (core_arg, runtime_arg) <- tcRetainedOperand binder body arg
-                 ; res <- retainedAppResult fun_ty binder operand_of_core
-                 ; co <- retainedVariableCast core_arg runtime_arg
-                 ; return (runtime_arg, res, co) }
+         then do { (core_arg, _, _) <- tcRetainedOperand binder body arg
+                 ; res <- retainedAppResult fun_ty binder core_arg
+                 ; return (arg, res, Nothing) }
          else do { tcPreUnifyRetainedHoleCon binder arg
                  ; fun_ty' <- liftZonkM (zonkTcType fun_ty)
                  ; (binder', body') <- case coreFullView fun_ty' of
@@ -5414,8 +5529,6 @@ tcRetainedHoleOperand retained_holes_ref fun_ty binder body arg
                      updTcRef ref (hole_tv :)
                  ; let res_ty = replaceTermVarInType binder' (mkTyVarTy hole_tv) body'
                  ; return (arg, res_ty, Nothing) } }
-  where
-    operand_of_core = panic "tcRetainedHoleOperand: unreachable after tcRetainedOperand"
 
 -- | Pre-unify flexible meta-variables in a retained binder's domain when the
 -- hole-bearing argument is headed by a known data constructor (e.g. `Succ _`).
@@ -5520,8 +5633,8 @@ substInstArgHoles subst = map subst_arg
   where
     subst_scaled (Scaled m t) = Scaled (Subst.substTy subst m) (Subst.substTy subst t)
     subst_arg (EValArg loc ty arg) = EValArg loc (subst_scaled ty) arg
-    subst_arg (ERetainedArg vis loc ty arg res_ty co) =
-      ERetainedArg vis loc (subst_scaled ty) arg (Subst.substTy subst res_ty) co
+    subst_arg (ERetainedArg vis loc ty arg res_ty co mb_tc) =
+      ERetainedArg vis loc (subst_scaled ty) arg (Subst.substTy subst res_ty) co mb_tc
     subst_arg arg@ETypeArg{ ea_ty_arg = ty } = arg { ea_ty_arg = Subst.substTy subst ty }
     subst_arg arg@EValArgQL{ eaql_arg_ty = ty, eaql_args = inner, eaql_res_rho = rho } =
       arg { eaql_arg_ty = subst_scaled ty
@@ -5569,10 +5682,12 @@ unifyNonHoleSubterms hole_set actual expected
        ; unifyNonHoleSubterms hole_set r1 r2 }
   | otherwise = return ()
 
--- | Resolve the index at the binder's checked scalar or function domain.
-tcRetainedOperand :: Id -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+-- | Check a retained operand once at its binder's scalar or function domain,
+-- returning its Core representation, checked syntax, and collected usage.
+-- See Note [Retained argument application].
+tcRetainedOperand :: Id -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc, UsageEnv)
 tcRetainedOperand binder body arg = do
-  result@(core_arg, _) <- if isNativeIndexFunctionId binder
+  result@(core_arg, _, _) <- if isNativeIndexFunctionId binder
     then tcRetainedFunctionArg domain arg
     else tcRetainedArgScaled (Scaled (idMult binder) domain) arg
   case core_arg of
@@ -5582,17 +5697,6 @@ tcRetainedOperand binder body arg = do
       | otherwise -> return result
   where
     domain = varType binder
-
--- | Reuse the nominal conversion of the exact written variable at value checking.
--- See Note [Retained argument application].
-retainedVariableCast :: Core.CoreExpr -> LHsExpr GhcRn -> TcM (Maybe CoercionN)
-retainedVariableCast (Core.Cast (Core.Var index) (SubCo co)) arg
-  | HsVar _ name <- unLoc (stripParensLHsExpr arg)
-  , unLocWithUserRdr name == getName index
-  = if isNativeIndexFunctionId index then return (Just co)
-    else do { givens <- getNativeGivens
-            ; return (if anyFreeVarsOfCo (`elem` givens) co then Just co else Nothing) }
-retainedVariableCast _ _ = return Nothing
 
 -- | Zonk a retained binder's domain when operand checking may have filled
 -- metavariables in it.
@@ -5614,11 +5718,14 @@ retainedAppResult fun_ty binder arg
        ; return (applyTypeToArgs fun_ty' [arg]) }
   | otherwise = return (applyTypeToArgs fun_ty [arg])
 
--- | Check a value operand and specialise a class selector to its checked method.
+-- | Check a value operand once and specialise a class selector to its checked method.
 -- See Note [Dictionary selection in retained arguments].
-tcRetainedValueOperand :: (LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn))
-                       -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedValueOperand resolve domain arg@(L loc original)
+tcRetainedValueOperand
+  :: (LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc))
+  -> (Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc))
+  -> Type -> LHsExpr GhcRn
+  -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+tcRetainedValueOperand resolve resolve_scoped_arg domain arg@(L loc original)
   | (op, args@(_:_)) <- split_call arg []
   , let (L head_loc head_expr, type_arg) = case op of
           L _ (HsAppType _ f ty) -> (stripParensLHsExpr f, Just ty)
@@ -5634,8 +5741,13 @@ tcRetainedValueOperand resolve domain arg@(L loc original)
               unchecked = failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall name))
           scoped <- tcScopedClassOperand domain arg
           case scoped of
-            Just (selector, inst, dict_expr, index, _) ->
-              pure (Core.mkApps (Core.Var selector) [Core.Type inst, dict_expr, Core.Var index], arg)
+            Just (selector, inst, dict_expr, index, operand) -> do
+              (_, checked_operand) <- tcScalingUsage ManyTy (resolve_scoped_arg inst operand)
+              let wrapper = mkWpEvApps [EvExpr dict_expr] <.> mkWpTyApps [inst]
+                  method  = noLocA (mkHsWrap wrapper (mkHsVar (noLocA selector)))
+                  call_tc = mkHsApps method [checked_operand]
+              pure (Core.mkApps (Core.Var selector) [Core.Type inst, dict_expr, Core.Var index],
+                    L loc (unLoc call_tc))
             Nothing -> do
               case tcSplitSigmaTy (varType sel) of
                 ([(_, tv)], [theta], rho)
@@ -5658,18 +5770,16 @@ tcRetainedValueOperand resolve domain arg@(L loc original)
                       <- shortCutLit platform literal integerTy
                   , n >= 0
                   -> do { (core, generated) <- buildRetainedNumeral dfun sel zero successor n
-                        ; return (core, L loc (mkExpandedLExpr original generated)) }
+                        ; return (core, L loc (XExpr (ExpandedThingTc (HSE (ExprCtxt original) generated)))) }
                 _ -> do
                   target_name <- maybe unchecked return (sourceMethodTarget_maybe dfun sel)
                   target <- tcLookupIdMaybe target_name >>= maybe unchecked return
                   unless (varType target `tcEqType` classMethodInstTy sel [domain]) unchecked
-
                   let target_head = L head_loc (HsVar noExtField (fmap (const (noUserRdr target_name)) lname))
-                      runtime_arg = L loc (mkExpandedLExpr original (mkHsApps target_head args))
-                  checked <- resolve runtime_arg
+                  (core, checked_call) <- resolve (mkHsApps target_head args)
                   recordSourceMethodUse dfun sel target
                   wantRetainedMethod sel dfun
-                  return checked
+                  return (core, L loc (XExpr (ExpandedThingTc (HSE (ExprCtxt original) checked_call))))
         _ -> ordinary
   | otherwise = ordinary
   where
@@ -5733,18 +5843,10 @@ tcScopedClassOperand _ _ = return Nothing
 
 {- Note [Scoped Given indices]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The complete signature can refer to a direct class Given in the result
-of a retained arrow. During application instantiation, use that same
-Given to form the index. During argument checking, apply the selector
-to the Given explicitly and check the value operand as usual.
-
-An ordinary Wanted can solve to the right Given but produce a fresh
-dictionary let binder. Keeping that alias in the result would allow a
-let-bound index to escape. Do not make this alias equal to the Given.
-Only a unique lexical Given of the selector's exact predicate qualifies.
-Read the operand's instantiated type and multiplicity before matching a
-constructor field. Use the original operand and evidence Ids.
-This path does not look for superclasses or global instances.
+A retained arrow result can mention a direct class Given (or unique superclass
+projection). Resolve the selector to that exact lexical dictionary variable in
+both type instantiation and operand checking. Never introduce a fresh Wanted
+dictionary let-binding, which would alter the index identity and escape scope.
 -}
 
 -- | Look up a completed, ground instance with no context.
@@ -5768,9 +5870,9 @@ wantRetainedMethod sel dfun = do
   emitSimple (mkNonCanonical ev)
   emitDelayedErrors (unitBag (DE_SourceMethod (ctEvEvId ev) dfun name (ctEvLoc ev)))
 
--- | Elaborate a nonnegative literal at a known retained domain.
+-- | Elaborate a nonnegative literal at a known retained domain in one pass.
 -- See Note [Retained integral literals].
-tcRetainedNumeral :: Type -> Name -> Integer -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+tcRetainedNumeral :: Type -> Name -> Integer -> TcM (Core.CoreExpr, LHsExpr GhcTc)
 tcRetainedNumeral domain from n = do
   let unverified :: TcM a
       unverified = failWithTc (TcRnRetainedQuantificationError (RetainedLiteralConversion from domain))
@@ -5783,105 +5885,82 @@ tcRetainedNumeral domain from n = do
     then do
       platform <- getPlatform
       wantRetainedMethod sel dfun
-      return (mkNaturalExpr platform n, nlHsLit (HsNatural noExtField (mkIntegralLit n)))
+      return (mkNaturalExpr platform n, noLocA (HsLit noExtField (HsNatural noExtField (mkIntegralLit n))))
     else do
       (zero, succ_con) <- maybe unverified return (sourceLiteralCons_maybe dfun sel)
       buildRetainedNumeral dfun sel zero succ_con n
 
--- | Build the index and runtime operand from a checked nonnegative conversion.
+-- | Build the Core index and checked constructor expression from a nonnegative conversion.
 buildRetainedNumeral :: Id -> Id -> DataCon -> DataCon -> Integer
-                     -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+                     -> TcM (Core.CoreExpr, LHsExpr GhcTc)
 buildRetainedNumeral dfun sel zero succ_con n = do
   dflags <- getDynFlags
   when (n > toInteger (maxBound :: Int) || intGtLimit (fromInteger n) (reductionDepth dflags)) $
     failWithTc (TcRnRetainedQuantificationError (RetainedLiteralDepth n))
   recordSourceLiteralUse dfun sel
   wantRetainedMethod sel dfun
-  let build :: Int -> (Core.CoreExpr, LHsExpr GhcRn)
-      build 0 = (Core.Var (dataConWorkId zero), nlHsVar (dataConName zero))
+  let zero_tc = noLocA (XExpr (ConLikeTc (RealDataCon zero)))
+      succ_tc = noLocA (XExpr (ConLikeTc (RealDataCon succ_con)))
+      build :: Int -> (Core.CoreExpr, LHsExpr GhcTc)
+      build 0 = (Core.Var (dataConWorkId zero), zero_tc)
       build k = let (val, src) = build (k - 1)
                 in (Core.App (Core.Var (dataConWorkId succ_con)) val,
-                    nlHsApp (nlHsVar (dataConName succ_con)) src)
+                    noLocA (HsApp noExtField succ_tc src))
   return (build (fromInteger n))
 
 {- Note [Retained integral literals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In replicateNative 3 x, the renamer supplies the literal conversion Name.
-The completed Num dictionary must certify its zero and successor equations.
-Require the ordinary solver to select this dictionary, just as for (+).
-Build both the runtime argument and its index from those exact constructors.
-The constructors may be private to the module that defines the instance.
+Elaborate a non-negative 'HsIntegral' literal (or non-rebound @fromInteger n@)
+from a certified ground 'Num' instance's zero and successor constructors within
+the 'reductionDepth' limit, or as a boxed 'HsNatural' literal at 'Natural'.
+Emit 'DE_SourceMethod' so the solver verifies that the lexical scope selects
+that same 'DFunId'.
 
-An explicit call to the same certified method can use the ordinary Integer
-literal shortcut for its argument. Require a non-rebound literal that the
-shortcut accepts at Integer. The outer method still needs the certificate
-and the exact dictionary. A rebound literal or a computed Integer argument
-can have a different meaning.
-
-The wired-in Natural domain uses the ordinary boxed literal and the
-DataKinds NumTyLit at the same kind. The standard Num Natural method maps a
-nonnegative Integer to exactly that value. Require its dictionary before
-using the literal shortcut. A local fromInteger cannot select this branch.
-A different Given will fail the dictionary check.
-
-A result signature such as Vec a 3 resolves its numeral independently through
-FromNatural. Ordinary type equality checks that the two meanings agree.
-Each successor adds one constructor. Check the reduction-depth budget before
-allocating the tree, including for a literal too large to fit in an Int.
-
-A complete monomorphic expression signature on the literal must denote the
-same retained domain. Check it before elaborating the literal. A qualified
-signature could introduce a Given and change the conversion. Keep the
-original annotation in the expansion for diagnostics. The constructor tree
-already has the checked domain. The ordinary operand check uses it directly.
+Note [Dictionary selection in retained arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Specialise a unary-parameter ground class method head (such as @(+)@ on @Nat@)
+to its certified 'sourceMethodTarget_maybe' target at each expected operand
+domain, check the rewritten call once, and attach 'DE_SourceMethod' to a fresh
+Wanted so a local Given dictionary cannot silently change the runtime method.
 -}
 
-{- Note [Dictionary selection in retained arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For replicateNative (n + m), the result type depends on which addition
-method the caller uses. Look up a candidate concrete dictionary from the
-known index domain. Require the method's result to be its class parameter:
-the result of an ambiguous method such as C a => Bool -> Bool cannot
-determine the dictionary type. The interface identifies an exact alias to a checked
-source function. The ordinary constraint solver must select this same
-dictionary for the method occurrence in its lexical scope. Emit an
-ordinary Wanted and attach the check to that Wanted's evidence variable.
-A Given for Num Nat can select a different dictionary.
+-- | Construct a checked unrestricted lambda expression for synthesized helpers.
+mkCheckedManyLam :: SrcSpan -> [Id] -> Type -> LHsExpr GhcTc -> LHsExpr GhcTc
+mkCheckedManyLam loc param_ids res_ty body_tc =
+  let sp       = noAnnSrcSpan loc
+      sp_n     = l2l sp
+      pats     = [L sp (VarPat noExtField (L sp_n v)) | v <- param_ids]
+      match_tc = mkSimpleMatch (LamAlt LamSingle) (L sp pats) body_tc
+      mg_tc    = MatchGroupTc [Scaled ManyTy (varType v) | v <- param_ids] res_ty
+                   (Generated OtherExpansion SkipPmc)
+  in L sp (HsLam noAnn LamSingle (MG { mg_alts = L sp [match_tc], mg_ext = mg_tc }))
 
-Run this selection at each recursive operand's expected domain. For example,
-in n * (m + k), select multiplication at the outer domain and addition at
-the second argument's domain. The resolver continuation keeps the same local
-binder environment. This is required when a lambda binds an index used by a
-nested method call. Selection inspects the head but does not check operands.
-The continuation checks the rewritten expression once. Its head is the exact
-source target, so it cannot select the same class method again.
-
-Check the target call and its rewrite rules before emitting the method
-obligation. An invalid operand or rule can already explain the error.
-Use the target for both the index and runtime. The expanded expression keeps the user's
-operator and its source span. The later argument check must not resolve
-a second dictionary. The source-call check verifies saturation and
-operand kinds and preserves the lazy call through erasure.
--}
-
--- | Resolve a lexical callback, an exact function with checked equations, or a
--- synthesized certified wrapper for a constructor, lambda, or composition,
--- returning both the Core operand and the numeral-expanded renamed expression.
+-- | Check a lexical callback, certified source function, constructor, lambda,
+-- or composition in one pass, returning its Core form, checked syntax, and usage.
 -- See Notes [Checking a cast retained callback] and [Named retained callbacks].
-tcRetainedFunctionArg :: Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedFunctionArg domain arg = setSrcSpanA (getLoc arg) $
+tcRetainedFunctionArg :: Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc, UsageEnv)
+tcRetainedFunctionArg domain arg = do
+  (arg_ue, (core_arg, checked_tc)) <- tcCollectingUsage (tcCheckRetainedFunctionArgM domain arg)
+  return (core_arg, checked_tc, arg_ue)
+
+tcCheckRetainedFunctionArgM :: Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+tcCheckRetainedFunctionArgM domain arg = setSrcSpanA (getLoc arg) $
   case retainedSourceHead arg of
     Just (name, written)
       | isExternalName name -> do
           mb_actual <- tcLookupIdMaybe name
           mb_owner <- maybe (pure Nothing) tcLookupSourceTableId mb_actual
           case (mb_owner, mb_actual) of
-            (Just owner, _) -> (,arg) <$> instantiate_named owner written
+            (Just owner, _) -> instantiate_named (getLoc arg) arg owner written
             (Nothing, Just actual)
-              | null written, isNativeNamedOpaqueFunctionId actual
-              -> do { expected <- liftZonkM (zonkTcType domain)
-                    ; if varType actual `tcEqType` expected then pure (Core.Var actual, arg)
-                      else unsupported }
+              | null written, isNativeNamedOpaqueFunctionId actual -> do
+                  expected <- liftZonkM (zonkTcType domain)
+                  if any isMetaTyVar (tyCoVarsOfTypeList expected)
+                    then void (unifyType Nothing (varType actual) expected)
+                    else unless (varType actual `tcEqType` expected) unsupported
+                  let a_loc = getLoc arg
+                      tc_e  = L a_loc (HsVar noExtField (L (l2l a_loc) actual))
+                  pure (Core.Var actual, tc_e)
             (Nothing, _)
               | null written -> do
                   mb_simple <- lookupLocalSimpleFunBind name
@@ -5893,28 +5972,48 @@ tcRetainedFunctionArg domain arg = setSrcSpanA (getLoc arg) $
       | null written -> do
           thing <- tcLookupLcl_maybe name
           case thing of
-            Just (ATcId { tct_id = actual }) ->
-              (,arg) <$> (liftZonkM (zonkId actual) >>= tcRetainedFunctionVar domain)
+            Just (ATcId { tct_id = actual }) -> do
+              actual' <- liftZonkM (zonkId actual)
+              tcEmitBindingUsage (singleUsageUE actual')
+              core_arg <- tcRetainedFunctionVar domain actual'
+              let a_loc   = getLoc arg
+                  base_tc = L a_loc (HsVar noExtField (L (l2l a_loc) actual'))
+                  arg_tc  = case core_arg of
+                    Core.Cast _ (SubCo co) -> mkLHsWrap (WpCast (SubCo co)) base_tc
+                    _                      -> base_tc
+              pure (core_arg, arg_tc)
             _ -> unsupported
     _
       | Just (mb_pat, body_rn) <- split_simple_lam_or_eta (unLoc (stripParensLHsExpr arg)) ->
           tcSynthesizeRetainedFunctionArg domain (getLocA arg) mb_pat body_rn
-      | HsApp{} <- unLoc (stripParensLHsExpr arg)
-      , let stripped = stripParensLHsExpr arg ->
-          if isDataConAppHead stripped
-            then tcSynthesizeRetainedFunctionArg domain (getLocA arg) Nothing stripped
-            else check_prefix
-      | OpApp _ lhs op rhs <- unLoc (stripParensLHsExpr arg) -> do
-          is_comp <- is_any_compose_expr op
-          if is_comp
-            then tcRetainedComposeFunctionArg domain (getLocA arg) lhs rhs
-            else check_prefix
-      | otherwise -> unsupported
+      | otherwise -> do
+          mb_comp <- split_compose_app (unLoc (stripParensLHsExpr arg))
+          case mb_comp of
+            Just (lhs, rhs) ->
+              tcRetainedComposeSinglePass domain (getLocA arg) lhs rhs
+            Nothing
+              | HsApp{} <- unLoc (stripParensLHsExpr arg)
+              , let stripped = stripParensLHsExpr arg ->
+                  if isDataConAppHead stripped
+                    then tcSynthesizeRetainedFunctionArg domain (getLocA arg) Nothing stripped
+                    else check_prefix
+              | OpApp{} <- unLoc (stripParensLHsExpr arg) ->
+                  check_prefix
+              | otherwise -> unsupported
   where
-    check_prefix = tcRetainedArgWith Core.nativeIndexFunctionArgIndex domain arg
+    check_prefix = tcCheckRetainedScalarArgM ManyTy Core.nativeIndexFunctionArgIndex domain arg
 
     unsupported :: TcM a
     unsupported = failWithTc $ TcRnRetainedQuantificationError RetainedFunctionArgument
+
+    split_compose_app :: HsExpr GhcRn -> TcM (Maybe (LHsExpr GhcRn, LHsExpr GhcRn))
+    split_compose_app (OpApp _ lhs op rhs) = do
+      is_c <- is_any_compose_expr op
+      pure (if is_c then Just (lhs, rhs) else Nothing)
+    split_compose_app (HsApp _ (L _ (HsApp _ op lhs)) rhs) = do
+      is_c <- is_any_compose_expr op
+      pure (if is_c then Just (lhs, rhs) else Nothing)
+    split_compose_app _ = pure Nothing
 
     split_simple_lam_or_eta :: HsExpr GhcRn -> Maybe (Maybe (LocatedN Name), LHsExpr GhcRn)
     split_simple_lam_or_eta (HsLam _ LamSingle MG { mg_alts = L _ [L _ Match
@@ -5933,21 +6032,53 @@ tcRetainedFunctionArg domain arg = setSrcSpanA (getLoc arg) $
     simple_lam_pat WildPat{}        = Just Nothing
     simple_lam_pat _                = Nothing
 
-    instantiate_named owner written = do
+    instantiate_named loc orig_fun owner0 written = do
       expected <- liftZonkM (zonkTcType domain)
-      owner <- liftZonkM (zonkId owner)
-      (core, sigma) <- foldM (applyRetainedSourceType unsupported owner)
-                             (Core.Var owner, varType owner) written
+      owner <- liftZonkM (zonkId owner0)
+      (written_tys, sigma) <- foldM (applyRetainedSourceType unsupported owner)
+                                    ([], varType owner) written
       let (binders, body) = tcSplitForAllInvisTyVars sigma
-      choices <- case binders of
-        [] | eqType body expected -> return []
-           | otherwise -> unsupported
-        _ -> chooseRetainedSourceTypes unsupported owner sigma (map snd binders)
-                                       [(body, pure (Just expected))]
-      let arg_core = Core.mkTyApps core choices
+          tvs = map snd binders
+      choices <- case tvs of
+        [] -> if any isMetaTyVar (tyCoVarsOfTypeList expected)
+          then do
+            co <- unifyType Nothing body expected
+            co' <- liftZonkM (zonkCo co)
+            unless (isReflCo co') unsupported
+            return []
+          else if eqType body expected then return [] else unsupported
+        _ | Just (in_ty, out_ty) <- nativeIndexFunctionTypeTys_maybe expected
+          , not (any isMetaTyVar (tyCoVarsOfTypeList in_ty))
+          , any isMetaTyVar (tyCoVarsOfTypeList out_ty)
+          , Just (_, _, _, f_dom, f_res) <- splitFunTy_maybe body -> do
+              cs <- chooseRetainedSourceTypes unsupported owner sigma tvs [(f_dom, pure (Just in_ty))]
+              let su = Subst.zipTvSubst tvs cs
+              co <- unifyType Nothing (Subst.substTy su f_res) out_ty
+              co' <- liftZonkM (zonkCo co)
+              unless (isReflCo co') unsupported
+              return cs
+          | otherwise ->
+              chooseRetainedSourceTypes unsupported owner sigma tvs [(body, pure (Just expected))]
+      expected' <- liftZonkM (zonkTcType expected)
+      let all_tys  = written_tys ++ choices
+          head_tc  = mkSourceHeadTc loc orig_fun owner all_tys
+          arg_core = Core.mkTyApps (Core.Var owner) all_tys
       case Core.nativeIndexFunctionArgIndex arg_core of
-        Just index | typeKind index `tcEqType` expected -> return arg_core
+        Just index | typeKind index `tcEqType` expected' -> return (arg_core, head_tc)
         _ -> unsupported
+
+-- | Build a type-applied checked head preserving record selector representation.
+mkSourceHeadTc :: SrcSpanAnnA -> LHsExpr GhcRn -> Id -> [Type] -> LHsExpr GhcTc
+mkSourceHeadTc loc orig_fun owner all_tys =
+  let inner = case unLoc (strip_ty_apps orig_fun) of
+        XExpr (HsRecSelRn (FieldOcc rdr (L fl_loc _))) | isRecordSelector owner ->
+          XExpr (HsRecSelTc (FieldOcc rdr (L fl_loc owner)))
+        _ -> HsVar noExtField (L (l2l loc) owner)
+  in mkLHsWrap (mkWpTyApps all_tys) (L loc inner)
+  where
+    strip_ty_apps (L _ (HsPar _ e))       = strip_ty_apps e
+    strip_ty_apps (L _ (HsAppType _ e _)) = strip_ty_apps e
+    strip_ty_apps e                       = e
 
 -- | Test whether an expression spine is headed by a data constructor.
 isDataConAppHead :: LHsExpr GhcRn -> Bool
@@ -5957,194 +6088,85 @@ isDataConAppHead (L _ (HsAppType _ fun _)) = isDataConAppHead fun
 isDataConAppHead (L _ (HsVar _ lname))     = isDataOcc (nameOccName (unLocWithUserRdr lname))
 isDataConAppHead _                         = False
 
-localSynthFunIdsRef :: IORef [(Module, [Id])]
-localSynthFunIdsRef = unsafePerformIO (newIORef [])
-{-# NOINLINE localSynthFunIdsRef #-}
-
-recordLocalSynthFunId :: Id -> TcM ()
-recordLocalSynthFunId fid = do
-  cur_mod <- tcg_mod <$> getGblEnv
-  liftIO $ atomicModifyIORef' localSynthFunIdsRef $ \entries ->
-    let cur  = fromMaybe [] (lookup cur_mod entries)
-        cur' = if any ((== idName fid) . idName) cur then cur else fid : cur
-        rest = filter ((/= cur_mod) . fst) entries
-    in ((cur_mod, cur') : rest, ())
-
-withLocalSynthFunIds :: TcM a -> TcM a
-withLocalSynthFunIds action = do
-  entries <- liftIO (readIORef localSynthFunIdsRef)
-  if null entries
-    then action
-    else do
-      gbl <- getGblEnv
-      let cur_mod = tcg_mod gbl
-          fids = [ fid | fid <- fromMaybe [] (lookup cur_mod entries)
-                       , isNothing (lookupTypeEnv (tcg_type_env gbl) (idName fid)) ]
-      foldr tcExtendGeneratedIdEnv action fids
-
--- | Lower an inline composition @lhs . rhs@ passed to a @foreach (f :: a -> c)@
--- binder to the certified 'GHC.Internal.Base.(.)' source table when the
--- intermediate type @b@ is determined, falling back to a synthesized helper.
-tcRetainedComposeFunctionArg
+-- | Check an inline composition @lhs . rhs@ passed to @foreach (f :: a -> c)@
+-- in a single deterministic O(k) pass with one intermediate metavariable,
+-- using certified 'GHC.Internal.Base.(.)' when available and falling back to a
+-- 1-equation synthesized helper without re-typechecking either operand.
+tcRetainedComposeSinglePass
   :: Type -> SrcSpan -> LHsExpr GhcRn -> LHsExpr GhcRn
-  -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedComposeFunctionArg raw_domain loc lhs rhs = do
+  -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+tcRetainedComposeSinglePass raw_domain loc lhs rhs = do
   expected <- liftZonkM (zonkTcType raw_domain)
-  mb_canon <- case nativeIndexFunctionTypeTys_maybe expected of
-    Just (arg_ty0, res_ty0) -> runMaybeT $ do
-      arg_ty <- liftMaybeT (liftZonkM (zonkTcType arg_ty0))
-      res_ty <- liftMaybeT (liftZonkM (zonkTcType res_ty0))
-      guard (not (any isMetaTyVar (tyCoVarsOfTypesList [arg_ty, res_ty])))
-      guard (tcIsLiftedTypeKind (typeKind arg_ty) && tcIsLiftedTypeKind (typeKind res_ty))
-      env <- liftMaybeT getGblEnv
-      guard (tcg_semantic_mod env /= gHC_INTERNAL_BASE)
-      compose_raw <- MaybeT (lookupBootModuleIdMaybe gHC_INTERNAL_BASE composeIdOcc)
-      compose_owner <- MaybeT (tcLookupSourceTableId compose_raw)
-      mid_ty <- MaybeT (infer_mid_ty arg_ty res_ty)
-      guard (tcIsLiftedTypeKind (typeKind mid_ty)
-             && not (any isMetaTyVar (tyCoVarsOfTypeList mid_ty))
-             && noQuickLookVars mid_ty)
-      valid_mid <- liftMaybeT (tcRetainedInstScope [mid_ty])
-      guard valid_mid
-      (core_lhs, lhs_rn) <- MaybeT $ tryTcDiscardingErrs (pure Nothing) $
-        Just <$> tcRetainedFunctionArg (mkVisFunTyManyU mid_ty res_ty) lhs
-      (core_rhs, rhs_rn) <- MaybeT $ tryTcDiscardingErrs (pure Nothing) $
-        Just <$> tcRetainedFunctionArg (mkVisFunTyManyU arg_ty mid_ty) rhs
-      let call_core = Core.mkApps (Core.mkTyApps (Core.Var compose_owner) [mid_ty, res_ty, arg_ty])
-                        [core_lhs, core_rhs]
-      idx <- MaybeT (pure (Core.nativeIndexFunctionArgIndex call_core))
-      guard (typeKind idx `tcEqType` expected)
-      liftMaybeT (recordLocalSynthFunId compose_owner)
-      let head_rn = L (noAnnSrcSpan loc) (HsVar noExtField (L (noAnnSrcSpan loc) (noUserRdr (idName compose_owner))))
-          ty_app_rn acc ty = L (noAnnSrcSpan loc) $
-            HsAppType Nothing acc (HsWC [] (L (noAnnSrcSpan loc) (XHsType (HsCoreTyRn ty))))
-          with_tys = foldl' ty_app_rn head_rn [mid_ty, res_ty, arg_ty]
-          call_rn  = nlHsApp (nlHsApp with_tys lhs_rn) rhs_rn
-      pure (call_core, call_rn)
-    Nothing -> pure Nothing
-  case mb_canon of
-    Just res -> pure res
-    Nothing -> do
-      x_nm <- newSysName (mkVarOcc "$x")
-      let body_rn = nlHsApp lhs (nlHsApp rhs (nlHsVar x_nm))
-      tcSynthesizeRetainedFunctionArg raw_domain loc (Just (L (noAnnSrcSpan loc) x_nm)) body_rn
+  case nativeIndexFunctionTypeTys_maybe expected of
+    Nothing -> unsupported
+    Just (arg_ty0, res_ty0) -> do
+      arg_ty <- liftZonkM (zonkTcType arg_ty0)
+      res_ty <- liftZonkM (zonkTcType res_ty0)
+      when (any isMetaTyVar (tyCoVarsOfTypeList arg_ty)
+            || not (tcIsLiftedTypeKind (typeKind arg_ty))
+            || not (tcIsLiftedTypeKind (typeKind res_ty)))
+        unsupported
+      mid_ty <- newFlexiTyVarTy liftedTypeKind
+      (rhs_ue, (_, rhs_tc)) <- tcCollectingUsage $
+        tcCheckRetainedFunctionArgM (mkVisFunTyManyU arg_ty mid_ty) rhs
+      mid_ty' <- liftZonkM (zonkTcType mid_ty)
+      when (any isMetaTyVar (tyCoVarsOfTypeList mid_ty')
+            || not (tcIsLiftedTypeKind (typeKind mid_ty'))
+            || not (noQuickLookVars mid_ty'))
+        unsupported
+      (lhs_ue, (lhs_core, lhs_tc)) <- tcCollectingUsage $
+        tcCheckRetainedFunctionArgM (mkVisFunTyManyU mid_ty' res_ty) lhs
+      res_ty' <- liftZonkM (zonkTcType res_ty)
+      when (any isMetaTyVar (tyCoVarsOfTypeList res_ty')
+            || not (noQuickLookVars res_ty'))
+        unsupported
+      let final_expected = mkVisFunTyManyU arg_ty res_ty'
+      mb_rhs_core <- tcExprToRetainedCore RCM_RetainedArg rhs_tc
+      mb_canon <- case mb_rhs_core of
+        Just (rhs_core, _, _) -> runMaybeT $ do
+          env <- liftMaybeT getGblEnv
+          guard (tcg_semantic_mod env /= gHC_INTERNAL_BASE)
+          compose_raw   <- MaybeT (lookupBootModuleIdMaybe gHC_INTERNAL_BASE composeIdOcc)
+          compose_owner <- MaybeT (tcLookupSourceTableId compose_raw)
+          valid_mid     <- liftMaybeT (tcRetainedInstScope [mid_ty'])
+          guard valid_mid
+          let call_core = Core.mkApps (Core.mkTyApps (Core.Var compose_owner) [mid_ty', res_ty', arg_ty])
+                            [lhs_core, rhs_core]
+          idx <- MaybeT (pure (Core.nativeIndexFunctionArgIndex call_core))
+          guard (typeKind idx `tcEqType` final_expected)
+          liftMaybeT $ do
+            recordLocalSynthFunId compose_owner
+            tcEmitBindingUsage rhs_ue
+            tcEmitBindingUsage lhs_ue
+          let sp        = noAnnSrcSpan loc
+              sp_n      = l2l sp
+              comp_wrap = WpTyApp arg_ty <.> WpTyApp res_ty' <.> WpTyApp mid_ty'
+              comp_head = L sp (mkHsWrap comp_wrap (HsVar noExtField (L sp_n compose_owner)))
+              call_tc   = L sp (HsApp noExtField (L sp (HsApp noExtField comp_head lhs_tc)) rhs_tc)
+          pure (call_core, call_tc)
+        Nothing -> pure Nothing
+      case mb_canon of
+        Just canon -> pure canon
+        Nothing -> do
+          let sp   = noAnnSrcSpan loc
+              sp_n = l2l sp
+          x_id <- newSysLocalId (fsLit "$x") ManyTy arg_ty
+          unless (isNativeOpaqueValueId x_id) unsupported
+          let x_tc    = L sp (HsVar noExtField (L sp_n x_id))
+              body_tc = L sp (HsApp noExtField lhs_tc (L sp (HsApp noExtField rhs_tc x_tc)))
+          mb_body_core <- tcExprToRetainedCore RCM_RetainedArg body_tc
+          core_body <- maybe unsupported (\(c, _, _) -> pure c) mb_body_core
+          tcRegisterCheckedSynthesizedFun loc arg_ty res_ty' x_id core_body body_tc
   where
-    infer_mid_ty :: Type -> Type -> TcM (Maybe Type)
-    infer_mid_ty arg_ty res_ty = do
-      mb_r <- infer_codomain arg_ty rhs
-      case mb_r of
-        Just mid -> pure (Just mid)
-        Nothing  -> infer_domain res_ty lhs
-
-    infer_codomain :: Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_codomain in_ty expr = case unLoc (stripParensLHsExpr expr) of
-      OpApp _ l op r -> do
-        is_c <- is_any_compose_expr op
-        if is_c
-          then do
-            mb_m <- infer_codomain in_ty r
-            maybe (pure Nothing) (`infer_codomain` l) mb_m
-          else infer_spine_codomain in_ty expr
-      HsLam _ LamSingle MG { mg_alts = L _ [L _ Match
-          { m_pats = L _ [L _ (VarPat _ lpat)]
-          , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body_rn) NE.:| []
-                            , grhssLocalBinds = L _ EmptyLocalBinds{} } }] } ->
-        tryTcDiscardingErrs (pure Nothing) $ do
-          let x_id = mkLocalId (unLoc lpat) ManyTy in_ty
-          ((_, (_, out_ty)), wanteds) <- captureConstraints $
-            tcCollectingUsage $ tcExtendIdEnv1 (unLoc lpat) x_id (tcInferRho body_rn)
-          out_ty' <- liftZonkM (zonkTcType out_ty)
-          if isEmptyWC wanteds && not (any isMetaTyVar (tyCoVarsOfTypeList out_ty'))
-            then pure (Just out_ty')
-            else pure Nothing
-      _ -> infer_spine_codomain in_ty expr
-
-    infer_domain :: Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_domain out_ty expr = case unLoc (stripParensLHsExpr expr) of
-      OpApp _ l op r -> do
-        is_c <- is_any_compose_expr op
-        if is_c
-          then do
-            mb_m <- infer_domain out_ty l
-            maybe (pure Nothing) (`infer_domain` r) mb_m
-          else infer_spine_domain out_ty expr
-      _ -> infer_spine_domain out_ty expr
-
-    infer_spine_codomain :: Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_spine_codomain = infer_spine_side True
-
-    infer_spine_domain :: Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_spine_domain = infer_spine_side False
-
-    infer_spine_side :: Bool -> Type -> LHsExpr GhcRn -> TcM (Maybe Type)
-    infer_spine_side forward known_ty expr = do
-      mb_sig <- fun_spine_arrow expr
-      pure $ do
-        (u_tvs, u_in, u_out) <- mb_sig
-        let (known_template, target_template) =
-              if forward then (u_in, u_out) else (u_out, u_in)
-        if null u_tvs
-          then guard (known_template `tcEqType` known_ty) >> Just target_template
-          else do
-            su <- matchRetainedAppType u_tvs Subst.emptySubst known_template known_ty
-            let target' = Subst.substTy su target_template
-            guard (not (any (`elemVarSet` tyCoVarsOfType target') u_tvs))
-            Just target'
-
-    fun_spine_arrow :: LHsExpr GhcRn -> TcM (Maybe ([TyVar], Type, Type))
-    fun_spine_arrow expr = case split_val_apps [] expr of
-      (L _ (HsVar _ lname), val_args) -> do
-        let nm = unLocWithUserRdr lname
-        if isDataOcc (nameOccName nm)
-          then do
-            thing <- tcLookupGlobal nm
-            case thing of
-              AConLike (RealDataCon dc)
-                | let (_, _, _, theta, _, _) = dataConFullSig dc
-                      u_tvs = dataConUserTyVars dc
-                      fields = map scaledThing (dataConOrigArgTys dc)
-                      res = dataConOrigResTy dc
-                , null theta
-                , [u_in] <- drop (length val_args) fields
-                , null val_args || null u_tvs
-                -> pure (Just (if null val_args then u_tvs else [], u_in, res))
-              _ -> pure Nothing
-          else do
-            mb_id <- tcLookupIdMaybe nm
-            case mb_id of
-              Just var -> do
-                v_ty <- liftZonkM (zonkTcType (varType var))
-                let (u_tvs, u_theta, u_tau) = tcRetainedInstTelescope v_ty
-                if null u_theta && (null val_args || null u_tvs)
-                  then pure ((\(i, o) -> (if null val_args then u_tvs else [], i, o))
-                              <$> peel_arrows (length val_args) u_tau)
-                  else pure Nothing
-              Nothing -> pure Nothing
-      _ -> pure Nothing
-
-    split_val_apps acc (L _ (HsPar _ inner))     = split_val_apps acc inner
-    split_val_apps acc (L _ (HsAppType _ fn _))  = split_val_apps acc fn
-    split_val_apps acc (L _ (HsApp _ fn a))      = split_val_apps (a : acc) fn
-    split_val_apps acc fn                        = (fn, acc)
-
-    peel_arrows 0 ty
-      | FunTy FTF_T_T _ mult dom cod <- coreFullView ty
-      , isManyTy mult
-      = Just (dom, cod)
-      | otherwise = Nothing
-    peel_arrows n ty
-      | n > 0
-      , Just (af, _, _, _, res) <- splitFunTy_maybe ty
-      , isVisibleFunArg af
-      = peel_arrows (n - 1) res
-      | otherwise = Nothing
+    unsupported :: TcM a
+    unsupported = failWithTc $ TcRnRetainedQuantificationError RetainedFunctionArgument
 
 -- | Synthesize a certified top-level 1-equation function helper and closed
--- source family for a constructor, simple lambda, composition, or local
--- 1-equation function passed to a retained @foreach (f :: a -> b)@ binder.
+-- source family for a constructor, simple lambda, or local 1-equation function
+-- passed to a retained @foreach (f :: a -> b)@ binder.
 tcSynthesizeRetainedFunctionArg
   :: Type -> SrcSpan -> Maybe (LocatedN Name) -> LHsExpr GhcRn
-  -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+  -> TcM (Core.CoreExpr, LHsExpr GhcTc)
 tcSynthesizeRetainedFunctionArg raw_domain loc mb_pat raw_body = do
   expected <- liftZonkM (zonkTcType raw_domain)
   case nativeIndexFunctionTypeTys_maybe expected of
@@ -6152,63 +6174,66 @@ tcSynthesizeRetainedFunctionArg raw_domain loc mb_pat raw_body = do
     Just (arg_ty0, res_ty0) -> do
       arg_ty <- liftZonkM (zonkTcType arg_ty0)
       res_ty <- liftZonkM (zonkTcType res_ty0)
-      when (any isMetaTyVar (tyCoVarsOfTypesList [arg_ty, res_ty])) unsupported
-      (x_loc, x_name, body_rn) <- case mb_pat of
-        Just lname -> pure (getLoc lname, unLoc lname, raw_body)
+      when (any isMetaTyVar (tyCoVarsOfTypeList arg_ty)) unsupported
+      (x_name, body_rn) <- case mb_pat of
+        Just lname -> pure (unLoc lname, raw_body)
         Nothing -> do
           fresh_x <- newSysName (mkVarOcc "$x")
-          let l_x    = noAnnSrcSpan loc
-              app_rn = if isDataConAppHead raw_body
+          let app_rn = if isDataConAppHead raw_body
                          then nlHsApp raw_body (nlHsVar fresh_x)
                          else raw_body
-          pure (l_x, fresh_x, app_rn)
+          pure (fresh_x, app_rn)
       let x_id = mkLocalId x_name ManyTy arg_ty
       unless (isNativeOpaqueValueId x_id) unsupported
-      (core_body, expanded_body_rn) <-
+      (_, (core_body, body_tc)) <- tcCollectingUsage $
         tcExtendIdEnv1 x_name x_id $
-          tcRetainedArgWith Core.retainedArgIndex res_ty body_rn
-      body_index <- maybe unsupported (liftZonkM . zonkTcType) (Core.retainedArgIndex core_body)
-      let raw_tyvars = filter isTyVar $
-                         tyCoVarsOfTypesList [arg_ty, res_ty, body_index]
-                         ++ filter isTyVar (exprFreeVarsList core_body)
-      when (any isMetaTyVar raw_tyvars || any isCoVar (tyCoVarsOfTypeList body_index)) unsupported
-      let cap_tvs = topo_sort_tvs raw_tyvars
-          raw_ids = [ v | v <- exprFreeVarsList core_body ++ filter isId (tyCoVarsOfTypeList body_index)
-                        , isId v, isLocalId v, v /= x_id ]
-          cap_val_ids = nub_vars raw_ids
-      unless (all (\v -> isManyTy (idMult v)
-                      && (isNativeOpaqueValueId v || isNativeIndexFunctionId v)
-                      && not (any isMetaTyVar (tyCoVarsOfTypeList (varType v))))
-                  cap_val_ids)
-        unsupported
-      valid <- tcExtendIdEnv1 x_name x_id $
-        tcRetainedInstScope (arg_ty : res_ty : body_index : map mkTyVarTy cap_tvs ++ map varType cap_val_ids)
-      unless valid unsupported
-      (fun_id, fam_tc) <- tcRegisterSynthesizedSourceFun loc cap_tvs cap_val_ids x_id res_ty body_index
-      let all_val_ids = cap_val_ids ++ [x_id]
-          pats_rn = [ L (if v == x_id then l2l x_loc else noAnnSrcSpan loc)
-                        (VarPat noExtField (L (if v == x_id then x_loc else noAnnSrcSpan loc) (getName v)))
-                    | v <- all_val_ids ]
-          lam_rn  = mkHsLam (L (noAnnSrcSpan loc) pats_rn) expanded_body_rn
-          mono_ty = foldr mkVisFunTyManyU (mkVisFunTyManyU arg_ty res_ty) (map varType cap_val_ids)
-      mb_rhs_tc <- tryTcDiscardingErrs (pure Nothing) $ do
-        (( _, lam_tc), wanteds) <- captureConstraints (tcCollectingUsage (withLocalSynthFunIds (tcCheckMonoExpr lam_rn mono_ty)))
-        if isEmptyWC wanteds
-          then pure (Just (mkLHsWrap (mkWpTyLams cap_tvs) lam_tc))
-          else pure Nothing
-      rhs_tc <- maybe unsupported pure mb_rhs_tc
-      tcCommitSynthesizedSourceFunBind fun_id (mkVarBind fun_id rhs_tc) fam_tc
-      recordLocalSynthFunId fun_id
-      let call_core = Core.mkApps (Core.mkTyApps (Core.Var fun_id) (map mkTyVarTy cap_tvs))
-                        (map Core.Var cap_val_ids)
-          head_rn   = L (noAnnSrcSpan loc) (HsVar noExtField (L (noAnnSrcSpan loc) (noUserRdr (idName fun_id))))
-          ty_app_rn acc tv = L (noAnnSrcSpan loc) $
-            HsAppType Nothing acc (HsWC [] (L (noAnnSrcSpan loc) (XHsType (HsCoreTyRn (mkTyVarTy tv)))))
-          with_tys  = foldl' ty_app_rn head_rn cap_tvs
-          call_rn   = foldl' (\acc v -> nlHsApp acc (nlHsVar (getName v))) with_tys cap_val_ids
-      case Core.nativeIndexFunctionArgIndex call_core of
-        Just idx | typeKind idx `tcEqType` expected -> pure (call_core, call_rn)
-        _ -> unsupported
+          tcCheckRetainedScalarArgM ManyTy Core.retainedArgIndex res_ty body_rn
+      res_ty' <- liftZonkM (zonkTcType res_ty)
+      when (any isMetaTyVar (tyCoVarsOfTypeList res_ty')) unsupported
+      tcRegisterCheckedSynthesizedFun loc arg_ty res_ty' x_id core_body body_tc
+  where
+    unsupported :: TcM a
+    unsupported = failWithTc $ TcRnRetainedQuantificationError RetainedFunctionArgument
+
+-- | Register a checked 1-argument body as a synthesized '$depfun$' source-table
+-- binding without re-typechecking the body expression.
+tcRegisterCheckedSynthesizedFun
+  :: SrcSpan -> Type -> Type -> Id -> Core.CoreExpr -> LHsExpr GhcTc
+  -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+tcRegisterCheckedSynthesizedFun loc arg_ty res_ty x_id core_body body_tc = do
+  body_index <- maybe unsupported (liftZonkM . zonkTcType) (Core.retainedArgIndex core_body)
+  let raw_tyvars = filter isTyVar $
+                     tyCoVarsOfTypesList [arg_ty, res_ty, body_index]
+                     ++ filter isTyVar (exprFreeVarsList core_body)
+  when (any isMetaTyVar raw_tyvars || any isCoVar (tyCoVarsOfTypeList body_index)) unsupported
+  let cap_tvs = topo_sort_tvs raw_tyvars
+      raw_ids = [ v | v <- exprFreeVarsList core_body ++ filter isId (tyCoVarsOfTypeList body_index)
+                    , isId v, isLocalId v, v /= x_id ]
+      cap_val_ids = nub_vars raw_ids
+  unless (all (\v -> isManyTy (idMult v)
+                  && (isNativeOpaqueValueId v || isNativeIndexFunctionId v)
+                  && not (any isMetaTyVar (tyCoVarsOfTypeList (varType v))))
+              cap_val_ids)
+    unsupported
+  valid <- tcExtendIdEnv1 (idName x_id) x_id $
+    tcRetainedInstScope (arg_ty : res_ty : body_index : map mkTyVarTy cap_tvs ++ map varType cap_val_ids)
+  unless valid unsupported
+  (fun_id, fam_tc) <- tcRegisterSynthesizedSourceFun loc cap_tvs cap_val_ids x_id res_ty body_index
+  let rhs_tc = mkLHsWrap (mkWpTyLams cap_tvs) (mkCheckedManyLam loc (cap_val_ids ++ [x_id]) res_ty body_tc)
+  tcCommitSynthesizedSourceFunBind fun_id (mkVarBind fun_id rhs_tc) fam_tc
+  recordLocalSynthFunId fun_id
+  mapM_ (tcEmitBindingUsage . singleUsageUE) cap_val_ids
+  let sp        = noAnnSrcSpan loc
+      sp_n      = l2l sp
+      call_core = Core.mkApps (Core.mkTyApps (Core.Var fun_id) (map mkTyVarTy cap_tvs))
+                    (map Core.Var cap_val_ids)
+      head_tc   = mkLHsWrap (mkWpTyApps (map mkTyVarTy cap_tvs)) (L sp (HsVar noExtField (L sp_n fun_id)))
+      call_tc   = foldl' (\acc v -> L sp (HsApp noExtField acc (L sp (HsVar noExtField (L sp_n v)))))
+                         head_tc cap_val_ids
+      expected  = mkVisFunTyManyU arg_ty res_ty
+  case Core.nativeIndexFunctionArgIndex call_core of
+    Just idx | typeKind idx `tcEqType` expected -> pure (call_core, call_tc)
+    _ -> unsupported
   where
     unsupported :: TcM a
     unsupported = failWithTc $ TcRnRetainedQuantificationError RetainedFunctionArgument
@@ -6249,28 +6274,17 @@ is_any_compose_expr _ = pure False
 
 {- Note [Named retained callbacks]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A retained callback can use a named function with checked source equations.
-Resolve the certificate through the written occurrence's defining Id.
-Record that use and its dependencies with tcLookupSourceTableId. This
-checks the same rewrite rules as a saturated source call.
+A retained function binder accepts a certified function owner (recording
+equation and rewrite-rule dependencies via 'tcLookupSourceTableId'), a
+partially applied certified source function with at least one remaining value
+parameter, or a local unrestricted callback variable.
 
-A source family takes the erased arguments of its term owner. A retained
-callback can supply a checked prefix of the value arguments. Keep at least
-one value binder unsaturated. Substituting the index for the callback saturates
-the family wherever the callback was applied to a value. The U arrow prevents using the application
-as evidence for the identity of either input. The ordinary argument check
-keeps the original function occurrence and its selected type arguments.
-A lexical variable still has its own index, even when its right-hand side
-names a certified function. A lambda has no certificate at this admission.
-Use the same checker for a named function operand of a certified source
-call. For example, the callback of foldrL plus Zero xs keeps its exact
-source family and curried arrow kind.
-
-The simplifier can substitute another lexical callback and preserve a strict
-case on an opaque call. It cannot substitute a source family into that case
-evidence. The latter needs a checked ordinary retained application which
-records the source equations and the active rule policy. Keep the lexical
-judgment for beta exposure, rule matching and strict case transport.
+Note [Checking a cast retained callback]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unify a local callback variable's type with the expected arrow at nominal role.
+If the resulting coercion is reflexive after zonking, retain the variable at
+its resolved type; otherwise wrap it in 'SubCo'.
+See Note [Wildcards in retained operand domains].
 -}
 
 -- | Check the nominal equality for the actual lexical callback.
@@ -6296,65 +6310,55 @@ tcRetainedFunctionVar expected actual
     mismatch = failWithTc $ TcRnRetainedQuantificationError $
                  RetainedIndexArgumentCast actual_ty expected
 
-{- Note [Checking a cast retained callback]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An ordinary caller can declare cmp :: Bool -> Bool -> Ordering while
-the provider expects Bool -> Result 'True. A type family can also
-determine the input type. The ordinary unifier must prove the nominal
-equality of the arrows. Use its coercion for both the retained index
-and the value argument. Both refer to the same local Id.
-
-Unification can also fix erased metavariables in the expected arrow.
-If the coercion zonks to reflexivity, keep the local Id at the resolved
-type. The Core judgment for callback casts requires non-reflexive
-evidence. See Note [Wildcards in retained operand domains].
--}
-
--- | Resolve a retained argument at its known domain without checking its value.
+-- | Check a retained argument in one pass at its known domain, returning its
+-- Core representation, checked syntax, and unscaled linearity usage.
 -- See Note [Retained argument application].
-tcRetainedArg :: Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
+tcRetainedArg :: Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc, UsageEnv)
 tcRetainedArg domain = tcRetainedArgScaled (Scaled ManyTy domain)
 
 -- | Like 'tcRetainedArg', carrying the expected multiplicity of the retained binder.
-tcRetainedArgScaled :: Scaled Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedArgScaled (Scaled expected_mult domain) =
-  tcRetainedArgWithMult expected_mult Core.retainedArgIndex domain
+tcRetainedArgScaled :: Scaled Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc, UsageEnv)
+tcRetainedArgScaled (Scaled expected_mult domain) arg = do
+  (arg_ue, (core_arg, checked_tc)) <- tcCollectingUsage $
+    tcCheckRetainedScalarArgM expected_mult Core.retainedArgIndex domain arg
+  return (core_arg, checked_tc, arg_ue)
 
--- | Resolve the operand and check its index at the expected domain.
--- See Note [Pre-unifying polymorphic retained domains in inference mode].
-tcRetainedArgWith :: (Core.CoreExpr -> Maybe Type) -> Type -> LHsExpr GhcRn
-                  -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedArgWith = tcRetainedArgWithMult ManyTy
-
--- | Resolve the operand at the expected multiplicity and domain.
-tcRetainedArgWithMult :: Mult -> (Core.CoreExpr -> Maybe Type) -> Type -> LHsExpr GhcRn
-                      -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-tcRetainedArgWithMult expected_mult reify domain arg
-  = setSrcSpanA (getLoc arg) $
-    do { domain <- constructor_domain domain arg
-       ; result@(core_arg, _) <- resolve emptyNameEnv domain arg
-       ; case reify core_arg of
+-- | Check a scalar or partial-call retained operand once, constructing
+-- 'LHsExpr' 'GhcTc' directly and extracting 'Core.CoreExpr' via 'tcExprToRetainedCore'.
+tcCheckRetainedScalarArgM :: Mult -> (Core.CoreExpr -> Maybe Type) -> Type -> LHsExpr GhcRn
+                          -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
+  = setSrcSpanA (getLoc arg0) $
+    do { domain <- constructor_domain domain0 arg0
+       ; (inter_core, checked_tc) <- resolve emptyNameEnv expected_mult0 domain arg0
+       ; target_domain <- case reify inter_core of
            Just index
-             | typeKind index `tcEqType` domain -> return result
+             | typeKind index `tcEqType` domain -> return domain
              | otherwise -> do { domain' <- liftZonkM (zonkTcType domain)
                                ; let actual_kind = typeKind index
                                ; if actual_kind `tcEqType` domain'
-                                 then return result
+                                 then return domain'
                                  else if anyFreeVarsOfType flexible domain'
                                          && not (hasNativeDependentExpr (Core.Type actual_kind))
                                       then do { co <- unifyType Nothing actual_kind domain'
                                               ; co' <- liftZonkM (zonkCo co)
                                               ; domain'' <- liftZonkM (zonkTcType domain')
                                               ; if isReflCo co' && actual_kind `tcEqType` domain''
-                                                then return result
+                                                then return domain''
                                                 else unsupported }
                                       else unsupported }
+           _ -> unsupported
+       ; mb_reified <- tcExprToRetainedCore RCM_RetainedArg checked_tc
+       ; case mb_reified of
+           Just (final_core, _, _)
+             | Just final_idx <- reify final_core
+             , typeKind final_idx `tcEqType` target_domain
+             -> return (final_core, checked_tc)
            _ -> unsupported }
   where
-    flexible tv = isTcTyVar tv && isMetaTyVar tv
+    flexible tv = isTcTyVar v_tv && isMetaTyVar v_tv
+      where v_tv = tv
 
-    -- See Note [Inferred domains of written retained constructors] and
-    -- Note [Pre-unifying polymorphic retained domains in inference mode].
     constructor_domain domain arg
       | anyFreeVarsOfType flexible domain
       , case unLoc (stripParensLHsExpr arg) of
@@ -6373,29 +6377,34 @@ tcRetainedArgWithMult expected_mult reify domain arg
         bind tv _ | flexible tv = BindMe
                   | otherwise   = DontBindMe
 
-    resolve :: NameEnv Id -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-    resolve env expected = resolve_with_args env expected []
+    resolve :: NameEnv Id -> Mult -> Type -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    resolve env m_here expected = resolve_with_args env m_here expected []
 
-    -- The other operands belong to the current application spine.
-    -- See Note [Erased arguments of certified source operands].
-    resolve_with_args :: NameEnv Id -> Type -> [LHsExpr GhcRn] -> LHsExpr GhcRn
-                      -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-    resolve_with_args env expected later original = do
-      result@(core, checked) <- tcRetainedValueOperand (resolve_expr env expected later) expected original
+    resolve_with_args :: NameEnv Id -> Mult -> Type -> [LHsExpr GhcRn] -> LHsExpr GhcRn
+                      -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    resolve_with_args env m_here expected later original = do
+      result@(core, checked_tc) <-
+        tcRetainedValueOperand
+          (resolve_expr env m_here expected later)
+          (resolve env ManyTy)
+          expected original
       case Core.splitNativeIndexedConApp core of
         Just _ | let actual = exprType core, not (actual `tcEqType` expected) -> do
           co <- unifyType Nothing actual expected
-          return (Core.Cast core (SubCo co), checked)
+          co' <- liftZonkM (zonkCo co)
+          if isReflCo co'
+            then return result
+            else return (Core.Cast core (SubCo co'), mkLHsWrap (WpCast (SubCo co')) checked_tc)
         _ -> return result
 
-    resolve_expr :: NameEnv Id -> Type -> [LHsExpr GhcRn] -> LHsExpr GhcRn
-                 -> TcM (Core.CoreExpr, LHsExpr GhcRn)
-    resolve_expr env expected later original@(L loc expr)
+    resolve_expr :: NameEnv Id -> Mult -> Type -> [LHsExpr GhcRn] -> LHsExpr GhcRn
+                 -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    resolve_expr env m_here expected later original@(L loc expr)
       = setSrcSpanA loc $ case expr of
-          HsPar x arg -> do
-            (core, arg') <- resolve_with_args env expected later arg
-            return (core, L loc (HsPar x arg'))
-          XExpr (ExpandedThingRn (HSE ctxt arg)) -> do
+          HsPar _ inner -> do
+            (core, inner_tc) <- resolve_with_args env m_here expected later inner
+            return (core, L loc (HsPar noExtField inner_tc))
+          XExpr (ExpandedThingRn (HSE ctxt inner)) -> do
             mb_dot <- case ctxt of
               ExprCtxt (HsGetField _ recv (L _ dfo)) ->
                 fmap (recv, dfo,) <$> tcResolveDependentDot True recv dfo
@@ -6404,145 +6413,174 @@ tcRetainedArgWithMult expected_mult reify domain arg
               Just (recv_of_ctxt, dfo_of_ctxt, (_, sel_id)) -> do
                 let L fl_loc _ = dfoLabel dfo_of_ctxt
                     sel_exp    = L (l2l fl_loc) (mkDependentSelectorExpr fl_loc sel_id)
-                (core, arg') <- resolve_with_args env expected later
-                                  (L loc (HsApp noExtField sel_exp recv_of_ctxt))
-                return (core, L loc (XExpr (ExpandedThingRn (HSE ctxt arg'))))
+                (core, app_tc) <- resolve_with_args env m_here expected later
+                                    (L loc (HsApp noExtField sel_exp recv_of_ctxt))
+                return (core, L loc (XExpr (ExpandedThingTc (HSE ctxt app_tc))))
               Nothing -> do
-                (core, arg') <- resolve_with_args env expected later arg
-                return (core, L loc (XExpr (ExpandedThingRn (HSE ctxt arg'))))
-          HsLit _ (HsChar _ c)
+                (core, inner_tc) <- resolve_with_args env m_here expected later inner
+                return (core, L loc (XExpr (ExpandedThingTc (HSE ctxt inner_tc))))
+          HsLit _ (HsChar s c)
             | charTy `tcEqType` expected
-            -> return (mkCharExpr c, original)
+            -> return (mkCharExpr c, L loc (HsLit noExtField (HsChar s c)))
           HsLit _ (HsString _ string)
             | mkListTy charTy `tcEqType` expected
             -> do { -- See Note [Quoted strings in retained operands].
-                    let chars = map (nlHsLit . HsChar NoSourceText) (unpackHText string)
-                  ; (core, expanded) <- resolve env expected (L loc (ExplicitList noExtField chars))
-                  ; return (core, L loc (mkExpandedLExpr expr expanded)) }
+                    let chars    = unpackHText string
+                        char_tcs = [noLocA (HsLit noExtField (HsChar NoSourceText c)) | c <- chars]
+                        list_tc  = L loc (ExplicitList charTy char_tcs)
+                        expanded = L loc (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) list_tc)))
+                        nil_c    = Core.mkConApp nilDataCon [Core.Type charTy]
+                        cons_c c r = Core.mkConApp consDataCon [Core.Type charTy, mkCharExpr c, r]
+                  ; return (foldr cons_c nil_c chars, expanded) }
           HsOverLit _ (OverLit OverLitRn{ol_from_fun = L _ from} (HsIntegral lit))
             | let n = il_value lit, n >= 0
             -> do { (core, generated) <- tcRetainedNumeral expected from n
-                  ; return (core, L loc (mkExpandedLExpr expr generated)) }
+                  ; return (core, L loc (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) generated)))) }
           ExprWithTySig _ operand sig
-            | HsOverLit _ (OverLit _ (HsIntegral lit)) <- unLoc (stripParensLHsExpr operand)
-            , il_value lit >= 0
-            , isCompleteHsSig sig
-            -> do { -- See Note [Retained integral literals].
-                    annotated <- tcHsSigWcType False (ExprSigCtxt NoRRC) sig
-                  ; unless (isTauTy annotated) unsupported
-                  ; expected' <- liftZonkM (zonkTcType expected)
-                  ; unless (annotated `tcEqType` expected') $
-                      failWithTc $ TcRnRetainedQuantificationError
-                        (RetainedIndexArgumentCast annotated expected')
-                  ; (core, operand') <- resolve env expected' operand
-                  ; return (core, L loc (mkExpandedLExpr expr operand')) }
-          ExprWithTySig _ operand sig
-            | isCompleteHsSig sig
-            -> do { annotated <- tcHsSigWcType False (ExprSigCtxt NoRRC) sig
-                  ; unless (isTauTy annotated) unsupported
-                  ; expected' <- liftZonkM (zonkTcType expected)
-                  ; target <- if annotated `tcEqType` expected'
+            | isCompleteHsSig sig -> do
+                annotated <- tcHsSigWcType False (ExprSigCtxt NoRRC) sig
+                unless (isTauTy annotated) unsupported
+                expected' <- liftZonkM (zonkTcType expected)
+                let cast_err :: forall a. TcM a
+                    cast_err = failWithTc $ TcRnRetainedQuantificationError
+                                 (RetainedIndexArgumentCast annotated expected')
+                    is_num_lit = case unLoc (stripParensLHsExpr operand) of
+                      HsOverLit _ (OverLit _ (HsIntegral lit)) -> il_value lit >= 0
+                      _ -> False
+                target <- if annotated `tcEqType` expected'
+                  then return expected'
+                  else if is_num_lit || hasScopedDictionaryType annotated || hasScopedDictionaryType expected'
+                  then cast_err
+                  else do
+                    loc_ct <- getCtLocM (lexprCtOrigin original) (Just TypeLevel)
+                    ann_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct annotated
+                    exp_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct expected'
+                    if ann_view `tcEqType` exp_view
                       then return expected'
-                      else if hasScopedDictionaryType annotated || hasScopedDictionaryType expected'
-                      then failWithTc $ TcRnRetainedQuantificationError
-                             (RetainedIndexArgumentCast annotated expected')
-                      else do
-                        { loc_ct <- getCtLocM (lexprCtOrigin original) (Just TypeLevel)
-                        ; ann_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct annotated
-                        ; exp_view <- reductionReducedType <$> tcRewriteFamilyAxioms loc_ct expected'
-                        ; if ann_view `tcEqType` exp_view
-                          then return expected'
-                          else if anyFreeVarsOfType (\v -> isTcTyVar v && isMetaTyVar v) exp_view
-                               then do { co <- unifyType Nothing ann_view exp_view
-                                       ; co' <- liftZonkM (zonkCo co)
-                                       ; unless (isReflCo co') $
-                                           failWithTc $ TcRnRetainedQuantificationError
-                                             (RetainedIndexArgumentCast annotated expected')
-                                       ; liftZonkM (zonkTcType expected') }
-                               else failWithTc $ TcRnRetainedQuantificationError
-                                      (RetainedIndexArgumentCast annotated expected') }
-                  ; (core, operand') <- resolve_with_args env target later operand
-                  ; return (core, L loc (mkExpandedLExpr expr operand')) }
-          HsApp x fun arg -> do
-            (core, fun', arg') <- resolve_app env expected later fun arg
-            return (core, L loc (HsApp x fun' arg'))
-          OpApp x left op right -> do
-            (partial, op', left') <- resolve_app env expected (right : later) op left
-            (core, right') <- apply env partial right
-            return (core, L loc (OpApp x left' op' right'))
-          ExplicitList x elements
+                      else if anyFreeVarsOfType flexible exp_view
+                      then do
+                        co <- unifyType Nothing ann_view exp_view
+                        co' <- liftZonkM (zonkCo co)
+                        unless (isReflCo co') cast_err
+                        liftZonkM (zonkTcType expected')
+                      else cast_err
+                (core, operand_tc) <- if is_num_lit
+                  then resolve env m_here target operand
+                  else resolve_with_args env m_here target later operand
+                return (core, L loc (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) operand_tc))))
+          HsApp _ fun arg ->
+            resolve_app env m_here expected later loc fun arg
+          OpApp _ left op right -> do
+            (partial_core, partial_tc) <- resolve_app env m_here expected (right : later) loc op left
+            (core, call_tc) <- apply env m_here loc partial_core partial_tc right
+            return (core, L loc (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) call_tc))))
+          ExplicitList _ elements
             | Just [element_ty] <- nativeIndexDataConTyArgs expected nilDataCon
-            -> do { nil <- constructor expected [] nilDataCon
-                  ; cons <- constructor expected [] consDataCon
-                  ; (values, elements') <- unzip <$> mapM (resolve env element_ty) elements
-                  ; return (foldr (\value rest -> Core.mkApps cons [value, rest]) nil values,
-                            L loc (ExplicitList x elements')) }
+            -> do { _ <- constructor loc expected [] nilDataCon
+                  ; _ <- constructor loc expected [] consDataCon
+                  ; pairs <- mapM (resolve env m_here element_ty) elements
+                  ; let nil_c = Core.mkConApp nilDataCon [Core.Type element_ty]
+                        cons_c (v, _) r = Core.mkConApp consDataCon [Core.Type element_ty, v, r]
+                  ; return (foldr cons_c nil_c pairs, L loc (ExplicitList element_ty (map snd pairs))) }
+          ExplicitTuple _ [Present _ first, Present _ second] Boxed
+            | null later
+            , let dc = tupleDataCon Boxed 2
+            , Just [t1, t2] <- nativeIndexDataConTyArgs expected dc
+            -> do { _ <- constructor loc expected [] dc
+                  ; (c1, e1_tc) <- resolve env m_here t1 first
+                  ; (c2, e2_tc) <- resolve env m_here t2 second
+                  ; let tup_tc = L loc (ExplicitTuple noExtField [Present noExtField e1_tc, Present noExtField e2_tc] Boxed)
+                  ; return (mkCoreTup [c1, c2], tup_tc) }
           HsVar _ lname
-            | Just arg_id <- lookupNameEnv env (unLocWithUserRdr lname)
-            -> (,original) <$> tcRetainedArgVar (lexprCtOrigin original) expected arg_id
-            | isDataOcc (nameOccName (unLocWithUserRdr lname))
-            -> do { con <- tcLookupConLike (unLoc lname)
-                  ; case con of
-                      RealDataCon dc -> (,original) <$> constructor expected later dc
-                      _ -> unsupported }
-            | otherwise
-            -> do { mb_id <- tcLookupIdMaybe (unLocWithUserRdr lname)
-                  ; case mb_id of
-                      Just arg_id
-                        -> do { arg_id <- liftZonkM (zonkId arg_id)
-                              ; arg_id <- case coreFullView (varType arg_id) of
-                                  TyVarTy tv
-                                    | isLocalId arg_id, isTcTyVar tv, isMetaTyVar tv
-                                    , not (isNativeOpaqueValueType (varType arg_id))
-                                    , isNativeOpaqueValueType expected
-                                    -> do { -- See Note [Inferring a local retained operand].
-                                            co <- unifyKind Nothing (tyVarKind tv) liftedTypeKind
-                                          ; co' <- liftZonkM (zonkCo co)
-                                          ; unless (isReflCo co') unsupported
-                                          ; liftZonkM (zonkId arg_id) }
-                                  _ -> return arg_id
-                              ; if isNativeOpaqueValueId (setIdMult arg_id ManyTy)
-                                then if isManyTy expected_mult
-                                  then do
-                                    { let mult = idMult arg_id
-                                          flexible = case coreFullView mult of
-                                            TyVarTy tv -> isMetaTyVar tv
-                                            _ -> False
-                                    ; unless (isManyTy mult || flexible) $ failWithTc $
-                                        TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
-                                    ; tcSubMult (OccurrenceOf (getName arg_id)) ManyTy mult
-                                    ; arg_id <- liftZonkM (zonkId arg_id)
-                                    ; if isNativeOpaqueValueId arg_id && isManyTy (idMult arg_id)
-                                      then (,original) <$> tcRetainedArgVar (lexprCtOrigin original) expected arg_id
-                                      else failWithTc $ TcRnRetainedQuantificationError
-                                             (RetainedIndexMultiplicity (idMult arg_id)) }
-                                  else if isNativeOpaqueValueId arg_id
-                                    then (,original) <$> tcRetainedArgVar (lexprCtOrigin original) expected arg_id
-                                    else failWithTc $ TcRnRetainedQuantificationError
-                                           (RetainedIndexMultiplicity (idMult arg_id))
-                                else case nameModule_maybe (getName arg_id) of
-                                  Just m | isGlobalId arg_id, isInteractiveModule m ->
-                                    failWithTc $ TcRnRetainedQuantificationError
-                                      (RetainedInteractiveIndex (getName arg_id))
-                                  _ -> unsupported }
-                      _ -> unsupported }
-          _ | Just pair <- retainedPairApplication expr -> do
-                (core, expanded) <- resolve env expected pair
-                return (core, L loc (mkExpandedLExpr expr expanded))
-            | otherwise -> unsupported
+            | Just bound_id <- lookupNameEnv env (unLocWithUserRdr lname) -> do
+                tcEmitBindingUsage (singleUsageUE bound_id)
+                core <- tcRetainedArgVar (lexprCtOrigin original) expected bound_id
+                return (core, wrap_var_cast loc core bound_id)
+            | isDataOcc (nameOccName (unLocWithUserRdr lname)) -> do
+                con <- tcLookupConLike (unLoc lname)
+                case con of
+                  RealDataCon dc -> constructor loc expected later dc
+                  _ -> unsupported
+            | otherwise -> do
+                mb_id <- tcLookupIdMaybe (unLocWithUserRdr lname)
+                case mb_id of
+                  Just arg_id0 -> do
+                    arg_id1 <- liftZonkM (zonkId arg_id0)
+                    arg_id2 <- case coreFullView (varType arg_id1) of
+                      TyVarTy tv
+                        | isLocalId arg_id1, isTcTyVar tv, isMetaTyVar tv
+                        , not (isNativeOpaqueValueType (varType arg_id1))
+                        , isNativeOpaqueValueType expected -> do
+                            co <- unifyKind Nothing (tyVarKind tv) liftedTypeKind
+                            co' <- liftZonkM (zonkCo co)
+                            unless (isReflCo co') unsupported
+                            liftZonkM (zonkId arg_id1)
+                      _ -> return arg_id1
+                    if isNativeOpaqueValueId (setIdMult arg_id2 ManyTy)
+                      then do
+                        arg_id <- if isManyTy m_here
+                          then do
+                            let mult = idMult arg_id2
+                                flex_m = case coreFullView mult of
+                                  TyVarTy tv -> isMetaTyVar tv
+                                  _ -> False
+                            unless (isManyTy mult || flex_m) $ failWithTc $
+                              TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
+                            tcSubMult (OccurrenceOf (getName arg_id2)) ManyTy mult
+                            arg_id' <- liftZonkM (zonkId arg_id2)
+                            if isNativeOpaqueValueId arg_id' && isManyTy (idMult arg_id')
+                              then return arg_id'
+                              else failWithTc $ TcRnRetainedQuantificationError
+                                     (RetainedIndexMultiplicity (idMult arg_id'))
+                          else if isNativeOpaqueValueId arg_id2
+                            then return arg_id2
+                            else failWithTc $ TcRnRetainedQuantificationError
+                                   (RetainedIndexMultiplicity (idMult arg_id2))
+                        tcEmitBindingUsage (singleUsageUE arg_id)
+                        core <- tcRetainedArgVar (lexprCtOrigin original) expected arg_id
+                        return (core, wrap_var_cast loc core arg_id)
+                      else case nameModule_maybe (getName arg_id2) of
+                        Just m | isGlobalId arg_id2, isInteractiveModule m ->
+                          failWithTc $ TcRnRetainedQuantificationError
+                            (RetainedInteractiveIndex (getName arg_id2))
+                        _ -> unsupported
+                  _ -> unsupported
+          _ -> unsupported
 
-    -- Instantiate the erased parameters from the complete expected domain.
-    constructor expected later dc = case nativeIndexDataConTyArgs expected dc of
-      Just tys -> return (Core.mkTyApps (Core.Var (dataConWorkId dc)) tys)
+    wrap_var_cast :: SrcSpanAnnA -> Core.CoreExpr -> Id -> LHsExpr GhcTc
+    wrap_var_cast loc core var_id =
+      let loc_n = l2l loc
+          base  = L loc (HsVar noExtField (L loc_n var_id))
+      in case core of
+           Core.Cast _ (SubCo co)     -> mkLHsWrap (WpCast (SubCo co)) base
+           Core.Var v | v /= var_id   -> L loc (HsVar noExtField (L loc_n v))
+           _                          -> base
+
+    constructor :: SrcSpanAnnA -> Type -> [LHsExpr GhcRn] -> DataCon -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    constructor loc expected later dc = case nativeIndexDataConTyArgs expected dc of
+      Just univ_tys -> do
+        let user_tvs = dataConUserTyVars dc
+            univ_map = zip (dataConUnivTyVars dc) univ_tys
+        user_tys <- maybe unsupported pure $
+          if user_tvs == dataConUnivTyVars dc
+            then Just univ_tys
+            else traverse (`lookup` univ_map) user_tvs
+        let con_tc   = mkLHsWrap (mkWpTyApps user_tys) (L loc (XExpr (ConLikeTc (RealDataCon dc))))
+            con_core = Core.mkTyApps (Core.Var (dataConWorkId dc)) univ_tys
+        return (con_core, con_tc)
       Nothing -> do
         first <- indexed expected
         case first of
-          Just app -> return app
-          Nothing -> do { refined <- tcRetainedDeclaredTypeView expected
-                        ; if refined `eqType` expected
-                          then unsupported
-                          else maybe unsupported return =<< indexed refined }
+          Just pair -> pure (build_con pair)
+          Nothing -> do
+            refined <- tcRetainedDeclaredTypeView expected
+            if refined `eqType` expected
+              then unsupported
+              else maybe unsupported (pure . build_con) =<< indexed refined
       where
+        build_con (con_core, user_tys) =
+          (con_core, mkLHsWrap (mkWpTyApps user_tys) (L loc (XExpr (ConLikeTc (RealDataCon dc)))))
+
         indexed domain = do
           let tvs = dataConUserTyVars dc
               orig_fields = dataConOrigArgTys dc
@@ -6558,52 +6596,62 @@ tcRetainedArgWithMult expected_mult reify domain arg
               return $ do
                 tys <- traverse (Subst.lookupTyVar subst) tvs
                 guard (substTyWith tvs tys (dataConOrigResTy dc) `eqType` domain)
-                case Core.nativeFamilyConHead_maybe dc tys of
-                  Just app -> return app
+                con_core <- case Core.nativeFamilyConHead_maybe dc tys of
+                  Just app -> Just app
                   Nothing -> do
                     (prefix, _) <- Core.nativeIndexedConArgs dc tys
-                    return (Core.mkApps (Core.Var (dataConWorkId dc)) prefix)
+                    Just (Core.mkApps (Core.Var (dataConWorkId dc)) prefix)
+                return (con_core, tys)
 
-    resolve_app :: NameEnv Id -> Type -> [LHsExpr GhcRn] -> LHsExpr GhcRn -> LHsExpr GhcRn
-                -> TcM (Core.CoreExpr, LHsExpr GhcRn, LHsExpr GhcRn)
-    resolve_app env expected later (L loc (HsPar x fun)) arg = do
-        (core, fun', arg') <- resolve_app env expected later fun arg
-        return (core, L loc (HsPar x fun'), arg')
-    resolve_app env expected later (L loc (XExpr (ExpandedThingRn (HSE ctxt fun)))) arg = do
-        (core, fun', arg') <- resolve_app env expected later fun arg
-        return (core, L loc (XExpr (ExpandedThingRn (HSE ctxt fun'))), arg')
-    resolve_app env expected _ (L loc (HsLam x LamSingle matches)) arg
-      | L alts_loc [L match_loc match@Match
-          { m_pats = L _ [L _ (VarPat _ lname)]
-          , m_grhss = rhss@GRHSs { grhssGRHSs = grhss
-                                , grhssLocalBinds = L _ (EmptyLocalBinds _) } }]
+    resolve_app :: NameEnv Id -> Mult -> Type -> [LHsExpr GhcRn] -> SrcSpanAnnA
+                -> LHsExpr GhcRn -> LHsExpr GhcRn -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    resolve_app env m_here expected later app_loc (L ploc (HsPar _ fun)) arg = do
+      (core, call_tc) <- resolve_app env m_here expected later app_loc fun arg
+      case call_tc of
+        L cloc (HsApp x f_tc a_tc) -> return (core, L cloc (HsApp x (L ploc (HsPar noExtField f_tc)) a_tc))
+        _                          -> return (core, call_tc)
+    resolve_app env m_here expected later app_loc (L eloc (XExpr (ExpandedThingRn (HSE ctxt fun)))) arg = do
+      (core, call_tc) <- resolve_app env m_here expected later app_loc fun arg
+      case call_tc of
+        L cloc (HsApp x f_tc a_tc) ->
+          return (core, L cloc (HsApp x (L eloc (XExpr (ExpandedThingTc (HSE ctxt f_tc)))) a_tc))
+        _ -> return (core, call_tc)
+    resolve_app env _ expected _ app_loc (L lam_loc (HsLam x LamSingle matches)) arg
+      | L alts_loc [L _ Match
+          { m_pats = L pats_loc [L pat_loc (VarPat _ lname)]
+          , m_grhss = GRHSs { grhssGRHSs = grhss
+                            , grhssLocalBinds = L _ (EmptyLocalBinds _) } }]
           <- mg_alts matches
-      , [L grhs_loc (GRHS grhs_ext [] body)] <- NE.toList grhss
-      = setSrcSpanA loc $
+      , [L _ (GRHS _ [] body)] <- NE.toList grhss
+      = setSrcSpanA lam_loc $
         do { strict <- xoptM LangExt.Strict
            ; when strict $ failWithTc
                (TcRnRetainedQuantificationError RetainedIndexLambdaStrict)
            ; let name = unLoc lname
                  binder = mkLocalId name ManyTy expected
-           ; (core_arg, arg') <- resolve env expected arg
-           ; (core_body, body') <- resolve (extendNameEnv env name binder) expected body
-           ; let rhss' = rhss { grhssGRHSs = NE.singleton (L grhs_loc (GRHS grhs_ext [] body')) }
-                 match' = match { m_grhss = rhss' }
-                 matches' = matches { mg_alts = L alts_loc [L match_loc match'] }
-           ; return (Core.App (Core.Lam binder core_body) core_arg,
-                     L loc (HsLam x LamSingle matches'), arg') }
-    resolve_app env expected later fun arg
+           ; (core_arg, arg_tc) <- tcScalingUsage ManyTy (resolve env ManyTy expected arg)
+           ; (body_ue, (core_body, body_tc)) <- tcCollectingUsage $
+               resolve (extendNameEnv env name binder) ManyTy expected body
+           ; tcEmitBindingUsage (snd (popUE body_ue binder))
+           ; let pat_tc   = L pat_loc (VarPat noExtField (L (getLoc lname) binder))
+                 match_tc = mkSimpleMatch (LamAlt LamSingle) (L pats_loc [pat_tc]) body_tc
+                 mg_tc    = MatchGroupTc [Scaled ManyTy expected] expected (Generated OtherExpansion SkipPmc)
+                 lam_tc   = L lam_loc (HsLam x LamSingle (MG { mg_alts = L alts_loc [match_tc], mg_ext = mg_tc }))
+           ; return (Core.App (Core.Lam binder core_body) core_arg, L app_loc (HsApp noExtField lam_tc arg_tc)) }
+    resolve_app env m_here expected later app_loc fun arg
       -- See Note [Record selectors in retained operands].
       = do { let source_head = case unLoc fun of
                    XExpr (HsRecSelRn field) -> Just (unLoc (foLabel field), [])
                    _ -> retainedSourceHead fun
-           ; (core_fun, fun') <- case source_head of
+           ; (core_fun, fun_tc) <- case source_head of
                Just (n, []) | not (isExternalName n) -> do
                    actual <- tcLookupIdMaybe n
                    case actual of
                      Just v | isNativeIndexFunctionId v -> do
                        fun_id <- liftZonkM (zonkId v)
-                       pure (Core.Var fun_id, fun)
+                       tcEmitBindingUsage (singleUsageUE fun_id)
+                       let f_loc = getLoc fun
+                       pure (Core.Var fun_id, L f_loc (HsVar noExtField (L (l2l f_loc) fun_id)))
                      _ -> setSrcSpanA (getLoc fun) $
                        failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall n))
                Just (n, written) -> do
@@ -6617,29 +6665,30 @@ tcRetainedArgWithMult expected_mult reify domain arg
                                >>= maybe (pure Nothing) tcLookupSourceTableId
                        _ -> pure Nothing
                      case certified of
-                       Just v -> do { core <- instantiate_source expected v written (arg : later)
-                                    ; pure (core, fun) }
+                       Just v -> instantiate_source expected fun v written (arg : later)
                        _ -> setSrcSpanA (getLoc fun) $
                               if is_rec_sel fun
                               then unsupported
                               else failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall n))
-               Nothing -> resolve_with_args env expected (arg : later) fun
-           ; (app, arg') <- apply env core_fun arg
-           ; return (app, fun', arg') }
+               Nothing -> resolve_with_args env m_here expected (arg : later) fun
+           ; apply env m_here app_loc core_fun fun_tc arg }
 
     -- See Note [Erased arguments of certified source operands] and
     -- Note [Pre-unifying polymorphic retained domains in inference mode].
-    instantiate_source :: Type -> Id -> [LHsWcType GhcRn] -> [LHsExpr GhcRn] -> TcM Core.CoreExpr
-    instantiate_source expected owner written args = do
-      owner <- liftZonkM (zonkId owner)
-      (core, sigma) <- foldM (applyRetainedSourceType unsupported owner)
-                             (Core.Var owner, varType owner) written
+    instantiate_source :: Type -> LHsExpr GhcRn -> Id -> [LHsWcType GhcRn] -> [LHsExpr GhcRn]
+                       -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    instantiate_source expected orig_fun owner0 written args = do
+      owner <- liftZonkM (zonkId owner0)
+      (written_tys, sigma) <- foldM (applyRetainedSourceType unsupported owner)
+                                    ([], varType owner) written
       let (binders, body) = tcSplitForAllInvisTyVars sigma
-      if null binders
-        then return core
-        else Core.mkTyApps core <$>
-               chooseRetainedSourceTypes unsupported owner sigma (map snd binders)
-                                           (declared_operands expected body args)
+      inferred_tys <- if null binders
+        then return []
+        else chooseRetainedSourceTypes unsupported owner sigma (map snd binders)
+               (declared_operands expected body args)
+      let all_tys = written_tys ++ inferred_tys
+          head_tc = mkSourceHeadTc (getLoc orig_fun) orig_fun owner all_tys
+      return (Core.mkTyApps (Core.Var owner) all_tys, head_tc)
 
     declared_operands expected ty (arg : args)
       | Just (af, _, _, formal, result) <- splitFunTy_maybe ty
@@ -6659,40 +6708,47 @@ tcRetainedArgWithMult expected_mult reify domain arg
         then return (Just expected')
         else return Nothing
 
-    -- Resolve the witness before checking the dependent payload. The next
-    -- application reads its domain from the type of this partial Core call.
-    apply env fun arg
-      | DepFunTy DepFunVisible binder _ <- coreFullView (exprType fun)
-      = do { (core_arg, arg') <- resolve env (varType binder) arg
+    apply :: NameEnv Id -> Mult -> SrcSpanAnnA -> Core.CoreExpr -> LHsExpr GhcTc -> LHsExpr GhcRn
+          -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    apply env m_here app_loc core_fun fun_tc arg
+      | DepFunTy DepFunVisible binder _ <- coreFullView (exprType core_fun)
+      = do { let b_mult = idMult binder
+           ; (core_arg, arg_tc) <- tcScalingUsage b_mult $
+               resolve env (mkMultMul m_here b_mult) (varType binder) arg
            ; case Core.retainedArgIndex core_arg of
                Just index | typeKind index `tcEqType` varType binder ->
-                 return (Core.App fun core_arg, arg')
+                 let res_ty = applyTypeToArgs (exprType core_fun) [core_arg]
+                 in return (Core.App core_fun core_arg,
+                            L app_loc (HsAppRetained (DepFunVisible, res_ty) fun_tc arg_tc))
                _ -> setSrcSpanA (getLoc arg) unsupported }
-      | otherwise = apply_ordinary env fun arg
+      | otherwise = apply_ordinary env m_here app_loc core_fun fun_tc arg
 
-    apply_ordinary env fun arg = case splitFunTy_maybe (exprType fun) of
-      Just (_, _, _, arg_ty, _) -> do
-        (core_arg, arg') <- case Core.collectArgs fun of
+    apply_ordinary :: NameEnv Id -> Mult -> SrcSpanAnnA -> Core.CoreExpr -> LHsExpr GhcTc -> LHsExpr GhcRn
+                   -> TcM (Core.CoreExpr, LHsExpr GhcTc)
+    apply_ordinary env m_here app_loc core_fun fun_tc arg = case splitFunTy_maybe (exprType core_fun) of
+      Just (_, _, f_mult, arg_ty, _) -> do
+        (core_arg, arg_tc) <- tcScalingUsage f_mult $ case Core.collectArgs core_fun of
           (Core.Var owner, _)
             | Just _ <- sourceTableId_maybe owner
             , Just _ <- nativeIndexFunctionTypeTys_maybe arg_ty
             , Just (name, _) <- retainedSourceHead arg
             , isExternalName name
-            -> tcRetainedFunctionArg arg_ty arg
-          _ -> resolve env arg_ty arg
-        let app = Core.App fun core_arg
+            -> tcCheckRetainedFunctionArgM arg_ty arg
+          _ -> resolve env (mkMultMul m_here f_mult) arg_ty arg
+        let app_core = Core.App core_fun core_arg
+            app_tc   = L app_loc (HsApp noExtField fun_tc arg_tc)
         -- See Note [Retained argument cast diagnostics].
         case core_arg of
           Core.Cast (Core.Var actual) co
-            | (Core.Var owner, args) <- Core.collectArgs app
+            | (Core.Var owner, args) <- Core.collectArgs app_core
             , Just family <- sourceTableId_maybe owner
             , length args == tyConArity family
-            , Nothing <- Core.nativeSourceCallIndex app
+            , Nothing <- Core.nativeSourceCallIndex app_core
             , not (varType actual `tcEqType` coercionRKind co)
             -> setSrcSpanA (getLoc arg) $
                  failWithTc (TcRnRetainedQuantificationError
                    (RetainedIndexArgumentCast (varType actual) (coercionRKind co)))
-          _ -> return (app, arg')
+          _ -> return (app_core, app_tc)
       _ -> unsupported
 
     unsupported :: TcM a
@@ -6718,10 +6774,10 @@ retainedSourceHead = go []
 
 -- | Check a written type without inferring an earlier erased argument.
 -- See Note [Erased arguments of certified source operands].
-applyRetainedSourceType :: TcM (Core.CoreExpr, TcSigmaType) -> Id
-                        -> (Core.CoreExpr, TcSigmaType) -> LHsWcType GhcRn
-                        -> TcM (Core.CoreExpr, TcSigmaType)
-applyRetainedSourceType unsupported owner (core, sigma) ty
+applyRetainedSourceType :: TcM ([Type], TcSigmaType) -> Id
+                        -> ([Type], TcSigmaType) -> LHsWcType GhcRn
+                        -> TcM ([Type], TcSigmaType)
+applyRetainedSourceType unsupported owner (tys, sigma) ty
   | Just (_, binder, _) <- tcSplitForAllTyVarBinder_maybe sigma
   , isSpecifiedForAllTyFlag (binderFlag binder)
   = do { (choice, body) <- tcVTA (idConcreteTvs owner) sigma Nothing ty
@@ -6731,7 +6787,7 @@ applyRetainedSourceType unsupported owner (core, sigma) ty
        ; if valid && all noQuickLookVars [choice, body]
                   && not (any (\v -> isTcTyVar v && isMetaTyVar v)
                               (tyCoVarsOfTypesList [choice, body]))
-         then return (Core.App core (Core.Type choice), body)
+         then return (tys ++ [choice], body)
          else unsupported }
   | otherwise = unsupported
 
@@ -6767,75 +6823,6 @@ chooseRetainedSourceTypes unsupported owner sigma tvs operands
       = do { valid <- tcRetainedInstScope checked
            ; if valid then return choices else unsupported }
       | otherwise = unsupported
-
-{- Note [Inferred domains of written retained constructors]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In zipWithExact [x,y] [u,v] (,), the two input lists determine their
-element types. The result type of the callback is still unknown. Ordinary
-forall instantiation can therefore supply a fresh element type for each
-list. If we build the (:) worker at that type before checking x, its Core
-type argument still contains the old metavariable when we recover the index.
-
-Read the declared type of the constructor tree before building its workers.
-Match only metavariables of the expected domain. Let the ordinary unifier
-check that match and read its result. An ordinary metavariable cannot stand
-for a type containing a runtime index. The existing immutable instantiation
-path handles those types. The operand check still validates each field and
-its usage. A bare local variable retains its lexical conversion evidence.
--}
-
-{- Note [Record selectors in retained operands]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The renamer uses HsRecSelRn for a record selector. A selector application
-must look up the resolved selector's own checked source table, just like
-a named function call. This also records any rewrite-rule dependencies.
-Keep the written selector for the ordinary argument check. If it has no
-source table, report an unsupported retained expression at the selector.
--}
-
-{- Note [Erased arguments of certified source operands]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A retained operand can call a checked source function with an erased element
-parameter. For example, sourceLength xs has type Nat when xs has a declared
-type [a]. Its certified head still has type forall a. [a] -> Nat. Instantiate
-that erased binder before reading the first runtime argument's domain.
-
-For zip xs ys, the declaration of xs fixes the first erased argument and
-the declaration of ys fixes the second. Keep the remaining operands of this
-application while resolving its head. Read their monomorphic declarations
-in order. An operand with no known type supplies no match. Stop when every
-unwritten erased binder has a choice, so sourceLength still needs only xs.
-
-Match kinds and types with one immutable substitution. Check the substituted
-domains, binder kinds, lexical scope, and concreteness requirements before
-constructing Core type arguments. A conflict or missing choice rejects the
-call. This pass allocates no inference variables and checks no occurrences.
-Keep the written expression for ordinary argument checking and usage
-recording. Each operand must still match its instantiated domain.
-
-A written prefix such as sourceLength @a xs uses tcVTA at each leading
-specified binder. Require known types after zonking. Do not apply tcVTA to
-an inferred binder or create a guessed instantiation before the written
-prefix. Remaining erased binders can use the same declaration matching.
-The runtime syntax keeps each written type argument. Its ordinary check uses
-the same specified binders and the same known types as these Core arguments.
-The argument's actual type must still match the instantiated domain.
-
-This step follows tcLookupSourceTableId. It does not certify a function or
-change declaration-group ordering. The defining group must have completed
-its source equations before another group can use them as an operand.
-The final retainedArgIndex check still validates saturation and all domains.
--}
-
-{- Note [Inferring a local retained operand]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An unsigned binding such as `get xs i = mkListIndex xs i` begins with
-a fresh type variable for xs. Its runtime representation can also be
-unknown. The expected list domain fixes that representation to LiftedRep.
-Unify the kinds before checking whether xs can be an opaque local index.
-Require a reflexive coercion after zonking. The usual variable check then
-checks the full domain, scope and multiplicity of the operand.
--}
 
 -- | Resolve an index variable at its expected domain. Function values keep
 -- their complete fixed type and lexical identity.
@@ -6873,142 +6860,43 @@ tcRetainedDomainConversion origin actual expected
 
 {- Note [Wildcards in retained operand domains]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In keepMaybe @_ m x, the type of m can determine the wildcard. The
-ordinary unifier checks the declared operand against the retained domain.
-If zonking then gives the same type on both sides, use the original
-runtime Id with its resolved type. This supplies an index for the
-codomain. A cast for a non-reflexive equality cannot supply that index.
-Use the resolved domain when applying the dependent function type too.
--}
+When a retained binder's domain contains flexible metavariables (such as
+@keepMaybe \@_ m x@), unify the operand's type with the domain first and zonk
+both the variable's type and the dependent arrow before substituting into the
+codomain.
 
-{- Note [Retained argument cast diagnostics]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-sourceLength @Bool xs requires [Bool] when xs has type [Int]. Variable
-resolution emits the ordinary equality wanted and keeps its nominal cast.
-The computed-index grammar cannot use that cast. Its final rejection would
-otherwise hide the argument types behind an unsupported-expression error.
+Note [Retained argument application]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Check each non-vacuous, hole-free retained argument once in 'tcInstFun':
 
-When a saturated certified call cannot recover its index and its argument is
-a casted variable, report the actual and expected types at that operand's
-existing span. Do not solve constraints, check the operand again, or discard
-a successful conversion. The message describes the required cast, rather
-than asserting that no nominal equality can hold in the current context.
--}
+1. Construct 'LHsExpr' 'GhcTc' directly inside 'tcCollectingUsage', expanding
+   plain 'HsString' literals at @[Char]@, elaborating non-negative numerals via
+   'tcRetainedNumeral', specialising ground class methods, and resolving lexical
+   Given class selectors.
+2. Recover the 'Core.CoreExpr' index via 'tcExprToRetainedCore'
+   ('RCM_RetainedArg') so 'applyTypeToArgs' substitutes the exact index that
+   'dsLExpr' emits for 'HsAppRetained'.
+3. Store @Just (checked_tc, arg_ue)@ in 'ea_retained_tc' on 'ERetainedArg'.
+   'tcValArg' scales @arg_ue@ once by the retained binder's multiplicity
+   ('OneTy', 'ManyTy', or a multiplicity variable) without re-typechecking the
+   expression: type formation uses grade 0 while runtime application consumes
+   the binder's grade; see Atkey, "The Syntax and Semantics of Quantitative
+   Type Theory", LICS 2018, pp. 56-65; Choudhury, Eades, Eisenberg & Weirich,
+   "A Graded Dependent Type System with a Usage-Aware Semantics", POPL 2021
+   (PACMPL 5(POPL):50); Brady, "Idris 2: Quantitative Type Theory in Practice",
+   ECOOP 2021 (LIPIcs 194:9); Norell, PhD thesis, Chalmers, 2007; and GHC
+   Proposal #378 (§4.7).
+4. Keep @ea_retained_tc = Nothing@ only for vacuous invisible 'DepFunTy'
+   binders, @TypeRep@ '@ty' overrides, and hole-bearing operands so 'tcValArg'
+   checks them once after Step 5 result refinement.
 
-{- Note [Quoted strings in retained operands]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A plain quoted string at [Char] has the same index as its written list
-of characters. Decode the parsed HText with its existing modified UTF-8
-decoder. This preserves embedded NUL and each Unicode code point.
-
-Check and desugar the expansion through the retained list path. It keeps
-the original literal for source diagnostics and the list constructors
-for Core index recovery. The constructor fields stay lazy. Ordinary
-string expressions still use GHC.Core.Make.mkStringExprFSWith.
-
-With OverloadedStrings the renamer produces HsOverLit, even when the
-expected type is [Char]. A fromString instance or a rebindable fromString
-can change the value or demand. Only a plain HsString uses this expansion.
--}
-
-{- Note [Retained argument application]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A plain source value argument consumes DepFunVisible. At DepFunInvisible it
-can determine an omitted operand. See Note [Inferring an invisible retained
-argument] and Note [Explicit invisible retained arguments].
-
-A retained argument is a value. Resolve a local unrestricted Id or a saturated
-constructor tree before instantiating the codomain. Also resolve an immediate
-single-variable lambda application in the checked native beta grammar.
-applyTypeToArgs uses the same index substitution as Core type recovery.
-Do not use tcVDQ: it translates an expression into an erased type argument.
-
-The retained binder supplies the checked domain. A lambda's provisional Many
-Id uses its actual renamed Name. Keep these Ids in a separate NameEnv; do not
-install them in the Tc environment or collect usage. Resolve the argument in
-the outer environment and the body in the extended environment. Constructor
-worker arrows supply their actual field domains. Do not use a constructor's
-result domain for all its fields. The shared Core bridge validates domains,
-saturation, and atomic beta arguments. See Note [Checked native index beta
-exposure] in GHC.Core. No provisional lambda binder survives normalization.
-
-A closed algebraic argument can contain eligible function leaves. Resolve
-each leaf to its actual lexical Id at its complete fixed function type.
-Do not cast a function to another domain or admit a global function here.
-The promoted constructor index stores the same Id as TermVarTy. A saturated
-family can expose that value; canonical application then forms TermAppTy.
-
-Keep the lambda grammar narrow: one VarPat, one unguarded RHS, and no local
-binds or signatures. Strict can make this variable pattern force its argument,
-so reject this new form with Strict. Under ordinary inference each admitted
-lambda starts with a fresh multiplicity. One usage does not equate it to One;
-Many usage requires Many. Remaining multiplicity metas default to Many during
-final zonking. No admitted signature, linear function head, or expected linear
-arrow can impose One. Check actual zonked lambda metadata when this grammar
-changes. The source pattern checker preserves the renamed Name/Unique.
-
-A local NoGen let can keep a fresh multiplicity metavariable. For example,
-let bools = [flag, False] can capture a do-bound flag before genericVector bools
-uses bools as a retained index. First check its local, non-CoVar, non-join,
-lifted shape with a temporary Many view. Do not store or return that view.
-Require Many on the actual Id with tcSubMult at retained resolution, then
-re-zonk the Id before its exact Core metadata check. This
-constrains an ordinary multiplicity. It does not default an unknown value or
-accept One or a rigid multiplicity. tcSubMult requires reflexive evidence.
-Use the same rule as Note [Dependent constructor field telescopes] in
-GHC.Tc.Gen.Pat. Keep optional declaration lookup read-only. Resolution emits
-no usage; the later ordinary argument check records the occurrence once.
-The separate fixed-domain function argument resolver keeps its existing rule.
-Reject an already known One or rigid multiplicity before requesting that
-constraint. Report the retained argument's Many requirement and its actual
-multiplicity. This is an unsupported retained argument, not a request to use
-GADT evidence to equate multiplicities.
-
-A variable can have a nominally equal domain with a different family
-application. For example, a constructor equation supplies cut ~# Z while a
-later retained variable still has domain Vec Bool (Add cut m). Lift the
-lexical constructor proof through the original domain. Family axioms can
-then reduce Add. Use this conversion only if it proves the complete domain
-equality. Otherwise, give the original types to the ordinary unifier so it
-can use other Given equalities or infer metavariables as usual.
-
-Keep the nominal domain cast in the resolved Core argument. If that cast
-uses the lexical branch evidence, reuse it on the same written variable
-in tcValArg. Check the occurrence at the cast's input type and account
-for its runtime usage once. Other arguments use the existing argument
-check. A failed domain equality remains a located type error.
-See Note [Nominal native index casts] in GHC.Core.
-
-Resolution does not inspect unfoldings or evaluate values. Later argument
-types use the same runtime Id, including a lazy binding whose RHS is bottom.
-The provisional Core expression does not replace this original source check.
-See GHC Proposal #378 (§4.7) and docs/dependent-haskell/CORE.md#laziness-and-eta.
--}
-
-{- Note [Explicit invisible retained arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In f @Int @{n} xs, @Int is an erased type application and @{n} is an
-expression in the ordinary term namespace. Agda uses braces to supply an
-implicit term; the prefix @ distinguishes the argument from GHC's record
-syntax (GHC Proposal #378, §4.7; Norell, 2007).
-
-Instantiate preceding erased foralls and dictionaries before consuming the
-invisible retained binder. Declaration advice can choose erased arguments.
-When the result mentions the binder, resolve the written operand by the same
-index rules as a visible retained argument and substitute it into the result.
-A vacuous binder needs only a checked runtime argument. See Note [Vacuous
-retained applications] in GHC.Core.Utils. An inferred operand cannot replace
-the written one. Check the expression at the binder's domain and multiplicity
-Many exactly once. Store the result type in HsAppRetained and desugar the
-operand to a runtime value application.
-
-Keep the written visibility in ERetainedArg and HsAppRetained. A visible
-operand uses ordinary value checking. Its stored result type keeps later
-passes from having to substitute the operand again. Breakpoint insertion
-recognises both visibilities. See Note [Breakpoints in retained operands]
-in GHC.HsToCore.Ticks. A written invisible operand counts in source
-diagnostic positions without consuming an ordinary argument cache position. Skip Quick Look for this application so that
-the retained result is checked without Quick Look instantiation variables.
+Note [Explicit invisible retained arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In @f \@Int \@{n} xs@, @\@{n}@ supplies a term-namespace expression to a
+'DepFunInvisible' binder (GHC Proposal #378, §4.7; Norell, PhD thesis,
+Chalmers, 2007). Non-vacuous written operands use the same single-pass retained
+check as visible retained arguments; vacuous binders defer to a single
+'tcPolyExpr' check in 'tcValArg'.
 -}
 
 -- | Is this a written runtime argument for an invisible retained binder?
@@ -8046,7 +7934,7 @@ tcRetainedInferableArg (L _ expr)
       where name = unLocWithUserRdr lname
     declared_field _ = return Nothing
 
-    -- | Exclude checking-only syntax without traversing compiler type graphs.
+    -- Exclude checking-only syntax without traversing compiler type graphs.
     simple_type :: Data a => a -> Bool
     simple_type thing
       | Just (_ :: SrcSpanAnnA) <- cast thing = True
@@ -8058,7 +7946,7 @@ tcRetainedInferableArg (L _ expr)
       | Just _ <- (cast thing :: Maybe Name) = True
       | otherwise = and (gmapQ simple_type thing)
 
-    -- | Keep explicit quantifiers, contexts and type splices on the usual path.
+    -- Keep explicit quantifiers, contexts and type splices on the usual path.
     simple_shape :: HsType GhcRn -> Bool
     simple_shape HsForAllTy{} = False
     simple_shape HsForEachTy{} = False
@@ -10301,14 +10189,6 @@ newArgTyVarTyQL do_ql frr_ctxt
         ; rr_info <- mkConcreteInfo conc_orig
         ; arg_nu  <- newOpenFlexiTyVarTyQL do_ql rr_info
         ; return arg_nu }
-
-instantiateSigmaQL :: QLFlag
-                   -> CtOrigin
-                   -> ConcreteTyVars -- ^ concreteness information
-                   -> [(Matchability, TyVar)]
-                   -> TcThetaType -> TcSigmaType
-                   -> TcM (HsWrapper, TcSigmaType)
-instantiateSigmaQL = instantiateSigmaQLWithAcc []
 
 instantiateSigmaQLWithAcc :: [HsExprArg 'TcpInst]
                           -> QLFlag

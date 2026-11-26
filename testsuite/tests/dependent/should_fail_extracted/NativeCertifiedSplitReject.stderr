@@ -127,19 +127,6 @@ NativeCertifiedSplitReject.hs:45:31: error: [GHC-83865]
         ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
         xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
 
-NativeCertifiedSplitReject.hs:45:31: error: [GHC-83865]
-    • Couldn't match type ‘P.plus cut suffix’ with ‘total’
-      Expected: P.Vec a (P.Add cut suffix)
-        Actual: P.Vec a total
-    • In the second argument of ‘splitAtValue’, namely ‘xs’
-      In the first argument of ‘SplitBothAtWidth’, namely
-        ‘(splitAtValue cut xs)’
-      In the second argument of ‘Pair’, namely
-        ‘(SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys))’
-    • Relevant bindings include
-        ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
-        xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
-
 NativeCertifiedSplitReject.hs:45:53: error: [GHC-83865]
     • Couldn't match type ‘P.plus cut suffix’ with ‘total’
       Expected: P.Vec b (P.Add cut suffix)
@@ -152,19 +139,6 @@ NativeCertifiedSplitReject.hs:45:53: error: [GHC-83865]
         ‘(Pair
             suffix
             (SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys)))’
-    • Relevant bindings include
-        ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
-        xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
-
-NativeCertifiedSplitReject.hs:45:53: error: [GHC-83865]
-    • Couldn't match type ‘P.plus cut suffix’ with ‘total’
-      Expected: P.Vec b (P.Add cut suffix)
-        Actual: P.Vec b total
-    • In the second argument of ‘splitAtValue’, namely ‘ys’
-      In the second argument of ‘SplitBothAtWidth’, namely
-        ‘(splitAtValue cut ys)’
-      In the second argument of ‘Pair’, namely
-        ‘(SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys))’
     • Relevant bindings include
         ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
         xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)

@@ -44,8 +44,8 @@ NativeOpenIndexedAppendFail.hs:25:38: error: [GHC-05617]
           P.S k
             -> (appendEmptyAt @a @('P.S k) xs, appendEmptyAt @a @('P.S k) ys)
     • Relevant bindings include
-        xs_a4Fd :: P.Vec a n1 (bound at <no location info>)
-        ys_a4Fe :: P.Vec a n1 (bound at <no location info>)
+        xs_a4F4 :: P.Vec a n1 (bound at <no location info>)
+        ys_a4F5 :: P.Vec a n1 (bound at <no location info>)
         wrongAppendPair :: foreach (n :: P.Nat)
                            -> foreach (xs :: P.Vec a n)
                               -> foreach (ys :: P.Vec a n) -> (EmptyLaw a n xs, EmptyLaw a n ys)

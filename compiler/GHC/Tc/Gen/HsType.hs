@@ -86,6 +86,8 @@ module GHC.Tc.Gen.HsType (
         tcRegisterSynthesizedSourceFun,
         tcCommitSynthesizedSourceFunBind,
         drainSynthesizedSourceFuns,
+        recordLocalSynthFunId,
+        withLocalSynthFunIds,
         setLocalSimpleFunBinds,
         lookupLocalSimpleFunBind,
 
@@ -6096,11 +6098,12 @@ data SynthTypeState = SynthTypeState
   , sts_ordinals       :: !(OccEnv Int)
   , sts_sig_cases      :: !(NameEnv [(Bool, [TyVar], Type, [([Name], LHsType GhcRn, LHsType GhcRn)], TyCon)])
   , sts_pending_checks :: ![TcM ()]
+  , sts_synth_fun_ids  :: ![Id]
   }
 
 emptySynthTypeState :: SynthTypeState
 emptySynthTypeState =
-  SynthTypeState emptyNameEnv emptyNameEnv Nothing emptyOccEnv emptyNameEnv []
+  SynthTypeState emptyNameEnv emptyNameEnv Nothing emptyOccEnv emptyNameEnv [] []
 
 getSynthTypeState :: TcM SynthTypeState
 getSynthTypeState = do
@@ -6348,6 +6351,31 @@ drainSynthesizedSourceFuns mod_key =
   modifySynthTypeState mod_key
     (\st -> (st { sts_source_funs = emptyNameEnv }, nonDetNameEnvElts (sts_source_funs st)))
     []
+
+-- | Record a synthesized function 'Id' in 'SynthTypeState' so later family
+-- rewrites in the same binding group can resolve its 'Name'.
+recordLocalSynthFunId :: Id -> TcM ()
+recordLocalSynthFunId fid = do
+  cur_mod <- tcg_mod <$> getGblEnv
+  modifySynthTypeState cur_mod
+    (\st ->
+       let cur  = sts_synth_fun_ids st
+           cur' = if any ((== idName fid) . idName) cur then cur else fid : cur
+       in (st { sts_synth_fun_ids = cur' }, ()))
+    ()
+
+-- | Extend the local value environment with synthesized function 'Id's that
+-- are not yet installed in 'tcg_type_env'.
+withLocalSynthFunIds :: TcM a -> TcM a
+withLocalSynthFunIds action = do
+  st <- getSynthTypeState
+  case sts_synth_fun_ids st of
+    []   -> action
+    rids -> do
+      gbl <- getGblEnv
+      let fids = [ fid | fid <- rids
+                       , isNothing (lookupTypeEnv (tcg_type_env gbl) (idName fid)) ]
+      foldr tcExtendGeneratedIdEnv action fids
 
 -- | Replace the active 1-argument renamed function table for a 'Module' and
 -- return the previous table so nested calls can restore it.

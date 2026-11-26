@@ -48,7 +48,6 @@ import GHC.Tc.Gen.Match( tcBody, tcScopedRuntimeBody, tcLambdaMatches, tcExprCas
                        , implicitPayloadType, matchesImplicitPayloadPat
                        , tcGRHSNE, tcDoStmts )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
-import GHC.Tc.Solver.Monad ( bumpReductionDepthTcM, matchFamTcM )
 import GHC.Tc.Zonk.TcType
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType as TcType
@@ -59,7 +58,6 @@ import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Utils.Env
 import GHC.Tc.Types.ErrCtxt ( ReportRedundantConstraints(NoRRC) )
 import GHC.Tc.Types.Origin
-import GHC.Tc.Types.CtLoc ( CtLoc )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Errors.Types hiding (HoleError)
 
@@ -70,7 +68,6 @@ import GHC.Core.Utils (applyTypeToArgs)
 import GHC.Core.UsageEnv
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
 import GHC.Core.Make (mkCoreApps, mkCoreConApps, rEC_CON_ERROR_ID, tYPE_ERROR_ID)
-import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Class(classTyCon)
@@ -1848,7 +1845,8 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
         result <- MaybeT (pure (abstractNativeIndices [(index, template)] expected))
         guard (anyFreeVarsOfType (== template) result)
         liftMaybeT $ do
-            (checked, runtime_rhs) <- tcRetainedArg domain rhs
+            (checked, argument, arg_ue) <- tcRetainedArg domain rhs
+            tcScalingUsage ManyTy (tcEmitBindingUsage arg_ue)
             let binder = mkLocalId (unLoc name) ManyTy domain
                 equality = mkNomEqPred (TermVarTy binder) index
                 signature = mkDepFunTy binder (mkPhiTy [equality] expected)
@@ -1856,7 +1854,6 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
                 row = genSimpleMatch (LamAlt LamSingle) [pat] body
                 matches = mkMatchGroup (Generated OtherExpansion SkipPmc) noAnn (wrapGenSpan [row])
                 lambda = wrapGenSpan (HsLam noAnn LamSingle matches)
-            argument <- tcScalingUsage ManyTy (tcCheckMonoExpr runtime_rhs domain)
             fun <- tcWithSourceLetView binder index (tcCheckMonoExprNC lambda signature)
             let result_ty = applyTypeToArgs signature [checked]
                 app = HsAppRetained (DepFunVisible, result_ty) fun argument
@@ -2182,15 +2179,17 @@ payload pattern still determines demand.
 -}
 
 -- | Classify an opaque call after ordinary expression and usage checking.
--- See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+-- See Note [Source opaque call refinement] in GHC.Tc.Gen.Match,
+-- Note [Checked source call arguments], and Note [Signed source call beta].
 checkedNativeCallIndex :: LHsExpr GhcTc -> Type -> TcM (Maybe Type)
 checkedNativeCallIndex expr result_ty
   | HsApp _ fun _ <- unLoc (stripParensLHsExpr expr)
   , local_head fun
-  = do { core <- checkedNativeCallArgument emptyNameEnv expr
+  = do { mb_core <- tcExprToRetainedCore (RCM_CaseCallArg emptyNameEnv) expr
        ; result_ty <- liftZonkM (zonkTcType result_ty)
        ; return $ do
-           index <- core >>= Core.exprToNativeCaseIndex
+           (core, _, _) <- mb_core
+           index <- Core.exprToNativeCaseIndex core
            guard (typeKind index `eqType` result_ty)
            return index }
   | otherwise = return Nothing
@@ -2202,210 +2201,32 @@ checkedNativeCallIndex expr result_ty
       HsVar _ (L _ f) -> isNativeIndexFunctionId f
       _ -> False
 
--- | Reconstruct a checked call argument for classification, not execution.
--- See Note [Checked source call arguments] and Note [Signed source call beta].
-checkedNativeCallArgument :: NameEnv Id -> LHsExpr GhcTc -> TcM (Maybe Core.CoreExpr)
-checkedNativeCallArgument bound expr
-  = case unLoc (stripParensLHsExpr expr) of
-      HsVar _ (L _ arg_id)
-        | let actual = fromMaybe arg_id (lookupNameEnv bound (idName arg_id))
-        , isNativeOpaqueValueId actual -> return (Just (Core.Var actual))
-      XExpr (ConLikeTc (RealDataCon con))
-        -> return (Just (Core.Var (dataConWrapId con)))
-      HsApp _ fun arg
-        | ExprWithTySig _ inner signature <- unLoc (strip_checked fun)
-        , Just domain_name <- simple_signature signature
-        -> checked_beta domain_name inner arg
-        | otherwise
-        -> do { fun' <- checked_fun fun
-              ; case fun' of
-                  Nothing -> return Nothing
-                  Just core_fun -> do
-                    { arg' <- checkedNativeCallArgument bound arg
-                    ; return (Core.App core_fun <$> arg') } }
-      XExpr (WrapExpr wrapper inner)
-        | Just tys <- type_arguments wrapper
-        -> do { tys <- mapM (liftZonkM . zonkTcType) tys
-              ; value <- checkedNativeCallArgument bound (noLocA inner)
-              ; return ((`Core.mkTyApps` tys) <$> value) }
-      ExplicitList element_ty elements
-        -> do { element_ty <- liftZonkM (zonkTcType element_ty)
-              ; values <- mapM (checkedNativeCallArgument bound) elements
-              ; let nil = Core.mkConApp nilDataCon [Core.Type element_ty]
-                    cons value rest = Core.mkConApp consDataCon [Core.Type element_ty, value, rest]
-              ; return (foldr cons nil <$> sequence values) }
-      XExpr (ExpandedThingTc (HSE _ inner))
-        -> checkedNativeCallArgument bound inner
-      _ -> return Nothing
-  where
-    -- See Note [Cases on a cast callback result].
-    checked_fun :: LHsExpr GhcTc -> TcM (Maybe Core.CoreExpr)
-    checked_fun fun
-      | XExpr (WrapExpr (WpCast co) inner) <- unLoc (stripParensLHsExpr fun)
-      = runMaybeT $ do
-          prefix@Core.App{} <- MaybeT (checkedNativeCallArgument bound (noLocA inner))
-          index <- MaybeT (pure (Core.exprToNativeCaseIndex prefix))
-          checked <- liftMaybeT (liftZonkM (zonkCo co))
-          let source = coercionLKind checked
-              target = coercionRKind checked
-          guard (coercionRole checked == Representational && typeKind index `eqType` source)
-          case setNominalRole_maybe Representational checked of
-            Just _ | isJust (nativeIndexFunctionTypeTys_maybe target) ->
-              pure (Core.Cast prefix checked)
-            _ -> do
-              loc <- liftMaybeT (getCtLocM PatCheckOrigin Nothing)
-              delta <- MaybeT (tryTcDiscardingErrs (pure Nothing) $
-                               runMaybeT (expose_arrow loc source))
-              let arrow = coercionRKind delta
-              _ <- liftMaybeT (unifyType Nothing arrow target)
-              target' <- liftMaybeT (liftZonkM (zonkTcType target))
-              Core.Cast prefix (mkSubCo delta) <$ guard (target' `eqType` arrow)
-      | otherwise = checkedNativeCallArgument bound fun
-
-    expose_arrow :: CtLoc -> TcType -> MaybeT TcM CoercionN
-    expose_arrow loc ty = do
-      (family, args) <- MaybeT (pure (tcSplitTyConApp_maybe ty))
-      guard (isTypeFamilyTyCon family && not (isConstrainedFamilyTyCon family))
-      Reduction step rhs <- MaybeT (matchFamTcM family args)
-      loc' <- liftMaybeT (bumpReductionDepthTcM loc ty)
-      if isJust (nativeIndexFunctionTypeTys_maybe rhs)
-        then pure step
-        else mkTransCo step <$> expose_arrow loc' rhs
-
-    -- Read only erased type application wrappers, in application order.
-    type_arguments WpHole = Just []
-    type_arguments (WpTyApp ty) = Just [ty]
-    type_arguments (WpCompose outer inner)
-      = (++) <$> type_arguments inner <*> type_arguments outer
-    type_arguments _ = Nothing
-
-    -- | Read only the existing transparent checked expression forms.
-    strip_checked :: LHsExpr GhcTc -> LHsExpr GhcTc
-    strip_checked expr = case unLoc (stripParensLHsExpr expr) of
-      XExpr (WrapExpr WpHole inner) -> strip_checked (noLocA inner)
-      XExpr (ExpandedThingTc (HSE _ inner)) -> strip_checked inner
-      _ -> stripParensLHsExpr expr
-
-    -- | Require a written, closed, plain A -> A signature with named domains.
-    simple_signature :: LHsSigWcType GhcRn -> Maybe Name
-    simple_signature (HsWC { hswc_ext = []
-                          , hswc_body = L _ HsSig
-                              { sig_bndrs = HsOuterImplicit { hso_ximplicit = [] }
-                              , sig_body = signature } })
-      | HsFunTy _ (HsModifiedFunArr _ [] (HsStandardArr _)) arg res <- strip_type signature
-      , HsTyVar _ NotPromoted (L _ (WithUserRdr _ arg_name)) <- strip_type arg
-      , HsTyVar _ NotPromoted (L _ (WithUserRdr _ res_name)) <- strip_type res
-      , arg_name == res_name
-      = Just arg_name
-    simple_signature _ = Nothing
-
-    -- | Remove parentheses without expanding type syntax or aliases.
-    strip_type :: LHsType GhcRn -> HsType GhcRn
-    strip_type (L _ (HsParTy _ ty)) = strip_type ty
-    strip_type (L _ ty) = ty
-
-    -- | Use the actual checked binder and read its existing assignments.
-    checked_beta :: Name -> LHsExpr GhcTc -> LHsExpr GhcTc
-                 -> TcM (Maybe Core.CoreExpr)
-    checked_beta domain_name inner arg
-      | HsLam _ LamSingle MG
-          { mg_ext = MatchGroupTc { mg_arg_tys = [pat_ty], mg_res_ty = result_ty }
-          , mg_alts = L _ [L _ Match
-              { m_pats = L _ [L _ (VarPat _ (L _ binder))]
-              , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body) NE.:| []
-                                , grhssLocalBinds = L _ (EmptyLocalBinds _) } }] }
-          <- unLoc (strip_checked inner)
-      = do { strict <- xoptM LangExt.Strict
-           ; if strict then return Nothing else
-             do { (actual, argument, result) <- liftZonkM $
-                    (,,) <$> zonkId binder <*> zonkScaledTcType pat_ty
-                         <*> zonkTcType result_ty
-                ; case (idMult actual, scaledMult argument) of
-                    (ManyTy, ManyTy)
-                      | isNativeIndexId actual
-                      , eqType (idType actual) (scaledThing argument)
-                      , eqType (idType actual) result
-                      , Just (tc, []) <- splitTyConApp_maybe (coreFullView (idType actual))
-                      , tyConName tc == domain_name
-                      -> do { body' <- checkedNativeCallArgument
-                                         (extendNameEnv bound (idName actual) actual) body
-                            ; case body' of
-                                Nothing -> return Nothing
-                                Just core_body -> do
-                                  { arg' <- checkedNativeCallArgument bound arg
-                                  ; return (Core.App (Core.Lam actual core_body) <$> arg') } }
-                    _ -> return Nothing } }
-    checked_beta _ _ _ = return Nothing
-
 {- Note [Signed source call beta]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A complete written A -> A signature can supply a checked Many lambda binder.
-Require the surviving ExprWithTySig, one plain arrow and the same bare type
-constructor Name on each side. Reject implicit or explicit forall binders,
-wildcards, contexts, type applications, aliases and nontrivial wrappers.
-Check the actual LamSingle, VarPat, unguarded RHS and empty local bindings.
+When 'RCM_CaseCallArg' in 'GHC.Tc.Gen.App.tcExprToRetainedCore' inspects a call
+@((\x -> body) :: A -> A) arg@ with a closed plain @A -> A@ signature, no
+@-XStrict@, and a zonked 'ManyTy' index binder @x@, reconstruct a temporary
+@Core.App (Core.Lam x core_body) core_arg@ for 'GHC.Core.exprToNativeIndex'
+without re-checking or altering execution (Norell, PhD thesis, Chalmers, 2007;
+GHC Proposal #378, §4.7). See Note [Source opaque call refinement] in
+GHC.Tc.Gen.Match.
 
-Read existing assignments with the during-TC zonker. It leaves Flexi untouched;
-only existing Indirect chains can be compressed. Require literal Many in the
-actual Id and scaled MatchGroup argument. Check both domains and the result.
-Preserve the binder Name and Unique. Use that zonked Id for bound occurrences,
-without changing the existing policy for external index variables or heads.
-Do not default, fill a meta, create a provisional Many Id or repeat usage.
+Note [Cases on a cast callback result]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a case scrutinee casts a partial callback call @f x@ by a representational
+coercion before applying @y@ (for example @f :: Bool -> Result 'True@ where
+@Result 'True@ reduces to @Bool -> Ordering@), 'tcExprToRetainedCore' follows
+nominal family equations on the source type to expose the arrow, unifies it
+with the cast target, and builds the nominal cast expected by
+'GHC.Core.exprToNativeCaseIndex' (Norell, PhD thesis, Chalmers, 2007; Cockx and
+Abel, ICFP 2018). See Note [Checking a cast retained callback] in GHC.Tc.Gen.App.
 
-The temporary Core.Lam is only classification data. exprToNativeIndex checks
-its existing atomic beta grammar and domains. Keep the original checked call
-for execution. No general lambda, residual opaque call or new Core rule is
-admitted. Under Strict return Nothing: source VarPat demand is added later by
-desugaring. Ordinary nondependent cases must retain their normal checking path.
-
-Agda checks a lambda in its target context and checks and substitutes arguments
-in telescope order (Norell, 2007; GHC Proposal #378, §4.7). That supplies scoped
-checking prior art, not GHC multiplicity defaulting or Haskell demand laws. See
-Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
--}
-
-{- Note [Cases on a cast callback result]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Suppose f :: Bool -> Result 'True and Result 'True reduces to
-Bool -> Ordering. In case f x y of ..., the checked scrutinee casts
-f x to that arrow before it applies y. The branch proof must use the
-same f, x and y, with a nominal cast on f x.
-
-The original cast can still have a coercion hole and unsolved argument
-multiplicity or result type. Follow nominal family equations at the
-head of its source until they expose the arrow. Unify that arrow with
-the original target and read the solved types. Keep the actual written
-scrutinee for execution. Core Lint and the interface reader recover the
-index from its cast and operands in GHC.Core.exprToNativeCaseIndex.
-
-After inlining, the lexical callback can also have a nominal result
-conversion supplied at its call site. GHC.Core.nativeIndexFunctionArgIndex
-checks that head before the first argument. See Note [Checking a cast
-retained callback] in GHC.Tc.Gen.App.
-Agda's with-abstraction equality also relates a matched result to the
-original computation (Norell, 2007; Cockx and Abel, ICFP 2018).
--}
-
-{- Note [Checked source call arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Classify a constructor argument only after ordinary expression and usage
-checking. Reconstruct a temporary Core spine from the actual Ids and DataCons.
-Use dataConWrapId, as the desugarer does. Never replace a real wrapper with its
-worker. exprToNativeIndex checks the closed domain, saturation, field domains
-and multiplicities. Closed native domains exclude constructor wrappers.
-
-The temporary spine is not executed. The original checked scrutinee remains
-in NativeCaseAlias and is desugared once. Parentheses, WpHole and a checked
-source expansion preserve that expression. Other wrappers, casts, type or
-evidence applications and opaque producers get no new admission. The separate
-signed beta path is described in Note [Signed source call beta].
-In particular, this classifier does not rerun tcRetainedArg on renamed syntax
-or emit argument usage a second time.
-
-Agda v2.8.0 Rules/Application.hs:774-808 checks the argument at the current
-domain before substitution (blob 82ba94ac864d19b947d4c92b9af252b0fe81347a).
-This supplies checking-order prior art, not a Haskell demand theorem.
-See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+Note [Checked source call arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'RCM_CaseCallArg' reconstructs a temporary Core spine from the checked 'HsExpr'
+'GhcTc' using 'dataConWrapId' so 'GHC.Core.exprToNativeCaseIndex' validates
+constructor wrappers, saturation, and domains without re-running expression or
+usage checks. See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
 -}
 
 {-
@@ -2500,7 +2321,7 @@ tcCheckExplicitTuple mults args tys
        checkTupSize (length args)
        go 1 mults args tys
   where
-    -- | Check fields and consume missing-field multiplicities in source order.
+    -- Check fields and consume missing-field multiplicities in source order.
     go :: Int -> [Mult] -> [HsTupArg GhcRn] -> [TcType] -> TcM [HsTupArg GhcTc]
     go _ [] [] [] = return []
     go i (mult : mults) (Missing{} : args) (arg_ty : tys)
@@ -3070,39 +2891,14 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
              retained_record _ = False
              supplied = mkNameEnv (zip (map idName sel_ids) rbinds)
 
-       ; case (relevant_cons, zip sel_ids rbinds) of
-           (RealDataCon con NE.:| [], _)
-             | let tc = dataConTyCon con
-             , [_] <- tyConDataCons tc
-             , Just (witness, payload_types) <- promotedRetainedFields con
-             , witness_field : payload_fields <- dataConFieldLabels con
-             , Just witness_bind <- lookupNameEnv supplied (flSelector witness_field)
-             -> expandRetainedWitnessUpd con witness payload_types witness_field payload_fields
-                  witness_bind supplied record_expr (map idName sel_ids) res_ty
-           (RealDataCon con NE.:| [], fields@(_ : _))
-             | let tc = dataConTyCon con
-             , [_] <- tyConDataCons tc
-             , Just (_witness, payload_types) <- promotedRetainedFields con
-             , witness_field : payload_fields <- dataConFieldLabels con
-             , not (flSelector witness_field `elemNameEnv` supplied)
-             -> expandParamRetainedRecordUpd con payload_types witness_field payload_fields
-                  fields supplied record_expr res_ty
-           (RealDataCon con NE.:| [], fields@((first, _) : _))
+       ; case relevant_cons of
+           RealDataCon con NE.:| []
              | retained_record relevant_con
-             , DepFunTy DepFunVisible receiver _ <- coreFullView (idType first)
-             , Just replacements <- traverse (retained_payload receiver) fields
-             -> expandRetainedRecordUpd con receiver replacements record_expr
+             -> expandRetainedRecordUpdate con (zip sel_ids rbinds) supplied record_expr res_ty
            _ | any retained_record relevant_cons
              -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
            _ -> expand_ordinary relevant_cons (map idName sel_ids) rbinds }
   where
-    retained_payload :: Id -> (Id, LHsRecUpdField GhcTc GhcRn)
-                     -> Maybe (Name, TcType, LHsExpr GhcRn)
-    retained_payload receiver (sel, L _ field)
-      | DepFunTy DepFunVisible binder _ <- coreFullView (idType sel)
-      , idType binder `tcEqType` idType receiver
-      = Just (idName sel, applyTypeToArgs (idType sel) [Core.Var receiver], hfbRHS field)
-      | otherwise = Nothing
 
     expand_ordinary relevant_cons@(relevant_con NE.:| _) upd_fld_names rbinds = do {
 
@@ -3252,132 +3048,109 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
                  ]
         ; return (ds_expr, ds_res_ty, RecordUpdCtxt relevant_cons upd_fld_names ex_tvs) }
 
--- | Build constructor patterns and rebuilt field arguments for a retained
--- record payload update.
-mkRetainedRecordUpdFields
+-- | Expand a record update on a retained constructor, handling witness-updating,
+-- parameterized witness-preserving, and monomorphic retained projection updates.
+-- See Note [Updating a retained record payload],
+-- Note [Replacing a retained record witness], and
+-- Note [Parameterized retained record updates].
+expandRetainedRecordUpdate
   :: DataCon
-  -> [(Name, TcType, LHsExpr GhcRn)]
-  -> TcM ([Name], [TcType], [LHsExpr GhcRn], [Name], [LPat GhcRn], [LHsExpr GhcRn])
-mkRetainedRecordUpdFields con replacements = do
-    let (fields, payload_types, values) = unzip3 replacements
-    names <- mapM (newSysName . nameOccName) fields
-    let updated = mkNameEnv (zip fields names)
-        field_arg fld = case lookupNameEnv updated (flSelector fld) of
-          Just name -> pure (genWildPat, genLHsVar name)
-          Nothing -> do
-            name <- newSysName (nameOccName (flSelector fld))
-            pure (genVarPat name, genLHsVar name)
-    (pats, args) <- mapAndUnzipM field_arg (dataConFieldLabels con)
-    pure (fields, payload_types, values, names, pats, args)
+  -> [(Id, LHsRecUpdField GhcTc GhcRn)]
+  -> NameEnv (LHsRecUpdField GhcTc GhcRn)
+  -> LHsExpr GhcRn
+  -> ExpRhoType
+  -> TcM (HsExpr GhcRn, TcType, HsCtxt)
+expandRetainedRecordUpdate con fields supplied record_expr res_ty
+  | [_] <- tyConDataCons tc
+  , Just (witness, payload_types) <- promotedRetainedFields con
+  , witness_field : payload_fields <- dataConFieldLabels con
+  , Scaled _ witness_orig_ty : payload_orig_tys <- orig_arg_tys
+  = case lookupNameEnv supplied (flSelector witness_field) of
+      Just witness_bind -> do
+        let p_fields = [(fld, lookupNameEnv supplied (flSelector fld)) | fld <- payload_fields]
+            missing  = [flLabel fld | (fld, Nothing) <- p_fields]
+            untouched_tys = [witness_orig_ty | not (null missing)]
+                         ++ [scaledThing t | ((_, Nothing), t) <- zip p_fields payload_orig_tys]
+            written = hfbRHS (unLoc witness_bind)
+        (in_tvs, extra_out_tvs, out_subst, out_tys) <-
+          instantiateRetainedRecordUnivs univ_tvs (closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys))
+        witness_val <- if null missing then pure written else do
+          mb_ok <- checkRetainedRecordWitness (idType witness) witness_field record_expr written
+          maybe (setSrcSpanA (getLoc (hfbLHS (unLoc witness_bind))) $
+                   failWithTc (TcRnRetainedQuantificationError
+                     (RetainedRecordUpdateWitness con_name (flLabel witness_field) missing)))
+                pure mb_ok
+        witness_nm <- newSysName (nameOccName (flSelector witness_field))
+        p_names    <- mapM (newSysName . nameOccName . flSelector) payload_fields
+        let in_rec_ty  = mkTyConApp tc (mkTyVarTys in_tvs)
+            out_rec_ty = mkTyConApp tc out_tys
+            witness'   = setIdType witness (substTy out_subst (idType witness))
+            old_pat    = genSimpleConPat con_name (replicate (1 + length p_names) genWildPat)
+            p_pat nm (_, Just _)  = genVarPat nm
+            p_pat nm (_, Nothing) = wrapGenSpan (LazyPat noExtField (genVarPat nm))
+            p_arg (_, Just b)     = hfbRHS (unLoc b)
+            p_arg (fld, Nothing)  = wrapGenSpan (genHsApps (flSelector fld) [record_expr])
+            sig = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
+                    mkVisFunTyManyU in_rec_ty $
+                    mkDepFunTy witness' $
+                    mkVisFunTysManyU [substTy out_subst (ty (TermVarTy witness')) | ty <- payload_types] out_rec_ty
+        ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
+        expanded  <- genRetainedRecordUpd sig (old_pat : genVarPat witness_nm : zipWith p_pat p_names p_fields)
+                       (genHsApps con_name (map genLHsVar (witness_nm : p_names)))
+                       (record_expr : witness_val : map p_arg p_fields)
+        pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) (map (idName . fst) fields) [])
 
--- | Expand payload updates at the receiver's stored witness.
--- See Note [Updating a retained record payload].
-expandRetainedRecordUpd :: DataCon -> Id -> [(Name, TcType, LHsExpr GhcRn)] -> LHsExpr GhcRn
-                        -> TcM (HsExpr GhcRn, TcType, HsCtxt)
-expandRetainedRecordUpd con receiver replacements record_expr = do
-    (fields, payload_types, values, names, pats, args) <-
-      mkRetainedRecordUpdFields con replacements
-    let con_name = dataConName con
-        result_ty = idType receiver
-        signature = mkDepFunTy receiver (mkVisFunTysManyU payload_types result_ty)
-    expanded <- genRetainedRecordUpd signature
-                  (genSimpleConPat con_name pats : map genVarPat names)
-                  (genHsApps con_name args) (record_expr : values)
-    pure (expanded, result_ty, RecordUpdCtxt (RealDataCon con NE.:| []) fields [])
+      Nothing | not (null fields) -> do
+        witness_sel   <- tcLookupId (flSelector witness_field)
+        witness_table <- maybe (failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate))
+                               pure (sourceTableId_maybe witness_sel)
+        let untouched_tys = witness_orig_ty :
+              [ scaledThing t | (pf, t) <- zip payload_fields payload_orig_tys
+                              , not (flSelector pf `elemNameEnv` supplied) ]
+        (in_tvs, extra_out_tvs, out_subst, out_tys) <-
+          instantiateRetainedRecordUnivs univ_tvs (closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys))
+        receiver <- mkSysLocalM (fsLit "record") ManyTy (mkTyConApp tc (mkTyVarTys in_tvs))
+        let witness_idx  = mkTyConApp witness_table (mkTyVarTys in_tvs ++ [TermVarTy receiver])
+            field_ty_env = mkNameEnv [ (flSelector pf, substTy out_subst (b witness_idx))
+                                     | (pf, b) <- zip payload_fields payload_types ]
+        replacements <- maybe (failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)) pure $
+          traverse (\(sel, L _ f) -> (\t -> (idName sel, t, hfbRHS f)) <$> lookupNameEnv field_ty_env (idName sel)) fields
+        ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
+        finish_keep_witness (in_tvs ++ extra_out_tvs) receiver (mkTyConApp tc out_tys) ds_res_ty replacements
 
--- | Expand payload updates at the receiver's stored witness for nullary or parameterized records.
--- See Note [Updating a retained record payload] and
--- Note [Parameterized retained record updates].
-expandParamRetainedRecordUpd :: DataCon -> [Type -> Type] -> FieldLabel -> [FieldLabel]
-                             -> [(Id, LHsRecUpdField GhcTc GhcRn)]
-                             -> NameEnv (LHsRecUpdField GhcTc GhcRn)
-                             -> LHsExpr GhcRn -> ExpRhoType
-                             -> TcM (HsExpr GhcRn, TcType, HsCtxt)
-expandParamRetainedRecordUpd con payload_types witness_field payload_fields fields supplied record_expr res_ty = do
-    witness_sel <- tcLookupId (flSelector witness_field)
-    witness_table <- case sourceTableId_maybe witness_sel of
-      Just tbl -> pure tbl
-      Nothing  -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
-    let tc = dataConTyCon con
-        (univ_tvs, _, _, _, Scaled _ witness_orig_ty : payload_orig_tys, _) = dataConFullSig con
-        untouched_tys = witness_orig_ty :
-          [ scaledThing orig_ty
-          | (pf, orig_ty) <- zip payload_fields payload_orig_tys
-          , not (flSelector pf `elemNameEnv` supplied) ]
-        pinned_tvs = closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys)
-    (in_tvs, extra_out_tvs, out_subst, out_tys) <- instantiateRetainedRecordUnivs univ_tvs pinned_tvs
-    let in_record_ty  = mkTyConApp tc (mkTyVarTys in_tvs)
-        out_record_ty = mkTyConApp tc out_tys
-    receiver <- mkSysLocalM (fsLit "record") ManyTy in_record_ty
-    let witness_index = mkTyConApp witness_table (mkTyVarTys in_tvs ++ [TermVarTy receiver])
-        field_ty_env = mkNameEnv
-          [ (flSelector pf, substTy out_subst (builder witness_index))
-          | (pf, builder) <- zip payload_fields payload_types ]
-        resolve_field (sel, L _ field) = do
-          ty <- lookupNameEnv field_ty_env (idName sel)
-          pure (idName sel, ty, hfbRHS field)
-    replacements <- case traverse resolve_field fields of
-      Just rs -> pure rs
       Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
-    (upd_fields, upd_payload_tys, values, names, pats, args) <-
-      mkRetainedRecordUpdFields con replacements
-    let con_name = dataConName con
-        signature = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
-                      mkDepFunTy receiver (mkVisFunTysManyU upd_payload_tys out_record_ty)
-    ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
-    expanded <- genRetainedRecordUpd signature
-                  (genSimpleConPat con_name pats : map genVarPat names)
-                  (genHsApps con_name args) (record_expr : values)
-    pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) upd_fields [])
 
--- | Check every replacement payload at the new witness.
--- See Note [Replacing a retained record witness] and
--- Note [Parameterized retained record updates].
-expandRetainedWitnessUpd :: DataCon -> Id -> [Type -> Type] -> FieldLabel -> [FieldLabel]
-                         -> LHsRecUpdField GhcTc GhcRn -> NameEnv (LHsRecUpdField GhcTc GhcRn)
-                         -> LHsExpr GhcRn -> [Name] -> ExpRhoType
-                         -> TcM (HsExpr GhcRn, TcType, HsCtxt)
-expandRetainedWitnessUpd con witness payload_types witness_field payload_fields witness_bind supplied record_expr updated res_ty = do
-    let tc = dataConTyCon con
-        (univ_tvs, _, _, _, Scaled _ witness_orig_ty : payload_orig_tys, _) = dataConFullSig con
-        fields = [(field, lookupNameEnv supplied (flSelector field)) | field <- payload_fields]
-        missing = [flLabel field | (field, Nothing) <- fields]
-        untouched_tys =
-          [witness_orig_ty | not (null missing)] ++
-          [ scaledThing orig_ty
-          | ((_, Nothing), orig_ty) <- zip fields payload_orig_tys ]
-        pinned_tvs = closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys)
-        payload_value (_, Just binding) = hfbRHS (unLoc binding)
-        payload_value (field, Nothing) = wrapGenSpan (genHsApps (flSelector field) [record_expr])
-        payload_pat name (_, Just _) = genVarPat name
-        payload_pat name (_, Nothing) = wrapGenSpan (LazyPat noExtField (genVarPat name))
-        con_name = dataConName con
-        written = hfbRHS (unLoc witness_bind)
-        witness_label = flLabel witness_field
-    (in_tvs, extra_out_tvs, out_subst, out_tys) <- instantiateRetainedRecordUnivs univ_tvs pinned_tvs
-    witness_value <- if null missing then pure written else do
-      reusable <- checkRetainedRecordWitness (idType witness) witness_field record_expr written
-      case reusable of
-        Just value -> pure value
-        Nothing -> setSrcSpanA (getLoc (hfbLHS (unLoc witness_bind))) $
-          failWithTc (TcRnRetainedQuantificationError
-            (RetainedRecordUpdateWitness con_name witness_label missing))
-    witness_name <- newSysName (nameOccName (flSelector witness_field))
-    names <- mapM (newSysName . nameOccName . flSelector) payload_fields
-    let in_record_ty  = mkTyConApp tc (mkTyVarTys in_tvs)
-        out_record_ty = mkTyConApp tc out_tys
-        witness' = setIdType witness (substTy out_subst (idType witness))
-        old_pat = genSimpleConPat con_name (replicate (1 + length names) genWildPat)
-        signature = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
-          mkVisFunTyManyU in_record_ty $
-          mkDepFunTy witness'
-            (mkVisFunTysManyU [substTy out_subst (ty (TermVarTy witness')) | ty <- payload_types] out_record_ty)
-        arguments = record_expr : witness_value : map payload_value fields
-        patterns = old_pat : genVarPat witness_name : zipWith payload_pat names fields
-    ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
-    expanded <- genRetainedRecordUpd signature patterns
-                  (genHsApps con_name (map genLHsVar (witness_name : names))) arguments
-    pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) updated [])
+  | (first_sel, _) : _ <- fields
+  , DepFunTy DepFunVisible receiver _ <- coreFullView (idType first_sel)
+  , Just replacements <- traverse (mono_field receiver) fields
+  = finish_keep_witness [] receiver (idType receiver) (idType receiver) replacements
+
+  | otherwise
+  = failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
+  where
+    tc       = dataConTyCon con
+    con_name = dataConName con
+    (univ_tvs, _, _, _, orig_arg_tys, _) = dataConFullSig con
+
+    mono_field receiver (sel, L _ f)
+      | DepFunTy DepFunVisible b _ <- coreFullView (idType sel)
+      , idType b `tcEqType` idType receiver
+      = Just (idName sel, applyTypeToArgs (idType sel) [Core.Var receiver], hfbRHS f)
+      | otherwise = Nothing
+
+    finish_keep_witness qtvs receiver out_rec_ty ds_res_ty replacements = do
+      let (upd_fields, upd_tys, values) = unzip3 replacements
+      names <- mapM (newSysName . nameOccName) upd_fields
+      let updated = mkNameEnv (zip upd_fields names)
+          mk_fld fld = case lookupNameEnv updated (flSelector fld) of
+            Just nm -> pure (genWildPat, genLHsVar nm)
+            Nothing -> (\nm -> (genVarPat nm, genLHsVar nm)) <$> newSysName (nameOccName (flSelector fld))
+      (pats, args) <- mapAndUnzipM mk_fld (dataConFieldLabels con)
+      let sig = mkSpecForAllTys (map (unmatchableDataConTy,) qtvs) $
+                  mkDepFunTy receiver (mkVisFunTysManyU upd_tys out_rec_ty)
+      expanded <- genRetainedRecordUpd sig (genSimpleConPat con_name pats : map genVarPat names)
+                    (genHsApps con_name args) (record_expr : values)
+      pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) upd_fields [])
 
 -- | Use a matching expected result type directly when available; otherwise allocate metavariables.
 retainedRecordUpdResTy :: TyCon -> [TyVar] -> ExpRhoType -> TcM TcType
@@ -3437,8 +3210,8 @@ checkRetainedRecordWitness domain field record_expr written
   , unLoc (foLabel occurrence) == field_name
   = tryTcDiscardingErrs (pure Nothing) $ runMaybeT $ do
       let old = wrapGenSpan (genHsApps field_name [record_expr])
-      (old_core, _) <- liftMaybeT (tcRetainedArg domain old)
-      (new_core, value) <- liftMaybeT (tcRetainedArg domain written)
+      (old_core, _, _) <- liftMaybeT (tcRetainedArg domain old)
+      (new_core, _, _) <- liftMaybeT (tcRetainedArg domain written)
       old_index <- MaybeT (pure (Core.retainedArgIndex old_core))
       new_index <- MaybeT (pure (Core.retainedArgIndex new_core))
       givens <- liftMaybeT getNativeGivens
@@ -3448,7 +3221,7 @@ checkRetainedRecordWitness domain field record_expr written
               (right `tcEqType` old_index && left `tcEqType` new_index)
             | otherwise = False
       guard (old_index `tcEqType` new_index || any matches givens)
-      pure value
+      pure written
   | otherwise = pure Nothing
   where
     rec_sel_head e = case unLoc (stripParensLHsExpr e) of
@@ -3469,70 +3242,24 @@ genRetainedRecordUpd signature pats rhs args = do
 
 {- Note [Updating a retained record payload]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Use the same receiver to instantiate all selected payload types. For
-example, expand @p { namedFlags = ys, namedLetters = xs }@ as
-@update p ys xs@, with a generated local binding of the following shape:
+'expandRetainedRecordUpdate' expands payload-only updates at the receiver's
+stored witness via a local @foreach (r :: Rec) -> ...@ updater that keeps
+untouched fields lazy. See Note [Replacing a retained record witness].
 
-  update :: foreach (r :: NamedColumns)
-         -> Vec Bool (storedLength r) -> Vec Char (storedLength r) -> NamedColumns
-  update (NamedColumns n _ _) ys xs = NamedColumns n xs ys
+Note [Replacing a retained record witness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a record update writes the witness field, 'expandRetainedRecordUpdate'
+checks replacement payloads at @foreach (w :: W) -> ...@ in constructor field
+order. Omitted payloads may be reused lazily via their old projections only
+when 'checkRetainedRecordWitness' proves that the written witness equals the
+receiver's witness projection (directly or under a lexical nominal Given).
 
-Check the replacements at the caller's receiver. The retained match then
-refines each replacement type to the constructor's witness. Reuse the
-witness and any untouched fields without forcing their values. Read the
-checked selector types after field disambiguation to use the same witness
-projection as source code. See
-Note [Replacing a retained record witness] for updates of the witness.
--}
-
-{- Note [Replacing a retained record witness]
+Note [Parameterized retained record updates]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When the update writes the witness, check each payload at the new
-witness. For a record with two payloads, generate the following function
-and apply it to the receiver and replacements:
-
-  update :: NamedColumns -> foreach (n :: Nat)
-         -> Vec Char n -> Vec Bool n -> NamedColumns
-  update (NamedColumns _ _ _) n xs ys = NamedColumns n xs ys
-
-Order the arguments by the constructor fields, even if the source lists
-them in a different order. The retained application checks each payload
-at the new witness. The old constructor pattern demands the receiver
-but keeps its fields lazy. The replacement patterns follow ordinary
-argument demand, including Strict. Keep the arguments unrestricted, as
-in the ordinary record update path.
-
-An omitted payload can use its old projection when the new witness is
-the resolved witness selector and the two elaborated indices agree. A
-scoped nominal Given can also establish this equality. The retained
-argument checker validates the selector's source table. Pass the actual
-written witness to the reconstruction. Check each old payload projection
-at its new type through ordinary argument checking. Use a lazy pattern
-for an omitted field, including under Strict. Restrict the receiver to
-a variable so the old projections share the original record. If this
-check cannot reuse the old fields, report them at the written witness.
--}
-
-{- Note [Parameterized retained record updates]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A single-constructor retained record can have universal type parameters:
-
-  data Columns a = Columns { storedLength :: Nat, cells :: Vec a storedLength }
-
-Quantify the generated local updater over fresh input binders for all
-universal parameters. If a universal parameter occurs in an omitted
-field (including the witness field when the update omits the witness),
-pin its output type to the input binder. Give every remaining universal
-parameter a fresh output binder so the update can change that parameter
-consistently across all updated fields:
-
-  update :: forall a b. foreach (r :: Columns a)
-         -> Vec b (storedLength r) -> Columns b
-  update (Columns n _) xs = Columns n xs
-
-Instantiate the expected result type with fresh metavariables, as in
-Note [Unifying result types in tcRecordUpd], so the call site unifies
-both the receiver parameters and the updated result parameters.
+'instantiateRetainedRecordUnivs' pins universal parameters mentioned in omitted
+fields (closed over kind dependencies) to their input binders and allocates
+fresh output binders for unpinned parameters so updates can change element
+types across updated fields.
 -}
 
 

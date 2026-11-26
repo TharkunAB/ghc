@@ -45,16 +45,6 @@ NativeRetainedPackageDepBad.hs:31:54: error: [GHC-83865]
     • Relevant bindings include
         xs :: Vec Int m (bound at NativeRetainedPackageDepBad.hs:31:18)
 
-NativeRetainedPackageDepBad.hs:31:54: error: [GHC-83865]
-    • Couldn't match type ‘m’ with ‘n3’
-      Expected: Vec Int n3
-        Actual: Vec Int m
-    • In the second argument of ‘PackVec’, namely ‘xs’
-      In the first argument of ‘keepPkg’, namely ‘(PackVec n xs)’
-      In the expression: keepPkg (PackVec n xs)
-    • Relevant bindings include
-        xs :: Vec Int m (bound at NativeRetainedPackageDepBad.hs:31:18)
-
 NativeRetainedPackageDepBad.hs:34:38: error: [GHC-83865]
     • Couldn't match type ‘_1’ with ‘Z’
       Expected: p Z
