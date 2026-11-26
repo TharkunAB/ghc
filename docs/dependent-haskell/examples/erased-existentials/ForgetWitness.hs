@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeApplications #-}
 
 -- | Keep the indexed payload and discard the runtime witness.
 module ForgetWitness (Flag, Retained, Hidden, forget, retained, unknown, observe) where

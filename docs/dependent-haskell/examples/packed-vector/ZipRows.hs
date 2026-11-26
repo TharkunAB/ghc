@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies, TypeOperators #-}
 
 module ZipRows (Min, countWithHeaderStep, zipMinimum, zipRows) where
 

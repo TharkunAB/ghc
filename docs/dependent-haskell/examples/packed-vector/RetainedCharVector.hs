@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 -- | Store a runtime length with a vector of Char at that length.
 module RetainedCharVector
     (CharVector(..), lengthOf, cellsOf, sample, bottomPayload, bottomFields) where

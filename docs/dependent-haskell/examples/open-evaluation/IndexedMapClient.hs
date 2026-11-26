@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module IndexedMapClient (mappedCells) where
 
 import IndexedMap (familyInput, getCells, mapIndexed, matchableInput)

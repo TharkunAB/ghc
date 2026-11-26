@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, PolyKinds, RankNTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, PolyKinds, RankNTypes #-}
 -- | Store a witness and a payload indexed by that witness.
 module DependentPair (DPair(..), Consumer, first, withPair) where
 

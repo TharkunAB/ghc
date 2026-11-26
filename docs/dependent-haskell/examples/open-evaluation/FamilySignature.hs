@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, StandaloneKindSignatures, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, StandaloneKindSignatures, TypeFamilies #-}
 -- | Use a signed local function in an imported family equation.
 module FamilySignature (observed, directObserved) where
 import Data.Kind (Type)

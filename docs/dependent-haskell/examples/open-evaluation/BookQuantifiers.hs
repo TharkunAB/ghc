@@ -1,9 +1,9 @@
 {-# LANGUAGE DataKinds, DependentTypes, GADTs, ListTuplePuns, PolyKinds #-}
 {-# LANGUAGE RankNTypes, ScopedTypeVariables, TypeAbstractions, TypeApplications #-}
--- | Executable Wave 4B through Wave 8 examples for Proposal #378 quantifiers,
+-- | Executable examples for Proposal #378 quantifiers,
 -- certified Num numerals, nested foreach patterns, retained GADTs, @Pack,
 -- explicit data heralds, polymorphic nested source domains, and dependent-base interop.
-module BookWave8Proposal378
+module BookQuantifiers
   ( Peano (..)
   , plusPeano
   , autoNumPlus

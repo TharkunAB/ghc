@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, KindSignatures, ScopedTypeVariables #-}
 module OpenSource (x, y, z, implicitlyBound, explicitlyBound, first, second, repeated, routedFirst, routedSecond, tupleFirst, tupleSecond, workerFirst, ignoresRigidPair) where
 
 import Data.Kind (Type)

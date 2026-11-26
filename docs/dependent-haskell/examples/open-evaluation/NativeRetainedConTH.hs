@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TemplateHaskell #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TemplateHaskell #-}
 -- | Store a value whose type depends on a preceding runtime argument.
 module NativeRetainedConTH (Stored(..), renderStored, InlineStored(..), storeInline) where
 

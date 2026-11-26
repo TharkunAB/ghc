@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, FlexibleInstances, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, FlexibleInstances, NoDependentTypes #-}
 module Row (Row(..)) where
 
 -- | A row with two fixed fields and a mapped element.

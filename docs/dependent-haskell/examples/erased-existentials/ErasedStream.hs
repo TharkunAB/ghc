@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, ScopedTypeVariables #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, ScopedTypeVariables #-}
 module ErasedStream (Stream, fromList, oddThrough, toList, mapToList) where
 
 import Data.Kind (Type)

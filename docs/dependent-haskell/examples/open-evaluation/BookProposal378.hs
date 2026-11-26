@@ -3,7 +3,7 @@
 -- | Proposal #378 umbrella syntax, %U type-lambda captures, same-module
 -- context/closure staging, inline GADT foreach arguments, Type large eliminations,
 -- and dependent-base list/foldr/matchability laws.
-module BookWave3Proposal378
+module BookProposal378
   ( SumTwo
   , peanoToInt
   , plusAssocProd

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitForAll #-}
 {-# LANGUAGE TypeFamilies #-}
 module FamilyCasePayload (ChoosePayload, KeepPayload, Dispatch, Count(..), Down, Width) where
 

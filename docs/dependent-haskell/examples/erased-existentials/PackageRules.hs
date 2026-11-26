@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 
 module PackageRules (Hidden, hide, open, roundTrip, applyHidden) where
 

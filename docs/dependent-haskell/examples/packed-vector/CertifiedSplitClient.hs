@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeApplications #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module CertifiedSplitClient (splitObservation, checkDemand, checkedObservation, checkBounds, pairedObservation, mixedObservation) where
 

@@ -2497,6 +2497,7 @@ of ``-W(no-)*``.
     :shortdesc: warn when type and term bindings share a name in one scope
     :type: dynamic
     :reverse: -Wno-pun-bindings
+    :since: 10.2
     :default: off
 
     Warn about type and term definitions with the same name in a module's
@@ -2527,6 +2528,7 @@ of ``-W(no-)*``.
     :shortdesc: warn about uses that rely on separate type and term namespaces
     :type: dynamic
     :reverse: -Wno-pun-uses
+    :since: 10.2
     :default: off
 
     Warn about uses of a global name when a name from the other namespace

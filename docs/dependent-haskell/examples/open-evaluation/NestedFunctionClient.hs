@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes, PolyKinds, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE NoDependentTypes, PolyKinds, TypeFamilies, TypeOperators #-}
 
 module NestedFunctionClient (binaryChoice, conjunction) where
 

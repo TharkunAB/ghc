@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneKindSignatures, TypeApplications, TypeOperators #-}
 module FinitePosition (FinView(..), viewFin, constructedViews, zeroView, zeroViewInlinable) where
 

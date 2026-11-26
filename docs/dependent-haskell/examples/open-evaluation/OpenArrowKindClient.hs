@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 {-# LANGUAGE PolyKinds, TypeApplications, TypeFamilies, TypeOperators #-}
 module OpenArrowKindClient (openKindRows, main) where
 import OpenArrowKind (OpenKind)

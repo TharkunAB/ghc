@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}
 module ComputedPairProof (Selected, SelectedRight, proof, proofRight) where
 
 import qualified ComputedPair as W

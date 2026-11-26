@@ -1,6 +1,6 @@
 {-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 {-# LANGUAGE DataKinds, DerivingStrategies, ExplicitNamespaces, FlexibleContexts, RequiredTypeArguments, TypeApplications #-}
-{-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, NoExperimentalDependentTypes, PartialTypeSignatures, QuantifiedConstraints, RankNTypes, ScopedTypeVariables, StandaloneDeriving, TypeFamilies, TypeOperators, UndecidableInstances #-}
+{-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, NoDependentTypes, PartialTypeSignatures, QuantifiedConstraints, RankNTypes, ScopedTypeVariables, StandaloneDeriving, TypeFamilies, TypeOperators, UndecidableInstances #-}
 module ConstrainedElementsClient (advanceCursor, showAdvance, showRemainder, splitCollection, Buffered(..), firstBuffered, constrainedElements, annotatedElement, explicitElements, renderField, formatField, renderKnownFields, retainedMaybeDomain, aliasedReflection, runReflection, partialElement, ViewsAfter) where
 
 import ConstrainedElements (Cursor(..), PrintableCursor, Collection(..), Allowed, Collects(..), BufferSource(..), BackingDomain, FieldKey, Field(..), applyField, field, withField, Reflection, reflectMaybe, MaybeBoolEcho, AtNothing, ViewsFor)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds, ScopedTypeVariables, TypeAbstractions #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds, ScopedTypeVariables, TypeAbstractions #-}
 {-# LANGUAGE ExplicitNamespaces, RequiredTypeArguments #-}
 module VisibleRuleArguments (Reading(..), keepReading, keepAfter, TaggedReading(..), keepTagged, keepRequired, keepTwoRequired) where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, GADTs, NoExperimentalDependentTypes, RankNTypes, RequiredTypeArguments, ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns, DataKinds, GADTs, NoDependentTypes, RankNTypes, RequiredTypeArguments, ScopedTypeVariables #-}
 
 -- | Construct and open imported dependent pairs in ordinary Haskell.
 module ListVectorClient

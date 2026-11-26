@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs #-}
 -- | Define the two projections in the same declaration group.
 module RetainedCharLocal (localLength, localCells) where
 

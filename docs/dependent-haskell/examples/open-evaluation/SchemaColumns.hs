@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeFamilies, UndecidableInstances #-}
 -- | Add an error schema to the open family defined by the row library.
 module SchemaColumns (Callable, Checked) where
 

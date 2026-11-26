@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, StandaloneKindSignatures, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, StandaloneKindSignatures, TypeFamilies #-}
 module PreludeZipWithSource (Zipped, PairHeads, Minimum) where
 
 import GHC.Exts (U)

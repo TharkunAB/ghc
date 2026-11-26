@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeFamilies, TypeOperators #-}
 module GroundProof (lateProof) where
 
 import Data.Type.Equality ((:~:)(Refl))

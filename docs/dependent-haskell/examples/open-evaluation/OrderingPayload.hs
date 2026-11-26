@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 {-# LANGUAGE TypeFamilies #-}
 module OrderingPayload (showComparison) where
 

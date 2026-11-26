@@ -1284,6 +1284,7 @@ messages and in GHCi:
     :type: dynamic
     :reverse: -fno-print-explicit-matchabilities
     :category: verbosity
+    :since: 10.2
 
     This flag displays matchabilities that GHC normally omits, including an
     unmatchable arrow that would appear as a bare arrow. For example, use it

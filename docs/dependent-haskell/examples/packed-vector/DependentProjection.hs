@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, PolyKinds #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, PolyKinds #-}
 module DependentProjection (second) where
 
 import DependentPair (DPair(..), first)

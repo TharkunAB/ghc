@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 module CompareOptional (readJust) where
 
 import CompareAt (Result, Witness(..), decideOptional)

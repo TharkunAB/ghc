@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExplicitForAll, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, ExplicitForAll, GADTs, NoDependentTypes #-}
 
 module WitnessedBatch
     ( Batch(..), build, partial, partialTail, firstWidth

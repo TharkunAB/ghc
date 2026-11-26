@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeDropWhileProof (prefixAndSuffix, rejoinPair) where
 

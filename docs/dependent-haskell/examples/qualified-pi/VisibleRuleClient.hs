@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitNamespaces, NoExperimentalDependentTypes, RequiredTypeArguments, TypeApplications #-}
+{-# LANGUAGE ExplicitNamespaces, NoDependentTypes, RequiredTypeArguments, TypeApplications #-}
 module VisibleRuleClient (readAt, readAfter, readTagged, readRequired, readTwoRequired) where
 
 import VisibleRuleArguments (Reading(..), keepReading, keepAfter, TaggedReading(..), keepTagged, keepRequired, keepTwoRequired)

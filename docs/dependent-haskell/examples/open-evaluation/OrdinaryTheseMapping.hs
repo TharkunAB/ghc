@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module OrdinaryTheseMapping (report, reportAt) where
 
 import These (These(..))

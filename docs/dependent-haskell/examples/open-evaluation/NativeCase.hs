@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll, PolyKinds, RankNTypes, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitForAll, PolyKinds, RankNTypes, TypeFamilies #-}
 -- | Select a type from the constructor of a type-level scrutinee.
 module NativeCase
   ( F, ByType, ElementOrSelf, Field, Same, Capture, Braces, roadmap

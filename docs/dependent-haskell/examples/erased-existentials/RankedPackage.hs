@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, ImpredicativeTypes, RankNTypes, RequiredTypeArguments, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, ImpredicativeTypes, RankNTypes, RequiredTypeArguments, ScopedTypeVariables, TypeApplications #-}
 
 module RankedPackage
     ( runCallback, runPair, runBuilder, CallbackPair, pairFor

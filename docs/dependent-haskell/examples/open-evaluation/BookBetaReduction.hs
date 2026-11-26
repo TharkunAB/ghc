@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, EmptyCase, GADTs, PolyKinds #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, DependentTypes, ListTuplePuns, EmptyCase, GADTs, PolyKinds #-}
 {-# LANGUAGE Modifiers, RankNTypes, StandaloneKindSignatures, TypeAbstractions, TypeApplications, TypeOperators #-}
 -- | Progress and capture-avoiding beta reduction for the PLFH DeBruijn terms.
 module BookBetaReduction (Step(..), Progress(..), progress, progressExamples,

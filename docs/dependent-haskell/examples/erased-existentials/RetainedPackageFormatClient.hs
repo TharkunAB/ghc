@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DeepSubsumption, MonoLocalBinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, DeepSubsumption, MonoLocalBinds, NoDependentTypes #-}
 {-# LANGUAGE RankNTypes, ScopedTypeVariables, TypeApplications #-}
 
 module RetainedPackageFormatClient (formatPackage) where

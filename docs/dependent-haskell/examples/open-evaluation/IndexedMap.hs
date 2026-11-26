@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, FlexibleInstances, Modifiers, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, FlexibleInstances, Modifiers, PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneKindSignatures, TypeAbstractions, TypeApplications, TypeFamilies #-}
 module IndexedMap where
 

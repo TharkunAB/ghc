@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 
 module ClosedTableLibrary (flipBit, Lamp(..), Signal(..), signal) where
 

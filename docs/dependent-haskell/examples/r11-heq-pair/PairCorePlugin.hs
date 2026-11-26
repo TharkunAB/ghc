@@ -15,7 +15,7 @@ import GHC.Types.Var (mkCoVar)
 
 plugin :: Plugin
 plugin = defaultPlugin
-  { installCoreToDos = \_ todos -> pure (CoreDoPluginPass "R11 scoped HEq prototype" check : todos)
+  { installCoreToDos = \_ todos -> pure (CoreDoPluginPass "Scoped HEq pair check" check : todos)
   , pluginRecompile = purePlugin
   }
 
@@ -135,10 +135,10 @@ freshCoVar label typ = do
 
 accepted :: LintConfig -> (String, CoreExpr) -> CoreM ()
 accepted config (label, expr) = case lintExpr config expr of
-  Nothing -> putMsgS ("R11 accepted " ++ label)
-  Just messages -> pprPanic ("R11 rejected " ++ label) (vcat (bagToList messages))
+  Nothing -> putMsgS ("HEqPair accepted " ++ label)
+  Just messages -> pprPanic ("HEqPair rejected " ++ label) (vcat (bagToList messages))
 
 rejected :: LintConfig -> (String, CoreExpr) -> CoreM ()
 rejected config (label, expr) = case lintExpr config expr of
-  Nothing -> pprPanic ("R11 accepted " ++ label) (ppr expr)
-  Just messages -> putMsg (text ("R11 rejected " ++ label) $$ vcat (bagToList messages))
+  Nothing -> pprPanic ("HEqPair accepted " ++ label) (ppr expr)
+  Just messages -> putMsg (text ("HEqPair rejected " ++ label) $$ vcat (bagToList messages))

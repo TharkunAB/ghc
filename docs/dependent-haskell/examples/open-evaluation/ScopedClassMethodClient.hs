@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables #-}
 module ScopedClassMethodClient (twoDictionaries, ordinaryChoices) where
 
 import ScopedClassMethod

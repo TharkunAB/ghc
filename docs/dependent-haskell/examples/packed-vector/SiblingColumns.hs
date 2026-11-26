@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 -- | Two vectors that share one stored length.
 module SiblingColumns (Columns(..), size, letters, flags, bottomFields) where
 

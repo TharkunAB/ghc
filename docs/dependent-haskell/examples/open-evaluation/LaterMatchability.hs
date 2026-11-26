@@ -1,5 +1,5 @@
 {-# LANGUAGE KindSignatures, Modifiers, PolyKinds, StandaloneKindSignatures, TypeFamilies, TypeOperators #-}
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE GADTs, RankNTypes, TypeAbstractions, TypeApplications #-}
 {-# LANGUAGE FlexibleInstances, MultiParamTypeClasses #-}
 module LaterMatchability where

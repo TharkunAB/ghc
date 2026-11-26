@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers #-}
 {-# LANGUAGE RankNTypes, RequiredTypeArguments, ScopedTypeVariables, TypeApplications #-}
 module PreludeFilterRuntime
     ( BooleanResult(..), booleanResult, decideBy, negationResult

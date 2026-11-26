@@ -1,6 +1,6 @@
 # Derive a closed family from a checked Char case
 
-Run `./check.sh ABS_GHC ABS_LIBDIR` with this fork's compiler and
+Run `./check.sh ABS_GHC ABS_LIBDIR` with GHC and its
 matching library directory. The script finds the checked-in
 `SimpleUpperCaseMapping.hs` relative to this directory. An optional
 third argument overrides that source path. The script builds in a

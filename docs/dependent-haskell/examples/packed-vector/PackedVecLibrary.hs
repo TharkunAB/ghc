@@ -2,7 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE ExplicitNamespaces #-}
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE NoStarIsType #-}
@@ -172,7 +172,6 @@ the head. An extra cons suffices for rejection.
 packList uses the length of the input itself. sourceVector supplies a
 vector at that index, so no equality test is needed. Keep both fields
 lazy so that headPacked can read the first cell without counting the tail.
-See docs/dependent-haskell/REFERENCES.md#checking-a-list-at-a-requested-length.
 -}
 
 -- | Evidence that the first length is at most the second length.
@@ -352,7 +351,6 @@ The recursive witness forces the whole first length before returning Sum.
 A finite first length can leave the second length and vector fields lazy.
 The proof is an ordinary lifted field. Matching Refl forces it. Haskell
 permits bottom and cyclic inputs; this is not a totality or erasure claim.
-See docs/dependent-haskell/REFERENCES.md#computed-length-append-next-source-probe.
 -}
 
 -- | Transport addition across a successor in its second operand.
@@ -398,7 +396,6 @@ The package leaves both fields lazy. Demanding the reversed vector first
 demands the whole finite Nat spine through rightZero, then the vector spine.
 Each addSucc can inspect the remaining Nat spine again. This is not a linear
 runtime claim. Proofs are ordinary lifted values and matching Refl forces them.
-See REFERENCES.md#length-preserving-reverse-next-source-probe for pinned sources.
 -}
 
 -- | Build a vector from a runtime length.
@@ -506,9 +503,6 @@ zipVec application. Its laziness concerns vectors, pair components, and tails,
 not the compared indices. Finite consistent inputs have the stated alignment.
 Partial and cyclic lengths need separate demand checks and can make comparison
 diverge.
-See REFERENCES.md#runtime-equality-and-aligned-zip-next-source-probe for the
-pinned Agda equality and vector operations. Their proof erasure and totality
-rules do not establish Haskell's evaluation behavior.
 -}
 
 {- Note [Uncons with a runtime predecessor]
@@ -522,8 +516,6 @@ Returning Just leaves the predecessor, head, and tail fields lazy. The finite
 drain follows the stored predecessors. Its functional specification assumes
 finite consistent lengths and vectors. Separate bottom and cyclic checks
 describe demand; they do not establish general infinite productivity.
-See REFERENCES.md#source-vector-uncons for Agda's vector operations and
-dependent context generalization.
 -}
 
 -- | Match and count a stored proof without evaluating the vector or length.
@@ -554,9 +546,7 @@ Ordinary aliases do not establish equality between distinct runtime indices.
 
 Nested constructor patterns evaluate only the selected payload or proof.
 Bare and wildcard fields remain lazy. Guards and later clauses retain their
-source order. Agda supplies constructor telescope and case-tree prior art;
-it does not supply Haskell's evaluation rules. See
-REFERENCES.md#source-package-patterns.
+source order.
 -}
 
 -- | Filter a vector and store its computed length with the result.
@@ -601,7 +591,6 @@ increases only the upper bound when an element is rejected.
 Agda marks its bound field irrelevant. The Haskell proof is an ordinary
 lazy field. Package and vector observations need not evaluate it. A bound
 interpretation requires terminating indices and a terminating proof.
-See REFERENCES.md#source-vector-filter for the pinned sources.
 -}
 
 {- Note [Filtering a packed vector]
@@ -609,7 +598,7 @@ See REFERENCES.md#source-vector-filter for the pinned sources.
 Agda's Data.Vec.filter returns Vec≤ with a hidden output length, a vector
 at that length, and a bound proof. PackVec stores the first two components.
 The retained branch constructs S n and VCons together. The rejected branch
-returns the recursive package. See REFERENCES.md#source-vector-filter.
+returns the recursive package.
 
 This implementation inspects each predicate before the recursive result.
 It scans the finite input spine before returning its package. Retained

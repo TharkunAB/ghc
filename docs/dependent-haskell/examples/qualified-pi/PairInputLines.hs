@@ -1,4 +1,4 @@
-{-# LANGUAGE Haskell2010, NoExperimentalDependentTypes #-}
+{-# LANGUAGE Haskell2010, NoDependentTypes #-}
 
 -- | Pair the corresponding characters of two input lines.
 module Main (main) where

@@ -69,7 +69,7 @@ so the closed family's ordinary apartness check can keep it stuck on a skolem.
 renderUpper :: [(Char, Char)] -> String
 renderUpper rows =
     unlines $
-        [ "{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeFamilies #-}"
+        [ "{-# LANGUAGE DataKinds, NoDependentTypes, TypeFamilies #-}"
         , "module Upper (Upper) where"
         , ""
         , "type family Upper (c :: Char) :: Char where"

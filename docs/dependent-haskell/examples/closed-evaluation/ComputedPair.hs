@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module ComputedPair (bump, bumpRight) where
 
 import Numeric.Natural (Natural)

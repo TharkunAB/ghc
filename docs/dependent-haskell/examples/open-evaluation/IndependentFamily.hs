@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, StandaloneKindSignatures, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, StandaloneKindSignatures, TypeFamilies #-}
 module IndependentFamily (Payload, result) where
 
 import Data.Kind (Type)

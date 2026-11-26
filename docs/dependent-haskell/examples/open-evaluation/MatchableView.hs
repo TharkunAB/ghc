@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, Modifiers, NoExperimentalDependentTypes, PolyKinds, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, Modifiers, NoDependentTypes, PolyKinds, ScopedTypeVariables, TypeApplications #-}
 module MatchableView (Applied(..), Known(..), viewResult, betaResult) where
 
 import Data.Kind (Type)

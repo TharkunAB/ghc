@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds, RankNTypes, RoleAnnotations #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, PolyKinds, RankNTypes, RoleAnnotations #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeApplications #-}
 module QuantifiedGadtIndex where
 

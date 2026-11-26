@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, ScopedTypeVariables, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, ScopedTypeVariables, TypeOperators #-}
 module InstalledNotProof (negateHead) where
 
 import Data.Proxy (Proxy)

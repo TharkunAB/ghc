@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, PolyKinds #-}
 
 module TypeLambdaClient (forwardErrors) where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE ImpredicativeTypes, NoDeepSubsumption, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ImpredicativeTypes, NoDeepSubsumption, NoDependentTypes #-}
 module ConstrainedElementsQuickLook (showReflection) where
 
 import ConstrainedElements (reflectMaybe)

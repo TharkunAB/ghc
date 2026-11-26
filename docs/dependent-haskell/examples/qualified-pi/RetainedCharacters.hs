@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 module RetainedCharacters
     ( RememberedChar, remember, rememberedChar
     , RememberedList, rememberList, rememberedList

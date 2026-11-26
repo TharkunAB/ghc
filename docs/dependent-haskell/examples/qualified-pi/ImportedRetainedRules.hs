@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, NoDependentTypes #-}
 module ImportedRetainedRules (tagged) where
 
 import RetainedRules (Choice(Unused), keep)

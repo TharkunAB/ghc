@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeFamilies #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module CheckedEitherInput (Input) where
 

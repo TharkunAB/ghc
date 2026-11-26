@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, LinearTypes, MonoLocalBinds, ImpredicativeTypes, LambdaCase, NoExperimentalDependentTypes, RequiredTypeArguments, ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns, LinearTypes, MonoLocalBinds, ImpredicativeTypes, LambdaCase, NoDependentTypes, RequiredTypeArguments, ScopedTypeVariables #-}
 module RankedPackageClient
     ( runGuarded, runConditional, runArgumentWitness, runProjections, projectAt, runDeclaredWitnesses, runExplicitBranches
     , runRankedInput

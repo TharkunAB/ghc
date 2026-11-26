@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, Modifiers, NoExperimentalDependentTypes, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, Modifiers, NoDependentTypes, PolyKinds, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeFilterAppendProof (FilterDecisions(..), filterAppend, showPreludeFilterAppend) where
 

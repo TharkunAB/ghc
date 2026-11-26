@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, TypeOperators, UndecidableInstances #-}
 module TypeLambdaSchema (forwardRowSchema, forwardSchemaTransformer) where
 

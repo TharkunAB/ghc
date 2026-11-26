@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, StandaloneKindSignatures, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, StandaloneKindSignatures, TypeFamilies #-}
 module ListFoldrSource (Folded, HeadStep) where
 
 import GHC.Exts (U)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RoleAnnotations #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RoleAnnotations #-}
 module RetainedStoredDictionary (Result(..), inspectStored, ignoreStored) where
 
 import StoredDictionary (Cell(Stored), Pick(pick))

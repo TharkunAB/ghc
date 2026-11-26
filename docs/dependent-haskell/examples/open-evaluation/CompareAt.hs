@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies, TypeOperators #-}
 module CompareAt (Witness(..), decideCompare, keepCompare, Result, decideFamilyCompare, keepFamilyCompare, decideOptional) where
 
 import Data.Kind (Type)

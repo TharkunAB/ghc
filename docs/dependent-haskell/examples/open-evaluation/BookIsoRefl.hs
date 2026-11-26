@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 -- | Reflexivity of isomorphism from the PLFH Isomorphism chapter.
 module BookIsoRefl (isoRefl) where

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeOperators #-}
 {-# OPTIONS_GHC -fenable-rewrite-rules -fno-ignore-interface-pragmas #-}
 module ConsRuleMapProof (negateHead, lazySpine, twiceHead, composedHead) where
 

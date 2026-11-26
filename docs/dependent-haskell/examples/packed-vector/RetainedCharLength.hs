@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 module RetainedCharLength (storedLength) where
 
 import PackedVecLibrary (Nat)

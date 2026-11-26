@@ -10,9 +10,11 @@ usage() {
 compiler=$1
 libdir=$2
 
-dep_base=${DEPENDENT_BASE_DIR:-/home/tritlo/Code/dependent-base}
+docs=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$docs/../.." && pwd)
+dep_base=${DEPENDENT_BASE_DIR:-"$repo_root/../dependent-base"}
 if [[ ! -d "$dep_base/src" ]]; then
-    echo "dependent-base source tree not found at $dep_base" >&2
+    echo "dependent-base source tree not found at $dep_base (set DEPENDENT_BASE_DIR)" >&2
     exit 1
 fi
 

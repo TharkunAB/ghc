@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, PolyKinds, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 
 module OpenVectorAppend (appendEmpty, appendEmptyAt, appendCons, appendConsAt, appendEmptyAtBoth) where

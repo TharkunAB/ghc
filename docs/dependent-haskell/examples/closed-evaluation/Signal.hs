@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module Signal (Signal (..), at, shouldStop) where
 
 import Numeric.Natural (Natural)

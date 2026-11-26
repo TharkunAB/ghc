@@ -720,6 +720,7 @@ Options affecting code generation
     :type: dynamic
     :reverse: -fno-write-source-equations
     :default: off
+    :since: 10.2
 
     Check functions for type-level use and write their accepted equations
     to the module interface. The checker accepts a limited fragment. For

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, StandaloneKindSignatures #-}
 module PreludeMapLengthSource (Count, Mapped) where
 
 import GHC.Exts (U)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveFunctor, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DeriveFunctor, NoDependentTypes #-}
 module These (These(..)) where
 
 -- | A value from either side or a value from both sides.

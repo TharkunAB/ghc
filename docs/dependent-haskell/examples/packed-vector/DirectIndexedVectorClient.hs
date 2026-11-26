@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 
 module DirectIndexedVectorClient (firstCells, firstCellsByLength, successorPayload) where
 

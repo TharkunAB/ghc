@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, ImpredicativeTypes, NoExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, ImpredicativeTypes, NoDependentTypes, TypeFamilies #-}
 module AssociatedPayloadSumClient (observePayload) where
 import Data.Proxy (Proxy (Proxy))
 import GHC.Sigma (Sigma (Pair))

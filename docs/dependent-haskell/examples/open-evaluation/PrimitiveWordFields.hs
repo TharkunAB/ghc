@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, MagicHash, TypeFamilies #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, MagicHash, TypeFamilies #-}
 #include "../../../../libraries/ghc-internal/include/WordSize.h"
 module PrimitiveWordFields (WordFieldResult, ZeroWord, MaximumWord) where
 

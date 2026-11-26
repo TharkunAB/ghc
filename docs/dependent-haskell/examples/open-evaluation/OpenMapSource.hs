@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, PolyKinds, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, PolyKinds, StandaloneKindSignatures #-}
 module OpenMapSource (Each, NegateAll, Signals, OrdinarySignals, OrdinaryPrefix, AtGreen, Heads) where
 
 import qualified ClosedTableLibrary as C

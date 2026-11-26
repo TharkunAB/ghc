@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, RoleAnnotations, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, RoleAnnotations, ScopedTypeVariables #-}
 module ScopedComparison (CompareZero(..), Compared(..), compareTagged) where
 
 -- | Compare a value with the zero for its domain.

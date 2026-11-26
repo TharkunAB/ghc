@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitNamespaces, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitNamespaces, GADTs #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators, UndecidableInstances #-}
 -- | Bind an intermediate result in a type synonym.
 module TypeLet (F, Shadow, Reuse, Outer, Nested, CaptureBeforeShadow, CaseResult, Frame,

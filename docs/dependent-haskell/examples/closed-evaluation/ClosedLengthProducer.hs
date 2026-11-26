@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module ClosedLengthProducer (length) where
 
 import Numeric.Natural (Natural)

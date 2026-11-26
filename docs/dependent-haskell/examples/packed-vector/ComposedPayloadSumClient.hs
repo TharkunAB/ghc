@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, FlexibleContexts, FlexibleInstances, GADTs, ImpredicativeTypes, NoExperimentalDependentTypes, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, FlexibleContexts, FlexibleInstances, GADTs, ImpredicativeTypes, NoDependentTypes, TypeFamilies, UndecidableInstances #-}
 module ComposedPayloadSumClient where
 
 import ComposedPayloadSum

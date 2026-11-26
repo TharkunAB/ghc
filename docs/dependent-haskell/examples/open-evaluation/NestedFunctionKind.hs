@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitNamespaces, GADTs, Modifiers, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ExplicitNamespaces, GADTs, Modifiers, NoDependentTypes #-}
 {-# LANGUAGE PolyKinds, TypeFamilies, TypeOperators, UndecidableInstances #-}
 
 module NestedFunctionKind (type (~>), Demote) where

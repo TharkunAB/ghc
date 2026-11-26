@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 -- | Observe the length stored in an ordinary imported package.
 module PackedLength (packageLength) where
 

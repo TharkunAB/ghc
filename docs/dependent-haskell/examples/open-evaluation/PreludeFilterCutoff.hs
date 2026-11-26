@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, RequiredTypeArguments, TypeApplications #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, RequiredTypeArguments, TypeApplications #-}
 module PreludeFilterCutoff (CutoffBound(..), decideRow, packCutoff, showCutoffBound) where
 
 import PreludeFilterLengthProof (AtMost)

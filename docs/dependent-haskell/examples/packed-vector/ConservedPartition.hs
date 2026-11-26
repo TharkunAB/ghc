@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators, UndecidableInstances #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeOperators, UndecidableInstances #-}
 
 -- | Partition a vector and preserve its total length.
 module ConservedPartition (Split, partitionVec, Branch, branchContents) where

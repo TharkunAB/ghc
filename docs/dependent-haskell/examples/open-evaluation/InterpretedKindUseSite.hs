@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, Modifiers, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, Modifiers, NoDependentTypes #-}
 
 module InterpretedKindUseSite (atM, atU, defaultAtResult) where
 

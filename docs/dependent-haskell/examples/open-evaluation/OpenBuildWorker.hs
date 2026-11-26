@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 {-# OPTIONS_GHC -fno-unoptimized-core-for-interpreter -fno-omit-interface-pragmas #-}
 
 module OpenBuildWorker (Shell (..), Nested (..), build, buildWithUncurry, wrap, echo, buildPair, partialPair, swapPair) where

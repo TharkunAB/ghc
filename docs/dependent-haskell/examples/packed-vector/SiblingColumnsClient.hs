@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module SiblingColumnsClient (readPairs) where
 
 import PackedVecLibrary (toList, zipVec)

@@ -1,4 +1,4 @@
-{-# LANGUAGE LiberalTypeSynonyms, NoExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE LiberalTypeSynonyms, NoDependentTypes, RankNTypes #-}
 module LiberalCallback (collectValues) where
 
 type Callback input output = forall a. input a -> output a

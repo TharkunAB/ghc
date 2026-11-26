@@ -1,11 +1,11 @@
 {-# LANGUAGE DependentTypes, LinearTypes, ListTuplePuns #-}
 {-# LANGUAGE MagicHash, OverloadedRecordDot, TypeFamilies, UnboxedTuples, UndecidableInstances #-}
--- | Executable Wave 10 through Wave 12 examples for DepFunTy INLINE unfoldings,
+-- | Executable examples for DepFunTy INLINE unfoldings,
 -- promoted Char# and unboxed tuples, superclass selectors in types, same-module
 -- closed evaluation, standalone constrained families, runtime Type cases,
 -- dependent OverloadedRecordDot, T2T operator sections, GHC.Exists combinators,
 -- linear foreach binders, absurd foreach branch refutation, and local type synonyms.
-module BookWave12RoadmapClosure
+module BookExtensions
   ( inlConsVec
   , IsAsciiA
   , FstUnboxed

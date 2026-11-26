@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, StandaloneKindSignatures #-}
 module PreludeMapSource (PreludeNegateAll, PreludeIdentityMap) where
 
 import qualified Prelude as P

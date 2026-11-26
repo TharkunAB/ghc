@@ -1,9 +1,9 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, Modifiers #-}
 {-# LANGUAGE NoListTuplePuns, PolyKinds, StandaloneKindSignatures, TypeOperators #-}
 -- The proof module reads packHead's Core unfolding, including in GHCi.
 {-# OPTIONS_GHC -fwrite-source-equations -fno-omit-interface-pragmas -fobject-code #-}
 -- | The Lists chapter's existential predicate witness for a Boolean list.
--- Adapted from PLFH under CC BY 4.0. See REFERENCES.md.
+-- Adapted from PLFA / PLFH under CC BY 4.0.
 module BookAnyWitness (Any(..), AnyWitness(..), Evidence(..), Flag(..), packHead, anyToWitness, witnessToAny) where
 
 import Data.Kind (Type)

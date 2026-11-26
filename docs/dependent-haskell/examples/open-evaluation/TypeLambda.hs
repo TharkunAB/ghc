@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers, PolyKinds, RankNTypes, ScopedTypeVariables, StandaloneKindSignatures,
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers, PolyKinds, RankNTypes, ScopedTypeVariables, StandaloneKindSignatures,
              TypeApplications, TypeFamilies, TypeOperators, UndecidableInstances #-}
 -- | Apply a type lambda to a list of type constructors.
 module TypeLambda

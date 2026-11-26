@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module RetainedRulesClient (fromInput, boundPayload, atFalse, ignoredIndex) where
 
 import RetainedRules

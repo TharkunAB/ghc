@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeDropWhileRuntime (showPrefixAndSuffix) where
 

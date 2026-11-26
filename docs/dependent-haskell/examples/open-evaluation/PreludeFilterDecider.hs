@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers #-}
 {-# LANGUAGE RequiredTypeArguments, ScopedTypeVariables, TypeFamilies #-}
 module PreludeFilterDecider
     ( FilterDecider(..), SomeFilterDecider(..), DecidedFilterBound(..)

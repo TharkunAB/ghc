@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module DefaultVector (DefaultElement(..)) where
 
 import PackedVecLibrary (Nat, Vec, replicateNative)

@@ -78,7 +78,7 @@ Unsaturated type families and synonyms
 .. extension:: UnsaturatedTypeFamilies
     :shortdesc: Allow partial applications of type families and type synonyms.
     :implies: :extension:`TypeFamilies`
-    :since: 10.1
+    :since: 10.2
 
     Permit a type argument to be a partial application of a type family or
     type synonym at an unmatchable arrow kind.
@@ -126,10 +126,14 @@ its second argument, so GHC can reduce the addition::
     addOne :: Map ((+) 1) '[2, 3, 4] :~: '[3, 4, 5]
     addOne = Refl
 
-:extension:`DependentTypes` implies :extension:`UnsaturatedTypeFamilies`
-and permits partial applications through the same matchability checks.
-In particular, ``NoUnsaturatedTypeFamilies`` disables partial type-family
-applications selectively even when :extension:`DependentTypes` is enabled.
+:extension:`DependentTypes` also permits partial applications of type families
+and type synonyms through the same matchability checks (when
+:extension:`TypeFamilies` is enabled or an imported family is used), without
+implying :extension:`TypeFamilies` or
+:ghc-flag:`-fprint-explicit-matchabilities`. Because
+:extension:`DependentTypes` enables this check directly rather than through
+``:implies:``, ``NoUnsaturatedTypeFamilies`` does not disable partial
+type-family applications while :extension:`DependentTypes` is enabled.
 
 .. _data-families:
 

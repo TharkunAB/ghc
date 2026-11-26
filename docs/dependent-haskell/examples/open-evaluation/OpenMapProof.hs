@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, Modifiers, NoExperimentalDependentTypes, ScopedTypeVariables, TypeOperators #-}
+{-# LANGUAGE DataKinds, Modifiers, NoDependentTypes, ScopedTypeVariables, TypeOperators #-}
 module OpenMapProof (eachEmpty, eachCons, negateHead, redStops, ordinaryRedStops, greenPermission, firstRowHead) where
 
 import qualified ClosedTableLibrary as C
