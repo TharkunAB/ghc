@@ -1,0 +1,16 @@
+NativeTypeCaseRecursiveIndex.hs:14:3: error: [GHC-79642]
+    Cannot determine which constructors are possible at this scrutinee kind:
+      Gate Bool True
+
+NativeTypeCaseRecursiveIndex.hs:19:8: error: [GHC-40404]
+    • Reduction stack overflow; size = 9
+      When simplifying the following type: Loop True
+    • In the first argument of ‘'Just’, namely ‘'Recursive’
+      When checking the type case in ‘Overflow’, at ‘'Just 'Recursive’
+      In the type case in ‘Overflow’
+    Suggested fix:
+      Use -freduction-depth=0 to disable this check
+      (any upper bound you could choose might fail unpredictably with
+       minor updates to GHC, so disabling the check is recommended if
+       you're sure that type checking should terminate)
+

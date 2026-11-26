@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 {-# LANGUAGE TypeApplications #-}
 module Provider (Hidden, supplied, synthesized, kindOnly, kindAndSchema,

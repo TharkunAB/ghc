@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 module NativeSourceFieldCoverage where
 
 data Nat = Z | S Nat

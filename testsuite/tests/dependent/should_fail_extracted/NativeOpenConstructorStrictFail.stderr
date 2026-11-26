@@ -1,0 +1,18 @@
+NativeOpenConstructorStrictFail.hs:8:57: error: [GHC-70566]
+    • Cannot reduce the open call to ‘W.demand’ in a type.
+        Reduction stopped at a case on the rigid argument p. A checked equation can retain this case until the argument's constructor is known.
+    • In the type signature:
+        blocked :: forall (p :: W.Choice Type Type). Proxy p -> W.demand p
+
+NativeOpenConstructorStrictFail.hs:11:33: error: [GHC-70566]
+    • Cannot reduce the open call to ‘W.demand’ in a type.
+        Reduction stopped at a case on the rigid argument a. A checked equation can retain this case until the argument's constructor is known.
+    • In the type signature:
+        strict :: forall a b. a -> b -> W.demand ('W.LeftFields a b)
+
+NativeOpenConstructorStrictFail.hs:14:58: error: [GHC-70566]
+    • Cannot reduce the open call to ‘W.unwrap’ in a type.
+        Reduction stopped at a case on the rigid argument p. A checked equation can retain this case until the argument's constructor is known.
+    • In the type signature:
+        badAbstract :: forall (p :: W.Envelope Type). Proxy p -> W.unwrap p
+

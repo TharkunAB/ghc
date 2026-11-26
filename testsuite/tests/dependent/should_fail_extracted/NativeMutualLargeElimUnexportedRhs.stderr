@@ -1,0 +1,4 @@
+NativeMutualLargeElimUnexportedRhs.hs:9:1: error: [GHC-70566]
+    Cannot reduce the open call to ‘logVLam’ in a type.
+      The dependent type needs this equation. Export LogArr to make it available.
+

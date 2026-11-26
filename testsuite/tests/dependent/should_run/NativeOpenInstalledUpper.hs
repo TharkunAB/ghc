@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeApplications, TypeOperators #-}
 module Main (main) where
 
 import Data.Proxy (Proxy(..))

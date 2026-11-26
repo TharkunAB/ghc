@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 {-# OPTIONS_GHC -frebindable-known-names #-}
 module NativeClosedOtherEither where
 import Data.Proxy (Proxy(..))

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes #-}
 
 module DotForall where
 

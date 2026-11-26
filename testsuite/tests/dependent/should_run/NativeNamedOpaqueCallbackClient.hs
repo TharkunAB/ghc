@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, NoDependentTypes #-}
 
 module Main where
 

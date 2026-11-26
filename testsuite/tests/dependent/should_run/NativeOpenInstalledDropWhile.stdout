@@ -1,0 +1,13 @@
+(True,[False],[True],True,True,True,True)
+(True,True,[False,True],True,True,True,True,True)
+([True],[True])
+(BothSucc (RightSucc (RightSucc ZeroBound)),[Zero],Succ (Succ (Succ Zero)))
+(BothSucc (BothSucc (RightSucc ZeroBound)),[Zero,Succ Zero],Succ (Succ (Succ Zero)))
+(BothSucc (BothSucc (BothSucc ZeroBound)),[Zero,Succ Zero,Succ (Succ Zero)],Succ (Succ (Succ Zero)))
+empty
+keep
+skip
+keep
+(RightSucc ZeroBound,[],Succ Zero)
+True
+("stop","stop","keep")

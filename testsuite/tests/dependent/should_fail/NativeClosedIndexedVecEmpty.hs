@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, TypeOperators #-}
 module NativeClosedIndexedVecEmpty where
 
 import Data.Type.Equality ((:~:)(Refl))

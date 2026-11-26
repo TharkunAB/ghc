@@ -1,0 +1,6 @@
+NativeDataFamilyRetainedStuckFamily.hs:5:23: error: [GHC-83605]
+    • A retained value argument requires a lifted type parameter or a supported algebraic type.
+      Its declared domain is: Reduce Bool
+    • In the type signature:
+        unresolved :: foreach (t :: Reduce Bool) -> t :~: t
+

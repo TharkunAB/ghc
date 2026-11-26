@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes #-}
 module NativeCheckedClosureProvider
 #ifdef HIDE_LOOP
     (Sort (..), Scope (..), Slot (..), Expr (At, Bind, Call, Lit, Test),

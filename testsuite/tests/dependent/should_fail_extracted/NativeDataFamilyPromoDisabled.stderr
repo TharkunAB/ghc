@@ -1,0 +1,8 @@
+NativeDataFamilyPromoDisabled.hs:4:18: error: [GHC-64578]
+    • Data constructor ‘Tup2’ cannot be used here
+        (it comes from a data family instance)
+    • In the first argument of ‘At’, namely
+        ‘('Tup2 'True 'False :: Tuple Bool Bool)’
+      In the type signature:
+        pairIndex :: At ('Tup2 'True 'False :: Tuple Bool Bool)
+

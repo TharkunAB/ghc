@@ -1,0 +1,22 @@
+NativeNestedPackagePatEscape.hs:9:72: error: [GHC-25897]
+    • Could not deduce ‘k ~ S n’
+      from the context: m0 ~ S n
+        bound by a pattern with constructor:
+                   VCons :: forall a (n :: Nat). a -> Vec a n -> Vec a (S n),
+                 in an equation for ‘escape’
+        at NativeNestedPackagePatEscape.hs:9:55-63
+      Expected: Vec a k
+        Actual: Vec a m0
+      ‘k’ is a rigid type variable bound by
+        the type signature for:
+          escape :: forall a (k :: Nat). NestedResult a -> Vec a k
+        at NativeNestedPackagePatEscape.hs:8:1-35
+    • In the expression: whole
+      In an equation for ‘escape’:
+          escape
+            (NestedResult (Pair _ (_, Pair _ (_, _, whole@(VCons _ _)))))
+            = whole
+    • Relevant bindings include
+        escape :: NestedResult a -> Vec a k
+          (bound at NativeNestedPackagePatEscape.hs:9:1)
+

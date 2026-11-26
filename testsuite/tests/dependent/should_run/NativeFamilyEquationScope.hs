@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, FlexibleContexts, FlexibleInstances, FunctionalDependencies, GADTs #-}
+{-# LANGUAGE CPP, DependentTypes, FlexibleContexts, ListTuplePuns, FlexibleInstances, FunctionalDependencies, GADTs #-}
 {-# LANGUAGE MultiParamTypeClasses, QuantifiedConstraints, TypeFamilies, UndecidableInstances, UndecidableSuperClasses #-}
 module NativeFamilyEquationScope where
 

@@ -1,0 +1,7 @@
+NativeUnboxedCharPrimDisabled.hs:5:23: error: [GHC-51819]
+    • The literal ‘'a'#’ cannot be promoted.
+      It is of the unpromotable type ‘GHC.Internal.Prim.Char#’.
+    • In the first argument of ‘'C#’, namely ‘'a'#’
+      In the first argument of ‘Proxy’, namely ‘('C# 'a'#)’
+      In the type ‘Proxy ('C# 'a'#)’
+

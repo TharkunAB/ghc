@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators #-}
 module NativeIndexedGadtFieldsProvider where
 

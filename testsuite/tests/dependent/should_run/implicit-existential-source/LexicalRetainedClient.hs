@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, CPP, DataKinds, MonoLocalBinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, CPP, DataKinds, MonoLocalBinds, NoDependentTypes #-}
 {-# LANGUAGE RankNTypes, ScopedTypeVariables, TypeApplications #-}
 #ifdef DEEP
 {-# LANGUAGE DeepSubsumption #-}

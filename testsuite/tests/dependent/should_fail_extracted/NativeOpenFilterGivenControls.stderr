@@ -1,0 +1,194 @@
+NativeOpenFilterGivenControls.hs:16:23: error: [GHC-83865]
+    • Couldn't match type: GHC.Internal.List.#guard:filter (p x) p x xs
+                     with: x : filter p xs
+      Expected: FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        Actual: filter p (x : xs) :~: filter p (x : xs)
+    • In the expression: Refl
+      In an equation for ‘withoutResult’: withoutResult _ _ _ = Refl
+    • Relevant bindings include
+        withoutResult :: Proxy p
+                         -> Proxy x
+                         -> Proxy xs
+                         -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+          (bound at NativeOpenFilterGivenControls.hs:16:1)
+
+NativeOpenFilterGivenControls.hs:21:21: error: [GHC-83865]
+    • Couldn't match type: filter p xs
+                     with: x : filter p xs
+      Expected: FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        Actual: filter p (x : xs) :~: filter p (x : xs)
+    • In the expression: Refl
+      In an equation for ‘wrongResult’: wrongResult _ _ _ = Refl
+    • Relevant bindings include
+        wrongResult :: Proxy p
+                       -> Proxy x
+                       -> Proxy xs
+                       -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+          (bound at NativeOpenFilterGivenControls.hs:21:1)
+
+NativeOpenFilterGivenControls.hs:28:22: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.List.#guard:filter (p1 x) p1 x xs
+                        ~ (x : filter p1 xs)’
+      from the context: p x ~ True
+        bound by the type signature for:
+                   otherPredicate :: forall a (p :: a %U -> Bool) (x :: a)
+                                            (xs :: [a]).
+                                     (p x ~ True) =>
+                                     Proxy '(p, x, xs)
+                                     -> forall (p1 :: a %U -> Bool).
+                                        Proxy p1
+                                        -> FilterWith p1 (x : xs) :~: (x : FilterWith p1 xs)
+        at NativeOpenFilterGivenControls.hs:(24,1)-(27,72)
+      Expected: FilterWith p1 (x : xs) :~: (x : FilterWith p1 xs)
+        Actual: filter p1 (x : xs) :~: filter p1 (x : xs)
+    • In the expression: Refl
+      In an equation for ‘otherPredicate’: otherPredicate _ _ = Refl
+    • Relevant bindings include
+        otherPredicate :: Proxy '(p, x, xs)
+                          -> forall (p1 :: a %U -> Bool).
+                             Proxy p1 -> FilterWith p1 (x : xs) :~: (x : FilterWith p1 xs)
+          (bound at NativeOpenFilterGivenControls.hs:28:1)
+
+NativeOpenFilterGivenControls.hs:33:19: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.List.#guard:filter (p x) p x xs
+                        ~ (x : filter p xs)’
+      from the context: p y ~ True
+        bound by the type signature for:
+                   otherHead :: forall a (p :: a %U -> Bool) (x :: a) (y :: a)
+                                       (xs :: [a]).
+                                (p y ~ True) =>
+                                Proxy p
+                                -> Proxy '(x, y)
+                                -> Proxy xs
+                                -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        at NativeOpenFilterGivenControls.hs:(30,1)-(32,62)
+      Expected: FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        Actual: filter p (x : xs) :~: filter p (x : xs)
+    • In the expression: Refl
+      In an equation for ‘otherHead’: otherHead _ _ _ = Refl
+    • Relevant bindings include
+        otherHead :: Proxy p
+                     -> Proxy '(x, y)
+                     -> Proxy xs
+                     -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+          (bound at NativeOpenFilterGivenControls.hs:33:1)
+
+NativeOpenFilterGivenControls.hs:38:32: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.List.#guard:filter (p x) p x xs
+                        ~ (x : filter p xs)’
+      from the context: Coercible (p x) True
+        bound by the type signature for:
+                   representationalResult :: forall a (p :: a %U -> Bool) (x :: a)
+                                                    (xs :: [a]).
+                                             Coercible (p x) True =>
+                                             Proxy p
+                                             -> Proxy x
+                                             -> Proxy xs
+                                             -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        at NativeOpenFilterGivenControls.hs:(35,1)-(37,75)
+      Expected: FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        Actual: filter p (x : xs) :~: filter p (x : xs)
+    • In the expression: Refl
+      In an equation for ‘representationalResult’:
+          representationalResult _ _ _ = Refl
+    • Relevant bindings include
+        representationalResult :: Proxy p
+                                  -> Proxy x
+                                  -> Proxy xs
+                                  -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+          (bound at NativeOpenFilterGivenControls.hs:38:1)
+
+NativeOpenFilterGivenControls.hs:49:19: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.List.#guard:filter
+                          (p Age) p Age xs
+                        ~ (Age : filter p xs)’
+      from the context: p Int ~ True
+        bound by the type signature for:
+                   newtypeHead :: forall (p :: * %U -> Bool) (xs :: [*]).
+                                  (p Int ~ True) =>
+                                  Proxy p
+                                  -> Proxy xs -> FilterWith p (Age : xs) :~: (Age : FilterWith p xs)
+        at NativeOpenFilterGivenControls.hs:(46,1)-(48,68)
+      Expected: FilterWith p (Age : xs) :~: (Age : FilterWith p xs)
+        Actual: filter p (Age : xs) :~: filter p (Age : xs)
+    • In the expression: Refl
+      In an equation for ‘newtypeHead’: newtypeHead _ _ = Refl
+    • Relevant bindings include
+        newtypeHead :: Proxy p
+                       -> Proxy xs -> FilterWith p (Age : xs) :~: (Age : FilterWith p xs)
+          (bound at NativeOpenFilterGivenControls.hs:49:1)
+
+NativeOpenFilterGivenControls.hs:53:20: error: [GHC-25897]
+    • Could not deduce ‘x ~ y’
+      from the context: p x ~ p y
+        bound by the type signature for:
+                   invertHead :: forall a (p :: a %U -> Bool) (x :: a) (y :: a).
+                                 (p x ~ p y) =>
+                                 Proxy p -> Proxy x -> Proxy y -> x :~: y
+        at NativeOpenFilterGivenControls.hs:(51,1)-(52,54)
+      Expected: x :~: y
+        Actual: x :~: x
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          invertHead :: forall a (p :: a %U -> Bool) (x :: a) (y :: a).
+                        (p x ~ p y) =>
+                        Proxy p -> Proxy x -> Proxy y -> x :~: y
+        at NativeOpenFilterGivenControls.hs:(51,1)-(52,54)
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          invertHead :: forall a (p :: a %U -> Bool) (x :: a) (y :: a).
+                        (p x ~ p y) =>
+                        Proxy p -> Proxy x -> Proxy y -> x :~: y
+        at NativeOpenFilterGivenControls.hs:(51,1)-(52,54)
+    • In the expression: Refl
+      In an equation for ‘invertHead’: invertHead _ _ _ = Refl
+    • Relevant bindings include
+        invertHead :: Proxy p -> Proxy x -> Proxy y -> x :~: y
+          (bound at NativeOpenFilterGivenControls.hs:53:1)
+
+NativeOpenFilterGivenControls.hs:57:25: error: [GHC-25897]
+    • Could not deduce ‘p ~ q’
+      from the context: p x ~ q x
+        bound by the type signature for:
+                   invertPredicate :: forall a (p :: a %U -> Bool) (q :: a %U -> Bool)
+                                             (x :: a).
+                                      (p x ~ q x) =>
+                                      Proxy p -> Proxy q -> Proxy x -> p :~: q
+        at NativeOpenFilterGivenControls.hs:(55,1)-(56,59)
+      Expected: p :~: q
+        Actual: p :~: p
+      ‘p’ is a rigid type variable bound by
+        the type signature for:
+          invertPredicate :: forall a (p :: a %U -> Bool) (q :: a %U -> Bool)
+                                    (x :: a).
+                             (p x ~ q x) =>
+                             Proxy p -> Proxy q -> Proxy x -> p :~: q
+        at NativeOpenFilterGivenControls.hs:(55,1)-(56,59)
+      ‘q’ is a rigid type variable bound by
+        the type signature for:
+          invertPredicate :: forall a (p :: a %U -> Bool) (q :: a %U -> Bool)
+                                    (x :: a).
+                             (p x ~ q x) =>
+                             Proxy p -> Proxy q -> Proxy x -> p :~: q
+        at NativeOpenFilterGivenControls.hs:(55,1)-(56,59)
+    • In the expression: Refl
+      In an equation for ‘invertPredicate’: invertPredicate _ _ _ = Refl
+    • Relevant bindings include
+        invertPredicate :: Proxy p -> Proxy q -> Proxy x -> p :~: q
+          (bound at NativeOpenFilterGivenControls.hs:57:1)
+
+NativeOpenFilterGivenControls.hs:68:28: error: [GHC-83865]
+    • Couldn't match type: GHC.Internal.List.#guard:filter (p x) p x xs
+                     with: x : filter p xs
+      Expected: FilterWith p (x : xs) :~: (x : FilterWith p xs)
+        Actual: filter p (x : xs) :~: filter p (x : xs)
+    • In the expression: Refl
+      In an equation for ‘staleGiven’: staleGiven _ _ _ Unknown = Refl
+    • Relevant bindings include
+        staleGiven :: Proxy p
+                      -> Proxy x
+                      -> Proxy xs
+                      -> HeadResult (p x)
+                      -> FilterWith p (x : xs) :~: (x : FilterWith p xs)
+          (bound at NativeOpenFilterGivenControls.hs:67:1)
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes #-}
 module OrdinaryPack where
 
 data Wrapped = Pack Int

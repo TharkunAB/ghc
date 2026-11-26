@@ -1,0 +1,15 @@
+NativeOpenMonusFail.hs:10:23: error: [GHC-83865]
+    • Couldn't match type: monus m n1
+                     with: Succ (monus m n1)
+      Expected: monus (Succ m) (Succ n1) :~: Succ (monus m n1)
+        Actual: monus (Succ m) (Succ n1) :~: monus (Succ m) (Succ n1)
+    • In the expression: Refl
+      In an equation for ‘wrongSuccessors’: wrongSuccessors _ _ = Refl
+
+NativeOpenMonusFail.hs:13:18: error: [GHC-83865]
+    • Couldn't match type ‘monus Zero n’ with ‘Zero’
+      Expected: monus Zero n :~: Zero
+        Actual: monus Zero n :~: monus Zero n
+    • In the expression: Refl
+      In an equation for ‘unknownRight’: unknownRight _ = Refl
+

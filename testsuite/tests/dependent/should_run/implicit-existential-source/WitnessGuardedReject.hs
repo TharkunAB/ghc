@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE GADTs, ImpredicativeTypes, LambdaCase, MultiWayIf, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, ImpredicativeTypes, LambdaCase, MultiWayIf, NoDependentTypes #-}
 module WitnessGuardedReject where
 
 import WitnessSchema

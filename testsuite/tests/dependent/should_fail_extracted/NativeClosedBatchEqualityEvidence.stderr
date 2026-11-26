@@ -1,0 +1,6 @@
+NativeClosedBatchEqualityEvidence.hs:9:28: error: [GHC-70565]
+    • Cannot evaluate ‘W.withEquality’ in a type.
+        Cannot recover a constructor-local type argument from the checked result type.
+    • In the first argument of ‘Proxy’, namely ‘(W.withEquality 4)’
+      In the type signature: equalityEvidence :: Proxy (W.withEquality 4)
+

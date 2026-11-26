@@ -1,4 +1,4 @@
-{-# LANGUAGE Haskell2010, NoExperimentalDependentTypes #-}
+{-# LANGUAGE Haskell2010, NoDependentTypes #-}
 module Main where
 
 import FoldCell (At(..), foldCell, foldDirect, foldValue)

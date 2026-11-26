@@ -1,0 +1,46 @@
+NativeOpenMatchabilityWrongCong.hs:16:32: error: [GHC-05617]
+    • Could not deduce ‘add (add n m1) p1 ~ add (add m1 n) p1’
+      from the context: m ~ S m1
+        bound by a pattern with constructor: S :: Nat -> Nat,
+                 in an equation for ‘wrongAssoc’
+        at NativeOpenMatchabilityWrongCong.hs:16:1-48
+      Expected: add (add m1 n) p1 :~: add m1 (add n p1)
+        Actual: add (add n m1) p1 :~: add n (add m1 p1)
+      Note: GHC cannot determine the arguments of the function ‘add’ from its result.
+    • In the second argument of ‘cong’, namely
+        ‘(wrongAssoc n_aFY m p_aFZ)’
+      In the expression: cong S (wrongAssoc n_aFY m p_aFZ)
+      In an equation for ‘wrongAssoc’:
+          wrongAssoc (S m) n p = cong S (wrongAssoc n m p)
+
+NativeOpenMatchabilityWrongCong.hs:20:24: error: [GHC-83865]
+    • Couldn't match type: add m2 x
+                     with: addRight m2 x
+      Expected: addRight m2 x :~: addRight m2 y
+        Actual: add m2 x :~: add m2 y
+    • In the expression: cong (add m) eq
+      In an equation for ‘wrongSource’:
+          wrongSource m _ _ eq = cong (add m) eq
+    • Relevant bindings include
+        eq :: x :~: y (bound at NativeOpenMatchabilityWrongCong.hs:20:19)
+
+NativeOpenMatchabilityWrongCong.hs:31:17: error: [GHC-25897]
+    • Couldn't match type ‘q’ with ‘p’
+      Expected: ReadProof (Proof p) :~: q
+        Actual: q :~: q
+      ‘q’ is a rigid type variable bound by
+        the type signature for:
+          wrongPreserve :: forall (p :: Checked True) (q :: Checked True).
+                           ReadProof (Proof p) :~: q
+        at NativeOpenMatchabilityWrongCong.hs:30:1-100
+      ‘p’ is a rigid type variable bound by
+        the type signature for:
+          wrongPreserve :: forall (p :: Checked True) (q :: Checked True).
+                           ReadProof (Proof p) :~: q
+        at NativeOpenMatchabilityWrongCong.hs:30:1-100
+    • In the expression: Refl
+      In an equation for ‘wrongPreserve’: wrongPreserve = Refl
+    • Relevant bindings include
+        wrongPreserve :: ReadProof (Proof p) :~: q
+          (bound at NativeOpenMatchabilityWrongCong.hs:31:1)
+

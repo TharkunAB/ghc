@@ -1,9 +1,10 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 module Main where
 
 import Data.Char (toUpper)
 import Data.Type.Equality ((:~:) (Refl))
 import NativeParamDependentRecordUpdateProvider
+import NativeParamDependentRecordUpdateOrd (checkOrdinaryStrict)
 
 -- Invariant payload update on parameterized Columns a.
 mapColumnsInvariant :: (a -> a) -> Columns a -> Columns a
@@ -69,4 +70,5 @@ main = do
         && toList (leftCells p1) == ["42"]
         && toList (zipVec (firstCells s1) (secondCells s1)) == [(True, False)]
         && toList (zipVec (firstCells s3) (secondCells s3)) == [('x', 'y')]
-  print ok
+  ordOk <- checkOrdinaryStrict
+  print (ok && ordOk)

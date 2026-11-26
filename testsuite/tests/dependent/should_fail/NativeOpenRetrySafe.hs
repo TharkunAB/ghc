@@ -1,5 +1,5 @@
 {-# LANGUAGE Haskell2010, Safe #-}
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, NamedWildCards #-}
+{-# LANGUAGE DataKinds, DependentTypes, NamedWildCards #-}
 {-# LANGUAGE PartialTypeSignatures, ScopedTypeVariables, TypeApplications #-}
 module NativeOpenRetrySafe where
 import qualified RetryCharacters

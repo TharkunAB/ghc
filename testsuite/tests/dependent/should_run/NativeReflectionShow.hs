@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds, GADTs, LinearTypes, Modifiers, TypeApplications #-}
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module Main where
 
 import Data.Kind (Type)

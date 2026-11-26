@@ -1,0 +1,6 @@
+NativeExistentialSourceWrongWitnessKind.hs:10:18: error: [GHC-83865]
+    • Expected a type, but ‘'True’ has kind ‘Bool’
+    • In the type ‘'True’
+      In the expression: Pack (type 'True) Nothing
+      In an equation for ‘bad’: bad = Pack (type 'True) Nothing
+

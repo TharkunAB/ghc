@@ -1,0 +1,6 @@
+(True,False)
+(Refl,Nothing)
+(Refl,Refl,Just False,Just True,True)
+((True,False),(False,True),())
+([7],[],[],2)
+((True,False),(True,False),(True,False))

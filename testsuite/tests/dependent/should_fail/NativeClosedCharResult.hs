@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 module NativeClosedCharResult where
 
 import qualified Data.Char

@@ -1,6 +1,3 @@
 ((Nothing,Just 1),(True,False,True,True))
 [Just 'b',Nothing,Nothing,Just 'x',Just 'x']
-((Nothing,Just 1),(True,False,True,True))
-[Just 'b',Nothing,Nothing,Just 'x',Just 'x']
-((Nothing,Just 1),(True,False,True,True))
-[Just 'b',Nothing,Nothing,Just 'x',Just 'x']
+retained VCons preserves demand

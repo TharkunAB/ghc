@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, TypeFamilies, GADTs, TypeOperators, ExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, DataKinds, TypeFamilies, GADTs, TypeOperators, DependentTypes, ListTuplePuns #-}
 module RetainedConstructor (emitted, lazy, withNatural, withRefinement) where
 
 import Data.Type.Equality ((:~:)(Refl))

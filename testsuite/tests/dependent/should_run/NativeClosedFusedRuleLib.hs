@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module NativeClosedFusedRuleLib (Parcel, make, first) where
 
 import Numeric.Natural (Natural)

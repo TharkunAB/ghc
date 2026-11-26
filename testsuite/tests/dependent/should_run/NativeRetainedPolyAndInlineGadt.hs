@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, KindSignatures, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExplicitNamespaces, DependentTypes, ListTuplePuns, GADTs, KindSignatures, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 module Main where
 
 import Data.Kind (Type)

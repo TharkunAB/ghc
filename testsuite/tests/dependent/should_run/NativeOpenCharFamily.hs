@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeApplications #-}
 module Main (main) where
 
 import CharacterExport (p3)

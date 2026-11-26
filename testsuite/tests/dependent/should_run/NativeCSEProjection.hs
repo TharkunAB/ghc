@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module Main where
 
 import GHC.Sigma.Projection (second)

@@ -1,0 +1,4 @@
+NativeImportedFamilyAssocCycleFail.hs:11:29: error: [GHC-70566]
+    Cannot reduce the open call to ‘keepAssoc’ in a type.
+      An associated type equation requires the unfinished local function keepAssoc.
+

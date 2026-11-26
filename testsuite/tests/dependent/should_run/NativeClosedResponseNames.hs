@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}
 {-# OPTIONS_GHC -frebindable-known-names #-}
 module NativeClosedResponseNames where
 

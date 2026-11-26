@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeApplications #-}
 module Main where
 import Control.Exception (ErrorCall, evaluate, try)
 import Data.List (isInfixOf)

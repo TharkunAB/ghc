@@ -1,0 +1,7 @@
+NativeStoredDictLinearCase.hs:7:30: error: [GHC-83605]
+    • A retained argument must have unrestricted multiplicity Many.
+      This argument has multiplicity: t0
+    • In the expression: observe x
+      In the expression: case observe x of Tagged b -> b
+      In a case alternative: Stored x -> case observe x of Tagged b -> b
+

@@ -1,0 +1,40 @@
+NativeMultiParamBodyRejects.hs:13:16: error: [GHC-83605]
+    • GHC cannot use method ‘lmap’ as a retained index.
+      This call needs a known ‘LabelledMap e (Either e)’ dictionary.
+    • In the first argument of ‘(:~:)’, namely
+        ‘lmap f (Right x :: Either e a)’
+      In the type signature:
+        inner :: foreach (f :: a -> b) ->
+                 foreach (x :: a) -> lmap f (Right x :: Either e a) :~: Right (f x)
+      In the expression:
+        let
+          inner ::
+            foreach (f :: a -> b) ->
+            foreach (x :: a) -> lmap f (Right x :: Either e a) :~: Right (f x)
+          inner _ _ = Refl
+        in inner id True `seq` ()
+
+NativeMultiParamBodyRejects.hs:18:15: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: NativeMultiParamMethodOpenEqProvider.$c== MZero MZero
+                :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘badEq’: badEq MZero = Refl
+
+NativeMultiParamBodyRejects.hs:19:19: error: [GHC-05617]
+    • Could not deduce ‘NativeMultiParamMethodOpenEqProvider.$c== _ _
+                        ~ False’
+      from the context: n ~ MSucc _
+        bound by a pattern with constructor: MSucc :: MyNat -> MyNat,
+                 in an equation for ‘badEq’
+        at NativeMultiParamBodyRejects.hs:19:1-22
+      Expected: NativeMultiParamMethodOpenEqProvider.$c==
+                  (MSucc _) (MSucc _)
+                :~: False
+        Actual: NativeMultiParamMethodOpenEqProvider.$c==
+                  (MSucc _) (MSucc _)
+                :~: NativeMultiParamMethodOpenEqProvider.$c== (MSucc _) (MSucc _)
+    • In the expression: Refl
+      In an equation for ‘badEq’: badEq (MSucc _) = Refl
+

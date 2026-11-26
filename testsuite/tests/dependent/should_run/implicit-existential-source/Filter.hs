@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeFamilies #-}
 module Filter (Hidden, familyHide, FilteredWith, SameLength, Product(..), ProductWith, ProductSame,
                makeProduct, filterVec, partitionVec, toList, fromList) where
 import Vector

@@ -1,4 +1,4 @@
-{-# LANGUAGE Haskell2010, NoExperimentalDependentTypes, BangPatterns, GADTs, ScopedTypeVariables, Strict #-}
+{-# LANGUAGE Haskell2010, NoDependentTypes, BangPatterns, GADTs, ScopedTypeVariables, Strict #-}
 module Main where
 
 import Control.Exception (ErrorCall, evaluate, try)

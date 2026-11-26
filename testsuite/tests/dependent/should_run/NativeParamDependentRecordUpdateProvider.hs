@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 -- | Parameterized dependent record definitions for record update testing.
 module NativeParamDependentRecordUpdateProvider
   ( Nat (..)

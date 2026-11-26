@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, RoleAnnotations #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, RoleAnnotations #-}
 module Selector (Tagged(..), tag, observe) where
 import StoredEvidence (Pick(..))
 

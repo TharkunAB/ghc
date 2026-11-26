@@ -127,7 +127,7 @@ vecEqGoal _ u v = _
 
 -- 9. Multi-clause equation with a variable pattern before an indexed GADT
 --    foreach argument keeps 'eq' in Relevant bindings and refinement fits,
---    and uses source names in the enclosing case context (PiTA #10).
+--    and uses source names in the enclosing case context.
 data Fin (n :: Nat) where
   FZ :: Fin (Succ n)
   FS :: Fin n -> Fin (Succ n)

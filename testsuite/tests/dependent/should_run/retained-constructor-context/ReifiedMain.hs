@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, ExperimentalDependentTypes, TemplateHaskell #-}
+{-# LANGUAGE GHC2024, DependentTypes, ListTuplePuns, TemplateHaskell #-}
 module Main where
 
 import Data.Type.Equality

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, NamedWildCards #-}
+{-# LANGUAGE DataKinds, DependentTypes, NamedWildCards #-}
 {-# LANGUAGE PartialTypeSignatures, ScopedTypeVariables, TypeApplications #-}
 module NativeOpenRetryWrong where
 import qualified RetryCharacters

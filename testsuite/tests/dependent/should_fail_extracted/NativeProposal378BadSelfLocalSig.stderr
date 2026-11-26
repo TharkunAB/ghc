@@ -1,0 +1,15 @@
+NativeProposal378BadSelfLocalSig.hs:6:20: error: [GHC-83605]
+    • A retained local signature index must refer to an already-bound unrestricted local value of a supported index domain.
+    • In the type signature: n :: Vec Int n
+      In the expression:
+        let
+          n :: Vec Int n
+          n = error "impossible"
+        in 0
+      In an equation for ‘bad’:
+          bad
+            = let
+                n :: Vec Int n
+                n = error "impossible"
+              in 0
+

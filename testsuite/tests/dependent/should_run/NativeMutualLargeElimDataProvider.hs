@@ -22,7 +22,7 @@ module NativeMutualLargeElimDataProvider
 
 import Data.Kind (Type)
 
--- 1. Minimal R13_LargeElimMutualData shape.
+-- 1. Minimal LargeElimMutualData shape.
 data Val = Bot | Arr Val Val | Join Val Val
 
 type HaltsV :: Val -> Type

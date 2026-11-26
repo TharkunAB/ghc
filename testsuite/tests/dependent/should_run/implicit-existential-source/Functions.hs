@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 
 module Functions (Function, one, empty, bodyTrap) where
 

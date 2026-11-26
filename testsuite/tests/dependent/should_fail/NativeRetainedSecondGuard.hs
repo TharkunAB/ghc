@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, StandaloneKindSignatures #-}
 module NativeRetainedSecondGuard where
 
 import Data.Kind (Type)

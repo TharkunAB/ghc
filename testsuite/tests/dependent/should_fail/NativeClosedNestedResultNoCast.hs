@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module NativeClosedNestedResultNoCast where
 
 import Data.Proxy (Proxy(..))

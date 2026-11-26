@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, PolyKinds, TypeFamilies, TypeOperators #-}
 module NativeClosedMatchabilityClient where
 
 import Data.Kind (Type)

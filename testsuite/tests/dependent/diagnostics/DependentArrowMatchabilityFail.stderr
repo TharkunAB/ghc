@@ -1,0 +1,42 @@
+DependentArrowMatchabilityFail.hs:11:47: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘* %U -> *’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the second argument of ‘P.D’, namely ‘Maybe’
+      In the type ‘P.D (FUN @U 'Many Type Type) Maybe’
+      In the type synonym declaration for ‘BadMaybeU’
+
+DependentArrowMatchabilityFail.hs:12:50: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %M -> *’, but ‘P.Abstract’ has kind ‘* %U -> *’
+    • In the second argument of ‘P.D’, namely ‘P.Abstract’
+      In the type ‘P.D (FUN @M 'Many Type Type) P.Abstract’
+      In the type synonym declaration for ‘BadAbstractM’
+
+DependentArrowMatchabilityFail.hs:15:23: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %M -> *’, but ‘P.Abstract’ has kind ‘* %U -> *’
+    • In the type ‘(P.Abstract :: Type %M -> Type)’
+      In the type synonym declaration for ‘BadAnnotation’
+
+DependentArrowMatchabilityFail.hs:18:39: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘P.Abstract’ has kind ‘* %U -> *’
+    • In the first argument of ‘AppliedDefault’, namely ‘P.Abstract’
+      In the type ‘AppliedDefault P.Abstract’
+      In the type synonym declaration for ‘AppliedAbstract’
+
+DependentArrowMatchabilityFail.hs:21:81: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘* %U -> *’, but ‘f’ has kind ‘* %M -> *’
+    • In the second argument of ‘P.D’, namely ‘f’
+      In the type ‘(f Bool, P.D (Type %M -> Type) f,
+                    P.D (Type %U -> Type) f)’
+      In the type synonym declaration for ‘BadMixedArrows’
+

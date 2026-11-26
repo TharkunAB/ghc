@@ -1,0 +1,7 @@
+NativeAssociatedSumFamilyRejects.hs:9:3: error: [GHC-41522]
+    • Illegal argument ‘[b]’ in:
+        ‘type Defaulted [b] = ...’
+        The arguments to ‘Defaulted’ must all be distinct type variables.
+    • In the default associated type family instance declaration for ‘Defaulted’
+      In the class declaration for ‘BadPattern’
+

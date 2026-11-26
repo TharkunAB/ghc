@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, TypeOperators #-}
 module NativeClosedIndexedWrongKind where
 import Data.Type.Equality ((:~:)(Refl))
 import qualified IndexedMark as P

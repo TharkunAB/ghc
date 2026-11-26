@@ -1,0 +1,33 @@
+NativeDepComposeHangInvisibleCong.hs:12:17: error: [GHC-83865]
+    • Couldn't match expected type: (p2 :~: p3) -> p0 :~: p1
+                  with actual type: f0 x0 :~: f0 y0
+    • The function ‘congInv’ is applied to two visible arguments,
+        but its type ‘forall {a} {b} {m :: Matchability} (f :: a %m -> b)
+                             (x :: a) (y :: a).
+                      (x :~: y) -> f x :~: f y’
+        has only one
+      In the expression: congInv (plus x) ih
+      In an equation for ‘step’: step x _ _ ih = congInv (plus x) ih
+
+NativeDepComposeHangInvisibleCong.hs:12:25: error: [GHC-83865]
+    • Couldn't match expected type: x0 :~: y0
+                  with actual type: Nat -> Nat
+    • In the first argument of ‘congInv’, namely ‘(plus x)’
+      In the expression: congInv (plus x) ih
+      In an equation for ‘step’: step x _ _ ih = congInv (plus x) ih
+
+NativeDepComposeHangInvisibleCong.hs:12:34: error: [GHC-18872]
+    • Couldn't match type ‘p2’ with ‘foldr plus z xs’
+        arising from a type equality
+          foldr plus z xs :~: plus (foldr plus Zero xs) z ~ p2 :~: p3
+      ‘p2’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeDepComposeHangInvisibleCong.hs:12:34-35
+    • In the second argument of ‘congInv’, namely ‘ih’
+      In the expression: congInv (plus x) ih
+      In an equation for ‘step’: step x _ _ ih = congInv (plus x) ih
+    • Relevant bindings include
+        ih :: foldr plus z xs :~: plus (foldr plus Zero xs) z
+          (bound at NativeDepComposeHangInvisibleCong.hs:12:12)
+

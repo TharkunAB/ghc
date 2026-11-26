@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ImpredicativeTypes, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, ImpredicativeTypes, NoDependentTypes, TypeApplications #-}
 module Main where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

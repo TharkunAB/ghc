@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, LinearTypes, Modifiers, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, LinearTypes, Modifiers, NoDependentTypes #-}
 {-# LANGUAGE PolyKinds, StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators, UnicodeSyntax #-}
 module NativePercentArrowProvider where
 import Data.Kind (Type)

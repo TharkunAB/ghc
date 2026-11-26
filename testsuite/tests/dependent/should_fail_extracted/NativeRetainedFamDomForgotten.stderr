@@ -1,0 +1,5 @@
+NativeRetainedFamDomForgotten.hs:5:14: error: [GHC-39999]
+    • No instance for ‘ConstrainedElements.Allowed Int’
+        arising from a use of ‘Elem’
+    • In the type signature: forgotten :: Ignore (Elem [Int])
+

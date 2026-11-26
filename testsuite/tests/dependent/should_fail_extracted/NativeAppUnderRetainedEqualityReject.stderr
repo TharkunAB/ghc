@@ -1,0 +1,36 @@
+NativeAppUnderRetainedEqualityReject.hs:10:48: error: [GHC-05617]
+    • Could not deduce ‘other ~ g’
+      from the context: a' ~ a
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘crossed’
+        at NativeAppUnderRetainedEqualityReject.hs:10:19-22
+      Expected: Term g a1
+        Actual: Term other a'1
+    • In the first argument of ‘id’, namely ‘x’
+      In the second argument of ‘App’, namely ‘(id x)’
+      In the second argument of ‘Pack’, namely ‘(App f (id x))’
+    • Relevant bindings include
+        x :: Term other a'1
+          (bound at NativeAppUnderRetainedEqualityReject.hs:10:26)
+        f :: Term g (Arr a1 b)
+          (bound at NativeAppUnderRetainedEqualityReject.hs:10:24)
+
+NativeAppUnderRetainedEqualityReject.hs:15:50: error: [GHC-05617]
+    • Could not deduce ‘a' ~ a’
+      from the context: b ~ other
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘unrelated’
+        at NativeAppUnderRetainedEqualityReject.hs:15:21-24
+      Expected: Term g1 a
+        Actual: Term g1 a'
+    • In the first argument of ‘id’, namely ‘x’
+      In the second argument of ‘App’, namely ‘(id x)’
+      In the second argument of ‘Pack’, namely ‘(App f (id x))’
+    • Relevant bindings include
+        x :: Term g1 a'
+          (bound at NativeAppUnderRetainedEqualityReject.hs:15:28)
+        f :: Term g1 (Arr a b)
+          (bound at NativeAppUnderRetainedEqualityReject.hs:15:26)
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LinearTypes, PolyKinds, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LinearTypes, PolyKinds, TypeApplications #-}
 module Nested
   ( packPair, partitionPair, localPartition, buildPair, roundTrip, hiddenKind
   , HiddenProduct, productPair, Product(..)

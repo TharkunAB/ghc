@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, NoDependentTypes #-}
 
 module Main (main) where
 

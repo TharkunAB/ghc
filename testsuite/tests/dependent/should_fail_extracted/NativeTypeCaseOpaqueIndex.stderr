@@ -1,0 +1,23 @@
+NativeTypeCaseOpaqueIndex.hs:14:9: error: [GHC-83865]
+    • Couldn't match kind ‘Ix a0’ with ‘Ordering’
+      Expected kind ‘Gate Ordering’,
+        but ‘'Family _’ has kind ‘Gate (Ix a0)’
+      The type variable ‘a0’ is ambiguous
+    • In the first argument of ‘'Just’, namely ‘('Family _)’
+      When checking the type case in ‘Bad’, at ‘'Just ('Family _)’
+      In the type case in ‘Bad’
+
+NativeTypeCaseOpaqueIndex.hs:27:9: error: [GHC-83865]
+    • Couldn't match kind ‘ClosedIx a0’ with ‘Ordering’
+      Expected kind ‘ClosedGate Ordering’,
+        but ‘'ClosedFamily _’ has kind ‘ClosedGate (ClosedIx a0)’
+      The type variable ‘a0’ is ambiguous
+    • In the first argument of ‘'Just’, namely ‘('ClosedFamily _)’
+      When checking the type case in ‘Blocked’,
+        at ‘'Just ('ClosedFamily _)’
+      In the type case in ‘Blocked’
+
+NativeTypeCaseOpaqueIndex.hs:40:3: error: [GHC-79642]
+    Cannot determine which constructors are possible at this scrutinee kind:
+      ConditionalGate Bool Bool
+

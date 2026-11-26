@@ -1,0 +1,4 @@
+NativeUnboxedCharPrimEscape.hs:4:24: error: [GHC-83865]
+    • Expected a lifted type, but ‘Char#’ is a WordRep type
+    • In a standalone kind signature for ‘Escape’: Char -> Char#
+

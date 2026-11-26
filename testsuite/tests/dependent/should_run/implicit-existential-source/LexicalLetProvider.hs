@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, LinearTypes, RankNTypes, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, LinearTypes, RankNTypes, ScopedTypeVariables, TypeApplications #-}
 module LexicalLetProvider
   ( HiddenPayload, producePayload, lazyPayload, bottomPayload
   , LinearPayload, linearPayload, forwardLinear, forwardLinearIf

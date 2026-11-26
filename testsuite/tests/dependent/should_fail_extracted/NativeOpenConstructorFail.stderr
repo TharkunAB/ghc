@@ -1,0 +1,39 @@
+NativeOpenConstructorFail.hs:11:13: error: [GHC-25897]
+    • Couldn't match type ‘a’ with ‘b’
+      Expected: W.pick (W.RightFields b a)
+        Actual: a
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          wrong :: forall a b. a -> b -> W.pick (W.RightFields b a)
+        at NativeOpenConstructorFail.hs:10:1-58
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          wrong :: forall a b. a -> b -> W.pick (W.RightFields b a)
+        at NativeOpenConstructorFail.hs:10:1-58
+    • In the expression: x
+      In an equation for ‘wrong’: wrong x _ = x
+    • Relevant bindings include
+        x :: a (bound at NativeOpenConstructorFail.hs:11:7)
+        wrong :: a -> b -> W.pick (W.RightFields b a)
+          (bound at NativeOpenConstructorFail.hs:11:1)
+
+NativeOpenConstructorFail.hs:14:18: error: [GHC-83865]
+    • Couldn't match type ‘W.pickNested (W.Nested m) '()’ with ‘'()’
+      Expected: PickNested (W.Nested m) '() :~: '()
+        Actual: '() :~: '()
+    • In the expression: Refl
+      In an equation for ‘nestedDemand’: nestedDemand _ = Refl
+    • Relevant bindings include
+        nestedDemand :: Proxy m -> PickNested (W.Nested m) '() :~: '()
+          (bound at NativeOpenConstructorFail.hs:14:1)
+
+NativeOpenConstructorFail.hs:17:17: error: [GHC-83865]
+    • Couldn't match type ‘W.pickNested p '()’ with ‘'()’
+      Expected: PickNested p '() :~: '()
+        Actual: '() :~: '()
+    • In the expression: Refl
+      In an equation for ‘outerDemand’: outerDemand _ = Refl
+    • Relevant bindings include
+        outerDemand :: Proxy p -> PickNested p '() :~: '()
+          (bound at NativeOpenConstructorFail.hs:17:1)
+

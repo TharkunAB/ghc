@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies, TypeOperators, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies, TypeOperators, UndecidableInstances #-}
 module FamilyCallback (Result, Via, decideVia, law) where
 
 import CompareAt (Result, Witness(..))

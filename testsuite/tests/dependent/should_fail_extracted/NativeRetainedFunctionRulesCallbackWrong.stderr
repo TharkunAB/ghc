@@ -1,0 +1,29 @@
+NativeRetainedFunctionRulesCallbackWrong.hs:8:35: error: [GHC-83865]
+    • Couldn't match type ‘Wrapped’ with ‘Bool’
+      Expected: Bool -> Bool
+        Actual: Wrapped -> Bool
+    • In the expression: readKept f x (makeChoice f x value)
+      In an equation for ‘checkNewtype’:
+          checkNewtype f x value = readKept f x (makeChoice f x value)
+
+NativeRetainedFunctionRulesCallbackWrong.hs:8:51: error: [GHC-83865]
+    • Couldn't match type ‘Wrapped’ with ‘Bool’
+      Expected: Bool -> Bool
+        Actual: Wrapped -> Bool
+    • In the third argument of ‘readKept’, namely
+        ‘(makeChoice f x value)’
+      In the expression: readKept f x (makeChoice f x value)
+      In an equation for ‘checkNewtype’:
+          checkNewtype f x value = readKept f x (makeChoice f x value)
+
+NativeRetainedFunctionRulesCallbackWrong.hs:11:40: error: [GHC-83865]
+    • Couldn't match type: g x
+                     with: f x
+      Expected: Choice (f x)
+        Actual: Choice (g x)
+    • In the third argument of ‘readKept’, namely
+        ‘(makeChoice g x value)’
+      In the expression: readKept f x (makeChoice g x value)
+      In an equation for ‘checkWrong’:
+          checkWrong f g x value = readKept f x (makeChoice g x value)
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitNamespaces, KindSignatures, RankNTypes, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitNamespaces, KindSignatures, RankNTypes, Modifiers #-}
 {-# LANGUAGE TypeFamilies, TypeOperators #-}
 module NativeTypeCaseHeads where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, EmptyCase, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, EmptyCase, DependentTypes, ListTuplePuns, GADTs, PolyKinds, TypeOperators #-}
 module Provider where
 
 import Data.Type.Equality ((:~:)(Refl))

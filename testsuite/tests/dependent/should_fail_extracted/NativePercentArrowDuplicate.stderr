@@ -1,0 +1,5 @@
+NativePercentArrowDuplicate.hs:4:19: error: [GHC-64627]
+    • An arrow can have only one matchability modifier.
+    • In the type ‘Int %M %U -> Bool’
+      In the type synonym declaration for ‘Bad’
+

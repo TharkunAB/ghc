@@ -1,0 +1,6 @@
+NativeScopedFamilyNonVarReceiver.hs:4:24: error: [GHC-83605]
+    • A class method in the remaining type uses this argument as its receiver.
+      Bind the argument to a local variable and pass that variable.
+    • In the expression: measuredEntry True 5
+      In an equation for ‘direct’: direct = measuredEntry True 5
+

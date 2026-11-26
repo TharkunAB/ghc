@@ -1,0 +1,8 @@
+NativeDefaultVectorBadHead.hs:13:16: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S n0’
+      Expected: Vec Char (S n0)
+        Actual: Vec Char Z
+    • In the first argument of ‘safeHead’, namely ‘(filled @Char 0)’
+      In the expression: safeHead (filled @Char 0)
+      In an equation for ‘bad’: bad = safeHead (filled @Char 0)
+

@@ -1,0 +1,9 @@
+NativeClosedComputedPairObserveRight.hs:8:10: error: [GHC-70565]
+    • Cannot evaluate ‘F.pickRight’ in a type.
+        unread
+        
+        HasCallStack backtrace:
+          error, called at ./ComputedPair.hs:8:18 in main:ComputedPair
+    • In the first argument of ‘(:~:)’, namely ‘F.pickRight (W.bump 7)’
+      In the type signature: proof :: F.pickRight (W.bump 7) :~: 'x'
+

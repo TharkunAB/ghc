@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 module NestedInnerBar where
 
 import Vector

@@ -1,0 +1,6 @@
+NativeIndexedFinMissingSucc.hs:7:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘missingSucc’:
+        Patterns of type ‘[a]’, ‘Fin (sourceLength xs)’ not matched:
+            (_:_) (FS _)
+

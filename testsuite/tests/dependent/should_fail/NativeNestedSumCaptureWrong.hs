@@ -1,9 +1,9 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds #-}
-{-# LANGUAGE StandaloneKindSignatures, TypeFamilies, UndecidableInstances #-}
-
+{-# LANGUAGE DependentTypes, TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 module NativeNestedSumCaptureWrong where
 
 import Data.Kind (Type)
+import GHC.Tuple (type Unit)
 
 data N = Z | S N
 
@@ -17,7 +17,7 @@ type family Add n m where
   Add (S n) m = S (Add n m)
 
 type AtLength :: forall (n :: N) -> Vec Bool n -> Type
-type AtLength n v = ()
+type AtLength n v = Unit
 
 type Wrong (n :: N) (m :: N) (v :: Vec Bool (Add n m)) =
   some (left :: Vec Bool n) |

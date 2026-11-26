@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TypeApplications, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeApplications, TypeFamilies, TypeOperators #-}
 module Main where
 import NativeConstrainedFamilyRulesProvider
 import FinitePosition (FinView(AtZero))

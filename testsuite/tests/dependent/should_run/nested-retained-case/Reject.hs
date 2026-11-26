@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, LinearTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, LinearTypes, TypeOperators #-}
 module Reject where
 
 import qualified Data.Type.Equality as Eq

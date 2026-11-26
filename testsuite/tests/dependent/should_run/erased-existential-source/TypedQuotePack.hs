@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}

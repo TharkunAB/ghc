@@ -26,9 +26,7 @@ test('T11311', normal, compile, [''])
 test('T11405', normal, compile, [''])
 test('T11241', normal, compile, [''])
 test('T11711', normal, compile, [''])
-test('CastedConstructorGivens',
-     extra_files(['../../../../docs/dependent-haskell/examples/open-evaluation/CastedConstructorGivens.hs']),
-     compile, ['-dcore-lint -dstg-lint'])
+test('CastedConstructorGivens', normal, compile, ['-dcore-lint -dstg-lint'])
 test('RaeJobTalk', normal, compile, [''])
 test('T11635', normal, compile, [''])
 test('T11719', normal, compile, [''])
@@ -104,8 +102,15 @@ test('NativeTypeCaseQuote', [req_th, only_ways(['normal'])],
      compile, [config.ghc_th_way_flags])
 
 test('NativeSourceCallIface',
-     extra_files(['../../../../docs/dependent-haskell/examples/qualified-pi/ClosedTableLibrary.hs',
-                  '../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs',
-                  'NativeMethodAliases.hs', 'NativeMethodAliasClient.hs', 'NativeLiteralClient.hs',
-                  '../../../../docs/dependent-haskell/examples/packed-vector/RetainedSumOperator.hs']),
+     extra_files(['ClosedTableLibrary.hs',
+                  'PackedVecLibrary.hs',
+                  'NativeMethodAliases.hs',
+                  'NativeMethodAliasClient.hs',
+                  'NativeLiteralClient.hs',
+                  'RetainedSumOperator.hs']),
      makefile_test, ['NativeSourceCallIface'])
+
+test('DepIfaceSerialization',
+     extra_files(['DepIfaceSerialization.hs',
+                  'DepIfaceSerializationClient.hs']),
+     makefile_test, ['DepIfaceSerialization'])

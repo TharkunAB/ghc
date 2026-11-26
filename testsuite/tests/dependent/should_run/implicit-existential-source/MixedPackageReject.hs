@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, LinearTypes, RequiredTypeArguments, ScopedTypeVariables #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, LinearTypes, RequiredTypeArguments, ScopedTypeVariables #-}
 module MixedPackageReject where
 
 import qualified GHC.Exists as Exists

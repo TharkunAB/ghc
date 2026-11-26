@@ -1,0 +1,246 @@
+NativeRetainedFamilyGivenFail.hs:17:23: error: [GHC-05617]
+    • Could not deduce ‘W (f3 n4) ~ W (g n4)’
+      from the context: f3 n4 ~ Count n4
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘callHead’
+        at NativeRetainedFamilyGivenFail.hs:17:16-19
+      Expected: W (Count n4) :~: W (g n4)
+        Actual: W (Count n4) :~: W (Count n4)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In an equation for ‘callHead’: callHead _ _ _ Refl = Refl
+
+NativeRetainedFamilyGivenFail.hs:21:22: error: [GHC-05617]
+    • Could not deduce ‘W (f2 n3) ~ W (f2 m)’
+      from the context: f2 n3 ~ Count n3
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘callArg’
+        at NativeRetainedFamilyGivenFail.hs:21:15-18
+      Expected: W (Count n3) :~: W (f2 m)
+        Actual: W (Count n3) :~: W (Count n3)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In an equation for ‘callArg’: callArg _ _ _ Refl = Refl
+
+NativeRetainedFamilyGivenFail.hs:25:25: error: [GHC-05617]
+    • Could not deduce ‘W (f1 n2) ~ W (Count n2)’
+      from the context: Coercible (Count n2) (f1 n2)
+        bound by a pattern with constructor:
+                   Coercion :: forall {k} (a :: k) (b :: k).
+                               Coercible a b =>
+                               Coercion a b,
+                 in an equation for ‘callRole’
+        at NativeRetainedFamilyGivenFail.hs:25:14-21
+      Expected: W (Count n2) :~: W (f1 n2)
+        Actual: W (Count n2) :~: W (Count n2)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In an equation for ‘callRole’: callRole _ _ Coercion = Refl
+
+NativeRetainedFamilyGivenFail.hs:29:22: error: [GHC-05617]
+    • Could not deduce ‘W (Count n1) ~ W Zero’
+      from the context: f (Count n1) ~ Count n1
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘callCycle’
+        at NativeRetainedFamilyGivenFail.hs:29:15-18
+      Expected: W (Count n1) :~: W Zero
+        Actual: W (Count n1) :~: W (Count n1)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In an equation for ‘callCycle’: callCycle _ _ Refl = Refl
+
+NativeRetainedFamilyGivenFail.hs:34:14: error: [GHC-83865]
+    • Couldn't match type: W (F xs5)
+                     with: W (G xs5)
+      Expected: W (F xs5) :~: W (G xs5)
+        Actual: W (F xs5) :~: W (F xs5)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In a case alternative: Nothing -> Refl
+      In the expression:
+        case proof of
+          Just Refl -> Refl
+          Nothing -> Refl
+    • Relevant bindings include
+        proof :: Maybe (F xs5 :~: G xs5)
+          (bound at NativeRetainedFamilyGivenFail.hs:32:11)
+
+NativeRetainedFamilyGivenFail.hs:38:44: error: [GHC-05617]
+    • Could not deduce ‘W (F ys1) ~ W (G ys1)’
+      from the context: G xs ~ F xs
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeRetainedFamilyGivenFail.hs:38:36-39
+      Expected: W (F ys1) :~: W (G ys1)
+        Actual: W (F ys1) :~: W (F ys1)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In a case alternative: Refl -> Refl
+      In the expression: case proof of Refl -> Refl
+
+NativeRetainedFamilyGivenFail.hs:41:45: error: [GHC-05617]
+    • Could not deduce ‘W (F xs4) ~ W (G xs4)’
+      from the context: Coercible (F xs4) (G xs4)
+        bound by a pattern with constructor:
+                   Coercion :: forall {k} (a :: k) (b :: k).
+                               Coercible a b =>
+                               Coercion a b,
+                 in a case alternative
+        at NativeRetainedFamilyGivenFail.hs:41:33-40
+      Expected: W (F xs4) :~: W (G xs4)
+        Actual: W (F xs4) :~: W (F xs4)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In a case alternative: Coercion -> Refl
+      In the expression: case proof of Coercion -> Refl
+    • Relevant bindings include
+        proof :: Coercion (F xs4) (G xs4)
+          (bound at NativeRetainedFamilyGivenFail.hs:41:11)
+
+NativeRetainedFamilyGivenFail.hs:44:42: error: [GHC-05617]
+    • Could not deduce ‘W (F xs3) ~ W Zero’
+      from the context: Succ (F xs3) ~ F xs3
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeRetainedFamilyGivenFail.hs:44:34-37
+      Expected: W (F xs3) :~: W Zero
+        Actual: W (F xs3) :~: W (F xs3)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In a case alternative: Refl -> Refl
+      In the expression: case proof of Refl -> Refl
+    • Relevant bindings include
+        proof :: F xs3 :~: Succ (F xs3)
+          (bound at NativeRetainedFamilyGivenFail.hs:44:12)
+
+NativeRetainedFamilyGivenFail.hs:50:22: error: [GHC-05617]
+    • Could not deduce ‘b2 ~ True’
+      from the context: b2 ~ Closed b2
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘closedWrong’
+        at NativeRetainedFamilyGivenFail.hs:50:15-18
+      Expected: Just (Closed b2) :~: Just True
+        Actual: Just (Closed b2) :~: Just (Closed b2)
+    • In the expression: Refl
+      In an equation for ‘closedWrong’: closedWrong _ Refl = Refl
+
+NativeRetainedFamilyGivenFail.hs:54:47: error: [GHC-05617]
+    • Could not deduce ‘W (F ys) ~ W (G ys)’
+      from the context: F xs ~ G xs
+        bound by a type expected by the context:
+                   (F xs ~ G xs) => W (F ys) :~: W (G ys)
+        at NativeRetainedFamilyGivenFail.hs:54:47-50
+      Expected: W (F ys) :~: W (G ys)
+        Actual: W (F ys) :~: W (F ys)
+      Note: ‘W’ is a non-injective type family.
+    • In the second argument of ‘gcastWith’, namely ‘Refl’
+      In the expression: gcastWith proof Refl
+      In an equation for ‘wrongContinuation’:
+          wrongContinuation _ _ proof = gcastWith proof Refl
+
+NativeRetainedFamilyGivenFail.hs:63:48: error: [GHC-83865]
+    • Couldn't match type: W (F xs)
+                     with: W (G xs)
+      Expected: W (F xs) :~: W (G xs)
+        Actual: W (F xs) :~: W (F xs)
+      Note: ‘W’ is a non-injective type family.
+    • In the second argument of ‘eliminate’, namely ‘Refl’
+      In the second argument of ‘trans’, namely
+        ‘(eliminate (id proof) Refl)’
+      In the first argument of ‘trans’, namely
+        ‘(trans (id left) (eliminate (id proof) Refl))’
+    • Relevant bindings include
+        right :: W (G xs) :~: G xs
+          (bound at NativeRetainedFamilyGivenFail.hs:62:24)
+        proof :: F xs :~: F xs
+          (bound at NativeRetainedFamilyGivenFail.hs:62:18)
+        left :: F xs :~: W (F xs)
+          (bound at NativeRetainedFamilyGivenFail.hs:62:13)
+
+NativeRetainedFamilyGivenFail.hs:67:20: error: [GHC-83865]
+    • Couldn't match type ‘b0’ with ‘G xs1’
+      Expected: a0 :~: b0
+        Actual: F xs1 :~: G xs1
+      ‘b0’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeRetainedFamilyGivenFail.hs:67:10-34
+    • In the first argument of ‘eliminate’, namely ‘(id proof)’
+      In the first argument of ‘trans’, namely
+        ‘(eliminate (id proof) Refl)’
+      In the expression:
+        trans (eliminate (id proof) Refl) (eliminate (id proof) Refl)
+    • Relevant bindings include
+        proof :: F xs1 :~: G xs1
+          (bound at NativeRetainedFamilyGivenFail.hs:66:17)
+
+NativeRetainedFamilyGivenFail.hs:67:48: error: [GHC-83865]
+    • Couldn't match type ‘b1’ with ‘G xs1’
+      Expected: a1 :~: b1
+        Actual: F xs1 :~: G xs1
+      ‘b1’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeRetainedFamilyGivenFail.hs:67:38-62
+    • In the first argument of ‘eliminate’, namely ‘(id proof)’
+      In the second argument of ‘trans’, namely
+        ‘(eliminate (id proof) Refl)’
+      In the expression:
+        trans (eliminate (id proof) Refl) (eliminate (id proof) Refl)
+    • Relevant bindings include
+        proof :: F xs1 :~: G xs1
+          (bound at NativeRetainedFamilyGivenFail.hs:66:17)
+
+NativeRetainedFamilyGivenFail.hs:67:59: error: [GHC-05617]
+    • Could not deduce ‘W a0 ~ W b1’
+      from the context: a1 ~ b1
+        bound by a type expected by the context:
+                   (a1 ~ b1) => W a0 :~: W b1
+        at NativeRetainedFamilyGivenFail.hs:67:59-62
+      Expected: W a0 :~: W b1
+        Actual: W a0 :~: W a0
+      Note: ‘W’ is a non-injective type family.
+      The type variables ‘a0’, ‘b1’ are ambiguous
+    • In the second argument of ‘eliminate’, namely ‘Refl’
+      In the second argument of ‘trans’, namely
+        ‘(eliminate (id proof) Refl)’
+      In the expression:
+        trans (eliminate (id proof) Refl) (eliminate (id proof) Refl)
+
+NativeRetainedFamilyGivenFail.hs:73:55: error: [GHC-83865]
+    • Couldn't match type: W (F xs2)
+                     with: W (G xs2)
+      Expected: W (F xs2) :~: W (G xs2)
+        Actual: W (F xs2) :~: W (F xs2)
+      Note: ‘W’ is a non-injective type family.
+    • In the expression: Refl
+      In a case alternative: () -> Refl
+      In the expression: case consume xs proof of () -> Refl
+    • Relevant bindings include
+        proof :: F xs2 :~: G xs2
+          (bound at NativeRetainedFamilyGivenFail.hs:73:16)
+
+NativeRetainedFamilyGivenFail.hs:80:49: error: [GHC-05617]
+    • Could not deduce ‘extent ~ S n0’
+      from the context: extent ~ Z
+        bound by a type expected by the context:
+                   (extent ~ Z) => Maybe Char
+        at NativeRetainedFamilyGivenFail.hs:80:33-78
+      Expected: Vec Char ((1 :: Nat) + n0)
+        Actual: Vec Char extent
+    • In the first argument of ‘firstVec’, namely
+        ‘(replicateNative extent 'x')’
+      In the first argument of ‘Just’, namely
+        ‘(firstVec (replicateNative extent 'x'))’
+      In the second argument of ‘gcastWith’, namely
+        ‘(Just (firstVec (replicateNative extent 'x')))’
+    • Relevant bindings include
+        proof :: extent :~: Z
+          (bound at NativeRetainedFamilyGivenFail.hs:80:8)
+

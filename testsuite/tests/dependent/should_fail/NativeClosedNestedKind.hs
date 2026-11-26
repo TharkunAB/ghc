@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module NativeClosedNestedKind where
 
 import qualified Data.Char

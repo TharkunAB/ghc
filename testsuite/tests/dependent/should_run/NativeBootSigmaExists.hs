@@ -7,6 +7,7 @@ import GHC.Exists
 import GHC.Sigma (Sigma(..), first, second)
 import GHC.Tuple (Tuple2, Unit)
 import NativeBootSigmaExistsProvider
+import NativeBootSigmaExistsOrdinary (checkOrdinaryCPair)
 import Prelude
 
 bottomNat :: Nat
@@ -56,6 +57,7 @@ main = do
     && barStr == "99"
     && plainVal == 123
     && lazyDiscard
+    && checkOrdinaryCPair
     )
   if not res
     then error "NativeBootSigmaExists observation mismatch"

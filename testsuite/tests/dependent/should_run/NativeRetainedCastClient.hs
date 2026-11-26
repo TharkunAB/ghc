@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE RankNTypes, TypeApplications, TypeOperators #-}
 module Main where
 

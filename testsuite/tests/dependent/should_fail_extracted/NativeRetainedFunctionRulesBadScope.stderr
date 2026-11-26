@@ -1,0 +1,51 @@
+NativeRetainedFunctionRulesBadScope.hs:20:69: error: [GHC-83865]
+    • Expecting one more argument to ‘Maybe’
+      Expected a type,
+      but ‘Maybe’ has kind
+      ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the type ‘Maybe’
+      In the expression: keepAfter ignored @Maybe m x
+      When checking the rewrite rule "wrong kind after"
+
+NativeRetainedFunctionRulesBadScope.hs:28:34: error: [GHC-83865]
+    • Couldn't match type ‘other’ with ‘m’
+      Expected: Reading m
+        Actual: Reading other
+    • In the fifth argument of ‘keepAfterTwo’, namely ‘x’
+      In the expression: keepAfterTwo b @Bool m other x
+      When checking the rewrite rule "independent"
+    • Relevant bindings include
+        x :: Reading other
+          (bound at NativeRetainedFunctionRulesBadScope.hs:27:59)
+
+NativeRetainedFunctionRulesBadScope.hs:28:38: error: [GHC-83865]
+    • Couldn't match type ‘other’ with ‘m’
+      Expected: Reading m
+        Actual: Reading other
+    • In the expression: x
+      When checking the rewrite rule "independent"
+    • Relevant bindings include
+        x :: Reading other
+          (bound at NativeRetainedFunctionRulesBadScope.hs:27:59)
+
+NativeRetainedFunctionRulesBadScope.hs:40:49: error: [GHC-83865]
+    • Couldn't match type ‘right’ with ‘left’
+      Expected: TaggedReading left m1
+        Actual: TaggedReading right m1
+    • In the expression: keepRequired right (type Bool) m x
+      When checking the rewrite rule "independentReq"
+    • Relevant bindings include
+        x :: TaggedReading left m1
+          (bound at NativeRetainedFunctionRulesBadScope.hs:39:58)
+
+NativeRetainedFunctionRulesBadScope.hs:40:82: error: [GHC-83865]
+    • Couldn't match type ‘left’ with ‘right’
+      Expected: TaggedReading right m1
+        Actual: TaggedReading left m1
+    • In the fourth argument of ‘keepRequired’, namely ‘x’
+      In the expression: keepRequired right (type Bool) m x
+      When checking the rewrite rule "independentReq"
+    • Relevant bindings include
+        x :: TaggedReading left m1
+          (bound at NativeRetainedFunctionRulesBadScope.hs:39:58)
+

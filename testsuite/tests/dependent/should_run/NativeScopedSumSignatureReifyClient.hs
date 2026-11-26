@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 {-# LANGUAGE TemplateHaskell #-}
 module NativeScopedSumSignatureReifyClient where
 

@@ -1,0 +1,5 @@
+NativeTypeCaseInvalid.hs:6:3: error: [GHC-76037]
+    Not in scope: data constructor ‘Test’
+    Suggested fix:
+      Perhaps use type constructor or class ‘Test’ (line 4)
+

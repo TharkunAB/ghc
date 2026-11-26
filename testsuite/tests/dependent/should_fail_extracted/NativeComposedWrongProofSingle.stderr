@@ -1,0 +1,52 @@
+NativeComposedWrongProofSingle.hs:10:47: error: [GHC-83865]
+    • Couldn't match expected type: foreach (x :: a) -> g (to x) :~: x
+                  with actual type: foreach (x :: a) -> g (h (f x)) :~: x
+    • In the fifth argument of ‘MkIso’, namely ‘left’
+      In the expression: MkIso @a @a to g left right
+      In an equation for ‘badSingle’:
+          badSingle _ g h left right
+            = MkIso @a @a to g left right
+            where
+                to :: a -> a
+                to x = h x
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedWrongProofSingle.hs:13:5)
+        right :: foreach (y :: a) -> h (f (g y)) :~: y
+          (bound at NativeComposedWrongProofSingle.hs:10:22)
+        left :: foreach (x :: a) -> g (h (f x)) :~: x
+          (bound at NativeComposedWrongProofSingle.hs:10:17)
+        h :: a -> a (bound at NativeComposedWrongProofSingle.hs:10:15)
+        g :: a -> a (bound at NativeComposedWrongProofSingle.hs:10:13)
+        badSingle :: foreach (f :: a -> a)
+                     -> foreach (g :: a -> a)
+                        -> foreach (h :: a -> a)
+                           -> (foreach (x :: a) -> g (h (f x)) :~: x)
+                              -> (foreach (y :: a) -> h (f (g y)) :~: y) -> Iso a a
+          (bound at NativeComposedWrongProofSingle.hs:10:1)
+
+NativeComposedWrongProofSingle.hs:10:52: error: [GHC-83865]
+    • Couldn't match expected type: foreach (y :: a) -> to (g y) :~: y
+                  with actual type: foreach (y :: a) -> h (f (g y)) :~: y
+    • In the sixth argument of ‘MkIso’, namely ‘right’
+      In the expression: MkIso @a @a to g left right
+      In an equation for ‘badSingle’:
+          badSingle _ g h left right
+            = MkIso @a @a to g left right
+            where
+                to :: a -> a
+                to x = h x
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedWrongProofSingle.hs:13:5)
+        right :: foreach (y :: a) -> h (f (g y)) :~: y
+          (bound at NativeComposedWrongProofSingle.hs:10:22)
+        left :: foreach (x :: a) -> g (h (f x)) :~: x
+          (bound at NativeComposedWrongProofSingle.hs:10:17)
+        h :: a -> a (bound at NativeComposedWrongProofSingle.hs:10:15)
+        g :: a -> a (bound at NativeComposedWrongProofSingle.hs:10:13)
+        badSingle :: foreach (f :: a -> a)
+                     -> foreach (g :: a -> a)
+                        -> foreach (h :: a -> a)
+                           -> (foreach (x :: a) -> g (h (f x)) :~: x)
+                              -> (foreach (y :: a) -> h (f (g y)) :~: y) -> Iso a a
+          (bound at NativeComposedWrongProofSingle.hs:10:1)
+

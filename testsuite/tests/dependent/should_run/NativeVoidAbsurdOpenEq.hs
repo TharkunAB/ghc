@@ -8,7 +8,7 @@ import GHC.Tuple (Tuple2, Unit)
 
 import NativeVoidAbsurdOpenEqProvider
 
--- Same-module empty-case and absurd functions for R13 staging coverage.
+-- Same-module empty-case and absurd functions for staging coverage.
 localSumZeroRTo :: Either a Void -> a
 localSumZeroRTo (Left x)  = x
 localSumZeroRTo (Right v) = case v of {}

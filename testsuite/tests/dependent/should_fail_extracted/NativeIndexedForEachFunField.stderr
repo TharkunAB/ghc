@@ -1,0 +1,6 @@
+NativeIndexedForEachFunField.hs:5:23: error: [GHC-83605]
+    • This retained argument has an unsupported function domain.
+      Its declared domain is: UTerm n -> UTerm n
+    • In the definition of data constructor ‘MkBadFun’
+      In the data type declaration for ‘BadFun’
+

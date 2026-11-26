@@ -1,0 +1,7 @@
+NativeBinaryEnumStrictModFail.hs:8:45: error: [GHC-70565]
+    • Cannot evaluate ‘IS.choose’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the first argument of ‘(:~:)’, namely ‘IS.choose 'False b’
+      In the type signature:
+        badStrictMod :: Proxy b -> IS.choose 'False b :~: b
+

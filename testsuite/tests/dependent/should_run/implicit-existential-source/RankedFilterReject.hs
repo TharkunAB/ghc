@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, ImpredicativeTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, ImpredicativeTypes, NoDependentTypes #-}
 module RankedFilterReject where
 
 import Filter (Hidden, filterVec, toList)

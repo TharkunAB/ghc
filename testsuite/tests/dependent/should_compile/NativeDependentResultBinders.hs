@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, PolyKinds, ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators #-}
 module NativeDependentResultBinders where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, RankNTypes #-}
 module NestedCapture where
 
 import Vector

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, ImpredicativeTypes, LinearTypes, NoExperimentalDependentTypes, RankNTypes, RequiredTypeArguments, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, ImpredicativeTypes, LinearTypes, NoDependentTypes, RankNTypes, RequiredTypeArguments, ScopedTypeVariables, TypeApplications #-}
 module WitnessLambdaReject where
 
 import Data.Proxy

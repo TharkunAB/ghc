@@ -1,0 +1,7 @@
+NativeNamedSiblingForeignFieldFail.hs:10:9: error: [GHC-53822]
+    • Constructor ‘NamedColumns’ does not have field ‘foreignField’
+    • In the expression:
+        NamedColumns {storedLength = Z, foreignField = True}
+      In an equation for ‘wrong’:
+          wrong = NamedColumns {storedLength = Z, foreignField = True}
+

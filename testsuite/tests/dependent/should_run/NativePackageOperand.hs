@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, RankNTypes, TypeFamilies #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, RankNTypes, TypeFamilies #-}
 module NativePackageOperand where
 
 import Data.Kind (Type)

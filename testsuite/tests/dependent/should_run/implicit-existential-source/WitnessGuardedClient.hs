@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, ImpredicativeTypes, LambdaCase, MultiWayIf, NoExperimentalDependentTypes, RequiredTypeArguments, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, ImpredicativeTypes, LambdaCase, MultiWayIf, NoDependentTypes, RequiredTypeArguments, TypeApplications #-}
 module WitnessGuardedClient where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

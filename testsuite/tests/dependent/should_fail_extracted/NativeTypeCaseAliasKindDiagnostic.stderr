@@ -1,0 +1,18 @@
+NativeTypeCaseAliasKindDiagnostic.hs:13:18: error: [GHC-83865]
+    • Couldn't match kind ‘Bool’ with ‘Ordering’
+      Expected kind ‘Maybe UserPayload’,
+        but ‘'Just 'True’ has kind ‘Maybe Bool’
+    • In the type ‘'Just 'True’
+      In the type case in ‘BadResult’
+
+NativeTypeCaseAliasKindDiagnostic.hs:22:19: error: [GHC-83865]
+    • Expected kind ‘Maybe Ordering’, but ‘Maybe 'True’ has kind ‘*’
+    • In the type ‘Maybe 'True’
+      In the type case in ‘BadOtherBranch’
+
+NativeTypeCaseAliasKindDiagnostic.hs:22:25: error: [GHC-83865]
+    • Expected a type, but ‘'True’ has kind ‘Bool’
+    • In the first argument of ‘Maybe’, namely ‘'True’
+      In the type ‘Maybe 'True’
+      In the type case in ‘BadOtherBranch’
+

@@ -1,0 +1,5 @@
+NativeOpenConstructorHelpersRuleFail.hs:31:15: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘P.choose’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘bridgeProof’: bridgeProof = Refl
+

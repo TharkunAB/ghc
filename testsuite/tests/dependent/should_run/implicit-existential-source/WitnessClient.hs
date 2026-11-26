@@ -1,5 +1,5 @@
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 {-# LANGUAGE DataKinds, LinearTypes, RequiredTypeArguments, TypeApplications #-}
 module WitnessClient where
 import Control.Monad (unless)

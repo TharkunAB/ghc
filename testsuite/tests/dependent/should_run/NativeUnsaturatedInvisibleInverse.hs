@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, FlexibleContexts, Modifiers, PolyKinds, RankNTypes, StandaloneKindSignatures, TypeApplications, TypeFamilies #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, Modifiers, PolyKinds, RankNTypes, StandaloneKindSignatures, TypeApplications, TypeFamilies #-}
 module NativeUnsaturatedInvisibleInverse where
 import Data.Kind (Type)
 import Data.Type.Equality

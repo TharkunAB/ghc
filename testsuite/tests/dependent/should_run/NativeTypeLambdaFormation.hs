@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, KindSignatures #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, KindSignatures #-}
 {-# LANGUAGE PolyKinds, ScopedTypeVariables, TypeFamilies #-}
 module NativeTypeLambdaFormation (formed) where
 

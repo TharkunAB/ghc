@@ -1,0 +1,39 @@
+NativeOpenFilterCutoffFail.hs:15:24: error: [GHC-83865]
+    • Couldn't match type: PreludeMapLengthSize.size (filter g1 rows)
+                     with: PreludeMapLengthSize.size (filter f1 rows)
+      Expected: AtMost (Count (FilterWith f1 rows)) (Count rows)
+        Actual: AtMost (Count (FilterWith g1 rows)) (Count rows)
+      Note: GHC cannot determine the arguments of the function ‘PreludeMapLengthSize.size’ from its result.
+    • In the expression:
+        runtimeFilterBoundFor @[Bool] (type g) (decideRow g) rows
+      In an equation for ‘wrongTarget’:
+          wrongTarget _ g rows
+            = runtimeFilterBoundFor @[Bool] (type g) (decideRow g) rows
+
+NativeOpenFilterCutoffFail.hs:19:65: error: [GHC-83865]
+    • Couldn't match expected type: foreach (x :: [Bool])
+                                    -> BooleanResult (f x)
+                  with actual type: foreach (row :: [Bool]) -> BooleanResult (g row)
+    • In the third argument of ‘runtimeFilterBoundFor’, namely
+        ‘(decideRow g)’
+      In the expression:
+        runtimeFilterBoundFor @[Bool] (type f) (decideRow g) rows
+      In an equation for ‘wrongDecider’:
+          wrongDecider f g rows
+            = runtimeFilterBoundFor @[Bool] (type f) (decideRow g) rows
+
+NativeOpenFilterCutoffFail.hs:26:19: error: [GHC-39999]
+    • Ambiguous type variable ‘b0’ arising from a use of ‘choose’
+      prevents the constraint ‘(Show b0)’ from being solved.
+      Probable fix: use a type annotation to specify what ‘b0’ should be.
+      Potentially matching instances:
+        instance Show (AtMost m n)
+          -- Defined at PreludeFilterLengthProof.hs:20:1
+        instance Show Integer -- Defined in ‘GHC.Internal.Show’
+        ...plus 26 others
+        ...plus 107 instances involving out-of-scope types
+        (use -fprint-potential-instances to see them all)
+    • In the expression: choose @Bool (type Negation) negationResult
+      In an equation for ‘ambiguousResult’:
+          ambiguousResult = choose @Bool (type Negation) negationResult
+

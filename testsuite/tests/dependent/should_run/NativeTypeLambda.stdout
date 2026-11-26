@@ -1,0 +1,7 @@
+(Left GT,Right True,Just 'a',Just True)
+(Just 'x',Right True)
+Right 'x'
+Right 'x'
+(Just 42,Left "missing")
+Right True
+('r','s')

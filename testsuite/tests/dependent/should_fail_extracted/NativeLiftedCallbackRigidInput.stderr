@@ -1,0 +1,39 @@
+NativeLiftedCallbackRigidInput.hs:6:58: error: [GHC-83605]
+    • The input of this retained callback must have kind ‘Type’.
+      ‘a’ has kind ‘TYPE r’.
+    • In the type signature:
+        rigid :: forall (r :: RuntimeRep) (a :: TYPE r). foreach (p :: a
+                                                                       -> Bool) ->
+                                                         Bool
+
+NativeLiftedCallbackRigidInput.hs:9:48: error: [GHC-83605]
+    • The input of this retained callback must have kind ‘Type’.
+      ‘a’ has kind ‘TYPE IntRep’.
+    • In the type signature:
+        unlifted :: forall (a :: TYPE IntRep). foreach (p :: a -> Bool) ->
+                                               Bool
+
+NativeLiftedCallbackRigidInput.hs:12:64: error: [GHC-83605]
+    • The result of this retained callback must have kind ‘Type’.
+      ‘b’ has kind ‘TYPE r’.
+    • In the type signature:
+        rigidResult :: forall (r :: RuntimeRep)
+                              (b :: TYPE r). foreach (p :: Bool -> b) -> Bool
+
+NativeLiftedCallbackRigidInput.hs:16:44: error: [GHC-83605]
+    • The result of this retained callback must have kind ‘Type’.
+      ‘b’ has kind ‘TYPE r’.
+    • In the first argument of ‘(:~:)’, namely ‘f p p’
+      In the type signature:
+        nestedResult :: forall (r :: RuntimeRep)
+                               (b :: TYPE r). foreach (f :: Bool -> Bool -> b) ->
+                                              foreach (p :: Bool) -> f p p :~: f p p
+
+NativeLiftedCallbackRigidInput.hs:20:44: error: [GHC-83605]
+    • A retained argument must have unrestricted multiplicity Many.
+      This argument has multiplicity: One
+    • In the first argument of ‘(:~:)’, namely ‘f p p’
+      In the type signature:
+        nestedLinear :: foreach (f :: Bool -> Bool %1 -> Bool) ->
+                        foreach (p :: Bool) -> f p p :~: f p p
+

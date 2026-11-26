@@ -1,0 +1,11 @@
+NativeRetainedPolyWrongAnnotCtor.hs:7:22: error: [GHC-83865]
+    • Couldn't match type ‘P.Zero’ with ‘P.Succ P.Zero’
+      Expected: P.UCtx P.Zero (P.Succ P.Zero)
+        Actual: P.UCtx P.Zero P.Zero
+    • In the first argument of ‘acceptNonDiag’, namely
+        ‘(P.CHole :: P.UCtx 'P.Zero ('P.Succ 'P.Zero))’
+      In the expression:
+        acceptNonDiag (P.CHole :: P.UCtx 'P.Zero ('P.Succ 'P.Zero))
+      In an equation for ‘bad’:
+          bad = acceptNonDiag (P.CHole :: P.UCtx 'P.Zero ('P.Succ 'P.Zero))
+

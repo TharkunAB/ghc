@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, KindSignatures #-}
 module NativeExprSigWrongReceiver where
 
 import Data.Proxy (Proxy(..))

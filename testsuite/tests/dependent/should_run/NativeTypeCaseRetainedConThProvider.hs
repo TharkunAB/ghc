@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LinearTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LinearTypes #-}
 module NativeTypeCaseRetainedConThProvider where
 
 import GHC.Types (Multiplicity(Many))

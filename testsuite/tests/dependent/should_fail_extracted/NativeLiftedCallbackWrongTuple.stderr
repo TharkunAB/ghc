@@ -1,0 +1,16 @@
+NativeLiftedCallbackWrongTuple.hs:6:19: error: [GHC-25897]
+    • Couldn't match type ‘chosen’ with ‘f x’
+      Expected: Decision chosen
+        Actual: Decision (f x)
+      ‘chosen’ is a rigid type variable bound by
+        the type signature for:
+          wrongTuple :: forall (chosen :: Bool).
+                        (Bool -> Bool) -> Bool -> (Decision chosen, ())
+        at NativeLiftedCallbackWrongTuple.hs:5:1-86
+    • In the expression: decide f x
+      In the expression: (decide f x, ())
+      In an equation for ‘wrongTuple’: wrongTuple f x = (decide f x, ())
+    • Relevant bindings include
+        wrongTuple :: (Bool -> Bool) -> Bool -> (Decision chosen, ())
+          (bound at NativeLiftedCallbackWrongTuple.hs:6:1)
+

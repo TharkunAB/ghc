@@ -1,0 +1,24 @@
+NativeTypeCaseSynonymCatchAll.hs:8:39: error: [GHC-55789]
+    • After expanding type synonyms, the pattern has no constructor head:
+        x
+    • In a branch of the type case in ‘Direct’
+      In the type family instance declaration for ‘NativeTypeCaseSynonymCatchAll.$case:Direct:0’
+
+NativeTypeCaseSynonymCatchAll.hs:9:39: error: [GHC-55789]
+    • After expanding type synonyms, the pattern has no constructor head:
+        x
+    • In a branch of the type case in ‘Nested’
+      In the type family instance declaration for ‘NativeTypeCaseSynonymCatchAll.$case:Nested:0’
+
+NativeTypeCaseSynonymCatchAll.hs:10:35: error: [GHC-55789]
+    • After expanding type synonyms, the pattern has no constructor head:
+        x
+    • In a branch of the type lambda in ‘Lambda’
+      In the type family instance declaration for ‘NativeTypeCaseSynonymCatchAll.$lambda:Lambda:0’
+
+NativeTypeCaseSynonymCatchAll.hs:11:41: error: [GHC-55789]
+    • After expanding type synonyms, the pattern has no constructor head:
+        x
+    • In a branch of the type case in ‘Imported’
+      In the type family instance declaration for ‘NativeTypeCaseSynonymCatchAll.$case:Imported:0’
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds, StandaloneKindSignatures #-}
 {-# LANGUAGE TypeAbstractions, TypeApplications, TypeFamilies, TypeOperators #-}
 module NativeUnsaturatedProvider (Select, Callback, Same, ForwardMap, WrittenMap, NamedMap) where
 

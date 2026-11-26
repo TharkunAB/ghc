@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 module Main where
 
 import Data.IORef (newIORef, readIORef)

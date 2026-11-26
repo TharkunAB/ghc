@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes, TypeFamilies, TypeOperators #-}
 module NativeRetainedFamilyGiven where
 
 import Data.Type.Equality ((:~:)(Refl), gcastWith, trans)

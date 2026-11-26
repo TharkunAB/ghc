@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeApplications, TypeOperators #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 module InstalledStagedPair where
 

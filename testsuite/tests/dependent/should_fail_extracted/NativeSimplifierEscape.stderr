@@ -1,0 +1,18 @@
+NativeSimplifierEscape.hs:6:57: error: [GHC-25897]
+    • Couldn't match expected type ‘a’ with actual type ‘t0’
+      ‘t0’ is a rigid type variable bound by
+        the type RankedBuilder
+        at NativeSimplifierEscape.hs:6:25-31
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          escape :: forall a. RankedBuilder -> Bool -> a
+        at NativeSimplifierEscape.hs:5:1-36
+    • In the expression: value
+      In a case alternative: Payload value _ -> value
+      In the expression: case builder b of Payload value _ -> value
+    • Relevant bindings include
+        value :: t0 (bound at NativeSimplifierEscape.hs:6:46)
+        unpacked_a1zS :: Bool -> Payload t0 (bound at <no location info>)
+        escape :: RankedBuilder -> Bool -> a
+          (bound at NativeSimplifierEscape.hs:6:1)
+

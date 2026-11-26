@@ -1,4 +1,4 @@
-{-# LANGUAGE ImpredicativeTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ImpredicativeTypes, NoDependentTypes #-}
 module RankedForwardEvidenceReject where
 
 import MixedPackageProvider

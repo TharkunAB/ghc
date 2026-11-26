@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, LinearTypes, MonoLocalBinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, DataKinds, LinearTypes, MonoLocalBinds, NoDependentTypes #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications #-}
 module LexicalOpenReject where
 

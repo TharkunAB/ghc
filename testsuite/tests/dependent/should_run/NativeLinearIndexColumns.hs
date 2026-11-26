@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, LinearTypes, ScopedTypeVariables, Strict #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, LinearTypes, ScopedTypeVariables, Strict #-}
 module NativeLinearIndexColumns (choose) where
 
 import PackedVecLibrary (sourceLength)

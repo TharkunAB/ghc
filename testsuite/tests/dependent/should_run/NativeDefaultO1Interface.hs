@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 module Main where
 
 import Control.Exception (ErrorCall, evaluate, try)

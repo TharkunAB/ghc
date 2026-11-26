@@ -1,0 +1,3 @@
+NativeTypeLetDisabled.hs:4:17: error: [GHC-29822]
+    A type-level ‘let’ or local ‘type’ synonym requires -XDependentTypes or -XExtendedLet.
+

@@ -1,0 +1,7 @@
+NativeSuperclassAmbiguousSig.hs:4:72: error: [GHC-83605]
+    • An opaque call index requires a local unrestricted function applied to value arguments of its declared domains.
+    • In the first argument of ‘Tagged’, namely ‘(choose x)’
+      In the type signature:
+        badSig :: (SubChoose a, AltSubChoose a) =>
+                  foreach (x :: a) -> Tagged (choose x)
+

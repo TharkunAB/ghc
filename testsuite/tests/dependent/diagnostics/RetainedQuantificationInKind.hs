@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, KindSignatures, RankNTypes #-}
 module RetainedQuantificationInKind where
 import Data.Proxy (Proxy(..))
 

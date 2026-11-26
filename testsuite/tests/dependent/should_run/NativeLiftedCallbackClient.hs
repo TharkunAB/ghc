@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TupleSections #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TupleSections #-}
 module Main where
 
 import CompareOptional (readJust)

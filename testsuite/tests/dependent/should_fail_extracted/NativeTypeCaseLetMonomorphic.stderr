@@ -1,0 +1,14 @@
+NativeTypeCaseLetMonomorphic.hs:6:22: error: [GHC-83865]
+    • Couldn't match kind ‘*’ with ‘Bool’
+      Expected kind ‘[Maybe Bool]’, but ‘x’ has kind ‘[Maybe (*)]’
+    • In the first argument of ‘AtBool’, namely ‘x’
+      In the type ‘AtBool x’
+      In the type case in ‘Bad’
+
+NativeTypeCaseLetMonomorphic.hs:7:21: error: [GHC-83865]
+    • Couldn't match kind ‘*’ with ‘Bool’
+      Expected kind ‘[Maybe Bool]’, but ‘x’ has kind ‘[Maybe (*)]’
+    • In the first argument of ‘AtBool’, namely ‘x’
+      In the type ‘AtBool x’
+      In the type case in ‘Bad’
+

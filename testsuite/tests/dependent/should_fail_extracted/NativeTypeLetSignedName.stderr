@@ -1,0 +1,4 @@
+NativeTypeLetSignedName.hs:3:18: error: [GHC-58217]
+    The signature for ‘width’ must immediately precede its binding.
+    The next binding is for ‘height’.
+

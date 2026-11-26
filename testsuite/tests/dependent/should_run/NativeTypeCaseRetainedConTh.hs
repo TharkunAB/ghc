@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, LinearTypes, TemplateHaskell #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LambdaCase, LinearTypes, TemplateHaskell #-}
 module NativeTypeCaseRetainedConTh where
 
 import qualified NativeTypeCaseRetainedConThProvider as P

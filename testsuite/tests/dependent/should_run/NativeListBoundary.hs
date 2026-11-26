@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, LinearTypes, ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LambdaCase, LinearTypes, ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
 module Main where
 
 import Control.Exception (ArithException(DivideByZero), evaluate, throw, try)

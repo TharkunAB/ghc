@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, FlexibleContexts, GADTs, ImpredicativeTypes, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, FlexibleContexts, GADTs, ImpredicativeTypes, NoDependentTypes, TypeFamilies, TypeOperators #-}
 
 module Main (main) where
 

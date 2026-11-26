@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds, LiberalTypeSynonyms, Modifiers, TemplateHaskell, TypeFamilies #-}
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module PartialFamilyArityAfterErasure where
 
 import Data.Kind (Type)

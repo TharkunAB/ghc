@@ -1,0 +1,9 @@
+NativeDataFamilyPromoWrongRefinement.hs:4:24: error: [GHC-83865]
+    • Couldn't match kind ‘Int’ with ‘Char’
+      Expected kind ‘C (Char, Bool)’,
+        but ‘'Refines’ has kind ‘C (Int, Bool)’
+    • In the first argument of ‘At’, namely
+        ‘('Refines :: C (Char, Bool))’
+      In the type signature:
+        wrongRefinement :: At ('Refines :: C (Char, Bool))
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, EmptyCase, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE DataKinds, EmptyCase, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 {-# LANGUAGE PolyKinds, ScopedTypeVariables, StandaloneKindSignatures, TypeApplications, TypeOperators #-}
 module NativeIndexedForEachCtorProvider
   ( Nat(..), Fin(..), UTerm(..), BetaStep(..), BetaSteps(..)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module NativeSourceLengthRecursion where
 
 data Nat = Z | S Nat

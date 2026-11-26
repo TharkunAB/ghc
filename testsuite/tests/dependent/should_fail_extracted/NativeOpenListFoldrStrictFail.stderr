@@ -1,0 +1,6 @@
+NativeOpenListFoldrStrictFail.hs:13:44: error: [GHC-70565]
+    • Cannot evaluate ‘F.forceBitStep’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘F.forceBitStep k z xs’
+      In the type synonym declaration for ‘StrictBitStep’
+

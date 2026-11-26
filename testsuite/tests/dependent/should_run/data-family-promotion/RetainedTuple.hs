@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, TypeFamilies, ExperimentalDependentTypes, GADTs, KindSignatures, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, TypeFamilies, DependentTypes, ListTuplePuns, GADTs, KindSignatures, TypeOperators #-}
 module RetainedTuple (observe, keep, reflexive) where
 import Data.Type.Equality ((:~:)(Refl))
 import TupleProvider

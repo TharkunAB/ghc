@@ -1,0 +1,14 @@
+NativeNamedOpaqueCharacterReject.hs:9:9: error: [GHC-83865]
+    • Couldn't match type ‘Char.isSpace 'x'’ with ‘False’
+      Expected: Space 'x' :~: False
+        Actual: Char.isSpace 'x' :~: Char.isSpace 'x'
+    • In the expression: Refl
+      In an equation for ‘wrong’: wrong = Refl
+
+NativeNamedOpaqueCharacterReject.hs:12:9: error: [GHC-83865]
+    • Couldn't match type ‘Space 'x'’ with ‘False’
+      Expected: Decision Char.isSpace False
+        Actual: Decision Char.isSpace (Space 'x')
+    • In the expression: spaceDecision 'x'
+      In an equation for ‘mixed’: mixed = spaceDecision 'x'
+

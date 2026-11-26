@@ -1,0 +1,6 @@
+NativeNamedRetainedRecordReifyFail.hs:7:2: error: [GHC-75721]
+    Can't represent a named retained record constructor in Template Haskell:
+      foreach (storedLength :: PackedVecLibrary.Nat)
+      -> PackedVecLibrary.Vec Char storedLength
+         -> PackedVecLibrary.Vec Bool storedLength -> NamedColumns
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 
 module NativeOpaqueCallbackAliasProof (Witness(..), token, accepts, runCallback) where
 

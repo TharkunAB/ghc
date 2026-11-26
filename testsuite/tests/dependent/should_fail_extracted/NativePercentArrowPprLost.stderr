@@ -1,0 +1,11 @@
+NativePercentArrowPprLost.hs:16:19: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘Callback’ has kind ‘* %U -> *’
+    • In the first argument of ‘Recovered’, namely ‘Callback’
+      In the first argument of ‘(:~:)’, namely
+        ‘Recovered Callback '[Int]’
+      In the type signature:
+        lost :: Recovered Callback '[Int] :~: '[Char]
+

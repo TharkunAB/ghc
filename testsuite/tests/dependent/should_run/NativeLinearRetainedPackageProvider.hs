@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LinearTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LinearTypes #-}
 {-# LANGUAGE RoleAnnotations, TypeFamilies, UndecidableInstances #-}
 module NativeLinearRetainedPackageProvider where
 

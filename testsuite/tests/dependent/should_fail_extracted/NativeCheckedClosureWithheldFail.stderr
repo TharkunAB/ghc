@@ -1,0 +1,9 @@
+NativeCheckedClosureWithheldFail.hs:11:85: error: [GHC-70565]
+    • Cannot evaluate ‘P.lookupHidden’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the first argument of ‘(:~:)’, namely ‘P.lookupHidden e i’
+      In the type signature:
+        badHiddenEnv :: forall (g :: P.Scope)
+                               (e :: P.Env g)
+                               (i :: P.Fin g). P.lookupHidden e i :~: 'True
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 {-# LANGUAGE LinearTypes #-}
 module WitnessPairEscape where
 import WitnessSchema

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 module NativeClosedSomeVecAmbiguous where
 
 import Data.Proxy (Proxy(..))

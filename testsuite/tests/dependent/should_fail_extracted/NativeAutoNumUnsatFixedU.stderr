@@ -1,0 +1,8 @@
+NativeAutoNumUnsatFixedU.hs:5:1: error: [GHC-83865]
+    • Couldn't match expected type ‘GHC.Internal.Types.Matchable’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+    • The kind synonym ‘UEndo’ supplies an unmatchable (U) arrow.
+      This declaration requires a matchable (M) arrow.
+      Use '%M ->' in the synonym's definition, or use a separate matchable synonym here.
+      In the data type declaration for ‘BadTag’
+

@@ -1,6 +1,6 @@
 :set -fbyte-code -O0 -fomit-interface-pragmas -fno-write-if-simplified-core
 :load *PackedVecLibrary.hs
-:seti -XDataKinds -XExperimentalDependentTypes -XTypeOperators -XTypeFamilies -XNoStarIsType
+:seti -XDataKinds -XDependentTypes -XListTuplePuns -XTypeOperators -XTypeFamilies -XNoStarIsType
 let { fill :: foreach (n :: Nat) -> Vec Bool (n + 1); fill n = replicateNative (n + 1) True } in print (toList (fill 2))
 import Data.Proxy
 import GHC.TypeNats.Experimental (FromNatural)

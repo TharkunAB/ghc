@@ -1,0 +1,5 @@
+NativeTypeCaseFieldFamilyKind.hs:7:40: error: [GHC-83865]
+    Cannot check the kind of ‘a’ in the type case in a field of ‘Compound’.
+    Note: ‘PayloadKind’ is a non-injective type family.
+    Use a named type synonym with a standalone kind signature for the case.
+

@@ -1,0 +1,8 @@
+NativeOpenMatchabilityConflict.hs:11:27: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘Arrow True’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the second argument of ‘Apply’, namely ‘Maybe’
+      In the type family instance declaration for ‘Apply’
+

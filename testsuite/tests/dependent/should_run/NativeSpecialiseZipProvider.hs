@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module NativeSpecialiseZipProvider (keepIndex, emptySpine) where
 
 import Data.Proxy (Proxy(..))

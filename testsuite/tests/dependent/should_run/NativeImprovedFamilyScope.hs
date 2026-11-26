@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP, FlexibleContexts, FlexibleInstances, FunctionalDependencies, GADTs, Modifiers #-}
-{-# LANGUAGE NoExperimentalDependentTypes, ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE NoDependentTypes, ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
 module NativeImprovedFamilyScope where
 
 import Data.Kind (Type)

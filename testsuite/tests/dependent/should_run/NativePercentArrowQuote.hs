@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, LinearTypes, Modifiers, PolyKinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, LinearTypes, Modifiers, PolyKinds, NoDependentTypes #-}
 {-# LANGUAGE TemplateHaskell, TypeApplications, TypeOperators #-}
 module NativePercentArrowQuote where
 import Data.Type.Equality ((:~:)(Refl))

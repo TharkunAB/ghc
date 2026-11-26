@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, KindSignatures, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, KindSignatures, NoDependentTypes, TypeApplications #-}
 {-# OPTIONS_GHC -Wno-orphans -Wno-inline-rule-shadowing #-}
 module WrongPairRule where
 

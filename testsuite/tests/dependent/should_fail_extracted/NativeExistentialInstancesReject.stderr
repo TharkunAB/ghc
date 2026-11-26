@@ -1,0 +1,56 @@
+NativeExistentialInstancesReject.hs:19:16: error: [GHC-39999]
+    • No instance for ‘StreamOnly (Stream Bool)’
+        arising from a use of ‘streamOnly’
+    • In the expression: streamOnly @(Stream Bool) (fromList [True])
+      In an equation for ‘undetermined’:
+          undetermined = streamOnly @(Stream Bool) (fromList [True])
+
+NativeExistentialInstancesReject.hs:22:12: error: [GHC-39999]
+    • No instance for ‘FirstElement Bool (Stream Char)’
+        arising from a use of ‘firstElement’
+    • In the expression:
+        firstElement @Bool @(Stream Char) Proxy (fromList "x")
+      In an equation for ‘conflict’:
+          conflict = firstElement @Bool @(Stream Char) Proxy (fromList "x")
+
+NativeExistentialInstancesReject.hs:26:9: error: [GHC-83865]
+    • Couldn't match type ‘IsBoolean (Stream (Element Int))’
+                     with ‘False’
+      Expected: IsBoolean (Stream (Element Int)) :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘stuck’: stuck = Refl
+
+NativeExistentialInstancesReject.hs:29:10: error: [GHC-83865]
+    • Couldn't match type ‘IsBoolean (Stream a)’ with ‘False’
+      Expected: IsBoolean (Stream a) :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘open’: open _ = Refl
+    • Relevant bindings include
+        open :: proxy a -> IsBoolean (Stream a) :~: False
+          (bound at NativeExistentialInstancesReject.hs:29:1)
+
+NativeExistentialInstancesReject.hs:32:16: error: [GHC-25897]
+    • Could not deduce ‘a ~ b’
+      from the context: Stream b ~ Stream a
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘inverse’
+        at NativeExistentialInstancesReject.hs:32:9-12
+      Expected: a :~: b
+        Actual: a :~: a
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          inverse :: forall a b. (Stream a :~: Stream b) -> a :~: b
+        at NativeExistentialInstancesReject.hs:31:1-43
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          inverse :: forall a b. (Stream a :~: Stream b) -> a :~: b
+        at NativeExistentialInstancesReject.hs:31:1-43
+    • In the expression: Refl
+      In an equation for ‘inverse’: inverse Refl = Refl
+    • Relevant bindings include
+        inverse :: (Stream a :~: Stream b) -> a :~: b
+          (bound at NativeExistentialInstancesReject.hs:32:1)
+

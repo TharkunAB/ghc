@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, ExperimentalDependentTypes #-}
+{-# LANGUAGE GHC2024, DependentTypes, ListTuplePuns #-}
 module Main where
 
 import Data.Kind (Type)

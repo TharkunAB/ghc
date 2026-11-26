@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module NativeClosedFamilyProjection (pick, pickRight, Optional(..), choose, Packet(..), choosePacket, makePacket) where
 
 import Numeric.Natural (Natural)

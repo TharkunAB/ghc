@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, EmptyCase, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, KindSignatures, PolyKinds #-}
+{-# LANGUAGE DataKinds, EmptyCase, ExplicitNamespaces, DependentTypes, ListTuplePuns, GADTs, KindSignatures, PolyKinds #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 module NativeRetainedPolyAndInlineGadtProvider
   ( Nat(..)

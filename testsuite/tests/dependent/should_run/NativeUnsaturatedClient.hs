@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, GADTs #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators #-}
 module NativeUnsaturatedClient where
 

@@ -1,0 +1,5 @@
+NativeExistsPackDisabled.hs:4:5: error: [GHC-27432]
+    • GHC.Exists.Pack requires -XDependentTypes or -XExistentialTypes.
+    • In the expression: Pack
+      In an equation for ‘x’: x = Pack
+

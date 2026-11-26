@@ -1,0 +1,30 @@
+NativeUnsaturatedNoExtRejects.hs:15:18: error: [GHC-27346]
+    • The type family ‘Select’ should have 2 arguments, but has been given 1
+    • In the type signature: badRaw :: Apply (Select 'True) :~: 'True
+    Suggested fix:
+      Use the ‘UnsaturatedTypeFamilies’ extension
+      to write a partial type family application.
+
+NativeUnsaturatedNoExtRejects.hs:18:18: error: [GHC-27346]
+    • The type family ‘CmpNat’ should have 2 arguments, but has been given 1
+    • In the type signature: prefix :: Proxy (CmpNat 1)
+    Suggested fix:
+      Use the ‘UnsaturatedTypeFamilies’ extension
+      to write a partial type family application.
+
+NativeUnsaturatedNoExtRejects.hs:21:39: error: [GHC-27346]
+    • The type family ‘Select’ should have 2 arguments, but has been given 1
+    • In the type signature:
+        badDirect :: NamedMap @Bool @U @Bool (Select 'True) '[ 'True]
+                     :~: '[Select 'True 'True]
+    Suggested fix:
+      Use the ‘UnsaturatedTypeFamilies’ extension
+      to write a partial type family application.
+
+NativeUnsaturatedNoExtRejects.hs:24:22: error: [GHC-27346]
+    • The type family ‘Identity’ should have 1 argument, but has been given none
+    • In the type signature: badStandalone :: Box Identity
+    Suggested fix:
+      Use the ‘UnsaturatedTypeFamilies’ extension
+      to write a partial type family application.
+

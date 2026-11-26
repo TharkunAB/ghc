@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, RequiredTypeArguments #-}
+{-# LANGUAGE DependentTypes, RequiredTypeArguments #-}
 module NativeRetainedTypeOperandContext where
 
 data TypeRep a = LocalRep

@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleInstances, NoExperimentalDependentTypes #-}
+{-# LANGUAGE FlexibleInstances, NoDependentTypes #-}
 module NativeClosedListsLib (characters, flags, empty, badElement, reverseNaturals, first, sameList) where
 
 import Data.Foldable (toList)

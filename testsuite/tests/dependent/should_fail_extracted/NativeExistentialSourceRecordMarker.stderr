@@ -1,0 +1,5 @@
+NativeExistentialSourceRecordMarker.hs:6:7: error: [GHC-27432]
+    • Use GHC.Exists.Pack in an explicit existential application or a sole case alternative with a fresh type variable or _ for the witness, followed by a payload pattern.
+    • In the expression: Pack {}
+      In an equation for ‘bad’: bad = Pack {}
+

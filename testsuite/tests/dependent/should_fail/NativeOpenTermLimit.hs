@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, ScopedTypeVariables #-}
+{-# LANGUAGE DependentTypes, ScopedTypeVariables #-}
 {-# OPTIONS_GHC -freduction-depth=1 #-}
 module NativeOpenTermLimit where
 

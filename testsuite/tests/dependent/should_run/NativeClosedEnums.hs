@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}
 module Main where
 
 import qualified FiniteTree as T

@@ -1,4 +1,4 @@
-{-# LANGUAGE ConstraintKinds, FlexibleContexts, FlexibleInstances, FunctionalDependencies, MultiParamTypeClasses, TypeFamilies, UndecidableSuperClasses #-}
+{-# LANGUAGE ConstraintKinds, DependentTypes, ListTuplePuns, FlexibleContexts, FlexibleInstances, FunctionalDependencies, MultiParamTypeClasses, TypeFamilies, UndecidableSuperClasses #-}
 module NativeConstrainedFamilyProvider (Collects(..), Display, Allowed, Defaulted(..), Pair(..), Key, KeyElement, Output(..), Projected, Chain(..), Fixed(..), ListBacking, ListSource(..)) where
 
 import Data.Kind (Constraint)
