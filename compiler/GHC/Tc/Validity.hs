@@ -3475,17 +3475,13 @@ checkFamInstRhs selectors lhs_tc lhs_tys rhs
         && tv_set `subVarSet` mkVarSet (mapMaybe getTyVar_maybe lhs_tys)
       | otherwise = False
 
-   forwards_lambda PCF_Size tc tys
-      | Just (root, False) <- closedFamilyScope_maybe lhs_tc
-      , root == tyConName lhs_tc
+   forwards_lambda _ tc _
+      | Just (_, False) <- closedFamilyScope_maybe lhs_tc
+      , Just ax <- closedFamilyTyConCoAxiom_maybe lhs_tc
+      , [branch] <- fromBranches (coAxiomBranches ax)
+      , all isTyVarTy (coAxBranchLHS branch)
       , all isTyVarTy lhs_tys
-      , TyConApp target args <- coreFullView rhs
-      , target == tc, eqTypes args tys
-      , lengthIs tys (tyConArity tc), distinct_lhs_tvs tys
-      , Nothing <- closedFamilyScope_maybe tc
-      , Just ax <- closedFamilyTyConCoAxiom_maybe tc
-      = all (isConstructorCaseType . coAxBranchRHS)
-            (fromBranches (coAxiomBranches ax))
+      = cannot_return_first_order emptyTyConSet [tc]
    forwards_lambda _ _ _ = False
 
    forwards_payload PCF_Size tc tys
@@ -3498,20 +3494,37 @@ checkFamInstRhs selectors lhs_tc lhs_tys rhs
         && cannot_return emptyTyConSet [tc]
    forwards_payload _ _ _ = False
 
-   cannot_return _ [] = True
-   cannot_return seen (tc:rest)
+   cannot_return = cannot_return_with (const True)
+   cannot_return_first_order = cannot_return_with no_app_ty
+
+   no_app_ty ty = case coreFullView ty of
+      AppTy {}          -> False
+      TyConApp _ args   -> all no_app_ty args
+      FunTy _ ma m a r  -> all no_app_ty [ma, m, a, r]
+      ForAllTy ma _ r   -> no_app_ty ma && no_app_ty r
+      CastTy t _        -> no_app_ty t
+      _                 -> True
+
+   cannot_return_with _ _ [] = True
+   cannot_return_with rhs_ok seen (tc:rest)
       | tc == lhs_tc = False
-      | tc `elemTyConSet` seen || not (isTypeFamilyTyCon tc) || isStuckTypeFamily tc
-      = cannot_return seen rest
+      | tc `elemTyConSet` seen = cannot_return_with rhs_ok seen rest
+      | Just syn_rhs <- synTyConRhs_maybe tc
+      = rhs_ok syn_rhs
+        && cannot_return_with rhs_ok (extendTyConSet seen tc)
+             (nonDetEltsUniqSet (tyConsOfTypes [syn_rhs]) ++ rest)
+      | not (isTypeFamilyTyCon tc) || isStuckTypeFamily tc
+      = cannot_return_with rhs_ok seen rest
       | Just ctf <- closedTypeFamily_maybe tc
       , CTF_Abstract <- ctf
       = False
       | Just ctf <- closedTypeFamily_maybe tc
-      = let rhs = [coAxBranchRHS branch
-                  | ax <- maybeToList (closedTyFamCoAxiom_maybe ctf)
-                  , branch <- fromBranches (coAxiomBranches ax)]
-            calls = nonDetEltsUniqSet (tyConsOfTypes rhs)
-        in cannot_return (extendTyConSet seen tc) (calls ++ rest)
+      = let rhs_list = [coAxBranchRHS branch
+                       | ax <- maybeToList (closedTyFamCoAxiom_maybe ctf)
+                       , branch <- fromBranches (coAxiomBranches ax)]
+            calls = nonDetEltsUniqSet (tyConsOfTypes rhs_list)
+        in all rhs_ok rhs_list
+           && cannot_return_with rhs_ok (extendTyConSet seen tc) (calls ++ rest)
       | otherwise = False
 
 -- | Substitute a selected constructor into the original family LHS and
@@ -3570,18 +3583,18 @@ isCaseSelectorType check_selector = go
 
 {- Note [Termination of a forwarding type lambda]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The lambda in 'type Stamped tag = \cell -> Stamp tag cell' produces
-an equation that passes its complete variable telescope to Stamp. Its
-synthetic family fails the size test even if Stamp is a closed family
-that only builds constructor types.
+A synthesized beta type lambda such as '\n -> plus n n' or
+'type Stamped tag = \cell -> Stamp tag cell' lowers to a single-branch
+closed family whose LHS patterns are distinct type variables. One
+application of that family performs one beta-substitution step and does
+not match constructors.
 
-Permit this one size-neutral edge when the saturated target is a named
-closed family and its checked branches satisfy isConstructorCaseType.
-Those branches cannot introduce a call to another family or apply a
-captured callback. A fresh generated name alone does not establish this.
-The source can refer to the surrounding synonym from a target equation.
-An open family can also gain equations in another module. Leave the
-standard checks in place for these cases and for other calls.
+Permit a family call in that single beta branch when every reachable
+target is a concrete closed family or type synonym, no reachable
+definition refers back to the lambda family, and no reachable branch
+applies a higher-order callback variable with AppTy. Reject open
+families, abstract placeholder families, higher-order Apply helpers, and
+mutual return edges through surrounding type synonyms.
 -}
 
 {- Note [Termination of lifted sum payloads]

@@ -1235,16 +1235,35 @@ rnHsTyKi env (XHsType (HsTypeLambda _ binders body)) = do
   unless enabled $ failWithTc TcRnTypeLambdaDisabled
   when (isRnKindLevel env || null binders) $ failWithTc TcRnTypeLambdaContext
   level <- getThLevel
-  let rename_parts = do
-        checkDupRdrNames binders
-        binders' <- traverse (\binder -> L (getLoc binder) <$> newLocalBndrRn binder) binders
-        (body', fvs) <- bindLocalNamesFV (map unLoc binders') (rnLHsTyKi env body)
-        pure ((binders', body'), fvs)
+  let named_rdrs = [rdr | L _ (HsTvb _ _ (HsBndrVar _ rdr) _) <- binders]
+      rename_bndr_tele [] k = do
+        (res, fvs) <- k
+        pure (([], res), fvs)
+      rename_bndr_tele (L bloc (HsTvb _ () bvar bkind) : bs) k = do
+        (bkind', kfvs) <- rnHsBndrKind (rtke_ctxt env) bkind
+        case bvar of
+          HsBndrVar _ lrdr@(L vloc _) -> do
+            nm <- newLocalBndrRn lrdr
+            let tvb' = L bloc (HsTvb noAnn () (HsBndrVar noExtField (L vloc nm)) bkind')
+            ((bs', res), bfvs) <- bindLocalNamesFV [nm] (rename_bndr_tele bs k)
+            pure ((tvb' : bs', res), kfvs `plusFN` bfvs)
+          HsBndrWildCard _ -> do
+            nm <- newSysName (mkTyVarOcc "_")
+            let wloc = noAnnSrcSpan (locA bloc)
+                tvb' = L bloc (HsTvb noAnn () (HsBndrVar noExtField (L wloc nm)) bkind')
+            ((bs', res), bfvs) <- rename_bndr_tele bs k
+            pure ((tvb' : bs', res), kfvs `plusFN` bfvs)
+      rename_parts = do
+        checkDupRdrNames named_rdrs
+        rename_bndr_tele binders (rnLHsTyKi env body)
       rename_quote = do
         ((binders', body'), fvs) <- rename_parts
         pure (XHsType (HsTypeLambdaQuoteRn binders' body'), fvs)
-      reject_wildcards body' fvs =
-        when (hasExprWildcardRn body' || not (isEmptyNameSet (fvs `intersectNameSet` rtke_nwcs env))) $
+      has_bndr_wildcard bs =
+        any hasExprWildcardRn [k | L _ (HsTvb _ _ _ (HsBndrKind _ k)) <- bs]
+      reject_wildcards binders' body' fvs =
+        when (has_bndr_wildcard binders' || hasExprWildcardRn body'
+              || not (isEmptyNameSet (fvs `intersectNameSet` rtke_nwcs env))) $
           failWithTc TcRnTypeLambdaContext
   case level of
     UntypedBrack{} -> rename_quote
@@ -1252,7 +1271,7 @@ rnHsTyKi env (XHsType (HsTypeLambda _ binders body)) = do
       unless (rtke_lambda_forall_ok env && allowed_lambda_ctxt (rtke_ctxt env)) $
         failWithTc TcRnTypeLambdaContext
       ((binders', body'), fvs) <- rename_parts
-      reject_wildcards body' fvs
+      reject_wildcards binders' body' fvs
       pure (XHsType (HsTypeLambdaQuoteRn binders' body'), fvs)
     Brack Comp RnPendingTyped -> rn_typed_quote rename_parts reject_wildcards
     Brack (Splice Typed Comp) RnPendingTyped -> rn_typed_quote rename_parts reject_wildcards
@@ -1278,7 +1297,7 @@ rnHsTyKi env (XHsType (HsTypeLambda _ binders body)) = do
       case typed_quote_label (rtke_ctxt env) of
         Just owner_label | rtke_lambda_forall_ok env -> do
           ((binders', body'), fvs) <- rename_parts
-          reject_wildcards body' fvs
+          reject_wildcards binders' body' fvs
           let source_name nm = isVarName nm || isJust (sourceTableTermOcc (nameOccName nm))
           when (nameSetAny source_name fvs) $ failWithTc TcRnTypeLambdaContext
           cur_mod <- getModule
@@ -1287,8 +1306,8 @@ rnHsTyKi env (XHsType (HsTypeLambda _ binders body)) = do
           let suffix  = zEncodeString (occNameString uniq_occ)
               syn_occ = mkTcOcc ("$signature-lambda:" ++ owner_label ++ ":" ++ suffix)
           syn_name <- newGlobalBinder cur_mod syn_occ Nothing loc
-          let bound_set = mkNameSet (map unLoc binders')
-              caps      = freeLocalTyVarsInOrder bound_set body'
+          let caps      = freeLocalTyVarsInOrder emptyNameSet
+                            (noLocA (XHsType (HsTypeLambdaQuoteRn binders' body')))
               syn_var   = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr syn_name)))
               cap_vars  = [noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr c))) | c <- caps]
               helper    = foldl' mkHsAppTy syn_var cap_vars
@@ -1331,7 +1350,8 @@ rnHsTyKi env (XHsType (HsTypeSome _ binder domain body)) = do
             pure (nm, res)
       some_span <- getSrcSpanM
       let sigma_ty = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr sigma_name)))
-          lam_ty   = L (noAnnSrcSpan some_span) (XHsType (HsTypeLambdaQuoteRn [L b_loc bndr_name] body'))
+          some_tvb = L (l2l b_loc) (HsTvb noAnn () (HsBndrVar noExtField (L b_loc bndr_name)) (HsBndrNoKind noExtField))
+          lam_ty   = L (noAnnSrcSpan some_span) (XHsType (HsTypeLambdaQuoteRn [some_tvb] body'))
       pure ( HsAppTy noExtField (noLocA (HsAppTy noExtField sigma_ty domain')) lam_ty
            , plusFNs [dom_fvs, body_fvs, unitFN sigma_name] )
 
@@ -1559,7 +1579,7 @@ freeLocalTyVarsInOrder bound0 root = dedup emptyNameSet (go bound0 root)
       | Just (L _ (XHsType (HsTypeExistsRn _ bndr body))) <- (cast thing :: Maybe (LHsType GhcRn))
       = go_tvbs bound [bndr] body
       | Just (L _ (XHsType (HsTypeLambdaQuoteRn bndrs body))) <- (cast thing :: Maybe (LHsType GhcRn))
-      = go (extendNameSetList bound (map unLoc bndrs)) body
+      = go_tvbs bound bndrs body
       | Just (L _ (XHsType (HsTypeLambdaCheckRn _ _ helper))) <- (cast thing :: Maybe (LHsType GhcRn))
       = go bound helper
       | Just (L _ (XHsType (HsTypeLetRn _ (L _ b) rhs body))) <- (cast thing :: Maybe (LHsType GhcRn))
@@ -1605,7 +1625,7 @@ collectFreeCaseRdrs root = go [] (noLocA root)
       HsQualTy _ (L _ (HsContext _ cs)) body -> concatMap (go bound) cs ++ go bound body
       XHsType (HsBangTy _ _ t)     -> go bound t
       XHsType (HsTypeExists _ v b) -> go_tvbs bound [v] b
-      XHsType (HsTypeLambda _ vs b) -> go (map unLoc vs ++ bound) b
+      XHsType (HsTypeLambda _ vs b) -> go_tvbs bound vs b
       XHsType (HsTypeSome _ v d b) -> go bound d ++ go (unLoc v : bound) b
       XHsType (HsTypeLet _ _ _ binds res) ->
         let (v, rhs, body) = splitHsTypeLet binds res
@@ -3565,12 +3585,12 @@ extract_lty (L _ ty) acc
       XHsType (HsTypeCaseAlias _ (_, _, alias) body) ->
         filter (\v -> Just (unLoc v) /= (unLoc <$> alias)) (extract_lty body []) ++ acc
       XHsType (HsTypeLambda _ binders body)
-                                  -> extract_body (map unLoc binders) body acc
+                                  -> extract_hs_tv_bndrs binders acc (extract_lty body [])
       XHsType (HsTypeLet _ _ _ binds result) ->
         let (binder, rhs, body) = splitHsTypeLet binds result
         in extract_lty rhs (extract_body [unLoc binder] body acc)
       XHsType (HsTypeLambdaCheck binders body helper)
-                                  -> extract_body (map unLoc binders) body (extract_lty helper acc)
+                                  -> extract_hs_tv_bndrs binders (extract_lty helper acc) (extract_lty body [])
       XHsType (HsTypeLetProductCheck _ _ rhs) -> extract_lty rhs acc
       XHsType (HsTypeSome _ binder domain body)
                                   -> extract_lty domain (extract_body [unLoc binder] body acc)

@@ -1531,9 +1531,10 @@ repLTyAt tyki (L _ (XHsType (HsTypeLetRn _ (L _ name) rhs body))) = do
     MkC name' <- lookupOcc name
     MkC body' <- repLTyAt tyki body
     rep2 letTName [name', rhs', body']
-repLTyAt tyki (L _ (XHsType (HsTypeLambdaQuoteRn binders body))) =
-  addSimpleTyVarBinds FreshNamesOnly (map unLoc binders) $ do
-    MkC names <- repList nameTyConOcc (lookupOcc . unLoc) binders
+repLTyAt tyki (L _ (XHsType (HsTypeLambdaQuoteRn binders body))) = do
+  let bndr_names = mapMaybe hsLTyVarLocName binders
+  addSimpleTyVarBinds FreshNamesOnly (map unLoc bndr_names) $ do
+    MkC names <- repList nameTyConOcc (lookupOcc . unLoc) bndr_names
     MkC body' <- repLTyAt tyki body
     rep2 lamTName [names, body']
 -- The typed quote has already checked the capture kinds against the body.

@@ -2005,7 +2005,9 @@ cvtTypeKindOnGadtSpine in_gadt typeOrKind ty
              mk_apps (XHsType (mkHsSingleTypeLet noAnn name' rhs' body')) tys'
 
            LamT binders@(_:_) body -> do
-             binders' <- traverse tNameN binders
+             binders' <- traverse (\b -> do
+               ln@(L l _) <- tNameN b
+               pure (L (l2l l) (HsTvb noAnn () (HsBndrVar noExtField ln) (HsBndrNoKind noExtField)))) binders
              body' <- cvtTypeKind typeOrKind body
              mk_apps (XHsType (HsTypeLambda (noEpTok, noEpUniTok) binders' body')) tys'
 

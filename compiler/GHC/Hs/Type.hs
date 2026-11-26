@@ -552,8 +552,8 @@ data HsTypeGhcRnExt
   | HsTypeCaseRn (LHsType GhcRn) [([Name], LHsType GhcRn, LHsType GhcRn)]
     -- Quoted case. Each row carries its pattern binders, pattern and result.
   | HsTypeLetProductCheckRn (LocatedN Name) !Int (LHsType GhcRn)
-  | HsTypeLambdaQuoteRn [LocatedN Name] (LHsType GhcRn)
-  | HsTypeLambdaCheckRn [LocatedN Name] (LHsType GhcRn) (LHsType GhcRn)
+  | HsTypeLambdaQuoteRn [LHsTyVarBndr () GhcRn] (LHsType GhcRn)
+  | HsTypeLambdaCheckRn [LHsTyVarBndr () GhcRn] (LHsType GhcRn) (LHsType GhcRn)
     -- Original body and lowered application. See Note [Checking local lambda captures]
     -- in GHC.Tc.Gen.HsType.
 
@@ -574,9 +574,9 @@ data HsTypeGhcPsExt
     -- See Note [Parsing data type declarations]
 
   | HsTypeLambda (EpToken "\\", EpUniToken "->" "→")
-                 [LocatedN RdrName] (LHsType GhcPs)
+                 [LHsTyVarBndr () GhcPs] (LHsType GhcPs)
 
-  | HsTypeLambdaCheck [LocatedN RdrName] (LHsType GhcPs) (LHsType GhcPs)
+  | HsTypeLambdaCheck [LHsTyVarBndr () GhcPs] (LHsType GhcPs) (LHsType GhcPs)
 
   | HsTypeExists (EpToken "exists", Either (EpToken "|") (EpToken "."))
       (LHsTyVarBndr Specificity GhcPs) (LHsType GhcPs)

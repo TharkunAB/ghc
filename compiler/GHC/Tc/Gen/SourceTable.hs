@@ -67,7 +67,7 @@ import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.FVs (tyCoVarsOfTypeList, tyConsOfTypes)
-import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TyVarTy, TermVarTy, DepFunTy, CastTy))
+import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TyVarTy, TermVarTy, DepFunTy, ForAllTy, CastTy))
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Unify (alwaysBindTv, tcMatchTys, tcUnifyTys)
@@ -3675,24 +3675,41 @@ rebuildSourceFamilyWith subst_tc table
 -- Embedded-type large eliminations (`HsEmbTy`) and Core-backed stage drivers
 -- ---------------------------------------------------------------------------
 
-data EmbRhs = EmbTypeRhs Type | EmbAbsurdRhs Id
+data EmbRhs = EmbTypeRhs Type | EmbAbsurdRhs Id | EmbCallRhs Id [Type] [EmbRhs]
 data EmbClause = EmbClause SrcSpan DataCon [Type] [Maybe Id] [Maybe Id] EmbRhs
-data EmbSpec = EmbSpec Id LeftOrRight [TyVar] [TcEvBinds] [EmbClause] [Type]
+data EmbSpec = EmbSpec Id LeftOrRight [TyVar] [TcEvBinds] [EmbClause] [Type] [Id]
 
 readEmbSpec :: HsBind GhcTc -> Maybe EmbSpec
 readEmbSpec binding = do
-    (fun, _, body_tvs, evidence, matches) <- sourceMatches binding
+    (fun, mono, body_tvs, evidence, matches) <- sourceMatches binding
+    guard (has_type_codomain False (varType fun))
     let readOrder order = do
-          (evs, clauses) <- unzip <$> traverse (readClause order) matches
-          let emb_tys = [t | EmbClause _ _ _ _ _ (EmbTypeRhs t) <- clauses]
-          EmbSpec fun order body_tvs (evidence ++ concat evs) clauses emb_tys <$ guard (not (null emb_tys))
+          (evs, clauses) <- unzip <$> traverse (readClause mono fun body_tvs order) matches
+          let emb_tys  = concatMap (rhs_tys . clause_rhs) clauses
+              call_ids = concatMap (rhs_callees . clause_rhs) clauses
+          EmbSpec fun order body_tvs (evidence ++ concat evs) clauses emb_tys call_ids
+            <$ guard (any (not . is_absurd . clause_rhs) clauses)
     readOrder CLeft <|> readOrder CRight
   where
+    has_type_codomain seen ty = case splitForAllTyCoVar_maybe ty of
+      Just (_, _, inner) -> has_type_codomain seen inner
+      Nothing -> case caseArrow ty of
+        Just (_, rest) -> has_type_codomain True rest
+        Nothing        -> seen && tcIsLiftedTypeKind ty
+
+    clause_rhs (EmbClause _ _ _ _ _ r) = r
+    is_absurd EmbAbsurdRhs{} = True; is_absurd _ = False
+    rhs_tys (EmbTypeRhs t)         = [t]
+    rhs_tys EmbAbsurdRhs{}         = []
+    rhs_tys (EmbCallRhs _ ts args) = ts ++ concatMap rhs_tys args
+    rhs_callees (EmbCallRhs f _ args) = f : concatMap rhs_callees args
+    rhs_callees _                     = []
+
     reorder CRight (a : b : rest) = b : a : rest; reorder _ xs = xs
     unParen (L _ (ParPat _ p)) = unParen p; unParen (L _ p) = p
     plainBinder p = case unParen p of { VarPat _ (L _ v) -> Just (Just v); WildPat _ -> Just Nothing; _ -> Nothing }
 
-    readClause order (L loc (Match { m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] (L _ rhs)) :| []) (L _ (EmptyLocalBinds _)) }))
+    readClause mono fun body_tvs order (L loc (Match { m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] (L _ rhs)) :| []) (L _ (EmptyLocalBinds _)) }))
       | pickLR order (True, lengthIs pats 2), pat : rest <- reorder order pats = do
           (evs, dc, params, fields) <- case unParen pat of
             ConPat (ConPatTc ps [] [] cevs WpHole []) (L _ (RealDataCon con)) details -> do
@@ -3702,18 +3719,59 @@ readEmbSpec binding = do
               (EvBinds emptyBag, tupleDataCon Boxed (length fs), ps,) <$> traverse plainBinder fs
             _ -> Nothing
           carried <- traverse plainBinder rest
-          ([evs],) . EmbClause (locA loc) dc params fields carried <$> parseEmbRhs rhs
-    readClause _ _ = Nothing
+          let local_scope = mkUniqSet (catMaybes fields ++ catMaybes carried)
+          ([evs],) . EmbClause (locA loc) dc params fields carried <$> parseEmbRhs mono fun body_tvs local_scope rhs
+    readClause _ _ _ _ _ = Nothing
 
-    parseEmbRhs (HsPar _ e) = parseEmbRhs (unLoc e)
-    parseEmbRhs (XExpr (WrapExpr WpHole e)) = parseEmbRhs e
-    parseEmbRhs (XExpr (ExpandedThingTc (HSE (ExprCtxt HsEmbTy{}) (L _ (XExpr (WrapExpr (WpCompose (WpTyApp t) (WpTyLam _)) _)))))) =
-      Just (EmbTypeRhs t)
-    parseEmbRhs (HsCase _ scrut (MG { mg_alts = L _ [] })) | Just v <- hsVar (unLoc scrut) = Just (EmbAbsurdRhs v)
-    parseEmbRhs (HsApp _ fn arg)
-      | Just f <- hsHead (unLoc fn), Just m <- nameModule_maybe (idName f), moduleUnitId m == ghcInternalUnitId
-      , occNameString (nameOccName (idName f)) == "absurd", Just v <- hsVar (unLoc arg) = Just (EmbAbsurdRhs v)
-    parseEmbRhs _ = Nothing
+    parseEmbRhs mono fun body_tvs scope = go_top
+      where
+        go_top (HsPar _ e) = go_top (unLoc e)
+        go_top (XExpr (WrapExpr WpHole e)) = go_top e
+        go_top (XExpr (ExpandedThingTc (HSE (ExprCtxt HsEmbTy{}) (L _ (XExpr (WrapExpr (WpCompose (WpTyApp t) (WpTyLam _)) _)))))) =
+          Just (EmbTypeRhs t)
+        go_top (HsCase _ scrut (MG { mg_alts = L _ [] })) | Just v <- hsVar (unLoc scrut) = Just (EmbAbsurdRhs v)
+        go_top (HsApp _ fn arg)
+          | Just f <- hsHead (unLoc fn), Just m <- nameModule_maybe (idName f), moduleUnitId m == ghcInternalUnitId
+          , occNameString (nameOccName (idName f)) == "absurd", Just v <- hsVar (unLoc arg) = Just (EmbAbsurdRhs v)
+        go_top (HsVar _ (L _ v))
+          | v `elementOfUniqSet` scope, tcIsLiftedTypeKind (varType v) = Just (EmbTypeRhs (TermVarTy v))
+        go_top e = parse_call e
+
+        go_arg (HsPar _ e) = go_arg (unLoc e)
+        go_arg (XExpr (WrapExpr WpHole e)) = go_arg e
+        go_arg (XExpr (ExpandedThingTc (HSE (ExprCtxt HsEmbTy{}) (L _ (XExpr (WrapExpr (WpCompose (WpTyApp t) (WpTyLam _)) _)))))) =
+          Just (EmbTypeRhs t)
+        go_arg (HsVar _ (L _ v))
+          | v `elementOfUniqSet` scope = Just (EmbTypeRhs (TermVarTy v))
+        go_arg e = parse_call e
+
+        parse_call e = do
+          (raw_head, ty_args, val_exprs) <- split_app_spine e []
+          guard (not (null val_exprs))
+          let (target, inst_tys)
+                | raw_head == mono = (fun, if null ty_args then mkTyVarTys body_tvs else ty_args)
+                | otherwise        = (raw_head, ty_args)
+          guard (isExternalName (idName target) && isNothing (isDataConId_maybe target))
+          parsed_args <- traverse go_arg val_exprs
+          pure (EmbCallRhs target inst_tys parsed_args)
+
+        split_app_spine (HsPar _ inner) vals = split_app_spine (unLoc inner) vals
+        split_app_spine (HsApp _ fn arg) vals = split_app_spine (unLoc fn) (unLoc arg : vals)
+        split_app_spine head_e vals = do
+          (f, tys) <- split_ty_head head_e []
+          pure (f, tys, vals)
+
+        split_ty_head (HsPar _ inner) tys = split_ty_head (unLoc inner) tys
+        split_ty_head (HsVar _ (L _ f)) tys = Just (f, tys)
+        split_ty_head (XExpr (WrapExpr wp inner)) tys = do
+          wp_tys <- wrap_ty_apps wp
+          split_ty_head inner (wp_tys ++ tys)
+        split_ty_head _ _ = Nothing
+
+        wrap_ty_apps WpHole = Just []
+        wrap_ty_apps (WpTyApp t) = Just [t]
+        wrap_ty_apps (WpCompose w1 w2) = (++) <$> wrap_ty_apps w2 <*> wrap_ty_apps w1
+        wrap_ty_apps _ = Nothing
 
     hsVar (HsPar _ e) = hsVar (unLoc e); hsVar (XExpr (WrapExpr WpHole e)) = hsVar e
     hsVar (HsVar _ (L _ v)) = Just v; hsVar _ = Nothing
@@ -3723,7 +3781,7 @@ readEmbSpec binding = do
     hsHead _ = Nothing
 
 certifyEmbSpec :: Bool -> Bool -> TcGblEnv -> (Id -> TcM (Maybe TyCon)) -> [Id] -> EmbSpec -> TcM (Maybe (Id, TyCon))
-certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun order body_tvs evidence clauses _) = do
+certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun order body_tvs evidence clauses _ _) = do
     clean <- allM emptyEvidence evidence
     if not clean then pure Nothing else do
       ty <- liftZonkM (zonkTcType (varType fun))
@@ -3731,18 +3789,23 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun o
       case sequence callee_tcs >>= checkDom ty of
         Nothing -> pure Nothing
         Just (tvs, inst_args, inst_dom, inst_carried, resolved_callees) -> do
-          mb_builders <- traverse (buildEmbClause body_tvs tvs inst_args inst_dom inst_carried (varName fun) resolved_callees) clauses
+          vars <- forM body_tvs $ \sk -> flip mkTyVar (tyVarKind sk) <$> newSysName (nameOccName (varName sk))
+          let inst_hdr = substTyWith body_tvs (mkTyVarTys vars)
+          args <- zipWithM freshSysTyVar ("x" : "y" : map (("arg" ++) . show) [3 :: Int ..])
+                    (reorder (inst_hdr inst_dom : map inst_hdr inst_carried))
+          let fam_binders = mkNamedTyConBinders (Invisible SpecifiedSpec) vars ++ mkAnonTyConBinders args
+              placeholder_fam =
+                mkFamilyTyCon (varName fun)
+                  (mkTyConKindWithMatchability unmatchableDataConTy fam_binders liftedTypeKind)
+                  fam_binders 0 liftedTypeKind Nothing
+                  (ClosedTypeFamilyTyCon CTF_Abstract) Nothing NotInjective
+          mb_builders <- traverse (buildEmbClause placeholder_fam body_tvs tvs inst_args inst_dom inst_carried (varName fun) resolved_callees) clauses
           case sequence mb_builders of
             Just builders | let real_brs = catMaybes builders, not (null real_brs) -> do
               table <- case if final_exports then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
                 Just existing -> pure existing
-                Nothing -> do
-                  vars <- forM body_tvs $ \sk -> flip mkTyVar (tyVarKind sk) <$> newSysName (nameOccName (varName sk))
-                  let inst = substTyWith body_tvs (mkTyVarTys vars)
-                  args <- zipWithM freshSysTyVar ("x" : "y" : map (("arg" ++) . show) [3 :: Int ..])
-                            (reorder (inst inst_dom : map inst inst_carried))
-                  makeSourceFamily (varName fun) (mkNamedTyConBinders (Invisible SpecifiedSpec) vars ++ mkAnonTyConBinders args)
-                    liftedTypeKind real_brs
+                Nothing ->
+                  makeSourceFamily (varName fun) fam_binders liftedTypeKind real_brs
               let exported = availsToNameSet (tcg_exports env)
               if final_exports && (not (idName fun `elemNameSet` exported) || not (null (unexportedLargeElimTypes env exported table)))
                 then pure Nothing else pure (Just (setIdType fun ty, table))
@@ -3757,6 +3820,7 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun o
     embBinder _ = Nothing
 
     embCarried tvs arg
+      | tcIsLiftedTypeKind arg = True
       | tcIsLiftedTypeKind (typeKind arg), isTyFamFree arg, all (`elem` tvs) (tyCoVarsOfTypeList arg)
       , Just (tc, _) <- splitTyConApp_maybe arg = isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc
       | otherwise = False
@@ -3794,7 +3858,7 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun o
       guard (equalLength actual_dcs expected_dcs && mkUniqSet actual_dcs == mkUniqSet expected_dcs)
       pure (tvs, inst_args, mkTyConApp tc inst_args, map inst_body carried, resolved)
 
-    buildEmbClause body_tvs _ pat_expected dom carried_tys owner_name resolved_callees
+    buildEmbClause placeholder_fam body_tvs _ pat_expected dom carried_tys owner_name resolved_callees
                    (EmbClause loc dc pat_args fields carried emb_rhs) = do
       args <- liftZonkM (zonkTcTypes pat_args)
       c_tys <- liftZonkM (traverse (traverse (zonkTcType . varType)) carried)
@@ -3822,19 +3886,48 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun o
                   tv <- lookup (Just v) (fields_scope ++ carried_scope)
                   Nothing <$ guard (all isTyFamFree patterns && inst (varType v) `eqType` tyVarKind tv &&
                                     isJust (emptyCaseDatatype (tyVarKind tv)))
-                EmbTypeRhs raw_ty -> do
-                  zonked_ty <- liftZonkM (zonkTcType raw_ty)
+                _ -> do
+                  zonked_rhs <- zonk_emb_rhs emb_rhs
                   pure $ do
-                    guard (all isTyFamFree patterns && not (hasCoercionHole zonked_ty) &&
-                           not (any isMetaTyVar (tyCoVarsOfTypeList zonked_ty)) && tcIsLiftedTypeKind (typeKind zonked_ty))
-                    _ <- rewriteEmb listTyCon qvars binders inst (inst dom) (mkTyVarTys qvars) fields_scope carried_scope zonked_ty
+                    guard (all isTyFamFree patterns && clean_emb_rhs zonked_rhs)
+                    _ <- rewriteEmb placeholder_fam qvars binders inst (inst dom) (mkTyVarTys qvars) fields_scope carried_scope zonked_rhs
                     pure $ Just $ \fam ->
                       let rhs_t = fromMaybe (panic "certifyEmbSpec") $
-                                    rewriteEmb fam qvars binders inst (inst dom) (mkTyVarTys qvars) fields_scope carried_scope zonked_ty
+                                    rewriteEmb fam qvars binders inst (inst dom) (mkTyVarTys qvars) fields_scope carried_scope zonked_rhs
                       in mkCoAxBranch binders [] [] patterns rhs_t (map (const Nominal) binders) loc
       where
-        rewriteEmb fam qvars binders inst inst_dom fam_args fields_scope carried_scope emb_ty = do
-          let sk_map = zip body_tvs qvars; all_scope = fields_scope ++ carried_scope
+        zonk_emb_rhs (EmbTypeRhs t) = EmbTypeRhs <$> liftZonkM (zonkTcType t)
+        zonk_emb_rhs (EmbCallRhs f ts args) =
+          EmbCallRhs <$> (setIdType f <$> liftZonkM (zonkTcType (varType f)))
+                     <*> liftZonkM (zonkTcTypes ts)
+                     <*> traverse zonk_emb_rhs args
+        zonk_emb_rhs r = pure r
+
+        clean_emb_rhs (EmbTypeRhs zonked_ty) =
+          not (hasCoercionHole zonked_ty) &&
+          not (any isMetaTyVar (tyCoVarsOfTypeList zonked_ty)) &&
+          tcIsLiftedTypeKind (typeKind zonked_ty)
+        clean_emb_rhs (EmbCallRhs _ ts args) =
+          all (\t -> not (hasCoercionHole t) && not (any isMetaTyVar (tyCoVarsOfTypeList t))) ts &&
+          all clean_emb_arg args
+        clean_emb_rhs _ = False
+
+        clean_emb_arg (EmbTypeRhs t) =
+          not (hasCoercionHole t) && not (any isMetaTyVar (tyCoVarsOfTypeList t))
+        clean_emb_arg c@EmbCallRhs{} = clean_emb_rhs c
+        clean_emb_arg _ = False
+
+        peel_emb_carry all_scope (ForAllTy _ (Bndr tv (Invisible InferredSpec)) inner)
+          | let s = occNameString (nameOccName (varName tv))
+          , Just occ <- if take 11 s == "$emb_carry:" then Just (drop 11 s) else Nothing
+          = do
+              (_, target_tv) <- find (\(mb_v, _) -> maybe False (\v -> occNameString (nameOccName (idName v)) == occ) mb_v) all_scope
+              (rest_pairs, body) <- peel_emb_carry all_scope inner
+              pure ((tv, target_tv) : rest_pairs, body)
+        peel_emb_carry _ ty = pure ([], ty)
+
+        rewriteEmb fam qvars binders inst inst_dom fam_args fields_scope carried_scope root_rhs = do
+          let all_scope = fields_scope ++ carried_scope
               field_set = mkUniqSet (map snd fields_scope); bndr_set = mkVarSet binders
               is_self t = nameModule_maybe (tyConName t) == nameModule_maybe owner_name &&
                           nameOccName (tyConName t) == mkSourceTableOcc (nameOccName owner_name)
@@ -3844,29 +3937,49 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun o
               resolve_callee t = listToMaybe [rt | (cid, rt) <- resolved_callees
                                                  , nameModule_maybe (tyConName t) == nameModule_maybe (idName cid)
                                                  , nameOccName (tyConName t) == mkSourceTableOcc (nameOccName (idName cid))]
-              (map_ty, _, _, _) = mapTyCo mapper
-              mapper = TyCoMapper
-                { tcm_tyvar = \tv -> pure (mkTyVarTy (fromMaybe tv (lookup tv sk_map)))
-                , tcm_termvar = \v -> lookup (Just v) all_scope >>= \tv -> mkTyVarTy tv <$ guard (inst (varType v) `eqType` tyVarKind tv)
-                , tcm_termbinder = \_ _ -> Nothing, tcm_covar = \_ -> Nothing, tcm_hole = \_ -> Nothing
-                , tcm_tycobinder = \tv _ k -> guard (tv `notElem` body_tvs) *> k tv
-                , tcm_tcapp_ty = \_ tc mapped ->
-                    if is_self tc then do
-                      let (t_args, v_args) = splitAt (length fam_args) mapped
-                      rec_arg : rec_cs <- pure (reorder v_args)
-                      ftv <- getTyVar_maybe rec_arg
-                      guard (length mapped == length fam_args + 1 + length carried_scope && eqTypes t_args fam_args &&
-                             ftv `elementOfUniqSet` field_set && tyVarKind ftv `eqType` inst_dom &&
-                             eqTypes rec_cs (mkTyVarTys (map snd carried_scope)))
-                      pure (mkTyConApp fam (fam_args ++ v_args))
-                    else case resolve_callee tc of
-                      Just rt -> mkTyConApp rt mapped <$ guard (length mapped == tyConArity rt)
-                      Nothing
-                        | isTypeSynonymTyCon tc, Just expanded <- coreView (mkTyConApp tc mapped)
-                        , any (\t -> is_self t || is_pending t) (nonDetEltsUniqSet (tyConsOfTypes [expanded])) -> map_ty expanded
-                        | otherwise -> mkTyConApp tc mapped <$ guard (not (is_pending tc))
-                , tcm_tcapp_co = \_ role tc cos -> mkTyConAppCo role tc cos <$ guard (not (is_self tc) && not (is_pending tc)) }
-          rewritten <- map_ty emb_ty
+              resolve_callee_id cid =
+                listToMaybe [rt | (c, rt) <- resolved_callees, idName c == idName cid] <|>
+                sourceTableId_maybe cid
+              check_self_args mapped = do
+                let (t_args, v_args) = splitAt (length fam_args) mapped
+                rec_arg : rec_cs <- pure (reorder v_args)
+                ftv <- getTyVar_maybe rec_arg
+                guard (length mapped == length fam_args + 1 + length carried_scope && eqTypes t_args fam_args &&
+                       ftv `elementOfUniqSet` field_set && tyVarKind ftv `eqType` inst_dom &&
+                       eqTypes rec_cs (mkTyVarTys (map snd carried_scope)))
+                pure (mkTyConApp fam (fam_args ++ v_args))
+              map_with extra_sk =
+                let sk_map = extra_sk ++ zip body_tvs qvars
+                    (map_ty, _, _, _) = mapTyCo TyCoMapper
+                      { tcm_tyvar = \tv -> pure (mkTyVarTy (fromMaybe tv (lookup tv sk_map)))
+                      , tcm_termvar = \v -> lookup (Just v) all_scope >>= \tv -> mkTyVarTy tv <$ guard (inst (varType v) `eqType` tyVarKind tv)
+                      , tcm_termbinder = \_ _ -> Nothing, tcm_covar = \_ -> Nothing, tcm_hole = \_ -> Nothing
+                      , tcm_tycobinder = \tv _ k -> guard (tv `notElem` body_tvs) *> k tv
+                      , tcm_tcapp_ty = \_ tc mapped ->
+                          if is_self tc then check_self_args mapped
+                          else case resolve_callee tc of
+                            Just rt -> mkTyConApp rt mapped <$ guard (length mapped == tyConArity rt)
+                            Nothing
+                              | isTypeSynonymTyCon tc, Just expanded <- coreView (mkTyConApp tc mapped)
+                              , any (\t -> is_self t || is_pending t) (nonDetEltsUniqSet (tyConsOfTypes [expanded])) -> map_ty expanded
+                              | otherwise -> mkTyConApp tc mapped <$ guard (not (is_pending tc))
+                      , tcm_tcapp_co = \_ role tc cos -> mkTyConAppCo role tc cos <$ guard (not (is_self tc) && not (is_pending tc)) }
+                in map_ty
+              go_rhs (EmbTypeRhs raw_ty) = do
+                (carry_pairs, inner_ty) <- peel_emb_carry all_scope raw_ty
+                map_with carry_pairs inner_ty
+              go_rhs (EmbCallRhs target ty_args arg_rhss) = do
+                mapped_tys  <- traverse (map_with []) ty_args
+                mapped_args <- traverse go_rhs arg_rhss
+                let mapped = mapped_tys ++ mapped_args
+                if idName target == owner_name
+                  then check_self_args mapped
+                  else do
+                    rt <- resolve_callee_id target
+                    guard (varType target `eqType` tyConKind rt && length mapped == tyConArity rt)
+                    pure (mkTyConApp rt mapped)
+              go_rhs EmbAbsurdRhs{} = Nothing
+          rewritten <- go_rhs root_rhs
           rewritten <$ guard (not (hasNativeDependentExpr (Core.Type rewritten)) &&
                               all (`elemVarSet` bndr_set) (tyCoVarsOfTypeList rewritten) &&
                               tcIsLiftedTypeKind (typeKind rewritten))
@@ -3959,10 +4072,14 @@ sourceTableTyCons local final_exports binds = do
                     | otherwise = False
 
     prepared <- fmap catMaybes $ forM binds $ \bind -> case readEmbSpec (unLoc bind) of
-      Just emb@(EmbSpec fun _ _ _ _ emb_tys) -> do
-        let emb_calls = [ o | tc <- nonDetEltsUniqSet (tyConsOfTypes emb_tys), let tn = tyConName tc
-                            , Just to <- [sourceTableTermOcc (nameOccName tn)], o <- bind_owners, o /= fun
-                            , nameModule_maybe (idName o) == nameModule_maybe tn, nameOccName (idName o) == to ]
+      Just emb@(EmbSpec fun _ _ _ _ emb_tys call_ids) -> do
+        let call_name_set = mkNameSet (map idName call_ids)
+            emb_calls = [ o | o <- bind_owners, o /= fun
+                            , idName o `elemNameSet` call_name_set ||
+                              any (\tc -> let tn = tyConName tc in
+                                     maybe False (\to -> nameModule_maybe (idName o) == nameModule_maybe tn && nameOccName (idName o) == to)
+                                           (sourceTableTermOcc (nameOccName tn)))
+                                  (nonDetEltsUniqSet (tyConsOfTypes emb_tys)) ]
         pure (Just (fun, Left (emb, emb_calls), emb_calls))
       Nothing -> case nominalBindPrecheck (unLoc bind) of
         Nothing -> pure Nothing

@@ -98,6 +98,7 @@ test('T25834', normal, compile, [''])
 test('GADTSingletons', normal, compile, [''])
 test('NativeNestedSumCapture', normal, compile, [''])
 test('NativeDependentResultBinders', normal, compile, [''])
+test('NativeTypeLamLargeElim', normal, compile, ['-dcore-lint'])
 test('NativeTypeCaseQuote', [req_th, only_ways(['normal'])],
      compile, [config.ghc_th_way_flags])
 

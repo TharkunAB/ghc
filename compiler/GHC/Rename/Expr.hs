@@ -3127,16 +3127,35 @@ rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
               return res
             _ -> do
               (mb_lam, lam_msgs) <- tryTc $ do
-                checkDupRdrNames binders
-                binders' <- traverse (\b -> L (getLoc b) <$> newLocalBndrRn b) binders
-                (HsWC wcs body', fvs) <-
-                  bindLocalNamesFV (map unLoc binders') $ do
-                    (wc, _, fv) <- rnHsTypeApp (HsWC noExtField body)
-                    return (wc, fv)
-                pure (wcs, binders', body', fvs)
+                let named_rdrs = [rdr | L _ (HsTvb _ _ (HsBndrVar _ rdr) _) <- binders]
+                    rn_bndrs [] = do
+                      (HsWC wcs body', _, fv) <- rnHsTypeApp (HsWC noExtField body)
+                      pure (wcs, [], body', fv)
+                    rn_bndrs (L bloc (HsTvb _ () bvar bkind) : bs) = do
+                      (kwcs, bkind', kfvs) <- case bkind of
+                        HsBndrNoKind _ -> pure ([], HsBndrNoKind noExtField, emptyFNs)
+                        HsBndrKind _ hs_k -> do
+                          (HsWC kw hs_k', _, kfv) <- rnHsTypeApp (HsWC noExtField hs_k)
+                          pure (kw, HsBndrKind noExtField hs_k', kfv)
+                      case bvar of
+                        HsBndrVar _ lrdr@(L vloc _) -> do
+                          nm <- newLocalBndrRn lrdr
+                          let tvb' = L bloc (HsTvb noAnn () (HsBndrVar noExtField (L vloc nm)) bkind')
+                          (wcs, bs', body', bfvs) <- bindLocalNamesFV [nm] (do
+                            (w, rbs, rb, rfv) <- rn_bndrs bs
+                            pure ((w, rbs, rb), rfv)) >>= \((w, rbs, rb), rfv) -> pure (w, rbs, rb, rfv)
+                          pure (kwcs ++ wcs, tvb' : bs', body', kfvs `plusFN` bfvs)
+                        HsBndrWildCard _ -> do
+                          nm <- newSysName (mkTyVarOcc "_")
+                          let wloc = noAnnSrcSpan (locA bloc)
+                              tvb' = L bloc (HsTvb noAnn () (HsBndrVar noExtField (L wloc nm)) bkind')
+                          (wcs, bs', body', bfvs) <- rn_bndrs bs
+                          pure (kwcs ++ wcs, tvb' : bs', body', kfvs `plusFN` bfvs)
+                checkDupRdrNames named_rdrs
+                rn_bndrs binders
               case mb_lam of
                 Just (wcs, binders', body', fvs)
-                  | not (null wcs) || has_anon_wildcard body' -> do
+                  | not (null wcs) || has_anon_wildcard binders' || has_anon_wildcard body' -> do
                       addMessages msgs
                       failM
                   | otherwise -> do
@@ -3148,7 +3167,7 @@ rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
                   failM
     _ -> rnHsTypeApp arg
   where
-    peel_type_lambda :: LHsType GhcPs -> Maybe (SrcSpanAnnA, [LocatedN RdrName], LHsType GhcPs)
+    peel_type_lambda :: LHsType GhcPs -> Maybe (SrcSpanAnnA, [LHsTyVarBndr () GhcPs], LHsType GhcPs)
     peel_type_lambda (L _ (HsParTy _ inner)) = peel_type_lambda inner
     peel_type_lambda (L l (XHsType (HsTypeLambda _ bndrs rhs))) = Just (l, bndrs, rhs)
     peel_type_lambda _ = Nothing

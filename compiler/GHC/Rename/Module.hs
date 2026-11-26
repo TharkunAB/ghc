@@ -864,6 +864,10 @@ localSourceTableBinders tycl_decls binds sigs = do
              (not (occ `elemOccSet` local_fun_occs) || occ `elemOccSet` signed)
         check :: [LHsExpr GhcPs] -> LHsExpr GhcPs -> Bool
         check args expr = case unLoc (stripParensLHsExpr expr) of
+          HsFunArr _ _ a b -> null args && check [] a && check [] b
+          HsForAll _ _ b -> null args && check [] b
+          HsQual _ (L _ (HsContext _ cs)) b -> null args && all (check []) cs && check [] b
+          HsStar{} -> null args
           HsApp _ fun arg -> check (arg : args) fun
           OpApp _ left op right -> check (left : right : args) op
           ExplicitTuple _ tup_args Boxed ->
@@ -955,6 +959,10 @@ localSourceTableBinders tycl_decls binds sigs = do
         check :: [LHsExpr GhcPs] -> LHsExpr GhcPs -> Bool
         check args expr = case unLoc (stripParensLHsExpr expr) of
           HsEmbTy _ (HsWC _ ty) -> null args && check_emb_ty [] ty
+          HsFunArr _ _ a b -> null args && check [] a && check [] b
+          HsForAll _ _ b -> null args && check [] b
+          HsQual _ (L _ (HsContext _ cs)) b -> null args && all (check []) cs && check [] b
+          HsStar{} -> null args
           HsApp _ fun arg -> check (arg : args) fun
           OpApp _ left op right -> check (left : right : args) op
           ExplicitTuple _ tup_args Boxed ->
@@ -1108,8 +1116,8 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
                      , not (b `elemNameSet` specialised)
                      , not (has_rn_splice fb)
                      , Just sig_wc <- [lookup_single_sig b]
-                     , let values = (fvs `intersectNameSet` local_values) `delFromNameSet` b
-                     , Just needed_tycons <- [candidate_types b sig_wc (fvs `minusNameSet` local_values)] ]
+                     , let values = ((fvs `intersectNameSet` local_values) `unionNameSet` rhs_tbl_vals fvs) `delFromNameSet` b
+                     , Just needed_tycons <- [candidate_types b sig_wc ((fvs `minusNameSet` local_values) `minusNameSet` rhs_tbl_names fvs)] ]
         candidate_set = mkNameSet [ b | (b, _, _) <- candidates ]
         schedule done (b, _, deps) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
                                    | otherwise = done
@@ -1172,9 +1180,24 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       [ maybe uses (uses `minusNameSet`) defs | (defs, uses) <- fromOL dus
       , not (maybe False (nameSetAny (isJust . sourceTableTermOcc . nameOccName)) defs) ]
 
-    local_values   = mkNameSet (collectHsValBinders CollNoDictBinders vals)
-    local_val_occs = mkOccSet [ nameOccName v | v <- nameSetElemsStable local_values ]
-    local_binders  = mkNameSet (hsGroupBinders group)
+    local_values     = mkNameSet (collectHsValBinders CollNoDictBinders vals)
+    local_val_occs   = mkOccSet [ nameOccName v | v <- nameSetElemsStable local_values ]
+    local_val_by_occ = mkOccEnv [ (nameOccName v, v) | v <- nameSetElemsStable local_values ]
+    local_binders    = mkNameSet (hsGroupBinders group)
+
+    rhs_tbl_names :: NameSet -> NameSet
+    rhs_tbl_names fvs = mkNameSet
+      [ nm
+      | nm <- nameSetElemsStable fvs
+      , is_pending_local_table nm ]
+
+    rhs_tbl_vals :: NameSet -> NameSet
+    rhs_tbl_vals fvs = mkNameSet
+      [ v
+      | nm <- nameSetElemsStable fvs
+      , is_pending_local_table nm
+      , Just term_occ <- [sourceTableTermOcc (nameOccName nm)]
+      , Just v <- [lookupOccEnv local_val_by_occ term_occ] ]
 
     local_syn_rhss :: NameEnv (Int, LHsType GhcRn)
     local_syn_rhss = mkNameEnv
@@ -3042,7 +3065,7 @@ lowerClosedFamDecls decls = do
           XHsType (HsTypeExistsRn fl v body) ->
             L loc (XHsType (HsTypeExistsRn fl (go sub v) (go_lty (delListFromNameEnv sub (maybeToList (hsLTyVarName v))) body)))
           XHsType (HsTypeLambdaQuoteRn vs body) ->
-            L loc (XHsType (HsTypeLambdaQuoteRn vs (go_lty (delListFromNameEnv sub (map unLoc vs)) body)))
+            L loc (XHsType (HsTypeLambdaQuoteRn (go sub vs) (go_lty (delListFromNameEnv sub (mapMaybe hsLTyVarName vs)) body)))
           XHsType (HsTypeLetRn src lb@(L _ b) r body) ->
             L loc (XHsType (HsTypeLetRn src lb (go_lty sub r) (go_lty (delFromNameEnv sub b) body)))
           XHsType (HsTypeCaseRn scrut rows) ->

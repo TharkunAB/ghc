@@ -8755,7 +8755,8 @@ tcSynthesizeConstMotive :: TcType -> TcType -> TcM (Maybe (TcType, CoAxiom Branc
 tcSynthesizeConstMotive dom_ty res_ty = do
   y_nm <- newSysName (mkTyVarOcc "$const_y")
   let lam_hs = noLocA $ XHsType $
-        HsTypeLambdaQuoteRn [noLocA y_nm] (noLocA (XHsType (HsCoreTyRn res_ty)))
+        HsTypeLambdaQuoteRn [noLocA (HsTvb noAnn () (HsBndrVar noExtField (noLocA y_nm)) (HsBndrNoKind noExtField))]
+                            (noLocA (XHsType (HsCoreTyRn res_ty)))
       exp_k  = mkVisFunTyManyU dom_ty liftedTypeKind
   motive_ty <- setXOptM LangExt.DependentTypes
                  (tcHsTypeApp (HsWC [] lam_hs) exp_k) >>= liftZonkM . zonkTcType
@@ -8779,7 +8780,8 @@ tcSynthesizeMotiveLambda ys raw_body = runMaybeT $ do
   hs_body <- MaybeT (pure (core_to_motive_hs id_set id_env body))
   let all_doms = map varType call_ids ++ doms
       lam_kind = foldr mkVisFunTyManyU liftedTypeKind all_doms
-      lam_hs   = noLocA $ XHsType $ HsTypeLambdaQuoteRn (map noLocA names) hs_body
+      lam_bndrs = [noLocA (HsTvb noAnn () (HsBndrVar noExtField (noLocA nm)) (HsBndrNoKind noExtField)) | nm <- names]
+      lam_hs    = noLocA $ XHsType $ HsTypeLambdaQuoteRn lam_bndrs hs_body
   fam_ty <- liftMaybeT (setXOptM LangExt.DependentTypes
                           (tcHsTypeApp (HsWC [] lam_hs) lam_kind) >>= liftZonkM . zonkTcType)
   return (mkAppTys fam_ty (map TermVarTy call_ids))
@@ -10359,27 +10361,43 @@ expr_to_type earg =
                ; rhs0 <- go in_data rhs >>= promote_section_tree
                ; sec_name <- newSysName (mkTyVarOcc "$comp")
                ; let sec_loc = noAnnSrcSpan (locA l)
+                     sec_tvb = L (l2l sec_loc) (HsTvb noAnn () (HsBndrVar noExtField (L sec_loc sec_name)) (HsBndrNoKind noExtField))
                      sec_ty  = L l (HsTyVar noAnn NotPromoted (L sec_loc (noUserRdr sec_name)))
                      inner   = L l (HsAppTy noExtField rhs0 sec_ty)
                      body    = L l (HsAppTy noExtField lhs0 inner)
-               ; return (L l (XHsType (HsTypeLambdaQuoteRn [L sec_loc sec_name] body))) }
+               ; return (L l (XHsType (HsTypeLambdaQuoteRn [sec_tvb] body))) }
              else do
                { lhs' <- go in_data lhs
                ; op'  <- go in_data op
                ; rhs' <- go in_data rhs
                ; return (L l (HsOpTy noExtField lhs' op' rhs')) } }
     go in_data e@(L l (HsLam _ LamSingle MG { mg_alts = L _ [L _ Match
-        { m_pats = L _ [pat]
+        { m_pats = L _ pats@(_:_)
         , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body_expr) NE.:| []
                           , grhssLocalBinds = L _ EmptyLocalBinds{} } }] })) =
       do { dep <- xoptM LangExt.DependentTypes
-         ; case (dep, unLoc pat) of
-             (True, VarPat _ (L vloc vname)) -> do
-               { tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName vname)))
-               ; raw_body <- go in_data body_expr
-               ; body <- promote_section_tree (subst_tyvar_occ vname tv_name raw_body)
-               ; return (L l (XHsType (HsTypeLambdaQuoteRn [L vloc tv_name] body))) }
-             _ -> failWith $ TcRnIllformedTypeArgument e }
+         ; unless dep $ failWith (TcRnIllformedTypeArgument e)
+         ; let go_pat p = case unLoc p of
+                 ParPat _ inner -> go_pat inner
+                 VarPat _ (L vloc vname) -> do
+                   tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName vname)))
+                   let tvb = L (l2l vloc) (HsTvb noAnn () (HsBndrVar noExtField (L vloc tv_name)) (HsBndrNoKind noExtField))
+                   pure (tvb, Just (vname, tv_name))
+                 WildPat _ -> do
+                   tv_name <- newSysName (mkTyVarOcc "_")
+                   let wloc = noAnnSrcSpan (getLocA p)
+                       tvb  = L (l2l wloc) (HsTvb noAnn () (HsBndrVar noExtField (L wloc tv_name)) (HsBndrNoKind noExtField))
+                   pure (tvb, Nothing)
+                 SigPat _ inner (HsPS _ sig_ty) -> do
+                   (L tloc (HsTvb x () bvar _), mb_sub) <- go_pat inner
+                   pure (L tloc (HsTvb x () bvar (HsBndrKind noExtField sig_ty)), mb_sub)
+                 _ -> failWith $ TcRnIllformedTypeArgument e
+         ; pairs <- mapM go_pat pats
+         ; raw_body <- go in_data body_expr
+         ; let (tvbs, subs) = (map fst pairs, catMaybes (map snd pairs))
+               sub_body = foldl' (\acc (old_nm, new_nm) -> subst_tyvar_occ old_nm new_nm acc) raw_body subs
+         ; body <- promote_section_tree sub_body
+         ; return (L l (XHsType (HsTypeLambdaQuoteRn tvbs body))) }
     go in_data (L l (SectionL _ lhs op)) =
       -- See Note [Operator sections in T2T].
       do { lhs' <- go in_data lhs
@@ -10387,9 +10405,10 @@ expr_to_type earg =
          ; op'  <- promote_section_op op0
          ; sec_name <- newSysName (mkTyVarOcc "$sec")
          ; let sec_loc = noAnnSrcSpan (locA l)
+               sec_tvb = L (l2l sec_loc) (HsTvb noAnn () (HsBndrVar noExtField (L sec_loc sec_name)) (HsBndrNoKind noExtField))
                sec_ty  = L l (HsTyVar noAnn NotPromoted (L sec_loc (noUserRdr sec_name)))
                body    = L l (HsOpTy noExtField lhs' op' sec_ty)
-         ; return (L l (XHsType (HsTypeLambdaQuoteRn [L sec_loc sec_name] body))) }
+         ; return (L l (XHsType (HsTypeLambdaQuoteRn [sec_tvb] body))) }
     go in_data (L l (SectionR _ op rhs)) =
       -- See Note [Operator sections in T2T].
       do { op0  <- go in_data op
@@ -10397,9 +10416,10 @@ expr_to_type earg =
          ; rhs' <- go in_data rhs
          ; sec_name <- newSysName (mkTyVarOcc "$sec")
          ; let sec_loc = noAnnSrcSpan (locA l)
+               sec_tvb = L (l2l sec_loc) (HsTvb noAnn () (HsBndrVar noExtField (L sec_loc sec_name)) (HsBndrNoKind noExtField))
                sec_ty  = L l (HsTyVar noAnn NotPromoted (L sec_loc (noUserRdr sec_name)))
                body    = L l (HsOpTy noExtField sec_ty op' rhs')
-         ; return (L l (XHsType (HsTypeLambdaQuoteRn [L sec_loc sec_name] body))) }
+         ; return (L l (XHsType (HsTypeLambdaQuoteRn [sec_tvb] body))) }
     go _ (L l (XExpr (HsRecSelRn (FieldOcc rdr (L fl_loc sel_name))))) =
       promote_section_op (L l (HsTyVar noAnn NotPromoted (L fl_loc (WithUserRdr rdr sel_name))))
     go in_data e@(L l (HsGetField _ recv (L _ dfo))) =

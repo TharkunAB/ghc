@@ -34,7 +34,7 @@ import GHC.Types.UnresolvedImport ( isGeneratedImport )
 import GHC.Types.FieldLabel
 import GHC.Types.Avail            ( Avails )
 import GHC.Types.Id               ( isDataConId_maybe )
-import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTyThing_maybe, getName )
+import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTyThing_maybe, getName, isSystemName )
 import GHC.Types.Name.Env         ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv )
 import GHC.Types.Name.Reader      ( RecFieldInfo(..), WithUserRdr(..) )
 import GHC.Types.SrcLoc
@@ -2065,8 +2065,13 @@ instance ToHie (LocatedA (HsType GhcRn)) where
         , toHie body
         ]
       XHsType (HsTypeLambdaQuoteRn binders body) ->
-        [ concatM [toHie $ C (TyVarBind (mkScope body) (ResolvedScopes [])) binder
-                  | binder <- binders]
+        [ concatM [ concatM $
+                      [ toHie $ C (TyVarBind (mkScope body) (ResolvedScopes [])) ln
+                      | Just ln <- [hsLTyVarLocName binder]
+                      , not (isSystemName (unLoc ln)) ] ++
+                      [ toHie k
+                      | L _ (HsTvb _ _ _ (HsBndrKind _ k)) <- [binder] ]
+                  | binder <- binders ]
         , toHie body
         ]
       XHsType _ -> []

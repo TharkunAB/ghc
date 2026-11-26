@@ -4283,9 +4283,21 @@ qvaropm :: { LocatedN RdrName }
 -----------------------------------------------------------------------------
 -- Type variables
 
-type_lambda_binders :: { [LocatedN RdrName] }
-        : tyvar                       { [$1] }
-        | tyvar type_lambda_binders    { $1 : $2 }
+type_lambda_binders :: { [LHsTyVarBndr () GhcPs] }
+        : type_lambda_bndr                      { [$1] }
+        | type_lambda_bndr type_lambda_binders  { $1 : $2 }
+
+type_lambda_bndr :: { LHsTyVarBndr () GhcPs }
+        : tyvar_wc                      {% amsA' (sL1 $1
+                                                (HsTvb { tvb_ext  = noAnn
+                                                       , tvb_flag = ()
+                                                       , tvb_var  = unLoc $1
+                                                       , tvb_kind = HsBndrNoKind noExtField })) }
+        | '(' tyvar_wc '::' kind ')'    {% amsA' (sLL $1 $>
+                                                (HsTvb { tvb_ext  = AnnTyVarBndr [glR $1] [glR $5] noAnn (epUniTok $3)
+                                                       , tvb_flag = ()
+                                                       , tvb_var  = unLoc $2
+                                                       , tvb_kind = HsBndrKind noExtField $4 })) }
 
 tyvar   :: { LocatedN RdrName }
 tyvar   : tyvarid               { $1 }

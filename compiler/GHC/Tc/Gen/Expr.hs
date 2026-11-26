@@ -265,7 +265,18 @@ tcPolyExprCheck expr res_ty
                                       then do { wc_ty <- expr_to_type_at_kind rep_kind (noLocA e)
                                               ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
                                       else tcExpr e (mkCheckExpType rho_ty') }
-                                  Nothing -> tcExpr e (mkCheckExpType rho_ty') } }
+                                  Nothing
+                                    | dep -> do
+                                        { rho_z <- liftZonkM (zonkTcType rho_ty')
+                                        ; if tcIsLiftedTypeKind rho_z
+                                          then do
+                                            { as_ty <- isUnadornedTypeExpr e
+                                            ; if as_ty
+                                              then do { wc_ty <- expr_to_type_at_kind liftedTypeKind (noLocA e)
+                                                      ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
+                                              else tcExpr e (mkCheckExpType rho_ty') }
+                                          else tcExpr e (mkCheckExpType rho_ty') }
+                                    | otherwise -> tcExpr e (mkCheckExpType rho_ty') } }
         in tc_body expr
 
     -- `outer_skolemise` checks expressions that need runtime abstraction.

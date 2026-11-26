@@ -2778,8 +2778,20 @@ splitMutualLargeElim env needed group@HsGroup
       , b == target ]
 
     is_emb_ty_match :: LMatch GhcRn (LHsExpr GhcRn) -> Bool
-    is_emb_ty_match (L _ Match{m_pats = L _ (_ : _), m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})})
-      | HsEmbTy{} <- unLoc (stripParensLHsExpr rhs) = True
+    is_emb_ty_match (L _ Match{m_pats = L _ (_ : _), m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})}) =
+      case unLoc (stripParensLHsExpr rhs) of
+        HsEmbTy{}         -> True
+        HsFunArr{}        -> True
+        HsForAll{}        -> True
+        HsQual{}          -> True
+        HsStar{}          -> True
+        HsVar{}           -> True
+        HsApp{}           -> True
+        HsAppType{}       -> True
+        ExplicitTuple{}   -> True
+        ExplicitList{}    -> True
+        ExprWithTySig{}   -> True
+        _                 -> False
     is_emb_ty_match _ = False
 
     find_large_elim_sig :: Name -> Maybe (SrcSpanAnnA, LHsSigWcType GhcRn)
