@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers #-}
 {-# LANGUAGE RoleAnnotations, StandaloneKindSignatures, TypeFamilies, TypeOperators #-}
 module NativeTypeLambdaEtaLib where
 

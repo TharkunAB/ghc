@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds #-}
 module NativeTypeCaseFallback where
 
 type Force (b :: Bool) = case b of { True -> Int; _ -> Int }

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 module NativeSimplifierLocalRec (observe, observeInGroup, ordinary) where
 
 data Flag (b :: Bool) where

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneKindSignatures, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module UniversalResultProof (MappedResult, fmapRight, originalRuntime) where

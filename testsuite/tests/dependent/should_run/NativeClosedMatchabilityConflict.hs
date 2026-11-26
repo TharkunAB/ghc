@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, NoDependentTypes #-}
 {-# LANGUAGE PolyKinds, TypeApplications, TypeFamilies, TypeOperators #-}
 module NativeClosedMatchabilityConflict where
 import Data.Kind (Type)

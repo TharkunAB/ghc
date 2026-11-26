@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ImpredicativeTypes, LinearTypes, PolyKinds, RankNTypes, RequiredTypeArguments, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ImpredicativeTypes, LinearTypes, PolyKinds, RankNTypes, RequiredTypeArguments, TypeApplications #-}
 module WitnessSchema
     ( Hidden, callback, unpack, Multi, pair, kindBox, KindBox, Deep, producer
     , CallbackPair, atTwoTypes, observePair, ignorePair

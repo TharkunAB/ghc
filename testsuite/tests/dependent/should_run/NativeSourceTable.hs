@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, FlexibleContexts, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 {-# LANGUAGE NoStarIsType, RankNTypes, TypeFamilies #-}
 
 module Main where

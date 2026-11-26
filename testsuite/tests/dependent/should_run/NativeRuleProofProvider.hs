@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies, TypeOperators #-}
 
 module NativeRuleProofProvider (Image, ImageAlias, imageProof, other) where
 

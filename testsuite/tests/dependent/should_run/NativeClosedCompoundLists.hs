@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, FlexibleInstances, KindSignatures, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, FlexibleInstances, KindSignatures, TypeOperators #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 module Main where

@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE GADTs, Modifiers, PolyKinds, RankNTypes, ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeAbstractions, TypeApplications, TypeOperators #-}
 

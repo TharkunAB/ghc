@@ -5,6 +5,7 @@ import Data.Proxy (Proxy (..))
 import GHC.Tuple (Tuple2, Unit)
 import GHC.Types (Multiplicity (..))
 import NativeLinearForEachAndExtendedLetProvider
+import NativeStandaloneExtendedLet (polySyn)
 
 singBoolToBool :: SingBool b -> Bool
 singBoolToBool STrue  = True
@@ -67,7 +68,7 @@ doAndInfixSynCheck = do
   pure (decode v1 + decode v2)
 
 main :: IO Unit
-main = do
+main = polySyn (Proxy @Int) `seq` do
   let v1 = vCons1 Zero 10 VNil
       v2 = vCons1 (Succ Zero) 25 v1
       b1 = singBoolToBool (idRetainedLinear True)

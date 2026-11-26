@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, ExperimentalDependentTypes, PolyKinds, RankNTypes #-}
+{-# LANGUAGE AllowAmbiguousTypes, DependentTypes, ListTuplePuns, PolyKinds, RankNTypes #-}
 {-# LANGUAGE RequiredTypeArguments, ScopedTypeVariables, TypeFamilies #-}
 module MixedPackageProvider
   ( Inner, Mixed, inner, returnInner, written, lazyInner, ignoreMixed, readMixed

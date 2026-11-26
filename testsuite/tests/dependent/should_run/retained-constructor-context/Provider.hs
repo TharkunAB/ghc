@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, ExperimentalDependentTypes #-}
+{-# LANGUAGE GHC2024, DependentTypes, ListTuplePuns #-}
 module Provider where
 
 import Data.Proxy (Proxy)

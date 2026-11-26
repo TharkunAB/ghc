@@ -1,11 +1,11 @@
 {-# LANGUAGE CPP, ScopedTypeVariables #-}
 #ifdef PROMOTED
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 #ifdef APPLICATIONS
 {-# LANGUAGE BangPatterns #-}
 #endif
 #else
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 #endif
 module ChooseEvidence where
 

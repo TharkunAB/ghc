@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, DataKinds, MagicHash, NoExperimentalDependentTypes, TypeApplications, TypeFamilies, PolyKinds, RankNTypes, TypeOperators #-}
+{-# LANGUAGE GADTs, DataKinds, MagicHash, NoDependentTypes, TypeApplications, TypeFamilies, PolyKinds, RankNTypes, TypeOperators #-}
 module NativeTypeCaseClient where
 
 import Data.Kind (Type)

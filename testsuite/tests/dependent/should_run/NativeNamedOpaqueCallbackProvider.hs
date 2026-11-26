@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 
 module NativeNamedOpaqueCallbackProvider (mapper, otherMapper) where
 

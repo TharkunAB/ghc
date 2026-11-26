@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, DataKinds #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, DataKinds #-}
 module NativeCSEProjectionLib (lazyWitness) where
 
 import GHC.Sigma (Sigma(Pair))

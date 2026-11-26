@@ -1,8 +1,11 @@
-{-# LANGUAGE AllowAmbiguousTypes, ExperimentalDependentTypes, GADTs, Modifiers, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE AllowAmbiguousTypes, BangPatterns, DependentTypes, ListTuplePuns, GADTs, Modifiers, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 module Main where
 
 import Data.Type.Equality ((:~:)(Refl), trans)
+import Control.Exception (ErrorCall, catch, evaluate)
 import GHC.Matchability (Matchability)
+import NativeComposedIsoFields ()
+import NativeComposedStrictLocal (strictLocal)
 
 data Iso a b where
   MkIso :: foreach (to :: a -> b) -> foreach (from :: b -> a)
@@ -14,7 +17,7 @@ cong :: forall {a} {b} {m :: Matchability} (f :: a %m -> b) x y.
         x :~: y -> f x :~: f y
 cong Refl = Refl
 
--- | Signed where-clauses with 1-arg lazy compositions (R04).
+-- | Signed where-clauses with 1-arg lazy compositions.
 packWhereSigned
   :: forall a b c. foreach (f :: a -> b) -> foreach (g :: b -> a)
   -> foreach (h :: b -> c) -> foreach (k :: c -> b)
@@ -175,4 +178,12 @@ main = do
              (composeLeft boolNot boolNot boolNot boolNot notInv notInv)
              (composeLeft boolNot boolNot boolNot boolNot notInv notInv)
   print (map observeIso [i1, i2, i3, i4, i5, i6, i7, i8, i9])
-  print (lazyCompose, boolToInt (intToBool 1))
+  let bangLocal :: Int
+      bangLocal = let to !x = const 1 (id x) in to (error "bang-forced")
+      expectBottom :: IO Int -> IO String
+      expectBottom act = (show <$> (act >>= evaluate)) `catch` \(_ :: ErrorCall) -> pure "bottom"
+  r1 <- expectBottom (pure bangLocal)
+  r2 <- expectBottom (pure strictLocal)
+  if (r1 ++ ":" ++ r2) == "bottom:bottom"
+    then print (lazyCompose, boolToInt (intToBool 1))
+    else error ("Unexpected strictness result: " ++ r1 ++ ":" ++ r2)

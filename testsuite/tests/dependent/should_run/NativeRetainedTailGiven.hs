@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, FlexibleContexts, GADTs, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, GADTs, TypeOperators #-}
 module NativeRetainedTailGiven where
 
 import Data.Type.Equality (gcastWith)

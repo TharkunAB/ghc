@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, RequiredTypeArguments #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, RequiredTypeArguments #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications #-}
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

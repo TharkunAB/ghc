@@ -107,7 +107,7 @@ idDep _ x = x
 implType :: foreach (a :: Type). a -> Tuple2 a (List Char)
 implType @b (x :: b) = (the b x, show b)
 
--- PLFH R04: Existential GADT retained operand
+-- Existential GADT retained operand
 data Ty = TUnit | TArr Ty Ty
   deriving (Eq, Show)
 
@@ -125,7 +125,7 @@ data Prog :: forall a. Term a -> Type where
 liftApp1 :: foreach (l :: Term (TArr a b)) (m :: Term a) -> Prog l -> Prog (App l m)
 liftApp1 _ m (PStep l' s) = PStep (App l' m) (XiApp1 s)
 
--- PLFH R23: Matchability forgetfulness in Leibniz equality
+-- Matchability forgetfulness in Leibniz equality
 data EqP (x :: a) :: a -> Type where
   ReflP :: EqP x x
 
@@ -135,7 +135,7 @@ newtype Leibniz a (x :: a) (y :: a)
 leibnizToEqP :: forall a (x :: a) (y :: a). Leibniz a x y -> EqP x y
 leibnizToEqP (Leibniz f) = f @(EqP x) ReflP
 
--- PLFH R16: Higher-rank renaming callback kind matchability inference
+-- Higher-rank renaming callback kind matchability inference
 data Ctx = Empty | Snoc Ctx Ty
 
 data FinCtx (g :: Ctx) (t :: Ty) where

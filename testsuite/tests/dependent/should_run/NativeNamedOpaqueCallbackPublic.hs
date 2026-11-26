@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, LinearTypes #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, LinearTypes #-}
 
 module NativeNamedOpaqueCallbackPublic (stored, owns, called, ownsCall) where
 

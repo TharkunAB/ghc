@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, NamedWildCards #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, NamedWildCards #-}
 {-# LANGUAGE PartialTypeSignatures, ScopedTypeVariables, TypeApplications #-}
 module NativeOpenRetryInterfaceProducer (upper) where
 

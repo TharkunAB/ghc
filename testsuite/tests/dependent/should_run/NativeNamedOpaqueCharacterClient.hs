@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, Modifiers, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, Modifiers, TypeOperators #-}
 module NativeNamedOpaqueCharacterClient where
 
 import CharacterDecision (Decision, Space, spaceDecision)

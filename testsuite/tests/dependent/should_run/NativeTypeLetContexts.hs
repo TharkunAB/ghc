@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications, TypeFamilies #-}
 module NativeTypeLetContexts where
 

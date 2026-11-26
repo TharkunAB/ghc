@@ -8,9 +8,11 @@ import Data.Type.Equality ((:~:)(Refl))
 import qualified GHC.Tuple as Tup
 import GHC.Types (List)
 import NativeDataHeraldInTypesProvider
+import NativeDataHeraldPunsOn (checkPunsOn)
+import NativeDataHeraldNoPunWarnings (boxDataT, boxDataList, boxDataPair, boxPunVar)
 
 -- 1. Punned data T = T:
---    Proxy T refers to type T :: Type, while Proxy (data T) refers to 'T :: T.
+--  Proxy T refers to type T :: Type, while Proxy (data T) refers to 'T :: T.
 proxyTypeT :: Proxy (T :: Type)
 proxyTypeT = Proxy :: Proxy T
 
@@ -152,4 +154,9 @@ main = do
     seq pairConData $
     seq rtaPunTypeAndData $
     seq rtaNested $
+    seq checkPunsOn $
+    seq boxDataT $
+    seq boxDataList $
+    seq boxDataPair $
+    seq (boxPunVar Zero) $
     print (len3, sum2, appBools, atT, atVar, rtaX, termData T)

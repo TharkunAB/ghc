@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE NamedWildCards, PartialTypeSignatures, ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications, TypeOperators #-}
 module Main (main) where

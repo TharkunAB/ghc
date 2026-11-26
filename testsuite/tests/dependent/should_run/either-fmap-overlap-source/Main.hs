@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, Modifiers #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module Main (main, originalChoice, specializedChoice) where

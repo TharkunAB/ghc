@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers, PolyKinds, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers, PolyKinds, StandaloneKindSignatures #-}
 {-# LANGUAGE TypeFamilies, TypeOperators, UndecidableInstances #-}
 module NativeTypeLambdaScope
   ( Levels, Adjacent, InferredLevels, UsesKind, LetKind

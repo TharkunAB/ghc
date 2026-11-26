@@ -4,6 +4,7 @@ module Main (main) where
 import Control.Exception (ErrorCall (..), throwIO)
 import Data.Type.Equality ((:~:) (Refl))
 import NativePolyNestedDomainOpenEqProvider
+import NativePolyNestedDomainOpenEqReverse (proofAssoc, proofDirectTuple, proofSum, proofUnit)
 
 clientAssocRT :: foreach (p :: ((a, b), c)) -> assocProdFrom (assocProdTo p) :~: p
 clientAssocRT (ab, _) = case ab of
@@ -70,5 +71,9 @@ main = do
        , clientDistribRT (Left True :: Either Bool Int, ())
        , clientDistribLRT ((), Right False :: Either Int Bool)
        , clientListPairRT ([True, False], ())
+       , proofAssoc ((True, False), ())
+       , proofDirectTuple ((True, False), ())
+       , proofUnit True
+       , proofSum (Right () :: Either (Either Bool Int) ())
        ) of
-    (Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl) -> pure ()
+    (Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl) -> pure ()

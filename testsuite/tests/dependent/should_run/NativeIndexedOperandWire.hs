@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 {-# LANGUAGE PolyKinds, ScopedTypeVariables, TypeApplications #-}
 module NativeIndexedOperandWire (tagCons) where
 

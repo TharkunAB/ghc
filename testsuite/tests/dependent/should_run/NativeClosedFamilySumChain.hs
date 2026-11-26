@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExplicitForAll, ExperimentalDependentTypes, PolyKinds, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, ExplicitForAll, DependentTypes, ListTuplePuns, PolyKinds, TypeFamilies, UndecidableInstances #-}
 
 module NativeClosedFamilySumChain (Loop, OpenLoop, OpenPackage, Outer) where
 

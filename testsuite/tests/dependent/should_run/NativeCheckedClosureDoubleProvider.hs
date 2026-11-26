@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, RankNTypes #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, RankNTypes #-}
 
 module NativeCheckedClosureDoubleProvider where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, StandaloneKindSignatures, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, StandaloneKindSignatures, TypeOperators #-}
 module Main where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, LambdaCase, ScopedTypeVariables #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, LambdaCase, ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications, TypeOperators #-}
 module SameGroupKeyTreeProof (Tree(..), Size(..), mapValues, nodes, nodesMap, forkCount) where
 

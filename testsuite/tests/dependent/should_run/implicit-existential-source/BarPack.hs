@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, RequiredTypeArguments #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, RequiredTypeArguments #-}
 module BarPack where
 
 import Filter

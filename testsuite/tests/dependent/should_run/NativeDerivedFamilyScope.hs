@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP, DerivingStrategies, DerivingVia, GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE NoExperimentalDependentTypes, StandaloneDeriving, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE NoDependentTypes, StandaloneDeriving, TypeFamilies, UndecidableInstances #-}
 module NativeDerivedFamilyScope where
 
 import NativeConstrainedFamilyProvider (Allowed, ListBacking, ListSource)

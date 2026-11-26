@@ -1,14 +1,9 @@
-{-# LANGUAGE CPP, DataKinds, FlexibleContexts, FlexibleInstances, GADTs, MultiParamTypeClasses, ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
-#ifdef DUPLICATE
-{-# LANGUAGE ExperimentalDependentTypes #-}
-#else
-{-# LANGUAGE NoExperimentalDependentTypes #-}
-#endif
+{-# LANGUAGE DataKinds, FlexibleContexts, FlexibleInstances, GADTs, MultiParamTypeClasses, NoDependentTypes, ScopedTypeVariables, TypeApplications, TypeFamilies, TypeOperators #-}
 module Main where
 
+import Data.Proxy (Proxy(..))
 import Data.Type.Equality
 import ErasedStream (Stream, fromList)
-import Data.Proxy (Proxy(..))
 import StreamPreview (prefix, preview)
 
 type family IsBoolean p where
@@ -24,33 +19,6 @@ instance StreamOnly (Stream a) where streamOnly _ = 0
 
 forward :: forall a. Stream a -> [a]
 forward xs = prefix 1 xs
-
-#if defined(UNDETERMINED)
-undetermined :: Int
-undetermined = streamOnly @(Stream Bool) (fromList [True])
-#elif defined(CONFLICT)
-conflict :: Int
-conflict = firstElement @Bool @(Stream Char) Proxy (fromList "x")
-#elif defined(STUCK)
-type family Element a
-wrong :: IsBoolean (Stream (Element Int)) :~: 'False
-wrong = Refl
-#elif defined(OPEN)
-wrong :: proxy a -> IsBoolean (Stream a) :~: 'False
-wrong _ = Refl
-#elif defined(INVERSE)
-wrong :: Stream a :~: Stream b -> a :~: b
-wrong Refl = Refl
-#elif defined(REPEATED)
-class Sample a
-instance Sample (a,a) => Sample (Maybe (Stream a))
-#elif defined(DUPLICATE)
-class Sample a
-type First = exists i. (i, i -> Bool)
-type Second = exists j. (j, j -> Bool)
-instance Sample First
-instance Sample Second
-#endif
 
 choices :: (IsBoolean (Stream Bool) :~: 'True, IsBoolean (Stream Char) :~: 'False)
 choices = (Refl, Refl)

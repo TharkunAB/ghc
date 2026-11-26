@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, LinearTypes, NoExperimentalDependentTypes, NoImpredicativeTypes, PatternSynonyms #-}
+{-# LANGUAGE DataKinds, GADTs, LinearTypes, NoDependentTypes, NoImpredicativeTypes, PatternSynonyms #-}
 
 module CaseMain where
 

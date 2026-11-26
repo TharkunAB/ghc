@@ -1,0 +1,8 @@
+(Right 42,Left "missing flag")
+(Right 42,Left "shadowed flag")
+(Right 42,Left "quoted flag")
+(Right 42,Left "type-spliced flag")
+17
+18
+(Right 42,Right True)
+(Right 42,Right True)

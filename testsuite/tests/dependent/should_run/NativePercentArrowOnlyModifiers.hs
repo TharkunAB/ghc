@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, Modifiers, NoLinearTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, Modifiers, NoLinearTypes, NoDependentTypes #-}
 {-# LANGUAGE GADTs, TypeApplications, TypeOperators #-}
 module NativePercentArrowOnlyModifiers where
 import Data.Kind (Type)

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, RequiredTypeArguments, TypeApplications #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, RequiredTypeArguments, TypeApplications #-}
 module Main where
 import Data.Kind (Type)
 import GHC.Exists

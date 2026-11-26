@@ -1,4 +1,4 @@
-{-# LANGUAGE ImpredicativeTypes, LinearTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ImpredicativeTypes, LinearTypes, NoDependentTypes #-}
 {-# LANGUAGE RankNTypes, ScopedTypeVariables #-}
 module RankedForwardReject where
 

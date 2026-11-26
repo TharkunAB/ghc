@@ -1,4 +1,4 @@
-:set -XDataKinds -XExperimentalDependentTypes -XPolyKinds -XTypeFamilies -XTypeOperators -XNoModifiers
+:set -XDataKinds -XDependentTypes -XListTuplePuns -XPolyKinds -XTypeFamilies -XTypeOperators -XNoModifiers
 import GHC.Matchability (Matchability(..))
 :{
 type family Map f xs where

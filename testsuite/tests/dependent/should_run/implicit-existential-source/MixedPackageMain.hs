@@ -1,4 +1,4 @@
-{-# LANGUAGE ImpredicativeTypes, NoExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE ImpredicativeTypes, NoDependentTypes, RankNTypes #-}
 module Main where
 
 import Control.Exception (ErrorCall(..), evaluate, try)

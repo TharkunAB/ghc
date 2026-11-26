@@ -1,20 +1,12 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 module Main where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)
 import Data.List (isInfixOf)
 import Data.Type.Equality ((:~:) (Refl))
 import NativeOpenMonusSource (monus)
+import NativeOpenMonusVariants (monusLocal, monusMixed)
 import PreludeMapLengthSize (Nat (..))
-
-#if defined(WRONG_SUCCESSORS)
-bad :: foreach (m :: Nat) -> foreach (n :: Nat)
-    -> monus ('Succ m) ('Succ n) :~: 'Succ (monus m n)
-bad _ _ = Refl
-#elif defined(UNKNOWN_RIGHT)
-bad :: foreach (n :: Nat) -> monus 'Zero n :~: 'Zero
-bad _ = Refl
-#endif
 
 zeroMonus :: foreach (n :: Nat) -> monus 'Zero n :~: 'Zero
 zeroMonus Zero = Refl
@@ -27,6 +19,13 @@ cancelSuccessors :: foreach (m :: Nat) -> foreach (n :: Nat)
                  -> monus ('Succ m) ('Succ n) :~: monus m n
 cancelSuccessors _ _ = Refl
 
+mixedZero :: foreach (n :: Nat) -> monusMixed n 'Zero :~: n
+mixedZero _ = Refl
+
+localCancel :: foreach (m :: Nat) -> foreach (n :: Nat)
+            -> monusLocal ('Succ m) ('Succ n) :~: monusLocal m n
+localCancel _ _ = Refl
+
 holds :: (a :: Nat) :~: b -> Bool
 holds Refl = True
 
@@ -34,7 +33,7 @@ main :: IO ()
 main = do
   print ( holds (zeroMonus Zero)
         , holds (zeroMonus (Succ Zero))
-        , holds (monusZero (Succ Zero))
+        , holds (monusZero (Succ Zero)) && holds (mixedZero Zero) && holds (localCancel Zero Zero)
         , holds (cancelSuccessors (Succ Zero) Zero)
         )
   case monus Zero (Succ (error "forced predecessor")) of

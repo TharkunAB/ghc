@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExplicitForAll, ExperimentalDependentTypes, GADTs, PolyKinds, TypeFamilies #-}
+{-# LANGUAGE CPP, DataKinds, ExplicitForAll, DependentTypes, ListTuplePuns, GADTs, PolyKinds, TypeFamilies #-}
 
 module NativeClosedFamilySumProvider (DirectOpen, KindCapture, KindOpen, Pack, PackViaAlias, Tagged (..)) where
 

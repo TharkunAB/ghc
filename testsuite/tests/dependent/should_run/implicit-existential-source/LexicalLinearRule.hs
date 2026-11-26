@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, LinearTypes, MonoLocalBinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, LinearTypes, MonoLocalBinds, NoDependentTypes #-}
 module LexicalLinearRule (readFromRule) where
 
 import LexicalLetProvider

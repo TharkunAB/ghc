@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes, PolyKinds, TypeFamilies #-}
+{-# LANGUAGE NoDependentTypes, PolyKinds, TypeFamilies #-}
 
 module NativeAssociatedSumClass (Build (..), Shape (..)) where
 

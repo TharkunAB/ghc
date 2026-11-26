@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RequiredTypeArguments #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RequiredTypeArguments #-}
 
 module RetainedDot where
 

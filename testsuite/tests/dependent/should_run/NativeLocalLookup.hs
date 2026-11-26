@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, EmptyCase, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE CPP, DataKinds, EmptyCase, DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE PolyKinds, RankNTypes, StandaloneKindSignatures, TypeOperators #-}
 #ifdef SPLICE_UNUSED_ABSTRACT
 {-# LANGUAGE TemplateHaskell #-}

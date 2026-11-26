@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, KindSignatures, NoExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE DataKinds, GADTs, KindSignatures, NoDependentTypes, TypeFamilies #-}
 module NativeClosedIndexedRoute where
 
 import Numeric.Natural (Natural)

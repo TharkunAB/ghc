@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GHC2024, NoDependentTypes #-}
 module Main where
 
 import Data.Type.Equality

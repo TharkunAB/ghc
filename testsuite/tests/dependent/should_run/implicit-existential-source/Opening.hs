@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, NoExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, NoDependentTypes, RankNTypes #-}
 module Opening (audit
 #if !defined(CHECK_INPUT_ESCAPE) && !defined(CHECK_FORWARD_ESCAPE)
                , viaFixedInput, viaForwardedInput

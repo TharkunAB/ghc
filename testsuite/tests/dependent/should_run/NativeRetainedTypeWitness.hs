@@ -1,11 +1,8 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE NoExperimentalDependentTypes #-}
-{-# LANGUAGE NoGeneralizedNewtypeDeriving #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE Safe #-}
-{-# LANGUAGE TypeApplications #-}
-module Main where
+{-# LANGUAGE DataKinds, NoDependentTypes, NoGeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RankNTypes, Safe, TypeApplications #-}
+module Main (main) where
 
+import NativeRetainedTypeOperand (runOperand)
 import NativeRetainedTypeWitnessLib
 import Type.Reflection
 
@@ -33,3 +30,4 @@ main = do
   let label :: Label 18446744073709551616
       label = labelWith 18446744073709551616 (error "unused payload" :: Bool)
   print (readLabel label)
+  runOperand

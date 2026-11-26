@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, FlexibleContexts, GADTs, Modifiers, PolyKinds, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, GADTs, Modifiers, PolyKinds, TypeOperators #-}
 module MappingScope where
 
 import Data.Proxy (Proxy)

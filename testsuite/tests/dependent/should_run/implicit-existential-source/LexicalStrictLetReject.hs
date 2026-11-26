@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, NoExperimentalDependentTypes, Strict #-}
+{-# LANGUAGE BangPatterns, NoDependentTypes, Strict #-}
 module LexicalStrictLetReject where
 
 import LexicalLetProvider

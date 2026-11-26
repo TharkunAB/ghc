@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeOperators #-}
 module WrongPairNamespace where
 
 import Data.Type.Equality ((:~:))

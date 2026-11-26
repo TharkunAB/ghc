@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeFamilies, TypeOperators #-}
 module NativeOpenMatchabilityClient where
 
 import Data.Kind (Type)

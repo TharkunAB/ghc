@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, KindSignatures, PolyKinds #-}
 {-# LANGUAGE TypeOperators #-}
 module WrongRigidPair where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, FlexibleContexts, GADTs #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, GADTs #-}
 {-# LANGUAGE Modifiers, PolyKinds, TypeApplications, TypeOperators #-}
 {-# OPTIONS_GHC -Wno-inline-rule-shadowing -Wno-simplifiable-class-constraints #-}
 module DirectMappingControl where

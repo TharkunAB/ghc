@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, TemplateHaskell, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LambdaCase, TemplateHaskell, TypeApplications #-}
 module NativeTypeCaseRetainedThRaw
   (chooseInline, chooseDirect, renderDirect, observeInline, caseData
   , chooseQuoted, renderQuoted, QuotedPick, chooseNested, SpliceFlag(..)

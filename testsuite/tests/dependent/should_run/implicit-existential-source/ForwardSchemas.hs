@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes, RequiredTypeArguments, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes, RequiredTypeArguments, TypeFamilies #-}
 module ForwardSchemas
     ( HiddenBar, Restricted, barValue, barIsEmpty, restrict, keepInput, lateResult
     , SlotBox, slotBox, slotLabel, Ranked, ranked, inspectRanked

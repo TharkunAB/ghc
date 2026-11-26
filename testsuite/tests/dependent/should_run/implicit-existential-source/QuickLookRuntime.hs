@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ImpredicativeTypes, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ImpredicativeTypes, RankNTypes #-}
 module QuickLookRuntime where
 
 import Data.Kind (Type)

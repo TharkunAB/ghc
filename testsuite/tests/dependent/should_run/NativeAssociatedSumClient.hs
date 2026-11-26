@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeFamilies #-}
 
 module Main (main) where
 

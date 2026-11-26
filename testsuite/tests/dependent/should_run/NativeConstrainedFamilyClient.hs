@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP, ConstraintKinds, FlexibleContexts, MultiParamTypeClasses, QuantifiedConstraints, TypeApplications #-}
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes, RankNTypes, ScopedTypeVariables, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE GADTs, NoDependentTypes, RankNTypes, ScopedTypeVariables, TypeFamilies, TypeOperators #-}
 module NativeConstrainedFamilyClient where
 
 import Data.Kind (Type)

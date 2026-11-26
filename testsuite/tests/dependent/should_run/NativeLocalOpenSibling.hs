@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, StandaloneKindSignatures #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, StandaloneKindSignatures #-}
 {-# OPTIONS_GHC -fenable-rewrite-rules -Wno-inline-rule-shadowing #-}
 module NativeLocalOpenSibling where
 import Data.Kind (Type)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, PolyKinds, ScopedTypeVariables, StandaloneKindSignatures, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, PolyKinds, ScopedTypeVariables, StandaloneKindSignatures, TypeApplications #-}
 module NativeIndexedConsProof (
     Seen(..), see, inlineNil, inlineCons, inlineNestedCons, writtenNil, writtenCons
   ) where

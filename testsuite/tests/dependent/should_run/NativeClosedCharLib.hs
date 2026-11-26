@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module NativeClosedCharLib (code, nonempty) where
 
 import Data.Char (ord)

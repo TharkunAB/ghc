@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, RankNTypes #-}
 module LexicalRetainedReader (RetainedReader, Display, worker, getText) where
 
 class Show a => Display a

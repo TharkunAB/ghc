@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, UndecidableInstances #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, UndecidableInstances #-}
 module NativeNestedPackagePatProvider where
 
 import Data.Proxy (Proxy)

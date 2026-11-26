@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, EmptyCase, ExperimentalDependentTypes, GADTs, LinearTypes, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, EmptyCase, DependentTypes, ListTuplePuns, GADTs, LinearTypes, ScopedTypeVariables #-}
 module NativeRetainedAsPattern (lookupBoth) where
 
 import PackedVecLibrary (sourceLength)

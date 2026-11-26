@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, PolyKinds, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, PolyKinds, RankNTypes #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeAbstractions, TypeFamilies #-}
 module NativeUnsaturatedInvisibleMatchable where
 import Data.Kind (Type)

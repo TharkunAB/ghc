@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, PolyKinds, TemplateHaskell, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, PolyKinds, TemplateHaskell, TypeFamilies, TypeOperators #-}
 module NativeTypeLambdaReify where
 
 import qualified Data.Kind as K

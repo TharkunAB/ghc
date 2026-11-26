@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module NativeOpenZipDemandControls (rightFirstPair, strictPair, strictResult, twiceMinimum) where
 
 import PreludeMapLengthSize (Nat(..), Size)

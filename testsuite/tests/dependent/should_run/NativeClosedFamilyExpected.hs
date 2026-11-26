@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, TypeApplications, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, TypeApplications, TypeOperators #-}
 module NativeClosedFamilyExpected where
 
 import Data.Proxy (Proxy(..))

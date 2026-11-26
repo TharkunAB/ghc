@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 module NativeOpenPairCoercionWorker (first, second, exchange, duplicate, same, duplicateRight) where
 
 first :: (a, a) -> a

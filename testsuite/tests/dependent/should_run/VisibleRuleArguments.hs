@@ -1,0 +1,51 @@
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds, ScopedTypeVariables, TypeAbstractions #-}
+{-# LANGUAGE ExplicitNamespaces, RequiredTypeArguments #-}
+module VisibleRuleArguments (Reading(..), keepReading, keepAfter, TaggedReading(..), keepTagged, keepRequired, keepTwoRequired) where
+
+import Data.Kind (Type)
+
+-- | A reading indexed by a runtime optional value.
+data Reading (m :: Maybe a) = Reading Int
+
+-- | Return the reading without evaluating its index.
+{-# NOINLINE keepReading #-}
+keepReading :: forall (a :: Type). foreach (m :: Maybe a) -> Reading m -> Reading m
+keepReading _ x = x
+
+{-# RULES "keepReading/Bool" forall m x. keepReading @Bool m x = x #-}
+
+-- | Ignore the Boolean before selecting the reading's element type.
+{-# NOINLINE keepAfter #-}
+keepAfter :: Bool -> forall (a :: Type). foreach (m :: Maybe a) -> Reading m -> Reading m
+keepAfter _ @a = keepReading @a
+
+{-# RULES "keepAfter/Bool" forall ignored m x. keepAfter ignored @Bool m x = x #-}
+
+-- | A payload indexed by values on both sides of an erased type binder.
+data TaggedReading (tag :: Bool) (m :: Maybe a) = TaggedReading Int
+
+-- | Keep both runtime indices while selecting the element type between them.
+{-# NOINLINE keepTagged #-}
+keepTagged :: foreach (tag :: Bool) -> forall (a :: Type).
+              foreach (m :: Maybe a) -> TaggedReading tag m -> TaggedReading tag m
+keepTagged _ _ x = x
+
+{-# RULES "keepTagged/Bool" forall tag m x. keepTagged tag @Bool m x = x #-}
+
+-- | Preserve the reading at both runtime indices.
+{-# NOINLINE keepRequired #-}
+keepRequired :: foreach (tag :: Bool) -> forall (a :: Type) ->
+                foreach (m :: Maybe a) -> TaggedReading tag m -> TaggedReading tag m
+keepRequired tag (type a) m x = keepTagged tag @a m x
+
+{-# RULES "keepRequired/Bool" forall tag m x.
+    keepRequired tag (type Bool) m x = x #-}
+
+-- | Keep the payload across both required type arguments.
+{-# NOINLINE keepTwoRequired #-}
+keepTwoRequired :: foreach (tag :: Bool) -> forall (a :: Type) -> foreach (m :: Maybe a) ->
+                   forall (b :: Type) -> foreach (n :: Maybe b) -> TaggedReading tag n -> TaggedReading tag n
+keepTwoRequired _ (type a) _ (type b) _ x = x
+
+{-# RULES "keepTwoRequired/Bool/Char" forall tag m n x.
+    keepTwoRequired tag (type Bool) m (type Char) n x = x #-}

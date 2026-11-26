@@ -1,0 +1,13 @@
+(These 'w' True,Refl)
+(These 'w' "aaaa",Refl)
+(These 'w' 1,Refl)
+(These True "vvv",Refl)
+(These 'w' GT,Refl)
+Refl
+0
+('i',1)
+('f',False,True)
+True
+(Empty,Refl)
+Refl
+True

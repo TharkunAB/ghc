@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, NoDependentTypes #-}
 {-# OPTIONS_GHC -fno-omit-interface-pragmas -fexpose-all-unfoldings #-}
 module NativeOpenBuildControls
   ( module OpenBuildWorker, diverging, strictBuild, otherBuild, slowOne, slowBoth ) where
