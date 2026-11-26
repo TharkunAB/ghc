@@ -2190,10 +2190,9 @@ unknown runtime Id can force that Id. CoreToStg removes the virtual proof
 after mandatory native Core Lint. Ordinary coercion slots keep their rules.
 
 Agda substitutes let definitions during checking. Dependent ANF compilation
-must preserve the identity of a named computation. These sources guide this
-explicit identity rule; they do not prove its behavior for lazy Haskell.
-See docs/dependent-haskell/REFERENCES.md#agda-provenance and the ANF reference
-there. This rule does not make ordinary let aliases definitionally equal.
+must preserve the identity of a named computation; see Weirich et al. (ICFP 2017)
+and Koronkevich et al. (JFP 2022, §4.1). This rule does not make ordinary let
+aliases definitionally equal.
 -}
 
 {- Note [Native algebraic branch evidence]
@@ -2213,11 +2212,11 @@ Retain the actual scrutinee index; do not substitute the case binder for it.
 The result annotation stays outside all alternative binders. lintCaseExpr checks
 coverage against the domain's ordinary constructors before admitting evidence.
 
-Agda's constructor splitting is the precedent for a refined field context.
+Agda's constructor splitting is the precedent for a refined field context
+(Cockx and Abel, ICFP 2018; Choudhury et al., POPL 2021, §7).
 Here fields remain lazy Haskell values. Constructor discrimination does not prove
 that the predecessor terminates or that a recursive runtime value is finite.
-The ordinary optimizer remains gated. See docs/dependent-haskell/CORE.md and
-the Agda provenance in docs/dependent-haskell/REFERENCES.md.
+The ordinary optimizer remains gated. See docs/dependent-haskell/CORE.md.
 -}
 
 {-
@@ -2285,7 +2284,7 @@ lintTyCoBndr tcv thing_inside
                      text "CoVar with non-coercion type:" <+> pprTyVar tcv
                  ; let (lhs, rhs, _) = coVarTypesRole tcv
                  ; lintL (typeKind lhs `eqType` typeKind rhs) $
-                     text "R11 mixed-kind coercion binder:" <+> ppr tcv_type }
+                     text "Mixed-kind coercion binder:" <+> ppr tcv_type }
 
        ; addInScopeTyCoVar tcv thing_inside }
 

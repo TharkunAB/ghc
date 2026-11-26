@@ -62,3 +62,11 @@ DepIfaceSerialization:
 	! grep -Eq '  SourceTable |CheckedClosureSourceTable' without_eqns.iface
 	! $(dep_iface_hc) -i -iwithout_eqns -outputdir without_eqns -fno-code -c DepIfaceSerializationClient.hs 2>without_eqns.stderr
 	grep -q 'GHC-70565' without_eqns.stderr
+	mkdir -p nocode_eqns
+	$(dep_iface_hc) -XDependentTypes -fwrite-source-equations -fno-code -fwrite-interface -outputdir nocode_eqns -c DepIfaceSerialization.hs
+	'$(TEST_HC)' $(TEST_HC_OPTS) --show-iface nocode_eqns/DepIfaceSerialization.hi > nocode_eqns.iface
+	grep -Fq 'SourceTable T:flipBit' nocode_eqns.iface
+	grep -Fq 'FinalCoreSourceTable T:monus' nocode_eqns.iface
+	grep -Fq 'CheckedClosureSourceTable T:renameExpr [extendName]' nocode_eqns.iface
+	grep -Fq 'CheckedClosureSourceTable T:replace' nocode_eqns.iface
+	$(dep_iface_hc) -i -inocode_eqns -outputdir nocode_eqns -fno-code -c DepIfaceSerializationClient.hs

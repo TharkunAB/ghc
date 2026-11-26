@@ -1575,8 +1575,8 @@ native cpeBind guard then keeps aliases whose global RHS is outside the scalar
 index or local function-head grammar. Keep the native unfolding and interface
 restrictions in force.
 
-This is a GHC scope adaptation, not a new dependent equality rule. See
-docs/dependent-haskell/REFERENCES.md#source-vector-uncons.
+This is a Core Tidy scope adaptation, not a new dependent equality rule; see
+GHC Proposal #378 (§4.6).
 -}
 
 -- TopTidyEnv: when tidying we need to know

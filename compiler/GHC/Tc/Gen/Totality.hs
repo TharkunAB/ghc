@@ -100,8 +100,8 @@ import Data.Maybe (isJust, isNothing)
 GHC Proposal #378 (Section 4.10) keeps Haskell partial by default. Type
 conversion, proof erasure, and module interfaces do not assume termination.
 At the same time, authors of proofs and indexed programs want local feedback
-on whether a function is total on finite, total inputs. See the local R05
-assurance task in docs/dependent-haskell/ROADMAP.md.
+on whether a function is total on finite, total inputs; see GHC Proposal #378
+(§4.13) and Casinghino, Sjöberg and Weirich (POPL 2014).
 
 When -freport-totality is enabled, reportModuleTotality inspects the zonked
 top-level value bindings of the module and emits one informational MCInfo

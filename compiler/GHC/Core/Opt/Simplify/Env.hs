@@ -826,6 +826,7 @@ doFloatFromRhs fe lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs 
       && not (isNilOL fs)
       && want_to_float
       && can_float
+      && not_escaping_runtime_index
   where
      want_to_float = isTopLevel lvl || exprIsExpandable rhs
                      -- See Note [Float when expandable]
@@ -834,6 +835,12 @@ doFloatFromRhs fe lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs 
                    FltLifted  -> True
                    FltOkSpec  -> isNotTopLevel lvl && isNonRec rec
                    FltCareful -> isNotTopLevel lvl && isNonRec rec && strict_bind
+
+     not_escaping_runtime_index
+       | isTopLevel lvl
+       = not (any (anyFreeVarsOfType isNonCoVarId . idType) (bindersOfBinds (fromOL fs)))
+       | otherwise
+       = True
 
      -- Whether any floating is allowed by flags.
      floatEnabled :: TopLevelFlag -> FloatEnable -> Bool

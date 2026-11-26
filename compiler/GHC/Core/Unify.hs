@@ -1726,8 +1726,7 @@ Id can become the common binder and falsely match that free occurrence.
 
 The opt-in path does not assign a Tc metavariable or provide solver equality or
 Pi congruence. Unsupported comparisons keep MaybeApart. See Note [Coverage
-checking retained functions] in GHC.HsToCore.Pmc.Solver and the Agda WHNF
-references in docs/dependent-haskell/REFERENCES.md.
+checking retained functions] in GHC.HsToCore.Pmc.Solver and Gundry (2013, §6.3).
 
 Alpha-equivalent retained types with no free TyCoVars can succeed by tcEqType.
 There are no template variables to bind and no enclosing forall renamings to
@@ -1758,7 +1757,7 @@ Do not equate those targets or change the existing substitution.
 Process casts before these rigid-index cases to preserve the kind coercion.
 Do not inspect Id unfoldings or evaluate an index. Retained-function congruence
 remains unsupported. See Note [Restricted retained dependent types] in
-GHC.Core.TyCo.Rep and docs/dependent-haskell/REFERENCES.md#agda-provenance.
+GHC.Core.TyCo.Rep and Gundry (2013, §6.3).
 -}
 
 

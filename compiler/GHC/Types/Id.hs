@@ -215,7 +215,7 @@ idName   :: Id -> Name
 idName    = Var.varName
 
 -- | Recover the actual closed family for this checked top-level function.
--- See Note [Source table Ids] in GHC.Tc.Gen.SourceTable.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 sourceTableId_maybe :: Id -> Maybe TyCon
 sourceTableId_maybe fun
   | Just (owner, table) <- case idDetails fun of
@@ -356,15 +356,14 @@ interface declaration records the pairs even when unfoldings are omitted. Its fi
 fingerprint depends on its checked family. Reconstruct the owner from the
 interface binder. Do not serialize a reference from the DFun to itself.
 A specialized or renamed binder must not inherit the original evidence.
-See Note [Source table Ids] in GHC.Tc.Gen.SourceTable.
+See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 
 A checked fromInteger method can supply the constructors for a nonnegative
 source literal. Record its selector and both constructors by Name. Recover
 them from the ground dictionary type and check their field types and demand
 before using either constructor. An ordinary method alias says nothing about
-fromInteger. Store the two certificates independently. See the Agda builtin
-natural registration and literal overloading references in
-docs/dependent-haskell/REFERENCES.md.
+fromInteger. Store the two certificates independently (GHC Proposal #378, §4.6;
+Gundry, 2013, §5.2).
 -}
 
 idUnique :: Id -> Unique

@@ -1781,9 +1781,9 @@ assert equality between distinct runtime values. Eligible native function
 heads keep their fixed domain policy.
 
 Ordinary forall binders still normalise their kinds through normalise_var_bndr.
-Agda compares Pi codomains in one shared extended context. The D/DC PiCong rule
-supplies explicit evidence for this abstraction. See
-docs/dependent-haskell/REFERENCES.md#agda-provenance.
+Agda compares Pi codomains in one shared extended context. The System DC PiCong
+rule supplies explicit evidence for this abstraction; see Weirich et al.
+(ICFP 2017; ICFP 2019, §4.3).
 
 Note [Closed retained domains]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

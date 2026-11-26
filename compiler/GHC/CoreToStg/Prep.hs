@@ -317,9 +317,8 @@ Top-level static indirections have no entry info table and cannot use a
 local SingleEntry demand.
 
 This restriction preserves lazy bindings. Agda's application and runtime
-irrelevance rules do not justify forcing a Haskell runtime index. See
-docs/dependent-haskell/REFERENCES.md#agda-provenance and
-docs/dependent-haskell/REFERENCES.md#haskell-evaluation-provenance.
+irrelevance rules do not justify forcing a Haskell runtime index; see
+Weirich et al. (ICFP 2017, §6) and Schmidt-Schauß, Sabel and Machkasova (LMCS 2015).
 -}
 
 corePrepExpr :: Logger -> CorePrepConfig -> CoreExpr -> IO CoreExpr
@@ -1504,8 +1503,8 @@ GlobalId or lambda into TermAppTy. Core Tidy supplies lazy aliases for free
 top-level heads; see Note [Local indices across Core Tidy] in GHC.Iface.Tidy.
 
 TermAppCo supplies forward argument congruence only. It neither evaluates the
-head nor decomposes an equality between call results. See
-docs/dependent-haskell/REFERENCES.md#opaque-runtime-function-indices-unimplemented-c1-comparison.
+head nor decomposes an equality between call results; see Weirich et al.
+(ICFP 2019) and Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
 -}
 
 {- Note [Naming later retained domains]
@@ -1962,10 +1961,10 @@ application transport before this naming pass. Converted index arguments keep
 their nominal evidence and their underlying field demand.
 See Note [Retained dependent function coercions] in GHC.Core.TyCo.Rep.
 
-Agda substitutes local lets and does not preserve their sharing. The dependent
-ANF literature retains the defining computation in continuation typing. Neither
-result proves this lazy FC rule. See Note [Native index alias evidence] in
-GHC.Core.Lint and docs/dependent-haskell/REFERENCES.md#agda-provenance.
+Agda substitutes local lets and does not preserve their sharing. Dependent ANF
+compilation retains the defining computation in continuation typing
+(Koronkevich et al., JFP 2022, §4.1 and §7.4). See Note [Native index alias
+evidence] in GHC.Core.Lint.
 -}
 
 isLazyExpr :: CoreExpr -> Bool

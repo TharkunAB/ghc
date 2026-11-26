@@ -1072,7 +1072,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
 -- | Drop provisional certificates whose exact owner or callee no longer checks.
 -- The typechecker creates them after checking all source uses.
--- See Note [Final Core source equations] in GHC.Tc.Gen.SourceTable.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 keepValidatedSourceMappers :: ModGuts -> ModGuts -> ModGuts
 keepValidatedSourceMappers original final
   | isEmptyNameSet owners && isEmptyNameSet families = final
@@ -1086,7 +1086,7 @@ keepValidatedSourceMappers original final
     clearBind (Rec pairs) = Rec [(clearOwner v, rhs) | (v, rhs) <- pairs]
 
 -- | Withdraw invalid provisional equations before emitting a simple interface.
--- See Note [Final Core source equations] in GHC.Tc.Gen.SourceTable.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 validateSimpleSourceTables :: ModGuts -> Maybe ModGuts -> TcGblEnv -> TcGblEnv
 validateSimpleSourceTables original final env
   | isEmptyNameSet owners && isEmptyNameSet families = env
@@ -1236,7 +1236,7 @@ externaliseExportedMethodWorkers name_cache mod tcs binds
       pure (occ_env', extendVarEnv env b b')
 
 -- | Prepare a checked retained body for equation validation without a backend.
--- See Note [Final Core source equations] in GHC.Tc.Gen.SourceTable and
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable and
 -- Note [Checked source equations in typecheck-only interfaces].
 validateRetainedSourceBodies :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO (Maybe ModGuts)
 validateRetainedSourceBodies mb_mut_ref env guts

@@ -1077,7 +1077,7 @@ mkSourceTableOcc occ
   | otherwise = mk_simple_deriv tcName "T:" occ
 
 -- | Private families for the unevaluated fields of an ordinary pair builder.
--- See Note [A partial pair in a nominal operand] in GHC.Tc.Gen.SourceTable.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 mkSourceFstOcc, mkSourceSndOcc :: OccName -> OccName
 mkSourceFstOcc = mk_simple_deriv tcName "P1:"
 mkSourceSndOcc = mk_simple_deriv tcName "P2:"

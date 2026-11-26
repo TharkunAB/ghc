@@ -279,11 +279,9 @@ instances compare this named syntax for binary sharing. They do not perform
 alpha equivalence. Free runtime Ids used by diagnostics have the separate
 IfaceFreeTermVar form. That form must not enter an interface file.
 
-Tags 10 and 11 require the fork's distinct configured compiler version.
-Old readers must reject the file in the whole-file version check before
-type decoding.
-See docs/dependent-haskell/REFERENCES.md#agda-provenance for the comparison
-with Agda's explicit binder and variable serialization.
+Tags 10 and 11 use the current interface format version.
+Old readers reject incompatible files in the whole-file version check before
+type decoding; see GHC Proposal #378 (§4.4) and Norell (2007).
 -}
 
 {- Note [Retained interface visibility]
@@ -320,7 +318,7 @@ of its coercion. Before constructing the cast, check that its nominal
 coercion starts at the actual kind of the call. Constructor fields can refer
 only to earlier fields. An IfaceDepFunTy binder can hold an opaque lifted
 value. Check its arrow when an IfaceTermAppTy uses it as a call head.
-See Note [Exported function-valued retained signatures]
+See Note [Source retained signatures]
 in GHC.Tc.Gen.HsType. This encoding adds no runtime call or function equality.
 
 A compiled callback uses IfaceNamedTermVar. Store its defining Name, including
@@ -335,10 +333,8 @@ argument for printing and traversal, but reject this form in the raw writer
 and importer. Do not encode an open head as a local spelling that could resolve
 to a different binder. Shared-type table writers use the same raw writer.
 
-Tag 12 requires the fork's distinct configured interface version. Native call
-coercions and unfolding generation remain separately gated. See the telescope
-scope comparison in docs/dependent-haskell/REFERENCES.md under
-function-valued-retained-package-fields-prior-art.
+Tag 12 uses the current interface format version. Native call coercions and
+unfolding generation remain separately gated; see GHC Proposal #378 (§4.7 and §4.9).
 -}
 
 {-

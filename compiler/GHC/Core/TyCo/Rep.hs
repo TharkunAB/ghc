@@ -328,8 +328,7 @@ entries check these forms with Core Lint before and after preparation.
 Interface signatures use scoped local Ids. The ordinary optimizer remains
 unsupported. Native interface templates retain their separate checks and
 module writer gate. These rules add no evaluator or totality assumption.
-See docs/dependent-haskell/CORE.md and the Agda provenance in
-docs/dependent-haskell/REFERENCES.md.
+See Weirich et al. (ICFP 2017) and docs/dependent-haskell/CORE.md.
 -}
 
 {- Note [Retained dependent function coercions]
@@ -361,11 +360,10 @@ visibility.
 Substitution, lifting, free variables and tidying use runtime binder callbacks.
 ForAllCo binds type and coercion variables. DepFunCo binds runtime Ids.
 
-This follows D/DC's asymmetric An-PiCong rule. The right body needs the inverse
-domain conversion. Agda compares Pi domains before codomains under a shared
-context. See the pinned provenance in docs/dependent-haskell/REFERENCES.md.
+This follows System DC's asymmetric An-PiCong rule (Weirich et al., ICFP 2017,
+Fig. 8) and System DR's role propagation (Weirich et al., ICFP 2019). The right
+body uses the inverse domain conversion.
 The body inherits an FC role; domain evidence remains nominal at every role.
-The comparison does not supply a preservation theorem for this implementation.
 
 Checked application of explicit congruence casts the actual argument back to A
 and substitutes that same argument in co. Symmetry reverses the transport.
@@ -415,10 +413,8 @@ such as transport through a saturated family. Do not replace that complete
 proof with argument-only TermAppCo. See Note [Native function-value application]
 in GHC.Core.TyCo.Make.
 
-Agda's neutral application and scoped substitution are the operational
-precedent. See Agda v2.8.0 Syntax/Internal.hs221-252 and
-TypeChecking/Substitute.hs827-852, pinned in docs/dependent-haskell/REFERENCES.md.
-See also GHC proposal #378, sections 1.4.4 and 1.4.7, on retention and
+Agda's neutral application and scoped substitution (Norell, 2007) are the
+precedent. See also GHC Proposal #378 (§4.4 and §4.7) on retention and
 substitution at dependent application.
 This rule does not add an evaluator to type equality.
 -}

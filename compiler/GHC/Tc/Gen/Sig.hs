@@ -51,7 +51,6 @@ import GHC.Tc.Utils.Unify( DeepSubsumptionFlag(..), tcSkolemise, unifyType, buil
 import GHC.Tc.Utils.Instantiate( topInstantiate, tcInstType, tcInstTypeBndrs )
 import GHC.Tc.Utils.Env
 
-import GHC.Tc.Types (TcGblEnv(tcg_source_rule_types), SourceRuleUses(sourceProofClosedResults))
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 import GHC.Tc.Types.Evidence
@@ -238,7 +237,7 @@ tcUserTypeSig loc hs_sig_ty mb_name
   = failWithTc $ TcRnRetainedQuantificationError RetainedPartialSignature
 
   | isCompleteHsSig hs_sig_ty
-  = do { -- See Note [Exported function-valued retained signatures] in GHC.Tc.Gen.HsType.
+  = do { -- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
          let allow_function = case mb_name of
                Just _ -> True
                Nothing -> False
@@ -277,7 +276,7 @@ tcUserTypeSig loc hs_sig_ty mb_name
                Nothing -> ExprSigCtxt rcc
 
 -- | Check the written result of an observation before type checking can
--- erase an alias or family. See Note [Opaque source proof observations]
+-- erase an alias or family. See Note [Source family evidence uses]
 -- in GHC.Tc.Gen.SourceTable.
 closedSourceProofResult :: LHsSigWcType GhcRn -> Bool
 closedSourceProofResult (HsWC { hswc_body = L _ (HsSig
@@ -1409,6 +1408,7 @@ tcRuleBndrs skol_info mb_lhs (RuleBndrs { rb_tyvs = mb_tv_bndrs, rb_tmvs = tm_bn
     binder_names (RuleBndr _ (L _ n)) = [n]
     binder_names (RuleBndrSig _ (L _ n) (HsPS { hsps_ext = ext })) =
       n : hsps_nwcs ext ++ hsps_imp_tvs ext
+    binder_names (XRuleBndr v) = dataConCantHappen v
 
     --------------
     go_tms :: (NameEnv Id -> Name -> Maybe Type) -> NameEnv Id -> [LRuleBndr GhcRn]

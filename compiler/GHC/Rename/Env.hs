@@ -1346,7 +1346,7 @@ optimizer pragma and is not part of this lookup rule.
 -- | Find the in-scope term bindings and their finite source tables.
 -- The flag keeps the ordinary term for a final Core identity.
 -- See Note [Names of finite source functions].
--- See Note [Identity certificates and open unfoldings] in GHC.Tc.Gen.SourceTable.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 lookupSourceTables :: Bool -> (GlobalRdrEnv, LocalRdrEnv) -> RdrName
                       -> RnM [(GlobalRdrElt, Maybe Name)]
 lookupSourceTables legacy_identity (gbl, lcl) term_rdr
@@ -1377,7 +1377,7 @@ lookupSourceTables legacy_identity (gbl, lcl) term_rdr
               let present occurrence = isJust (mi_hash_fn iface occurrence)
                   term_occ = nameOccName term
               -- Keep the ordinary function available for executable calls.
-              -- See Note [A partial pair in a nominal operand] in GHC.Tc.Gen.SourceTable.
+              -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
               if present occ && not (present (mkSourceFstOcc term_occ) || present (mkSourceSndOcc term_occ))
                 then do
                   thing <- tcLookupGlobal term

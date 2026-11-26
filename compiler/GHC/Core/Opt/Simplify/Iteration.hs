@@ -3811,7 +3811,7 @@ improveSeq fam_envs (saf,env) scrut case_bndr case_bndr1 [Alt DEFAULT _ _]
   -- See Note [Retained case binders in improveSeq].
   , not (sm_core_mode (seMode env) == RetainedCore
          && isNativeOpaqueValueId case_bndr1
-         && not (isDeadBinder case_bndr))
+         && (not (isDeadBinder case_bndr) || isJust (termVar_maybe scrut)))
   -- The cast changes the scrutinee type. Preserve the case multiplicity.
   = do { case_bndr2 <- newId (fsLit "nt") (idMult case_bndr1) ty2
         ; let rhs  = DoneEx (Var case_bndr2 `Cast` mkSymCo co) NotJoinPoint

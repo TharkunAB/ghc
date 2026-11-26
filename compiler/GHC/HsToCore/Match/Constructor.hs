@@ -290,8 +290,8 @@ selectConMatchVars. The proof therefore names the actual alternative fields.
 For an indexed GADT proof, keep the ordinary existentials and equalities first.
 Select the exact named fields, including a variable named by a signature pattern.
 Append the virtual proof after those fields.
-See Note [Retained constructor matches] in GHC.Tc.Gen.Match and the Agda
-constructor-context provenance in docs/dependent-haskell/REFERENCES.md.
+See Note [Retained constructor matches] in GHC.Tc.Gen.Match and Cockx and Abel
+(ICFP 2018).
 -}
 
 {- Note [Retained package equation scope]
@@ -322,9 +322,8 @@ Instantiate the constructor telescope with each selected pattern Id before
 selecting the next field. This preserves dependencies on the actual Ids.
 For a linear case, multiply each ordinary field's declared multiplicity by
 the case multiplicity. The retained index field stays unrestricted.
-Agda supplies the constructor-telescope and clause-discrimination precedent.
-Separate cases preserve Haskell's field demand and source clause order.
-See docs/dependent-haskell/REFERENCES.md#source-package-patterns.
+Separate cases preserve Haskell's field demand and source clause order; see
+GHC Proposal #378 (§4.5 and §4.9), GHC Proposal #473, and Cockx and Abel (ICFP 2018).
 -}
 
 {- Note [Retained constructor equation scope]

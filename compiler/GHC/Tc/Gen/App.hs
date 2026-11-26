@@ -2928,10 +2928,9 @@ constructor imports when inserting the selected operand, after the erased
 argument prepass. See wrinkle (DTW2) of Note [DataToTag overview] in
 GHC.Tc.Instance.Class.
 
-Agda inserts hidden argument terms from the expected telescope. Here the
-immutable match supplies a checked runtime occurrence. It leaves stuck
-families and opaque calls alone. See the pinned Agda sources in
-docs/dependent-haskell/REFERENCES.md#invisible-retained-binders-next-candidate.
+Agda inserts hidden argument terms from the expected telescope (Norell, 2007).
+Here the immutable match supplies a checked runtime occurrence and leaves stuck
+families and opaque calls alone; see GHC Proposal #378 (§4.7) and #448.
 -}
 
 -- | Find a declared native element type without checking the literal.
@@ -3254,9 +3253,9 @@ to a different position. Written type arguments at this position still use
 the usual visible type application rule.
 
 Quick Look's h-var reads a declared type and its argument advice precedes full
-checking. Agda checks each domain under the substituted telescope and retains
-the checked prefix. This route uses complete immutable choices, not their
-mutable instantiation rules. See docs/dependent-haskell/REFERENCES.md.
+checking (Serrano et al., ICFP 2020; GHC Proposal #274). Agda checks each domain
+under the substituted telescope and retains the checked prefix (Norell, 2007).
+This route uses complete immutable choices, not mutable instantiation rules.
 -}
 
 {- Note [Ground retained applications]
@@ -3319,11 +3318,8 @@ complete IALL plan; see Note [Declared native argument choices].
 The IALL/ITYARG rules follow
 Serrano et al., A quick look at impredicativity, ICFP 2020; see
 Note [Quick Look overview]. This checked route does not extend those rules
-with mutable native instantiation. Agda v2.8.0 retains a checked prefix in
-Rules/Application.hs:619-641 and substitutes arguments in telescope order at
-774-808. Its contextual metas do not justify native GHC meta assignment.
-See docs/dependent-haskell/REFERENCES.md#applications-with-fixed-native-type-choices
-for the pinned source links and the limits of this adaptation.
+with mutable native instantiation. Agda retains a checked prefix and substitutes
+arguments in telescope order (Norell, 2007; Eisenberg, 2016, §6).
 -}
 
 -- | Use ordinary checking for a known native value or callback.
@@ -3435,8 +3431,8 @@ scope and keep the complete subsumption check and dictionary obligations.
 The call-telescope check permits a retained polytype or its algebraic
 container at a declared argument. For example, consume can supply
 Maybe Callback to its operand Just reflect. The constructor then uses
-the expected result to choose Callback. See Note [Ground retained applications].
-See docs/dependent-haskell/REFERENCES.md#qualified-retained-function-types.
+the expected result to choose Callback. See Note [Ground retained applications]
+and GHC Proposal #378 (§4.7).
 -}
 
 -- | Bind native dictionary evidence at the application that needs it.
@@ -3481,9 +3477,8 @@ meta-variable. Applications without native Wanteds emit their original constrain
 This is a context boundary for evidence, not a new equality rule or a way to fill
 native meta-variables. Keep the original theta and the final subsumption checks.
 Agda inserts instance arguments in the current context and postpones their search
-during application checking. The GHC implementation uses delayed FC evidence and
-an expression-local implication. See
- docs/dependent-haskell/REFERENCES.md#retained-class-consumers.
+during application checking (Norell, 2007). The GHC implementation uses delayed
+FC evidence and an expression-local implication (Vytiniotis et al., JFP 2011).
 -}
 
 finishApp :: TcM ()                 -- Saved constraints and result Quick Look
@@ -5843,7 +5838,7 @@ Check the target call and its rewrite rules before emitting the method
 obligation. An invalid operand or rule can already explain the error.
 Use the target for both the index and runtime. The expanded expression keeps the user's
 operator and its source span. The later argument check must not resolve
-a second dictionary. M81's source-call check verifies saturation and
+a second dictionary. The source-call check verifies saturation and
 operand kinds and preserves the lazy call through erasure.
 -}
 
@@ -6938,7 +6933,7 @@ Require Many on the actual Id with tcSubMult at retained resolution, then
 re-zonk the Id before its exact Core metadata check. This
 constrains an ordinary multiplicity. It does not default an unknown value or
 accept One or a rigid multiplicity. tcSubMult requires reflexive evidence.
-Use the same rule as Note [Checking retained package patterns] in
+Use the same rule as Note [Dependent constructor field telescopes] in
 GHC.Tc.Gen.Pat. Keep optional declaration lookup read-only. Resolution emits
 no usage; the later ordinary argument check records the occurrence once.
 The separate fixed-domain function argument resolver keeps its existing rule.
@@ -6965,16 +6960,15 @@ See Note [Nominal native index casts] in GHC.Core.
 Resolution does not inspect unfoldings or evaluate values. Later argument
 types use the same runtime Id, including a lazy binding whose RHS is bottom.
 The provisional Core expression does not replace this original source check.
-See docs/dependent-haskell/REFERENCES.md#agda-provenance and
-docs/dependent-haskell/CORE.md#laziness-and-eta.
+See GHC Proposal #378 (§4.7) and docs/dependent-haskell/CORE.md#laziness-and-eta.
 -}
 
 {- Note [Explicit invisible retained arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In f @Int @{n} xs, @Int is an erased type application and @{n} is an
 expression in the ordinary term namespace. Agda uses braces to supply an
-implicit term. The prefix @ distinguishes the argument from GHC's record
-syntax. See docs/dependent-haskell/REFERENCES.md#invisible-retained-binders-next-candidate.
+implicit term; the prefix @ distinguishes the argument from GHC's record
+syntax (GHC Proposal #378, §4.7; Norell, 2007).
 
 Instantiate preceding erased foralls and dictionaries before consuming the
 invisible retained binder. Declaration advice can choose erased arguments.
@@ -7726,8 +7720,8 @@ have substituted declaration variables. Require every field to be supplied.
 Partial constructors and ordinary retained functions keep the existing path.
 mkDepFunTy represents an unused retained binder as an ordinary Many arrow.
 For a retained metadata entry, also accept that arrow with the same closed
-index domain. This consumes the field without choosing its runtime value.
-See docs/dependent-haskell/REFERENCES.md#computed-length-append-next-source-probe.
+index domain. This consumes the field without choosing its runtime value; see
+GHC Proposal #378 (§4.7) and Eisenberg et al. (ICFP 2021).
 
 The expected Sigma Nat p can have no runtime Id in it. Its generative
 constructor exposes both erased parameters of Pair as direct arguments.
@@ -7750,9 +7744,8 @@ The eligibility check also applies to algebraic containers. See
 Note [Known retained function instantiation].
 
 Agda inserts hidden arguments from the expected result and compares Pi bodies
-under one shared context. This route uses an immutable substitution instead of
-contextual mutable metas. See docs/dependent-haskell/REFERENCES.md under
-Expected-type instantiation of retained workers.
+under one shared context (Norell, 2007; Eisenberg, 2016, §6). This route uses
+an immutable substitution instead of contextual mutable metas.
 -}
 
 {- Note [Known retained function instantiation]
@@ -8230,8 +8223,7 @@ for this attempted call's ordinary fallback too. Re-entering Quick Look could
 partially typecheck the RHS again, including nested splices and usage. Calls
 that fail the eligibility checks before inference keep their existing path.
 No general Quick Look rule or native meta-fill restriction changes. See
-Note [Quick Look for particular Ids] and
-docs/dependent-haskell/REFERENCES.md#runtime-equality-and-aligned-zip-next-source-probe.
+Note [Quick Look for particular Ids] and Serrano et al. (ICFP 2020).
 -}
 
 -- | Immutable choices for successive invisible binder groups. Nothing uses
@@ -8304,8 +8296,7 @@ forall and theta groups after nested contexts and leading VTA. IALL and
 instCall still check the original evidence. Final argument subsumption and
 result checking still run. No native type is assigned to a mutable meta.
 No runtime argument order or function eta rule changes. See
-Note [Cached retained argument inference] and
-docs/dependent-haskell/REFERENCES.md#native-worker-argument-inference.
+Note [Cached retained argument inference] and Eisenberg (2016, §6).
 -}
 
 -- | Match cached index arguments after a caller selects native checking.
@@ -9525,7 +9516,7 @@ RHS might ultimately select a caller-supplied dictionary. Reading the
 candidate supplies no equality and records no source-equation use. Keep
 the original inferred expression, type and usage in RetainedArgCache.
 tcValArgsWithCache must check that type against the instantiated domain.
-The M92 implication solver can supply a defining equality only when its
+The implication solver can supply a defining equality only when its
 ordinary evidence justifies it. Static and arrow scopes delimit the
 candidate environment in the same way as lexical native evidence.
 -}
@@ -9545,8 +9536,7 @@ Reduce a mismatched family application at the source argument's location. Keep t
 for the final exact-domain check. The original argument cache supplies the
 expression and type to subsumption, which constructs its own coercion.
 A stuck sum n + 1 supplies no successor equation for an unknown n.
-See Note [Family views in native argument inference] and the Agda conversion
-reference in docs/dependent-haskell/REFERENCES.md.
+See Note [Family views in native argument inference] and Norell (2007).
 -}
 
 {- Note [Family views in native argument inference]
@@ -9953,10 +9943,10 @@ Cache the wrapped callback at its checked type. Final argument and result
 subsumption still run. Preserve IALL evidence order and all native scope,
 kind, concreteness and Quick Look guards.
 
-Agda expands a do bind to ordinary application and a lambda. Its local
-context stores the checked term and type. This implementation keeps GHC's
-runtime Ids opaque and keeps Haskell evaluation unchanged. See
-docs/dependent-haskell/REFERENCES.md#scoped-native-source-inference.
+Agda expands a do bind to ordinary application and a lambda; its local
+context stores the checked term and type (Norell, 2007). This implementation
+keeps GHC's runtime Ids opaque and keeps Haskell evaluation unchanged; see
+GHC Proposal #378 (§4.6 and §4.7).
 -}
 
 -- | Preserve matched native choices and freshen undetermined ordinary binders.
@@ -10148,10 +10138,8 @@ occurrence and its authoritative binding before checking their identity,
 exact domain and Many multiplicity. Imported GlobalIds, linear indices and
 missing bindings still fail. The existing
 Core Tidy alias step keeps accepted module indices local when Tidy globalises
-their top-level bindings. Keep the Core index grammar unchanged.
-
-See docs/dependent-haskell/PLAN.md and
-docs/dependent-haskell/REFERENCES.md#runtime-equality-and-aligned-zip-next-source-probe.
+their top-level bindings; see Note [Local indices across Core Tidy] in
+GHC.Iface.Tidy and GHC Proposal #378 (§4.6). Keep the Core index grammar unchanged.
 -}
 
 -- Is the argument supposed to instantiate a forall?

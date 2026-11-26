@@ -84,7 +84,7 @@ lookupTypeEnv = lookupNameEnv
 
 -- | Restore the semantic details of a checked source binder after desugaring.
 -- Preserve the occurrence's own type, multiplicity and optimisation information.
--- See Note [Source table Ids] in GHC.Tc.Gen.SourceTable.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 restoreSourceTableId :: TypeEnv -> Id -> Id
 restoreSourceTableId types fun
   | isLocalId fun, isExternalName (getName fun)

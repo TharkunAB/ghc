@@ -1433,9 +1433,8 @@ only type variables free. This path records the exact checked type on the local
 Id. It does not assign the schema to a metavariable or generalise it. The usual
 application check opens rest at its use with a fresh scoped witness.
 
-Agda's lexical let context supplies prior art; it does not justify transparent
-Haskell index aliases. See docs/dependent-haskell/REFERENCES.md,
-"Scoped native source inference".
+Agda's lexical let context supplies prior art (Norell, 2007); it does not
+justify transparent Haskell index aliases; see GHC Proposal #378 (§4.6) and #523.
 -}
 
 tcMonoBinds :: RecFlag  -- Whether the binding is recursive for typechecking purposes

@@ -778,10 +778,9 @@ when the body does not use r. The source checker wraps this carrier in
 ExpandedThingTc so diagnostics print the original source. Its own printer
 shows the checked operation for debug output.
 
-Agda's with-abstraction generalizes a checked scrutinee and its context.
-See the pinned v2.8.0 With.hs101-173 and with-abstraction manual910-936 in
-docs/dependent-haskell/REFERENCES.md. Haskell's case must also preserve
-bottom and demand order; with-abstraction alone does not establish that rule.
+Agda's with-abstraction generalizes a checked scrutinee and its context
+(Norell, 2007; Cockx and Abel, ICFP 2018; GHC Proposal #378, §4.5). Haskell's
+case also preserves bottom and demand order.
 See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
 -}
 

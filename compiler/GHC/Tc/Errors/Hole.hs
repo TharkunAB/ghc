@@ -1557,7 +1557,7 @@ Under `DependentTypes`, hole checking interacts with runtime index binders
 
 2. Immutable index instantiation (`tcDepCheckCand`):
    Mutable unification variables cannot bind types that contain `TermVarTy`
-   (see Note [Term-variable occurrences in types] in `GHC.Tc.Utils.Unify`).
+   (see Note [Rigid retained indices] in `GHC.Tc.Utils.Unify`).
    For candidates or holes with native dependent forms or visible `forall a ->`
    binders, peel invisible quantifiers, constraints, and `n_ref` visible
    parameters (`FunTy`, `DepFunTy`, or `ForAllTy Required`), abstracting

@@ -158,8 +158,8 @@ recursive groups. Keep the original annotations after removing an inner
 binding. They can retain extra outer bindings; they cannot omit a surviving
 dependency. This is one conservative pass, not a fixed-point analysis.
 
-Agda separates complete free-variable queries from later Treeless usage
-analysis. See the pinned M53 references in docs/dependent-haskell/REFERENCES.md.
+Agda separates complete free-variable queries from runtime usage analysis; see
+Choudhury et al. (POPL 2021) and Note [The binder-swap substitution].
 That distinction does not justify changing Haskell evaluation or eta rules.
 -}
 

@@ -1606,8 +1606,8 @@ Its domain remains independently closed. A later TermAppTy resolves its head
 from this actual lexical Id environment. The complete field-type check still
 rejects every runtime Id outside the earlier-field prefix. Keep these checks
 deferred for recursive function domains too. See Note [Opaque call indices in
-interfaces] in GHC.Iface.Type. See Note [Detected recursive native interface
-domains] for the boundary around each field eligibility result.
+interfaces] in GHC.Iface.Type and Note [Checking native domain shapes] for the
+boundary around each field eligibility result.
 
 The ordinary field decoder keeps its existing lazy boundary. No new field
 name scopes over the constructor result, context, or erased binders. This
@@ -2447,8 +2447,8 @@ Domain validation can force constructor argument types. Keep it within the
 existing deferred declaration decoding. See Note [Positioning of forkM].
 The domain predicate tracks visited TyCons before it follows their fields.
 Thus a recursive Nat domain does not require an infinite field traversal.
-An unfinished field decoder is a separate case. See Note [Detected recursive
-native interface domains] for the diagnostic boundary around eligibility.
+An unfinished field decoder is a separate case. See Note [Checking native
+domain shapes] for the diagnostic boundary around eligibility.
 
 IfaceFreeTermVar preserves an open Id only for diagnostics. It cannot enter
 this decoding path. Boolean branch proof reconstruction is described in
@@ -3045,8 +3045,7 @@ Bind the fresh nominal CoVar only while reading this branch. Check the
 result type for escaping binders before returning the case.
 
 An ordinary DEFAULT has no binders. Its existing tag and bytes stay the
-same. See Note [Native index alias evidence] in GHC.Core.Lint and
-Note [Versioning retained evidence] in GHC.Iface.Binary.
+same. See Note [Native index alias evidence] in GHC.Core.Lint.
 -}
 
 {- Note [Native constructor evidence in interfaces]
@@ -3059,7 +3058,7 @@ equals the promoted Pair applied to x and payload.
 The earlier reader supports this slot only on Bool. Preserve that encoding
 for Bool. Write IfaceDataAltWithProof for the other supported constructors.
 When reading a legacy unfolding, recognize its proof slot by the same
-constructor shape. See Note [Versioning retained evidence] in GHC.Iface.Binary.
+constructor shape.
 
 Check that all field and proof names differ before extending the interface
 environment. A repeated name would hide the preceding field in the branch.

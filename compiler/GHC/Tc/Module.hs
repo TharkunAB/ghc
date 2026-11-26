@@ -708,7 +708,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                           , tcg_patsyns   = pat_syns'  ++ patsyns_mf } } ;
 
         -- The interface also carries the equations of eligible source functions.
-        -- See Note [Closed source tables] in GHC.Tc.Gen.SourceTable.
+        -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
       ; tcg_env' <- setGblEnv tcg_env' $ do
           checkSourceMethodUses tcg_env'
           checkAndInstallSourceProofs tcg_env'

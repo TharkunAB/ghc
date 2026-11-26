@@ -1745,9 +1745,8 @@ and Note [Local indices across Core Tidy] in GHC.Iface.Tidy.
 -- | Keep the binding scope of the free runtime indices in a float's type.
 -- See Note [Floating a dependent result].
 hasRuntimeIndexRefs :: LevelEnv -> TyCoVarSet -> Bool
-hasRuntimeIndexRefs env refs =
-    floatCoreMode (le_switches env) == RetainedCore
-      && anyVarSet (\v -> isId v && not (isCoVar v)) refs
+hasRuntimeIndexRefs _ refs =
+    anyVarSet (\v -> isId v && not (isCoVar v)) refs
 
 {- Note [Floating a dependent result]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

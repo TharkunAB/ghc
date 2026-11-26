@@ -2034,7 +2034,7 @@ The interface marks partial synonyms and built-in families in both
 types and coercions. An older reader can treat a partial synonym's
 supplied arguments as injective, or reject a partial built-in in Core
 Lint after it has read the interface.
-See proposal #242 and the R23 card in docs/dependent-haskell/roadmap.
+See GHC Proposal #242 and Kiss et al. (ICFP 2019).
 -}
 
 isFamFreeTy :: Type -> Bool
@@ -3042,9 +3042,9 @@ Use the field predicate in source and interface constructor checking and
 when building DataCon metadata.
 
 Agda's checkPiTelescope checks the domain and extends the context for the
-result. See docs/dependent-haskell/REFERENCES.md#agda-provenance. The GHC
-binder preserves the runtime argument and its laziness. Two distinct
-binders at the same domain still name distinct values.
+result (Norell, 2007; GHC Proposal #378, §4.6). The GHC binder preserves the
+runtime argument and its laziness. Two distinct binders at the same domain
+still name distinct values.
 -}
 
 {- Note [Abstract witness domains]
@@ -3132,9 +3132,8 @@ The function argument remains a lazy runtime argument. A type occurrence does
 not force it or add a runtime use. No function equality or inverse call rule
 follows from this binder policy.
 
-See the pinned Agda context and neutral-call comparison in
-docs/dependent-haskell/REFERENCES.md, under
-head-only-function-valued-retained-binders-prior-art.
+See Norell (2007) and GHC Proposal #378 (§4.7) on neutral function-head calls
+under dependent binders.
 -}
 
 {- Note [Algebraic runtime index domains]
@@ -3184,11 +3183,11 @@ its worker's runtime fields. In particular, do not promote an unpacked payload a
 if it were the original boxed field. Constructor field multiplicities may be One
 or Many; the retained identifier itself must be unrestricted.
 
-Agda's constructor indices and refined field context are the precedent. The
-schema and worker restrictions bound this implementation; they are not
-Agda language restrictions. Haskell fields can be partial or cyclic. Do not use
-termination or finite-tree apartness to compare opaque runtime indices.
-See the Agda Nat/Vec provenance in docs/dependent-haskell/REFERENCES.md.
+Agda's constructor indices and refined field context are the precedent
+(Cockx and Abel, ICFP 2018; Weirich et al., ICFP 2017). The schema and worker
+restrictions bound this implementation; they are not Agda language restrictions.
+Haskell fields can be partial or cyclic. Do not use termination or finite-tree
+apartness to compare opaque runtime indices.
 -}
 
 -- | Test whether an identifier can occur as a retained Boolean index.

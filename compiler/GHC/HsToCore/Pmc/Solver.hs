@@ -469,10 +469,9 @@ without asking tcNormalise to rewrite their components. Its rewriteType path
 requires dependent congruence when it encounters DepFunTy, which is not yet
 supported. Reporting that solver restriction from initTcDsForSolver panics.
 
-This is a WHNF rule, not normalization under a dependent binder. Agda 2.8.0
-also returns a Pi head without reducing its domain or codomain. Its full
-normalizer visits both components. See the pinned reduction references in
-docs/dependent-haskell/REFERENCES.md.
+This is a WHNF rule, not normalization under a dependent binder. Agda also
+returns a Pi head in WHNF without reducing its domain or codomain; see Norell
+(2007) and Graf, Peyton Jones and Scott (ICFP 2020).
 
 Keep the usual conservative inhabitation path for a function type. In
 particular, failure to split an algebraic TyCon must not produce an empty
@@ -1875,7 +1874,7 @@ fresh binders. Their types mention the fresh witnesses. Pass the value
 fields as arguments to the term oracle.
 
 The observed source-pattern path instead uses its checked field Ids. See
-Note [Checking retained package patterns] in GHC.Tc.Gen.Pat. Both paths keep
+Note [Opening implicit packages in patterns] in GHC.Tc.Gen.Pat. Both paths keep
 ordinary coverage checking. They do not evaluate runtime indices or fields.
 -}
                         -- See Note [Instantiating a ConLike].

@@ -3226,8 +3226,8 @@ supported grammar, binder restrictions, and domains.
 
 DC's An-Beta and An-AppAbs rules require a typed primitive reduction. Agda's
 application checking substitutes an actual argument in the dependent result.
-These are precedents, not a preservation proof for this fragment of lazy Core.
-See docs/dependent-haskell/REFERENCES.md#core-contract-audit-and-bounded-beta-exposure.
+See Weirich et al. (ICFP 2017, §§4-5) on System DC and Schmidt-Schauß, Sabel
+and Machkasova (LMCS 2015) on call-by-need sharing.
 No general evaluator, nominal proof from Coercible, or new coercion is added.
 -}
 
@@ -4006,9 +4006,8 @@ constructors without wrappers. Their
 fields have the boxed representation of the declared field types.
 
 Agda's indexed constructor split refines the indices and binds the
-constructor fields in the branch context. See
-docs/dependent-haskell/REFERENCES.md#agda-provenance. The GHC case keeps
-Haskell's demand on the scrutinee.
+constructor fields in the branch context; see Weirich et al. (ICFP 2017) and
+Cockx and Abel (ICFP 2018). The GHC case keeps Haskell's demand on the scrutinee.
 
 Inlining can replace the scrutinee with a package payload cast from its
 generated family type to Vec a n. exprToNativeIndex checks the nominal

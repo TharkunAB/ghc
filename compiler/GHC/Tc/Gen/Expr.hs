@@ -1385,7 +1385,7 @@ Identify TypeRep from the selector's result so that aliases work and a
 locally declared type with the same name keeps its ordinary meaning.
 
 The caller can learn the expected witness type from an imported signature.
-See Note [Explicit retained Type witnesses] in GHC.Tc.Gen.HsType.
+See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
 A required forall argument takes a separate path in GHC.Tc.Gen.App.
 It remains erased and requires no Typeable dictionary.
 -}
@@ -1901,8 +1901,9 @@ Neither the view nor the type match constructs evidence. Leave other
 lets to ordinary binding checks, including recursive groups and Strict
 bindings. A class selector alone supplies no checked index. Choosing a
 global instance here could change the meaning of ordinary multiplication
-under a local Num dictionary. Agda's let conversion motivates the equality.
-The lazy value argument preserves Haskell sharing. See docs/dependent-haskell/REFERENCES.md.
+under a local Num dictionary. Agda's let conversion motivates the equality
+(Norell, 2007; GHC Proposal #378, §4.6); the lazy value argument preserves
+Haskell sharing.
 -}
 
 -- | Check a local definition in the scope of the preceding definitions.
@@ -2015,9 +2016,9 @@ scrutinee. Keep the original binding or match and its multiplicity checks.
 
 Only the exact returned binder transmits the expected type. The existing
 implicit result check packs each witness in the scope that introduced it.
-This follows Elab-Gen's scope rule. No witness enters the binding's type.
-An inferred result, a recursive or signed let, and other case patterns
-keep their ordinary checking rules. See R22 in the dependent Haskell roadmap.
+This follows Elab-Gen's scope rule (Eisenberg et al., ICFP 2021; GHC Proposal #473).
+No witness enters the binding's type. An inferred result, a recursive or signed
+let, and other case patterns keep their ordinary checking rules.
 -}
 
 {- Note [Signed and grouped local indices]
@@ -2357,13 +2358,10 @@ for execution. No general lambda, residual opaque call or new Core rule is
 admitted. Under Strict return Nothing: source VarPat demand is added later by
 desugaring. Ordinary nondependent cases must retain their normal checking path.
 
-Agda v2.8.0 Rules/Term.hs lines 468-486 and 542-587 check a lambda in its
-target context. Rules/Application.hs lines 774-808 check and substitute the
-argument. Their blobs are 02991c9fa0085315cc854d2833a9080af14a7740 and
-82ba94ac864d19b947d4c92b9af252b0fe81347a. They supply scoped checking prior art,
-not GHC multiplicity defaulting or Haskell demand laws. See
-docs/dependent-haskell/REFERENCES.md#checked-constructor-call-arguments-prior-art
-and Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+Agda checks a lambda in its target context and checks and substitutes arguments
+in telescope order (Norell, 2007; GHC Proposal #378, §4.7). That supplies scoped
+checking prior art, not GHC multiplicity defaulting or Haskell demand laws. See
+Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
 -}
 
 {- Note [Cases on a cast callback result]
@@ -2385,7 +2383,7 @@ conversion supplied at its call site. GHC.Core.nativeIndexFunctionArgIndex
 checks that head before the first argument. See Note [Checking a cast
 retained callback] in GHC.Tc.Gen.App.
 Agda's with-abstraction equality also relates a matched result to the
-original computation. See docs/dependent-haskell/REFERENCES.md.
+original computation (Norell, 2007; Cockx and Abel, ICFP 2018).
 -}
 
 {- Note [Checked source call arguments]
@@ -2589,8 +2587,8 @@ or move an expression outside those lambdas. Named captured values retain
 their original sharing. Keep field usage and scope checks unchanged.
 
 The ordinary product does not bind a runtime index. Returning (n, xs) cannot
-hide a free callback-local n. Use an explicit package for that purpose.
-See docs/dependent-haskell/REFERENCES.md#boxed-tuple-inference-prior-art.
+hide a free callback-local n. Use an explicit package for that purpose; see
+GHC Proposal #473 and Eisenberg et al. (ICFP 2021).
 -}
 
 ---------------------------

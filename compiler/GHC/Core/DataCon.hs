@@ -2338,8 +2338,7 @@ closed scalar domains or lifted erased type parameters. The actual field Id
 scopes the head of TermAppTy in later fields. Keep the function and its
 argument as separate runtime fields. No call equality
 implies function or argument equality. See Note [Function-valued retained
-binders] in GHC.Core.Type and
-docs/dependent-haskell/REFERENCES.md#function-valued-retained-package-fields-prior-art.
+binders] in GHC.Core.Type, GHC Proposal #378 (§4.9), and GHC Proposal #402.
 
 The promoted kind must bind each index used in a later field. See
 Note [Promoting one retained witness]. Reject other retained telescopes
@@ -2355,9 +2354,9 @@ Constructor impossibility checking returns False without calling the flat
 signature API. The coverage checker must arrange its own field scope
 before it can use a retained result equality.
 
-Agda constructor telescopes scope earlier fields over later field types.
-This guides the binding representation, not the evaluation rules for lazy
-Haskell. See docs/dependent-haskell/REFERENCES.md for the pinned provenance.
+Agda constructor telescopes scope earlier fields over later field types
+(Norell, 2007; Eisenberg, 2016, §5). This guides the binding representation,
+not the evaluation rules for lazy Haskell.
 
 Note [Retained constructor equality contexts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -188,10 +188,9 @@ A dependent dictionary uses its predicate and the body in the extended
 scope. A class selector uses the method's global name and the four type
 fields in order. This keeps two different lexical dictionaries distinct.
 
-Agda v2.8.0 represents Var with a de Bruijn index and Pi with an explicit
-binder body. Its Abs equality compares the scoped bodies. These are the
-scope rules used here, with GHC's distinct native key constructors. See the
-pinned sources in docs/dependent-haskell/REFERENCES.md#native-type-map-equality.
+Agda represents bound variables with de Bruijn indices and Pi codomains as
+scoped abstractions (Norell, 2007; Weirich et al., ICFP 2017). Those scope
+rules apply here with distinct TypeMap key constructors.
 -}
 
 -- | Squeeze out any synonyms, and change TyConApps to nested AppTys. Why the

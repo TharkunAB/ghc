@@ -144,7 +144,7 @@ data IdDetails
   = VanillaId
 
   -- | The checked source definition and its closed family of equations.
-  -- See Note [Source table Ids] in GHC.Tc.Gen.SourceTable.
+  -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
   | SourceTableId Name TyCon SourceTableOrigin
 
   -- | The 'Id' for a record selector
@@ -233,7 +233,7 @@ data IdDetails
         -- ^ 'Name' of the dictionary function the instance method belongs to.
 
   -- | A checked indexed closure family and the source Names of its helpers.
-  -- See Note [Checked closure dependencies] in GHC.Tc.Gen.SourceTable.
+  -- See Note [Certifying a checked source closure] in GHC.Tc.Gen.SourceClosure.
   | CheckedClosureSourceTableId Name TyCon [Name]
 
 data RecSelInfo

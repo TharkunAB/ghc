@@ -1653,10 +1653,9 @@ See Note [Function fields in native index domains] in GHC.Core.Type.
 Keep both forms outside quotations. See Note [Source opaque call indices]
 in GHC.Tc.Gen.HsType.
 
-The dependent scope follows the function types described in
-docs/dependent-haskell/REFERENCES.md#agda-provenance. This check does not
-evaluate an index. Haskell laziness still applies; see
-docs/dependent-haskell/REFERENCES.md#haskell-evaluation-provenance.
+The dependent scope follows GHC Proposal #378 (§§4.8-4.9) and #425. This check
+does not evaluate an index; Haskell call-by-need laziness still applies
+(Schmidt-Schauß, Sabel and Machkasova, LMCS 2015).
 -}
 
 ----------------------------------------

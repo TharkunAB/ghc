@@ -816,10 +816,10 @@ same coercion twice.
 
 This rule supplies congruence for normalization. It does not enable retained
 meta-variable assignment, inferred retained bindings, or structural unification.
-Agda's context extension and conversion motivate the scoped rule. Haskell keeps
-explicit FC evidence and its own evaluation rules. See the pinned sources and
-evaluation boundary in docs/dependent-haskell/REFERENCES.md#agda-provenance and
-Note [Retained dependent function coercions] in GHC.Core.TyCo.Rep.
+Agda's context extension and conversion motivate the scoped rule (Norell, 2007;
+Weirich et al., ICFP 2017). Haskell keeps explicit FC evidence and its own
+evaluation rules; see Note [Retained dependent function coercions] in
+GHC.Core.TyCo.Rep.
 -}
 
 {- Note [Rewriting checked local indices]

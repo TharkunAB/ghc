@@ -350,7 +350,7 @@ desugarConPatOut x con univ_tys ex_tvs dicts con_args
     InfixCon  _ p1 p2                -> go_field_pats arg_tys (zip [0..] [p1,p2])
     RecCon    _ (HsRecFields _ fs _) -> go_field_pats arg_tys (rec_field_ps fs)
   where
-    -- See Note [Checking retained package patterns] in GHC.Tc.Gen.Pat.
+    -- See Note [Opening implicit packages in patterns] in GHC.Tc.Gen.Pat.
     -- Checked outer field types contain the preceding retained source Ids.
     -- Nested patterns can carry GADT evidence. Keep ordinary PMC enabled.
 

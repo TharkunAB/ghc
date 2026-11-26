@@ -368,10 +368,8 @@ maintains the in-scope set. Clear the alias from the inlining environment.
 The existing traversal substitutes terms, types and coercions together and
 freshens surviving binders to avoid capture. This rule does not use ordinary
 inlining or occurrence analysis. Keep recursive and top-level bindings.
-See docs/dependent-haskell/REFERENCES.md#agda-provenance for dependent
-substitution. See
-docs/dependent-haskell/REFERENCES.md#haskell-evaluation-provenance for the
-demand restriction.
+See Weirich et al. (ICFP 2017) for dependent substitution and Schmidt-Schauß,
+Sabel and Machkasova (LMCS 2015) for the call-by-need demand restriction.
 
 Scalar beta reduction substitutes an optimized local variable or exact
 constructor into terms and types together. A retained function head substitutes
@@ -421,13 +419,11 @@ type, and alternatives in their scopes. Do not eliminate the DEFAULT branch
 or float its proof out of the case. See Note [Native index alias evidence]
 in GHC.Core.Lint.
 
-Agda's dependent application rule motivates substitution into the codomain.
-Its case-tree reduction and with-abstraction equality motivate constructor
-reduction with an explicit scrutinee equation. See
-docs/dependent-haskell/REFERENCES.md#agda-provenance. These rules do not establish
-preservation for Haskell. Agda's function eta equality does not justify eta
-reduction across Haskell's bottom and seq. See
-docs/dependent-haskell/REFERENCES.md#haskell-evaluation-provenance.
+Agda's dependent application rule motivates substitution into the codomain, and
+case-tree reduction motivates constructor reduction with an explicit scrutinee
+equation (Weirich et al., ICFP 2017; Cockx and Abel, ICFP 2018). Agda's function
+eta equality does not justify eta reduction across Haskell's bottom and seq
+(Schmidt-Schauß, Sabel and Machkasova, LMCS 2015).
 General inlining and occurrence analysis remain unsupported. Forward opaque
 call congruence follows Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
 

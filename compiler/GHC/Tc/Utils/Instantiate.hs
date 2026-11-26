@@ -509,9 +509,8 @@ contain an out-of-scope index.
 Use the same dictionary constructor as solveEqualityDict. Keep the expression
 in WpEvApp at the call site, within the runtime binder's scope. Check both
 Boolean Ids and their identity. This rule does not unify indices, introduce
-bindings, or solve other native constraints. See
- docs/dependent-haskell/REFERENCES.md#agda-provenance
-for reflexive equality. Ordinary constraint instantiation is unchanged.
+bindings, or solve other native constraints; see GHC Proposal #378 (§4.7) and
+Serrano et al. (ICFP 2020). Ordinary constraint instantiation is unchanged.
 -}
 
 {- Note [Possible fast path for equality constraints]

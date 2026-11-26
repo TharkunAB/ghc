@@ -446,11 +446,9 @@ This keeps metadata available while checking recursive interface declarations.
 Local names add no global dependencies. The field types retain their global
 dependencies.
 
-Agda serializes a telescope as a domain and an abstraction over its tail.
-It uses de Bruijn indices, whereas GHC resolves local interface names to fresh
-Ids. See the Agda telescope serialization sources in
-docs/dependent-haskell/REFERENCES.md#constructor-field-interface-provenance.
-This comparison does not supply a scope checker for malformed interface data.
+Agda serializes a telescope as a domain and an abstraction over its tail using
+de Bruijn indices (Norell, 2007), whereas GHC resolves local interface names to
+fresh Ids; see GHC Proposal #378 (§4.9).
 -}
 
 -- | This corresponds to an HsImplBang; that is, the final

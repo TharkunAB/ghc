@@ -1967,8 +1967,8 @@ the rest of the signature and solves any other class constraints.
 
 The fresh runtime Ids scope over their body constraints and remain
 available during ambiguity solving. The check discards all evidence and
-does not change the signature. See docs/dependent-haskell/REFERENCES.md
-for Agda's shared-context comparison.
+does not change the signature; see Gundry (2013, §6.2) and Norell (2007) for
+shared-context comparison.
 -}
 
 ---------------
@@ -4318,8 +4318,8 @@ eta expansion would change bottom-function behavior in Haskell.
 Input casts and coercion types whose evidence depends on the selected index
 remain unsupported. See Note [Scoped native index abstraction] in GHC.Core.Coercion.
 This adds no axiom, singleton, general Pi unification, or term evaluation.
-It follows dependent pattern specialization; see
-docs/dependent-haskell/REFERENCES.md#agda-provenance.
+It follows dependent pattern specialization (Cockx and Abel, ICFP 2018;
+Gundry, 2013, §6.3).
 The caller uses the nominal proof for argument and inverse result casts.
 -}
 
@@ -4387,10 +4387,9 @@ RHS and later restores it with writeMetaTyVar. That route must not assign
 native syntax. An occurs cycle remains irreducible. Every Wanted, unification,
 defaulting and concreteness check keeps this option disabled.
 
-See docs/dependent-haskell/REFERENCES.md#agda-provenance for dependent
-binding and application. These checks add no evaluation or runtime uses;
-Haskell evaluation follows
-docs/dependent-haskell/REFERENCES.md#haskell-evaluation-provenance.
+See Gundry (2013, §§6.2-6.3) and Eisenberg (2016, §6.3) for dependent binding
+and application, and Schmidt-Schauß, Sabel and Machkasova (LMCS 2015) for
+Haskell call-by-need evaluation.
 -}
 
 simpleUnifyCheck :: UnifyCheckCaller -> TcLevel -> TcTyVar -> TcType -> SimpleUnifyResult

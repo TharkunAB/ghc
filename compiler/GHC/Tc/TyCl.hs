@@ -1046,8 +1046,8 @@ Add n m because Add is non-injective.
 Keep visible binders that the checked header uses in later kinds.
 Then each helper application substitutes a, n, and m before it checks
 v. As with Agda's telescopes, each domain refers to the binders that
-precede it. For the renamer's copy of the witness domain, see
-Note [Lifting type lambdas] in GHC.Rename.Module.
+precede it. For the lowering of dependent sum payloads, see
+Note [Post-renaming lowering of lambdas, sums, and cases] in GHC.Tc.Gen.HsType.
 
 Use the renamer's sum payload provenance to select this path. The
 generated applications pass the same lexical captures in order. Their
@@ -4629,7 +4629,7 @@ caseHelperOwners declarations =
     caseRow _ = Nothing
 
 -- | Keep the owner of an elaborated retained signature case.
--- See Note [Equality of ordered retained case trees] in GHC.Builtin.CoercionRules.
+-- See Note [Equality of retained case trees] in GHC.Builtin.CoercionRules.
 signatureCaseOwner :: Bool -> [TyFamEqnValidityInfo] -> Maybe Name
 signatureCaseOwner ordered infos = do
   ((owner, column) : rest) <- traverse case_owner infos

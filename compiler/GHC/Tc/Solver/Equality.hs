@@ -1142,8 +1142,8 @@ The body proof is nominal even for a representational Wanted. Downgrade the
 complete nominal proof only after constructing DepFunCo. A representational
 equality between phantom domain parameters cannot supply nominal transport.
 Function-valued domain changes and opaque Pi projection remain unsupported.
-This uses the D/DC An-PiCong rule and Agda's domain-before-body discipline.
-See docs/dependent-haskell/REFERENCES.md#nominal-retained-domain-conversion.
+This uses System DC's An-PiCong rule (Weirich et al., ICFP 2017, Fig. 8) and
+System DR's nominal domain role discipline (Weirich et al., ICFP 2019).
 -}
 
 ---------------------------------

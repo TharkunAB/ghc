@@ -2219,7 +2219,7 @@ abstractNativeIndices pairs ty = go emptyVarEnv initial_scope pairs ty
                 return (TermVarTy (setIdMult (setVarType v domain) mult))
           TermAppTy f arg -> do
             fty <- go renamed scope replacements (varType f)
-            -- A callable head retains its fixed M65 domain.
+            -- A callable head retains its fixed domain.
             if fty `eqType` varType f then pure () else Nothing
             let f' = maybe f snd (lookupVarEnv renamed f)
             TermAppTy f' <$> go renamed scope replacements arg

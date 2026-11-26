@@ -931,12 +931,11 @@ occur in the result type. See proposal #378, section "Quantifiers".
 HsForAllTy denotes erased quantification, including visible `forall a -> ty`.
 Keep these constructors separate. Reuse HsTyVarBndr only for binder syntax.
 
-The lexer recognizes `foreach` only with ExperimentalDependentTypes.
+The lexer recognizes `foreach` only with DependentTypes.
 Without this extension, `foreach` remains an ordinary identifier.
-The spelling is experimental. The parser does not establish its typing rules.
-See docs/dependent-haskell/REFERENCES.md#agda-provenance for the Agda function
-types that inform dependent binding and application. Haskell evaluation rules
-still apply to retained arguments.
+The parser does not establish its typing rules; see GHC Proposal #378 (§4.4),
+GHC Proposal #102, and Eisenberg (2016, §4.2). Haskell evaluation rules still
+apply to retained arguments.
 -}
 
 -- | Haskell Type

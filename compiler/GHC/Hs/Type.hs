@@ -995,7 +995,7 @@ ignoreParens (L _ (HsParTy _ ty)) = ignoreParens ty
 ignoreParens ty                   = ty
 
 -- | Find retained binders through parentheses, contexts and function arrows.
--- See Note [Higher-order retained signatures] in GHC.Tc.Gen.HsType.
+-- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
 hsHasForEachTy :: HsType (GhcPass p) -> Bool
 hsHasForEachTy HsForEachTy{} = True
 hsHasForEachTy (HsParTy _ ty) = hsHasForEachTy (unLoc ty)
@@ -1067,7 +1067,7 @@ check. Inspect the whole type, including binder kinds, multiplicities and
 constraints. A wildcard outside a retained telescope still makes that type
 argument incomplete. Named wildcards are recorded separately by the renamer;
 the caller must also check that list. HsCoreTy contains no syntax wildcard.
-See Note [Retained Pi type arguments] in GHC.Tc.Gen.HsType.
+See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
 -}
 
 {-
