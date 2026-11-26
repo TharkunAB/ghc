@@ -2132,8 +2132,8 @@ binding. addImplicitBinds generates its constructor worker later. Classify
 that module before simplification and tidying, then use the checked native
 CorePrep path for its generated worker. Keep the late-plugin output guard.
 This adds no singleton or index evaluation. It carries the existing dependent
-application and constructor rules through the module driver; see the Agda
-provenance in docs/dependent-haskell/REFERENCES.md#agda-provenance.
+application and constructor rules through the module driver; see Weirich et al.
+(ICFP 2017) and docs/dependent-haskell/CORE.md.
 -}
 
 --------------------------------------------------------------
@@ -2242,8 +2242,7 @@ removes that evidence after checking its scope and runtime representations.
 Report an unsupported backend as Sorry. It is a feature restriction, not an
 internal compiler error. The checked module path is separate; see
 Note [Compiling native dependent modules]. Native unfoldings remain gated.
-See docs/dependent-haskell/CORE.md and the Agda provenance in
-docs/dependent-haskell/REFERENCES.md.
+See Weirich et al. (ICFP 2017) and docs/dependent-haskell/CORE.md.
 -}
 
 hscCompileCoreExpr :: HscEnv -> SrcSpan -> CoreExpr -> IO (ForeignHValue, [LinkableUsage], PkgsLoaded)
