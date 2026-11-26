@@ -491,28 +491,21 @@ openTypeFailureReason UnexpectedNeutral =
   (Nothing, "Reduction did not produce a supplied rigid variable, an application of a supplied type-level callback, or a finite constructor value with supported fields.")
 
 {- Note [Open source calls]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-Serokell's open evaluator example applies a source function to a rigid
-type variable. GHC #27413 describes observation with unknowns. Start by
-observing an ordinary Core definition at its declared input kinds.
-Admit a lifted invisible forall telescope and ordinary saturated arrows.
-An input can use a quantified variable or a boxed pair of them. The
-result must use a quantified variable. Instantiate each parameter at Type.
-Construct a symbolic pair only when the source supplies a pair constructor.
-A variable of pair kind stays neutral. A projection on it must block.
-Use a fresh symbolic Id per distinct skolem in the observer only.
-Check the application's result kind and reify the returned Id by identity.
-The observer emits no residual Core expression or conversion proof.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a type expression applies a term function to open operands (rigid type
+variables or constructors with symbolic fields), 'observeOpenType' evaluates
+the instantiated Core unfolding symbolically to weak head normal form and
+reads back a 'Type' (see Eisenberg and Stolarek, "Promoting Functions to Type
+Families in Haskell", Haskell Symposium 2014).
 
-At -O0, interface loading normally ignores optimizer pragmas. Read the
-needed template from the complete interface when the observer demands its
-Id. The package interface table can already have dropped mi_decls. Keep
-this read separate from optimizer configuration. Record the Name of every
-template used, including aliases. Record a local definition when it is
-unfolded, too. Scheduling a local argument makes its body available,
-but a lazy function can ignore it. Only the bodies the observer used
-supply dependencies for the source RULE check. The compiler's usual interface usage
-fingerprints include these declaration dependencies. The observer charges
-each observation step against the same configurable limit used for type
-reduction. A zero command-line value disables the limit, as in the solver.
+Admit a lifted invisible @forall@ telescope and saturated unrestricted arrows,
+instantiating each parameter at 'Type'. Construct a symbolic pair only when the
+source supplies a pair constructor; a bare variable of pair kind stays neutral
+so projections on it block. Each distinct skolem receives a fresh symbolic 'Id'
+in the observer and reifies back by identity without emitting residual Core.
+
+Read unfoldings directly from full module interfaces so observation remains
+independent of @-fignore-interface-pragmas@ at @-O0@. Record only definitions
+unfolded during evaluation for rewrite-rule validation and recompilation
+tracking, and bound evaluation steps by @-freduction-depth@.
 -}

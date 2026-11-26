@@ -1,4 +1,4 @@
 NativeNestedSumRecursiveAlias.hs:5:1: error: [GHC-97522]
     Cycle in type synonym declarations:
       NativeNestedSumRecursiveAlias.hs:(5,1)-(6,33): type Loop a =
-                                                         GHC.Sigma.Sigma Bool NativeNestedSumRecursiveAlias.$lambda:Loop:0-sigma a
+                                                         GHC.Sigma.Sigma Bool \left -> (GHC.Sigma.Sigma Bool \right -> Loop a)

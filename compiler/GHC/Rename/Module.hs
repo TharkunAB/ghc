@@ -19,12 +19,12 @@ module GHC.Rename.Module (
 import GHC.Prelude hiding ( head )
 
 import {-# SOURCE #-} GHC.Rename.Expr( rnLExpr )
-import {-# SOURCE #-} GHC.Rename.Splice ( rnSpliceDecl, rnTopSpliceDecls, rnSpliceTypeWith )
+import {-# SOURCE #-} GHC.Rename.Splice ( rnSpliceDecl, rnTopSpliceDecls )
 
 import GHC.Hs
 import qualified GHC.Hs.Decls as HsDecls
 import GHC.Hs.Decls.Overlap ( OverlapMode(..) )
-import GHC.Iface.Env ( lookupOrig )
+import GHC.Core.TyCo.Rep ( Type )
 
 import GHC.Rename.HsType
 import GHC.Rename.Bind
@@ -35,13 +35,13 @@ import GHC.Rename.Utils ( mapFvRn, bindLocalNames
                         , warnUnusedTypePatterns, warnPunBindingsAgainst
                         , noNestedForallsContextsErr
                         , addNoNestedForallsContextsErr, checkInferredVars
-                        , makeRnValBinds)
-import GHC.Rename.Unbound ( notInScopeErr, WhereLooking(WL_Global)
-                          , reportUnboundName )
+                        , makeRnValBinds )
+import GHC.Rename.Unbound ( notInScopeErr, WhereLooking(WL_Global) )
 import GHC.Rename.Names
 
 import GHC.Tc.Errors.Types
-import GHC.Tc.Utils.Env (isBrackLevel)
+import GHC.Tc.TyCl.Build ( newImplicitBinder )
+import GHC.Tc.Utils.Env ( isBrackLevel )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Origin ( TypedThing(..) )
 
@@ -49,8 +49,9 @@ import GHC.Unit
 import GHC.Unit.Module.Warnings
 import GHC.Builtin( mkUnboundName )
 import GHC.Builtin.KnownKeys
-import GHC.Builtin.KnownOccs (consDataCon_RDR)
-import GHC.Builtin.WiredIn.Types (liftedTypeKindTyConName)
+import GHC.Builtin.KnownOccs ( consDataCon_RDR )
+import GHC.Builtin.WiredIn.Types ( liftedTypeKindTyConName )
+import GHC.Iface.Env ( lookupOrig )
 
 import GHC.Types.FieldLabel
 import GHC.Types.Name.Reader
@@ -58,16 +59,16 @@ import GHC.Types.ForeignCall
 import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Name.Env
-import GHC.Types.Basic  ( VisArity,  TyConFlavour(..), TypeOrKind(..), NewOrData(..), RuleName, RecFlag )
-import GHC.Types.GREInfo (ConLikeInfo (..), ConInfo, mkConInfo, conInfoFields)
-import GHC.Types.Hint (SigLike(..))
+import GHC.Types.Var ( Specificity(SpecifiedSpec) )
+import GHC.Types.Basic  ( TyConFlavour(..), TypeOrKind(..), NewOrData(..), RuleName, RecFlag, VisArity )
+import GHC.Types.GREInfo ( ConLikeInfo(..), ConInfo, mkConInfo, conInfoFields )
+import GHC.Types.Hint ( SigLike(..) )
 import GHC.Types.Unique.Set
 import GHC.Types.SrcLoc as SrcLoc
 
 import GHC.Driver.DynFlags
-import GHC.Driver.Env ( HscEnv(..), hsc_home_unit)
+import GHC.Driver.Env ( HscEnv(..), hsc_home_unit )
 
-import GHC.Utils.Encoding ( zEncodeString )
 import GHC.Utils.Misc   ( lengthExceeds )
 import GHC.Utils.Panic
 import GHC.Utils.Outputable
@@ -78,1870 +79,16 @@ import GHC.Data.Graph.Directed ( SCC, flattenSCC, Node(..)
                                , stronglyConnCompFromEdgedVerticesUniq )
 import GHC.Data.OrdList
 import qualified GHC.LanguageExtensions as LangExt
-import Language.Haskell.Syntax.Specificity (Specificity(SpecifiedSpec))
 
-import Control.Applicative ((<|>))
+import Control.Applicative ( (<|>) )
 import Control.Monad
-import Data.Bifunctor ( first, second )
+import Data.Bifunctor ( first )
 import Data.Foldable ( toList, for_ )
-import Data.List ( elemIndex, find, mapAccumL, nub, partition, unzip4 )
+import Data.List ( nub, partition )
 import Data.List.NonEmpty ( NonEmpty(..), head, nonEmpty )
-import Data.Data (Data, cast, gmapQ, gmapT)
-import Data.Maybe (catMaybes,  isJust, isNothing, fromMaybe, mapMaybe, maybeToList )
-import qualified Data.Set as Set ( Set, delete, difference, disjoint, empty, fromList, member, null, toList, union )
-
-{- Note [Lifting type lambdas]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Lower a type lambda to a closed family before declaration dependency
-analysis. Keep the original kind annotation so the typechecker checks
-the generated application against the source kind. Prefix lexical captures
-and give the generated family one more argument for the lambda binder.
-Give the lifted family and the synonym the same kind-checking SCC.
-Constraints from later arguments can fix the kind of the lambda binder
-before kind generalization. The existing family checker checks the
-scope, kind and beta equation.
-
-Keep the capture's original header binder and kind. Earlier header
-variables scope over later kinds. An equation can give a shadowed
-capture a private name while retaining the original name for the new
-lambda binder. Pass all captures to a nested family, including private
-equation names: their values can still occur in the kind of another
-capture.
-
-For example, if a synonym binds (q :: Type) (a :: q), a lambda that
-binds q must still carry the original q so its header can bind a.
-A nested lambda then passes that original q using the parent
-equation's private name, while source occurrences of q still refer
-to the nearest lambda.
-
-The ordinary declaration renamer brings implicit kind variables
-from the synonym header and its outer kind annotation into scope.
-Make those variables explicit parameters of each lifted family.
-Keep the original synonym's implicit binders and their order.
-
-If the lambda body is a case on one of its arguments, generate one
-family equation per constructor alternative. This leaves the case
-stuck on an unknown argument, even when the alternatives agree.
-A branch may use the whole matched value. See Note [Type case aliases]
-in GHC.Tc.TyCl.
-
-A closed written polymorphic kind on a tail-case lambda also provides
-a standalone signature for the family. Check the kind before its
-equations, so a constructor pattern cannot fix a kind variable for
-every branch. Preserve the written forall binders. Give closed captures
-parameters before that telescope. Keep the normal inference path when
-a capture's kind depends on the enclosing context.
-
-A retained dependent sum uses the same lifting. Lower
-some (x :: A) | B to Sigma A with the lifted lambda for B. The
-name Sigma comes from GHC.Sigma in the configured base unit.
-The witness domain stays outside the lambda scope. Sigma's
-payload parameter checks the kind of the lifted family.
-
-With explicitly kinded captures, a later capture or the witness domain
-can depend on an earlier capture. For example, in
-  type Keep (n :: N) (m :: N) (x :: Proxy (Add n m)) =
-    some (tag :: Bool) | (x :~: x)
-the helper needs a kind of the form
-  forall (n :: N) (m :: N) -> Proxy (Add n m) -> Bool -> Type
-The anonymous binders of the provisional family kind do not substitute
-the actual arguments for n and m in the kind of x. Give the hidden
-family a standalone kind signature when all the written kinds determine
-the telescope. Keep the inference path for incomplete kinds and do not
-copy source splices into the signature.
-
-A nested sum also captures the enclosing witness. Keep the written
-domain on the witness header when the same syntax checks as a type
-and a kind. Otherwise, infer the domain from the Sigma application.
-A written domain scopes over the enclosing equation's variables.
-Restore those names with type lets if the header has private names.
-For example, a domain of Proxy x after some (x :: A) must refer to
-the witness header, even when it shadows a synonym parameter x.
-See Note [Provisional kinds of sum payloads] in GHC.Tc.TyCl.
-
-A closed type family equation can use a type lambda anywhere that a
-synonym body can use one. Give each equation its own lifted families.
-A type family equation can also return a sum. In both cases, take
-captures from the equation binders. An implicit equation binds the
-variables in its left-hand side, as in rnFamEqn.
-Keep the binders that a capture's written kind needs. Keep the entire
-scope when the result contains a splice. The free-variable traversal
-cannot see the variables in the result of a splice. The original equation
-still goes through the ordinary scope, kind, and termination checks.
-For a top-level type instance, allocate a stable occurrence before lifting
-the payload. The same open family can have multiple instances, including
-instances in separate declaration groups. The payload helper belongs to
-the instance module even if that module imports the family.
-Check whether the equation would generate a helper before allocating
-its owner. An ordinary equation must not consume a unique occurrence.
-Use a separate occurrence for a lambda in an open family instance.
-Its lexical captures come from that equation. The renamed instance
-still goes through the usual type family validity and overlap checks.
-
-In an associated instance, an explicit equation forall can use variables
-from the enclosing instance head. Keep those captures as arguments to the
-helper. rnFamEqn still checks that these variables occur on the left-hand
-side. Copy only their names. An annotation on the instance head can
-mention another variable outside the family equation. For a splice, pass
-only enclosing variables written in the family pattern. The splice's
-source does not show which variables its result uses. A class default has
-only the scope of its own equation.
-
-Both operands of a function arrow use the enclosing scope. Visit
-the domain before the result so their lambda helpers have distinct
-names. Keep the arrow and its modifiers at the written occurrence.
-This step lifts lambdas. The existing sum positions stay the same.
-
-An ordinary erased forall adds explicitly kinded variables to the
-lambda's scope. Check the copied kinds in telescope order. The original
-forall remains at its source site. The new path requires distinct
-telescope names and splice-free syntax. The lambda binder can shadow a
-kind name because the existing lambda pass separates its equation
-patterns from the captured kinds.
-
-A type let binds a name only in its body. Lift callbacks in the RHS
-with the outer captures. A callback in the body can capture the checked
-let result as another argument. Give this argument a fresh family
-parameter. When the let shadows an outer capture, save the outer value
-before the let. Another capture can still depend on it in its kind.
-
-An unused capture gets a wildcard in the generated equation. The
-family still receives the capture because other arguments can depend
-on it. Keep named patterns for written lambda binders so the renamer
-can diagnose unused binders at the source.
--}
--- | Lift type lambdas and sum payloads from declaration right-hand sides.
--- See Note [Lifting type lambdas].
-liftTypeLambdas :: Bool -> RdrName -> HsGroup GhcPs
-                -> RnM (HsGroup GhcPs, [(OccName, OccName)], OccEnv (OccName, Bool))
-liftTypeLambdas lift_lambdas sigma group = do
-  (groups, hidden, scopes) <- unzip3 <$> traverse liftGroup (hs_tyclds group)
-  return (group { hs_tyclds = groups }, concat hidden, mkOccEnv (concat scopes))
-  where
-    liftGroup decls = do
-      (instances, lifted_insts) <- unzip <$> traverse liftInst (group_instds decls)
-      (defs, lifted) <- unzip <$> traverse liftDecl (group_tyclds decls)
-      let (families, hidden, signatures, scopes) = unzip4 (concat lifted ++ concat lifted_insts)
-      return (decls { group_tyclds = defs ++ families
-                    , group_kisigs = group_kisigs decls ++ catMaybes signatures
-                    , group_instds = instances }
-             , hidden, catMaybes scopes)
-
-    liftInst (L loc inst@ClsInstD
-                  { cid_inst = decl@ClsInstDecl{cid_poly_ty = header, cid_decls = nested} }) = do
-      (nested', lifted) <- liftNested (instanceVars header) nested
-      return (L loc inst{cid_inst = decl{cid_decls = nested'}}, lifted)
-    liftInst inst = liftTypeInst [] inst
-
-    liftNested inherited nested = do
-      (nested', lifted) <- unzip <$> traverse liftDeclInst nested
-      return (nested', concat lifted)
-      where
-        liftDeclInst (L loc (InstD ext inst)) = do
-          (L _ inst', lifted) <- liftTypeInst inherited (L loc inst)
-          return (L loc (InstD ext inst'), lifted)
-        liftDeclInst decl = return (decl, [])
-
-    instanceVars (L _ HsSig{sig_bndrs = outer, sig_body = body}) =
-      case outer of
-        HsOuterImplicit{} -> nubN (extractHsTyRdrTyVars body)
-        HsOuterExplicit{hso_bndrs = binders} -> mapMaybe hsLTyVarLocName binders
-
-    liftTypeInst inherited (L loc inst@TyFamInstD
-                                { tfid_inst = decl@TyFamInstDecl
-                                { tfid_eqn = eqn@FamEqn{feqn_tycon = owner, feqn_rhs = rhs} } })
-      | let liftFor name = liftEquation inherited name (0 :: Int) (L loc eqn)
-            (_, (_, candidates)) = liftFor owner
-      , not (null candidates) = do
-          let family = occNameString (rdrNameOcc (unLoc owner))
-              stem | sumResult rhs = "$sum:" ++ family
-                   | otherwise = "$callback:" ++ family ++ ":instance"
-          occ <- chooseUniqueOccTc (mkInstTyTcOcc stem)
-          let instance_owner = L (getLoc owner) (mkRdrUnqual occ)
-              (_, (L _ eqn', lifted)) = liftFor instance_owner
-          return (L loc inst{tfid_inst = decl{tfid_eqn = eqn'}}, lifted)
-    liftTypeInst _ inst = return (inst, [])
-
-    liftDecl (L loc syn@SynDecl{tcdLName = owner, tcdRhs = rhs,
-                                tcdTyVars = HsQTvs{hsq_explicit = captures}})
-      | Just scoped <- traverse capture captures
-      = let (kind_occs, _) = hsQTyVarKindOccs captures (extractHsTyRdrTyVarsKindVars rhs)
-            kinds = nubN kind_occs
-            implicit = [(liftedTypeVarBinder k, k) | k <- kinds]
-            (rhs', families, _) = liftRhs True Nothing owner (implicit ++ scoped) rhs (0 :: Int)
-        in return (L loc syn{tcdRhs = rhs'}, families)
-    liftDecl (L loc decl@FamDecl{tcdFam = family@FamilyDecl
-                  { fdLName = owner, fdInfo = ClosedTypeFamily ann (Just rows) }}) =
-      let (_, results) = mapAccumL (liftEquation [] owner) (0 :: Int) rows
-          (rows', lifted) = unzip results
-          family' = family{fdInfo = ClosedTypeFamily ann (Just rows')}
-      in return (L loc decl{tcdFam = family'}, concat lifted)
-    liftDecl (L loc cls@ClassDecl{tcdDecls = nested}) = do
-      (nested', lifted) <- liftNested [] nested
-      return (L loc cls{tcdDecls = nested'}, lifted)
-    liftDecl decl = return (decl, [])
-
-    liftEquation inherited owner salt (L loc eqn@FamEqn{feqn_rhs = rhs}) =
-      let used = usedEquationCaptures rhs (equationCaptures inherited eqn)
-          (rhs', families, next) = liftRhs (sumResult rhs) Nothing owner used rhs salt
-      in (next, (L loc eqn{feqn_rhs = rhs'}, families))
-
-    sumResult (L _ (HsParTy _ body)) = sumResult body
-    sumResult (L _ (HsKindSig _ body _)) = sumResult body
-    sumResult (L _ (XHsType HsTypeSome{})) = True
-    sumResult _ = False
-
-    equationCaptures inherited FamEqn{feqn_bndrs = outer, feqn_pats = pats, feqn_rhs = rhs} =
-      [(liftedTypeVarBinder v, v) | v <- inherited
-                                , not (any (sameBinder v . snd) local)
-                                , without_splice || any (sameBinder v) lhs] ++ local
-      where
-        without_splice = spliceFree rhs
-        lhs = nubN (extractHsTyArgRdrKiTyVars pats)
-        local = mapMaybe capture (familyEquationBinders outer lhs)
-
-    liftRhs _ scoped owner captures (L loc (HsKindSig ann body kind)) salt
-      | lift_lambdas
-      , L _ HsForAllTy{} <- ignoreParens kind
-      , closedSpliceFreeKind kind
-      , Just capture_kinds <- traverse (closedCaptureKind . fst) captures
-      , L lam_loc (XHsType (HsTypeLambda _ vars rhs)) <- ignoreParens body
-      , (_, result) <- collectLambdas salt vars rhs
-      , L _ (XHsType HsTypeCase{}) <- ignoreParens result
-      = let (body', families, next) =
-                liftLambdaRhs scoped Nothing owner captures lam_loc vars rhs salt
-                  (Just (foldr nlHsFunTy kind capture_kinds))
-        in (L loc (HsKindSig ann body' kind), families, next)
-    liftRhs lift_sum scoped owner captures (L loc (HsKindSig ann body kind)) salt =
-      let (body', families, next) = liftRhs lift_sum scoped owner captures body salt
-      in (L loc (HsKindSig ann body' kind), families, next)
-    liftRhs _ scoped owner captures (L loc (HsFunTy ann arrow domain result)) salt =
-      let (domain', domain_families, next) = liftRhs False scoped owner captures domain salt
-          (result', result_families, end) = liftRhs False scoped owner captures result next
-      in (L loc (HsFunTy ann arrow domain' result'), domain_families ++ result_families, end)
-    liftRhs _ scoped owner captures
-      (L loc quantified@HsForAllTy{hst_tele = tele, hst_body = body}) salt
-      | ordinaryErasedForall tele
-      , Just locals <- forallCaptures tele
-      , Just scope <- extendLambdaForallScope captures locals
-      , spliceFree body
-      = let (body', families, next) = liftRhs False scoped owner scope body salt
-        in (L loc quantified{hst_body = body'}, families, next)
-    liftRhs _ scoped owner captures (L loc (XHsType let_ty@(HsTypeLet ann _ _ binds result_ty))) salt =
-      let (binder, rhs, body) = splitHsTypeLet binds result_ty
-          (rhs', rhs_families, next) = liftRhs False scoped owner captures rhs salt
-          saved = privateName "let-outer" next 0 binder
-          header = liftedTypeVarBinder (privateName "let-header" next 0 binder)
-          shadowed (_, name) = sameBinder binder name
-          save c@(param, _) | shadowed c = (param, saved)
-                            | otherwise  = c
-          scope = map save captures ++ [(header, binder)]
-          (body', body_families, end) = liftRhs False scoped owner scope body (next + 1)
-          local = L loc (XHsType (mkHsSingleTypeLet ann binder rhs' body'))
-          result | not (null body_families), any shadowed captures
-                 = L loc (XHsType (mkHsSingleTypeLet noAnn saved (typeName binder) local))
-                 | otherwise = local
-      in (preserveTypeLetSource let_ty result, rhs_families ++ body_families, if null body_families then next else end)
-    liftRhs _ scoped owner captures (L loc (XHsType (HsTypeLambda _ vars body))) salt
-      | lift_lambdas = liftLambdaRhs scoped Nothing owner captures loc vars body salt Nothing
-    liftRhs True scoped owner captures (L loc (XHsType (HsTypeSome _ binder domain body))) salt =
-      let signature = sumPayloadKind captures domain
-          (schema, families, next) = liftLambdaRhs scoped (Just domain) owner captures loc [binder] body salt signature
-          sigma_ty = typeName (L (l2l loc) sigma)
-          app f arg = L loc (HsAppTy noExtField f arg)
-      in (app (app sigma_ty domain) schema, families, next)
-    liftRhs lift_sum scoped owner captures ty salt =
-      liftTypeChildren (liftRhs lift_sum scoped owner captures) ty salt
-
-    -- A standalone kind signature quantifies the invisible prefix before
-    -- checking any equation. If the first row could fix that prefix, GADT
-    -- matches with different result indices would become monomorphic.
-    -- 'capture' has already removed kinds that contain a splice.
-    closedCaptureKind (L _ (HsTvb _ _ _ (HsBndrKind _ kind)))
-      | null (extractHsTyRdrTyVars kind) = Just kind
-    closedCaptureKind _ = Nothing
-
-    -- The written annotation and capture binders remain in the synonym.
-    -- A copied kind must not cause another execution of a source splice.
-    closedSpliceFreeKind kind =
-      null (extractHsTyRdrTyVars kind) && spliceFree kind
-
-    -- See Note [Lifting type lambdas]. Bind only captures that occur in a
-    -- later kind. Check closure after binding the captures in source order.
-    -- The written domain must refer to the same names in this signature.
-    sumPayloadKind captures domain
-      | Just binders <- traverse explicitCapture captures
-      , completeKind domain
-      , (kind, free, True) <- foldr addCapture (result, kindVars domain, False) binders
-      , Set.null free
-      = Just kind
-      | otherwise = Nothing
-      where
-        result = nlHsFunTy domain (nlHsTyVar NotPromoted (Exact (ExactName liftedTypeKindTyConName)))
-        kindVars = Set.fromList . map unLoc . extractHsTyRdrTyVars
-
-        explicitCapture (binder@(L _ (HsTvb _ _ (HsBndrVar _ name) (HsBndrKind _ kind))), source)
-          | completeKind kind
-          , sameBinder name source || not (unLoc source `Set.member` kindVars domain)
-          = Just (binder, unLoc name, kind)
-        explicitCapture _ = Nothing
-
-        addCapture (binder, name, kind) (body, free, dependent) =
-          let used = Set.member name free
-              kind' | used = L (getLoc kind) (HsForAllTy noExtField
-                                 (mkHsForAllVisTele noAnn [fmap (setHsTyVarBndrFlag ()) binder]) body)
-                    | otherwise = nlHsFunTy kind body
-          in (kind', kindVars kind `Set.union` Set.delete name free, used || dependent)
-
-    completeKind :: Data a => a -> Bool
-    completeKind node =
-      case cast node :: Maybe (LHsType GhcPs) of
-        Just (L _ HsSpliceTy{})    -> False
-        Just (L _ HsWildCardTy{})  -> False
-        Just (L _ XHsType{})      -> False
-        _ -> and (gmapQ completeKind node)
-
-    -- See Note [Lifting type lambdas].
-    witnessKind captures domain
-      | completeKind domain
-      , sameDomainMode domain
-      , Set.null (free `Set.difference` scope)
-      = Just (foldr restore domain captures)
-      | otherwise = Nothing
-      where
-        free = Set.fromList (map unLoc (extractHsTyRdrTyVars domain))
-        scope = Set.fromList (map (unLoc . snd) captures)
-        restore (L _ HsTvb{tvb_var = HsBndrVar _ header}, source) body
-          | not (sameBinder header source)
-          , unLoc source `Set.member` free
-          = L (getLoc body) (XHsType (mkHsSingleTypeLet noAnn source (typeName header) body))
-        restore _ body = body
-
-    -- For example, a bare arrow can change matchability in a kind.
-    sameDomainMode :: Data a => a -> Bool
-    sameDomainMode node = case cast node :: Maybe (LHsType GhcPs) of
-      Just (L _ HsFunTy{}) -> False
-      Just (L _ HsForAllTy{}) -> False
-      Just (L _ HsForEachTy{}) -> False
-      _ -> and (gmapQ sameDomainMode node)
-
-    liftLambdaRhs outer_scope domain owner captures loc vars body salt signature =
-      let owner_occ = rdrNameOcc (unLoc owner)
-          is_sum = isJust domain
-          scoped
-            | Just scope@(_, sum_scope) <- outer_scope, sum_scope || not is_sum = scope
-            | otherwise = (lambdaOcc owner_occ salt is_sum, is_sum)
-          (binders, result) = collectLambdas salt vars body
-          -- Keep source spellings in a malformed list so the normal family
-          -- binder check diagnoses a duplicate at the written binder.
-          header_names
-            | hasDuplicates binders = binders
-            | otherwise = zipWith (privateName "header" salt) [0..] binders
-          local_binders = map liftedTypeVarBinder header_names
-          locals = zip (annotateWitness local_binders) binders
-          annotateWitness (L b_loc binder : rest)
-            | Just kind <- domain >>= witnessKind captures
-            = L b_loc binder{tvb_kind = HsBndrKind noExtField kind} : rest
-          annotateWitness bs = bs
-          equation_captures = zipWith (hideCapture binders salt) [0..] captures
-          equation_scope = equation_captures ++ locals
-          (body', families, next) =
-            liftRhs True (Just scoped) owner equation_scope result (salt + 1)
-          (applied, lifted) = liftLambda scoped is_sum owner loc captures equation_scope body' salt signature
-      in (applied, lifted : families, next)
-    liftLambda (root, sum_scope) is_sum owner loc captures equation_scope body salt signature =
-      let owner_occ = rdrNameOcc (unLoc owner)
-          occ = lambdaOcc owner_occ salt sum_scope
-          name = L (getLoc owner) (mkRdrUnqual occ)
-          equations
-            | L _ (XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) <- ignoreParens body
-            , L _ (HsTyVar _ NotPromoted scrut) <- ignoreParens scrutinee
-            , [selected] <- [i | (i, (_, v)) <- zip [0 :: Int ..] equation_scope
-                               , sameBinder v scrut]
-            , selected >= length captures
-            , Just branches <- traverse classifyBranch alts
-            = map (caseEquation owner name selected equation_scope case_kw scrut) branches
-            | otherwise
-            = [equation loc name (capture_pats ++ binder_pats) body]
-          (capture_names, binder_names) = splitAt (length captures) (map snd equation_scope)
-          capture_pats = map capturePat capture_names
-          binder_pats = map typeName binder_names
-          free = Set.fromList (map unLoc (extractHsTyRdrTyVars body))
-          splice_free = spliceFree body
-          capturePat v
-            | splice_free, not (unLoc v `Set.member` free)
-            = L (l2l (getLoc v)) (HsWildCardTy (HoleVar (noLocA unnamedHoleRdrName)))
-            | otherwise = typeName v
-          -- A quoted capture has an exact name in the original scope.
-          -- Give the generated family a separate parameter.
-          copied = [(unLoc v, unLoc (privateName "quoted-capture" salt index v))
-                   | (index, (_, v)) <- zip [0..] captures
-                   , isJust (rdrNameExactName_maybe (unLoc v))]
-          family = renameCaptures copied $ L loc (FamDecl noExtField
-                   (FamilyDecl noAnn (ClosedTypeFamily noAnn (Just equations)) TopLevel
-                       name (HsQTvs noExtField (map fst equation_scope)) Prefix
-                       (L (l2l loc) (NoSig noExtField)) Nothing))
-          applied = foldl' (\f (_, n) -> L loc (HsAppTy noExtField f (typeName n)))
-                           (typeName name) captures
-          sig kind = L loc (StandaloneKindSig noAnn name
-                       (L (getLoc kind) (mkHsImplicitSigType (renameCaptures copied kind))))
-      in (applied, (family, (occ, owner_occ), sig <$> signature, Just (occ, (root, is_sum))))
-
-    lambdaOcc owner salt scoped =
-      mkTcOcc ("$lambda:" ++ occNameString owner ++ ":" ++ show salt
-                ++ if scoped then "-sigma" else "")
-
-    -- A tail case on a lambda argument can be represented directly by
-    -- the lambda's equations. Matching remains deferred until application.
-    classifyBranch (L loc (HsTypeCaseAlt pat _ rhs)) = do
-      (pat', bound) <- classifyTypeCasePattern pat
-      pure (loc, pat', bound, rhs)
-
-    caseEquation owner name selected scope case_kw scrut (loc, pat, bound, rhs) =
-      equation loc name (zipWith argument [0..] scope) body
-      where
-        body = L (noAnnSrcSpan (getEpTokenSrcSpan case_kw))
-                 (XHsType (HsTypeCaseAlias generated (owner, selected, alias) rhs))
-        alias
-          | unLoc scrut `notElem` bound
-          , any ((== unLoc scrut) . unLoc) (extractHsTyRdrTyVars rhs)
-          = Just scrut
-          | otherwise = Nothing
-
-        generated = [unLoc (captureName index v)
-                    | (index, (_, v)) <- zip [0..] scope, index /= selected]
-        argument index (_, v)
-          | index == selected = pat
-          | otherwise = typeName (captureName index v)
-        captureName index v
-          | unLoc v `elem` bound = privateName "case-capture" 0 index v
-          | otherwise = v
-
-    equation loc name params =
-      L loc . FamEqn ([], [], noAnn) name mkHsOuterImplicit
-                     (map (HsValArg noExtField) params) Prefix
-
-    -- An adjacent lambda shares the current telescope, so the inner
-    -- closure is just a partial application of the same family.
-    collectLambdas salt vars body
-      | not (hasDuplicates vars)
-      , L _ (XHsType (HsTypeLambda _ more inner)) <- ignoreParens body
-      , not (hasDuplicates more)
-      = collectLambdas salt (zipWith (hideEarlier more salt) [0..] vars ++ more) inner
-      | otherwise = (vars, body)
-
-    sameBinder a b = unLoc a == unLoc b
-    hasDuplicates = not . null . findDupsEq sameBinder
-
-    hideEarlier binders salt index var
-      | any (sameBinder var) binders = privateName "argument" salt index var
-      | otherwise = var
-
-    hideCapture binders salt index (header, var)
-      | any (sameBinder var) binders = (header, privateName "capture" salt index var)
-      | otherwise = (header, var)
-
-    privateName role salt index (L loc _) = L loc (mkRdrUnqual
-      (mkTyVarOcc ("$lambda-" ++ role ++ ":" ++ show (salt :: Int)
-                              ++ ":" ++ show (index :: Int))))
-
-    capture original@(L loc (HsTvb ann vis@(HsBndrRequired _) var@(HsBndrVar _ n) kind)) =
-      Just (capture_binder, n)
-      where
-        capture_binder
-          | HsBndrKind _ written_kind <- kind
-          , not (spliceFree written_kind)
-          -- The synonym checks the written splice. Infer this generated
-          -- parameter from the capture passed by the synonym in the same SCC.
-          = L loc (HsTvb ann vis var (HsBndrNoKind noExtField))
-          | otherwise = original
-    capture _ = Nothing
-
--- | Wrap a located 'RdrName' as an unpromoted 'HsTyVar'.
-typeName :: LocatedN RdrName -> LHsType GhcPs
-typeName n = L (l2l (getLoc n)) (HsTyVar noAnn NotPromoted n)
-
--- | Form a required parameter for a lifted type expression.
-liftedTypeVarBinder :: LocatedN RdrName -> LHsTyVarBndr (HsBndrVis GhcPs) GhcPs
-liftedTypeVarBinder v =
-  L (l2l (getLoc v)) (HsTvb noAnn (HsBndrRequired noExtField)
-    (HsBndrVar noExtField v) (HsBndrNoKind noExtField))
-
--- | The parameter copied into a generated declaration and its lexical name.
-type LiftedTypeCapture = (LHsTyVarBndr (HsBndrVis GhcPs) GhcPs, LocatedN RdrName)
-
-explicitCaptures :: [LHsTyVarBndr flag GhcPs] -> [LiftedTypeCapture]
-explicitCaptures binders =
-  [(fmap (updateHsTyVarBndrFlag (const (HsBndrRequired noExtField))) b, v)
-  | b <- binders, Just v <- [hsLTyVarLocName b]]
-
-ordinaryErasedForall :: HsForAllTelescope GhcPs -> Bool
-ordinaryErasedForall HsForAllInvis{hsf_matchability = Nothing} = True
-ordinaryErasedForall _ = False
-
-forallCaptures :: HsForAllTelescope GhcPs -> Maybe [LiftedTypeCapture]
-forallCaptures HsForAllInvis{hsf_invis_bndrs = binders} = writtenCaptures binders
-forallCaptures HsForAllVis{hsf_vis_bndrs = binders} = writtenCaptures binders
-
-writtenCaptures :: [LHsTyVarBndr flag GhcPs] -> Maybe [LiftedTypeCapture]
-writtenCaptures binders
-  | all hasWrittenKind binders = Just (explicitCaptures binders)
-  | otherwise = Nothing
-
-hasWrittenKind :: LHsTyVarBndr flag GhcPs -> Bool
-hasWrittenKind (L _ (HsTvb _ _ HsBndrVar{} (HsBndrKind _ kind))) = copyable kind
-hasWrittenKind _ = False
-
--- | Check that a copied binding cannot acquire a different kind variable.
-extendLambdaForallScope :: [LiftedTypeCapture] -> [LiftedTypeCapture]
-                        -> Maybe [LiftedTypeCapture]
-extendLambdaForallScope captures locals
-  | all originalName captures
-  , Just _ <- foldM extend (map (unLoc . snd) captures) locals
-  = Just (captures ++ locals)
-  | otherwise = Nothing
-  where
-    originalName (binder, name) =
-      copyable binder && (unLoc <$> hsLTyVarLocName binder) == Just (unLoc name)
-    extend names (L _ HsTvb{tvb_kind = HsBndrKind _ kind}, name) =
-      extendForallNames names (unLoc name) (map unLoc (extractHsTyRdrTyVars kind))
-    extend _ _ = Nothing
-
-extendForallNames :: [RdrName] -> RdrName -> [RdrName] -> Maybe [RdrName]
-extendForallNames names name mentions
-  | name `notElem` names, all (`elem` names) mentions = Just (name : names)
-  | otherwise = Nothing
-
--- | Check that a type can be copied into a lifted declaration.
-copyable :: Data a => a -> Bool
-copyable node = case cast node :: Maybe (LHsType GhcPs) of
-  Just (L _ HsSpliceTy{}) -> False
-  Just (L _ HsWildCardTy{}) -> False
-  _ -> and (gmapQ copyable node)
-
--- | Rename occurrences whose binding sites the caller has identified.
-renameCaptures :: Data a => [(RdrName, RdrName)] -> a -> a
-renameCaptures [] node = node
-renameCaptures copied node
-  | Just rdr <- cast node
-  , Just replacement <- lookup rdr copied
-  = fromMaybe node (cast replacement)
-  | otherwise = gmapT (renameCaptures copied) node
-
--- | Select the equation's lexical binders as in 'rnFamEqn'.
-familyEquationBinders :: HsOuterFamEqnTyVarBndrs GhcPs -> [LocatedN RdrName]
-                      -> [LHsTyVarBndr (HsBndrVis GhcPs) GhcPs]
-familyEquationBinders HsOuterImplicit{} lhs = map liftedTypeVarBinder lhs
-familyEquationBinders HsOuterExplicit{hso_bndrs = binders} _ =
-  map (fmap (setHsTyVarBndrFlag (HsBndrRequired noExtField))) binders
-
--- | Keep the RHS's free captures and the binders needed by their kinds.
--- A splice can return references that are absent from the source.
-usedEquationCaptures
-  :: LHsType GhcPs -> [(LHsTyVarBndr (HsBndrVis GhcPs) GhcPs, LocatedN RdrName)]
-  -> [(LHsTyVarBndr (HsBndrVis GhcPs) GhcPs, LocatedN RdrName)]
-usedEquationCaptures rhs captures
-  | spliceFree rhs = fst (foldr select ([], freeNames rhs) captures)
-  | otherwise = captures
-  where
-    freeNames = Set.fromList . map unLoc . extractHsTyRdrTyVars
-    select c@(binder, v) (used, free)
-      | Set.member (unLoc v) free =
-          let kinds = case unLoc binder of
-                HsTvb{tvb_kind = HsBndrKind _ kind} -> freeNames kind
-                _ -> Set.empty
-          in (c : used, Set.union kinds (Set.delete (unLoc v) free))
-      | otherwise = (used, free)
-
--- | A copied capture kind must not run a type splice a second time.
-spliceFree :: Data a => a -> Bool
-spliceFree node
-  | Just (L _ HsSpliceTy{}) <- (cast node :: Maybe (LHsType GhcPs)) = False
-  | otherwise = and (gmapQ spliceFree node)
-
-{- Note [Lifting types from signatures and fields]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Give each lifted expression a private synonym. For a retained sum,
-the synonym checks the witness domain and fixes the missing argument
-of the payload family. A type case in a value signature uses the
-same closed family translation as a case in a written synonym.
-The family keeps its lexical owner. See Note [Lifting type lambdas]
-and Note [Lifting type cases].
-
-Name the synonym from the value name and the position of the expression in its
-signature. Count from left to right in the argument and result types.
-Different values use separate counters. The private type namespace also
-separates a function operator from a same-spelled type operator. A
-signature shared by several values uses its first name.
-
-Within one signature telescope, identical cases can share a synonym.
-This keeps two uses equal when their common scrutinee is unknown.
-Compare the parsed names, applications and ordered rows. A row binder
-has the same scope at both occurrences. Skip comparison for syntax
-that can contain a nested binder. Keep the first location for checking
-the shared case.
-
-In a value signature, a nested erased forall can also provide captures.
-Require written kinds for its local variables and keep the forall at
-the original occurrence. Start a new comparison table there. Remove a
-shadowed outer name from the capture scope. The capture check still
-requires the kind of each selected variable to refer to earlier
-captures. If that requires a shadowed variable, leave the case in the
-source so the normal context check rejects it.
-
-Give a lambda in a top-level value signature or ordinary constructor
-field its own private synonym. Its parameters are the free variables
-of the lambda and the variables in their kinds. Keep the application
-of the synonym at the written occurrence. In a signature, an ordinary
-erased forall can also provide captures. The existing lambda pass
-then lifts the synonym body. See Note [Lifting type lambdas].
-
-A foreach telescope starts a new table too. Lift a case on an
-application tree with retained variables among its operands. Each
-application head can name a type constructor or a checked source function
-in scope. See Note [Resolving retained case heads].
-The synonym binds an erased index for each retained variable. It uses
-the written domain as the kind. The application receives the original
-runtime indices. Ordinary source calls in the copied tree use the
-existing checked source equations.
-See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
-
-A type lambda in a retained value signature uses the same capture
-parameters. For example, `\\a -> Vec a (size p)` can close over a
-written `foreach (p :: Columns)`. The lifted family has an erased
-parameter of kind Columns and uses the checked source equation for
-size. The application in the original signature passes p. This keeps
-its nominal identity when two record arguments have the same domain.
-Restrict this lifting to a body with no inner binders. Resolve source
-call heads in the declaration scope and respect lambda binders that
-shadow those names.
-
-An inline sum in a retained signature also uses these capture parameters.
-For `foreach (m :: Size) -> foreach (n :: Size) -> some (k :: Size) |
-k :~: plus m n`, pass m and n to the lifted synonym in telescope order.
-The payload family binds k in addition to those captures. Permit source
-calls in the copied domain and payload. Only the payload scopes over k.
-Use this path for domains and payloads with no further binders.
-
-Check copied runtime domains for forms whose checking differs between
-types and kinds. A bare arrow defaults to unmatchable in a retained
-domain and can default to matchable in an erased binder kind. Leave
-the corresponding case at the written occurrence.
-
-Two retained cases can use one family when all their captures are
-retained indices and their closed domains, application trees, and
-ordered rows agree. Compare the index leaves by position in the
-telescope. Compare the other names in the same declaration group.
-Each application passes its own nominal indices in telescope order.
-Retain the source synonym for each signature so diagnostics can name it.
-
-For a constructor field, use the constructor's name and count sums
-from left to right. Use a separate prefix for constructor fields.
-The constructor name is unique in the module even when record labels
-repeat. A Haskell98 field can use the type header's erased variables.
-A GADT constructor field uses the constructor signature's outer binders
-and any earlier retained arguments on the constructor's argument spine.
-Use the same free-variable order as rnConDecl for implicit binders.
-Leave the constructor result and any context to ordinary constructor
-checking. Leave inner forall groups to the ordinary renamer.
-
-The parser stores the argument spine from the first retained binder in
-con_res_ty. Walk that spine in source order. Reuse the normal checking of
-the retained application to each lifted synonym. A later binder does not
-scope over earlier fields. Stop at shadowing because the copied kind of
-an earlier parameter may need a name that the shadowing binder hides.
-
-A GADT field can itself start with a retained telescope. Its binders
-scope over that field only. Remove shadowed captures before lifting the
-body. Check the remaining written kinds for hidden names. In a group of
-retained binders, a binder's kind is checked before that binder enters
-scope, so check the kinds in order.
-
-Copy only the parameters used by the lifted expression and the parameters
-used in their written kinds. Keep their original order. Require each
-free variable to be in scope in the source signature or field. Otherwise
-kind inference for the synonym could bind a variable that is out of scope
-at the source occurrence.
-Skip types that contain splices or holes. A wildcard in a case pattern
-is part of the match. Leave nested binders outside these field telescopes
-to the ordinary renamer.
-
-For a type case in an ordinary constructor field, use the same
-lexical capture check as for a value signature. Give each written
-case its own helper, including cases in different fields of one
-constructor. A case under a retained binder can inspect that binder,
-a closed name, or a checked application to the binder. Keep the original foreach in the field. Apply the
-same restriction on copying written retained domains as in value
-signatures. For example, a copied arrow can change matchability.
-
-Keep an inner erased forall and put the helper application in its body. Save any shadowed variables that a capture
-kind uses with type lets before the forall. Give the saved variables
-formal parameters in the helper. Use type lets in the copied kinds
-to bind the original names to those parameters. The renamer then
-checks the original kind syntax with its own local scopes. Include
-the dependencies of the saved variables in telescope order.
--}
--- | Select the expressions that can be lifted at a declaration type position.
-data LiftedTypeSite
-  = FieldTypeSite
-  | RetainedFieldTypeSite [RdrName]
-  | SignatureTypeSite
-  | LocalLambdaTypeSite LocalLambdaScope
-  | ForallTypeSite Bool  -- The scope permits lifting a type lambda.
-  | RetainedTypeSite [RdrName]
-  deriving Eq
-
--- | Enclosing names at a local signature. Unavailable names cannot become
--- implicit formals.
-data LocalLambdaScope = LocalLambdaScope
-  { localLambdaArguments :: [(RdrName, RdrName)]
-  , localLambdaUnavailable :: [RdrName]
-  }
-  deriving Eq
-
--- | Rewrite the declarations and return their new private synonyms separately.
--- See Note [Lifting types from signatures and fields].
-liftDeclarationTypes :: [(RdrName, Maybe (GlobalRdrElt, Name))]
-                     -> [(RetainedCaseKey, RdrName)] -> (Int -> String)
-                     -> Bool -> Bool -> Maybe (LocalLambdaScope, [LiftedTypeCapture])
-                     -> HsGroup GhcPs
-                     -> (HsGroup GhcPs, [TyClGroup GhcPs], LiftedDecls,
-                         [(LocatedN RdrName, GlobalRdrElt)], [LocatedN RdrName],
-                         [(RetainedCaseKey, OccName)])
-liftDeclarationTypes source_heads earlier helper_suffix lift_cases named_wildcards local_scope group
-  | not (null synonyms)
-  = (group{hs_valds = values, hs_tyclds = type_groups}, [anchors], names, concat uses, missing, helpers)
-  | otherwise = (group, [], [], [], [], [])
-  where
-    (values, signature_types) = case hs_valds group of
-      ValBinds ann binds ->
-        let (_, lifted) = mapAccumL liftBind emptyOccEnv binds
-            (binds', types) = unzip lifted
-        in (ValBinds ann binds', concat types)
-      binds -> (binds, [])
-    (type_groups, groups_sums) = unzip (map liftGroup (hs_tyclds group))
-    (seen, shared) = mapAccumL shareRetainedCase earlier signature_types
-    helpers = [(key, rdrNameOcc name) | (key, name) <- seen, isUnqual name]
-    (shared_types, uses) = unzip shared
-    field_types = concat groups_sums
-    (synonyms, names) = unzip (shared_types ++ [entry | (entry, _, _) <- field_types])
-    missing = concat [unbound | (_, _, unbound) <- field_types]
-    anchors = TyClGroup noExtField synonyms [] [] []
-
-    shareRetainedCase seen (entry@(L loc alias@SynDecl{}, names@(occ, _)), Just (key, captures, heads), _)
-      | Just first <- lookup key seen
-      = let rhs = applyCaseAlias loc first captures
-        in (seen, ((L loc alias{tcdRhs = rhs}, names), heads))
-      | otherwise
-      = ((key, mkRdrUnqual occ) : seen, (entry, []))
-    shareRetainedCase seen (entry, _, _) = (seen, (entry, []))
-
-    liftGroup decls =
-      let (decls', sums) = unzip (map liftData (group_tyclds decls))
-      in (decls{group_tyclds = decls'}, concat sums)
-
-    liftData (L loc decl@DataDecl{tcdTyVars = hsq,
-                                 tcdDataDefn = defn@HsDataDefn{dd_cons = cons}}) =
-      let binders = hsQTvExplicit hsq
-          (kind_occs, _) = hsQTyVarKindOccs binders []
-          scope = implicitCaptures kind_occs ++ explicitCaptures binders
-          (cons', sums) = case cons of
-            DataTypeCons False fields ->
-              let (fields', lifted) = unzip (map (liftConstructor scope) fields)
-              in (DataTypeCons False fields', concat lifted)
-            NewTypeCon con -> first NewTypeCon (liftConstructor scope con)
-            _ -> (cons, [])
-      in (L loc decl{tcdDataDefn = defn{dd_cons = cons'}}, sums)
-    liftData decl = (decl, [])
-
-    liftConstructor scope (L loc con@ConDeclH98{con_telescope = [], con_name = owner, con_args = args}) =
-      let (args', sums) = liftFields (liftField (liftFieldAt FieldTypeSite owner scope)) args
-      in (L loc con{con_args = args'}, sums)
-    liftConstructor _ (L loc con@ConDeclGADT
-      { con_names = names, con_outer_bndrs = L _ outer, con_telescope = telescope
-      , con_g_args = args, con_res_ty = result })
-      | all without_inner_forall telescope
-      = let occurrences = extractHsGadtTelescopes telescope $
-                          extractConDeclGADTDetailsTyVars args $
-                          extractHsTysRdrTyVars [result] []
-            owner = head names
-            call_sites
-              | null source_heads = Set.empty
-              | otherwise = Set.fromList
-                  [(loc, unLoc v) | v <- retainedFieldCallHeads args result
-                                  , RealSrcSpan loc _ <- [getLocA v]
-                                  , isJust (lookup (unLoc v) source_heads)
-                                  , not (namedWildcard (unLoc v)) ]
-            is_call_head v = case getLocA v of
-              RealSrcSpan loc _ -> Set.member (loc, unLoc v) call_sites
-              _ -> False
-            scope = outerCaptures outer (filter (not . is_call_head) occurrences)
-            visit = liftField (liftFieldType FieldTypeSite owner scope)
-            (args', sums) = case args of
-              PrefixConGADT ann fields -> first (PrefixConGADT ann) (liftFieldList visit fields)
-              RecConGADT ann fields -> first (RecConGADT ann) (liftRecordFields visit fields)
-            (result', retained_types, _) = liftRetainedFields owner scope [] result (length sums)
-        in (L loc con{con_g_args = args', con_res_ty = result'}, sums ++ retained_types)
-      where
-        without_inner_forall (L _ HsGadtForAll{}) = False
-        without_inner_forall _ = True
-    liftConstructor _ con = (con, [])
-
-    liftRetainedFields owner scope retained ty@(L loc node) salt = case node of
-      HsForEachTy{hst_bndrs = binders, hst_body = body}
-        | let locals = explicitCaptures binders
-              scope' = scope ++ locals
-        , length locals == length binders
-        , null (findDupsEq (==) (map (unLoc . snd) scope')) ->
-            let retained' = map (unLoc . snd) locals ++ retained
-                (body', sums, next) = liftRetainedFields owner scope' retained' body salt
-            in (L loc node{hst_body = body'}, sums, next)
-      HsFunTy ann arrow arg result ->
-        let (arg', sums, next) = liftFieldType (RetainedFieldTypeSite retained) owner scope arg salt
-            (result', later, end) = liftRetainedFields owner scope retained result next
-        in (L loc (HsFunTy ann arrow arg' result'), sums ++ later, end)
-      HsParTy ann body ->
-        let (body', sums, next) = liftRetainedFields owner scope retained body salt
-        in (L loc (HsParTy ann body'), sums, next)
-      _ -> (ty, [], salt)
-
-    liftFieldType site owner scope ty@(L loc node) salt = case node of
-      HsForEachTy{hst_bndrs = binders, hst_body = body}
-        | let locals = explicitCaptures binders
-              names = map (unLoc . snd) locals
-              (hidden, outer) = partition ((`elem` names) . unLoc . snd) scope
-        , length locals == length binders
-        , null (findDupsEq (==) names)
-        , fieldKindsInScope hidden outer locals ->
-            let inner = RetainedFieldTypeSite (names ++ retainedNames site)
-                (body', sums, next) = liftFieldType inner owner (outer ++ locals) body salt
-            in (L loc node{hst_body = body'}, sums, next)
-      HsParTy ann body ->
-        let (body', sums, next) = liftFieldType site owner scope body salt
-        in (L loc (HsParTy ann body'), sums, next)
-      _ -> liftFieldAt site owner scope ty salt
-
-    fieldKindsInScope hidden outer locals =
-      all (Set.disjoint shadowed . kindNames . fst) outer
-        && localKindsInScope shadowed locals
-      where
-        shadowed = Set.fromList (map (unLoc . snd) hidden)
-
-    -- Preserve the capture kinds across an erased forall's shadowing.
-    rankedFieldScope scope hidden outer locals loc salt
-      | fieldKindsInScope hidden outer locals = Just (outer ++ locals, [])
-      | otherwise = do
-          guard (localKindsInScope hidden_names locals)
-          copied <- traverse copy scope
-          pure (catMaybes copied ++ locals, saved)
-      where
-        hidden_names = Set.fromList (map (unLoc . snd) hidden)
-        (required, _) = foldr (select []) ([], Set.fromList (map (unLoc . snd) outer)) scope
-        needed = [v | (_, v) <- required, unLoc v `Set.member` hidden_names]
-        occupied = Set.fromList (map (unLoc . snd) (scope ++ locals))
-        fresh = [L (l2l loc) name
-                | i <- [0 :: Int ..]
-                , let name = mkRdrUnqual (mkTyVarOcc
-                             ("$field-kind:" ++ show salt ++ ":" ++ show i))
-                , not (Set.member name occupied)]
-        saved = zip needed fresh
-        saved_names = [(unLoc old, new) | (old, new) <- saved]
-
-        copy (old_binder@(L binder_loc binder@HsTvb{tvb_var = HsBndrVar ann _}), v)
-          | Just new <- lookup (unLoc v) saved_names
-          = Just (Just (L binder_loc binder{tvb_var = HsBndrVar ann new,
-                                           tvb_kind = restoreKind old_binder}, new))
-          | unLoc v `Set.member` hidden_names = Just Nothing
-          | otherwise = Just (Just (L binder_loc binder{tvb_kind = restoreKind old_binder}, v))
-        copy _ = Nothing
-
-        restoreKind binder@(L _ HsTvb{tvb_kind = HsBndrKind ann kind}) =
-          HsBndrKind ann (foldr restore kind saved)
-          where
-            free = kindNames binder
-            restore (old, new) body
-              | unLoc old `Set.member` free = bindTypeName old new body
-              | otherwise = body
-        restoreKind (L _ HsTvb{tvb_kind = kind}) = kind
-
-    bindTypeName binder rhs body =
-      L (getLoc body) (XHsType (mkHsSingleTypeLet noAnn binder (typeName rhs) body))
-
-    localKindsInScope _ [] = True
-    localKindsInScope hidden ((binder, name):locals) =
-      Set.disjoint hidden (kindNames binder) && localKindsInScope (Set.delete (unLoc name) hidden) locals
-
-    liftFields visit (PrefixCon ann fields) =
-      first (PrefixCon ann) (liftFieldList visit fields)
-    liftFields visit (RecCon ann fields) =
-      first (RecCon ann) (liftRecordFields visit fields)
-    liftFields visit (InfixCon ann left right) =
-      let (next, (left', left_sums)) = visit 0 left
-          (_, (right', right_sums)) = visit next right
-      in (InfixCon ann left' right', left_sums ++ right_sums)
-    liftFields _ fields = (fields, [])
-
-    liftRecordFields visit (L loc fields) =
-      first (L loc) (liftFieldList visitRecord fields)
-      where
-        visitRecord salt (L field_loc field@HsConDeclRecField{cdrf_spec = spec}) =
-          let (next, (spec', sums)) = visit salt spec
-          in (next, (L field_loc field{cdrf_spec = spec'}, sums))
-        visitRecord salt field = (salt, (field, []))
-
-    liftFieldList visit fields =
-      let (_, lifted) = mapAccumL visit 0 fields
-          (fields', sums) = unzip lifted
-      in (fields', concat sums)
-
-    liftField visit salt field@CDF{cdf_type = ty} =
-      let (ty', sums, next) = visit ty salt
-      in (next, (field{cdf_type = ty'}, sums))
-
-    liftBind counters (VbSig (L loc (TypeSig sig_ann mods names@(owner:_) wc@HsWC
-                  {hswc_body = L sig_loc sig@HsSig{sig_bndrs = outer, sig_body = body}}))) =
-      let occ = rdrNameOcc (unLoc owner)
-          first = fromMaybe 0 (lookupOccEnv counters occ)
-          site = maybe SignatureTypeSite (LocalLambdaTypeSite . fst) local_scope
-          (body', aliases, (next, _)) = liftBody site owner
-                                    (signatureCaptures outer body) body (first, [])
-          sig' = L sig_loc (sig{sig_body = body'})
-      in (extendOccEnv counters occ next, (VbSig (L loc (TypeSig sig_ann mods names
-                                                       wc{hswc_body = sig'})), aliases))
-    liftBind counters bind = (counters, (bind, []))
-
-    signatureCaptures outer body =
-      maybe [] snd local_scope ++ outerCaptures outer
-        [v | v <- extractHsTyRdrTyVars body
-           , isNothing (join (lookup (unLoc v) source_heads))
-           , not (boundOutsideSignature (unLoc v))]
-
-    boundOutsideSignature rdr = case fmap fst local_scope of
-      Just local -> isJust (lookup rdr (localLambdaArguments local))
-                 || rdr `elem` localLambdaUnavailable local
-      Nothing -> False
-
-    outerCaptures HsOuterImplicit{} occurrences = implicitCaptures occurrences
-    outerCaptures HsOuterExplicit{hso_bndrs = binders} _ = explicitCaptures binders
-
-    implicitCaptures occurrences =
-      [(liftedTypeVarBinder v, v) | v <- nubN occurrences
-                                , not (namedWildcard (unLoc v))]
-
-    namedWildcard = (named_wildcards &&) . startsWithUnderscore . rdrNameOcc
-
-    liftFieldAt site owner scope ty salt =
-      let (ty', sums, (next, _)) = liftBody site owner scope ty (salt, [])
-      in (ty', sums, next)
-
-    liftedAnchor site _ ty@(L _ (XHsType HsTypeLambda{}))
-      | lift_cases, signatureLambdaSite site, copyable ty = Just ("$signature-lambda:", Nothing)
-    liftedAnchor RetainedTypeSite{} _ ty@(L _ (XHsType (HsTypeLambda _ _ body)))
-      | lift_cases, ordinaryLambdaBody body, copyable ty = Just ("$signature-lambda:", Nothing)
-    liftedAnchor LocalLambdaTypeSite{} _ _ = Nothing
-    liftedAnchor FieldTypeSite _ ty@(L _ (XHsType HsTypeLambda{}))
-      | lift_cases, copyable ty = Just ("$field-lambda:", Nothing)
-    liftedAnchor SignatureTypeSite _ ty@(L _ (XHsType HsTypeLet{}))
-      | lift_cases
-      , snd (caseCaptureUses ty)
-      , copyableLetCases ty
-      = Just ("$signature-case:", Nothing)
-    liftedAnchor site _ ty@(L _ (XHsType HsTypeSome{}))
-      | fieldSite site, copyable ty = Just ("$field-sum:", Nothing)
-    liftedAnchor SignatureTypeSite _ ty@(L _ (XHsType HsTypeSome{}))
-      | copyable ty = Just ("$signature-sum:", Nothing)
-    liftedAnchor RetainedTypeSite{} _ ty@(L _ (XHsType (HsTypeSome _ _ domain body)))
-      | ordinaryLambdaBody domain, ordinaryLambdaBody body, copyable ty
-      = Just ("$signature-sum:", Nothing)
-    liftedAnchor site scope (L _ (XHsType (HsTypeCase _ _ scrutinee alts)))
-      | lift_cases
-      , caseScrutinee site scope scrutinee
-      , copyableCase scrutinee alts
-      = if fieldSite site
-          then Just ("$field-case:", Nothing)
-          else Just ("$signature-case:", signatureCaseKey scrutinee alts)
-    liftedAnchor _ _ _ = Nothing
-
-    copyableLetCases ty = case unLoc (ignoreParens ty) of
-      XHsType (HsTypeLet _ _ _ binds result) ->
-        let (_, rhs, body) = splitHsTypeLet binds result
-        in copyableLetCases rhs && copyableLetCases body
-      HsKindSig _ body kind -> copyableLetCases body && copyable kind
-      XHsType (HsTypeCase _ _ scrutinee alts) -> copyableCase scrutinee alts
-      _ -> copyable ty
-
-    fieldSite FieldTypeSite = True
-    fieldSite RetainedFieldTypeSite{} = True
-    fieldSite _ = False
-
-    signatureSite SignatureTypeSite = True
-    signatureSite ForallTypeSite{} = True
-    signatureSite _ = False
-
-    signatureLambdaSite SignatureTypeSite = True
-    signatureLambdaSite LocalLambdaTypeSite{} = True
-    signatureLambdaSite (ForallTypeSite allowed) = allowed
-    signatureLambdaSite _ = False
-
-    caseScrutinee (RetainedFieldTypeSite names) scope scrutinee
-      | L _ (HsTyVar _ _ name) <- ignoreParens scrutinee
-      , let rdr = unLoc name
-      = not (isTvOcc (rdrNameOcc rdr)) || rdr `elem` names
-      | otherwise = checkedRetainedScrutinee names True scope scrutinee
-    caseScrutinee (RetainedTypeSite names) scope scrutinee =
-      checkedRetainedScrutinee names False scope scrutinee
-    caseScrutinee _ _ _ = True
-
-    checkedRetainedScrutinee names diagnose scope scrutinee =
-      isJust (signatureCasePart scrutinee >>= retainedCaseScrutinee names (resolvePart diagnose scope))
-
-    resolveHead scope name
-      | all ((/= name) . unLoc . snd) scope = lookup name source_heads
-      | otherwise = Nothing
-
-    resolvePart diagnose scope name = case resolveHead scope name of
-      Just (Just (_, table)) -> Just (CasePartSource table)
-      Just Nothing | diagnose, not (namedWildcard name) -> Just (CasePartName NotPromoted name)
-      _ -> Nothing
-
-    retainedHeadUses site scope (L _ (XHsType (HsTypeCase _ _ scrutinee _)))
-      | not (null (retainedNames site)) =
-          retainedUses site scope (sourceCallHeads scrutinee)
-    retainedHeadUses site@RetainedTypeSite{} scope (L _ (XHsType (HsTypeLambda _ binders body))) =
-      retainedUses site scope (lambdaCallHeads binders body)
-    retainedHeadUses site@RetainedTypeSite{} scope (L _ (XHsType (HsTypeSome _ binder domain body))) =
-      retainedUses site scope (sumCallHeads binder domain body)
-    retainedHeadUses _ _ _ = ([], [])
-
-    retainedUses site scope calls =
-      let heads = [(v, entry) | v <- calls, Just entry <- [resolveHead scope (unLoc v)]]
-      in ( [(v, gre) | (v, Just (gre, _)) <- heads]
-         , [v | RetainedFieldTypeSite{} <- [site], (v, Nothing) <- heads
-              , not (namedWildcard (unLoc v))] )
-
-    retainedNames (RetainedTypeSite names) = names
-    retainedNames (RetainedFieldTypeSite names) = names
-    retainedNames _ = []
-
-    -- A case pattern can contain a wildcard. Keep the ordinary copy check
-    -- for the scrutinee and row expressions.
-    copyableCase scrutinee alts = copyable scrutinee && all copyableAlt alts
-      where
-        copyableAlt (L _ (HsTypeCaseAlt pat _ rhs)) =
-          isJust (classifyTypeCasePattern pat) && copyable rhs
-
-    innerScope site scope (HsForAllTy x tele body)
-      | signatureSite site
-      , Just locals <- forallCaptures tele
-      = let lift_lambda = signatureLambdaSite site && ordinaryErasedForall tele
-                          && isJust (extendLambdaForallScope scope locals) && spliceFree body
-        in Just (ForallTypeSite lift_lambda, locals, body, HsForAllTy x tele)
-      | site == FieldTypeSite
-      , ordinaryErasedForall tele
-      , Just locals <- forallCaptures tele
-      = Just (FieldTypeSite, locals, body, HsForAllTy x tele)
-    innerScope site _ (HsForEachTy x binders body)
-      | not (fieldSite site)
-      , not (localLambdaSite site)
-      , Just locals <- writtenCaptures binders
-      , not (null locals)
-      = Just (RetainedTypeSite (map (unLoc . snd) locals ++ retainedNames site), locals, body,
-              HsForEachTy x binders)
-    innerScope _ _ _ = Nothing
-
-    localLambdaSite LocalLambdaTypeSite{} = True
-    localLambdaSite _ = False
-
-    liftBody site owner scope whole@(L loc _) (salt, seen)
-      | Just (prefix, key) <- liftedAnchor site scope whole
-      , let exact_retained = filter (isJust . rdrNameExactName_maybe) (retainedNames site)
-            free = caseCaptures exact_retained whole
-            (heads, unbound) = retainedHeadUses site scope whole
-            written = Set.fromList (map (unLoc . fst) heads ++ map unLoc unbound)
-            (used, missing) = foldr (select exact_retained) ([], free `Set.difference` written) scope
-      , Set.null missing
-      , all (copyableCapture site whole) used
-      , Just check_formation <- localLambdaCheck site used whole
-      = case key >>= (`lookup` seen) of
-          Just occ -> (check_formation (applyAnchor site loc occ used), [], (salt + 1, seen))
-          Nothing ->
-            let occ = mkTcOcc (prefix ++ occNameString (rdrNameOcc (unLoc owner))
-                                 ++ ":" ++ helper_suffix salt)
-                name = L (l2l loc) (mkRdrUnqual occ)
-                -- The signature applies the helper to the original binders.
-                -- Bind fresh type variables in the copy of a quoted case.
-                copied = [ (rdr, mkRdrUnqual (mkTyVarOcc ("$quoted-case-capture:" ++ show i)))
-                         | (i, (_, v)) <- zip [0 :: Int ..] used
-                         , let rdr = unLoc v
-                         , isJust (rdrNameExactName_maybe rdr) ]
-                header = map (renameCaptures copied . fst) used
-                rhs = renameCaptures copied whole
-                alias = L loc (SynDecl noAnn name (mkHsQTvs header) Prefix rhs)
-                seen' = maybe seen (\k -> (k, occ) : seen) key
-                shared = do
-                  (share_key, captures, call_uses) <- sharedRetainedCaseKey site scope used whole key heads
-                  -- A shared alias also applies the family to its private formals.
-                  pure (share_key, renameCaptures copied captures, call_uses)
-                replacement = check_formation (applyAnchor site loc occ used)
-            in (replacement, [((alias, (occ, Nothing)), shared, unbound)], (salt + 1, seen'))
-    liftBody site owner scope (L loc quantified) (salt, seen)
-      | Just (inner, locals, body, rebuild) <- innerScope site scope quantified
-      , let names = map (unLoc . snd) locals
-      , null (findDupsEq (==) names)
-      , let (hidden, outer) = partition ((`elem` names) . unLoc . snd) scope
-      , Just (scope', saved) <- if inner == FieldTypeSite
-                                then rankedFieldScope scope hidden outer locals loc salt
-                                else Just (outer ++ locals, [])
-      = let (body', aliases, (next, _)) = liftBody inner owner scope' body (salt, [])
-            uses = Set.fromList (map unLoc (extractHsTyRdrTyVars body'))
-            save (old, new) ty
-              | unLoc new `Set.member` uses = bindTypeName new old ty
-              | otherwise = ty
-            result = foldr save (L loc (rebuild body')) saved
-        in (result, aliases, (next, seen))
-    liftBody site owner scope (L loc (HsFunTy ann arrow arg result)) state =
-      let (arg', arg_aliases, next) = liftBody site owner scope arg state
-          (result', result_aliases, end) = liftBody site owner scope result next
-      in (L loc (HsFunTy ann arrow arg' result'), arg_aliases ++ result_aliases, end)
-    liftBody site owner scope (L loc (HsQualTy ann ctxt body)) state =
-      let (body', aliases, next) = liftBody site owner scope body state
-      in (L loc (HsQualTy ann ctxt body'), aliases, next)
-    liftBody site owner scope (L loc (HsKindSig ann body kind)) state =
-      let (body', aliases, next) = liftBody site owner scope body state
-      in (L loc (HsKindSig ann body' kind), aliases, next)
-    liftBody site owner scope ty state = liftTypeChildren (liftBody site owner scope) ty state
-
-    -- See Note [Checking local lambda captures] in GHC.Tc.Gen.HsType.
-    localLambdaCheck (LocalLambdaTypeSite local) captures
-                     (L loc (XHsType (HsTypeLambda _ binders body)))
-      | any inferred capture_names = do
-          guard (ordinaryLambdaBody body)
-          pure (L loc . XHsType . HsTypeLambdaCheck binders body)
-      where
-        capture_names = [unLoc name
-                        | (L _ HsTvb{tvb_kind = HsBndrNoKind{}}, name) <- captures]
-        inferred name = isJust (lookup name (localLambdaArguments local))
-    localLambdaCheck _ _ _ = Just id
-
-    applyAnchor site loc occ captures =
-      applyCaseAlias loc (mkRdrUnqual occ) $ case site of
-        LocalLambdaTypeSite local ->
-          let actuals = localLambdaArguments local
-          in [(header, fmap (\rdr -> fromMaybe rdr (lookup rdr actuals)) name)
-             | (header, name) <- captures]
-        _ -> captures
-    applyCaseAlias loc name = foldl' (\f (_, v) -> L loc (HsAppTy noExtField f (typeName v)))
-                                    (typeName (L (l2l loc) name))
-
-    select exact_retained pair@(binder, name) (captures, used)
-      | unLoc name `Set.member` used
-      = (pair : captures, Set.delete (unLoc name) used `Set.union` kindNamesWith exact_retained binder)
-      | otherwise = (captures, used)
-
-    kindNames binder = kindNamesWith [] binder
-
-    kindNamesWith exact_retained (L _ HsTvb{tvb_kind = HsBndrKind _ kind}) =
-      caseCaptures exact_retained kind
-    kindNamesWith _ _ = Set.empty
-
-    -- TH IndexVarT supplies an exact term Name. The ordinary type-variable
-    -- extractor omits that namespace. Recover only names in this telescope.
-    caseCaptures exact_retained ty =
-      Set.fromList (map unLoc (extractHsTyRdrTyVars ty) ++ exactUses ty)
-      where
-        exactUses :: Data a => a -> [RdrName]
-        exactUses node
-          | null exact_retained = []
-          | Just rdr <- cast node = [rdr | rdr `elem` exact_retained]
-          | otherwise = concat (gmapQ exactUses node)
-
-    copyableCapture site (L _ ty) (binder, name) =
-      copyable binder && case ty of
-        XHsType HsTypeCase{} -> copyableRetainedKind
-        XHsType HsTypeLambda{} -> copyableRetainedKind
-        XHsType HsTypeSome{} | RetainedTypeSite{} <- site -> copyableRetainedKind
-        _ -> True
-      where
-        copyableRetainedKind = unLoc name `notElem` retainedNames site
-                            || hasWrittenKind binder && copyableDomain binder
-
-    copyableDomain :: Data a => a -> Bool
-    copyableDomain node = case cast node :: Maybe (LHsType GhcPs) of
-      Just (L _ HsFunTy{}) -> False
-      Just (L _ HsOpTy{}) -> False
-      Just (L _ HsForAllTy{}) -> False
-      Just (L _ HsForEachTy{}) -> False
-      _ -> and (gmapQ copyableDomain node)
-
-    sharedRetainedCaseKey (RetainedTypeSite names) scope used
-      (L _ (XHsType (HsTypeCase _ _ _ alts))) (Just (scrutinee, rows)) heads
-      | let indices = map (unLoc . snd) used
-      , all (`elem` names) indices
-      , Just domains <- traverse (closedDomain . fst) used
-      , Just scrutinee_key <- retainedCaseScrutinee indices (resolvePart False scope) scrutinee
-      , all closedRow alts
-      = Just ((domains, scrutinee_key, rows), used, heads)
-    sharedRetainedCaseKey _ _ _ _ _ _ = Nothing
-
-    closedDomain (L _ HsTvb{tvb_kind = HsBndrKind _ domain})
-      | null (extractHsTyRdrTyVars domain) = signatureCasePart domain
-    closedDomain _ = Nothing
-
-    closedRow (L _ (HsTypeCaseAlt pat _ rhs)) =
-      case classifyTypeCasePattern pat of
-        Just (_, []) -> null (extractHsTyRdrTyVars rhs)
-        _ -> False
-
--- | Check the type forms allowed in a lambda body with no inner binders.
-ordinaryLambdaBody :: LHsType GhcPs -> Bool
-ordinaryLambdaBody (L _ ty) = case ty of
-  HsTyVar{} -> True
-  HsTyLit{} -> True
-  HsStarTy{} -> True
-  HsAppTy _ fun arg -> ordinaryLambdaBody fun && ordinaryLambdaBody arg
-  HsAppKindTy _ fun kind -> ordinaryLambdaBody fun && ordinaryLambdaBody kind
-  HsFunTy _ (HsModifiedFunArr _ mods _) arg res ->
-    all (\(L _ (HsModifier _ m)) -> ordinaryLambdaBody m) mods &&
-    ordinaryLambdaBody arg && ordinaryLambdaBody res
-  HsOpTy _ lhs _ rhs -> ordinaryLambdaBody lhs && ordinaryLambdaBody rhs
-  HsParTy _ body -> ordinaryLambdaBody body
-  HsKindSig _ body kind -> ordinaryLambdaBody body && ordinaryLambdaBody kind
-  HsListTy _ elt -> ordinaryLambdaBody elt
-  HsTupleTy _ _ fields -> all ordinaryLambdaBody fields
-  HsExplicitListTy _ _ fields -> all ordinaryLambdaBody fields
-  HsExplicitTupleTy _ _ fields -> all ordinaryLambdaBody fields
-  _ -> False
-
--- | Find application heads that a binder-free lambda body can inherit.
-lambdaCallHeads :: [LocatedN RdrName] -> LHsType GhcPs -> [LocatedN RdrName]
-lambdaCallHeads binders = walk
-  where
-    walk :: Data a => a -> [LocatedN RdrName]
-    walk node = here ++ concat (gmapQ walk node)
-      where
-        here
-          | Just (L _ (HsAppTy _ fun _)) <- cast node :: Maybe (LHsType GhcPs)
-          , L _ (HsTyVar _ NotPromoted name) <- ignoreParens fun
-          , unLoc name `notElem` map unLoc binders = [name]
-          | otherwise = []
-
--- | Find source calls in the witness domain and in its scoped payload.
-sumCallHeads :: LocatedN RdrName -> LHsType GhcPs -> LHsType GhcPs -> [LocatedN RdrName]
-sumCallHeads binder domain body = lambdaCallHeads [] domain ++ lambdaCallHeads [binder] body
-
--- | The case syntax compared within a single signature.
-data SignatureCasePart
-  = CasePartName PromotionFlag RdrName
-  | CasePartApp SignatureCasePart SignatureCasePart
-  | CasePartCapture Int
-  | CasePartSource Name
-  | CasePartWildcard
-  deriving Eq
-
--- | Admit applications of global names and normalize retained operands.
-retainedCaseScrutinee :: [RdrName] -> (RdrName -> Maybe SignatureCasePart)
-                      -> SignatureCasePart -> Maybe SignatureCasePart
-retainedCaseScrutinee names resolve scrutinee = do
-  checked <- operand scrutinee
-  guard (hasCapture checked)
-  pure checked
-  where
-    operand (CasePartName NotPromoted name)
-      | Just i <- elemIndex name names = Just (CasePartCapture i)
-    operand (CasePartApp fun arg) = CasePartApp <$> application fun <*> operand arg
-    operand name = global name
-
-    application (CasePartApp fun arg) = CasePartApp <$> application fun <*> operand arg
-    application (CasePartName NotPromoted name)
-      | Just part <- resolve name = Just part
-    application name = global name
-
-    global part@(CasePartName _ name)
-      | isQual name || isRdrTc name || isRdrDataCon name = Just part
-    global _ = Nothing
-
-    hasCapture CasePartCapture{} = True
-    hasCapture (CasePartApp fun arg) = hasCapture fun || hasCapture arg
-    hasCapture _ = False
-
--- | Locate the written heads of applications in a case scrutinee.
-sourceCallHeads :: LHsType GhcPs -> [LocatedN RdrName]
-sourceCallHeads = spine []
-  where
-    spine args ty = case unLoc (ignoreParens ty) of
-      HsAppTy _ fun arg -> spine (arg : args) fun
-      HsTyVar _ NotPromoted name | not (null args) -> name : concatMap sourceCallHeads args
-      _ -> []
-
--- | Find a checked source family or an absent unqualified field head.
-retainedSourceHeads :: [LSig GhcPs] -> [TyClGroup GhcPs]
-                    -> RnM [(RdrName, Maybe (GlobalRdrElt, Name))]
-retainedSourceHeads sigs type_groups = do
-  envs@(global, local) <- getRdrEnvs
-  let signature_heads = Set.fromList
-        [unLoc v | L _ (TypeSig _ _ _ sig) <- sigs
-                 , v <- caseCallHeads sig ++ retainedSignatureCallHeads False sig]
-      field_heads = Set.fromList
-        [unLoc v | grp <- type_groups
-                 , L _ DataDecl{tcdDataDefn = HsDataDefn{dd_cons = cs}} <- group_tyclds grp
-                 , L _ ConDeclGADT{con_g_args = args, con_res_ty = res} <- toList cs
-                 , v <- retainedFieldCallHeads args res]
-  fmap catMaybes $ forM (Set.toList (Set.union signature_heads field_heads)) $ \rdr ->
-    case demoteRdrNameTv rdr of
-      Just term
-        | not (elemLocalRdrEnv rdr local || elemLocalRdrEnv term local)
-        , null (lookupGRE global (LookupRdrName rdr (RelevantGREsFOS WantNormal)))
-        -> do
-          -- Use the same lookup as ordinary calls. Keep an existing name
-          -- without a checked table separate from an absent name.
-          candidates <- lookupSourceTables False envs term
-          pure $ case candidates of
-            [(gre, Just table)] -> Just (rdr, Just (gre, table))
-            [] | isUnqual rdr, Set.member rdr field_heads -> Just (rdr, Nothing)
-            _ -> Nothing
-      _ -> pure Nothing
-
--- | Inspect case expressions only in constructor types with a retained binder.
-retainedFieldCallHeads :: HsConDeclGADTDetails GhcPs -> LHsType GhcPs -> [LocatedN RdrName]
-retainedFieldCallHeads args result = concatMap heads (result : fields)
-  where
-    heads ty | hsHasForEachTy (unLoc ty) = caseCallHeads ty
-             | otherwise = []
-    fields = case args of
-      PrefixConGADT _ xs -> map cdf_type xs
-      RecConGADT _ xs -> [cdf_type (cdrf_spec field) | L _ field <- unLoc xs]
-
--- | Collect the written application heads in type case scrutinees.
-caseCallHeads :: Data a => a -> [LocatedN RdrName]
-caseCallHeads node = here ++ concat (gmapQ caseCallHeads node)
-  where
-    here = case cast node :: Maybe (LHsType GhcPs) of
-      Just (L _ (XHsType (HsTypeCase _ _ scrutinee _))) -> sourceCallHeads scrutinee
-      _ -> []
-
--- | Collect source calls in lifted types below a retained telescope.
-retainedSignatureCallHeads :: Data a => Bool -> a -> [LocatedN RdrName]
-retainedSignatureCallHeads retained node = case cast node :: Maybe (LHsType GhcPs) of
-  Just (L _ HsForEachTy{hst_body = body}) -> retainedSignatureCallHeads True body
-  Just (L _ HsSpliceTy{}) -> []
-  Just (L _ (XHsType (HsTypeLambda _ binders body)))
-    | retained && ordinaryLambdaBody body -> lambdaCallHeads binders body
-    | otherwise -> []
-  Just (L _ (XHsType (HsTypeSome _ binder domain body)))
-    | retained, ordinaryLambdaBody domain, ordinaryLambdaBody body -> sumCallHeads binder domain body
-    | otherwise -> []
-  _ -> concat (gmapQ (retainedSignatureCallHeads retained) node)
-
--- | The scrutinee followed by the pattern and result in each source row.
-type SignatureCaseKey = (SignatureCasePart, [(SignatureCasePart, SignatureCasePart)])
-
--- | Compare capture domains, the scrutinee and the ordered rows.
-type RetainedCaseKey = ([SignatureCasePart], SignatureCasePart,
-                        [(SignatureCasePart, SignatureCasePart)])
-
--- | Only reuse a retained capture case across splice expansions when its
--- names have fixed identities. See Note [Lifting cases from signature splices].
-stableSplicedCase :: RetainedCaseKey -> Bool
-stableSplicedCase (domains, CasePartCapture _, rows) =
-  all stable domains && all (\(pat, rhs) -> stable pat && stable rhs) rows
-  where
-    stable (CasePartName _ name) =
-      isJust (isOrig_maybe name) || maybe False isExternalName (rdrNameExactName_maybe name)
-    stable (CasePartApp fun arg) = stable fun && stable arg
-    stable CasePartWildcard = True
-    stable _ = False
-stableSplicedCase _ = False
-
--- | Compare spellings and branch order, ignoring source locations and parentheses.
-signatureCaseKey :: LHsType GhcPs -> [LocatedA HsTypeCaseAlt] -> Maybe SignatureCaseKey
-signatureCaseKey scrutinee alts = (,) <$> signatureCasePart scrutinee <*> traverse alternative alts
-  where
-    alternative (L _ (HsTypeCaseAlt pat _ rhs)) =
-      (,) <$> signatureCasePart pat <*> signatureCasePart rhs
-
--- | Compare parsed names and applications in a signature case or closed domain.
-signatureCasePart :: LHsType GhcPs -> Maybe SignatureCasePart
-signatureCasePart (L _ (HsTyVar _ promotion name)) = Just (CasePartName promotion (unLoc name))
-signatureCasePart (L _ (HsAppTy _ f x)) = CasePartApp <$> signatureCasePart f <*> signatureCasePart x
-signatureCasePart (L _ (HsParTy _ ty)) = signatureCasePart ty
-signatureCasePart (L _ HsWildCardTy{}) = Just CasePartWildcard
-signatureCasePart _ = Nothing
-
-{- Note [Lifting type cases]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Use a checked closed family to match a type case. Each source branch
-becomes one equation. A constructor pattern tests the scrutinee. A
-variable or wildcard accepts it when the earlier tests permit that row.
-See Note [Publishing ordered type cases] in GHC.Tc.TyCl. Keep lexical captures as
-additional arguments. Hide a captured argument's name in any branch
-where a pattern binds that spelling. Put the family and its owner in
-the same kind-checking SCC when they need to share kind inference.
-
-Lift a case from the RHS of a closed family equation using the
-equation's binders. An implicit equation binds the variables in its
-patterns. An explicit forall supplies its own scope. Give each
-equation fresh helpers. Leave the original patterns in place so the
-usual scoping, overlap and termination checks still apply.
-
-An untyped declaration quote keeps the case in its source signature,
-synonym or field. The quote emits CaseT with its local names. Lift the
-case when the declarations enter the splice's checking group.
-
-For a case in a let body, put the RHS in one private type synonym.
-The original let and the branch rows use that checked synonym at the
-corresponding lexical captures. Keep earlier captures needed by the
-kinds of those variables. Each row uses its own capture parameters,
-even if a pattern binds a variable with the same source name. Give
-cases in the scrutinee the same alias environment. A new let extends
-it only after checking its RHS in the original lexical scope. The
-helper fragment accepts references to the synonym's parameters.
-An inner let can refer to an earlier let through its existing helper.
-Copy the earlier helper's capture arguments into the inner helper's
-telescope. Use the nearest alias for each written name. A restored
-alias can shadow a capture that another alias needs, so save that
-capture under a fresh name before restoring the aliases.
-An inferred kind parameter must be determined by a checked capture.
-For an infix RHS, a backticked operator can itself be a bound type
-variable. Keep the parsed application so the renamer still resolves
-the operator's fixity in the original scope. A captured operator can have a
-function kind. Include variables from arrow modifiers when collecting
-the captures of that kind or of a function RHS.
-See Note [Checked RHSs for cases in type lets] in GHC.Tc.TyCl.
-
-A case result needed by a later case is a visible argument of the later
-family. Leave the first application in the original let. A checked RHS
-synonym would have to expose that application before the same
-kind-checking group publishes the first family's equations.
-Follow free uses through ordinary alias RHSs. This also finds a case
-result that a later row uses through several local names. A shadowed
-capture can still be needed by a preceding alias. Give it a private
-name and keep its argument position for that alias. Also keep it when
-a later capture's kind uses it. Rename that occurrence in the copied
-kind before adding the new binder. The written RHS still uses the
-enclosing scope.
-
-Both sides of a function arrow have the arrow's lexical scope.
-Lift each side with the same captures. Keep the original arrow and
-its modifiers for the arrow checker.
-
-Keep an invisible forall in place and copy its binders, in order, to
-the family header. The application uses the original variables inside
-the forall, so their skolems stay in scope.
-
-A dependent binder needs the generalized family kind when checking the
-owner's application. Use the actual declaration dependencies for that
-family. If there is no cycle, normal kind checking generalizes the family
-before the owner uses it. A real cycle keeps the usual restrictions on
-polymorphic recursion. Copy the written kind of the scrutinee from its
-binder. A kind annotation on the case also gives the family its result
-kind. See Note [Result kinds of dependent type cases] in GHC.Tc.TyCl.
-
-An ordinary case can use a written result kind, including a kind
-signature on a let RHS. Copy that kind to the family so its equations
-check at the written kind. Use the actual declaration dependencies
-so a result kind with a captured variable can generalize before use.
-The kind can use earlier let bindings. Restore those aliases using
-the same capture substitution as an ordinary let RHS. The family
-header needs the preceding helpers before it checks the equations.
-Use the actual declaration dependencies for this annotated let chain.
-An unannotated case keeps the shared kind inference of its owner.
-
-A named scrutinee can also depend on an earlier binder of the synonym.
-Generalize the family before checking the synonym when the captures
-form a telescope. Its initial monomorphic kind would leave the capture
-variables free. For `(b :: Bool) (d :: Gate (Index b))`, checking
-the application would then require equality of family applications at
-different `b` variables. The generalized family substitutes the
-supplied `b`. Infer the scrutinee kind from the rows as before.
-This lets the patterns match at an abstract index and keeps `Index b`
-out of their constructor arguments.
-See Note [No polymorphic recursion in type decls] in GHC.Tc.TyCl.
-
-Stop if a binder shadows a capture, including a kind variable in its
-header. The name in the copied header must keep its original meaning.
-Stop in an active case-let alias environment. The alias bindings belong
-to the outer case and can shadow names in the copied telescope.
--}
--- | Private names with optional edges back to their kind-checking owners.
-type LiftedDecls = [(OccName, Maybe OccName)]
-
-liftTypeCases :: HsGroup GhcPs -> (HsGroup GhcPs, LiftedDecls)
-liftTypeCases group =
-  let (groups, hidden) = unzip (map liftGroup (hs_tyclds group))
-  in (group { hs_tyclds = groups }, concat hidden)
-  where
-    liftGroup decls =
-      let (defs, lifted) = unzip (map liftDecl (group_tyclds decls))
-          (families, hidden) = unzip (concat lifted)
-      in (decls { group_tyclds = defs ++ families }, hidden)
-
-    liftDecl (L loc syn@SynDecl{tcdLName = owner, tcdRhs = rhs,
-                                tcdTyVars = HsQTvs{hsq_explicit = params}})
-      | Just captures <- traverse capture params
-      = let (rhs', cases, _) = liftRhs owner False captures [] rhs (0 :: Int)
-        in (L loc syn{tcdRhs = rhs'}, cases)
-    liftDecl (L loc decl@FamDecl{tcdFam = family@FamilyDecl
-                  { fdLName = owner, fdInfo = ClosedTypeFamily ann (Just rows) }}) =
-      let (_, results) = mapAccumL (liftEquation owner) (0 :: Int) rows
-          (rows', lifted) = unzip results
-      in (L loc decl{tcdFam = family{fdInfo = ClosedTypeFamily ann (Just rows')}},
-          concat lifted)
-    liftDecl decl = (decl, [])
-
-    liftEquation owner salt (L loc eqn@FamEqn{feqn_bndrs = outer, feqn_pats = pats,
-                                              feqn_rhs = rhs})
-      | let binders = familyEquationBinders outer (nubN (extractHsTyArgRdrKiTyVars pats))
-      , Just scoped <- traverse capture binders
-      , all (\(binder, _, _) -> spliceFree binder) scoped
-      = let used = usedEquationCaptures rhs [(binder, name) | (binder, name, _) <- scoped]
-            (rhs', cases, next) = liftRhs owner False
-                                    [(binder, name, name) | (binder, name) <- used] [] rhs salt
-        in (next, (L loc eqn{feqn_rhs = rhs'}, cases))
-    liftEquation _ salt row = (salt, (row, []))
-
-    liftRhs owner independent captures aliases (L loc (XHsType (HsTypeCase _ _ scrutinee alts))) salt
-      | Just patterns <- traverse checkAlt alts
-      , Just scrut_kind <- caseScrutineeKind independent captures scrutinee
-      = liftCase owner independent captures aliases loc (scrutinee, scrut_kind) Nothing patterns salt
-    liftRhs owner independent captures aliases (L loc (HsKindSig ann body kind)) salt
-      | L case_loc (XHsType (HsTypeCase _ _ scrutinee alts)) <- ignoreParens body
-      , Just patterns <- traverse checkAlt alts
-      , Just scrut_kind <- caseScrutineeKind independent captures scrutinee
-      , Just result_kind <- caseResultKind captures aliases kind
-      = let (body', cases, next) = liftCase owner independent captures aliases case_loc
-                                   (scrutinee, scrut_kind) (Just result_kind) patterns salt
-        in (L loc (HsKindSig ann body' kind), cases, next)
-    liftRhs owner independent captures aliases
-      (L loc (XHsType let_ty@(HsTypeLet ann _ _ binds result_ty))) salt
-      | not independent
-      , let (binder, rhs, body) = splitHsTypeLet binds result_ty
-            captures_result = Set.member (unLoc binder) (fst (caseCaptureUses body))
-            body_aliases = filter (\(_, v, _, _) -> unLoc v /= unLoc binder) aliases
-      , orderedCase rhs || annotatedCase rhs || not captures_result
-      , isJust (letCaseBody body)
-      , let (rhs', rhs_cases, rhs_end) = liftRhs owner False captures aliases rhs salt
-      , Just (outer, saved) <- caseBodyCaptures captures body_aliases binder captures_result salt
-      , let (body', body_cases, next) = liftRhs owner False outer body_aliases body rhs_end
-      , not (null body_cases)
-      , captures_result || all (not . mentionsBinder (unLoc binder) . fst) body_cases
-      = let result = letTy loc ann binder rhs' body'
-            scoped = case saved of
-              Nothing -> result
-              Just (name, previous) -> letTy loc ann name (typeName previous) result
-        in (preserveTypeLetSource let_ty scoped,
-          rhs_cases ++ body_cases, next)
-    liftRhs owner independent captures aliases
-      (L loc (XHsType let_ty@(HsTypeLet ann _ _ binds result_ty))) salt
-      | not independent
-      , let (binder, rhs, body) = splitHsTypeLet binds result_ty
-      , Just annotated <- letCaseBody body
-      , Just (used, references) <- rhsCaptures captures aliases rhs
-      , let owner_occ = rdrNameOcc (unLoc owner)
-            occ = mkTcOcc ("$case-let-rhs:" ++ occNameString owner_occ ++ ":" ++ show salt)
-            name = L (l2l (getLoc rhs)) (mkRdrUnqual occ)
-            helper_rhs = restoreRhs ann used references rhs
-            helper = L loc (SynDecl noAnn name
-                       (HsQTvs noExtField [header | (_, (header, _, _)) <- used]) Prefix helper_rhs)
-            rhs_ref = applyType loc name [typeName v | (_, (_, _, v)) <- used]
-            saved = L (getLoc binder) (mkRdrUnqual (mkTyVarOcc ("$case-let-outer:" ++ show salt)))
-            shadowed (_, _, current) = unLoc current == unLoc binder
-            hide capture@(header, v, _)
-              | shadowed capture = (header, v, saved)
-              | otherwise = capture
-            branch_binding = (ann, binder, name, map fst used)
-            (body', generated, next) = liftRhs owner False (map hide captures)
-                (aliases ++ [branch_binding]) body (salt + 1)
-      , not (null generated)
-      = let result = letTy loc ann binder rhs_ref body'
-            result'
-              | any shadowed captures = letTy loc ann saved (typeName binder) result
-              | otherwise = result
-            helper_owner = if annotated then Nothing else Just owner_occ
-        in (preserveTypeLetSource let_ty result', (helper, (occ, helper_owner)) : generated, next)
-    liftRhs owner False captures aliases (L loc (XHsType let_ty@(HsTypeLet ann _ _ binds result_ty))) salt =
-      let (v, rhs, body) = splitHsTypeLet binds result_ty
-          (rhs', cases, next) = liftRhs owner False captures aliases rhs salt
-      in (preserveTypeLetSource let_ty (letTy loc ann v rhs' body), cases, next)
-    liftRhs owner independent captures aliases (L loc (HsFunTy ann arrow domain result)) salt =
-      let (domain', domain_cases, next) = liftRhs owner independent captures aliases domain salt
-          (result', result_cases, end) = liftRhs owner independent captures aliases result next
-      in (L loc (HsFunTy ann arrow domain' result'), domain_cases ++ result_cases, end)
-    liftRhs owner independent captures aliases
-      (L loc quantified@HsForAllTy
-        { hst_tele = HsForAllInvis { hsf_matchability = Nothing, hsf_invis_bndrs = binders }
-        , hst_body = body }) salt
-      | null aliases
-      , Just locals <- traverse (capture . fmap (updateHsTyVarBndrFlag (const (HsBndrRequired noExtField)))) binders
-      , let (implicit, _) = hsQTyVarKindOccs [h | (h, _, _) <- captures] []
-            kind_scope = [unLoc name | (_, name, _) <- captures]
-            mentions = concatMap (fromMaybe [] . captureKindNames) locals
-      , all (`notElem` map unLoc implicit) [unLoc name | (_, name, _) <- locals]
-      , all (`elem` mentions) [unLoc name | (L _ HsTvb{tvb_kind = HsBndrNoKind{}}, name, _) <- locals]
-      , Just _ <- foldM extendForall kind_scope locals
-      = let separate = independent || not (null mentions)
-            (body', cases, next) = liftRhs owner separate (captures ++ locals) aliases body salt
-        in (L loc quantified{hst_body = body'}, cases, next)
-    liftRhs owner independent captures aliases ty salt =
-      liftTypeChildren (liftRhs owner independent captures aliases) ty salt
-
-    liftCase owner independent captures aliases loc (scrutinee, scrut_kind) result_kind patterns salt =
-      let owner_occ = rdrNameOcc (unLoc owner)
-          suffix = if independent then "-forall" else ""
-          occ = mkTcOcc ("$case:" ++ occNameString owner_occ ++ ":" ++ show salt ++ suffix)
-          name = L (getLoc owner) (mkRdrUnqual occ)
-          scrut_var = L (getLoc owner) (mkRdrUnqual (mkTyVarOcc "$scrutinee"))
-          scrut_binder = L loc (HsTvb noAnn (HsBndrRequired noExtField)
-                         (HsBndrVar noExtField scrut_var) scrut_kind)
-          eqns = map (branch owner name captures aliases) patterns
-          fam = L loc (FamDecl noExtField
-                  (FamilyDecl noAnn (ClosedTypeFamily noAnn (Just eqns)) TopLevel
-                     name (HsQTvs noExtField ([h | (h, _, _) <- captures] ++ [scrut_binder]))
-                     Prefix (L (l2l loc) (maybe (NoSig noExtField) (KindSig noExtField) result_kind)) Nothing))
-          (scrutinee', nested, next) = liftRhs owner independent captures aliases scrutinee (salt + 1)
-          result = applyType loc name ([typeName v | (_, _, v) <- captures] ++ [scrutinee'])
-          separate = independent || isJust result_kind ||
-                     (null aliases && dependentScrutinee captures scrutinee)
-      in (result, (fam, (occ, if separate then Nothing else Just owner_occ)) : nested, next)
-
-    dependentScrutinee captures scrutinee
-      | Just (HsBndrKind _ kind) <- caseScrutineeKind True captures scrutinee
-      , Just (_:_) <- lexicalNames kind
-      , Just _ <- foldM extendForall [] captures
-      = True
-    dependentScrutinee _ _ = False
-
-    caseScrutineeKind False _ _ = Just (HsBndrNoKind noExtField)
-    caseScrutineeKind True captures scrutinee
-      | L _ (HsTyVar _ NotPromoted name) <- ignoreParens scrutinee
-      , [kind] <- [kind | (L _ HsTvb{tvb_kind = HsBndrKind _ kind}, _, bound) <- captures
-                        , unLoc name == unLoc bound]
-      = Just (HsBndrKind noExtField kind)
-    caseScrutineeKind _ _ _ = Nothing
-
-    letTy loc ann v rhs body = L loc (XHsType (mkHsSingleTypeLet ann v rhs body))
-    applyType loc name = foldl' (\f x -> L loc (HsAppTy noExtField f x)) (typeName name)
-
-    -- A name used only as a scrutinee argument need not be in the family.
-    -- A branch that uses the name needs an explicit capture.
-    mentionsBinder :: Data a => RdrName -> a -> Bool
-    mentionsBinder name node
-      | Just rdr <- cast node = name == rdr
-      | otherwise = or (gmapQ (mentionsBinder name) node)
-
-    caseBodyCaptures captures aliases binder captures_result salt =
-      case break shadows captures of
-        (_, []) -> Just (withResult captures, Nothing)
-        (earlier, (L loc header@HsTvb{tvb_var = HsBndrVar ann _}, _, current) : later)
-          | all (not . shadows) later -> do
-              -- The kind fragment checked here has no local binders.
-              kinds <- concat <$> traverse captureKindNames later
-              if null aliases && unLoc binder `notElem` kinds
-                then Just (withResult (earlier ++ later), Nothing)
-                else do
-                  let saved = L (getLoc binder)
-                        (mkRdrUnqual (mkTyVarOcc ("$case-let-shadow:" ++ show salt)))
-                      save = unLoc current == unLoc binder
-                      actual = if save then saved else current
-                      binding = if save then Just (saved, current) else Nothing
-                      renamed = (L loc header{tvb_var = HsBndrVar ann saved}, saved, actual)
-                      rest = map (renameCaptureKind saved) later
-                  pure (withResult (earlier ++ (renamed : rest)), binding)
-        _ -> Nothing
-      where
-        shadows (_, v, _) = unLoc v == unLoc binder
-        withResult cs = cs ++ [(liftedTypeVarBinder binder, binder, binder) | captures_result]
-        renameCaptureKind saved (L loc header@HsTvb{tvb_kind = kind}, name, actual) =
-          (L loc header{tvb_kind = renameCaptures [(unLoc binder, unLoc saved)] kind}, name, actual)
-
-    -- Follow an ordered chain to a case, including cases in binding RHSs.
-    -- A written result kind needs the preceding helpers before checking the
-    -- family's header.
-    letCaseBody ty
-      | orderedCase ty = Just False
-      | annotatedCase ty = Just True
-      | L _ (XHsType (HsTypeLet _ _ _ binds result_ty)) <- ignoreParens ty
-      = let (_, rhs, body) = splitHsTypeLet binds result_ty
-        in if orderedCase rhs
-           then Just False
-           else if annotatedCase rhs
-                then Just True
-                else lexicalNames rhs >> letCaseBody body
-      | otherwise = Nothing
-
-    orderedCase ty
-      | L _ (XHsType (HsTypeCase _ _ _ alts)) <- ignoreParens ty
-      = all (isJust . checkAlt) alts
-      | otherwise = False
-
-    annotatedCase ty
-      | L _ (HsKindSig _ body _) <- ignoreParens ty = orderedCase body
-      | otherwise = False
-
-    caseResultKind captures [] kind = do
-      mentions <- lexicalNames kind
-      guard (all (`elem` [unLoc name | (_, name, _) <- captures]) mentions)
-      pure kind
-    caseResultKind captures aliases kind = do
-      (used, references) <- rhsCaptures captures aliases kind
-      pure (restoreRhs noAnn used references kind)
-
-    -- Include the captures of every referenced alias, and their kinds.
-    rhsCaptures captures aliases rhs = do
-      names <- lexicalNames rhs
-      let named alias (_, v, _, _) = alias == unLoc v
-          resolve n = find (named n) (reverse aliases)
-          references = mapMaybe resolve (nub names)
-          transitive = concat [indices | (_, _, _, indices) <- references]
-          direct = [n | n <- names, not (any (named n) references)]
-          numbered = zip [0 :: Int ..] captures
-          names' = direct ++ [unLoc v | (i, (_, v, _)) <- numbered, i `elem` transitive]
-      needed <- foldr captureKind (Just names') captures
-      let available = [unLoc n | (_, n, _) <- captures]
-      guard (all (`elem` available) needed)
-      pure ([pair | pair@(_, (_, v, _)) <- numbered, unLoc v `elem` needed], references)
-
-    -- Keep capture variables visible to later alias applications.
-    restoreRhs ann used references rhs = foldr save restored arguments
-      where
-        loc = getLoc rhs
-        alias_names = [unLoc v | (_, v, _, _) <- references]
-        arguments = [(i, v, argument i v) | (i, (_, v, _)) <- used]
-        argument i v
-          | unLoc v `elem` alias_names =
-              L (getLoc v) (mkRdrUnqual (mkTyVarOcc ("$case-let-argument:" ++ show i)))
-          | otherwise = v
-        save (_, original, saved) body
-          | unLoc original /= unLoc saved = letTy loc ann saved (typeName original) body
-          | otherwise = body
-        restored = foldr restore rhs references
-        restore (alias_ann, binder, helper, indices) =
-          letTy loc alias_ann binder
-            (applyType loc helper [typeName v | (i, _, v) <- arguments, i `elem` indices])
-
-    captureKind (L _ HsTvb{tvb_kind = HsBndrKind _ kind}, v, _) inside = do
-      names <- inside
-      if unLoc v `elem` names then (names ++) <$> lexicalNames kind else pure names
-    captureKind _ inside = inside
-
-    lexicalNames (L _ (HsTyVar _ _ n))
-      | isTvOcc (rdrNameOcc (unLoc n)) = Just [unLoc n]
-      | otherwise = Just []
-    lexicalNames (L _ (HsAppTy _ f x)) = (++) <$> lexicalNames f <*> lexicalNames x
-    lexicalNames (L _ (HsOpTy _ left op right)) = concat <$> traverse lexicalNames [left, op, right]
-    lexicalNames (L _ (HsFunTy _ (HsModifiedFunArr _ mods _) domain result)) =
-      concat <$> traverse lexicalNames (domain : [ty | L _ (HsModifier _ ty) <- mods] ++ [result])
-    lexicalNames (L _ HsStarTy{}) = Just []
-    lexicalNames (L _ (HsParTy _ ty)) = lexicalNames ty
-    lexicalNames (L _ (HsExplicitListTy _ _ tys)) = concat <$> traverse lexicalNames tys
-    lexicalNames (L _ (HsTupleTy _ HsBoxedOrConstraintTuple tys)) = concat <$> traverse lexicalNames tys
-    lexicalNames (L _ (HsExplicitTupleTy _ _ tys)) = concat <$> traverse lexicalNames tys
-    lexicalNames (L _ (HsKindSig _ ty kind)) = (++) <$> lexicalNames ty <*> lexicalNames kind
-    lexicalNames (L _ HsTyLit{}) = Just []
-    lexicalNames _ = Nothing
-
-    capture b@(L _ (HsTvb _ (HsBndrRequired _) (HsBndrVar _ n) _)) = Just (b, n, n)
-    capture _ = Nothing
-
-    captureKindNames (L _ HsTvb{tvb_kind = HsBndrKind _ kind}, _, _) = lexicalNames kind
-    captureKindNames _ = Just []
-
-    extendForall names binder@(_, name, _) = do
-      mentions <- captureKindNames binder
-      extendForallNames names (unLoc name) mentions
-
-    checkAlt (L loc (HsTypeCaseAlt pat _ rhs)) = do
-      (pat', bound) <- classifyTypeCasePattern pat
-      pure (loc, pat', bound, rhs)
-
-    branch owner name captures aliases (loc, pat, bound, rhs) =
-      let alias_names = [unLoc v | (_, v, _, _) <- aliases]
-          capture_name index (_, n@(L name_loc var), _)
-            | var `elem` bound || var `elem` alias_names =
-                L name_loc (mkRdrUnqual (mkTyVarOcc ("$case-capture:" ++ show index)))
-            | otherwise = n
-          capture_names = zipWith capture_name [0 :: Int ..] captures
-          captured = map typeName capture_names
-          pats = captured ++ [pat]
-          branch_rhs = foldr restore rhs aliases
-          body = L (getLoc branch_rhs)
-                   (XHsType (HsTypeCaseAlias (map unLoc capture_names)
-                             (owner, length captures, Nothing) branch_rhs))
-          restore (ann, binder, helper, indices) rest
-            | unLoc binder `notElem` bound =
-                letTy (getLoc rhs) ann binder
-                  (applyType (getLoc rhs) helper
-                    [v | (i, v) <- zip [0 :: Int ..] captured, i `elem` indices]) rest
-            | otherwise = rest
-      in L loc (FamEqn ([], [], noAnn) name mkHsOuterImplicit
-                       (map (HsValArg noExtField) pats) Prefix body)
-
--- | Find the names needed by lifted declarations and whether one of the
--- cases needs the result of an earlier case in this let chain.
-caseCaptureUses :: LHsType GhcPs -> (Set.Set RdrName, Bool)
-caseCaptureUses source = case unLoc (ignoreParens source) of
-  XHsType (HsTypeCase _ _ scrutinee alts) ->
-    let (names, capture) = caseCaptureUses scrutinee
-    in (foldr (Set.union . rowNames) names alts, capture)
-  XHsType (HsTypeLet _ _ _ binds result) ->
-    let (binder, rhs, body) = splitHsTypeLet binds result
-        name = unLoc binder
-        (rhs_names, rhs_capture) = caseCaptureUses rhs
-        (body_names, body_capture) = caseCaptureUses body
-        needed = Set.member name body_names
-        case_rhs = isCaseRhs rhs
-        aliases | needed && not case_rhs = freeNames rhs
-                | otherwise = Set.empty
-        names = rhs_names `Set.union` aliases `Set.union` Set.delete name body_names
-    in (names, rhs_capture || body_capture || (needed && case_rhs))
-  HsKindSig _ ty kind
-    | L _ (XHsType HsTypeCase{}) <- ignoreParens ty ->
-        let (names, capture) = caseCaptureUses ty
-        in (freeNames kind `Set.union` names, capture)
-  _ -> (Set.empty, False)
-  where
-    freeNames = Set.fromList . map unLoc . extractHsTyRdrTyVars
-    rowNames (L _ (HsTypeCaseAlt pat _ rhs))
-      | Just (_, bound) <- classifyTypeCasePattern pat =
-          freeNames rhs `Set.difference` Set.fromList bound
-      | otherwise = Set.empty
-
-    isCaseRhs rhs = case unLoc (ignoreParens rhs) of
-      XHsType HsTypeCase{} -> True
-      HsKindSig _ body _ | L _ (XHsType HsTypeCase{}) <- ignoreParens body -> True
-      _ -> False
-
--- | Visit type expression children that share their enclosing lexical scope.
--- The caller handles binders and kind annotations. Thread its state
--- through the children in source order.
-liftTypeChildren :: (LHsType GhcPs -> s -> (LHsType GhcPs, [a], s))
-                 -> LHsType GhcPs -> s -> (LHsType GhcPs, [a], s)
-liftTypeChildren visit ty@(L loc node) salt = case node of
-  HsParTy ann body -> one (HsParTy ann) body
-  HsAppTy ann f x -> two (HsAppTy ann) f x
-  HsAppKindTy ann f kind -> one (\f' -> HsAppKindTy ann f' kind) f
-  HsOpTy ann l op r -> two (\l' r' -> HsOpTy ann l' op r') l r
-  HsListTy ann t -> one (HsListTy ann) t
-  HsTupleTy ann sort ts -> many (HsTupleTy ann sort) ts
-  HsExplicitListTy ann promoted ts -> many (HsExplicitListTy ann promoted) ts
-  HsExplicitTupleTy ann promoted ts -> many (HsExplicitTupleTy ann promoted) ts
-  XHsType (HsTypeLetProductCheck con arity body) -> one (XHsType . HsTypeLetProductCheck con arity) body
-  _ -> (ty, [], salt)
-  where
-    one rebuild t =
-      let (t', lifted, next) = visit t salt
-      in (L loc (rebuild t'), lifted, next)
-
-    two rebuild l r =
-      let (l', left, next) = visit l salt
-          (r', right, end) = visit r next
-      in (L loc (rebuild l' r'), left ++ right, end)
-
-    many rebuild ts =
-      let step next t = case visit t next of
-            (t', lifted, end) -> (end, (t', lifted))
-          (end, results) = mapAccumL step salt ts
-          (ts', lifted) = unzip results
-      in (L loc (rebuild ts'), concat lifted, end)
+import Data.Data ( Data, cast, gmapQ, gmapT )
+import Data.Maybe ( isJust, isNothing, fromMaybe, mapMaybe, maybeToList )
+import qualified Data.Set as Set ( difference, fromList, null, toList )
 
 {- | @rnSourceDecl@ "renames" declarations.
 It simultaneously performs dependency analysis and precedence parsing.
@@ -1961,29 +108,7 @@ does NOT assume that anything is in scope already
 -}
 rnSrcDecls :: HsGroup GhcPs -> RnM (TcGblEnv, HsGroup GhcRn)
 -- Rename a top-level HsGroup; used for normal source files *and* hs-boot files
-rnSrcDecls group = do
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
-  named_wildcards <- xoptM LangExt.NamedWildCards
-  level <- getThLevel
-  dflags <- getDynFlags
-  let lift_cases = case level of
-        UntypedBrack{} -> False
-        _ -> enabled
-      sigma_mod = mkModule (RealUnit (Definite (baseUnitId dflags))) (mkModuleName "GHC.Sigma")
-      sigma = mkOrig sigma_mod (mkTcOcc "Sigma")
-      (with_cases, case_names) = if lift_cases then liftTypeCases group else (group, [])
-  -- Keep written lambdas in untyped declaration quotes.
-  -- See Note [Quoting type lambdas] in GHC.HsToCore.Quote.
-  (expanded, lambda_names, scopes) <-
-    if enabled then liftTypeLambdas lift_cases sigma with_cases else return (group, [], emptyOccEnv)
-  rnSrcDeclsWithLambdas sigma named_wildcards lift_cases
-                        (case_names ++ [(fam, Just owner) | (fam, owner) <- lambda_names])
-                        scopes expanded
-
--- | Rename the declarations and record the kind-inference edges of private families.
-rnSrcDeclsWithLambdas :: RdrName -> Bool -> Bool -> LiftedDecls -> OccEnv (OccName, Bool) -> HsGroup GhcPs
-                      -> RnM (TcGblEnv, HsGroup GhcRn)
-rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes group@(HsGroup { hs_valds   = val_decls,
+rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
                             hs_splcds  = splice_decls,
                             hs_tyclds  = tycl_decls,
                             hs_derivds = deriv_decls,
@@ -2021,7 +146,6 @@ rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes
    --          Again, they have no value declarations
    --
    (tc_envs, tc_bndrs) <- getLocalNonValBinders local_fix_env group ;
-
 
    restoreEnvs tc_envs $ do {
 
@@ -2061,74 +185,26 @@ rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes
                      (map (mkLocalVanillaGRE NoParent) table_names) } ;
    restoreEnvs (gbl_env { tcg_rdr_env = rdr_env }, lcl_env) $ do {
 
-   --  Now everything is in scope, as the remaining renaming assumes.
-   --  See Note [Resolving retained case heads].
-   (sig_types, updated_types, sigs, hidden, scopes) <-
-     if dependent && not is_boot
-     then do { heads <- if lift_cases then retainedSourceHeads sigs' tycl_decls else pure []
-             ; let input = emptyRdrGroup{hs_valds = val_decls, hs_tyclds = tycl_decls}
-                   (updated, anchors, aliases, uses, unbound, _) =
-                     liftDeclarationTypes heads [] show lift_cases named_wildcards Nothing input
-                   (cases, case_names) = liftTypeCases emptyRdrGroup{hs_tyclds = anchors}
-             ; (late, lambdas, late_scopes) <- liftTypeLambdas True sigma cases
-             ; let late_hidden = aliases ++ case_names ++ [(fam, Just owner) | (fam, owner) <- lambdas]
-             ; forM_ unbound $ \v ->
-                 forM_ (demoteRdrNameTv (unLoc v)) $ \term ->
-                   setSrcSpanA (getLoc v) (void (reportUnboundName WL_Anything term))
-             ; unless (null unbound) failIfErrsM
-             ; forM_ uses $ \(loc, gre) -> setSrcSpanA (getLoc loc) (addUsedGRE AllDeprecationWarnings gre)
-             ; return (hs_tyclds late, hs_tyclds updated, case hs_valds updated of
-                                         ValBinds _ entries -> val_sigs entries
-                                         _ -> sigs',
-                       early_hidden ++ late_hidden, plusOccEnv early_scopes late_scopes) }
-     else pure ([], tycl_decls, sigs', early_hidden, early_scopes) ;
-   (sig_envs, sig_bndrs) <- if null sig_types
-     then (, emptyNameSet) <$> getEnvs
-     else getLocalNonValBinders local_fix_env emptyRdrGroup{hs_tyclds = sig_types} ;
-   restoreEnvs sig_envs $ do {
-
    -- (E) Rename type and class decls
    --     (note that value LHSes need to be in scope for default methods)
-   --
-   -- You might think that we could build proper def/use information
-   -- for type and class declarations, but they can be involved
-   -- in mutual recursion across modules, and we only do the SCC
-   -- analysis for them in the type checker.
-   -- So we content ourselves with gathering uses only; that
-   -- means we'll only report a declaration as unused if it isn't
-   -- mentioned at all.  Ah well.
    traceRn "Start rnTyClDecls" (ppr tycl_decls) ;
-   (rn_source_types, source_type_fvs) <- rnTyClDecls hidden scopes (sig_types ++ updated_types) ;
+   (rn_tycl_decls, src_fvs1) <- rnTyClDecls tycl_decls ;
 
    -- (F) Rename Value declarations right-hand sides
    traceRn "Start rnmono" empty ;
    let { val_bndr_set = mkNameSet id_bndrs `unionNameSet` mkNameSet pat_syn_bndrs } ;
-   let { new_lhs = makeRnValBinds noExtField binds' sigs } ;
-   ((rn_val_decls@(XValBindsLR (HsVBG rn_binds sigs')), bind_dus), rn_splice_types) <-
-     if lift_cases && not is_boot
-     then do { splice_types <- newTcRef []
-             ; splice_cases <- newTcRef (0, [])
-             ; local_lambdas <- newTcRef (0 :: Int)
-             ; let rename_splice = rnSplicedSignatureTypes sigma named_wildcards local_fix_env splice_types splice_cases
-                   lift_local = rnLocalSignatureLambdas sigma named_wildcards local_fix_env splice_types local_lambdas
-             ; binds <- updGblEnv (\env -> env{tcg_rn_local_lambdas = Just ([], lift_local)}) $
-                          rnValBindsRHSWith (rnHsSigWcTypeWithSplice rename_splice)
-                          (TopSigCtxt val_bndr_set) new_lhs
-             ; types <- reverse <$> readTcRef splice_types
-             ; pure (binds, types) }
-     else (, []) <$> if is_boot
-       -- The signatures bind the boot names. There are no value bindings.
-       then rnTopBindsBoot tc_bndrs new_lhs
-       else rnValBindsRHS (TopSigCtxt val_bndr_set) new_lhs ;
-   let { rn_tycl_decls = rn_source_types ++ concatMap fst rn_splice_types
-       ; src_fvs1 = plusFNs (source_type_fvs : map snd rn_splice_types) } ;
+   let { new_lhs = makeRnValBinds noExtField binds' sigs' } ;
+   (rn_val_decls@(XValBindsLR (HsVBG rn_binds rn_sigs)), bind_dus) <- if is_boot
+     -- The signatures bind the boot names. There are no value bindings.
+     then rnTopBindsBoot tc_bndrs new_lhs
+     else rnValBindsRHS (TopSigCtxt val_bndr_set) new_lhs ;
    traceRn "finish rnmono" (ppr rn_val_decls) ;
 
    -- (G) Rename Fixity and deprecations
 
    -- Rename fixity declarations and error if we try to
    -- fix something from another module (duplicates were checked in (A))
-   let { all_bndrs = tc_bndrs `unionNameSet` sig_bndrs `unionNameSet` val_bndr_set } ;
+   let { all_bndrs = tc_bndrs `unionNameSet` val_bndr_set } ;
    traceRn "rnSrcDecls fixity" $
      vcat [ text "all_bndrs:" <+> ppr all_bndrs ] ;
    rn_fix_decls <- mapM (mapM (rnSrcFixityDecl (TopSigCtxt all_bndrs)))
@@ -2156,8 +232,8 @@ rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes
    last_tcg_env0 <- getGblEnv ;
    let { last_tcg_env =
             last_tcg_env0
-              { tcg_complete_matches = tcg_complete_matches last_tcg_env0 ++ localCompletePragmas sigs'
-                                      , tcg_complete_match_env = tcg_complete_match_env last_tcg_env0 ++ localCompletePragmas sigs'}
+              { tcg_complete_matches = tcg_complete_matches last_tcg_env0 ++ localCompletePragmas rn_sigs
+              , tcg_complete_match_env = tcg_complete_match_env last_tcg_env0 ++ localCompletePragmas rn_sigs }
        } ;
    -- (I) Compute the results and return
    let {rn_group = HsGroup { hs_ext     = noExtField,
@@ -2192,388 +268,12 @@ rnSrcDeclsWithLambdas sigma named_wildcards lift_cases early_hidden early_scopes
                         in -- we return the deprecs in the env, not in the HsGroup above
                         tcg_env' { tcg_warns = insertWarnDecls (tcg_warns tcg_env') rn_decl_warns
                                  , tcg_rdr_env = delListFromOccEnv (tcg_rdr_env tcg_env')
-                                                   (map fst hidden ++ map nameOccName table_names) };
+                                                   (map nameOccName table_names) };
        } ;
    traceRn "finish rnSrc" (ppr rn_group) ;
    traceRn "finish Dus" (ppr src_dus ) ;
    return (final_tcg_env, rn_group)
-                    }}}}}
-
-{- Note [Lifting type lambdas from local signatures]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The local signature renamer runs with the enclosing lexical Names in scope.
-Carry their written kinds while renaming the corresponding definitions.
-Resolve unqualified names by their occurrence. A shadowing pattern or
-signature can exclude an outer binder from this lookup. A spliced lambda
-can refer to the outer binder by its exact Name while it remains in scope.
-Look up each spelling in the local environment. Exclude names that belong
-to the local signature's own forall. Only names used in a lambda or its
-captures' kinds become parameters of the helper.
-
-For a capture with a written kind, copy names and applications in
-telescope order. Keep external Names and references to earlier visible
-captures in the same name form as the copied binder. This keeps two
-distinct exact Names with the same occurrence separate. Leave the
-signature unchanged when a needed written kind cannot be copied. For a
-capture with no annotation, leave the helper's parameter unannotated
-as in an ordinary type synonym. Also retain the lambda
-body so that the signature checker can check the actual capture kinds.
-See Note [Checking local lambda captures] in GHC.Tc.Gen.HsType.
-
-Emit the helpers in the current declaration group, using the same
-accumulator as signature splices. Expression annotations use the same
-scope and accumulator. An annotation's explicit forall can supply kind
-information to an annotation inside its expression. Visible type arguments
-use an empty explicit telescope. See Note [Type lambdas in visible type
-arguments] in GHC.Rename.HsType. The generated owner label identifies
-the source position in diagnostics. The lifter does not execute or copy splices.
--}
-
--- | Lift a local type lambda after its lexical scope has entered the renamer.
--- See Note [Lifting type lambdas from local signatures].
-rnLocalSignatureLambdas
-  :: RdrName -> Bool -> MiniFixityEnv -> TcRef [([TyClGroup GhcRn], FreeNames)]
-  -> TcRef Int -> LocalSignatureKinds -> HsDocContext -> LHsSigWcType GhcPs
-  -> RnM (Maybe (LHsSigWcType GhcRn, FreeNames))
-rnLocalSignatureLambdas sigma named_wildcards fix_env generated local_lambdas kinds
-  doc ty@HsWC{hswc_body = L sig_loc HsSig{sig_bndrs = outer, sig_body = body}}
-  | let names = case doc of
-          TypeSigCtx binders -> binders
-          ExprWithTySigCtx -> [L (l2l sig_loc) (mkRdrUnqual (mkVarOcc "$expression"))]
-          HsTypeCtx -> [L (l2l sig_loc) (mkRdrUnqual (mkVarOcc "$type-argument"))]
-          _ -> []
-  , not (null names), hasLambda body && copyable ty && no_named_hole
-  = do
-      local <- getLocalRdrEnv
-      ordinal <- readTcRef local_lambdas
-      level <- getThLevel
-      let site = "local-" ++ show ordinal
-      site_suffix <- case level of
-        Brack _ RnPendingTyped ->
-          zEncodeString . occNameString <$>
-            chooseUniqueOccTc (mkInstTyTcOcc ("$typed-quote-" ++ site))
-        _ -> pure site
-      let formals = case outer of
-              HsOuterImplicit{} -> []
-              HsOuterExplicit{hso_bndrs = binders} -> mapMaybe hsLTyVarName binders
-          source_formals = map (mkRdrUnqual . rdrNameOcc) formals
-          source_captures = localSignatureCaptures (mkRdrUnqual . nameOccName) local source_formals kinds
-          exact_captures
-            | any (isExact . unLoc) occurrences = localSignatureCaptures nameRdrName local formals kinds
-            | otherwise = []
-          ambient = source_captures ++ exact_captures
-          actuals = [(unLoc name, nameRdrName actual) | ((_, name), actual) <- ambient]
-          unavailable =
-            [rdr
-            | rdr <- map unLoc (nubN occurrences), rdr `notElem` formals
-            , isJust (lookupLocalRdrEnv local rdr)
-            , isNothing (lookup rdr actuals)]
-          scope = LocalLambdaScope actuals unavailable
-          signature = noLocA (TypeSig noAnn [] names ty)
-          input = emptyRdrGroup{hs_valds = ValBinds noExtField [VbSig signature]}
-          suffix salt = site_suffix ++ "-" ++ show salt
-          (updated, anchors, aliases, _, _, _) =
-            liftDeclarationTypes [] [] suffix True named_wildcards (Just (scope, map fst ambient)) input
-      case (anchors, hs_valds updated) of
-        (_ : _, ValBinds _ [VbSig (L _ (TypeSig _ _ _ result))]) -> do
-          (late, lambdas, scopes) <- liftTypeLambdas True sigma emptyRdrGroup{hs_tyclds = anchors}
-          let hidden = aliases ++ [(fam, Just owner) | (fam, owner) <- lambdas]
-              declarations = hs_tyclds late
-          -- See Note [Lifting type lambdas in typed quotations].
-          (envs, names) <- setThLevel Comp $
-            getLocalNonValBinders fix_env emptyRdrGroup{hs_tyclds = declarations}
-          let at_source :: RnM a -> RnM a
-              at_source action = restoreEnvs envs $ setThLevel level $
-                updLclCtxt (atHelperStage level names) action
-          renamed <- at_source $ setLocalRdrEnv emptyLocalRdrEnv $
-            rnTyClDecls hidden scopes declarations
-          updTcRef generated (renamed :)
-          updTcRef local_lambdas (+ 1)
-          Just <$> at_source (rnHsSigWcType doc result)
-        _ -> pure Nothing
-  | otherwise = pure Nothing
-  where
-    atHelperStage level names ctxt =
-      ctxt{tcl_th_bndrs = extendNameEnvList (tcl_th_bndrs ctxt)
-        [(name, (TopLevel, thLevelIndex level)) | name <- nonDetEltsUniqSet names]}
-
-    occurrences = extractHsTyRdrTyVars body
-    no_named_hole = not named_wildcards ||
-      all (not . startsWithUnderscore . rdrNameOcc . unLoc) occurrences
-
-    hasLambda :: Data a => a -> Bool
-    hasLambda node
-      | Just (L _ (XHsType HsTypeLambda{})) <- cast node :: Maybe (LHsType GhcPs) = True
-      | otherwise = or (gmapQ hasLambda node)
-
-{- Note [Lifting type lambdas in typed quotations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The producer checks the body of a typed quote. The typed splice runs in the
-zonker, after the consumer has checked its declaration group. It cannot add
-a lambda's helper declarations to that group. Lift the lambda in the producer
-and quote the resulting helper application. The helper is a private global
-type synonym, so a splice in another module can resolve its original Name
-from the producer's interface. Reserve its suffix in the module-wide
-occurrence supply. The ordinary local counter restarts at each declaration
-group, so it cannot distinguish helpers referenced by different quotes on
-the two sides of a declaration splice. Encode the suffix so a colon in
-it does not change the owner found by pprLiftedTypeLambdaSite.
-
-Allocate the helper's name at Comp so it is external. Rename its copied
-source at the quote's level, where the usual checks on levelled names
-apply. The helper itself is available at that level. A typed quote
-evaluated by an untyped splice during renaming cannot use this path.
-Its declaration group has yet to be typechecked.
--}
-
--- | Bind the visible captures in their original dependency order and name form.
-localSignatureCaptures :: (Name -> RdrName) -> LocalRdrEnv -> [RdrName] -> LocalSignatureKinds
-                       -> [(LiftedTypeCapture, Name)]
-localSignatureCaptures captureName local formals = catMaybes . snd . mapAccumL copy emptyNameSet
-  where
-    copy earlier (located, written_kind)
-      | rdr `notElem` formals
-      , lookupLocalRdrEnv local rdr == Just name
-      , Just kind <- traverse (copyKind earlier) written_kind
-      = let binder = case kind of
-              Nothing -> liftedTypeVarBinder source
-              Just kind' -> fmap (\b -> b{tvb_kind = HsBndrKind noExtField kind'})
-                              (liftedTypeVarBinder source)
-        in (extendNameSet earlier name, Just ((binder, source), name))
-      | otherwise = (earlier, Nothing)
-      where
-        name = unLoc located
-        rdr = captureName name
-        source = rdr <$ located
-
-    copyKind earlier (L loc node) = case node of
-      HsParTy _ body -> L loc . HsParTy (noEpTok, noEpTok) <$> copyKind earlier body
-      HsAppTy _ fun arg -> do
-        fun' <- copyKind earlier fun
-        arg' <- copyKind earlier arg
-        pure (L loc (HsAppTy noExtField fun' arg'))
-      HsAppKindTy _ fun kind -> do
-        fun' <- copyKind earlier fun
-        kind' <- copyKind earlier kind
-        pure (L loc (HsAppKindTy noEpTok fun' kind'))
-      HsFunTy _ arrow arg res -> do
-        arrow' <- copyArrow earlier arrow
-        arg' <- copyKind earlier arg
-        res' <- copyKind earlier res
-        pure (L loc (HsFunTy noExtField arrow' arg' res'))
-      HsListTy _ elt -> L loc . HsListTy (noEpTok, noEpTok) <$> copyKind earlier elt
-      HsTupleTy _ sort elts -> L loc . HsTupleTy noAnn sort <$> traverse (copyKind earlier) elts
-      HsKindSig _ body k -> do
-        body' <- copyKind earlier body
-        k' <- copyKind earlier k
-        pure (L loc (HsKindSig noAnn body' k'))
-      HsStarTy _ -> pure (L loc (HsStarTy noAnn))
-      HsTyVar _ promoted var
-        | let name = getName (unLoc var)
-        , name `elemNameSet` earlier
-        -> pure (L loc (HsTyVar noAnn promoted (captureName name <$ var)))
-      _ -> namedSpliceType (L loc node)
-
-    copyArrow earlier (HsModifiedFunArr _ mods arr) = do
-      mods' <- traverse (copyModifier earlier) mods
-      let arr' = case arr of
-            HsStandardArr _ -> HsStandardArr (EpArrow noAnn)
-            HsLinearArr _   -> HsLinearArr noEpTok
-      pure (HsModifiedFunArr noExtField mods' arr')
-
-    copyModifier earlier (L loc (HsModifier _ mod_ty)) =
-      L loc . HsModifier noEpTok <$> copyKind earlier mod_ty
-
--- | Lift cases and lambdas from the parsed result of a top-level signature splice.
--- See Note [Lifting cases from signature splices].
-rnSplicedSignatureTypes
-  :: RdrName -> Bool -> MiniFixityEnv -> TcRef [([TyClGroup GhcRn], FreeNames)]
-  -> TcRef (Int, [(RetainedCaseKey, Name)])
-  -> SignatureSpliceSite -> HsDocContext -> HsUntypedSplice GhcPs
-  -> RnM (HsType GhcRn, FreeNames)
-rnSplicedSignatureTypes sigma named_wildcards fix_env generated splice_cases site doc =
-  rnSpliceTypeWith indices $ \raw -> do
-    local <- getLocalRdrEnv
-    case doc of
-      TypeSigCtx names@(_:_)
-        | contains_lifted_type raw
-        , Just (outer, retained) <- splice_scope local raw
-        -> do
-        let rename ty = rnLHsType (SpliceTypeCtx raw) ty
-            sig = HsSig noExtField outer (wrap_retained retained raw)
-            wc = HsWC noExtField (L (getLoc raw) sig)
-            input_sig = noLocA (TypeSig noAnn [] names wc)
-            input = emptyRdrGroup{hs_valds = ValBinds noExtField [VbSig input_sig]}
-        heads <- retainedSourceHeads [input_sig] []
-        (ordinal, complete_helpers) <- readTcRef splice_cases
-        let (earlier, suffix) = case site of
-              CompleteSignatureSplice -> (complete_helpers, show)
-              NestedSignatureSplice{} -> ([], \salt -> "splice" ++ show ordinal ++ "-" ++ show salt)
-        let (updated, anchors, aliases, uses, _, helpers) =
-              liftDeclarationTypes heads (map (fmap nameRdrName) earlier) suffix True named_wildcards Nothing input
-        case (anchors, hs_valds updated) of
-          (_:_, ValBinds _ [VbSig (L _ (TypeSig _ _ _ HsWC{hswc_body = L _ HsSig{sig_body = ty}}))])
-            | Just result <- unwrap_retained retained ty -> do
-            let (cases, case_names) = liftTypeCases emptyRdrGroup{hs_tyclds = anchors}
-            (late, lambdas, scopes) <- liftTypeLambdas True sigma cases
-            let hidden = aliases ++ case_names ++ [(fam, Just owner) | (fam, owner) <- lambdas]
-                declarations = hs_tyclds late
-            forM_ uses $ \(loc, gre) -> setSrcSpanA (getLoc loc) (addUsedGRE AllDeprecationWarnings gre)
-            (envs@(global, local), _) <- getLocalNonValBinders fix_env emptyRdrGroup{hs_tyclds = declarations}
-            let rdr_env = foldl' extendGlobalRdrEnv (tcg_rdr_env global)
-                            [mkExactGRE name Vanilla | (_, name) <- earlier]
-            types <- restoreEnvs (global{tcg_rdr_env = rdr_env}, local) $
-              rnTyClDecls hidden scopes declarations
-            restoreEnvs envs $ do
-              case site of
-                CompleteSignatureSplice -> do
-                  new_helpers <- forM (filter (stableSplicedCase . fst) helpers) $ \(key, occ) -> do
-                    name <- getName <$> lookupTopBndrRn WL_Anything (mkRdrUnqual occ)
-                    pure (key, name)
-                  updTcRef splice_cases (second (new_helpers ++))
-                NestedSignatureSplice{} ->
-                  updTcRef splice_cases (first (+ 1))
-              updTcRef generated (types :)
-              rename result
-          _ -> rename raw
-      _ -> rnLHsType (SpliceTypeCtx raw) raw
-  where
-    indices = case site of
-      CompleteSignatureSplice -> []
-      NestedSignatureSplice _ retained -> mapMaybe hsLTyVarName retained
-
-    wrap_retained [] ty = ty
-    wrap_retained binders ty =
-      L (getLoc ty) (HsForEachTy (noEpTok, Left noEpUniTok) binders ty)
-
-    unwrap_retained [] ty = Just ty
-    unwrap_retained _ (L _ HsForEachTy{hst_body = body}) = Just body
-    unwrap_retained _ _ = Nothing
-
-    contains_lifted_type :: Data a => a -> Bool
-    contains_lifted_type node = case cast node :: Maybe (LHsType GhcPs) of
-      Just (L _ (XHsType HsTypeCase{})) -> True
-      Just (L _ (XHsType HsTypeLambda{})) -> True
-      _ -> or (gmapQ contains_lifted_type node)
-
-    splice_scope local raw = case site of
-      CompleteSignatureSplice -> Just (mkHsOuterImplicit, [])
-      NestedSignatureSplice outer retained -> do
-        let binders = case outer of
-              HsOuterImplicit{} -> []
-              HsOuterExplicit{hso_bndrs = bound} -> mapMaybe (closedSpliceCapture namedSpliceType) bound
-            copied = mapMaybe (closedSpliceCapture retainedSpliceDomain) retained
-            available = mapMaybe hsLTyVarName binders ++ mapMaybe hsLTyVarName copied
-        guard (all ((`elem` available) . unLoc) (extractHsTyRdrTyVars raw))
-        guard (not (uses_other_local local available raw))
-        pure (mkHsOuterExplicit noAnn binders, copied)
-
-    uses_other_local :: Data a => LocalRdrEnv -> [RdrName] -> a -> Bool
-    uses_other_local local available node
-      | Just (HsBndrVar _ name) <- cast node :: Maybe (HsBndrVar GhcPs)
-      , unLoc name `elem` available
-      = True
-      | Just (HsTypeCaseAlt pat _ _) <- cast node :: Maybe HsTypeCaseAlt
-      , any ((`elem` available) . unLoc) (extractHsTyRdrTyVars pat)
-      = True
-      | Just rdr <- cast node :: Maybe RdrName
-      = rdr `notElem` available &&
-        (elemLocalRdrEnv rdr local ||
-         maybe False (`elemLocalRdrEnv` local) (demoteRdrNameTv rdr))
-      | otherwise = or (gmapQ (uses_other_local local available) node)
-
--- | Copy an exact binder and its supported domain to the helper scope.
-closedSpliceCapture :: (LHsType GhcRn -> Maybe (LHsType GhcPs))
-                    -> LHsTyVarBndr flag GhcRn -> Maybe (LHsTyVarBndr flag GhcPs)
-closedSpliceCapture copy_type (L loc HsTvb{tvb_flag = flag, tvb_var = HsBndrVar _ name,
-                                          tvb_kind = HsBndrKind _ kind}) = do
-  exact_kind <- copy_type kind
-  pure (L loc (HsTvb noAnn flag (HsBndrVar noExtField (fmap nameRdrName name))
-                     (HsBndrKind noExtField exact_kind)))
-closedSpliceCapture _ _ = Nothing
-
--- | Retain the original Name of a type or promoted data constructor.
-namedSpliceType :: LHsType GhcRn -> Maybe (LHsType GhcPs)
-namedSpliceType ty
-  | L loc (HsTyVar _ promoted con) <- ignoreParens ty
-  , let resolved = getName (unLoc con)
-        occ = nameOccName resolved
-  , isExternalName resolved
-  , isTcOcc occ || isDataOcc occ
-  = Just (L loc (HsTyVar noAnn promoted (nameRdrName resolved <$ con)))
-  | otherwise = Nothing
-
--- | Copy a closed constructor application in a retained capture's domain.
-retainedSpliceDomain :: LHsType GhcRn -> Maybe (LHsType GhcPs)
-retainedSpliceDomain ty = case ignoreParens ty of
-  L loc (HsAppTy _ fun arg) -> do
-    fun' <- retainedSpliceDomain fun
-    arg' <- retainedSpliceDomain arg
-    pure (L loc (HsAppTy noExtField fun' arg'))
-  ty -> namedSpliceType ty
-
-{- Note [Lifting cases from signature splices]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A splice at the root of a value signature can return a type case or lambda. The
-initial declaration lifting pass has only the source splice. Run the splice
-in the ordinary signature renamer. Use its parsed result to construct the
-same private declarations as for a written signature. Register the names
-only while renaming these declarations and the result. Add the renamed
-declarations to the owning group for kind checking and interface writing.
-
-The splice runs once, in signature order. The regular splice path carries
-its free names and module finalizers. A nested type splice can refer to an
-enclosing signature binder by its exact name. For an erased binder, copy
-a single resolved type or promoted constructor. For a retained binder,
-also copy a closed constructor application. The copied domain needs no
-local bindings. Present these retained binders to the ordinary lifting
-pass as an enclosing telescope. Remove that synthetic telescope from the
-result so the helper application refers to the original runtime binders.
-Give each nested splice a distinct helper suffix so it does not collide
-with a written case or another splice in the signature.
-The new private declarations use the same capture and ordered case checks
-as in Note [Lifting types from signatures and fields].
-
-Two signature splices in the same declaration group can reuse one private
-helper for the same case on a retained capture. Compare the formal capture's
-position, the closed capture domains and every row in order. Require original
-or exact external names in the domains and rows. A splice can construct an
-unqualified name whose interpretation depends on the scope at its expansion.
-Only the generated alias refers to the earlier helper's exact name. Register
-it again for that renaming pass. End reuse at the declaration group boundary.
--}
-
-{- Note [Resolving retained case heads]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Prepare value signature and constructor field aliases after the declaration
-group's type and term binders enter scope. Register the new synonyms and
-families before renaming the rewritten constructor fields. The original
-constructors already have names.
-
-In an implicitly quantified GADT constructor, a written application
-head such as `not` in `case not b of ...` can name a checked function.
-Exclude that occurrence from the implicit binder list when lookup finds
-the function. Keep other occurrences of the same spelling and all explicit
-binders. A field always keeps its own helper and original call.
-
-An unqualified head with no binding in the current declaration group can
-also reach the retained-case shape check. If the case can be lifted and
-the head has no separate type occurrence or lexical binder, report the
-ordinary unbound-name diagnostic at the head before renaming the helper.
-Keep a separate type occurrence as evidence for an implicit constructor
-binder. This lookup uses the current group and earlier checked groups.
-
-The R16 lookup sees a local source definition or a visible import.
-Each signature's written telescope can
-shadow that lookup. A shared case compares resolved source family Names
-and the formal index positions. Keep the original expression in the
-checked helper. The regular renamer and type checker still check its
-source equation.
-
-An alias that uses a shared helper drops its own scrutinee expression.
-Record the original imports of its resolved application heads at their
-source locations. This keeps each qualifier and its deprecations.
--}
+                    }}}}
 
 {- Note [Ordering local source tables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3582,7 +1282,7 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       = Just name
       | otherwise = Nothing
 
-    -- | Read distinct named arguments and check the known local arity.
+    -- Read distinct named arguments and check the known local arity.
     parameter_domain :: LHsType GhcRn -> Maybe (Maybe Name, [Name])
     parameter_domain ty = do
       (root, args) <- case unLoc (ignoreParens ty) of
@@ -5422,18 +3122,22 @@ another instance, so we better add them to the environment one by one.
 -}
 
 
-rnTyClDecls :: LiftedDecls -> OccEnv (OccName, Bool) -> [TyClGroup GhcPs]
+rnTyClDecls :: [TyClGroup GhcPs]
             -> RnM ([TyClGroup GhcRn], FreeNames)
 -- Rename the declarations and do dependency analysis on them
-rnTyClDecls hidden scopes tycl_ds
+rnTyClDecls tycl_ds
   = do { -- Flatten TyClGroups and rename each declaration individually.
          -- Steps (TCDEP1) and (TCDEP2) of Note [Dependency analysis of type and class decls]
-       ; tycls_w_fvs <- mapM (wrapLocFstMA (rnTyClDecl scopes)) (tyClGroupTyClDecls tycl_ds)
+       ; tycls_w_fvs0 <- mapM (wrapLocFstMA rnTyClDecl) (tyClGroupTyClDecls tycl_ds)
+       ; level <- getThLevel
+       ; (tycls_w_fvs, owner_edges) <- case level of
+           UntypedBrack{} -> pure (tycls_w_fvs0, [])
+           _              -> lowerClosedFamDecls tycls_w_fvs0
        ; let tc_names = mkNameSet (map (tcdName . unLoc . fst) tycls_w_fvs)
        ; traceRn "rnTyClDecls" $
            vcat [ text "tyClGroupTyClDecls:" <+> ppr tycls_w_fvs
                 , text "tc_names:" <+> ppr tc_names ]
-       ; kisigs_w_fvs <- rnStandaloneKindSignatures hidden tc_names (tyClGroupKindSigs tycl_ds)
+       ; kisigs_w_fvs <- rnStandaloneKindSignatures tc_names (tyClGroupKindSigs tycl_ds)
        ; instds_w_fvs <- mapM (wrapLocFstMA rnSrcInstDecl) (tyClGroupInstDecls tycl_ds)
        ; role_annots  <- rnRoleAnnots tc_names (tyClGroupRoleDecls tycl_ds)
 
@@ -5442,7 +3146,7 @@ rnTyClDecls hidden scopes tycl_ds
        ; rdr_env <- getGlobalRdrEnv
        ; traceRn "rnTyClDecls SCC analysis" $
            vcat [ text "rdr_env:" <+> ppr rdr_env ]
-       ; let tycl_sccs = depAnalTyClDecls hidden rdr_env tc_names kisig_fv_env tycls_w_fvs
+       ; let tycl_sccs = depAnalTyClDecls owner_edges rdr_env tc_names kisig_fv_env tycls_w_fvs
              (kisig_env, kisig_fv_env) = mkKindSig_fv_env kisigs_w_fvs
              role_annot_env = mkRoleAnnotEnv role_annots
 
@@ -5479,6 +3183,307 @@ rnTyClDecls hidden scopes tycl_ds
                           , group_roles  = getRoleAnnots node_bndrs role_env
                           , group_instds = [] }
 
+{- Note [Lowering type cases in closed type families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an equation right-hand side of a closed type family contains an
+'HsTypeCaseRn' outside type lambdas (GHC Proposal #378; Eisenberg and Stolarek,
+Haskell Symposium 2014), 'lowerClosedFamDecls' extracts a companion closed type
+family @$case:<Fam>:<i>@ in the same 'TyClGroup' strongly connected component:
+
+* Free equation binders referenced by the case become unannotated leading
+  parameters of @$case:<Fam>:<i>@; kind inference in the shared SCC determines
+  their kinds without copying surface kind annotations.
+* When the scrutinee is a bare equation variable @v@, @v@ is passed once in the
+  scrutinee slot and any unshadowed right-hand-side occurrence of @v@ is bound
+  to the branch pattern via 'HsTypeCaseAliasRn' so recursive termination checks
+  in 'GHC.Tc.Validity.refineCaseCall' see the refined constructor pattern.
+* When a surrounding 'HsTypeLetRn' right-hand side itself lowers a type case,
+  the @let@ variable becomes an explicit capture parameter of any subsequent
+  type case in its body so 'GHC.Tc.Validity.checkFamInstRhs' validates the
+  nested selector call.
+-}
+
+-- | Extract companion @$case:<Fam>:<i>@ closed type families for type cases in
+-- closed type family equations, returning the expanded declaration list and
+-- helper-to-owner SCC edges.
+-- See Note [Lowering type cases in closed type families].
+lowerClosedFamDecls
+  :: [(LTyClDecl GhcRn, FreeNames)]
+  -> RnM ([(LTyClDecl GhcRn, FreeNames)], [(Name, Name)])
+lowerClosedFamDecls decls = do
+  results <- mapM lower_one decls
+  let (decls_lists, edge_lists) = unzip results
+  pure (concat decls_lists, concat edge_lists)
+  where
+    lower_one (L decl_loc (FamDecl _ fam@FamilyDecl
+                      { fdInfo  = ClosedTypeFamily (anns, mb_scope) (Just eqns)
+                      , fdLName = L _ fam_name }), fvs)
+      | any (has_eqn_case . feqn_rhs . unLoc) eqns = do
+          idx_ref <- newTcRef (0 :: Int)
+          (eqns', helper_batches) <- unzip <$> mapM (lower_eqn decl_loc fam_name idx_ref) eqns
+          let helpers     = concat helper_batches
+              helper_nms  = [tcdName (unLoc d) | (d, _) <- helpers]
+              fam'        = fam { fdInfo = ClosedTypeFamily (anns, mb_scope) (Just eqns') }
+              owner_fvs   = extendNameSetList fvs helper_nms
+              owner_edges = [(h, fam_name) | h <- helper_nms]
+          pure ((L decl_loc (FamDecl noExtField fam'), owner_fvs) : helpers, owner_edges)
+    lower_one item = pure ([item], [])
+
+    has_eqn_case :: LHsType GhcRn -> Bool
+    has_eqn_case (L _ ty) = case ty of
+      XHsType HsTypeCaseRn{}        -> True
+      XHsType HsTypeLambdaQuoteRn{} -> False
+      XHsType HsTypeLambdaCheckRn{} -> False
+      HsForAllTy{}                  -> False
+      HsParTy _ t                   -> has_eqn_case t
+      HsKindSig _ t k               -> has_eqn_case t || has_eqn_case k
+      HsAppTy _ f a                 -> has_eqn_case f || has_eqn_case a
+      HsAppKindTy _ t k             -> has_eqn_case t || has_eqn_case k
+      HsFunTy _ _ a b               -> has_eqn_case a || has_eqn_case b
+      HsOpTy _ a _ b                -> has_eqn_case a || has_eqn_case b
+      HsListTy _ t                  -> has_eqn_case t
+      HsTupleTy _ _ ts              -> any has_eqn_case ts
+      HsSumTy _ ts                  -> any has_eqn_case ts
+      HsExplicitListTy _ _ ts       -> any has_eqn_case ts
+      HsExplicitTupleTy _ _ ts      -> any has_eqn_case ts
+      HsQualTy _ (L _ (HsContext _ cs)) b -> any has_eqn_case cs || has_eqn_case b
+      HsDocTy _ t _                 -> has_eqn_case t
+      HsIParamTy _ _ t              -> has_eqn_case t
+      HsSpliceTy (HsUntypedSpliceTop _ inner) _ -> has_eqn_case inner
+      XHsType (HsTypeLetRn _ _ r b) -> has_eqn_case r || has_eqn_case b
+      XHsType (HsTypeExistsRn _ _ b) -> has_eqn_case b
+      XHsType (HsTypeLetProductCheckRn _ _ r) -> has_eqn_case r
+      _                             -> False
+
+    lower_eqn decl_loc fam_name idx_ref (L eqn_loc eqn@FamEqn { feqn_bndrs = bndrs, feqn_rhs = rhs }) = do
+      let base_caps = [ (nm, mk_var_ty nm, False) | nm <- hsOuterTyVarNames bndrs ]
+      (rhs', helpers) <- lower_ty decl_loc fam_name idx_ref base_caps rhs
+      pure (L eqn_loc (eqn { feqn_rhs = rhs' }), helpers)
+
+    is_bare_var :: LHsType GhcRn -> Bool
+    is_bare_var (L _ (HsParTy _ t)) = is_bare_var t
+    is_bare_var (L _ (HsTyVar _ NotPromoted _)) = True
+    is_bare_var _ = False
+
+    mk_var_ty :: Name -> LHsType GhcRn
+    mk_var_ty nm = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr nm)))
+
+    mk_plain_tvb :: Name -> LHsTyVarBndr (HsBndrVis GhcRn) GhcRn
+    mk_plain_tvb nm =
+      noLocA (HsTvb noAnn (HsBndrRequired noExtField)
+                (HsBndrVar noExtField (noLocA nm))
+                (HsBndrNoKind noExtField))
+
+    lower_ty decl_loc fam_name idx_ref caps (L loc ty) = case ty of
+      HsParTy x t -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsParTy x t'), hs)
+      HsKindSig x t k -> do
+        (t', hs1) <- lower_ty decl_loc fam_name idx_ref caps t
+        (k', hs2) <- lower_ty decl_loc fam_name idx_ref caps k
+        pure (L loc (HsKindSig x t' k'), hs1 ++ hs2)
+      HsAppTy x f a -> do
+        (f', hs1) <- lower_ty decl_loc fam_name idx_ref caps f
+        (a', hs2) <- lower_ty decl_loc fam_name idx_ref caps a
+        pure (L loc (HsAppTy x f' a'), hs1 ++ hs2)
+      HsAppKindTy x t k -> do
+        (t', hs1) <- lower_ty decl_loc fam_name idx_ref caps t
+        (k', hs2) <- lower_ty decl_loc fam_name idx_ref caps k
+        pure (L loc (HsAppKindTy x t' k'), hs1 ++ hs2)
+      HsFunTy x m a b -> do
+        (a', hs1) <- lower_ty decl_loc fam_name idx_ref caps a
+        (b', hs2) <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (HsFunTy x m a' b'), hs1 ++ hs2)
+      HsOpTy x a op b -> do
+        (a', hs1) <- lower_ty decl_loc fam_name idx_ref caps a
+        (b', hs2) <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (HsOpTy x a' op b'), hs1 ++ hs2)
+      HsListTy x t -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsListTy x t'), hs)
+      HsTupleTy x s ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsTupleTy x s ts'), concat hss)
+      HsSumTy x ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsSumTy x ts'), concat hss)
+      HsExplicitListTy x ip ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsExplicitListTy x ip ts'), concat hss)
+      HsExplicitTupleTy x ip ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsExplicitTupleTy x ip ts'), concat hss)
+      HsQualTy x (L cloc (HsContext ca cs)) b -> do
+        (cs', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) cs
+        (b', hsb)  <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (HsQualTy x (L cloc (HsContext ca cs')) b'), concat hss ++ hsb)
+      HsDocTy x t doc -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsDocTy x t' doc), hs)
+      HsIParamTy x n t -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsIParamTy x n t'), hs)
+      HsSpliceTy (HsUntypedSpliceTop mf inner) sp -> do
+        (inner', hs) <- lower_ty decl_loc fam_name idx_ref caps inner
+        pure (L loc (HsSpliceTy (HsUntypedSpliceTop mf inner') sp), hs)
+      XHsType (HsTypeExistsRn fl v b) -> do
+        (b', hs) <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (XHsType (HsTypeExistsRn fl v b')), hs)
+      XHsType (HsTypeLetProductCheckRn con ar r) -> do
+        (r', hs) <- lower_ty decl_loc fam_name idx_ref caps r
+        pure (L loc (XHsType (HsTypeLetProductCheckRn con ar r')), hs)
+      XHsType (HsTypeLetRn src lb@(L _ let_nm) rhs body) -> do
+        (rhs', hs_rhs) <- lower_ty decl_loc fam_name idx_ref caps rhs
+        if not (has_eqn_case body)
+          then pure (L loc (XHsType (HsTypeLetRn src lb rhs' body)), hs_rhs)
+          else if null hs_rhs && not (is_bare_var rhs')
+            then do
+              let body_sub = substRnNameInType (unitNameEnv let_nm rhs') body
+              (body', hs_body) <- lower_ty decl_loc fam_name idx_ref caps body_sub
+              pure (body', hs_rhs ++ hs_body)
+            else do
+              let caps' = filter (\(cn, _, _) -> cn /= let_nm) caps ++ [(let_nm, rhs', True)]
+              (body', hs_body) <- lower_ty decl_loc fam_name idx_ref caps' body
+              pure (L loc (XHsType (HsTypeLetRn src lb rhs' body')), hs_rhs ++ hs_body)
+      XHsType (HsTypeCaseRn scrut rows) -> do
+        (scrut', hs_scrut) <- lower_ty decl_loc fam_name idx_ref caps scrut
+        idx <- readTcRef idx_ref
+        writeTcRef idx_ref (idx + 1)
+        helper_name <- newImplicitBinder fam_name $ \occ ->
+          mkTcOcc ("$case:" ++ occNameString occ ++ ":" ++ show idx)
+        scrut_param <- newSysName (mkTyVarOcc "$scrutinee")
+        let bare_scrut_nm = case unLoc (ignoreParens scrut') of
+              HsTyVar _ NotPromoted (L _ (WithUserRdr _ n)) -> Just n
+              _ -> Nothing
+            case_fvs  = freeRnNames (L loc (XHsType (HsTypeCaseRn scrut' rows)) :: LHsType GhcRn)
+            used_caps = [ (cn, cexpr)
+                        | (cn, cexpr, is_let) <- caps
+                        , cn `elemNameSet` case_fvs
+                        , not (is_let && Just cn == bare_scrut_nm) ]
+            n_caps    = length used_caps
+        header_cap_nms <- mapM (newSysName . nameOccName . fst) used_caps
+        (helper_eqns, hs_rows_batches) <- unzip <$> forM rows (\(pat_nms, pat_ty, row_rhs) -> do
+          let row_caps = [c | c@(cn, _, _) <- caps, cn `notElem` pat_nms]
+          (row_rhs1, hs_row) <- lower_ty decl_loc fam_name idx_ref row_caps row_rhs
+          lhs_cap_nms <- mapM (newSysName . nameOccName . fst) used_caps
+          let cap_sub = mkNameEnv [ (cn, mk_var_ty ln)
+                                  | ((cn, _), ln) <- zip used_caps lhs_cap_nms
+                                  , cn `notElem` pat_nms
+                                  , Just cn /= bare_scrut_nm ]
+              row_rhs2 = substRnNameInType cap_sub row_rhs1
+          (mb_alias, row_rhs3) <- case bare_scrut_nm of
+            Just sn | sn `notElem` pat_nms, sn `elemNameSet` freeRnNames row_rhs2 -> do
+              alias_nm <- newSysName (nameOccName sn)
+              let r' = substRnNameInType (unitNameEnv sn (mk_var_ty alias_nm)) row_rhs2
+              pure (Just (noLocA alias_nm), r')
+            _ -> pure (Nothing, row_rhs2)
+          let eqn_loc  = combineSrcSpans (getLocA pat_ty) (getLocA row_rhs)
+              lhs_args = [HsValArg noExtField (mk_var_ty ln) | ln <- lhs_cap_nms]
+                         ++ [HsValArg noExtField pat_ty]
+              alias_rhs = L (getLoc row_rhs) $ XHsType $
+                            HsTypeCaseAliasRn (fam_name, n_caps, mb_alias) row_rhs3
+              feqn = FamEqn
+                { feqn_ext    = noAnn
+                , feqn_tycon  = noLocA helper_name
+                , feqn_bndrs  = HsOuterImplicit { hso_ximplicit = lhs_cap_nms ++ pat_nms }
+                , feqn_pats   = lhs_args
+                , feqn_fixity = Prefix
+                , feqn_rhs    = alias_rhs }
+          pure (L (noAnnSrcSpan eqn_loc) feqn, hs_row))
+        let helper_tvs  = HsQTvs { hsq_ext = []
+                                 , hsq_explicit = map mk_plain_tvb (header_cap_nms ++ [scrut_param]) }
+            helper_fam  = FamilyDecl
+              { fdExt       = noAnn
+              , fdInfo      = ClosedTypeFamily (noAnn, Nothing) (Just helper_eqns)
+              , fdTopLevel  = TopLevel
+              , fdLName     = noLocA helper_name
+              , fdTyVars    = helper_tvs
+              , fdFixity    = Prefix
+              , fdResultSig = noLocA (NoSig noExtField)
+              , fdInjectivityAnn = Nothing }
+            helper_decl = L decl_loc (FamDecl noExtField helper_fam)
+            helper_fvs  = delFromNameSet (freeRnExternalNames helper_eqns) helper_name
+            call_head   = L loc (HsTyVar noAnn NotPromoted (noLocA (noUserRdr helper_name)))
+            call_ty     = foldl' mkHsAppTy call_head ([cexpr | (_, cexpr) <- used_caps] ++ [scrut'])
+        pure (call_ty, hs_scrut ++ concat hs_rows_batches ++ [(helper_decl, helper_fvs)])
+      _ -> pure (L loc ty, [])
+
+    freeRnNames :: Data a => a -> NameSet
+    freeRnNames root = go emptyNameSet root
+      where
+        go :: Data a => NameSet -> a -> NameSet
+        go bound thing
+          | Just (_ :: SrcSpanAnnA) <- cast thing = emptyNameSet
+          | Just (_ :: SrcSpanAnnN) <- cast thing = emptyNameSet
+          | Just (_ :: SrcSpan)     <- cast thing = emptyNameSet
+          | Just (_ :: Type)        <- cast thing = emptyNameSet
+          | Just (nm :: Name)       <- cast thing
+          = if nm `elemNameSet` bound then emptyNameSet else unitNameSet nm
+          | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+          = go bound inner
+          | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = emptyNameSet
+          | Just (L _ (XHsType (HsTypeLetRn _ (L _ b) r body))) <- (cast thing :: Maybe (LHsType GhcRn))
+          = go bound r `unionNameSet` go (extendNameSet bound b) body
+          | Just (L _ (XHsType (HsTypeCaseRn scrut rows))) <- (cast thing :: Maybe (LHsType GhcRn))
+          = go bound scrut `unionNameSet`
+            unionNameSets [go (extendNameSetList bound ns) r | (ns, _, r) <- rows]
+          | otherwise = unionNameSets (gmapQ (go bound) thing)
+
+    freeRnExternalNames :: Data a => a -> NameSet
+    freeRnExternalNames thing
+      | Just (_ :: SrcSpanAnnA) <- cast thing = emptyNameSet
+      | Just (_ :: SrcSpanAnnN) <- cast thing = emptyNameSet
+      | Just (_ :: SrcSpan)     <- cast thing = emptyNameSet
+      | Just (_ :: Type)        <- cast thing = emptyNameSet
+      | Just (nm :: Name)       <- cast thing
+      = if isExternalName nm then unitNameSet nm else emptyNameSet
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = freeRnExternalNames inner
+      | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = emptyNameSet
+      | otherwise = unionNameSets (gmapQ freeRnExternalNames thing)
+
+    substRnNameInType :: NameEnv (LHsType GhcRn) -> LHsType GhcRn -> LHsType GhcRn
+    substRnNameInType env root
+      | isEmptyNameEnv env = root
+      | otherwise          = go env root
+      where
+        go :: Data a => NameEnv (LHsType GhcRn) -> a -> a
+        go sub thing
+          | isEmptyNameEnv sub = thing
+          | Just (_ :: SrcSpanAnnA) <- cast thing = thing
+          | Just (_ :: SrcSpanAnnN) <- cast thing = thing
+          | Just (_ :: SrcSpan)     <- cast thing = thing
+          | Just (_ :: Name)        <- cast thing = thing
+          | Just (_ :: Type)        <- cast thing = thing
+          | Just (lty :: LHsType GhcRn) <- cast thing
+          , Just lty' <- cast (go_lty sub lty) = lty'
+          | otherwise = gmapT (go sub) thing
+
+        go_lty sub orig@(L loc ty) = case ty of
+          HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm))
+            | Just repl <- lookupNameEnv sub nm -> L loc (unLoc repl)
+            | otherwise -> orig
+          HsForAllTy x tele body ->
+            let bs = case tele of
+                  HsForAllVis   _ _ vs -> mapMaybe hsLTyVarName vs
+                  HsForAllInvis _ _ vs -> mapMaybe hsLTyVarName vs
+            in L loc (HsForAllTy x (go sub tele) (go_lty (delListFromNameEnv sub bs) body))
+          HsForEachTy x vs body ->
+            L loc (HsForEachTy x (go sub vs) (go_lty (delListFromNameEnv sub (mapMaybe hsLTyVarName vs)) body))
+          HsSpliceTy (HsUntypedSpliceTop mf inner) sp ->
+            L loc (HsSpliceTy (HsUntypedSpliceTop mf (go_lty sub inner)) sp)
+          HsSpliceTy{} -> orig
+          XHsType (HsTypeExistsRn fl v body) ->
+            L loc (XHsType (HsTypeExistsRn fl (go sub v) (go_lty (delListFromNameEnv sub (maybeToList (hsLTyVarName v))) body)))
+          XHsType (HsTypeLambdaQuoteRn vs body) ->
+            L loc (XHsType (HsTypeLambdaQuoteRn vs (go_lty (delListFromNameEnv sub (map unLoc vs)) body)))
+          XHsType (HsTypeLetRn src lb@(L _ b) r body) ->
+            L loc (XHsType (HsTypeLetRn src lb (go_lty sub r) (go_lty (delFromNameEnv sub b) body)))
+          XHsType (HsTypeCaseRn scrut rows) ->
+            L loc (XHsType (HsTypeCaseRn (go_lty sub scrut)
+              [ (ns, p, go_lty (delListFromNameEnv sub ns) r) | (ns, p, r) <- rows ]))
+          _ -> gmapT (go sub) orig
+
 -- | Free variables of standalone kind signatures.
 newtype KindSig_FV_Env = KindSig_FV_Env (NameEnv FreeNames)
 
@@ -5501,23 +3506,23 @@ getKindSigs :: [Name] -> KindSigEnv -> [LStandaloneKindSig GhcRn]
 getKindSigs bndrs kisig_env = mapMaybe (lookupNameEnv kisig_env) bndrs
 
 rnStandaloneKindSignatures
-  :: LiftedDecls -> NameSet  -- names of types and classes in the current TyClGroup
+  :: NameSet  -- names of types and classes in the current TyClGroup
   -> [LStandaloneKindSig GhcPs]
   -> RnM [(LStandaloneKindSig GhcRn, FreeNames)]
-rnStandaloneKindSignatures hidden tc_names kisigs
+rnStandaloneKindSignatures tc_names kisigs
   = do { let (no_dups, dup_kisigs) = removeDupsOn get_name kisigs
              get_name = standaloneKindSigName . unLoc
        ; mapM_ dupKindSig_Err dup_kisigs
-       ; mapM (wrapLocFstMA (rnStandaloneKindSignature hidden tc_names)) no_dups
+       ; mapM (wrapLocFstMA (rnStandaloneKindSignature tc_names)) no_dups
        }
 
 rnStandaloneKindSignature
-  :: LiftedDecls -> NameSet  -- names of types and classes in the current TyClGroup
+  :: NameSet  -- names of types and classes in the current TyClGroup
   -> StandaloneKindSig GhcPs
   -> RnM (StandaloneKindSig GhcRn, FreeNames)
-rnStandaloneKindSignature hidden tc_names (StandaloneKindSig _ v ki)
+rnStandaloneKindSignature tc_names (StandaloneKindSig _ v ki)
   = do  { standalone_ki_sig_ok <- xoptM LangExt.StandaloneKindSignatures
-        ; unless (standalone_ki_sig_ok || rdrNameOcc (unLoc v) `elem` map fst hidden) $
+        ; unless standalone_ki_sig_ok $
             addErr TcRnUnexpectedStandaloneKindSig
         ; new_v <- lookupSigCtxtOccRn (TopSigCtxt tc_names) SigLikeStandaloneKindSig v
         ; (new_ki, fvs) <- rnHsSigType (StandaloneKindSigCtx v) KindLevel ki
@@ -5525,21 +3530,17 @@ rnStandaloneKindSignature hidden tc_names (StandaloneKindSig _ v ki)
         }
 
 -- See Note [Dependency analysis of type and class decls]
-depAnalTyClDecls :: LiftedDecls -> GlobalRdrEnv
+depAnalTyClDecls :: [(Name, Name)]
+                 -> GlobalRdrEnv
                  -> NameSet                         -- Names in the current HsGroup
                  -> KindSig_FV_Env                  -- FVs of standalone kind signatures
                  -> [(LTyClDecl GhcRn, FreeNames)]
                  -> [SCC (LTyClDecl GhcRn, NameSet)]
-depAnalTyClDecls hidden rdr_env tc_names kisig_fv_env ds_w_fvs
+depAnalTyClDecls owner_edges rdr_env tc_names kisig_fv_env ds_w_fvs
   = stronglyConnCompFromEdgedVerticesUniq edges
   where
-    lifted_owners = mkOccEnv hidden
-    names_by_occ = mkOccEnv [(nameOccName name, name) | name <- nonDetEltsUniqSet tc_names]
-    -- The application supplies an edge from the owner to the lifted family.
-    -- Add the reverse edge when they need to share kind inference.
-    owner_edge name = mkNameSet
-      [owner | Just occ <- maybeToList (lookupOccEnv lifted_owners (nameOccName name))
-             , owner <- maybeToList (lookupOccEnv names_by_occ occ)]
+    owner_map = mkNameEnv owner_edges
+    owner_edge name = maybe emptyNameSet unitNameSet (lookupNameEnv owner_map name)
     -- Build a graph where each node is a `TyClDecl` keyed by its name, and
     -- its `FreeNames` give rise to edges.
     -- Step (TCDEP3) of Note [Dependency analysis of type and class decls]
@@ -5743,22 +3744,16 @@ mkInstGroups rdr_env tc_names inst_ds_fvs
 *                                                       *
 ****************************************************** -}
 
-rnTyClDecl :: OccEnv (OccName, Bool) -> TyClDecl GhcPs
+rnTyClDecl :: TyClDecl GhcPs
            -> RnM (TyClDecl GhcRn, FreeNames)
 
 -- All flavours of top-level type family declarations ("type family", "newtype
 -- family", and "data family")
-rnTyClDecl scopes (FamDecl { tcdFam = fam })
+rnTyClDecl (FamDecl { tcdFam = fam })
   = do { (fam', fvs) <- rnFamDecl Nothing fam
-       ; info <- case fdInfo fam' of
-           ClosedTypeFamily (anns, _) equations
-             | Just (root, is_sum) <- lookupOccEnv scopes (rdrNameOcc (unLoc (fdLName fam))) -> do
-                 owner <- getName <$> lookupTopBndrRn WL_TyCon (mkRdrUnqual root)
-                 pure (ClosedTypeFamily (anns, Just (owner, is_sum)) equations)
-           ordinary -> pure ordinary
-       ; return (FamDecl noExtField fam' { fdInfo = info }, fvs) }
+       ; return (FamDecl noExtField fam', fvs) }
 
-rnTyClDecl _ (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
+rnTyClDecl (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
                       tcdFixity = fixity, tcdRhs = rhs })
   = do { tycon' <- lookupLocatedTopBndrRnN WL_TyCon tycon
        ; let kvs = extractHsTyRdrTyVarsKindVars rhs
@@ -5776,7 +3771,7 @@ rnTyClDecl _ (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
       addDiagnosticAt (getLocA kv) (TcRnImplicitRhsQuantification kv)
 
 -- "data", "newtype" declarations
-rnTyClDecl _ (DataDecl
+rnTyClDecl (DataDecl
     { tcdLName = tycon, tcdTyVars = tyvars,
       tcdFixity = fixity,
       tcdDataDefn = defn@HsDataDefn{ dd_cons = cons, dd_kindSig = kind_sig},
@@ -5808,7 +3803,7 @@ rnTyClDecl _ (DataDecl
                           , tcdDExt     = rn_info
                           , tcdModifiers = mods' }, fvs `plusFN` mods_fvs) } }
 
-rnTyClDecl _ (ClassDecl { tcdCtxt = context, tcdLName = lcls,
+rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
                         tcdTyVars = tyvars, tcdFixity = fixity,
                         tcdFDs = fds,
                         tcdDecls = decls,

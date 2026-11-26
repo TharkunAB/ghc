@@ -22,8 +22,8 @@ module GHC.Rename.HsType (
         lookupField, mkHsOpTyRn,
         rnLTyVar, classifyTypeCasePattern, warnPunnedTypeSyntax, warnPunnedTyConSyntax,
 
-        rnHsConDeclField, rnRetainedSigType, rnHsSigWcTypeWithSplice,
-        SignatureSpliceSite(..), isInferredForEachBndr, splitForEachBndrModifiers,
+        rnHsConDeclField, rnRetainedSigType,
+        isInferredForEachBndr, splitForEachBndrModifiers,
         rnWithRetainedAliases,
 
         -- Precence related stuff
@@ -53,11 +53,12 @@ import {-# SOURCE #-} GHC.Rename.Splice( rnSpliceType, rnSpliceTypeWith,
                                         checkThLocalTyName, checkThLocalNameNoLift )
 
 import GHC.Core.TyCo.FVs ( tyCoVarsOfTypeList )
+import GHC.Core.TyCo.Rep ( Type )
 import GHC.Core.TyCon    ( isKindName )
 import GHC.Driver.DynFlags ( baseUnitId, getDynFlags )
 import GHC.Driver.Flags
 import GHC.Data.List.SetOps (findDupsEq)
-import GHC.Iface.Env     ( lookupOrig )
+import GHC.Iface.Env     ( lookupOrig, newGlobalBinder )
 import GHC.Parser.PostProcess (setRdrNameSpace)
 
 import GHC.Hs
@@ -66,7 +67,8 @@ import GHC.Rename.Env
 import GHC.Rename.Doc
 import GHC.Rename.Utils  ( mapFvRn, bindLocalNamesFV, bindImplicitLocalNamesFV
                          , typeAppErr, newLocalBndrRn, checkDupRdrNames
-                         , checkShadowedRdrNames, recordImplicitPunBinders )
+                         , checkShadowedRdrNames, recordImplicitPunBinders
+                         , warnUnusedTypePatterns )
 import GHC.Rename.Fixity ( lookupFieldFixityRn, lookupFixityRn
                          , lookupTypeFixityRn, lookupTypeFixityWithUsesRn )
 import GHC.Rename.Unbound ( notInScopeErr, WhereLooking(WL_LocalOnly) )
@@ -94,6 +96,7 @@ import GHC.Builtin.WiredIn.Types( listTyConName, oneDataConName )
 import GHC.Unit.Module ( getModule, mkModule, mkModuleName )
 import GHC.Unit.Types  ( GenUnit(RealUnit), Definite(Definite) )
 
+import GHC.Utils.Encoding (zEncodeString)
 import GHC.Utils.Lexeme (isLexVarSym)
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
@@ -101,6 +104,7 @@ import GHC.Utils.Panic
 import GHC.Data.FastString
 import GHC.Data.Maybe
 import qualified GHC.LanguageExtensions as LangExt
+import Language.Haskell.Syntax.Specificity (Specificity(SpecifiedSpec))
 
 import Data.Foldable (for_)
 import Data.List (nubBy, partition)
@@ -164,119 +168,46 @@ rnLocalHsSigWcType bound_names doc ty@(HsWC { hswc_body = sig_ty })
        ; rnWithRetainedAliases bound_names RetainedPartialSignature free_vars sig_ty $
            rnScopedHsSigWcType doc ty }
 
--- | Use the local type-lambda lifter in the current declaration group.
+-- | Rename a scoped local signature.
 rnScopedHsSigWcType :: HsDocContext -> LHsSigWcType GhcPs
                     -> RnM (LHsSigWcType GhcRn, FreeNames)
-rnScopedHsSigWcType doc ty =
-  tryLiftLocalTypeLambdas doc ty >>= maybe (rnHsSigWcType doc ty) pure
+rnScopedHsSigWcType = rnHsSigWcType
 
--- | Try the local type-lambda lifter while renaming a declaration group.
-tryLiftLocalTypeLambdas :: HsDocContext -> LHsSigWcType GhcPs
-                        -> RnM (Maybe (LHsSigWcType GhcRn, FreeNames))
-tryLiftLocalTypeLambdas doc ty = do
-  level <- getThLevel
-  lift_lambdas <- tcg_rn_local_lambdas <$> getGblEnv
-  case (level, lift_lambdas) of
-    (Comp, Just (scope, lift_sig)) -> lift_sig scope doc ty
-    -- See Note [Lifting type lambdas in typed quotations] in GHC.Rename.Module.
-    (Brack Comp RnPendingTyped, Just (scope, lift_sig)) -> lift_sig scope doc ty
-    (Brack (Splice Typed Comp) RnPendingTyped, Just (scope, lift_sig)) -> lift_sig scope doc ty
-    _ -> pure Nothing
-
--- | Get the optional written kinds of explicitly scoped erased binders.
+-- | Retained for compatibility with signature-scoping callers in "GHC.Rename.Bind".
 signatureWrittenKinds :: [Name] -> LHsSigType GhcRn -> LocalSignatureKinds
-signatureWrittenKinds scoped (L _ HsSig{sig_bndrs = HsOuterExplicit{hso_bndrs = binders}}) =
-  [(v, writtenKind kind) | L _ HsTvb{tvb_var = HsBndrVar _ v, tvb_kind = kind} <- binders
-                        , unLoc v `elem` scoped]
-  where
-    writtenKind (HsBndrKind _ kind) = Just kind
-    writtenKind _ = Nothing
 signatureWrittenKinds _ _ = []
 
--- | Scope kinds only while the corresponding signature binds the variables.
+-- | Retained for compatibility with signature-scoping callers in "GHC.Rename.Bind".
 withWrittenSignatureKinds :: LocalSignatureKinds -> RnM a -> RnM a
-withWrittenSignatureKinds [] action = action
-withWrittenSignatureKinds kinds action = do
-  scoped <- xoptM LangExt.ScopedTypeVariables
-  if scoped
-    then updGblEnv (\env -> env { tcg_rn_local_lambdas =
-          (\(scope, lift_sig) -> (scope ++ kinds, lift_sig)) <$> tcg_rn_local_lambdas env }) action
-    else action
+withWrittenSignatureKinds _ action = action
 
 -- | Rename a visible type argument with aliases for lexical runtime indices.
+-- Preserve the written syntax in 'HsAppTypeSource' when the argument contains
+-- a type lambda so diagnostics print the source argument.
 -- See Note [Runtime indices in visible type arguments].
 rnHsTypeApp :: LHsWcType GhcPs
             -> RnM (LHsWcType GhcRn, Maybe HsAppTypeSource, FreeNames)
 rnHsTypeApp ty@(HsWC { hswc_body = hs_ty })
   = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
-       ; if experimental
-         then do { free_vars <- filterInScopeM (extractHsTyRdrTyVars hs_ty)
-                 ; rnWithRetainedAliases emptyNameSet RetainedPartialTypeArgument free_vars hs_ty $
-                     rn_argument }
-         else ordinary_argument }
+       ; (argument, fvs) <- if experimental
+           then do { free_vars <- filterInScopeM (extractHsTyRdrTyVars hs_ty)
+                   ; rnWithRetainedAliases emptyNameSet RetainedPartialTypeArgument free_vars hs_ty $
+                       rnHsWcType HsTypeCtx ty }
+           else rnHsWcType HsTypeCtx ty
+       ; let src = if experimental && hasRenamedTypeLambda (hswc_body argument)
+                   then Just (HsAppTypeSource ty)
+                   else Nothing
+       ; pure (argument, src, fvs) }
   where
-    ordinary_argument = finish False <$> rnHsWcType HsTypeCtx ty
-
-    rn_argument
-      | hasParsedRetainedPi hs_ty = ordinary_argument
-      | otherwise = do
-          lifted <- try_lift_argument hs_ty
-          case lifted of
-            Just result -> pure (finish True result)
-            Nothing -> do
-              lifted_splice <- newTcRef False
-              result <- rnHsWcTypeWithSplice
-                (rn_argument_splice (writeTcRef lifted_splice True)) HsTypeCtx ty
-              changed <- readTcRef lifted_splice
-              pure (finish changed result)
-
-    finish lifted (argument, fvs) =
-      (argument, if lifted then Just (HsAppTypeSource ty) else Nothing, fvs)
-
-    rn_argument_splice remember_lift = rnSpliceTypeWith [] $ \raw -> do
-      lifted <- if hasParsedRetainedPi raw then pure Nothing else try_lift_argument raw
-      case lifted of
-        Just (HsWC { hswc_body = body }, fvs) -> do
-          _ <- remember_lift
-          pure (body, fvs)
-        Nothing -> rnLHsType (SpliceTypeCtx raw) raw
-
-    try_lift_argument :: LHsType GhcPs -> RnM (Maybe (LHsWcType GhcRn, FreeNames))
-    try_lift_argument body = do
-      -- See Note [Type lambdas in visible type arguments].
-      let wrapper = HsWC noExtField
-                      (L (l2l (getLoc body)) (mkHsExplicitSigType noAnn [] body))
-      lifted <- tryLiftLocalTypeLambdas HsTypeCtx wrapper
-      pure $ case lifted of
-        Just (HsWC { hswc_ext = wcs, hswc_body = L _ HsSig { sig_body = result } }, fvs)
-          -> Just (HsWC wcs result, fvs)
-        Nothing -> Nothing
-
-{- Note [Type lambdas in visible type arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In rowFor @(\cell -> Either e cell), e can refer to an enclosing
-ScopedTypeVariables binder. A visible type argument cannot bind a free
-type variable. Give the local signature lifter an empty explicit
-telescope so it lifts lambdas with the same lexical scope as the argument.
-Discard the temporary signature after lifting. The type checker receives
-the result as an ordinary visible type argument.
-
-Keep the written argument for diagnostics when the lifter emits a helper.
-The argument may contain a splice whose result needs lifting. Record the
-lift in its renaming continuation. The written copy is never renamed or
-type checked.
-
-The local lifter accepts only copyable types. When it emits no helper,
-rename the original argument with rnHsWcType. Ordinary wildcards and the
-checks for retained Pi arguments use their existing visible argument path.
-In an untyped quote, leave the lambda in the quoted syntax. The lifter
-runs when the argument is spliced into the ordinary declaration group.
-
-In rowFor @($([t| \err cell -> Either err cell |]) e), the renamer
-first runs the type splice. Use its normal continuation to try lifting
-the resulting type. The splice runs once and retains its finalizers.
-If lifting fails, rename the result in the ordinary SpliceTypeCtx.
--}
+    hasRenamedTypeLambda :: Data a => a -> Bool
+    hasRenamedTypeLambda thing
+      | Just (L _ (XHsType HsTypeLambdaQuoteRn{})) <- (cast thing :: Maybe (LHsType GhcRn)) = True
+      | Just (L _ (XHsType HsTypeLambdaCheckRn{})) <- (cast thing :: Maybe (LHsType GhcRn)) = True
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = hasRenamedTypeLambda inner
+      | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = False
+      | Just _ <- (cast thing :: Maybe Name) = False
+      | otherwise = or (gmapQ hasRenamedTypeLambda thing)
 
 -- | Scope aliases for complete types that capture lexical runtime Names.
 -- The excluded Names belong to an unavailable signature binding group.
@@ -400,30 +331,16 @@ Keep all other signatures
 on the ordinary path. Type splices and compiler Core types have no parsed
 signature wildcard to inspect here.
 
-Agda checks a declared let type and its RHS in the existing local context.
-See docs/dependent-haskell/REFERENCES.md for the pinned let-checking sources.
-This precedent does not make Haskell runtime bindings definitionally transparent.
-The index remains the actual opaque Id. No RHS is unfolded or evaluated.
+Agda checks a declared let type and its RHS in the existing local context
+(Norell, PhD thesis, 2007). This precedent does not make Haskell runtime bindings
+definitionally transparent: the index remains the actual opaque Id and no RHS is
+unfolded or evaluated (GHC Proposal #378).
 -}
 
 rnHsSigWcType :: HsDocContext
               -> LHsSigWcType GhcPs
               -> RnM (LHsSigWcType GhcRn, FreeNames)
-rnHsSigWcType = rnHsSigWcTypeWithSplice (\_ _ -> rnSpliceType)
-
--- | Whether a splice supplies the entire signature or a type within it.
-data SignatureSpliceSite
-  = CompleteSignatureSplice
-  | NestedSignatureSplice (HsOuterSigTyVarBndrs GhcRn) [LHsTyVarBndr () GhcRn]
-
--- | Rename a type splice and return its free names.
-type RenameTypeSplice = HsUntypedSplice GhcPs -> RnM (HsType GhcRn, FreeNames)
-
--- | Allow a top-level signature checker to rename its type splices.
-rnHsSigWcTypeWithSplice
-  :: (SignatureSpliceSite -> HsDocContext -> RenameTypeSplice)
-  -> HsDocContext -> LHsSigWcType GhcPs -> RnM (LHsSigWcType GhcRn, FreeNames)
-rnHsSigWcTypeWithSplice rename_splice doc (HsWC { hswc_body =
+rnHsSigWcType doc (HsWC { hswc_body =
     sig_ty@(L loc (HsSig{sig_bndrs = outer_bndrs, sig_body = body_ty })) })
   = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
        ; free_vars <- filterInScopeM (extract_lhs_sig_ty sig_ty)
@@ -433,12 +350,10 @@ rnHsSigWcTypeWithSplice rename_splice doc (HsWC { hswc_body =
            case retainedWildcardSpan body_ty `mplus`
                 (getLocA <$> listToMaybe nwc_rdrs) of
              Nothing -> pure ()
-             Just loc -> setSrcSpan loc $
+             Just wc_loc -> setSrcSpan wc_loc $
                failWithTc $ TcRnRetainedQuantificationError RetainedPartialSignature
        ; bindHsOuterTyVarBndrs doc Nothing imp_tv_nms outer_bndrs $ \outer_bndrs' ->
-    do { let nested_splice retained =
-               rename_splice (NestedSignatureSplice outer_bndrs' retained) doc
-             env = (mkTyKiEnv doc TypeLevel RnTypeBody){rtke_splice = nested_splice}
+    do { let env = mkTyKiEnv doc TypeLevel RnTypeBody
        ; (wcs, body_ty', fvs) <-
            if | hsHasForEachTy (unLoc body_ty)
               -> do { case doc of
@@ -451,13 +366,20 @@ rnHsSigWcTypeWithSplice rename_splice doc (HsWC { hswc_body =
               | HsOuterImplicit{} <- outer_bndrs
               , L splice_loc (HsSpliceTy _ splice) <- body_ty
               -> setSrcSpanA splice_loc $ do
-                   (body', fvs) <- rename_splice CompleteSignatureSplice doc splice
+                   (body', fvs) <- rnSpliceTypeWith [] (rnSpliceSigBody doc) splice
                    pure ([], L splice_loc body', fvs)
-              | otherwise -> rnWcBodyTyKiWithSplice nested_splice TypeLevel doc nwc_rdrs body_ty
+              | otherwise -> rnWcBodyTyKi TypeLevel doc nwc_rdrs body_ty
        ; pure ( HsWC  { hswc_ext = wcs, hswc_body = L loc $
                 HsSig { sig_ext = noExtField
                       , sig_bndrs = outer_bndrs', sig_body = body_ty' }}
               , fvs) } }
+  where
+    rnSpliceSigBody ctxt raw
+      | TypeSigCtx{} <- ctxt
+      , hsHasForEachTy (unLoc raw)
+      = rnRetainedSigType ctxt raw
+      | otherwise
+      = rnLHsType (SpliceTypeCtx raw) raw
 
 -- | Rename retained telescopes in the arrow positions of a value signature.
 -- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
@@ -525,7 +447,7 @@ rnRetainedTelescope env rn_body bndrs body
                ; name <- newLocalBndrRn (L lv term_rdr)
                ; let occ = setOccNameSpace tvName (rdrNameOcc rdr)
                      bndr' = L lb (rebuildForEachBndr lb xb (HsBndrVar noExtField (L lv name)) mods' mb_kind')
-                     env' = env{rtke_splice = rtke_splice env . (bndr' :)}
+                     env' = env{rtke_indices = rtke_indices env ++ [name]}
                ; ((rest', body'), body_fvs) <- bindLocalNamesFV [name] $
                    do { rdr_env <- getLocalRdrEnv
                       ; setLocalRdrEnv (extendLocalRdrEnvWithAlias rdr_env occ name) $
@@ -535,8 +457,7 @@ rnRetainedTelescope env rn_body bndrs body
             do { (mods', mod_fvs) <- mapFvRn (rnModifier env) mods
                ; (mb_kind', domain_fvs) <- rn_bndr_kind raw_kind
                ; let bndr' = L lb (rebuildForEachBndr lb xb (HsBndrWildCard hk) mods' mb_kind')
-                     env' = env{rtke_splice = rtke_splice env . (bndr' :)}
-               ; ((rest', body'), body_fvs) <- bind_bndrs env' rest
+               ; ((rest', body'), body_fvs) <- bind_bndrs env rest
                ; pure ((bndr' : rest', body'), plusFNs [mod_fvs, domain_fvs, body_fvs]) }
           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedBinderNeedsName
       where
@@ -641,7 +562,6 @@ again to catch holes in already-expanded splices, including sibling arguments.
 Do not expand a splice twice or inspect its module finalizers. Ordinary arguments
 such as @_ keep their existing rules. Generated holes within a Pi also remain
 subject to the typechecker's native-index completeness guard.
-See Note [Retained Pi type arguments] in GHC.Tc.Gen.HsType.
 -}
 
 rnHsPatSigType :: HsPatSigTypeScoping
@@ -690,31 +610,17 @@ rnHsPatSigTyKi level scoping ctx sig_ty thing_inside
     pat_sig_ty = hsPatSigType sig_ty
 
 rnHsWcType :: HsDocContext -> LHsWcType GhcPs -> RnM (LHsWcType GhcRn, FreeNames)
-rnHsWcType = rnHsWcTypeWithSplice rnSpliceType
-
--- | Rename wildcards and use the caller's continuation for type splices.
-rnHsWcTypeWithSplice :: RenameTypeSplice -> HsDocContext -> LHsWcType GhcPs
-                    -> RnM (LHsWcType GhcRn, FreeNames)
-rnHsWcTypeWithSplice rename_splice ctxt (HsWC { hswc_body = hs_ty })
+rnHsWcType ctxt (HsWC { hswc_body = hs_ty })
   = do { free_vars <- filterInScopeM (extractHsTyRdrTyVars hs_ty)
        ; (nwc_rdrs', _) <- partition_nwcs free_vars
        ; let nwc_rdrs = nubL nwc_rdrs'
-       ; (wcs, hs_ty', fvs) <- rnWcBodyTyKiWithSplice (const rename_splice)
-                                TypeLevel ctxt nwc_rdrs hs_ty
+       ; (wcs, hs_ty', fvs) <- rnWcBodyTyKi TypeLevel ctxt nwc_rdrs hs_ty
        ; let sig_ty' = HsWC { hswc_ext = wcs, hswc_body = hs_ty' }
        ; return (sig_ty', fvs) }
 
-
 rnWcBodyTyKi :: TypeOrKind -> HsDocContext -> [LocatedN RdrName] -> LHsType GhcPs
-         -> RnM ([Name], LHsType GhcRn, FreeNames)
-rnWcBodyTyKi = rnWcBodyTyKiWithSplice (const rnSpliceType)
-
--- | Rename a type with wildcards using the caller's splice continuation.
-rnWcBodyTyKiWithSplice
-  :: ([LHsTyVarBndr () GhcRn] -> RenameTypeSplice)
-  -> TypeOrKind -> HsDocContext -> [LocatedN RdrName] -> LHsType GhcPs
-  -> RnM ([Name], LHsType GhcRn, FreeNames)
-rnWcBodyTyKiWithSplice rename_splice level ctxt nwc_rdrs hs_ty
+             -> RnM ([Name], LHsType GhcRn, FreeNames)
+rnWcBodyTyKi level ctxt nwc_rdrs hs_ty
   = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
        ; let pi_argument = experimental && TypeLevel == level &&
                  case ctxt of
@@ -727,11 +633,7 @@ rnWcBodyTyKiWithSplice rename_splice level ctxt nwc_rdrs hs_ty
              Just loc -> setSrcSpan loc $
                failWithTc $ TcRnRetainedQuantificationError RetainedPartialTypeArgument
        ; nwcs <- mapM newLocalBndrRn nwc_rdrs
-       ; let env = RTKE { rtke_level = level
-                        , rtke_what  = RnTypeBody
-                        , rtke_nwcs  = mkNameSet nwcs
-                        , rtke_ctxt  = ctxt
-                        , rtke_splice = rename_splice }
+       ; let env = (mkTyKiEnv ctxt level RnTypeBody) { rtke_nwcs = mkNameSet nwcs }
        ; (hs_ty', fvs) <- bindLocalNamesFV nwcs $
                           rn_lty env hs_ty
        ; when pi_argument $
@@ -752,11 +654,12 @@ rnWcBodyTyKiWithSplice rename_splice level ctxt nwc_rdrs hs_ty
       = rnHsTyKi env ty
 
     rn_ty env (HsForAllTy { hst_tele = tele, hst_body = hs_body })
-      = bindHsForAllTelescope (rtke_ctxt env) tele $ \ tele' ->
-        do { (hs_body', fvs) <- rn_lty env hs_body
-           ; return (HsForAllTy { hst_xforall = noExtField
-                                , hst_tele = tele', hst_body = hs_body' }
-                    , fvs) }
+      = do { env' <- updateForAllScope env tele
+           ; bindHsForAllTelescope (rtke_ctxt env) tele $ \ tele' ->
+             do { (hs_body', fvs) <- rn_lty env' hs_body
+                ; return (HsForAllTy { hst_xforall = noExtField
+                                     , hst_tele = tele', hst_body = hs_body' }
+                         , fvs) } }
 
     rn_ty env (HsQualTy { hst_ctxt = L cx (HsContext ac hs_ctxt)
                         , hst_body = hs_ty })
@@ -940,15 +843,18 @@ want a gratuitous knot.
 -}
 
 data RnTyKiEnv
-  = RTKE { rtke_ctxt  :: HsDocContext
-         , rtke_level :: TypeOrKind  -- Am I renaming a type or a kind?
-         , rtke_what  :: RnTyKiWhat  -- And within that what am I renaming?
-         , rtke_nwcs  :: NameSet     -- These are the in-scope named wildcards
-         , rtke_splice :: [LHsTyVarBndr () GhcRn] -> RenameTypeSplice
+  = RTKE { rtke_ctxt             :: HsDocContext
+         , rtke_level            :: TypeOrKind  -- Am I renaming a type or a kind?
+         , rtke_what             :: RnTyKiWhat  -- And within that what am I renaming?
+         , rtke_nwcs             :: NameSet     -- These are the in-scope named wildcards
+         , rtke_indices          :: [Name]      -- Enclosing retained foreach binders
+         , rtke_outer_tvs        :: NameSet     -- Enclosing local type binders before shadowing
+         , rtke_lambda_forall_ok :: Bool        -- Enclosing nested foralls permit type lambdas
+         , rtke_case_forall_ok   :: Bool        -- Enclosing nested foralls permit type cases
     }
 
 data RnTyKiWhat = RnTypeBody
-                | RnTypeCasePat     -- A classified type-case pattern in a quote
+                | RnTypeCasePat     -- A classified type-case pattern
                 | RnGadtSuffix      -- The right spine of an ordered GADT signature
                 | RnTopConstraint   -- Top-level context of HsSigWcTypes
                 | RnConstraint      -- All other constraints
@@ -971,7 +877,35 @@ mkTyKiEnv :: HsDocContext -> TypeOrKind -> RnTyKiWhat -> RnTyKiEnv
 mkTyKiEnv cxt level what
  = RTKE { rtke_level = level, rtke_nwcs = emptyNameSet
         , rtke_what = what, rtke_ctxt = cxt
-        , rtke_splice = const rnSpliceType }
+        , rtke_indices = [], rtke_outer_tvs = emptyNameSet
+        , rtke_lambda_forall_ok = True, rtke_case_forall_ok = True }
+
+updateForAllScope :: RnTyKiEnv -> HsForAllTelescope GhcPs -> RnM RnTyKiEnv
+updateForAllScope env tele = do
+  lcl <- getLocalRdrEnv
+  let outer_tvs' = rtke_outer_tvs env `unionNameSet` mkNameSet (localRdrEnvElts lcl)
+      (lam_ok, case_ok) = case tele of
+        HsForAllInvis { hsf_matchability = mb_ma, hsf_invis_bndrs = bndrs }
+          | allows_forall_ma mb_ma
+          , Just rdrs <- traverse spec_bndr bndrs
+          , null (findDupsEq (==) rdrs)
+          -> let kind_occs = map unLoc (extractHsTyVarBndrsKVs bndrs)
+                 all_kinded = all (\b -> has_kind b || maybe False (`elem` kind_occs) (hsLTyVarName b)) bndrs
+                 no_shadow  = not (any (`elemLocalRdrEnv` lcl) rdrs)
+                 ty_syn_ctx = case rtke_ctxt env of { TySynCtx{} -> True; _ -> False }
+             in ( rtke_lambda_forall_ok env && (not ty_syn_ctx || no_shadow)
+                , rtke_case_forall_ok env && all_kinded && (not ty_syn_ctx || no_shadow) )
+        _ -> (False, False)
+  pure (env { rtke_outer_tvs = outer_tvs', rtke_lambda_forall_ok = lam_ok, rtke_case_forall_ok = case_ok })
+  where
+    allows_forall_ma Nothing = True
+    allows_forall_ma (Just (L _ (HsTyVar _ _ (L _ r)))) =
+      occNameString (rdrNameOcc r) `elem` ["Unmatchable", "U"]
+    allows_forall_ma _ = False
+    spec_bndr (L _ HsTvb { tvb_flag = SpecifiedSpec, tvb_var = HsBndrVar _ (L _ rdr) }) = Just rdr
+    spec_bndr _ = Nothing
+    has_kind (L _ HsTvb { tvb_kind = HsBndrKind{} }) = True
+    has_kind _ = False
 
 isRnKindLevel :: RnTyKiEnv -> Bool
 isRnKindLevel (RTKE { rtke_level = KindLevel }) = True
@@ -1141,8 +1075,9 @@ rnHsTyKi env (HsForEachTy x bndrs body)
 
 rnHsTyKi env ty@(HsForAllTy { hst_tele = tele, hst_body = tau })
   = do { checkPolyKinds env (HsType ty)
+       ; env' <- updateForAllScope env tele
        ; bindHsForAllTelescope (rtke_ctxt env) tele $ \ tele' ->
-    do { (tau',  fvs) <- rnLHsTyKi env tau
+    do { (tau',  fvs) <- rnLHsTyKi env' tau
        ; return ( HsForAllTy { hst_xforall = noExtField
                              , hst_tele = tele' , hst_body =  tau' }
                 , fvs) } }
@@ -1257,8 +1192,12 @@ rnHsTyKi _ (HsStarTy x)
   = return (HsStarTy x, emptyFNs)
 
 rnHsTyKi env (HsSpliceTy _ sp)
-  | isRnKindLevel env = rnSpliceType sp
-  | otherwise = rtke_splice env [] sp
+  | isRnKindLevel env || null (rtke_indices env) = rnSpliceType sp
+  | otherwise = flip (rnSpliceTypeWith (rtke_indices env)) sp $ \raw ->
+      let splice_env = env { rtke_ctxt = SpliceTypeCtx raw, rtke_nwcs = emptyNameSet }
+      in if hsHasForEachTy (unLoc raw)
+         then rnRetainedSigTypeWith splice_env raw
+         else rnLHsTyKi splice_env raw
 
 rnHsTyKi env (HsDocTy x ty haddock_doc)
   = do { (ty', fvs) <- rnLHsTyKi env ty
@@ -1290,41 +1229,79 @@ rnHsTyKi env ty@(XHsType (HsBangTy _ bang (L _ inner))) = do
       TcRnUnexpectedAnnotation ty bang
   rnHsTyKi env inner
 
+-- See Note [Renaming type lambdas and type cases].
 rnHsTyKi env (XHsType (HsTypeLambda _ binders body)) = do
   enabled <- xoptM LangExt.ExperimentalDependentTypes
   unless enabled $ failWithTc TcRnTypeLambdaDisabled
+  when (isRnKindLevel env || null binders) $ failWithTc TcRnTypeLambdaContext
   level <- getThLevel
-  let rename_lambda = do
+  let rename_parts = do
         checkDupRdrNames binders
         binders' <- traverse (\binder -> L (getLoc binder) <$> newLocalBndrRn binder) binders
         (body', fvs) <- bindLocalNamesFV (map unLoc binders') (rnLHsTyKi env body)
+        pure ((binders', body'), fvs)
+      rename_quote = do
+        ((binders', body'), fvs) <- rename_parts
         pure (XHsType (HsTypeLambdaQuoteRn binders' body'), fvs)
+      reject_wildcards body' fvs =
+        when (hasExprWildcardRn body' || not (isEmptyNameSet (fvs `intersectNameSet` rtke_nwcs env))) $
+          failWithTc TcRnTypeLambdaContext
   case level of
-    -- See Note [Quoting type lambdas] in GHC.HsToCore.Quote.
-    UntypedBrack{} -> rename_lambda
+    UntypedBrack{} -> rename_quote
+    Comp -> do
+      unless (rtke_lambda_forall_ok env && allowed_lambda_ctxt (rtke_ctxt env)) $
+        failWithTc TcRnTypeLambdaContext
+      ((binders', body'), fvs) <- rename_parts
+      reject_wildcards body' fvs
+      pure (XHsType (HsTypeLambdaQuoteRn binders' body'), fvs)
+    Brack Comp RnPendingTyped -> rn_typed_quote rename_parts reject_wildcards
+    Brack (Splice Typed Comp) RnPendingTyped -> rn_typed_quote rename_parts reject_wildcards
     Brack _ RnPendingTyped -> do
-      -- If lifting failed, still report any scope errors in the callback.
-      _ <- checkNoErrs rename_lambda
+      _ <- checkNoErrs rename_quote
       failWithTc TcRnTypeLambdaContext
     _ -> failWithTc TcRnTypeLambdaContext
+  where
+    allowed_lambda_ctxt TySynCtx{}         = True
+    allowed_lambda_ctxt TypeSigCtx{}       = True
+    allowed_lambda_ctxt ConDeclCtx{}       = True
+    allowed_lambda_ctxt ExprWithTySigCtx{} = True
+    allowed_lambda_ctxt HsTypeCtx{}        = True
+    allowed_lambda_ctxt SpliceTypeCtx{}    = True
+    allowed_lambda_ctxt _                  = False
 
--- See Note [Checking local lambda captures] in GHC.Tc.Gen.HsType.
-rnHsTyKi env (XHsType (HsTypeLambdaCheck binders body helper)) = do
-  checkDupRdrNames binders
-  binders' <- traverse (\bndr -> L (getLoc bndr) <$> newLocalBndrRn bndr) binders
-  (body', body_fvs) <- bindLocalNamesFV (map unLoc binders') (rnLHsTyKi env body)
-  -- An ordinary type can resolve to a source term in this extension.
-  -- A generated source family can still select executable code.
-  let source_name name = isVarName name || isJust (sourceTableTermOcc (nameOccName name))
-  when (nameSetAny source_name body_fvs) $
-    failWithTc TcRnTypeLambdaContext
-  (helper', helper_fvs) <- rnLHsTyKi env helper
-  pure (XHsType (HsTypeLambdaCheckRn binders' body' helper'),
-        body_fvs `plusFN` helper_fvs)
+    typed_quote_label (TypeSigCtx (L _ rdr : _)) = Just (occNameString (rdrNameOcc rdr))
+    typed_quote_label ExprWithTySigCtx           = Just "$expression"
+    typed_quote_label HsTypeCtx                  = Just "$type-argument"
+    typed_quote_label _                          = Nothing
 
--- Lower uncaptured @some (x :: A) | B@ (and @.@) directly to @Sigma A (\x -> B)@
--- when top-level family lifting in "GHC.Rename.Module" did not rewrite it.
--- See Note [Direct lowering of uncaptured some types] in GHC.Tc.Gen.HsType.
+    rn_typed_quote rename_parts reject_wildcards =
+      case typed_quote_label (rtke_ctxt env) of
+        Just owner_label | rtke_lambda_forall_ok env -> do
+          ((binders', body'), fvs) <- rename_parts
+          reject_wildcards body' fvs
+          let source_name nm = isVarName nm || isJust (sourceTableTermOcc (nameOccName nm))
+          when (nameSetAny source_name fvs) $ failWithTc TcRnTypeLambdaContext
+          cur_mod <- getModule
+          uniq_occ <- chooseUniqueOccTc (mkInstTyTcOcc "$typed-quote")
+          loc <- getSrcSpanM
+          let suffix  = zEncodeString (occNameString uniq_occ)
+              syn_occ = mkTcOcc ("$signature-lambda:" ++ owner_label ++ ":" ++ suffix)
+          syn_name <- newGlobalBinder cur_mod syn_occ Nothing loc
+          let bound_set = mkNameSet (map unLoc binders')
+              caps      = freeLocalTyVarsInOrder bound_set body'
+              syn_var   = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr syn_name)))
+              cap_vars  = [noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr c))) | c <- caps]
+              helper    = foldl' mkHsAppTy syn_var cap_vars
+          pure (XHsType (HsTypeLambdaCheckRn binders' body' helper), fvs `addOneFN` syn_name)
+        _ -> do
+          _ <- checkNoErrs rename_parts
+          failWithTc TcRnTypeLambdaContext
+
+rnHsTyKi _ (XHsType HsTypeLambdaCheck{}) = failWithTc TcRnTypeLambdaContext
+
+-- Lower @some (x :: A) | B@ (and @.@) directly to @Sigma A (\x -> B)@
+-- via 'HsTypeLambdaQuoteRn'.
+-- See Note [Post-renaming lowering of lambdas, sums, and cases] in GHC.Tc.Gen.HsType.
 rnHsTyKi env (XHsType (HsTypeSome _ binder domain body)) = do
   experimental <- xoptM LangExt.ExperimentalDependentTypes
   unless (experimental && not (isRnKindLevel env)) $
@@ -1358,9 +1335,7 @@ rnHsTyKi env (XHsType (HsTypeSome _ binder domain body)) = do
       pure ( HsAppTy noExtField (noLocA (HsAppTy noExtField sigma_ty domain')) lam_ty
            , plusFNs [dom_fvs, body_fvs, unitFN sigma_name] )
 
--- A bare case pattern prefers a data constructor, as before. Resolve it
--- after the declaration group is in scope. If the data name is absent,
--- use the ordinary type namespace and the ordinary family-pattern checks.
+-- A bare case pattern prefers a data constructor, falling back to the type namespace.
 rnHsTyKi env (XHsType (HsTypeCaseHead name))
   = do { let data_name = fmap (`setRdrNameSpace` srcDataName) name
        ; found <- lookupOccRn_maybe (unLoc data_name)
@@ -1369,16 +1344,7 @@ rnHsTyKi env (XHsType (HsTypeCaseHead name))
            Nothing -> rnHsTyVar lookupTypeOccRn env (HsTyVar noAnn NotPromoted name) NotPromoted
                         (fmap (`setRdrNameSpace` tcName) name) }
 
-rnHsTyKi env (XHsType (HsTypeCaseAlias generated (owner, index, alias) body)) = do
-  -- Compiler-generated family arguments are absent from the source pattern.
-  -- Keep the normal unused binder check for written constructor fields.
-  generated_names <- mapM (lookupOccRn WL_TyVar) generated
-  owner' <- lookupLocatedOccRn WL_TyCon owner
-  alias' <- forM alias $ \binder -> do
-    name <- newLocalBndrRn binder
-    pure (fmap (const name) binder)
-  (body', fvs) <- bindLocalNamesFV (maybeToList (unLoc <$> alias')) (rnLHsTyKi env body)
-  pure (XHsType (HsTypeCaseAliasRn (unLoc owner', index, alias') body'), extendNameSetList fvs generated_names)
+rnHsTyKi _ (XHsType HsTypeCaseAlias{}) = failWithTc TcRnTypeCaseContext
 
 rnHsTyKi env (XHsType let_ty@(HsTypeLet (let_kw, _) _ _ binds result)) = do
   let (binder, rhs, body) = splitHsTypeLet binds result
@@ -1402,7 +1368,7 @@ rnHsTyKi env (XHsType (HsTypeLetProductCheck con arity rhs)) = do
   (rhs', rhs_fvs) <- rnLHsTyKi env rhs
   pure (XHsType (HsTypeLetProductCheckRn con' arity rhs'), extendNameSet rhs_fvs (unLoc con'))
 
-rnHsTyKi env (XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) = do
+rnHsTyKi env whole@(XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) = do
   enabled <- xoptM LangExt.ExperimentalDependentTypes
   let case_span = getEpTokenSrcSpan case_kw
   unless enabled $ setSrcSpan case_span $ failWithTc TcRnTypeCaseDisabled
@@ -1414,20 +1380,62 @@ rnHsTyKi env (XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) = do
   level <- getThLevel
   case level of
     UntypedBrack{} -> do
-      -- Record the source case in the quote. The splice site supplies the
-      -- declaration group that checks and lifts the case.
       (scrutinee', scrutinee_fvs) <- rnLHsTyKi env scrutinee
-      (rows', rows_fvs) <- mapFvRn rn_row rows
+      (rows', rows_fvs) <- mapFvRn (rn_row False) rows
+      pure (XHsType (HsTypeCaseRn scrutinee' rows'), scrutinee_fvs `plusFN` rows_fvs)
+    Comp -> do
+      unless (not (isRnKindLevel env) && rtke_case_forall_ok env && allowed_case_ctxt (rtke_ctxt env)) $
+        setSrcSpan case_span $ failWithTc TcRnTypeCaseContext
+      check_case_capture_hygiene case_span rows
+      (scrutinee', scrutinee_fvs) <- rnLHsTyKi env scrutinee
+      (rows', rows_fvs) <- mapFvRn (rn_row True) rows
       pure (XHsType (HsTypeCaseRn scrutinee' rows'), scrutinee_fvs `plusFN` rows_fvs)
     _ -> setSrcSpan case_span $ failWithTc TcRnTypeCaseContext
   where
-    rn_row (pat, rhs) = do
+    allowed_case_ctxt TySynCtx{}      = True
+    allowed_case_ctxt TypeSigCtx{}    = True
+    allowed_case_ctxt ConDeclCtx{}    = True
+    allowed_case_ctxt SpliceTypeCtx{} = True
+    allowed_case_ctxt _               = False
+
+    rn_row warn_unused (pat, rhs) = do
       names <- mapM newLocalBndrRn (extractHsTyRdrTyVars pat)
       bindLocalNamesFV names $ do
-        -- See Note [Wildcards in quoted type case patterns].
+        -- See Note [Renaming type lambdas and type cases].
         (pat', pat_fvs) <- rnLHsTyKi (env { rtke_what = RnTypeCasePat }) pat
         (rhs', rhs_fvs) <- rnLHsTyKi env rhs
+        when warn_unused $ warnUnusedTypePatterns names rhs_fvs
         pure ((names, pat', rhs'), pat_fvs `plusFN` rhs_fvs)
+
+    check_case_capture_hygiene case_span rows = case rtke_ctxt env of
+      ConDeclCtx{} -> do
+        envs@(_, lcl) <- getRdrEnvs
+        let fvs = map unLoc (extract_lty (noLocA whole) [])
+        ok <- and <$> mapM (in_con_field_scope envs lcl) fvs
+        unless ok $ setSrcSpan case_span $ failWithTc TcRnTypeCaseContext
+      SpliceTypeCtx{} -> do
+        lcl <- getLocalRdrEnv
+        let lcl_set = extendNameSetList
+                        (mkNameSet (localRdrEnvElts lcl) `unionNameSet` rtke_outer_tvs env)
+                        (rtke_indices env)
+            free_rdrs = collectFreeCaseRdrs whole
+            bad_free r
+              | Unqual{} <- r = elemLocalRdrEnv r lcl || maybe False (`elemLocalRdrEnv` lcl) (demoteRdrNameTv r)
+              | Just n <- rdrNameExactName_maybe r, not (isExternalName n) = not (n `elemNameSet` lcl_set)
+              | otherwise = False
+            bad_pat_bndr (pat, _) = any (\(L _ r) -> maybe False (`elemNameSet` lcl_set) (rdrNameExactName_maybe r))
+                                        (extractHsTyRdrTyVars pat)
+        when (any bad_free free_rdrs || any bad_pat_bndr rows) $
+          setSrcSpan case_span $ failWithTc TcRnTypeCaseContext
+      _ -> pure ()
+
+    in_con_field_scope envs lcl rdr
+      | elemLocalRdrEnv rdr lcl = pure True
+      | Just term_rdr <- demoteRdrNameTv rdr =
+          if elemLocalRdrEnv term_rdr lcl
+            then pure True
+            else not . null <$> lookupSourceTables False envs term_rdr
+      | otherwise = pure False
 
 rnHsTyKi env ty@(XHsType (HsRecTy {})) = do
   -- Record types (which only show up temporarily in constructor
@@ -1455,7 +1463,7 @@ rnHsTyKi env (HsWildCardTy h)
 
 
 -- | Recognize a type case pattern and collect its branch-local binders.
--- See Note [Lifting type cases] in GHC.Rename.Module.
+-- See Note [Renaming type lambdas and type cases].
 classifyTypeCasePattern :: LHsType GhcPs -> Maybe (LHsType GhcPs, [RdrName])
 classifyTypeCasePattern pat = do
   (pat', bound) <- argumentPattern pat
@@ -1479,17 +1487,141 @@ classifyTypeCasePattern pat = do
       = Just (L loc (if isPromoted promotion then pat else XHsType (HsTypeCaseHead name)), [])
     constructorPattern _ = Nothing
 
-{- Note [Wildcards in quoted type case patterns]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An ordinary type case becomes a family equation before renaming its
-pattern. A quotation keeps the case as written. Its pattern can occur
-in a type synonym, where a wildcard in a type expression is illegal.
+{- Note [Renaming type lambdas and type cases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Type lambdas, dependent sums (@some@), type @let@ bindings, and type @case@
+expressions are renamed directly in 'rnHsTyKi' without pre-renaming 'GhcPs'
+closure conversion (GHC Proposals #281, #378, #425, #473, and #523; Eisenberg
+and Stolarek, Haskell Symposium 2014; Danvy and Nielsen, PPDP 2001).
 
-Classify the pattern first. Rename only that pattern with RnTypeCasePat.
-An anonymous wildcard binds nothing. The branch variables enter scope
-through bindLocalNamesFV. The scrutinee and branch RHS use the original
-context, including its wildcard rules.
+* Type lambdas ('HsTypeLambda'): check duplicate binders, allocate fresh local
+  'Name's, and rename the body in the extended lexical scope, rejecting
+  expression wildcards outside type-case patterns. At 'Comp' and in untyped
+  quotations, produce 'HsTypeLambdaQuoteRn' for 'GHC.Tc.Gen.HsType' (or
+  'GHC.HsToCore.Quote'). In a typed quotation, pre-allocate a module-unique
+  helper 'Name' via 'HsTypeLambdaCheckRn' so cross-module typed splices resolve
+  the synthesized 'TyCon' from the producer's interface.
+* Dependent sums ('HsTypeSome'): rewrite @some (x :: A) | B@ directly to
+  @GHC.Sigma.Sigma A (\x -> B)@ using 'HsTypeLambdaQuoteRn'.
+* Type cases ('HsTypeCase'): classify each branch pattern with
+  'classifyTypeCasePattern', rename the pattern under 'RnTypeCasePat' (allowing
+  pattern wildcards even in contexts such as type synonyms where expression
+  wildcards are rejected), scope branch binders over both the pattern and the
+  right-hand side, and emit '-Wunused-type-patterns' at 'Comp'. Closed type
+  family equations lower 'HsTypeCaseRn' in 'GHC.Rename.Module'; all other sites
+  lower in 'GHC.Tc.Gen.HsType'.
 -}
+
+-- | Test whether a renamed type contains an expression wildcard outside
+-- type-case patterns.
+hasExprWildcardRn :: Data a => a -> Bool
+hasExprWildcardRn thing
+  | Just (_ :: SrcSpanAnnA) <- cast thing = False
+  | Just (_ :: SrcSpanAnnN) <- cast thing = False
+  | Just (_ :: SrcSpan)     <- cast thing = False
+  | Just (_ :: Name)        <- cast thing = False
+  | Just (_ :: Type)        <- cast thing = False
+  | Just (L _ HsWildCardTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = True
+  | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+  = hasExprWildcardRn inner
+  | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = False
+  | Just (L _ (XHsType (HsTypeCaseRn scrut rows))) <- (cast thing :: Maybe (LHsType GhcRn))
+  = hasExprWildcardRn scrut || any (\(_, _, rhs) -> hasExprWildcardRn rhs) rows
+  | otherwise = or (gmapQ hasExprWildcardRn thing)
+
+-- | Collect distinct free local 'TyVar' 'Name's of a renamed type in
+-- left-to-right occurrence order.
+freeLocalTyVarsInOrder :: NameSet -> LHsType GhcRn -> [Name]
+freeLocalTyVarsInOrder bound0 root = dedup emptyNameSet (go bound0 root)
+  where
+    dedup _ [] = []
+    dedup seen (n : ns)
+      | n `elemNameSet` seen = dedup seen ns
+      | otherwise            = n : dedup (extendNameSet seen n) ns
+
+    go :: Data a => NameSet -> a -> [Name]
+    go bound thing
+      | Just (_ :: SrcSpanAnnA) <- cast thing = []
+      | Just (_ :: SrcSpanAnnN) <- cast thing = []
+      | Just (_ :: SrcSpan)     <- cast thing = []
+      | Just (_ :: Type)        <- cast thing = []
+      | Just (nm :: Name)       <- cast thing
+      = [nm | isTyVarName nm, not (isExternalName nm), not (nm `elemNameSet` bound)]
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go bound inner
+      | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = []
+      | Just (L _ (HsForAllTy _ tele body)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = case tele of
+          HsForAllVis   _ ma vs -> go bound ma ++ go_tvbs bound vs body
+          HsForAllInvis _ ma vs -> go bound ma ++ go_tvbs bound vs body
+      | Just (L _ (HsForEachTy _ bndrs body)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go_tvbs bound bndrs body
+      | Just (L _ (XHsType (HsTypeExistsRn _ bndr body))) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go_tvbs bound [bndr] body
+      | Just (L _ (XHsType (HsTypeLambdaQuoteRn bndrs body))) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go (extendNameSetList bound (map unLoc bndrs)) body
+      | Just (L _ (XHsType (HsTypeLambdaCheckRn _ _ helper))) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go bound helper
+      | Just (L _ (XHsType (HsTypeLetRn _ (L _ b) rhs body))) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go bound rhs ++ go (extendNameSet bound b) body
+      | Just (L _ (XHsType (HsTypeCaseRn scrut rows))) <- (cast thing :: Maybe (LHsType GhcRn))
+      = go bound scrut ++ concat [go (extendNameSetList bound ns) rhs | (ns, _, rhs) <- rows]
+      | otherwise = concat (gmapQ (go bound) thing)
+
+    go_tvbs bound [] body = go bound body
+    go_tvbs bound (L _ b : bs) body =
+      go_bkind bound (tvb_kind b) ++
+      go_tvbs (maybe bound (extendNameSet bound) (hsTyVarName b)) bs body
+
+    go_bkind bound (HsBndrKind _ k) = go bound k
+    go_bkind _     _                = []
+
+-- | Collect free 'RdrName' occurrences (including 'Exact' names) of a parsed
+-- type expression for splice hygiene checks.
+collectFreeCaseRdrs :: HsType GhcPs -> [RdrName]
+collectFreeCaseRdrs root = go [] (noLocA root)
+  where
+    go :: [RdrName] -> LHsType GhcPs -> [RdrName]
+    go bound (L _ ty) = case ty of
+      HsTyVar _ _ (L _ r)          -> [r | r `notElem` bound]
+      HsAppTy _ f a                -> go bound f ++ go bound a
+      HsAppKindTy _ t k            -> go bound t ++ go bound k
+      HsFunTy _ (HsModifiedFunArr _ mods _) a b ->
+        concat [go bound m | L _ (HsModifier _ m) <- mods] ++ go bound a ++ go bound b
+      HsListTy _ t                 -> go bound t
+      HsTupleTy _ _ ts             -> concatMap (go bound) ts
+      HsSumTy _ ts                 -> concatMap (go bound) ts
+      HsOpTy _ a op b              -> go bound a ++ go bound op ++ go bound b
+      HsParTy _ t                  -> go bound t
+      HsIParamTy _ _ t             -> go bound t
+      HsDocTy _ t _                -> go bound t
+      HsExplicitListTy _ _ ts      -> concatMap (go bound) ts
+      HsExplicitTupleTy _ _ ts     -> concatMap (go bound) ts
+      HsKindSig _ t k              -> go bound t ++ go bound k
+      HsForAllTy _ tele body       -> case tele of
+        HsForAllVis   _ ma vs -> maybe [] (go bound) ma ++ go_tvbs bound vs body
+        HsForAllInvis _ ma vs -> maybe [] (go bound) ma ++ go_tvbs bound vs body
+      HsForEachTy _ vs body        -> go_tvbs bound vs body
+      HsQualTy _ (L _ (HsContext _ cs)) body -> concatMap (go bound) cs ++ go bound body
+      XHsType (HsBangTy _ _ t)     -> go bound t
+      XHsType (HsTypeExists _ v b) -> go_tvbs bound [v] b
+      XHsType (HsTypeLambda _ vs b) -> go (map unLoc vs ++ bound) b
+      XHsType (HsTypeSome _ v d b) -> go bound d ++ go (unLoc v : bound) b
+      XHsType (HsTypeLet _ _ _ binds res) ->
+        let (v, rhs, body) = splitHsTypeLet binds res
+        in go bound rhs ++ go (unLoc v : bound) body
+      XHsType (HsTypeCaseHead (L _ r)) -> [r | r `notElem` bound]
+      XHsType (HsTypeCase _ _ scrut alts) ->
+        go bound scrut ++ concat
+          [ let pvs = map unLoc (extractHsTyRdrTyVars pat)
+            in go (pvs ++ bound) pat ++ go (pvs ++ bound) rhs
+          | L _ (HsTypeCaseAlt pat _ rhs) <- alts ]
+      _ -> []
+
+    go_tvbs bound [] body = go bound body
+    go_tvbs bound (L _ b : bs) body =
+      (case tvb_kind b of { HsBndrKind _ k -> go bound k; _ -> [] }) ++
+      go_tvbs (maybe bound (: bound) (hsTyVarName b)) bs body
 
 {-
 Note [Strict level checks with ExplicitLevelImports]
