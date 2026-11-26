@@ -1,29 +1,17 @@
 {-# LANGUAGE DependentTypes #-}
 {-# LANGUAGE ListTuplePuns #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE MagicHash #-}
-{-# LANGUAGE Modifiers #-}
 {-# LANGUAGE NamedWildCards #-}
 {-# LANGUAGE NoStarIsType #-}
 {-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE PolyKinds #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneKindSignatures #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeAbstractions #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeData #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
 
 -- | Runnable examples of the completed Dependent Haskell source features.
@@ -205,9 +193,9 @@ import qualified BookContextPlug
 import qualified BookEnvironment
 import qualified BookReverseProof
 import qualified ExplicitListReverse
-import qualified BookWave3Proposal378 as Wave3
-import qualified BookWave8Proposal378 as Wave8
-import qualified BookWave12RoadmapClosure as Wave12
+import qualified BookProposal378 as Prop378
+import qualified BookQuantifiers as Quant
+import qualified BookExtensions as Ext
 import qualified BookNaturals
 import qualified CastedConstructorGivens as TreeProof
 import qualified SumOfSizes
@@ -292,17 +280,18 @@ This module uses ordinary application checking. Imported providers keep their
 own language extensions. GroundApplicationClient checks the native function
 types used as equality operands with ImpredicativeTypes.
 
-Run from the repository root with this fork's matching compiler and libraries:
+Run from the repository root with a matching GHC build and `DEPENDENT_BASE_DIR`:
 
   mkdir -p _build/showcase
   _build/stage1/bin/ghc --make -O0 -fomit-interface-pragmas \
     -fno-write-if-simplified-core -dcore-lint -dstg-lint \
-    -i/home/tritlo/Code/dependent-base/src \
+    -i"$DEPENDENT_BASE_DIR/src" \
     -idocs/dependent-haskell/examples/packed-vector \
     -idocs/dependent-haskell/examples/qualified-pi \
     -idocs/dependent-haskell/examples/closed-evaluation \
     -idocs/dependent-haskell/examples/erased-existentials \
     -idocs/dependent-haskell/examples/open-evaluation \
+    -idocs/dependent-haskell/examples/r11-heq-pair \
     -outputdir _build/showcase docs/dependent-haskell/Showcase.hs \
     -o _build/showcase/showcase
   _build/showcase/showcase
@@ -2097,7 +2086,7 @@ main = do
              (n, Refl) -> n)
     prefixBound <- newIORef (1 :: DepBase.Nat) >>= readIORef
     observe "apply the same partially applied addition to equal sizes"
-        (Wave3.addUnder prefixBound prefixBound DepBase.Zero)
+        (Prop378.addUnder prefixBound prefixBound DepBase.Zero)
     count <- newIORef (3 :: DepBase.Nat) >>= readIORef
     observe "prove the length of a countdown"
         (Book.downFrom count, Book.lengthDownFrom count)
@@ -2312,7 +2301,7 @@ main = do
     observe "prove map and zipWith length directly and with trans and congFirst"
         ( zipWith zipCallback (map beforeZip zipLeft) zipRight
         , DepBase.lengthZipMap beforeZip zipCallback zipLeft zipRight
-        , Wave3.zipMapLaw beforeZip zipCallback zipLeft zipRight
+        , Prop378.zipMapLaw beforeZip zipCallback zipLeft zipRight
         )
     observe "use the Prelude.zipWith cons equation with both tails unevaluated"
         PreludeZipWithProof.firstPair
@@ -2370,48 +2359,48 @@ main = do
     observe "verify explicit-list reverse equations in Final Core under default -O2"
         (explicitRevPair, explicitRevStep True [False], ExplicitListReverse.rev [True, False])
     observe "group retained telescopes and multi-binder sums under DependentTypes"
-        ( Wave3.plusAssocProd 1 2 3
-        , Wave3.peanoToInt Wave3.sumTwoFirst
-        , Wave3.peanoToInt Wave3.infixForEachArg )
+        ( Prop378.plusAssocProd 1 2 3
+        , Prop378.peanoToInt Prop378.sumTwoFirst
+        , Prop378.peanoToInt Prop378.infixForEachArg )
     observe "capture an unmatchable predicate variable inside a Leibniz symmetry lambda"
-        (Wave3.leibnizUToEq (Wave3.leibnizUSym @'True @'True (\px -> px)))
+        (Prop378.leibnizUToEq (Prop378.leibnizUSym @'True @'True (\px -> px)))
     observe "stage same-module context plug and inline GADT congruence proofs"
-        (Wave3.sameModulePlugBeta, Wave3.inlineHoleCong @('Wave3.ULam ('Wave3.UVar 'Wave3.FZ)))
+        (Prop378.sameModulePlugBeta, Prop378.inlineHoleCong @('Prop378.ULam ('Prop378.UVar 'Prop378.FZ)))
     observe "compute function types from a term-to-Type large elimination and foldr laws"
-        ( Wave3.applyValPred (\u v -> case (u, v) of ((), ()) -> ())
-        , Wave3.checkFoldrAndMatchability
+        ( Prop378.applyValPred (\u v -> case (u, v) of ((), ()) -> ())
+        , Prop378.checkFoldrAndMatchability
             [DepBase.Zero, DepBase.Succ DepBase.Zero]
             [DepBase.Succ DepBase.Zero] )
     observe "override invisible foreach binders and pass unadorned Type witnesses"
-        ( DepBase.toListVec (Wave8.replicateInvis @(DepBase.Succ (DepBase.Succ DepBase.Zero)) 'w')
-        , Wave8.theValue Int (42 :: Int)
-        , Wave8.autoNumPlus )
+        ( DepBase.toListVec (Quant.replicateInvis @(DepBase.Succ (DepBase.Succ DepBase.Zero)) 'w')
+        , Quant.theValue Int (42 :: Int)
+        , Quant.autoNumPlus )
     observe "match nested foreach patterns, catch-all cases, and constrained GADTs"
-        ( Wave8.classifyLen (DepBase.Succ (DepBase.Succ DepBase.Zero))
+        ( Quant.classifyLen (DepBase.Succ (DepBase.Succ DepBase.Zero))
             (DepBase.VCons 10 (DepBase.VCons 32 DepBase.VNil))
-        , DepBase.toListVec (Wave8.fallbackVec (DepBase.Succ DepBase.Zero)
+        , DepBase.toListVec (Quant.fallbackVec (DepBase.Succ DepBase.Zero)
             (DepBase.VCons 7 DepBase.VNil))
-        , Wave8.renderShowBox (Wave8.MkShowBox (DepBase.Succ (DepBase.Succ DepBase.Zero))
+        , Quant.renderShowBox (Quant.MkShowBox (DepBase.Succ (DepBase.Succ DepBase.Zero))
             (DepBase.VCons True (DepBase.VCons False DepBase.VNil))) )
     observe "eliminate @Pack existentials and disambiguate punned data heralds"
-        ( Wave8.showAtPack Wave8.packSample
-        , Wave8.proxyDataTag
-        , Wave8.useDataHeraldTag )
+        ( Quant.showAtPack Quant.packSample
+        , Quant.proxyDataTag
+        , Quant.useDataHeraldTag )
     observe "reassociate polymorphic nested domains and project dependent-base vectors"
-        ( Wave8.assocProdRoundTrip ((True, 'k'), 2 :: Wave8.Peano)
-        , Wave8.dependentBaseSecondLookup "hi" )
+        ( Quant.assocProdRoundTrip ((True, 'k'), 2 :: Quant.Peano)
+        , Quant.dependentBaseSecondLookup "hi" )
     observe "inline DepFunTy unfoldings, promoted Char# and (# , #), and closed fib"
-        ( DepBase.toListVec (Wave12.inlConsVec (DepBase.Succ DepBase.Zero) 9 (DepBase.VCons 4 DepBase.VNil))
-        , (Wave12.primCharRefl, Wave12.unboxedSwapRefl)
-        , (Wave12.sameModuleFibProof, Wave12.standaloneItemProof) )
+        ( DepBase.toListVec (Ext.inlConsVec (DepBase.Succ DepBase.Zero) 9 (DepBase.VCons 4 DepBase.VNil))
+        , (Ext.primCharRefl, Ext.unboxedSwapRefl)
+        , (Ext.sameModuleFibProof, Ext.standaloneItemProof) )
     observe "match runtime Type witnesses, dependent record dot, and superclass selectors"
-        ( (Wave12.describeType Int, Wave12.describeType [Char], Wave12.describeType Double)
-        , Wave12.checkDependentDot "ab"
-        , Wave12.observeSubGate True )
+        ( (Ext.describeType Int, Ext.describeType [Char], Ext.describeType Double)
+        , Ext.checkDependentDot "ab"
+        , Ext.observeSubGate True )
     observe "apply T2T operator sections, GHC.Exists combinators, linear foreach, and local type"
-        ( (Wave12.congRightPlus @(DepBase.Succ DepBase.Zero) @(DepBase.Succ DepBase.Zero) (DepBase.Succ DepBase.Zero) Refl, Wave12.congRightCons @Char @'x' @'x' @'[ 'y' ] Refl)
-        , Wave12.upperExistsVec
-        , (Wave12.checkLinearAndRefute, Wave12.localTypeSynCheck) )
+        ( (Ext.congRightPlus @(DepBase.Succ DepBase.Zero) @(DepBase.Succ DepBase.Zero) (DepBase.Succ DepBase.Zero) Refl, Ext.congRightCons @Char @'x' @'x' @'[ 'y' ] Refl)
+        , Ext.upperExistsVec
+        , (Ext.checkLinearAndRefute, Ext.localTypeSynCheck) )
 
 -- | Complement one flag at the type level.
 type family FlipFlag (b :: Bool) :: Bool where

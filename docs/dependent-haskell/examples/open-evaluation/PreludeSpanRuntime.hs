@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeApplications #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeSpanRuntime (showSpan) where
 

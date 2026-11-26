@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes, TypeOperators #-}
 
 -- | Filter a vector without writing a package constructor or a witness.
 module ImplicitVector (Filtered, FilteredWith, filterVec, withVector, partitionVec, firstKept, Rows(..), HiddenRows, packRows, partitionRows, rowLists, firstPassing, cells, transportFiltered, pairWithSelf, forgetLength, observations, singletonBuilder, runBuilder) where

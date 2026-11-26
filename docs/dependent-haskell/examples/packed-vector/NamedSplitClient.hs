@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, DataKinds, GADTs, NoDependentTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module NamedSplitClient (observeNamedSplitIO) where

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, TypeOperators #-}
 module RetainedSumOperator (appendByMethod, sumIndex, successorIndex) where
 
 import PackedVecLibrary (Nat, Vec, appendNative, replicateNative)

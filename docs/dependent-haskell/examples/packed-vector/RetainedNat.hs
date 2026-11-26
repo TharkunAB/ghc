@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes #-}
 -- | Eliminate a package at its stored natural index.
 module RetainedNat (Retained(..), withRetained, constantPackage) where
 

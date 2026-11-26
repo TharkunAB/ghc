@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, PolyKinds #-}
 {-# LANGUAGE StandaloneKindSignatures #-}
 
 module CastedConstructorGivens where

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, NoDependentTypes #-}
 
 -- | Read indexed Natural values from an ordinary module.
 module RetainedNaturalClient (observeNaturals, observeNamedNatural) where

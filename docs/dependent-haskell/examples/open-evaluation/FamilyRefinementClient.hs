@@ -1,4 +1,4 @@
-{-# LANGUAGE Haskell2010, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE Haskell2010, NoDependentTypes, TypeOperators #-}
 module FamilyRefinementClient (refinedResult) where
 
 import Data.Type.Equality ((:~:))

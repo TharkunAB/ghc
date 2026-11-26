@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeFamilies, TypeOperators #-}
 module PackageEquality (sameRetained) where
 
 import Data.Type.Equality ((:~:)(Refl))

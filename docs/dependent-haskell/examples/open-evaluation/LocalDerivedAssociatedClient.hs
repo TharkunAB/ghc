@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeFamilies, TypeOperators #-}
 module LocalDerivedAssociatedClient (reading) where
 
 import Data.Type.Equality ((:~:) (Refl))

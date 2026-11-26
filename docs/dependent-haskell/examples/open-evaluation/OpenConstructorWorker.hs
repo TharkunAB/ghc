@@ -1,5 +1,5 @@
 {-# LANGUAGE BangPatterns, ExplicitForAll #-}
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 {-# OPTIONS_GHC -fno-unoptimized-core-for-interpreter -fno-omit-interface-pragmas -fexpose-all-unfoldings #-}
 
 module OpenConstructorWorker (Choice (..), Nested (..), pick, reordered, Envelope, unwrap, route, routeCached, cachedPick, pickNested, demand) where

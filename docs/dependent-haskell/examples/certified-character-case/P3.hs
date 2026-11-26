@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, FlexibleContexts, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, FlexibleContexts, NoDependentTypes #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications, TypeFamilies #-}
 module P3 (p3) where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds, TypeFamilies #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, PolyKinds, TypeFamilies #-}
 
 module LegacyKindArgument (maybeField, defaultCallback) where
 

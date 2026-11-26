@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, PolyKinds, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, PolyKinds, RankNTypes #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeAbstractions, TypeApplications, TypeFamilies #-}
 module InvisibleFamily
   (Test, Observed, Inferred, PickVisible, ObservedVisible, IndexedVisible,

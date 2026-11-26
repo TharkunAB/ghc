@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneKindSignatures, TypeApplications #-}
 {-# LANGUAGE TypeFamilies, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}

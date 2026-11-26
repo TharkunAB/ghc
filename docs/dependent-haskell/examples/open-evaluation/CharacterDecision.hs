@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers #-}
 module CharacterDecision (Decision(..), Space, spaceDecision) where
 
 import qualified Data.Char as Char

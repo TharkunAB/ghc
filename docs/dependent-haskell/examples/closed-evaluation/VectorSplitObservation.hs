@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, NoDependentTypes #-}
 
 module VectorSplitObservation (reassembleTwo) where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module OrdinaryEitherMapping (example) where
 
 import qualified PreludeFmapEitherProof as Proof

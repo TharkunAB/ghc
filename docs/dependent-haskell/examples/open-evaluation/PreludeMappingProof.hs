@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers, PolyKinds, TypeOperators #-}
 module PreludeMappingProof (mapNothing, mapJust, mapTwice, example, presentExample) where
 
 import Data.Proxy (Proxy(..))

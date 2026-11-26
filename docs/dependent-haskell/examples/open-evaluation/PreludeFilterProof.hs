@@ -1,5 +1,5 @@
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeOperators #-}
 module PreludeFilterProof
   (keepFalse, skipTrue, keepTrue, skipFalse, lazyHead, lazyIdentityHead, showPreludeFilterProofs) where
 

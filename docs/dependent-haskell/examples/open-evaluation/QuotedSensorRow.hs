@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TemplateHaskell, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TemplateHaskell, TypeFamilies #-}
 
 -- | A named sensor has an integer reading. A missing sensor has no reading.
 module QuotedSensorRow (readings) where

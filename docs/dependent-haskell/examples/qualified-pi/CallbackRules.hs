@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module CallbackRules (Choice, makeChoice, keepChoice, readKept) where
 
 -- | Store an integer at the result index of a callback.

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs #-}
 
 -- | Read a bounded element from a column with a runtime type witness.
 module RuntimeTypeColumn

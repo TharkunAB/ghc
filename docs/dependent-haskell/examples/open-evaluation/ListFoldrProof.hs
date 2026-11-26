@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, Modifiers, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, Modifiers, NoDependentTypes #-}
 {-# LANGUAGE PolyKinds, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module ListFoldrProof (foldNil, foldCons, foldAppend, showListFoldAppend) where

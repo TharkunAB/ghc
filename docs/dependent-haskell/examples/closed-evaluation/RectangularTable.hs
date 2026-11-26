@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 module RectangularTable
     ( Table(..), ColumnTable(..), Square(..), Matrix(..)
     , withoutRowLabels, square, matrix, totals, sample, selectedTotals

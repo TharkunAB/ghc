@@ -1,4 +1,4 @@
-{-# LANGUAGE EmptyCase, ExperimentalDependentTypes, GADTs, LinearTypes, ScopedTypeVariables #-}
+{-# LANGUAGE EmptyCase, DependentTypes, ListTuplePuns, GADTs, LinearTypes, ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications, UndecidableInstances #-}
 
 -- | Store an ordinary list with a position checked against that list.

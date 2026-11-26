@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications, TypeFamilies #-}
 module CharacterExport (p3, Flag) where
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 module IndexedPrefix (CheckedList, negatedCons, elements, withElements) where
 
 import Data.Type.Equality ((:~:)(Refl))

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, Modifiers #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeSpanSource (Span, SpanPrefix, SpanSuffix) where
 

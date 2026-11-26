@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ImpredicativeTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ImpredicativeTypes #-}
 {-# LANGUAGE PolyKinds, RankNTypes, TypeOperators #-}
 module StoredReflection (boxedReflection) where
 

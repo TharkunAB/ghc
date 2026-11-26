@@ -25,8 +25,13 @@ for option in "$@"; do
 done
 
 docs=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$docs/../.." && pwd)
 examples=$docs/examples
-dep_base=${DEPENDENT_BASE_DIR:-/home/tritlo/Code/dependent-base}
+dep_base=${DEPENDENT_BASE_DIR:-"$repo_root/../dependent-base"}
+if [[ ! -d "$dep_base/src" ]]; then
+    echo "dependent-base source tree not found at $dep_base (set DEPENDENT_BASE_DIR)" >&2
+    exit 1
+fi
 out=$(mktemp -d)
 trap 'rm -rf -- "$out"' EXIT
 

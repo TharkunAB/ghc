@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications #-}
 
 module TypeLambdaArgument (messageCells, rowFor) where

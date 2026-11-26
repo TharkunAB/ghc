@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeApplications, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeFilterAppendRuntime (RuntimeFilterAppend(..), packFilterAppend, decisionsForNot) where
 

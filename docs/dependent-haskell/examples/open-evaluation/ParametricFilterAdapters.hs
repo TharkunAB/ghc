@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 module ParametricFilterAdapters (boolToOrdering, isGT, isTrue) where
 

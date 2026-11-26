@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, NoDependentTypes #-}
 module SpineWorker
     ( Spine(..), firstMaybe, firstViaHelper, firstViaWrap, Marked(..), firstViaMark, secondOrFirst, erase, fill
     , boxedFirst, strictFirst, Secret, privateFirst, StrictResult(..), strictResult

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeFamilies #-}
 module LocalDerivedAssociated (Signal(..), Flipped, Sample(..)) where
 
 -- | Show still uses the regular deriving pass.

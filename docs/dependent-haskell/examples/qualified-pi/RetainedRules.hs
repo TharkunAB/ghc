@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables #-}
 module RetainedRules (Choice(..), choose, keep, readChoice, readKept) where
 
 -- | The first two constructors record the Boolean that selected them.

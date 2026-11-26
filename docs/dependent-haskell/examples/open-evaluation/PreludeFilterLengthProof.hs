@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, Modifiers, NoExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE DataKinds, GADTs, Modifiers, NoDependentTypes, PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneDeriving, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeFilterLengthProof

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, MonoLocalBinds, ScopedTypeVariables, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, MonoLocalBinds, ScopedTypeVariables, TypeFamilies #-}
 module ImportedFamily (importedFamilyResults) where
 import Data.Proxy (Proxy(..))
 import ImportedFamilyProvider (Payload, importedFirst)

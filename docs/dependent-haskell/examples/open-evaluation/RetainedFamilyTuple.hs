@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, DependentTypes, ListTuplePuns, TypeOperators #-}
 module RetainedFamilyTuple (readPair, RefinedInput, readRefinement) where
 
 import Data.Type.Equality ((:~:)(Refl))

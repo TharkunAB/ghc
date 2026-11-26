@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeOperators #-}
 module AppendLengthClient (appendTwoAndOne) where
 
 import qualified GHC.TypeNats as N

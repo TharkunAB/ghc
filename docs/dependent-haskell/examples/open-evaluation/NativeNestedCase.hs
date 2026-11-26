@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase, LinearTypes, MagicHash, Modifiers, PolyKinds, RankNTypes, RequiredTypeArguments, StandaloneKindSignatures, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LambdaCase, LinearTypes, MagicHash, Modifiers, PolyKinds, RankNTypes, RequiredTypeArguments, StandaloneKindSignatures, TypeFamilies #-}
 module NativeNestedCase
   ( Pick, Pair(..), LeftFirst, IgnoreLeft, Uniform, SameFallback
   , Indexed(..), IndexedPick, TypeHead, UniformTypeHead, Wrapped, WrappedBool

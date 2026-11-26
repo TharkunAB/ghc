@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitForAll, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ExplicitForAll, NoDependentTypes #-}
 
 module ZipLengthSource (countWithHeader, zipLength) where
 

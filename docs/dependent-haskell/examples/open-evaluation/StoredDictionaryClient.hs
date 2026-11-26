@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, Haskell2010, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, Haskell2010, NoDependentTypes #-}
 module StoredDictionaryClient (storedDecisions, bindingDemand) where
 
 import Control.Exception (ErrorCall, evaluate, try)

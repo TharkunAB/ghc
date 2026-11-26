@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs #-}
 module RetainedProjection (project) where
 
 import RetainedNat (Retained(..))

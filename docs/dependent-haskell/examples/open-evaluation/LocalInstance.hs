@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, InstanceSigs, RankNTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, InstanceSigs, RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables, StandaloneKindSignatures #-}
 module LocalInstance (Input, passValue) where
 

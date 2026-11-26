@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 
 module IndexedMatrix
     ( Matrix(Rectangle, Square), TileShape(Rectangular), Tile(Tile), HiddenTile

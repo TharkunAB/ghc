@@ -1,6 +1,6 @@
 {-# LANGUAGE DataKinds, KindSignatures, TypeOperators #-}
 {-# LANGUAGE ExplicitForAll, Modifiers, TypeApplications #-}
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE GADTs, NoDependentTypes, TypeFamilies #-}
 module LaterMatchabilityClient
   ( laterMatchability, forwardedMap, annotatedMap, nestedCallback, appliedCallback
   , boxedCallbacks, rankedMap, flippedCallbacks, computedDictionary, inferredEndo, barePromotedEndo

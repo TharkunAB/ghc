@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 module RuntimeOrdering (Witness(..), Compared(..), decideOrdering, compareFrom) where
 
 -- | Record the observed result of the comparison.

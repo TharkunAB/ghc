@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, FlexibleInstances, FunctionalDependencies, MultiParamTypeClasses, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, FlexibleInstances, FunctionalDependencies, MultiParamTypeClasses, TypeFamilies, UndecidableInstances #-}
 module ComposedPayloadSum where
 
 import Data.Proxy (Proxy(..))

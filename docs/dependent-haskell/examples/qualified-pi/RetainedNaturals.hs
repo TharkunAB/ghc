@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, RoleAnnotations #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, RoleAnnotations #-}
 
 -- | Keep a built-in Natural alongside its index.
 module RetainedNaturals (Reading, rememberNatural, readNatural) where

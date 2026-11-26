@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE KindSignatures #-}

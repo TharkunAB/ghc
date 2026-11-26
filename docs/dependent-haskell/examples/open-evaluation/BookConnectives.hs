@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 -- | Isomorphisms for commutativity of sums and products in PLFH.
 module BookConnectives (sumComm, prodComm) where
 

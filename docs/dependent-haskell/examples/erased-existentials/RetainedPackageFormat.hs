@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, LinearTypes, RankNTypes, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, LinearTypes, RankNTypes, ScopedTypeVariables #-}
 
 module RetainedPackageFormat
     ( OpenValue, chooseValue, relay

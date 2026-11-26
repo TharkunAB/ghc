@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleInstances, MultiParamTypeClasses, NoExperimentalDependentTypes #-}
+{-# LANGUAGE FlexibleInstances, MultiParamTypeClasses, NoDependentTypes #-}
 
 -- | Preview a stream through its exported interface.
 module StreamPreview (Preview(preview), Prefix(prefix)) where

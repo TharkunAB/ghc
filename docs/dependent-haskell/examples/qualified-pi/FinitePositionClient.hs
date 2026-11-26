@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, ScopedTypeVariables, TypeApplications #-}
 module FinitePositionClient (lookupVecViaView, observeFinitePosition, observeConstructedViews, observeZeroViews, observeListIndices, observeEmptyIndex) where
 import Control.Exception (ErrorCall, displayException, evaluate, try)
 import Data.IORef (newIORef, readIORef)

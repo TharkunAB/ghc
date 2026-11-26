@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module OpenMapWorker (each, Lamp(..), Signal(..), signal, mayProceed) where
 
 -- | Apply a function to each element and keep the result fields lazy.

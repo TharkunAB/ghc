@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 -- | An isomorphism whose two functions appear in its proof fields.
 module BookIsomorphism (Iso(..), Bit(..), sample) where
 

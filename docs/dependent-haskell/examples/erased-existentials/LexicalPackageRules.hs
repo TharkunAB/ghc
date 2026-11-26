@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 
 module LexicalPackageRules (readHidden, hideInt, project, increment, local) where
 

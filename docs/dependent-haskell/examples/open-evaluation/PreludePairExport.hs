@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, FlexibleContexts, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, KindSignatures #-}
 {-# LANGUAGE PolyKinds, TypeFamilies, TypeOperators #-}
 module PreludePairExport
   (first, second, swapped, nestedFirst, nestedSecond,

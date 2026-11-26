@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 module DirectIndexedList (IndexedList(IndexedList), Reading(Reading), Sample(..), SomeSample) where
 
 -- | Store a runtime list at its own index.

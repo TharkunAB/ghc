@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, StandaloneKindSignatures #-}
 module PreludeAppendLengthSource (Appended, Plus, plus) where
 
 import qualified Prelude as P

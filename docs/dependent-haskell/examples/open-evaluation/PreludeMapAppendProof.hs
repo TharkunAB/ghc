@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, PolyKinds, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeMapAppendProof (mapAppend, showPreludeMapAppend) where
 

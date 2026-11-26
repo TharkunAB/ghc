@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 {-# LANGUAGE RequiredTypeArguments, TypeFamilies, TypeOperators #-}
 module Main (main) where
 

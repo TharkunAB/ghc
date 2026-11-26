@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, LinearTypes, MonoLocalBinds, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE BangPatterns, LinearTypes, MonoLocalBinds, NoDependentTypes, TypeApplications #-}
 
 -- | Open a checked list selection in an ordinary module.
 module CursorClient (observeCursors, observeIndexedCallback, observeAligned, observeBoth, observeZip, zipTwoPairs, zipIntLiterals, zipInt8Literals) where

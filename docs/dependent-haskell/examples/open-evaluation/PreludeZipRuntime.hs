@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 module PreludeZipRuntime (lengthZip, lengthZipWith, lengthZipMap) where
 
 import Data.Type.Equality ((:~:)(Refl))

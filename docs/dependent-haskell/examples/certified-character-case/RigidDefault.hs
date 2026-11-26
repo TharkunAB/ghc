@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, TypeOperators #-}
 module RigidDefault where
 

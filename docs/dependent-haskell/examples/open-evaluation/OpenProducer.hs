@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, NoDependentTypes #-}
 {-# OPTIONS_GHC -fno-unoptimized-core-for-interpreter -fno-omit-interface-pragmas -fignore-interface-pragmas #-}
 module OpenProducer (select, second, strictSecond, routeLeft, routeRight, pairFirst, strictPairFirst, ignorePair) where
 

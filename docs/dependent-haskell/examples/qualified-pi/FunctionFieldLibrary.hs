@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 {-# LANGUAGE ScopedTypeVariables, TypeFamilies #-}
 
 -- | Store a local function inside a closed algebraic index.

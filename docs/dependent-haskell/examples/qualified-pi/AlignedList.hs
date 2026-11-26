@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeFamilies #-}
 
 -- | Combine finite lists whose lengths agree.
 module AlignedList (zipWithExact, checkedZipWith) where

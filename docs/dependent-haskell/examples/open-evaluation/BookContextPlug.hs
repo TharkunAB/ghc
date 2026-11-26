@@ -1,7 +1,7 @@
 {-# LANGUAGE DependentTypes #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 -- | Untyped one-hole contexts from PLFH ContextualEquivalence.
--- Adapted from PLFH under CC BY 4.0. See REFERENCES.md.
+-- Adapted from PLFA / PLFH under CC BY 4.0.
 module BookContextPlug (UCtx(..), plug) where
 
 import BookParallel (UTerm(..))

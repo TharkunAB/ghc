@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes, NoImpredicativeTypes, RankNTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes, NoImpredicativeTypes, RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 module StoredReflectionClient (readStoredReflection) where
 

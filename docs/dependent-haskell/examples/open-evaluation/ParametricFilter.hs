@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers, PolyKinds #-}
 {-# LANGUAGE RankNTypes, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module ParametricFilter (FilterKind, FilterNaturality, filterNaturality) where

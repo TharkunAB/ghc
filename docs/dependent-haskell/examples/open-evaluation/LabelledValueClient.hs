@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitNamespaces, GADTs, Haskell2010, NoExperimentalDependentTypes, NoRequiredTypeArguments #-}
+{-# LANGUAGE ExplicitNamespaces, GADTs, Haskell2010, NoDependentTypes, NoRequiredTypeArguments #-}
 {-# LANGUAGE ScopedTypeVariables, TypeAbstractions, TypeApplications, ViewPatterns #-}
 module LabelledValueClient (labelledValues, labelledPair, storedChecks, rankedPairs, typedNotes, typeTags) where
 

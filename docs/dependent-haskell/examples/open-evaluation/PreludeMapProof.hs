@@ -1,5 +1,5 @@
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, PolyKinds, TypeOperators #-}
 module PreludeMapProof (preludeNil, preludeNegateHead, preludeIdentityHead, showPreludeMapProofs) where
 
 import Data.Proxy (Proxy(..))

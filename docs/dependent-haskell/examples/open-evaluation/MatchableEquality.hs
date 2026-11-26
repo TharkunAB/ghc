@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, Modifiers, NoExperimentalDependentTypes, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, GADTs, Modifiers, NoDependentTypes, PolyKinds, TypeOperators #-}
 module MatchableEquality (project) where
 
 import Data.Kind (Type)

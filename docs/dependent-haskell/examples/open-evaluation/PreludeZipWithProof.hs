@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds, TypeApplications, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, NoDependentTypes, PolyKinds, TypeApplications, TypeOperators #-}
 #ifndef RULES_ON
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 #endif

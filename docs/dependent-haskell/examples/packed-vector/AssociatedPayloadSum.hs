@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, FlexibleInstances, GADTs, LambdaCase, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, FlexibleInstances, GADTs, LambdaCase, TypeFamilies, UndecidableInstances #-}
 module AssociatedPayloadSum (PayloadFormat (Body, Packet), Allowed, Permit (Permit), makeGlobal, makePermitted) where
 
 import Data.Kind (Type)

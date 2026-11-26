@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 module DirectIndexedListClient (firstCell, readingFields, acceptedSamples) where
 
 import Data.IORef (newIORef, readIORef)

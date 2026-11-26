@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, StandaloneKindSignatures #-}
 module InstalledNotSource (NegateAll) where
 
 import qualified OpenMapWorker as W

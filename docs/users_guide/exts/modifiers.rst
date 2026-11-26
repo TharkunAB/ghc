@@ -23,7 +23,7 @@ Modifiers are a way to attach types to various places in the syntax tree.
 They're intended as a general hook to allow new features without introducing new
 syntax.
 
-This fork recognises a modifier of kind ``Matchability`` on a function
+GHC recognises a modifier of kind ``Matchability`` on a function
 arrow. With :extension:`LinearTypes`, GHC also recognises multiplicity
 modifiers. GHC ignores unrecognised modifiers and warns about them with
 ``-Wunrecognised-modifiers``.

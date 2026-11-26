@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module PrimitiveWordFieldsClient (wordFieldResults) where
 
 import PrimitiveWordFields (MaximumWord, WordFieldResult, ZeroWord)

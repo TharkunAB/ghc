@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, StandaloneKindSignatures, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, StandaloneKindSignatures, TypeFamilies #-}
 module LocalDataFamily (result) where
 
 import Data.Kind (Type)

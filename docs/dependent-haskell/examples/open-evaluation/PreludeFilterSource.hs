@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, PolyKinds, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, PolyKinds, StandaloneKindSignatures #-}
 module PreludeFilterSource (FilterNegated, FilterIdentity, FilterWith, Negation) where
 
 import GHC.Exts (U)

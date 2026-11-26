@@ -1,5 +1,5 @@
 {-# LANGUAGE StandaloneKindSignatures #-}
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module CertifiedSplit
     ( SplitAtValue, splitAtValue

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TemplateHaskell #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TemplateHaskell #-}
 -- | Select a result type with a retained signature from a quote.
 module NativeRetainedTH
   (Select, quoted, quotedCase, render, renderCase, renderMaybeCase, renderMaybeField, renderNestedMaybe) where

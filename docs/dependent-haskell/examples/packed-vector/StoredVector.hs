@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll, GADTs, ScopedTypeVariables, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitForAll, GADTs, ScopedTypeVariables, TypeFamilies, UndecidableInstances #-}
 
 -- | Store vectors of different lengths behind one record type.
 module StoredVector (ListVector, VectorResult, Batch(..), singleton, cells, Wrapped(..), wrapVector, wrappedContents, gadtLength, nestedObservation, viewSelection) where

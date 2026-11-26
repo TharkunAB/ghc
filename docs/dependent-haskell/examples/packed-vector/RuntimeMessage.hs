@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies #-}
 
 module RuntimeMessage (Message, Payload (..), Allowed, Format (Configured), Permit (..), make) where
 

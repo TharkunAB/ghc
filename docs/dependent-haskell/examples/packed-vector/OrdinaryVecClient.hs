@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeApplications #-}
 
 -- | Use imported retained contracts from an ordinary source module.
 module OrdinaryVecClient (ordinaryReplicate, ordinaryConvert, ordinaryRoundTrip, ordinaryZipExact) where

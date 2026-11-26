@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts, FlexibleInstances, NoExperimentalDependentTypes #-}
+{-# LANGUAGE FlexibleContexts, FlexibleInstances, NoDependentTypes #-}
 {-# LANGUAGE QuantifiedConstraints, ScopedTypeVariables, TypeApplications, TypeFamilies, UndecidableInstances #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 module ConstrainedFormatClient (renderedRawView) where

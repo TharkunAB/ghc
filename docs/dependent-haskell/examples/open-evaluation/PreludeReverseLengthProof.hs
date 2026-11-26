@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables, TypeAbstractions, TypeApplications, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeReverseLengthProof (lengthReverse, showPreludeReverseLength) where

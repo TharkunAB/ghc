@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, NoExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, NoDependentTypes, PolyKinds #-}
 {-# LANGUAGE TypeApplications, TypeFamilies, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module PreludeZipWithLengthProof (Minimum, lengthZipWith, shorterLeft, shorterRight) where

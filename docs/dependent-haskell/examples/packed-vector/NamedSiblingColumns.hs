@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 -- | Named vectors that share one stored length.
 module NamedSiblingColumns (NamedColumns(..)) where
 

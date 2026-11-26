@@ -1,8 +1,8 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, LambdaCase #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, LambdaCase #-}
 {-# LANGUAGE PolyKinds, RankNTypes, StandaloneKindSignatures #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 -- | Typed terms and substitution from the PLFH DeBruijn chapter.
--- Adapted from PLFH batch 21 under CC BY 4.0. See REFERENCES.md.
+-- Adapted from PLFA / PLFH under CC BY 4.0.
 module BookDeBruijn (Ty(..), Ctx(..), Lookup(..), Term(..), Value(..),
                      ext, rename, weakenLookup, exts, subst, substSingle, substDouble) where
 

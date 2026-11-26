@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeFamilies, TypeOperators #-}
 module Wrong where
 
 import Data.Type.Equality ((:~:)(Refl))

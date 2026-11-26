@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, NoDependentTypes, TypeFamilies, TypeOperators #-}
 module CallbackRulesClient where
 
 import CallbackRules

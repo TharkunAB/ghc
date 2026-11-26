@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, NoUndecidableInstances, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, NoUndecidableInstances, TypeFamilies #-}
 -- | Keep empty cells empty and attach an error type to populated cells.
 module CellValidation (Validate) where
 

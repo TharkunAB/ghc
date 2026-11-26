@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 
 module IndexedMatrixClient (observeDimensions, observeTile, observeTopLayer) where
 

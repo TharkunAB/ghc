@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, StandaloneKindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, StandaloneKindSignatures #-}
 module ConsRuleMapSource (NegateAll, NegateTwice) where
 
 import qualified ConsRuleMap as M

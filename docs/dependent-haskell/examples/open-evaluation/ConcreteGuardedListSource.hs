@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, Modifiers #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, Modifiers #-}
 module ConcreteGuardedListSource (DropBool, DropMarkers, Negated, IsMarker) where
 
 import ConcreteGuardedList (Signal, dropBool, dropMarkers, isMarker)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, TypeOperators #-}
 module MapWitness (NegateAll, First(..), Checked(..), checked) where
 
 import Data.Proxy (Proxy(..))

@@ -1,7 +1,7 @@
 {-# LANGUAGE DependentTypes, LambdaCase #-}
 {-# OPTIONS_GHC -fwrite-source-equations #-}
 -- | Untyped terms, substitution and congruence of parallel reduction in PLFH Confluence.
--- Adapted from PLFH under CC BY 4.0. See REFERENCES.md.
+-- Adapted from PLFA / PLFH under CC BY 4.0.
 module BookParallel (Fin(..), UTerm(..), Par(..), parRefl,
                      extU, renameU, extsU, substU, substSingleU) where
 

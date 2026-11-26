@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, ImpredicativeTypes, NoExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE GADTs, ImpredicativeTypes, NoDependentTypes, TypeFamilies #-}
 
 module RuntimeMessageClient (main, observeMessage) where
 

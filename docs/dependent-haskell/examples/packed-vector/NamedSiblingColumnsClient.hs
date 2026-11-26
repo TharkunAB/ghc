@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 
 -- | Use generated dependent record selectors in ordinary Haskell.
 module NamedSiblingColumnsClient (readPairs, copyFlagsAtSameLength) where

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, RoleAnnotations, TypeFamilies #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, RoleAnnotations, TypeFamilies #-}
 module MixedFamily (Envelope, Stored(..), mixedResult) where
 
 import ImportedFamilyProvider (Payload)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 
 module DirectIndexedVector (SomeVec(SomeVec), SuccVec(SuccVec)) where
 

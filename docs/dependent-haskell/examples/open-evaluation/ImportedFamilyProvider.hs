@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, FlexibleContexts, FlexibleInstances, NoExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE BangPatterns, FlexibleContexts, FlexibleInstances, NoDependentTypes, TypeFamilies #-}
 {-# OPTIONS_GHC -fno-unoptimized-core-for-interpreter -fno-omit-interface-pragmas #-}
 module ImportedFamilyProvider
   (Payload, hidden, hiddenNested, Branch(..), importedFirst, importedStrict) where

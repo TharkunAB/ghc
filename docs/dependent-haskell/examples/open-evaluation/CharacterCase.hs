@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}
 module CharacterCase (upper, flag, Flag, upperAlias, flagAlias) where
 
 -- | Map two characters and preserve every other input.

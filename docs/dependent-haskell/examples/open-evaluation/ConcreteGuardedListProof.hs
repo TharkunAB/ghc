@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module ConcreteGuardedListProof (showConcreteGuardedLists) where
 

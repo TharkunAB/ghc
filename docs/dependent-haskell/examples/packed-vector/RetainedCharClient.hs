@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, NoDependentTypes #-}
 module RetainedCharClient
     (observeProjection, observeSeparateProjection, observeReplacement) where
 

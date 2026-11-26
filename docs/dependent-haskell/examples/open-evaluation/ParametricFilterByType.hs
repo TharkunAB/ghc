@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, Modifiers, PolyKinds #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers, PolyKinds #-}
 {-# LANGUAGE RankNTypes, StandaloneKindSignatures, TypeApplications, TypeFamilies, TypeOperators #-}
 {-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
 module ParametricFilterByType where

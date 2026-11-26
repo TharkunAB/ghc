@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, NoExperimentalDependentTypes, RankNTypes,
+{-# LANGUAGE CPP, DataKinds, GADTs, NoDependentTypes, RankNTypes,
              ScopedTypeVariables, TypeOperators #-}
 module Main (main) where
 
