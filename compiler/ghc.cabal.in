@@ -853,6 +853,7 @@ Library
         GHC.Tc.Gen.App
         GHC.Tc.Gen.Arrow
         GHC.Tc.Gen.Bind
+        GHC.Tc.Gen.ClosedEval
         GHC.Tc.Gen.Default
         GHC.Tc.Gen.Do
         GHC.Tc.Gen.Expand

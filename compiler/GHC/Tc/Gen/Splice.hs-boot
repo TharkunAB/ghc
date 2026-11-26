@@ -4,7 +4,7 @@ module GHC.Tc.Gen.Splice where
 
 import GHC.Prelude
 import GHC.Core (CoreExpr)
-import GHC.Core.Type (Kind, Type)
+import GHC.Core.Type (Type)
 import GHC.Types.Name
 import GHC.Types.Var (Id)
 import GHC.Hs.Expr ( PendingRnSplice, DelayedSplice )
@@ -50,14 +50,4 @@ runQinTcM :: TH.Q a -> TcM a
 runRemoteModFinalizers :: ThModFinalizers -> TcM ()
 finishTH :: TcM ()
 tcDecodeClosedCallOperand :: Name -> Type -> TcM (Maybe CoreExpr)
-
-tcHasClosedCallExecutable :: Name -> TcM Bool
-tcCheckClosedCallContext :: Name -> TcM ()
-tcPreflightClosedCall :: Name -> TcM ()
-
 tcRunClosedCall :: Id -> CoreExpr -> Type -> TcM Type
-
-tcPrepareClosedApplication :: Id -> [Type] -> Kind -> [Bool] -> TcM ([CoreExpr] -> TcM CoreExpr)
-tcPrepareClosedFunctionValue :: Id -> Type -> TcM CoreExpr
-tcPrepareClosedResult :: Name -> Kind -> TcM (CoreExpr -> TcM Type)
-tcPrepareClosedObservation :: Name -> Kind -> Name -> TcM (CoreExpr -> TcM (Maybe Type))

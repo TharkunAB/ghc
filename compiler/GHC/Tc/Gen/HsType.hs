@@ -115,7 +115,7 @@ import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
                               recordSourceMethodUse, recordSourceProofAliasUse)
-import {-# SOURCE #-} GHC.Tc.Gen.Splice (tcPrepareClosedApplication, tcPrepareClosedFunctionValue, tcPrepareClosedResult, tcPrepareClosedObservation, tcCheckClosedCallContext, tcPreflightClosedCall, tcDecodeClosedCallOperand, tcHasClosedCallExecutable)
+import GHC.Tc.Gen.ClosedEval (tcPrepareClosedApplication, tcPrepareClosedFunctionValue, tcPrepareClosedResult, tcPrepareClosedObservation, tcCheckClosedCallContext, tcPreflightClosedCall, tcDecodeClosedCallOperand, tcHasClosedCallExecutable)
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Iface.Env (lookupOrig, newGlobalBinder)
