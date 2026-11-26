@@ -4594,16 +4594,16 @@ data TcRnMessage where
   -- | More than one matchability modifier on the same arrow.
   TcRnTooManyMatchabilities :: TcRnMessage
 
-  -- | A type lambda appears with ExperimentalDependentTypes disabled.
+  -- | A type lambda appears with DependentTypes disabled.
   TcRnTypeLambdaDisabled :: TcRnMessage
 
-  -- | A type-level let appears with ExperimentalDependentTypes disabled.
+  -- | A type-level let appears with DependentTypes disabled.
   TcRnTypeLetDisabled :: TcRnMessage
 
   -- | A type lambda appears outside the supported declaration context.
   TcRnTypeLambdaContext :: TcRnMessage
 
-  -- | A type-level case needs ExperimentalDependentTypes.
+  -- | A type-level case needs DependentTypes.
   TcRnTypeCaseDisabled :: TcRnMessage
 
   -- | The pattern is malformed, or its expansion has no constructor head.

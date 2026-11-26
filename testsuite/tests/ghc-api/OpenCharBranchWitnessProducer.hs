@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase, NoExperimentalDependentTypes #-}
+{-# LANGUAGE LambdaCase, NoDependentTypes #-}
 module OpenCharBranchWitnessProducer (classify, otherClassifier) where
 
 classify :: Char -> Char

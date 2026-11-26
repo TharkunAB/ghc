@@ -1082,6 +1082,7 @@ lintCoreExpr (Let (NonRec bndr rhs) body)
        ; lintBinder LetBind bndr $
     do { lintLetBind NotTopLevel NonRecursive bndr rhs rhs_ty
        ; addAliasUE bndr let_ue $
+         markLetVars [bndr] $
          lintLetBody (BodyOfLet bndr) [bndr] body } }
 
   | otherwise
@@ -1102,6 +1103,7 @@ lintCoreExpr e@(Let (Rec pairs) body)
           -- See Note [Multiplicity of let binders] in Var
         ; ((body_type, body_ue), ues) <-
             lintRecBindings NotTopLevel pairs $
+            markLetVars bndrs $
             lintLetBody (BodyOfLetRec bndrs) bndrs body
         ; return (body_type, body_ue  `addUE` scaleUE ManyTy (foldr1WithDefault zeroUE addUE ues)) }
   where
@@ -2341,7 +2343,8 @@ lintIdBndr top_lvl bind_site id thing_inside
 
        ; addLoc (IdTy id) (lintValueType id_ty)
 
-       ; addInScopeId id thing_inside }
+       ; (if is_let_bind then (\x -> x) else clearLetVar id) $
+         addInScopeId id thing_inside }
   where
     id_ty = idType id
 
@@ -2436,9 +2439,12 @@ lintType (TermVarTy v)
   | otherwise
   = do { in_scope <- getInScope
        ; allow_dicts <- lintScopedDictionaryMode
-       ; let eligible b = isNativeOpaqueValueId b || (allow_dicts && isNativeClassDictionaryId b)
+       ; let_vars <- getLetVars
+       ; let eligible b = (isNativeOpaqueValueId b && (not (b `elemVarSet` let_vars) || isManyTy (idMult b)))
+                          || (allow_dicts && isNativeClassDictionaryId b)
        ; lintL (eligible v
-                 && maybe False (\b -> eligible b && varType b `eqType` varType v)
+                 && maybe False (\b -> eligible b && varType b `eqType` varType v
+                                                  && idMult b `eqType` idMult v)
                                 (lookupInScope in_scope v))
            (text "Invalid runtime index:" <+> ppr v <+> dcolon <+> ppr (varType v))
        ; lintVarOcc v }
@@ -3718,6 +3724,9 @@ data LintEnv
            -- ^ Join points in scope that are valid
            -- See Note [Join points]
 
+       , le_let_vars :: !VarSet
+           -- ^ Non-top-level let-bound Ids in scope (must be Many if used in TermVarTy)
+
        , le_ue_aliases :: !(NameEnv UsageEnv)
              -- See Note [Linting linearity]
              -- Assigns usage environments to the alias-like binders,
@@ -4079,11 +4088,23 @@ initL cfg m
              , le_vars     = mkVarEnv [ (v,(v, init_level)) | v <- vars ]
              , le_in_scope = mkInScopeSetList vars
              , le_joins    = emptyUniqMap
+             , le_let_vars = emptyVarSet
              , le_loc      = []
              , le_ue_aliases = emptyNameEnv
              , le_platform = l_platform cfg
              , le_diagOpts = l_diagOpts cfg
              }
+
+markLetVars :: [Id] -> LintM a -> LintM a
+markLetVars ids m = LintM $ \env errs ->
+  unLintM m (env { le_let_vars = extendVarSetList (le_let_vars env) ids }) errs
+
+clearLetVar :: Id -> LintM a -> LintM a
+clearLetVar v m = LintM $ \env errs ->
+  unLintM m (env { le_let_vars = delVarSet (le_let_vars env) v }) errs
+
+getLetVars :: LintM VarSet
+getLetVars = LintM $ \env errs -> fromBoxedLResult (Just (le_let_vars env), errs)
 
 setReportUnsat :: Bool -> LintM a -> LintM a
 -- Switch off lf_report_unsat_syns

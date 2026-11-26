@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ghc=("$1" "-B$2" -v0 -package-env - -fno-code -fforce-recomp -ferror-spans -fdiagnostics-color=never)
-implied=-XExperimentalDependentTypes
+implied=-XDependentTypes
 explicit=-XRequiredTypeArguments
 off=-XNoRequiredTypeArguments
 vdq='[GHC-51580]'

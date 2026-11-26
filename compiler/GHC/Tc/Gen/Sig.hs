@@ -244,8 +244,9 @@ tcUserTypeSig loc hs_sig_ty mb_name
        ; sigma_ty <- withSourceProofSignature mb_name $ tcHsSigWcType allow_function ctxt_no_rrc hs_sig_ty
        ; when (isExternalName name && closedSourceProofResult hs_sig_ty) $ do
            env <- getGblEnv
-           updTcRef (tcg_source_rule_types env) $ \state ->
-             state { sourceProofClosedResults = extendNameSet (sourceProofClosedResults state) name }
+           updTcRef (tcg_source_check env) $ \s ->
+             let r = scs_rule_uses s
+             in s { scs_rule_uses = r { sourceProofClosedResults = extendNameSet (sourceProofClosedResults r) name } }
        ; traceTc "tcuser" (ppr sigma_ty)
        ; return $ TcCompleteSig $
          CSig { sig_bndr  = mkLocalId name ManyTy sigma_ty
@@ -1405,10 +1406,10 @@ tcRuleBndrs skol_info mb_lhs (RuleBndrs { rb_tyvs = mb_tv_bndrs, rb_tmvs = tm_bn
                               (reverse bndrs)
     unsigned (L _ RuleBndr{}) = True
     unsigned _ = False
+    binder_names :: RuleBndr GhcRn -> [Name]
     binder_names (RuleBndr _ (L _ n)) = [n]
     binder_names (RuleBndrSig _ (L _ n) (HsPS { hsps_ext = ext })) =
       n : hsps_nwcs ext ++ hsps_imp_tvs ext
-    binder_names (XRuleBndr v) = dataConCantHappen v
 
     --------------
     go_tms :: (NameEnv Id -> Name -> Maybe Type) -> NameEnv Id -> [LRuleBndr GhcRn]

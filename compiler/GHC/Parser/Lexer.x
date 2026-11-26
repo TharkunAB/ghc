@@ -1080,9 +1080,9 @@ reservedWordsFM = listToUFM $
          ( "where",          ITwhere,         0 ),
 
          ( "forall",         ITforall NormalSyntax, 0),
-         ( "foreach",        ITforeach,        xbit ExperimentalDependentTypesBit),
-         ( "exists",         ITexists,         xbit ExperimentalDependentTypesBit),
-         ( "some",           ITsome,           xbit ExperimentalDependentTypesBit),
+         ( "foreach",        ITforeach,        xbit DependentTypesBit),
+         ( "exists",         ITexists,         xbit DependentTypesBit),
+         ( "some",           ITsome,           xbit DependentTypesBit),
          ( "mdo",            ITmdo Nothing,   xbit RecursiveDoBit),
              -- See Note [Lexing type pseudo-keywords]
          ( "family",         ITfamily,        0 ),
@@ -1163,7 +1163,7 @@ reservedSymsFM = listToUFM $
        ,("∷",   ITdcolon UnicodeSyntax,     UnicodeSyntax, 0 )
        ,("⇒",   ITdarrow UnicodeSyntax,     UnicodeSyntax, 0 )
        ,("∀",   ITforall UnicodeSyntax,     UnicodeSyntax, 0 )
-       ,("∏",   ITforeach,                  UnicodeSyntax, xbit ExperimentalDependentTypesBit )
+       ,("∏",   ITforeach,                  UnicodeSyntax, xbit DependentTypesBit )
        ,("→",   ITrarrow UnicodeSyntax,     UnicodeSyntax, 0 )
        ,("←",   ITlarrow UnicodeSyntax,     UnicodeSyntax, 0 )
 
@@ -2852,7 +2852,7 @@ data ExtBits
   | ListTuplePunsBit
   | ViewPatternsBit
   | RequiredTypeArgumentsBit
-  | ExperimentalDependentTypesBit
+  | DependentTypesBit
   | MultilineStringsBit
   | LevelImportsBit
   | QualifiedStringsBit
@@ -2939,7 +2939,7 @@ mkParserOpts extensionFlags diag_opts
       .|. ListTuplePunsBit            `xoptBit` LangExt.ListTuplePuns
       .|. ViewPatternsBit             `xoptBit` LangExt.ViewPatterns
       .|. RequiredTypeArgumentsBit    `xoptBit` LangExt.RequiredTypeArguments
-      .|. ExperimentalDependentTypesBit `xoptBit` LangExt.ExperimentalDependentTypes
+      .|. DependentTypesBit `xoptBit` LangExt.DependentTypes
       .|. MultilineStringsBit         `xoptBit` LangExt.MultilineStrings
       .|. LevelImportsBit             `xoptBit` LangExt.ExplicitLevelImports
       .|. QualifiedStringsBit         `xoptBit` LangExt.QualifiedStrings

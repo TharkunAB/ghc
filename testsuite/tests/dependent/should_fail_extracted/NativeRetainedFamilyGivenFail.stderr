@@ -1,53 +1,53 @@
 NativeRetainedFamilyGivenFail.hs:17:23: error: [GHC-05617]
-    • Could not deduce ‘W (f3 n4) ~ W (g n4)’
-      from the context: f3 n4 ~ Count n4
+    • Could not deduce ‘W (f3 n3) ~ W (g n3)’
+      from the context: f3 n3 ~ Count n3
         bound by a pattern with constructor:
                    Refl :: forall {k} (a :: k). a :~: a,
                  in an equation for ‘callHead’
         at NativeRetainedFamilyGivenFail.hs:17:16-19
-      Expected: W (Count n4) :~: W (g n4)
-        Actual: W (Count n4) :~: W (Count n4)
+      Expected: W (Count n3) :~: W (g n3)
+        Actual: W (Count n3) :~: W (Count n3)
       Note: ‘W’ is a non-injective type family.
     • In the expression: Refl
       In an equation for ‘callHead’: callHead _ _ _ Refl = Refl
 
 NativeRetainedFamilyGivenFail.hs:21:22: error: [GHC-05617]
-    • Could not deduce ‘W (f2 n3) ~ W (f2 m)’
-      from the context: f2 n3 ~ Count n3
+    • Could not deduce ‘W (f2 n2) ~ W (f2 m)’
+      from the context: f2 n2 ~ Count n2
         bound by a pattern with constructor:
                    Refl :: forall {k} (a :: k). a :~: a,
                  in an equation for ‘callArg’
         at NativeRetainedFamilyGivenFail.hs:21:15-18
-      Expected: W (Count n3) :~: W (f2 m)
-        Actual: W (Count n3) :~: W (Count n3)
+      Expected: W (Count n2) :~: W (f2 m)
+        Actual: W (Count n2) :~: W (Count n2)
       Note: ‘W’ is a non-injective type family.
     • In the expression: Refl
       In an equation for ‘callArg’: callArg _ _ _ Refl = Refl
 
 NativeRetainedFamilyGivenFail.hs:25:25: error: [GHC-05617]
-    • Could not deduce ‘W (f1 n2) ~ W (Count n2)’
-      from the context: Coercible (Count n2) (f1 n2)
+    • Could not deduce ‘W (f1 n1) ~ W (Count n1)’
+      from the context: Coercible (Count n1) (f1 n1)
         bound by a pattern with constructor:
                    Coercion :: forall {k} (a :: k) (b :: k).
                                Coercible a b =>
                                Coercion a b,
                  in an equation for ‘callRole’
         at NativeRetainedFamilyGivenFail.hs:25:14-21
-      Expected: W (Count n2) :~: W (f1 n2)
-        Actual: W (Count n2) :~: W (Count n2)
+      Expected: W (Count n1) :~: W (f1 n1)
+        Actual: W (Count n1) :~: W (Count n1)
       Note: ‘W’ is a non-injective type family.
     • In the expression: Refl
       In an equation for ‘callRole’: callRole _ _ Coercion = Refl
 
 NativeRetainedFamilyGivenFail.hs:29:22: error: [GHC-05617]
-    • Could not deduce ‘W (Count n1) ~ W Zero’
-      from the context: f (Count n1) ~ Count n1
+    • Could not deduce ‘W (Count n) ~ W Zero’
+      from the context: f (Count n) ~ Count n
         bound by a pattern with constructor:
                    Refl :: forall {k} (a :: k). a :~: a,
                  in an equation for ‘callCycle’
         at NativeRetainedFamilyGivenFail.hs:29:15-18
-      Expected: W (Count n1) :~: W Zero
-        Actual: W (Count n1) :~: W (Count n1)
+      Expected: W (Count n) :~: W Zero
+        Actual: W (Count n) :~: W (Count n)
       Note: ‘W’ is a non-injective type family.
     • In the expression: Refl
       In an equation for ‘callCycle’: callCycle _ _ Refl = Refl

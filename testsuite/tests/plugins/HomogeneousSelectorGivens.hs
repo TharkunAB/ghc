@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GHC2024, NoDependentTypes #-}
 {-# OPTIONS_GHC -fplugin=DeferredHeterogeneousPlugin #-}
 module Main where
 

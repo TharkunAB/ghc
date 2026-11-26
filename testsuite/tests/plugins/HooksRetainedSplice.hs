@@ -1,5 +1,5 @@
 {-# OPTIONS_GHC -fplugin=Hooks.MetaPlugin -fplugin-opt=Hooks.MetaPlugin:trace-type #-}
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TemplateHaskell #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TemplateHaskell #-}
 module HooksRetainedSplice (choose) where
 
 import Language.Haskell.TH

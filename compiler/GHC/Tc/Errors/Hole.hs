@@ -648,7 +648,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; sortingAlg <- getHoleFitSortingAlg
      ; dflags <- getDynFlags
      ; let exts = extensionFlags dflags
-           dep_exts = EnumSet.member LangExt.ExperimentalDependentTypes exts
+           dep_exts = EnumSet.member LangExt.DependentTypes exts
            hole_term_ids
              | dep_exts
              = [ v
@@ -1021,7 +1021,7 @@ tcFilterHoleFitsWith lookup_cand limit typed_hole ht@(hole_ty, _) candidates =
                                                  -- with the refinement
                                                  -- variables in ref_vars.
     fitsHole (h_ty, ref_vars) cand_ty cand_is_datacon =
-      do { dep_exts <- xoptM LangExt.ExperimentalDependentTypes
+      do { dep_exts <- xoptM LangExt.DependentTypes
          ; let n_ref = length ref_vars
                base_hole_ty = peelRefinementArrows n_ref h_ty
          ; if | dep_exts
@@ -1189,7 +1189,7 @@ tcCheckHoleFit ds_flag (TypedHole {..}) hole_ty cand_ty = discardErrs $
                 ; traceTc "final_wc is: " $ ppr final_wc
 
                   -- runTcSEarlyAbort: (FastHoles4) from Note [Speeding up valid hole-fits]
-                ; dep_exts <- xoptM LangExt.ExperimentalDependentTypes
+                ; dep_exts <- xoptM LangExt.DependentTypes
                 ; let cap_depth d
                         | dep_exts
                         = d { reductionDepth = min (reductionDepth d) (mkIntWithInf 24) }
@@ -1251,7 +1251,7 @@ checkInsolubleM no_givens no_given_dicts wc@(WC { wc_simple = simples })
   = return True
   | otherwise
   = do { dflags <- getDynFlags
-       ; if not (xopt LangExt.ExperimentalDependentTypes dflags)
+       ; if not (xopt LangExt.DependentTypes dflags)
          then return False
          else anyM (is_insol_ct dflags) (bagToList simples) }
   where
@@ -1931,7 +1931,7 @@ isGadtHoleTy ty
         (_, _, eq_spec, _, _, _) -> not (null eq_spec)
 
 -- | Build a memoized candidate type lookup across level-0 and refinement passes.
--- On GADT proof holes under 'ExperimentalDependentTypes', skip unloaded
+-- On GADT proof holes under 'DependentTypes', skip unloaded
 -- 'Prelude' modules unrelated to propositional equality so cold hole checks do
 -- not deserialize irrelevant interfaces.
 mkCachedCandLookup :: Bool

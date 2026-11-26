@@ -13,7 +13,6 @@ NativeTypeCaseRetainedThSeparateWrong.hs:20:33: error: [GHC-83865]
                      with: case c of {True -> Int; False -> Char}
       Expected: the type case in the signature for ‘renderSame’
         Actual: the type case in the signature for ‘choose’
-      Note: GHC cannot determine the arguments of the type case in the signature for ‘renderSame’ from its result.
     • In the second argument of ‘renderSame’, namely ‘(choose b)’
       In the expression: renderSame c (choose b)
       In an equation for ‘diffCapture’:

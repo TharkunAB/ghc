@@ -95,7 +95,7 @@ import GHC.Settings (UnitSettings(unitSettings_ghcInternalUnitId))
 import GHC.Tc.Errors.Types (RetainedQuantificationError(..), TcRnMessage(..))
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Tc.TyCl.Build (newImplicitBinder)
-import GHC.Tc.Types (SourceRuleUses(..), TcGblEnv(..), tcVisibleOrphanMods)
+import GHC.Tc.Types (SourceCheckState(..), SourceRuleUses(..), TcGblEnv(..), tcVisibleOrphanMods)
 import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, ATcTyCon, tct_id))
 import GHC.Tc.Types.ErrCtxt (FunAppCtxtFunArg(..), HsCtxt(..))
 import GHC.Tc.Types.Evidence (EvBindsState(..), HsWrapper(..), TcEvBinds(..), collectHsWrapBinders, isEmptyEvBindsMap)
@@ -103,9 +103,9 @@ import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTyp
 import GHC.Tc.Utils.Env (tcGetInstEnvs, tcLookupId, tcLookupIdMaybe)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
 import GHC.Tc.Utils.Monad
-  ( TcM, addErr, checkNoErrs, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getLclEnv
+  ( TcM, addErr, attemptM, checkNoErrs, failM, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getLclEnv
   , getTcEvBindsMap, getTcEvBindsState, getTopEnv, goptM, keepAlive, liftZonkM, newSysName
-  , newTcRef, readTcRef, recordHomeRuleDependencies, setGblEnv, setSrcSpan, setSrcSpanA, updTcRef, writeTcRef, xoptM )
+  , readTcRef, recordHomeRuleDependencies, setSrcSpan, setSrcSpanA, updTcRef, xoptM )
 import GHC.Tc.Utils.TcType (isMetaTyVar, isTyFamFree)
 import GHC.Tc.Zonk.TcType (zonkTcType, zonkTcTypes)
 import GHC.Tc.Zonk.Type (zonkTopDecls)
@@ -230,11 +230,11 @@ lookupBootModuleIdMaybe mod occ = do
 
 recordSourceTableUse :: TcGblEnv -> Name -> TcM ()
 recordSourceTableUse env name =
-    updTcRef (tcg_source_table_uses env) (\uses -> let !u = extendNameSet uses name in u)
+    updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) name })
 
 recordSourceTableUses :: TcGblEnv -> [Name] -> TcM ()
 recordSourceTableUses env names =
-    updTcRef (tcg_source_table_uses env) (\uses -> let !u = extendNameSetList uses names in u)
+    updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSetList (scs_table_uses s) names })
 
 freshSysTyVar :: String -> Kind -> TcM TyVar
 freshSysTyVar occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
@@ -776,43 +776,53 @@ captureSourceMethodProof :: Id -> Id -> Id -> (SourceProofArgs, [Id]) -> TcM ()
 captureSourceMethodProof dfun selector target (checked, leaves) = do
     env <- getGblEnv
     let ops = sourceMethodOps dfun selector target
-    updTcRef (tcg_source_rule_types env) $ \state -> case sourceProofSignature state of
-      Just owner ->
-        let new_deps = [(idName v, first, finalCoreMapperOwner v, if v == selector then checked else []) | (v, first) <- ops]
-                       ++ [(idName v, Nothing, False, []) | v <- leaves]
-            !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) owner new_deps
-        in state { sourceProofDefinitions = defs' }
-      Nothing -> state
+    updTcRef (tcg_source_check env) $ \s ->
+      let state = scs_rule_uses s
+      in case sourceProofSignature state of
+           Just owner ->
+             let new_deps = [(idName v, first, finalCoreMapperOwner v, if v == selector then checked else []) | (v, first) <- ops]
+                            ++ [(idName v, Nothing, False, []) | v <- leaves]
+                 !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) owner new_deps
+             in s { scs_rule_uses = state { sourceProofDefinitions = defs' } }
+           Nothing -> s
 
 withSourceProofSignature :: Maybe Name -> TcM a -> TcM a
 withSourceProofSignature (Just owner) action | isExternalName owner = do
-    enabled <- xoptM LangExt.ExperimentalDependentTypes
+    enabled <- xoptM LangExt.DependentTypes
     if not enabled then action else do
       env <- getGblEnv
-      let proof_ref = tcg_source_rule_types env
-      before <- readTcRef proof_ref
-      local <- newTcRef (before { sourceProofSignature = Just owner })
-      result <- setGblEnv (env { tcg_source_rule_types = local }) action
-      after <- readTcRef local
-      writeTcRef proof_ref (after { sourceProofSignature = sourceProofSignature before })
-      pure result
+      let check_ref = tcg_source_check env
+      before <- scs_rule_uses <$> readTcRef check_ref
+      updTcRef check_ref $ \s ->
+        s { scs_rule_uses = (scs_rule_uses s) { sourceProofSignature = Just owner } }
+      mb_res <- attemptM action
+      case mb_res of
+        Just result -> do
+          updTcRef check_ref $ \s ->
+            s { scs_rule_uses = (scs_rule_uses s) { sourceProofSignature = sourceProofSignature before } }
+          pure result
+        Nothing -> do
+          updTcRef check_ref (\s -> s { scs_rule_uses = before })
+          failM
 withSourceProofSignature _ action = action
 
 recordSourceProofAliasUse :: Maybe Name -> TyCon -> TcM ()
 recordSourceProofAliasUse owner tc
   | deps@(_ : _) <- synTyConSourceProofRules tc = do
       env <- getGblEnv
-      updTcRef (tcg_source_rule_types env) $ \state -> case owner <|> sourceProofSignature state of
-        Just name | isExternalName name ->
-          let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) name deps
-          in state { sourceProofDefinitions = defs' }
-        _ -> state
+      updTcRef (tcg_source_check env) $ \s ->
+        let state = scs_rule_uses s
+        in case owner <|> sourceProofSignature state of
+             Just name | isExternalName name ->
+               let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) name deps
+               in s { scs_rule_uses = state { sourceProofDefinitions = defs' } }
+             _ -> s
   | otherwise = pure ()
 
 sourceProofRulesFor :: Name -> TcM [SourceProofRule]
 sourceProofRulesFor name = do
     env <- getGblEnv
-    defs <- sourceProofDefinitions <$> readTcRef (tcg_source_rule_types env)
+    defs <- sourceProofDefinitions . scs_rule_uses <$> readTcRef (tcg_source_check env)
     pure (stableSourceProofRules (fromMaybe [] (lookupNameEnv defs name)))
 
 takeSourceProofRulesFor :: Name -> TcM [SourceProofRule]
@@ -820,13 +830,15 @@ takeSourceProofRulesFor name = do
     rules <- sourceProofRulesFor name
     unless (null rules) $ do
       env <- getGblEnv
-      updTcRef (tcg_source_rule_types env) $ \state ->
-        let !defs' = delFromNameEnv (sourceProofDefinitions state) name in state { sourceProofDefinitions = defs' }
+      updTcRef (tcg_source_check env) $ \s ->
+        let state = scs_rule_uses s
+            !defs' = delFromNameEnv (sourceProofDefinitions state) name
+        in s { scs_rule_uses = state { sourceProofDefinitions = defs' } }
     pure rules
 
 checkAndInstallSourceProofs :: TcGblEnv -> TcM TcGblEnv
 checkAndInstallSourceProofs env = do
-    state <- readTcRef (tcg_source_rule_types env)
+    state <- scs_rule_uses <$> readTcRef (tcg_source_check env)
     let occurrences = sourceProofOccurrences state
         imported = mkNameEnv [(name, ops) | (name, _, ops) <- occurrences]
         rhs_proofs = mkNameEnv
@@ -1308,7 +1320,7 @@ optionalSourceUses heads methods = do
 registerOptionalSourceUses :: TcEvBinds -> CoVar -> OptionalSourceUses -> TcM ()
 registerOptionalSourceUses evidence proof (OptionalSourceUses owners ops tables) = do
     env <- getGblEnv
-    updTcRef (tcg_optional_source_uses env) (\pending -> let !e = (evidence, proof, owners, ops, tables) in e : pending)
+    updTcRef (tcg_source_check env) (\s -> let !e = (evidence, proof, owners, ops, tables) in s { scs_optional_uses = e : scs_optional_uses s })
 
 optionalSourceUsePlan :: [Id] -> [(Id, Id, Maybe Id)] -> TcM (Maybe ([Id], [(Id, Maybe Name)], [Name]))
 optionalSourceUsePlan heads methods = do
@@ -1459,7 +1471,7 @@ changedSourceUse ops = do
 
 commitOptionalSourceUses :: TcGblEnv -> TcM ()
 commitOptionalSourceUses env = do
-    pending <- readTcRef (tcg_optional_source_uses env)
+    pending <- scs_optional_uses <$> readTcRef (tcg_source_check env)
     remaining <- fmap catMaybes $ forM pending $ \entry@(evidence, proof, owners, ops, tables) -> do
       needed <- case evidence of
         TcEvBinds var -> (proof `elemVarSet`) . ebs_needs <$> getTcEvBindsState var
@@ -1469,7 +1481,7 @@ commitOptionalSourceUses env = do
         recordSourceTableUses env tables
         forM_ owners $ \o -> when (nameModule_maybe (idName o) == Just (tcg_semantic_mod env)) (keepAlive (idName o))
         pure Nothing
-    writeTcRef (tcg_optional_source_uses env) remaining
+    updTcRef (tcg_source_check env) (\s -> s { scs_optional_uses = remaining })
 
 recordSourceUses :: [(Id, Maybe Name)] -> TcM ()
 recordSourceUses ops = do
@@ -1483,9 +1495,10 @@ recordSourceUses ops = do
           case mb_shunt of
             Just (proof_owner, shunt_owner) -> do
               let deps = [(idName v, Nothing, True, [SourceProofUnknown]), (idName shunt_owner, Nothing, False, [])]
-              updTcRef (tcg_source_rule_types env) $ \state ->
-                let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) proof_owner deps
-                in state { sourceProofDefinitions = defs' }
+              updTcRef (tcg_source_check env) $ \s ->
+                let state = scs_rule_uses s
+                    !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) proof_owner deps
+                in s { scs_rule_uses = state { sourceProofDefinitions = defs' } }
               pure Nothing
             Nothing -> pure (Just (v, arg))
         unless (null filtered) (publishSourceUses filtered)
@@ -1499,28 +1512,33 @@ publishSourceUses ops = do
     let combine a b | isEmptyNameSet a || isEmptyNameSet b = emptyNameSet | otherwise = unionNameSet a b
         add !acc (v, arg) = extendNameEnv_C combine acc (idName v) (maybe emptyNameSet unitNameSet arg)
     recordSourceTableUses env (map (idName . fst) ops)
-    updTcRef (tcg_source_rule_types env) (\s -> let !t = foldl' add (sourceRuleTypes s) ops in s { sourceRuleTypes = t })
+    updTcRef (tcg_source_check env) $ \sc ->
+      let s = scs_rule_uses sc
+          !t = foldl' add (sourceRuleTypes s) ops
+      in sc { scs_rule_uses = s { sourceRuleTypes = t } }
 
 checkSourceMethodUses :: TcGblEnv -> TcM ()
-checkSourceMethodUses env = checkSourceMethodUsesWithPending env >> writeTcRef (tcg_optional_source_uses env) []
+checkSourceMethodUses env =
+    checkSourceMethodUsesWithPending env >> updTcRef (tcg_source_check env) (\s -> s { scs_optional_uses = [] })
 
 checkOptionalSourceUses :: TcGblEnv -> TcM ()
 checkOptionalSourceUses env = do
-    pending <- readTcRef (tcg_optional_source_uses env)
+    pending <- scs_optional_uses <$> readTcRef (tcg_source_check env)
     unless (null pending) (checkNoErrs (checkSourceMethodUsesWithPending env))
 
 checkSourceMethodUsesWithPending :: TcGblEnv -> TcM ()
 checkSourceMethodUsesWithPending env = do
     commitOptionalSourceUses env
-    uses <- filterNameSet (\n -> let o = nameOccName n in isVarOcc o || isFieldOcc o) <$> readTcRef (tcg_source_table_uses env)
-    unfolded <- readTcRef (tcg_evaluated_term_uses env)
+    scs <- readTcRef (tcg_source_check env)
+    let uses = filterNameSet (\n -> let o = nameOccName n in isVarOcc o || isFieldOcc o) (scs_table_uses scs)
+        unfolded = scs_evaluated_uses scs
     rewriting <- goptM Opt_EnableRewriteRules
     let uses_final_core v = finalCoreMapperOwner v && not (isFinalCoreIdentity v && idName v `elemNameSet` unfolded)
         needs_rules v = uses_final_core v || isNominalStructuralSource v
     checked_uses <- if rewriting then pure uses else
       mkNameSet <$> filterM (fmap (maybe True (not . needs_rules)) . tcLookupIdMaybe) (nameSetElemsStable uses)
     unless (isEmptyNameSet checked_uses) $ do
-      types <- sourceRuleTypes <$> readTcRef (tcg_source_rule_types env)
+      types <- sourceRuleTypes . scs_rule_uses <$> readTcRef (tcg_source_check env)
       let arguments name | Just ts <- lookupNameEnv types name, not (isEmptyNameSet ts) = map Just (nameSetElemsStable ts)
                          | otherwise = [Nothing]
           affected rule name = anyM (\arg -> elemNameSet name <$> sourceRuleOwnersAtTc arg [rule]) (arguments name)
@@ -1547,7 +1565,7 @@ checkSourceMethodUsesWithPending env = do
           pure conflict
         when (all isNothing conflicts) (recordCommittedHomeRules env)
     when rewriting $ do
-      defs <- sourceProofDefinitions <$> readTcRef (tcg_source_rule_types env)
+      defs <- sourceProofDefinitions . scs_rule_uses <$> readTcRef (tcg_source_check env)
       append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
       when (any (any (\(n, _, m, c) -> n == append_name && m && c == [SourceProofUnknown])) (nonDetNameEnvElts defs)) $ do
         mb_append <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "++")
@@ -1717,7 +1735,7 @@ directRetainedWitnessType ty =
       sig@(ConstructorCaseType _ tc args [domain] 0 result) <- constructorCaseType ty
       [con] <- pure (tyConDataCons tc)
       witness : _ <- pure (dataConOrigArgTys con)
-      guard (isRetainedCaseRoot domain tc &&
+      guard (isJust (getTyVar_maybe result) && isRetainedCaseRoot domain tc &&
              result `eqType` substTyWith (dataConUnivTyVars con) args (scaledThing witness))
       pure (con, sig)
 
@@ -2297,10 +2315,12 @@ data BranchState = BranchState
 compileCoreEquations :: CoreCompileSpec -> Id -> Core.CoreExpr -> Maybe CompiledCoreTable
 compileCoreEquations spec owner original_rhs = do
     let rhs0 = stripTicksE isSourceBreakpoint original_rhs
-    guard ((isJust (ccs_witness_root spec) || not (hasNativeDependentExprRhs original_rhs)) &&
-           exprType rhs0 `eqType` varType owner)
+    guard (exprType rhs0 `eqType` varType owner)
     (declared_tele, _, _) <- splitCoreSignature (varType owner)
     (telescope, domains, result) <- splitCoreSignature (exprType rhs0)
+    let has_retained_root = isJust (ccs_witness_root spec) ||
+                            any (\d -> maybe False (isRetainedCaseRoot d . fst) (caseDatatype d)) domains
+    guard (has_retained_root || not (hasNativeDependentExprRhs original_rhs))
     let (all_lams, raw_body) = Core.collectBinders rhs0
         (parameters, prefix_terms) = splitAt (length telescope) all_lams
     guard (parameters == binderVars telescope && all isId prefix_terms &&
@@ -2621,7 +2641,7 @@ compileCoreEquations spec owner original_rhs = do
       | length prefix_terms == length domains = Just (prefix_terms, [], Nothing, owner, Nothing, raw_body)
       | otherwise = Nothing
 
-    expandCaseDefaults in_scope True tc args (Core.Alt Core.DEFAULT [] def_body : rest) | not (null rest) = do
+    expandCaseDefaults in_scope True tc args (Core.Alt Core.DEFAULT [] def_body : rest) | not (null (tyConDataCons tc)) = do
       let explicit = [dc | Core.Alt (Core.DataAlt dc) _ _ <- rest]
           missing = filter (`notElem` explicit) (tyConDataCons tc)
           alloc sc [] = Just (sc, [])
@@ -4076,7 +4096,7 @@ compileBooleanGuardCase public predicate owner body
 sourceCaseTables :: NameSet -> LHsBinds GhcTc -> TcM ([(Id, TyCon)], [TyCon])
 sourceCaseTables nominal_owners binds = do
   env <- getGblEnv
-  char_tables <- xoptM LangExt.ExperimentalDependentTypes
+  char_tables <- xoptM LangExt.DependentTypes
   dflags <- getDynFlags
   rdr_env <- getGlobalRdrEnv
   let generates_code = backendGeneratesCode (backend dflags)

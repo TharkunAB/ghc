@@ -445,7 +445,7 @@ rnLocalValBindsAndThen
 rnLocalValBindsAndThen (ValBinds x vbinds) thing_inside
   | (local_syns@((first_syn_loc, _, _, _, _) : _), ordinary_vbinds)
       <- partitionEithers (map splitLocalTySynVb vbinds)
-  = do  { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do  { enabled <- xoptM LangExt.DependentTypes
         ; unless enabled $
             setSrcSpanA first_syn_loc $ failWithTc TcRnTypeLetDisabled
         ; let ordinary_binds = ValBinds x ordinary_vbinds
@@ -1322,7 +1322,7 @@ renameValueSig
 renameValueSig rename_type ctxt sig@(TypeSig _ mods vs ty)
   = do  { new_vs <- mapM (lookupSigOccRn ctxt sig) vs
         ; let doc = TypeSigCtx vs
-        ; retained <- xoptM LangExt.ExperimentalDependentTypes
+        ; retained <- xoptM LangExt.DependentTypes
         ; (new_ty, fvs) <- case ctxt of
             LocalBindCtxt bound_names | retained ->
               let own_names = mkNameSet (map unLoc new_vs)
@@ -1597,7 +1597,7 @@ bindRuleTmVars doc tyvs vars names thing_inside
     -- See Note [Runtime indices in RULE binders].
     scope_index name inside
       | RuleCtx{} <- doc
-      = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+      = do { enabled <- xoptM LangExt.DependentTypes
            ; env <- getLocalRdrEnv
            ; let occ = setOccNameSpace tvName (nameOccName name)
            ; if enabled && isNothing (lookupLocalRdrEnv env (Unqual occ))

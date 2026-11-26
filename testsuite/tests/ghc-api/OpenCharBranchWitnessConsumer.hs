@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 module OpenCharBranchWitnessConsumer (probe) where
 
 import OpenCharBranchWitnessProducer (classify)

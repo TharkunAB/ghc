@@ -205,7 +205,7 @@ extensionName = \case
   LangExt.Modifiers -> "Modifiers"
   LangExt.LinearTypes -> "LinearTypes"
   LangExt.RequiredTypeArguments -> "RequiredTypeArguments"    -- Visible forall (VDQ) in types of terms
-  LangExt.ExperimentalDependentTypes -> "ExperimentalDependentTypes"
+  LangExt.DependentTypes -> "DependentTypes"
   LangExt.StandaloneDeriving -> "StandaloneDeriving"
   LangExt.DeriveDataTypeable -> "DeriveDataTypeable"
   LangExt.AutoDeriveTypeable -> "AutoDeriveTypeable"       -- Automatic derivation of Typeable
@@ -376,7 +376,7 @@ impliedXFlags
 
     , (LangExt.ExplicitLevelImports, Off LangExt.ImplicitStagePersistence)
     , (LangExt.LinearTypes, On LangExt.Modifiers)
-    , (LangExt.ExperimentalDependentTypes, On LangExt.RequiredTypeArguments)
+    , (LangExt.DependentTypes, On LangExt.RequiredTypeArguments)
   ]
 
 

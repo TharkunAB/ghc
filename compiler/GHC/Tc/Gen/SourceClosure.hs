@@ -75,7 +75,7 @@ import GHC.Tc.Types (tcVisibleOrphanMods)
 import GHC.Tc.Utils.Env (tcLookupIdMaybe)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
 import GHC.Tc.Utils.Monad
-  ( TcGblEnv(..), TcM, addErr, failIfErrsM, getGblEnv, getGlobalRdrEnv, getTopEnv, goptM, liftIO
+  ( SourceCheckState(..), TcGblEnv(..), TcM, addErr, failIfErrsM, getGblEnv, getGlobalRdrEnv, getTopEnv, goptM, liftIO
   , newSysName, readTcRef, setSrcSpan )
 import GHC.Tc.Utils.TcType (isTyFamFree)
 import GHC.Types.Avail (availsToNameSet)
@@ -2072,7 +2072,7 @@ earlyIndexedLookups env = [(fun, table) | (fun, table, _, _) <- earlySourceClosu
 
 pruneUnusedIndexedLookups :: TcGblEnv -> TcM TcGblEnv
 pruneUnusedIndexedLookups env = do
-    direct_used <- readTcRef (tcg_source_table_uses env)
+    direct_used <- scs_table_uses <$> readTcRef (tcg_source_check env)
     let entries = earlySourceClosureEntries env
         table_map = mkNameEnv [(tyConName table, table) | (_, table, _, _) <- entries]
         close_uses seen [] = seen

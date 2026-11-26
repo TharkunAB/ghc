@@ -6,7 +6,7 @@ trap 'rm -rf -- "$out"' EXIT
 cd "$out"
 
 cat >Provider.hs <<'EOF'
-{-# LANGUAGE CPP, GADTs, NoExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE CPP, GADTs, NoDependentTypes, RankNTypes #-}
 module Provider where
 
 data Early where
@@ -29,7 +29,7 @@ data Context where
 EOF
 
 cat >Client.hs <<'EOF'
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes, TypeAbstractions, TypeApplications #-}
+{-# LANGUAGE GADTs, NoDependentTypes, TypeAbstractions, TypeApplications #-}
 module Main where
 import Provider (Inferred(..))
 

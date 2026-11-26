@@ -6,12 +6,12 @@ NativeGadtRetainedSumCoverage.hs:14:1: error: [GHC-62161] [-Wincomplete-patterns
 NativeGadtRetainedSumCoverage.hs:17:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
     Pattern match has inaccessible right hand side
     In an equation for ‘knownUnreachable’:
-        knownUnreachable (DirectVec (S __a237) _) = ...
+        knownUnreachable (DirectVec (S __a22E) _) = ...
 
 NativeGadtRetainedSumCoverage.hs:34:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
     Pattern match has inaccessible right hand side
     In an equation for ‘disjointSquareMatch’:
-        disjointSquareMatch (Square __a21m _) = ...
+        disjointSquareMatch (Square __a20T _) = ...
 
 NativeGadtRetainedSumCoverage.hs:43:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
     Pattern match(es) are non-exhaustive
@@ -39,7 +39,7 @@ NativeGadtRetainedSumCoverage.hs:61:1: error: [GHC-62161] [-Wincomplete-patterns
 NativeGadtRetainedSumCoverage.hs:64:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
     Pattern match has inaccessible right hand side
     In an equation for ‘knownNestedInaccessible’:
-        knownNestedInaccessible (Blocked __a1Yn __a1Yo __a1Yp (VCons _ _)
+        knownNestedInaccessible (Blocked __a1XU __a1XV __a1XW (VCons _ _)
                                          _) = ...
 
 NativeGadtRetainedSumCoverage.hs:68:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]

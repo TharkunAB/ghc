@@ -2083,9 +2083,12 @@ dataConWrapperType :: DataCon -> Type
 -- NB: If the constructor is part of a data instance, the result type
 -- mentions the family tycon, not the internal one.
 dataConWrapperType con
-  | not (con `hasKey` heqDataConKey)
+  | con `hasKey` heqDataConKey
+  = dataConRepType con
+  | not (null (dataConRepArgBinders con))
+  = dataConRepType con `seq` dataConWrapperTypeUnchecked con
+  | otherwise
   = dataConWrapperTypeUnchecked con
-  | otherwise = dataConRepType con
 
 -- | Rebuild the user type after the retained representation check.
 dataConWrapperTypeUnchecked :: DataCon -> Type

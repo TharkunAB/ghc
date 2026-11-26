@@ -1,4 +1,4 @@
-{-# LANGUAGE GHC2024, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GHC2024, NoDependentTypes #-}
 module HomogeneousSelectorGivensProvider where
 
 type role Premise nominal

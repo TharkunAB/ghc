@@ -1,5 +1,9 @@
 NativeTypeCaseDominatedWrongKind.hs:8:20: error: [GHC-83865]
     • Expected a type, but ‘'True’ has kind ‘Bool’
-    • In the type ‘'True’
-      In the type lambda in ‘Bad’
+    • In the type lambda in ‘Bad’
+      In the type ‘((\d -> case d of {'Just _ -> Int;
+                                      'Just ('Just _) -> 'True;
+                                      'Nothing -> Char}) :: forall k. @U
+                                                            Maybe (Maybe k) %U -> Type)’
+      In the type synonym declaration for ‘Bad’
 

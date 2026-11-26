@@ -50,7 +50,6 @@ import GHC.Unit.Module.Warnings
 import GHC.Builtin( mkUnboundName )
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs ( consDataCon_RDR )
-import GHC.Builtin.WiredIn.Types ( liftedTypeKindTyConName )
 import GHC.Iface.Env ( lookupOrig )
 
 import GHC.Types.FieldLabel
@@ -60,7 +59,7 @@ import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Name.Env
 import GHC.Types.Var ( Specificity(SpecifiedSpec) )
-import GHC.Types.Basic  ( TyConFlavour(..), TypeOrKind(..), NewOrData(..), RuleName, RecFlag, VisArity )
+import GHC.Types.Basic  ( TyConFlavour(..), TypeOrKind(..), NewOrData(..), RuleName, VisArity )
 import GHC.Types.GREInfo ( ConLikeInfo(..), ConInfo, mkConInfo, conInfoFields )
 import GHC.Types.Hint ( SigLike(..) )
 import GHC.Types.Unique.Set
@@ -80,14 +79,13 @@ import GHC.Data.Graph.Directed ( SCC, flattenSCC, Node(..)
 import GHC.Data.OrdList
 import qualified GHC.LanguageExtensions as LangExt
 
-import Control.Applicative ( (<|>) )
 import Control.Monad
 import Data.Bifunctor ( first )
 import Data.Foldable ( toList, for_ )
 import Data.List ( nub, partition )
 import Data.List.NonEmpty ( NonEmpty(..), head, nonEmpty )
 import Data.Data ( Data, cast, gmapQ, gmapT )
-import Data.Maybe ( isJust, isNothing, fromMaybe, mapMaybe, maybeToList )
+import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, mapMaybe, maybeToList )
 import qualified Data.Set as Set ( difference, fromList, null, toList )
 
 {- | @rnSourceDecl@ "renames" declarations.
@@ -178,7 +176,7 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    warnPunBindingsAgainst earlier_pun_scope
      (nonDetEltsUniqSet (tc_bndrs `unionNameSet` mkNameSet (pat_syn_bndrs ++ id_bndrs))) ;
    -- See Note [Ordering local source tables].
-   dependent <- xoptM LangExt.ExperimentalDependentTypes ;
+   dependent <- xoptM LangExt.DependentTypes ;
    tables <- if dependent then localSourceTableBinders tycl_decls binds' sigs' else pure [] ;
    let { table_names = map snd tables
        ; rdr_env = foldl' extendGlobalRdrEnv (tcg_rdr_env gbl_env)
@@ -368,7 +366,7 @@ The source row passes the carried variable unchanged. For example, in
 fields of the scrutinized pattern can supply the decreasing argument.
 A list worker with one element type can also push the head onto the
 accumulator while recursing on the tail.
-See Note [Checked list reverse] in GHC.Tc.Gen.SourceTable. Check the
+See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable. Check the
 recursive operands before constructing an axiom. Return all requested
 names so the caller can report an uncertified table at the source binding.
 
@@ -394,7 +392,6 @@ localSourceTableBinders tycl_decls binds sigs = do
               (any matches_second rows && all (constructor_row n True) rows) ||
               all (right_constructor_row n) rows ||
               right_structural_rows n rows ||
-              all (mapping_row n) rows ||
               all pair_swap_row rows ||
               (not strict && (all (poly_nested_row n) rows ||
                               all (poly_right_nested_row n) rows ||
@@ -905,8 +902,7 @@ localSourceTableBinders tycl_decls binds sigs = do
     right_constructor_row _ _ = False
 
     -- The first row of a right-first split carries its left operand.
-    -- The remaining rows inspect both operands. See Note [Local structural
-    -- case equations] in GHC.Tc.Gen.SourceTable.
+    -- The remaining rows inspect both operands. See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
     right_structural_rows self rows@[base, next, recur]
       | Just [(Nothing, Just []), (Just [], Just [_]), (Just [_], Just [_])]
           <- traverse constructor_columns rows
@@ -917,33 +913,9 @@ localSourceTableBinders tycl_decls binds sigs = do
       Just (constructor_fields (unparen left), constructor_fields (unparen right))
     constructor_columns _ = Nothing
 
-    mapping_row :: Name -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
-    mapping_row self (L _ Match{m_pats = L _ [callback, pat], m_grhss = rhss})
-      | Just fields <- constructor_fields (unparen pat)
-      , all plain_field fields
-      , Just bound <- callback_binder (unparen callback)
-      , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
-      = mapping_result self (collectPatsBinders CollNoDictBinders fields) bound rhs
-    mapping_row _ _ = False
-
     callback_binder (VarPat _ (L _ v)) = Just (Just v)
     callback_binder WildPat{} = Just Nothing
     callback_binder _ = Nothing
-
-    mapping_result self fields callback = check []
-      where
-        check args expr = case unLoc (stripParensLHsExpr expr) of
-          HsApp _ fun arg -> check (arg : args) fun
-          OpApp _ left op right -> check (left : right : args) op
-          HsAppType _ fun _ -> check args fun
-          HsVar _ (L _ name)
-            | isRdrDataCon name -> all (check []) args
-            | name `elem` fields -> null args
-            | Just name == callback, [arg] <- args -> in_field arg
-            | same_source_owner self name, [fun, arg] <- args
-            -> isJust callback && variable fun == callback && in_field arg
-          _ -> False
-        in_field arg = maybe False (`elem` fields) (variable arg)
 
     variable :: LHsExpr GhcPs -> Maybe RdrName
     variable e = case unLoc (stripParensLHsExpr e) of
@@ -956,14 +928,13 @@ localSourceTableBinders tycl_decls binds sigs = do
       rdrNameExactName_maybe r == Just self
 
     -- The typed checker checks the whole matrix, including the constructor
-    -- identities and the order of both columns. See Note [Local structural
-    -- case equations] in GHC.Tc.Gen.SourceTable.
+    -- identities and the order of both columns. See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
     matches_second (L _ Match{m_pats = L _ [_, p]}) =
       isJust (constructor_fields (unparen p))
     matches_second _ = False
 
     carried_binders :: Bool -> [LPat GhcPs] -> Maybe [Maybe RdrName]
-    -- See Note [Carried arguments of a source equation] in GHC.Tc.Gen.SourceTable.
+    -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
     carried_binders False ps = traverse (callback_binder . unparen) ps
     carried_binders True [p]
       | Just carried <- callback_binder (unparen p) = Just (maybe [] (pure . Just) carried)
@@ -1024,7 +995,7 @@ localSourceTableBinders tycl_decls binds sigs = do
           = lifted_callback cb inner
           | otherwise = False
         -- The solved Core must use the original head, tail and accumulator.
-        -- See Note [Checked list reverse] in GHC.Tc.Gen.SourceTable.
+        -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
         cons_onto x acc expr = case unLoc (stripParensLHsExpr expr) of
           OpApp _ left op right -> cons op left right
           HsApp _ fun right
@@ -1106,16 +1077,16 @@ functions on the ordinary path. The typed pair case checker verifies
 the swap and supplies its exact equation.
 -}
 
--- | A type use requires equations before type declarations; a value use can wait.
--- A missing arity marks a domain applied to the worker's bound parameters.
--- The renamer has checked the arity of such an independent local datatype.
--- The callback receives the arities of independent local datatypes.
+-- | Context in which local source-table candidates are scheduled.
+-- 'TableInType' carries a predicate validating external 'TyCon' names.
 -- See Note [Ordering local source tables].
 data SourceTableUse
-  = TableInType ((Name -> Maybe (Int, NameSet)) -> [(Name, Maybe Int)] -> Maybe NameSet)
+  = TableInType (Name -> Bool)
   | TableInTerm
 
--- | Schedule independent local source functions. See Note [Ordering local source tables].
+-- | Schedule independent local source functions ahead of dependent consumers
+-- using renamed 'FreeNames' and 'TyClGroup' dependencies.
+-- See Note [Ordering local source tables].
 splitLocalSourceTables :: SourceTableUse -> DefUses -> HsGroup GhcRn
                        -> Maybe ([(Name, Name)], HsGroup GhcRn, HsGroup GhcRn)
 splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG binds sigs)),
@@ -1129,51 +1100,50 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
                           , requested b f ]
         wanted_set = mkNameSet (map fst wanted)
         specialised = mkNameSet [ b | L _ s <- sigs, b <- spec_name s ]
-        signatures = mkNameEnv
-          [ (b, deps) | L _ (TypeSig _ [] [L _ b] sig) <- sigs
-            , L _ HsSig{sig_bndrs = outer, sig_body = raw_body} <- [dropWildCards sig]
-            , let (body, syn_deps) = expand_rn_syn 4 raw_body
-            , Just (arg, res) <- [source_arrow body]
-            , Just (is_idx, raw_deps) <- [worker_dependencies outer arg res]
-            , let deps = (is_idx || not (null syn_deps), syn_deps ++ raw_deps) ]
         declared = mkOccSet [ nameOccName f | f <- nameSetElemsStable (duDefs dus)
                                             , nameModule_maybe f == nameModule_maybe n ]
-        candidates = [ (b, deps, values) | (_, [L _ FunBind{fun_id = L _ b, fun_ext = fvs}]) <- binds
+        candidates = [ (b, needed_tycons, values)
+                     | (_, [L _ fb@FunBind{fun_id = L _ b, fun_ext = fvs}]) <- binds
                      , mkSourceTableOcc (nameOccName b) `elemOccSet` declared
-                     , not (b `elemNameSet` specialised), Just kinds <- [lookupNameEnv signatures b]
+                     , not (b `elemNameSet` specialised)
+                     , not (has_rn_splice fb)
+                     , Just sig_wc <- [lookup_single_sig b]
                      , let values = (fvs `intersectNameSet` local_values) `delFromNameSet` b
-                     , Just deps <- [independent_types kinds (fvs `minusNameSet` local_values)] ]
+                     , Just needed_tycons <- [candidate_types b sig_wc (fvs `minusNameSet` local_values)] ]
         candidate_set = mkNameSet [ b | (b, _, _) <- candidates ]
-        external_term_uses = unionNameSets
-          [ uses | (defs, uses) <- fromOL dus
-          , not (maybe False (nameSetAny (\d -> isJust (sourceTableTermOcc (nameOccName d))
-                                             || d `elemNameSet` candidate_set)) defs) ]
         schedule done (b, _, deps) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
                                    | otherwise = done
         close_ready done =
           let done' = foldl' schedule done candidates
           in if isEmptyNameSet (done' `minusNameSet` done) then done else close_ready done'
         ready = close_ready emptyNameSet
-        t2t_indexed_seeds = case use of
+        non_cand_sigs = [ s | s@(L _ sig) <- sigs, all (not . (`elemNameSet` candidate_set)) (sig_names sig) ]
+        non_cand_binds = [ bs | (_, bs) <- binds
+                              , not (any (\case L _ FunBind{fun_id = L _ b} -> b `elemNameSet` candidate_set
+                                                _ -> False) bs) ]
+        external_term_uses = unionNameSets
+          [ uses | (defs, uses) <- fromOL dus
+          , not (maybe False (nameSetAny (\d -> is_source_table_nm d || d `elemNameSet` candidate_set)) defs) ]
+        t2t_seeds = case use of
           TableInType{} -> mkNameSet
-            [ b | (b, _, _) <- candidates
-                , b `elemNameSet` ready
-                , b `elemNameSet` external_term_uses
-                , Just (True, _) <- [lookupNameEnv signatures b] ]
+            [ nm | nm <- nameSetElemsStable
+                           (mkNameSet (type_names_in (tycls, non_cand_sigs, non_cand_binds))
+                            `unionNameSet` external_term_uses)
+                 , nm `elemNameSet` candidate_set
+                 , nm `elemNameSet` ready ]
           TableInTerm -> emptyNameSet
-  , not (null wanted) || not (isEmptyNameSet t2t_indexed_seeds)
+  , not (null wanted) || not (isEmptyNameSet t2t_seeds)
   = let include (b, _, deps) rest | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSet deps rest
                                   | otherwise = rest
         close_needed acc =
           let acc' = foldr include acc candidates
           in if isEmptyNameSet (acc' `minusNameSet` acc) then acc else close_needed acc'
-        needed = close_needed (wanted_set `unionNameSet` t2t_indexed_seeds)
+        needed = close_needed (wanted_set `unionNameSet` t2t_seeds)
         early = [ (b, kinds) | (b, kinds, _) <- candidates
                              , b `elemNameSet` ready, b `elemNameSet` needed ]
         early_names = mkNameSet (map fst early)
         early_types = unionNameSets (map snd early)
         (first_binds, rest_binds) = partition early_bind binds
-        early_bind :: (RecFlag, LHsBinds GhcRn) -> Bool
         early_bind (_, [L _ FunBind{fun_id = L _ b}]) = b `elemNameSet` early_names
         early_bind _ = False
         (first_sigs, rest_sigs) = partition (any (`elemNameSet` early_names) . sig_names . unLoc) sigs
@@ -1186,11 +1156,11 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
           | not (early_ty tg) = Just tg
           | null (group_instds tg) = Nothing
           | otherwise = Just tg { group_tyclds = [], group_kisigs = [], group_roles = [] }
-        first = emptyRnGroup { hs_valds = XValBindsLR (HsVBG first_binds first_sigs), hs_tyclds = first_tys }
-        rest = group { hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs), hs_tyclds = rest_tys }
+        first_grp = emptyRnGroup { hs_valds = XValBindsLR (HsVBG first_binds first_sigs), hs_tyclds = first_tys }
+        rest_grp  = group { hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs), hs_tyclds = rest_tys }
     in case use of
          TableInTerm | null first_binds -> Nothing
-         _ -> Just (wanted, first, rest)
+         _ -> Just (wanted, first_grp, rest_grp)
   where
     bound_names = [ b | (_, bs) <- binds, L _ FunBind{fun_id = L _ b} <- bs, isExternalName b ]
     used_names = allUses dus
@@ -1198,598 +1168,194 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       TableInType{} -> True
       TableInTerm -> b `elemNameSet` term_uses && not (f `elemNameSet` used_names)
 
-    -- Exclude the generated table-to-term edge and a function's own recursion.
     term_uses = unionNameSets
       [ maybe uses (uses `minusNameSet`) defs | (defs, uses) <- fromOL dus
       , not (maybe False (nameSetAny (isJust . sourceTableTermOcc . nameOccName)) defs) ]
-    local_values = mkNameSet (collectHsValBinders CollNoDictBinders vals)
-    local_binders = mkNameSet (hsGroupBinders group)
-    independent_types (indexed, kinds) fvs = case use of
-      TableInTerm
-        | all ((== Just 0) . snd) kinds -> Just (mkNameSet (map fst kinds))
-        | otherwise -> Nothing
-      TableInType typeDeps -> do
-        let ready name
-              | indexed, Just (_, arity, deps, cs) <- lookupNameEnv indexed_datatypes name =
-                  Just (arity, deps, cs)
-              | Just (arity, cons) <- lookupNameEnv early_datatypes name =
-                  Just (arity, emptyNameSet, cons)
-              | otherwise = Nothing
-            extra_rhs_tcs
-              | indexed = [ (tc, Nothing)
-                          | tc <- nameSetElemsStable (fvs `intersectNameSet` local_tycon_names) ]
-              | otherwise = []
-        needed <- typeDeps (fmap (\(arity, deps, _) -> (arity, deps)) . ready) (kinds ++ extra_rhs_tcs)
-        let cons = mkNameSet (concatMap (maybe [] (\(_, _, cs) -> cs) . ready)
-                                        (nameSetElemsStable needed))
-            allowed_local = cons `unionNameSet` needed
-        guard (nameSetAll (`elemNameSet` allowed_local) (fvs `intersectNameSet` local_binders))
-        pure needed
-    type_name :: LHsType GhcRn -> Maybe Name
-    type_name ty = case unLoc (ignoreParens ty) of
-      HsTyVar _ _ (L _ (WithUserRdr _ name))
-        | isTyConName name, isNothing (sourceTableTermOcc (nameOccName name)) -> Just name
-      _ -> Nothing
 
-    type_application :: LHsType GhcRn -> Maybe (Name, [LHsType GhcRn])
-    type_application = go []
-      where
-        go args ty
-          | L _ (HsAppTy _ fun arg) <- ignoreParens ty = go (arg : args) fun
-          | otherwise = (, args) <$> type_name ty
+    local_values   = mkNameSet (collectHsValBinders CollNoDictBinders vals)
+    local_val_occs = mkOccSet [ nameOccName v | v <- nameSetElemsStable local_values ]
+    local_binders  = mkNameSet (hsGroupBinders group)
 
-    -- Count only the written visible arguments. The typechecker verifies the
-    -- arity of the synonym and each dependency before moving the declarations.
-    type_dependencies :: LHsType GhcRn -> Maybe [(Name, Maybe Int)]
-    type_dependencies ty = case unLoc (ignoreParens ty) of
-      HsTupleTy _ HsBoxedOrConstraintTuple elems ->
-        concat <$> traverse type_dependencies elems
-      _ | Just elem_ty <- list_element ty ->
-            type_dependencies elem_ty
-        | otherwise -> do
-            (name, args) <- type_application ty
-            nested <- traverse type_dependencies args
-            pure ((name, Just (length args)) : concat nested)
-
-    poly_sig_deps :: NameSet -> LHsType GhcRn -> Maybe [(Name, Maybe Int)]
-    poly_sig_deps bound ty = case unLoc (ignoreParens ty) of
-      HsTupleTy _ HsBoxedOrConstraintTuple elems ->
-        concat <$> traverse (poly_sig_deps bound) elems
-      _ | Just elem_ty <- list_element ty ->
-            poly_sig_deps bound elem_ty
-        | Just v <- parameter_name ty, v `elemNameSet` bound ->
-            Just []
-        | otherwise -> do
-            (name, args) <- type_application ty
-            case lookupNameEnv early_datatypes name of
-              Just (arity, _) -> guard (arity == length args)
-              Nothing -> pure ()
-            nested <- traverse (poly_sig_deps bound) args
-            pure ((name, Just (length args)) : concat nested)
-
-    domain_dependencies :: HsOuterSigTyVarBndrs GhcRn -> LHsType GhcRn -> Maybe [(Name, Maybe Int)]
-    domain_dependencies outer ty = case outer_vars outer of
-      Just [] -> type_dependencies (fromMaybe ty (list_element ty))
-      Just vars -> do
-        (root, params) <- parameter_domain ty
-        guard (mkNameSet params == mkNameSet vars)
-        pure (maybe [] (\name -> [(name, Nothing)]) root)
-      _ -> Nothing
-
-    parameter_name :: LHsType GhcRn -> Maybe Name
-    parameter_name ty
-      | L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))) <- ignoreParens ty
-      = Just name
-      | otherwise = Nothing
-
-    -- Read distinct named arguments and check the known local arity.
-    parameter_domain :: LHsType GhcRn -> Maybe (Maybe Name, [Name])
-    parameter_domain ty = do
-      (root, args) <- case unLoc (ignoreParens ty) of
-        HsTupleTy _ HsBoxedOrConstraintTuple [left, right] -> Just (Nothing, [left, right])
-        _ | Just element <- list_element ty -> Just (Nothing, [element])
-        _ -> do
-          (name, args) <- type_application ty
-          guard (not (null args))
-          case lookupNameEnv early_datatypes name of
-            Just (arity, _) -> guard (arity == length args)
-            Nothing -> pure ()
-          pure (Just name, args)
-      params <- traverse parameter_name args
-      guard (length (nub params) == length params)
-      pure (root, params)
-
-    worker_dependencies outer arg result
-      | TableInType{} <- use
-      , Just deps <- indexed_lookup_dependencies outer arg result
-                 <|> indexed_closure_dependencies outer arg result
-                 <|> indexed_large_elim_dependencies outer arg result
-      = Just (True, deps)
-      | otherwise = (False,) <$> ordinary_worker_dependencies outer arg result
-
-    indexed_large_elim_dependencies outer arg result = do
-      (tvs, outer_deps) <- indexed_outer_binders outer
-      let (carried, output) = split_source_arrows result
-          is_lifted_type t = case unLoc (ignoreParens t) of
-            HsStarTy{} -> True
-            _ -> type_name t == Just liftedTypeKindTyConName
-      guard (is_lifted_type output && (not (null tvs) || not (null carried)))
-      deps <- traverse (indexed_sig_deps (mkNameSet tvs)) (arg : carried)
-      pure (outer_deps ++ concat deps)
-
-    indexed_lookup_dependencies outer arg result = do
-      (scope, scope_deps) <- indexed_scope_binder outer
-      (other, output) <- source_arrow result
-      (left, [left_scope]) <- type_application arg
-      (right, [right_scope]) <- type_application other
-      guard (left /= right &&
-             parameter_name left_scope == Just scope &&
-             parameter_name right_scope == Just scope)
-      target <- type_name output
-      pure ([(left, Nothing), (right, Nothing), (target, Just 0)] ++ scope_deps)
-
-    indexed_closure_dependencies outer arg result = do
-      (tvs, outer_deps) <- indexed_outer_binders outer
-      guard (not (null tvs))
-      let item_deps bound ty =
-            indexed_sig_deps bound ty <|> do
-              (cb_tvs, dom_in, dom_out) <- callback_domain ty
-              (in_tc, _ : _) <- type_application dom_in
-              guard (is_indexed_domain_tc in_tc)
-              concat <$> traverse (indexed_sig_deps (bound `extendNameSetList` cb_tvs)) [dom_in, dom_out]
-          traversal_or_wrapper = do
-            (first_tc, first_args) <- type_application arg
-            guard (not (null first_args) && is_indexed_domain_tc first_tc)
-            let (carried, output) = split_source_arrows result
-                bound = mkNameSet tvs
-            deps <- traverse (item_deps bound) (arg : carried ++ [output])
-            pure (outer_deps ++ concat deps)
-          callback_worker = do
-            (cb_tvs, cb_in, cb_out) <- callback_domain arg
-            (in_tc, _ : _) <- type_application cb_in
-            guard (is_indexed_domain_tc in_tc)
-            let (carried, output) = split_source_arrows result
-                bound = mkNameSet tvs
-            cb_deps <- traverse (indexed_sig_deps (mkNameSet (tvs ++ cb_tvs))) [cb_in, cb_out]
-            car_deps <- traverse (item_deps bound) carried
-            out_deps <- item_deps bound output
-            pure (outer_deps ++ concat cb_deps ++ concat car_deps ++ out_deps)
-      traversal_or_wrapper <|> callback_worker
-
-    is_indexed_domain_tc tc
-      | tc `elemNameSet` local_tycon_names =
-          maybe False (\(is_gadt, _, _, _) -> is_gadt) (lookupNameEnv indexed_datatypes tc)
-      | otherwise = nameUnique tc /= listTyConKey
-
-    split_source_arrows ty
-      | Just (dom, cod) <- source_arrow ty
-      , let (rest, out) = split_source_arrows cod
-      = (dom : rest, out)
-      | otherwise = ([], ty)
-
-    callback_domain ty = case unLoc (ignoreParens ty) of
-      HsForAllTy{hst_tele = HsForAllInvis{hsf_matchability = Nothing, hsf_invis_bndrs = bndrs}, hst_body = body} -> do
-        (cb_tvs, _) <- indexed_spec_binders bndrs
-        (dom, cod) <- source_arrow body
-        pure (cb_tvs, dom, cod)
-      _ -> do
-        (dom, cod) <- source_arrow ty
-        pure ([], dom, cod)
-
-    indexed_outer_binders :: HsOuterSigTyVarBndrs GhcRn -> Maybe ([Name], [(Name, Maybe Int)])
-    indexed_outer_binders (HsOuterImplicit names) = Just (names, [])
-    indexed_outer_binders (HsOuterExplicit _ Nothing bndrs) = indexed_spec_binders bndrs
-    indexed_outer_binders _ = Nothing
-
-    indexed_spec_binders bndrs = do
-      pairs <- traverse one bndrs
-      pure (map fst pairs, concatMap snd pairs)
-      where
-        one (L _ (HsTvb _ SpecifiedSpec (HsBndrVar _ (L _ tv)) kind)) =
-          case kind of
-            HsBndrNoKind{} -> Just (tv, [])
-            HsBndrKind _ k
-              | HsStarTy{} <- unLoc (ignoreParens k) -> Just (tv, [])
-              | otherwise -> (tv,) <$> indexed_sig_deps emptyNameSet k
-        one _ = Nothing
-
-    indexed_sig_deps :: NameSet -> LHsType GhcRn -> Maybe [(Name, Maybe Int)]
-    indexed_sig_deps bound = walk []
-      where
-        walk args ty = case unLoc (ignoreParens ty) of
-          HsAppTy _ fun arg -> walk (arg : args) fun
-          HsAppKindTy _ fun _ -> walk args fun
-          HsTyVar _ _ (L _ (WithUserRdr _ name))
-            | name `elemNameSet` bound || isTyVarName name ->
-                guard (null args) >> pure []
-            | isDataConName name -> do
-                nested <- traverse (walk []) args
-                let parent_dep = maybe [] (\p -> [(p, Nothing)]) (lookupNameEnv con_owners name)
-                pure (parent_dep ++ concat nested)
-            | Just tc <- type_name ty -> do
-                nested <- traverse (walk []) args
-                pure ((tc, Just (length args)) : concat nested)
-          _ -> Nothing
-
-    indexed_scope_binder :: HsOuterSigTyVarBndrs GhcRn -> Maybe (Name, [(Name, Maybe Int)])
-    indexed_scope_binder (HsOuterImplicit [scope]) = Just (scope, [])
-    indexed_scope_binder (HsOuterExplicit _ Nothing
-                           [L _ (HsTvb _ SpecifiedSpec (HsBndrVar _ (L _ scope)) kind)]) =
-      case kind of
-        HsBndrNoKind{} -> Just (scope, [])
-        HsBndrKind _ k
-          | HsStarTy{} <- unLoc (ignoreParens k) -> Just (scope, [])
-          | otherwise -> (scope,) <$> type_dependencies k
-    indexed_scope_binder _ = Nothing
-
-    ordinary_worker_dependencies outer arg result
-      | TableInType{} <- use
-      , Just vars <- outer_vars outer
-      , Just (root, params) <- parameter_domain arg
-      , Just (target, new_params) <- parameter_domain result
-      , root == target, params /= new_params
-      , mkNameSet params == mkNameSet new_params, mkNameSet vars == mkNameSet params
-      = Just (maybe [] (\name -> [(name, Nothing)]) root)
-      | TableInType{} <- use
-      , Just vars@(_ : _) <- retained_outer_vars outer
-      , Just (root, params) <- parameter_domain arg
-      , mkNameSet params == mkNameSet vars
-      , Just v <- parameter_name result, v `elem` vars
-      = Just (maybe [] (\name -> [(name, Nothing)]) root)
-      | TableInType{} <- use
-      , Just (from, to) <- source_arrow arg
-      , Just (domain, codomain) <- source_arrow result
-      , Just vars <- outer_vars outer
-      , Just a <- parameter_name from
-      , Just b <- parameter_name to
-      , Just (root, params) <- parameter_domain domain
-      , Just (root', params') <- parameter_domain codomain
-      , root == root', a `elem` params
-      , map (\v -> if v == a then b else v) params == params'
-      , mkNameSet vars == mkNameSet (b : params)
-      = Just (maybe [] (\name -> [(name, Nothing)]) root)
-      | TableInType{} <- use
-      , Just vars <- outer_vars outer
-      , let (carried, output) = split_source_arrows result
-            bound = mkNameSet vars
-      , Just deps <- traverse (poly_sig_deps bound) (arg : carried ++ [output])
-      = Just (concat deps)
-      | otherwise = (++) <$> domain_dependencies outer arg <*> result_dependencies outer result
-
-    source_arrow :: LHsType GhcRn -> Maybe (LHsType GhcRn, LHsType GhcRn)
-    source_arrow (L _ (HsParTy _ ty)) = source_arrow ty
-    source_arrow (L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) arg result))
-      = Just (arg, result)
-    source_arrow _ = Nothing
-
-    result_dependencies :: HsOuterSigTyVarBndrs GhcRn -> LHsType GhcRn -> Maybe [(Name, Maybe Int)]
-    result_dependencies outer ty = case unLoc (ignoreParens ty) of
-      HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) carried result
-        | TableInType{} <- use, Just [_] <- outer_vars outer -> do
-            deps <- domain_dependencies outer carried
-            res <- domain_dependencies outer result
-            pure (deps ++ res)
-        | Just [] <- outer_vars outer -> do
-            deps <- domain_dependencies outer carried
-            res <- result_dependencies outer result
-            pure (deps ++ res)
-      -- See Note [Source equations returning a structural list] in GHC.Tc.Gen.SourceTable.
-      _ | Just [] <- outer_vars outer, Just element <- list_element ty ->
-            type_dependencies element
-        | TableInType{} <- use, Just [_] <- outer_vars outer, Just _ <- list_element ty ->
-            domain_dependencies outer ty
-      _ -> type_dependencies ty
-
-    list_element :: LHsType GhcRn -> Maybe (LHsType GhcRn)
-    list_element ty = case unLoc (ignoreParens ty) of
-      HsListTy _ element -> Just element
-      HsAppTy _ list element
-        | Just con <- type_name list, nameUnique con == listTyConKey -> Just element
-      _ -> Nothing
-
-    outer_vars :: HsOuterSigTyVarBndrs GhcRn -> Maybe [Name]
-    outer_vars (HsOuterImplicit names) = Just names
-    outer_vars (HsOuterExplicit _ Nothing binders) = traverse plain_binder binders
-    outer_vars _ = Nothing
-
-    plain_binder (L _ (HsTvb _ SpecifiedSpec (HsBndrVar _ (L _ a)) kind))
-      | plain_kind kind = Just a
-    plain_binder _ = Nothing
-
-    plain_kind :: HsBndrKind GhcRn -> Bool
-    plain_kind HsBndrNoKind{} = True
-    plain_kind (HsBndrKind _ k)
-      | HsStarTy{} <- unLoc (ignoreParens k) = True
-      | Just n <- type_name k = nameUnique n == liftedTypeKindTyConKey
-    plain_kind _ = False
-
-    early_datatype_list =
-      [ (t, (length params, cons)) | TyClGroup{group_ext = deps, group_kisigs = [], group_tyclds =
-                     [L _ DataDecl{tcdLName = L _ t, tcdModifiers = [],
-                                   tcdTyVars = HsQTvs{hsq_explicit = params},
-                                   tcdDataDefn = HsDataDefn{dd_ctxt = Nothing, dd_kindSig = Nothing,
-                                     dd_cons = DataTypeCons False cs, dd_derivs = derivs}}]} <- tycls
-                  , isEmptyNameSet deps
-                  , Just cons <- [early_constructors t params cs derivs] ]
-    early_datatypes = mkNameEnv early_datatype_list
-
-    local_tycon_names = mkNameSet [tcdName (unLoc d) | tg <- tycls, d <- group_tyclds tg]
-    local_syn_list =
-      [ (syn, (params, rhs, group_ext tg))
+    local_syn_rhss :: NameEnv (Int, LHsType GhcRn)
+    local_syn_rhss = mkNameEnv
+      [ (syn, (length tvbs, rhs))
       | tg <- tycls
       , null (group_kisigs tg)
-      , [L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}]
-          <- [group_tyclds tg]
-      , Just params <- [traverse hsLTyVarNameRn tvbs]
-      , not (nameSetAny (isJust . sourceTableTermOcc . nameOccName) (group_ext tg)) ]
-      where
-        hsLTyVarNameRn b = unLoc <$> hsLTyVarLocName b
-    local_rn_syns = mkNameEnv local_syn_list
-    local_syn_names = mkNameSet (map fst local_syn_list)
+      , [L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}] <- [group_tyclds tg] ]
 
-    expand_rn_syn :: Int -> LHsType GhcRn -> (LHsType GhcRn, [(Name, Maybe Int)])
-    expand_rn_syn 0 ty = (ty, [])
-    expand_rn_syn fuel ty
-      | isEmptyNameEnv local_rn_syns = (ty, [])
-      | otherwise = case unLoc (ignoreParens ty) of
-      HsForAllTy x tele body ->
-        let (body', deps) = expand_rn_syn fuel body
-        in (L (getLoc ty) (HsForAllTy x tele body'), deps)
-      HsFunTy x arr dom cod ->
-        let (dom', d1) = expand_rn_syn fuel dom
-            (cod', d2) = expand_rn_syn fuel cod
-        in (L (getLoc ty) (HsFunTy x arr dom' cod'), d1 ++ d2)
-      _ | Just (syn_name, args) <- type_application ty
-        , Just (params, rhs, _) <- lookupNameEnv local_rn_syns syn_name
-        , length params == length args ->
-            let (expanded, more) = expand_rn_syn (fuel - 1) (subst_rn_ty (zip params args) rhs)
-            in (expanded, (syn_name, Just (length args)) : more)
-        | otherwise -> (ty, [])
+    lookup_single_sig :: Name -> Maybe (LHsSigWcType GhcRn)
+    lookup_single_sig target =
+      case [ wc | L _ (TypeSig _ [] ns wc) <- sigs, any ((== target) . unLoc) ns ] of
+        [wc] | null (hswc_ext wc)
+             , let L _ HsSig{sig_body = body} = hswc_body wc
+             , hsTypeHasNoAnonWildcards body
+             , not (has_rn_splice wc)
+             , not (has_qual_ty wc)
+             , has_std_arrow (4 :: Int) body
+             -> Just wc
+        _ -> Nothing
 
-    subst_rn_ty :: [(Name, LHsType GhcRn)] -> LHsType GhcRn -> LHsType GhcRn
-    subst_rn_ty [] node = node
-    subst_rn_ty env (L loc (HsTyVar ann NotPromoted (L vloc (WithUserRdr _ nm))))
-      | Just replacement <- lookup nm env = replacement
-      | otherwise = L loc (HsTyVar ann NotPromoted (L vloc (noUserRdr nm)))
-    subst_rn_ty env (L loc t) = L loc (gmapT (gmap_rn env) t)
-      where
-        gmap_rn :: Data d => [(Name, LHsType GhcRn)] -> d -> d
-        gmap_rn s d = case cast d of
-          Just lty -> fromMaybe d (cast (subst_rn_ty s lty))
-          Nothing  -> gmapT (gmap_rn s) d
+    has_std_arrow _ (L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) _ _)) = True
+    has_std_arrow fuel (L _ (HsParTy _ t)) = has_std_arrow fuel t
+    has_std_arrow fuel (L _ HsForAllTy{hst_tele = HsForAllInvis{}, hst_body = b}) = has_std_arrow fuel b
+    has_std_arrow fuel ty
+      | fuel > 0
+      , (L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ syn))), n_args) <- syn_head 0 ty
+      , Just (arity, rhs) <- lookupNameEnv local_syn_rhss syn
+      , arity == n_args
+      = has_std_arrow (fuel - 1) rhs
+    has_std_arrow _ _ = False
 
-    local_non_data_binders = mkNameSet $
+    syn_head :: Int -> LHsType GhcRn -> (LHsType GhcRn, Int)
+    syn_head k (L _ (HsParTy _ t)) = syn_head k t
+    syn_head k (L _ (HsAppTy _ f _)) = syn_head (k + 1) f
+    syn_head k (L _ (HsAppKindTy _ f _)) = syn_head k f
+    syn_head k t = (t, k)
+
+    -- Identify movable DataDecl / SynDecl TyClGroups and their transitive local closures.
+    local_tycon_names = mkNameSet [tcdName (unLoc d) | tg <- tycls, d <- group_tyclds tg]
+    non_movable_binders = mkNameSet $
       collectHsValBinders CollNoDictBinders vals ++
-      [ b | tg <- tycls, L _ d <- group_tyclds tg, not (isDataDecl d)
-          , tcdName d `notElem` map fst local_syn_list
+      [ b | tg <- tycls, L _ d <- group_tyclds tg, not (is_data_or_syn d)
           , b <- hsTyClForeignBinders [TyClGroup emptyNameSet [noLocA d] [] [] []] [] ]
-    isDataDecl DataDecl{} = True
-    isDataDecl _ = False
+      where
+        is_data_or_syn DataDecl{tcdModifiers = [], tcdDataDefn = HsDataDefn{dd_ctxt = Nothing, dd_cons = cs}} =
+          case cs of { DataTypeCons False _ -> True; NewTypeCon{} -> True; _ -> False }
+        is_data_or_syn SynDecl{} = True
+        is_data_or_syn _ = False
 
-    -- A lookup, GADT traversal, or substitution chain can need an indexed or
-    -- mutually recursive datatype group. Move the whole renamed group and
-    -- follow its prerequisites. See Note [Ordering local source tables].
-    indexed_datatype_list =
-      [ (t, (is_gadt, arity, group_ext tg, constructors))
-      | tg <- tycls
-      , all indexed_kisig (group_kisigs tg)
-      , Just ds <- [traverse (indexed_datatype (group_kisigs tg)) (group_tyclds tg)]
-      , (t, is_gadt, arity, constructors) <- ds ] ++
-      [ (syn, (False, length params, deps, []))
-      | (syn, (params, _, deps)) <- local_syn_list
-      , isEmptyNameSet (deps `intersectNameSet` (local_non_data_binders `minusNameSet` local_syn_names)) ]
-    indexed_datatypes = mkNameEnv indexed_datatype_list
+    tg_info_list =
+      [ (idx, tg, tc_nms, all_bndrs, direct_ok && ext_ok)
+      | (idx, tg) <- zip [0 :: Int ..] tycls
+      , let decls = group_tyclds tg
+            kisigs = group_kisigs tg
+      , not (null decls)
+      , let tc_nms    = mkNameSet (map (tcdName . unLoc) decls)
+            all_bndrs = mkNameSet (hsTyClForeignBinders [tg { group_instds = [] }] [])
+            ast_nms   = mkNameSet (names_in (decls, kisigs))
+            decl_fvs  = unionNameSets (group_ext tg : [fvs | L _ DataDecl{tcdDExt = DataDeclRn{tcdFVs = fvs}} <- decls])
+            all_refs  = ast_nms `unionNameSet` decl_fvs
+            direct_ok = not (has_rn_splice (decls, kisigs))
+                        && not (has_qual_ty (decls, kisigs))
+                        && all (eligible_decl . unLoc) decls
+                        && not (nameSetAny is_pending_local_table all_refs)
+                        && isEmptyNameSet ((all_refs `minusNameSet` all_bndrs) `intersectNameSet` non_movable_binders)
+            ext_ok = case use of
+              TableInTerm -> False
+              TableInType ok_ext ->
+                all ok_ext [ nm | nm <- nameSetElemsStable all_refs
+                                , isTyConName nm
+                                , not (nm `elemNameSet` local_tycon_names) ] ]
+      where
+        eligible_decl DataDecl{tcdModifiers = [], tcdDataDefn = HsDataDefn{dd_ctxt = Nothing, dd_cons = cs}} =
+          case cs of { DataTypeCons False _ -> True; NewTypeCon{} -> True; _ -> False }
+        eligible_decl SynDecl{} = True
+        eligible_decl _ = False
 
-    con_owners = mkNameEnv $
-      [ (c, t) | (t, (_, _, _, cs)) <- indexed_datatype_list, c <- cs ] ++
-      [ (c, t) | (t, (_, cs)) <- early_datatype_list, c <- cs ]
+    binder_to_tg :: NameEnv Int
+    binder_to_tg = mkNameEnv
+      [ (b, idx)
+      | (idx, _, _, bndrs, _) <- tg_info_list
+      , b <- nameSetElemsStable bndrs ]
 
-    indexed_kisig (L _ (StandaloneKindSig _ _ sig)) =
-      null [() | n <- names_in sig
-               , isJust (sourceTableTermOcc (nameOccName n)) || n `elemNameSet` local_non_data_binders]
+    tg_by_idx :: Int -> Maybe (TyClGroup GhcRn, NameSet, NameSet, Bool)
+    tg_by_idx idx = listToMaybe
+      [ (tg, tc_nms, bndrs, ok) | (i, tg, tc_nms, bndrs, ok) <- tg_info_list, i == idx ]
+
+    close_movable_tgs :: [Int] -> Maybe (NameSet, NameSet)
+    close_movable_tgs roots = go [] roots
+      where
+        go seen [] = do
+          infos <- traverse tg_by_idx seen
+          pure ( unionNameSets [tcs | (_, tcs, _, _) <- infos]
+               , unionNameSets [bs  | (_, _, bs, _)  <- infos] )
+        go seen (i : rest)
+          | i `elem` seen = go seen rest
+          | otherwise = do
+              (tg, _, _, ok) <- tg_by_idx i
+              guard ok
+              let refs = nameSetElemsStable (group_ext tg) ++ names_in (group_tyclds tg, group_kisigs tg)
+                  deps = [ j | nm <- refs, Just j <- [lookupNameEnv binder_to_tg nm], j /= i ]
+              go (i : seen) (deps ++ rest)
+
+    candidate_types :: Name -> LHsSigWcType GhcRn -> NameSet -> Maybe NameSet
+    candidate_types owner sig_wc non_val_fvs = case use of
+      TableInTerm -> do
+        let L _ HsSig{sig_bndrs = outer} = dropWildCards sig_wc
+            sig_nms = names_in sig_wc
+            self_tbl = mkSourceTableOcc (nameOccName owner)
+            bad_rhs_tbl nm = is_pending_local_table nm && nameOccName nm /= self_tbl
+        case outer of
+          HsOuterImplicit [] -> pure ()
+          _ -> Nothing
+        guard (not (any (`elemNameSet` local_values) sig_nms))
+        guard (not (any is_source_table_nm sig_nms))
+        guard (not (nameSetAny bad_rhs_tbl non_val_fvs))
+        pure emptyNameSet
+      TableInType ok_ext -> do
+        let sig_nms  = names_in sig_wc
+            self_tbl = mkSourceTableOcc (nameOccName owner)
+            bad_rhs_tbl nm = is_pending_local_table nm && nameOccName nm /= self_tbl
+            all_refs = mkNameSet sig_nms `unionNameSet` non_val_fvs
+        guard (not (any is_source_table_nm sig_nms))
+        guard (not (nameSetAny bad_rhs_tbl non_val_fvs))
+        let ext_sig_tcs = [ nm | nm <- sig_nms
+                               , isTyConName nm
+                               , not (nm `elemNameSet` local_tycon_names) ]
+            ext_local_vals = [ nm | nm <- nameSetElemsStable non_val_fvs
+                                  , isVarName nm
+                                  , nameModule_maybe nm == nameModule_maybe owner ]
+        guard (all ok_ext (ext_sig_tcs ++ ext_local_vals))
+        let root_idxs = [ idx | nm <- nameSetElemsStable all_refs
+                              , Just idx <- [lookupNameEnv binder_to_tg nm] ]
+        (needed_tcs, allowed_bndrs) <- close_movable_tgs root_idxs
+        guard (nameSetAll (`elemNameSet` allowed_bndrs) (all_refs `intersectNameSet` local_binders))
+        pure needed_tcs
+
+    is_source_table_nm :: Name -> Bool
+    is_source_table_nm nm = isJust (sourceTableTermOcc (nameOccName nm))
+
+    is_pending_local_table :: Name -> Bool
+    is_pending_local_table nm
+      | n0 : _ <- bound_names
+      , nameModule_maybe nm == nameModule_maybe n0
+      , Just term_occ <- sourceTableTermOcc (nameOccName nm)
+      = term_occ `elemOccSet` local_val_occs
+      | otherwise = False
+
+    type_names_in :: Data a => a -> [Name]
+    type_names_in node = case cast node :: Maybe (LHsType GhcRn) of
+      Just ty -> names_in ty
+      Nothing -> concat (gmapQ type_names_in node)
 
     names_in :: Data a => a -> [Name]
     names_in node = maybeToList (cast node) ++ concat (gmapQ names_in node)
 
-    kind_sig_arity :: LHsKind GhcRn -> Maybe (Bool, Int)
-    kind_sig_arity ty = case unLoc (ignoreParens ty) of
-      HsForAllTy{hst_body = body} -> kind_sig_arity body
-      HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod -> do
-        guard (indexed_type dom)
-        (has_idx, k_arity) <- kind_sig_arity cod
-        let dom_idx = case unLoc (ignoreParens dom) of
-              HsStarTy{} -> False
-              _ -> type_name dom /= Just liftedTypeKindTyConName
-        pure (dom_idx || has_idx, k_arity + 1)
-      HsStarTy{} -> Just (False, 0)
-      _ | type_name ty == Just liftedTypeKindTyConName -> Just (False, 0)
-        | otherwise -> Nothing
+    has_rn_splice :: Data a => a -> Bool
+    has_rn_splice node =
+      isJust (cast node :: Maybe (HsTypedSplice GhcRn))
+      || isJust (cast node :: Maybe (HsUntypedSplice GhcRn))
+      || or (gmapQ has_rn_splice node)
 
-    indexed_datatype kisigs (L _ DataDecl
-      { tcdLName = L _ t, tcdModifiers = [], tcdDExt = DataDeclRn{tcdFVs = fvs}
-      , tcdTyVars = HsQTvs{hsq_explicit = params}
-      , tcdDataDefn = HsDataDefn{dd_ctxt = Nothing, dd_kindSig = mb_ksig,
-          dd_cons = DataTypeCons False cs, dd_derivs = _derivs} })
-      | not (nameSetAny (isJust . sourceTableTermOcc . nameOccName) fvs)
-      , isEmptyNameSet (fvs `intersectNameSet` local_non_data_binders)
-      , let mb_sak = case [ sig_body (unLoc sig)
-                          | L _ (StandaloneKindSig _ (L _ kt) sig) <- kisigs
-                          , kt == t ] of
-              s : _ -> Just s
-              []    -> Nothing
-      , Just (ksig_idx, ksig_n) <- case mb_ksig <|> mb_sak of
-          Nothing -> Just (False, 0)
-          Just ks -> kind_sig_arity ks
-      , Just param_flags <- traverse indexed_parameter params
-      , Just con_infos <- traverse indexed_constructor cs
-      = let is_gadt = ksig_idx || or param_flags || any fst con_infos
-        in Just (t, is_gadt, length params + ksig_n, concatMap snd con_infos)
-    indexed_datatype _ _ = Nothing
-
-    indexed_parameter (L _ HsTvb{tvb_flag = HsBndrRequired{}, tvb_kind = kind})
-      = case kind of
-          HsBndrNoKind{} -> Just False
-          HsBndrKind _ ty
-            | plain_kind kind -> Just False
-            | indexed_type ty -> Just True
-            | otherwise -> Nothing
-    indexed_parameter _ = Nothing
-
-    indexed_constructor (L _ ConDeclGADT{con_names = cs, con_modifiers = [],
-                                          con_telescope = [], con_outer_bndrs = L _ outer_bndrs,
-                                          con_g_args = PrefixConGADT _ fields, con_res_ty = res})
-      | indexed_outer outer_bndrs
-      , indexed_type res, all (plain_constructor_field indexed_type) fields
-      = Just (True, map unLoc (toList cs))
-    indexed_constructor (L _ ConDeclH98{con_name = L _ c, con_modifiers = [],
-                                         con_telescope = [], con_args = PrefixCon _ fields})
-      | all (plain_constructor_field indexed_type) fields
-      = Just (False, [c])
-    indexed_constructor _ = Nothing
-
-    indexed_outer HsOuterImplicit{} = True
-    indexed_outer (HsOuterExplicit _ Nothing bndrs) = all indexed_spec_binder bndrs
-    indexed_outer _ = False
-
-    indexed_spec_binder (L _ HsTvb{tvb_flag = SpecifiedSpec, tvb_kind = kind}) =
-      case kind of
-        HsBndrNoKind{} -> True
-        HsBndrKind _ ty -> indexed_type ty
-    indexed_spec_binder _ = False
-
-    indexed_type ty = case unLoc (ignoreParens ty) of
-      HsTyVar _ _ (L _ (WithUserRdr _ name)) ->
-        isTyVarName name || isDataConName name || isJust (type_name ty)
-      HsAppTy _ fun arg -> indexed_type fun && indexed_type arg
-      HsStarTy{} -> True
-      _ -> False
-
-    early_constructors t params [con] [] | Just c <- retained_constructor t params con = Just [c]
-    early_constructors t [] cs _ = concat <$> traverse (prefix_con t) cs
-    early_constructors t params cs _ = do
-      field_type <- independent_field_type t params
-      traverse (parameterized_con field_type) cs
-
-    independent_field_type t params = do
-      vars <- traverse regular_parameter params
-      pure (field vars)
-      where
-        field vars ty = case unLoc (ignoreParens ty) of
-          HsTupleTy _ HsBoxedOrConstraintTuple elems -> all (field vars) elems
-          _ | Just elem_ty <- list_element ty -> field vars elem_ty
-            | Just parameter <- parameter_name ty, parameter `elem` vars -> True
-            | Just (root, args) <- type_application ty ->
-                root == t && traverse parameter_name args == Just vars
-            | otherwise -> False
-
-        regular_parameter
-          (L _ (HsTvb _ HsBndrRequired{} (HsBndrVar _ (L _ name)) kind))
-          | plain_kind kind = Just name
-        regular_parameter _ = Nothing
-
-    parameterized_con field_type
-      (L _ ConDeclH98{con_name = L _ c, con_modifiers = [], con_telescope = [],
-                      con_args = PrefixCon _ fields})
-      | all (plain_constructor_field field_type) fields = Just c
-    parameterized_con _ _ = Nothing
-
-    retained_outer_vars :: HsOuterSigTyVarBndrs GhcRn -> Maybe [Name]
-    retained_outer_vars (HsOuterImplicit names) = Just names
-    retained_outer_vars (HsOuterExplicit _ Nothing binders) =
-      retained_param_binders (const True) binders
-    retained_outer_vars _ = Nothing
-
-    retained_param_binders :: (flag -> Bool) -> [LHsTyVarBndr flag GhcRn] -> Maybe [Name]
-    retained_param_binders ok_flag = go []
-      where
-        go seen [] = Just (reverse seen)
-        go seen (L _ (HsTvb _ flag (HsBndrVar _ (L _ name)) kind) : rest)
-          | ok_flag flag
-          , retained_binder_kind seen kind
-          = go (name : seen) rest
-        go _ _ = Nothing
-
-    retained_binder_kind :: [Name] -> HsBndrKind GhcRn -> Bool
-    retained_binder_kind seen kind = case kind of
-      HsBndrNoKind{} -> True
-      HsBndrKind _ k -> retained_kind_expr seen k
-
-    retained_kind_expr :: [Name] -> LHsType GhcRn -> Bool
-    retained_kind_expr seen ty = case unLoc (ignoreParens ty) of
-      HsStarTy{} -> True
-      HsFunTy _ (HsModifiedFunArr _ _ HsStandardArr{}) dom cod ->
-        retained_kind_expr seen dom && retained_kind_expr seen cod
-      HsAppTy _ fun arg ->
-        retained_kind_expr seen fun && retained_kind_expr seen arg
-      HsTyVar _ _ (L _ (WithUserRdr _ name)) ->
-        name `elem` seen || isDataConName name || isJust (type_name ty)
-      _ -> False
-
-    is_req_bndr :: HsBndrVis GhcRn -> Bool
-    is_req_bndr HsBndrRequired{} = True
-    is_req_bndr _ = False
-
-    retained_constructor t params (L _ ConDeclGADT
-      { con_names = L _ c :| [], con_modifiers = [], con_telescope = []
-      , con_outer_bndrs = L _ outer, con_g_args = PrefixConGADT _ []
-      , con_res_ty = sig })
-      | Just param_vars <- retained_param_binders is_req_bndr params
-      , Just con_vars <- retained_outer_vars outer
-      , length con_vars == length param_vars
-      , HsForEachTy _ [L _ (HsTvb _ () (HsBndrVar _ (L _ witness)) (HsBndrKind _ domain))] body
-          <- unLoc (ignoreParens sig)
-      , isJust (type_name domain) || maybe False (`elem` con_vars) (parameter_name domain)
-      , HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) field result <- unLoc (ignoreParens body)
-      , retained_field_type con_vars witness field
-      , retained_payloads t con_vars witness result
-      = Just c
-    retained_constructor _ _ _ = Nothing
-
-    retained_payloads t con_vars witness ty
-      | HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) field result <- unLoc (ignoreParens ty)
-      = retained_field_type con_vars witness field && retained_payloads t con_vars witness result
-      | Just (root, args) <- type_application ty
-      = root == t && traverse parameter_name args == Just con_vars
-      | otherwise = False
-
-    retained_field_type con_vars witness ty = case unLoc (ignoreParens ty) of
-      HsAppTy _ fun arg -> retained_field_type con_vars witness fun && retained_field_type con_vars witness arg
-      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) ->
-        name == witness || name `elem` con_vars || isJust (type_name ty)
-      _ -> False
-
-    -- See Note [Ordinary constructors in GADT syntax] in GHC.Tc.Gen.SourceTable.
-    prefix_con :: Name -> LConDecl GhcRn -> Maybe [Name]
-    prefix_con _ (L _ ConDeclH98{con_name = L _ c, con_modifiers = [], con_telescope = [],
-                                 con_args = PrefixCon _ fields})
-      | all independent_field fields = Just [c]
-    prefix_con t (L _ ConDeclGADT{con_names = cs, con_modifiers = [], con_telescope = [],
-                                  con_outer_bndrs = L _ outer, con_g_args = PrefixConGADT _ fields,
-                                  con_res_ty = result})
-      | Just [] <- outer_vars outer
-      , type_name result == Just t
-      , all independent_field fields = Just (map unLoc (toList cs))
-    prefix_con _ _ = Nothing
-
-    independent_field = plain_constructor_field (isJust . type_name)
-
-    plain_constructor_field :: (LHsType GhcRn -> Bool) -> HsConDeclField GhcRn -> Bool
-    plain_constructor_field check
-      CDF{cdf_type = ty, cdf_multiplicity = HsModifiedFunArr _ [] HsStandardArr{}}
-      = check ty
-    plain_constructor_field _ _ = False
+    has_qual_ty :: Data a => a -> Bool
+    has_qual_ty node
+      | Just (HsQualTy{}) <- (cast node :: Maybe (HsType GhcRn)) = True
+      | Just (ConDeclGADT{con_g_args = args, con_telescope = tele})
+          <- (cast node :: Maybe (ConDecl GhcRn))
+      = not (null (gadtTelescopeContexts tele)) || or (gmapQ has_qual_ty args)
+      | otherwise = or (gmapQ has_qual_ty node)
 
     sig_names :: Sig GhcRn -> [Name]
     sig_names (TypeSig _ _ [L _ b] _) = [b]
     sig_names (InlineSig _ (L _ b) _) = [b]
     sig_names (SCCFunSig _ (L _ b) _) = [b]
     sig_names _ = []
+
     spec_name :: Sig GhcRn -> [Name]
     spec_name (SpecSig _ (L _ b) _ _) = [b]
     spec_name (SpecSigE b _ _ _) = [b]
     spec_name _ = []
 splitLocalSourceTables _ _ _ = Nothing
-
 addTcgDUs :: TcGblEnv -> DefUses -> TcGblEnv
 -- This function could be defined lower down in the module hierarchy,
 -- but there doesn't seem anywhere very logical to put it.
@@ -4564,7 +4130,7 @@ rnConDecl _ decl@(ConDeclGADT { con_names   = names
     do  { (new_args, fvs2)   <- rnConDeclGADTDetails (unLoc (head new_names)) ctxt args
         ; (new_res_ty, fvs3) <-
             if hsHasForEachTy (unLoc res_ty)
-            then do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+            then do { enabled <- xoptM LangExt.DependentTypes
                     ; if enabled then rnRetainedSigType ctxt res_ty
                                  else rnLHsType ctxt res_ty }
             else case HsDecls.splitGadtInterior args res_ty of

@@ -23,7 +23,7 @@ import GHC.Core.Opt.Stats ( Tick(..) )
 import GHC.Core.Opt.Simplify.Env
 import GHC.Core.Opt.Simplify.Inline
 import GHC.Core.Opt.Simplify.Utils
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr, zapLambdaBndrs )
+import GHC.Core.Opt.OccurAnal ( occurAnalyseExprWithMode, zapLambdaBndrs )
 import GHC.Core.Make hiding( wrapFloats )
 import qualified GHC.Core.Make
 import GHC.Core.Coercion hiding ( substCo, substCoVar )
@@ -2547,7 +2547,7 @@ simplOutExpr env expr cont
 
   | Lam {} <- expr
   , cont_has_args
-  = simplLam env (occurAnalyseExpr expr) cont
+  = simplLam env (occurAnalyseExprWithMode (sm_core_mode (seMode env)) expr) cont
     -- ToDo:explain; c.f. Note [Occurrence-analyse after rule firing]
 
   | Cast e co <- expr  -- The inlined expression may be (x |> co)
@@ -5399,6 +5399,6 @@ simplRules env mb_new_id rules bind_cxt
            ; return (rule { ru_bndrs = bndrs'
                           , ru_fn    = fn_name'
                           , ru_args  = args'
-                          , ru_rhs   = occurAnalyseExpr rhs' }) }
+                          , ru_rhs   = occurAnalyseExprWithMode (sm_core_mode (seMode env)) rhs' }) }
                             -- Remember to occ-analyse, to drop dead code.
                             -- See Note [OccInfo in unfoldings and rules] in GHC.Core

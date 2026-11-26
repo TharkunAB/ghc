@@ -5060,12 +5060,14 @@ liftedTypeContext name
 
 -- | Describe a case by its source synonym, value signature or constructor.
 pprTypeCaseOwner :: String -> SDoc
-pprTypeCaseOwner owner
+pprTypeCaseOwner raw_owner
   | Just signature <- stripLiftedTypeOwner "$signature-case:" owner
   = text "type case in the signature for" <+> quotes (text signature)
   | Just constructor <- stripLiftedTypeOwner "$field-case:" owner
   = text "type case in a field of" <+> quotes (text constructor)
   | otherwise = text "type case in" <+> quotes (text owner)
+  where
+    owner = fromMaybe raw_owner (stripLiftedTypeOwner "$lambda:" raw_owner)
 
 -- | Report a kind mismatch between a field case and its lifted family.
 -- The saved kind variables belong to different declarations. Use the

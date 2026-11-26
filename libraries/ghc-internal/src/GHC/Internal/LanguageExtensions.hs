@@ -171,7 +171,7 @@ data Extension
    | ImplicitStagePersistence
    | QualifiedStrings
    | LazyFieldAnnotations
-   | ExperimentalDependentTypes
+   | DependentTypes
    | UnsaturatedTypeFamilies
    deriving (Eq, Enum, Show, Generic, Bounded)
 -- 'Ord' and 'Bounded' are provided for GHC API users (see discussions

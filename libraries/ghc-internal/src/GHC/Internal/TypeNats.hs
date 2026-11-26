@@ -86,7 +86,7 @@ import GHC.Internal.TypeNats.Internal(CmpNat)
 type Nat = Natural
 
 -- | Interpret a nonnegative type literal at a registered result kind.
--- With @ExperimentalDependentTypes@, an available instance supplies the
+-- With @DependentTypes@, an available instance supplies the
 -- interpretation when the expected kind is a closed lifted datatype.
 -- For example, an instance for a Peano type can map the literal to a
 -- sequence of promoted successor constructors. The instance is optional.

@@ -359,11 +359,7 @@ initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
   do { keep_var             <- newIORef emptyNameSet
      ; has_dep_imports      <- newIORef False
      ; used_gre_var         <- newIORef []
-     ; source_table_uses    <- newIORef emptyNameSet
-     ; evaluated_term_uses  <- newIORef emptyNameSet
-     ; source_rule_types    <- newIORef emptySourceRuleUses
-     ; home_rule_dependencies <- newIORef Map.empty
-     ; optional_source_uses <- newIORef []
+     ; source_check         <- newIORef emptySourceCheckState
      ; th_var               <- newIORef False
      ; infer_var            <- newIORef True
      ; infer_reasons_var    <- newIORef emptyMessages
@@ -435,14 +431,10 @@ initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
           , tcg_import_decls       = []
           , tcg_used_gres          = used_gre_var
           , tcg_has_dep_imports    = has_dep_imports
-          , tcg_source_table_uses    = source_table_uses
+          , tcg_source_check        = source_check
           , tcg_local_open_demands  = Nothing
           , tcg_local_open_defs     = emptyNameEnv
           , tcg_local_open_owners   = emptyNameEnv
-          , tcg_evaluated_term_uses  = evaluated_term_uses
-          , tcg_source_rule_types    = source_rule_types
-          , tcg_home_rule_dependencies = home_rule_dependencies
-          , tcg_optional_source_uses = optional_source_uses
           , tcg_dus                = emptyDUs
 
           , tcg_rn_imports = []
@@ -748,7 +740,7 @@ xoptM flag = xopt flag <$> getDynFlags
 -- extension's TypeFamilies and printing implications to umbrella modules.
 unsaturatedTypeFamiliesEnabled :: TcM Bool
 unsaturatedTypeFamiliesEnabled =
-  xoptM LangExt.UnsaturatedTypeFamilies <||> xoptM LangExt.ExperimentalDependentTypes
+  xoptM LangExt.UnsaturatedTypeFamilies <||> xoptM LangExt.DependentTypes
 
 doptM :: DumpFlag -> TcRnIf gbl lcl Bool
 doptM flag = do
@@ -1361,7 +1353,8 @@ recordHomeRuleDependencies ifaces = do
         , mod /= tcg_mod env
         , toUnitId (moduleUnit mod) `Set.member` home_units
         ]
-  updTcRef (tcg_home_rule_dependencies env) (`Map.union` checked)
+  updTcRef (tcg_source_check env) $ \s ->
+    s { scs_home_rule_deps = Map.union (scs_home_rule_deps s) checked }
 
 {-
 ************************************************************************
@@ -1375,8 +1368,9 @@ recordHomeRuleDependencies ifaces = do
 recordSourceProofUse :: SrcSpan -> Name -> [SourceProofRule] -> TcM ()
 recordSourceProofUse loc name deps = do
     env <- getGblEnv
-    updTcRef (tcg_source_rule_types env) $ \state ->
-      state { sourceProofOccurrences = (name, loc, deps) : sourceProofOccurrences state }
+    updTcRef (tcg_source_check env) $ \s ->
+      let r = scs_rule_uses s
+      in s { scs_rule_uses = r { sourceProofOccurrences = (name, loc, deps) : sourceProofOccurrences r } }
 
 getSrcSpanM :: TcRn SrcSpan
         -- Avoid clash with Name.getSrcLoc

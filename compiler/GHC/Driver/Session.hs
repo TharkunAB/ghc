@@ -2795,9 +2795,8 @@ makeExtensionFlags ext = [ makeExtensionFlag name depr ext | (depr, name) <- ext
 
 xFlagsDeps :: [(Deprecation, FlagSpec LangExt.Extension)]
 xFlagsDeps = concatMap makeExtensionFlags [minBound .. maxBound]
-          ++ [ (NotDeprecated, FlagSpec "DependentTypes" LangExt.ExperimentalDependentTypes setDependentTypesBundle AllModes)
-             , (NotDeprecated, FlagSpec "ExistentialTypes" LangExt.ExperimentalDependentTypes nop AllModes)
-             , (NotDeprecated, FlagSpec "ExtendedLet" LangExt.ExperimentalDependentTypes nop AllModes)
+          ++ [ (NotDeprecated, FlagSpec "ExistentialTypes" LangExt.DependentTypes nop AllModes)
+             , (NotDeprecated, FlagSpec "ExtendedLet" LangExt.DependentTypes nop AllModes)
              ]
 
 -- | Enable the core dependent-types extension bundle and disable list and tuple puns.
@@ -2826,13 +2825,13 @@ setDependentTypesBundle True  = do
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 GHC Proposal #378 (Section 4.12) and GHC Proposal #102 specify one umbrella
 extension, -XDependentTypes. Enabling -XDependentTypes activates
-ExperimentalDependentTypes and the standard dependent-types extension bundle
+the standard dependent-types extension bundle
 in setDependentTypesBundle. It also disables ListTuplePuns so that list and
 tuple syntax in types follows GHC Proposal #475. Users can re-enable
 ListTuplePuns with a later pragma or flag.
 
 MakeDynFlagsConsistent also enables Opt_WriteSourceEquations by default when
-ExperimentalDependentTypes is active outside the ghc-internal home unit. When
+DependentTypes is active outside the ghc-internal home unit. When
 the home unit is ghc-internal, makeDynFlagsConsistent leaves
 Opt_WriteSourceEquations disabled by default so early boot modules do not
 request sibling ghc-internal interfaces before they exist. See
@@ -2876,6 +2875,8 @@ extensionEffect = \case
     -> setIncoherentInsts
   LangExt.DerivingVia
     -> setDeriveVia
+  LangExt.DependentTypes
+    -> setDependentTypesBundle
   LangExt.UnsaturatedTypeFamilies
     -> \enabled -> when enabled (setGeneralFlag Opt_PrintExplicitMatchabilities)
   _ -> nop
@@ -4011,7 +4012,7 @@ makeDynFlagsConsistent dflags
          | gopt Opt_ExplicitWriteSourceEquations dflags = True
          | gopt Opt_SuppressSourceEquations dflags      = False
          | in_ghc_internal                              = False
-         | otherwise = xopt LangExt.ExperimentalDependentTypes dflags
+         | otherwise = xopt LangExt.DependentTypes dflags
  , gopt Opt_WriteSourceEquations dflags /= want_source_eqs
     = let dflags' | want_source_eqs = gopt_set dflags Opt_WriteSourceEquations
                   | otherwise       = gopt_unset dflags Opt_WriteSourceEquations

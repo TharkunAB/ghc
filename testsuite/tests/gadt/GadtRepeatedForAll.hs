@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, Haskell2010, ImpredicativeTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, Haskell2010, ImpredicativeTypes, NoDependentTypes #-}
 {-# LANGUAGE ScopedTypeVariables, TypeAbstractions, TypeApplications #-}
 module Main where
 

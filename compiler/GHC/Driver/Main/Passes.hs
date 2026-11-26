@@ -925,7 +925,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
           let no_late_plugins = not (hasActiveLatePlugins hsc_env)
               exported_names = availsToNameSet (tcg_exports tc_result)
               want_closures = gopt Opt_WriteSourceEquations dflags &&
-                              xopt LangExt.ExperimentalDependentTypes dflags &&
+                              xopt LangExt.DependentTypes dflags &&
                               no_late_plugins && null (tcg_rules tc_result)
           checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
             no_late_plugins local_eval_terms mutated_names
@@ -1012,7 +1012,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                                 null (tcg_rules tc_result) &&
                                 not (gopt Opt_Hpc dflags)
             want_closures = want_source_iface &&
-                            xopt LangExt.ExperimentalDependentTypes dflags
+                            xopt LangExt.DependentTypes dflags
         checked_tc <- case mb_desugar of
           Just guts
             | let no_rules = null (mg_rules guts)
@@ -1284,11 +1284,11 @@ validateRetainedLookupBodies mb_mut_ref env guts
     dflags = hsc_dflags env
     simplified = simpleOptNativeProgram (mg_binds guts)
 
--- | Extract local value bindings from 'tcg_evaluated_term_uses' that were
+-- | Extract local value bindings from 'scs_evaluated_uses' that were
 -- evaluated at compile time during typechecking.
 localEvaluatedTermUses :: TcGblEnv -> IO [Name]
 localEvaluatedTermUses tc_result = do
-  eval_uses <- readIORef (tcg_evaluated_term_uses tc_result)
+  eval_uses <- scs_evaluated_uses <$> readIORef (tcg_source_check tc_result)
   let this_mod = tcg_semantic_mod tc_result
   pure [ nm
        | nm <- nameSetElemsStable eval_uses

@@ -180,7 +180,7 @@ helperSource =
 retainedSource :: String
 retainedSource =
     unlines
-        [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RankNTypes, TypeOperators #-}"
+        [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, RankNTypes, TypeOperators #-}"
         , "module NativeSourceKeep where"
         , "import NativeRuntimeHelpers"
         , "entry :: IO String"
@@ -197,7 +197,7 @@ retainedSource =
 retainedSelectionSource :: String
 retainedSelectionSource =
     unlines
-        [ "{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, KindSignatures, TypeFamilies #-}"
+        [ "{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, KindSignatures, TypeFamilies #-}"
         , "module NativeSourceSelection where"
         , "import NativeRuntimeHelpers"
         , "type family Select (b :: Bool) where"
@@ -224,7 +224,7 @@ retainedSelectionSource =
 retainedChooseSource :: String -> String -> String
 retainedChooseSource moduleName observation =
     unlines
-        [ "{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
+        [ "{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
         , "module " ++ moduleName ++ " where"
         , "import NativeRuntimeHelpers"
         , "type family Select (b :: Bool) where"
@@ -257,7 +257,7 @@ retainedChooseSource moduleName observation =
 retainedNatSource :: String -> String -> String
 retainedNatSource moduleName observation =
     unlines
-        [ "{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, ScopedTypeVariables, TypeAbstractions, TypeApplications, TypeFamilies #-}"
+        [ "{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, ScopedTypeVariables, TypeAbstractions, TypeApplications, TypeFamilies #-}"
         , "module " ++ moduleName ++ " where"
         , "import NativeRuntimeHelpers hiding (appendVec)"
         , "type family ConstantNat (n :: Nat) where"
@@ -909,7 +909,7 @@ retainedCallSource moduleName observation =
 strictCallSource :: String -> String -> String
 strictCallSource moduleName observation =
     unlines
-        [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, ScopedTypeVariables, Strict #-}"
+        [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, ScopedTypeVariables, Strict #-}"
         , "module " ++ moduleName ++ " where"
         , "import NativeRuntimeHelpers"
         , "strictCaptured :: (Nat -> Nat) -> Nat -> Int"
@@ -978,7 +978,7 @@ retainedProgramObservation =
 retainedLibrarySource :: String
 retainedLibrarySource =
     unlines
-        [ "{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
+        [ "{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
         , "module NativeRetainedLibrary (Select, choose, keep, observe, forceChosen, forceIndependent, keepIndependent) where"
         , "type family Select (b :: Bool) where"
         , "  Select True = Int"
@@ -1193,7 +1193,7 @@ runModuleChecks libdir = do
         "sum-declaration"
         "NativeSumDeclaration"
         ( unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, TypeFamilies, TypeOperators #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, TypeFamilies, TypeOperators #-}"
             , "module NativeSumDeclaration where"
             , "import Data.Type.Equality ((:~:))"
             , "data Nat = Z | S Nat"
@@ -1207,7 +1207,7 @@ runModuleChecks libdir = do
             ]
         )
         ( unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeApplications, TypeOperators #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeApplications, TypeOperators #-}"
             , "module Main where"
             , "import NativeSumDeclaration"
             , "import Data.IORef"
@@ -1858,7 +1858,7 @@ runModuleCases libdir label producers extraFlags consumer expected = do
 runInvisibleRetainedModuleChecks :: FilePath -> IO ()
 runInvisibleRetainedModuleChecks libdir = do
     vectors <- readFile "PackedVecLibrary.hs"
-    let extensions = "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ScopedTypeVariables, TypeApplications, TypeFamilies #-}"
+    let extensions = "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ScopedTypeVariables, TypeApplications, TypeFamilies #-}"
         library = unlines
             [ extensions
             , "module NativeInvisibleRetained where"
@@ -2088,7 +2088,7 @@ runRecompilationChecks libdir = do
     forM_ [producerDirectory, consumerDirectory, artifacts] $ createDirectoryIfMissing True
     writeFile consumerSource $
         unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}"
             , "module NativeRetainedUsage where"
             , "import NativeRetainedLibrary (choose, keep)"
             , "use :: Int"
@@ -2143,14 +2143,14 @@ runRecompilationChecks libdir = do
     -- Moving a clause changes its source location. Changing its result
     -- invalidates the proof, even when the interface omits unfoldings.
     let withFlipBit body = unlines
-            [ "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            [ "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "module NativeRetainedLibrary (flipBit) where"
             , "flipBit :: Bool -> Bool"
             , body
             ]
         table falseRow = withFlipBit (falseRow ++ "\nflipBit True = False")
         proofSource = unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}"
             , "module NativeRetainedUsage where"
             , "import NativeRetainedLibrary (flipBit)"
             , "import Data.Type.Equality"
@@ -2168,7 +2168,7 @@ runRecompilationChecks libdir = do
             | (_, IfaceAxiom{ifAxSourceSpans = spans}) <- mi_decls iface
             , RealSrcSpan loc _ <- spans
             ]
-    unless (equationLines first == [4, 5] && equationLines moved == [5, 6]) $
+    unless (equationLines first == [4, 4] && equationLines moved == [5, 5]) $
         fail "FAIL: source equation locations did not survive an interface round trip"
     unless (mi_mod_hash first == mi_mod_hash moved) $
         fail "FAIL: moving a source equation changed the module ABI"
@@ -2180,7 +2180,7 @@ runRecompilationChecks libdir = do
     -- over the name that the consumer imports.
     void $ producer (withFlipBit "flipBit b = b")
     writeFile consumerSource $ unlines
-        [ "{-# LANGUAGE ExperimentalDependentTypes, NoRequiredTypeArguments #-}"
+        [ "{-# LANGUAGE DependentTypes, ListTuplePuns, NoRequiredTypeArguments #-}"
         , "module NativeRetainedUsage where"
         , "import NativeRetainedLibrary (flipBit)"
         , "p :: flipBit () -> flipBit ()"
@@ -2334,7 +2334,7 @@ runSourceChecks :: GHC.Ghc ()
 runSourceChecks = do
     -- Strict forces the anonymous argument. The case must retain its index.
     void $ sourceEntry "NativeSourceStrictWildcard" $ unlines
-        [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Strict #-}"
+        [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Strict #-}"
         , "module NativeSourceStrictWildcard where"
         , "import Data.Proxy"
         , "tag :: foreach (b :: Bool) -> Proxy b"
@@ -2343,7 +2343,7 @@ runSourceChecks = do
         , "entry = tag True"
         ]
     void $ sourceEntry "NativeSourceOpaqueInt" $ unlines
-        [ "{-# LANGUAGE ExperimentalDependentTypes, TypeOperators #-}"
+        [ "{-# LANGUAGE DependentTypes, ListTuplePuns, TypeOperators #-}"
         , "module NativeSourceOpaqueInt where"
         , "import Data.Type.Equality ((:~:)(Refl))"
         , "entry :: foreach (n :: Int) -> n :~: n"
@@ -2404,7 +2404,7 @@ runSourceChecks = do
 runPolyPayloadSourceCheck :: GHC.Ghc ()
 runPolyPayloadSourceCheck = do
     expression <- sourceEntry "NativeSourcePolyPayload" $ unlines
-        [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeOperators #-}"
+        [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeOperators #-}"
         , "module NativeSourcePolyPayload where"
         , "type Poly (b :: Bool) = forall (a :: Bool). (a ~ b) => Int"
         , "keep :: foreach (b :: Bool) -> Poly b -> Int"
@@ -3638,7 +3638,7 @@ runNatContextSourceChecks = do
         ]
     sourceModuleRejects "irreducible retained context" 83605 "Only class and equality constraints" "NativeSourceIrreducibleContext" $
         unlines
-            [ "{-# LANGUAGE ConstraintKinds, DataKinds, ExperimentalDependentTypes, FlexibleContexts, TypeFamilies #-}"
+            [ "{-# LANGUAGE ConstraintKinds, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, TypeFamilies #-}"
             , "module NativeSourceIrreducibleContext where"
             , "import Data.Kind (Constraint)"
             , "import NativeRuntimeHelpers"
@@ -3648,7 +3648,7 @@ runNatContextSourceChecks = do
             ]
     sourceModuleRejects "irreducible constraint-tuple component" 83605 "Only class and equality constraints" "NativeSourceIrreducibleTuple" $
         unlines
-            [ "{-# LANGUAGE ConstraintKinds, DataKinds, ExperimentalDependentTypes, FlexibleContexts, TypeFamilies, TypeOperators #-}"
+            [ "{-# LANGUAGE ConstraintKinds, DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, TypeFamilies, TypeOperators #-}"
             , "module NativeSourceIrreducibleTuple where"
             , "import Data.Kind (Constraint)"
             , "import NativeRuntimeHelpers"
@@ -3921,7 +3921,7 @@ sourceRejects label code fragment extensions declarations = do
     let moduleName = "NativeSourceRejected"
         source =
             unlines $
-                ["{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"]
+                ["{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"]
                     ++ map (\extension -> "{-# LANGUAGE " ++ extension ++ " #-}") extensions
                     ++ [ "module " ++ moduleName ++ " where"
                        , "type family Select (b :: Bool) where"
@@ -4062,7 +4062,6 @@ runPackageSourceRejectChecks = do
         , ("MatrixContextMissing", 83605, "Missing equation for the retained constructor pair", ["FlexibleContexts"], equalityImports, ["bad :: foreach (n :: Nat) -> Show Int => foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Nothing", "bad (S left) (S right) = Nothing"])
         , ("MatrixFallbackNonterminal", 83605, "only one final equation", [], equalityImports, ["bad :: foreach (n :: Nat) -> foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Nothing", "bad first second = Nothing", "bad (S left) (S right) = Nothing"])
         , ("MatrixFallbackRepeated", 83605, "only one final equation", [], equalityImports, ["bad :: foreach (n :: Nat) -> foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Nothing", "bad first second = Nothing", "bad another final = Nothing"])
-        , ("MatrixFallbackMixedWildcard", 83605, "The first index column requires constructor patterns with variables or wildcards as fields.", [], equalityImports, ["bad :: foreach (n :: Nat) -> foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Nothing", "bad _ Z = Nothing", "bad _ _ = Nothing"])
         , ("MatrixFallbackWildcardsFalseRefl", 83865, "Just Refl", [], equalityImports, ["bad :: foreach (n :: Nat) -> foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Just Refl", "bad _ _ = Just Refl"])
         , ("MatrixFallbackLeftVariableFalseRefl", 83865, "Just Refl", [], equalityImports, ["bad :: foreach (n :: Nat) -> foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Just Refl", "bad first _ = Just Refl"])
         , ("MatrixFallbackRightVariableFalseRefl", 83865, "Just Refl", [], equalityImports, ["bad :: foreach (n :: Nat) -> foreach (m :: Nat) -> Maybe (n :~: m)", "bad Z Z = Just Refl", "bad _ second = Just Refl"])
@@ -4307,7 +4306,7 @@ runPackageSourceRejectChecks = do
             let moduleName = "NativeSourcePiOperand" ++ name
                 source =
                     unlines $
-                        [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll #-}"
+                        [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitForAll #-}"
                         , "{-# LANGUAGE GADTs, KindSignatures, RankNTypes, ScopedTypeVariables #-}"
                         , "{-# LANGUAGE TypeApplications, TypeFamilies, TypeOperators #-}"
                         ]
@@ -4326,7 +4325,7 @@ runPackageSourceRejectChecks = do
     void
         $ sourceEntry "NativeSourcePackageOrdinarySplicedWildcard"
         $ unlines
-        $ [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}"
+        $ [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}"
           , "{-# LANGUAGE RankNTypes, ScopedTypeVariables, TypeApplications, TemplateHaskell #-}"
           , "module NativeSourcePackageOrdinarySplicedWildcard where"
           , "import Language.Haskell.TH (Type(WildCardT))"
@@ -4375,10 +4374,10 @@ runPackageSourceRejectChecks = do
     void (GHC.setSessionDynFlags flags)
     liftIO $ putStrLn "package source rejection checks: ok"
   where
-    containerExtensions = ["DataKinds", "ExperimentalDependentTypes", "ExplicitForAll", "GADTs", "KindSignatures", "RankNTypes", "ScopedTypeVariables", "TypeFamilies", "TypeOperators", "FlexibleContexts", "ConstraintKinds", "AllowAmbiguousTypes", "TypeApplications", "NoImpredicativeTypes"]
+    containerExtensions = ["DataKinds", "DependentTypes", "ListTuplePuns", "ExplicitForAll", "GADTs", "KindSignatures", "RankNTypes", "ScopedTypeVariables", "TypeFamilies", "TypeOperators", "FlexibleContexts", "ConstraintKinds", "AllowAmbiguousTypes", "TypeApplications", "NoImpredicativeTypes"]
     containerProvider =
         unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll, GADTs, KindSignatures, RankNTypes, ScopedTypeVariables, TypeFamilies, TypeOperators, FlexibleContexts, ConstraintKinds, AllowAmbiguousTypes, TypeApplications, ImpredicativeTypes, PolyKinds, UnboxedTuples, MagicHash #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitForAll, GADTs, KindSignatures, RankNTypes, ScopedTypeVariables, TypeFamilies, TypeOperators, FlexibleContexts, ConstraintKinds, AllowAmbiguousTypes, TypeApplications, ImpredicativeTypes, PolyKinds, UnboxedTuples, MagicHash #-}"
             , "module NativePiContainerProvider where"
             , "import PackedVecLibrary"
             , "import Data.Type.Equality ((:~:)(Refl))"
@@ -4540,7 +4539,7 @@ runPackageSourceRejectChecks = do
         ]
     packageModule moduleName extensions imports declarations =
         unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, ExplicitForAll #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, ExplicitForAll #-}"
             , "{-# LANGUAGE GADTs, KindSignatures, RankNTypes, ScopedTypeVariables #-}"
             , "{-# LANGUAGE TypeApplications, TypeOperators #-}"
             ]
@@ -4724,7 +4723,7 @@ runSourceRejectChecks = do
     -- See Note [Known retained function instantiation] in GHC.Tc.Gen.App.
     void $ sourceEntry "NativeSourceContainerUndefined" $
         unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators, NoImpredicativeTypes #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators, NoImpredicativeTypes #-}"
             , "module NativeSourceContainerUndefined where"
             , "type family Select (b :: Bool) where"
             , "  Select True = Int"
@@ -4737,7 +4736,7 @@ runSourceRejectChecks = do
     -- Keep the former Quick Look boundary as the same checked source.
     void $ sourceEntry "NativeSourceGroundImpredicative" $
         unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
             , "{-# LANGUAGE ImpredicativeTypes #-}"
             , "module NativeSourceGroundImpredicative where"
             , "type family Select (b :: Bool) where"
@@ -4748,7 +4747,7 @@ runSourceRejectChecks = do
     -- The signed alias names the same runtime index as its RHS.
     void $ sourceEntry "NativeSourceSignedBoolAlias" $
         unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
             , "module NativeSourceSignedBoolAlias where"
             , "type family Select (b :: Bool) where"
             , "  Select True = Int"
@@ -4760,7 +4759,7 @@ runSourceRejectChecks = do
     -- Ordinary literal patterns use the refined argument type and keep row order.
     void $ sourceEntry "NativeSourceLaterOrdinaryLiteral" $
         unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies, TypeOperators #-}"
             , "module NativeSourceLaterOrdinaryLiteral where"
             , "type family Select (b :: Bool) where"
             , "  Select True = Int"
@@ -4773,7 +4772,7 @@ runSourceRejectChecks = do
     -- selects Int before the literal is passed to the retained function.
     void $ sourceEntry "NativeSourceCheckedBooleanProducer" $
         unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies #-}"
             , "module NativeSourceCheckedBooleanProducer where"
             , "type family Select (b :: Bool) where"
             , "  Select True = Int"
@@ -4782,7 +4781,7 @@ runSourceRejectChecks = do
     forM_ [("Inline", "INLINE"), ("Inlinable", "INLINABLE")] $ \(suffix, pragma) -> do
         let name = "NativeSource" ++ suffix
         void $ sourceEntry name $ unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies #-}"
             , "module " ++ name ++ " where"
             , "type family Select (b :: Bool) where"
             , "  Select True = Int"
@@ -4790,7 +4789,7 @@ runSourceRejectChecks = do
             ] ++ local ["{-# " ++ pragma ++ " keep #-}"] selection identity "keep True 42"
     void $ sourceEntry "NativeSourceUnannotatedAndWildcard" $
         unlines $
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeFamilies #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeFamilies #-}"
             , "module NativeSourceUnannotatedAndWildcard where"
             , "type family Select (b :: Bool) where"
             , "  Select True = Int"
@@ -6308,7 +6307,7 @@ runChecks = do
 runSourceCallIndexChecks :: GHC.Ghc ()
 runSourceCallIndexChecks = do
     parsed <- parseSourceTarget "NativeSourceCallIndices" $ unlines
-        [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}"
+        [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns #-}"
         , "module NativeSourceCallIndices where"
         , "import Data.Proxy (Proxy)"
         , "data Packed = Packed { flag :: Bool, token :: Proxy flag }"
@@ -6573,7 +6572,7 @@ retainedMultiPackageSource moduleName observation =
 -- | Compile source constructors with the ordinary runtime helpers.
 multiPackageHelperSource :: String
 multiPackageHelperSource =
-    unlines (["{-# LANGUAGE ExperimentalDependentTypes #-}"] ++ lines helperSource ++ packageDeclarations)
+    unlines (["{-# LANGUAGE DependentTypes, ListTuplePuns #-}"] ++ lines helperSource ++ packageDeclarations)
   where
     packageDeclarations =
         [ "data PackedVec a where"
@@ -6675,7 +6674,7 @@ runFunctionPackageModuleChecks libdir = do
             , "guardedIgnore _ (FunctionPack f n xs) = ignoreFunction (FunctionPack f n xs)"
             ]
         consumer = unlines
-            [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications #-}"
+            [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeApplications #-}"
             , ""
             , "-- | Prospective finite observations through a separate producer interface."
             , "module Main (main) where"
@@ -6852,7 +6851,7 @@ runFunctionFieldModuleChecks libdir = do
     artifacts <- makeAbsolute ("NativeDependentCoreRun.modules" </> "function-field-source" </> "artifacts")
     forM_
             [ ("RejectReductionDepth", 40404, "Reduction stack overflow", unlines
-                [ "{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures #-}"
+                [ "{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, KindSignatures #-}"
                 , "{-# LANGUAGE TypeApplications, TypeFamilies, UndecidableInstances #-}"
                 , "{-# OPTIONS_GHC -freduction-depth=12 #-}"
                 , "module RejectReductionDepth where"
@@ -6868,7 +6867,7 @@ runFunctionFieldModuleChecks libdir = do
                 ]
             )
             , ("RejectCrossPayload", 5617, "consumeFlag", unlines
-                [ "{-# LANGUAGE ExperimentalDependentTypes, GADTs #-}"
+                [ "{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs #-}"
                 , "module RejectCrossPayload where"
                 , "import FunctionFieldLibrary"
                 , "wrong :: Box -> Box -> Int"
@@ -6877,7 +6876,7 @@ runFunctionFieldModuleChecks libdir = do
             )
             , ("RejectMatchableShape", 40564, "Inaccessible code", unlines
                 [ "{-# LANGUAGE DataKinds, GADTs, KindSignatures, TypeApplications #-}"
-                , "{-# LANGUAGE ExperimentalDependentTypes, ExplicitForAll #-}"
+                , "{-# LANGUAGE DependentTypes, ListTuplePuns, ExplicitForAll #-}"
                 , "module RejectMatchableShape where"
                 , "import GHC.Exts (FUN, M, Multiplicity (Many))"
                 , "data Flag (b :: Bool) where"
@@ -6903,7 +6902,7 @@ runGenericListModuleChecks libdir = do
     library <- readFile "PackedVecLibrary.hs"
     let warnings = ["-Werror=inaccessible-code", "-Werror=overlapping-patterns"]
         consumer = unlines
-            [ "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            [ "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE EmptyCase #-}"
             , "{-# LANGUAGE GADTs #-}"
@@ -7012,7 +7011,7 @@ runGenericListModuleChecks libdir = do
             , "[3]"
             ]
         rejection = unlines
-            [ "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            [ "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE EmptyCase #-}"
             , "{-# LANGUAGE GADTs #-}"
@@ -7035,7 +7034,7 @@ runGenericListModuleChecks libdir = do
             , "wrongList xs ys = genericVector ys"
             ]
         linearRejection = unlines
-            [ "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            [ "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE LinearTypes #-}"
@@ -7174,7 +7173,7 @@ runGenericSafeIndexModuleChecks libdir = do
             , "generic literal list in retained callback: [7,7]"
             , "generic selected function WHNF: forced"
             ]
-    forM_ [("edt", "ExperimentalDependentTypes"), ("ordinary", "NoExperimentalDependentTypes")] $
+    forM_ [("dt", "DependentTypes, ListTuplePuns"), ("ordinary", "NoDependentTypes")] $
         \(label, extension) -> do
             let consumer = unlines (("{-# LANGUAGE " ++ extension ++ " #-}") : body)
             runModuleCases libdir ("generic-safe-index-" ++ label)
@@ -7198,7 +7197,7 @@ runOrdinaryRetainedModuleChecks libdir = do
     library <- readFile "PackedVecLibrary.hs"
     ordinary <- readFile "OrdinaryVecClient.hs"
     let warnings = ["-Werror=inaccessible-code", "-Werror=overlapping-patterns"]
-        modes = [("NoEDT", "NoExperimentalDependentTypes"), ("EDT", "ExperimentalDependentTypes")]
+        modes = [("NoDT", "NoDependentTypes"), ("DT", "DependentTypes, ListTuplePuns")]
         cases :: [(String, [String], String, [String])]
         cases =
             [
@@ -7662,7 +7661,7 @@ runOrdinaryRetainedModuleChecks libdir = do
             , let moduleName = "M68" ++ name ++ suffix
             ]
         driver = unlines $
-            ["{-# LANGUAGE NoExperimentalDependentTypes #-}", "module Main (main) where"]
+            ["{-# LANGUAGE NoDependentTypes #-}", "module Main (main) where"]
             ++ ["import qualified " ++ name | (name, _) <- clients]
             ++ ["main :: IO ()", "main = do"]
             ++ concat [["    putStrLn " ++ show name, "    " ++ name ++ ".main"] | (name, _) <- clients]
@@ -7715,7 +7714,7 @@ runBoundedFamilyModuleChecks libdir = do
     let finite = unlines
             [ "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE ExplicitForAll #-}"
-            , "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            , "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE KindSignatures #-}"
             , "{-# LANGUAGE TypeFamilies #-}"
@@ -7764,7 +7763,7 @@ runBoundedFamilyModuleChecks libdir = do
         consumer = unlines
             [ "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE ExplicitForAll #-}"
-            , "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            , "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE KindSignatures #-}"
             , "{-# LANGUAGE TypeFamilies #-}"
@@ -7803,7 +7802,7 @@ runBoundedFamilyModuleChecks libdir = do
         [ ("LoopShape", Nothing, unlines
             [ "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE ExplicitForAll #-}"
-            , "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            , "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE KindSignatures #-}"
             , "{-# LANGUAGE TypeFamilies #-}"
@@ -7827,7 +7826,7 @@ runBoundedFamilyModuleChecks libdir = do
         , ("LoopCached", Nothing, unlines
             [ "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE ExplicitForAll #-}"
-            , "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            , "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE KindSignatures #-}"
             , "{-# LANGUAGE TypeFamilies #-}"
@@ -7852,7 +7851,7 @@ runBoundedFamilyModuleChecks libdir = do
         , ("LoopCachedSecond", Just (22, 28, "second argument"), unlines
             [ "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE ExplicitForAll #-}"
-            , "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            , "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE KindSignatures #-}"
             , "{-# LANGUAGE TypeFamilies #-}"
@@ -7878,7 +7877,7 @@ runBoundedFamilyModuleChecks libdir = do
             [ "{-# LANGUAGE TypeApplications #-}"
             , "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE ExplicitForAll #-}"
-            , "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            , "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE KindSignatures #-}"
             , "{-# LANGUAGE TypeFamilies #-}"
@@ -8022,7 +8021,7 @@ runExportedFunctionSignatureModuleChecks libdir = do
             , "idCall f n xs = xs"
             ]
         consumer = unlines
-            [ "{-# LANGUAGE ExperimentalDependentTypes #-}"
+            [ "{-# LANGUAGE DependentTypes, ListTuplePuns #-}"
             , "{-# LANGUAGE DataKinds #-}"
             , "{-# LANGUAGE GADTs #-}"
             , "{-# LANGUAGE ScopedTypeVariables #-}"

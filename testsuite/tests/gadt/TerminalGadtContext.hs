@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitNamespaces, FlexibleInstances, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ExplicitNamespaces, FlexibleInstances, GADTs, NoDependentTypes #-}
 {-# LANGUAGE NoRequiredTypeArguments, TypeApplications #-}
 module Main where
 

@@ -479,7 +479,7 @@ addFamInstsWithHelpers helper_tycons fam_insts
 
 {- Note [Automatic FromNatural synthesis for certified Num instances]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Under ExperimentalDependentTypes (and DependentTypes), a Peano datatype with
+Under DependentTypes (and DependentTypes), a Peano datatype with
 a ground Num instance whose fromInteger method follows the certified 3-guard
 zero/successor definition can interpret type-level numerals directly without
 a separate `type instance FromNatural T n = ...` declaration.
@@ -499,7 +499,7 @@ unchanged.
 synthesizeCertifiedFromNatural :: Maybe NameSet -> [InstInfo GhcRn] -> [FamInst] -> TcM ([TyCon], [FamInst])
 synthesizeCertifiedFromNatural Nothing _ _ = pure ([], [])
 synthesizeCertifiedFromNatural (Just excluded_targets) local_infos explicit_fams = do
-  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  experimental <- xoptM LangExt.DependentTypes
   rebindable   <- xoptM LangExt.RebindableSyntax
   hs_src       <- tcHscSource
   case hs_src of

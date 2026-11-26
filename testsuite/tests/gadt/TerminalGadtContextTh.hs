@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitNamespaces, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ExplicitNamespaces, GADTs, NoDependentTypes #-}
 {-# LANGUAGE RequiredTypeArguments, TemplateHaskell, TypeApplications #-}
 module Main where
 

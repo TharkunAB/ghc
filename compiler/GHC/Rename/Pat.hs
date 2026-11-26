@@ -520,7 +520,7 @@ rnLArgPatAndThen mk = wrapSrcSpanCps rnArgPatAndThen where
       addErr (TcRnIllegalInvisibleTypePattern tp' InvisPatWithoutFlag)
     let ex_tvs = hstp_exp_tvs (hstp_ext tp') ++ hstp_imp_tvs (hstp_ext tp')
     liftCpsWithCont $ \k -> do
-      dep <- xoptM LangExt.ExperimentalDependentTypes
+      dep <- xoptM LangExt.DependentTypes
       if dep && not (null ex_tvs)
         then do
           rdr_env <- getLocalRdrEnv

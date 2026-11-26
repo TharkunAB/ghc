@@ -269,7 +269,7 @@ ghcInternalArgs = package ghcInternal ? do
             inputs [ "**/GHC/Internal/Unicode.hs"
                    , "**/GHC/Internal/Unicode/Char/UnicodeData/Simple*CaseMapping.hs"
                    , "**/GHC/Internal/Data/Tuple.hs"
-                   ] ? arg "-XExperimentalDependentTypes"
+                   ] ? pure ["-XDependentTypes", "-XListTuplePuns"]
 
           , builder (Cabal Flags) ? staged (buildFlag NeedLibatomic) `cabalFlag` "need-atomic"
 

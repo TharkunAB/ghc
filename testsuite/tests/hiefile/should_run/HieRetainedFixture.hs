@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures, RankNTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, KindSignatures, RankNTypes #-}
 
 module HieRetainedFixture where
 

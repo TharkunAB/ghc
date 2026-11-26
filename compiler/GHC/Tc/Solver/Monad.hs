@@ -2430,7 +2430,7 @@ matchCertifiedFromNatural tycon args@[target, lit_ty]
   , Just k <- isNumLitTy lit_ty
   , k >= 0
   , noFreeVarsOfType target
-  = do { enabled <- TcM.xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- TcM.xoptM LangExt.DependentTypes
        ; if not enabled then return Nothing else
          do { let num_mod = mkGhcInternalModule (fsLit "GHC.Internal.Num")
             ; from_int <- lookupOrig num_mod fromIntegerClassOpOcc

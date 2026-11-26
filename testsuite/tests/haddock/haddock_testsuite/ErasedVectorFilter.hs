@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, ExplicitNamespaces, DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 {-# OPTIONS_GHC -O0 #-}
 

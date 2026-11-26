@@ -1,7 +1,7 @@
 NativeTypeLambdaWrongTarget.hs:7:20: error: [GHC-25897]
     • Couldn't match type ‘y’ with ‘x’
       Expected: p y -> p x
-        Actual: (type lambda in a visible type argument) a y p y
+        Actual: (type lambda in a visible type argument) a p y y
       ‘y’ is a rigid type variable bound by
         the type signature for:
           leibnizUSymAt :: forall {a} (x :: a) (y :: a) (p :: a %U -> *).

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExplicitNamespaces, GADTs, Haskell2010, ImpredicativeTypes, LinearTypes, NoExperimentalDependentTypes, RequiredTypeArguments, ScopedTypeVariables, TypeAbstractions, TypeApplications #-}
+{-# LANGUAGE ExplicitNamespaces, GADTs, Haskell2010, ImpredicativeTypes, LinearTypes, NoDependentTypes, RequiredTypeArguments, ScopedTypeVariables, TypeAbstractions, TypeApplications #-}
 module Main where
 
 import Control.Exception

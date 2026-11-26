@@ -668,7 +668,7 @@ tcTyClDecls open_indices tyclds kisig_env domain_env role_annots
             -- type synonyms, as we have not tested for type synonym
             -- loops yet and could fall into a black hole.
             -- See Note [Publishing ordered type cases].
-       ; edt <- xoptM LangExt.ExperimentalDependentTypes
+       ; edt <- xoptM LangExt.DependentTypes
        ; let check_declarations rec_case_axioms =
                fixM $ \ ~(rec_tyclss_with_validity_infos, _) -> do
                { tcg_env <- getGblEnv
@@ -1666,7 +1666,7 @@ legacyKindArrowTree rhs = matchabilityArrow rhs && go rhs
 {- Note [Inferred matchability for ordinary kind-arrow synonyms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In ordinary Haskell modules (where neither UnsaturatedTypeFamilies nor
-ExperimentalDependentTypes is enabled), programs often declare nullary
+DependentTypes is enabled), programs often declare nullary
 higher-order kind synonyms using bare arrows, such as:
 
   type MTrans = (Type -> Type) -> (Type -> Type)
@@ -1683,7 +1683,7 @@ Type one inferred Matchability binder, just as `inferArrowIndices` already
 does for a nullary closed family equation. `tcCheckMatchabilitySynRhs`
 applies that binder to every bare arrow in the tree. Kind-level uses then
 select M and type-level uses select U. Modules that enable
-UnsaturatedTypeFamilies or ExperimentalDependentTypes retain Proposal #242's
+UnsaturatedTypeFamilies or DependentTypes retain Proposal #242's
 fixed U default on synonym RHSs.
 -}
 
@@ -2769,7 +2769,7 @@ synonym solver still handles RHS metadata separately. An arrow whose
 shape is already known needs no variable. Rechecking the RHS uses the
 inferred kind, including the selected matchability.
 
-When ExperimentalDependentTypes enables unsaturation, `type Apply f a = f a`
+When DependentTypes enables unsaturation, `type Apply f a = f a`
 can accept either a constructor or a type family. Proposal #242 generalises
 an unresolved matchability in an inferred higher-order argument kind.
 LiberalTypeSynonyms already does this for calls that become saturated after
@@ -4164,7 +4164,7 @@ tcFamDecl1 case_axioms mb_domain parent (FamilyDecl { fdInfo = fam_info
   ; checkFamFlag tc_name
   ; inj' <- tcInjectivity tc_bndrs inj
   ; checkResultSigFlag tc_name sig  -- check after injectivity for better errors
-  ; enabled <- xoptM LangExt.ExperimentalDependentTypes
+  ; enabled <- xoptM LangExt.DependentTypes
   ; is_boot <- tcIsHsBootOrSig
   ; let flav
           | enabled, Just _ <- parent = ConstrainedTypeFamilyTyCon
@@ -4219,7 +4219,7 @@ tcFamDecl1 case_axioms mb_domain parent (FamilyDecl { fdInfo = fam_info
 
        ; co_ax_name <- newFamInstAxiomName tc_lname []
        ; let check_equation = tcTyFamInstEqn tc_fam_tc NotAssociated
-       ; track_proofs <- xoptM LangExt.ExperimentalDependentTypes
+       ; track_proofs <- xoptM LangExt.DependentTypes
        ; checked <- mapAndReportM (\eqn ->
            if track_proofs
            then do result <- withSourceProofSignature (Just co_ax_name) (check_equation eqn)
@@ -7295,7 +7295,7 @@ checkFamFlag tc_name
   = do { idx_tys <- xoptM LangExt.TypeFamilies
        ; lifted_lambda <- if any (`List.isPrefixOf` occNameString (nameOccName tc_name))
                                   ["$lambda:", "$case:"]
-                          then xoptM LangExt.ExperimentalDependentTypes
+                          then xoptM LangExt.DependentTypes
                           else pure False
        ; unless (idx_tys || lifted_lambda) $
            addErrTc (TcRnTyFamsDisabled (TyFamsDisabledFamily tc_name)) }

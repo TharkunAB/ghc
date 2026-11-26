@@ -28,7 +28,7 @@ core expression with (hopefully) improved usage information.
 module GHC.Core.Opt.OccurAnal (
     OccurAnalOpts(..), SimplCoreMode(..),
     occurAnalysePgm,
-    occurAnalyseExpr, occurAnalyseBndrsAndExpr,
+    occurAnalyseExpr, occurAnalyseExprWithMode, occurAnalyseBndrsAndExpr,
     occurAnalyseNativeExpr, canDropNativeLocalBinding,
     occurAnalyseExpr_Prep,
     zapLambdaBndrs
@@ -85,9 +85,14 @@ Here's the externally-callable interface:
 
 -- | Do occurrence analysis, and discard occurrence info returned
 occurAnalyseExpr :: CoreExpr -> CoreExpr
-occurAnalyseExpr expr = expr'
+occurAnalyseExpr = occurAnalyseExprWithMode OrdinaryCore
+
+-- | Occurrence-analyse a single expression under the active 'SimplCoreMode'.
+occurAnalyseExprWithMode :: SimplCoreMode -> CoreExpr -> CoreExpr
+occurAnalyseExprWithMode mode expr = expr'
   where
-    WUD _ expr' = occAnal initOccEnv expr
+    env = initOccEnv { occ_opts = (occ_opts initOccEnv) { oa_core_mode = mode } }
+    WUD _ expr' = occAnal env expr
 
 -- | Remove unused lazy local bindings without rewriting dependent scope.
 -- See Note [Native dead local bindings].

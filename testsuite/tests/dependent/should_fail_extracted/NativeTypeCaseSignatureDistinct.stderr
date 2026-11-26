@@ -37,7 +37,6 @@ NativeTypeCaseSignatureDistinct.hs:20:31: error: [GHC-83865]
                      with: case right of {True -> Int; False -> Char}
       Expected: the type case in the signature for ‘differentRetained’
         Actual: the type case in the signature for ‘differentRetained’
-      Note: GHC cannot determine the arguments of the type case in the signature for ‘differentRetained’ from its result.
     • In the expression: input
       In an equation for ‘differentRetained’:
           differentRetained _ _ input = input

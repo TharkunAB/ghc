@@ -8,8 +8,8 @@ NativeOpenMatchabilityWrongCong.hs:16:32: error: [GHC-05617]
         Actual: add (add n m1) p1 :~: add n (add m1 p1)
       Note: GHC cannot determine the arguments of the function ‘add’ from its result.
     • In the second argument of ‘cong’, namely
-        ‘(wrongAssoc n_aFY m p_aFZ)’
-      In the expression: cong S (wrongAssoc n_aFY m p_aFZ)
+        ‘(wrongAssoc n_aG4 m p_aG5)’
+      In the expression: cong S (wrongAssoc n_aG4 m p_aG5)
       In an equation for ‘wrongAssoc’:
           wrongAssoc (S m) n p = cong S (wrongAssoc n m p)
 

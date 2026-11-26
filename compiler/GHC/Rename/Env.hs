@@ -1230,7 +1230,7 @@ lookupTypeOcc position rdr_name
                           IAmTyCon $
                           eqTyConName <$ tyConFlavour eqTyCon }
                | Just term_rdr <- source_term_rdr rdr_name
-                 -> do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+                 -> do { experimental <- xoptM LangExt.DependentTypes
                        ; if experimental then lookup_table term_rdr
                                          else lookup_demoted rdr_name }
                | otherwise -> lookup_demoted rdr_name }
@@ -1397,10 +1397,10 @@ lookupSourceTables legacy_identity (gbl, lcl) term_rdr
                           then Just <$> lookupOrig gHC_INTERNAL_BASE base_occ
                           else return Nothing
                       _ -> do
-                        updTcRef (tcg_source_table_uses env) (`extendNameSet` name)
+                        updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) name })
                         return Nothing
                   else do
-                    updTcRef (tcg_source_table_uses env) (`extendNameSet` name)
+                    updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) name })
                     return Nothing
       | otherwise = return Nothing
 
@@ -1432,7 +1432,7 @@ lookupSourceTables legacy_identity (gbl, lcl) term_rdr
 
 {- Note [Names of finite source functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Under ExperimentalDependentTypes a type can mention a function such as
+Under DependentTypes a type can mention a function such as
 flipBit. First look for a type variable with that spelling. Then resolve the
 term with the written qualifier and import list. The defining module supplies
 the name of its closed family, even when an intermediate module re-exports

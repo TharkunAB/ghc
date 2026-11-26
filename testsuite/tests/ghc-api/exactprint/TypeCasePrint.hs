@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, UnicodeSyntax #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, UnicodeSyntax #-}
 module TypeCasePrint where
 
 type F a = case a of

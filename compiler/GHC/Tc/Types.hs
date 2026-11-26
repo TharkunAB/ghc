@@ -23,7 +23,9 @@ module GHC.Tc.Types(
 
         -- The environment types
         Env(..),
-        TcGblEnv(..), SourceRuleUses(..), emptySourceRuleUses, TcLclEnv(..), modifyLclCtxt, TcLclCtxt(..),
+        TcGblEnv(..), SourceRuleUses(..), emptySourceRuleUses,
+        SourceCheckState(..), emptySourceCheckState,
+        TcLclEnv(..), modifyLclCtxt, TcLclCtxt(..),
         setLclEnvTcLevel, getLclEnvTcLevel,
         setLclEnvLoc, getLclEnvLoc, lclEnvInGeneratedCode,
         IfGblEnv(..), IfLclEnv(..),
@@ -559,6 +561,36 @@ data SourceRuleUses = SourceRuleUses
 emptySourceRuleUses :: SourceRuleUses
 emptySourceRuleUses = SourceRuleUses emptyNameEnv Nothing emptyNameEnv [] emptyNameSet
 
+-- | Accumulated source-equation, evaluated-term, and rewrite-rule dependencies
+-- for the module being typechecked.
+data SourceCheckState = SourceCheckState
+  { scs_table_uses     :: !NameSet
+    -- ^ Type Names record missing imported tables and tables used by retained
+    -- calls. A local table Name records an actual use. Term Names record the
+    -- DFun, selector and source target of a retained method application.
+    -- See Note [Source table usage fingerprints] in GHC.Unit.Module.ModIface.
+  , scs_evaluated_uses :: !NameSet
+    -- ^ Definitions and constructors used in compile-time type evaluation.
+  , scs_rule_uses      :: !SourceRuleUses
+    -- ^ Known first type arguments to retained rule heads and proof occurrences.
+  , scs_home_rule_deps :: !(Map Module Fingerprint)
+    -- ^ Complete home interfaces inspected by accepted source proofs.
+  , scs_optional_uses  :: ![(TcEvBinds, CoVar, [Id], [(Id, Maybe Name)], [Name])]
+    -- ^ Deferred source dependencies: evidence, proof, term owners,
+    -- rule heads with known type arguments, and table Names.
+    -- See Note [Optional source dependencies] in GHC.Tc.Gen.SourceTable.
+  }
+
+-- | Initial empty 'SourceCheckState'.
+emptySourceCheckState :: SourceCheckState
+emptySourceCheckState = SourceCheckState
+  { scs_table_uses     = emptyNameSet
+  , scs_evaluated_uses = emptyNameSet
+  , scs_rule_uses      = emptySourceRuleUses
+  , scs_home_rule_deps = M.empty
+  , scs_optional_uses  = []
+  }
+
 -- | 'TcGblEnv' describes the top-level of the module at the
 -- point at which the typechecker is finished work.
 -- It is this structure that is handed on to the desugarer
@@ -660,11 +692,9 @@ data TcGblEnv
         tcg_has_dep_imports :: !(TcRef Bool),
           -- ^ @True@ once an imported interface with dependent constructs is loaded.
 
-        tcg_source_table_uses :: TcRef NameSet,
-          -- ^ Type Names record missing imported tables and tables used by retained
-          -- calls. A local table Name records an actual use. Term Names record the
-          -- DFun, selector and source target of a retained method application.
-          -- See Note [Source table usage fingerprints] in GHC.Unit.Module.ModIface.
+        tcg_source_check :: !(TcRef SourceCheckState),
+          -- ^ Accumulated source-equation, evaluated-term, and rewrite-rule
+          -- dependencies for this module.
 
         tcg_local_open_demands :: Maybe (TcRef [(Name, SrcSpan)]),
           -- ^ Record only the local term heads admitted by the source group renamer.
@@ -674,21 +704,6 @@ data TcGblEnv
 
         tcg_local_open_owners :: NameEnv Id,
           -- ^ Source owners of demanded monomorphic binders inside checked Core.
-
-        tcg_evaluated_term_uses :: TcRef NameSet,
-          -- ^ Imported definitions used in type evaluation, including instance dictionaries.
-
-        tcg_source_rule_types :: TcRef SourceRuleUses,
-          -- ^ Known first type arguments to retained rule heads. An empty
-          -- set requires checking all rules for the head.
-
-        tcg_home_rule_dependencies :: TcRef (Map Module Fingerprint),
-          -- ^ Complete home interfaces inspected by accepted source proofs.
-
-        tcg_optional_source_uses :: TcRef [(TcEvBinds, CoVar, [Id], [(Id, Maybe Name)], [Name])],
-          -- ^ Deferred source dependencies: evidence, proof, term owners,
-          -- rule heads with known type arguments, and table Names.
-          -- See Note [Optional source dependencies] in GHC.Tc.Gen.SourceTable.
 
         tcg_th_used :: TcRef Bool,
           -- ^ @True@ \<=> Template Haskell syntax used.

@@ -4,3 +4,15 @@ NativeOpenInstalledDropWhileWalkFail.hs:9:34: error: [GHC-70565]
     • In the type ‘BW.otherHead p xs’
       In the type synonym declaration for ‘BadHead’
 
+NativeOpenInstalledDropWhileWalkFail.hs:12:39: error: [GHC-70565]
+    • Cannot evaluate ‘BW.strictSuffix’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘BW.strictSuffix p xs’
+      In the type synonym declaration for ‘BadSuffix’
+
+NativeOpenInstalledDropWhileWalkFail.hs:15:35: error: [GHC-70565]
+    • Cannot evaluate ‘BW.ruledWalk’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘BW.ruledWalk p xs’
+      In the type synonym declaration for ‘BadRuled’
+

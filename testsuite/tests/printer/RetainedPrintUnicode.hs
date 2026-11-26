@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE UnicodeSyntax #-}
 {-# LANGUAGE DataKinds, ExplicitForAll, GADTs, RankNTypes #-}
 {-# LANGUAGE RequiredTypeArguments, TypeAbstractions #-}

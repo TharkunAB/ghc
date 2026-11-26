@@ -257,7 +257,7 @@ tcPolyExprCheck expr res_ty
           -- before handing off to tcExpr
           tc_body e = do { ds_flag <- getDeepSubsumptionFlag
                          ; inner_skolemise ds_flag rho_ty $ \rho_ty' ->
-                           do { dep <- xoptM LangExt.ExperimentalDependentTypes
+                           do { dep <- xoptM LangExt.DependentTypes
                               ; mb_rep <- if dep
                                           then tcTypeRepTarget_maybe rho_ty'
                                           else pure Nothing
@@ -847,7 +847,7 @@ tcExpr e@HsQualLit{} _ = pprPanic "tcExpr: HsQualLit" (ppr e)
 -- GHC.Rename.Expr. Note [Handling overloaded and rebindable constructs]
 tcExpr expr@(ExplicitList _ exprs) res_ty
   = do { anchor <- case res_ty of
-             Infer _ -> do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+             Infer _ -> do { enabled <- xoptM LangExt.DependentTypes
                            ; if enabled then find_native [] exprs
                                         else return Nothing }
              _ -> return Nothing
@@ -895,7 +895,7 @@ If vector :: Vec Int n, inferring [vector] must retain that exact element
 type. The ordinary list path allocates an element meta-variable first.
 It cannot contain the runtime Id n.
 
-Under ExperimentalDependentTypes, an inferred list can use a declared
+Under DependentTypes, an inferred list can use a declared
 monomorphic native variable as its element type. Look through parentheses.
 Read and zonk its declared type without checking its occurrence or emitting
 usage. Do not expand splices or infer an application to select this type.
@@ -1021,7 +1021,7 @@ tcExpr original@(HsLet x local_binds@(L loc binds) body) res_ty
        ; case opened of
            Just expr -> return expr
            Nothing -> do
-             { enabled <- xoptM LangExt.ExperimentalDependentTypes
+             { enabled <- xoptM LangExt.DependentTypes
              ; expansion <- case res_ty of
                    Check expected | enabled
                                   , hasNativeDependentExpr (Core.Type expected)
@@ -1091,7 +1091,7 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
             ; (scrut', scrut_ty) <- if null (unLoc (mg_alts matches))
                                      then tcEmptyRetainedScrutinee operand operand_ty
                                      else pure (operand, operand_ty)
-            ; dependent <- xoptM LangExt.ExperimentalDependentTypes
+            ; dependent <- xoptM LangExt.DependentTypes
             ; special <- case unLoc (stripParensLHsExpr scrut') of
                 _ | ExistsTy ImplicitExists _ _ <- coreFullView scrut_ty
                   -> dot_case scrut' scrut_ty mult expected
@@ -1323,7 +1323,7 @@ tcExpr (HsStatic free_names expr) res_ty
 
 -- See Note [Reflecting a checked type operand].
 tcExpr expr@(HsEmbTy _ written) expected
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; unless enabled $ failWith (TcRnIllegalTypeExpr TypeKeywordSyntax)
        ; case expected of
            Check ty ->
@@ -1373,7 +1373,7 @@ tcExpr (HsStar _)         _ = failWith (TcRnIllegalTypeExpr StarKindSyntax)
 
 {- Note [Reflecting a checked type operand]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In an expression checked against TypeRep t, ExperimentalDependentTypes
+In an expression checked against TypeRep t, DependentTypes
 allows (type t) and unadorned type arguments to supply the runtime witness.
 Check the written type at the expected kind and instantiate the same selector
 as typeRep. This requires Typeable t. When the written type references a local
@@ -2079,7 +2079,7 @@ tcExistsCase expr@(HsCase ctxt scrut matches)
     strip_pat (L _ pat) = pat
 
     check_pack con_loc con args
-      = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+      = do { enabled <- xoptM LangExt.DependentTypes
            ; unless enabled $ failWithTc (TcRnExistsPack ExistsPackExtension)
            ; case args of
                PrefixCon _ [witness_pat, payload_pat]

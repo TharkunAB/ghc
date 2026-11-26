@@ -1,12 +1,12 @@
 NativeTypeLambdaTypeAppKind.hs:7:27: error: [GHC-83865]
     • Expected a type, but ‘'True’ has kind ‘Bool’
     • In the first argument of ‘Either’, namely ‘'True’
-      In the type ‘Either 'True cell_a25M’
       In the type lambda in a visible type argument
+      In the type ‘($([t| \err cell -> Either 'True cell |]) String)’
 
 NativeTypeLambdaTypeAppKind.hs:8:36: error: [GHC-83865]
     • Expected a type, but ‘'True’ has kind ‘Bool’
     • In the first argument of ‘Either’, namely ‘'True’
-      In the type ‘Either 'True cell’
       In the type lambda in a visible type argument
+      In the type ‘(\cell -> Either 'True cell)’
 

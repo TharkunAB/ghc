@@ -121,7 +121,7 @@ fingerprintDynFlags hsc_env this_mod nameio =
 
         -- See Note [Recompiling ordinary pair producers]
         -- and Note [Opting in to checked source equations].
-        base_fp | xopt LangExt.ExperimentalDependentTypes dflags = computeFingerprint nameio f
+        base_fp | xopt LangExt.DependentTypes dflags = computeFingerprint nameio f
                 | gopt Opt_WriteSourceEquations dflags =
                     computeFingerprint nameio (f, "write-source-equations-v1" :: String)
                 | otherwise = computeFingerprint nameio (f, "ordinary-pair-equations-v1" :: String)
@@ -161,7 +161,7 @@ change in the ordinary module's self-recompilation fingerprint. This
 costs one rebuild of each old ordinary home module. An unchanged second
 build can reuse it, even if the module supplies no equations.
 
-Modules with ExperimentalDependentTypes already ran the pair check.
+Modules with DependentTypes already ran the pair check.
 Keep their existing flags fingerprint. Installed interfaces can still be
 read without access to their source or object code.
 -}

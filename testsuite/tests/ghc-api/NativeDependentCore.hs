@@ -1639,7 +1639,8 @@ runNatChecks dflags = do
     domain <- timeout 2000000 (evaluate (isNativeIndexType natTy))
     check "recursive Nat index domain terminates" (domain == Just True)
     check "Nat runtime Id is an index" (isNativeIndexId n)
-    check "linear Nat Id is not an index" (not (isNativeIndexId (setIdMult n OneTy)))
+    check "linear Nat Id is an index" (isNativeIndexId (setIdMult n OneTy))
+    check "non-multiplicity Nat Id is not an index" (not (isNativeIndexId (setIdMult n zeroTy)))
     checkType dflags "runtime Nat index has kind Nat" natTy (typeKind index)
     forM_
         [ (Var n, index)
@@ -1718,8 +1719,8 @@ runNatChecks dflags = do
                 lintAccepts dflags "Bool beta ordinary typing" [boolInput, m] expression
             Nothing -> fail "FAIL: checked Bool beta was rejected"
     forM_
-        [ ("linear binder", App (Lam (setIdMult beta OneTy) (Var beta)) (Var m))
-        , ("linear argument", betaConstant (Var (setIdMult m OneTy)))
+        [ ("non-multiplicity binder", App (Lam (setIdMult beta zeroTy) (Var beta)) (Var m))
+        , ("non-multiplicity argument", betaConstant (Var (setIdMult m zeroTy)))
         , ("wrong argument domain", betaIdentity (Var (dataConWorkId trueDataCon)))
         , ("ignored wrong argument domain", betaConstant (Var (dataConWorkId trueDataCon)))
         , ("wrong Bool argument domain", App (Lam boolBeta (Var boolBeta)) zeroExpr)
@@ -1908,7 +1909,7 @@ runNatChecks dflags = do
     forM_
         [ ("type variable", mkTyVar (mkSystemName (unique 1704) (mkTyVarOcc "bad_index")) natTy)
         , ("coercion variable", proof 1705 zeroTy zeroTy)
-        , ("linear Id", setIdMult n OneTy)
+        , ("non-multiplicity Id", setIdMult n zeroTy)
         , ("join Id", asJoinId (local 1706 "bad_index" (mkVisFunTyManyU boolTy boolTy)) 1)
         , ("unlifted domain", local 1707 "bad_index" intPrimTy)
         ]
@@ -3114,7 +3115,7 @@ runIfaceChecks libdir = runGhc (Just libdir) $ do
             case functionPiWire of
                 IfaceDepFunTy vis (mult, name, domain) body -> do
                     let badDomain replacement = IfaceDepFunTy vis (mult, name, replacement) body
-                    rejectsIface "function Pi rejects outer multiplicity One" "Invalid retained binder" [] $
+                    rejectsIface "function Pi rejects outer multiplicity One" "Invalid retained call head" [] $
                         IfaceDepFunTy vis (toIfaceType OneTy, name, domain) body
                     rejectsIface "native call rejects an opaque inner linear arrow" "Invalid retained call head" [] $
                         badDomain (toIfaceType (mkFunctionType unmatchableDataConTy OneTy boolTy boolTy))
@@ -3568,14 +3569,14 @@ runIfaceChecks libdir = runGhc (Just libdir) $ do
                         decoded <- roundtrip NormalCompression (IfaceDepFunTy DepFunVisible binder body)
                         rejectsIface label fragment [] decoded
                 malformed "unlifted interface binder" "Invalid retained binder" (multiplicity, name, toIfaceType intPrimTy)
-                malformed "linear interface binder" "Invalid retained binder" (toIfaceType OneTy, name, domain)
+                malformed "non-multiplicity interface binder" "Invalid retained binder" (toIfaceType boolTy, name, domain)
                 malformed "interface binder outside its own domain scope" "Iface id out of scope" (multiplicity, name, IfaceTermVar name)
             _ -> fail "FAIL: interface conversion did not retain the Boolean binder"
         let constraintResult = DepFunTy DepFunVisible b (mkTyConApp eqTyCon [boolTy, TermVarTy b, TermVarTy b])
         constraintIface <- roundtrip NormalCompression (toIfaceType (tidyTopType constraintResult))
         rejectsIface "Constraint interface result" "Invalid retained function result" [] constraintIface
         let badType = local 305 "badType" intPrimTy
-            badMultiplicity = mkSysLocal (fsLit "badMultiplicity") (unique 306) OneTy boolTy
+            badMultiplicity = mkSysLocal (fsLit "badMultiplicity") (unique 306) boolTy boolTy
             badJoin = asJoinId (local 110410 "badJoin" (mkVisFunTyManyU boolTy boolTy)) 1
             badCoVar = proof 110411 (constructorIndex trueDataCon) (constructorIndex trueDataCon)
         forM_ [badType, badMultiplicity, badJoin, badCoVar] $ \bad -> do
@@ -4511,7 +4512,7 @@ runSyntaxChecks :: DynFlags -> IO ()
 runSyntaxChecks dflags = do
     logger <- initLogger
     (nativeFlags, leftovers, _) <-
-        parseDynamicFlagsCmdLine logger dflags [noLoc "-XExperimentalDependentTypes"]
+        parseDynamicFlagsCmdLine logger dflags [noLoc "-XDependentTypes", noLoc "-XListTuplePuns"]
     check "retained extension flag" (null leftovers)
     let source = "foreach (b :: Bool) -> Select b -> Select b"
         parseWith flags input =
@@ -4683,9 +4684,11 @@ runDepFunCoChecks dflags = do
         wrongDomain = local 708 "co_unlifted" intPrimTy
         opaqueInt = local 81035 "co_opaque_int" intTy
         linear = setIdMult b OneTy
+        badMult = setIdMult b boolTy
     lintAccepts dflags "retained Nat coercion binder" [] (Coercion (DepFunCo DepFunVisible DepFunVisible nat MRefl (mkNomReflCo intTy)))
     lintAccepts dflags "opaque Int coercion binder" [] (Coercion (DepFunCo DepFunVisible DepFunVisible opaqueInt MRefl (mkNomReflCo intTy)))
-    forM_ [("erased variable", erased), ("coercion variable", cv), ("unlifted domain", wrongDomain), ("linear runtime binder", linear)] $ \(label, binder) ->
+    lintAccepts dflags "linear retained coercion binder" [] (Coercion (DepFunCo DepFunVisible DepFunVisible linear MRefl (mkNomReflCo intTy)))
+    forM_ [("erased variable", erased), ("coercion variable", cv), ("unlifted domain", wrongDomain), ("non-multiplicity runtime binder", badMult)] $ \(label, binder) ->
         lintRejects dflags ("retained coercion rejects " ++ label) [] (Coercion (DepFunCo DepFunVisible DepFunVisible binder MRefl (mkNomReflCo intTy)))
     lintRejects dflags "retained coercion rejects unlifted results" [] (Coercion (DepFunCo DepFunVisible DepFunVisible b MRefl (mkNomReflCo intPrimTy)))
     forM_ [("left", proof 709 intPrimTy intTy), ("right", proof 710 intTy intPrimTy)] $ \(side, evidence) -> do

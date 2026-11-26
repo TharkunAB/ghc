@@ -2954,9 +2954,9 @@ isNativeRetainedBinderType ty
 -- See Note [Opaque algebraic retained binders].
 isNativeRetainedField :: Id -> Bool
 isNativeRetainedField v
-  = isNativeOpaqueValueId v
+  = isNativeOpaqueValueId v && isManyTy (idMult v)
     && (isNativeIndexType ty || isNativeIndexedFieldDomain ty || isTyVarTy ty
-        || (noFreeVarsOfType (idMult v) && isNativeRetainedFieldFunctionType ty))
+        || isNativeRetainedFieldFunctionType ty)
   where
     ty = varType v
 

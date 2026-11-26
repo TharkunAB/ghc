@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, UnicodeSyntax #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, UnicodeSyntax #-}
 module TypeLetPrint where
 
 type F a = let b {- bind -} = G a

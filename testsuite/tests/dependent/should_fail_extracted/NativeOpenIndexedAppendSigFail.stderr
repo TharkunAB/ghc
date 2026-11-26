@@ -12,7 +12,7 @@ NativeOpenIndexedAppendSigFail.hs:11:14: error: [GHC-83865]
                                  foreach (xs :: P.Vec a (P.Add cut m)) ->
                                  EmptyLaw a (P.Add cut m) xs
     • Relevant bindings include
-        xs_a4f7 :: P.Vec a (P.Add cut m) (bound at <no location info>)
+        xs_a4oK :: P.Vec a (P.Add cut m) (bound at <no location info>)
 
 NativeOpenIndexedAppendSigFail.hs:16:28: error: [GHC-83865]
     • Couldn't match kind ‘P.Z’ with ‘P.S P.Z’

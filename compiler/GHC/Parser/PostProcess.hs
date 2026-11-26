@@ -1060,7 +1060,7 @@ checkRuleTyVarBndrNames bndrs
    = sequence_ [ check lname | L _ (RuleTyTmVar _ lname _) <- bndrs ]
   where
     check (L loc (Unqual occ)) = do
-      dependent <- getBit ExperimentalDependentTypesBit
+      dependent <- getBit DependentTypesBit
       let name = occNameFS occ
       when (name `elem` [fsLit "family",fsLit "role"] || (dependent && name == fsLit "some")) $
         addFatalError $ mkPlainErrorMsgEnvelope (locA loc) $
@@ -3834,7 +3834,7 @@ requireLTPuns err start end =
     addError (mkPlainErrorMsgEnvelope loc (PsErrInvalidPun err))
   where
     allowed = case err of
-      PEP_TupleSyntaxType -> (||) <$> punsAllowed <*> getBit ExperimentalDependentTypesBit
+      PEP_TupleSyntaxType -> (||) <$> punsAllowed <*> getBit DependentTypesBit
       _                   -> punsAllowed
     loc = (combineSrcSpans (getLoc start) (getLoc end))
 

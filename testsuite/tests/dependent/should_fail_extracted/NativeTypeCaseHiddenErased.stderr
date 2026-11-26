@@ -1,5 +1,9 @@
 NativeTypeCaseHiddenErased.hs:6:3: error: [GHC-30337]
-    Dodgy type variable ‘a’ in the LHS of a family instance:
-      the type variable ‘a’ syntactically appears in LHS patterns,
-      but it doesn't appear in an injective position.
+    • Dodgy type variable ‘a’ in the LHS of a family instance:
+        the type variable ‘a’ syntactically appears in LHS patterns,
+        but it doesn't appear in an injective position.
+    • In the type ‘case d of {Hidden a -> Int;
+                              'Just _ -> Int;
+                              'Nothing -> Char}’
+      In the type synonym declaration for ‘F’
 

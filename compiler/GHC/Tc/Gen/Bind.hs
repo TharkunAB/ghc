@@ -1342,7 +1342,7 @@ checkInferredRetainedTypes :: (TcType -> Bool) -> [MonoBindInfo] -> TcM ()
 checkInferredRetainedTypes local_value infos
   | all has_complete_sig infos = return ()
   | otherwise = do
-      enabled <- xoptM LangExt.ExperimentalDependentTypes
+      enabled <- xoptM LangExt.DependentTypes
       when enabled $ mapM_ check_info infos
   where
     has_complete_sig (MBI { mbi_sig = Just (TISI { sig_inst_sig = TcCompleteSig{} }) }) = True

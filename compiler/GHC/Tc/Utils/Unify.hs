@@ -254,7 +254,7 @@ reduceNativeFunFamily_maybe fuel tc args
            Just (Reduction co rhs) -> do
              when is_source_fam $ do
                env <- getGblEnv
-               updTcRef (tcg_source_table_uses env) (`extendNameSet` tyConName tc)
+               updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) (tyConName tc) })
                let ty' = mkTyConApp tc args'
                when (isTauTy ty') $ do
                  loc <- getCtLocM AnnOrigin (Just TypeLevel)

@@ -35,17 +35,17 @@ NativeOpenIndexedAppendFail.hs:25:38: error: [GHC-05617]
         at NativeOpenIndexedAppendFail.hs:25:3-63
       Expected: P.appendVec P.VNil ys1 :~: ys1
         Actual: P.appendVec P.VNil xs1 :~: xs1
-    • In the expression: appendEmptyAt @a @'P.Z xs_a4vg
+    • In the expression: appendEmptyAt @a @'P.Z xs
       In the expression:
-        (appendEmptyAt @a @'P.Z xs_a4vg, appendEmptyAt @a @'P.Z xs_a4vg)
+        (appendEmptyAt @a @'P.Z xs, appendEmptyAt @a @'P.Z xs)
       In the expression:
         case n of
           P.Z -> (appendEmptyAt @a @'P.Z xs, appendEmptyAt @a @'P.Z xs)
           P.S k
             -> (appendEmptyAt @a @('P.S k) xs, appendEmptyAt @a @('P.S k) ys)
     • Relevant bindings include
-        ys :: P.Vec a n (bound at NativeOpenIndexedAppendFail.hs:24:22)
-        xs :: P.Vec a n (bound at NativeOpenIndexedAppendFail.hs:24:19)
+        xs_a4Fd :: P.Vec a n1 (bound at <no location info>)
+        ys_a4Fe :: P.Vec a n1 (bound at <no location info>)
         wrongAppendPair :: foreach (n :: P.Nat)
                            -> foreach (xs :: P.Vec a n)
                               -> foreach (ys :: P.Vec a n) -> (EmptyLaw a n xs, EmptyLaw a n ys)

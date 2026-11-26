@@ -1,4 +1,13 @@
 NativeTypeLambdaQuoteUnavailableKind.hs:10:24: error: [GHC-27185]
-    A type lambda needs a supported position in a top-level type synonym, the right-hand side of a type family equation, a value signature, an expression type annotation, a complete visible type argument, or an ordinary constructor field.
-    A local signature can use a type lambda during ordinary compilation when GHC can copy the kinds of its captures, or infer their kinds and check the body in that scope.
-
+    • A type lambda needs a supported position in a top-level type synonym, the right-hand side of a type family equation, a value signature, an expression type annotation, a complete visible type argument, or an ordinary constructor field.
+      A local signature can use a type lambda during ordinary compilation when GHC can copy the kinds of its captures, or infer their kinds and check the body in that scope.
+    • In the first argument of ‘Proxy’, namely
+        ‘((\cell -> (f 'True, cell)) Bool)’
+      In the type signature:
+        witness :: Proxy ((\cell -> (f 'True, cell)) Bool)
+      In an equation for ‘unavailableKind’:
+          unavailableKind _
+            = const True witness
+            where
+                witness :: Proxy ((\cell -> (f 'True, cell)) Bool)
+                witness = Proxy

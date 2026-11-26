@@ -2,9 +2,9 @@ NativeRevExplicitListO2RuleFail.hs:34:43: error: [GHC-83605]
     • GHC cannot use the checked equation for ‘++’ with the current rewrite rules.
       Use -fno-enable-rewrite-rules in the module that needs this equation.
     • In the second argument of ‘const’, namely
-        ‘(Refl :: (('[] :: [Bool]) ++ ys_aKC) :~: ys_aKC)’
+        ‘(Refl :: (('[] :: [Bool]) ++ ys_aKO) :~: ys_aKO)’
       In the expression:
-        const Refl (Refl :: (('[] :: [Bool]) ++ ys_aKC) :~: ys_aKC)
+        const Refl (Refl :: (('[] :: [Bool]) ++ ys_aKO) :~: ys_aKO)
       In an equation for ‘smuggledExprSig’:
           smuggledExprSig [] ys _
             = const Refl (Refl :: (('[] :: [Bool]) ++ ys) :~: ys)
@@ -12,9 +12,9 @@ NativeRevExplicitListO2RuleFail.hs:34:43: error: [GHC-83605]
 NativeRevExplicitListO2RuleFail.hs:34:44: error: [GHC-83605]
     • GHC cannot use the checked equation for ‘++’ with the current rewrite rules.
       Use -fno-enable-rewrite-rules in the module that needs this equation.
-    • In the expression: Refl :: (('[] :: [Bool]) ++ ys_aKC) :~: ys_aKC
+    • In the expression: Refl :: (('[] :: [Bool]) ++ ys_aKO) :~: ys_aKO
       In the second argument of ‘const’, namely
-        ‘(Refl :: (('[] :: [Bool]) ++ ys_aKC) :~: ys_aKC)’
+        ‘(Refl :: (('[] :: [Bool]) ++ ys_aKO) :~: ys_aKO)’
       In the expression:
-        const Refl (Refl :: (('[] :: [Bool]) ++ ys_aKC) :~: ys_aKC)
+        const Refl (Refl :: (('[] :: [Bool]) ++ ys_aKO) :~: ys_aKO)
 

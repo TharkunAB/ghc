@@ -1,5 +1,5 @@
 NativeTypeCaseRetainedThIndexScope.hs:18:38: error: [GHC-28709]
-    • Malformed type IndexVarT flag_6989586621679015906
+    • Malformed type IndexVarT flag_6989586621679015891
       When splicing a TH type: flag_0
     • In the untyped splice:
         $(do n <- newName "flag"

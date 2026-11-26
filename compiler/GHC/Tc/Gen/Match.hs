@@ -789,7 +789,7 @@ tcDependentCaseWithMotive spec matches@(MG { mg_alts = L loc alternatives }) (Ch
                   aliases_of v = nub (idName v : [nm | (nm, u) <- resolved_nms, u == v])
                   lex_env      = ( Just (aliases_of index, motive_idx)
                                  , [(aliases_of c, sh_nm) | (c, sh_nm) <- zip captures shared_names] )
-                  matches'     = prepare_motive_alts application shared_names constructors
+                  matches'     = prepare_motive_alts Nothing application shared_names constructors
                   arg_tys      = map (mkCheckExpFunPatTy . Scaled ManyTy . varType) (motive_idx : shared ++ dictionaries)
                   cap_plan v b = if used_as_idx v then RetainedConIndex b else RetainedConValue
                   plan         = RetainedConIndex motive_idx
@@ -868,7 +868,7 @@ tcDependentCaseWithMotive spec matches@(MG { mg_alts = L loc alternatives }) (Ch
           let dictionaries = motive_proof : old_dictionaries
               aliases_of c = nub (idName c : [nm | (nm, u) <- resolved_caps, u == c])
               lex_env      = (Nothing, [(aliases_of c, sh_nm) | (c, sh_nm) <- zip captures shared_names])
-              matches'     = prepare_motive_alts False shared_names constructors
+              matches'     = prepare_motive_alts (Just (fun, indices)) False shared_names constructors
               pat_tys      = map (mkCheckExpFunPatTy . Scaled ManyTy)
                                (domain : map varType dictionaries ++ map generalize capture_cos)
               plan         = RetainedConIndex motive_idx
@@ -938,7 +938,7 @@ tcDependentCaseWithMotive spec matches@(MG { mg_alts = L loc alternatives }) (Ch
                      && all (`elem` domain_cons) cons) case_error
       pure constructors
 
-    prepare_motive_alts keep_case_ctxt shared_names constructors =
+    prepare_motive_alts mb_call_spec keep_case_ctxt shared_names constructors =
       matches { mg_alts = L loc (zipWith add_args alternatives constructors) }
       where
         extra = map (noLocA . VarPat noExtField . noLocA) shared_names
@@ -946,7 +946,11 @@ tcDependentCaseWithMotive spec matches@(MG { mg_alts = L loc alternatives }) (Ch
           let subject_pats = maybe (map stripParPat pats)
                                    (\(_, fs) -> map (bindRetainedConFields fs) pats) mb_con
               ctxt = if keep_case_ctxt then m_ctxt m else LamAlt LamSingle
-          in L mloc (m { m_ctxt = ctxt, m_pats = L ploc (subject_pats ++ extra) })
+              m1   = case (mb_call_spec, mb_con) of
+                       (Just (c_fun, c_idxs), Just (con, fs)) ->
+                         rewriteCallTypeAnnotation c_fun c_idxs con fs m
+                       _ -> m
+          in L mloc (m1 { m_ctxt = ctxt, m_pats = L ploc (subject_pats ++ extra) })
 tcDependentCaseWithMotive _ _ _ = pure Nothing
 
 -- | Detect whether a renamed AST contains a type annotation spelling the exact
@@ -958,16 +962,41 @@ hasCallTypeAnnotation fun indices = go
     go thing
       | Just HsTypedBracket{}   <- (cast thing :: Maybe (HsExpr GhcRn)) = False
       | Just HsUntypedBracket{} <- (cast thing :: Maybe (HsExpr GhcRn)) = False
-      | Just ty <- (cast thing :: Maybe (HsType GhcRn)), is_call ty     = True
+      | Just ty <- (cast thing :: Maybe (HsType GhcRn))
+      , matchExactCallType fun indices ty                               = True
       | Just _ <- (cast thing :: Maybe Name)    = False
       | Just _ <- (cast thing :: Maybe NameSet) = False
       | Just _ <- (cast thing :: Maybe Type)    = False
       | otherwise = or (gmapQ go thing)
 
-    is_call ty =
-      let (head_ty, args) = split_apps [] ty
-      in is_name (idName fun) head_ty && indices `equalLength` args
-         && and (zipWith is_index indices args)
+-- | Rewrite exact @fun indices@ type annotations in a branch to the branch's
+-- promoted constructor application so local signatures refine with the branch.
+rewriteCallTypeAnnotation :: Data a => Id -> [Type] -> DataCon -> [Id] -> a -> a
+rewriteCallTypeAnnotation fun indices con fields = go
+  where
+    call_names = idName fun : [idName v | idx <- indices, v <- tyCoVarsOfTypeList idx, isId v]
+    con_type :: HsType GhcRn
+    con_type = foldl' (\f a -> HsAppTy noExtField (noLocA f) a)
+      (HsTyVar noAnn IsPromoted (noLocA (noUserRdr (dataConName con))))
+      (map (noLocA . HsTyVar noAnn NotPromoted . noLocA . noUserRdr . idName) fields)
+    go :: Data b => b -> b
+    go thing
+      | Just ty <- (cast thing :: Maybe (HsType GhcRn))
+      , matchExactCallType fun indices ty
+      = fromMaybe thing (cast con_type)
+      | Just names <- (cast thing :: Maybe NameSet)
+      , all (`elemNameSet` names) call_names
+      = fromMaybe thing (cast (names `unionNameSet` mkNameSet (dataConName con : map idName fields)))
+      | Just _ <- (cast thing :: Maybe Name) = thing
+      | Just _ <- (cast thing :: Maybe Type) = thing
+      | otherwise = gmapT go thing
+
+matchExactCallType :: Id -> [Type] -> HsType GhcRn -> Bool
+matchExactCallType fun indices ty =
+  let (head_ty, args) = split_apps [] ty
+  in is_name (idName fun) head_ty && indices `equalLength` args
+     && and (zipWith is_index indices args)
+  where
 
     is_name nm (HsParTy _ ty) = is_name nm (unLoc ty)
     is_name nm (HsTyVar _ NotPromoted (L _ (WithUserRdr _ actual))) = nm == actual
@@ -2894,7 +2923,7 @@ prepareUnguardedWhereGRHSs (Check expected) original@GRHSs
   | hasNativeDependentExpr (Type expected)
     || (isTauTy expected && not (anyFreeVarsOfType (\v -> isTyVar v && isMetaTyVar v) expected))
   , not (null groups), all nonrecursive_function groups, all isTypeLSig sigs
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; strict <- xoptM LangExt.Strict
        ; if enabled && not strict
          then let body = wrapGenSpan' (combineSrcSpans (getLocA rhs) (locA binds_loc))

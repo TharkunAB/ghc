@@ -148,7 +148,7 @@ import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Class
 import GHC.Core.FamInstEnv (familyNameInstances, famInstTyCon, lookupFamInstEnv, fim_instance,
-                            mkBranchedCoAxiom, mkCoAxBranch, reduceTyFamApp_maybe)
+                            mkBranchedCoAxiom, mkCoAxBranch, normaliseType, reduceTyFamApp_maybe)
 import GHC.Tc.TyCl.Build (newImplicitBinder)
 import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr )
@@ -213,7 +213,7 @@ import Data.Function ( on )
 import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import Data.Dynamic (fromDynamic, toDyn)
-import Data.List (elemIndex, isPrefixOf, mapAccumL, nub, sort)
+import Data.List (elemIndex, intercalate, isPrefixOf, mapAccumL, nub, sort)
 import qualified Data.Map as Map
 import Data.Proxy (Proxy(..))
 import Data.Typeable (typeRep)
@@ -659,7 +659,7 @@ isAstLeafAnnotation thing
 -- Note [Runtime indices in visible type arguments] in GHC.Rename.HsType.
 tcRetainedAmbientIndices :: RetainedQuantificationError -> LHsType GhcRn -> TcM (NameEnv Id)
 tcRetainedAmbientIndices invalid_reason hs_ty
-  = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+  = do { experimental <- xoptM LangExt.DependentTypes
        ; if experimental
          then case dedup_ambient emptyNameSet (ambient_names hs_ty) of
                 []         -> return emptyNameEnv
@@ -1352,14 +1352,14 @@ tcStandaloneKindSig decl ksig = do
 
 -- | Check a standalone kind signature and extract an optional canonical
 -- constrained kind for top-level open or closed type families under
--- @ExperimentalDependentTypes@.
+-- @DependentTypes@.
 tcStandaloneKindSigWithDomain :: TyClDecl GhcRn
                               -> LStandaloneKindSig GhcRn
                               -> TcM (Name, Kind, Maybe Kind)
 tcStandaloneKindSigWithDomain decl (L _ (StandaloneKindSig _ (L _ name) ksig))
   = addSigCtxt ctxt (UserLHsSigType ksig) $
     do { raw_kind <- tc_top_lhs_type_x (Just decl) KindLevel ctxt ksig
-       ; edt <- xoptM LangExt.ExperimentalDependentTypes
+       ; edt <- xoptM LangExt.DependentTypes
        ; case if edt && is_top_type_family decl
                 then splitStandaloneFamilyConstrainedKind decl raw_kind
                 else Nothing of
@@ -2002,7 +2002,7 @@ familyRhsForContext rhs = rhs
 {- Note [Inferred closed family callback arrows]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In an unsigned closed family, an application such as f x can determine
-the kind of f. With ExperimentalDependentTypes and PolyKinds, use a fresh
+the kind of f. With DependentTypes and PolyKinds, use a fresh
 matchability for the missing arrow. Generalise it with the other kind
 variables. Use fresh matchabilities also when forwarding f to an inferred
 family. Defaulting the receiver's index would specialise the new family.
@@ -2426,7 +2426,7 @@ tcHsType mode (HsOpTy _ ty1 tyop ty2) exp_kind
 --------- Foralls
 tcHsType mode ty@HsForEachTy{} exp_kind
   | TypeLevel <- mode_tyki mode
-  = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+  = do { experimental <- xoptM LangExt.DependentTypes
        ; unless experimental $ failWithTc TcRnRetainedQuantificationNotImplemented
        ; ty' <- tcCheckRetainedType (mode_complete_type_arg mode == Just True) Nothing
                                     mode (noLocA ty) liftedTypeKind
@@ -2680,7 +2680,7 @@ tcHsType mode (XHsType (HsTypeLetRn _ (L _ binder) rhs body)) exp_kind = do
     after_env <- ambientMetaTyVars exp_kind
     zonked <- liftZonkM (zonkTcTypes (mkTyVarTys rhs_metas))
     when (anyVarSet (\tv -> isMetaTyVar tv && not (tv `elemVarSet` after_env)) (tyCoVarsOfTypes zonked)) $
-      addErrAt (getLocA rhs) $ mkTcRnUnknownMessage $ mkPlainError [] $
+      setSrcSpan (getLocA rhs) $ failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
         text "A type let used in a case body cannot generalize the kind of its right-hand side."
   pure res
 
@@ -2732,14 +2732,14 @@ tc_hs_lit_ty mode rn_ty (HsChar _ c) exp_kind
   = do checkWiredInTyCon charTyCon
        checkExpKind mode rn_ty (mkCharLitTy c) charTy exp_kind
 tc_hs_lit_ty mode rn_ty lit@(HsCharPrim _ c) exp_kind
-  = do { native <- xoptM LangExt.ExperimentalDependentTypes
+  = do { native <- xoptM LangExt.DependentTypes
        ; if native
            then do { checkWiredInTyCon charTyCon
                    ; checkExpKind mode rn_ty (mkCharPrimLitTy c) charPrimTy exp_kind }
            else failWithTc (TcRnUnpromotableLit lit) }
 tc_hs_lit_ty mode rn_ty lit exp_kind
   | Just (mk_prim_lit, kind) <- prim_lit lit
-  = do { native <- xoptM LangExt.ExperimentalDependentTypes
+  = do { native <- xoptM LangExt.DependentTypes
        ; if native
            then do { platform <- targetPlatform <$> getDynFlags
                    ; checkExpKind mode rn_ty (LitTy (mk_prim_lit platform)) kind exp_kind }
@@ -2757,7 +2757,7 @@ tcConvertedNumeral :: TcTyMode -> ExpKind -> Type -> TcM (Maybe Type)
 tcConvertedNumeral mode (Check expected) raw
   | Just (_, HM_FamPat{}) <- mode_holes mode = pure Nothing
   | otherwise = do
-      enabled <- xoptM LangExt.ExperimentalDependentTypes
+      enabled <- xoptM LangExt.DependentTypes
       if not enabled then pure Nothing else do
         target <- liftZonkM (zonkTcType expected)
         case splitTyConApp_maybe target of
@@ -2851,7 +2851,7 @@ tc_hs_tuple_ty rn_ty mode HsBoxedOrConstraintTuple hs_tys exp_kind
        ; finish_tuple mode rn_ty tup_sort tys' (map (const arg_kind) tys') exp_kind }
 tc_hs_tuple_ty rn_ty mode HsUnboxedTuple tys exp_kind
   | isTypeLevel (mode_tyki mode)
-  = do { edt <- xoptM LangExt.ExperimentalDependentTypes
+  = do { edt <- xoptM LangExt.DependentTypes
        ; ubx <- xoptM LangExt.UnboxedTuples
        ; if edt && ubx
            then tc_promoted_or_unboxed_tuple rn_ty mode tys exp_kind
@@ -2906,7 +2906,7 @@ tc_promoted_or_unboxed_tuple rn_ty mode tys exp_kind = do
 
 {- Note [Unboxed Char# and unboxed tuple promotion]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Under ExperimentalDependentTypes (and DependentTypes), GHC extends DataKinds
+Under DependentTypes (and DependentTypes), GHC extends DataKinds
 promotion to two unboxed value forms:
 
 1. Primitive character literals and C# pattern binders:
@@ -3304,7 +3304,7 @@ tc_fun_type_x check type_level_ma mode mult ty1 ty2 exp_kind = case mode_tyki mo
                       (tcMkVisFunTy ma (fromMaybe manyDataConTy mult') ty1' ty2')
                       liftedTypeKind exp_kind }
   KindLevel ->  -- no representation polymorphism in kinds. yet.
-    do { edt <- xoptM LangExt.ExperimentalDependentTypes
+    do { edt <- xoptM LangExt.DependentTypes
        ; ubx <- xoptM LangExt.UnboxedTuples
        ; (ty1', ty2') <-
            if edt && ubx
@@ -3390,7 +3390,7 @@ tupKindSort_maybe k
 
 tc_tuple :: HsType GhcRn -> TcTyMode -> TupleSort -> [LHsType GhcRn] -> TcKind -> TcM TcType
 tc_tuple rn_ty mode tup_sort tys exp_kind
-  = do { edt <- xoptM LangExt.ExperimentalDependentTypes
+  = do { edt <- xoptM LangExt.DependentTypes
        ; arg_kinds <- case tup_sort of
            BoxedTuple      -> return (replicate arity liftedTypeKind)
            UnboxedTuple
@@ -3565,7 +3565,7 @@ tcTermAppInType mode rn_ty exp_kind
       | L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr rdr name))) <- hs_fun_ty
       = if isVarName name && isExternalName name
           then do
-            enabled <- xoptM LangExt.ExperimentalDependentTypes
+            enabled <- xoptM LangExt.DependentTypes
             if enabled
               then setSrcSpanA loc (dispatch_term_head rdr name)
               else tc_app_ty_generic mode rn_ty exp_kind
@@ -3713,14 +3713,24 @@ tcTermAppInType mode rn_ty exp_kind
       selected <- if not is_local && ordinary_call then checkedClassMethod fun args else pure Nothing
       case selected of
         Just check -> check
-        Nothing -> do
-          staging <- closedOperandStaging args
-          if isJust staging
-            then run_closed_tree (RunClosedFunction fun) args
-            else stage4_uninterp fun $
-                   if lengthIs args 1 && is_closed_retry_head (varType fun)
-                     then run_closed_tree (RunClosedFunction fun) args
-                     else unsupported name
+        Nothing
+          | not is_local -> do
+              let run_closed = run_closed_tree (RunClosedFunction fun) args
+              tc_plugins <- if ordinary_call then hasActiveTcPlugins else pure False
+              staging <- if tc_plugins then closedOperandStaging args else pure (Just True)
+              case staging of
+                Nothing -> stage4_uninterp fun run_closed
+                Just _
+                  | tc_plugins -> tryTcDiscardingErrs (stage4_uninterp fun run_closed) run_closed
+                  | otherwise  -> run_closed
+          | otherwise -> do
+              staging <- closedOperandStaging args
+              if isJust staging
+                then run_closed_tree (RunClosedFunction fun) args
+                else stage4_uninterp fun $
+                       if lengthIs args 1 && is_closed_retry_head (varType fun)
+                         then run_closed_tree (RunClosedFunction fun) args
+                         else unsupported name
 
     is_closed_retry_head fun_ty
       | (_, binders, rho) <- splitInvisPiTys fun_ty
@@ -3931,11 +3941,11 @@ tc_app_ty_runtime_head mode rn_ty exp_kind head_id
 {- Note [Captured term names in ordinary types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Under 'RequiredTypeArguments' (GHC Proposal #281, Eisenberg, 2020), a name in a
-type can resolve to a term. Without 'ExperimentalDependentTypes', keep that
+type can resolve to a term. Without 'DependentTypes', keep that
 occurrence on 'tc_app_ty_generic' so it reports the standard term-capture
 diagnostic.
 
-With 'ExperimentalDependentTypes', 'tcTermAppInType' routes applications in
+With 'DependentTypes', 'tcTermAppInType' routes applications in
 four deterministic stages without speculative backtracking:
   1. Scoped dictionary selectors ('ClassAppTy') and registered runtime function
      indices ('TermVarTy' / 'TermAppTy'),
@@ -4099,7 +4109,7 @@ tcObserveOpenTypeCall local indexed instantiated result_kind operands = do
             Nothing -> tcLookupId n
       dependencies <- forM used $ \(n, first) -> (, first) <$> lookup_owner n
       recordUnfoldedSourceUses dependencies
-      updTcRef (tcg_evaluated_term_uses env) (\seen -> seen `unionNameSet` constructors `unionNameSet` mkNameSet (map fst used))
+      updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = scs_evaluated_uses s `unionNameSet` constructors `unionNameSet` mkNameSet (map fst used) })
       pure (Right result)
 
 -- | Report an unavailable observation at the source call.
@@ -4442,20 +4452,35 @@ tcPlanClosedTree mode ordinary hint root arguments = do
                           else closedConstructorAlias arg
             unless eligible $ do
               declared <- liftZonkM (zonkTcType expected)
+              let scalars = [naturalTy, charTy, boolTy]
+                  cand_kinds = scalars ++ map mkListTy scalars
+                  matched_kinds = filter (isJust . tcMatchTy raw_dom) cand_kinds
+                  has_con_head = case splitHsAppTys (unLoc (ignoreParens arg)) of
+                    (L _ (HsTyVar _ _ (L _ (WithUserRdr _ c))), _) -> isDataConName c
+                    _ -> False
+                  var_or_field_reason
+                    | L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ var))) <- ignoreParens arg
+                    , isTyVarName var
+                    = "This argument is a type variable. Closed evaluation requires a known value."
+                    | otherwise
+                    = "Each constructor field must be a closed literal. This operand contains an open or unsupported field."
               if outer_call && is_unary && declared `tcEqType` charTy
                 then setSrcSpan call_loc $
                        failWithTc (TcRnClosedTypeEval name "The argument must be a closed Char literal, such as 'x'.")
                 else if outer_call && is_unary && declared `tcEqType` mkListTy naturalTy
                 then setSrcSpan call_loc $
                        failWithTc (TcRnClosedTypeEval name "The argument must be a closed list of Natural literals, such as '[1, 2, 3].")
-                else do
-                  let reason
-                        | L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ var))) <- ignoreParens arg
-                        , isTyVarName var
-                        = "This argument is a type variable. Closed evaluation requires a known value."
-                        | otherwise
-                        = "Each constructor field must be a closed literal. This operand contains an open or unsupported field."
-                  failWithTc (TcRnClosedTypeEval name reason)
+                else if outer_call && is_unary && isNothing lit_kind
+                then case matched_kinds of
+                       [inp] -> do
+                         dflags <- getDynFlags
+                         failWithTc (TcRnClosedTypeEval name ("The argument must be a closed literal of kind " ++ showPpr dflags inp ++ "."))
+                       [] | has_con_head -> failWithTc (TcRnClosedTypeEval name var_or_field_reason)
+                          | otherwise    -> setSrcSpan call_loc (failWithTc (TcRnNoSourceTable name))
+                       inps -> do
+                         dflags <- getDynFlags
+                         failWithTc (TcRnClosedTypeEval name ("The argument must be a closed literal of one of these kinds: " ++ intercalate ", " (map (showPpr dflags) inps) ++ "."))
+                else failWithTc (TcRnClosedTypeEval name var_or_field_reason)
             unless (bare_empty arg) $
               forM_ lit_kind $ \actual -> do
                 when outer_call $ do
@@ -4630,7 +4655,7 @@ tcPlanClosedTree mode ordinary hint root arguments = do
             recordSourceUses [(fun, Nothing)]
             ordinal <- readTcRef (tcg_zany_n env)
             updTcRef (tcg_zany_n env) (+ 1)
-            updTcRef (tcg_evaluated_term_uses env) (`extendNameSet` tyConName field)
+            updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = extendNameSet (scs_evaluated_uses s) (tyConName field) })
             let mod = tcg_semantic_mod env
                 key = mkStrLitTy (fsLit (show (unitString (moduleUnit mod),
                                                moduleNameString (moduleName mod), ordinal)))
@@ -6635,7 +6660,7 @@ tcSomeTypeInHsType
   :: TcTyMode -> HsType GhcRn -> Name -> LHsType GhcRn -> SrcSpan
   -> LocatedN Name -> LHsType GhcRn -> ExpKind -> TcM TcType
 tcSomeTypeInHsType mode rn_ty sigma_nm dom_hs lam_loc bndr body_hs exp_kind = do
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  enabled <- xoptM LangExt.DependentTypes
   unless enabled $
     failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
   (site, in_kc) <- classifySynthSite mode
@@ -6795,7 +6820,7 @@ tcHsTypeLambda
   -> TcTyMode -> HsType GhcRn -> [LocatedN Name] -> LHsType GhcRn
   -> ExpKind -> TcM TcType
 tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  enabled <- xoptM LangExt.DependentTypes
   unless enabled $ failWithTc TcRnTypeLambdaDisabled
   level <- getThLevel
   case (level, mb_pre_syn) of
@@ -6843,7 +6868,7 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
         else build_case_lambda gbl_site site wrap_syn_mb fam_name root_fam lam_loc
                (zip mid_skols mid_invis_specs) z_skols dom_kinds res_kind scrut_col checked_rows
     Nothing -> do
-      track_proofs <- xoptM LangExt.ExperimentalDependentTypes
+      track_proofs <- xoptM LangExt.DependentTypes
       ax_probe <- newImplicitBinder fam_name mkInstTyCoOcc
       (body_ty0, proof_deps) <- solve_if_tc $ addErrCtxt (TyConDeclCtxt fam_name ClosedTypeFamilyFlavour) $
         extend_lam $
@@ -6971,7 +6996,7 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
             fn  <- mk_g ("$lambda:" ++ occNameString c_occ ++ ":" ++ show idx)
             pure (Nothing, fn, fn, cf_nm)
           SynthOpenFamInst of_nm -> do
-            u_occ <- chooseUniqueOccTc (mkInstTyTcOcc ("$callback:" ++ occNameString (nameOccName of_nm)))
+            u_occ <- chooseUniqueOccTc (mkInstTyTcOcc ("$callback:" ++ occNameString (nameOccName of_nm) ++ ":"))
             fn    <- newGlobalBinder cur_mod u_occ Nothing loc
             pure (Nothing, fn, fn, fn)
           SynthExprT2T -> do
@@ -7089,7 +7114,7 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
       finish_lambda_app site wrap_syn_mb fam_tc p_invis p_vis (map res_rec cap_args0)
 
     check_lambda_case_rows solve_row body_mode fam_name mid_skols0 z_skols0 dom_kinds0 scrut_col scrut_nm res_kind0 rows = do
-      raw_fields <- xoptM LangExt.ExperimentalDependentTypes
+      raw_fields <- xoptM LangExt.DependentTypes
       pat_mode   <- mkHoleMode TypeLevel (HM_FamPat raw_fields)
       let pat_mode' = pat_mode { mode_indices = mode_indices body_mode }
           init_in_scope = mkInScopeSet (tyCoVarsOfTypes (res_kind0 : dom_kinds0 ++ map tyVarKind (mid_skols0 ++ z_skols0)))
@@ -7209,7 +7234,7 @@ tcHsTypeCase
   -> [([Name], LHsType GhcRn, LHsType GhcRn)]
   -> ExpKind -> TcM TcType
 tcHsTypeCase mode src scrut_hs rows exp_kind = do
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  enabled <- xoptM LangExt.DependentTypes
   unless enabled $ failWithTc TcRnTypeCaseDisabled
   level <- getThLevel
   case level of
@@ -7236,8 +7261,10 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
         case_loc <- getSrcSpanM
         (wrap_syn_mb, owner_for_nodes, fam_name, is_scoped_sig) <- alloc_case_names in_kc site case_loc
         res_k0 <- expTypeToType exp_kind >>= liftZonkM . zonkTcType
-        (pat_scrut_k0, fam_abs_pairs0) <- abstract_scrut_fam_apps fam_name scrut_k
-        raw_fields <- xoptM LangExt.ExperimentalDependentTypes
+        fam_envs <- tcGetFamInstEnvs
+        let Reduction _ scrut_k_norm = normaliseType fam_envs Nominal scrut_k
+        (pat_scrut_k0, fam_abs_pairs0) <- abstract_scrut_fam_apps fam_name scrut_k_norm
+        raw_fields <- xoptM LangExt.DependentTypes
         pat_mode   <- mkHoleMode TypeLevel (HM_FamPat raw_fields)
         let pat_mode' = pat_mode { mode_indices = mode_indices mode }
             solve_if_tc = if in_kc then id else solveEqualities "tcHsTypeCase"
@@ -7246,7 +7273,11 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
               _ -> Nothing
         raw_rows <- solve_if_tc $ addErrCtxt (TyConDeclCtxt fam_name ClosedTypeFamilyFlavour) $
           forM rows $ \(pat_nms, pat_hs, rhs_hs) -> do
-            let rloc = combineSrcSpans (getLocA pat_hs) (getLocA rhs_hs)
+            let rloc
+                  | isGoodSrcSpan (getLocA pat_hs), isGoodSrcSpan (getLocA rhs_hs)
+                  = combineSrcSpans (getLocA pat_hs) (getLocA rhs_hs)
+                  | isGoodSrcSpan (getLocA pat_hs) = getLocA pat_hs
+                  | otherwise                      = case_loc
             setSrcSpan rloc $ do
               pat_tvs <- mapM (\nm -> newMetaKindVar >>= newPatTyVar nm) pat_nms
               tcExtendNameTyVarEnv (zip pat_nms pat_tvs) $ do
@@ -7321,23 +7352,26 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
                 abs_col  = length fam_invis + length p_vis
                 cap_tvs        = map fst fam_invis ++ p_vis
                 orig_bound_set = mkVarSet ([tv | TyVarTy tv <- cap_args0] ++ map fst fam_abs_pairs)
-            built_rows <- forM checked_rows $ \(rloc, pat_hs, _, pat_ty0, rhs_ty0, deps) -> do
-              let pat_vs = scopedSort $
+            built_rows <- forM checked_rows $ \(rloc, pat_hs, pat_tvs', pat_ty0, rhs_ty0, deps) -> do
+              let user_pat_set = mkVarSet pat_tvs'
+                  pat_vs = scopedSort $
                              filterOut (\v -> isId v || v `elemVarSet` orig_bound_set) $
                                tyCoVarsOfTypesList [pat_ty0, rhs_ty0]
-              (subst_p, _) <- mapAccumLM (\s tv -> do
-                nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv))))
+              (subst_p, pat_pairs) <- mapAccumLM (\s tv -> do
+                let occ = mkTyVarOccFS (occNameFS (nameOccName (getName tv)))
+                nm <- (\u -> mkInternalName u occ rloc) <$> newUnique
                 let ki  = res_rec (replaceTypeTermIds id_env (Subst.substTy s (tyVarKind tv)))
                     tv' = mkTyVar nm ki
-                pure (Subst.extendTvSubstAndInScope s tv (mkTyVarTy tv'), tv')) subst_c pat_vs
+                pure (Subst.extendTvSubstAndInScope s tv (mkTyVarTy tv'), (tv, tv'))) subst_c pat_vs
               let sub_row = res_rec . replaceTypeTermIds id_env . Subst.substTy subst_p
                   pat_ty' = sub_row pat_ty0
                   rhs_ty' = sub_row rhs_ty0
                   lhs_tys = mkTyVarTys cap_tvs ++ [pat_ty']
                   qtvs    = scopedSort (tyCoVarsOfTypesList (rhs_ty' : lhs_tys))
+                  non_usr = mkVarSet [tv' | (tv, tv') <- pat_pairs, not (tv `elemVarSet` user_pat_set)]
                   vi      = VI { vi_loc = rloc
                                , vi_qtvs = qtvs
-                               , vi_non_user_tvs = emptyVarSet
+                               , vi_non_user_tvs = non_usr
                                , vi_pats = lhs_tys
                                , vi_case_pattern = Just (owner_for_nodes, abs_col, sourceCasePatternRn pat_hs, pat_ty')
                                , vi_rhs = rhs_ty' }
@@ -7943,7 +7977,7 @@ synthCheckedPattern path (CasePatternConstructor sp _ fields) ty =
 -- See Note [Matchability forgetfulness in visible type applications].
 tcForgetMatchabilityArrows :: CtOrigin -> TcType -> TcKind -> TcKind -> TcM (Maybe TcType)
 tcForgetMatchabilityArrows origin res_ty act_kind0 exp_kind0 = do
-  dep <- xoptM LangExt.ExperimentalDependentTypes
+  dep <- xoptM LangExt.DependentTypes
   if not dep
     then pure Nothing
     else do
@@ -8229,7 +8263,7 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
 
            AGlobal AnId{}    -> promotionErr name TermVariablePE
            ATcId { tct_id = v } ->
-             do { dep <- xoptM LangExt.ExperimentalDependentTypes
+             do { dep <- xoptM LangExt.DependentTypes
                 ; mb_rep <- if dep
                             then tcTypeRepTarget_maybe (varType v)
                             else pure Nothing
@@ -8255,7 +8289,7 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
       = do { unless (null (dataConRepArgBinders dc) || dataConHasPromotedRetained dc) $
                failWithTc $ TcRnRetainedQuantificationError RetainedPackagePromotion
            ; when (isDataFamInstTyCon (dataConTyCon dc)) $
-               do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+               do { enabled <- xoptM LangExt.DependentTypes
                   ; unless (enabled && canPromoteDataFamilyCon dc) $
                       promotionErr name FamDataConPE }
            ; let (_, _, _, theta, _, _) = dataConFullSig dc
@@ -8270,7 +8304,7 @@ tcTyVar mode name      -- Could be a tyvar, a tycon, or a datacon
                  unless ubx $
                    failWithTc $
                      TcRnUnboxedTupleOrSumTypeFuncArg UnboxedTupleType (mkTyConTy tc)
-                 edt <- xoptM LangExt.ExperimentalDependentTypes
+                 edt <- xoptM LangExt.DependentTypes
                  if edt
                    then do
                      let arity = dataConSourceArity dc
@@ -9693,7 +9727,7 @@ primFamilyPatKinds fam pats
 -- | Enable the raw binder judgment only in an opted-in closed family equation.
 primFamilyPatEnabled :: TyCon -> TcM Bool
 primFamilyPatEnabled fam
-  | ClosedTypeFamilyFlavour <- tyConFlavour fam = xoptM LangExt.ExperimentalDependentTypes
+  | ClosedTypeFamilyFlavour <- tyConFlavour fam = xoptM LangExt.DependentTypes
   | otherwise = return False
 
 -- | Recognize a written reference to the constructor's primitive field kind.
@@ -10702,7 +10736,7 @@ tcHsPartialSigType call_owner ctxt sig_ty
   , (hs_ctxt, hs_tau) <- splitLHsQualTy body_ty
   = addSigCtxt ctxt (UserLHsSigType sig_ty) $
     do { mode0 <- mkHoleMode TypeLevel HM_Sig
-       ; experimental <- xoptM LangExt.ExperimentalDependentTypes
+       ; experimental <- xoptM LangExt.DependentTypes
        ; ambient <- if experimental
                     then tcRetainedAmbientIndices RetainedLocalSignatureIndex body_ty
                     else pure emptyNameEnv
@@ -11062,7 +11096,7 @@ tc_type_in_pat ctxt mb_skol hole_mode hs_ty wcs ns ctxt_kind
                bindNamedWildCardBinders wcs $ \ wcs ->
                tcExtendNameTyVarEnv tkv_prs $
                do { ek <- newExpectedKind ctxt_kind
-                  ; experimental <- xoptM LangExt.ExperimentalDependentTypes
+                  ; experimental <- xoptM LangExt.DependentTypes
                   ; mode <- case ctxt of
                       RuleBndrTypeCtxt{} -> do
                         indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex hs_ty

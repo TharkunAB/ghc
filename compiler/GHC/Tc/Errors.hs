@@ -1803,7 +1803,7 @@ instance Outputable DependentCaseSplitHint where
 dependentHoleHints :: SolverReportErrCtxt -> CtLocEnv -> Hole -> ValidHoleFits -> TcM [GhcHint]
 dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_ty })
                    (ValidHoleFits { holeFits = Fits direct_fits _ })
-  = do { dep_exts <- xoptM LangExt.ExperimentalDependentTypes
+  = do { dep_exts <- xoptM LangExt.DependentTypes
        ; home_mod <- tcg_mod <$> getGblEnv
        ; if not dep_exts || has_direct_fit home_mod
          then return noHints

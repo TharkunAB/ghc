@@ -1,21 +1,21 @@
 NativeTypeLetQuoteBadRhs.hs:4:16: error: [GHC-83865]
     • Expected kind ‘* %GHC.Internal.Types.Matchable -> k0’,
         but ‘Int’ has kind ‘*’
-    • In the type ‘(let b_a1rl = Int Bool in Int)’
+    • In the type ‘(let b_a1r5 = Int Bool in Int)’
       In the type synonym declaration for ‘BadRhs’
 
 NativeTypeLetQuoteBadRhs.hs:5:17: error: [GHC-83865]
-    • Expected kind ‘(a0, b0)’, but ‘pair_a1qq’ has kind ‘*’
+    • Expected kind ‘(a0, b0)’, but ‘pair_a1qa’ has kind ‘*’
     • In the first argument of ‘ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst’, namely
-        ‘pair_a1qq’
-      In the type ‘(let pair_a1qq = Bool in let __a1qr = ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst pair_a1qq in Int)’
+        ‘pair_a1qa’
+      In the type ‘(let pair_a1qa = Bool in let __a1qb = ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst pair_a1qa in Int)’
       In the type synonym declaration for ‘NonPair’
 
 NativeTypeLetQuoteBadRhs.hs:6:23: error: [GHC-83865]
-    • Expected kind ‘(a1, b1)’, but ‘pair_a1pz’ has kind ‘*’
+    • Expected kind ‘(a1, b1)’, but ‘pair_a1pj’ has kind ‘*’
     • In the first argument of ‘ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst’, namely
-        ‘pair_a1pz’
-      In the type ‘(let pair_a1py = '(Bool,
-                                      Char) in let pair_a1pz = ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst pair_a1py in let __a1pA = ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst pair_a1pz in Int)’
+        ‘pair_a1pj’
+      In the type ‘(let pair_a1pi = '(Bool,
+                                      Char) in let pair_a1pj = ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst pair_a1pi in let __a1pk = ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst pair_a1pj in Int)’
       In the type synonym declaration for ‘NonNestedPair’
 

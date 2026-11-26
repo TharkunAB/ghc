@@ -4,3 +4,21 @@ NativeOpenListFoldrStrictFail.hs:13:44: error: [GHC-70565]
     • In the type ‘F.forceBitStep k z xs’
       In the type synonym declaration for ‘StrictBitStep’
 
+NativeOpenListFoldrStrictFail.hs:16:44: error: [GHC-70565]
+    • Cannot evaluate ‘F.forceBitSeed’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘F.forceBitSeed k z xs’
+      In the type synonym declaration for ‘StrictBitSeed’
+
+NativeOpenListFoldrStrictFail.hs:19:42: error: [GHC-70565]
+    • Cannot evaluate ‘F.forceStep’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘F.forceStep k z xs’
+      In the type synonym declaration for ‘StrictPolyStep’
+
+NativeOpenListFoldrStrictFail.hs:22:42: error: [GHC-70565]
+    • Cannot evaluate ‘F.forceSeed’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘F.forceSeed k z xs’
+      In the type synonym declaration for ‘StrictPolySeed’
+

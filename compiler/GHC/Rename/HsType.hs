@@ -159,7 +159,7 @@ data HsPatSigTypeScoping
     -- "GHC.Hs.Type".
 
 -- | Rename a local signature with aliases for already-scoped term Names.
--- The caller checks ExperimentalDependentTypes and LocalBindCtxt.
+-- The caller checks DependentTypes and LocalBindCtxt.
 -- See Note [Local retained signature aliases].
 rnLocalHsSigWcType :: NameSet -> HsDocContext -> LHsSigWcType GhcPs
                   -> RnM (LHsSigWcType GhcRn, FreeNames)
@@ -188,7 +188,7 @@ withWrittenSignatureKinds _ action = action
 rnHsTypeApp :: LHsWcType GhcPs
             -> RnM (LHsWcType GhcRn, Maybe HsAppTypeSource, FreeNames)
 rnHsTypeApp ty@(HsWC { hswc_body = hs_ty })
-  = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+  = do { experimental <- xoptM LangExt.DependentTypes
        ; (argument, fvs) <- if experimental
            then do { free_vars <- filterInScopeM (extractHsTyRdrTyVars hs_ty)
                    ; rnWithRetainedAliases emptyNameSet RetainedPartialTypeArgument free_vars hs_ty $
@@ -288,7 +288,7 @@ renamedRetainedWildcardSpan thing
 
 {- Note [Runtime indices in visible type arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-With ExperimentalDependentTypes, a complete visible type argument can refer to
+With DependentTypes, a complete visible type argument can refer to
 an already-bound runtime index, for example f @(Vec Int n). Use the same lexical
 aliases as complete local signatures. Keep the actual term Name and Unique.
 Existing erased type variables take precedence. Do not capture named wildcards,
@@ -342,7 +342,7 @@ rnHsSigWcType :: HsDocContext
               -> RnM (LHsSigWcType GhcRn, FreeNames)
 rnHsSigWcType doc (HsWC { hswc_body =
     sig_ty@(L loc (HsSig{sig_bndrs = outer_bndrs, sig_body = body_ty })) })
-  = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+  = do { experimental <- xoptM LangExt.DependentTypes
        ; free_vars <- filterInScopeM (extract_lhs_sig_ty sig_ty)
        ; (nwc_rdrs', imp_tv_nms) <- partition_nwcs free_vars
        ; let nwc_rdrs = nubL nwc_rdrs'
@@ -420,7 +420,7 @@ rnRetainedTelescope :: RnTyKiEnv
                     -> [LHsTyVarBndr () GhcPs] -> a
                     -> RnM (([LHsTyVarBndr () GhcRn], b), FreeNames)
 rnRetainedTelescope env rn_body bndrs body
-  = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+  = do { experimental <- xoptM LangExt.DependentTypes
        ; unless (experimental && not (isRnKindLevel env)) $
            failWithTc TcRnRetainedQuantificationNotImplemented
        ; level <- getThLevel
@@ -621,7 +621,7 @@ rnHsWcType ctxt (HsWC { hswc_body = hs_ty })
 rnWcBodyTyKi :: TypeOrKind -> HsDocContext -> [LocatedN RdrName] -> LHsType GhcPs
              -> RnM ([Name], LHsType GhcRn, FreeNames)
 rnWcBodyTyKi level ctxt nwc_rdrs hs_ty
-  = do { experimental <- xoptM LangExt.ExperimentalDependentTypes
+  = do { experimental <- xoptM LangExt.DependentTypes
        ; let pi_argument = experimental && TypeLevel == level &&
                  case ctxt of
                    HsTypeCtx -> hasParsedRetainedPi hs_ty
@@ -1231,7 +1231,7 @@ rnHsTyKi env ty@(XHsType (HsBangTy _ bang (L _ inner))) = do
 
 -- See Note [Renaming type lambdas and type cases].
 rnHsTyKi env (XHsType (HsTypeLambda _ binders body)) = do
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  enabled <- xoptM LangExt.DependentTypes
   unless enabled $ failWithTc TcRnTypeLambdaDisabled
   when (isRnKindLevel env || null binders) $ failWithTc TcRnTypeLambdaContext
   level <- getThLevel
@@ -1303,7 +1303,7 @@ rnHsTyKi _ (XHsType HsTypeLambdaCheck{}) = failWithTc TcRnTypeLambdaContext
 -- via 'HsTypeLambdaQuoteRn'.
 -- See Note [Post-renaming lowering of lambdas, sums, and cases] in GHC.Tc.Gen.HsType.
 rnHsTyKi env (XHsType (HsTypeSome _ binder domain body)) = do
-  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  experimental <- xoptM LangExt.DependentTypes
   unless (experimental && not (isRnKindLevel env)) $
     failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
   level <- getThLevel
@@ -1348,7 +1348,7 @@ rnHsTyKi _ (XHsType HsTypeCaseAlias{}) = failWithTc TcRnTypeCaseContext
 
 rnHsTyKi env (XHsType let_ty@(HsTypeLet (let_kw, _) _ _ binds result)) = do
   let (binder, rhs, body) = splitHsTypeLet binds result
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  enabled <- xoptM LangExt.DependentTypes
   unless enabled $
     setSrcSpan (getEpTokenSrcSpan let_kw) $ failWithTc TcRnTypeLetDisabled
   (rhs', rhs_fvs) <- rnLHsTyKi env rhs
@@ -1369,7 +1369,7 @@ rnHsTyKi env (XHsType (HsTypeLetProductCheck con arity rhs)) = do
   pure (XHsType (HsTypeLetProductCheckRn con' arity rhs'), extendNameSet rhs_fvs (unLoc con'))
 
 rnHsTyKi env whole@(XHsType (HsTypeCase (case_kw, _) _ scrutinee alts)) = do
-  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  enabled <- xoptM LangExt.DependentTypes
   let case_span = getEpTokenSrcSpan case_kw
   unless enabled $ setSrcSpan case_span $ failWithTc TcRnTypeCaseDisabled
   rows <- forM alts $ \(L _ (HsTypeCaseAlt pat _ rhs)) ->
@@ -1705,7 +1705,7 @@ throw an error accordingly.
 -- See Note [Unquoted constructors in symbolic source operands].
 rnHsAppTy :: RnTyKiEnv -> (Bool, Bool) -> LHsType GhcPs -> LHsType GhcPs -> RnM (HsType GhcRn, FreeNames)
 rnHsAppTy env (eligible, has_sym) fun arg = do
-  dependent <- xoptM LangExt.ExperimentalDependentTypes
+  dependent <- xoptM LangExt.DependentTypes
   let parsed_var rdr = isRdrTyVar rdr || isVarOcc (rdrNameOcc rdr)
       parsed_open = isOpenTypeOperandWith parsed_var (isDataOcc . rdrNameOcc) arg
       parsed_closed_con = isClosedConOperand (isDataOcc . rdrNameOcc) arg
@@ -2634,7 +2634,7 @@ rnRetainedHsRecordFields result ctxt fls
   , plain_field first_field
   , let witness = mkRdrUnqual (setOccNameSpace tvName (rdrNameOcc (unLoc name)))
   , all (uses_witness witness) rest
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; field_selectors <- xoptM LangExt.FieldSelectors
        ; strict <- xoptM LangExt.StrictData
        ; duplicate_fields <- xoptM LangExt.DuplicateRecordFields
@@ -2675,7 +2675,7 @@ rnRetainedHsRecordFields _ _ _ _ = pure Nothing
 
 {- Note [Named retained record fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-With ExperimentalDependentTypes, the first field of a Haskell98
+With DependentTypes, the first field of a Haskell98
 record can bind its stored value in later field types. Use the same
 renaming scope as foreach. The first field's type is outside that scope.
 An existing type variable takes precedence. GADT records retain their
@@ -3291,7 +3291,7 @@ filterInScopeNonClassM cls_tvs vars
 filterGadtConTyVars :: ConDecl GhcPs -> FreeKiTyVars -> RnM FreeKiTyVars
 filterGadtConTyVars _ [] = return []
 filterGadtConTyVars decl vars = do
-  dependent <- xoptM LangExt.ExperimentalDependentTypes
+  dependent <- xoptM LangExt.DependentTypes
   if dependent
     then do { envs <- getRdrEnvs
             ; return (filterOut (already_bound envs . unLoc) vars) }
@@ -3331,7 +3331,7 @@ Consider a module that defines a term function step and declares
   data Witness (target :: Term) where
     W :: Witness (step t)
 
-With ExperimentalDependentTypes, step refers to the existing function.
+With DependentTypes, step refers to the existing function.
 Only t is implicitly quantified if its name is free in both namespaces.
 Quantifying step as well would let a caller choose a different function
 with visible type application. Resolve names before checking whether GHC
@@ -3345,7 +3345,7 @@ term lookup when a free occurrence is an application head in the
 signature. Compare occurrence locations to ignore shadowed applications.
 
 An explicit forall still binds its names. Modules that do not enable
-ExperimentalDependentTypes keep the usual GADT implicit binders.
+DependentTypes keep the usual GADT implicit binders.
 -}
 
 -- | Exclude finite source functions before binding implicit type variables.
@@ -3354,7 +3354,7 @@ ExperimentalDependentTypes keep the usual GADT implicit binders.
 filterSourceTableNames :: (GlobalRdrEnv, LocalRdrEnv) -> FreeKiTyVars -> RnM FreeKiTyVars
 filterSourceTableNames _ [] = return []
 filterSourceTableNames envs@(_, lcl) vars = do
-  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  experimental <- xoptM LangExt.DependentTypes
   if experimental then filterM implicit vars else return vars
   where
     implicit (L _ rdr)

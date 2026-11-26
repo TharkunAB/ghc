@@ -1,13 +1,19 @@
 NativeTypeCaseRecursiveIndex.hs:14:3: error: [GHC-79642]
-    Cannot determine which constructors are possible at this scrutinee kind:
-      Gate Bool True
+    • Cannot determine which constructors are possible at this scrutinee kind:
+        Gate Bool True
+    • In the type ‘case d of {'Just ('Known 'True) -> Int;
+                              'Just _ -> Bool;
+                              'Nothing -> ()}’
+      In the type synonym declaration for ‘Pick’
 
 NativeTypeCaseRecursiveIndex.hs:19:8: error: [GHC-40404]
     • Reduction stack overflow; size = 9
       When simplifying the following type: Loop True
     • In the first argument of ‘'Just’, namely ‘'Recursive’
-      When checking the type case in ‘Overflow’, at ‘'Just 'Recursive’
       In the type case in ‘Overflow’
+      In the type ‘case d of {'Just 'Recursive -> Int;
+                              'Just _ -> Bool;
+                              'Nothing -> ()}’
     Suggested fix:
       Use -freduction-depth=0 to disable this check
       (any upper bound you could choose might fail unpredictably with

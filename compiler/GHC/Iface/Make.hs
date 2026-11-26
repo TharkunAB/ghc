@@ -295,9 +295,10 @@ mkRecompUsageInfo hsc_env tc_result = do
   if not (gopt Opt_WriteSelfRecompInfo dflags)
     then return Nothing
     else do
-     tables <- readIORef (tcg_source_table_uses tc_result)
-     evaluated_terms <- readIORef (tcg_evaluated_term_uses tc_result)
-     home_rule_deps <- readIORef (tcg_home_rule_dependencies tc_result)
+     scs <- readIORef (tcg_source_check tc_result)
+     let tables = scs_table_uses scs
+         evaluated_terms = scs_evaluated_uses scs
+         home_rule_deps = scs_home_rule_deps scs
      let used_names = mkUsedNames tc_result `unionNameSet` tables `unionNameSet` evaluated_terms
      dep_files <- (readIORef (tcg_dependent_files tc_result))
      dep_dirs  <- (readIORef (tcg_dependent_dirs tc_result))

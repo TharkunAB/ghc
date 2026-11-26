@@ -1,5 +1,10 @@
-NativeClosedComputedPairRepeatPartial.hs:17:10: error: [GHC-83605]
-    • A rewrite rule can change the result of ‘pickLocal’, which GHC uses to check a dependent type.
-    • In the expression: x
-      In an equation for ‘same’: same x = x
+NativeClosedComputedPairRepeatPartial.hs:16:23: error: [GHC-70565]
+    • Cannot evaluate ‘W.bump’ in a type.
+        unread
+        
+        HasCallStack backtrace:
+          error, called at ./ComputedPair.hs:8:18 in main:ComputedPair
+    • In the first argument of ‘N’, namely ‘(pickLocal (W.bump 7))’
+      In the type signature:
+        same :: N (pickLocal (W.bump 7)) -> N (pickLocal (W.bump 7))
 

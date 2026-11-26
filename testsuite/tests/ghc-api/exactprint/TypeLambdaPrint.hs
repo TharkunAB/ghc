@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 module TypeLambdaPrint where
 
 type L = Map (\ {- binder -} f  -> {- body -} f Int)

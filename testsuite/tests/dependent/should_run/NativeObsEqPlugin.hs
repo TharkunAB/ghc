@@ -1,22 +1,22 @@
-{-# LANGUAGE DependentTypes, ListTuplePuns #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, ListTuplePuns #-}
 {-# OPTIONS_GHC -fplugin=Dependent.Plugin.ObsEq #-}
 
 module Main (main) where
 
 import Data.Type.Equality ( (:~:) (Refl), gcastWith, sym )
 import Dependent.ObsEq
-  ( Gen
-  , ObsConfig (..)
-  , chooseInt
+  ( ObsConfig
+  , castEq
+  , checkObsEq
   , defaultObsConfig
   , obsEq
-  , obsEqGen
-  , obsEqWith
-  , withObsEq
-  , withObsEqWith
-  , withPartialPct
-  , withTests
-  , withTimeoutUs
+  , setApproxDepth
+  , setMaxSize
+  , setPartialPct
+  , setTests
+  , setTimeoutUs
+  , totalObsConfig
+  , usingEq
   )
 import ObsProvider ( Nat (..), natToInt, plus, stepUnfoldAdd, whileAdd )
 
@@ -61,68 +61,33 @@ mc91Spec n
   | n > 100 = n - 10
   | otherwise = 91
 
--- 2. Domain-restricted functions for obsEqGen & obsEqWith.
-evenOnly :: Int -> Int
-evenOnly n
-  | even n = (n `quot` 2) * 2
-  | otherwise = n + 1
-
-evenPairSum :: Int -> Int -> Int
-evenPairSum a b = evenOnly a + evenOnly b
-
-rawPairSum :: Int -> Int -> Int
-rawPairSum a b = a + b
-
-genEvenInt :: Gen Int
-genEvenInt = (* 2) <$> chooseInt (-60, 60)
-
-genEvenPair :: (Gen Int, Gen Int)
-genEvenPair = (genEvenInt, genEvenInt)
-
 cfgTotal200 :: ObsConfig
-cfgTotal200 = ObsConfig {obsTests = 200, obsMaxSize = 16, obsApproxDepth = 10, obsPartialPct = 0, obsTimeoutUs = 20000, obsSeed = 0}
-
--- 3. Diverging function for bounded timeout agreement.
-loop :: Nat -> Nat
-loop n = loop n
-
-cfgFastTimeout :: ObsConfig
-cfgFastTimeout = withTests 6 (withTimeoutUs 1500 defaultObsConfig)
+cfgTotal200 = setTests 200 (setMaxSize 16 (setApproxDepth 10 (setTimeoutUs 20000 totalObsConfig)))
 
 -- Observational proofs (with partial-pct = 25 active by default!):
 localUnfoldLaw :: foreach (m :: Nat) (n :: Nat) -> localUnfoldAdd m n :~: plus m n
-localUnfoldLaw m n = obsEq
+localUnfoldLaw _m _n = obsEq
 
 importedUnfoldLaw :: foreach (m :: Nat) (n :: Nat) -> stepUnfoldAdd m n :~: plus m n
-importedUnfoldLaw m n = obsEq
+importedUnfoldLaw _m _n = obsEq
 
 mc91Law :: foreach (n :: Int) -> mc91 n :~: mc91Spec n
-mc91Law n = obsEq
+mc91Law _n = obsEq
 
--- Total-domain observational proofs via obsEqWith:
+-- Total-domain observational proofs via checkObsEq:
 accPlusLaw :: foreach (m :: Nat) (n :: Nat) -> accPlus m n :~: plus m n
-accPlusLaw m n = obsEqWith cfgTotal200
+accPlusLaw _m _n = checkObsEq cfgTotal200
 
 importedWhileLaw :: foreach (m :: Nat) (n :: Nat) -> whileAdd m n :~: plus m n
-importedWhileLaw m n = obsEqWith (withPartialPct 0 (withTests 200 defaultObsConfig))
+importedWhileLaw _m _n = checkObsEq (setPartialPct 0 (setTests 200 defaultObsConfig))
 
 collatzLaw :: foreach (n :: Nat) -> collatz n :~: Succ Zero
-collatzLaw n = obsEqWith cfgTotal200
+collatzLaw _n = checkObsEq cfgTotal200
 
 collatzLawInline :: foreach (n :: Nat) -> collatz n :~: Succ Zero
-collatzLawInline n = obsEqWith (withPartialPct 0 (withTests 120 defaultObsConfig))
+collatzLawInline _n = checkObsEq (setPartialPct 0 (setTests 120 defaultObsConfig))
 
--- Custom generator proofs (1-var and 2-var):
-evenLaw :: foreach (n :: Int) -> evenOnly n :~: n
-evenLaw n = obsEqGen genEvenInt
-
-evenPairLaw :: foreach (a :: Int) (b :: Int) -> evenPairSum a b :~: rawPairSum a b
-evenPairLaw a b = obsEqGen genEvenPair
-
-loopShiftLaw :: foreach (n :: Nat) -> loop n :~: loop (Succ n)
-loopShiftLaw n = obsEqWith cfgFastTimeout
-
--- Runtime indexed transport via withObsEq, withObsEqWith, and localUnfoldLaw:
+-- Runtime indexed transport via castEq, usingEq, gcastWith, and localUnfoldLaw:
 data Vec a (n :: Nat) where
   VNil :: Vec a Zero
   VCons :: a -> Vec a n -> Vec a (Succ n)
@@ -132,7 +97,7 @@ vSum VNil = 0
 vSum (VCons x xs) = x + vSum xs
 
 toUnfoldVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (localUnfoldAdd m n)
-toUnfoldVec m n v = withObsEq @(plus m n) @(localUnfoldAdd m n) @(Vec Int (localUnfoldAdd m n)) v
+toUnfoldVec _m _n v = castEq obsEq v
 
 fromUnfoldVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (localUnfoldAdd m n) -> Vec Int (plus m n)
 fromUnfoldVec m n v = case sym (localUnfoldLaw m n) of
@@ -142,18 +107,18 @@ roundtripUnfoldVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec
 roundtripUnfoldVec m n v = fromUnfoldVec m n (toUnfoldVec m n v)
 
 toAccVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (accPlus m n)
-toAccVec m n v = gcastWith (obsEqWith cfgTotal200 :: plus m n :~: accPlus m n) v
+toAccVec m n v = gcastWith (checkObsEq cfgTotal200 :: plus m n :~: accPlus m n) v
 
 fromAccVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (accPlus m n) -> Vec Int (plus m n)
-fromAccVec m n v = withObsEqWith cfgTotal200 @(accPlus m n) @(plus m n) @(Vec Int (plus m n)) v
+fromAccVec m n v = usingEq (accPlusLaw m n) v
 
 roundtripAccVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (plus m n)
 roundtripAccVec m n v = fromAccVec m n (toAccVec m n v)
 
-runIntChecks :: Int -> Int -> Int -> IO ()
-runIntChecks x e1 e2 =
-  case (mc91Law x, evenLaw e1, evenPairLaw e1 e2) of
-    (Refl, Refl, Refl) -> pure ()
+runIntChecks :: Int -> IO ()
+runIntChecks x =
+  case mc91Law x of
+    Refl -> pure ()
 
 main :: IO ()
 main = do
@@ -170,7 +135,7 @@ main = do
     then error "NativeObsEqPlugin: transport mismatch"
     else pure ()
 
-  runIntChecks 42 24 14
+  runIntChecks 42
 
-  case (importedUnfoldLaw two one, importedWhileLaw two one, collatzLaw two, collatzLawInline one, loopShiftLaw one) of
-    (Refl, Refl, Refl, Refl, Refl) -> pure ()
+  case (importedUnfoldLaw two one, importedWhileLaw two one, collatzLaw two, collatzLawInline one) of
+    (Refl, Refl, Refl, Refl) -> pure ()

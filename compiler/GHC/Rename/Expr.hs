@@ -393,7 +393,7 @@ rnExpr (HsAppType _ fun arg)
        ; return (HsAppType original fun' arg', fvFun `plusFN` fvArg) }
 
 rnExpr (HsAppRetained _ fun arg)
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; unless enabled $
            addErr (TcRnRetainedQuantificationError RetainedArgumentExtension)
        ; (fun', fv_fun) <- rnLExpr fun
@@ -586,7 +586,7 @@ rnExpr (RecordUpd { rupd_expr = L l expr, rupd_flds = rbinds })
 
 
 rnExpr (ExprWithTySig _ expr pty)
-  = do  { retained <- xoptM LangExt.ExperimentalDependentTypes
+  = do  { retained <- xoptM LangExt.DependentTypes
         ; (pty', fvTy) <- if retained
                           then rnLocalHsSigWcType emptyNameSet ExprWithTySigCtx pty
                           else rnScopedHsSigWcType ExprWithTySigCtx pty
@@ -762,7 +762,7 @@ Proposal #378 §4.9 allows runtime pattern matching `case a of` on a retained
 
 Because the parser builds `ConPat` and `ListPat` in the data constructor
 namespace, `lookupConCps` would reject `Int`, `Bool`, `Char`, or `Maybe` before
-the typechecker sees `a :: TypeRep a_tv`. When `-XExperimentalDependentTypes` is
+the typechecker sees `a :: TypeRep a_tv`. When `-XDependentTypes` is
 active, the scrutinee is a local variable, and at least one branch contains a
 top-level `EmbTyPat` or a `ConPat` head in scope in the type namespace rather
 than the data namespace, `rnTypeCaseMatchesMaybe` translates each non-catch-all
@@ -784,7 +784,7 @@ rnTypeCaseMatchesMaybe :: LHsExpr GhcRn
                        -> MatchGroup GhcPs (LHsExpr GhcPs)
                        -> RnM (Maybe (MatchGroup GhcRn (LHsExpr GhcRn), FreeNames))
 rnTypeCaseMatchesMaybe scrut matches@(MG { mg_alts = L lm alts, mg_ext = (origin, mann) }) = do
-  dep <- xoptM LangExt.ExperimentalDependentTypes
+  dep <- xoptM LangExt.DependentTypes
   case stripParensLHsExpr scrut of
     L _ (HsVar _ lname)
       | dep
@@ -3116,7 +3116,7 @@ rnHsUpdProjs us = do
 rnHsTypeAppOrQuote :: LHsWcType GhcPs
                    -> RnM (LHsWcType GhcRn, Maybe HsAppTypeSource, FreeNames)
 rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
-  experimental <- xoptM LangExt.ExperimentalDependentTypes
+  experimental <- xoptM LangExt.DependentTypes
   level <- getThLevel
   case (experimental, level, peel_type_lambda hs_ty) of
     (True, Comp, Just (lam_loc, binders, body)) -> do

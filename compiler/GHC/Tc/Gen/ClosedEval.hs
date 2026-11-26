@@ -35,7 +35,7 @@ import GHC.Driver.Session (safeInferOn, safeLanguageOn)
 import GHC.Hs
 
 import GHC.Tc.Errors.Types
-import {-# SOURCE #-} GHC.Tc.Gen.Expr (tcCheckMonoExpr)
+import GHC.Tc.Gen.Expr (tcCheckMonoExpr)
 import GHC.Tc.Gen.OpenTypeEval (readOpenDefinition, readOpenMethodWorker)
 import GHC.Tc.Gen.SourceTable (captureSourceMethodProof, closedSourceProofArgs)
 import GHC.Tc.Solver (simplifyTopNoDefaulting)
@@ -286,7 +286,7 @@ tcClosedCallValueShape owner kind = do
         [gre | (_, constructors) <- datatypes, con <- constructors
              , Just gre <- [closedImportedGRE (tcg_rdr_env env) con]
              , isImportedGRE gre]
-      updTcRef (tcg_evaluated_term_uses env) (`extendNameSetList` used)
+      updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) used })
       return (Just codec)
     Left err -> reportClosedShapeError owner err
 
@@ -778,7 +778,7 @@ tcPrepareClosedApplication fun domains result_kind rigid_args = do
         stable <- and <$> traverse closedRuleLeaf (worker : leaves)
         if stable then do
           env <- getGblEnv
-          updTcRef (tcg_evaluated_term_uses env) (`extendNameSetList` map idName (worker : leaves))
+          updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) (map idName (worker : leaves)) })
           pure (checked, leaves)
         else pure ([], [])
       captureSourceMethodProof dfun fun worker refined
@@ -819,6 +819,7 @@ prepareClosedFunction :: Id -> Type -> TcM (Core.CoreExpr, Maybe (Id, Id))
 prepareClosedFunction fun expected = do
   let name = idName fun
   tcPreflightClosedCall name
+  failIfErrsM
   (function, method) <- if idType fun `tcEqType` expected
                           then pure (Core.Var fun, Nothing)
                           else specializeClosedFunction fun expected
@@ -827,7 +828,7 @@ prepareClosedFunction fun expected = do
       "The closed call does not have the expected ordinary function type.")
   env <- getGblEnv
   unless (nameIsLocalOrFrom (tcg_semantic_mod env) name) $
-    updTcRef (tcg_evaluated_term_uses env) (`extendNameSet` name)
+    updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = extendNameSet (scs_evaluated_uses s) name })
   return (function, method)
 
 -- | Render and interpret a complete runtime expression at a type boundary.
@@ -853,6 +854,7 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
                     "lists, boxed pairs, Maybe, and Either of supported results, " ++
                     "or ordinary boxed datatypes with supported fields and imported constructors.")
   interp <- checkClosedTypeEvalStage hsc_env name
+  failIfErrsM
   render <- closedCallRenderer name shape
   ret_id <- lookupOrig gHC_INTERNAL_BASE returnIOIdOcc >>= tcLookupId
   io_tc <- lookupOrig gHC_TYPES (mkTcOcc "IO") >>= tcLookupTyCon
@@ -883,7 +885,7 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
             then hsc_env
             else hsc_env { hsc_IC = extendInteractiveContextWithIds (hsc_IC hsc_env) (map fst local_bco_binds) }
     unless (null local_bco_names) $
-      updTcRef (tcg_evaluated_term_uses gbl_env) (`extendNameSetList` local_bco_names)
+      updTcRef (tcg_source_check gbl_env) (\s -> s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) local_bco_names })
     compiled <- tryMostM $ liftIO $ do
       (local_links, local_pkgs) <-
         if needs_local_itbls
@@ -1092,10 +1094,11 @@ specializeClosedFunction fun expected = do
   when (any unavailable free) $
     failWithTc (TcRnClosedTypeEval name
       "The specialization uses an unfinished local binding or dictionary.")
-  updTcRef (tcg_evaluated_term_uses env)
-           (`extendNameSetList` [ getName v
-                                | v <- free, isGlobalId v
-                                , not (nameIsLocalOrFrom this_mod (getName v)) ])
+  updTcRef (tcg_source_check env) $ \s ->
+    s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s)
+          [ getName v
+          | v <- free, isGlobalId v
+          , not (nameIsLocalOrFrom this_mod (getName v)) ] }
   method <- closedMethodProof env fun free
   pure (core, method)
 
@@ -1182,7 +1185,7 @@ closedMethodProof env selector free
                  , Just (actual, [_]) <- [getClassPredTys_maybe (idType v)]
                  , cls == actual]
   = do
-      state <- readTcRef (tcg_source_rule_types env)
+      state <- scs_rule_uses <$> readTcRef (tcg_source_check env)
       case sourceProofSignature state of
         Nothing -> pure Nothing
         Just _ -> do
@@ -1362,7 +1365,7 @@ source arguments, so operand decoding checks the index equations directly.
 Use 'DataKinds' constructor identities in both directions. An interface can
 contain constructors hidden from the client. To inspect an unknown result,
 require and record non-SOURCE imports for every constructor that the renderer
-may inspect, and record the parent datatype in 'tcg_evaluated_term_uses'. For
+may inspect, and record the parent datatype in 'scs_evaluated_uses'. For
 a known operand, require and record only the selected constructors.
 
 Plan the result as a finite graph of instantiated datatypes. Exact repeats
@@ -1388,7 +1391,7 @@ single constructor-tagged S-expression codec over 'ClosedData' and 'ClosedRef'.
 
 For an overloaded producer, specialize the occurrence with the splice solver
 with defaulting disabled and local dictionary references rejected. Record
-evaluated global names in 'tcg_evaluated_term_uses' before simplification and
+evaluated global names in 'scs_evaluated_uses' before simplification and
 record loaded linkables through 'recordThNeededRuntimeDeps' (see Note [Object
 File Dependencies] in "GHC.HsToCore.Usage").
 -}
@@ -1445,11 +1448,10 @@ tcHasClosedCallExecutable name = do
 -- | Check policy at the location where the call occurs.
 tcCheckClosedCallContext :: Name -> TcM ()
 tcCheckClosedCallContext name = do
-  failIfErrsM
   dflags <- getDynFlags
   let reject = failWithTc . TcRnClosedTypeEval name
-  unlessXOptM LangExt.ExperimentalDependentTypes $
-    reject "Compile-time evaluation in types requires ExperimentalDependentTypes."
+  unlessXOptM LangExt.DependentTypes $
+    reject "Compile-time evaluation in types requires DependentTypes."
   when (safeLanguageOn dflags) $
     reject "Safe Haskell disallows executing imported functions in types."
   level <- getThLevel

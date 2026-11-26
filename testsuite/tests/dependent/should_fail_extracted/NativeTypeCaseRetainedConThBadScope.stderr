@@ -1,5 +1,5 @@
 NativeTypeCaseRetainedConThBadScope.hs:7:2: error: [GHC-28709]
-    Malformed type IndexVarT b_6989586621679015588
+    Malformed type IndexVarT b_6989586621679015564
     When splicing a TH declaration:
       data BadScope where
     BadScope :: (NativeTypeCaseRetainedConThProvider.Select b_0) %'GHC.Internal.Types.One ->

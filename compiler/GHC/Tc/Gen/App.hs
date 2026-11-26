@@ -67,7 +67,7 @@ import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Utils ( applyTypeToArgs, exprType, isVacuousRetainedBinder )
 import GHC.Core.FVs ( exprFreeVars, exprFreeVarsList )
 import GHC.Core.InstEnv ( lookupUniqueInstEnv, instanceDFunId )
-import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe, mkNomEqPred )
+import GHC.Core.Predicate ( classMethodInstTy, getEqPredTys_maybe, isEqPred, mkNomEqPred )
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs
@@ -1780,7 +1780,7 @@ outside the new skolem. See Note [Implicit existential arguments].
 -- See Note [Checking explicit existential packages].
 tcExistsPack :: HsExpr GhcRn -> [HsExprArg 'TcpRn] -> ExpRhoType -> TcM (HsExpr GhcTc)
 tcExistsPack rn_expr args expected
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; unless enabled $ failWithTc (TcRnExistsPack ExistsPackExtension)
        ; let (type_args, rest) = span isETypeArg (filter_not_parens args)
        ; case rest of
@@ -1880,7 +1880,7 @@ existential schema from the payload.
 tcRetainedAppCapability :: TcSigmaType -> ExpRhoType -> [HsExprArg 'TcpRn]
                         -> TcM Bool
 tcRetainedAppCapability sigma expected args
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; if enabled then return True else
     do { has_dep <- tcHasDepImports
        ; if not has_dep then return False else
@@ -1894,7 +1894,7 @@ tcRetainedAppCapability sigma expected args
 {- Note [Imported native application contracts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 An imported type can contain a retained index when the client does not enable
-ExperimentalDependentTypes. For example, toList consumes Vec a n through an
+DependentTypes. For example, toList consumes Vec a n through an
 erased n. An argument with the declared type Vec Int n supplies that choice.
 The client flag must not remove the inference needed to use this contract.
 
@@ -3638,6 +3638,28 @@ tcRetainedResultCoercion args ty
       = tcLookupIdMaybe (unLocWithUserRdr name)
     index_arg _ = return Nothing
 
+-- | Instantiate call constraints, transporting predicates that mention a
+-- preceding retained motive index along the active constructor Given so class
+-- constraints after @foreach@ solve against the branch's refined Givens.
+instRetainedCall :: QLFlag -> [HsExprArg 'TcpInst] -> CtOrigin -> [TcType] -> TcThetaType -> TcM HsWrapper
+instRetainedCall NoQL rev_acc orig inst_tys theta@(_:_)
+  | any is_retained rev_acc
+  = do { wraps <- forM theta $ \pred -> do
+           { co <- tcRetainedResultCoercion rev_acc pred
+           ; w  <- instCallConstraints orig [coercionRKind co]
+           ; let sym_sub = mkSymCo (mkSubCo co)
+           ; pure $ case (isReflCo co, w) of
+               (False, WpEvApp (EvExpr (Core.Coercion co_ev))) | isEqPred pred ->
+                 WpEvApp (evCoercion (mkCoCast co_ev sym_sub))
+               (False, WpEvApp (EvExpr e)) | not (isEqPred pred) ->
+                 WpEvApp (evCast e sym_sub)
+               _ -> w }
+       ; pure (foldl' (flip (<.>)) (mkWpTyApps inst_tys) wraps) }
+  where
+    is_retained ERetainedArg{} = True
+    is_retained _              = False
+instRetainedCall _ _ orig inst_tys theta = instCall orig inst_tys theta
+
 -- | Identify class selectors with an unmatchable-capable class parameter.
 classHasUnmatchableReceiver :: HsExpr GhcTc -> Bool
 classHasUnmatchableReceiver (HsVar _ (L _ selector))
@@ -4203,7 +4225,7 @@ tcValArgExpr do_ql pos rn_fun_head lspan sc_arg_ty larg@(L arg_loc arg)
          -- Now check the argument. Fully explicit outer type applications
          -- can already have supplied a known native callback input.
          -- See Note [Named callbacks at known native inputs].
-       ; enabled <- xoptM LangExt.ExperimentalDependentTypes
+       ; enabled <- xoptM LangExt.DependentTypes
        ; callback_enabled <- if enabled then return True else
            do { callback_ty <- liftZonkM (zonkTcType exp_arg_ty)
               ; return (hasNativeDependentExpr (Core.Type callback_ty)) }
@@ -4565,7 +4587,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                 -- that may be emitted from instantiating fun_sigma
                 setSrcSpan fun_lspan $
                 case selected of
-                  Nothing -> do { (wrap, rho) <- instantiateSigmaQL do_ql fun_orig
+                  Nothing -> do { (wrap, rho) <- instantiateSigmaQLWithAcc acc do_ql fun_orig
                                                   fun_conc_tvs tvs theta body2
                                 ; return (wrap, rho, plan) }
                   Just choices -> do
@@ -4575,7 +4597,7 @@ tcInstFunWithPrefix look_arg prefix_only prefix retained_holes_ref vta_cache exp
                               && and (zipWith (substKindAgrees subst) (map snd tvs) inst_tys)) $
                         pprPanic "tcInstFun: invalid retained instantiations"
                                  (ppr tvs $$ ppr choices)
-                    ; wrap <- instCall fun_orig inst_tys (substTheta subst theta)
+                    ; wrap <- instRetainedCall do_ql acc fun_orig inst_tys (substTheta subst theta)
                     ; return (wrap, substTy subst body2, Just rest) }
 
                   -- See Note [Representation-polymorphism checking built-ins]
@@ -5680,7 +5702,7 @@ tcScopedClassOperand result_ty call
   | HsApp _ method operand <- unLoc (stripParensLHsExpr call)
   , HsVar _ method_name <- unLoc (stripParensLHsExpr method)
   , HsVar _ operand_name <- unLoc (stripParensLHsExpr operand)
-  = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
+  = do { enabled <- xoptM LangExt.DependentTypes
        ; if not enabled then return Nothing else do
        { selector <- tcLookupIdMaybe (unLocWithUserRdr method_name)
        ; actual <- tcLookupLcl_maybe (unLocWithUserRdr operand_name)
@@ -8054,7 +8076,7 @@ lookup argument supplies the actual runtime index. The existing callback
 path can choose the erased index from the exact cached argument type.
 
 Report an anchor without marking the literal itself inferable. Checking it
-at a known list type works even without ExperimentalDependentTypes. The
+at a known list type works even without DependentTypes. The
 standalone list-inference rule has its own extension check. The anchor probe
 reads declarations only and excludes overloaded lists. The inner call still
 selects its type arguments and checks each element, including its usage.
@@ -8847,7 +8869,7 @@ tcSynthesizeConstMotive dom_ty res_ty = do
   let lam_hs = noLocA $ XHsType $
         HsTypeLambdaQuoteRn [noLocA y_nm] (noLocA (XHsType (HsCoreTyRn res_ty)))
       exp_k  = mkVisFunTyManyU dom_ty liftedTypeKind
-  motive_ty <- setXOptM LangExt.ExperimentalDependentTypes
+  motive_ty <- setXOptM LangExt.DependentTypes
                  (tcHsTypeApp (HsWC [] lam_hs) exp_k) >>= liftZonkM . zonkTcType
   return $ do
     (fam_tc, cap_args) <- tcSplitTyConApp_maybe motive_ty
@@ -8870,7 +8892,7 @@ tcSynthesizeMotiveLambda ys raw_body = runMaybeT $ do
   let all_doms = map varType call_ids ++ doms
       lam_kind = foldr mkVisFunTyManyU liftedTypeKind all_doms
       lam_hs   = noLocA $ XHsType $ HsTypeLambdaQuoteRn (map noLocA names) hs_body
-  fam_ty <- liftMaybeT (setXOptM LangExt.ExperimentalDependentTypes
+  fam_ty <- liftMaybeT (setXOptM LangExt.DependentTypes
                           (tcHsTypeApp (HsWC [] lam_hs) lam_kind) >>= liftZonkM . zonkTcType)
   return (mkAppTys fam_ty (map TermVarTy call_ids))
   where
@@ -10286,16 +10308,25 @@ instantiateSigmaQL :: QLFlag
                    -> [(Matchability, TyVar)]
                    -> TcThetaType -> TcSigmaType
                    -> TcM (HsWrapper, TcSigmaType)
+instantiateSigmaQL = instantiateSigmaQLWithAcc []
+
+instantiateSigmaQLWithAcc :: [HsExprArg 'TcpInst]
+                          -> QLFlag
+                          -> CtOrigin
+                          -> ConcreteTyVars
+                          -> [(Matchability, TyVar)]
+                          -> TcThetaType -> TcSigmaType
+                          -> TcM (HsWrapper, TcSigmaType)
 -- (instantiateSigmaQL orig tvs theta ty)
 --     instantiates the type variables tvs, emits the (instantiated)
 --     constraints theta, and returns the (instantiated) type ty
 -- See Note [Instantiating type variables in QuickLook]
-instantiateSigmaQL do_ql orig concs tvs theta body_ty
+instantiateSigmaQLWithAcc rev_acc do_ql orig concs tvs theta body_ty
   = do { rec (subst, inst_tvs) <- mapAccumLM (new_meta subst) empty_subst (map snd tvs)
        ; let inst_theta  = substTheta subst theta
              inst_body   = substTy subst body_ty
 
-       ; wrap <- instCall orig (mkTyVarTys inst_tvs) inst_theta
+       ; wrap <- instRetainedCall do_ql rev_acc orig (mkTyVarTys inst_tvs) inst_theta
        ; traceTc "Instantiating"
                  (vcat [ text "origin" <+> pprCtOrigin orig
                        , text "tvs"   <+> ppr tvs
@@ -10441,7 +10472,7 @@ expr_to_type earg =
          ; return (L l (HsAppKindTy noExtField lhs' rhs')) }
     go in_data (L l (OpApp _ lhs op rhs)) =
       do { is_comp <- is_any_compose_expr op
-         ; dep <- xoptM LangExt.ExperimentalDependentTypes
+         ; dep <- xoptM LangExt.DependentTypes
          ; if dep && is_comp
              then do
                { lhs0 <- go in_data lhs >>= promote_section_tree
@@ -10461,7 +10492,7 @@ expr_to_type earg =
         { m_pats = L _ [pat]
         , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] body_expr) NE.:| []
                           , grhssLocalBinds = L _ EmptyLocalBinds{} } }] })) =
-      do { dep <- xoptM LangExt.ExperimentalDependentTypes
+      do { dep <- xoptM LangExt.DependentTypes
          ; case (dep, unLoc pat) of
              (True, VarPat _ (L vloc vname)) -> do
                { tv_name <- newSysName (mkTyVarOccFS (occNameFS (nameOccName vname)))
@@ -10582,7 +10613,7 @@ expr_to_type earg =
 
     is_same_retained_type_witness :: Name -> Name -> TcM Bool
     is_same_retained_type_witness u_nm p_nm = do
-      dep <- xoptM LangExt.ExperimentalDependentTypes
+      dep <- xoptM LangExt.DependentTypes
       if not dep
         then pure False
         else do
@@ -10696,7 +10727,7 @@ hasSpecifiedInvisibleArgument ty = case coreFullView ty of
 prepareTypeWitnessArg :: LHsExpr GhcRn -> Scaled TcType -> TcType
                       -> TcM (LHsExpr GhcRn, Scaled TcType, TcType)
 prepareTypeWitnessArg arg sc_arg_ty@(Scaled mult raw_arg_ty) res_ty = do
-  dep <- xoptM LangExt.ExperimentalDependentTypes
+  dep <- xoptM LangExt.DependentTypes
   if not dep
     then pure (arg, sc_arg_ty, res_ty)
     else do
@@ -12245,7 +12276,7 @@ those inside an erased package. Zonk first
 so that the check also sees a type behind a filled metavariable. Check the
 WpTyApp inputs before qlMonoInstArgs enters its ZonkM folder.
 
-This check depends on the actual type, not ExperimentalDependentTypes.
+This check depends on the actual type, not DependentTypes.
 Imported contracts can contain native types in a client without that flag.
 An incomplete immutable application plan can retain DoQL in such a client.
 The native-type rejection must still run before a Quick Look assignment or

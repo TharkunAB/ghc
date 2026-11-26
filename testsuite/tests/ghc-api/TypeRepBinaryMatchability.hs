@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, Modifiers, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, Modifiers, TypeFamilies #-}
 
 module Main (main) where
 

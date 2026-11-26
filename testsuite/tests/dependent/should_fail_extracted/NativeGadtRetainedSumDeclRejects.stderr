@@ -25,9 +25,7 @@ NativeGadtRetainedSumDeclRejects.hs:12:50: error: [GHC-83605]
 NativeGadtRetainedSumDeclRejects.hs:16:46: error: [GHC-83605]
     • GHC cannot check a retained dependent sum in this position.
       A top-level type synonym can name the sum and take its outer indices as parameters.
-    • In the second argument of ‘GHC.Sigma.Sigma’, namely
-        ‘\m -> (KindTag n, Vec Char m)’
-      In the definition of data constructor ‘HiddenKind’
+    • In the definition of data constructor ‘HiddenKind’
       In the data type declaration for ‘HiddenKind’
 
 NativeGadtRetainedSumDeclRejects.hs:20:3: error: [GHC-83605]
