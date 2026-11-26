@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE Modifiers #-}
 {-# LANGUAGE PolyKinds #-}
