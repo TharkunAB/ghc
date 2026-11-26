@@ -69,7 +69,7 @@ import GHC.Unit.External ( eps_PTE )
 import GHC.Unit.Module ( moduleUnit, moduleName, moduleNameString )
 import GHC.Unit.Types ( unitString )
 import GHC.Types.Var ( TyVar, mkTyVar, setTyVarKind, isVisibleFunArg, isInvisibleForAllTyFlag
-                     , DepFunTyFlag(..), VarBndr(..), isNonCoVarId
+                     , DepFunTyFlag(..), VarBndr(..), isNonCoVarId, isTyVar
                      , tyVarKind, varType )
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env ( TidyEnv )
@@ -77,7 +77,7 @@ import GHC.Types.TyThing
 import GHC.Data.Bag
 import GHC.Core.ConLike ( ConLike(..) )
 import GHC.Utils.Misc
-import GHC.Tc.Utils.Env ( tcLookup, tcExtendIdEnv )
+import GHC.Tc.Utils.Env ( tcLookup, tcExtendIdEnv, tcExtendNameTyVarEnv )
 import GHC.Utils.Outputable
 import GHC.Driver.DynFlags
 import GHC.Data.Maybe
@@ -466,9 +466,12 @@ We currently use the following shortcuts.
 
     (FastHoles1)
       If 'hole_ty' is an immutable type variable (i.e. a skolem type variable),
-      then the only possible (useful) fits are fits of exactly that type, which
-      can only come from locally bound variables for which that skolem is in scope.
-      In that case, only include local identifiers in the list of candidate Ids.
+      then the only possible (useful) atomic fits are fits of exactly that type,
+      which can only come from locally bound variables for which that skolem is
+      in scope. Candidate plugins still receive the full 'locals ++ syntax ++ globals'
+      list so proof-search plugins can synthesize compound terms from global
+      constructors, while GHC's built-in atomic check filters down to local
+      candidates afterwards.
 
       This speeds things up quite a bit when we don't know anything about the type
       of the hole, and helps with degenerate fits like (`id (_ :: a)` and `head (_ :: [a])`)
@@ -600,12 +603,22 @@ getLocalBindings tidy_orig ct_loc
         discard_it = go env sofar tc_bndrs
         keep_it id = go env (id:sofar) tc_bndrs
 
+-- | Extract original signature binder names mapped to their instantiated skolem
+-- 'TcTyVar's from enclosing implications, ordered from outermost to innermost.
+implicSigSkolPairs :: [Implication] -> [(Name, TcTyVar)]
+implicSigSkolPairs implics =
+  [ (getName tv, tv) | imp <- outer_first, tv <- ic_skols imp, isTyVar tv ] ++
+  [ pair | imp <- outer_first, SigSkol _ _ pairs <- [ic_info imp], pair <- pairs ]
+  where
+    outer_first = reverse implics
+
 -- | Restore the hole constraint's local reader, binder, type, and Given scope.
 -- See Note [Dependent hole fits and subgoal splitting].
 withHoleLclEnv :: CtLoc -> [Id] -> [Implication] -> TcM a -> TcM a
 withHoleLclEnv ct_loc extra_ids implics thing_inside
   = setCtLocM ct_loc $
     updLclEnv (setLclEnvRdrEnv (ctl_rdr lcl_env)) $
+    tcExtendNameTyVarEnv (implicSigSkolPairs implics) $
     tcExtendIdEnv scope_ids $
     tcExtendLexicalGivens all_givens $
     thing_inside
@@ -698,11 +711,20 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
            -- See (FastHoles1) in Note [Speeding up valid hole-fits].
            only_locals = any isImmutableTyVar $ getTyVar_maybe hole_ty
            gadt_proof_hole = dep_exts && isGadtHoleTy hole_ty
-           to_check
-             | only_locals     = locals
-             | gadt_proof_hole = locals ++ globals
-             | otherwise       = locals ++ syntax ++ globals
-     ; cands <- foldM (flip ($)) to_check candidatePlugins
+           all_cands = locals ++ syntax ++ globals
+           keep_builtin_cand cand
+             | only_locals = case cand of
+                 IdHFCand{}    -> True
+                 GreHFCand gre -> gre_lcl gre
+                 NameHFCand{}  -> False
+             | gadt_proof_hole = case cand of
+                 NameHFCand{}  -> False
+                 _             -> True
+             | otherwise = True
+     ; raw_cands <- if null candidatePlugins
+                    then pure all_cands
+                    else foldM (flip ($)) all_cands candidatePlugins
+     ; let cands = filter keep_builtin_cand raw_cands
      ; lookup_fn <- mkCachedCandLookup gadt_proof_hole
      ; traceTc "numPlugins are:" $ ppr (length candidatePlugins)
      ; (searchDiscards, subs0) <-
@@ -1144,6 +1166,7 @@ tcCheckHoleFit _ _ hole_ty cand_ty
   | hole_ty `eqType` cand_ty
   = return $ Just idHsWrapper
 tcCheckHoleFit ds_flag (TypedHole {..}) hole_ty cand_ty = discardErrs $
+  tcExtendNameTyVarEnv (implicSigSkolPairs th_implics) $
   do { -- We wrap the subtype constraint in the implications to pass along the
        -- givens, and so we must ensure that any nested implications and skolems
        -- end up with the correct level. The implications are ordered so that

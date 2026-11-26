@@ -608,28 +608,48 @@ localSourceTableBinders tycl_decls binds sigs = do
 
     weakening_signed = mkOccSet
       [ rdrNameOcc n
-      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
-      , is_weakening_sig (sig_body (unLoc (hswc_body wc))) ]
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , is_weakening_sig (sig_body (unLoc (hswc_body wc)))
+      , L _ n <- ns ]
 
     subst_map_signed = mkOccSet
       [ rdrNameOcc n
-      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
-      , is_subst_map_sig [] (sig_body (unLoc (hswc_body wc))) ]
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , is_subst_map_sig [] (sig_body (unLoc (hswc_body wc)))
+      , L _ n <- ns ]
 
     sigma_comb_signed = mkOccSet
       [ rdrNameOcc n
-      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
-      , is_sigma_comb_sig (sig_body (unLoc (hswc_body wc))) ]
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , is_sigma_comb_sig (sig_body (unLoc (hswc_body wc)))
+      , L _ n <- ns ]
 
     poly_nested_signed = mkOccSet
       [ rdrNameOcc n
-      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
-      , is_poly_nested_sig (sig_body (unLoc (hswc_body wc))) ]
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , is_poly_nested_sig (sig_body (unLoc (hswc_body wc)))
+      , L _ n <- ns ]
 
     producer_signed = mkOccSet
       [ rdrNameOcc n
-      | L _ (TypeSig _ [] [L _ n] wc) <- sigs
-      , is_producer_sig (sig_body (unLoc (hswc_body wc))) ]
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , is_producer_sig (sig_body (unLoc (hswc_body wc)))
+      , L _ n <- ns ]
+
+    large_elim_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , returns_ps_type False (sig_body (unLoc (hswc_body wc)))
+      , L _ n <- ns ]
+
+    returns_ps_type seen_arr ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsForAllTy{hst_body = body} -> returns_ps_type seen_arr body
+           HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) _ cod -> returns_ps_type True cod
+           HsStarTy{} -> seen_arr
+           HsTyVar _ NotPromoted (L _ r) -> seen_arr && occNameString (rdrNameOcc r) == "Type"
+           _ -> False
 
     peel_plain_ps_foralls ty =
       let expanded = expand_ps_syn 4 ty
@@ -807,10 +827,10 @@ localSourceTableBinders tycl_decls binds sigs = do
       isJust (constructor_fields (unparen pat))
     constructor_head_alt _ = False
 
-    local_sig_for go_rdr (L _ (TypeSig _ [] [L _ n] _)) = n == go_rdr
+    local_sig_for go_rdr (L _ (TypeSig _ [] ns _)) = any ((== go_rdr) . unLoc) ns
     local_sig_for _ _ = False
 
-    signed = mkOccSet [ rdrNameOcc n | L _ (TypeSig _ [] [L _ n] _) <- sigs ]
+    signed = mkOccSet [ rdrNameOcc n | L _ (TypeSig _ [] ns _) <- sigs, L _ n <- ns ]
     local_fun_occs = mkOccSet [ nameOccName n | L _ FunBind{fun_id = L _ n} <- binds ]
 
     poly_nested_row :: Name -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
@@ -889,20 +909,24 @@ localSourceTableBinders tycl_decls binds sigs = do
           _ -> False
     constructor_row :: Name -> Bool -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
     constructor_row self structural (L _ Match{m_pats = L _ (pat : rest), m_grhss = rhss})
-      | Just fields <- constructor_fields (unparen pat)
-      , all plain_field fields
+      | let is_large = nameOccName self `elemOccSet` large_elim_signed
+      , Just fields <- constructor_fields (unparen pat)
+      , all (if is_large then nested_pat else plain_field) fields
       , Just carried <- carried_binders structural rest
       , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
       = row_result self [] (collectPatsBinders CollNoDictBinders fields) carried rhs
     constructor_row _ _ _ = False
 
     right_constructor_row :: Name -> LMatch GhcPs (LHsExpr GhcPs) -> Bool
-    right_constructor_row self (L _ Match{m_pats = L _ [left, right], m_grhss = rhss})
-      | Just carried <- callback_binder (unparen left)
+    right_constructor_row self (L _ Match{m_pats = L _ (left : right : rest), m_grhss = rhss})
+      | let is_large = nameOccName self `elemOccSet` large_elim_signed
+      , is_large || null rest
+      , Just carried_l <- callback_binder (unparen left)
       , Just fields <- constructor_fields (unparen right)
-      , all plain_field fields
+      , all (if is_large then nested_pat else plain_field) fields
+      , Just carried_r <- traverse (callback_binder . unparen) rest
       , GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) <- rhss
-      = row_result self [carried] (collectPatsBinders CollNoDictBinders fields) [] rhs
+      = row_result self [carried_l] (collectPatsBinders CollNoDictBinders fields) carried_r rhs
     right_constructor_row _ _ = False
 
     -- The first row of a right-first split carries its left operand.
@@ -933,7 +957,7 @@ localSourceTableBinders tycl_decls binds sigs = do
 
     -- The typed checker checks the whole matrix, including the constructor
     -- identities and the order of both columns. See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
-    matches_second (L _ Match{m_pats = L _ [_, p]}) =
+    matches_second (L _ Match{m_pats = L _ (_ : p : _)}) =
       isJust (constructor_fields (unparen p))
     matches_second _ = False
 
@@ -948,8 +972,7 @@ localSourceTableBinders tycl_decls binds sigs = do
 
     constructor_fields :: Pat GhcPs -> Maybe [LPat GhcPs]
     constructor_fields ConPat{pat_args = PrefixCon _ fields} = Just fields
-    constructor_fields ConPat{pat_con = L _ con, pat_args = InfixCon _ x xs}
-      | con == consDataCon_RDR = Just [x, xs]
+    constructor_fields ConPat{pat_args = InfixCon _ x xs} = Just [x, xs]
     constructor_fields (ListPat _ []) = Just []
     constructor_fields _ = Nothing
 
@@ -978,21 +1001,32 @@ localSourceTableBinders tycl_decls binds sigs = do
                 HsVar _ (L _ r) | is_self r -> check args fun
                 _ -> False
           HsVar _ (L _ r)
-            | isRdrDataCon r -> all (check []) args
-            | r `elem` fields || Just r `elem` leading || Just r `elem` trailing ->
-                null args || case args of
-                  [arg] -> Just r `elem` leading && maybe False (`elem` fields) (variable arg)
-                  _     -> False
-            | null args, not (is_self r), rdrNameOcc r `elemOccSet` weakening_signed -> True
-            | is_self r, Just operands <- traverse variable args
-            , (before, field : after) <- splitAt (length leading) operands
-            -> map Just before == leading && field `elem` fields && map Just after == trailing
-            | is_self r, [Just cb] <- leading, null trailing, [cb_expr, field_expr] <- args
-            -> lifted_callback cb cb_expr && maybe False (`elem` fields) (variable field_expr)
-            | is_self r, null leading, [next, pushed] <- args
-            , [x, xs] <- fields, [Just acc] <- trailing
-            -> variable next == Just xs && cons_onto x acc pushed
-            | not (is_self r), not (null args) -> all (check []) args
+            | let is_large = nameOccName self `elemOccSet` large_elim_signed
+            -> if
+              | isRdrDataCon r -> all (check []) args
+              | r `elem` fields || Just r `elem` leading || Just r `elem` trailing ->
+                  null args ||
+                  (if is_large
+                     then Just r `elem` (leading ++ trailing) && all (check []) args
+                     else case args of
+                            [arg] -> Just r `elem` leading && maybe False (`elem` fields) (variable arg)
+                            _     -> False)
+              | null args, not (is_self r), rdrNameOcc r `elemOccSet` weakening_signed -> True
+              | is_self r, Just operands <- traverse variable args
+              , (before, field : after) <- splitAt (length leading) operands
+              , map Just before == leading && field `elem` fields && map Just after == trailing -> True
+              | is_large && is_self r
+              , length args >= length leading + 1 + length trailing
+              , (before, field_arg : after) <- splitAt (length leading) args
+              , maybe False (`elem` fields) (variable field_arg)
+              , all (check []) (before ++ after) -> True
+              | is_self r, [Just cb] <- leading, null trailing, [cb_expr, field_expr] <- args
+              -> lifted_callback cb cb_expr && maybe False (`elem` fields) (variable field_expr)
+              | is_self r, null leading, [next, pushed] <- args
+              , [x, xs] <- fields, [Just acc] <- trailing
+              -> variable next == Just xs && cons_onto x acc pushed
+              | not (is_self r), not (null args) -> all (check []) args
+              | otherwise -> False
           _ -> False
         lifted_callback cb expr
           | variable expr == Just cb = True
@@ -1040,9 +1074,10 @@ localSourceTableBinders tycl_decls binds sigs = do
 
         check_self_ty_args :: [LHsType GhcPs] -> Bool
         check_self_ty_args t_args
-          | Just operands <- traverse ty_term_var t_args
-          , (before, field : after) <- splitAt (length leading) operands
-          = map Just before == leading && field `elem` fields && map Just after == trailing
+          | length t_args >= length leading + 1 + length trailing
+          , (before, field_arg : after) <- splitAt (length leading) t_args
+          , maybe False (`elem` fields) (ty_term_var field_arg)
+          = all (check_emb_ty []) (before ++ after)
           | otherwise = False
 
         ty_term_var :: LHsType GhcPs -> Maybe RdrName
@@ -1110,21 +1145,31 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
         specialised = mkNameSet [ b | L _ s <- sigs, b <- spec_name s ]
         declared = mkOccSet [ nameOccName f | f <- nameSetElemsStable (duDefs dus)
                                             , nameModule_maybe f == nameModule_maybe n ]
-        candidates = [ (b, needed_tycons, values)
+        candidates = [ (b, needed_tycons, values, term_deps, tbl_deps)
                      | (_, [L _ fb@FunBind{fun_id = L _ b, fun_ext = fvs}]) <- binds
                      , mkSourceTableOcc (nameOccName b) `elemOccSet` declared
                      , not (b `elemNameSet` specialised)
                      , not (has_rn_splice fb)
                      , Just sig_wc <- [lookup_single_sig b]
-                     , let values = ((fvs `intersectNameSet` local_values) `unionNameSet` rhs_tbl_vals fvs) `delFromNameSet` b
+                     , let term_deps = (fvs `intersectNameSet` local_values) `delFromNameSet` b
+                           tbl_deps  = rhs_tbl_vals fvs `delFromNameSet` b
+                           values    = term_deps `unionNameSet` tbl_deps
                      , Just needed_tycons <- [candidate_types b sig_wc ((fvs `minusNameSet` local_values) `minusNameSet` rhs_tbl_names fvs)] ]
-        candidate_set = mkNameSet [ b | (b, _, _) <- candidates ]
-        schedule done (b, _, deps) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
-                                   | otherwise = done
+        candidate_set = mkNameSet [ b | (b, _, _, _, _) <- candidates ]
+        schedule done (b, _, deps, _, _) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
+                                         | otherwise = done
         close_ready done =
           let done' = foldl' schedule done candidates
           in if isEmptyNameSet (done' `minusNameSet` done) then done else close_ready done'
         ready = close_ready emptyNameSet
+        schedule_wave done (b, _, _, t_deps, ty_deps)
+          | isEmptyNameSet ty_deps
+          , isEmptyNameSet (t_deps `minusNameSet` done) = extendNameSet done b
+          | otherwise = done
+        close_wave done =
+          let done' = foldl' schedule_wave done candidates
+          in if isEmptyNameSet (done' `minusNameSet` done) then done else close_wave done'
+        wave_ready = close_wave emptyNameSet
         non_cand_sigs = [ s | s@(L _ sig) <- sigs, all (not . (`elemNameSet` candidate_set)) (sig_names sig) ]
         non_cand_binds = [ bs | (_, bs) <- binds
                               , not (any (\case L _ FunBind{fun_id = L _ b} -> b `elemNameSet` candidate_set
@@ -1141,20 +1186,33 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
                  , nm `elemNameSet` ready ]
           TableInTerm -> emptyNameSet
   , not (null wanted) || not (isEmptyNameSet t2t_seeds)
-  = let include (b, _, deps) rest | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSet deps rest
-                                  | otherwise = rest
+  = let include (b, _, deps, _, _) rest | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSet deps rest
+                                        | otherwise = rest
         close_needed acc =
           let acc' = foldr include acc candidates
           in if isEmptyNameSet (acc' `minusNameSet` acc) then acc else close_needed acc'
         needed = close_needed (wanted_set `unionNameSet` t2t_seeds)
-        early = [ (b, kinds) | (b, kinds, _) <- candidates
-                             , b `elemNameSet` ready, b `elemNameSet` needed ]
+        eligible_wave b = case use of
+          TableInType{} -> b `elemNameSet` wave_ready
+          TableInTerm   -> b `elemNameSet` ready
+        early = [ (b, kinds) | (b, kinds, _, _, _) <- candidates
+                             , eligible_wave b, b `elemNameSet` needed ]
         early_names = mkNameSet (map fst early)
         early_types = unionNameSets (map snd early)
         (first_binds, rest_binds) = partition early_bind binds
         early_bind (_, [L _ FunBind{fun_id = L _ b}]) = b `elemNameSet` early_names
         early_bind _ = False
-        (first_sigs, rest_sigs) = partition (any (`elemNameSet` early_names) . sig_names . unLoc) sigs
+        split_sig sig@(L loc (TypeSig ext mods owners tau)) (f_acc, r_acc) =
+          case partition ((`elemNameSet` early_names) . unLoc) owners of
+            ([], _) -> (f_acc, sig : r_acc)
+            (_, []) -> (sig : f_acc, r_acc)
+            (before, after) ->
+              (L loc (TypeSig ext mods before tau) : f_acc,
+               L loc (TypeSig ext mods after tau) : r_acc)
+        split_sig sig@(L _ decl) (f_acc, r_acc)
+          | any (`elemNameSet` early_names) (sig_names decl) = (sig : f_acc, r_acc)
+          | otherwise = (f_acc, sig : r_acc)
+        (first_sigs, rest_sigs) = foldr split_sig ([], []) sigs
         early_ty tg = any ((`elemNameSet` early_types) . tcdName . unLoc) (group_tyclds tg)
         (first_tys, rest_tys) = case use of
           TableInTerm -> partition early_ty tycls
@@ -1369,7 +1427,7 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       | otherwise = or (gmapQ has_qual_ty node)
 
     sig_names :: Sig GhcRn -> [Name]
-    sig_names (TypeSig _ _ [L _ b] _) = [b]
+    sig_names (TypeSig _ _ ns _) = map unLoc ns
     sig_names (InlineSig _ (L _ b) _) = [b]
     sig_names (SCCFunSig _ (L _ b) _) = [b]
     sig_names _ = []

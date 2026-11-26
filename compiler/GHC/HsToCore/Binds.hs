@@ -36,6 +36,7 @@ import {-# SOURCE #-}   GHC.HsToCore.Match ( matchWrapper )
 import GHC.HsToCore.Pmc.Utils( tracePm )
 
 import GHC.HsToCore.Monad
+import GHC.HsToCore.Types ( ds_type_env )
 import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.GuardedRHSs
 import GHC.HsToCore.Utils
@@ -69,11 +70,13 @@ import GHC.Builtin.KnownOccs
 import GHC.Builtin.WiredIn.Types ( naturalTy, typeSymbolKind, charTy )
 
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Utils.Monad ( getGblEnv )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.InlinePragma
 import GHC.Types.Name
+import GHC.Types.TypeEnv (TypeEnv, restoreSourceTableId)
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Var( EvVar, mkLocalVar, isRuntimePiTyBinder, coreTyLamForAllTyFlag, isInvisibleDepFunFlag )
@@ -118,7 +121,9 @@ dsTopLHsBinds binds
             ; massertPpr (null force_vars || xstrict) (ppr binds $$ ppr force_vars) }
               -- with -XStrict, even top-level vars are listed as force vars.
 
-       ; return (toOL prs) }
+       ; env <- getGblEnv
+       ; let prs' = mapFst (restoreSourceTableId (ds_type_env env)) prs
+       ; return (toOL prs') }
 
   where
     unlifted_binds = filter (isUnliftedHsBind . unLoc) binds
@@ -1836,8 +1841,28 @@ dsEvBind (EvBind { eb_lhs = v, eb_rhs = r, eb_info = info }) = do
 *                                                                      *
 **********************************************************************-}
 
+-- | Restore 'SourceTableId' details on local binders inside evidence expressions
+-- after 'zonkCoreExpr' replaced occurrences with the pre-table 'LocalId'.
+restoreSourceTableExpr :: TypeEnv -> CoreExpr -> CoreExpr
+restoreSourceTableExpr type_env = go
+  where
+    go (Var v)                 = Var (restoreSourceTableId type_env v)
+    go (App f x)               = App (go f) (go x)
+    go (Lam b body)            = Lam b (go body)
+    go (Let bind body)         = Let (go_bind bind) (go body)
+    go (Case scrut b ty alts)  = Case (go scrut) b ty [Alt c bs (go rhs) | Alt c bs rhs <- alts]
+    go (Cast expr co)          = Cast (go expr) co
+    go (Tick t expr)           = Tick t (go expr)
+    go (Pack ty w body)        = Pack ty w (go body)
+    go (Unpack w p scrut body) = Unpack w p (go scrut) (go body)
+    go other                   = other
+
+    go_bind (NonRec b r) = NonRec (restoreSourceTableId type_env b) (go r)
+    go_bind (Rec pairs)  = Rec [(restoreSourceTableId type_env b, go r) | (b, r) <- pairs]
+
 dsEvTerm :: EvTerm -> DsM CoreExpr
-dsEvTerm (EvExpr e)          = return e
+dsEvTerm (EvExpr e)          = do { env <- getGblEnv
+                                  ; return (restoreSourceTableExpr (ds_type_env env) e) }
 dsEvTerm (EvTypeable ty ev)  = dsEvTypeable ty ev
 dsEvTerm (EvFun { et_tvs = tvs, et_given = given
                 , et_binds = ev_binds, et_body = wanted_id })

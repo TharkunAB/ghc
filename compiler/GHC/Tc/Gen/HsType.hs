@@ -20,8 +20,8 @@ module GHC.Tc.Gen.HsType (
 
         tcHsClsInstType,
         tcDefaultDeclClass, tcHsDeriv, tcDerivStrategy,
-        tcHsTypeApp, tcHsTypeAppWithSource, tcCheckEmbeddedType,
-        buildPendingLargeElimHeader,
+        tcHsTypeApp, tcHsTypeAppWithSource, tcCheckEmbeddedType, tcCheckEmbeddedTypeAtKind,
+        buildPendingLargeElimHeader, buildPendingLargeElimHeaderWithArity,
         UserTypeCtxt(..),
         bindImplicitTKBndrs_Tv, bindImplicitTKBndrs_Skol,
             bindImplicitTKBndrs_Q_Tv, bindImplicitTKBndrs_Q_Skol,
@@ -117,6 +117,7 @@ import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(InvalidInput, UnavailableDefinit
 import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourceTableFamilyUse, sourceTableTypeUses,
                               sourceCaseKindUse, sourceTableOccurrence, sourceTableReferenceUse, indexedProjectionSource, isSourceConstructorCase, monomorphicEnumCaseArity, sourceCaseVisibleArity, sourceTableOwner, sourcePairBuilderField,
                               isFinalCoreIdentity, isFinalCoreReverseWrapper, isFinalStructuralSource,
+                              isLargeElimResultKind, toKindMatchableArrows,
                               lookupObservedPairField, lookupPairObserver, lookupPairRecipe, canObservePairSource,
                               lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
@@ -797,24 +798,67 @@ tcWithLocalTySyns (_ : rest) thing_inside = tcWithLocalTySyns rest thing_inside
 
 -- | Check a `type (...)` or unadorned T2T expression RHS for a Type-valued source equation.
 tcCheckEmbeddedType :: LHsWcType GhcRn -> TcM Type
-tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
+tcCheckEmbeddedType wc = tcCheckEmbeddedTypeAtKind wc liftedTypeKind
+
+-- | Check an embedded type expression at an expected large-elimination result kind
+-- (such as `Type` or `Type -> Type`).
+tcCheckEmbeddedTypeAtKind :: LHsWcType GhcRn -> Kind -> TcM Type
+tcCheckEmbeddedTypeAtKind (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 }) exp_res_kind
   = do { unless (null sig_wcs && hsTypeHasNoAnonWildcards hs_ty0) $
            failWithTc (TcRnRetainedQuantificationError
-             (RetainedTypeOperandContext (Just liftedTypeKind)))
-       ; hs_ty <- promote_embedded_source_heads hs_ty0
+             (RetainedTypeOperandContext (Just exp_res_kind)))
+       ; mb_enclosing_fun <- enclosing_fun_name
+       ; hs_ty <- promote_embedded_source_heads mb_enclosing_fun hs_ty0
        ; carry_binds <- local_type_carry_binders hs_ty
        ; tcExtendNameTyVarEnv [(nm, tv) | (nm, tv) <- carry_binds] $ do
            { indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex hs_ty
-           ; pending <- pending_source_families hs_ty
+           ; pending <- pending_source_families mb_enclosing_fun hs_ty
            ; ty <- tcExtendRecEnv pending $
                    solveEqualities "tcCheckEmbeddedType" $
                    tc_check_lhs_type (typeLevelMode { mode_indices = indices })
-                                     hs_ty liftedTypeKind
+                                     hs_ty exp_res_kind
            ; zonked <- liftZonkM (zonkTcType ty)
            ; pure (mkInfForAllTys [(unmatchableDataConTy, tv) | (_, tv) <- carry_binds] zonked) } }
   where
-    promote_embedded_source_heads :: LHsType GhcRn -> TcM (LHsType GhcRn)
-    promote_embedded_source_heads root = do
+    enclosing_fun_name :: TcM (Maybe Name)
+    enclosing_fun_name = do
+      lcl <- getLclEnv
+      let ctxts = getLclEnvErrCtxt lcl
+          from_ctxt =
+            [ nm
+            | c <- ctxts
+            , Just nm <- [case c of
+                UserSigCtxt (FunSigCtxt nm _) _        -> Just nm
+                MatchCtxt (FunRhs { mc_fun = L _ nm }) -> Just nm
+                _                                      -> Nothing] ]
+          from_not_top =
+            [ idName b
+            | TcIdBndr b NotTopLevel <- reverse (getLclEnvBinderStack lcl) ]
+          from_top =
+            [ bndr_nm
+            | bndr <- getLclEnvBinderStack lcl
+            , Just bndr_nm <- [case bndr of
+                TcIdBndr b TopLevel            -> Just (idName b)
+                TcIdBndr_ExpType nm _ TopLevel -> Just nm
+                _                              -> Nothing] ]
+      pure (listToMaybe (from_ctxt ++ from_not_top ++ from_top))
+
+    count_arrows :: Type -> Int
+    count_arrows t =
+      let (_, tau) = splitForAllForAllTyBinders t
+          go ty | Just (FTF_T_T, _, _, _, rest) <- splitFunTy_maybe ty = 1 + go rest
+                | otherwise = 0
+      in go tau
+
+    arity_for :: Maybe Name -> Name -> Type -> Maybe Int
+    arity_for (Just enc_nm) fn fun_ty
+      | fn == enc_nm || nameOccName fn == nameOccName enc_nm
+      , let k = count_arrows fun_ty - count_arrows exp_res_kind
+      , k > 0 = Just k
+    arity_for _ _ _ = Nothing
+
+    promote_embedded_source_heads :: Maybe Name -> LHsType GhcRn -> TcM (LHsType GhcRn)
+    promote_embedded_source_heads mb_enc root = do
       gbl <- getGblEnv
       lcl <- getLclEnv
       let cur_mod   = tcg_semantic_mod gbl
@@ -837,14 +881,18 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
             HsForAllTy x tele body -> HsForAllTy x tele <$> go_ty body
             HsQualTy x (L lc (HsContext an cs)) body ->
               HsQualTy x <$> (L lc . HsContext an <$> traverse go_ty cs) <*> go_ty body
+            XHsType (HsTypeLambdaQuoteRn binders body) ->
+              XHsType . HsTypeLambdaQuoteRn binders <$> go_ty body
+            XHsType (HsTypeLambdaCheckRn binders body helper) ->
+              XHsType <$> (HsTypeLambdaCheckRn binders <$> go_ty body <*> go_ty helper)
             HsTyVar ann NotPromoted (L vloc (WithUserRdr rdr nm))
               | isVarName nm, isExternalName nm -> do
-                  mb_tbl_nm <- resolve_source_head cur_mod gbl local_type_fun nm
+                  mb_tbl_nm <- resolve_source_head mb_enc cur_mod gbl local_type_fun nm
                   pure $ HsTyVar ann NotPromoted (L vloc (WithUserRdr rdr (fromMaybe nm mb_tbl_nm)))
             other -> pure other
       go_ty root
 
-    resolve_source_head cur_mod gbl local_type_fun nm = do
+    resolve_source_head mb_enc cur_mod gbl local_type_fun nm = do
       mb_id <- case local_type_fun nm of
         Just fid -> pure (Just fid)
         Nothing  -> tcLookupIdMaybe nm
@@ -858,7 +906,7 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
                 else case mb_id of
                   Just fid -> do
                     fun_ty <- liftZonkM (zonkTcType (varType fid))
-                    mb_hdr <- buildPendingLargeElimHeader fam_nm fun_ty
+                    mb_hdr <- buildPendingLargeElimHeaderWithArity (arity_for mb_enc nm fun_ty) fam_nm fun_ty
                     pure (fam_nm <$ mb_hdr)
                   Nothing -> pure Nothing
           | otherwise -> pure Nothing
@@ -871,13 +919,22 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
         case mb_thing of
           Just (ATcId { tct_id = v }) | not (isExternalName nm) -> do
             v' <- zonkIdIfNeeded v
-            if isManyTy (idMult v') && tcIsLiftedTypeKind (varType v')
+            vt <- liftZonkM (zonkTcType (varType v'))
+            if isManyTy (idMult v') && is_carry_type_kind vt
               then do
                 let carry_occ = mkTyVarOcc ("$emb_carry:" ++ occNameString (nameOccName (idName v')))
                 tv_nm <- newSysName carry_occ
-                pure (Just (nm, mkTyVar tv_nm liftedTypeKind))
+                pure (Just (nm, mkTyVar tv_nm vt))
               else pure Nothing
           _ -> pure Nothing
+
+    is_carry_type_kind :: Type -> Bool
+    is_carry_type_kind t
+      | isLargeElimResultKind t = True
+      | Just (FTF_T_T, ma, mult, dom, res) <- splitFunTy_maybe t
+      = ma `eqType` unmatchableDataConTy && isManyTy mult &&
+        tcIsLiftedTypeKind (typeKind dom) && is_carry_type_kind res
+      | otherwise = False
 
     local_var_names :: Data a => a -> [Name]
     local_var_names thing
@@ -887,8 +944,8 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
       , not (isExternalName name) = [name]
       | otherwise = concat (gmapQ local_var_names thing)
 
-    pending_source_families :: LHsType GhcRn -> TcM [(Name, TyThing)]
-    pending_source_families root = do
+    pending_source_families :: Maybe Name -> LHsType GhcRn -> TcM [(Name, TyThing)]
+    pending_source_families mb_enc root = do
       gbl <- getGblEnv
       lcl <- getLclEnv
       let lcl_bndrs = nonDetNameEnvElts (tcl_env (tcl_lcl_ctxt lcl))
@@ -905,7 +962,8 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
             | isJust (lookupTypeEnv (tcg_type_env gbl) fam_name) = pure Nothing
             | Just fun_id <- find_local_fun fam_name = do
                 fun_ty <- liftZonkM (zonkTcType (varType fun_id))
-                mb_tc <- build_pending_family fam_name fun_ty
+                let mb_arity = arity_for mb_enc (idName fun_id) fun_ty
+                mb_tc <- fmap fst <$> buildPendingLargeElimHeaderWithArity mb_arity fam_name fun_ty
                 pure ((\tc -> (fam_name, ATyCon tc)) <$> mb_tc)
             | otherwise = pure Nothing
       catMaybes <$> mapM make_pending (uniq_names (source_family_names root))
@@ -926,29 +984,41 @@ tcCheckEmbeddedType (HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty0 })
       , isSourceFamilyName name = [name]
       | otherwise = concat (gmapQ source_family_names thing)
 
-    build_pending_family :: Name -> Type -> TcM (Maybe TyCon)
-    build_pending_family fam_name fun_ty =
-      fmap fst <$> buildPendingLargeElimHeader fam_name fun_ty
-
 -- | Build an abstract placeholder family and TcTyCon from a Type-valued signature.
 -- See Note [Staging mutually recursive large eliminations] in GHC.Tc.Module.
 buildPendingLargeElimHeader :: Name -> Type -> TcM (Maybe (TyCon, TcTyCon))
-buildPendingLargeElimHeader fam_name fun_ty = runMaybeT $ do
+buildPendingLargeElimHeader = buildPendingLargeElimHeaderWithArity Nothing
+
+-- | Like 'buildPendingLargeElimHeader', optionally fixing the syntactic clause arity
+-- so higher-kinded results (`List Eff -> Type -> Type`, arity 1) and Type-valued
+-- accumulators (`List Eff -> Type -> Type`, arity 2) build distinct family headers.
+buildPendingLargeElimHeaderWithArity :: Maybe Int -> Name -> Type -> TcM (Maybe (TyCon, TcTyCon))
+buildPendingLargeElimHeaderWithArity mb_arity fam_name fun_ty = runMaybeT $ do
   let (tele, tau) = splitForAllForAllTyBinders fun_ty
   tvs <- MaybeT $ pure $ traverse (\(ma, Bndr tv vis) -> do
            guard (ma `eqType` unmatchableDataConTy
                   && isSpecifiedForAllTyFlag vis
                   && isTyVar tv
-                  && (tcIsLiftedTypeKind (tyVarKind tv)
-                      || maybe False (isAlgTyCon . fst) (splitTyConApp_maybe (tyVarKind tv))))
+                  && tcIsLiftedTypeKind (typeKind (tyVarKind tv)))
            pure tv) tele
-  let collect_arrows t
+  let peel_n 0 t
+        | isLargeElimResultKind t = pure ([], toKindMatchableArrows t)
+        | otherwise = Nothing
+      peel_n n t
+        | n > 0
+        , Just (FTF_T_T, ma, mult, arg, rest) <- splitFunTy_maybe t
+        , ma `eqType` unmatchableDataConTy && isManyTy mult
+        = do { (args, res) <- peel_n (n - 1) rest; pure (arg : args, res) }
+        | otherwise = Nothing
+      collect_arrows t
         | Just (FTF_T_T, ma, mult, arg, rest) <- splitFunTy_maybe t
         , ma `eqType` unmatchableDataConTy && isManyTy mult
         = do { (args, res) <- collect_arrows rest; pure (arg : args, res) }
         | tcIsLiftedTypeKind t = pure ([], t)
         | otherwise = Nothing
-  (domains, res_kind) <- MaybeT $ pure (collect_arrows tau)
+  (domains, res_kind) <- MaybeT $ pure $ case mb_arity of
+    Just k  -> peel_n k tau
+    Nothing -> collect_arrows tau
   guard (not (null domains))
   arg_tvs <- lift $ freshAnonArgTyVars domains
   abstract_tc <- lift $ mkSynthClosedFamily fam_name tvs arg_tvs res_kind SynthAbstractFam
@@ -5607,7 +5677,28 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
            ; case owner of
                Nothing -> tc_check_lhs_type mode arg expected
                Just (defaults, _) -> check_arrows defaults arg expected }
-      | otherwise = tc_check_lhs_type mode arg expected
+      | otherwise = do
+          mb_forgot <- case (mode_tyki mode, tcSplitTyConApp_maybe fun, tcSplitFunTy_maybe expected) of
+            (TypeLevel, Just (tc, _), Just (ma, _, _))
+              | isSourceFamilyName (tyConName tc)
+              , ma `tcEqType` unmatchableDataConTy
+              , is_tycon_app_hs_ty arg -> do
+                  (arg_ty, arg_kind) <- tc_infer_lhs_type mode arg
+                  let orig = TypeEqOrigin { uo_actual    = arg_kind
+                                          , uo_expected  = expected
+                                          , uo_thing     = Just (HsTypeRnThing (unLoc arg))
+                                          , uo_invisible = Nothing }
+                  tcForgetMatchabilityArrows orig arg_ty arg_kind expected
+            _ -> pure Nothing
+          case mb_forgot of
+            Just forgotten -> pure forgotten
+            Nothing        -> tc_check_lhs_type mode arg expected
+
+    is_tycon_app_hs_ty (L _ (HsParTy _ inner))  = is_tycon_app_hs_ty inner
+    is_tycon_app_hs_ty (L _ (HsAppTy _ f _))    = is_tycon_app_hs_ty f
+    is_tycon_app_hs_ty (L _ (HsAppKindTy _ f _)) = is_tycon_app_hs_ty f
+    is_tycon_app_hs_ty (L _ (HsTyVar _ _ (L _ (WithUserRdr _ nm)))) = isTyConName nm
+    is_tycon_app_hs_ty _ = False
 
     -- This slot supplies the kind for a wildcard or an exact annotation.
     -- See Note [Primitive family pattern binders] in GHC.Core.Type.

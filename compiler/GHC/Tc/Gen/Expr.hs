@@ -37,7 +37,8 @@ import GHC.Tc.Gen.Expand( tcExpand )
 import GHC.Tc.Gen.App
 import GHC.Tc.Gen.Head
 import GHC.Tc.Gen.Do
-import GHC.Tc.Gen.SourceTable (sourceTableOccurrence, optionalSourceUses, registerOptionalSourceUses)
+import GHC.Tc.Gen.SourceTable (sourceTableOccurrence, optionalSourceUses, registerOptionalSourceUses,
+                               isLargeElimResultKind, toKindMatchableArrows)
 import GHC.Tc.Gen.Bind        ( tcLocalBinds, tcNonRecLets, tcNonRecLetAtType )
 import GHC.Tc.Gen.Sig         ( isCompleteHsSig )
 import GHC.Tc.Gen.HsType
@@ -268,11 +269,12 @@ tcPolyExprCheck expr res_ty
                                   Nothing
                                     | dep -> do
                                         { rho_z <- liftZonkM (zonkTcType rho_ty')
-                                        ; if tcIsLiftedTypeKind rho_z
+                                        ; if isLargeElimResultKind rho_z
                                           then do
                                             { as_ty <- isUnadornedTypeExpr e
                                             ; if as_ty
-                                              then do { wc_ty <- expr_to_type_at_kind liftedTypeKind (noLocA e)
+                                              then do { let res_k = toKindMatchableArrows rho_z
+                                                      ; wc_ty <- expr_to_type_at_kind res_k (noLocA e)
                                                       ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
                                               else tcExpr e (mkCheckExpType rho_ty') }
                                           else tcExpr e (mkCheckExpType rho_ty') }
@@ -1336,12 +1338,13 @@ tcExpr expr@(HsEmbTy _ written) expected
        ; case expected of
            Check ty ->
              do { ty' <- liftZonkM (zonkTcType ty)
-                ; if tcIsLiftedTypeKind ty'
+                ; if isLargeElimResultKind ty'
                   then do
-                    { checked_ty <- tcCheckEmbeddedType written
+                    { let res_k = toKindMatchableArrows ty'
+                    ; checked_ty <- tcCheckEmbeddedTypeAtKind written res_k
                     ; tv_name <- newSysName (mkTyVarOcc "emb")
-                    ; let tv = mkTyVar tv_name liftedTypeKind
-                          err_fun = mkHsWrap (mkWpTyApps [liftedRepTy, liftedTypeKind])
+                    ; let tv = mkTyVar tv_name res_k
+                          err_fun = mkHsWrap (mkWpTyApps [liftedRepTy, ty'])
                                              (mkHsVar (noLocA tYPE_ERROR_ID))
                           err_msg = noLocA (HsLit noExtField
                                       (HsStringPrim NoSourceText

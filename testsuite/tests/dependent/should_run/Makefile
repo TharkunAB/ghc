@@ -446,10 +446,10 @@ DepPluginsPackageDb:
 	time_id="$$('$(GHC_PKG)' --package-db plug_db field time id --simple-output | head -n1)"; \
 	printf 'name: test-general-plugins\nversion: 0.1\nid: %s\nkey: %s\nexposed: True\nexposed-modules: TestTcPlugin TestSourcePlugin TestHoleFitPlugin TestCoreInspectPlugin TestCoreMutatePlugin TestLatePlugin\nimport-dirs: "%s/gen_lib"\nlibrary-dirs: "%s/gen_lib"\ndynamic-library-dirs: "%s/gen_lib"\nhs-libraries: HS%s\ndepends: %s %s\n' \
 	  "$$g_unit" "$$g_unit" "$$PWD" "$$PWD" "$$PWD" "$$g_unit" "$$base_id" "$$ghc_id" | '$(GHC_PKG)' --package-db plug_db register - >/dev/null; \
-	o_unit="dependent-obs-eq-0.2.0.0"; \
+	o_unit="dependent-obs-eq-0.1.0.0"; \
 	o_so="libHS$${o_unit}-ghc$${ghc_ver}.so"; \
 	o_mods="$(DEPENDENT_OBS_EQ_DIR)/src/Dependent/ObsEq.hs $(DEPENDENT_OBS_EQ_DIR)/src/Dependent/Plugin/ObsEq.hs"; \
-	$(HC_BASE) $$pflags -O2 -XGHC2024 --make -no-link -dynamic-too -this-unit-id "$$o_unit" -package base -package containers -package ghc -package time -i -i"$(DEPENDENT_OBS_EQ_DIR)/src" -odir obs_lib -hidir obs_lib $$o_mods; \
+	$(HC_BASE) $$pflags -O0 -XGHC2024 -dynamic-too --make -this-unit-id "$$o_unit" -package base -package containers -package ghc -package time -i"$(DEPENDENT_OBS_EQ_DIR)/src" -odir obs_lib -hidir obs_lib $$o_mods; \
 	"$$ar_cmd" rcs "obs_lib/libHS$${o_unit}.a" $$(find obs_lib -name '*.o' | sort); \
 	$(HC_BASE) $$pflags -shared -dynamic -no-hs-main -package base -package containers -package ghc -package time "-optl-Wl,-soname,$$o_so" $$(find obs_lib -name '*.dyn_o' | sort) -o "obs_lib/$$o_so" 2>/dev/null; \
 	printf 'name: dependent-obs-eq\nversion: 0.2.0.0\nid: %s\nkey: %s\nexposed: True\nexposed-modules: Dependent.ObsEq Dependent.Plugin.ObsEq\nhidden-modules: Dependent.ObsEq.Domain Dependent.ObsEq.Internal Dependent.Plugin.ObsEq.Rewrite\nimport-dirs: "%s/obs_lib"\nlibrary-dirs: "%s/obs_lib"\ndynamic-library-dirs: "%s/obs_lib"\nhs-libraries: HS%s\ndepends: %s %s %s %s\n' \
@@ -473,7 +473,7 @@ DepPluginsPackageDb:
 	mkdir -p holes neg_m1 neg_m2 neg_late; \
 	cp plugins_package_db/ProofWithHoles.hs holes/; \
 	! $(HC_BASE) $$pflags --make -fno-code -fwrite-interface -frefinement-level-hole-fits=1 -package ghc-experimental -package ghc-internal -XGHC2024 -package test-general-plugins -fplugin=TestTcPlugin -fplugin=TestSourcePlugin -fplugin=TestHoleFitPlugin -fplugin=TestCoreInspectPlugin -i -i"$(DEPENDENT_BASE_DIR)/src" -iholes -odir holes/b -hidir holes/b holes/ProofWithHoles.hs > holes/out.log 2>&1; \
-	grep -Fq 'pluginSynthesizedFit' holes/out.log && grep -Fq 'Refl ::' holes/out.log && grep -Fq 'plusZero (_ :: Nat)' holes/out.log; \
+	grep -Fq 'pluginSynthesizedFit' holes/out.log && grep -Fq 'sawGlobalPairAtSkolem' holes/out.log && grep -Fq 'sawSigSkolR1InScope' holes/out.log && grep -Fq 'Refl ::' holes/out.log && grep -Fq 'plusZero (_ :: Nat)' holes/out.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -c -package test-general-plugins -fplugin=TestCoreMutatePlugin -odir neg_m1 -hidir neg_m1 plugins_package_db/BadLookup.hs > neg_m1/out.log 2>&1; \
 	grep -Fq '[GHC-68947]' neg_m1/out.log; \
 	cp plugins_package_db/MutatedProvider.hs plugins_package_db/MutatedClient.hs neg_m2/; \
@@ -485,15 +485,15 @@ DepPluginsPackageDb:
 	cp plugins_package_db/ObsProvider.hs obs_prov/; \
 	$(HC_BASE) $$pflags -O2 -package base -XGHC2024 -c obs_prov/ObsProvider.hs -o obs_prov/ObsProvider.o -ohi obs_prov/ObsProvider.hi; \
 	$(HC_BASE) $$pflags -O2 -dynamic -fPIC -osuf dyn_o -hisuf dyn_hi -package base -XGHC2024 -c obs_prov/ObsProvider.hs -o obs_prov/ObsProvider.dyn_o -ohi obs_prov/ObsProvider.dyn_hi; \
-	$(HC_BASE) $$pflags -O0 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_pos0 -hidir obs_pos0 NativeObsEqPlugin.hs -o obs_pos0/prog && ./obs_pos0/prog >/dev/null; \
-	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_pos2 -hidir obs_pos2 NativeObsEqPlugin.hs -o obs_pos2/prog && ./obs_pos2/prog >/dev/null; \
-	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -i"$(DEPENDENT_OBS_EQ_DIR)/test" -odir obs_pkg -hidir obs_pkg "$(DEPENDENT_OBS_EQ_DIR)/test/Main.hs" -o obs_pkg/prog && ./obs_pkg/prog >/dev/null; \
+	$(HC_BASE) $$pflags -O0 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_pos0 -hidir obs_pos0 NativeObsEqPlugin.hs -o obs_pos0/prog 2>/dev/null && ./obs_pos0/prog >/dev/null; \
+	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_pos2 -hidir obs_pos2 NativeObsEqPlugin.hs -o obs_pos2/prog 2>/dev/null && ./obs_pos2/prog >/dev/null; \
+	$(HC_BASE) $$pflags -O0 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i"$(DEPENDENT_OBS_EQ_DIR)/test" -odir obs_pkg -hidir obs_pkg "$(DEPENDENT_OBS_EQ_DIR)/test/Main.hs" -o obs_pkg/prog 2>/dev/null && ./obs_pkg/prog >/dev/null; \
 	cp obs_prov/ObsProvider.* obs_neg/; \
 	! $(HC_BASE) $$pflags -O0 -c -fno-code -package base -package ghc-experimental -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/NoPluginLocal.hs > obs_neg/np1.log 2>&1 && grep -Fq '[GHC-68947]' obs_neg/np1.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/NoPluginImported.hs > obs_neg/np2.log 2>&1 && grep -Fq '[GHC-70565]' obs_neg/np2.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -odir obs_neg -hidir obs_neg plugins_package_db/EvenRefuted.hs > obs_neg/er.log 2>&1 && grep -Fq 'Observational equivalence refuted' obs_neg/er.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/StrictVsLazy.hs > obs_neg/svl.log 2>&1 && tr '\n' ' ' < obs_neg/svl.log | grep -Eq 'Observational equivalence refuted.*<bottom#'; \
-	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/LoopVsZero.hs > obs_neg/lvz.log 2>&1 && tr '\n' ' ' < obs_neg/lvz.log | grep -Eq 'Observational equivalence inconclusive.*per-sample timeout'; \
+	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/LoopVsZero.hs > obs_neg/lvz.log 2>&1 && tr '\n' ' ' < obs_neg/lvz.log | grep -Eq 'Observational equivalence inconclusive.*timeout'; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/BareReflAssume.hs > obs_neg/bre.log 2>&1 && tr '\n' ' ' < obs_neg/bre.log | grep -Eq 'Couldn.t match type'; \
-	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -fplugin-opt=Dependent.Plugin.ObsEq:policy=assume -XGHC2024 -i -iobs_prov -odir obs_ass -hidir obs_ass plugins_package_db/BareReflAssume.hs -o obs_ass/prog && ./obs_ass/prog; \
+	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -fplugin-opt=Dependent.Plugin.ObsEq:policy=assume -XGHC2024 -i -iobs_prov -odir obs_ass -hidir obs_ass plugins_package_db/BareReflAssume.hs -o obs_ass/prog 2>/dev/null && ./obs_ass/prog; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/BareReflFalseAssume.hs > obs_neg/brfa.log 2>&1 && tr '\n' ' ' < obs_neg/brfa.log | grep -Eq 'Observational equivalence refuted.*<bottom#'

@@ -35,7 +35,8 @@ import GHC.Core.Coercion hiding( substCo )
 import GHC.Core.Rules
 import GHC.Core.Predicate ( scopedSort, typeDeterminesValue )
 import GHC.Core.Type     hiding ( substTy )
-import GHC.Core.TyCo.Rep (Type(DepFunTy))
+import GHC.Core.TyCo.Rep (Type(DepFunTy, DepDictTy))
+import GHC.Core.TyCo.Compare ( eqType )
 import GHC.Core.TyCon   (TyCon, tyConName )
 import GHC.Core.Multiplicity
 import GHC.Core.Ppr     ( pprParendExpr )
@@ -2674,11 +2675,9 @@ callToPat env bndr_occs call@(Call fn args con_env)
                 -- See Note [Free type variables of the qvar types]
                 -- See Note [Shadowing in SpecConstr] at the top
 
-              (qktvs, qids) = partition isTyVar qvars
-              qvars'        = scopedSort qktvs ++ qids
-                -- Order into kind variables, type variables, term variables
-                -- The kind of a type variable may mention a kind variable
-                -- and the type of a term variable may mention a type variable
+              (_qktvs, qids) = partition isTyVar qvars
+              qvars'         = scopedSort qvars
+                -- Order into dependency order across kind, type, and retained term variables
 
         -- Check for bad coercion variables: see Note [SpecConstr and casts]
         ; let bad_covars = filter isCoVar qids
@@ -2717,7 +2716,10 @@ argsToPats env in_scope val_env = go
       = do { (pat, strs') <- case arg of
                Type {} -> do { pat <- argToPat env in_scope val_env arg_ty arg occ NotMarkedStrict
                              ; return (pat, strs) }
-               _ | str : strs' <- strs
+               _ | is_dep_dict, _ : strs' <- strs
+                       -> do { pat <- wildCardPat arg_ty NotMarkedStrict
+                             ; return (pat, strs') }
+                 | str : strs' <- strs
                        -> do { pat <- argToPat env in_scope val_env arg_ty arg occ str
                              ; return (pat, strs') }
                  | otherwise
@@ -2726,7 +2728,11 @@ argsToPats env in_scope val_env = go
            ; pats <- go (applyTypeToArgs fun_ty [sndOf3 pat]) args occs strs'
            ; return (pat : pats) }
       where
+        is_dep_dict = case coreFullView fun_ty of
+                        DepDictTy {} -> True
+                        _            -> False
         arg_ty | DepFunTy _ binder _ <- coreFullView fun_ty = varType binder
+               | DepDictTy binder _  <- coreFullView fun_ty = varType binder
                | otherwise = let (_, bndr, _) = splitPiTy fun_ty in piTyBinderType bndr
 
 -- | 'argToPat' takes an actual argument, and returns an abstracted
@@ -2789,6 +2795,12 @@ argToPat1 env in_scope val_env pat_ty (Let _ arg) arg_occ arg_str
         -- e.g.         f (let v = rhs in (v,w))
         -- Here we can specialise for f (v,w)
         -- because the rule-matcher will look through the let.
+
+   -- When an earlier retained dependent argument was abstracted to a wildcard or
+   -- partial constructor pattern, pat_ty no longer matches exprType arg.
+argToPat1 _env _in_scope _val_env pat_ty arg _arg_occ arg_str
+  | not (pat_ty `eqType` exprType arg)
+  = wildCardPat pat_ty arg_str
 
    -- Casts: see Note [SpecConstr and casts]
 argToPat1 env in_scope val_env pat_ty (Cast arg co) arg_occ arg_str
