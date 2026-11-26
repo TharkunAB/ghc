@@ -1206,7 +1206,7 @@ setNominalRole_maybe r co
     setNominalRole_maybe_helper co@(TermAppCo {}) = Just co
     setNominalRole_maybe_helper (DepFunCo visL visR b domain co)
       -- See Note [Retained function visibility coercions] in GHC.Core.TyCo.Make.
-      | visL == visR
+      | visL `eqDepFunVis` visR
       = mkDepFunCoWithVis visL visR b domain <$> setNominalRole_maybe_helper co
     setNominalRole_maybe_helper co@(ForAllCo { fco_visL = visL, fco_visR = visR, fco_body = body_co })
       | visL `eqForAllVis` visR -- See (FC3) in Note [ForAllCo] in GHC.Core.TyCo.Rep

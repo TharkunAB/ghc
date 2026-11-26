@@ -1150,7 +1150,7 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
     bind_indices allow vis mode (L loc bndr : rest) body
       = setSrcSpanA loc $
         let mark_bndr
-              | vis == DepFunInvisible
+              | isInvisibleDepFunFlag vis
               = (if isInferredForEachBndr bndr then markInferredRetainedBinder else id)
                 . markInvisibleRetainedBinder
               | otherwise = id
@@ -1159,15 +1159,19 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
             do { domain_ty <- tcRetainedBinderDomain valid_field_domain mode domain
                ; let index = mark_bndr (mkLocalId name ManyTy domain_ty)
                      mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name index }
+                     vis'  | isInvisibleDepFunFlag vis, isInferredForEachBndr bndr = DepFunInferred
+                           | otherwise = vis
                ; (binders, body_ty) <- bind_indices allow vis mode' rest body
-               ; return (Just index : binders, mkDepFunTyWithVis vis index body_ty) }
+               ; return (Just index : binders, mkDepFunTyWithVis vis' index body_ty) }
           HsTvb _ () (HsBndrWildCard _) (HsBndrKind _ domain)
-            | vis == DepFunInvisible ->
+            | isInvisibleDepFunFlag vis ->
               do { domain_ty <- tcRetainedBinderDomain valid_field_domain mode domain
                  ; sys_name <- newSysName (mkVarOcc "_")
                  ; let index = mark_bndr (mkLocalId sys_name ManyTy domain_ty)
+                       vis'  | isInferredForEachBndr bndr = DepFunInferred
+                             | otherwise                 = DepFunInvisible
                  ; (binders, body_ty) <- bind_indices allow vis mode rest body
-                 ; return (Just index : binders, mkDepFunTyWithVis DepFunInvisible index body_ty) }
+                 ; return (Just index : binders, mkDepFunTyWithVis vis' index body_ty) }
             | otherwise ->
               do { domain_ty <- tc_check_lhs_type mode domain liftedTypeKind
                  ; (binders, body_ty) <- bind_indices allow vis mode rest body

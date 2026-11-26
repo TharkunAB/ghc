@@ -6,10 +6,8 @@ import GHC.Prelude
 import GHC.Settings.Config
 
 hiVersion :: Integer
--- The suffix changes when the fork changes a common interface payload.
--- Reject old HEq# applications and heq_sel references before decoding Core.
--- Version 80 also gates scoped workers for GADTs with quantified index kinds.
-hiVersion = read (cProjectVersionInt ++ cProjectPatchLevel ++ "80") :: Integer
+-- Increment the suffix whenever the binary interface format changes.
+hiVersion = read (cProjectVersionInt ++ cProjectPatchLevel ++ "81") :: Integer
 
 -- All pretty arbitrary:
 

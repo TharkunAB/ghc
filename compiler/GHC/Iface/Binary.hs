@@ -19,8 +19,6 @@ module GHC.Iface.Binary (
         getIfaceWithExtFields,
         putIfaceWithExtFields,
         sourceTableLocations,
-        scopedSumDomainField, composedScopedSumDomainField, scopedSumDomainFields,
-        couldInferLiberalSynonymMatchability,
         getWithUserData,
         putWithUserData,
 
@@ -36,39 +34,28 @@ module GHC.Iface.Binary (
 import GHC.Prelude
 
 import GHC.Builtin   ( knownKeyOccMap, wiredInNamesMap )
-import GHC.Builtin.KnownKeys (matchabilityTyConKey)
-import GHC.Builtin.WiredIn.Types (matchableDataConName)
 import GHC.Builtin.Uniques( knownUniqueTupleName )
 
 import GHC.Utils.Panic
 import GHC.Utils.Binary as Binary
-import GHC.Utils.Misc (split)
 import GHC.Utils.Outputable
 
-import GHC.Types.Avail (availNames)
 import GHC.Types.Name
-import GHC.Types.Name.Set (elemNameSet, mkNameSet)
 import GHC.Types.Unique
 import GHC.Types.SrcLoc
 import GHC.Types.Name.Cache
 import GHC.Types.Unique.FM
 
 import GHC.Unit
-import GHC.Unit.Module.Deps (Usage(UsageHomeModuleInterface))
 import GHC.Unit.Module.ModIface
 
 import GHC.Platform.Profile
 import GHC.Platform
 import GHC.Settings.Constants
-import GHC.Iface.Ext.Fields
-  ( depFunUnfoldingField, getExtensibleFields, readFieldWith, writeFieldWith, deleteField )
-import GHC.Iface.Syntax (IfaceDecl(..), IfaceFamTyConFlav(..), IfaceClassBody(..), IfaceAT(..), IfaceIdDetails(..))
-import GHC.Types.Basic (SourceTableOrigin(ExecutableSourceTable, FinalCoreSourceTable))
-import GHC.Iface.Type (IfaceType(..), IfaceBndr(..), IfaceAppArgs(..), IfaceTyCon(..), IfaceTyConBinder,
-                       getIfaceType, putIfaceType, ifaceTypeSharedByte,
-                       IfaceEvidence(..), IfaceEvidenceVersion)
-import GHC.Core.TyCon (isInferredTyConBinder, isVisibleTyConBinder)
-import GHC.Types.Var (VarBndr(..), isInvisibleFunArg, isVisibleFunArg)
+import GHC.Iface.Ext.Fields ( readFieldWith, writeFieldWith, deleteField )
+import GHC.Iface.Syntax (IfaceDecl(..))
+import GHC.Iface.Type (IfaceType(..),
+                       getIfaceType, putIfaceType, ifaceTypeSharedByte)
 
 import GHC.Data.FastMutInt
 import GHC.Data.Maybe( orElse )
@@ -79,13 +66,8 @@ import Data.Array.IO
 import Data.Array.Unsafe
 import Data.Char
 import Data.IORef
-import Data.List (find, intercalate, stripPrefix)
 import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
 import Data.Word
-import qualified Data.ByteString as BS
-import System.IO (IOMode(WriteMode), withBinaryFile)
 import System.IO.Unsafe
 import Data.Typeable (Typeable)
 import qualified GHC.Data.Strict as Strict
@@ -133,8 +115,8 @@ instance Outputable CompressionIFace where
   ppr = text . show
 
 -- | Read an interface file header, checking the magic number, version, and
--- way. Returns the hash of the source file and a BinHandle which points at the
--- start of the rest of the interface file data.
+-- way. Returns a BinHandle which points at the start of the rest of the
+-- interface file data.
 readBinIfaceHeader
   :: Profile
   -> NameCache
@@ -142,12 +124,7 @@ readBinIfaceHeader
   -> TraceBinIFace
   -> FilePath
   -> IO ReadBinHandle
-readBinIfaceHeader profile _name_cache checkHiWay traceBinIFace hi_path =
-    snd <$> readBinIfaceHeaderVersion profile checkHiWay traceBinIFace hi_path
-
-readBinIfaceHeaderVersion
-  :: Profile -> CheckHiWay -> TraceBinIFace -> FilePath -> IO (IfaceEvidenceVersion, ReadBinHandle)
-readBinIfaceHeaderVersion profile checkHiWay traceBinIFace hi_path = do
+readBinIfaceHeader profile _name_cache checkHiWay traceBinIFace hi_path = do
     let platform = profilePlatform profile
 
         wantedGot :: String -> a -> a -> (a -> SDoc) -> IO ()
@@ -180,14 +157,7 @@ readBinIfaceHeaderVersion profile checkHiWay traceBinIFace hi_path = do
     check_ver  <- get bh
     let our_ver = show hiVersion
     wantedGot "Version" our_ver check_ver text
-    let versions = [our_ver, enumCallbackIfaceVersion, finalCoreIfaceVersion,
-                    matchabilitySchemeIfaceVersion, openMatchabilityIfaceVersion,
-                    constrainedFamilyIfaceVersion]
-    evidence <- case listToMaybe (mapMaybe (parse_version check_ver) versions) of
-        Just requirements -> pure requirements
-        Nothing -> do
-            errorOnMismatch "mismatched interface file versions" our_ver check_ver
-            pure Set.empty
+    errorOnMismatch "mismatched interface file versions" our_ver check_ver
 
     check_tag <- get bh
     let tag = profileBuildTag profile
@@ -195,11 +165,7 @@ readBinIfaceHeaderVersion profile checkHiWay traceBinIFace hi_path = do
     when (checkHiWay == CheckHiWay) $
         errorOnMismatch "mismatched interface file profile tag" tag check_tag
 
-    pure (evidence, bh)
-  where
-    parse_version actual base = do
-      suffix <- stripPrefix base actual
-      parseEvidenceSuffix (stripPrefix liberalSynonymCallbackSuffix suffix `orElse` suffix)
+    return bh
 
 -- | Read an interface file.
 --
@@ -212,15 +178,12 @@ readBinIface
   -> FilePath
   -> IO ModIface
 readBinIface profile name_cache checkHiWay traceBinIface hi_path = do
-    (evidence, bh) <- readBinIfaceHeaderVersion profile checkHiWay traceBinIface hi_path
-
-    mod_iface <- getIfaceWithExtFields evidence name_cache bh
-
-    return $ mod_iface
+    bh <- readBinIfaceHeader profile name_cache checkHiWay traceBinIface hi_path
+    getIfaceWithExtFields name_cache bh
 
 
-getIfaceWithExtFields :: IfaceEvidenceVersion -> NameCache -> ReadBinHandle -> IO ModIface
-getIfaceWithExtFields evidence name_cache bh = do
+getIfaceWithExtFields :: NameCache -> ReadBinHandle -> IO ModIface
+getIfaceWithExtFields name_cache bh = do
   -- Start offset for the byte array that contains the serialised 'ModIface'.
   start <- tellBinReader bh
   extFields_p_rel <- getRelBin bh
@@ -245,7 +208,7 @@ getIfaceWithExtFields evidence name_cache bh = do
   modIfaceBinData <- freezeBinHandle bh start
   pure $ located_iface
     & set_mi_ext_fields extFields
-    & set_mi_hi_bytes (FullIfaceBinHandle $ Strict.Just (evidence, modIfaceBinData))
+    & set_mi_hi_bytes (FullIfaceBinHandle $ Strict.Just modIfaceBinData)
 
 -- | This performs a get action after reading the dictionary and symbol
 -- table. It is necessary to run this before trying to deserialise any
@@ -299,471 +262,22 @@ writeBinIface :: Profile -> TraceBinIFace -> CompressionIFace -> FilePath -> Mod
 writeBinIface profile traceBinIface compressionLevel hi_path mod_iface = do
     case traceBinIface of
       QuietBinIFace -> pure ()
-      TraceBinIFace printer -> do
+      TraceBinIFace printer ->
         printer (text "writeBinIface compression level:" <+> ppr compressionLevel)
 
     bh <- openBinMem initBinMemSize
-    let writeHeader h version = do
-          put_ h (binaryInterfaceMagic (profilePlatform profile))
-          put_ h version
-          put_ h (profileBuildTag profile)
-
-    -- Select the existing version first. The writer records extra features.
-    let base_version
-          | any (hasConstrainedFamily . snd) (mi_decls mod_iface) = constrainedFamilyIfaceVersion
-          | any (hasOpenMatchabilityScheme . snd) (mi_decls mod_iface) = openMatchabilityIfaceVersion
-          | any hasMatchabilityScheme (mi_decls mod_iface) = matchabilitySchemeIfaceVersion
-          | any hasFinalCore (mi_decls mod_iface) = finalCoreIfaceVersion
-          | any hasEnumCallback (mi_decls mod_iface) = enumCallbackIfaceVersion
-          | otherwise = show hiVersion
-        version
-          | hasLiberalSynonymCallback (mi_exports mod_iface) (map snd (mi_decls mod_iface)) =
-              base_version ++ liberalSynonymCallbackSuffix
-          | otherwise = base_version
-    writeHeader bh version
-    payload <- tellBinWriter bh
-    recorded <- putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface
-    -- A selector definition may bind a dictionary without making a dependent
-    -- dictionary application. The complete Core payload still needs its reader.
-    let evidence
-          | isJust (mi_simplified_core mod_iface)
-          , Set.member ExperimentalScopedDictionaryEvidence recorded
-          = Set.insert ExperimentalScopedDictionaryCoreEvidence recorded
-          | otherwise = recorded
-    if Set.null evidence
-      then writeBinMem bh hi_path
-      else do
-        header <- openBinMem 128
-        writeHeader header (version ++ evidenceSuffix evidence)
-        -- The payload uses relative offsets, so it can follow the longer header.
-        withBinaryFile hi_path WriteMode $ \ h ->
-          withBinBuffer header $ \ prefix ->
-            withBinBufferFrom bh payload $ \ body -> do
-              BS.hPut h prefix
-              BS.hPut h body
-
--- | Header suffix required by the retained evidence in the payload.
-evidenceSuffix :: IfaceEvidenceVersion -> String
-evidenceSuffix requirements
-  | needs ErasedUserRuleEvidence || needs LexicalPackageRuleEvidence
-    || needs OrphanErasedUserRuleEvidence || needs AnchoredErasedRuleEvidence
-    || needs RetainedUserRuleEvidence || needs ImportedRetainedRuleEvidence
-    || needs IndexedConstructorCaseEvidence || needs IndexedConstructorFieldsEvidence
-    || needs IndexedOrdinaryConstructorCaseEvidence || needs IndexedDiagonalConstructorCaseEvidence
-    || needs IndexedConstructorOperandEvidence
-    || needs IndexedConstructorExistentialCaseEvidence || needs GeneralIndexedConstructorOperandEvidence
-    || needs RetainedUserUnfoldingEvidence || needs LinearUnpackEvidence
-    || needs RetainedCharOperandEvidence || needs MatchableProjectionEvidence
-    || needs RetainedNaturalOperandEvidence
-    || needs ExperimentalIntPrimIndexEvidence || needs ExperimentalWordPrimIndexEvidence
-    || needs ExperimentalScopedDictionaryEvidence
-    || needs ExperimentalScopedDictionaryCoreEvidence || needs RetainedDataFamilyConOperandEvidence
-    || needs TerminalGadtForAllEvidence || needs TerminalGadtContextEvidence
-    || needs TerminalGadtTrailingContextEvidence || needs TerminalGadtContextOnlyEvidence
-    || needs InteriorGadtContextEvidence || needs InteriorGadtForAllEvidence
-    || needs RepeatedInteriorGadtForAllEvidence || needs OrderedGadtTelescopeEvidence
-    || needs InferredOrderedGadtBindersEvidence
-    || needs ExtendedOrderedGadtTelescopeEvidence || needs FieldlessOrderedGadtTelescopeEvidence
-    || needs RefinedOrderedGadtTelescopeEvidence
-    || needs ScopedLambdaEvidence || needs ScopedLambdaEtaEvidence
-    || needs RetainedConstructorContextEvidence
-    || needs HomeRuleInterfaceEvidence || needs PartialSynonymEvidence
-    || needs PartialBuiltinFamilyEvidence
-    || needs SourceProofRuleEvidence || needs SourceProofRuleAliasEvidence
-    || needs SourceProofRuleAxiomEvidence || needs SourceProofRuleInfoEvidence
-    || needs SourceProofRuleArgumentsEvidence || needs PolymorphicSourceMethodEvidence
-    || needs SourceProofRuleBranchesEvidence || needs ScopedEnumCaseEvidence
-    || needs ScopedConstructorCaseEvidence || needs ScopedCaseResultEvidence
-    || needs OrderedNewtypeTelescopeEvidence || needs ScopedOrderedCaseEvidence
-    || needs OrderedRepPolyNewtypeEvidence || needs OrderedTypeDataTelescopeEvidence
-    || needs NamedRetainedCallbackEvidence || needs ScopedSumDomainEvidence
-    || needs ComposedScopedSumDomainEvidence || needs RetainedSiblingFieldsEvidence
-    || needs RetainedNamedRecordEvidence || needs RetainedRecordParametersEvidence
-    || needs CheckedClosureSourceTableEvidence || needs OpaqueOrdinaryConstructorCaseEvidence
-    || needs RetainedDepFunUnfoldingEvidence = feature_set
-  | needs RetainedDefaultEvidence
-  , needs ErasedExistentialEvidence || needs ScopedSigmaEvidence || needs ImplicitExistentialEvidence
-  = feature_set
-  | needs ImplicitExistentialEvidence && needs ScopedSigmaEvidence
-  = feature_set
-  | needs ScopedSigmaEvidence
-  , needs IndexAliasEvidence || needs ErasedExistentialEvidence
-  = combinedScopedSigmaSuffix
-  | otherwise = maybe "" legacyEvidenceSuffix (Set.lookupMax requirements)
-  where
-    needs feature = Set.member feature requirements
-    feature_set = featureSetPrefix ++ intercalate "+" [name | (name, feature) <- independentFeatures, needs feature]
-
-legacyEvidenceSuffix :: IfaceEvidence -> String
-legacyEvidenceSuffix ExperimentalIntPrimIndexEvidence = featureSetPrefix ++ "experimental-int-prim-index"
-legacyEvidenceSuffix ExperimentalWordPrimIndexEvidence = featureSetPrefix ++ "experimental-word-prim-index"
-legacyEvidenceSuffix ScopedEnumCaseEvidence = featureSetPrefix ++ "scoped-enum-case-v1"
-legacyEvidenceSuffix ScopedConstructorCaseEvidence = featureSetPrefix ++ "scoped-constructor-case-v1"
-legacyEvidenceSuffix ScopedCaseResultEvidence = featureSetPrefix ++ "scoped-case-result-v1"
-legacyEvidenceSuffix OrderedNewtypeTelescopeEvidence = featureSetPrefix ++ "ordered-newtype-telescope"
-legacyEvidenceSuffix ScopedOrderedCaseEvidence = featureSetPrefix ++ "scoped-ordered-case-v1"
-legacyEvidenceSuffix OrderedRepPolyNewtypeEvidence = featureSetPrefix ++ "ordered-rep-poly-newtype"
-legacyEvidenceSuffix OrderedTypeDataTelescopeEvidence = featureSetPrefix ++ "ordered-type-data-telescope"
-legacyEvidenceSuffix PartialSynonymEvidence = featureSetPrefix ++ "partial-synonym-v2"
-legacyEvidenceSuffix PartialBuiltinFamilyEvidence = featureSetPrefix ++ "partial-builtin-family-v1"
-legacyEvidenceSuffix ErasedUserRuleEvidence = featureSetPrefix ++ "user-rule"
-legacyEvidenceSuffix LexicalPackageRuleEvidence = featureSetPrefix ++ "lexical-rule"
-legacyEvidenceSuffix OrphanErasedUserRuleEvidence = featureSetPrefix ++ "orphan-user-rule"
-legacyEvidenceSuffix AnchoredErasedRuleEvidence = featureSetPrefix ++ "anchored-user-rule"
-legacyEvidenceSuffix RetainedUserRuleEvidence = featureSetPrefix ++ "retained-user-rule"
-legacyEvidenceSuffix ImportedRetainedRuleEvidence = featureSetPrefix ++ "imported-retained-rule"
-legacyEvidenceSuffix IndexedConstructorCaseEvidence = featureSetPrefix ++ "indexed-constructor-case"
-legacyEvidenceSuffix IndexedConstructorFieldsEvidence = featureSetPrefix ++ "indexed-constructor-fields"
-legacyEvidenceSuffix IndexedOrdinaryConstructorCaseEvidence = featureSetPrefix ++ "indexed-ordinary-constructor-case"
-legacyEvidenceSuffix IndexedDiagonalConstructorCaseEvidence = featureSetPrefix ++ "indexed-diagonal-constructor-case"
-legacyEvidenceSuffix IndexedConstructorOperandEvidence = featureSetPrefix ++ "indexed-constructor-operand"
-legacyEvidenceSuffix IndexedConstructorExistentialCaseEvidence = featureSetPrefix ++ "indexed-constructor-existential-case"
-legacyEvidenceSuffix RetainedUserUnfoldingEvidence = featureSetPrefix ++ "retained-user-unfolding"
-legacyEvidenceSuffix LinearUnpackEvidence = featureSetPrefix ++ "linear-unpack"
-legacyEvidenceSuffix RetainedCharOperandEvidence = featureSetPrefix ++ "retained-char-operand"
-legacyEvidenceSuffix MatchableProjectionEvidence = featureSetPrefix ++ "matchable-projection"
-legacyEvidenceSuffix RetainedNaturalOperandEvidence = featureSetPrefix ++ "retained-natural-operand"
-legacyEvidenceSuffix ExperimentalScopedDictionaryEvidence = featureSetPrefix ++ "experimental-scoped-dictionary"
-legacyEvidenceSuffix ExperimentalScopedDictionaryCoreEvidence = featureSetPrefix ++ "experimental-scoped-dictionary-core-v3"
-legacyEvidenceSuffix RetainedDataFamilyConOperandEvidence = featureSetPrefix ++ "retained-data-family-constructor-operand"
-legacyEvidenceSuffix TerminalGadtForAllEvidence = featureSetPrefix ++ "terminal-gadt-forall"
-legacyEvidenceSuffix TerminalGadtContextEvidence = featureSetPrefix ++ "terminal-gadt-context"
-legacyEvidenceSuffix TerminalGadtTrailingContextEvidence = featureSetPrefix ++ "terminal-gadt-trailing-context"
-legacyEvidenceSuffix TerminalGadtContextOnlyEvidence = featureSetPrefix ++ "terminal-gadt-context-only"
-legacyEvidenceSuffix InteriorGadtContextEvidence = featureSetPrefix ++ "interior-gadt-context"
-legacyEvidenceSuffix InteriorGadtForAllEvidence = featureSetPrefix ++ "interior-gadt-forall"
-legacyEvidenceSuffix RepeatedInteriorGadtForAllEvidence = featureSetPrefix ++ "repeated-interior-gadt-forall"
-legacyEvidenceSuffix OrderedGadtTelescopeEvidence = featureSetPrefix ++ "ordered-gadt-telescope"
-legacyEvidenceSuffix InferredOrderedGadtBindersEvidence = featureSetPrefix ++ "inferred-ordered-gadt-binders"
-legacyEvidenceSuffix ExtendedOrderedGadtTelescopeEvidence = featureSetPrefix ++ "extended-ordered-gadt-telescope"
-legacyEvidenceSuffix FieldlessOrderedGadtTelescopeEvidence = featureSetPrefix ++ "fieldless-ordered-gadt-telescope"
-legacyEvidenceSuffix RefinedOrderedGadtTelescopeEvidence = featureSetPrefix ++ "refined-ordered-gadt-telescope"
-legacyEvidenceSuffix ScopedLambdaEvidence = featureSetPrefix ++ "scoped-lambda"
-legacyEvidenceSuffix ScopedLambdaEtaEvidence = featureSetPrefix ++ "scoped-lambda-eta-v1"
-legacyEvidenceSuffix RetainedConstructorContextEvidence = featureSetPrefix ++ "retained-constructor-context"
-legacyEvidenceSuffix HomeRuleInterfaceEvidence = featureSetPrefix ++ "home-rule-interfaces"
-legacyEvidenceSuffix SourceProofRuleEvidence = featureSetPrefix ++ "source-proof-rules"
-legacyEvidenceSuffix SourceProofRuleAliasEvidence = featureSetPrefix ++ "source-proof-rule-aliases"
-legacyEvidenceSuffix SourceProofRuleAxiomEvidence = featureSetPrefix ++ "source-proof-rule-axioms"
-legacyEvidenceSuffix SourceProofRuleInfoEvidence = featureSetPrefix ++ "source-proof-id-rules"
-legacyEvidenceSuffix SourceProofRuleArgumentsEvidence = featureSetPrefix ++ "source-proof-rule-arguments"
-legacyEvidenceSuffix PolymorphicSourceMethodEvidence = featureSetPrefix ++ "polymorphic-source-method"
-legacyEvidenceSuffix SourceProofRuleBranchesEvidence = featureSetPrefix ++ "source-proof-rule-branches"
-legacyEvidenceSuffix GeneralIndexedConstructorOperandEvidence = featureSetPrefix ++ "general-indexed-constructor-operand"
-legacyEvidenceSuffix ScopedSumDomainEvidence = featureSetPrefix ++ "scoped-sum-domain-v1"
-legacyEvidenceSuffix ComposedScopedSumDomainEvidence = featureSetPrefix ++ "scoped-sum-domain-v2"
-legacyEvidenceSuffix RetainedSiblingFieldsEvidence = featureSetPrefix ++ "retained-sibling-fields-v1"
-legacyEvidenceSuffix RetainedNamedRecordEvidence = featureSetPrefix ++ "retained-named-record-v1"
-legacyEvidenceSuffix RetainedRecordParametersEvidence = featureSetPrefix ++ "retained-record-parameters-v1"
-legacyEvidenceSuffix CheckedClosureSourceTableEvidence = featureSetPrefix ++ "checked-closure-source-table"
-legacyEvidenceSuffix OpaqueOrdinaryConstructorCaseEvidence = featureSetPrefix ++ "opaque-ordinary-constructor-case"
-legacyEvidenceSuffix RetainedDepFunUnfoldingEvidence = featureSetPrefix ++ "retained-depfun-unfolding"
-legacyEvidenceSuffix NamedRetainedCallbackEvidence = featureSetPrefix ++ "named-retained-callback-v1"
-legacyEvidenceSuffix DepFunCoEvidence           = "-retained-depfunco-v1"
-legacyEvidenceSuffix ConstructorCaseEvidence   = "-retained-constructor-case-v1"
-legacyEvidenceSuffix RetainedSpecRuleEvidence  = "-retained-specialisation-rule-v1"
-legacyEvidenceSuffix IndexAliasEvidence        = "-retained-index-alias-v1"
-legacyEvidenceSuffix ErasedExistentialEvidence = "-erased-existentials-v1"
-legacyEvidenceSuffix ImplicitExistentialEvidence = "-implicit-existentials-v1"
-legacyEvidenceSuffix ScopedSigmaEvidence       = "-r04-scoped-sigma-experiment-v1"
-legacyEvidenceSuffix RetainedDefaultEvidence   = "-retained-compulsory-default-v1"
-
-combinedScopedSigmaSuffix :: String
-combinedScopedSigmaSuffix = "-scoped-sigma-combined-v1"
-
-featureSetPrefix :: String
-featureSetPrefix = "-retained-features-v1-"
-
--- | Keep the wire order independent of declaration and compression order.
-independentFeatures :: [(String, IfaceEvidence)]
-independentFeatures = [ ("default", RetainedDefaultEvidence)
-                      , ("erased", ErasedExistentialEvidence)
-                      , ("implicit", ImplicitExistentialEvidence)
-                      , ("scoped", ScopedSigmaEvidence)
-                      , ("user-rule", ErasedUserRuleEvidence)
-                      , ("lexical-rule", LexicalPackageRuleEvidence)
-                      , ("orphan-user-rule", OrphanErasedUserRuleEvidence)
-                      , ("anchored-user-rule", AnchoredErasedRuleEvidence)
-                      , ("retained-user-rule", RetainedUserRuleEvidence)
-                      , ("imported-retained-rule", ImportedRetainedRuleEvidence)
-                      , ("indexed-constructor-case", IndexedConstructorCaseEvidence)
-                      , ("indexed-constructor-fields", IndexedConstructorFieldsEvidence)
-                      , ("indexed-ordinary-constructor-case", IndexedOrdinaryConstructorCaseEvidence)
-                      , ("indexed-diagonal-constructor-case", IndexedDiagonalConstructorCaseEvidence)
-                      , ("indexed-constructor-operand", IndexedConstructorOperandEvidence)
-                      , ("indexed-constructor-existential-case", IndexedConstructorExistentialCaseEvidence)
-                      , ("general-indexed-constructor-operand", GeneralIndexedConstructorOperandEvidence)
-                      , ("retained-user-unfolding", RetainedUserUnfoldingEvidence)
-                      , ("linear-unpack", LinearUnpackEvidence)
-                      , ("retained-char-operand", RetainedCharOperandEvidence)
-                      , ("matchable-projection", MatchableProjectionEvidence)
-                      , ("retained-natural-operand", RetainedNaturalOperandEvidence)
-                      , ("experimental-int-prim-index", ExperimentalIntPrimIndexEvidence)
-                      , ("experimental-word-prim-index", ExperimentalWordPrimIndexEvidence)
-                      , ("experimental-scoped-dictionary", ExperimentalScopedDictionaryEvidence)
-                      , ("experimental-scoped-dictionary-core-v3", ExperimentalScopedDictionaryCoreEvidence)
-                      , ("retained-data-family-constructor-operand", RetainedDataFamilyConOperandEvidence)
-                      , ("terminal-gadt-forall", TerminalGadtForAllEvidence)
-                      , ("terminal-gadt-context", TerminalGadtContextEvidence)
-                      , ("terminal-gadt-trailing-context", TerminalGadtTrailingContextEvidence)
-                      , ("terminal-gadt-context-only", TerminalGadtContextOnlyEvidence)
-                      , ("interior-gadt-context", InteriorGadtContextEvidence)
-                      , ("interior-gadt-forall", InteriorGadtForAllEvidence)
-                      , ("repeated-interior-gadt-forall", RepeatedInteriorGadtForAllEvidence)
-                      , ("ordered-gadt-telescope", OrderedGadtTelescopeEvidence)
-                      , ("inferred-ordered-gadt-binders", InferredOrderedGadtBindersEvidence)
-                      , ("extended-ordered-gadt-telescope", ExtendedOrderedGadtTelescopeEvidence)
-                      , ("fieldless-ordered-gadt-telescope", FieldlessOrderedGadtTelescopeEvidence)
-                      , ("refined-ordered-gadt-telescope", RefinedOrderedGadtTelescopeEvidence)
-                      , ("scoped-lambda", ScopedLambdaEvidence)
-                      , ("scoped-lambda-eta-v1", ScopedLambdaEtaEvidence)
-                      , ("retained-constructor-context", RetainedConstructorContextEvidence)
-                      , ("home-rule-interfaces", HomeRuleInterfaceEvidence)
-                      , ("partial-synonym-v2", PartialSynonymEvidence)
-                      , ("source-proof-rules", SourceProofRuleEvidence)
-                      , ("source-proof-rule-aliases", SourceProofRuleAliasEvidence)
-                      , ("source-proof-rule-axioms", SourceProofRuleAxiomEvidence)
-                      , ("source-proof-id-rules", SourceProofRuleInfoEvidence)
-                      , ("source-proof-rule-arguments", SourceProofRuleArgumentsEvidence)
-                      , ("polymorphic-source-method", PolymorphicSourceMethodEvidence)
-                      , ("source-proof-rule-branches", SourceProofRuleBranchesEvidence)
-                      , ("scoped-enum-case-v1", ScopedEnumCaseEvidence)
-                      , ("scoped-constructor-case-v1", ScopedConstructorCaseEvidence)
-                      , ("scoped-case-result-v1", ScopedCaseResultEvidence)
-                      , ("ordered-newtype-telescope", OrderedNewtypeTelescopeEvidence)
-                      , ("scoped-ordered-case-v1", ScopedOrderedCaseEvidence)
-                      , ("ordered-rep-poly-newtype", OrderedRepPolyNewtypeEvidence)
-                      , ("ordered-type-data-telescope", OrderedTypeDataTelescopeEvidence)
-                      , ("named-retained-callback-v1", NamedRetainedCallbackEvidence)
-                      , ("partial-builtin-family-v1", PartialBuiltinFamilyEvidence)
-                      , ("scoped-sum-domain-v1", ScopedSumDomainEvidence)
-                      , ("scoped-sum-domain-v2", ComposedScopedSumDomainEvidence)
-                      , ("retained-sibling-fields-v1", RetainedSiblingFieldsEvidence)
-                      , ("retained-named-record-v1", RetainedNamedRecordEvidence)
-                      , ("retained-record-parameters-v1", RetainedRecordParametersEvidence)
-                      , ("checked-closure-source-table", CheckedClosureSourceTableEvidence)
-                      , ("opaque-ordinary-constructor-case", OpaqueOrdinaryConstructorCaseEvidence)
-                      , ("retained-depfun-unfolding", RetainedDepFunUnfoldingEvidence) ]
-
--- | Accept the old suffixes and the canonical spelling of a new feature set.
-parseEvidenceSuffix :: String -> Maybe IfaceEvidenceVersion
-parseEvidenceSuffix "" = Just Set.empty
-parseEvidenceSuffix suffix
-  | suffix == combinedScopedSigmaSuffix
-  = Just (Set.fromList [ScopedSigmaEvidence, ErasedExistentialEvidence])
-  | Just feature <- find ((== suffix) . legacyEvidenceSuffix) [minBound..maxBound]
-  = Just (Set.singleton feature)
-  | Just names <- stripPrefix featureSetPrefix suffix
-  , Just features <- traverse (`lookup` independentFeatures) (split '+' names)
-  , let requirements = Set.fromList features
-  , evidenceSuffix requirements == suffix
-  = Just requirements
-  | otherwise = Nothing
-
-{- Note [Versioning retained evidence]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In an optimized unfolding of second, a Pair alternative binds its two
-fields and a nominal equality. A reader that expects only constructor
-fields loses the equality and fails when the branch uses it. Give this
-alternative its own binary tag. Select its version while emitting the
-tag so a reader without support rejects the header before loading the
-unfolding. A reader for constructor evidence also supports DepFunCo.
-Cache the required version alongside the serialized payload. This
-keeps the header consistent when the writer copies the cached bytes.
-See Note [Native constructor evidence in interfaces] in GHC.IfaceToCore.
-
-An automatically generated retained specialization rule uses its own
-tag in the rule origin byte. Older readers reject a retained rule at
-the header. Ordinary user and automatic rules retain their byte values.
-See Note [Exported retained specialisations] in GHC.Core.Rules.
-
-An erased user rule can construct or open a package on either side.
-Record that requirement when writing the rule expression. A reader that
-only supports calls at erased package types rejects the newer header.
-
-The Unpack operand includes the payload multiplicity. Older readers decode
-that field and require Many when they typecheck a rule or unfolding. Record
-LinearUnpackEvidence when serializing an Unpack with any other multiplicity.
-Those readers then reject the header before trying to load the rule. An
-opening in object code alone does not require this feature.
-
-An indexed constructor proof follows the ordinary GADT equality binder.
-Its reader reconstructs the promoted endpoint using that equality.
-The indexed alternative has its own tag and independent feature marker.
-
-An index alias uses a distinct DEFAULT alternative tag. An older reader
-accepts ordinary DEFAULT alternatives from the same compiler. It must reject
-the alias form at the header. See Note [Native index alias evidence in
-interfaces] in GHC.IfaceToCore.
-
-An interface can export an erased existential type with interface pragmas
-omitted. Select the existential version when writing the existential type
-tag. This also covers type entries in compression tables. An Unpack in an
-unfolding can have an ordinary result type and refer to a package from
-another interface. Select the version when writing each existential
-expression tag as well. An existential coercion can serialize an ordinary
-forall premise without an existential type tag. Select the version when
-writing either of its built-in rule names. The dot existential reader also
-knows the bar tags. It predates scoped sums and compulsory retained defaults.
-Record the separate requirements when either occurs with a dot existential.
-
-A generated retained-sum payload can have a class domain. Record its
-independent requirement even when interface pragmas are omitted. An
-older reader can decode the existing family shape but cannot check
-that domain. A re-export or inferred type can expose the affected
-payload without declaring the private family again. A payload that
-uses a constrained family under an ordinary algebraic constructor
-requires the second version. A reader of the first version can
-check only a direct constrained family application.
-
-A retained-sum codomain uses a scoped family tag. A consumer can also
-publish a proof that refers to the scoped equality rule. Either feature
-requires this reader. Mark each feature when it is written, including
-a proof in a consumer with no scoped family declarations. This
-experiment uses its own version suffix. Its reader supports generated
-specialization rules, constructor case evidence and dependent function
-coercions. It predates index aliases and erased existentials. An interface
-that also uses either feature needs a distinct header in both declaration
-orders. Each historical reader must reject the mixed payload early.
-
-An independent type lambda root uses its own closed family tag. Mark
-both that tag and the scoped-lambda proof rule in the header. A proof
-can refer entirely to closures from a different interface. Existing
-scoped sum families keep their own tag and feature.
-
-An ordered GADT constructor can put an inferred binder after a field.
-The existing binder flag carries its specificity. Older readers only
-accept specified binders in a late invisible group. Record the new
-requirement for that group so those readers reject the interface header.
-Inferred binders before the first field use the existing format.
-See Note [Terminal constructor type arguments] in GHC.Core.DataCon.
-
-The existing interface constructor already stores its context and its
-retained field names. Older readers reject their combination while loading
-the constructor. Mark it when writing the declaration so these readers
-reject the header, even when interface pragmas are omitted. Ordinary
-constructor contexts and retained constructors without a context keep
-their existing header.
-
-A compulsory retained default includes the older index alias, rule and
-coercion forms. Erased existentials and scoped sums have independent
-requirements. Keep each requirement while writing. Use the existing
-suffixes when their readers support the complete payload. Otherwise encode
-the independent requirements in a canonical feature list. Check the list
-before reading the payload. Reject unknown, duplicate or out-of-order names.
-The cached payload keeps its requirements and writes the same suffix.
--}
-
-
--- Executable-origin declarations use a new IdDetails tag. Keep ordinary
--- interfaces readable by the older compiler. Its version check rejects
--- these producer interfaces before it reaches the new tag.
-enumCallbackIfaceVersion :: String
-enumCallbackIfaceVersion = show hiVersion ++ "-enum-callbacks-v1"
-
-finalCoreIfaceVersion :: String
-finalCoreIfaceVersion = show hiVersion ++ "-final-core-mapper-v1"
-
--- | Keep the old header for modules without a new type scheme.
--- A previous compiler must reject a changed family or synonym interface
--- before decoding old applications against its new binder list.
-matchabilitySchemeIfaceVersion :: String
-matchabilitySchemeIfaceVersion = show hiVersion ++ "-matchability-schemes-v1"
-
--- | Older readers must not load an associated family with a new binder list.
-openMatchabilityIfaceVersion :: String
-openMatchabilityIfaceVersion = show hiVersion ++ "-matchability-schemes-v2"
-
--- | Announce the checked domain before an older reader reaches its tag.
-constrainedFamilyIfaceVersion :: String
-constrainedFamilyIfaceVersion = show hiVersion ++ "-constrained-families-v1"
-
-hasConstrainedFamily :: IfaceDecl -> Bool
-hasConstrainedFamily IfaceFamily{ifFamFlav = IfaceConstrainedTypeFamilyTyCon} = True
-hasConstrainedFamily IfaceFamily{ifKind = kind} = iface_kind_has_constraint kind
-  where
-    iface_kind_has_constraint (IfaceForAllTy _ _ rest) = iface_kind_has_constraint rest
-    iface_kind_has_constraint (IfaceFunTy af _ _ _ rest)
-      = isInvisibleFunArg af || iface_kind_has_constraint rest
-    iface_kind_has_constraint _ = False
-hasConstrainedFamily IfaceClass{ifBody = IfConcreteClass{ifATs = ats}} =
-  any (\(IfaceAT decl _) -> hasConstrainedFamily decl) ats
-hasConstrainedFamily _ = False
-
-hasOpenMatchabilityScheme :: IfaceDecl -> Bool
-hasOpenMatchabilityScheme IfaceFamily
-  { ifBinders = b : _, ifFamFlav = IfaceOpenTypeFamilyTyCon } = matchabilityBinder b
-hasOpenMatchabilityScheme IfaceClass{ifBody = IfConcreteClass{ifATs = ats}} =
-  any (\(IfaceAT decl _) -> hasOpenMatchabilityScheme decl) ats
-hasOpenMatchabilityScheme _ = False
-
-hasMatchabilityScheme :: (a, IfaceDecl) -> Bool
-hasMatchabilityScheme (_, IfaceSynonym{ifBinders = b : _}) = matchabilityBinder b
-hasMatchabilityScheme (_, IfaceFamily{ifBinders = b : _}) = matchabilityBinder b
-hasMatchabilityScheme _ = False
-
-matchabilityBinder :: IfaceTyConBinder -> Bool
-matchabilityBinder b@(Bndr (IfaceTvBndr (_, IfaceTyConApp tc IA_Nil)) _) =
-  isInferredTyConBinder b && ifaceTyConName tc `hasKnownKey` matchabilityTyConKey
-matchabilityBinder _ = False
-
--- | Announce a synonym binder scheme that needs callback kind inference.
--- The suffix is independent of existing schemes and retained evidence.
-liberalSynonymCallbackSuffix :: String
-liberalSynonymCallbackSuffix = "-liberal-synonym-callback-v1"
-
--- | Find a checked callback selector in an exported synonym kind.
-hasLiberalSynonymCallback :: [IfaceExport] -> [IfaceDecl] -> Bool
-hasLiberalSynonymCallback = exportedSynonymCallback instantiated
-  where
-    instantiated binders (IfaceTyVar name) =
-      any (selects name) (filter matchabilityBinder binders)
-    instantiated _ _ = False
-
-    selects name (Bndr (IfaceTvBndr (index, _)) _) = index == name
-    selects _ _ = False
-
--- | Find a fixed M callback that a prior producer can have defaulted.
-couldInferLiberalSynonymMatchability :: [IfaceExport] -> [IfaceDecl] -> Bool
-couldInferLiberalSynonymMatchability = exportedSynonymCallback fixed
-  where
-    fixed _ (IfaceTyConApp tc IA_Nil) = ifaceTyConName tc == matchableDataConName
-    fixed _ _ = False
-
--- | Inspect direct curried callback arrows in the checked parameter kinds.
--- See Note [Callback arrows in inferred synonym kinds] in GHC.Tc.TyCl.
-exportedSynonymCallback :: ([IfaceTyConBinder] -> IfaceType -> Bool)
-                        -> [IfaceExport] -> [IfaceDecl] -> Bool
-exportedSynonymCallback accepts exports = any is_candidate
-  where
-    exported = mkNameSet (concatMap availNames exports)
-    is_candidate IfaceSynonym{ifName = name, ifBinders = binders}
-      | name `elemNameSet` exported = any (parameter binders) binders
-    is_candidate _ = False
-
-    parameter binders b@(Bndr (IfaceTvBndr (_, kind)) _)
-      | isVisibleTyConBinder b = callback binders kind
-    parameter _ _ = False
-
-    callback binders (IfaceFunTy flag arrow _ _ result)
-      | isVisibleFunArg flag = accepts binders arrow || callback binders result
-    callback _ _ = False
-
-hasFinalCore :: (a, IfaceDecl) -> Bool
-hasFinalCore (_, IfaceId{ifIdDetails = IfSourceTableId _ FinalCoreSourceTable}) = True
-hasFinalCore _ = False
-
--- | Test whether the declaration requires the executable-source tag.
-hasEnumCallback :: (a, IfaceDecl) -> Bool
-hasEnumCallback (_, IfaceId{ifIdDetails = IfSourceTableId _ ExecutableSourceTable}) = True
-hasEnumCallback _ = False
+    put_ bh (binaryInterfaceMagic (profilePlatform profile))
+    put_ bh (show hiVersion)
+    put_ bh (profileBuildTag profile)
+    putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface
+    writeBinMem bh hi_path
 
 -- | Puts the 'ModIface' to the 'WriteBinHandle'.
 --
 -- This avoids serialisation of the 'ModIface' if the fields 'mi_hi_bytes' contains a
 -- 'Just' value. This field is populated by reading the 'ModIface' using
 -- 'getIfaceWithExtFields' and not modifying it in any way afterwards.
-putIfaceWithExtFields :: TraceBinIFace -> CompressionIFace -> WriteBinHandle -> ModIface -> IO IfaceEvidenceVersion
+putIfaceWithExtFields :: TraceBinIFace -> CompressionIFace -> WriteBinHandle -> ModIface -> IO ()
 putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface =
   case mi_hi_bytes mod_iface of
     FullIfaceBinHandle Strict.Nothing -> do
@@ -772,25 +286,10 @@ putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface =
         []   -> pure (deleteField sourceTableField fields)
         locs -> writeFieldWith sourceTableField
                     (\h -> putWithUserData QuietBinIFace NormalCompression h locs) fields
-      let home_rule_interface_usage UsageHomeModuleInterface{} = True
-          home_rule_interface_usage _ = False
-          usage_version = withSelfRecomp mod_iface Set.empty $ \info ->
-            if any home_rule_interface_usage (mi_sr_usages info)
-              then Set.singleton HomeRuleInterfaceEvidence
-              else Set.empty
-          scoped_sum_version = usage_version `Set.union` Set.fromList
-            [requirement | (field, requirement) <- (depFunUnfoldingField, RetainedDepFunUnfoldingEvidence)
-                                                   : scopedSumDomainFields
-                         , Map.member field (getExtensibleFields fields)]
-      found <- newIORef scoped_sum_version
-      let notify _ required = modifyIORef' found (Set.insert required)
-          feature_bh = addWriterToUserData (mkWriter notify) bh
-      forwardPutRel_ feature_bh (\_ -> put_ feature_bh fields') $
-        putWithUserData traceBinIface compressionLevel feature_bh mod_iface
-      readIORef found
-    FullIfaceBinHandle (Strict.Just (found, binData)) -> do
+      forwardPutRel_ bh (\_ -> put_ bh fields') $
+        putWithUserData traceBinIface compressionLevel bh mod_iface
+    FullIfaceBinHandle (Strict.Just binData) ->
       putFullBinData bh binData
-      pure found
 
 {- Note [Source table locations in interfaces]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -808,19 +307,6 @@ to rewrite its interface when a clause moves, even with -fno-write-if-self-recom
 A client still checks the unchanged ABI of the equations. See addFingerprints
 in GHC.Iface.Recomp.
 -}
-
--- | The semantic interface requirement for checking generated payload domains.
-scopedSumDomainField :: String
-scopedSumDomainField = "ghc.scoped-sum-domain.v1"
-
--- | The requirement for class domains under ordinary algebraic constructors.
-composedScopedSumDomainField :: String
-composedScopedSumDomainField = "ghc.scoped-sum-domain.v2"
-
--- | Map checked payload requirements to their interface extension fields.
-scopedSumDomainFields :: [(String, IfaceEvidence)]
-scopedSumDomainFields = [(scopedSumDomainField, ScopedSumDomainEvidence),
-                         (composedScopedSumDomainField, ComposedScopedSumDomainEvidence)]
 
 sourceTableField :: String
 sourceTableField = "ghc.source-table-locations.v1"

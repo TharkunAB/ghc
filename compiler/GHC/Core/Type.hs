@@ -72,8 +72,6 @@ module GHC.Core.Type (
         isNativeOpaqueValueId, isNativeOpaqueValueType, isNativeClassDictionaryId,
         markInferredRetainedBinder, isInferredRetainedBinder,
         markInvisibleRetainedBinder, isInvisibleRetainedBinder,
-        retainedDataConBinderFlags,
-        inferredRetainedBinderFlags, applyInferredRetainedBinderFlags,
         replaceTermVarInType,
         isNativeIndexDomainConversion,
         isNativeRetainedBinder, isNativeRetainedBinderType,
@@ -2780,96 +2778,6 @@ markInvisibleRetainedBinder v =
 -- | Test whether a retained constructor field binder has 'DepFunInvisible'.
 isInvisibleRetainedBinder :: Id -> Bool
 isInvisibleRetainedBinder = invisibleRetainedIdInfo . idInfo
-
--- | Encode '(isInvisibleRetainedBinder, isInferredRetainedBinder)' pairs for
--- each retained constructor field so interface files preserve visibility and
--- specificity across separate compilation.
-retainedDataConBinderFlags :: DataCon -> [Bool]
-retainedDataConBinderFlags dc =
-  concat [ [isInvisibleRetainedBinder b, isInferredRetainedBinder b]
-         | Just b <- dataConRepArgBinders dc ]
-
--- | Collect 'InferredSpec' flags of 'DepFunInvisible' binders in preorder.
-inferredRetainedBinderFlags :: Type -> [Bool]
-inferredRetainedBinderFlags ty0 = go ty0 []
-  where
-    go (DepFunTy vis b body) acc =
-      let rest = go (idMult b) (go (varType b) (go body acc))
-      in if vis == DepFunInvisible then isInferredRetainedBinder b : rest else rest
-    go (ForAllTy ma (Bndr v _) body) acc = go ma (go (varType v) (go body acc))
-    go (FunTy _ ma mult arg res) acc = go ma (go mult (go arg (go res acc)))
-    go (AppTy f a) acc = go f (go a acc)
-    go (TyConApp _ tys) acc = foldr go acc tys
-    go (CastTy ty _) acc = go ty acc
-    go (ExistsTy _ v body) acc = go (varType v) (go body acc)
-    go (DepDictTy v body) acc = go (varType v) (go body acc)
-    go _ acc = acc
-
--- | Restore 'InferredSpec' flags onto 'DepFunInvisible' binders in preorder.
-applyInferredRetainedBinderFlags :: [Bool] -> Type -> ([Bool], Type)
-applyInferredRetainedBinderFlags flags0 ty0 = go flags0 ty0
-  where
-    has_dep_fun (DepFunTy {}) = True
-    has_dep_fun (ForAllTy ma (Bndr v _) body) =
-      has_dep_fun ma || has_dep_fun (varType v) || has_dep_fun body
-    has_dep_fun (FunTy _ ma mult arg res) =
-      has_dep_fun ma || has_dep_fun mult || has_dep_fun arg || has_dep_fun res
-    has_dep_fun (AppTy f a) = has_dep_fun f || has_dep_fun a
-    has_dep_fun (TyConApp _ tys) = any has_dep_fun tys
-    has_dep_fun (CastTy ty _) = has_dep_fun ty
-    has_dep_fun (ExistsTy _ v body) = has_dep_fun (varType v) || has_dep_fun body
-    has_dep_fun (DepDictTy v body) = has_dep_fun (varType v) || has_dep_fun body
-    has_dep_fun _ = False
-
-    go flags ty | not (has_dep_fun ty) = (flags, ty)
-    go flags (DepFunTy vis b body) =
-      let (flags1, b_flag) = case (vis, flags) of
-            (DepFunInvisible, f : fs) -> (fs, f)
-            _                         -> (flags, False)
-          (flags2, mult') = go flags1 (idMult b)
-          (flags3, dom')  = go flags2 (varType b)
-          b' = (if b_flag then markInferredRetainedBinder else setIdNotExported)
-                 (setIdMult (setVarType b dom') mult')
-          body0 = if dom' `eqType` varType b && mult' `eqType` idMult b
-                  then body
-                  else replaceTermVarInType b (TermVarTy b') body
-          (flags4, body') = go flags3 body0
-      in (flags4, DepFunTy vis b' body')
-    go flags (ForAllTy ma (Bndr v vis) body) =
-      let (flags1, ma')   = go flags ma
-          (flags2, kind') = go flags1 (varType v)
-          v'              = setVarType v kind'
-          (flags3, body') = go flags2 body
-      in (flags3, ForAllTy ma' (Bndr v' vis) body')
-    go flags (FunTy af ma mult arg res) =
-      let (flags1, ma')   = go flags ma
-          (flags2, mult') = go flags1 mult
-          (flags3, arg')  = go flags2 arg
-          (flags4, res')  = go flags3 res
-      in (flags4, FunTy af ma' mult' arg' res')
-    go flags (AppTy f a) =
-      let (flags1, f') = go flags f
-          (flags2, a') = go flags1 a
-      in (flags2, AppTy f' a')
-    go flags (TyConApp tc tys) =
-      let step fl [] = (fl, [])
-          step fl (t : ts) = let (fl1, t') = go fl t
-                                 (fl2, ts') = step fl1 ts
-                             in (fl2, t' : ts')
-          (flags', tys') = step flags tys
-      in (flags', TyConApp tc tys')
-    go flags (CastTy ty co) =
-      let (flags', ty') = go flags ty
-      in (flags', CastTy ty' co)
-    go flags (ExistsTy ex v body) =
-      let (flags1, k')    = go flags (varType v)
-          (flags2, body') = go flags1 body
-      in (flags2, ExistsTy ex (setVarType v k') body')
-    go flags (DepDictTy v body) =
-      let (flags1, d')    = go flags (varType v)
-          (flags2, body') = go flags1 body
-      in (flags2, DepDictTy (setVarType v d') body')
-    go flags ty = (flags, ty)
 
 -- | Replace occurrences of a provisional 'TermVarTy' binder inside a 'Type'.
 replaceTermVarInType :: Id -> Type -> Type -> Type

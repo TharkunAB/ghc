@@ -42,6 +42,7 @@ module GHC.Unit.Module.ModIface
    , set_mi_module
    , set_mi_sig_of
    , set_mi_hsc_src
+   , set_mi_dep_flags
    , set_mi_self_recomp
    , set_mi_hi_bytes
    , set_mi_deps
@@ -104,6 +105,12 @@ module GHC.Unit.Module.ModIface
    , mi_export_avails_hash
    , mi_orphan_like_hash
    , mi_orphan_hash
+   , ifaceHasDepConstructsBit
+   , ifaceHasExistentialBit
+   , ifaceHasDepFunUnfoldingBit
+   , mi_has_dep_constructs
+   , mi_has_existential
+   , mi_has_depfun_unfolding
    , renameFreeHoles
    , emptyPartialModIface
    , emptyFullModIface
@@ -119,7 +126,6 @@ import GHC.Prelude
 import GHC.Hs
 
 import GHC.Iface.Syntax
-import GHC.Iface.Type (IfaceEvidenceVersion)
 import GHC.Iface.Flags
 import GHC.Iface.Ext.Fields
 import GHC.Iface.Recomp.Types
@@ -149,6 +155,7 @@ import GHC.Utils.Binary
 
 import Control.DeepSeq
 import Control.Exception
+import Data.Word (Word8)
 
 
 {- Note [Interface file stages]
@@ -238,7 +245,7 @@ data IfaceBinHandle (phase :: ModIfacePhase) where
   --
   -- See Note [Private fields in ModIface] for when this fields needs to be cleared
   -- (e.g., set to 'Nothing').
-  FullIfaceBinHandle :: !(Strict.Maybe (IfaceEvidenceVersion, FullBinData)) -> IfaceBinHandle 'ModIfaceFinal
+  FullIfaceBinHandle :: !(Strict.Maybe FullBinData) -> IfaceBinHandle 'ModIfaceFinal
 
 
 withSelfRecomp :: ModIface_ phase -> r -> (IfaceSelfRecomp -> r) -> r
@@ -316,8 +323,36 @@ data ModIface_ (phase :: ModIfacePhase)
 data IfaceModInfo = IfaceModInfo {
   mi_mod_info_module :: Module, -- ^ Name of the module we are for
   mi_mod_info_sig_of :: Maybe Module, -- ^ Are we a sig of another mod?
-  mi_mod_info_hsc_src :: HscSource -- ^ Boot? Signature?
+  mi_mod_info_hsc_src :: HscSource, -- ^ Boot? Signature?
+  mi_mod_info_dep_flags :: !Word8 -- ^ Bitmask of dependent interface properties
 }
+
+-- | Bit 0: module exposes or transitively imports dependent type constructs.
+ifaceHasDepConstructsBit :: Int
+ifaceHasDepConstructsBit = 0
+
+-- | Bit 1: module declarations contain erased existential types or expressions.
+ifaceHasExistentialBit :: Int
+ifaceHasExistentialBit = 1
+
+-- | Bit 2: module declarations expose checked native 'DepFunTy' user unfoldings.
+ifaceHasDepFunUnfoldingBit :: Int
+ifaceHasDepFunUnfoldingBit = 2
+
+-- | Test whether an interface exposes or transitively imports dependent constructs.
+mi_has_dep_constructs :: ModIface_ phase -> Bool
+mi_has_dep_constructs iface =
+  testBit (mi_mod_info_dep_flags (mi_mod_info iface)) ifaceHasDepConstructsBit
+
+-- | Test whether an interface contains erased existential types or expressions.
+mi_has_existential :: ModIface_ phase -> Bool
+mi_has_existential iface =
+  testBit (mi_mod_info_dep_flags (mi_mod_info iface)) ifaceHasExistentialBit
+
+-- | Test whether an interface exposes checked native 'DepFunTy' user unfoldings.
+mi_has_depfun_unfolding :: ModIface_ phase -> Bool
+mi_has_depfun_unfolding iface =
+  testBit (mi_mod_info_dep_flags (mi_mod_info iface)) ifaceHasDepFunUnfoldingBit
 
 -- | The public interface of a module which are used by other modules when importing this module.
 -- The ABI of a module.
@@ -663,18 +698,22 @@ instance Binary IfaceModInfo where
   put_ bh (IfaceModInfo { mi_mod_info_module = mod
                         , mi_mod_info_sig_of = sig_of
                         , mi_mod_info_hsc_src = hsc_src
+                        , mi_mod_info_dep_flags = dep_flags
                         }) = do
     put_ bh mod
     put_ bh sig_of
     put_ bh hsc_src
+    putByte bh dep_flags
 
   get bh = do
     mod <- get bh
     sig_of <- get bh
     hsc_src <- get bh
+    dep_flags <- getByte bh
     return (IfaceModInfo { mi_mod_info_module = mod
                          , mi_mod_info_sig_of = sig_of
                          , mi_mod_info_hsc_src = hsc_src
+                         , mi_mod_info_dep_flags = dep_flags
                          })
 
 
@@ -787,6 +826,7 @@ emptyIfaceModInfo mod = IfaceModInfo
   { mi_mod_info_module = mod
   , mi_mod_info_sig_of = Nothing
   , mi_mod_info_hsc_src = HsSrcFile
+  , mi_mod_info_dep_flags = 0
   }
 
 
@@ -894,10 +934,11 @@ instance ( NFData (IfaceAbiHashesExts (phase :: ModIfacePhase))
     `seq` rnf a10
 
 instance NFData IfaceModInfo where
-  rnf (IfaceModInfo a1 a2 a3)
+  rnf (IfaceModInfo a1 a2 a3 a4)
     =  rnf a1
     `seq` rnf a2
     `seq` rnf a3
+    `seq` rnf a4
 
 
 instance NFData IfaceSimplifiedCore where
@@ -1102,6 +1143,9 @@ set_mi_sig_of val = set_mi_mod_info_field (\info -> info { mi_mod_info_sig_of = 
 
 set_mi_hsc_src :: HscSource -> ModIface_ phase -> ModIface_ phase
 set_mi_hsc_src val = set_mi_mod_info_field (\info -> info { mi_mod_info_hsc_src = val })
+
+set_mi_dep_flags :: Word8 -> ModIface_ phase -> ModIface_ phase
+set_mi_dep_flags val = set_mi_mod_info_field (\info -> info { mi_mod_info_dep_flags = val })
 
 -- | Helper function for setting fields in mi_mod_info_
 set_mi_mod_info_field :: (IfaceModInfo -> IfaceModInfo) -> ModIface_ phase -> ModIface_ phase

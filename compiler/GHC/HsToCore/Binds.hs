@@ -76,7 +76,7 @@ import GHC.Types.InlinePragma
 import GHC.Types.Name
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
-import GHC.Types.Var( EvVar, mkLocalVar, isRuntimePiTyBinder, coreTyLamForAllTyFlag )
+import GHC.Types.Var( EvVar, mkLocalVar, isRuntimePiTyBinder, coreTyLamForAllTyFlag, isInvisibleDepFunFlag )
 import GHC.Types.SrcLoc
 import GHC.Types.Basic
 import GHC.Types.Unique.Set( nonDetEltsUniqSet )
@@ -564,7 +564,7 @@ findSatArity vis_arity ty = go vis_arity ty
   where
     go ar next
       | DepFunTy vis _ res <- coreFullView next
-      = step ar (vis == DepFunInvisible) True res
+      = step ar (isInvisibleDepFunFlag vis) True res
       | DepDictTy _ res <- coreFullView next
       = step ar True True res
       | Just (_, bndr, res) <- splitPiTy_maybe next

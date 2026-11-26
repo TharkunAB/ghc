@@ -826,11 +826,11 @@ mkDepFunCoWithVis :: DepFunTyFlag -> DepFunTyFlag -> Id
 mkDepFunCoWithVis visL visR b domain co
   | MCo delta <- domain, isReflCo delta
   = mkDepFunCoWithVis visL visR b MRefl co
-  | visL == visR
+  | visL `eqDepFunVis` visR
   , MRefl <- domain, Just (ty, role) <- isReflCo_maybe co
   = mkReflCo role (mkDepFunTyWithVis visL b ty)
   | otherwise
-  = assertPpr (coercionRole co /= Nominal || visL == visR)
+  = assertPpr (coercionRole co /= Nominal || visL `eqDepFunVis` visR)
       (text "Nominal retained coercion has different visibilities:" <+> ppr b) $
     DepFunCo visL visR b domain co
 

@@ -262,6 +262,7 @@ tyConToIfaceDecl env tycon
                     ifConCtxt    = tidyToIfaceContext con_env3 theta,
                     ifConArgTys  = if_arg_tys,
                     ifConArgBinders = if_arg_binders,
+                    ifConRetainedFlags = if_retained_flags,
                     ifConFields  = dataConFieldLabels data_con,
                     ifConStricts = map (toIfaceBang con_env1)
                                        (dataConImplBangs data_con),
@@ -281,6 +282,14 @@ tyConToIfaceDecl env tycon
           to_eq_spec (tv,ty) = (tidyTyVar con_env3 tv, tidyToIfaceType con_env4 ty)
 
           arg_binders = dataConRepArgBinders data_con
+          raw_retained_flags =
+            [ if isInvisibleRetainedBinder b
+              then if isInferredRetainedBinder b then DepFunInferred else DepFunInvisible
+              else DepFunVisible
+            | Just b <- arg_binders ]
+          if_retained_flags
+            | all (== DepFunVisible) raw_retained_flags = []
+            | otherwise = raw_retained_flags
           (con_env4, (if_arg_binders, if_arg_tys))
             | null arg_binders
             = (con_env3, ([], map (\(Scaled w t) -> (tidyToIfaceType con_env3 w
