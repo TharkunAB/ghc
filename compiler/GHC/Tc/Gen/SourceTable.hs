@@ -1,47 +1,68 @@
--- | Closed type families for checked functions that match one constructor.
-module GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, publishRetainedRecordWitness, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness, finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables, finalCoreSourceFamilies, isFinalCoreIdentity, indexedProjectionSource, isFinalCoreReverseWrapper, sourcePairBuilderField, lookupObservedPairField, lookupPairObserver, lookupPairRecipe, canObservePairSource, sourceRuleOwners, sourceTableOccurrence, tcLookupSourceTableId,
-                              sourceTableCallees, sourceTableDependencies, sourceTableTypeUses, sourceTableFamilyUse,
-                              sourceTableFamilyAppUse, sourceTableReferenceUse, sourceCaseKindUse, sourceCaseVisibleArity, isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead, sourceLocalBooleanCases,
-                              isFinalStructuralSource, isStructuralSourceTable, isNominalStructuralSource,
-                              isLargeElimTable, rebuildSourceFamilyWith,
-                              visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt,
-                              sourceEquationDatatypes, publicCaseType, ordinaryImport,
-                              sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod, lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods, keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt, recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers, lookupBootModuleIdMaybe, isSourceFilterGuard,
-                              OptionalSourceUses, optionalSourceUses, registerOptionalSourceUses,
-                              checkOptionalSourceUses, checkSourceMethodUses,
-                              withSourceProofSignature,
-                              recordSourceProofAliasUse, sourceProofRulesFor, takeSourceProofRulesFor,
-                              captureSourceMethodProof, closedSourceProofArgs,
-                              checkAndInstallSourceProofs) where
+-- | Certify and publish nominal closed type-family equations (`SourceTable`)
+-- from desugared and post-Simplifier Core bindings, dictionary methods, and
+-- fusion-guarded list functions.
+--
+-- See Note [Certifying source equations from Core].
+module GHC.Tc.Gen.SourceTable
+  ( recordSourceUses, recordUnfoldedSourceUses, sourceTableTyCons, sourceCaseTables
+  , sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables
+  , publishRetainedRecordWitness, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness
+  , finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables, finalCoreSourceFamilies
+  , isFinalCoreIdentity, indexedProjectionSource, isFinalCoreReverseWrapper
+  , sourcePairBuilderField, lookupObservedPairField, lookupPairObserver, lookupPairRecipe
+  , canObservePairSource, sourceRuleOwners, sourceTableOccurrence, tcLookupSourceTableId
+  , sourceTableCallees, sourceTableDependencies, sourceTableTypeUses, sourceTableFamilyUse
+  , sourceTableFamilyAppUse, sourceTableReferenceUse, sourceCaseKindUse, sourceCaseVisibleArity
+  , isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead
+  , sourceLocalBooleanCases, isFinalStructuralSource, isStructuralSourceTable
+  , isNominalStructuralSource, isLargeElimTable, rebuildSourceFamilyWith
+  , visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt
+  , sourceEquationDatatypes, publicCaseType, ordinaryImport
+  , sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod
+  , lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods
+  , keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt
+  , recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers
+  , lookupBootModuleIdMaybe, isSourceFilterGuard
+  , OptionalSourceUses, optionalSourceUses, registerOptionalSourceUses
+  , checkOptionalSourceUses, checkSourceMethodUses
+  , withSourceProofSignature, recordSourceProofAliasUse
+  , sourceProofRulesFor, takeSourceProofRulesFor
+  , captureSourceMethodProof, closedSourceProofArgs, checkAndInstallSourceProofs
+  ) where
 
 import GHC.Prelude
 
+import GHC.Builtin.KnownKeys (patErrorIdKey)
 import GHC.Builtin.KnownOccs (eqClassOpOcc, minusClassOpOcc)
-import GHC.Core.Class (Class, classAllSelIds, classMethods, className, classTyCon, classTyVars)
 import GHC.Builtin.Modules (gHC_CLASSES, gHC_INTERNAL_BASE, gHC_INTERNAL_NUM_INTEGER, gHC_TYPES, mkGhcInternalModule)
-import GHC.Builtin.WiredIn.Types (nilDataCon, consDataCon, boolTy, falseDataCon, trueDataCon, charTy, typeSymbolKind, stringTy, integerTy, integerTyConName, listTyCon, mkListTy, mkTupleTy, promotedTupleDataCon, tupleDataCon, tupleTyCon, unmatchableDataConTy)
+import GHC.Builtin.WiredIn.Types
+  ( nilDataCon, consDataCon, boolTy, falseDataCon, trueDataCon, charTy, integerTy, integerTyConName
+  , listTyCon, mkListTy, mkTupleTy, promotedTupleDataCon, tupleDataCon, tupleTyCon, unmatchableDataConTy )
 import GHC.Core (CoreRule(..), isAutoRule, ruleActivation)
 import qualified GHC.Core as Core
-import GHC.Core.CharCase
-    ( certDefault, certOwner, certResultTyCon, certRows, certify, charCaseResultTyCon )
-import GHC.Core.OpenWhnf (openDataConFieldTypes)
-import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe, isPredTy, mkClassPred)
-import GHC.Core.Rules (RuleEnv(..), emptyRuleBase, emptyRuleEnv, extendRuleBaseList, getRules)
-import GHC.Core.Coercion (abstractNativeIndices, coercionLKind, coercionRKind, coercionRole, hasCoercionHole, mkCoVarCo, mkNomReflCo, mkSymCo, mkTyConAppCo)
-import GHC.Core.Coercion.Axiom (ClosedTyFam(..), CoAxBranch, coAxiomBranches, coAxiomName, coAxiomRole,
-                                coAxBranchCoVars, coAxBranchLHS, coAxBranchRHS, coAxBranchRoles, coAxBranchSpan, coAxBranchTyVars,
-                                fromBranches)
+import GHC.Core.CharCase (certDefault, certOwner, certResultTyCon, certRows, certify, charCaseResultTyCon)
+import GHC.Core.Class (Class, classAllSelIds, classMethods, className, classTyCon, classTyVars)
+import GHC.Core.Coercion
+  ( abstractNativeIndices, coercionLKind, coercionRKind, coercionRole, hasCoercionHole
+  , mkCoVarCo, mkNomReflCo, mkSymCo, mkTyConAppCo )
+import GHC.Core.Coercion.Axiom
+  ( ClosedTyFam(..), CoAxBranch, coAxiomBranches, coAxiomName, coAxiomRole
+  , coAxBranchCoVars, coAxBranchLHS, coAxBranchRHS, coAxBranchRoles, coAxBranchSpan, coAxBranchTyVars, fromBranches )
 import GHC.Core.ConLike (ConLike(..))
 import GHC.Core.DataCon
-import GHC.Core.Dependent (hasNativeDependentExpr, hasNativeDependentExprRhs)
+import GHC.Core.Dependent (hasExistentialExpr, hasNativeDependentExpr, hasNativeDependentExprRhs)
 import GHC.Core.FVs (exprSomeFreeVarsList, exprsFreeVars)
 import GHC.Core.FamInstEnv (FamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch, reduceTyFamApp_maybe)
-import GHC.Core.InstEnv (ClsInst(is_tcs, is_tvs, is_tys), classInstances, instanceCantMatch, instanceDFunId,
-                         isIncoherent, lookupUniqueInstEnv, roughMatchTcs)
-import GHC.Core.RoughMap (RoughMatchTc(RM_KnownTc))
+import GHC.Core.InstEnv
+  ( ClsInst(is_tcs, is_tvs, is_tys), classInstances, instanceCantMatch, instanceDFunId
+  , isIncoherent, lookupUniqueInstEnv, roughMatchTcs )
 import GHC.Core.Multiplicity (scaledThing)
+import GHC.Core.OpenWhnf (openDataConFieldTypes)
+import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe, isPredTy, mkClassPred)
 import GHC.Core.Reduction (reductionCoercion, reductionReducedType)
-import GHC.Core.SimpleOpt (defaultSimpleOpts, simpleOptExpr)
+import GHC.Core.RoughMap (RoughMatchTc(RM_KnownTc))
+import GHC.Core.Rules (RuleEnv(..), emptyRuleBase, emptyRuleEnv, extendRuleBaseList, getRules)
+import GHC.Core.SimpleOpt (SimpleOpts, defaultSimpleOpts, simpleOptExpr)
 import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
@@ -50,65 +71,76 @@ import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, TyVarTy, TermVarTy, DepFunTy,
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Unify (alwaysBindTv, tcMatchTys, tcUnifyTys)
-import GHC.Core.Utils (dataConRepInstPat, exprType, findAlt, mergeAlts, stripTicksE, stripTicksTopE)
-import GHC.Data.Graph.Directed (Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq)
-import GHC.Data.FastString (fsLit)
+import GHC.Core.Utils (exprType, findAlt, mergeAlts, stripTicksE, stripTicksTopE)
 import GHC.Data.Bag (emptyBag, isEmptyBag)
+import GHC.Data.FastString (fsLit)
+import GHC.Data.Graph.Directed (Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq)
 import GHC.Data.OrdList (fromOL)
 import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config (initSimpleOpts)
-import GHC.Driver.DynFlags (DynFlags(homeUnitId_), unitSettings)
-import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
+import GHC.Driver.DynFlags (DynFlags(ghcMode, homeUnitId_), isOneShot, unitSettings)
 import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hugRuleInterfacesBelow, hugRulesBelow, lookupIfaceByModuleHsc, visibleUnloadedSourceRuleHeads)
 import GHC.Driver.Plugins (hasActiveLatePlugins)
-import GHC.Settings (UnitSettings(unitSettings_ghcInternalUnitId))
+import GHC.Driver.Session
+  ( GeneralFlag(Opt_EnableRewriteRules, Opt_Hpc, Opt_WriteIfSimplifiedCore, Opt_WriteInterface, Opt_WriteSourceEquations)
+  , HasDynFlags(getDynFlags), backend, gopt )
 import GHC.Hs
 import {-# SOURCE #-} GHC.HsToCore.Binds (dsTopLHsBinds)
-import GHC.HsToCore.Errors.Ppr () -- Diagnostic DsMessage
+import GHC.HsToCore.Errors.Ppr ()
 import GHC.HsToCore.Monad (initDsTc)
 import GHC.Iface.Env (lookupOrig)
 import GHC.Iface.Load (loadInterfaceForName)
 import qualified GHC.LanguageExtensions as LangExt
+import GHC.Settings (UnitSettings(unitSettings_ghcInternalUnitId))
 import GHC.Tc.Errors.Types (RetainedQuantificationError(..), TcRnMessage(..))
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Tc.TyCl.Build (newImplicitBinder)
+import GHC.Tc.Types (SourceRuleUses(..), TcGblEnv(..), tcVisibleOrphanMods)
 import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, ATcTyCon, tct_id))
 import GHC.Tc.Types.ErrCtxt (FunAppCtxtFunArg(..), HsCtxt(..))
-import GHC.Tc.Types.Evidence (HsWrapper(..), TcEvBinds(..), EvBindsState(..), collectHsWrapBinders, isEmptyEvBindsMap)
+import GHC.Tc.Types.Evidence (EvBindsState(..), HsWrapper(..), TcEvBinds(..), collectHsWrapBinders, isEmptyEvBindsMap)
 import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTypeEnv)
-import GHC.Tc.Types (TcGblEnv(..), SourceRuleUses(..), tcVisibleOrphanMods)
+import GHC.Tc.Utils.Env (tcGetInstEnvs, tcLookupId, tcLookupIdMaybe)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
-import GHC.Tc.Utils.Env (tcLookupGlobal, tcLookupId, tcLookupIdMaybe, tcGetInstEnvs)
-import GHC.Tc.Utils.Monad (TcM, addErr, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getLclEnv,
-                           getTcEvBindsMap, getTcEvBindsState,
-                           checkNoErrs, getTopEnv, goptM, keepAlive, liftZonkM, newSysName, readTcRef, writeTcRef, newTcRef, setGblEnv,
-                           recordHomeRuleDependencies, setSrcSpan, setSrcSpanA, updTcRef, xoptM)
+import GHC.Tc.Utils.Monad
+  ( TcM, addErr, checkNoErrs, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getLclEnv
+  , getTcEvBindsMap, getTcEvBindsState, getTopEnv, goptM, keepAlive, liftZonkM, newSysName
+  , newTcRef, readTcRef, recordHomeRuleDependencies, setGblEnv, setSrcSpan, setSrcSpanA, updTcRef, writeTcRef, xoptM )
 import GHC.Tc.Utils.TcType (isMetaTyVar, isTyFamFree)
-import GHC.Tc.Zonk.Type (zonkTopDecls)
 import GHC.Tc.Zonk.TcType (zonkTcType, zonkTcTypes)
+import GHC.Tc.Zonk.Type (zonkTopDecls)
 import GHC.Types.Avail (availsToNameSet)
-import GHC.Types.Basic (Origin(..), LeftOrRight(..), SourceTableOrigin(..), UnfoldingSource(VanillaSrc),
-                        isMarkedCbv, pickLR)
+import GHC.Types.Basic (LeftOrRight(..), Origin(..), SourceTableOrigin(..), UnfoldingSource(VanillaSrc), isMarkedCbv, pickLR)
 import GHC.Types.Error (errorsFound)
+import GHC.Types.Id
+  ( globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo, idInlineActivation, idInlinePragma, idName
+  , idUnfolding, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isJoinId, mkSysLocal, mkSysLocalM
+  , mkVanillaGlobal, realIdUnfolding, setIdExported, setIdInfo, setIdType, setSourceMethodIds
+  , sourceLiteralCons_maybe, sourceMethodAliases, sourceMethodDFunClass, sourceMethodTarget_maybe, sourceTableId_maybe )
 import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, DFunId, SourceTableId, VanillaId), SourceDFun(..), setSourceProofRuleInfo)
-import GHC.Types.Id (globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo, idName, setIdInfo, idInlineActivation, idInlinePragma, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isJoinId, idUnfolding, realIdUnfolding, mkSysLocalM, mkVanillaGlobal, setIdType, sourceTableId_maybe, sourceLiteralCons_maybe,
-                     setIdExported, setSourceMethodIds, sourceMethodAliases, sourceMethodTarget_maybe,
-                     sourceMethodDFunClass)
-import GHC.Types.InlinePragma (ActivationX(ActiveAfter, ActiveBefore), PhaseNum,
-                               isDefaultInlinePragma, isNeverActive, isOpaquePragma)
-import GHC.Types.Name (Name, OccName, isExternalName, mkSourceTableOcc, mkSourceFstOcc, mkSourceSndOcc, mkInstTyCoOcc, mkTcOcc,
-                       isFieldOcc, isVarOcc, mkTyVarOcc, mkVarOcc, nameModule_maybe, nameOccName, nameSrcSpan, occNameString, setOccNameSpace, sourceTableTermOcc, stableNameCmp, nameStableString, tvName, SourceProofRule, SourceProofArgs, SourceProofArg(..))
-import GHC.Core.Opt.Pipeline (pairObservationOcc, pairObservationType, scalarRecipeTableOcc)
-import GHC.Types.Name.Reader (GlobalRdrEnv, gre_imp, is_decl, is_isboot, isLocalGRE, lookupGRE_Name)
-import GHC.Types.Name.Env (NameEnv, delFromNameEnv, elemNameEnv, extendNameEnv, extendNameEnv_C, isEmptyNameEnv,
-                           lookupNameEnv, mkNameEnv, nonDetNameEnvElts, plusNameEnv_C)
-import GHC.Types.Name.Set (NameSet, emptyNameSet, elemNameSet, extendNameSet, extendNameSetList, filterNameSet,
-                           intersectsNameSet,
-                           intersectNameSet, isEmptyNameSet, minusNameSet, mkNameSet, nameSetElemsStable,
-                           unionNameSet, unionNameSets, unitNameSet)
+import GHC.Types.InlinePragma (ActivationX(ActiveAfter, ActiveBefore), PhaseNum, isDefaultInlinePragma, isNeverActive, isOpaquePragma)
+import GHC.Types.Name
+  ( Name, OccName, SourceProofArg(..), SourceProofArgs, SourceProofRule, isExternalName, isFieldOcc, isVarOcc
+  , mkInstTyCoOcc, mkSourceFstOcc, mkSourceSndOcc, mkSourceTableOcc, mkTyVarOcc, mkVarOcc, nameModule_maybe
+  , nameOccName, nameSrcSpan, nameStableString, occNameString, setOccNameSpace, sourceTableTermOcc, stableNameCmp, tvName )
+import GHC.Types.Name.Env (NameEnv, delFromNameEnv, elemNameEnv, extendNameEnv, extendNameEnv_C, isEmptyNameEnv, lookupNameEnv, mkNameEnv, nonDetNameEnvElts, plusNameEnv_C)
+import GHC.Types.Name.Reader (GlobalRdrEnv, gre_imp, isLocalGRE, is_decl, is_isboot, lookupGRE_Name)
+import GHC.Types.Name.Set
+  ( NameSet, elemNameSet, emptyNameSet, extendNameSet, extendNameSetList, filterNameSet
+  , intersectNameSet, intersectsNameSet, isEmptyNameSet, minusNameSet, mkNameSet, nameSetElemsStable
+  , unionNameSet, unionNameSets, unitNameSet )
+import GHC.Types.SourceFile (hscSourceToIsBoot, isHsBootOrSig)
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish (CoreTickish, GenTickish(Breakpoint))
-import GHC.Types.SourceFile (hscSourceToIsBoot, isHsBootOrSig)
+import GHC.Types.TyThing (TyThing(..))
+import GHC.Types.TypeEnv (TypeEnv, extendTypeEnvWithIds, lookupTypeEnv, typeEnvElts, typeEnvIds)
+import GHC.Types.Unique (hasKey, minLocalUnique)
+import GHC.Types.Unique.FM (plusUFM_C)
+import GHC.Types.Unique.Set (elementOfUniqSet, mkUniqSet, nonDetEltsUniqSet, sizeUniqSet)
+import GHC.Types.Unique.Supply (UniqSupply)
+import GHC.Types.Var (CoVar, Id, VarBndr(..), idDetails, isCoVar, isId, mkTyVar, setIdDetails, varName)
+import GHC.Types.Var.Env (InScopeSet, extendInScopeSet, mkInScopeSet, uniqAway)
+import GHC.Types.Var.Set (elemVarSet, mkVarSet)
 import GHC.Unit.External (eps_rule_base)
 import GHC.Unit.Home (homeUnitId)
 import GHC.Unit.Home.Graph (lookupHugByModule)
@@ -119,121 +151,97 @@ import GHC.Unit.Module.Env (lookupInstalledModuleEnv, moduleSetElts)
 import GHC.Unit.Module.ModDetails (md_rules)
 import GHC.Unit.Module.ModIface (mi_boot, mi_hash_fn)
 import GHC.Unit.Types (GenWithIsBoot(..), ghcInternalUnitId, isInteractiveModule, moduleName, moduleUnitId)
-import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, extendTypeEnvWithIds, typeEnvElts, typeEnvIds)
-import GHC.Types.TyThing (TyThing(..))
-import GHC.Types.Unique.FM (plusUFM_C)
-import GHC.Types.Unique.Set (elementOfUniqSet, mkUniqSet, nonDetEltsUniqSet, sizeUniqSet)
-import GHC.Types.Unique.Supply (UniqSupply, listSplitUniqSupply, splitUniqSupply, uniqsFromSupply)
-import GHC.Types.Var (Id, CoVar, idDetails, idMult, VarBndr(..), isId, isCoVar, mkTyVar, setIdDetails, varName)
-import GHC.Types.Var.Env (mkInScopeSet)
-import GHC.Types.Var.Set (elemVarSet, mkVarSet)
 import GHC.Utils.Misc (equalLength, lengthAtLeast, lengthIs)
 import GHC.Utils.Monad (allM, anyM)
 import GHC.Utils.Outputable (ppr, text)
 import GHC.Utils.Panic (panic, pprPanic)
 
-import Control.Monad (filterM, foldM, forM, forM_, guard, unless, void, when, zipWithM)
+import Control.Applicative ((<|>))
+import Control.Monad (filterM, foldM, forM, forM_, guard, unless, when, zipWithM, zipWithM_)
 import Control.Monad.IO.Class (liftIO)
-import Control.Applicative (empty, (<|>))
-import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Maybe (MaybeT(..))
+import Data.Data (Data, cast, gmapQ)
 import Data.Functor.Identity (Identity(..))
 import Data.List (find, findIndex, nubBy, partition, sortBy, stripPrefix, unsnoc)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import Data.Semigroup ((<>))
 
--- | Read the current defining Id without registering use of its equations.
--- A local occurrence can still carry the Id from before equation checking.
--- See Note [Source table Ids].
+{- Note [Certifying source equations from Core]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A term-level function `f` promoted into a dependent type (GHC Proposal #378,
+§4.6 and §4.11; GHC Proposal #509) reduces on open type arguments via a private
+nominal closed type family `T:f` attached to `f`'s `IdDetails` (`SourceTableId`).
+Following Eisenberg and Stolarek (Haskell Symposium 2014) and Weirich et al.
+(ICFP 2017; ICFP 2019), `compileCoreEquations` compiles desugared Core decision
+trees (Maranget, ML 2008) into `[CoAxBranch]` equations over unmatchable (`%U`,
+GHC Proposal #242; Kiss et al., ICFP 2019) function arrows:
+  1. Exhaustive lazy `Case (Var v)` splits (expanding `DEFAULT` branches over
+     finite ADTs and refuting uninhabited types via `case v of {}` or `absurd`)
+     produce nominal constructor patterns without forcing unused arguments.
+  2. Non-variable Boolean guard cases (`filter`, `dropWhile`, `span`, and
+     checked structural predicates) lift to a private `#guard:` companion
+     closed family (Danvy and Nielsen, PPDP 2001 / BRICS RS-01-23) so open
+     predicate calls stay stuck until a concrete `Bool` constructor appears.
+  3. Under `-O` / `Opt_EnableRewriteRules`, `FinalCoreSourceTable` entries are
+     re-compiled after the Core Simplifier (`verifyFinalCoreMapper` and
+     `checkedFinalCaseTable`) and retained only when post-Simplifier Core yields
+     alpha-identical `CoAxBranch` equations (`matchesCompiledTable`) and every
+     active `RULES` pragma preserves call-by-need definedness in the presence of
+     `seq` (Gill, Launchbury, and Peyton Jones, FPCA 1993; Johann and
+     Voigtländer, Fundam. Inform. 2006; Schmidt-Schauß et al., LMCS 2015).
+-}
+
+{- Note [Cold ghc-internal interface lookups]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+During a cold build of `ghc-internal`, early modules compile before
+`GHC.Internal.Base` and `GHC.Internal.Bignum.Integer` write their `.hi` files.
+`isBootModuleReady` verifies that a non-boot `ModIface` is already loaded in
+`lookupIfaceByModuleHsc` before `lookupBootModuleIdMaybe` queries `lookupOrig`.
+-}
+
 sourceTableOccurrence :: TcGblEnv -> Id -> Maybe Id
 sourceTableOccurrence env actual
-  | nameModule_maybe name == Just (tcg_semantic_mod env)
-  = case lookupTypeEnv (tcg_type_env env) name of
-      Just (AnId fun) | fun == actual -> Just fun
-      _ -> Nothing
+  | nameModule_maybe name == Just (tcg_semantic_mod env) =
+      case lookupTypeEnv (tcg_type_env env) name of
+        Just (AnId fun) | fun == actual -> Just fun
+        _ -> Nothing
   | otherwise = Just actual
   where
     name = varName actual
 
--- | Resolve a checked source call through the defining term's identity.
--- See Note [Source table Ids].
 tcLookupSourceTableId :: Id -> TcM (Maybe Id)
 tcLookupSourceTableId = tcLookupSourceTableIdAt Nothing
 
-{- Note [Cold ghc-internal interface lookups]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Source-equation and optional-let checks inspect standard definitions in
-`GHC.Internal.Base`, `GHC.Internal.Data.Tuple`, and
-`GHC.Internal.Bignum.Integer` (`build`, `(++)`, `(.)`, `otherwise`, `fst`,
-`snd`, and `Integer` comparison workers). Outside `ghc-internal`, those
-interfaces already exist in the installed package database.
-
-During a cold build of `ghc-internal` itself (`homeUnitId_ dflags ==
-ghcInternalUnitId`), early modules such as `GHC.Internal.Data.Tuple` and
-`GHC.Internal.Unicode.Char.UnicodeData.Simple*CaseMapping` compile before
-`GHC.Internal.Base` and `GHC.Internal.Bignum.Integer` write their `.hi`
-files. Calling `tcLookupIdMaybe` on an unloaded sibling module triggers
-`loadInterfaceForName` and fails with `GHC-94559`.
-
-When the home unit is `ghc-internal` and `mod` is not the current semantic
-module, `isBootModuleReady` checks that a non-boot `ModIface` for `mod` is
-loaded in `lookupIfaceByModuleHsc` before `lookupBootModuleIdMaybe` calls
-`lookupOrig` and `tcLookupIdMaybe`. In addition, `makeDynFlagsConsistent`
-leaves `Opt_WriteSourceEquations` disabled by default when the home unit is
-`ghc-internal`.
--}
-
--- | Test whether a `ghc-internal` module can be queried without loading an
--- unbuilt sibling interface during a cold `ghc-internal` build.
--- See Note [Cold ghc-internal interface lookups].
 isBootModuleReady :: Module -> TcM Bool
 isBootModuleReady mod = do
   dflags <- getDynFlags
   env <- getGblEnv
-  let in_ghc_internal =
-        homeUnitId_ dflags == ghcInternalUnitId ||
-        homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
-  if not in_ghc_internal || tcg_semantic_mod env == mod
-    then pure True
-    else do
-      hsc_env <- getTopEnv
-      mb_iface <- liftIO (lookupIfaceByModuleHsc hsc_env mod)
-      pure $ case mb_iface of
-        Just iface -> mi_boot iface == NotBoot
-        Nothing    -> False
+  let in_ghc_internal = homeUnitId_ dflags == ghcInternalUnitId ||
+                        homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
+  if not in_ghc_internal || tcg_semantic_mod env == mod then pure True else do
+    hsc_env <- getTopEnv
+    mb_iface <- liftIO (lookupIfaceByModuleHsc hsc_env mod)
+    pure (maybe False ((== NotBoot) . mi_boot) mb_iface)
 
--- | Look up a `ghc-internal` value identifier only when its defining module
--- is ready in the current compilation environment.
--- See Note [Cold ghc-internal interface lookups].
 lookupBootModuleIdMaybe :: Module -> OccName -> TcM (Maybe Id)
 lookupBootModuleIdMaybe mod occ = do
   ready <- isBootModuleReady mod
-  if not ready
-    then pure Nothing
-    else lookupOrig mod occ >>= tcLookupIdMaybe
+  if not ready then pure Nothing else lookupOrig mod occ >>= tcLookupIdMaybe
 
--- | Strictly record one source-table Name in 'tcg_source_table_uses'.
 recordSourceTableUse :: TcGblEnv -> Name -> TcM ()
 recordSourceTableUse env name =
-    updTcRef (tcg_source_table_uses env) $ \uses ->
-      let !uses' = extendNameSet uses name in uses'
+    updTcRef (tcg_source_table_uses env) (\uses -> let !u = extendNameSet uses name in u)
 
--- | Strictly record a list of source-table Names in 'tcg_source_table_uses'.
 recordSourceTableUses :: TcGblEnv -> [Name] -> TcM ()
 recordSourceTableUses env names =
-    updTcRef (tcg_source_table_uses env) $ \uses ->
-      let !uses' = extendNameSetList uses names in uses'
+    updTcRef (tcg_source_table_uses env) (\uses -> let !u = extendNameSetList uses names in u)
 
--- | Allocate a fresh system 'TyVar' with the given occurrence string and kind.
 freshSysTyVar :: String -> Kind -> TcM TyVar
 freshSysTyVar occ kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc occ)
 
--- | Extract 'Type' arguments from a prefix of 'Core.Type' expressions.
 coreTypeArgs :: [Core.CoreExpr] -> Maybe [Type]
 coreTypeArgs = traverse (\case Core.Type ty -> Just ty; _ -> Nothing)
 
--- | Filter only the exact root owner at a checked specialization.
 tcLookupSourceTableIdAt :: Maybe Name -> Id -> TcM (Maybe Id)
 tcLookupSourceTableIdAt first actual = do
     env <- getGblEnv
@@ -241,20 +249,18 @@ tcLookupSourceTableIdAt first actual = do
       Just fun | Just table <- sourceTableId_maybe fun -> do
         dependencies <- sourceTableDependencies table
         case dependencies of
-          Nothing -> return Nothing
+          Nothing -> pure Nothing
           Just callees -> do
             build_use <- if finalCoreMapperOwner fun && isFinalSourceListTable table
               then fmap (\b -> [(b, Nothing)]) <$> lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "build")
               else pure Nothing
             recordSourceUses ((fun, first) : [(v, Nothing) | v <- callees] ++ fromMaybe [] build_use)
             forM_ (fun : callees) $ \owner ->
-              when (nameModule_maybe (idName owner) == Just (tcg_semantic_mod env)) $
-                keepAlive (idName owner)
+              when (nameModule_maybe (idName owner) == Just (tcg_semantic_mod env)) (keepAlive (idName owner))
             recordSourceTableUse env (tyConName table)
-            return (Just fun)
-      _ -> return Nothing
+            pure (Just fun)
+      _ -> pure Nothing
 
--- | Recover the exact owner of a source family without recording a use.
 sourceTableOwner :: TyCon -> TcM (Maybe Id)
 sourceTableOwner table
   | Just occ <- sourceEquationOwnerOcc (nameOccName (tyConName table))
@@ -262,9 +268,7 @@ sourceTableOwner table
       name <- lookupOrig mod occ
       env <- getGblEnv
       owner <- if mod == tcg_semantic_mod env
-        then pure $ case lookupTypeEnv (tcg_type_env env) name of
-          Just (AnId fun) -> Just fun
-          _ -> Nothing
+        then pure $ case lookupTypeEnv (tcg_type_env env) name of { Just (AnId fun) -> Just fun; _ -> Nothing }
         else do
           absent <- importedSourceOwnerAbsent table
           if absent then pure Nothing else tcLookupIdMaybe name
@@ -280,14 +284,11 @@ sourceTableOwner table
         pure fun
   | otherwise = pure Nothing
 
--- | Recover the common owner for a checked list function and its guard.
--- See Note [Checked guarded list equations].
 sourceEquationOwnerOcc :: OccName -> Maybe OccName
 sourceEquationOwnerOcc occ = do
     term <- sourceTableTermOcc occ
     pure (maybe term mkVarOcc (stripPrefix "#guard:" (occNameString term)))
 
--- | Confirm that an imported interface omits a source table's term owner.
 importedSourceOwnerAbsent :: TyCon -> TcM Bool
 importedSourceOwnerAbsent table = do
     env <- getGblEnv
@@ -297,25 +298,19 @@ importedSourceOwnerAbsent table = do
         pure (isNothing (mi_hash_fn iface occ))
       _ -> pure False
 
--- | Collect source families in a stable order, including beneath synonyms.
 sourceFamilyTyCons :: [Type] -> [TyCon]
 sourceFamilyTyCons tys =
-    case [tc | tc <- nonDetEltsUniqSet (tyConsOfTypes tys)
-             , isJust (sourceTableTermOcc (nameOccName (tyConName tc)))] of
+    case [tc | tc <- nonDetEltsUniqSet (tyConsOfTypes tys), isJust (sourceTableTermOcc (nameOccName (tyConName tc)))] of
       []   -> []
       [tc] -> [tc]
       tcs  -> sortBy (\a b -> stableNameCmp (tyConName a) (tyConName b)) tcs
 
--- | Read distinct source families from a closed table's right-hand sides.
 sourceTableCallees :: TyCon -> Maybe [TyCon]
 sourceTableCallees table = do
     axiom <- closedFamilyTyConCoAxiom_maybe table
-    pure [tc | tc <- sourceFamilyTyCons $
-                      map coAxBranchRHS (fromBranches (coAxiomBranches axiom))
+    pure [tc | tc <- sourceFamilyTyCons (map coAxBranchRHS (fromBranches (coAxiomBranches axiom)))
              , tyConName tc /= tyConName table]
 
--- | Recover all checked callees from closed source equations.
--- See Note [Composed source equations].
 sourceTableDependencies :: TyCon -> TcM (Maybe [Id])
 sourceTableDependencies root = do
     owner <- sourceTableOwner root
@@ -323,9 +318,7 @@ sourceTableDependencies root = do
       Just (CheckedClosureSourceTableId _ _ helpers)
         | not (null helpers) -> do
             ids <- traverse tcLookupIdMaybe helpers
-            case sequence ids of
-              Just checked -> walk (unitNameSet (tyConName root)) (reverse checked) [root]
-              Nothing -> pure Nothing
+            maybe (pure Nothing) (\checked -> walk (unitNameSet (tyConName root)) (reverse checked) [root]) (sequence ids)
         | otherwise -> pure Nothing
       _ -> walk (unitNameSet (tyConName root)) [] [root]
   where
@@ -337,31 +330,23 @@ sourceTableDependencies root = do
           case sequence found of
             Nothing -> pure Nothing
             Just callees -> do
-              let separate called fun =
-                    not (maybe False (\source -> isFilterGuardFor source called) (sourceTableId_maybe fun))
+              let separate called fun = not (maybe False (`isFilterGuardFor` called) (sourceTableId_maybe fun))
                   new_owners = [fun | (called, fun) <- zip wanted callees, separate called fun]
-                  closure_helper_names =
-                    [ h | fun <- new_owners
-                        , CheckedClosureSourceTableId _ _ hs <- [idDetails fun]
-                        , h <- hs ]
-              mb_closure_helpers <- traverse tcLookupIdMaybe closure_helper_names
-              case sequence mb_closure_helpers of
+                  closure_hs = [h | fun <- new_owners, CheckedClosureSourceTableId _ _ hs <- [idDetails fun], h <- hs]
+              mb_chs <- traverse tcLookupIdMaybe closure_hs
+              case sequence mb_chs of
                 Nothing -> pure Nothing
-                Just closure_helpers ->
-                  walk (extendNameSetList seen (map tyConName wanted))
-                       (reverse closure_helpers ++ reverse new_owners ++ owners) (wanted ++ rest)
+                Just chs -> walk (extendNameSetList seen (map tyConName wanted))
+                                 (reverse chs ++ reverse new_owners ++ owners) (wanted ++ rest)
       | otherwise = pure Nothing
 
--- | Guard source families in a type, including families beneath synonyms.
 sourceTableTypeUses :: Type -> TcM ()
 sourceTableTypeUses ty
   | TyConApp tc args <- coreFullView ty = do
-      when (isJust (sourceTableTermOcc (nameOccName (tyConName tc)))) $
-        record_or_use tc (Just args)
+      when (isJust (sourceTableTermOcc (nameOccName (tyConName tc)))) (record_or_use tc (Just args))
       mapM_ sourceTableTypeUses args
   | otherwise = mapM_ (\tc -> record_or_use tc Nothing) (sourceFamilyTyCons [ty])
 
--- | A saturated reference can be stored without consuming an equation.
 sourceTableReferenceUse :: TyCon -> TcM ()
 sourceTableReferenceUse table = record_or_use table Nothing
 
@@ -375,57 +360,49 @@ record_or_use table args
         _ -> do
           owner <- sourceTableOwner table
           case owner of
-            Just fun | finalCoreMapperOwner fun -> do
-              env <- getGblEnv
-              recordSourceTableUse env (tyConName table)
+            Just fun | finalCoreMapperOwner fun -> getGblEnv >>= (`recordSourceTableUse` tyConName table)
             _ -> maybe (sourceTableFamilyUse table) (sourceTableFamilyAppUse table) args
 
--- | Check a source family when its axiom supplies type equality evidence.
--- See Note [Source family evidence uses].
+{- Note [Source family evidence uses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unsaturated references to a source family record only its interface identity.
+When the solver reduces a saturated family application, `sourceTableFamilyAppUse`
+checks the owner and transitive callees, specializing rule-conflict checks to a
+generative first kind argument (`groundFirstHead`) when available.
+-}
+
 sourceTableFamilyUse :: TyCon -> TcM ()
 sourceTableFamilyUse table = sourceTableFamilyUseAt table Nothing
 
--- | Record evidence use at an application, including cache and plugin reductions.
--- See Note [Source family evidence uses].
 sourceTableFamilyAppUse :: TyCon -> [Type] -> TcM ()
 sourceTableFamilyAppUse table args
   | not (args `lengthAtLeast` tyConArity table)
-  , isJust (sourceTableTermOcc (nameOccName (tyConName table))) = do
-      -- Carry the exact identity through interfaces. A bare callback
-      -- does not use an equation or publish a RULE restriction.
-      env <- getGblEnv
-      recordSourceTableUse env (tyConName table)
+  , isJust (sourceTableTermOcc (nameOccName (tyConName table))) =
+      getGblEnv >>= (`recordSourceTableUse` tyConName table)
   | isNothing (indexedSourceTableVisibleArity table)
   , Just visible <- sourceCaseVisibleArity table <|>
-                      (length (dropWhile isInvisibleTyConBinder (tyConBinders table)) <$ sourcePairBuilderField table)
+                    (length (dropWhile isInvisibleTyConBinder (tyConBinders table)) <$ sourcePairBuilderField table)
   , lengthIs args (tyConArity table) = do
       kinds <- liftZonkM (zonkTcTypes (take (tyConArity table - visible) args))
       sourceTableFamilyUseAt table (groundFirstHead kinds)
   | otherwise = sourceTableFamilyUse table
 
--- | Check specialized kinds before running a constructor case operand.
 sourceCaseKindUse :: TyCon -> [Kind] -> TcM ()
 sourceCaseKindUse table kinds
   | isNothing (indexedSourceTableVisibleArity table)
   , Just visible <- sourceCaseVisibleArity table
-  , lengthIs kinds (tyConArity table - visible)
-  = sourceTableFamilyUseAt table (groundFirstHead kinds)
+  , lengthIs kinds (tyConArity table - visible) = sourceTableFamilyUseAt table (groundFirstHead kinds)
   | otherwise = sourceTableFamilyUse table
 
--- | A ground, family-free first type argument can disprove a rough rule match.
 groundFirstHead :: [Type] -> Maybe Name
 groundFirstHead args@(first : _)
   | all noFreeVarsOfType args, all isTyFamFree args
-  , Just (tc, _) <- tcSplitTyConApp_maybe first
-  , isGenerativeTyCon tc Nominal
-  = Just (tyConName tc)
+  , Just (tc, _) <- tcSplitTyConApp_maybe first, isGenerativeTyCon tc Nominal = Just (tyConName tc)
 groundFirstHead _ = Nothing
 
--- | Check the exact owner and record its dependency with the available precision.
 sourceTableFamilyUseAt :: TyCon -> Maybe Name -> TcM ()
 sourceTableFamilyUseAt table first
-  | isTcTyCon table = pure ()
-  | isNothing (sourceTableTermOcc (nameOccName (tyConName table))) = pure ()
+  | isTcTyCon table || isNothing (sourceTableTermOcc (nameOccName (tyConName table))) = pure ()
   | Just (ClosedTypeFamilyTyCon CTF_Abstract) <- famTyConFlav_maybe table = pure ()
   | otherwise = do
       lcl <- getLclEnvTypeEnv <$> getLclEnv
@@ -435,73 +412,25 @@ sourceTableFamilyUseAt table first
           owner <- sourceTableOwner table
           checked <- maybe (pure Nothing) (tcLookupSourceTableIdAt first) owner
           when (isNothing checked) $ do
-            -- See Note [Legacy private source leaves].
             absent <- importedSourceOwnerAbsent table
             env <- getGblEnv
             let local_synth = nameModule_maybe (tyConName table) == Just (tcg_semantic_mod env)
             case sourceTableCallees table of
-              Just [] | absent, not (isSourceFilterGuard table) ->
-                recordSourceTableUse env (tyConName table)
+              Just [] | absent, not (isSourceFilterGuard table) -> recordSourceTableUse env (tyConName table)
               Just callees
                 | absent || local_synth
                 , Just _ <- stripPrefix "T:$depfun$" (occNameString (nameOccName (tyConName table))) -> do
-                    mapM_ (\c -> sourceTableFamilyUseAt c Nothing) callees
+                    mapM_ (`sourceTableFamilyUseAt` Nothing) callees
                     recordSourceTableUse env (tyConName table)
               _ -> failWithTc (TcRnRetainedQuantificationError
                                (RetainedUncheckedSourceCall (maybe (tyConName table) idName owner)))
 
-{- Note [Source family evidence uses]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For Each Flip xs, a partial family can appear as an operand. Export
-the identity of Flip so an ordinary reader can instantiate Each. In
-the empty branch the reader needs no equation of Flip. In the cons
-branch, rewriting Flip x uses an equation. Record that use in the
-client itself, including when it has only the original alias interface.
-See NativeOpenMap for the changed-clause and matching-rule tests.
-
-An imported value can have a generated source family in its type. A caller
-can reduce this family without spelling a source function or enabling
--XDependentTypes. Check the family owner and its callees when
-the solver uses a family reduction. Check only the active family head.
-A type in an unused argument does not establish a use of that argument's
-axiom. Cache and plugin reductions need the same check.
-
-For a checked constructor case, the final family argument represents the
-term scrutinee. The preceding kind arguments instantiate the ordinary function.
-Use that prefix when comparing an explicit type argument in a rewrite
-rule. A pair of unknown Booleans still rules out a Char specialization.
-Before final zonking, the first type argument of a rule with a typed
-term binder can be a filled metavariable. Read that argument before
-comparing heads. An unresolved argument still permits a match.
-
-An imported synonym can contain two nested source applications. Keep
-the arguments at each application when checking the synonym RHS. A
-set of family names loses the specialization that excludes a disjoint
-rule. Retain the conservative check for families in casts and other
-types where this walk does not recover the application.
--}
-
-{- Note [Legacy private source leaves]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An older interface can export a type synonym that mentions a private source
-table but omit the private term. Allow this type-only use if the interface
-has no declaration for the term and the closed axiom has no distinct source
-family in its RHS. Record the table Name for recompilation.
-
-A present term without SourceTableId is not a legacy omission. Reject it.
-Retained calls, composed helper edges and generated list guards require
-the exact owner. Do not use this exception for those equations.
--}
-
--- | Load the rules visible to the module, including rules from home boot cycles.
 visibleSourceMethodRules :: TcGblEnv -> TcM RuleEnv
 visibleSourceMethodRules env = do
     hsc <- getTopEnv
     eps <- getEps
     let mod = tcg_mod env
         visible = tcVisibleOrphanMods env
-        -- GHCi's synthetic module has no node in the module graph. Start at
-        -- its actual imports, as runTcInteractive does for instance visibility.
         from_import rules m = do
           info <- lookupHugByModule m (hsc_HUG hsc)
           case info of
@@ -511,30 +440,20 @@ visibleSourceMethodRules env = do
               pure (extendRuleBaseList (plusUFM_C (++) rules below) (md_rules (hm_details hmi)))
     home_rules <- liftIO $ if isInteractiveModule mod
       then foldM from_import emptyRuleBase (moduleSetElts visible)
-      else hugRulesBelow hsc (homeUnitId (hsc_home_unit hsc))
-                         (GWIB (moduleName mod) (hscSourceToIsBoot (tcg_src env)))
-    pure emptyRuleEnv { re_home_rules = home_rules, re_eps_rules = eps_rule_base eps
-                      , re_visible_orphs = visible }
+      else hugRulesBelow hsc (homeUnitId (hsc_home_unit hsc)) (GWIB (moduleName mod) (hscSourceToIsBoot (tcg_src env)))
+    pure emptyRuleEnv { re_home_rules = home_rules, re_eps_rules = eps_rule_base eps, re_visible_orphs = visible }
 
--- | Collect active non-auto rule heads that @-fno-code@ or
--- @-fomit-interface-pragmas@ stripped from @mi_rules@.
 unloadedSourceRuleHeads :: TcGblEnv -> TcM NameSet
 unloadedSourceRuleHeads env = do
     hsc <- getTopEnv
-    liftIO $ visibleUnloadedSourceRuleHeads hsc False
-               (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
+    liftIO $ visibleUnloadedSourceRuleHeads hsc False (tcg_mod env) (tcg_src env) (tcVisibleOrphanMods env)
 
--- | Test for a visible user rewrite on the exact Id. Every class selector
--- has a built-in dictionary selection rule. That rule selects this field.
 hasSourceMethodRule :: RuleEnv -> Id -> Bool
 hasSourceMethodRule rules = hasSourceMethodRuleAt rules Nothing
 
--- | Skip rules whose first rough-match type constructor differs from the
--- actual type constructor. For example, eqString cannot rewrite (==) @Integer.
 hasSourceMethodRuleAt :: RuleEnv -> Maybe Name -> Id -> Bool
 hasSourceMethodRuleAt rules first = hasSourceMethodRuleAtArgs rules first []
 
--- | An imported rule can also be apart at a checked value argument.
 hasSourceMethodRuleAtArgs :: RuleEnv -> Maybe Name -> SourceProofArgs -> Id -> Bool
 hasSourceMethodRuleAtArgs rules first checked fun = any user_rule (getRules rules (globaliseId fun))
   where
@@ -546,204 +465,145 @@ hasSourceMethodRuleAtArgs rules first checked fun = any user_rule (getRules rule
     user_rule Rule{ru_args = args}
       | not (null checked)
       , dictionary : values <- filter (not . Core.isTypeArg) args
-      , not (Core.isTyCoArg dictionary), isPredTy (exprType dictionary)
-      , not (any Core.isTyCoArg values)
-      , sourceProofArgsApart checked (closedSourceProofArgs (map Just values))
-      = False
+      , not (Core.isTyCoArg dictionary), isPredTy (exprType dictionary), not (any Core.isTyCoArg values)
+      , sourceProofArgsApart checked (closedSourceProofArgs (map Just values)) = False
     user_rule rule = not (isAutoRule rule || isNeverActive (ruleActivation rule))
 
--- | Retain only syntactic constructor applications at checked value positions.
 closedSourceProofArgs :: [Maybe Core.CoreExpr] -> SourceProofArgs
-closedSourceProofArgs args = case map (maybe SourceProofUnknown (constructorArg view)) args of
-    shapes | all (== SourceProofUnknown) shapes -> []
-           | otherwise -> shapes
+closedSourceProofArgs args =
+    case map (maybe SourceProofUnknown (constructorArg view)) args of
+      shapes | all (== SourceProofUnknown) shapes -> []
+             | otherwise -> shapes
   where
-    view e
-      | (Core.Var fun, args) <- Core.collectArgs e
-      , Just con <- isDataConWorkId_maybe fun
-      , let fields = dropWhile Core.isTypeArg args
-      , not (any Core.isTyCoArg fields)
-      = Just (con, fields)
-      | otherwise = Nothing
+    view e | (Core.Var fun, as) <- Core.collectArgs e, Just con <- isDataConWorkId_maybe fun
+           , let fields = dropWhile Core.isTypeArg as, not (any Core.isTyCoArg fields) = Just (con, fields)
+           | otherwise = Nothing
 
--- | Keep only saturated ordinary data constructors.
--- See Note [No RULES on datacons] in GHC.HsToCore.Binds.
 constructorArg :: (e -> Maybe (DataCon, [e])) -> e -> SourceProofArg Name
 constructorArg view = go
   where
     go expr
-      | Just (con, fields) <- view expr
-      , let tc = dataConTyCon con
+      | Just (con, fields) <- view expr, let tc = dataConTyCon con
       , isVanillaDataCon con, isVanillaAlgTyCon tc, isBoxedDataTyCon tc
-      , isNothing (dataConWrapId_maybe con)
-      , lengthIs fields (dataConSourceArity con)
+      , isNothing (dataConWrapId_maybe con), lengthIs fields (dataConSourceArity con)
       = SourceProofCon (dataConName con) (map go fields)
       | otherwise = SourceProofUnknown
 
--- | Prove that the application and rule differ at the same saturated path.
--- See Note [Constructor apartness in source proof rules].
 sourceProofArgsApart :: SourceProofArgs -> SourceProofArgs -> Bool
-sourceProofArgsApart checked rule =
-    lengthIs rule (length checked) && or (zipWith apart checked rule)
+sourceProofArgsApart checked rule = lengthIs rule (length checked) && or (zipWith apart checked rule)
   where
     apart (SourceProofCon a as) (SourceProofCon b bs)
       | a /= b = True
       | lengthIs bs (length as) = or (zipWith apart as bs)
     apart _ _ = False
 
-{- Note [Constructor apartness in source proof rules]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The recorded argument and the rule pattern can use constructors of
-different arities. For example, a rule on fmap f Nothing cannot match
-fmap not (Just True). Compare constructor Names first. Only compare
-fields at corresponding positions under the same constructor.
-
-Both readers use constructorArg to record saturated constructors.
-An unknown argument gives no evidence of a constructor clash.
--}
-
--- | Read a local rule before desugaring. Only application wrappers
--- preserve the value positions used by the constructor check.
 localSourceRuleApart :: Name -> SourceProofArgs -> LRuleDecl GhcTc -> Bool
 localSourceRuleApart owner checked (L _ HsRule{rd_lhs = lhs})
-  | not (null checked)
-  , (HsVar _ (L _ id), args) <- applications True (unLoc lhs) []
-  , idName id == owner
+  | not (null checked), (HsVar _ (L _ v), args) <- applications True (unLoc lhs) [], idName v == owner
   = sourceProofArgsApart checked (map (constructorArg view) args)
   | otherwise = False
   where
-    view expr
-      | (XExpr (ConLikeTc (RealDataCon con)), fields) <- applications False expr []
-      = Just (con, fields)
-      | otherwise = Nothing
-
-    applications allow_evidence expr args = case expr of
-      HsApp _ fun arg -> applications allow_evidence (unLoc fun) (unLoc arg : args)
-      HsAppType _ fun _ -> applications allow_evidence (unLoc fun) args
-      HsPar _ e -> applications allow_evidence (unLoc e) args
-      XExpr (WrapExpr wrap e)
-        | transparent allow_evidence wrap -> applications allow_evidence e args
+    view expr | (XExpr (ConLikeTc (RealDataCon con)), fs) <- applications False expr [] = Just (con, fs)
+              | otherwise = Nothing
+    applications allow expr args = case expr of
+      HsApp _ fun arg -> applications allow (unLoc fun) (unLoc arg : args)
+      HsAppType _ fun _ -> applications allow (unLoc fun) args
+      HsPar _ e -> applications allow (unLoc e) args
+      XExpr (WrapExpr w e) | transparent allow w -> applications allow e args
       _ -> (expr, args)
-
     transparent _ WpHole = True
     transparent _ WpTyApp{} = True
     transparent allow WpEvApp{} = allow
     transparent allow WpLet{} = allow
     transparent allow (WpCompose a b) = transparent allow a && transparent allow b
-    transparent allow (WpSubType wrap) = transparent allow wrap
+    transparent allow (WpSubType w) = transparent allow w
     transparent _ _ = False
 
--- | Check that every visible rule of a certified mapper preserves its two list equations.
--- See Note [Checked list traversal rules].
+{- Note [Certified list fusion rules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Standard `map` traversal rules (`map (\x -> x) xs = xs`, `map/cons`, and
+`map f (map g xs) = map (\x -> f (g x)) xs`) and `zip`/`zipWith` `foldr/build`
+fusion rules (Gill, Launchbury, and Peyton Jones, FPCA 1993) preserve lazy list
+equations under `seq` when the fold, step, and left-producer adapter satisfy the
+head-normal-form hypotheses of Johann and Voigtländer (Fundam. Inform. 2006,
+Theorem 8.2) and carry no extra call-by-value marks or user rules on helpers.
+-}
+
+exactRuleVars :: [Var] -> [Var] -> Bool
+exactRuleVars binders vars =
+    lengthIs binders (length vars) && sizeUniqSet (mkUniqSet vars) == length vars &&
+    mkUniqSet binders == mkUniqSet vars
+
 checkedMapperRules :: RuleEnv -> Id -> Bool
 checkedMapperRules env owner = case activeMapperRules env owner of
-    [rule] | Just table <- sourceTableId_maybe owner
-           , isTwoListCaseTable table
-           -> isJust (checkedImportedSpecConstr env owner table rule)
-    rules | Just table <- sourceTableId_maybe owner
-          , isFinalCoreCaseTable table || isCompositionSourceTable table -> null rules
+    [rule] | Just table <- sourceTableId_maybe owner, isTwoListCaseTable table ->
+      isJust (checkedImportedSpecConstr env owner table rule)
+    rules | Just table <- sourceTableId_maybe owner, isFinalCoreCaseTable table || isCompositionSourceTable table ->
+      null rules
     [] -> False
-    rules -> all (\rule -> identityTraversal rule || consTraversal rule || composeTraversals rule) rules
+    rules -> all (\r -> identityTraversal r || consTraversal r || composeTraversals r) rules
   where
     identityTraversal Rule{ru_fn = fn, ru_bndrs = [a, xs],
-                           ru_args = [Core.Type input, Core.Type output,
-                                      Core.Lam x (Core.Var y), Core.Var arg],
-                           ru_rhs = Core.Var result}
-      = fn == idName owner && getTyVar_maybe input == Just a && eqType input output
-        && isId x && x == y && eqType (varType x) input
-        && isId xs && xs == arg && arg == result && eqType (varType xs) (mkListTy input)
+                           ru_args = [Core.Type i, Core.Type o, Core.Lam x (Core.Var y), Core.Var arg],
+                           ru_rhs = Core.Var res} =
+      fn == idName owner && getTyVar_maybe i == Just a && eqType i o &&
+      isId x && x == y && eqType (varType x) i &&
+      isId xs && xs == arg && arg == res && eqType (varType xs) (mkListTy i)
     identityTraversal _ = False
 
-    consTraversal Rule{ru_fn = fn, ru_bndrs = binders,
-                       ru_args = [Core.Type input, Core.Type output, Core.Var f, spine],
-                       ru_rhs = rhs}
-      | fn == idName owner
-      , Just a <- getTyVar_maybe input, Just b <- getTyVar_maybe output
-      , (Core.Var in_cons, [Core.Type in_ty, Core.Var x, Core.Var xs]) <- Core.collectArgs spine
-      , in_cons == dataConWorkId consDataCon, eqType in_ty input
-      , lengthIs binders 5, mkUniqSet binders == mkUniqSet [a, b, f, x, xs]
-      , isId f, isId x, isId xs
-      , Just (domain, range) <- caseArrow (varType f)
-      , eqType input domain, eqType output range
-      , eqType (varType x) input, eqType (varType xs) (mkListTy input)
-      , (Core.Var out_cons, [Core.Type out_ty, hd, tl]) <- Core.collectArgs rhs
-      , out_cons == dataConWorkId consDataCon, eqType out_ty output
-      , (Core.Var callback, [Core.Var h']) <- Core.collectArgs hd
-      , callback == f, h' == x
-      , Just (a', b', Core.Var f', Core.Var t') <- mapperCall tl
-      = eqType a' input && eqType b' output && f' == f && t' == xs
+    consTraversal Rule{ru_fn = fn, ru_bndrs = bs, ru_args = [Core.Type i, Core.Type o, Core.Var f, spine], ru_rhs = rhs}
+      | fn == idName owner, Just a <- getTyVar_maybe i, Just b <- getTyVar_maybe o
+      , (Core.Var in_c, [Core.Type in_t, Core.Var x, Core.Var xs]) <- Core.collectArgs spine
+      , in_c == dataConWorkId consDataCon, eqType in_t i, exactRuleVars bs [a, b, f, x, xs]
+      , all isId [f, x, xs], Just (dom, rng) <- caseArrow (varType f), eqTypes [i, o] [dom, rng]
+      , eqTypes [varType x, varType xs] [i, mkListTy i]
+      , (Core.Var out_c, [Core.Type out_t, hd, tl]) <- Core.collectArgs rhs
+      , out_c == dataConWorkId consDataCon, eqType out_t o
+      , (Core.Var cb, [Core.Var h']) <- Core.collectArgs hd, cb == f, h' == x
+      , Just (a', b', Core.Var f', Core.Var t') <- mapperCall tl =
+          eqTypes [a', b'] [i, o] && f' == f && t' == xs
     consTraversal _ = False
 
-    composeTraversals Rule{ru_fn = fn, ru_bndrs = binders,
-                           ru_args = [Core.Type middle, Core.Type output, Core.Var f, inner],
-                           ru_rhs = rhs}
-      | fn == idName owner
-      , Just (input, middle', Core.Var g, Core.Var xs) <- mapperCall inner
-      , eqType middle' middle
-      , Just a <- getTyVar_maybe input
-      , Just b <- getTyVar_maybe middle
-      , Just c <- getTyVar_maybe output
-      , lengthIs binders 6, mkUniqSet binders == mkUniqSet [a, b, c, f, g, xs]
-      , isId f, isId g, isId xs
-      , Just (f_in, f_out) <- caseArrow (varType f)
-      , eqType f_in middle, eqType f_out output
-      , Just (g_in, g_out) <- caseArrow (varType g)
-      , eqType g_in input, eqType g_out middle
-      , eqType (varType xs) (mkListTy input)
-      , Just (input', output', Core.Lam x body, Core.Var xs') <- mapperCall rhs
-      , eqType input' input, eqType output' output, xs' == xs
-      , isId x, x `notElem` binders, eqType (varType x) input
-      , (Core.Var f', [g_app]) <- Core.collectArgs body
-      , (Core.Var g', [Core.Var x']) <- Core.collectArgs g_app
-      = f' == f && g' == g && x' == x
+    composeTraversals Rule{ru_fn = fn, ru_bndrs = bs, ru_args = [Core.Type mid, Core.Type o, Core.Var f, inner], ru_rhs = rhs}
+      | fn == idName owner, Just (i, mid', Core.Var g, Core.Var xs) <- mapperCall inner, eqType mid' mid
+      , Just [a, b, c] <- traverse getTyVar_maybe [i, mid, o], exactRuleVars bs [a, b, c, f, g, xs]
+      , all isId [f, g, xs], Just (f_in, f_out) <- caseArrow (varType f), Just (g_in, g_out) <- caseArrow (varType g)
+      , eqTypes [f_in, f_out, g_in, g_out, varType xs] [mid, o, i, mid, mkListTy i]
+      , Just (i', o', Core.Lam x body, Core.Var xs') <- mapperCall rhs
+      , eqTypes [i', o'] [i, o], xs' == xs, isId x, x `notElem` bs, eqType (varType x) i
+      , (Core.Var f', [g_app]) <- Core.collectArgs body, (Core.Var g', [Core.Var x']) <- Core.collectArgs g_app =
+          f' == f && g' == g && x' == x
     composeTraversals _ = False
 
     mapperCall expr = case Core.collectArgs expr of
-      (Core.Var mapper, [Core.Type input, Core.Type output, callback, spine])
-        | mapper == owner -> Just (input, output, callback, spine)
+      (Core.Var m, [Core.Type i, Core.Type o, cb, s]) | m == owner -> Just (i, o, cb, s)
       _ -> Nothing
 
 activeMapperRules :: RuleEnv -> Id -> [CoreRule]
-activeMapperRules env =
-    filter (not . isNeverActive . ruleActivation) . getRules env . globaliseId
+activeMapperRules env = filter (not . isNeverActive . ruleActivation) . getRules env . globaliseId
 
--- | Compare the list interpretation of a zipper's fusion rule with its table.
--- See Note [List interpretation of zipper fusion].
 zipFusionRuleHelpers :: Id -> TyCon -> CoreRule -> Maybe (PhaseNum, Id, Id, Id)
-zipFusionRuleHelpers owner table Rule{ru_fn = fn, ru_bndrs = binders,
-                                     ru_act = activation, ru_args = lhs, ru_rhs = rhs} = do
-    ActiveBefore phase <- pure activation
-    (xs, ys, zipper_args) <- case reverse lhs of
-      Core.Var ys : Core.Var xs : args -> pure (xs, ys, reverse args)
-      _ -> Nothing
-    (a, b, output, callback, parameters) <- zipRuleOperands zipper_args
+zipFusionRuleHelpers owner table Rule{ru_fn = fn, ru_bndrs = binders, ru_act = ActiveBefore phase, ru_args = lhs, ru_rhs = rhs} = do
+    Core.Var ys : Core.Var xs : rev_args <- pure (reverse lhs)
+    (a, b, output, callback, parameters) <- zipRuleOperands (reverse rev_args)
     let variables = parameters ++ maybeToList callback ++ [xs, ys]
         list = mkListTy output
-    guard (fn == idName owner && all isId [xs, ys] &&
-           lengthIs binders (length variables) &&
-           sizeUniqSet (mkUniqSet variables) == length variables &&
-           mkUniqSet binders == mkUniqSet variables &&
+    guard (fn == idName owner && all isId [xs, ys] && exactRuleVars binders variables &&
            eqTypes (map varType [xs, ys]) (map mkListTy [a, b]))
     (Core.Var build, [Core.Type element, generator]) <- pure (Core.collectArgs rhs)
     guard (element `eqType` output && exprType rhs `eqType` list)
     ([accumulator, cons, nil], fold_call) <- pure (Core.collectBinders generator)
     guard (isTyVar accumulator && all isId [cons, nil])
     let r = mkTyVarTy accumulator
-    (Core.Var fold, [Core.Type x, Core.Type y, Core.Type state,
-                     step_call, Core.Var seed, Core.Var l, Core.Var rgt]) <-
+    (Core.Var fold, [Core.Type x, Core.Type y, Core.Type state, step_call, Core.Var seed, Core.Var l, Core.Var rgt]) <-
       pure (Core.collectArgs fold_call)
     guard (eqTypes [a, b, r] [x, y, state] && [seed, l, rgt] == [nil, xs, ys])
     (step, Core.Var actual) <- zipStepOperands a b r output callback step_call
-    guard (actual == cons)
     ActiveAfter build_phase <- pure (idInlineActivation build)
-    guard (phase == build_phase)
-    build_body <- unfolding build
-    fold_body <- unfolding fold
-    step_body <- unfolding step
-    guard (checkedZipFoldAlgebra fold fold_body &&
-           case callback of
-             Nothing -> checkedZipPairStep step step_body
-             Just _ -> checkedZipCallbackStep step step_body)
+    guard (actual == cons && phase == build_phase)
+    [build_body, fold_body, step_body] <- traverse (\v -> case realIdUnfolding v of
+      Core.CoreUnfolding{Core.uf_tmpl = body} -> Just body; _ -> Nothing) [build, fold, step]
+    guard (checkedZipFoldAlgebra fold fold_body && checkedZipStep (isJust callback) step step_body)
     ([element_var, builder], algebra) <- pure (Core.collectBinders build_body)
     guard (isTyVar element_var && isId builder)
     let e = mkTyVarTy element_var
@@ -751,73 +611,51 @@ zipFusionRuleHelpers owner table Rule{ru_fn = fn, ru_bndrs = binders,
     guard (apply == builder && result `eqType` mkListTy e &&
            listRuleConstructor consDataCon e cons_arg && listRuleConstructor nilDataCon e nil_arg)
     let cons_value = Core.mkConApp consDataCon [Core.Type output]
-    list_step <- instantiate step_body $
-      case callback of
-        Nothing -> map Core.Type [a, b, list, list] ++ [cons_value]
-        Just f -> map Core.Type [output, list, list, a, b] ++ [cons_value, Core.Var f]
+    list_step <- instantiate step_body $ case callback of
+      Nothing -> map Core.Type [a, b, list, list] ++ [cons_value]
+      Just f  -> map Core.Type [output, list, list, a, b] ++ [cons_value, Core.Var f]
     list_result <- instantiate fold_body
-      [Core.Type a, Core.Type b, Core.Type list, list_step,
-       Core.mkConApp nilDataCon [Core.Type output], Core.Var xs, Core.Var ys]
-    let expanded = simpleOptExpr defaultSimpleOpts (Core.mkLams variables list_result)
-    (signature, rows) <- checkedListZip (const True) owner expanded
-    guard (matchesConstructorCase table signature rows)
-    pure (phase, build, fold, step)
+      [Core.Type a, Core.Type b, Core.Type list, list_step, Core.mkConApp nilDataCon [Core.Type output], Core.Var xs, Core.Var ys]
+    cct <- compileZipCore (const True) owner (safeSimpleOptExpr defaultSimpleOpts (Core.mkLams variables list_result))
+    (phase, build, fold, step) <$ guard (matchesCompiledTable table Nothing cct)
   where
-    unfolding v = do
-      Core.CoreUnfolding { Core.uf_tmpl = body } <- pure (realIdUnfolding v)
-      pure body
     instantiate expression args = do
       let (parameters, body) = Core.collectBinders expression
           (applied, remaining) = splitAt (length args) parameters
-          argument v a = not (isCoVar v || Core.isCoArg a) && isTyVar v == Core.isTypeArg a
           rest = Core.mkLams remaining body
-          scope = mkInScopeSet (exprsFreeVars (rest : args))
-      guard (equalLength applied args && and (zipWith argument applied args))
-      pure (CoreSubst.substExpr (CoreSubst.mkOpenSubst scope (zip applied args)) rest)
+      guard (equalLength applied args &&
+             and (zipWith (\v arg -> not (isCoVar v || Core.isCoArg arg) && isTyVar v == Core.isTypeArg arg) applied args))
+      pure (CoreSubst.substExpr (CoreSubst.mkOpenSubst (mkInScopeSet (exprsFreeVars (rest : args))) (zip applied args)) rest)
 zipFusionRuleHelpers _ _ _ = Nothing
 
--- | Check the inverse at the list algebra and at the phase of builder inlining.
 checkedZipInverse :: Id -> Id -> Id -> PhaseNum -> CoreRule -> Bool
 checkedZipInverse owner fold step phase
-    Rule{ru_fn = fn, ru_act = activation, ru_bndrs = binders, ru_args = lhs, ru_rhs = rhs}
+    Rule{ru_fn = fn, ru_act = ActiveAfter inv_phase, ru_bndrs = binders, ru_args = [Core.Type a, Core.Type b, Core.Type r, step_call, nil], ru_rhs = rhs}
   = isJust $ do
-    ActiveAfter inverse_phase <- pure activation
-    [Core.Type a, Core.Type b, Core.Type r, step_call, nil] <- pure lhs
-    (Core.Var zipper, args) <- pure (Core.collectArgs rhs)
+    let (raw_fn, args) = Core.collectArgs rhs
+    Core.Var zipper <- pure raw_fn
     (a', b', output, callback, parameters) <- zipRuleOperands args
-    let variables = parameters ++ maybeToList callback
-    guard (inverse_phase == phase && fn == idName fold && zipper == owner &&
-           eqTypes [a, b, r] [a', b', mkListTy output] &&
-           lengthIs binders (length variables) &&
-           sizeUniqSet (mkUniqSet variables) == length variables &&
-           mkUniqSet binders == mkUniqSet variables)
+    guard (inv_phase == phase && fn == idName fold && zipper == owner &&
+           eqTypes [a, b, r] [a', b', mkListTy output] && exactRuleVars binders (parameters ++ maybeToList callback))
     (step', cons) <- zipStepOperands a b r output callback step_call
-    guard (step == step' &&
-           listRuleConstructor consDataCon output cons && listRuleConstructor nilDataCon output nil)
+    guard (step == step' && listRuleConstructor consDataCon output cons && listRuleConstructor nilDataCon output nil)
 checkedZipInverse _ _ _ _ _ = False
 
--- | Read the type arguments and the optional callback of a zipper application.
 zipRuleOperands :: [Core.CoreExpr] -> Maybe (Type, Type, Type, Maybe Id, [TyVar])
 zipRuleOperands (Core.Type a : Core.Type b : rest) = do
     parameters <- traverse getTyVar_maybe [a, b]
     case rest of
       [] -> pure (a, b, mkTupleTy Boxed [a, b], Nothing, parameters)
-      [Core.Type output, Core.Var callback] -> do
-        result <- getTyVar_maybe output
-        guard (isId callback)
-        pure (a, b, output, Just callback, parameters ++ [result])
+      [Core.Type output, Core.Var cb] | isId cb ->
+        (\res -> (a, b, output, Just cb, parameters ++ [res])) <$> getTyVar_maybe output
       _ -> Nothing
 zipRuleOperands _ = Nothing
 
--- | Read the continuation passed to the pair or callback step.
-zipStepOperands :: Type -> Type -> Type -> Type -> Maybe Id -> Core.CoreExpr
-                -> Maybe (Id, Core.CoreExpr)
-zipStepOperands a b r output callback expr =
-  case (callback, Core.collectArgs expr) of
+zipStepOperands :: Type -> Type -> Type -> Type -> Maybe Id -> Core.CoreExpr -> Maybe (Id, Core.CoreExpr)
+zipStepOperands a b r output callback expr = case (callback, Core.collectArgs expr) of
     (Nothing, (Core.Var step, [Core.Type x, Core.Type y, Core.Type c, Core.Type d, k]))
       | eqTypes [a, b, r, r] [x, y, c, d] -> Just (step, k)
-    (Just f, (Core.Var step, [Core.Type e, Core.Type c, Core.Type d, Core.Type x,
-                             Core.Type y, k, Core.Var f']))
+    (Just f, (Core.Var step, [Core.Type e, Core.Type c, Core.Type d, Core.Type x, Core.Type y, k, Core.Var f']))
       | eqTypes [output, r, r, a, b] [e, c, d, x, y], f' == f -> Just (step, k)
     _ -> Nothing
 
@@ -826,151 +664,70 @@ listRuleConstructor con element value = case Core.collectArgs value of
   (Core.Var worker, [Core.Type ty]) -> worker == dataConWorkId con && ty `eqType` element
   _ -> False
 
--- | Check the fold before specializing its abstract continuation and seed.
--- See Note [List interpretation of zipper fusion].
 checkedZipFoldAlgebra :: Id -> Core.CoreExpr -> Bool
 checkedZipFoldAlgebra folder expression = isJust $ do
-    ([a, b, r, k, seed, left, right], Core.Let (Core.Rec [(go, loop)]) start) <-
-      pure (Core.collectBinders expression)
-    guard (all isTyVar [a, b, r] && all isId [k, seed, left, right] &&
-           exact_call go [left, right] start)
-    let marks = fromMaybe [] (idCbvMarks_maybe folder)
-        extra_marks = take 2 marks ++ drop 3 marks ++ drop 1 (fromMaybe [] (idCbvMarks_maybe go))
-    guard (not (any isMarkedCbv extra_marks))
+    ([a, b, r, k, seed, left, right], Core.Let (Core.Rec [(go, loop)]) start) <- pure (Core.collectBinders expression)
+    let exact_call f vs e = case Core.collectArgs e of
+          (Core.Var fun, as) -> fun == f && traverse (\case Core.Var v -> Just v; _ -> Nothing) as == Just vs
+          _ -> False
+        split_list scrut e = do
+          Core.Case (Core.Var act) _ _
+            [Core.Alt (Core.DataAlt nil) [] (Core.Var s), Core.Alt (Core.DataAlt cons) [hv, tv] rest] <- pure e
+          (s, hv, tv, rest) <$ guard (act == scrut && nil == nilDataCon && cons == consDataCon)
+        marks = fromMaybe [] (idCbvMarks_maybe folder)
+    guard (all isTyVar [a, b, r] && all isId [k, seed, left, right] && exact_call go [left, right] start &&
+           not (any isMarkedCbv (take 2 marks ++ drop 3 marks ++ drop 1 (fromMaybe [] (idCbvMarks_maybe go)))))
     ([xs, ys], outer) <- pure (Core.collectBinders loop)
-    (empty_left, x, xt, inner) <- split_list xs outer
-    (empty_right, y, yt, both) <- split_list ys inner
-    guard (empty_left == seed && empty_right == seed)
-    (Core.Var step, [Core.Var head_left, Core.Var head_right, tail_call]) <-
-      pure (Core.collectArgs both)
-    guard (step == k && [head_left, head_right] == [x, y] && exact_call go [xt, yt] tail_call)
-  where
-    exact_call f values body = case Core.collectArgs body of
-      (Core.Var fun, args) -> fun == f && traverse argument args == Just values
-      _ -> False
-    argument (Core.Var v) = Just v
-    argument _ = Nothing
-    split_list scrutinee body = do
-      Core.Case (Core.Var actual) _ _
-        [Core.Alt (Core.DataAlt nil) [] (Core.Var seed),
-         Core.Alt (Core.DataAlt cons) [head_var, tail_var] rest] <- pure body
-      guard (actual == scrutinee && nil == nilDataCon && cons == consDataCon)
-      pure (seed, head_var, tail_var, rest)
+    (e_l, x, xt, inner) <- split_list xs outer
+    (e_r, y, yt, both) <- split_list ys inner
+    (Core.Var step, [Core.Var hl, Core.Var hr, tail_call]) <- pure (Core.collectArgs both)
+    guard (e_l == seed && e_r == seed && step == k && [hl, hr] == [x, y] && exact_call go [xt, yt] tail_call)
 
--- | Keep the pair and recursive result as arguments of the abstract continuation.
-checkedZipPairStep :: Id -> Core.CoreExpr -> Bool
-checkedZipPairStep step expression = isJust $ do
-    ([a, b, c, d, k, x, y, r], body) <- pure (Core.collectBinders expression)
-    guard (all isTyVar [a, b, c, d] && all isId [k, x, y, r] &&
-           not (any isMarkedCbv (fromMaybe [] (idCbvMarks_maybe step))))
-    (Core.Var apply, [pair, Core.Var tail_result]) <- pure (Core.collectArgs body)
-    (Core.Var constructor, [Core.Type left, Core.Type right, Core.Var head_left, Core.Var head_right]) <-
-      pure (Core.collectArgs pair)
-    guard (apply == k && tail_result == r && constructor == dataConWorkId (tupleDataCon Boxed 2) &&
-           eqTypes [left, right] (mkTyVarTys [a, b]) && [head_left, head_right] == [x, y])
+checkedZipStep :: Bool -> Id -> Core.CoreExpr -> Bool
+checkedZipStep has_cb step expression = isJust $ do
+    let (bndrs, body) = Core.collectBinders expression
+    guard (not (any isMarkedCbv (fromMaybe [] (idCbvMarks_maybe step))))
+    (Core.Var cont, [head_res, Core.Var tail_res]) <- pure (Core.collectArgs body)
+    if has_cb
+      then do
+        [a, b, c, d, e, k, f, x, y, r] <- pure bndrs
+        (Core.Var cb, [Core.Var hl, Core.Var hr]) <- pure (Core.collectArgs head_res)
+        guard (all isTyVar [a, b, c, d, e] && all isId [k, f, x, y, r] &&
+               cont == k && cb == f && tail_res == r && [hl, hr] == [x, y])
+      else do
+        [a, b, c, d, k, x, y, r] <- pure bndrs
+        (Core.Var ctor, [Core.Type l, Core.Type rgt, Core.Var hl, Core.Var hr]) <- pure (Core.collectArgs head_res)
+        guard (all isTyVar [a, b, c, d] && all isId [k, x, y, r] && cont == k && tail_res == r &&
+               ctor == dataConWorkId (tupleDataCon Boxed 2) && eqTypes [l, rgt] (mkTyVarTys [a, b]) && [hl, hr] == [x, y])
 
--- | Keep the callback application and tail lazy in the abstract continuation.
-checkedZipCallbackStep :: Id -> Core.CoreExpr -> Bool
-checkedZipCallbackStep step expression = isJust $ do
-    ([a, b, c, d, e, k, f, x, y, r], body) <- pure (Core.collectBinders expression)
-    guard (all isTyVar [a, b, c, d, e] && all isId [k, f, x, y, r] &&
-           not (any isMarkedCbv (fromMaybe [] (idCbvMarks_maybe step))))
-    (Core.Var continuation, [head_result, Core.Var tail_result]) <- pure (Core.collectArgs body)
-    (Core.Var callback, [Core.Var head_left, Core.Var head_right]) <-
-      pure (Core.collectArgs head_result)
-    guard (continuation == k && callback == f && tail_result == r && [head_left, head_right] == [x, y])
-
--- | Check the rule that fuses a build producer in the fold's left input.
--- See Note [List interpretation of zipper fusion].
 checkedZipLeftFusion :: Id -> Id -> CoreRule -> Maybe Id
 checkedZipLeftFusion fold build
-    Rule{ru_fn = fn, ru_bndrs = binders, ru_args = lhs, ru_rhs = rhs} = do
-    [Core.Type a, Core.Type b, Core.Type r, Core.Var step, Core.Var seed,
-      producer, Core.Var right] <- pure lhs
+    Rule{ru_fn = fn, ru_bndrs = binders, ru_args = [Core.Type a, Core.Type b, Core.Type r, Core.Var step, Core.Var seed, producer, Core.Var right], ru_rhs = rhs} = do
     type_vars <- traverse getTyVar_maybe [a, b, r]
     (Core.Var builder, [Core.Type element, Core.Var generator]) <- pure (Core.collectArgs producer)
-    let variables = type_vars ++ [step, seed, generator, right]
-    guard (fn == idName fold && builder == build && eqType element a &&
-           all isId [step, seed, generator, right] &&
-           lengthIs binders (length variables) &&
-           sizeUniqSet (mkUniqSet variables) == length variables &&
-           mkUniqSet binders == mkUniqSet variables)
-    (Core.Var g, [Core.Type result, on_cons, Core.Lam ignored (Core.Var on_nil), Core.Var ys]) <-
-      pure (Core.collectArgs rhs)
-    guard (g == generator && isId ignored && eqType (varType ignored) (mkListTy b) &&
-           on_nil == seed && ys == right)
+    guard (fn == idName fold && builder == build && eqType element a && all isId [step, seed, generator, right] &&
+           exactRuleVars binders (type_vars ++ [step, seed, generator, right]))
+    (Core.Var g, [Core.Type result, on_cons, Core.Lam ignored (Core.Var on_nil), Core.Var ys]) <- pure (Core.collectArgs rhs)
     (FTF_T_T, _, mult, domain, range) <- splitFunTy_maybe result
-    guard (isManyTy mult && eqTypes [domain, range] [mkListTy b, r])
-    (Core.Var adapt, [Core.Type a', Core.Type b', Core.Type c', Core.Type r',
-                      Core.Var k, Core.Var z]) <- pure (Core.collectArgs on_cons)
-    guard (eqTypes [a, b, r, r] [a', b', c', r'] && k == step && z == seed)
+    guard (g == generator && isId ignored && eqType (varType ignored) (mkListTy b) && on_nil == seed && ys == right &&
+           isManyTy mult && eqTypes [domain, range] [mkListTy b, r])
+    (Core.Var adapt, [Core.Type a', Core.Type b', Core.Type c', Core.Type r', Core.Var k, Core.Var z]) <- pure (Core.collectArgs on_cons)
     Core.CoreUnfolding{Core.uf_tmpl = body} <- pure (realIdUnfolding adapt)
-    guard (checkedZipLeftAdapter adapt body)
-    pure adapt
+    adapt <$ guard (eqTypes [a, b, r, r] [a', b', c', r'] && k == step && z == seed && checkedZipLeftAdapter adapt body)
 checkedZipLeftFusion _ _ _ = Nothing
 
--- | Verify that the cons adapter is a function before it sees the right input.
 checkedZipLeftAdapter :: Id -> Core.CoreExpr -> Bool
 checkedZipLeftAdapter adapt expression = isJust $ do
     ([a, b, c, d, k, z, x, recur, right], body) <- pure (Core.collectBinders expression)
-    guard (all isTyVar [a, b, c, d] && all isId [k, z, x, recur, right] &&
-           idArity adapt == 5 &&
+    guard (all isTyVar [a, b, c, d] && all isId [k, z, x, recur, right] && idArity adapt == 5 &&
            not (any isMarkedCbv (take 4 (fromMaybe [] (idCbvMarks_maybe adapt)))))
     Core.Case (Core.Var input) _ _
-      [Core.Alt (Core.DataAlt nil) [] (Core.Var seed),
-       Core.Alt (Core.DataAlt cons) [y, ys] next] <- pure body
-    guard (input == right && nil == nilDataCon && cons == consDataCon && seed == z)
-    (Core.Var continuation, [Core.Var head_left, Core.Var head_right, rest]) <-
-      pure (Core.collectArgs next)
-    (Core.Var f, [Core.Var tail_right]) <- pure (Core.collectArgs rest)
-    guard (continuation == k && head_left == x && head_right == y &&
-           f == recur && tail_right == ys)
+      [Core.Alt (Core.DataAlt nil) [] (Core.Var seed), Core.Alt (Core.DataAlt cons) [y, ys] next] <- pure body
+    (Core.Var cont, [Core.Var hl, Core.Var hr, rest]) <- pure (Core.collectArgs next)
+    (Core.Var f, [Core.Var tr]) <- pure (Core.collectArgs rest)
+    guard (input == right && nil == nilDataCon && cons == consDataCon && seed == z &&
+           cont == k && hl == x && hr == y && f == recur && tr == ys)
 
-{- Note [List interpretation of zipper fusion]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A zipper can have an optimizer rule whose right-hand side builds a
-list from a two-list fold. Read the actual Core rule and the helper
-unfoldings. Instantiate the generator with the lazy list algebra
-from the builder. Compare the ordered cases and the recursive
-operands with the owner's already checked table.
-
-This check establishes the list interpretation of the forward rule.
-Check the fold and step with their original abstract arguments first.
-The fold tests the left spine and, only for a cons, the right spine.
-Each nil result returns the seed. The cons result leaves the heads
-and recursive result in the original continuation's arguments. Check
-call-by-value marks for any extra demand. Substituting [] before this
-check could erase an early test of the seed. An output consumer can
-supply a bottom seed to a continuation that leaves its tail unused.
-
-The simplifier can also rewrite the introduced helpers before
-inlining them. The inverse zipper rule must supply the same list algebra
-to the same fold and return the same zipper. Its phase starts when the
-builder can inline and the forward rule stops. This avoids a rewrite
-cycle. A rule on the builder can replace the entire zip result. Report
-these conflicts through the same checks as other source-rule conflicts.
-
-The left-producer rule is an instance of fold/build with a function
-accumulator. The nil algebra returns a lambda. The cons algebra
-applies the adapter to the continuation, the seed, a left element and
-a recursive function. The adapter still awaits a right list, so this
-application is in head normal form even when those four arguments
-diverge. In the adapter, a right nil returns the original seed. A right
-cons passes the original heads and recursive right tail to the original
-continuation. These equations and the two head-normal-form properties
-give the hypotheses of Johann and Voigtlaender, The Impact of seq on
-Free Theorems-Based Program Transformations, Theorem 8.2. The rank-2
-producer can use seq.
-
-Both zipper variants use the same fold. Check every rule on that fold.
-An inverse can return the original owner or another checked zipper
-on the same fold and builder. Verify that owner's forward rule and
-table before accepting its inverse. Check the builder, both steps and the
-left-producer adapter for additional rules. A rule for a helper can
-change the interpretation even if it has a different rule name.
--}
-
--- | Check final-Core rules and identify an introduced helper with an active rule.
 finalCoreRuleConflict :: RuleEnv -> NameSet -> NameSet -> Id -> Maybe RetainedQuantificationError
 finalCoreRuleConflict visible unloaded local owner
   | idName owner `elemNameSet` local || idName owner `elemNameSet` unloaded = Just fallback
@@ -978,224 +735,127 @@ finalCoreRuleConflict visible unloaded local owner
   | Just table <- sourceTableId_maybe owner
   , isTwoListCaseTable table || isListZipWithTable table
   , [rule] <- activeMapperRules visible owner
-  , Just (phase, build, fold, step) <- zipFusionRuleHelpers owner table rule
-  = let fold_rules = activeMapperRules visible fold
-        inverse = checkedZipInverse owner fold step phase
-        dependencies = map (foldRuleDependencies inverse phase build fold) fold_rules
-        helper_conflict = find changed (build : step : concat (catMaybes dependencies))
-        fold_conflict = Just (RetainedSourceRule (idName fold))
-    in if idName fold `elemNameSet` local ||
-          idName fold `elemNameSet` unloaded ||
-          any (\r -> usesStep step r && not (inverse r)) fold_rules
-       then fold_conflict
-       else case helper_conflict of
-         Just helper -> Just (RetainedSourceRule (idName helper))
-         Nothing
-           | any isNothing dependencies -> fold_conflict
-           | any inverse fold_rules -> Nothing
-           | otherwise -> Just fallback
+  , Just (phase, build, fold, step) <- zipFusionRuleHelpers owner table rule =
+      let fold_rules = activeMapperRules visible fold
+          inverse = checkedZipInverse owner fold step phase
+          dependencies = map (foldRuleDependencies inverse phase build fold) fold_rules
+          helper_conflict = find changed (build : step : concat (catMaybes dependencies))
+          fold_conflict = Just (RetainedSourceRule (idName fold))
+      in if idName fold `elemNameSet` local || idName fold `elemNameSet` unloaded ||
+            any (\r -> usesStep step r && not (inverse r)) fold_rules
+         then fold_conflict
+         else case helper_conflict of
+           Just helper -> Just (RetainedSourceRule (idName helper))
+           Nothing | any isNothing dependencies -> fold_conflict
+                   | any inverse fold_rules     -> Nothing
+                   | otherwise                  -> Just fallback
   | otherwise = Just fallback
   where
-    usesStep step Rule{ru_args = _ : _ : _ : arg : _}
-      | (Core.Var fun, _) <- Core.collectArgs arg = fun == step
+    usesStep step Rule{ru_args = _ : _ : _ : arg : _} | (Core.Var fun, _) <- Core.collectArgs arg = fun == step
     usesStep _ _ = False
     foldRuleDependencies inverse phase build fold rule
       | inverse rule = Just []
       | Just adapter <- checkedZipLeftFusion fold build rule = Just [adapter]
-      | Rule{ru_rhs = rhs} <- rule
-      , (Core.Var peer, _) <- Core.collectArgs rhs
-      , peer /= owner
-      , not (idName peer `elemNameSet` local)
-      , not (idName peer `elemNameSet` unloaded)
-      , Just table <- sourceTableId_maybe peer
-      , isTwoListCaseTable table || isListZipWithTable table
+      | Rule{ru_rhs = rhs} <- rule, (Core.Var peer, _) <- Core.collectArgs rhs
+      , peer /= owner, not (idName peer `elemNameSet` local), not (idName peer `elemNameSet` unloaded)
+      , Just table <- sourceTableId_maybe peer, isTwoListCaseTable table || isListZipWithTable table
       , [forward] <- activeMapperRules visible peer
-      , Just (peer_phase, peer_build, peer_fold, peer_step) <- zipFusionRuleHelpers peer table forward
-      , phase == peer_phase, build == peer_build, fold == peer_fold
-      , checkedZipInverse peer fold peer_step phase rule
-      = Just [peer_step]
+      , Just (p_phase, p_build, p_fold, p_step) <- zipFusionRuleHelpers peer table forward
+      , phase == p_phase, build == p_build, fold == p_fold, checkedZipInverse peer fold p_step phase rule
+      = Just [p_step]
       | otherwise = Nothing
-    changed v = idName v `elemNameSet` local || idName v `elemNameSet` unloaded ||
-                not (null (activeMapperRules visible v))
+    changed v = idName v `elemNameSet` local || idName v `elemNameSet` unloaded || not (null (activeMapperRules visible v))
     fallback = RetainedFinalCoreRulesEnabled (idName owner)
 
-{- Note [Checked list traversal rules]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For the checked list mapper, mapping the identity lambda over an empty
-list gives the empty list. On a cons it returns the original head and
-maps the same lambda over the tail. Neither side forces the head or
-the tail. These equations also preserve a divergent spine.
-
-On a cons, a rule can also expose the checked mapper's own equation.
-The left side supplies the list constructor, so neither side needs to
-force its fields. The right side builds a lazy cons with the same
-callback application and the same recursive call on the input tail.
-The callback stays a rule parameter. This reasoning covers a divergent
-callback and does not require properties of any particular function.
-
-Two traversals can become one with the lambda \x -> f (g x). Both
-sides inspect the original spine and return [] for []. For a cons,
-both produce the same lazy head f (g x). Their tails satisfy the same
-equation on the original input tail. This argument also covers partial
-and infinite lists because each observation of a cons needs one step.
-In particular, g can diverge when f ignores its argument.
-
-The cons and composition rules introduce no fixed rule head except
-the same mapper.
-See getRules in GHC.Core.Rules for the list constructor.
-
-Check the binders and both sides of every visible rule. An unverified
-rule can change the result or its demand even if the other rules pass.
-Recheck after processing declarations and splices.
--}
-
--- | Check the selected method at the occurrence, and record its semantic dependencies.
 recordSourceMethodUse :: Id -> Id -> Id -> TcM ()
 recordSourceMethodUse dfun selector target = do
     recordSourceUses (sourceMethodOps dfun selector target)
     captureSourceMethodProof dfun selector target ([], [])
 
--- | Record the observed method in the current named proof declaration.
--- The caller applies its own checks before publishing the result.
 captureSourceMethodProof :: Id -> Id -> Id -> (SourceProofArgs, [Id]) -> TcM ()
 captureSourceMethodProof dfun selector target (checked, leaves) = do
     env <- getGblEnv
     let ops = sourceMethodOps dfun selector target
-    updTcRef (tcg_source_rule_types env) $ \state ->
-      case sourceProofSignature state of
-        Just owner ->
-          let new_deps =
-                [ (idName v, first, finalCoreMapperOwner v, if v == selector then checked else [])
-                | (v, first) <- ops ] ++ [(idName v, Nothing, False, []) | v <- leaves]
-              !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) owner new_deps
-          in state { sourceProofDefinitions = defs' }
-        Nothing -> state
+    updTcRef (tcg_source_rule_types env) $ \state -> case sourceProofSignature state of
+      Just owner ->
+        let new_deps = [(idName v, first, finalCoreMapperOwner v, if v == selector then checked else []) | (v, first) <- ops]
+                       ++ [(idName v, Nothing, False, []) | v <- leaves]
+            !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) owner new_deps
+        in state { sourceProofDefinitions = defs' }
+      Nothing -> state
 
-{- Note [Imported source method proofs]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Readback can erase the selected method from a proof's signature. Record
-its rule dependencies while checking the source signature. An ordinary
-consumer may use the resulting proof without enabling the extension.
-Check rules at that occurrence, after all declaration groups have finished.
-
-The checking flag is the consumer's Opt_EnableRewriteRules. If rules are
-off, the consumer still records the dependencies of an exported forwarder.
-Re-exporting the imported binding preserves its original Name and metadata.
-The defining module checked its own rules when it produced the proof.
-For new rules, use the stable rule-head identity in RuleEnv. A head can
-identify a private method worker with no interface declaration.
-
-This check uses the existing first-type-constructor test and
-checkedMapperRules whitelist. Use the same rule policy as for checked
-source method calls. For a direct closed selector application, checked
-constructor arguments can rule out a match. See Note [Closed rule argument
-shapes] in GHC.Tc.Gen.Splice. Keep other uses of the same method in the
-dependency list even if one use has checked arguments.
-
-This metadata covers methods checked in complete top-level signatures.
-It does not recover the provenance of proofs from earlier interfaces.
--}
-
--- | Collect method dependencies while checking a complete source signature.
 withSourceProofSignature :: Maybe Name -> TcM a -> TcM a
-withSourceProofSignature (Just owner) action
-  | isExternalName owner = do
-      enabled <- xoptM LangExt.ExperimentalDependentTypes
-      if not enabled then action else do
-        env <- getGblEnv
-        let proof_ref = tcg_source_rule_types env
-        before <- readTcRef proof_ref
-        local <- newTcRef (before { sourceProofSignature = Just owner })
-        result <- setGblEnv (env { tcg_source_rule_types = local }) action
-        after <- readTcRef local
-        writeTcRef proof_ref (after { sourceProofSignature = sourceProofSignature before })
-        pure result
+withSourceProofSignature (Just owner) action | isExternalName owner = do
+    enabled <- xoptM LangExt.ExperimentalDependentTypes
+    if not enabled then action else do
+      env <- getGblEnv
+      let proof_ref = tcg_source_rule_types env
+      before <- readTcRef proof_ref
+      local <- newTcRef (before { sourceProofSignature = Just owner })
+      result <- setGblEnv (env { tcg_source_rule_types = local }) action
+      after <- readTcRef local
+      writeTcRef proof_ref (after { sourceProofSignature = sourceProofSignature before })
+      pure result
 withSourceProofSignature _ action = action
 
--- | Carry the referenced synonym's rule dependencies into a named signature
--- or another synonym before kind checking can discard the reference.
 recordSourceProofAliasUse :: Maybe Name -> TyCon -> TcM ()
 recordSourceProofAliasUse owner tc
   | deps@(_ : _) <- synTyConSourceProofRules tc = do
       env <- getGblEnv
-      updTcRef (tcg_source_rule_types env) $ \state ->
-        case owner <|> sourceProofSignature state of
-          Just name | isExternalName name ->
-            let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) name deps
-            in state { sourceProofDefinitions = defs' }
-          _ -> state
+      updTcRef (tcg_source_rule_types env) $ \state -> case owner <|> sourceProofSignature state of
+        Just name | isExternalName name ->
+          let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) name deps
+          in state { sourceProofDefinitions = defs' }
+        _ -> state
   | otherwise = pure ()
 
--- | Get the checked rule dependencies for a finished source declaration.
 sourceProofRulesFor :: Name -> TcM [SourceProofRule]
 sourceProofRulesFor name = do
     env <- getGblEnv
     defs <- sourceProofDefinitions <$> readTcRef (tcg_source_rule_types env)
     pure (stableSourceProofRules (fromMaybe [] (lookupNameEnv defs name)))
 
--- | Finish a family equation before collecting dependencies for another
--- equation under the same axiom name.
 takeSourceProofRulesFor :: Name -> TcM [SourceProofRule]
 takeSourceProofRulesFor name = do
     rules <- sourceProofRulesFor name
     unless (null rules) $ do
       env <- getGblEnv
       updTcRef (tcg_source_rule_types env) $ \state ->
-        let !defs' = delFromNameEnv (sourceProofDefinitions state) name
-        in state { sourceProofDefinitions = defs' }
+        let !defs' = delFromNameEnv (sourceProofDefinitions state) name in state { sourceProofDefinitions = defs' }
     pure rules
 
--- | Verify imported proofs and committed synonym reductions in this consumer and retain the dependencies of
--- its exports, including forwards through a private local group.
 checkAndInstallSourceProofs :: TcGblEnv -> TcM TcGblEnv
 checkAndInstallSourceProofs env = do
     state <- readTcRef (tcg_source_rule_types env)
     let occurrences = sourceProofOccurrences state
         imported = mkNameEnv [(name, ops) | (name, _, ops) <- occurrences]
-        -- A Wanted can be solved after checking the binding. Its source
-        -- span still belongs to the checked RHS. Attach the observed
-        -- dependency to the exact singleton signature binding. A type
-        -- reference elsewhere in the module is not evidence of a use.
         rhs_proofs = mkNameEnv
           [ (idName owner, deps)
           | not (null occurrences)
-          , L loc (XHsBindsLR (AbsBinds { abs_sig = True
-                                       , abs_exports = [ABE { abe_poly = owner }] }))
-              <- tcg_binds env
-          , let deps = concat [ops | (_, site, ops) <- occurrences
-                                   , site `isSubspanOf` locA loc]
+          , L loc (XHsBindsLR (AbsBinds { abs_sig = True, abs_exports = [ABE { abe_poly = owner }] })) <- tcg_binds env
+          , let deps = concat [ops | (_, site, ops) <- occurrences, site `isSubspanOf` locA loc]
           , not (null deps) ]
-        definitions = plusNameEnv_C (++) rhs_proofs $
-                      plusNameEnv_C (++) (sourceProofDefinitions state) imported
+        definitions = plusNameEnv_C (++) rhs_proofs (plusNameEnv_C (++) (sourceProofDefinitions state) imported)
     rewriting <- goptM Opt_EnableRewriteRules
     when (rewriting && not (null occurrences)) $ do
       visible <- visibleSourceMethodRules env
       unloaded <- unloadedSourceRuleHeads env
       conflicts <- forM (reverse occurrences) $ \(_, loc, ops) -> do
         conflict <- listToMaybe . catMaybes <$> traverse (changed visible unloaded) ops
-        forM_ conflict $ \reason ->
-          setSrcSpan loc (addErr (TcRnRetainedQuantificationError reason))
+        forM_ conflict (\reason -> setSrcSpan loc (addErr (TcRnRetainedQuantificationError reason)))
         pure conflict
-      when (all isNothing conflicts) $ recordCommittedHomeRules env
+      when (all isNothing conflicts) (recordCommittedHomeRules env)
     if isEmptyNameEnv definitions then pure env else do
-      let -- DefUses also contains group-independent uses, such as RULES and
-          -- export lists. They cannot make a different exported binding a proof.
-          bindings = fromOL (tcg_dus env)
+      let bindings = fromOL (tcg_dus env)
           exports = availsToNameSet (tcg_exports env)
-          uses_of v = foldr add_uses (unitNameSet (idName v)) bindings
-          add_uses (Just defs, uses) needed
-            | defs `intersectsNameSet` needed = uses `unionNameSet` needed
+          close_uses v = foldr add_uses (unitNameSet (idName v)) bindings
+          add_uses (Just defs, uses) needed | defs `intersectsNameSet` needed = uses `unionNameSet` needed
           add_uses _ needed = needed
           proof_id v
-            | not rewriting
-            , isOpaquePragma (idInlinePragma v)
-            , idName v `elemNameSet` sourceProofClosedResults state
-            = Nothing
+            | not rewriting, isOpaquePragma (idInlinePragma v), idName v `elemNameSet` sourceProofClosedResults state = Nothing
             | idName v `elemNameSet` exports
-            , let deps = concatMap (\name -> fromMaybe [] (lookupNameEnv definitions name))
-                                   (nameSetElemsStable (uses_of v))
-            , not (null deps) =
-                Just (setIdInfo v (setSourceProofRuleInfo (idInfo v) (stableSourceProofRules deps)))
+            , let deps = concatMap (\nm -> fromMaybe [] (lookupNameEnv definitions nm)) (nameSetElemsStable (close_uses v))
+            , not (null deps) = Just (setIdInfo v (setSourceProofRuleInfo (idInfo v) (stableSourceProofRules deps)))
             | otherwise = Nothing
           types = tcg_type_env env
       pure env { tcg_type_env = extendTypeEnvWithIds types (mapMaybe proof_id (typeEnvIds types)) }
@@ -1206,134 +866,52 @@ checkAndInstallSourceProofs env = do
       let conflict = Just (RetainedFinalCoreRulesEnabled owner)
       if owner `elemNameSet` local then pure conflict else
         if mapper then do
-          -- Use the same checks as source formation. Only this mode
-          -- requires the checked worker declaration.
           worker <- tcLookupIdMaybe owner
           let helper_rules = sourceRuleOwners relevant `minusNameSet` unitNameSet owner
           case worker of
-            Just v
-              | finalCoreMapperOwner v
-              , checked == spineStrictAppendSentinel -> do
-                  res <- checkedAppendFusionRules visible unloaded helper_rules v
-                  pure (either Just (const Nothing) res)
-              | finalCoreMapperOwner v ->
-                  pure (finalCoreRuleConflict visible unloaded helper_rules v)
+            Just v | finalCoreMapperOwner v, checked == [SourceProofUnknown] ->
+                       either Just (const Nothing) <$> checkedAppendFusionRules visible unloaded helper_rules v
+                   | finalCoreMapperOwner v ->
+                       pure (finalCoreRuleConflict visible unloaded helper_rules v)
             _ -> pure conflict
-        else
-          -- A newly imported rule is in the rule environment. Its head
-          -- can be found even when the defining Id is private.
-          pure $ if owner `elemNameSet` unloaded ||
-                    hasSourceMethodRuleAtArgs visible arg checked (mkVanillaGlobal owner liftedTypeKind)
-                 then conflict else Nothing
+        else pure $ if owner `elemNameSet` unloaded ||
+                       hasSourceMethodRuleAtArgs visible arg checked (mkVanillaGlobal owner liftedTypeKind)
+                    then conflict else Nothing
 
-{- Note [Opaque source proof observations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A rules-off provider can use evidence to compute a closed observation
-without exporting the evidence used by its implementation. A client's
-rules cannot enter an OPAQUE body by inlining or specialisation. Its
-written result must expose only built-in data with no evidence fields
-or manifest reflexivity. The grammar admits Bool, Char, Int, String,
-and lists of those types, as well as reflexive equalities on literal
-Bool constructors. The complete signature cannot bind type variables or
-include constraints. Check the renamed signature before a synonym or
-family can reduce to one of those types. Other results keep
-the dependencies. For example, a user-defined data constructor can
-return the evidence used by its implementation as a field.
--}
-
--- | Preserve stable interface fingerprints when a rule head occurs twice.
 stableSourceProofRules :: [SourceProofRule] -> [SourceProofRule]
 stableSourceProofRules = nubBy (==) . sortBy (\(a, b, c, args) (d, e, f, other) ->
-    stableNameCmp a d <> cmpArg b e <> compare c f <> compare (stableArgs args) (stableArgs other))
+    stableNameCmp a d <> cmpArg b e <> compare c f <> compare (map (fmap nameStableString) args) (map (fmap nameStableString) other))
   where
-    cmpArg Nothing Nothing = EQ
-    cmpArg Nothing _ = LT
-    cmpArg _ Nothing = GT
+    cmpArg Nothing Nothing   = EQ
+    cmpArg Nothing _         = LT
+    cmpArg _ Nothing         = GT
     cmpArg (Just a) (Just b) = stableNameCmp a b
-    stableArgs = map (fmap nameStableString)
 
 {- Note [Select the dictionary for a promoted method]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An occurrence of Prelude.foldr names a class selector. A list operand
-fixes its instance head to Foldable []. A local Given can still supply
-the dictionary, for example after a match on Dict (Foldable []).
-Only the dictionary that selects the checked worker justifies its equations.
-
-For a binary selector of type a -> a -> a, a retained argument fixes a.
-Use the binder's type to look up the dictionary. Check the original
-operands, including any written kind annotations, against the worker's table.
-
-For a method of type (a -> b) -> h a -> h b, the kind of the receiver
-fixes h. Check that the receiver and result use the class parameter
-before using it to find an instance. The selected worker determines
-what happens to each constructor.
-
-First find the method field of the visible instance dictionary. Check
-its specialized type and its equations. Then ask the ordinary
-solver which dictionary the source call uses. GHC.Tc.Gen.HsType supplies
-both lexical Givens and the constraints written in the signature. It
-disables the constant dictionary shortcut for this check because the
-shortcut can bypass a Given. Record the selector, dictionary and worker
-so that a change to the provider invalidates the proof.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Promoted class selectors (`fmap`, `foldr`, `(==)`, `compare`, and multi-parameter
+or superclass-bearing methods) resolve their unique visible dictionary (`DFunId`)
+from the receiver or operand domain, verify apartness of all competing instances,
+and hand the instantiated predicate back to `GHC.Tc.Gen.HsType` so lexical Givens
+and active `RULES` on the selector, `DFunId`, and worker are checked together.
 -}
 
-{- Note [Multi-parameter and superclass source methods]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A source type can call a class method from a class with superclasses, a
-single-method newtype class, or a multi-parameter class.
-
-1. Dictionary layout. A DataTyCon dictionary applies its constructor to all
-   class type arguments, followed by superclass evidence and method fields in
-   classAllSelIds order. A single-method class with no superclasses uses a
-   NewTyCon coercion around its sole method field. Read both Core forms in
-   dictionarySlotsMulti.
-
-2. Multi-parameter mapping methods. A selector of type (a -> b) -> F a -> F b
-   can belong to a multi-parameter class C t_1 ... t_n when F is a type
-   variable head applied to distinct class parameters (for example, f in
-   LabelledMap e f | f -> e, or f i in IndexedMap f i). At a call site with
-   receiver domain D, match the class receiver head F against D, instantiate
-   the unique visible instance, and verify that all other instances of C are
-   apart from the resulting class arguments (handling functional dependencies
-   that determine extra class parameters such as e from f). Pass the full
-   instantiated class predicate C u_1 ... u_n back to GHC.Tc.Gen.HsType so the
-   constraint solver checks lexical Givens and superclass evidence.
-
-3. Binary ground methods. A binary selector of type a -> a -> r where a is a
-   class parameter and r is either a or a closed algebraic datatype (such as
-   Bool for Eq.(==) or Ordering for Ord.compare) resolves its ground instance
-   dictionary when the unique visible instance has no context and determines all
-   class parameters from the operand type. Final Core validation certifies
-   both inline worker bindings (such as $c== or $ccompare) and external method
-   aliases.
--}
-
--- | Read the class and operand parameter of a binary method returning the
--- same parameter or a closed ordinary datatype (such as @Bool@ or @Ordering@).
--- See Note [Multi-parameter and superclass source methods].
 sourceBinarySelectorWithTarget :: Id -> Maybe (Class, TyVar)
 sourceBinarySelectorWithTarget selector = do
     cls <- isClassOpId_maybe selector
     let params = classTyVars cls
-        param_tys = mkTyVarTys params
-    (left, rest) <- caseArrow (classMethodInstTy selector param_tys)
+    (left, rest) <- caseArrow (classMethodInstTy selector (mkTyVarTys params))
     (right, result) <- caseArrow rest
     target <- getTyVar_maybe left
-    guard (target `elem` params && left `eqType` right &&
-           (result `eqType` left || isJust (ordinaryDataType result)))
+    guard (target `elem` params && left `eqType` right && (result `eqType` left || isJust (ordinaryDataType result)))
     pure (cls, target)
 
--- | Read the class of an admissible binary source method selector.
 sourceBinarySelector :: Id -> Maybe Class
 sourceBinarySelector = fmap fst . sourceBinarySelectorWithTarget
 
--- | Resolve a saturated binary selector to its certified ground source worker.
--- See Note [Select the dictionary for a promoted method] and
--- Note [Multi-parameter and superclass source methods].
 lookupSourceBinaryMethod :: Id -> Type -> TcM (Maybe (Id, Id, TyCon))
 lookupSourceBinaryMethod selector domain
-  | Just (cls, target_tv) <- sourceBinarySelectorWithTarget selector
-  = do
+  | Just (cls, target_tv) <- sourceBinarySelectorWithTarget selector = do
       selected <- if lengthIs (classTyVars cls) 1
         then fmap (, [domain]) <$> lookupSourceGroundDFun cls domain
         else lookupSourceMultiGroundDFun cls target_tv domain
@@ -1343,21 +921,17 @@ lookupSourceBinaryMethod selector domain
           pure $ do
             method <- worker
             guard (varType method `eqType` classMethodInstTy selector pred_args)
-            table <- sourceTableId_maybe method
-            pure (dfun, method, table)
+            (dfun, method,) <$> sourceTableId_maybe method
         _ -> pure Nothing
   | otherwise = pure Nothing
 
--- | Find a unique, context-free imported dictionary for a multi-parameter
--- class when the operand domain fixes all class parameters.
 lookupSourceMultiGroundDFun :: Class -> TyVar -> Type -> TcM (Maybe (Id, [Type]))
 lookupSourceMultiGroundDFun cls target_tv domain
   | noFreeVarsOfType domain, isTyFamFree domain
   , Just target_idx <- findIndex (== target_tv) (classTyVars cls) = do
       insts <- tcGetInstEnvs
       env <- getGblEnv
-      let all_insts = classInstances insts cls
-      matches <- fmap catMaybes $ forM all_insts $ \inst -> do
+      matches <- fmap catMaybes $ forM (classInstances insts cls) $ \inst -> do
         (renaming, fresh_tvs) <- freshenTyVarBndrs (is_tvs inst)
         let fresh_tys = substTys renaming (is_tys inst)
         pure $ case drop target_idx fresh_tys of
@@ -1365,32 +939,26 @@ lookupSourceMultiGroundDFun cls target_tv domain
             | Just subst <- tcMatchTys [pat_ty] [domain]
             , Just inst_args <- traverse (lookupTyVar subst) fresh_tvs
             , let pred_args = map (substTy subst) fresh_tys
-            , all (\t -> noFreeVarsOfType t && isTyFamFree t) pred_args
-            -> Just (inst, inst_args, pred_args)
+            , all (\t -> noFreeVarsOfType t && isTyFamFree t) pred_args -> Just (inst, inst_args, pred_args)
           _ -> Nothing
       case matches of
         [(inst, [], pred_args)]
-          | not (isIncoherent inst)
-          , Right (chosen, []) <- lookupUniqueInstEnv insts cls pred_args
+          | not (isIncoherent inst), Right (chosen, []) <- lookupUniqueInstEnv insts cls pred_args
           , instanceDFunId chosen == instanceDFunId inst
           , let name = idName (instanceDFunId inst)
           , nameModule_maybe name /= Just (tcg_semantic_mod env) -> do
               candidate <- tcLookupIdMaybe name
               pure $ do
                 dfun <- candidate
-                guard (varType dfun `eqType` mkClassPred cls pred_args)
-                pure (dfun, pred_args)
+                (dfun, pred_args) <$ guard (varType dfun `eqType` mkClassPred cls pred_args)
         _ -> pure Nothing
   | otherwise = pure Nothing
 
--- | Find the checked worker named by a method of a ground container instance.
--- See Note [Select the dictionary for a promoted method].
 lookupSourceContainerMethod :: Id -> Type -> TcM (Maybe (Id, Id, TyCon))
 lookupSourceContainerMethod selector domain
   | Just cls <- isClassOpId_maybe selector
   , let fold_method = listFoldSelector cls selector
-  , fold_method || sourceMapSelector selector
-  = do
+  , fold_method || sourceMapSelector selector = do
       selected <- lookupSourceGroundDFun cls domain
       case selected of
         Just dfun -> do
@@ -1398,59 +966,46 @@ lookupSourceContainerMethod selector domain
             Just term -> tcLookupIdMaybe term
             Nothing -> pure $ do
               Core.DFunUnfolding [] con fields <- pure (idUnfolding dfun)
-              let body = Core.mkApps (Core.Var (dataConWorkId con)) fields
-              slots <- dictionarySlotsMulti cls [domain] body
+              slots <- dictionarySlotsMulti cls [domain] (Core.mkApps (Core.Var (dataConWorkId con)) fields)
               Core.Var method <- lookup selector slots
               pure method
           pure $ do
             method <- target
             guard (varType method `eqType` classMethodInstTy selector [domain])
             table <- sourceTableId_maybe method
-            guard (not fold_method || isListFoldTable table)
-            pure (dfun, method, table)
+            (dfun, method, table) <$ guard (not fold_method || isListFoldTable table)
         _ -> pure Nothing
   | otherwise = pure Nothing
 
--- | Find the checked worker used by a mapping dictionary, including one with
--- erased parameters, superclasses, or multi-parameter class arguments.
--- See Note [Erased arguments in a checked source dictionary] and
--- Note [Multi-parameter and superclass source methods].
 lookupSourceCheckedMapMethod :: Class -> Id -> Type -> TcM (Maybe (Id, Type, Id, TyCon))
 lookupSourceCheckedMapMethod cls selector domain
-  | isTyFamFree domain
-  , Just (head_tc, _) <- tcSplitTyConApp_maybe domain
-  , isGenerativeTyCon head_tc Nominal
-  , Just (_, recv_pat) <- sourceMapSelectorWithTarget selector = do
+  | isTyFamFree domain, Just (head_tc, _) <- tcSplitTyConApp_maybe domain
+  , isGenerativeTyCon head_tc Nominal, Just (_, recv_pat) <- sourceMapSelectorWithTarget selector = do
       insts <- tcGetInstEnvs
       env <- getGblEnv
       let check_selected inst args pred_args allow_empty = do
             let name = idName (instanceDFunId inst)
-            if nameModule_maybe name == Just (tcg_semantic_mod env)
-              then pure Nothing
-              else do
-                candidate <- tcLookupIdMaybe name
-                case candidate of
-                  Just dfun
-                    | let predicate = mkClassPred cls pred_args
-                    , Just applied <- erasedMethodType (varType dfun) args
-                    , applied `eqType` predicate
-                    , Just target <- sourceMethodTarget_maybe dfun selector -> do
-                        worker <- tcLookupIdMaybe target
-                        pure $ do
-                          method <- worker
-                          method_ty <- erasedMethodType (varType method) args
-                          guard (method_ty `eqType` classMethodInstTy selector pred_args)
-                          table <- sourceTableId_maybe method
-                          sig <- constructorCaseType (tyConKind table)
-                          guard (isJust (checkedMapPrefixAllowEmpty allow_empty sig) &&
-                                 sourceCaseVisibleArity table == Just 2)
-                          pure (dfun, predicate, method, table)
-                  _ -> pure Nothing
+            if nameModule_maybe name == Just (tcg_semantic_mod env) then pure Nothing else do
+              candidate <- tcLookupIdMaybe name
+              case candidate of
+                Just dfun
+                  | let predicate = mkClassPred cls pred_args
+                  , Just applied <- erasedMethodType (varType dfun) args, applied `eqType` predicate
+                  , Just target <- sourceMethodTarget_maybe dfun selector -> do
+                      worker <- tcLookupIdMaybe target
+                      pure $ do
+                        method <- worker
+                        method_ty <- erasedMethodType (varType method) args
+                        guard (method_ty `eqType` classMethodInstTy selector pred_args)
+                        table <- sourceTableId_maybe method
+                        sig <- constructorCaseType (tyConKind table)
+                        guard (isJust (checkedMapPrefixAllowEmpty allow_empty sig) && sourceCaseVisibleArity table == Just 2)
+                        pure (dfun, predicate, method, table)
+                _ -> pure Nothing
       if lengthIs (classTyVars cls) 1
         then case lookupUniqueInstEnv insts cls [domain] of
           Right (inst, args)
-            | noFreeVarsOfType domain ||
-              (not (isIncoherent inst) && all (apart1 inst) (classInstances insts cls)) ->
+            | noFreeVarsOfType domain || (not (isIncoherent inst) && all (apart1 inst) (classInstances insts cls)) ->
                 check_selected inst args [domain] False
           _ -> pure Nothing
         else do
@@ -1460,51 +1015,39 @@ lookupSourceCheckedMapMethod cls selector domain
           matched <- fmap catMaybes $ forM all_insts $ \inst -> do
             (renaming, fresh_tvs) <- freshenTyVarBndrs (is_tvs inst)
             let fresh_tys = substTys renaming (is_tys inst)
-                pat = inst_recv_ty fresh_tys
             pure $ do
-              subst <- tcMatchTys [pat] [domain]
+              subst <- tcMatchTys [inst_recv_ty fresh_tys] [domain]
               inst_args <- traverse (lookupTyVar subst) fresh_tvs
               let pred_args = map (substTy subst) fresh_tys
-              guard (all isTyFamFree pred_args)
-              pure (inst, inst_args, pred_args)
+              (inst, inst_args, pred_args) <$ guard (all isTyFamFree pred_args)
           case matched of
             [(inst, args, pred_args)]
-              | not (isIncoherent inst)
-              , Right (chosen, chosen_args) <- lookupUniqueInstEnv insts cls pred_args
-              , instanceDFunId chosen == instanceDFunId inst
-              , eqTypes chosen_args args -> do
+              | not (isIncoherent inst), Right (chosen, chosen_args) <- lookupUniqueInstEnv insts cls pred_args
+              , instanceDFunId chosen == instanceDFunId inst, eqTypes chosen_args args -> do
                   others_apart <- allM (apartMulti inst pred_args inst_recv_ty) all_insts
-                  if others_apart
-                    then check_selected inst args pred_args True
-                    else pure Nothing
+                  if others_apart then check_selected inst args pred_args True else pure Nothing
             _ -> pure Nothing
   | otherwise = pure Nothing
   where
     rough = RM_KnownTc (className cls) : roughMatchTcs [domain]
-    apart1 chosen other = instanceDFunId other == instanceDFunId chosen ||
-                          instanceCantMatch (is_tcs other) rough
-
+    apart1 chosen other = instanceDFunId other == instanceDFunId chosen || instanceCantMatch (is_tcs other) rough
     apartMulti chosen pred_args inst_recv_ty other
       | instanceDFunId other == instanceDFunId chosen = pure True
       | otherwise = do
           (renaming, _) <- freshenTyVarBndrs (is_tvs other)
           let other_tys = substTys renaming (is_tys other)
-              other_recv = inst_recv_ty other_tys
           pure $ if all noFreeVarsOfType pred_args
             then isNothing (tcMatchTys other_tys pred_args)
-            else isNothing (tcUnifyTys alwaysBindTv [other_recv] [domain]) &&
+            else isNothing (tcUnifyTys alwaysBindTv [inst_recv_ty other_tys] [domain]) &&
                  isNothing (tcUnifyTys alwaysBindTv other_tys pred_args)
 
--- | Instantiate a prefix of ordinary erased type parameters.
 erasedMethodType :: Type -> [Type] -> Maybe Type
 erasedMethodType ty args = do
-    let (binders, _) = splitForAllForAllTyBinders ty
-        prefix = take (length args) binders
+    let prefix = take (length args) (fst (splitForAllForAllTyBinders ty))
     guard (equalLength prefix args)
     _ <- traverse ordinaryCaseBinder prefix
     pure (piResultTys ty args)
 
--- | Find a complete, imported dictionary with no instance context.
 lookupSourceGroundDFun :: Class -> Type -> TcM (Maybe Id)
 lookupSourceGroundDFun cls domain
   | noFreeVarsOfType domain, isTyFamFree domain = do
@@ -1512,39 +1055,27 @@ lookupSourceGroundDFun cls domain
       env <- getGblEnv
       case lookupUniqueInstEnv insts cls [domain] of
         Right (inst, [])
-          | let name = idName (instanceDFunId inst)
-          , nameModule_maybe name /= Just (tcg_semantic_mod env) -> do
+          | let name = idName (instanceDFunId inst), nameModule_maybe name /= Just (tcg_semantic_mod env) -> do
               candidate <- tcLookupIdMaybe name
-              pure $ do
-                dfun <- candidate
-                guard (varType dfun `eqType` mkClassPred cls [domain])
-                pure dfun
+              pure (candidate >>= \dfun -> dfun <$ guard (varType dfun `eqType` mkClassPred cls [domain]))
         _ -> pure Nothing
   | otherwise = pure Nothing
 
--- | The selector's list operand must determine the class parameter.
--- Inspect the unspecialized method type. A method that always takes a list
--- can have the same specialized type without selecting the list dictionary.
 listFoldSelector :: Class -> Id -> Bool
 listFoldSelector cls selector = isJust $ do
     [parameter] <- pure (classTyVars cls)
-    let (_, body) = splitForAllForAllTyBinders
-                      (classMethodInstTy selector [mkTyVarTy parameter])
-    (_, after_step) <- caseArrow body
-    (_, after_seed) <- caseArrow after_step
-    (receiver, _) <- caseArrow after_seed
+    let (_, body) = splitForAllForAllTyBinders (classMethodInstTy selector [mkTyVarTy parameter])
+    (_, s1) <- caseArrow body
+    (_, s2) <- caseArrow s1
+    (receiver, _) <- caseArrow s2
     (head_ty, _) <- splitAppTy_maybe receiver
     guard (getTyVar_maybe head_ty == Just parameter)
 
--- | Read the class and receiver type constructor pattern of a mapping method.
--- Supports both single-parameter classes (@f@) and multi-parameter classes
--- (@f@ in @LabelledMap e f@ or @f i@ in @IndexedMap f i@).
 sourceMapSelectorWithTarget :: Id -> Maybe (Class, Type)
 sourceMapSelectorWithTarget selector = do
     cls <- isClassOpId_maybe selector
     let cls_tvs = classTyVars cls
-        (_, body) = splitForAllForAllTyBinders
-                      (classMethodInstTy selector (mkTyVarTys cls_tvs))
+        (_, body) = splitForAllForAllTyBinders (classMethodInstTy selector (mkTyVarTys cls_tvs))
     (callback, rest) <- caseArrow body
     (input, output) <- caseArrow callback
     (receiver, result) <- caseArrow rest
@@ -1552,290 +1083,135 @@ sourceMapSelectorWithTarget selector = do
     (res_head, res_arg) <- splitAppTy_maybe result
     let (head_fn, head_args) = splitAppTys recv_head
     head_tvs <- traverse getTyVar_maybe (head_fn : head_args)
-    guard (not (null head_tvs) &&
-           all (`elem` cls_tvs) head_tvs &&
+    guard (not (null head_tvs) && all (`elem` cls_tvs) head_tvs &&
            sizeUniqSet (mkUniqSet head_tvs) == length head_tvs &&
-           recv_head `eqType` res_head &&
-           recv_arg `eqType` input &&
-           res_arg `eqType` output)
+           recv_head `eqType` res_head && recv_arg `eqType` input && res_arg `eqType` output)
     pure (cls, recv_head)
 
--- | The receiver and result of a mapping method use the class parameter head.
 sourceMapSelector :: Id -> Bool
 sourceMapSelector = isJust . sourceMapSelectorWithTarget
 
--- | Pair the fields of a complete dictionary (including multi-parameter,
--- superclass-bearing, and single-method newtype dictionaries) with selectors.
--- See Note [Multi-parameter and superclass source methods].
 dictionarySlotsMulti :: Class -> [Type] -> Core.CoreExpr -> Maybe [(Id, Core.CoreExpr)]
 dictionarySlotsMulti cls pred_args expr
   | equalLength pred_args (classTyVars cls)
-  , isNewTyCon (classTyCon cls)
-  , [selector] <- classAllSelIds cls
+  , isNewTyCon (classTyCon cls), [selector] <- classAllSelIds cls
   , Core.Cast field co <- stripTicksTopE isSourceBreakpoint expr
-  , coercionRKind co `eqType` mkClassPred cls pred_args
-  , exprType field `eqType` coercionLKind co
+  , coercionRKind co `eqType` mkClassPred cls pred_args, exprType field `eqType` coercionLKind co
   = Just [(selector, field)]
   | equalLength pred_args (classTyVars cls)
   , (Core.Var constructor, args) <- Core.collectArgs (stripTicksTopE isSourceBreakpoint expr)
-  , Just con <- isDataConWorkId_maybe constructor
-  , con == tyConSingleDataCon (classTyCon cls)
-  , let (ty_args, fields) = splitAt (length pred_args) args
-        selectors = classAllSelIds cls
-  , Just applied <- coreTypeArgs ty_args
-  , eqTypes applied pred_args
-  , lengthIs fields (length selectors)
+  , Just con <- isDataConWorkId_maybe constructor, con == tyConSingleDataCon (classTyCon cls)
+  , let (ty_args, fields) = splitAt (length pred_args) args; selectors = classAllSelIds cls
+  , Just applied <- coreTypeArgs ty_args, eqTypes applied pred_args, lengthIs fields (length selectors)
   = Just (zip selectors fields)
   | otherwise = Nothing
 
-{- Note [Erased arguments in a checked source dictionary]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A context-free dictionary for Functor (Either e) applies its method to e
-before supplying the method's operands. Check that its final Core field
-passes every erased parameter to the worker in order. Check the worker's
-constructor rows and its specialized type.
-
-Ordinary matching at a rigid receiver can leave instances that might
-apply after substitution. It can discard incoherent candidates. At a
-receiver with free variables, require every other visible instance to be
-apart. The solver then checks the actual evidence at the occurrence.
-
-The resulting family names the checked worker. An ordinary client can
-use that family even when it introduces an overlapping instance. A new
-selector application in that client still uses its own dictionary. Record
-the selected dictionary, method and selector as rule dependencies.
-
-Check the receiver and result at the same datatype and fixed parameters.
-For example, fmap on These e a can inspect a constructor that contains
-both an e and an a. The number of constructors does not determine the
-equations. checkedConstructorCase reads each result from the worker and
-checks coverage, field types and callback applications.
-
-At the use site, a foreach binder names a runtime Id in the type
-checker. Such an Id can supply the callback or a constructor field.
-Treat it as an open operand when selecting the checked method.
--}
-
--- | Return the preserved receiver prefix, optionally allowing unary type
--- constructors (such as @Maybe@ in a multi-parameter mapping class).
 checkedMapPrefixAllowEmpty :: Bool -> ConstructorCaseType -> Maybe [Type]
 checkedMapPrefixAllowEmpty allow_empty (ConstructorCaseType _ tc params [callback, _] 1 result)
-  | Just (prefix, input) <- unsnoc params
-  , allow_empty || not (null prefix)
-  , Just (from, to) <- caseArrow callback
-  , input `eqType` from, result `eqType` mkTyConApp tc (prefix ++ [to])
+  | Just (prefix, input) <- unsnoc params, allow_empty || not (null prefix)
+  , Just (from, to) <- caseArrow callback, input `eqType` from, result `eqType` mkTyConApp tc (prefix ++ [to])
   = Just prefix
 checkedMapPrefixAllowEmpty _ _ = Nothing
 
--- | Types in the receiver prefix carried unchanged by a mapping method.
--- See Note [Closed parameters in a checked mapping instance].
 fixedMapTypes :: ConstructorCaseType -> [Type]
 fixedMapTypes sig@(ConstructorCaseType binders _ _ [callback, _] 1 _)
   | Just prefix <- checkedMapPrefixAllowEmpty True sig
-  , Just (from, _) <- caseArrow callback
-  , Just mapped_tv <- getTyVar_maybe from
+  , Just (from, _) <- caseArrow callback, Just mapped_tv <- getTyVar_maybe from
   , let qvars = mkTyVarTys (binderVars binders)
-  = [ ty | ty <- prefix
-         , mapped_tv `notElem` tyCoVarsOfTypeList ty
-         , caseKind qvars ty ]
+  = [ty | ty <- prefix, mapped_tv `notElem` tyCoVarsOfTypeList ty, caseKind qvars ty]
 fixedMapTypes _ = []
 
-{- Note [Closed parameters in a checked mapping instance]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For Functor (Row Int Bool), the worker takes a Row Int Bool a and returns
-a Row Int Bool b. It can copy an Int field without using its constructor.
-Keep the closed prefix types when checking the fields and publishing the
-equations. Treat them as opaque at those occurrences. The checker for a
-case on a field still requires the actual constructor to be available.
-The same check applies when a result builds a constructor.
+data CheckedMethodTarget = FreshMethodWorker Id CompiledCoreTable | ExistingMethodWorker Id
 
-The kind telescope still quantifies the callback's input and output.
-Record only types from the fixed prefix of the same datatype on both
-sides of the mapping signature.
-See Note [Erased arguments in a checked source dictionary].
--}
-
--- | A certified method implementation extracted from a final Core dictionary.
-data CheckedMethodTarget
-  = FreshMethodWorker Id ConstructorCaseType [ConstructorCaseRow]
-  | ExistingMethodWorker Id
-
--- | Keep the checked workers until Tidy gives their binders external names.
 keepCheckedMapWorkers :: UniqSupply -> TcGblEnv -> [Core.CoreBind] -> [Core.CoreBind]
 keepCheckedMapWorkers supply env binds
   | isEmptyNameSet targets = binds
-  | otherwise = map keep binds
+  | otherwise = map (\case Core.NonRec v r -> Core.NonRec (mark v) r
+                           Core.Rec ps -> Core.Rec [(mark v, r) | (v, r) <- ps]) binds
   where
-    targets = mkNameSet [ idName owner
-                        | (_, fields) <- checkedMapWorkers supply env binds
-                        , (_, FreshMethodWorker owner _ _) <- fields ]
-    exported v | idName v `elemNameSet` targets = setIdExported v
-               | otherwise = v
-    keep (Core.NonRec v rhs) = Core.NonRec (exported v) rhs
-    keep (Core.Rec pairs) = Core.Rec [(exported v, rhs) | (v, rhs) <- pairs]
+    targets = mkNameSet [idName o | (_, fs) <- checkedMapWorkers supply env binds, (_, FreshMethodWorker o _) <- fs]
+    mark v | idName v `elemNameSet` targets = setIdExported v | otherwise = v
 
--- | Publish mandatory aliases and nominal equations for the same final workers.
 publishCheckedMapMethods :: UniqSupply -> TcGblEnv -> [Core.CoreBind] -> Maybe (TcM ([Id], [TyCon]))
 publishCheckedMapMethods supply env binds
   | null candidates = Nothing
   | otherwise = Just $ do
-      let owners = nubBy (\(a, _, _) (b, _, _) -> a == b)
-                     [ (owner, sig, rows)
-                     | (_, fields) <- candidates
-                     , (_, FreshMethodWorker owner sig rows) <- fields ]
-      tables <- forM owners $ \(owner, sig, rows) -> do
-        table <- publishConstructorCase owner sig rows
-        let worker = setIdDetails owner (SourceTableId (idName owner) table NominalSourceTable)
-        pure (worker, table)
-      let checked = mkNameEnv [(idName owner, owner) | (owner, _) <- tables]
-          resolve_target (FreshMethodWorker owner _ _) = lookupNameEnv checked (idName owner)
-          resolve_target (ExistingMethodWorker target) = Just target
-          publish (dfun, fields) = addSourceMethods dfun
-            [ (selector, target)
-            | (selector, entry) <- fields
-            , Just target <- [resolve_target entry] ]
+      let owners = nubBy (\(a, _) (b, _) -> a == b) [(o, cct) | (_, fs) <- candidates, (_, FreshMethodWorker o cct) <- fs]
+      tables <- forM owners $ \(owner, cct) -> do
+        table <- publishCompiledTable owner cct
+        pure (setIdDetails owner (SourceTableId (idName owner) table NominalSourceTable), table)
+      let checked = mkNameEnv [(idName o, o) | (o, _) <- tables]
+          resolve (FreshMethodWorker o _)   = lookupNameEnv checked (idName o)
+          resolve (ExistingMethodWorker t)  = Just t
+          publish (dfun, fs) = addSourceMethods dfun [(sel, t) | (sel, e) <- fs, Just t <- [resolve e]]
       pure (map fst tables ++ map publish candidates, map snd tables)
   where
-    is_external_entry (_, FreshMethodWorker owner _ _) = isExternalName (idName owner)
-    is_external_entry (_, ExistingMethodWorker owner)  = isExternalName (idName owner)
-    candidates = [ (dfun, external)
-                 | (dfun, fields) <- checkedMapWorkers supply env binds
-                 , let external = filter is_external_entry fields
-                 , not (null external) ]
+    isExt (_, FreshMethodWorker o _)  = isExternalName (idName o)
+    isExt (_, ExistingMethodWorker o) = isExternalName (idName o)
+    candidates = [(dfun, ext) | (dfun, fs) <- checkedMapWorkers supply env binds, let ext = filter isExt fs, not (null ext)]
 
--- | Read a complete DFun dictionary and certify its mapping and binary methods.
--- See Note [Multi-parameter and superclass source methods].
-checkedMapWorkers :: UniqSupply -> TcGblEnv -> [Core.CoreBind]
-                  -> [(Id, [(Id, CheckedMethodTarget)])]
-checkedMapWorkers supply env binds
+checkedMapWorkers :: UniqSupply -> TcGblEnv -> [Core.CoreBind] -> [(Id, [(Id, CheckedMethodTarget)])]
+checkedMapWorkers _ env binds
   | null dfuns = []
-  | otherwise  = mapMaybe (uncurry selected) (zip dfuns (listSplitUniqSupply supply))
+  | otherwise  = mapMaybe selected dfuns
   where
-    bind_pairs (Core.NonRec v rhs) = [(v, rhs)]
-    bind_pairs (Core.Rec pairs)    = pairs
-    dfuns = [ pair
-            | bind <- binds
-            , pair@(v, _) <- bind_pairs bind
-            , DFunId{} <- [idDetails v] ]
-    owners = mkNameEnv [ (idName v, pair)
-                       | bind <- binds
-                       , pair@(v, _) <- bind_pairs bind ]
+    pairs = Core.flattenBinds binds
+    dfuns = [p | p@(v, _) <- pairs, DFunId{} <- [idDetails v]]
+    owners = mkNameEnv [(idName v, p) | p@(v, _) <- pairs]
     exported = availsToNameSet (tcg_exports env)
     local_rules = sourceRuleOwners (tcg_rules env)
-    visible tc = tc == listTyCon || isBoxedTupleTyCon tc || visibleCaseType available tc
-    available name
-      | nameModule_maybe name == Just (tcg_semantic_mod env) = name `elemNameSet` exported
-      | Just gre <- lookupGRE_Name (tcg_rdr_env env) name =
-          any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
-      | otherwise = False
+    visible tc = tc == listTyCon || isBoxedTupleTyCon tc ||
+                 publicCaseType env exported (ordinaryImport (tcg_rdr_env env)) tc
     current_id v
-      | nameModule_maybe (idName v) == Just (tcg_semantic_mod env)
-      = case lookupTypeEnv (tcg_type_env env) (idName v) of
-          Just (AnId installed) -> installed
-          _ -> maybe v fst (lookupNameEnv owners (idName v))
+      | nameModule_maybe (idName v) == Just (tcg_semantic_mod env) =
+          case lookupTypeEnv (tcg_type_env env) (idName v) of
+            Just (AnId installed) -> installed
+            _ -> maybe v fst (lookupNameEnv owners (idName v))
       | otherwise = v
-    selected (dfun, rhs) dict_supply = do
+    selected (dfun, rhs) = do
       cls <- sourceMethodDFunClass (varType dfun)
       guard (not (idName dfun `elemNameSet` local_rules))
       let (binders, body) = Core.collectBinders rhs
       guard (all isTyVar binders && exprType rhs `eqType` varType dfun)
       (_, pred_args) <- getClassPredTys_maybe (exprType body)
       slots <- dictionarySlotsMulti cls pred_args body
-      let methods = catMaybes (zipWith (checkSlot cls pred_args binders) slots (listSplitUniqSupply dict_supply))
+      let methods = mapMaybe (checkSlot cls pred_args binders) slots
       (dfun, methods) <$ guard (not (null methods))
 
-    checkSlot cls pred_args binders (selector, field) slot_supply
-      | selector `elem` classMethods cls
-      , not (idName selector `elemNameSet` local_rules)
-      = checkMapSlot cls pred_args binders (selector, field) slot_supply <|>
-        checkBinarySlot pred_args binders (selector, field) slot_supply
+    checkSlot cls pred_args binders slot@(selector, _)
+      | selector `elem` classMethods cls, not (idName selector `elemNameSet` local_rules) =
+          checkMapSlot cls pred_args binders slot <|> checkBinarySlot pred_args binders slot
       | otherwise = Nothing
 
-    checkMapSlot cls pred_args binders (selector, field) slot_supply = do
+    checkMapSlot cls pred_args binders (selector, field) = do
       guard (sourceMapSelector selector)
       (Core.Var worker, args) <- pure (Core.collectArgs (stripTicksTopE isSourceBreakpoint field))
       types <- coreTypeArgs args
-      guard (eqTypes types (mkTyVarTys binders))
       (owner, rhs) <- lookupNameEnv owners (idName worker)
-      guard (not (idName owner `elemNameSet` exported) &&
-             not (idName owner `elemNameSet` local_rules) &&
-             isNothing (sourceTableId_maybe (current_id owner)) &&
+      guard (eqTypes types (mkTyVarTys binders) && not (idName owner `elemNameSet` exported) &&
+             not (idName owner `elemNameSet` local_rules) && isNothing (sourceTableId_maybe (current_id owner)) &&
              exprType field `eqType` classMethodInstTy selector pred_args)
-      let body = expandMappingDefaults slot_supply (stripTicksE isSourceBreakpoint rhs)
-          allow_empty = length pred_args > 1
-      (sig, rows) <- checkedConstructorCase visible (const Nothing) owner body
-      guard (isJust (checkedMapPrefixAllowEmpty allow_empty sig))
-      -- Ensure single-parameter mapping keeps the exact existing rule.
-      guard (length (classTyVars cls) > 1 || lengthIs pred_args 1)
-      pure (selector, FreshMethodWorker owner sig rows)
+      sig <- constructorCaseType (varType owner)
+      guard (isJust (checkedMapPrefixAllowEmpty (length pred_args > 1) sig) &&
+             (length (classTyVars cls) > 1 || lengthIs pred_args 1))
+      (selector,) . FreshMethodWorker owner <$> compileOrdinaryCase visible (const Nothing) sig owner rhs
 
-    checkBinarySlot pred_args binders (selector, field) slot_supply = do
-      guard (null binders && all (\t -> noFreeVarsOfType t && isTyFamFree t) pred_args)
-      guard (isJust (sourceBinarySelector selector))
+    checkBinarySlot pred_args binders (selector, field) = do
+      guard (null binders && all (\t -> noFreeVarsOfType t && isTyFamFree t) pred_args && isJust (sourceBinarySelector selector))
       let stripped = stripTicksTopE isSourceBreakpoint field
-      guard (exprType stripped `eqType` classMethodInstTy selector pred_args)
       Core.Var worker <- pure stripped
-      guard (not (idName worker `elemNameSet` local_rules))
+      guard (exprType stripped `eqType` classMethodInstTy selector pred_args && not (idName worker `elemNameSet` local_rules))
       let cur = current_id worker
       case sourceTableId_maybe cur of
-        Just _
-          | varType cur `eqType` classMethodInstTy selector pred_args ->
-              pure (selector, ExistingMethodWorker cur)
+        Just _ | varType cur `eqType` classMethodInstTy selector pred_args -> pure (selector, ExistingMethodWorker cur)
         _ -> do
           (owner, rhs) <- lookupNameEnv owners (idName worker)
-          guard (not (idName owner `elemNameSet` exported) &&
-                 isNothing (sourceTableId_maybe (current_id owner)) &&
+          guard (not (idName owner `elemNameSet` exported) && isNothing (sourceTableId_maybe (current_id owner)) &&
                  varType owner `eqType` classMethodInstTy selector pred_args)
-          let clean_rhs = simpleOptExpr defaultSimpleOpts
-                            (expandMappingDefaults slot_supply (stripTicksE isSourceBreakpoint rhs))
-          (sig, rows) <- checkedStructuralCase visible owner clean_rhs <|>
-                         checkedConstructorCase visible (const Nothing) owner clean_rhs
-          pure (selector, FreshMethodWorker owner sig rows)
-
--- | Expose the constructors tested by grouped mapping alternatives.
--- See Note [Default alternatives in mapping equations].
-expandMappingDefaults :: UniqSupply -> Core.CoreExpr -> Core.CoreExpr
-expandMappingDefaults supply (Core.Lam v rhs) = Core.Lam v (expandMappingDefaults supply rhs)
-expandMappingDefaults supply (Core.Let bind@(Core.NonRec _ (Core.Var _)) rhs) =
-    Core.Let bind (expandMappingDefaults supply rhs)
-expandMappingDefaults supply (Core.Case scrut binder result alts) =
-    Core.Case scrut binder result (fromMaybe checked (expand checked))
-  where
-    (pat_supply, rhs_supply) = splitUniqSupply supply
-    checked = zipWith descend (listSplitUniqSupply rhs_supply) alts
-    descend us (Core.Alt con fields body) = Core.Alt con fields (expandMappingDefaults us body)
-    expand (Core.Alt Core.DEFAULT [] body : rest) = do
-      (tc, args) <- caseDatatype (varType binder)
-      let explicit = [dc | Core.Alt (Core.DataAlt dc) _ _ <- rest]
-          missing = filter (`notElem` explicit) (tyConDataCons tc)
-      guard (equalLength explicit rest && not (null missing))
-      let alternative us dc = do
-            _ <- openDataConFieldTypes dc args
-            let (ex, fields) = dataConRepInstPat (uniqsFromSupply us) (idMult binder) dc args
-            guard (null ex)
-            pure (Core.Alt (Core.DataAlt dc) fields body)
-      inferred <- sequence (zipWith alternative (listSplitUniqSupply pat_supply) missing)
-      pure (mergeAlts rest inferred)
-    expand _ = Nothing
-expandMappingDefaults _ expr = expr
-
-{- Note [Default alternatives in mapping equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-GHC can merge identical mapping branches into a DEFAULT alternative. For
-example, both Empty and Flagged _ _ can map to Empty. A family equation with
-a variable for the entire row would also reduce at an unknown row. The Core
-case must inspect the row first.
-
-For equation checking, expose a DataAlt for each missing lazy constructor.
-Use dataConRepInstPat to bind its fields at their instantiated types. The
-DEFAULT body cannot refer to those fresh binders. The ordinary row checker
-still checks the visibility, constructor patterns, and result of each branch.
-GHCi puts debugger breakpoints on constructor results and callback calls.
-Skip these ticks when reading the equations. A breakpoint does not force
-the variables that it captures. Keep coverage ticks and strict cases.
-The executable worker keeps its original case and ticks. See refineDefaultAlt in
-GHC.Core.Utils for the corresponding single-constructor transformation.
--}
+          let clean_rhs = safeSimpleOptExpr defaultSimpleOpts (stripTicksE isSourceBreakpoint rhs)
+          cct <- compileStructuralCore visible owner clean_rhs <|>
+                 (constructorCaseType (varType owner) >>= \s -> compileOrdinaryCase visible (const Nothing) s owner clean_rhs)
+          pure (selector, FreshMethodWorker owner cct)
 
 addSourceMethods :: Id -> [(Id, Id)] -> Id
 addSourceMethods dfun methods =
@@ -1846,124 +1222,80 @@ addSourceMethods dfun methods =
       in setIdDetails dfun (DFunId terminating (Just checked { sdf_methods = aliases }))
     _ -> dfun
 
-{- Note [Mandatory list fold method evidence]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Record just the selector and implementation Names from the final dictionary
-constructor. The actual field must be a checked fold at the specialized
-method type. Read a local field's current binder after final source-table
-validation. A Core occurrence can still carry the pre-validation IdDetails.
-Keep older mandatory evidence for other methods.
-
-The ordinary DFun unfolding can disappear when the producer omits interface
-pragmas or the reader ignores them. The SourceDFun pair remains available.
-It records only the exact method choice and does not supply any equations
-by itself. The client still checks its scoped dictionary and visible rules.
--}
-
--- | Publish exact list fold aliases from the final dictionary bindings.
--- See Note [Mandatory list fold method evidence].
 publishListFoldMethods :: Module -> [Core.CoreBind] -> [Core.CoreBind]
 publishListFoldMethods mod binds
-  | not (any has_list_dfun binds) = binds
-  | otherwise = map publishBind binds
+  | not (any (any is_list_dfun . Core.bindersOf) binds) = binds
+  | otherwise = map (\case Core.NonRec v r -> Core.NonRec (publish v r) r
+                           Core.Rec ps -> Core.Rec [(publish v r, r) | (v, r) <- ps]) binds
   where
     list_ty = mkTyConTy listTyCon
-    is_list_dfun v
-      | DFunId{} <- idDetails v
-      , Just (_, [domain]) <- getClassPredTys_maybe (varType v)
-      = domain `eqType` list_ty
-      | otherwise = False
-    has_list_dfun (Core.NonRec v _) = is_list_dfun v
-    has_list_dfun (Core.Rec pairs)  = any (is_list_dfun . fst) pairs
-    locals = mkNameEnv [ (idName v, v)
-                       | bind <- binds
-                       , v <- Core.bindersOf bind ]
-    publishBind (Core.NonRec v rhs) = Core.NonRec (publish v rhs) rhs
-    publishBind (Core.Rec pairs) = Core.Rec [(publish v rhs, rhs) | (v, rhs) <- pairs]
+    is_list_dfun v | DFunId{} <- idDetails v, Just (_, [dom]) <- getClassPredTys_maybe (varType v) = dom `eqType` list_ty
+                   | otherwise = False
+    locals = mkNameEnv [(idName v, v) | bind <- binds, v <- Core.bindersOf bind]
+    current f | nameModule_maybe (idName f) == Just mod = lookupNameEnv locals (idName f) | otherwise = Just f
     publish v rhs = fromMaybe v $ do
       DFunId{} <- pure (idDetails v)
       (cls, [domain]) <- getClassPredTys_maybe (varType v)
       guard (domain `eqType` list_ty)
       slots <- dictionarySlotsMulti cls [domain] rhs
-      let methods =
-            [ (selector, target)
-            | (selector, Core.Var field) <- slots, selector `elem` classMethods cls
-            , listFoldSelector cls selector
-            , Just target <- [current field]
-            , varType target `eqType` classMethodInstTy selector [domain]
-            , Just table <- [sourceTableId_maybe target], isListFoldTable table ]
-      guard (not (null methods))
-      pure (addSourceMethods v methods)
+      let methods = [ (sel, target) | (sel, Core.Var f) <- slots, sel `elem` classMethods cls, listFoldSelector cls sel
+                                    , Just target <- [current f], varType target `eqType` classMethodInstTy sel [domain]
+                                    , Just table <- [sourceTableId_maybe target], isListFoldTable table ]
+      addSourceMethods v methods <$ guard (not (null methods))
 
-    current field
-      | nameModule_maybe (idName field) == Just mod = lookupNameEnv locals (idName field)
-      | otherwise = Just field
-
--- | The dictionary fixes the nominal head of the selector's first argument.
--- The worker and the dictionary itself can have any active rule.
 sourceMethodOps :: Id -> Id -> Id -> [(Id, Maybe Name)]
-sourceMethodOps dfun selector target =
-    [(selector, first), (dfun, Nothing), (target, Nothing)]
+sourceMethodOps dfun selector target = [(selector, first), (dfun, Nothing), (target, Nothing)]
   where
     first = do
       (_, domain : _) <- getClassPredTys_maybe (snd (splitForAllForAllTyBinders (varType dfun)))
       (tc, _) <- tcSplitTyConApp_maybe domain
-      guard (isGenerativeTyCon tc Nominal)
-      return (tyConName tc)
+      tyConName tc <$ guard (isGenerativeTyCon tc Nominal)
 
--- | The public implementations used by the standard Integer dictionaries.
--- Guard the comparison bodies that can inline as well as their method heads.
 sourceLiteralWorkers :: TcM (Maybe [Id])
 sourceLiteralWorkers = fmap sequence $
     traverse (\(mod, occ) -> lookupBootModuleIdMaybe mod (mkVarOcc occ)) $
       (gHC_TYPES, "isTrue#") :
-      [(gHC_INTERNAL_NUM_INTEGER, occ) | occ <- ["integerLt", "integerEq", "integerSub"
-                                               , "integerLt#", "integerEq#", "integerCompare"]]
+      [(gHC_INTERNAL_NUM_INTEGER, occ) | occ <- ["integerLt", "integerEq", "integerSub", "integerLt#", "integerEq#", "integerCompare"]]
 
--- | Check rules on the selected conversion and its standard Integer operations.
--- See Note [Certifying a source literal conversion] in GHC.Tc.TyCl.Instance.
 recordSourceLiteralUse :: Id -> Id -> TcM ()
 recordSourceLiteralUse dfun selector = do
     ops <- sourceLiteralUses dfun selector
-    maybe (failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall (idName selector))))
-          recordSourceUses ops
+    maybe (failWithTc (TcRnRetainedQuantificationError (RetainedUncheckedSourceCall (idName selector)))) recordSourceUses ops
 
--- | Read the dependencies of a certified literal without recording a use.
 sourceLiteralUses :: Id -> Id -> TcM (Maybe [(Id, Maybe Name)])
 sourceLiteralUses dfun selector = case sourceLiteralCons_maybe dfun selector of
   Nothing -> pure Nothing
   Just (zero, _) -> do
-    let num_module = mkGhcInternalModule (fsLit "GHC.Internal.Num")
-        lookup_id mod occ = lookupBootModuleIdMaybe mod occ
-    mb_cmp <- lookup_id gHC_CLASSES (mkVarOcc "<")
-    mb_eq <- lookup_id gHC_CLASSES eqClassOpOcc
-    mb_sub <- lookup_id num_module minusClassOpOcc
-    mb_otherwise <- lookup_id gHC_INTERNAL_BASE (mkVarOcc "otherwise")
-    -- This also loads the Integer module's ground comparison dictionaries.
+    let num_mod = mkGhcInternalModule (fsLit "GHC.Internal.Num")
+    mb_cmp <- lookupBootModuleIdMaybe gHC_CLASSES (mkVarOcc "<")
+    mb_eq <- lookupBootModuleIdMaybe gHC_CLASSES eqClassOpOcc
+    mb_sub <- lookupBootModuleIdMaybe num_mod minusClassOpOcc
+    mb_oth <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "otherwise")
     mb_workers <- sourceLiteralWorkers
     insts <- tcGetInstEnvs
-    let integer_dict op mod = case isClassOpId_maybe op of
-          Just cls | Right (inst, []) <- lookupUniqueInstEnv insts cls [integerTy]
-                   , let d = instanceDFunId inst
-                   , nameModule_maybe (idName d) == Just mod -> Just d
-          _ -> Nothing
+    let int_dict op mod = do
+          cls <- isClassOpId_maybe op
+          Right (inst, []) <- pure (lookupUniqueInstEnv insts cls [integerTy])
+          let d = instanceDFunId inst
+          d <$ guard (nameModule_maybe (idName d) == Just mod)
     pure $ do
-      cmp <- mb_cmp
-      eq <- mb_eq
-      sub <- mb_sub
-      otherwise_id <- mb_otherwise
-      workers <- mb_workers
-      ord_d <- integer_dict cmp gHC_INTERNAL_NUM_INTEGER
-      eq_d  <- integer_dict eq  gHC_INTERNAL_NUM_INTEGER
-      num_d <- integer_dict sub num_module
+      cmp <- mb_cmp; eq <- mb_eq; sub <- mb_sub; oth <- mb_oth; workers <- mb_workers
+      ord_d <- int_dict cmp gHC_INTERNAL_NUM_INTEGER
+      eq_d <- int_dict eq gHC_INTERNAL_NUM_INTEGER
+      num_d <- int_dict sub num_mod
       pure $ (selector, Just (tyConName (dataConTyCon zero))) :
              [(op, Just integerTyConName) | op <- [cmp, eq, sub, selector]] ++
-             [(v, Nothing) | v <- [dfun, ord_d, eq_d, num_d, otherwise_id] ++ workers]
+             [(v, Nothing) | v <- [dfun, ord_d, eq_d, num_d, oth] ++ workers]
 
--- | The checked dependencies of one optional alias, before proof-use selection.
+{- Note [Optional source dependencies]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Lazy local aliases validate source certificates and visible `RULES` without
+recording use immediately. Committed evidence variables mark `ebs_needs` so
+`commitOptionalSourceUses` publishes only dependencies demanded by final proofs.
+-}
+
 data OptionalSourceUses = OptionalSourceUses [Id] [(Id, Maybe Name)] [Name]
 
--- | Read and validate optional dependencies without recording source uses.
 optionalSourceUses :: [Id] -> [(Id, Id, Maybe Id)] -> TcM (Maybe OptionalSourceUses)
 optionalSourceUses heads methods = do
     plan <- optionalSourceUsePlan heads methods
@@ -1971,36 +1303,25 @@ optionalSourceUses heads methods = do
       Nothing -> pure Nothing
       Just (owners, ops, tables) -> do
         changed <- changedSourceUse ops
-        pure $ case changed of
-          Nothing -> Just (OptionalSourceUses owners ops tables)
-          Just _ -> Nothing
+        pure (if isNothing changed then Just (OptionalSourceUses owners ops tables) else Nothing)
 
--- | Register dependencies whose proof use is decided by the committed solver.
--- See Note [Optional source dependencies].
 registerOptionalSourceUses :: TcEvBinds -> CoVar -> OptionalSourceUses -> TcM ()
 registerOptionalSourceUses evidence proof (OptionalSourceUses owners ops tables) = do
     env <- getGblEnv
-    updTcRef (tcg_optional_source_uses env) $ \pending ->
-      let !entry = (evidence, proof, owners, ops, tables)
-      in entry : pending
+    updTcRef (tcg_optional_source_uses env) (\pending -> let !e = (evidence, proof, owners, ops, tables) in e : pending)
 
--- | Resolve the exact source owners, transitive callees, and literal workers.
-optionalSourceUsePlan :: [Id] -> [(Id, Id, Maybe Id)]
-                      -> TcM (Maybe ([Id], [(Id, Maybe Name)], [Name]))
+optionalSourceUsePlan :: [Id] -> [(Id, Id, Maybe Id)] -> TcM (Maybe ([Id], [(Id, Maybe Name)], [Name]))
 optionalSourceUsePlan heads methods = do
     env <- getGblEnv
-    let targets = [target | (_, _, Just target) <- methods]
-        roots = nubBy (\a b -> idName a == idName b) (heads ++ targets)
+    let roots = nubBy (\a b -> idName a == idName b) (heads ++ [t | (_, _, Just t) <- methods])
         source fun = case sourceTableOccurrence env fun of
-          Just actual | Just table <- sourceTableId_maybe actual -> do
-            deps <- sourceTableDependencies table
-            pure ((\callees -> (actual : callees, tyConName table)) <$> deps)
+          Just actual | Just table <- sourceTableId_maybe actual ->
+            fmap (\cs -> (actual : cs, tyConName table)) <$> sourceTableDependencies table
           _ -> pure Nothing
-        method (dfun, selector, Just target)
-          | sourceMethodTarget_maybe dfun selector == Just (idName target)
-          = pure (Just (sourceMethodOps dfun selector target))
+        method (dfun, sel, Just target)
+          | sourceMethodTarget_maybe dfun sel == Just (idName target) = pure (Just (sourceMethodOps dfun sel target))
           | otherwise = pure Nothing
-        method (dfun, selector, Nothing) = sourceLiteralUses dfun selector
+        method (dfun, sel, Nothing) = sourceLiteralUses dfun sel
     sources <- traverse source roots
     method_ops <- traverse method methods
     pure $ do
@@ -2012,114 +1333,15 @@ optionalSourceUsePlan heads methods = do
 {- Note [Spine-strict accumulator proofs over list append]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 List append `(++)` is not demand-equivalent under `-O2` `build`/`augment` fusion
-to its nominal two-clause recursion. With `producer cons seed = seed \`seq\` cons True seed`,
-`null (map not (build producer ++ error "ys"))` fuses and diverges, whereas
-`let mxs = map not (build producer) in null (mxs ++ map not (error "ys"))`
-evaluates to `False`. Keep `map f (xs ++ ys) :~: (map f xs ++ map f ys)` guarded
-by `GHC-83605` when rewrite rules are enabled.
-
-Let `shunt` be the certified spine-strict list accumulator
-(`shunt [] ys = ys`, `shunt (x : xs) ys = shunt xs (x : ys)`). Consider a
-top-level retained proof of type:
-  `foreach (xs :: [a]) -> foreach (ys :: [a]) -> foreach (zs :: [a])
-   -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)`
-or its symmetric orientation. When `shuntAppend xs ys zs` evaluates to `Refl`,
-the proof has already forced `xs` to a finite spine `[x_1, ..., x_k]`. The
-function `shunt` forces the entire spine of its first argument before it returns
-its second argument, and `xs`, `ys`, and `zs` each occur linearly once on each
-side:
-  1. If `ys` diverges with bottom `b`, `shunt ys (shunt xs zs)` diverges with `b`.
-     Under stock `augment` fusion, `shunt (augment g ys) zs` forces `ys` either
-     inside `g (:)` or at the end of `xs`'s finite spine, and diverges with `b`.
-  2. If `ys` converges to WHNF, `ys` is non-bottom. By parametricity with `seq`
-     for `augment` at the constructor algebra `(:)` (Johann and Voigtlander),
-     `xs ++ ys` produces the spine `x_1 : ... : x_k : ys`. Both sides agree.
-
-Admit `(++)` under `Opt_EnableRewriteRules` only inside such a top-level proof.
-Require every active rewrite rule on `(++)` and on every helper referenced by
-`(++)`'s rules (`augment`, `foldr`, `build`, and the `unpack*CString*#` workers)
-to come from `GHC.Internal.Base`, `GHC.Internal.CString`, or `GHC.Internal.List`,
-with no local or unloaded user rules. Re-check this condition after all module
-declarations and splices finish, and record the dependency in exported `IdInfo`.
+for lazy consumers (`map f (xs ++ ys)`), so general `(++)` equations stay gated
+under `Opt_EnableRewriteRules`. Inside a top-level nominal proof of
+`shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)` where `shunt` is a spine-strict
+tail-recursive list accumulator, both sides force the spine of `xs` and demand
+`ys` identically by parametricity with `seq` (Johann and Voigtländer, Fundam.
+Inform. 2006), provided `(++)` and its fusion helpers carry only stock
+`ghc-internal` rules (`checkedAppendFusionRules`).
 -}
 
--- | Sentinel distinguishing a spine-strict append proof dependency from an
--- unrestricted `Semigroup (<>)` method proof (`closedSourceProofArgs` never
--- emits an all-`SourceProofUnknown` non-empty list, and `sourceProofArgsApart`
--- returns `False` on `SourceProofUnknown` against every rule).
-spineStrictAppendSentinel :: SourceProofArgs
-spineStrictAppendSentinel = [SourceProofUnknown]
-
--- | Check that `table` is the exact two-branch tail-recursive list accumulator
--- `shunt [] ys = ys; shunt (x : xs) ys = shunt xs (x : ys)`.
-isExactShuntTable :: TyCon -> Bool
-isExactShuntTable table = isJust $ do
-    guard (isReverseWorkerTable table)
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    [b_nil, b_cons] <- pure (fromBranches (coAxiomBranches axiom))
-    [a1, pat_nil, ys1] <- pure (coAxBranchLHS b_nil)
-    tv_a1 <- getTyVar_maybe a1
-    tv_ys1 <- getTyVar_maybe ys1
-    guard (mkUniqSet (coAxBranchTyVars b_nil) == mkUniqSet [tv_a1, tv_ys1] &&
-           pat_nil `eqType` mkTyConApp (promoteDataCon nilDataCon) [a1] &&
-           coAxBranchRHS b_nil `eqType` ys1)
-    [a2, pat_cons, ys2] <- pure (coAxBranchLHS b_cons)
-    tv_a2 <- getTyVar_maybe a2
-    tv_ys2 <- getTyVar_maybe ys2
-    (cons_tc1, [c_a1, x_ty, xs_ty]) <- splitTyConApp_maybe pat_cons
-    tv_x <- getTyVar_maybe x_ty
-    tv_xs <- getTyVar_maybe xs_ty
-    guard (cons_tc1 == promoteDataCon consDataCon && c_a1 `eqType` a2 &&
-           sizeUniqSet (mkUniqSet [tv_a2, tv_x, tv_xs, tv_ys2]) == 4 &&
-           mkUniqSet (coAxBranchTyVars b_cons) == mkUniqSet [tv_a2, tv_x, tv_xs, tv_ys2])
-    let expected_rhs =
-          mkTyConApp table
-            [ a2
-            , xs_ty
-            , mkTyConApp (promoteDataCon consDataCon) [a2, x_ty, ys2] ]
-    guard (coAxBranchRHS b_cons `eqType` expected_rhs)
-
--- | Test whether `ty` has the exact spine-strict accumulator append shape
--- `foreach xs -> foreach ys -> foreach zs -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)`
--- (up to outer invisible `forall`s, binder permutation of `(xs, ys, zs)`, and `: ~ :` symmetry),
--- returning the element type and certified `shunt` table TyCon when matched.
-spineStrictAppendProofType :: TyCon -> Type -> Maybe (Type, TyCon)
-spineStrictAppendProofType append_tc ty = do
-    let (_, body0) = splitForAllForAllTyBinders ty
-    (b1, body1) <- dep_vis body0
-    (b2, body2) <- dep_vis body1
-    (b3, eq_ty) <- dep_vis body2
-    guard (sizeUniqSet (mkUniqSet [b1, b2, b3]) == 3)
-    TyConApp eq_tc [eq_kind, side1, side2] <- pure (coreFullView eq_ty)
-    let eq_mod = mkGhcInternalModule (fsLit "GHC.Internal.Data.Type.Equality")
-    guard (nameModule_maybe (tyConName eq_tc) == Just eq_mod &&
-           occNameString (nameOccName (tyConName eq_tc)) == ":~:")
-    (list_tc, [elem_ty]) <- splitTyConApp_maybe eq_kind
-    guard (list_tc == listTyCon &&
-           all (\b -> varType b `eqType` mkListTy elem_ty) [b1, b2, b3])
-    shunt_tc <- match_sides [b1, b2, b3] elem_ty side1 side2 <|>
-                match_sides [b1, b2, b3] elem_ty side2 side1
-    pure (elem_ty, shunt_tc)
-  where
-    dep_vis t = case coreFullView t of
-      DepFunTy DepFunVisible b rest -> Just (b, rest)
-      _ -> Nothing
-
-    match_sides bndrs elem_ty lhs rhs = do
-      TyConApp shunt1 [e1, app_node, TermVarTy zs] <- pure (coreFullView lhs)
-      guard (isExactShuntTable shunt1 && e1 `eqType` elem_ty)
-      TyConApp app_tc [e2, TermVarTy xs, TermVarTy ys] <- pure (coreFullView app_node)
-      guard (tyConName app_tc == tyConName append_tc && e2 `eqType` elem_ty)
-      TyConApp shunt2 [e3, TermVarTy ys', inner_shunt] <- pure (coreFullView rhs)
-      TyConApp shunt3 [e4, TermVarTy xs', TermVarTy zs'] <- pure (coreFullView inner_shunt)
-      guard (shunt1 == shunt2 && shunt1 == shunt3 &&
-             all (`eqType` elem_ty) [e3, e4] &&
-             xs == xs' && ys == ys' && zs == zs' &&
-             mkUniqSet [xs, ys, zs] == mkUniqSet bndrs)
-      pure shunt1
-
--- | Check if the current typechecking context is the RHS of a top-level binding
--- whose signature is a spine-strict append proof over `append_owner`.
 enclosingSpineStrictAppendProof :: Id -> TcM (Maybe (Name, Id))
 enclosingSpineStrictAppendProof append_owner = do
     append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
@@ -2136,86 +1358,80 @@ enclosingSpineStrictAppendProof append_owner = do
           case not_top_ids of
             outer_bndr : inner_bndrs
               | not has_exp_bndr
-              , Just (elem_ty, shunt_tc) <- spineStrictAppendProofType append_tc (varType outer_bndr)
-              , let allowed_local lb =
-                      varType lb `eqType` elem_ty || varType lb `eqType` mkListTy elem_ty
-              , all allowed_local inner_bndrs -> do
+              , all (not . hasNativeDependentExpr . Core.Type . varType) inner_bndrs
+              , Just consumer_tc <- spineStrictAppendSig append_tc (varType outer_bndr) -> do
                   proof_name <- lookupOrig (tcg_semantic_mod env) (nameOccName (idName outer_bndr))
-                  let valid_top_sig = case lookupNameEnv (getLclEnvTypeEnv lcl_env) proof_name of
+                  let valid_top = case lookupNameEnv (getLclEnvTypeEnv lcl_env) proof_name of
                         Just (ATcId { tct_id = top_id }) ->
-                          isExternalName (idName top_id) &&
-                          isJust (spineStrictAppendProofType append_tc (varType top_id))
+                          isExternalName (idName top_id) && isJust (spineStrictAppendSig append_tc (varType top_id))
                         _ -> False
-                      allowed_expr (HsVar {}) = True
-                      allowed_expr (ExplicitList _ es) = all (allowed_expr . unLoc) es
-                      allowed_expr (HsPar _ e) = allowed_expr (unLoc e)
-                      allowed_expr (HsApp _ f a) = allowed_expr (unLoc f) && allowed_expr (unLoc a)
-                      allowed_expr (OpApp _ l op r) =
-                        allowed_expr (unLoc l) && allowed_expr (unLoc op) && allowed_expr (unLoc r)
-                      allowed_expr (HsCase _ scrut _) = allowed_expr (unLoc scrut)
-                      allowed_expr _ = False
-                      disallowed_ctxt (PatMonoBindsCtxt {}) = True
-                      disallowed_ctxt (UserSigCtxt {}) = True
-                      disallowed_ctxt (TypeCtxt {}) = True
-                      disallowed_ctxt (KindCtxt {}) = True
-                      disallowed_ctxt (FunAppCtxt (FunAppCtxtTy _ _) _) = True
-                      disallowed_ctxt (FunAppCtxt (FunAppCtxtExpr f a) _) =
-                        not (allowed_expr f && allowed_expr a)
-                      disallowed_ctxt (ExprCtxt e) = not (allowed_expr e)
-                      disallowed_ctxt (MatchCtxt (FunRhs { mc_fun = L _ mc_nm })) =
-                        mc_nm /= proof_name && mc_nm /= idName outer_bndr
-                      disallowed_ctxt _ = False
-                  if valid_top_sig && not (any disallowed_ctxt (getLclEnvErrCtxt lcl_env))
-                    then do
-                      mb_shunt <- sourceTableOwner shunt_tc
-                      pure ((proof_name,) <$> mb_shunt)
+                      bad_expr ExprWithTySig{} = True
+                      bad_expr (HsPar _ e)     = bad_expr (unLoc e)
+                      bad_expr (HsApp _ f a)   = bad_expr (unLoc f) || bad_expr (unLoc a)
+                      bad_expr _               = False
+                      bad_ctxt PatMonoBindsCtxt{} = True
+                      bad_ctxt UserSigCtxt{}      = True
+                      bad_ctxt TypeCtxt{}         = True
+                      bad_ctxt KindCtxt{}         = True
+                      bad_ctxt (FunAppCtxt (FunAppCtxtTy _ _) _)     = True
+                      bad_ctxt (FunAppCtxt (FunAppCtxtExpr f a) _)   = bad_expr f || bad_expr a
+                      bad_ctxt (ExprCtxt e)                          = bad_expr e
+                      bad_ctxt (MatchCtxt (FunRhs { mc_fun = L _ nm })) = nm /= proof_name && nm /= idName outer_bndr
+                      bad_ctxt _ = False
+                  if valid_top && not (any bad_ctxt (getLclEnvErrCtxt lcl_env))
+                    then fmap (proof_name,) <$> sourceTableOwner consumer_tc
                     else pure Nothing
             _ -> pure Nothing
 
--- | Verify that `(++)` and every helper in its active rules carry only stock
--- `ghc-internal` list/CString rules, with no local or unloaded user rules.
--- See Note [Spine-strict accumulator proofs over list append].
-checkedAppendFusionRules :: RuleEnv -> NameSet -> NameSet -> Id
-                         -> TcM (Either RetainedQuantificationError [Id])
+spineStrictAppendSig :: TyCon -> Type -> Maybe TyCon
+spineStrictAppendSig append_tc ty = do
+    let peel_dep acc t = case coreFullView t of
+          DepFunTy DepFunVisible b rest -> peel_dep (b : acc) rest
+          other -> (reverse acc, other)
+        (bndrs, eq_ty) = peel_dep [] (snd (splitForAllForAllTyBinders ty))
+    guard (sizeUniqSet (mkUniqSet bndrs) == 3)
+    TyConApp eq_tc [_, side1, side2] <- pure (coreFullView eq_ty)
+    guard (occNameString (nameOccName (tyConName eq_tc)) == ":~:")
+    match_sides bndrs side1 side2 <|> match_sides bndrs side2 side1
+  where
+    is_acc_consumer tc = isJust $ do
+      guard (isReverseWorkerTable tc)
+      [b0, _] <- fromBranches . coAxiomBranches <$> closedFamilyTyConCoAxiom_maybe tc
+      [_, _, acc] <- pure (coAxBranchLHS b0)
+      guard (isJust (getTyVar_maybe acc) && coAxBranchRHS b0 `eqType` acc)
+    match_sides bndrs lhs rhs = do
+      TyConApp f1 [_, app_node, TermVarTy zs] <- pure (coreFullView lhs)
+      TyConApp app_tc [_, TermVarTy xs, TermVarTy ys] <- pure (coreFullView app_node)
+      TyConApp f2 [_, TermVarTy ys', inner] <- pure (coreFullView rhs)
+      TyConApp f3 [_, TermVarTy xs', TermVarTy zs'] <- pure (coreFullView inner)
+      f1 <$ guard (is_acc_consumer f1 && f1 == f2 && f1 == f3 && tyConName app_tc == tyConName append_tc &&
+                   xs == xs' && ys == ys' && zs == zs' && mkUniqSet [xs, ys, zs] == mkUniqSet bndrs)
+
+checkedAppendFusionRules :: RuleEnv -> NameSet -> NameSet -> Id -> TcM (Either RetainedQuantificationError [Id])
 checkedAppendFusionRules visible unloaded local_rules append_owner = do
     append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
     mb_build <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "build")
-    let boot_mods =
-          [ gHC_INTERNAL_BASE
-          , mkGhcInternalModule (fsLit "GHC.Internal.CString")
-          , mkGhcInternalModule (fsLit "GHC.Internal.List") ]
+    let boot_mods = [gHC_INTERNAL_BASE, mkGhcInternalModule (fsLit "GHC.Internal.CString"), mkGhcInternalModule (fsLit "GHC.Internal.List")]
         is_boot_rule BuiltinRule{} = True
-        is_boot_rule r@Rule{ru_origin = orig}
-          | isAutoRule r || isNeverActive (ruleActivation r) = True
-          | otherwise = orig `elem` boot_mods
-        fallback = Left (RetainedFinalCoreRulesEnabled (idName append_owner))
-    if idName append_owner /= append_name ||
-       idName append_owner `elemNameSet` local_rules ||
+        is_boot_rule r@Rule{ru_origin = orig} = isAutoRule r || isNeverActive (ruleActivation r) || orig `elem` boot_mods
+    if idName append_owner /= append_name || idName append_owner `elemNameSet` local_rules ||
        idName append_owner `elemNameSet` unloaded
-      then pure fallback
+      then pure (Left (RetainedFinalCoreRulesEnabled (idName append_owner)))
       else do
         let app_rules = activeMapperRules visible append_owner
         if null app_rules || not (all is_boot_rule app_rules)
           then pure (Left (RetainedSourceRule (idName append_owner)))
           else do
-            let rule_free_globals Rule{ru_bndrs = bndrs, ru_args = args, ru_rhs = rhs} =
-                  let bset = mkVarSet bndrs
-                      keep v = isId v && not (v `elemVarSet` bset) &&
-                               isExternalName (idName v) &&
-                               isNothing (isDataConId_maybe v)
-                  in concatMap (exprSomeFreeVarsList keep) (rhs : args)
-                rule_free_globals BuiltinRule{} = []
-                helpers = nubBy (\a b -> idName a == idName b) $
-                  maybeToList mb_build ++ concatMap rule_free_globals app_rules
-                bad_helper h =
-                  idName h `elemNameSet` local_rules ||
-                  idName h `elemNameSet` unloaded ||
-                  not (all is_boot_rule (getRules visible (globaliseId h)))
-            pure $ case find bad_helper helpers of
-              Just bad -> Left (RetainedSourceRule (idName bad))
-              Nothing  -> Right helpers
+            let rule_globals Rule{ru_bndrs = bs, ru_args = as, ru_rhs = r} =
+                  let bset = mkVarSet bs
+                      keep v = isId v && not (v `elemVarSet` bset) && isExternalName (idName v) && isNothing (isDataConId_maybe v)
+                  in concatMap (exprSomeFreeVarsList keep) (r : as)
+                rule_globals BuiltinRule{} = []
+                helpers = nubBy (\a b -> idName a == idName b) (maybeToList mb_build ++ concatMap rule_globals app_rules)
+                bad_h h = idName h `elemNameSet` local_rules || idName h `elemNameSet` unloaded ||
+                          not (all is_boot_rule (getRules visible (globaliseId h)))
+            pure (maybe (Right helpers) (Left . RetainedSourceRule . idName) (find bad_h helpers))
 
--- | Find a currently visible rewrite that can change one selected operation.
 changedSourceUse :: [(Id, Maybe Name)] -> TcM (Maybe RetainedQuantificationError)
 changedSourceUse ops = do
     env <- getGblEnv
@@ -2226,65 +1442,35 @@ changedSourceUse ops = do
         check [] = pure Nothing
         check ((v, arg) : rest)
           | isNominalStructuralSource v, not rewriting = check rest
-          | finalCoreMapperOwner v
-          = if rewriting
-            then do
-              mb_shunt <- enclosingSpineStrictAppendProof v
-              case mb_shunt of
-                Just _ -> do
-                  res <- checkedAppendFusionRules visible unloaded local_rules v
-                  case res of
+          | finalCoreMapperOwner v =
+              if not rewriting then check rest else do
+                mb_shunt <- enclosingSpineStrictAppendProof v
+                case mb_shunt of
+                  Just _ -> checkedAppendFusionRules visible unloaded local_rules v >>= \case
                     Left reason -> pure (Just reason)
                     Right _     -> check rest
-                Nothing ->
-                  case finalCoreRuleConflict visible unloaded local_rules v of
-                    Just reason -> pure (Just reason)
-                    Nothing -> check rest
-            else check rest
+                  Nothing -> maybe (check rest) (pure . Just) (finalCoreRuleConflict visible unloaded local_rules v)
           | otherwise = do
               local <- sourceRuleOwnersAtTc arg (tcg_rules env)
-              if idName v `elemNameSet` local ||
-                 idName v `elemNameSet` unloaded ||
-                 hasSourceMethodRuleAt visible arg v
+              if idName v `elemNameSet` local || idName v `elemNameSet` unloaded || hasSourceMethodRuleAt visible arg v
                 then pure (Just (RetainedSourceRule (idName v)))
                 else check rest
     check ops
 
--- | Publish only dependencies selected by final evidence, and retain pending ones.
 commitOptionalSourceUses :: TcGblEnv -> TcM ()
 commitOptionalSourceUses env = do
     pending <- readTcRef (tcg_optional_source_uses env)
     remaining <- fmap catMaybes $ forM pending $ \entry@(evidence, proof, owners, ops, tables) -> do
       needed <- case evidence of
         TcEvBinds var -> (proof `elemVarSet`) . ebs_needs <$> getTcEvBindsState var
-        EvBinds{} -> pure False
-      if needed then do
+        EvBinds{}     -> pure False
+      if not needed then pure (Just entry) else do
         publishSourceUses ops
         recordSourceTableUses env tables
-        forM_ owners $ \owner ->
-          when (nameModule_maybe (idName owner) == Just (tcg_semantic_mod env)) $
-            keepAlive (idName owner)
+        forM_ owners $ \o -> when (nameModule_maybe (idName o) == Just (tcg_semantic_mod env)) (keepAlive (idName o))
         pure Nothing
-      else pure (Just entry)
     writeTcRef (tcg_optional_source_uses env) remaining
 
-{- Note [Optional source dependencies]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A lazy local alias can use checked source equations only when its body
-needs the alias proof. Read the certificates and visible RULES before
-checking that body. Cache the exact source owners, transitive callees,
-table Names, selected methods, and literal workers without recording use.
-
-The solver records proof use in the original evidence variable's ebs_needs.
-Speculative evidence variables do not commit that marker. Before module
-finalization or compile-time execution, publish only marked dependencies.
-Keep unmarked entries because a later solve can still use their proofs.
-Then run the ordinary late-rule check. It reports a local rule at the rule
-declaration, including a rule introduced by a splice. An ordinary alias
-whose proof is unused records no source dependency or rule restriction.
--}
-
--- | Record rule heads and their ABI dependencies after checking the visible rules.
 recordSourceUses :: [(Id, Maybe Name)] -> TcM ()
 recordSourceUses ops = do
     changed <- changedSourceUse ops
@@ -2296,8 +1482,7 @@ recordSourceUses ops = do
           mb_shunt <- enclosingSpineStrictAppendProof v
           case mb_shunt of
             Just (proof_owner, shunt_owner) -> do
-              let deps = [ (idName v, Nothing, True, spineStrictAppendSentinel)
-                         , (idName shunt_owner, Nothing, False, []) ]
+              let deps = [(idName v, Nothing, True, [SourceProofUnknown]), (idName shunt_owner, Nothing, False, [])]
               updTcRef (tcg_source_rule_types env) $ \state ->
                 let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) proof_owner deps
                 in state { sourceProofDefinitions = defs' }
@@ -2305,68 +1490,46 @@ recordSourceUses ops = do
             Nothing -> pure (Just (v, arg))
         unless (null filtered) (publishSourceUses filtered)
 
--- | Use the exact dependencies visited by the open evaluator.
--- See Note [Identity certificates and open unfoldings].
 recordUnfoldedSourceUses :: [(Id, Maybe Name)] -> TcM ()
-recordUnfoldedSourceUses = recordSourceUses . map ordinary_use
-  where
-    ordinary_use (v, arg)
-      | isFinalCoreIdentity v = (setIdDetails v VanillaId, arg)
-      | otherwise = (v, arg)
+recordUnfoldedSourceUses = recordSourceUses . map (\(v, a) -> (if isFinalCoreIdentity v then setIdDetails v VanillaId else v, a))
 
--- | Record checked operations without changing the location of late-rule errors.
 publishSourceUses :: [(Id, Maybe Name)] -> TcM ()
 publishSourceUses ops = do
     env <- getGblEnv
-    let add !acc (v, arg) = extendNameEnv_C combine acc (idName v) (maybe emptyNameSet unitNameSet arg)
-        combine a b | isEmptyNameSet a || isEmptyNameSet b = emptyNameSet
-                    | otherwise = unionNameSet a b
+    let combine a b | isEmptyNameSet a || isEmptyNameSet b = emptyNameSet | otherwise = unionNameSet a b
+        add !acc (v, arg) = extendNameEnv_C combine acc (idName v) (maybe emptyNameSet unitNameSet arg)
     recordSourceTableUses env (map (idName . fst) ops)
-    updTcRef (tcg_source_rule_types env) $ \state ->
-      let !types' = foldl' add (sourceRuleTypes state) ops
-      in state { sourceRuleTypes = types' }
+    updTcRef (tcg_source_rule_types env) (\s -> let !t = foldl' add (sourceRuleTypes s) ops in s { sourceRuleTypes = t })
 
--- | Check rules declared or imported after an earlier retained application.
--- Report a local rule at its declaration, including one added by a splice.
 checkSourceMethodUses :: TcGblEnv -> TcM ()
-checkSourceMethodUses env = do
-    checkSourceMethodUsesWithPending env
-    writeTcRef (tcg_optional_source_uses env) []
+checkSourceMethodUses env = checkSourceMethodUsesWithPending env >> writeTcRef (tcg_optional_source_uses env) []
 
--- | Check pending aliases before execution without discarding later solver work.
 checkOptionalSourceUses :: TcGblEnv -> TcM ()
 checkOptionalSourceUses env = do
     pending <- readTcRef (tcg_optional_source_uses env)
     unless (null pending) (checkNoErrs (checkSourceMethodUsesWithPending env))
 
--- | Publish committed optional dependencies and check visible rule conflicts.
 checkSourceMethodUsesWithPending :: TcGblEnv -> TcM ()
 checkSourceMethodUsesWithPending env = do
     commitOptionalSourceUses env
-    let source_owner name = let occ = nameOccName name in isVarOcc occ || isFieldOcc occ
-    uses <- filterNameSet source_owner <$> readTcRef (tcg_source_table_uses env)
+    uses <- filterNameSet (\n -> let o = nameOccName n in isVarOcc o || isFieldOcc o) <$> readTcRef (tcg_source_table_uses env)
     unfolded <- readTcRef (tcg_evaluated_term_uses env)
     rewriting <- goptM Opt_EnableRewriteRules
-    let uses_final_core v = finalCoreMapperOwner v
-          && not (isFinalCoreIdentity v && idName v `elemNameSet` unfolded)
+    let uses_final_core v = finalCoreMapperOwner v && not (isFinalCoreIdentity v && idName v `elemNameSet` unfolded)
         needs_rules v = uses_final_core v || isNominalStructuralSource v
     checked_uses <- if rewriting then pure uses else
-      mkNameSet <$> filterM (fmap (maybe True (not . needs_rules)) . tcLookupIdMaybe)
-        (nameSetElemsStable uses)
+      mkNameSet <$> filterM (fmap (maybe True (not . needs_rules)) . tcLookupIdMaybe) (nameSetElemsStable uses)
     unless (isEmptyNameSet checked_uses) $ do
       types <- sourceRuleTypes <$> readTcRef (tcg_source_rule_types env)
-      let arguments name | Just ts <- lookupNameEnv types name, not (isEmptyNameSet ts)
-                         = map Just (nameSetElemsStable ts)
+      let arguments name | Just ts <- lookupNameEnv types name, not (isEmptyNameSet ts) = map Just (nameSetElemsStable ts)
                          | otherwise = [Nothing]
           affected rule name = anyM (\arg -> elemNameSet name <$> sourceRuleOwnersAtTc arg [rule]) (arguments name)
           report name = addErr (TcRnRetainedQuantificationError (RetainedSourceRule name))
       local <- forM (tcg_rules env) $ \rule -> do
-        let candidates = checked_uses `intersectNameSet` sourceRuleOwners [rule]
-        names <- filterM (affected rule) (nameSetElemsStable candidates)
-        pure (rule, mkNameSet names)
+        let cands = checked_uses `intersectNameSet` sourceRuleOwners [rule]
+        (rule,) . mkNameSet <$> filterM (affected rule) (nameSetElemsStable cands)
       let imported = checked_uses `minusNameSet` unionNameSets (map snd local)
-      forM_ local $ \(rule, names) ->
-        setSrcSpanA (getLoc rule) (mapM_ report (nameSetElemsStable names))
+      forM_ local (\(rule, names) -> setSrcSpanA (getLoc rule) (mapM_ report (nameSetElemsStable names)))
       unless (isEmptyNameSet imported) $ do
         visible <- visibleSourceMethodRules env
         unloaded <- unloadedSourceRuleHeads env
@@ -2375,69 +1538,48 @@ checkSourceMethodUsesWithPending env = do
           let local_rules = sourceRuleOwners (tcg_rules env) `minusNameSet` unitNameSet name
               conflict
                 | uses_final_core v = finalCoreRuleConflict visible unloaded local_rules v
-                | name `elemNameSet` unloaded
-                    || any (\arg -> hasSourceMethodRuleAt visible arg v) (arguments name) =
+                | name `elemNameSet` unloaded || any (\arg -> hasSourceMethodRuleAt visible arg v) (arguments name) =
                     Just (RetainedSourceRule name)
                 | otherwise = Nothing
           forM_ conflict $ \case
             RetainedFinalCoreRulesEnabled _ -> report name
             reason -> addErr (TcRnRetainedQuantificationError reason)
           pure conflict
-        when (all isNothing conflicts) $ recordCommittedHomeRules env
-    -- Also re-verify late/splice rules on `(++)` and its fusion helpers when a
-    -- spine-strict accumulator append proof was checked in this module.
+        when (all isNothing conflicts) (recordCommittedHomeRules env)
     when rewriting $ do
       defs <- sourceProofDefinitions <$> readTcRef (tcg_source_rule_types env)
       append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
-      let has_spine_append =
-            any (any (\(n, _, m, c) -> n == append_name && m && c == spineStrictAppendSentinel))
-                (nonDetNameEnvElts defs)
-      when has_spine_append $ do
+      when (any (any (\(n, _, m, c) -> n == append_name && m && c == [SourceProofUnknown])) (nonDetNameEnvElts defs)) $ do
         mb_append <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "++")
         forM_ mb_append $ \append_id -> do
           visible <- visibleSourceMethodRules env
           unloaded <- unloadedSourceRuleHeads env
-          let all_local = sourceRuleOwners (tcg_rules env)
-          res <- checkedAppendFusionRules visible unloaded all_local append_id
+          res <- checkedAppendFusionRules visible unloaded (sourceRuleOwners (tcg_rules env)) append_id
           case res of
             Left reason -> do
-              let bad_name = case reason of
-                    RetainedSourceRule n -> n
-                    RetainedFinalCoreRulesEnabled n -> n
-                    _ -> append_name
-                  matching_local = [r | r <- tcg_rules env, bad_name `elemNameSet` sourceRuleOwners [r]]
-              case matching_local of
-                r : _ -> setSrcSpanA (getLoc r) $
-                           addErr (TcRnRetainedQuantificationError (RetainedSourceRule bad_name))
-                [] -> addErr (TcRnRetainedQuantificationError reason)
+              let bad_name = case reason of { RetainedSourceRule n -> n; RetainedFinalCoreRulesEnabled n -> n; _ -> append_name }
+              case [r | r <- tcg_rules env, bad_name `elemNameSet` sourceRuleOwners [r]] of
+                r : _ -> setSrcSpanA (getLoc r) (addErr (TcRnRetainedQuantificationError (RetainedSourceRule bad_name)))
+                []    -> addErr (TcRnRetainedQuantificationError reason)
             Right _ -> recordCommittedHomeRules env
 
--- | Retain the home rule environment of an accepted proof.
--- A private rule can change the full interface hash without changing its ABI.
 recordCommittedHomeRules :: TcGblEnv -> TcM ()
 recordCommittedHomeRules env = do
     let here = tcg_mod env
     unless (isInteractiveModule here || isHsBootOrSig (tcg_src env)) $ do
       hsc <- getTopEnv
-      deps <- liftIO $ hugRuleInterfacesBelow hsc (homeUnitId (hsc_home_unit hsc))
-                 (GWIB (moduleName here) NotBoot)
+      deps <- liftIO $ hugRuleInterfacesBelow hsc (homeUnitId (hsc_home_unit hsc)) (GWIB (moduleName here) NotBoot)
       recordHomeRuleDependencies deps
 
--- | Find source functions that a user rule can rewrite.
 sourceRuleOwners :: [LRuleDecl GhcTc] -> NameSet
 sourceRuleOwners = sourceRuleOwnersAt Nothing
 
--- | Exclude a local rule only when its first applied type constructor is known
--- and differs from the actual one. A polymorphic rule can match any argument.
 sourceRuleOwnersAt :: Maybe Name -> [LRuleDecl GhcTc] -> NameSet
 sourceRuleOwnersAt arg rules = runIdentity (sourceRuleOwnersWith Identity arg rules)
 
--- | Before final zonking, the inferred type argument of a local rule can
--- still refer to a filled metavariable. See Note [Source family evidence uses].
 sourceRuleOwnersAtTc :: Maybe Name -> [LRuleDecl GhcTc] -> TcM NameSet
 sourceRuleOwnersAtTc = sourceRuleOwnersWith (liftZonkM . zonkTcType)
 
--- | Select active rule heads, using the supplied view of their first type argument.
 sourceRuleOwnersWith :: Monad m => (Type -> m Type) -> Maybe Name -> [LRuleDecl GhcTc] -> m NameSet
 sourceRuleOwnersWith zonk arg rules = unionNameSets <$> sequence
     [ case headOf (unLoc lhs) of
@@ -2451,1670 +1593,139 @@ sourceRuleOwnersWith zonk arg rules = unionNameSets <$> sequence
     | L _ HsRule{rd_ext = (HsRuleRn lhs_fvs _, _), rd_lhs = lhs, rd_act = act} <- rules
     , not (isNeverActive act) ]
   where
-    headOf :: HsExpr GhcTc -> Maybe (Name, Maybe Type)
     headOf (HsVar _ (L _ f)) = Just (varName f, Nothing)
     headOf (XExpr (HsRecSelTc (FieldOcc _ (L _ f)))) = Just (varName f, Nothing)
     headOf (HsApp _ f _) = headOf (unLoc f)
-    headOf (HsAppType ty f _) = add_app (Just ty) <$> headOf (unLoc f)
+    headOf (HsAppType ty f _) = (\(fn, inner) -> (fn, inner <|> Just ty)) <$> headOf (unLoc f)
     headOf (HsPar _ f) = headOf (unLoc f)
     headOf (XExpr (WrapExpr _ f)) | isNothing arg = headOf f
-    headOf (XExpr (WrapExpr w f)) = add_app <$> first_arg w <*> headOf f
+    headOf (XExpr (WrapExpr w f)) = (\a (fn, inner) -> (fn, inner <|> a)) <$> first_arg w <*> headOf f
     headOf (XExpr (ExpandedThingTc (HSE _ expansion))) = headOf (unLoc expansion)
     headOf _ = Nothing
 
-    add_app arg (f, inner) = (f, inner <|> arg)
     first_arg (WpCompose outer inner) = (<|>) <$> first_arg inner <*> first_arg outer
     first_arg (WpTyApp ty) = Just (Just ty)
-    first_arg WpHole = Just Nothing
-    first_arg WpLet{} = Just Nothing
-    first_arg WpEvApp{} = Just Nothing
+    first_arg WpHole       = Just Nothing
+    first_arg WpLet{}      = Just Nothing
+    first_arg WpEvApp{}    = Just Nothing
     first_arg (WpSubType w) = first_arg w
-    first_arg _ = Nothing
+    first_arg _            = Nothing
+-- ---------------------------------------------------------------------------
+-- Core telescope, datatype, and source-table classification predicates
+-- ---------------------------------------------------------------------------
 
-{- Note [Checked closure dependencies]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A checked closure interpreter can inline or combine its source helpers.
-Their Names need not occur in a generated equation. The interface's
-checked-closure source-table details therefore store the helper Names
-alongside the private family. These Names are part of the owner's
-interface fingerprint.
-
-Keep this information in the source-table details. The ordinary term Id
-must not become a source proof at every runtime occurrence. The reader
-for a checked closure table must check the helper Rules before using the
-equations. The selective header feature makes a reader without that
-payload reject a closure interface before decoding it. Other source
-tables keep their existing interface format.
--}
-
-{- Note [Closed source tables]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For a definition such as
-
-  flipBit :: Bool -> Bool
-  flipBit False = True
-  flipBit True  = False
-
-make one closed family with the corresponding two equations. The left
-and right sides refer to the promoted DataCons used in the checked
-clauses. As in singletons-th, a family axiom justifies each reduction.
-An application to an unknown input stays stuck. The term binding keeps
-its ordinary Haskell pattern matching.
-
-Each row matches one outer constructor of an ordinary lifted datatype.
-For example, the clause previous (S n) = n contributes the equation
-T:previous ('S n) = n. As in singletons-th, give each pattern field a
-fresh type variable in that equation. Use the checked Id to find the
-variable for a returned field. A wildcard gets a fresh variable too.
-Matching a lazy field with a variable or wildcard leaves it unevaluated.
-A strict field or a nested pattern would require another demand check.
-
-Check the domain for complete, disjoint coverage before creating the
-axiom. A row can return one of its fields or apply a result constructor.
-It can also call the same function on one field of the input type. For
-example, listCount (_ : xs) = S (listCount xs) checks because xs is a
-proper subterm of the matched cons. Use the checked Ids for both the
-function and the field. A call on a rebuilt constructor does not pass
-this test. This is the direct structural decrease used in Agda.
-
-Instantiate the input constructor at the parameters of the checked
-domain. For listCount :: [Bool] -> Nat, the promoted cons takes Bool as
-its first argument. Its field variables have kinds Bool and [Bool].
-These constructor arguments occur in the family pattern. For example,
-the promoted nil at [F ()] contains F () even though it has no fields.
-Apply the same family-free check as Core Lint to the completed pattern.
-The kind of a field variable may mention a family.
-Check each RHS before tying the family to its axiom. A successful branch
-builder only supplies the family TyCon at verified recursive calls.
-Each branch keeps the source span of its equation.
-
-For sourceLength :: forall a. [a] -> Nat, tcPolyCheck binds the body
-skolem in a WpTyLam on the FunBind. The variable in the public type
-can have a different Unique. Check the public input with its own
-binders. Substitute the body skolems into the input's type arguments
-before checking the constructor pattern. Check the recursive type
-arguments in forall order. An inferred application carries a WpTyApp.
-A written application carries the checked type in HsAppType.
-
-For nodes :: forall v k. Tree k v -> Size, the family quantifies v
-before k. The constructor pattern still takes k before v. Give the
-family and each branch fresh type variables in forall order. Use the
-datatype's argument order to instantiate its fields. Every recursive
-call keeps both type arguments and uses a field with the complete
-original input type. The same checks apply inside a call to a certified
-helper such as plus.
-
-A declaration splice can introduce a type that uses a function from an
-earlier group. At this boundary, simplifyTop has solved the constraints
-for the group. Read the evidence bindings and follow the solved type of
-each candidate. The final module zonker can run typed splices and default
-metavariables, so do not run it on the group's terms here.
-
-Note [Source table Ids]
-~~~~~~~~~~~~~~~~~~~~~~~
-A retained call needs both the runtime function and its type-level equations.
-After checking the rows, keep the public Id and its closed family together.
-Install SourceTableId on this Id in the global type environment. Desugaring
-copies these details to the matching binder and occurrences. The original
-external Name identifies the owner even if Tidy makes its name internal.
-A record selector stores this external Name in its FieldLabel. Compare
-the current Id with the stored Name by Unique. Read the defining module
-from the stored Name. A fresh binder with copied details has a different
-Unique.
-
-Store the family Name in the function's interface declaration. This makes
-its ABI depend on the equations. The typechecker reads the same declaration
-when it uses a no-code interface or follows a re-export. An hs-boot file has
-no checked body and therefore supplies no certificate. Keep a private owner
-alive when a type uses its table. Imported type aliases need this owner to
-check its rewrite dependencies.
-
-An ordinary function between two enumerations can supply equations for an
-open callback. A closed call to the same function can already execute its
-object code. Mark the certificate ExecutableSourceTable so that a direct
-closed call still uses the executable when it is available. An interface
-with this mark needs a new file version. An older compiler can read the
-original nominal certificates but cannot choose how to use the new ones.
-
-Constructor workers have no rewrite rules. See getRules in GHC.Core.Rules.
-Exclude a source rule that can rewrite the owner or a checked callee.
-An import cycle through an hs-boot
-file can make a home rule for this Id visible to the producer. Check those
-rules when rewriting is enabled. A declaration splice can add a rule after
-an earlier group used the certificate. Recheck those uses at module finish.
-As elsewhere in GHC, Core plugins must preserve the semantics of the program.
-
-Note [Composed source equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A source equation can call another checked monomorphic function:
-
-  times Z     m = Z
-  times (S n) m = plus m (times n m)
-
-The self call still decreases the original first operand and preserves the
-carried operand. The call to plus uses its own checked termination argument.
-Collect local tables in dependency order. Publish a candidate to the collector
-only after all its branches pass. A cycle between different owners has no
-first checked member, so the collector rejects it and its dependents.
-Do not resolve a failed local candidate through an earlier installed table.
-
-Helper calls must supply every type and value argument and require no
-evidence arguments. Match the solved signature with the checked family's
-kind. Instantiate the argument and result kinds with the actual type
-arguments before building the family application. This permits:
-
-  rev []     = []
-  rev (x:xs) = app (rev xs) [x]
-
-The recursive call still takes the original tail. The checked equations
-for app supply their own demand on the first list. Admit a built-in
-bracket literal only when provider RULES are disabled. Otherwise its
-desugaring can introduce build, with rules beyond the checked call
-heads. A written cons and nil uses the constructors directly.
-
-The family RHS records each helper's family Name. Recover its exact owner
-through SourceTableId when installing or using a table. Follow this closure
-to guard rewrite rules in downstream modules, including type-only uses.
-Speculative collection must not record a use or keep a rejected owner alive.
-
-Note [Carried arguments of a source equation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The equations for plus can inspect their first argument and carry a
-second argument unchanged:
-
-  plus Z     m = m
-  plus (S n) m = S (plus n m)
-
-As in Agda's definition of addition, only the first argument decreases.
-A row can carry ordinary variable operands and can discard an operand
-with a wildcard. Keep every position in the family left-hand side.
-A recursive call must pass the original variable at every carried
-position in source order. A wildcard supplies no variable to pass.
-For the first operand, look up the Id among the fields of the matched
-constructor. When both arguments have type Nat, a call such as plus m m
-would otherwise pass the type check without decreasing.
-
-For an infix call such as n + m, tcExpand places the checked prefix
-application under an ExpandedThingTc. The ExprCtxt identifies the
-original OpApp. Check the expanded function and operands with the same
-rules as a written (+) n m. See Note [Desugar OpApp in the typechecker]
-in GHC.Tc.Gen.Head.
-
-A binary definition can also scrutinize its right operand, as in PLFA's
-exponentiation. The first argument is carried unchanged, and the exponent
-decreases. Put the scrutinized argument first when checking the patterns
-and recursive arguments. Restore source order in the family telescope,
-each equation, and each recursive application. Calls to checked helpers
-already use source order.
-
-Represent each carried variable or wildcard by a fresh nominal binder in
-each axiom branch. The equation can use only the named variables. With
-Strict, desugaring adds bangs to these variable patterns. Skip equations
-with carried arguments in that case. The local renamer uses the same
-carried pattern restriction before the solved clauses are available.
--}
-
--- | Derive closed families after solving the group's top-level constraints.
--- Pass @True@ for @final_exports@ only after @rnExports@ has populated @tcg_exports@.
-sourceTableTyCons :: Bool -> Bool -> LHsBinds GhcTc -> TcM [(Id, TyCon)]
-sourceTableTyCons local final_exports binds = do
-    strict <- xoptM LangExt.Strict
-    rules <- goptM Opt_EnableRewriteRules
-    dflags <- getDynFlags
-    env <- getGblEnv
-    let generates_code = backendGeneratesCode (backend dflags)
-    (visible_rules, unloaded_rules, local_rules, build_clean) <- if rules && generates_code
-      then do
-        visible <- visibleSourceMethodRules env
-        unloaded <- unloadedSourceRuleHeads env
-        let local_r = sourceRuleOwners (tcg_rules env)
-        build_ready <- isBootModuleReady gHC_INTERNAL_BASE
-        build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
-        mb_build <- if build_ready then tcLookupIdMaybe build_name else pure Nothing
-        let ok = build_ready &&
-                 not (build_name `elemNameSet` local_r) &&
-                 not (build_name `elemNameSet` unloaded) &&
-                 maybe True (not . hasSourceMethodRule visible) mb_build
-        pure (Just visible, unloaded, local_r, ok)
-      else pure (Nothing, emptyNameSet, emptyNameSet, False)
-    structural <- if local && not strict
-                  then fmap catMaybes $ forM binds $ \bind ->
-                    runMaybeT (localStructuralTable (unLoc bind) <|> localListReverseTable bind)
-                  else pure []
-    let read_candidate bind = case sourceRows False bind of
-          Just row -> Just (row, False)
-          Nothing
-            | final_exports, rules, generates_code, build_clean
-            , Just row@(fun, _, _, _, _) <- sourceRows True bind
-            , isDefaultInlinePragma (idInlinePragma fun)
-            , not (idName fun `elemNameSet` local_rules)
-            , not (idName fun `elemNameSet` unloaded_rules)
-            , maybe True (\vis -> not (hasSourceMethodRule vis fun)) visible_rules
-            -> Just (row, True)
-            | otherwise -> Nothing
-        raw_candidates = if not rules
-          then map ((, False)) (mapMaybe (sourceRows True . unLoc) binds)
-          else mapMaybe (read_candidate . unLoc) binds
-        candidates =
-          [ (row, needs_final, emb_calls, concatMap rowCalls rows ++ emb_calls)
-          | (row@(fun, _, _, _, rows), needs_final) <- raw_candidates
-          , let emb_calls = embeddedLocalCalls fun rows ]
-        candidate_names = mkNameSet [idName f | ((f, _, _, _, _), _, _, _) <- candidates]
-        init_available = extendNameSetList emptyNameSet (map (idName . fst) structural)
-    collect env strict visible_rules unloaded_rules local_rules candidate_names init_available structural candidates
-  where
-    bind_owners = concatMap (collectHsBindBinders CollNoDictBinders . unLoc) binds
-    local_names = extendNameSetList emptyNameSet (map idName bind_owners)
-
-    collect env strict visible_rules unloaded_rules local_rules candidate_names !available checked pending = do
-      let ready (_, _, _, all_calls) =
-            all (\f -> not (idName f `elemNameSet` candidate_names)
-                       || idName f `elemNameSet` available)
-                all_calls
-          (next, later) = partition ready pending
-      if null next then pure checked else do
-        tables <- catMaybes <$> traverse (certify env strict visible_rules unloaded_rules local_rules checked) next
-        if null tables
-          then pure checked
-          else
-            let !available' = extendNameSetList available (map (idName . fst) tables)
-            in collect env strict visible_rules unloaded_rules local_rules candidate_names available' (checked ++ tables) later
-
-    rowCalls (SourceRow _ _ _ _ _ rhs) = sourceCalls rhs
-    rowCalls (SourceProducerRow _ _ rhs) = sourceCalls rhs
-
-    embeddedLocalCalls fun rows =
-      case [ty | SourceRow _ _ _ _ _ (EmbeddedType ty) <- rows] of
-        [] -> []
-        emb_tys ->
-          [ owner
-          | tc <- nonDetEltsUniqSet (tyConsOfTypes emb_tys)
-          , let tc_name = tyConName tc
-          , Just term_occ <- [sourceTableTermOcc (nameOccName tc_name)]
-          , owner <- bind_owners
-          , owner /= fun
-          , nameModule_maybe (idName owner) == nameModule_maybe tc_name
-          , nameOccName (idName owner) == term_occ ]
-
-    lookupCall checked actual = do
-      env <- getGblEnv
-      let current = case lookupTypeEnv (tcg_type_env env) (idName actual) of
-            Just (AnId fun) | fun == actual -> sourceTableId_maybe fun
-            _ -> Nothing
-          predecessor = snd <$> find ((== actual) . fst) checked
-      table <- if idName actual `elemNameSet` local_names
-        then pure predecessor
-        else pure $ if nameModule_maybe (idName actual) == Just (tcg_semantic_mod env)
-                    then current else sourceTableId_maybe actual
-      ty <- liftZonkM (zonkTcType (varType actual))
-      pure $ do
-        fam <- table
-        (binders, args, result) <- constructorHelperType ty <|>
-          (\(inputs, output) -> ([], inputs, output)) <$> ordinaryArrows ty <|>
-          typeResultHelperType ty <|>
-          polyHelperType ty
-        guard (not (null args) && length binders + length args == tyConArity fam)
-        guard (ty `eqType` tyConKind fam)
-        pure (fam, binderVars binders, args, result)
-
-    polyHelperType ty = do
-      let (telescope, tau) = splitForAllForAllTyBinders ty
-      binders <- traverse ordinaryCaseBinder telescope
-      guard (all (tcIsLiftedTypeKind . tyVarKind . binderVar) binders)
-      (inputs, output) <- polySourceArrows (binderVars binders) tau
-      pure (binders, inputs, output)
-
-    callee_clean visible_rules unloaded_rules local_rules callee =
-      not (idName callee `elemNameSet` local_rules) &&
-      (if finalCoreMapperOwner callee
-       then maybe True (\vis -> isNothing (finalCoreRuleConflict vis unloaded_rules local_rules callee)) visible_rules
-       else not (idName callee `elemNameSet` unloaded_rules) &&
-            not (maybe False (`hasSourceMethodRule` callee) visible_rules))
-
-    public_table_types env exported table =
-      let tables = sourceTableWithCallees table
-          rdr_env = tcg_rdr_env env
-          imported = ordinaryImport rdr_env
-          not_boot_import name
-            | nameModule_maybe name == Just (tcg_semantic_mod env) = name `elemNameSet` exported
-            | Just gre <- lookupGRE_Name rdr_env name =
-                any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
-            | otherwise = True
-          public_con_tc tc =
-            tc == listTyCon || isBoxedTupleTyCon tc || isKindTyCon tc ||
-            publicCaseType env exported imported tc
-          public_passive_tc tc =
-            tc == listTyCon || isBoxedTupleTyCon tc || isKindTyCon tc ||
-            not_boot_import (tyConName tc)
-      in all public_con_tc (tablePromotedParents True tables) &&
-         all public_passive_tc (sourceEquationDatatypes tables)
-
-    certify env strict visible_rules unloaded_rules local_rules checked
-            ((fun, order, body_tvs, evidence, rows), needs_final, emb_calls, callees) = do
-      clean <- allM emptyEvidence evidence
-      let callees_ok = not needs_final || all (callee_clean visible_rules unloaded_rules local_rules) callees
-      if clean && callees_ok then do
-        ty <- liftZonkM (zonkTcType (varType fun))
-        case checkedDomains strict order body_tvs ty rows of
-          Nothing -> pure Nothing
-          Just (input, carried, result) -> do
-            branches <- traverse (sourceBranch (lookupCall checked) (varName fun) emb_calls order input carried result) rows
-            case sequence branches of
-              Nothing -> pure Nothing
-              Just maybe_builders ->
-                let branch_builders = catMaybes maybe_builders
-                in if null branch_builders
-                   then pure Nothing
-                   else do
-                     table <- case if final_exports then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
-                       Just existing -> pure existing
-                       _ -> makeFamily (varName fun) order input carried result branch_builders
-                     let exported = availsToNameSet (tcg_exports env)
-                     if final_exports && tcIsLiftedTypeKind result
-                        && (not (idName fun `elemNameSet` exported)
-                            || not (null (unexportedLargeElimTypes env exported table)))
-                       then pure Nothing
-                       else if final_exports && not (tcIsLiftedTypeKind result)
-                               && not (public_table_types env exported table)
-                       then pure Nothing
-                       else do
-                         let owner = if needs_final
-                               then setIdDetails (setIdType fun ty) (SourceTableId (idName fun) table FinalCoreSourceTable)
-                               else setIdType fun ty
-                         pure (Just (owner, table))
-      else pure Nothing
-
--- | Publish checked case and pair equations, with their private field families.
--- See Note [Checked Char cases] and Note [Checked pair cases].
-sourceCaseTables :: NameSet -> LHsBinds GhcTc -> TcM ([(Id, TyCon)], [TyCon])
-sourceCaseTables nominal_owners binds = do
-  env <- getGblEnv
-  char_tables <- xoptM LangExt.ExperimentalDependentTypes
-  dflags <- getDynFlags
-  rdr_env <- getGlobalRdrEnv
-  let generates_code = backendGeneratesCode (backend dflags)
-  no_code_structural <- if generates_code || gopt Opt_WriteIfSimplifiedCore dflags ||
-                           not (null (tcg_rules env))
-    then pure False
-    else do
-      hsc <- getTopEnv
-      pure (not (hasActiveLatePlugins hsc))
-  let exported = availsToNameSet (tcg_exports env)
-      ruled = sourceRuleOwners (tcg_rules env)
-      enum_enabled = not char_tables
-      imported = ordinaryImport rdr_env
-      public = publicCaseType env exported imported
-      eligible_case = eligibleCase env exported enum_enabled imported
-      list_case_position owner
-        | generates_code
-        , let ty = varType owner
-        , Just (ConstructorCaseType _ tc _ _ position _) <-
-            constructorCaseType ty <|> monomorphicGuardedListCaseType ty
-        , tc == listTyCon = Just position
-        | otherwise = Nothing
-      indexed_candidate owner
-        | generates_code
-        , Just (IndexedProjection _ _ _ con _ _ _) <- indexedProjectionType (varType owner)
-        = publicCaseType env exported imported (dataConTyCon con)
-        | otherwise = False
-      structural_candidate owner
-        | generates_code || no_code_structural
-        , isNothing (sourceTableOccurrence env owner >>= sourceTableId_maybe)
-        , Just signature <- constructorCaseType (varType owner)
-        = isTwoStructuralCase signature || isSizeListCase signature
-        | otherwise = False
-      partial_case_candidate owner =
-        (generates_code || no_code_structural) &&
-        not (idName owner `elemNameSet` nominal_owners) &&
-        isNothing (sourceTableOccurrence env owner >>= sourceTableId_maybe) &&
-        isJust (partialConstructorCaseType (varType owner))
-      final_candidate owner = isJust (list_case_position owner) || indexed_candidate owner ||
-                              structural_candidate owner || partial_case_candidate owner
-      binary_list_candidate owner =
-        not (idName owner `elemNameSet` nominal_owners) && list_case_position owner == Just 0
-      fold_candidate owner = (generates_code || no_code_structural) &&
-                             isJust (listFoldType (varType owner))
-      zip_candidate owner = generates_code && isJust (listZipWithType (varType owner))
-      reverse_wrapper_candidate owner =
-        generates_code && isJust (listReverseWrapperType (varType owner))
-      identity_candidate owner = generates_code && isIdentitySourceType (varType owner)
-      composition_candidate owner = generates_code && isJust (compositionSourceType (varType owner))
-      is_exported owner = idName owner `elemNameSet` exported &&
-                          not (idName owner `elemNameSet` nominal_owners)
-      eligible owner =
-        is_exported owner &&
-        (final_candidate owner || not (idName owner `elemNameSet` ruled)) &&
-        ((char_tables && isJust (charCaseResultTyCon (varType owner))) ||
-         isJust (pairCaseType (varType owner)) ||
-         isJust (pairBuilderType (varType owner)) ||
-         eligible_case owner)
-      owners = [ (bind, owner) | bind <- binds
-               , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind) ]
-      candidates = [(bind, owner) | (bind, owner) <- owners
-                    , eligible owner ||
-                      (is_exported owner && (identity_candidate owner ||
-                       composition_candidate owner || final_candidate owner ||
-                       reverse_wrapper_candidate owner || fold_candidate owner ||
-                       zip_candidate owner))]
-  if isHsBootOrSig (tcg_src env) || null candidates
-    then pure ([], [])
-    else do
-      visible <- visibleSourceMethodRules env
-      unloaded <- unloadedSourceRuleHeads env
-      let changed owner = idName owner `elemNameSet` ruled
-                       || idName owner `elemNameSet` unloaded
-                       || hasSourceMethodRule visible owner
-          prepare = simpleOptExpr (initSimpleOpts dflags)
-      prepared <- fmap catMaybes $ forM candidates $ \(bind, owner) -> do
-        let ruled_owner = changed owner
-            check_final = isJust (list_case_position owner)
-        if ruled_owner && not (final_candidate owner || identity_candidate owner || fold_candidate owner ||
-                              zip_candidate owner || reverse_wrapper_candidate owner) then pure Nothing else do
-          rhs <- bindingCore bind owner
-          pure $ do
-            body <- rhs
-            let guarded = if check_final
-                          then (\(signature, branches) -> (signature, GuardedListBranches branches))
-                                 <$> directGuardedList prepare owner body
-                               <|> (,GuardedPairBranches) <$> directGuardedListPair prepare [] owner body
-                          else Nothing
-            pure (owner, body, ruled_owner, guarded)
-      let root_cores = [(owner, body) | (owner, body, False, Nothing) <- prepared
-                                     , eligible owner]
-      final <- forM prepared $ \(owner, body, ruled_owner, guarded) ->
-        case guarded of
-          Just (signature, branches) -> do
-            tables <- publishGuardedList owner signature branches
-            case tables of
-              Just (table, guard_table) -> pure (Just (finalOwner owner table, table), [guard_table])
-              Nothing -> pure (Nothing, [])
-          Nothing | Just (signature, rows) <-
-                      (guard ruled_owner *> directListMapper owner body) <|>
-                      (guard (binary_list_candidate owner) *>
-                        (directListAppend owner body <|> directListReverseWorker owner (prepare body) <|>
-                         checkedTwoListCase public owner (prepare body))) <|>
-                      (guard (structural_candidate owner) *>
-                        checkedStructuralCase public owner (prepare body)) <|>
-                      (guard (partial_case_candidate owner) *>
-                        checkedPartialConstructorCase public owner (prepare body)) <|>
-                      (guard (fold_candidate owner) *> directListFold owner (prepare body)) <|>
-                      (guard (zip_candidate owner) *> checkedListZip public owner (prepare body)) -> do
-            table <- publishConstructorCase owner signature rows
-            pure (Just (finalOwner owner table, table), [])
-          Nothing | indexed_candidate owner
-                  , Just (projection, recursion) <- checkedIndexedProjection prepare owner body -> do
-            checked <- publishIndexedProjection owner projection recursion
-            pure (fmap (\table -> (finalOwner owner table, table)) checked, [])
-          Nothing | composition_candidate owner
-                  , Just (telescope, domains, result, row) <- checkedCompositionSource owner body -> do
-            table <- publishConstructorRows owner telescope domains result [row]
-            pure (Just (finalOwner owner table, table), [])
-          _ -> pure (Nothing, [])
-      let core_entries = catMaybes (map fst final)
-      right_first <- fmap catMaybes $ forM
-        [bind | (bind, owner) <- candidates, structural_candidate owner,
-                not (changed owner), not (any ((== owner) . fst) core_entries)] $ \bind ->
-          runMaybeT $ do
-            (owner, signature@(ConstructorCaseType _ root _ _ _ result), rows) <-
-              checkedStructuralSource CRight (unLoc bind)
-            guard (public root && casePublicKind public [] result)
-            table <- lift (publishConstructorCase owner signature rows)
-            pure (finalOwner owner table, table)
-      let final_entries = core_entries ++ right_first
-          checked_predicates = mkNameEnv [(idName v, v) | (v, _) <- final_entries,
-                                                         isFinalStructuralSource v]
-          predicate callee =
-            checkedBranchPredicate (fromMaybe callee (lookupNameEnv checked_predicates (idName callee)))
-      boolean_cases <- forM
-        [ (owner, checked)
-        | (owner, body, _, Nothing) <- prepared
-        , partial_case_candidate owner
-        , Just checked <- [checkedBooleanConstructorCase public predicate owner (prepare body)]
-        ] $ \(owner, checked) -> do
-          (table, select) <- publishBooleanCase owner checked
-          pure ((finalOwner owner table, table), select)
-      let reverse_workers = mkNameEnv
-            [(idName worker, table) | (Just (worker, table), _) <- final,
-                                      isReverseWorkerTable table]
-      reverse_wrappers <- forM
-        [ (owner, binders, operand, element, table)
-        | (owner, body, _, _) <- prepared
-        , reverse_wrapper_candidate owner
-        , Just (binders, operand, element, callee) <- [directListReverseWrapper owner (prepare body)]
-        , Just table <- [lookupNameEnv reverse_workers (idName callee)]
-        ] $ \(owner, binders, operand, element, worker) -> do
-          let domain = varType operand
-              row = ConstructorCaseRow [CaseField operand]
-                      (CaseCall worker [element]
-                         [CaseField operand, CaseConstructor nilDataCon [element] []])
-          table <- publishConstructorRows owner binders [domain] domain [row]
-          pure (finalOwner owner table, table)
-      let localCall v = isId v && nameModule_maybe (idName v) == Just (tcg_semantic_mod env)
-          references = map idName . exprSomeFreeVarsList localCall
-          reachable = concatMap (references . snd)
-                        (filter (eligible_case . fst) root_cores)
-          local_owners = mkNameEnv [(idName owner, (bind, owner)) | (bind, owner) <- owners]
-          helperCore name
-            | Just (bind, owner) <- lookupNameEnv local_owners name
-            , isExternalName name
-            , not (eligible owner)
-            , not (name `elemNameSet` ruled)
-            , not (name `elemNameSet` unloaded)
-            , not (hasSourceMethodRule visible owner)
-            , Just _ <- constructorHelperType (varType owner)
-            = fmap (owner,) <$> bindingCore bind owner
-            | otherwise = pure Nothing
-      helper_cores <- collectHelpers helperCore references emptyNameSet reachable
-      helpers <- foldM (buildHelper env imported public) []
-                   (stronglyConnCompFromEdgedVerticesUniq helper_cores)
-      certified <- forM root_cores $ \(owner, rhs) ->
-        certifyBinding env exported enum_enabled rdr_env helpers owner rhs
-      let (root_entries, fields) = unzip certified
-      roots <- publishCharacterAliases env root_cores (catMaybes root_entries)
-      let helper_tables = mkNameEnv [(tyConName table, table) | (_, table) <- helpers]
-          used = helperClosure helper_tables emptyNameSet (calleeNames roots)
-          referenced (_, table) = tyConName table `elemNameSet` used
-          used_helpers = filter referenced helpers
-          helper_owners = mkNameSet (map (idName . fst) used_helpers)
-      identities <- forM [(owner, projection)
-                         | (owner, body, _, _) <- prepared
-                         , identity_candidate owner
-                         , not (idName owner `elemNameSet` helper_owners)
-                         , Just projection <- [checkedIdentitySource owner body]] $
-        \(owner, (telescope, domains, result, row)) -> do
-          table <- publishConstructorRows owner telescope domains result [row]
-          pure (finalOwner owner table, table)
-      let (boolean_tables, boolean_selectors) = unzip boolean_cases
-          boolean_owners = mkNameSet (map (idName . fst) boolean_tables)
-          other_final = filter (\(v, _) -> not (idName v `elemNameSet` boolean_owners)) final_entries
-      pure (other_final ++ boolean_tables ++ reverse_wrappers ++ identities ++ roots ++ used_helpers,
-            concatMap snd final ++ boolean_selectors ++ concat fields)
-  where
-    finalOwner owner table = setIdDetails owner
-      (SourceTableId (idName owner) table FinalCoreSourceTable)
-
-    collectHelpers _ _ _ [] = pure []
-    collectHelpers helperCore references seen (name : rest)
-      | name `elemNameSet` seen = collectHelpers helperCore references seen rest
-      | otherwise = do
-          let next = collectHelpers helperCore references (extendNameSet seen name)
-          core <- helperCore name
-          case core of
-            Just (owner, rhs) -> do
-              let direct = references rhs
-              others <- next (direct ++ rest)
-              pure (DigraphNode (owner, rhs) name direct : others)
-            Nothing -> next rest
-
-    buildHelper env imported public done (AcyclicSCC (owner, rhs))
-      | Just (telescope, domains, result, row) <- checkedConstructorHelper public helper owner rhs
-      = publish (publishConstructorRows owner telescope domains result [row])
-      | Just (signature, rows) <- checkedConstructorCase public helper owner rhs
-      , not (isBinaryListCase signature)
-      , not (isTwoStructuralCase signature || isSizeListCase signature)
-      = publish (publishConstructorCase owner signature rows)
-      where
-        helper = lookupHelper env imported done
-        publish make = do
-          table <- make
-          pure ((owner, table) : done)
-    buildHelper _ _ _ done _ = pure done
-
-    calleeNames = concatMap (callees . snd)
-    callees = map tyConName . maybe [] id . sourceTableCallees
-
-    helperClosure _ seen [] = seen
-    helperClosure tables seen (name : rest)
-      | name `elemNameSet` seen = helperClosure tables seen rest
-      | Just table <- lookupNameEnv tables name =
-          let children = callees table
-          in helperClosure tables (extendNameSet seen name) (children ++ rest)
-      | otherwise = helperClosure tables seen rest
-
-    eligibleCase env exported enum_enabled imported owner
-      | Just kinds <- monomorphicEnumCaseKinds (varType owner)
-      = enum_enabled && all enumVisible kinds
-      | Just (con, _) <- monomorphicRetainedWitnessType (varType owner)
-      = publicCaseType env exported imported (dataConTyCon con)
-      | Just signature@(ConstructorCaseType _ tc _ domains position _) <- constructorCaseType (varType owner)
-      , not (isBinaryListCase signature)
-      , not (isTwoStructuralCase signature || isSizeListCase signature)
-      = (position == 1 && (tc == listTyCon || publicCaseType env exported imported tc)) ||
-        (isPermutingConstructorCase signature && publicCaseType env exported imported tc) ||
-        (nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env) &&
-         publicCaseType env exported (const False) tc) ||
-        (maybe False (\(_, domain, _) -> isRetainedCaseRoot domain tc)
-                     (splitCaseOperand position domains) &&
-         publicCaseType env exported imported tc)
-      | otherwise = False
-      where
-        enumVisible = maybe False (publicCaseType env exported imported . fst) . caseDatatype
-
-    certifyBinding env exported enum_enabled rdr_env helpers owner rhs
-      | Just build <- checkedPairBuilder owner rhs = build
-      | otherwise = (, []) <$>
-          case rhs of
-            Core.Var target | Just result <- charCaseResultTyCon (varType owner) ->
-              forwardSourceCharacter env result owner target
-            _ | Just projection <- checkedPairCase owner rhs ->
-                  Just . (owner,) <$> publishPairCase owner projection
-              | let imported = ordinaryImport rdr_env
-                    enum_arity = monomorphicEnumCaseArity (varType owner)
-              , eligibleCase env exported enum_enabled imported owner
-              , Just (signature, rows) <- checkedConstructorCase
-                  (publicCaseType env exported imported)
-                  (lookupHelper env imported helpers) owner rhs
-              , enum_arity /= Just 2 || all enum_binary_row rows -> do
-                  table <- publishConstructorCase owner signature rows
-                  let certified
-                        | isJust enum_arity = setIdDetails owner
-                            (SourceTableId (idName owner) table ExecutableSourceTable)
-                        | otherwise = owner
-                  pure (Just (certified, table))
-              | otherwise -> publishCertifiedCharacter owner rhs
-
-    -- A binary enumeration certificate inspects the first argument.
-    -- Each row can return the second argument without inspecting it.
-    enum_binary_row (ConstructorCaseRow [CaseConstructor{}, CaseField{}] result) =
-      case result of
-        CaseField{} -> True
-        CaseConstructor _ _ [] -> True
-        _ -> False
-    enum_binary_row _ = False
-
-    lookupHelper env imported helpers actual
-      | nameModule_maybe (idName actual) == Just (tcg_semantic_mod env) =
-          lookup actual helpers
-      | imported (idName actual) = sourceTableId_maybe actual
-      | otherwise = Nothing
-
--- | Check character cases demanded from completed declaration groups.
--- The caller supplies the guarded, zonked definitions from that group.
-sourceCharacterTables :: NameEnv (Id, Core.CoreExpr) -> TcM [(Id, TyCon)]
-sourceCharacterTables definitions = do
-  env <- getGblEnv
-  let candidates = sortBy (\(left, _) (right, _) -> stableNameCmp (idName left) (idName right))
-                   (nonDetNameEnvElts definitions)
-  direct <- fmap catMaybes $ forM candidates $ \(owner, rhs) ->
-    case charCaseResultTyCon (varType owner) of
-      Just result
-        | Just old <- sourceTableOccurrence env owner >>= sourceTableId_maybe ->
-            pure (Just (owner, old))
-        | Core.Var target <- rhs ->
-            forwardSourceCharacter env result owner target
-        | otherwise -> publishCertifiedCharacter owner rhs
-      Nothing -> pure Nothing
-  publishCharacterAliases env candidates direct
-
--- | Certify only the demanded direct witnesses from already solved bindings.
-sourceRetainedWitnessTables :: NameEnv (Id, Core.CoreExpr) -> TcM [(Id, TyCon)]
-sourceRetainedWitnessTables definitions = do
-  env <- getGblEnv
-  rdr_env <- getGlobalRdrEnv
-  let available name
-        | nameModule_maybe name == Just (tcg_semantic_mod env) =
-            maybe False isLocalGRE (lookupGRE_Name rdr_env name)
-        | otherwise = ordinaryImport rdr_env name
-      public = visibleCaseType available
-      candidates = sortBy (\(left, _) (right, _) -> stableNameCmp (idName left) (idName right))
-                   (nonDetNameEnvElts definitions)
-  fmap catMaybes $ forM candidates $ \(owner, rhs) ->
-    if isMonomorphicRetainedWitness owner
-      then case checkedConstructorCase public (const Nothing) owner rhs of
-        Just (signature, rows) -> Just . (owner,) <$> publishConstructorCase owner signature rows
-        Nothing -> pure Nothing
-      else pure Nothing
-
--- | Certify demanded cases on a computed Boolean and their exact predicates.
--- See Note [Local Boolean constructor equations].
-sourceLocalBooleanCases :: NameEnv (Id, Core.CoreExpr) -> NameEnv (Id, Core.CoreExpr)
-                        -> TcM ([(Id, TyCon)], [TyCon])
-sourceLocalBooleanCases roots definitions = do
-    env <- getGblEnv
-    rdr_env <- getGlobalRdrEnv
-    dflags <- getDynFlags
-    let available name
-          | nameModule_maybe name == Just (tcg_semantic_mod env) =
-              maybe False isLocalGRE (lookupGRE_Name rdr_env name)
-          | otherwise = ordinaryImport rdr_env name
-        public = visibleCaseType available
-        prepare = simpleOptExpr (initSimpleOpts dflags)
-        fresh owner = isNothing (sourceTableOccurrence env owner >>= sourceTableId_maybe)
-        ordered = sortBy (\a b -> stableNameCmp (idName (fst a)) (idName (fst b))) . nonDetNameEnvElts
-    predicates <- forM
-      [ (owner, signature, rows)
-      | (owner, body) <- ordered definitions
-      , fresh owner, Just sig <- [constructorCaseType (varType owner)]
-      , isTwoStructuralCase sig, typeKindResultBool sig
-      , Just (signature, rows) <- [checkedStructuralCase public owner (prepare body)]
-      ] $ \(owner, signature, rows) -> do
-        table <- publishConstructorCase owner signature rows
-        pure (owner, table)
-    let local = mkNameEnv [(idName owner, table) | (owner, table) <- predicates]
-        predicate callee = lookupNameEnv local (idName callee) <|>
-          (sourceTableOccurrence env callee >>= checkedBranchPredicate)
-    (cases, selectors) <- fmap unzip $ forM
-      [ (owner, checked)
-      | (owner, body) <- ordered roots
-      , fresh owner, isJust (partialConstructorCaseType (varType owner))
-      , Just checked <- [checkedBooleanConstructorCase public predicate owner (prepare body)]
-      ] $ \(owner, checked) -> do
-        (table, selector) <- publishBooleanCase owner checked
-        pure ((owner, table), selector)
-    let used = mkNameSet [tyConName callee | (_, table) <- cases
-                                         , callee <- fromMaybe [] (sourceTableCallees table)]
-    pure (filter ((`elemNameSet` used) . tyConName . snd) predicates ++ cases, selectors)
-  where
-    typeKindResultBool (ConstructorCaseType _ _ _ _ _ result) = result `eqType` boolTy
-
-{- Note [Local Boolean constructor equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A constructor result can mention an ordinary function before final Core
-is available. For example, a beta-step constructor calls substitution on
-its open indices. The declaration scheduler checks the function and its
-dependencies first. Use the solved, zonked Core to check its constructor
-rows with the same checkers as interface publication. A Boolean test can
-use only an already checked predicate on two structural operands.
-
-Publish the equations and private selector before checking the
-constructor result. The nominal equations can now occur in a type or
-coercion, so final Core publication preserves them. The usual source
-rule checks apply to the case and to the predicate.
--}
-
--- | Publish the equation of the generated first selector of a retained record.
--- The generated match returns the first field of this exact constructor.
-publishRetainedRecordWitness :: DataCon -> Id -> TcM TyCon
-publishRetainedRecordWitness con owner
-  | Just (expected, signature@(ConstructorCaseType _ _ args _ _ _)) <- retainedWitnessType (varType owner)
-  , con == expected
-  , Just witness : _ <- dataConRepArgBinders con
-  , _ : payloads <- dataConOrigArgTys con
-  = do { let instantiate = substTyWith (dataConUnivTyVars con) args
-       ; fields <- mapM (mkSysLocalM (fsLit "field") ManyTy . instantiate . scaledThing) payloads
-       ; let lhs = CaseConstructor con args (map CaseField (witness : fields))
-       ; publishConstructorCase owner signature [ConstructorCaseRow [lhs] (CaseField witness)] }
-  | otherwise = pprPanic "publishRetainedRecordWitness: invalid selector" (ppr owner)
-
--- | Validate the exports that were unavailable when checking local cases.
--- See Note [Retained field kinds in source equations] and
--- Note [Local Boolean constructor equations].
-checkLocalRetainedWitnessExports :: TcGblEnv -> [Id] -> TcM ()
-checkLocalRetainedWitnessExports env owners = do
-    let exported = availsToNameSet (tcg_exports env)
-        exported_tycons = tyConsOfTypes (exportedLargeElimInterfaceTypes exported (tcg_type_env env))
-    forM_ owners $ \owner ->
-      case sourceTableId_maybe owner of
-        Just table
-          | Just (con, _) <- directRetainedWitnessType (varType owner)
-                             <|> retainedWitnessType (varType owner)
-          , let tc = dataConTyCon con
-          , nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env)
-          , not (publicCaseType env exported (const False) tc) -> do
-              let name = idName owner
-                  uses = [ idName consumer | consumer <- owners
-                         , table `elem` sourceFamilyTyCons [varType consumer] ]
-                  dependent = listToMaybe (sortBy stableNameCmp uses)
-                  reason = "The dependent type needs this equation. Export the matched constructor "
-                           ++ occNameString (nameOccName (dataConName con)) ++ " to make it available."
-              setSrcSpan (nameSrcSpan (fromMaybe name dependent)) $
-                addErr (TcRnOpenTypeEval name dependent reason)
-          | isNominalStructuralSource owner
-          , isJust (booleanSelector table)
-          , hidden : _ <- unexported_case_types exported table -> do
-              let name = idName owner
-                  reason = "The dependent type needs this equation. Export the constructors of "
-                           ++ occNameString (nameOccName hidden) ++ " to make it available."
-              setSrcSpan (nameSrcSpan name) $
-                addErr (TcRnOpenTypeEval name Nothing reason)
-          | SourceTableId _ _ NominalSourceTable <- idDetails owner
-          , isLargeElimTable table
-          , let name = idName owner
-                exposed = table `elementOfUniqSet` exported_tycons
-          , name `elemNameSet` exported || exposed ->
-              case unexportedLargeElimTypes env exported table of
-                (hidden, needs_cons) : _ -> do
-                  let detail = if needs_cons
-                        then "Export the constructors of " ++ occNameString (nameOccName hidden)
-                        else "Export " ++ occNameString (nameOccName hidden)
-                      reason = "The dependent type needs this equation. " ++ detail ++ " to make it available."
-                  setSrcSpan (nameSrcSpan name) $
-                    addErr (TcRnOpenTypeEval name Nothing reason)
-                [] | exposed, not (name `elemNameSet` exported) -> do
-                  let reason = "The dependent type needs this equation. Export "
-                               ++ occNameString (nameOccName name) ++ " to make it available."
-                  setSrcSpan (nameSrcSpan name) $
-                    addErr (TcRnOpenTypeEval name Nothing reason)
-                [] -> pure ()
-          | SourceTableId _ _ NominalSourceTable <- idDetails owner
-          , not (isLargeElimTable table)
-          , table `elementOfUniqSet` exported_tycons
-          , (hidden, needs_cons) : _ <- unexported_value_table_types exported table -> do
-              let name = idName owner
-                  detail = if needs_cons
-                    then "Export the constructors of " ++ occNameString (nameOccName hidden)
-                    else "Export " ++ occNameString (nameOccName hidden)
-                  reason = "The dependent type needs this equation. " ++ detail ++ " to make it available."
-              setSrcSpan (nameSrcSpan name) $
-                addErr (TcRnOpenTypeEval name Nothing reason)
-        _ -> pure ()
-  where
-    unexported_case_types exported table =
-      sortBy stableNameCmp
-        [ name | tc <- sourceEquationDatatypes (sourceTableWithCallees table)
-               , let name = tyConName tc
-               , nameModule_maybe name == Just (tcg_semantic_mod env)
-               , not (publicCaseType env exported (const False) tc) ]
-
-    unexported_value_table_types exported table =
-      map (, True) (sortBy stableNameCmp hidden_promoted) ++
-      map (, False) (sortBy stableNameCmp hidden_passive)
-      where
-        tables = sourceTableWithCallees table
-        is_local name = nameModule_maybe name == Just (tcg_semantic_mod env)
-        hidden_promoted =
-          [ name
-          | tc <- tablePromotedParents True tables
-          , let name = tyConName tc
-          , is_local name
-          , not (publicCaseType env exported (const False) tc) ]
-        hidden_passive =
-          [ name
-          | tc <- sourceEquationDatatypes tables
-          , let name = tyConName tc
-          , is_local name
-          , not (name `elemNameSet` exported) ]
-
--- | Pair a source family with its direct source-family callees.
-sourceTableWithCallees :: TyCon -> [TyCon]
-sourceTableWithCallees table = table : fromMaybe [] (sourceTableCallees table)
-
--- | Collect distinct parent datatypes of promoted data constructors occurring
--- in the RHSs (and optionally LHSs) of a group of closed source families.
-tablePromotedParents :: Bool -> [TyCon] -> [TyCon]
-tablePromotedParents include_lhs tables =
-    nonDetEltsUniqSet $ mkUniqSet
-      [ dataConTyCon dc
-      | tc <- nonDetEltsUniqSet (tyConsOfTypes branch_tys)
-      , Just dc <- [isPromotedDataCon_maybe tc] ]
-  where
-    branch_tys =
-      [ ty
-      | t <- tables
-      , axiom <- maybeToList (closedFamilyTyConCoAxiom_maybe t)
-      , branch <- fromBranches (coAxiomBranches axiom)
-      , ty <- coAxBranchRHS branch : if include_lhs then coAxBranchLHS branch else [] ]
-
--- | Check whether a closed source family eliminates values into Type.
-isLargeElimTable :: TyCon -> Bool
-isLargeElimTable table =
-  isJust (closedFamilyTyConCoAxiom_maybe table) &&
-  isJust (sourceTableTermOcc (nameOccName (tyConName table))) &&
-  tcIsLiftedTypeKind (tyConResKind table)
-
--- | Find unexported local domain constructors or RHS types in a Type-valued source table.
-unexportedLargeElimTypes :: TcGblEnv -> NameSet -> TyCon -> [(Name, Bool)]
-unexportedLargeElimTypes env exported table =
-    map (, True) (sortBy stableNameCmp hidden_domains) ++
-    map (, False) (sortBy stableNameCmp hidden_rhs_types)
-  where
-    tables = sourceTableWithCallees table
-    is_local name = nameModule_maybe name == Just (tcg_semantic_mod env)
-
-    lhs_and_promoted_types t = tyConKind t :
-      [ ty | axiom <- maybeToList (closedFamilyTyConCoAxiom_maybe t)
-           , branch <- fromBranches (coAxiomBranches axiom)
-           , ty <- coAxBranchLHS branch ++ map tyVarKind (coAxBranchTyVars branch) ]
-    domain_tycons =
-      [ parent
-      | tc <- nonDetEltsUniqSet (tyConsOfTypes (concatMap lhs_and_promoted_types tables))
-              ++ tablePromotedParents False tables
-      , let parent = maybe tc dataConTyCon (isPromotedDataCon_maybe tc)
-      , isAlgTyCon parent ]
-    hidden_domains =
-      [ name
-      | tc <- nonDetEltsUniqSet (mkUniqSet domain_tycons)
-      , let name = tyConName tc
-      , is_local name
-      , not (publicCaseType env exported (const False) tc) ]
-
-    all_rhs_tys =
-      [ coAxBranchRHS branch
-      | t <- tables
-      , axiom <- maybeToList (closedFamilyTyConCoAxiom_maybe t)
-      , branch <- fromBranches (coAxiomBranches axiom) ]
-    rhs_tycons =
-      [ tc
-      | tc <- nonDetEltsUniqSet (tyConsOfTypes all_rhs_tys)
-      , isNothing (isPromotedDataCon_maybe tc)
-      , tc `notElem` tables ]
-    callee_owners =
-      [ mkVarOcc (occNameString term_occ)
-      | callee <- fromMaybe [] (sourceTableCallees table)
-      , isLargeElimTable callee
-      , is_local (tyConName callee)
-      , Just term_occ <- [sourceTableTermOcc (nameOccName (tyConName callee))] ]
-    hidden_callee_names =
-      [ idName v
-      | v <- typeEnvIds (tcg_type_env env)
-      , is_local (idName v)
-      , nameOccName (idName v) `elem` callee_owners
-      , not (idName v `elemNameSet` exported) ]
-    hidden_rhs_types =
-      [ name
-      | tc <- nonDetEltsUniqSet (mkUniqSet rhs_tycons)
-      , let name = tyConName tc
-      , is_local name
-      , not (name `elemNameSet` exported) ]
-      ++ hidden_callee_names
-
-exportedLargeElimInterfaceTypes :: NameSet -> TypeEnv -> [Type]
-exportedLargeElimInterfaceTypes exported type_env = concatMap entity_types (typeEnvElts type_env)
-  where
-    entity_types (AnId v)
-      | idName v `elemNameSet` exported = [varType v]
-      | otherwise = []
-    entity_types (AConLike (RealDataCon dc))
-      | dataConName dc `elemNameSet` exported = [varType (dataConWrapId dc), varType (dataConWorkId dc)]
-      | otherwise = []
-    entity_types (AConLike PatSynCon{}) = []
-    entity_types (ATyCon tc)
-      | tyConName tc `elemNameSet` exported = tyConKind tc : maybeToList (synTyConRhs_maybe tc)
-      | otherwise = []
-    entity_types ACoAxiom{} = []
-
--- | Find the datatypes that supply the types and promoted constructors
--- of a group of emitted equations, including their operand kinds.
-sourceEquationDatatypes :: [TyCon] -> [TyCon]
-sourceEquationDatatypes tables =
-    [ parent | tc <- nonDetEltsUniqSet (tyConsOfTypes (concatMap equation_types tables))
-             , let parent = maybe tc dataConTyCon (isPromotedDataCon_maybe tc)
-             , isAlgTyCon parent ]
-  where
-    equation_types tc = tyConKind tc :
-      [ ty | axiom <- maybeToList (closedFamilyTyConCoAxiom_maybe tc)
-           , branch <- fromBranches (coAxiomBranches axiom)
-           , ty <- coAxBranchRHS branch : coAxBranchLHS branch ++ map tyVarKind (coAxBranchTyVars branch) ]
-
--- | The early witness path only considers signatures accepted by this rule.
-isMonomorphicRetainedWitness :: Id -> Bool
-isMonomorphicRetainedWitness = isJust . directRetainedWitnessType . varType
-
--- | Require the case datatype and all of its constructors to be visible.
-publicCaseType :: TcGblEnv -> NameSet -> (Name -> Bool) -> TyCon -> Bool
-publicCaseType env exported imported = visibleCaseType available
-  where
-    available name
-      | nameModule_maybe name == Just (tcg_semantic_mod env) = name `elemNameSet` exported
-      | otherwise = imported name
-
--- | Check the identities of the case datatype and its constructors.
-visibleCaseType :: (Name -> Bool) -> TyCon -> Bool
-visibleCaseType available tc =
-    all available (tyConName tc : map dataConName (tyConDataCons tc))
-
--- | A constructor-case certificate cannot depend on a boot-only import.
-ordinaryImport :: GlobalRdrEnv -> Name -> Bool
-ordinaryImport rdr_env name = case lookupGRE_Name rdr_env name of
-  Just gre -> any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
-  Nothing -> False
-
--- | Order exact aliases of checked character workers by source identity.
-publishCharacterAliases :: TcGblEnv -> [(Id, Core.CoreExpr)] -> [(Id, TyCon)]
-                        -> TcM [(Id, TyCon)]
-publishCharacterAliases env candidates direct = do
-  let root_tables = mkNameEnv [(idName owner, table) | (owner, table) <- direct]
-      aliases =
-        [ DigraphNode (owner, target, result) (idName owner) [idName target]
-        | (owner, Core.Var target) <- candidates
-        , not (idName owner `elemNameEnv` root_tables)
-        , nameModule_maybe (idName target) == Just (tcg_semantic_mod env)
-        , Just result <- [charCaseResultTyCon (varType owner)]
-        ]
-  (_, forwarded) <- foldM publishLocalAlias (root_tables, [])
-                        (stronglyConnCompFromEdgedVerticesUniq aliases)
-  pure (direct ++ reverse forwarded)
-
-publishCertifiedCharacter :: Id -> Core.CoreExpr -> TcM (Maybe (Id, TyCon))
-publishCertifiedCharacter owner rhs
-  | Right certificate <- certify owner rhs
-  , certOwner certificate == idName owner =
-      Just <$> publishSourceCharacter owner (certResultTyCon certificate)
-                                     (certRows certificate) (certDefault certificate)
-  | otherwise = pure Nothing
-
-publishLocalAlias :: (NameEnv TyCon, [(Id, TyCon)]) -> SCC (Id, Id, TyCon)
-                  -> TcM (NameEnv TyCon, [(Id, TyCon)])
-publishLocalAlias (tables, published) (AcyclicSCC (owner, target, result))
-  | Just table <- lookupNameEnv tables (idName target)
-  , compatibleForwarding owner target result table
-  = do
-      entry@(_, alias) <- publishForwarding owner result table
-      pure (extendNameEnv tables (idName owner) alias, entry : published)
-publishLocalAlias checked _ = pure checked
-
-compatibleForwarding :: Id -> Id -> TyCon -> TyCon -> Bool
-compatibleForwarding owner target result table =
-  varType target `eqType` varType owner &&
-  tyConResKind table `eqType` mkTyConTy result &&
-  case tyConTyVars table of
-    [arg] -> tyVarKind arg `eqType` charTy
-    _ -> False
-
-publishForwarding :: Id -> TyCon -> TyCon -> TcM (Id, TyCon)
-publishForwarding owner result table =
-  publishSourceCharacter owner result [] (\arg_ty -> mkTyConApp table [arg_ty])
-
--- | Publish a forwarding equation for an exact imported owner.
-forwardSourceCharacter :: TcGblEnv -> TyCon -> Id -> Id -> TcM (Maybe (Id, TyCon))
-forwardSourceCharacter env result owner target
-  | Just target_mod <- nameModule_maybe (idName target)
-  , target_mod /= tcg_semantic_mod env
-  , not (isHoleModule target_mod)
-  , (installed, Nothing) <- getModuleInstantiation target_mod
-  , Just IsBoot /= (gwib_isBoot <$> lookupInstalledModuleEnv
-                                  (imp_boot_mods (tcg_imports env)) installed)
-  , Just table <- sourceTableId_maybe target
-  , compatibleForwarding owner target result table
-  = do
-    dependencies <- sourceTableDependencies table
-    case dependencies of
-      Just callees -> do
-        let uses = [(v, Nothing) | v <- target : callees]
-        changed <- changedSourceUse uses
-        case changed of
-          Nothing -> do
-            forwarded <- publishForwarding owner result table
-            publishSourceUses uses
-            pure (Just forwarded)
-          Just _ -> pure Nothing
-      Nothing -> pure Nothing
-  | otherwise = pure Nothing
-
-publishSourceCharacter :: Id -> TyCon -> [(Char, Type)] -> (Type -> Type)
-                       -> TcM (Id, TyCon)
-publishSourceCharacter owner result rows fallback = do
-  let loc = nameSrcSpan (idName owner)
-      literal (input, value) _ =
-        mkCoAxBranch [] [] [] [mkCharLitTy input] value [] loc
-  var <- freshSysTyVar "c" charTy
-  let ty = mkTyVarTy var
-      default_branch _ = mkCoAxBranch [var] [] [] [ty] (fallback ty) [Nominal] loc
-  table <- makeFamily (idName owner) CLeft (ClosedInput charTy []) [] (mkTyConTy result)
-                      (map literal rows ++ [default_branch])
-  pure (owner, table)
-
-{- Note [Publishing local source aliases]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An exact alias can publish a family that calls the target's checked family.
-Publish each local target before its aliases. Use the same SCC analysis as
-for constructor helpers. A cycle or an unchecked target supplies no table.
-A Template Haskell declaration-group boundary still constrains the names
-in the checked bindings.
-
-This pass runs after type checking. It supplies no equations for an
-earlier local type. installSourceTables (GHC.Tc.Module) adds the candidate
-owners to the environment together, then checks transitive dependencies
-and rewrite rules. Keep the target's family in the alias equation so
-the checks and interface fingerprints follow the exact dependency.
--}
-
-{- Note [Checked Char cases]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Certify an exported direct Char worker from its solved, desugared binding.
-This check runs only at final publication. It provides no table for an
-earlier use in the defining module. Speculative desugaring keeps its
-diagnostics local. Ordinary module desugaring reports them.
-
-See Note [Character case certificates] in GHC.Core.CharCase for the
-accepted Core. Keep literal equations before the default so closed-family apartness
-governs reduction when the argument is still rigid. Reject visible rules
-for the owner before constructing the family. The usual SourceTableId
-publication and solver dependency checks apply to the resulting table.
-
-An exact imported variable can forward to an existing checked table.
-Require the target's own SourceTableId and the same checked arrow type. Check the target and all its checked callees for visible rules
-before publishing. The default equation references the target family, so
-the usual dependency walk checks the same chain where the solver uses it.
-The new table belongs to the alias. Re-exporting the target keeps its
-original name and requires no forwarding table.
--}
-
--- | Require a lifted polymorphic signature with ordinary arrows and no contexts.
-constructorHelperType :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
-constructorHelperType ty = do
-    let (telescope, body) = splitForAllForAllTyBinders ty
-    binders <- traverse liftedSourceBinder telescope
-    guard (not (null binders))
-    let (domains, result) = splitArrows body
-        parameters = [mkTyVarTy v | Bndr v _ <- binders]
-    guard (not (null domains) && all (caseKind parameters) (result : domains))
-    pure (binders, domains, result)
-  where
-    splitArrows tau
-      | Just (FTF_T_T, ma, mult, input, output) <- splitFunTy_maybe tau
-      , ma `eqType` unmatchableDataConTy, isManyTy mult
-      = let (inputs, result) = splitArrows output in (input : inputs, result)
-      | otherwise = ([], tau)
-
--- | Check an invisible, unmatchable binder over lifted types.
-liftedSourceBinder :: (Matchability, ForAllTyBinder) -> Maybe ForAllTyBinder
-liftedSourceBinder (ma, binder@(Bndr a (Invisible _)))
-  | ma `eqType` unmatchableDataConTy
-  , isTyVar a, varType a `eqType` liftedTypeKind = Just binder
-liftedSourceBinder _ = Nothing
-
--- | Check a construction using earlier checked helpers and scoped inputs.
-checkedConstructorHelper :: (TyCon -> Bool) -> (Id -> Maybe TyCon) -> Id -> Core.CoreExpr
-                         -> Maybe ([ForAllTyBinder], [Type], Type, ConstructorCaseRow)
-checkedConstructorHelper public helper owner rhs = do
-    let rhs_type = exprType rhs
-    guard (rhs_type `eqType` varType owner)
-    (telescope, domains, result) <- constructorHelperType rhs_type
-    (signature, _, _) <- constructorHelperType (varType owner)
-    let (binders, body) = Core.collectBinders rhs
-        (parameters, terms) = splitAt (length telescope) binders
-        publicKind = casePublicKind public (mkTyVarTys parameters)
-        declared = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope signature
-    guard (parameters == [v | Bndr v _ <- telescope] &&
-           all isId terms && eqTypes (map varType terms) domains)
-    guard (all publicKind (result : domains))
-    value <- checkCaseResult public publicKind helper
-                             (\v -> v <$ guard (v `elem` terms)) (const Nothing) result body
-    pure (declared, domains, result, ConstructorCaseRow (map CaseField terms) value)
-
-{- Note [Published polymorphic identity]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The constructor helper check derives the equation that returns its
-argument. An exported identity can supply this equation even when its
-interface omits its Core unfolding. Require a single lifted type
-parameter and a single ordinary argument of that type. Check the same
-projection before and after optimization.
-
-The optimizer can share a body with another binding. Follow aliases
-only within this module's final Core, and check the terminal body.
-
-Keep an identity's private helper table when another source table
-depends on it. A provisional final Core table cannot be a dependency
-of another table. See Note [Final Core source equations].
--}
-
--- | Recognize an ordinary lifted polymorphic identity signature.
-isIdentitySourceType :: Type -> Bool
-isIdentitySourceType ty =
-    case constructorHelperType ty of
-      Just ([Bndr a _], [domain], result) ->
-        getTyVar_maybe domain == Just a && domain `eqType` result
-      _ -> False
-
--- | Check the exact projection using the existing constructor helper.
-checkedIdentitySource :: Id -> Core.CoreExpr -> Maybe ([ForAllTyBinder], [Type], Type, ConstructorCaseRow)
-checkedIdentitySource owner rhs = do
-    guard (isIdentitySourceType (varType owner))
-    checkedConstructorHelper (const False) (const Nothing) owner rhs
-
--- | Recognize an identity whose equation was checked against final Core.
-isFinalCoreIdentity :: Id -> Bool
-isFinalCoreIdentity v = finalCoreMapperOwner v && isIdentitySourceType (varType v)
-
--- | Recognize the lifted, unrestricted type of function composition.
-compositionSourceType :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
-compositionSourceType ty = do
-    let (parameters, body) = splitForAllForAllTyBinders ty
-    guard (lengthIs parameters 3)
-    telescope <- traverse liftedSourceBinder parameters
-    (f, rest) <- caseArrow body
-    (g, arrow) <- caseArrow rest
-    (input, output) <- caseArrow arrow
-    (middle, f_output) <- caseArrow f
-    (g_input, g_output) <- caseArrow g
-    guard (eqTypes [input, middle, output] [g_input, g_output, f_output])
-    variables <- traverse getTyVar_maybe [input, middle, output]
-    guard (mkUniqSet (binderVars telescope) == mkUniqSet variables)
-    pure (telescope, [f, g, input], output)
-
--- | Check that composition applies the two original callbacks in order.
--- See Note [Checked function composition].
-checkedCompositionSource :: Id -> Core.CoreExpr -> Maybe ([ForAllTyBinder], [Type], Type, ConstructorCaseRow)
-checkedCompositionSource owner rhs = do
-    let rhs_type = exprType rhs
-    guard (rhs_type `eqType` varType owner)
-    (signature, _, _) <- compositionSourceType (varType owner)
-    (telescope, domains, result) <- compositionSourceType rhs_type
-    let (binders, body) = Core.collectBinders rhs
-    (parameters, terms@[f, g, x]) <- pure (splitAt (length telescope) binders)
-    guard (parameters == binderVars telescope && all isId terms && eqTypes (map varType terms) domains)
-    Core.App (Core.Var outer) (Core.App (Core.Var inner) (Core.Var arg)) <- pure body
-    guard (outer == f && inner == g && arg == x)
-    let declared = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope signature
-        row = ConstructorCaseRow (map CaseField terms) (CaseApply f [CaseApply g [CaseField x]])
-    pure (declared, domains, result, row)
-
--- | Recognize a closed family table produced by 'checkedCompositionSource'.
-isCompositionSourceTable :: TyCon -> Bool
-isCompositionSourceTable table = isJust $ do
-    _ <- sourceTableTermOcc (nameOccName (tyConName table))
-    (telescope, domains, _) <- compositionSourceType (tyConKind table)
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    guard (coAxiomRole axiom == Nominal)
-    [branch] <- pure (fromBranches (coAxiomBranches axiom))
-    let vars = coAxBranchTyVars branch
-    (params, [f, g, x]) <- pure (splitAt (length telescope) vars)
-    guard (lengthIs params 3 && lengthIs domains 3 && null (coAxBranchCoVars branch))
-    guard (eqTypes (coAxBranchLHS branch) (mkTyVarTys vars))
-    guard (coAxBranchRHS branch `eqType` mkAppTy (mkTyVarTy f) (mkAppTy (mkTyVarTy g) (mkTyVarTy x)))
-
-{- Note [Checked function composition]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Prelude's (.) binds two functions and an argument. Its body applies
-the first function to the result of applying the second to the
-argument. Require these exact Core applications before and after
-optimization. A case on the inner result would change demand when the
-outer function ignores its argument, so that body cannot supply this
-equation.
-
-The source table takes all three operands. A type can give it only
-the two callbacks and pass the remaining arrow to map. Reducing the
-complete application checks the source owner and its visible rules.
--}
-
-{- Note [Identity certificates and open unfoldings]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An identity certificate can supply a bare callback without an unfolding.
-It does not record the aliases exposed by optimizer inlining. A consumer
-of the certificate must disable rewriting.
-
-Use the checked projection when a written application depends on a
-retained index of arbitrary lifted type. The open evaluator represents
-polymorphic operands at kind Type. It cannot observe such an index.
-Keep the ordinary evaluator for a closed application. Its expected kind
-can determine the result of its operand, as in (id (fromIntegral x) :: Nat).
-It also preserves the ordinary staging rules. See GHC.Rename.Env.
-
-The open evaluator reads each definition it visits, including aliases,
-and records its instantiated rule head. Present those identities as
-ordinary Ids to the rule check. Their Names, types, and attached rules
-are the same. The late rule check can identify them in
-tcg_evaluated_term_uses. Keep the stricter rule policy for uses of the
-checked family and for non-identity final Core owners.
--}
-
--- | Recognize a private constructor-case family and its nominal equations.
-isSourceConstructorCase :: TyCon -> Bool
-isSourceConstructorCase table = isJust (sourceCaseVisibleArity table)
-
--- | Return the number of value operands of a certified constructor case.
-sourceCaseVisibleArity :: TyCon -> Maybe Int
-sourceCaseVisibleArity table
-  | Just _ <- reverseWrapperWorker table = Just 1
-  | isListFoldTable table = Just 3
-  | Nothing <- sourceTableTermOcc (nameOccName (tyConName table)) = Nothing
-  | Just axiom <- closedFamilyTyConCoAxiom_maybe table
-  , coAxiomRole axiom == Nominal
-  = let branches = fromBranches (coAxiomBranches axiom)
-        kind = tyConKind table
-    in case pairCaseType kind of
-        Just (telescope, _, _, _) ->
-          case traverse (caseBranchConstructor telescope) branches of
-            Just [con] | con == tupleDataCon Boxed 2 -> Just 1
-            _ -> Nothing
-        Nothing
-          | Just (expected, ConstructorCaseType telescope _ _ _ _ _) <- retainedWitnessType kind -> do
-              [branch] <- pure branches
-              (con, witness : _) <- caseBranch telescope branch
-              (patterns, _) <- branchPatterns telescope branch
-              [pattern_ty] <- pure patterns
-              (_, args) <- splitTyConApp_maybe pattern_ty
-              let arity = length telescope
-                  parameters = take arity (coAxBranchTyVars branch)
-              guard (con == expected &&
-                     eqTypes (take arity args) (mkTyVarTys parameters) &&
-                     coAxBranchRHS branch `eqType` witness)
-              pure 1
-          | otherwise -> case constructorCaseType kind <|> monomorphicGuardedListCaseType kind of
-              Just (ConstructorCaseType telescope tc _ domains position _)
-                | isNothing (monomorphicEnumCaseArity kind)
-                , let visible = length domains
-                , Just roots <- traverse (projectionBranch telescope tc visible position) branches
-                , mkUniqSet roots == mkUniqSet (tyConDataCons tc) -> Just visible
-              _ -> indexedSourceTableVisibleArity table
-  | otherwise = Nothing
-  where
-    projectionBranch telescope tc visible root branch = do
-      (patterns, vars) <- branchPatterns telescope branch
-      guard (lengthIs patterns visible)
-      (before, root_pat, after) <- splitCaseOperand root patterns
-      (root_con, _) <- constructorPattern root_pat
-      guard (dataConTyCon root_con == tc)
-      leaves <- concat <$> traverse patternLeaves patterns
-      guard (eqTypes leaves vars && resultPattern (before ++ after) vars False (coAxBranchRHS branch))
-      pure root_con
-
-    patternLeaves ty
-      | Just _ <- getTyVar_maybe ty = Just [ty]
-      | otherwise = do
-          (_, fields) <- constructorPattern ty
-          concat <$> traverse patternLeaves fields
-
-    resultPattern carried vars under_constructor ty
-      | any (eqType ty) vars = True
-      | Just (helper, args) <- splitTyConApp_maybe ty
-      , isFilterGuardFor table helper
-      , lengthIs args (tyConArity helper)
-      , [predicate_result, p, x, xs] <- drop (helperInvisibleArity helper) args
-      , any (eqType p) carried
-      , Just (domain, result) <- caseArrow (typeKind p) =
-          domain `eqType` typeKind x && result `eqType` boolTy &&
-          eqType predicate_result (mkAppTy p x) && all (\v -> any (eqType v) vars) [p, x, xs]
-      | Just (con, fields) <- constructorPattern ty
-      = lengthIs fields (dataConRepArity con) && all (resultPattern carried vars True) fields
-      | under_constructor, Just (fun, arg) <- splitAppTy_maybe ty
-      , any (eqType fun) carried, any (eqType arg) vars
-      , Just (domain, _) <- caseArrow (typeKind fun)
-      = typeKind arg `eqType` domain
-      | Just (helper, args) <- splitTyConApp_maybe ty
-      , Just _ <- sourceTableTermOcc (nameOccName (tyConName helper))
-      , Just _ <- closedFamilyTyConCoAxiom_maybe helper
-      , lengthIs args (tyConArity helper)
-      = all (resultPattern carried vars under_constructor) (drop (helperInvisibleArity helper) args)
-      | otherwise = False
-
-    caseBranchConstructor telescope branch = fst <$> caseBranch telescope branch
-    caseBranch telescope branch = do
-      (patterns, vars) <- branchPatterns telescope branch
-      [pattern_ty] <- pure patterns
-      (con, fields) <- constructorPattern pattern_ty
-      guard (eqTypes fields vars)
-      pure (con, fields)
-
-    branchPatterns telescope branch = do
-      let (params, patterns) = splitAt (length telescope) (coAxBranchLHS branch)
-          (qvars, fields) = splitAt (length telescope) (coAxBranchTyVars branch)
-      guard (null (coAxBranchCoVars branch) && eqTypes params (mkTyVarTys qvars))
-      pure (patterns, mkTyVarTys fields)
-
-    constructorPattern pattern_ty = do
-      (promoted, args) <- splitTyConApp_maybe pattern_ty
-      con <- isPromotedDataCon_maybe promoted
-      let (parameters, fields) = splitAt (length (dataConUserTyVars con)) args
-      guard (lengthIs parameters (length (dataConUserTyVars con)))
-      unless (null (dataConRepArgBinders con)) $ do
-        let domain = mkTyConApp (dataConTyCon con) parameters
-        guard (isRetainedCaseRoot domain (dataConTyCon con))
-        guard (Core.nativeIndexArgKinds con parameters fields)
-      pure (con, fields)
-
--- | Return the visible value arity of a promoted scope-indexed source table
--- (`T:renameU`, `T:shiftFin`, `T:singleSubst`, etc.) so partial applications
--- in visible type arguments (`cong (U.renameU U.shiftFin)`) elaborate via the
--- nominal family rather than the closed call evaluator.
-indexedSourceTableVisibleArity :: TyCon -> Maybe Int
-indexedSourceTableVisibleArity table
-  | isJust (sourceTableTermOcc (nameOccName (tyConName table)))
-  , Just axiom <- closedFamilyTyConCoAxiom_maybe table
-  , coAxiomRole axiom == Nominal
-  , not (tcIsLiftedTypeKind (tyConResKind table))
-  , Just (res_tc, _ : _) <- splitTyConApp_maybe (tyConResKind table)
-  , isAlgTyCon res_tc
-  , let binders = tyConBinders table
-        invis_tvs = [tv | b@(Bndr tv _) <- binders, isInvisibleTyConBinder b]
-        visible = length [() | Bndr _ AnonTCB <- binders]
-        is_promoted_index k =
-          not (tcIsLiftedTypeKind k) &&
-          case splitTyConApp_maybe k of
-            Just (kc, _) -> isAlgTyCon kc
-            Nothing -> False
-  , visible >= 1
-  , any (is_promoted_index . tyVarKind) invis_tvs
-  = Just visible
-  | otherwise = Nothing
-
--- | Identify the lifted parameter telescope and result of a boxed pair case.
-pairCaseType :: Type -> Maybe ([ForAllTyBinder], TyVar, TyVar, Type)
-pairCaseType tau = do
-    let (telescope, body) = splitForAllForAllTyBinders tau
-    binders <- traverse liftedBinder telescope
-    (FTF_T_T, ma, mult, domain, result) <- splitFunTy_maybe body
-    guard (ma `eqType` unmatchableDataConTy && isManyTy mult)
-    (tuple, [first, second]) <- splitTyConApp_maybe domain
-    guard (tuple == tupleTyCon Boxed 2)
-    x <- getTyVar_maybe first
-    y <- getTyVar_maybe second
-    let field ty = ty `eqType` first || ty `eqType` second
-    guard (field result || case splitTyConApp_maybe result of
-             Just (tc, [a,b]) -> tc == tuple && field a && field b
-             _ -> False)
-    let parameters = [v | Bndr v _ <- binders]
-    guard (x `elem` parameters && y `elem` parameters)
-    guard (all (\v -> v == x || v == y) parameters)
-    pure (binders, x, y, result)
-  where
-    liftedBinder (_, binder@(Bndr v (Invisible _)))
-      | isTyVar v, varType v `eqType` liftedTypeKind = Just binder
-    liftedBinder _ = Nothing
-
--- | Recognize a mapper or a change in parameter order for early source checking.
-sourceMapperType :: Type -> Bool
-sourceMapperType tau =
-    maybe False isPermutingConstructorCase (constructorCaseType tau) ||
-    isPairPermutationType tau || isJust mapper
-
-  where
-    mapper = do
-        ConstructorCaseType binders root params [callback, _] 1 result <- constructorCaseType tau
-        guard (all (tcIsLiftedTypeKind . tyVarKind) (binderVars binders))
-        (input, output) <- caseArrow callback
-        a <- getTyVar_maybe input
-        b <- getTyVar_maybe output
-        vars <- traverse getTyVar_maybe params
-        guard (a `elem` vars && (a == b || b `notElem` vars))
-        guard (mkUniqSet (binderVars binders) == mkUniqSet (b : vars))
-        let mapped = [if v == a then output else mkTyVarTy v | v <- vars]
-        guard (result `eqType` mkTyConApp root mapped)
-
--- | Publish constructor equations for a solved local binding.
--- See Note [Parameter permutations in source equations].
-sourceMapperTable :: Id -> Core.CoreExpr -> TcM (Maybe (Id, TyCon))
-sourceMapperTable owner rhs = do
-    env <- getGblEnv
-    let available name
-          | nameModule_maybe name == Just (tcg_semantic_mod env) = True
-          | otherwise = ordinaryImport (tcg_rdr_env env) name
-        public = visibleCaseType available
-    case checkedConstructorCase public (const Nothing) owner rhs of
-      Just (signature, rows) -> Just . (owner,) <$> publishConstructorCase owner signature rows
-      Nothing
-        | isPairPermutationType (varType owner)
-        , Just projection <- checkedPairCase owner rhs
-        -> Just . (owner,) <$> publishPairCase owner projection
-        | otherwise -> pure Nothing
-
-{- Note [Parameter permutations in source equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A unary constructor case can change the order of the lifted parameters
-of a datatype, as in Either a b -> Either b a. The signature admits the
-case to the existing constructor-row checker. That checker still checks
-coverage, field demand, constructor visibility, and the result of
-each row. Both early and final checking use the same equations.
-
-Boxed pairs already have a checker for one strict case with lazy fields.
-Use that checker for a pair swap, including when a local proof needs
-the equation before the end of the module.
--}
-
--- | A boxed pair can use the pair equation checker for early publication.
-isPairPermutationType :: Type -> Bool
-isPairPermutationType ty = isJust $ do
-    (_, x, y, result) <- pairCaseType ty
-    guard (x /= y && result `eqType` mkTyConApp (tupleTyCon Boxed 2) (mkTyVarTys [y, x]))
-
--- | An ordinary unary constructor case can permute its lifted parameters.
-isPermutingConstructorCase :: ConstructorCaseType -> Bool
-isPermutingConstructorCase (ConstructorCaseType _ root args [_] 0 result) = isJust $ do
-    (target, new_args) <- caseDatatype result
-    old <- traverse getTyVar_maybe args
-    new <- traverse getTyVar_maybe new_args
-    guard (root == target && old /= new &&
-           mkUniqSet old == mkUniqSet new && length old == length new)
-isPermutingConstructorCase _ = False
-
--- | The number of leading invisible arguments to a checked helper family.
 helperInvisibleArity :: TyCon -> Int
 helperInvisibleArity = length . takeWhile isInvisibleTyConBinder . tyConBinders
 
--- | The kind telescope, input datatype, value domains, case position and result.
 data ConstructorCaseType = ConstructorCaseType [ForAllTyBinder] TyCon [Type] [Type] Int Type
 
--- | Binary list cases use final Core evidence. Exclude them from ordinary cases.
-isBinaryListCase :: ConstructorCaseType -> Bool
-isBinaryListCase (ConstructorCaseType _ root _ _ position _) =
-    root == listTyCon && position == 0
+hasSourceTableAxiom :: Bool -> (Type -> Bool) -> TyCon -> Bool
+hasSourceTableAxiom require_nom pred_fn table =
+    isJust (sourceTableTermOcc (nameOccName (tyConName table))) &&
+    maybe False (\ax -> not require_nom || coAxiomRole ax == Nominal) (closedFamilyTyConCoAxiom_maybe table) &&
+    pred_fn (tyConKind table)
 
--- | Identify the two-list case grammar without the specialized append and
--- reverse worker signature. See Note [Checked cases on two lists].
+isBinaryListCase :: ConstructorCaseType -> Bool
+isBinaryListCase (ConstructorCaseType _ root _ _ pos _) = root == listTyCon && pos == 0
+
 isTwoListCase :: ConstructorCaseType -> Bool
-isTwoListCase (ConstructorCaseType binders root _ domains position result) =
-    root == listTyCon && position == 0 && twoListDomains domains &&
+isTwoListCase (ConstructorCaseType binders root _ domains pos result) =
+    root == listTyCon && pos == 0 && twoListDomains domains &&
     not (lengthIs binders 1 && eqTypes domains [result, result])
 
 isTwoListCaseTable :: TyCon -> Bool
-isTwoListCaseTable table =
-    isJust (sourceTableTermOcc (nameOccName (tyConName table))) &&
-    isJust (closedFamilyTyConCoAxiom_maybe table) &&
-    maybe False isTwoListCase (constructorCaseType (tyConKind table))
+isTwoListCaseTable = hasSourceTableAxiom False (maybe False isTwoListCase . constructorCaseType)
 
--- | Two structural sizes, returning a size of that datatype or a Boolean.
--- See Note [Checked cases on two structural sizes].
 isTwoStructuralCase :: ConstructorCaseType -> Bool
-isTwoStructuralCase (ConstructorCaseType [] root [] [left, right] position result) =
-    (position == 0 || position == 1) &&
-    left `eqType` right &&
+isTwoStructuralCase (ConstructorCaseType [] root [] [left, right] pos result) =
+    (pos == 0 || pos == 1) && left `eqType` right &&
     (left `eqType` result || result `eqType` boolTy ||
      maybe False (\(tc, args) -> null args && isEnumerationTyCon tc) (ordinaryDataType result)) &&
     isStructuralSize root left
 isTwoStructuralCase _ = False
 
--- | A structural size bound followed by an ordinary list of the result type.
--- See Note [Checked cases on a size and a list].
 isSizeListCase :: ConstructorCaseType -> Bool
 isSizeListCase (ConstructorCaseType _ root [] [bound, input] 0 result)
-  | Just (tc, _) <- caseDatatype input
-  = tc == listTyCon && input `eqType` result && isStructuralSize root bound
+  | Just (tc, _) <- caseDatatype input = tc == listTyCon && input `eqType` result && isStructuralSize root bound
 isSizeListCase _ = False
 
 isStructuralSize :: TyCon -> Type -> Bool
 isStructuralSize root ty
   | Just fields <- traverse (`openDataConFieldTypes` []) (tyConDataCons root)
-  , lengthIs fields 2, [child] <- concat fields
-  = child `eqType` ty
+  , lengthIs fields 2, [child] <- concat fields = child `eqType` ty
   | otherwise = False
 
 isSizeListCaseTable :: TyCon -> Bool
-isSizeListCaseTable table =
-    isJust (sourceTableTermOcc (nameOccName (tyConName table))) &&
-    isJust (closedFamilyTyConCoAxiom_maybe table) &&
-    maybe False isSizeListCase (constructorCaseType (tyConKind table))
+isSizeListCaseTable = hasSourceTableAxiom False (maybe False isSizeListCase . constructorCaseType)
 
 isTwoStructuralCaseTable :: TyCon -> Bool
-isTwoStructuralCaseTable table =
-    isJust (sourceTableTermOcc (nameOccName (tyConName table))) &&
-    isJust (closedFamilyTyConCoAxiom_maybe table) &&
-    maybe False isTwoStructuralCase (constructorCaseType (tyConKind table))
+isTwoStructuralCaseTable = hasSourceTableAxiom False (maybe False isTwoStructuralCase . constructorCaseType)
 
--- | Identify a structural family that can be checked before final Core.
 isStructuralSourceTable :: TyCon -> Bool
 isStructuralSourceTable table
-  | isReverseWorkerTable table = True
-  | isJust (booleanSelector table) = True
-  | isTwoStructuralCaseTable table
-  , Just axiom <- closedFamilyTyConCoAxiom_maybe table
-  = any matches_second (fromBranches (coAxiomBranches axiom))
+  | isReverseWorkerTable table || isJust (booleanSelector table) = True
+  | isTwoStructuralCaseTable table, Just axiom <- closedFamilyTyConCoAxiom_maybe table =
+      any (\br -> case coAxBranchLHS br of
+                    [_, r] | Just (c, _) <- splitTyConApp_maybe r -> isJust (isPromotedDataCon_maybe c)
+                    _ -> False) (fromBranches (coAxiomBranches axiom))
   | otherwise = False
-  where
-    matches_second branch
-      | [_, right] <- coAxBranchLHS branch
-      , Just (constructor, _) <- splitTyConApp_maybe right
-      = isJust (isPromotedDataCon_maybe constructor)
-      | otherwise = False
 
--- | Identify a source certificate installed before final Core is available.
 isNominalStructuralSource :: Id -> Bool
 isNominalStructuralSource owner
-  | SourceTableId _ table NominalSourceTable <- idDetails owner
-  = isStructuralSourceTable table
+  | SourceTableId _ table NominalSourceTable <- idDetails owner = isStructuralSourceTable table
   | otherwise = False
 
--- | Identify the exact owner of final Core equations on two structural sizes.
 isFinalStructuralSource :: Id -> Bool
-isFinalStructuralSource owner
-  | finalCoreMapperOwner owner, Just table <- sourceTableId_maybe owner
-  = isTwoStructuralCaseTable table
-  | otherwise = False
+isFinalStructuralSource owner =
+    finalCoreMapperOwner owner && maybe False isTwoStructuralCaseTable (sourceTableId_maybe owner)
 
 twoListDomains :: [Type] -> Bool
-twoListDomains domains =
-    lengthIs domains 2 && all (\ty -> fmap fst (caseDatatype ty) == Just listTyCon) domains
+twoListDomains ds = lengthIs ds 2 && all (\ty -> fmap fst (caseDatatype ty) == Just listTyCon) ds
 
--- | Check the ordinary unary or binary signature for a constructor case.
 constructorCaseType :: Type -> Maybe ConstructorCaseType
 constructorCaseType tau = do
     let (telescope, body) = splitForAllForAllTyBinders tau
     binders <- traverse ordinaryCaseBinder telescope
-    let quantified = [v | Bndr v _ <- binders]
-        kinds = mkTyVarTys quantified
+    let quantified = binderVars binders; kinds = mkTyVarTys quantified
     (first, rest) <- caseArrow body
-    (domain, carried, domains, position, result) <- case (caseArrow first, caseArrow rest) of
-      (Just (input, output), Just (second, result))
-        | all (caseKind kinds) [input, output] ->
-          Just (second, [], [first, second], 1, result)
-      (Nothing, Just (second, result)) -> Just (first, [second], [first, second], 0, result)
-      (Nothing, Nothing) -> Just (first, [], [first], 0, rest)
-      _ -> Nothing
+    (domain, carried, domains, pos, result) <- case (caseArrow first, caseArrow rest) of
+      (Just (i, o), Just (second, res)) | all (caseKind kinds) [i, o] -> Just (second, [], [first, second], 1, res)
+      (Nothing, Just (second, res)) -> Just (first, [second], [first, second], 0, res)
+      (Nothing, Nothing)            -> Just (first, [], [first], 0, rest)
+      _                             -> Nothing
     (tc, args) <- caseDatatype domain
-    let signature = ConstructorCaseType binders tc args domains position result
-        binder_kinds = map (varType . binderVar) binders
-    guard (all isLiftedTypeKind binder_kinds ||
+    let sig = ConstructorCaseType binders tc args domains pos result
+    guard (all (isLiftedTypeKind . varType) quantified ||
            (isRetainedCaseRoot domain tc && noFreeVarsOfType (mkForAllTys telescope liftedTypeKind)))
     let two_lists = twoListDomains domains
-    if isSizeListCase signature || (null binders && (two_lists || isTwoStructuralCase signature))
+    if isSizeListCase sig || (null binders && (two_lists || isTwoStructuralCase sig))
       then guard (all (caseKind kinds) args)
       else do
-        parameters <- catMaybes <$> traverse (domainParameter (fixedMapTypes signature)) args
-        guard ((isJust (monomorphicEnumCaseArity tau) || not (null parameters)) &&
-               sizeUniqSet (mkUniqSet parameters) == length parameters)
-    guard (tyCoVarsOfTypes domains == mkUniqSet quantified &&
-           caseKind kinds result && all (caseKind kinds) carried &&
-           (tc /= listTyCon || position == 1 || two_lists) &&
-           (tc /= tupleTyCon Boxed 2 || position == 1))
-    pure signature
-  where
-    domainParameter fixed ty
-      | ty `eqType` liftedTypeKind || any (eqType ty) fixed = Just Nothing
-      | otherwise = Just <$> getTyVar_maybe ty
+        let fixed = fixedMapTypes sig
+            domParam ty | ty `eqType` liftedTypeKind || any (eqType ty) fixed = Just Nothing
+                        | otherwise = Just <$> getTyVar_maybe ty
+        params <- catMaybes <$> traverse domParam args
+        guard ((isJust (monomorphicEnumCaseArity tau) || not (null params)) &&
+               sizeUniqSet (mkUniqSet params) == length params)
+    guard (tyCoVarsOfTypes domains == mkUniqSet quantified && caseKind kinds result && all (caseKind kinds) carried &&
+           (tc /= listTyCon || pos == 1 || two_lists) && (tc /= tupleTyCon Boxed 2 || pos == 1))
+    pure sig
 
--- | Check the signature of a direct witness projection from a monomorphic or
--- polymorphic single-constructor retained package (such as @GHC.Sigma.first@).
--- See Note [Retained field kinds in source equations].
 directRetainedWitnessType :: Type -> Maybe (DataCon, ConstructorCaseType)
 directRetainedWitnessType ty =
     monomorphicRetainedWitnessType ty <|> do
-      signature@(ConstructorCaseType _ tc args [domain] 0 result) <- constructorCaseType ty
+      sig@(ConstructorCaseType _ tc args [domain] 0 result) <- constructorCaseType ty
       [con] <- pure (tyConDataCons tc)
-      guard (isJust (getTyVar_maybe result) && isRetainedCaseRoot domain tc)
       witness : _ <- pure (dataConOrigArgTys con)
-      let inst = substTyWith (dataConUnivTyVars con) args
-      guard (result `eqType` inst (scaledThing witness))
-      pure (con, signature)
+      guard (isRetainedCaseRoot domain tc &&
+             result `eqType` substTyWith (dataConUnivTyVars con) args (scaledThing witness))
+      pure (con, sig)
 
--- | Check the signature of a direct witness projection from a nullary package.
--- See Note [Retained field kinds in source equations].
 monomorphicRetainedWitnessType :: Type -> Maybe (DataCon, ConstructorCaseType)
 monomorphicRetainedWitnessType ty = do
-    result@(_, ConstructorCaseType [] _ _ _ _ _) <- retainedWitnessType ty
-    pure result
+    res@(_, ConstructorCaseType [] _ _ _ _ _) <- retainedWitnessType ty
+    pure res
 
--- | Check the receiver and its erased parameters for a retained witness.
--- Only generated record witnesses may have an erased parameter telescope.
 retainedWitnessType :: Type -> Maybe (DataCon, ConstructorCaseType)
 retainedWitnessType ty = do
     let (telescope, body) = splitForAllForAllTyBinders ty
@@ -4122,23 +1733,17 @@ retainedWitnessType ty = do
     (domain, result) <- caseArrow body
     (tc, args) <- caseDatatype domain
     [con] <- pure (tyConDataCons tc)
-    guard (all (\tv -> varType tv `eqType` liftedTypeKind) (binderVars binders) &&
+    witness : _ <- pure (dataConOrigArgTys con)
+    guard (all (isLiftedTypeKind . varType) (binderVars binders) &&
            eqTypes args (mkTyVarTys (binderVars binders)) &&
            (null binders || not (null (dataConFieldLabels con))) &&
-           isRetainedCaseRoot domain tc)
-    witness : _ <- pure (dataConOrigArgTys con)
-    guard (result `eqType` scaledThing witness)
+           isRetainedCaseRoot domain tc && result `eqType` scaledThing witness)
     pure (con, ConstructorCaseType binders tc args [domain] 0 result)
 
--- | A type variable quantified by an ordinary inferred or specified forall.
 ordinaryCaseBinder :: (Type, ForAllTyBinder) -> Maybe ForAllTyBinder
-ordinaryCaseBinder (ma, binder@(Bndr v (Invisible _)))
-  | ma `eqType` unmatchableDataConTy
-  , isTyVar v = Just binder
+ordinaryCaseBinder (ma, binder@(Bndr v (Invisible _))) | ma `eqType` unmatchableDataConTy, isTyVar v = Just binder
 ordinaryCaseBinder _ = Nothing
 
--- | Check the exact closed signature of a guarded list.
--- See Note [Monomorphic guarded list equations].
 monomorphicGuardedListCaseType :: Type -> Maybe ConstructorCaseType
 monomorphicGuardedListCaseType ty = do
     (predicate, rest) <- caseArrow ty
@@ -4148,383 +1753,1442 @@ monomorphicGuardedListCaseType ty = do
            predicate `eqType` mkVisFunTyManyU element boolTy && result `eqType` input)
     pure (ConstructorCaseType [] root [element] [predicate, input] 1 result)
 
-{- Note [Monomorphic guarded list equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The general constructor-case signature tracks type parameters of the
-scrutinized datatype. A guarded list can instead have a fixed element
-type. Check that it is a closed, lifted datatype and require the exact
-callback type for that element. The checker still inspects the same Core
-fields and publishes a nominal axiom. Representational equality cannot
-substitute a different callback domain.
-
-Use this signature when checking a guarded result before and after
-optimization, and when reading its equations. Other constructor cases
-use the general signature. The private guard has no invisible kind
-parameter for a concrete list. Read its value operands after the actual
-invisible binders.
--}
-
-{- Note [Retained field kinds in source equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The structural root admits a checked single-constructor telescope. Match
-the actual Core alternative fields against that telescope in order. The
-payload Id's type names the witness Id from the same alternative.
-Check both fields and the result before publishing an equation.
-
-The axiom has type variables instead of runtime Ids. Publish the witness
-before the payload. Use the earlier variables to abstract the payload's
-kind. For `DPair a (p :: a -> Type)`, freshen `a` before using it in
-the kind of the new `p` binder. Keep the declared arrow matchability.
-Match the result Id to the exact pattern leaf. The resulting RHS
-does not introduce a free runtime Id or a new axiom about evaluation.
-The ordinary visibility, constructor coverage, and RULE checks still
-apply. Interface recognition checks the instantiated promoted argument
-kinds again before classifying the table as a constructor case.
-
-A retained record selector quantifies over the same erased parameters as
-its constructor. Pass those parameters to the witness family before its
-receiver. This makes the receiver determine the erased arguments and
-keeps the result of a payload selector indexed by that receiver.
-
-A nullary package can also supply a handwritten witness projection.
-Check that its Core case returns its first field directly.
-Each payload field remains a variable in the checked alternative, even
-when its type depends on the witness. Check that the sole imported
-equation also returns the first variable of this same constructor.
-Only the package constructor occurs in the equation. Require the
-ordinary kind grammar for its fields and the result. Their types can
-hide their constructors because both fields are variables. Still
-check the exact field kinds against the promoted constructor telescope.
-
-The early typechecker cannot use the module's export list. Later
-splices and finalizers can add declarations to it. Use the local
-constructor's GRE to check the witness in the current scope, then
-validate installed witnesses against the final exports before publishing.
-Imported packages already need the constructor in ordinary scope.
--}
-
--- | Check the retained constructor and its actual structural root domain.
--- See Note [Retained field kinds in source equations].
 isRetainedCaseRoot :: Type -> TyCon -> Bool
 isRetainedCaseRoot domain tc
-  | [con] <- tyConDataCons tc
-  , dataConHasPromotedRetained con
-  = isJust (nativeIndexDataConTyArgs domain con)
+  | [con] <- tyConDataCons tc, dataConHasPromotedRetained con = isJust (nativeIndexDataConTyArgs domain con)
   | otherwise = False
 
--- | Read a lifted ordinary arrow with no dictionary or coercion operand.
 caseArrow :: Type -> Maybe (Type, Type)
 caseArrow ty = do
     (FTF_T_T, ma, mult, arg, res) <- splitFunTy_maybe ty
-    guard (ma `eqType` unmatchableDataConTy && isManyTy mult &&
-           all (isLiftedTypeKind . typeKind) [arg, res])
-    pure (arg, res)
+    (arg, res) <$ guard (ma `eqType` unmatchableDataConTy && isManyTy mult && all (isLiftedTypeKind . typeKind) [arg, res])
 
--- | Separate the scrutinized operand from the other operands.
 splitCaseOperand :: Int -> [a] -> Maybe ([a], a, [a])
-splitCaseOperand i xs = case splitAt i xs of
-    (before, x : after) -> Just (before, x, after)
-    _ -> Nothing
+splitCaseOperand i xs = case splitAt i xs of { (before, x : after) -> Just (before, x, after); _ -> Nothing }
 
--- | The number of value arguments of an ordinary enumeration worker.
 monomorphicEnumCaseArity :: Type -> Maybe Int
 monomorphicEnumCaseArity = fmap (subtract 1 . length) . monomorphicEnumCaseKinds
 
--- | The domain and result kinds of a unary or binary enumeration worker.
 monomorphicEnumCaseKinds :: Type -> Maybe [Type]
 monomorphicEnumCaseKinds ty = do
     (domain, rest) <- caseArrow ty
-    let kinds = case caseArrow rest of
-          Just (carried, result) -> [domain, carried, result]
-          Nothing -> [domain, rest]
-    guard (all enumeration kinds)
-    pure kinds
-  where
-    enumeration t = case caseDatatype t of
-      Just (tc, []) -> all nullary (tyConDataCons tc)
-      _ -> False
-    nullary dc =
-      case openDataConFieldTypes dc [] of
-        Just [] -> True
-        _ -> False
+    let kinds = maybe [domain, rest] (\(c, r) -> [domain, c, r]) (caseArrow rest)
+        isEnum t = case caseDatatype t of
+          Just (tc, []) -> all (maybe False null . (`openDataConFieldTypes` [])) (tyConDataCons tc)
+          _ -> False
+    kinds <$ guard (all isEnum kinds)
 
--- | Read a saturated ordinary boxed datatype with constructors.
 caseDatatype :: Type -> Maybe (TyCon, [Type])
 caseDatatype ty = do
     (tc, args) <- splitTyConApp_maybe ty
-    guard (isVanillaAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
-           lengthIs args (tyConArity tc) && not (null (tyConDataCons tc)))
-    pure (tc, args)
+    (tc, args) <$ guard (isVanillaAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
+                         lengthIs args (tyConArity tc) && not (null (tyConDataCons tc)))
 
--- | Read a saturated boxed algebraic datatype with zero data constructors
--- (such as 'Data.Void.Void').
--- See Note [Empty-case branches in source equations].
 emptyCaseDatatype :: Type -> Maybe (TyCon, [Type])
 emptyCaseDatatype ty = do
     (tc, args) <- splitTyConApp_maybe ty
-    guard (isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
-           not (isAbstractTyCon tc) && null (tyConStupidTheta tc) &&
-           lengthIs args (tyConArity tc) && null (tyConDataCons tc))
-    pure (tc, args)
+    (tc, args) <$ guard (isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
+                         not (isAbstractTyCon tc) && null (tyConStupidTheta tc) &&
+                         lengthIs args (tyConArity tc) && null (tyConDataCons tc))
 
--- | Kinds expressible using lifted parameters and ordinary boxed datatypes.
 caseKind :: [Type] -> Type -> Bool
-caseKind parameters ty
-  | ty `eqType` liftedTypeKind || any (eqType ty) parameters = True
-  | Just (_, args) <- caseDatatype ty = all (caseKind parameters) args
+caseKind = casePublicKind (const True)
+
+casePublicKind :: (TyCon -> Bool) -> [Type] -> Type -> Bool
+casePublicKind public parameters kind
+  | kind `eqType` liftedTypeKind || any (eqType kind) parameters = True
+  | Just (tc, args) <- caseDatatype kind = public tc && all (casePublicKind public parameters) args
   | otherwise = False
 
--- | A checked constructor tree. Pattern leaves bind Core Ids and result
--- leaves refer to those bindings.
-data ConstructorCaseTree
-  = CaseField Id
-  | CaseConstructor DataCon [Type] [ConstructorCaseTree]
-  | CaseCall TyCon [Type] [ConstructorCaseTree]
-  | CaseSelf [Type] [ConstructorCaseTree]
-  | CaseApply Id [ConstructorCaseTree]
-  | CaseBoolean ConstructorCaseTree ConstructorCaseTree ConstructorCaseTree
+ordinaryDataType :: Type -> Maybe (TyCon, [Type])
+ordinaryDataType ty
+  | Just (tc, args) <- caseDatatype ty, null (tyConStupidTheta tc)
+  , all (tcIsLiftedTypeKind . tyVarKind) (tyConTyVars tc), all ordinaryField args
+  , let cons = tyConDataCons tc
+  , (null args && isEnumerationTyCon tc) || all (ordinaryCon args) cons = Just (tc, args)
+  | otherwise = Nothing
+  where
+    ordinaryField f = tcIsLiftedTypeKind (typeKind f) && noFreeVarsOfType f && isTauTy f
+    ordinaryCon args con =
+      isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con &&
+      maybe False (all ordinaryField) (openDataConFieldTypes con args)
 
--- | A complete path through the Core cases and its checked result.
-data ConstructorCaseRow = ConstructorCaseRow [ConstructorCaseTree] ConstructorCaseTree
+ordinaryArrows :: Type -> Maybe ([Type], Type)
+ordinaryArrows ty
+  | Just (arg, rest) <- caseArrow ty = ordinaryDataType arg *> ((\(as, r) -> (arg : as, r)) <$> ordinaryArrows rest)
+  | otherwise = ([], ty) <$ ordinaryDataType ty
 
-{- Note [Final Core source equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Check lazy list equations and indexed projections at final typechecking
-publication. At this point the module has checked all user declarations.
-See Note [Nullary indexed source projections].
-The new private family is available to neither user declarations nor the
-helper collector.
+polySourceType :: [TyVar] -> Type -> Bool
+polySourceType = polySourceTypeWith emptyNameSet
 
-A no-code module can check equations for structural sizes, for a size and a
-list, and for independent constructor cases. The driver checks the
-optimized body before it writes the equations to the simple interface.
-Simple interfaces do not include rules. A source rule can rewrite a call
-without changing the rule owner's Core. Skip new no-code candidates in
-modules with source rules. Also skip them in modules with plugins so
-no-code compilation does not start running Core plugin passes.
+polySourceTypeWith :: NameSet -> [TyVar] -> Type -> Bool
+polySourceTypeWith seen allowed_tvs ty
+  | Just tv <- getTyVar_maybe ty = tv `elem` allowed_tvs && tcIsLiftedTypeKind (tyVarKind tv)
+  | isTyFamFree ty, Just (tc, args) <- caseDatatype ty, null (tyConStupidTheta tc)
+  , let tc_tvs = tyConTyVars tc
+  , equalLength args tc_tvs, all (tcIsLiftedTypeKind . tyVarKind) tc_tvs
+  , all (polySourceArgTypeWith seen allowed_tvs) args =
+      tyConName tc `elemNameSet` seen || (null args && isEnumerationTyCon tc) ||
+      let seen' = extendNameSet seen (tyConName tc); formal = mkTyVarTys tc_tvs
+      in all (\con -> isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con &&
+                      maybe False (all (polySourceArgTypeWith seen' tc_tvs)) (openDataConFieldTypes con formal))
+             (tyConDataCons tc)
+  | otherwise = False
 
-For a retained module, use its restricted simplifier and one retained
-Gentle iteration with rules disabled. Discard the candidates if the body
-does not support this iteration. Check the same owner and equations
-against the result. This emits equations without a Core program. The
-retained program pipeline still requires an object or bytecode backend.
-A module that explicitly requests simplified Core uses its existing path
-and does not create these candidates. See validateSimpleSourceTables
-in GHC.Driver.Main.Passes.
+polySourceArgType :: [TyVar] -> Type -> Bool
+polySourceArgType = polySourceArgTypeWith emptyNameSet
 
-A local signature can instead require an ordinary nominal table. See
-Note [Checked list reverse]. Do not remove that table after optimization.
+polySourceArgTypeWith :: NameSet -> [TyVar] -> Type -> Bool
+polySourceArgTypeWith seen allowed_tvs ty =
+    polySourceTypeWith seen allowed_tvs ty ||
+    (tcIsLiftedTypeKind (typeKind ty) && isTyFamFree ty && isTauTy ty &&
+     all (\tv -> tv `elem` allowed_tvs && tcIsLiftedTypeKind (tyVarKind tv)) (tyCoVarsOfTypeList ty))
 
-Before Tidy the driver checks the final optimized definition of the same
-owner with the same structural test. This check covers the actual callback,
-constructors, recursive arguments and demand. A changed or missing owner
-loses both the provisional IdDetails and family. Ordinary compilation
-continues. See keepValidatedSourceMappers in GHC.Driver.Main.Passes.
+isPairPermutationType :: Type -> Bool
+isPairPermutationType ty = isJust $ do
+    (_, x, y, result) <- pairCaseType ty
+    guard (x /= y && result `eqType` mkTyConApp (tupleTyCon Boxed 2) (mkTyVarTys [y, x]))
 
-The final worker check says what the produced binding does. It does not
-prove the rules that another module can use to rewrite a call. The distinct
-interface origin requires the consumer to disable rewriting or check
-every visible rule. See Note [Checked list traversal rules]. A fusion
-rule can expose other rule heads and requires a separate proof.
+isPermutingConstructorCase :: ConstructorCaseType -> Bool
+isPermutingConstructorCase (ConstructorCaseType _ root args [_] 0 result) = isJust $ do
+    (target, new_args) <- caseDatatype result
+    old <- traverse getTyVar_maybe args
+    new <- traverse getTyVar_maybe new_args
+    guard (root == target && old /= new && mkUniqSet old == mkUniqSet new && length old == length new)
+isPermutingConstructorCase _ = False
 
-Forming a type records the interface dependency without using the
-equation. The solver checks the rules when it uses an equation,
-including through an imported alias.
+pairCaseType :: Type -> Maybe ([ForAllTyBinder], TyVar, TyVar, Type)
+pairCaseType tau = do
+    let (telescope, body) = splitForAllForAllTyBinders tau
+    binders <- traverse liftedSourceBinder telescope
+    (domain, result) <- caseArrow body
+    (tuple, [first, second]) <- splitTyConApp_maybe domain
+    guard (tuple == tupleTyCon Boxed 2)
+    x <- getTyVar_maybe first
+    y <- getTyVar_maybe second
+    let field ty = ty `eqType` first || ty `eqType` second
+        params = binderVars binders
+    guard ((field result || case splitTyConApp_maybe result of
+              Just (tc, [a, b]) -> tc == tuple && field a && field b; _ -> False) &&
+           x `elem` params && y `elem` params && all (\v -> v == x || v == y) params)
+    pure (binders, x, y, result)
 
-Note [Checked cases on two lists]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The case tree for zipLength inspects the first list before it inspects
-the second. Keep every path in Core alternative order, including the
-path that leaves the second operand untouched. The empty second list
-does not select an equation when the first list is unknown.
+liftedSourceBinder :: (Matchability, ForAllTyBinder) -> Maybe ForAllTyBinder
+liftedSourceBinder (ma, binder@(Bndr a (Invisible _)))
+  | ma `eqType` unmatchableDataConTy, isTyVar a, varType a `eqType` liftedTypeKind = Just binder
+liftedSourceBinder _ = Nothing
 
-For each recursive call, check each operand against its own original
-binder and pattern. Accept the original value or a proper subterm of
-that operand with the same type. At least one operand must decrease.
-The sum of the sizes of the finite constructor trees decreases on each
-call, even when different calls decrease different operands. The
-checked case tree determines demand independently of that decrease.
+constructorHelperType :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
+constructorHelperType ty = do
+    (binders@(_ : _), domains, result) <- splitCoreSignature ty
+    guard (all (isLiftedTypeKind . varType) (binderVars binders) &&
+           all (caseKind (mkTyVarTys (binderVars binders))) (result : domains))
+    pure (binders, domains, result)
 
-A case binder names its scrutinee. Keep this alias when checking the
-recursive operands. When a matched operand stays unchanged, use its
-branch pattern as the operand in the type-level equation. This uses
-the original value in Core and the known constructor in the equation.
+isIdentitySourceType :: Type -> Bool
+isIdentitySourceType ty = case constructorHelperType ty of
+    Just ([Bndr a _], [domain], result) -> getTyVar_maybe domain == Just a && domain `eqType` result
+    _ -> False
 
-The final checker matches all equations against the provisional axiom.
-It uses the axiom's variables at the same positions in each path. This
-checks the constructors and operands after alpha-renaming. Drop the
-table if optimization changes a pattern or result, even if the new
-body also passes the structural check. Check the exact owner for
-visible rules at an imported use.
+isFinalCoreIdentity :: Id -> Bool
+isFinalCoreIdentity v = finalCoreMapperOwner v && isIdentitySourceType (varType v)
 
-Ignore debugger breakpoints in both checks. Keep coverage ticks because
-they record evaluation.
+compositionSourceType :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
+compositionSourceType ty = do
+    let (parameters, body) = splitForAllForAllTyBinders ty
+    guard (lengthIs parameters 3)
+    telescope <- traverse liftedSourceBinder parameters
+    (f, rest) <- caseArrow body; (g, arrow) <- caseArrow rest; (input, output) <- caseArrow arrow
+    (middle, f_out) <- caseArrow f; (g_in, g_out) <- caseArrow g
+    guard (eqTypes [input, middle, output] [g_in, g_out, f_out])
+    variables <- traverse getTyVar_maybe [input, middle, output]
+    (telescope, [f, g, input], output) <$ guard (mkUniqSet (binderVars telescope) == mkUniqSet variables)
 
-Note [Checked cases on two structural sizes]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A structural size has two constructors. One is nullary. The other has a
-single lazy field at the same datatype. An ordinary function can inspect
-two values at this datatype and return a size or Bool. For example,
-minSize returns zero if the left size is zero. It inspects the right size
-only after the left size matches its successor constructor. A predicate
-such as eqSize scrutinizes both sizes.
+isCompositionSourceTable :: TyCon -> Bool
+isCompositionSourceTable table = isJust $ do
+    _ <- sourceTableTermOcc (nameOccName (tyConName table))
+    (telescope, domains, _) <- compositionSourceType (tyConKind table)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    [branch] <- pure (fromBranches (coAxiomBranches axiom))
+    let vars = coAxBranchTyVars branch
+    (params, [f, g, x]) <- pure (splitAt (length telescope) vars)
+    guard (coAxiomRole axiom == Nominal && lengthIs params 3 && lengthIs domains 3 && null (coAxBranchCoVars branch) &&
+           eqTypes (coAxBranchLHS branch) (mkTyVarTys vars) &&
+           coAxBranchRHS branch `eqType` mkAppTy (mkTyVarTy f) (mkAppTy (mkTyVarTy g) (mkTyVarTy x)))
 
-A case can inspect the right operand first. For example, monus m Zero
-returns m without inspecting it, and monus Zero (Succ n) returns Zero.
-Try the same check with the right operand as the root. Keep the original
-arguments in each equation and publish rows in the order of the checked
-Core cases. When the first source row has a variable on the left, the
-desugarer can introduce a DEFAULT and a match-failure join. Check the
-three solved source clauses for this shape before simplification. Treat
-those rows as provisional. Publish them only when final Core checks the
-same patterns and results. A type with an unknown right operand cannot
-select a rule for monus Zero n until it knows that operand's constructor.
+listFoldType :: Type -> Maybe ConstructorCaseType
+listFoldType ty = do
+    let (telescope, body) = splitForAllForAllTyBinders ty
+    binders <- traverse ordinaryCaseBinder telescope
+    guard (all (isLiftedTypeKind . varType . binderVar) binders)
+    (cb, r1) <- caseArrow body; (seed, r2) <- caseArrow r1; (list, result) <- caseArrow r2
+    (el, cb_r) <- caseArrow cb; (st, out) <- caseArrow cb_r
+    (tc, [param]) <- caseDatatype list
+    guard (tc == listTyCon && el `eqType` param && all (eqType seed) [st, out, result])
+    case mkTyVarTys (binderVars binders) of
+      []     -> guard (noFreeVarsOfType el && noFreeVarsOfType seed)
+      [a, b] -> guard (eqTypes [el, seed] [a, b] || eqTypes [el, seed] [b, a])
+      _      -> Nothing
+    pure (ConstructorCaseType binders tc [el] [cb, seed, list] 2 result)
 
-The retained Core pipeline can keep the failure join and repeat a case
-on an operand that an outer branch already matched. In the right-first
-checker, remember the constructor and fields selected by each branch.
-A repeated case must have an alternative for that constructor. Use the
-original field binders in that alternative. A return of the case binder
-can use a known nullary constructor. Skip a lazy join binding. The
-checker still rejects a reachable jump to it.
+isListFoldTable :: TyCon -> Bool
+isListFoldTable = hasSourceTableAxiom True (isJust . listFoldType)
 
-A leaf can return a direct recursive call. Apply the same operand checks
-as for recursion under a constructor. For example, monus and eqSize
-recurse on both predecessor fields after matching two successors.
-A new, swapped, or unbound operand fails the check for its own column.
-See PLFA v22.08, Naturals, Monus.
+listZipWithType :: Type -> Maybe ConstructorCaseType
+listZipWithType ty = do
+    let (telescope, body) = splitForAllForAllTyBinders ty
+    binders <- traverse ordinaryCaseBinder telescope
+    [a, b, c] <- pure (mkTyVarTys (binderVars binders))
+    (cb, r1) <- caseArrow body; (left, r2) <- caseArrow r1; (right, result) <- caseArrow r2
+    guard (all (isLiftedTypeKind . varType . binderVar) binders &&
+           cb `eqType` mkVisFunTyManyU a (mkVisFunTyManyU b c) && eqTypes [left, right, result] (map mkListTy [a, b, c]))
+    pure (ConstructorCaseType binders listTyCon [a] [cb, left, right] 1 result)
 
-Use the same row checker as for two list operands. Each recursive operand
-must be its original value or a field of its own pattern. At least one
-operand must decrease. The initial case inspects the first operand. The
-remaining cases determine which parts of either operand the function
-demands. Neither the datatype nor the function needs a particular spelling.
+isListZipWithTable :: TyCon -> Bool
+isListZipWithTable = hasSourceTableAxiom True (isJust . listZipWithType)
 
-Require the checked tree to scrutinize the second operand in a row. The
-earlier source checker can already publish functions that match only one
-operand and carry the other unchanged.
+listReverseWrapperType :: Type -> Maybe [ForAllTyBinder]
+listReverseWrapperType ty = do
+    (binders@[Bndr el _], [domain], output) <- constructorHelperType ty
+    binders <$ guard (domain `eqType` mkListTy (mkTyVarTy el) && domain `eqType` output)
 
-Publish only the rows from the checked Core of the exported definition.
-Compare the exact row order, constructor fields, and recursive calls with
-the final owner before publishing the interface. At use sites, require an
-empty set of active rewrite rules for this owner.
+isReverseWorkerTable :: TyCon -> Bool
+isReverseWorkerTable table
+  | hasSourceTableAxiom True (maybe False isBinaryListCase . constructorCaseType) table
+  , Just axiom <- closedFamilyTyConCoAxiom_maybe table =
+      any (\br -> fmap fst (splitTyConApp_maybe (coAxBranchRHS br)) == Just table) (fromBranches (coAxiomBranches axiom))
+  | otherwise = False
 
-Ignore debugger breakpoints in both checks. Keep coverage ticks because
-they record evaluation.
+isFinalCoreReverseWrapper :: Id -> Bool
+isFinalCoreReverseWrapper owner = finalCoreMapperOwner owner && isJust (sourceTableId_maybe owner >>= reverseWrapperWorker)
 
-Note [Checked cases on a size and a list]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A structural size can bound a recursion over the spine of a list. The
-size and list operands have different types. Keep the ordered case tree:
-the zero branch can skip the list, and the empty-list branch can skip
-the predecessor. Use each operand's own Core binder and constructor
-fields when checking recursive descent. The sum of the sizes of the two
-finite constructor trees must decrease. Publish the equations only for
-a checked ordinary provider, and verify the same equations in final
-Core. The source family uses the same row representation as the size
-and list families.
--}
+reverseWrapperWorker :: TyCon -> Maybe TyCon
+reverseWrapperWorker table = do
+    guard (hasSourceTableAxiom True (isJust . listReverseWrapperType) table)
+    [branch] <- fromBranches . coAxiomBranches <$> closedFamilyTyConCoAxiom_maybe table
+    [element, operand] <- pure (coAxBranchTyVars branch)
+    let kind = mkTyVarTy element; left = mkTyVarTy operand
+    (worker, [actual, input, nil]) <- splitTyConApp_maybe (coAxBranchRHS branch)
+    worker <$ guard (null (coAxBranchCoVars branch) && eqTypes (coAxBranchLHS branch) [kind, left] &&
+                     eqTypes [actual, input, nil] [kind, left, mkTyConApp (promoteDataCon nilDataCon) [kind]] &&
+                     isReverseWorkerTable worker)
 
-{- Note [Nullary indexed source projections]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A nullary GADT constructor can fix an invisible index of a binary
-ordinary function. Check that the function cases on its first operand
-and that the exact nullary alternative returns the second operand. A
-cast has no runtime effect. Use separate nominal evidence for the equation.
+partialConstructorCaseType :: Type -> Maybe ConstructorCaseType
+partialConstructorCaseType ty = do
+    (domains@(first : _ : _), result) <- ordinaryArrows ty
+    (root, args) <- ordinaryDataType first
+    (_, []) <- ordinaryDataType result
+    guard (root /= listTyCon && root /= tupleTyCon Boxed 2 && all (caseKind []) (result : domains))
+    pure (ConstructorCaseType [] root args domains 0 result)
 
-The family quantifies the original invisible telescope. Each row
-supplies the index from its constructor result and quantifies the
-remaining parameters and the carried operand. Build the nominal
-result-kind cast using ordinary family axioms. Permit one reduction
-per argument under the same boxed result datatype. This check runs
-before installing the module's source owners, so it uses the family
-matcher directly. The cast records its axioms. Installation and
-subsequent evidence use check those owners and their RULES.
+isPartialConstructorCaseTable :: TyCon -> Bool
+isPartialConstructorCaseTable table = isJust $ do
+    _ <- sourceTableTermOcc (nameOccName (tyConName table))
+    ConstructorCaseType _ root _ domains _ _ <- partialConstructorCaseType (tyConKind table)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    let branchRoot br = do
+          lhs : carried <- pure (coAxBranchLHS br)
+          (promoted, args) <- splitTyConApp_maybe lhs
+          con <- isPromotedDataCon_maybe promoted
+          let fields = drop (length (dataConUnivTyVars con)) args
+          con <$ guard (equalLength domains (lhs : carried) && dataConTyCon con == root &&
+                        lengthIs fields (dataConSourceArity con) &&
+                        eqTypes (fields ++ carried) (mkTyVarTys (coAxBranchTyVars br)))
+    roots <- traverse branchRoot (fromBranches (coAxiomBranches axiom))
+    guard (not (null roots) && length roots < length (tyConDataCons root) && sizeUniqSet (mkUniqSet roots) == length roots)
 
-The second row can rebuild one lazy constructor. The ordinary GADT
-alternative binds its existential predecessor and its two fields. Check
-that the result copies that head and suspends the same owner applied to
-the strict subpattern and the same carried operand. Keep the other erased
-arguments unchanged. Derive the promoted output index from the recursive
-call's declared result. The same nominal argument check proves the cast
-to the current branch's result kind. This certificate gives a decreasing
-left operand and leaves argument definedness to the caller.
+checkedBranchPredicate :: Id -> Maybe TyCon
+checkedBranchPredicate callee = do
+    table <- sourceTableId_maybe callee
+    table <$ guard ((isFinalStructuralSource callee || (isNominalStructuralSource callee && isTwoStructuralCaseTable table)) &&
+                    tyConResKind table `eqType` boolTy)
 
-Check each published row again in final Core. The typechecker uses the
-family for the nullary constructor, a checked recursive constructor with
-a symbolic operand, or a bare neutral left operand. Closed recursive calls
-keep the executable route. A symbolic field can be either an erased type
-variable or a retained value from the type checker's index environment.
-Check the original operand after selecting the equation. The length index
-alone cannot select a row.
--}
+booleanSelector :: TyCon -> Maybe TyCon
+booleanSelector table = do
+    _ <- partialConstructorCaseType (tyConKind table)
+    select <- sourceTableCallees table >>= find (isFilterGuardFor table)
+    let result = tyConResKind table
+    (domains, selected) <- ordinaryArrows (tyConKind select)
+    select <$ guard (eqTypes domains [boolTy, result, result] && selected `eqType` result)
 
--- | The owner's telescope, visible types, and one specialized index.
--- The constructor arguments use the owner's original type variables.
-data IndexedProjection =
-  IndexedProjection [ForAllTyBinder] (Type, Type) Type DataCon TyVar Type [Type]
+filterGuardOcc :: OccName -> OccName
+filterGuardOcc = mkSourceTableOcc . mkVarOcc . ("#guard:" ++) . occNameString
 
--- | Recognize one nullary indexed constructor in an ordinary function's
--- first domain. The other binders and carried domain must be independent of
--- the refined variable.
+isSourceFilterGuard :: TyCon -> Bool
+isSourceFilterGuard tc = isJust (sourceTableTermOcc (nameOccName (tyConName tc)) >>= stripPrefix "#guard:" . occNameString)
+
+isFilterGuardFor :: TyCon -> TyCon -> Bool
+isFilterGuardFor primary candidate =
+    nameModule_maybe root == nameModule_maybe guard_name &&
+    maybe False ((== nameOccName guard_name) . filterGuardOcc) (sourceTableTermOcc (nameOccName root))
+  where
+    root = tyConName primary; guard_name = tyConName candidate
+
+finalCoreSourceFamilies :: Id -> [TyCon]
+finalCoreSourceFamilies owner = do
+    primary <- maybeToList (sourceTableId_maybe owner)
+    primary : filter (isFilterGuardFor primary) (fromMaybe [] (sourceTableCallees primary))
+
+finalCoreMapperOwner :: Id -> Bool
+finalCoreMapperOwner v = case idDetails v of { SourceTableId _ _ FinalCoreSourceTable -> True; _ -> False }
+
+finalCoreMappers :: [Core.CoreBind] -> [Id]
+finalCoreMappers = filter finalCoreMapperOwner . concatMap Core.bindersOf
+
+isFinalCoreCaseTable :: TyCon -> Bool
+isFinalCoreCaseTable table =
+    isFinalCoreListCaseTable table || isTwoStructuralCaseTable table ||
+    isPartialConstructorCaseTable table || isJust (booleanSelector table)
+
+isFinalCoreListCaseTableBase :: TyCon -> Bool
+isFinalCoreListCaseTableBase table =
+    isListFoldTable table || isListZipWithTable table || isReverseWorkerTable table ||
+    isJust (reverseWrapperWorker table) || isTwoListCaseTable table || isSizeListCaseTable table
+
+isFinalCoreListCaseTable :: TyCon -> Bool
+isFinalCoreListCaseTable table = isFinalCoreListCaseTableBase table || isFinalSourceListTable table
+
+isFinalSourceListTable :: TyCon -> Bool
+isFinalSourceListTable table = isJust $ do
+    guard (hasSourceTableAxiom True (not . hasArrowDomain) table &&
+           not (isFinalCoreListCaseTableBase table || isTwoStructuralCaseTable table ||
+                isPartialConstructorCaseTable table || isJust (booleanSelector table) || isSourceFilterGuard table))
+    branches <- fromBranches . coAxiomBranches <$> closedFamilyTyConCoAxiom_maybe table
+    let tcs = tyConsOfTypes (map coAxBranchRHS branches)
+    guard (lengthAtLeast branches 2 && not (isAppendBranches table branches) &&
+           (promoteDataCon consDataCon `elementOfUniqSet` tcs || promoteDataCon nilDataCon `elementOfUniqSet` tcs))
+  where
+    hasArrowDomain ty = go (snd (splitForAllForAllTyBinders ty))
+      where go t | Just (dom, rest) <- caseArrow t = isJust (caseArrow dom) || go rest | otherwise = False
+    isAppendBranches fam [b1, b2]
+      | Just (_, TyVarTy v1) <- unsnoc (coAxBranchLHS b1), coAxBranchRHS b1 `eqType` mkTyVarTy v1
+      , lengthIs (coAxBranchLHS b2) (tyConArity fam)
+      , Just (c, [_, _, tail_ty]) <- splitTyConApp_maybe (coAxBranchRHS b2), c == promoteDataCon consDataCon
+      , Just (rec_fam, _) <- splitTyConApp_maybe tail_ty = rec_fam == fam
+    isAppendBranches _ _ = False
+
+isSourceBreakpoint :: CoreTickish -> Bool
+isSourceBreakpoint Breakpoint{} = True
+isSourceBreakpoint _            = False
+
+sourceMapperType :: Type -> Bool
+sourceMapperType tau =
+    maybe False isPermutingConstructorCase (constructorCaseType tau) || isPairPermutationType tau || isJust mapper
+  where
+    mapper = do
+      ConstructorCaseType binders root params [callback, _] 1 result <- constructorCaseType tau
+      guard (all (tcIsLiftedTypeKind . tyVarKind) (binderVars binders))
+      (input, output) <- caseArrow callback
+      a <- getTyVar_maybe input; b <- getTyVar_maybe output
+      vars <- traverse getTyVar_maybe params
+      guard (a `elem` vars && (a == b || b `notElem` vars) && mkUniqSet (binderVars binders) == mkUniqSet (b : vars) &&
+             result `eqType` mkTyConApp root [if v == a then output else mkTyVarTy v | v <- vars])
+
+isSourceConstructorCase :: TyCon -> Bool
+isSourceConstructorCase = isJust . sourceCaseVisibleArity
+
+sourceCaseVisibleArity :: TyCon -> Maybe Int
+sourceCaseVisibleArity table
+  | isJust (reverseWrapperWorker table) = Just 1
+  | isListFoldTable table = Just 3
+  | not (hasSourceTableAxiom True (const True) table) = Nothing
+  | Just axiom <- closedFamilyTyConCoAxiom_maybe table =
+      let branches = fromBranches (coAxiomBranches axiom)
+          kind = tyConKind table
+      in case pairCaseType kind of
+          Just (tele, _, _, _) -> case traverse (fmap fst . caseBranch tele) branches of
+            Just [con] | con == tupleDataCon Boxed 2 -> Just 1
+            _ -> Nothing
+          Nothing
+            | Just (expected, ConstructorCaseType tele _ _ _ _ _) <- retainedWitnessType kind -> do
+                [branch] <- pure branches
+                (con, witness : _) <- caseBranch tele branch
+                ([pattern_ty], _) <- branchPatterns tele branch
+                (_, args) <- splitTyConApp_maybe pattern_ty
+                let arity = length tele
+                1 <$ guard (con == expected && eqTypes (take arity args) (mkTyVarTys (take arity (coAxBranchTyVars branch))) &&
+                            coAxBranchRHS branch `eqType` witness)
+            | otherwise -> case constructorCaseType kind <|> monomorphicGuardedListCaseType kind of
+                Just (ConstructorCaseType tele tc _ domains pos _)
+                  | isNothing (monomorphicEnumCaseArity kind), let vis = length domains
+                  , Just roots <- traverse (projectionBranch tele tc vis pos) branches
+                  , mkUniqSet roots == mkUniqSet (tyConDataCons tc) -> Just vis
+                _ -> indexedSourceTableVisibleArity table
+  | otherwise = Nothing
+  where
+    projectionBranch tele tc vis root branch = do
+      (patterns, vars) <- branchPatterns tele branch
+      guard (lengthIs patterns vis)
+      (before, root_pat, after) <- splitCaseOperand root patterns
+      (root_con, _) <- constructorPattern root_pat
+      leaves <- concat <$> traverse patternLeaves patterns
+      root_con <$ guard (dataConTyCon root_con == tc && eqTypes leaves vars &&
+                         resultPattern (before ++ after) vars False (coAxBranchRHS branch))
+
+    patternLeaves ty | isJust (getTyVar_maybe ty) = Just [ty]
+                     | otherwise = constructorPattern ty >>= fmap concat . traverse patternLeaves . snd
+
+    resultPattern carried vars under_con ty
+      | any (eqType ty) vars = True
+      | Just (helper, args) <- splitTyConApp_maybe ty, isFilterGuardFor table helper
+      , lengthIs args (tyConArity helper), [pred_res, p, x, xs] <- drop (helperInvisibleArity helper) args
+      , any (eqType p) carried, Just (dom, res) <- caseArrow (typeKind p) =
+          dom `eqType` typeKind x && res `eqType` boolTy && pred_res `eqType` mkAppTy p x &&
+          all (\v -> any (eqType v) vars) [p, x, xs]
+      | Just (con, fields) <- constructorPattern ty =
+          lengthIs fields (dataConRepArity con) && all (resultPattern carried vars True) fields
+      | under_con, Just (fun, arg) <- splitAppTy_maybe ty, any (eqType fun) carried, any (eqType arg) vars
+      , Just (dom, _) <- caseArrow (typeKind fun) = typeKind arg `eqType` dom
+      | Just (helper, args) <- splitTyConApp_maybe ty, hasSourceTableAxiom False (const True) helper
+      , lengthIs args (tyConArity helper) = all (resultPattern carried vars under_con) (drop (helperInvisibleArity helper) args)
+      | otherwise = False
+
+    caseBranch tele branch = do
+      ([pattern_ty], vars) <- branchPatterns tele branch
+      (con, fields) <- constructorPattern pattern_ty
+      (con, fields) <$ guard (eqTypes fields vars)
+
+    branchPatterns tele branch = do
+      let (params, patterns) = splitAt (length tele) (coAxBranchLHS branch)
+          (qvars, fields) = splitAt (length tele) (coAxBranchTyVars branch)
+      (patterns, mkTyVarTys fields) <$ guard (null (coAxBranchCoVars branch) && eqTypes params (mkTyVarTys qvars))
+
+    constructorPattern pattern_ty = do
+      (promoted, args) <- splitTyConApp_maybe pattern_ty
+      con <- isPromotedDataCon_maybe promoted
+      let (params, fields) = splitAt (length (dataConUserTyVars con)) args
+      guard (lengthIs params (length (dataConUserTyVars con)))
+      unless (null (dataConRepArgBinders con)) $
+        guard (isRetainedCaseRoot (mkTyConApp (dataConTyCon con) params) (dataConTyCon con) &&
+               Core.nativeIndexArgKinds con params fields)
+      pure (con, fields)
+
+indexedSourceTableVisibleArity :: TyCon -> Maybe Int
+indexedSourceTableVisibleArity table
+  | hasSourceTableAxiom True (const True) table
+  , not (tcIsLiftedTypeKind (tyConResKind table))
+  , Just (res_tc, _ : _) <- splitTyConApp_maybe (tyConResKind table), isAlgTyCon res_tc
+  , let binders = tyConBinders table
+        invis_tvs = [tv | b@(Bndr tv _) <- binders, isInvisibleTyConBinder b]
+        visible = length [() | Bndr _ AnonTCB <- binders]
+  , visible >= 1
+  , any (\tv -> let k = tyVarKind tv in not (tcIsLiftedTypeKind k) && maybe False (isAlgTyCon . fst) (splitTyConApp_maybe k)) invis_tvs
+  = Just visible
+  | otherwise = Nothing
+
+-- ---------------------------------------------------------------------------
+-- Unified multi-arity Core decision-tree and #guard: continuation compiler
+-- ---------------------------------------------------------------------------
+
+data CorePat = PatVar Id | PatCon DataCon [Type] [CorePat]
+data GuardSpec = CallbackGuard Id Id Id | PredicateGuard CoreRhs
+
+data CoreRhs
+  = RhsVar Id
+  | RhsCon DataCon [Type] [CoreRhs]
+  | RhsCall TyCon [Type] [CoreRhs]
+  | RhsSelf [Type] [CoreRhs]
+  | RhsApply Id [CoreRhs]
+  | RhsGuard GuardSpec CoreRhs CoreRhs
+  | RhsTupleProj LeftOrRight Type CoreRhs
+
+data CompiledCoreRow = CompiledCoreRow [CorePat] CoreRhs
+
+data CompiledCoreTable = CompiledCoreTable
+  { cct_binders    :: [ForAllTyBinder]
+  , cct_domains    :: [Type]
+  , cct_result     :: Type
+  , cct_rows       :: [CompiledCoreRow]
+  , cct_used_build :: Bool
+  }
+
+data CoreCompileSpec = CoreCompileSpec
+  { ccs_public            :: TyCon -> Bool
+  , ccs_helper            :: Id -> Maybe TyCon
+  , ccs_predicate         :: Id -> Maybe TyCon
+  , ccs_bindings          :: [(Id, Core.CoreExpr)]
+  , ccs_spec_worker       :: Maybe Id
+  , ccs_partial_root      :: Bool
+  , ccs_allow_build       :: Bool
+  , ccs_allow_zero_cases  :: Bool
+  , ccs_allow_tail_self   :: Bool
+  , ccs_allow_accum_self  :: Bool
+  , ccs_allow_call_self   :: Bool
+  , ccs_allow_top_apply   :: Bool
+  , ccs_allow_guard       :: Bool
+  , ccs_check_kind_public :: Bool
+  , ccs_fixed_kinds       :: [Type]
+  , ccs_witness_root      :: Maybe DataCon
+  }
+
+defaultCoreSpec :: (TyCon -> Bool) -> CoreCompileSpec
+defaultCoreSpec public = CoreCompileSpec
+  { ccs_public = public, ccs_helper = const Nothing, ccs_predicate = const Nothing
+  , ccs_bindings = [], ccs_spec_worker = Nothing, ccs_partial_root = False
+  , ccs_allow_build = False, ccs_allow_zero_cases = False, ccs_allow_tail_self = False
+  , ccs_allow_accum_self = False, ccs_allow_call_self = False, ccs_allow_top_apply = False
+  , ccs_allow_guard = False, ccs_check_kind_public = True, ccs_fixed_kinds = [], ccs_witness_root = Nothing }
+
+isPatVar :: CorePat -> Bool
+isPatVar PatVar{} = True
+isPatVar _        = False
+
+isPatCon :: CorePat -> Bool
+isPatCon PatCon{} = True
+isPatCon _        = False
+
+hasPatVar :: Id -> CorePat -> Bool
+hasPatVar v (PatVar u)          = v == u
+hasPatVar v (PatCon _ _ fields) = any (hasPatVar v) fields
+
+patIds :: CorePat -> [Id]
+patIds (PatVar u)          = [u]
+patIds (PatCon _ _ fields) = concatMap patIds fields
+
+anyRhs :: (CoreRhs -> Bool) -> CoreRhs -> Bool
+anyRhs p r = p r || case r of
+  RhsCon _ _ as      -> any (anyRhs p) as
+  RhsCall _ _ as     -> any (anyRhs p) as
+  RhsApply _ as      -> any (anyRhs p) as
+  RhsGuard _ n y     -> anyRhs p n || anyRhs p y
+  RhsTupleProj _ _ i -> anyRhs p i
+  _                  -> False
+
+rhsHasSelf :: CoreRhs -> Bool
+rhsHasSelf = anyRhs (\case RhsSelf{} -> True; _ -> False)
+
+rhsHasTupleProj :: CoreRhs -> Bool
+rhsHasTupleProj = anyRhs (\case RhsTupleProj{} -> True; _ -> False)
+
+rhsHasCallbackGuard :: CoreRhs -> Bool
+rhsHasCallbackGuard (RhsGuard CallbackGuard{} _ _) = True
+rhsHasCallbackGuard _                              = False
+
+rhsHasPredicateGuard :: CoreRhs -> Bool
+rhsHasPredicateGuard (RhsGuard PredicateGuard{} _ _) = True
+rhsHasPredicateGuard _                               = False
+
+splitCoreSignature :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
+splitCoreSignature tau = do
+    let (telescope, body) = splitForAllForAllTyBinders tau
+        splitArrows t | Just (a, r) <- caseArrow t = let (as, o) = splitArrows r in (a : as, o) | otherwise = ([], t)
+        (domains, result) = splitArrows body
+    binders <- traverse ordinaryCaseBinder telescope
+    (binders, domains, result) <$ guard (not (null domains))
+
+resolveCaseAlias :: [(Id, Id)] -> Id -> Id
+resolveCaseAlias aliases v = fromMaybe v (lookup v aliases)
+
+completeCase :: TyCon -> [DataCon] -> Bool
+completeCase tc actual =
+    let expected = tyConDataCons tc in lengthIs actual (length expected) && mkUniqSet actual == mkUniqSet expected
+
+data BranchState = BranchState
+  { bs_scope   :: InScopeSet
+  , bs_root    :: Bool
+  , bs_pats    :: [CorePat]
+  , bs_aliases :: [(Id, Id)]
+  , bs_known   :: [(Id, (DataCon, [Type], [Id]))]
+  , bs_lets    :: [(Id, Core.CoreExpr)]
+  , bs_susps   :: [(Id, (Type, CoreRhs))]
+  , bs_projs   :: [(Id, CoreRhs)]
+  }
+
+compileCoreEquations :: CoreCompileSpec -> Id -> Core.CoreExpr -> Maybe CompiledCoreTable
+compileCoreEquations spec owner original_rhs = do
+    let rhs0 = stripTicksE isSourceBreakpoint original_rhs
+    guard ((isJust (ccs_witness_root spec) || not (hasNativeDependentExprRhs original_rhs)) &&
+           exprType rhs0 `eqType` varType owner)
+    (declared_tele, _, _) <- splitCoreSignature (varType owner)
+    (telescope, domains, result) <- splitCoreSignature (exprType rhs0)
+    let (all_lams, raw_body) = Core.collectBinders rhs0
+        (parameters, prefix_terms) = splitAt (length telescope) all_lams
+    guard (parameters == binderVars telescope && all isId prefix_terms &&
+           length prefix_terms <= length domains && eqTypes (map varType prefix_terms) (take (length prefix_terms) domains))
+    let q_tys = mkTyVarTys parameters
+        allowed_kinds = q_tys ++ ccs_fixed_kinds spec
+        public tc = ccs_public spec tc || tc == listTyCon || isBoxedTupleTyCon tc
+        public_kind = if ccs_check_kind_public spec then casePublicKind public allowed_kinds else const True
+        public_dom ty
+          | not (ccs_check_kind_public spec) = True
+          | Just (i, o) <- caseArrow ty =
+              let ok t = maybe (public_kind t) (\(a, b) -> public_kind a && public_kind b) (caseArrow t) in ok i && ok o
+          | otherwise = public_kind ty
+    guard (isJust (ccs_witness_root spec) || (public_dom result && all public_dom domains))
+    (terms, init_aliases, mb_local_worker, target_loop, unboxed_pair_mode, body0) <-
+      unwrapWorkerWrapper parameters prefix_terms domains result raw_body
+    let eff_result = maybe result (\l -> mkTupleTy Unboxed [l, l]) unboxed_pair_mode
+        init_st = BranchState (mkInScopeSet (exprsFreeVars [rhs0])) True (map PatVar terms) init_aliases [] [] [] []
+
+        descend st raw_e =
+          let body = stripTicksE isSourceBreakpoint raw_e
+              scoped v = any (hasPatVar v) (bs_pats st)
+              st_inner = st { bs_root = False }
+          in case body of
+            Core.Let (Core.NonRec b _) rest
+              | isId b, not (isUnliftedType (varType b)), not (isJoinId b)
+              , not (b `elemVarSet` exprsFreeVars [rest]) -> descend st rest
+            Core.Let (Core.NonRec j _) rest | isJoinId j -> descend st rest
+            Core.Let (Core.NonRec b (Core.Var target)) rest
+              | isId b, isId target, b /= target, not (isJoinId b), not (scoped b)
+              , isNothing (lookup b (bs_aliases st)), varType b `eqType` varType target
+              , let sel = resolveCaseAlias (bs_aliases st) target
+              , scoped sel || isJust (lookup sel (bs_known st)) ->
+                  descend (st { bs_aliases = (b, sel) : bs_aliases st }) rest
+            Core.Let (Core.NonRec susp call) rest
+              | isId susp, not (isJoinId susp), not (bs_root st)
+              , Just (tup_tc, [l1, l2]) <- splitTyConApp_maybe (varType susp)
+              , tup_tc == tupleTyCon Boxed 2, l1 `eqType` l2
+              , Just raw_call <- case unboxed_pair_mode of
+                  Just list_ty | list_ty `eqType` l1 -> reboxedCall list_ty call
+                  Nothing -> Just call
+                  _ -> Nothing
+              , Just (self_rhs, False) <- checkSelfCall st raw_call ->
+                  descend (st_inner { bs_susps = (susp, (l1, self_rhs)) : bs_susps st }) rest
+            Core.Let (Core.NonRec alias sel_expr) rest
+              | isId alias, not (isJoinId alias), not (bs_root st)
+              , Just (side, list_ty, self_rhs) <- matchSuspendedProj (bs_susps st) sel_expr ->
+                  descend (st_inner { bs_projs = (alias, RhsTupleProj side list_ty self_rhs) : bs_projs st }) rest
+            Core.Let (Core.NonRec b bound) rest
+              | isId b, not (isUnliftedType (varType b)), not (isJoinId b)
+              , not (b `elemVarSet` exprsFreeVars [bound]) ->
+                  descend (st { bs_lets = (b, bound) : bs_lets st }) rest
+
+            Core.Case (Core.Var actual) _ case_res alts
+              | not (bs_root st), case_res `eqType` eff_result
+              , let scrut = resolveCaseAlias (bs_aliases st) actual
+              , scoped scrut, isJust (emptyCaseDatatype (varType scrut))
+              , case alts of { [] -> True; [Core.Alt Core.DEFAULT [] _] -> True; _ -> False } ->
+                  pure ([], False)
+            Core.Case (Core.Var actual) binder case_res alts
+              | not (bs_root st), let scrut = resolveCaseAlias (bs_aliases st) actual
+              , Just (dc, _, fields) <- lookup scrut (bs_known st)
+              , varType binder `eqType` varType actual, case_res `eqType` eff_result
+              , Just (Core.Alt key actual_fs rhs_e) <- findAlt (Core.DataAlt dc) alts ->
+                  case key of
+                    Core.DEFAULT | null actual_fs ->
+                      descend (st_inner { bs_aliases = (binder, scrut) : bs_aliases st }) rhs_e
+                    Core.DataAlt chosen | chosen == dc, all isId actual_fs, eqTypes (map varType actual_fs) (map varType fields) ->
+                      descend (st_inner { bs_aliases = (binder, scrut) : zip actual_fs fields ++ bs_aliases st }) rhs_e
+                    _ -> Nothing
+            Core.Case (Core.Var actual) binder case_res raw_alts
+              | let scrut = resolveCaseAlias (bs_aliases st) actual
+              , scoped scrut, varType binder `eqType` varType actual, case_res `eqType` eff_result -> do
+                  (tc, args) <- caseDatatype (varType scrut)
+                  guard (public tc && all public_kind args)
+                  (in_scope', alts) <- expandCaseDefaults (bs_scope st) (not (ccs_partial_root spec)) tc args raw_alts
+                  let st_br = st_inner { bs_scope = in_scope', bs_aliases = (binder, scrut) : bs_aliases st }
+                  checked_alts <- traverse (checkAlt (ccs_partial_root spec && bs_root st) st_br scrut tc args) alts
+                  let (dcs, row_lists, build_flags) = unzip3 checked_alts
+                  guard (completeCase tc dcs)
+                  pure (concat row_lists, or build_flags)
+
+            Core.Case test g_binder case_res [Core.Alt (Core.DataAlt no_dc) [] no_e, Core.Alt (Core.DataAlt yes_dc) [] yes_e]
+              | ccs_allow_guard spec, not (bs_root st), no_dc == falseDataCon, yes_dc == trueDataCon
+              , case_res `eqType` eff_result, varType g_binder `eqType` boolTy
+              , null (bs_susps st), null (bs_projs st) -> do
+                  guard_spec <- matchGuardSpec st test
+                  let st_arm = st_inner { bs_susps = [], bs_projs = [] }
+                  ([CompiledCoreRow _ no_rhs], b1) <- descend st_arm no_e
+                  ([CompiledCoreRow _ yes_rhs], b2) <- descend st_arm yes_e
+                  guard (not (rhsHasCallbackGuard no_rhs || rhsHasCallbackGuard yes_rhs ||
+                              rhsHasPredicateGuard no_rhs || rhsHasPredicateGuard yes_rhs))
+                  pure ([CompiledCoreRow (bs_pats st) (RhsGuard guard_spec no_rhs yes_rhs)], b1 || b2)
+
+            _ | not (bs_root st), isJust (matchAbsurdLeaf (bs_aliases st) scoped body) -> pure ([], False)
+              | not (bs_root st) || ccs_allow_zero_cases spec -> do
+                  (leaf, used_b) <- checkLeaf [] False True st eff_result body
+                  guard ((null (bs_susps st) || rhsHasTupleProj leaf) &&
+                         all (\(a, _) -> isNothing (lookup a (bs_lets st))) (bs_projs st))
+                  let norm_leaf = case unboxed_pair_mode of
+                        Just list_ty | RhsCon dc _ cs <- leaf, dc == tupleDataCon Unboxed 2 ->
+                          RhsCon (tupleDataCon Boxed 2) [list_ty, list_ty] cs
+                        _ -> leaf
+                  pure ([CompiledCoreRow (bs_pats st) norm_leaf], used_b)
+              | otherwise -> Nothing
+
+        checkAlt partial_here st scrut tc args (Core.Alt (Core.DataAlt dc) fields alt_body) = do
+          guard (dataConTyCon dc == tc && dataConUserTyVars dc == dataConUnivTyVars dc)
+          let domain = mkTyConApp tc args; kinds = map varType fields
+          if isRetainedCaseRoot domain tc
+            then guard (all isNativeOpaqueValueId fields && Core.nativeIndexArgKinds dc args (map TermVarTy fields) &&
+                        all (publicFieldKind dc allowed_kinds (map TermVarTy fields) public) kinds)
+            else do
+              expected <- openDataConFieldTypes dc args
+              guard (all isId fields && eqTypes kinds expected && all public_kind kinds)
+          let replace (PatVar v) | v == scrut = (True, PatCon dc args (map PatVar fields))
+              replace pat@PatVar{} = (False, pat)
+              replace (PatCon con tys cs) = let (fs, cs') = unzip (map replace cs) in (or fs, PatCon con tys cs')
+              (replaced, patterns') = unzip (map replace (bs_pats st))
+          guard (or replaced)
+          let sub_res = descend (st { bs_pats = patterns', bs_known = (scrut, (dc, args, fields)) : bs_known st }) alt_body
+          if partial_here
+            then case sub_res of
+              Just ([row@(CompiledCoreRow lhs _)], b) | equalLength lhs patterns', and (zipWith samePat lhs patterns') ->
+                pure (dc, [row], b)
+              _ -> pure (dc, [], False)
+            else (\(rows, b) -> (dc, rows, b)) <$> sub_res
+        checkAlt _ _ _ _ _ _ = Nothing
+
+        matchGuardSpec st test = matchCallback <|> matchPred
+          where
+            matchCallback = do
+              [PatVar p, PatCon dc _ [PatVar x, PatVar xs]] <- pure (bs_pats st)
+              (Core.Var pred_fn, [Core.Var arg_v]) <- pure (Core.collectArgs (stripTicksE isSourceBreakpoint test))
+              guard (dc == consDataCon && resolveCaseAlias (bs_aliases st) pred_fn == p &&
+                     resolveCaseAlias (bs_aliases st) arg_v == x)
+              pure (CallbackGuard p x xs)
+            matchPred = do
+              (Core.Var callee, arguments) <- pure (Core.collectArgs (stripTicksE isSourceBreakpoint test))
+              table <- ccs_predicate spec callee
+              let (type_args, fields) = splitAt (helperInvisibleArity table) arguments
+                  st_pred = st { bs_known = [], bs_susps = [], bs_projs = [] }
+              args <- coreTypeArgs type_args
+              guard (all public_kind args)
+              (input_kinds, result_kind) <- helperKinds table args
+              guard (result_kind `eqType` boolTy && lengthIs fields (length input_kinds))
+              children_pairs <- zipWithM (checkLeaf [] False False st_pred) input_kinds fields
+              let (children, b_flags) = unzip children_pairs
+              PredicateGuard (RhsCall table args children) <$ guard (not (or b_flags))
+
+        checkSelfCall st expr = checkSpecCall <|> checkDirectOrLocal
+          where
+            patterns = bs_pats st; aliases = bs_aliases st
+            checkSpecCall = do
+              worker <- ccs_spec_worker spec
+              [_, other] <- pure terms
+              [first@(PatCon con _ [PatVar hd, PatVar tl]), second] <- pure patterns
+              (Core.Var callee, Core.Type x : Core.Type y : operands) <- pure (Core.collectArgs expr)
+              guard (con == consDataCon && callee == worker && eqTypes [x, y] q_tys)
+              [a_hd, a_tl, a_other] <- traverse (\case Core.Var v -> Just (resolveCaseAlias aliases v); _ -> Nothing) operands
+              guard (a_hd == hd && a_tl == tl)
+              (True, smaller) <- recursiveOperand (other, second) a_other
+              pure (RhsSelf q_tys (map patToRhs [first, smaller]), False)
+
+            checkDirectOrLocal = do
+              (Core.Var callee, raw_args) <- pure (Core.collectArgs expr)
+              operands <- if callee == target_loop
+                then do
+                  let (kind_args, val_args) = splitAt (length q_tys) raw_args
+                  tys <- coreTypeArgs kind_args
+                  val_args <$ guard (eqTypes tys q_tys && equalLength val_args terms)
+                else case mb_local_worker of
+                  Just (w_id, carried) | callee == w_id -> do
+                    guard (not (any Core.isTyCoArg raw_args) && length carried + length raw_args == length terms)
+                    pure (map Core.Var carried ++ raw_args)
+                  _ -> Nothing
+              checked <- zipWithM checkRecArg (zip terms patterns) operands
+              let (dec_flags, rhs_args, build_flags) = unzip3 checked
+              guard (or dec_flags)
+              when (length [() | PatCon{} <- patterns] == 1 && not (ccs_allow_accum_self spec)) $
+                forM_ (zip3 terms patterns checked) $ \(orig, pat, (dec, _, _)) -> when dec $ case pat of
+                  PatCon _ _ children ->
+                    guard $ not $ null [v | Core.Var raw_v <- operands, let v = resolveCaseAlias aliases raw_v
+                                          , any (\case PatVar c -> c == v; _ -> False) children, varType v `eqType` varType orig]
+                  _ -> Nothing
+              pure (RhsSelf q_tys rhs_args, or build_flags)
+
+            checkRecArg (orig, pat) arg_e
+              | Core.Var raw_v <- stripTicksE isSourceBreakpoint arg_e = do
+                  (dec, sub_pat) <- recursiveOperand (orig, pat) (resolveCaseAlias aliases raw_v)
+                  pure (dec, patToRhs sub_pat, False)
+              | ccs_allow_accum_self spec, PatVar _ <- pat = do
+                  (acc_rhs, used_b) <- checkLeaf [] True True (st { bs_known = [] }) (varType orig) arg_e
+                  pure (False, acc_rhs, used_b)
+              | otherwise = Nothing
+
+            recursiveOperand (orig, pat) field
+              | field == orig = Just (False, pat)
+              | PatCon _ _ cs <- pat, varType field `eqType` varType orig, any (hasPatVar field) cs = Just (True, PatVar field)
+              | otherwise = Nothing
+            patToRhs (PatVar v)        = RhsVar v
+            patToRhs (PatCon dc ts fs) = RhsCon dc ts (map patToRhs fs)
+
+        checkLeaf seen under_con allow_full st expected raw_expr = do
+          let expr = stripTicksE isSourceBreakpoint raw_expr
+              scoped v = any (hasPatVar v) (bs_pats st)
+          guard (exprType expr `eqType` expected)
+          case splitTyConApp_maybe expected of
+            Just (tc, [el]) | tc == listTyCon, Just built <- unwrapBuildExpr el expr -> do
+              (res, _) <- checkLeaf seen under_con allow_full st expected built
+              pure (res, True)
+            _ -> checkNonBuild seen under_con scoped expr
+          where
+            checkNonBuild seen_vs under_c scoped expr =
+              (do guard under_c
+                  (side, list_ty, self_rhs) <- matchSuspendedProj (bs_susps st) expr
+                  (RhsTupleProj side list_ty self_rhs, False) <$ guard (list_ty `eqType` expected)) <|>
+              (case Core.collectArgs expr of
+                (Core.Var out_v, []) | isNothing (isDataConWorkId_maybe out_v) ->
+                  let sel = resolveCaseAlias (bs_aliases st) out_v
+                  in (guard (scoped sel && varType sel `eqType` expected) $> (RhsVar sel, False)) <|>
+                     (guard under_c *> ((, False) <$> lookup out_v (bs_projs st))) <|>
+                     ((, False) <$> reconstructKnown scoped (bs_known st) sel) <|>
+                     (do guard (out_v `notElem` seen_vs)
+                         bound <- lookup out_v (bs_lets st) <|>
+                                  (guard (not (isExternalName (idName out_v))) *> lookup out_v (ccs_bindings spec))
+                         checkLeaf (out_v : seen_vs) under_c allow_full st expected bound)
+
+                (Core.Var worker, args)
+                  | allow_full, Just list_ty <- unboxed_pair_mode, not under_c
+                  , worker == dataConWorkId (tupleDataCon Unboxed 2)
+                  , expected `eqType` mkTupleTy Unboxed [list_ty, list_ty]
+                  , (_, [f1, f2]) <- span Core.isTypeArg args -> do
+                      (c1, b1) <- checkLeaf seen_vs True allow_full st list_ty f1
+                      (c2, b2) <- checkLeaf seen_vs True allow_full st list_ty f2
+                      pure (RhsCon (tupleDataCon Unboxed 2) [list_ty, list_ty] [c1, c2], b1 || b2)
+
+                (Core.Var worker, arguments) | Just dc <- isDataConWorkId_maybe worker -> do
+                  let tc = dataConTyCon dc; universals = dataConUnivTyVars dc
+                      (type_args, fields) = splitAt (length universals) arguments
+                  guard (public tc && dataConUserTyVars dc == universals)
+                  args <- coreTypeArgs type_args
+                  guard (all public_kind args && mkTyConApp tc args `eqType` expected)
+                  kinds <- openDataConFieldTypes dc args
+                  guard (lengthIs fields (length kinds))
+                  (children, b_flags) <- unzip <$> zipWithM (checkLeaf seen_vs True allow_full st) kinds fields
+                  pure (RhsCon dc args children, or b_flags)
+
+                (Core.Var callee, arguments) | Just table <- ccs_helper spec callee -> do
+                  let (type_args, fields) = splitAt (helperInvisibleArity table) arguments
+                  args <- coreTypeArgs type_args
+                  guard (all public_kind args)
+                  (input_kinds, result_kind) <- helperKinds table args
+                  guard (result_kind `eqType` expected && lengthIs fields (length input_kinds))
+                  (children, b_flags) <- unzip <$>
+                    zipWithM (checkLeaf seen_vs (under_c || ccs_allow_call_self spec) allow_full st) input_kinds fields
+                  pure (RhsCall table args children, or b_flags)
+
+                _ ->
+                  (guard (allow_full && (under_c || ccs_allow_tail_self spec)) *> checkSelfCall st expr) <|>
+                  (do guard (allow_full && (under_c || ccs_allow_top_apply spec))
+                      (Core.Var raw_fn, val_args@(_ : _)) <- pure (Core.collectArgs expr)
+                      let fn = resolveCaseAlias (bs_aliases st) raw_fn
+                      guard (scoped fn && not (any Core.isTyCoArg val_args))
+                      (arg_doms, fn_res) <- peelFunArgs (length val_args) (varType fn)
+                      guard (fn_res `eqType` expected)
+                      (rhs_args, b_flags) <- unzip <$> zipWithM (checkLeaf seen_vs True allow_full st) arg_doms val_args
+                      pure (RhsApply fn rhs_args, or b_flags)))
+
+    (rows, used_build) <- descend init_st body0
+    guard (not (null rows))
+    forM_ (ccs_witness_root spec) $ \con -> do
+      [CompiledCoreRow [PatCon actual _ (PatVar witness : payloads)] (RhsVar value)] <- pure rows
+      guard (actual == con && value == witness && all isPatVar payloads)
+    pure CompiledCoreTable
+      { cct_binders    = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope declared_tele
+      , cct_domains    = domains
+      , cct_result     = result
+      , cct_rows       = rows
+      , cct_used_build = used_build
+      }
+  where
+    ($>) = flip (<$)
+
+    collectValueLams (Core.Lam v e) | isId v = let (vs, rest) = collectValueLams e in (v : vs, rest)
+    collectValueLams e = ([], e)
+
+    unwrapWorkerWrapper parameters prefix_terms domains result raw_body
+      | length prefix_terms == length domains, [p, ls] <- prefix_terms
+      , Just (root, [_]) <- caseDatatype (varType ls), root == listTyCon
+      , result `eqType` mkTupleTy Boxed [varType ls, varType ls]
+      , Just call <- reboxedCall (varType ls) raw_body
+      , Just worker <- guardedPairCall (mkTyVarTys parameters) p ls call, worker /= owner
+      , Just w_expr <- lookup worker (ccs_bindings spec)
+      , let w_rhs = stripTicksE isSourceBreakpoint w_expr, exprType w_rhs `eqType` varType worker
+      , let (w_lams, w_body) = Core.collectBinders w_rhs
+            (w_tvs, w_terms) = splitAt (length parameters) w_lams
+      , lengthIs w_tvs (length parameters), all isTyVar w_tvs, lengthIs w_terms 2, all isId w_terms
+      , let subst_in_scope = mkInScopeSet (exprsFreeVars [w_rhs, raw_body])
+            w_terms' = [setIdType v (substTyWith w_tvs (mkTyVarTys parameters) (varType v)) | v <- w_terms]
+            full_sub = CoreSubst.mkOpenSubst subst_in_scope
+                         ([(tv, Core.Type (mkTyVarTy p_tv)) | (tv, p_tv) <- zip w_tvs parameters] ++
+                          [(old_v, Core.Var new_v) | (old_v, new_v) <- zip w_terms w_terms'])
+            inst_body = stripTicksE isSourceBreakpoint (CoreSubst.substExpr full_sub w_body)
+      , eqTypes (map varType w_terms') domains
+      = Just (w_terms', [], Nothing, worker, Just (varType (w_terms' !! 1)), inst_body)
+
+      | Core.Let (Core.Rec [(worker, worker_rhs)]) invoke <- raw_body
+      , (Core.Var invoked, invoke_args) <- Core.collectArgs invoke, invoked == worker
+      , Just supplied <- traverse (\case Core.Var v -> Just v; _ -> Nothing) invoke_args
+      , let n_carried = length prefix_terms - length supplied, n_carried >= 0
+      , drop n_carried prefix_terms == supplied
+      , let carried = take n_carried prefix_terms; (w_params, w_body) = collectValueLams worker_rhs
+      , not (null w_params), length carried + length w_params == length domains
+      , eqTypes (map varType (carried ++ w_params)) domains
+      = Just (carried ++ w_params, zip supplied w_params, Just (worker, carried), owner, Nothing, w_body)
+
+      | length prefix_terms == length domains = Just (prefix_terms, [], Nothing, owner, Nothing, raw_body)
+      | otherwise = Nothing
+
+    expandCaseDefaults in_scope True tc args (Core.Alt Core.DEFAULT [] def_body : rest) | not (null rest) = do
+      let explicit = [dc | Core.Alt (Core.DataAlt dc) _ _ <- rest]
+          missing = filter (`notElem` explicit) (tyConDataCons tc)
+          alloc sc [] = Just (sc, [])
+          alloc sc (fty : ftys) = do
+            let v' = uniqAway sc (mkSysLocal (fsLit "def") minLocalUnique ManyTy fty)
+            (sc'', vs) <- alloc (extendInScopeSet sc v') ftys
+            pure (sc'', v' : vs)
+          build sc [] = Just (sc, [])
+          build sc (dc : dcs) = do
+            ftys <- openDataConFieldTypes dc args
+            (sc', fs) <- alloc sc ftys
+            (sc'', more) <- build sc' dcs
+            pure (sc'', Core.Alt (Core.DataAlt dc) fs def_body : more)
+      guard (equalLength explicit rest && not (null missing))
+      (in_scope', inferred) <- build in_scope missing
+      pure (in_scope', mergeAlts rest inferred)
+    expandCaseDefaults in_scope _ _ _ alts = Just (in_scope, alts)
+
+    samePat (PatVar a) (PatVar b) = a == b
+    samePat (PatCon c1 _ fs1) (PatCon c2 _ fs2) = c1 == c2 && equalLength fs1 fs2 && and (zipWith samePat fs1 fs2)
+    samePat _ _ = False
+
+    publicFieldKind dc parameters fields public kind
+      | Just (family, index) <- splitAppTy_maybe kind, any (eqType family) parameters, any (eqType index) fields = True
+      | Just dc == ccs_witness_root spec = caseKind (parameters ++ fields) kind
+      | otherwise = casePublicKind public (parameters ++ fields) kind
+
+    matchAbsurdLeaf aliases scoped expr
+      | (Core.Var f, args) <- Core.collectArgs expr
+      , (_ : _, [Core.Var raw_v]) <- span Core.isTypeArg args
+      , Just m <- nameModule_maybe (idName f), moduleUnitId m == ghcInternalUnitId
+      , occNameString (nameOccName (idName f)) == "absurd"
+      , let v = resolveCaseAlias aliases raw_v
+      , scoped v, isJust (emptyCaseDatatype (varType v)) = Just v
+      | otherwise = Nothing
+
+    matchSuspendedProj susp_pairs expr = do
+      Core.Case (Core.Var pair_v) _ kind [Core.Alt (Core.DataAlt con) [first, second] (Core.Var sel)] <-
+        pure (stripTicksE isSourceBreakpoint expr)
+      (list_ty, self_rhs) <- lookup pair_v susp_pairs
+      guard (con == tupleDataCon Boxed 2 && kind `eqType` list_ty)
+      side <- if sel == first then Just CLeft else if sel == second then Just CRight else Nothing
+      pure (side, list_ty, self_rhs)
+
+    reconstructKnown scoped known u
+      | scoped u = Just (RhsVar u)
+      | Just (dc, c_args, fs) <- lookup u known = RhsCon dc c_args <$> traverse (reconstructKnown scoped known) fs
+      | otherwise = Nothing
+
+    unwrapBuildExpr el expr
+      | ccs_allow_build spec
+      , (Core.Var b_id, [Core.Type b_el, Core.Lam tv (Core.Lam c_id (Core.Lam n_id alg))]) <- Core.collectArgs expr
+      , nameModule_maybe (idName b_id) == Just gHC_INTERNAL_BASE
+      , occNameString (nameOccName (idName b_id)) == "build"
+      , b_el `eqType` el, isTyVar tv, isId c_id, isId n_id = expandAlg c_id n_id (stripTicksE isSourceBreakpoint alg)
+      | otherwise = Nothing
+      where
+        expandAlg _ n_id (Core.Var v) | v == n_id = Just (Core.mkConApp nilDataCon [Core.Type el])
+        expandAlg c_id n_id e
+          | (Core.Var hd_fn, [item, rest]) <- Core.collectArgs e, hd_fn == c_id =
+              (\r -> Core.mkConApp consDataCon [Core.Type el, item, r]) <$> expandAlg c_id n_id (stripTicksE isSourceBreakpoint rest)
+        expandAlg _ _ _ = Nothing
+
+    helperKinds table args = do
+      let (invisible, visible) = span isInvisibleTyConBinder (tyConBinders table)
+          vars = binderVars invisible; inst = substTyWith vars args
+      guard (lengthIs args (length vars) && not (null visible) &&
+             and (zipWith eqType (map typeKind args) (map (inst . varType) vars)))
+      kinds <- traverse (\case Bndr v AnonTCB -> Just (varType v); _ -> Nothing) visible
+      pure (map inst kinds, inst (tyConResKind table))
+
+    peelFunArgs 0 ty = Just ([], ty)
+    peelFunArgs n ty = do
+      (dom, rest) <- caseArrow ty
+      (\(ds, out) -> (dom : ds, out)) <$> peelFunArgs (n - 1) rest
+
+guardedPairCall :: [Type] -> Id -> Id -> Core.CoreExpr -> Maybe Id
+guardedPairCall types predicate input value = do
+    (Core.Var function, args) <- pure (Core.collectArgs value)
+    let (kind_args, terms) = span Core.isTypeArg args
+    [Core.Var p, Core.Var ls] <- pure terms
+    function <$ guard (p == predicate && ls == input && eqTypes (map Core.exprToType kind_args) types)
+
+reboxedCall :: Type -> Core.CoreExpr -> Maybe Core.CoreExpr
+reboxedCall list expr = do
+    Core.Case call _ result [Core.Alt (Core.DataAlt con) [first, second] rhs] <- pure expr
+    (Core.Var worker, args) <- pure (Core.collectArgs rhs)
+    (_, [Core.Var left, Core.Var right]) <- pure (span Core.isTypeArg args)
+    call <$ guard (con == tupleDataCon Unboxed 2 && result `eqType` mkTupleTy Boxed [list, list] &&
+                   exprType call `eqType` mkTupleTy Unboxed [list, list] &&
+                   worker == dataConWorkId (tupleDataCon Boxed 2) && left == first && right == second)
+
+guardedListProjections :: Type -> TcM (Maybe (TyCon, TyCon))
+guardedListProjections list = do
+    envs <- tcGetFamInstEnvs
+    left <- mkTyVarTy <$> freshSysTyVar "field" list
+    right <- mkTyVarTy <$> freshSysTyVar "field" list
+    let inputs = [list, list, mkTyConApp (promotedTupleDataCon Boxed 2) [list, list, left, right]]
+        projection occ selected = do
+          projected <- lookupBootModuleIdMaybe (mkGhcInternalModule (fsLit "GHC.Internal.Data.Tuple")) (mkVarOcc occ)
+          pure $ do
+            table <- projected >>= sourceTableId_maybe
+            guard (sourceCaseVisibleArity table == Just 1)
+            reduced <- reduceTyFamApp_maybe envs Nominal table inputs
+            table <$ guard (reductionReducedType reduced `eqType` selected)
+    (\a b -> (,) <$> a <*> b) <$> projection "fst" left <*> projection "snd" right
+
+publishCompiledTable :: Id -> CompiledCoreTable -> TcM TyCon
+publishCompiledTable owner cct = publishCompiledWithGuard owner cct >>= \case
+    Just (table, []) -> pure table
+    _ -> pprPanic "publishCompiledTable: unexpected guard or invalid branches" (ppr owner)
+
+publishCompiledWithGuard :: Id -> CompiledCoreTable -> TcM (Maybe (TyCon, [TyCon]))
+publishCompiledWithGuard owner cct = do
+    let telescope = cct_binders cct; domains = cct_domains cct; result = cct_result cct; rows = cct_rows cct
+        term = idName owner; loc = nameSrcSpan term
+    mb_projs <- case [l | CompiledCoreRow _ r <- rows, Just l <- [findProjListTy r]] of
+      l : _ -> guardedListProjections l
+      []    -> pure (Just (listTyCon, listTyCon))
+    case mb_projs of
+      Nothing -> pure Nothing
+      Just projs -> do
+        (renaming, quantifiers) <- freshenTyVarBndrs (binderVars telescope)
+        let kind_binders = zipWith mkNamedTyConBinder (map binderFlag telescope) quantifiers
+            instantiate = substTyUnchecked renaming . expandTypeSynonyms
+            q_tys = mkTyVarTys quantifiers; inst_res = instantiate result
+        operands <- mapM (freshSysTyVar "arg" . instantiate) domains
+        mb_guard <- if any (\(CompiledCoreRow _ r) -> rhsHasCallbackGuard r) rows
+          then Just . Left <$> allocateCallbackGuard term kind_binders instantiate domains
+          else if any (\(CompiledCoreRow _ r) -> rhsHasPredicateGuard r) rows
+          then Just . Right <$> publishBooleanSelector owner inst_res
+          else pure Nothing
+        built <- forM rows $ \(CompiledCoreRow patterns rhs) -> do
+          (lhs_pats, scoped) <- publishPats instantiate [] patterns
+          let fields = reverse scoped
+          pure (quantifiers ++ map snd fields, lhs_pats, fields, rhs)
+        let checkValid = all (all isTyFamFree . coAxBranchLHS)
+            branchesOf tc = maybe [] (fromBranches . coAxiomBranches) (closedFamilyTyConCoAxiom_maybe tc)
+            hdr = kind_binders ++ mkAnonTyConBinders operands
+        case mb_guard of
+          Nothing -> do
+            let mk_br (vars, lhs_pats, fields, rhs) fam =
+                  mkCoAxBranch vars [] [] (q_tys ++ lhs_pats) (translateRhs fam projs instantiate fields rhs)
+                    (map (const Nominal) vars) loc
+            table <- makeSourceFamily term hdr inst_res (map mk_br built)
+            pure (if checkValid (branchesOf table) then Just (table, []) else Nothing)
+          Just (Right select) -> do
+            let mk_br (vars, lhs_pats, fields, rhs) fam =
+                  let rhs_ty = case rhs of
+                        RhsGuard (PredicateGuard pr) nr yr ->
+                          mkTyConApp select (map (translateRhs fam projs instantiate fields) [pr, nr, yr])
+                        _ -> translateRhs fam projs instantiate fields rhs
+                  in mkCoAxBranch vars [] [] (q_tys ++ lhs_pats) rhs_ty (map (const Nominal) vars) loc
+            table <- makeSourceFamily term hdr inst_res (map mk_br built)
+            pure (if checkValid (branchesOf table) then Just (table, [select]) else Nothing)
+          Just (Left (g_name, g_ax, g_binders)) -> do
+            root_name <- newImplicitBinder term mkSourceTableOcc
+            root_ax <- newImplicitBinder root_name mkInstTyCoOcc
+            case built of
+              [(nil_vars, nil_pats, nil_fs, nil_rhs),
+               (cons_vars, cons_pats, cons_fs, RhsGuard (CallbackGuard p_id x_id xs_id) no_r yes_r)]
+                | Just [p_tv, x_tv, xs_tv] <- traverse (`lookup` cons_fs) [p_id, x_id, xs_id] -> do
+                    let p_ty = mkTyVarTy p_tv; x_ty = mkTyVarTy x_tv; xs_ty = mkTyVarTy xs_tv
+                        g_tvs = quantifiers ++ [p_tv, x_tv, xs_tv]
+                        mkG con arm _ = mkCoAxBranch g_tvs [] [] (q_tys ++ [mkTyConTy (promoteDataCon con), p_ty, x_ty, xs_ty])
+                                          (translateRhs spine projs instantiate cons_fs arm) (map (const Nominal) g_tvs) loc
+                        spine = buildSourceFamily root_name root_ax hdr inst_res
+                                  [ \_ -> mkCoAxBranch nil_vars [] [] (q_tys ++ nil_pats)
+                                            (translateRhs spine projs instantiate nil_fs nil_rhs) (map (const Nominal) nil_vars) loc
+                                  , \_ -> mkCoAxBranch cons_vars [] [] (q_tys ++ cons_pats)
+                                            (mkTyConApp guard_tc (q_tys ++ [mkAppTy p_ty x_ty, p_ty, x_ty, xs_ty]))
+                                            (map (const Nominal) cons_vars) loc ]
+                        guard_tc = buildSourceFamily g_name g_ax g_binders inst_res [mkG falseDataCon no_r, mkG trueDataCon yes_r]
+                    pure (if checkValid (concatMap branchesOf [spine, guard_tc]) then Just (spine, [guard_tc]) else Nothing)
+              _ -> pure Nothing
+  where
+    findProjListTy (RhsTupleProj _ l _)    = Just l
+    findProjListTy (RhsCon _ _ args)       = listToMaybe (mapMaybe findProjListTy args)
+    findProjListTy (RhsCall _ _ args)      = listToMaybe (mapMaybe findProjListTy args)
+    findProjListTy (RhsApply _ args)       = listToMaybe (mapMaybe findProjListTy args)
+    findProjListTy (RhsGuard _ no_r yes_r) = findProjListTy no_r <|> findProjListTy yes_r
+    findProjListTy _                       = Nothing
+
+    allocateCallbackGuard term kind_binders instantiate [pred_dom, list_dom] = do
+      let pred_k = instantiate pred_dom; list_k = instantiate list_dom
+          el_k = case caseDatatype list_k of { Just (_, [e]) -> e; _ -> liftedTypeKind }
+      g_ops <- mapM (freshSysTyVar "arg") [boolTy, pred_k, el_k, list_k]
+      g_name <- newImplicitBinder term filterGuardOcc
+      g_ax <- newImplicitBinder g_name mkInstTyCoOcc
+      pure (g_name, g_ax, kind_binders ++ mkAnonTyConBinders g_ops)
+    allocateCallbackGuard term _ _ _ = pprPanic "allocateCallbackGuard" (ppr term)
+
+    publishPats _ scoped [] = pure ([], scoped)
+    publishPats instantiate scoped (p : ps) = do
+      (t, s') <- publishPat instantiate scoped p
+      (ts, s'') <- publishPats instantiate s' ps
+      pure (t : ts, s'')
+
+    publishPat instantiate scoped (PatVar ident) = do
+      let kind = instantiate (varType ident)
+          indices = [(TermVarTy runtime, tv) | (runtime, tv) <- scoped]
+          checked_k
+            | not (anyFreeVarsOfType isId kind) = kind
+            | Just abstracted <- abstractNativeIndices indices kind, not (anyFreeVarsOfType isId abstracted) = abstracted
+            | otherwise = panic "publishCompiledWithGuard: unchecked field kind"
+          occ_str = occNameString (nameOccName (varName ident))
+      field <- flip mkTyVar checked_k <$> newSysName (mkTyVarOcc (if null occ_str then "field" else occ_str))
+      pure (mkTyVarTy field, (ident, field) : scoped)
+    publishPat instantiate scoped (PatCon dc params children) = do
+      (fs, s') <- publishPats instantiate scoped children
+      pure (mkTyConApp (promoteDataCon dc) (map instantiate params ++ fs), s')
+
+translateRhs :: TyCon -> (TyCon, TyCon) -> (Type -> Type) -> [(Id, TyVar)] -> CoreRhs -> Type
+translateRhs family (fst_tc, snd_tc) instantiate fields = go
+  where
+    fieldTy sel = maybe (panic "translateRhs: unbound field") mkTyVarTy (lookup sel fields)
+    go (RhsVar sel)               = fieldTy sel
+    go (RhsCon dc args children)  = mkTyConApp (promoteDataCon dc) (map instantiate args ++ map go children)
+    go (RhsCall tc args children) = mkTyConApp tc (map instantiate args ++ map go children)
+    go (RhsSelf args children)    = mkTyConApp family (map instantiate args ++ map go children)
+    go (RhsApply fn args)         = mkAppTys (fieldTy fn) (map go args)
+    go (RhsTupleProj side l r)    = let il = instantiate l in mkTyConApp (pickLR side (fst_tc, snd_tc)) [il, il, go r]
+    go RhsGuard{}                 = panic "translateRhs: nested RhsGuard"
+
+publishBooleanSelector :: Id -> Type -> TcM TyCon
+publishBooleanSelector owner result = do
+    let term = idName owner; loc = nameSrcSpan term
+    binders <- traverse (uncurry freshSysTyVar) [("test", boolTy), ("no", result), ("yes", result)]
+    no <- freshSysTyVar "no" result; yes <- freshSysTyVar "yes" result
+    name <- newImplicitBinder term filterGuardOcc
+    axiom <- newImplicitBinder name mkInstTyCoOcc
+    let choose con sel _ = mkCoAxBranch [no, yes] [] [] (mkTyConTy (promoteDataCon con) : mkTyVarTys [no, yes])
+                             (mkTyVarTy sel) [Nominal, Nominal] loc
+    pure (buildSourceFamily name axiom (mkAnonTyConBinders binders) result [choose falseDataCon no, choose trueDataCon yes])
+
+makeSourceFamily :: Name -> [TyConBinder] -> Kind -> [TyCon -> CoAxBranch] -> TcM TyCon
+makeSourceFamily fun binders res_kind branches = do
+    name <- newImplicitBinder fun mkSourceTableOcc
+    ax_name <- newImplicitBinder name mkInstTyCoOcc
+    pure (buildSourceFamily name ax_name binders res_kind branches)
+
+buildSourceFamily :: Name -> Name -> [TyConBinder] -> Kind -> [TyCon -> CoAxBranch] -> TyCon
+buildSourceFamily name ax_name binders res_kind branches =
+    let fam_tc = mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy binders res_kind)
+                   binders 0 res_kind Nothing (ClosedTypeFamilyTyCon (CTF (Just axiom))) Nothing NotInjective
+        axiom = mkBranchedCoAxiom Nominal ax_name fam_tc (map ($ fam_tc) branches)
+    in fam_tc
+
+-- ---------------------------------------------------------------------------
+-- Canonical CoAxBranch equivalence & post-Simplifier verification (ST8)
+-- ---------------------------------------------------------------------------
+
+matchesCompiledTable :: TyCon -> Maybe TyCon -> CompiledCoreTable -> Bool
+matchesCompiledTable table mb_guard cct = isJust $ do
+    exp_branches <- fromBranches . coAxiomBranches <$> closedFamilyTyConCoAxiom_maybe table
+    let rows = cct_rows cct; telescope = cct_binders cct
+        projs = case mb_guard >>= sourceTableCallees of
+          Just cs -> let findOcc s = find (\tc -> occNameString (nameOccName (tyConName tc)) == s) cs
+                     in fromMaybe (listTyCon, listTyCon) ((,) <$> findOcc "T:fst" <*> findOcc "T:snd")
+          Nothing -> (listTyCon, listTyCon)
+    case mb_guard of
+      Nothing -> guard (equalLength rows exp_branches) >> zipWithM_ (matchRow table projs Nothing telescope) rows exp_branches
+      Just guard_tc
+        | Just sel <- booleanSelector table, sel == guard_tc ->
+            guard (equalLength rows exp_branches) >> zipWithM_ (matchRow table projs (Just sel) telescope) rows exp_branches
+        | otherwise -> do
+            [exp_no, exp_yes] <- fromBranches . coAxiomBranches <$> closedFamilyTyConCoAxiom_maybe guard_tc
+            [exp_nil, exp_cons] <- pure exp_branches
+            [nil_row, CompiledCoreRow cons_pats (RhsGuard (CallbackGuard p_id x_id xs_id) no_r yes_r)] <- pure rows
+            matchRow table projs Nothing telescope nil_row exp_nil
+            let (params, fields) = splitAt (length telescope) (coAxBranchTyVars exp_cons)
+                ids = concatMap patIds cons_pats
+                inst = substTyWith (binderVars telescope) (mkTyVarTys params)
+                f_map = zip ids fields
+            guard (equalLength params telescope && equalLength ids fields && eqTypes (map (inst . varType) ids) (map varType fields))
+            [p_tv, x_tv, xs_tv] <- traverse (`lookup` f_map) [p_id, x_id, xs_id]
+            let p_ty = mkTyVarTy p_tv; x_ty = mkTyVarTy x_tv; xs_ty = mkTyVarTy xs_tv
+            guard (coAxBranchRHS exp_cons `eqType` mkTyConApp guard_tc (mkTyVarTys params ++ [mkAppTy p_ty x_ty, p_ty, x_ty, xs_ty]))
+            matchGuardArm table projs telescope [p_id, x_id, xs_id] no_r exp_no
+            matchGuardArm table projs telescope [p_id, x_id, xs_id] yes_r exp_yes
+  where
+    matchRow fam projs mb_sel telescope (CompiledCoreRow pats rhs) branch = do
+      let (params, fields) = splitAt (length telescope) (coAxBranchTyVars branch)
+          ids = concatMap patIds pats
+          inst = substTyWith (binderVars telescope) (mkTyVarTys params)
+          f_map = zip ids fields
+          patToTy (PatVar v)          = mkTyVarTy <$> lookup v f_map
+          patToTy (PatCon dc c_as cs) = mkTyConApp (promoteDataCon dc) . (map inst c_as ++) <$> traverse patToTy cs
+          rhsToTy (RhsGuard (PredicateGuard pr) nr yr) | Just sel <- mb_sel =
+            mkTyConApp sel (map (translateRhs fam projs inst f_map) [pr, nr, yr])
+          rhsToTy r = translateRhs fam projs inst f_map r
+      guard (null (coAxBranchCoVars branch) && equalLength params telescope && equalLength ids fields &&
+             eqTypes (map (inst . varType) ids) (map varType fields))
+      lhs_tys <- traverse patToTy pats
+      guard (eqTypes (mkTyVarTys params ++ lhs_tys) (coAxBranchLHS branch) && rhsToTy rhs `eqType` coAxBranchRHS branch)
+
+    matchGuardArm fam projs telescope ids arm_r g_branch = do
+      let (g_params, g_fields) = splitAt (length telescope) (coAxBranchTyVars g_branch)
+          inst = substTyWith (binderVars telescope) (mkTyVarTys g_params)
+      guard (equalLength g_params telescope && equalLength ids g_fields &&
+             translateRhs fam projs inst (zip ids g_fields) arm_r `eqType` coAxBranchRHS g_branch)
+
+isValidMapperTable :: CompiledCoreTable -> Bool
+isValidMapperTable cct = case cct_rows cct of
+    [ CompiledCoreRow [PatVar _, PatCon nil _ []] (RhsCon r_nil _ [])
+      , CompiledCoreRow [PatVar cb, PatCon cons _ [PatVar h, PatVar t]]
+          (RhsCon r_cons _ [RhsApply f [RhsVar x], RhsSelf _ [RhsVar f', RhsVar xs]]) ] ->
+      all (== nilDataCon) [nil, r_nil] && all (== consDataCon) [cons, r_cons] && cb == f && cb == f' && h == x && t == xs
+    _ -> False
+
+isValidAppendTable :: CompiledCoreTable -> Bool
+isValidAppendTable cct = case cct_rows cct of
+    [ CompiledCoreRow [PatCon nil _ [], PatVar r1] (RhsVar ret)
+      , CompiledCoreRow [PatCon cons _ [PatVar h, PatVar t], PatVar r2]
+          (RhsCon r_cons _ [RhsVar h', RhsSelf _ [RhsVar t', RhsVar r2']]) ] ->
+      nil == nilDataCon && all (== consDataCon) [cons, r_cons] && r1 == ret && h == h' && t == t' && r2 == r2'
+    _ -> False
+
+isValidFoldTable :: CompiledCoreTable -> Bool
+isValidFoldTable cct = case cct_rows cct of
+    [ CompiledCoreRow [PatVar _, PatVar s1, PatCon nil _ []] (RhsVar ret)
+      , CompiledCoreRow [PatVar cb, PatVar s2, PatCon cons _ [PatVar h, PatVar t]]
+          (RhsApply f [RhsVar x, RhsSelf _ [RhsVar cb', RhsVar s2', RhsVar xs]]) ] ->
+      nil == nilDataCon && cons == consDataCon && s1 == ret && cb == f && cb == cb' && s2 == s2' && h == x && t == xs
+    _ -> False
+
+isValidReverseWorkerTable :: CompiledCoreTable -> Bool
+isValidReverseWorkerTable cct = case cct_rows cct of
+    [ CompiledCoreRow [PatCon nil _ [], PatVar a1] (RhsVar ret)
+      , CompiledCoreRow [PatCon cons _ [PatVar h, PatVar t], PatVar a2]
+          (RhsSelf _ [RhsVar t', RhsCon p_cons _ [RhsVar h', RhsVar a2']]) ] ->
+      nil == nilDataCon && all (== consDataCon) [cons, p_cons] && a1 == ret && h == h' && t == t' && a2 == a2'
+    _ -> False
+
+isValidZipTable :: CompiledCoreTable -> Bool
+isValidZipTable cct = case cct_rows cct of
+    [ CompiledCoreRow (_ : _) (RhsCon n1 _ [])
+      , CompiledCoreRow (_ : _) (RhsCon n2 _ [])
+      , CompiledCoreRow pats (RhsCon c _ [_, RhsSelf{}]) ] ->
+      all (== nilDataCon) [n1, n2] && c == consDataCon && length [() | PatCon dc _ _ <- pats, dc == consDataCon] == 2
+    _ -> False
+
+directListReverseWrapper :: Id -> Core.CoreExpr -> Maybe ([ForAllTyBinder], Id, Type, Id)
+directListReverseWrapper owner rhs = do
+    guard (exprType rhs `eqType` varType owner)
+    [Bndr _ visibility] <- listReverseWrapperType (varType owner)
+    ([core_element, input], body) <- pure (Core.collectBinders (stripTicksE isSourceBreakpoint rhs))
+    (Core.Var callee, [Core.Type kind, Core.Var operand, empty_e]) <- pure (Core.collectArgs body)
+    (Core.Var nil, [Core.Type nil_kind]) <- pure (Core.collectArgs empty_e)
+    guard (isTyVar core_element && isId input && kind `eqType` mkTyVarTy core_element && operand == input &&
+           nil == dataConWorkId nilDataCon && nil_kind `eqType` kind)
+    pure ([Bndr core_element visibility], input, kind, callee)
+
+compileZipCore :: (TyCon -> Bool) -> Id -> Core.CoreExpr -> Maybe CompiledCoreTable
+compileZipCore visible owner rhs = do
+    let ty = varType owner
+    guard (isJust (listZipWithType ty) || maybe False isTwoListCase (constructorCaseType ty))
+    cct <- compileCoreEquations ((defaultCoreSpec visible) { ccs_allow_top_apply = False, ccs_check_kind_public = True }) owner rhs
+    cct <$ guard (isValidZipTable cct)
+
+compileStructuralCore :: (TyCon -> Bool) -> Id -> Core.CoreExpr -> Maybe CompiledCoreTable
+compileStructuralCore visible owner rhs = do
+    sig@(ConstructorCaseType _ _ _ _ pos _) <- constructorCaseType (varType owner)
+    guard (isTwoStructuralCase sig || isSizeListCase sig)
+    cct <- compileCoreEquations ((defaultCoreSpec visible) { ccs_allow_tail_self = isTwoStructuralCase sig }) owner rhs
+    let checksOther 0 (CompiledCoreRow [_, PatCon{}] _) = True
+        checksOther 1 (CompiledCoreRow [PatCon{}, _] _) = True
+        checksOther _ _                                 = False
+    cct <$ guard (any (checksOther pos) (cct_rows cct))
+
+verifyFinalCoreMapper :: [Core.CoreBind] -> Id -> Bool
+verifyFinalCoreMapper binds original =
+    case [p | p@(v, _) <- bindings, idName v == idName original] of
+      [(owner, expression)]
+        | not (varType owner `eqType` varType original) -> False
+        | isIdentitySourceType (varType owner) -> verifyIdentity (unitNameSet (idName owner)) owner expression
+        | isJust (compositionSourceType (varType owner)), Just table <- sourceTableId_maybe original ->
+            matchesSpec ((defaultCoreSpec (const True))
+              { ccs_allow_zero_cases = True, ccs_allow_top_apply = True, ccs_check_kind_public = False })
+              table Nothing owner expression
+        | Just table <- sourceTableId_maybe original, isFinalCoreCaseTable table ->
+            checkedFinalCaseTable bindings table
+        | Just (_, constructors) <- indexedProjectionSource original ->
+            maybe False (\(_, rec_row) -> lengthIs constructors 1 || isJust rec_row)
+              (checkedIndexedProjection id owner expression)
+        | otherwise -> case finalCoreSourceFamilies original of
+            [table] -> case compileCoreEquations ((defaultCoreSpec (const False)) { ccs_check_kind_public = False }) owner expression of
+              Just cct -> (isValidMapperTable cct || isValidAppendTable cct) && matchesCompiledTable table Nothing cct
+              Nothing  -> False
+            [table, guard_tc] ->
+              matchesSpec ((defaultCoreSpec (const True))
+                { ccs_bindings = bindings, ccs_allow_guard = True, ccs_allow_tail_self = True, ccs_check_kind_public = False })
+                table (Just guard_tc) owner expression
+            _ -> False
+      _ -> False
+  where
+    bindings = Core.flattenBinds binds
+    matchesSpec s t g o e = maybe False (matchesCompiledTable t g) (compileCoreEquations s o e)
+    verifyIdentity seen owner (Core.Var target)
+      | not (idName target `elemNameSet` seen), varType target `eqType` varType owner
+      , Just rhs <- lookup target bindings = verifyIdentity (extendNameSet seen (idName target)) target rhs
+    verifyIdentity _ owner expression =
+      case compileCoreEquations ((defaultCoreSpec (const False)) { ccs_allow_zero_cases = True }) owner expression of
+        Just cct | [CompiledCoreRow [PatVar x] (RhsVar y)] <- cct_rows cct -> x == y
+        _ -> False
+
+failedFinalListTables :: [Core.CoreBind] -> [Core.CoreBind] -> [TyCon] -> [TyCon]
+failedFinalListTables original binds tables =
+    [table | table <- tables, isFinalCoreListCaseTable table
+           , not (tyConName table `elemNameSet` early), not (checkedFinalCaseTable (Core.flattenBinds binds) table)]
+  where
+    early = mkNameSet [tyConName t | bind <- original, o <- Core.bindersOf bind, SourceTableId _ t NominalSourceTable <- [idDetails o]]
+
+checkedFinalCaseTable :: [(Id, Core.CoreExpr)] -> TyCon -> Bool
+checkedFinalCaseTable bindings table = isJust $ do
+    (owner, rhs) <- find (owns table . fst) bindings
+    guard (sourceTableId_maybe owner == Just table)
+    let base_spec = (defaultCoreSpec (const True)) { ccs_check_kind_public = False }
+    case reverseWrapperWorker table of
+      Just worker_tc -> do
+        (_, _, _, callee) <- directListReverseWrapper owner rhs
+        guard (owns worker_tc callee)
+        w_rhs <- lookup callee bindings
+        w_cct <- compileCoreEquations (base_spec { ccs_allow_tail_self = True, ccs_allow_accum_self = True }) callee w_rhs
+        guard (isValidReverseWorkerTable w_cct && matchesCompiledTable worker_tc Nothing w_cct)
+      Nothing
+        | Just select <- booleanSelector table -> do
+            let pred_fn c = checkedBranchPredicate (fromMaybe c (fst <$> find ((== c) . fst) bindings))
+            cct <- compileCoreEquations (base_spec { ccs_predicate = pred_fn, ccs_allow_guard = True }) owner rhs
+            guard (matchesCompiledTable table (Just select) cct)
+        | isPartialConstructorCaseTable table -> do
+            cct <- compileCoreEquations (base_spec { ccs_partial_root = True }) owner rhs
+            guard (matchesCompiledTable table Nothing cct)
+        | isTwoListCaseTable table -> do
+            let check mb_w = compileCoreEquations (base_spec { ccs_spec_worker = mb_w }) owner rhs >>=
+                             \cct -> guard (matchesCompiledTable table Nothing cct)
+            check Nothing <|> (checkedSpecConstrWorker bindings table owner >>= check . Just)
+        | otherwise -> do
+            let calleeLookup fn = sourceTableId_maybe fn >>= \fam ->
+                  fam <$ guard (isJust (sourceTableTermOcc (nameOccName (tyConName fam))))
+                spec = base_spec
+                  { ccs_helper           = if isFinalSourceListTable table then calleeLookup else const Nothing
+                  , ccs_bindings         = bindings
+                  , ccs_allow_tail_self  = isReverseWorkerTable table || isTwoStructuralCaseTable table
+                  , ccs_allow_accum_self = isReverseWorkerTable table
+                  , ccs_allow_call_self  = isFinalSourceListTable table
+                  , ccs_allow_top_apply  = isListFoldTable table }
+            cct <- compileCoreEquations spec owner rhs
+            when (isListFoldTable table) (guard (isValidFoldTable cct))
+            when (isListZipWithTable table) (guard (isValidZipTable cct))
+            when (isReverseWorkerTable table) (guard (isValidReverseWorkerTable cct))
+            guard (matchesCompiledTable table Nothing cct)
+  where
+    owns fam val = nameModule_maybe (idName val) == nameModule_maybe (tyConName fam) &&
+                   sourceTableTermOcc (nameOccName (tyConName fam)) == Just (nameOccName (idName val))
+
+checkedImportedSpecConstr :: RuleEnv -> Id -> TyCon -> CoreRule -> Maybe ()
+checkedImportedSpecConstr env owner table rule = do
+    worker <- checkSpecConstrRule owner rule
+    guard (worker /= owner && nameModule_maybe (idName worker) == nameModule_maybe (idName owner) &&
+           lazySpecConstrFields worker && null (activeMapperRules env worker))
+    Core.CoreUnfolding { Core.uf_src = VanillaSrc, Core.uf_tmpl = rhs } <- pure (realIdUnfolding owner)
+    let plain = (defaultCoreSpec (const True)) { ccs_check_kind_public = False }
+    guard (isNothing (compileCoreEquations plain owner rhs))
+    cct <- compileCoreEquations (plain { ccs_spec_worker = Just worker }) owner rhs
+    guard (matchesCompiledTable table Nothing cct)
+
+lazySpecConstrFields :: Id -> Bool
+lazySpecConstrFields = all (not . isMarkedCbv) . take 2 . fromMaybe [] . idCbvMarks_maybe
+
+checkedSpecConstrWorker :: [(Id, Core.CoreExpr)] -> TyCon -> Id -> Maybe Id
+checkedSpecConstrWorker bindings table owner = do
+    ConstructorCaseType telescope _ _ [left, right] 0 result <- constructorCaseType (varType owner)
+    [Bndr a _, Bndr b _] <- pure telescope
+    guard (eqTypes [left, right] (map (mkListTy . mkTyVarTy) [a, b]))
+    [rule@Rule{ru_local = True}] <- pure (filter (not . isNeverActive . ruleActivation) (idCoreRules owner))
+    target <- checkSpecConstrRule owner rule
+    (worker, rhs) <- find ((== target) . fst) bindings
+    guard (worker /= owner && not (isExternalName (idName worker)) &&
+           eqType (varType target) (varType worker) && eqType (exprType rhs) (varType worker))
+    (x : y : fields@[hd, tl, other], body) <- pure (Core.collectBinders (stripTicksE isSourceBreakpoint rhs))
+    guard (all isTyVar [x, y] && all isId fields && eqTypes (map varType [x, y]) (map varType [a, b]))
+    let instantiate = substTyWith [a, b] (mkTyVarTys [x, y])
+    guard (eqTypes (map varType fields) (map instantiate [mkTyVarTy a, left, right]) &&
+           maybe True null (idCbvMarks_maybe worker) && lazySpecConstrFields (tidyCbvInfoTop emptyNameSet worker rhs))
+    (res_tc, res_args) <- caseDatatype (instantiate result)
+    null_dc <- find (\dc -> dataConSourceArity dc == 0) (tyConDataCons res_tc)
+    let list_arg = mkSysLocal (fsLit "spec_ls") minLocalUnique ManyTy (instantiate left)
+        wrapper_ty = mkForAllTys (zipWith (\v (Bndr _ vis) -> (unmatchableDataConTy, Bndr v vis)) [x, y] telescope)
+                       (mkVisFunTyManyU (instantiate left) (mkVisFunTyManyU (instantiate right) (instantiate result)))
+        synth_case = Core.Case (Core.Var list_arg) list_arg (instantiate result)
+                       [ Core.Alt (Core.DataAlt nilDataCon) [] (Core.mkConApp null_dc (map Core.Type res_args))
+                       , Core.Alt (Core.DataAlt consDataCon) [hd, tl] body ]
+        spec = (defaultCoreSpec (const True)) { ccs_spec_worker = Just worker, ccs_check_kind_public = False }
+    cct <- compileCoreEquations spec (setIdType owner wrapper_ty) (Core.mkLams [x, y, list_arg, other] synth_case)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    let isCons br = case drop (length telescope) (coAxBranchLHS br) of
+          [p1, _] -> fmap fst (splitTyConApp_maybe p1) == Just (promoteDataCon consDataCon); _ -> False
+        cons_rows = [r | r@(CompiledCoreRow [PatCon dc _ _, _] _) <- cct_rows cct, dc == consDataCon]
+        sub_table = buildSourceFamily (tyConName table) (coAxiomName axiom) (tyConBinders table)
+                      (tyConResKind table) (map const (filter isCons (fromBranches (coAxiomBranches axiom))))
+    worker <$ guard (not (null cons_rows) && matchesCompiledTable sub_table Nothing (cct { cct_rows = cons_rows }))
+
+checkSpecConstrRule :: Id -> CoreRule -> Maybe Id
+checkSpecConstrRule owner Rule{ru_fn = fn, ru_origin = origin, ru_auto = True,
+                               ru_bndrs = binders, ru_args = Core.Type left : Core.Type right : first : rest, ru_rhs = rhs} = do
+    guard (fn == idName owner && Just origin == nameModule_maybe (idName owner))
+    a <- getTyVar_maybe left; b <- getTyVar_maybe right
+    (Core.Var cons, [Core.Type element, Core.Var hd, Core.Var tl]) <- pure (Core.collectArgs first)
+    later <- traverse (\case Core.Var v -> Just v; _ -> Nothing) rest
+    let captures = hd : tl : later
+    guard (cons == dataConWorkId consDataCon && element `eqType` left && all isId captures &&
+           eqTypes (map varType [hd, tl]) [left, mkListTy left] && (null later || eqTypes (map varType later) [mkListTy right]) &&
+           exactRuleVars binders (a : b : captures))
+    (Core.Var worker, Core.Type x : Core.Type y : arguments) <- pure (Core.collectArgs rhs)
+    fields <- traverse (\case Core.Var v -> Just v; _ -> Nothing) arguments
+    worker <$ guard (left `eqType` x && right `eqType` y && captures == fields &&
+                     exprType (Core.mkApps (Core.Var owner) (Core.Type left : Core.Type right : first : rest)) `eqType` exprType rhs)
+checkSpecConstrRule _ _ = Nothing
+
+-- ---------------------------------------------------------------------------
+-- Nullary and recursive GADT index projections (ST6)
+-- ---------------------------------------------------------------------------
+
+data IndexedProjection = IndexedProjection [ForAllTyBinder] (Type, Type) Type DataCon TyVar Type [Type]
+data IndexedRecursion = IndexedRecursion DataCon TyVar Type [Type] Kind
+
 indexedProjectionType :: Type -> Maybe IndexedProjection
 indexedProjectionType ty = do
-  let (binders, body) = splitForAllForAllTyBinders ty
-  telescope <- traverse ordinary binders
-  (left, more) <- caseArrow body
-  (right, result) <- caseArrow more
-  (tc, args) <- splitTyConApp_maybe left
-  guard (not (null telescope) && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
-         lengthIs args (tyConArity tc))
-  [(con, slot, index, parameters)] <- pure (mapMaybe (refinement args) (tyConDataCons tc))
-  let quantified = binderVars telescope
-  guard (slot `elem` quantified &&
-         not (anyFreeVarsOfType (== slot) right) &&
-         all (not . anyFreeVarsOfType (== slot) . varType) quantified)
-  pure (IndexedProjection telescope (left, right) result con slot index parameters)
+    let (binders, body) = splitForAllForAllTyBinders ty
+    telescope <- traverse ordinaryCaseBinder binders
+    (left, more) <- caseArrow body; (right, result) <- caseArrow more
+    (tc, args) <- splitTyConApp_maybe left
+    guard (not (null telescope) && isBoxedDataTyCon tc && isLiftedAlgTyCon tc && lengthIs args (tyConArity tc))
+    [(con, slot, index, parameters)] <- pure (mapMaybe (refinement args) (tyConDataCons tc))
+    let quantified = binderVars telescope
+    guard (slot `elem` quantified && not (anyFreeVarsOfType (== slot) right) &&
+           all (not . anyFreeVarsOfType (== slot) . varType) quantified)
+    pure (IndexedProjection telescope (left, right) result con slot index parameters)
   where
-    ordinary (ma, binder@(Bndr v (Invisible _)))
-      | ma `eqType` unmatchableDataConTy, isTyVar v = Just binder
-    ordinary _ = Nothing
-
     refinement args con = do
-      let (universals, existentials, equalities, context, fields, _) = dataConFullSig con
-      guard (null existentials && null context && null fields &&
-             null (dataConStupidTheta con) && lengthIs universals (length args))
-      [equation] <- pure equalities
-      arg <- lookup (eqSpecTyVar equation) (zip universals args)
-      slot <- getTyVar_maybe arg
+      (universals, [], [equation], [], [], _) <- pure (dataConFullSig con)
+      guard (null (dataConStupidTheta con) && lengthIs universals (length args))
+      slot <- lookup (eqSpecTyVar equation) (zip universals args) >>= getTyVar_maybe
       let index = eqSpecType equation
-      guard (noFreeVarsOfType index && isTyFamFree index &&
-             typeKind index `eqType` varType slot)
-      parameters <- traverse (`lookup` zip universals args) (dataConUserTyVars con)
-      pure (con, slot, index, parameters)
+      guard (noFreeVarsOfType index && isTyFamFree index && typeKind index `eqType` varType slot)
+      (con, slot, index,) <$> traverse (`lookup` zip universals args) (dataConUserTyVars con)
 
--- | Read only the explicit case on the first operand and its selected row.
 checkedIndexedProjection :: (Core.CoreExpr -> Core.CoreExpr) -> Id -> Core.CoreExpr
                          -> Maybe (IndexedProjection, Maybe IndexedRecursion)
 checkedIndexedProjection prepare owner original = do
-  projection@(IndexedProjection binders _ _ con slot _ _) <- indexedProjectionType (varType owner)
-  guard (exprType original `eqType` varType owner)
-  let (parameters, body) = Core.collectBinders (prepare original)
-      (core_types, arguments) = splitAt (length binders) parameters
-  [left, right] <- pure arguments
-  guard (all isTyVar core_types)
-  Core.Case (Core.Var scrutinee) _ _ alts <- pure body
-  guard (left == scrutinee && isId right)
-  [rhs] <- pure [branch | Core.Alt (Core.DataAlt dc) [evidence] branch <- alts,
-                         dc == con, isCoVar evidence]
-  case stripIndexedBreakpoints rhs of
-    Core.Var v | v == right -> pure ()
-    Core.Cast (Core.Var v) _ | v == right -> pure ()
-    _ -> Nothing
-  let recursion = do
-        row <- indexedRecursionType projection
-        checkIndexedRecursion owner (binderVars binders) slot core_types right alts row
-        pure row
-  pure (projection, recursion)
+    projection@(IndexedProjection binders _ _ con slot _ _) <- indexedProjectionType (varType owner)
+    guard (exprType original `eqType` varType owner)
+    let (core_types, arguments) = splitAt (length binders) (fst (Core.collectBinders (prepare original)))
+    [left, right] <- pure arguments
+    Core.Case (Core.Var scrutinee) _ _ alts <- pure (snd (Core.collectBinders (prepare original)))
+    guard (all isTyVar core_types && left == scrutinee && isId right)
+    [rhs] <- pure [br | Core.Alt (Core.DataAlt dc) [ev] br <- alts, dc == con, isCoVar ev]
+    case stripTicksTopE isSourceBreakpoint rhs of
+      Core.Var v | v == right -> pure ()
+      Core.Cast (Core.Var v) _ | v == right -> pure ()
+      _ -> Nothing
+    let recursion = do
+          row <- indexedRecursionType projection
+          row <$ checkIndexedRecursion owner (binderVars binders) slot core_types right alts row
+    pure (projection, recursion)
 
--- | Publish the selected row with actual nominal result-kind evidence.
 publishIndexedProjection :: Id -> IndexedProjection -> Maybe IndexedRecursion -> TcM (Maybe TyCon)
 publishIndexedProjection owner projection@(IndexedProjection telescope (left, right) result con slot index con_args) recursion = do
     (renaming, parameters) <- freshenTyVarBndrs (binderVars telescope)
@@ -4533,28 +3197,20 @@ publishIndexedProjection owner projection@(IndexedProjection telescope (left, ri
         specialize = instantiate . substTyWith [slot] [index]
         hidden = map (specialize . mkTyVarTy) (binderVars telescope)
         branch_params = [v | (old, v) <- zip (binderVars telescope) parameters, old /= slot]
-        left_kind = specialize left
-        right_kind = specialize right
-        result_kind = specialize result
         constructor = mkTyConApp (promoteDataCon con) (map specialize con_args)
+        term = idName owner
     families <- tcGetFamInstEnvs
-    case projectionResultCoercion families right_kind result_kind of
-      Just cast | typeKind constructor `eqType` left_kind -> do
-        carried <- freshSysTyVar "carried" right_kind
+    case projectionResultCoercion families (specialize right) (specialize result) of
+      Just cast | typeKind constructor `eqType` specialize left -> do
+        carried <- freshSysTyVar "carried" (specialize right)
         operands <- mapM (freshSysTyVar "arg" . instantiate) [left, right]
-        let vars = branch_params ++ [carried]
-            right_pat = mkTyVarTy carried
+        let vars = branch_params ++ [carried]; right_pat = mkTyVarTy carried
             branch _ = mkCoAxBranch vars [] [] (hidden ++ [constructor, right_pat])
-              (mkCastTy right_pat cast) (map (const Nominal) vars) (nameSrcSpan term)
-        recursive <- maybe (pure Nothing)
-          (publishIndexedRecursion families projection parameters instantiate carried) recursion
-        Just <$> makeSourceFamily term (named ++ mkAnonTyConBinders operands)
-                                  (instantiate result) (branch : maybe [] pure recursive)
+                         (mkCastTy right_pat cast) (map (const Nominal) vars) (nameSrcSpan term)
+        recursive <- maybe (pure Nothing) (publishIndexedRecursion families projection parameters instantiate carried) recursion
+        Just <$> makeSourceFamily term (named ++ mkAnonTyConBinders operands) (instantiate result) (branch : maybeToList recursive)
       _ -> pure Nothing
-  where
-    term = idName owner
 
--- | Prove the result kind nominally, with at most one family step per index.
 projectionResultCoercion :: FamInstEnvs -> Kind -> Kind -> Maybe Coercion
 projectionResultCoercion families from to
   | from `eqType` to = Just (mkNomReflCo from)
@@ -4569,14 +3225,8 @@ projectionResultCoercion families from to
       | otherwise = do
           (fam, args) <- splitTyConApp_maybe expected
           reduction <- reduceTyFamApp_maybe families Nominal fam args
-          guard (reductionReducedType reduction `eqType` found)
-          pure (mkSymCo (reductionCoercion reduction))
+          mkSymCo (reductionCoercion reduction) <$ guard (reductionReducedType reduction `eqType` found)
 
--- | The constructor's predecessor, result index, hidden arguments, and head kind.
--- The input tail has the owner's left domain at the predecessor.
-data IndexedRecursion = IndexedRecursion DataCon TyVar Type [Type] Kind
-
--- | Check one lazy constructor whose only existential is the tail index.
 indexedRecursionType :: IndexedProjection -> Maybe IndexedRecursion
 indexedRecursionType (IndexedProjection _ (left, _) _ nil slot _ _) = do
     (_, args) <- splitTyConApp_maybe left
@@ -4584,137 +3234,91 @@ indexedRecursionType (IndexedProjection _ (left, _) _ nil slot _ _) = do
     pure row
   where
     refinement args con = do
-      let (universals, existentials, equalities, context, fields, _) = dataConFullSig con
-          instantiate = substTyWith universals args
-      guard (null context && null (dataConStupidTheta con) &&
-             lengthIs args (length universals) && isLazyDataConRep con &&
-             all (not . isUnpacked) (dataConImplBangs con) &&
-             dataConRepArity con == length fields + length equalities)
-      [predecessor] <- pure existentials
-      guard (isTyVar predecessor && varType predecessor `eqType` varType slot)
-      [equation] <- pure equalities
+      (universals, [predecessor], [equation], [], fields, _) <- pure (dataConFullSig con)
+      let instantiate = substTyWith universals args
+      guard (null (dataConStupidTheta con) && lengthIs args (length universals) && isLazyDataConRep con &&
+             all (not . isUnpacked) (dataConImplBangs con) && dataConRepArity con == length fields + 1 &&
+             isTyVar predecessor && varType predecessor `eqType` varType slot)
       [head_kind, tail_kind] <- pure (map (instantiate . scaledThing) fields)
       actual_slot <- lookup (eqSpecTyVar equation) (zip universals args)
       let index = instantiate (eqSpecType equation)
       (successor, [argument]) <- splitTyConApp_maybe index
       _ <- isPromotedDataCon_maybe successor
-      guard (actual_slot `eqType` mkTyVarTy slot &&
-             argument `eqType` mkTyVarTy predecessor &&
+      guard (actual_slot `eqType` mkTyVarTy slot && argument `eqType` mkTyVarTy predecessor &&
              not (anyFreeVarsOfType (\v -> v == predecessor || v == slot) head_kind) &&
-             isLiftedTypeKind (typeKind head_kind) &&
-             tail_kind `eqType` substTyWith [slot] [argument] left)
-      pure (IndexedRecursion con predecessor index
-              (map (instantiate . mkTyVarTy) (dataConUserTyVars con)) head_kind)
+             isLiftedTypeKind (typeKind head_kind) && tail_kind `eqType` substTyWith [slot] [argument] left)
+      pure (IndexedRecursion con predecessor index (map (instantiate . mkTyVarTy) (dataConUserTyVars con)) head_kind)
 
--- | Verify the original head and the structurally smaller call in the
--- rebuilding branch. Constructor wrapping and its result cast are erased.
-checkIndexedRecursion :: Id -> [TyVar] -> TyVar -> [TyVar] -> Id -> [Core.CoreAlt]
-                      -> IndexedRecursion -> Maybe ()
+checkIndexedRecursion :: Id -> [TyVar] -> TyVar -> [TyVar] -> Id -> [Core.CoreAlt] -> IndexedRecursion -> Maybe ()
 checkIndexedRecursion owner parameters slot core_types carried alts (IndexedRecursion con _ _ _ _) = do
-    [(predecessor, evidence, hd, tl, rhs)] <-
-      pure [(p, co, x, xs, e) | Core.Alt (Core.DataAlt dc) [p, co, x, xs] e <- alts, dc == con]
+    [(predecessor, evidence, hd, tl, rhs)] <- pure [(p, co, x, xs, e) | Core.Alt (Core.DataAlt dc) [p, co, x, xs] e <- alts, dc == con]
     guard (isTyVar predecessor && isCoVar evidence && isId hd && isId tl)
-    let value = case stripIndexedBreakpoints rhs of
-          Core.Cast body _ -> stripIndexedBreakpoints body
-          body -> body
+    let value = case stripTicksTopE isSourceBreakpoint rhs of { Core.Cast b _ -> stripTicksTopE isSourceBreakpoint b; b -> b }
     (Core.Var rebuild, args) <- pure (Core.collectArgs value)
-    guard (isDataConId_maybe rebuild == Just con)
     [Core.Var first, recurse] <- pure (dropWhile Core.isTyCoArg args)
-    guard (first == hd)
-    (Core.Var self, arguments) <- pure (Core.collectArgs (stripIndexedBreakpoints recurse))
+    (Core.Var self, arguments) <- pure (Core.collectArgs (stripTicksTopE isSourceBreakpoint recurse))
     let (types, terms) = splitAt (length parameters) arguments
-        expected = [mkTyVarTy (if v == slot then predecessor else core_v)
-                   | (v, core_v) <- zip parameters core_types]
+        expected = [mkTyVarTy (if v == slot then predecessor else cv) | (v, cv) <- zip parameters core_types]
     actual <- coreTypeArgs types
     [Core.Var tail_arg, Core.Var carried_arg] <- pure terms
-    guard (self == owner && eqTypes actual expected && tail_arg == tl && carried_arg == carried)
+    guard (isDataConId_maybe rebuild == Just con && first == hd && self == owner &&
+           eqTypes actual expected && tail_arg == tl && carried_arg == carried)
 
--- | Read through debugger breakpoints on an indexed result.
-stripIndexedBreakpoints :: Core.CoreExpr -> Core.CoreExpr
-stripIndexedBreakpoints = stripTicksTopE isSourceBreakpoint
-
--- | A debugger breakpoint does not evaluate its captured variables.
-isSourceBreakpoint :: CoreTickish -> Bool
-isSourceBreakpoint Breakpoint{} = True
-isSourceBreakpoint _ = False
-
--- | Check the index of the recursive result and compute the promoted
--- constructor arguments, using the same untouched parameters as the input.
-indexedRecursionResult :: IndexedProjection -> IndexedRecursion -> [Type] -> Type
-                       -> Maybe ([Type], [Type], Kind)
+indexedRecursionResult :: IndexedProjection -> IndexedRecursion -> [Type] -> Type -> Maybe ([Type], [Type], Kind)
 indexedRecursionResult (IndexedProjection telescope (left, _) result _ slot _ _)
-                       (IndexedRecursion _ predecessor index args _) hidden predecessor_ty = do
+                       (IndexedRecursion _ predecessor index args _) hidden pred_ty = do
     (input_tc, input_args) <- splitTyConApp_maybe left
     let parameters = binderVars telescope
         at applied = substTyWith parameters applied
-        recur_args = zipWith (\v ty -> if v == slot then predecessor_ty else ty) parameters hidden
-        recur_kind = at recur_args result
-        match (input, output)
-          | getTyVar_maybe input == Just slot = Just (Just output)
-          | at hidden input `eqType` output = Just Nothing
-          | otherwise = Nothing
-    (output_tc, output_args) <- splitTyConApp_maybe recur_kind
+        recur_args = zipWith (\v ty -> if v == slot then pred_ty else ty) parameters hidden
+        match (inp, out) | getTyVar_maybe inp == Just slot = Just (Just out)
+                         | at hidden inp `eqType` out = Just Nothing
+                         | otherwise = Nothing
+    (output_tc, output_args) <- splitTyConApp_maybe (at recur_args result)
     guard (input_tc == output_tc && lengthIs input_args (length output_args))
     [output_index] <- catMaybes <$> traverse match (zip input_args output_args)
-    let instantiate = at hidden . substTyWith [predecessor] [output_index]
-        result_args = zipWith (\v ty -> if v == slot then instantiate index else ty) parameters hidden
-    pure (recur_args, map instantiate args, at result_args left)
+    let inst = at hidden . substTyWith [predecessor] [output_index]
+    pure (recur_args, map inst args, at (zipWith (\v ty -> if v == slot then inst index else ty) parameters hidden) left)
 
--- | Build the second row from the certified smaller call and exact head.
-publishIndexedRecursion :: FamInstEnvs -> IndexedProjection -> [TyVar]
-                        -> (Type -> Type) -> TyVar -> IndexedRecursion
-                        -> TcM (Maybe (TyCon -> CoAxBranch))
+publishIndexedRecursion :: FamInstEnvs -> IndexedProjection -> [TyVar] -> (Type -> Type) -> TyVar
+                        -> IndexedRecursion -> TcM (Maybe (TyCon -> CoAxBranch))
 publishIndexedRecursion families projection@(IndexedProjection telescope (left, right) result _ slot _ _)
-                        parameters instantiate carried
-                        row@(IndexedRecursion con predecessor index args head_kind) = do
+                        parameters instantiate carried row@(IndexedRecursion con predecessor index args head_kind) = do
     p <- freshSysTyVar "predecessor" (instantiate (varType slot))
     let p_ty = mkTyVarTy p
         specialized = instantiate . substTyWith [predecessor] [p_ty]
-        selected_index = specialized index
-        branch_arg v | v == slot = selected_index
-                     | otherwise = instantiate (mkTyVarTy v)
-        hidden = map branch_arg (binderVars telescope)
+        hidden = [if v == slot then specialized index else instantiate (mkTyVarTy v) | v <- binderVars telescope]
         specialize = substTyWith (binderVars telescope) hidden
-        tail_kind = specialize (substTyWith [slot] [p_ty] left)
     hd <- freshSysTyVar "head" (specialize (specialized head_kind))
-    tl <- freshSysTyVar "tail" tail_kind
+    tl <- freshSysTyVar "tail" (specialize (substTyWith [slot] [p_ty] left))
     pure $ do
       (recur_args, result_args, rebuilt_kind) <- indexedRecursionResult projection row hidden p_ty
       cast <- projectionResultCoercion families rebuilt_kind (specialize result)
-      let h = mkTyVarTy hd
-          t = mkTyVarTy tl
-          ys = mkTyVarTy carried
-          constructor = promoteDataCon con
-          pat = mkTyConApp constructor (map (specialize . specialized) args ++ [h, t])
+      let h = mkTyVarTy hd; t = mkTyVarTy tl; ys = mkTyVarTy carried
+          pat = mkTyConApp (promoteDataCon con) (map (specialize . specialized) args ++ [h, t])
           vars = [v | (old, v) <- zip (binderVars telescope) parameters, old /= slot] ++ [p, hd, tl, carried]
       guard (typeKind pat `eqType` specialize left && typeKind ys `eqType` specialize right)
       pure $ \family ->
-        let call = mkTyConApp family (recur_args ++ [t, ys])
-            rhs = mkTyConApp constructor (result_args ++ [h, call])
+        let rhs = mkTyConApp (promoteDataCon con) (result_args ++ [h, mkTyConApp family (recur_args ++ [t, ys])])
         in mkCoAxBranch vars [] [] (hidden ++ [pat, ys]) (mkCastTy rhs cast)
                         (map (const Nominal) vars) (nameSrcSpan (tyConName family))
 
--- | Read the exact private family and the constructor heads it checks.
 indexedProjectionSource :: Id -> Maybe (TyCon, [DataCon])
 indexedProjectionSource owner = do
-  guard (finalCoreMapperOwner owner)
-  table <- sourceTableId_maybe owner
-  guard (tyConKind table `eqType` varType owner)
-  projection@(IndexedProjection _ _ _ nil _ _ _) <- indexedProjectionType (varType owner)
-  axiom <- closedFamilyTyConCoAxiom_maybe table
-  guard (coAxiomRole axiom == Nominal)
-  case fromBranches (coAxiomBranches axiom) of
-    [empty] -> do
-      checkIndexedSourceBranch projection table Nothing empty
-      pure (table, [nil])
-    [empty, nonempty] -> do
-      checkIndexedSourceBranch projection table Nothing empty
-      row@(IndexedRecursion con _ _ _ _) <- indexedRecursionType projection
-      checkIndexedSourceBranch projection table (Just row) nonempty
-      pure (table, [nil, con])
-    _ -> Nothing
+    guard (finalCoreMapperOwner owner)
+    table <- sourceTableId_maybe owner
+    guard (tyConKind table `eqType` varType owner)
+    projection@(IndexedProjection _ _ _ nil _ _ _) <- indexedProjectionType (varType owner)
+    axiom <- closedFamilyTyConCoAxiom_maybe table
+    guard (coAxiomRole axiom == Nominal)
+    case fromBranches (coAxiomBranches axiom) of
+      [empty_br] -> (table, [nil]) <$ checkIndexedSourceBranch projection table Nothing empty_br
+      [empty_br, nonempty] -> do
+        checkIndexedSourceBranch projection table Nothing empty_br
+        row@(IndexedRecursion con _ _ _ _) <- indexedRecursionType projection
+        (table, [nil, con]) <$ checkIndexedSourceBranch projection table (Just row) nonempty
+      _ -> Nothing
 
--- | Check the binders, specialized index, and the nominal RHS cast.
 checkIndexedSourceBranch :: IndexedProjection -> TyCon -> Maybe IndexedRecursion -> CoAxBranch -> Maybe ()
 checkIndexedSourceBranch projection@(IndexedProjection telescope (left, right) result nil slot index con_args)
                          table recursion branch = do
@@ -4727,10 +3331,8 @@ checkIndexedSourceBranch projection@(IndexedProjection telescope (left, right) r
     [refined] <- pure [arg | (v, arg) <- zip parameters hidden, v == slot]
     hidden_vars <- traverse getTyVar_maybe [arg | (v, arg) <- zip parameters hidden, v /= slot]
     (local_vars, wanted) <- case recursion of
-      Nothing -> do
-        guard (index `eqType` refined &&
-               mkTyConApp (promoteDataCon nil) (map specialize con_args) `eqType` constructor)
-        pure ([], carried)
+      Nothing -> ([] , carried) <$ guard (index `eqType` refined &&
+                                          mkTyConApp (promoteDataCon nil) (map specialize con_args) `eqType` constructor)
       Just row@(IndexedRecursion con predecessor result_index args head_kind) -> do
         (_, [pred_ty]) <- splitTyConApp_maybe refined
         pred_var <- getTyVar_maybe pred_ty
@@ -4740,3367 +3342,995 @@ checkIndexedSourceBranch projection@(IndexedProjection telescope (left, right) r
         [hd, tl] <- pure fields
         field_vars <- traverse getTyVar_maybe fields
         guard (promoted == promoteDataCon con && inst result_index `eqType` refined &&
-               eqTypes (map inst args) promoted_params &&
-               typeKind hd `eqType` inst head_kind &&
+               eqTypes (map inst args) promoted_params && typeKind hd `eqType` inst head_kind &&
                typeKind tl `eqType` specialize (substTyWith [slot] [pred_ty] left))
         (recur_args, result_args, _) <- indexedRecursionResult projection row hidden pred_ty
-        let call = mkTyConApp table (recur_args ++ [tl, carried])
-        pure (pred_var : field_vars, mkTyConApp promoted (result_args ++ [hd, call]))
-    let rhs = coAxBranchRHS branch
-        vars = hidden_vars ++ local_vars ++ [carried_var]
-    guard (coAxBranchTyVars branch == vars &&
-           sizeUniqSet (mkUniqSet vars) == length vars &&
+        pure (pred_var : field_vars, mkTyConApp promoted (result_args ++ [hd, mkTyConApp table (recur_args ++ [tl, carried])]))
+    let rhs = coAxBranchRHS branch; vars = hidden_vars ++ local_vars ++ [carried_var]
+    guard (coAxBranchTyVars branch == vars && sizeUniqSet (mkUniqSet vars) == length vars &&
            eqTypes (map typeKind hidden) (map (specialize . varType) parameters) &&
-           lengthIs (coAxBranchRoles branch) (length vars) &&
-           all (== Nominal) (coAxBranchRoles branch) &&
-           typeKind constructor `eqType` specialize left &&
-           typeKind carried `eqType` specialize right &&
+           lengthIs (coAxBranchRoles branch) (length vars) && all (== Nominal) (coAxBranchRoles branch) &&
+           typeKind constructor `eqType` specialize left && typeKind carried `eqType` specialize right &&
            typeKind rhs `eqType` specialize result)
     case rhs of
       CastTy payload co -> guard (payload `eqType` wanted && coercionRole co == Nominal &&
-                                  coercionLKind co `eqType` typeKind wanted &&
-                                  coercionRKind co `eqType` specialize result)
+                                  coercionLKind co `eqType` typeKind wanted && coercionRKind co `eqType` specialize result)
       _ -> guard (rhs `eqType` wanted)
 
--- | The two equations for a lazy constructor-to-constructor list map.
--- Check the same complete shape before and after optimizing its owner.
-directListMapper :: Id -> Core.CoreExpr -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-directListMapper owner body = do
-  result@(ConstructorCaseType _ tc _ _ position _, rows) <-
-    checkedConstructorCase (const False) (const Nothing) owner body
-  guard (tc == listTyCon && position == 1)
-  case rows of
-    [ ConstructorCaseRow [CaseField _, CaseConstructor nil _ []] (CaseConstructor retNil _ [])
-      , ConstructorCaseRow [CaseField callback, CaseConstructor cons _ [CaseField h, CaseField t]]
-          (CaseConstructor retCons _ [CaseApply f [CaseField x], CaseSelf _ [CaseField f', CaseField xs]]) ]
-      | nil == nilDataCon, retNil == nilDataCon, cons == consDataCon, retCons == consDataCon
-      , callback == f, callback == f', h == x, t == xs -> pure result
-    _ -> Nothing
+-- ---------------------------------------------------------------------------
+-- Partial pair builders, character cases, retained witnesses, and exports
+-- ---------------------------------------------------------------------------
 
--- | Check append's two equations and the demand on both operands.
-directListAppend :: Id -> Core.CoreExpr -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-directListAppend owner body = do
-  result@(signature, rows) <-
-    checkedConstructorCase (const False) (const Nothing) owner body
-  guard (isBinaryListCase signature)
-  case rows of
-    [ ConstructorCaseRow [CaseConstructor nil _ [], CaseField right] (CaseField returned)
-      , ConstructorCaseRow [CaseConstructor cons _ [CaseField h, CaseField t], CaseField right']
-          (CaseConstructor retCons _ [CaseField head', CaseSelf _ [CaseField tail', CaseField carried]]) ]
-      | nil == nilDataCon, cons == consDataCon, retCons == consDataCon
-      , right == returned, h == head', t == tail', right' == carried -> pure result
-    _ -> Nothing
-
--- | Check the ordinary, lifted signature of a right list fold.
-listFoldType :: Type -> Maybe ConstructorCaseType
-listFoldType ty = do
-  let (telescope, body) = splitForAllForAllTyBinders ty
-  binders <- traverse ordinaryCaseBinder telescope
-  guard (all (isLiftedTypeKind . varType . binderVar) binders)
-  (callback, rest) <- caseArrow body
-  (seed, rest') <- caseArrow rest
-  (list, result) <- caseArrow rest'
-  (element, callback_rest) <- caseArrow callback
-  (state, output) <- caseArrow callback_rest
-  (tc, [parameter]) <- caseDatatype list
-  guard (tc == listTyCon && element `eqType` parameter &&
-         all (eqType seed) [state, output, result])
-  case mkTyVarTys (binderVars binders) of
-    [] -> guard (noFreeVarsOfType element && noFreeVarsOfType seed)
-    [a, b] -> guard (eqTypes [element, seed] [a, b] || eqTypes [element, seed] [b, a])
-    _ -> Nothing
-  pure (ConstructorCaseType binders tc [element] [callback, seed, list] 2 result)
-
--- | Check the lifted signature of a list zipper with a curried callback.
-listZipWithType :: Type -> Maybe ConstructorCaseType
-listZipWithType ty = do
-    let (telescope, body) = splitForAllForAllTyBinders ty
-    binders <- traverse ordinaryCaseBinder telescope
-    guard (all (isLiftedTypeKind . varType . binderVar) binders)
-    [a, b, c] <- pure (mkTyVarTys (binderVars binders))
-    (callback, rest) <- caseArrow body
-    (left, rest') <- caseArrow rest
-    (right, result) <- caseArrow rest'
-    guard (callback `eqType` mkVisFunTyManyU a (mkVisFunTyManyU b c) &&
-           eqTypes [left, right, result] (map mkListTy [a, b, c]))
-    pure (ConstructorCaseType binders listTyCon [a] [callback, left, right] 1 result)
-
--- | Identify a nominal family backed by a checked zipper.
-isListZipWithTable :: TyCon -> Bool
-isListZipWithTable table = isJust $ do
-    _ <- sourceTableTermOcc (nameOccName (tyConName table))
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    guard (coAxiomRole axiom == Nominal)
-    listZipWithType (tyConKind table)
-
-{- Note [Checked list zippers]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Check the left list first. The left nil branch leaves the right list
-and the callback alone. Only the left cons branch checks the right
-list. Check the two-cons result with the ordinary lazy constructor
-checker. It may build a pair from the heads or apply the carried
-callback to both heads. The tail calls the same function on both
-original tails.
-
-The recursion can use the owner directly or a single local worker with
-the callback in scope. In the local form, check that the owner applies
-the worker to its exact list operands, allowing eta reduction. The
-recursive call must use that exact worker and both original tails.
-Recheck the rows against the axiom after optimization. Use the
-existing final Core rule policy for the owner's signature.
-
-The desugarer can put a pattern-failure join around the cases and
-test an operand again in a default alternative. Select the reachable
-alternative for each list constructor with findAlt. Check both nil
-results and the cons result independently. A repeated test can only
-inspect an operand already forced on that path. Thus no checked path
-can reach the failure join, and the left nil path never tests the right.
--}
-
--- | Read the three ordered equations of a list zipper, with or without a callback.
-checkedListZip :: (TyCon -> Bool) -> Id -> Core.CoreExpr
-               -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedListZip visible owner original = do
-    let rhs = stripTicksE isSourceBreakpoint original
-        rhs_type = exprType rhs
-    guard (rhs_type `eqType` varType owner)
-    ConstructorCaseType telescope root [a] domains position result <- signature rhs_type
-    ConstructorCaseType declared _ _ _ _ _ <- signature (varType owner)
-    let (bindings, body) = Core.collectBinders rhs
-        (parameters, operands) = splitAt (length telescope) bindings
-        (carried, supplied) = splitAt position operands
-        types = mkTyVarTys parameters
-    [left_kind, right_kind] <- pure (drop position domains)
-    (right_tc, [b]) <- caseDatatype right_kind
-    (result_tc, [c]) <- caseDatatype result
-    guard (right_tc == listTyCon && result_tc == listTyCon)
-    guard (parameters == binderVars telescope)
-    ([left, right], cases, selfCall) <- case (supplied, body) of
-      (_, Core.Let (Core.Rec [(worker, worker_rhs)]) invoke)
-        | exactCall worker [] supplied invoke ->
-            let (inputs, branches) = Core.collectBinders worker_rhs
-            in pure (inputs, branches, \xs ys -> exactCall worker [] [xs, ys])
-      ([_, _], _) ->
-        pure (supplied, body, \xs ys -> exactCall owner types (carried ++ [xs, ys]))
-      _ -> Nothing
-    guard (all isId (carried ++ [left, right]) &&
-           eqTypes (map varType carried) (take position domains) &&
-           eqTypes (map varType [left, right]) [left_kind, right_kind])
-    let outer = case cases of
-          Core.Let (Core.NonRec j _) rest | isJoinId j -> rest
-          _ -> cases
-        left_nil = (left, a, nilDataCon)
-        left_cons = (left, a, consDataCon)
-        right_nil = (right, b, nilDataCon)
-        right_cons = (right, b, consDataCon)
-    (left_nil_fields, left_empty) <- listAlt result left_nil outer
-    (_, empty) <- followCases result [(left_nil, left_nil_fields)] left_empty
-    guard (nilResult c empty)
-    (left_fields, inner) <- listAlt result left_cons outer
-    (right_nil_fields, right_empty) <- listAlt result right_nil inner
-    (_, empty') <- followCases result [(left_cons, left_fields), (right_nil, right_nil_fields)] right_empty
-    guard (nilResult c empty')
-    (right_fields, rest) <- listAlt result right_cons inner
-    ([(_, [x, xs]), (_, [y, ys])], nonempty) <-
-      followCases result [(left_cons, left_fields), (right_cons, right_fields)] rest
-    let binders = zipWith (\v (Bndr _ vis) -> Bndr v vis) parameters declared
-        nil element_kind = CaseConstructor nilDataCon [element_kind] []
-        cell element_kind h t = CaseConstructor consDataCon [element_kind] [CaseField h, CaseField t]
-        row left_pat right_pat = ConstructorCaseRow (map CaseField carried ++ [left_pat, right_pat])
-        scoped v = v <$ guard (v `elem` [x, xs, y, ys])
-        call expr =
-          CaseSelf types (map CaseField (carried ++ [xs, ys])) <$ guard (selfCall xs ys expr) <|>
-          do [callback] <- pure carried
-             guard (exactCall callback [] [x, y] expr)
-             pure (CaseApply callback (map CaseField [x, y]))
-    value@(CaseConstructor cons _ [_, CaseSelf{}]) <-
-      checkCaseResult public (casePublicKind public types) (const Nothing) scoped call result nonempty
-    guard (cons == consDataCon)
-    pure (ConstructorCaseType binders root [a] domains position result,
-           [ row (nil a) (CaseField right) (nil c)
-           , row (cell a x xs) (nil b) (nil c)
-           , row (cell a x xs) (cell b y ys) value ])
-  where
-    signature ty = listZipWithType ty <|> do
-      ordinary <- constructorCaseType ty
-      ordinary <$ guard (isTwoListCase ordinary)
-
-    public tc = visible tc || tc == listTyCon || isBoxedTupleTyCon tc
-
-    exactCall fun kinds operands expression =
-      case Core.collectArgs expression of
-        (Core.Var callee, arguments)
-          | (types, values) <- span Core.isTypeArg arguments ->
-              callee == fun && eqTypes (map Core.exprToType types) kinds &&
-              mapM operand values == Just operands
-        _ -> False
-    operand (Core.Var v) = Just v
-    operand _ = Nothing
-
-    nilResult output expression =
-      case Core.collectArgs expression of
-        (Core.Var nil_worker, [Core.Type nil_kind]) ->
-          nil_worker == dataConWorkId nilDataCon && nil_kind `eqType` output
-        _ -> False
-
-    listAlt result (scrutinee, input, con) expression = do
-      Core.Case (Core.Var actual) _ case_result alts <- pure expression
-      guard (actual == scrutinee && case_result `eqType` result)
-      Core.Alt alt fields rest <- findAlt (Core.DataAlt con) alts
-      guard (all isId fields && eqTypes (map varType fields)
-               (if alt == Core.DataAlt consDataCon then [input, mkListTy input] else []))
-      pure (fields, rest)
-
-    followCases result known expression
-      | Core.Case (Core.Var scrutinee) _ _ _ <- expression = do
-          (earlier, (fact, fields) : later) <- pure $
-              break (\((v, _, _), _) -> v == scrutinee) known
-          (new_fields, rest) <- listAlt result fact expression
-          let selected = if null new_fields then fields else new_fields
-          followCases result (earlier ++ (fact, selected) : later) rest
-      | otherwise = pure (known, expression)
-
--- | Recognize the compiler-generated nominal family for a right list fold.
-isListFoldTable :: TyCon -> Bool
-isListFoldTable table = isJust $ do
-  _ <- sourceTableTermOcc (nameOccName (tyConName table))
-  axiom <- closedFamilyTyConCoAxiom_maybe table
-  guard (coAxiomRole axiom == Nominal)
-  listFoldType (tyConKind table)
-
-{- Note [Checked right list folds]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The empty branch returns the seed. The cons branch applies the original
-callback to the original head and the fold of the original tail. Check
-both branches and the exact recursive arguments. The cons branch can
-pass the recursive result to a callback because the equation preserves
-the call and both of its operands. It does not assert that the callback,
-its operands, or the fold terminate.
-
-A fold can recurse directly or use a local worker with the callback and
-seed in its scope. The installed list binding uses the local worker.
-Accept only an exact invocation of that worker on the list; the final
-Core may add an eta binder. A monomorphic fold can use closed lifted
-element and seed types. The same check runs before and after Core
-optimization. In GHCi, read through debugger breakpoints on the empty
-result, the callback application, and the recursive call. The executable
-Core keeps these ticks. Rules that can replace the fold call remain a
-separate obligation. In particular the type of a build producer does
-not justify fold/build when the producer can use seq.
-
-The exact fold shape can supply an interface in a fresh no-code build.
-Use the same guard as other structural cases. Local rules, Core plugins
-and simplified Core output still require the final Core path.
--}
-
--- | Check both defining equations against the actual binding.
-directListFold :: Id -> Core.CoreExpr -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-directListFold owner original = do
-  let rhs = stripTicksE isSourceBreakpoint original
-      rhs_type = exprType rhs
-  guard (rhs_type `eqType` varType owner)
-  ConstructorCaseType telescope tc [element] domains position result <- listFoldType rhs_type
-  ConstructorCaseType declared _ _ _ _ _ <- listFoldType (varType owner)
-  let (binders, body) = Core.collectBinders rhs
-      (type_binders, operands) = splitAt (length telescope) binders
-      type_args = mkTyVarTys type_binders
-  guard (type_binders == binderVars telescope)
-  callback : seed : remaining <- pure operands
-  (input, branches, exact_recur) <- case (remaining, body) of
-    ([list], Core.Case{}) -> pure (list, body, directCall type_args callback seed)
-    (_, Core.Let (Core.Rec [(worker, Core.Lam list branches)]) invoke)
-      | startsWorker remaining worker invoke -> pure (list, branches, localCall worker)
-    _ -> Nothing
-  guard (all isId [callback, seed, input] && eqTypes (map varType [callback, seed, input]) domains)
-  Core.Case (Core.Var actual) _ result_kind
-    [ Core.Alt (Core.DataAlt nil) [] (Core.Var returned)
-    , Core.Alt (Core.DataAlt cons) [head_arg, tail_arg] application ] <- pure branches
-  guard (actual == input && result_kind `eqType` result && nil == nilDataCon &&
-         cons == consDataCon && returned == seed && all isId [head_arg, tail_arg] &&
-         eqTypes (map varType [head_arg, tail_arg]) [element, varType input])
-  (Core.Var combine, [Core.Var hd, recur]) <- pure (Core.collectArgs application)
-  guard (combine == callback && hd == head_arg && exact_recur tail_arg recur)
-  let binders' = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope declared
-      row spine value = ConstructorCaseRow [CaseField callback, CaseField seed, spine] value
-      self = CaseSelf type_args (map CaseField [callback, seed, tail_arg])
-  pure (ConstructorCaseType binders' tc [element] domains position result,
-        [ row (CaseConstructor nil [element] []) (CaseField seed)
-        , row (CaseConstructor cons [element] (map CaseField [head_arg, tail_arg]))
-              (CaseApply callback [CaseField head_arg, self]) ])
-  where
-    directCall expected callback seed tail_arg expr = case Core.collectArgs expr of
-      (Core.Var callee, args)
-        | (types, [Core.Var f, Core.Var z, Core.Var xs]) <- span Core.isTypeArg args ->
-            callee == owner && eqTypes (map Core.exprToType types) expected &&
-            f == callback && z == seed && xs == tail_arg
-      _ -> False
-    localCall worker tail_arg expr = case expr of
-      Core.App (Core.Var callee) (Core.Var xs) -> callee == worker && xs == tail_arg
-      _ -> False
-    startsWorker [] worker (Core.Var start) = start == worker
-    startsWorker [eta] worker (Core.App (Core.Var start) (Core.Var original)) =
-      start == worker && original == eta
-    startsWorker _ _ _ = False
-
-{- Note [Checked list reverse]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The worker scrutinizes only its first list. An empty list returns the
-accumulator. A cons replaces the first list with its original tail and
-adds its original head to the same accumulator. The call is in tail
-position. It can return a constructor only after traversing the input
-spine. Match the recursive callee, type argument, and both operands.
-The simple optimizer removes desugaring aliases before this check.
-
-For a local signature, run the same check on the solved, zonked source
-binding. The renamer can schedule a signed worker in a separate group.
-Publish a nominal equation only after matching both rows of its Core.
-Keep that equation through final optimization because the local signature
-can refer to its axiom. Check visible RULES as for other local structural
-equations.
-
-The wrapper calls that checked local worker with its original input
-and an empty accumulator. Publish both equations from the desugared
-Core and recheck both at their original names after optimization. A
-different target with the same shape cannot justify the wrapper's
-equation. The library exposes the worker in GHC.Internal.List so an
-ordinary proof can state an invariant for any accumulator.
--}
--- | Check the original tail and the exact lazy cons onto the carried list.
-directListReverseWorker :: Id -> Core.CoreExpr
-                        -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-directListReverseWorker owner rhs = do
-  let rhs_type = exprType rhs
-  guard (rhs_type `eqType` varType owner)
-  signature@(ConstructorCaseType [binder] _ _ _ _ _) <- constructorCaseType rhs_type
-  guard (isBinaryListCase signature)
-  ConstructorCaseType [Bndr _ visibility] tc _ _ position _ <-
-    constructorCaseType (varType owner)
-  let (binders, body) = Core.collectBinders rhs
-  [element, input, acc] <- pure binders
-  guard (element == binderVar binder && isId input && isId acc)
-  Core.Case (Core.Var actual) _ _
-    [Core.Alt (Core.DataAlt nil) [] (Core.Var returned),
-     Core.Alt (Core.DataAlt cons) [input_head, input_tail] step] <- pure body
-  guard (actual == input && returned == acc && nil == nilDataCon && cons == consDataCon)
-  (Core.Var self, [Core.Type kind, Core.Var next, pushed]) <- pure (Core.collectArgs step)
-  guard (self == owner && kind `eqType` mkTyVarTy element && next == input_tail)
-  (Core.Var cell, [Core.Type cell_kind, Core.Var first, Core.Var carried]) <-
-    pure (Core.collectArgs pushed)
-  guard (cell == dataConWorkId consDataCon && cell_kind `eqType` kind &&
-         first == input_head && carried == acc)
-  -- Publish with the actual Core type binder and the declared visibility.
-  ConstructorCaseType _ _ core_args core_domains _ core_output <- pure signature
-  let rows = [ ConstructorCaseRow [CaseConstructor nil [kind] [], CaseField acc] (CaseField acc)
-             , ConstructorCaseRow [CaseConstructor cons [kind] [CaseField input_head, CaseField input_tail],
-                                   CaseField acc]
-                 (CaseSelf [kind] [CaseField input_tail,
-                    CaseConstructor cons [kind] [CaseField input_head, CaseField acc]]) ]
-  pure (ConstructorCaseType [Bndr element visibility] tc core_args core_domains position core_output, rows)
-
--- | Check a signed local worker before typechecking the signatures that use its equations.
--- See Note [Checked list reverse].
-localListReverseTable :: LHsBind GhcTc -> MaybeT TcM (Id, TyCon)
-localListReverseTable bind = do
-  (fun, _, [_], evidence, matches) <- MaybeT (pure (sourceMatches (unLoc bind)))
-  guard (lengthIs matches 2)
-  guard =<< lift (allM emptyEvidence evidence)
-  ty <- lift (liftZonkM (zonkTcType (varType fun)))
-  candidate <- MaybeT (pure (constructorCaseType ty))
-  guard (isBinaryListCase candidate)
-  (_, _, [zonked], _, _, _, _) <- lift (zonkTopDecls emptyBag [bind] [] [] [] [])
-  let owner = setIdType fun ty
-  body <- MaybeT (bindingCore zonked owner)
-  dflags <- lift getDynFlags
-  (signature, rows) <- MaybeT (pure (directListReverseWorker owner (simpleOptExpr (initSimpleOpts dflags) body)))
-  family <- lift (publishConstructorCase owner signature rows)
-  pure (owner, family)
-
--- | Read the named binding from desugared top-level bindings.
-bindingCore :: LHsBind GhcTc -> Id -> TcM (Maybe Core.CoreExpr)
-bindingCore bind owner = do
-  (messages, bindings) <- initDsTc (dsTopLHsBinds [bind])
-  pure $ case bindings of
-    Just core | not (errorsFound messages)
-      , [rhs] <- [expr | (ident, expr) <- fromOL core, idName ident == idName owner] ->
-        Just rhs
-    _ -> Nothing
-
--- | Recognize the wrapper's ordinary polymorphic list signature.
-listReverseWrapperType :: Type -> Maybe [ForAllTyBinder]
-listReverseWrapperType ty = do
-  (binders@[Bndr element _], [domain], output) <- constructorHelperType ty
-  guard (domain `eqType` mkListTy (mkTyVarTy element) && domain `eqType` output)
-  pure binders
-
--- | Require the original operand and an empty accumulator at the same kind.
-directListReverseWrapper :: Id -> Core.CoreExpr -> Maybe ([ForAllTyBinder], Id, Type, Id)
-directListReverseWrapper owner rhs = do
-  let rhs_type = exprType rhs
-      (binders, body) = Core.collectBinders rhs
-  guard (rhs_type `eqType` varType owner)
-  [Bndr _ visibility] <- listReverseWrapperType (varType owner)
-  [core_element, input] <- pure binders
-  guard (isTyVar core_element && isId input)
-  (Core.Var callee, [Core.Type kind, Core.Var operand, empty]) <-
-    pure (Core.collectArgs body)
-  guard (kind `eqType` mkTyVarTy core_element && operand == input)
-  (Core.Var nil, [Core.Type nil_kind]) <- pure (Core.collectArgs empty)
-  guard (nil == dataConWorkId nilDataCon && nil_kind `eqType` kind)
-  pure ([Bndr core_element visibility], input, kind, callee)
-
--- | A checked tail-recursive worker has a self-call at the root of its result.
-isReverseWorkerTable :: TyCon -> Bool
-isReverseWorkerTable table
-  | Just _ <- sourceTableTermOcc (nameOccName (tyConName table))
-  , Just axiom <- closedFamilyTyConCoAxiom_maybe table
-  , coAxiomRole axiom == Nominal
-  , Just signature <- constructorCaseType (tyConKind table)
-  , isBinaryListCase signature =
-      any tail_call (fromBranches (coAxiomBranches axiom))
-  | otherwise = False
-  where
-    tail_call branch
-      | Just (callee, _) <- splitTyConApp_maybe (coAxBranchRHS branch) = callee == table
-      | otherwise = False
-
--- | Preserve the executable path for a closed call to the reverse wrapper.
-isFinalCoreReverseWrapper :: Id -> Bool
-isFinalCoreReverseWrapper owner =
-    finalCoreMapperOwner owner && isJust (sourceTableId_maybe owner >>= reverseWrapperWorker)
-
--- | Read a checked wrapper's exact worker and classify its single equation.
-reverseWrapperWorker :: TyCon -> Maybe TyCon
-reverseWrapperWorker table = do
-  _ <- sourceTableTermOcc (nameOccName (tyConName table))
-  _ <- listReverseWrapperType (tyConKind table)
-  axiom <- closedFamilyTyConCoAxiom_maybe table
-  guard (coAxiomRole axiom == Nominal)
-  [branch] <- pure (fromBranches (coAxiomBranches axiom))
-  [element, operand] <- pure (coAxBranchTyVars branch)
-  let kind = mkTyVarTy element
-      left = mkTyVarTy operand
-  guard (null (coAxBranchCoVars branch) && eqTypes (coAxBranchLHS branch) [kind, left])
-  (worker, [actual, input, nil]) <- splitTyConApp_maybe (coAxBranchRHS branch)
-  guard (eqTypes [actual, input, nil]
-                 [kind, left, mkTyConApp (promoteDataCon nilDataCon) [kind]] &&
-         isReverseWorkerTable worker)
-  pure worker
-
-{- Note [Checked guarded list equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The cons branch must test the original callback on the original head.
-Each result returns [], the original cons, the original tail, a call on
-that tail, or the original head with that call as its lazy tail. The
-empty branch skips the callback. The cons alternative establishes that
-the input variable and case binder refer to the same cons. The equation
-for returning either variable uses the original head and tail of that cons.
-
-Check the exact body before and after optimization. The result of each
-Boolean branch must agree. The simple optimizer removes the desugarer's
-local failure continuation and binder aliases before the first check.
-It does not apply user rewrite rules.
-The optimizer can replace the empty constructor with the binder of the
-list case. The empty alternative already establishes its constructor.
-
-GHCi places debugger breakpoints on the predicate call, the constructor
-head and the branch results. Read through these ticks in the verifier.
-The checks compare the same cases and results as an object-code build.
-The executable Core keeps its breakpoints. No-code builds still lack
-the final Core check and cannot publish these equations.
-
-The list family tests the spine first. Its cons equation calls a private
-family whose first argument is the predicate result. An unknown result
-cannot select either branch. The recursive application uses the original
-callback and a strict subpattern of the list. Both families share the same
-ordinary owner, including when the solver first sees the guard family
-through an imported type. Drop both families if the final Core check fails.
-
-The guard name identifies its original term owner. A guard with no
-recursive branch can have no source family in its result. It still needs
-its owner and cannot use the allowance for a legacy private leaf.
-See Note [Legacy private source leaves].
--}
-
--- | The checked result of a guarded list branch.
-data GuardedListResult = GuardNil | GuardInput | GuardTail | GuardRecur | GuardConsRecur
-
--- | The two list branches or the checked lazy pair construction.
-data GuardedListBranches
-  = GuardedListBranches (GuardedListResult, GuardedListResult)
-  | GuardedPairBranches
-
--- | Check the predicate case and the result of each alternative.
-directGuardedList :: (Core.CoreExpr -> Core.CoreExpr) -> Id -> Core.CoreExpr
-                  -> Maybe (ConstructorCaseType, (GuardedListResult, GuardedListResult))
-directGuardedList prepare owner original = do
-    ConstructorCaseType declared tc [declared_el] [declared_pred, declared_input] 1 declared_result <-
-      guarded_signature (varType owner)
-    guard (tc == listTyCon && declared_input `eqType` declared_result &&
-           declared_pred `eqType` mkVisFunTyManyU declared_el boolTy &&
-           not (hasNativeDependentExprRhs original) &&
-           exprType original `eqType` varType owner)
-    let rhs = stripTicksE isSourceBreakpoint (prepare original)
-    ConstructorCaseType telescope _ elements domains _ result <- guarded_signature (exprType rhs)
-    [element] <- pure elements
-    [pred_ty, input] <- pure domains
-    let (binders, body) = Core.collectBinders rhs
-        (types, terms) = splitAt (length telescope) binders
-        kind_args = mkTyVarTys types
-        returned con fields = listConstructor con element fields
-    [p, ls] <- pure terms
-    guard (types == binderVars telescope && all isId terms &&
-           eqTypes (map varType terms) [pred_ty, input])
-    (list_binder, x, xs, empty, rejected, accepted) <- guardedListBody p ls element result body
-    case empty of
-      Core.Var value | value == list_binder -> pure ()
-      _ -> void (returned nilDataCon 0 empty)
-    let recurse value = do
-          (Core.Var f, args) <- pure (Core.collectArgs value)
-          let (kind_args', value_args) = splitAt (length types) args
-          kinds <- coreTypeArgs kind_args'
-          [Core.Var callback, Core.Var tail_arg] <- pure value_args
-          guard (f == owner && eqTypes kinds kind_args && callback == p && tail_arg == xs)
-        branch (Core.Var v)
-          | v == list_binder || v == ls = Just GuardInput
-          | v == xs = Just GuardTail
-        branch value =
-          (GuardNil <$ returned nilDataCon 0 value) <|>
-          (GuardRecur <$ recurse value) <|>
-          (do [Core.Var head_value, tail_value] <- returned consDataCon 2 value
-              guard (head_value == x)
-              GuardConsRecur <$ recurse tail_value)
-    on_false <- branch rejected
-    on_true <- branch accepted
-    let kept_binders = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope declared
-    pure (ConstructorCaseType kept_binders tc elements domains 1 result, (on_false, on_true))
-  where
-    guarded_signature ty = constructorCaseType ty <|> monomorphicGuardedListCaseType ty
-
--- | Read the input spine and the application of the same predicate to its head.
-guardedListBody :: Id -> Id -> Type -> Type -> Core.CoreExpr
-                -> Maybe (Id, Id, Id, Core.CoreExpr, Core.CoreExpr, Core.CoreExpr)
-guardedListBody p input element result body = do
-    Core.Case (Core.Var scrutinee) list_binder outer
-      [ Core.Alt (Core.DataAlt nil) [] empty
-        , Core.Alt (Core.DataAlt cons) [head_id, tail_id] nonempty ] <- pure body
-    guard (scrutinee == input && outer `eqType` result && nil == nilDataCon &&
-           cons == consDataCon && isId head_id && isId tail_id &&
-           eqTypes (map varType [head_id, tail_id]) [element, varType input])
-    Core.Case test _ inner
-      [ Core.Alt (Core.DataAlt no) [] rejected
-        , Core.Alt (Core.DataAlt yes) [] accepted ] <- pure nonempty
-    (Core.Var predicate, [Core.Var head_arg]) <- pure (Core.collectArgs test)
-    guard (predicate == p && head_arg == head_id && inner `eqType` result &&
-           no == falseDataCon && yes == trueDataCon)
-    pure (list_binder, head_id, tail_id, empty, rejected, accepted)
-
-{- Note [Lazy recursive guarded list pairs]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The input spine and predicate guard the returned pair. The accepting
-branch returns a boxed pair with the original head in the first field.
-Both field selectors scrutinize the same suspended recursive call.
-The recursive call must stay under that suspension. A case on the
-recursive pair before the result constructor would force the tail.
-
-CPR can put an unboxed result in a private worker. Check the exported
-wrapper's exact call and exact reboxing. In the worker, check the
-unboxed constructors and the same lazy selectors. The reboxing on the
-recursive edge must remain in the let binding. Check the target and
-arguments of both calls. The rules for an ordinary guarded list still
-require the original predicate, the original head, and the matched tail.
-
-GHCi can keep a selector in a let binding named by a debugger breakpoint.
-Check that exact binding when a result field uses it. The executable
-Core keeps the aliases and breakpoints.
-
-Use the installed checked pair projection equations in the accepting
-branch. The publisher checks both projections at the list field kind.
-Their family applications remain under the returned pair. A neutral
-recursive tail therefore leaves the same family application as an
-ordinary client call to the projection. The standard source dependency
-walk checks the projection owners and their rules.
--}
-
--- | Check both forms of the guarded pair. See Note [Lazy recursive guarded list pairs].
-directGuardedListPair :: (Core.CoreExpr -> Core.CoreExpr) -> [(Id, Core.CoreExpr)]
-                      -> Id -> Core.CoreExpr -> Maybe ConstructorCaseType
-directGuardedListPair prepare bindings owner original = do
-    guard (exprType original `eqType` varType owner && not (hasNativeDependentExprRhs original))
-    signature@(ConstructorCaseType telescope tc [element] [predicate, input] 1 result) <-
-        constructorCaseType (varType owner)
-    guard (tc == listTyCon && predicate `eqType` mkVisFunTyManyU element boolTy &&
-           result `eqType` mkTupleTy Boxed [input, input])
-    let rhs = stripTicksE isSourceBreakpoint (prepare original)
-        operands expr = do
-          let (binders, body) = Core.collectBinders expr
-              (types, terms) = splitAt (length telescope) binders
-          [p, ls] <- pure terms
-          (root, [elt]) <- caseDatatype (varType ls)
-          guard (root == listTyCon && all isId terms && lengthIs types (length telescope) &&
-                 all (\v -> isTyVar v && isLiftedTypeKind (varType v)) types &&
-                 varType p `eqType` mkVisFunTyManyU elt boolTy)
-          pure (mkTyVarTys types, p, ls, elt, body)
-
-        verify box loop expr = do
-          guard (exprType expr `eqType` varType loop)
-          (types, p, ls, elt, body) <- operands expr
-          let list = varType ls
-              result_ty = mkTupleTy box [list, list]
-              nil (Core.Var v) list_binder = v == list_binder || v == ls
-              nil value _ = isJust (listConstructor nilDataCon elt 0 value)
-          (list_binder, x, xs, empty, rejected, accepted) <-
-            guardedListBody p ls elt result_ty body
-          (nil_left, nil_right) <- pairFields box list empty
-          guard (nil nil_left list_binder && nil nil_right list_binder)
-          (nil_field, Core.Var returned) <- pairFields box list rejected
-          void (listConstructor nilDataCon elt 0 nil_field)
-          guard (returned == list_binder || returned == ls)
-          Core.Let (Core.NonRec suspended call) value <- pure accepted
-          guard (varType suspended `eqType` mkTupleTy Boxed [list, list])
-          recursive <- case box of
-            Boxed -> pure call
-            Unboxed -> reboxedCall list call
-          guard (guardedPairCall types p xs recursive == Just loop)
-          let (aliases, pair) = selectorLets value
-          (prefix, suffix) <- pairFields box list pair
-          [Core.Var head_id, tail_value] <- listConstructor consDataCon elt 2 prefix
-          guard (head_id == x)
-          first <- pairField aliases CLeft list suspended tail_value
-          second <- pairField aliases CRight list suspended suffix
-          guard (lengthIs aliases (length (catMaybes [first, second])))
-
-        worker_wrapper = do
-          (types, p, ls, _, body) <- operands rhs
-          call <- reboxedCall (varType ls) body
-          worker <- guardedPairCall types p ls call
-          guard (worker /= owner)
-          expression <- lookup worker bindings
-          verify Unboxed worker (stripTicksE isSourceBreakpoint expression)
-    verify Boxed owner rhs <|> worker_wrapper
-    pure signature
-  where
-    selectorLets (Core.Let (Core.NonRec alias selector) value) =
-      let (aliases, result) = selectorLets value
-      in ((alias, selector) : aliases, result)
-    selectorLets value = ([], value)
-
--- | Match a saturated list constructor at the checked element type.
-listConstructor :: DataCon -> Type -> Int -> Core.CoreExpr -> Maybe [Core.CoreExpr]
-listConstructor con element arity value = case Core.collectArgs value of
-    (Core.Var worker, Core.Type ty : fields)
-      | worker == dataConWorkId con, ty `eqType` element, lengthIs fields arity -> Just fields
-    _ -> Nothing
-
--- | Match the original predicate, list operand, and visible type arguments.
-guardedPairCall :: [Type] -> Id -> Id -> Core.CoreExpr -> Maybe Id
-guardedPairCall types predicate input value = do
-    (Core.Var function, args) <- pure (Core.collectArgs value)
-    let (kind_args, terms) = span Core.isTypeArg args
-    [Core.Var p, Core.Var ls] <- pure terms
-    guard (p == predicate && ls == input && eqTypes (map Core.exprToType kind_args) types)
-    pure function
-
--- | Read only the two lazy fields of the specified tuple constructor.
-pairFields :: Boxity -> Type -> Core.CoreExpr -> Maybe (Core.CoreExpr, Core.CoreExpr)
-pairFields box field_kind value = do
-    (Core.Var worker, args) <- pure (Core.collectArgs value)
-    let (_, terms) = span Core.isTypeArg args
-    [first, second] <- pure terms
-    guard (worker == dataConWorkId (tupleDataCon box 2) &&
-           exprType value `eqType` mkTupleTy box [field_kind, field_kind] &&
-           eqTypes (map exprType terms) [field_kind, field_kind])
-    pure (first, second)
-
--- | Read a worker call whose unboxed result is placed in a new boxed pair.
-reboxedCall :: Type -> Core.CoreExpr -> Maybe Core.CoreExpr
-reboxedCall list expr = do
-    Core.Case call _ result [Core.Alt (Core.DataAlt con) [first, second] rhs] <- pure expr
-    guard (con == tupleDataCon Unboxed 2 && result `eqType` mkTupleTy Boxed [list, list] &&
-           exprType call `eqType` mkTupleTy Unboxed [list, list])
-    (Core.Var left, Core.Var right) <- pairFields Boxed list rhs
-    guard (left == first && right == second)
-    pure call
-
--- | Match a strict selector inside a lazy result field and report its alias.
-pairField :: [(Id, Core.CoreExpr)] -> LeftOrRight -> Type -> Id -> Core.CoreExpr -> Maybe (Maybe Id)
-pairField aliases side list suspended field = do
-    (alias, value) <- case field of
-      Core.Var v -> (Just v,) <$> lookup v aliases
-      _ -> pure (Nothing, field)
-    Core.Case (Core.Var pair) _ kind
-      [Core.Alt (Core.DataAlt con) [first, second] (Core.Var selected)] <- pure value
-    guard (con == tupleDataCon Boxed 2 && pair == suspended && kind `eqType` list &&
-           selected == pickLR side (first, second))
-    pure alias
-
--- | The auxiliary family shares the filter's source-equation owner.
-filterGuardOcc :: OccName -> OccName
-filterGuardOcc = mkSourceTableOcc . mkVarOcc . ("#guard:" ++) . occNameString
-
--- | Recognise a generated Boolean guard for a checked filter.
-isSourceFilterGuard :: TyCon -> Bool
-isSourceFilterGuard tc = isJust $
-    sourceTableTermOcc (nameOccName (tyConName tc)) >>= stripPrefix "#guard:" . occNameString
-
--- | Compare the exact derived occurrence and module of a filter guard.
-isFilterGuardFor :: TyCon -> TyCon -> Bool
-isFilterGuardFor primary candidate =
-    nameModule_maybe root == nameModule_maybe guard_name &&
-    case sourceTableTermOcc (nameOccName root) of
-      Just owner -> nameOccName guard_name == filterGuardOcc owner
-      Nothing -> False
-  where
-    root = tyConName primary
-    guard_name = tyConName candidate
-
--- | Resolve and check the pair selectors used by the guarded list equations.
--- See Note [Lazy recursive guarded list pairs].
-guardedListProjections :: Type -> TcM (Maybe (TyCon, TyCon))
-guardedListProjections list = do
-    envs <- tcGetFamInstEnvs
-    left <- fresh_field
-    right <- fresh_field
-    let pair = mkTyConApp (promotedTupleDataCon Boxed 2) [list, list, left, right]
-        inputs = [list, list, pair]
-        projection occ selected = do
-          projected <- lookupBootModuleIdMaybe
-                         (mkGhcInternalModule (fsLit "GHC.Internal.Data.Tuple"))
-                         (mkVarOcc occ)
-          pure $ do
-            table <- projected >>= sourceTableId_maybe
-            guard (sourceCaseVisibleArity table == Just 1)
-            reduced <- reduceTyFamApp_maybe envs Nominal table inputs
-            guard (reductionReducedType reduced `eqType` selected)
-            pure table
-    first <- projection "fst" left
-    second <- projection "snd" right
-    pure ((,) <$> first <*> second)
-  where
-    fresh_field = mkTyVarTy <$> freshSysTyVar "field" list
-
--- | Publish two families for the two tests in a guarded cons equation.
-publishGuardedList :: Id -> ConstructorCaseType -> GuardedListBranches -> TcM (Maybe (TyCon, TyCon))
-publishGuardedList owner signature@(ConstructorCaseType _ _ _ [_, list] _ _) branches =
-    case branches of
-      GuardedListBranches results -> Just <$> publishGuardedListWith owner signature (Left results)
-      GuardedPairBranches -> do
-        selectors <- guardedListProjections list
-        traverse (publishGuardedListWith owner signature . Right) selectors
-publishGuardedList _ _ _ = panic "publishGuardedList: invalid checked signature"
-
--- | Share the signature and predicate case across both guarded result shapes.
-publishGuardedListWith :: Id -> ConstructorCaseType
-                       -> Either (GuardedListResult, GuardedListResult) (TyCon, TyCon)
-                       -> TcM (TyCon, TyCon)
-publishGuardedListWith owner
-    (ConstructorCaseType telescope _ [element] [predicate_domain, list_domain] _ result) branches = do
-    (renaming, parameters) <- freshenTyVarBndrs (binderVars telescope)
-    let instantiate = substTyUnchecked renaming . expandTypeSynonyms
-        args = mkTyVarTys parameters
-        kind_binders = zipWith mkNamedTyConBinder (map binderFlag telescope) parameters
-        el = instantiate element
-        pred_kind = instantiate predicate_domain
-        list = instantiate list_domain
-        result_kind = instantiate result
-        loc = nameSrcSpan term
-    operands <- mapM (freshSysTyVar "arg") [pred_kind, instantiate list_domain]
-    guard_operands <- mapM (freshSysTyVar "arg") [boolTy, pred_kind, el, list]
-    p <- freshSysTyVar "predicate" pred_kind
-    x <- freshSysTyVar "head" el
-    xs <- freshSysTyVar "tail" list
-    root_name <- newImplicitBinder term mkSourceTableOcc
-    root_axiom <- newImplicitBinder root_name mkInstTyCoOcc
-    guard_name <- newImplicitBinder term filterGuardOcc
-    guard_axiom <- newImplicitBinder guard_name mkInstTyCoOcc
-    let promoted_pair first second =
-          mkTyConApp (promotedTupleDataCon Boxed 2) [list, list, first, second]
-        branch vars lhs rhs _ =
-          mkCoAxBranch (parameters ++ vars) [] [] (args ++ lhs) rhs
-                        (map (const Nominal) (parameters ++ vars)) loc
-        yes = mkTyConTy (promoteDataCon trueDataCon)
-        no = mkTyConTy (promoteDataCon falseDataCon)
-    let predicate = mkTyVarTy p
-        hd = mkTyVarTy x
-        tl = mkTyVarTy xs
-        nil = mkTyConApp (promoteDataCon nilDataCon) [el]
-        cons first rest = mkTyConApp (promoteDataCon consDataCon) [el, first, rest]
-        spine = buildSourceFamily root_name root_axiom
-          (kind_binders ++ mkAnonTyConBinders operands) result_kind
-          [ branch [p] [predicate, nil] empty
-            , branch [p, x, xs] [predicate, cons hd tl]
-                (mkTyConApp select (args ++ [mkAppTy predicate hd, predicate, hd, tl])) ]
-        select = buildSourceFamily guard_name guard_axiom
-          (kind_binders ++ mkAnonTyConBinders guard_operands) result_kind
-          [ branch [p, x, xs] [no, predicate, hd, tl] rejected
-            , branch [p, x, xs] [yes, predicate, hd, tl] accepted ]
-        branch_result = guardedListBranchResult spine args predicate hd tl
-        (empty, rejected, accepted) = case branches of
-          Left (on_false, on_true) ->
-            (nil, branch_result on_false, branch_result on_true)
-          Right (first, second) ->
-            let recur = mkTyConApp spine (args ++ [predicate, tl])
-                project selector = mkTyConApp selector [list, list, recur]
-            in (promoted_pair nil nil, promoted_pair nil (cons hd tl),
-                promoted_pair (cons hd (project first)) (project second))
-    pure (spine, select)
-  where
-    term = idName owner
-publishGuardedListWith _ _ _ = panic "publishGuardedListWith: invalid checked signature"
-
--- | Interpret a checked result using the head and tail of the matched cons.
-guardedListBranchResult :: TyCon -> [Type] -> Type -> Type -> Type -> GuardedListResult -> Type
-guardedListBranchResult spine params predicate hd tl branch = case branch of
-    GuardNil -> mkTyConApp (promoteDataCon nilDataCon) [element]
-    GuardInput -> cons tl
-    GuardTail -> tl
-    GuardRecur -> recur
-    GuardConsRecur -> cons recur
-  where
-    element = typeKind hd
-    cons rest = mkTyConApp (promoteDataCon consDataCon) [element, hd, rest]
-    recur = mkTyConApp spine (params ++ [predicate, tl])
-
--- | Collect the provisional families that must leave the interface together.
-finalCoreSourceFamilies :: Id -> [TyCon]
-finalCoreSourceFamilies owner = do
-    primary <- maybe [] pure (sourceTableId_maybe owner)
-    primary : filter (isFilterGuardFor primary) (fromMaybe [] (sourceTableCallees primary))
-
--- | Identify an owner whose nominal equations require disabled caller rules.
--- See Note [Final Core source equations].
-finalCoreMapperOwner :: Id -> Bool
-finalCoreMapperOwner v = case idDetails v of
-  SourceTableId _ _ FinalCoreSourceTable -> True
-  _ -> False
-
--- | Remember exact owners before optimization.
-finalCoreMappers :: [Core.CoreBind] -> [Id]
-finalCoreMappers = foldr collect []
-  where
-    collect (Core.NonRec v _) acc
-      | finalCoreMapperOwner v = v : acc
-      | otherwise              = acc
-    collect (Core.Rec pairs) acc =
-      foldr (\(v, _) rest -> if finalCoreMapperOwner v then v : rest else rest) acc pairs
-
--- | Confirm the same owner and the same checked equations after optimization.
-verifyFinalCoreMapper :: [Core.CoreBind] -> Id -> Bool
-verifyFinalCoreMapper binds original =
-  case findByName (idName original) binds of
-    [(owner, expression)]
-      | varType owner `eqType` varType original
-      , isIdentitySourceType (varType owner)
-      -> verifyProjection (unitNameSet (idName owner)) owner expression
-      | varType owner `eqType` varType original
-      , isJust (compositionSourceType (varType owner))
-      -> isJust (checkedCompositionSource owner expression)
-      | varType owner `eqType` varType original
-      , Just table <- sourceTableId_maybe original
-      , isFinalCoreCaseTable table
-      -> checkedFinalCaseTable bindings table
-      | varType owner `eqType` varType original
-      , Just (_, constructors) <- indexedProjectionSource original
-      -> case checkedIndexedProjection id owner expression of
-           Just (_, recursion) -> lengthIs constructors 1 || isJust recursion
-           Nothing -> False
-      | varType owner `eqType` varType original
-      -> case finalCoreSourceFamilies original of
-           [_] -> isJust (directListMapper owner expression <|> directListAppend owner expression)
-           [spine, _] | Just (tc, _) <- splitTyConApp_maybe (tyConResKind spine)
-                      , tc == tupleTyCon Boxed 2 ->
-                        isJust (directGuardedListPair id bindings owner expression)
-           [spine, select] -> isJust $ do
-             (_, (on_false, on_true)) <- directGuardedList id owner expression
-             axiom <- closedFamilyTyConCoAxiom_maybe select
-             [rejected, accepted] <- pure (fromBranches (coAxiomBranches axiom))
-             let check expected branch = do
-                   let (params, operands) = splitAt (helperInvisibleArity select) (coAxBranchLHS branch)
-                   [_, predicate, hd, tl] <- pure operands
-                   guard (coAxBranchRHS branch `eqType`
-                          guardedListBranchResult spine params predicate hd tl expected)
-             check on_false rejected
-             check on_true accepted
-           _ -> False
-    _ -> False
-  where
-    findByName target = foldr matchBind []
-      where
-        matchBind (Core.NonRec v rhs) acc
-          | idName v == target = (v, rhs) : acc
-          | otherwise          = acc
-        matchBind (Core.Rec pairs) acc =
-          foldr (\p@(v, _) r -> if idName v == target then p : r else r) acc pairs
-    bindings = Core.flattenBinds binds
-    verifyProjection seen owner (Core.Var target)
-      | not (idName target `elemNameSet` seen)
-      , varType target `eqType` varType owner
-      , Just rhs <- lookup target bindings
-      = verifyProjection (extendNameSet seen (idName target)) target rhs
-    verifyProjection _ owner expression =
-      isJust (checkedIdentitySource owner expression)
-
-isFinalCoreCaseTable :: TyCon -> Bool
-isFinalCoreCaseTable table =
-    isFinalCoreListCaseTable table || isTwoStructuralCaseTable table ||
-    isPartialConstructorCaseTable table || isJust (booleanSelector table)
-
-isFinalCoreListCaseTableBase :: TyCon -> Bool
-isFinalCoreListCaseTableBase table =
-    isListFoldTable table || isListZipWithTable table ||
-    isReverseWorkerTable table || isJust (reverseWrapperWorker table) ||
-    isTwoListCaseTable table || isSizeListCaseTable table
-
-isFinalCoreListCaseTable :: TyCon -> Bool
-isFinalCoreListCaseTable table =
-    isFinalCoreListCaseTableBase table || isFinalSourceListTable table
-
--- | Identify a nominal list-constructing source table certified under -O2 rules.
-isFinalSourceListTable :: TyCon -> Bool
-isFinalSourceListTable table = isJust $ do
-    _ <- sourceTableTermOcc (nameOccName (tyConName table))
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    guard (coAxiomRole axiom == Nominal)
-    guard (not (isFinalCoreListCaseTableBase table ||
-                isTwoStructuralCaseTable table ||
-                isPartialConstructorCaseTable table ||
-                isJust (booleanSelector table) ||
-                isSourceFilterGuard table))
-    guard (not (hasArrowDomain (tyConKind table)))
-    let branches = fromBranches (coAxiomBranches axiom)
-    guard (lengthAtLeast branches 2 && not (isAppendBranches table branches))
-    guard (anyConstructsList branches)
-  where
-    hasArrowDomain ty =
-      let (_, body) = splitForAllForAllTyBinders ty
-      in go body
-      where
-        go t | Just (dom, rest) <- caseArrow t = isJust (caseArrow dom) || go rest
-             | otherwise = False
-
-    isAppendBranches fam [b1, b2]
-      | Just (_, TyVarTy v1) <- unsnoc (coAxBranchLHS b1)
-      , coAxBranchRHS b1 `eqType` mkTyVarTy v1
-      , lengthIs (coAxBranchLHS b2) (tyConArity fam)
-      = let rhs2 = coAxBranchRHS b2
-        in case splitTyConApp_maybe rhs2 of
-             Just (c, [_, _, tail_ty])
-               | c == promoteDataCon consDataCon
-               , Just (rec_fam, _) <- splitTyConApp_maybe tail_ty
-               -> rec_fam == fam
-             _ -> False
-    isAppendBranches _ _ = False
-
-    anyConstructsList branches =
-      let cons_tc = promoteDataCon consDataCon
-          nil_tc  = promoteDataCon nilDataCon
-          tcs     = tyConsOfTypes (map coAxBranchRHS branches)
-      in cons_tc `elementOfUniqSet` tcs || nil_tc `elementOfUniqSet` tcs
-
--- | Recheck provisional list tables even when simplification dropped the owner's IdDetails.
--- The original owner identifies tables that already have nominal authority.
-failedFinalListTables :: [Core.CoreBind] -> [Core.CoreBind] -> [TyCon] -> [TyCon]
-failedFinalListTables original binds tables =
-    [table | table <- tables
-           , isFinalCoreListCaseTable table
-           , not (tyConName table `elemNameSet` early)
-           , not (checkedFinalCaseTable bindings table)]
-  where
-    early = extendNameSetList emptyNameSet
-      [ tyConName table
-      | bind <- original
-      , owner <- Core.bindersOf bind
-      , SourceTableId _ table NominalSourceTable <- [idDetails owner] ]
-    bindings = Core.flattenBinds binds
-
--- | Check the same final owner and any exact call from a reverse wrapper.
-checkedFinalCaseTable :: [(Id, Core.CoreExpr)] -> TyCon -> Bool
-checkedFinalCaseTable bindings table = isJust $ do
-    (owner, rhs) <- find (owns table . fst) bindings
-    guard (sourceTableId_maybe owner == Just table)
-    case reverseWrapperWorker table of
-      Just worker -> do
-        (_, _, _, callee) <- directListReverseWrapper owner rhs
-        guard (owns worker callee)
-        worker_rhs <- lookup callee bindings
-        () <$ directListReverseWorker callee worker_rhs
-      Nothing | isListFoldTable table -> () <$ directListFold owner rhs
-              | isListZipWithTable table -> do
-                  (signature, rows) <- checkedListZip (const True) owner rhs
-                  guard (matchesConstructorCase table signature rows)
-              | isTwoListCaseTable table -> do
-                  let check specialized = do
-                        (signature, rows) <- checkedTwoListCaseWith specialized (const True) owner rhs
-                        guard (matchesConstructorCase table signature rows)
-                  check Nothing <|> do
-                    worker <- checkedSpecConstrWorker bindings table owner
-                    check (Just worker)
-              | Just select <- booleanSelector table ->
-                  let predicate callee =
-                        checkedBranchPredicate (fromMaybe callee (fst <$> find ((== callee) . fst) bindings))
-                  in do
-                    (signature, rows) <- checkedBooleanConstructorCase (const True) predicate owner rhs
-                    guard (matchesConstructorCase table signature (selectConstructorRows select rows))
-              | isTwoStructuralCaseTable table || isSizeListCaseTable table -> do
-                  (signature, rows) <- checkedStructuralCase (const True) owner rhs
-                  guard (matchesConstructorCase table signature rows)
-              | isPartialConstructorCaseTable table -> do
-                  (signature, rows) <- checkedPartialConstructorCase (const True) owner rhs
-                  guard (matchesConstructorCase table signature rows)
-              | isFinalSourceListTable table ->
-                  guard (matchesFinalSourceTable bindings table owner rhs)
-              | otherwise -> () <$ directListReverseWorker owner rhs
-  where
-    owns family value =
-      let family_name = tyConName family
-          owner_name = idName value
-      in nameModule_maybe owner_name == nameModule_maybe family_name &&
-         sourceTableTermOcc (nameOccName family_name) == Just (nameOccName owner_name)
-
--- | Verify on post-simplifier Core that build was inlined to literal constructors
--- matching the certified closed-family branches of the source table.
-matchesFinalSourceTable :: [(Id, Core.CoreExpr)] -> TyCon -> Id -> Core.CoreExpr -> Bool
-matchesFinalSourceTable bindings table owner rhs = isJust $ do
-    guard (exprType rhs `eqType` varType owner && varType owner `eqType` tyConKind table)
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    let branches = fromBranches (coAxiomBranches axiom)
-        (invisible_bndrs, visible_bndrs) = span isInvisibleTyConBinder (tyConBinders table)
-        n_tvs = length invisible_bndrs
-        n_vals = length visible_bndrs
-        (core_bndrs, core_body0) = Core.collectBinders (stripTicksE isSourceBreakpoint rhs)
-        (core_tvs, core_vals) = splitAt n_tvs core_bndrs
-    guard (lengthIs core_tvs n_tvs && all isTyVar core_tvs &&
-           lengthIs core_vals n_vals && all isId core_vals)
-    let fam_tyvars = map binderVar invisible_bndrs
-        fam_subst = zipTvSubst fam_tyvars (mkTyVarTys core_tvs)
-    guard (eqTypes (map varType core_tvs) (map (substTy fam_subst . varType) fam_tyvars))
-    guard (eqTypes (map varType core_vals) (map (substTy fam_subst . varType . binderVar) visible_bndrs))
-    (let_env, core_body) <- pure (peelCoreAliases [] core_body0)
-    Core.Case (Core.Var scrut) case_bndr case_res alts <- pure (stripTicksE isSourceBreakpoint core_body)
-    let res_expected = substTy fam_subst (tyConResKind table)
-    guard (case_res `eqType` res_expected)
-    branch0 : _ <- pure branches
-    let (_, pat_tys0) = splitAt n_tvs (coAxBranchLHS branch0)
-    scrut_pos <- findIndex (isJust . promotedPat) pat_tys0
-    let scrut_arg = core_vals !! scrut_pos
-        carried_vals = [v | (i, v) <- zip [0..] core_vals, i /= scrut_pos]
-    guard (resolveCaseAlias let_env scrut == scrut_arg)
-    (scrut_dc0, _) <- promotedPat (pat_tys0 !! scrut_pos)
-    let scrut_tc = dataConTyCon scrut_dc0
-        alt_dcs = [dc | Core.Alt (Core.DataAlt dc) _ _ <- alts]
-    guard (lengthIs alts (length alt_dcs) && completeCase scrut_tc alt_dcs)
-    forM_ branches $ \branch -> do
-      let (fam_args, pat_tys) = splitAt n_tvs (coAxBranchLHS branch)
-      quantified <- traverse getTyVar_maybe fam_args
-      (dc, pat_args) <- promotedPat (pat_tys !! scrut_pos)
-      guard (dataConTyCon dc == scrut_tc)
-      let field_pats = drop (length (dataConUnivTyVars dc)) pat_args
-          carried_pats = [p | (i, p) <- zip [0..] pat_tys, i /= scrut_pos]
-      field_tvs <- traverse getTyVar_maybe field_pats
-      carried_tvs <- traverse getTyVar_maybe carried_pats
-      Core.Alt _ fields alt_rhs <- find (altFor dc) alts
-      guard (all isId fields && equalLength fields field_tvs && equalLength carried_vals carried_tvs)
-      let br_subst = zipTvSubst quantified (mkTyVarTys core_tvs)
-      guard (eqTypes (map varType fields) (map (substTy br_subst . varType) field_tvs))
-      guard (eqTypes (map varType carried_vals) (map (substTy br_subst . varType) carried_tvs))
-      let var_map = zip field_tvs fields ++ zip carried_tvs carried_vals
-          aliases = (case_bndr, scrut_arg) : let_env
-      guard (matchBranch [] aliases [] br_subst var_map (coAxBranchRHS branch) alt_rhs)
-  where
-    promotedPat ty = do
-      (tc, args) <- splitTyConApp_maybe ty
-      dc <- isPromotedDataCon_maybe tc
-      pure (dc, args)
-
-    altFor dc (Core.Alt (Core.DataAlt actual) _ _) = dc == actual
-    altFor _ _ = False
-
-    peelCoreAliases env (Core.Let (Core.NonRec b (Core.Var target)) rest)
-      | isId b, isId target = peelCoreAliases ((b, resolveCaseAlias env target) : env) (stripTicksE isSourceBreakpoint rest)
-    peelCoreAliases env expr = (env, expr)
-
-    matchBranch seen aliases let_env br_subst var_map expected_ty expr0 =
-      case stripTicksE isSourceBreakpoint expr0 of
-        Core.Let (Core.NonRec b bound) rest
-          | isId b, not (isUnliftedType (varType b)), not (isJoinId b)
-          -> matchBranch seen aliases ((b, bound) : let_env) br_subst var_map expected_ty rest
-        expr -> case expected_ty of
-          TyVarTy tv -> case lookup tv var_map of
-            Just target -> case expr of
-              Core.Var v -> resolveCaseAlias aliases v == target ||
-                (v `notElem` seen && maybe False (matchBranch (v : seen) aliases let_env br_subst var_map expected_ty) (lookup v let_env))
-              _ -> False
-            Nothing -> False
-          TyConApp tc args
-            | Just dc <- isPromotedDataCon_maybe tc ->
-                case expr of
-                  Core.Var v
-                    | isNothing (isDataConWorkId_maybe v)
-                    , v `notElem` seen
-                    , Just bound <- lookup v let_env <|> lookup v bindings
-                    -> matchBranch (v : seen) aliases let_env br_subst var_map expected_ty bound
-                  _ -> case Core.collectArgs expr of
-                    (Core.Var work, core_args)
-                      | isDataConWorkId_maybe work == Just dc ->
-                          let n_univ = length (dataConUnivTyVars dc)
-                              (ty_args, val_args) = splitAt n_univ core_args
-                              (exp_tys, exp_vals) = splitAt n_univ args
-                          in matchTypes br_subst exp_tys ty_args &&
-                             equalLength exp_vals val_args &&
-                             and (zipWith (matchBranch seen aliases let_env br_subst var_map) exp_vals val_args)
-                    _ -> False
-            | tc == table ->
-                case Core.collectArgs expr of
-                  (Core.Var fn, core_args)
-                    | fn == owner ->
-                        let n_inv = helperInvisibleArity table
-                            (ty_args, val_args) = splitAt n_inv core_args
-                            (exp_tys, exp_vals) = splitAt n_inv args
-                        in matchTypes br_subst exp_tys ty_args &&
-                           equalLength exp_vals val_args &&
-                           and (zipWith (matchBranch seen aliases let_env br_subst var_map) exp_vals val_args)
-                  _ -> False
-            | isJust (sourceTableTermOcc (nameOccName (tyConName tc))) ->
-                case Core.collectArgs expr of
-                  (Core.Var fn, core_args)
-                    | Just callee_fam <- sourceTableId_maybe fn
-                    , tyConName callee_fam == tyConName tc ->
-                        let n_inv = helperInvisibleArity tc
-                            (ty_args, val_args) = splitAt n_inv core_args
-                            (exp_tys, exp_vals) = splitAt n_inv args
-                        in matchTypes br_subst exp_tys ty_args &&
-                           equalLength exp_vals val_args &&
-                           and (zipWith (matchBranch seen aliases let_env br_subst var_map) exp_vals val_args)
-                  _ -> False
-          _ -> False
-
-    matchTypes br_subst exp_tys core_args =
-      let tys = [t | Core.Type t <- core_args]
-      in equalLength core_args tys &&
-         equalLength exp_tys tys &&
-         eqTypes (map (substTy br_subst) exp_tys) tys
-
--- | Check a left-first case tree on two ordinary lists.
-checkedTwoListCase :: (TyCon -> Bool) -> Id -> Core.CoreExpr
-                   -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedTwoListCase = checkedTwoListCaseWith Nothing
-
-checkedTwoListCaseWith :: Maybe Id -> (TyCon -> Bool) -> Id -> Core.CoreExpr
-                       -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedTwoListCaseWith specialized public owner rhs = do
-    (signature, rows) <-
-      checkedConstructorCaseWith CompleteConstructorCase specialized public (const Nothing) owner
-        (stripTicksE isSourceBreakpoint rhs) <|>
-      (guard (isNothing specialized) *> checkedListZip public owner rhs)
-    guard (isTwoListCase signature)
-    pure (signature, rows)
-
--- | Check a structural size case that examines both operands.
-checkedStructuralCase :: (TyCon -> Bool) -> Id -> Core.CoreExpr
-                         -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedStructuralCase public owner rhs = do
-    let body = stripTicksE isSourceBreakpoint rhs
-    checked@(signature@(ConstructorCaseType _ _ _ _ position _), rows) <-
-      checkedConstructorCase public (const Nothing) owner body <|>
-      checkedConstructorCaseWith RightStructuralConstructorCase Nothing public (const Nothing) owner body
-    guard ((isTwoStructuralCase signature || isSizeListCase signature) &&
-           any (checks_other position) rows)
-    pure checked
-  where
-    checks_other 0 (ConstructorCaseRow [_, CaseConstructor{}] _) = True
-    checks_other 1 (ConstructorCaseRow [CaseConstructor{}, _] _) = True
-    checks_other _ _ = False
-
--- | Check independent alternatives of a case on the first ordinary operand.
--- See Note [Independent constructor equations].
-checkedPartialConstructorCase :: (TyCon -> Bool) -> Id -> Core.CoreExpr
-                              -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedPartialConstructorCase public owner rhs = do
-    checked@(ConstructorCaseType _ root _ _ _ _, rows) <-
-      checkedConstructorCaseWith IndependentConstructorCase Nothing public (const Nothing) owner
-        (stripTicksE isSourceBreakpoint rhs)
-    guard (not (null rows) && length rows < length (tyConDataCons root))
-    pure checked
-
-partialConstructorCaseType :: Type -> Maybe ConstructorCaseType
-partialConstructorCaseType ty = do
-    (domains@(first : _ : _), result) <- ordinaryArrows ty
-    (root, args) <- ordinaryDataType first
-    (_, []) <- ordinaryDataType result
-    guard (root /= listTyCon && root /= tupleTyCon Boxed 2 &&
-           all (caseKind []) domains && caseKind [] result)
-    pure (ConstructorCaseType [] root args domains 0 result)
-
-isPartialConstructorCaseTable :: TyCon -> Bool
-isPartialConstructorCaseTable table = isJust $ do
-    _ <- sourceTableTermOcc (nameOccName (tyConName table))
-    ConstructorCaseType _ root _ domains _ _ <- partialConstructorCaseType (tyConKind table)
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    roots <- traverse (branchRoot root domains) (fromBranches (coAxiomBranches axiom))
-    guard (not (null roots) && length roots < length (tyConDataCons root) &&
-           sizeUniqSet (mkUniqSet roots) == length roots)
-  where
-    branchRoot root domains branch = do
-      lhs : carried <- pure (coAxBranchLHS branch)
-      guard (equalLength domains (lhs : carried))
-      (promoted, args) <- splitTyConApp_maybe lhs
-      con <- isPromotedDataCon_maybe promoted
-      let fields = drop (length (dataConUnivTyVars con)) args
-      guard (dataConTyCon con == root && lengthIs fields (dataConSourceArity con) &&
-             eqTypes (fields ++ carried) (mkTyVarTys (coAxBranchTyVars branch)))
-      pure con
-
--- | Use only the existing checked predicate on two structural operands.
--- See Note [Checked Boolean branches].
-checkedBranchPredicate :: Id -> Maybe TyCon
-checkedBranchPredicate callee = do
-    table <- sourceTableId_maybe callee
-    guard (isFinalStructuralSource callee ||
-           (isNominalStructuralSource callee && isTwoStructuralCaseTable table))
-    guard (tyConResKind table `eqType` boolTy)
-    pure table
-
-checkedBooleanConstructorCase :: (TyCon -> Bool) -> (Id -> Maybe TyCon) -> Id -> Core.CoreExpr
-                              -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedBooleanConstructorCase public predicate owner rhs = do
-    checked@(_, rows) <- checkedConstructorCaseWith BooleanConstructorCase Nothing public predicate owner
-                          (stripTicksE isSourceBreakpoint rhs)
-    guard (any checked_guard rows)
-    pure checked
-  where
-    checked_guard (ConstructorCaseRow _ CaseBoolean{}) = True
-    checked_guard _ = False
-
--- | Install the same private branch selector for early and interface equations.
-publishBooleanCase :: Id -> (ConstructorCaseType, [ConstructorCaseRow]) -> TcM (TyCon, TyCon)
-publishBooleanCase owner (signature@(ConstructorCaseType _ _ _ _ _ result), rows) = do
-    select <- publishBooleanSelector owner result
-    table <- publishConstructorCase owner signature (selectConstructorRows select rows)
-    pure (table, select)
-
--- | Recover the private selector of an ordinary constructor case.
-booleanSelector :: TyCon -> Maybe TyCon
-booleanSelector table = do
-    _ <- partialConstructorCaseType (tyConKind table)
-    callees <- sourceTableCallees table
-    select <- find (isFilterGuardFor table) callees
-    let result = tyConResKind table
-    (domains, selected) <- ordinaryArrows (tyConKind select)
-    guard (eqTypes domains [boolTy, result, result] && selected `eqType` result)
-    pure select
-
--- | Keep a Boolean scrutinee even when both branches have the same result.
--- See Note [Checked Boolean branches].
-publishBooleanSelector :: Id -> Type -> TcM TyCon
-publishBooleanSelector owner result = do
-    let term = idName owner
-        loc = nameSrcSpan term
-    binders <- traverse (uncurry freshSysTyVar) [("test", boolTy), ("no", result), ("yes", result)]
-    no <- freshSysTyVar "no" result
-    yes <- freshSysTyVar "yes" result
-    name <- newImplicitBinder term filterGuardOcc
-    axiom <- newImplicitBinder name mkInstTyCoOcc
-    let choose con selected _ =
-          mkCoAxBranch [no, yes] [] [] (mkTyConTy (promoteDataCon con) : mkTyVarTys [no, yes])
-                        (mkTyVarTy selected) [Nominal, Nominal] loc
-    pure (buildSourceFamily name axiom (mkAnonTyConBinders binders) result
-                            [choose falseDataCon no, choose trueDataCon yes])
-
-selectConstructorRows :: TyCon -> [ConstructorCaseRow] -> [ConstructorCaseRow]
-selectConstructorRows select = map select_row
-  where
-    select_row (ConstructorCaseRow lhs (CaseBoolean test rejected accepted)) =
-      ConstructorCaseRow lhs (CaseCall select [] [test, rejected, accepted])
-    select_row row = row
-
-{- Note [Independent constructor equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-One alternative may compute a guard even though another returns a constructor
-without inspecting any other operand. Check the first case for complete,
-distinct constructor coverage. Check each result separately. Retain a row
-only when its left side matches that constructor and otherwise binds fields
-and operands without inspecting them.
-
-For example, a substitution function can have a direct equation for a
-successor while comparing names in the variable and binder alternatives.
-Match the successor even when its field and the carried arguments are open.
-Keep the recursive call under the constructor, on a proper field and with
-the same carried arguments. The call stays stuck if no published equation
-matches it. Omit an alternative that forces an extra operand or whose result
-cannot be checked. A computed guard supplies no independent equation,
-even if both branches return the same value.
-
-Publish the checked subset only with the exact term owner. Check the same
-rows against the final Core and use its usual rule checks in clients.
--}
-
-{- Note [Checked Boolean branches]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An ordinary case on a checked Boolean call can also retain both branches.
-Use the exact saturated predicate. All three expressions must pass the
-same scope, kind and recursion checks. Return the original case pattern
-if a branch returns the root case binder. Simplification can replace a
-constructor reconstruction with this binder. It has already been forced
-by the outer case.
-
-The private selector has an equation for each Boolean constructor.
-A scrutinee that is still unknown leaves the selector stuck, even when
-both arms are equal. Keep the predicate's family in the equation so that
-the rule-dependency walk checks it. Check the same call and alternatives
-in final Core. The guard and the root leave the interface together.
--}
-
-{- Note [Checked constructor specialization]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-SpecConstr can fix the first list to a known cons. Its rule can include
-the second operand or leave it to a subsequent application. Check the
-exact bound type arguments and field order in the rule. Find the exact
-worker binder in this module's final Core.
-
-Start the worker check with the captured cons in the first pattern.
-Its remaining case must inspect the second list. Compare the rows to
-the original cons equations. Each recursive worker call keeps both
-captured fields and passes a proper subterm of the second operand.
-Check the same field mapping at calls from the wrapper. Compare all
-wrapper equations after translating these calls to the original owner.
-
-Tidy uses demand information to choose the call-by-value arguments.
-Check the two captured fields with the same Tidy computation. A strict
-second list agrees with the checked first case of the worker.
-
-The importer can recover the same worker from the owner's vanilla
-unfolding. Tidy regenerates that unfolding from the final binding.
-The direct check must fail and the check with the rule's worker must
-succeed. Thus the final binding contains a call to this exact worker.
-The producer could only keep the table after checking this worker
-and its equations. An older producer with the direct check alone
-cannot export a table for this wrapper.
-
-Check the imported worker's call-by-value marks and every visible
-rule for the worker. A missing vanilla unfolding leaves the rule
-unchecked. A stable source unfolding can differ from the final
-binding, so it cannot provide this evidence.
--}
-
--- | Recover the checked worker from the final wrapper's vanilla unfolding.
--- See Note [Checked constructor specialization].
-checkedImportedSpecConstr :: RuleEnv -> Id -> TyCon -> CoreRule -> Maybe ()
-checkedImportedSpecConstr env owner table rule = do
-    worker <- checkSpecConstrRule owner rule
-    guard (worker /= owner &&
-           nameModule_maybe (idName worker) == nameModule_maybe (idName owner) &&
-           lazySpecConstrFields worker && null (activeMapperRules env worker))
-    Core.CoreUnfolding { Core.uf_src = VanillaSrc, Core.uf_tmpl = rhs } <-
-      pure (realIdUnfolding owner)
-    guard (isNothing (checkedTwoListCase (const True) owner rhs))
-    (signature, rows) <- checkedTwoListCaseWith (Just worker) (const True) owner rhs
-    guard (matchesConstructorCase table signature rows)
-
-lazySpecConstrFields :: Id -> Bool
-lazySpecConstrFields = all (not . isMarkedCbv) . take 2 . fromMaybe [] . idCbvMarks_maybe
-
--- | Validate a local worker specialized to a known cons in the first position.
--- See Note [Checked constructor specialization].
-checkedSpecConstrWorker :: [(Id, Core.CoreExpr)] -> TyCon -> Id -> Maybe Id
-checkedSpecConstrWorker bindings table owner = do
-    ConstructorCaseType telescope _ _ [left, right] 0 result <- constructorCaseType (varType owner)
-    [Bndr a _, Bndr b _] <- pure telescope
-    guard (eqTypes [left, right] (map (mkListTy . mkTyVarTy) [a, b]))
-    [rule@Rule{ru_local = True}] <-
-      pure (filter (not . isNeverActive . ruleActivation) (idCoreRules owner))
-    target <- checkSpecConstrRule owner rule
-    (worker, rhs) <- find ((== target) . fst) bindings
-    guard (worker /= owner && not (isExternalName (idName worker)) &&
-           eqType (varType target) (varType worker) && eqType (exprType rhs) (varType worker))
-    let (args, body) = Core.collectBinders (stripTicksE isSourceBreakpoint rhs)
-    (x : y : fields@[hd, tl, other]) <- pure args
-    guard (all isTyVar [x, y] && all isId fields &&
-           eqTypes (map varType [x, y]) (map varType [a, b]))
-    let parameters = mkTyVarTys [x, y]
-        instantiate = substTyWith [a, b] parameters
-        pattern = CaseConstructor consDataCon [mkTyVarTy x] [CaseField hd, CaseField tl]
-    guard (eqTypes (map varType fields) (map instantiate [mkTyVarTy a, left, right]) &&
-           maybe True null (idCbvMarks_maybe worker))
-    guard (lazySpecConstrFields (tidyCbvInfoTop emptyNameSet worker rhs))
-    rows <- checkedConstructorRows CompleteConstructorCase True False (const True) Nothing (const Nothing)
-              (checkedSpecializedCall worker other parameters)
-              parameters (instantiate result) [pattern, CaseField other] other body
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    let cons_branch branch = case drop (length telescope) (coAxBranchLHS branch) of
-          [first, _] -> fmap fst (splitTyConApp_maybe first) == Just (promoteDataCon consDataCon)
-          _ -> False
-        branches = filter cons_branch (fromBranches (coAxiomBranches axiom))
-        worker_telescope = zipWith (\v (Bndr _ vis) -> Bndr v vis) [x, y] telescope
-    guard (matchesConstructorRows table worker_telescope rows branches)
-    pure worker
-
--- | Read the generated rule for that one specialization.
-checkSpecConstrRule :: Id -> CoreRule -> Maybe Id
-checkSpecConstrRule owner Rule{ru_fn = fn, ru_origin = origin, ru_auto = True,
-                               ru_bndrs = binders, ru_args = lhs, ru_rhs = rhs} = do
-    guard (fn == idName owner && Just origin == nameModule_maybe (idName owner))
-    (Core.Type left : Core.Type right : first : rest) <- pure lhs
-    a <- getTyVar_maybe left
-    b <- getTyVar_maybe right
-    (Core.Var cons, [Core.Type element, Core.Var hd, Core.Var tl]) <- pure (Core.collectArgs first)
-    guard (cons == dataConWorkId consDataCon && element `eqType` left)
-    later <- traverse (\case Core.Var v -> Just v; _ -> Nothing) rest
-    let captures = hd : tl : later
-        variables = a : b : captures
-    guard (all isId captures && eqTypes (map varType [hd, tl]) [left, mkListTy left] &&
-           (null later || eqTypes (map varType later) [mkListTy right]) &&
-           lengthIs binders (length variables) &&
-           sizeUniqSet (mkUniqSet binders) == length variables &&
-           mkUniqSet binders == mkUniqSet variables)
-    (Core.Var worker, Core.Type x : Core.Type y : arguments) <- pure (Core.collectArgs rhs)
-    fields <- traverse (\case Core.Var v -> Just v; _ -> Nothing) arguments
-    guard (left `eqType` x && right `eqType` y && captures == fields &&
-           exprType (Core.mkApps (Core.Var owner) lhs) `eqType` exprType rhs)
-    pure worker
-checkSpecConstrRule _ _ = Nothing
-
--- | Translate a saturated call with these exact captured fields.
-checkedSpecializedCall :: Id -> Id -> [Type] -> [ConstructorCaseTree] -> [(Id, Id)]
-                       -> Core.CoreExpr -> Maybe ConstructorCaseTree
-checkedSpecializedCall worker other parameters patterns aliases expr = do
-    [first@(CaseConstructor con _ [CaseField hd, CaseField tl]), second] <- pure patterns
-    (Core.Var callee, Core.Type x : Core.Type y : operands) <- pure (Core.collectArgs expr)
-    guard (con == consDataCon && callee == worker && eqTypes [x, y] parameters)
-    [actual_head, actual_tail, actual_other] <-
-      traverse (\case Core.Var v -> Just (resolveCaseAlias aliases v); _ -> Nothing) operands
-    guard (actual_head == hd && actual_tail == tl)
-    (True, smaller) <- recursiveCaseOperand (other, second) actual_other
-    pure (CaseSelf parameters [first, smaller])
-
--- | Compare the final rows with the exact nominal equations for this owner.
-matchesConstructorCase :: TyCon -> ConstructorCaseType -> [ConstructorCaseRow] -> Bool
-matchesConstructorCase table (ConstructorCaseType telescope _ _ _ _ _) rows =
-    case closedFamilyTyConCoAxiom_maybe table of
-      Just axiom -> matchesConstructorRows table telescope rows (fromBranches (coAxiomBranches axiom))
-      Nothing -> False
-
-matchesConstructorRows :: TyCon -> [ForAllTyBinder] -> [ConstructorCaseRow] -> [CoAxBranch] -> Bool
-matchesConstructorRows table telescope rows branches = isJust $ do
-    guard (equalLength rows branches)
-    zipWithM matches rows branches
-  where
-    matches (ConstructorCaseRow patterns result) branch = do
-      let (parameters, fields) = splitAt (length telescope) (coAxBranchTyVars branch)
-          ids = concatMap patternFields patterns
-          instantiate = substTyWith (binderVars telescope) (mkTyVarTys parameters)
-          toType = constructorCaseTreeType table instantiate (zip ids fields)
-      guard (null (coAxBranchCoVars branch) && equalLength parameters telescope &&
-             equalLength ids fields &&
-             eqTypes (map (instantiate . varType) ids) (map varType fields) &&
-             eqTypes (mkTyVarTys parameters ++ map toType patterns) (coAxBranchLHS branch) &&
-             toType result `eqType` coAxBranchRHS branch)
-
-    patternFields (CaseField v) = [v]
-    patternFields (CaseConstructor _ _ fields) = concatMap patternFields fields
-    patternFields _ = panic "matchesConstructorCase: call in pattern"
-
--- | Read exhaustive cases on exact bound operands and check each result.
-checkedConstructorCase :: (TyCon -> Bool) -> (Id -> Maybe TyCon) -> Id -> Core.CoreExpr
-                       -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedConstructorCase = checkedConstructorCaseWith CompleteConstructorCase Nothing
-
-data ConstructorCaseMode
-  = CompleteConstructorCase
-  | RightStructuralConstructorCase
-  | IndependentConstructorCase
-  | BooleanConstructorCase
-  deriving Eq
-
-checkedConstructorCaseWith :: ConstructorCaseMode -> Maybe Id -> (TyCon -> Bool) -> (Id -> Maybe TyCon) -> Id -> Core.CoreExpr
-                           -> Maybe (ConstructorCaseType, [ConstructorCaseRow])
-checkedConstructorCaseWith mode specialized visible helper owner rhs = do
-    let rhs_type = exprType rhs
-    guard (rhs_type `eqType` varType owner)
-    signature@(ConstructorCaseType telescope tc args domains position result) <-
-      checked_signature
-    let (bindings, body) = Core.collectBinders rhs
-        (parameters, terms) = splitAt (length telescope) bindings
-    guard (parameters == [v | Bndr v _ <- telescope])
-    guard (all isId terms && eqTypes (map varType terms) domains)
-    (_, scrutinee, _) <- splitCaseOperand position terms
-    let kinds = [mkTyVarTy v | Bndr v _ <- telescope] ++ fixedMapTypes signature ++
-                [element | isTwoListCase signature
-                         , operand <- domains
-                         , Just (_, [element]) <- [caseDatatype operand]]
-        public_domain ty = case caseArrow ty of
-          Just (input, output) -> all (casePublicKind public kinds) [input, output]
-          Nothing -> casePublicKind public kinds ty
-        witness_root = fst <$> directRetainedWitnessType rhs_type
-        result_kind
-          | isJust witness_root = caseKind kinds result
-          | otherwise = public_domain result
-    guard (result_kind && all public_domain domains)
-    let recursive patterns aliases expr =
-          checkedSelfCall signature terms patterns aliases expr <|>
-          checkedCallback signature patterns aliases expr <|>
-          (do worker <- specialized
-              [_, other] <- pure terms
-              checkedSpecializedCall worker other (mkTyVarTys (binderVars telescope))
-                                     patterns aliases expr)
-    rows <- checkedConstructorRows mode (mode /= CompleteConstructorCase || multipleCaseOperands signature)
-                                  (isTwoStructuralCase signature)
-                                  public witness_root helper recursive kinds result
-                                  (map CaseField terms) scrutinee body
-    forM_ witness_root $ \con -> do
-      [ConstructorCaseRow [CaseConstructor actual _ (CaseField witness : payloads)]
-                          (CaseField value)] <- pure rows
-      guard (actual == con && value == witness && all is_field payloads)
-    -- The patterns use types from the Core binders. Use the same telescope
-    -- for substitution. Keep the owner's declared visibility in the interface.
-    ConstructorCaseType declared _ _ _ _ _ <- signature_type (varType owner)
-    let binders = zipWith (\(Bndr v _) (Bndr _ vis) -> Bndr v vis) telescope declared
-    pure (ConstructorCaseType binders tc args domains position result, rows)
-  where
-    is_field CaseField{} = True
-    is_field _ = False
-
-    signature_type ty = case mode of
-      CompleteConstructorCase -> constructorCaseType ty <|> (snd <$> directRetainedWitnessType ty)
-      RightStructuralConstructorCase -> do
-        signature@(ConstructorCaseType binders root args domains _ result) <- constructorCaseType ty
-        guard (isTwoStructuralCase signature)
-        pure (ConstructorCaseType binders root args domains 1 result)
-      _ -> partialConstructorCaseType ty
-    checked_signature = signature_type (exprType rhs)
-
-    public tc = visible tc || case checked_signature of
-      Just signature@(ConstructorCaseType _ root _ _ _ _) ->
-        tc == listTyCon && (root == tc || isSizeListCase signature)
-      _ -> False
-
-    checkedSelfCall signature@(ConstructorCaseType telescope tc args _ position _) terms patterns aliases expr = do
-      (Core.Var callee, arguments) <- pure (Core.collectArgs expr)
-      guard (callee == owner)
-      let (kind_args, operands) = splitAt (length telescope) arguments
-          expected = [mkTyVarTy v | Bndr v _ <- telescope]
-      types <- coreTypeArgs kind_args
-      guard (eqTypes types expected)
-      fields <- traverse (\case Core.Var v -> Just (resolveCaseAlias aliases v); _ -> Nothing) operands
-      guard (equalLength terms fields)
-      next <- if multipleCaseOperands signature
-        then do
-          checked <- zipWithM recursiveCaseOperand (zip terms patterns) fields
-          guard (any fst checked)
-          pure (map snd checked)
-        else do
-          (before, CaseConstructor _ _ children, after) <- splitCaseOperand position patterns
-          (left, field, right) <- splitCaseOperand position fields
-          guard (varType field `eqType` mkTyConApp tc args && any (hasCaseField field) children)
-          original <- traverse (\case CaseField v -> Just v; _ -> Nothing) (before ++ after)
-          guard (left ++ right == original)
-          pure (map CaseField fields)
-      pure (CaseSelf types next)
-
-    checkedCallback (ConstructorCaseType _ _ _ _ 1 _) patterns aliases expr = do
-      [CaseField carried, root@CaseConstructor{}] <- pure patterns
-      (Core.Var fun, [Core.Var arg]) <- pure (Core.collectArgs expr)
-      let field = resolveCaseAlias aliases arg
-      guard (resolveCaseAlias aliases fun == carried && hasCaseField field root)
-      (input, output) <- caseArrow (varType carried)
-      guard (input `eqType` varType field && output `eqType` exprType expr)
-      pure (CaseApply carried [CaseField field])
-    checkedCallback _ _ _ _ = Nothing
-
--- | Check more than one structural operand and allow each to decrease.
-multipleCaseOperands :: ConstructorCaseType -> Bool
-multipleCaseOperands signature =
-    isTwoListCase signature || isTwoStructuralCase signature || isSizeListCase signature
-
--- | Check the remaining cases from the supplied operand patterns.
-checkedConstructorRows :: ConstructorCaseMode -> Bool -> Bool -> (TyCon -> Bool) -> Maybe DataCon -> (Id -> Maybe TyCon)
-                       -> ([ConstructorCaseTree] -> [(Id, Id)] -> Core.CoreExpr -> Maybe ConstructorCaseTree)
-                       -> [Type] -> Type -> [ConstructorCaseTree] -> Id -> Core.CoreExpr
-                       -> Maybe [ConstructorCaseRow]
-checkedConstructorRows mode bind_aliases tail_self public witness_root helper recursive parameters result patterns root =
-    checkBody patterns [] [] (Just root)
-  where
-    -- See Note [Checked cases on two structural sizes].
-    structural_right = mode == RightStructuralConstructorCase
-
-    checkCase partial_root patterns aliases known scrutinee
-              (Core.Case (Core.Var actual) binder case_result alternatives) = do
-      guard (resolveCaseAlias aliases actual == scrutinee &&
-             varType binder `eqType` varType actual && case_result `eqType` result)
-      (tc, args) <- caseDatatype (varType actual)
-      guard (public tc && all (casePublicKind public parameters) args)
-      let branch_aliases
-            | bind_aliases = (binder, scrutinee) : aliases
-            | otherwise = aliases
-      branches <- traverse (checkAlt partial_root patterns branch_aliases known scrutinee tc args)
-                           alternatives
-      guard (completeCase tc (map fst branches))
-      pure (concatMap snd branches)
-    checkCase _ _ _ _ _ _ = Nothing
-
-    checkAlt partial_root patterns aliases known scrutinee tc args
-             (Core.Alt (Core.DataAlt dc) fields body) = do
-      guard (dataConTyCon dc == tc && dataConUserTyVars dc == dataConUnivTyVars dc)
-      let domain = mkTyConApp tc args
-          kinds = map varType fields
-      if isRetainedCaseRoot domain tc then
-        do { guard (all isNativeOpaqueValueId fields)
-           ; guard (Core.nativeIndexArgKinds dc args (map TermVarTy fields))
-           ; guard (all (publicFieldKind dc parameters (map TermVarTy fields)) kinds) }
-      else
-        do { expected <- openDataConFieldTypes dc args
-           ; guard (all isId fields && eqTypes kinds expected)
-           ; guard (all (casePublicKind public parameters) kinds) }
-      let replace (CaseField v)
-            | v == scrutinee = (True, CaseConstructor dc args (map CaseField fields))
-          replace field@CaseField{} = (False, field)
-          replace (CaseConstructor con types children) =
-            let (flags, children') = unzip (map replace children)
-            in (or flags, CaseConstructor con types children')
-          replace call = (False, call)
-          (replaced, patterns') = unzip (map replace patterns)
-      guard (or replaced)
-      let known'
-            | bind_aliases = (scrutinee, (dc, args, fields)) : known
-            | otherwise = known
-          checked = checkBody patterns' aliases known' Nothing body
-      rows <- if partial_root
-              then pure [row | Just [row@(ConstructorCaseRow lhs _)] <- [checked]
-                             , lengthIs lhs (length patterns')
-                             , and (zipWith samePattern lhs patterns')]
-              else checked
-      pure (dc, rows)
-    checkAlt _ _ _ _ _ _ _ _ = Nothing
-
-    samePattern (CaseField v) (CaseField w) = v == w
-    samePattern (CaseConstructor c _ fields) (CaseConstructor d _ others) =
-      c == d && equalLength fields others && and (zipWith samePattern fields others)
-    samePattern _ _ = False
-
-    publicFieldKind dc parameters fields kind
-      | Just (family, index) <- splitAppTy_maybe kind
-      , any (eqType family) parameters, any (eqType index) fields
-      = True
-      -- See Note [Retained field kinds in source equations].
-      | Just dc == witness_root = caseKind (parameters ++ fields) kind
-      | otherwise = casePublicKind public (parameters ++ fields) kind
-
-    checkBody patterns aliases known first_case body = case body of
-      Core.Case (Core.Var next) binder ty alternatives
-        | structural_right, isNothing first_case
-        , let selected = resolveCaseAlias aliases next
-        , Just (dc, _, fields) <- lookup selected known
-        , varType binder `eqType` varType next, ty `eqType` result
-        , Just (Core.Alt _ actual rhs) <- find (matches_con dc) alternatives
-        , all isId actual, eqTypes (map varType actual) (map varType fields) ->
-            checkBody patterns ((binder, selected) : zip actual fields ++ aliases)
-                      known Nothing rhs
-        | otherwise ->
-            checkCase (mode == IndependentConstructorCase && isJust first_case)
-              patterns aliases known (fromMaybe (resolveCaseAlias aliases next) first_case) body
-      Core.Let (Core.NonRec join _) rest
-        | structural_right, isJoinId join ->
-            checkBody patterns aliases known first_case rest
-      Core.Let (Core.NonRec binder (Core.Var target)) rest
-        | isId binder, binder /= target, not (scoped binder)
-        , isNothing (lookup binder aliases)
-        , varType binder `eqType` varType target
-        , let selected = resolveCaseAlias aliases target
-        , scoped selected ->
-            checkBody patterns ((binder, selected) : aliases) known first_case rest
-      Core.Case test binder ty
-        [ Core.Alt (Core.DataAlt rejected) [] no, Core.Alt (Core.DataAlt accepted) [] yes ]
-        | mode == BooleanConstructorCase, isNothing first_case
-        , rejected == falseDataCon, accepted == trueDataCon
-        , ty `eqType` result, varType binder `eqType` boolTy -> do
-            predicate@CaseCall{} <- checkCaseResult public public_kind helper select
-                                       (const Nothing) boolTy test
-            on_false <- check_result no
-            on_true <- check_result yes
-            pure [ConstructorCaseRow patterns (CaseBoolean predicate on_false on_true)]
-      _ -> do
-        guard (isNothing first_case)
-        value <- check_result body
-        pure [ConstructorCaseRow patterns value]
-      where
-        scoped v = any (hasCaseField v) patterns
-        public_kind = casePublicKind public parameters
-        select v = let selected = resolveCaseAlias aliases v
-                   in selected <$ guard (scoped selected)
-        check_self = recursive patterns aliases
-        reconstruct_known u
-          | scoped u = Just (CaseField u)
-          | Just (dc, c_args, fs) <- lookup u known =
-              CaseConstructor dc c_args <$> traverse reconstruct_known fs
-          | otherwise = Nothing
-        check_result (Core.Var v)
-          | mode == BooleanConstructorCase
-          , resolveCaseAlias aliases v == root
-          , varType v `eqType` result
-          , pattern@CaseConstructor{} : _ <- patterns
-          = Just pattern
-        check_result (Core.Var v)
-          | bind_aliases
-          , Just (dc, c_args, fs) <- lookup (resolveCaseAlias aliases v) known
-          , varType v `eqType` result
-          , Just children <- traverse reconstruct_known fs
-          = Just (CaseConstructor dc c_args children)
-        check_result rhs = (guard tail_self *> check_self rhs) <|>
-          checkCaseResult public public_kind helper select check_self result rhs
-
-    matches_con dc (Core.Alt (Core.DataAlt actual) _ _) = dc == actual
-    matches_con _ _ = False
-
-recursiveCaseOperand :: (Id, ConstructorCaseTree) -> Id -> Maybe (Bool, ConstructorCaseTree)
-recursiveCaseOperand (original, pattern) field
-  | field == original = Just (False, pattern)
-  | CaseConstructor _ _ children <- pattern
-  , varType field `eqType` varType original
-  , any (hasCaseField field) children = Just (True, CaseField field)
-  | otherwise = Nothing
-
--- | Each alias already names a leaf or its original scrutinee.
-resolveCaseAlias :: [(Id, Id)] -> Id -> Id
-resolveCaseAlias aliases v = case lookup v aliases of
-  Just target -> target
-  Nothing -> v
-
-hasCaseField :: Id -> ConstructorCaseTree -> Bool
-hasCaseField selected (CaseField v) = selected == v
-hasCaseField selected (CaseConstructor _ _ children) = any (hasCaseField selected) children
-hasCaseField _ _ = False
-
--- | Account for the visibility of every datatype in a checked kind.
-casePublicKind :: (TyCon -> Bool) -> [Type] -> Type -> Bool
-casePublicKind public parameters kind
-  | kind `eqType` liftedTypeKind || any (eqType kind) parameters = True
-  | Just (tc, args) <- caseDatatype kind =
-      public tc && all (casePublicKind public parameters) args
-  | otherwise = False
-
--- | Check a scoped variable, lazy constructor, or an available helper call.
-checkCaseResult :: (TyCon -> Bool) -> (Type -> Bool) -> (Id -> Maybe TyCon)
-                -> (Id -> Maybe Id) -> (Core.CoreExpr -> Maybe ConstructorCaseTree)
-                -> Type -> Core.CoreExpr -> Maybe ConstructorCaseTree
-checkCaseResult public publicKind helper scoped self = check False
-  where
-    check under_constructor expected expr = do
-      guard (exprType expr `eqType` expected)
-      case Core.collectArgs expr of
-        (Core.Var output, [])
-          | Just selected <- scoped output
-          , varType selected `eqType` expected ->
-              pure (CaseField selected)
-        (Core.Var worker, arguments)
-          | Just dc <- isDataConWorkId_maybe worker -> do
-              let tc = dataConTyCon dc
-                  universals = dataConUnivTyVars dc
-                  (type_args, fields) = splitAt (length universals) arguments
-              guard (public tc && dataConUserTyVars dc == universals)
-              args <- traverse coreType type_args
-              guard (all publicKind args &&
-                     mkTyConApp tc args `eqType` expected)
-              kinds <- openDataConFieldTypes dc args
-              guard (lengthIs fields (length kinds))
-              children <- zipWithM (check True) kinds fields
-              pure (CaseConstructor dc args children)
-        (Core.Var callee, arguments)
-          | Just table <- helper callee -> do
-              let (type_args, fields) = splitAt (helperInvisibleArity table) arguments
-              args <- traverse coreType type_args
-              guard (all publicKind args)
-              (input_kinds, result_kind) <- helperKinds table args
-              guard (result_kind `eqType` expected && lengthIs fields (length input_kinds))
-              children <- zipWithM (check under_constructor) input_kinds fields
-              pure (CaseCall table args children)
-        _ | under_constructor -> self expr
-          | otherwise -> Nothing
-
-    helperKinds table args = do
-      let (invisible, visible) = span isInvisibleTyConBinder (tyConBinders table)
-          vars = [v | Bndr v _ <- invisible]
-          result = tyConResKind table
-          inst = substTyWith vars args
-      guard (lengthIs args (length vars) && not (null visible) &&
-             and (zipWith eqType (map typeKind args) (map (inst . varType) vars)))
-      kinds <- traverse visibleKind visible
-      pure (map inst kinds, inst result)
-    visibleKind (Bndr v AnonTCB) = Just (varType v)
-    visibleKind _ = Nothing
-
-    coreType (Core.Type ty) = Just ty
-    coreType _ = Nothing
-
--- | Check distinct and complete constructor coverage without a default.
-completeCase :: TyCon -> [DataCon] -> Bool
-completeCase tc actual =
-    lengthIs actual (length expected) && mkUniqSet actual == mkUniqSet expected
-  where
-    expected = tyConDataCons tc
-
--- | Publish one nominal equation per complete path through the checked cases.
-publishConstructorCase :: Id -> ConstructorCaseType -> [ConstructorCaseRow] -> TcM TyCon
-publishConstructorCase owner (ConstructorCaseType telescope _ _ domains _ result) =
-    publishConstructorRows owner telescope domains result
-
--- | Publish checked rows with the original kind telescope and visible domains.
-publishConstructorRows :: Id -> [ForAllTyBinder] -> [Type] -> Type -> [ConstructorCaseRow] -> TcM TyCon
-publishConstructorRows owner telescope domains result rows = do
-    (renaming, quantifiers) <- freshenTyVarBndrs (binderVars telescope)
-    let kind_binders = zipWith mkNamedTyConBinder (map binderFlag telescope) quantifiers
-        instantiate = substTyUnchecked renaming . expandTypeSynonyms
-    operands <- mapM (freshSysTyVar "arg" . instantiate) domains
-    branches <- forM rows $ \(ConstructorCaseRow patterns result_value) -> do
-      (lhs, scoped) <- publishPatterns instantiate [] patterns
-      let fields = reverse scoped
-          vars = quantifiers ++ map snd fields
-          branch family = mkCoAxBranch vars [] [] (mkTyVarTys quantifiers ++ lhs)
-                      (constructorCaseTreeType family instantiate fields result_value)
-                      (map (const Nominal) vars) (nameSrcSpan (idName owner))
-      pure branch
-    makeSourceFamily (idName owner) (kind_binders ++ mkAnonTyConBinders operands)
-                     (instantiate result) branches
-  where
-    -- See Note [Retained field kinds in source equations].
-    publishPatterns _ scoped [] = pure ([], scoped)
-    publishPatterns instantiate scoped (pattern : patterns) = do
-      (pat, scoped') <- publishPattern instantiate scoped pattern
-      (pats, scoped'') <- publishPatterns instantiate scoped' patterns
-      pure (pat : pats, scoped'')
-
-    publishPattern instantiate scoped (CaseField ident) = do
-      let kind = instantiate (varType ident)
-          indices = [(TermVarTy runtime, type_var) | (runtime, type_var) <- scoped]
-          checked_kind
-            | not (anyFreeVarsOfType isId kind) = kind
-            | Just abstracted <- abstractNativeIndices indices kind
-            , not (anyFreeVarsOfType isId abstracted) = abstracted
-            | otherwise = panic "publishConstructorCase: unchecked field kind"
-      field <- freshSysTyVar "field" checked_kind
-      pure (mkTyVarTy field, (ident, field) : scoped)
-    publishPattern instantiate scoped (CaseConstructor dc parameters children) = do
-      (fields, scoped') <- publishPatterns instantiate scoped children
-      pure (mkTyConApp (promoteDataCon dc) (map instantiate parameters ++ fields), scoped')
-    publishPattern _ _ _ = panic "publishConstructorCase: call in pattern"
-
--- | Translate a checked case tree under the equation's field binders.
-constructorCaseTreeType :: TyCon -> (Type -> Type) -> [(Id, TyVar)] -> ConstructorCaseTree -> Type
-constructorCaseTreeType family instantiate fields = translate
-  where
-    translate (CaseField selected) = fieldType selected
-    translate (CaseConstructor dc args children) = application (promoteDataCon dc) args children
-    translate (CaseCall table args children) = application table args children
-    translate (CaseSelf args operands) = application family args operands
-    translate (CaseApply fun args) = mkAppTys (fieldType fun) (map translate args)
-    translate CaseBoolean{} = panic "constructorCaseTreeType: untranslated Boolean case"
-
-    application tc args children = mkTyConApp tc (map instantiate args ++ map translate children)
-    fieldType selected = case lookup selected fields of
-      Just v -> mkTyVarTy v
-      Nothing -> panic "publishConstructorCase: unbound selected field"
-
-{- Note [Reachable constructor helpers]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Start from the free local Ids of the desugared case roots. Desugar a
-candidate helper only the first time an exact resolved Id reaches it.
-Sort the reachable graph with the existing SCC utility. Check callees
-before callers. Skip a recursive component, including a self edge.
-The result checker can only reference already checked local helpers or
-exact imported source tables. A caller of a rejected helper cannot
-publish an equation that calls it.
-
-A private helper may also scrutinize an argument. Use the same case
-checker as for an exported function. The caller keeps the helper
-application under its constructor. Its family can select a branch
-when a later client supplies the scrutinee. The checks for public
-constructors, strict fields and exhaustive branches still apply.
-
-Free Core Ids find candidates. The checked RHS family applications
-determine which helpers actually leave the module. Traverse those
-applications from published roots, including under constructors.
-The ordinary source-table dependency walk checks the exact retained
-owners and their rules. In particular, a private helper has no source
-export, but it needs an interface Id and an axiom when a dependent
-consumer can reach it through a public family.
--}
-
-{- Note [Checked sum projections]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Start with a case on the first argument of the ordinary function. Each
-subsequent case must scrutinize one of the still-visible variables. Check
-all alternatives against the lazy boxed constructor representation. Check
-that each leaf returns an in-scope field, the carried argument, or a
-saturated ordinary constructor applied to checked results. Check each
-result's kind against the actual worker and check the parameter order.
-Building a lazy constructor introduces no new tests on its fields.
-An ordinary callback can precede the scrutinized operand. Only use that
-callback on a bound field beneath a lazy result constructor. Publish the
-application with an unmatchable arrow and preserve the original value
-argument order. An abstract callback is already a type variable. A
-specific callback also needs a valid under-saturated family.
-
-A worker can call itself beneath such a constructor. As in
-Note [Closed source tables], the first operand must be a proper field
-of the matched input. Require the original kind instantiation and
-the exact recursive Id. If the worker has a second operand, it must
-remain a pattern variable and the call must pass that same Core Id.
-Each reduction passes a strict subpattern as the first operand. A
-rigid tail remains stuck.
-Keep a saturated helper as a reference to its exact checked family,
-including inside a constructor field. An imported helper must already
-have a source table. Within this producer, a private helper can supply
-an equation if its solved Core returns a scoped input variable or
-a checked lazy constructor tree over the inputs. A helper cannot inspect
-its inputs. It can call another helper using public, checked kinds.
-See Note [Reachable constructor helpers].
-Publish only the transitive helper dependencies of checked case equations. The same
-dependency closure retains the helper Id in stripped interfaces and
-checks rules even when a client mentions only an exported alias.
-A case removes its scrutinee from the scope of leaves. Pattern matching
-can bind a selected variable through a nonrecursive let. Follow a
-same-typed alias to an existing leaf without introducing a new field.
-Reject casts, contexts, strict fields, defaults and unrelated scrutinees.
-
-Each path contributes one nominal equation, with a constructor at every
-point demanded by Core. A branch for Nested (Just x) requires both the
-outer Nested and the inner Just. These equations do not match a neutral
-scrutinee even when all of its possible branches would agree. The
-unselected fields and any unused fallback are not demanded.
-
-Require an exported local input datatype. Any other datatype mentioned
-by an emitted pattern, result or field kind must also be public. Its exact
-constructor names must be exported locally or visible through ordinary
-imports. A poly-kinded datatype may have a kind argument fixed at Type
-in the ordinary worker. This fixed argument belongs to the datatype
-pattern, not to the worker's invisible telescope. The original
-invisible telescope precedes one or two visible arguments. Recognize that prefix when checking applicable rules.
--}
-
--- | Recognize an ordinary function returning a boxed pair.
 pairBuilderType :: Type -> Maybe ([ForAllTyBinder], [Type], Type, Type, Type)
 pairBuilderType ty = do
-  let (telescope, body) = splitForAllForAllTyBinders ty
-      (_, arrows, result) = splitFunTys body
-      domains = map scaledThing arrows
-  (tc, [left, right]) <- splitTyConApp_maybe result
-  guard (tc == tupleTyCon Boxed 2 && not (null domains) &&
-         body `eqType` foldr mkVisFunTyManyU result domains &&
-         all (isLiftedTypeKind . typeKind) domains)
-  binders <- traverse lifted telescope
-  pure (binders, domains, result, left, right)
-  where
-    lifted (_, b@(Bndr v (Invisible _)))
-      | isTyVar v && varType v `eqType` liftedTypeKind = Just b
-    lifted _ = Nothing
+    let (telescope, body) = splitForAllForAllTyBinders ty
+        (_, arrows, result) = splitFunTys body
+        domains = map scaledThing arrows
+    (tc, [left, right]) <- splitTyConApp_maybe result
+    guard (tc == tupleTyCon Boxed 2 && not (null domains) &&
+           body `eqType` foldr mkVisFunTyManyU result domains && all (isLiftedTypeKind . typeKind) domains)
+    (\bs -> (bs, domains, result, left, right)) <$> traverse liftedSourceBinder telescope
 
--- | Certify the constructor spine and allocate the suspended field's private family.
--- See Note [A partial pair in a nominal operand].
 checkedPairBuilder :: Id -> Core.CoreExpr -> Maybe (TcM (Maybe (Id, TyCon), [TyCon]))
 checkedPairBuilder owner rhs = do
-  guard (exprType rhs `eqType` varType owner)
-  (tvs, domains, result, left, right) <- pairBuilderType (exprType rhs)
-  (signature, _, _, _, _) <- pairBuilderType (varType owner)
-  let (params, body) = Core.collectBinders rhs
-      (types, terms) = splitAt (length tvs) params
-  guard (types == [v | Bndr v _ <- tvs] && all isId terms &&
-         eqTypes domains (map varType terms))
-  (Core.Var worker, [Core.Type l, Core.Type r, x, y]) <- pure (Core.collectArgs body)
-  guard (isDataConWorkId_maybe worker == Just (tupleDataCon Boxed 2) &&
-         eqTypes [l, r, exprType x, exprType y] [left, right, left, right])
-  let input (Core.Var v) | v `elem` terms = Just v
-      input _ = Nothing
-      purePairField (Core.Var v) | v `elem` terms = True
-      purePairField expr
-        | (Core.Var worker, args) <- Core.collectArgs expr
-        , Just dc <- isDataConWorkId_maybe worker
-        , let (ty_args, val_args) = splitAt (length (dataConUnivTyVars dc)) args
-        , Just inst_tys <- coreTypeArgs ty_args
-        , isJust (openDataConFieldTypes dc inst_tys)
-        = all purePairField val_args
-        | otherwise = False
-      complete_poly_pair other =
-        not (null tvs) &&
-        all (polySourceType types) (result : domains) &&
-        purePairField other
-  pure $ do
-    let parameters = zipWith (\v (Bndr _ vis) -> Bndr v (NamedTCB vis)) types signature
+    guard (exprType rhs `eqType` varType owner)
+    (tvs, domains, result, left, right) <- pairBuilderType (exprType rhs)
+    (signature, _, _, _, _) <- pairBuilderType (varType owner)
+    let (types, terms) = splitAt (length tvs) (fst (Core.collectBinders rhs))
+    guard (types == binderVars tvs && all isId terms && eqTypes domains (map varType terms))
+    (Core.Var worker, [Core.Type l, Core.Type r, x, y]) <- pure (Core.collectArgs (snd (Core.collectBinders rhs)))
+    guard (isDataConWorkId_maybe worker == Just (tupleDataCon Boxed 2) &&
+           eqTypes [l, r, exprType x, exprType y] [left, right, left, right])
+    let input (Core.Var v) | v `elem` terms = Just v; input _ = Nothing
+        purePairField (Core.Var v) | v `elem` terms = True
+        purePairField expr
+          | (Core.Var w, args) <- Core.collectArgs expr, Just dc <- isDataConWorkId_maybe w
+          , let (ty_as, val_as) = splitAt (length (dataConUnivTyVars dc)) args
+          , Just inst_tys <- coreTypeArgs ty_as, isJust (openDataConFieldTypes dc inst_tys) = all purePairField val_as
+          | otherwise = False
+        complete_poly other = not (null tvs) && all (polySourceType types) (result : domains) && purePairField other
+        parameters = zipWith (\v (Bndr _ vis) -> Bndr v (NamedTCB vis)) types signature
         name = idName owner
         copiedPair known side opaque_kind occ = do
           args <- forM domains (freshSysTyVar "arg")
-          let binders = parameters ++ mkAnonTyConBinders args
-              vars = types ++ args
-              lhs = mkTyVarTys vars
-              selected = case lookup known (zip terms args) of
-                Just v -> mkTyVarTy v
-                Nothing -> panic "checkedPairBuilder: unbound pair field"
-          field <- emptyPairField name occ binders opaque_kind
-          let suspended = mkTyConApp field lhs
-              pair_fields = pickLR side ([selected, suspended], [suspended, selected])
-              pair = mkTyConApp (promotedTupleDataCon Boxed 2) ([left, right] ++ pair_fields)
-              branch _ = mkCoAxBranch vars [] [] lhs pair (map (const Nominal) vars) (nameSrcSpan name)
-          table <- makeSourceFamily name binders result [branch]
+          let binders = parameters ++ mkAnonTyConBinders args; vars = types ++ args; lhs = mkTyVarTys vars
+              selected = maybe (panic "checkedPairBuilder") mkTyVarTy (lookup known (zip terms args))
+          field_nm <- newImplicitBinder name occ
+          let field = mkFamilyTyCon field_nm (mkTyConKindWithMatchability unmatchableDataConTy binders opaque_kind)
+                        binders 0 opaque_kind Nothing (ClosedTypeFamilyTyCon (CTF Nothing)) Nothing NotInjective
+              pair_fs = pickLR side ([selected, mkTyConApp field lhs], [mkTyConApp field lhs, selected])
+              pair = mkTyConApp (promotedTupleDataCon Boxed 2) ([left, right] ++ pair_fs)
+          table <- makeSourceFamily name binders result
+                     [\_ -> mkCoAxBranch vars [] [] lhs pair (map (const Nominal) vars) (nameSrcSpan name)]
           pure (Just (owner, table), [field])
-    case (input x, input y) of
-      (Just v, Nothing) | not (complete_poly_pair y) -> copiedPair v CLeft right mkSourceSndOcc
-      (Nothing, Just v) | not (complete_poly_pair x) -> copiedPair v CRight left mkSourceFstOcc
-      _ | Just _ <- pairObservationType (varType owner) -> do
-            key <- freshSysTyVar "observation" typeSymbolKind
-            let binders = mkAnonTyConBinders [key]
-            first <- emptyPairField name (mkObservedFieldOcc CRight) binders left
-            second <- emptyPairField name (mkObservedFieldOcc CLeft) binders right
-            pure (Nothing, [first, second])
-        | otherwise -> pure (Nothing, [])
+    pure $ case (input x, input y) of
+      (Just v, Nothing) | not (complete_poly y) -> copiedPair v CLeft right mkSourceSndOcc
+      (Nothing, Just v) | not (complete_poly x) -> copiedPair v CRight left mkSourceFstOcc
+      _ -> pure (Nothing, [])
 
--- | Reserve the unread field occurrence for the given projection.
-mkObservedFieldOcc :: LeftOrRight -> OccName -> OccName
-mkObservedFieldOcc side = mkTcOcc . (prefix ++) . occNameString
-  where
-    prefix = pickLR side ("Q2:", "Q1:")
-
--- | Allocate an opaque field family in the ordinary producer's interface.
-emptyPairField :: Name -> (OccName -> OccName) -> [TyConBinder] -> Kind -> TcM TyCon
-emptyPairField owner occ binders result = do
-    name <- newImplicitBinder owner occ
-    let kind = mkTyConKindWithMatchability unmatchableDataConTy binders result
-    pure (mkFamilyTyCon name kind binders 0 result Nothing
-            (ClosedTypeFamilyTyCon (CTF Nothing)) Nothing NotInjective)
-
--- | Find the exact private field of an ordinary imported pair producer.
 lookupObservedPairField :: LeftOrRight -> Id -> [Type] -> Kind -> TcM (Maybe TyCon)
-lookupObservedPairField side producer params expected
-  | Just mod <- nameModule_maybe owner
-  , not (isHoleModule mod)
-  , (installed, Nothing) <- getModuleInstantiation mod = do
-      env <- getGblEnv
-      let ordinary = case lookupGRE_Name (tcg_rdr_env env) owner of
-            Just gre -> any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
-            Nothing -> False
-          boot = gwib_isBoot <$> lookupInstalledModuleEnv
-                   (imp_boot_mods (tcg_imports env)) installed
-      if mod /= tcg_semantic_mod env && ordinary && boot /= Just IsBoot
-        then loadField mod
-        else pure Nothing
-  | otherwise = pure Nothing
-  where
-    owner = idName producer
+lookupObservedPairField _ _ _ _ = pure Nothing
 
-    loadField mod = do
-      iface <- loadInterfaceForName (text "staged pair producer") owner
-      let occ = mkObservedFieldOcc side (nameOccName owner)
-      case mi_hash_fn iface occ of
-        Nothing -> pure Nothing
-        Just _ -> do
-          name <- lookupOrig mod occ
-          thing <- tcLookupGlobal name
-          pure $ do
-            ATyCon field <- Just thing
-            guard (tyConName field == name)
-            ClosedTypeFamilyTyCon (CTF Nothing) <- famTyConFlav_maybe field
-            let (invisible, visible) = span isInvisibleTyConBinder (tyConBinders field)
-                parameters = [v | Bndr v _ <- invisible]
-                inst = substTyWith parameters params
-            [Bndr key AnonTCB] <- pure visible
-            guard (varType key `eqType` typeSymbolKind &&
-                   lengthIs params (length parameters) &&
-                   eqTypes (map typeKind params) (map (inst . varType) parameters) &&
-                   inst (tyConResKind field) `eqType` expected)
-            pure field
-
--- | Keep ordinary staging if simplification can change the producer call.
 canObservePairSource :: Id -> TcM Bool
-canObservePairSource owner
-  | Core.hasCoreUnfolding (idUnfolding owner) = pure False
-  | otherwise = isNothing <$> changedSourceUse [(owner, Nothing)]
+canObservePairSource _ = pure False
 
--- | Find the exact hidden observer emitted by the final Core pass.
 lookupPairObserver :: LeftOrRight -> Id -> Int -> TcM (Maybe Id)
-lookupPairObserver side producer arity
-  | Just mod <- nameModule_maybe owner =
-      lookupRecipeEntry False mod (pairObservationOcc (Just side) arity (nameOccName owner))
-  | otherwise = pure Nothing
-  where
-    owner = idName producer
+lookupPairObserver _ _ _ = pure Nothing
 
--- | Check both artifact forms of a scalar relay. An object-only replacement
--- can add the table or replace it with the old per-owner closure.
 lookupPairRecipe :: Module -> OccName -> Int -> TcM (Maybe Id, Maybe Id)
-lookupPairRecipe mod owner arity =
-    (,) <$> lookupRecipeEntry True mod scalarRecipeTableOcc
-        <*> lookupRecipeEntry True mod (pairObservationOcc Nothing arity owner)
+lookupPairRecipe _ _ _ = pure (Nothing, Nothing)
 
--- | An optional artifact probe can use the reserved entry type when an old
--- interface has no declaration. This ID is used only in temporary bytecode
--- guarded by the loader's optional symbol check.
-lookupRecipeEntry :: Bool -> Module -> OccName -> TcM (Maybe Id)
-lookupRecipeEntry allow_missing mod occ = do
-    name <- lookupOrig mod occ
-    iface <- loadInterfaceForName (text "staged pair recipe") name
-    case mi_hash_fn iface occ of
-      Nothing
-        | allow_missing -> pure (Just (mkVanillaGlobal name stringTy))
-        | otherwise -> pure Nothing
-      Just _ -> do
-        thing <- tcLookupGlobal name
-        pure $ case thing of
-          AnId entry | idName entry == name, varType entry `eqType` stringTy -> Just entry
-          _ -> Nothing
-
--- | Identify the copied field and its zero-based position among the value inputs.
 sourcePairBuilderField :: TyCon -> Maybe (LeftOrRight, Int)
 sourcePairBuilderField table = do
     owner <- sourceTableTermOcc (nameOccName (tyConName table))
     axiom <- closedFamilyTyConCoAxiom_maybe table
     [branch] <- pure (fromBranches (coAxiomBranches axiom))
     let lhs = coAxBranchLHS branch
-        inputs = drop (length (takeWhile isInvisibleTyConBinder (tyConBinders table))) lhs
+        inputs = drop (helperInvisibleArity table) lhs
         opaque occ ty = case splitTyConApp_maybe ty of
-          Just (tc,args) -> nameModule_maybe (tyConName tc) == nameModule_maybe (tyConName table) &&
-                            nameOccName (tyConName tc) == occ owner &&
-                            eqTypes args lhs && case famTyConFlav_maybe tc of
-                              Just (ClosedTypeFamilyTyCon (CTF Nothing)) -> True
-                              _ -> False
+          Just (tc, args) -> nameModule_maybe (tyConName tc) == nameModule_maybe (tyConName table) &&
+                             nameOccName (tyConName tc) == occ owner && eqTypes args lhs &&
+                             case famTyConFlav_maybe tc of { Just (ClosedTypeFamilyTyCon (CTF Nothing)) -> True; _ -> False }
           _ -> False
     (pair, [_, _, left, right]) <- splitTyConApp_maybe (coAxBranchRHS branch)
     guard (pair == promotedTupleDataCon Boxed 2 && coAxiomRole axiom == Nominal &&
            eqTypes lhs (mkTyVarTys (coAxBranchTyVars branch)) && null (coAxBranchCoVars branch))
     (side, copied) <- if opaque mkSourceSndOcc right then Just (CLeft, left)
-                      else if opaque mkSourceFstOcc left then Just (CRight, right)
-                      else Nothing
-    input <- findIndex (eqType copied) inputs
-    pure (side, input)
+                      else if opaque mkSourceFstOcc left then Just (CRight, right) else Nothing
+    (side,) <$> findIndex (eqType copied) inputs
 
-{- Note [A partial pair in a nominal operand]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For make n = (n, e), the solved Core returns the boxed constructor before
-it inspects e. Give the unknown field an empty closed family P2:make
-indexed by every type and value argument. The checked equation is
+sourceCharacterTables :: NameEnv (Id, Core.CoreExpr) -> TcM [(Id, TyCon)]
+sourceCharacterTables definitions = do
+    env <- getGblEnv
+    let candidates = sortBy (\(l, _) (r, _) -> stableNameCmp (idName l) (idName r)) (nonDetNameEnvElts definitions)
+    direct <- fmap catMaybes $ forM candidates $ \(owner, rhs) -> case charCaseResultTyCon (varType owner) of
+      Just result
+        | Just old <- sourceTableOccurrence env owner >>= sourceTableId_maybe -> pure (Just (owner, old))
+        | Core.Var target <- rhs -> forwardSourceCharacter env result owner target
+        | otherwise -> publishCertifiedCharacter owner rhs
+      Nothing -> pure Nothing
+    publishCharacterAliases env candidates direct
 
-    T:make n = '(n, P2:make n)
+publishCharacterAliases :: TcGblEnv -> [(Id, Core.CoreExpr)] -> [(Id, TyCon)] -> TcM [(Id, TyCon)]
+publishCharacterAliases env candidates direct = do
+    let root_tables = mkNameEnv [(idName o, t) | (o, t) <- direct]
+        aliases = [ DigraphNode (o, target, res) (idName o) [idName target]
+                  | (o, Core.Var target) <- candidates, not (idName o `elemNameEnv` root_tables)
+                  , nameModule_maybe (idName target) == Just (tcg_semantic_mod env)
+                  , Just res <- [charCaseResultTyCon (varType o)] ]
+        step (tables, pub) (AcyclicSCC (o, target, res))
+          | Just t <- lookupNameEnv tables (idName target), compatibleForwarding o target res t = do
+              e@(_, alias) <- publishSourceCharacter o res [] (\arg_ty -> mkTyConApp t [arg_ty])
+              pure (extendNameEnv tables (idName o) alias, e : pub)
+        step checked _ = pure checked
+    (_, forwarded) <- foldM step (root_tables, []) (stronglyConnCompFromEdgedVerticesUniq aliases)
+    pure (direct ++ reverse forwarded)
 
-The module and position are part of the field's Name. Nothing reduces
-P2:make and no equality about e follows from its creation. Checking the
-constructor spine needs no unfolding from e. The symmetric equation uses
-P1:make. A case or a cast outside the pair does not have this shape.
+publishCertifiedCharacter :: Id -> Core.CoreExpr -> TcM (Maybe (Id, TyCon))
+publishCertifiedCharacter owner rhs
+  | Right c <- certify owner rhs, certOwner c == idName owner =
+      Just <$> publishSourceCharacter owner (certResultTyCon c) (certRows c) (certDefault c)
+  | otherwise = pure Nothing
 
-A direct producer with the executable observer ABI exports a private
-Q2 family when it has no copied field. The observer fills the demanded
-field using actual executable code. The unread field uses the exact
-producer declaration and an observation key.
-The key records the full semantic unit and module and an ordinal from that
-module's successful observations. Allocate after readback succeeds.
-Unlike compiler Uniques or source locations, this numbering is independent
-of the Unique supply and distinguishes multiple checks of a single span. Do not add a T equation merely to expose these private fields.
-This preserves ordinary name resolution when neither field is copied.
-See Note [The types Any and UnusedType] in GHC.Builtin.WiredIn.Types.
+compatibleForwarding :: Id -> Id -> TyCon -> TyCon -> Bool
+compatibleForwarding owner target result table =
+    varType target `eqType` varType owner && tyConResKind table `eqType` mkTyConTy result &&
+    case tyConTyVars table of { [arg] -> tyVarKind arg `eqType` charTy; _ -> False }
 
-The renamer keeps the ordinary producer in scope. A direct nominal
-projection can store both checked applications in an interface when
-its equation selects the copied field. The solver validates the actual
-owners and their rules when it uses either equation. Ordinary executable
-calls still use the producer, including calls that select the opaque
-field. Quoting all inputs of the field family must also preserve demand.
-A computed argument in any other position stays on the executable path.
--}
+forwardSourceCharacter :: TcGblEnv -> TyCon -> Id -> Id -> TcM (Maybe (Id, TyCon))
+forwardSourceCharacter env result owner target
+  | Just target_mod <- nameModule_maybe (idName target), target_mod /= tcg_semantic_mod env, not (isHoleModule target_mod)
+  , (installed, Nothing) <- getModuleInstantiation target_mod
+  , Just IsBoot /= (gwib_isBoot <$> lookupInstalledModuleEnv (imp_boot_mods (tcg_imports env)) installed)
+  , Just table <- sourceTableId_maybe target, compatibleForwarding owner target result table = do
+      deps <- sourceTableDependencies table
+      case deps of
+        Just callees -> do
+          let uses = [(v, Nothing) | v <- target : callees]
+          changed <- changedSourceUse uses
+          if isJust changed then pure Nothing else do
+            forwarded <- publishSourceCharacter owner result [] (\arg_ty -> mkTyConApp table [arg_ty])
+            Just forwarded <$ publishSourceUses uses
+        Nothing -> pure Nothing
+  | otherwise = pure Nothing
 
--- | The original kind-parameter order and result of the alternative.
-data PairCase = PairCase [ForAllTyBinder] TyVar TyVar PairCaseResult
+publishSourceCharacter :: Id -> TyCon -> [(Char, Type)] -> (Type -> Type) -> TcM (Id, TyCon)
+publishSourceCharacter owner result rows fallback = do
+    let loc = nameSrcSpan (idName owner)
+        literal (inp, val) _ = mkCoAxBranch [] [] [] [mkCharLitTy inp] val [] loc
+    var <- freshSysTyVar "c" charTy; arg <- freshSysTyVar "x" charTy
+    let ty = mkTyVarTy var
+    (owner,) <$> makeSourceFamily (idName owner) [mkAnonTyConBinder arg] (mkTyConTy result)
+                   (map literal rows ++ [\_ -> mkCoAxBranch [var] [] [] [ty] (fallback ty) [Nominal] loc])
 
--- | The index of a field bound by the checked case.
-data PairField = FirstField | SecondField
+sourceRetainedWitnessTables :: NameEnv (Id, Core.CoreExpr) -> TcM [(Id, TyCon)]
+sourceRetainedWitnessTables definitions = do
+    env <- getGblEnv; rdr_env <- getGlobalRdrEnv
+    let available n | nameModule_maybe n == Just (tcg_semantic_mod env) = maybe False isLocalGRE (lookupGRE_Name rdr_env n)
+                    | otherwise = ordinaryImport rdr_env n
+        public = visibleCaseType available
+    fmap catMaybes $ forM (sortBy (\(l, _) (r, _) -> stableNameCmp (idName l) (idName r)) (nonDetNameEnvElts definitions)) $
+      \(owner, rhs) -> case directRetainedWitnessType (varType owner) >>= \(con, _) ->
+                            compileCoreEquations ((defaultCoreSpec public) { ccs_witness_root = Just con }) owner rhs of
+        Just cct -> Just . (owner,) <$> publishCompiledTable owner cct
+        Nothing  -> pure Nothing
 
--- | Return a field or build another boxed pair from the bound fields.
-data PairCaseResult = SelectField PairField | BuildPair PairField PairField
+publishRetainedRecordWitness :: DataCon -> Id -> TcM TyCon
+publishRetainedRecordWitness con owner
+  | Just (expected, ConstructorCaseType tele _ args domains _ result) <- retainedWitnessType (varType owner)
+  , con == expected, Just witness : _ <- dataConRepArgBinders con, _ : payloads <- dataConOrigArgTys con = do
+      let instantiate = substTyWith (dataConUnivTyVars con) args
+      fields <- mapM (mkSysLocalM (fsLit "field") ManyTy . instantiate . scaledThing) payloads
+      publishCompiledTable owner
+        (CompiledCoreTable tele domains result [CompiledCoreRow [PatCon con args (map PatVar (witness : fields))] (RhsVar witness)] False)
+  | otherwise = pprPanic "publishRetainedRecordWitness: invalid selector" (ppr owner)
 
--- | Certify a strict pair case that uses only its bound fields.
-checkedPairCase :: Id -> Core.CoreExpr -> Maybe PairCase
-checkedPairCase owner rhs = do
-    let rhs_type = exprType rhs
-    guard (rhs_type `eqType` varType owner)
-    (binders, x, y, r) <- pairCaseType rhs_type
-    (owner_binders, x_owner, y_owner, _) <- pairCaseType (varType owner)
-    let (parameters, rest) = Core.collectBinders rhs
-        (type_args, term_args) = splitAt (length binders) parameters
-    guard (type_args == [v | Bndr v _ <- binders])
-    [pair] <- pure term_args
-    guard (isId pair && varType pair `eqType` mkTyConApp (tupleTyCon Boxed 2) (mkTyVarTys [x,y]))
-    Core.Case (Core.Var scrutinee) case_binder result
-      [Core.Alt (Core.DataAlt con) [first, second] alternative] <- pure rest
-    guard (scrutinee == pair && varType case_binder `eqType` varType pair)
-    guard (con == tupleDataCon Boxed 2 && first /= second)
-    guard (isId first && isId second)
-    guard (varType first `eqType` mkTyVarTy x && varType second `eqType` mkTyVarTy y)
-    guard (result `eqType` r && exprType alternative `eqType` result)
-    let field v | v == first  = Just FirstField
-                | v == second = Just SecondField
-                | otherwise   = Nothing
-    selected <- case Core.collectArgs alternative of
-      (Core.Var chosen, []) -> SelectField <$> field chosen
-      (Core.Var worker, [Core.Type left, Core.Type right, Core.Var a, Core.Var b])
-        | worker == dataConWorkId con
-        , left `eqType` varType a, right `eqType` varType b ->
-            BuildPair <$> field a <*> field b
-      _ -> Nothing
-    pure (PairCase owner_binders x_owner y_owner selected)
-
--- | Publish the single constructor equation certified by the ordinary pair case.
-publishPairCase :: Id -> PairCase -> TcM TyCon
-publishPairCase owner (PairCase telescope first second selected) = do
-    kind_binders <- forM telescope $ \(Bndr variable visibility) -> do
-      name <- newSysName (nameOccName (varName variable))
-      pure (mkNamedTyConBinder visibility (mkTyVar name liftedTypeKind))
-    let quantifiers = [v | Bndr v _ <- kind_binders]
-        source_variables = [v | Bndr v _ <- telescope]
-        instantiate = substTyWith source_variables (mkTyVarTys quantifiers)
-        first_kind = instantiate (mkTyVarTy first)
-        second_kind = instantiate (mkTyVarTy second)
-        pair_kind a b = mkTyConApp (tupleTyCon Boxed 2) [a, b]
-        promoted_pair ka kb a b =
-          mkTyConApp (promotedTupleDataCon Boxed 2) [ka, kb, a, b]
-    pair <- freshSysTyVar "p" (pair_kind first_kind second_kind)
-    x <- freshSysTyVar "a" first_kind
-    y <- freshSysTyVar "b" second_kind
-    let binders = kind_binders ++ mkAnonTyConBinders [pair]
-        field FirstField  = (first_kind, mkTyVarTy x)
-        field SecondField = (second_kind, mkTyVarTy y)
-        (result, rhs) = case selected of
-          SelectField f -> field f
-          BuildPair a b -> let (ka, ta) = field a
-                               (kb, tb) = field b
-                           in (pair_kind ka kb, promoted_pair ka kb ta tb)
-        pat = promoted_pair first_kind second_kind (mkTyVarTy x) (mkTyVarTy y)
-        args = mkTyVarTys quantifiers ++ [pat]
-        clause_binders = quantifiers ++ [x,y]
-        branch _ = mkCoAxBranch clause_binders [] [] args rhs
-                       (map (const Nominal) clause_binders) (nameSrcSpan (idName owner))
-    makeSourceFamily (idName owner) binders result [branch]
-
-{- Note [Checked pair cases]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-A checked boxed case can publish one nominal constructor equation.
-Check exported ordinary functions when finalizing the producer module.
-The family and its axiom belong to that module. A dependent client can
-keep a call on an unknown pair in its interface. A later client can
-reduce the application when the pair constructor becomes known. Ordinary
-term uses keep the original Id. The dependent client's renamer selects
-the family only when -XDependentTypes is enabled there.
-The two bound field types become kind parameters in that equation.
-A homogeneous term type shares one kind parameter but still introduces
-two independent fields. The actual case determines which fields go into the equation. Returning the exact alternative binder requires no
-demand of the other field. Rebuilding a pair from the exact field binders leaves both fields lazy.
-Preserve the selected order, including repeated uses of the same field. Both bodies force the
-input pair to weak head normal form. With a neutral pair the family
-does not choose an alternative and the equality can survive an interface.
-
-An equation for a pair result matches only the input constructor.
-In particular, a body that rebuilds the pair in its original order does
-not equate a neutral pair with its fieldwise reconstruction. A case
-that also forces a field retains the ordinary term entry.
--}
-
-{- Note [Polymorphic nested domains and constructor producers]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Source functions that witness algebraic laws (such as ((a, b), c) -> (a, (b, c)),
-(a, ()) -> a, a -> (a, ()), Either (Either a b) c -> Either a (Either b c), and
-(Either a b, c) -> Either (a, c) (b, c)) use three features beyond flat
-parameterized constructor cases:
-
-1. Nested and concrete type arguments. The scrutinized domain TyConApp tc args
-   can apply tc to arbitrary family-free lifted types built from outer forall
-   variables and boxed algebraic datatypes with vanilla lazy constructors
-   (polySourceType). Require every outer forall variable to occur free in at
-   least one visible argument type so the left-hand side determines all
-   invisible family arguments.
-
-2. Carried arguments and nested constructor patterns. Under NoStrict, allow
-   carried variable or wildcard arguments alongside polymorphic domains (such
-   as assocPairR :: (a, b) -> c -> (a, (b, c))), and allow nested constructor
-   and boxed tuple patterns (SourcePat). Check pattern coverage with a
-   left-to-right strict decision tree (completePatMatrix): every column in a
-   branch group either leaves all rows as variables or partitions the rows
-   exhaustively across every constructor of a vanilla lazy datatype, ending at
-   a unique leaf row. This guarantees exhaustiveness, disjointness, and exact
-   agreement with Haskell left-to-right pattern demand.
-
-3. Total constructor producers. A single-clause non-recursive function whose
-   patterns are all lazy variables or wildcards and whose right-hand side is
-   headed by a lazy constructor (such as unitRFrom :: a -> (a, ());
-   unitRFrom x = (x, ())) forces none of its arguments. Under NoStrict, publish
-   its single equation directly in sourceTableTyCons, and skip partial-pair
-   P1:/P2: allocation in checkedPairBuilder when both fields are pure
-   constructor/variable trees.
--}
-
--- | A checked pattern tree in a source equation.
--- See Note [Polymorphic nested domains and constructor producers].
-data SourcePat
-  = SourcePatVar (Maybe Id)
-  | SourcePatCon DataCon [Type] [SourcePat]
-
--- | Test whether a source pattern is a bare variable or wildcard.
-isSourcePatVar :: SourcePat -> Bool
-isSourcePatVar SourcePatVar{} = True
-isSourcePatVar _ = False
-
--- | Test whether a source pattern matches a data constructor.
-isSourcePatCon :: SourcePat -> Bool
-isSourcePatCon SourcePatCon{} = True
-isSourcePatCon _ = False
-
--- | The constructor pattern or total producer binders, carried operands, and RHS.
-data SourceRow
-  = SourceRow SrcSpan DataCon [Type] [SourcePat] [Maybe Id] SourceRhs
-  | SourceProducerRow SrcSpan [Maybe Id] SourceRhs
-
-{- Note [Empty-case branches in source equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A total source function over a sum datatype can have an uninhabited constructor
-branch whose field has a zero-constructor boxed algebraic datatype such as
-`Data.Void.Void`:
-
-    sumZeroRTo :: Either a Void -> a
-    sumZeroRTo (Left x)  = x
-    sumZeroRTo (Right v) = case v of {}
-
-or `sumZeroRTo (Right v) = absurd v`.
-
-In lazy Haskell evaluation, `sumZeroRTo (Right undefined)` diverges because
-`case v of {}` forces `v`. Therefore `T:sumZeroRTo` must emit no axiom branch
-for `'Right v`, leaving `T:sumZeroRTo ('Right v)` stuck while publishing the
-checked equation `T:sumZeroRTo ('Left x) = x` for the inhabited constructor.
-
-Certify an `AbsurdField v` branch only when:
-1. All constructors of the scrutinized datatype are covered in the source
-   pattern matrix, with at least one inhabited non-absurd branch.
-2. The scrutinized variable `v` is bound by that row's pattern or carried
-   binders, and its instantiated type satisfies `emptyCaseDatatype` (a concrete,
-   non-abstract boxed lifted algebraic datatype with zero data constructors).
--}
-
--- | The expression forms allowed in one source equation.
-data SourceRhs = Field Id | Construct DataCon [SourceRhs] | Recur [Type] Id
-               | Call Id [Type] [SourceRhs] | EmbeddedType Type
-               | AbsurdField Id
-
--- | Collect non-self calls, including calls inside operands.
-sourceCalls :: SourceRhs -> [Id]
-sourceCalls (Field _) = []
-sourceCalls (Construct _ args) = concatMap sourceCalls args
-sourceCalls (Recur _ _) = []
-sourceCalls (Call fun _ args) = fun : concatMap sourceCalls args
-sourceCalls (EmbeddedType _) = []
-sourceCalls (AbsurdField _) = []
-
--- | Test whether a row refutes an uninhabited field via an empty case or 'absurd'.
-isAbsurdSourceRow :: SourceRow -> Bool
-isAbsurdSourceRow (SourceRow _ _ _ _ _ AbsurdField{}) = True
-isAbsurdSourceRow _ = False
-
--- | Test whether a row returns an embedded type via @type@.
-isEmbeddedTypeRow :: SourceRow -> Bool
-isEmbeddedTypeRow (SourceRow _ _ _ _ _ EmbeddedType{}) = True
-isEmbeddedTypeRow _ = False
-
--- | Test whether a row is a zero-match constructor producer.
-isProducerSourceRow :: SourceRow -> Bool
-isProducerSourceRow SourceProducerRow{} = True
-isProducerSourceRow _ = False
-
--- | Test whether a constructor row inspects nested subpatterns.
-isNestedSourcePatRow :: SourceRow -> Bool
-isNestedSourcePatRow (SourceRow _ _ _ pats _ _) = any isSourcePatCon pats
-isNestedSourcePatRow _ = False
-
--- | Test whether a source right-hand side builds an outer data constructor.
-isConstructorHeadedRhs :: SourceRhs -> Bool
-isConstructorHeadedRhs Construct{} = True
-isConstructorHeadedRhs _ = False
-
--- | A closed input, a datatype applied to types over lifted body skolems,
--- or a zero-match constructor producer over lifted body skolems.
--- See Note [Closed source tables] and
--- Note [Polymorphic nested domains and constructor producers].
-data SourceInput
-  = ClosedInput Type [Type]
-  | PolyInput TyCon [TyVar] [Type]
-  | ProducerInput [TyVar]
-
--- | Check a family-free lifted type built from outer type variables and
--- ordinary boxed algebraic datatypes whose constructors are vanilla and lazy.
-polySourceType :: [TyVar] -> Type -> Bool
-polySourceType = polySourceTypeWith emptyNameSet
-
--- | Worker for 'polySourceType' tracking visited 'TyCon' names so inductive
--- and mutually recursive datatypes terminate.
-polySourceTypeWith :: NameSet -> [TyVar] -> Type -> Bool
-polySourceTypeWith seen allowed_tvs ty
-  | Just tv <- getTyVar_maybe ty =
-      tv `elem` allowed_tvs && tcIsLiftedTypeKind (tyVarKind tv)
-  | isTyFamFree ty
-  , Just (tc, args) <- caseDatatype ty
-  , null (tyConStupidTheta tc)
-  , let tc_tvs = tyConTyVars tc
-  , equalLength args tc_tvs
-  , all (tcIsLiftedTypeKind . tyVarKind) tc_tvs
-  , all (polySourceArgTypeWith seen allowed_tvs) args
-  = tyConName tc `elemNameSet` seen ||
-    (null args && isEnumerationTyCon tc) ||
-    let seen' = extendNameSet seen (tyConName tc)
-        formal_args = mkTyVarTys tc_tvs
-    in all (\con -> isVanillaDataCon con &&
-                    dataConUserTyVars con == dataConUnivTyVars con &&
-                    maybe False (all (polySourceArgTypeWith seen' tc_tvs))
-                          (openDataConFieldTypes con formal_args))
-           (tyConDataCons tc)
-  | otherwise = False
-
--- | Allow passive lifted family-free tau types (such as @Int@) in uninspected
--- argument positions alongside algebraic constructor trees.
-polySourceArgType :: [TyVar] -> Type -> Bool
-polySourceArgType = polySourceArgTypeWith emptyNameSet
-
--- | Worker for 'polySourceArgType' sharing the visited-'TyCon' set.
-polySourceArgTypeWith :: NameSet -> [TyVar] -> Type -> Bool
-polySourceArgTypeWith seen allowed_tvs ty =
-  polySourceTypeWith seen allowed_tvs ty ||
-  (tcIsLiftedTypeKind (typeKind ty) &&
-   isTyFamFree ty &&
-   isTauTy ty &&
-   all (\tv -> tv `elem` allowed_tvs && tcIsLiftedTypeKind (tyVarKind tv))
-       (tyCoVarsOfTypeList ty))
-
--- | Verify that a pattern matrix forms an exhaustive, pairwise-disjoint
--- left-to-right decision tree over vanilla lazy constructors.
--- See Note [Polymorphic nested domains and constructor producers].
-completePatMatrix :: [Type] -> [[SourcePat]] -> Bool
-completePatMatrix [] rows = lengthIs rows 1
-completePatMatrix (ty : tys) rows
-  | null rows = False
-  | all isSourcePatVar first_col =
-      completePatMatrix tys [rest | _ : rest <- rows]
-  | all isSourcePatCon first_col
-  , isTyFamFree ty
-  , Just (tc, args) <- caseDatatype ty
-  , null (tyConStupidTheta tc)
-  = all (\dc ->
-      isVanillaDataCon dc &&
-      dataConUserTyVars dc == dataConUnivTyVars dc &&
-      case openDataConFieldTypes dc args of
-        Just field_tys ->
-          let matching = [ subpats ++ rest
-                         | SourcePatCon actual _ subpats : rest <- rows
-                         , actual == dc
-                         , equalLength subpats field_tys ]
-          in not (null matching) && completePatMatrix (field_tys ++ tys) matching
-        Nothing -> False) (tyConDataCons tc)
-  | otherwise = False
+checkLocalRetainedWitnessExports :: TcGblEnv -> [Id] -> TcM ()
+checkLocalRetainedWitnessExports env owners = do
+    let exported = availsToNameSet (tcg_exports env)
+        exported_tycons = tyConsOfTypes (exportedLargeElimInterfaceTypes exported (tcg_type_env env))
+        emit span_nm owner mb_dep detail = setSrcSpan (nameSrcSpan span_nm) $
+          addErr (TcRnOpenTypeEval owner mb_dep ("The dependent type needs this equation. " ++ detail ++ " to make it available."))
+        detailFor (hidden, True)  = "Export the constructors of " ++ occNameString (nameOccName hidden)
+        detailFor (hidden, False) = "Export " ++ occNameString (nameOccName hidden)
+    forM_ owners $ \owner -> case sourceTableId_maybe owner of
+      Just table
+        | Just (con, _) <- directRetainedWitnessType (varType owner) <|> retainedWitnessType (varType owner)
+        , let tc = dataConTyCon con, nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env)
+        , not (publicCaseType env exported (const False) tc) -> do
+            let name = idName owner
+                dep = listToMaybe (sortBy stableNameCmp [idName c | c <- owners, table `elem` sourceFamilyTyCons [varType c]])
+            emit (fromMaybe name dep) name dep ("Export the matched constructor " ++ occNameString (nameOccName (dataConName con)))
+        | isNominalStructuralSource owner, isJust (booleanSelector table)
+        , hidden : _ <- unexported_case_types exported table ->
+            emit (idName owner) (idName owner) Nothing ("Export the constructors of " ++ occNameString (nameOccName hidden))
+        | SourceTableId _ _ NominalSourceTable <- idDetails owner, isLargeElimTable table
+        , let name = idName owner; exposed = table `elementOfUniqSet` exported_tycons
+        , name `elemNameSet` exported || exposed ->
+            case unexportedLargeElimTypes env exported table of
+              pair : _ -> emit name name Nothing (detailFor pair)
+              [] | exposed, not (name `elemNameSet` exported) -> emit name name Nothing ("Export " ++ occNameString (nameOccName name))
+              [] -> pure ()
+        | SourceTableId _ _ NominalSourceTable <- idDetails owner, not (isLargeElimTable table)
+        , table `elementOfUniqSet` exported_tycons
+        , pair : _ <- unexported_value_table_types exported table ->
+            emit (idName owner) (idName owner) Nothing (detailFor pair)
+      _ -> pure ()
   where
-    first_col = [p | p : _ <- rows]
+    is_local n = nameModule_maybe n == Just (tcg_semantic_mod env)
+    unexported_case_types exported table = sortBy stableNameCmp
+      [tyConName tc | tc <- sourceEquationDatatypes (sourceTableWithCallees table)
+                    , is_local (tyConName tc), not (publicCaseType env exported (const False) tc)]
+    unexported_value_table_types exported table =
+      let tables = sourceTableWithCallees table
+      in map (, True) (sortBy stableNameCmp [tyConName tc | tc <- tablePromotedParents True tables
+                                                          , is_local (tyConName tc), not (publicCaseType env exported (const False) tc)]) ++
+         map (, False) (sortBy stableNameCmp [tyConName tc | tc <- sourceEquationDatatypes tables
+                                                           , is_local (tyConName tc), not (tyConName tc `elemNameSet` exported)])
 
--- | Collect the constructors and evidence for a candidate source function.
-sourceRows :: Bool -> HsBind GhcTc -> Maybe (Id, LeftOrRight, [TyVar], [TcEvBinds], [SourceRow])
-sourceRows bracket_lists binding = do
-    (fun, mono, body_tvs, evidence, matches) <- sourceMatches binding
-    let self v = v == fun || v == mono
-        read_rows order = do
-          pairs <- traverse (sourceRow bracket_lists order self) matches
-          pure (order, (concatMap fst pairs, map snd pairs))
-        read_producer
-          | [one] <- matches
-          , Just row <- sourceProducerRow bracket_lists self one
-          = Just (CLeft, ([], [row]))
-          | otherwise = Nothing
-    (order, (row_evidence, rows)) <- read_rows CLeft <|> read_rows CRight <|> read_producer
-    pure (fun, order, body_tvs, evidence ++ row_evidence, rows)
+sourceTableWithCallees :: TyCon -> [TyCon]
+sourceTableWithCallees table = table : fromMaybe [] (sourceTableCallees table)
 
--- | Put the scrutinized operand first for checking, or restore source order.
--- The right-operand path checks only binary source functions.
-sourceOperandOrder :: LeftOrRight -> [a] -> [a]
-sourceOperandOrder CRight (left : right : rest) = right : left : rest
-sourceOperandOrder _ operands = operands
+tablePromotedParents :: Bool -> [TyCon] -> [TyCon]
+tablePromotedParents include_lhs tables =
+    nonDetEltsUniqSet $ mkUniqSet [dataConTyCon dc | tc <- nonDetEltsUniqSet (tyConsOfTypes branch_tys), Just dc <- [isPromotedDataCon_maybe tc]]
+  where
+    branch_tys = [ty | t <- tables, ax <- maybeToList (closedFamilyTyConCoAxiom_maybe t)
+                     , br <- fromBranches (coAxiomBranches ax)
+                     , ty <- coAxBranchRHS br : if include_lhs then coAxBranchLHS br else []]
 
--- | Read the original function clauses with the solver evidence in scope.
-sourceMatches :: HsBind GhcTc
-              -> Maybe (Id, Id, [TyVar], [TcEvBinds], [LMatch GhcTc (LHsExpr GhcTc)])
+isLargeElimTable :: TyCon -> Bool
+isLargeElimTable table = hasSourceTableAxiom False (const True) table && tcIsLiftedTypeKind (tyConResKind table)
+
+unexportedLargeElimTypes :: TcGblEnv -> NameSet -> TyCon -> [(Name, Bool)]
+unexportedLargeElimTypes env exported table =
+    map (, True) (sortBy stableNameCmp hidden_domains) ++ map (, False) (sortBy stableNameCmp hidden_rhs_types)
+  where
+    tables = sourceTableWithCallees table
+    is_local name = nameModule_maybe name == Just (tcg_semantic_mod env)
+    lhs_tys t = tyConKind t : [ty | ax <- maybeToList (closedFamilyTyConCoAxiom_maybe t)
+                                  , br <- fromBranches (coAxiomBranches ax)
+                                  , ty <- coAxBranchLHS br ++ map tyVarKind (coAxBranchTyVars br)]
+    domain_tcs = [parent | tc <- nonDetEltsUniqSet (tyConsOfTypes (concatMap lhs_tys tables)) ++ tablePromotedParents False tables
+                         , let parent = maybe tc dataConTyCon (isPromotedDataCon_maybe tc), isAlgTyCon parent]
+    hidden_domains = [tyConName tc | tc <- nonDetEltsUniqSet (mkUniqSet domain_tcs)
+                                   , is_local (tyConName tc), not (publicCaseType env exported (const False) tc)]
+    all_rhs_tys = [coAxBranchRHS br | t <- tables, ax <- maybeToList (closedFamilyTyConCoAxiom_maybe t), br <- fromBranches (coAxiomBranches ax)]
+    rhs_tcs = [tc | tc <- nonDetEltsUniqSet (tyConsOfTypes all_rhs_tys), isNothing (isPromotedDataCon_maybe tc), tc `notElem` tables]
+    callee_owners = [ mkVarOcc (occNameString o) | c <- fromMaybe [] (sourceTableCallees table)
+                    , isLargeElimTable c, is_local (tyConName c), Just o <- [sourceTableTermOcc (nameOccName (tyConName c))] ]
+    hidden_callees = [idName v | v <- typeEnvIds (tcg_type_env env), is_local (idName v)
+                               , nameOccName (idName v) `elem` callee_owners, not (idName v `elemNameSet` exported)]
+    hidden_rhs_types = [tyConName tc | tc <- nonDetEltsUniqSet (mkUniqSet rhs_tcs)
+                                     , is_local (tyConName tc), not (tyConName tc `elemNameSet` exported)] ++ hidden_callees
+
+exportedLargeElimInterfaceTypes :: NameSet -> TypeEnv -> [Type]
+exportedLargeElimInterfaceTypes exported = concatMap entity_types . typeEnvElts
+  where
+    entity_types (AnId v) | idName v `elemNameSet` exported = [varType v]
+    entity_types (AConLike (RealDataCon dc)) | dataConName dc `elemNameSet` exported = [varType (dataConWrapId dc), varType (dataConWorkId dc)]
+    entity_types (ATyCon tc) | tyConName tc `elemNameSet` exported = tyConKind tc : maybeToList (synTyConRhs_maybe tc)
+    entity_types _ = []
+
+sourceEquationDatatypes :: [TyCon] -> [TyCon]
+sourceEquationDatatypes tables =
+    [parent | tc <- nonDetEltsUniqSet (tyConsOfTypes (concatMap eq_tys tables))
+            , let parent = maybe tc dataConTyCon (isPromotedDataCon_maybe tc), isAlgTyCon parent]
+  where
+    eq_tys tc = tyConKind tc : [ty | ax <- maybeToList (closedFamilyTyConCoAxiom_maybe tc), br <- fromBranches (coAxiomBranches ax)
+                                   , ty <- coAxBranchRHS br : coAxBranchLHS br ++ map tyVarKind (coAxBranchTyVars br)]
+
+isMonomorphicRetainedWitness :: Id -> Bool
+isMonomorphicRetainedWitness = isJust . directRetainedWitnessType . varType
+
+publicCaseType :: TcGblEnv -> NameSet -> (Name -> Bool) -> TyCon -> Bool
+publicCaseType env exported imported = visibleCaseType (\n -> if nameModule_maybe n == Just (tcg_semantic_mod env) then n `elemNameSet` exported else imported n)
+
+visibleCaseType :: (Name -> Bool) -> TyCon -> Bool
+visibleCaseType available tc = all available (tyConName tc : map dataConName (tyConDataCons tc))
+
+ordinaryImport :: GlobalRdrEnv -> Name -> Bool
+ordinaryImport rdr_env name = maybe False (any ((== NotBoot) . is_isboot . is_decl) . gre_imp) (lookupGRE_Name rdr_env name)
+
+rebuildSourceFamilyWith :: (TyCon -> TyCon) -> TyCon -> TyCon
+rebuildSourceFamilyWith subst_tc table
+  | Just ax <- closedFamilyTyConCoAxiom_maybe table =
+      buildSourceFamily (tyConName table) (coAxiomName ax) (tyConBinders table) (tyConResKind table)
+        [ \fam -> mkCoAxBranch (coAxBranchTyVars br) [] (coAxBranchCoVars br)
+                    (coAxBranchLHS br) (map_rhs fam (coAxBranchRHS br)) (coAxBranchRoles br) (coAxBranchSpan br)
+        | br <- fromBranches (coAxiomBranches ax) ]
+  | otherwise = pprPanic "rebuildSourceFamilyWith: expected closed family" (ppr table)
+  where
+    map_rhs fam =
+      let subst t | tyConName t == tyConName table = fam | otherwise = subst_tc t
+          (map_ty, _, _, _) = mapTyCo TyCoMapper
+            { tcm_tyvar = pure . mkTyVarTy, tcm_termvar = pure . TermVarTy, tcm_termbinder = \v k -> k v
+            , tcm_covar = pure . mkCoVarCo, tcm_hole = pprPanic "rebuildSourceFamilyWith: coercion hole" . ppr
+            , tcm_tycobinder = \tv _ k -> k tv
+            , tcm_tcapp_ty = \_ tc tys -> Identity (TyConApp (subst tc) tys)
+            , tcm_tcapp_co = \_ role tc cos -> Identity (mkTyConAppCo role (subst tc) cos) }
+      in runIdentity . map_ty
+
+-- ---------------------------------------------------------------------------
+-- Embedded-type large eliminations (`HsEmbTy`) and Core-backed stage drivers
+-- ---------------------------------------------------------------------------
+
+data EmbRhs = EmbTypeRhs Type | EmbAbsurdRhs Id
+data EmbClause = EmbClause SrcSpan DataCon [Type] [Maybe Id] [Maybe Id] EmbRhs
+data EmbSpec = EmbSpec Id LeftOrRight [TyVar] [TcEvBinds] [EmbClause] [Type]
+
+readEmbSpec :: HsBind GhcTc -> Maybe EmbSpec
+readEmbSpec binding = do
+    (fun, _, body_tvs, evidence, matches) <- sourceMatches binding
+    let readOrder order = do
+          (evs, clauses) <- unzip <$> traverse (readClause order) matches
+          let emb_tys = [t | EmbClause _ _ _ _ _ (EmbTypeRhs t) <- clauses]
+          EmbSpec fun order body_tvs (evidence ++ concat evs) clauses emb_tys <$ guard (not (null emb_tys))
+    readOrder CLeft <|> readOrder CRight
+  where
+    reorder CRight (a : b : rest) = b : a : rest; reorder _ xs = xs
+    unParen (L _ (ParPat _ p)) = unParen p; unParen (L _ p) = p
+    plainBinder p = case unParen p of { VarPat _ (L _ v) -> Just (Just v); WildPat _ -> Just Nothing; _ -> Nothing }
+
+    readClause order (L loc (Match { m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] (L _ rhs)) :| []) (L _ (EmptyLocalBinds _)) }))
+      | pickLR order (True, lengthIs pats 2), pat : rest <- reorder order pats = do
+          (evs, dc, params, fields) <- case unParen pat of
+            ConPat (ConPatTc ps [] [] cevs WpHole []) (L _ (RealDataCon con)) details -> do
+              fs <- case details of { PrefixCon _ xs -> Just xs; InfixCon _ x1 x2 -> Just [x1, x2]; _ -> Nothing }
+              (cevs, con, ps,) <$> traverse plainBinder fs
+            TuplePat ps fs Boxed | length fs /= 1 ->
+              (EvBinds emptyBag, tupleDataCon Boxed (length fs), ps,) <$> traverse plainBinder fs
+            _ -> Nothing
+          carried <- traverse plainBinder rest
+          ([evs],) . EmbClause (locA loc) dc params fields carried <$> parseEmbRhs rhs
+    readClause _ _ = Nothing
+
+    parseEmbRhs (HsPar _ e) = parseEmbRhs (unLoc e)
+    parseEmbRhs (XExpr (WrapExpr WpHole e)) = parseEmbRhs e
+    parseEmbRhs (XExpr (ExpandedThingTc (HSE (ExprCtxt HsEmbTy{}) (L _ (XExpr (WrapExpr (WpCompose (WpTyApp t) (WpTyLam _)) _)))))) =
+      Just (EmbTypeRhs t)
+    parseEmbRhs (HsCase _ scrut (MG { mg_alts = L _ [] })) | Just v <- hsVar (unLoc scrut) = Just (EmbAbsurdRhs v)
+    parseEmbRhs (HsApp _ fn arg)
+      | Just f <- hsHead (unLoc fn), Just m <- nameModule_maybe (idName f), moduleUnitId m == ghcInternalUnitId
+      , occNameString (nameOccName (idName f)) == "absurd", Just v <- hsVar (unLoc arg) = Just (EmbAbsurdRhs v)
+    parseEmbRhs _ = Nothing
+
+    hsVar (HsPar _ e) = hsVar (unLoc e); hsVar (XExpr (WrapExpr WpHole e)) = hsVar e
+    hsVar (HsVar _ (L _ v)) = Just v; hsVar _ = Nothing
+
+    hsHead (HsPar _ e) = hsHead (unLoc e); hsHead (HsVar _ (L _ f)) = Just f
+    hsHead (HsAppType _ fn _) = hsHead (unLoc fn); hsHead (XExpr (WrapExpr _ fn)) = hsHead fn
+    hsHead _ = Nothing
+
+certifyEmbSpec :: Bool -> Bool -> TcGblEnv -> (Id -> TcM (Maybe TyCon)) -> [Id] -> EmbSpec -> TcM (Maybe (Id, TyCon))
+certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun order body_tvs evidence clauses _) = do
+    clean <- allM emptyEvidence evidence
+    if not clean then pure Nothing else do
+      ty <- liftZonkM (zonkTcType (varType fun))
+      callee_tcs <- traverse (\c -> fmap (c,) <$> lookup_callee c) emb_callees
+      case sequence callee_tcs >>= checkDom ty of
+        Nothing -> pure Nothing
+        Just (tvs, inst_args, inst_dom, inst_carried, resolved_callees) -> do
+          mb_builders <- traverse (buildEmbClause body_tvs tvs inst_args inst_dom inst_carried (varName fun) resolved_callees) clauses
+          case sequence mb_builders of
+            Just builders | let real_brs = catMaybes builders, not (null real_brs) -> do
+              table <- case if final_exports then sourceTableOccurrence env fun >>= sourceTableId_maybe else Nothing of
+                Just existing -> pure existing
+                Nothing -> do
+                  vars <- forM body_tvs $ \sk -> flip mkTyVar (tyVarKind sk) <$> newSysName (nameOccName (varName sk))
+                  let inst = substTyWith body_tvs (mkTyVarTys vars)
+                  args <- zipWithM freshSysTyVar ("x" : "y" : map (("arg" ++) . show) [3 :: Int ..])
+                            (reorder (inst inst_dom : map inst inst_carried))
+                  makeSourceFamily (varName fun) (mkNamedTyConBinders (Invisible SpecifiedSpec) vars ++ mkAnonTyConBinders args)
+                    liftedTypeKind real_brs
+              let exported = availsToNameSet (tcg_exports env)
+              if final_exports && (not (idName fun `elemNameSet` exported) || not (null (unexportedLargeElimTypes env exported table)))
+                then pure Nothing else pure (Just (setIdType fun ty, table))
+            _ -> pure Nothing
+  where
+    reorder (a : b : rest) | CRight <- order = b : a : rest
+    reorder xs = xs
+
+    embBinder (ma, Bndr tv (Invisible SpecifiedSpec))
+      | ma `eqType` unmatchableDataConTy, isTyVar tv
+      , tcIsLiftedTypeKind (tyVarKind tv) || isJust (ordinaryDataType (tyVarKind tv)) = Just tv
+    embBinder _ = Nothing
+
+    embCarried tvs arg
+      | tcIsLiftedTypeKind (typeKind arg), isTyFamFree arg, all (`elem` tvs) (tyCoVarsOfTypeList arg)
+      , Just (tc, _) <- splitTyConApp_maybe arg = isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc
+      | otherwise = False
+
+    embArrows _ ty | tcIsLiftedTypeKind ty = Just ([], ty)
+    embArrows tvs ty | Just (arg, rest) <- caseArrow ty = guard (embCarried tvs arg) *> ((\(m, o) -> (arg : m, o)) <$> embArrows tvs rest)
+    embArrows _ _ = Nothing
+
+    checkDom ty resolved = do
+      let (telescope, tau) = splitForAllForAllTyBinders ty
+      guard (equalLength telescope body_tvs)
+      tvs <- traverse embBinder telescope
+      (first_ty, rest_ty) <- caseArrow tau
+      (arg_ty, carried, res_ty) <- case order of
+        CLeft  -> (\(cs, r) -> (first_ty, cs, r)) <$> embArrows tvs rest_ty
+        CRight -> guard (embCarried tvs first_ty) *> ((\(s, r) -> (s, [first_ty], r)) <$> caseArrow rest_ty)
+      guard (tcIsLiftedTypeKind res_ty && (null carried || not strict))
+      let lhs_fvs = concatMap tyCoVarsOfTypeList (arg_ty : carried); inst_body = substTyWith tvs (mkTyVarTys body_tvs)
+      (tc, inst_args) <- case tvs of
+        [] | Just (tc, ps) <- ordinaryDataType arg_ty -> pure (tc, ps)
+           | not strict, Just (tc, as) <- caseDatatype arg_ty, polySourceType [] arg_ty -> pure (tc, as)
+           | otherwise -> Nothing
+        _  | Just (tc, []) <- ordinaryDataType arg_ty -> (tc, []) <$ guard (not strict && all (`elem` lhs_fvs) tvs)
+           | otherwise -> do
+               (tc, args) <- caseDatatype arg_ty
+               params <- traverse getTyVar_maybe args
+               guard (equalLength params (nubBy (==) params) && all (`elem` tvs) params && all (`elem` lhs_fvs) tvs)
+               unless (tc == listTyCon) $ do
+                 guard (not strict && not (isGadtSyntaxTyCon tc) && null (tyConStupidTheta tc))
+                 forM_ (tyConDataCons tc) $ \con -> do
+                   guard (isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con)
+                   openDataConFieldTypes con args >>= guard . all (caseKind args)
+               pure (tc, map inst_body args)
+      let expected_dcs = tyConDataCons tc; actual_dcs = [dc | EmbClause _ dc _ _ _ _ <- clauses]
+      guard (equalLength actual_dcs expected_dcs && mkUniqSet actual_dcs == mkUniqSet expected_dcs)
+      pure (tvs, inst_args, mkTyConApp tc inst_args, map inst_body carried, resolved)
+
+    buildEmbClause body_tvs _ pat_expected dom carried_tys owner_name resolved_callees
+                   (EmbClause loc dc pat_args fields carried emb_rhs) = do
+      args <- liftZonkM (zonkTcTypes pat_args)
+      c_tys <- liftZonkM (traverse (traverse (zonkTcType . varType)) carried)
+      f_tys <- liftZonkM (traverse (traverse (zonkTcType . varType)) fields)
+      let bound_ids = catMaybes fields ++ catMaybes carried
+      if not (eqTypes args pat_expected && equalLength c_tys carried_tys && length fields == dataConSourceArity dc &&
+              sizeUniqSet (mkUniqSet bound_ids) == length bound_ids && and (zipWith (\e a -> maybe True (eqType e) a) carried_tys c_tys))
+        then pure Nothing
+        else do
+          qvars <- forM body_tvs $ \sk -> flip mkTyVar (tyVarKind sk) <$> newSysName (nameOccName (varName sk))
+          let inst = substTyWith body_tvs (mkTyVarTys qvars); params = map inst pat_expected
+              expected_f_tys = map scaledThing (dataConInstOrigArgTys dc params)
+              allocVar mb_v k = flip mkTyVar k <$> newSysName (maybe (mkTyVarOcc "_") (setOccNameSpace tvName . nameOccName . varName) mb_v)
+          if not (equalLength f_tys expected_f_tys && and (zipWith (\e a -> maybe True (eqType e . inst) a) expected_f_tys f_tys))
+            then pure Nothing
+            else do
+              field_tvs <- zipWithM allocVar fields expected_f_tys
+              carried_tvs <- zipWithM allocVar carried (map inst carried_tys)
+              let fields_scope = zip fields field_tvs; carried_scope = zip carried carried_tvs
+                  lhs_con = mkTyConApp (promoteDataCon dc) (params ++ mkTyVarTys field_tvs)
+                  patterns = mkTyVarTys qvars ++ reorder (lhs_con : mkTyVarTys carried_tvs)
+                  binders = qvars ++ field_tvs ++ carried_tvs
+              case emb_rhs of
+                EmbAbsurdRhs v -> pure $ do
+                  tv <- lookup (Just v) (fields_scope ++ carried_scope)
+                  Nothing <$ guard (all isTyFamFree patterns && inst (varType v) `eqType` tyVarKind tv &&
+                                    isJust (emptyCaseDatatype (tyVarKind tv)))
+                EmbTypeRhs raw_ty -> do
+                  zonked_ty <- liftZonkM (zonkTcType raw_ty)
+                  pure $ do
+                    guard (all isTyFamFree patterns && not (hasCoercionHole zonked_ty) &&
+                           not (any isMetaTyVar (tyCoVarsOfTypeList zonked_ty)) && tcIsLiftedTypeKind (typeKind zonked_ty))
+                    _ <- rewriteEmb listTyCon qvars binders inst (inst dom) (mkTyVarTys qvars) fields_scope carried_scope zonked_ty
+                    pure $ Just $ \fam ->
+                      let rhs_t = fromMaybe (panic "certifyEmbSpec") $
+                                    rewriteEmb fam qvars binders inst (inst dom) (mkTyVarTys qvars) fields_scope carried_scope zonked_ty
+                      in mkCoAxBranch binders [] [] patterns rhs_t (map (const Nominal) binders) loc
+      where
+        rewriteEmb fam qvars binders inst inst_dom fam_args fields_scope carried_scope emb_ty = do
+          let sk_map = zip body_tvs qvars; all_scope = fields_scope ++ carried_scope
+              field_set = mkUniqSet (map snd fields_scope); bndr_set = mkVarSet binders
+              is_self t = nameModule_maybe (tyConName t) == nameModule_maybe owner_name &&
+                          nameOccName (tyConName t) == mkSourceTableOcc (nameOccName owner_name)
+              is_pending t | Just (ClosedTypeFamilyTyCon CTF_Abstract) <- famTyConFlav_maybe t =
+                               isJust (sourceTableTermOcc (nameOccName (tyConName t)))
+                           | otherwise = False
+              resolve_callee t = listToMaybe [rt | (cid, rt) <- resolved_callees
+                                                 , nameModule_maybe (tyConName t) == nameModule_maybe (idName cid)
+                                                 , nameOccName (tyConName t) == mkSourceTableOcc (nameOccName (idName cid))]
+              (map_ty, _, _, _) = mapTyCo mapper
+              mapper = TyCoMapper
+                { tcm_tyvar = \tv -> pure (mkTyVarTy (fromMaybe tv (lookup tv sk_map)))
+                , tcm_termvar = \v -> lookup (Just v) all_scope >>= \tv -> mkTyVarTy tv <$ guard (inst (varType v) `eqType` tyVarKind tv)
+                , tcm_termbinder = \_ _ -> Nothing, tcm_covar = \_ -> Nothing, tcm_hole = \_ -> Nothing
+                , tcm_tycobinder = \tv _ k -> guard (tv `notElem` body_tvs) *> k tv
+                , tcm_tcapp_ty = \_ tc mapped ->
+                    if is_self tc then do
+                      let (t_args, v_args) = splitAt (length fam_args) mapped
+                      rec_arg : rec_cs <- pure (reorder v_args)
+                      ftv <- getTyVar_maybe rec_arg
+                      guard (length mapped == length fam_args + 1 + length carried_scope && eqTypes t_args fam_args &&
+                             ftv `elementOfUniqSet` field_set && tyVarKind ftv `eqType` inst_dom &&
+                             eqTypes rec_cs (mkTyVarTys (map snd carried_scope)))
+                      pure (mkTyConApp fam (fam_args ++ v_args))
+                    else case resolve_callee tc of
+                      Just rt -> mkTyConApp rt mapped <$ guard (length mapped == tyConArity rt)
+                      Nothing
+                        | isTypeSynonymTyCon tc, Just expanded <- coreView (mkTyConApp tc mapped)
+                        , any (\t -> is_self t || is_pending t) (nonDetEltsUniqSet (tyConsOfTypes [expanded])) -> map_ty expanded
+                        | otherwise -> mkTyConApp tc mapped <$ guard (not (is_pending tc))
+                , tcm_tcapp_co = \_ role tc cos -> mkTyConAppCo role tc cos <$ guard (not (is_self tc) && not (is_pending tc)) }
+          rewritten <- map_ty emb_ty
+          rewritten <$ guard (not (hasNativeDependentExpr (Core.Type rewritten)) &&
+                              all (`elemVarSet` bndr_set) (tyCoVarsOfTypeList rewritten) &&
+                              tcIsLiftedTypeKind (typeKind rewritten))
+
+sourceMatches :: HsBind GhcTc -> Maybe (Id, Id, [TyVar], [TcEvBinds], [LMatch GhcTc (LHsExpr GhcTc)])
 sourceMatches binding = do
-    (fun, mono, body_tvs, MG { mg_ext = MatchGroupTc { mg_origin = FromSource },
-               mg_alts = L _ matches }, evidence) <- case binding of
-      XHsBindsLR (AbsBinds { abs_tvs = [], abs_ev_vars = [], abs_ev_binds = evs
-                          , abs_exports = [ABE { abe_poly = fun, abe_mono = mono
-                                              , abe_wrap = WpHole }]
-                          , abs_binds = [L _ body], abs_sig = has_sig }) -> do
-        (bound, body_tvs, matches) <- funBind body
-        guard (bound == mono)
-        guard (null body_tvs || has_sig)
-        pure (fun, mono, body_tvs, matches, evs)
-      _ -> do
-        (fun, [], matches) <- funBind binding
-        pure (fun, fun, [], matches, [])
-    guard (isExternalName (varName fun))
-    pure (fun, mono, body_tvs, evidence, matches)
+    (fun, mono, body_tvs, MG { mg_ext = MatchGroupTc { mg_origin = FromSource }, mg_alts = L _ matches }, evidence) <-
+      case binding of
+        XHsBindsLR (AbsBinds { abs_tvs = [], abs_ev_vars = [], abs_ev_binds = evs
+                             , abs_exports = [ABE { abe_poly = fun, abe_mono = mono, abe_wrap = WpHole }]
+                             , abs_binds = [L _ body], abs_sig = has_sig }) -> do
+          (bound, body_tvs, matches) <- funBind body
+          (fun, mono, body_tvs, matches, evs) <$ guard (bound == mono && (null body_tvs || has_sig))
+        _ -> do
+          (f, [], ms) <- funBind binding
+          pure (f, f, [], ms, [])
+    (fun, mono, body_tvs, evidence, matches) <$ guard (isExternalName (varName fun))
   where
-    funBind :: HsBind GhcTc -> Maybe (Id, [TyVar], MatchGroup GhcTc (LHsExpr GhcTc))
     funBind (FunBind { fun_ext = (wrap, []), fun_id = L _ f, fun_matches = mg })
       | (tvs, WpHole) <- collectHsWrapBinders wrap
-      , all (\tv -> isTyVar tv &&
-                    (tcIsLiftedTypeKind (tyVarKind tv) || isJust (ordinaryDataType (tyVarKind tv)))) tvs
+      , all (\tv -> isTyVar tv && (tcIsLiftedTypeKind (tyVarKind tv) || isJust (ordinaryDataType (tyVarKind tv)))) tvs
       = Just (f, tvs, mg)
     funBind _ = Nothing
 
--- | Derive local structural equations before checking a dependent signature.
--- See Note [Local structural case equations].
-localStructuralTable :: HsBind GhcTc -> MaybeT TcM (Id, TyCon)
-localStructuralTable binding = do
-    (owner, signature, rows) <-
-      checkedStructuralSource CLeft binding <|> checkedStructuralSource CRight binding
-    family <- lift (publishConstructorCase owner signature rows)
-    pure (owner, family)
-
--- | Check three complete source rows that split one size and then the other.
--- See Note [Checked cases on two structural sizes].
-checkedStructuralSource :: LeftOrRight -> HsBind GhcTc
-                        -> MaybeT TcM (Id, ConstructorCaseType, [ConstructorCaseRow])
-checkedStructuralSource order binding = do
-    (fun, mono, [], evidence, matches) <- MaybeT (pure (sourceMatches binding))
-    guard (lengthIs matches 3)
-    guard =<< lift (allM emptyEvidence evidence)
-    ty <- lift (liftZonkM (zonkTcType (varType fun)))
-    signature@(ConstructorCaseType telescope root args domains _ result) <-
-      MaybeT (pure (constructorCaseType ty))
-    guard (isTwoStructuralCase signature)
-    let self v = v == fun || v == mono
-        position = pickLR order (0, 1)
-        selected = ConstructorCaseType telescope root args domains position result
-    rows <- traverse (read_row self root result) matches
-    guard (complete (map orient rows))
-    pure (setIdType fun ty, selected, rows)
-  where
-    orient row@(ConstructorCaseRow [left, right] rhs) =
-      pickLR order (row, ConstructorCaseRow [right, left] rhs)
-    orient row = row
-
-    complete
-      [ ConstructorCaseRow [CaseConstructor z [] [], CaseField _] _
-      , ConstructorCaseRow [CaseConstructor s [] [_], CaseConstructor z' [] []] _
-      , ConstructorCaseRow [CaseConstructor s' [] [_], CaseConstructor s'' [] [_]] _ ]
-      = z == z' && s == s' && s == s''
-    complete _ = False
-
-    read_row self root domain (L _ Match{m_pats = L _ [lhs, rhs], m_grhss = rhss})
-      | GRHSs _ (L _ (GRHS _ [] (L _ body)) :| []) (L _ (EmptyLocalBinds _)) <- rhss
-      = do
-          left <- read_pattern root domain lhs
-          right <- read_pattern root domain rhs
-          let predecessors = case right of
-                CaseConstructor _ [] [CaseField field] -> [field]
-                _ -> []
-          output <- MaybeT (pure (sourceRhs False CLeft self (map Just predecessors) body))
-          let visit under_constructor = \case
-                Field v | any (hasCaseField v) [left, right] -> Just (CaseField v)
-                Construct dc args | dataConTyCon dc == root
-                                  , lengthIs args (dataConSourceArity dc) ->
-                    CaseConstructor dc [] <$> traverse (visit True) args
-                Recur [] x | under_constructor || pickLR order (False, True)
-                           , CaseConstructor _ [] [CaseField x'] <- left
-                           , x == x', [y] <- predecessors ->
-                    Just (CaseSelf [] [CaseField x, CaseField y])
-                _ -> Nothing
-          ConstructorCaseRow [left, right] <$> MaybeT (pure (visit False output))
-    read_row _ _ _ _ = empty
-
-    read_pattern root _domain (L _ (ConPat (ConPatTc [] [] [] evidence WpHole [])
-                                   (L _ (RealDataCon dc)) (PrefixCon _ pats))) = do
-      guard (dataConTyCon dc == root)
-      guard =<< lift (emptyEvidence evidence)
-      kinds <- MaybeT (pure (openDataConFieldTypes dc []))
-      guard (equalLength pats kinds)
-      CaseConstructor dc [] <$> zipWithM read_field kinds pats
-    read_pattern root domain (L _ (ParPat _ p)) = read_pattern root domain p
-    read_pattern _ domain p = read_field domain p
-
-    read_field kind (L _ (VarPat _ (L _ v))) = do
-      ty <- lift (liftZonkM (zonkTcType (varType v)))
-      guard (ty `eqType` kind)
-      pure (CaseField (setIdType v ty))
-    read_field kind (L _ WildPat{}) = CaseField <$> lift (mkSysLocalM (fsLit "_") ManyTy kind)
-    read_field kind (L _ (ParPat _ p)) = read_field kind p
-    read_field _ _ = empty
-
-{- Note [Local structural case equations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Local proofs can need a source equation before the compiler has final
-Core for its owner. Check the solved source clauses before publishing a
-nominal table when a local type requires it. A declaration splice can
-publish other source tables for a later group. Keep the structural
-table on its ordinary final-Core path in that case. See
-Note [Checked cases on two structural sizes]. If the source table is already
-installed, keep that authority through final zonking and publication.
-
-Read the nullary clause on the first scrutinized operand. Its other
-pattern is a variable or a wildcard. The next two clauses match the
-recursive constructor and split on the other operand. These rows are
-complete and disjoint. Each recursive call uses the actual predecessor
-binder from each column. A left-first table requires a lazy constructor
-around the recursive call. A right-first table can return the recursive
-call directly, as in truncated subtraction.
-
-Strict adds an implicit bang to a variable pattern. Skip this checker
-under Strict. Read only plain constructor fields, variables, and
-wildcards. Require empty evidence and unguarded right-hand sides.
-Install the table through the existing nominal source rule checks. They
-also check rules when later declarations finish typechecking. The compiler
-can use these equations with rewriting disabled. Use the actual second
-constructor column to identify this rule policy. An earlier nominal table
-can have the same kind and carry its second argument unchanged.
--}
-
--- | Collect the domains and result of an ordinary monomorphic function.
-ordinaryArrows :: Type -> Maybe ([Type], Type)
-ordinaryArrows ty
-  | Just (arg, rest) <- caseArrow ty = do
-      _ <- ordinaryDataType arg
-      (args, result) <- ordinaryArrows rest
-      pure (arg : args, result)
-  | otherwise = do
-      _ <- ordinaryDataType ty
-      pure ([], ty)
-
--- | Check a `forall` binder of a Type-valued source equation, allowing
--- promoted algebraic kinds (such as `Nat`) in addition to `Type`.
-embeddedTypeBinder :: (Type, ForAllTyBinder) -> Maybe TyVar
-embeddedTypeBinder (ma, Bndr tv (Invisible SpecifiedSpec))
-  | ma `eqType` unmatchableDataConTy
-  , isTyVar tv
-  , tcIsLiftedTypeKind (tyVarKind tv) || isJust (ordinaryDataType (tyVarKind tv))
-  = Just tv
-embeddedTypeBinder _ = Nothing
-
--- | Allow any boxed lifted algebraic or GADT type (whose free type variables
--- come from the outer `forall` telescope) as an untouched carried argument of a
--- Type-valued source equation.
-embeddedCarriedType :: [TyVar] -> Type -> Bool
-embeddedCarriedType allowed_tvs arg
-  | tcIsLiftedTypeKind (typeKind arg)
-  , isTyFamFree arg
-  , all (`elem` allowed_tvs) (tyCoVarsOfTypeList arg)
-  , Just (tc, _) <- splitTyConApp_maybe arg
-  = isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc
-  | otherwise = False
-
--- | Collect carried domains of a Type-valued source equation ending in `Type`.
-embeddedTypeResultArrows :: [TyVar] -> Type -> Maybe ([Type], Type)
-embeddedTypeResultArrows allowed_tvs ty
-  | Just (arg, rest) <- caseArrow ty = do
-      guard (embeddedCarriedType allowed_tvs arg)
-      (args, result) <- embeddedTypeResultArrows allowed_tvs rest
-      pure (arg : args, result)
-  | tcIsLiftedTypeKind ty = pure ([], ty)
-  | otherwise = Nothing
-
--- | Read a closed or polymorphic Type-valued source equation signature.
-typeResultHelperType :: Type -> Maybe ([ForAllTyBinder], [Type], Type)
-typeResultHelperType ty = do
-    let (telescope, tau) = splitForAllForAllTyBinders ty
-    tvs <- traverse embeddedTypeBinder telescope
-    (first_arg, rest) <- caseArrow tau
-    guard (isJust (ordinaryDataType first_arg) || caseKind (mkTyVarTys tvs) first_arg)
-    (carried, output) <- embeddedTypeResultArrows tvs rest
-    pure (map snd telescope, first_arg : carried, output)
-
-{- Note [Source equations returning a structural list]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A unary function can build a list from a structural size, as in PLFA's
-downFrom:
-
-    downFrom Zero     = []
-    downFrom (Succ n) = n : downFrom n
-
-Keep the solved result kind, including the list element. Check that
-the element type is the structural input type. Publish only complete
-rows. A self call still takes a proper field of the matched input.
-The list constructors leave both fields of a cons lazy.
-
-The typechecker can put a type application on each list constructor.
-Read the same element kind from the solved result when building the
-equation. The renamer follows that element's dependency when scheduling
-the definition for a local proof.
--}
-
--- | Collect the domains and result of a polymorphic or closed algebraic function.
-polySourceArrows :: [TyVar] -> Type -> Maybe ([Type], Type)
-polySourceArrows allowed_tvs ty
-  | Just (arg, rest) <- caseArrow ty = do
-      guard (polySourceArgType allowed_tvs arg)
-      (args, result) <- polySourceArrows allowed_tvs rest
-      pure (arg : args, result)
-  | polySourceArgType allowed_tvs ty = pure ([], ty)
-  | otherwise = Nothing
-
--- | Check that the rows cover the domain of the solved function type.
-checkedDomains :: Bool -> LeftOrRight -> [TyVar] -> Type -> [SourceRow]
-               -> Maybe (SourceInput, [Type], Type)
-checkedDomains strict order body_tvs ty rows
-  | [SourceProducerRow _ vars rhs] <- rows = do
-      let producer_rhs Construct{} = True
-          producer_rhs Call{}      = True
-          producer_rhs _           = False
-      guard (not strict && order == CLeft && producer_rhs rhs)
-      let (telescope, tau) = splitForAllForAllTyBinders ty
-      guard (equalLength telescope body_tvs)
-      tvs <- traverse ordinary_binder telescope
-      (args, final_ty) <- polySourceArrows tvs tau
-      guard (not (null args) && equalLength args vars && polySourceType tvs final_ty)
-      let lhs_fvs = concatMap tyCoVarsOfTypeList args
-          instantiate_body = substTyWith tvs (mkTyVarTys body_tvs)
-      guard (all (`elem` lhs_fvs) tvs)
-      pure (ProducerInput body_tvs, map instantiate_body args, instantiate_body final_ty)
-  | otherwise = do
-      let (telescope, tau) = splitForAllForAllTyBinders ty
-          non_absurd_rows = filter (not . isAbsurdSourceRow) rows
-          embedded_type_rows = not (null non_absurd_rows) && all isEmbeddedTypeRow non_absurd_rows
-          has_nested_pats = any isNestedSourcePatRow rows
-      guard (not (null non_absurd_rows) && not (any isProducerSourceRow rows))
-      guard (equalLength telescope body_tvs)
-      guard (embedded_type_rows || not (any isEmbeddedTypeRow non_absurd_rows))
-      guard (not (embedded_type_rows && has_nested_pats))
-      tvs <- traverse (if embedded_type_rows then embeddedTypeBinder else ordinary_binder) telescope
-      (FTF_T_T, ma, mult, first_ty, rest_ty) <- splitFunTy_maybe tau
-      guard (ma `eqType` unmatchableDataConTy && isManyTy mult)
-      let homogeneous_list first carried result =
-            not strict && fmap fst (caseDatatype first) == Just listTyCon &&
-            all (eqType first) (result : carried)
-          open_list = do
-            (_, first : carried, result) <- constructorHelperType ty
-            guard (homogeneous_list first carried result)
-            pure (carried, result)
-          instantiate_body = substTyWith tvs (mkTyVarTys body_tvs)
-      (arg_ty, carried, final_ty) <- case order of
-        CLeft -> do
-          (carried, result) <- if embedded_type_rows
-            then embeddedTypeResultArrows tvs rest_ty
-            else ordinaryArrows rest_ty <|> open_list <|>
-                 (guard (not strict) *> polySourceArrows tvs rest_ty)
-          pure (first_ty, carried, result)
-        CRight -> do
-          if embedded_type_rows
-            then guard (embeddedCarriedType tvs first_ty)
-            else guard ((null tvs && isJust (ordinaryDataType first_ty)) ||
-                        (not strict && polySourceArgType tvs first_ty))
-          (second_ty, result) <- if embedded_type_rows
-            then do
-              (FTF_T_T, ma2, mult2, s_ty, res_ty) <- splitFunTy_maybe rest_ty
-              guard (ma2 `eqType` unmatchableDataConTy && isManyTy mult2 && tcIsLiftedTypeKind res_ty)
-              pure (s_ty, res_ty)
-            else caseArrow rest_ty
-          pure (second_ty, [first_ty], result)
-      let lhs_fvs = concatMap tyCoVarsOfTypeList (arg_ty : carried)
-      (domain, input) <- case tvs of
-        [] | Just (tc, params) <- ordinaryDataType arg_ty ->
-             pure (tc, ClosedInput arg_ty params)
-           | not strict
-           , Just (tc, args) <- caseDatatype arg_ty
-           , polySourceType [] arg_ty ->
-             pure (tc, ClosedInput arg_ty args)
-           | otherwise -> empty
-        _ | embedded_type_rows
-          , Just (tc, []) <- ordinaryDataType arg_ty -> do
-              guard (not strict && all (`elem` lhs_fvs) tvs)
-              pure (tc, PolyInput tc body_tvs [])
-        _ | embedded_type_rows -> do
-              (tc, args) <- caseDatatype arg_ty
-              params <- traverse getTyVar_maybe args
-              guard (equalLength params (nubBy (==) params) &&
-                     all (`elem` tvs) params && all (`elem` lhs_fvs) tvs)
-              unless (tc == listTyCon) $ do
-                guard (not strict && not (isGadtSyntaxTyCon tc) && null (tyConStupidTheta tc))
-                let ordinary con = do
-                      guard (isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con)
-                      fields <- openDataConFieldTypes con args
-                      guard (all (caseKind args) fields)
-                mapM_ ordinary (tyConDataCons tc)
-              pure (tc, PolyInput tc body_tvs (map instantiate_body args))
-        _ -> do
-          (tc, args) <- caseDatatype arg_ty
-          guard (all (`elem` lhs_fvs) tvs)
-          if tc == listTyCon && strict
-            then do
-              params <- traverse getTyVar_maybe args
-              guard (equalLength params tvs && mkUniqSet params == mkUniqSet tvs && not has_nested_pats)
-            else guard (not strict && polySourceType tvs arg_ty)
-          pure (tc, PolyInput tc body_tvs (map instantiate_body args))
-      -- See Note [Carried arguments of a source equation].
-      if embedded_type_rows then do
-        guard (tcIsLiftedTypeKind final_ty)
-        guard (null carried || not strict)
-      else unless (homogeneous_list arg_ty carried final_ty) $ do
-        guard (null carried || not strict)
-        guard (not has_nested_pats || not strict)
-        if null tvs
-          then case ordinaryDataType final_ty of
-            Just (result, result_params) ->
-              guard (null result_params ||
-                     (result == listTyCon && null carried &&
-                      eqTypes result_params [arg_ty] && isStructuralSize domain arg_ty) ||
-                     (not strict && polySourceArgType [] final_ty))
-            Nothing ->
-              guard (not strict && polySourceArgType [] final_ty)
-          else guard (not strict && polySourceArgType tvs final_ty)
-      if has_nested_pats
-        then do
-          let pat_matrix = [ [SourcePatCon con pat_tys subpats]
-                           | SourceRow _ con pat_tys subpats _ _ <- rows ]
-          guard (equalLength pat_matrix rows &&
-                 completePatMatrix [instantiate_body arg_ty] pat_matrix)
-        else do
-          let expected = tyConDataCons domain
-              actual   = [con | SourceRow _ con _ _ _ _ <- rows]
-          guard (length actual == length expected && mkUniqSet actual == mkUniqSet expected)
-      pure (input, map instantiate_body carried, instantiate_body final_ty)
-
-  where
-    ordinary_binder (ma, Bndr tv (Invisible SpecifiedSpec))
-      | ma `eqType` unmatchableDataConTy
-      , isTyVar tv, tcIsLiftedTypeKind (tyVarKind tv)
-      = Just tv
-    ordinary_binder _ = Nothing
-
-{- Note [Ordinary constructors in GADT syntax]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A constructor signature such as Join :: Tree -> Tree -> Tree has the
-same representation as an H98 constructor declaration. Check for
-vanilla constructors with ordinary lifted fields. This excludes equality
-evidence, existentials, constructor wrappers and strict fields.
-
-The early declaration split in GHC.Rename.Module can move a nullary
-datatype before a local source equation. For GADT syntax, check that
-each constructor returns this datatype and uses the same prefix fields.
-The typechecker still checks its solved constructor representation.
--}
-
--- | Recognise a closed instance of a datatype with ordinary lifted parameters.
--- See Note [Ordinary constructors in GADT syntax].
-ordinaryDataType :: Type -> Maybe (TyCon, [Type])
-ordinaryDataType ty
-  | Just (tc, args) <- splitTyConApp_maybe ty
-  , isVanillaAlgTyCon tc, isBoxedDataTyCon tc, isLiftedAlgTyCon tc
-  , length args == tyConArity tc, null (tyConStupidTheta tc)
-  , all (tcIsLiftedTypeKind . tyVarKind) (tyConTyVars tc), all ordinaryField args
-  , let cons = tyConDataCons tc
-  , (null args && isEnumerationTyCon tc) ||
-    (not (null cons) && all (ordinaryCon args) cons)
-  = Just (tc, args)
-  | otherwise = Nothing
-  where
-    ordinaryCon args con =
-      null (dataConRepArgBinders con) && isVanillaDataCon con &&
-      length args == length (dataConUnivTyVars con) &&
-      dataConUserTyVars con == dataConUnivTyVars con &&
-      isNothing (dataConWrapId_maybe con) &&
-      not (any isBanged (dataConImplBangs con)) &&
-      all (ordinaryField . scaledThing) (dataConInstOrigArgTys con args)
-
-    ordinaryField field =
-      tcIsLiftedTypeKind (typeKind field) && noFreeVarsOfType field && isTauTy field
-
--- | Read one total non-recursive constructor-producer equation.
--- See Note [Polymorphic nested domains and constructor producers].
-sourceProducerRow :: Bool -> (Id -> Bool) -> LMatch GhcTc (LHsExpr GhcTc) -> Maybe SourceRow
-sourceProducerRow bracket_lists self (L loc (Match { m_pats = L _ pats, m_grhss = rhss }))
-  | not (null pats)
-  , GRHSs _ (L _ (GRHS _ [] (L _ rhs)) :| []) (L _ (EmptyLocalBinds _)) <- rhss
-  = do
-      vars <- traverse plainBinder pats
-      output <- sourceRhs bracket_lists CLeft (const False) vars rhs
-      guard (isConstructorHeadedRhs output && not (any self (sourceCalls output)))
-      pure (SourceProducerRow (locA loc) vars output)
-  where
-    unParen :: LPat GhcTc -> Pat GhcTc
-    unParen (L _ (ParPat _ p)) = unParen p
-    unParen (L _ p) = p
-
-    plainBinder p = case unParen p of
-      VarPat _ (L _ v) -> Just (Just v)
-      WildPat _        -> Just Nothing
-      _                -> Nothing
-sourceProducerRow _ _ _ = Nothing
-
--- | Read one unguarded source equation with no local bindings.
-sourceRow :: Bool -> LeftOrRight -> (Id -> Bool) -> LMatch GhcTc (LHsExpr GhcTc) -> Maybe ([TcEvBinds], SourceRow)
-sourceRow bracket_lists order self (L loc (Match { m_pats = L _ pats, m_grhss = rhss }))
-  | pickLR order (True, lengthIs pats 2)
-  , pat : rest <- sourceOperandOrder order pats
-  , GRHSs _ (L _ (GRHS _ [] (L _ rhs)) :| []) (L _ (EmptyLocalBinds _)) <- rhss
-  = do
-      (evs, input, params, subpats) <- topConPat pat
-      carried <- traverse plainBinder rest
-      output <- sourceRhs bracket_lists order self carried rhs
-      guard (not (any isSourcePatCon subpats) || null (recurIds output))
-      pure (evs, SourceRow (locA loc) input params subpats carried output)
-  where
-    unParen :: LPat GhcTc -> Pat GhcTc
-    unParen (L _ (ParPat _ p)) = unParen p
-    unParen (L _ p) = p
-
-    topConPat :: LPat GhcTc -> Maybe ([TcEvBinds], DataCon, [Type], [SourcePat])
-    topConPat p = case unParen p of
-      ConPat (ConPatTc params [] [] evs WpHole []) (L _ (RealDataCon input)) details -> do
-        fields <- conDetails fieldsFromDetails details
-        (nested_evs, subpats) <- unzip <$> traverse subPat fields
-        pure (evs : concat nested_evs, input, params, subpats)
-      TuplePat params ps Boxed
-        | length ps /= 1 -> do
-            (nested_evs, subpats) <- unzip <$> traverse subPat ps
-            pure (concat nested_evs, tupleDataCon Boxed (length ps), params, subpats)
-      _ -> Nothing
-
-    fieldsFromDetails = id
-    conDetails f details = case details of
-      PrefixCon _ ps   -> Just (f ps)
-      InfixCon _ p1 p2 -> Just (f [p1, p2])
-      _                -> Nothing
-
-    subPat :: LPat GhcTc -> Maybe ([TcEvBinds], SourcePat)
-    subPat p = case unParen p of
-      VarPat _ (L _ v) -> Just ([], SourcePatVar (Just v))
-      WildPat _        -> Just ([], SourcePatVar Nothing)
-      _ -> do
-        (evs, dc, params, children) <- topConPat p
-        pure (evs, SourcePatCon dc params children)
-
-    plainBinder p = case unParen p of
-      VarPat _ (L _ v) -> Just (Just v)
-      WildPat _        -> Just Nothing
-      _                -> Nothing
-
-    recurIds (Recur _ v) = [v]
-    recurIds (Construct _ args) = concatMap recurIds args
-    recurIds (Call _ _ args) = concatMap recurIds args
-    recurIds _ = []
-
-sourceRow _ _ _ _ = Nothing
-
--- | Recognise constructors, helper calls, and decreasing self calls.
-sourceRhs :: Bool -> LeftOrRight -> (Id -> Bool) -> [Maybe Id] -> HsExpr GhcTc -> Maybe SourceRhs
-sourceRhs bracket_lists order self carried = go []
-  where
-    go :: [HsExpr GhcTc] -> HsExpr GhcTc -> Maybe SourceRhs
-    go args (HsPar _ e)   = go args (unLoc e)
-    go args (HsApp _ f x) = go (unLoc x : args) (unLoc f)
-    go args (XExpr (WrapExpr WpHole e)) = go args e
-    go args (XExpr (ExpandedThingTc (HSE (ExprCtxt (OpApp{})) expansion))) =
-      go args (unLoc expansion)
-    go args (XExpr (ExpandedThingTc (HSE (ExprCtxt (ExplicitTuple{})) expansion))) =
-      go args (unLoc expansion)
-    go [] (XExpr (ExpandedThingTc (HSE (ExprCtxt (HsEmbTy{}))
-            (L _ (XExpr (WrapExpr (WpCompose (WpTyApp emb_ty) (WpTyLam _)) _)))))) =
-      Just (EmbeddedType emb_ty)
-    go [] (HsCase _ scrut (MG { mg_alts = L _ [] }))
-      | Just v <- variable (unLoc scrut)
-      = Just (AbsurdField v)
-    go args (XExpr (WrapExpr wrap con@(XExpr (ConLikeTc (RealDataCon _)))))
-      | isJust (typeApps wrap) = go args con
-    go args (XExpr (ConLikeTc (RealDataCon con))) = Construct con <$> traverse (go []) args
-    go [] (ExplicitTuple _ tup_args Boxed)
-      | length tup_args /= 1 = do
-          items <- traverse (\case Present _ e -> go [] (unLoc e); _ -> Nothing) tup_args
-          pure (Construct (tupleDataCon Boxed (length items)) items)
-    go [] (ExplicitList _ items) | bracket_lists =
-      foldr (\x xs -> Construct consDataCon [x, xs]) (Construct nilDataCon [])
-        <$> traverse (go [] . unLoc) items
-    go [] (HsVar _ (L _ v)) = Just (Field v)
-    go [arg] expr
-      | Just (f, [_]) <- appliedHead expr
-      , isBaseAbsurdId f
-      , Just v <- variable arg
-      = Just (AbsurdField v)
-    go args expr
-      | Just (f, tys) <- appliedHead expr, self f = call tys args
-      | Just (f, tys) <- appliedHead expr, isExternalName (idName f) =
-          Call f tys <$> traverse (go []) args
-    go _ _ = Nothing
-
-    isBaseAbsurdId :: Id -> Bool
-    isBaseAbsurdId f =
-      nameModule_maybe (idName f) == Just gHC_INTERNAL_BASE &&
-      occNameString (nameOccName (idName f)) == "absurd"
-
-    appliedHead :: HsExpr GhcTc -> Maybe (Id, [Type])
-    appliedHead (HsPar _ e) = appliedHead (unLoc e)
-    appliedHead (HsVar _ (L _ f)) = Just (f, [])
-    appliedHead (HsAppType ty fun _) = fmap (++ [ty]) <$> appliedHead (unLoc fun)
-    appliedHead (XExpr (WrapExpr wrap fun)) = do
-      (f, inner) <- appliedHead fun
-      outer <- typeApps wrap
-      pure (f, inner ++ outer)
-    appliedHead _ = Nothing
-
-    typeApps :: HsWrapper -> Maybe [Type]
-    typeApps WpHole = Just []
-    typeApps (WpTyApp ty) = Just [ty]
-    typeApps (WpCompose outer inner) = (++) <$> typeApps inner <*> typeApps outer
-    typeApps _ = Nothing
-
-    call tys args = do
-      arg : rest <- pure (sourceOperandOrder order args)
-      variables <- traverse variable rest
-      guard (map Just variables == carried)
-      Recur tys <$> variable arg
-
-    variable e = do { Field v <- go [] e; pure v }
-
--- | Check both the mutable evidence after solving and the final zonked evidence.
 emptyEvidence :: TcEvBinds -> TcM Bool
 emptyEvidence (EvBinds binds) = pure (isEmptyBag binds)
 emptyEvidence (TcEvBinds var) = isEmptyEvBindsMap <$> getTcEvBindsMap var
 
--- | Instantiate the input with fresh Core binders for one family header or equation.
-freshInput :: SourceInput -> TcM ([TyVar], Type, [Type])
-freshInput (ClosedInput domain params) = pure ([], domain, params)
-freshInput (PolyInput root skolems args) = do
-    vars <- forM skolems $ \sk -> do
-      name <- newSysName (nameOccName (varName sk))
-      pure (mkTyVar name (tyVarKind sk))
-    let params = map (substTyWith skolems (mkTyVarTys vars)) args
-    pure (vars, mkTyConApp root params, params)
-freshInput (ProducerInput skolems) = do
-    vars <- forM skolems $ \sk -> do
-      name <- newSysName (nameOccName (varName sk))
-      pure (mkTyVar name (tyVarKind sk))
-    pure (vars, liftedTypeKind, [])
+bindingCore :: LHsBind GhcTc -> Id -> TcM (Maybe Core.CoreExpr)
+bindingCore bind owner = do
+    (messages, bindings) <- initDsTc (dsTopLHsBinds [bind])
+    pure $ case bindings of
+      Just core | not (errorsFound messages), [rhs] <- [e | (i, e) <- fromOL core, idName i == idName owner] -> Just rhs
+      _ -> Nothing
 
--- | Instantiate the solved body kinds with the binders of this equation.
-instantiateInput :: SourceInput -> [TyVar] -> Type -> Type
-instantiateInput ClosedInput{} _ = id
-instantiateInput (PolyInput _ skolems _) vars = substTyWith skolems (mkTyVarTys vars)
-instantiateInput (ProducerInput skolems) vars = substTyWith skolems (mkTyVarTys vars)
+hasPendingTypedSplice :: Data a => a -> Bool
+hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
+    Just HsTypedSplice{} -> True
+    _ -> or (gmapQ hasPendingTypedSplice node)
 
--- | Check a branch before supplying the family at its recursive calls.
--- An uninhabited empty-case branch validates and returns @Just Nothing@.
--- See Note [Empty-case branches in source equations].
-sourceBranch :: (Id -> TcM (Maybe (TyCon, [TyVar], [Type], Type)))
-             -> Name -> [Id] -> LeftOrRight -> SourceInput -> [Type] -> Type -> SourceRow
-             -> TcM (Maybe (Maybe (TyCon -> CoAxBranch)))
-sourceBranch lookup_call owner_name extra_callees order input carried_types result (SourceProducerRow loc vars output) = do
-    var_tys <- liftZonkM (traverse (traverse (zonkTcType . varType)) vars)
-    checked_output <- runMaybeT (checkCalls output)
-    callees <- traverse (\f -> fmap (f,) <$> lookup_call f) (sourceCalls output ++ extra_callees)
-    let bound_ids = catMaybes vars
-        vars_ok = equalLength var_tys carried_types &&
-                  sizeUniqSet (mkUniqSet bound_ids) == length bound_ids &&
-                  and (zipWith (\expected actual -> maybe True (eqType expected) actual) carried_types var_tys)
-    if vars_ok then do
-      (quantified, _, _) <- freshInput input
-      let family_args = mkTyVarTys quantified
-          instantiate = instantiateInput input quantified
-          arg_kinds = map instantiate carried_types
-      arg_tvs <- zipWithM fieldVar vars arg_kinds
-      pure $ do
-        checked_callees <- sequence callees
-        let patterns = family_args ++ mkTyVarTys arg_tvs
-            binders = quantified ++ arg_tvs
-            carried_scope = zip vars arg_tvs
-        guard (all isTyFamFree patterns)
-        rhs <- check_rhs checked_callees quantified binders instantiate liftedTypeKind family_args
-                         [] carried_scope (instantiate result) =<< checked_output
-        pure (Just (\fam -> mkCoAxBranch binders [] [] patterns (rhs fam)
-                              (map (const Nominal) binders) loc))
-    else pure Nothing
+nominalBindPrecheck :: HsBind GhcTc -> Maybe (Id, [TyVar], [TcEvBinds])
+nominalBindPrecheck binding = do
+    (fun, _, body_tvs, evs, matches) <- sourceMatches binding
+    guard (not (null matches) && not (hasPendingTypedSplice binding))
+    (\pevs -> (fun, body_tvs, evs ++ concat pevs)) <$> traverse checkMatch matches
   where
-    (call_args, skolem_vars) = case input of
-      ClosedInput{} -> ([], [])
-      PolyInput _ skolems _ -> (mkTyVarTys skolems, skolems)
-      ProducerInput skolems -> (mkTyVarTys skolems, skolems)
+    checkMatch (L _ Match{m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] _) :| []) (L _ (EmptyLocalBinds _))}) =
+      concat <$> traverse checkPat pats
+    checkMatch _ = Nothing
+    checkPat (L _ p) = case p of
+      ParPat _ inner -> checkPat inner
+      VarPat{} -> Just []; WildPat{} -> Just []
+      TuplePat _ ps Boxed | length ps /= 1 -> concat <$> traverse checkPat ps
+      ConPat (ConPatTc _ [] [] cevs WpHole []) (L _ (RealDataCon _)) details -> do
+        fs <- case details of { PrefixCon _ xs -> Just xs; InfixCon _ x1 x2 -> Just [x1, x2]; _ -> Nothing }
+        (cevs :) . concat <$> traverse checkPat fs
+      _ -> Nothing
 
-    checkCalls = sourceBranchCheckCalls call_args
-    fieldVar = sourceBranchFieldVar
-    check_rhs = sourceBranchCheckRhs owner_name order skolem_vars
-sourceBranch lookup_call owner_name extra_callees order input carried_types result (SourceRow loc con pat_args fields carried output) = do
-    args <- liftZonkM (zonkTcTypes pat_args)
-    carried_tys <- liftZonkM (traverse (traverse (zonkTcType . varType)) carried)
-    zonked_fields <- liftZonkM (traverse zonkPat fields)
-    checked_output <- runMaybeT (checkCalls output)
-    callees <- traverse (\f -> fmap (f,) <$> lookup_call f) (sourceCalls output ++ extra_callees)
-    let bound_ids = concatMap patIds zonked_fields ++ catMaybes carried
-        carried_ok = equalLength carried_tys carried_types &&
-          sizeUniqSet (mkUniqSet bound_ids) == length bound_ids &&
-          and (zipWith (\expected actual -> maybe True (eqType expected) actual) carried_types carried_tys)
-    if eqTypes args pattern_args && carried_ok
-       && length zonked_fields == dataConSourceArity con then do
-      (quantified, domain, params) <- freshInput input
-      let field_types = map scaledThing (dataConInstOrigArgTys con params)
-          family_args = mkTyVarTys quantified
-          instantiate = instantiateInput input quantified
-          carried_kinds = map instantiate carried_types
-      built_pats <- runMaybeT (zipWithM (buildPat instantiate) zonked_fields field_types)
-      carried_tvs <- zipWithM fieldVar carried carried_kinds
-      pure $ do
-        (sub_lhs, fields_scopes) <- unzip <$> built_pats
-        checked_callees <- sequence callees
-        let fields_scope = concat fields_scopes
-            tvs = map snd fields_scope
-            lhs = mkTyConApp (promoteDataCon con) (params ++ sub_lhs)
-            patterns = family_args ++ sourceOperandOrder order (lhs : mkTyVarTys carried_tvs)
-            binders = quantified ++ tvs ++ carried_tvs
-            carried_scope = zip carried carried_tvs
-        guard (all isTyFamFree patterns)
-        valid_rhs <- checked_output
-        case valid_rhs of
-          AbsurdField v -> do
-            tv <- lookup (Just v) (fields_scope ++ carried_scope)
-            guard (instantiate (varType v) `eqType` tyVarKind tv)
-            guard (isJust (emptyCaseDatatype (tyVarKind tv)))
-            pure Nothing
-          _ -> do
-            rhs <- check_rhs checked_callees quantified binders instantiate domain family_args
-                             fields_scope carried_scope (instantiate result) valid_rhs
-            pure (Just (\fam -> mkCoAxBranch binders [] [] patterns (rhs fam)
-                                  (map (const Nominal) binders) loc))
-    else pure Nothing
+sourceTableTyCons :: Bool -> Bool -> LHsBinds GhcTc -> TcM [(Id, TyCon)]
+sourceTableTyCons local final_exports binds = do
+    strict <- xoptM LangExt.Strict
+    rules <- goptM Opt_EnableRewriteRules
+    dflags <- getDynFlags
+    env <- getGblEnv
+    let generates_code = backendGeneratesCode (backend dflags)
+        produces_iface = gopt Opt_WriteInterface dflags || not (isOneShot (ghcMode dflags))
+    no_code_final <- if generates_code || not final_exports || not produces_iface ||
+                        not (gopt Opt_WriteSourceEquations dflags) || gopt Opt_WriteIfSimplifiedCore dflags ||
+                        gopt Opt_Hpc dflags || not (null (tcg_rules env))
+      then pure False else not . hasActiveLatePlugins <$> getTopEnv
+    let checks_final_core = generates_code || no_code_final
+        prepare = safeSimpleOptExpr (initSimpleOpts dflags)
+    (visible_rules, unloaded_rules, local_rules, build_clean) <- if rules && checks_final_core
+      then do
+        visible <- visibleSourceMethodRules env
+        unloaded <- unloadedSourceRuleHeads env
+        let local_r = sourceRuleOwners (tcg_rules env)
+        build_ready <- isBootModuleReady gHC_INTERNAL_BASE
+        build_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "build")
+        mb_build <- if build_ready then tcLookupIdMaybe build_name else pure Nothing
+        let ok = build_ready && not (build_name `elemNameSet` local_r) &&
+                 not (build_name `elemNameSet` unloaded) && maybe True (not . hasSourceMethodRule visible) mb_build
+        pure (Just visible, unloaded, local_r, ok)
+      else pure (Nothing, emptyNameSet, emptyNameSet, False)
+
+    let bind_owners = concatMap (collectHsBindBinders CollNoDictBinders . unLoc) binds
+        local_names = mkNameSet (map idName bind_owners)
+        isBuiltin v | Just m <- nameModule_maybe (idName v), moduleUnitId m == ghcInternalUnitId =
+                        occNameString (nameOccName (idName v)) `elem` ["build", "absurd"]
+                    | otherwise = False
+
+    prepared <- fmap catMaybes $ forM binds $ \bind -> case readEmbSpec (unLoc bind) of
+      Just emb@(EmbSpec fun _ _ _ _ emb_tys) -> do
+        let emb_calls = [ o | tc <- nonDetEltsUniqSet (tyConsOfTypes emb_tys), let tn = tyConName tc
+                            , Just to <- [sourceTableTermOcc (nameOccName tn)], o <- bind_owners, o /= fun
+                            , nameModule_maybe (idName o) == nameModule_maybe tn, nameOccName (idName o) == to ]
+        pure (Just (fun, Left (emb, emb_calls), emb_calls))
+      Nothing -> case nominalBindPrecheck (unLoc bind) of
+        Nothing -> pure Nothing
+        Just (fun, _, evs) -> do
+          clean <- allM emptyEvidence evs
+          if not clean then pure Nothing else do
+            ty <- liftZonkM (zonkTcType (varType fun))
+            if any isMetaTyVar (tyCoVarsOfTypeList ty) then pure Nothing else do
+              zonked_bind <- if final_exports then pure bind else do
+                (_, _, [zb], _, _, _, _) <- zonkTopDecls emptyBag [bind] [] [] [] []
+                pure zb
+              let owner = setIdType fun ty
+              mb_rhs <- bindingCore zonked_bind owner
+              pure $ flip fmap mb_rhs $ \rhs ->
+                let opt_rhs = prepare rhs
+                    callees = exprSomeFreeVarsList
+                      (\v -> isId v && isExternalName (idName v) && idName v /= idName owner &&
+                             not (v `hasKey` patErrorIdKey) && isNothing (isDataConWorkId_maybe v) && not (isBuiltin v))
+                      opt_rhs
+                in (owner, Right (opt_rhs, callees), callees)
+
+    structural <- if local && not strict
+      then fmap catMaybes $ forM prepared $ \(owner, payload, _) -> case payload of
+        Right (opt_rhs, []) -> do
+          let tryRev = do
+                sig <- constructorCaseType (varType owner); guard (isBinaryListCase sig)
+                cct <- compileCoreEquations ((defaultCoreSpec (const True))
+                         { ccs_allow_tail_self = True, ccs_allow_accum_self = True, ccs_check_kind_public = False }) owner opt_rhs
+                cct <$ guard (isValidReverseWorkerTable cct)
+              tryStruct = do
+                sig <- constructorCaseType (varType owner); guard (isTwoStructuralCase sig)
+                cct <- compileStructuralCore (const True) owner opt_rhs
+                cct <$ guard (lengthIs (cct_rows cct) 3)
+          maybe (pure Nothing) (\cct -> Just . (owner,) <$> publishCompiledTable owner cct) (tryStruct <|> tryRev)
+        _ -> pure Nothing
+      else pure []
+
+    let struct_names = mkNameSet (map (idName . fst) structural)
+        remaining = [c | c@(f, _, _) <- prepared, not (idName f `elemNameSet` struct_names)]
+        cand_names = extendNameSetList struct_names [idName f | (f, _, _) <- remaining]
+        calleeClean c = not (idName c `elemNameSet` local_rules) &&
+          (if finalCoreMapperOwner c
+             then maybe True (\vis -> isNothing (finalCoreRuleConflict vis unloaded_rules local_rules c)) visible_rules
+             else not (idName c `elemNameSet` unloaded_rules) && not (maybe False (`hasSourceMethodRule` c) visible_rules))
+        lookupCallee checked actual = do
+          let current = case lookupTypeEnv (tcg_type_env env) (idName actual) of
+                Just (AnId fun) | fun == actual -> sourceTableId_maybe fun; _ -> Nothing
+              table = if idName actual `elemNameSet` local_names then snd <$> find ((== actual) . fst) checked
+                      else if nameModule_maybe (idName actual) == Just (tcg_semantic_mod env) then current
+                      else sourceTableId_maybe actual
+          ty <- liftZonkM (zonkTcType (varType actual))
+          pure (table >>= \fam -> fam <$ guard (ty `eqType` tyConKind fam && tyConArity fam > 0))
+        certifyNominal callee_pairs owner opt_rhs = do
+          let owner_clean = isDefaultInlinePragma (idInlinePragma owner) && calleeClean owner && all (calleeClean . fst) callee_pairs
+              allow_build = not rules || (final_exports && checks_final_core && build_clean && owner_clean)
+              spec = (defaultCoreSpec (const True))
+                { ccs_helper = (`lookup` callee_pairs), ccs_allow_build = allow_build
+                , ccs_allow_zero_cases = not strict, ccs_allow_call_self = True, ccs_check_kind_public = False }
+          case compileCoreEquations spec owner opt_rhs >>= checkNominalShape strict of
+            Nothing -> pure Nothing
+            Just cct -> do
+              table <- case if final_exports then sourceTableOccurrence env owner >>= sourceTableId_maybe else Nothing of
+                Just existing -> pure existing
+                Nothing       -> publishCompiledTable owner cct
+              let exported = availsToNameSet (tcg_exports env)
+              if final_exports && not (publicTableTypes env exported table) then pure Nothing else
+                pure $ Just (if rules && cct_used_build cct
+                               then setIdDetails owner (SourceTableId (idName owner) table FinalCoreSourceTable)
+                               else owner, table)
+        collect !available checked pending = do
+          let (next, later) = partition (\(_, _, cs) -> all (\f -> not (idName f `elemNameSet` cand_names) || idName f `elemNameSet` available) cs) pending
+          if null next then pure checked else do
+            tables <- fmap catMaybes $ forM next $ \(owner, payload, _) -> case payload of
+              Left (emb, emb_calls) -> certifyEmbSpec strict final_exports env (lookupCallee checked) emb_calls emb
+              Right (opt_rhs, callees) -> do
+                resolved <- traverse (\c -> fmap (c,) <$> lookupCallee checked c) callees
+                maybe (pure Nothing) (\pairs -> certifyNominal pairs owner opt_rhs) (sequence resolved)
+            if null tables then pure checked
+              else collect (extendNameSetList available (map (idName . fst) tables)) (checked ++ tables) later
+    collect struct_names structural remaining
   where
-    (call_args, pattern_args, skolem_vars) = case input of
-      ClosedInput _ params -> ([], params, [])
-      PolyInput _ skolems params -> (mkTyVarTys skolems, params, skolems)
-      ProducerInput skolems -> (mkTyVarTys skolems, [], skolems)
+    publicTableTypes env exported table =
+      let tables = sourceTableWithCallees table; rdr_env = tcg_rdr_env env; imported = ordinaryImport rdr_env
+          not_boot n | nameModule_maybe n == Just (tcg_semantic_mod env) = n `elemNameSet` exported
+                     | Just gre <- lookupGRE_Name rdr_env n = any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
+                     | otherwise = True
+          builtin tc = tc == listTyCon || isBoxedTupleTyCon tc || isKindTyCon tc
+      in all (\tc -> builtin tc || publicCaseType env exported imported tc) (tablePromotedParents True tables) &&
+         all (\tc -> builtin tc || not_boot (tyConName tc)) (sourceEquationDatatypes tables)
 
-    checkCalls = sourceBranchCheckCalls call_args
-    fieldVar = sourceBranchFieldVar
-    check_rhs = sourceBranchCheckRhs owner_name order skolem_vars
+    checkNominalShape strict cct = do
+      let tele = cct_binders cct; domains = cct_domains cct; result = cct_result cct; rows = cct_rows cct; tvs = binderVars tele
+      guard (all (\b -> case binderFlag b of { Invisible SpecifiedSpec -> tcIsLiftedTypeKind (tyVarKind (binderVar b)); _ -> False }) tele &&
+             all (`elem` concatMap tyCoVarsOfTypeList domains) tvs)
+      case rows of
+        [CompiledCoreRow pats rhs] | all isPatVar pats -> do
+          let is_prod RhsCon{} = True; is_prod RhsCall{} = True; is_prod _ = False
+          cct <$ guard (not strict && is_prod rhs && not (rhsHasSelf rhs) &&
+                        all (polySourceArgType tvs) domains && polySourceType tvs result)
+        CompiledCoreRow pats0 _ : _ -> do
+          col_idx <- findIndex isPatCon pats0
+          guard ((col_idx == 0 || (col_idx == 1 && lengthIs domains 2)) &&
+                 all (\(CompiledCoreRow ps _) -> equalLength ps domains && isPatCon (ps !! col_idx) &&
+                                                 all (\(i, p) -> i == col_idx || isPatVar p) (zip [0 ..] ps)) rows)
+          let has_nested = any (\(CompiledCoreRow ps _) -> case ps !! col_idx of { PatCon _ _ cs -> any isPatCon cs; _ -> False }) rows
+          guard (not (has_nested && any (\(CompiledCoreRow _ r) -> rhsHasSelf r) rows))
+          let arg_ty = domains !! col_idx; carried = [d | (i, d) <- zip [0 ..] domains, i /= col_idx]
+          if not strict && fmap fst (caseDatatype arg_ty) == Just listTyCon && all (eqType arg_ty) (result : carried)
+            then pure ()
+            else do
+              guard ((null carried || not strict) && (not has_nested || not strict))
+              if strict
+                then case tvs of
+                  [] -> () <$ (ordinaryDataType arg_ty >> ordinaryDataType result >>= \(_, as) -> guard (null as))
+                  _  -> do
+                    (tc, args) <- caseDatatype arg_ty
+                    params <- traverse getTyVar_maybe args
+                    guard (tc == listTyCon && equalLength params tvs && mkUniqSet params == mkUniqSet tvs && result `eqType` arg_ty)
+                else guard (polySourceType tvs arg_ty && all (polySourceArgType tvs) (result : carried))
+          pure cct
+        [] -> Nothing
 
-    zonkPat (SourcePatVar mb_v) = SourcePatVar <$> traverse (\v -> setIdType v <$> zonkTcType (varType v)) mb_v
-    zonkPat (SourcePatCon dc tys ps) = SourcePatCon dc <$> zonkTcTypes tys <*> traverse zonkPat ps
+compileBooleanGuardCase :: (TyCon -> Bool) -> (Id -> Maybe TyCon) -> Id -> Core.CoreExpr -> TcM (Maybe ((Id, TyCon), TyCon))
+compileBooleanGuardCase public predicate owner body
+  | Just cct <- compileCoreEquations ((defaultCoreSpec public) { ccs_predicate = predicate, ccs_allow_guard = True }) owner body
+  , any (\(CompiledCoreRow _ r) -> rhsHasPredicateGuard r) (cct_rows cct) = do
+      mb_pub <- publishCompiledWithGuard owner cct
+      pure $ case mb_pub of { Just (table, [sel]) -> Just ((owner, table), sel); _ -> Nothing }
+  | otherwise = pure Nothing
 
-    patIds (SourcePatVar mb_v) = maybeToList mb_v
-    patIds (SourcePatCon _ _ ps) = concatMap patIds ps
+sourceCaseTables :: NameSet -> LHsBinds GhcTc -> TcM ([(Id, TyCon)], [TyCon])
+sourceCaseTables nominal_owners binds = do
+  env <- getGblEnv
+  char_tables <- xoptM LangExt.ExperimentalDependentTypes
+  dflags <- getDynFlags
+  rdr_env <- getGlobalRdrEnv
+  let generates_code = backendGeneratesCode (backend dflags)
+      produces_iface = gopt Opt_WriteInterface dflags || not (isOneShot (ghcMode dflags))
+  no_code_structural <- if generates_code || gopt Opt_WriteIfSimplifiedCore dflags || not (null (tcg_rules env))
+    then pure False else not . hasActiveLatePlugins <$> getTopEnv
+  let checks_final_core = generates_code || (no_code_structural && produces_iface &&
+                                             gopt Opt_WriteSourceEquations dflags && not (gopt Opt_Hpc dflags))
+      can_struct = generates_code || no_code_structural
+      exported = availsToNameSet (tcg_exports env); ruled = sourceRuleOwners (tcg_rules env)
+      enum_enabled = not char_tables; imported = ordinaryImport rdr_env
+      public = publicCaseType env exported imported
+      eligible_case owner
+        | Just kinds <- monomorphicEnumCaseKinds (varType owner) =
+            enum_enabled && all (maybe False (public . fst) . caseDatatype) kinds
+        | Just (con, _) <- monomorphicRetainedWitnessType (varType owner) = public (dataConTyCon con)
+        | Just sig@(ConstructorCaseType _ tc _ domains pos _) <- constructorCaseType (varType owner)
+        , not (isBinaryListCase sig || isTwoStructuralCase sig || isSizeListCase sig) =
+            (pos == 1 && (tc == listTyCon || public tc)) || (isPermutingConstructorCase sig && public tc) ||
+            (nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env) && publicCaseType env exported (const False) tc) ||
+            (maybe False (\(_, dom, _) -> isRetainedCaseRoot dom tc) (splitCaseOperand pos domains) && public tc)
+        | otherwise = False
+      list_case_position o
+        | checks_final_core, let ty = varType o
+        , Just (ConstructorCaseType _ tc _ _ pos _) <- constructorCaseType ty <|> monomorphicGuardedListCaseType ty
+        , tc == listTyCon = Just pos
+        | otherwise = Nothing
+      indexed_cand o = checks_final_core && maybe False (\(IndexedProjection _ _ _ c _ _ _) -> public (dataConTyCon c)) (indexedProjectionType (varType o))
+      struct_cand o = can_struct && isNothing (sourceTableOccurrence env o >>= sourceTableId_maybe) &&
+                      maybe False (\s -> isTwoStructuralCase s || isSizeListCase s) (constructorCaseType (varType o))
+      partial_cand o = can_struct && not (idName o `elemNameSet` nominal_owners) &&
+                       isNothing (sourceTableOccurrence env o >>= sourceTableId_maybe) && isJust (partialConstructorCaseType (varType o))
+      final_cand o = isJust (list_case_position o) || indexed_cand o || struct_cand o || partial_cand o
+      bin_list_cand o = not (idName o `elemNameSet` nominal_owners) && list_case_position o == Just 0
+      fold_cand o = can_struct && isJust (listFoldType (varType o))
+      zip_cand o = checks_final_core && isJust (listZipWithType (varType o))
+      rev_wrap_cand o = checks_final_core && isJust (listReverseWrapperType (varType o))
+      id_cand o = checks_final_core && isIdentitySourceType (varType o)
+      comp_cand o = checks_final_core && isJust (compositionSourceType (varType o))
+      is_exported o = idName o `elemNameSet` exported && not (idName o `elemNameSet` nominal_owners)
+      eligible o = is_exported o && (final_cand o || not (idName o `elemNameSet` ruled)) &&
+                   ((char_tables && isJust (charCaseResultTyCon (varType o))) || isJust (pairCaseType (varType o)) ||
+                    isJust (pairBuilderType (varType o)) || eligible_case o)
+      owners = [(b, o) | b <- binds, o <- collectHsBindBinders CollNoDictBinders (unLoc b)]
+      candidates = [(b, o) | (b, o) <- owners, eligible o ||
+                    (is_exported o && (id_cand o || comp_cand o || final_cand o || rev_wrap_cand o || fold_cand o || zip_cand o))]
+  if isHsBootOrSig (tcg_src env) || null candidates then pure ([], []) else do
+    visible <- visibleSourceMethodRules env
+    unloaded <- unloadedSourceRuleHeads env
+    let changed o = idName o `elemNameSet` ruled || idName o `elemNameSet` unloaded || hasSourceMethodRule visible o
+        prepare = safeSimpleOptExpr (initSimpleOpts dflags)
+        finalOwner o t = setIdDetails o (SourceTableId (idName o) t FinalCoreSourceTable)
+    all_bind_pairs <- fmap catMaybes $ forM owners $ \(b, o) -> fmap (o,) <$> bindingCore b o
+    prepared <- fmap catMaybes $ forM candidates $ \(bind, owner) -> do
+      let ruled_owner = changed owner
+      if ruled_owner && not (final_cand owner || id_cand owner || fold_cand owner || zip_cand owner || rev_wrap_cand owner)
+        then pure Nothing
+        else do
+          mb_body <- maybe (bindingCore bind owner) (pure . Just) (lookup owner all_bind_pairs)
+          pure $ flip fmap mb_body $ \body ->
+            let guarded_cct
+                  | isJust (list_case_position owner), let ty = varType owner
+                  , Just (ConstructorCaseType _ tc [el] [pred_ty, inp] 1 res) <- constructorCaseType ty <|> monomorphicGuardedListCaseType ty
+                  , tc == listTyCon, pred_ty `eqType` mkVisFunTyManyU el boolTy
+                  , res `eqType` inp || res `eqType` mkTupleTy Boxed [inp, inp]
+                  , let g_spec = (defaultCoreSpec public)
+                          { ccs_bindings = all_bind_pairs, ccs_allow_guard = True, ccs_allow_tail_self = True, ccs_check_kind_public = False }
+                  , Just cct <- compileCoreEquations g_spec owner (prepare body)
+                  , any (\(CompiledCoreRow _ r) -> rhsHasCallbackGuard r) (cct_rows cct) = Just cct
+                  | otherwise = Nothing
+            in (owner, body, ruled_owner, guarded_cct)
 
-    buildPat :: (Type -> Type) -> SourcePat -> Type -> MaybeT TcM (Type, [(Maybe Id, TyVar)])
-    buildPat instantiate (SourcePatVar mb_v) expected_ty = do
-      forM_ mb_v $ \v -> guard (instantiate (varType v) `eqType` expected_ty)
-      tv <- lift (fieldVar mb_v expected_ty)
-      pure (mkTyVarTy tv, [(mb_v, tv)])
-    buildPat instantiate (SourcePatCon dc sub_args sub_pats) expected_ty = do
-      (tc, inst_args) <- MaybeT (pure (caseDatatype expected_ty))
-      guard (dataConTyCon dc == tc &&
-             isVanillaDataCon dc &&
-             dataConUserTyVars dc == dataConUnivTyVars dc &&
-             eqTypes (map instantiate sub_args) inst_args &&
-             length sub_pats == dataConSourceArity dc)
-      sub_field_tys <- MaybeT (pure (openDataConFieldTypes dc inst_args))
-      guard (equalLength sub_pats sub_field_tys)
-      children <- zipWithM (buildPat instantiate) sub_pats sub_field_tys
-      let (child_tys, child_scopes) = unzip children
-      pure (mkTyConApp (promoteDataCon dc) (inst_args ++ child_tys), concat child_scopes)
+    let root_cores = [(o, body) | (o, body, False, Nothing) <- prepared, eligible o]
+        tryFinal o raw_b opt_b ruled_o =
+          (guard ruled_o *> compileCoreEquations ((defaultCoreSpec (const False)) { ccs_check_kind_public = False }) o raw_b >>=
+             \c -> c <$ guard (isValidMapperTable c)) <|>
+          (do guard (bin_list_cand o)
+              let s_app = (defaultCoreSpec (const False)) { ccs_check_kind_public = False }
+                  s_rev = s_app { ccs_allow_tail_self = True, ccs_allow_accum_self = True }
+              (compileCoreEquations s_app o raw_b >>= \c -> c <$ guard (isValidAppendTable c)) <|>
+                (compileCoreEquations s_rev o opt_b >>= \c -> c <$ guard (isValidReverseWorkerTable c)) <|>
+                (do sig@(ConstructorCaseType _ _ _ ds _ _) <- constructorCaseType (varType o); guard (isTwoListCase sig)
+                    let el_ks = [el | d <- ds, Just (_, [el]) <- [caseDatatype d]]
+                    compileCoreEquations ((defaultCoreSpec public) { ccs_fixed_kinds = el_ks }) o opt_b <|>
+                      compileZipCore public o opt_b)) <|>
+          (guard (struct_cand o) *> compileStructuralCore public o opt_b) <|>
+          (do guard (partial_cand o)
+              ConstructorCaseType _ root _ _ _ _ <- partialConstructorCaseType (varType o)
+              cct <- compileCoreEquations ((defaultCoreSpec public) { ccs_partial_root = True }) o opt_b
+              cct <$ guard (length (cct_rows cct) < length (tyConDataCons root))) <|>
+          (guard (fold_cand o) *>
+             compileCoreEquations ((defaultCoreSpec (const True)) { ccs_allow_top_apply = True, ccs_check_kind_public = False }) o opt_b >>=
+             \c -> c <$ guard (isValidFoldTable c)) <|>
+          (guard (zip_cand o) *> compileZipCore public o opt_b) <|>
+          (do guard (comp_cand o)
+              cct <- compileCoreEquations ((defaultCoreSpec (const True))
+                       { ccs_allow_zero_cases = True, ccs_allow_top_apply = True, ccs_check_kind_public = False }) o raw_b
+              case cct_rows cct of
+                [CompiledCoreRow [PatVar f, PatVar g, PatVar x] (RhsApply f' [RhsApply g' [RhsVar x']])]
+                  | f == f', g == g', x == x' -> pure cct
+                _ -> Nothing)
 
--- | Zonk type arguments on helper calls, recursive calls, and embedded types.
-sourceBranchCheckCalls :: [Type] -> SourceRhs -> MaybeT TcM SourceRhs
-sourceBranchCheckCalls call_args = checkCalls
-  where
-    checkCalls field@Field{} = pure field
-    checkCalls (Construct con args) = Construct con <$> traverse checkCalls args
-    checkCalls (Call f tys args) =
-      Call f <$> lift (liftZonkM (zonkTcTypes tys)) <*> traverse checkCalls args
-    checkCalls recur@(Recur tys _) = do
-      guard =<< lift (eqTypes call_args <$> liftZonkM (zonkTcTypes tys))
-      pure recur
-    checkCalls (EmbeddedType raw_ty) =
-      EmbeddedType <$> lift (liftZonkM (zonkTcType raw_ty))
-    checkCalls absurd_rhs@AbsurdField{} = pure absurd_rhs
+    final <- forM prepared $ \(owner, body, ruled_owner, mb_guarded) -> case mb_guarded of
+      Just cct -> publishCompiledWithGuard owner cct >>= \case
+        Just (table, gs) -> pure (Just (finalOwner owner table, table), gs)
+        Nothing          -> pure (Nothing, [])
+      Nothing
+        | Just cct <- tryFinal owner body (prepare body) ruled_owner -> do
+            table <- publishCompiledTable owner cct
+            pure (Just (finalOwner owner table, table), [])
+        | indexed_cand owner, Just (proj, rec_r) <- checkedIndexedProjection prepare owner body -> do
+            checked <- publishIndexedProjection owner proj rec_r
+            pure (fmap (\t -> (finalOwner owner t, t)) checked, [])
+        | otherwise -> pure (Nothing, [])
 
--- | Allocate a fresh type variable representing one pattern or carried binder.
-sourceBranchFieldVar :: Maybe Id -> Type -> TcM TyVar
-sourceBranchFieldVar field ty = do
-    let occ = maybe (mkTyVarOcc "_") (setOccNameSpace tvName . nameOccName . varName) field
-    name <- newSysName occ
-    pure (mkTyVar name ty)
+    let final_entries = catMaybes (map fst final)
+        checked_preds = mkNameEnv [(idName v, v) | (v, _) <- final_entries, isFinalStructuralSource v]
+        predicate c = checkedBranchPredicate (fromMaybe c (lookupNameEnv checked_preds (idName c)))
+    boolean_cases <- fmap catMaybes $ forM [(o, prepare b) | (o, b, _, Nothing) <- prepared, partial_cand o] $
+      \(o, b) -> fmap (\((o', t), sel) -> ((finalOwner o' t, t), sel)) <$> compileBooleanGuardCase public predicate o b
 
--- | Build the promoted right-hand side type of a checked source branch.
-sourceBranchCheckRhs
-  :: Name
-  -> LeftOrRight
-  -> [TyVar]
-  -> [(Id, (TyCon, [TyVar], [Type], Type))]
-  -> [TyVar]
-  -> [TyVar]
-  -> (Type -> Type)
-  -> Type
-  -> [Type]
-  -> [(Maybe Id, TyVar)]
-  -> [(Maybe Id, TyVar)]
-  -> Type
-  -> SourceRhs
-  -> Maybe (TyCon -> Type)
-sourceBranchCheckRhs owner_name order skolem_vars callees quantified binders instantiate domain family_args fields_scope carried_scope = go
-  where
-    skolem_map = zip skolem_vars quantified
-    all_scope = fields_scope ++ carried_scope
-    field_tv_set = mkUniqSet (map snd fields_scope)
-    binder_set = mkVarSet binders
+    let reverse_workers = mkNameEnv [(idName w, t) | (Just (w, t), _) <- final, isReverseWorkerTable t]
+    reverse_wrappers <- forM
+      [ (o, bs, op, el, w_tc) | (o, body, _, _) <- prepared, rev_wrap_cand o
+      , Just (bs, op, el, callee) <- [directListReverseWrapper o (prepare body)]
+      , Just w_tc <- [lookupNameEnv reverse_workers (idName callee)] ] $ \(o, bs, op, el, w_tc) -> do
+        let dom = varType op
+            row = CompiledCoreRow [PatVar op] (RhsCall w_tc [el] [RhsVar op, RhsCon nilDataCon [el] []])
+        table <- publishCompiledTable o (CompiledCoreTable bs [dom] dom [row] False)
+        pure (finalOwner o table, table)
 
-    is_self_tc tc =
-      nameModule_maybe (tyConName tc) == nameModule_maybe owner_name &&
-      nameOccName (tyConName tc) == mkSourceTableOcc (nameOccName owner_name)
+    let references = map idName . exprSomeFreeVarsList (\v -> isId v && nameModule_maybe (idName v) == Just (tcg_semantic_mod env))
+        local_owners = mkNameEnv [(idName o, (b, o)) | (b, o) <- owners]
+        helperCore name
+          | Just (b, o) <- lookupNameEnv local_owners name, isExternalName name, not (eligible o)
+          , not (changed o), isJust (constructorHelperType (varType o)) = fmap (o,) <$> bindingCore b o
+          | otherwise = pure Nothing
+        collectHelpers _ [] = pure []
+        collectHelpers seen (nm : rest)
+          | nm `elemNameSet` seen = collectHelpers seen rest
+          | otherwise = helperCore nm >>= \case
+              Just (o, rhs) -> let direct = references rhs in (DigraphNode (o, rhs) nm direct :) <$> collectHelpers (extendNameSet seen nm) (direct ++ rest)
+              Nothing -> collectHelpers (extendNameSet seen nm) rest
+        lookupHelper helpers actual
+          | nameModule_maybe (idName actual) == Just (tcg_semantic_mod env) = lookup actual helpers
+          | imported (idName actual) = sourceTableId_maybe actual
+          | otherwise = Nothing
+        buildHelper done (AcyclicSCC (o, rhs))
+          | Just cct <- compileCoreEquations ((defaultCoreSpec public) { ccs_helper = lookupHelper done, ccs_allow_zero_cases = True }) o rhs
+          , [CompiledCoreRow pats _] <- cct_rows cct, all isPatVar pats = (\t -> (o, t) : done) <$> publishCompiledTable o cct
+          | Just sig <- constructorCaseType (varType o)
+          , not (isBinaryListCase sig || isTwoStructuralCase sig || isSizeListCase sig)
+          , Just cct <- compileOrdinaryCase public (lookupHelper done) sig o rhs = (\t -> (o, t) : done) <$> publishCompiledTable o cct
+        buildHelper done _ = pure done
 
-    resolve_callee_tc tc = listToMaybe
-      [ real_table
-      | (callee_id, (real_table, _, _, _)) <- callees
-      , nameModule_maybe (tyConName tc) == nameModule_maybe (idName callee_id)
-      , nameOccName (tyConName tc) == mkSourceTableOcc (nameOccName (idName callee_id)) ]
+    helper_cores <- collectHelpers emptyNameSet (concatMap (references . snd) (filter (eligible_case . fst) root_cores))
+    helpers <- foldM buildHelper [] (stronglyConnCompFromEdgedVerticesUniq helper_cores)
+    let isEnumBinRow (CompiledCoreRow [PatCon{}, PatVar{}] r) = case r of { RhsVar{} -> True; RhsCon _ _ [] -> True; _ -> False }
+        isEnumBinRow _ = False
+        certifyRoot (o, rhs)
+          | Just build <- checkedPairBuilder o rhs = build
+          | otherwise = (, []) <$> case rhs of
+              Core.Var target | Just res <- charCaseResultTyCon (varType o) -> forwardSourceCharacter env res o target
+              _ | isJust (pairCaseType (varType o)), Just cct <- compilePairCase o rhs ->
+                    Just . (o,) <$> publishCompiledTable o cct
+                | let enum_arity = monomorphicEnumCaseArity (varType o)
+                , eligible_case o
+                , Just (con_mb, sig) <- ((\(c, s) -> (Just c, s)) <$> directRetainedWitnessType (varType o)) <|>
+                                        ((Nothing,) <$> constructorCaseType (varType o))
+                , Just cct <- compileOrdinaryCaseWithWitness con_mb public (lookupHelper helpers) sig o rhs
+                , enum_arity /= Just 2 || all isEnumBinRow (cct_rows cct) -> do
+                    table <- publishCompiledTable o cct
+                    pure $ Just (if isJust enum_arity then setIdDetails o (SourceTableId (idName o) table ExecutableSourceTable) else o, table)
+                | otherwise -> publishCertifiedCharacter o rhs
 
-    rewrite_embedded :: TyCon -> Type -> Maybe Type
-    rewrite_embedded fam emb_ty = do
-      let (map_ty, _, _, _) = mapTyCo mapper
-          mapper :: TyCoMapper Maybe
-          mapper = TyCoMapper
-            { tcm_tyvar = \tv -> pure (maybe (mkTyVarTy tv) mkTyVarTy (lookup tv skolem_map))
-            , tcm_termvar = \v -> do
-                tv <- lookup (Just v) all_scope
-                guard (instantiate (varType v) `eqType` tyVarKind tv)
-                pure (mkTyVarTy tv)
-            , tcm_termbinder = \_ _ -> Nothing
-            , tcm_covar = \_ -> Nothing
-            , tcm_hole = \_ -> Nothing
-            , tcm_tycobinder = \tv _ k -> do
-                guard (tv `notElem` skolem_vars)
-                k tv
-            , tcm_tcapp_ty = \_ tc mapped_tys ->
-                if is_self_tc tc then do
-                  guard (length mapped_tys == length family_args + 1 + length carried_scope)
-                  let (actual_ty_args, actual_val_args) = splitAt (length family_args) mapped_tys
-                  guard (eqTypes actual_ty_args family_args)
-                  rec_arg : rec_carried <- pure (sourceOperandOrder order actual_val_args)
-                  field_tv <- getTyVar_maybe rec_arg
-                  guard (field_tv `elementOfUniqSet` field_tv_set && tyVarKind field_tv `eqType` domain)
-                  guard (eqTypes rec_carried (mkTyVarTys (map snd carried_scope)))
-                  pure (mkTyConApp fam (family_args ++ actual_val_args))
-                else case resolve_callee_tc tc of
-                  Just real_table -> do
-                    guard (length mapped_tys == tyConArity real_table)
-                    pure (mkTyConApp real_table mapped_tys)
-                  Nothing
-                    | isTypeSynonymTyCon tc
-                    , Just expanded <- coreView (mkTyConApp tc mapped_tys)
-                    , any (\t -> is_self_tc t || is_pending_source_tc t)
-                          (nonDetEltsUniqSet (tyConsOfTypes [expanded])) ->
-                        map_ty expanded
-                    | otherwise -> do
-                        guard (not (is_pending_source_tc tc))
-                        pure (mkTyConApp tc mapped_tys)
-            , tcm_tcapp_co = \_ role tc mapped_cos -> do
-                guard (not (is_self_tc tc))
-                guard (not (is_pending_source_tc tc))
-                pure (mkTyConAppCo role tc mapped_cos)
-            }
-      rewritten <- map_ty emb_ty
-      guard (not (hasNativeDependentExpr (Core.Type rewritten)))
-      guard (all (`elemVarSet` binder_set) (tyCoVarsOfTypeList rewritten))
-      guard (tcIsLiftedTypeKind (typeKind rewritten))
-      pure rewritten
+    (root_entries, fields) <- unzip <$> traverse certifyRoot root_cores
+    roots <- publishCharacterAliases env root_cores (catMaybes root_entries)
+    let helper_tables = mkNameEnv [(tyConName t, t) | (_, t) <- helpers]
+        closeH seen [] = seen
+        closeH seen (nm : rest)
+          | nm `elemNameSet` seen = closeH seen rest
+          | Just t <- lookupNameEnv helper_tables nm = closeH (extendNameSet seen nm) (maybe [] (map tyConName) (sourceTableCallees t) ++ rest)
+          | otherwise = closeH seen rest
+        used = closeH emptyNameSet (concatMap (maybe [] (map tyConName) . sourceTableCallees . snd) roots)
+        used_helpers = filter (\(_, t) -> tyConName t `elemNameSet` used) helpers
+        helper_owners = mkNameSet (map (idName . fst) used_helpers)
+    identities <- fmap catMaybes $ forM
+      [ (o, cct) | (o, body, _, _) <- prepared, id_cand o, not (idName o `elemNameSet` helper_owners)
+      , Just cct <- [compileCoreEquations ((defaultCoreSpec (const False)) { ccs_allow_zero_cases = True }) o body]
+      , [CompiledCoreRow [PatVar x] (RhsVar y)] <- [cct_rows cct], x == y
+      ] $ \(o, cct) -> Just . (\t -> (finalOwner o t, t)) <$> publishCompiledTable o cct
 
-    is_pending_source_tc tc
-      | Just (ClosedTypeFamilyTyCon CTF_Abstract) <- famTyConFlav_maybe tc
-      = isJust (sourceTableTermOcc (nameOccName (tyConName tc)))
-      | otherwise = False
+    let (boolean_tables, boolean_selectors) = unzip boolean_cases
+        boolean_owners = mkNameSet (map (idName . fst) boolean_tables)
+        other_final = filter (\(v, _) -> not (idName v `elemNameSet` boolean_owners)) final_entries
+    pure (other_final ++ boolean_tables ++ reverse_wrappers ++ identities ++ roots ++ used_helpers,
+          concatMap snd final ++ boolean_selectors ++ concat fields)
 
-    go expected rhs = case rhs of
-      EmbeddedType emb_ty -> do
-        guard (tcIsLiftedTypeKind expected &&
-               not (hasCoercionHole emb_ty) &&
-               not (any isMetaTyVar (tyCoVarsOfTypeList emb_ty)) &&
-               tcIsLiftedTypeKind (typeKind emb_ty))
-        -- Validate against a dummy TyCon placeholder first so malformed branches fail before makeFamily.
-        _ <- rewrite_embedded listTyCon emb_ty
-        pure (\fam -> fromMaybe (panic "sourceBranch: rewrite_embedded") (rewrite_embedded fam emb_ty))
-      Field v -> do
-        tv <- lookup (Just v) (fields_scope ++ carried_scope)
-        guard (tyVarKind tv `eqType` expected)
-        pure (const (mkTyVarTy tv))
-      Recur _ v -> do
-        -- See Note [Carried arguments of a source equation].
-        tv <- lookup (Just v) fields_scope
-        guard (tyVarKind tv `eqType` domain)
-        let operands = mkTyVarTys (sourceOperandOrder order (tv : map snd carried_scope))
-        pure (\fam -> mkTyConApp fam (family_args ++ operands))
-      Construct dc args -> do
-        (tc, params) <- ordinaryDataType expected <|> caseDatatype expected
-        guard (dataConTyCon dc == tc &&
-               isVanillaDataCon dc &&
-               dataConUserTyVars dc == dataConUnivTyVars dc &&
-               length args == dataConSourceArity dc &&
-               all (polySourceArgType quantified) params)
-        arg_tys <- openDataConFieldTypes dc params
-        guard (equalLength args arg_tys)
-        children <- zipWithM go arg_tys args
-        pure (\fam -> mkTyConApp (promoteDataCon dc) (params ++ [child fam | child <- children]))
-      Call fun tys args -> do
-        (table, parameters, arg_tys, res_ty) <- lookup fun callees
-        let actual_tys = map instantiate tys
-            specialize = substTyWith parameters actual_tys
-        guard (equalLength parameters actual_tys &&
-               all (\t -> tcIsLiftedTypeKind (typeKind t) && polySourceArgType quantified t) actual_tys)
-        guard (equalLength args arg_tys && specialize res_ty `eqType` expected)
-        children <- zipWithM go (map specialize arg_tys) args
-        pure (\fam -> mkTyConApp table (actual_tys ++ [child fam | child <- children]))
-      AbsurdField _ -> Nothing
+compilePairCase :: Id -> Core.CoreExpr -> Maybe CompiledCoreTable
+compilePairCase owner rhs = do
+    _ <- pairCaseType (varType owner)
+    cct <- compileCoreEquations (defaultCoreSpec (const False)) owner rhs
+    case cct_rows cct of
+      [CompiledCoreRow [PatCon dc _ [PatVar a, PatVar b]] r]
+        | dc == tupleDataCon Boxed 2
+        , let ok (RhsVar v) = v == a || v == b; ok _ = False
+        , ok r || case r of { RhsCon dc' _ [f1, f2] -> dc' == dc && ok f1 && ok f2; _ -> False } -> pure cct
+      _ -> Nothing
 
--- | Give the table the representation of a closed, non-injective family.
-makeFamily :: Name -> LeftOrRight -> SourceInput -> [Type] -> Type -> [TyCon -> CoAxBranch] -> TcM TyCon
-makeFamily fun order input carried_types result branches = do
-    (quantified, domain, _) <- freshInput input
-    let instantiate = instantiateInput input quantified
-        visible_tys = case input of
-          ProducerInput{} -> map instantiate carried_types
-          _ -> sourceOperandOrder order (domain : map instantiate carried_types)
-    args <- zipWithM freshSysTyVar ("x" : "y" : map (("arg" ++) . show) [3 :: Int ..]) visible_tys
-    let binders = mkNamedTyConBinders (Invisible SpecifiedSpec) quantified ++
-                  mkAnonTyConBinders args
-    makeSourceFamily fun binders (instantiate result) branches
+compileOrdinaryCase :: (TyCon -> Bool) -> (Id -> Maybe TyCon) -> ConstructorCaseType -> Id -> Core.CoreExpr
+                    -> Maybe CompiledCoreTable
+compileOrdinaryCase = compileOrdinaryCaseWithWitness Nothing
 
--- | Build a nominal closed family from an explicit telescope and result kind.
-makeSourceFamily :: Name -> [TyConBinder] -> Kind -> [TyCon -> CoAxBranch] -> TcM TyCon
-makeSourceFamily fun binders res_kind branches = do
-    name <- newImplicitBinder fun mkSourceTableOcc
-    ax_name <- newImplicitBinder name mkInstTyCoOcc
-    pure (buildSourceFamily name ax_name binders res_kind branches)
+compileOrdinaryCaseWithWitness :: Maybe DataCon -> (TyCon -> Bool) -> (Id -> Maybe TyCon)
+                               -> ConstructorCaseType -> Id -> Core.CoreExpr -> Maybe CompiledCoreTable
+compileOrdinaryCaseWithWitness mb_con public helper sig@(ConstructorCaseType _ _ _ _ pos _) owner rhs = do
+    let spec = (defaultCoreSpec public) { ccs_helper = helper, ccs_fixed_kinds = fixedMapTypes sig, ccs_witness_root = mb_con }
+    cct <- compileCoreEquations spec owner rhs
+    let multi = isTwoListCase sig || isTwoStructuralCase sig || isSizeListCase sig
+    cct <$ guard (all (\(CompiledCoreRow ps _) -> pos < length ps && isPatCon (ps !! pos) &&
+                        (multi || all (\(i, p) -> i == pos || isPatVar p) (zip [0 ..] ps))) (cct_rows cct))
 
--- | Construct a checked family after its name and axiom name are allocated.
-buildSourceFamily :: Name -> Name -> [TyConBinder] -> Kind -> [TyCon -> CoAxBranch] -> TyCon
-buildSourceFamily name ax_name binders res_kind branches =
-    let kind = mkTyConKindWithMatchability unmatchableDataConTy binders res_kind
-        fam_tc = mkFamilyTyCon name kind binders 0 res_kind Nothing
-                   (ClosedTypeFamilyTyCon (CTF (Just axiom))) Nothing NotInjective
-        axiom = mkBranchedCoAxiom Nominal ax_name fam_tc (map ($ fam_tc) branches)
-    in fam_tc
+sourceMapperTable :: Id -> Core.CoreExpr -> TcM (Maybe (Id, TyCon))
+sourceMapperTable owner rhs = do
+    env <- getGblEnv
+    let public = visibleCaseType (\n -> nameModule_maybe n == Just (tcg_semantic_mod env) || ordinaryImport (tcg_rdr_env env) n)
+        mb_cct = (constructorCaseType (varType owner) >>= \sig -> compileOrdinaryCase public (const Nothing) sig owner rhs) <|>
+                 (guard (isPairPermutationType (varType owner)) *> compilePairCase owner rhs)
+    maybe (pure Nothing) (\cct -> Just . (owner,) <$> publishCompiledTable owner cct) mb_cct
 
--- | Rebuild a certified closed source family, substituting knot-tied mutual TyCons in branch RHSs.
--- See Note [Staging mutually recursive large eliminations] in GHC.Tc.Module.
-rebuildSourceFamilyWith :: (TyCon -> TyCon) -> TyCon -> TyCon
-rebuildSourceFamilyWith subst_tc table
-  | Just ax <- closedFamilyTyConCoAxiom_maybe table
-  = let name = tyConName table
-        ax_name = coAxiomName ax
-        binders = tyConBinders table
-        res_kind = tyConResKind table
-        branch_builders =
-          [ \fam -> mkCoAxBranch
-              (coAxBranchTyVars br)
-              []
-              (coAxBranchCoVars br)
-              (coAxBranchLHS br)
-              (map_rhs fam (coAxBranchRHS br))
-              (coAxBranchRoles br)
-              (coAxBranchSpan br)
-          | br <- fromBranches (coAxiomBranches ax) ]
-    in buildSourceFamily name ax_name binders res_kind branch_builders
-  | otherwise = pprPanic "rebuildSourceFamilyWith: expected closed family" (ppr table)
-  where
-    map_rhs fam =
-      let subst t
-            | tyConName t == tyConName table = fam
-            | otherwise = subst_tc t
-          (map_ty, _, _, _) = mapTyCo TyCoMapper
-            { tcm_tyvar = pure . mkTyVarTy
-            , tcm_termvar = pure . TermVarTy
-            , tcm_termbinder = \v k -> k v
-            , tcm_covar = pure . mkCoVarCo
-            , tcm_hole = pprPanic "rebuildSourceFamilyWith: coercion hole" . ppr
-            , tcm_tycobinder = \tv _ k -> k tv
-            , tcm_tcapp_ty = \_ tc tys -> Identity (TyConApp (subst tc) tys)
-            , tcm_tcapp_co = \_ role tc cos -> Identity (mkTyConAppCo role (subst tc) cos)
-            }
-      in runIdentity . map_ty
+safeSimpleOptExpr :: SimpleOpts -> Core.CoreExpr -> Core.CoreExpr
+safeSimpleOptExpr opts expr
+  | hasExistentialExpr expr || hasNativeDependentExpr expr = expr
+  | otherwise                                              = simpleOptExpr opts expr
+
+sourceLocalBooleanCases :: NameEnv (Id, Core.CoreExpr) -> NameEnv (Id, Core.CoreExpr) -> TcM ([(Id, TyCon)], [TyCon])
+sourceLocalBooleanCases roots definitions = do
+    env <- getGblEnv; rdr_env <- getGlobalRdrEnv; dflags <- getDynFlags
+    let public = visibleCaseType (\n -> if nameModule_maybe n == Just (tcg_semantic_mod env)
+                                          then maybe False isLocalGRE (lookupGRE_Name rdr_env n)
+                                          else ordinaryImport rdr_env n)
+        prepare = safeSimpleOptExpr (initSimpleOpts dflags)
+        fresh o = isNothing (sourceTableOccurrence env o >>= sourceTableId_maybe)
+        ordered = sortBy (\a b -> stableNameCmp (idName (fst a)) (idName (fst b))) . nonDetNameEnvElts
+    predicates <- forM
+      [ (o, cct) | (o, body) <- ordered definitions, fresh o
+      , Just sig@(ConstructorCaseType _ _ _ _ _ res) <- [constructorCaseType (varType o)]
+      , isTwoStructuralCase sig, res `eqType` boolTy
+      , Just cct <- [compileStructuralCore public o (prepare body)]
+      ] $ \(o, cct) -> (o,) <$> publishCompiledTable o cct
+    let local_map = mkNameEnv [(idName o, t) | (o, t) <- predicates]
+        predicate c = lookupNameEnv local_map (idName c) <|> (sourceTableOccurrence env c >>= checkedBranchPredicate)
+    pairs <- fmap catMaybes $ forM [(o, prepare b) | (o, b) <- ordered roots, fresh o, isJust (partialConstructorCaseType (varType o))] $
+      uncurry (compileBooleanGuardCase public predicate)
+    let (cases, selectors) = unzip pairs
+        used = mkNameSet [tyConName c | (_, t) <- cases, c <- fromMaybe [] (sourceTableCallees t)]
+    pure (filter ((`elemNameSet` used) . tyConName . snd) predicates ++ cases, selectors)

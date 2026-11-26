@@ -1,3 +1,7 @@
+-- | Demand-driven call-by-need weak-head normalizer and finite value readback
+-- for open Core expressions with rigid variables and GADT equalities.
+--
+-- See Note [Observing open Core] and Note [Observing indexed constructor cases].
 module GHC.Core.OpenWhnf
   ( EvalFailure(..)
   , Whnf(..)
@@ -521,7 +525,8 @@ chosen body together. Save the value fields with their original
 environments. A cast whose endpoints still differ blocks observation.
 A neutral scrutinee cannot choose a branch. For example, a substitution
 worker can apply its callback to a known bound variable, but it cannot
-inspect an unknown term. See PLFA v22.08, DeBruijn, Single substitution.
+inspect an unknown term (Weirich et al., ICFP 2017; Cockx and Abel, ICFP 2018;
+GHC Proposal #378, §4.6 and #509).
 
 When a worker builds a GADT constructor through its wrapper, use the
 wrapper unfolding reconstructed from the constructor interface. It is
@@ -598,8 +603,8 @@ Ordinary case observation continues to leave unselected fields suspended.
 A case must inspect its scrutinee even when it has only a DEFAULT branch.
 If the scrutinee is neutral, retain the alternatives, the binder and their
 environment. A rigid input stays neutral. An unsolved input can be observed
-again with a new definition. This distinction follows Agda's weak-head
-reducer and its blockers. See Note [Open source calls] in GHC.Tc.Gen.OpenTypeEval.
+again with a new definition (Norell, 2007; Schmidt-Schauß, Sabel, and
+Machkasova, LMCS 2015). See Note [Open source calls] in GHC.Tc.Gen.OpenTypeEval.
 
 GHCi inserts Breakpoint ticks into ordinary imported function bodies.
 They identify positions for the runtime debugger. When observing a type,

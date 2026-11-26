@@ -164,8 +164,9 @@ import GHC.Types.Avail (availsToNameSet)
 import GHC.Types.Error
 import GHC.Types.ForeignStubs
 import GHC.Types.Id
-import GHC.Types.Id.Info (IdDetails(VanillaId))
+import GHC.Types.Id.Info (IdDetails(DFunId, VanillaId))
 import GHC.Types.Var (setIdDetails)
+import GHC.Types.Name.Cache (NameCache)
 import GHC.Types.Name.Env (elemNameEnv, filterNameEnv, lookupNameEnv, mapNameEnv, mkNameEnv)
 import GHC.Types.Name.Set (NameSet, emptyNameSet, mkNameSet, elemNameSet, extendNameSet, extendNameSetList, isEmptyNameSet, nameSetElemsStable)
 import GHC.Types.IPE
@@ -176,11 +177,11 @@ import GHC.Types.SourceError
 import GHC.Types.SafeHaskell
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
-import GHC.Types.TypeEnv (lookupTypeEnv, plusTypeEnv, typeEnvFromEntities)
-import GHC.Types.TyThing (TyThing(..))
-import GHC.Types.Unique.Supply ( mkSplitUniqSupply, splitUniqSupply, uniqFromTag, UniqueTag(BcoTag, HscTag) )
+import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, plusTypeEnv, typeEnvFromEntities)
+import GHC.Types.TyThing (TyThing(..), implicitTyConThings)
+import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, splitUniqSupply, uniqFromTag, UniqueTag(BcoTag, HscTag) )
 import GHC.Types.Unique.Set
-import GHC.Types.Var.Env       ( mkEmptyTidyEnv )
+import GHC.Types.Var.Env       ( emptyVarEnv, extendVarEnv, lookupVarEnv, mkEmptyTidyEnv )
 import GHC.Types.Var.Set
 
 import GHC.Utils.Fingerprint ( Fingerprint )
@@ -204,7 +205,7 @@ import GHC.Data.Maybe
 import qualified GHC.Data.Strict as Strict
 
 import qualified Data.Array as A
-import Data.List ( nub, isPrefixOf, partition )
+import Data.List ( nub, isPrefixOf, partition, sortBy )
 import qualified Data.List.NonEmpty as NE
 import Control.Monad
 import Data.IORef
@@ -219,7 +220,7 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Time
 
 import System.IO.Unsafe ( unsafeInterleaveIO )
-import GHC.Iface.Env ( trace_if )
+import GHC.Iface.Env ( allocateGlobalBinder, trace_if )
 import GHC.Types.Unique.DSet ( uniqDSetToList )
 
 
@@ -923,45 +924,30 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
           let no_late_plugins = not (hasActiveLatePlugins hsc_env)
               exported_names = availsToNameSet (tcg_exports tc_result)
-          checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
-            no_late_plugins local_eval_terms (mg_binds desugared_guts) mutated_names
-          checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
+              want_closures = gopt Opt_WriteSourceEquations dflags &&
+                              xopt LangExt.ExperimentalDependentTypes dflags &&
+                              no_late_plugins && null (tcg_rules tc_result)
+          checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+            no_late_plugins local_eval_terms mutated_names
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
             (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
-          let checked_details = original_details
-                { md_types = finalizeEarlyClosureTypes (Just (cg_binds cg_guts)) exported_names
-                               (md_types original_details) }
-
-          publication <- case publishCheckedMapMethods after_tidy tc_result (cg_binds cg_guts) of
-            Nothing -> pure Nothing
-            Just publish -> liftIO $ fmap snd $
-              initTc NoTcMPlugins hsc_env hsc_src False (mg_module checked) (tcg_top_loc tc_result) $
-                setGblEnv tc_result publish
-          let method_details = case publication of
-                Just (ids, families) ->
-                  let types = md_types checked_details `plusTypeEnv` typeEnvFromEntities ids families [] []
-                      update dfun = case lookupTypeEnv types (idName dfun) of
-                        Just (AnId new) -> new
-                        _ -> dfun
-                  in checked_details { md_types = types
-                                     , md_insts = updateClsInstDFuns update (md_insts checked_details) }
-                Nothing -> checked_details
-
-          details <- if gopt Opt_WriteSourceEquations dflags &&
-                        xopt LangExt.ExperimentalDependentTypes dflags &&
-                        no_late_plugins && null (tcg_rules tc_result)
-            then do
-              (_, closures) <- liftIO $
-                initTc NoTcMPlugins hsc_env hsc_src False (mg_module checked) (tcg_top_loc tc_result) $
-                  setGblEnv tc_result $
-                    publishCheckedSourceClosures (mg_binds desugared_guts) (cg_binds cg_guts)
-                                                 (md_types method_details)
-              pure $ case closures of
-                Just (ids, families) | not (null ids) ->
-                  method_details { md_types = md_types method_details `plusTypeEnv`
-                                                typeEnvFromEntities ids families [] [] }
+          let base_types = finalizeEarlyClosureTypes (Just (cg_binds cg_guts)) exported_names
+                             (md_types original_details)
+          (method_pub, closure_pub) <- liftIO $
+            finalizeSimplifiedSourceTables hsc_env hsc_src after_tidy True want_closures
+              (mg_module checked) (mg_binds desugared_guts) (cg_binds cg_guts) tc_result base_types
+          let method_details = case method_pub of
+                Just (ids, fams) ->
+                  let types = base_types `plusTypeEnv` typeEnvFromEntities ids fams [] []
+                  in original_details { md_types = types
+                                      , md_insts = updateClsInstDFuns
+                                          (\d -> case lookupTypeEnv types (idName d) of { Just (AnId n) -> n; _ -> d })
+                                          (md_insts original_details) }
+                Nothing -> original_details { md_types = base_types }
+              details = case closure_pub of
+                Just (ids, fams) | not (null ids) ->
+                  method_details { md_types = md_types method_details `plusTypeEnv` typeEnvFromEntities ids fams [] [] }
                 _ -> method_details
-            else pure method_details
 
           !partial_iface <- liftIO $
                 {-# SCC "GHC.Driver.Main.mkPartialIface" #-}
@@ -990,9 +976,8 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
           let no_late_plugins = not (hasActiveLatePlugins hsc_env)
               exported_names = availsToNameSet (tcg_exports tc_result)
-          checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
-            no_late_plugins local_eval_terms (mg_binds desugared_guts) mutated_names
-          checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
+          checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+            no_late_plugins local_eval_terms mutated_names
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
             (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
           let tc_result_final = tc_result
@@ -1013,6 +998,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
       -- Check a provisional source equation against optimized Core even
       -- when the interface will not contain a Core program.
+      -- See Note [Checked source equations in typecheck-only interfaces].
       _ -> do
         added_plugins0 <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
         let no_late_plugins = not (hasActiveLatePlugins hsc_env)
@@ -1020,19 +1006,26 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
             has_local_eval_plugins =
               not (null local_eval_terms) &&
               (hasActiveCorePlugins hsc_env || not (null added_plugins0) || not no_late_plugins)
-            want_closures = gopt Opt_WriteSourceEquations dflags &&
-                            xopt LangExt.ExperimentalDependentTypes dflags &&
-                            null (tcg_rules tc_result) &&
-                            not (gopt Opt_Hpc dflags)
+            produces_iface = gopt Opt_WriteInterface dflags || not (isOneShot (ghcMode dflags))
+            want_source_iface = produces_iface &&
+                                gopt Opt_WriteSourceEquations dflags &&
+                                null (tcg_rules tc_result) &&
+                                not (gopt Opt_Hpc dflags)
+            want_closures = want_source_iface &&
+                            xopt LangExt.ExperimentalDependentTypes dflags
         checked_tc <- case mb_desugar of
           Just guts
             | let no_rules = null (mg_rules guts)
+                  can_publish_methods = want_source_iface && no_late_plugins && no_rules &&
+                                        not (null (tcg_insts tc_result))
                   can_publish_closures = want_closures && no_late_plugins && no_rules
                   has_mappers = not (null (finalCoreMappers (mg_binds guts)))
-            , has_mappers || has_early_lookups || has_local_eval_plugins || can_publish_closures -> do
+            , has_mappers || has_early_lookups || has_local_eval_plugins ||
+              can_publish_methods || can_publish_closures -> do
                 let retained = hasNativeDependentModuleBody (mg_binds guts) [] (mg_tcs guts)
                     need_opt = has_early_lookups || has_local_eval_plugins ||
-                               (has_mappers && no_rules) || can_publish_closures
+                               (has_mappers && no_rules) ||
+                               can_publish_methods || can_publish_closures
                 active_opt <- if not need_opt
                   then pure Nothing
                   else if not retained
@@ -1046,39 +1039,21 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                         liftIO $ validateRetainedLookupBodies mb_mut_ref hsc_env_p guts
                       else pure Nothing
                 mutated_names <- read_plugin_mutations
-                checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
-                  no_late_plugins local_eval_terms (mg_binds guts) mutated_names
-                when has_early_lookups $
-                  checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result no_late_plugins
-                    (mg_rules guts ++ maybe [] mg_rules active_opt)
-                    (mg_binds guts) (mg_binds <$> active_opt) Nothing
+                checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+                  no_late_plugins local_eval_terms mutated_names
+                  (mg_rules guts ++ maybe [] mg_rules active_opt)
+                  (mg_binds guts) (mg_binds <$> active_opt) Nothing
                 let checked_mappers_tc
                       | has_mappers = validateSimpleSourceTables guts (if no_rules then active_opt else Nothing) tc_result
                       | otherwise   = tc_result
                 case active_opt of
-                  Just opt_guts | can_publish_closures, null (mg_rules opt_guts) -> do
-                    let exported_names = availsToNameSet (tcg_exports checked_mappers_tc)
-                        keep_exported (AnId v) = idName v `elemNameSet` exported_names
-                        keep_exported _        = True
-                        exported_types = filterNameEnv keep_exported (tcg_type_env checked_mappers_tc)
-                    (_, closures) <- liftIO $
-                      initTc NoTcMPlugins hsc_env hsc_src False (mg_module guts) (tcg_top_loc checked_mappers_tc) $
-                        setGblEnv checked_mappers_tc $
-                          publishCheckedSourceClosures (mg_binds guts) (mg_binds opt_guts) exported_types
-                    pure $ case closures of
-                      Just (ids, families) | not (null ids) ->
-                        checked_mappers_tc
-                          { tcg_type_env = tcg_type_env checked_mappers_tc `plusTypeEnv`
-                                           typeEnvFromEntities ids families [] []
-                          , tcg_tcs = tcg_tcs checked_mappers_tc ++ families }
-                      _ -> checked_mappers_tc
+                  Just opt_guts | null (mg_rules opt_guts) ->
+                    liftIO $ finalizeNoCodeSourceTables hsc_env hsc_src can_publish_methods
+                               can_publish_closures guts opt_guts checked_mappers_tc
                   _ -> pure checked_mappers_tc
           _ -> do
-            checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
-              no_late_plugins local_eval_terms [] emptyNameSet
-            when has_early_lookups $
-              checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result False
-                [] [] Nothing Nothing
+            checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+              False local_eval_terms emptyNameSet [] [] Nothing Nothing
             pure tc_result
         let final_tc = checked_tc
               { tcg_type_env = finalizeEarlyClosureTypes Nothing
@@ -1124,21 +1099,170 @@ validateSimpleSourceTables original final env
     clearOwner (AnId owner) = AnId (clearInvalidSourceOwner owners families owner)
     clearOwner thing = thing
 
+{- Note [Checked source equations in typecheck-only interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When `NoBackend` is active (`-fno-code`), GHC builds a `ModIface` that
+downstream modules read when `-fwrite-interface` writes an `.hi` file or
+when multi-module compilation (`not (isOneShot (ghcMode dflags))`) stores
+the `ModIface` in the home package table.
+
+When `Opt_WriteSourceEquations` is also enabled, a typecheck-only module
+must publish the same checked source equations, method workers, and source
+closures as an `-O0` compilation. Without this parity, downstream modules
+that compile at `-O0` fail in `-fno-code -fwrite-interface` or `--make
+-fno-code` when they reduce an imported function such as a list accumulator
+wrapper, an indexed GADT traversal, or a derived comparison method.
+
+GHC keeps one-shot `-fno-code` without `-fwrite-interface` on the fast path
+because no consumer reads the resulting `ModIface`. Ordinary modules with
+`Opt_WriteSourceEquations` disabled also keep their existing `-fno-code`
+candidate set. When a typecheck-only module produces a source-equation
+interface and has no local `RULES`, coverage ticks (`Opt_Hpc`), or active
+late plugins:
+
+  1. `sourceTableTyCons` and `sourceCaseTables` in `GHC.Tc.Gen.SourceTable`
+     propose the same provisional `FinalCoreSourceTable` candidates as code
+     generation.
+  2. `hscDesugarAndSimplify` simplifies the desugared `ModGuts` and validates
+     all provisional tables through `validateSimpleSourceTables`.
+  3. On retained modules at `-O0` that do not enter `simplifyRetainedGentle`,
+     `validateRetainedSourceBodies` validates against `simpleOptNativeProgram`
+     (after any active Core plugin passes), matching `hscSimplifyWithPluginMutations`.
+  4. `finalizeNoCodeSourceTables` externalises fresh exported method workers in
+     the `NameCache` and runs `publishListFoldMethods` and `finalizeSimplifiedSourceTables`
+     before `hscSimpleIface`.
+-}
+
+-- | Run a post-desugaring 'TcM' action under an existing 'TcGblEnv'.
+runPostTcMaybe :: HscEnv -> HscSource -> Module -> TcGblEnv -> TcM a -> IO (Maybe a)
+runPostTcMaybe hsc_env hsc_src mod tc_env action =
+  fmap snd $ initTc NoTcMPlugins hsc_env hsc_src False mod (tcg_top_loc tc_env) (setGblEnv tc_env action)
+
+-- | Publish certified instance methods and source closures across simplified Core.
+finalizeSimplifiedSourceTables
+  :: HscEnv -> HscSource -> UniqSupply -> Bool -> Bool
+  -> Module -> CoreProgram -> CoreProgram -> TcGblEnv -> TypeEnv
+  -> IO (Maybe ([Id], [TyCon]), Maybe ([Id], [TyCon]))
+finalizeSimplifiedSourceTables hsc_env hsc_src after_tidy want_methods want_closures
+                               mod desugared_binds final_binds tc_env base_types = do
+  method_pub <- maybe (pure Nothing) (runPostTcMaybe hsc_env hsc_src mod tc_env)
+                  (guard want_methods *> publishCheckedMapMethods after_tidy tc_env final_binds)
+  let add_ents env (ids, fams) = env `plusTypeEnv` typeEnvFromEntities ids fams [] []
+      types_with_methods = maybe base_types (add_ents base_types) method_pub
+      tc_with_methods = case method_pub of
+        Just ents@(_, fams) -> tc_env { tcg_type_env = add_ents (tcg_type_env tc_env) ents
+                                      , tcg_tcs      = tcg_tcs tc_env ++ fams }
+        Nothing -> tc_env
+  closure_pub <- if not want_closures
+    then pure Nothing
+    else runPostTcMaybe hsc_env hsc_src mod tc_with_methods $
+           publishCheckedSourceClosures desugared_binds final_binds types_with_methods
+  pure (method_pub, closure_pub)
+
+-- | Finalize 'TcGblEnv' for a typecheck-only interface after simplification.
+-- See Note [Checked source equations in typecheck-only interfaces].
+finalizeNoCodeSourceTables
+  :: HscEnv -> HscSource -> Bool -> Bool -> ModGuts -> ModGuts -> TcGblEnv -> IO TcGblEnv
+finalizeNoCodeSourceTables hsc_env hsc_src want_methods want_closures original_guts opt_guts tc_env = do
+  (before_tidy, after_tidy) <- splitUniqSupply <$> mkSplitUniqSupply HscTag
+  let mod = mg_module opt_guts
+  (final_binds, fold_dfuns) <- if not want_methods
+    then pure (mg_binds opt_guts, [])
+    else do
+      let valid_guts = keepValidatedSourceMappers original_guts opt_guts
+          marked_binds = keepCheckedMapWorkers before_tidy tc_env $
+                           publishListFoldMethods mod (mg_binds valid_guts)
+      ext_binds <- externaliseExportedMethodWorkers (hsc_NC hsc_env) mod (mg_tcs valid_guts) marked_binds
+      let dfuns = [ b | b <- bindersOfBinds ext_binds, DFunId _ (Just _) <- [idDetails b] ]
+      pure (ext_binds, dfuns)
+  let exported_names = availsToNameSet (tcg_exports tc_env)
+      keep_exported (AnId v) = isExportedId v || idName v `elemNameSet` exported_names
+      keep_exported _        = True
+      base_types = filterNameEnv keep_exported $
+                     tcg_type_env tc_env `plusTypeEnv` typeEnvFromEntities fold_dfuns [] [] []
+  (method_pub, closure_pub) <-
+    finalizeSimplifiedSourceTables hsc_env hsc_src after_tidy want_methods want_closures
+      mod (mg_binds original_guts) final_binds tc_env base_types
+  let (pub_ids, pub_families) = fromMaybe ([], []) method_pub
+      pub_names = mkNameSet (map idName pub_ids)
+      extra_dfuns = filter (\b -> not (idName b `elemNameSet` pub_names)) fold_dfuns
+      (clos_ids, clos_families) = case closure_pub of
+        Just (ids, fams) | not (null ids) -> (ids, fams)
+        _                                 -> ([], [])
+      all_ids = extra_dfuns ++ pub_ids ++ clos_ids
+      all_families = pub_families ++ clos_families
+  pure $ if null all_ids && null all_families
+    then tc_env
+    else tc_env
+      { tcg_type_env = tcg_type_env tc_env `plusTypeEnv`
+                       typeEnvFromEntities all_ids all_families [] []
+      , tcg_tcs = tcg_tcs tc_env ++ all_families }
+
+-- | Assign deterministic external `Name`s to exported local method workers
+-- before `publishCheckedMapMethods` inspects a typecheck-only Core program.
+-- See Note [Checked source equations in typecheck-only interfaces].
+externaliseExportedMethodWorkers :: NameCache -> Module -> [TyCon] -> CoreProgram -> IO CoreProgram
+externaliseExportedMethodWorkers name_cache mod tcs binds
+  | null targets = pure binds
+  | otherwise = do
+      (_, env) <- foldM allocate (init_occ_env, emptyVarEnv) targets
+      let rename_bndr b = fromMaybe b (lookupVarEnv env b)
+          rename_expr (GHC.Core.Var v)   = GHC.Core.Var (rename_bndr v)
+          rename_expr (App f a)          = App (rename_expr f) (rename_expr a)
+          rename_expr (Lam b e)          = Lam b (rename_expr e)
+          rename_expr (Let bind body)    = Let (rename_bind bind) (rename_expr body)
+          rename_expr (Case s b ty alts) = Case (rename_expr s) b ty
+                                             [ Alt con bs (rename_expr r) | Alt con bs r <- alts ]
+          rename_expr (Cast e co)        = Cast (rename_expr e) co
+          rename_expr (Tick t e)         = Tick t (rename_expr e)
+          rename_expr (Pack s w e)       = Pack s w (rename_expr e)
+          rename_expr (Unpack w p pkg e) = Unpack w p (rename_expr pkg) (rename_expr e)
+          rename_expr e                  = e
+          rename_bind (NonRec b r)       = NonRec (rename_bndr b) (rename_expr r)
+          rename_bind (Rec pairs)        = Rec [ (rename_bndr b, rename_expr r) | (b, r) <- pairs ]
+      pure (map rename_bind binds)
+  where
+    binders = bindersOfBinds binds
+    targets = sortBy (\a b -> compare (getOccName a) (getOccName b))
+                [ b | b <- binders, isExportedId b, not (isExternalName (idName b)) ]
+    avoids  = [ getOccName name | b <- binders, let name = idName b, isExternalName name ]
+           ++ [ getOccName thing | tc <- tcs, thing <- implicitTyConThings tc ]
+    init_occ_env = initTidyOccEnv avoids
+    allocate (occ_env, env) b = do
+      let old_name = idName b
+          (occ_env', occ') = tidyOccName occ_env (nameOccName old_name)
+      ext_name <- allocateGlobalBinder name_cache mod occ' Nothing (nameSrcSpan old_name)
+      let !b' = setIdName b ext_name
+      pure (occ_env', extendVarEnv env b b')
+
 -- | Prepare a checked retained body for equation validation without a backend.
--- See Note [Final Core source equations] in GHC.Tc.Gen.SourceTable.
+-- See Note [Final Core source equations] in GHC.Tc.Gen.SourceTable and
+-- Note [Checked source equations in typecheck-only interfaces].
 validateRetainedSourceBodies :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO (Maybe ModGuts)
 validateRetainedSourceBodies mb_mut_ref env guts
   | supportsNativeGentle simplified = do
-      gentle <- simplifyRetainedGentle lint_env (guts { mg_binds = simplified })
+      gentle <- simplifyRetainedGentle lint_env result
       after_plugins <- if hasActiveCorePlugins lint_env
         then runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env gentle
         else pure gentle
       pure $ if supportsNativeGentle (mg_binds after_plugins)
              then Just after_plugins
              else Nothing
+  | hasScopedDictionaryProgram simplified
+  , not (supportsScopedDictionaryCore simplified && no_binder_rules)
+  = pure Nothing
+  | hasActiveCorePlugins lint_env = do
+      after_plugins <- runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env result
+      pure $ if not (hasScopedDictionaryProgram (mg_binds after_plugins))
+                || supportsScopedDictionaryCore (mg_binds after_plugins)
+             then Just after_plugins
+             else Nothing
+  | no_binder_rules = pure (Just result)
   | otherwise = pure Nothing
   where
     simplified = simpleOptNativeProgram (mg_binds guts)
+    result = guts { mg_binds = simplified }
+    no_binder_rules = all (null . idCoreRules) (bindersOfBinds simplified)
     lint_env = hscUpdateFlags
       (\df -> gopt_set (gopt_unset df Opt_EnableRewriteRules) Opt_DoCoreLinting) env
 
@@ -1171,6 +1295,28 @@ localEvaluatedTermUses tc_result = do
        , nameIsLocalOrFrom this_mod nm
        , isVarName nm ]
 
+-- | Run both post-simplification plugin-mutation and early-closure checks.
+checkSimplifiedSourceInvariants
+  :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts
+  -> TcGblEnv -> Bool -> [Name] -> NameSet -> [CoreRule] -> [CoreBind]
+  -> Maybe [CoreBind] -> Maybe [CoreBind] -> Hsc ()
+checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+                                no_plugins local_eval_terms mutated_names
+                                rules desugared_binds mb_simplified mb_tidy = do
+  checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
+    no_plugins local_eval_terms desugared_binds mutated_names
+  unless (null (earlyIndexedLookups tc_result)) $
+    runPostTcDiagnostics hsc_env hsc_src logger print_config diag_opts tc_result $
+      validateEarlyIndexedLookups no_plugins rules desugared_binds mb_simplified mb_tidy
+
+runPostTcDiagnostics
+  :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts -> TcGblEnv -> TcM () -> Hsc ()
+runPostTcDiagnostics hsc_env hsc_src logger print_config diag_opts tc_result action = do
+  (msgs, _) <- liftIO $
+    initTc NoTcMPlugins hsc_env hsc_src False (tcg_mod tc_result) (tcg_top_loc tc_result) $
+      setGblEnv tc_result action
+  liftIO $ printOrThrowDiagnostics logger print_config diag_opts (GhcTcRnMessage <$> msgs)
+
 -- | Reject same-module evaluated bindings when a 'latePlugin' is active or when
 -- a 'CoreDoPluginPass' mutated the binding or one of its local helpers.
 -- See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
@@ -1198,28 +1344,11 @@ checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts
                           in reachesMutated (extendNameSet seen n) (deps ++ ns)
                       | otherwise = reachesMutated (extendNameSet seen n) ns
                 in filter (reachesMutated emptyNameSet . (: [])) local_eval_terms
-      unless (null bad_owners) $ do
-        (msgs, _) <- liftIO $
-          initTc NoTcMPlugins hsc_env hsc_src False (tcg_mod tc_result) (tcg_top_loc tc_result) $
-            setGblEnv tc_result $ do
-              forM_ bad_owners $ \nm ->
-                setSrcSpan (nameSrcSpan nm) (addErr (TcRnNoSourceTable nm))
-              failIfErrsM
-        liftIO $ printOrThrowDiagnostics logger print_config diag_opts (GhcTcRnMessage <$> msgs)
-
--- | Confirm that early-staged indexed lookup tables match desugared and final Core.
-checkEarlyIndexedLookups :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts
-                         -> TcGblEnv -> Bool -> [CoreRule] -> [CoreBind]
-                         -> Maybe [CoreBind] -> Maybe [CoreBind] -> Hsc ()
-checkEarlyIndexedLookups hsc_env hsc_src logger print_config diag_opts tc_result
-                         no_plugins rules desugared_binds mb_simplified mb_tidy
-  | null (earlyIndexedLookups tc_result) = pure ()
-  | otherwise = do
-      (msgs, _) <- liftIO $
-        initTc NoTcMPlugins hsc_env hsc_src False (tcg_mod tc_result) (tcg_top_loc tc_result) $
-          setGblEnv tc_result $
-            validateEarlyIndexedLookups no_plugins rules desugared_binds mb_simplified mb_tidy
-      liftIO $ printOrThrowDiagnostics logger print_config diag_opts (GhcTcRnMessage <$> msgs)
+      unless (null bad_owners) $
+        runPostTcDiagnostics hsc_env hsc_src logger print_config diag_opts tc_result $ do
+          forM_ bad_owners $ \nm ->
+            setSrcSpan (nameSrcSpan nm) (addErr (TcRnNoSourceTable nm))
+          failIfErrsM
 
 -- | Collect rejected owners and families, including equations that refer to them.
 invalidSourceMappers :: ModGuts -> Maybe ModGuts -> (NameSet, NameSet)
@@ -2003,8 +2132,8 @@ binding. addImplicitBinds generates its constructor worker later. Classify
 that module before simplification and tidying, then use the checked native
 CorePrep path for its generated worker. Keep the late-plugin output guard.
 This adds no singleton or index evaluation. It carries the existing dependent
-application and constructor rules through the module driver; see the Agda
-provenance in docs/dependent-haskell/REFERENCES.md#agda-provenance.
+application and constructor rules through the module driver; see Weirich et al.
+(ICFP 2017) and docs/dependent-haskell/CORE.md.
 -}
 
 --------------------------------------------------------------
@@ -2113,8 +2242,7 @@ removes that evidence after checking its scope and runtime representations.
 Report an unsupported backend as Sorry. It is a feature restriction, not an
 internal compiler error. The checked module path is separate; see
 Note [Compiling native dependent modules]. Native unfoldings remain gated.
-See docs/dependent-haskell/CORE.md and the Agda provenance in
-docs/dependent-haskell/REFERENCES.md.
+See Weirich et al. (ICFP 2017) and docs/dependent-haskell/CORE.md.
 -}
 
 hscCompileCoreExpr :: HscEnv -> SrcSpan -> CoreExpr -> IO (ForeignHValue, [LinkableUsage], PkgsLoaded)
