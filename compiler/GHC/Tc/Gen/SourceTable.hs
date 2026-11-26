@@ -19,7 +19,7 @@ import GHC.Prelude
 import GHC.Builtin.KnownOccs (eqClassOpOcc, minusClassOpOcc)
 import GHC.Core.Class (Class, classAllSelIds, classMethods, className, classTyCon, classTyVars)
 import GHC.Builtin.Modules (gHC_CLASSES, gHC_INTERNAL_BASE, gHC_INTERNAL_NUM_INTEGER, gHC_TYPES, mkGhcInternalModule)
-import GHC.Builtin.WiredIn.Types (nilDataCon, consDataCon, boolTy, falseDataCon, trueDataCon, charTy, typeSymbolKind, stringTy, integerTy, integerTyConName, listTyCon, mkListTy, mkTupleTy, promotedTupleDataCon, tupleDataCon, tupleTyCon, unmatchableDataConTy)
+import GHC.Builtin.WiredIn.Types (nilDataCon, consDataCon, boolTy, falseDataCon, trueDataCon, charTy, integerTy, integerTyConName, listTyCon, mkListTy, mkTupleTy, promotedTupleDataCon, tupleDataCon, tupleTyCon, unmatchableDataConTy)
 import GHC.Core (CoreRule(..), isAutoRule, ruleActivation)
 import qualified GHC.Core as Core
 import GHC.Core.CharCase
@@ -78,7 +78,7 @@ import GHC.Tc.Types.Evidence (HsWrapper(..), TcEvBinds(..), EvBindsState(..), co
 import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTypeEnv)
 import GHC.Tc.Types (TcGblEnv(..), SourceRuleUses(..), tcVisibleOrphanMods)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
-import GHC.Tc.Utils.Env (tcLookupGlobal, tcLookupId, tcLookupIdMaybe, tcGetInstEnvs)
+import GHC.Tc.Utils.Env (tcLookupId, tcLookupIdMaybe, tcGetInstEnvs)
 import GHC.Tc.Utils.Monad (TcM, addErr, failWithTc, getEps, getGblEnv, getGlobalRdrEnv, getLclEnv,
                            getTcEvBindsMap, getTcEvBindsState,
                            checkNoErrs, getTopEnv, goptM, keepAlive, liftZonkM, newSysName, readTcRef, writeTcRef, newTcRef, setGblEnv,
@@ -96,9 +96,8 @@ import GHC.Types.Id (globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo
                      sourceMethodDFunClass)
 import GHC.Types.InlinePragma (ActivationX(ActiveAfter, ActiveBefore), PhaseNum,
                                isDefaultInlinePragma, isNeverActive, isOpaquePragma)
-import GHC.Types.Name (Name, OccName, isExternalName, mkSourceTableOcc, mkSourceFstOcc, mkSourceSndOcc, mkInstTyCoOcc, mkTcOcc,
+import GHC.Types.Name (Name, OccName, isExternalName, mkSourceTableOcc, mkSourceFstOcc, mkSourceSndOcc, mkInstTyCoOcc,
                        isFieldOcc, isVarOcc, mkTyVarOcc, mkVarOcc, nameModule_maybe, nameOccName, nameSrcSpan, occNameString, setOccNameSpace, sourceTableTermOcc, stableNameCmp, nameStableString, tvName, SourceProofRule, SourceProofArgs, SourceProofArg(..))
-import GHC.Core.Opt.Pipeline (pairObservationOcc, pairObservationType, scalarRecipeTableOcc)
 import GHC.Types.Name.Reader (GlobalRdrEnv, gre_imp, is_decl, is_isboot, isLocalGRE, lookupGRE_Name)
 import GHC.Types.Name.Env (NameEnv, delFromNameEnv, elemNameEnv, extendNameEnv, extendNameEnv_C, isEmptyNameEnv,
                            lookupNameEnv, mkNameEnv, nonDetNameEnvElts, plusNameEnv_C)
@@ -1213,7 +1212,7 @@ checkAndInstallSourceProofs env = do
           case worker of
             Just v
               | finalCoreMapperOwner v
-              , checked == spineStrictAppendSentinel -> do
+              , checked == [SourceProofUnknown] -> do
                   res <- checkedAppendFusionRules visible unloaded helper_rules v
                   pure (either Just (const Nothing) res)
               | finalCoreMapperOwner v ->
@@ -2043,83 +2042,9 @@ with no local or unloaded user rules. Re-check this condition after all module
 declarations and splices finish, and record the dependency in exported `IdInfo`.
 -}
 
--- | Sentinel distinguishing a spine-strict append proof dependency from an
--- unrestricted `Semigroup (<>)` method proof (`closedSourceProofArgs` never
--- emits an all-`SourceProofUnknown` non-empty list, and `sourceProofArgsApart`
--- returns `False` on `SourceProofUnknown` against every rule).
-spineStrictAppendSentinel :: SourceProofArgs
-spineStrictAppendSentinel = [SourceProofUnknown]
-
--- | Check that `table` is the exact two-branch tail-recursive list accumulator
--- `shunt [] ys = ys; shunt (x : xs) ys = shunt xs (x : ys)`.
-isExactShuntTable :: TyCon -> Bool
-isExactShuntTable table = isJust $ do
-    guard (isReverseWorkerTable table)
-    axiom <- closedFamilyTyConCoAxiom_maybe table
-    [b_nil, b_cons] <- pure (fromBranches (coAxiomBranches axiom))
-    [a1, pat_nil, ys1] <- pure (coAxBranchLHS b_nil)
-    tv_a1 <- getTyVar_maybe a1
-    tv_ys1 <- getTyVar_maybe ys1
-    guard (mkUniqSet (coAxBranchTyVars b_nil) == mkUniqSet [tv_a1, tv_ys1] &&
-           pat_nil `eqType` mkTyConApp (promoteDataCon nilDataCon) [a1] &&
-           coAxBranchRHS b_nil `eqType` ys1)
-    [a2, pat_cons, ys2] <- pure (coAxBranchLHS b_cons)
-    tv_a2 <- getTyVar_maybe a2
-    tv_ys2 <- getTyVar_maybe ys2
-    (cons_tc1, [c_a1, x_ty, xs_ty]) <- splitTyConApp_maybe pat_cons
-    tv_x <- getTyVar_maybe x_ty
-    tv_xs <- getTyVar_maybe xs_ty
-    guard (cons_tc1 == promoteDataCon consDataCon && c_a1 `eqType` a2 &&
-           sizeUniqSet (mkUniqSet [tv_a2, tv_x, tv_xs, tv_ys2]) == 4 &&
-           mkUniqSet (coAxBranchTyVars b_cons) == mkUniqSet [tv_a2, tv_x, tv_xs, tv_ys2])
-    let expected_rhs =
-          mkTyConApp table
-            [ a2
-            , xs_ty
-            , mkTyConApp (promoteDataCon consDataCon) [a2, x_ty, ys2] ]
-    guard (coAxBranchRHS b_cons `eqType` expected_rhs)
-
--- | Test whether `ty` has the exact spine-strict accumulator append shape
--- `foreach xs -> foreach ys -> foreach zs -> shunt (xs ++ ys) zs :~: shunt ys (shunt xs zs)`
--- (up to outer invisible `forall`s, binder permutation of `(xs, ys, zs)`, and `: ~ :` symmetry),
--- returning the element type and certified `shunt` table TyCon when matched.
-spineStrictAppendProofType :: TyCon -> Type -> Maybe (Type, TyCon)
-spineStrictAppendProofType append_tc ty = do
-    let (_, body0) = splitForAllForAllTyBinders ty
-    (b1, body1) <- dep_vis body0
-    (b2, body2) <- dep_vis body1
-    (b3, eq_ty) <- dep_vis body2
-    guard (sizeUniqSet (mkUniqSet [b1, b2, b3]) == 3)
-    TyConApp eq_tc [eq_kind, side1, side2] <- pure (coreFullView eq_ty)
-    let eq_mod = mkGhcInternalModule (fsLit "GHC.Internal.Data.Type.Equality")
-    guard (nameModule_maybe (tyConName eq_tc) == Just eq_mod &&
-           occNameString (nameOccName (tyConName eq_tc)) == ":~:")
-    (list_tc, [elem_ty]) <- splitTyConApp_maybe eq_kind
-    guard (list_tc == listTyCon &&
-           all (\b -> varType b `eqType` mkListTy elem_ty) [b1, b2, b3])
-    shunt_tc <- match_sides [b1, b2, b3] elem_ty side1 side2 <|>
-                match_sides [b1, b2, b3] elem_ty side2 side1
-    pure (elem_ty, shunt_tc)
-  where
-    dep_vis t = case coreFullView t of
-      DepFunTy DepFunVisible b rest -> Just (b, rest)
-      _ -> Nothing
-
-    match_sides bndrs elem_ty lhs rhs = do
-      TyConApp shunt1 [e1, app_node, TermVarTy zs] <- pure (coreFullView lhs)
-      guard (isExactShuntTable shunt1 && e1 `eqType` elem_ty)
-      TyConApp app_tc [e2, TermVarTy xs, TermVarTy ys] <- pure (coreFullView app_node)
-      guard (tyConName app_tc == tyConName append_tc && e2 `eqType` elem_ty)
-      TyConApp shunt2 [e3, TermVarTy ys', inner_shunt] <- pure (coreFullView rhs)
-      TyConApp shunt3 [e4, TermVarTy xs', TermVarTy zs'] <- pure (coreFullView inner_shunt)
-      guard (shunt1 == shunt2 && shunt1 == shunt3 &&
-             all (`eqType` elem_ty) [e3, e4] &&
-             xs == xs' && ys == ys' && zs == zs' &&
-             mkUniqSet [xs, ys, zs] == mkUniqSet bndrs)
-      pure shunt1
-
--- | Check if the current typechecking context is the RHS of a top-level binding
--- whose signature is a spine-strict append proof over `append_owner`.
+-- | Check whether the current context is the body of a top-level nominal proof
+-- whose `(++)` application is consumed by a certified tail-recursive list accumulator.
+-- See Note [Spine-strict accumulator proofs over list append].
 enclosingSpineStrictAppendProof :: Id -> TcM (Maybe (Name, Id))
 enclosingSpineStrictAppendProof append_owner = do
     append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
@@ -2136,41 +2061,61 @@ enclosingSpineStrictAppendProof append_owner = do
           case not_top_ids of
             outer_bndr : inner_bndrs
               | not has_exp_bndr
-              , Just (elem_ty, shunt_tc) <- spineStrictAppendProofType append_tc (varType outer_bndr)
-              , let allowed_local lb =
-                      varType lb `eqType` elem_ty || varType lb `eqType` mkListTy elem_ty
-              , all allowed_local inner_bndrs -> do
+              , all (not . hasNativeDependentExpr . Core.Type . varType) inner_bndrs
+              , Just consumer_tc <- spineStrictAppendSig append_tc (varType outer_bndr) -> do
                   proof_name <- lookupOrig (tcg_semantic_mod env) (nameOccName (idName outer_bndr))
-                  let valid_top_sig = case lookupNameEnv (getLclEnvTypeEnv lcl_env) proof_name of
+                  let valid_top = case lookupNameEnv (getLclEnvTypeEnv lcl_env) proof_name of
                         Just (ATcId { tct_id = top_id }) ->
                           isExternalName (idName top_id) &&
-                          isJust (spineStrictAppendProofType append_tc (varType top_id))
+                          isJust (spineStrictAppendSig append_tc (varType top_id))
                         _ -> False
-                      allowed_expr (HsVar {}) = True
-                      allowed_expr (ExplicitList _ es) = all (allowed_expr . unLoc) es
-                      allowed_expr (HsPar _ e) = allowed_expr (unLoc e)
-                      allowed_expr (HsApp _ f a) = allowed_expr (unLoc f) && allowed_expr (unLoc a)
-                      allowed_expr (OpApp _ l op r) =
-                        allowed_expr (unLoc l) && allowed_expr (unLoc op) && allowed_expr (unLoc r)
-                      allowed_expr (HsCase _ scrut _) = allowed_expr (unLoc scrut)
-                      allowed_expr _ = False
-                      disallowed_ctxt (PatMonoBindsCtxt {}) = True
-                      disallowed_ctxt (UserSigCtxt {}) = True
-                      disallowed_ctxt (TypeCtxt {}) = True
-                      disallowed_ctxt (KindCtxt {}) = True
-                      disallowed_ctxt (FunAppCtxt (FunAppCtxtTy _ _) _) = True
-                      disallowed_ctxt (FunAppCtxt (FunAppCtxtExpr f a) _) =
-                        not (allowed_expr f && allowed_expr a)
-                      disallowed_ctxt (ExprCtxt e) = not (allowed_expr e)
-                      disallowed_ctxt (MatchCtxt (FunRhs { mc_fun = L _ mc_nm })) =
-                        mc_nm /= proof_name && mc_nm /= idName outer_bndr
-                      disallowed_ctxt _ = False
-                  if valid_top_sig && not (any disallowed_ctxt (getLclEnvErrCtxt lcl_env))
-                    then do
-                      mb_shunt <- sourceTableOwner shunt_tc
-                      pure ((proof_name,) <$> mb_shunt)
+                      bad_expr ExprWithTySig{} = True
+                      bad_expr (HsPar _ e) = bad_expr (unLoc e)
+                      bad_expr (HsApp _ f a) = bad_expr (unLoc f) || bad_expr (unLoc a)
+                      bad_expr _ = False
+                      bad_ctxt PatMonoBindsCtxt{} = True
+                      bad_ctxt UserSigCtxt{} = True
+                      bad_ctxt TypeCtxt{} = True
+                      bad_ctxt KindCtxt{} = True
+                      bad_ctxt (FunAppCtxt (FunAppCtxtTy _ _) _) = True
+                      bad_ctxt (FunAppCtxt (FunAppCtxtExpr f a) _) = bad_expr f || bad_expr a
+                      bad_ctxt (ExprCtxt e) = bad_expr e
+                      bad_ctxt (MatchCtxt (FunRhs { mc_fun = L _ nm })) =
+                        nm /= proof_name && nm /= idName outer_bndr
+                      bad_ctxt _ = False
+                  if valid_top && not (any bad_ctxt (getLclEnvErrCtxt lcl_env))
+                    then fmap (proof_name,) <$> sourceTableOwner consumer_tc
                     else pure Nothing
             _ -> pure Nothing
+
+spineStrictAppendSig :: TyCon -> Type -> Maybe TyCon
+spineStrictAppendSig append_tc ty = do
+    let (_, body0) = splitForAllForAllTyBinders ty
+        peel_dep acc t = case coreFullView t of
+          DepFunTy DepFunVisible b rest -> peel_dep (b : acc) rest
+          other -> (reverse acc, other)
+        (bndrs, eq_ty) = peel_dep [] body0
+    guard (sizeUniqSet (mkUniqSet bndrs) == 3)
+    TyConApp eq_tc [_, side1, side2] <- pure (coreFullView eq_ty)
+    guard (occNameString (nameOccName (tyConName eq_tc)) == ":~:")
+    match_sides bndrs side1 side2 <|> match_sides bndrs side2 side1
+  where
+    is_acc_consumer tc = isJust $ do
+      guard (isReverseWorkerTable tc)
+      ax <- closedFamilyTyConCoAxiom_maybe tc
+      [b0, _] <- pure (fromBranches (coAxiomBranches ax))
+      [_, _, acc] <- pure (coAxBranchLHS b0)
+      guard (isJust (getTyVar_maybe acc) && coAxBranchRHS b0 `eqType` acc)
+    match_sides bndrs lhs rhs = do
+      TyConApp f1 [_, app_node, TermVarTy zs] <- pure (coreFullView lhs)
+      TyConApp app_tc [_, TermVarTy xs, TermVarTy ys] <- pure (coreFullView app_node)
+      TyConApp f2 [_, TermVarTy ys', inner] <- pure (coreFullView rhs)
+      TyConApp f3 [_, TermVarTy xs', TermVarTy zs'] <- pure (coreFullView inner)
+      guard (is_acc_consumer f1 && f1 == f2 && f1 == f3 &&
+             tyConName app_tc == tyConName append_tc &&
+             xs == xs' && ys == ys' && zs == zs' &&
+             mkUniqSet [xs, ys, zs] == mkUniqSet bndrs)
+      pure f1
 
 -- | Verify that `(++)` and every helper in its active rules carry only stock
 -- `ghc-internal` list/CString rules, with no local or unloaded user rules.
@@ -2296,7 +2241,7 @@ recordSourceUses ops = do
           mb_shunt <- enclosingSpineStrictAppendProof v
           case mb_shunt of
             Just (proof_owner, shunt_owner) -> do
-              let deps = [ (idName v, Nothing, True, spineStrictAppendSentinel)
+              let deps = [ (idName v, Nothing, True, [SourceProofUnknown])
                          , (idName shunt_owner, Nothing, False, []) ]
               updTcRef (tcg_source_rule_types env) $ \state ->
                 let !defs' = extendNameEnv_C (++) (sourceProofDefinitions state) proof_owner deps
@@ -2390,7 +2335,7 @@ checkSourceMethodUsesWithPending env = do
       defs <- sourceProofDefinitions <$> readTcRef (tcg_source_rule_types env)
       append_name <- lookupOrig gHC_INTERNAL_BASE (mkVarOcc "++")
       let has_spine_append =
-            any (any (\(n, _, m, c) -> n == append_name && m && c == spineStrictAppendSentinel))
+            any (any (\(n, _, m, c) -> n == append_name && m && c == [SourceProofUnknown]))
                 (nonDetNameEnvElts defs)
       when has_spine_append $ do
         mb_append <- lookupBootModuleIdMaybe gHC_INTERNAL_BASE (mkVarOcc "++")
@@ -6759,19 +6704,7 @@ checkedPairBuilder owner rhs = do
     case (input x, input y) of
       (Just v, Nothing) | not (complete_poly_pair y) -> copiedPair v CLeft right mkSourceSndOcc
       (Nothing, Just v) | not (complete_poly_pair x) -> copiedPair v CRight left mkSourceFstOcc
-      _ | Just _ <- pairObservationType (varType owner) -> do
-            key <- freshSysTyVar "observation" typeSymbolKind
-            let binders = mkAnonTyConBinders [key]
-            first <- emptyPairField name (mkObservedFieldOcc CRight) binders left
-            second <- emptyPairField name (mkObservedFieldOcc CLeft) binders right
-            pure (Nothing, [first, second])
-        | otherwise -> pure (Nothing, [])
-
--- | Reserve the unread field occurrence for the given projection.
-mkObservedFieldOcc :: LeftOrRight -> OccName -> OccName
-mkObservedFieldOcc side = mkTcOcc . (prefix ++) . occNameString
-  where
-    prefix = pickLR side ("Q2:", "Q1:")
+      _ -> pure (Nothing, [])
 
 -- | Allocate an opaque field family in the ordinary producer's interface.
 emptyPairField :: Name -> (OccName -> OccName) -> [TyConBinder] -> Kind -> TcM TyCon
@@ -6781,85 +6714,21 @@ emptyPairField owner occ binders result = do
     pure (mkFamilyTyCon name kind binders 0 result Nothing
             (ClosedTypeFamilyTyCon (CTF Nothing)) Nothing NotInjective)
 
--- | Find the exact private field of an ordinary imported pair producer.
+-- | Stub retained for cross-module call compatibility until unused exports are pruned.
 lookupObservedPairField :: LeftOrRight -> Id -> [Type] -> Kind -> TcM (Maybe TyCon)
-lookupObservedPairField side producer params expected
-  | Just mod <- nameModule_maybe owner
-  , not (isHoleModule mod)
-  , (installed, Nothing) <- getModuleInstantiation mod = do
-      env <- getGblEnv
-      let ordinary = case lookupGRE_Name (tcg_rdr_env env) owner of
-            Just gre -> any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
-            Nothing -> False
-          boot = gwib_isBoot <$> lookupInstalledModuleEnv
-                   (imp_boot_mods (tcg_imports env)) installed
-      if mod /= tcg_semantic_mod env && ordinary && boot /= Just IsBoot
-        then loadField mod
-        else pure Nothing
-  | otherwise = pure Nothing
-  where
-    owner = idName producer
+lookupObservedPairField _ _ _ _ = pure Nothing
 
-    loadField mod = do
-      iface <- loadInterfaceForName (text "staged pair producer") owner
-      let occ = mkObservedFieldOcc side (nameOccName owner)
-      case mi_hash_fn iface occ of
-        Nothing -> pure Nothing
-        Just _ -> do
-          name <- lookupOrig mod occ
-          thing <- tcLookupGlobal name
-          pure $ do
-            ATyCon field <- Just thing
-            guard (tyConName field == name)
-            ClosedTypeFamilyTyCon (CTF Nothing) <- famTyConFlav_maybe field
-            let (invisible, visible) = span isInvisibleTyConBinder (tyConBinders field)
-                parameters = [v | Bndr v _ <- invisible]
-                inst = substTyWith parameters params
-            [Bndr key AnonTCB] <- pure visible
-            guard (varType key `eqType` typeSymbolKind &&
-                   lengthIs params (length parameters) &&
-                   eqTypes (map typeKind params) (map (inst . varType) parameters) &&
-                   inst (tyConResKind field) `eqType` expected)
-            pure field
-
--- | Keep ordinary staging if simplification can change the producer call.
+-- | Stub retained for cross-module call compatibility until unused exports are pruned.
 canObservePairSource :: Id -> TcM Bool
-canObservePairSource owner
-  | Core.hasCoreUnfolding (idUnfolding owner) = pure False
-  | otherwise = isNothing <$> changedSourceUse [(owner, Nothing)]
+canObservePairSource _ = pure False
 
--- | Find the exact hidden observer emitted by the final Core pass.
+-- | Stub retained for cross-module call compatibility until unused exports are pruned.
 lookupPairObserver :: LeftOrRight -> Id -> Int -> TcM (Maybe Id)
-lookupPairObserver side producer arity
-  | Just mod <- nameModule_maybe owner =
-      lookupRecipeEntry False mod (pairObservationOcc (Just side) arity (nameOccName owner))
-  | otherwise = pure Nothing
-  where
-    owner = idName producer
+lookupPairObserver _ _ _ = pure Nothing
 
--- | Check both artifact forms of a scalar relay. An object-only replacement
--- can add the table or replace it with the old per-owner closure.
+-- | Stub retained for cross-module call compatibility until unused exports are pruned.
 lookupPairRecipe :: Module -> OccName -> Int -> TcM (Maybe Id, Maybe Id)
-lookupPairRecipe mod owner arity =
-    (,) <$> lookupRecipeEntry True mod scalarRecipeTableOcc
-        <*> lookupRecipeEntry True mod (pairObservationOcc Nothing arity owner)
-
--- | An optional artifact probe can use the reserved entry type when an old
--- interface has no declaration. This ID is used only in temporary bytecode
--- guarded by the loader's optional symbol check.
-lookupRecipeEntry :: Bool -> Module -> OccName -> TcM (Maybe Id)
-lookupRecipeEntry allow_missing mod occ = do
-    name <- lookupOrig mod occ
-    iface <- loadInterfaceForName (text "staged pair recipe") name
-    case mi_hash_fn iface occ of
-      Nothing
-        | allow_missing -> pure (Just (mkVanillaGlobal name stringTy))
-        | otherwise -> pure Nothing
-      Just _ -> do
-        thing <- tcLookupGlobal name
-        pure $ case thing of
-          AnId entry | idName entry == name, varType entry `eqType` stringTy -> Just entry
-          _ -> Nothing
+lookupPairRecipe _ _ _ = pure (Nothing, Nothing)
 
 -- | Identify the copied field and its zero-based position among the value inputs.
 sourcePairBuilderField :: TyCon -> Maybe (LeftOrRight, Int)
@@ -6897,17 +6766,6 @@ The module and position are part of the field's Name. Nothing reduces
 P2:make and no equality about e follows from its creation. Checking the
 constructor spine needs no unfolding from e. The symmetric equation uses
 P1:make. A case or a cast outside the pair does not have this shape.
-
-A direct producer with the executable observer ABI exports a private
-Q2 family when it has no copied field. The observer fills the demanded
-field using actual executable code. The unread field uses the exact
-producer declaration and an observation key.
-The key records the full semantic unit and module and an ordinal from that
-module's successful observations. Allocate after readback succeeds.
-Unlike compiler Uniques or source locations, this numbering is independent
-of the Unique supply and distinguishes multiple checks of a single span. Do not add a T equation merely to expose these private fields.
-This preserves ordinary name resolution when neither field is copied.
-See Note [The types Any and UnusedType] in GHC.Builtin.WiredIn.Types.
 
 The renamer keeps the ordinary producer in scope. A direct nominal
 projection can store both checked applications in an interface when
