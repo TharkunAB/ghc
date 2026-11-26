@@ -1,0 +1,3 @@
+NativeTypeCaseForallResult.hs:4:60: error: [GHC-97233]
+    A type case needs a supported position in a top-level type synonym, a closed type family equation RHS, a top-level value signature, or a constructor field.
+

@@ -1,0 +1,55 @@
+NativeClosedBatchTermRejects.hs:10:50: error: [GHC-83865]
+    • Couldn't match type ‘IndexedVec.Z’
+                     with ‘IndexedVec.S IndexedVec.Z’
+      Expected: Vec (IndexedVec.S IndexedVec.Z) Bool
+        Actual: Vec IndexedVec.Z Bool
+    • In the fourth argument of ‘MaskedRow’, namely ‘VNil’
+      In the expression: MaskedRow (SS SZ) (VCons 4 VNil) 'x' VNil
+      In an equation for ‘badLength’:
+          badLength = MaskedRow (SS SZ) (VCons 4 VNil) 'x' VNil
+
+NativeClosedBatchTermRejects.hs:14:32: error: [GHC-25897]
+    • Couldn't match type ‘cols’ with ‘rows’
+      Expected: Vec rows a
+        Actual: Vec cols a
+      ‘cols’ is a rigid type variable bound by
+        a pattern with constructor:
+          TableMargins :: forall (cols :: IndexedVec.N)
+                                 (rows :: IndexedVec.N) a.
+                          Vec rows Char
+                          -> Vec cols Char -> Vec rows a -> Vec cols a -> TableMargins a,
+        in an equation for ‘swapped’
+        at NativeClosedBatchTermRejects.hs:13:10-57
+      ‘rows’ is a rigid type variable bound by
+        a pattern with constructor:
+          TableMargins :: forall (cols :: IndexedVec.N)
+                                 (rows :: IndexedVec.N) a.
+                          Vec rows Char
+                          -> Vec cols Char -> Vec rows a -> Vec cols a -> TableMargins a,
+        in an equation for ‘swapped’
+        at NativeClosedBatchTermRejects.hs:13:10-57
+    • In the third argument of ‘TableMargins’, namely ‘colTotals’
+      In the expression: TableMargins rowKeys colKeys colTotals rowTotals
+      In an equation for ‘swapped’:
+          swapped (TableMargins rowKeys colKeys rowTotals colTotals)
+            = TableMargins rowKeys colKeys colTotals rowTotals
+    • Relevant bindings include
+        colTotals :: Vec cols a
+          (bound at NativeClosedBatchTermRejects.hs:13:49)
+        rowTotals :: Vec rows a
+          (bound at NativeClosedBatchTermRejects.hs:13:39)
+        colKeys :: Vec cols Char
+          (bound at NativeClosedBatchTermRejects.hs:13:31)
+        rowKeys :: Vec rows Char
+          (bound at NativeClosedBatchTermRejects.hs:13:23)
+
+NativeClosedBatchTermRejects.hs:18:32: error: [GHC-83865]
+    • Couldn't match type ‘IndexedVec.Z’
+                     with ‘IndexedVec.S IndexedVec.Z’
+      Expected: Vec (IndexedVec.S IndexedVec.Z) Int
+        Actual: Vec IndexedVec.Z Int
+    • In the second argument of ‘VCons’, namely ‘VNil’
+      In the first argument of ‘VCons’, namely ‘(VCons 1 VNil)’
+      In the third argument of ‘Table’, namely
+        ‘(VCons (VCons 1 VNil) VNil)’
+

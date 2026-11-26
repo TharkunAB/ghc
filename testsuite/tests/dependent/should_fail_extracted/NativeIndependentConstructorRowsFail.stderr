@@ -1,0 +1,32 @@
+NativeIndependentConstructorRowsFail.hs:10:20: error: [GHC-83865]
+    • Couldn't match type ‘I.decorate (I.Atom x2) x2 v2’ with ‘v2’
+      Expected: I.decorate (I.Atom x2) x2 v2 :~: v2
+        Actual: I.decorate (I.Atom x2) x2 v2
+                :~: I.decorate (I.Atom x2) x2 v2
+    • In the expression: Refl
+      In an equation for ‘unknownIndep’: unknownIndep _ _ = Refl
+
+NativeIndependentConstructorRowsFail.hs:14:22: error: [GHC-83865]
+    • Couldn't match type ‘NativeIndependentConstructorRowsGuarded.#guard:decorate
+                             (G.matches x1 x1) (G.Atom x1) v1’
+                     with ‘v1’
+      Expected: G.decorate (G.Atom x1) x1 v1 :~: v1
+        Actual: G.decorate (G.Atom x1) x1 v1
+                :~: G.decorate (G.Atom x1) x1 v1
+    • In the expression: Refl
+      In an equation for ‘unknownGuarded’: unknownGuarded _ _ = Refl
+
+NativeIndependentConstructorRowsFail.hs:18:25: error: [GHC-05617]
+    • Could not deduce ‘NativeIndependentConstructorRowsGuarded.#guard:decorate
+                          (G.matches x l) (G.Atom x) v
+                        ~ v’
+      from the context: True ~ G.matches l x
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘wrongGuard’
+        at NativeIndependentConstructorRowsFail.hs:18:18-21
+      Expected: G.decorate (G.Atom x) l v :~: v
+        Actual: G.decorate (G.Atom x) l v :~: G.decorate (G.Atom x) l v
+    • In the expression: Refl
+      In an equation for ‘wrongGuard’: wrongGuard _ _ _ Refl = Refl
+

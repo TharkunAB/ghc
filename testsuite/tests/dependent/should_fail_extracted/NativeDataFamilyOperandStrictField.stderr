@@ -1,0 +1,7 @@
+NativeDataFamilyOperandStrictField.hs:9:22: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: keepStrict (StrictTuple True)
+      In an equation for ‘strict’: strict = keepStrict (StrictTuple True)
+

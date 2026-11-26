@@ -1,0 +1,6 @@
+NativeConstrainedFamExplicitPrefix.hs:8:8: error: [GHC-90647]
+    • Constrained associated type family ‘Explicit’
+      Supply ‘e’ to determine the instance of ‘Output’.
+    • In the type signature:
+        bad :: Proxy c -> Proxy (Hold (Explicit (Key Bool)))
+

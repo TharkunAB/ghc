@@ -1,0 +1,113 @@
+NativeRetainedPackageDepBad.hs:13:39: error: [GHC-83865]
+    • Couldn't match type: plus m1 n4
+                     with: S (plus m1 n4)
+      Expected: S (plus m1 n4) :~: plus m1 n4
+        Actual: S (plus m1 n4) :~: S (plus m1 n4)
+    • In the second argument of ‘Pair’, namely ‘Refl’
+      In the expression: Pair (S (plus m n)) Refl
+      In an equation for ‘wrongInline’:
+          wrongInline m n = Pair (S (plus m n)) Refl
+
+NativeRetainedPackageDepBad.hs:21:17: error: [GHC-83865]
+    • Couldn't match type: foreach (x :: IO Int) -> Proxy x -> Proxy x
+                     with: foreach (x :: IO Int) -> Proxy x -> r
+      Expected: Body (IO Int) r
+        Actual: Indexed (IO Int)
+    • In the first argument of ‘takeBody’, namely ‘indexed’
+      In the expression: takeBody indexed
+      In an equation for ‘leak’: leak = takeBody indexed
+    • Relevant bindings include
+        leak :: Proxy r (bound at NativeRetainedPackageDepBad.hs:21:1)
+
+NativeRetainedPackageDepBad.hs:24:34: error: [GHC-05617]
+    • Could not deduce ‘_2 ~ S _2’
+      from the context: p ~ PackVec _2 xs
+        bound by a pattern with constructor:
+                   PackVec :: forall a. foreach (n :: Nat) -> Vec a n -> PackedVec a,
+                 in an equation for ‘wrongProjection’
+        at NativeRetainedPackageDepBad.hs:24:1-35
+      Expected: Vec a (S (Length (PackVec _2 xs1)))
+        Actual: Vec a _2
+    • In the expression: xs
+      In an equation for ‘wrongProjection’:
+          wrongProjection (PackVec _ xs) = xs
+    • Relevant bindings include
+        xs :: Vec a _2 (bound at NativeRetainedPackageDepBad.hs:24:28)
+
+NativeRetainedPackageDepBad.hs:31:54: error: [GHC-83865]
+    • Couldn't match type ‘m’ with ‘n3’
+      Expected: Vec Int n3
+        Actual: Vec Int m
+    • In the expression: keepPkg (PackVec n xs)
+      In the first argument of ‘consumePkg’, namely
+        ‘(keepPkg (PackVec n xs))’
+      In the expression: consumePkg (keepPkg (PackVec n xs))
+    • Relevant bindings include
+        xs :: Vec Int m (bound at NativeRetainedPackageDepBad.hs:31:18)
+
+NativeRetainedPackageDepBad.hs:31:54: error: [GHC-83865]
+    • Couldn't match type ‘m’ with ‘n3’
+      Expected: Vec Int n3
+        Actual: Vec Int m
+    • In the second argument of ‘PackVec’, namely ‘xs’
+      In the first argument of ‘keepPkg’, namely ‘(PackVec n xs)’
+      In the expression: keepPkg (PackVec n xs)
+    • Relevant bindings include
+        xs :: Vec Int m (bound at NativeRetainedPackageDepBad.hs:31:18)
+
+NativeRetainedPackageDepBad.hs:34:38: error: [GHC-83865]
+    • Couldn't match type ‘_1’ with ‘Z’
+      Expected: p Z
+        Actual: p _1
+    • In the expression: value
+      In an equation for ‘wrongFamilyResult’:
+          wrongFamilyResult (Retain _ value) = value
+    • Relevant bindings include
+        value :: p _1 (bound at NativeRetainedPackageDepBad.hs:34:29)
+
+NativeRetainedPackageDepBad.hs:37:19: error: [GHC-83865]
+    • Couldn't match type ‘xs’ with ‘ys2’
+      Expected: xs :~: ys2
+        Actual: xs :~: xs
+    • In the expression: Refl
+      In an equation for ‘wrongVector’: wrongVector _ _ = Refl
+    • Relevant bindings include
+        wrongVector :: foreach (xs :: Vec a n)
+                       -> foreach (ys :: Vec a n) -> xs :~: ys
+          (bound at NativeRetainedPackageDepBad.hs:37:1)
+
+NativeRetainedPackageDepBad.hs:42:20: error: [GHC-83865]
+    • Couldn't match type ‘ys1’ with ‘VNil’
+      Expected: ys1 :~: VNil
+        Actual: ys1 :~: ys1
+    • In the expression: Refl
+      In the expression: (Refl, Refl)
+      In a case alternative: VNil -> (Refl, Refl)
+
+NativeRetainedPackageDepBad.hs:46:21: error: [GHC-83865]
+    • Couldn't match type ‘VNil’ with ‘ys’
+      Expected: VNil :~~: ys
+        Actual: VNil :~~: VNil
+    • In the expression: HRefl
+      In an equation for ‘crossed’: crossed _ _ HRefl = HRefl
+    • Relevant bindings include
+        crossed :: foreach (xs :: Vec Bool n)
+                   -> foreach (ys :: Vec Bool n) -> (xs :~~: VNil) -> VNil :~~: ys
+          (bound at NativeRetainedPackageDepBad.hs:46:1)
+
+NativeRetainedPackageDepBad.hs:57:38: error: [GHC-83865]
+    • Couldn't match type ‘_’ with ‘other’
+      Expected: Carrier other
+        Actual: Carrier _
+    • In the expression: pay
+      In a case alternative: HRefl -> pay
+      In the expression: case back of HRefl -> pay
+    • Relevant bindings include
+        pay :: Carrier _ (bound at NativeRetainedPackageDepBad.hs:50:41)
+        back :: _ :~~: _3 (bound at NativeRetainedPackageDepBad.hs:50:32)
+        branch :: _4 :~~: _ (bound at NativeRetainedPackageDepBad.hs:50:18)
+        p3 :: _ :~~: _5 (bound at NativeRetainedPackageDepBad.hs:50:14)
+        wrongLinked :: foreach (other :: Vec Bool Z)
+                       -> Linked n p q r -> Carrier other
+          (bound at NativeRetainedPackageDepBad.hs:49:1)
+

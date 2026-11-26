@@ -1,0 +1,189 @@
+NativeNamedSiblingTcRejects.hs:13:45: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: replicateNative (counted p) '-'
+      In the first argument of ‘toList’, namely
+        ‘(replicateNative (counted p) '-')’
+      In the expression: toList (replicateNative (counted p) '-')
+
+NativeNamedSiblingTcRejects.hs:16:69: error: [GHC-83605]
+    • No checked source equations are available for ‘storedLength’ in this retained argument.
+    • In the expression: replicateNative (storedLength p) '-'
+      In the first argument of ‘toList’, namely
+        ‘(replicateNative (storedLength p) '-')’
+      In the expression: toList (replicateNative (storedLength p) '-')
+
+NativeNamedSiblingTcRejects.hs:24:24: error: [GHC-83865]
+    • Couldn't match type: PC.storedLength q3
+                     with: PC.storedLength p4
+      Expected: Vec a (PC.storedLength p4)
+        Actual: Vec a (PC.storedLength q3)
+      Note: GHC cannot determine the arguments of the function ‘PC.storedLength’ from its result.
+    • In the expression: PC.cells q
+      In an equation for ‘badParamReceiver’:
+          badParamReceiver _ q = PC.cells q
+    • Relevant bindings include
+        q :: PC.Columns a (bound at NativeNamedSiblingTcRejects.hs:24:20)
+        badParamReceiver :: foreach (p :: PC.Columns a)
+                            -> PC.Columns a -> Vec a (PC.storedLength p)
+          (bound at NativeNamedSiblingTcRejects.hs:24:1)
+
+NativeNamedSiblingTcRejects.hs:27:18: error: [GHC-83605]
+    • Constructor ‘NamedColumns’ requires witness field ‘storedLength’.
+    • In the expression:
+        NamedColumns {namedLetters = VNil, namedFlags = VNil}
+      In an equation for ‘missingWitness’:
+          missingWitness
+            = NamedColumns {namedLetters = VNil, namedFlags = VNil}
+
+NativeNamedSiblingTcRejects.hs:32:17: error: [GHC-95909]
+    • Constructor ‘OrdinaryStrict’ does not have the required strict field(s):
+        strictField :: Bool
+    • In the expression: OrdinaryStrict {lazyField = 0}
+      In an equation for ‘missingStrict’:
+          missingStrict = OrdinaryStrict {lazyField = 0}
+
+NativeNamedSiblingTcRejects.hs:35:69: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Char (S Z)
+        Actual: Vec Char Z
+    • In the expression: VNil
+      In the expression:
+        NamedColumns
+          {storedLength = S Z, namedLetters = VNil, namedFlags = VNil}
+      In an equation for ‘badConstruct’:
+          badConstruct
+            = NamedColumns
+                {storedLength = S Z, namedLetters = VNil, namedFlags = VNil}
+
+NativeNamedSiblingTcRejects.hs:35:88: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Bool (S Z)
+        Actual: Vec Bool Z
+    • In the expression: VNil
+      In the expression:
+        NamedColumns
+          {storedLength = S Z, namedLetters = VNil, namedFlags = VNil}
+      In an equation for ‘badConstruct’:
+          badConstruct
+            = NamedColumns
+                {storedLength = S Z, namedLetters = VNil, namedFlags = VNil}
+
+NativeNamedSiblingTcRejects.hs:38:21: error: [GHC-83865]
+    • Couldn't match type ‘storedLength p3’ with ‘Z’
+      Expected: Vec Bool Z
+        Actual: Vec Bool (storedLength p3)
+    • In the expression: p.namedFlags
+      In an equation for ‘badDotSelection’:
+          badDotSelection p = p.namedFlags
+
+NativeNamedSiblingTcRejects.hs:41:30: error: [GHC-83605]
+    • Updating witness field ‘storedLength’ of constructor
+      ‘NamedColumns’
+        requires replacement for fields ‘namedLetters’, ‘namedFlags’.
+    • In the expression: p {storedLength = Z}
+      In an equation for ‘badUpdateOnlyWitness’:
+          badUpdateOnlyWitness p = p {storedLength = Z}
+
+NativeNamedSiblingTcRejects.hs:46:12: error: [GHC-83605]
+    • Updating witness field ‘storedLength’ of constructor
+      ‘NamedColumns’
+        requires replacement for field ‘namedLetters’.
+    • In the expression: old {storedLength = Z, namedFlags = VNil}
+      In the expression:
+        let old = NamedColumns (S Z) (VCons 'x' VNil) (VCons True VNil)
+        in old {storedLength = Z, namedFlags = VNil}
+      In an equation for ‘missingChangedPayload’:
+          missingChangedPayload
+            = let old = NamedColumns (S Z) (VCons ...) (VCons ...)
+              in old {storedLength = Z, namedFlags = VNil}
+
+NativeNamedSiblingTcRejects.hs:49:24: error: [GHC-83605]
+    • Updating witness field ‘storedLength’ of constructor
+      ‘NamedColumns’
+        requires replacement for field ‘namedLetters’.
+    • In the expression:
+        p {storedLength = storedLength q, namedFlags = namedFlags q}
+      In an equation for ‘otherWitness’:
+          otherWitness p q
+            = p {storedLength = storedLength q, namedFlags = namedFlags q}
+
+NativeNamedSiblingTcRejects.hs:54:10: error: [GHC-83605]
+    • Updating witness field ‘storedLength’ of constructor
+      ‘NamedColumns’
+        requires replacement for field ‘namedLetters’.
+    • In the expression:
+        p {storedLength = storedLength p, namedFlags = VNil}
+      In the expression:
+        let storedLength _ = Z
+        in p {storedLength = storedLength p, namedFlags = VNil}
+      In an equation for ‘shadowWitness’:
+          shadowWitness p
+            = let storedLength _ = Z
+              in p {storedLength = storedLength p, namedFlags = VNil}
+
+NativeNamedSiblingTcRejects.hs:57:61: error: [GHC-83865]
+    • Couldn't match type ‘S Z’ with ‘Z’
+      Expected: Vec Char Z
+        Actual: Vec Char (S Z)
+    • In the expression: VCons 'x' VNil
+      In a record update at fields ‘storedLength’, ‘namedLetters’,
+                                   ‘namedFlags’,
+      with type constructor ‘NamedColumns’
+      and data constructor ‘NamedColumns’.
+      In the expression:
+        p {storedLength = Z, namedLetters = VCons 'x' VNil,
+           namedFlags = VNil}
+
+NativeNamedSiblingTcRejects.hs:60:41: error: [GHC-83865]
+    • Couldn't match type: storedLength q2
+                     with: storedLength p2
+      Expected: Vec Bool (storedLength p2)
+        Actual: Vec Bool (storedLength q2)
+      Note: GHC cannot determine the arguments of the function ‘storedLength’ from its result.
+    • In the expression: namedFlags q
+      In a record update at field ‘namedFlags’,
+      with type constructor ‘NamedColumns’
+      and data constructor ‘NamedColumns’.
+      In the expression: p {namedFlags = namedFlags q}
+
+NativeNamedSiblingTcRejects.hs:63:72: error: [GHC-83865]
+    • Couldn't match type: storedLength q1
+                     with: storedLength p1
+      Expected: Vec Bool (storedLength p1)
+        Actual: Vec Bool (storedLength q1)
+      Note: GHC cannot determine the arguments of the function ‘storedLength’ from its result.
+    • In the expression: namedFlags q
+      In a record update at fields ‘namedLetters’, ‘namedFlags’,
+      with type constructor ‘NamedColumns’
+      and data constructor ‘NamedColumns’.
+      In the expression:
+        p {namedLetters = namedLetters p, namedFlags = namedFlags q}
+
+NativeNamedSiblingTcRejects.hs:66:29: error: [GHC-83865]
+    • Couldn't match type ‘n0’ with ‘storedLength p’
+      Expected: Vec Char n0
+        Actual: Vec Char (storedLength p)
+      ‘n0’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeNamedSiblingTcRejects.hs:66:22-59
+    • In the first argument of ‘zipVec’, namely ‘(namedLetters p)’
+      In the expression: zipVec (namedLetters p) (namedFlags q)
+      In the first argument of ‘toList’, namely
+        ‘(zipVec (namedLetters p) (namedFlags q))’
+
+NativeNamedSiblingTcRejects.hs:66:46: error: [GHC-83865]
+    • Couldn't match type ‘n0’ with ‘storedLength q’
+      Expected: Vec Bool n0
+        Actual: Vec Bool (storedLength q)
+      ‘n0’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeNamedSiblingTcRejects.hs:66:22-59
+    • In the second argument of ‘zipVec’, namely ‘(namedFlags q)’
+      In the expression: zipVec (namedLetters p) (namedFlags q)
+      In the first argument of ‘toList’, namely
+        ‘(zipVec (namedLetters p) (namedFlags q))’
+

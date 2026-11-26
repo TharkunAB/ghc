@@ -1,0 +1,6 @@
+NativeClosedBatchNestedField.hs:9:23: error: [GHC-70565]
+    • Cannot evaluate ‘W.nested’ in a type.
+        Cannot reify field 2 of ‘W.Nested’. The field type depends on multiple hidden indices (rows, cols). Its constructors must determine one index. A field of the enclosing constructor must determine each remaining index.
+    • In the first argument of ‘Proxy’, namely ‘(W.nested 4)’
+      In the type signature: nestedField :: Proxy (W.nested 4)
+

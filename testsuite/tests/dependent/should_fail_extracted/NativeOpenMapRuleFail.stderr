@@ -1,0 +1,5 @@
+NativeOpenMapRuleFail.hs:12:9: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘C.flipBit’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘proof’: proof = Refl
+

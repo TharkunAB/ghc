@@ -1,0 +1,7 @@
+NativeDataFamilyDisabledNewtype.hs:6:19: error: [GHC-64578]
+    • Data constructor ‘MkWrap’ cannot be used here
+        (it comes from a data family instance)
+    • In the first argument of ‘Proxy’, namely ‘('MkWrap 'True)’
+      In the type ‘Proxy ('MkWrap 'True)’
+      In the type synonym declaration for ‘Bad’
+

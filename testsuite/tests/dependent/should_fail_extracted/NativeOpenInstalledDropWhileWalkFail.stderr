@@ -1,0 +1,6 @@
+NativeOpenInstalledDropWhileWalkFail.hs:9:34: error: [GHC-70565]
+    • Cannot evaluate ‘BW.otherHead’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘BW.otherHead p xs’
+      In the type synonym declaration for ‘BadHead’
+

@@ -1,0 +1,38 @@
+NativeUnsaturatedMatchAndSynRejects.hs:13:25: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘Bool %M -> Bool’,
+        but ‘Select 'True’ has kind ‘Bool
+                                     %GHC.Internal.Types.Unmatchable -> Bool’
+    • In the first argument of ‘ApplyM’, namely ‘(Select 'True)’
+      In the type ‘ApplyM (Select 'True)’
+      In the type synonym declaration for ‘BadMatch’
+
+NativeUnsaturatedMatchAndSynRejects.hs:15:44: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘Bool %M -> Bool’,
+        but ‘Select 'True’ has kind ‘Bool
+                                     %GHC.Internal.Types.Unmatchable -> Bool’
+    • In the fourth argument of ‘NamedMap’, namely ‘(Select 'True)’
+      In the type ‘NamedMap @Bool @M @Bool (Select 'True) '[ 'True]’
+      In the type synonym declaration for ‘BadDirectM’
+
+NativeUnsaturatedMatchAndSynRejects.hs:17:31: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘Bool %GHC.Internal.Types.Matchable -> Bool’,
+        but ‘Callback 'True’ has kind ‘Bool %GHC.Internal.Types.U -> Bool’
+    • In the first argument of ‘WrittenMap’, namely ‘(Callback 'True)’
+      In the type ‘WrittenMap (Callback 'True) '[ 'True]’
+      In the type synonym declaration for ‘BadWritten’
+
+NativeUnsaturatedMatchAndSynRejects.hs:23:3: error: [GHC-05175]
+    • Type family equation violates the family's injectivity annotation.
+      Type variable ‘a’ cannot be inferred from the right-hand side.
+      In the type family equation:
+        Claim a = Slot (Drop a)
+          -- Defined at NativeUnsaturatedMatchAndSynRejects.hs:23:3
+    • In the equations for closed type family ‘Claim’
+      In the type family declaration for ‘Claim’
+

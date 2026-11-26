@@ -1,0 +1,24 @@
+NativeRetainedPackageFamBad.hs:8:29: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘Nat %GHC.Internal.Types.Matchable -> *’,
+        but ‘Calculate’ has kind ‘Nat %GHC.Internal.Types.Unmatchable -> *’
+    • In the first argument of ‘Retained’, namely ‘Calculate’
+      In the type ‘Retained Calculate’
+      In the type synonym declaration for ‘WrongFamily’
+
+NativeRetainedPackageFamBad.hs:13:19: error: [GHC-83605]
+    • This retained constructor has no supported promoted field telescope.
+      Promotion requires one witness followed by fields whose final type argument is that witness.
+    • In the first argument of ‘ShiftWitness’, namely ‘('Shift n _)’
+      In the type family declaration for ‘ShiftWitness’
+
+NativeRetainedPackageFamBad.hs:15:30: error: [GHC-83865]
+    • Couldn't match kind ‘S Z’ with ‘Z’
+      Expected kind ‘Vec Bool Z’,
+        but ‘'VCons 'True 'VNil’ has kind ‘Vec Bool (S Z)’
+    • In the second argument of ‘'PackVec’, namely
+        ‘('VCons 'True 'VNil)’
+      In the type ‘'PackVec 'Z ('VCons 'True 'VNil)’
+      In the type synonym declaration for ‘WrongIdx’
+

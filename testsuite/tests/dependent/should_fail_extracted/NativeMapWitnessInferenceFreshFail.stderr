@@ -1,0 +1,6 @@
+NativeMapWitnessInferenceFreshFail.hs:8:9: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘map’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression: Refl
+      In an equation for ‘fresh’: fresh = Refl
+

@@ -1,0 +1,23 @@
+NativeConstrainedSumMissingDomain.hs:9:48: error: [GHC-39999]
+    • No instance for ‘Allowed Int’ arising from a use of ‘Forwarded’
+    • In the pattern: Pair tag _
+      In a case alternative: Pair tag _ -> tag
+      In the expression:
+        case make (Proxy :: Proxy Int) of Pair tag _ -> tag
+
+NativeConstrainedSumMissingDomain.hs:15:60: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      forall a (p :: a %GHC.Internal.Types.U -> *).
+      foreach (x :: a) -> p x -> Sigma a p
+    • In the second argument of ‘readForwarded’, namely
+        ‘(Pair True (error "missing constructor domain"))’
+      In the expression:
+        readForwarded
+          (Proxy :: Proxy Int)
+          (Pair True (error "missing constructor domain"))
+      In an equation for ‘badConstructorDomain’:
+          badConstructorDomain
+            = readForwarded
+                (Proxy :: Proxy Int)
+                (Pair True (error "missing constructor domain"))
+

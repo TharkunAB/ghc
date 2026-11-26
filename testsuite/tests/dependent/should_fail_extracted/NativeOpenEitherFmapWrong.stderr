@@ -1,0 +1,12 @@
+NativeOpenEitherFmapWrong.hs:12:18: error: [GHC-83865]
+    • Couldn't match type: Left False
+                     with: Right (f x)
+      Expected: MappedEither f (Right x) :~: Left False
+        Actual: Left False :~: Left False
+    • In the expression: Refl
+      In an equation for ‘wrongRight’: wrongRight _ _ = Refl
+    • Relevant bindings include
+        wrongRight :: Proxy f
+                      -> Proxy x -> MappedEither f (Right x) :~: Left False
+          (bound at NativeOpenEitherFmapWrong.hs:12:1)
+

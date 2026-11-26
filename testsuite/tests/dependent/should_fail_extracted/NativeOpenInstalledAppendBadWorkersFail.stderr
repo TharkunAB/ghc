@@ -1,0 +1,12 @@
+NativeOpenInstalledAppendBadWorkersFail.hs:8:23: error: [GHC-70566]
+    • Cannot reduce the open call to ‘BW.forceRight’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘BW.forceRight xs ys’
+      In the type synonym declaration for ‘BadRight’
+
+NativeOpenInstalledAppendBadWorkersFail.hs:11:23: error: [GHC-70566]
+    • Cannot reduce the open call to ‘BW.ruledAppend’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘BW.ruledAppend xs ys’
+      In the type synonym declaration for ‘BadRuled’
+

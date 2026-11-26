@@ -1,0 +1,29 @@
+NativeTypeLambdaEtaTermination.hs:11:18: error: [GHC-22979]
+    • The type-family application ‘Apply f cell’
+        is no smaller than
+        the LHS of the family instance ‘NativeTypeLambdaEtaTermination.$lambda:Applied:0
+                                          f cell’
+    • In a branch of the type lambda in ‘Applied’
+      In the type lambda in ‘Applied’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+
+NativeTypeLambdaEtaTermination.hs:13:20: error: [GHC-22979]
+    • The type-family application ‘Stamp tag cell’
+        is no smaller than
+        the LHS of the family instance ‘NativeTypeLambdaEtaTermination.$lambda:Stamped:0
+                                          tag cell’
+    • In a branch of the type lambda in ‘Stamped’
+      In the type lambda in ‘Stamped’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+
+NativeTypeLambdaEtaTermination.hs:15:3: error: [GHC-22979]
+    • The type-family application ‘NativeTypeLambdaEtaTermination.$lambda:Stamped:0
+                                     tag cell’
+        is no smaller than the LHS of the family instance ‘Stamp tag cell’
+    • In the equations for closed type family ‘Stamp’
+      In the type family declaration for ‘Stamp’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+

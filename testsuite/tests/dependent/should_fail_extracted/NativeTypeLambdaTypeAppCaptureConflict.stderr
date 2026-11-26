@@ -1,0 +1,42 @@
+NativeTypeLambdaTypeAppCaptureConflict.hs:11:70: error: [GHC-25897]
+    • Expected a type, but ‘err’ has kind ‘k’
+      ‘k’ is a rigid type variable bound by
+        the type signature for:
+          badSpliceCapture :: forall {k} (err :: k).
+                              Proxy err -> Fields [Either String Int, Either String Bool]
+        at NativeTypeLambdaTypeAppCaptureConflict.hs:10:1-92
+    • When checking the type lambda in a visible type argument,
+        at ‘err’
+      In the type ‘($([t| \tag cell -> Either tag cell |]) err)’
+      In the expression:
+        rowFor
+          @($([t| \tag cell -> Either tag cell |]) err) Proxy (Right 42)
+          (Right True)
+    • Relevant bindings include
+        badSpliceCapture :: Proxy err
+                            -> Fields [Either String Int, Either String Bool]
+          (bound at NativeTypeLambdaTypeAppCaptureConflict.hs:11:1)
+
+NativeTypeLambdaTypeAppCaptureConflict.hs:15:28: error: [GHC-25897]
+    • Couldn't match type ‘err’ with ‘String’
+      Expected: Fields [Either String Int, Either String Bool]
+        Actual: Fields
+                  [(type lambda in a visible type argument) err Int,
+                   (type lambda in a visible type argument) err Bool]
+      ‘err’ is a rigid type variable bound by
+        the type signature for:
+          badCapturedConflict :: forall err cell.
+                                 Proxy err
+                                 -> Proxy cell -> Fields [Either String Int, Either String Bool]
+        at NativeTypeLambdaTypeAppCaptureConflict.hs:(13,1)-(14,76)
+    • In the expression:
+        rowFor @(\cell -> Either err cell) Proxy (Right 42) (Right True)
+      In an equation for ‘badCapturedConflict’:
+          badCapturedConflict _ _
+            = (rowFor
+                 @(\cell -> Either err cell) Proxy (Right 42) (Right True))
+    • Relevant bindings include
+        badCapturedConflict :: Proxy err
+                               -> Proxy cell -> Fields [Either String Int, Either String Bool]
+          (bound at NativeTypeLambdaTypeAppCaptureConflict.hs:15:1)
+

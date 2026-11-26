@@ -1,0 +1,15 @@
+NativeExistentialInstancesInstancesBad.hs:6:10: error: [GHC-22979]
+    • Variable ‘a’ occurs more often
+        in the constraint ‘Sample (a, a)’
+        than in the instance head ‘Sample (Maybe (Stream a))’
+    • In the instance declaration for ‘Sample (Maybe (Stream a))’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+
+NativeExistentialInstancesInstancesBad.hs:11:10: error: [GHC-59692]
+    Duplicate instance declarations:
+      instance Dup First
+        -- Defined at NativeExistentialInstancesInstancesBad.hs:11:10
+      instance Dup Second
+        -- Defined at NativeExistentialInstancesInstancesBad.hs:12:10
+

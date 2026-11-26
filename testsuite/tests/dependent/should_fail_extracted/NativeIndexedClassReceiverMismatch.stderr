@@ -1,0 +1,16 @@
+NativeIndexedClassReceiverMismatch.hs:9:70: error: [GHC-83865]
+    • Couldn't match expected type ‘()’ with actual type ‘Bool’
+    • In the first argument of ‘makeReceiver’, namely ‘True’
+      In the second argument of ‘mapIndexed’, namely
+        ‘(makeReceiver True)’
+      In the first argument of ‘getCells’, namely
+        ‘(mapIndexed (fmap not) (makeReceiver True))’
+
+NativeIndexedClassReceiverMismatch.hs:12:15: error: [GHC-83865]
+    • Couldn't match type ‘Bool’ with ‘Char’
+      Expected: [Maybe Char]
+        Actual: [IndexedMap.Pick True Bool]
+    • In the expression: getCells (mapIndexed (fmap not) familyInput)
+      In an equation for ‘wrongResult’:
+          wrongResult = getCells (mapIndexed (fmap not) familyInput)
+

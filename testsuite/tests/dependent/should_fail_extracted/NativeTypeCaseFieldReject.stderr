@@ -1,0 +1,141 @@
+NativeTypeCaseFieldReject.hs:9:23: error: [GHC-83865]
+    • Couldn't match type ‘the type case in a field of ‘CaseField’’
+                     with ‘Int’
+      Expected: Int
+        Actual: the type case in a field of ‘CaseField’
+    • In the expression: n
+      In an equation for ‘rigid’: rigid (CaseField n) = n
+    • Relevant bindings include
+        n :: the type case in a field of ‘CaseField’
+          (bound at NativeTypeCaseFieldReject.hs:9:18)
+        rigid :: CaseField (Just bit) -> Int
+          (bound at NativeTypeCaseFieldReject.hs:9:1)
+
+NativeTypeCaseFieldReject.hs:12:34: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: Proxy True
+        Actual: Proxy (the type case in a field of ‘ShadowedCaseField’)
+    • In the expression: bit
+      In an equation for ‘shadow’: shadow (ShadowedCaseField bit) = bit
+
+NativeTypeCaseFieldReject.hs:15:39: error: [GHC-83865]
+    • Couldn't match type ‘the type case in a field of ‘OrderedRankedCaseField’’
+                     with ‘Int’
+      Expected: Int
+        Actual: the type case in a field of ‘OrderedRankedCaseField’
+    • In the expression: f @('Just bit) Proxy
+      In an equation for ‘ranked’:
+          ranked _ (OrderedRankedCaseField f) = f @('Just bit) Proxy
+    • Relevant bindings include
+        ranked :: Proxy bit -> OrderedRankedCaseField True -> Int
+          (bound at NativeTypeCaseFieldReject.hs:15:1)
+
+NativeTypeCaseFieldReject.hs:18:36: error: [GHC-83865]
+    • Couldn't match type ‘Int’ with ‘Char’
+      Expected: Char
+        Actual: the type case in a field of ‘RankedCaseField’
+    • In the expression: f @'True Proxy
+      In an equation for ‘rankedShadow’:
+          rankedShadow (RankedCaseField f) = f @'True Proxy
+
+NativeTypeCaseFieldReject.hs:21:40: error: [GHC-83865]
+    • Couldn't match type ‘'(True, False)’ with ‘Int’
+      Expected: Proxy Int
+        Actual: the type case in a field of ‘CapturedKindCaseField’
+    • In the expression: f @Int @'True Proxy
+      In an equation for ‘badCapture’:
+          badCapture (CapturedKindCaseField f) = f @Int @'True Proxy
+
+NativeTypeCaseFieldReject.hs:24:24: error: [GHC-25897]
+    • Couldn't match kind ‘k’ with ‘l’
+      Expected kind ‘Proxy @{Tag @{*} @{*} l k} ('Tag @{*} @{*} @l @k)’,
+        but ‘f @Int @Double @'True
+               Proxy’ has kind ‘the type case in a field of ‘Compound’’
+      ‘k’ is a rigid type variable bound by
+        the type signature for:
+          swapped :: forall k l.
+                     Compound k l ('Tag @{*} @{*} @k @l)
+                     -> Proxy @{Tag @{*} @{*} l k} ('Tag @{*} @{*} @l @k)
+        at NativeTypeCaseFieldReject.hs:23:1-80
+      ‘l’ is a rigid type variable bound by
+        the type signature for:
+          swapped :: forall k l.
+                     Compound k l ('Tag @{*} @{*} @k @l)
+                     -> Proxy @{Tag @{*} @{*} l k} ('Tag @{*} @{*} @l @k)
+        at NativeTypeCaseFieldReject.hs:23:1-80
+    • In the expression: f @Int @Double @'True Proxy
+      In an equation for ‘swapped’:
+          swapped (Compound f) = f @Int @Double @'True Proxy
+    • Relevant bindings include
+        f :: forall k1 l1 (b :: Bool).
+             Proxy b -> the type case in a field of ‘Compound’
+          (bound at NativeTypeCaseFieldReject.hs:24:19)
+        swapped :: Compound k l 'Tag -> Proxy 'Tag
+          (bound at NativeTypeCaseFieldReject.hs:24:1)
+
+NativeTypeCaseFieldReject.hs:27:11: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from a non-linear pattern ‘_’
+    • In the pattern: _
+      In an equation for ‘dropInput’: dropInput _ = 0
+
+NativeTypeCaseFieldReject.hs:30:16: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from multiplicity of ‘x’
+    • In an equation for ‘duplicateInput’: duplicateInput x = x + x
+
+NativeTypeCaseFieldReject.hs:33:15: error: [GHC-25897]
+    • Couldn't match type ‘p’ with ‘Many’
+        arising from a non-linear pattern ‘_’
+      ‘p’ is a rigid type variable bound by
+        the type signature for:
+          dropPolyInput :: MultiplicityArrowDomain True
+        at NativeTypeCaseFieldReject.hs:32:1-46
+    • In the pattern: _
+      In an equation for ‘dropPolyInput’: dropPolyInput _ = Proxy
+    • Relevant bindings include
+        dropPolyInput :: NativeNestedCase.$case:MultiplicityArrowDomain:0
+                           True p True
+                         %p -> Proxy p
+          (bound at NativeTypeCaseFieldReject.hs:33:1)
+
+NativeTypeCaseFieldReject.hs:36:35: error: [GHC-83865]
+    • Couldn't match type ‘Int’ with ‘Char’
+      Expected: Char
+        Actual: the type case in a field of ‘RetainedField’
+    • In the expression: f True
+      In an equation for ‘wrongRetained’:
+          wrongRetained (RetainedField f) = f True
+
+NativeTypeCaseFieldReject.hs:39:39: error: [GHC-83865]
+    • Couldn't match type ‘case b1 of {True -> Int; False -> Char}’
+                     with ‘Int’
+      Expected: Int
+        Actual: the type case in a field of ‘RetainedField’
+    • In the expression: f b
+      In an equation for ‘neutralRetained’:
+          neutralRetained b (RetainedField f) = f b
+
+NativeTypeCaseFieldReject.hs:43:17: error: [GHC-05617]
+    • Could not deduce ‘NativeTypeCaseRetainedField.$case:$field-case:RetainedField:0:0
+                          other other
+                        ~ Int’
+      from the context: b ~ True
+        bound by a pattern with constructor: True :: Bool,
+                 in a case alternative
+        at NativeTypeCaseFieldReject.hs:43:3-31
+      Expected: Int
+        Actual: the type case in a field of ‘RetainedField’
+    • In the expression: f other :: Int
+      In the first argument of ‘show’, namely ‘(f other :: Int)’
+      In the expression: show (f other :: Int)
+
+NativeTypeCaseFieldReject.hs:48:27: error: [GHC-83865]
+    • Couldn't match type ‘case b of {True -> Int; False -> Char}’
+                     with ‘Int’
+      Expected: Int
+        Actual: the type case in a field of ‘RetainedField’
+    • In the expression: f b :: Int
+      In the first argument of ‘show’, namely ‘(f b :: Int)’
+      In the expression: show (f b :: Int)
+

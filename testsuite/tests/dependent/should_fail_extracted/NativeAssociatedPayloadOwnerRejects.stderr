@@ -1,0 +1,30 @@
+NativeAssociatedPayloadOwnerRejects.hs:12:8: error: [GHC-90647]
+    • Constrained associated type family ‘OtherPacket’
+      The equation requires ‘PayloadFormat [a]’
+      from its owning class constraint ‘Other [a]’.
+    • In the associated type family instance declaration for ‘OtherPacket’
+      In the instance declaration for ‘Other [a]’
+
+NativeAssociatedPayloadOwnerRejects.hs:18:8: error: [GHC-90647]
+    • Constrained associated type family ‘BadScoped’
+      The equation requires ‘Second [Int]’
+      from its owning class constraint ‘BadBoth [Int]’.
+    • In the associated type family instance declaration for ‘BadScoped’
+      In the instance declaration for ‘BadBoth [Int]’
+
+NativeAssociatedPayloadOwnerRejects.hs:24:23: error: [GHC-90647]
+    • Constrained associated type family ‘Tagged’
+      Use the family in a value signature, type synonym, expression annotation, constructor field, or explicit type argument.
+    • In a branch of the type lambda in ‘InvalidWitness’
+      In the type lambda in ‘InvalidWitness’
+
+NativeAssociatedPayloadOwnerRejects.hs:26:1: error: [GHC-39999]
+    • No instance for ‘First key’ arising from a use of ‘FirstBody’
+    • In the type synonym declaration for ‘InvalidDomain’
+
+NativeAssociatedPayloadOwnerRejects.hs:33:23: error: [GHC-90647]
+    • Constrained associated type family ‘OmittedBody’
+      Use the family in a value signature, type synonym, expression annotation, constructor field, or explicit type argument.
+    • In a branch of the type lambda in ‘InvalidOmitted’
+      In the type lambda in ‘InvalidOmitted’
+

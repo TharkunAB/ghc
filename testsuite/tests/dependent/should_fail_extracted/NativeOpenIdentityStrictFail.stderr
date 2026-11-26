@@ -1,0 +1,29 @@
+NativeOpenIdentityStrictFail.hs:10:36: error: [GHC-70566]
+    • Cannot reduce the open call to ‘OpenProducer.strictSecond’ in a type.
+        Reduction stopped at a case on the rigid argument a. A checked equation can retain this case until the argument's constructor is known.
+    • In the type signature:
+        strictArg :: forall a b. a -> b -> OpenProducer.strictSecond a b
+
+NativeOpenIdentityStrictFail.hs:13:42: error: [GHC-70566]
+    • Cannot reduce the open call to ‘OpenProducer.strictPairFirst’ in a type.
+        Reduction stopped at a case on the rigid argument b. A checked equation can retain this case until the argument's constructor is known.
+    • In the type signature:
+        strictPairField :: forall a b. a
+                                       -> b -> OpenProducer.strictPairFirst '(a, b)
+
+NativeOpenIdentityStrictFail.hs:16:60: error: [GHC-70566]
+    • Cannot reduce the open call to ‘OpenProducer.strictPairFirst’ in a type.
+        Reduction stopped at a case on the rigid argument p. A checked equation can retain this case until the argument's constructor is known.
+    • In the first argument of ‘Proxy’, namely
+        ‘(OpenProducer.strictPairFirst p)’
+      In the type signature:
+        stuckPair :: forall (p :: (Type, Type)). Proxy p
+                                                 -> Proxy (OpenProducer.strictPairFirst p)
+
+NativeOpenIdentityStrictFail.hs:19:35: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Omitted.identity’ in a type.
+        While reading the definition of ‘Omitted.identity’.
+        The interface for a referenced definition contains no usable Core unfolding. Use an interface that exposes the unfolding or provides a checked equation for this call.
+    • In the type signature:
+        missingBody :: forall a. Num a => Omitted.identity a
+

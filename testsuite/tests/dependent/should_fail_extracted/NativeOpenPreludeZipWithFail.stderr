@@ -1,0 +1,101 @@
+NativeOpenPreludeZipWithFail.hs:19:11: error: [GHC-83865]
+    • Couldn't match type: twiceMinimum (size xs1) (size ys1)
+                     with: Succ (twiceMinimum (size xs1) (size ys1))
+      Expected: size (zip (_ : xs1) (_1 : ys1))
+                :~: twiceMinimum (size (_ : xs1)) (size (_1 : ys1))
+        Actual: size (zip (_ : xs1) (_1 : ys1))
+                :~: size (zip (_ : xs1) (_1 : ys1))
+    • In the expression: Refl
+      In a case alternative: Refl -> Refl
+      In the expression: case wrongMin xs ys of Refl -> Refl
+    • Relevant bindings include
+        ys :: [b] (bound at NativeOpenPreludeZipWithFail.hs:18:24)
+        xs :: [a] (bound at NativeOpenPreludeZipWithFail.hs:18:15)
+        wrongMin :: foreach (xs :: [a])
+                    -> foreach (ys :: [b])
+                       -> size (zip xs ys) :~: twiceMinimum (size xs) (size ys)
+          (bound at NativeOpenPreludeZipWithFail.hs:16:1)
+
+NativeOpenPreludeZipWithFail.hs:22:19: error: [GHC-83865]
+    • Couldn't match type: zipWith f xs '[]
+                     with: '[]
+      Expected: Zipped f xs '[] :~: '[]
+        Actual: '[] :~: '[]
+    • In the expression: Refl
+      In an equation for ‘unknownLeft’: unknownLeft _ _ = Refl
+    • Relevant bindings include
+        unknownLeft :: Proxy f -> Proxy xs -> Zipped f xs '[] :~: '[]
+          (bound at NativeOpenPreludeZipWithFail.hs:22:1)
+
+NativeOpenPreludeZipWithFail.hs:26:22: error: [GHC-83865]
+    • Couldn't match type: zipWith f xs ys
+                     with: f x y : zipWith f xs ys
+      Expected: Zipped f (x : xs) (y : ys) :~: Zipped f xs ys
+        Actual: zipWith f (x : xs) (y : ys)
+                :~: zipWith f (x : xs) (y : ys)
+    • In the expression: Refl
+      In an equation for ‘dropCons’: dropCons _ _ _ _ _ = Refl
+    • Relevant bindings include
+        dropCons :: Proxy f
+                    -> Proxy x
+                    -> Proxy y
+                    -> Proxy xs
+                    -> Proxy ys
+                    -> Zipped f (x : xs) (y : ys) :~: Zipped f xs ys
+          (bound at NativeOpenPreludeZipWithFail.hs:26:1)
+
+NativeOpenPreludeZipWithFail.hs:29:22: error: [GHC-83865]
+    • Couldn't match type ‘size (zipWith f xs '[])’ with ‘Zero’
+      Expected: Count (Zipped f xs '[]) :~: Zero
+        Actual: Zero :~: Zero
+    • In the expression: Refl
+      In an equation for ‘unknownLeftLen’: unknownLeftLen _ _ = Refl
+    • Relevant bindings include
+        unknownLeftLen :: Proxy f
+                          -> Proxy xs -> Count (Zipped f xs '[]) :~: Zero
+          (bound at NativeOpenPreludeZipWithFail.hs:29:1)
+
+NativeOpenPreludeZipWithFail.hs:33:22: error: [GHC-83865]
+    • Couldn't match type: size (zipWith f xs ys)
+                     with: Succ (size (zipWith f xs ys))
+      Expected: Count (Zipped f (x : xs) (y : ys))
+                :~: Count (Zipped f xs ys)
+        Actual: size (Zipped f (x : xs) (y : ys))
+                :~: size (Zipped f (x : xs) (y : ys))
+    • In the expression: Refl
+      In an equation for ‘dropSucc’: dropSucc _ _ _ _ _ = Refl
+    • Relevant bindings include
+        dropSucc :: Proxy f
+                    -> Proxy x
+                    -> Proxy y
+                    -> Proxy xs
+                    -> Proxy ys
+                    -> Count (Zipped f (x : xs) (y : ys)) :~: Count (Zipped f xs ys)
+          (bound at NativeOpenPreludeZipWithFail.hs:33:1)
+
+NativeOpenPreludeZipWithFail.hs:36:20: error: [GHC-83865]
+    • Couldn't match type: zip xs '[]
+                     with: '[]
+      Expected: ZipPairs xs '[] :~: '[]
+        Actual: '[] :~: '[]
+    • In the expression: Refl
+      In an equation for ‘unknownZipLeft’: unknownZipLeft _ = Refl
+    • Relevant bindings include
+        unknownZipLeft :: Proxy xs -> ZipPairs xs '[] :~: '[]
+          (bound at NativeOpenPreludeZipWithFail.hs:36:1)
+
+NativeOpenPreludeZipWithFail.hs:40:23: error: [GHC-83865]
+    • Couldn't match type: zip xs ys
+                     with: '(x, y) : zip xs ys
+      Expected: ZipPairs (x : xs) (y : ys) :~: ZipPairs xs ys
+        Actual: zip (x : xs) (y : ys) :~: zip (x : xs) (y : ys)
+    • In the expression: Refl
+      In an equation for ‘dropZipCons’: dropZipCons _ _ _ _ = Refl
+    • Relevant bindings include
+        dropZipCons :: Proxy x
+                       -> Proxy xs
+                       -> Proxy y
+                       -> Proxy ys
+                       -> ZipPairs (x : xs) (y : ys) :~: ZipPairs xs ys
+          (bound at NativeOpenPreludeZipWithFail.hs:40:1)
+

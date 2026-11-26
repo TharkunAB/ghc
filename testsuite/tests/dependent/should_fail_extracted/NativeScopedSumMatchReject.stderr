@@ -1,0 +1,69 @@
+NativeScopedSumMatchReject.hs:11:19: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: Same (L.Alpha a) (R.Alpha a) :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘wrongFallback’: wrongFallback _ = Refl
+
+NativeScopedSumMatchReject.hs:14:16: error: [GHC-83865]
+    • Couldn't match type ‘Same
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchLeft.$lambda:Named:0-sigma a))
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchRight.$lambda:Named:0-sigma a))’
+                     with ‘True’
+      Expected: Same (L.Named a) (R.Named a) :~: True
+        Actual: True :~: True
+    • In the expression: Refl
+      In an equation for ‘namedMatch’: namedMatch _ = Refl
+    • Relevant bindings include
+        namedMatch :: Proxy a -> Same (L.Named a) (R.Named a) :~: True
+          (bound at NativeScopedSumMatchReject.hs:14:1)
+
+NativeScopedSumMatchReject.hs:17:19: error: [GHC-83865]
+    • Couldn't match type ‘Same
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchLeft.$lambda:Named:0-sigma a))
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchRight.$lambda:Named:0-sigma a))’
+                     with ‘False’
+      Expected: Same (L.Named a) (R.Named a) :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘namedFallback’: namedFallback _ = Refl
+    • Relevant bindings include
+        namedFallback :: Proxy a -> Same (L.Named a) (R.Named a) :~: False
+          (bound at NativeScopedSumMatchReject.hs:17:1)
+
+NativeScopedSumMatchReject.hs:20:18: error: [GHC-83865]
+    • Couldn't match type ‘Same
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchLeft.$lambda:ForeignScope:0-sigma a))
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchRight.$lambda:ForeignScope:0-sigma a))’
+                     with ‘True’
+      Expected: Same (L.ForeignScope a) (R.ForeignScope a) :~: True
+        Actual: True :~: True
+    • In the expression: Refl
+      In an equation for ‘foreignMatch’: foreignMatch _ = Refl
+    • Relevant bindings include
+        foreignMatch :: Proxy a
+                        -> Same (L.ForeignScope a) (R.ForeignScope a) :~: True
+          (bound at NativeScopedSumMatchReject.hs:20:1)
+
+NativeScopedSumMatchReject.hs:23:21: error: [GHC-83865]
+    • Couldn't match type ‘Same
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchLeft.$lambda:ForeignScope:0-sigma a))
+                             (GHC.Sigma.Sigma
+                                Bool (NativeScopedSumMatchRight.$lambda:ForeignScope:0-sigma a))’
+                     with ‘False’
+      Expected: Same (L.ForeignScope a) (R.ForeignScope a) :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘foreignFallback’: foreignFallback _ = Refl
+    • Relevant bindings include
+        foreignFallback :: Proxy a
+                           -> Same (L.ForeignScope a) (R.ForeignScope a) :~: False
+          (bound at NativeScopedSumMatchReject.hs:23:1)
+

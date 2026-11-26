@@ -1,0 +1,130 @@
+NativeCheckedClosureFail.hs:28:16: error: [GHC-83865]
+    • Couldn't match type: P.Old (P.Old P.New)
+                     with: P.New
+      Expected: Step
+                  (P.Call (P.Bind Body) Inserted) (P.Bind (P.Bind (P.At P.New)))
+        Actual: Step
+                  (P.Call (P.Bind Body) Inserted) (P.replace Body Inserted)
+    • In the expression:
+        Beta @NatScope @Fn @(P.Arrow P.Nat Fn) @Body @Inserted
+      In an equation for ‘wrongCapture’:
+          wrongCapture
+            = Beta @NatScope @Fn @(P.Arrow P.Nat Fn) @Body @Inserted
+
+NativeCheckedClosureFail.hs:33:14: error: [GHC-83865]
+    • Couldn't match type: P.findMarked (P.Marked next stamp)
+                     with: P.findMarked (P.Marked next other)
+      Expected: P.findMarked (P.Marked (P.Old next) stamp)
+                :~: P.InTail (P.findMarked (P.Marked next other))
+        Actual: P.findMarked (P.Marked (P.Old next) stamp)
+                :~: P.findMarked (P.Marked (P.Old next) stamp)
+      Note: GHC cannot determine the arguments of the function ‘P.findMarked’ from its result.
+    • In the expression: Refl
+      In an equation for ‘wrongStamp’: wrongStamp = Refl
+    • Relevant bindings include
+        wrongStamp :: P.findMarked (P.Marked (P.Old next) stamp)
+                      :~: P.InTail (P.findMarked (P.Marked next other))
+          (bound at NativeCheckedClosureFail.hs:33:1)
+
+NativeCheckedClosureFail.hs:39:18: error: [GHC-83865]
+    • Couldn't match type: P.AtHead stamp
+                     with: P.InTail (P.AtHead stamp)
+      Expected: P.findMarked (P.markFound (P.InTail (P.AtHead stamp)))
+                :~: P.AtHead stamp
+        Actual: P.AtHead stamp :~: P.AtHead stamp
+    • In the expression: Refl
+      In an equation for ‘wrongDuplicate’: wrongDuplicate = Refl
+    • Relevant bindings include
+        wrongDuplicate :: P.findMarked
+                            (P.markFound (P.InTail (P.AtHead stamp)))
+                          :~: P.AtHead stamp
+          (bound at NativeCheckedClosureFail.hs:39:1)
+
+NativeCheckedClosureFail.hs:49:22: error: [GHC-83865]
+    • Couldn't match type: DP.New
+                     with: DP.Old DP.New
+      Expected: DP.replaceBoth DUnder (DP.At DP.New) DP.Flag
+                :~: DP.BindBoth (DP.Both (DP.At (DP.Old DP.New)) DP.Flag)
+        Actual: DP.BindBoth (DP.Both (DP.At (DP.Old DP.New)) DP.Flag)
+                :~: DP.BindBoth (DP.Both (DP.At (DP.Old DP.New)) DP.Flag)
+    • In the expression: Refl
+      In an equation for ‘wrongDoubleCapture’: wrongDoubleCapture = Refl
+
+NativeCheckedClosureFail.hs:56:17: error: [GHC-83865]
+    • Couldn't match type: s x
+                     with: r x
+      Expected: DP.renameExpr r (DP.At x) :~: DP.At (s x)
+        Actual: DP.At (s x) :~: DP.At (s x)
+    • In the expression: Refl
+      In an equation for ‘wrongRenaming’: wrongRenaming = Refl
+    • Relevant bindings include
+        wrongRenaming :: DP.renameExpr r (DP.At x) :~: DP.At (s x)
+          (bound at NativeCheckedClosureFail.hs:56:1)
+
+NativeCheckedClosureFail.hs:60:14: error: [GHC-83865]
+    • Couldn't match type: t x
+                     with: s x
+      Expected: DN.walk s (DN.At x) :~: t x
+        Actual: t x :~: t x
+    • In the expression: Refl
+      In an equation for ‘wrongSubst’: wrongSubst = Refl
+    • Relevant bindings include
+        wrongSubst :: DN.walk s (DN.At x) :~: t x
+          (bound at NativeCheckedClosureFail.hs:60:1)
+
+NativeCheckedClosureFail.hs:63:22: error: [GHC-25897]
+    • Couldn't match type ‘x’ with ‘y’
+      Expected: LP.lookupEnv (LP.Cons x (LP.Cons y LP.Nil)) (LP.FS LP.FZ)
+                :~: x
+        Actual: x :~: x
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          wrongLookupIdx :: forall (x :: Bool) (y :: Bool).
+                            Proxy x
+                            -> Proxy y
+                            -> LP.lookupEnv (LP.Cons x (LP.Cons y LP.Nil)) (LP.FS LP.FZ) :~: x
+        at NativeCheckedClosureFail.hs:62:1-108
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          wrongLookupIdx :: forall (x :: Bool) (y :: Bool).
+                            Proxy x
+                            -> Proxy y
+                            -> LP.lookupEnv (LP.Cons x (LP.Cons y LP.Nil)) (LP.FS LP.FZ) :~: x
+        at NativeCheckedClosureFail.hs:62:1-108
+    • In the expression: Refl
+      In an equation for ‘wrongLookupIdx’: wrongLookupIdx _ _ = Refl
+    • Relevant bindings include
+        wrongLookupIdx :: Proxy x
+                          -> Proxy y
+                          -> LP.lookupEnv (LP.Cons x (LP.Cons y LP.Nil)) (LP.FS LP.FZ) :~: x
+          (bound at NativeCheckedClosureFail.hs:63:1)
+
+NativeCheckedClosureFail.hs:66:13: error: [GHC-25897]
+    • Couldn't match type ‘m’ with ‘UP.ULam (UP.UVar UP.FZ)’
+      Expected: UP.plug UP.CHole m :~: UP.ULam (UP.UVar UP.FZ)
+        Actual: UP.ULam (UP.UVar UP.FZ) :~: UP.ULam (UP.UVar UP.FZ)
+      ‘m’ is a rigid type variable bound by
+        the type signature for:
+          wrongHole :: forall (n :: UP.Nat) (m :: UP.UTerm n).
+                       UP.plug UP.CHole m :~: UP.ULam (UP.UVar UP.FZ)
+        at NativeCheckedClosureFail.hs:65:1-99
+    • In the expression: Refl
+      In an equation for ‘wrongHole’: wrongHole = Refl
+    • Relevant bindings include
+        wrongHole :: UP.plug UP.CHole m :~: UP.ULam (UP.UVar UP.FZ)
+          (bound at NativeCheckedClosureFail.hs:66:1)
+
+NativeCheckedClosureFail.hs:76:17: error: [GHC-83865]
+    • Couldn't match type: UP.FS UP.FZ
+                     with: UP.FZ
+      Expected: BetaStep
+                  (UP.UApp
+                     (UP.ULam (UP.ULam (UP.UVar (UP.FS UP.FZ)))) (UP.UVar UP.FZ))
+                  (UP.ULam (UP.UVar UP.FZ))
+        Actual: BetaStep
+                  (UP.UApp
+                     (UP.ULam (UP.ULam (UP.UVar (UP.FS UP.FZ)))) (UP.UVar UP.FZ))
+                  (UP.substSingleU (UP.ULam (UP.UVar (UP.FS UP.FZ))) (UP.UVar UP.FZ))
+    • In the expression: BetaU
+      In an equation for ‘wrongCaptureU’: wrongCaptureU = BetaU
+

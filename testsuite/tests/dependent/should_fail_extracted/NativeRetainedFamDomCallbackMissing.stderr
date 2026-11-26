@@ -1,0 +1,9 @@
+NativeRetainedFamDomCallbackMissing.hs:5:16: error: [GHC-39999]
+    • No instance for ‘Collects c’ arising from a use of ‘Elem’
+      Possible fix:
+        add (Collects c) to the context of
+          a type expected by the context:
+            forall (c :: k). Proxy c -> Elem c -> Elem c
+    • In the type signature:
+        unqualified :: (forall c. Proxy c -> Elem c -> Elem c) -> Bool
+

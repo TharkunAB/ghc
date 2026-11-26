@@ -1,0 +1,7 @@
+NativeOpenInstalledAppendRulesFail.hs:12:29: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘++’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression: Refl
+      In an equation for ‘lengthAppendRules’:
+          lengthAppendRules Empty _ = Refl
+

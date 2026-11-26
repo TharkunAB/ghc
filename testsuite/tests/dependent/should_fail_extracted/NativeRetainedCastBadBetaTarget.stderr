@@ -1,0 +1,18 @@
+NativeRetainedCastBadBetaTarget.hs:9:26: error: [GHC-83865]
+    • Couldn't match type ‘NativeRetainedCastSourceCallProvider.$apply:substSingle
+                             (NativeRetainedCastSourceCallProvider.$replace:substSingle m) body’
+                     with ‘m’
+      Expected: Step (App (Lam body) m) m
+        Actual: Step (App (Lam body) m) (substSingle body m)
+    • In the second argument of ‘PStep’, namely ‘(BetaLam w)’
+      In the expression: PStep m (BetaLam w)
+      In an equation for ‘badBeta’: badBeta _ m w = PStep m (BetaLam w)
+    • Relevant bindings include
+        w :: Value m (bound at NativeRetainedCastBadBetaTarget.hs:9:13)
+        m :: Term CEmpty a
+          (bound at NativeRetainedCastBadBetaTarget.hs:9:11)
+        badBeta :: foreach (body :: Term (CExt CEmpty a) a)
+                   -> foreach (m :: Term CEmpty a)
+                      -> Value m -> Progress (App (Lam body) m)
+          (bound at NativeRetainedCastBadBetaTarget.hs:9:1)
+

@@ -1,0 +1,6 @@
+NativeExtendedLetUnusedIllKinded.hs:4:24: error: [GHC-83865]
+    • Expected kind ‘* %GHC.Internal.Types.Matchable -> k0’,
+        but ‘Maybe Int’ has kind ‘*’
+    • In the expression: let Wrong :: Maybe Int Bool in 42
+      In an equation for ‘bad’: bad = let Wrong :: Maybe Int Bool in 42
+

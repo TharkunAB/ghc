@@ -1,0 +1,7 @@
+NativeProposal378BadInferredConField.hs:5:7: error: [GHC-95781]
+    • Cannot apply expression of type ‘foreach (n :: Nat).
+                                       Vec Bool n -> InvisVec Bool’
+      to a visible type argument ‘Zero’
+    • In the expression: MkInvisInf @Bool @Zero VNil
+      In an equation for ‘bad’: bad = MkInvisInf @Bool @Zero VNil
+

@@ -1,0 +1,9 @@
+NativeTypeLetScope.hs:3:26: error: [GHC-76037]
+    Not in scope: type variable ‘b’
+
+NativeTypeLetScope.hs:4:26: error: [GHC-76037]
+    Not in scope: type variable ‘b’
+
+NativeTypeLetScope.hs:5:37: error: [GHC-76037]
+    Not in scope: type variable ‘later’
+

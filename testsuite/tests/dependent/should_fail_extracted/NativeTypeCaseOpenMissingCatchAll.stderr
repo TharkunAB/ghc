@@ -1,0 +1,12 @@
+NativeTypeCaseOpenMissingCatchAll.hs:5:9: error: [GHC-83605]
+    • Dependent case refinement requires one unguarded match for each constructor, with variables or wildcards as fields.
+    • In the expression:
+        case a of
+          type Int -> Just 0
+          type Bool -> Just True
+      In an equation for ‘bad’:
+          bad a
+            = case a of
+                type Int -> Just 0
+                type Bool -> Just True
+

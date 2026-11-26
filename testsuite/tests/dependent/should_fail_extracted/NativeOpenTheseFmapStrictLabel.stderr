@@ -1,0 +1,11 @@
+NativeOpenTheseFmapStrictLabel.hs:13:16: error: [GHC-70565]
+    • Cannot evaluate ‘fmap’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘Prelude.fmap f ('SBoth n 'True x)’
+      In the type signature:
+        claim :: foreach (n :: Int) ->
+                 foreach (f :: Bool -> Bool) ->
+                 foreach (x :: Bool) ->
+                 Prelude.fmap f ('SBoth n 'True x) :~: 'SBoth n 'True (f x)
+

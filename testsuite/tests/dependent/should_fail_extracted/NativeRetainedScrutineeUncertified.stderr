@@ -1,0 +1,7 @@
+NativeRetainedScrutineeUncertified.hs:13:27: error: [GHC-83605]
+    • No checked source equations are available for ‘opaqueId’ in this retained argument.
+    • In the expression: appendNilR (opaqueId ys)
+      In the expression: case appendNilR (opaqueId ys) of Refl -> 0
+      In an equation for ‘bad’:
+          bad ys = case appendNilR (opaqueId ys) of Refl -> 0
+

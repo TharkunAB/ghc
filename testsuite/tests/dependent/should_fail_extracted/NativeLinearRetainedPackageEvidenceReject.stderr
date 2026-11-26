@@ -1,0 +1,44 @@
+NativeLinearRetainedPackageEvidenceReject.hs:7:44: error: [GHC-05617]
+    • Could not deduce ‘_ ~ Z’
+      from the context: retained_field ~ S _
+        bound by a pattern with constructor: S :: Nat %1 -> Nat,
+                 in an equation for ‘wrong’
+        at NativeLinearRetainedPackageEvidenceReject.hs:7:13-17
+      Expected: At Z
+        Actual: Payload (S _)
+    • In the second argument of ‘readAt’, namely ‘payload’
+      In the expression: readAt Z payload
+      In the expression: (readAt Z payload, a)
+    • Relevant bindings include
+        payload :: Payload (S _)
+          (bound at NativeLinearRetainedPackageEvidenceReject.hs:7:21)
+
+NativeLinearRetainedPackageEvidenceReject.hs:11:72: error: [GHC-83865]
+    • Couldn't match type ‘()’ with ‘Bool’
+      Expected: Bool
+        Actual: Flag True
+    • In the expression: flag
+      In the expression: (readAt k payload, flag)
+      In the expression: ((readAt k payload, flag), a)
+
+NativeLinearRetainedPackageEvidenceReject.hs:15:69: error: [GHC-05617]
+    • Could not deduce ‘Flag b ~ Bool’
+      from the context: retained_field ~ S _
+        bound by a pattern with constructor: S :: Nat %1 -> Nat,
+                 in an equation for ‘wrongMark’
+        at NativeLinearRetainedPackageEvidenceReject.hs:15:18-22
+      or from: retained_field ~ Pair b payload
+        bound by a pattern with constructor:
+                   Pair :: forall a (p :: a %GHC.Internal.Types.U -> *).
+                           foreach (x :: a) -> p x %1 -> Sigma a p,
+                 in an equation for ‘wrongMark’
+        at NativeLinearRetainedPackageEvidenceReject.hs:15:24-39
+      Expected: Flag False
+        Actual: Flag b
+    • In the second argument of ‘readFlag’, namely ‘payload’
+      In the expression: readFlag False payload
+      In the expression: (readFlag False payload, a)
+    • Relevant bindings include
+        payload :: Flag b
+          (bound at NativeLinearRetainedPackageEvidenceReject.hs:15:32)
+

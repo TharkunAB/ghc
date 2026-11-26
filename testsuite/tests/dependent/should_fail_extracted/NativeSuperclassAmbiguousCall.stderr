@@ -1,0 +1,9 @@
+NativeSuperclassAmbiguousCall.hs:5:14: error: [GHC-83605]
+    • Constraint solving for this retained function type is not supported yet:
+      ($dChoose :: Choose a) =>
+      foreach (x :: a) -> Tagged (choose @a $dChoose x)
+    • In the expression: chooseTagged x
+      In the expression: case chooseTagged x of Tagged v -> v
+      In an equation for ‘bad’:
+          bad x = case chooseTagged x of Tagged v -> v
+

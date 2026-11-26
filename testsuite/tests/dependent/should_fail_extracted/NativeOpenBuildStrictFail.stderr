@@ -1,0 +1,6 @@
+NativeOpenBuildStrictFail.hs:8:23: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Ctrl.strictBuild’ in a type.
+        Reduction stopped at a case on the rigid argument a. A checked equation can retain this case until the argument's constructor is known.
+    • In the type ‘Ctrl.strictBuild a b’
+      In the type synonym declaration for ‘StrictMake’
+

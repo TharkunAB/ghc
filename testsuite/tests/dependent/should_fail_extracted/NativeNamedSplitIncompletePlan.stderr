@@ -1,0 +1,18 @@
+NativeNamedSplitIncompletePlan.hs:12:54: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      Vec Bool _
+    • In the second argument of ‘unknown’, namely ‘right’
+      In the first argument of ‘toList’, namely ‘(unknown left right)’
+      In the expression: toList (unknown left right)
+
+NativeNamedSplitIncompletePlan.hs:15:44: error: [GHC-83865]
+    • Couldn't match type ‘S _’ with ‘Z’
+      Expected: Vec Bool Z
+        Actual: Vec Bool (S Z PackedVecLibrary.+ _)
+    • In the expression: appendVec left right
+      In an equation for ‘wrongLength’:
+          wrongLength (Pair _ (left, right, Refl)) = appendVec left right
+    • Relevant bindings include
+        right :: Vec Bool _
+          (bound at NativeNamedSplitIncompletePlan.hs:15:28)
+

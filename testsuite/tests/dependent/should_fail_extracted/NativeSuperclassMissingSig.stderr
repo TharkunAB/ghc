@@ -1,0 +1,6 @@
+NativeSuperclassMissingSig.hs:4:47: error: [GHC-83605]
+    • An opaque call index requires a local unrestricted function applied to value arguments of its declared domains.
+    • In the first argument of ‘Tagged’, namely ‘(choose x)’
+      In the type signature:
+        badSig :: Eq a => foreach (x :: a) -> Tagged (choose x)
+

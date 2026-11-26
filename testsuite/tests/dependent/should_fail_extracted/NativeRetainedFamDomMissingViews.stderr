@@ -1,0 +1,25 @@
+NativeRetainedFamDomMissingViews.hs:9:14: error: [GHC-39999]
+    • Could not deduce ‘Allowed a’ arising from a use of ‘FieldView’
+      from the context: (forall (x :: k).
+                         Allowed x =>
+                         RenderFormat (FormatKey (f x)),
+                         Show (f a))
+        bound by the type signature for:
+                   renderRaw :: forall {k} (f :: k -> *) (a :: k).
+                                (forall (x :: k). Allowed x => RenderFormat (FormatKey (f x)),
+                                 Show (f a)) =>
+                                Proxy f -> Proxy a -> ViewsAfter f a -> String
+        at NativeRetainedFamDomMissingViews.hs:(9,14)-(12,55)
+      Possible fix:
+        add (Allowed a) to the context of
+          the type signature for:
+            renderRaw :: forall {k} (f :: k -> *) (a :: k).
+                         (forall (x :: k). Allowed x => RenderFormat (FormatKey (f x)),
+                          Show (f a)) =>
+                         Proxy f -> Proxy a -> ViewsAfter f a -> String
+    • In the type signature:
+        renderRaw :: forall f a. (forall x.
+                                  Allowed x => RenderFormat (FormatKey (f x)),
+                                  Show (f a)) =>
+                                 Proxy f -> Proxy a -> ViewsAfter f a -> String
+

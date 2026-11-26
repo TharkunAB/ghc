@@ -1,0 +1,6 @@
+NativeParamRecUpdateMissingPayload.hs:5:13: error: [GHC-83605]
+    • Updating witness field ‘storedLength’ of constructor ‘Columns’
+        requires replacement for field ‘cells’.
+    • In the expression: r {storedLength = Z}
+      In an equation for ‘bad’: bad r = r {storedLength = Z}
+

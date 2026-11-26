@@ -1,0 +1,16 @@
+NativePolyNestedStrictUnit.hs:13:16: error: [GHC-05617]
+    • Could not deduce ‘unitRTo '(_, _1) ~ _’
+      from the context: p ~ '(_, _1)
+        bound by a pattern with constructor:
+                   (,) :: forall a b. a -> b -> (a, b),
+                 in an equation for ‘badRT’
+        at NativePolyNestedStrictUnit.hs:13:1-19
+      Expected: unitRFrom (unitRTo '(_, _1)) :~: '(_, _1)
+        Actual: unitRFrom (unitRTo '(_, _1))
+                :~: unitRFrom (unitRTo '(_, _1))
+    • In the expression: Refl
+      In an equation for ‘badRT’: badRT (_, _) = Refl
+    • Relevant bindings include
+        badRT :: foreach (p :: (a, ())) -> unitRFrom (unitRTo p) :~: p
+          (bound at NativePolyNestedStrictUnit.hs:13:1)
+

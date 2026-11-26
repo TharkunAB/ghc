@@ -1,0 +1,8 @@
+NativeNamedCallbackChangeSize.hs:10:32: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘A.size’, which GHC uses to check a dependent type.
+    • In the expression: measuredZip A.size xs ys Refl
+      In the expression:
+        case measuredZip A.size xs ys Refl of Refl -> True
+      In an equation for ‘check’:
+          check xs ys = case measuredZip A.size xs ys Refl of Refl -> True
+

@@ -1,0 +1,17 @@
+NativeExtendedLetUndersaturated.hs:5:46: error: [GHC-27346]
+    • The type synonym ‘PairOf’ should have 1 argument, but has been given none
+    • In the type signature: x :: PairOf
+      In the expression:
+        let
+          PairOf :: forall a. Tuple2 a a
+          x :: PairOf
+          x = 0
+        in x
+      In an equation for ‘bad’:
+          bad
+            = let
+                PairOf :: forall a. Tuple2 a a
+                x :: PairOf
+                x = 0
+              in x
+

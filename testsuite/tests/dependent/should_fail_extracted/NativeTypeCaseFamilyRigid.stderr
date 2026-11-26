@@ -1,0 +1,35 @@
+NativeTypeCaseFamilyRigid.hs:9:9: error: [GHC-83865]
+    • Couldn't match type ‘case input of {Nothing -> Bool;
+                                          Just field -> field}’
+                     with ‘Bool’
+      Expected: ChoosePayload Bool input :~: Bool
+        Actual: Bool :~: Bool
+    • In the expression: Refl
+      In an equation for ‘bad’: bad _ = Refl
+    • Relevant bindings include
+        bad :: Proxy input -> ChoosePayload Bool input :~: Bool
+          (bound at NativeTypeCaseFamilyRigid.hs:9:1)
+
+NativeTypeCaseFamilyRigid.hs:12:13: error: [GHC-83865]
+    • Couldn't match type ‘case n of {Z -> True;
+                                      S prior -> Down (S prior)}’
+                     with ‘True’
+      Expected: Down (S n) :~: True
+        Actual: True :~: True
+    • In the expression: Refl
+      In an equation for ‘blocked’: blocked _ = Refl
+    • Relevant bindings include
+        blocked :: Proxy n -> Down (S n) :~: True
+          (bound at NativeTypeCaseFamilyRigid.hs:12:1)
+
+NativeTypeCaseFamilyRigid.hs:15:18: error: [GHC-83865]
+    • Couldn't match type ‘case flag of {True -> 3; False -> 2}’
+                     with ‘2’
+      Expected: Width flag Nothing :~: 2
+        Actual: 2 :~: 2
+    • In the expression: Refl
+      In an equation for ‘unknownWidth’: unknownWidth _ = Refl
+    • Relevant bindings include
+        unknownWidth :: Proxy flag -> Width flag Nothing :~: 2
+          (bound at NativeTypeCaseFamilyRigid.hs:15:1)
+

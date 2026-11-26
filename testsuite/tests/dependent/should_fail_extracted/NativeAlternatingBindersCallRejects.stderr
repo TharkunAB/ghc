@@ -1,0 +1,67 @@
+NativeAlternatingBindersCallRejects.hs:10:31: error: [GHC-83865]
+    • Couldn't match kind ‘Ordering’ with ‘Bool’
+      Expected kind ‘NativeAlternatingBindersProvider.K True’,
+        but ‘'EQ’ has kind ‘Ordering’
+    • In the type ‘'EQ’
+      In the expression: forwardKind True @'EQ Marker
+      In an equation for ‘wrongKind’:
+          wrongKind = forwardKind True @'EQ Marker
+
+NativeAlternatingBindersCallRejects.hs:11:40: error: [GHC-83865]
+    • Couldn't match kind ‘Ordering’ with ‘Bool’
+      Expected kind ‘NativeAlternatingBindersProvider.K True’,
+        but ‘'EQ’ has kind ‘Ordering’
+    • In the type ‘'EQ’
+      In the expression: requiredKind True (type 'EQ) Marker
+      In an equation for ‘wrongReqKind’:
+          wrongReqKind = requiredKind True (type 'EQ) Marker
+
+NativeAlternatingBindersCallRejects.hs:15:39: error: [GHC-83865]
+    • Couldn't match type ‘left’ with ‘r’
+      Expected: Reading r m
+        Actual: Reading left m
+    • In the third argument of ‘keepAfter’, namely ‘x’
+      In the expression: keepAfter r m x
+      In the expression: \ @a m x -> keepAfter r m x
+    • Relevant bindings include
+        x :: Reading left m
+          (bound at NativeAlternatingBindersCallRejects.hs:15:21)
+
+NativeAlternatingBindersCallRejects.hs:21:53: error: [GHC-83865]
+    • Couldn't match type ‘ys’ with ‘xs’
+      Expected: (Nothing : xs) :~: (Nothing : xs)
+        Actual: (Nothing : ys) :~: (Nothing : ys)
+    • In the fourth argument of ‘keepCons’, namely ‘p’
+      In the expression: keepCons phase @a xs p x
+      In the expression: \ @a xs _ p x -> keepCons phase @a xs p x
+    • Relevant bindings include
+        x :: ConsReading phase1 (Nothing : xs)
+          (bound at NativeAlternatingBindersCallRejects.hs:21:28)
+        p :: (Nothing : ys) :~: (Nothing : ys)
+          (bound at NativeAlternatingBindersCallRejects.hs:21:26)
+        xs :: [Maybe a]
+          (bound at NativeAlternatingBindersCallRejects.hs:21:21)
+
+NativeAlternatingBindersCallRejects.hs:26:32: error: [GHC-83865]
+    • Couldn't match type ‘other’ with ‘phase’
+      Expected: ConsReading phase (Nothing : xs1)
+        Actual: ConsReading other (Nothing : xs1)
+    • In the expression: keepCons other @a xs p x
+      In the expression: \ @a xs p x -> keepCons other @a xs p x
+      In an equation for ‘wrongPhase’:
+          wrongPhase _ other @a xs p x = keepCons other @a xs p x
+    • Relevant bindings include
+        x :: ConsReading phase (Nothing : xs1)
+          (bound at NativeAlternatingBindersCallRejects.hs:26:28)
+
+NativeAlternatingBindersCallRejects.hs:26:55: error: [GHC-83865]
+    • Couldn't match type ‘phase’ with ‘other’
+      Expected: ConsReading other (Nothing : xs1)
+        Actual: ConsReading phase (Nothing : xs1)
+    • In the fifth argument of ‘keepCons’, namely ‘x’
+      In the expression: keepCons other @a xs p x
+      In the expression: \ @a xs p x -> keepCons other @a xs p x
+    • Relevant bindings include
+        x :: ConsReading phase (Nothing : xs1)
+          (bound at NativeAlternatingBindersCallRejects.hs:26:28)
+

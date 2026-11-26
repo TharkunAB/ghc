@@ -1,0 +1,6 @@
+NativeOpenPreludeZipWithRuleFail.hs:13:18: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘zipStrictSeed’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression: Refl
+      In an equation for ‘badStrict’: badStrict [] _ = Refl
+

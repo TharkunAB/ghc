@@ -1,0 +1,287 @@
+NativeTypeCaseRigid.hs:10:13: error: [GHC-83865]
+    • Couldn't match type ‘case a of {True -> Int; False -> Int}’
+                     with ‘Int’
+      Expected: Same a :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘blocked’: blocked _ = Refl
+    • Relevant bindings include
+        blocked :: Proxy a -> Same a :~: Int
+          (bound at NativeTypeCaseRigid.hs:10:1)
+
+NativeTypeCaseRigid.hs:13:14: error: [GHC-83865]
+    • Couldn't match type: case a of {Just x1 -> '(x, x1);
+                                      Nothing -> '(x, False)}
+                     with: '(x, False)
+      Expected: Capture x a :~: '(x, False)
+        Actual: '(x, False) :~: '(x, False)
+    • In the expression: Refl
+      In an equation for ‘shadow’: shadow _ _ = Refl
+    • Relevant bindings include
+        shadow :: Proxy x -> Proxy a -> Capture x a :~: '(x, False)
+          (bound at NativeTypeCaseRigid.hs:13:1)
+
+NativeTypeCaseRigid.hs:16:12: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘SameFallback’’ with ‘Int’
+      Expected: N.SameFallback (Just inner) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘nested’: nested _ = Refl
+    • Relevant bindings include
+        nested :: Proxy inner -> N.SameFallback (Just inner) :~: Int
+          (bound at NativeTypeCaseRigid.hs:16:1)
+
+NativeTypeCaseRigid.hs:19:10: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘LeftFirst’’ with ‘Bool’
+      Expected: N.LeftFirst (N.Pair first (Just True)) :~: Bool
+        Actual: Bool :~: Bool
+    • In the expression: Refl
+      In an equation for ‘left’: left _ = Refl
+    • Relevant bindings include
+        left :: Proxy first
+                -> N.LeftFirst (N.Pair first (Just True)) :~: Bool
+          (bound at NativeTypeCaseRigid.hs:19:1)
+
+NativeTypeCaseRigid.hs:22:13: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘Uniform’’ with ‘Int’
+      Expected: N.Uniform (Just tag) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘indexed’: indexed _ = Refl
+    • Relevant bindings include
+        indexed :: Proxy tag -> N.Uniform (Just tag) :~: Int
+          (bound at NativeTypeCaseRigid.hs:22:1)
+
+NativeTypeCaseRigid.hs:27:14: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘UniformTypeHead’’
+                     with ‘Int’
+      Expected: N.UniformTypeHead (Just a) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘typeHead’: typeHead _ = Refl
+    • Relevant bindings include
+        typeHead :: Proxy a -> N.UniformTypeHead (Just a) :~: Int
+          (bound at NativeTypeCaseRigid.hs:27:1)
+
+NativeTypeCaseRigid.hs:30:19: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘UniformTypeHead’’
+                     with ‘Int’
+      Expected: N.UniformTypeHead (Just (Unknown a)) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘stuckTypeHead’: stuckTypeHead _ = Refl
+    • Relevant bindings include
+        stuckTypeHead :: Proxy a
+                         -> N.UniformTypeHead (Just (Unknown a)) :~: Int
+          (bound at NativeTypeCaseRigid.hs:30:1)
+
+NativeTypeCaseRigid.hs:33:18: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘WrittenFirst’’ with ‘Int’
+      Expected: N.WrittenFirst (Just (Either Char x)) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘writtenFirst’: writtenFirst _ = Refl
+    • Relevant bindings include
+        writtenFirst :: Proxy x
+                        -> N.WrittenFirst (Just (Either Char x)) :~: Int
+          (bound at NativeTypeCaseRigid.hs:33:1)
+
+NativeTypeCaseRigid.hs:36:19: error: [GHC-83865]
+    • Couldn't match type ‘Bool’ with ‘Char’
+      Expected: N.PickFlipped (Just (Maybe (Either Char Bool)))
+                :~: Proxy Bool
+        Actual: Proxy Bool :~: Proxy Bool
+    • In the expression: Refl
+      In an equation for ‘wrongAliasField’: wrongAliasField = Refl
+
+NativeTypeCaseRigid.hs:39:16: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘AliasFirst’’ with ‘Int’
+      Expected: N.AliasFirst (N.Pair first Nothing) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘aliasFirst’: aliasFirst _ = Refl
+    • Relevant bindings include
+        aliasFirst :: Proxy first
+                      -> N.AliasFirst (N.Pair first Nothing) :~: Int
+          (bound at NativeTypeCaseRigid.hs:39:1)
+
+NativeTypeCaseRigid.hs:42:21: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘MixedAlias’’ with ‘Int’
+      Expected: N.MixedAlias (N.Pair (Just first) Nothing) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘mixedAliasFirst’: mixedAliasFirst _ = Refl
+    • Relevant bindings include
+        mixedAliasFirst :: Proxy first
+                           -> N.MixedAlias (N.Pair (Just first) Nothing) :~: Int
+          (bound at NativeTypeCaseRigid.hs:42:1)
+
+NativeTypeCaseRigid.hs:45:21: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘FamilyGatePick’’
+                     with ‘Bool’
+      Expected: N.FamilyGatePick (Just field) :~: Bool
+        Actual: Bool :~: Bool
+    • In the expression: Refl
+      In an equation for ‘knownIndexRigid’: knownIndexRigid _ = Refl
+    • Relevant bindings include
+        knownIndexRigid :: Proxy field
+                           -> N.FamilyGatePick (Just field) :~: Bool
+          (bound at NativeTypeCaseRigid.hs:45:1)
+
+NativeTypeCaseRigid.hs:48:17: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘HiddenGatePick’’
+                     with ‘Int’
+      Expected: N.HiddenGatePick (Just x) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘hiddenIndex’: hiddenIndex _ = Refl
+    • Relevant bindings include
+        hiddenIndex :: Proxy x -> N.HiddenGatePick (Just x) :~: Int
+          (bound at NativeTypeCaseRigid.hs:48:1)
+
+NativeTypeCaseRigid.hs:52:22: error: [GHC-83865]
+    • Couldn't match type: the type case in ‘ArrowResult’
+                     with: (Proxy LT, Proxy False)
+      Expected: N.ArrowResult LT (Just x)
+                :~: (() -> (Proxy LT, Proxy False))
+        Actual: (() -> (Proxy LT, Proxy False))
+                :~: (() -> (Proxy LT, Proxy False))
+    • In the expression: Refl
+      In an equation for ‘rigidArrowResult’: rigidArrowResult _ = Refl
+    • Relevant bindings include
+        rigidArrowResult :: Proxy x
+                            -> N.ArrowResult LT (Just x) :~: (() -> (Proxy LT, Proxy False))
+          (bound at NativeTypeCaseRigid.hs:52:1)
+
+NativeTypeCaseRigid.hs:55:31: error: [GHC-83865]
+    • Couldn't match type: the type case in ‘ForallResult’
+                     with: (Proxy LT, Int)
+      Expected: (Proxy LT, Int)
+        Actual: the type case in ‘ForallResult’
+    • In the expression: select tag flag
+      In an equation for ‘rigidForall’:
+          rigidForall select tag flag = select tag flag
+    • Relevant bindings include
+        flag :: N.CaseFlag (Just x) (bound at NativeTypeCaseRigid.hs:55:24)
+        rigidForall :: N.ForallResult
+                       -> Proxy LT -> N.CaseFlag (Just x) -> (Proxy LT, Int)
+          (bound at NativeTypeCaseRigid.hs:55:1)
+
+NativeTypeCaseRigid.hs:59:23: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘IndexedFieldOrder’’
+                     with ‘Int’
+      Expected: N.IndexedFieldOrder
+                  (Just (N.RefinedFieldBox 'Proxy (N.FieldOn flag)))
+                :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘rigidIndexedField’: rigidIndexedField _ = Refl
+    • Relevant bindings include
+        rigidIndexedField :: Proxy flag
+                             -> N.IndexedFieldOrder
+                                  (Just (N.RefinedFieldBox 'Proxy (N.FieldOn flag)))
+                                :~: Int
+          (bound at NativeTypeCaseRigid.hs:59:1)
+
+NativeTypeCaseRigid.hs:63:21: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘OpenIndexPick’’ with ‘Int’
+      Expected: N.OpenIndexPick (N.OpenCaseIndex b) (Just d) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘rigidOpenHead’: rigidOpenHead _ _ = Refl
+    • Relevant bindings include
+        rigidOpenHead :: Proxy b
+                         -> Proxy d -> N.OpenIndexPick (N.OpenCaseIndex b) (Just d) :~: Int
+          (bound at NativeTypeCaseRigid.hs:63:1)
+
+NativeTypeCaseRigid.hs:67:22: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘OpenIndexPick’’ with ‘Int’
+      Expected: N.OpenIndexPick
+                  (N.OpenCaseIndex b) (Just (N.OpenPlain flag))
+                :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘rigidOpenField’: rigidOpenField _ _ = Refl
+    • Relevant bindings include
+        rigidOpenField :: Proxy b
+                          -> Proxy flag
+                          -> N.OpenIndexPick (N.OpenCaseIndex b) (Just (N.OpenPlain flag))
+                             :~: Int
+          (bound at NativeTypeCaseRigid.hs:67:1)
+
+NativeTypeCaseRigid.hs:73:21: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘OpenIndexPick’’ with ‘Int’
+      Expected: N.OpenIndexPick
+                  (N.OpenCaseIndex b) (Just (DeferredOpenGate (N.OpenCaseIndex b)))
+                :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘rigidOpenFamily’: rigidOpenFamily _ = Refl
+    • Relevant bindings include
+        rigidOpenFamily :: Proxy b
+                           -> N.OpenIndexPick
+                                (N.OpenCaseIndex b) (Just (DeferredOpenGate (N.OpenCaseIndex b)))
+                              :~: Int
+          (bound at NativeTypeCaseRigid.hs:73:1)
+
+NativeTypeCaseRigid.hs:77:22: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘DependentFieldPick’’
+                     with ‘Char’
+      Expected: N.DependentFieldPick (Just d) :~: Char
+        Actual: Char :~: Char
+    • In the expression: Refl
+      In an equation for ‘blockedTransport’: blockedTransport _ = Refl
+    • Relevant bindings include
+        blockedTransport :: Proxy d
+                            -> N.DependentFieldPick (Just d) :~: Char
+          (bound at NativeTypeCaseRigid.hs:77:1)
+
+NativeTypeCaseRigid.hs:81:21: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘RefinedBranchPick’’
+                     with ‘Int’
+      Expected: N.RefinedBranchPick
+                  seed (Just (N.RefinedBranch 'Proxy (N.RefinedBit bit)))
+                :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘blockedBranch’: blockedBranch _ _ = Refl
+    • Relevant bindings include
+        blockedBranch :: Proxy seed
+                         -> Proxy bit
+                         -> N.RefinedBranchPick
+                              seed (Just (N.RefinedBranch 'Proxy (N.RefinedBit bit)))
+                            :~: Int
+          (bound at NativeTypeCaseRigid.hs:81:1)
+
+NativeTypeCaseRigid.hs:85:24: error: [GHC-83865]
+    • Couldn't match type: the type case in ‘NestedLetCase’
+                     with: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+      Expected: NestedLetCase a (Just bit)
+                :~: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+        Actual: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+                :~: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+    • In the expression: Refl
+      In an equation for ‘blockedNestedLet’: blockedNestedLet _ _ = Refl
+    • Relevant bindings include
+        blockedNestedLet :: Proxy a
+                            -> Proxy bit
+                            -> NestedLetCase a (Just bit)
+                               :~: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+          (bound at NativeTypeCaseRigid.hs:85:1)
+
+NativeTypeCaseRigid.hs:89:24: error: [GHC-83865]
+    • Couldn't match type: the type case in ‘ArrowDomain’
+                     with: (Proxy LT, Proxy bit)
+      Expected: N.ArrowDomain LT (Just (Just bit))
+                :~: ((Proxy LT, Proxy bit) -> Int)
+        Actual: ((Proxy LT, Proxy bit) -> Int)
+                :~: ((Proxy LT, Proxy bit) -> Int)
+    • In the expression: Refl
+      In an equation for ‘blockedArrowDomain’:
+          blockedArrowDomain _ = Refl
+    • Relevant bindings include
+        blockedArrowDomain :: Proxy bit
+                              -> N.ArrowDomain LT (Just (Just bit))
+                                 :~: ((Proxy LT, Proxy bit) -> Int)
+          (bound at NativeTypeCaseRigid.hs:89:1)
+

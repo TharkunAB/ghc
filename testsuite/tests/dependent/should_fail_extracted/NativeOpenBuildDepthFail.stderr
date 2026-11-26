@@ -1,0 +1,12 @@
+NativeOpenBuildDepthFail.hs:8:22: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Ctrl.diverging’ in a type.
+        Reduction exceeded the open evaluation step limit (-freduction-depth).
+    • In the type ‘Ctrl.diverging a b’
+      In the type synonym declaration for ‘Diverging’
+
+NativeOpenBuildDepthFail.hs:11:20: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Ctrl.slowBoth’ in a type.
+        Reduction exceeded the open evaluation step limit (-freduction-depth).
+    • In the type ‘Ctrl.slowBoth a b’
+      In the type synonym declaration for ‘TooSlow’
+

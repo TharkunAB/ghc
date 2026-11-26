@@ -1,0 +1,5 @@
+NativeRetainedFamDomMissingPrefix.hs:6:11: error: [GHC-39999]
+    • No instance for ‘ConstrainedElements.Allowed Int’
+        arising from a use of ‘Echo’
+    • In the type signature: prefix :: Uses Echo
+

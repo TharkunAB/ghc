@@ -1,0 +1,6 @@
+NativeExistentialSourceWrongSchema.hs:8:7: error: [GHC-27432]
+    • GHC.Exists.Pack needs an explicit existential type.
+        The available type is ‘Bool’.
+    • In the expression: Pack @Bool (type Bool) (Just True)
+      In an equation for ‘bad’: bad = Pack @Bool (type Bool) (Just True)
+

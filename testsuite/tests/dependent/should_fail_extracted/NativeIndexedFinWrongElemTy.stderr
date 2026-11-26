@@ -1,0 +1,7 @@
+NativeIndexedFinWrongElemTy.hs:7:53: error: [GHC-39999]
+    • No instance for ‘Num Char’ arising from the literal ‘5’
+    • In the first argument of ‘(+)’, namely ‘5’
+      In the expression: 5 + 1
+      In the expression:
+        zipWithExact @Char @Int @Int [5 + 1, 'x'] [10, 20] (\ _ y -> y)
+

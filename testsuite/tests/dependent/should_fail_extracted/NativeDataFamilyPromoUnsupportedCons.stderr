@@ -1,0 +1,12 @@
+NativeDataFamilyPromoUnsupportedCons.hs:4:16: error: [GHC-64578]
+    • Data constructor ‘MkC’ cannot be used here
+        (it comes from a data family instance)
+    • In the first argument of ‘At’, namely ‘('MkC 'True)’
+      In the type signature: context :: At ('MkC 'True)
+
+NativeDataFamilyPromoUnsupportedCons.hs:6:19: error: [GHC-64578]
+    • Data constructor ‘MkN’ cannot be used here
+        (it comes from a data family instance)
+    • In the first argument of ‘At’, namely ‘('MkN 3#)’
+      In the type signature: newtypeCon :: At ('MkN 3#)
+

@@ -1,0 +1,64 @@
+NativeConstrainedFamPartialScope.hs:13:13: error: [GHC-39999]
+    • Ambiguous type variable ‘c’ arising from a use of ‘Elem’
+      prevents the constraint ‘(Collects c)’ from being solved.
+      Relevant bindings include
+        ctxWild :: Proxy c -> w0
+          (bound at NativeConstrainedFamPartialScope.hs:13:1)
+      Probable fix: use a type annotation to specify what ‘c’ should be.
+      Potentially matching instance:
+        instance NativeConstrainedFamilyProvider.Allowed a => Collects [a]
+          -- Defined at NativeConstrainedFamilyProvider.hs:15:10
+        ...plus one instance involving out-of-scope types
+        (use -fprint-potential-instances to see them all)
+    • In the first argument of ‘seq’, namely ‘Proxy @(Elem c)’
+      In the expression: Proxy @(Elem c) `seq` ()
+      In an equation for ‘ctxWild’: ctxWild _ = Proxy @(Elem c) `seq` ()
+
+NativeConstrainedFamPartialScope.hs:15:24: error: [GHC-39999]
+    • Ambiguous type variable ‘c’ arising from a use of ‘Elem’
+      prevents the constraint ‘(Collects c)’ from being solved.
+      Relevant bindings include
+        staticEsc :: Proxy c -> w0
+          (bound at NativeConstrainedFamPartialScope.hs:15:1)
+      Probable fix: use a type annotation to specify what ‘c’ should be.
+      Potentially matching instance:
+        instance NativeConstrainedFamilyProvider.Allowed a => Collects [a]
+          -- Defined at NativeConstrainedFamilyProvider.hs:15:10
+        ...plus one instance involving out-of-scope types
+        (use -fprint-potential-instances to see them all)
+    • In the first argument of ‘seq’, namely ‘Proxy @(Elem c)’
+      In the body of a static form: (Proxy @(Elem c) `seq` ())
+      In the expression:
+          static (Proxy @(Elem c) `seq` ()) :: StaticPtr ()
+
+NativeConstrainedFamPartialScope.hs:17:67: error: [GHC-39999]
+    • No instance for ‘Collects Int’ arising from a use of ‘Elem’
+    • In the expression: quoted @(Elem Int)
+      In the typed Template Haskell splice: $$(quoted @(Elem Int))
+      In the expression: $$(quoted @(Elem Int))
+
+NativeConstrainedFamPartialScope.hs:19:33: error: [GHC-39999]
+    • Could not deduce ‘Collects other’ arising from a use of ‘Elem’
+      from the context: Collects w0
+        bound by a type argument:
+                   Elem other
+        at NativeConstrainedFamPartialScope.hs:19:33-51
+      The type variable ‘other’ is ambiguous
+      Relevant bindings include
+        otherIdx :: Proxy w0 -> Proxy other -> w1
+          (bound at NativeConstrainedFamPartialScope.hs:19:1)
+      Potentially matching instance:
+        instance NativeConstrainedFamilyProvider.Allowed a => Collects [a]
+          -- Defined at NativeConstrainedFamilyProvider.hs:15:10
+        ...plus one instance involving out-of-scope types
+        (use -fprint-potential-instances to see them all)
+    • In the first argument of ‘seq’, namely ‘Proxy @(Elem other)’
+      In the expression: Proxy @(Elem other) `seq` ()
+      In an equation for ‘otherIdx’:
+          otherIdx _ (_ :: Proxy other) = Proxy @(Elem other) `seq` ()
+
+NativeConstrainedFamPartialScope.hs:21:1: error: [GHC-39999]
+    • No instance for ‘Collects c’ arising from a use of ‘Elem’
+    • When checking the inferred type
+        inferredEsc :: forall {k} (c :: k). Witness c -> Proxy (Elem c)
+

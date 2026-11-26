@@ -1,0 +1,22 @@
+NativeInferredSourceOperandsFail.hs:15:32: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: observe (P.appendVec xs ys)
+      In the expression:
+        case observe (P.appendVec xs ys) of Observed -> True
+      In an equation for ‘conflict’:
+          conflict xs ys
+            = case observe (P.appendVec xs ys) of Observed -> True
+
+NativeInferredSourceOperandsFail.hs:18:37: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: observe (P.appendVec P.VNil ys)
+      In the expression:
+        case observe (P.appendVec P.VNil ys) of Observed -> True
+      In an equation for ‘underconstrained’:
+          underconstrained ys
+            = case observe (P.appendVec P.VNil ys) of Observed -> True
+

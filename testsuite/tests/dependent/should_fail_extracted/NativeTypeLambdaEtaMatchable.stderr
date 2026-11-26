@@ -1,0 +1,12 @@
+NativeTypeLambdaEtaMatchable.hs:6:28: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘NativeTypeLambdaEtaMatchable.$signature-lambda:badMatchable:0’ has kind ‘*
+                                                                                      %GHC.Internal.Types.Unmatchable -> *’
+    • In the second argument of ‘(:~:)’, namely
+        ‘(NativeTypeLambdaEtaMatchable.$signature-lambda:badMatchable:0)’
+      In the type signature:
+        badMatchable :: Maybe
+                        :~: (NativeTypeLambdaEtaMatchable.$signature-lambda:badMatchable:0)
+

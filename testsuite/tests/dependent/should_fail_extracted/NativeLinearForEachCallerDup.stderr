@@ -1,0 +1,6 @@
+NativeLinearForEachCallerDup.hs:7:11: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from multiplicity of ‘n’
+    • In an equation for ‘callerDup’:
+          callerDup n = (dupInTypeLinearInTerm n Proxy, n)
+

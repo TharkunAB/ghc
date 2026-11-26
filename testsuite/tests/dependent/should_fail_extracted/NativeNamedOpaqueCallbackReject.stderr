@@ -1,0 +1,8 @@
+NativeNamedOpaqueCallbackLexical.hs:13:24: error: [GHC-83865]
+    • Couldn't match type ‘mapper’ with ‘Left.mapper’
+      Expected: Stored Left.mapper
+        Actual: Stored mapper
+    • In the expression: store mapper
+      In an equation for ‘storedLexical’:
+          storedLexical mapper = store mapper
+

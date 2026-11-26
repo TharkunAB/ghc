@@ -1,0 +1,5 @@
+NativePolyNestedRuleOnHelper.hs:17:18: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘assocPairR’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘badProof’: badProof _ _ _ = Refl
+

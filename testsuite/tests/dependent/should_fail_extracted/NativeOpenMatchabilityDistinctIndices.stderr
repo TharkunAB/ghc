@@ -1,0 +1,8 @@
+NativeOpenMatchabilityDistinctIndices.hs:10:54: error: [GHC-83865]
+    • Expected kind ‘K @n True’, but ‘p’ has kind ‘K @m True’
+      Note: ‘K’ is a non-injective type family.
+    • In the second argument of ‘Consume’, namely ‘p’
+      In a standalone kind signature for ‘Reject’:
+        forall (m :: Matchability)
+               (n :: Matchability). forall (p :: K @m True) -> Consume @n p
+

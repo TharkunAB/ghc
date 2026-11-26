@@ -1,0 +1,24 @@
+NativeLiftedCallbackNoInverse.hs:8:26: error: [GHC-05617]
+    • Could not deduce ‘y1 ~ z’
+      from the context: cmp x z ~ cmp x y1
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘noInverse’
+        at NativeLiftedCallbackNoInverse.hs:8:19-22
+      Expected: y1 :~: z
+        Actual: y1 :~: y1
+    • In the expression: Refl
+      In an equation for ‘noInverse’: noInverse _ _ _ _ Refl = Refl
+
+NativeLiftedCallbackNoInverse.hs:12:17: error: [GHC-83865]
+    • Couldn't match type: cmp x y
+                     with: cmp y x
+      Expected: cmp x y :~: cmp y x
+        Actual: cmp x y :~: cmp x y
+    • In the expression: Refl
+      In an equation for ‘swapped’: swapped _ _ _ = Refl
+    • Relevant bindings include
+        swapped :: foreach (cmp :: a -> a -> b)
+                   -> foreach (x :: a) -> foreach (y :: a) -> cmp x y :~: cmp y x
+          (bound at NativeLiftedCallbackNoInverse.hs:12:1)
+

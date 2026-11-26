@@ -1,0 +1,47 @@
+NativeTypeLetBadKinds.hs:5:63: error: [GHC-83865]
+    • Expected a type, but ‘'True’ has kind ‘Bool’
+    • In the first argument of ‘Maybe’, namely ‘'True’
+      In the type ‘Maybe 'True’
+      In the type case in ‘UnusedCase’
+
+NativeTypeLetBadKinds.hs:6:48: error: [GHC-83865]
+    • Expected a type, but ‘a’ has kind ‘Bool’
+    • In the first argument of ‘Maybe’, namely ‘a’
+      In the type ‘let b = Maybe a in Int’
+      In the type synonym declaration for ‘UnusedInvalid’
+
+NativeTypeLetBadKinds.hs:7:61: error: [GHC-83865]
+    • Expected a type, but ‘b’ has kind ‘Bool’
+    • In the first argument of ‘Maybe’, namely ‘b’
+      In the type ‘let b = a in let ignored = Maybe b in Int’
+      In the type synonym declaration for ‘UnusedGroup’
+
+NativeTypeLetBadKinds.hs:8:48: error: [GHC-83865]
+    • Expected kind ‘Bool’,
+        but ‘0’ has kind ‘GHC.Internal.Bignum.Natural.Natural’
+    • In the type ‘let width = (0 :: Bool) in Int’
+      In the type synonym declaration for ‘SignedKind’
+
+NativeTypeLetBadKinds.hs:9:36: error: [GHC-83865]
+    • Expected kind ‘(a0, b0)’, but ‘Bool’ has kind ‘*’
+    • In the type ‘let (_, _) = Bool in Int’
+      In the type synonym declaration for ‘IgnoredNonPair’
+
+NativeTypeLetBadKinds.hs:10:44: error: [GHC-83865]
+    • Expected a type, but ‘'True’ has kind ‘Bool’
+    • In the first argument of ‘Maybe’, namely ‘'True’
+      In the type ‘let (value, _) = '(Maybe 'True, 'False) in value’
+      In the type synonym declaration for ‘BadPairRhs’
+
+NativeTypeLetBadKinds.hs:11:66: error: [GHC-83865]
+    • Expected a type, but ‘flag’ has kind ‘Bool’
+    • In the first argument of ‘Maybe’, namely ‘flag’
+      In the type ‘let (flag, _) = '( 'True, 'False) in Maybe flag’
+      In the type synonym declaration for ‘BadPairOperand’
+
+NativeTypeLetBadKinds.hs:12:51: error: [GHC-83865]
+    • Expected kind ‘(a1, b1)’,
+        but ‘ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst $type-let-pair:0’ has kind ‘Bool’
+    • In the type ‘let ((_, _), height) = dims in height’
+      In the type synonym declaration for ‘NestedWrongKind’
+
