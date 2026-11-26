@@ -533,7 +533,7 @@ inline_generic_eq_type_x syn_flag mult_flag mb_env
                            (Just (rnBndr2 env v1 v2)) body1 body2
 
       (DepFunTy vis1 v1 body1, DepFunTy vis2 v2 body2)
-        -> vis1 == vis2 && case mb_env of
+        -> vis1 `eqDepFunVis` vis2 && case mb_env of
               Nothing -> generic_eq_type_x syn_flag mult_flag
                             (Just (initRnEnv t1 t2)) t1 t2
               Just env
@@ -863,7 +863,7 @@ nonDetCmpTypeX env orig_t1 orig_t2 =
         `thenCmpTy` go env (varType v1) (varType v2)
         `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
     go env (DepFunTy vis1 v1 t1) (DepFunTy vis2 v2 t2)
-      = liftOrdering (compare vis1 vis2)
+      = liftOrdering (vis1 `cmpDepFunVis` vis2)
         `thenCmpTy` go env (idMult v1) (idMult v2)
         `thenCmpTy` go env (varType v1) (varType v2)
         `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
@@ -1084,7 +1084,7 @@ mayLookIdentical orig_ty1 orig_ty2
       | otherwise = return False
 
     go env _top (DepFunTy vis1 v1 ty1) (DepFunTy vis2 v2 ty2)
-      | vis1 == vis2
+      | vis1 `eqDepFunVis` vis2
       = (\m k b -> m && k && b)
           <$> go env False (idMult v1) (idMult v2)
           <*> go env False (varType v1) (varType v2)

@@ -66,6 +66,7 @@ module GHC.Tc.Utils.Monad(
   getDeclaredDefaultTys,
   addDependentFiles, addDependentDirectories,
   recordHomeRuleDependencies,
+  tcHasDepImports, tcHasSourceProofEnv,
 
   -- * Error management
   getSrcSpanM, getRealSrcSpanM, setSrcSpan, setSrcSpanA, addLocM,
@@ -356,6 +357,7 @@ initTc plugin_handling hsc_env hsc_src keep_rn_syntax mod loc do_this
 initTcGblEnv :: HscEnv -> HscSource -> Bool -> Module -> RealSrcSpan -> IO TcGblEnv
 initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
   do { keep_var             <- newIORef emptyNameSet
+     ; has_dep_imports      <- newIORef False
      ; used_gre_var         <- newIORef []
      ; source_table_uses    <- newIORef emptyNameSet
      ; evaluated_term_uses  <- newIORef emptyNameSet
@@ -432,6 +434,7 @@ initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
           , tcg_imports            = emptyImportAvails
           , tcg_import_decls       = []
           , tcg_used_gres          = used_gre_var
+          , tcg_has_dep_imports    = has_dep_imports
           , tcg_source_table_uses    = source_table_uses
           , tcg_local_open_demands  = Nothing
           , tcg_local_open_defs     = emptyNameEnv
@@ -2713,9 +2716,24 @@ initIfaceTcRn thing_inside
               if_env = IfGblEnv { if_doc = text "initIfaceTcRn"
                                 , if_rec_types = if is_instantiate
                                                  then emptyKnotVars
-                                                 else readTcRef <$> knot_vars }
+                                                 else readTcRef <$> knot_vars
+                                , if_has_dep_imports = Just (tcg_has_dep_imports tcg_env) }
 
         ; setEnvs (if_env, ()) thing_inside }
+
+-- | Return @True@ once an imported interface with dependent constructs is loaded.
+tcHasDepImports :: TcRn Bool
+tcHasDepImports = getGblEnv >>= readTcRef . tcg_has_dep_imports
+{-# INLINE tcHasDepImports #-}
+
+-- | Return @True@ when source-proof or retained family checks can be active.
+tcHasSourceProofEnv :: TcRn Bool
+tcHasSourceProofEnv = do
+  dflags <- getDynFlags
+  if gopt Opt_WriteSourceEquations dflags || gopt Opt_SuppressSourceEquations dflags
+    then return True
+    else tcHasDepImports
+{-# INLINE tcHasSourceProofEnv #-}
 
 -- | 'initIfaceLoad' can be used when there's no chance that the action will
 -- call 'typecheckIface' when inside a module loop and hence 'tcIfaceGlobal'.
@@ -2723,7 +2741,8 @@ initIfaceLoad :: HscEnv -> IfG a -> IO a
 initIfaceLoad hsc_env do_this
  = do let gbl_env = IfGblEnv {
                         if_doc = text "initIfaceLoad",
-                        if_rec_types = emptyKnotVars
+                        if_rec_types = emptyKnotVars,
+                        if_has_dep_imports = Nothing
                     }
       initTcRnIf IfaceTag (hsc_env { hsc_type_env_vars = emptyKnotVars }) gbl_env () do_this
 
@@ -2734,7 +2753,8 @@ initIfaceLoadModule :: HscEnv -> Module -> IfG a -> IO a
 initIfaceLoadModule hsc_env this_mod do_this
  = do let gbl_env = IfGblEnv {
                         if_doc = text "initIfaceLoadModule",
-                        if_rec_types = readTcRef <$> knotVarsWithout this_mod (hsc_type_env_vars hsc_env)
+                        if_rec_types = readTcRef <$> knotVarsWithout this_mod (hsc_type_env_vars hsc_env),
+                        if_has_dep_imports = Nothing
                     }
       initTcRnIf IfaceTag hsc_env gbl_env () do_this
 
@@ -2744,7 +2764,8 @@ initIfaceCheck :: SDoc -> HscEnv -> IfG a -> IO a
 initIfaceCheck doc hsc_env do_this
  = do let gbl_env = IfGblEnv {
                         if_doc = text "initIfaceCheck" <+> doc,
-                        if_rec_types = readTcRef <$> hsc_type_env_vars hsc_env
+                        if_rec_types = readTcRef <$> hsc_type_env_vars hsc_env,
+                        if_has_dep_imports = Nothing
                     }
       initTcRnIf IfaceTag hsc_env gbl_env () do_this
 

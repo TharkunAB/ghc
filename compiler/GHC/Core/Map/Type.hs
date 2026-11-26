@@ -302,7 +302,7 @@ eqDeBruijnType env_t1@(D env1 t1) env_t2@(D env2 t2) =
                 go (D env (varType v)) (D env' (varType v')) `andEq`
                 go (D (extendCME env v) ty) (D (extendCME env' v') ty')
           (DepFunTy vis v ty, DepFunTy vis' v' ty')
-              -> liftEquality (vis == vis') `andEq`
+              -> liftEquality (vis `eqDepFunVis` vis') `andEq`
                  go (D env (varType v)) (D env' (varType v')) `andEq`
                  go (D (extendCME env v) ty) (D (extendCME env' v') ty')
 
@@ -396,7 +396,7 @@ lkT (D env ty) m = go ty m
     go (ExistsTy flag v ty) = tm_exists >.> Map.lookup flag
                                        >=> lkG (D env (varType v))
                                    >=> lkG (D (extendCME env v) ty)
-    go (DepFunTy vis v ty)        = tm_depfun >.> Map.lookup vis
+    go (DepFunTy vis v ty)        = tm_depfun >.> Map.lookup (normalizeDepFunVis vis)
                                                >=> lkG (D env (varType v))
                                                >=> lkG (D (extendCME env v) ty)
     go (TyVarTy v)                 = tm_var    >.> lkVar env v
@@ -434,7 +434,7 @@ xtT (D env (ExistsTy flag v ty)) f m
                                 |>> xtG (D env (varType v))
                                 |>> xtG (D (extendCME env v) ty) f }
 xtT (D env (DepFunTy vis v ty)) f m
-  = m { tm_depfun = tm_depfun m |> alterTM vis
+  = m { tm_depfun = tm_depfun m |> alterTM (normalizeDepFunVis vis)
                                 |>> xtG (D env (varType v))
                                 |>> xtG (D (extendCME env v) ty) f }
 xtT (D env (TyVarTy v))       f m = m { tm_var    = tm_var m |> xtVar env v f }

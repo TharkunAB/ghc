@@ -13,7 +13,7 @@ import {-# SOURCE #-} GHC.Tc.Solver.Solve( solveSimpleWanteds )
 
 import GHC.Builtin.CoercionRules
   ( proveBoxedPairProjection, proveScopedSigmaClosure, proveScopedLambdaClosure
-  , proveScopedLambdaEta, proveScopedConstructorCase )
+  , proveScopedLambdaEta, proveScopedCaseTree )
 import GHC.Builtin.WiredIn.Types ( heqClass )
 import GHC.Tc.Gen.SourceTable ( sourceTableFamilyAppUse, sourceTableOwner )
 import GHC.Tc.Errors.Types ( RetainedQuantificationError(..), TcRnMessage(..) )
@@ -687,6 +687,7 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1 _ ty2 _
 -- See Note [Congruence for generated type lambdas].
 can_eq_nc ces _ _ ev eq_rel lhs _ rhs _
   | bothRewritten ces, isWanted ev
+  , not (isTyVarTy lhs || isTyVarTy rhs)
   , Just co <- proveLambdaCongruence lhs rhs
   = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
        ; stopWith ev "Checked scoped type lambda" }
@@ -755,8 +756,9 @@ can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
         else rewrite_both
 
     rewrite_both
-      = do { ((redn1@(Reduction _ xi1), deps1), rewriters1) <- rewrite_if_unrewritten (ces_rwL ces) ps_ty1
-           ; ((redn2@(Reduction _ xi2), deps2), rewriters2) <- rewrite_if_unrewritten (ces_rwR ces) ps_ty2
+      = do { source_proof_env <- wrapTcS TcM.tcHasSourceProofEnv
+           ; ((redn1@(Reduction _ xi1), deps1), rewriters1) <- rewrite_if_unrewritten source_proof_env (ces_rwL ces) ps_ty1
+           ; ((redn2@(Reduction _ xi2), deps2), rewriters2) <- rewrite_if_unrewritten source_proof_env (ces_rwR ces) ps_ty2
            ; new_ev <- rewriteEqEvidence ev NotSwapped redn1 redn2
                                          (rewriters1 S.<> rewriters2)
            ; traceTcS "can_eq_nc: go round again" (ppr new_ev $$ ppr xi1 $$ ppr xi2)
@@ -771,8 +773,8 @@ can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
                             , ces_rwR = True
                             }
            ; proof <- case eq_rel of
-               NomEq -> tryRetainedFamilyEquality new_ev xi1 xi2
-               ReprEq -> return Nothing
+               NomEq | source_proof_env -> tryRetainedFamilyEquality new_ev xi1 xi2
+               _ -> return Nothing
            ; case proof of
                Just (co, tables, uses) -> do
                  { let holes = foldr (flip addRewriter) emptyCoHoleSet
@@ -806,14 +808,15 @@ can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
       loc <- TcM.getSrcSpanM
       mapM_ (uncurry (TcM.recordSourceProofUse loc)) uses
 
-    rewrite_if_unrewritten :: Bool -> TcType
+    rewrite_if_unrewritten :: Bool -> Bool -> TcType
                            -> TcS ((Reduction, [(Name, [SourceProofRule])]), CoHoleSet)
-    rewrite_if_unrewritten already_rewritten ps_ty
+    rewrite_if_unrewritten _ already_rewritten ps_ty
       | already_rewritten
       = return ((mkReflRedn (eqRelRole eq_rel) ps_ty, []), emptyCoHoleSet)
+    rewrite_if_unrewritten True _ ps_ty
       | NomEq <- eq_rel, isWanted ev
       = rewriteWithSourceProofs ev ps_ty
-      | otherwise
+    rewrite_if_unrewritten _ _ ps_ty
       = do { (redn, rewriters) <- rewrite ev ps_ty
            ; return ((redn, []), rewriters) }
 
@@ -822,10 +825,22 @@ can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
 -- Only rewritten types end up below here.
 ----------------------------
 
--- See Note [Equality of retained constructor cases] in GHC.Builtin.CoercionRules.
+-- (EQNC6a): TyVarLHS fast path before dependent family-closure checks.
+-- None of proveScopedCaseTree, proveScopedSigmaClosure, or
+-- proveBoxedPairProjection can match when either endpoint is a type variable.
+can_eq_nc ces _rdr_env _envs ev eq_rel (TyVarTy tv1) ps_ty1 ty2 ps_ty2
+  | bothRewritten ces
+  = do { traceTcS "can_eq1" (ppr tv1 $$ ppr ty2)
+       ; canEqCanLHS ev eq_rel NotSwapped (TyVarLHS tv1) ps_ty1 ty2 ps_ty2 }
+can_eq_nc ces _rdr_env _envs ev eq_rel ty1 ps_ty1 (TyVarTy tv2) ps_ty2
+  | bothRewritten ces
+  = do { traceTcS "can_eq2" (ppr ty1 $$ ppr tv2)
+       ; canEqCanLHS ev eq_rel IsSwapped (TyVarLHS tv2) ps_ty2 ty1 ps_ty1 }
+
+-- See Note [Equality of retained case trees] in GHC.Builtin.CoercionRules.
 can_eq_nc ces _ _ ev eq_rel lhs _ rhs _
   | bothRewritten ces, isWanted ev
-  , Just co <- proveScopedConstructorCase lhs rhs
+  , Just co <- proveScopedCaseTree lhs rhs
   = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
        ; stopWith ev "Checked retained constructor case" }
 

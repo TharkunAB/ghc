@@ -2487,7 +2487,7 @@ lintType ClassAppTy{} = failWithL (text "Class selector application requires sco
 lintType (DepFunTy vis b body)
   = do { lintL (isNativeOpaqueValueId b)
            (text "Invalid retained runtime binder:" <+> ppr b <+> dcolon <+> ppr (varType b))
-       ; lintL (vis == DepFunInvisible || b `elemVarSet` tyCoVarsOfType body)
+       ; lintL (isInvisibleDepFunFlag vis || b `elemVarSet` tyCoVarsOfType body)
            (text "Vacuous visible retained dependent binder:" <+> ppr b)
        ; lintBinder LambdaBind b $
          do { lintType body
@@ -3058,7 +3058,7 @@ lintCoercion co@(DepFunCo visL visR b domain body_co)
                     (text "Unsupported retained domain conversion:" <+> ppr delta) }
        ; lintBinder LambdaBind b $
          do { lintCoercion body_co
-            ; lintL (coercionRole body_co /= Nominal || visL == visR)
+            ; lintL (coercionRole body_co /= Nominal || visL `eqDepFunVis` visR)
                 (text "Nominal retained coercion has different visibilities:" <+> ppr co)
                 -- See Note [Retained function visibility coercions] in GHC.Core.TyCo.Make.
             ; let Pair left right = coercionKind body_co

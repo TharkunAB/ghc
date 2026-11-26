@@ -756,6 +756,7 @@ rnIfaceConDecl
           , ifConCtxt          = con_ctxt0
           , ifConArgTys        = con_arg_tys0
           , ifConArgBinders    = con_arg_binders
+          , ifConRetainedFlags = con_retained_flags
           , ifConFields        = con_fields0
           , ifConStricts       = con_stricts0
           , ifConWrapper       = con_wrapper
@@ -786,6 +787,7 @@ rnIfaceConDecl
         , ifConCtxt          = con_ctxt
         , ifConArgTys        = con_arg_tys
         , ifConArgBinders    = con_arg_binders
+        , ifConRetainedFlags = con_retained_flags
         , ifConFields        = con_fields
         , ifConStricts       = con_stricts
         , ifConWrapper       = con_wrapper
@@ -973,7 +975,6 @@ rnIfaceIdDetails (IfSourceTableId table origin) = flip IfSourceTableId origin <$
 rnIfaceIdDetails (IfSourceDFunId methods literal) =
   IfSourceDFunId <$> mapM (\(sel, target) -> (,) <$> rnIfaceGlobal sel <*> rnIfaceGlobal target) methods
                  <*> traverse (\(sel, z, s) -> (,,) <$> rnIfaceGlobal sel <*> rnIfaceGlobal z <*> rnIfaceGlobal s) literal
-rnIfaceIdDetails (IfSourceProofId deps) = IfSourceProofId <$> traverse (fmap fst . rnSourceProofRule . (, [])) deps
 rnIfaceIdDetails details
   = pure details
 

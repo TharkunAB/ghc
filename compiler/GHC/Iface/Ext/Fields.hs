@@ -12,8 +12,6 @@ module GHC.Iface.Ext.Fields
    , deleteField
    -- * Known field names
    , sourceRuleHeadsField
-   , inferredRetainedBindersField
-   , depFunUnfoldingField
    )
 where
 
@@ -101,12 +99,3 @@ deleteField name (ExtensibleFields fs) = ExtensibleFields $ Map.delete name fs
 -- preserved when @-fno-code@ or @-fomit-interface-pragmas@ strips 'mi_rules'.
 sourceRuleHeadsField :: FieldName
 sourceRuleHeadsField = "ghc.source-rule-heads.v1"
-
--- | Extensible interface field recording 'InferredSpec' flags on invisible
--- @foreach@ binders in exported value and type-synonym signatures.
-inferredRetainedBindersField :: FieldName
-inferredRetainedBindersField = "ghc.inferred-retained-binders.v1"
-
--- | Extensible interface field recording checked native @DepFunTy@ user unfoldings.
-depFunUnfoldingField :: FieldName
-depFunUnfoldingField = "ghc.retained-depfun-unfolding.v1"

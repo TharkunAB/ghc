@@ -1882,12 +1882,14 @@ tcRetainedAppCapability :: TcSigmaType -> ExpRhoType -> [HsExprArg 'TcpRn]
 tcRetainedAppCapability sigma expected args
   = do { enabled <- xoptM LangExt.ExperimentalDependentTypes
        ; if enabled then return True else
+    do { has_dep <- tcHasDepImports
+       ; if not has_dep then return False else
     do { sigma' <- zonkAppTypeIfNeeded sigma
        ; expected_ty <- readExpType_maybe expected >>= mapM zonkAppTypeIfNeeded
        ; if any (hasNativeDependentExpr . Core.Type) (sigma' : maybeToList expected_ty)
          then return True else
     do { shapes <- mapM tcRetainedInferableArg [arg | EValArg { ea_arg = arg } <- args]
-       ; return (any snd shapes) } } }
+       ; return (any snd shapes) } } } }
 
 {- Note [Imported native application contracts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

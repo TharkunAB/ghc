@@ -55,7 +55,7 @@ import GHC.Iface.Recomp.Binary
 
 import GHC.Builtin( mkUnboundName )
 import GHC.Builtin.KnownKeys ( unrestrictedFunTyConKey, liftedTypeKindTyConKey
-                             , constraintKindTyConKey, manyDataConKey, intPrimTyConKey, wordPrimTyConKey )
+                             , constraintKindTyConKey )
 
 import GHC.Core( IsOrphan, isOrphan, UnfoldingCache(..) )
 import GHC.Core.Class
@@ -78,8 +78,7 @@ import GHC.Types.InlinePragma
 import GHC.Types.Tickish
 import GHC.Types.SrcLoc
 import GHC.Types.SourceText
-import GHC.Types.Var( VarBndr(..), binderVar, binderFlag, isInferredForAllTyFlag,
-                      isSpecifiedForAllTyFlag, visArgTypeLike )
+import GHC.Types.Var( VarBndr(..), DepFunTyFlag(..), binderVar, binderFlag, visArgTypeLike, isSpecifiedForAllTyFlag )
 
 import GHC.Unit.Module
 import GHC.Unit.Module.Warnings
@@ -98,7 +97,7 @@ import GHC.Utils.Fingerprint
 import GHC.Utils.Binary
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Misc( dropList, equalLength, filterByList, lengthExceeds, lengthIs,
+import GHC.Utils.Misc( dropList, equalLength, filterByList,
                        notNull, unzipWith, zipWithEqual )
 
 import GHC.Data.FastString
@@ -110,7 +109,7 @@ import Language.Haskell.Syntax.Text
 
 import Control.Monad
 import Control.DeepSeq
-import Data.Maybe (isJust, isNothing, mapMaybe)
+import Data.Maybe (isJust)
 import Data.Proxy
 import Data.Word (Word8)
 import qualified Data.Set as Set
@@ -405,6 +404,7 @@ data IfaceConDecl
         ifConArgTys  :: [(IfaceMult, IfaceType)],-- Arg types
         ifConArgBinders :: [Maybe IfLclName], -- [] for ordinary fields
           -- See Note [Retained constructor fields in interfaces].
+        ifConRetainedFlags :: [DepFunTyFlag],
         ifConFields  :: [FieldLabel],  -- ...ditto... (field labels)
         ifConStricts :: [IfaceBang],
           -- Empty (meaning all lazy),
@@ -640,7 +640,6 @@ data IfaceIdDetails
   | IfSourceDFunId [(IfExtName, IfExtName)] (Maybe (IfExtName, IfExtName, IfExtName))
   -- Rule heads can name private bindings. Their defining module and
   -- occurrence identify a RULE without requiring an Id declaration.
-  | IfSourceProofId [IfaceSourceProofHead] -- Legacy private interface encoding.
   | IfCheckedClosureSourceTableId IfExtName [IfExtName]
 
 -- | A source proof identifies a rule head by its module and occurrence.
@@ -1782,6 +1781,8 @@ pprIfaceConDecl ss gadt_style tycon tc_binders parent
     (early_ctxt, late_ctxt)
       | late_count == gadtTrailingContextOnly || ifaceHasTrailingContext late = ([], ctxt)
       | otherwise = (ctxt, [])
+    ifaceHasTrailingContext (binder : _) = isSpecifiedForAllTyFlag (ifaceForAllTyFlag (binderFlag binder))
+    ifaceHasTrailingContext []           = False
     pp_gadt_res_ty = pprIfaceForAllPart (map (ifaceUnmatchable,) late) late_ctxt
                                        (mk_user_con_res_ty eq_spec)
     ppr_gadt_ty
@@ -2124,7 +2125,6 @@ instance Outputable IfaceIdDetails where
             NominalSourceTable -> "SourceTable"
             ExecutableSourceTable -> "ExecutableSourceTable"
             FinalCoreSourceTable -> "FinalCoreSourceTable"
-  ppr (IfSourceProofId deps) = text "SourceProof" <+> ppr deps
   ppr (IfWorkerLikeId dmd) = text "StrWork" <> parens (ppr dmd)
   ppr (IfRecSelId tc _c b _fl table) = text "RecSel" <+> ppr tc
                             <+> ppWhen b (text "<naughty>")
@@ -2255,7 +2255,6 @@ freeNamesIfIdDetails (IfRecSelId tc first_con _ fl table) =
 freeNamesIfIdDetails IfVanillaId         = emptyNameSet
 freeNamesIfIdDetails (IfSourceTableId table _) = unitFN table
 freeNamesIfIdDetails (IfCheckedClosureSourceTableId table helpers) = mkNameSet (table : helpers)
-freeNamesIfIdDetails (IfSourceProofId _) = emptyNameSet
 freeNamesIfIdDetails (IfWorkerLikeId {}) = emptyNameSet
 freeNamesIfIdDetails IfDFunId            = emptyNameSet
 freeNamesIfIdDetails (IfSourceDFunId methods literal) =
@@ -2574,12 +2573,7 @@ details.
 
 instance Binary IfaceDecl where
     put_ bh (IfaceId name ty details idinfo deps) = do
-        -- Earlier readers accept source methods only on a ground DFun.
-        case (ty, details) of
-          (IfaceForAllTy{}, IfSourceDFunId{}) ->
-            requireIfaceEvidenceVersion bh PolymorphicSourceMethodEvidence
-          _ -> pure ()
-        putSourceProofTag bh deps SourceProofRuleInfoEvidence 0 11 12
+        putSourceProofTag bh deps 0 11 12
         putIfaceTopBndr bh name
         lazyPut bh (ty, details, idinfo)
         putSourceProofRules bh deps
@@ -2600,7 +2594,7 @@ instance Binary IfaceDecl where
         put_ bh a11
 
     put_ bh (IfaceSynonym a1 a6 a2 a3 a4 a5 deps) = do
-        putSourceProofTag bh deps SourceProofRuleAliasEvidence 3 9 13
+        putSourceProofTag bh deps 3 9 13
         putIfaceTopBndr bh a1
         put_ bh a2
         put_ bh a3
@@ -2652,10 +2646,9 @@ instance Binary IfaceDecl where
         put_deps <- case (branches, deps) of
             (_, []) -> putByte bh 6 >> pure (pure ())
             ([IfaceAxBranch { ifaxbLHS = IA_Nil }], [(0, rules)]) -> do
-                putSourceProofTag bh rules SourceProofRuleAxiomEvidence 6 10 14
+                putSourceProofTag bh rules 6 10 14
                 pure (putSourceProofRules bh rules)
             _ -> do
-                requireIfaceEvidenceVersion bh SourceProofRuleBranchesEvidence
                 putByte bh 15
                 pure (put_ bh deps)
         putIfaceTopBndr bh a1
@@ -2801,14 +2794,12 @@ instance Binary IfaceDecl where
           return (IfaceSynonym a1 a6 a2 a3 a4 a5 deps)
 
 -- | Keep the existing encoding when a declaration has no checked arguments.
-putSourceProofTag :: WriteBinHandle -> [IfaceSourceProofRule] -> IfaceEvidence
+putSourceProofTag :: WriteBinHandle -> [IfaceSourceProofRule]
                   -> Word8 -> Word8 -> Word8 -> IO ()
-putSourceProofTag bh deps old_feature unmarked coarse shaped
+putSourceProofTag bh deps unmarked coarse shaped
   | null deps = putByte bh unmarked
-  | any (not . null . snd) deps = do
-      requireIfaceEvidenceVersion bh SourceProofRuleArgumentsEvidence
-      putByte bh shaped
-  | otherwise = requireIfaceEvidenceVersion bh old_feature >> putByte bh coarse
+  | any (not . null . snd) deps = putByte bh shaped
+  | otherwise = putByte bh coarse
 
 -- | Write the rule dependencies in the encoding selected by the tag.
 putSourceProofRules :: WriteBinHandle -> [IfaceSourceProofRule] -> IO ()
@@ -2868,11 +2859,9 @@ instance Binary IfaceFamTyConFlav where
       case ctf of
         IfaceClosedTyFamTyCon mb      -> putByte bh 2 >> put_ bh mb
         IfaceAbstractClosedTyFamTyCon -> putByte bh 3
-        IfaceScopedClosedTyFamTyCon owner is_sum ax -> do
-          requireIfaceEvidenceVersion bh ScopedSigmaEvidence
+        IfaceScopedClosedTyFamTyCon owner is_sum ax ->
           putByte bh 4 >> put_ bh owner >> put_ bh is_sum >> put_ bh ax
-        IfaceLambdaClosedTyFamTyCon ax -> do
-          requireIfaceEvidenceVersion bh ScopedLambdaEvidence
+        IfaceLambdaClosedTyFamTyCon ax ->
           putByte bh 6 >> put_ bh ax
         IfaceBuiltInClosedTyFamTyCon  ->
           pprPanic "Cannot serialize IfaceBuiltInClosedTyFamTyCon (pretty-printing only)" Outputable.empty
@@ -2913,10 +2902,6 @@ instance Binary IfaceAT where
 
 instance Binary IfaceAxBranch where
     put_ bh (IfaceAxBranch a1 a2 a3 a4 a5 a6 a7) = do
-        when (any (primitive_binder intPrimTyConKey) a1) $
-          requireIfaceEvidenceVersion bh ExperimentalIntPrimIndexEvidence
-        when (any (primitive_binder wordPrimTyConKey) a1) $
-          requireIfaceEvidenceVersion bh ExperimentalWordPrimIndexEvidence
         put_ bh a1
         put_ bh a2
         put_ bh a3
@@ -2924,9 +2909,6 @@ instance Binary IfaceAxBranch where
         put_ bh a5
         put_ bh a6
         put_ bh a7
-      where
-        primitive_binder key (_, IfaceTyConApp tc IA_Nil) = ifaceTyConName tc `hasKey` key
-        primitive_binder _ _ = False
     get bh = do
         a1 <- get bh
         a2 <- get bh
@@ -2937,73 +2919,14 @@ instance Binary IfaceAxBranch where
         a7 <- get bh
         return (IfaceAxBranch a1 a2 a3 a4 a5 a6 a7)
 
--- The terminal binders distinguish the two context positions.
--- See Note [Terminal constructor type arguments] in GHC.Core.DataCon.
-ifaceHasTrailingContext :: [IfaceForAllBndr] -> Bool
-ifaceHasTrailingContext (binder : _) = isSpecifiedForAllTyFlag (ifaceForAllTyFlag (binderFlag binder))
-ifaceHasTrailingContext [] = False
-
-{- Note [Versioning extended ordered constructor telescopes]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Earlier readers reject a binder group after a leading context and before
-the first value field. They also reject existential binders in the
-interior-context format. When reification triggers either failure during
-external Template Haskell, the reader can block on the interpreter.
-Mark these orders in the header so an earlier reader rejects them before
-starting a splice. The new reader still accepts unmarked interfaces
-written by earlier compilers with support for these orders.
-
-A context can also precede a type argument when the constructor has
-no fields. The payload counts type arguments, contexts, and fields
-separately. Older readers require a field in this layout.
-Mark the fieldless order in the header to reject it before a splice.
-
-An ordered constructor can refine its result parameters. Store its
-result equalities in the ordinary EqSpec list. The source order
-counts only the written contexts. Older readers reject EqSpec in
-an ordered constructor, so mark this use before external TH.
-
-The original newtype tag has no order payload. Give ordered newtypes a
-separate tag and feature marker. Keep the original tag for other newtypes.
-
-Representation-polymorphic ordered newtypes need a wrapper that casts the
-field directly. Older readers can decode the telescope, but the wrapper
-they build can fail at a use with a kind coercion. Mark this form separately
-and preserve the exact encodings for ordinary and fixed-representation
-ordered newtypes. See Note [Desugaring unlifted newtypes] in GHC.Core.SimpleOpt.
-
-A type data constructor has no wrapper, but its promoted kind uses the
-source order. Store that order when it differs from the original format.
-Older readers reject the marker instead of loading a different kind.
--}
-
 instance Binary IfaceConDecls where
     put_ bh IfAbstractTyCon  = putByte bh 0
     put_ bh (IfDataTyCon False cs)
       | any ordered orders = do
-          when (any (isJust . conInteriorContext) orders) $
-            requireIfaceEvidenceVersion bh InteriorGadtContextEvidence
-          let forall_groups = mapMaybe conInteriorForAll orders
-          when (any (\gs -> gs `lengthIs` 1) forall_groups) $
-            requireIfaceEvidenceVersion bh InteriorGadtForAllEvidence
-          when (any (\gs -> gs `lengthExceeds` 1) forall_groups) $
-            requireIfaceEvidenceVersion bh RepeatedInteriorGadtForAllEvidence
-          when (any wider_order orders) $
-            requireIfaceEvidenceVersion bh OrderedGadtTelescopeEvidence
-          when (any has_inferred_late_binder cs) $
-            requireIfaceEvidenceVersion bh InferredOrderedGadtBindersEvidence
-          when (any has_extended_order cs) $
-            requireIfaceEvidenceVersion bh ExtendedOrderedGadtTelescopeEvidence
-          when (any (\con -> ordered (ifConSourceOrder con) && null (ifConArgTys con)) cs) $
-            requireIfaceEvidenceVersion bh FieldlessOrderedGadtTelescopeEvidence
-          when (any (\con -> ordered (ifConSourceOrder con) && not (null (ifConEqSpec con))) cs) $
-            requireIfaceEvidenceVersion bh RefinedOrderedGadtTelescopeEvidence
-          record_legacy
           putByte bh 5
           put_ bh cs
           put_ bh orders
       | any (/= 0) late = do
-          record_legacy
           putByte bh 4
           put_ bh cs
           put_ bh late
@@ -3013,40 +2936,8 @@ instance Binary IfaceConDecls where
         late = map legacyConOrder orders
         ordered OrderedConArgs{} = True
         ordered _ = False
-        wider_order order =
-          ordered order && isNothing (conInteriorContext order) && isNothing (conInteriorForAll order)
-        has_inferred_late_binder con
-          | OrderedConArgs (ConTypeArgs early : _) <- ifConSourceOrder con
-          = any (isInferredForAllTyFlag . ifaceForAllTyFlag . binderFlag)
-                (drop early (ifConUserTvBinders con))
-          | otherwise = False
-        -- See Note [Versioning extended ordered constructor telescopes].
-        has_extended_order con = case ifConSourceOrder con of
-          OrderedConArgs (ConTypeArgs _ : ConContextArgs _ : rest) ->
-            type_before_field rest
-          order -> isJust (conInteriorContext order) && not (null (ifConExTCvs con))
-        type_before_field (ConTypeArgs{} : _) = True
-        type_before_field (ConContextArgs{} : rest) = type_before_field rest
-        type_before_field _ = False
-        record_legacy = do
-          when (any (> 0) late) $
-            requireIfaceEvidenceVersion bh TerminalGadtForAllEvidence
-          when (gadtTrailingContextOnly `elem` late) $
-            requireIfaceEvidenceVersion bh TerminalGadtContextOnlyEvidence
-          when (any has_trailing_context cs) $
-            requireIfaceEvidenceVersion bh TerminalGadtTrailingContextEvidence
-          when (any has_leading_context cs) $
-            requireIfaceEvidenceVersion bh TerminalGadtContextEvidence
-        has_trailing_context con =
-          let count = legacyConOrder (ifConSourceOrder con)
-              binders = ifConUserTvBinders con
-          in count > 0 && ifaceHasTrailingContext (drop (length binders - count) binders)
-        has_leading_context con =
-          legacyConOrder (ifConSourceOrder con) > 0 &&
-          not (null (ifConCtxt con)) && not (has_trailing_context con)
     put_ bh (IfDataTyCon True cs)
       | any has_type_data_order orders = do
-          requireIfaceEvidenceVersion bh OrderedTypeDataTelescopeEvidence
           putByte bh 8
           put_ bh cs
           put_ bh orders
@@ -3054,9 +2945,6 @@ instance Binary IfaceConDecls where
       where orders = map ifConSourceOrder cs
     put_ bh (IfNewTyCon rep_poly c)
       | order@OrderedConArgs{} <- ifConSourceOrder c = do
-          requireIfaceEvidenceVersion bh OrderedNewtypeTelescopeEvidence
-          when rep_poly $
-            requireIfaceEvidenceVersion bh OrderedRepPolyNewtypeEvidence
           putByte bh (if rep_poly then 7 else 6)
           put_ bh c
           put_ bh order
@@ -3129,13 +3017,7 @@ instance Binary ConSourceGroup where
         _ -> fail "Invalid constructor argument group tag"
 
 instance Binary IfaceConDecl where
-    put_ bh (IfCon a1 a2 a3 univ_bndrs a4 a5 a6 ctxt a8 arg_binders a9 a10 a11 _) = do
-        unless (null arg_binders || null ctxt) $
-          requireIfaceEvidenceVersion bh RetainedConstructorContextEvidence
-        unless (null arg_binders || null a9) $ do
-          requireIfaceEvidenceVersion bh RetainedNamedRecordEvidence
-          unless (null univ_bndrs) $
-            requireIfaceEvidenceVersion bh RetainedRecordParametersEvidence
+    put_ bh (IfCon a1 a2 a3 univ_bndrs a4 a5 a6 ctxt a8 arg_binders retained_flags a9 a10 a11 _) = do
         putIfaceTopBndr bh a1
         put_ bh a2
         put_ bh a3
@@ -3145,6 +3027,7 @@ instance Binary IfaceConDecl where
         put_ bh ctxt
         put_ bh a8
         put_ bh arg_binders
+        unless (null arg_binders) $ put_ bh retained_flags
         put_ bh (length a9)
         mapM_ (put_ bh) a9
         put_ bh a10
@@ -3160,12 +3043,13 @@ instance Binary IfaceConDecl where
         a7 <- get bh
         a8 <- get bh
         a13 <- get bh
+        a14 <- if null a13 then pure [] else get bh
         n_fields <- get bh
         a9 <- replicateM n_fields (get bh)
         a10 <- get bh
         a11 <- get bh
         a12 <- get bh
-        return (IfCon a1 a2 a3 a12 a4 a5 a6 a7 a8 a13 a9 a10 a11 (LegacyConOrder 0))
+        return (IfCon a1 a2 a3 a12 a4 a5 a6 a7 a8 a13 a14 a9 a10 a11 (LegacyConOrder 0))
 
 instance Binary IfaceBang where
     put_ bh IfNoBang        = putByte bh 0
@@ -3233,39 +3117,22 @@ instance Binary IfaceFamInst where
         return (IfaceFamInst fam tys name orph)
 
 instance Binary IfaceRule where
-    put_ bh rule@(IfaceRule a1 a2 a3 a4 a5 a6 a7 a8) = do
+    put_ bh (IfaceRule a1 a2 a3 a4 a5 a6 a7 a8) = do
         put_ bh a1
         put_ bh a2
         put_ bh a3
         put_ bh a4
         put_ bh a5
         put_ bh a6
-        case a7 of
-          IfaceUserRule -> putByte bh 0
-          IfaceAutoRule -> putByte bh 1
-          IfaceRetainedAutoRule -> do
-            requireIfaceEvidenceVersion bh RetainedSpecRuleEvidence
-            putByte bh 2
-          IfaceErasedUserRule -> do
-            when (isOrphan (ifRuleOrph rule)) $
-              requireIfaceEvidenceVersion bh OrphanErasedUserRuleEvidence
-            putErased 3
-          IfaceAnchoredErasedRule -> do
-            requireIfaceEvidenceVersion bh AnchoredErasedRuleEvidence
-            putErased 4
-          IfaceRetainedUserRule -> do
-            requireIfaceEvidenceVersion bh RetainedUserRuleEvidence
-            putByte bh 5
-          IfaceImportedRetainedRule -> do
-            requireIfaceEvidenceVersion bh ImportedRetainedRuleEvidence
-            putByte bh 6
+        putByte bh $ case a7 of
+          IfaceUserRule             -> 0
+          IfaceAutoRule             -> 1
+          IfaceRetainedAutoRule     -> 2
+          IfaceErasedUserRule       -> 3
+          IfaceAnchoredErasedRule   -> 4
+          IfaceRetainedUserRule     -> 5
+          IfaceImportedRetainedRule -> 6
         put_ bh a8
-      where
-        putErased tag = do
-          requireIfaceEvidenceVersion bh ErasedUserRuleEvidence
-          when (isLexicalPackageRule rule) $
-            requireIfaceEvidenceVersion bh LexicalPackageRuleEvidence
-          putByte bh tag
     get bh = do
         a1 <- get bh
         a2 <- get bh
@@ -3318,15 +3185,12 @@ instance Binary IfaceAnnotation where
 instance Binary IfaceIdDetails where
     put_ bh IfVanillaId           = putByte bh 0
     put_ bh (IfRecSelId a b c d table)
-                                = do { case table of
-                                         Nothing -> putByte bh 1
-                                         Just _ -> do { requireIfaceEvidenceVersion bh RetainedNamedRecordEvidence
-                                                      ; putByte bh 10 }
-                                       ; put_ bh a
-                                       ; put_ bh b
-                                       ; put_ bh c
-                                       ; put_ bh d
-                                       ; mapM_ (put_ bh) table }
+                                = do { putByte bh (case table of { Nothing -> 1; Just _ -> 10 })
+                                     ; put_ bh a
+                                     ; put_ bh b
+                                     ; put_ bh c
+                                     ; put_ bh d
+                                     ; mapM_ (put_ bh) table }
     put_ bh (IfWorkerLikeId dmds) = putByte bh 2 >> put_ bh dmds
     put_ bh IfDFunId              = putByte bh 3
     put_ bh (IfSourceTableId table NominalSourceTable) = putByte bh 4 >> put_ bh table
@@ -3335,10 +3199,7 @@ instance Binary IfaceIdDetails where
     put_ bh (IfSourceDFunId methods Nothing) = putByte bh 5 >> put_ bh methods
     put_ bh (IfSourceDFunId methods (Just literal)) =
       putByte bh 6 >> put_ bh methods >> put_ bh literal
-    put_ bh (IfSourceProofId deps) =
-      requireIfaceEvidenceVersion bh SourceProofRuleEvidence >> putByte bh 9 >> put_ bh deps
     put_ bh (IfCheckedClosureSourceTableId table helpers) =
-      requireIfaceEvidenceVersion bh CheckedClosureSourceTableEvidence >>
       putByte bh 11 >> put_ bh table >> put_ bh helpers
     get bh = do
         h <- getByte bh
@@ -3357,7 +3218,6 @@ instance Binary IfaceIdDetails where
             6 -> IfSourceDFunId <$> get bh <*> (Just <$> get bh)
             7 -> flip IfSourceTableId ExecutableSourceTable <$> get bh
             8 -> flip IfSourceTableId FinalCoreSourceTable <$> get bh
-            9 -> IfSourceProofId <$> get bh
             10 -> IfRecSelId <$> get bh <*> get bh <*> get bh <*> get bh <*> (Just <$> get bh)
             11 -> IfCheckedClosureSourceTableId <$> get bh <*> get bh
             _ -> panic "Binary IfaceIdDetails: unknown tag"
@@ -3388,10 +3248,6 @@ instance Binary IfaceInfoItem where
 
 instance Binary IfaceUnfolding where
     put_ bh (IfCoreUnfold s c g e) = do
-        case s of
-          RetainedDefaultSrc -> requireIfaceEvidenceVersion bh RetainedDefaultEvidence
-          RetainedUserSrc -> requireIfaceEvidenceVersion bh RetainedUserUnfoldingEvidence
-          _ -> pure ()
         putByte bh 0
         put_ bh s
         putUnfoldingCache bh c
@@ -3485,29 +3341,18 @@ instance Binary IfaceExpr where
         put_ bh os
         put_ bh af
     put_ bh (IfaceIndexedConArg shape arg) = do
-        case shape of
-          IfaceSimpleIndexedCon -> do
-            requireIfaceEvidenceVersion bh IndexedConstructorOperandEvidence
-            putByte bh 17
-          IfaceGeneralIndexedCon -> do
-            requireIfaceEvidenceVersion bh GeneralIndexedConstructorOperandEvidence
-            putByte bh 18
-          IfaceDataFamilyCon -> do
-            requireIfaceEvidenceVersion bh RetainedDataFamilyConOperandEvidence
-            putByte bh 22
+        putByte bh $ case shape of
+          IfaceSimpleIndexedCon  -> 17
+          IfaceGeneralIndexedCon -> 18
+          IfaceDataFamilyCon     -> 22
         put_ bh arg
     put_ bh (IfaceRetainedCharArg arg) = do
-        requireIfaceEvidenceVersion bh RetainedCharOperandEvidence
         putByte bh 19
         put_ bh arg
     put_ bh (IfaceRetainedNaturalArg arg) = do
-        requireIfaceEvidenceVersion bh RetainedNaturalOperandEvidence
         putByte bh 20
         put_ bh arg
-    -- Public character and Natural operands use tags 19 and 20.
-    -- The v3 scoped dictionary Core capability selects tag 21.
     put_ bh (IfaceDictApp f dict) = do
-        requireIfaceEvidenceVersion bh ExperimentalScopedDictionaryCoreEvidence
         putByte bh 21
         put_ bh f
         put_ bh dict
@@ -3551,16 +3396,11 @@ instance Binary IfaceExpr where
         put_ bh r
         put_ bh torc
     put_ bh (IfacePack schema witness value) = do
-        requireIfaceEvidenceVersion bh ErasedExistentialEvidence
         putByte bh 15
         put_ bh schema
         put_ bh witness
         put_ bh value
-    put_ bh (IfaceUnpack witness value@(mult, _, _) package body) = do
-        requireIfaceEvidenceVersion bh ErasedExistentialEvidence
-        case mult of
-          IfaceTyConApp tc IA_Nil | ifaceTyConName tc `hasKey` manyDataConKey -> pure ()
-          _ -> requireIfaceEvidenceVersion bh LinearUnpackEvidence
+    put_ bh (IfaceUnpack witness value package body) = do
         putByte bh 16
         put_ bh witness
         put_ bh value
@@ -3671,44 +3511,18 @@ instance Binary IfaceTickish where
             _ -> panic ("get IfaceTickish " ++ show h)
 
 instance Binary IfaceConAlt where
-    put_ bh IfaceDefaultAlt   = putByte bh 0
-    put_ bh IfaceDefaultAltWithProof = do
-        requireIfaceEvidenceVersion bh IndexAliasEvidence
-        putByte bh 4
-    put_ bh (IfaceDataAlt aa) = putByte bh 1 >> put_ bh aa
-    put_ bh (IfaceLitAlt ac)  = putByte bh 2 >> put_ bh ac
-    put_ bh (IfaceDataAltWithProof con) = do
-        requireIfaceEvidenceVersion bh ConstructorCaseEvidence
-        putByte bh 3
-        put_ bh con
-    put_ bh (IfaceRetainedSiblingsAltWithProof con) = do
-        requireIfaceEvidenceVersion bh RetainedSiblingFieldsEvidence
-        putByte bh 8
-        put_ bh con
-    put_ bh (IfaceIndexedDataAltWithProof con) = do
-        requireIfaceEvidenceVersion bh IndexedConstructorCaseEvidence
-        putByte bh 5
-        put_ bh con
-    put_ bh (IfaceIndexedFieldsAltWithProof con) = do
-        requireIfaceEvidenceVersion bh IndexedConstructorFieldsEvidence
-        putByte bh 6
-        put_ bh con
-    put_ bh (IfaceIndexedExistentialAltWithProof con) = do
-        requireIfaceEvidenceVersion bh IndexedConstructorExistentialCaseEvidence
-        putByte bh 7
-        put_ bh con
-    put_ bh (IfaceIndexedOrdinaryAltWithProof con) = do
-        requireIfaceEvidenceVersion bh IndexedOrdinaryConstructorCaseEvidence
-        putByte bh 9
-        put_ bh con
-    put_ bh (IfaceIndexedDiagonalAltWithProof con) = do
-        requireIfaceEvidenceVersion bh IndexedDiagonalConstructorCaseEvidence
-        putByte bh 10
-        put_ bh con
-    put_ bh (IfaceOpaqueOrdinaryAltWithProof con) = do
-        requireIfaceEvidenceVersion bh OpaqueOrdinaryConstructorCaseEvidence
-        putByte bh 11
-        put_ bh con
+    put_ bh IfaceDefaultAlt                        = putByte bh 0
+    put_ bh (IfaceDataAlt aa)                      = putByte bh 1 >> put_ bh aa
+    put_ bh (IfaceLitAlt ac)                       = putByte bh 2 >> put_ bh ac
+    put_ bh (IfaceDataAltWithProof con)            = putByte bh 3 >> put_ bh con
+    put_ bh IfaceDefaultAltWithProof               = putByte bh 4
+    put_ bh (IfaceIndexedDataAltWithProof con)     = putByte bh 5 >> put_ bh con
+    put_ bh (IfaceIndexedFieldsAltWithProof con)   = putByte bh 6 >> put_ bh con
+    put_ bh (IfaceIndexedExistentialAltWithProof con) = putByte bh 7 >> put_ bh con
+    put_ bh (IfaceRetainedSiblingsAltWithProof con) = putByte bh 8 >> put_ bh con
+    put_ bh (IfaceIndexedOrdinaryAltWithProof con) = putByte bh 9 >> put_ bh con
+    put_ bh (IfaceIndexedDiagonalAltWithProof con) = putByte bh 10 >> put_ bh con
+    put_ bh (IfaceOpaqueOrdinaryAltWithProof con)  = putByte bh 11 >> put_ bh con
     get bh = do
         h <- getByte bh
         case h of
@@ -3880,9 +3694,10 @@ instance NFData IfaceConDecls where
     IfNewTyCon _ f1 -> rnf f1
 
 instance NFData IfaceConDecl where
-  rnf (IfCon f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13 _) =
+  rnf (IfCon f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f14 f11 f12 f13 _) =
     rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq`
-    rnf f7 `seq` rnf f8 `seq` rnf f9 `seq` rnf f10 `seq` rnf f11 `seq` rnf f12 `seq` rnf f13
+    rnf f7 `seq` rnf f8 `seq` rnf f9 `seq` rnf f10 `seq` rnf f14 `seq`
+    rnf f11 `seq` rnf f12 `seq` rnf f13
 
 instance NFData IfaceSrcBang where
   rnf (IfSrcBang f1 f2) = rnf f1 `seq` rnf f2 `seq` ()
@@ -3899,7 +3714,6 @@ instance NFData IfaceIdDetails where
     IfSourceTableId table origin -> rnf table `seq` origin `seq` ()
     IfCheckedClosureSourceTableId table helpers -> rnf table `seq` rnf helpers
     IfWorkerLikeId dmds -> rnf dmds `seq` ()
-    IfSourceProofId deps -> rnf deps
     IfRecSelId parent b c d table ->
       either rnf rnf parent `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf table
     IfDFunId -> ()

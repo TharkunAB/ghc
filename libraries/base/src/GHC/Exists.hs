@@ -2,7 +2,6 @@
 {-# LANGUAGE DependentTypes #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE NoImplicitPrelude #-}
-{-# OPTIONS_GHC -fomit-interface-pragmas -fno-write-if-simplified-core #-}
 
 {- | Explicit construction, constraint pairing, witness tokens, and
 combinators for erased existential packages (GHC Proposal #473).
@@ -46,10 +45,12 @@ data c /\ a where
 -- | Return the value and ignore the stored constraint dictionary.
 discardEvidence :: (c /\ a) -> a
 discardEvidence (MkCPair x) = x
+{-# INLINE discardEvidence #-}
 
 -- | Open a paired constraint dictionary and value in a continuation.
 withEvidence :: (c /\ a) -> (c => a -> r) -> r
 withEvidence (MkCPair x) k = k x
+{-# INLINE withEvidence #-}
 
 -- | An erased witness token for a type @a@ of any kind @k@.
 type Witness :: forall {k}. k -> Type
@@ -65,6 +66,7 @@ withExists
   -> r
 withExists pkg k = case pkg of
   Pack (type x) payload -> k x payload
+{-# INLINE withExists #-}
 
 -- | Transform the payload of an explicit existential package at the same
 -- erased witness.
@@ -76,6 +78,7 @@ mapExists
   -> (exists (x :: k) | q x)
 mapExists f pkg = case pkg of
   Pack (type x) payload -> Pack (type x) (f x payload)
+{-# INLINE mapExists #-}
 
 -- | Open a nested two-witness explicit existential package and pass both
 -- erased witnesses and the payload to a continuation.
@@ -88,3 +91,4 @@ uncurryExists
 uncurryExists pkg k = case pkg of
   Pack (type x) inner -> case inner of
     Pack (type y) payload -> k x y payload
+{-# INLINE uncurryExists #-}

@@ -783,9 +783,15 @@ loadInterface doc_str mod from
                 -- Check whether we have the interface already
         ; hsc_env <- getTopEnv
         ; let mhome_unit = ue_homeUnit (hsc_unit_env hsc_env)
+              note_dep_iface :: ModIface -> IfM any ()
+              note_dep_iface iface =
+                case if_has_dep_imports gbl_env of
+                  Just ref | mi_has_dep_constructs iface -> writeTcRef ref True
+                  _ -> pure ()
         ; liftIO (lookupIfaceByModule hug (eps_PIT eps) mod) >>= \case {
             Just iface
-                -> return (Succeeded iface) ;   -- Already loaded
+                -> do { note_dep_iface iface
+                      ; return (Succeeded iface) } ;   -- Already loaded
             _ -> do {
 
         -- READ THE MODULE IN
@@ -821,6 +827,7 @@ loadInterface doc_str mod from
         initIfaceLcl (mi_semantic_module iface) loc_doc (mi_boot iface) $
 
         dontLeakTheHUG $ do
+        ; note_dep_iface iface
 
         --      Load the new ModIface into the External Package State
         -- Even home-package interfaces loaded by loadInterface

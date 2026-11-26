@@ -80,7 +80,6 @@ import GHC.Types.Id.Info
 import GHC.Types.InlinePragma
 import GHC.Types.Literal
 import GHC.Types.Name
-import GHC.Types.Unique ( hasKey )
 import GHC.Types.Basic
 import GHC.Types.Var
 import GHC.Types.Var.Env
@@ -227,8 +226,12 @@ toIfaceTypeX fr (ExistsTy flag var body)
   = IfaceExistsTy flag (toIfaceTvBndrX fr var)
                   (toIfaceTypeX (fr `delVarSet` var) body)
 toIfaceTypeX fr (DepFunTy vis var res)
-  = IfaceDepFunTy vis (toIfaceIdBndrX fr var)
+  = IfaceDepFunTy vis' (toIfaceIdBndrX fr var)
                   (toIfaceTypeX (fr `delVarSet` var) res)
+  where
+    vis' | isInvisibleDepFunFlag vis, isInferredDepFunFlag vis || isInferredRetainedBinder var
+         = DepFunInferred
+         | otherwise = vis
 toIfaceTypeX fr ty@(AppTy {})  =
   -- Flatten as many argument AppTys as possible, then turn them into an
   -- IfaceAppArgs list.
@@ -888,10 +891,11 @@ mkIfaceApps _ iface [] = iface
 -- See Note [Vacuous retained applications in interfaces].
 mkIfaceApps ty iface (arg : rest)
   | not (isTyCoArg arg)
-  , DepFunTy DepFunInvisible b body <- coreFullView ty
+  , DepFunTy vis b body <- coreFullView ty
+  , isInvisibleDepFunFlag vis
   , isVacuousRetainedBinder b body
   , Nothing <- retainedArgIndex arg
-  = let co = mkDepFunCoWithVis DepFunInvisible DepFunVisible b MRefl (mkRepReflCo body)
+  = let co = mkDepFunCoWithVis vis DepFunVisible b MRefl (mkRepReflCo body)
         apply = IfaceApp (IfaceCast iface (toIfaceCoercion co)) (toIfaceExpr arg)
     in mkIfaceApps body apply rest
 mkIfaceApps ty iface (arg : rest)

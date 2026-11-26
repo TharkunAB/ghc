@@ -66,7 +66,7 @@ import GHC.Types.SourceFile
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Basic         ( RecFlag(..), TypeOrKind(..), VisArity )
 import GHC.Types.Unique        ( getUnique )
-import GHC.Types.Var           ( DepFunTyFlag(..), Specificity(..) )
+import GHC.Types.Var           ( isInvisibleDepFunFlag, Specificity(..) )
 
 import GHC.Types.CompleteMatch
 import GHC.Types.Hint ( SigLike(..) )
@@ -910,7 +910,7 @@ mkScopedSigBndrs sigs = \n -> lookupNameEnv env n `orElse` ([], [], [])
 
     retained_scopes pos ty
       | L _ (HsForEachTy ann bndrs body) <- ignoreParens ty
-      , hsForEachVisibility ann == DepFunInvisible
+      , isInvisibleDepFunFlag (hsForEachVisibility ann)
       = (pos, mapMaybe hsLTyVarName bndrs) : retained_scopes pos body
       | L _ (HsForEachTy _ bndrs body) <- ignoreParens ty
       = retained_scopes (pos + length bndrs) body

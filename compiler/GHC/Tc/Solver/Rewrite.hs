@@ -59,7 +59,11 @@ import GHC.Data.Maybe
 import GHC.Exts (oneShot)
 import Control.Monad
 import Control.Applicative (liftA3)
-import GHC.Builtin.WiredIn.Types (tYPETyCon, falseDataCon, trueDataCon)
+import GHC.Builtin.WiredIn.Types
+  ( tYPETyCon, falseDataCon, trueDataCon
+  , unmatchableDataConTyCon, matchableDataConTyCon
+  , manyDataConTyCon, oneDataConTyCon
+  , boxedRepDataConTyCon, liftedDataConTyCon, unliftedDataConTyCon )
 import Data.List ( find )
 import GHC.Data.List.Infinite (Infinite)
 import GHC.Data.Bag( listToBag, bagToList, isEmptyBag )
@@ -81,32 +85,32 @@ type FamilyEvidencePath = [(EqRel, TcType)]
 
 -- | The 'RewriteM' monad is a wrapper around 'TcS' with a 'RewriteEnv'.
 newtype RewriteM a
-  = RewriteM { runRewriteM :: RewriteEnv -> FamilyEvidencePath -> TcS a }
+  = RewriteM { runRewriteM :: RewriteEnv -> TcS a }
 
 -- | Smart constructor for 'RewriteM', as describe in Note [The one-shot state
 -- monad trick] in "GHC.Utils.Monad".
-mkRewriteM :: (RewriteEnv -> FamilyEvidencePath -> TcS a) -> RewriteM a
-mkRewriteM f = RewriteM (oneShot (\env -> oneShot (f env)))
+mkRewriteM :: (RewriteEnv -> TcS a) -> RewriteM a
+mkRewriteM f = RewriteM (oneShot f)
 {-# INLINE mkRewriteM #-}
 
 instance Monad RewriteM where
-  m >>= k  = mkRewriteM $ \env path ->
-             do { a  <- runRewriteM m env path
-                ; runRewriteM (k a) env path }
+  m >>= k  = mkRewriteM $ \env ->
+             do { a  <- runRewriteM m env
+                ; runRewriteM (k a) env }
 
 instance Applicative RewriteM where
-  pure x = mkRewriteM $ \_ _ -> pure x
+  pure x = mkRewriteM $ \_ -> pure x
   (<*>) = ap
 
 instance Functor RewriteM where
-  fmap f (RewriteM x) = mkRewriteM $ \env path -> fmap f (x env path)
+  fmap f (RewriteM x) = mkRewriteM $ \env -> fmap f (x env)
 
 instance HasDynFlags RewriteM where
   getDynFlags = liftTcS getDynFlags
 
 liftTcS :: TcS a -> RewriteM a
 liftTcS thing_inside
-  = mkRewriteM $ \_ _ -> thing_inside
+  = mkRewriteM $ \_ -> thing_inside
 
 -- convenient wrapper when you have a CtEvidence describing
 -- the rewriting operation
@@ -124,15 +128,14 @@ runRewrite loc flav eq_rel thing_inside
        ; source_lets <- getSourceLetScope
        ; used_cos_ref  <- newTcRef emptyUnivCoDeps
        ; rewriters_ref <- newTcRef emptyCoHoleSet
-       ; source_proof_ref <- newTcRef False
        ; let fmode = RE { re_loc       = resetCtLocDepth loc
                             -- Start reducing from zero
                         , re_flavour   = flav
                         , re_eq_rel    = eq_rel
                         , re_rewriters = rewriters_ref
                         , re_used_cos  = used_cos_ref
-                        , re_source_proof_family = source_proof_ref
-                        , re_source_proof_synonyms = Nothing
+                        , re_source_proof = Nothing
+                        , re_evidence_path = []
                         , re_native_lifting = emptyLiftingContext emptyInScopeSet
                         , re_source_lets = source_lets
                         , re_native_binders = native_binders
@@ -140,7 +143,7 @@ runRewrite loc flav eq_rel thing_inside
                         , re_zap_coercions = isEmptyVarEnv source_lets
                                              && isEmptyVarSet native_binders
                                              && gopt Opt_ZapCoercions dflags }
-       ; res <- runRewriteM thing_inside fmode []
+       ; res <- runRewriteM thing_inside fmode
        ; rewriters <- readTcRef rewriters_ref
        ; return (res, rewriters) }
 
@@ -153,12 +156,12 @@ getRewriteEnv = getRewriteEnvField id
 
 getRewriteEnvField :: (RewriteEnv -> a) -> RewriteM a
 getRewriteEnvField accessor
-  = mkRewriteM $ \env _ -> return (accessor env)
+  = mkRewriteM $ \env -> return (accessor env)
 
--- | Change the plugin-visible fields and keep the current rewrite path.
+-- | Update the rewriting environment in a nested scope.
 withRewriteEnv :: (RewriteEnv -> RewriteEnv) -> RewriteM a -> RewriteM a
-withRewriteEnv f action = mkRewriteM $ \env path ->
-  runRewriteM action (f env) path
+withRewriteEnv f action = mkRewriteM $ \env ->
+  runRewriteM action (f env)
 {-# INLINE withRewriteEnv #-}
 
 getEqRel :: RewriteM EqRel
@@ -179,10 +182,10 @@ getFlavourRole
 -- | Change the 'EqRel' in a 'RewriteM'.
 setEqRel :: EqRel -> RewriteM a -> RewriteM a
 setEqRel new_eq_rel thing_inside
-  = mkRewriteM $ \env path ->
+  = mkRewriteM $ \env ->
     if new_eq_rel == re_eq_rel env
-    then runRewriteM thing_inside env path
-    else runRewriteM thing_inside (env { re_eq_rel = new_eq_rel }) path
+    then runRewriteM thing_inside env
+    else runRewriteM thing_inside (env { re_eq_rel = new_eq_rel })
 {-# INLINE setEqRel #-}
 
 -- | Normalize a retained body with its runtime binder in scope.
@@ -202,22 +205,22 @@ withNativeLifting lc b thing_inside =
 -- See Note [Solving retained function equalities] in GHC.Tc.Solver.Equality.
 withoutExternalEvidence :: a -> RewriteM a -> RewriteM a
 withoutExternalEvidence fallback thing_inside
-  = mkRewriteM $ \env path ->
+  = mkRewriteM $ \env ->
     if not (re_fam_axioms_only env) && isEmptyVarSet (re_native_binders env)
     then do { mode <- getTcSMode
             ; if tcsmGivenOnly mode then return fallback
-              else runRewriteM thing_inside env path }
+              else runRewriteM thing_inside env }
     else return fallback
 {-# INLINE withoutExternalEvidence #-}
 
 bumpReductionDepthRM :: Type -> RewriteM a -> RewriteM a
 bumpReductionDepthRM ty (RewriteM thing_inside)
-  = mkRewriteM $ \env path -> do
+  = mkRewriteM $ \env -> do
       { loc' <- TcS.bumpReductionDepth (re_loc env) ty
       ; let !env' = env { re_loc = loc' }
             -- !env: bumpReductionDepth can be called a lot during rewriting
             -- so we force the new env to avoid accumulating thunks
-      ; thing_inside env' path }
+      ; thing_inside env' }
 
 recordRewriter :: CtEvidence -> RewriteM ()
 -- ^ Record that we have rewritten the target with this (equality) evidence
@@ -228,11 +231,11 @@ recordRewriter :: CtEvidence -> RewriteM ()
 --
 -- Also records the evidence coercion in 're_used_cos',
 -- as per Note [Computing coercion dependencies].
-recordRewriter (CtGiven (GivenCt { ctev_evar = evar })) = mkRewriteM $ \env _ ->
+recordRewriter (CtGiven (GivenCt { ctev_evar = evar })) = mkRewriteM $ \env ->
   updTcRef (re_used_cos env) (addUnivCoDepCoVar evar)
 recordRewriter (CtWanted (WantedCt { ctev_dest = dest })) =
   case dest of
-    HoleDest hole -> mkRewriteM $ \env _ ->
+    HoleDest hole -> mkRewriteM $ \env ->
       do { updTcRef (re_rewriters env) (`addRewriter` hole)
          ; updTcRef (re_used_cos env) (addUnivCoDepHole hole) }
     other -> pprPanic "recordRewriter: non-equality constraint" (ppr other)
@@ -332,12 +335,14 @@ collectSourceProofsAndTables
   :: RewriteM Reduction
   -> RewriteM (Reduction, [(TyCon, [TcType])], [(Name, [SourceProofRule])])
 collectSourceProofsAndTables action = do
-  synonyms_ref <- liftTcS $ newTcRef []
-  withRewriteEnv (\env -> env { re_source_proof_synonyms = Just synonyms_ref }) $ do
+  proof_ref <- liftTcS $ newTcRef (False, [])
+  withRewriteEnv (\env -> env { re_source_proof = Just proof_ref }) $ do
     redn <- action
-    axioms <- reductionSourceAxioms redn
-    synonyms <- liftTcS $ readTcRef synonyms_ref
-    let tables =
+    (marked_family, synonyms) <- liftTcS $ readTcRef proof_ref
+    let axioms = if marked_family
+                 then sourceProofAxioms (not (null synonyms)) (reductionCoercion redn)
+                 else []
+        tables =
           [ (tc, args)
           | (BranchedAxiom axiom _, proof) <- axioms
           , let tc = coAxiomTyCon axiom
@@ -679,41 +684,27 @@ rewrite_args_tc
                    -- Otherwise: no assumptions; use roles provided
   -> [Type]
   -> RewriteM ArgsReductions -- See the commentary on rewrite_args
-rewrite_args_tc tc = rewrite_args all_bndrs any_named_bndrs inner_ki emptyVarSet
-  -- NB: TyCon kinds are always closed
+rewrite_args_tc tc m_roles tys
+  | no_named_pi tc_kind
+  = case m_roles of
+      Nothing    -> rewrite_args_fast tys
+      Just roles -> rewrite_args_roles_fast roles tys
+  | otherwise
+  = let (all_bndrs, inner_ki, _) = split_pi_tys' tc_kind
+    in rewrite_args_slow all_bndrs inner_ki emptyVarSet
+         (fromMaybe (Inf.repeat Nominal) m_roles) tys
   where
-  -- There are many bang patterns in here. It's been observed that they
-  -- greatly improve performance of an optimized build.
-  -- The T9872 test cases are good witnesses of this fact.
+    tc_kind = tyConKind tc
 
-    (all_bndrs, inner_ki, any_named_bndrs) = split_pi_tys' (tyConKind tc)
-
-{-# INLINE rewrite_args #-}
-rewrite_args :: [(Type, PiTyBinder)] -> Bool -- Binders, and True iff any of them are
-                                     -- named.
-             -> Kind -> TcTyCoVarSet -- function kind; kind's free vars
-             -> Maybe (Infinite Role) -> [Type]    -- these are in 1-to-1 correspondence
-                                          -- Nothing: use all Nominal
-             -> RewriteM ArgsReductions
--- This function returns ArgsReductions (Reductions cos xis) res_co
---   coercions: co_i :: ty_i ~ xi_i, at roles given
---   types:     xi_i
---   coercion:  res_co :: typeKind(fun tys) ~N typeKind(fun xis)
--- That is, the result coercion relates the kind of some function (whose kind is
--- passed as the first parameter) instantiated at tys to the kind of that
--- function instantiated at the xis. This is useful in keeping rewriting
--- homogeneous. The list of roles must be at least as long as the list of
--- types.
-rewrite_args orig_binders
-             any_named_bndrs
-             orig_inner_ki
-             orig_fvs
-             orig_m_roles
-             orig_tys
-  = case (orig_m_roles, any_named_bndrs) of
-      (Nothing, False) -> rewrite_args_fast orig_tys
-      _ -> rewrite_args_slow orig_binders orig_inner_ki orig_fvs orig_roles orig_tys
-        where orig_roles = fromMaybe (Inf.repeat Nominal) orig_m_roles
+-- | Zero-allocation check that a 'Kind' has no dependent 'ForAllTy',
+-- 'DepFunTy', or 'DepDictTy' binders.
+no_named_pi :: Kind -> Bool
+no_named_pi (FunTy { ft_res = res }) = no_named_pi res
+no_named_pi (ForAllTy {})            = False
+no_named_pi (DepFunTy {})            = False
+no_named_pi (DepDictTy {})           = False
+no_named_pi ty | Just ty' <- coreView ty = no_named_pi ty'
+no_named_pi _                        = True
 
 {-# INLINE rewrite_args_fast #-}
 -- | fast path rewrite_args, in which none of the binders are named and
@@ -734,6 +725,30 @@ rewrite_args_fast orig_tys
     finish :: Reductions -> ArgsReductions
     finish redns = ArgsReductions redns MRefl
 
+{-# INLINE rewrite_args_roles_fast #-}
+-- | Fast path for non-Nominal rewriting when none of the binders are named.
+rewrite_args_roles_fast :: Infinite Role -> [Type] -> RewriteM ArgsReductions
+rewrite_args_roles_fast orig_roles orig_tys
+  = fmap (`ArgsReductions` MRefl) (go orig_roles orig_tys)
+  where
+    go :: Infinite Role -> [Type] -> RewriteM Reductions
+    go _ [] = pure $ Reductions [] []
+    go (Inf.Inf r rs) (ty : tys) = do
+      Reduction  co  xi  <- rewrite_arg_at_role r ty
+      Reductions cos xis <- go rs tys
+      pure $ Reductions (co : cos) (xi : xis)
+
+{-# INLINE rewrite_arg_at_role #-}
+rewrite_arg_at_role :: Role -> Type -> RewriteM Reduction
+rewrite_arg_at_role Nominal ty
+  = setEqRel NomEq $ rewrite_one ty
+rewrite_arg_at_role Representational ty
+  = setEqRel ReprEq $ rewrite_one ty
+rewrite_arg_at_role Phantom ty
+  -- See Note [Phantoms in the rewriter]
+  = do { ty' <- liftTcS $ zonkTcType ty
+       ; return $! mkReflRedn Phantom ty' }
+
 {-# INLINE rewrite_args_slow #-}
 -- | Slow path, compared to rewrite_args_fast, because this one must track
 -- a lifting context.
@@ -741,25 +756,10 @@ rewrite_args_slow :: [(Type, PiTyBinder)] -> Kind -> TcTyCoVarSet
                   -> Infinite Role -> [Type]
                   -> RewriteM ArgsReductions
 rewrite_args_slow binders inner_ki fvs roles tys
-  = do { rewritten_args <- zipWithM rw (Inf.toList roles) tys
+  = do { rewritten_args <- zipWithM rewrite_arg_at_role (Inf.toList roles) tys
        ; return $
            simplifyArgsWorker binders inner_ki fvs roles tys rewritten_args
        }
-  where
-    {-# INLINE rw #-}
-    rw :: Role -> Type -> RewriteM Reduction
-    rw Nominal ty
-      = setEqRel NomEq $
-        rewrite_one ty
-
-    rw Representational ty
-      = setEqRel ReprEq $
-        rewrite_one ty
-
-    rw Phantom ty
-    -- See Note [Phantoms in the rewriter]
-      = do { ty <- liftTcS $ zonkTcType ty
-           ; return $! mkReflRedn Phantom ty }
 
 ------------------
 {- Note [Rewriting retained dependent functions]
@@ -972,7 +972,7 @@ rewrite_one (TyConApp tc tys)
   = rewrite_ty_con_app tc tys
 
 rewrite_one (FunTy { ft_af = vis, ft_ma = ma, ft_mult = mult, ft_arg = ty1, ft_res = ty2 })
-  = do { ma_redn <- setEqRel NomEq $ rewrite_one ma
+  = do { ma_redn <- rewrite_nominal_closed ma
        ; arg_redn <- rewrite_one ty1
        ; res_redn <- rewrite_one ty2
 
@@ -982,22 +982,23 @@ rewrite_one (FunTy { ft_af = vis, ft_ma = ma, ft_mult = mult, ft_arg = ty1, ft_r
        ; let arg_rep = getRuntimeRep (reductionReducedType arg_redn)
              res_rep = getRuntimeRep (reductionReducedType res_redn)
 
-       ; (w_redn, arg_rep_redn, res_rep_redn) <- setEqRel NomEq $
-           liftA3 (,,) (rewrite_one mult)
-                       (rewrite_one arg_rep)
-                       (rewrite_one res_rep)
+       ; (w_redn, arg_rep_redn, res_rep_redn) <-
+           liftA3 (,,) (rewrite_nominal_closed mult)
+                       (rewrite_nominal_closed arg_rep)
+                       (rewrite_nominal_closed res_rep)
        ; role <- getRole
 
        ; let arg_rep_co = reductionCoercion arg_rep_redn
-                -- :: arg_rep ~ arg_rep_xi
-             arg_ki_co  = mkTyConAppCo Nominal tYPETyCon [arg_rep_co]
-                -- :: TYPE arg_rep ~ TYPE arg_rep_xi
-             casted_arg_redn = mkCoherenceRightRedn role arg_redn arg_ki_co
-                -- :: ty1 ~> arg_xi |> arg_ki_co
+             casted_arg_redn
+               | isReflCo arg_rep_co = arg_redn
+               | otherwise = mkCoherenceRightRedn role arg_redn
+                               (mkTyConAppCo Nominal tYPETyCon [arg_rep_co])
 
              res_rep_co = reductionCoercion res_rep_redn
-             res_ki_co  = mkTyConAppCo Nominal tYPETyCon [res_rep_co]
-             casted_res_redn = mkCoherenceRightRedn role res_redn res_ki_co
+             casted_res_redn
+               | isReflCo res_rep_co = res_redn
+               | otherwise = mkCoherenceRightRedn role res_redn
+                               (mkTyConAppCo Nominal tYPETyCon [res_rep_co])
 
           -- We must rewrite the representations, because that's what would
           -- be done if we used TyConApp instead of FunTy. These rewritten
@@ -1005,17 +1006,30 @@ rewrite_one (FunTy { ft_af = vis, ft_ma = ma, ft_mult = mult, ft_arg = ty1, ft_r
           -- Forgetting this caused #19677.
        ; return $! mkFunRedn role vis ma_redn w_redn casted_arg_redn casted_res_redn }
 
-rewrite_one (ForAllTy ma (Bndr tv vis) rho)
+rewrite_one (ForAllTy ma bndr@(Bndr tv vis) rho)
 -- TODO (RAE): This is inadequate, as it doesn't rewrite the kind of
 -- the bound tyvar. Doing so will require carrying around a substitution
 -- and the usual substTyVarBndr-like silliness. Argh.
 
 -- We allow for-alls when, but only when, no type function
 -- applications inside the forall involve the bound type variables.
+  | is_closed_matchability ma
+  = let !(bndrs, body) = split_closed_foralls [(ma, bndr)] rho
+    in mkHomoForAllRedn bndrs <$> rewrite_one body
+  | otherwise
   = do { ma_redn <- setEqRel NomEq $ rewrite_one ma
        ; redn <- rewrite_one rho
        ; return $! mkForAllRedn vis tv ma_redn
                      (mkReflRedn Nominal (varType tv)) redn }
+  where
+    is_closed_matchability (TyConApp tc [])
+      = tc == unmatchableDataConTyCon || tc == matchableDataConTyCon
+    is_closed_matchability _ = False
+
+    split_closed_foralls acc (ForAllTy ma' bndr' rest)
+      | is_closed_matchability ma'
+      = split_closed_foralls ((ma', bndr') : acc) rest
+    split_closed_foralls acc rest = (reverse acc, rest)
 
 rewrite_one (CastTy ty g)
   = do { redn <- rewrite_one ty
@@ -1031,6 +1045,18 @@ rewrite_one (CoercionTy co)
   = do { co' <- rewrite_co co
        ; role <- getRole
        ; return $! mkReflCoRedn role co' }
+
+rewrite_nominal_closed :: TcType -> RewriteM ReductionN
+rewrite_nominal_closed ty@(TyConApp tc [])
+  | tc == unmatchableDataConTyCon || tc == matchableDataConTyCon
+    || tc == manyDataConTyCon || tc == oneDataConTyCon
+  = pure $! mkReflRedn Nominal ty
+rewrite_nominal_closed ty@(TyConApp tc [TyConApp lev []])
+  | tc == boxedRepDataConTyCon
+  , lev == liftedDataConTyCon || lev == unliftedDataConTyCon
+  = pure $! mkReflRedn Nominal ty
+rewrite_nominal_closed ty = setEqRel NomEq $ rewrite_one ty
+{-# INLINE rewrite_nominal_closed #-}
 
 -- | "Rewrite" a coercion. Really, just zonk it so we can uphold
 -- (F1) of Note [Rewriting]
@@ -1128,13 +1154,17 @@ rewrite_vector :: Kind   -- of the function being applied to these arguments
                -> [Type] -- the args to rewrite
                -> RewriteM ArgsReductions
 rewrite_vector ki roles tys
+  | no_named_pi ki
   = do { eq_rel <- getEqRel
-       ; let mb_roles = case eq_rel of { NomEq -> Nothing; ReprEq -> Just roles }
-       ; rewrite_args bndrs any_named_bndrs inner_ki fvs mb_roles tys
-       }
-  where
-    (bndrs, inner_ki, any_named_bndrs) = split_pi_tys' ki
-    fvs                                = tyCoVarsOfType ki
+       ; case eq_rel of
+           NomEq  -> rewrite_args_fast tys
+           ReprEq -> rewrite_args_roles_fast roles tys }
+  | otherwise
+  = do { eq_rel <- getEqRel
+       ; let (bndrs, inner_ki, _) = split_pi_tys' ki
+             fvs                  = tyCoVarsOfType ki
+             eff_roles            = case eq_rel of { NomEq -> Inf.repeat Nominal; ReprEq -> roles }
+       ; rewrite_args_slow bndrs inner_ki fvs eff_roles tys }
 {-# INLINE rewrite_vector #-}
 
 
@@ -1326,10 +1356,14 @@ rewriteExactFamAppWithOrigins origins tc tys =
 -- | Inspect the coercion only after a relevant family reduced.
 -- See Note [Committing checked source family branches].
 reductionSourceAxioms :: Reduction -> RewriteM [(CoAxiomRule, Coercion)]
-reductionSourceAxioms redn = mkRewriteM $ \env _ -> do
-    marked_family <- readTcRef (re_source_proof_family env)
-    has_synonyms <- maybe (pure False) (fmap (not . null) . readTcRef) (re_source_proof_synonyms env)
-    return $ if marked_family then sourceProofAxioms has_synonyms (reductionCoercion redn) else []
+reductionSourceAxioms redn = mkRewriteM $ \env ->
+    case re_source_proof env of
+      Nothing -> return []
+      Just ref -> do
+        (marked_family, synonyms) <- readTcRef ref
+        return $ if marked_family
+                 then sourceProofAxioms (not (null synonyms)) (reductionCoercion redn)
+                 else []
 
 -- | Collect selected branches and private source-family axioms in a reduction.
 sourceProofAxioms :: Bool -> Coercion -> [(CoAxiomRule, Coercion)]
@@ -1620,15 +1654,14 @@ rewrite_exact_fam_app_step origins tc tys
       result <- try_to_reduce tc args rewriters
       case result of
         FreshReduction (Reduction co _) -> do
-          ref <- getRewriteEnvField re_source_proof_synonyms
-          case (ref, axiom_step co) of
-            (Just uses, Just (rule, proof)) -> do
+          mb_ref <- getRewriteEnvField re_source_proof
+          case (mb_ref, axiom_step co) of
+            (Just ref, Just (rule, proof)) -> do
               let arg_syns = expandedProofSynonyms (mkTyConApp tc args) (coercionLKind proof)
                   recorded = (if matches_origin rule then origins else []) ++ arg_syns
-              unless (null recorded) $ do
-                env <- getRewriteEnv
-                liftTcS $ writeTcRef (re_source_proof_family env) True
-                liftTcS $ updTcRef uses ([(rule, proof, owner, deps) | (owner, deps) <- recorded] ++)
+              unless (null recorded) $
+                liftTcS $ updTcRef ref $ \(_, syns) ->
+                  (True, [(rule, proof, owner, deps) | (owner, deps) <- recorded] ++ syns)
             _ -> return ()
         _ -> return ()
       return result
@@ -1644,8 +1677,8 @@ rewrite_exact_fam_app_step origins tc tys
 -- See Note [Mixed-flavour family rewrite cycles].
 withFamilyEvidence :: TyCon -> Maybe [TcType] -> RewriteM a -> RewriteM a
 withFamilyEvidence _ Nothing action = action
-withFamilyEvidence tc (Just args) action = mkRewriteM $ \env path ->
-  runRewriteM action env ((re_eq_rel env, mkTyConApp tc args) : path)
+withFamilyEvidence tc (Just args) action =
+  withRewriteEnv (\env -> env { re_evidence_path = (re_eq_rel env, mkTyConApp tc args) : re_evidence_path env }) action
 
 -- | Look up family evidence that this path has yet to use.
 lookupFamilyEvidence :: EqRel -> FamilyEvidencePath -> TyCon -> [TcType]
@@ -1661,8 +1694,8 @@ lookupFamilyEvidence eq_rel path tc args lookup_evidence = do
 
 -- | Look up family evidence in the current rewriting context.
 lookupOnceAtFamilyApp :: TyCon -> [TcType] -> TcS (Maybe a) -> RewriteM (Maybe a)
-lookupOnceAtFamilyApp tc args lookup_evidence = mkRewriteM $ \env path ->
-  lookupFamilyEvidence (re_eq_rel env) path tc args lookup_evidence
+lookupOnceAtFamilyApp tc args lookup_evidence = mkRewriteM $ \env ->
+  lookupFamilyEvidence (re_eq_rel env) (re_evidence_path env) tc args lookup_evidence
 
 {- Note [Mixed-flavour family rewrite cycles]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1784,12 +1817,12 @@ splitTyFamApp_maybe ty
 --
 -- See Note [Computing coercion dependencies].
 trackingDependencies :: RewriteM a -> RewriteM (UnivCoDeps, a)
-trackingDependencies thing_inside = mkRewriteM $ \env path ->
+trackingDependencies thing_inside = mkRewriteM $ \env ->
   do { let ref = re_used_cos env
      ; outer_deps <- readTcRef ref
      ; unless (isEmptyUnivCoDeps outer_deps) $
          writeTcRef ref emptyUnivCoDeps
-     ; res  <- runRewriteM thing_inside env path
+     ; res  <- runRewriteM thing_inside env
      ; deps <- readTcRef ref
        -- Restore the outer dependencies, adding on the inner ones.
      ; unless (isEmptyUnivCoDeps outer_deps) $
@@ -2242,7 +2275,7 @@ zapRedn :: UnivCoDeps -- ^ dependencies of the coercion being zapped
         -> TcType     -- ^ LHS type of the reduction
         -> Reduction
         -> RewriteM Reduction
-zapRedn deps lhs redn@(Reduction _co xi) = mkRewriteM $ \env _ ->
+zapRedn deps lhs redn@(Reduction _co xi) = mkRewriteM $ \env ->
   if not (re_zap_coercions env)
   then return redn
   else
@@ -2355,14 +2388,16 @@ data FamilyReduction = NoFamilyReduction
 -- | Try to reduce a type family application at the current role.
 -- See Note [How to normalise a family application].
 try_to_reduce :: TyCon -> [TcType] -> [TcPluginRewriter] -> RewriteM FamilyReduction
-try_to_reduce tc tys tc_rewriters = mkRewriteM $ \env path ->
+try_to_reduce tc tys tc_rewriters = mkRewriteM $ \env ->
   do { let eq_rel = re_eq_rel env
 
            finish origin redn = do
              { traceTcS "Eager T.F. reduction success" (vcat [ppr tc, ppr tys, ppr redn])
-             ; case closedFamilyTyConCoAxiom_maybe tc of
-                 Just ax | isMethodSourceFamily tc || not (null (co_ax_source_proof_rules ax)) ->
-                   writeTcRef (re_source_proof_family env) True
+             ; case re_source_proof env of
+                 Just ref
+                   | Just ax <- closedFamilyTyConCoAxiom_maybe tc
+                   , isMethodSourceFamily tc || not (null (co_ax_source_proof_rules ax)) ->
+                     updTcRef ref (\(_, syns) -> (True, syns))
                  _ -> return ()
              ; return $! origin $! case eq_rel of
                  NomEq  -> redn
@@ -2374,7 +2409,7 @@ try_to_reduce tc tys tc_rewriters = mkRewriteM $ \env path ->
              ; finish origin redn }
 
            match_fam
-             | re_fam_axioms_only env, isJust (re_source_proof_synonyms env) = do
+             | re_fam_axioms_only env, isJust (re_source_proof env) = do
                  fam_envs <- TcS.getFamInstEnvs
                  maybe (return NoFamilyReduction) (finish FreshReduction)
                    (reduceTyFamApp_maybe fam_envs Nominal tc tys)
@@ -2384,7 +2419,7 @@ try_to_reduce tc tys tc_rewriters = mkRewriteM $ \env path ->
 
            -- STEP 1b & STEP 4b, followed by the top-level instances.
            try_cache = do
-             { cached <- lookupFamilyEvidence eq_rel path tc tys (lookupFamAppCache tc tys)
+             { cached <- lookupFamilyEvidence eq_rel (re_evidence_path env) tc tys (lookupFamAppCache tc tys)
              ; maybe match_fam (use_external CachedReduction) cached }
 
        ; if re_fam_axioms_only env || not (isEmptyVarSet (re_native_binders env))

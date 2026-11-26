@@ -1075,7 +1075,7 @@ mkDepFunTy = mkDepFunTyWithVis DepFunVisible
 -- See Note [Retained function visibility].
 mkDepFunTyWithVis :: DepFunTyFlag -> Id -> Type -> Type
 mkDepFunTyWithVis vis b body
-  | vis == DepFunInvisible || b `elemVarSet` tyCoVarsOfType body
+  | isInvisibleDepFunFlag vis || b `elemVarSet` tyCoVarsOfType body
   = DepFunTy vis b body
   | otherwise = tcMkVisFunTy unmatchableDataConTy (idMult b) (varType b) body
 

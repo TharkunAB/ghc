@@ -133,9 +133,9 @@ import GHC.Data.FastString
 import GHC.Data.FastString.Env
 
 import Control.DeepSeq
+import qualified Data.ByteString as BS
 import Data.Char
 import Data.Data
-import Data.List (stripPrefix)
 import qualified Data.Semigroup as S
 import GHC.Exts( Int(I#), dataToTag# )
 
@@ -1085,10 +1085,17 @@ mkSourceSndOcc = mk_simple_deriv tcName "P2:"
 -- | Recover the source function's spelling from its family occurrence.
 sourceTableTermOcc :: OccName -> Maybe OccName
 sourceTableTermOcc occ
-  | isTcOcc occ, Just rest <- stripPrefix "T:field:" (occNameString occ)
-  , [(parent, ':' : selector)] <- reads rest
-  = Just (mkOccName (fieldName (mkFastString parent)) selector)
-  | isTcOcc occ, 'T':':':term <- occNameString occ = Just (mkVarOcc term)
+  | isTcOcc occ
+  , let bs = bytesFS (occNameFS occ)
+  , BS.length bs > 2
+  , BS.index bs 0 == 84 -- 'T'
+  , BS.index bs 1 == 58 -- ':'
+  = if "T:field:" `BS.isPrefixOf` bs
+    then case reads (drop 8 (occNameString occ)) of
+           [(parent, ':' : selector)] ->
+             Just (mkOccName (fieldName (mkFastString parent)) selector)
+           _ -> Nothing
+    else Just (mkVarOccFS (mkFastStringByteString (BS.drop 2 bs)))
   | otherwise = Nothing
 
 mkSuperDictAuxOcc :: Int -> OccName -> OccName

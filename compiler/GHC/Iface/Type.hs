@@ -35,7 +35,6 @@ module GHC.Iface.Type (
 
         -- Binary utilities
         putIfaceType, getIfaceType, ifaceTypeSharedByte,
-        IfaceEvidence(..), IfaceEvidenceVersion, requireIfaceEvidenceVersion,
         -- Equality testing
         isIfaceLiftedTypeKind,
         hasIfaceDepFunType,
@@ -88,7 +87,7 @@ import GHC.Core.Multiplicity ( pprArrowWithModifiers )
 import GHC.Core.Type ( isRuntimeRepTy, isMultiplicityTy, isLevityTy )
 import GHC.Core.TyCo.Rep( CoSel, UnivCoProvenance(..) )
 import GHC.Core.TyCon hiding ( pprPromotionQuote )
-import GHC.Core.Coercion.Axiom
+import GHC.Core.Coercion.Axiom ( BranchIndex )
 import GHC.Types.Var
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.Modules (gHC_INTERNAL_TYPENATS)
@@ -108,7 +107,7 @@ import qualified Data.Semigroup as Semi
 import Data.Word (Word8)
 import Control.Arrow (first)
 import Control.DeepSeq
-import Control.Monad ((<$!>), when)
+import Control.Monad ((<$!>))
 import Data.List (dropWhileEnd, stripPrefix)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Set as Set
@@ -2657,7 +2656,7 @@ ppr_co ctxt_prec (IfaceDepFunCo visL visR (_, var, arg) domain co)
         , visibility <+> pprIfaceCoercion co ]
   where
     visibility
-      | visL == visR = pprIfaceDepFunArrow visL
+      | visL `eqDepFunVis` visR = pprIfaceDepFunArrow visL
       | otherwise = braces (pprIfaceDepFunArrow visL <> char '~' <> pprIfaceDepFunArrow visR)
     ppr_domain IfaceMRefl = empty
     ppr_domain (IfaceMCo proof) = text "|>" <+> pprIfaceCoercion proof
@@ -2814,15 +2813,9 @@ instance Binary IfaceTyConSort where
    put_ bh (IfaceTupleTyCon arity sort) = putByte bh 1 >> put_ bh arity >> put_ bh sort
    put_ bh (IfaceSumTyCon arity)        = putByte bh 2 >> put_ bh arity
    put_ bh IfaceEqualityTyCon           = putByte bh 3
-   put_ bh IfacePartialSynonym          = do
-     requireIfaceEvidenceVersion bh PartialSynonymEvidence
-     putByte bh 4
-   put_ bh IfacePartialBuiltinFamily    = do
-     requireIfaceEvidenceVersion bh PartialBuiltinFamilyEvidence
-     putByte bh 5
-   put_ bh IfaceRetainedSiblings       = do
-     requireIfaceEvidenceVersion bh RetainedSiblingFieldsEvidence
-     putByte bh 6
+   put_ bh IfacePartialSynonym          = putByte bh 4
+   put_ bh IfacePartialBuiltinFamily    = putByte bh 5
+   put_ bh IfaceRetainedSiblings        = putByte bh 6
 
    get bh = do
        n <- getByte bh
@@ -2853,15 +2846,9 @@ instance Outputable IfaceTyLit where
 instance Binary IfaceTyLit where
   put_ bh (IfaceNumTyLit n)   = putByte bh 1 >> put_ bh n
   put_ bh (IfaceStrTyLit n)   = putByte bh 2 >> put_ bh n
-  put_ bh (IfaceCharTyLit n)  = putByte bh 3 >> put_ bh n
-  put_ bh (IfaceIntPrimTyLit n) = do
-    requireIfaceEvidenceVersion bh ExperimentalIntPrimIndexEvidence
-    putByte bh 4
-    put_ bh n
-  put_ bh (IfaceWordPrimTyLit n) = do
-    requireIfaceEvidenceVersion bh ExperimentalWordPrimIndexEvidence
-    putByte bh 5
-    put_ bh n
+  put_ bh (IfaceCharTyLit n)      = putByte bh 3 >> put_ bh n
+  put_ bh (IfaceIntPrimTyLit n)   = putByte bh 4 >> put_ bh n
+  put_ bh (IfaceWordPrimTyLit n)  = putByte bh 5 >> put_ bh n
 
   get bh =
     do tag <- getByte bh
@@ -2999,29 +2986,20 @@ putIfaceType _ (IfaceFreeTermAppTy fun _)
 putIfaceType bh (IfaceTermAppTy fun arg)
   = do { putByte bh 12; put_ bh fun; put_ bh arg }
 putIfaceType bh (IfaceExistsTy flag bndr body)
-  = do { case flag of
-           ExplicitExists -> do
-             requireIfaceEvidenceVersion bh ErasedExistentialEvidence
-             putByte bh 13
-           ImplicitExists -> do
-             requireIfaceEvidenceVersion bh ImplicitExistentialEvidence
-             putByte bh 14
+  = do { putByte bh (case flag of { ExplicitExists -> 13; ImplicitExists -> 14 })
        ; put_ bh bndr; put_ bh body }
 putIfaceType bh (IfaceDepFunTy vis bndr body)
   = do { putByte bh 10; put_ bh vis; put_ bh bndr; put_ bh body }
 putIfaceType bh (IfaceDepDictTy bndr body)
-  = do { requireIfaceEvidenceVersion bh ExperimentalScopedDictionaryEvidence
-       ; putByte bh 15; put_ bh bndr; put_ bh body }
+  = do { putByte bh 15; put_ bh bndr; put_ bh body }
 putIfaceType bh (IfaceClassAppTy method inst dict@IfaceTermVar{} arg@IfaceTermVar{})
-  = do { requireIfaceEvidenceVersion bh ExperimentalScopedDictionaryEvidence
-       ; putByte bh 16; put_ bh method; put_ bh inst; put_ bh dict; put_ bh arg }
+  = do { putByte bh 16; put_ bh method; put_ bh inst; put_ bh dict; put_ bh arg }
 putIfaceType _ ty@IfaceClassAppTy{}
   = pprPanic "Cannot serialise an unscoped class selector" (ppr ty)
 putIfaceType bh (IfaceTermVar var)
   = do { putByte bh 11; put_ bh var }
 putIfaceType bh (IfaceNamedTermVar name)
-  = do { requireIfaceEvidenceVersion bh NamedRetainedCallbackEvidence
-       ; putByte bh 17; put_ bh name }
+  = do { putByte bh 17; put_ bh name }
 
 putIfaceType bh (IfaceForAllTy ma aa ab) = do
         putByte bh 0
@@ -3120,72 +3098,6 @@ instance Binary IfaceMCoercion where
                  return $ IfaceMCo a
          _ -> panic ("get IfaceMCoercion " ++ show tag)
 
--- | A wire requirement recorded when the writer emits a retained form.
-data IfaceEvidence
-  = DepFunCoEvidence | ConstructorCaseEvidence | RetainedSpecRuleEvidence
-  | IndexAliasEvidence | ErasedExistentialEvidence | ScopedSigmaEvidence
-  | RetainedDefaultEvidence | ImplicitExistentialEvidence | ErasedUserRuleEvidence
-  | LexicalPackageRuleEvidence | OrphanErasedUserRuleEvidence | AnchoredErasedRuleEvidence
-  | RetainedUserRuleEvidence | ImportedRetainedRuleEvidence
-  | IndexedConstructorCaseEvidence | IndexedConstructorFieldsEvidence
-  | IndexedOrdinaryConstructorCaseEvidence
-  | IndexedConstructorOperandEvidence
-  | IndexedConstructorExistentialCaseEvidence | GeneralIndexedConstructorOperandEvidence
-  | RetainedUserUnfoldingEvidence | LinearUnpackEvidence | RetainedCharOperandEvidence
-  | MatchableProjectionEvidence
-  | RetainedNaturalOperandEvidence
-  | ExperimentalScopedDictionaryEvidence | ExperimentalScopedDictionaryCoreEvidence
-  | RetainedDataFamilyConOperandEvidence
-  | TerminalGadtForAllEvidence
-  | TerminalGadtContextEvidence
-  | TerminalGadtTrailingContextEvidence
-  | TerminalGadtContextOnlyEvidence
-  | InteriorGadtContextEvidence
-  | InteriorGadtForAllEvidence
-  | RepeatedInteriorGadtForAllEvidence
-  | OrderedGadtTelescopeEvidence
-  | InferredOrderedGadtBindersEvidence
-  | ExtendedOrderedGadtTelescopeEvidence
-  | ExperimentalIntPrimIndexEvidence
-  | ScopedLambdaEvidence
-  | RetainedConstructorContextEvidence
-  | HomeRuleInterfaceEvidence
-  | PartialSynonymEvidence
-  | SourceProofRuleEvidence
-  | SourceProofRuleAliasEvidence
-  | SourceProofRuleAxiomEvidence
-  | SourceProofRuleInfoEvidence
-  | SourceProofRuleArgumentsEvidence
-  | PolymorphicSourceMethodEvidence
-  | SourceProofRuleBranchesEvidence
-  | ExperimentalWordPrimIndexEvidence
-  | ScopedEnumCaseEvidence
-  | FieldlessOrderedGadtTelescopeEvidence
-  | RefinedOrderedGadtTelescopeEvidence
-  | ScopedConstructorCaseEvidence
-  | ScopedCaseResultEvidence
-  | OrderedNewtypeTelescopeEvidence
-  | ScopedOrderedCaseEvidence
-  | OrderedRepPolyNewtypeEvidence
-  | OrderedTypeDataTelescopeEvidence
-  | NamedRetainedCallbackEvidence
-  | PartialBuiltinFamilyEvidence
-  | ScopedSumDomainEvidence
-  | ComposedScopedSumDomainEvidence
-  | RetainedSiblingFieldsEvidence
-  | ScopedLambdaEtaEvidence
-  | RetainedNamedRecordEvidence
-  | RetainedRecordParametersEvidence
-  | CheckedClosureSourceTableEvidence
-  | IndexedDiagonalConstructorCaseEvidence
-  | OpaqueOrdinaryConstructorCaseEvidence
-  | RetainedDepFunUnfoldingEvidence
-  deriving (Bounded, Enum, Eq, Ord)
-
--- | Requirements of an interface payload. See Note [Versioning retained evidence]
--- in GHC.Iface.Binary.
-type IfaceEvidenceVersion = Set.Set IfaceEvidence
-
 -- | Check whether an interface function signature binds a native dependent value or dictionary.
 hasIfaceDepFunType :: IfaceType -> Bool
 hasIfaceDepFunType (IfaceDepFunTy {}) = True
@@ -3262,18 +3174,10 @@ hasIfaceScopedDictCo (IfaceSubCo c) = hasIfaceScopedDictCo c
 hasIfaceScopedDictCo (IfaceAxiomCo _ cos) = any hasIfaceScopedDictCo cos
 hasIfaceScopedDictCo _ = False
 
--- | Record a feature only while writing the full interface.
-requireIfaceEvidenceVersion :: WriteBinHandle -> IfaceEvidence -> IO ()
-requireIfaceEvidenceVersion bh required =
-  case findOptionalUserDataWriter (Proxy :: Proxy IfaceEvidence) bh of
-    Just notify -> putEntry notify bh required
-    Nothing -> pure () -- Fingerprinting does not write a version header.
-
 instance Binary IfaceCoercion where
   put_ _ (IfaceTermAppCo {})
        = ioError (userError "Opaque runtime call congruence interfaces are not implemented.")
   put_ bh (IfaceDepFunCo visL visR bndr domain body) = do
-       requireIfaceEvidenceVersion bh DepFunCoEvidence
        putByte bh 18
        put_ bh visL
        put_ bh visR
@@ -3433,31 +3337,7 @@ instance Binary IfaceUnivCoDep where
   get bh = IfaceUnivCoDepCoVar <$> get bh
 
 instance Binary IfaceAxiomRule where
-  put_ bh (IfaceAR_X n) = do
-    let uses flag = ifLclNameFS n `elem`
-          [existsCoRuleName flag Nominal, existsCoRuleName flag Representational]
-    when (uses ExplicitExists) $
-      requireIfaceEvidenceVersion bh ErasedExistentialEvidence
-    when (uses ImplicitExists) $
-      requireIfaceEvidenceVersion bh ImplicitExistentialEvidence
-    when (isJust (matchableProjectionDirection (ifLclNameFS n))) $
-      requireIfaceEvidenceVersion bh MatchableProjectionEvidence
-    when (ifLclNameFS n == scopedSigmaClosureName) $
-      requireIfaceEvidenceVersion bh ScopedSigmaEvidence
-    when (ifLclNameFS n == scopedLambdaClosureName) $
-      requireIfaceEvidenceVersion bh ScopedLambdaEvidence
-    when (ifLclNameFS n == scopedLambdaEtaName) $
-      requireIfaceEvidenceVersion bh ScopedLambdaEtaEvidence
-    when (ifLclNameFS n == scopedEnumCaseName) $
-      requireIfaceEvidenceVersion bh ScopedEnumCaseEvidence
-    when (ifLclNameFS n == scopedConstructorCaseName) $
-      requireIfaceEvidenceVersion bh ScopedConstructorCaseEvidence
-    when (ifLclNameFS n == scopedCaseResultName) $
-      requireIfaceEvidenceVersion bh ScopedCaseResultEvidence
-    when (ifLclNameFS n == scopedOrderedCaseName) $
-      requireIfaceEvidenceVersion bh ScopedOrderedCaseEvidence
-    putByte bh 0
-    put_ bh n
+  put_ bh (IfaceAR_X n)   = putByte bh 0 >> put_ bh n
   put_ bh (IfaceAR_U n)   = putByte bh 1 >> put_ bh n
   put_ bh (IfaceAR_B n i) = putByte bh 2 >> put_ bh n >> put_ bh i
 

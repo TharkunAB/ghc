@@ -717,8 +717,9 @@ tcDependentCaseWithMotive spec matches@(MG { mg_alts = L loc alternatives }) (Ch
                 extra = [ v | v <- tyCoVarsOfTypesList types, isId v, not (isCoVar v)
                         , isLocalId v, depends (varType v), v `notElem` named ]
             pure (resolved, scopedSort (named ++ extra))
-          use_application =
-            if not (dependent || isNativeIndexId index)
+          use_application = do
+            has_dep <- if dependent then pure True else tcHasDepImports
+            if not has_dep || not (dependent || isNativeIndexId index)
               then pure False
               else do
                 let retained_worker (ATcId { tct_id = w })

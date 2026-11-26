@@ -28,7 +28,6 @@ import GHC.StgToCmm.Types (CmmCgInfos (..))
 
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
-import GHC.Tc.Validity (ScopedSumDomainRequirement(..), scopedSumDomainRequirement)
 import GHC.Tc.Gen.SourceTable (sourceRuleOwners)
 
 import GHC.Iface.Warnings
@@ -47,9 +46,6 @@ import GHC.Core.Coercion.Axiom
 import GHC.Core.Dependent (hasNativeDependentProgram, hasRetainedRuleHead)
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Core.DataCon ( dataConName )
-import GHC.Core.TyCon ( synTyConRhs_maybe, tyConDataCons )
-import GHC.Core.Type ( inferredRetainedBinderFlags, retainedDataConBinderFlags )
 import GHC.Core.Ppr
 import GHC.Core.RoughMap ( RoughMatchTc(..) )
 
@@ -60,7 +56,7 @@ import GHC.Driver.Plugins
 
 import GHC.Types.Basic (isStableUserSource)
 import GHC.Types.Id
-import GHC.Types.Var ( varType )
+import GHC.Types.Var ( VarBndr(..) )
 import GHC.Types.Fixity.Env
 import GHC.Types.ForeignStubs (ForeignStubs (NoStubs))
 import GHC.Types.InlinePragma (isNeverActive)
@@ -100,12 +96,14 @@ import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.Deps
 import GHC.Unit.Module.WholeCoreBindings (encodeIfaceForeign, emptyIfaceForeign)
 
+import qualified Data.Bits as Bits
 import Data.Function
 import Data.List ( sortBy )
-import qualified Data.Map.Strict as Map
 import Data.Ord
 import Data.IORef
+import qualified Data.Set as Set
 import Data.Traversable
+import Data.Word ( Word8 )
 
 {-
 ************************************************************************
@@ -206,10 +204,10 @@ shareIface _ NormalCompression mi = do
 shareIface nc compressionLevel  mi = do
   bh <- openBinMem initBinMemSize
   start <- tellBinWriter bh
-  evidence <- putIfaceWithExtFields QuietBinIFace compressionLevel bh mi
+  putIfaceWithExtFields QuietBinIFace compressionLevel bh mi
   rbh <- shrinkBinBuffer bh
   seekBinReader rbh start
-  res <- getIfaceWithExtFields evidence nc rbh
+  res <- getIfaceWithExtFields nc rbh
   forceModIface res
   return res
 
@@ -395,14 +393,6 @@ mkIface_ hsc_env
         icomplete_matches = map mkIfaceCompleteMatch complete_matches
         !rdrs = mkIfaceTopEnv rdr_env
 
-    let declared = mkNameSet (map ifName decls)
-        roots = unionNameSets (declared : mkNameSet (concatMap availNames exports)
-                              : map freeNamesIfDecl decls ++ map freeNamesIfRule iface_rules)
-    scoped_sum_domains <- ifaceScopedSumDomainRequirement hsc_env type_env declared roots
-    fields0 <- case scoped_sum_domains of
-      Just DirectScopedSumDomain -> writeField scopedSumDomainField () emptyExtensibleFields
-      Just ComposedScopedSumDomain -> writeField composedScopedSumDomainField () emptyExtensibleFields
-      Nothing -> pure emptyExtensibleFields
     let iface_rule_heads = mkNameSet
           [ ifRuleHead rule
           | rule <- iface_rules
@@ -412,35 +402,27 @@ mkIface_ hsc_env
           source_rule_owners `unionNameSet` iface_rule_heads
         stripped_rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
           source_rule_owners `minusNameSet` iface_rule_heads
-    fields1 <- if null all_rule_heads
-      then pure fields0
+    fields <- if null all_rule_heads
+      then pure emptyExtensibleFields
       else writeFieldWith sourceRuleHeadsField
              (\bh -> putWithUserData QuietBinIFace NormalCompression bh
                        (all_rule_heads, stripped_rule_heads))
-             fields0
-    let inferred_retained =
-          [ (nm, flags)
-          | thing <- entities
-          , isExternalName (getName thing)
-          , (nm, flags) <- case thing of
-              AnId v -> [(getName thing, inferredRetainedBinderFlags (varType v))]
-              ATyCon tc
-                | Just rhs <- synTyConRhs_maybe tc ->
-                    [(getName thing, inferredRetainedBinderFlags rhs)]
-                | otherwise ->
-                    [ (dataConName dc, retainedDataConBinderFlags dc)
-                    | dc <- tyConDataCons tc ]
-              _ -> []
-          , or flags ]
-    fields2 <- if null inferred_retained
-      then pure fields1
-      else writeFieldWith inferredRetainedBindersField
-             (\bh -> putWithUserData QuietBinIFace NormalCompression bh inferred_retained)
-             fields1
-    -- See Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
-    fields <- if any has_special_depfun_unfold decls
-      then writeField depFunUnfoldingField () fields2
-      else pure fields2
+             emptyExtensibleFields
+    direct_dep_has_dep <- fmap or $ forM (Set.toList (dep_direct_mods deps)) $ \(_, uid, gwib) -> do
+      let mod = mkModule (RealUnit (Definite uid)) (gwib_mod gwib)
+      maybe False mi_has_dep_constructs <$> lookupIfaceByModuleHsc hsc_env mod
+    let has_existential = any decl_has_existential decls || any rule_has_existential iface_rules
+        has_depfun_unfold = any has_special_depfun_unfold decls
+        has_dep_constructs = has_existential
+                          || has_depfun_unfold
+                          || not (null all_rule_heads)
+                          || any decl_has_dep decls
+                          || any rule_has_dep iface_rules
+                          || direct_dep_has_dep
+        dep_flags :: Word8
+        !dep_flags = (if has_dep_constructs then Bits.bit ifaceHasDepConstructsBit else 0)
+                 .|. (if has_existential then Bits.bit ifaceHasExistentialBit else 0)
+                 .|. (if has_depfun_unfold then Bits.bit ifaceHasDepFunUnfoldingBit else 0)
 
     pure $ emptyPartialModIface this_mod
           -- Need to record this because it depends on the -instantiated-with flag
@@ -449,7 +431,8 @@ mkIface_ hsc_env
                                       then Nothing
                                       else Just semantic_mod)
           & set_mi_hsc_src          hsc_src
-          & set_mi_self_recomp      (stampPackageRuleProvider iface_rules <$> self_recomp)
+          & set_mi_dep_flags        dep_flags
+          & set_mi_self_recomp      self_recomp
           & set_mi_deps             deps
           & set_mi_exports          (mkIfaceExports exports)
 
@@ -552,50 +535,112 @@ mkIface_ hsc_env
            any go_bndr bs || any go_expr args
          go_info _ = False
 
--- | Check types and re-exports for the exact generated payload families.
-ifaceScopedSumDomainRequirement
-  :: HscEnv -> TypeEnv -> NameSet -> NameSet -> IO (Maybe ScopedSumDomainRequirement)
-ifaceScopedSumDomainRequirement env local declared roots =
-  go Nothing emptyNameSet (nameSetElemsStable roots)
-  where
-    go requirement _ [] = pure requirement
-    go requirement seen (name : rest)
-      | not (isExternalName name) || isWiredInName name || name `elemNameSet` seen =
-          go requirement seen rest
-      | otherwise = do
-          thing <- case lookupTypeEnv local name of
-            Just thing -> pure (Just thing)
-            Nothing -> lookupImported name
-          let next = extendNameSet seen name
-          case thing of
-            Just decl ->
-              let declaration_requirement = case decl of
-                    ATyCon tc -> scopedSumDomainRequirement tc
-                    _ -> Nothing
-                  required = max requirement declaration_requirement
-              in case required of
-                   Just ComposedScopedSumDomain -> pure required
-                   -- The roots include the free names of every emitted declaration.
-                   _ | name `elemNameSet` declared -> go required next rest
-                   _ -> go required next (declarationNames decl ++ rest)
-            Nothing -> go requirement next rest
+     type_has_exists (IfaceExistsTy {}) = True
+     type_has_exists (IfaceDepFunTy _ (w, _, dom) res) =
+       type_has_exists w || type_has_exists dom || type_has_exists res
+     type_has_exists (IfaceDepDictTy (w, _, dom) res) =
+       type_has_exists w || type_has_exists dom || type_has_exists res
+     type_has_exists (IfaceForAllTy ma (Bndr b _) body) =
+       type_has_exists ma || bndr_has_exists b || type_has_exists body
+     type_has_exists (IfaceFunTy _ ma w arg res) =
+       type_has_exists ma || type_has_exists w || type_has_exists arg || type_has_exists res
+     type_has_exists (IfaceAppTy f args) =
+       type_has_exists f || any type_has_exists (appArgsIfaceTypes args)
+     type_has_exists (IfaceTyConApp _ args) =
+       any type_has_exists (appArgsIfaceTypes args)
+     type_has_exists (IfaceTupleTy _ _ args) =
+       any type_has_exists (appArgsIfaceTypes args)
+     type_has_exists (IfaceCastTy ty _) = type_has_exists ty
+     type_has_exists _ = False
 
-    -- Imported declarations cannot expose a checked payload unless their
-    -- producer records the requirement. Avoid descending into ordinary imports.
-    lookupImported name = do
-      iface <- lookupIfaceByModuleHsc env (nameModule name)
-      case iface of
-        Just imported
-          | let fields = getExtensibleFields (mi_ext_fields imported)
-          , all (\(field, _) -> Map.notMember field fields) scopedSumDomainFields ->
-              pure Nothing
-        _ -> lookupType env name
+     bndr_has_exists (IfaceTvBndr (_, k)) = type_has_exists k
+     bndr_has_exists (IfaceIdBndr (w, _, t)) = type_has_exists w || type_has_exists t
 
-    declarationNames thing = nameSetElemsStable (freeNamesIfDecl signature)
-      where
-        signature = case tyThingToIfaceDecl thing of
-          decl@IfaceId{} -> decl { ifIdInfo = [], ifIdDetails = IfVanillaId }
-          decl -> decl
+     decl_has_existential (IfaceId { ifType = ty, ifIdInfo = infos }) =
+       type_has_exists ty || any info_has_pkg infos
+       where
+         info_has_pkg (HsUnfold _ (IfCoreUnfold _ _ _ rhs)) = hasIfacePackageExpr rhs
+         info_has_pkg _ = False
+     decl_has_existential (IfaceSynonym { ifSynRhs = rhs }) = type_has_exists rhs
+     decl_has_existential (IfaceData { ifCons = cons }) =
+       any (any (type_has_exists . snd) . ifConArgTys) (visibleIfConDecls cons)
+     decl_has_existential (IfaceAxiom { ifAxBranches = bs }) =
+       any (type_has_exists . ifaxbRHS) bs
+     decl_has_existential _ = False
+
+     rule_has_existential r =
+       isLexicalPackageRule r || any expr_has_exists (ifRuleRhs r : ifRuleArgs r)
+       where
+         expr_has_exists (IfaceType t) = type_has_exists t
+         expr_has_exists e = hasIfacePackageExpr e
+
+     type_has_dep (IfaceDepFunTy {}) = True
+     type_has_dep (IfaceDepDictTy {}) = True
+     type_has_dep (IfaceExistsTy {}) = True
+     type_has_dep (IfaceTermVar {}) = True
+     type_has_dep (IfaceNamedTermVar {}) = True
+     type_has_dep (IfaceTermAppTy {}) = True
+     type_has_dep (IfaceClassAppTy {}) = True
+     type_has_dep (IfaceForAllTy ma (Bndr b _) body) =
+       type_has_dep ma || bndr_has_dep b || type_has_dep body
+     type_has_dep (IfaceFunTy _ ma w arg res) =
+       type_has_dep ma || type_has_dep w || type_has_dep arg || type_has_dep res
+     type_has_dep (IfaceAppTy f args) =
+       type_has_dep f || any type_has_dep (appArgsIfaceTypes args)
+     type_has_dep (IfaceTyConApp tc args) =
+       isJust (sourceTableTermOcc (nameOccName (ifaceTyConName tc)))
+       || any type_has_dep (appArgsIfaceTypes args)
+     type_has_dep (IfaceTupleTy _ _ args) =
+       any type_has_dep (appArgsIfaceTypes args)
+     type_has_dep (IfaceCastTy ty _) = type_has_dep ty
+     type_has_dep _ = False
+
+     bndr_has_dep (IfaceTvBndr (_, k)) = type_has_dep k
+     bndr_has_dep (IfaceIdBndr (w, _, t)) = type_has_dep w || type_has_dep t
+
+     vbndr_has_dep (Bndr b _) = bndr_has_dep b
+
+     decl_has_dep (IfaceId { ifType = ty, ifIdDetails = dets, ifIdSourceProofRules = prfs }) =
+       not (null prfs) || dets_has_dep dets || type_has_dep ty
+       where
+         dets_has_dep (IfCheckedClosureSourceTableId {}) = True
+         dets_has_dep (IfRecSelId { ifRecSelSourceTable = Just _ }) = True
+         dets_has_dep _ = False
+     decl_has_dep (IfaceData { ifKind = k, ifBinders = bs, ifResKind = rk, ifCtxt = ctxt, ifCons = cons }) =
+       type_has_dep k || any vbndr_has_dep bs || type_has_dep rk
+       || any type_has_dep ctxt || any con_has_dep (visibleIfConDecls cons)
+       where
+         con_has_dep c = not (null (ifConArgBinders c))
+                      || any (type_has_dep . snd) (ifConArgTys c)
+                      || any (type_has_dep . snd) (ifConEqSpec c)
+                      || any type_has_dep (ifConCtxt c)
+     decl_has_dep (IfaceSynonym { ifKind = k, ifBinders = bs, ifResKind = rk, ifSynRhs = rhs, ifSynSourceProofRules = prfs }) =
+       not (null prfs) || type_has_dep k || any vbndr_has_dep bs || type_has_dep rk || type_has_dep rhs
+     decl_has_dep (IfaceFamily { ifKind = k, ifBinders = bs, ifResKind = rk, ifFamFlav = flav }) =
+       flav_has_dep flav || type_has_dep k || any vbndr_has_dep bs || type_has_dep rk
+       where
+         flav_has_dep IfaceConstrainedTypeFamilyTyCon = True
+         flav_has_dep (IfaceClosedTypeFamilyTyCon IfaceScopedClosedTyFamTyCon{}) = True
+         flav_has_dep (IfaceClosedTypeFamilyTyCon IfaceLambdaClosedTyFamTyCon{}) = True
+         flav_has_dep _ = False
+     decl_has_dep (IfaceAxiom { ifTyCon = tc, ifAxBranches = bs, ifAxSourceProofRules = prfs }) =
+       not (null prfs)
+       || (isNothing (sourceTableTermOcc (nameOccName (ifaceTyConName tc)))
+           && any (\b -> any type_has_dep (appArgsIfaceTypes (ifaxbLHS b)) || type_has_dep (ifaxbRHS b)) bs)
+     decl_has_dep (IfaceClass { ifKind = k, ifBinders = bs, ifBody = body }) =
+       type_has_dep k || any vbndr_has_dep bs || body_has_dep body
+       where
+         body_has_dep IfAbstractClass = False
+         body_has_dep (IfConcreteClass { ifClassCtxt = ctxt, ifATs = ats, ifSigs = sigs }) =
+           any type_has_dep ctxt
+           || any (\(IfaceAT d defs) -> decl_has_dep d || any type_has_dep defs) ats
+           || any (\(IfaceClassOp _ ty _) -> type_has_dep ty) sigs
+     decl_has_dep (IfacePatSyn { ifPatArgs = args, ifPatTy = pat_ty }) =
+       any type_has_dep (pat_ty : args)
+
+     rule_has_dep r =
+       ifRuleKind r `notElem` [IfaceUserRule, IfaceAutoRule]
+       || hasIfacePackageExpr (ifRuleRhs r)
 
 --------------------------
 defaultsToIfaceDefaults :: DefaultEnv -> [IfaceDefault]

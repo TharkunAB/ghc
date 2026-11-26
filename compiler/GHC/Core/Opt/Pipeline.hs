@@ -32,29 +32,16 @@ import GHC.Driver.Config.Core.Opt.WorkWrap ( initWorkWrapOpts )
 import GHC.Driver.Config.Core.Rules ( initRuleOpts )
 import GHC.Platform.Ways  ( hasWay, Way(WayProf) )
 
-import GHC.Builtin.KnownKeys (knownKeyOccName)
-import GHC.Builtin.Modules (gHC_INTERNAL_ERR, gHC_TYPES)
-import GHC.Builtin.PrimOps (PrimOp(RaiseOp))
 import GHC.Builtin.WiredIn.Types
-  (boolTy, charTy, naturalTy, pairTyCon, stringTy, tupleDataCon)
+  (boolTy, charTy, naturalTy, pairTyCon)
 import GHC.Core
-import GHC.Core.Make (getMkStringIds, mkCharExpr, mkListExpr, mkStringExprWith)
 import GHC.Core.TyCo.Rep (scaledThing)
 import GHC.Core.TyCo.Compare (eqType)
 import GHC.Core.Type
-  (Type, getTyVar_maybe, mkVisFunTyManyU, splitForAllForAllTyBinders,
-   splitFunTys, splitTyConApp_maybe)
-import GHC.Iface.Env (allocateGlobalBinder, lookupNameCache)
-import GHC.Tc.Utils.Env (lookupGlobal_maybe)
-import GHC.Data.Maybe (MaybeErr(..))
-import GHC.Types.Basic (Boxity(Boxed), LeftOrRight(..))
-import GHC.Types.Id (idName, idType, isExportedId, isGlobalId, isPrimOpId_maybe,
-                     isDataConWorkId_maybe, mkExportedVanillaId, setInlinePragma)
-import GHC.Types.Name (getOccName, nameModule_maybe, nameOccName, nameSrcSpan)
+  (Type, mkVisFunTyManyU, splitFunTys, splitTyConApp_maybe)
+import GHC.Types.Basic (LeftOrRight(..))
 import GHC.Types.Name.Occurrence (OccName, mkVarOcc, occNameString)
-import GHC.Types.TyThing (TyThing(AnId))
-import GHC.Types.Var (Var, VarBndr(Bndr))
-import GHC.Types.Var.Set (emptyVarSet, elemVarSet, extendVarSet)
+import GHC.Types.Var (Var)
 import GHC.Core.Dependent
 import GHC.Core.Lint ( endScopedDictionaryPassIO )
 import GHC.Core.Map.Expr ( eqCoreExpr )
@@ -62,7 +49,7 @@ import GHC.Core.SimpleOpt (simpleOptNativeProgram, simpleOptPgm)
 import GHC.Core.Opt.CSE  ( cseProgramWithMode )
 import GHC.Core.Rules   ( RuleBase, ruleCheckProgram, getRules )
 import GHC.Core.Ppr     ( pprCoreBindings, pprRules )
-import GHC.Core.Utils   ( dumpIdInfoOfProgram, diffBinds, stripTicksE, exprType )
+import GHC.Core.Utils   ( dumpIdInfoOfProgram, diffBinds, stripTicksE )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
 import GHC.Core.Opt.Simplify ( SimplifyExprOpts, SimplifyOpts(..), simplifyPgm )
 import GHC.Core.Opt.Simplify.Env (SimplMode(..))
@@ -95,10 +82,11 @@ import GHC.Utils.Panic
 import GHC.Unit.Module.ModGuts
 import GHC.Unit.External ( ExternalUnitCache )
 
+import GHC.Types.Id (idName, idType)
 import GHC.Types.Id.Info
 import GHC.Types.Tickish ( tickishIsCode )
-import GHC.Types.Var.Env ( mkRnEnv2, emptyInScopeSet, mkVarEnv, lookupVarEnv )
-import GHC.Types.InlinePragma ( CompilerPhase(..), neverInlinePragma )
+import GHC.Types.Var.Env ( mkRnEnv2, emptyInScopeSet )
+import GHC.Types.InlinePragma ( CompilerPhase(..) )
 import GHC.Types.Demand ( zapDmdEnvSig )
 import GHC.Types.Name.Env ( mkNameEnv, lookupNameEnv )
 import GHC.Types.Name.Ppr
@@ -106,9 +94,7 @@ import GHC.Types.Name.Set ( NameSet, mkNameSet, unionNameSet )
 import GHC.Types.Unique.Supply ( UniqueTag(..) )
 
 import Control.Monad
-import Control.Monad.Trans.Maybe (MaybeT(..))
 import Data.IORef ( IORef, modifyIORef' )
-import Data.Maybe (catMaybes, isJust)
 import GHC.Unit.Module
 
 {-
@@ -197,8 +183,7 @@ core2coreFor mb_mut_ref mode hsc_env guts@(ModGuts { mg_module  = mod
                                       | RetainedCore <- mode
                                       = optimized { mg_binds = simpleOptNativeProgram (mg_binds optimized) }
                                       | otherwise = optimized
-                              ; withTiming logger (text "Pair field observations" <+> brackets (ppr mod))
-                                  (const ()) (addPairObservations final) }
+                              ; pure final }
 
        ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl_stats
              "Grand total simplifier statistics"
@@ -283,112 +268,6 @@ observationArrow ty = do
 -- | Scalar codecs for the bounded native ABI.
 scalarCodec :: Type -> Bool
 scalarCodec ty = any (eqType ty) [boolTy, charTy, naturalTy]
-
--- | Publish hidden native entries for checked pair observations.
-addPairObservations :: ModGuts -> CoreM ModGuts
-addPairObservations guts = do
-    env <- getHscEnv
-    let emit occ owner rhs = do
-          name <- liftIO $ allocateGlobalBinder (hsc_NC env) this_mod occ
-                    Nothing (nameSrcSpan (idName owner))
-          let entry = mkExportedVanillaId name (exprType rhs)
-          pure (NonRec (setInlinePragma entry neverInlinePragma) rhs)
-
-        typedEntry mod occ = do
-          name <- lookupNameCache (hsc_NC env) mod occ
-          thing <- lookupType env name
-          pure $ case thing of
-            Just (AnId entry) -> idType entry `eqType` stringTy
-            _ -> False
-
-        importedProof owner arity
-          | Just mod <- nameModule_maybe (idName owner)
-          , RealUnit _ <- moduleUnit mod
-          , mod /= this_mod = liftIO $ do
-              let occ = nameOccName (idName owner)
-              legacy <- typedEntry mod (pairObservationOcc Nothing arity occ)
-              table <- if relayArity mod owner == Just arity
-                         then typedEntry mod scalarRecipeTableOcc else pure False
-              pure $ if legacy || table
-                then show (unitString (moduleUnit mod), moduleNameString (moduleName mod),
-                           occNameString occ, arity)
-                else ""
-          | otherwise = pure ""
-
-        proof seen expr = case collectArgs expr of
-          (Var fn, args)
-            | isPrimOpId_maybe fn == Just RaiseOp
-            , valArgCount args == 1 -> pure "!"
-            | null args
-            , Just body <- lookupVarEnv bodies fn
-            , not (fn `elemVarSet` seen) -> proof (extendVarSet seen fn) body
-            | isGlobalId fn
-            , all (not . isCoArg) args -> importedProof fn (valArgCount args)
-          (Case _ _ _ [Alt _ _ body], []) -> proof seen body
-          (Tick _ body, []) -> proof seen body
-          _ -> pure ""
-
-        addPair (owner, rhs)
-          | isExportedId owner
-          , isJust (pairObservationType (idType owner)) = do
-              (left, right) <- case collectBinders rhs of
-                ([_], body)
-                  | (Var con, [Type _, Type _, x, y]) <- collectArgs body
-                  , isDataConWorkId_maybe con == Just (tupleDataCon Boxed 2) ->
-                      (,) <$> proof emptyVarSet x <*> proof emptyVarSet y
-                _ -> pure ("", "")
-              let entry side flag = emit (pairObservationOcc (Just side) 1 (getOccName owner))
-                                         owner (recipe flag)
-              sequence [entry CLeft right, entry CRight left]
-          | otherwise = pure []
-
-        addRelay (owner, rhs)
-          | isExportedId owner
-          , Just arity <- relayArity this_mod owner = do
-              let (params, body) = collectBinders rhs
-              flag <- if length (filter isId params) == arity
-                        then proof emptyVarSet body
-                        else pure ""
-              pure (Just (owner, arity, flag))
-          | otherwise = pure Nothing
-    pair_entries <- concat <$> mapM addPair bindings
-    relay_rows <- catMaybes <$> mapM addRelay bindings
-    table_entry <- case relay_rows of
-      [] -> pure []
-      (owner, _, _):_ -> do
-        let rows = [(occNameString (getOccName fn), arity, flag)
-                   | (fn, arity, flag) <- relay_rows, not (null flag)]
-        packed <- liftIO $ packTable env (show rows)
-        (:[]) <$> emit scalarRecipeTableOcc owner packed
-    pure guts{mg_binds = mg_binds guts ++ pair_entries ++ table_entry}
-  where
-    this_mod = mg_module guts
-    bindings = flattenBinds (mg_binds guts)
-    bodies = mkVarEnv bindings
-    recipe = mkListExpr charTy . map mkCharExpr
-
-    -- Use the standard String codec for compiler metadata.
-    -- Early library builds can use the literal list when the codec is absent.
-    packTable env text = do
-      ids <- runMaybeT (getMkStringIds findUnpacker)
-      pure (maybe (recipe text) (`mkStringExprWith` text) ids)
-      where
-        findUnpacker key = MaybeT $ do
-          name <- lookupNameCache (hsc_NC env) gHC_TYPES (knownKeyOccName key)
-          thing <- lookupGlobal_maybe env name
-          pure $ case thing of
-            Succeeded (AnId unpacker) -> Just unpacker
-            _ -> Nothing
-
-    relayArity mod owner
-      | Just (_, result) <- observationArrow (idType owner)
-      , scalarCodec result = Just 1
-      | mod == gHC_INTERNAL_ERR
-      , let (parameters, body) = splitForAllForAllTyBinders (idType owner)
-            (_, args, result) = splitFunTys body
-      , Just variable <- getTyVar_maybe result
-      , variable `elem` [v | (_, Bndr v _) <- parameters] = Just (length args)
-      | otherwise = Nothing
 
 {-
 ************************************************************************

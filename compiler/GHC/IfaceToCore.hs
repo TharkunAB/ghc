@@ -33,14 +33,11 @@ import GHC.Prelude
 import GHC.ByteCode.Types
 
 import GHC.Driver.Session
-import GHC.Driver.Env ( hsc_NC )
 import GHC.Driver.Config.Core.Lint ( initLintConfig )
 
 import GHC.Builtin.CoercionRules (builtInCoAxiomRules)
 import GHC.Builtin.WiredIn.Types
 
-import GHC.Iface.Binary ( getWithUserData )
-import GHC.Iface.Ext.Fields ( inferredRetainedBindersField, readFieldWith )
 import GHC.Iface.Syntax
 import GHC.Iface.Load
 import GHC.Iface.Env
@@ -100,13 +97,11 @@ import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
-import GHC.Utils.Exception ( NonTermination(..), evaluate )
 
 import GHC.Data.Bag
 import GHC.Data.List.SetOps (hasNoDups)
 import GHC.Data.Maybe
 import GHC.Data.FastString
-import qualified GHC.Data.Strict as Strict
 
 import GHC.Types.Annotations
 import GHC.Types.SourceFile
@@ -145,7 +140,6 @@ import GHC.Unit.Module.WholeCoreBindings
 import Data.IORef
 import Data.Foldable
 import Data.List(nub)
-import qualified Data.Set as Set
 import GHC.Builtin.Modules   ( rOOT_MAIN )
 import GHC.Iface.Errors.Types
 
@@ -721,27 +715,23 @@ the forkM stuff.
 tcIfaceDecl :: Bool     -- ^ True <=> discard IdInfo on IfaceId bindings
             -> IfaceDecl
             -> IfL TyThing
-tcIfaceDecl = tc_iface_decl emptyNameEnv Nothing
+tcIfaceDecl = tc_iface_decl Nothing
 
-tc_iface_decl :: NameEnv [Bool]
-              -> Maybe Class  -- ^ For associated type/data family declarations
+tc_iface_decl :: Maybe Class  -- ^ For associated type/data family declarations
               -> Bool         -- ^ True <=> discard IdInfo on IfaceId bindings
               -> IfaceDecl
               -> IfL TyThing
-tc_iface_decl _ _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
+tc_iface_decl _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
                                        ifIdDetails = raw_details, ifIdInfo = info,
                                        ifIdSourceProofRules = deps })
   = do  { ty <- tcIfaceType iface_type
-        ; let (details, proof_rules) = case raw_details of
-                IfSourceProofId legacy -> (IfVanillaId, map (, []) legacy)
-                _ -> (raw_details, deps)
-        ; details <- tcIdDetails name ty details
+        ; details <- tcIdDetails name ty raw_details
         ; info <- tcIdInfo ignore_prags TopLevel name ty info
-        ; rules <- tcIfaceSourceProofRules proof_rules
+        ; rules <- tcIfaceSourceProofRules deps
         ; let checked_info = if null rules then info else setSourceProofRuleInfo info rules
         ; return (AnId (mkGlobalId details name ty checked_info)) }
 
-tc_iface_decl inferred_env _ _
+tc_iface_decl _ _
   (IfaceData {ifName = tc_name,
               ifKind = kind,
               ifCType = cType,
@@ -764,7 +754,7 @@ tc_iface_decl inferred_env _ _
        ; kind' <- tcIfaceType kind
        ; shape <- tcIfaceDataDomainShape binders ctxt mb_parent rdr_cons
        ; tycon <- fixM $ \ tycon -> do
-               { cons <- tcIfaceDataCons inferred_env tc_name tycon rdr_cons
+               { cons <- tcIfaceDataCons tc_name tycon rdr_cons
                ; bindIfaceTyConBinders_AT binders $ \ binders' ->
             do { res_kind' <- tcIfaceType res_kind
                ; when has_retained $ unless (res_kind' `eqType` liftedTypeKind) $
@@ -792,7 +782,7 @@ tc_iface_decl inferred_env _ _
            ; lhs_tys <- tcIfaceAppArgs arg_tys
            ; return (DataFamInstTyCon ax fam_tc lhs_tys) }
 
-tc_iface_decl _ _ _
+tc_iface_decl _ _
   (IfaceSynonym {ifName = tc_name,
                  ifKind = kind,
                  ifRoles = roles,
@@ -822,7 +812,7 @@ tc_iface_decl _ _ _
    where
      mk_doc n = text "Type synonym" <+> ppr n
 
-tc_iface_decl _ parent _ (IfaceFamily {ifName = tc_name,
+tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
                                      ifKind = kind,
                                      ifFamFlav = fam_flav,
                                      ifBinders = binders,
@@ -865,7 +855,7 @@ tc_iface_decl _ parent _ (IfaceFamily {ifName = tc_name,
           pprPanic "tc_iface_decl" $
             text "IfaceBuiltInClosedTyFamTyCon in interface file"
 
-tc_iface_decl _ _parent _ignore_prags
+tc_iface_decl _parent _ignore_prags
             (IfaceClass {ifName = tc_name,
                          ifKind = kind,
                          ifRoles = roles,
@@ -878,7 +868,7 @@ tc_iface_decl _ _parent _ignore_prags
        ; cls  <- buildAbstractClass tc_name kind' binders' roles fds
        ; return (ATyCon (classTyCon cls)) } }
 
-tc_iface_decl inferred_env _parent ignore_prags
+tc_iface_decl _parent ignore_prags
             (IfaceClass {ifName = tc_name,
                          ifKind = kind,
                          ifRoles = roles,
@@ -934,7 +924,7 @@ tc_iface_decl inferred_env _parent ignore_prags
              ; return (Just (GenericDM (noSrcSpan, ty'))) }
 
    tc_at cls (IfaceAT tc_decl if_def)
-     = do ATyCon tc <- tc_iface_decl inferred_env (Just cls) ignore_prags tc_decl
+     = do ATyCon tc <- tc_iface_decl (Just cls) ignore_prags tc_decl
           mb_def <- case if_def of
                       Nothing  -> return Nothing
                       Just def -> forkM (mk_at_doc tc)                 $
@@ -956,7 +946,7 @@ tc_iface_decl inferred_env _parent ignore_prags
    mk_at_doc tc = text "Associated type" <+> ppr tc
    mk_op_doc op_name op_ty = text "Class op" <+> sep [ppr op_name, ppr op_ty]
 
-tc_iface_decl _ _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
+tc_iface_decl _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
                               , ifAxBranches = branches, ifAxSourceSpans = spans
                               , ifAxSourceProofRules = deps, ifRole = role })
   = do { tc_tycon    <- tcIfaceTyCon tc
@@ -973,7 +963,7 @@ tc_iface_decl _ _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
                       { co_ax_source_proof_rules = rules }
        ; return (ACoAxiom axiom) }
 
-tc_iface_decl _ _ _ (IfacePatSyn{ ifName = name
+tc_iface_decl _ _ (IfacePatSyn{ ifName = name
                               , ifPatMatcher = if_matcher
                               , ifPatBuilder = if_builder
                               , ifPatIsInfix = is_infix
@@ -1068,14 +1058,8 @@ mk_top_id (IfLclTopBndr raw_name iface_type info details) = do
 
 -- | Read declarations, omitting optional templates outside the supported subset.
 tcIfaceDeclsFromIface :: Bool -> ModIface -> IfL [(Name, TyThing)]
-tcIfaceDeclsFromIface ignore_prags iface = do
-  hsc_env <- getTopEnv
-  mb_inferred <- liftIO $
-    readFieldWith inferredRetainedBindersField
-      (getWithUserData (hsc_NC hsc_env))
-      (mi_ext_fields iface)
-  let inferred_env = maybe emptyNameEnv mkNameEnv mb_inferred
-  concatMapM (tc_iface_decl_with_inferred inferred_env ignore_prags) (ifaceDeclsForTc iface)
+tcIfaceDeclsFromIface ignore_prags iface =
+  tcIfaceDecls ignore_prags (ifaceDeclsForTc iface)
 
 tcIfaceDecls :: Bool
           -> [(Fingerprint, IfaceDecl)]
@@ -1088,19 +1072,18 @@ tcIfaceDecls ignore_prags ver_decls
 -- Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
 ifaceDeclsForTc :: ModIface -> [(Fingerprint, IfaceDecl)]
 ifaceDeclsForTc iface
-  | FullIfaceBinHandle (Strict.Just (features, _)) <- mi_hi_bytes iface
-  , any (`Set.member` features) [ErasedExistentialEvidence, ImplicitExistentialEvidence]
-  = [(fingerprint, prune (Set.member RetainedDepFunUnfoldingEvidence features) decl)
+  | mi_has_existential iface
+  = [(fingerprint, prune (mi_has_depfun_unfolding iface) decl)
     | (fingerprint, decl) <- mi_decls iface]
   | otherwise = mi_decls iface
   where
     prune allow_depfun decl@IfaceId { ifType = ty, ifIdInfo = info }
-      = decl { ifIdInfo = filter (keep (allow_depfun && hasIfaceDepFunType ty)) info }
+      = decl { ifIdInfo = filter (keep (allow_depfun || not (hasIfaceDepFunType ty))) info }
     prune _ decl = decl
 
-    keep allow_depfun (HsUnfold _ (IfCoreUnfold src _ _ rhs))
+    keep allow_stable_user (HsUnfold _ (IfCoreUnfold src _ _ rhs))
       | RetainedUserSrc <- src = True
-      | allow_depfun, isStableUserSource src = True
+      | allow_stable_user, isStableUserSource src = True
       | otherwise = isCompulsorySource src || not (hasIfacePackageExpr rhs)
     keep _ _ = True
 
@@ -1110,12 +1093,10 @@ The retained optimizer can process Pack and Unpack. An optional template
 with these expressions can cross an interface when its top-level binding
 has the RetainedUserSrc tag. The tag selects that optimizer in a client.
 Check the expression forms, types and scope before using the template.
-Check nested unfolding templates in their own thunks. Older readers know
-the package and stable-template tags and discard the optional template.
-They can still call the original object code.
+Check nested unfolding templates in their own thunks.
 
-Check the serialized syntax only when the interface header records an
-erased existential tag. This leaves ordinary interface loading unchanged
+Check the serialized syntax only when the interface records an
+existential construct. This leaves ordinary interface loading unchanged
 and keeps the typed unfolding lazy. See Note [Lazily checking Unfoldings].
 Keep mandatory templates. Restricted SimpleOpt must expand them before
 the driver checks whether the result can enter optimization.
@@ -1125,29 +1106,12 @@ tc_iface_decl_fingerprint :: Bool                    -- Don't load pragmas into 
           -> (Fingerprint, IfaceDecl)
           -> IfL [(Name,TyThing)]   -- The list can be poked eagerly, but the
                                     -- TyThings are forkM'd thunks
-tc_iface_decl_fingerprint = tc_iface_decl_with_inferred emptyNameEnv
-
-tc_iface_decl_with_inferred :: NameEnv [Bool]
-          -> Bool
-          -> (Fingerprint, IfaceDecl)
-          -> IfL [(Name,TyThing)]
-tc_iface_decl_with_inferred inferred_env ignore_prags (_version, decl)
+tc_iface_decl_fingerprint ignore_prags (_version, decl)
   = do  {       -- Populate the name cache with final versions of all
                 -- the names associated with the decl
           let !main_name = ifName decl
                 -- Force this field access, as `main_name` thunk will otherwise
                 -- be retained in the thunk created by `forkM`.
-              restore_inferred nm thing0
-                | Just flags <- lookupNameEnv inferred_env nm
-                = case thing0 of
-                    AnId v ->
-                      AnId (setVarType v (snd (applyInferredRetainedBinderFlags flags (varType v))))
-                    ATyCon tc | Just rhs <- synTyConRhs_maybe tc ->
-                      let rhs' = snd (applyInferredRetainedBinderFlags flags rhs)
-                      in ATyCon (buildSynTyCon (tyConName tc) (tyConKind tc) (tyConBinders tc)
-                                               (tyConResKind tc) (tyConRoles tc) rhs')
-                    _ -> thing0
-                | otherwise = thing0
 
         -- Typecheck the thing, lazily
         -- NB. Firstly, the laziness is there in case we never need the
@@ -1157,8 +1121,7 @@ tc_iface_decl_with_inferred inferred_env ignore_prags (_version, decl)
         -- which includes its nameParent.
 
         ; thing <- forkM doc $ do { bumpDeclStats main_name
-                                  ; thing0 <- tc_iface_decl inferred_env Nothing ignore_prags decl
-                                  ; return (restore_inferred main_name thing0) }
+                                  ; tc_iface_decl Nothing ignore_prags decl }
 
         -- Populate the type environment with the implicitTyThings too.
         --
@@ -1275,8 +1238,8 @@ tc_ax_branch loc (IfaceAxBranch { ifaxbTyVars = tv_bndrs
                          , cab_overlaps = placeHolderOverlaps
                          , cab_incomps  = placeHolderIncomps }) }
 
-tcIfaceDataCons :: NameEnv [Bool] -> Name -> TyCon -> IfaceConDecls -> IfL AlgTyConRhs
-tcIfaceDataCons inferred_env tycon_name tycon if_cons
+tcIfaceDataCons :: Name -> TyCon -> IfaceConDecls -> IfL AlgTyConRhs
+tcIfaceDataCons tycon_name tycon if_cons
   = case if_cons of
         IfAbstractTyCon
           -> return AbstractTyCon
@@ -1301,6 +1264,7 @@ tcIfaceDataCons inferred_env tycon_name tycon if_cons
                          ifConUserTvBinders = user_bndrs,
                          ifConName = dc_name, ifConWrapper = has_wrapper,
                          ifConArgBinders = arg_binders,
+                         ifConRetainedFlags = retained_flags,
                          ifConCtxt = ctxt, ifConEqSpec = spec,
                          ifConArgTys = args, ifConFields = lbl_names,
                          ifConStricts = if_stricts,
@@ -1421,23 +1385,25 @@ tcIfaceDataCons inferred_env tycon_name tycon if_cons
                                          _ -> check_prefix_scope (concatMap (\(Scaled mult ty) -> [mult, ty]) tys)
                                      ; return tys }
                             ; return ([], arg_tys) }
-                    else tc_retained_args dc_name (fromMaybe [] (lookupNameEnv inferred_env dc_name))
+                    else tc_retained_args dc_name retained_flags
                                           emptyVarSet arg_binders args
                 ; when (not (null arg_binders) && not (null lbl_names)) $
-                    do { valid <- evaluateIfaceNativeDomain (ppr dc_name)
-                           (all (\tv -> varType tv `eqType` liftedTypeKind) univ_tvs
-                            && validRetainedRecordFields retained_binders arg_tys)
+                    do { checkAcyclicIfaceTypes (ppr dc_name)
+                           (map varType univ_tvs ++ map scaledThing arg_tys)
+                       ; let valid = all (\tv -> varType tv `eqType` liftedTypeKind) univ_tvs
+                                  && validRetainedRecordFields retained_binders arg_tys
                        ; unless valid $
                            failIfM (text "Invalid retained record fields in interface:" <+> ppr dc_name) }
                 ; let retained_fields = [field | Just field <- retained_binders]
                 ; eq_spec <- extendIfaceIdEnv retained_fields $ tcIfaceEqSpec spec
                 ; when (not (null arg_binders) && not (null spec)) $
-                    do { valid <- evaluateIfaceNativeDomain (ppr dc_name)
-                           (validRetainedResultEqSpec univ_tvs retained_fields eq_spec
-                            && all (\f -> isNativeClosedIndexType (varType f)
-                                       || isNativeIndexedGadtFieldDomain (varType f))
-                                   retained_fields
-                            && all (not . anyFreeVarsOfType isId . scaledMult) arg_tys)
+                    do { checkAcyclicIfaceTypes (ppr dc_name)
+                           (map varType univ_tvs ++ map varType retained_fields ++ map eqSpecType eq_spec)
+                       ; let valid = validRetainedResultEqSpec univ_tvs retained_fields eq_spec
+                                  && all (\f -> isNativeClosedIndexType (varType f)
+                                             || isNativeIndexedGadtFieldDomain (varType f))
+                                         retained_fields
+                                  && all (not . anyFreeVarsOfType isId . scaledMult) arg_tys
                        ; unless valid $
                            failIfM (text "Invalid retained result field in interface:" <+> ppr dc_name) }
                 ; stricts <- mapM tc_strict if_stricts
@@ -1574,14 +1540,14 @@ tcIfaceDataCons inferred_env tycon_name tycon if_cons
                               && nativeDomainShapePossible NativeRetainedUse domain_shape) }
                   ; mult <- tcIfaceType w
                   ; field_ty <- tcIfaceType ty
-                  ; valid <- evaluateIfaceNativeDomain (ppr name) $
-                            typeKind mult `eqType` multiplicityTy
-                            && isLiftedTypeKind (typeKind field_ty)
-                            && not (anyFreeVarsOfType
-                                 (\v -> isId v && not (v `elemVarSet` scope)) field_ty)
-                            && case mb of
-                                 Nothing -> True
-                                 Just _  -> isManyTy mult && isNativeRetainedGadtFieldType field_ty
+                  ; checkAcyclicIfaceTypes (ppr name) [mult, field_ty]
+                  ; let valid = typeKind mult `eqType` multiplicityTy
+                             && isLiftedTypeKind (typeKind field_ty)
+                             && not (anyFreeVarsOfType
+                                  (\v -> isId v && not (v `elemVarSet` scope)) field_ty)
+                             && case mb of
+                                  Nothing -> True
+                                  Just _  -> isManyTy mult && isNativeRetainedGadtFieldType field_ty
                   ; unless valid $
                       failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
                                $$ text "Expected a lifted field with only earlier runtime indices;"
@@ -1593,12 +1559,11 @@ tcIfaceDataCons inferred_env tycon_name tycon if_cons
                  ; return (Nothing : rest, Scaled mult field_ty : fields) }
                Just fs -> do
                  { field_name <- newIfaceName (mkVarOccFS (ifLclNameFS fs))
-                 ; let (is_invis, is_inf, flags') = case flags of
-                         f1 : f2 : more -> (f1, f2, more)
-                         [f1]           -> (f1, False, [])
-                         []             -> (False, False, [])
-                       mark_field = (if is_inf then markInferredRetainedBinder else id)
-                                  . (if is_invis then markInvisibleRetainedBinder else id)
+                 ; let (vis, flags') = case flags of
+                         f : more -> (f, more)
+                         []       -> (DepFunVisible, [])
+                       mark_field = (if isInferredDepFunFlag vis then markInferredRetainedBinder else id)
+                                  . (if isInvisibleDepFunFlag vis then markInvisibleRetainedBinder else id)
                        field = mark_field (mkLocalId field_name ManyTy field_ty)
                  ; ~(rest, fields) <- extendIfaceIdEnv [field] $
                      tc_retained_args name flags' (extendVarSet scope field) bs args
@@ -2041,21 +2006,6 @@ data NativeDomainUse = NativeScalarUse | NativeFunctionUse | NativeStructuralFun
                      | NativeFieldMultUse | NativeManyMultUse | NativeUnmatchableUse
   deriving Eq
 
--- | Project an available Type head without expanding synonyms.
--- See Note [Checking native domain shapes].
-nativeTypeDomainShape :: Type -> NativeDomainShape
-nativeTypeDomainShape (TyConApp tc []) = NativeTyConDomain tc
-nativeTypeDomainShape (FunTy FTF_T_T ma mult arg res)
-  = NativeFunctionDomain (nativeTypeDomainShape ma)
-                         (nativeTypeDomainShape mult)
-                         (nativeTypeDomainShape arg) (nativeTypeDomainShape res)
-nativeTypeDomainShape FunTy{} = NativeInvalidDomain
-nativeTypeDomainShape (DepFunTy _vis binder body)
-  = NativePiDomain (nativeTypeDomainShape (idMult binder))
-                   (nativeTypeDomainShape (varType binder))
-                   (nativeTypeDomainShape body)
-nativeTypeDomainShape _ = NativeUnknownDomain
-
 -- | Reject known unsupported shapes; True still requires the typed checks.
 -- See Note [Checking native domain shapes].
 nativeDomainShapePossible :: NativeDomainUse -> NativeDomainShape -> Bool
@@ -2116,27 +2066,11 @@ nativeDomainShapePossible use shape = go emptyTyConSet emptyTyConSet use shape
     function_endpoint_use NativeFunctionUse = NativeOpaqueUse
     function_endpoint_use _ = NativeFunctionEndpointUse
 
--- | Preserve the Id guards before inspecting its imported domain view.
-nativeIdDomainShapePossible :: NativeDomainUse -> Id -> Bool
-nativeIdDomainShapePossible use v
-  | not (isLocalId v && not (isCoVar v) && isManyTy (idMult v)) = True
-  | use == NativeRetainedUse
-  = nativeDomainShapePossible NativeScalarUse shape
-    || not function_guards
-    || nativeDomainShapePossible NativeStructuralFunctionUse shape
-  | use == NativeFunctionUse, not function_guards = True
-  | otherwise = nativeDomainShapePossible use shape
-  where
-    shape = nativeTypeDomainShape (varType v)
-    function_guards = not (isJoinIdDetails (idDetails v))
-                   && noFreeVarsOfType (idMult v)
-
 -- | Report an early domain rejection without printing unfinished Types.
 -- See Note [Checking native domain shapes].
 precheckIfaceNativeDomain :: SDoc -> Bool -> IfL ()
 precheckIfaceNativeDomain name possible
-  = do { valid <- evaluateIfaceNativeDomain name possible
-       ; unless valid $ failIfM (name $$ text "Unsupported retained domain shape.") }
+  = unless possible $ failIfM (name $$ text "Unsupported retained domain shape.")
 
 {- Note [Checking native domain shapes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2210,12 +2144,8 @@ tcIfaceType = go
     go (IfaceTermAppTy fun arg)
       -- See Note [Opaque call indices in interfaces] in GHC.Iface.Type.
       = do { f <- tcIfaceLclId fun
-           ; precheckIfaceNativeDomain
-               (text "Invalid retained call head in interface:" <+> ppr fun)
-               (nativeIdDomainShapePossible NativeFunctionUse f)
-           ; fun_tys <- evaluateIfaceNativeDomain (ppr fun)
-                          (nativeIndexFunctionTys_maybe f)
-           ; case fun_tys of
+           ; checkAcyclicIfaceTypes (ppr fun) [idMult f, varType f]
+           ; case nativeIndexFunctionTys_maybe f of
                Nothing ->
                  failIfM (text "Invalid retained call head in interface:" <+> ppr fun
                           $$ text "Expected a local unrestricted function with lifted argument and result types."
@@ -2235,11 +2165,8 @@ tcIfaceType = go
                _ -> failIfM (text "Invalid named retained callback in interface:" <+> ppr name) }
     go (IfaceTermVar n)
       = do { v <- tcIfaceLclId n
-           ; precheckIfaceNativeDomain
-               (text "Invalid retained index in interface:" <+> ppr n)
-               (nativeIdDomainShapePossible NativeOpaqueUse v)
-           ; valid <- evaluateIfaceNativeDomain (ppr n) (isNativeOpaqueValueId v)
-           ; unless valid $
+           ; checkAcyclicIfaceTypes (ppr n) [idMult v, varType v]
+           ; unless (isNativeOpaqueValueId v) $
                failIfM (text "Invalid retained index in interface:" <+> ppr n
                         $$ text "Expected a local identifier with multiplicity Many"
                         $$ text "at a lifted value type."
@@ -2279,23 +2206,24 @@ tcIfaceType = go
                (text "Invalid retained binder in interface:" <+> ppr name)
                (nativeDomainShapePossible NativeFieldMultUse mult_shape
                 && nativeDomainShapePossible NativeOpaqueUse domain_shape)
-           ; bindIfaceId bndr $ \ v ->
-        do { precheckIfaceNativeDomain
-               (text "Invalid retained binder in interface:" <+> ppr name)
-               (nativeIdDomainShapePossible NativeOpaqueUse v)
-           ; valid <- evaluateIfaceNativeDomain (ppr name) (isNativeOpaqueValueId v)
-           ; unless valid $
-               failIfM (text "Invalid retained binder in interface:" <+> ppr v
-                        $$ text "Expected a local identifier with a valid multiplicity"
-                        $$ text "at a lifted value type."
-                        $$ text "Actual type:" <+> ppr (varType v)
-                        $$ text "Actual multiplicity:" <+> ppr (idMult v))
-           ; body' <- go body
-           ; unless (typeKind body' `eqType` liftedTypeKind) $
-               failIfM (text "Invalid retained function result in interface for:" <+> ppr v
-                        $$ text "Expected kind Type."
-                        $$ text "Actual kind:" <+> ppr (typeKind body'))
-           ; return (mkDepFunTyWithVis vis v body') } }
+           ; bindIfaceId bndr $ \ v0 ->
+             let v | isInferredDepFunFlag vis = markInferredRetainedBinder v0
+                   | otherwise                = v0
+                 bind_v = if isInferredDepFunFlag vis then extendIfaceIdEnv [v] else id
+             in bind_v $ do
+               { checkAcyclicIfaceTypes (ppr name) [idMult v, varType v]
+               ; unless (isNativeOpaqueValueId v) $
+                   failIfM (text "Invalid retained binder in interface:" <+> ppr v
+                            $$ text "Expected a local identifier with a valid multiplicity"
+                            $$ text "at a lifted value type."
+                            $$ text "Actual type:" <+> ppr (varType v)
+                            $$ text "Actual multiplicity:" <+> ppr (idMult v))
+               ; body' <- go body
+               ; unless (typeKind body' `eqType` liftedTypeKind) $
+                   failIfM (text "Invalid retained function result in interface for:" <+> ppr v
+                            $$ text "Expected kind Type."
+                            $$ text "Actual kind:" <+> ppr (typeKind body'))
+               ; return (mkDepFunTyWithVis vis v body') } }
     go (IfaceLitTy l)            = LitTy <$> tcIfaceTyLit l
     go (IfaceFunTy flag ma w t1 t2) = FunTy flag <$> go ma <*> go w <*> go t1 <*> go t2
     go (IfaceTupleTy s i tks)    = tcIfaceTupleTy s i tks
@@ -2325,19 +2253,18 @@ tcIfaceType = go
                  | isJust (tyConDataFamCoercion_maybe (dataConTyCon con))
                  , let (tys, fields) = splitAt (length (dataConUserTyVars con)) tks'
                  , any has_id fields ->
-                 do { valid <- evaluateIfaceNativeDomain (ppr tc) $
-                          isJust (nativeFamilyPromotedCon_maybe con tys fields)
-                      ; unless valid $
-                          failIfM (text "Invalid retained data family constructor fields in interface:"
-                                   <+> ppr tc) }
+                 do { checkAcyclicIfaceTypes (ppr tc) tks'
+                    ; unless (isJust (nativeFamilyPromotedCon_maybe con tys fields)) $
+                        failIfM (text "Invalid retained data family constructor fields in interface:"
+                                 <+> ppr tc) }
                  | let (tys, fields) = splitAt (length (dataConUnivTyVars con)) tks'
                  , any has_id fields ->
-                 do { valid <- evaluateIfaceNativeDomain (ppr tc) $
-                          isJust (nativeIndexDataConTyArgs (mkTyConApp (dataConTyCon con) tys) con)
-                          && nativeIndexArgKinds con tys fields
-                      ; unless valid $
-                          failIfM (text "Invalid retained constructor fields in interface:"
-                                   <+> ppr tc) }
+                 do { checkAcyclicIfaceTypes (ppr tc) tks'
+                    ; let valid = isJust (nativeIndexDataConTyArgs (mkTyConApp (dataConTyCon con) tys) con)
+                               && nativeIndexArgKinds con tys fields
+                    ; unless valid $
+                        failIfM (text "Invalid retained constructor fields in interface:"
+                                 <+> ppr tc) }
                _ | any (call_operand False) args ->
                      check_call_arg_kinds (ppr tc) (tyConKind tc') tks'
                _ -> return ()
@@ -2352,10 +2279,10 @@ tcIfaceType = go
            ; co' <- tcIfaceCo co
            ; case cast_function_head ty' of
                Just f | isNativeIndexFunctionId f ->
-                 do { valid <- evaluateIfaceNativeDomain (ppr f) $
-                        coercionRole co' == Nominal
-                        && coercionLKind co' `eqType` typeKind ty'
-                        && isJust (nativeIndexCastCo_maybe (SubCo co'))
+                 do { checkAcyclicIfaceTypes (ppr f) [ty', coercionLKind co', coercionRKind co']
+                    ; let valid = coercionRole co' == Nominal
+                               && coercionLKind co' `eqType` typeKind ty'
+                               && isJust (nativeIndexCastCo_maybe (SubCo co'))
                     ; unless valid $
                         failIfM (text "Invalid retained function-value cast in interface:"
                                  <+> ppr f)
@@ -2373,17 +2300,15 @@ tcIfaceType = go
     -- A raw ordinary application can expose a native function-value head.
     -- Check its argument before the smart maker forms TermAppTy.
     app _ fun@(TermVarTy f) arg
-      = do { domains <- evaluateIfaceNativeDomain (ppr f)
-                          (nativeIndexFunctionTys_maybe f)
-           ; case domains of
+      = do { checkAcyclicIfaceTypes (ppr f) [varType f, arg]
+           ; case nativeIndexFunctionTys_maybe f of
                Just (domain, _) | typeKind arg `eqType` domain ->
                  return (mkAppTy fun arg)
                _ -> failIfM (text "Invalid retained function-value application in interface:"
                              <+> ppr f) }
     app True fun arg
-      = do { arrow <- evaluateIfaceNativeDomain (ppr fun)
-                        (nativeIndexFunctionTypeTys_maybe (typeKind fun))
-           ; case arrow of
+      = do { checkAcyclicIfaceTypes (ppr fun) [fun, arg]
+           ; case nativeIndexFunctionTypeTys_maybe (typeKind fun) of
                Just (domain, _) | typeKind arg `eqType` domain ->
                  return (mkAppTy fun arg)
                _ -> failIfM (text "A retained call result cannot be applied to this argument in an interface:"
@@ -2414,12 +2339,11 @@ tcIfaceType = go
       (text "Invalid type application containing a retained call in interface:" <+> name)
 
     check_call_result_cast ty co = do
+      checkAcyclicIfaceTypes (ppr ty) [ty, coercionLKind co]
       let call_kind = typeKind ty
           co_kind = coercionLKind co
           role = coercionRole co
-      valid <- evaluateIfaceNativeDomain (ppr ty) $
-                 role == Nominal && call_kind `eqType` co_kind
-      unless valid $
+      unless (role == Nominal && call_kind `eqType` co_kind) $
         failIfM (text "Invalid retained call result cast in interface:" <+> ppr ty
                  $$ text "Expected nominal evidence from kind:" <+> ppr call_kind
                  $$ text "Actual role:" <+> ppr role
@@ -2432,8 +2356,8 @@ tcIfaceType = go
     check_iface_retained_args name = check_iface_arg_kinds name
       (text "Invalid retained constructor fields in interface:" <+> name)
     check_iface_arg_kinds name diagnostic kind args
-      = do { failure <- evaluateIfaceNativeDomain name (check kind args)
-           ; forM_ failure $ \reason -> failIfM (diagnostic $$ reason) }
+      = do { checkAcyclicIfaceTypes name (kind : args)
+           ; forM_ (check kind args) $ \reason -> failIfM (diagnostic $$ reason) }
       where
         check _ [] = Nothing
         check kind (arg : rest)
@@ -2471,52 +2395,40 @@ This checks an application in a type. Deriving evidence from a case expression
 requires the constructor and fields of the actual scrutinee.
 -}
 
--- | Check the exact lifted kind without printing a possibly recursive Type.
--- See Note [Positioning of forkM] and Note [Detected recursive native interface domains].
+-- | Check the exact lifted kind after rejecting cyclic synonym expansions.
 check_exists_kind :: IfLclName -> SDoc -> Kind -> IfL ()
 check_exists_kind name part kind = do
-    valid <- evaluateIfaceValidation
-      (text "Cannot validate existential type in interface:" <+> ppr name)
-      (kind `eqType` liftedTypeKind)
-    unless valid $
+    checkAcyclicIfaceTypes (ppr name) [kind]
+    unless (kind `eqType` liftedTypeKind) $
       failIfM (text "Existential" <+> part <+> text "must have kind Type:" <+> ppr name)
 
--- | Evaluate native interface eligibility and report detected recursive knots.
--- See Note [Detected recursive native interface domains].
-evaluateIfaceNativeDomain :: SDoc -> a -> IfL a
-evaluateIfaceNativeDomain name =
-  evaluateIfaceValidation (text "Cannot validate retained type in interface:" <+> name)
+-- | Reject cyclic type synonym expansions before expanding interface types.
+checkAcyclicIfaceTypes :: SDoc -> [Type] -> IfL ()
+checkAcyclicIfaceTypes name tys =
+    when (any hasCyclicSynonym tys) $
+      failIfM (text "Cyclic type synonym in interface:" <+> name)
 
-evaluateIfaceValidation :: SDoc -> a -> IfL a
-evaluateIfaceValidation description result
-  = do { checked <- liftIO (try (evaluate result))
-       ; case checked of
-           Left NonTermination ->
-             failIfM (description $$ text "Validation encountered recursive type information.")
-           Right value -> return value }
-
-{- Note [Detected recursive native interface domains]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The native domain predicate follows algebraic constructor fields. A generic
-IfaceDepFunTy in an ordinary field can force this predicate before its field
-Type exists. Following that field again can raise NonTermination. The visited
-TyCon set handles available recursive field Types, not an active decoder.
-
-Keep validation before returning the decoded Type. Evaluate each existing
-eligibility result inside IO and catch only NonTermination. Bool guards and
-the outer Maybe constructor force the native domain checks. Preserve their
-order. On a detected knot, fail through the existing interface error path.
-Do not return a placeholder Type, skip a check, or retry the active thunk.
-Use the encoded name in the diagnostic; printing a recursive field Type can
-force the same failed computation. Other exceptions propagate unchanged.
-
-This boundary improves diagnostics. It does not stage the loader or guarantee
-termination. The runtime does not guarantee detection of every loop. A
-shape-first loader needs independent declaration and synonym information.
-Merely deferring validation into Type children is insufficient: typeKind can
-inspect a Type head without forcing those children. See Note [Retained binders
-in interfaces], Note [Checking native domain shapes] and Note [Positioning of forkM].
--}
+-- | Detect cyclic type synonym expansions using a visited 'NameSet'.
+hasCyclicSynonym :: Type -> Bool
+hasCyclicSynonym = go emptyNameSet
+  where
+    go seen (TyConApp tc args)
+      | any (go seen) args = True
+      | Just (tvs, rhs) <- synTyConDefn_maybe tc
+      , args `lengthAtLeast` length tvs
+      = let nm = tyConName tc
+            (syn_args, rest_args) = splitAt (length tvs) args
+        in nm `elemNameSet` seen
+           || go (extendNameSet seen nm) (mkAppTys (substTyWith tvs syn_args rhs) rest_args)
+      | otherwise = False
+    go seen (AppTy f a) = go seen f || go seen a
+    go seen (FunTy _ ma w a r) = go seen ma || go seen w || go seen a || go seen r
+    go seen (ForAllTy ma (Bndr v _) body) = go seen ma || go seen (varType v) || go seen body
+    go seen (DepFunTy _ v body) = go seen (idMult v) || go seen (varType v) || go seen body
+    go seen (DepDictTy d body) = go seen (idMult d) || go seen (varType d) || go seen body
+    go seen (ExistsTy _ v body) = go seen (varType v) || go seen body
+    go seen (CastTy t _) = go seen t
+    go _ _ = False
 
 {- Note [Retained binders in interfaces]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2649,7 +2561,7 @@ tcIfaceCo = go
                           $$ text "Expected nominal evidence." $$ ppr delta)
            ; bindIfaceId bndr $ \ bndr' ->
         do { body' <- go body
-           ; unless (coercionRole body' /= Nominal || visL == visR) $
+           ; unless (coercionRole body' /= Nominal || visL `eqDepFunVis` visR) $
                failIfM (text "Invalid retained function coercion in interface for:" <+> ppr name
                         $$ text "Nominal evidence requires identical visibilities.")
            ; return (DepFunCo visL visR bndr' domain' body') } }
@@ -2801,8 +2713,8 @@ tcIfaceExpr (IfaceUnpack witness@(name, _) value package body)
            ExistsTy _ a payload_ty ->
              bindIfaceTyVar witness $ \witness' ->
              bindIfaceId value $ \value' ->
-             do { valid <- evaluateIfaceValidation (ppr name) (varType witness' `eqType` varType a)
-                ; unless valid $
+             do { checkAcyclicIfaceTypes (ppr name) [varType witness', varType a]
+                ; unless (varType witness' `eqType` varType a) $
                     failIfM (text "Existential Unpack witness kind differs from its package:" <+> ppr name)
                 ; let mult = idMult value'
                 ; unless (isNonCoVarId value'
@@ -3197,7 +3109,6 @@ tcIdDetails owner ty (IfCheckedClosureSourceTableId table_name helpers)
   | otherwise = do
       table <- tcIfaceSourceTable owner ty table_name
       return (CheckedClosureSourceTableId owner table helpers)
-tcIdDetails _ _ (IfSourceProofId _) = pure VanillaId
 tcIdDetails _ _  (IfWorkerLikeId dmds) = return $ WorkerLikeId dmds
 tcIdDetails _ ty IfDFunId              = return (mkDFunIdDetails cls)
   where
@@ -3447,6 +3358,11 @@ tcUnfoldingRhs source toplvl name declared_ty expr
       _ | is_depfun_user ->
         unless (isTopLevel toplvl && supportsNativeDepFunUnfolding core_expr') $
           failIfM (text "Invalid native DepFunTy unfolding:" <+> ppr name)
+      _ | isStableUserSource source, hasExistentialExpr core_expr' ->
+        unless (isTopLevel toplvl
+                && hasNativeDependentExprRhs (Type declared_ty)
+                && supportsNativeUserUnfolding core_expr') $
+          failIfM (text "Invalid existential user unfolding:" <+> ppr name)
       _ -> pure ()
     dflags <- getDynFlags
     -- Check for type consistency in the unfolding
