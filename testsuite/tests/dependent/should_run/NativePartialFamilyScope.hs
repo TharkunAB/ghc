@@ -1,5 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes, Arrows, CPP, FlexibleContexts, GADTs, NamedWildCards #-}
-{-# LANGUAGE NoExperimentalDependentTypes, PartialTypeSignatures, QuantifiedConstraints #-}
+{-# LANGUAGE NoDependentTypes, PartialTypeSignatures, QuantifiedConstraints #-}
 {-# LANGUAGE ScopedTypeVariables, StaticPointers, TemplateHaskell, TypeApplications, TypeFamilies #-}
 module NativePartialFamilyScope where
 

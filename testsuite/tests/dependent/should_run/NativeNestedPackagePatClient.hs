@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes, TemplateHaskell, TypeApplications #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TemplateHaskell, TypeApplications #-}
 module Main where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

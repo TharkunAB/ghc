@@ -1,0 +1,17 @@
+NativeSynonymReifyRejects.hs:9:16: error: [GHC-20967]
+    • Cannot apply function of kind ‘(* %t0 -> *) -> * -> *’
+      to visible kind argument ‘M’
+    • In the first argument of ‘(:~:)’, namely ‘Copied @M Maybe Bool’
+      In the type signature:
+        badExplicit :: Copied @M Maybe Bool :~: Maybe Bool
+
+NativeSynonymReifyRejects.hs:12:25: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘* %GHC.Internal.Types.Unmatchable -> *’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the first argument of ‘CopiedPlain’, namely ‘Maybe’
+      In the first argument of ‘(:~:)’, namely ‘CopiedPlain Maybe Bool’
+      In the type signature:
+        badPlain :: CopiedPlain Maybe Bool :~: Maybe Bool
+

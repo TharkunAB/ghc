@@ -1,4 +1,4 @@
-{-# LANGUAGE NoExperimentalDependentTypes #-}
+{-# LANGUAGE NoDependentTypes #-}
 
 module NativeOpaqueCallbackAliasProvider (mapper, otherMapper) where
 

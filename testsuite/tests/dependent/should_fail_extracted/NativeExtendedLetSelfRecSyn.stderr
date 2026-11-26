@@ -1,0 +1,5 @@
+NativeExtendedLetSelfRecSyn.hs:4:11: error: [GHC-97522]
+    Cycle in type synonym declarations:
+      NativeExtendedLetSelfRecSyn.hs:4:11-38: type Loop a =
+                                                  Maybe (Loop a)
+

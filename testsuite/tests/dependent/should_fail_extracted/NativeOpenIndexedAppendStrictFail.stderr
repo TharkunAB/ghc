@@ -1,0 +1,28 @@
+NativeOpenIndexedAppendStrictFail.hs:11:11: error: [GHC-70566]
+    • Cannot reduce the open call to ‘P.appendStrictNil’ in a type.
+        While reading the definition of ‘P.appendStrictNil’.
+        The interface for a referenced definition contains no usable Core unfolding. Use an interface that exposes the unfolding or provides a checked equation for this call.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.appendStrictNil 'P.VNil xs’
+      In the type signature:
+        badNil :: forall a
+                         (n :: P.Nat)
+                         (xs :: P.Vec a n). P.appendStrictNil 'P.VNil xs :~: xs
+
+NativeOpenIndexedAppendStrictFail.hs:27:41: error: [GHC-70565]
+    • Cannot evaluate ‘P.appendChangeCarried’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.appendChangeCarried ('P.VCons x xs) ys’
+      In the type signature:
+        badConsCarried :: forall a
+                                 (n :: P.Nat)
+                                 (m :: P.Nat)
+                                 (x :: a)
+                                 (xs :: P.Vec a n)
+                                 (ys :: P.Vec a m). Proxy xs
+                                                    -> Proxy ys
+                                                       -> P.appendChangeCarried ('P.VCons x xs) ys
+                                                          :~:
+                                                          'P.VCons x (P.appendChangeCarried xs ys)
+

@@ -1,0 +1,72 @@
+NativeOpenInstalledAppendFail.hs:17:14: error: [GHC-83865]
+    • Couldn't match type ‘S.Zero’ with ‘S.Succ S.Zero’
+      Expected: Count (Appended Empty Empty)
+                :~: S.Succ (Plus (Count Empty) (Count Empty))
+        Actual: S.size (Appended Empty Empty)
+                :~: S.size (Appended Empty Empty)
+    • In the expression: Refl
+      In an equation for ‘wrongEmpty’: wrongEmpty = Refl
+
+NativeOpenInstalledAppendFail.hs:21:31: error: [GHC-05617]
+    • Could not deduce ‘S.plus (S.size xs1) (S.size ys)
+                        ~ S.size (xs1 ++ ys)’
+      from the context: xs ~ (x : xs1)
+        bound by a pattern with constructor:
+                   Cons :: forall {a} (xs :: [a]) (x :: a).
+                           Spine xs -> Spine (x : xs),
+                 in an equation for ‘missingAppendHyp’
+        at NativeOpenInstalledAppendFail.hs:21:19-24
+      Expected: Count (Appended xs ys) :~: Plus (Count xs) (Count ys)
+        Actual: S.size (Appended xs ys) :~: S.size (Appended xs ys)
+    • In the expression: Refl
+      In an equation for ‘missingAppendHyp’:
+          missingAppendHyp (Cons _) _ = Refl
+    • Relevant bindings include
+        missingAppendHyp :: Spine xs
+                            -> Proxy ys
+                            -> Count (Appended xs ys) :~: Plus (Count xs) (Count ys)
+          (bound at NativeOpenInstalledAppendFail.hs:20:1)
+
+NativeOpenInstalledAppendFail.hs:26:30: error: [GHC-05617]
+    • Could not deduce ‘(map f xs1 ++ map f ys) ~ map f (xs1 ++ ys)’
+      from the context: xs ~ (x : xs1)
+        bound by a pattern with constructor:
+                   Cons :: forall {a} (xs :: [a]) (x :: a).
+                           Spine xs -> Spine (x : xs),
+                 in an equation for ‘missingMapHyp’
+        at NativeOpenInstalledAppendFail.hs:26:18-23
+      Expected: Mapped f (Appended xs ys)
+                :~: Appended (Mapped f xs) (Mapped f ys)
+        Actual: map f (Appended xs ys) :~: map f (Appended xs ys)
+    • In the expression: Refl
+      In an equation for ‘missingMapHyp’:
+          missingMapHyp _ (Cons _) _ = Refl
+    • Relevant bindings include
+        missingMapHyp :: Proxy f
+                         -> Spine xs
+                         -> Proxy ys
+                         -> Mapped f (Appended xs ys)
+                            :~: Appended (Mapped f xs) (Mapped f ys)
+          (bound at NativeOpenInstalledAppendFail.hs:25:1)
+
+NativeOpenInstalledAppendFail.hs:31:31: error: [GHC-05617]
+    • Could not deduce ‘map (f . g) xs1 ~ map f (map g xs1)’
+      from the context: xs ~ (x : xs1)
+        bound by a pattern with constructor:
+                   Cons :: forall {a} (xs :: [a]) (x :: a).
+                           Spine xs -> Spine (x : xs),
+                 in an equation for ‘missingCompHyp’
+        at NativeOpenInstalledAppendFail.hs:31:21-26
+      Expected: Mapped f (Mapped g xs) :~: ComposedMap f g xs
+        Actual: map f (Mapped g xs) :~: map f (Mapped g xs)
+      Note: GHC cannot determine the arguments of the function ‘map’ from its result.
+    • In the expression: Refl
+      In an equation for ‘missingCompHyp’:
+          missingCompHyp _ _ (Cons _) = Refl
+    • Relevant bindings include
+        missingCompHyp :: Proxy f
+                          -> Proxy g
+                          -> Spine xs
+                          -> Mapped f (Mapped g xs) :~: ComposedMap f g xs
+          (bound at NativeOpenInstalledAppendFail.hs:30:1)
+

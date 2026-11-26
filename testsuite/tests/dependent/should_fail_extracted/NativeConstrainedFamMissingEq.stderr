@@ -1,0 +1,5 @@
+NativeConstrainedFamMissingEq.hs:5:1: error: [GHC-90647]
+    • Constrained associated type family ‘NativeConstrainedFamilyProvider.Elem’
+      This instance must provide an associated type equation or default.
+    • In the instance declaration for ‘Collects Bool’
+

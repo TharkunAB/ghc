@@ -1,135 +1,44 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DependentTypes #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE ListTuplePuns #-}
-{-# LANGUAGE PolyKinds #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE Haskell2010, NoDependentTypes, DataKinds, GADTs, KindSignatures, ScopedTypeVariables #-}
+module Main (main) where
 
-module NativeDepFunUnfolding
-  ( Nat (..)
-  , Vec (..)
-  , Hidden
-  , Choose (..)
-  , Tagged (..)
-  , Pick
-  , topZero
-  , inlVarApp
-  , inlBoolCase
-  , inlVecHead
-  , inlAliasDefault
-  , inlPackVec
-  , inlUnpackSum
-  , inlTopIndex
-  , inlScopedDict
-  , inlinableScaleHead
-  , inlinablePack
-  , inlinableScopedDict
-  , recVecSum
-  ) where
-
-import Data.Kind (Type)
 import Data.Proxy (Proxy (..))
+import NativeDepFunUnfoldingDepClient (runDepClient)
+import NativeDepFunUnfoldingProvider
 
-data Nat = Z | S Nat
+lazyHeadH2010 :: Int
+lazyHeadH2010 =
+  let go :: Nat -> Int
+      go badNat =
+        let badTail = error "strict H2010 tail"
+        in inlVecHead badNat (inlVarApp badNat 42 badTail)
+  in go (error "strict H2010 Nat index")
 
-data Vec (a :: Type) (n :: Nat) where
-  VNil :: Vec a 'Z
-  VCons :: a -> Vec a n -> Vec a ('S n)
+lazyPackH2010 :: Int
+lazyPackH2010 =
+  let badPayload = error "strict H2010 payload"
+      (_, packed) = inlPackVec True badPayload
+  in inlUnpackSum False Proxy packed
 
-type Hidden = exists (a :: Type). (Maybe a, a -> Int)
+activePackH2010 :: Int
+activePackH2010 =
+  let (_, packed) = inlPackVec True 20
+  in inlUnpackSum True Proxy packed
 
-type family Pick (b :: Bool) :: Type where
-  Pick 'True = Int
-  Pick 'False = Bool
+topIdxH2010 :: Int
+topIdxH2010 = snd (inlTopIndex True 10)
 
-class Choose a where
-  choose :: a -> Bool
+scopedAndSpecH2010 :: [Int]
+scopedAndSpecH2010 =
+  let flag = True
+      a = case inlScopedDict flag 42 of Tagged v -> v
+      b = inlinableScaleHead Z (3 :: Int) (VCons 40 VNil)
+      c = case inlinableScopedDict flag of Tagged v -> v
+      d = recVecSum (S (S Z)) (VCons 2 (VCons 4 VNil))
+  in [a, b, c, d]
 
-instance Choose Bool where
-  choose b = b
-
-data Tagged (b :: Bool) where
-  Tagged :: Int -> Tagged b
-
-{-# NOINLINE topZero #-}
-topZero :: Nat
-topZero = Z
-
-{-# NOINLINE takeProxy #-}
-takeProxy :: foreach (n :: Nat) -> Proxy n -> Int
-takeProxy _ Proxy = 10
-
-{-# NOINLINE tagBoolInt #-}
-tagBoolInt :: foreach (b :: Bool) -> Int -> Tagged b
-tagBoolInt _ n = Tagged n
-
-{-# INLINE inlVarApp #-}
-inlVarApp :: foreach (n :: Nat) -> Int -> Vec Int n -> Vec Int ('S n)
-inlVarApp _ x xs = VCons x xs
-
-{-# INLINE inlBoolCase #-}
-inlBoolCase :: foreach (b :: Bool) -> Int -> Pick b
-inlBoolCase b n = case b of
-  True -> n + 1
-  False -> False
-
-{-# INLINE inlVecHead #-}
-inlVecHead :: foreach (n :: Nat) -> Vec Int ('S n) -> Int
-inlVecHead _ (VCons x _) = x
-
-{-# INLINE inlAliasDefault #-}
-inlAliasDefault :: foreach (n :: Nat) -> Vec Int n -> Vec Int n
-inlAliasDefault n xs = case n of
-  Z -> xs
-  _ -> xs
-
-{-# INLINE inlPackVec #-}
-inlPackVec :: foreach (b :: Bool) -> Int -> (Proxy b, Hidden)
-inlPackVec b x =
-  ( Proxy
-  , case b of
-      True -> ((Just x, (+ 1)) :: Hidden)
-      False -> ((Nothing :: Maybe Int, id) :: Hidden)
-  )
-
-{-# INLINE inlUnpackSum #-}
-inlUnpackSum :: foreach (b :: Bool) -> Proxy b -> Hidden -> Int
-inlUnpackSum b Proxy pv = case b of
-  False -> 7
-  True -> case pv of
-    (val, render) -> maybe 0 render val
-
-{-# INLINE inlTopIndex #-}
-inlTopIndex :: foreach (b :: Bool) -> Int -> (Proxy b, Int)
-inlTopIndex b n =
-  ( Proxy
-  , case b of
-      False -> n
-      True -> takeProxy topZero Proxy + n
-  )
-
-{-# INLINE inlScopedDict #-}
-inlScopedDict :: forall a. Choose a => foreach (x :: a) -> Int -> Tagged (choose x)
-inlScopedDict x k = tagBoolInt (choose x) (k + 10)
-
-{-# INLINABLE inlinableScaleHead #-}
-inlinableScaleHead :: forall a. Num a => foreach (n :: Nat) -> a -> Vec a ('S n) -> a
-inlinableScaleHead _ factor (VCons x _) = factor * x
-
-{-# INLINABLE inlinablePack #-}
-inlinablePack :: foreach (n :: Nat) -> Vec Int n -> Hidden
-inlinablePack _ xs = case xs of
-  VNil -> ((Nothing :: Maybe Int, id) :: Hidden)
-  VCons x _ -> ((Just x, (* 2)) :: Hidden)
-
-{-# INLINABLE inlinableScopedDict #-}
-inlinableScopedDict :: forall a. Choose a => foreach (x :: a) -> Tagged (choose x)
-inlinableScopedDict x = tagBoolInt (choose x) 99
-
-{-# INLINABLE recVecSum #-}
-recVecSum :: foreach (n :: Nat) -> Vec Int n -> Int
-recVecSum Z VNil = 0
-recVecSum (S m) (VCons x xs) = x + recVecSum m xs
+main :: IO ()
+main = do
+  let h2010Vals = [lazyHeadH2010, lazyPackH2010, activePackH2010, topIdxH2010] ++ scopedAndSpecH2010
+  if runDepClient == h2010Vals
+    then mapM_ print h2010Vals
+    else error ("Mismatch: " ++ show (runDepClient, h2010Vals))

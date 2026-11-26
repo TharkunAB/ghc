@@ -1,4 +1,4 @@
-{-# LANGUAGE LinearTypes, MonoLocalBinds, NoExperimentalDependentTypes, Strict #-}
+{-# LANGUAGE LinearTypes, MonoLocalBinds, NoDependentTypes, Strict #-}
 module LexicalStrictLet (ignoreStrict, ignoreStrictTilde, readStrictField, repackStrict, readLinearStrict) where
 
 import LexicalLetProvider

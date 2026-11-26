@@ -1,48 +1,33 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
-{-# OPTIONS_GHC -Wno-inline-rule-shadowing #-}
-module NativeLocalListAccumulator
-    ( shunt, step
-#ifdef LOCAL_REVERSE
-    , rev, reverseStep
-#endif
-    ) where
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeApplications,
+             TypeOperators #-}
+module Main where
 
+import Control.Exception (ErrorCall, displayException, evaluate, try)
+import Data.List (isInfixOf)
 import Data.Type.Equality ((:~:)(Refl))
+import NativeLocalListAccumulatorLib (shunt)
+import NativeLocalListAccumulatorRevProof (revStep)
 
-shunt :: [a] -> [a] -> [a]
-#ifndef PARTIAL
-shunt [] ys = ys
-#endif
-#ifdef NONDECREASING
-shunt (x : xs) ys = shunt (x : xs) (x : ys)
-#elif defined(FORCED)
-shunt (x : xs) ys = seq ys (shunt xs (x : ys))
-#else
-shunt (x : xs) ys = shunt xs (x : ys)
-#endif
+open :: foreach (xs :: [Bool]) -> foreach (ys :: [Bool])
+     -> shunt ('True ': xs) ys :~: shunt xs ('True ': ys)
+open _ _ = Refl
 
-#ifdef RULE
-{-# RULES "skip shunt" forall xs ys. shunt xs ys = ys #-}
-#endif
+onEmpty :: foreach (ys :: [Bool]) -> shunt '[] ys :~: ys
+onEmpty _ = Refl
 
-step :: foreach (x :: a) -> foreach (xs :: [a]) -> foreach (ys :: [a])
-#ifdef FALSE_EQ
-     -> shunt (x ': xs) ys :~: shunt xs ys
-#else
-     -> shunt (x ': xs) ys :~: shunt xs (x ': ys)
-#endif
-step _ _ _ = Refl
+{-# NOINLINE spine #-}
+spine :: [Bool] -> Bool
+spine [] = False
+spine (_ : _) = True
 
-#ifdef LOCAL_REVERSE
-rev :: [a] -> [a]
-rev [] = []
-rev (x:xs) = rev xs ++ [x]
-
-reverseStep :: foreach (x :: Bool) -> foreach (xs :: [Bool])
-#ifdef FALSE_REVERSE
-            -> rev (x ': xs) :~: (rev xs ++ '[ 'False])
-#else
-            -> rev (x ': xs) :~: (rev xs ++ '[x])
-#endif
-reverseStep _ _ = Refl
-#endif
+main :: IO ()
+main = case revStep True [] of
+  Refl -> do
+    print (open [] [], onEmpty [])
+    print (shunt [True, False] [True])
+    print (spine (shunt [error "head forced"] (error "accumulator forced")))
+    demanded <- try @ErrorCall (evaluate (spine (shunt (True : error "input tail") [])))
+    case demanded of
+      Left exception | "input tail" `isInfixOf` displayException exception ->
+        putStrLn "demanded input tail"
+      _ -> fail "skipped input tail"

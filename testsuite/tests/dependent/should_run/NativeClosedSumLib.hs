@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, NoExperimentalDependentTypes, UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes, NoDependentTypes, UndecidableInstances #-}
 module NativeClosedSumLib
     ( weighted, containsAny, identity
     , unavailable, Local (..), local, ambiguous, hiddenRequirement

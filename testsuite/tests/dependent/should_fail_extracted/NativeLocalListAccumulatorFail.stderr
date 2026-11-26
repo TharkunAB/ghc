@@ -1,0 +1,41 @@
+NativeLocalListAccumulatorFail.hs:11:22: error: [GHC-83865]
+    • Couldn't match type: shunt xs3 (x2 : ys1)
+                     with: shunt xs3 ys1
+      Expected: shunt (x2 : xs3) ys1 :~: shunt xs3 ys1
+        Actual: shunt (x2 : xs3) ys1 :~: shunt (x2 : xs3) ys1
+      Note: GHC cannot determine the arguments of the function ‘shunt’ from its result.
+    • In the expression: Refl
+      In an equation for ‘badLocalStep’: badLocalStep _ _ _ = Refl
+    • Relevant bindings include
+        badLocalStep :: foreach (x :: a)
+                        -> foreach (xs :: [a])
+                           -> foreach (ys :: [a]) -> shunt (x : xs) ys :~: shunt xs ys
+          (bound at NativeLocalListAccumulatorFail.hs:11:1)
+
+NativeLocalListAccumulatorFail.hs:15:21: error: [GHC-83865]
+    • Couldn't match type: shunt xs2 (True : ys)
+                     with: shunt xs2 (False : ys)
+      Expected: shunt (True : xs2) ys :~: shunt xs2 (False : ys)
+        Actual: shunt (True : xs2) ys :~: shunt (True : xs2) ys
+      Note: GHC cannot determine the arguments of the function ‘shunt’ from its result.
+    • In the expression: Refl
+      In an equation for ‘badClientOpen’: badClientOpen _ _ = Refl
+
+NativeLocalListAccumulatorFail.hs:19:19: error: [GHC-83865]
+    • Couldn't match type: rev xs1 ++ '[x1]
+                     with: rev xs1 ++ '[False]
+      Expected: rev (x1 : xs1) :~: (rev xs1 ++ '[False])
+        Actual: rev (x1 : xs1) :~: rev (x1 : xs1)
+      Note: GHC cannot determine the arguments of the function ‘++’ from its result.
+    • In the expression: Refl
+      In an equation for ‘badLocalRev’: badLocalRev _ _ = Refl
+
+NativeLocalListAccumulatorFail.hs:23:22: error: [GHC-83865]
+    • Couldn't match type: RS.app (RS.rev xs) '[x]
+                     with: RS.app (RS.rev xs) '[False]
+      Expected: RS.rev (x : xs) :~: RS.app (RS.rev xs) '[False]
+        Actual: RS.rev (x : xs) :~: RS.rev (x : xs)
+      Note: GHC cannot determine the arguments of the function ‘RS.app’ from its result.
+    • In the expression: Refl
+      In an equation for ‘badImportedRev’: badImportedRev _ _ = Refl
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, FlexibleContexts, GADTs, NoStarIsType, RankNTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, FlexibleContexts, GADTs, NoStarIsType, RankNTypes, TypeOperators #-}
 module NativeTypeNumeralWrong where
 
 import Data.Proxy

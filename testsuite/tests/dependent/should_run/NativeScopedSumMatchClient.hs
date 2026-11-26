@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeFamilies, TypeOperators #-}
 module NativeScopedSumMatchClient (Same, converted, fallback) where
 
 import Data.Proxy (Proxy)

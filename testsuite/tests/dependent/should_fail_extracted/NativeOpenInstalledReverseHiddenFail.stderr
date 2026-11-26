@@ -1,0 +1,9 @@
+NativeOpenInstalledReverseHiddenFail.hs:3:17: error: [GHC-61689]
+    Module ‘Prelude’ does not export ‘reverseOnto’.
+
+NativeOpenInstalledReverseHiddenFail.hs:4:19: error: [GHC-61689]
+    Module ‘Data.List’ does not export ‘reverseOnto’.
+
+NativeOpenInstalledReverseHiddenFail.hs:5:18: error: [GHC-61689]
+    Module ‘GHC.List’ does not export ‘reverseOnto’.
+

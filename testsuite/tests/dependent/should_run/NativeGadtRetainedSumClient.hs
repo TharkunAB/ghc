@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, EmptyCase, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, DataKinds, EmptyCase, GADTs, NoDependentTypes #-}
 module Main (main) where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

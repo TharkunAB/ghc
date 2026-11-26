@@ -1,0 +1,36 @@
+NativeClosedMethodApartnessMatchFail.hs:12:12: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:15:13: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:18:15: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:21:21: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:24:22: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:24:22: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:27:19: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:30:18: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessMatchFail.hs:30:42: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+

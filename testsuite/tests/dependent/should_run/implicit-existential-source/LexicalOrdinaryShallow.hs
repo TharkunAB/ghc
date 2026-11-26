@@ -1,4 +1,4 @@
-{-# LANGUAGE NoDeepSubsumption, NoExperimentalDependentTypes, RankNTypes, TypeApplications #-}
+{-# LANGUAGE NoDeepSubsumption, NoDependentTypes, RankNTypes, TypeApplications #-}
 module LexicalOrdinaryShallow (shallow) where
 
 {-# NOINLINE reader #-}

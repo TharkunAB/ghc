@@ -1,0 +1,4 @@
+NativeUnsaturatedBadInstanceHead.hs:8:10: error: [GHC-27346]
+    • The type family ‘Select’ should have 2 arguments, but has been given 1
+    • In the instance declaration for ‘C (Select 'True)’
+

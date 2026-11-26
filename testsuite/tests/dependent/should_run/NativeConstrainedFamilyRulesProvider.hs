@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, FlexibleInstances, GADTs, LinearTypes, MonoLocalBinds, ScopedTypeVariables, TypeApplications, TypeFamilies #-}
+{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, FlexibleInstances, GADTs, LinearTypes, MonoLocalBinds, ScopedTypeVariables, TypeApplications, TypeFamilies #-}
 module NativeConstrainedFamilyRulesProvider (Collects(..), zero, make, consume) where
 import FinitePosition
 import ParameterizedIndexLibrary (Fin(..))

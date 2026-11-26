@@ -6,6 +6,7 @@ import Data.Type.Equality ((:~:)(Refl), sym)
 import qualified GHC.Tuple as Tup
 import GHC.Types (List)
 import NativeRetainedScrutineePolyProvider
+import NativeRetainedScrutineePitaSurface (checkSurface)
 
 appendNilR :: forall a. foreach (xs :: List a) -> appList xs [] :~: xs
 appendNilR [] = Refl
@@ -110,7 +111,7 @@ withRevBaseCase ys = case appendNilRBase (rev ys) of
   Refl -> Refl
 
 main :: IO Tup.Unit
-main = do
+main = checkSurface `seq` do
   let nums :: List Int
       nums = [1, 2, 3]
       nums2 :: List Int

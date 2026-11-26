@@ -1,0 +1,20 @@
+NativeOpenEitherFmapGiven.hs:18:31: error: [GHC-83605]
+    • GHC cannot use method ‘P.fmap’ as a retained index.
+      This call needs a known ‘P.Functor (P.Either e)’ dictionary.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.fmap f ('P.Left x :: P.Either e a)’
+      In the type signature:
+        left :: forall a b (f :: a %U -> b) (x :: e). Proxy f
+                                                      -> Proxy x
+                                                         -> P.fmap f ('P.Left x :: P.Either e a)
+                                                            :~: ('P.Left x :: P.Either e b)
+      In the expression:
+        let
+          left ::
+            forall a b (f :: a %U -> b) (x :: e). Proxy f
+                                                  -> Proxy x
+                                                     -> P.fmap f ('P.Left x :: P.Either e a)
+                                                        :~: ('P.Left x :: P.Either e b)
+          left _ _ = Refl
+        in ()
+

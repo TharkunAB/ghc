@@ -1,0 +1,6 @@
+NativeParamRecUpdateInconsistent.hs:6:42: error: [GHC-83865]
+    • Couldn't match expected type ‘Bool’ with actual type ‘Int’
+    • In the expression: 0 :: Int
+      In the first argument of ‘mapVec’, namely ‘(\ _ -> (0 :: Int))’
+      In the expression: mapVec (\ _ -> (0 :: Int)) (secondCells s)
+

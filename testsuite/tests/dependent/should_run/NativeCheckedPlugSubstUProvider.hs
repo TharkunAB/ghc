@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, EmptyCase, ExperimentalDependentTypes, GADTs, LambdaCase, PolyKinds, RankNTypes #-}
+{-# LANGUAGE CPP, DataKinds, EmptyCase, DependentTypes, ListTuplePuns, GADTs, LambdaCase, PolyKinds, RankNTypes #-}
 module NativeCheckedPlugSubstUProvider
 #ifdef HIDE_CTX
   (Nat(..), Fin(..), UTerm(..), UCtx(CHole, CAppL, CAppR), SCtx(..),

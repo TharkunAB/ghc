@@ -1,0 +1,18 @@
+NativeComposedOrphanRule.hs:11:44: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘.’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression: MkIso @a @c (h . f) (g . k) left right
+      In an equation for ‘badDirect’:
+          badDirect f g h k left right
+            = MkIso @a @c (h . f) (g . k) left right
+
+NativeComposedOrphanRule.hs:17:41: error: [GHC-83605]
+    • GHC cannot use this function-valued retained argument.
+      Pass an unrestricted local function or a named unary function with checked source equations at the required type.
+    • In the expression: MkIso @a @a to g left right
+      In an equation for ‘badWhere’:
+          badWhere f g h left right
+            = MkIso @a @a to g left right
+            where
+                to x = h (f x)
+

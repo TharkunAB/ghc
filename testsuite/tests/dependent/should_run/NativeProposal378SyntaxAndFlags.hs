@@ -7,6 +7,9 @@ import GHC.Sigma (Sigma(Pair))
 import GHC.Tuple (Unit)
 import GHC.Types (List)
 import NativeProposal378SyntaxAndFlagsProvider
+import NativeProposal378AliasChecks ()
+import NativeProposal378NonUnicodeProd (prodSample)
+import NativeProposal378SomeInfix (someInfixVal)
 
 -- Unicode ∏ + shared-type multi-binder group (m n p :: Nat):
 plusAssoc :: ∏ (m n p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
@@ -66,7 +69,7 @@ closureEq :: forall g a b (s :: Slot g a).
 closureEq = Refl
 
 main :: IO Unit
-main = do
+main = prodSample `seq` someInfixVal `seq` do
   let Refl = plusAssoc (Succ Zero) (Succ Zero) Zero
       Refl = symTrans Refl (plusAssoc (Succ Zero) Zero Zero)
       Refl = closureEq @(Push Empty SNat) @SNat @SNat @New

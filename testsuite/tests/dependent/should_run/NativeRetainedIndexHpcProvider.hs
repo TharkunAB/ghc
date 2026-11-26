@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, KindSignatures #-}
 module NativeRetainedIndexHpcProvider where
 
 data Nat = Z | S Nat

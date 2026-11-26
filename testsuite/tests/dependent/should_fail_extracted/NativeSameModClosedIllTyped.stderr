@@ -1,0 +1,6 @@
+NativeSameModClosedIllTyped.hs:7:15: error: [GHC-70565]
+    • Cannot evaluate ‘incNat’ in a type.
+        The operand has kind Bool, which does not match the declared input type Natural.
+    • In the first argument of ‘(:~:)’, namely ‘incNat 'True’
+      In the type signature: bad :: incNat 'True :~: 1
+

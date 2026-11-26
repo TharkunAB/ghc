@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, TypeApplications #-}
 
 module NativeLiteralClient where
 

@@ -1,0 +1,59 @@
+NativeGadtRetainedSumCoverage.hs:14:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘unknownZero’:
+        Patterns of type ‘DirectVec a n’ not matched: DirectVec (S _) _
+
+NativeGadtRetainedSumCoverage.hs:17:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
+    Pattern match has inaccessible right hand side
+    In an equation for ‘knownUnreachable’:
+        knownUnreachable (DirectVec (S __a237) _) = ...
+
+NativeGadtRetainedSumCoverage.hs:34:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
+    Pattern match has inaccessible right hand side
+    In an equation for ‘disjointSquareMatch’:
+        disjointSquareMatch (Square __a21m _) = ...
+
+NativeGadtRetainedSumCoverage.hs:43:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘unknownPredecessor’:
+        Patterns of type ‘SuccVec a n’ not matched: SuccVec (S _) _
+
+NativeGadtRetainedSumCoverage.hs:49:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘unknownTile’:
+        Patterns of type ‘Tile a shape’ not matched: Tile (S _) _ _
+
+NativeGadtRetainedSumCoverage.hs:58:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘unknownNested’:
+        Patterns of type ‘Blocked a (Block n mark depth)’ not matched:
+            Blocked _ _ _ VNil _
+
+NativeGadtRetainedSumCoverage.hs:61:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘knownNestedBool’:
+        Patterns of type ‘Blocked
+                            Bool (Block (S n) mark depth)’ not matched:
+            Blocked _ _ _ (VCons False _) _
+
+NativeGadtRetainedSumCoverage.hs:64:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
+    Pattern match has inaccessible right hand side
+    In an equation for ‘knownNestedInaccessible’:
+        knownNestedInaccessible (Blocked __a1Yn __a1Yo __a1Yp (VCons _ _)
+                                         _) = ...
+
+NativeGadtRetainedSumCoverage.hs:68:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘missingNamed’:
+        Patterns of type ‘Phantom’ not matched: Pair (S _) _
+
+NativeGadtRetainedSumCoverage.hs:71:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘missingApplied’:
+        Patterns of type ‘Packed Bool’ not matched: Pair (S _) _
+
+NativeGadtRetainedSumCoverage.hs:74:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In an equation for ‘missingOrdinary’:
+        Patterns of type ‘Maybe Bool’ not matched: Nothing
+

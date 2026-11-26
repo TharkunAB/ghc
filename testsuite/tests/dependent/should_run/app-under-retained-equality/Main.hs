@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes #-}
 module Main where
 
 import Data.Type.Equality ((:~:)(Refl))

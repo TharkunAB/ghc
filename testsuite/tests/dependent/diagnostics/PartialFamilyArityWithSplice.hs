@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds, Modifiers, TemplateHaskell, TypeFamilies #-}
-{-# LANGUAGE NoExperimentalDependentTypes, NoLiberalTypeSynonyms #-}
+{-# LANGUAGE NoDependentTypes, NoLiberalTypeSynonyms #-}
 module PartialFamilyArityWithSplice where
 
 import Data.Kind (Type)

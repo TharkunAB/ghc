@@ -1,4 +1,4 @@
-{-# LANGUAGE ImpredicativeTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE ImpredicativeTypes, NoDependentTypes #-}
 module Main where
 
 import ImplicitVector (Filtered, cells, filterVec, withVector)

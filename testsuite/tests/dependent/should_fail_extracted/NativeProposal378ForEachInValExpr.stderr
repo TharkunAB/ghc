@@ -1,0 +1,7 @@
+NativeProposal378ForEachInValExpr.hs:4:6: error: [GHC-31244]
+    • Unexpected forall telescope
+    • In the expression: type foreach (n :: Nat) -> Vec Int n
+      In an equation for ‘x’: x = (type foreach (n :: Nat) -> Vec Int n)
+    Suggested fix:
+      Perhaps you intended to use the ‘RequiredTypeArguments’ extension (implied by ‘DependentTypes’)
+

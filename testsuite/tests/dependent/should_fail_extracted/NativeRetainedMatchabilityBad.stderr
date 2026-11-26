@@ -1,0 +1,20 @@
+NativeRetainedMatchabilityBad.hs:8:1: error: [GHC-83865]
+    Couldn't match type ‘GHC.Internal.Types.Unmatchable’
+                   with ‘GHC.Internal.Types.Matchable’
+    Expected: M
+      Actual: GHC.Internal.Types.Unmatchable
+
+NativeRetainedMatchabilityBad.hs:11:26: error: [GHC-83865]
+    • Couldn't match type ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected: M
+        Actual: GHC.Internal.Types.Unmatchable
+    • In the expression: \ (type a) _ x -> x
+      In an equation for ‘badRetained’: badRetained _ (type a) _ x = x
+
+NativeRetainedMatchabilityBad.hs:14:1: error: [GHC-83865]
+    Couldn't match type ‘GHC.Internal.Types.Unmatchable’
+                   with ‘GHC.Internal.Types.Matchable’
+    Expected: M
+      Actual: GHC.Internal.Types.Unmatchable
+

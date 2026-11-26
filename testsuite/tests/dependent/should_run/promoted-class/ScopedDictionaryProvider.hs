@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables #-}
 module Provider
     ( Choose(..), observe, observeBoth, observeGround, ignorePayload
 #ifdef SCOPED_DICTIONARY_EXPORT

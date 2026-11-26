@@ -1,0 +1,8 @@
+NativeProposal378BadUnmatchableToMatchable.hs:8:24: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘Bool %M -> *’, but ‘f’ has kind ‘Bool %U -> *’
+    • In the type ‘f’
+      In the expression: wantMatchable @f x
+      In an equation for ‘bad’: bad x = wantMatchable @f x
+

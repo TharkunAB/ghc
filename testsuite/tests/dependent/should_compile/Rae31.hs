@@ -1,17 +1,18 @@
 {-# LANGUAGE TemplateHaskell, TypeOperators, PolyKinds, DataKinds,
-             TypeFamilies, RankNTypes #-}
+             TypeFamilies, RankNTypes, Modifiers #-}
 
 module A where
 
 import Data.Kind
+import GHC.Exts (M)
 
 data family Sing (k :: Type) :: k -> Type
 type Sing' (x :: k) = Sing k x
 data TyFun' (a :: Type) (b :: Type) :: Type
-type TyFun (a :: Type) (b :: Type) = TyFun' a b -> Type
+type TyFun (a :: Type) (b :: Type) = TyFun' a b %M -> Type
 type family (a :: TyFun k1 k2) @@ (b :: k1) :: k2
 data TyPi' (a :: Type) (b :: TyFun a Type) :: Type
-type TyPi (a :: Type) (b :: TyFun a Type) = TyPi' a b -> Type
+type TyPi (a :: Type) (b :: TyFun a Type) = TyPi' a b %M -> Type
 type family (a :: TyPi k1 k2) @@@ (b :: k1) :: k2 @@ b
 $(return [])
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveAnyClass, DeriveGeneric, DerivingStrategies, ExperimentalDependentTypes, StandaloneDeriving #-}
+{-# LANGUAGE DeriveAnyClass, DeriveGeneric, DerivingStrategies, DependentTypes, ListTuplePuns, StandaloneDeriving #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeOperators #-}
 module NativeLocalOpenDerived where
 

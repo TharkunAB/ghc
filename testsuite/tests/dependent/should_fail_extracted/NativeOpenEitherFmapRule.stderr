@@ -1,0 +1,4 @@
+NativeOpenEitherFmapRule.hs:15:11: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+

@@ -1,0 +1,8 @@
+(Refl,Refl)
+(Just False,Nothing,Nothing)
+(Refl,Refl)
+(Just False,Just True,Just False)
+(Just False,Just True,Nothing)
+Refl
+closed observation
+(Just False,Nothing)

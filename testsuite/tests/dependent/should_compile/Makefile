@@ -42,3 +42,23 @@ NativeSourceCallIface:
 	! $(source_call_hc) -c NativeLiteralClient.hs 2>changed-literal.stderr
 	grep -q 'has no checked zero and successor equations' changed-literal.stderr
 	grep -q 'twoAnnotated' changed-literal.stderr
+
+dep_iface_hc = '$(TEST_HC)' $(TEST_HC_OPTS) -v0 -fomit-interface-pragmas -fno-write-if-simplified-core
+
+DepIfaceSerialization:
+	mkdir -p with_eqns no_closures without_eqns
+	$(dep_iface_hc) -XDependentTypes -fwrite-source-equations -fexpose-all-unfoldings -outputdir with_eqns -c DepIfaceSerialization.hs
+	'$(TEST_HC)' $(TEST_HC_OPTS) --show-iface with_eqns/DepIfaceSerialization.hi > with_eqns.iface
+	grep -Fq 'SourceTable T:flipBit' with_eqns.iface
+	grep -Fq 'FinalCoreSourceTable T:monus' with_eqns.iface
+	grep -Fq 'CheckedClosureSourceTable T:renameExpr [extendName]' with_eqns.iface
+	grep -Fq 'CheckedClosureSourceTable T:replace' with_eqns.iface
+	$(dep_iface_hc) -i -iwith_eqns -outputdir with_eqns -fno-code -c DepIfaceSerializationClient.hs
+	$(dep_iface_hc) -XDependentTypes -fno-write-source-equations -fexpose-all-unfoldings -outputdir no_closures -c DepIfaceSerialization.hs
+	'$(TEST_HC)' $(TEST_HC_OPTS) --show-iface no_closures/DepIfaceSerialization.hi > no_closures.iface
+	! grep -Fq 'CheckedClosureSourceTable' no_closures.iface
+	$(dep_iface_hc) -XNoDependentTypes -fno-write-source-equations -outputdir without_eqns -c DepIfaceSerialization.hs
+	'$(TEST_HC)' $(TEST_HC_OPTS) --show-iface without_eqns/DepIfaceSerialization.hi > without_eqns.iface
+	! grep -Eq '  SourceTable |CheckedClosureSourceTable' without_eqns.iface
+	! $(dep_iface_hc) -i -iwithout_eqns -outputdir without_eqns -fno-code -c DepIfaceSerializationClient.hs 2>without_eqns.stderr
+	grep -q 'GHC-70565' without_eqns.stderr

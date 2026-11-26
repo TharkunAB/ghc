@@ -1,9 +1,11 @@
-{-# LANGUAGE DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DataKinds, ExplicitNamespaces, DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 module Main where
 
 import Data.Type.Equality ((:~:)(Refl))
 import NativeLargeElimTypeProvider
   ( BoxVal(..), Val(..), idArr, tupleOf, valPred, valRel )
+import qualified NativeLargeElimIndexedCli as ICli
+import qualified NativeLargeElimIndexedSame as ISame
 
 proofBot :: valPred 'Bot :~: ()
 proofBot = Refl
@@ -29,7 +31,7 @@ unboxEval :: foreach (v :: Val) -> BoxVal v -> ()
 unboxEval v (MkBoxVal payload) = evalVal v payload
 
 main :: IO ()
-main = do
+main = ICli.useClosJoin `seq` ISame.sameBot `seq` do
   let r1 = case (proofBot, proofArr, proofRel, proofTuple) of
              (Refl, Refl, Refl, Refl) -> True
       r2 = idArr () == ()

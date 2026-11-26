@@ -1,0 +1,14 @@
+NativeConstrainedFamInstanceAndLocal.hs:9:10: error: [GHC-39999]
+    • No instance for ‘NativeConstrainedFamilyProvider.Allowed Int’
+        arising from a use of ‘Elem’
+    • In the instance declaration for ‘Render Ground’
+
+NativeConstrainedFamInstanceAndLocal.hs:11:22: error: [GHC-39999]
+    • No instance for ‘Collects c’ arising from a use of ‘Elem’
+      Possible fix:
+        add (Collects c) to the context of
+          the type of the constructor ‘Unqualified’:
+            forall {k} (c :: k). Proxy (Elem c) -> Unqualified c
+    • In the definition of data constructor ‘Unqualified’
+      In the data type declaration for ‘Unqualified’
+

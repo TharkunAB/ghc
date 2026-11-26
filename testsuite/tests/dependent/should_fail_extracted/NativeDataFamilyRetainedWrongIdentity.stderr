@@ -1,0 +1,7 @@
+NativeDataFamilyRetainedWrongIdentity.hs:6:13: error: [GHC-83865]
+    • Couldn't match type ‘x’ with ‘y’
+      Expected: x :~: y
+        Actual: x :~: x
+    • In the expression: Refl
+      In an equation for ‘wrong’: wrong _ _ = Refl
+

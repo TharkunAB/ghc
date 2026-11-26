@@ -1,15 +1,16 @@
 -- Based on https://github.com/idris-lang/Idris-dev/blob/v0.9.10/libs/effects/Effects.idr
 
 {-# LANGUAGE DataKinds, PolyKinds, ScopedTypeVariables, TypeOperators,
-             TypeApplications, GADTs, TypeFamilies, AllowAmbiguousTypes #-}
+             TypeApplications, GADTs, TypeFamilies, AllowAmbiguousTypes, Modifiers #-}
 
 module T12442 where
 
 import Data.Kind
+import GHC.Exts (M)
 
 data family Sing (a :: k)
 data TyFun :: Type -> Type -> Type
-type a ~> b = TyFun a b -> Type
+type a ~> b = TyFun a b %M -> Type
 infixr 0 ~>
 type family (a :: k1 ~> k2) @@ (b :: k1) :: k2
 

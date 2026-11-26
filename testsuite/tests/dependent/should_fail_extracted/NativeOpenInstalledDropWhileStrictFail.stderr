@@ -1,0 +1,6 @@
+NativeOpenInstalledDropWhileStrictFail.hs:8:36: error: [GHC-70565]
+    • Cannot evaluate ‘strictSpan’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘strictSpan p xs’
+      In the type synonym declaration for ‘StrictSplit’
+

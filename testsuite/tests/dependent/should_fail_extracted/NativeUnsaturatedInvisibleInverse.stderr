@@ -1,0 +1,63 @@
+NativeUnsaturatedInvisibleInverse.hs:14:7: error: [GHC-25897]
+    • Could not deduce ‘f ~ g’
+      from the context: f ~ g
+        bound by the type signature for:
+                   bad :: forall (f :: forall k. @U k) (g :: forall k. @U k).
+                          (f ~ g) =>
+                          Box f :~: Box g
+        at NativeUnsaturatedInvisibleInverse.hs:(12,1)-(13,40)
+      Expected: Box f :~: Box g
+        Actual: Box f :~: Box f
+      ‘f’ is a rigid type variable bound by
+        the type signature for:
+          bad :: forall (f :: forall k. @U k) (g :: forall k. @U k).
+                 (f ~ g) =>
+                 Box f :~: Box g
+        at NativeUnsaturatedInvisibleInverse.hs:(12,1)-(13,40)
+      ‘g’ is a rigid type variable bound by
+        the type signature for:
+          bad :: forall (f :: forall k. @U k) (g :: forall k. @U k).
+                 (f ~ g) =>
+                 Box f :~: Box g
+        at NativeUnsaturatedInvisibleInverse.hs:(12,1)-(13,40)
+    • In the expression: Refl
+      In an equation for ‘bad’: bad = Refl
+    • Relevant bindings include
+        bad :: Box f :~: Box g
+          (bound at NativeUnsaturatedInvisibleInverse.hs:14:1)
+
+NativeUnsaturatedInvisibleInverse.hs:17:14: error: [GHC-25897]
+    • Could not deduce ‘a ~ b’
+      from the context: IndexedVisible a ~ IndexedVisible b
+        bound by the type signature for:
+                   badVisible :: forall (a :: Bool) (b :: Bool).
+                                 (IndexedVisible a ~ IndexedVisible b) =>
+                                 a :~: b
+        at NativeUnsaturatedInvisibleInverse.hs:16:1-62
+      Expected: a :~: b
+        Actual: a :~: a
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          badVisible :: forall (a :: Bool) (b :: Bool).
+                        (IndexedVisible a ~ IndexedVisible b) =>
+                        a :~: b
+        at NativeUnsaturatedInvisibleInverse.hs:16:1-62
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          badVisible :: forall (a :: Bool) (b :: Bool).
+                        (IndexedVisible a ~ IndexedVisible b) =>
+                        a :~: b
+        at NativeUnsaturatedInvisibleInverse.hs:16:1-62
+    • In the expression: Refl
+      In an equation for ‘badVisible’: badVisible = Refl
+    • Relevant bindings include
+        badVisible :: a :~: b
+          (bound at NativeUnsaturatedInvisibleInverse.hs:17:1)
+
+NativeUnsaturatedInvisibleInverse.hs:28:15: error: [GHC-83865]
+    • Couldn't match type ‘Required’ with ‘RequiredCopy’
+      Expected: RequiredBox Required :~: RequiredBox RequiredCopy
+        Actual: RequiredBox Required :~: RequiredBox Required
+    • In the expression: Refl
+      In an equation for ‘badRequired’: badRequired = Refl
+

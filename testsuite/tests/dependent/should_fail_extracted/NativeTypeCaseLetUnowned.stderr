@@ -1,0 +1,6 @@
+NativeTypeCaseLetUnowned.hs:4:26: error:
+    A type let used in a case body cannot generalize the kind of its right-hand side.
+
+NativeTypeCaseLetUnowned.hs:9:15: error:
+    A type let used in a case body cannot generalize the kind of its right-hand side.
+

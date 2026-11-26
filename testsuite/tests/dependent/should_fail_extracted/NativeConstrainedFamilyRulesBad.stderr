@@ -1,0 +1,6 @@
+NativeConstrainedFamilyRulesBad.hs:6:8: error: [GHC-39999]
+    • No instance for ‘NativeConstrainedFamilyRulesProvider.Allowed
+                         Int’
+        arising from a use of ‘Elem’
+    • In the type signature: bad :: Elem [Int] :~: Int
+

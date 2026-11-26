@@ -1,0 +1,25 @@
+NativeUnsaturatedInverse.hs:10:18: error: [GHC-25897]
+    • Could not deduce ‘a ~ b’
+      from the context: f b ~ f a
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘inverse’
+        at NativeUnsaturatedInverse.hs:10:11-14
+      Expected: a :~: b
+        Actual: a :~: a
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          inverse :: forall (f :: Bool %U -> Bool) (a :: Bool) (b :: Bool).
+                     Proxy f -> (f a :~: f b) -> a :~: b
+        at NativeUnsaturatedInverse.hs:(8,1)-(9,35)
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          inverse :: forall (f :: Bool %U -> Bool) (a :: Bool) (b :: Bool).
+                     Proxy f -> (f a :~: f b) -> a :~: b
+        at NativeUnsaturatedInverse.hs:(8,1)-(9,35)
+    • In the expression: Refl
+      In an equation for ‘inverse’: inverse _ Refl = Refl
+    • Relevant bindings include
+        inverse :: Proxy f -> (f a :~: f b) -> a :~: b
+          (bound at NativeUnsaturatedInverse.hs:10:1)
+

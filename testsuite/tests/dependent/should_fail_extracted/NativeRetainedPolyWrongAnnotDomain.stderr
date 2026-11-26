@@ -1,0 +1,36 @@
+NativeRetainedPolyWrongAnnotDomain.hs:9:16: error: [GHC-25897]
+    • Could not deduce ‘P.plug c t ~ t’
+      from the context: c ~ P.CHole
+        bound by a type expected by the context:
+                   (c ~ P.CHole) => P.plug c t :~: t
+        at NativeRetainedPolyWrongAnnotDomain.hs:9:1-19
+      Expected: P.plug c t :~: t
+        Actual: P.plug c t :~: P.plug c t
+      ‘t’ is a rigid type variable bound by
+        the type signature for:
+          plugHoleId :: forall (t :: P.UTerm P.Zero).
+                        foreach (c1 :: P.UCtx P.Zero P.Zero)
+                        -> (c1 ~ P.CHole) => P.plug c1 t :~: t
+        at NativeRetainedPolyWrongAnnotDomain.hs:(5,1)-(8,30)
+    • In the expression: Refl
+      In the expression: \ -> Refl
+      In an equation for ‘plugHoleId’: plugHoleId _ = Refl
+    • Relevant bindings include
+        plugHoleId :: foreach (c :: P.UCtx P.Zero P.Zero)
+                      -> (c ~ P.CHole) => P.plug c t :~: t
+          (bound at NativeRetainedPolyWrongAnnotDomain.hs:9:1)
+
+NativeRetainedPolyWrongAnnotDomain.hs:11:19: error: [GHC-83605]
+    • GHC cannot use the cast required for this argument as a retained index.
+      Expected: P.UCtx P.Zero P.Zero
+        Actual: P.UCtx P.Zero (P.Succ P.Zero)
+    • In the expression:
+        plugHoleId
+          @(P.ULam (P.UVar P.FZ) :: P.UTerm 'P.Zero)
+          (P.CHole :: P.UCtx 'P.Zero ('P.Succ 'P.Zero))
+      In an equation for ‘bad’:
+          bad
+            = plugHoleId
+                @(P.ULam (P.UVar P.FZ) :: P.UTerm 'P.Zero)
+                (P.CHole :: P.UCtx 'P.Zero ('P.Succ 'P.Zero))
+

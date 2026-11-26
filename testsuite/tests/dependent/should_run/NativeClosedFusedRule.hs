@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}
 module NativeClosedFusedRule where
 
 import Data.Type.Equality ((:~:)(Refl))

@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, ImpredicativeTypes, LambdaCase, NoExperimentalDependentTypes #-}
+{-# LANGUAGE GADTs, ImpredicativeTypes, LambdaCase, NoDependentTypes #-}
 module WitnessJointReject where
 
 import WitnessSchema

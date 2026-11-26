@@ -1,0 +1,10 @@
+NativeTypeCaseHiddenAlias.hs:11:11: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘F’’ with ‘Int’
+      Expected: F (Just x) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘proof’: proof _ = Refl
+    • Relevant bindings include
+        proof :: Proxy x -> F (Just x) :~: Int
+          (bound at NativeTypeCaseHiddenAlias.hs:11:1)
+

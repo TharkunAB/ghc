@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}
 module Main where
 import Data.Type.Equality ((:~:)(Refl))
 import qualified IndexedMark as P (Mark(Count, Pair), sample, readMark)

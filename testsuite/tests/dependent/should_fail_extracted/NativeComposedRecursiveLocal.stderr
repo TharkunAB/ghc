@@ -1,0 +1,50 @@
+NativeComposedRecursiveLocal.hs:9:42: error: [GHC-83865]
+    • Couldn't match expected type: foreach (x :: a) -> k (to x) :~: x
+                  with actual type: foreach (x :: a) -> k (h (h x)) :~: x
+    • In the fifth argument of ‘MkIso’, namely ‘left’
+      In the expression: MkIso @a @a to k left right
+      In an equation for ‘badRec’:
+          badRec h k left right
+            = MkIso @a @a to k left right
+            where
+                to :: a -> a
+                to x = h (to x)
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedRecursiveLocal.hs:12:5)
+        right :: foreach (y :: a) -> h (h (k y)) :~: y
+          (bound at NativeComposedRecursiveLocal.hs:9:17)
+        left :: foreach (x :: a) -> k (h (h x)) :~: x
+          (bound at NativeComposedRecursiveLocal.hs:9:12)
+        k :: a -> a (bound at NativeComposedRecursiveLocal.hs:9:10)
+        h :: a -> a (bound at NativeComposedRecursiveLocal.hs:9:8)
+        badRec :: foreach (h :: a -> a)
+                  -> foreach (k :: a -> a)
+                     -> (foreach (x :: a) -> k (h (h x)) :~: x)
+                        -> (foreach (y :: a) -> h (h (k y)) :~: y) -> Iso a a
+          (bound at NativeComposedRecursiveLocal.hs:9:1)
+
+NativeComposedRecursiveLocal.hs:9:47: error: [GHC-83865]
+    • Couldn't match expected type: foreach (y :: a) -> to (k y) :~: y
+                  with actual type: foreach (y :: a) -> h (h (k y)) :~: y
+    • In the sixth argument of ‘MkIso’, namely ‘right’
+      In the expression: MkIso @a @a to k left right
+      In an equation for ‘badRec’:
+          badRec h k left right
+            = MkIso @a @a to k left right
+            where
+                to :: a -> a
+                to x = h (to x)
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedRecursiveLocal.hs:12:5)
+        right :: foreach (y :: a) -> h (h (k y)) :~: y
+          (bound at NativeComposedRecursiveLocal.hs:9:17)
+        left :: foreach (x :: a) -> k (h (h x)) :~: x
+          (bound at NativeComposedRecursiveLocal.hs:9:12)
+        k :: a -> a (bound at NativeComposedRecursiveLocal.hs:9:10)
+        h :: a -> a (bound at NativeComposedRecursiveLocal.hs:9:8)
+        badRec :: foreach (h :: a -> a)
+                  -> foreach (k :: a -> a)
+                     -> (foreach (x :: a) -> k (h (h x)) :~: x)
+                        -> (foreach (y :: a) -> h (h (k y)) :~: y) -> Iso a a
+          (bound at NativeComposedRecursiveLocal.hs:9:1)
+

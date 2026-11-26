@@ -1,11 +1,11 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds #-}
-{-# LANGUAGE StandaloneKindSignatures, TypeFamilies, TypeOperators #-}
+{-# LANGUAGE DependentTypes, TypeFamilies #-}
 
 module NativeNestedSumCapture where
 
 import Data.Kind (Type)
 import Data.Proxy (Proxy)
 import Data.Type.Equality ((:~:))
+import GHC.Tuple (type Tuple3)
 
 data N = Z | S N
 
@@ -20,15 +20,15 @@ type family Add n m where
 
 type Keep a (n :: N) (m :: N) (v :: Vec a (Add n m)) =
   some (left :: Vec a n) |
-    (some (right :: Vec a m) | (Proxy left, Proxy right, v :~: v))
+    (some (right :: Vec a m) | Tuple3 (Proxy left) (Proxy right) (v :~: v))
 
 type Shadow :: forall (a :: Type) -> forall (n :: N) -> forall (m :: N)
             -> Vec a (Add n m) -> Type
 type Shadow a (n :: N) (m :: N) (v :: Vec a (Add n m)) =
   some (n :: Vec a n) |
-    (some (x :: Proxy n) | (Proxy n, Proxy x, v :~: v))
+    (some (x :: Proxy n) | Tuple3 (Proxy n) (Proxy x) (v :~: v))
 
 type NestedShadow (n :: N) (m :: N) (v :: Vec Bool (Add n m)) =
   some (n :: Vec Bool n) |
     (some (n :: Proxy n) |
-      (some (x :: Proxy n) | (Proxy n, Proxy x, v :~: v)))
+      (some (x :: Proxy n) | Tuple3 (Proxy n) (Proxy x) (v :~: v)))

@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, LinearTypes, RoleAnnotations #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, LinearTypes, RoleAnnotations #-}
 module FoldCell (At(..), foldCell, foldDirect, foldValue) where
 
 import Selector (Tagged(..), observe, tag)

@@ -1,0 +1,6 @@
+NativeAutoNumUncertified.hs:13:9: error: [GHC-83865]
+    • Expected kind ‘Bad’,
+        but ‘3’ has kind ‘GHC.Internal.Bignum.Natural.Natural’
+    • In the first argument of ‘(:~:)’, namely ‘(3 :: Bad)’
+      In the type signature: bad :: (3 :: Bad) :~: 'BZero
+

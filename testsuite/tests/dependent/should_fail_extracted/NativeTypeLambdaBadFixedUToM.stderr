@@ -1,0 +1,6 @@
+NativeTypeLambdaBadFixedUToM.hs:6:18: error: [GHC-83865]
+    • Couldn't match expected type: Maybe Bool
+                  with actual type: f0 Bool
+    • In the expression: x
+      In an equation for ‘badFixedUToM’: badFixedUToM x = x
+

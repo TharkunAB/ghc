@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds, ScopedTypeVariables #-}
 {-# LANGUAGE ExplicitNamespaces, GADTs, RequiredTypeArguments, TypeAbstractions, TypeFamilies, TypeOperators #-}
 module NativeAlternatingBindersProvider
   ( Reading(..), Marker(..), keepAfter, keepExplicit, keepImplicit

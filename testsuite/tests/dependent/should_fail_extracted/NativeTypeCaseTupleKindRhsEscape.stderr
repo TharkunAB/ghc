@@ -1,0 +1,3 @@
+NativeTypeCaseTupleKindRhsEscape.hs:7:41: error: [GHC-76037]
+    Not in scope: type variable ‘ghost’
+

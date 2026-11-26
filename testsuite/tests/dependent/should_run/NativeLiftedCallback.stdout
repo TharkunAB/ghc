@@ -1,0 +1,17 @@
+(False,False,True)
+True
+True
+True
+(IsFalse,())
+(IsFalse,())
+True
+(GT,LT,EQ)
+Refl
+Refl
+(GT,LT)
+(GT,LT,EQ)
+EQ
+True
+Refl
+(GT,LT)
+EQ

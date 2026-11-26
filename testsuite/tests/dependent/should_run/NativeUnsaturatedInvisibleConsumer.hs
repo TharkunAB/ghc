@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TypeOperators #-}
 module NativeUnsaturatedInvisibleConsumer where
 import Data.Type.Equality
 import InvisibleFamily (Observed, ObservedVisible, ReadFlag, ReadType, RequiredPair, Test)

@@ -1,0 +1,5 @@
+NativeSameModLocalRuleHelper.hs:285:14: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘exts’, which GHC uses to check a dependent type.
+    • In the expression: BetaLst VZero VNil
+      In an equation for ‘betaDouble’: betaDouble = BetaLst VZero VNil
+

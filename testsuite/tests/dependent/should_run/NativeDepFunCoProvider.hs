@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures, RankNTypes, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures, RankNTypes, TypeFamilies #-}
 module NativeDepFunCoProvider (Nat(..), Vec(..), SourceToken, TargetToken, transport) where
 
 import Data.Kind (Type)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TemplateHaskell, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TemplateHaskell, TypeOperators #-}
 module NativeClosedSumLocal where
 
 import Data.Type.Equality ((:~:)(Refl))

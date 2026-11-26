@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, NoDependentTypes #-}
 module NativeSourceProductRule where
 
 import PackedVecLibrary (Nat(..), Vec(..), flattenRows, plus)

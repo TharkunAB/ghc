@@ -1,0 +1,5 @@
+NativeOpenPreludeZipWithInverseRuleFail.hs:13:19: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘NativeOpenPreludeZipWithFoldProvider.foldZip’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘badInverse’: badInverse [] _ = Refl
+

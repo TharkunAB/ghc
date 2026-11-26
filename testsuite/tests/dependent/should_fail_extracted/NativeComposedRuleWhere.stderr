@@ -1,0 +1,3 @@
+NativeComposedRuleWhere.hs:14:11: error: [GHC-83605]
+    A rewrite rule can change the result of ‘.’, which GHC uses to check a dependent type.
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, FunctionalDependencies, ScopedTypeVariables, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, FunctionalDependencies, ScopedTypeVariables, TypeFamilies #-}
 module ScopedFamilyMethodProvider (Collects(..), TaggedEntry(..), inspectEntry, inspectPayload, measuredEntry, Encode(..), encodeEntry) where
 
 import Data.Proxy (Proxy(..))

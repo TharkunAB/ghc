@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 
 module Builder (Builder, singleton, empty, throwing, shadowed) where
 

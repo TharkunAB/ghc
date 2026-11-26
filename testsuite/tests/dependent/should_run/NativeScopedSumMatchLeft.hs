@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeFamilies, UndecidableInstances #-}
 module NativeScopedSumMatchLeft (Alpha, Named, ForeignScope) where
 
 import Data.Proxy (Proxy)

@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP, DependentTypes, ListTuplePuns #-}
--- | Provider for casted certified source-call operands in retained fields (R03, R05, R11).
+-- | Provider for casted certified source-call operands in retained fields.
 module NativeRetainedCastSourceCallProvider
   ( Nat (..)
   , Ty (..)

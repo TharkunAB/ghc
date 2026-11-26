@@ -1,0 +1,7 @@
+NativeOpenZipRowsNondecreasingFail.hs:9:56: error: [GHC-70565]
+    • Cannot evaluate ‘loopLength’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the first argument of ‘(:~:)’, namely ‘loopLength '[] ys’
+      In the type signature:
+        nondecreasing :: forall (ys :: [Char]). loopLength '[] ys :~: 'Z
+

@@ -1,0 +1,4 @@
+(Refl,Refl,Refl,Refl,Refl,1,2,1,[5],[])
+(Refl,Refl,Just 5,Just 8)
+(Refl,(Just 8,Just 4),Just 7)
+(Refl,Refl,Refl,Refl,(Just 18,Just 9),(Nothing,Just 0),(Just 0,Nothing))

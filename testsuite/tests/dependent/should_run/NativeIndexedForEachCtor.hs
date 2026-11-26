@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds #-}
 module Main where
 
 import GHC.Sigma (Sigma(..))

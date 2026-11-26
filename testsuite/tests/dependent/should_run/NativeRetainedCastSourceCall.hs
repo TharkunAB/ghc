@@ -1,5 +1,5 @@
 {-# LANGUAGE DependentTypes, ListTuplePuns #-}
--- | Client for casted certified source-call operands across interfaces (R03, R05, R11).
+-- | Client for casted certified source-call operands across interfaces.
 module Main (main) where
 
 import NativeRetainedCastSourceCallProvider

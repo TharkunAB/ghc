@@ -1,0 +1,12 @@
+NativeOpenConstructorMarkerKindFail.hs:7:30: error: [GHC-83865]
+    • Couldn't match kind ‘True’ with ‘Bool’
+      Expected kind ‘L.Marker Bool’,
+        but ‘'L.Marker :: L.Marker 'True’ has kind ‘L.Marker True’
+    • In the first argument of ‘L.retain’, namely
+        ‘('L.Marker :: L.Marker 'True)’
+      In the first argument of ‘(:~:)’, namely
+        ‘L.retain ('L.Marker :: L.Marker 'True) 'False’
+      In the type signature:
+        wrongMarkerKind :: L.retain ('L.Marker :: L.Marker 'True) 'False
+                           :~: 'False
+

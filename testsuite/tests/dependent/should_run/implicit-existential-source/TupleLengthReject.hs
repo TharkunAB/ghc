@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NoExperimentalDependentTypes, NoImpredicativeTypes #-}
+{-# LANGUAGE CPP, NoDependentTypes, NoImpredicativeTypes #-}
 module TupleLengthReject where
 
 import Filter (ProductSame, SameLength, filterVec, makeProduct)

@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, RequiredTypeArguments, ScopedTypeVariables #-}
+{-# LANGUAGE DependentTypes, RequiredTypeArguments, ScopedTypeVariables #-}
 module NativeRetainedTypeWitnessSynthesis where
 
 import Data.Kind (Type)

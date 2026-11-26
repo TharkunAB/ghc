@@ -1,0 +1,7 @@
+NativeOpenZipRowsPatternFail.hs:10:13: error: [GHC-83605]
+    This retained constructor pair is matched by an earlier equation.
+
+NativeOpenZipRowsPatternFail.hs:18:1: error: [GHC-83605]
+    Missing equation for the retained constructor pair (Last, True).
+    Add an equation for this pair or a final equation that covers it.
+

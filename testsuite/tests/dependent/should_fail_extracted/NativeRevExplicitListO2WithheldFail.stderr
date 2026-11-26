@@ -1,0 +1,15 @@
+NativeRevExplicitListO2WithheldFail.hs:9:34: error: [GHC-70565]
+    • Cannot evaluate ‘revHijack’ in a type.
+        The argument must be a closed literal of one of these kinds: [Natural], [Char], [Bool].
+    • In the first argument of ‘(:~:)’, namely ‘revHijack ('[] :: [a])’
+      In the type signature:
+        badHijack :: forall a. revHijack ('[] :: [a]) :~: '[]
+
+NativeRevExplicitListO2WithheldFail.hs:12:40: error: [GHC-70565]
+    • Cannot evaluate ‘revInlinable’ in a type.
+        The argument must be a closed literal of one of these kinds: [Natural], [Char], [Bool].
+    • In the first argument of ‘(:~:)’, namely
+        ‘revInlinable ('[] :: [a])’
+      In the type signature:
+        badInlinable :: forall a. revInlinable ('[] :: [a]) :~: '[]
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 module NativeClosedIndexedContext where
 import Data.Proxy (Proxy(..))
 import qualified NativeClosedIndexedContextLib as P

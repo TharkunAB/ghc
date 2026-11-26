@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 
 module EscapePackage where
 

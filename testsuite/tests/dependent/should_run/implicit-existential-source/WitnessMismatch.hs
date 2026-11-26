@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ImpredicativeTypes, RankNTypes, TypeApplications, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ImpredicativeTypes, RankNTypes, TypeApplications, TypeFamilies #-}
 module WitnessMismatch where
 import Data.Kind (Type)
 type family Key (a :: Type) :: Type where

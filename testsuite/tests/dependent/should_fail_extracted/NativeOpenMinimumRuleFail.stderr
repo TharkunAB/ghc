@@ -1,0 +1,5 @@
+NativeOpenMinimumRuleFail.hs:15:17: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘minSizeSame’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘zeroLawSame’: zeroLawSame _ = Refl
+

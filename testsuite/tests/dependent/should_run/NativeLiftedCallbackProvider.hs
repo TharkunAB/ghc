@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs, Modifiers #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs, Modifiers #-}
 module NativeLiftedCallbackProvider (Decision(..), decide) where
 
 data Decision (b :: Bool) where

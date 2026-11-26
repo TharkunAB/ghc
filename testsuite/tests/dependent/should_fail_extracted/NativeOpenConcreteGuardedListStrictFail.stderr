@@ -1,0 +1,6 @@
+NativeOpenConcreteGuardedListStrictFail.hs:8:31: error: [GHC-70565]
+    • Cannot evaluate ‘dropBool’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘dropBool p xs’
+      In the type synonym declaration for ‘DropBool’
+

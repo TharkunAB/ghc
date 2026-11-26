@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, RequiredTypeArguments, TemplateHaskell #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, RequiredTypeArguments, TemplateHaskell #-}
 module NativeTypeCaseRetainedReify where
 
 import Language.Haskell.TH (reify)

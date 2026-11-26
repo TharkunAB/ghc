@@ -1,0 +1,34 @@
+NativeOpenBuildFail.hs:12:15: error: [GHC-25897]
+    • Couldn't match type ‘p’ with ‘B.swapPair p’
+      Expected: B.swapPair p :~: p
+        Actual: p :~: p
+      ‘p’ is a rigid type variable bound by
+        the type signature for:
+          rigidSwap :: forall (p :: (*, *)). Proxy p -> B.swapPair p :~: p
+        at NativeOpenBuildFail.hs:11:1-70
+    • In the expression: Refl
+      In an equation for ‘rigidSwap’: rigidSwap _ = Refl
+    • Relevant bindings include
+        rigidSwap :: Proxy p -> B.swapPair p :~: p
+          (bound at NativeOpenBuildFail.hs:12:1)
+
+NativeOpenBuildFail.hs:15:18: error: [GHC-25897]
+    • Couldn't match type ‘a’ with ‘b’
+      Expected: Make a b :~: B.Shell b a
+        Actual: Make a b :~: Make a b
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          wrongOrder :: forall a b.
+                        Proxy a -> Proxy b -> Make a b :~: B.Shell b a
+        at NativeOpenBuildFail.hs:14:1-73
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          wrongOrder :: forall a b.
+                        Proxy a -> Proxy b -> Make a b :~: B.Shell b a
+        at NativeOpenBuildFail.hs:14:1-73
+    • In the expression: Refl
+      In an equation for ‘wrongOrder’: wrongOrder _ _ = Refl
+    • Relevant bindings include
+        wrongOrder :: Proxy a -> Proxy b -> Make a b :~: B.Shell b a
+          (bound at NativeOpenBuildFail.hs:15:1)
+

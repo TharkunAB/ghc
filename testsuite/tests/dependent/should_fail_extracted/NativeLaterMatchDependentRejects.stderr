@@ -1,0 +1,106 @@
+NativeLaterMatchDependentRejects.hs:13:26: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘KnownListCallback’ has kind ‘* %U -> *’
+    • In the first argument of ‘ApplyM’, namely ‘KnownListCallback’
+      In the type ‘ApplyM KnownListCallback Bool’
+      In the type synonym declaration for ‘BadSignedM’
+
+NativeLaterMatchDependentRejects.hs:16:26: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘* %U -> *’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the first argument of ‘ApplyU’, namely ‘Maybe’
+      In the type ‘ApplyU Maybe Bool’
+      In the type synonym declaration for ‘BadSignedU’
+
+NativeLaterMatchDependentRejects.hs:18:33: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘* %(LaterMatchability.Flip M) -> *’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the second argument of ‘ApplyFlipped’, namely ‘Maybe’
+      In the type ‘ApplyFlipped @M Maybe Bool’
+      In the type synonym declaration for ‘BadComp1’
+
+NativeLaterMatchDependentRejects.hs:19:53: error: [GHC-83865]
+    • Couldn't match kind ‘LaterMatchability.Flip m’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %(LaterMatchability.Flip m) -> *’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+      The type variable ‘m’ is ambiguous
+    • In the second argument of ‘ApplyFlipped’, namely ‘Maybe’
+      In the type ‘ApplyFlipped @m Maybe Bool’
+      In the type synonym declaration for ‘BadComp2’
+
+NativeLaterMatchDependentRejects.hs:22:25: error: [GHC-83865]
+    • Expected kind ‘LaterMatchability.Mapper’,
+        but ‘MOnly’ has kind ‘(* %M -> *) -> [*] -> [*]’
+    • In the first argument of ‘Recipe’, namely ‘MOnly’
+      In the type ‘Recipe MOnly’
+      In the type synonym declaration for ‘BadRecipe’
+
+NativeLaterMatchDependentRejects.hs:27:27: error: [GHC-83865]
+    • Couldn't match kind: forall {t :: Matchability} {a}
+                                  {k}. @GHC.Internal.Types.Unmatchable
+                           (k %t -> a)
+                           %GHC.Internal.Types.Unmatchable -> [k]
+                           %GHC.Internal.Types.Unmatchable -> [a]
+                     with: forall (flag :: Bool) {b} {a}. @U
+                           (a %M -> b) %U -> [a] %U -> [b]
+      Expected kind ‘WrongMapper’,
+        but ‘Map’ has kind ‘forall {t :: Matchability} {a}
+                                   {k}. @GHC.Internal.Types.Unmatchable
+                            (k %t -> a)
+                            %GHC.Internal.Types.Unmatchable -> [k]
+                            %GHC.Internal.Types.Unmatchable -> [a]’
+    • In the first argument of ‘Wrong’, namely ‘Map’
+      In the type ‘Wrong Map’
+      In the type synonym declaration for ‘BadWrongKind’
+
+NativeLaterMatchDependentRejects.hs:29:49: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘Anchor U’,
+        but ‘'Match’ has kind ‘Anchor GHC.Internal.Types.Matchable’
+    • In the third argument of ‘Receiver’, namely ‘'Match’
+      In the type ‘Receiver @U (Select 'True) 'Match’
+      In the type synonym declaration for ‘FixedReceiver’
+
+NativeLaterMatchDependentRejects.hs:30:47: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘Anchor U’,
+        but ‘'Match’ has kind ‘Anchor GHC.Internal.Types.Matchable’
+    • In the second argument of ‘Receiver’, namely ‘'Match’
+      In the type ‘Receiver (Select @U 'True) 'Match’
+      In the type synonym declaration for ‘FixedSelect’
+
+NativeLaterMatchDependentRejects.hs:31:50: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘Anchor M’,
+        but ‘'Unmatch’ has kind ‘Anchor GHC.Internal.Types.Unmatchable’
+    • In the third argument of ‘Receiver’, namely ‘'Unmatch’
+      In the type ‘Receiver @M (Select @M 'True) 'Unmatch’
+      In the type synonym declaration for ‘WrongAnchor’
+
+NativeLaterMatchDependentRejects.hs:36:1: error: [GHC-16220]
+    • Uninferrable type variable a0 in
+      the type synonym right-hand side:
+      Receiver
+        @(Selector a0) (Select @(Selector a0) True) (Unselected @a0)
+    • In the type synonym declaration for ‘BadAmbiguous’
+
+NativeLaterMatchDependentRejects.hs:39:30: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘WrapOpen 'True’ has kind ‘*
+                                       %GHC.Internal.Types.Unmatchable -> *’
+    • In the first argument of ‘FixedBox’, namely ‘(WrapOpen 'True)’
+      In the type ‘FixedBox (WrapOpen 'True)’
+      In the type synonym declaration for ‘BadFixedBox’
+

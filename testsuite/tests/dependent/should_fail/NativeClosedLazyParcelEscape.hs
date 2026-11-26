@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 module NativeClosedLazyParcelEscape where
 import Data.Proxy (Proxy(..))
 import qualified LazyParcel as P

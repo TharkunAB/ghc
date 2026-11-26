@@ -1,0 +1,37 @@
+NativeRetainedMatchabilityTooLate.hs:11:1: error: [GHC-25897]
+    • Couldn't match expected type ‘ma’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+      ‘ma’ is a rigid type variable bound by
+        the type signature for:
+          ordinary :: forall (ma :: Matchability). @GHC.Internal.Types.Unmatchable
+                      Witness ma %ma -> Int
+        at NativeRetainedMatchabilityTooLate.hs:10:1-62
+    • Relevant bindings include
+        ordinary :: Witness ma %ma -> Int
+          (bound at NativeRetainedMatchabilityTooLate.hs:11:1)
+
+NativeRetainedMatchabilityTooLate.hs:14:12: error: [GHC-25897]
+    • Couldn't match expected type ‘ma’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+      ‘ma’ is a rigid type variable bound by
+        the type signature for:
+          retained :: forall (ma :: Matchability). @GHC.Internal.Types.Unmatchable
+                      foreach (tag :: Bool) -> Witness ma %ma -> Reading tag
+        at NativeRetainedMatchabilityTooLate.hs:13:1-95
+    • Relevant bindings include
+        retained :: foreach (tag :: Bool) -> Witness ma %ma -> Reading tag
+          (bound at NativeRetainedMatchabilityTooLate.hs:14:1)
+
+NativeRetainedMatchabilityTooLate.hs:17:1: error: [GHC-25897]
+    • Couldn't match expected type ‘ma’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+      ‘ma’ is a rigid type variable bound by
+        the type signature for:
+          constructor :: forall (ma :: Matchability). @GHC.Internal.Types.Unmatchable
+                         foreach (tag :: Bool) -> Witness ma %ma -> Reading tag
+        at NativeRetainedMatchabilityTooLate.hs:16:1-98
+    • Relevant bindings include
+        constructor :: foreach (tag :: Bool)
+                       -> Witness ma %ma -> Reading tag
+          (bound at NativeRetainedMatchabilityTooLate.hs:17:1)
+

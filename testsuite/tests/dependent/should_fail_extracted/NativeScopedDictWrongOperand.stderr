@@ -1,0 +1,4 @@
+NativeScopedDictWrongOperand.hs:1:1: error: [GHC-83605]
+    Constraint solving for this retained function type is not supported yet:
+    choose @b $dChoose y
+

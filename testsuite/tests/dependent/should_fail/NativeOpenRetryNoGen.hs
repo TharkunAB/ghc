@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, LinearTypes #-}
+{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, LinearTypes #-}
 {-# LANGUAGE NamedWildCards, PartialTypeSignatures, TypeApplications #-}
 module NativeOpenRetryNoGen where
 import GHC.Types (Multiplicity(Many))

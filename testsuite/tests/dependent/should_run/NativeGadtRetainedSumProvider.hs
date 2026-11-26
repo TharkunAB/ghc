@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, RankNTypes, TypeOperators, UndecidableInstances #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, RankNTypes, TypeOperators, UndecidableInstances #-}
 module NativeGadtRetainedSumProvider where
 
 import Data.Type.Equality ((:~:)(Refl))

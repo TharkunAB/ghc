@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, GADTs, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, DataKinds, GADTs, NoDependentTypes #-}
 module WrongDomain where
 import CompareAt
 import Data.Proxy

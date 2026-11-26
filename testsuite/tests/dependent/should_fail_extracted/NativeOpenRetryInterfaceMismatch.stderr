@@ -1,0 +1,15 @@
+NativeOpenRetryInterfaceMismatch.hs:8:21: error: [GHC-83865]
+    • Couldn't match type ‘'b'’ with ‘'a'’
+      Expected: Proxy 'a'
+        Actual: Proxy 'b'
+    • In the first argument of ‘upper’, namely ‘(Proxy @'b')’
+      In the expression: upper (Proxy @'b')
+      In an equation for ‘wrongInput’: wrongInput = upper (Proxy @'b')
+
+NativeOpenRetryInterfaceMismatch.hs:11:15: error: [GHC-83865]
+    • Couldn't match type ‘'A'’ with ‘'Z'’
+      Expected: Proxy 'Z'
+        Actual: Proxy 'A'
+    • In the expression: upper (Proxy @'a')
+      In an equation for ‘wrongResult’: wrongResult = upper (Proxy @'a')
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeepSubsumption, ImpredicativeTypes, NoExperimentalDependentTypes #-}
+{-# LANGUAGE DeepSubsumption, ImpredicativeTypes, NoDependentTypes #-}
 module WitnessDeep where
 import WitnessSchema
 

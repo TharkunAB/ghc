@@ -1,0 +1,5 @@
+NativeLargeElimRuleConflict.hs:13:7: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘valPred’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘bad’: bad = Refl
+

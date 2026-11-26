@@ -1,0 +1,31 @@
+NativeTotalityReport.hs:33:1:: totality: plus: checked-structural
+NativeTotalityReport.hs:38:1::
+    totality: appendVec: checked-structural
+NativeTotalityReport.hs:43:1::
+    totality: lookupVec: checked-structural
+NativeTotalityReport.hs:48:1::
+    totality: congSucc: checked-structural
+NativeTotalityReport.hs:53:1::
+    totality: plusAssoc: checked-structural
+NativeTotalityReport.hs:58:1::
+    totality: stepHelper: checked-structural
+NativeTotalityReport.hs:63:1::
+    totality: callsCheckedHelper: checked-structural
+NativeTotalityReport.hs:68:1::
+    totality: divergentHelper: unknown (non-structural recursive call)
+NativeTotalityReport.hs:72:1::
+    totality: callsDivergentHelper: unknown (calls non-total local function)
+NativeTotalityReport.hs:77:1::
+    totality: loop: unknown (non-structural recursive call)
+NativeTotalityReport.hs:81:1::
+    totality: apply: unknown (higher-order call)
+NativeTotalityReport.hs:85:1::
+    totality: headOnly: unknown (partial or guarded equations)
+NativeTotalityReport.hs:89:1::
+    totality: revExternal: unknown (imports external function)
+NativeTotalityReport.hs:93:1::
+    totality: evenN: unknown (mutual recursion)
+NativeTotalityReport.hs:97:1::
+    totality: oddN: unknown (mutual recursion)
+NativeTotalityReport.hs:101:1::
+    totality: main: unknown (imports external function)

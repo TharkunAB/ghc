@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, NoExperimentalDependentTypes, TemplateHaskell #-}
+{-# LANGUAGE DataKinds, NoDependentTypes, TemplateHaskell #-}
 {-# LANGUAGE GADTs, PolyKinds, RankNTypes, TypeAbstractions, TypeApplications, TypeOperators #-}
 module NativeTypeCaseReify where
 import Data.Type.Equality ((:~:)(Refl))

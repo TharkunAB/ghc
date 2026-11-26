@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ImpredicativeTypes, NoExperimentalDependentTypes, ScopedTypeVariables, TypeFamilies #-}
+{-# LANGUAGE DataKinds, ImpredicativeTypes, NoDependentTypes, ScopedTypeVariables, TypeFamilies #-}
 module QuickLookForward where
 
 import Control.Exception (ErrorCall, displayException, evaluate, try)

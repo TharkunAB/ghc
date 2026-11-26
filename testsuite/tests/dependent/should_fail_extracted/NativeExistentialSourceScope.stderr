@@ -1,0 +1,3 @@
+NativeExistentialSourceScope.hs:10:55: error: [GHC-76037]
+    Not in scope: type variable ‘a’
+

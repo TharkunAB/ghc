@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExplicitNamespaces, ExperimentalDependentTypes, GADTs, KindSignatures, ScopedTypeVariables, TypeOperators #-}
+{-# LANGUAGE DataKinds, ExplicitNamespaces, DependentTypes, ListTuplePuns, GADTs, KindSignatures, ScopedTypeVariables, TypeOperators #-}
 module NativeLargeElimTypeProvider
   ( Val(..)
   , valPred

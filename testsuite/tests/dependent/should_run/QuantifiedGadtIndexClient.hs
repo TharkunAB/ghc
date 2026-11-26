@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, NoExperimentalDependentTypes, PolyKinds, RankNTypes, TypeApplications #-}
+{-# LANGUAGE GADTs, NoDependentTypes, PolyKinds, RankNTypes, TypeApplications #-}
 module Main where
 
 import Data.Kind (Type)

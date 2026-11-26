@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, NoDependentTypes #-}
 module NativeOpenEitherFmapProducer (Result(..), Translate(..)) where
 
 data Result e a = Failed e | Succeeded a

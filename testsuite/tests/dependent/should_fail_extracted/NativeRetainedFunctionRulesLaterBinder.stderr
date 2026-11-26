@@ -1,0 +1,32 @@
+NativeRetainedFunctionRulesLaterBinder.hs:9:49: error: [GHC-25897]
+    • Couldn't match expected type ‘Choice b’ with actual type ‘t’
+      ‘t’ is a rigid type variable bound by
+        the RULE "later binder"
+        at NativeRetainedFunctionRulesLaterBinder.hs:9:11-53
+    • In the second argument of ‘readKept’, namely ‘x’
+      In the expression: readKept b x
+      When checking the rewrite rule "later binder"
+    • Relevant bindings include
+        x :: t (bound at NativeRetainedFunctionRulesLaterBinder.hs:9:33)
+
+NativeRetainedFunctionRulesLaterBinder.hs:15:59: error: [GHC-25897]
+    • Couldn't match expected type ‘Reading m’ with actual type ‘t’
+      ‘t’ is a rigid type variable bound by
+        the RULE "later reading"
+        at NativeRetainedFunctionRulesLaterBinder.hs:15:11-63
+    • In the third argument of ‘keepReading’, namely ‘x’
+      In the expression: keepReading @Bool m x
+      When checking the rewrite rule "later reading"
+    • Relevant bindings include
+        x :: t (bound at NativeRetainedFunctionRulesLaterBinder.hs:15:34)
+
+NativeRetainedFunctionRulesLaterBinder.hs:15:63: error: [GHC-25897]
+    • Couldn't match expected type ‘Reading m’ with actual type ‘t’
+      ‘t’ is a rigid type variable bound by
+        the RULE "later reading"
+        at NativeRetainedFunctionRulesLaterBinder.hs:15:11-63
+    • In the expression: x
+      When checking the rewrite rule "later reading"
+    • Relevant bindings include
+        x :: t (bound at NativeRetainedFunctionRulesLaterBinder.hs:15:34)
+

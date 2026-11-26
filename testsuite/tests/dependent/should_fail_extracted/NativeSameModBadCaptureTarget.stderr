@@ -1,0 +1,12 @@
+NativeSameModBadCaptureTarget.hs:280:13: error: [GHC-83865]
+    • Couldn't match type: S Z
+                     with: Z
+      Expected: Step
+                  (App (Lam (Lam (Var (S Z)))) (Lam (Var (S Z))))
+                  (Lam (Lam (Var (S Z))))
+        Actual: Step
+                  (App (Lam (Lam (Var (S Z)))) (Lam (Var (S Z))))
+                  (substSingle (Lam (Var (S Z))) (Lam (Var (S Z))))
+    • In the expression: BetaLam VLam
+      In an equation for ‘betaShift’: betaShift = BetaLam VLam
+

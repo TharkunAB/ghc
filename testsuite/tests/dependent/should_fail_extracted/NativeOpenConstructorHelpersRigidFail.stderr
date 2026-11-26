@@ -1,0 +1,10 @@
+NativeOpenConstructorHelpersRigidFail.hs:10:15: error: [GHC-70566]
+    • Cannot reduce the open call to ‘S.substOne’ in a type.
+        Reduction stopped at a case on the rigid argument x. A checked equation can retain this case until the argument's constructor is known.
+    • In the first argument of ‘(:~:)’, namely
+        ‘S.substOne ('S.Bind ('S.Use ('S.There 'S.Here)) :: Term ('Extend g 'Num) ('Fun 'Num 'Num)) x’
+      In the type signature:
+        rigidSubst :: forall (g :: Ctx)
+                             (x :: Term g 'Num). S.substOne ('S.Bind ('S.Use ('S.There 'S.Here)) :: Term ('Extend g 'Num) ('Fun 'Num 'Num)) x
+                                                 :~: 'S.Bind ('S.Use 'S.Here)
+

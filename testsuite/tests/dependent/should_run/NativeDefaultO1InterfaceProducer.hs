@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE BangPatterns, DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeOperators #-}
 module NativeDefaultO1InterfaceProducer (exposure, ordinaryWorker, indexedWorker, Flag(..), classify) where
 
 import Data.Type.Equality ((:~:)(Refl))

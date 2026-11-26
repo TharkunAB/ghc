@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, FlexibleInstances, GADTs, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, FlexibleInstances, GADTs, TypeFamilies, UndecidableInstances #-}
 
 module NativeConstrainedSumProvider (Allowed, Choice (Shape), Forward (Forwarded), Permit (Permit), Staged (Staged), make) where
 

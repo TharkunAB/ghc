@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, PolyKinds, TypeFamilies #-}
 
 module NativeNestedSumRecursiveAlias where
 

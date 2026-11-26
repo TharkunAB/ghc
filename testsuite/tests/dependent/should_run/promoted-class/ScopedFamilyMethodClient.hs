@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, Haskell2010, NoExperimentalDependentTypes, MultiParamTypeClasses, TypeFamilies #-}
+{-# LANGUAGE DataKinds, Haskell2010, NoDependentTypes, MultiParamTypeClasses, TypeFamilies #-}
 module Main where
 
 import Data.Proxy (Proxy)

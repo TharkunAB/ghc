@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
@@ -88,6 +88,15 @@ headOnly (x : _) = x
 revExternal :: [a] -> [a]
 revExternal xs = Prelude.reverse xs
 
+-- | Mutually recursive parity functions.
+evenN :: Nat -> Prelude.Bool
+evenN Zero = Prelude.True
+evenN (Succ n) = oddN n
+
+oddN :: Nat -> Prelude.Bool
+oddN Zero = Prelude.False
+oddN (Succ n) = evenN n
+
 main :: Prelude.IO ()
 main = do
     let v1 = VCons 'a' (VCons 'b' VNil)
@@ -100,6 +109,7 @@ main = do
              Prelude.&& apply (\n -> Succ n) Zero Prelude.== Succ Zero
              Prelude.&& headOnly ['q'] Prelude.== 'q'
              Prelude.&& revExternal ['x', 'y'] Prelude.== ['y', 'x']
+             Prelude.&& evenN (Succ (Succ Zero))
              Prelude.&& case plusAssoc (Succ Zero) (Succ Zero) Zero of Refl -> Prelude.True
     if ok
         then Prelude.putStrLn "totality-advisory-ok"

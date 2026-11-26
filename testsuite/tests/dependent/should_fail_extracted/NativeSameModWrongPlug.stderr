@@ -1,0 +1,10 @@
+NativeSameModWrongPlug.hs:103:14: error: [GHC-70566]
+    • Cannot reduce the open call to ‘plug’ in a type.
+        Reduction stopped at a case on the rigid argument c. A checked equation can retain this case until the argument's constructor is known.
+    • In the first argument of ‘(:~:)’, namely ‘plug (CLam c) t’
+      In the type signature:
+        plugLamEq :: forall m
+                            n
+                            (c :: UCtx m ('Succ n))
+                            (t :: UTerm m). plug (CLam c) t :~: ULam (plug c t)
+

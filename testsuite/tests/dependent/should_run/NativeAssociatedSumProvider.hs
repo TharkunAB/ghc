@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExplicitForAll, ExperimentalDependentTypes, GADTs, MultiParamTypeClasses, PolyKinds, TypeFamilies, UndecidableInstances #-}
+{-# LANGUAGE CPP, DataKinds, ExplicitForAll, DependentTypes, ListTuplePuns, GADTs, MultiParamTypeClasses, PolyKinds, TypeFamilies, UndecidableInstances #-}
 
 module NativeAssociatedSumProvider (DefaultSum (..), Tagged (..)) where
 

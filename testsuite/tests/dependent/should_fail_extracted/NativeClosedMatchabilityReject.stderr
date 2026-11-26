@@ -1,0 +1,16 @@
+NativeClosedMatchabilityReject.hs:8:33: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘FixedNullary’,
+        but ‘Maybe’ has kind ‘* %GHC.Internal.Types.Matchable -> *’
+    • In the type ‘Maybe’
+      In the type family instance declaration for ‘Interpret’
+
+NativeClosedMatchabilityReject.hs:12:24: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘K True’, but ‘g’ has kind ‘* %U -> *’
+    • In the third argument of ‘Bridge’, namely ‘g’
+      In the type ‘Bridge (K 'True) f g’
+      In the type synonym declaration for ‘Wrong’
+

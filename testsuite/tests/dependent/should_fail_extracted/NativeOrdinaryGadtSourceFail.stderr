@@ -1,0 +1,7 @@
+NativeOrdinaryGadtSourceFail.hs:8:11: error: [GHC-83865]
+    • Couldn't match type ‘x’ with ‘Join x Other’
+      Expected: focus (Arrow x Empty) :~: Join x Other
+        Actual: focus (Arrow x Empty) :~: focus (Arrow x Empty)
+    • In the expression: Refl
+      In an equation for ‘wrong’: wrong _ = Refl
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TemplateHaskell, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, TemplateHaskell, TypeOperators #-}
 module NativeTypeCaseQuote where
 
 import Data.Type.Equality ((:~:)(Refl))

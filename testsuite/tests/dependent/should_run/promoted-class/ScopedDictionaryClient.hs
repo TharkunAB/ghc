@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, Haskell2010, NoExperimentalDependentTypes #-}
+{-# LANGUAGE CPP, Haskell2010, NoDependentTypes #-}
 module Main (main) where
 import Provider
 import System.Environment (getArgs)

@@ -1,0 +1,6 @@
+NativeConstrainedFamDerivedNoProj.hs:9:1: error: [GHC-90647]
+    • Constrained associated type family ‘NativeConstrainedFamilyProvider.SourceItem’
+      The equation requires ‘ListSource [a]’
+      from its owning class constraint ‘ListSource (ViaList a)’.
+    • In the instance declaration for ‘ListSource (ViaList a)’
+

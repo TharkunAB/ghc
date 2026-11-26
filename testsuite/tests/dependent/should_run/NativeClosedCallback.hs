@@ -1,7 +1,8 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TypeOperators #-}
 module Main (main) where
 
 import Data.Type.Equality ((:~:)(Refl))
+import qualified NativeClosedCallbackForward as C
 import qualified NativeClosedCallbackLib as W
 import qualified Prelude as P
 
@@ -17,5 +18,8 @@ constant = Refl
 polymorphic :: W.each P.id '[ 'P.True, 'P.False] :~: '[ 'P.True, 'P.False]
 polymorphic = Refl
 
+forwarded :: W.each C.step '[ 'P.True] :~: '[ 'P.False]
+forwarded = Refl
+
 main :: P.IO ()
-main = P.print (prelude, complemented, constant, polymorphic)
+main = forwarded `P.seq` P.print (prelude, complemented, constant, polymorphic)

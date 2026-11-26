@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, TypeApplications #-}
 
 module HiddenName where
 

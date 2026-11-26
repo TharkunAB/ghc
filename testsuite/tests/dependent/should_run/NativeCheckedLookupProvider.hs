@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 #ifdef HIDE_ENV
 module NativeCheckedLookupProvider (Nat(..), Env, Fin(..), lookupEnv) where
 #else

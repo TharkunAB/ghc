@@ -1,0 +1,5 @@
+NativeSameModOrphanBootRule.hs:29:7: error: [GHC-83605]
+    • A rewrite rule can change the result of ‘substSingle’, which GHC uses to check a dependent type.
+    • In the expression: Refl
+      In an equation for ‘law’: law = Refl
+

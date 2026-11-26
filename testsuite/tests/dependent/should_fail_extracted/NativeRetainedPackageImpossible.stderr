@@ -1,0 +1,20 @@
+NativeRetainedPackageImpossible.hs:8:5: warning: [GHC-94210] [-Woverlapping-patterns (in -Wdefault)]
+    Pattern match has inaccessible right hand side
+    In a case alternative: Just HRefl -> ...
+
+NativeRetainedPackageImpossible.hs:8:10: error: [GHC-40564] [-Winaccessible-code (in -Wdefault), Werror=inaccessible-code]
+    • Inaccessible code in
+        a pattern with constructor:
+          HRefl :: forall {k1} (a :: k1). a :~~: a,
+        in a case alternative
+      Couldn't match type ‘Z’ with ‘S n’
+    • In the pattern: HRefl
+      In the pattern: Just HRefl
+      In a case alternative: Just HRefl -> True
+    • Relevant bindings include
+        proof :: Maybe (xs :~~: VNil)
+          (bound at NativeRetainedPackageImpossible.hs:7:14)
+        impossible :: foreach (xs :: Vec Bool (S n))
+                      -> Maybe (xs :~~: VNil) -> Bool
+          (bound at NativeRetainedPackageImpossible.hs:7:1)
+

@@ -1,0 +1,9 @@
+NativeDataFamilyPromoWrongKind.hs:4:18: error: [GHC-83865]
+    • Couldn't match kind ‘Bool’ with ‘Int’
+      Expected kind ‘Tuple Int Bool’,
+        but ‘'Tup2 'True 'False’ has kind ‘Tuple Bool Bool’
+    • In the first argument of ‘At’, namely
+        ‘('Tup2 'True 'False :: Tuple Int Bool)’
+      In the type signature:
+        wrongKind :: At ('Tup2 'True 'False :: Tuple Int Bool)
+

@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, EmptyCase, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, EmptyCase, DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE LambdaCase, PolyKinds, RankNTypes, ScopedTypeVariables, StandaloneKindSignatures #-}
 {-# LANGUAGE TypeApplications, TypeOperators #-}
 module Main where

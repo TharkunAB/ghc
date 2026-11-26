@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, TypeOperators #-}
 module NativeClosedCharWrong where
 
 import qualified Data.Char

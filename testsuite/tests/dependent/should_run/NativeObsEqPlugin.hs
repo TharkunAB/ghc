@@ -21,7 +21,7 @@ import Dependent.ObsEq
 import ObsProvider ( Nat (..), natToInt, plus, stepUnfoldAdd, whileAdd )
 
 -- 1. Non-structural local unfold (lazy-equivalent to plus on partial spines),
---    tail-recursive accumulator (total-domain equivalent), Collatz, and McCarthy 91.
+--  tail-recursive accumulator (total-domain equivalent), Collatz, and McCarthy 91.
 localUnfoldAdd :: Nat -> Nat -> Nat
 localUnfoldAdd m n = step (Just m) n
   where

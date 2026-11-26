@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 {-# LANGUAGE StandaloneKindSignatures, UndecidableInstances #-}
 {-# LANGUAGE Modifiers, ScopedTypeVariables, TypeFamilies, TypeOperators #-}
 module NativeTypeLambdaEtaReject where

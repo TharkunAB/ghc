@@ -1,0 +1,10 @@
+NativeSizeListNoDescentFail.hs:9:29: error: [GHC-70565]
+    • Cannot evaluate ‘withoutDescent’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘withoutDescent bound xs’
+      In the type signature:
+        unchecked :: forall a. foreach (bound :: Size) ->
+                               foreach (xs :: [a]) ->
+                               withoutDescent bound xs :~: withoutDescent bound xs
+

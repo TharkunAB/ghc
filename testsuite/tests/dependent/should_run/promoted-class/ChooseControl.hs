@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeFamilies #-}
 module ChooseControl where
 
 data Tagged (b :: Bool) where

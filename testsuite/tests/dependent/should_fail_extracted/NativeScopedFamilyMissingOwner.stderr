@@ -1,0 +1,4 @@
+NativeScopedFamilyMissingOwner.hs:5:12: error: [GHC-39999]
+    • No instance for ‘Collects Double’ arising from a use of ‘Element’
+    • In the type signature: missing :: Proxy (Element Double)
+

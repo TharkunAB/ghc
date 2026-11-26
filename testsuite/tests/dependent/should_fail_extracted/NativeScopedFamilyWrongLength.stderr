@@ -1,0 +1,17 @@
+NativeScopedFamilyWrongLength.hs:6:57: error: [GHC-83865]
+    • Couldn't match type ‘5’ with ‘6’
+      Expected: Proxy 6
+        Actual: Proxy 5
+    • In the expression: lengthProxy
+      In a case alternative: (_, lengthProxy) -> lengthProxy
+      In the expression:
+        case measuredEntry x 5 of (_, lengthProxy) -> lengthProxy
+
+NativeScopedFamilyWrongLength.hs:8:18: error: [GHC-83865]
+    • Couldn't match type ‘5’ with ‘6’
+      Expected: Proxy 6
+        Actual: Proxy 5
+    • In the expression: snd (id (measuredEntry x 5))
+      In an equation for ‘wrongProject’:
+          wrongProject x = snd (id (measuredEntry x 5))
+

@@ -1,0 +1,25 @@
+NativePromotedClassDirectCancel.hs:7:18: error: [GHC-25897]
+    • Could not deduce ‘x ~ y’
+      from the context: Just (f y) ~ Just (f x)
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘control’
+        at NativePromotedClassDirectCancel.hs:7:11-14
+      Expected: x :~: y
+        Actual: x :~: x
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          control :: forall a b (f :: a %U -> b) (x :: a) (y :: a).
+                     Proxy f -> (Just (f x) :~: Just (f y)) -> x :~: y
+        at NativePromotedClassDirectCancel.hs:6:1-133
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          control :: forall a b (f :: a %U -> b) (x :: a) (y :: a).
+                     Proxy f -> (Just (f x) :~: Just (f y)) -> x :~: y
+        at NativePromotedClassDirectCancel.hs:6:1-133
+    • In the expression: Refl
+      In an equation for ‘control’: control _ Refl = Refl
+    • Relevant bindings include
+        control :: Proxy f -> (Just (f x) :~: Just (f y)) -> x :~: y
+          (bound at NativePromotedClassDirectCancel.hs:7:1)
+

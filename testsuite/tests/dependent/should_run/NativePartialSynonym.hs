@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, Modifiers, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, Modifiers, PolyKinds #-}
 {-# LANGUAGE StandaloneKindSignatures, TypeFamilies #-}
 module NativePartialSynonym where
 

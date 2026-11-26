@@ -1,0 +1,54 @@
+NativeComposedWrongProof.hs:10:46: error: [GHC-05617]
+    • Could not deduce ‘(foreach (x :: a) -> g (k (h (f x))) :~: x)
+                        ~ (foreach (x :: a) -> from (to x) :~: x)’
+      from the context: from ~ (g . k)
+        bound by the local definition of ‘from’
+        at NativeComposedWrongProof.hs:15:5-8
+    • In the fifth argument of ‘MkIso’, namely ‘left’
+      In the expression: MkIso @a @a to from left right
+      In an equation for ‘bad’:
+          bad _ g h k left right
+            = MkIso @a @a to from left right
+            where
+                to :: a -> a
+                to x = h x
+                from :: a -> a
+                from y = g (k y)
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedWrongProof.hs:13:5)
+        from :: a -> a (bound at NativeComposedWrongProof.hs:15:5)
+        right :: foreach (y :: a) -> h (f (g (k y))) :~: y
+          (bound at NativeComposedWrongProof.hs:10:18)
+        left :: foreach (x :: a) -> g (k (h (f x))) :~: x
+          (bound at NativeComposedWrongProof.hs:10:13)
+        k :: a -> a (bound at NativeComposedWrongProof.hs:10:11)
+        h :: a -> a (bound at NativeComposedWrongProof.hs:10:9)
+        (Some bindings suppressed; use -fmax-relevant-binds=N or -fno-max-relevant-binds)
+
+NativeComposedWrongProof.hs:10:51: error: [GHC-05617]
+    • Could not deduce ‘(foreach (y :: a) -> h (f (g (k y))) :~: y)
+                        ~ (foreach (y :: a) -> to (from y) :~: y)’
+      from the context: from ~ (g . k)
+        bound by the local definition of ‘from’
+        at NativeComposedWrongProof.hs:15:5-8
+    • In the sixth argument of ‘MkIso’, namely ‘right’
+      In the expression: MkIso @a @a to from left right
+      In an equation for ‘bad’:
+          bad _ g h k left right
+            = MkIso @a @a to from left right
+            where
+                to :: a -> a
+                to x = h x
+                from :: a -> a
+                from y = g (k y)
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedWrongProof.hs:13:5)
+        from :: a -> a (bound at NativeComposedWrongProof.hs:15:5)
+        right :: foreach (y :: a) -> h (f (g (k y))) :~: y
+          (bound at NativeComposedWrongProof.hs:10:18)
+        left :: foreach (x :: a) -> g (k (h (f x))) :~: x
+          (bound at NativeComposedWrongProof.hs:10:13)
+        k :: a -> a (bound at NativeComposedWrongProof.hs:10:11)
+        h :: a -> a (bound at NativeComposedWrongProof.hs:10:9)
+        (Some bindings suppressed; use -fmax-relevant-binds=N or -fno-max-relevant-binds)
+

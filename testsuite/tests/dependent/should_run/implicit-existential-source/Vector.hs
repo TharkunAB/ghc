@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, GADTs, KindSignatures, NoExperimentalDependentTypes, RankNTypes #-}
+{-# LANGUAGE DataKinds, GADTs, KindSignatures, NoDependentTypes, RankNTypes #-}
 module Vector (Nat(..), Vec(..), consumeVector) where
 
 data Nat = Z | S Nat

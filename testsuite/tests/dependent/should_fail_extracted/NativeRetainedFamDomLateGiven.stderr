@@ -1,0 +1,7 @@
+NativeRetainedFamDomLateGiven.hs:5:12: error: [GHC-39999]
+    • No instance for ‘Collects (FieldKey False)’
+        arising from a use of ‘Elem’
+    • In the type signature:
+        earlier :: Proxy (Elem (FieldKey 'False))
+                   -> foreach (b :: Bool) -> Collects (FieldKey 'False) => Proxy b
+

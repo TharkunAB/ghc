@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, KindSignatures #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications, TypeFamilies, BangPatterns, TypeOperators #-}
 module NativeSimplifierProvider (choose, keep, Tagged(..), keepTagged, one, toList, typeOnly, Nat(..), observeLengths, observeDemand, lazyLengths, lazyPartial, impossible, scopeAnnotations, Packed, sample, observePacked, driveSame, scopeLet, scopeTop, scopeKnown) where
 

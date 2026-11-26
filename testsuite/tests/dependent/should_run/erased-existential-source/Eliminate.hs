@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications, TypeOperators #-}

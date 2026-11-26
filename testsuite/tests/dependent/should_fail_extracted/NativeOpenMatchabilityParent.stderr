@@ -1,0 +1,18 @@
+NativeOpenMatchabilityParent.hs:6:24: error: [GHC-45219]
+    • The return-kind synonym ‘Varianced’ supplies an unmatchable (U) invisible forall.
+      This data family instance requires a matchable (M) invisible forall.
+    • In the definition of data constructor ‘P’
+      In the data family instance declaration for ‘Parser’
+
+NativeOpenMatchabilityParent.hs:10:3: error: [GHC-45219]
+    • Data constructor ‘Wrong’ returns type ‘Other’
+        instead of an instance of its parent type ‘Ordinary a’
+    • In the definition of data constructor ‘Wrong’
+      In the data type declaration for ‘Ordinary’
+
+NativeOpenMatchabilityParent.hs:14:3: error: [GHC-83865]
+    • Couldn't match expected type ‘FamParser Bool’
+                  with actual type ‘Other’
+    • In the result type of data constructor ‘WrongFam’
+      In the data family instance declaration for ‘FamParser’
+

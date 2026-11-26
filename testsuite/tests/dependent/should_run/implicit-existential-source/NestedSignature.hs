@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds #-}
 module NestedSignature (PackedPair, PackedKind) where
 
 import Data.Kind (Type)

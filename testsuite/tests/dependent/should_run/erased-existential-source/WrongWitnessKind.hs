@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 module WrongWitnessKind where
 

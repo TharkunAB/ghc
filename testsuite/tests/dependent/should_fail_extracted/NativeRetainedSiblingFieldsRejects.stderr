@@ -1,0 +1,59 @@
+NativeRetainedSiblingFieldsRejects.hs:11:33: error: [GHC-83865]
+    • Couldn't match type ‘n0’ with ‘size p1’
+      Expected: Vec Char n0
+        Actual: Vec Char (size p1)
+      ‘n0’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeRetainedSiblingFieldsRejects.hs:11:26-53
+    • In the first argument of ‘zipVec’, namely ‘(letters p)’
+      In the expression: zipVec (letters p) (flags q)
+      In the first argument of ‘toList’, namely
+        ‘(zipVec (letters p) (flags q))’
+
+NativeRetainedSiblingFieldsRejects.hs:11:45: error: [GHC-83865]
+    • Couldn't match type ‘n0’ with ‘size q1’
+      Expected: Vec Bool n0
+        Actual: Vec Bool (size q1)
+      ‘n0’ is untouchable
+        inside the constraints: ()
+        bound by a retained application
+        at NativeRetainedSiblingFieldsRejects.hs:11:26-53
+    • In the second argument of ‘zipVec’, namely ‘(flags q)’
+      In the expression: zipVec (letters p) (flags q)
+      In the first argument of ‘toList’, namely
+        ‘(zipVec (letters p) (flags q))’
+
+NativeRetainedSiblingFieldsRejects.hs:15:42: error: [GHC-83865]
+    • Couldn't match type: size q
+                     with: size p
+      Expected: Vec Bool (size p)
+        Actual: Vec Bool (size q)
+      Note: GHC cannot determine the arguments of the function ‘size’ from its result.
+    • In the first argument of ‘Field’, namely ‘(flags q)’
+      In the second argument of ‘Field’, namely ‘(Field (flags q) End)’
+      In the expression: Field (letters p) (Field (flags q) End)
+
+NativeRetainedSiblingFieldsRejects.hs:18:14: error: [GHC-83865]
+    • Couldn't match type ‘S Z’ with ‘Z’
+      Expected: size ('Columns Z VNil VNil) :~: S Z
+        Actual: S Z :~: S Z
+    • In the expression: Refl
+      In an equation for ‘wrongKnown’: wrongKnown = Refl
+
+NativeRetainedSiblingFieldsRejects.hs:21:31: error: [GHC-05617]
+    • Could not deduce ‘_ ~ S _’
+      from the context: p ~ 'Columns _ _1 bs
+        bound by a pattern with constructor:
+                   Columns :: foreach (n :: Nat)
+                              -> Vec Char n -> Vec Bool n -> Columns,
+                 in an equation for ‘wrongFlags’
+        at NativeRetainedSiblingFieldsRejects.hs:21:1-32
+      Expected: Vec Bool (S (size ('Columns _ _1 bs)))
+        Actual: Vec Bool _
+    • In the expression: bs
+      In an equation for ‘wrongFlags’: wrongFlags (Columns _ _ bs) = bs
+    • Relevant bindings include
+        bs :: Vec Bool _
+          (bound at NativeRetainedSiblingFieldsRejects.hs:21:25)
+

@@ -1,0 +1,6 @@
+NativeLocalOpenStrict.hs:5:17: error: [GHC-70566]
+    • Cannot reduce the open call to ‘keep’ in a type.
+        Reduction stopped at a case on the rigid argument a. A checked equation can retain this case until the argument's constructor is known.
+    • In the type ‘NativeLocalOpenStrict.keep a’
+      In the type synonym declaration for ‘Result’
+

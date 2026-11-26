@@ -1,0 +1,14 @@
+NativeRetainedReboundRejects.hs:16:29: error: [GHC-83605]
+    • Cannot use this numeral as a retained index of type ‘Natural’.
+      Conversion ‘fromInteger’ has no checked zero and successor equations.
+    • In the expression: rememberNatural 5
+      In an equation for ‘customNat’: customNat = rememberNatural 5
+
+NativeRetainedReboundRejects.hs:19:31: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: rememberList "λ🙂"
+      In an equation for ‘overloadedWord’:
+          overloadedWord = rememberList "λ🙂"
+

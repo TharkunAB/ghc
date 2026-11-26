@@ -1,0 +1,19 @@
+NativeNamedCallbackWrong.hs:13:50: error: [GHC-83865]
+    • Couldn't match type: A.size xs
+                     with: otherSize xs
+      Expected: A.size xs :~: otherSize xs
+        Actual: A.size xs :~: A.size xs
+    • In the fourth argument of ‘measuredZip’, namely ‘Refl’
+      In the expression: measuredZip otherSize xs ys Refl
+      In the expression:
+        case measuredZip otherSize xs ys Refl of Refl -> True
+
+NativeNamedCallbackWrong.hs:16:38: error: [GHC-83605]
+    • No checked source equations are available for ‘uncheckedSize’ in this retained argument.
+    • In the expression: measuredZip uncheckedSize xs ys Refl
+      In the expression:
+        case measuredZip uncheckedSize xs ys Refl of Refl -> True
+      In an equation for ‘uncheckedFn’:
+          uncheckedFn xs ys
+            = case measuredZip uncheckedSize xs ys Refl of Refl -> True
+

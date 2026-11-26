@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DataKinds, ExperimentalDependentTypes, GADTs, TemplateHaskell, TypeOperators #-}
+{-# LANGUAGE CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, TemplateHaskell, TypeOperators #-}
 module NativeLocalMinSizeRule where
 
 import Data.Type.Equality ((:~:)(Refl))

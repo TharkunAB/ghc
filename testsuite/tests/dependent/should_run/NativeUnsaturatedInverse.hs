@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ScopedTypeVariables, TypeApplications, TypeOperators #-}
 module NativeUnsaturatedInverse where
 import Data.Proxy (Proxy)
 import Data.Type.Equality ((:~:)(Refl))

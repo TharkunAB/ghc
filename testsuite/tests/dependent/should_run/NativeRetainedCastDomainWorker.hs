@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, ExperimentalDependentTypes, GADTs, PolyKinds, RankNTypes, ScopedTypeVariables, StandaloneKindSignatures, TypeApplications #-}
+{-# LANGUAGE AllowAmbiguousTypes, CPP, DataKinds, DependentTypes, ListTuplePuns, GADTs, PolyKinds, RankNTypes, ScopedTypeVariables, StandaloneKindSignatures, TypeApplications #-}
 module NativeRetainedCastDomainWorker
     (observe, forceWorker, forceIndex, observeBranch, observePair, branchVector, BranchVector(..)) where
 

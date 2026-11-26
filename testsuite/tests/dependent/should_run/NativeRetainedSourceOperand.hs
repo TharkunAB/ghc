@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 module NativeRetainedSourceOperand (select, ordinaryNot) where
 
 import PreludeFilterSource (Negation)

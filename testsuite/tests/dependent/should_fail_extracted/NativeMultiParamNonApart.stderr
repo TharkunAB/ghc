@@ -1,0 +1,9 @@
+NativeMultiParamNonApart.hs:8:19: error: [GHC-70565]
+    • Cannot evaluate ‘omap’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘omap f (Right x :: Either e a)’
+      In the type signature:
+        ambiguous :: foreach (f :: a -> b) ->
+                     foreach (x :: a) -> omap f (Right x :: Either e a) :~: Right (f x)
+

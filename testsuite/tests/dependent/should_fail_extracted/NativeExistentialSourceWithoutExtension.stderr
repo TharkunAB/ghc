@@ -1,0 +1,5 @@
+NativeExistentialSourceWithoutExtension.hs:6:7: error: [GHC-27432]
+    • GHC.Exists.Pack requires -XDependentTypes or -XExistentialTypes.
+    • In the expression: Pack
+      In an equation for ‘bad’: bad = Pack
+

@@ -5,6 +5,8 @@ module Main (main) where
 import Data.Type.Equality ((:~:)(Refl))
 import GHC.Tuple (Unit)
 import NativeAutoNumLiteralsProvider
+import NativeAutoNumExplicitFam (explicitFour)
+import NativeAutoNumMTransClient (mtransOk)
 import Prelude
 
 plusProof :: plusP 2 3 :~: 5
@@ -24,8 +26,8 @@ joinedChars = appendP (replicateP 2 'a') (replicateP 1 'b')
 
 main :: IO Unit
 main =
-  case (sameModPlusProof, sameModZeroProof, plusProof, timesProof, succOpenProof @'PZero) of
-    (Refl, Refl, Refl, Refl, Refl) ->
+  mtransOk `seq` case (sameModPlusProof, sameModZeroProof, plusProof, timesProof, succOpenProof @'PZero, explicitFour) of
+    (Refl, Refl, Refl, Refl, Refl, Refl) ->
       if vecPToList threeTrues == [True, True, True] && vecPToList joinedChars == "aab"
         then pure ()
         else error "NativeAutoNumLiterals runtime mismatch"

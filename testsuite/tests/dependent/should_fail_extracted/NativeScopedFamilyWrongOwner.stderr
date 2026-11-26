@@ -1,0 +1,23 @@
+NativeScopedFamilyWrongOwner.hs:6:15: error: [GHC-39999]
+    • Could not deduce ‘Collects c’ arising from a use of ‘Element’
+      from the context: OtherClass c
+        bound by the type signature for:
+                   wrongOwner :: forall c1.
+                                 ($dOtherClass :: OtherClass c1) =>
+                                 foreach (x :: c1)
+                                 -> Element c1
+                                    -> TaggedEntry (Element c1) (otherCompare @c1 $dOtherClass x)
+        at NativeScopedFamilyWrongOwner.hs:(6,15)-(7,87)
+      Possible fix:
+        add (Collects c) to the context of
+          the type signature for:
+            wrongOwner :: forall c.
+                          ($dOtherClass :: OtherClass c) =>
+                          foreach (x :: c)
+                          -> Element c
+                             -> TaggedEntry (Element c) (otherCompare @c $dOtherClass x)
+    • In the type signature:
+        wrongOwner :: forall c. OtherClass c =>
+                                foreach (x :: c) ->
+                                Element c -> TaggedEntry (Element c) (otherCompare x)
+

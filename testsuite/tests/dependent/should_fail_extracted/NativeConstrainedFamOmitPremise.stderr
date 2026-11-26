@@ -1,0 +1,19 @@
+NativeConstrainedFamOmitPremise.hs:7:18: error: [GHC-39999]
+    • Could not deduce ‘Allowed a’ arising from a use of ‘Elem’
+      from the context: forall (x :: k). Allowed x => Collects (f x)
+        bound by the type signature for:
+                   local :: Proxy (Elem (f a))
+        at NativeConstrainedFamOmitPremise.hs:7:18-35
+    • In the type signature: local :: Proxy (Elem (f a))
+      In the expression:
+        let
+          local :: Proxy (Elem (f a))
+          local = Proxy
+        in local `seq` ()
+      In an equation for ‘fromRule’:
+          fromRule _
+            = let
+                local :: Proxy (Elem (f a))
+                local = Proxy
+              in local `seq` ()
+

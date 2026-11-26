@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE NoGeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RoleAnnotations #-}

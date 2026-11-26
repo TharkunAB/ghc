@@ -1,0 +1,3 @@
+NativeTypeLambdaDisabled.hs:3:13: error: [GHC-27184]
+    Type lambdas require -XDependentTypes.
+

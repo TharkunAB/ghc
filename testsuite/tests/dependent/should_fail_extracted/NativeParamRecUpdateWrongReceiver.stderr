@@ -1,0 +1,17 @@
+NativeParamRecUpdateWrongReceiver.hs:5:23: error: [GHC-83865]
+    • Couldn't match type: storedLength q
+                     with: storedLength p
+      Expected: Vec a (storedLength p)
+        Actual: Vec a (storedLength q)
+      Note: GHC cannot determine the arguments of the function ‘storedLength’ from its result.
+    • In the expression: cells q
+      In a record update at field ‘cells’,
+      with type constructor ‘Columns’
+      and data constructor ‘Columns’.
+      In the expression: p {cells = cells q}
+    • Relevant bindings include
+        q :: Columns a (bound at NativeParamRecUpdateWrongReceiver.hs:5:7)
+        p :: Columns a (bound at NativeParamRecUpdateWrongReceiver.hs:5:5)
+        bad :: Columns a -> Columns a -> Columns a
+          (bound at NativeParamRecUpdateWrongReceiver.hs:5:1)
+

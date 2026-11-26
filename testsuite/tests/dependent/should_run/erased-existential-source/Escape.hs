@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 module Escape where
 

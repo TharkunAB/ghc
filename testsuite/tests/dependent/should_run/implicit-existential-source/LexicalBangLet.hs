@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, NoExperimentalDependentTypes #-}
+{-# LANGUAGE BangPatterns, NoDependentTypes #-}
 module LexicalBangLet (ignoreTilde, ignoreBang, readBangField) where
 
 import LexicalLetProvider

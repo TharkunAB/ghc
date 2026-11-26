@@ -1,0 +1,21 @@
+QuantifiedGadtIndexWrong.hs:11:18: error: [GHC-25897]
+    • Could not deduce ‘g ~ Slot’
+      from the context: (k ~ Bool, f ~ Slot)
+        bound by a pattern with constructor: PickBool :: Pick Slot,
+                 in an equation for ‘bad’
+        at QuantifiedGadtIndexWrong.hs:11:5-12
+      Expected: Carrier Slot
+        Actual: Carrier g
+      ‘g’ is a rigid type variable bound by
+        the type signature for:
+          bad :: forall k (f :: forall (a :: k). Proxy a -> *)
+                        (g :: forall (a :: k). Proxy a -> *).
+                 Pick f -> Carrier g -> Carrier Slot
+        at QuantifiedGadtIndexWrong.hs:(8,1)-(10,49)
+    • In the expression: x
+      In an equation for ‘bad’: bad PickBool x = x
+    • Relevant bindings include
+        x :: Carrier g (bound at QuantifiedGadtIndexWrong.hs:11:14)
+        bad :: Pick f -> Carrier g -> Carrier Slot
+          (bound at QuantifiedGadtIndexWrong.hs:11:1)
+
