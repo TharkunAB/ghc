@@ -949,8 +949,8 @@ closedCallRenderer name (ClosedCodec shape nodes) = do
             guard (coercionLKind lifted `tcEqType` varType var &&
                    coercionRKind lifted `tcEqType` closedShapeKind field)
             return (mkCast (Core.Var var) (mkSubCo lifted))
-      tag_constructor con suffix =
-        foldr (\c rest -> mkConsExpr charTy (mkCharExpr c) rest) suffix (closedConstructorTag con)
+      prependTag Nothing body = body
+      prependTag (Just s) body = foldr (\c r -> mkConsExpr charTy (mkCharExpr c) r) body s
       unexpected_rep :: TcM a
       unexpected_rep = failWithTc (TcRnClosedTypeEval name "Unexpected indexed constructor representation.")
       renderWitnessField refs quote actuals field value = case field of
@@ -996,7 +996,8 @@ closedCallRenderer name (ClosedCodec shape nodes) = do
                   return (\rest -> mkCoreApps (Core.Var loop) [Core.Type child, Core.Var var, rest])
                 _ -> unexpected_rep
               let encoded = foldr ($) (Core.Var suffix) renderers
-              return (Core.Alt (Core.DataAlt con) (locals ++ binders) (tag_constructor con encoded))
+              return (Core.Alt (Core.DataAlt con) (locals ++ binders)
+                        (prependTag (Just (closedConstructorTag con)) encoded))
             _ -> unexpected_rep
         let body = Core.Case (Core.Var current) binder stringTy alts
             binding = Core.Rec [(loop, Core.Lam index (Core.Lam current (Core.Lam suffix body)))]
@@ -1040,12 +1041,9 @@ closedCallRenderer name (ClosedCodec shape nodes) = do
                     renderers <- zipWithM (renderWitnessField refs quote actuals) codecs binders
                     return (foldr (.) id renderers)
                 | otherwise -> unexpected_rep
-            let alt suffix =
-                  let body = render_body suffix
-                      emit c = mkConsExpr charTy (mkCharExpr c)
-                      tagged = maybe body (foldr emit body) tag
-                  in Core.Alt (Core.DataAlt con) (worker_binders ++ binders) tagged
-            return alt
+            return $ \suffix ->
+              Core.Alt (Core.DataAlt con) (worker_binders ++ binders)
+                (prependTag tag (render_body suffix))
           let select value suffix = Core.Case value binder stringTy (map ($ suffix) render_alts)
           case render_alts of
             [_] -> return select
@@ -1231,9 +1229,8 @@ decodeClosedCallResult (ClosedCodec shape nodes) rendered = case shape of
             return (value, rest)
 
     decodeOpen known open_shape@(ClosedOpenShape _ result_tc _ alternatives) expected input = do
-      (ClosedOpenAlternative con result_index fields, payload) <- listToMaybe
-        [(alt, rest) | alt@(ClosedOpenAlternative ctor _ _) <- alternatives
-                     , Just rest <- [stripPrefix (closedConstructorTag ctor) input]]
+      (ClosedOpenAlternative con result_index fields, payload) <-
+        stripTaggedAlt (\(ClosedOpenAlternative ctor _ _) -> Just (closedConstructorTag ctor)) alternatives input
       expected_child <- case (expected, result_index) of
         (Nothing, _) -> return Nothing
         (Just index, ClosedFixedIndex fixed) -> do
@@ -1288,9 +1285,11 @@ decodeClosedCallResult (ClosedCodec shape nodes) rendered = case shape of
 
     selectConstructor [constructor@(ClosedConstructor Nothing _ _)] input =
       Just (constructor, input)
-    selectConstructor alternatives input = listToMaybe
-      [(constructor, rest) | constructor@(ClosedConstructor (Just tag) _ _) <- alternatives
-                           , Just rest <- [stripPrefix tag input]]
+    selectConstructor alternatives input =
+      stripTaggedAlt (\(ClosedConstructor tag _ _) -> tag) alternatives input
+
+    stripTaggedAlt tag_of alts input = listToMaybe
+      [(alt, rest) | alt <- alts, Just tag <- [tag_of alt], Just rest <- [stripPrefix tag input]]
 
     decodeArguments _ [] input = return ([], input)
     decodeArguments decode (field : fields) input = do

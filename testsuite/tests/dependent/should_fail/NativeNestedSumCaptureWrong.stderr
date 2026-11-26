@@ -5,5 +5,5 @@ NativeNestedSumCaptureWrong.hs:24:54: error: [GHC-83865]
         but ‘v’ has kind ‘Vec Bool (Add n m)’
       Note: ‘Add’ is a non-injective type family.
     • In the second argument of ‘AtLength’, namely ‘v’
-      In the type ‘AtLength (Add m n) v’
       In the type lambda in ‘Wrong’
+      In the type ‘GHC.Sigma.Sigma Vec Bool n \left -> (GHC.Sigma.Sigma Vec Bool m \right -> AtLength (Add m n) v)’

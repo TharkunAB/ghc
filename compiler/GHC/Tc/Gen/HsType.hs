@@ -79,6 +79,10 @@ module GHC.Tc.Gen.HsType (
         tcRetainedAmbientIndices,
         isLocalTySynLSig, tcWithLocalTySyns,
         drainForgetMTyCons,
+        withRollbackSynthTypeState,
+        runPendingSynthChecks,
+        pendingSynthSigmaPayloads,
+        lookupPendingSynthTyCon,
         tcRegisterSynthesizedSourceFun,
         tcCommitSynthesizedSourceFunBind,
         drainSynthesizedSourceFuns,
@@ -114,7 +118,8 @@ import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               lookupObservedPairField, lookupPairObserver, lookupPairRecipe, canObservePairSource,
                               lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
-                              recordSourceMethodUse, recordSourceProofAliasUse)
+                              recordSourceMethodUse, recordSourceProofAliasUse,
+                              takeSourceProofRulesFor, withSourceProofSignature)
 import {-# SOURCE #-} GHC.Tc.Gen.ClosedEval (tcPrepareClosedApplication, tcPrepareClosedFunctionValue, tcPrepareClosedResult, tcPrepareClosedObservation, tcCheckClosedCallContext, tcPreflightClosedCall, tcDecodeClosedCallOperand, tcHasClosedCallExecutable)
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
@@ -130,9 +135,14 @@ import GHC.Tc.Utils.Instantiate ( tcInstInvisibleTyBinders, tcInstInvisibleTyBin
                                   tcRuntimeForAllBndrs )
 import GHC.Tc.Zonk.TcType
 
-import GHC.Core.Reduction (reductionReducedType)
-import GHC.Core.Coercion (hasCoercionHole)
-import GHC.Core.Coercion.Axiom (ClosedTyFam(CTF, CTF_Abstract, CTF_Scoped))
+import GHC.Core.Reduction (Reduction(..), reductionCoercion, reductionReducedType)
+import GHC.Core.Coercion (coercionKind, emptyLiftingContext,
+                          extendLiftingContextAndInScope, hasCoercionHole, liftCoSubst,
+                          mkGReflRightMCo, mkNomReflCo, mkTransCo, mkTyConAppCo,
+                          tyCoVarsOfCo)
+import GHC.Core.Coercion.Axiom (Branched, ClosedTyFam(CTF, CTF_Abstract, CTF_Scoped),
+                                CoAxBranch, CoAxiom(..), coAxBranchRHS, coAxiomBranches,
+                                fromBranches)
 import GHC.Core.TyCon
 import GHC.Core.ConLike
 import GHC.Core.DataCon
@@ -147,7 +157,9 @@ import GHC.Core.Type
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Ppr
 import qualified GHC.Core.TyCo.Subst as Subst
-import GHC.Core.Unify ( BindFlag(..), tcMatchTy, tcMatchTyX, tcMatchTyX_BM, tcUnifyTys )
+import GHC.Core.Unify ( BindFlag(..), alwaysBindTv, tcMatchTy, tcMatchTyKis,
+                        tcMatchTyX_BM, tcUnifyTy, tcUnifyTys,
+                        typeListsAreApart, typesAreApart )
 
 import GHC.Builtin( allNameStrings )
 import GHC.Builtin.Modules (gHC_INTERNAL_TYPENATS)
@@ -167,7 +179,9 @@ import GHC.Types.Name.Set (NameSet, mkNameSet, unionNameSet, emptyNameSet, isEmp
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Name
-import GHC.Types.TypeEnv (lookupTypeEnv)
+import GHC.Data.Pair (pFst, pSnd)
+import GHC.Types.Error (mkPlainError)
+import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv)
 import GHC.Types.Var.Env
 import GHC.Types.Basic
 import GHC.Types.SrcLoc
@@ -177,6 +191,7 @@ import GHC.Types.Unique.Supply
 import GHC.Unit.Module (Module, mkModule, mkModuleName, moduleName, moduleNameString, moduleUnit, stringToUnit, unitString)
 import GHC.Unit.Module.ModIface (mi_hash_fn)
 
+import GHC.Utils.Encoding (zEncodeString)
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -198,10 +213,10 @@ import Data.Function ( on )
 import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import Data.Dynamic (fromDynamic, toDyn)
-import Data.List (isPrefixOf, mapAccumL)
+import Data.List (elemIndex, isPrefixOf, mapAccumL, nub, sort)
 import qualified Data.Map as Map
 import Data.Proxy (Proxy(..))
-import Data.Typeable (Typeable, typeRep)
+import Data.Typeable (typeRep)
 import Control.Monad
 import Data.Data (Data, cast, gmapQ)
 import Data.Tuple (swap)
@@ -448,7 +463,7 @@ tcHsSigWcType :: Bool -> UserTypeCtxt -> LHsSigWcType GhcRn -> TcM Type
 -- This one is used when we have a LHsSigWcType, but in
 -- a place where wildcards aren't allowed. The renamer has
 -- already checked this, so we can simply ignore it.
--- See Note [Exported function-valued retained signatures].
+-- See Note [Retained Pi type formation] in GHC.Rename.HsType.
 tcHsSigWcType allow_function ctxt sig_ty =
   tc_hs_sig_type allow_function ctxt (dropWildCards sig_ty)
 
@@ -872,7 +887,7 @@ does not introduce a retained binder or evaluate its operand.
 -}
 
 -- | Check retained telescopes in function positions of a complete signature.
--- See Note [Higher-order retained signatures].
+-- See Note [Retained Pi type formation] in GHC.Rename.HsType.
 tcCheckRetainedSigType :: Bool -> SkolemInfo -> LHsType GhcRn -> TcKind -> TcM TcType
 tcCheckRetainedSigType allow_function skol_info hs_ty kind
   = do { indices <- tcRetainedAmbientIndices RetainedLocalSignatureIndex hs_ty
@@ -883,7 +898,7 @@ tcCheckRetainedSigType allow_function skol_info hs_ty kind
            (typeLevelMode { mode_indices = indices, mode_source_proof_owner = proof_owner }) hs_ty kind }
 
 -- | Check a retained type without changing the caller's index environment.
--- See Note [Retained Pi type arguments].
+-- See Note [Retained Pi type formation] in GHC.Rename.HsType.
 tcCheckRetainedType :: Bool -> Maybe SkolemInfo -> TcTyMode -> LHsType GhcRn -> TcKind -> TcM TcType
 tcCheckRetainedType allow_function witness_skol = go
   where
@@ -896,7 +911,7 @@ tcCheckRetainedType allow_function witness_skol = go
       | not (isEmptyNameEnv (mode_indices mode)) || hsHasForEachTy (unLoc body)
       = setSrcSpanA loc $
         tcExtendIdEnv (nonDetNameEnvElts (mode_indices mode)) $
-        do { (binders, body_ty) <- tcTKTelescope mode tele (go mode body kind)
+        do { (binders, body_ty) <- tcTKTelescope mode tele (go (mode { mode_under_forall = True }) body kind)
            ; return (mkForAllTys binders body_ty) }
     go mode (L loc ty@(HsQualTy _ ctxt body)) kind
       | hsHasForEachTy (unLoc body)
@@ -921,7 +936,7 @@ tcCheckRetainedType allow_function witness_skol = go
       , not (isEmptyNameEnv (mode_indices mode)) || hsHasForEachTy (unLoc body)
       = setSrcSpanA loc $
         tcExtendIdEnv (nonDetNameEnvElts (mode_indices mode)) $
-        tc_vis_forall_type mode ty tele (go mode body) (Check kind)
+        tc_vis_forall_type mode ty tele (go (mode { mode_under_forall = True }) body) (Check kind)
     go mode (L loc ty@(HsForEachTy ann bndrs body)) kind
       = setSrcSpanA loc $
         do { level <- getThLevel
@@ -967,7 +982,7 @@ tcCheckRetainedType allow_function witness_skol = go
                    ; domain_ty <- tcRetainedBinderDomain valid_domain mode domain
                    ; case witness_skol of
                        Just skol | isLiftedTypeKind domain_ty ->
-                         -- See Note [Explicit retained Type witnesses].
+                         -- See Note [Retained Pi type formation] in GHC.Rename.HsType.
                          mk_type_witness bndr_mult skol name $ \tv ->
                            tcExtendNameTyVarEnv [(name, tv)] (check_bndrs mode rest)
                        _ ->
@@ -1540,48 +1555,17 @@ tc_top_lhs_type_x decl tyki ctxt (L loc sig_ty@(HsSig { sig_bndrs = hs_outer_bnd
 
 {- Note [Checked declaration-kind matchability]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A declaration's consumed Pi prefix is M for data, data families and
-classes. It is U for type families and synonyms. Its result kind is independent.
-Explicit metadata must satisfy this rule. Do not replace it in mkTyCon.
+Per GHC Proposal #242 (Kiss et al., ICFP 2019) and GHC Proposal #425, the
+consumed Pi prefix of a declaration is Matchable ('M') for data, data families,
+and classes, and Unmatchable ('U') for type families and type synonyms, while
+its residual result kind is independent.
 
-During a standalone kind signature check, omitted metadata gets a local
-metavariable for each semantic binder. A source group does not share an omitted
-annotation. checkDeclKindMatchability constrains only the consumed Pi prefix.
-Its header walk shares the zippable/skippable rules with matchUpSigWithDecl.
-Invisible signature binders belong to this prefix only while a header binder
-remains. Data and class declarations also consume their eta-expanded prefix.
-The check uses the elaborated kind, so it also checks aliases and computed
-metadata. A family with no header binders keeps its entire residual kind.
-The solver checks explicit metadata with ordinary equality constraints.
-defaultDeclKindMatchabilities then defaults remaining local metavariables to M
-before generalization. Explicit bound metadata variables remain bound.
-No new matchability quantifier is inferred.
-
-Solve the formation equalities before selecting the declaration prefix. A
-visible forall checks its body against an outer open kind. Inside its binder
-scope, this check can defer an equality and put a CastTy around the body.
-For example, the cast can hide the second argument of
-  type F :: forall k -> k -> Type
-  type family F k a
-The prefix splitter stops at that cast until the formation solver fills its
-coercion hole. Check the prefix after that solve. Solve its metadata constraints
-with the original residual constraints at the same pushed level. Only then
-default metadata. Do not discard a cast to select the prefix.
-
-Keep implicit outer annotations associated with their binder identities when
-scopedSortOuter changes their order. Kind generalization can introduce more
-inferred binders after this defaulting step. Assign those new binders concrete
-metadata from the same prefix partition. The residual binders get the normal
-kind default M. Ordinary source types instead default their foralls to U.
-
-Inline data-kind signatures use etaExpandAlgTyCon. It checks the metadata of
-each Pi node that becomes a declared argument. This also rejects U
-arrows in data signatures without a standalone kind signature.
-
-The earlier matchability prototype used a declaration-wide M/U default for
-standalone signatures. That default also changed nested and result arrows.
-This check instead constrains the declared prefix before it applies the M
-kind default. Existing aliases retain their metadata and their source shape.
+During standalone kind signature checking, omitted matchability annotations get
+fresh local metavariables. After solving formation equalities (exposing any
+binders beneath 'CastTy'), 'checkDeclKindMatchability' constrains only the Pi
+prefix consumed by header matching and datatype eta-expansion;
+'defaultDeclKindMatchabilities' then defaults remaining local metavariables in
+the residual kind to 'M' before kind generalization.
 -}
 
 -- | Check all Pi nodes consumed by the declaration header.
@@ -1797,7 +1781,7 @@ tcHsTypeApp = tcHsTypeAppWithSource Nothing
 
 -- | Type-check the lowered argument. Use the written syntax in its context.
 -- See Note [Recipe for checking a signature] in GHC.Tc.Gen.HsType
--- See Note [Type lambdas in visible type arguments] in GHC.Rename.HsType.
+-- See Note [Renaming type lambdas and type cases] in GHC.Rename.HsType.
 tcHsTypeAppWithSource :: Maybe HsAppTypeSource -> LHsWcType GhcRn -> Kind -> TcM Type
 tcHsTypeAppWithSource source wc_ty kind
   | HsWC { hswc_ext = sig_wcs, hswc_body = hs_ty } <- wc_ty
@@ -2169,10 +2153,13 @@ data TcTyMode
                -- See Note [Pending calls in partial signatures] in GHC.Tc.Solver.
              , mode_synonym_metadata :: Maybe (Name -> [Bool] -> TcM [Type], Maybe (TypeOrKind -> TcM Matchability))
              , mode_source_proof_owner :: Maybe Name
-             , mode_complete_type_arg :: Maybe Bool }
+             , mode_complete_type_arg :: Maybe Bool
+             , mode_under_forall :: !Bool
+             , mode_lambda_root :: !(Maybe (Name, Name))
+             , mode_sigma_root :: !(Maybe (Name, Name)) }
                -- Nothing outside a visible type argument. Just records
                -- completeness of the whole argument, not the current child.
-               -- See Note [Retained Pi type arguments].
+               -- See Note [Retained Pi type formation] in GHC.Rename.HsType.
 
 data CallbackArrowMode
   = OrdinaryArrowChecking
@@ -2206,7 +2193,7 @@ mkMode tyki = TcTyMode { mode_tyki = tyki, mode_holes = Nothing
                       , mode_pending_calls = Nothing
                       , mode_synonym_metadata = Nothing
                       , mode_source_proof_owner = Nothing
-                      , mode_complete_type_arg = Nothing }
+                      , mode_complete_type_arg = Nothing, mode_under_forall = False, mode_lambda_root = Nothing, mode_sigma_root = Nothing }
 
 typeLevelMode, kindLevelMode :: TcTyMode
 -- These modes expect no wildcards (holes) in the type
@@ -2226,7 +2213,7 @@ mkHoleMode tyki hm
                           , mode_pending_calls = Nothing
                           , mode_synonym_metadata = Nothing
                       , mode_source_proof_owner = Nothing
-                          , mode_complete_type_arg = Nothing }) }
+                          , mode_complete_type_arg = Nothing, mode_under_forall = False, mode_lambda_root = Nothing, mode_sigma_root = Nothing }) }
 
 instance Outputable HoleMode where
   ppr HM_Sig      = text "HM_Sig"
@@ -2449,14 +2436,14 @@ tcHsType mode HsForAllTy{} _
 
 tcHsType mode t@(HsForAllTy { hst_tele = tele, hst_body = ty }) exp_kind
   | HsForAllInvis{} <- tele
-  = do { (tv_bndrs, ty') <- tcTKTelescope mode tele (tcLHsType mode ty exp_kind)
+  = do { (tv_bndrs, ty') <- tcTKTelescope mode tele (tcLHsType (mode { mode_under_forall = True }) ty exp_kind)
        ; return (mkForAllTys tv_bndrs ty') }
                  -- For an invisible forall, we allow the body to have
                  -- an arbitrary kind (hence exp_kind above).
                  -- See Note [Body kind of a HsForAllTy]
 
   | HsForAllVis{} <- tele
-  = tc_vis_forall_type mode t tele (tc_check_lhs_type mode ty) exp_kind
+  = tc_vis_forall_type mode t tele (tc_check_lhs_type (mode { mode_under_forall = True }) ty) exp_kind
 
 tcHsType mode t@(HsQualTy { hst_ctxt = ctxt, hst_body = rn_ty }) exp_kind
   | null (hsc_ctxt $ unLoc ctxt)
@@ -2621,30 +2608,19 @@ tcHsType mode src@(XHsType (HsTypeExistsRn flag binder body)) exp_kind
 tcHsType mode (XHsType (HsGadtFieldRn field)) exp_kind =
   tcLHsType mode (cdf_type field) exp_kind
 tcHsType _ (XHsType HsTypeCaseAliasRn{}) _ = failWithTc TcRnTypeCaseContext
-tcHsType _ (XHsType HsTypeCaseRn{}) _ = failWithTc TcRnTypeCaseContext
+tcHsType mode src@(XHsType (HsTypeCaseRn scrut rows)) exp_kind =
+  tcHsTypeCase mode src scrut rows exp_kind
 tcHsType mode src@(XHsType (HsTypeLambdaQuoteRn binders body)) exp_kind =
-  tcInlineSomeLambda mode src binders body exp_kind
-
-tcHsType mode src@(XHsType (HsTypeLambdaCheckRn binders body helper)) exp_kind = do
-  (ty, kind) <- tc_infer_lhs_type mode helper
-  checked_kind <- liftZonkM (zonkTcType kind)
-  (telescope, result_kind) <- splitLambdaKind binders checked_kind
-  skol <- mkSkolemInfo (ForAllSkol (HsTyVarBndrsRn (map unLoc telescope)))
-  _ <- tcExplicitTKBndrs skol telescope $
-    tcLHsType mode body (Check result_kind)
-  checkExpKind mode src ty kind exp_kind
+  tcHsTypeLambda Nothing mode src binders body exp_kind
+tcHsType mode src@(XHsType (HsTypeLambdaCheckRn binders body helper)) exp_kind =
+  case splitHsAppTys (unLoc helper) of
+    (L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ syn_nm))), hs_cap_args)
+      | Just cap_nms <- traverse extract_cap_nm hs_cap_args ->
+          tcHsTypeLambda (Just (syn_nm, cap_nms)) mode src binders body exp_kind
+    _ -> failWithTc TcRnTypeLambdaContext
   where
-    -- See Note [Checking local lambda captures].
-    splitLambdaKind :: [LocatedN Name] -> TcKind -> TcM ([LHsTyVarBndr () GhcRn], TcKind)
-    splitLambdaKind [] result = pure ([], result)
-    splitLambdaKind (name : rest) k
-      | Just (_, arg, result) <- tcSplitFunTy_maybe k = do
-          (binders, result_kind) <- splitLambdaKind rest result
-          let loc = getLoc name
-              kind_ty = L (l2l loc) (XHsType (HsCoreTyRn (scaledThing arg)))
-              binder = HsTvb noAnn () (HsBndrVar noExtField name) (HsBndrKind noExtField kind_ty)
-          pure (L (l2l loc) binder : binders, result_kind)
-      | otherwise = failWithTc TcRnTypeLambdaContext
+    extract_cap_nm (HsValArg _ (L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm))))) = Just nm
+    extract_cap_nm _ = Nothing
 
 tcHsType mode src@(XHsType (HsTypeLetProductCheckRn (L loc name) arity rhs)) exp_kind = do
   parent <- setSrcSpanA loc $ do
@@ -2671,8 +2647,12 @@ tcHsType mode src@(XHsType (HsTypeLetProductCheckRn (L loc name) arity rhs)) exp
 
 -- See Note [Typechecking type lets].
 tcHsType mode (XHsType (HsTypeLetRn _ (L _ binder) rhs body)) exp_kind = do
-  (rhs_ty, rhs_kind) <- tcInferTypeLetRhs mode rhs
-  (checked_rhs, checked_kind) <-
+  (_, in_kc) <- classifySynthSite mode
+  let check_case_metas = not in_kc && letUsedInCaseRn binder body
+      solve_rhs = if check_case_metas then solveEqualities "tcHsTypeLet" else id
+  before_metas <- if check_case_metas then ambientMetaTyVars exp_kind else pure emptyVarSet
+  (checked_rhs, checked_kind) <- solve_rhs $ do
+    (rhs_ty, rhs_kind) <- tcInferTypeLetRhs mode rhs
     if isTypeLetPairOcc (nameOccName binder)
       then do
         first_kind <- newMetaKindVar
@@ -2682,8 +2662,23 @@ tcHsType mode (XHsType (HsTypeLetRn _ (L _ binder) rhs body)) exp_kind = do
           checkExpKind mode (unLoc rhs) rhs_ty rhs_kind (Check pair_kind)
         pure (rhs', pair_kind)
       else pure (rhs_ty, rhs_kind)
-  updLclCtxt (tcExtendLocalTypeEnv [(binder, ATcTypeLet binder checked_rhs checked_kind)]) $
-    tcLHsType mode body exp_kind
+  rhs_metas <- if check_case_metas
+    then do
+      tys_z <- liftZonkM (zonkTcTypes [checked_rhs, checked_kind])
+      pure [ tv | tv <- tyCoVarsOfTypesList tys_z
+                , isMetaTyVar tv
+                , not (tyVarKind tv `tcEqType` matchabilityTy)
+                , not (tv `elemVarSet` before_metas) ]
+    else pure []
+  res <- updLclCtxt (tcExtendLocalTypeEnv [(binder, ATcTypeLet binder checked_rhs checked_kind)]) $
+           tcLHsType mode body exp_kind
+  when (not (null rhs_metas)) $ do
+    after_env <- ambientMetaTyVars exp_kind
+    zonked <- liftZonkM (zonkTcTypes (mkTyVarTys rhs_metas))
+    when (anyVarSet (\tv -> isMetaTyVar tv && not (tv `elemVarSet` after_env)) (tyCoVarsOfTypes zonked)) $
+      addErrAt (getLocA rhs) $ mkTcRnUnknownMessage $ mkPlainError [] $
+        text "A type let used in a case body cannot generalize the kind of its right-hand side."
+  pure res
 
 {- Note [Typechecking type lets]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3278,7 +3273,7 @@ when formation would require this extra check.
 -}
 
 -- | Check a required forall with the supplied checker for its body.
--- See Note [Body kind of a HsForAllTy] and Note [Higher-order retained signatures].
+-- See Note [Body kind of a HsForAllTy] and Note [Retained Pi type formation] in GHC.Rename.HsType.
 tc_vis_forall_type :: TcTyMode -> HsType GhcRn -> HsForAllTelescope GhcRn
                    -> (TcKind -> TcM TcType) -> ExpKind -> TcM TcType
 tc_vis_forall_type mode ty tele check_body exp_kind
@@ -3516,6 +3511,13 @@ tc_app_ty = tcTermAppInType
 -- Note [Uninterpreted term applications for TcPlugins].
 tcTermAppInType :: TcTyMode -> HsType GhcRn -> ExpKind -> TcM TcType
 tcTermAppInType mode rn_ty exp_kind
+  -- Post-renaming lowered dependent sum: GHC.Sigma.Sigma domain (\b -> body)
+  | TypeLevel <- mode_tyki mode
+  , (L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ s_nm))),
+     [HsValArg _ dom_hs, HsValArg _ (L lam_loc (XHsType (HsTypeLambdaQuoteRn [bndr] body_hs)))])
+      <- splitHsAppTys rn_ty
+  , isSigmaTyConName s_nm
+  = tcSomeTypeInHsType mode rn_ty s_nm dom_hs (locA lam_loc) bndr body_hs exp_kind
   -- Stage 1a: Scoped dictionary method call on a retained index.
   | not (null (mode_dictionaries mode))
   , (L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr _ method))), [HsValArg _ arg]) <- splitHsAppTys rn_ty
@@ -3666,11 +3668,11 @@ tcTermAppInType mode rn_ty exp_kind
               | otherwise -> unsupported name
 
     resolve_term_head env True name =
-      case lookupNameEnv (tcg_local_open_defs env) name of
-        Just (fun, _) -> pure (Just fun)
-        Nothing -> case lookupTypeEnv (tcg_type_env env) name of
-          Just (AnId fun) -> pure (Just fun)
-          _               -> tcLookupIdMaybe name
+      case lookupTypeEnv (tcg_type_env env) name of
+        Just (AnId fun) -> pure (Just fun)
+        _ -> case lookupNameEnv (tcg_local_open_defs env) name of
+          Just (fun, _) -> pure (Just fun)
+          Nothing       -> tcLookupIdMaybe name
     resolve_term_head _ False name
       | ordinary_call || isJust (mode_pending_calls mode) = do
           thing <- tcLookupGlobal name
@@ -3711,7 +3713,20 @@ tcTermAppInType mode rn_ty exp_kind
           staging <- closedOperandStaging args
           if isJust staging
             then run_closed_tree (RunClosedFunction fun) args
-            else stage4_uninterp fun (unsupported name)
+            else stage4_uninterp fun $
+                   if lengthIs args 1 && is_closed_retry_head (varType fun)
+                     then run_closed_tree (RunClosedFunction fun) args
+                     else unsupported name
+
+    is_closed_retry_head fun_ty
+      | (_, binders, rho) <- splitInvisPiTys fun_ty
+      , all isTyVar (mapMaybe namedPiTyBinder_maybe binders)
+      , let preds = mapMaybe anonPiTyBinderType_maybe binders
+      , Just (FTF_T_T, _, _, domain, _) <- splitFunTy_maybe rho
+      , let retry_tys = [charTy, mkListTy naturalTy]
+      = any (tcEqType domain) retry_tys
+        || (not (null preds) && any (isJust . tcMatchTy domain) retry_tys)
+      | otherwise = False
 
     stage4_uninterp fun on_miss
       | not ordinary_call = on_miss
@@ -3764,9 +3779,9 @@ tcTermAppInType mode rn_ty exp_kind
 
     ordinary_source_arity fun table
       | SourceTableId _ _ NominalSourceTable <- idDetails fun
-      , not (any isNamedTyConBinder (tyConBinders table))
-      , varType fun `tcEqType` tyConKind table
-      = Just (tyConArity table)
+      , let vis = count isVisibleTyConBinder (tyConBinders table)
+      , vis > 0
+      = Just vis
       | otherwise = Nothing
 
     checked_callback table = do
@@ -4232,7 +4247,7 @@ tcPlanClosedTree mode ordinary hint root arguments = do
     RunClosedFunction fun -> collect deferred_ref True fun hint arguments
     CheckClosedCase table -> collect_family deferred_ref False table hint arguments
     ReduceClosedCase table -> collect_family deferred_ref True table hint arguments
-  checked <- solveEqualities "tcPlanClosedTree: checked families" (prepare_boundaries deferred_ref tree)
+  checked <- solveEqualities "tcPlanClosedTree: checked families" (prepare_boundaries True tree)
   solveEqualities "tcPlanClosedTree: default empty lists" (default_empty checked)
   deferred <- readTcRef deferred_ref
   solveEqualities "tcPlanClosedTree: deferred operand kinds" $
@@ -4413,35 +4428,40 @@ tcPlanClosedTree mode ordinary hint root arguments = do
             ch_hint <- child_hint outer_call is_unary raw_dom expected
             c <- collect deferred_ref False fun ch_hint args
             record_child_kind deferred_ref outer_call is_unary name raw_dom arg expected c
-      | otherwise = setSrcSpanA (getLoc arg) $ do
-          let lit_kind = closedCallLiteralKind arg
-          unless (ordinary || isJust lit_kind) (failWithTc (TcRnNoSourceTable name))
-          eligible <- if closedConstructorLiteral arg
-                        then pure True
-                        else closedConstructorAlias arg
-          unless eligible $ do
-            declared <- liftZonkM (zonkTcType expected)
-            let reason
-                  | outer_call && is_unary && declared `tcEqType` charTy
-                  = "The argument must be a closed Char literal, such as 'x'."
-                  | outer_call && is_unary && declared `tcEqType` mkListTy naturalTy
-                  = "The argument must be a closed list of Natural literals, such as '[1, 2, 3]."
-                  | L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ var))) <- ignoreParens arg
-                  , isTyVarName var
-                  = "This argument is a type variable. Closed evaluation requires a known value."
-                  | otherwise
-                  = "Each constructor field must be a closed literal. This operand contains an open or unsupported field."
-            failWithTc (TcRnClosedTypeEval name reason)
-          unless (bare_empty arg) $
-            forM_ lit_kind $ \actual -> do
-              when outer_call $ do
-                declared <- liftZonkM (zonkTcType expected)
-                when (noFreeVarsOfType declared && isTyFamFree declared &&
-                      not (actual `tcEqType` declared)) $
-                  closedOperandMismatch name actual declared
-              discardResult (unifyKind (Just (HsTypeRnThing (unLoc arg))) actual expected)
-          literal <- tc_check_lhs_type mode arg expected
-          return (ClosedLiteral name arg literal)
+      | otherwise = do
+          call_loc <- getSrcSpanM
+          setSrcSpanA (getLoc arg) $ do
+            let lit_kind = closedCallLiteralKind arg
+            unless (ordinary || isJust lit_kind) (failWithTc (TcRnNoSourceTable name))
+            eligible <- if closedConstructorLiteral arg
+                          then pure True
+                          else closedConstructorAlias arg
+            unless eligible $ do
+              declared <- liftZonkM (zonkTcType expected)
+              if outer_call && is_unary && declared `tcEqType` charTy
+                then setSrcSpan call_loc $
+                       failWithTc (TcRnClosedTypeEval name "The argument must be a closed Char literal, such as 'x'.")
+                else if outer_call && is_unary && declared `tcEqType` mkListTy naturalTy
+                then setSrcSpan call_loc $
+                       failWithTc (TcRnClosedTypeEval name "The argument must be a closed list of Natural literals, such as '[1, 2, 3].")
+                else do
+                  let reason
+                        | L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ var))) <- ignoreParens arg
+                        , isTyVarName var
+                        = "This argument is a type variable. Closed evaluation requires a known value."
+                        | otherwise
+                        = "Each constructor field must be a closed literal. This operand contains an open or unsupported field."
+                  failWithTc (TcRnClosedTypeEval name reason)
+            unless (bare_empty arg) $
+              forM_ lit_kind $ \actual -> do
+                when outer_call $ do
+                  declared <- liftZonkM (zonkTcType expected)
+                  when (noFreeVarsOfType declared && isTyFamFree declared &&
+                        not (actual `tcEqType` declared)) $
+                    closedOperandMismatch name actual declared
+                discardResult (unifyKind (Just (HsTypeRnThing (unLoc arg))) actual expected)
+            literal <- tc_check_lhs_type mode arg expected
+            return (ClosedLiteral name arg literal)
 
     check_deferred_match (arg_span, arg_ty, owner, raw_dom, actual, expected) = do
       actual' <- liftZonkM (zonkTcType actual)
@@ -4451,7 +4471,7 @@ tcPlanClosedTree mode ordinary hint root arguments = do
         else setSrcSpan arg_span $
                discardResult (unifyKind (Just (HsTypeRnThing arg_ty)) actual' expected')
 
-    prepare_boundaries deferred_ref (ClosedBoundary arg expected)
+    prepare_boundaries _ (ClosedBoundary arg expected)
       | Just (loc, rdr, name, args) <- nestedClosedCall arg = do
         expected' <- liftZonkM (zonkTcType expected)
         let hint' = nestedClosedResultHint ordinary expected'
@@ -4459,10 +4479,23 @@ tcPlanClosedTree mode ordinary hint root arguments = do
         setSrcSpanA (getLoc arg) $
           discardResult (unifyKind (Just (HsTypeRnThing (unLoc arg))) actual expected)
         return (CheckedBoundary value)
-    prepare_boundaries deferred_ref (ClosedApplication loc fun vars predicates inputs result children) =
-      ClosedApplication loc fun vars predicates inputs result <$> traverse (prepare_boundaries deferred_ref) children
-    prepare_boundaries deferred_ref (ClosedFamilyApplication loc owner table kinds inputs result children) =
-      ClosedFamilyApplication loc owner table kinds inputs result <$> traverse (prepare_boundaries deferred_ref) children
+    prepare_boundaries True (ClosedApplication loc fun vars predicates inputs result [ClosedBoundary arg expected])
+      | Just (b_loc, rdr, name, args) <- nestedClosedCall arg = do
+        expected' <- liftZonkM (zonkTcType expected)
+        let hint' = nestedClosedResultHint ordinary expected'
+            (_, _, rho) = splitInvisPiTys (varType fun)
+            (_, arrows, _) = splitFunTys rho
+        (actual, value) <- setSrcSpan b_loc (tcPlanClosedHead mode ordinary hint' rdr name args)
+        case map scaledThing arrows of
+          [raw_dom] | not (isTyVarTy raw_dom) && isNothing (tcUnifyTys meta_bind [actual] [expected']) ->
+            setSrcSpanA (getLoc arg) (closedOperandMismatch (getName fun) actual raw_dom)
+          _ -> setSrcSpanA (getLoc arg) $
+                 discardResult (unifyKind (Just (HsTypeRnThing (unLoc arg))) actual expected)
+        return (ClosedApplication loc fun vars predicates inputs result [CheckedBoundary value])
+    prepare_boundaries _ (ClosedApplication loc fun vars predicates inputs result children) =
+      ClosedApplication loc fun vars predicates inputs result <$> traverse (prepare_boundaries False) children
+    prepare_boundaries _ (ClosedFamilyApplication loc owner table kinds inputs result children) =
+      ClosedFamilyApplication loc owner table kinds inputs result <$> traverse (prepare_boundaries False) children
     prepare_boundaries _ tree = return tree
 
     default_empty (ClosedLiteral _ arg literal)
@@ -4495,7 +4528,8 @@ tcPlanClosedTree mode ordinary hint root arguments = do
     verify _ (ClosedApplication loc fun vars constraints inputs result children) = setSrcSpan loc $ do
       let name = getName fun
           ground ty = noFreeVarsOfType ty && isTyFamFree ty
-      checked_children <- traverse (verify False) children
+          child_app_first = case children of { [ClosedApplication{}] -> True; _ -> False }
+      pre_children <- if child_app_first then Just <$> traverse (verify False) children else pure Nothing
       values <- liftZonkM (zonkTcTypes (map snd vars))
       let unresolved = [getOccString tv | ((tv, _), value) <- zip vars values, not (ground value)]
           subject = case children of
@@ -4518,6 +4552,7 @@ tcPlanClosedTree mode ordinary hint root arguments = do
                 reductionReducedType <$> tcRewriteFamilyAxioms norm_loc zonked_result
         else return zonked_result
       unless (ground result') $ unsupported name
+      checked_children <- maybe (traverse (verify False) children) pure pre_children
       pure (ClosedApplication loc fun (zip (map fst vars) values) [] inputs' result' checked_children)
 
     verify _ (ClosedFamilyApplication loc owner table kinds inputs result children) = setSrcSpan loc $ do
@@ -5634,47 +5669,14 @@ An explicit kind argument and a family pattern keep their usual paths.
 -}
 
 {- Note [Immutable native kind arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider Count :: forall a. List a -> Nat and xs :: List (Vec Int n), where
-n is an earlier runtime index. Instantiating a with a mutable meta before
-checking xs requires that meta to contain n. The native escape check correctly
-rejects that assignment. Choose a from the checked kind of xs instead.
-
-Before instantiating an invisible prefix, inspect whether the source argument
-mentions an actual Name in mode_indices. Infer that argument once and cache
-its Type and kind. This also handles a constructor or saturated family around
-the index: inference checks its smaller source arguments first. Applications
-without registered runtime Names keep the ordinary checking path.
-
-When the checked kind contains native metadata, match the visible domain with
-tcMatchTyX_BM. Only the pending invisible variables can bind. Require complete
-choices, check their substituted kinds, and reject free pending variables in
-those choices. Seed matching with the actual target's free variables, then add
-source kind variables with extendSubstInScopeSetFromSource. Target entries
-retain their prepared metadata. Check the entire instantiated domain too.
-Preserve the existing
-mode default for Matchability binders; do not infer an omitted M/U choice from
-the argument. A checked declaration's deferred default keeps its old path.
-
-Apply a successful choice through mkAppTyM. It preserves the Purely Kinded
-Type Invariant and the original forall annotations. Then run checkExpectedKind
-on the cached argument. If matching fails, instantiate normally and retain
-the same cache. A smaller pending prefix can try matching again. Never repeat
-argument inference, splice finalizers or constraints after a failed candidate.
-The cache survives a kind-substitution or arrow-exposure restart and is cleared
-when its visible argument is consumed.
-
-Check runtime occurrences against mode_indices and its deep earlier metadata
-dependencies. Direct mode entries take priority. This covers signature binders
-which are not ATcIds yet. It also covers an ambient xs whose kind mentions an
-earlier n not written separately in this argument. The ambient resolver already
-checked xs. Zonk the original prototypes and compare their complete types and
-Many multiplicities. Do not consult a global type environment or IdInfo.
-
-This changes immutable instantiation, not meta assignment or native admission.
-The source argument supplies its lexical scope. Ordinary kind checking and
-complete-signature validity still check the resulting type. No new quantifier,
-runtime use, family evaluator or escape exception is introduced.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an argument mentions a registered runtime index in 'mode_indices' (GHC
+Proposal #378; Gundry, PhD thesis, 2013, §6.2), instantiating an invisible kind
+parameter with a mutable metavariable would fail the runtime-index escape check
+(for example @Count xs@ with @xs :: List (Vec Int n)@). Instead, infer and cache
+the argument once, match the pending invisible prefix against the checked kind
+via 'tcMatchTyX_BM', validate 'native_scope', and apply the rigid choices with
+'mkAppTyM' while preserving the Purely Kinded Type Invariant.
 -}
 
 mkAppTyM :: Subst
@@ -6055,17 +6057,21 @@ replaceTypeTermIds env
     go (CastTy t co)      = CastTy (go t) co
     go t                  = t
 
--- | Per-module state for synthesized closed type families and retained function
--- helpers, stored in 'tcg_th_state' so no global 'IORef's are used.
+-- | Per-module state for synthesized closed type families, synonyms, and
+-- retained function helpers, stored in 'tcg_th_state' and mirrored to
+-- 'tcg_type_env_var' so no global 'IORef's are used.
 data SynthTypeState = SynthTypeState
-  { sts_tycons      :: !(NameEnv TyCon)
-  , sts_source_funs :: !(NameEnv (Id, LHsBind GhcTc, TyCon))
-  , sts_simple_funs :: !(Maybe (NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)))
+  { sts_tycons         :: !(NameEnv TyCon)
+  , sts_source_funs    :: !(NameEnv (Id, LHsBind GhcTc, TyCon))
+  , sts_simple_funs    :: !(Maybe (NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)))
+  , sts_ordinals       :: !(OccEnv Int)
+  , sts_sig_cases      :: !(NameEnv [(Bool, [TyVar], Type, [([Name], LHsType GhcRn, LHsType GhcRn)], TyCon)])
+  , sts_pending_checks :: ![TcM ()]
   }
-  deriving Typeable
 
 emptySynthTypeState :: SynthTypeState
-emptySynthTypeState = SynthTypeState emptyNameEnv emptyNameEnv Nothing
+emptySynthTypeState =
+  SynthTypeState emptyNameEnv emptyNameEnv Nothing emptyOccEnv emptyNameEnv []
 
 getSynthTypeState :: TcM SynthTypeState
 getSynthTypeState = do
@@ -6087,6 +6093,30 @@ modifySynthTypeState mod_key f def_val = do
           (!next, res) = f cur
       writeTcRef ref (Map.insert rep (toDyn next) st_map)
       pure res
+
+-- | Snapshot 'SynthTypeState' across an attempted declaration group and restore
+-- it if the action fails or emits errors so retried groups start from a clean
+-- ordinal state.
+withRollbackSynthTypeState :: TcM a -> TcM a
+withRollbackSynthTypeState act = do
+  cur_mod <- tcg_mod <$> getGblEnv
+  saved <- getSynthTypeState
+  let rollback = modifySynthTypeState cur_mod (const (saved, ())) ()
+  (mb_res, had_errs) <- askErrsFound (attemptM act)
+  case mb_res of
+    Just res -> do
+      when had_errs rollback
+      pure res
+    Nothing  -> rollback >> failM
+
+allocSynthOrdinal :: OccName -> TcM Int
+allocSynthOrdinal owner_occ = do
+  cur_mod <- tcg_mod <$> getGblEnv
+  modifySynthTypeState cur_mod
+    (\st ->
+       let n = fromMaybe 0 (lookupOccEnv (sts_ordinals st) owner_occ)
+       in (st { sts_ordinals = extendOccEnv (sts_ordinals st) owner_occ (n + 1) }, n))
+    0
 
 -- | Look up a synthesized 'TyCon' in 'tcg_type_env' or the current group's
 -- 'SynthTypeState'.
@@ -6119,18 +6149,17 @@ data SynthClosedFamFlav
   | SynthUninterpFam
   | SynthClosedEqns (Maybe (Name -> (Name, Bool))) [([TyVar], [Type], Type, SrcSpan)]
 
--- | Construct a closed 'FamilyTyCon' (and optional 'CoAxiom') with unmatchable
--- visible arrows.
-mkSynthClosedFamily :: Name -> [TyVar] -> [TyVar] -> Kind -> SynthClosedFamFlav -> TcM TyCon
-mkSynthClosedFamily fam_name invis_tvs vis_tvs res_kind flav = do
-  let tc_binders = mkNamedTyConBinders (Invisible SpecifiedSpec) invis_tvs
-                   ++ mkAnonTyConBinders vis_tvs
-      tc_kind    = mkTyConKindWithMatchability unmatchableDataConTy tc_binders res_kind
-      mk_tc ctf  = mkFamilyTyCon fam_name tc_kind tc_binders 0 res_kind Nothing
-                     (ClosedTypeFamilyTyCon ctf) Nothing NotInjective
+-- | Construct a closed 'FamilyTyCon' from explicit 'TyConBinder's.
+mkSynthClosedFamilyTcbs :: Name -> [TyConBinder] -> Kind -> SynthClosedFamFlav -> TcM TyCon
+mkSynthClosedFamilyTcbs fam_name tc_binders res_kind flav = do
+  let tc_kind   = mkTyConKindWithMatchability unmatchableDataConTy tc_binders res_kind
+      mk_tc ctf = mkFamilyTyCon fam_name tc_kind tc_binders 0 res_kind Nothing
+                    (ClosedTypeFamilyTyCon ctf) Nothing NotInjective
   case flav of
     SynthAbstractFam -> pure (mk_tc CTF_Abstract)
     SynthUninterpFam -> pure (mk_tc (CTF Nothing))
+    SynthClosedEqns mb_scope [] -> pure (mk_tc (CTF Nothing))
+      where _ = mb_scope
     SynthClosedEqns mb_scope rows -> do
       ax_name <- newImplicitBinder fam_name mkInstTyCoOcc
       let branches = [ mkCoAxBranch qtvs [] [] lhs rhs (map (const Nominal) qtvs) loc
@@ -6142,6 +6171,39 @@ mkSynthClosedFamily fam_name invis_tvs vis_tvs res_kind flav = do
           fam_tc = mk_tc ctf
           axiom  = mkBranchedCoAxiom Nominal ax_name fam_tc branches
       pure fam_tc
+
+-- | Construct a closed 'FamilyTyCon' with specified invisible binders and
+-- non-dependent visible binders.
+mkSynthClosedFamily :: Name -> [TyVar] -> [TyVar] -> Kind -> SynthClosedFamFlav -> TcM TyCon
+mkSynthClosedFamily fam_name invis_tvs vis_tvs res_kind flav =
+  mkSynthClosedFamilyTcbs fam_name
+    (mkNamedTyConBinders (Invisible SpecifiedSpec) invis_tvs ++ mkAnonTyConBinders vis_tvs)
+    res_kind flav
+
+-- | Build 'TyConBinder's from invisible/visible binder groups, marking visible
+-- binders used in subsequent kinds as 'Required' rather than 'AnonTCB'.
+mkDependentTyConBinders
+  :: [(TyVar, Specificity)]
+  -> [TyVar]
+  -> [(TyVar, Specificity)]
+  -> [TyVar]
+  -> Kind
+  -> [TyConBinder]
+mkDependentTyConBinders pre_invis pre_vis mid_invis tail_vis res_kind =
+  let raw = [ (tv, Just sp) | (tv, sp) <- pre_invis ]
+         ++ [ (tv, Nothing) | tv       <- pre_vis ]
+         ++ [ (tv, Just sp) | (tv, sp) <- mid_invis ]
+         ++ [ (tv, Nothing) | tv       <- tail_vis ]
+      build [] = ([], tyCoVarsOfType res_kind)
+      build ((tv, mb_sp) : rest) =
+        let (rest_tcbs, later_fvs) = build rest
+            tcb = case mb_sp of
+              Just sp -> Bndr tv (NamedTCB (Invisible sp))
+              Nothing | tv `elemVarSet` later_fvs -> Bndr tv (NamedTCB Required)
+                      | otherwise                 -> Bndr tv AnonTCB
+            fvs' = (later_fvs `delVarSet` tv) `unionVarSet` tyCoVarsOfType (tyVarKind tv)
+        in (tcb : rest_tcbs, fvs')
+  in fst (build raw)
 
 -- | Intern a synthesized closed 'FamilyTyCon' in the current module's
 -- 'SynthTypeState', reusing an existing entry when 'fam_name' is already bound.
@@ -6171,24 +6233,50 @@ abstractSynthCaptures :: [Var] -> [Var] -> TcM (Subst.Subst, [(TyVar, Var)], Typ
 abstractSynthCaptures raw_fvs extra_in_scope = do
   let ordered_fvs = scopedSort raw_fvs
       init_subst  = Subst.mkEmptySubst (mkInScopeSet (mkVarSet (ordered_fvs ++ extra_in_scope)))
-      alloc subst v = do
-        let ki = Subst.substTy subst (varType v)
+      alloc (subst, id_acc) v = do
+        let ki = replaceTypeTermIds id_acc (Subst.substTy subst (varType v))
         nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName v))))
-        let tv     = mkTyVar nm ki
-            subst' = if isTyVar v
-                       then Subst.extendTvSubstAndInScope subst v (mkTyVarTy tv)
-                       else subst
-        pure (subst', (tv, v))
-  (subst1, pairs) <- mapAccumLM alloc init_subst ordered_fvs
-  let id_map = mkVarEnv [(orig_v, mkTyVarTy p_tv) | (p_tv, orig_v) <- pairs, isId orig_v]
-      subst_all s ty = replaceTypeTermIds id_map (Subst.substTy s ty)
+        let tv      = mkTyVar nm ki
+            subst'  = if isTyVar v
+                        then Subst.extendTvSubstAndInScope subst v (mkTyVarTy tv)
+                        else subst
+            id_acc' = if isId v
+                        then extendVarEnv id_acc v (mkTyVarTy tv)
+                        else id_acc
+        pure ((subst', id_acc'), (tv, v))
+  ((subst1, id_map), pairs) <- mapAccumLM alloc (init_subst, emptyVarEnv) ordered_fvs
+  let subst_all s ty = replaceTypeTermIds id_map (Subst.substTy s ty)
   pure (subst1, pairs, subst_all subst1)
 
--- | Drain and return all synthesized 'TyCon's recorded for the given 'Module'.
+-- | Queue a post-knot validity check for a synthesized family or synonym in the
+-- current 'TyClGroup'.
+deferSynthCheck :: TcM () -> TcM ()
+deferSynthCheck act = do
+  cur_mod <- tcg_mod <$> getGblEnv
+  modifySynthTypeState cur_mod
+    (\st -> (st { sts_pending_checks = act : sts_pending_checks st }, ()))
+    ()
+
+-- | Run and clear all deferred validity checks queued during the current
+-- 'TyClGroup' knot.
+runPendingSynthChecks :: TcM ()
+runPendingSynthChecks = do
+  cur_mod <- tcg_mod <$> getGblEnv
+  checks <- modifySynthTypeState cur_mod
+    (\st -> (st { sts_pending_checks = [] }, reverse (sts_pending_checks st)))
+    []
+  sequence_ checks
+
+-- | Drain and return all synthesized 'TyCon's recorded for the given 'Module',
+-- resetting per-group ordinal and intra-signature case caches.
 drainForgetMTyCons :: Module -> TcM [TyCon]
 drainForgetMTyCons mod_key =
   modifySynthTypeState mod_key
-    (\st -> (st { sts_tycons = emptyNameEnv }, nonDetNameEnvElts (sts_tycons st)))
+    (\st -> ( st { sts_tycons         = emptyNameEnv
+                  , sts_ordinals       = emptyOccEnv
+                  , sts_sig_cases      = emptyNameEnv
+                  , sts_pending_checks = [] }
+             , nonDetNameEnvElts (sts_tycons st) ))
     []
 
 -- | Allocate a closed 1-equation source family and top-level helper 'Id' for a
@@ -6256,94 +6344,1595 @@ lookupLocalSimpleFunBind nm = do
       st <- getSynthTypeState
       pure (sts_simple_funs st >>= (`lookupNameEnv` nm))
 
-{- Note [Direct lowering of uncaptured some types]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-"GHC.Rename.HsType" rewrites @some (x :: A) | B@ (GHC Proposal #473, Eisenberg
-et al., 2022) to @Sigma A (\x -> B)@ using 'HsTypeLambdaQuoteRn'. When
-'tcInlineSomeLambda' checks @\x -> B@ at an unmatchable arrow kind, it checks
-@B@ under skolem binders, abstracts free type variables and runtime index 'Id's
-in 'scopedSort' order, and interns a 1-equation closed 'FamilyTyCon' via
-'tcInternSynthClosedFamily' so "GHC.Tc.Module" exports it in module interfaces.
+{- Note [Post-renaming lowering of lambdas, sums, and cases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+After 'GHC.Rename.HsType' renames type lambdas, dependent sums (@some@), and
+type @case@ expressions in their lexical scope (GHC Proposals #281, #378, #425,
+#473, and #523; Eisenberg and Stolarek, Haskell Symposium 2014; Danvy and
+Nielsen, PPDP 2001), 'GHC.Tc.Gen.HsType' lowers them directly from typed
+environments without pre-renaming 'GhcPs' closure conversion:
+
+* Declaration kind-inference pass ('kcTyClGroup'): while the enclosing
+  declaration 'Name' is not yet present in 'tcg_type_env', check all binders,
+  scrutinees, patterns, and right-hand sides to record kind constraints, then
+  return an @Any@ placeholder of the checked kind without registering
+  'MonoTcTyCon'-bearing helpers. In the knot-tied declaration pass
+  ('tcTyClDecls'), 'resolveRecTcTypes' replaces any 'TcTyCon' from the current
+  recursive group with its knot-tied 'TyCon' using lazy 'TyConApp' nodes.
+* Dependent sums ('tcSomeTypeInHsType'): synthesize @$lambda:<Owner>:<i>-sigma@
+  with @CTF_Scoped root True@ (plus a @$signature-sum:@ or @$field-sum:@
+  wrapper synonym on value signatures and constructor fields so Template Haskell
+  'reify' sees an ordinary synonym application).
+* Type lambdas ('tcHsTypeLambda'): coalesce duplicate-free curried binders,
+  skolemise expected-kind @forall@ prefixes and unmatchable arrows, compile
+  direct scrutinee @case@ bodies as multi-branch family equations, and attach
+  @CTF_Scoped root False@ so nested lambdas share their outer scope root.
+* Type cases ('tcHsTypeCase'): synthesize @$case:<Owner>:<i>@ (with
+  @CTF_Scoped syn False@ on top-level value signatures for cross-module
+  definitional equality) and compile overlapping, wildcard, or nested
+  constructor patterns into ordered decision families via
+  'compileOrderedSynthCase' (Maranget, ML 2008).
 -}
 
--- | Elaborate a lowered @some@ payload lambda into a closed 1-equation family
--- application at an unmatchable arrow kind.
--- See Note [Direct lowering of uncaptured some types].
-tcInlineSomeLambda :: TcTyMode -> HsType GhcRn -> [LocatedN Name] -> LHsType GhcRn
-                   -> ExpKind -> TcM TcType
-tcInlineSomeLambda mode src binders body exp_kind = do
+data SynthSite
+  = SynthInLambda Name Name
+  | SynthInSigma Name Name
+  | SynthTySyn Name
+  | SynthClosedFam Name
+  | SynthOpenFamInst Name
+  | SynthConField Name (Maybe Name)
+  | SynthTopSig Name
+  | SynthLocalSig String
+  | SynthExprT2T
+
+classifySynthSite :: TcTyMode -> TcM (SynthSite, Bool)
+classifySynthSite mode = do
+  gbl <- getGblEnv
+  lcl <- getLclEnv
+  lcl_env <- getLclTypeEnv
+  let ctxts = getLclEnvErrCtxt lcl
+      is_real_decl_tc dt =
+        isJust (lookupNameEnv lcl_env dt) || isJust (lookupTypeEnv (tcg_type_env gbl) dt)
+      mb_decl_tc = listToMaybe [dt | TyConDeclCtxt dt _ <- ctxts, is_real_decl_tc dt]
+      in_kc = case mb_decl_tc of
+        Just dt -> isNothing (lookupTypeEnv (tcg_type_env gbl) dt)
+        Nothing -> isJust (mode_synonym_metadata mode) && isNothing (mode_source_proof_owner mode)
+      from_ctxts [] = SynthExprT2T
+      from_ctxts (c : cs) = case c of
+        DataConDefCtxt (L _ con_nm :| _) -> SynthConField con_nm mb_decl_tc
+        TyConDeclCtxt tc_nm TypeSynonymFlavour | is_real_decl_tc tc_nm -> SynthTySyn tc_nm
+        TyConDeclCtxt tc_nm ClosedTypeFamilyFlavour | is_real_decl_tc tc_nm -> SynthClosedFam tc_nm
+        TyConInstCtxt fam_nm flav
+          | OpenFamilyFlavour IAmType _ <- tyConInstFlavour flav -> SynthOpenFamInst fam_nm
+        UserSigCtxt (FunSigCtxt val_nm _) _
+          | isExternalName val_nm -> SynthTopSig val_nm
+          | otherwise -> SynthLocalSig (occNameString (nameOccName val_nm))
+        UserSigCtxt (ExprSigCtxt _) _ -> SynthLocalSig "$expression"
+        _ -> from_ctxts cs
+      site
+        | Just (r, o) <- mode_lambda_root mode = SynthInLambda r o
+        | Just (r, o) <- mode_sigma_root mode  = SynthInSigma r o
+        | Just (_, HM_VTA) <- mode_holes mode  = SynthLocalSig "$type-argument"
+        | otherwise                            = from_ctxts ctxts
+  pure (site, in_kc)
+
+-- | Replace 'TcTyCon' occurrences from the current recursive 'TyClGroup' with
+-- their knot-tied 'TyCon's in 'tcg_type_env' without forcing the knot thunks.
+resolveRecTcTypes :: TypeEnv -> Type -> Type
+resolveRecTcTypes tenv = go
+  where
+    go (TyVarTy tv)       = TyVarTy (setTyVarKind tv (go (tyVarKind tv)))
+    go (AppTy f a)        = AppTy (go f) (go a)
+    go (TyConApp tc args)
+      | isTcTyCon tc
+      , Just (ATyCon real_tc) <- lookupTypeEnv tenv (tyConName tc)
+      = TyConApp real_tc (map go args)
+      | otherwise
+      = TyConApp tc (map go args)
+    go (ForAllTy ma (Bndr b vis) r) = ForAllTy (go ma) (Bndr (updateVarType go b) vis) (go r)
+    go (FunTy af ma m a r) = FunTy af (go ma) (go m) (go a) (go r)
+    go (CastTy t co)      = CastTy (go t) co
+    go (TermVarTy v)      = TermVarTy (updateIdTypeAndMult go v)
+    go (TermAppTy f a)    = TermAppTy (updateIdTypeAndMult go f) (go a)
+    go (DepFunTy vis b r) = DepFunTy vis (updateIdTypeAndMult go b) (go r)
+    go (ExistsTy vis b r) = ExistsTy vis (setTyVarKind b (go (tyVarKind b))) (go r)
+    go (DepDictTy b r)    = DepDictTy (updateIdTypeAndMult go b) (go r)
+    go (ClassAppTy s a d x k) = ClassAppTy (updateIdTypeAndMult go s) (go a) (go d) (go x) (go k)
+    go t                  = t
+
+isSigmaTyConName :: Name -> Bool
+isSigmaTyConName nm =
+  occNameFS (nameOccName nm) == fsLit "Sigma"
+  && maybe False (\m -> moduleNameString (moduleName m) == "GHC.Sigma") (nameModule_maybe nm)
+
+letUsedInCaseRn :: Name -> LHsType GhcRn -> Bool
+letUsedInCaseRn target = go
+  where
+    go (L _ ty) = case ty of
+      XHsType (HsTypeCaseRn scrut rows) ->
+        mentions target scrut || any (\(ns, _, r) -> target `notElem` ns && mentions target r) rows
+      XHsType (HsTypeLetRn _ (L _ b) r body) ->
+        go r || (target /= b && (go body || (mentions target r && letUsedInCaseRn b body)))
+      HsParTy _ t            -> go t
+      HsKindSig _ t k        -> go t || go k
+      HsAppTy _ f a          -> go f || go a
+      HsAppKindTy _ t k      -> go t || go k
+      HsFunTy _ _ a b        -> go a || go b
+      HsOpTy _ a _ b         -> go a || go b
+      HsListTy _ t           -> go t
+      HsTupleTy _ _ ts       -> any go ts
+      HsSumTy _ ts           -> any go ts
+      HsExplicitListTy _ _ ts -> any go ts
+      HsExplicitTupleTy _ _ ts -> any go ts
+      HsForAllTy _ _ b       -> go b
+      HsForEachTy _ _ b      -> go b
+      HsQualTy _ _ b         -> go b
+      HsSpliceTy (HsUntypedSpliceTop _ inner) _ -> go inner
+      _                      -> False
+
+    mentions :: Data a => Name -> a -> Bool
+    mentions nm thing
+      | isAstLeafAnnotation thing = case cast thing :: Maybe Name of
+          Just n  -> n == nm
+          Nothing -> False
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = mentions nm inner
+      | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = False
+      | otherwise = or (gmapQ (mentions nm) thing)
+
+ambientMetaTyVars :: ExpKind -> TcM TyCoVarSet
+ambientMetaTyVars exp_kind = do
+  lcl <- getLclTypeEnv
+  let env_tys = concatMap thing_tys (nonDetNameEnvElts lcl)
+      ek_tys  = maybeToList (checkingExpType_maybe exp_kind)
+  zonked <- liftZonkM (zonkTcTypes (ek_tys ++ env_tys))
+  pure (filterVarSet isMetaTyVar (tyCoVarsOfTypes zonked))
+  where
+    thing_tys (ATyVar _ tv)        = [mkTyVarTy tv, tyVarKind tv]
+    thing_tys (ATcTypeLet _ ty ki) = [ty, ki]
+    thing_tys (ATcId { tct_id = v }) = [varType v, idMult v]
+    thing_tys _                    = []
+
+-- | Partition captured 'Var's into invisible kind captures and visible type or
+-- runtime-index captures, preserving explicit declaration header binders when
+-- present.
+partitionSynthCaptures
+  :: Bool                     -- ^ Under an inner explicit @forall@
+  -> Maybe ([TyVar], [TyVar]) -- ^ Optional explicit declaration (invis, vis) header binders
+  -> [Var]                    -- ^ Free variables referenced by the lowered construct
+  -> TcM (Subst.Subst, [(TyVar, Specificity)], [TyVar], [Type], Type -> Type)
+partitionSynthCaptures under_forall mb_decl_hdr raw_fvs = do
+  lcl_full <- getLclEnv
+  lcl <- getLclTypeEnv
+  let stack_vars =
+        [ v
+        | b <- reverse (getLclEnvBinderStack lcl_full)
+        , Just v <- [case b of
+                       TcTvBndr _ tv -> Just (tv :: Var)
+                       TcIdBndr i _  -> Just (i :: Var)
+                       _             -> Nothing] ]
+      stack_pos = mkVarEnv (zip stack_vars [0 :: Int ..])
+      lcl_spans = mkVarEnv [(tv :: Var, nameSrcSpan nm) | ATyVar nm tv <- nonDetNameEnvElts lcl]
+      active_invis_specs = mkVarEnv
+        [ (tv, SpecifiedSpec)
+        | ATyVar _ tv <- nonDetNameEnvElts lcl ]
+      lcl_tv_set = mkVarSet [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
+      (hdr_invis, hdr_vis) = fromMaybe ([], []) mb_decl_hdr
+      hdr_vis_set   = mkVarSet hdr_vis
+      hdr_invis_set = mkVarSet hdr_invis
+      non_hdr_fvs   = sort_by_bind_loc stack_pos lcl_spans [v | v <- dedup_vars raw_fvs, not (v `elemVarSet` hdr_vis_set)]
+      -- Include all explicit visible header binders for SynDecl so reify sees full arity.
+      seed_vars     = dedup_vars (map (\v -> v :: Var) hdr_vis ++ non_hdr_fvs)
+      base_vars     = scopedSort (close_kinds seed_vars)
+      -- Distinguish kind-only variables and inferred metavariables from written visible variables:
+      explicit_set  = mkVarSet seed_vars
+      is_invis_var v
+        | not (isTyVar v)                  = False
+        | not (v `elemVarSet` lcl_tv_set)  = True
+        | v `elemVarSet` hdr_invis_set     = True
+        | isJust mb_decl_hdr, not under_forall = not (v `elemVarSet` hdr_vis_set)
+        | not (v `elemVarSet` explicit_set) = True
+        | otherwise                        = False
+      (invis_orig, vis_orig) =
+        ( [v | v <- base_vars, is_invis_var v]
+        , [v | v <- base_vars, not (is_invis_var v)] )
+      ordered = invis_orig ++ vis_orig
+  (subst1, pairs, subst_fn) <- abstractSynthCaptures ordered []
+  let (invis_pairs, vis_pairs) = splitAt (length invis_orig) pairs
+      spec_of orig_v = lookupVarEnv active_invis_specs orig_v `orElse` InferredSpec
+      invis_out = [ (p_tv, spec_of orig_v) | (p_tv, orig_v) <- invis_pairs ]
+      vis_out   = map fst vis_pairs
+      cap_args  = [ if isTyVar orig_v then mkTyVarTy orig_v else TermVarTy orig_v
+                  | (_, orig_v) <- invis_pairs ++ vis_pairs ]
+  pure (subst1, invis_out, vis_out, cap_args, subst_fn)
+  where
+    sort_by_bind_loc stack_pos lcl_spans =
+      maybe [] (NE.toList . NE.sortBy (cmp_bind stack_pos lcl_spans)) . NE.nonEmpty
+    bind_span lcl_spans v = lookupVarEnv lcl_spans v `orElse` nameSrcSpan (getName v)
+    cmp_bind stack_pos lcl_spans v1 v2 = case (lookupVarEnv stack_pos v1, lookupVarEnv stack_pos v2) of
+      (Just i1, Just i2) | i1 /= i2 -> compare i1 i2
+      _ -> case (srcSpanStart (bind_span lcl_spans v1), srcSpanStart (bind_span lcl_spans v2)) of
+        (RealSrcLoc l1 _, RealSrcLoc l2 _) -> compare l1 l2
+        _ -> EQ
+    dedup_vars = go emptyVarSet
+      where
+        go _ [] = []
+        go seen (v : vs)
+          | v `elemVarSet` seen = go seen vs
+          | otherwise           = v : go (extendVarSet seen v) vs
+    close_kinds vs =
+      let k_fvs = tyCoVarsOfTypesList (map varType vs)
+          more  = filterOut (`elemVarSet` mkVarSet vs) k_fvs
+      in if null more then vs else close_kinds (more ++ vs)
+
+lookupDeclHeaderTyVars :: SynthSite -> TcM (Maybe ([TyVar], [TyVar]))
+lookupDeclHeaderTyVars (SynthTySyn syn_nm) = do
+  gbl <- getGblEnv
+  lcl <- getLclTypeEnv
+  let mb_tc = case lookupNameEnv lcl syn_nm of
+        Just (ATcTyCon tc) -> Just tc
+        _ -> case lookupTypeEnv (tcg_type_env gbl) syn_nm of
+          Just (ATyCon tc) -> Just tc
+          _                -> Nothing
+      lcl_by_occ = mkOccEnv [(nameOccName nm, lcl_tv) | ATyVar nm lcl_tv <- nonDetNameEnvElts lcl]
+      resolve_lcl tv = case lookupNameEnv lcl (getName tv) of
+        Just (ATyVar _ lcl_tv) -> Just lcl_tv
+        _                      -> lookupOccEnv lcl_by_occ (nameOccName (getName tv))
+  case mb_tc of
+    Just poly_tc ->
+      let bndrs = tyConBinders poly_tc
+          invis = mapMaybe resolve_lcl [tv | Bndr tv vis <- bndrs, isInvisibleTyConBinder (Bndr tv vis)]
+          vis   = mapMaybe resolve_lcl [tv | Bndr tv vis <- bndrs, isVisibleTyConBinder (Bndr tv vis)]
+      in pure (Just (invis, vis))
+    Nothing -> pure Nothing
+lookupDeclHeaderTyVars _ = pure Nothing
+
+checkSynthFamValidity :: TyCon -> [TyVar] -> [Type] -> Type -> SrcSpan -> Maybe SDoc -> TcM ()
+checkSynthFamValidity fam_tc _qtvs lhs rhs loc _mb_override_err =
+  setSrcSpan loc $
+    setErrCtxt [] $
+      addErrCtxt (TyConDeclCtxt (tyConName fam_tc) ClosedTypeFamilyFlavour) $
+        addErrCtxt (ClosedFamEqnCtxt fam_tc) $
+          checkValidTyFamEqn fam_tc lhs rhs
+
+isInDeclKnotM :: TcM Bool
+isInDeclKnotM = do
+  lcl <- getLclEnv
+  pure $ any (\case { TyConDeclCtxt{} -> True; DataConDefCtxt{} -> True; _ -> False })
+             (getLclEnvErrCtxt lcl)
+
+runOrDeferSynthCheck :: TcM () -> TcM ()
+runOrDeferSynthCheck act = do
+  in_decl <- isInDeclKnotM
+  if in_decl then deferSynthCheck act else act
+
+hasAmbientMetaKindsM :: TcM Bool
+hasAmbientMetaKindsM = do
+  lcl <- getLclTypeEnv
+  let scoped = [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
+      scoped_set = mkVarSet scoped
+  ks <- liftZonkM $ zonkTcTypes (map tyVarKind scoped)
+  pure (anyVarSet (\v -> isMetaTyVar v && not (v `elemVarSet` scoped_set)) (tyCoVarsOfTypes ks))
+
+-- | Return the branch right-hand sides of all synthesized @CTF_Scoped _ True@
+-- sum payload families in the active declaration group for 'checkSynCyclesWithPayloads'.
+pendingSynthSigmaPayloads :: TcM (NameEnv [Type])
+pendingSynthSigmaPayloads = do
+  st <- getSynthTypeState
+  pure $ mkNameEnv
+    [ (tyConName stc, [coAxBranchRHS b | b <- fromBranches (coAxiomBranches ax)])
+    | stc <- nonDetNameEnvElts (sts_tycons st)
+    , Just (_, True) <- [closedFamilyScope_maybe stc]
+    , Just ax <- [closedFamilyTyConCoAxiom_maybe stc] ]
+
+-- | Lower @some (x :: A) | B@ (represented as @GHC.Sigma.Sigma A (\x -> B)@).
+-- See Note [Post-renaming lowering of lambdas, sums, and cases].
+tcSomeTypeInHsType
+  :: TcTyMode -> HsType GhcRn -> Name -> LHsType GhcRn -> SrcSpan
+  -> LocatedN Name -> LHsType GhcRn -> ExpKind -> TcM TcType
+tcSomeTypeInHsType mode rn_ty sigma_nm dom_hs lam_loc bndr body_hs exp_kind = do
+  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  unless enabled $
+    failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
+  (site, in_kc) <- classifySynthSite mode
+  has_kc_metas <- if in_kc then hasAmbientMetaKindsM else pure False
+  if in_kc && not has_kc_metas
+    then checkExpKind mode rn_ty (mkTyConApp anyTyCon [liftedTypeKind]) liftedTypeKind exp_kind
+    else do
+      sigma_tc <- tcLookupTyCon sigma_nm
+      dom_ty0  <- tc_check_lhs_type mode dom_hs liftedTypeKind >>= liftZonkM . zonkTcType
+      (wrap_syn_mb, fam_name, root_fam, next_owner) <- alloc_some_names in_kc site lam_loc
+      let hs_tvb = HsTvb noAnn () (HsBndrVar noExtField bndr)
+                     (HsBndrKind noExtField (L (l2l (getLoc bndr)) (XHsType (HsCoreTyRn dom_ty0))))
+      skol <- mkSkolemInfo (ForAllSkol (HsTyVarBndrsRn [hs_tvb]))
+      x_skol <- newSkolemTyVar skol (unLoc bndr) dom_ty0
+      let body_mode = mode { mode_sigma_root = Just (root_fam, next_owner) }
+          solve_if_tc = if in_kc then id else solveEqualities "tcSomeTypeInHsType"
+          wrap_ctxt = case site of
+            SynthInSigma{} -> id
+            _              -> addErrCtxt (TyConDeclCtxt fam_name ClosedTypeFamilyFlavour)
+          body_check = tcExtendNameTyVarEnv [(unLoc bndr, x_skol)] $
+                         tc_check_lhs_type body_mode body_hs liftedTypeKind
+      body_ty0 <- solve_if_tc (wrap_ctxt body_check)
+                    >>= liftZonkM . zonkTcType
+      dom_ty   <- liftZonkM (zonkTcType dom_ty0)
+      if in_kc
+        then checkExpKind mode rn_ty (mkTyConApp anyTyCon [liftedTypeKind]) liftedTypeKind exp_kind
+        else do
+          gbl <- getGblEnv
+          let raw_fvs = filterOut (== (x_skol :: Var)) $
+                          tyCoVarsOfTypesList [dom_ty, body_ty0]
+              cap_ids = [v | v <- raw_fvs, isId v]
+          when (any isCoVar raw_fvs
+                || not (null (findDupsEq (==) (map (nameOccName . getName) cap_ids)))
+                || (not (null cap_ids) && not (allows_runtime_some site))) $
+            failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
+          mb_hdr <- lookupDeclHeaderTyVars site
+          (subst1, invis_caps, vis_caps, cap_args0, _) <- partitionSynthCaptures (mode_under_forall mode) mb_hdr raw_fvs
+          x_nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (unLoc bndr))))
+          let rec_tenv = tcg_type_env gbl
+              res_rec  = resolveRecTcTypes rec_tenv
+              id_map   = mkVarEnv [ (orig_v, cap_ty)
+                                  | (orig_v, cap_ty) <- zip [v | v <- map snd_var raw_fvs] [] ]
+              all_cap_tvs = map fst invis_caps ++ vis_caps
+          let ordered_orig = [ v | arg <- cap_args0
+                             , Just v <- [case arg of { TyVarTy tv -> Just (tv :: Var); TermVarTy i -> Just (i :: Var); _ -> Nothing }] ]
+          (subst_c, cap_pairs, _) <- abstractSynthCaptures ordered_orig [x_skol]
+          let p_all_tvs = map fst cap_pairs
+              (p_invis_tvs, p_vis_tvs) = splitAt (length invis_caps) p_all_tvs
+              p_invis = zip p_invis_tvs (map snd invis_caps)
+              x_tv0   = mkTyVar x_nm (Subst.substTy subst_c ( replaceTypeTermIds
+                          (mkVarEnv [(ov, mkTyVarTy pv) | (pv, ov) <- cap_pairs, isId ov]) dom_ty ))
+              subst_x = Subst.extendTvSubstAndInScope subst_c x_skol (mkTyVarTy x_tv0)
+              id_env  = mkVarEnv [(ov, mkTyVarTy pv) | (pv, ov) <- cap_pairs, isId ov]
+              sub_ty  = res_rec . replaceTypeTermIds id_env . Subst.substTy subst_x
+              x_tv    = setTyVarKind x_tv0 (res_rec (tyVarKind x_tv0))
+              p_invis' = [(setTyVarKind tv (res_rec (tyVarKind tv)), sp) | (tv, sp) <- p_invis]
+              p_vis'   = [setTyVarKind tv (res_rec (tyVarKind tv)) | tv <- p_vis_tvs]
+              rhs_ty'  = sub_ty body_ty0
+              dom_sub  = sub_ty dom_ty
+              qtvs     = map fst p_invis' ++ p_vis' ++ [x_tv]
+              tcbs     = mkDependentTyConBinders p_invis' p_vis' [] [x_tv] liftedTypeKind
+              leaked   = filterOut (`elemVarSet` mkVarSet qtvs) $
+                           tyCoVarsOfTypesList (rhs_ty' : map tyVarKind qtvs)
+              _ = (subst1, id_map, all_cap_tvs)
+          unless (null leaked && all (tcIsLiftedTypeKind . typeKind . tyVarKind) qtvs) $
+            failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
+          fam_tc <- mkSynthClosedFamilyTcbs fam_name tcbs liftedTypeKind
+                      (SynthClosedEqns (Just (const (root_fam, True)))
+                        [(qtvs, mkTyVarTys qtvs, rhs_ty', lam_loc)])
+          _ <- registerSynthTyCon fam_tc
+          let cap_args = map res_rec cap_args0
+              sigma_app = mkTyConApp sigma_tc [res_rec dom_ty, mkTyConApp fam_tc cap_args]
+          res_ty <- case wrap_syn_mb of
+            Just syn_name -> do
+              let syn_tcbs  = mkDependentTyConBinders p_invis' p_vis' [] [] liftedTypeKind
+                  syn_kind  = mkTyConKindWithMatchability unmatchableDataConTy syn_tcbs liftedTypeKind
+                  syn_roles = map (const Nominal) syn_tcbs
+                  fam_vars  = mkTyVarTys (map fst p_invis' ++ p_vis')
+                  syn_rhs   = mkTyConApp sigma_tc [dom_sub, mkTyConApp fam_tc fam_vars]
+                  syn_tc    = buildSynTyCon syn_name syn_kind syn_tcbs liftedTypeKind syn_roles syn_rhs
+              _ <- registerSynthTyCon syn_tc
+              pure (mkTyConApp syn_tc cap_args)
+            Nothing -> pure sigma_app
+          case site of
+            SynthExprT2T -> pure ()
+            SynthLocalSig{} ->
+              setXOptM LangExt.UndecidableInstances $
+                checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
+            _ -> do
+              undec <- xoptM LangExt.UndecidableInstances
+              runOrDeferSynthCheck $
+                (if undec then setXOptM LangExt.UndecidableInstances else id) $
+                  checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
+          checkExpKind mode rn_ty res_ty liftedTypeKind exp_kind
+  where
+    snd_var v = v
+    allows_runtime_some SynthTopSig{}   = True
+    allows_runtime_some SynthConField{} = True
+    allows_runtime_some SynthInSigma{}  = True
+    allows_runtime_some SynthExprT2T    = True
+    allows_runtime_some (SynthLocalSig "$type-argument") = True
+    allows_runtime_some _               = False
+
+    alloc_some_names in_kc site loc = do
+      cur_mod <- tcg_mod <$> getGblEnv
+      let mk_g occ = newGlobalBinder cur_mod (mkTcOcc occ) Nothing loc
+          next_ord occ = if in_kc then pure 0 else allocSynthOrdinal occ
+      case site of
+        SynthInSigma root_fam owner_nm -> do
+          let o_occ = nameOccName owner_nm
+          idx <- next_ord o_occ
+          fn  <- mk_g ("$lambda:" ++ occNameString o_occ ++ ":" ++ show idx ++ "-sigma")
+          pure (Nothing, fn, root_fam, owner_nm)
+        SynthTopSig val_nm -> do
+          let v_occ = nameOccName val_nm
+          idx <- next_ord (mkTcOcc ("$signature-sum:" ++ occNameString v_occ))
+          let syn_str = "$signature-sum:" ++ occNameString v_occ ++ ":" ++ show idx
+          sn <- mk_g syn_str
+          fn <- mk_g ("$lambda:" ++ syn_str ++ ":0-sigma")
+          _  <- next_ord (nameOccName sn)
+          pure (Just sn, fn, fn, sn)
+        SynthConField con_nm _ -> do
+          let c_occ = nameOccName con_nm
+          idx <- next_ord (mkTcOcc ("$field-sum:" ++ occNameString c_occ))
+          let syn_str = "$field-sum:" ++ occNameString c_occ ++ ":" ++ show idx
+          sn <- mk_g syn_str
+          fn <- mk_g ("$lambda:" ++ syn_str ++ ":0-sigma")
+          _  <- next_ord (nameOccName sn)
+          pure (Just sn, fn, fn, sn)
+        SynthTySyn syn_nm -> do
+          let s_occ = nameOccName syn_nm
+          idx <- next_ord s_occ
+          fn  <- mk_g ("$lambda:" ++ occNameString s_occ ++ ":" ++ show idx ++ "-sigma")
+          pure (Nothing, fn, fn, syn_nm)
+        SynthClosedFam cf_nm -> do
+          let c_occ = nameOccName cf_nm
+          idx <- next_ord c_occ
+          fn  <- mk_g ("$lambda:" ++ occNameString c_occ ++ ":" ++ show idx ++ "-sigma")
+          pure (Nothing, fn, fn, cf_nm)
+        SynthOpenFamInst of_nm -> do
+          u_occ <- chooseUniqueOccTc (mkInstTyTcOcc ("$sum:" ++ occNameString (nameOccName of_nm)))
+          sn    <- newGlobalBinder cur_mod u_occ Nothing loc
+          fn    <- mk_g ("$lambda:" ++ occNameString u_occ ++ ":0-sigma")
+          _     <- next_ord u_occ
+          pure (Nothing, fn, fn, sn)
+        _ -> do
+          uniq <- getUniqueM
+          fn   <- mk_g ("$some$" ++ show uniq)
+          pure (Nothing, fn, fn, fn)
+
+-- | Lower a post-renaming type lambda ('HsTypeLambdaQuoteRn' or
+-- 'HsTypeLambdaCheckRn') into a synthesized closed type family (and wrapper
+-- synonym where required).
+-- See Note [Post-renaming lowering of lambdas, sums, and cases].
+tcHsTypeLambda
+  :: Maybe (Name, [Name])
+  -> TcTyMode -> HsType GhcRn -> [LocatedN Name] -> LHsType GhcRn
+  -> ExpKind -> TcM TcType
+tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
   enabled <- xoptM LangExt.ExperimentalDependentTypes
   unless enabled $ failWithTc TcRnTypeLambdaDisabled
   level <- getThLevel
-  case level of
-    Comp -> pure ()
-    _ -> failWithTc TcRnTypeLambdaContext
-  unless (isTypeLevel (mode_tyki mode) && not (null binders)) $
+  case (level, mb_pre_syn) of
+    (Comp, _)                -> pure ()
+    (Brack _ TcPending{}, Just _) -> pure ()
+    _                        -> failWithTc TcRnTypeLambdaContext
+  unless (isTypeLevel (mode_tyki mode) && not (null binders0)) $
     failWithTc TcRnTypeLambdaContext
+  (site, in_kc) <- classifySynthSite mode
+  when (disallow_lambda_site site) $ failWithTc TcRnTypeLambdaContext
+  let (all_bndrs, inner_body) = coalesce_lambdas binders0 body0
+  lam_loc <- getSrcSpanM
+  (wrap_syn_mb, fam_name, root_fam, next_owner) <- alloc_lambda_names in_kc site lam_loc
   ek0 <- expTypeToType exp_kind >>= liftZonkM . zonkTcType
-  (dom_kinds, res_kind0) <- peel_arrows binders ek0
+  skol_invis_info <- mkSkolemInfo (TyConSkol ClosedTypeFamilyFlavour fam_name)
+  (mid_invis_skols, ek_rho) <- tcSkolemiseInvisibleBndrs (getSkolemInfo skol_invis_info) ek0
+  let mid_invis_specs = extract_invis_specs (length mid_invis_skols) ek0
+  (dom_kinds0, res_kind0) <- peel_unmatchable_arrows src all_bndrs ek_rho
   let hs_tvbs =
         [ HsTvb noAnn () (HsBndrVar noExtField b)
             (HsBndrKind noExtField (L (l2l (getLoc b)) (XHsType (HsCoreTyRn dk))))
-        | (b, dk) <- zip binders dom_kinds ]
+        | (b, dk) <- zip all_bndrs dom_kinds0 ]
   skol <- mkSkolemInfo (ForAllSkol (HsTyVarBndrsRn hs_tvbs))
-  z_skols <- sequence
-    [ newSkolemTyVar skol (unLoc b) dk | (b, dk) <- zip binders dom_kinds ]
-  body_ty0 <- tcExtendNameTyVarEnv (zip (map unLoc binders) z_skols) $
-                tc_check_lhs_type mode body res_kind0
-  dom_kinds' <- mapM (liftZonkM . zonkTcType) dom_kinds
-  res_kind   <- liftZonkM (zonkTcType res_kind0)
-  body_ty    <- liftZonkM (zonkTcType body_ty0)
-  let skol_set = mkVarSet z_skols
-      raw_fvs  = filterOut (`elemVarSet` skol_set) $
-                   tyCoVarsOfTypesList (dom_kinds' ++ [res_kind, body_ty])
-  when (any isCoVar raw_fvs) $
-    failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
-  (subst1, p_pairs, _) <- abstractSynthCaptures raw_fvs (map (\v -> v :: Var) z_skols)
-  (subst2, z_tvs) <- mapAccumLM alloc_binder subst1 (zip z_skols dom_kinds')
-  let p_tvs        = map fst p_pairs
-      id_map       = mkVarEnv [(orig_v, mkTyVarTy p_tv) | (p_tv, orig_v) <- p_pairs, isId orig_v]
-      subst_all ty = replaceTypeTermIds id_map (Subst.substTy subst2 ty)
-      res_kind'    = subst_all res_kind
-      rhs_ty'      = subst_all body_ty
-      all_tvs      = p_tvs ++ z_tvs
-      all_tv_set   = mkVarSet all_tvs
-      leaked_fvs   = filterOut (`elemVarSet` all_tv_set) $
-                       tyCoVarsOfTypesList (res_kind' : rhs_ty' : map tyVarKind all_tvs)
-  unless (null leaked_fvs
-          && tcIsLiftedTypeKind (typeKind res_kind')
-          && all (tcIsLiftedTypeKind . typeKind . tyVarKind) all_tvs) $
-    failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
-  cur_mod <- tcg_mod <$> getGblEnv
-  let bndr_tag = case binders of { b : _ -> show (getUnique (unLoc b)); [] -> "empty" }
-  base_name <- newGlobalBinder cur_mod (mkTcOcc ("$some$" ++ bndr_tag)) Nothing noSrcSpan
-  mb_base <- lookupPendingSynthTyCon base_name
-  fam_tc <- case mb_base of
-    Just existing | tyConArity existing == length all_tvs -> pure existing
-    _ -> do
-      fam_name <- case mb_base of
-        Nothing -> pure base_name
-        Just _  -> do
-          uniq <- getUniqueM
-          newGlobalBinder cur_mod (mkTcOcc ("$some$" ++ show uniq)) Nothing noSrcSpan
-      tc <- mkSynthClosedFamily fam_name p_tvs z_tvs res_kind'
-              (SynthClosedEqns (Just (, True)) [(all_tvs, mkTyVarTys all_tvs, rhs_ty', noSrcSpan)])
-      registerSynthTyCon tc
-  let cap_args = [if isTyVar v then mkTyVarTy v else TermVarTy v | (_, v) <- p_pairs]
-      app_ty   = mkTyConApp fam_tc cap_args
-  checkExpKind mode src app_ty (typeKind app_ty) exp_kind
+  z_skols <- sequence [newSkolemTyVar skol (unLoc b) dk | (b, dk) <- zip all_bndrs dom_kinds0]
+  let body_mode = mode { mode_lambda_root = Just (root_fam, next_owner) }
+      solve_if_tc :: TcM a -> TcM a
+      solve_if_tc = if in_kc then id else solveEqualities "tcHsTypeLambda"
+      extend_lam :: TcM a -> TcM a
+      extend_lam = tcExtendTyVarEnv mid_invis_skols
+                 . tcExtendNameTyVarEnv (zip (map unLoc all_bndrs) z_skols)
+  case direct_lambda_case all_bndrs inner_body of
+    Just (scrut_col, scrut_nm, case_rows) -> do
+      checked_rows <- addErrCtxt (TyConDeclCtxt fam_name ClosedTypeFamilyFlavour) $
+        extend_lam $
+          check_lambda_case_rows solve_if_tc body_mode fam_name
+            mid_invis_skols z_skols dom_kinds0 scrut_col scrut_nm res_kind0 case_rows
+      dom_kinds <- mapM (liftZonkM . zonkTcType) dom_kinds0
+      res_kind  <- liftZonkM (zonkTcType res_kind0)
+      mid_skols <- mapM (liftZonkM . zonkTyCoVarKind) mid_invis_skols
+      if in_kc
+        then do
+          let full_k = mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- mid_skols]
+                         (foldr mkVisFunTyManyU res_kind dom_kinds)
+          checkExpKind mode src (mkTyConApp anyTyCon [full_k]) full_k exp_kind
+        else build_case_lambda gbl_site site wrap_syn_mb fam_name root_fam lam_loc
+               (zip mid_skols mid_invis_specs) z_skols dom_kinds res_kind scrut_col checked_rows
+    Nothing -> do
+      track_proofs <- xoptM LangExt.ExperimentalDependentTypes
+      ax_probe <- newImplicitBinder fam_name mkInstTyCoOcc
+      (body_ty0, proof_deps) <- solve_if_tc $ addErrCtxt (TyConDeclCtxt fam_name ClosedTypeFamilyFlavour) $
+        extend_lam $
+          if track_proofs
+            then do
+              r <- withSourceProofSignature (Just ax_probe) (tc_check_lhs_type body_mode inner_body res_kind0)
+              ds <- takeSourceProofRulesFor ax_probe
+              pure (r, ds)
+            else (, []) <$> tc_check_lhs_type body_mode inner_body res_kind0
+      dom_kinds <- mapM (liftZonkM . zonkTcType) dom_kinds0
+      res_kind  <- liftZonkM (zonkTcType res_kind0)
+      body_ty   <- liftZonkM (zonkTcType body_ty0)
+      mid_skols <- mapM (liftZonkM . zonkTyCoVarKind) mid_invis_skols
+      if in_kc
+        then do
+          let full_k = mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- mid_skols]
+                         (foldr mkVisFunTyManyU res_kind dom_kinds)
+          checkExpKind mode src (mkTyConApp anyTyCon [full_k]) full_k exp_kind
+        else build_beta_lambda site wrap_syn_mb fam_name root_fam lam_loc
+               (zip mid_skols mid_invis_specs) z_skols dom_kinds res_kind body_ty proof_deps
   where
-    peel_arrows [] k = pure ([], k)
-    peel_arrows (_ : bs) k
-      | Just (_ma, arg, res) <- tcSplitFunTy_maybe k
-      , isManyTy (scaledMult arg)
-      = do { (ds, rk) <- peel_arrows bs res; pure (scaledThing arg : ds, rk) }
-      | otherwise = failWithTc TcRnTypeLambdaContext
+    gbl_site = ()
 
-    alloc_binder subst (skol_tv, dk) = do
-      nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName skol_tv))))
-      let tv = mkTyVar nm (Subst.substTy subst dk)
-      pure (Subst.extendTvSubstAndInScope subst skol_tv (mkTyVarTy tv), tv)
+    disallow_lambda_site (SynthLocalSig _) = mode_under_forall mode
+    disallow_lambda_site _                 = False
+
+    coalesce_lambdas bs (L _ (HsParTy _ inner)) = coalesce_lambdas bs inner
+    coalesce_lambdas bs (L _ (XHsType (HsTypeLambdaQuoteRn more inner)))
+      | let combined = bs ++ more
+      , null (findDupsEq (==) (map (nameOccName . unLoc) combined))
+      = coalesce_lambdas combined inner
+    coalesce_lambdas bs body = (bs, body)
+
+    extract_invis_specs 0 _ = []
+    extract_invis_specs n k
+      | Just (_, Named (Bndr _ vis), rest) <- tcSplitPiTy_maybe k
+      = let sp = case vis of { Inferred -> InferredSpec; _ -> SpecifiedSpec }
+        in sp : extract_invis_specs (n - 1) rest
+      | otherwise = replicate n SpecifiedSpec
+
+    peel_unmatchable_arrows _ [] k = pure ([], k)
+    peel_unmatchable_arrows hs_src (_ : bs) k = do
+      k' <- liftZonkM (zonkTcType k)
+      case tcSplitFunTy_maybe k' of
+        Just (ma, arg, res) | isManyTy (scaledMult arg) -> do
+          let orig = TypeEqOrigin { uo_actual = unmatchableDataConTy
+                                  , uo_expected = ma
+                                  , uo_thing = Just (HsTypeRnThing hs_src)
+                                  , uo_invisible = Nothing }
+          _ <- unifyTypeAndEmit KindLevel orig unmatchableDataConTy ma
+          (ds, rk) <- peel_unmatchable_arrows hs_src bs res
+          pure (scaledThing arg : ds, rk)
+        _ -> do
+          co <- matchExpectedFunKind (HsTypeRnThing hs_src)
+                  (Just (pure unmatchableDataConTy)) (1 + length bs) k'
+          k_exp <- liftZonkM (zonkTcType (pprPanic_or_rhs co k'))
+          case tcSplitFunTy_maybe k_exp of
+            Just (_, arg, res) -> do
+              (ds, rk) <- peel_unmatchable_arrows hs_src bs res
+              pure (scaledThing arg : ds, rk)
+            Nothing -> failWithTc TcRnTypeLambdaContext
+
+    pprPanic_or_rhs co orig_k = pFst (coercionKind co) `seq` pSnd (coercionKind co)
+      where _ = orig_k
+
+    direct_lambda_case bs body
+      | L _ (XHsType (HsTypeCaseRn scrut rows)) <- ignoreParens body
+      , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ s_nm))) <- ignoreParens scrut
+      , Just col <- elemIndex s_nm (map unLoc bs)
+      = Just (col, s_nm, rows)
+      | otherwise = Nothing
+
+    alloc_lambda_names in_kc site loc = do
+      cur_mod <- tcg_mod <$> getGblEnv
+      let mk_g occ = newGlobalBinder cur_mod (mkTcOcc occ) Nothing loc
+          next_ord occ = if in_kc then pure 0 else allocSynthOrdinal occ
+      case mb_pre_syn of
+        Just (pre_syn, _) -> do
+          let s_str = occNameString (nameOccName pre_syn)
+          fn <- mk_g ("$lambda:" ++ s_str ++ ":0")
+          _  <- next_ord (nameOccName pre_syn)
+          pure (Just pre_syn, fn, fn, pre_syn)
+        Nothing -> case site of
+          SynthInLambda root_fam owner_nm -> do
+            let o_occ = nameOccName owner_nm
+            idx <- next_ord o_occ
+            fn  <- mk_g ("$lambda:" ++ occNameString o_occ ++ ":" ++ show idx)
+            pure (Nothing, fn, root_fam, owner_nm)
+          SynthInSigma _ owner_nm -> do
+            let o_occ = nameOccName owner_nm
+            idx <- next_ord o_occ
+            fn  <- mk_g ("$lambda:" ++ occNameString o_occ ++ ":" ++ show idx)
+            pure (Nothing, fn, fn, owner_nm)
+          SynthTopSig val_nm -> do
+            let v_occ = nameOccName val_nm
+            idx <- next_ord (mkTcOcc ("$signature-lambda:" ++ occNameString v_occ))
+            let s_str = "$signature-lambda:" ++ occNameString v_occ ++ ":" ++ show idx
+            sn <- mk_g s_str
+            fn <- mk_g ("$lambda:" ++ s_str ++ ":0")
+            _  <- next_ord (nameOccName sn)
+            pure (Just sn, fn, fn, sn)
+          SynthLocalSig label -> do
+            idx <- next_ord (mkTcOcc ("$signature-lambda:" ++ label))
+            let s_str = "$signature-lambda:" ++ label ++ ":local-" ++ show idx
+            sn <- mk_g s_str
+            fn <- mk_g ("$lambda:" ++ s_str ++ ":0")
+            _  <- next_ord (nameOccName sn)
+            pure (Just sn, fn, fn, sn)
+          SynthConField con_nm _ -> do
+            let c_occ = nameOccName con_nm
+            idx <- next_ord (mkTcOcc ("$field-lambda:" ++ occNameString c_occ))
+            let s_str = "$field-lambda:" ++ occNameString c_occ ++ ":" ++ show idx
+            sn <- mk_g s_str
+            fn <- mk_g ("$lambda:" ++ s_str ++ ":0")
+            _  <- next_ord (nameOccName sn)
+            pure (Just sn, fn, fn, sn)
+          SynthTySyn syn_nm -> do
+            let s_occ = nameOccName syn_nm
+            idx <- next_ord s_occ
+            fn  <- mk_g ("$lambda:" ++ occNameString s_occ ++ ":" ++ show idx)
+            pure (Nothing, fn, fn, syn_nm)
+          SynthClosedFam cf_nm -> do
+            let c_occ = nameOccName cf_nm
+            idx <- next_ord c_occ
+            fn  <- mk_g ("$lambda:" ++ occNameString c_occ ++ ":" ++ show idx)
+            pure (Nothing, fn, fn, cf_nm)
+          SynthOpenFamInst of_nm -> do
+            u_occ <- chooseUniqueOccTc (mkInstTyTcOcc ("$callback:" ++ occNameString (nameOccName of_nm)))
+            fn    <- newGlobalBinder cur_mod u_occ Nothing loc
+            pure (Nothing, fn, fn, fn)
+          SynthExprT2T -> do
+            uniq <- getUniqueM
+            fn   <- mk_g ("$lambda$" ++ show uniq)
+            pure (Nothing, fn, fn, fn)
+
+    prepare_lambda_captures site mid_invis z_skols dom_kinds res_kind extra_tys = do
+      gbl <- getGblEnv
+      lcl <- getLclTypeEnv
+      let local_skols = mkVarSet (map fst mid_invis ++ z_skols)
+          raw_fvs0    = filterOut (`elemVarSet` local_skols) $
+                          tyCoVarsOfTypesList (dom_kinds ++ [res_kind] ++ map (tyVarKind . fst) mid_invis ++ extra_tys)
+          cap_ids     = [v | v <- raw_fvs0, isId v]
+          allows_ids  = case site of
+            SynthTopSig{}    -> True
+            SynthConField{}  -> True
+            SynthInLambda{}  -> True
+            SynthInSigma{}   -> True
+            SynthExprT2T     -> True
+            SynthLocalSig "$type-argument" -> True
+            _                -> False
+      when (any isCoVar raw_fvs0
+            || (not (null cap_ids) && not allows_ids)
+            || any (\v -> isTyVar v && isForAllTy (tyVarKind v)) raw_fvs0) $
+        failWithTc TcRnTypeLambdaContext
+      case mb_pre_syn of
+        Just (_, pre_cap_nms) -> do
+          let vis_tvs0 = sort_bind [ tv | nm <- pre_cap_nms, Just (ATyVar _ tv) <- [lookupNameEnv lcl nm] ]
+              vis_set  = mkVarSet vis_tvs0
+              all_fvs  = scopedSort (close_k (dedup_v (map (\v -> v :: Var) vis_tvs0 ++ raw_fvs0)))
+              invis_vs = [v | v <- all_fvs, not (v `elemVarSet` vis_set)]
+              ordered  = invis_vs ++ map (\v -> v :: Var) vis_tvs0
+          (subst_c, cap_pairs, _) <- abstractSynthCaptures ordered (map (\v -> v :: Var) (map fst mid_invis ++ z_skols))
+          let (p_invis_ps, p_vis_ps) = splitAt (length invis_vs) cap_pairs
+              p_invis = [(tv, InferredSpec) | (tv, _) <- p_invis_ps]
+              p_vis   = map fst p_vis_ps
+              cap_args = [if isTyVar ov then mkTyVarTy ov else TermVarTy ov | (_, ov) <- cap_pairs]
+              id_env   = mkVarEnv [(ov, mkTyVarTy pv) | (pv, ov) <- cap_pairs, isId ov]
+          pure (tcg_type_env gbl, subst_c, id_env, p_invis, p_vis, cap_args)
+        Nothing -> do
+          mb_hdr <- lookupDeclHeaderTyVars site
+          (_, invis_specs, vis_dummy, cap_args0, _) <- partitionSynthCaptures (mode_under_forall mode) mb_hdr raw_fvs0
+          let ordered_orig = [ v | arg <- cap_args0
+                             , Just v <- [case arg of { TyVarTy tv -> Just (tv :: Var); TermVarTy i -> Just (i :: Var); _ -> Nothing }] ]
+              _ = vis_dummy
+          (subst_c, cap_pairs, _) <- abstractSynthCaptures ordered_orig (map (\v -> v :: Var) (map fst mid_invis ++ z_skols))
+          let (p_invis_ps, p_vis_ps) = splitAt (length invis_specs) cap_pairs
+              p_invis = zip (map fst p_invis_ps) (map snd invis_specs)
+              p_vis   = map fst p_vis_ps
+              id_env  = mkVarEnv [(ov, mkTyVarTy pv) | (pv, ov) <- cap_pairs, isId ov]
+          pure (tcg_type_env gbl, subst_c, id_env, p_invis, p_vis, cap_args0)
+      where
+        sort_bind = maybe [] (NE.toList . NE.sortBy cmp_b) . NE.nonEmpty
+        cmp_b v1 v2 = case (srcSpanStart (nameSrcSpan (getName v1)), srcSpanStart (nameSrcSpan (getName v2))) of
+          (RealSrcLoc l1 _, RealSrcLoc l2 _) -> compare l1 l2
+          _ -> EQ
+        dedup_v = go emptyVarSet
+          where
+            go _ [] = []
+            go seen (v : vs)
+              | v `elemVarSet` seen = go seen vs
+              | otherwise           = v : go (extendVarSet seen v) vs
+        close_k vs =
+          let k_fvs = tyCoVarsOfTypesList (map varType vs)
+              more  = filterOut (`elemVarSet` mkVarSet vs) k_fvs
+          in if null more then vs else close_k (more ++ vs)
+
+    alloc_skol_binders subst0 id_env rec_tenv skols =
+      mapAccumLM (\s tv -> do
+        nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv))))
+        let ki  = resolveRecTcTypes rec_tenv (replaceTypeTermIds id_env (Subst.substTy s (tyVarKind tv)))
+            tv' = mkTyVar nm ki
+        pure (Subst.extendTvSubstAndInScope s tv (mkTyVarTy tv'), tv')) subst0 skols
+
+    build_beta_lambda site wrap_syn_mb fam_name root_fam lam_loc mid_invis z_skols dom_kinds res_kind body_ty proof_deps = do
+      (rec_tenv, subst_c, id_env, p_invis0, p_vis0, cap_args0) <-
+        prepare_lambda_captures site mid_invis z_skols dom_kinds res_kind [body_ty]
+      let res_rec = resolveRecTcTypes rec_tenv
+          p_invis = [(setTyVarKind tv (res_rec (tyVarKind tv)), sp) | (tv, sp) <- p_invis0]
+          p_vis   = [setTyVarKind tv (res_rec (tyVarKind tv)) | tv <- p_vis0]
+      (subst_m, mid_tvs) <- alloc_skol_binders subst_c id_env rec_tenv (map fst mid_invis)
+      (subst_z, z_tvs)   <- alloc_skol_binders subst_m id_env rec_tenv
+                              [setTyVarKind sk dk | (sk, dk) <- zip z_skols dom_kinds]
+      let mid_out  = zip mid_tvs (map snd mid_invis)
+          sub_raw  = replaceTypeTermIds id_env . Subst.substTy subst_z
+          sub_rec  = res_rec . sub_raw
+          res_k'   = sub_rec res_kind
+          rhs_raw  = sub_raw body_ty
+          rhs_ty'  = res_rec rhs_raw
+          qtvs     = map fst p_invis ++ p_vis ++ mid_tvs ++ z_tvs
+          tcbs     = mkDependentTyConBinders p_invis p_vis mid_out z_tvs res_k'
+          leaked   = filterOut (`elemVarSet` mkVarSet qtvs) $
+                       tyCoVarsOfTypesList (res_k' : rhs_ty' : map tyVarKind qtvs)
+      unless (null leaked) $ failWithTc TcRnTypeLambdaContext
+      ax_name <- newImplicitBinder fam_name mkInstTyCoOcc
+      let branch = mkCoAxBranch qtvs [] [] (mkTyVarTys qtvs) rhs_ty' (map (const Nominal) qtvs) lam_loc
+          proof_rules = [(0, proof_deps) | not (null proof_deps)]
+          fam_kind = mkTyConKindWithMatchability unmatchableDataConTy tcbs res_k'
+          fam_tc = mkFamilyTyCon fam_name fam_kind tcbs 0 res_k' Nothing
+                     (ClosedTypeFamilyTyCon (CTF_Scoped root_fam False axiom)) Nothing NotInjective
+          axiom  = (mkBranchedCoAxiom Nominal ax_name fam_tc [branch])
+                     { co_ax_source_proof_rules = proof_rules }
+      _ <- registerSynthTyCon fam_tc
+      case site of
+        SynthExprT2T -> pure ()
+        SynthLocalSig{} ->
+          setXOptM LangExt.UndecidableInstances $
+            checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
+        _ -> do
+          undec <- xoptM LangExt.UndecidableInstances
+          runOrDeferSynthCheck $
+            (if undec then setXOptM LangExt.UndecidableInstances else id) $
+              checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
+      finish_lambda_app site wrap_syn_mb fam_tc p_invis p_vis (map res_rec cap_args0)
+
+    check_lambda_case_rows solve_row body_mode fam_name mid_skols0 z_skols0 dom_kinds0 scrut_col scrut_nm res_kind0 rows = do
+      raw_fields <- xoptM LangExt.ExperimentalDependentTypes
+      pat_mode   <- mkHoleMode TypeLevel (HM_FamPat raw_fields)
+      let pat_mode' = pat_mode { mode_indices = mode_indices body_mode }
+          init_in_scope = mkInScopeSet (tyCoVarsOfTypes (res_kind0 : dom_kinds0 ++ map tyVarKind (mid_skols0 ++ z_skols0)))
+      raw_rows <- forM rows $ \(pat_nms, pat_hs, rhs_hs) -> do
+        let row_loc = combineSrcSpans (getLocA pat_hs) (getLocA rhs_hs)
+        setSrcSpan row_loc $ solve_row $ do
+          (mid_subst, row_mid_tvs) <- mapAccumLM
+            (\s tv -> do
+              mtv <- newPatTyVar (getName tv) (Subst.substTy s (tyVarKind tv))
+              pure (Subst.extendTvSubstAndInScope s tv (mkTyVarTy mtv), mtv))
+            (Subst.mkEmptySubst init_in_scope)
+            mid_skols0
+          let row_z_skols = [ setTyVarKind sk (Subst.substTy mid_subst dk0)
+                            | (sk, dk0) <- zip z_skols0 dom_kinds0 ]
+              scrut_k   = Subst.substTy mid_subst (dom_kinds0 !! scrut_col)
+              row_res_k = Subst.substTy mid_subst res_kind0
+              row_m_env = zip (map getName mid_skols0) row_mid_tvs
+              row_z_env = [(getName sk, rsk) | (sk, rsk) <- zip z_skols0 row_z_skols, getName sk /= scrut_nm]
+          pat_tvs <- mapM (\nm -> newMetaKindVar >>= newPatTyVar nm) pat_nms
+          tcExtendTyVarEnv row_mid_tvs $
+            tcExtendNameTyVarEnv (row_m_env ++ row_z_env ++ zip pat_nms pat_tvs) $ do
+              pat_ty0 <- tc_check_lhs_type pat_mode' pat_hs scrut_k
+              let bind_alias = if scrut_nm `notElem` pat_nms
+                    then updLclCtxt (tcExtendLocalTypeEnv [(scrut_nm, ATcTypeLet scrut_nm pat_ty0 scrut_k)])
+                    else id
+              ax_probe <- newImplicitBinder fam_name mkInstTyCoOcc
+              rhs_ty0 <- withSourceProofSignature (Just ax_probe) $
+                bind_alias $ tc_check_lhs_type body_mode rhs_hs row_res_k
+              deps <- takeSourceProofRulesFor ax_probe
+              pure (row_loc, pat_hs, pat_tvs, row_mid_tvs, row_z_skols, pat_ty0, rhs_ty0, deps)
+      forM raw_rows $ \(row_loc, pat_hs, pat_tvs, row_mid_tvs, row_z_skols, pat_ty0, rhs_ty0, deps) -> do
+        row_mid_tys <- mapM (liftZonkM . zonkTcType . mkTyVarTy) row_mid_tvs
+        row_z_tys   <- mapM (liftZonkM . zonkTyCoVarKind) row_z_skols
+        pat_ty      <- liftZonkM (zonkTcType pat_ty0)
+        rhs_ty      <- liftZonkM (zonkTcType rhs_ty0)
+        pat_tvs'    <- mapM (liftZonkM . zonkTyCoVarKind) pat_tvs
+        pure (row_loc, pat_hs, pat_tvs', row_mid_tys, row_z_tys, pat_ty, rhs_ty, deps)
+
+    build_case_lambda _ site wrap_syn_mb fam_name root_fam _ mid_invis z_skols dom_kinds res_kind scrut_col checked_rows = do
+      let sig_fvs = tyCoVarsOfTypes (res_kind : dom_kinds ++ map (tyVarKind . fst) mid_invis)
+          lhs_pat_tvs = mkVarSet
+            [ tv | (_, _, ptvs, mtys, _, p, _, _) <- checked_rows
+            , tv <- ptvs ++ [ v | v <- tyCoVarsOfTypesList (mtys ++ [p])
+                                , isTcTyVar v, isMetaTyVar v, not (v `elemVarSet` sig_fvs) ] ]
+          row_fvs = filterOut (`elemVarSet` lhs_pat_tvs) $
+                      tyCoVarsOfTypesList [t | (_, _, _, mtys, _, p, r, _) <- checked_rows, t <- mtys ++ [p, r]]
+          row_fv_tys = [if isTyVar v then mkTyVarTy v else TermVarTy v | v <- row_fvs]
+      (rec_tenv, subst_c, id_env, p_invis0, p_vis0, cap_args0) <-
+        prepare_lambda_captures site mid_invis z_skols dom_kinds res_kind row_fv_tys
+      let res_rec = resolveRecTcTypes rec_tenv
+          p_invis = [(setTyVarKind tv (res_rec (tyVarKind tv)), sp) | (tv, sp) <- p_invis0]
+          p_vis   = [setTyVarKind tv (res_rec (tyVarKind tv)) | tv <- p_vis0]
+      (subst_m, mid_tvs) <- alloc_skol_binders subst_c id_env rec_tenv (map fst mid_invis)
+      (subst_z, z_tvs)   <- alloc_skol_binders subst_m id_env rec_tenv
+                              [setTyVarKind sk dk | (sk, dk) <- zip z_skols dom_kinds]
+      let mid_out   = zip mid_tvs (map snd mid_invis)
+          sub_raw   = replaceTypeTermIds id_env . Subst.substTy subst_z
+          sub_rec   = res_rec . sub_raw
+          res_k'    = sub_rec res_kind
+          tcbs      = mkDependentTyConBinders p_invis p_vis mid_out z_tvs res_k'
+          fam_kind  = mkTyConKindWithMatchability unmatchableDataConTy tcbs res_k'
+          abs_col   = length p_invis + length p_vis + length mid_tvs + scrut_col
+          cap_vs    = map fst p_invis ++ p_vis
+          pre_z_vs  = take scrut_col z_tvs
+          suf_z_vs  = drop (scrut_col + 1) z_tvs
+          orig_bound_set = mkVarSet ([tv | TyVarTy tv <- cap_args0] ++ map fst mid_invis ++ z_skols)
+      built_rows <- forM checked_rows $ \(rloc, pat_hs, _, row_mid_tys0, row_z_tys0, pat_ty0, rhs_ty0, deps) -> do
+        let pat_fvs = scopedSort $
+                        filterOut (\v -> isId v || v `elemVarSet` orig_bound_set) $
+                          tyCoVarsOfTypesList (row_mid_tys0 ++ [pat_ty0, rhs_ty0])
+        (subst_p, _) <- alloc_skol_binders subst_z id_env rec_tenv pat_fvs
+        let sub_row  = res_rec . replaceTypeTermIds id_env . Subst.substTy subst_p
+            mid_tys' = map sub_row row_mid_tys0
+            pat_ty'  = sub_row pat_ty0
+            rhs_ty'  = sub_row rhs_ty0
+            pre_tys  = [ mkTyVarTy (setTyVarKind tv (sub_row (tyVarKind sk)))
+                       | (tv, sk) <- zip pre_z_vs (take scrut_col row_z_tys0) ]
+            suf_tys  = [ mkTyVarTy (setTyVarKind tv (sub_row (tyVarKind sk)))
+                       | (tv, sk) <- zip suf_z_vs (drop (scrut_col + 1) row_z_tys0) ]
+            lhs_tys  = mkTyVarTys cap_vs ++ mid_tys' ++ pre_tys ++ [pat_ty'] ++ suf_tys
+            qtvs     = scopedSort (tyCoVarsOfTypesList (rhs_ty' : lhs_tys))
+            vi       = VI { vi_loc = rloc
+                          , vi_qtvs = qtvs
+                          , vi_non_user_tvs = emptyVarSet
+                          , vi_pats = lhs_tys
+                          , vi_case_pattern = Just (fam_name, abs_col, sourceCasePatternRn pat_hs, pat_ty')
+                          , vi_rhs = rhs_ty' }
+        pure (mkCoAxBranch qtvs [] [] lhs_tys rhs_ty' (map (const Nominal) qtvs) rloc, vi, deps)
+      fam_tc <- finalizeCaseFamily fam_name fam_kind tcbs res_k' (Just (root_fam, False)) built_rows
+      _ <- registerSynthTyCon fam_tc
+      finish_lambda_app site wrap_syn_mb fam_tc p_invis p_vis (map res_rec cap_args0)
+
+    finish_lambda_app site wrap_syn_mb fam_tc p_invis p_vis cap_args = do
+      let app_ty = mkTyConApp fam_tc cap_args
+          has_term_cap = any (\case TermVarTy{} -> True; _ -> False) cap_args
+          eff_wrap_syn = case (site, wrap_syn_mb) of
+            (SynthLocalSig "$type-argument", _) | has_term_cap -> Nothing
+            _ -> wrap_syn_mb
+      res_ty <- case eff_wrap_syn of
+        Just syn_name -> do
+          let syn_res_k = typeKind (mkTyConApp fam_tc (mkTyVarTys (map fst p_invis ++ p_vis)))
+              syn_tcbs  = mkDependentTyConBinders p_invis p_vis [] [] syn_res_k
+              syn_kind  = mkTyConKindWithMatchability unmatchableDataConTy syn_tcbs syn_res_k
+              syn_rhs   = mkTyConApp fam_tc (mkTyVarTys (map fst p_invis ++ p_vis))
+              syn_tc    = buildSynTyCon syn_name syn_kind syn_tcbs syn_res_k
+                            (map (const Nominal) syn_tcbs) syn_rhs
+          _ <- registerSynthTyCon syn_tc
+          pure (mkTyConApp syn_tc cap_args)
+        Nothing -> pure app_ty
+      checkExpKind mode src res_ty (typeKind res_ty) exp_kind
+
+-- | Lower a post-renaming type case ('HsTypeCaseRn') outside closed type
+-- family equations into a synthesized @$case:@ closed type family.
+-- See Note [Post-renaming lowering of lambdas, sums, and cases].
+tcHsTypeCase
+  :: TcTyMode -> HsType GhcRn -> LHsType GhcRn
+  -> [([Name], LHsType GhcRn, LHsType GhcRn)]
+  -> ExpKind -> TcM TcType
+tcHsTypeCase mode src scrut_hs rows exp_kind = do
+  enabled <- xoptM LangExt.ExperimentalDependentTypes
+  unless enabled $ failWithTc TcRnTypeCaseDisabled
+  level <- getThLevel
+  case level of
+    Comp -> pure ()
+    _    -> failWithTc TcRnTypeCaseContext
+  unless (isTypeLevel (mode_tyki mode)) $ failWithTc TcRnTypeCaseContext
+  (site, in_kc) <- classifySynthSite mode
+  unless (allowed_case_site site) $ failWithTc TcRnTypeCaseContext
+  when (is_retained_con_field site) $
+    unless (valid_retained_field_scrut scrut_hs) $ failWithTc TcRnTypeCaseContext
+  (let_fam_pairs, extend_let_fams) <- if in_kc then pure ([], id) else abstract_let_fams
+  let let_fam_env = mkVarEnv let_fam_pairs
+  extend_let_fams $ do
+    (scrut_ty0, scrut_k0) <- tc_infer_lhs_type mode scrut_hs
+    scrut_ty <- liftZonkM (zonkTcType scrut_ty0)
+    scrut_k  <- liftZonkM (zonkTcType scrut_k0)
+    -- Intra-signature sharing for top-level retained signatures:
+    mb_shared <- if isEmptyVarEnv let_fam_env then lookup_shared_sig_case site scrut_ty rows else pure Nothing
+    case mb_shared of
+      Just (shared_syn, shared_args) ->
+        let app = mkTyConApp shared_syn shared_args
+        in checkExpKind mode src app (typeKind app) exp_kind
+      Nothing -> do
+        case_loc <- getSrcSpanM
+        (wrap_syn_mb, owner_for_nodes, fam_name, is_scoped_sig) <- alloc_case_names in_kc site case_loc
+        res_k0 <- expTypeToType exp_kind >>= liftZonkM . zonkTcType
+        (pat_scrut_k0, fam_abs_pairs0) <- abstract_scrut_fam_apps fam_name scrut_k
+        raw_fields <- xoptM LangExt.ExperimentalDependentTypes
+        pat_mode   <- mkHoleMode TypeLevel (HM_FamPat raw_fields)
+        let pat_mode' = pat_mode { mode_indices = mode_indices mode }
+            solve_if_tc = if in_kc then id else solveEqualities "tcHsTypeCase"
+            bare_scrut_nm = case unLoc (ignoreParens scrut_hs) of
+              HsTyVar _ NotPromoted (L _ (WithUserRdr _ n)) -> Just n
+              _ -> Nothing
+        raw_rows <- solve_if_tc $ addErrCtxt (TyConDeclCtxt fam_name ClosedTypeFamilyFlavour) $
+          forM rows $ \(pat_nms, pat_hs, rhs_hs) -> do
+            let rloc = combineSrcSpans (getLocA pat_hs) (getLocA rhs_hs)
+            setSrcSpan rloc $ do
+              pat_tvs <- mapM (\nm -> newMetaKindVar >>= newPatTyVar nm) pat_nms
+              tcExtendNameTyVarEnv (zip pat_nms pat_tvs) $ do
+                pat_ty0 <- tc_check_lhs_type pat_mode' pat_hs pat_scrut_k0
+                let bind_alias = case bare_scrut_nm of
+                      Just sn | sn `notElem` pat_nms ->
+                        updLclCtxt (tcExtendLocalTypeEnv [(sn, ATcTypeLet sn pat_ty0 pat_scrut_k0)])
+                      _ -> id
+                ax_probe <- newImplicitBinder fam_name mkInstTyCoOcc
+                rhs_ty0  <- withSourceProofSignature (Just ax_probe) $
+                              bind_alias $ tc_check_lhs_type mode rhs_hs res_k0
+                deps     <- takeSourceProofRulesFor ax_probe
+                pure (rloc, pat_hs, pat_tvs, pat_ty0, rhs_ty0, deps)
+        checked_rows <- forM raw_rows $ \(rloc, pat_hs, pat_tvs, pat_ty0, rhs_ty0, deps) -> do
+          pat_ty   <- liftZonkM (zonkTcType pat_ty0)
+          rhs_ty   <- liftZonkM (zonkTcType rhs_ty0)
+          pat_tvs' <- mapM (liftZonkM . zonkTyCoVarKind) pat_tvs
+          pure (rloc, pat_hs, pat_tvs', pat_ty, rhs_ty, deps)
+        res_k       <- liftZonkM (zonkTcType res_k0)
+        scrut_ty'   <- liftZonkM (zonkTcType scrut_ty)
+        pat_scrut_k <- liftZonkM (zonkTcType pat_scrut_k0)
+        fam_abs_pairs <- forM fam_abs_pairs0 $ \(atv, fapp) -> do
+          atv'  <- liftZonkM (zonkTyCoVarKind atv)
+          fapp' <- liftZonkM (zonkTcType fapp)
+          pure (atv', fapp')
+        if in_kc
+          then checkExpKind mode src (mkTyConApp anyTyCon [res_k]) res_k exp_kind
+          else do
+            gbl <- getGblEnv
+            let rec_tenv   = tcg_type_env gbl
+                res_rec    = resolveRecTcTypes rec_tenv
+                row_tys    = concat [[p, r] | (_, _, _, p, r, _) <- checked_rows]
+                abs_tv_set = mkVarSet (map fst fam_abs_pairs)
+                sig_fvs    = tyCoVarsOfTypes (scrut_ty' : pat_scrut_k : res_k : map snd fam_abs_pairs)
+                -- Free variables of the case (excluding branch-local pat_tvs and abstracted kind family skolems):
+                pat_tv_set = mkVarSet [ tv | (_, _, ptvs, p, _, _) <- checked_rows
+                                      , tv <- ptvs ++ [ v | v <- tyCoVarsOfTypesList [p]
+                                                          , isTcTyVar v, isMetaTyVar v, not (v `elemVarSet` sig_fvs) ] ]
+                raw_fvs = filterOut (\v -> v `elemVarSet` pat_tv_set || v `elemVarSet` abs_tv_set) $
+                            tyCoVarsOfTypesList (pat_scrut_k : res_k : map snd fam_abs_pairs ++ row_tys)
+            when (any isCoVar raw_fvs) $ failWithTc TcRnTypeCaseContext
+            mb_hdr <- lookupDeclHeaderTyVars site
+            let mb_hdr' = case mb_hdr of
+                  Just (invis_h, vis_h) | not (isEmptyVarEnv let_fam_env) ->
+                    let let_tvs = [tv | tv <- raw_fvs, isTyVar tv, tv `elemVarEnv` let_fam_env]
+                    in Just (invis_h, vis_h ++ let_tvs)
+                  _ -> mb_hdr
+            (_, invis_specs, _, cap_args0, _) <- partitionSynthCaptures (mode_under_forall mode) mb_hdr' raw_fvs
+            let ordered_orig = [ v | arg <- cap_args0
+                               , Just v <- [case arg of { TyVarTy tv -> Just (tv :: Var); TermVarTy i -> Just (i :: Var); _ -> Nothing }] ]
+            when (mode_under_forall mode) $
+              check_shadowed_field_kinds site wrap_syn_mb ordered_orig
+            (subst_c0, cap_pairs, _) <- abstractSynthCaptures ordered_orig (map fst fam_abs_pairs)
+            let id_env  = mkVarEnv [(ov, mkTyVarTy pv) | (pv, ov) <- cap_pairs, isId ov]
+            (subst_c, abs_tvs) <- mapAccumLM (\s (atv, _) -> do
+              nm <- newSysName (mkTyVarOcc "$fam_idx")
+              let ki  = res_rec (replaceTypeTermIds id_env (Subst.substTy s (tyVarKind atv)))
+                  tv' = mkTyVar nm ki
+              pure (Subst.extendTvSubstAndInScope s atv (mkTyVarTy tv'), tv')) subst_c0 fam_abs_pairs
+            let (p_invis_ps, p_vis_ps) = splitAt (length invis_specs) cap_pairs
+                p_invis   = [(setTyVarKind tv (res_rec (tyVarKind tv)), sp) | ((tv, _), (_, sp)) <- zip p_invis_ps invis_specs]
+                fam_invis = p_invis ++ [(tv, InferredSpec) | tv <- abs_tvs]
+                p_vis     = [setTyVarKind tv (res_rec (tyVarKind tv)) | (tv, _) <- p_vis_ps]
+                sub_raw   = replaceTypeTermIds id_env . Subst.substTy subst_c
+                sub_rec   = res_rec . sub_raw
+                scrut_k_sub = sub_rec pat_scrut_k
+                res_k_sub   = sub_rec res_k
+            scrut_nm <- newSysName (mkTyVarOcc "$scrutinee")
+            let scrut_tv = mkTyVar scrut_nm scrut_k_sub
+                tcbs     = mkDependentTyConBinders fam_invis (p_vis ++ [scrut_tv]) [] [] res_k_sub
+                fam_kind = mkTyConKindWithMatchability unmatchableDataConTy tcbs res_k_sub
+                abs_col  = length fam_invis + length p_vis
+                cap_tvs        = map fst fam_invis ++ p_vis
+                orig_bound_set = mkVarSet ([tv | TyVarTy tv <- cap_args0] ++ map fst fam_abs_pairs)
+            built_rows <- forM checked_rows $ \(rloc, pat_hs, _, pat_ty0, rhs_ty0, deps) -> do
+              let pat_vs = scopedSort $
+                             filterOut (\v -> isId v || v `elemVarSet` orig_bound_set) $
+                               tyCoVarsOfTypesList [pat_ty0, rhs_ty0]
+              (subst_p, _) <- mapAccumLM (\s tv -> do
+                nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv))))
+                let ki  = res_rec (replaceTypeTermIds id_env (Subst.substTy s (tyVarKind tv)))
+                    tv' = mkTyVar nm ki
+                pure (Subst.extendTvSubstAndInScope s tv (mkTyVarTy tv'), tv')) subst_c pat_vs
+              let sub_row = res_rec . replaceTypeTermIds id_env . Subst.substTy subst_p
+                  pat_ty' = sub_row pat_ty0
+                  rhs_ty' = sub_row rhs_ty0
+                  lhs_tys = mkTyVarTys cap_tvs ++ [pat_ty']
+                  qtvs    = scopedSort (tyCoVarsOfTypesList (rhs_ty' : lhs_tys))
+                  vi      = VI { vi_loc = rloc
+                               , vi_qtvs = qtvs
+                               , vi_non_user_tvs = emptyVarSet
+                               , vi_pats = lhs_tys
+                               , vi_case_pattern = Just (owner_for_nodes, abs_col, sourceCasePatternRn pat_hs, pat_ty')
+                               , vi_rhs = rhs_ty' }
+              pure (mkCoAxBranch qtvs [] [] lhs_tys rhs_ty' (map (const Nominal) qtvs) rloc, vi, deps)
+            let mb_scope
+                  | null built_rows = Nothing
+                  | is_scoped_sig   = Just (owner_for_nodes, False)
+                  | SynthInSigma root_fam _ <- site  = Just (root_fam, False)
+                  | SynthInLambda root_fam _ <- site = Just (root_fam, False)
+                  | otherwise = Nothing
+            fam_tc <- finalizeCaseFamily fam_name fam_kind tcbs res_k_sub mb_scope built_rows
+            _ <- registerSynthTyCon fam_tc
+            let exp_let_ty ty
+                  | Just tv <- getTyVar_maybe ty
+                  , Just lt <- lookupVarEnv let_fam_env tv = lt
+                  | otherwise = ty
+                cap_args_resolved = [res_rec (exp_let_ty a) | a <- cap_args0]
+                (invis_cap_args, vis_cap_args) = splitAt (length p_invis) cap_args_resolved
+                abs_call_args = [ res_rec (Subst.substTyWith (map fst let_fam_pairs) (map snd let_fam_pairs) fapp)
+                                | (_, fapp) <- fam_abs_pairs ]
+                scrut_arg = res_rec (exp_let_ty scrut_ty')
+                fam_app   = mkTyConApp fam_tc (invis_cap_args ++ abs_call_args ++ vis_cap_args ++ [scrut_arg])
+            res_ty <- case wrap_syn_mb of
+              Just syn_name -> do
+                let syn_abs_args = [sub_rec fapp | (_, fapp) <- fam_abs_pairs]
+                    syn_tcbs = mkDependentTyConBinders p_invis (p_vis ++ [scrut_tv]) [] [] res_k_sub
+                    syn_kind = mkTyConKindWithMatchability unmatchableDataConTy syn_tcbs res_k_sub
+                    syn_rhs  = mkTyConApp fam_tc (mkTyVarTys (map fst p_invis) ++ syn_abs_args ++ mkTyVarTys (p_vis ++ [scrut_tv]))
+                    syn_tc   = buildSynTyCon syn_name syn_kind syn_tcbs res_k_sub
+                                 (map (const Nominal) syn_tcbs) syn_rhs
+                _ <- registerSynthTyCon syn_tc
+                when (null let_fam_pairs) $
+                  record_shared_sig_case site scrut_ty rows syn_tc (cap_args_resolved ++ [scrut_arg])
+                pure (mkTyConApp syn_tc (cap_args_resolved ++ [scrut_arg]))
+              Nothing -> pure fam_app
+            checkExpKind mode src res_ty res_k exp_kind
+  where
+    abstract_let_fams = do
+      lcl <- getLclTypeEnv
+      let let_entries =
+            [ (nm, let_ty, let_ki)
+            | ATcTypeLet nm let_ty let_ki <- nonDetNameEnvElts lcl
+            , not (isTyFamFree (expandTypeSynonyms let_ty)) ]
+      if null let_entries
+        then pure ([], id)
+        else do
+          skol_info <- mkSkolemInfo (ForAllSkol (HsTyVarBndrsRn ([] :: [HsTyVarBndr () GhcRn])))
+          triples <- forM let_entries $ \(nm, let_ty, let_ki) -> do
+            ki' <- liftZonkM (zonkTcType let_ki)
+            ty' <- liftZonkM (zonkTcType let_ty)
+            tv  <- newSkolemTyVar skol_info nm ki'
+            pure (nm, tv, ty')
+          let pairs     = [(tv, ty') | (_, tv, ty') <- triples]
+              ext_binds = [(nm, ATyVar nm tv) | (nm, tv, _) <- triples]
+          pure (pairs, updLclCtxt (tcExtendLocalTypeEnv ext_binds))
+    abstract_scrut_fam_apps owner_nm ki0
+      | isTyFamFree ki0 = pure (ki0, [])
+      | otherwise = do
+          skol_info <- mkSkolemInfo (TyConSkol ClosedTypeFamilyFlavour owner_nm)
+          let go ty
+                | Just ty' <- coreView ty = go ty'
+              go fam_ty@(TyConApp tc args)
+                | isTypeFamilyTyCon tc = do
+                    nm <- newSysName (mkTyVarOcc "$fam_idx")
+                    tv <- newSkolemTyVar skol_info nm (typeKind fam_ty)
+                    pure (mkTyVarTy tv, [(tv, fam_ty)])
+                | otherwise = do
+                    (args', pairs) <- mapAndUnzipM go args
+                    pure (TyConApp tc args', concat pairs)
+              go (AppTy f a) = do
+                (f', p1) <- go f
+                (a', p2) <- go a
+                pure (AppTy f' a', p1 ++ p2)
+              go ty = pure (ty, [])
+          go ki0
+    allowed_case_site SynthTopSig{}   = True
+    allowed_case_site SynthConField{} = True
+    allowed_case_site SynthTySyn{}    = True
+    allowed_case_site SynthInLambda{} = True
+    allowed_case_site SynthInSigma{}  = True
+    allowed_case_site _               = False
+
+    is_retained_con_field SynthConField{} = not (isEmptyNameEnv (mode_indices mode))
+    is_retained_con_field _               = False
+
+    valid_retained_field_scrut hs =
+      let fvs = free_names hs
+      in any (`elemNameEnv` mode_indices mode) fvs
+         || all isExternalName fvs
+      where
+        free_names :: Data a => a -> [Name]
+        free_names thing
+          | isAstLeafAnnotation thing = case cast thing :: Maybe Name of
+              Just n  -> [n]
+              Nothing -> []
+          | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+          = free_names inner
+          | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = []
+          | otherwise = concat (gmapQ free_names thing)
+
+    check_shadowed_field_kinds (SynthConField con_nm _) (Just syn_name) ordered_orig = do
+      lcl <- getLclTypeEnv
+      let lcl_tvs = [(nm, tv) | ATyVar nm tv <- nonDetNameEnvElts lcl]
+          is_shadowed v = isTyVar v && any (\(nm, tv') -> tv' /= v && nameOccName nm == nameOccName (getName v)) lcl_tvs
+          shadowed = filter is_shadowed ordered_orig
+      unless (null shadowed) $ addErrCtxt (TyConDeclCtxt syn_name TypeSynonymFlavour) $ do
+        cur_mod <- tcg_mod <$> getGblEnv
+        let mk_fk tag i v = do
+              let occ = mkTyVarOcc ("$field-kind:" ++ occNameString (nameOccName con_nm) ++ ":" ++ tag ++ show (i :: Int))
+              fnm <- newGlobalBinder cur_mod occ Nothing (getSrcSpan con_nm)
+              det <- newMetaDetails TauTv
+              pure (v, mkTyVarTy (mkTcTyVar fnm (varType v) det))
+        prs1 <- zipWithM (mk_fk "a") [0..] shadowed
+        prs2 <- zipWithM (mk_fk "b") [0..] shadowed
+        let s1 = zipTvSubst [tv | (tv, _) <- prs1] (map snd prs1)
+            s2 = zipTvSubst [tv | (tv, _) <- prs2] (map snd prs2)
+        forM_ [v | v <- ordered_orig, not (v `elem` shadowed)] $ \v -> do
+          let k0 = varType v
+              k1 = Subst.substTy s1 k0
+              k2 = Subst.substTy s2 k0
+          when (not (k1 `tcEqType` k0)) $ do
+            let orig = TypeEqOrigin
+                  { uo_actual    = k1
+                  , uo_expected  = k2
+                  , uo_thing     = Just (HsTypeRnThing (HsTyVar noAnn NotPromoted (noLocA (noUserRdr (getName v)))))
+                  , uo_invisible = Nothing }
+            _ <- unifyTypeAndEmit KindLevel orig k1 k2
+            _ <- unifyType Nothing k1 k0
+            pure ()
+    check_shadowed_field_kinds _ _ _ = pure ()
+
+    lookup_shared_sig_case (SynthTopSig val_nm) scrut_ty rws = do
+      st <- getSynthTypeState
+      lcl <- getLclTypeEnv
+      let active_tvs = scopedSort [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
+          entries    = fromMaybe [] (lookupNameEnv (sts_sig_cases st) val_nm)
+          same_rows r1 r2 = length r1 == length r2 && and (zipWith same_row r1 r2)
+          same_row (ns1, p1, b1) (ns2, p2, b2) =
+            length ns1 == length ns2 && showSDocUnsafe (ppr p1) == showSDocUnsafe (ppr p2)
+            && showSDocUnsafe (ppr b1) == showSDocUnsafe (ppr b2)
+      case [ (syn_tc, scrut_ty)
+           | (uf, tvs, s_ty, old_rws, syn_tc) <- entries
+           , uf == mode_under_forall mode
+           , tvs == active_tvs
+           , s_ty `tcEqType` scrut_ty
+           , same_rows old_rws rws
+           , tyConArity syn_tc == 1 ] of
+        (syn_tc, s_arg) : _ -> pure (Just (syn_tc, [s_arg]))
+        [] -> pure Nothing
+    lookup_shared_sig_case _ _ _ = pure Nothing
+
+    record_shared_sig_case (SynthTopSig val_nm) scrut_ty rws syn_tc [_] = do
+      cur_mod <- tcg_mod <$> getGblEnv
+      lcl <- getLclTypeEnv
+      let active_tvs = scopedSort [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
+          entry = (mode_under_forall mode, active_tvs, scrut_ty, rws, syn_tc)
+      modifySynthTypeState cur_mod
+        (\st ->
+           let prev = fromMaybe [] (lookupNameEnv (sts_sig_cases st) val_nm)
+           in (st { sts_sig_cases = extendNameEnv (sts_sig_cases st) val_nm (entry : prev) }, ()))
+        ()
+    record_shared_sig_case _ _ _ _ _ = pure ()
+
+    alloc_case_names in_kc site loc = do
+      cur_mod <- tcg_mod <$> getGblEnv
+      let mk_g occ = newGlobalBinder cur_mod (mkTcOcc occ) Nothing loc
+          next_ord occ = if in_kc then pure 0 else allocSynthOrdinal occ
+      case site of
+        SynthTopSig val_nm -> do
+          let v_occ = nameOccName val_nm
+          idx <- next_ord (mkTcOcc ("$signature-case:" ++ occNameString v_occ))
+          let s_str = "$signature-case:" ++ occNameString v_occ ++ ":" ++ show idx
+          sn <- mk_g s_str
+          fn <- mk_g ("$case:" ++ s_str ++ ":0")
+          pure (Just sn, sn, fn, True)
+        SynthConField con_nm _ -> do
+          let c_occ = nameOccName con_nm
+          idx <- next_ord (mkTcOcc ("$field-case:" ++ occNameString c_occ))
+          let s_str = "$field-case:" ++ occNameString c_occ ++ ":" ++ show idx
+          sn <- mk_g s_str
+          fn <- mk_g ("$case:" ++ s_str ++ ":0")
+          pure (Just sn, sn, fn, False)
+        SynthTySyn syn_nm -> do
+          let s_occ = nameOccName syn_nm
+              sfx   = if mode_under_forall mode then "-forall" else ""
+          idx <- next_ord (mkTcOcc ("$case:" ++ occNameString s_occ ++ sfx))
+          fn  <- mk_g ("$case:" ++ occNameString s_occ ++ ":" ++ show idx ++ sfx)
+          pure (Nothing, syn_nm, fn, False)
+        SynthInLambda _ owner_nm -> do
+          let o_occ = nameOccName owner_nm
+          idx <- next_ord (mkTcOcc ("$case:" ++ occNameString o_occ))
+          fn  <- mk_g ("$case:" ++ occNameString o_occ ++ ":" ++ show idx)
+          pure (Nothing, owner_nm, fn, False)
+        SynthInSigma _ owner_nm -> do
+          let o_occ = nameOccName owner_nm
+          idx <- next_ord (mkTcOcc ("$case:" ++ occNameString o_occ))
+          fn  <- mk_g ("$case:" ++ occNameString o_occ ++ ":" ++ show idx)
+          pure (Nothing, owner_nm, fn, False)
+        _ -> failWithTc TcRnTypeCaseContext
+
+sourceCasePatternRn :: LHsType GhcRn -> TypeCasePattern
+sourceCasePatternRn original = go [] original
+  where
+    go args (L _ (HsParTy _ pat))      = go args pat
+    go args (L _ (HsAppTy _ con fld))  = go (fld : args) con
+    go args (L _ (HsTyVar _ _ (L _ (WithUserRdr _ nm))))
+      | not (isTvOcc (nameOccName nm)) =
+          CasePatternConstructor (getLocA original) nm (map sourceCasePatternRn args)
+    go _ _ = CasePatternField
+
+data CheckedSynthPattern
+  = SynthCaseField
+  | SynthCaseConstructor [Int] SrcSpan TyCon [CheckedSynthPattern]
+
+finalizeCaseFamily
+  :: Name -> Kind -> [TyConBinder] -> Kind -> Maybe (Name, Bool)
+  -> [(CoAxBranch, TyFamEqnValidityInfo, [SourceProofRule])]
+  -> TcM TyCon
+finalizeCaseFamily fam_name fam_kind tcbs res_kind mb_scope built_rows = do
+  ax_name <- newImplicitBinder fam_name mkInstTyCoOcc
+  let branches   = [b | (b, _, _) <- built_rows]
+      infos      = [v | (_, v, _) <- built_rows]
+      proof_rules = [(i, ds) | (i, (_, _, ds)) <- zip [0..] built_rows, not (null ds)]
+      mk_ctf Nothing            Nothing   = CTF Nothing
+      mk_ctf Nothing            (Just ax) = CTF (Just ax)
+      mk_ctf (Just (own, is_s)) (Just ax) = CTF_Scoped own is_s ax
+      mk_ctf (Just _)           Nothing   = CTF Nothing
+      raw_ax     = (mkBranchedCoAxiom Nominal ax_name fam_tc branches)
+                     { co_ax_source_proof_rules = proof_rules }
+      raw_mb_ax  = if null branches then Nothing else Just raw_ax
+      fam_tc     = mkFamilyTyCon fam_name fam_kind tcbs 0 res_kind Nothing
+                     (ClosedTypeFamilyTyCon (mk_ctf mb_scope raw_mb_ax)) Nothing NotInjective
+  ordered <- synthNeedsOrderedCase fam_tc infos
+  let flav = TyConInstFlavour ClosedTypeFamilyFlavour False
+  if not ordered
+    then do
+      runOrDeferSynthCheck $
+        setErrCtxt [] $
+          addErrCtxt (TyConInstCtxt fam_name flav) $
+            addErrCtxt (ClosedFamEqnCtxt fam_tc) $ do
+              mapM_ (checkTyFamEqnValidityInfo fam_tc) infos
+              forM_ raw_mb_ax (checkValidCoAxiom emptyNameEnv)
+      pure fam_tc
+    else do
+      in_decl <- isInDeclKnotM
+      let run_ord_val =
+            setErrCtxt [] $
+              addErrCtxt (TyConInstCtxt fam_name flav) $
+                addErrCtxt (ClosedFamEqnCtxt fam_tc) $
+                  mapM_ (checkTyFamEqnValidityInfo fam_tc) infos
+      if in_decl then deferSynthCheck run_ord_val else checkNoErrs run_ord_val
+      (ord_ax0, node_tcs) <- compileOrderedSynthCase fam_tc infos
+      let ord_ax = ord_ax0 { co_ax_source_proof_rules = proof_rules }
+          ord_tc = mkFamilyTyCon fam_name fam_kind tcbs 0 res_kind Nothing
+                     (ClosedTypeFamilyTyCon (mk_ctf mb_scope (Just ord_ax))) Nothing NotInjective
+      mapM_ registerSynthTyCon node_tcs
+      pure ord_tc
+
+synthNeedsOrderedCase :: TyCon -> [TyFamEqnValidityInfo] -> TcM Bool
+synthNeedsOrderedCase root infos
+  | any has_ord infos = pure True
+  | _ : _ : _ <- infos = or <$> mapM has_expanded infos
+  | otherwise = pure False
+  where
+    has_ord VI { vi_case_pattern = Just (_, _, CasePatternField, _) } = True
+    has_ord VI { vi_case_pattern = Just (_, _, pat, _) } = nestedTypeCasePattern pat
+    has_ord _ = False
+
+    has_expanded vi@VI { vi_case_pattern = Just (_, _, pat, ty) }
+      | may_expand ty = do
+          checkNoErrs (checkTyFamEqnValidityInfo root vi)
+          checked <- synthCheckedPattern [] pat ty
+          pure $ case checked of
+            SynthCaseConstructor _ _ _ fields -> any is_ctor fields
+            SynthCaseField -> False
+    has_expanded _ = pure False
+
+    may_expand (CastTy ty _) = may_expand ty
+    may_expand ty = maybe False (isTypeSynonymTyCon . fst) (splitTyConAppNoView_maybe ty)
+
+    is_ctor SynthCaseConstructor{} = True
+    is_ctor SynthCaseField         = False
+
+compileOrderedSynthCase :: TyCon -> [TyFamEqnValidityInfo] -> TcM (CoAxiom Branched, [TyCon])
+compileOrderedSynthCase root infos = do
+  let vars = binderVars (tyConBinders root)
+      args = mkTyVarTys vars
+      res  = tyConResKind root
+      loc  = case infos of { VI { vi_loc = sp } : _ -> sp; _ -> getSrcSpan root }
+      unsupported :: TcM a
+      unsupported = setSrcSpan loc $
+        failWithTc (mkTcRnUnknownMessage (mkPlainError []
+          (text "This nested type case needs an unsupported constructor telescope.")))
+  checked_rows <- forM infos $ \case
+    vi@VI { vi_case_pattern = Just (owner, i, pat, ty) } -> do
+      checked <- synthCheckedPattern [] pat ty
+      pure ((owner, i), (vi, [checked]))
+    _ -> unsupported
+  ((owner, column), rows) <- case unzip checked_rows of
+    (first_oc : rest_oc, rws) | all (== first_oc) rest_oc -> pure (first_oc, rws)
+    _ -> unsupported
+  scrutinee <- case drop column args of { s : _ -> pure s; [] -> unsupported }
+  next <- newTcRef (0 :: Int)
+  let fresh kind = (`mkTyVar` kind) <$> newSysName (mkTyVarOcc "field")
+      bindersFor = mkNamedTyConBinders (Invisible InferredSpec)
+      true_ty    = mkTyConTy promotedTrueDataCon
+      false_ty   = mkTyConTy promotedFalseDataCon
+      branch lhs rhs =
+        let ts = scopedSort (tyCoVarsOfTypesList lhs)
+        in mkCoAxBranch ts [] [] lhs rhs (replicate (length ts) Nominal) loc
+
+      makeFamily bs result branches = do
+        i <- readTcRef next
+        writeTcRef next (i + 1)
+        let suffix = zEncodeString (occNameString (nameOccName (tyConName root))) ++ "." ++ show i
+        name <- newImplicitBinder owner $ \occ ->
+          mkTcOcc ("$case-node:" ++ occNameString occ ++ ":" ++ suffix)
+        let kind = mkTyConKindWithMatchability unmatchableDataConTy bs result
+        ax_name <- newImplicitBinder name mkInstTyCoOcc
+        let fam = mkFamilyTyCon name kind bs 0 result Nothing
+                    (ClosedTypeFamilyTyCon closed) Nothing NotInjective
+            closed
+              | Just (sc_owner, _) <- closedFamilyScope_maybe root = CTF_Scoped sc_owner False ax
+              | otherwise = CTF (Just ax)
+            ax = mkBranchedCoAxiom Nominal ax_name fam branches
+        pure fam
+
+      makeChild sourceArgs slots result liveRows = do
+        let ts = scopedSort (tyCoVarsOfTypesList (result : sourceArgs ++ slots))
+        unless (all isTyVar ts) unsupported
+        (branches, helpers) <- build sourceArgs ts slots result liveRows
+        fam <- makeFamily (bindersFor ts) result branches
+        pure (mkTyConApp fam (mkTyVarTys ts), fam : helpers)
+
+      build sourceArgs variables slots result
+        liveRows@((VI { vi_loc = row_loc, vi_pats = row_pats, vi_rhs = row_rhs }, first_pats) : _) =
+        case [(path, (fld, sp, con)) | (fld, SynthCaseConstructor path sp con _) <- zip [0..] first_pats] of
+          [] -> case tcMatchTyKis row_pats sourceArgs of
+            Just subst
+              | let rhs = Subst.substTyUnchecked subst row_rhs
+              , typeKind rhs `eqType` result ->
+                  pure ([branch (mkTyVarTys variables) rhs], [])
+            _ -> unsupported
+          d0 : d_rest -> do
+            let (_, (fld, sp, con)) = minimumBy (\(p, _) (q, _) -> compare p q) (d0 :| d_rest)
+            case drop fld slots of
+              slot : _ | Just scrut <- getTyVar_maybe slot ->
+                if varType scrut `eqType` liftedTypeKind
+                  then classifyColumn sourceArgs variables slots result liveRows row_loc sp fld scrut con
+                  else closedColumn sourceArgs variables slots result liveRows row_loc sp fld scrut con
+              _ -> unsupported
+        where
+          specialize fld con (row, pats) = case splitAt fld pats of
+            (pfx, SynthCaseField : sfx) ->
+              Just (row, pfx ++ replicate arity SynthCaseField ++ sfx)
+            (pfx, SynthCaseConstructor _ _ expected fields : sfx)
+              | expected == con, length fields == arity ->
+                  Just (row, pfx ++ fields ++ sfx)
+            _ -> Nothing
+            where arity = count isVisibleTyConBinder (tyConBinders con)
+
+          closedColumn sourceArgs' variables' slots' result' liveRows' row_loc' sp fld scrut con = do
+            (parent, _) <- maybe unsupported pure (tcSplitTyConApp_maybe (varType scrut))
+            cs <- maybe unsupported pure (tyConDataCons_maybe parent)
+            case isPromotedDataCon_maybe con of
+              Just dc
+                | isVanillaDataCon dc, null (dataConRepArgBinders dc)
+                , any (not . isFamFreeTy . dataConOrigResTy) cs ->
+                    classifyColumn sourceArgs' variables' slots' result' liveRows' row_loc' sp fld scrut con
+              _ -> do
+                let promotable dc = let (_, _, _, th, _, _) = dataConFullSig dc in null th
+                results <- forM (filter promotable cs) $ \dc -> do
+                  let promoted = promoteDataCon dc
+                      selected = mapMaybe (specialize fld promoted) liveRows'
+                  if null selected then pure Nothing else do
+                    unless (null (dataConRepArgBinders dc)) unsupported
+                    onConstructor sourceArgs' variables' slots' result' row_loc' fld scrut promoted selected
+                let branches = catMaybes results
+                if null branches then unsupported else
+                  pure ( [branch lhs rhs | (_, lhs, rhs, _) <- branches]
+                       , concat [hs | (_, _, _, hs) <- branches] )
+
+          classifyColumn sourceArgs' variables' slots' result' liveRows' row_loc' sp fld scrut con = do
+            unless (isGenerativeTyCon con Nominal && not (isTypeFamilyTyCon con)) $
+              setSrcSpan sp $ failWithTc (TcRnNestedTypeCasePattern (mkTyVarTy scrut))
+            let matchRows = mapMaybe (specialize fld con) liveRows'
+                missRow (_, pats) = case drop fld pats of
+                  SynthCaseConstructor _ _ expected _ : _ -> expected /= con
+                  _ -> True
+                missRows = filter missRow liveRows'
+                v_args   = mkTyVarTys variables'
+                kind     = varType scrut
+                kindVars = scopedSort (tyCoVarsOfTypesList [kind])
+                testArgs a = mkTyVarTys kindVars ++ [a]
+            unless (all isTyVar kindVars) unsupported
+            matched <- onConstructor sourceArgs' variables' slots' result' row_loc' fld scrut con matchRows
+            (pat_ty, lhs, matchedRhs, matchedHelpers) <- maybe unsupported pure matched
+            unless (typeKind pat_ty `eqType` kind) unsupported
+            testArg  <- fresh kind
+            classify <- makeFamily (bindersFor kindVars ++ [mkAnonTyConBinder testArg]) boolTy
+              [branch (testArgs pat_ty) true_ty, branch (testArgs (mkTyVarTy testArg)) false_ty]
+            (missBranches, missHelpers) <- if null missRows then pure ([], []) else do
+              (missRhs, hs) <- makeChild sourceArgs' slots' result' missRows
+              pure ([branch (false_ty : v_args) missRhs], hs)
+            selector <- fresh boolTy
+            decision <- makeFamily (mkAnonTyConBinder selector : bindersFor variables') result'
+              (branch (true_ty : lhs) matchedRhs : missBranches)
+            pure ( [branch v_args (mkTyConApp decision (mkTyConApp classify (testArgs (mkTyVarTy scrut)) : v_args))]
+                 , classify : decision : matchedHelpers ++ missHelpers )
+      build _ _ _ _ _ = unsupported
+
+      onConstructor sourceArgs' variables' slots' result' row_loc' fld scrut con selected = do
+        let bndrs = tyConBinders con
+        binders <- map snd <$> foldM (freshBinder fresh) [] bndrs
+        let instantiated = Subst.substTyWith (binderVars bndrs) (mkTyVarTys binders)
+            con_kind     = instantiated (tyConResKind con)
+            scrut_kind   = varType scrut
+        refinement <- case tcUnifyTy con_kind scrut_kind of
+          Just refine -> pure (Just (refine, Nothing))
+          Nothing
+            | typeListsAreApart [con_kind] [scrut_kind] -> pure Nothing
+            | otherwise -> do
+                (red_ref, apart) <- synthCaseKindRefinement con_kind scrut_kind
+                case red_ref of
+                  Just (refine, co) -> pure (Just (refine, Just co))
+                  Nothing
+                    | apart -> pure Nothing
+                    | otherwise -> setSrcSpan row_loc' $
+                        failWithTc (TcRnTypeCaseIndexApartness scrut_kind)
+        case refinement of
+          Nothing -> pure Nothing
+          Just (refine, kind_co) -> do
+            (before, after) <- case splitAt fld slots' of
+              (bf, _ : af) -> pure (bf, af)
+              _            -> unsupported
+            let refineTy = Subst.substTyUnchecked refine
+                extras   = result' : sourceArgs' ++ slots' ++ mkTyVarTys binders
+                liveVars = scopedSort (tyCoVarsOfTypesList (map refineTy extras))
+                renameVar s v
+                  | v == scrut = pure s
+                  | otherwise =
+                      let nk = Subst.substTyUnchecked s (refineTy (varType v))
+                      in if nk `eqType` varType v then pure s
+                         else do { v' <- fresh nk; pure (Subst.extendTvSubstAndInScope s v (mkTyVarTy v')) }
+                initial = Subst.mkEmptySubst (mkInScopeSet (mkVarSet liveVars))
+            renaming <- foldM renameVar initial liveVars
+            let retag   = Subst.substTyUnchecked renaming . refineTy
+                con_pat = mkTyConApp con (map (retag . mkTyVarTy) binders)
+                pat     = case kind_co of
+                  Nothing -> con_pat
+                  Just co -> mkCastTy con_pat (substCo renaming (substCo refine co))
+                replace = Subst.substTyWith [scrut] [pat] . retag
+                fields  = [replace (mkTyVarTy v) | (b, v) <- zip bndrs binders, isVisibleTyConBinder b]
+                src_a   = map replace sourceArgs'
+                c_slots = map replace before ++ fields ++ map replace after
+                lhs     = map (replace . mkTyVarTy) variables'
+            (rhs, helpers) <- makeChild src_a c_slots (replace result') selected
+            pure (Just (pat, lhs, rhs, helpers))
+
+  (branches, helpers) <- build args vars [scrutinee] res rows
+  ax_name <- newImplicitBinder (tyConName root) mkInstTyCoOcc
+  pure (mkBranchedCoAxiom Nominal ax_name root branches, helpers)
+  where
+    freshBinder fresh previous (Bndr var _) = do
+      let s = Subst.substTyWith (map fst previous) (mkTyVarTys (map snd previous))
+      fld <- fresh (s (varType var))
+      pure (previous ++ [(var, fld)])
+
+synthCaseKindRefinement :: Kind -> Kind -> TcM (Maybe (Subst.Subst, CoercionN), Bool)
+synthCaseKindRefinement actual expected
+  | Just (tc, as)  <- tcSplitTyConApp_maybe actual
+  , Just (tc', bs) <- tcSplitTyConApp_maybe expected
+  , tc == tc', isGenerativeTyCon tc Nominal, as `equalLength` bs
+  = do env  <- getGblEnv
+       st   <- getSynthTypeState
+       fams <- tcGetFamInstEnvs
+       let index_step a b
+             | not (a `eqType` b)
+             , Just (family, args) <- tcSplitTyConApp_maybe a
+             , let name = tyConName family
+             , not (nameIsLocalOrFrom (tcg_mod env) name)
+               || name `elemNameEnv` tcg_type_env env
+               || name `elemNameEnv` sts_tycons st
+             , Just _ <- closedFamilyTyConCoAxiom_maybe family
+             , Just redn <- reduceTyFamApp_maybe fams Nominal family args
+             = redn
+             | otherwise = Reduction (mkNomReflCo a) a
+           binders = binderVars (tyConBinders tc)
+           check_indices prior actual_args expected_args =
+             let steps = zipWith index_step actual_args expected_args
+                 redns
+                   | binders `equalLength` steps, all isTyVar binders
+                   = snd (mapAccumL transport (emptyLiftingContext emptyInScopeSet) (zip binders steps))
+                   | otherwise = steps
+                 reduced = map reductionReducedType redns
+                 refinement = do
+                   guard (kinded_args (tyConKind tc) reduced)
+                   tcUnifyTy (mkTyConApp tc reduced) (mkTyConApp tc expected_args)
+             in case refinement of
+               Just refine ->
+                 let co       = mkTyConAppCo Nominal tc (map reductionCoercion redns)
+                     complete = maybe refine (Subst.composeTCvSubst refine) prior
+                     scoped   = Subst.extendSubstInScopeSetFromSource complete (tyCoVarsOfCo co)
+                 in (Just (scoped, co), False)
+               Nothing -> (Nothing, or (zipWith index_apart reduced expected_args))
+
+           transport lc (binder, Reduction co arg) =
+             let kind_co = liftCoSubst Nominal lc (varType binder)
+                 arg_co  = co `mkTransCo` mkGReflRightMCo Nominal arg (MCo kind_co)
+                 lc'     = extendLiftingContextAndInScope lc binder arg_co
+             in (lc', Reduction arg_co (mkCastTy arg kind_co))
+           index_apart a b = typeKind a `eqType` typeKind b && typesAreApart a b
+           kinded_args _ [] = True
+           kinded_args k (arg : rest)
+             | Just (_, bndr, _) <- splitPiTy_maybe k
+             , typeKind arg `eqType` piTyBinderType bndr
+             = kinded_args (piResultTy k arg) rest
+             | otherwise = False
+           structural_pair (a, b) = isFamFreeTy a && isFamFreeTy b && typeKind a `eqType` typeKind b
+       pure $ case check_indices Nothing as bs of
+         (Nothing, False)
+           | let (lhs, rhs) = unzip (filter structural_pair (zip as bs))
+           , Just prior <- tcUnifyTys alwaysBindTv lhs rhs
+           , not (Subst.isEmptySubst prior)
+           -> check_indices (Just prior) (Subst.substTys prior as) (Subst.substTys prior bs)
+         result -> result
+  | otherwise = pure (Nothing, False)
+
+synthCheckedPattern :: [Int] -> TypeCasePattern -> Type -> TcM CheckedSynthPattern
+synthCheckedPattern _ CasePatternField _ = pure SynthCaseField
+synthCheckedPattern path pat (CastTy ty _) = synthCheckedPattern path pat ty
+synthCheckedPattern path (CasePatternConstructor sp _ fields) ty =
+  setSrcSpan sp $ case (splitTyConAppNoView_maybe ty, split_pat ty) of
+    (Just (written, original), Just (resolved, canonical))
+      | let old = vis_args written original
+            new = vis_args resolved canonical
+      , length fields == length old
+      , isGenerativeTyCon resolved Nominal
+      , not (isTypeFamilyTyCon resolved) -> do
+          children <- if written == resolved
+            then sequence [synthCheckedPattern (path ++ [i]) fld arg
+                          | (i, fld, arg) <- zip3 [0..] fields old]
+            else synonym_fields written original resolved new
+          pure (SynthCaseConstructor path sp resolved children)
+    (_, Nothing) -> failWithTc (TcRnTypeCasePattern (Just ty))
+    _            -> failWithTc (TcRnNestedTypeCasePattern ty)
+  where
+    split_pat = tcSplitTyConApp_maybe . typeCasePatternView
+    vis_args tc as = [a | (b, a) <- zip (tyConBinders tc) as, isVisibleTyConBinder b]
+    unsupported :: TcM a
+    unsupported = failWithTc (TcRnNestedTypeCasePattern ty)
+    is_test CasePatternField         = False
+    is_test CasePatternConstructor{} = True
+    find_marker marked sh = getTyVar_maybe (typeCasePatternView sh) >>= (`lookup` marked)
+
+    synonym_fields written original resolved new = do
+      markers <- forM (vis_args written original) $ \arg ->
+        (`mkTyVar` typeKind arg) <$> newSysName (mkTyVarOcc "case_argument")
+      let marker_args [] as = map snd as
+          marker_args _  [] = []
+          marker_args pending ((bndr, a) : as)
+            | isVisibleTyConBinder bndr, m : more <- pending =
+                mkTyVarTy m : marker_args more as
+            | otherwise = a : marker_args pending as
+          expanded = mkTyConApp written (marker_args markers (zip (tyConBinders written) original))
+          marked   = zip markers (zip [0..] fields)
+      case split_pat expanded of
+        Just (head_tc, as)
+          | head_tc == resolved
+          , let shape = vis_args head_tc as
+          , length shape == length new ->
+              case traverse (find_marker marked) shape of
+                Just aligned
+                  | let used = [i | (i, fld) <- aligned, is_test fld]
+                  , length used == length (nub used) ->
+                      sequence [synthCheckedPattern (path ++ [i]) fld actual
+                               | ((i, fld), actual) <- zip aligned new]
+                _ -> do
+                  aligned <- sequence [expand_field marked (path ++ [i]) sh actual
+                                      | (i, sh, actual) <- zip3 [0..] shape new]
+                  let used = concatMap snd aligned
+                  unless (used == sort (nub used)) unsupported
+                  pure (map fst aligned)
+        _ -> unsupported
+
+    expand_field marked pos sh actual
+      | Just (i, fld) <- find_marker marked sh = do
+          checked <- synthCheckedPattern pos fld actual
+          pure (checked, [i | is_test fld])
+      | Just (con, sh_args) <- split_pat sh
+      , Just (act_con, act_args) <- split_pat actual
+      , act_con == con, isGenerativeTyCon con Nominal, not (isTypeFamilyTyCon con)
+      , let sh_flds  = vis_args con sh_args
+            act_flds = vis_args con act_args
+      , length sh_flds == length act_flds = do
+          children <- sequence [expand_field marked (pos ++ [i]) fld a
+                               | (i, fld, a) <- zip3 [0..] sh_flds act_flds]
+          pure (SynthCaseConstructor pos sp con (map fst children), concatMap snd children)
+      | otherwise = unsupported
 
 -- | Adapt a visible type argument from matchable arrows to unmatchable arrows
 -- via a closed 1-equation eta-expansion family.
@@ -8313,7 +9902,7 @@ bindExplicitTKBndrsX skol_mode@(SM { sm_parent = check_parent, sm_kind = ctxt_ki
                          , mode_pending_calls = Nothing
                          , mode_synonym_metadata = if family_metadata then familyKindMetadata else Nothing
                          , mode_source_proof_owner = Nothing
-                         , mode_complete_type_arg = Nothing }
+                         , mode_complete_type_arg = Nothing, mode_under_forall = False, mode_lambda_root = Nothing, mode_sigma_root = Nothing }
                  -- Inherit the HoleInfo from the context
 
     go [] = do { res <- thing_inside

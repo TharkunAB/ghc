@@ -2152,27 +2152,24 @@ tcLookupTh :: Name -> TcM TcTyThing
 -- This is a specialised version of GHC.Tc.Utils.Env.tcLookup; specialised mainly in that
 -- it gives a reify-related error message on failure, whereas in the normal
 -- tcLookup, failure is a bug.
-tcLookupTh name
-  = do  { (gbl_env, lcl_env) <- getEnvs
-        ; case lookupNameEnv (getLclEnvTypeEnv lcl_env) name of {
-                Just thing -> return thing;
-                Nothing    ->
-
-          case lookupNameEnv (tcg_type_env gbl_env) name of {
-                Just thing -> return (AGlobal thing);
-                Nothing    ->
-
-          -- EZY: I don't think this choice matters, no TH in signatures!
-          if nameIsLocalOrFrom (tcg_semantic_mod gbl_env) name
-          then  -- It's defined in this module
+tcLookupTh name = do
+  (gbl_env, lcl_env) <- getEnvs
+  case lookupNameEnv (getLclEnvTypeEnv lcl_env) name of
+    Just thing -> return thing
+    Nothing -> case lookupNameEnv (tcg_type_env gbl_env) name of
+      Just thing -> return (AGlobal thing)
+      Nothing -> do
+        mb_synth <- lookupPendingSynthTyCon name
+        case mb_synth of
+          Just tc -> return (AGlobal (ATyCon tc))
+          Nothing
+            | nameIsLocalOrFrom (tcg_semantic_mod gbl_env) name ->
                 failWithTc (notInEnv name)
-
-          else
-     do { mb_thing <- tcLookupImported_maybe name
-        ; case mb_thing of
-            Succeeded thing -> return (AGlobal thing)
-            Failed msg      -> failWithTc (TcRnInterfaceError msg)
-    }}}}
+            | otherwise -> do
+                mb_thing <- tcLookupImported_maybe name
+                case mb_thing of
+                  Succeeded thing -> return (AGlobal thing)
+                  Failed msg      -> failWithTc (TcRnInterfaceError msg)
 
 notInScope :: TH.Name -> TcRnMessage
 notInScope th_name =

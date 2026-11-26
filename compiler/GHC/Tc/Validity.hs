@@ -3469,13 +3469,20 @@ checkFamInstRhs selectors lhs_tc lhs_tys rhs
    check_branch (lhs, refined_rhs) = checkFamInstRhs emptyNameEnv lhs_tc lhs refined_rhs
 
    -- See Note [Termination of a forwarding type lambda].
+   distinct_lhs_tvs tys
+      | Just tvs <- traverse getTyVar_maybe tys
+      , let tv_set = mkVarSet tvs
+      = sizeVarSet tv_set == length tvs
+        && tv_set `subVarSet` mkVarSet (mapMaybe getTyVar_maybe lhs_tys)
+      | otherwise = False
+
    forwards_lambda PCF_Size tc tys
       | Just (root, False) <- closedFamilyScope_maybe lhs_tc
       , root == tyConName lhs_tc
       , all isTyVarTy lhs_tys
       , TyConApp target args <- coreFullView rhs
       , target == tc, eqTypes args tys
-      , lengthIs tys (tyConArity tc), eqTypes lhs_tys tys
+      , lengthIs tys (tyConArity tc), distinct_lhs_tvs tys
       , Nothing <- closedFamilyScope_maybe tc
       , Just ax <- closedFamilyTyConCoAxiom_maybe tc
       = all (isConstructorCaseType . coAxBranchRHS)
@@ -3483,11 +3490,12 @@ checkFamInstRhs selectors lhs_tc lhs_tys rhs
    forwards_lambda _ _ _ = False
 
    forwards_payload PCF_Size tc tys
-      | Just (root, True) <- closedFamilyScope_maybe lhs_tc
-      , Just (root', True) <- closedFamilyScope_maybe tc
+      | Just (root, is_sigma) <- closedFamilyScope_maybe lhs_tc
+      , Just (root', is_sigma') <- closedFamilyScope_maybe tc
       = root == root'
-        && tyConArity tc == length tys + 1
-        && eqTypes lhs_tys tys
+        && is_sigma == is_sigma'
+        && tyConArity tc > length tys
+        && distinct_lhs_tvs tys
         && cannot_return emptyTyConSet [tc]
    forwards_payload _ _ _ = False
 

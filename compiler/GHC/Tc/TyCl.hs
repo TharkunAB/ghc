@@ -546,7 +546,8 @@ tcTyClGroup open_indices (TyClGroup { group_tyclds = tyclds
                        , group_roles  = roles
                        , group_kisigs = kisigs
                        , group_instds = instds })
-  = do { let role_annots = mkRoleAnnotEnv roles
+  = withRollbackSynthTypeState $
+    do { let role_annots = mkRoleAnnotEnv roles
 
            -- Step 1: Typecheck the standalone kind signatures and type/class declarations
        ; traceTc "---- tcTyClGroup ---- {" empty
@@ -573,7 +574,8 @@ tcTyClGroup open_indices (TyClGroup { group_tyclds = tyclds
            -- NB: put the TyCons in the environment for validity checking,
            -- as we might look them up in checkTyConConsistentWithBoot.
            -- See Note [TyCon boot consistency checking].
-          fmap concat . for tyclss_with_validity_infos $ \ (tycls, ax_validity_infos) ->
+          do { runPendingSynthChecks
+             ; fmap concat . for tyclss_with_validity_infos $ \ (tycls, ax_validity_infos) ->
           do { let inst_flav =
                      TyConInstFlavour
                        { tyConInstFlavour = tyConFlavour tycls
@@ -591,7 +593,7 @@ tcTyClGroup open_indices (TyClGroup { group_tyclds = tyclds
                            NoVI -> pure ()
                        ; setXOptM LangExt.UndecidableInstances (checkValidTyCl emptyNameEnv tycls) }
                else checkValidTyCl (mkNameEnv [(helper, rows) | (owner, helper, rows) <- cases
-                                                             , owner == tyConName tycls]) tycls }
+                                                             , owner == tyConName tycls]) tycls } }
 
        ; setXOptM LangExt.UndecidableInstances (mapM_ (checkValidTyCl emptyNameEnv) decision_helpers)
        ; let tyclss_and_helpers = tyclss ++ decision_helpers
@@ -700,6 +702,7 @@ tcTyClDecls open_indices tyclds kisig_env domain_env role_annots
                ; pure (tycons, data_deriv_infos) }
              check_syn_cycles tycons = do
                home_unit <- hsc_home_unit <$> getTopEnv
+               synth_payloads <- pendingSynthSigmaPayloads
                let scoped = mkNameSet
                      [ unLoc name
                      | L _ (FamDecl _ FamilyDecl{fdLName = name,
@@ -708,7 +711,7 @@ tcTyClDecls open_indices tyclds kisig_env domain_env role_annots
                      [ (name, [rhs | VI{vi_rhs = rhs} <- infos])
                      | (tc, infos) <- tycons
                      , let name = tyConName tc
-                     , name `elemNameSet` scoped ]
+                     , name `elemNameSet` scoped ] `plusNameEnv` synth_payloads
                checkSynCyclesWithPayloads payloads (homeUnitAsUnit home_unit) (map fst tycons) tyclds
        ; if not edt
          then do { (tycons, derives) <- check_declarations emptyNameEnv
