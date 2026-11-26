@@ -721,13 +721,25 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                     then sourceTableTyCons False True binds else pure []
           -- Keep complete source equations ahead of partial final-Core
           -- equations for the same owner.
-          let nominal_owners = if tables_enabled
+          let is_final_table owner = case idDetails owner of
+                SourceTableId _ _ FinalCoreSourceTable -> True
+                _ -> False
+              complete_owners = mkNameSet
+                [ idName owner
+                | (owner, _) <- tables
+                , not (is_final_table owner) ]
+              nominal_owners = if tables_enabled
                 then mkNameSet (map (idName . fst) tables)
                 else emptyNameSet
-          (cases, fields) <- sourceCaseTables nominal_owners binds
+          (cases0, fields) <- sourceCaseTables nominal_owners binds
           -- Keep the existing ordinary certificates when both checkers
-          -- accept the same owner. Enumeration cases retain executable origin.
-          let case_owners = mkNameSet (map (idName . fst) cases)
+          -- accept the same owner. Enumeration cases retain executable origin,
+          -- while complete source equations stay ahead of final-Core ones.
+          let cases
+                | tables_enabled = cases0
+                | otherwise = filter (\(owner, _) ->
+                    not (is_final_table owner && idName owner `elemNameSet` complete_owners)) cases0
+              case_owners = mkNameSet (map (idName . fst) cases)
               new_tables
                 | tables_enabled = tables
                 | otherwise = filter (\(owner, _) -> not (idName owner `elemNameSet` case_owners)) tables

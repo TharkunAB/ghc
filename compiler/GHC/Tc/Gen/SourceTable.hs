@@ -57,8 +57,8 @@ import GHC.Data.Bag (emptyBag, isEmptyBag)
 import GHC.Data.OrdList (fromOL)
 import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config (initSimpleOpts)
-import GHC.Driver.DynFlags (DynFlags(homeUnitId_), unitSettings)
-import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_WriteIfSimplifiedCore), backend, gopt, HasDynFlags(getDynFlags))
+import GHC.Driver.DynFlags (DynFlags(ghcMode, homeUnitId_), isOneShot, unitSettings)
+import GHC.Driver.Session (GeneralFlag(Opt_EnableRewriteRules, Opt_Hpc, Opt_WriteIfSimplifiedCore, Opt_WriteInterface, Opt_WriteSourceEquations), backend, gopt, HasDynFlags(getDynFlags))
 import GHC.Driver.Env (hsc_HUG, hsc_home_unit, hugRuleInterfacesBelow, hugRulesBelow, lookupIfaceByModuleHsc, visibleUnloadedSourceRuleHeads)
 import GHC.Driver.Plugins (hasActiveLatePlugins)
 import GHC.Settings (UnitSettings(unitSettings_ghcInternalUnitId))
@@ -2662,8 +2662,18 @@ sourceTableTyCons local final_exports binds = do
     rules <- goptM Opt_EnableRewriteRules
     dflags <- getDynFlags
     env <- getGblEnv
+    -- See Note [Checked source equations in typecheck-only interfaces]
+    -- in GHC.Driver.Main.Passes.
     let generates_code = backendGeneratesCode (backend dflags)
-    (visible_rules, unloaded_rules, local_rules, build_clean) <- if rules && generates_code
+        produces_iface = gopt Opt_WriteInterface dflags || not (isOneShot (ghcMode dflags))
+    no_code_final <- if generates_code || not final_exports || not produces_iface ||
+                        not (gopt Opt_WriteSourceEquations dflags) ||
+                        gopt Opt_WriteIfSimplifiedCore dflags ||
+                        gopt Opt_Hpc dflags || not (null (tcg_rules env))
+      then pure False
+      else not . hasActiveLatePlugins <$> getTopEnv
+    let checks_final_core = generates_code || no_code_final
+    (visible_rules, unloaded_rules, local_rules, build_clean) <- if rules && checks_final_core
       then do
         visible <- visibleSourceMethodRules env
         unloaded <- unloadedSourceRuleHeads env
@@ -2684,7 +2694,7 @@ sourceTableTyCons local final_exports binds = do
     let read_candidate bind = case sourceRows False bind of
           Just row -> Just (row, False)
           Nothing
-            | final_exports, rules, generates_code, build_clean
+            | final_exports, rules, checks_final_core, build_clean
             , Just row@(fun, _, _, _, _) <- sourceRows True bind
             , isDefaultInlinePragma (idInlinePragma fun)
             , not (idName fun `elemNameSet` local_rules)
@@ -2832,28 +2842,35 @@ sourceCaseTables nominal_owners binds = do
   char_tables <- xoptM LangExt.ExperimentalDependentTypes
   dflags <- getDynFlags
   rdr_env <- getGlobalRdrEnv
+  -- See Note [Checked source equations in typecheck-only interfaces]
+  -- in GHC.Driver.Main.Passes.
   let generates_code = backendGeneratesCode (backend dflags)
+      produces_iface = gopt Opt_WriteInterface dflags || not (isOneShot (ghcMode dflags))
   no_code_structural <- if generates_code || gopt Opt_WriteIfSimplifiedCore dflags ||
                            not (null (tcg_rules env))
     then pure False
     else do
       hsc <- getTopEnv
       pure (not (hasActiveLatePlugins hsc))
-  let exported = availsToNameSet (tcg_exports env)
+  let no_code_equations = no_code_structural && produces_iface &&
+                          gopt Opt_WriteSourceEquations dflags &&
+                          not (gopt Opt_Hpc dflags)
+      checks_final_core = generates_code || no_code_equations
+      exported = availsToNameSet (tcg_exports env)
       ruled = sourceRuleOwners (tcg_rules env)
       enum_enabled = not char_tables
       imported = ordinaryImport rdr_env
       public = publicCaseType env exported imported
       eligible_case = eligibleCase env exported enum_enabled imported
       list_case_position owner
-        | generates_code
+        | checks_final_core
         , let ty = varType owner
         , Just (ConstructorCaseType _ tc _ _ position _) <-
             constructorCaseType ty <|> monomorphicGuardedListCaseType ty
         , tc == listTyCon = Just position
         | otherwise = Nothing
       indexed_candidate owner
-        | generates_code
+        | checks_final_core
         , Just (IndexedProjection _ _ _ con _ _ _) <- indexedProjectionType (varType owner)
         = publicCaseType env exported imported (dataConTyCon con)
         | otherwise = False
@@ -2874,11 +2891,11 @@ sourceCaseTables nominal_owners binds = do
         not (idName owner `elemNameSet` nominal_owners) && list_case_position owner == Just 0
       fold_candidate owner = (generates_code || no_code_structural) &&
                              isJust (listFoldType (varType owner))
-      zip_candidate owner = generates_code && isJust (listZipWithType (varType owner))
+      zip_candidate owner = checks_final_core && isJust (listZipWithType (varType owner))
       reverse_wrapper_candidate owner =
-        generates_code && isJust (listReverseWrapperType (varType owner))
-      identity_candidate owner = generates_code && isIdentitySourceType (varType owner)
-      composition_candidate owner = generates_code && isJust (compositionSourceType (varType owner))
+        checks_final_core && isJust (listReverseWrapperType (varType owner))
+      identity_candidate owner = checks_final_core && isIdentitySourceType (varType owner)
+      composition_candidate owner = checks_final_core && isJust (compositionSourceType (varType owner))
       is_exported owner = idName owner `elemNameSet` exported &&
                           not (idName owner `elemNameSet` nominal_owners)
       eligible owner =
@@ -4295,22 +4312,23 @@ See Note [Nullary indexed source projections].
 The new private family is available to neither user declarations nor the
 helper collector.
 
-A no-code module can check equations for structural sizes, for a size and a
-list, and for independent constructor cases. The driver checks the
-optimized body before it writes the equations to the simple interface.
-Simple interfaces do not include rules. A source rule can rewrite a call
-without changing the rule owner's Core. Skip new no-code candidates in
-modules with source rules. Also skip them in modules with plugins so
-no-code compilation does not start running Core plugin passes.
+A no-code module checks structural sizes, right list folds, and independent
+constructor cases by default, and checks the full final-Core candidate set when
+it produces an interface with `Opt_WriteSourceEquations` enabled. See
+Note [Checked source equations in typecheck-only interfaces] in
+GHC.Driver.Main.Passes. The driver checks the optimized body before it writes
+the equations to the simple interface. Simple interfaces do not include rules.
+A source rule can rewrite a call without changing the rule owner's Core. Skip
+new no-code candidates in modules with source rules, coverage ticks, or active
+late plugins.
 
-For a retained module, use its restricted simplifier and one retained
-Gentle iteration with rules disabled. Discard the candidates if the body
-does not support this iteration. Check the same owner and equations
-against the result. This emits equations without a Core program. The
-retained program pipeline still requires an object or bytecode backend.
-A module that explicitly requests simplified Core uses its existing path
-and does not create these candidates. See validateSimpleSourceTables
-in GHC.Driver.Main.Passes.
+For a retained module at `-O0`, use its restricted simplifier and run one
+retained Gentle iteration with rules disabled when the body supports it;
+otherwise validate against the simplified retained Core, matching `-O0` code
+generation. Check the same owner and equations against the result. This emits
+equations without a Core program. A module that explicitly requests simplified
+Core uses its existing path and does not create these candidates. See
+validateSimpleSourceTables in GHC.Driver.Main.Passes.
 
 A local signature can instead require an ordinary nominal table. See
 Note [Checked list reverse]. Do not remove that table after optimization.
