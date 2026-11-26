@@ -50,7 +50,7 @@ import GHC.Core.Coercion.Axiom
   , coAxBranchCoVars, coAxBranchLHS, coAxBranchRHS, coAxBranchRoles, coAxBranchSpan, coAxBranchTyVars, fromBranches )
 import GHC.Core.ConLike (ConLike(..))
 import GHC.Core.DataCon
-import GHC.Core.Dependent (hasNativeDependentExpr, hasNativeDependentExprRhs)
+import GHC.Core.Dependent (hasExistentialExpr, hasNativeDependentExpr, hasNativeDependentExprRhs)
 import GHC.Core.FVs (exprSomeFreeVarsList, exprsFreeVars)
 import GHC.Core.FamInstEnv (FamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch, reduceTyFamApp_maybe)
 import GHC.Core.InstEnv
@@ -62,7 +62,7 @@ import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe, isPredTy, m
 import GHC.Core.Reduction (reductionCoercion, reductionReducedType)
 import GHC.Core.RoughMap (RoughMatchTc(RM_KnownTc))
 import GHC.Core.Rules (RuleEnv(..), emptyRuleBase, emptyRuleEnv, extendRuleBaseList, getRules)
-import GHC.Core.SimpleOpt (defaultSimpleOpts, simpleOptExpr)
+import GHC.Core.SimpleOpt (SimpleOpts, defaultSimpleOpts, simpleOptExpr)
 import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
@@ -616,7 +616,7 @@ zipFusionRuleHelpers owner table Rule{ru_fn = fn, ru_bndrs = binders, ru_act = A
       Just f  -> map Core.Type [output, list, list, a, b] ++ [cons_value, Core.Var f]
     list_result <- instantiate fold_body
       [Core.Type a, Core.Type b, Core.Type list, list_step, Core.mkConApp nilDataCon [Core.Type output], Core.Var xs, Core.Var ys]
-    cct <- compileZipCore (const True) owner (simpleOptExpr defaultSimpleOpts (Core.mkLams variables list_result))
+    cct <- compileZipCore (const True) owner (safeSimpleOptExpr defaultSimpleOpts (Core.mkLams variables list_result))
     (phase, build, fold, step) <$ guard (matchesCompiledTable table Nothing cct)
   where
     instantiate expression args = do
@@ -1208,7 +1208,7 @@ checkedMapWorkers _ env binds
           (owner, rhs) <- lookupNameEnv owners (idName worker)
           guard (not (idName owner `elemNameSet` exported) && isNothing (sourceTableId_maybe (current_id owner)) &&
                  varType owner `eqType` classMethodInstTy selector pred_args)
-          let clean_rhs = simpleOptExpr defaultSimpleOpts (stripTicksE isSourceBreakpoint rhs)
+          let clean_rhs = safeSimpleOptExpr defaultSimpleOpts (stripTicksE isSourceBreakpoint rhs)
           cct <- compileStructuralCore visible owner clean_rhs <|>
                  (constructorCaseType (varType owner) >>= \s -> compileOrdinaryCase visible (const Nothing) s owner clean_rhs)
           pure (selector, FreshMethodWorker owner cct)
@@ -1717,7 +1717,7 @@ directRetainedWitnessType ty =
       sig@(ConstructorCaseType _ tc args [domain] 0 result) <- constructorCaseType ty
       [con] <- pure (tyConDataCons tc)
       witness : _ <- pure (dataConOrigArgTys con)
-      guard (isJust (getTyVar_maybe result) && isRetainedCaseRoot domain tc &&
+      guard (isRetainedCaseRoot domain tc &&
              result `eqType` substTyWith (dataConUnivTyVars con) args (scaledThing witness))
       pure (con, sig)
 
@@ -3918,7 +3918,7 @@ sourceTableTyCons local final_exports binds = do
                         gopt Opt_Hpc dflags || not (null (tcg_rules env))
       then pure False else not . hasActiveLatePlugins <$> getTopEnv
     let checks_final_core = generates_code || no_code_final
-        prepare = simpleOptExpr (initSimpleOpts dflags)
+        prepare = safeSimpleOptExpr (initSimpleOpts dflags)
     (visible_rules, unloaded_rules, local_rules, build_clean) <- if rules && checks_final_core
       then do
         visible <- visibleSourceMethodRules env
@@ -4127,7 +4127,7 @@ sourceCaseTables nominal_owners binds = do
     visible <- visibleSourceMethodRules env
     unloaded <- unloadedSourceRuleHeads env
     let changed o = idName o `elemNameSet` ruled || idName o `elemNameSet` unloaded || hasSourceMethodRule visible o
-        prepare = simpleOptExpr (initSimpleOpts dflags)
+        prepare = safeSimpleOptExpr (initSimpleOpts dflags)
         finalOwner o t = setIdDetails o (SourceTableId (idName o) t FinalCoreSourceTable)
     all_bind_pairs <- fmap catMaybes $ forM owners $ \(b, o) -> fmap (o,) <$> bindingCore b o
     prepared <- fmap catMaybes $ forM candidates $ \(bind, owner) -> do
@@ -4307,13 +4307,18 @@ sourceMapperTable owner rhs = do
                  (guard (isPairPermutationType (varType owner)) *> compilePairCase owner rhs)
     maybe (pure Nothing) (\cct -> Just . (owner,) <$> publishCompiledTable owner cct) mb_cct
 
+safeSimpleOptExpr :: SimpleOpts -> Core.CoreExpr -> Core.CoreExpr
+safeSimpleOptExpr opts expr
+  | hasExistentialExpr expr || hasNativeDependentExpr expr = expr
+  | otherwise                                              = simpleOptExpr opts expr
+
 sourceLocalBooleanCases :: NameEnv (Id, Core.CoreExpr) -> NameEnv (Id, Core.CoreExpr) -> TcM ([(Id, TyCon)], [TyCon])
 sourceLocalBooleanCases roots definitions = do
     env <- getGblEnv; rdr_env <- getGlobalRdrEnv; dflags <- getDynFlags
     let public = visibleCaseType (\n -> if nameModule_maybe n == Just (tcg_semantic_mod env)
                                           then maybe False isLocalGRE (lookupGRE_Name rdr_env n)
                                           else ordinaryImport rdr_env n)
-        prepare = simpleOptExpr (initSimpleOpts dflags)
+        prepare = safeSimpleOptExpr (initSimpleOpts dflags)
         fresh o = isNothing (sourceTableOccurrence env o >>= sourceTableId_maybe)
         ordered = sortBy (\a b -> stableNameCmp (idName (fst a)) (idName (fst b))) . nonDetNameEnvElts
     predicates <- forM
