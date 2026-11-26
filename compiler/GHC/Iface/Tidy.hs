@@ -879,6 +879,10 @@ addExternal opts mentions_marked is_rec mb_rhs id
       = not (hasExistentialExpr rhs) || supportsNativeUserUnfolding rhs
       | is_depfun_user src
       = not (is_rec || loop_breaker) && supportsNativeDepFunUnfolding rhs
+      | isStableUserSource src
+      , hasNativeDependentExprRhs (Type (idType id))
+      = not (is_rec || loop_breaker)
+        && (not (hasExistentialExpr rhs) || supportsNativeUserUnfolding rhs)
       | otherwise
       = not (hasExistentialExpr rhs) &&
         (hasNativeDependentExprRhs (Type (idType id))

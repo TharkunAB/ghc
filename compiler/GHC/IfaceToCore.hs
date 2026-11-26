@@ -1078,12 +1078,12 @@ ifaceDeclsForTc iface
   | otherwise = mi_decls iface
   where
     prune allow_depfun decl@IfaceId { ifType = ty, ifIdInfo = info }
-      = decl { ifIdInfo = filter (keep (allow_depfun && hasIfaceDepFunType ty)) info }
+      = decl { ifIdInfo = filter (keep (allow_depfun || not (hasIfaceDepFunType ty))) info }
     prune _ decl = decl
 
-    keep allow_depfun (HsUnfold _ (IfCoreUnfold src _ _ rhs))
+    keep allow_stable_user (HsUnfold _ (IfCoreUnfold src _ _ rhs))
       | RetainedUserSrc <- src = True
-      | allow_depfun, isStableUserSource src = True
+      | allow_stable_user, isStableUserSource src = True
       | otherwise = isCompulsorySource src || not (hasIfacePackageExpr rhs)
     keep _ _ = True
 
@@ -3358,6 +3358,11 @@ tcUnfoldingRhs source toplvl name declared_ty expr
       _ | is_depfun_user ->
         unless (isTopLevel toplvl && supportsNativeDepFunUnfolding core_expr') $
           failIfM (text "Invalid native DepFunTy unfolding:" <+> ppr name)
+      _ | isStableUserSource source, hasExistentialExpr core_expr' ->
+        unless (isTopLevel toplvl
+                && hasNativeDependentExprRhs (Type declared_ty)
+                && supportsNativeUserUnfolding core_expr') $
+          failIfM (text "Invalid existential user unfolding:" <+> ppr name)
       _ -> pure ()
     dflags <- getDynFlags
     -- Check for type consistency in the unfolding
