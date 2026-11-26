@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, KindSignatures, ScopedTypeVariables #-}
 module NativeClosedCharRigid where
 
 import qualified Data.Char

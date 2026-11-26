@@ -1,17 +1,18 @@
 {-# LANGUAGE TemplateHaskell, RankNTypes, TypeOperators, DataKinds,
-             PolyKinds, TypeFamilies, GADTs #-}
+             PolyKinds, TypeFamilies, GADTs, Modifiers #-}
 
 module RAE_T32a where
 
 import Data.Kind
+import GHC.Exts (M)
 
 data family Sing (k :: Type) :: k -> Type
 
 data TyArr' (a :: Type) (b :: Type) :: Type
-type TyArr (a :: Type) (b :: Type) = TyArr' a b -> Type
+type TyArr (a :: Type) (b :: Type) = TyArr' a b %M -> Type
 type family (a :: TyArr k1 k2) @@ (b :: k1) :: k2
 data TyPi' (a :: Type) (b :: TyArr a Type) :: Type
-type TyPi (a :: Type) (b :: TyArr a Type) = TyPi' a b -> Type
+type TyPi (a :: Type) (b :: TyArr a Type) = TyPi' a b %M -> Type
 type family (a :: TyPi k1 k2) @@@ (b :: k1) :: k2 @@ b
 $(return [])
 

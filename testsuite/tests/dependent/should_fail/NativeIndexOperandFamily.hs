@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, ScopedTypeVariables, TypeApplications, TypeFamilies #-}
 module NativeIndexOperandFamily where
 
 import Data.Proxy (Proxy(..))

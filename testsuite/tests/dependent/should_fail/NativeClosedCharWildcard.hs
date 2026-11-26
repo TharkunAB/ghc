@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, PolyKinds, ScopedTypeVariables, TypeApplications #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, PolyKinds, ScopedTypeVariables, TypeApplications #-}
 module NativeClosedCharWildcard where
 
 import qualified Data.Char

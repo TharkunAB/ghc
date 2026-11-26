@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, ScopedTypeVariables #-}
 module NativeLetMethodRule where
 
 import PackedVecLibrary

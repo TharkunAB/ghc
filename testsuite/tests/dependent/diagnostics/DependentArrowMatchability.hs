@@ -114,9 +114,9 @@ scope :: forall (m :: Matchability). Proxy m ->
          P.D (FUN @m 'Many Type Type) (P.AbstractAny :: FUN @m 'Many Type Type) -> Scoped
 scope _ = Scoped @m
 
--- | A different declaration with no local m must keep the old U default.
+-- | A declaration with no local m uses the U default.
 type Outside = P.D (Type -> Type) P.AbstractAny
--- | Check the legacy default outside a quantified field.
+-- | Check the U default outside a quantified field.
 outside :: Outside :~: P.D (FUN @U 'Many Type Type) P.AbstractAny
 outside = Refl
 

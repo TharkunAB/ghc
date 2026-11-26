@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, KindSignatures, TypeOperators #-}
 module NativeMethodAliasClient where
 
 import Data.Proxy (Proxy(..))

@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, TypeFamilies #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, DependentTypes, ListTuplePuns, TypeFamilies #-}
 module NativeSplitResult where
 import Data.Proxy
 import PackedVecLibrary

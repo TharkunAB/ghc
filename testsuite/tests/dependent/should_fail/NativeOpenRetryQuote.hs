@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, NamedWildCards #-}
+{-# LANGUAGE DataKinds, DependentTypes, NamedWildCards #-}
 {-# LANGUAGE PartialTypeSignatures, ScopedTypeVariables, TemplateHaskell, TypeApplications #-}
 module NativeOpenRetryQuote where
 import qualified RetryCharacters

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, KindSignatures #-}
+{-# LANGUAGE DataKinds, DependentTypes, KindSignatures #-}
 {-# OPTIONS_GHC -fdefer-type-errors -Wno-deferred-type-errors #-}
 module NativeClosedResultDictionary where
 

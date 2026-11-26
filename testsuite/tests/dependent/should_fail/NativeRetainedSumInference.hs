@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DataKinds, ExperimentalDependentTypes, GADTs #-}
+{-# LANGUAGE AllowAmbiguousTypes, DataKinds, DependentTypes, ListTuplePuns, GADTs #-}
 {-# LANGUAGE ScopedTypeVariables, TypeApplications, TypeFamilies #-}
 module NativeRetainedSumInference where
 

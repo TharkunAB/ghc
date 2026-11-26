@@ -1,4 +1,4 @@
-{-# LANGUAGE Haskell2010, DataKinds, ExperimentalDependentTypes, Safe #-}
+{-# LANGUAGE Haskell2010, DataKinds, DependentTypes, ListTuplePuns, Safe #-}
 module NativeClosedEvalSafe where
 
 import qualified ClosedLengthProducer as Length

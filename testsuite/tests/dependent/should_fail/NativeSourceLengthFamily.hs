@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, TemplateHaskell, TypeFamilies #-}
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, TemplateHaskell, TypeFamilies #-}
 module NativeSourceLengthFamily where
 
 import Data.Kind (Type)

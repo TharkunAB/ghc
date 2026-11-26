@@ -77,40 +77,40 @@ test('T15076b', normal, compile_fail, [''])
 test('T17687', normal, compile_fail, [''])
 test('T18271', normal, compile_fail, [''])
 test('NativeSourceTableWrong',
-     extra_files(['../../../../docs/dependent-haskell/examples/qualified-pi/ClosedTableLibrary.hs']),
+     extra_files(['../should_compile/ClosedTableLibrary.hs']),
      multimod_compile_fail,
      ['NativeSourceTableWrong', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeIndexedListContents',
-     extra_files(['../../../../docs/dependent-haskell/examples/open-evaluation/IndexedPrefix.hs']),
+     extra_files(['IndexedPrefix.hs']),
      multimod_compile_fail, ['NativeIndexedListContents', '-v0'])
 test('NativeSourceTablePartial', normal, compile_fail, [''])
 test('NativeListBoundaryPartial',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeListBoundaryPartial', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeListIndexDiagnostics',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs',
-                  '../../../../docs/dependent-haskell/examples/qualified-pi/ParameterizedIndexLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs',
+                  'ParameterizedIndexLibrary.hs']),
      multimod_compile_fail,
      ['NativeListIndexDiagnostics', '-v0 -fwrite-source-equations'])
 test('NativeSourceFieldCoverage', normal, compile_fail, [''])
 test('NativeSourceLengthRecursion', normal, compile_fail, [''])
 test('NativeSourcePlusRecursion', normal, compile_fail, [''])
 test('NativeSourceProductRecursion',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeSourceProductRecursion', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeSourceProductRule',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeSourceProductRule', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeLetMethodRule',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeLetMethodRule', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeSourceLengthFamily', req_th, compile_fail, [''])
 test('NativeOpenTermLimit', normal, compile_fail, [''])
-retry_chars = extra_files(['../../../../docs/dependent-haskell/examples/open-evaluation/RetryCharacters.hs'])
+retry_chars = extra_files(['RetryCharacters.hs'])
 test('NativeOpenRetryWrong', [req_interp, req_rts_linker, only_ways(['normal']), retry_chars],
      multimod_compile_fail,
      ['NativeOpenRetryWrong', '-v0 -fdefer-type-errors -Wno-partial-type-signatures ' + config.ghc_th_way_flags])
@@ -125,7 +125,7 @@ test('NativeOpenRetrySafe', [normal, retry_chars], multimod_compile_fail,
 test('NativeOpenRetryQuote', [req_th, retry_chars], multimod_compile_fail,
      ['NativeOpenRetryQuote', '-v0 -Wno-partial-type-signatures'])
 test('NativeClosedEvalSafe',
-     extra_files(['../../../../docs/dependent-haskell/examples/closed-evaluation/ClosedLengthProducer.hs']),
+     extra_files(['ClosedLengthProducer.hs']),
      multimod_compile_fail, ['NativeClosedEvalSafe', '-v0'])
 test('NativeClosedCharRigid', normal, compile_fail, [''])
 test('NativeClosedCharResult', normal, compile_fail, [''])
@@ -179,7 +179,7 @@ test('NativeClosedEnumKind',
      multimod_compile_fail, ['NativeClosedEnumKind', '-v0 ' + config.ghc_th_way_flags])
 for name in ['NativeClosedLazyParcelDemand', 'NativeClosedLazyParcelEscape', 'NativeClosedLazyParcelKind']:
     test(name, [req_interp, req_rts_linker, only_ways(['normal']),
-                extra_files(['../../../../docs/dependent-haskell/examples/closed-evaluation/LazyParcel.hs'])],
+                extra_files(['LazyParcel.hs'])],
          multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
 for name in ['NativeClosedPresentBottom', 'NativeClosedUnsupportedAlternative', 'NativeClosedOtherEither']:
     test(name, [req_interp, req_rts_linker, only_ways(['normal']),
@@ -193,18 +193,17 @@ for name in ['NativeClosedIndexedVecEmpty', 'NativeClosedIndexHidden', 'NativeCl
              'NativeClosedSomeVecAmbiguous']:
     test(name, [req_interp, req_rts_linker, only_ways(['normal']),
                 extra_files(['NativeClosedIndexFailures.hs',
-                             '../../../../docs/dependent-haskell/examples/closed-evaluation/IndexedVec.hs'])],
+                             'IndexedVec.hs'])],
          multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
 for name in ['NativeClosedSomeVecIndexVisibility', 'NativeClosedWitnessMismatch',
              'NativeClosedWitnessMissing']:
     test(name, [req_interp, req_rts_linker, only_ways(['normal']),
                 extra_files(['NativeClosedWitnessFailures.hs'] +
-                            ['../../../../docs/dependent-haskell/examples/closed-evaluation/' + f
-                             for f in ['IndexedVec.hs', 'ExistentialVec.hs']])],
+                            ['IndexedVec.hs', 'ExistentialVec.hs'])],
          multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
 for name in ['NativeClosedIndexedWrongKind', 'NativeClosedIndexedWrongValue', 'NativeClosedIndexedPartial']:
     test(name, [req_interp, req_rts_linker, only_ways(['normal']),
-                extra_files(['../../../../docs/dependent-haskell/examples/closed-evaluation/IndexedMark.hs'])],
+                extra_files(['IndexedMark.hs'])],
          multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
 test('NativeClosedWrongAlternative', [req_interp, req_rts_linker, only_ways(['normal'])],
      compile_fail, [config.ghc_th_way_flags])
@@ -228,18 +227,18 @@ test('NativeClosedNestedStrict',
       extra_files(['../should_run/NativeClosedListsLib.hs'])],
      multimod_compile_fail, ['NativeClosedNestedStrict', '-v0 ' + config.ghc_th_way_flags])
 test('NativeSplitResult',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail, ['NativeSplitResult', '-v0 -fomit-interface-pragmas'])
 test('NativeSourceLengthEmpty',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeSourceLengthEmpty', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeTypeNumeralWrong',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeTypeNumeralWrong', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
 test('NativeMethodGiven',
-     extra_files(['../../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
      ['NativeMethodGiven', '-v0 -fdefer-type-errors -Wno-simplifiable-class-constraints -fomit-interface-pragmas'])
 test('NativeClosedSumMissing',

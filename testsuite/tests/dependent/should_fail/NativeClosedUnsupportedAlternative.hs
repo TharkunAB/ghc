@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes #-}
+{-# LANGUAGE DataKinds, DependentTypes #-}
 module NativeClosedUnsupportedAlternative where
 import Data.Proxy (Proxy(..))
 import qualified NativeClosedChoiceLib as P

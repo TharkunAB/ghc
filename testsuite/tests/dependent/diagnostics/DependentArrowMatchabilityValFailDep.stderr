@@ -1,0 +1,55 @@
+DependentArrowMatchabilityValFailDep.hs:16:19: error: [GHC-25897]
+    • Could not deduce ‘a ~ b’
+      from the context: f b ~ f a
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘inverseU’
+        at DependentArrowMatchabilityValFailDep.hs:16:12-15
+      Expected: a :~: b
+        Actual: a :~: a
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          inverseU :: forall (f :: * %U -> *) a b.
+                      Proxy f -> (f a :~: f b) -> a :~: b
+        at DependentArrowMatchabilityValFailDep.hs:(14,1)-(15,45)
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          inverseU :: forall (f :: * %U -> *) a b.
+                      Proxy f -> (f a :~: f b) -> a :~: b
+        at DependentArrowMatchabilityValFailDep.hs:(14,1)-(15,45)
+    • In the expression: Refl
+      In an equation for ‘inverseU’: inverseU _ Refl = Refl
+    • Relevant bindings include
+        inverseU :: Proxy f -> (f a :~: f b) -> a :~: b
+          (bound at DependentArrowMatchabilityValFailDep.hs:16:1)
+
+DependentArrowMatchabilityValFailDep.hs:20:31: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘P.Abstract’ has kind ‘* %U -> *’
+    • In the type ‘P.Abstract’
+      In the expression: ascribedDefault @P.Abstract
+      In an equation for ‘badDefault’:
+          badDefault = ascribedDefault @P.Abstract
+
+DependentArrowMatchabilityValFailDep.hs:24:35: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘P.Abstract’ has kind ‘* %U -> *’
+    • In the type ‘P.Abstract’
+      In the expression: binderDefault @P.Abstract
+      In an equation for ‘badBinderDefault’:
+          badBinderDefault = binderDefault @P.Abstract
+
+DependentArrowMatchabilityValFailDep.hs:28:34: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘(* %U -> *) %GHC.Internal.Types.Matchable -> *’,
+        but ‘NestedAbstract’ has kind ‘(* %U -> *) %U -> *’
+    • In the type ‘NestedAbstract’
+      In the expression: nestedBinder @NestedAbstract
+      In an equation for ‘badNestedDefault’:
+          badNestedDefault = nestedBinder @NestedAbstract
+

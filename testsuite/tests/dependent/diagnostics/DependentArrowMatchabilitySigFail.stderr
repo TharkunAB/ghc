@@ -1,0 +1,32 @@
+DependentArrowMatchabilitySigFail.hs:11:79: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected kind ‘* %U -> *’, but ‘f’ has kind ‘* %M -> *’
+    • In the second argument of ‘P.D’, namely ‘f’
+      In the first argument of ‘Proxy’, namely
+        ‘(P.D (Type %U -> Type) f)’
+      In the type signature:
+        laterBinderBad :: forall (f :: Type %M -> Type). Proxy (P.D (Type
+                                                                     %U -> Type) f)
+                                                         -> Proxy f -> Proxy f
+
+DependentArrowMatchabilitySigFail.hs:15:27: error: [GHC-97739]
+    • These kind and type variables: (f :: Type -> Type)
+                                     (m :: Matchability)
+      are out of dependency order. Perhaps try this ordering:
+        (m :: Matchability) (f :: * %m -> *)
+    • In the type signature:
+        scopedBinderBad :: forall (f :: Type -> Type)
+                                  (m :: Matchability). Proxy (P.D (FUN @m 'Many Type Type) f)
+                                                       -> Proxy f -> Proxy f
+
+DependentArrowMatchabilitySigFail.hs:21:29: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %M -> *’, but ‘P.Abstract’ has kind ‘* %U -> *’
+    • In the first argument of ‘g’, namely ‘P.Abstract’
+      In the first argument of ‘Proxy’, namely ‘(g P.Abstract)’
+      In the type signature:
+        nestedBinderBad :: forall (g :: (Type %M -> Type)
+                                        -> Type). Proxy (g P.Abstract) -> Proxy g -> Proxy g
+

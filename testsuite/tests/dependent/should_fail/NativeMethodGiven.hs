@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, FlexibleContexts, TypeOperators #-}
+{-# LANGUAGE DataKinds, DependentTypes, FlexibleContexts, TypeOperators #-}
 module NativeMethodGiven where
 
 import PackedVecLibrary

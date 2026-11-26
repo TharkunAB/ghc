@@ -9,6 +9,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
+{-# LANGUAGE Modifiers #-}
 
 
 
@@ -16,6 +17,7 @@ module T13135 where
 
 
 import Data.Kind (Type)
+import GHC.Exts (M)
 
 
 class sub :<: sup
@@ -32,7 +34,7 @@ data Sig a = Full a | (:->) a (Sig a)
 
 infixr :->
 
-type Sym t = (Sig t -> Type)
+type Sym t = (Sig t %M -> Type)
 
 data AST :: Sym t -> Sym t
   where
@@ -48,7 +50,7 @@ data Constr sig = Constr String
 smartSym :: (sub :<: sup) => sub sig -> SmartFun sup sig
 smartSym = error "urk"
 
-type family   SmartFun (sym :: Sig t -> Type) sig = f | f -> sym sig  where
+type family   SmartFun (sym :: Sig t %M -> Type) sig = f | f -> sym sig  where
 -- In full glory:
 -- type family SmartFun {t} (sym :: Sig t -> Type) (sig :: Sig t) :: *
 --            = f | f -> {t} sym sig  where

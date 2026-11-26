@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# OPTIONS_GHC -Werror=incomplete-patterns #-}
 module NativeListBoundaryPartial where
 import PackedVecLibrary (Nat(..))

@@ -1,4 +1,4 @@
-{-# LANGUAGE DataKinds, ExperimentalDependentTypes, GADTs, NamedWildCards #-}
+{-# LANGUAGE DataKinds, DependentTypes, GADTs, NamedWildCards #-}
 {-# LANGUAGE PartialTypeSignatures, TypeApplications #-}
 module NativeOpenRetryGiven where
 

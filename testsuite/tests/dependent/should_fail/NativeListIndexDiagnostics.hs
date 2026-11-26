@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes, ListTuplePuns #-}
 {-# OPTIONS_GHC -Werror=incomplete-patterns -Werror=overlapping-patterns -Wno-inaccessible-code #-}
 module NativeListIndexDiagnostics where
 

@@ -10,9 +10,11 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE Modifiers #-}
 module T13910 where
 
 import Data.Kind
+import GHC.Matchability (M)
 import Data.Type.Equality
 
 data family Sing (a :: k)
@@ -35,7 +37,7 @@ withSomeSing x f =
     SomeSing x' -> f x'
 
 data TyFun :: Type -> Type -> Type
-type a ~> b = TyFun a b -> Type
+type a ~> b = TyFun a b %M -> Type
 infixr 0 ~>
 
 type family Apply (f :: k1 ~> k2) (x :: k1) :: k2

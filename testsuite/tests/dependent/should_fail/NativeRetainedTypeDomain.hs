@@ -1,4 +1,4 @@
-{-# LANGUAGE ExperimentalDependentTypes #-}
+{-# LANGUAGE DependentTypes #-}
 module NativeRetainedTypeDomain where
 
 import Data.Kind (Type)
