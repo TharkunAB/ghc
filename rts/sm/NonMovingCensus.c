@@ -17,6 +17,10 @@
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 RTS_PRIVATE uint32_t ghc_rust_count_nonmoving_marks(const uint8_t *bits, uint32_t n, uint8_t epoch);
 RTS_PRIVATE uint32_t ghc_rust_filled_segment_words(const StgClosure *first, size_t stride, uint32_t count);
+RTS_PRIVATE uint32_t ghc_rust_marked_segment_words(const uint8_t *marks,
+                                                   const StgClosure *first,
+                                                   size_t stride, uint32_t count,
+                                                   uint8_t epoch, uint32_t *out_blocks);
 #endif
 
 // N.B. This may miss segments in the event of concurrent mutation (e.g. if a
@@ -63,11 +67,18 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
         census.n_active_segs++;
         unsigned int n = nonmovingSegmentBlockCount(seg);
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-        if (!collect_live_words) {
+        if (collect_live_words) {
+            uint32_t blocks = 0;
+            if (n != 0) {
+                census.n_live_words += ghc_rust_marked_segment_words(
+                    seg->bitmap, (StgClosure *) nonmovingSegmentGetBlock(seg, 0),
+                    alloc->block_size, n, nonmovingMarkEpoch, &blocks);
+            }
+            census.n_live_blocks += blocks;
+        } else {
             census.n_live_blocks += ghc_rust_count_nonmoving_marks(seg->bitmap, n, nonmovingMarkEpoch);
-            continue;
         }
-#endif
+#else
         for (unsigned int i=0; i < n; i++) {
             if (nonmovingGetMark(seg, i) == nonmovingMarkEpoch) {
                 StgClosure *c = (StgClosure *) nonmovingSegmentGetBlock(seg, i);
@@ -76,6 +87,7 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
                 census.n_live_blocks++;
             }
         }
+#endif
     }
 
     // current segments
@@ -85,11 +97,18 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
         struct NonmovingSegment *seg = cap->current_segments[alloc_idx];
         unsigned int n = nonmovingSegmentBlockCount(seg);
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-        if (!collect_live_words) {
+        if (collect_live_words) {
+            uint32_t blocks = 0;
+            if (n != 0) {
+                census.n_live_words += ghc_rust_marked_segment_words(
+                    seg->bitmap, (StgClosure *) nonmovingSegmentGetBlock(seg, 0),
+                    alloc->block_size, n, 0, &blocks);
+            }
+            census.n_live_blocks += blocks;
+        } else {
             census.n_live_blocks += ghc_rust_count_nonmoving_marks(seg->bitmap, n, 0);
-            continue;
         }
-#endif
+#else
         for (unsigned int i=0; i < n; i++) {
             if (nonmovingGetMark(seg, i)) {
                 StgClosure *c = (StgClosure *) nonmovingSegmentGetBlock(seg, i);
@@ -98,6 +117,7 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
                 census.n_live_blocks++;
             }
         }
+#endif
     }
     return census;
 }
