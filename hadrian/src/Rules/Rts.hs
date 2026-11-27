@@ -37,6 +37,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/stable_name.rs"
                 , "rts/rust/stable_ptr.rs"
                 , "rts/rust/static_ptr_table.rs"
+                , "rts/rust/suspended_calls.rs"
                 , "rts/rust/timeout_queue.rs"
                 ] rustCfg output
         buildPath -/- "rust-rts-prim-bits.o" %>

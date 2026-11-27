@@ -31,6 +31,7 @@
 #include "Sparks.h"
 #include "Capability.h"
 #include "Task.h"
+#include "SuspendedCalls.h"
 #include "IOManager.h"
 #if defined(mingw32_HOST_OS)
 #include "win32/MIOManager.h"
@@ -2423,6 +2424,15 @@ deleteAllThreads (void)
    Locks required: sched_mutex
    -------------------------------------------------------------------------- */
 
+/* Note [Suspended in-call list in Rust]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * C owns each Capability and InCall. Rust changes only the list links and
+ * count while C holds the capability. The collector visits the original
+ * suspended_tso slots so that evacuation can replace their pointers. It
+ * reads the next link after the callback. C keeps capability synchronization
+ * and the fork reset. TSAN builds use the C list operations and visitor.
+ */
+
 STATIC_INLINE void
 suspendTask (Capability *cap, Task *task)
 {
@@ -2430,6 +2440,11 @@ suspendTask (Capability *cap, Task *task)
 
     incall = task->incall;
     ASSERT(incall->next == NULL && incall->prev == NULL);
+#if defined(USE_RUST_SUSPENDED_CALLS)
+    ghc_rust_suspended_calls_insert(&cap->suspended_ccalls,
+                                    &cap->n_suspended_ccalls, incall,
+                                    offsetof(InCall, prev));
+#else
     incall->next = cap->suspended_ccalls;
     incall->prev = NULL;
     if (cap->suspended_ccalls) {
@@ -2437,6 +2452,7 @@ suspendTask (Capability *cap, Task *task)
     }
     cap->suspended_ccalls = incall;
     cap->n_suspended_ccalls++;
+#endif
 }
 
 STATIC_INLINE void
@@ -2445,6 +2461,12 @@ recoverSuspendedTask (Capability *cap, Task *task)
     InCall *incall;
 
     incall = task->incall;
+#if defined(USE_RUST_SUSPENDED_CALLS)
+    ASSERT(incall->prev != NULL || cap->suspended_ccalls == incall);
+    ghc_rust_suspended_calls_remove(&cap->suspended_ccalls,
+                                    &cap->n_suspended_ccalls, incall,
+                                    offsetof(InCall, prev));
+#else
     if (incall->prev) {
         incall->prev->next = incall->next;
     } else {
@@ -2456,6 +2478,7 @@ recoverSuspendedTask (Capability *cap, Task *task)
     }
     incall->next = incall->prev = NULL;
     cap->n_suspended_ccalls--;
+#endif
 }
 
 /* ---------------------------------------------------------------------------

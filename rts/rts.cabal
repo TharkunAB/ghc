@@ -14,6 +14,7 @@ build-type: Configure
 extra-source-files:
     configure
     configure.ac
+    SuspendedCalls.h
     rust/adjustor_slots.rs
     rust/archive_member.rs
     rust/arena.rs
@@ -40,6 +41,7 @@ extra-source-files:
     rust/stable_name.rs
     rust/stable_ptr.rs
     rust/static_ptr_table.rs
+    rust/suspended_calls.rs
     rust/timeout_queue.rs
     rust/wsdeque.rs
 
