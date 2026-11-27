@@ -5,9 +5,9 @@ const SEGMENT_SIZE: usize = 1024;
 // Hash.c checks the entry layout and segment size at compile time.
 #[repr(C)]
 pub(super) struct Entry {
-    key: usize,
-    value: *const c_void,
-    next: *mut Entry,
+    pub(super) key: usize,
+    pub(super) value: *const c_void,
+    pub(super) next: *mut Entry,
 }
 
 type Directory = *const *const *mut Entry;

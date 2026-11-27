@@ -67,6 +67,14 @@ RTS_PRIVATE int ghc_rust_hash_keys(HashList ***dir, size_t buckets, StgWord *key
 RTS_PRIVATE void ghc_rust_hash_map(HashList ***dir, size_t buckets, void *data, MapHashFn fn);
 RTS_PRIVATE void ghc_rust_hash_map_keys(HashList ***dir, size_t buckets, void *data, MapHashFnKeys fn);
 RTS_PRIVATE void ghc_rust_hash_iter(HashList ***dir, size_t buckets, void *data, IterHashFn fn);
+
+RTS_PRIVATE const void *ghc_rust_hash_lookup_word(HashList *head, StgWord key);
+RTS_PRIVATE const void *ghc_rust_hash_lookup_str(HashList *head, StgWord key);
+RTS_PRIVATE const void *ghc_rust_hash_lookup_custom(HashList *head, StgWord key, CompareFunction cmp);
+RTS_PRIVATE HashList *ghc_rust_hash_unlink_word(HashList **head, StgWord key, const void *data);
+RTS_PRIVATE HashList *ghc_rust_hash_unlink_str(HashList **head, StgWord key, const void *data);
+RTS_PRIVATE HashList *ghc_rust_hash_unlink_custom(HashList **head, StgWord key, const void *data,
+                                                CompareFunction cmp);
 #endif
 
 /* Create an identical structure, but is distinct on a type level,
@@ -212,6 +220,13 @@ expand(HashTable *table, HashFunction f)
     return;
 }
 
+#if defined(USE_RUST_RTS)
+STATIC_INLINE HashList **findHashBucket(const HashTable *table, StgWord key, HashFunction hash)
+{
+    int bucket = hash(table, key);
+    return &table->dir[bucket / HSEGSIZE][bucket % HSEGSIZE];
+}
+#else
 STATIC_INLINE void*
 lookupHashTable_inlined(const HashTable *table, StgWord key,
                         HashFunction f, CompareFunction cmp)
@@ -235,24 +250,39 @@ lookupHashTable_inlined(const HashTable *table, StgWord key,
     return NULL;
 }
 
+#endif
+
 void *
 lookupHashTable_(const HashTable *table, StgWord key,
                  HashFunction f, CompareFunction cmp)
 {
+#if defined(USE_RUST_RTS)
+    return (void *)ghc_rust_hash_lookup_custom(*findHashBucket(table, key, f), key, cmp);
+#else
     return lookupHashTable_inlined(table, key, f, cmp);
+#endif
 }
 
 void *
 lookupHashTable(const HashTable *table, StgWord key)
 {
+#if defined(USE_RUST_RTS)
+    return (void *)ghc_rust_hash_lookup_word(*findHashBucket(table, key, hashWord), key);
+#else
     return lookupHashTable_inlined(table, key, hashWord, compareWord);
+#endif
 }
 
 void *
 lookupStrHashTable(const StrHashTable* table, const char* key)
 {
+#if defined(USE_RUST_RTS)
+    StgWord word = (StgWord)key;
+    return (void *)ghc_rust_hash_lookup_str(*findHashBucket(&table->table, word, hashStr), word);
+#else
     return lookupHashTable_inlined(&table->table, (StgWord) key,
                                    hashStr, compareStr);
+#endif
 }
 
 // Puts up to szKeys keys of the hash table into the given array. Returns the
@@ -388,6 +418,18 @@ insertStrHashTable(StrHashTable *table, const char * key, const void *data)
     insertHashTable_inlined(&table->table, (StgWord) key, data, hashStr);
 }
 
+#if defined(USE_RUST_RTS)
+STATIC_INLINE void *finishHashRemoval(HashTable *table, HashList *removed, const void *data STG_UNUSED)
+{
+    if (removed == NULL) {
+        ASSERT(data == NULL);
+        return NULL;
+    }
+    freeHashList(table, removed);
+    table->kcount--;
+    return (void *)removed->data;
+}
+#else
 STATIC_INLINE void*
 removeHashTable_inlined(HashTable *table, StgWord key, const void *data,
                         HashFunction f, CompareFunction cmp)
@@ -420,24 +462,42 @@ removeHashTable_inlined(HashTable *table, StgWord key, const void *data,
     return NULL;
 }
 
+#endif
+
 void*
 removeHashTable_(HashTable *table, StgWord key, const void *data,
                  HashFunction f, CompareFunction cmp)
 {
+#if defined(USE_RUST_RTS)
+    HashList *removed = ghc_rust_hash_unlink_custom(findHashBucket(table, key, f), key, data, cmp);
+    return finishHashRemoval(table, removed, data);
+#else
     return removeHashTable_inlined(table, key, data, f, cmp);
+#endif
 }
 
 void *
 removeHashTable(HashTable *table, StgWord key, const void *data)
 {
+#if defined(USE_RUST_RTS)
+    HashList *removed = ghc_rust_hash_unlink_word(findHashBucket(table, key, hashWord), key, data);
+    return finishHashRemoval(table, removed, data);
+#else
     return removeHashTable_inlined(table, key, data, hashWord, compareWord);
+#endif
 }
 
 void *
 removeStrHashTable(StrHashTable *table, const char * key, const void *data)
 {
+#if defined(USE_RUST_RTS)
+    StgWord word = (StgWord)key;
+    HashList *removed = ghc_rust_hash_unlink_str(findHashBucket(&table->table, word, hashStr), word, data);
+    return finishHashRemoval(&table->table, removed, data);
+#else
     return removeHashTable_inlined(&table->table, (StgWord) key,
                                    data, hashStr, compareStr);
+#endif
 }
 
 /* -----------------------------------------------------------------------------

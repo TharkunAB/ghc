@@ -20,7 +20,8 @@ extra-source-files:
     rust/eventlog_file_writer.rs
     rust/file_lock.rs
     rust/gc_budget.rs
-  rust/hash_walk.rs
+    rust/hash_chain.rs
+    rust/hash_walk.rs
     rust/lib.rs
     rust/mblock_extents.rs
     rust/poll_slots.rs
