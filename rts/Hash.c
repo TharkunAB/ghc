@@ -193,6 +193,9 @@ expand(HashTable *table, HashFunction f)
     if (newindex == 0)
         allocSegment(table, newsegment);
 
+    // A custom hash function may inspect the table during the split.
+    table->dir[newsegment][newindex] = NULL;
+
     if (++table->split == table->max) {
         table->split = 0;
         table->max *= 2;
