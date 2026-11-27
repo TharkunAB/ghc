@@ -17,11 +17,20 @@ int checkVectorSupport(void) {
   // Detect x86/x86_64 support using CPUID
   #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
     unsigned int eax, ebx, ecx, edx;
-    unsigned int leaf1_ecx, leaf1_edx, leaf7_ebx;
+    unsigned int max_basic_leaf, leaf1_ecx, leaf1_edx, leaf7_ebx = 0;
     unsigned int xcr0_eax = 0, xcr0_edx = 0;
     unsigned long long xcr0 = 0;
 
-    // Check for SSE (128-bit)
+    // Find the highest supported basic CPUID leaf.
+    eax = 0;
+    __asm__ __volatile__ (
+        "cpuid"
+        : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
+        : "a" (eax)
+    );
+    max_basic_leaf = eax;
+
+    // Check for SSE (128-bit).
     eax = 1;
     __asm__ __volatile__ (
         "cpuid"
@@ -32,16 +41,18 @@ int checkVectorSupport(void) {
     leaf1_ecx = ecx;
     leaf1_edx = edx;
 
-    // Check for AVX2 and AVX512-F
-    eax = 7;
-    ecx = 0;
-    __asm__ __volatile__ (
-        "cpuid"
-        : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
-        : "a" (eax), "c" (ecx)
-    );
+    // Check for AVX2 and AVX512-F when structured feature flags exist.
+    if (max_basic_leaf >= 7) {
+        eax = 7;
+        ecx = 0;
+        __asm__ __volatile__ (
+            "cpuid"
+            : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
+            : "a" (eax), "c" (ecx)
+        );
 
-    leaf7_ebx = ebx;
+        leaf7_ebx = ebx;
+    }
 
     // See Note [Vector state availability].
     if (leaf1_ecx & (1u << 27)) {
