@@ -258,6 +258,37 @@ The active shared Stage1 worker `fd8d51d` uses GHC 10.1.20261115.1 (executable S
 
 The release also handles an up-to-date `-c -dynamic-too` command with Hadrian's optional `+RTS -O64M -A64m -RTS` block. Across six warm samples per executable on a single-file fixture, ordinary GHC took 210.1 ms, the previous worker took 209.4 ms, and the new worker took 19.6 ms at the median (10.7× versus ordinary GHC). A required compile delegated once with the original arguments and reproduced all four artifacts byte for byte.
 
+### Shared Stage0 worker 94c0f01
+
+The active worker uses a bounded binary codec for the optional positive
+CPP cache. Both workers used GHC 10.1.20261127 (`cafe7121a8e6`) and the
+same 943-module dependency command. Two ordinary GHC controls took
+10.747 s and 10.546 s (median 10.646 s).
+
+| Dependency scan | Previous worker `7d77754` | Binary cache `94c0f01` |
+| --- | ---: | ---: |
+| Admit current records into a nearly full history | 6.327 s | 5.787 s |
+| Fresh daemon after admission | 4.308 s | 3.964 s |
+| Fresh daemon with a normal populated cache | 5.362 s | 4.422 s |
+
+First admission took 8.5% less time than on the previous worker and
+45.6% less than on ordinary GHC. It improved all four alternating pairs.
+Restarts after admission improved three of four pairs. The two normal
+populated-cache pairs had split results. Median daemon CPU on admission
+fell from 6.14 s to 5.49 s. Median peak daemon RSS on restarts after
+admission fell from 561.7 MiB to 534.9 MiB.
+
+Both workers added all 104 current CPP records to the same history
+fixture with 5,195 synthetic keys derived from real header lists.
+The previous worker retained 5,097 historical keys and the new worker
+retained all 5,195. Both reused 104 positive and 835 empty results at
+restart. Dependency files, backups, stdout and diagnostics matched
+ordinary GHC, and all 1,068 watched inputs stayed stable. Pueue 7461
+peaked at 561 MiB. Job 7460 covered capacity, invalid stores and
+concurrent writers. Job 7471 verified that the packaged shim and daemon
+had the timed executable hashes and passed release smoke. The v4 store
+uses a separate file and starts filling on first use.
+
 ### Shared Stage0 worker 7d77754
 
 The packaged worker reuses the decoded positive CPP store when a
