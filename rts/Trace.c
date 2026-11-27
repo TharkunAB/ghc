@@ -25,6 +25,8 @@
 #include "RtsFlags.h"
 #include "ThreadLabels.h"
 
+#include <limits.h>
+
 #if defined(HAVE_UNISTD_H)
 #include <unistd.h>
 #endif
@@ -250,7 +252,8 @@ static void traceSchedEvent_stderr (Capability *cap, EventTypeNum tag,
     // See Note [Thread label publication] in ThreadLabels.c.
     StgArrBytes *label = ACQUIRE_LOAD(&tso->label);
     if (label) {
-        threadLabelLen = (int) label->bytes;
+        threadLabelLen = label->bytes > (StgWord)INT_MAX
+                       ? INT_MAX : (int)label->bytes;
         threadLabel = (char *) label->payload;
     }
 
@@ -918,8 +921,9 @@ void traceThreadLabel_(Capability *cap,
     if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
         ACQUIRE_LOCK(&trace_utx);
         tracePreface();
+        int precision = len > (size_t)INT_MAX ? INT_MAX : (int)len;
         debugBelch("cap %d: thread %" FMT_Word " has label %.*s\n",
-                   cap->no, (W_)tso->id, (int) len, label);
+                   cap->no, (W_)tso->id, precision, label);
         RELEASE_LOCK(&trace_utx);
     } else
 #endif
