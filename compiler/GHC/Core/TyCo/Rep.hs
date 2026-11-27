@@ -923,7 +923,7 @@ mkTyCoVarTy v
 mkTyCoVarTys :: [TyCoVar] -> [Type]
 mkTyCoVarTys = map mkTyCoVarTy
 
-infixr 3 `mkFunTy`, `mkInvisFunTy`, `mkVisFunTyMany`
+infixr 3 `mkFunTy`, `mkInvisFunTy`, `mkVisFunTyMany`, `mkVisFunTyManyM`, `mkVisFunTyManyU`
 
 {- Note [Ordinary arrow matchability]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

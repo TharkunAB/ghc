@@ -3159,6 +3159,11 @@ nativeIndexExprWith allow_conversions extra = go emptyVarEnv
       = do { (fields', indices) <- unzip <$> traverse (go env) fields
            ; index <- nativeFamilyPromotedCon_maybe con tys indices
            ; return (build fields', index) }
+      | Just (con, tys, build, field) <- splitNativeNewtypeConApp expr
+      = do { (field', index) <- go env field
+           ; if nativeIndexArgKinds con tys [index]
+             then Just (build field', mkTyConApp (promoteDataCon con) (tys ++ [index]))
+             else Nothing }
       | Just (con, tys, fields) <- splitNativeIndexedConApp expr
       , (builder, args) <- collectArgs expr
       = do { (fields', indices) <- unzip <$> traverse (go env) fields
@@ -3393,8 +3398,47 @@ mapNativeIndexWithNatural mk_natural subst expr
       , fields `lengthIs` dataConSourceArity con
       , nativeIndexArgKinds con tys fields
       = do { values <- traverse from_index fields
-           ; return (mkConApp con (map Type tys ++ values)) }
+           ; case (newTyConCo_maybe (dataConTyCon con), values) of
+               (Just nt_ax, [val]) | isNewTyCon (dataConTyCon con) ->
+                 return (Cast val (mkSymCo (mkUnbranchedAxInstCo Representational nt_ax tys [])))
+               _ -> return (mkConApp con (map Type tys ++ values)) }
     from_index _ = Nothing
+
+-- | Recognise a lifted vanilla newtype constructor application or representation cast.
+splitNativeNewtypeConApp :: CoreExpr
+                         -> Maybe (DataCon, [Type], CoreExpr -> CoreExpr, CoreExpr)
+splitNativeNewtypeConApp (Cast field sym_nt_co) = do
+  (nt_ax, tys) <- sym_unbranched_axiom sym_nt_co
+  let tc = coAxiomTyCon nt_ax
+  guard (isVanillaAlgTyCon tc && isNewTyCon tc && isLiftedAlgTyCon tc && not (isTypeDataTyCon tc))
+  guard (Just nt_ax == newTyConCo_maybe tc)
+  con <- tyConSingleDataCon_maybe tc
+  _ <- nativeIndexDataConTyArgs (mkTyConApp tc tys) con
+  [Scaled _ dom] <- pure (dataConInstOrigArgTys con tys)
+  guard (coercionRole sym_nt_co == Representational
+         && coercionLKind sym_nt_co `eqType` dom
+         && coercionRKind sym_nt_co `eqType` mkTyConApp tc tys)
+  return (con, tys, (`Cast` sym_nt_co), field)
+splitNativeNewtypeConApp (App (Lam v (Cast (Var v') sym_nt_co)) field)
+  | v == v'
+  = splitNativeNewtypeConApp (Cast field sym_nt_co)
+splitNativeNewtypeConApp expr = do
+  (Var fn, args) <- Just (collectArgs expr)
+  con <- case isDataConWrapId_maybe fn of
+           Just c  -> Just c
+           Nothing -> isDataConWorkId_maybe fn
+  let tc = dataConTyCon con
+  guard (isVanillaAlgTyCon tc && isNewTyCon tc && isLiftedAlgTyCon tc && not (isTypeDataTyCon tc))
+  nt_ax <- newTyConCo_maybe tc
+  let (type_args, rest) = splitAt (length (dataConUnivTyVars con)) args
+  [field] <- pure rest
+  tys <- traverse family_type_arg type_args
+  _ <- nativeIndexDataConTyArgs (mkTyConApp tc tys) con
+  [Scaled _ dom] <- pure (dataConInstOrigArgTys con tys)
+  let sym_nt_co = mkSymCo (mkUnbranchedAxInstCo Representational nt_ax tys [])
+  guard (coercionLKind sym_nt_co `eqType` dom
+         && coercionRKind sym_nt_co `eqType` mkTyConApp tc tys)
+  return (con, tys, (`Cast` sym_nt_co), field)
 
 -- | Read the public wrapper of an ordinary lazy data family constructor.
 nativeFamilyConHead_maybe :: DataCon -> [Type] -> Maybe CoreExpr

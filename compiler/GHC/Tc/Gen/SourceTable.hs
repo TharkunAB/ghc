@@ -6,7 +6,8 @@
 module GHC.Tc.Gen.SourceTable
   ( recordSourceUses, recordUnfoldedSourceUses, sourceTableTyCons, sourceCaseTables
   , sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables
-  , publishRetainedRecordWitness, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness
+  , publishRetainedRecordWitness, publishPlainRecordFieldSelector
+  , checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness
   , finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables, finalCoreSourceFamilies
   , isFinalCoreIdentity, indexedProjectionSource, isFinalCoreReverseWrapper
   , sourcePairBuilderField, lookupObservedPairField, lookupPairObserver, lookupPairRecipe
@@ -19,9 +20,9 @@ module GHC.Tc.Gen.SourceTable
   , toKindMatchableArrows, rebuildSourceFamilyWith
   , visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt
   , sourceEquationDatatypes, publicCaseType, ordinaryImport
-  , sourceBinarySelector, sourceMapSelector, lookupSourceBinaryMethod, lookupSourceContainerMethod
+  , sourceBinarySelector, sourceMapSelector, lookupSourceUnaryMethod, lookupSourceBinaryMethod, lookupSourceContainerMethod
   , lookupSourceGroundDFun, lookupSourceCheckedMapMethod, publishListFoldMethods
-  , keepCheckedMapWorkers, publishCheckedMapMethods, sourceRuleOwnersAt
+  , keepCheckedMapWorkers, publishCheckedMapMethods, addSourceMethods, certifyLocalInstanceMethods, sourceRuleOwnersAt
   , recordSourceMethodUse, recordSourceLiteralUse, sourceLiteralWorkers
   , lookupBootModuleIdMaybe, isSourceFilterGuard
   , OptionalSourceUses, optionalSourceUses, registerOptionalSourceUses
@@ -33,12 +34,13 @@ module GHC.Tc.Gen.SourceTable
 
 import GHC.Prelude
 
-import GHC.Builtin.KnownKeys (patErrorIdKey)
+import GHC.Builtin.KnownKeys (eqClassKey, patErrorIdKey)
 import GHC.Builtin.KnownOccs (eqClassOpOcc, minusClassOpOcc)
 import GHC.Builtin.Modules (gHC_CLASSES, gHC_INTERNAL_BASE, gHC_INTERNAL_NUM_INTEGER, gHC_TYPES, mkGhcInternalModule)
+import GHC.Builtin.PrimOps (PrimOp(DataToTagLargeOp, DataToTagSmallOp))
 import GHC.Builtin.WiredIn.Types
   ( nilDataCon, consDataCon, boolTy, falseDataCon, trueDataCon, charTy, integerTy, integerTyConName
-  , listTyCon, matchableDataConTy, mkListTy, mkTupleTy, promotedTupleDataCon, tupleDataCon, tupleTyCon
+  , listTyCon, manyDataConTy, matchableDataConTy, mkListTy, mkTupleTy, promotedTupleDataCon, tupleDataCon, tupleTyCon
   , unmatchableDataConTy )
 import GHC.Core (CoreRule(..), isAutoRule, ruleActivation)
 import qualified GHC.Core as Core
@@ -46,9 +48,9 @@ import GHC.Core.CharCase (certDefault, certOwner, certResultTyCon, certRows, cer
 import GHC.Core.Class (Class, classAllSelIds, classMethods, className, classTyCon, classTyVars)
 import GHC.Core.Coercion
   ( abstractNativeIndices, coercionLKind, coercionRKind, coercionRole, hasCoercionHole
-  , mkCoVarCo, mkNomReflCo, mkSymCo, mkTyConAppCo )
+  , isReflCo, mkCoVarCo, mkNomReflCo, mkSymCo, mkTyConAppCo )
 import GHC.Core.Coercion.Axiom
-  ( ClosedTyFam(..), CoAxBranch, coAxiomBranches, coAxiomName, coAxiomRole
+  ( ClosedTyFam(..), CoAxBranch, CoAxiomRule(UnbranchedAxiom), coAxiomBranches, coAxiomName, coAxiomRole
   , coAxBranchCoVars, coAxBranchLHS, coAxBranchRHS, coAxBranchRoles, coAxBranchSpan, coAxBranchTyVars, fromBranches )
 import GHC.Core.ConLike (ConLike(..))
 import GHC.Core.DataCon
@@ -69,7 +71,7 @@ import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.FVs (tyCoVarsOfTypeList, tyConsOfTypes)
-import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, FunTy, TyVarTy, TermVarTy, DepFunTy, DepDictTy, ForAllTy, ExistsTy, CastTy))
+import GHC.Core.TyCo.Rep (Coercion(AxiomCo, SymCo), Type(TyConApp, FunTy, TyVarTy, TermVarTy, DepFunTy, DepDictTy, ForAllTy, ExistsTy, CastTy))
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Unify (alwaysBindTv, tcMatchTys, tcUnifyTys)
@@ -100,7 +102,7 @@ import GHC.Tc.TyCl.Build (newImplicitBinder)
 import GHC.Tc.Types (SourceCheckState(..), SourceRuleUses(..), TcGblEnv(..), tcVisibleOrphanMods)
 import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, ATcTyCon, tct_id))
 import GHC.Tc.Types.ErrCtxt (FunAppCtxtFunArg(..), HsCtxt(..))
-import GHC.Tc.Types.Evidence (EvBindsState(..), HsWrapper(..), TcEvBinds(..), collectHsWrapBinders, isEmptyEvBindsMap)
+import GHC.Tc.Types.Evidence (EvBind(..), EvBindsState(..), EvTerm(..), HsWrapper(..), TcEvBinds(..), collectHsWrapBinders, evBindMapBinds)
 import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTypeEnv)
 import GHC.Tc.Utils.Env (tcGetInstEnvs, tcLookupId, tcLookupIdMaybe)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
@@ -116,10 +118,10 @@ import GHC.Types.Basic (LeftOrRight(..), Origin(..), SourceTableOrigin(..), Unfo
 import GHC.Types.Error (errorsFound)
 import GHC.Types.Id
   ( globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo, idInlineActivation, idInlinePragma, idMult, idName
-  , idUnfolding, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isJoinId, mkSysLocal, mkSysLocalM
-  , mkVanillaGlobal, realIdUnfolding, setIdExported, setIdInfo, setIdType, setSourceMethodIds
+  , idUnfolding, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isJoinId, isPrimOpId_maybe
+  , mkLocalId, mkSysLocal, mkSysLocalM, mkVanillaGlobal, realIdUnfolding, setIdExported, setIdInfo, setIdType, setSourceMethodIds
   , sourceLiteralCons_maybe, sourceMethodAliases, sourceMethodDFunClass, sourceMethodTarget_maybe, sourceTableId_maybe )
-import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, DFunId, SourceTableId, VanillaId), SourceDFun(..), setSourceProofRuleInfo)
+import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, DFunId, RecSelId, SourceTableId, VanillaId, sel_sourceTable), SourceDFun(..), setSourceProofRuleInfo)
 import GHC.Types.InlinePragma (ActivationX(ActiveAfter, ActiveBefore), PhaseNum, isDefaultInlinePragma, isNeverActive, isOpaquePragma)
 import GHC.Types.Name
   ( Name, OccName, SourceProofArg(..), SourceProofArgs, SourceProofRule, isExternalName, isFieldOcc, isVarOcc
@@ -138,7 +140,7 @@ import GHC.Types.TyThing (TyThing(..))
 import GHC.Types.TypeEnv (TypeEnv, extendTypeEnvWithIds, lookupTypeEnv, typeEnvElts, typeEnvIds)
 import GHC.Types.Unique (hasKey, minLocalUnique)
 import GHC.Types.Unique.FM (plusUFM_C)
-import GHC.Types.Unique.Set (elementOfUniqSet, mkUniqSet, nonDetEltsUniqSet, sizeUniqSet)
+import GHC.Types.Unique.Set (addOneToUniqSet, elementOfUniqSet, emptyUniqSet, mkUniqSet, nonDetEltsUniqSet, sizeUniqSet)
 import GHC.Types.Unique.Supply (UniqSupply)
 import GHC.Types.Var (CoVar, Id, VarBndr(..), idDetails, isCoVar, isId, mkTyVar, setIdDetails, varName)
 import GHC.Types.Var.Env (InScopeSet, extendInScopeSet, mkInScopeSet, uniqAway)
@@ -911,6 +913,32 @@ and hand the instantiated predicate back to `GHC.Tc.Gen.HsType` so lexical Given
 and active `RULES` on the selector, `DFunId`, and worker are checked together.
 -}
 
+sourceUnarySelectorWithTarget :: Id -> Maybe (Class, TyVar)
+sourceUnarySelectorWithTarget selector = do
+    cls <- isClassOpId_maybe selector
+    let params = classTyVars cls
+    (dom, result) <- caseArrow (classMethodInstTy selector (mkTyVarTys params))
+    target <- getTyVar_maybe dom
+    guard (target `elem` params && (result `eqType` dom || isJust (ordinaryDataType result)))
+    pure (cls, target)
+
+lookupSourceUnaryMethod :: Id -> Type -> TcM (Maybe (Id, Id, TyCon))
+lookupSourceUnaryMethod selector domain
+  | Just (cls, target_tv) <- sourceUnarySelectorWithTarget selector = do
+      env <- getGblEnv
+      selected <- if lengthIs (classTyVars cls) 1
+        then fmap (, [domain]) <$> lookupSourceGroundDFun cls domain
+        else lookupSourceMultiGroundDFun cls target_tv domain
+      case selected of
+        Just (dfun, pred_args) | Just name <- sourceMethodTarget_maybe dfun selector -> do
+          worker <- lookupInstalledOrGlobalId env name
+          pure $ do
+            method <- worker
+            guard (varType method `eqType` classMethodInstTy selector pred_args)
+            (dfun, method,) <$> sourceTableId_maybe method
+        _ -> pure Nothing
+  | otherwise = pure Nothing
+
 sourceBinarySelectorWithTarget :: Id -> Maybe (Class, TyVar)
 sourceBinarySelectorWithTarget selector = do
     cls <- isClassOpId_maybe selector
@@ -927,12 +955,13 @@ sourceBinarySelector = fmap fst . sourceBinarySelectorWithTarget
 lookupSourceBinaryMethod :: Id -> Type -> TcM (Maybe (Id, Id, TyCon))
 lookupSourceBinaryMethod selector domain
   | Just (cls, target_tv) <- sourceBinarySelectorWithTarget selector = do
+      env <- getGblEnv
       selected <- if lengthIs (classTyVars cls) 1
         then fmap (, [domain]) <$> lookupSourceGroundDFun cls domain
         else lookupSourceMultiGroundDFun cls target_tv domain
       case selected of
         Just (dfun, pred_args) | Just name <- sourceMethodTarget_maybe dfun selector -> do
-          worker <- tcLookupIdMaybe name
+          worker <- lookupInstalledOrGlobalId env name
           pure $ do
             method <- worker
             guard (varType method `eqType` classMethodInstTy selector pred_args)
@@ -959,26 +988,33 @@ lookupSourceMultiGroundDFun cls target_tv domain
       case matches of
         [(inst, [], pred_args)]
           | not (isIncoherent inst), Right (chosen, []) <- lookupUniqueInstEnv insts cls pred_args
-          , instanceDFunId chosen == instanceDFunId inst
-          , let name = idName (instanceDFunId inst)
-          , nameModule_maybe name /= Just (tcg_semantic_mod env) -> do
-              candidate <- tcLookupIdMaybe name
+          , instanceDFunId chosen == instanceDFunId inst -> do
+              let name = idName (instanceDFunId inst)
+              candidate <- lookupInstalledOrGlobalId env name
               pure $ do
                 dfun <- candidate
                 (dfun, pred_args) <$ guard (varType dfun `eqType` mkClassPred cls pred_args)
         _ -> pure Nothing
   | otherwise = pure Nothing
 
+lookupInstalledOrGlobalId :: TcGblEnv -> Name -> TcM (Maybe Id)
+lookupInstalledOrGlobalId env name =
+  case lookupTypeEnv (tcg_type_env env) name of
+    Just (AnId v) -> pure (Just v)
+    _ | nameModule_maybe name == Just (tcg_semantic_mod env) -> pure Nothing
+      | otherwise -> tcLookupIdMaybe name
+
 lookupSourceContainerMethod :: Id -> Type -> TcM (Maybe (Id, Id, TyCon))
 lookupSourceContainerMethod selector domain
   | Just cls <- isClassOpId_maybe selector
   , let fold_method = listFoldSelector cls selector
   , fold_method || sourceMapSelector selector = do
+      env <- getGblEnv
       selected <- lookupSourceGroundDFun cls domain
       case selected of
         Just dfun -> do
           target <- case sourceMethodTarget_maybe dfun selector of
-            Just term -> tcLookupIdMaybe term
+            Just term -> lookupInstalledOrGlobalId env term
             Nothing -> pure $ do
               Core.DFunUnfolding [] con fields <- pure (idUnfolding dfun)
               slots <- dictionarySlotsMulti cls [domain] (Core.mkApps (Core.Var (dataConWorkId con)) fields)
@@ -1000,23 +1036,22 @@ lookupSourceCheckedMapMethod cls selector domain
       env <- getGblEnv
       let check_selected inst args pred_args allow_empty = do
             let name = idName (instanceDFunId inst)
-            if nameModule_maybe name == Just (tcg_semantic_mod env) then pure Nothing else do
-              candidate <- tcLookupIdMaybe name
-              case candidate of
-                Just dfun
-                  | let predicate = mkClassPred cls pred_args
-                  , Just applied <- erasedMethodType (varType dfun) args, applied `eqType` predicate
-                  , Just target <- sourceMethodTarget_maybe dfun selector -> do
-                      worker <- tcLookupIdMaybe target
-                      pure $ do
-                        method <- worker
-                        method_ty <- erasedMethodType (varType method) args
-                        guard (method_ty `eqType` classMethodInstTy selector pred_args)
-                        table <- sourceTableId_maybe method
-                        sig <- constructorCaseType (tyConKind table)
-                        guard (isJust (checkedMapPrefixAllowEmpty allow_empty sig) && sourceCaseVisibleArity table == Just 2)
-                        pure (dfun, predicate, method, table)
-                _ -> pure Nothing
+            candidate <- lookupInstalledOrGlobalId env name
+            case candidate of
+              Just dfun
+                | let predicate = mkClassPred cls pred_args
+                , Just applied <- erasedMethodType (varType dfun) args, applied `eqType` predicate
+                , Just target <- sourceMethodTarget_maybe dfun selector -> do
+                    worker <- lookupInstalledOrGlobalId env target
+                    pure $ do
+                      method <- worker
+                      method_ty <- erasedMethodType (varType method) args
+                      guard (method_ty `eqType` classMethodInstTy selector pred_args)
+                      table <- sourceTableId_maybe method
+                      sig <- constructorCaseType (tyConKind table)
+                      guard (isJust (checkedMapPrefixAllowEmpty allow_empty sig) && sourceCaseVisibleArity table == Just 2)
+                      pure (dfun, predicate, method, table)
+              _ -> pure Nothing
       if lengthIs (classTyVars cls) 1
         then case lookupUniqueInstEnv insts cls [domain] of
           Right (inst, args)
@@ -1069,10 +1104,10 @@ lookupSourceGroundDFun cls domain
       insts <- tcGetInstEnvs
       env <- getGblEnv
       case lookupUniqueInstEnv insts cls [domain] of
-        Right (inst, [])
-          | let name = idName (instanceDFunId inst), nameModule_maybe name /= Just (tcg_semantic_mod env) -> do
-              candidate <- tcLookupIdMaybe name
-              pure (candidate >>= \dfun -> dfun <$ guard (varType dfun `eqType` mkClassPred cls [domain]))
+        Right (inst, []) -> do
+          let name = idName (instanceDFunId inst)
+          candidate <- lookupInstalledOrGlobalId env name
+          pure (candidate >>= \dfun -> dfun <$ guard (varType dfun `eqType` mkClassPred cls [domain]))
         _ -> pure Nothing
   | otherwise = pure Nothing
 
@@ -1803,7 +1838,7 @@ monomorphicEnumCaseKinds ty = do
 caseDatatype :: Type -> Maybe (TyCon, [Type])
 caseDatatype ty = do
     (tc, args) <- splitTyConApp_maybe ty
-    (tc, args) <$ guard (isVanillaAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
+    (tc, args) <$ guard (isVanillaAlgTyCon tc && isLiftedDataOrNewTyCon tc &&
                          lengthIs args (tyConArity tc) && not (null (tyConDataCons tc)))
 
 emptyCaseDatatype :: Type -> Maybe (TyCon, [Type])
@@ -1897,7 +1932,7 @@ strictlyPositiveSourceField rec_tcs pos_tvs ty0
         strictlyPositiveSourceField rec_tcs (delVarSet pos_tvs b) body
       CastTy t _ -> strictlyPositiveSourceField rec_tcs pos_tvs t
       TyConApp tc args
-        | isAlgTyCon tc, isBoxedDataTyCon tc, not (isAbstractTyCon tc), null (tyConStupidTheta tc)
+        | isAlgTyCon tc, isLiftedDataOrNewTyCon tc, not (isAbstractTyCon tc), null (tyConStupidTheta tc)
         , let tc_tvs = tyConTyVars tc
         , equalLength args tc_tvs
         , all (\con -> isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con)
@@ -2396,6 +2431,9 @@ compileCoreEquations spec owner original_rhs = do
     let eff_result = maybe result (\l -> mkTupleTy Unboxed [l, l]) unboxed_pair_mode
         init_st = BranchState (mkInScopeSet (exprsFreeVars [rhs0])) True (map PatVar terms) init_aliases [] [] [] []
 
+        descend st raw_e
+          | Just (st_nt, nt_body) <- exposeNewtypeUnwrap public public_kind st (stripTicksE isSourceBreakpoint raw_e)
+          = descend st_nt nt_body
         descend st raw_e =
           let body = stripTicksE isSourceBreakpoint raw_e
               scoped v = any (hasPatVar v) (bs_pats st)
@@ -2591,6 +2629,15 @@ compileCoreEquations spec owner original_rhs = do
             _ -> checkNonBuild seen under_con scoped expr
           where
             checkNonBuild seen_vs under_c scoped expr =
+              (do Core.Cast inner_expr sym_co <- pure expr
+                  (tc, args) <- caseDatatype expected
+                  guard (isNewTyCon tc && public tc && all public_kind args)
+                  nt_ax <- newTyConCo_maybe tc
+                  [dc] <- pure (tyConDataCons tc)
+                  [field_ty] <- openDataConFieldTypes dc args
+                  guard (public_kind field_ty && isNewtypeWrapCo nt_ax field_ty expected sym_co)
+                  (child, b_flag) <- checkLeaf seen_vs True allow_full st field_ty inner_expr
+                  pure (RhsCon dc args [child], b_flag)) <|>
               (do guard under_c
                   (side, list_ty, self_rhs) <- matchSuspendedProj (bs_susps st) expr
                   (RhsTupleProj side list_ty self_rhs, False) <$ guard (list_ty `eqType` expected)) <|>
@@ -2660,6 +2707,65 @@ compileCoreEquations spec owner original_rhs = do
       }
   where
     ($>) = flip (<$)
+
+    isNewtypeUnwrapCo nt_ax src_ty dst_ty co@(AxiomCo (UnbranchedAxiom ax) cos) =
+      ax == nt_ax && all isReflCo cos &&
+      coercionLKind co `eqType` src_ty && coercionRKind co `eqType` dst_ty
+    isNewtypeUnwrapCo _ _ _ _ = False
+
+    isNewtypeWrapCo nt_ax src_ty dst_ty (SymCo co) = isNewtypeUnwrapCo nt_ax dst_ty src_ty co
+    isNewtypeWrapCo _ _ _ _                        = False
+
+    exposeNewtypeUnwrap public public_kind st expr = do
+      (scrut, nt_ax, dc, args, field_ty) <- findUnwrap expr
+      let f_id = uniqAway (bs_scope st) (mkSysLocal (fsLit "nt") minLocalUnique ManyTy field_ty)
+          in_scope' = extendInScopeSet (bs_scope st) f_id
+          replace (PatVar v) | v == scrut = (True, PatCon dc args [PatVar f_id])
+          replace pat@PatVar{}            = (False, pat)
+          replace (PatCon con tys cs)     = let (fs, cs') = unzip (map replace cs) in (or fs, PatCon con tys cs')
+          (replaced, patterns') = unzip (map replace (bs_pats st))
+      guard (or replaced)
+      let rewrite (Core.Cast (Core.Var actual) co)
+            | resolveCaseAlias (bs_aliases st) actual == scrut
+            , isNewtypeUnwrapCo nt_ax (varType scrut) field_ty co
+            = Core.Var f_id
+          rewrite (Core.App a b)        = Core.App (rewrite a) (rewrite b)
+          rewrite (Core.Lam b e)        = Core.Lam b (rewrite e)
+          rewrite (Core.Let b e)        = Core.Let (rewriteBind b) (rewrite e)
+          rewrite (Core.Case s b t as)  = Core.Case (rewrite s) b t [Core.Alt c bs (rewrite r) | Core.Alt c bs r <- as]
+          rewrite (Core.Cast e co)      = Core.Cast (rewrite e) co
+          rewrite (Core.Tick t e)       = Core.Tick t (rewrite e)
+          rewrite other                 = other
+          rewriteBind (Core.NonRec b r) = Core.NonRec b (rewrite r)
+          rewriteBind (Core.Rec ps)     = Core.Rec [(b, rewrite r) | (b, r) <- ps]
+          st' = st { bs_root  = False
+                   , bs_scope = in_scope'
+                   , bs_pats  = patterns'
+                   , bs_known = (scrut, (dc, args, [f_id])) : bs_known st }
+      pure (st', rewrite expr)
+      where
+        is_pat_var v = any (hasPatVar v) (bs_pats st) &&
+                       all (\case PatCon _ _ _ -> True; _ -> True) (bs_pats st) &&
+                       isNothing (lookup v (bs_known st))
+        findUnwrap (Core.Cast (Core.Var actual) co)
+          | let scrut = resolveCaseAlias (bs_aliases st) actual
+          , is_pat_var scrut
+          , Just (tc, args) <- caseDatatype (varType scrut)
+          , isNewTyCon tc && public tc && all public_kind args
+          , Just nt_ax <- newTyConCo_maybe tc
+          , [dc] <- tyConDataCons tc
+          , Just [field_ty] <- openDataConFieldTypes dc args
+          , public_kind field_ty
+          , isNewtypeUnwrapCo nt_ax (varType scrut) field_ty co
+          = Just (scrut, nt_ax, dc, args, field_ty)
+        findUnwrap (Core.App a b)       = findUnwrap a <|> findUnwrap b
+        findUnwrap (Core.Lam _ e)       = findUnwrap e
+        findUnwrap (Core.Let (Core.NonRec _ r) e) = findUnwrap r <|> findUnwrap e
+        findUnwrap (Core.Let (Core.Rec ps) e)     = foldr (<|>) (findUnwrap e) (map (findUnwrap . snd) ps)
+        findUnwrap (Core.Case s _ _ as) = findUnwrap s <|> foldr (<|>) Nothing [findUnwrap r | Core.Alt _ _ r <- as]
+        findUnwrap (Core.Cast e _)      = findUnwrap e
+        findUnwrap (Core.Tick _ e)      = findUnwrap e
+        findUnwrap _                    = Nothing
 
     collectValueLams (Core.Lam v e) | isId v = let (vs, rest) = collectValueLams e in (v : vs, rest)
     collectValueLams e = ([], e)
@@ -3293,7 +3399,7 @@ projectionResultCoercion families from to
   | otherwise = do
       (tc, left) <- splitTyConApp_maybe from
       (result_tc, right) <- splitTyConApp_maybe to
-      guard (tc == result_tc && isBoxedDataTyCon tc && lengthIs left (length right))
+      guard (tc == result_tc && isLiftedDataOrNewTyCon tc && lengthIs left (length right))
       mkTyConAppCo Nominal tc <$> zipWithM check left right
   where
     check found expected
@@ -3601,6 +3707,36 @@ publishRetainedRecordWitness con owner
         (CompiledCoreTable tele domains result [CompiledCoreRow [PatCon con args (map PatVar (witness : fields))] (RhsVar witness)] False)
   | otherwise = pprPanic "publishRetainedRecordWitness: invalid selector" (ppr owner)
 
+-- | Publish a source equation family for a total single-constructor record field selector
+-- when @-fwrite-source-equations@ is active.
+publishPlainRecordFieldSelector :: DataCon -> Int -> Id -> TcM (Maybe TyCon)
+publishPlainRecordFieldSelector con idx owner = do
+  write_eqs <- goptM Opt_WriteSourceEquations
+  if not write_eqs then pure Nothing else
+    case plain_selector_spec of
+      Nothing -> pure Nothing
+      Just (binders, args, domain, result, field_tys) -> do
+        fields <- mapM (mkSysLocalM (fsLit "field") ManyTy) field_tys
+        let target = fields !! idx
+            row    = CompiledCoreRow [PatCon con args (map PatVar fields)] (RhsVar target)
+        fmap fst <$> publishCompiledWithGuard owner (CompiledCoreTable binders [domain] result [row] False)
+  where
+    plain_selector_spec = do
+      let tc = dataConTyCon con
+          (telescope, body) = splitForAllForAllTyBinders (varType owner)
+      guard (isVanillaAlgTyCon tc && isLiftedDataOrNewTyCon tc && [con] == tyConDataCons tc)
+      binders <- traverse ordinaryCaseBinder telescope
+      (domain, result) <- caseArrow body
+      (tc', args) <- caseDatatype domain
+      guard (tc' == tc && all (tcIsLiftedTypeKind . varType) (binderVars binders)
+             && eqTypes args (mkTyVarTys (binderVars binders)))
+      let instantiate = substTyWith (dataConUnivTyVars con) args
+          field_tys   = map (instantiate . scaledThing) (dataConOrigArgTys con)
+      guard (idx >= 0 && idx < length field_tys
+             && all (\t -> tcIsLiftedTypeKind (typeKind t) && isTauTy t) field_tys
+             && result `eqType` (field_tys !! idx))
+      pure (binders, args, domain, result, field_tys)
+
 checkLocalRetainedWitnessExports :: TcGblEnv -> [Id] -> TcM ()
 checkLocalRetainedWitnessExports env owners = do
     let exported = availsToNameSet (tcg_exports env)
@@ -3631,6 +3767,12 @@ checkLocalRetainedWitnessExports env owners = do
         , table `elementOfUniqSet` exported_tycons
         , pair : _ <- unexported_value_table_types exported table ->
             emit (idName owner) (idName owner) Nothing (detailFor pair)
+        | RecSelId { sel_sourceTable = Just ts } <- idDetails owner, ts == table
+        , isNothing (directRetainedWitnessType (varType owner))
+        , isNothing (retainedWitnessType (varType owner))
+        , table `elementOfUniqSet` exported_tycons
+        , pair : _ <- unexported_value_table_types exported table ->
+            emit (idName owner) (idName owner) Nothing (detailFor pair)
       _ -> pure ()
   where
     is_local n = nameModule_maybe n == Just (tcg_semantic_mod env)
@@ -3645,7 +3787,15 @@ checkLocalRetainedWitnessExports env owners = do
                                                            , is_local (tyConName tc), not (tyConName tc `elemNameSet` exported)])
 
 sourceTableWithCallees :: TyCon -> [TyCon]
-sourceTableWithCallees table = table : fromMaybe [] (sourceTableCallees table)
+sourceTableWithCallees root = go emptyUniqSet [root]
+  where
+    go _ [] = []
+    go seen (t : ts)
+      | t `elementOfUniqSet` seen = go seen ts
+      | otherwise =
+          let seen'   = addOneToUniqSet seen t
+              callees = fromMaybe [] (sourceTableCallees t)
+          in t : go seen' (callees ++ ts)
 
 tablePromotedParents :: Bool -> [TyCon] -> [TyCon]
 tablePromotedParents include_lhs tables =
@@ -3707,9 +3857,11 @@ unexportedLargeElimTypes env exported table =
     hidden_domains = [tyConName tc | tc <- nonDetEltsUniqSet (mkUniqSet domain_tcs)
                                    , is_local (tyConName tc), not (publicCaseType env exported (const False) tc)]
     all_rhs_tys = [coAxBranchRHS br | t <- tables, ax <- maybeToList (closedFamilyTyConCoAxiom_maybe t), br <- fromBranches (coAxiomBranches ax)]
-    rhs_tcs = [tc | tc <- nonDetEltsUniqSet (tyConsOfTypes all_rhs_tys), isNothing (isPromotedDataCon_maybe tc), tc `notElem` tables]
-    callee_owners = [ mkVarOcc (occNameString o) | c <- fromMaybe [] (sourceTableCallees table)
-                    , isLargeElimTable c, is_local (tyConName c), Just o <- [sourceTableTermOcc (nameOccName (tyConName c))] ]
+    raw_rhs_tcs = [tc | tc <- nonDetEltsUniqSet (tyConsOfTypes all_rhs_tys), isNothing (isPromotedDataCon_maybe tc), tc `notElem` tables]
+    rhs_tcs = [tc | tc <- raw_rhs_tcs, isNothing (sourceTableTermOcc (nameOccName (tyConName tc)))]
+    callee_owners = [ mkVarOcc (occNameString o)
+                    | c <- drop 1 tables ++ raw_rhs_tcs
+                    , is_local (tyConName c), Just o <- [sourceTableTermOcc (nameOccName (tyConName c))] ]
     hidden_callees = [idName v | v <- typeEnvIds (tcg_type_env env), is_local (idName v)
                                , nameOccName (idName v) `elem` callee_owners, not (idName v `elemNameSet` exported)]
     hidden_rhs_types = [tyConName tc | tc <- nonDetEltsUniqSet (mkUniqSet rhs_tcs)
@@ -3961,7 +4113,7 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun a
       | Just (FTF_T_T, ma, mult, dom, res) <- splitFunTy_maybe arg
       = ma `eqType` unmatchableDataConTy && isManyTy mult && embCarried tvs dom && embCarried tvs res
       | tcIsLiftedTypeKind (typeKind arg), isTyFamFree arg, all (`elem` tvs) (tyCoVarsOfTypeList arg)
-      , Just (tc, _) <- splitTyConApp_maybe arg = isAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc
+      , Just (tc, _) <- splitTyConApp_maybe arg = isAlgTyCon tc && isLiftedDataOrNewTyCon tc
       | otherwise = False
 
     peelNArrows 0 ty = Just ([], ty)
@@ -4238,8 +4390,63 @@ sourceMatches binding = do
     funBind _ = Nothing
 
 emptyEvidence :: TcEvBinds -> TcM Bool
-emptyEvidence (EvBinds binds) = pure (isEmptyBag binds)
-emptyEvidence (TcEvBinds var) = isEmptyEvBindsMap <$> getTcEvBindsMap var
+emptyEvidence ev_binds = do
+    env <- getGblEnv
+    binds <- case ev_binds of
+      EvBinds bs    -> pure ( foldr (:) [] bs )
+      TcEvBinds var -> foldr (:) [] . evBindMapBinds <$> getTcEvBindsMap var
+    pure (all (certified_ev_bind env) binds)
+  where
+    certified_ev_bind env EvBind{eb_rhs = EvExpr e} = certified_dict_expr env e
+    certified_ev_bind _ _                           = False
+
+    certified_dict_expr env expr =
+      let (hd, args) = Core.collectArgs expr
+      in case hd of
+           Core.Var v
+             | DFunId{} <- idDetails (installed_id env v)
+             , let cur = installed_id env v
+             , not (null (sourceMethodAliases cur))
+             -> all (\a -> Core.isTypeArg a || certified_dict_expr env a) args
+           _ -> False
+
+    installed_id env v = case lookupTypeEnv (tcg_type_env env) (idName v) of
+      Just (AnId cur) -> cur
+      _               -> v
+
+rewriteCertifiedDictCalls :: TcGblEnv -> Core.CoreExpr -> TcM Core.CoreExpr
+rewriteCertifiedDictCalls env = go
+  where
+    installed_id v = case lookupTypeEnv (tcg_type_env env) (idName v) of
+      Just (AnId cur) -> cur
+      _               -> v
+
+    go expr
+      | (Core.Var sel, args) <- Core.collectArgs expr
+      , Just cls <- isClassOpId_maybe sel
+      , let n_cls = length (classTyVars cls)
+      , (ty_args, Core.Var raw_dfun : rest_args) <- splitAt n_cls args
+      , Just pred_tys <- coreTypeArgs ty_args
+      , let dfun = installed_id raw_dfun
+      , Just target_name <- sourceMethodTarget_maybe dfun sel
+      = do
+          mb_target <- lookupInstalledOrGlobalId env target_name
+          case mb_target of
+            Just target
+              | isJust (sourceTableId_maybe target)
+              , varType target `eqType` classMethodInstTy sel pred_tys
+              -> Core.mkApps (Core.Var target) <$> traverse go rest_args
+            _ -> go_default expr
+    go expr = go_default expr
+
+    go_default (Core.App f a)                 = Core.App <$> go f <*> go a
+    go_default (Core.Lam b e)                 = Core.Lam b <$> go e
+    go_default (Core.Let (Core.NonRec b r) e) = Core.Let <$> (Core.NonRec b <$> go r) <*> go e
+    go_default (Core.Let (Core.Rec ps) e)     = Core.Let . Core.Rec <$> traverse (\(b, r) -> (b,) <$> go r) ps <*> go e
+    go_default (Core.Case s b t as)           = Core.Case <$> go s <*> pure b <*> pure t <*> traverse (\(Core.Alt c bs r) -> Core.Alt c bs <$> go r) as
+    go_default (Core.Cast e co)               = (`Core.Cast` co) <$> go e
+    go_default (Core.Tick t e)                = Core.Tick t <$> go e
+    go_default other                          = pure other
 
 bindingCore :: LHsBind GhcTc -> Id -> TcM (Maybe Core.CoreExpr)
 bindingCore bind owner = do
@@ -4326,13 +4533,16 @@ sourceTableTyCons local final_exports binds = do
                 pure zb
               let owner = setIdType fun ty
               mb_rhs <- bindingCore zonked_bind owner
-              pure $ flip fmap mb_rhs $ \rhs ->
-                let opt_rhs = prepare rhs
-                    callees = exprSomeFreeVarsList
-                      (\v -> isId v && isExternalName (idName v) && idName v /= idName owner &&
-                             not (v `hasKey` patErrorIdKey) && isNothing (isDataConWorkId_maybe v) && not (isBuiltin v))
-                      opt_rhs
-                in (owner, Right (opt_rhs, callees), callees)
+              case mb_rhs of
+                Nothing -> pure Nothing
+                Just rhs -> do
+                  rewritten <- rewriteCertifiedDictCalls env (prepare rhs)
+                  let opt_rhs = prepare rewritten
+                      callees = exprSomeFreeVarsList
+                        (\v -> isId v && isExternalName (idName v) && idName v /= idName owner &&
+                               not (v `hasKey` patErrorIdKey) && isNothing (isDataConWorkId_maybe v) && not (isBuiltin v))
+                        opt_rhs
+                  pure (Just (owner, Right (opt_rhs, callees), callees))
 
     structural <- if local && not strict
       then fmap catMaybes $ forM prepared $ \(owner, payload, _) -> case payload of
@@ -4371,7 +4581,7 @@ sourceTableTyCons local final_exports binds = do
               spec = (defaultCoreSpec (const True))
                 { ccs_helper = (`lookup` callee_pairs), ccs_allow_build = allow_build
                 , ccs_allow_zero_cases = not strict, ccs_allow_call_self = True, ccs_check_kind_public = False }
-          case compileCoreEquations spec owner opt_rhs >>= checkNominalShape strict of
+          case compileCoreEquations spec owner opt_rhs >>= checkNominalCoreShape strict of
             Nothing -> pure Nothing
             Just cct -> do
               table <- case if final_exports then sourceTableOccurrence env owner >>= sourceTableId_maybe else Nothing of
@@ -4403,37 +4613,185 @@ sourceTableTyCons local final_exports binds = do
       in all (\tc -> builtin tc || publicCaseType env exported imported tc) (tablePromotedParents True tables) &&
          all (\tc -> builtin tc || not_boot (tyConName tc)) (sourceEquationDatatypes tables)
 
-    checkNominalShape strict cct = do
-      let tele = cct_binders cct; domains = cct_domains cct; result = cct_result cct; rows = cct_rows cct; tvs = binderVars tele
-      guard (all (\b -> case binderFlag b of { Invisible SpecifiedSpec -> tcIsLiftedTypeKind (tyVarKind (binderVar b)); _ -> False }) tele &&
-             all (`elem` concatMap tyCoVarsOfTypeList domains) tvs)
-      case rows of
-        [CompiledCoreRow pats rhs] | all isPatVar pats -> do
-          let is_prod RhsCon{} = True; is_prod RhsCall{} = True; is_prod _ = False
-          cct <$ guard (not strict && is_prod rhs && not (rhsHasSelf rhs) &&
-                        all (polySourceArgType tvs) domains && polySourceType tvs result)
-        CompiledCoreRow pats0 _ : _ -> do
-          col_idx <- findIndex isPatCon pats0
-          guard ((col_idx == 0 || (col_idx == 1 && lengthIs domains 2)) &&
-                 all (\(CompiledCoreRow ps _) -> equalLength ps domains && isPatCon (ps !! col_idx) &&
-                                                 all (\(i, p) -> i == col_idx || isPatVar p) (zip [0 ..] ps)) rows)
-          let has_nested = any (\(CompiledCoreRow ps _) -> case ps !! col_idx of { PatCon _ _ cs -> any isPatCon cs; _ -> False }) rows
-          guard (not (has_nested && any (\(CompiledCoreRow _ r) -> rhsHasSelf r) rows))
-          let arg_ty = domains !! col_idx; carried = [d | (i, d) <- zip [0 ..] domains, i /= col_idx]
-          if not strict && fmap fst (caseDatatype arg_ty) == Just listTyCon && all (eqType arg_ty) (result : carried)
-            then pure ()
-            else do
-              guard ((null carried || not strict) && (not has_nested || not strict))
-              if strict
-                then case tvs of
-                  [] -> () <$ (ordinaryDataType arg_ty >> ordinaryDataType result >>= \(_, as) -> guard (null as))
-                  _  -> do
-                    (tc, args) <- caseDatatype arg_ty
-                    params <- traverse getTyVar_maybe args
-                    guard (tc == listTyCon && equalLength params tvs && mkUniqSet params == mkUniqSet tvs && result `eqType` arg_ty)
-                else guard (polySourceType tvs arg_ty && all (polySourceArgType tvs) (result : carried))
-          pure cct
-        [] -> Nothing
+checkNominalCoreShape :: Bool -> CompiledCoreTable -> Maybe CompiledCoreTable
+checkNominalCoreShape strict cct = do
+  let tele = cct_binders cct; domains = cct_domains cct; result = cct_result cct; rows = cct_rows cct; tvs = binderVars tele
+  guard (all (\b -> case binderFlag b of { Invisible SpecifiedSpec -> tcIsLiftedTypeKind (tyVarKind (binderVar b)); _ -> False }) tele &&
+         all (`elem` concatMap tyCoVarsOfTypeList domains) tvs)
+  case rows of
+    [CompiledCoreRow pats rhs] | all isPatVar pats -> do
+      let is_prod RhsCon{} = True; is_prod RhsCall{} = True; is_prod _ = False
+      cct <$ guard (not strict && is_prod rhs && not (rhsHasSelf rhs) &&
+                    all (polySourceArgType tvs) domains && polySourceType tvs result)
+    CompiledCoreRow pats0 _ : _ -> do
+      col_idx <- findIndex isPatCon pats0
+      guard ((col_idx == 0 || (col_idx == 1 && lengthIs domains 2)) &&
+             all (\(CompiledCoreRow ps _) -> equalLength ps domains && isPatCon (ps !! col_idx) &&
+                                             all (\(i, p) -> i == col_idx || isPatVar p) (zip [0 ..] ps)) rows)
+      let has_nested = any (\(CompiledCoreRow ps _) -> case ps !! col_idx of { PatCon _ _ cs -> any isPatCon cs; _ -> False }) rows
+      guard (not (has_nested && any (\(CompiledCoreRow _ r) -> rhsHasSelf r) rows))
+      let arg_ty = domains !! col_idx; carried = [d | (i, d) <- zip [0 ..] domains, i /= col_idx]
+      if not strict && fmap fst (caseDatatype arg_ty) == Just listTyCon && all (eqType arg_ty) (result : carried)
+        then pure ()
+        else do
+          guard ((null carried || not strict) && (not has_nested || not strict))
+          if strict
+            then case tvs of
+              [] -> () <$ (ordinaryDataType arg_ty >> ordinaryDataType result >>= \(_, as) -> guard (null as))
+              _  -> do
+                (tc, args) <- caseDatatype arg_ty
+                params <- traverse getTyVar_maybe args
+                guard (tc == listTyCon && equalLength params tvs && mkUniqSet params == mkUniqSet tvs && result `eqType` arg_ty)
+            else guard (polySourceType tvs arg_ty && all (polySourceArgType tvs) (result : carried))
+      pure cct
+    [] -> Nothing
+
+-- | Certify ground unary and binary instance method workers (including stock
+-- @deriving Eq@ tag-based @==@ workers) from desugared local instance bindings.
+certifyLocalInstanceMethods
+  :: TcGblEnv -> [(Id, Core.CoreExpr)]
+  -> TcM ([LHsBind GhcTc], [(Id, TyCon)], [(Id, [(Id, Id)])])
+certifyLocalInstanceMethods env0 pairs
+  | null dfun_candidates = pure ([], [], [])
+  | otherwise = do
+      strict <- xoptM LangExt.Strict
+      dflags <- getDynFlags
+      mb_and_tc <- do
+        mb_and <- lookupBootModuleIdMaybe gHC_CLASSES (mkVarOcc "&&")
+        pure (mb_and >>= sourceTableId_maybe)
+      let prepare = safeSimpleOptExpr (initSimpleOpts dflags)
+          local_rules = sourceRuleOwners (tcg_rules env0)
+          owners = mkNameEnv [(idName v, (v, rhs)) | (v, rhs) <- pairs]
+          step env eq_tables acc_binds acc_tables acc_dfuns [] =
+            pure (reverse acc_binds, reverse acc_tables, reverse acc_dfuns)
+          step env eq_tables acc_binds acc_tables acc_dfuns pending = do
+            results <- forM pending $ \cand@(dfun, cls, inst_ty, slots) ->
+              if idName dfun `elemNameSet` local_rules
+                then pure (Left cand)
+                else do
+                  slot_res <- fmap catMaybes $ forM slots $ \(sel, field) ->
+                    case stripTicksTopE isSourceBreakpoint field of
+                      Core.Var worker
+                        | not (idName sel `elemNameSet` local_rules)
+                        , Just (meth_id, raw_rhs) <- lookupNameEnv owners (idName worker)
+                        , varType meth_id `eqType` classMethodInstTy sel [inst_ty] -> do
+                            rewritten <- rewriteCertifiedDictCalls env (prepare raw_rhs)
+                            let clean_rhs = prepare rewritten
+                                spec = (defaultCoreSpec (const True))
+                                  { ccs_allow_call_self = True, ccs_check_kind_public = False }
+                                mb_struct =
+                                  (guard (isJust (sourceBinarySelector sel)) *>
+                                     compileStructuralCore (const True) meth_id clean_rhs) <|>
+                                  (guard (not strict) *>
+                                     (compileCoreEquations spec meth_id clean_rhs >>= checkNominalCoreShape strict))
+                            mb_cct <- case mb_struct of
+                              Just cct -> pure (Just cct)
+                              Nothing  -> compileDerivedEqCoreM mb_and_tc eq_tables cls sel inst_ty dfun clean_rhs
+                            case mb_cct of
+                              Nothing -> pure Nothing
+                              Just cct -> do
+                                (target_id, mb_bind) <- if isExternalName (idName meth_id)
+                                  then pure (meth_id, Nothing)
+                                  else do
+                                    ext_name <- newImplicitBinder (idName dfun) $ \df_occ ->
+                                      mkVarOcc (occNameString df_occ ++ "_" ++ occNameString (nameOccName (idName meth_id)))
+                                    let synth = setIdExported (mkLocalId ext_name manyDataConTy (varType meth_id))
+                                        rhs_tc = noLocA (HsVar noExtField (noLocA meth_id))
+                                    pure (synth, Just (mkVarBind synth rhs_tc))
+                                table <- publishCompiledTable target_id cct
+                                let certified_id = setIdDetails target_id (SourceTableId (idName target_id) table NominalSourceTable)
+                                pure (Just (sel, certified_id, table, mb_bind))
+                      _ -> pure Nothing
+                  if null slot_res
+                    then pure (Left cand)
+                    else pure (Right (dfun, cls, inst_ty, slot_res))
+            let progressed = [ r | Right r <- results ]
+                remaining  = [ c | Left c <- results ]
+            if null progressed
+              then pure (reverse acc_binds, reverse acc_tables, reverse acc_dfuns)
+              else do
+                let new_binds  = [ b | (_, _, _, ss) <- progressed, (_, _, _, Just b) <- ss ]
+                    new_tables = [ (cid, tbl) | (_, _, _, ss) <- progressed, (_, cid, tbl, _) <- ss ]
+                    new_dfuns  = [ (dfun, [(sel, cid) | (sel, cid, _, _) <- ss]) | (dfun, _, _, ss) <- progressed ]
+                    new_eqs    = [ (inst_ty, tbl)
+                                 | (_, cls, inst_ty, ss) <- progressed, cls `hasKey` eqClassKey
+                                 , (sel, _, tbl, _) <- ss, nameOccName (idName sel) == eqClassOpOcc ]
+                    upd_dfun_ids = [ let cur = case lookupTypeEnv (tcg_type_env env) (idName dfun) of
+                                           Just (AnId d) -> d
+                                           _             -> dfun
+                                     in addSourceMethods cur m_pairs
+                                   | (dfun, m_pairs) <- new_dfuns ]
+                    env' = env { tcg_type_env = extendTypeEnvWithIds (tcg_type_env env)
+                                                  (map fst new_tables ++ upd_dfun_ids) }
+                step env' (new_eqs ++ eq_tables)
+                     (reverse new_binds ++ acc_binds)
+                     (reverse new_tables ++ acc_tables)
+                     (reverse new_dfuns ++ acc_dfuns)
+                     remaining
+      step env0 [] [] [] [] dfun_candidates
+  where
+    dfun_candidates =
+      [ (dfun, cls, inst_ty, [s | s@(sel, _) <- slots, sel `elem` classMethods cls])
+      | (dfun, rhs) <- pairs
+      , DFunId{} <- [idDetails dfun]
+      , let (bndrs, body) = Core.collectBinders rhs
+      , null bndrs
+      , exprType rhs `eqType` varType dfun
+      , Just (cls, [inst_ty]) <- [getClassPredTys_maybe (varType dfun)]
+      , noFreeVarsOfType inst_ty, isTyFamFree inst_ty
+      , Just slots <- [dictionarySlotsMulti cls [inst_ty] body] ]
+
+    compileDerivedEqCoreM mb_and_tc eq_tables cls sel inst_ty dfun rhs
+      | cls `hasKey` eqClassKey
+      , nameOccName (idName sel) == eqClassOpOcc
+      , Just (tc, tc_args) <- splitTyConApp_maybe inst_ty
+      , isBoxedDataTyCon tc, not (isTypeDataTyCon tc)
+      , let dcs = tyConDataCons tc
+      , not (null dcs)
+      , all (\dc -> dataConUserTyVars dc == dataConUnivTyVars dc && isJust (openDataConFieldTypes dc tc_args)) dcs
+      , let all_ids = exprSomeFreeVarsList isId rhs
+            has_tag_op = any (\v -> maybe False (\op -> op == DataToTagSmallOp || op == DataToTagLargeOp) (isPrimOpId_maybe v)) all_ids
+            ext_ids = [ v | v <- all_ids, isExternalName (idName v), isNothing (isDataConWorkId_maybe v) ]
+            ok_ext v = v == dfun || v == sel || v `hasKey` patErrorIdKey
+                    || maybe False (\m -> moduleUnitId m == ghcInternalUnitId) (nameModule_maybe (idName v))
+                    || isCertifiedFieldEqDFun v
+      , lengthIs dcs 1 || has_tag_op
+      , all ok_ext ext_ids = do
+          mb_rows <- sequence [ build_eq_row tc_args dc1 dc2 | dc1 <- dcs, dc2 <- dcs ]
+          pure (CompiledCoreTable [] [inst_ty, inst_ty] boolTy <$> sequence mb_rows <*> pure False)
+      | otherwise = pure Nothing
+      where
+        isCertifiedFieldEqDFun v
+          | DFunId{} <- idDetails v
+          , Just (c, [fty]) <- getClassPredTys_maybe (varType v)
+          , c `hasKey` eqClassKey = any (eqType fty . fst) eq_tables
+          | otherwise = False
+
+        lookupEqTable fty = snd <$> find (eqType fty . fst) eq_tables
+
+        build_eq_row tc_args dc1 dc2
+          | Just ftys1 <- openDataConFieldTypes dc1 tc_args
+          , Just ftys2 <- openDataConFieldTypes dc2 tc_args = do
+              xs <- mapM (mkSysLocalM (fsLit "eq_x") manyDataConTy) ftys1
+              ys <- mapM (mkSysLocalM (fsLit "eq_y") manyDataConTy) ftys2
+              let lhs = [PatCon dc1 tc_args (map PatVar xs), PatCon dc2 tc_args (map PatVar ys)]
+              if dc1 /= dc2
+                then pure (Just (CompiledCoreRow lhs (RhsCon falseDataCon [] [])))
+                else case zip3 ftys1 xs ys of
+                  [] -> pure (Just (CompiledCoreRow lhs (RhsCon trueDataCon [] [])))
+                  [(fty, x, y)] -> pure (CompiledCoreRow lhs <$> field_cmp fty x y)
+                  triples
+                    | Just and_tc <- mb_and_tc ->
+                        pure $ do
+                          c0 : cs <- traverse (\(fty, x, y) -> field_cmp fty x y) triples
+                          pure (CompiledCoreRow lhs (foldr (\a b -> RhsCall and_tc [] [a, b]) c0 cs))
+                    | otherwise -> pure Nothing
+          | otherwise = pure Nothing
+
+        field_cmp fty x y
+          | fty `eqType` inst_ty = Just (RhsSelf [] [RhsVar x, RhsVar y])
+          | Just eq_tc <- lookupEqTable fty = Just (RhsCall eq_tc [] [RhsVar x, RhsVar y])
+          | otherwise = Nothing
 
 compileBooleanGuardCase :: (TyCon -> Bool) -> (Id -> Maybe TyCon) -> Id -> Core.CoreExpr -> TcM (Maybe ((Id, TyCon), TyCon))
 compileBooleanGuardCase public predicate owner body

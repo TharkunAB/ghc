@@ -21,7 +21,8 @@ import {-# SOURCE #-} GHC.HsToCore.Match ( match )
 import GHC.Hs
 import GHC.HsToCore.Binds
 import GHC.Core.ConLike
-import GHC.Core.Coercion ( MCoercion(..), coercionLKind, mkUnbranchedAxInstCo )
+import GHC.Core.Coercion ( MCoercion(..), coVarRole, coercionKind, coercionLKind
+                         , mkCoVarCo, mkUnbranchedAxInstCo, mkUnivCo )
 import GHC.Core.DataCon ( DataCon, dataConRepType, dataConTyCon, dataConTag
                        , dataConRepArgBinders, dataConRepArity, dataConContextFieldCount
                        , dataConHasRetainedResult, dataConSourceArity
@@ -32,14 +33,15 @@ import GHC.Core.TyCon ( isNewTyCon, newTyConCo, tyConDataCons )
 import GHC.Core.FVs ( exprFreeVars )
 import qualified GHC.Core.Subst as Subst
 import GHC.Core.TyCo.Subst ( deepSubstCo, deepSubstTy )
-import GHC.Tc.Types.Evidence ( EvBind(..), TcEvBinds(EvBinds), isEmptyTcEvBinds, isIdHsWrapper )
+import GHC.Tc.Types.Evidence ( EvBind(..), TcEvBinds(EvBinds), isIdHsWrapper )
 import GHC.Tc.Utils.TcType
 import GHC.Core.Multiplicity
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Errors.Types (DsMessage(DsRetainedPackagePatterns, DsLinearRetainedPackageRows))
 import GHC.HsToCore.Utils
-import GHC.Core ( CoreExpr, Expr(Var), splitNativeIndexedPatternEvidence )
-import GHC.Core.TyCo.Rep ( Type(DepFunTy, FunTy, ft_mult) )
+import GHC.Core ( Bind(NonRec), CoreExpr, Expr(Coercion, Var), splitNativeIndexedPatternEvidence )
+import GHC.Core.TyCo.Rep ( Type(DepFunTy, FunTy, ft_mult), UnivCoProvenance(PluginProv) )
+import GHC.Data.Pair ( Pair(..) )
 import GHC.Core.Utils ( applyTypeToArgs )
 import GHC.Core.Make ( mkCoreLets )
 import GHC.Utils.Misc
@@ -220,9 +222,10 @@ matchNewtypeCon var vars ty eqns
               (ppr var $$ ppr nt_co) $
 
     -- Push the newtype coercion into the 'MatchId' and continue with
-    -- the inner pattern.
-    match (var `castMatchId` MCo nt_co : vars) ty
-          (NE.toList (field_pat <$> eqns))
+    -- the inner pattern, scoping any retained nominal constructor proof
+    -- and branch evidence immediately after the inner field pattern.
+    do { eqns' <- traverse field_pat eqns
+       ; match (var `castMatchId` MCo nt_co : vars) ty (NE.toList eqns') }
   where
     ConPat { pat_con = L _ con1
            , pat_con_ext = ConPatTc { cpt_arg_tys = arg_tys } }
@@ -237,30 +240,27 @@ matchNewtypeCon var vars ty eqns
               (newTyConCo (dataConTyCon dc)) arg_tys []
       -- nt_co :: N arg_tys ~R# fld_ty
 
-    -- Replace the constructor pattern with its inner field pattern.
-    field_pat :: EquationInfoNE -> EquationInfoNE
+    -- Replace the constructor pattern with its inner field pattern,
+    -- binding any retained constructor coercion after the field pattern.
+    field_pat :: EquationInfoNE -> DsM EquationInfoNE
     field_pat ( EqnMatch { eqn_pat = L _ p, eqn_rest = rest })
       | ConPat
-        { pat_con_ext = _con_pat_tc
+        { pat_con_ext = ConPatTc _arg_tys tvs dicts binds wrap ordered_binds
         , pat_args    = args
         } <- p
-      = assertPpr (isTrivialConPatTc _con_pat_tc) (ppr con1) $
-        prependPats (conArgPats fld_tys args) rest
+      = assertPpr (null tvs && isIdHsWrapper wrap && null ordered_binds && all isCoVar dicts)
+                  (ppr con1 $$ ppr dicts) $
+        dsTcEvBinds binds $ \ds_binds -> do
+          let proof_binds =
+                [ NonRec cv (Coercion (mkUnivCo (PluginProv "dependent-newtype") [] (coVarRole cv) lhs rhs))
+                | cv <- dicts
+                , let Pair lhs rhs = coercionKind (mkCoVarCo cv) ]
+              all_binds = proof_binds ++ ds_binds
+              scoped_rest
+                | null all_binds = rest
+                | otherwise      = EqnScope all_binds rest
+          return (prependPats (conArgPats fld_tys args) scoped_rest)
     field_pat eqn = pprPanic "matchNewtypeCon" (ppr eqn)
-
--- | Is this 'ConPatTc' trivial, in that it contains no existentials, no
--- dictionaries or evidence bindings, only identity 'HsWrapper's, etc?
-isTrivialConPatTc :: ConPatTc -> Bool
-isTrivialConPatTc (ConPatTc _arg_tys tvs dicts binds wrap ordered_binds) =
-  -- NB: Use a positional pattern match in order to guarantee that all fields
-  --     will continue to be handled if new fields are added.
-  and
-    [ null tvs
-    , null dicts
-    , isEmptyTcEvBinds binds
-    , isIdHsWrapper wrap
-    , null ordered_binds
-    ]
 
 matchPatSyn :: NonEmpty MatchId
             -> Type

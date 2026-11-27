@@ -64,6 +64,7 @@ module GHC.Core.Type (
         mkPiTy, mkPiTys, DepFunTyFlag(..), mkDepFunTy, mkDepFunTyWithVis, isBoolIndexId,
         mkPiTysM, mkPiTysU,
         isNativeIndexId, isNativeIndexType, isNativeClosedIndexType, nativeIndexDataConTyArgs,
+        isLiftedDataOrNewTyCon,
         primFamilyPatFieldKind, isPrimFamilyPatBinderKind, isPrimFamilyPatBinder,
         hasConstraintPremise,
         isNativeIndexFunctionId, nativeIndexFunctionTys_maybe,
@@ -290,7 +291,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Monad.StrictReader
 
 import GHC.Data.FastString
-import GHC.Data.Maybe   ( orElse, isJust )
+import GHC.Data.Maybe   ( orElse, isJust, isNothing )
 
 -- $type_classification
 -- #type_classification#
@@ -2520,6 +2521,23 @@ isNativeIndexType = nativeIndexType True
 isNativeClosedIndexType :: Type -> Bool
 isNativeClosedIndexType = nativeIndexType False
 
+-- | Test whether a type constructor is a lifted boxed data or newtype constructor
+-- whose underlying representation never unwraps to a @type data@ constructor.
+isLiftedDataOrNewTyCon :: TyCon -> Bool
+isLiftedDataOrNewTyCon = go []
+  where
+    go seen tc
+      | tyConName tc `elem` seen = False
+      | isTypeDataTyCon tc       = False
+      | isBoxedDataTyCon tc      = True
+      | isNewTyCon tc, isLiftedAlgTyCon tc
+      , (_, rhs) <- newTyConRhs tc =
+          case splitTyConApp_maybe rhs of
+            Just (inner_tc, _) | isNewTyCon inner_tc || isTypeDataTyCon inner_tc ->
+              go (tyConName tc : seen) inner_tc
+            _ -> True
+      | otherwise                = False
+
 -- | Check a structural schema or a closed function-free endpoint.
 -- See Note [Function fields in native index domains].
 nativeIndexType :: Bool -> Type -> Bool
@@ -2530,8 +2548,8 @@ nativeIndexType structural_fields = go []
       , Just previous <- lookup tc path
       = eqTypes args previous
       | TyConApp tc args <- coreFullView ty
-      , isVanillaAlgTyCon tc, isBoxedDataTyCon tc
-      , not (isTypeDataTyCon tc), tyConArity tc == length args
+      , isVanillaAlgTyCon tc, isLiftedDataOrNewTyCon tc
+      , tyConArity tc == length args
       , tcIsLiftedTypeKind (typeKind ty)
       , null (tyConStupidTheta tc)
       , let cons = tyConDataCons tc
@@ -2587,7 +2605,7 @@ nativeIndexType structural_fields = go []
       , univs `equalLength` args
       , all (tcIsLiftedTypeKind . tyVarKind) univs
       , null (dataConStupidTheta con)
-      , Nothing <- dataConWrapId_maybe con
+      , isNewTyCon (dataConTyCon con) || isNothing (dataConWrapId_maybe con)
       , substTyWith univs args res `eqType` domain
       , orig_args `equalLength` rep_args
       , and (zipWith same_field (instantiate orig_args) (instantiate rep_args))
@@ -3016,7 +3034,7 @@ isNativeAlgebraicOrAbstractDomain ty = case coreFullView ty of
   TyVarTy {} -> True
   TyConApp tc args
     | isDataFamilyTyCon tc -> tyConArity tc <= length args
-    | otherwise -> isVanillaAlgTyCon tc && isBoxedDataTyCon tc && tyConArity tc == length args
+    | otherwise -> isVanillaAlgTyCon tc && isLiftedDataOrNewTyCon tc && tyConArity tc == length args
   _ -> False
 
 {- Note [Opaque algebraic retained binders]

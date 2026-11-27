@@ -30,7 +30,7 @@ import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Bind( tcValBinds )
-import GHC.Tc.Gen.SourceTable (publishRetainedRecordWitness, sourceTableReferenceUse)
+import GHC.Tc.Gen.SourceTable (publishPlainRecordFieldSelector, publishRetainedRecordWitness, sourceTableReferenceUse)
 import GHC.Tc.Utils.TcType
 
 import GHC.Builtin.WiredIn.Types( unitTy, unmatchableDataConTy )
@@ -997,6 +997,18 @@ mkRecSelBinds tycons = concat <$> mapM make_selectors tycons
                    (Just (mkForAllTys telescope (mkDepFunTy record (result index))))
                    cons parent fld FieldSelectors
            ; pure (first_sel : zipWithEqual payload_sel rest payloads) }
+      | [con] <- tyConDataCons tc
+      , flds@(_ : _) <- tyConFieldLabels tc
+      = do { let cons   = [RealDataCon con]
+                 parent = RecSelData tc
+           ; traverse (\(idx, fl) -> do
+               { let plain@(sel0, _) = mkOneRecordSelector cons parent fl FieldSelectors
+               ; if isNaughtyRecordSelector sel0
+                   then pure plain
+                   else do
+                     { mb_table <- publishPlainRecordFieldSelector con idx sel0
+                     ; pure $ maybe plain (\tbl -> mkRecordSelector (Just tbl) Nothing cons parent fl FieldSelectors) mb_table } })
+               (zip [0..] flds) }
       | otherwise = pure (map (mkRecSelBind . (tc,)) (tyConFieldLabels tc))
 
 mkRecSelBind :: (TyCon, FieldLabel) -> (Id, LHsBind GhcRn)

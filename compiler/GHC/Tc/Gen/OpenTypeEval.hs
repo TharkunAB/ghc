@@ -6,6 +6,7 @@ module GHC.Tc.Gen.OpenTypeEval
   , instantiateOpenTypeFunction
   , openTypeFunctionSignature
   , instantiateOpenMethod
+  , instantiateOpenDictMethod
   , readOpenMethodWorker
   , readOpenDefinition
   ) where
@@ -14,42 +15,54 @@ import GHC.Prelude
 
 import qualified Data.Set as Set
 import Control.Monad (foldM, guard)
-import Data.List (sortBy)
+import Data.List (elemIndex, sortBy)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (runExceptT, throwE)
-import GHC.Builtin.WiredIn.Types (liftedTypeKind, manyDataConTy, unmatchableDataConTy)
-import GHC.Core.Class (classAllSelIds)
-import GHC.Core (CoreExpr, Expr(..), mkApps)
-import GHC.Core.Coercion (mkSubCo)
+import GHC.Builtin.KnownKeys (eqClassKey)
+import GHC.Builtin.WiredIn.Types
+  ( boolTy, consDataCon, falseDataCon, liftedTypeKind, manyDataConTy
+  , mkListTy, nilDataCon, trueDataCon, unmatchableDataConTy )
+import GHC.Core.Class (Class, classAllSelIds, classMethods, classTyCon)
+import GHC.Core (Alt(..), AltCon(..), CoreExpr, Expr(..), maybeUnfoldingTemplate, mkApps, mkLams)
+import GHC.Core.Coercion (mkSubCo, mkSymCo, mkUnbranchedAxInstCo)
+import GHC.Core.Coercion.Axiom (Role(Representational), coAxBranchLHS, coAxBranchRHS, coAxiomBranches, fromBranches)
 import GHC.Core.Reduction (Reduction(..))
-import GHC.Core.DataCon (DataCon, dataConName, dataConTyCon, dataConUserTyVars, dataConWorkId, isVanillaDataCon)
-import GHC.Core.TyCon (isBoxedDataTyCon, isPromotedDataCon_maybe, tyConArity, tyConDataCons, tyConName)
-import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe)
-import GHC.Core.TyCo.Rep (Type(AppTy, TermAppTy, TermVarTy, TyVarTy))
-import GHC.Core.Type (Kind, Type, FunTyFlag(FTF_T_T), isLiftedTypeKind, isManyTy,
+import GHC.Core.DataCon
+  ( DataCon, classDataCon, dataConName, dataConRepArgTys, dataConTyCon, dataConUnivTyVars, dataConUserTyVars
+  , dataConWorkId, dataConWrapId, isVanillaDataCon, promoteDataCon )
+import GHC.Core.InstEnv (instanceDFunId, isIncoherent, lookupUniqueInstEnv)
+import GHC.Core.TyCon
+  ( TyCon, closedFamilyTyConCoAxiom_maybe, isBoxedDataTyCon, isNewTyCon, isPromotedDataCon_maybe
+  , newTyConCo_maybe, tyConArity, tyConDataCons, tyConName )
+import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe, isUnaryClass)
+import GHC.Core.TyCo.Rep (Scaled(..), Type(AppTy, TermAppTy, TermVarTy, TyVarTy))
+import GHC.Core.Type (Kind, PredType, Type, FunTyFlag(FTF_T_T), getTyVar_maybe, isLiftedDataOrNewTyCon, isLiftedTypeKind, isManyTy,
                       isNativeOpaqueValueId, mkTyConApp, mkTyVarTy, mkVisFunTyManyU,
                       splitForAllForAllTyBinders, splitFunTy_maybe, splitTyConApp_maybe,
                       substTyWith, typeKind)
 import GHC.Core.Utils (exprType, mkCast)
-import GHC.Core.TyCo.Subst (lookupTyVar, substTy)
+import GHC.Core.TyCo.Subst (lookupTyVar, substTheta, substTy, zipTvSubst)
 import GHC.Core.Unify (tcMatchTys)
 import GHC.Data.FastString (fsLit)
-import GHC.Data.Maybe (MaybeErr(..))
+import GHC.Data.Maybe (MaybeErr(..), isNothing)
 import GHC.Driver.DynFlags (HasDynFlags(getDynFlags), ghcMode, isOneShot, reductionDepth)
 import GHC.Driver.Env (HscEnv, hsc_HUG, hsc_all_home_unit_ids, hsc_dflags)
 import GHC.Iface.Load (findAndReadIface)
-import GHC.Iface.Syntax (IfaceDecl(..), IfaceExpr(..), IfaceInfoItem(..), IfaceUnfolding(..))
+import GHC.Iface.Syntax (IfaceDecl(..), IfaceExpr(..), IfaceInfoItem(..), IfaceOneShot(..), IfaceUnfolding(..))
 import GHC.IfaceToCore (tcIfaceExpr)
 import GHC.Rename.Env (DeprecationWarnings(NoDeprecationWarnings), addUsedGREs)
 import GHC.Tc.Gen.SourceTable (groundFirstHead)
 import GHC.Tc.Types (IfL)
+import GHC.Tc.Utils.Env (tcGetInstEnvs)
 import GHC.Tc.Utils.Monad (TcM, getGblEnv, getTopEnv, initIfaceLcl, initIfaceTcRn,
                            liftIO, newTcRef, newUnique, readTcRef, tcg_imports,
                            tcg_rdr_env, tcg_semantic_mod, tcg_local_open_defs, tcg_local_open_owners, updTcRef)
-import GHC.Tc.Utils.TcType (TcTyVarDetails(SkolemTv), isTyFamFree, noFreeVarsOfType, tcEqType)
+import GHC.Tc.Utils.TcType (TcTyVarDetails(SkolemTv), isTyFamFree, noFreeVarsOfType, tcEqType, tcSplitDFunTy, tcSplitSigmaTy)
 import GHC.Types.Basic (mkIntWithInf)
-import GHC.Types.Id (Id, idName, idType, isClassOpId_maybe, mkSysLocal)
-import GHC.Types.Name (Name, getOccString, nameModule_maybe, stableNameCmp)
+import GHC.Types.Id (Id, idName, idType, isClassOpId_maybe, mkSysLocal, realIdUnfolding, sourceTableId_maybe)
+import GHC.Types.Id.Make (mkDictSelRhs)
+import GHC.Types.Name (Name, getOccString, isBuiltInSyntax, isExternalName, nameModule_maybe, stableNameCmp)
+import GHC.Types.Unique (hasKey)
 import GHC.Types.Name.Env (emptyNameEnv, extendNameEnv_C, lookupNameEnv, nonDetNameEnvElts)
 import GHC.Types.Name.Reader (gre_imp, isLocalGRE, is_decl, is_isboot, lookupGRE_Name)
 import GHC.Types.Name.Set (NameSet, emptyNameSet, isEmptyNameSet, mkNameSet, nameSetElemsStable,
@@ -133,9 +146,27 @@ observeOpenType local_call indexed instantiated result_kind operands
                   Just rhs -> pure (Just rhs)
                   Nothing
                     | Just (_, rhs) <- lookupNameEnv locals (idName v) ->
-                        if tcEqType (exprType rhs) (idType v)
+                        if sameTemplateType (exprType rhs) (idType v)
                           then remember v rhs
                           else throwE (UnavailableDefinition (idName v) WrongTemplateType)
+                    | Just cls <- isClassOpId_maybe v
+                    , not (isUnaryClass cls)
+                    , Just tmpl <- maybeUnfoldingTemplate (realIdUnfolding v)
+                    , sameTemplateType (exprType tmpl) (idType v) ->
+                        remember v tmpl
+                    | Just cls <- isClassOpId_maybe v
+                    , isUnaryClass cls -> do
+                        mb_tmpl <- lift (unaryClassSelRhs cls)
+                        case mb_tmpl of
+                          Just tmpl | sameTemplateType (exprType tmpl) (idType v) -> remember v tmpl
+                          _ -> throwE (UnavailableDefinition (idName v) WrongTemplateType)
+                    | Just cls <- isClassOpId_maybe v
+                    , not (isUnaryClass cls)
+                    , Just val_index <- elemIndex v (classAllSelIds cls) ->
+                        let tmpl = mkDictSelRhs cls val_index
+                        in if sameTemplateType (exprType tmpl) (idType v)
+                             then remember v tmpl
+                             else throwE (UnavailableDefinition (idName v) WrongTemplateType)
                     | not (isGlobalId v) -> pure Nothing
                     | otherwise -> do
                         definition <- lift (readOpenDefinition v)
@@ -143,20 +174,22 @@ observeOpenType local_call indexed instantiated result_kind operands
                           Left failure -> throwE (UnavailableDefinition (idName v) failure)
                           Right rhs -> remember v rhs
                 case result of
-                  Just _ -> record (idName v) (first_type >>= groundFirstHead . (:[]))
-                  Nothing -> pure ()
+                  Just _ | isExternalName (idName v) ->
+                    record (idName v) (first_type >>= groundFirstHead . (:[]))
+                  _ -> pure ()
                 pure result
           let origin v = lookupVarEnv origins v
               constructorGRE con = lookupGRE_Name (tcg_rdr_env env) (dataConName con)
-              visible con = pure $ case constructorGRE con of
+              visible con = pure $ isBuiltInSyntax (dataConName con) || case constructorGRE con of
                 Just gre -> isLocalGRE gre || any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
                 Nothing -> False
           outcome <- openReadbackM local_call indexed limit obtain local origin visible result_kind application
           case outcome of
             Left (ReadbackEvaluation failure) -> throwE (CannotReduce failure)
             Left (ReadbackHidden con) -> throwE (HiddenConstructor (tyConName (dataConTyCon con)))
-            Left (ReadbackOpaque (Neutral (CaseBlocked (Rigid actual) _)))
-              | Just ty <- origin actual ->
+            Left (ReadbackOpaque (Neutral (CaseBlocked n _)))
+              | Just actual <- neutralRigidVar n
+              , Just ty <- origin actual ->
                   case ty of
                     TyVarTy skolem -> throwE (RigidCase (varName skolem))
                     TermVarTy idx  -> throwE (RigidCase (varName idx))
@@ -241,7 +274,13 @@ observeOpenType local_call indexed instantiated result_kind operands
       pure (OperandState symbols (extendVarEnv origins symbol ty), Var symbol)
     buildOperand state (OpenConstructor con erased fields) = do
       (state', revFields) <- foldM buildArgument (state, []) fields
-      pure (state', mkApps (Var (dataConWorkId con)) (erased ++ reverse revFields))
+      let fieldExprs = reverse revFields
+          tc         = dataConTyCon con
+      case (newTyConCo_maybe tc, traverse (\case Type t -> Just t; _ -> Nothing) erased, fieldExprs) of
+        (Just nt_ax, Just tys, [fieldExpr]) | isNewTyCon tc ->
+          pure (state', mkCast fieldExpr (mkSymCo (mkUnbranchedAxInstCo Representational nt_ax tys [])))
+        _ ->
+          pure (state', mkApps (Var (dataConWorkId con)) (erased ++ fieldExprs))
 
     symbolFor state@(OperandState symbols origins) v =
       case lookupVarEnv symbols v of
@@ -307,7 +346,7 @@ openTypeFunctionSignature local_families function
       , isManyTy mult
       = mkVisFunTyManyU <$> domainKind a <*> domainKind b
       | Just (con, parameters) <- splitTyConApp_maybe ty
-      , isBoxedDataTyCon con
+      , isLiftedDataOrNewTyCon con
       , tyConArity con == length parameters
       , all isVanillaDataCon (tyConDataCons con)
       = mkTyConApp con <$> traverse domainKind parameters
@@ -343,6 +382,53 @@ instantiateOpenMethod worker left right = do
         result_kind = substTy subst result
     guard (exprType method `tcEqType` mkVisFunTyManyU left (mkVisFunTyManyU right result_kind))
     pure (method, result_kind)
+
+-- | Specialize a class method by recursively resolving its dictionary constraints
+-- in 'InstEnv' so 'observeOpenType' can unfold the dictionary directly in Core.
+instantiateOpenDictMethod :: Id -> [Type] -> [Kind] -> Kind -> TcM (Maybe CoreExpr)
+instantiateOpenDictMethod fun ty_args doms result_kind
+  | let (ma_tvs, theta, _) = tcSplitSigmaTy (idType fun)
+        tvs                = map snd ma_tvs
+  , equalLength tvs ty_args
+  , not (null theta) = do
+      let inst_theta = substTheta (zipTvSubst tvs ty_args) theta
+          expected   = foldr mkVisFunTyManyU result_kind doms
+      mb_dicts <- traverse (resolveDict 16) inst_theta
+      pure $ do
+        dicts <- sequence mb_dicts
+        let specialized = mkApps (Var fun) (map Type ty_args ++ dicts)
+        specialized <$ guard (exprType specialized `tcEqType` expected)
+  | otherwise = pure Nothing
+  where
+    resolveDict :: Int -> PredType -> TcM (Maybe CoreExpr)
+    resolveDict depth pred_ty
+      | depth <= 0 = pure Nothing
+      | Just (cls, tys) <- getClassPredTys_maybe pred_ty
+      , all isTyFamFree tys = do
+          insts <- tcGetInstEnvs
+          env   <- getGblEnv
+          case lookupUniqueInstEnv insts cls tys of
+            Right (inst, inst_ty_args)
+              | not (isIncoherent inst) -> do
+                  let dfun      = instanceDFunId inst
+                      dfun_name = idName dfun
+                      is_local  = nameModule_maybe dfun_name == Just (tcg_semantic_mod env)
+                  if is_local && isNothing (lookupNameEnv (tcg_local_open_defs env) dfun_name)
+                    then pure Nothing
+                    else do
+                      let (d_ma_tvs, d_theta, _) = tcSplitSigmaTy (idType dfun)
+                          d_tvs                  = map snd d_ma_tvs
+                      if not (equalLength d_tvs inst_ty_args)
+                        then pure Nothing
+                        else do
+                          let sub_preds = substTheta (zipTvSubst d_tvs inst_ty_args) d_theta
+                          mb_subs <- traverse (resolveDict (depth - 1)) sub_preds
+                          pure $ do
+                            subs <- sequence mb_subs
+                            let d_expr = mkApps (Var dfun) (map Type inst_ty_args ++ subs)
+                            d_expr <$ guard (exprType d_expr `tcEqType` pred_ty)
+            _ -> pure Nothing
+      | otherwise = pure Nothing
 
 -- | An ordinary erased parameter of lifted kind.
 liftedUniversal :: (Type, VarBndr TyVar ForAllTyFlag) -> Bool
@@ -401,15 +487,201 @@ readOpenMethodWorker dfun selector = do
 readOpenDefinition :: Id -> TcM (Either DefinitionFailure CoreExpr)
 readOpenDefinition identifier = do
   info <- readOpenIdInfo identifier
+  let fallback = do
+        mb_st <- case sourceTableId_maybe identifier of
+          Just table -> sourceTableCoreTemplate identifier table
+          Nothing    -> pure Nothing
+        case mb_st of
+          Just tmpl -> pure (Right tmpl)
+          Nothing   -> maybe (Left MissingTemplate) Right <$> stdEqListCoreTemplate identifier
   case info of
-    Left failure -> pure (Left failure)
+    Left failure -> do
+      fb <- fallback
+      pure $ case fb of
+        Right tmpl -> Right tmpl
+        Left _     -> Left failure
     Right (mod, items)
       | [template] <- [template | HsUnfold _ (IfCoreUnfold _ _ _ template) <- items] -> do
           body <- readOpenIfaceExpr mod (tcIfaceExpr template)
-          pure $ if tcEqType (exprType body) (idType identifier)
+          pure $ if sameTemplateType (exprType body) (idType identifier)
             then Right body
             else Left WrongTemplateType
-      | otherwise -> pure (Left MissingTemplate)
+      | [IfDFunUnfold bs ops] <- [df | HsUnfold _ df@IfDFunUnfold{} <- items]
+      , let (_, _, cls, _) = tcSplitDFunTy (idType identifier)
+            con_name       = idName (dataConWrapId (classDataCon cls))
+            iface_rhs      = foldr (\b e -> IfaceLam (b, IfaceNoOneShot) e)
+                                   (foldl' IfaceApp (IfaceExt con_name) ops) bs -> do
+          body <- readOpenIfaceExpr mod (tcIfaceExpr iface_rhs)
+          pure $ if sameTemplateType (exprType body) (idType identifier)
+            then Right body
+            else Left WrongTemplateType
+      | otherwise -> fallback
+
+-- | Compare a Core template's type against its declared 'Id' type, ignoring
+-- 'Inferred' versus 'Specified' binder specificity introduced by Core 'Lam'.
+sameTemplateType :: Type -> Type -> Bool
+sameTemplateType t1 t2
+  | tcEqType t1 t2 = True
+  | (b1, r1) <- splitForAllForAllTyBinders t1
+  , (b2, r2) <- splitForAllForAllTyBinders t2
+  , not (null b1), equalLength b1 b2
+  , let vs1 = [v | (_, Bndr v _) <- b1]
+        vs2 = [v | (_, Bndr v _) <- b2]
+  , and (zipWith (\v1 v2 -> tcEqType (tyVarKind v1) (tyVarKind v2)) vs1 vs2)
+  = sameTemplateType (substTyWith vs1 (map mkTyVarTy vs2) r1) r2
+  | otherwise = False
+
+-- | Synthesize the dictionary-unwrap selector expression for a unary class method.
+unaryClassSelRhs :: Class -> TcM (Maybe CoreExpr)
+unaryClassSelRhs cls
+  | isUnaryClass cls
+  , let tc = classTyCon cls
+  , [data_con] <- tyConDataCons tc
+  , [Scaled _ field_ty] <- dataConRepArgTys data_con
+  = do
+      u1 <- newUnique
+      u2 <- newUnique
+      let tvs      = dataConUnivTyVars data_con
+          tv_tys   = map mkTyVarTy tvs
+          pred_ty  = mkTyConApp tc tv_tys
+          dict_id  = mkSysLocal (fsLit "dict") u1 manyDataConTy pred_ty
+          field_id = mkSysLocal (fsLit "meth") u2 manyDataConTy field_ty
+          rhs_body = case newTyConCo_maybe tc of
+            Just nt_ax -> mkCast (Var dict_id) (mkUnbranchedAxInstCo Representational nt_ax tv_tys [])
+            Nothing    -> Case (Var dict_id) dict_id field_ty [Alt (DataAlt data_con) [field_id] (Var field_id)]
+      pure (Just (mkLams tvs (Lam dict_id rhs_body)))
+  | otherwise = pure Nothing
+
+-- | Synthesize the canonical Core equation for @GHC.Internal.Classes.$fEqList_$c==@
+-- when loop-breaker pruning omits its unfolding from @Classes.hi@.
+stdEqListCoreTemplate :: Id -> TcM (Maybe CoreExpr)
+stdEqListCoreTemplate owner
+  | getOccString (idName owner) == "$fEqList_$c=="
+  , ([(_, tv)], [pred_ty], rho) <- tcSplitSigmaTy (idType owner)
+  , Just (eq_cls, [tv_ty]) <- getClassPredTys_maybe pred_ty
+  , eq_cls `hasKey` eqClassKey
+  , tv_ty `tcEqType` mkTyVarTy tv
+  , eq_op : _ <- classMethods eq_cls
+  = do
+      let list_ty = mkListTy tv_ty
+          fresh lbl ty = (\u -> mkSysLocal (fsLit lbl) u manyDataConTy ty) <$> newUnique
+      d_eq <- fresh "dEq" pred_ty
+      xs   <- fresh "xs" list_ty
+      ys   <- fresh "ys" list_ty
+      w1   <- fresh "w1" list_ty
+      w2   <- fresh "w2" list_ty
+      w3   <- fresh "w3" list_ty
+      wb   <- fresh "wb" boolTy
+      x    <- fresh "x" tv_ty
+      xt   <- fresh "xt" list_ty
+      y    <- fresh "y" tv_ty
+      yt   <- fresh "yt" list_ty
+      y0   <- fresh "y0" tv_ty
+      yt0  <- fresh "yt0" list_ty
+      let f_expr   = Var (dataConWorkId falseDataCon)
+          t_expr   = Var (dataConWorkId trueDataCon)
+          eq_hd    = mkApps (Var eq_op) [Type tv_ty, Var d_eq, Var x, Var y]
+          rec_tl   = mkApps (Var owner) [Type tv_ty, Var d_eq, Var xt, Var yt]
+          nil_rhs  = Case (Var ys) w2 boolTy
+                       [ Alt (DataAlt nilDataCon)  []         t_expr
+                       , Alt (DataAlt consDataCon) [y0, yt0]  f_expr ]
+          cons_rhs = Case (Var ys) w3 boolTy
+                       [ Alt (DataAlt nilDataCon)  []       f_expr
+                       , Alt (DataAlt consDataCon) [y, yt]
+                           (Case eq_hd wb boolTy
+                              [ Alt (DataAlt falseDataCon) [] f_expr
+                              , Alt (DataAlt trueDataCon)  [] rec_tl ]) ]
+          tmpl     = mkLams [tv, d_eq, xs, ys] $
+                       Case (Var xs) w1 boolTy
+                         [ Alt (DataAlt nilDataCon)  []      nil_rhs
+                         , Alt (DataAlt consDataCon) [x, xt] cons_rhs ]
+      pure (if sameTemplateType (exprType tmpl) (idType owner) && rho `tcEqType` mkVisFunTyManyU list_ty (mkVisFunTyManyU list_ty boolTy)
+              then Just tmpl
+              else Nothing)
+  | otherwise = pure Nothing
+
+-- | Reconstruct a pure Core template from a single-column certified 'SourceTable'
+-- when an imported function omits its 'IfCoreUnfold' due to phase pragmas (e.g. '++').
+sourceTableCoreTemplate :: Id -> TyCon -> TcM (Maybe CoreExpr)
+sourceTableCoreTemplate owner table
+  | Just axiom <- closedFamilyTyConCoAxiom_maybe table
+  , let branches = fromBranches (coAxiomBranches axiom)
+        (bndrs, rho) = splitForAllForAllTyBinders (idType owner)
+        tvs = [tv | (_, Bndr tv (Invisible _)) <- bndrs]
+  , not (null branches), equalLength tvs bndrs
+  , Just (doms, res_ty) <- peelValArrows rho
+  , not (null doms) = do
+      arg_ids <- mapM (freshLocal "st_arg") doms
+      wild_ids <- mapM (freshLocal "st_wild") doms
+      let try_col col_idx
+            | Just (tc, tc_args) <- splitTyConApp_maybe (doms !! col_idx)
+            , isBoxedDataTyCon tc = do
+                mb_alts <- traverse (build_alt col_idx tc tc_args arg_ids) branches
+                pure $ do
+                  alts <- sequence mb_alts
+                  let sorted = sortBy (\(Alt c1 _ _) (Alt c2 _ _) -> compare c1 c2) alts
+                      scrut  = arg_ids !! col_idx
+                      wild   = wild_ids !! col_idx
+                      tmpl   = mkLams (tvs ++ arg_ids) (Case (Var scrut) wild res_ty sorted)
+                  tmpl <$ guard (sameTemplateType (exprType tmpl) (idType owner))
+            | otherwise = pure Nothing
+      candidates <- mapM try_col [0 .. length doms - 1]
+      pure (foldr (\a b -> case a of { Just{} -> a; Nothing -> b }) Nothing candidates)
+  | otherwise = pure Nothing
+  where
+    freshLocal :: String -> Type -> TcM Id
+    freshLocal lbl ty = do
+      u <- newUnique
+      pure (mkSysLocal (fsLit lbl) u manyDataConTy ty)
+
+    peelValArrows :: Type -> Maybe ([Type], Type)
+    peelValArrows ty
+      | Just (FTF_T_T, ma, mult, d, r) <- splitFunTy_maybe ty
+      , ma `tcEqType` unmatchableDataConTy, isManyTy mult =
+          case peelValArrows r of
+            Just (ds, out) -> Just (d : ds, out)
+            Nothing        -> Just ([d], r)
+      | otherwise = Just ([], ty)
+
+    build_alt col_idx tc tc_args arg_ids br
+      | let (q_tys, lhs_pats) = splitAt (length tvs) (coAxBranchLHS br)
+      , equalLength lhs_pats arg_ids
+      , Just q_tvs <- traverse getTyVar_maybe q_tys
+      , Just (prom_dc, dc_all_args) <- splitTyConApp_maybe (lhs_pats !! col_idx)
+      , Just dc <- isPromotedDataCon_maybe prom_dc
+      , dataConTyCon dc == tc
+      , let (dc_univ, dc_field_pats) = splitAt (length tc_args) dc_all_args
+      , equalLength dc_univ tc_args
+      , Just field_tvs <- traverse getTyVar_maybe dc_field_pats
+      , Just other_tvs <- sequence [ getTyVar_maybe p | (i, p) <- zip [0 ..] lhs_pats, i /= col_idx ]
+      = do
+          let ty_subst = zipTvSubst q_tvs (map mkTyVarTy tvs)
+          case openDataConFieldTypes dc tc_args of
+            Just field_tys | equalLength field_tys field_tvs -> do
+              field_ids <- mapM (freshLocal "st_f") field_tys
+              let other_ids = [ a | (i, a) <- zip [0 ..] arg_ids, i /= col_idx ]
+                  term_env  = zip other_tvs (map Var other_ids) ++ zip field_tvs (map Var field_ids)
+              pure $ Alt (DataAlt dc) field_ids <$> trans_rhs ty_subst term_env (coAxBranchRHS br)
+            _ -> pure Nothing
+      | otherwise = pure Nothing
+      where
+        (bndrs, _) = splitForAllForAllTyBinders (idType owner)
+        tvs        = [tv | (_, Bndr tv (Invisible _)) <- bndrs]
+
+    trans_rhs ty_subst term_env rhs_ty
+      | Just tv <- getTyVar_maybe rhs_ty = lookup tv term_env
+      | Just (prom_c, c_args) <- splitTyConApp_maybe rhs_ty
+      , Just c <- isPromotedDataCon_maybe prom_c = do
+          let (c_univ, c_fields) = splitAt (length (dataConUnivTyVars c)) c_args
+          val_args <- traverse (trans_rhs ty_subst term_env) c_fields
+          pure (mkApps (Var (dataConWorkId c)) (map (Type . substTy ty_subst) c_univ ++ val_args))
+      | Just (fam, f_args) <- splitTyConApp_maybe rhs_ty
+      , fam == table = do
+          let n_tvs = length [tv | (_, Bndr tv (Invisible _)) <- fst (splitForAllForAllTyBinders (idType owner))]
+              (f_tys, f_vals) = splitAt n_tvs f_args
+          val_args <- traverse (trans_rhs ty_subst term_env) f_vals
+          pure (mkApps (Var owner) (map (Type . substTy ty_subst) f_tys ++ val_args))
+      | otherwise = Nothing
 
 -- | Read an imported declaration with its optimizer information.
 readOpenIdInfo :: Id -> TcM (Either DefinitionFailure (Module, [IfaceInfoItem]))

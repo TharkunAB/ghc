@@ -44,7 +44,7 @@ import GHC.Data.Maybe
 import Control.Applicative
 import Control.Monad (unless)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Except (runExceptT, throwE)
+import Control.Monad.Trans.Except (catchE, runExceptT, throwE)
 
 import Data.List (isSuffixOf)
 
@@ -161,9 +161,14 @@ get_link_deps check_artifacts opts pls maybe_normal_osuf mods = runExceptT $ do
     get_linkable osuf mod = do
       info <- lift $ HUG.lookupHugByModule mod (ue_home_unit_graph unit_env)
       case info of
-        Just hmi
-          | Just lnk <- preferredHomeLinkable opts hmi -> checked_linkable osuf lnk
-          | otherwise -> no_obj mod
+        Just hmi ->
+          case preferredHomeLinkable opts hmi of
+            Just lnk ->
+              catchE (checked_linkable osuf lnk) $ \err ->
+                case homeModInfoByteCode hmi of
+                  Just bc -> checked_linkable osuf bc
+                  Nothing -> fallback_home_bytecode mod (throwE err)
+            Nothing -> fallback_home_bytecode mod (no_obj mod)
         Nothing
           | Just home_unit <- ue_homeUnit unit_env -> do
               -- In one-shot mode, prefer bytecode. Discovery returns an
@@ -180,6 +185,17 @@ get_link_deps check_artifacts opts pls maybe_normal_osuf mods = runExceptT $ do
                       maybe (no_obj mod) (checked_linkable osuf) object
                 _ -> no_obj mod
         Nothing -> no_obj mod
+
+    fallback_home_bytecode mod on_missing
+      | Just home_unit <- ue_homeUnit unit_env = do
+          found <- lift $ runFinderM $ findHomeModule
+                     (ldFinderCache opts) (ldFinderOpts opts) home_unit (moduleName mod)
+          case found of
+            Found loc _ -> do
+              bytecode <- lift $ ldFindByteCode opts mod loc
+              maybe on_missing pure bytecode
+            _ -> on_missing
+      | otherwise = on_missing
 
     checked_linkable osuf lnk = do
       parts <- traverse (adjust_part osuf) (linkableParts lnk)

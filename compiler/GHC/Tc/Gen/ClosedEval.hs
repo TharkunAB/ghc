@@ -50,7 +50,8 @@ import qualified GHC.Core as Core
 import GHC.Core.Class (classMethods, className)
 import GHC.Core.Coercion
   ( coercionLKind, coercionRKind, coercionRole, liftCoSubstWith
-  , mkCoVarCo, mkSelCo, mkSubCo, mkSymCo )
+  , mkCoVarCo, mkSelCo, mkSubCo, mkSymCo, mkUnbranchedAxInstCo )
+import GHC.Core.Coercion.Axiom (Role(Nominal, Representational))
 import GHC.Core.DataCon as DataCon
 import GHC.Core.FVs (exprSomeFreeVarsList)
 import GHC.Core.InstEnv (instanceDFunId, lookupUniqueInstEnv)
@@ -612,7 +613,7 @@ closedScalar ty
 
 ordinaryClosedTyCon :: TyCon -> [Type] -> Bool
 ordinaryClosedTyCon tc args =
-  isVanillaAlgTyCon tc && isBoxedDataTyCon tc && isLiftedAlgTyCon tc &&
+  isVanillaAlgTyCon tc && isLiftedDataOrNewTyCon tc &&
   lengthIs args (tyConArity tc) && null (tyConStupidTheta tc) &&
   all closedGroundType args &&
   all (closedGroundField . instantiate . tyVarKind) tvs
@@ -677,7 +678,7 @@ closedConstructorPlan checked_args here args con
   , not (any isUnpacked bangs)
   , not (null specs) || not (null existentials) || isVanillaDataCon con
   , not (null specs) || not (null existentials) || isNothing (dataConWrapId_maybe con) ||
-      any isBanged bangs || dataConUserTyVars con /= universals
+      any isBanged bangs || dataConUserTyVars con /= universals || isNewTyCon (dataConTyCon con)
   , let user_vars = dataConUserTyVars con
         refined = map (fst . eqSpecPair) specs
         allowed = filter (`notElem` refined) universals ++ existentials
@@ -1023,6 +1024,17 @@ closedCallRenderer name (ClosedCodec shape nodes) = do
           | otherwise -> failWithTc (TcRnClosedTypeEval name "Missing recursive constructor renderer.")
         ClosedScalar scalar -> renderToken quote <$> renderScalar scalar
         ClosedScalarList scalar -> renderToken quote <$> renderList scalar
+        ClosedData tc kinds [ClosedConstructor tag _ (ClosedStaticFields _ [codec])]
+          | isNewTyCon tc
+          , Just nt_ax <- newTyConCo_maybe tc -> do
+              let co = mkUnbranchedAxInstCo Representational nt_ax kinds []
+              if coercionLKind co `tcEqType` closedShapeKind current
+                 && coercionRKind co `tcEqType` closedShapeKind codec
+                then do
+                  render_inner <- renderFields refs quote codec
+                  return $ \value suffix ->
+                    prependTag tag (render_inner (mkCast value co) suffix)
+                else failWithTc (TcRnClosedTypeEval name "Unexpected newtype representation.")
         ClosedData _ kinds alternatives -> do
           binder <- mkSysLocalM (fsLit "closed_data") ManyTy (closedShapeKind current)
           render_alts <- forM alternatives $ \(ClosedConstructor tag con fields) -> do

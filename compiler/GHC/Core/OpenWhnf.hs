@@ -12,6 +12,7 @@ module GHC.Core.OpenWhnf
   , checkedMultiplicityCast
   , openFamilyReduction
   , openDataConFieldTypes, openIndexedDataCon, openReadbackM, OpenReadbackFailure(..)
+  , neutralRigidVar
   ) where
 
 import GHC.Prelude
@@ -23,15 +24,16 @@ import Control.Monad.Trans.State.Strict (StateT, evalStateT, get, mapStateT, put
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (isJust, isNothing)
+import GHC.Builtin.PrimOps (PrimOp(..))
 import GHC.Builtin.WiredIn.Types
   (charDataCon, mkPromotedPairTy, pairTyCon, tupleDataCon, unboxedUnitDataCon, unboxedUnitTy, unmatchableDataConTy)
 import GHC.Core.Coercion (coercionLKind, coercionRKind, coercionType, isReflCo, mkNomReflCo)
 import GHC.Core.FamInstEnv (emptyFamInstEnvs, reduceTyFamApp_maybe)
-import GHC.Core.Coercion.Axiom (Role(Nominal))
+import GHC.Core.Coercion.Axiom (CoAxiomRule(UnbranchedAxiom), Role(Nominal), coAxiomTyCon)
 import GHC.Core.Reduction (Reduction(..), isReflRedn, mkFunRedn, mkReflRedn)
 import GHC.Core.DataCon
   ( DataCon, dataConWorkId, dataConTyCon, dataConFullSig, dataConRepArity
-  , dataConRepArgTys, dataConExTyCoVars, eqSpecPair
+  , dataConRepArgTys, dataConExTyCoVars, dataConTagZ, eqSpecPair
   , dataConRepArgBinders, dataConStupidTheta, dataConImplBangs
   , dataConWrapId_maybe, dataConUserTyVars, dataConUnivTyVars, promoteDataCon
   , isBanged, isTypeDataCon )
@@ -39,20 +41,23 @@ import GHC.Core (Alt(..), AltCon(..), Bind(..), CoreAlt, CoreExpr, Expr(..), col
 import GHC.Core.FVs (exprFreeVars)
 import GHC.Core.Opt.Arity (etaExpand)
 import GHC.Core.Subst (Subst, extendCvSubst, extendTvSubst, mkEmptySubst, substExpr, substTy)
-import GHC.Core.TyCo.Compare (eqType)
-import GHC.Core.TyCon (closedFamilyTyConCoAxiom_maybe, isBoxedDataTyCon)
+import GHC.Core.TyCo.Compare (eqType, eqTypes)
+import GHC.Core.TyCon
+  ( closedFamilyTyConCoAxiom_maybe, isBoxedDataTyCon
+  , isNewTyCon, isUnaryClassTyCon, newTyConCo_maybe, tyConDataCons, tyConResKind, tyConSingleDataCon_maybe )
 import GHC.Core.TyCo.Rep
   ( Coercion(..), MCoercion(MRefl), Type(TermVarTy), UnivCoProvenance(SubMultProv)
   , UnivCoDeps(NoUnivCoDeps), scaledThing )
 import GHC.Core.Type
-  ( FunTyFlag(FTF_T_T), Kind, Type, isLiftedTypeKind, isManyTy, isOneTy
+  ( FunTyFlag(FTF_T_T), Kind, Type, isConstraintLikeKind, isLiftedTypeKind, isManyTy, isOneTy
   , mkAppTy, mkTyConApp, mkTyVarTy
-  , repGetTyVar_maybe, splitFunTy_maybe, splitTyConApp_maybe, substTyWith, tyCoVarsOfType, typeKind )
+  , repGetTyVar_maybe, splitForAllForAllTyBinders, splitFunTy_maybe, splitTyConApp_maybe
+  , substTyWith, tyCoVarsOfType, typeKind )
 import GHC.Core.Utils (exprType, findAlt)
 import GHC.Types.Basic (Boxity(Boxed), IntWithInf, intGtLimit)
-import GHC.Types.Id (dataConWrapUnfolding_maybe, isDataConWorkId_maybe, isJoinId)
-import GHC.Types.Literal (Literal(LitChar))
-import GHC.Types.Var (Var, eqForAllVis, isCoVar, isId, isTyVar, varType)
+import GHC.Types.Id (dataConWrapUnfolding_maybe, isDataConWorkId_maybe, isDataConWrapId_maybe, isJoinId, isPrimOpId_maybe)
+import GHC.Types.Literal (LitNumType(LitNumInt), Literal(LitChar, LitNumber), mkLitIntUnchecked)
+import GHC.Types.Var (Var, VarBndr(..), eqForAllVis, isCoVar, isId, isTyVar, varType)
 import GHC.Types.Var.Env (VarEnv, emptyVarEnv, extendVarEnv, extendVarEnvList, lookupVarEnv,
                           mkInScopeSet)
 import GHC.Types.Var.Set (VarSet, emptyVarSet, elemVarSet, unionVarSet)
@@ -84,6 +89,7 @@ data CaseContinuation = CaseContinuation Env Var Type [CoreAlt]
 -- | A weak head observation of a typed expression.
 data Whnf
   = Lambda Var Suspension
+  | PrimDataToTag
   | Literal Literal
   | BoxedChar Char
   | BoxedPair Suspension Suspension
@@ -102,7 +108,16 @@ data Neutral
   = Rigid Var
   | Unsolved Var
   | Applied Neutral Suspension
+  | NewtypeUnwrap Neutral DataCon [Type]
+  | PrimBlocked Neutral
   | CaseBlocked Neutral CaseContinuation
+
+-- | Recover the underlying rigid variable of a neutral head or newtype projection.
+neutralRigidVar :: Neutral -> Maybe Var
+neutralRigidVar (Rigid v)             = Just v
+neutralRigidVar (NewtypeUnwrap n _ _) = neutralRigidVar n
+neutralRigidVar (PrimBlocked n)       = neutralRigidVar n
+neutralRigidVar _                     = Nothing
 
 -- | A known elimination performed on the observation path.
 -- The caller must supply typed Core. A step is not a Core coercion.
@@ -273,6 +288,11 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
       pure whnf
   where
     eval_step = case expr of
+      _ | App (App (Var prim_fn) (Type _lev)) (Type scrut_ty) <- expr
+        , Just op <- isPrimOpId_maybe prim_fn
+        , op == DataToTagSmallOp || op == DataToTagLargeOp
+        , isLiftedTypeKind (typeKind scrut_ty) ->
+            pure PrimDataToTag
       _ | Just (con, arguments, fields, missing) <- constructorApplication expr
         , missing > 0 || con /= pairCon ->
             if missing > 0
@@ -285,8 +305,9 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
         | Just binding <- lookupVarEnv env v -> do
             lift (lift (local v))
             recur binding
-        | indexed, Just wrapper <- dataConWrapUnfolding_maybe v
-        , exprType wrapper `eqType` varType v ->
+        | indexed || maybe False (isNewTyCon . dataConTyCon) (isDataConWrapId_maybe v)
+        , Just wrapper <- dataConWrapUnfolding_maybe v
+        , sameWrapperType (exprType wrapper) (varType v) ->
             recur (mkSuspension emptyVarEnv wrapper)
         | otherwise -> do
             definition <- lift (lift (obtain v first_type))
@@ -299,6 +320,30 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
                 | v `elemVarSet` unsolved -> pure (Neutral (Unsolved v))
                 | otherwise -> pure (Neutral (Rigid v))
       Cast body co
+        | TransCo c1 c2 <- co ->
+            recurHead first_type (mkSuspension env (Cast (Cast body c1) c2))
+        | Just (con, tys, field_ty) <- matchNewtypeWrapCo co
+        , exprType body `eqType` field_ty -> do
+            whnf <- recur (mkSuspension env body)
+            case whnf of
+              Neutral (NewtypeUnwrap inner_n con' tys')
+                | con' == con, eqTypes tys' tys ->
+                    pure (Neutral inner_n)
+              _ -> do
+                EvalState s n m <- get
+                put (EvalState s (n + 1) (IntMap.insert n whnf m))
+                pure (BoxedData con tys [Suspension env body (Just n)])
+        | Just (con, tys, field_ty) <- matchNewtypeUnwrapCo co
+        , exprType body `eqType` mkTyConApp (dataConTyCon con) tys
+        , coercionRKind co `eqType` field_ty -> do
+            whnf <- recur (mkSuspension env body)
+            case whnf of
+              BoxedData con' tys' [field_susp]
+                | con' == con, eqTypes tys' tys ->
+                    recurHead first_type field_susp
+              Neutral inner_n ->
+                pure (Neutral (NewtypeUnwrap inner_n con tys))
+              _ -> lift (throwE UnsupportedCore)
         | indexed
         , coercionLKind co `eqType` coercionRKind co || checkedMultiplicityCast co ->
             recurHead first_type (mkSuspension env body)
@@ -316,6 +361,44 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
             payload <- recur (mkSuspension env arg)
             case payload of
               Literal (LitChar c) -> pure (BoxedChar c)
+              _ -> lift (throwE UnsupportedCore)
+      App (App (Var prim_fn) (Type res_ty)) arg
+        | Just TagToEnumOp <- isPrimOpId_maybe prim_fn
+        , Just (tc, tc_args) <- splitTyConApp_maybe res_ty
+        , isBoxedDataTyCon tc -> do
+            tag_whnf <- recur (mkSuspension env arg)
+            case tag_whnf of
+              Neutral n -> pure (Neutral (PrimBlocked n))
+              Literal (LitNumber LitNumInt tag) ->
+                case [dc | dc <- tyConDataCons tc
+                         , null (dataConRepArgTys dc)
+                         , toInteger (dataConTagZ dc) == tag] of
+                  [dc] -> pure (BoxedData dc tc_args [])
+                  _    -> lift (throwE UnsupportedCore)
+              _ -> lift (throwE UnsupportedCore)
+      App (App (App (Var prim_fn) (Type _lev)) (Type _scrut_ty)) arg
+        | Just op <- isPrimOpId_maybe prim_fn
+        , op == DataToTagSmallOp || op == DataToTagLargeOp -> do
+            val_whnf <- recur (mkSuspension env arg)
+            case val_whnf of
+              Neutral n -> pure (Neutral (PrimBlocked n))
+              BoxedData dc _ _ -> pure (Literal (mkLitIntUnchecked (toInteger (dataConTagZ dc))))
+              IndexedData dc _ _ _ _ -> pure (Literal (mkLitIntUnchecked (toInteger (dataConTagZ dc))))
+              BoxedPair _ _ -> pure (Literal (mkLitIntUnchecked 0))
+              _ -> lift (throwE UnsupportedCore)
+      App (App (Var prim_fn) lhs_arg) rhs_arg
+        | Just op <- isPrimOpId_maybe prim_fn
+        , Just cmp <- intCmpPrimOp op -> do
+            lhs_whnf <- recur (mkSuspension env lhs_arg)
+            case lhs_whnf of
+              Neutral n -> pure (Neutral (PrimBlocked n))
+              Literal (LitNumber LitNumInt i) -> do
+                rhs_whnf <- recur (mkSuspension env rhs_arg)
+                case rhs_whnf of
+                  Neutral n -> pure (Neutral (PrimBlocked n))
+                  Literal (LitNumber LitNumInt j) ->
+                    pure (Literal (mkLitIntUnchecked (if cmp i j then 1 else 0)))
+                  _ -> lift (throwE UnsupportedCore)
               _ -> lift (throwE UnsupportedCore)
       App (App (App (App (Var worker) (Type a)) (Type b)) x) y
         | worker == pairWorker
@@ -344,6 +427,15 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
                 -- See Note [Observing open Core].
                 lift (lift (record ContinueWithUnit))
                 recur (mkSuspension closure body)
+          PrimDataToTag
+            | not (isTyCoArg arg) -> do
+                val_whnf <- recur (mkSuspension env arg)
+                case val_whnf of
+                  Neutral n -> pure (Neutral (PrimBlocked n))
+                  BoxedData dc _ _ -> pure (Literal (mkLitIntUnchecked (toInteger (dataConTagZ dc))))
+                  IndexedData dc _ _ _ _ -> pure (Literal (mkLitIntUnchecked (toInteger (dataConTagZ dc))))
+                  BoxedPair _ _ -> pure (Literal (mkLitIntUnchecked 0))
+                  _ -> lift (throwE UnsupportedCore)
           Neutral neutral -> pure (Neutral (Applied neutral (mkSuspension env arg)))
           _ -> lift (throwE UnsupportedCore)
       Let (NonRec binder rhs) body
@@ -422,6 +514,15 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
 
     matches field (Suspension _ body _) =
       liftedBinder field && varType field `eqType` exprType body
+
+    intCmpPrimOp :: PrimOp -> Maybe (Integer -> Integer -> Bool)
+    intCmpPrimOp IntEqOp = Just (==)
+    intCmpPrimOp IntNeOp = Just (/=)
+    intCmpPrimOp IntLtOp = Just (<)
+    intCmpPrimOp IntLeOp = Just (<=)
+    intCmpPrimOp IntGtOp = Just (>)
+    intCmpPrimOp IntGeOp = Just (>=)
+    intCmpPrimOp _       = Nothing
 
 -- | Check a compiler-generated weakening of an otherwise unchanged arrow.
 -- See Note [Observing indexed constructor cases].
@@ -574,9 +675,11 @@ function uses its argument. The callback still runs the same code.
 -- Both the source operand decoder and the Core observer use this check.
 openDataConFieldTypes :: DataCon -> [Type] -> Maybe [Type]
 openDataConFieldTypes con parameters
-  | isBoxedDataTyCon (dataConTyCon con), not (isTypeDataCon con)
+  | let tc = dataConTyCon con
+  , (isBoxedDataTyCon tc && isNothing (dataConWrapId_maybe con))
+    || ((isNewTyCon tc || isUnaryClassTyCon tc) && isLiftedOrConstraintKind (tyConResKind tc))
+  , not (isTypeDataCon con)
   , null (dataConRepArgBinders con), null (dataConStupidTheta con)
-  , Nothing <- dataConWrapId_maybe con
   , all (not . isBanged) (dataConImplBangs con)
   , (vars, [], [], [], fields, result) <- dataConFullSig con
   , length vars == length parameters
@@ -585,14 +688,50 @@ openDataConFieldTypes con parameters
         field_types = map (instantiate . scaledThing) fields
   -- The kind of a parameter may refer to earlier constructor parameters.
   , and (zipWith eqType (map (instantiate . varType) vars) (map typeKind parameters))
-  , isLiftedTypeKind (typeKind (instantiate result))
-  , all (isLiftedTypeKind . typeKind) field_types
+  , isLiftedOrConstraintKind (typeKind (instantiate result))
+  , all (isLiftedOrConstraintKind . typeKind) field_types
   = Just field_types
   | otherwise = Nothing
 
--- | Only lifted term binders (and join points in local lets) can enter the lazy environment.
+isLiftedOrConstraintKind :: Kind -> Bool
+isLiftedOrConstraintKind k = isLiftedTypeKind k || isConstraintLikeKind k
+
+matchNewtypeUnwrapCo :: Coercion -> Maybe (DataCon, [Type], Type)
+matchNewtypeUnwrapCo co@(AxiomCo (UnbranchedAxiom nt_ax) cos)
+  | all (\c -> isReflCo c || coercionLKind c `eqType` coercionRKind c) cos
+  , let tc = coAxiomTyCon nt_ax
+        tys = map coercionLKind cos
+  , isNewTyCon tc && isLiftedOrConstraintKind (tyConResKind tc)
+  , Just nt_ax == newTyConCo_maybe tc
+  , Just con <- tyConSingleDataCon_maybe tc
+  , Just [field_ty] <- openDataConFieldTypes con tys
+  , coercionLKind co `eqType` mkTyConApp tc tys
+  , coercionRKind co `eqType` field_ty
+  = Just (con, tys, field_ty)
+matchNewtypeUnwrapCo _ = Nothing
+
+matchNewtypeWrapCo :: Coercion -> Maybe (DataCon, [Type], Type)
+matchNewtypeWrapCo (SymCo co) = matchNewtypeUnwrapCo co
+matchNewtypeWrapCo _          = Nothing
+
+-- | Compare a constructor wrapper unfolding's type against its 'Id' type,
+-- ignoring 'Inferred' versus 'Specified' specificity introduced by Core 'Lam'.
+sameWrapperType :: Type -> Type -> Bool
+sameWrapperType t1 t2
+  | t1 `eqType` t2 = True
+  | (b1, r1) <- splitForAllForAllTyBinders t1
+  , (b2, r2) <- splitForAllForAllTyBinders t2
+  , not (null b1), length b1 == length b2
+  , let vs1 = [v | (_, Bndr v _) <- b1]
+        vs2 = [v | (_, Bndr v _) <- b2]
+  , and (zipWith (\v1 v2 -> varType v1 `eqType` varType v2) vs1 vs2)
+  = sameWrapperType (substTyWith vs1 (map mkTyVarTy vs2) r1) r2
+  | otherwise = False
+
+-- | Lifted term and dictionary binders (and join points in local lets) can enter the lazy environment.
 liftedBinder :: Var -> Bool
-liftedBinder binder = isId binder && isLiftedTypeKind (typeKind (varType binder))
+liftedBinder binder =
+  isId binder && not (isCoVar binder) && isLiftedOrConstraintKind (typeKind (varType binder))
 
 liftedOrJoinBinder :: Var -> Bool
 liftedOrJoinBinder binder = liftedBinder binder || isJoinId binder

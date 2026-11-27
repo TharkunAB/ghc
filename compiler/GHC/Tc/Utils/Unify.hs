@@ -6502,6 +6502,8 @@ mightEqualLater inert_set given_pred given_loc wanted_pred wanted_loc
       MaybeApart reason subst
         | MARInfinite <- reason -- see Example 7 in the Note.
         -> Nothing
+        | MARRuntimeIndex <- reason
+        -> Nothing
         | otherwise
         -> Just subst
       SurelyApart -> Nothing

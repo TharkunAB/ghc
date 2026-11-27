@@ -1649,19 +1649,37 @@ inferArrowIndices metadata decls tc
       (mkNamedTyConBinders Inferred indices ++ tyConBinders tc)
       0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc)
 
--- | Recognize a tree of bare arrows whose leaves are lifted Type.
+-- | Recognize a quantifier-free nullary synonym RHS over Type that contains at
+-- least one bare standard arrow (either at the root or nested in a kind constructor
+-- application such as @TyFun (Type -> Type) (Maybe Type)@).
 -- See Note [Inferred matchability for ordinary kind-arrow synonyms].
 legacyKindArrowTree :: LHsType GhcRn -> Bool
-legacyKindArrowTree rhs = matchabilityArrow rhs && go rhs
+legacyKindArrowTree rhs =
+    let (has_arrow, has_star, ok) = go rhs
+    in ok && has_arrow && has_star
   where
+    combine (a1, s1, ok1) (a2, s2, ok2) = (a1 || a2, s1 || s2, ok1 && ok2)
     go ty
-      | L _ (HsFunTy _ _ domain result) <- ignoreParens ty
-      , matchabilityArrow ty
-      = go domain && go result
+      | L _ (HsFunTy _ arr domain result) <- ignoreParens ty
+      = case arr of
+          HsModifiedFunArr _ [] HsStandardArr{} ->
+            let (a1, s1, ok1) = go domain
+                (a2, s2, ok2) = go result
+            in (True || a1 || a2, s1 || s2, ok1 && ok2)
+          _ -> combine (go domain) (go result)
       | otherwise = case unLoc (ignoreParens ty) of
-          HsStarTy{} -> True
-          HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> name == liftedTypeKindTyConName
-          _ -> False
+          HsStarTy{} -> (False, True, True)
+          HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) ->
+            (False, name == liftedTypeKindTyConName, True)
+          HsAppTy _ f a -> combine (go f) (go a)
+          HsAppKindTy _ f k -> combine (go f) (go k)
+          HsOpTy _ l _ r -> combine (go l) (go r)
+          HsTupleTy _ _ ts -> foldr (combine . go) (False, False, True) ts
+          HsListTy _ t -> go t
+          HsKindSig _ t k -> combine (go t) (go k)
+          HsForAllTy{} -> (False, False, False)
+          HsQualTy{} -> (False, False, False)
+          _ -> (False, False, True)
 
 {- Note [Inferred matchability for ordinary kind-arrow synonyms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4332,8 +4350,11 @@ tcTySynRhs metadata roles_info tc_name hs_ty
                        unless (null rest) $ pprPanic "unused synonym metadata sites" (ppr tc_name)
                        pure ty
                      Nothing -> case tc_bndrs of
-                       b : _ | inferredMatchabilityIndex b ->
-                         tcCheckMatchabilitySynRhs (mkTyVarTy (binderVar b)) hs_ty res_kind
+                       b : rest
+                         | inferredMatchabilityIndex b
+                         , not (binderVar b `elemVarSet`
+                                  tyCoVarsOfTypes (res_kind : map (tyVarKind . binderVar) rest)) ->
+                           tcCheckMatchabilitySynRhs (mkTyVarTy (binderVar b)) hs_ty res_kind
                        _ -> tcCheckSynonymRhs tc_name hs_ty res_kind
 
          -- See Note [Error on unconstrained meta-variables] in GHC.Tc.Utils.TcMType

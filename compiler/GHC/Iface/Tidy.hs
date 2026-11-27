@@ -1507,6 +1507,8 @@ localiseNativeTopIndices name_cache binds = mapM localise_bind binds
       (\s as -> Case s b ty as) <$> protect_calls scrut <*> traverse protect_alt alts
     protect_calls (Cast e co) = (\e' -> Cast e' co) <$> protect_calls e
     protect_calls (Tick t e) = Tick t <$> protect_calls e
+    protect_calls (Pack ty w payload) = Pack ty w <$> protect_calls payload
+    protect_calls (Unpack w p pkg body) = Unpack w p <$> protect_calls pkg <*> protect_calls body
     protect_calls e = pure e
 
     protect_alt (Alt con bs rhs) = Alt con bs <$> protect_calls rhs

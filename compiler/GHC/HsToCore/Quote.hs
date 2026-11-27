@@ -51,7 +51,7 @@ import GHC.Core.Class
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core
-import GHC.Core.Type( pattern ManyTy, mkFunTy, defaultForAllMatchability, tyConAppTyCon, isMultiplicityTy )
+import GHC.Core.Type( pattern ManyTy, defaultForAllMatchability, mkFunTy, isMultiplicityTy, tyConAppTyCon )
 import GHC.Core.Make
 import GHC.Core.Utils
 
@@ -1459,10 +1459,7 @@ outerForallMatchability HsOuterImplicit{} = Nothing
 repForallMatchability :: Maybe TypeOrKind -> Maybe (LHsType GhcRn)
                      -> MetaM (Maybe (Core (M TH.Type)))
 repForallMatchability _ (Just ma) = Just <$> repLTy KindLevel ma
-repForallMatchability Nothing Nothing = pure Nothing
-repForallMatchability (Just tyki) Nothing =
-  Just <$> (lookupOcc (tyConName (tyConAppTyCon (defaultForAllMatchability tyki))) >>=
-              repPromotedDataCon)
+repForallMatchability _ Nothing   = pure Nothing
 
 -- | Annotate a nonempty TH forall group when its metadata is selected.
 -- Context-only groups and deferred declaration-kind omissions remain bare.
@@ -3248,7 +3245,9 @@ repOrderedGadt names result = go
     matchability tele = do
       ma <- repForallMatchability (Just TypeLevel) (hsf_matchability tele)
       case ma of
-        Nothing -> panic "repOrderedGadt: missing matchability"
+        Nothing ->
+          lookupOcc (tyConName (tyConAppTyCon (defaultForAllMatchability TypeLevel))) >>=
+            repPromotedDataCon
         Just ma' -> pure ma'
 
 -- | Quote the source annotations on one ordered constructor field.

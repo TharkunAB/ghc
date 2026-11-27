@@ -87,11 +87,12 @@ import GHC.Tc.Gen.SourceClosure
   ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
   , pruneUnusedIndexedLookups, sourceEarlyClosureTables )
 import GHC.Tc.Gen.SourceTable (sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
-                               isStructuralSourceTable, isNominalStructuralSource, isLargeElimTable, rebuildSourceFamilyWith,
+                               isStructuralSourceTable, isNominalStructuralSource, isLargeElimTable, isLargeElimResultKind, rebuildSourceFamilyWith,
                                sourceTableFamilyUse,
                                sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
                                hasSourceMethodRule, hasSourceMethodRuleAt, sourceLiteralWorkers, checkSourceMethodUses,
                                checkOptionalSourceUses, checkAndInstallSourceProofs,
+                               addSourceMethods, certifyLocalInstanceMethods,
                                sourceMapSelector, sourceTableDependencies)
 import GHC.Tc.Gen.Foreign
 import GHC.Tc.Deriv (DerivInfo)
@@ -794,7 +795,10 @@ installSourceMethods wanted env
         for_ checked $ \(_, pairs, _) -> for_ pairs $ \(_, target) ->
           when (nameIsLocalOrFrom (tcg_semantic_mod env) (idName target)) $
             keepAlive (idName target)
-        tcExtendGlobalValEnv [setSourceLiteralCons (setSourceMethodIds dfun pairs) literal
+        let current_dfun d = case lookupTypeEnv (tcg_type_env env) (idName d) of
+              Just (AnId existing) -> existing
+              _                    -> d
+        tcExtendGlobalValEnv [setSourceLiteralCons (addSourceMethods (current_dfun dfun) pairs) literal
                              | (dfun, pairs, literal) <- checked] getGblEnv
 
 {- Note [Source table dependency closure]
@@ -2104,7 +2108,7 @@ tcTopSrcDeclsThenWith prev_deriv requests group finish = do
                         (done_early, rem_current) = partition ((`elemNameSet` all_checked) . fst) current
                         run_rem
                           | null rem_current = do
-                              (envs, _, _) <- tcTopSrcDeclGroupWithMethods False (Just derivs) rest_grp
+                              (envs, _, _) <- tcTopSrcDeclGroupWithMethods Nothing (Just derivs) rest_grp
                               finish envs
                           | otherwise = tcIndependentFamilyProducersWith derivs rem_current rest_grp finish
                     if null done_early
@@ -2603,7 +2607,7 @@ constraints differently. Use the ordinary declaration order in that case.
 tcTopSrcTablesWith :: [DerivInfo] -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
 tcTopSrcTablesWith prev_deriv =
   tcTopSrcTablesCont False prev_deriv $ \derivs g -> do
-    (envs, _, _) <- tcTopSrcDeclGroupWithMethods False (Just derivs) g
+    (envs, _, _) <- tcTopSrcDeclGroupWithMethods Nothing (Just derivs) g
     pure envs
 
 tcTopSrcTablesCont :: Bool -> [DerivInfo]
@@ -2632,7 +2636,7 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
           else do
             -- See Note [Deriving for early source tables].
             ((envs@(early_env, _), _, deriving_info), wanteds) <- captureTopConstraints $
-              tcTopSrcDeclGroupWithMethods False Nothing early
+              tcTopSrcDeclGroupWithMethods Nothing Nothing early
             restoreEnvs envs $ do
               evs <- simplifyTop wanteds
               (ordinary, companions, helpers) <- sourceTablesWithMappers True early_names evs early_env
@@ -2656,24 +2660,30 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
               let tables = ordinary ++ cases
                   found = mkNameSet (map (tyConName . snd) tables)
                   used_in_early = mkNameSet (localUses (mkNameSet (map snd needed)) early)
-              has_interp <- isJust . hsc_interp <$> getTopEnv
               defer_on <- or <$> sequence
                 [ goptM Opt_DeferTypeErrors
                 , goptM Opt_DeferTypedHoles
                 , goptM Opt_DeferOutOfScopeVariables ]
-              let all_early_demands =
-                    [ (nm, nameSrcSpan nm) | nm <- nameSetElemsStable early_names ]
-              for_ needed $ \(term, family) ->
-                when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
-                  unless (family `elemNameSet` found) $
-                    setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
-              failIfErrsM
-              local_defs <-
-                if has_interp && not defer_on
+              local_defs@(local_def_map, _) <-
+                if not defer_on
                   then tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
-                         (localOpenDefinitions all_early_demands
+                         (opportunisticOpenDefinitions
                            (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
                   else pure (emptyNameEnv, emptyNameEnv)
+              let is_large_elim_owner nm = case lookupTypeEnv (tcg_type_env early_env) nm of
+                    Just (AnId fn) ->
+                      let (_, body_ty) = splitForAllTyCoVars (idType fn)
+                          (_, _, res_ty) = splitFunTys body_ty
+                      in isLargeElimResultKind res_ty && not (res_ty `eqType` body_ty)
+                    _ -> False
+              for_ needed $ \(term, family) ->
+                when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
+                  unless (family `elemNameSet` found
+                          || (not (family `elemNameSet` used_in_early)
+                              && not (is_large_elim_owner term)
+                              && term `elemNameEnv` local_def_map)) $
+                    setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+              failIfErrsM
               addTopEvBinds evs $ do
                 tables_env <- installEarlyTables (tables, companions, helpers)
                 setGblEnv tables_env $
@@ -3236,22 +3246,31 @@ tcLocalOpenGroupWith prev_deriv demands group@HsGroup
           rest = group { hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs)
                        , hs_tyclds = rest_tys ++ map (uncurry make_instance_group) late_list
                        , hs_derivds = [], hs_defds = [] }
+      let rest_val_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rest))
+          deferred_vals
+            | not (null instances) || not (null prev_deriv) = Just rest_val_names
+            | otherwise                                     = Nothing
       ((envs@(early_env, _), methods, _), wanted) <- captureTopConstraints $
-        tcTopSrcDeclGroupWithMethods (not (null instances) || not (null prev_deriv)) (Just prev_deriv) early
+        tcTopSrcDeclGroupWithMethods deferred_vals (Just prev_deriv) early
       restoreEnvs envs $ do
         evs <- checkNoErrs (simplifyTop wanted)
         let checked_demands = reverse ready
-        definitions <- localOpenDefinitions checked_demands
-                         (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+        (req_defs, req_owners) <- localOpenDefinitions checked_demands
+                                    (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+        (opp_defs, opp_owners) <- tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                                    (opportunisticOpenDefinitions
+                                      (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
+        let definitions = (opp_defs `plusNameEnv` req_defs, opp_owners `plusNameEnv` req_owners)
         addTopEvBinds evs $ withLocalCaseTables checked_demands definitions $
           tcTopSrcDeclsThen (map fst (reverse blocked)) rest $ \rest_envs ->
             case methods of
               Nothing -> finish rest_envs
-              Just (classes, infos) -> restoreEnvs rest_envs $ do
-                bindings <- tcInstDecls2 classes infos
-                (env, lcl) <- getEnvs
-                env' <- installForgetMTyCons (env { tcg_binds = tcg_binds env ++ bindings })
-                finish (env', lcl)
+              Just (dm_ids, classes, infos) -> restoreEnvs rest_envs $
+                tcExtendGlobalValEnv dm_ids $ do
+                  bindings <- tcInstDecls2 classes infos
+                  (env, lcl) <- getEnvs
+                  env' <- installForgetMTyCons (env { tcg_binds = tcg_binds env ++ bindings })
+                  finish (env', lcl)
   where
     externalDeclUsesList :: Data a => a -> [Name]
     externalDeclUsesList node
@@ -3577,12 +3596,51 @@ closeLocalNames dependencies = foldM visit
           uses <- dependencies name
           foldM visit (extendNameSet checked name) (nameSetElemsStable uses)
 
--- | Collect resolved term references from one checked binding.
+-- | Opportunistically desugar solved bindings (such as early source-table
+-- candidates, derived instances, and independent class instances) without
+-- failing when an unrelated binding cannot be observed.
+opportunisticOpenDefinitions :: Bag EvBind -> LHsBinds GhcTc
+                             -> TcM (NameEnv (Id, CoreExpr), NameEnv Id)
+opportunisticOpenDefinitions evidence binds = do
+    let safe_binds = [ bind | bind <- binds, not (hasPendingTypedSplice bind) ]
+    if null safe_binds
+      then pure (emptyNameEnv, emptyNameEnv)
+      else do
+        (_, zonked_ev_binds, zonked, _, _, _, _) <-
+          withReadOnlyFinalZonk $ zonkTopDecls evidence safe_binds [] [] [] []
+        let collect_lets (Core.Let b e) = let (bs, body) = collect_lets e in (b : bs, body)
+            collect_lets e              = ([], e)
+            single_export (L loc (XHsBindsLR (abs_binds@AbsBinds{abs_exports = exports@(_ : _ : _)}))) =
+              [L loc (XHsBindsLR (abs_binds { abs_exports = [owner] })) | owner <- exports]
+            single_export bind = [bind]
+            mono_owners (L _ (XHsBindsLR AbsBinds{abs_exports = exports})) =
+              [(idName mono, poly) | ABE{abe_mono = mono, abe_poly = poly} <- exports]
+            mono_owners _ = []
+        (messages, proposal) <- initDsTc $
+          dsHsWrapper (WpLet (EvBinds zonked_ev_binds)) $ \wrap_ev -> do
+            core_prs <- dsTopLHsBinds (concatMap single_export zonked)
+            let (ev_core_binds, _) = collect_lets (wrap_ev (Core.Var unitDataConId))
+            return (flattenBinds ev_core_binds ++ fromOL core_prs)
+        let owners = mkNameEnv (concatMap mono_owners zonked)
+            definitions = mkNameEnv
+              [ (idName owner, (owner, rhs))
+              | pairs <- maybeToList proposal, not (errorsFound messages)
+              , (owner, rhs) <- pairs
+              , exprType rhs `eqType` idType owner ]
+        pure (definitions, owners)
+  where
+    hasPendingTypedSplice :: Data a => a -> Bool
+    hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
+      Just HsTypedSplice{} -> True
+      _ -> or (gmapQ hasPendingTypedSplice node)
+
+-- | Collect resolved term and evidence references from one checked binding.
 localOpenReferences :: Data a => a -> [Name]
 localOpenReferences node = case cast node :: Maybe (HsExpr GhcTc) of
     Just (HsVar _ (L _ v)) -> [idName v]
     Just HsTypedSplice{} -> []
-    _ -> concat (gmapQ localOpenReferences node)
+    _ -> maybe [] (\v -> [idName (v :: Id)]) (cast node)
+      ++ concat (gmapQ localOpenReferences node)
 
 -- | Confine the checked definitions to the current typechecking continuation.
 withLocalOpenDefinitions :: (NameEnv (Id, CoreExpr), NameEnv Id)
@@ -3673,14 +3731,15 @@ tcSourceValueBinds group = do
 
 tcTopSrcDeclGroup :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
 tcTopSrcDeclGroup group = do
-    (envs, _, _) <- tcTopSrcDeclGroupWithMethods False (Just []) group
+    (envs, _, _) <- tcTopSrcDeclGroupWithMethods Nothing (Just []) group
     pure envs
 
 -- | Check a source batch. If deriving info is absent, save the attached
--- deriving clauses for a later batch. The instance method pass can also wait.
-tcTopSrcDeclGroupWithMethods :: Bool -> Maybe [DerivInfo] -> HsGroup GhcRn
-  -> TcM ((TcGblEnv, TcLclEnv), Maybe ([LTyClDecl GhcRn], [InstInfo GhcRn]), [DerivInfo])
-tcTopSrcDeclGroupWithMethods defer_methods previous_deriving group@(HsGroup { hs_tyclds = tycl_decls,
+-- deriving clauses for a later batch. When @deferred_val_names@ is 'Just',
+-- defer only class and instance methods that reference those later value bindings.
+tcTopSrcDeclGroupWithMethods :: Maybe NameSet -> Maybe [DerivInfo] -> HsGroup GhcRn
+  -> TcM ((TcGblEnv, TcLclEnv), Maybe ([Id], [LTyClDecl GhcRn], [InstInfo GhcRn]), [DerivInfo])
+tcTopSrcDeclGroupWithMethods deferred_val_names previous_deriving group@(HsGroup { hs_tyclds = tycl_decls,
                          hs_derivds = deriv_decls,
                          hs_fords  = foreign_decls,
                          hs_defds  = default_decls,
@@ -3695,11 +3754,126 @@ tcTopSrcDeclGroupWithMethods defer_methods previous_deriving group@(HsGroup { hs
                 -- Source-language instances, including derivings,
                 -- and import the supporting declarations
         traceTc "Tc3" empty ;
-        (tcg_env, inst_infos, th_bndrs,
+        dep_types <- xoptM LangExt.DependentTypes ;
+        let { is_syn_only_group tg =
+                null (group_instds tg) && null (group_roles tg)
+                && all (isSynDecl . unLoc) (group_tyclds tg)
+            ; tg_defs tg = mkNameSet (map (tcdName . unLoc) (group_tyclds tg))
+            ; tg_uses tg = group_ext tg `unionNameSet` externalDeclUses (group_tyclds tg, group_kisigs tg, group_instds tg)
+            ; close_needed needed
+                | let more = unionNameSets [ tg_uses tg | tg <- tycl_decls, is_syn_only_group tg
+                                           , not (isEmptyNameSet (tg_defs tg `intersectNameSet` needed)) ]
+                , not (isEmptyNameSet (more `minusNameSet` needed))
+                = close_needed (needed `unionNameSet` more)
+                | otherwise = needed
+            ; non_syn_uses = externalDeclUses deriv_decls `unionNameSet`
+                             unionNameSets [ tg_uses tg | tg <- tycl_decls, not (is_syn_only_group tg) ]
+            ; needed_early_syns = close_needed non_syn_uses
+            ; (trailing_syn_decls, main_tycl_decls) =
+                if dep_types && isJust previous_deriving
+                  then partition (\tg -> is_syn_only_group tg
+                                      && isEmptyNameSet (tg_defs tg `intersectNameSet` needed_early_syns))
+                                 tycl_decls
+                  else ([], tycl_decls)
+            ; val_bind_names = mkNameSet (collectHsValBinders CollNoDictBinders hs_val_binds)
+            ; unready_val_names = val_bind_names `unionNameSet` fromMaybe emptyNameSet deferred_val_names } ;
+        (tcg_env0, inst_infos, th_bndrs0,
          XValBindsLR (HsVBG deriv_binds deriv_sigs), deferred_deriving)
-            <- tcTyClsInstDecls previous_deriving tycl_decls deriv_decls default_decls val_binds ;
+            <- tcTyClsInstDecls previous_deriving main_tycl_decls deriv_decls default_decls val_binds ;
 
-        updLclCtxt (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs `plusNameEnv` tcl_th_bndrs tcl_env }) $
+        updLclCtxt (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs0 `plusNameEnv` tcl_th_bndrs tcl_env }) $
+        setGblEnv tcg_env0 $ do {
+        let { all_method_classes = tyClGroupTyClDecls main_tycl_decls
+            ; (early_deriv_binds, early_deriv_sigs, late_deriv_binds, late_deriv_sigs)
+                | dep_types, isJust previous_deriving
+                , null (localUses unready_val_names (deriv_binds, deriv_sigs))
+                = (deriv_binds, deriv_sigs, [], [])
+                | otherwise = ([], [], deriv_binds, deriv_sigs)
+            ; (early_classes, late_classes)
+                | dep_types, isJust previous_deriving
+                = partition (null . localUses unready_val_names) all_method_classes
+                | otherwise = ([], all_method_classes)
+            ; late_class_names = mkNameSet (map (tcdName . unLoc) late_classes)
+            ; (early_insts, late_insts)
+                | dep_types, isJust previous_deriving
+                = partition (\info ->
+                    null (localUses unready_val_names (ib_binds (iBinds info)))
+                    && null (localUses late_class_names (idType (instanceDFunId (iSpec info)))))
+                    inst_infos
+                | otherwise = ([], inst_infos) } ;
+
+        (tcg_env_staged, early_dm_ids, early_open_defs, early_staged_binds) <-
+          if null early_deriv_binds && null early_classes && null early_insts
+            then do { g <- getGblEnv ; pure (g, [], (emptyNameEnv, emptyNameEnv), []) }
+            else do {
+              let { prev_bind_count = length (tcg_binds tcg_env0) } ;
+              ((g1, l1, e_inst_binds), wanteds_inst) <- captureTopConstraints $ do {
+                envs_d <- discardWarnings (tcTopBinds early_deriv_binds early_deriv_sigs) ;
+                restoreEnvs envs_d $ do {
+                  ib <- tcInstDecls2 early_classes early_insts ;
+                  (g_cur, l_cur) <- getEnvs ;
+                  pure (g_cur, l_cur, ib) } } ;
+              let { new_deriv_binds = drop prev_bind_count (tcg_binds g1)
+                  ; staged_binds = new_deriv_binds ++ e_inst_binds
+                  ; dm_ids =
+                      [ v
+                      | bind <- e_inst_binds
+                      , v <- collectHsBindBinders CollNoDictBinders (unLoc bind)
+                      , take 3 (getOccString v) == "$dm" ] } ;
+              evs_inst <- restoreEnvs (g1, l1) (simplifyTop wanteds_inst) ;
+              let { g2 = (g1 `addEvBinds` evs_inst) { tcg_binds = tcg_binds tcg_env0 ++ staged_binds } } ;
+              errs <- ifErrsM (pure True) (pure False) ;
+              if errs
+                then pure (g2, dm_ids, (emptyNameEnv, emptyNameEnv), staged_binds)
+                else restoreEnvs (g2, l1) $ do {
+                  (_, zonked_ev, zonked_staged, _, _, _, _) <-
+                    withReadOnlyFinalZonk (zonkTopDecls (tcg_ev_binds g2) staged_binds [] [] [] []) ;
+                  defer_on <- or <$> sequence
+                    [ goptM Opt_DeferTypeErrors
+                    , goptM Opt_DeferTypedHoles
+                    , goptM Opt_DeferOutOfScopeVariables ] ;
+                  meth_tables0 <- sourceTableTyCons True False zonked_staged ;
+                  g3 <- installSourceTables meth_tables0 ;
+                  (inst_defs, extra_meth_binds, extra_meth_tables, extra_dfuns) <-
+                    if not defer_on && not (null staged_binds)
+                      then do {
+                        defs@(def_map, _) <- tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                                               (opportunisticOpenDefinitions zonked_ev zonked_staged) ;
+                        let { ds_pairs = nonDetNameEnvElts def_map } ;
+                        (m_binds, m_tables, m_dfuns) <- certifyLocalInstanceMethods g3 ds_pairs ;
+                        pure (defs, m_binds, m_tables, m_dfuns) }
+                      else pure ((emptyNameEnv, emptyNameEnv), [], [], []) ;
+                  g3b <- setGblEnv g3 (installSourceTables extra_meth_tables) ;
+                  for_ extra_dfuns $ \(_, m_pairs) -> for_ m_pairs $ \(_, target) ->
+                    keepAlive (idName target) ;
+                  let { upd_dfuns =
+                          [ let cur = case lookupTypeEnv (tcg_type_env g3b) (idName dfun) of
+                                  Just (AnId existing) -> existing
+                                  _                    -> dfun
+                            in addSourceMethods cur m_pairs
+                          | (dfun, m_pairs) <- extra_dfuns ] } ;
+                  g3c <- setGblEnv g3b (tcExtendGlobalValEnv upd_dfuns getGblEnv) ;
+                  let { all_staged = staged_binds ++ extra_meth_binds
+                      ; all_zonked = zonked_staged ++ extra_meth_binds } ;
+                  g4 <- installSourceMethods (const True) (g3c { tcg_binds = all_zonked, tcg_ev_binds = zonked_ev }) ;
+                  let { g5 = g4 { tcg_binds = tcg_binds tcg_env0, tcg_ev_binds = tcg_ev_binds g2 } } ;
+                  pure (g5, dm_ids, inst_defs, all_staged) } } ;
+
+        setGblEnv tcg_env_staged $ do {
+        (tcg_env, th_bndrs_syn) <-
+          if null trailing_syn_decls
+            then pure (tcg_env_staged, emptyNameEnv)
+            else do {
+              th_ref <- newTcRef emptyNameEnv ;
+              (g_syn, _) <- withLocalOpenDefinitions early_open_defs $ do {
+                (g_s, _, _, th_s) <- tcTyAndClassDecls trailing_syn_decls ;
+                writeTcRef th_ref th_s ;
+                l_s <- getLclEnv ;
+                pure (g_s, l_s) } ;
+              th_s <- readTcRef th_ref ;
+              pure (g_syn, th_s) } ;
+
+        updLclCtxt (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs_syn `plusNameEnv` tcl_th_bndrs tcl_env }) $
         setGblEnv tcg_env       $ do {
 
                 -- Foreign import declarations next.
@@ -3713,23 +3887,23 @@ tcTopSrcDeclGroupWithMethods defer_methods previous_deriving group@(HsGroup { hs
                 -- may be defined in terms of the former. (For instance,
                 -- the bindings produced in a Data instance.)
         traceTc "Tc5" empty ;
-        tc_envs <- tcSourceValueBinds group;
+        tc_envs <- withLocalOpenDefinitions early_open_defs (tcSourceValueBinds group);
         restoreEnvs tc_envs $ do {
 
                 -- Now GHC-generated derived bindings, generics, and selectors
                 -- Do not generate warnings from compiler-generated code;
                 -- hence the use of discardWarnings
         tc_envs@(tcg_env, tcl_env)
-            <- discardWarnings (tcTopBinds deriv_binds deriv_sigs) ;
+            <- discardWarnings (tcTopBinds late_deriv_binds late_deriv_sigs) ;
         restoreEnvs tc_envs $ do {  -- Environment doesn't change now
 
                 -- Second pass over class and instance declarations,
                 -- now using the kind-checked decls
         traceTc "Tc6" empty ;
-        let { method_classes = tyClGroupTyClDecls tycl_decls } ;
-        (inst_binds, pending_methods) <- if defer_methods
-          then pure ([], Just (method_classes, inst_infos))
-          else (, Nothing) <$> tcInstDecls2 method_classes inst_infos ;
+        (inst_binds, pending_methods) <- case deferred_val_names of {
+          Just _  -> pure ([], Just (early_dm_ids, late_classes, late_insts)) ;
+          Nothing -> tcExtendGlobalValEnv early_dm_ids $
+                       (, Nothing) <$> tcInstDecls2 late_classes late_insts } ;
 
                 -- Foreign exports
         traceTc "Tc7" empty ;
@@ -3743,7 +3917,7 @@ tcTopSrcDeclGroupWithMethods defer_methods previous_deriving group@(HsGroup { hs
 
                 -- Wrap up
         traceTc "Tc7a" empty ;
-        let { all_binds = inst_binds ++ foe_binds
+        let { all_binds = early_staged_binds ++ inst_binds ++ foe_binds
 
             ; fo_gres = fi_gres `unionBags` foe_gres
             ; fo_fvs = foldr (\gre fvs -> fvs `addOneFN` (greName gre))
@@ -3769,7 +3943,7 @@ tcTopSrcDeclGroupWithMethods defer_methods previous_deriving group@(HsGroup { hs
 
         tcg_env'' <- installForgetMTyCons tcg_env' ;
         return ((tcg_env'', tcl_env), pending_methods, deferred_deriving)
-    }}}}}
+    }}}}}}}
 
 tcTopSrcDeclGroupWithMethods _ _ _ = panic "tcTopSrcDeclGroup: ValBindsIn"
 

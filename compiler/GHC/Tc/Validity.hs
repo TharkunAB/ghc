@@ -461,7 +461,8 @@ checkValidMonoType :: Type -> TcM ()
 -- Assumes argument is fully zonked
 checkValidMonoType = check_valid_mono_type checkNoConstrainedFamilyApps Nothing
 
-check_valid_mono_type :: (Type -> TcM ()) -> Maybe (SkolemInfoAnon, CoercionN -> TcM ())
+check_valid_mono_type :: (Type -> TcM ())
+                      -> Maybe (Maybe TyCoVarSet, SkolemInfoAnon, CoercionN -> TcM ())
                       -> Type -> TcM ()
 check_valid_mono_type check_domains instance_pat ty
   = do { env <- liftZonkM $ tcInitOpenTidyEnv (tyCoVarsOfTypeList ty)
@@ -1449,7 +1450,7 @@ data ValidityEnv = ValidityEnv
   , ve_indices  :: VarSet
   , ve_imported_synonym :: Bool
   , ve_partial_family_hint :: Bool
-  , ve_instance_pat :: Maybe (SkolemInfoAnon, CoercionN -> TcM ()) }  -- When checking a matching pattern
+  , ve_instance_pat :: Maybe (Maybe TyCoVarSet, SkolemInfoAnon, CoercionN -> TcM ()) }  -- When checking a matching pattern
 
 instance Outputable ValidityEnv where
   ppr (ValidityEnv{ ve_tidy_env = env, ve_ctxt = ctxt
@@ -1517,7 +1518,7 @@ check_type ve (AppTy ty1 ty2)
         ; check_arg_type False ve ty2
         ; case (ve_instance_pat ve, ve_expand ve) of
             (_, NoExpand) -> pure ()
-            (Just (skol_info, record), _) -> checkPatternMatchability skol_info record ty1
+            (Just (mb_qtvs, skol_info, record), _) -> checkPatternMatchability mb_qtvs skol_info record ty1
             _ -> pure () }
 
 check_type ve ty@(TyConApp tc tys)
@@ -2246,18 +2247,18 @@ check_pred_help under_syn env dflags ctxt pred
               -- to box such constraints in GHC.Tc.Utils.TcType.pickQuantifiablePreds, as described
               -- in Note [Lift equality constraints when quantifying] in GHC.Tc.Solver
 
-      ForAllPred _ theta head -> check_quant_pred env dflags ctxt pred theta head
-      _                       -> return ()
+      ForAllPred qtvs theta head -> check_quant_pred env dflags ctxt (map snd qtvs) pred theta head
+      _                          -> return ()
 
 check_quant_pred :: TidyEnv -> DynFlags -> UserTypeCtxt
-                 -> PredType -> ThetaType -> PredType -> TcM ()
-check_quant_pred env dflags ctxt pred theta head_pred
+                 -> [TyCoVar] -> PredType -> ThetaType -> PredType -> TcM ()
+check_quant_pred env dflags ctxt qtvs pred theta head_pred
   = addErrCtxt (QuantifiedCtCtxt pred) $
     do { -- Check the instance head
          case classifyPredType head_pred of
                                  -- SigmaCtxt tells checkValidInstHead that
                                  -- this is the head of a quantified constraint
-            ClassPred cls tys -> do { checkValidInstHead SigmaCtxt cls tys
+            ClassPred cls tys -> do { checkValidQuantPredHead (mkVarSet qtvs) cls tys
                                     ; check_pred_help False env dflags ctxt head_pred }
                                -- need check_pred_help to do extra pred-only validity
                                -- checks, such as for (~). Otherwise, we get #17563
@@ -2472,6 +2473,13 @@ We can also have instances for functions: @instance Foo (a -> b) ...@.
 
 checkValidInstHead :: UserTypeCtxt -> Class -> [Type] -> TcM ()
 checkValidInstHead = checkValidInstHeadWith (const (pure ()))
+
+checkValidQuantPredHead :: TyCoVarSet -> Class -> [Type] -> TcM ()
+checkValidQuantPredHead qtvs clas cls_args
+  = do { dflags  <- getDynFlags
+       ; hsc_src <- tcHscSource
+       ; check_special_inst_head dflags hsc_src SigmaCtxt clas cls_args
+       ; checkValidTypePatsWith (Just qtvs) (const (pure ())) (classTyCon clas) cls_args }
 
 checkValidInstHeadWith :: (CoercionN -> TcM ()) -> UserTypeCtxt -> Class -> [Type] -> TcM ()
 checkValidInstHeadWith record ctxt clas cls_args
@@ -3800,7 +3808,10 @@ checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
 --    * No type-family applications
 --    * Matchable application heads
 checkValidTypePats :: (CoercionN -> TcM ()) -> TyCon -> [Type] -> TcM ()
-checkValidTypePats record tc pat_ty_args
+checkValidTypePats = checkValidTypePatsWith Nothing
+
+checkValidTypePatsWith :: Maybe TyCoVarSet -> (CoercionN -> TcM ()) -> TyCon -> [Type] -> TcM ()
+checkValidTypePatsWith mb_qtvs record tc pat_ty_args
   = do { -- Check that each of pat_ty_args is a monotype.
          -- One could imagine generalising to allow
          --      instance C (forall a. a->a)
@@ -3808,7 +3819,7 @@ checkValidTypePats record tc pat_ty_args
          --
          -- Suppress the opt-in hint when the expanded pattern still
          -- contains a family application. The extension cannot make it legal.
-         traverse_ (check_valid_mono_type checkNoConstrainedFamilyApps (Just (skol_info, record))) pat_ty_args
+         traverse_ (check_valid_mono_type checkNoConstrainedFamilyApps (Just (mb_qtvs, skol_info, record))) pat_ty_args
 
        -- Ensure that no type family applications occur a type pattern
        ; case tcTyConAppTyFamInstsAndVis tc pat_ty_args of
@@ -3824,9 +3835,16 @@ checkValidTypePats record tc pat_ty_args
       | otherwise       = FamInstSkol
 
 -- | Check the consumed kind binder of an application in an instance pattern.
+-- In a quantified constraint ('Just' @qtvs@), a fixed outer type variable head
+-- (disjoint from @qtvs@) is matched by syntactic congruence rather than
+-- pattern inversion, so unmatchable outer predicates such as @f :: a %U -> Type@
+-- in @forall (x :: a). C (f x)@ are valid.
 -- See Note [Matchability of instance patterns].
-checkPatternMatchability :: SkolemInfoAnon -> (CoercionN -> TcM ()) -> Type -> TcM ()
-checkPatternMatchability skol_info record head_ty
+checkPatternMatchability :: Maybe TyCoVarSet -> SkolemInfoAnon -> (CoercionN -> TcM ()) -> Type -> TcM ()
+checkPatternMatchability mb_qtvs skol_info record head_ty
+  | Just qtvs <- mb_qtvs
+  , disjointVarSet qtvs (tyCoVarsOfType head_ty)
+  = pure ()
   | Just (ma, _, _) <- splitPiTy_maybe (typeKind head_ty)
   , not (ma `eqType` matchableDataConTy)
   = do { co <- pushLevelAndSolveEqualities skol_info [] $

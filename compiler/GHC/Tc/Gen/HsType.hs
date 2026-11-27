@@ -113,7 +113,7 @@ import GHC.Tc.Utils.TcMType
 import GHC.Tc.Validity
 import GHC.Core.OpenWhnf (EvalFailure(Exhausted))
 import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(CannotReduce, InvalidInput, UnavailableDefinition),
-                               DefinitionFailure(MissingTemplate), instantiateOpenMethod,
+                               DefinitionFailure(MissingTemplate), instantiateOpenDictMethod, instantiateOpenMethod,
                                openTypeFunctionSignature, observeOpenType,
                                openTypeFailureReason, readOpenMethodWorker)
 import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourceTableFamilyUse, sourceTableTypeUses,
@@ -121,7 +121,7 @@ import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               isFinalCoreIdentity, isFinalCoreReverseWrapper, isFinalStructuralSource,
                               isLargeElimResultKind, toKindMatchableArrows,
                               lookupObservedPairField, lookupPairObserver, lookupPairRecipe, canObservePairSource,
-                              lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
+                              lookupSourceUnaryMethod, lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
                               recordSourceMethodUse, recordSourceProofAliasUse,
                               takeSourceProofRulesFor, withSourceProofSignature)
@@ -2326,6 +2326,7 @@ data CallbackArrowMode
   | CheckFamilyRhsArrows
   | InferUnsignedFamilyArrows
   | InferDatatypeArrows NameSet
+  | FixedTypeArrowMatchability TcType
 
 -- See Note [Levels for wildcards]
 -- Nothing <=> no wildcards expected
@@ -3321,7 +3322,11 @@ combinations of extensions.
 ------------------------------------------
 tc_fun_type :: TcTyMode -> HsModifiedFunArr GhcRn -> LHsType GhcRn -> LHsType GhcRn -> ExpKind
             -> TcM TcType
-tc_fun_type mode = tc_fun_type_x (tc_check_lhs_type mode) (pure unmatchableDataConTy) mode
+tc_fun_type mode = tc_fun_type_x (tc_check_lhs_type mode) default_ma mode
+  where
+    default_ma = case mode_callback_arrow mode of
+      FixedTypeArrowMatchability ma -> pure ma
+      _                             -> pure unmatchableDataConTy
 
 -- | Recognize the existing kind scheme used by the inferred arrow index.
 inferredMatchabilityIndex :: TyConBinder -> Bool
@@ -3373,7 +3378,10 @@ hasInferredMatchability tc
 tcCheckMatchabilitySynRhs :: TcType -> LHsType GhcRn -> TcKind -> TcM TcType
 tcCheckMatchabilitySynRhs ma hs_ty kind
   | matchabilityArrow hs_ty = tcCheckMatchabilityArrow ma hs_ty kind
-  | otherwise = tcCheckIndexedMatchability typeLevelMode (pure ma) hs_ty kind
+  | otherwise =
+      tcCheckIndexedMatchability
+        (typeLevelMode { mode_callback_arrow = FixedTypeArrowMatchability ma })
+        (pure ma) hs_ty kind
 
 -- | Supply metadata to a direct application of a declared indexed type.
 tcCheckIndexedMatchability :: TcTyMode -> TcM TcType -> LHsType GhcRn
@@ -3718,10 +3726,15 @@ tcTermAppInType mode rn_ty exp_kind
       , isNativeIndexFunctionId head_id
       = tc_app_ty_runtime_head mode rn_ty exp_kind head_id
       | L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr rdr name))) <- hs_fun_ty
-      = if isVarName name && isExternalName name
+      = if (isVarName name || isFieldOcc (nameOccName name)) && isExternalName name
           then do
             enabled <- xoptM LangExt.DependentTypes
-            if enabled
+            env <- getGblEnv
+            let field_ready = not (isFieldOcc (nameOccName name))
+                           || not (nameIsLocalOrFrom (tcg_semantic_mod env) name)
+                           || isJust (lookupTypeEnv (tcg_type_env env) name)
+                           || name `elemNameEnv` tcg_local_open_defs env
+            if enabled && field_ready
               then setSrcSpanA loc (dispatch_term_head rdr name)
               else tc_app_ty_generic mode rn_ty exp_kind
           else if isSourceFamilyName name
@@ -3735,35 +3748,52 @@ tcTermAppInType mode rn_ty exp_kind
       , not (null args)
       , isTypeLevel (mode_tyki mode)
       , ordinary_call || (lengthIs args 1 && ready_partial_call)
-      = do fallback <- localFallbackFamilyOwner name
-           case fallback of
-             Just fun -> setSrcSpanA loc $ do
-               staging <- closedOperandStaging args
-               if isJust staging
-                 then run_closed_tree (RunClosedFunction fun) args
-                 else stage4_uninterp fun (unsupported (getName fun))
-             Nothing
-               | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
+      = do env <- getGblEnv
+           if nameIsLocalOrFrom (tcg_semantic_mod env) name
+              && isNothing (lookupTypeEnv (tcg_type_env env) name)
+             then do
+               owner <- closedFamilyOwner name
+               if owner `elemNameEnv` tcg_local_open_defs env
+                 then setSrcSpanA loc (dispatch_term_head rdr owner)
+                 else do
+                   fallback <- localFallbackFamilyOwner name
+                   case fallback of
+                     Just fun -> setSrcSpanA loc $ do
+                       staging <- closedOperandStaging args
+                       if isJust staging
+                         then run_closed_tree (RunClosedFunction fun) args
+                         else stage4_uninterp fun (unsupported (getName fun))
+                     Nothing -> setSrcSpanA loc (unsupported owner)
+             else do
+               fallback <- localFallbackFamilyOwner name
+               case fallback of
+                 Just fun -> setSrcSpanA loc $ do
                    staging <- closedOperandStaging args
-                   executable <- tcClosedCaseExecutableOwner False rdr name args staging
-                   case executable of
-                     Just owner -> setSrcSpanA loc (run_closed_tree (RunClosedFunction owner) args)
-                     Nothing
-                       | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args -> do
-                           table <- tcLookupTyCon name
-                           checkOpenCallbackInterfaces table args
-                           mapM_ checkNominalCallback args
-                           tc_app_ty_generic mode rn_ty exp_kind
-                       | ordinary_call, any nominalCallback args -> do
-                           mapM_ checkNominalCallback args
-                           tc_app_ty_generic mode rn_ty exp_kind
-                       | ordinary_call, staging == Just True -> do
-                           table <- tcLookupTyCon name
-                           if supportsClosedFamilyTree table args
-                             then setSrcSpanA loc (run_closed_tree (CheckClosedCase table) args)
-                             else tc_app_ty_generic mode rn_ty exp_kind
-                       | otherwise -> tc_app_ty_generic mode rn_ty exp_kind
-               | otherwise -> tc_app_ty_generic mode rn_ty exp_kind
+                   if isJust staging
+                     then run_closed_tree (RunClosedFunction fun) args
+                     else stage4_uninterp fun (unsupported (getName fun))
+                 Nothing
+                   | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
+                       staging <- closedOperandStaging args
+                       executable <- tcClosedCaseExecutableOwner False rdr name args staging
+                       case executable of
+                         Just owner -> setSrcSpanA loc (run_closed_tree (RunClosedFunction owner) args)
+                         Nothing
+                           | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args -> do
+                               table <- tcLookupTyCon name
+                               checkOpenCallbackInterfaces table args
+                               mapM_ checkNominalCallback args
+                               tc_app_ty_generic mode rn_ty exp_kind
+                           | ordinary_call, any nominalCallback args -> do
+                               mapM_ checkNominalCallback args
+                               tc_app_ty_generic mode rn_ty exp_kind
+                           | ordinary_call, staging == Just True -> do
+                               table <- tcLookupTyCon name
+                               if supportsClosedFamilyTree table args
+                                 then setSrcSpanA loc (run_closed_tree (CheckClosedCase table) args)
+                                 else tc_app_ty_generic mode rn_ty exp_kind
+                           | otherwise -> tc_app_ty_generic mode rn_ty exp_kind
+                   | otherwise -> tc_app_ty_generic mode rn_ty exp_kind
       | otherwise = tc_app_ty_generic mode rn_ty exp_kind
 
     -- Stage 2-4 on a resolved term Name (both same-module and imported).
@@ -3798,11 +3828,11 @@ tcTermAppInType mode rn_ty exp_kind
               -> defer
               -- Stage 3: Pure OpenTypeEval with ClosedEval bytecode fallback.
               | ordinary_call
-              , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name)
+              , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name) || isJust (isClassOpId_maybe fun)
               , Just sig@(_, domains, _, _) <- openTypeFunctionSignature is_local fun
               , equalLength domains args
               , let is_open_arg = if is_local then is_local_open_operand else isOpenTypeOperand mode
-              , any is_open_arg args
+              , is_local || any is_open_arg args
               , all (\a -> is_open_arg a || isClosedConTypeOperand a) args
               -> do outcome <- tcTryOpenTypeCall mode name fun sig args
                     case outcome of
@@ -3812,7 +3842,7 @@ tcTermAppInType mode rn_ty exp_kind
                         | not is_local -> stage3_closed_or_uninterp is_local rdr name fun args
                       Left err -> stage4_uninterp fun (reportOpenTypeFailure name err)
               | ordinary_call
-              , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name)
+              , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name) || isJust (isClassOpId_maybe fun)
               , Just telescope@(_, inputs, _) <- indexedOpenTypeFunction fun
               , equalLength inputs args
               , all (\a -> known_constructor a || isOpenTypeOperand mode a) args
@@ -3825,7 +3855,7 @@ tcTermAppInType mode rn_ty exp_kind
                         | otherwise    -> stage4_uninterp fun (unsupported name)
               | not (null args)
               , ordinary_call || ((is_local || isQual rdr) && ready_partial_call && lengthIs args 1)
-              , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name)
+              , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name) || isJust (isClassOpId_maybe fun)
               -> stage3_closed_or_uninterp is_local rdr name fun args
               -- Stage 4: Uninterpreted closed family U:f when TcPlugins are active.
               | ordinary_call -> stage4_uninterp fun (unsupported name)
@@ -3870,27 +3900,34 @@ tcTermAppInType mode rn_ty exp_kind
     imported_certified_table _ _ = Nothing
 
     stage3_closed_or_uninterp is_local _rdr name fun args = do
-      selected <- if not is_local && ordinary_call then checkedClassMethod fun args else pure Nothing
+      selected <- if ordinary_call then checkedClassMethod fun args else pure Nothing
       case selected of
         Just check -> check
-        Nothing
-          | not is_local -> do
-              let run_closed = run_closed_tree (RunClosedFunction fun) args
-              tc_plugins <- if ordinary_call then hasActiveTcPlugins else pure False
-              staging <- if tc_plugins then closedOperandStaging args else pure (Just True)
-              case staging of
-                Nothing -> stage4_uninterp fun run_closed
-                Just _
-                  | tc_plugins -> tryTcDiscardingErrs (stage4_uninterp fun run_closed) run_closed
-                  | otherwise  -> run_closed
-          | otherwise -> do
-              staging <- closedOperandStaging args
-              if isJust staging
-                then run_closed_tree (RunClosedFunction fun) args
-                else stage4_uninterp fun $
-                       if lengthIs args 1 && is_closed_retry_head (varType fun)
-                         then run_closed_tree (RunClosedFunction fun) args
-                         else unsupported name
+        Nothing -> do
+          open_dict <- if ordinary_call && isJust (isClassOpId_maybe fun)
+                          && (any open_mapping_operand args || all isClosedConTypeOperand args)
+                         then tcTryOpenDictMethodCall mode name fun args
+                         else pure Nothing
+          case open_dict of
+            Just (result, result_kind) -> checkExpKind mode rn_ty result result_kind exp_kind
+            Nothing
+              | not is_local -> do
+                  let run_closed = run_closed_tree (RunClosedFunction fun) args
+                  tc_plugins <- if ordinary_call then hasActiveTcPlugins else pure False
+                  staging <- if tc_plugins then closedOperandStaging args else pure (Just True)
+                  case staging of
+                    Nothing -> stage4_uninterp fun run_closed
+                    Just _
+                      | tc_plugins -> tryTcDiscardingErrs (stage4_uninterp fun run_closed) run_closed
+                      | otherwise  -> run_closed
+              | otherwise -> do
+                  staging <- closedOperandStaging args
+                  if isJust staging
+                    then run_closed_tree (RunClosedFunction fun) args
+                    else stage4_uninterp fun $
+                           if lengthIs args 1 && is_closed_retry_head (varType fun)
+                             then run_closed_tree (RunClosedFunction fun) args
+                             else unsupported name
 
     is_closed_retry_head fun_ty
       | (_, binders, rho) <- splitInvisPiTys fun_ty
@@ -4027,6 +4064,27 @@ tcTermAppInType mode rn_ty exp_kind
       , Just domain <- retainedDomain left <|> retainedDomain right
       = do actual <- zonkTcTypeIfNeeded domain
            fmap (checkTableMethod fun) <$> lookupSourceBinaryMethod fun actual
+      | Just _ <- isClassOpId_maybe fun
+      , any open_mapping_operand args || all isClosedConTypeOperand args
+      = do mb_dom <- tryTcDiscardingErrs (pure Nothing) (Just . snd <$> tc_infer_lhs_type mode left)
+           case mb_dom of
+             Just domain -> do
+               actual <- zonkTcTypeIfNeeded domain
+               fmap (checkTableMethod fun) <$> lookupSourceBinaryMethod fun actual
+             Nothing -> pure Nothing
+    checkedClassMethod fun [arg]
+      | Just _ <- isClassOpId_maybe fun
+      , Just domain <- retainedDomain arg
+      = do actual <- zonkTcTypeIfNeeded domain
+           fmap (checkTableMethod fun) <$> lookupSourceUnaryMethod fun actual
+      | Just _ <- isClassOpId_maybe fun
+      , open_mapping_operand arg || isClosedConTypeOperand arg
+      = do mb_dom <- tryTcDiscardingErrs (pure Nothing) (Just . snd <$> tc_infer_lhs_type mode arg)
+           case mb_dom of
+             Just domain -> do
+               actual <- zonkTcTypeIfNeeded domain
+               fmap (checkTableMethod fun) <$> lookupSourceUnaryMethod fun actual
+             Nothing -> pure Nothing
     checkedClassMethod _ _ = pure Nothing
 
     open_mapping_operand = isOpenTypeOperandWith (\(WithUserRdr _ n) -> indexed_variable n)
@@ -4214,6 +4272,95 @@ tcTryOpenTypeCall mode name fun (tvs, domains, result_tpl, wrap) args = do
       let applied = wrap (foldl' Core.App (Core.Var fun) (map Core.Type ty_args))
       fmap (, result_kind) <$> tcObserveOpenTypeCall local False applied result_kind operands
 
+-- | Specialize a class method dictionary via 'InstEnv' and evaluate open arguments in Core.
+tcTryOpenDictMethodCall
+  :: TcTyMode -> Name -> Id -> [LHsType GhcRn] -> TcM (Maybe (Type, Kind))
+tcTryOpenDictMethodCall mode name fun args
+  | let (ma_tvs, theta, rho) = tcSplitSigmaTy (varType fun)
+        tvs                  = map snd ma_tvs
+  , not (null theta)
+  , all (tcIsLiftedTypeKind . typeKind . tyVarKind) tvs
+  , Just (domains, result_tpl) <- peel_arrows (length args) rho
+  = tryTcDiscardingErrs (pure Nothing) $ do
+      _ <- tcOpenTypeContext mode name
+      (meta_tvs, doms0, res_k0, raw_ops) <- do
+        (subst, mvs) <- newMetaTyVars tvs
+        let exp_doms = map (Subst.substTy subst) domains
+            has_ret_idx arg = not (isEmptyNameEnv (mode_indices mode)) &&
+              isOpenTypeOperandWith
+                (\(WithUserRdr _ n) -> isJust (lookupNameEnv (mode_indices mode) n))
+                (\(WithUserRdr _ n) -> isDataConName n)
+                arg
+        -- Check arguments without retained runtime indices first and solve equalities
+        -- so retained operands see concrete domains rather than unfilled metavariables.
+        pass1 <- solveEqualities "tcTryOpenDictMethodCall.pass1" $
+          forM (zip args exp_doms) $ \(arg, kd) ->
+            if has_ret_idx arg
+              then pure Nothing
+              else Just <$> setSrcSpanA (getLoc arg) (tc_check_lhs_type mode arg kd)
+        doms_z <- liftZonkM (zonkTcTypes exp_doms)
+        ops <- solveEqualities "tcTryOpenDictMethodCall.pass2" $
+          forM (zip3 args doms_z pass1) $ \(arg, kd, mb_done) ->
+            case mb_done of
+              Just op -> pure op
+              Nothing -> do
+                (op_ty, op_kind) <- setSrcSpanA (getLoc arg) (tc_infer_lhs_type mode arg)
+                when (anyFreeVarsOfType isMetaTyVar kd && not (anyFreeVarsOfType isId op_kind)) $
+                  discardResult (unifyKind Nothing op_kind kd)
+                kd' <- liftZonkM (zonkTcType kd)
+                if op_kind `tcEqType` kd'
+                  then pure op_ty
+                  else setSrcSpanA (getLoc arg) (tc_check_lhs_type mode arg kd')
+        pure (mvs, doms_z, Subst.substTy subst result_tpl, ops)
+      ty_args0  <- liftZonkM (zonkTcTypes (mkTyVarTys meta_tvs))
+      doms1     <- liftZonkM (zonkTcTypes doms0)
+      res_k1    <- liftZonkM (zonkTcType res_k0)
+      operands1 <- liftZonkM (zonkTcTypes raw_ops)
+      let all_tys ts ds rk ops = ts ++ ds ++ [rk] ++ map typeKind ops ++ [varType v | v <- tyCoVarsOfTypesList ops]
+      forM_ [ mv | mv <- tyCoVarsOfTypesList (all_tys ty_args0 doms1 res_k1 operands1)
+                 , isTcTyVar mv, isMetaTyVar mv, not (isTyVarTyVar mv) ] $ \mv -> do
+        cts <- readMetaTyVar mv
+        case cts of
+          Flexi | tyVarKind mv `tcEqType` runtimeRepTy -> liftZonkM (writeMetaTyVar mv liftedRepTy)
+          _ -> pure ()
+      ty_args1  <- liftZonkM (zonkTcTypes ty_args0)
+      doms2     <- liftZonkM (zonkTcTypes doms1)
+      res_k2    <- liftZonkM (zonkTcType res_k1)
+      operands2 <- liftZonkM (zonkTcTypes operands1)
+      forM_ [ mv | mv <- tyCoVarsOfTypesList (all_tys ty_args1 doms2 res_k2 operands2)
+                 , isTcTyVar mv, isMetaTyVar mv, not (isTyVarTyVar mv) ] $ \mv -> do
+        cts <- readMetaTyVar mv
+        case cts of
+          Flexi | tcIsLiftedTypeKind (tyVarKind mv) -> liftZonkM (writeMetaTyVar mv liftedTypeKind)
+          _ -> pure ()
+      ty_args     <- liftZonkM (zonkTcTypes ty_args1)
+      doms        <- liftZonkM (zonkTcTypes doms2)
+      result_kind <- liftZonkM (zonkTcType res_k2)
+      operands    <- liftZonkM (zonkTcTypes operands2)
+      if anyVarSet isMetaTyVar (tyCoVarsOfTypes (result_kind : ty_args ++ doms))
+        then pure Nothing
+        else do
+          mb_spec <- instantiateOpenDictMethod fun ty_args doms result_kind
+          case mb_spec of
+            Nothing -> pure Nothing
+            Just specialized -> do
+              observed <- tcObserveOpenTypeCall True True specialized result_kind operands
+              case observed of
+                Right ty -> pure (Just (ty, result_kind))
+                Left (CannotReduce Exhausted) -> reportOpenTypeFailure name (CannotReduce Exhausted)
+                Left _ -> pure Nothing
+  | otherwise = pure Nothing
+  where
+    peel_arrows 0 rest = Just ([], rest)
+    peel_arrows n ty
+      | n > 0
+      , Just (FTF_T_T, ma, mult, dom, rest) <- splitFunTy_maybe ty
+      , ma `tcEqType` unmatchableDataConTy
+      , isManyTy mult
+      = do (doms, res) <- peel_arrows (n - 1) rest
+           pure (dom : doms, res)
+      | otherwise = Nothing
+
 -- | Find the erased telescope of an indexed source call with ordinary arrows.
 -- See Note [Known indexed operands in source calls].
 indexedOpenTypeFunction :: Id -> Maybe ([TyVar], [Kind], Kind)
@@ -4302,7 +4449,9 @@ tcObserveOpenTypeCall local indexed instantiated result_kind operands = do
       let locals = tcg_local_open_defs env
           lookup_owner n = case lookupNameEnv locals n of
             Just (owner, _) -> pure owner
-            Nothing -> tcLookupId n
+            Nothing -> case lookupTypeEnv (tcg_type_env env) n of
+              Just (AnId v) -> pure v
+              _             -> tcLookupId n
       dependencies <- forM used $ \(n, first) -> (, first) <$> lookup_owner n
       recordUnfoldedSourceUses dependencies
       updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = scs_evaluated_uses s `unionNameSet` constructors `unionNameSet` mkNameSet (map fst used) })

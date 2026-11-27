@@ -1528,10 +1528,22 @@ checkedSourceMethods wanted env = mapMaybe dictionary binds
                     , sel `elem` classMethods cls, wanted sel
                     , InstMethId owner <- [idDetails meth], owner == idName dfun
                     , idType meth `eqType` classMethodInstTy sel [inst_ty]
-                    , Just (tvs, evs, match) <- [lookupVarEnv bodies meth]
-                    , Just body <- [case checked_alias meth tvs match of
-                        Just target -> Just (SourceMethodAlias target)
-                        Nothing -> guard (null tvs) >> checkedSourceLiteral dfun sel inst_ty top_evidence evs match]]
+                    , let cur_meth = case lookupTypeEnv (tcg_type_env env) (idName meth) of
+                            Just (AnId actual) -> actual
+                            _                  -> meth
+                    , Just body <- [case lookupVarEnv bodies meth of
+                        Just (tvs, evs, match) ->
+                          case checked_alias meth tvs match of
+                            Just target -> Just (SourceMethodAlias target)
+                            Nothing
+                              | null tvs, isJust (sourceTableId_maybe cur_meth) ->
+                                  Just (SourceMethodAlias cur_meth)
+                              | otherwise ->
+                                  guard (null tvs) >> checkedSourceLiteral dfun sel inst_ty top_evidence evs match
+                        Nothing
+                          | isJust (sourceTableId_maybe cur_meth) ->
+                              Just (SourceMethodAlias cur_meth)
+                          | otherwise -> Nothing]]
       guard (not (null methods))
       pure (dfun, methods)
 

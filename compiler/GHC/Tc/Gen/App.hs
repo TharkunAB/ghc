@@ -1859,7 +1859,7 @@ tcPrepareNativeQLApp True DoQL exp_ty rn_head fun sigma args
       HsPragE _ _ a -> arg_has_non_ql_anchor a
       XExpr (ExpandedThingRn (HSE { hse_ctxt = ExprCtxt (HsGetField _ recv (L _ dfo))
                                   , hse_exp = a })) -> do
-        mb_sel <- tcResolveDependentDot False recv dfo
+        mb_sel <- tcResolveDependentDot False False recv dfo
         case mb_sel of
           Just (_, sel_id)
             | (_, body) <- tcSplitForAllInvisTyVars (varType sel_id)
@@ -4389,8 +4389,9 @@ tcExprToRetainedCore mode0 lexpr0 = runMaybeT (go mode0 lexpr0)
           return (Core.Var owner', [owner'], [])
         RCM_CaseCallArg{} -> mzero
       XExpr (ConLikeTc (RealDataCon con)) -> case mode of
-        RCM_OptionalLet -> return (Core.Var (dataConWorkId con), [], [])
-        _               -> return (Core.Var (dataConWrapId con), [], [])
+        RCM_OptionalLet | not (isNewTyCon (dataConTyCon con)) ->
+          return (Core.Var (dataConWorkId con), [], [])
+        _ -> return (Core.Var (dataConWrapId con), [], [])
       HsLit _ (HsChar _ c)
         | RCM_RetainedArg <- mode -> return (mkCharExpr c, [], [])
       HsLit _ (HsNatural _ il)
@@ -4527,8 +4528,9 @@ tcExprToRetainedCore mode0 lexpr0 = runMaybeT (go mode0 lexpr0)
         Right (inst, []) -> return (getName (instanceDFunId inst))
         _ -> mzero
       env <- liftMaybeT getGblEnv
-      guard (not (nameIsLocalOrFrom (tcg_semantic_mod env) dfun_name))
-      dfun <- MaybeT (tcLookupIdMaybe dfun_name)
+      dfun <- case lookupTypeEnv (tcg_type_env env) dfun_name of
+        Just (AnId d) -> pure d
+        _             -> MaybeT (tcLookupIdMaybe dfun_name)
       guard (isDFunId dfun && varType dfun `tcEqType` varType wanted
              && noFreeVarsOfType (varType dfun))
       return (selector, dfun, wanted)
@@ -5513,7 +5515,7 @@ tcRetainedValueOperand resolve resolve_scoped_arg domain arg@(L loc original)
               forM_ type_arg $ \ty -> do
                 (supplied, _) <- tcVTA (idConcreteTvs sel) (varType sel) Nothing ty
                 unless (supplied `tcEqType` domain) unchecked
-              dfun <- tcRetainedDFun name cls domain >>= maybe unchecked return
+              dfun <- tcRetainedDFun name sel cls domain >>= maybe unchecked return
               platform <- getPlatform
               case args of
                 [operand]
@@ -5604,16 +5606,21 @@ dictionary let-binding, which would alter the index identity and escape scope.
 -}
 
 -- | Look up a completed, ground instance with no context.
-tcRetainedDFun :: Name -> Class -> Type -> TcM (Maybe Id)
-tcRetainedDFun method cls domain = do
+tcRetainedDFun :: Name -> Id -> Class -> Type -> TcM (Maybe Id)
+tcRetainedDFun method sel cls domain = do
   insts <- tcGetInstEnvs
   case lookupUniqueInstEnv insts cls [domain] of
     Right (inst, []) -> do
       env <- getGblEnv
       let dfun_name = getName (instanceDFunId inst)
-      when (nameIsLocalOrFrom (tcg_semantic_mod env) dfun_name) $
+      mb_dfun <- case lookupTypeEnv (tcg_type_env env) dfun_name of
+        Just (AnId d) -> pure (Just d)
+        _             -> tcLookupIdMaybe dfun_name
+      when (nameIsLocalOrFrom (tcg_semantic_mod env) dfun_name
+            && maybe True (\d -> isNothing (sourceMethodTarget_maybe d sel)
+                                 && isNothing (sourceLiteralCons_maybe d sel)) mb_dfun) $
         failWithTc (TcRnRetainedQuantificationError (RetainedLocalSourceMethod method))
-      tcLookupIdMaybe dfun_name
+      return mb_dfun
     _ -> return Nothing
 
 -- | Require the ordinary solver to select this dictionary at the use site.
@@ -5634,7 +5641,7 @@ tcRetainedNumeral domain from n = do
   cls <- case isClassOpId_maybe sel of
     Just cls | cls `hasKey` numClassKey, noFreeVarsOfType domain -> return cls
     _ -> unverified
-  dfun <- tcRetainedDFun from cls domain >>= maybe unverified return
+  dfun <- tcRetainedDFun from sel cls domain >>= maybe unverified return
   if isNaturalTy domain
     then do
       platform <- getPlatform
@@ -6161,7 +6168,7 @@ tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
           XExpr (ExpandedThingRn (HSE ctxt inner)) -> do
             mb_dot <- case ctxt of
               ExprCtxt (HsGetField _ recv (L _ dfo)) ->
-                fmap (recv, dfo,) <$> tcResolveDependentDot True recv dfo
+                fmap (recv, dfo,) <$> tcResolveDependentDot True True recv dfo
               _ -> pure Nothing
             case mb_dot of
               Just (recv_of_ctxt, dfo_of_ctxt, (_, sel_id)) -> do
@@ -6319,8 +6326,10 @@ tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
           if user_tvs == dataConUnivTyVars dc
             then Just univ_tys
             else traverse (`lookup` univ_map) user_tvs
-        let con_tc   = mkLHsWrap (mkWpTyApps user_tys) (L loc (XExpr (ConLikeTc (RealDataCon dc))))
-            con_core = Core.mkTyApps (Core.Var (dataConWorkId dc)) univ_tys
+        let con_id   | isNewTyCon (dataConTyCon dc) = dataConWrapId dc
+                     | otherwise                    = dataConWorkId dc
+            con_tc   = mkLHsWrap (mkWpTyApps user_tys) (L loc (XExpr (ConLikeTc (RealDataCon dc))))
+            con_core = Core.mkTyApps (Core.Var con_id) univ_tys
         return (con_core, con_tc)
       Nothing -> do
         first <- indexed expected
@@ -6767,7 +6776,7 @@ tcRetainedInferableArg (L _ expr)
       HsPar _ arg -> tcRetainedInferableArg arg
       HsPragE _ _ arg -> tcRetainedInferableArg arg
       XExpr (ExpandedThingRn (HSE { hse_ctxt = ExprCtxt (HsGetField _ recv (L _ dfo)), hse_exp = arg })) ->
-        do { mb_sel <- tcResolveDependentDot False recv dfo
+        do { mb_sel <- tcResolveDependentDot False True recv dfo
            ; case mb_sel of
                Just (_, sel_id) ->
                  let L fl_loc _ = dfoLabel dfo
@@ -7369,7 +7378,7 @@ expr_to_type earg =
     go _ (L l (XExpr (HsRecSelRn (FieldOcc rdr (L fl_loc sel_name))))) =
       promote_section_op (L l (HsTyVar noAnn NotPromoted (L fl_loc (WithUserRdr rdr sel_name))))
     go in_data e@(L l (HsGetField _ recv (L _ dfo))) =
-      do { mb_sel <- tcResolveDependentDot True recv dfo
+      do { mb_sel <- tcResolveDependentDot True True recv dfo
          ; case mb_sel of
              Just (_, sel_id) ->
                do { recv' <- go in_data recv
@@ -7808,7 +7817,7 @@ tcRewriteDependentDotApp :: [HsExprArg 'TcpRn]
                          -> TcM (Maybe (HsExpr GhcRn, [HsExprArg 'TcpRn]))
 tcRewriteDependentDotApp rn_args
   | Just (outer_wraps, exp_wrap, dfo, val_loc, recv_arg, rest_args) <- split_dot_args [] rn_args
-  = do { mb_sel <- tcResolveDependentDot True recv_arg dfo
+  = do { mb_sel <- tcResolveDependentDot True False recv_arg dfo
        ; case mb_sel of
            Just (_, sel_id) ->
              let L fl_loc _ = dfoLabel dfo
@@ -7849,10 +7858,11 @@ tcRewriteDependentDotApp rn_args
 -- projection.
 -- See Note [Dependent OverloadedRecordDot resolution].
 tcResolveDependentDot :: Bool
+                      -> Bool
                       -> LHsExpr GhcRn
                       -> DotFieldOcc GhcRn
                       -> TcM (Maybe (GlobalRdrElt, Id))
-tcResolveDependentDot record_use recv dfo = do
+tcResolveDependentDot record_use allow_plain_recsel recv dfo = do
   let lbl    = unLoc (dfoLabel dfo)
       lbl_fs = mkFastStringShortText (field_label lbl)
   rdr_env <- getGlobalRdrEnv
@@ -7900,7 +7910,7 @@ tcResolveDependentDot record_use recv dfo = do
                 | isVisibleFunArg af
                 , isJust (sourceTableId_maybe sel_id)
                 , Just (rec_tc, args) <- tcSplitTyConApp_maybe arg_ty
-                , is_dep_witness_projection sel_id rec_tc -> do
+                , allow_plain_recsel || is_dep_witness_projection sel_id rec_tc -> do
                     fam_envs <- tcGetFamInstEnvs
                     let (r_tc, _, _) = tcLookupDataFamInst fam_envs rec_tc args
                     pure (Just (gre, sel_id, r_tc))
@@ -7922,7 +7932,7 @@ tcResolveDependentDot record_use recv dfo = do
           Just v  -> liftZonkM (zonkTcType (varType v)) >>= tycon_of_type
           Nothing -> probe_infer e
       XExpr (ExpandedThingRn (HSE (ExprCtxt (HsGetField _ inner_recv (L _ inner_dfo))) _)) -> do
-        mb_inner_sel <- tcResolveDependentDot False inner_recv inner_dfo
+        mb_inner_sel <- tcResolveDependentDot False True inner_recv inner_dfo
         case mb_inner_sel of
           Just (_, inner_sel) -> do
             sel_ty <- liftZonkM (zonkTcType (idType inner_sel))

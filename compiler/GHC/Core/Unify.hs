@@ -1871,20 +1871,20 @@ unify_ty env ty1 (TyVarTy tv2) kco
 -- Applications need a bit of care!
 -- They can match FunTy and TyConApp, so use splitAppTy_maybe
 unify_ty env ty1@(AppTy fun _) ty2 _
-  | not (isMatchableFunTy (typeKind fun))
+  | not (isDecomposableLhsAppFun env fun)
   = unify_opaque_app env ty1 ty2
 unify_ty env ty1 ty2@(AppTy fun _) _
-  | not (isMatchableFunTy (typeKind fun))
+  | not (isDecomposableRhsAppFun env fun)
   = unify_opaque_app env ty1 ty2
 
 unify_ty env (AppTy ty1a ty1b) ty2 _kco
   | Just (ty2a, ty2b) <- tcSplitAppTyNoView_maybe ty2
-  , isMatchableFunTy (typeKind ty2a)
+  , isDecomposableRhsAppFun env ty2a
   = unify_ty_app env ty1a [ty1b] ty2a [ty2b]
 
 unify_ty env ty1 (AppTy ty2a ty2b) _kco
   | Just (ty1a, ty1b) <- tcSplitAppTyNoView_maybe ty1
-  , isMatchableFunTy (typeKind ty1a)
+  , isDecomposableLhsAppFun env ty1a
   = unify_ty_app env ty1a [ty1b] ty2a [ty2b]
 
 unify_ty _ (LitTy x) (LitTy y) _kco | x == y = return ()
@@ -2204,6 +2204,27 @@ Maybe (f y). Unequal syntax does not establish that these targets differ.
 Keep MaybeApart in these cases. Do not decompose the opaque application.
 -}
 
+isDecomposableLhsAppFun :: UMEnv -> Type -> Bool
+isDecomposableLhsAppFun env fun
+  | isMatchableFunTy (typeKind fun) = True
+  | MatchRule <- um_match_mode env
+  , Matching  <- um_unif env
+  , let (hd, _) = splitAppTys fun
+  , Just tv <- getTyVar_maybe hd
+  , DontBindMe <- um_bind_tv_fun env (rnOccL (um_rn_env env) tv) hd
+  = True
+  | otherwise = False
+
+isDecomposableRhsAppFun :: UMEnv -> Type -> Bool
+isDecomposableRhsAppFun env fun
+  | isMatchableFunTy (typeKind fun) = True
+  | MatchRule <- um_match_mode env
+  , Matching  <- um_unif env
+  , let (hd, _) = splitAppTys fun
+  , Just _ <- getTyVar_maybe hd
+  = True
+  | otherwise = False
+
 -----------------------------
 unify_ty_app :: UMEnv -> Type -> [Type] -> Type -> [Type] -> UM ()
 -- Deal with (t1 t1args) ~ (t2 t2args)
@@ -2211,7 +2232,7 @@ unify_ty_app :: UMEnv -> Type -> [Type] -> Type -> [Type] -> UM ()
 unify_ty_app env ty1 ty1args ty2 ty2args
   | Just (ty1', ty1a) <- splitAppTyNoView_maybe ty1
   , Just (ty2', ty2a) <- splitAppTyNoView_maybe ty2
-  , isMatchableFunTy (typeKind ty1'), isMatchableFunTy (typeKind ty2')
+  , isDecomposableLhsAppFun env ty1', isDecomposableRhsAppFun env ty2'
   = unify_ty_app env ty1' (ty1a : ty1args) ty2' (ty2a : ty2args)
 
   | otherwise

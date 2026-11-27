@@ -2758,6 +2758,13 @@ setDependentTypesBundle True  = do
     , LangExt.ExplicitNamespaces
     ]
   unSetExtensionFlag LangExt.ListTuplePuns
+  upd $ \dflags ->
+    let in_ghc_internal =
+          homeUnitId_ dflags == ghcInternalUnitId ||
+          homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
+    in if not in_ghc_internal && not (gopt Opt_SuppressSourceEquations dflags)
+         then gopt_set dflags Opt_WriteSourceEquations
+         else dflags
 
 {- Note [Proposal #378 DependentTypes bundle and telescopes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

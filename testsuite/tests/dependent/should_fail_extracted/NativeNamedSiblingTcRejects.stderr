@@ -1,13 +1,3 @@
-NativeNamedSiblingTcRejects.hs:13:45: error: [GHC-83605]
-    • GHC cannot use this expression as a retained index.
-      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
-      An immediate application of a supported lambda is also allowed.
-    • In the first argument of ‘toList’, namely
-        ‘(replicateNative (counted p) '-')’
-      In the expression: toList (replicateNative (counted p) '-')
-      In an equation for ‘badOrdinarySel’:
-          badOrdinarySel p = toList (replicateNative (counted p) '-')
-
 NativeNamedSiblingTcRejects.hs:16:69: error: [GHC-83605]
     • No checked source equations are available for ‘storedLength’ in this retained argument.
     • In the first argument of ‘toList’, namely
