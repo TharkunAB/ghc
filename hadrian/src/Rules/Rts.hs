@@ -32,8 +32,8 @@ rtsRules = priority 3 $ do
                 , "rts/rust/prim_float.rs"
                 , "rts/rust/stable_ptr.rs"
                 ] rustCfg output
-        buildPath -/- "rust-rts-bit-count.o" %>
-            buildRustRts stage "ghc_rts_bit_count" "rts/rust/bit_count.rs" [] []
+        buildPath -/- "rust-rts-prim-bits.o" %>
+            buildRustRts stage "ghc_rts_prim_bits" "rts/rust/prim_bits.rs" [] []
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []
         buildPath -/- "rust-rts-poll-slots.o" %>
@@ -60,7 +60,7 @@ rtsRustObjects stage way = do
                 trackArgsHash flags
                 notElem "thread-sanitizer" <$> interpret flags getArgs
             else pure False
-        pure $ [path -/- "rust-rts.o", path -/- "rust-rts-bit-count.o"]
+        pure $ [path -/- "rust-rts.o", path -/- "rust-rts-prim-bits.o"]
             ++ [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
             ++ [path -/- "rust-rts-poll-slots.o" | poll]
             ++ [path -/- "rust-rts-spark-retain.o" | Threaded `wayUnit` way]
