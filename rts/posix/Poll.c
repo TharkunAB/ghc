@@ -130,6 +130,21 @@ the aiop_table, but still allows the full_poll_table to have an extra entry.
 ******************************************************************************/
 
 /* Forward declarations */
+#if defined(USE_RUST_RTS)
+/* Match PollFd in rts/rust/poll_slots.rs. */
+GHC_STATIC_ASSERT(sizeof(struct pollfd) == 8 && _Alignof(struct pollfd) == 4,
+                  "Rust pollfd layout");
+GHC_STATIC_ASSERT(offsetof(struct pollfd, fd) == 0 &&
+                  offsetof(struct pollfd, events) == 4 &&
+                  offsetof(struct pollfd, revents) == 6,
+                  "Rust pollfd offsets");
+#include "BeginPrivate.h"
+int ghc_rust_poll_process_ready(CapIOManager *iomgr, struct pollfd *slots,
+                                int count, int ready);
+void ghc_rust_poll_complete_slot(CapIOManager *iomgr, int index, short revents);
+#include "EndPrivate.h"
+#endif
+
 static bool enlargeTables(CapIOManager *iomgr);
 static void notifyIOCompletion(CapIOManager *iomgr, StgAsyncIOOp *aiop);
 static void removeFromTables(CapIOManager *iomgr, int i);
@@ -287,6 +302,36 @@ static void notifyIOCompletion(CapIOManager *iomgr, StgAsyncIOOp *aiop)
 }
 
 
+static void completePollSlot(CapIOManager *iomgr, int index, short revents)
+{
+    ASSERT(index >= 0 && index < sizeClosureTable(&iomgr->aiop_table));
+    ASSERT(revents != 0);
+    StgAsyncIOOp *aiop = indexClosureTable(&iomgr->aiop_table, index);
+    ASSERT(aiop->outcome == IOOpOutcomeInFlight);
+
+    /* POLLNVAL means the descriptor is invalid. POLLERR and POLLHUP wake the
+     * thread so it can observe the result of its next I/O operation. */
+    if (revents & POLLNVAL) {
+        aiop->outcome = IOOpOutcomeFailed;
+        aiop->error   = EBADF;
+    } else {
+        aiop->outcome = IOOpOutcomeSuccess;
+        aiop->result  = 0;
+    }
+
+    removeFromTables(iomgr, index);
+    notifyIOCompletion(iomgr, aiop);
+}
+
+
+#if defined(USE_RUST_RTS)
+void ghc_rust_poll_complete_slot(CapIOManager *iomgr, int index, short revents)
+{
+    completePollSlot(iomgr, index, revents);
+}
+#endif
+
+
 /* Called from poll/awaitCompletedTimeoutsOrIOPoll after a successful poll()
  * call to process all the I/O completions.
  *
@@ -321,46 +366,27 @@ static bool processIOCompletions(CapIOManager *iomgr, int ncompletions)
 #endif
 
     struct pollfd *aiop_poll_table = iomgr->aiop_poll_table;
+#if defined(USE_RUST_RTS)
+    if (ncompletions > 0) {
+        int count = sizeClosureTable(&iomgr->aiop_table);
+        int completed = ghc_rust_poll_process_ready(iomgr, aiop_poll_table,
+                                                     count, ncompletions);
+        ASSERT(completed == ncompletions);
+        (void)completed;
+    }
+#else
     int i = 0;
     while (ncompletions > 0) {
         ASSERT(i < sizeClosureTable(&iomgr->aiop_table));
-
-        /* Since each aiop_table entry is for a single (fd, rw) pair, we
-         * just need to check if the aiop_poll_table[n].revents contains
-         * anything. We don't need to distinguish read vs write.
-         */
         if (aiop_poll_table[i].revents) {
-            StgAsyncIOOp *aiop = indexClosureTable(&iomgr->aiop_table, i);
-
-            ASSERT(aiop->outcome == IOOpOutcomeInFlight);
-
-            /* We do need to handle POLLNVAL, but we do not need to do anything
-             * special for POLLERR or POLLHUP. (See man poll for details).
-             * The calling thread will typically try to do I/O after waiting
-             * for I/O readiness. Thus for POLLERR they'll discover the error
-             * when doing the I/O. And for POLLHUP, there is typically no
-             * action required anyway: it's a notification and not an error.
-             */
-            if (aiop_poll_table[i].revents & POLLNVAL) {
-                aiop->outcome = IOOpOutcomeFailed;
-                aiop->error   = EBADF;
-            } else {
-                aiop->outcome = IOOpOutcomeSuccess;
-                aiop->result  = 0;
-            }
-
-            removeFromTables(iomgr, i);
-            notifyIOCompletion(iomgr, aiop);
+            completePollSlot(iomgr, i, aiop_poll_table[i].revents);
             ncompletions--;
         } else {
-            /* You'd expect incrementing the table index to be unconditional,
-             * but we don't increment the index if we did process the entry,
-             * because using removeFromTables means we'll move an entry from
-             * the end of the table into the index i.
-             */
+            /* Removal moves the last slot into the gap. Check it next. */
             i++;
         }
     }
+#endif
     return interrupt;
 }
 

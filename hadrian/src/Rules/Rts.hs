@@ -14,12 +14,8 @@ rtsRules = priority 3 $ do
     forM_ [Stage1, Stage2, Stage3 ] $ \ stage -> do
         let buildPath = root -/- buildDir (rtsContext stage)
         buildPath -/- "rust-rts.o" %> \output -> do
-            autoconf <- readFile' (buildPath -/- "include/ghcautoconf.h")
-            let largeAddressSpace = ["#define", "USE_LARGE_ADDRESS_SPACE", "1"]
-                rustCfg
-                    | any ((== largeAddressSpace) . words) (lines autoconf) =
-                        ["--cfg", "ghc_use_large_address_space"]
-                    | otherwise = []
+            largeAddressSpace <- rtsConfigDefines buildPath "USE_LARGE_ADDRESS_SPACE"
+            let rustCfg = if largeAddressSpace then ["--cfg", "ghc_use_large_address_space"] else []
             buildRustRts stage "ghc_rts" "rts/rust/lib.rs"
                 [ "rts/rust/archive_member.rs"
                 , "rts/rust/encode.rs"
@@ -31,6 +27,8 @@ rtsRules = priority 3 $ do
                 ] rustCfg output
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []
+        buildPath -/- "rust-rts-poll-slots.o" %>
+            buildRustRts stage "ghc_rts_poll_slots" "rts/rust/poll_slots.rs" [] []
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
         buildPath -/- "libHSghc-internal-*.dll.a" %> buildGhcInternalImportLib stage
 
@@ -40,8 +38,18 @@ rtsRustObjects stage way = do
     rustc <- rtsRustCompiler stage
     if null rustc then pure [] else do
         path <- rtsBuildPath stage
-        pure $ (path -/- "rust-rts.o") :
-            [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
+        poll <- if Threaded `wayUnit` way
+            then pure False
+            else rtsConfigDefines path "IOMGR_BUILD_POLL"
+        pure $ [path -/- "rust-rts.o"]
+            ++ [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
+            ++ [path -/- "rust-rts-poll-slots.o" | poll]
+
+-- | Check an RTS feature macro in the generated configuration.
+rtsConfigDefines :: FilePath -> String -> Action Bool
+rtsConfigDefines path name = do
+    autoconf <- readFile' (path -/- "include/ghcautoconf.h")
+    pure $ any ((== ["#define", name, "1"]) . words) (lines autoconf)
 
 -- | Compile a Rust RTS crate to a PIC object.
 buildRustRts :: Stage -> String -> FilePath -> [FilePath] -> [String] -> FilePath -> Action ()
