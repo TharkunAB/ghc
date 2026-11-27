@@ -39,6 +39,8 @@ rtsRules = priority 3 $ do
             buildRustRts stage "ghc_rts_check_vector_support" "rts/rust/check_vector_support.rs" [] []
         buildPath -/- "rust-rts-pathdir.o" %>
             buildRustRts stage "ghc_rts_pathdir" "rts/rust/pathdir.rs" [] []
+        buildPath -/- "rust-rts-posix-getenv.o" %>
+            buildRustRts stage "ghc_rts_posix_getenv" "rts/rust/posix_getenv.rs" [] []
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []
         buildPath -/- "rust-rts-poll-slots.o" %>
@@ -66,6 +68,7 @@ rtsRustObjects stage way = do
         pure $ [path -/- "rust-rts.o", path -/- "rust-rts-prim-bits.o"]
             ++ [path -/- "rust-rts-check-vector-support.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-pathdir.o" | rustTsanSafe]
+            ++ [path -/- "rust-rts-posix-getenv.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
             ++ [path -/- "rust-rts-poll-slots.o" | poll]
             ++ [path -/- "rust-rts-spark-retain.o" | Threaded `wayUnit` way]
