@@ -31,6 +31,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/hash_walk.rs"
                 , "rts/rust/mblock_extents.rs"
                 , "rts/rust/prim_float.rs"
+                , "rts/rust/pool.rs"
                 , "rts/rust/stable_name.rs"
                 , "rts/rust/stable_ptr.rs"
                 , "rts/rust/static_ptr_table.rs"

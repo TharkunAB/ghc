@@ -10,6 +10,7 @@ mod gc_budget;
 mod hash_chain;
 mod hash_insert;
 mod hash_walk;
+mod pool;
 #[cfg(ghc_use_large_address_space)]
 mod mblock_extents;
 mod prim_float;
