@@ -579,9 +579,10 @@ static void leftify_up_shortcut (StgTimeoutQueue *h)
             if (h->rank == rb + 1) break; /* short-cut condition */
             h->rank = rb + 1;
         } else {
+            /* Restore child order even when the parent needs no rank update. */
+            swap(&h->a, &h->b);
             if (h->rank == ra + 1) break; /* short-cut condition */
             h->rank = ra + 1;
-            swap(&h->a, &h->b);
         }
         ASSERT(h->rank == min(rank(h->a), rank(h->b)) + 1);
         h = h->parent;
