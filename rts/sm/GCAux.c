@@ -38,6 +38,21 @@ GHC_STATIC_ASSERT(IND == 27 && IND_STATIC == 28 && BLACKHOLE == 38, "Rust indire
 RTS_PRIVATE StgClosure *ghc_rust_is_alive(StgClosure *p, const StgWord16 *(*flags)(StgClosure *),
     bool (*marked)(StgClosure *), ptrdiff_t info_type_offset, size_t indirectee_offset);
 
+/* Note [Block lookup for closure liveness]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * In the large address space, a megablock contains the descriptors for its
+ * blocks. See Bdescr in rts/storage/Block.h. The release fast path reads the
+ * flags and compaction bitmap in Rust. This avoids a C callback per closure.
+ * Use the native accessors when assertions or another heap layout require them.
+ */
+#if defined(USE_LARGE_ADDRESS_SPACE) && !defined(ASSERTS_ENABLED) && MBLOCK_SHIFT == 20 && BLOCK_SHIFT == 12 && BDESCR_SHIFT == 6
+#define RUST_LARGE_LIVENESS
+GHC_STATIC_ASSERT(offsetof(bdescr, start) == 0 && offsetof(bdescr, u.bitmap) == 24 &&
+                  offsetof(bdescr, flags) == 46 && offsetof(struct mblock_address_range, begin) == 0 &&
+                  offsetof(struct mblock_address_range, end) == sizeof(StgWord), "Rust megablock lookup");
+RTS_PRIVATE StgClosure *ghc_rust_is_alive_large(StgClosure *p, const struct mblock_address_range *range);
+#endif
+
 static const StgWord16 *livenessBlockFlags(StgClosure *q)
 {
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(q));
@@ -57,6 +72,11 @@ isAlive(StgClosure *p)
     ptrdiff_t type_offset = offsetof(StgInfoTable, type);
 #if defined(TABLES_NEXT_TO_CODE)
     type_offset -= (ptrdiff_t)sizeof(StgInfoTable);
+#endif
+#if defined(RUST_LARGE_LIVENESS)
+    if (type_offset == -8 && offsetof(StgInd, indirectee) == 8) {
+        return ghc_rust_is_alive_large(p, &mblock_address_space);
+    }
 #endif
     return ghc_rust_is_alive(p, livenessBlockFlags, livenessMarked, type_offset,
                              offsetof(StgInd, indirectee));
