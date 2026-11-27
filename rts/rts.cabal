@@ -45,6 +45,7 @@ extra-source-files:
     rust/stable_ptr.rs
     rust/static_ptr_table.rs
     rust/suspended_calls.rs
+    rust/thread_label.rs
     rust/timeout_queue.rs
     rust/wsdeque.rs
 

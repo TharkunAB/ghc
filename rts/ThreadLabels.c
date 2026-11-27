@@ -20,6 +20,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void
+threadLabelBeforeStore(Capability *cap, StgTSO *tso,
+                       StgArrBytes *old_label)
+{
+    if (old_label) {
+        IF_NONMOVING_WRITE_BARRIER_ENABLED {
+            updateRemembSetPushClosure(cap, (StgClosure *) old_label);
+        }
+    }
+    recordClosureMutated(cap, (StgClosure *) tso);
+}
+
+#if defined(USE_RUST_RTS)
+/* The Rust writer calls this before it publishes the new label. */
+RTS_PRIVATE void
+ghc_rust_thread_label_before_store(Capability *cap, StgTSO *tso,
+                                   StgArrBytes *old_label)
+{
+    threadLabelBeforeStore(cap, tso, old_label);
+}
+#endif
+
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_THREAD_LABELS
+RTS_PRIVATE void ghc_rust_label_thread(StgArrBytes **slot,
+                                       Capability *cap, StgTSO *tso,
+                                       StgArrBytes *label);
+#endif
+
 /*
  * Note [Thread Labels]
  * ~~~~~~~~~~~~~~~~~~~~
@@ -60,13 +89,12 @@ labelThread(Capability  *cap,
             StgTSO      *tso,
             StgArrBytes *label)
 {
+#if defined(USE_RUST_THREAD_LABELS)
+    ghc_rust_label_thread(&tso->label, cap, tso, label);
+#else
     StgArrBytes *old_label = ACQUIRE_LOAD(&tso->label);
-    if (old_label) {
-        IF_NONMOVING_WRITE_BARRIER_ENABLED {
-            updateRemembSetPushClosure(cap, (StgClosure *) old_label);
-        }
-    }
-    recordClosureMutated(cap, (StgClosure*)tso);
+    threadLabelBeforeStore(cap, tso, old_label);
     RELEASE_STORE(&tso->label, label);
+#endif
     traceThreadLabel(cap, tso, (char *) label->payload, label->bytes);
 }
