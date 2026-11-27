@@ -6,6 +6,8 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 const _: () = {
     assert!(size_of::<AtomicPtr<c_void>>() == size_of::<*mut c_void>());
     assert!(align_of::<AtomicPtr<c_void>>() == align_of::<*mut c_void>());
+    assert!(size_of::<AtomicUsize>() == size_of::<usize>());
+    assert!(align_of::<AtomicUsize>() == align_of::<usize>());
 };
 
 core::arch::global_asm!(
@@ -18,7 +20,7 @@ unsafe extern "C" {
     fn allocateArrBytes(cap: *mut c_void, bytes: usize, ccs: *mut c_void) -> *mut c_void;
     fn updateRemembSetPushClosure(cap: *mut c_void, label: *mut c_void);
     fn recordClosureMutated(cap: *mut c_void, tso: *mut c_void);
-    static nonmoving_write_barrier_enabled: usize;
+    static mut nonmoving_write_barrier_enabled: usize;
 }
 
 /// Allocate and initialize a label from a NUL-terminated C string.
@@ -58,9 +60,8 @@ pub(super) unsafe extern "C" fn ghc_rust_label_thread(
         let slot = AtomicPtr::from_ptr(slot);
         let old_label = slot.load(Ordering::Acquire);
         if barrier_possible != 0 && !old_label.is_null() {
-            let barrier_enabled =
-                AtomicUsize::from_ptr((&raw const nonmoving_write_barrier_enabled).cast_mut())
-                    .load(Ordering::Relaxed);
+            let barrier_enabled = AtomicUsize::from_ptr(&raw mut nonmoving_write_barrier_enabled)
+                .load(Ordering::Relaxed);
             if barrier_enabled != 0 {
                 updateRemembSetPushClosure(cap, old_label);
             }
