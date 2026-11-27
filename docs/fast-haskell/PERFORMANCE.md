@@ -51,6 +51,26 @@ Each cell is one run on the same previously built source tree, native Stage0 com
 
 The starting and published configurations ran 303 Haskell compile commands. The pilot ran 54. Only the edited producer generated code. The module artifacts of all 249 skipped importers, the compiler archive, shared library, compiler executable, and a separately compiled and executed GHC API consumer matched the ordinary reference. Each immediate no-op ran zero builder actions. The two separate starting benchmark jobs peaked at 2,564 and 2,578 MiB in their cgroups. The two-direction worker and pilot jobs peaked at 5,772 and 4,680 MiB. These are whole-job peaks, including the compiler and resident workers.
 
+### Private Stage0 cache for CPP dependencies
+
+The exact shared Stage0 CLI (`cafe7121a8e6`) ran the same 943-module
+dependency scan as a private worker built with three replacement GHC API
+objects. With fresh worker daemons and both disk caches populated, the
+worker took **4.793 s with the existing cache and 3.466 s with the
+CPP dependency cache added** (27.7% less time over four alternating pairs).
+Both arms reused 835 empty certificates. The opt-in arm also reused all
+104 CPP records and still ran normal preprocessing. The Makefile, backup
+and diagnostics matched stock GHC. The 1,068 watched inputs were stable.
+Stock GHC took 7.582 s and the installed `2baf1e8` worker took 4.506 s
+with its existing cache in separate single controls.
+
+A separate build against the ordinary toolchain omitted the new cache
+capability and passed the dependency, compile-check and fallback smoke
+tests. Pueue jobs 7211 and 7214 collected these results. The optimized
+worker used a private API overlay. The shared Stage0 selector stays on
+`2baf1e8` until the API can be packaged reproducibly and qualified for
+ordinary compile checks as well as dependency scans.
+
 ### Cabal compiler-library installation
 
 We replayed the complete Stage1 GHC package copy with the original Cabal
