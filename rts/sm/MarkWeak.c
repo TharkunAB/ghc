@@ -781,3 +781,25 @@ scavengeLiveWeak(StgWeak *w)
     evacuate(&w->cfinalizers);
 #endif
 }
+
+#if defined(USE_RUST_WEAK_GC)
+/* Note [Live weak roots from Rust]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Rust selects the four writable fields and their visit order. Install the
+ * GC worker once while C evacuates those fields. Each slot can change.
+ */
+RTS_PRIVATE void ghc_rust_mark_weak_roots(gc_thread *worker,
+    StgClosure **value, StgClosure **key, StgClosure **finalizer,
+    StgClosure **cfinalizers)
+{
+#if defined(THREADED_RTS)
+    gc_thread *saved = gct;
+#endif
+    SET_GCT(worker);
+    evacuate(value);
+    evacuate(key);
+    evacuate(finalizer);
+    evacuate(cfinalizers);
+    SET_GCT(saved);
+}
+#endif

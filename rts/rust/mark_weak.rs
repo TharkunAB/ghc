@@ -16,6 +16,13 @@ core::arch::global_asm!(
 
 unsafe extern "C" {
     fn mark_root(gc_thread: *mut c_void, slot: *mut *mut u8);
+    fn ghc_rust_mark_weak_roots(
+        worker: *mut c_void,
+        value: *mut *mut u8,
+        key: *mut *mut u8,
+        finalizer: *mut *mut u8,
+        cfinalizers: *mut *mut u8,
+    );
     static stg_NO_FINALIZER_closure: u8;
     static stg_DEAD_WEAK_info: u8;
 }
@@ -38,10 +45,13 @@ unsafe extern "C" fn ghc_rust_scavenge_live_weak(
 ) {
     unsafe {
         let payload = weak.add(payload_offset).cast::<WeakPayload>();
-        mark_root(worker, &raw mut (*payload).value);
-        mark_root(worker, &raw mut (*payload).key);
-        mark_root(worker, &raw mut (*payload).finalizer);
-        mark_root(worker, &raw mut (*payload).cfinalizers);
+        ghc_rust_mark_weak_roots(
+            worker,
+            &raw mut (*payload).value,
+            &raw mut (*payload).key,
+            &raw mut (*payload).finalizer,
+            &raw mut (*payload).cfinalizers,
+        );
     }
 }
 
