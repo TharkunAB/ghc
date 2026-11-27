@@ -229,8 +229,31 @@ traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
  * This means marking the finalizer (and possibly value) in preparation for
  * later finalization.
  */
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+/* Note [Visiting dead weak pointers from Rust]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The main GC thread runs this pass after the weak keys reach a fixed point.
+ * Keep each Haskell finalizer alive. A C finalizer also needs the weak value
+ * to stay alive until its callback runs. See Note [MallocPtr finalizers] in
+ * GHC.Internal.ForeignPtr.
+ *
+ * Rust passes the addresses of both slots to mark_root. The collector can
+ * replace the pointers in these slots. mark_root restores the GC thread
+ * register before calling evacuate and restores the caller's register on
+ * return. Rust can then link the weak object into the pending list.
+ */
+RTS_PRIVATE void ghc_rust_collect_dead_weaks(StgWeak *old, StgWeak **pending,
+    void *gc_thread_ptr, size_t cfinalizers_offset, size_t value_offset,
+    size_t finalizer_offset, size_t link_offset);
+#endif
+
 static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_collect_dead_weaks(gen->old_weak_ptr_list, dead_weak_ptr_list, gct,
+        offsetof(StgWeak, cfinalizers), offsetof(StgWeak, value),
+        offsetof(StgWeak, finalizer), offsetof(StgWeak, link));
+#else
     StgWeak *w, *next_w;
     for (w = gen->old_weak_ptr_list; w != NULL; w = next_w) {
         // If we have C finalizers, keep the value alive for this GC.
@@ -243,6 +266,7 @@ static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
         w->link = *dead_weak_ptr_list;
         *dead_weak_ptr_list = w;
     }
+#endif
 }
 
 /*

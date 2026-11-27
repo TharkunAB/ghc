@@ -18,6 +18,7 @@ mod hash_insert;
 mod hash_walk;
 mod pool;
 mod incall;
+mod mark_weak;
 #[cfg(ghc_use_large_address_space)]
 mod mblock_extents;
 mod prim_float;

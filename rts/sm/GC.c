@@ -214,7 +214,6 @@ DECLARE_GCT
    Static function declarations
    -------------------------------------------------------------------------- */
 
-static void mark_root               (void *user, StgClosure **root);
 static void prepare_collected_gen   (generation *gen);
 static void prepare_uncollected_gen (generation *gen);
 static void init_gc_thread          (gc_thread *t);
@@ -1965,7 +1964,7 @@ init_gc_thread (gc_thread *t)
    Function we pass to evacuate roots.
    -------------------------------------------------------------------------- */
 
-static void
+void
 mark_root(void *user USED_IF_THREADS, StgClosure **root)
 {
     // we stole a register for gct, but this function is called from
