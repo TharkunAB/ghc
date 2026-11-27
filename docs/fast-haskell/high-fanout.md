@@ -53,6 +53,12 @@ A direct ABI fingerprint would miss a re-export. In an `-O2` fixture, A used an 
 
 The next step is to derive eligibility from the current compilation instead of a fixed list of modules. The rule must track imported code used at compile time, independent file and directory dependencies, and changes to flags or imports. Measure the cost of producing these fingerprints across the build before enabling the rule for other modules.
 
+### Native opt-in on the live dependency graph
+
+The portable implementation is available through `HADRIAN_NORMALIZED_IFACE_WORKER` with a prepared worker that advertises interface capability v2. It discovers high-fanout providers from the Stage1 compiler dependency graph and checks the consumer's successful compile arguments and both interfaces. The package keeps ordinary dependencies when the worker cannot establish that a consumer can skip its provider's source hash.
+
+On the rebuilt GHC 10.1.20261127 Stage0, the initial linked edit recorded 3,147 normalized edges. The warm revert ran 54 Haskell compile requests, compared with 303 when the feature was disabled. It still compiled the producer and relinked the compiler. The initial opt-out ran 249 up-to-date checks so Shake could restore ordinary dependencies. Compiler artifacts and a separately compiled dynamic consumer matched stock in each source state. This qualification shared the scheduler with other tasks. Use the cumulative comparison for latency. [Hadrian setup](../../hadrian/README.md#experimental-normalized-interface-dependencies)
+
 ## Source edits before optimization
 
 In separate checked one-shot compilations of `GHC.Utils.Misc` at `-O2`, an unchanged compile took 0.20 s. A same-line trailing comment or a change in internal spacing took 2.14–2.19 s. The source hash in the interface changed, but the printed desugared Core, printed optimized Core and native object matched. Inserting a whole comment line changed the object even with debug information off. In a runnable `HasCallStack` example, the observed source position moved from line 6 to line 7. With `-g2`, changing spacing alone changed source ticks and native bytes.
