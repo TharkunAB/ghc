@@ -2,6 +2,7 @@
 
 mod adjustor_slots;
 mod archive_member;
+mod closure_table;
 mod arena;
 mod encode;
 mod exec_page;

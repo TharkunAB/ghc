@@ -9,6 +9,20 @@
 
 #include <string.h>
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_CLOSURE_TABLE_GROWTH
+GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t),
+                  "Closure table word must match Rust usize");
+GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(StgClosure *),
+                  "Closure table card words must match pointer slots");
+RTS_PRIVATE void ghc_rust_closure_table_init_growth(
+    StgClosure *const *old_payload, StgClosure **new_payload,
+    const StgWord *old_free, StgWord *new_free,
+    size_t old_capacity, size_t new_capacity,
+    size_t old_card_words, size_t new_card_words,
+    size_t old_free_words, int old_free_head, StgClosure *null_closure);
+#endif
+
 
 void initClosureTable(ClosureTable *t, enum ClosureTableMode mode)
 {
@@ -59,16 +73,24 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
     newfree = allocateArrBytes(cap, arrsize, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(newfree == NULL)) return false;
 
-    /* With allocation done nothing can fail now, so ok to overwrite things */
-
-    t->capacity = newcapacity;
-
-    /* We build the new array by copying the elements over from the old array
-     * and the card table from the old array. The extra elements (if any) are
-     * initialised to a null value, and the extra card table entries (if any)
-     * are cleared.
+    /* Note [Closure table growth initialization]
+     * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     * C allocates both arrays and publishes the completed table. Rust copies
+     * the old payload, card words, and free-list words. This copies the old
+     * padding too. Rust then initializes the new entries. C records the
+     * mutable array after initialization. The TSAN build keeps the C path.
      */
-    /* Copy the old elements */
+    StgWord oldcardsize = mutArrPtrsCardTableSize(oldcapacity);
+    StgWord newcardsize = mutArrPtrsCardTableSize(newcapacity);
+    StgWord oldfreesizeW = ROUNDUP_BYTES_TO_WDS((StgWord)oldcapacity * sizeof(int));
+#if defined(USE_RUST_CLOSURE_TABLE_GROWTH)
+    ghc_rust_closure_table_init_growth(
+        oldcapacity == 0 ? NULL : oldarr->payload, newarr->payload,
+        oldcapacity == 0 ? NULL : oldfree->payload, newfree->payload,
+        oldcapacity, newcapacity, oldcardsize, newcardsize, oldfreesizeW,
+        t->free_hd, &stg_CLOSURE_TABLE_NULL_closure);
+#else
+    /* Copy the old elements. */
     for (int i = 0; i < oldcapacity; i++) {
         newarr->payload[i] = oldarr->payload[i];
     }
@@ -77,21 +99,13 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
         newarr->payload[i] = &stg_CLOSURE_TABLE_NULL_closure;
     }
     /* Copy the the mutable array's card table. And init extra elements to 0 */
-    StgWord oldcardsize = mutArrPtrsCardTableSize(oldcapacity);
-    StgWord newcardsize = mutArrPtrsCardTableSize(newcapacity);
     for (StgWord i = 0; i < oldcardsize; i++) {
         newarr->payload[newcapacity+i] = oldarr->payload[oldcapacity+i];
     }
     for (StgWord i = oldcardsize; i < newcardsize; i++) {
         newarr->payload[newcapacity+i] = 0;
     }
-    /* We conservatively assume the old array was dirty, so we marked the new
-       one as dirty too, and now we put the array on the mutated list. */
-    recordClosureMutated(cap, (StgClosure*)newarr);
-    t->arr = newarr;
-
     /* Copy the free list. */
-    StgWord oldfreesizeW = ROUNDUP_BYTES_TO_WDS((StgWord)oldcapacity * sizeof(int));
     for (StgWord i = 0; i < oldfreesizeW; i++) {
         newfree->payload[i] = oldfree->payload[i];
     }
@@ -104,8 +118,14 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
         StgArrBytesAsCInts(newfree)[i] = i+1;
     }
     StgArrBytesAsCInts(newfree)[newcapacity-1] = t->free_hd;
+#endif
+
+    /* The new array is dirty. Record it before publishing the table. */
+    recordClosureMutated(cap, (StgClosure*)newarr);
+    t->arr = newarr;
     t->free_hd = oldcapacity;
     t->free = newfree;
+    t->capacity = newcapacity;
 
     return true;
 }

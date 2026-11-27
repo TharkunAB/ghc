@@ -21,6 +21,7 @@ rtsRules = priority 3 $ do
             buildRustRts stage "ghc_rts" "rts/rust/lib.rs"
                 [ "rts/rust/adjustor_slots.rs"
                 , "rts/rust/archive_member.rs"
+                , "rts/rust/closure_table.rs"
                 , "rts/rust/arena.rs"
                 , "rts/rust/encode.rs"
                 , "rts/rust/exec_page.rs"
