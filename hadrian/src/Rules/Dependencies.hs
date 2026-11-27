@@ -20,6 +20,7 @@ import qualified Text.Parsec as Parsec
 
 buildPackageDependencies :: [(Resource, Int)] -> Rules ()
 buildPackageDependencies rs = do
+    dependencyWorkerRules
     root <- buildRootRules
     root -/- "**/.dependencies.mk" %> \mk -> do
         DepMkFile stage pkgpath <- getDepMkFile root mk

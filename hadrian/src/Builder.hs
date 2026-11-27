@@ -1,4 +1,4 @@
-{-# LANGUAGE InstanceSigs, TypeOperators #-}
+{-# LANGUAGE InstanceSigs, TypeFamilies, TypeOperators #-}
 module Builder (
     -- * Data types
     ArMode (..), CcMode (..), ConfigurationInfo (..), DependencyType (..),
@@ -8,10 +8,14 @@ module Builder (
     -- * Builder properties
     builderProvenance, systemBuilderPath, builderPath, isSpecified, needBuilders,
     runBuilder, runBuilderWith, runBuilderWithCmdOptions, getBuilderPath,
-    builderEnvironment, remBuilderEnvironment
+    builderEnvironment, remBuilderEnvironment, dependencyWorkerRules
     ) where
 
+import Control.Exception (evaluate)
 import Control.Exception.Extra (Partial)
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Data.ByteString.Base16 as Base16
+import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BSL
 import Development.Shake.Classes
 import Development.Shake.Command
@@ -25,8 +29,10 @@ import Hadrian.Builder.Tar
 import Hadrian.Oracles.Path
 import Hadrian.Oracles.TextFile
 import Hadrian.Utilities
+import qualified System.Directory as Dir
+import System.IO.Error (tryIOError)
 import System.Exit
-import System.IO (stderr)
+import System.IO (IOMode(ReadMode), stderr, withBinaryFile)
 
 import Base
 import Context
@@ -211,6 +217,87 @@ builderProvenance = \case
   where
     context s p = Just $ vanillaContext s p
 
+-- | Shake key for the dependency worker selected for this invocation.
+data DependencyWorker = DependencyWorker deriving (Eq, Generic, Show)
+instance Binary DependencyWorker
+instance Hashable DependencyWorker
+instance NFData DependencyWorker
+type instance RuleResult DependencyWorker = Maybe (FilePath, FilePath, String)
+
+-- | Shake key for the SHA-256 digest of a stage compiler executable.
+newtype CompilerHash = CompilerHash FilePath deriving (Eq, Generic, Show)
+instance Binary CompilerHash
+instance Hashable CompilerHash
+instance NFData CompilerHash
+type instance RuleResult CompilerHash = Maybe String
+
+{- Note [Dependency worker selection]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+HADRIAN_DEPENDENCY_WORKER is an absolute path to a prepared worker shim.
+Resolve it once per Hadrian invocation. A change to the release selector
+during a build cannot change the worker.
+Match the release compiler path and executable hash to the stage compiler.
+Keep the ordinary dependency on the stage compiler. The hash does not cover
+shared libraries. The release must use libraries that match the stage compiler.
+-}
+
+-- | Track the opt-in, selected release and stage compiler hashes.
+dependencyWorkerRules :: Rules ()
+dependencyWorkerRules = do
+    void $ addOracle $ \DependencyWorker -> do
+        optIn <- getEnv "HADRIAN_DEPENDENCY_WORKER"
+        case optIn of
+          Just requested | isAbsolute requested -> do
+            resolved <- liftIO $ tryIOError $ Dir.canonicalizePath requested
+            case resolved of
+              Left _ -> pure Nothing
+              Right worker -> do
+                let metadata = takeDirectory worker -/- "metadata"
+                    realGhc = worker ++ ".real-ghc"
+                    files = [worker, metadata, realGhc]
+                available <- allM doesFileExist files
+                if available
+                then do
+                    need (requested : files)
+                    liftIO $ either (const Nothing) id <$> tryIOError (do
+                        real <- lines . BSC.unpack <$> BS.readFile realGhc
+                        fields <- lines . BSC.unpack <$> BS.readFile metadata
+                        permissions <- Dir.getPermissions worker
+                        pure $ case (real, mapMaybe (stripPrefix "compiler_sha256=") fields) of
+                          ([compiler], [digest])
+                            | Dir.executable permissions, isAbsolute compiler, length digest == 64 ->
+                                Just (worker, compiler, digest)
+                          _ -> Nothing)
+                else pure Nothing
+          _ -> pure Nothing
+    void $ addOracleCache $ \(CompilerHash compiler) -> do
+        need [compiler]
+        liftIO $ either (const Nothing) Just <$> tryIOError
+            (withBinaryFile compiler ReadMode $ \handle -> do
+                digest <- evaluate . SHA256.hashlazy =<< BSL.hGetContents handle
+                pure . BSC.unpack $ Base16.encode digest)
+
+-- | Choose the worker only for the compiler recorded in its release metadata.
+dependencyWorker :: FilePath -> Action (Maybe FilePath)
+dependencyWorker stageCompiler = do
+    selection <- askOracle DependencyWorker
+    case selection of
+      Just (worker, compiler, digest) -> do
+        paths <- liftIO $ tryIOError $
+            (,) <$> Dir.canonicalizePath stageCompiler <*> Dir.canonicalizePath compiler
+        case paths of
+          Right (stagePath, releasePath) | stagePath == releasePath -> do
+            currentHash <- askOracle (CompilerHash stagePath)
+            pure $ if currentHash == Just digest then Just worker else Nothing
+          _ -> pure Nothing
+      Nothing -> pure Nothing
+
+-- | Use the prepared release's compiler, daemon and libdir settings.
+dependencyWorkerOptions :: Maybe FilePath -> [CmdOption]
+dependencyWorkerOptions Nothing = []
+dependencyWorkerOptions (Just _) =
+    map RemEnv ["GHC_WORKER_REAL_GHC", "GHC_WORKER_DAEMON", "GHC_WORKER_LIBDIR"]
+
 instance H.Builder Builder where
     builderPath :: Builder -> Action FilePath
     builderPath builder = case builderProvenance builder of
@@ -289,7 +376,10 @@ instance H.Builder Builder where
     runBuilderWith :: Builder -> BuildInfo -> Action ()
     runBuilderWith builder BuildInfo {..} = do
         path <- builderPath builder
-        prog <- exeSpawnPath path
+        worker <- case builder of
+            Ghc FindHsDependencies _ -> dependencyWorker path
+            _ -> pure Nothing
+        prog <- exeSpawnPath (fromMaybe path worker)
         withResources buildResources $ do
             verbosity <- getVerbosity
             let input  = fromSingleton msgIn buildInputs
@@ -358,7 +448,7 @@ instance H.Builder Builder where
                     prog
                     (toCmdArgument buildArgs)
                     buildInputs
-                    (toCmdArgument buildOptions)
+                    (toCmdArgument (buildOptions ++ dependencyWorkerOptions worker))
 
                 HsCpp {}    -> captureStdout
 
