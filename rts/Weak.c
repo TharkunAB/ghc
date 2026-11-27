@@ -42,6 +42,8 @@ GHC_STATIC_ASSERT(offsetof(StgWeak, header.info) == 0, "Rust weak info pointer l
 RTS_PRIVATE void ghc_rust_run_c_finalizers(StgCFinalizerList *list, size_t payload_offset);
 RTS_PRIVATE void ghc_rust_run_all_c_finalizers(StgWeak *list, bool *running,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset);
+RTS_PRIVATE StgWord ghc_rust_drain_c_finalizers(StgWeak **cursor, StgWord limit,
+    size_t callbacks_offset, size_t link_offset, size_t payload_offset);
 #endif
 
 // List of dead weak pointers collected by the last GC
@@ -276,6 +278,11 @@ bool runSomeFinalizers(bool all)
     }
 
     StgWeak *w = finalizer_list;
+#if defined(USE_RUST_C_FINALIZERS)
+    StgWord count = ghc_rust_drain_c_finalizers(&w, all ? STG_WORD_MAX : finalizer_chunk,
+        offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
+        offsetof(StgCFinalizerList, link));
+#else
     StgWord count = 0;
     while (w != NULL) {
         runCFinalizers((StgCFinalizerList *)w->cfinalizers);
@@ -283,6 +290,7 @@ bool runSomeFinalizers(bool all)
         ++count;
         if (!all && count >= finalizer_chunk) break;
     }
+#endif
 
     RELAXED_STORE(&finalizer_list, w);
     SEQ_CST_ADD(&n_finalizers, -count);
