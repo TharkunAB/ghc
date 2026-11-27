@@ -1,12 +1,20 @@
 use core::ffi::{c_char, c_int, c_void};
 use core::mem::{offset_of, size_of};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 core::arch::global_asm!(
     ".hidden ghc_rust_foreign_exports_enqueue",
     ".hidden ghc_rust_foreign_exports_process",
+    ".hidden ghc_rust_foreign_exports_is_loading",
+    ".hidden ghc_rust_foreign_exports_begin_loading",
+    ".hidden ghc_rust_foreign_exports_finish_loading",
 );
 
 type StablePtr = *mut c_void;
+// See Note [Tracking foreign exports] in ForeignExports.c.
+static PENDING: AtomicPtr<ForeignExportsList> = AtomicPtr::new(ptr::null_mut());
+static LOADING_OBJ: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 /// Match the list that generated C constructors register with the RTS.
 #[repr(C)]
@@ -34,30 +42,50 @@ unsafe extern "C" {
 
 /// Queue exports without allocation. Constructors can call this before RTS startup.
 #[unsafe(no_mangle)]
-pub(super) unsafe extern "C" fn ghc_rust_foreign_exports_enqueue(
-    pending: *mut *mut ForeignExportsList,
-    loading_obj: *mut c_void,
-    exports: *mut ForeignExportsList,
-) {
+pub(super) unsafe extern "C" fn ghc_rust_foreign_exports_enqueue(exports: *mut ForeignExportsList) {
     unsafe {
-        (*exports).next = *pending;
-        (*exports).oc = loading_obj;
-        *pending = exports;
+        (*exports).next = PENDING.load(Ordering::Relaxed);
+        (*exports).oc = LOADING_OBJ.load(Ordering::Relaxed);
+        PENDING.store(exports, Ordering::Relaxed);
     }
+}
+
+/// Check the loader state for the native assertions.
+#[unsafe(no_mangle)]
+pub(super) extern "C" fn ghc_rust_foreign_exports_is_loading() -> bool {
+    !LOADING_OBJ.load(Ordering::Relaxed).is_null()
+}
+
+/// Begin loading while the caller owns the linker lock.
+#[unsafe(no_mangle)]
+pub(super) extern "C" fn ghc_rust_foreign_exports_begin_loading(oc: *mut c_void) {
+    LOADING_OBJ.store(oc, Ordering::Relaxed);
+}
+
+/// Finish loading and create roots while the caller owns the linker lock.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_foreign_exports_finish_loading(
+    check: Option<unsafe extern "C" fn(*mut ForeignExportsList)>,
+    head: unsafe extern "C" fn(*mut c_void) -> *mut *mut ForeignExportsList,
+) {
+    LOADING_OBJ.store(ptr::null_mut(), Ordering::Relaxed);
+    unsafe { ghc_rust_foreign_exports_process(check, head) }
 }
 
 /// Create roots after the stable pointer table is ready.
 /// The caller holds the linker lock after RTS startup.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_foreign_exports_process(
-    pending: *mut *mut ForeignExportsList,
     check: Option<unsafe extern "C" fn(*mut ForeignExportsList)>,
     head: unsafe extern "C" fn(*mut c_void) -> *mut *mut ForeignExportsList,
 ) {
     unsafe {
-        while !(*pending).is_null() {
-            let exports = *pending;
-            *pending = (*exports).next;
+        loop {
+            let exports = PENDING.load(Ordering::Relaxed);
+            if exports.is_null() {
+                break;
+            }
+            PENDING.store((*exports).next, Ordering::Relaxed);
             if let Some(check) = check {
                 check(exports);
             }
