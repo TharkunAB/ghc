@@ -30,6 +30,7 @@ extra-source-files:
     rust/hash_insert.rs
     rust/hash_walk.rs
     rust/lib.rs
+    rust/incall.rs
     rust/mblock_extents.rs
     rust/poll_slots.rs
     rust/pool.rs
