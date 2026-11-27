@@ -19,6 +19,15 @@
 #include "Trace.h"
 #include "AllocArray.h"
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+GHC_STATIC_ASSERT(sizeof(((StgCFinalizerList *)0)->flag) == sizeof(size_t),
+                  "Rust C finalizer flag must fit in a native word");
+RTS_PRIVATE void ghc_rust_run_c_finalizers(
+    StgCFinalizerList *list, StgClosure *end,
+    size_t link_offset, size_t fptr_offset, size_t ptr_offset,
+    size_t eptr_offset, size_t flag_offset);
+#endif
+
 // List of dead weak pointers collected by the last GC
 static StgWeak *finalizer_list = NULL;
 
@@ -28,6 +37,15 @@ static uint32_t n_finalizers = 0;
 void
 runCFinalizers(StgCFinalizerList *list)
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_run_c_finalizers(
+        list, &stg_NO_FINALIZER_closure,
+        offsetof(StgCFinalizerList, link),
+        offsetof(StgCFinalizerList, fptr),
+        offsetof(StgCFinalizerList, ptr),
+        offsetof(StgCFinalizerList, eptr),
+        offsetof(StgCFinalizerList, flag));
+#else
     StgCFinalizerList *head;
     for (head = list;
         (StgClosure *)head != &stg_NO_FINALIZER_closure;
@@ -38,6 +56,7 @@ runCFinalizers(StgCFinalizerList *list)
         else
             ((void (*)(void *))head->fptr)(head->ptr);
     }
+#endif
 }
 
 void
