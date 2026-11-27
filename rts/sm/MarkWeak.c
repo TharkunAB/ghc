@@ -57,28 +57,51 @@ typedef struct {
 } WeakListOps;
 
 static const WeakListOps weakListOps;
+static StgTSO **inspectTidyThread(StgTSO **current);
+
+typedef struct {
+    size_t stride;
+    size_t old_threads_offset;
+    size_t live_weaks_offset;
+    size_t old_weaks_offset;
+    size_t number_offset;
+    size_t weak_payload_offset;
+    size_t tso_link_offset;
+    size_t tso_what_next_offset;
+    StgTSO *end_tso;
+    StgWord16 killed;
+    StgWord16 complete;
+    StgTSO **(*inspect_tso)(StgTSO **);
+    const WeakListOps *weak_ops;
+    void (*check_oldest)(StgWeak **);
+} WeakStageLayout;
+
+typedef struct {
+    generation *generations;
+    uint32_t collected;
+    uint32_t oldest;
+    bool nonmoving;
+    gc_thread *worker;
+    StgWeak **dead;
+    StgTSO **resurrected;
+    uint32_t *evac_gen;
+    bool *failed;
+    StgWeak **oldest_old_slot;
+} WeakStageRun;
+
+static const WeakStageLayout weakStageLayout;
 RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
     size_t live_offset, size_t old_offset, uint32_t collected, uint32_t oldest, bool nonmoving);
-RTS_PRIVATE bool ghc_rust_traverse_weaks(void *context,
-    bool (*run_pass)(void *context, uint8_t pass));
-RTS_PRIVATE bool ghc_rust_tidy_weak_generations(const WeakGenerations *gens,
-    gc_thread *worker, uint32_t *evac_gen, bool *failed,
-    size_t payload_offset, const WeakListOps *ops);
-RTS_PRIVATE void ghc_rust_collect_dead_weak_generations(generation *gens,
-    size_t stride, size_t old_offset, uint32_t collected, StgWeak **pending,
-    void *gc_thread_ptr, size_t payload_offset);
-RTS_PRIVATE void ghc_rust_tidy_thread_generations(const WeakGenerations *gens,
-    StgTSO *end, size_t link_offset, StgTSO **(*inspect)(StgTSO **));
-RTS_PRIVATE bool ghc_rust_resurrect_thread_generations(const WeakGenerations *gens,
-    StgTSO **resurrected, void *gc_thread_ptr, StgTSO *end,
-    size_t link_offset, size_t what_next_offset, StgWord16 killed, StgWord16 complete);
+RTS_PRIVATE bool ghc_rust_traverse_weaks(const WeakStageLayout *layout,
+    const WeakStageRun *run);
 
 static WeakGenerations weakGenerationLayout(void)
 {
     return (WeakGenerations) {
-        generations, sizeof(generation), offsetof(generation, old_threads),
-        offsetof(generation, weak_ptr_list), offsetof(generation, old_weak_ptr_list),
-        offsetof(generation, no), N, oldest_gen->no, RtsFlags.GcFlags.useNonmoving
+        generations, weakStageLayout.stride, weakStageLayout.old_threads_offset,
+        weakStageLayout.live_weaks_offset, weakStageLayout.old_weaks_offset,
+        weakStageLayout.number_offset, N, oldest_gen->no,
+        RtsFlags.GcFlags.useNonmoving
     };
 }
 #endif
@@ -174,8 +197,8 @@ void
 initWeakForGC(void)
 {
 #if defined(USE_RUST_WEAK_GC)
-    ghc_rust_init_weak_generations(generations, sizeof(generation),
-        offsetof(generation, weak_ptr_list), offsetof(generation, old_weak_ptr_list),
+    ghc_rust_init_weak_generations(generations, weakStageLayout.stride,
+        weakStageLayout.live_weaks_offset, weakStageLayout.old_weaks_offset,
         N, oldest_gen->no, RtsFlags.GcFlags.useNonmoving);
 #else
     uint32_t oldest = N;
@@ -194,55 +217,6 @@ initWeakForGC(void)
 #endif
 }
 
-#if defined(USE_RUST_WEAK_GC)
-// These pass identifiers cross the ABI. See WeakPass in rust/mark_weak.rs.
-enum { TidyThreads, TidyWeakKeys, ResurrectThreads, CollectDeadWeaks };
-
-typedef struct {
-    gc_thread *worker;
-    StgWeak **dead;
-    StgTSO **resurrected;
-    WeakGenerations generations;
-} WeakPassContext;
-static StgTSO **inspectTidyThread(StgTSO **current);
-
-static bool runWeakPass(void *user, uint8_t pass)
-{
-    WeakPassContext *ctx = user;
-    if (pass == TidyThreads) {
-        ghc_rust_tidy_thread_generations(&ctx->generations, END_TSO_QUEUE,
-            offsetof(StgTSO, global_link), inspectTidyThread);
-        return false;
-    }
-    if (pass == ResurrectThreads) {
-        return ghc_rust_resurrect_thread_generations(&ctx->generations,
-            ctx->resurrected, ctx->worker, END_TSO_QUEUE,
-            offsetof(StgTSO, global_link), offsetof(StgTSO, what_next),
-            ThreadKilled, ThreadComplete);
-    }
-    if (pass == CollectDeadWeaks) {
-        ghc_rust_collect_dead_weak_generations(generations, sizeof(generation),
-            offsetof(generation, old_weak_ptr_list), N, ctx->dead, ctx->worker,
-            offsetof(StgWeak, cfinalizers));
-        return false;
-    }
-    if (pass != TidyWeakKeys) barf("runWeakPass: unknown pass %u", (unsigned)pass);
-    // The Rust caller uses the platform ABI. See mark_root in GC.c.
-#if defined(THREADED_RTS)
-    gc_thread *saved = gct;
-#endif
-    SET_GCT(ctx->worker);
-    if (ctx->generations.nonmoving && ctx->generations.oldest <= ctx->generations.collected) {
-        ASSERT(oldest_gen->old_weak_ptr_list == NULL);
-    }
-    bool changed = ghc_rust_tidy_weak_generations(&ctx->generations,
-        ctx->worker, &gct->evac_gen_no, &gct->failed_to_evac,
-        offsetof(StgWeak, cfinalizers), &weakListOps);
-    SET_GCT(saved);
-    return changed;
-}
-#endif
-
 /*
  * Walk the weak pointer lists after having finished a round of scavenging,
  * tidying the weak (and possibly thread) lists (depending upon the current
@@ -255,9 +229,11 @@ bool
 traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
 {
 #if defined(USE_RUST_WEAK_GC)
-  WeakPassContext ctx = { gct, dead_weak_ptr_list, resurrected_threads,
-      weakGenerationLayout() };
-  return ghc_rust_traverse_weaks(&ctx, runWeakPass);
+  WeakStageRun run = { generations, N, oldest_gen->no,
+      RtsFlags.GcFlags.useNonmoving, gct, dead_weak_ptr_list,
+      resurrected_threads, &gct->evac_gen_no, &gct->failed_to_evac,
+      &oldest_gen->old_weak_ptr_list };
+  return ghc_rust_traverse_weaks(&weakStageLayout, &run);
 #else
   bool flag = false;
 
@@ -487,6 +463,26 @@ static void traceLiveWeak(StgWeak *w, uint32_t from, uint32_t to)
 static const WeakListOps weakListOps = {
     liveWeakKey, weakDestination, rememberUnpromotedWeak, TRACE_LIVE_WEAK
 };
+
+#if defined(ASSERTS_ENABLED)
+static void checkOldestWeakList(StgWeak **slot)
+{
+    ASSERT(*slot == NULL);
+}
+#define CHECK_OLDEST_WEAK_LIST checkOldestWeakList
+#else
+#define CHECK_OLDEST_WEAK_LIST NULL
+#endif
+
+static const WeakStageLayout weakStageLayout = {
+    sizeof(generation), offsetof(generation, old_threads),
+    offsetof(generation, weak_ptr_list), offsetof(generation, old_weak_ptr_list),
+    offsetof(generation, no), offsetof(StgWeak, cfinalizers),
+    offsetof(StgTSO, global_link), offsetof(StgTSO, what_next),
+    END_TSO_QUEUE, ThreadKilled, ThreadComplete,
+    inspectTidyThread, &weakListOps, CHECK_OLDEST_WEAK_LIST
+};
+#undef CHECK_OLDEST_WEAK_LIST
 #endif
 
 #if !defined(USE_RUST_WEAK_GC)

@@ -76,6 +76,54 @@ struct WeakGenerations {
 }
 
 #[repr(C)]
+struct WeakStageLayout {
+    stride: usize,
+    old_threads_offset: usize,
+    live_weaks_offset: usize,
+    old_weaks_offset: usize,
+    number_offset: usize,
+    weak_payload_offset: usize,
+    tso_link_offset: usize,
+    tso_what_next_offset: usize,
+    end_tso: *mut u8,
+    killed: u16,
+    complete: u16,
+    inspect_tso: unsafe extern "C" fn(*mut *mut u8) -> *mut *mut u8,
+    weak_ops: *const WeakListOps,
+    check_oldest: Option<unsafe extern "C" fn(*mut *mut u8)>,
+}
+
+#[repr(C)]
+struct WeakStageRun {
+    generations: *mut u8,
+    collected: u32,
+    oldest: u32,
+    nonmoving: bool,
+    worker: *mut c_void,
+    dead: *mut *mut u8,
+    resurrected: *mut *mut u8,
+    evac_gen: *mut u32,
+    failed: *mut bool,
+    oldest_old_slot: *mut *mut u8,
+}
+
+unsafe fn tidy_live_keys(
+    layout: &WeakStageLayout,
+    run: &WeakStageRun,
+    generations: &WeakGenerations,
+) -> bool {
+    unsafe {
+        if run.nonmoving && run.oldest <= run.collected {
+            if let Some(check) = layout.check_oldest {
+                check(run.oldest_old_slot);
+            }
+        }
+        ghc_rust_tidy_weak_generations(generations, run.worker, run.evac_gen,
+            run.failed, layout.weak_payload_offset, layout.weak_ops)
+    }
+}
+
+#[repr(C)]
 struct WeakListOps {
     live_key: unsafe extern "C" fn(*mut u8, *const u8) -> *mut u8,
     destination: unsafe extern "C" fn(*mut u8, *mut u32) -> *mut *mut u8,
@@ -215,29 +263,37 @@ enum WeakStage {
 // Only the main GC thread reads or changes the stage during a collection.
 static mut WEAK_STAGE: WeakStage = WeakStage::Pointers;
 
-// The native pass installs the main GC worker before it examines the heap.
-#[repr(u8)]
-enum WeakPass {
-    TidyThreads = 0,
-    TidyWeakKeys = 1,
-    ResurrectThreads = 2,
-    CollectDeadWeaks = 3,
-}
-
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_traverse_weaks(
-    context: *mut c_void,
-    run_pass: unsafe extern "C" fn(*mut c_void, WeakPass) -> bool,
+    layout: *const WeakStageLayout,
+    run: *const WeakStageRun,
 ) -> bool {
     unsafe {
+        let layout = &*layout;
+        let run = &*run;
+        let generations = WeakGenerations {
+            generations: run.generations,
+            stride: layout.stride,
+            old_threads_offset: layout.old_threads_offset,
+            live_weaks_offset: layout.live_weaks_offset,
+            old_weaks_offset: layout.old_weaks_offset,
+            number_offset: layout.number_offset,
+            collected: run.collected,
+            oldest: run.oldest,
+            nonmoving: run.nonmoving,
+        };
         match WEAK_STAGE {
             WeakStage::Done => return false,
             WeakStage::Threads => {
-                run_pass(context, WeakPass::TidyThreads);
-                if run_pass(context, WeakPass::TidyWeakKeys) {
+                ghc_rust_tidy_thread_generations(&raw const generations,
+                    layout.end_tso, layout.tso_link_offset, layout.inspect_tso);
+                if tidy_live_keys(layout, run, &generations) {
                     return true;
                 }
-                let resurrected = run_pass(context, WeakPass::ResurrectThreads);
+                let resurrected = ghc_rust_resurrect_thread_generations(
+                    &raw const generations, run.resurrected, run.worker,
+                    layout.end_tso, layout.tso_link_offset, layout.tso_what_next_offset,
+                    layout.killed, layout.complete);
                 WEAK_STAGE = WeakStage::Pointers;
                 if resurrected {
                     return true;
@@ -245,8 +301,10 @@ unsafe extern "C" fn ghc_rust_traverse_weaks(
             }
             WeakStage::Pointers => {}
         }
-        if !run_pass(context, WeakPass::TidyWeakKeys) {
-            run_pass(context, WeakPass::CollectDeadWeaks);
+        if !tidy_live_keys(layout, run, &generations) {
+            ghc_rust_collect_dead_weak_generations(
+                run.generations, layout.stride, layout.old_weaks_offset,
+                run.collected, run.dead, run.worker, layout.weak_payload_offset);
             WEAK_STAGE = WeakStage::Done;
         }
         // The collector must scavenge the roots reached by the last pass.
