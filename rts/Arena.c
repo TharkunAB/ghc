@@ -32,7 +32,7 @@ struct _Arena {
 };
 
 // We like to keep track of how many blocks we've allocated for
-// Storage.c:memInventory().
+// memInventory and GC sizing. Distinct arenas share this count.
 static StgWord arena_blocks = 0;
 
 // Begin a new arena
@@ -46,7 +46,7 @@ newArena( void )
     arena->current->link = NULL;
     arena->free = arena->current->start;
     arena->lim  = arena->current->start + BLOCK_SIZE_W;
-    arena_blocks++;
+    RELAXED_ADD(&arena_blocks, 1);
 
     return arena;
 }
@@ -86,7 +86,7 @@ arenaAlloc( Arena *arena, size_t size )
         // allocate a fresh block...
         req_blocks =  size_w / BLOCK_SIZE_W + (size_w % BLOCK_SIZE_W != 0);
         bd = allocGroup_lock(req_blocks);
-        arena_blocks += bd->blocks;
+        RELAXED_ADD(&arena_blocks, bd->blocks);
 
         bd->gen_no  = 0;
         bd->gen     = NULL;
@@ -109,8 +109,8 @@ arenaFree( Arena *arena )
 
     for (bd = arena->current; bd != NULL; bd = next) {
         next = bd->link;
-        ASSERT(arena_blocks >= bd->blocks);
-        arena_blocks -= bd->blocks;
+        StgWord blocks = RELAXED_ADD(&arena_blocks, -(StgWord)bd->blocks);
+        ASSERT(blocks <= STG_WORD_MAX - bd->blocks);
         freeGroup_lock(bd);
     }
     stgFree(arena);
@@ -119,7 +119,7 @@ arenaFree( Arena *arena )
 StgWord
 arenaBlocks( void )
 {
-    return arena_blocks;
+    return RELAXED_LOAD(&arena_blocks);
 }
 
 #if defined(DEBUG)

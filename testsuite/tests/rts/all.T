@@ -22,6 +22,13 @@ test('testarena', [extra_files(['../../../rts/Arena.h']),
                    c_src, only_ways(['normal'])],
                    compile_and_run, [''])
 
+test('testarenaConcurrent',
+     [unless(in_tree_compiler(), skip),
+      when(arch('wasm32'), skip),
+      only_ways(['threaded1', 'threaded2']),
+      extra_run_opts('+RTS -N4 -I0 -A4m -RTS')],
+     compile_and_run, ['-static -rtsopts'])
+
 # See bug #101, test requires +RTS -c (or equivalently +RTS -M<something>)
 # only GHCi triggers the bug, but we run the test all ways for completeness.
 test('bug1010',
