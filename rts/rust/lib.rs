@@ -3,6 +3,7 @@
 mod archive_member;
 mod arena;
 mod encode;
+mod exec_page;
 mod eventlog_file_writer;
 mod file_lock;
 mod gc_budget;

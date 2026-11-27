@@ -22,6 +22,7 @@ rtsRules = priority 3 $ do
                 [ "rts/rust/archive_member.rs"
                 , "rts/rust/arena.rs"
                 , "rts/rust/encode.rs"
+                , "rts/rust/exec_page.rs"
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
                 , "rts/rust/gc_budget.rs"
