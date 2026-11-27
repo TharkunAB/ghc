@@ -253,6 +253,12 @@ RTS_PRIVATE void ghc_rust_collect_dead_weaks(StgWeak *old, StgWeak **pending,
     void *gc_thread_ptr, size_t payload_offset);
 RTS_PRIVATE void ghc_rust_mark_weak_list(StgWeak **head, void *gc_thread_ptr,
     size_t payload_offset, void (*check)(StgWeak *));
+GHC_STATIC_ASSERT(offsetof(Capability, weak_ptr_list_tl) ==
+                  offsetof(Capability, weak_ptr_list_hd) + sizeof(StgWeak *),
+                  "Rust capability weak list endpoints");
+RTS_PRIVATE void ghc_rust_collect_fresh_weaks(StgWeak **nursery, Capability **caps,
+    uint32_t count, size_t endpoints_offset, size_t payload_offset,
+    void (*check)(StgWeak *, StgWeak *));
 #endif
 
 static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
@@ -488,8 +494,28 @@ static void checkWeakPtrSanity(StgWeak *hd, StgWeak *tl)
  * Traverse the capabilities' local new-weak-pointer lists at the beginning of
  * GC and move them to the nursery's weak_ptr_list.
  */
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED) && defined(ASSERTS_ENABLED)
+static void checkFreshWeakList(StgWeak *head, StgWeak *tail)
+{
+    if (tail == NULL) {
+        ASSERT(head == NULL);
+    } else {
+        IF_DEBUG(sanity, checkWeakPtrSanity(head, tail));
+    }
+}
+#define CHECK_FRESH_WEAK_LIST checkFreshWeakList
+#else
+#define CHECK_FRESH_WEAK_LIST NULL
+#endif
+
 void collectFreshWeakPtrs( void )
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    // GC owns all capability lists until scavenging starts.
+    ghc_rust_collect_fresh_weaks(&g0->weak_ptr_list, capabilities, getNumCapabilities(),
+        offsetof(Capability, weak_ptr_list_hd), offsetof(StgWeak, cfinalizers),
+        CHECK_FRESH_WEAK_LIST);
+#else
     uint32_t i;
     // move recently allocated weak_ptr_list to the old list as well
     for (i = 0; i < getNumCapabilities(); i++) {
@@ -504,6 +530,7 @@ void collectFreshWeakPtrs( void )
             ASSERT(cap->weak_ptr_list_hd == NULL);
         }
     }
+#endif
 }
 
 /* -----------------------------------------------------------------------------
