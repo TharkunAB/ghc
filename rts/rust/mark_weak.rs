@@ -4,13 +4,14 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 core::arch::global_asm!(
     ".hidden ghc_rust_collect_dead_weak_generations",
-    ".hidden ghc_rust_mark_weak_list",
+    ".hidden ghc_rust_mark_weak_generations",
     ".hidden ghc_rust_collect_fresh_weaks",
     ".hidden ghc_rust_init_weak_generations",
     ".hidden ghc_rust_traverse_weaks",
     ".hidden ghc_rust_resurrect_thread_generations",
     ".hidden ghc_rust_scavenge_live_weak",
     ".hidden ghc_rust_tidy_weak_list",
+    ".hidden ghc_rust_tidy_weak_generations",
     ".hidden ghc_rust_tidy_thread_generations",
 );
 
@@ -61,13 +62,18 @@ struct WeakList {
     tail: *mut u8,
 }
 
-// See Note [Thread generation traversal from Rust] in sm/MarkWeak.c.
+// See Note [Weak generation traversal from Rust] in sm/MarkWeak.c.
 #[repr(C)]
-struct ThreadGenerations {
+struct WeakGenerations {
     generations: *mut u8,
     stride: usize,
     old_threads_offset: usize,
+    live_weaks_offset: usize,
+    old_weaks_offset: usize,
+    number_offset: usize,
     collected: u32,
+    oldest: u32,
+    nonmoving: bool,
 }
 
 #[repr(C)]
@@ -132,6 +138,32 @@ unsafe extern "C" fn ghc_rust_tidy_weak_list(
     }
 }
 
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_tidy_weak_generations(
+    generations: *const WeakGenerations,
+    worker: *mut c_void,
+    evac_gen: *mut u32,
+    failed: *mut bool,
+    payload_offset: usize,
+    ops: *const WeakListOps,
+) -> bool {
+    unsafe {
+        let layout = &*generations;
+        let mut found = false;
+        for index in 0..=layout.collected {
+            if layout.nonmoving && index == layout.oldest {
+                continue;
+            }
+            let generation = layout.generations.add(index as usize * layout.stride);
+            let old = generation.add(layout.old_weaks_offset).cast::<*mut u8>();
+            let from = generation.add(layout.number_offset).cast::<u32>().read();
+            found |= ghc_rust_tidy_weak_list(old, from, worker, evac_gen,
+                failed, payload_offset, ops);
+        }
+        found
+    }
+}
+
 // See Note [Tidy thread list ownership] in sm/MarkWeak.c.
 unsafe fn tidy_thread_list(
     old: *mut *mut u8,
@@ -160,7 +192,7 @@ unsafe fn tidy_thread_list(
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_tidy_thread_generations(
-    generations: *const ThreadGenerations,
+    generations: *const WeakGenerations,
     end: *mut u8,
     link_offset: usize,
     inspect: unsafe extern "C" fn(*mut *mut u8) -> *mut *mut u8,
@@ -282,24 +314,30 @@ unsafe extern "C" fn ghc_rust_collect_fresh_weaks(
 
 // Evacuation can replace the object in the root slot. Follow the link in its new location.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_mark_weak_list(
-    mut slot: *mut *mut u8,
-    gc_thread: *mut c_void,
+unsafe extern "C" fn ghc_rust_mark_weak_generations(
+    generations: *const WeakGenerations,
+    worker: *mut c_void,
     payload_offset: usize,
     check: Option<unsafe extern "C" fn(*mut u8)>,
 ) {
     unsafe {
-        loop {
-            let weak = AtomicPtr::from_ptr(slot).load(Ordering::Relaxed);
-            if weak.is_null() {
-                return;
+        // The oldest nonmoving generation keeps its live weak list. Mark it too.
+        let layout = &*generations;
+        for index in 0..=layout.collected {
+            let generation = layout.generations.add(index as usize * layout.stride);
+            let mut slot = generation.add(layout.live_weaks_offset).cast::<*mut u8>();
+            loop {
+                let weak = AtomicPtr::from_ptr(slot).load(Ordering::Relaxed);
+                if weak.is_null() {
+                    break;
+                }
+                if let Some(check) = check {
+                    check(weak);
+                }
+                mark_root(worker, slot);
+                let moved = slot.read().add(payload_offset).cast::<WeakPayload>();
+                slot = &raw mut (*moved).link;
             }
-            if let Some(check) = check {
-                check(weak);
-            }
-            mark_root(gc_thread, slot);
-            let moved = slot.read().add(payload_offset).cast::<WeakPayload>();
-            slot = &raw mut (*moved).link;
         }
     }
 }
@@ -343,7 +381,7 @@ unsafe fn resurrect_unreachable_threads(
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_resurrect_thread_generations(
-    generations: *const ThreadGenerations,
+    generations: *const WeakGenerations,
     resurrected: *mut *mut u8,
     gc_thread: *mut c_void,
     end: *mut u8,
