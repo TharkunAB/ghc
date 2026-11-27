@@ -4,7 +4,7 @@ use core::{
 };
 
 use super::{
-    hash_insert::{Table, recycle_entry},
+    hash_insert::{Hash, Table, bucket_slot, ghc_rust_hash_str, ghc_rust_hash_word, recycle_entry},
     hash_walk::Entry,
 };
 
@@ -53,28 +53,32 @@ unsafe fn unlink(
 ///
 /// # Safety
 ///
-/// The bucket chain must remain valid and stable during traversal.
+/// The table and selected bucket chain must remain valid and stable during traversal.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_lookup_word(
-    head: *mut Entry,
+    table: *mut Table,
     key: usize,
 ) -> *const c_void {
-    unsafe { lookup(head, key, |left, right| left == right) }
+    unsafe {
+        let head = bucket_slot(table, ghc_rust_hash_word(table, key) as usize);
+        lookup(head.read(), key, |left, right| left == right)
+    }
 }
 
 /// Find the value of the first matching C string.
 ///
 /// # Safety
 ///
-/// The bucket chain must remain stable and every compared key must point to
+/// The table and selected bucket chain must remain stable and every compared key must point to
 /// a valid NUL-terminated string.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_lookup_str(
-    head: *mut Entry,
+    table: *mut Table,
     key: usize,
 ) -> *const c_void {
     unsafe {
-        lookup(head, key, |left, right| {
+        let head = bucket_slot(table, ghc_rust_hash_str(table, key) as usize);
+        lookup(head.read(), key, |left, right| {
             strcmp(left as *const c_char, right as *const c_char) == 0
         })
     }
@@ -84,17 +88,19 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_lookup_str(
 ///
 /// # Safety
 ///
-/// The bucket chain must remain valid during traversal. A nonempty chain
+/// The table and selected bucket chain must remain valid during traversal. A nonempty chain
 /// requires a valid callback, which may inspect the table but must not
 /// modify the chain.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_lookup_custom(
-    head: *mut Entry,
+    table: *mut Table,
     key: usize,
+    hash: Hash,
     compare: Option<Compare>,
 ) -> *const c_void {
     unsafe {
-        lookup(head, key, |left, right| {
+        let head = bucket_slot(table, hash(table, key) as usize);
+        lookup(head.read(), key, |left, right| {
             compare.unwrap_unchecked()(left, right) != 0
         })
     }
@@ -104,31 +110,33 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_lookup_custom(
 ///
 /// # Safety
 ///
-/// The bucket head slot and chain must be valid, with exclusive access.
+/// The table, selected bucket head and chain must be valid, with exclusive access.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_remove_word(
     table: *mut Table,
-    head: *mut *mut Entry,
     key: usize,
     value: *const c_void,
 ) -> *const c_void {
-    unsafe { recycle_entry(table, unlink(head, key, value, |left, right| left == right)) }
+    unsafe {
+        let head = bucket_slot(table, ghc_rust_hash_word(table, key) as usize);
+        recycle_entry(table, unlink(head, key, value, |left, right| left == right))
+    }
 }
 
 /// Remove the first matching C string and optional value.
 ///
 /// # Safety
 ///
-/// The bucket head slot and chain require exclusive access. All compared
+/// The table, selected bucket head and chain require exclusive access. All compared
 /// keys must point to valid NUL-terminated strings.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_remove_str(
     table: *mut Table,
-    head: *mut *mut Entry,
     key: usize,
     value: *const c_void,
 ) -> *const c_void {
     unsafe {
+        let head = bucket_slot(table, ghc_rust_hash_str(table, key) as usize);
         let entry = unlink(head, key, value, |left, right| {
             strcmp(left as *const c_char, right as *const c_char) == 0
         });
@@ -140,17 +148,18 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_remove_str(
 ///
 /// # Safety
 ///
-/// The bucket head and chain must be valid, with exclusive write access.
+/// The table, selected bucket head and chain must be valid, with exclusive write access.
 /// A nonempty chain requires a valid callback that must not modify the chain.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_remove_custom(
     table: *mut Table,
-    head: *mut *mut Entry,
     key: usize,
     value: *const c_void,
+    hash: Hash,
     compare: Option<Compare>,
 ) -> *const c_void {
     unsafe {
+        let head = bucket_slot(table, hash(table, key) as usize);
         let entry = unlink(head, key, value, |left, right| {
             compare.unwrap_unchecked()(left, right) != 0
         });

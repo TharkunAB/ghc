@@ -1,8 +1,10 @@
 use core::ffi::{c_int, c_void};
 
+use super::hash_insert::Table;
+
 pub(super) const SEGMENT_SIZE: usize = 1024;
 
-// Hash.c checks the entry layout and segment size at compile time.
+// The key slot is part of the C visitor API.
 #[repr(C)]
 pub(super) struct Entry {
     pub(super) key: usize,
@@ -10,17 +12,17 @@ pub(super) struct Entry {
     pub(super) next: *mut Entry,
 }
 
-type Directory = *const *const *mut Entry;
-
 /// Visit buckets in descending order and chains from head to tail.
 /// Stop when the visitor returns false.
 ///
 /// # Safety
 ///
-/// The directory must contain the initialized buckets in 0..buckets.
+/// The table must contain valid segments for its initialized buckets.
 /// Their segments and entries must remain allocated during the walk.
 /// The caller provides synchronization. A visitor can update a key in place.
-unsafe fn walk(directory: Directory, buckets: usize, mut visit: impl FnMut(*mut Entry) -> bool) {
+unsafe fn walk(table: *mut Table, mut visit: impl FnMut(*mut Entry) -> bool) {
+    let directory = unsafe { (&raw const (*table).directory).cast::<*mut *mut Entry>() };
+    let buckets = unsafe { (*table).bucket_count as usize };
     for bucket in (0..buckets).rev() {
         let segment = unsafe { directory.add(bucket / SEGMENT_SIZE).read() };
         let mut entry = unsafe { segment.add(bucket % SEGMENT_SIZE).read() };
@@ -37,19 +39,18 @@ unsafe fn walk(directory: Directory, buckets: usize, mut visit: impl FnMut(*mut 
 ///
 /// # Safety
 ///
-/// The directory must satisfy the contract of walk. The output must be writable for
+/// The table must satisfy the contract of walk. The output must be writable for
 /// each copied word and be disjoint from the table.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_keys(
-    directory: Directory,
-    buckets: usize,
+    table: *mut Table,
     output: *mut usize,
     capacity: c_int,
 ) -> c_int {
     let mut copied = 0;
     if capacity > 0 {
         unsafe {
-            walk(directory, buckets, |entry| {
+            walk(table, |entry| {
                 output.add(copied as usize).write((*entry).key);
                 copied += 1;
                 copied < capacity
@@ -63,18 +64,17 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_keys(
 ///
 /// # Safety
 ///
-/// The directory must satisfy the contract of walk. The context must be valid for the
+/// The table must satisfy the contract of walk. The context must be valid for the
 /// supplied visitor.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_map(
-    directory: Directory,
-    buckets: usize,
+    table: *mut Table,
     context: *mut c_void,
     visit: Option<unsafe extern "C" fn(*mut c_void, usize, *const c_void)>,
 ) {
     let Some(visit) = visit else { return };
     unsafe {
-        walk(directory, buckets, |entry| {
+        walk(table, |entry| {
             visit(context, (*entry).key, (*entry).value);
             true
         });
@@ -85,18 +85,17 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_map(
 ///
 /// # Safety
 ///
-/// The directory must satisfy the contract of walk. The context must be valid for the
+/// The table must satisfy the contract of walk. The context must be valid for the
 /// supplied visitor. The key slots must be writable.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_map_keys(
-    directory: Directory,
-    buckets: usize,
+    table: *mut Table,
     context: *mut c_void,
     visit: Option<unsafe extern "C" fn(*mut c_void, *mut usize, *const c_void)>,
 ) {
     let Some(visit) = visit else { return };
     unsafe {
-        walk(directory, buckets, |entry| {
+        walk(table, |entry| {
             visit(context, &raw mut (*entry).key, (*entry).value);
             true
         });
@@ -107,19 +106,16 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_map_keys(
 ///
 /// # Safety
 ///
-/// The directory must satisfy the contract of walk. The context must be valid for the
+/// The table must satisfy the contract of walk. The context must be valid for the
 /// supplied visitor.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_hash_iter(
-    directory: Directory,
-    buckets: usize,
+    table: *mut Table,
     context: *mut c_void,
     visit: Option<unsafe extern "C" fn(*mut c_void, usize, *const c_void) -> bool>,
 ) {
     let Some(visit) = visit else { return };
     unsafe {
-        walk(directory, buckets, |entry| {
-            visit(context, (*entry).key, (*entry).value)
-        });
+        walk(table, |entry| visit(context, (*entry).key, (*entry).value));
     }
 }

@@ -11,7 +11,7 @@ const CHUNK_ENTRIES: usize = 1024 * size_of::<usize>() / size_of::<Entry>();
 const DIRECTORY_SIZE: usize = 1024;
 const LOAD: c_int = 5;
 
-// Hash.c checks this layout and the constants used for expansion.
+// The C API uses only opaque pointers to this table.
 #[repr(C)]
 pub(super) struct Table {
     split: c_int,
@@ -19,8 +19,8 @@ pub(super) struct Table {
     mask1: c_int,
     mask2: c_int,
     key_count: c_int,
-    bucket_count: c_int,
-    directory: [*mut *mut Entry; DIRECTORY_SIZE],
+    pub(super) bucket_count: c_int,
+    pub(super) directory: [*mut *mut Entry; DIRECTORY_SIZE],
     free_list: *mut Entry,
     chunks: *mut Chunk,
 }
@@ -31,11 +31,13 @@ struct Chunk {
     entries: [Entry; CHUNK_ENTRIES],
 }
 
-type Hash = unsafe extern "C" fn(*const Table, usize) -> c_int;
+pub(super) type Hash = unsafe extern "C" fn(*const Table, usize) -> c_int;
 
 unsafe extern "C" {
     fn stgMallocBytes(size: usize, label: *const c_char) -> *mut c_void;
     fn stgFree(ptr: *mut c_void);
+    fn strlen(value: *const c_char) -> usize;
+    fn ghc_c_hash_buffer(buf: *const c_void, len: usize) -> usize;
 }
 
 unsafe fn segment_slot(table: *mut Table, segment: usize) -> *mut *mut *mut Entry {
@@ -147,7 +149,49 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_free(
     }
 }
 
-unsafe fn bucket_slot(table: *mut Table, index: usize) -> *mut *mut Entry {
+// Select the bucket in the larger table only if the smaller bucket has split.
+unsafe fn select_bucket(table: *const Table, hash: usize) -> c_int {
+    unsafe {
+        let bucket = (hash & (*table).mask1 as usize) as c_int;
+        if bucket < (*table).split {
+            (hash & (*table).mask2 as usize) as c_int
+        } else {
+            bucket
+        }
+    }
+}
+
+/// The table must be initialized and stable during bucket selection.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_hash_word(table: *const Table, key: usize) -> c_int {
+    unsafe { select_bucket(table, key / size_of::<usize>()) }
+}
+
+/// The table must be stable and the buffer must contain len accessible bytes.
+/// The native primitive accepts a null buffer when len is zero.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_hash_buffer(
+    table: *const Table,
+    buf: *const c_void,
+    len: usize,
+) -> c_int {
+    unsafe { select_bucket(table, ghc_c_hash_buffer(buf, len)) }
+}
+
+/// The table must be stable and the key must point to a C string.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_hash_str(table: *const Table, key: usize) -> c_int {
+    let string = key as *const c_char;
+    unsafe { ghc_rust_hash_buffer(table, string.cast(), strlen(string)) }
+}
+
+/// The table must be initialized and readable.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_hash_count(table: *const Table) -> c_int {
+    unsafe { (*table).key_count }
+}
+
+pub(super) unsafe fn bucket_slot(table: *mut Table, index: usize) -> *mut *mut Entry {
     unsafe {
         segment_slot(table, index / SEGMENT_SIZE)
             .read()
@@ -239,14 +283,23 @@ pub(super) unsafe extern "C" fn ghc_rust_hash_insert_word(
 ) {
     unsafe {
         insert(table, key, value, |table, key| {
-            let word = key / size_of::<usize>();
-            let bucket = (word & (*table).mask1 as usize) as c_int;
-            if bucket < (*table).split {
-                (word & (*table).mask2 as usize) as c_int
-            } else {
-                bucket
-            }
-        });
+            ghc_rust_hash_word(table, key)
+        })
+    }
+}
+
+/// Insert a C string key. All affected keys must be valid C strings.
+/// The caller must exclude concurrent and reentrant mutation.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_hash_insert_str(
+    table: *mut Table,
+    key: usize,
+    value: *const c_void,
+) {
+    unsafe {
+        insert(table, key, value, |table, key| {
+            ghc_rust_hash_str(table, key)
+        })
     }
 }
 
