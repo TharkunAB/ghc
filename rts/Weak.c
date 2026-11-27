@@ -47,8 +47,8 @@ RTS_PRIVATE void ghc_rust_run_all_c_finalizers(StgWeak *list, bool *running,
 // List of dead weak pointers collected by the last GC
 static StgWeak *finalizer_list = NULL;
 
-// Count of the above list.
-static uint32_t n_finalizers = 0;
+// Use the same count width as the heap array that holds the finalizers.
+static StgWord n_finalizers = 0;
 
 void
 runCFinalizers(StgCFinalizerList *list)
@@ -123,7 +123,7 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
 {
     StgWeak *w;
     StgTSO *t;
-    uint32_t n, i;
+    StgWord n, i;
 
     // n_finalizers is not necessarily zero under non-moving collection
     // because non-moving collector does not wait for the list to be consumed
@@ -177,7 +177,7 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     // No Haskell finalizers to run?
     if (n == 0) return;
 
-    debugTrace(DEBUG_weak, "weak: batching %d finalizers", n);
+    debugTrace(DEBUG_weak, "weak: batching %" FMT_Word " finalizers", n);
 
     StgMutArrPtrs *arr = allocateMutArrPtrs(cap, n, NULL, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(arr == NULL)) exitHeapOverflow();
@@ -247,7 +247,7 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
 // runSomeFinalizers(). This is so that we only tie up the capability
 // for a short time, and respond quickly if new work becomes
 // available.
-static const int32_t finalizer_chunk = 100;
+static const StgWord finalizer_chunk = 100;
 
 // non-zero if a thread is already in runSomeFinalizers(). This
 // protects the globals finalizer_list and n_finalizers.
@@ -268,7 +268,7 @@ bool runSomeFinalizers(bool all)
         return false;
     }
 
-    debugTrace(DEBUG_sched, "running C finalizers, %d remaining", n_finalizers);
+    debugTrace(DEBUG_sched, "running C finalizers, %" FMT_Word " remaining", n_finalizers);
 
     Task *task = myTask();
     if (task != NULL) {
@@ -276,7 +276,7 @@ bool runSomeFinalizers(bool all)
     }
 
     StgWeak *w = finalizer_list;
-    int32_t count = 0;
+    StgWord count = 0;
     while (w != NULL) {
         runCFinalizers((StgCFinalizerList *)w->cfinalizers);
         w = w->link;
@@ -291,7 +291,7 @@ bool runSomeFinalizers(bool all)
         task->running_finalizers = false;
     }
 
-    debugTrace(DEBUG_sched, "ran %d C finalizers", count);
+    debugTrace(DEBUG_sched, "ran %" FMT_Word " C finalizers", count);
     bool ret = n_finalizers != 0;
     RELEASE_STORE(&finalizer_lock, 0);
     return ret;
