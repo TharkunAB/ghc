@@ -33,6 +33,8 @@
 #define USE_RUST_WEAK_GC
 RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
     size_t live_offset, size_t old_offset, uint32_t collected, uint32_t oldest, bool nonmoving);
+RTS_PRIVATE bool ghc_rust_traverse_weaks(void *context,
+    bool (*run_pass)(void *context, uint8_t pass));
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -80,8 +82,10 @@ RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
 /* Which stage of processing various kinds of weak pointer are we at?
  * (see traverseWeakPtrList() below for discussion).
  */
+#if !defined(USE_RUST_WEAK_GC)
 typedef enum { WeakPtrs, WeakThreads, WeakDone } WeakStage;
 static WeakStage weak_stage;
+#endif
 
 static void    collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list);
 static bool tidyWeakList (generation *gen);
@@ -138,9 +142,43 @@ initWeakForGC(void)
         gen->weak_ptr_list = NULL;
     }
 
-#endif
     weak_stage = WeakThreads;
+#endif
 }
+
+#if defined(USE_RUST_WEAK_GC)
+// These pass identifiers cross the ABI. See WeakPass in rust/mark_weak.rs.
+enum { TidyThreads, TidyWeakKeys, ResurrectThreads, CollectDeadWeaks };
+
+typedef struct {
+    gc_thread *worker;
+    StgWeak **dead;
+    StgTSO **resurrected;
+} WeakPassContext;
+
+static bool runWeakPass(void *user, uint8_t pass)
+{
+    WeakPassContext *ctx = user;
+    bool changed = false;
+    // The Rust caller uses the platform ABI. See mark_root in GC.c.
+#if defined(THREADED_RTS)
+    gc_thread *saved = gct;
+#endif
+    SET_GCT(ctx->worker);
+    for (uint32_t i = 0; i <= N; i++) {
+        generation *gen = &generations[i];
+        switch (pass) {
+        case TidyThreads: tidyThreadList(gen); break;
+        case TidyWeakKeys: changed |= tidyWeakList(gen); break;
+        case ResurrectThreads: changed |= resurrectUnreachableThreads(gen, ctx->resurrected); break;
+        case CollectDeadWeaks: collectDeadWeakPtrs(gen, ctx->dead); break;
+        default: barf("runWeakPass: unknown pass %u", (unsigned)pass);
+        }
+    }
+    SET_GCT(saved);
+    return changed;
+}
+#endif
 
 /*
  * Walk the weak pointer lists after having finished a round of scavenging,
@@ -153,6 +191,10 @@ initWeakForGC(void)
 bool
 traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
 {
+#if defined(USE_RUST_WEAK_GC)
+  WeakPassContext ctx = { gct, dead_weak_ptr_list, resurrected_threads };
+  return ghc_rust_traverse_weaks(&ctx, runWeakPass);
+#else
   bool flag = false;
 
   switch (weak_stage) {
@@ -234,6 +276,7 @@ traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
       barf("traverseWeakPtrList");
       return true;
   }
+#endif
 }
 
 /*

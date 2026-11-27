@@ -7,6 +7,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_mark_weak_list",
     ".hidden ghc_rust_collect_fresh_weaks",
     ".hidden ghc_rust_init_weak_generations",
+    ".hidden ghc_rust_traverse_weaks",
 );
 
 unsafe extern "C" {
@@ -27,6 +28,55 @@ struct WeakPayload {
 struct WeakList {
     head: *mut u8,
     tail: *mut u8,
+}
+
+#[derive(Clone, Copy)]
+enum WeakStage {
+    Threads,
+    Pointers,
+    Done,
+}
+
+// Only the main GC thread reads or changes the stage during a collection.
+static mut WEAK_STAGE: WeakStage = WeakStage::Pointers;
+
+// The native pass installs the main GC worker before it examines the heap.
+#[repr(u8)]
+enum WeakPass {
+    TidyThreads = 0,
+    TidyWeakKeys = 1,
+    ResurrectThreads = 2,
+    CollectDeadWeaks = 3,
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_traverse_weaks(
+    context: *mut c_void,
+    run_pass: unsafe extern "C" fn(*mut c_void, WeakPass) -> bool,
+) -> bool {
+    unsafe {
+        match WEAK_STAGE {
+            WeakStage::Done => return false,
+            WeakStage::Threads => {
+                run_pass(context, WeakPass::TidyThreads);
+                if run_pass(context, WeakPass::TidyWeakKeys) {
+                    return true;
+                }
+                let resurrected = run_pass(context, WeakPass::ResurrectThreads);
+                WEAK_STAGE = WeakStage::Pointers;
+                if resurrected {
+                    return true;
+                }
+            }
+            WeakStage::Pointers => {}
+        }
+        if !run_pass(context, WeakPass::TidyWeakKeys) {
+            run_pass(context, WeakPass::CollectDeadWeaks);
+            WEAK_STAGE = WeakStage::Done;
+        }
+        // The collector must scavenge the roots reached by the last pass.
+        true
+    }
 }
 
 // See Note [Weak pointer processing and the non-moving GC] in sm/MarkWeak.c.
@@ -51,6 +101,7 @@ unsafe extern "C" fn ghc_rust_init_weak_generations(
             old.write(live.read());
             live.write(null_mut());
         }
+        WEAK_STAGE = WeakStage::Threads;
     }
 }
 
