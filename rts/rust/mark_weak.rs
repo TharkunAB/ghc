@@ -9,6 +9,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_init_weak_generations",
     ".hidden ghc_rust_traverse_weaks",
     ".hidden ghc_rust_resurrect_unreachable_threads",
+    ".hidden ghc_rust_scavenge_live_weak",
 );
 
 unsafe extern "C" {
@@ -18,11 +19,27 @@ unsafe extern "C" {
 
 #[repr(C)]
 struct WeakPayload {
-    cfinalizers: *const u8,
+    cfinalizers: *mut u8,
     key: *mut u8,
     value: *mut u8,
     finalizer: *mut u8,
     link: *mut u8,
+}
+
+// The caller can be the main collector or a worker scavenging a mutable list.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_scavenge_live_weak(
+    weak: *mut u8,
+    worker: *mut c_void,
+    payload_offset: usize,
+) {
+    unsafe {
+        let payload = weak.add(payload_offset).cast::<WeakPayload>();
+        mark_root(worker, &raw mut (*payload).value);
+        mark_root(worker, &raw mut (*payload).key);
+        mark_root(worker, &raw mut (*payload).finalizer);
+        mark_root(worker, &raw mut (*payload).cfinalizers);
+    }
 }
 
 #[repr(C)]
@@ -209,7 +226,7 @@ unsafe extern "C" fn ghc_rust_collect_dead_weaks(
     unsafe {
         while !weak.is_null() {
             let payload = weak.add(payload_offset).cast::<WeakPayload>();
-            if (*payload).cfinalizers != &raw const stg_NO_FINALIZER_closure {
+            if (*payload).cfinalizers.cast_const() != &raw const stg_NO_FINALIZER_closure {
                 mark_root(gc_thread, &raw mut (*payload).value);
             }
             mark_root(gc_thread, &raw mut (*payload).finalizer);

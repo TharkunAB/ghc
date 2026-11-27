@@ -312,6 +312,8 @@ RTS_PRIVATE bool ghc_rust_resurrect_unreachable_threads(StgTSO **old,
     StgWord16 killed, StgWord16 complete);
 RTS_PRIVATE void ghc_rust_mark_weak_list(StgWeak **head, void *gc_thread_ptr,
     size_t payload_offset, void (*check)(StgWeak *));
+RTS_PRIVATE void ghc_rust_scavenge_live_weak(StgWeak *w, void *gc_thread_ptr,
+    size_t payload_offset);
 GHC_STATIC_ASSERT(offsetof(Capability, weak_ptr_list_tl) ==
                   offsetof(Capability, weak_ptr_list_hd) + sizeof(StgWeak *),
                   "Rust capability weak list endpoints");
@@ -658,8 +660,12 @@ markWeakPtrList ( void )
 void
 scavengeLiveWeak(StgWeak *w)
 {
+#if defined(USE_RUST_WEAK_GC)
+    ghc_rust_scavenge_live_weak(w, gct, offsetof(StgWeak, cfinalizers));
+#else
     evacuate(&w->value);
     evacuate(&w->key);
     evacuate(&w->finalizer);
     evacuate(&w->cfinalizers);
+#endif
 }

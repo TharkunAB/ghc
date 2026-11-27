@@ -1967,11 +1967,9 @@ init_gc_thread (gc_thread *t)
 void
 mark_root(void *user USED_IF_THREADS, StgClosure **root)
 {
-    // we stole a register for gct, but this function is called from
-    // *outside* the GC where the register variable is not in effect,
-    // so we need to save and restore it here.  NB. only call
-    // mark_root() from the main GC thread, otherwise gct will be
-    // incorrect.
+    // The caller uses the platform ABI and can use the GC register for
+    // another value. The main GC thread and each parallel worker pass
+    // their own gc_thread as user. Install it for the call to evacuate.
 #if defined(THREADED_RTS)
     gc_thread *saved_gct;
     saved_gct = gct;
