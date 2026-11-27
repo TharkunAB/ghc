@@ -16,12 +16,6 @@
 #include "AllocArray.h"
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-RTS_PRIVATE void ghc_rust_heap_pap_small(StgClosure **ptrs, StgWord *nptrs,
-                                          StgClosure *const *payload,
-                                          StgWord size, StgWord bitmap);
-RTS_PRIVATE void ghc_rust_heap_pap_large(StgClosure **ptrs, StgWord *nptrs,
-                                          StgClosure *const *payload,
-                                          uint32_t size, const StgWord *bitmap);
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t) &&
                   sizeof(StgClosure *) == sizeof(StgWord),
                   "Rust PAP bitmap uses native stack words");
@@ -34,14 +28,12 @@ StgWord heap_view_closureSize(StgClosure *closure) {
     return closure_sizeW(closure);
 }
 
+#if !defined(USE_RUST_RTS) || defined(TSAN_ENABLED)
 static void
 heap_view_closure_ptrs_in_large_bitmap(StgClosure *ptrs[], StgWord *nptrs
                         , StgClosure **p, StgLargeBitmap *large_bitmap
                         , uint32_t size )
 {
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-    return ghc_rust_heap_pap_large(ptrs, nptrs, p, size, large_bitmap->bitmap);
-#else
     uint32_t i, j, b;
     StgWord bitmap;
 
@@ -58,9 +50,10 @@ heap_view_closure_ptrs_in_large_bitmap(StgClosure *ptrs[], StgWord *nptrs
             bitmap = bitmap >> 1;
         }
     }
-#endif
 }
+#endif
 
+#if !defined(USE_RUST_RTS) || defined(TSAN_ENABLED)
 void heap_view_closure_ptrs_in_pap_payload(StgClosure *ptrs[], StgWord *nptrs
                       , StgClosure *fun, StgClosure **payload, StgWord size) {
     StgWord bitmap;
@@ -85,9 +78,6 @@ void heap_view_closure_ptrs_in_pap_payload(StgClosure *ptrs[], StgWord *nptrs
     default:
         bitmap = BITMAP_BITS(stg_arg_bitmaps[fun_info->f.fun_type]);
     small_bitmap:
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-        return ghc_rust_heap_pap_small(ptrs, nptrs, p, size, bitmap);
-#else
         while (size > 0) {
             if ((bitmap & 1) == 0) {
                 ptrs[(*nptrs)++] = *p;
@@ -96,10 +86,10 @@ void heap_view_closure_ptrs_in_pap_payload(StgClosure *ptrs[], StgWord *nptrs
             p++;
             size--;
         }
-#endif
         break;
     }
 }
+#endif
 
 /* Use the RTS diagnostics for unsupported tags and failed TSO assertions. */
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)

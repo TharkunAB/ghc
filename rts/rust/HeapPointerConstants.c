@@ -4,6 +4,26 @@
 /* See Note [Closure size build constants] in ClosureSizeConstants.c. */
 FIELD(INFO_TYPE, StgInfoTable, type, uint32_t);
 FIELD(INFO_PTRS, StgInfoTable, layout.payload.ptrs, uint32_t);
+FIELD(CLOSURE_INFO, StgClosure, header.info, const StgInfoTable *);
+FIELD(FUN_TYPE, StgFunInfoTable, f.fun_type, uint32_t);
+GHC_STATIC_ASSERT(sizeof(StgHalfWord) == sizeof(uint32_t),
+                  "Rust reads a 32-bit function type");
+FIELD(FUN_BITMAP, StgFunInfoTable, f.b.bitmap, StgWord);
+FIELD(BCO_BITMAP, StgBCO, bitmap[0], StgWord);
+FIELD(LARGE_BITMAP_BITS, StgLargeBitmap, bitmap[0], StgWord);
+OFFSET(BITMAP_SHIFT, BITMAP_BITS_SHIFT);
+OFFSET(CLOSURE_TAG_MASK, TAG_MASK);
+OFFSET(ARG_GEN_KIND, ARG_GEN);
+OFFSET(ARG_GEN_BIG_KIND, ARG_GEN_BIG);
+OFFSET(ARG_BCO_KIND, ARG_BCO);
+OFFSET(ARG_BITMAP_TABLE_LEN, ARG_PPPPPPPP + 1);
+#if defined(TABLES_NEXT_TO_CODE)
+OFFSET(FUN_INFO_BIAS, sizeof(StgFunInfoTable));
+GHC_STATIC_ASSERT(sizeof(((StgFunInfoTable *)0)->f.b.bitmap_offset) == sizeof(int32_t),
+                  "Rust reads a signed 32-bit bitmap offset");
+#else
+OFFSET(FUN_INFO_BIAS, 0);
+#endif
 FIELD(PAYLOAD, StgClosure, payload[0], StgClosure *);
 FIELD(THUNK_PAYLOAD, StgThunk, payload[0], StgClosure *);
 FIELD(SELECTEE, StgSelector, selectee, StgClosure *);

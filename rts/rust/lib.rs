@@ -19,7 +19,6 @@ mod gc_budget;
 mod hash_chain;
 mod hash_insert;
 mod hash_walk;
-mod pap_bitmap;
 mod pool;
 mod incall;
 mod liveness;
