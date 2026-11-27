@@ -1503,6 +1503,23 @@ classifyTypeCasePattern pat = do
       (con', bound) <- constructorPattern con
       (field', field_bound) <- argumentPattern field
       pure (L loc (HsAppTy ann con' field'), bound ++ field_bound)
+    constructorPattern (L loc (HsAppKindTy ann con ki)) = do
+      (con', bound) <- constructorPattern con
+      pure (L loc (HsAppKindTy ann con' ki), bound)
+    constructorPattern (L loc (HsOpTy ann lhs tyop rhs)) = do
+      (con', b_con) <- constructorPattern tyop
+      (lhs', b_lhs) <- argumentPattern lhs
+      (rhs', b_rhs) <- argumentPattern rhs
+      pure (L loc (HsOpTy ann lhs' con' rhs'), b_con ++ b_lhs ++ b_rhs)
+    constructorPattern (L loc (HsExplicitListTy ann ip tys)) = do
+      pairs <- traverse argumentPattern tys
+      let (tys', bss) = unzip pairs
+      pure (L loc (HsExplicitListTy ann ip tys'), concat bss)
+    constructorPattern (L loc (HsExplicitTupleTy ann ip tys))
+      | length tys /= 1 = do
+          pairs <- traverse argumentPattern tys
+          let (tys', bss) = unzip pairs
+          pure (L loc (HsExplicitTupleTy ann ip tys'), concat bss)
     constructorPattern (L loc pat@(HsTyVar _ promotion name))
       | isRdrTc (unLoc name) || isRdrDataCon (unLoc name)
       = Just (L loc (if isPromoted promotion then pat else XHsType (HsTypeCaseHead name)), [])
@@ -2660,7 +2677,7 @@ rnRetainedHsRecordFields result ctxt fls
   | all (plain_field . cdrf_spec . unLoc) rest
   , plain_field first_field
   , let witness = mkRdrUnqual (setOccNameSpace tvName (rdrNameOcc (unLoc name)))
-  , all (uses_witness witness) rest
+  , any (uses_witness witness) rest
   = do { enabled <- xoptM LangExt.DependentTypes
        ; field_selectors <- xoptM LangExt.FieldSelectors
        ; strict <- xoptM LangExt.StrictData

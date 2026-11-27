@@ -20,7 +20,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (runExceptT, throwE)
 import GHC.Builtin.KnownKeys (eqClassKey)
 import GHC.Builtin.WiredIn.Types
-  ( boolTy, consDataCon, falseDataCon, liftedTypeKind, manyDataConTy
+  ( anyTypeOfKind, boolTy, consDataCon, falseDataCon, liftedTypeKind, manyDataConTy
   , mkListTy, nilDataCon, trueDataCon, unmatchableDataConTy )
 import GHC.Core.Class (Class, classAllSelIds, classMethods, classTyCon)
 import GHC.Core (Alt(..), AltCon(..), CoreExpr, Expr(..), maybeUnfoldingTemplate, mkApps, mkLams)
@@ -35,11 +35,12 @@ import GHC.Core.TyCon
   ( TyCon, closedFamilyTyConCoAxiom_maybe, isBoxedDataTyCon, isNewTyCon, isPromotedDataCon_maybe
   , newTyConCo_maybe, tyConArity, tyConDataCons, tyConName )
 import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe, isUnaryClass)
+import GHC.Core.TyCo.FVs (tyCoVarsOfTypeList)
 import GHC.Core.TyCo.Rep (Scaled(..), Type(AppTy, TermAppTy, TermVarTy, TyVarTy))
 import GHC.Core.Type (Kind, PredType, Type, FunTyFlag(FTF_T_T), getTyVar_maybe, isLiftedDataOrNewTyCon, isLiftedTypeKind, isManyTy,
                       isNativeOpaqueValueId, mkTyConApp, mkTyVarTy, mkVisFunTyManyU,
                       splitForAllForAllTyBinders, splitFunTy_maybe, splitTyConApp_maybe,
-                      substTyWith, typeKind)
+                      substTyWith, tcIsLiftedTypeKind, typeKind)
 import GHC.Core.Utils (exprType, mkCast)
 import GHC.Core.TyCo.Subst (lookupTyVar, substTheta, substTy, zipTvSubst)
 import GHC.Core.Unify (tcMatchTys)
@@ -340,7 +341,7 @@ openTypeFunctionSignature local_families function
     binder_tys = map mkTyVarTy tvs
     bound ty = any (tcEqType ty) binder_tys
     domainKind ty
-      | bound ty = Just ty
+      | bound ty || tcIsLiftedTypeKind ty = Just ty
       | Just (FTF_T_T, ma, mult, a, b) <- splitFunTy_maybe ty
       , ma `tcEqType` unmatchableDataConTy
       , isManyTy mult
@@ -349,7 +350,11 @@ openTypeFunctionSignature local_families function
       , isLiftedDataOrNewTyCon con
       , tyConArity con == length parameters
       , all isVanillaDataCon (tyConDataCons con)
-      = mkTyConApp con <$> traverse domainKind parameters
+      = mkTyConApp con <$> traverse paramKind parameters
+      | otherwise = Nothing
+    paramKind p
+      | Just d <- domainKind p = Just d
+      | isTyFamFree p && all (`elem` tvs) (tyCoVarsOfTypeList p) = Just p
       | otherwise = Nothing
     termKinds ty
       | Just (FTF_T_T, matchability, multiplicity, domain, result) <- splitFunTy_maybe ty
@@ -360,12 +365,18 @@ openTypeFunctionSignature local_families function
           pure (input : inputs, output)
       | otherwise = ([],) <$> domainKind ty
 
--- | Instantiate the type binders at 'Type' and recover the checked input and result kinds.
+-- | Instantiate the type binders at 'Type' (or 'Any' at their instantiated kind) and recover the checked input and result kinds.
 instantiateOpenTypeFunction :: Bool -> Id -> Maybe (CoreExpr, [Kind], Kind)
 instantiateOpenTypeFunction local_families function = do
   (tvs, domains, result, wrap) <- openTypeFunctionSignature local_families function
-  let inst = substTyWith tvs (liftedTypeKind <$ tvs)
-      applied = foldl' (\expr _ -> App expr (Type liftedTypeKind)) (Var function) tvs
+  let chooseInst acc tv =
+        let k = substTyWith (map fst acc) (map snd acc) (tyVarKind tv)
+            t = if tcIsLiftedTypeKind k then liftedTypeKind else anyTypeOfKind k
+        in acc ++ [(tv, t)]
+      inst_pairs = foldl' chooseInst [] tvs
+      inst_tys   = map snd inst_pairs
+      inst       = substTyWith tvs inst_tys
+      applied    = foldl' (\expr t -> App expr (Type t)) (Var function) inst_tys
   pure (wrap applied, map inst domains, inst result)
 
 -- | Instantiate a selected binary method using the kinds of both operands.
@@ -430,10 +441,10 @@ instantiateOpenDictMethod fun ty_args doms result_kind
             _ -> pure Nothing
       | otherwise = pure Nothing
 
--- | An ordinary erased parameter of lifted kind.
+-- | An ordinary erased parameter of lifted or small kind.
 liftedUniversal :: (Type, VarBndr TyVar ForAllTyFlag) -> Bool
 liftedUniversal (_, Bndr v (Invisible _)) =
-    isTyVar v && tyVarKind v `tcEqType` liftedTypeKind
+    isTyVar v && (tyVarKind v `tcEqType` liftedTypeKind || tcIsLiftedTypeKind (typeKind (tyVarKind v)))
 liftedUniversal _ = False
 
 {- Note [Observing an imported method worker]

@@ -4297,7 +4297,7 @@ tcTryOpenTypeCall mode name fun (tvs, domains, result_tpl, wrap) args = do
   result_kind <- liftZonkM (zonkTcType res_k2)
   operands    <- liftZonkM (zonkTcTypes operands2)
   if anyVarSet isMetaTyVar (tyCoVarsOfTypes (result_kind : ty_args))
-     || not (all (tcIsLiftedTypeKind . typeKind) ty_args)
+     || not (all (\t -> tcIsLiftedTypeKind (typeKind t) || tcIsLiftedTypeKind (typeKind (typeKind t))) ty_args)
     then pure (Left InvalidInput)
     else do
       let applied = wrap (foldl' Core.App (Core.Var fun) (map Core.Type ty_args))
@@ -8191,11 +8191,21 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
 sourceCasePatternRn :: LHsType GhcRn -> TypeCasePattern
 sourceCasePatternRn original = go [] original
   where
+    sp = getLocA original
     go args (L _ (HsParTy _ pat))      = go args pat
     go args (L _ (HsAppTy _ con fld))  = go (fld : args) con
+    go args (L _ (HsAppKindTy _ con _)) = go args con
+    go []   (L _ (HsOpTy _ lhs tyop rhs)) = go [lhs, rhs] tyop
+    go []   (L _ (HsExplicitListTy _ _ tys)) =
+      foldr (\hd acc -> CasePatternConstructor sp (dataConName consDataCon) [sourceCasePatternRn hd, acc])
+            (CasePatternConstructor sp (dataConName nilDataCon) [])
+            tys
+    go []   (L _ (HsExplicitTupleTy _ _ tys))
+      | length tys /= 1 =
+          CasePatternConstructor sp (dataConName (tupleDataCon Boxed (length tys))) (map sourceCasePatternRn tys)
     go args (L _ (HsTyVar _ _ (L _ (WithUserRdr _ nm))))
       | not (isTvOcc (nameOccName nm)) =
-          CasePatternConstructor (getLocA original) nm (map sourceCasePatternRn args)
+          CasePatternConstructor sp nm (map sourceCasePatternRn args)
     go _ _ = CasePatternField
 
 data CheckedSynthPattern

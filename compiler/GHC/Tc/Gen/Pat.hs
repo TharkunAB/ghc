@@ -2037,7 +2037,7 @@ isRetainedVarPat _ = False
 -- See Note [Wildcard retained binders] in GHC.Tc.Gen.Match.
 bindRetainedWildcard :: Name -> LPat GhcRn -> LPat GhcRn
 bindRetainedWildcard name (L loc WildPat{})
-  = L loc (VarPat noExtField (noLocA name))
+  = L loc (VarPat noExtField (L (noAnnSrcSpan generatedSrcSpan) name))
 bindRetainedWildcard name (L loc (ParPat x p))
   = L loc (ParPat x (bindRetainedWildcard name p))
 bindRetainedWildcard name (L loc (BangPat x p))

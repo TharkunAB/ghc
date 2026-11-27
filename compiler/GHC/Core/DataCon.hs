@@ -1656,12 +1656,15 @@ promotedRetainedFields con
   = Just (witness, payloads)
   | otherwise = Nothing
 
--- | Check that the record has a closed first witness and promoted payloads.
+-- | Check that the record has a closed or quantified first witness and promoted payloads.
 -- See Note [Retained constructor field telescopes].
 validRetainedRecordFields :: [Maybe Id] -> [Scaled Type] -> Bool
 validRetainedRecordFields (Just witness : binders) (_ : fields@(_ : _)) =
-  all isNothing binders && isNativeClosedIndexType (varType witness) &&
-  all (isJust . promotedRetainedPayload [] witness) fields
+  let fam_tvs = [tv | Scaled _ (AppTy (TyVarTy tv) _) <- fields]
+  in all isNothing binders
+     && (isNativeClosedIndexType (varType witness) || isJust (getTyVar_maybe (varType witness)))
+     && any (anyFreeVarsOfType (== witness) . scaledThing) fields
+     && all (isJust . promotedRetainedPayload fam_tvs witness) fields
 validRetainedRecordFields _ _ = False
 
 -- | Abstract the final witness argument of one checked payload type.
@@ -1684,6 +1687,8 @@ promotedRetainedPayload univs witness (Scaled mult body)
       , let prefix = reverse reverse_prefix
       , all (not . anyFreeVarsOfType isId) prefix
       = Just (\index -> mkTyConApp head_tc (prefix ++ [index]))
+      | not (anyFreeVarsOfType isId ty)
+      = Just (const ty)
       | otherwise = Nothing
 
 freshNames :: [Name] -> [Name]

@@ -87,8 +87,8 @@ import GHC.Tc.Gen.SourceClosure
   ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
   , pruneUnusedIndexedLookups, sourceEarlyClosureTables )
 import GHC.Tc.Gen.SourceTable (sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
-                               isStructuralSourceTable, isNominalStructuralSource, isLargeElimTable, isLargeElimResultKind, rebuildSourceFamilyWith,
-                               sourceTableFamilyUse,
+                               isStructuralSourceTable, isNominalStructuralSource, isSimpleNominalTable, isLargeElimTable, isLargeElimResultKind, rebuildSourceFamilyWith,
+                               isSourceFilterGuard, sourceTableCallees, sourceTableFamilyUse,
                                sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
                                hasSourceMethodRule, hasSourceMethodRuleAt, sourceLiteralWorkers, checkSourceMethodUses,
                                checkOptionalSourceUses, checkAndInstallSourceProofs,
@@ -719,32 +719,39 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
       ; write_equations <- goptM Opt_WriteSourceEquations
       ; setGblEnv tcg_env' $ do
           let binds = tcg_binds tcg_env'
+          local_used_tables <- scs_table_uses <$> readTcRef (tcg_source_check tcg_env')
+          let pre_installed = mkNameSet
+                [ idName v
+                | v <- typeEnvIds (tcg_type_env tcg_env')
+                , Just tbl <- [sourceTableId_maybe v]
+                , tyConName tbl `elemNameSet` local_used_tables ]
           tables <- if tables_enabled || write_equations
                     then sourceTableTyCons False True binds else pure []
-          -- Keep complete source equations ahead of partial final-Core
-          -- equations for the same owner.
+          -- Keep complete single-column source equations and already-staged
+          -- local tables ahead of final-Core equations for the same owner.
           let is_final_table owner = case idDetails owner of
                 SourceTableId _ _ FinalCoreSourceTable -> True
                 _ -> False
+              keep_ahead (owner, table) =
+                idName owner `elemNameSet` pre_installed ||
+                isSimpleNominalTable owner table
               complete_owners = mkNameSet
                 [ idName owner
-                | (owner, _) <- tables
-                , not (is_final_table owner) ]
+                | pair@(owner, _) <- tables
+                , not (is_final_table owner)
+                , keep_ahead pair ]
               nominal_owners = if tables_enabled
-                then mkNameSet (map (idName . fst) tables)
+                then mkNameSet [ idName owner | pair@(owner, _) <- tables, keep_ahead pair ]
                 else emptyNameSet
           (cases0, fields) <- sourceCaseTables nominal_owners binds
           -- Keep the existing ordinary certificates when both checkers
           -- accept the same owner. Enumeration cases retain executable origin,
           -- while complete source equations stay ahead of final-Core ones.
-          let cases
-                | tables_enabled = cases0
-                | otherwise = filter (\(owner, _) ->
-                    not (is_final_table owner && idName owner `elemNameSet` complete_owners)) cases0
+          let cases = filter (\(owner, _) ->
+                not (is_final_table owner && idName owner `elemNameSet` complete_owners)) cases0
               case_owners = mkNameSet (map (idName . fst) cases)
-              new_tables
-                | tables_enabled = tables
-                | otherwise = filter (\(owner, _) -> not (idName owner `elemNameSet` case_owners)) tables
+              new_tables = filter (\(owner, _) -> not (idName owner `elemNameSet` case_owners)) tables
+              all_table_owners = mkNameSet (map (idName . fst) new_tables) `unionNameSet` case_owners
           with_fields0 <- if null fields then getGblEnv else fst <$> addTyConsToGblEnv fields
           with_fields <- pruneUnusedIndexedLookups with_fields0
           let installed = typeEnvIds (tcg_type_env with_fields)
@@ -753,7 +760,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
               early_nominal = early_closures ++
                 [(fun, table) | fun <- installed
                               , not (idName fun `elemNameSet` early_closure_owners)
-                              , not (idName fun `elemNameSet` nominal_owners)
+                              , not (idName fun `elemNameSet` all_table_owners)
                               , SourceTableId _ table NominalSourceTable <- [idDetails fun]
                               , isNominalStructuralSource fun
                                 || isLargeElimTable table
@@ -883,7 +890,17 @@ installSourceTables tables = do
             [ tyConName tbl
             | ((_, tbl, _, _), fn') <- zip prepared ids
             , isJust (sourceTableId_maybe fn') ]
-          accepted_new_tables = [tc | tc <- new_tables, tyConName tc `elemNameSet` accepted]
+          existing_new_set = mkNameSet (map tyConName new_tables)
+          accepted_guards =
+            [ g
+            | ((_, tbl, _, _), fn') <- zip prepared ids
+            , isJust (sourceTableId_maybe fn')
+            , g <- fromMaybe [] (sourceTableCallees tbl)
+            , isSourceFilterGuard g
+            , nameIsLocalOrFrom (tcg_semantic_mod env) (tyConName g)
+            , not (tyConName g `elemNameSet` existing_new_set)
+            , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName g)) ]
+          accepted_new_tables = [tc | tc <- new_tables, tyConName tc `elemNameSet` accepted] ++ accepted_guards
       tcExtendGlobalValEnv ids $
         if null accepted_new_tables then getGblEnv else fst <$> addTyConsToGblEnv accepted_new_tables
 
@@ -923,8 +940,12 @@ sourceTablesWithMappers structural names evidence env = do
     let ordinary_owners = mkNameSet (map (idName . fst) ordinary)
         ordinary_ids = [setIdDetails fn (SourceTableId (idName fn) tbl NominalSourceTable)
                        | (fn, tbl) <- ordinary]
+        ord_guards = [g | (_, tc) <- ordinary
+                        , g <- fromMaybe [] (sourceTableCallees tc)
+                        , isSourceFilterGuard g
+                        , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName g))]
         new_ord_tcs = [tc | (_, tc) <- ordinary
-                          , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))]
+                          , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))] ++ ord_guards
         in_group = [owner | bind <- tcg_binds env
                           , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind)
                           , idName owner `elemNameSet` names
@@ -966,7 +987,7 @@ sourceTablesWithMappers structural names evidence env = do
                   (definitions, _) <- localOpenDefinitions demands
                                         (tcg_ev_binds env `unionBags` evidence) (tcg_binds env)
                   sourceEarlyClosureTables closure_cands definitions
-            pure (ordinary ++ catMaybes mappers ++ closures, companions, helpers)
+            pure (ordinary ++ catMaybes mappers ++ closures, ord_guards ++ companions, helpers)
 
 installEarlyTables :: ([(Id, TyCon)], [TyCon], [Id]) -> TcM TcGblEnv
 installEarlyTables (tables, companions, helpers) = do
@@ -2479,6 +2500,24 @@ independentCore planned_types producers = go emptyNameSet emptyNameSet
       , valid_type tyvars rhs
       , normalize lhs `eqType` normalize rhs =
           go tyvars locals body
+    go tyvars locals (Core.Case scrut binder case_ty alts@(_ : _))
+      | term_binder tyvars binder
+      , exprType scrut `eqType` varType binder
+      , valid_type tyvars case_ty
+      , go tyvars locals scrut
+      , Just (tc, tc_args) <- splitTyConApp_maybe (varType binder)
+      , independentDataKind tc && equalLength tc_args (tyConTyVars tc) && all (valid_type tyvars) tc_args
+      , let expected_cons = tyConDataCons tc
+            check_alt (Core.Alt (Core.DataAlt dc) fs rhs)
+              | Just ftys <- independentDataFields dc tc_args
+              , equalLength fs ftys && all (term_binder tyvars) fs
+              , and (zipWith eqType (map varType fs) ftys)
+              = Just (dc, go tyvars (extendNameSetList locals (map getName fs)) rhs)
+            check_alt _ = Nothing
+      , Just pairs <- traverse check_alt alts
+      , let (dcs, ok_rhss) = unzip pairs
+      , equalLength dcs expected_cons && mkNameSet (map getName dcs) == mkNameSet (map getName expected_cons)
+      = and ok_rhss
     go tyvars _ (Core.Type ty) = valid_type tyvars ty
     go _ _ _ = False
 
@@ -2664,6 +2703,7 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
                 [ goptM Opt_DeferTypeErrors
                 , goptM Opt_DeferTypedHoles
                 , goptM Opt_DeferOutOfScopeVariables ]
+              strict_mode <- xoptM LangExt.Strict
               local_defs@(local_def_map, _) <-
                 if not defer_on
                   then tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
@@ -2676,12 +2716,63 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
                           (_, _, res_ty) = splitFunTys body_ty
                       in isLargeElimResultKind res_ty && not (res_ty `eqType` body_ty)
                     _ -> False
+                  safe_open_fallback nm = not strict_mode && case lookupNameEnv local_def_map nm of
+                    Just (_, rhs) -> safe_open_expr nm rhs
+                    Nothing       -> False
+                  safe_open_expr owner_nm = check_expr
+                    where
+                      bad_fv v = idName v == owner_nm || v `hasKey` patErrorIdKey
+                      check_expr e
+                        | any bad_fv (exprSomeFreeVarsList isId e) = False
+                        | otherwise = go_e e
+                      go_e (Core.Var _)          = True
+                      go_e (Core.Lit _)          = True
+                      go_e (Core.Type _)         = True
+                      go_e (Core.Coercion _)     = True
+                      go_e (Core.App f a)        = go_e f && go_e a
+                      go_e (Core.Lam _ b)        = go_e b
+                      go_e (Core.Cast b _)       = go_e b
+                      go_e (Core.Tick _ b)       = go_e b
+                      go_e (Core.Let (Core.NonRec _ r) b) = go_e r && go_e b
+                      go_e (Core.Let (Core.Rec [(v, r)]) b) =
+                        not (any (== v) (exprSomeFreeVarsList isId r)) && go_e r && go_e b
+                      go_e (Core.Let Core.Rec{} _) = False
+                      go_e (Core.Case s _ _ alts@(_ : _)) =
+                        go_e s && check_alts alts && all (\(Core.Alt _ _ r) -> go_e r) alts
+                      go_e Core.Case{} = False
+                      check_alts [Core.Alt Core.DEFAULT _ _] = False
+                      check_alts alts =
+                        not (any (\case Core.Alt Core.LitAlt{} _ _ -> True; _ -> False) alts) &&
+                        case [dc | Core.Alt (Core.DataAlt dc) _ _ <- alts] of
+                          dc0 : rest_dcs ->
+                            any (\case Core.Alt Core.DEFAULT _ _ -> True; _ -> False) alts ||
+                            length (dc0 : rest_dcs) == length (tyConDataCons (dataConTyCon dc0))
+                          [] -> False
+                  rest_local_vals = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rest))
+                  only_closed_in_rest fam = check_closed_uses fam rest
+                  check_closed_uses :: Data a => Name -> a -> Bool
+                  check_closed_uses fam node = case cast node :: Maybe (LHsType GhcRn) of
+                    Just lty -> check_lty fam [] lty
+                    Nothing  -> and (gmapQ (check_closed_uses fam) node)
+                  check_lty fam acc (L _ t) = case t of
+                    HsParTy _ inner -> check_lty fam acc inner
+                    HsAppTy _ fn arg -> check_lty fam (arg : acc) fn && check_lty fam [] arg
+                    HsAppKindTy _ fn k -> check_lty fam acc fn && check_lty fam [] k
+                    HsTyVar _ _ (L _ (WithUserRdr _ nm))
+                      | nm == fam -> not (null acc) && all closed_ty_arg acc
+                      | otherwise -> True
+                    _ -> and (gmapQ (check_closed_uses fam) t)
+                  closed_ty_arg arg =
+                    not (any (\n -> isInternalName n || isTyVarName n || n `elemNameSet` rest_local_vals) (local_ty_names arg))
+                  local_ty_names :: Data a => a -> [Name]
+                  local_ty_names node = maybeToList (cast node) ++ concat (gmapQ local_ty_names node)
               for_ needed $ \(term, family) ->
                 when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
                   unless (family `elemNameSet` found
                           || (not (family `elemNameSet` used_in_early)
                               && not (is_large_elim_owner term)
-                              && term `elemNameEnv` local_def_map)) $
+                              && term `elemNameEnv` local_def_map
+                              && (safe_open_fallback term || only_closed_in_rest family))) $
                     setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
               failIfErrsM
               addTopEvBinds evs $ do
@@ -3701,8 +3792,12 @@ tcSourceValueBinds group = do
           evs <- simplifyTop wanteds
           let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds first))
           tables <- sourceTablesFor False names first_env
+          let new_tcs = [ tc | (_, tbl) <- tables
+                             , tc <- tbl : [g | g <- fromMaybe [] (sourceTableCallees tbl), isSourceFilterGuard g]
+                             , isNothing (lookupTypeEnv (tcg_type_env first_env) (tyConName tc)) ]
           addTopEvBinds evs $ do
-            env' <- installSourceTables tables
+            env_tcs <- if null new_tcs then getGblEnv else fst <$> addTyConsToGblEnv new_tcs
+            env' <- setGblEnv env_tcs (installSourceTables tables)
             setGblEnv env' (check_group rest)
     restore_simple res
   where

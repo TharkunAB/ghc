@@ -433,7 +433,14 @@ pprParendPat p pat = sdocOption sdocPrintTypecheckerElaboration $ \ print_tc_ela
       -- is the pattern inside that matters.  Sigh.
 
 pprPat :: forall p. (OutputableBndrId p) => Pat (GhcPass p) -> SDoc
-pprPat (VarPat _ lvar)          = pprPatBndr (unLoc lvar)
+pprPat (VarPat _ (L l var))
+  | GhcTc <- ghcPass @p
+  , isGeneratedSrcSpan (locA l)
+  = sdocOption sdocPrintTypecheckerElaboration $ \print_tc_elab ->
+      if print_tc_elab
+        then pprPatBndr var
+        else getPprDebug $ \dbg -> if dbg then pprPatBndr var else char '_'
+  | otherwise                   = pprPatBndr var
 pprPat (WildPat _)              = char '_'
 pprPat (LazyPat _ pat)          = char '~' <> pprParendLPat appPrec pat
 pprPat (BangPat _ pat)          = char '!' <> pprParendLPat appPrec pat

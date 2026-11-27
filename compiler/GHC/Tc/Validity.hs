@@ -3487,8 +3487,7 @@ checkFamInstRhs selectors lhs_tc lhs_tys rhs
 
    selector_result tc tys
       | tyConArity tc == length tys
-      , kind@TyConApp{} <- coreFullView (typeKind (mkTyConApp tc tys))
-      = isConstructorCaseType kind
+      = isConstructorCaseType (coreFullView (typeKind (mkTyConApp tc tys)))
       | otherwise = False
 
    constructor_row VI{vi_rhs = rhs} = isConstructorCaseType rhs
@@ -3561,39 +3560,76 @@ checkFamInstRhs selectors lhs_tc lhs_tys rhs
 -- those arguments to recover the branch field and capture substitutions.
 -- See Note [Termination of lifted case selectors] in GHC.Tc.TyCl.
 refineCaseCall :: TyCon -> [Type] -> [Type] -> TyFamEqnValidityInfo -> Maybe ([Type], Type)
-refineCaseCall owner lhs args VI{vi_pats = pats, vi_rhs = rhs,
+refineCaseCall owner lhs args VI{vi_qtvs = qtvs, vi_pats = pats, vi_rhs = rhs,
                                  vi_case_pattern = Just (_, column, shape, pat)} = do
   actual : _ <- pure (drop column args)
   scrutinee <- getTyVar_maybe actual
-  let scope = tyCoVarsOfTypes (pat : lhs ++ args)
+  let caller_scope   = tyCoVarsOfTypes (lhs ++ args)
       scrutinee_kind = varType scrutinee
   guard (scrutinee `elemVarSet` tyCoVarsOfTypes lhs)
-  guard (isEmptyVarSet (tyCoVarsOfType scrutinee_kind)
-         && scrutinee_kind `eqType` typeKind pat)
+  guard (not (scrutinee `elemVarSet` tyCoVarsOfType scrutinee_kind))
+  let (fresh_sub, qtvs1) = substTyVarBndrs (mkEmptySubst (mkInScopeSet caller_scope)) (scopedSort qtvs)
+      pats1 = substTys fresh_sub pats
+      pat1  = substTy fresh_sub pat
+      rhs1  = substTy fresh_sub rhs
+  k_match <- tcMatchTyKis [typeKind pat1] [scrutinee_kind]
+  guard (eqType (substTy k_match (typeKind pat1)) scrutinee_kind)
+  let base_in_scope = mkInScopeSet (caller_scope `unionVarSet` mkVarSet qtvs1)
+      step_qtv sub tv
+        | Just mapped_ty <- lookupTyVar k_match tv = extendTvSubst sub tv mapped_ty
+        | otherwise                                = fst (substTyVarBndr sub tv)
+      inst_sub = foldl' step_qtv (mkEmptySubst base_in_scope) qtvs1
+      pats2    = substTys inst_sub pats1
+      pat2     = substTy inst_sub pat1
+      rhs2     = substTy inst_sub rhs1
+      scope    = caller_scope `unionVarSet` tyCoVarsOfTypes (pat2 : pats2 ++ [rhs2])
+      pat_tvs  = tyCoVarsOfType pat2 `minusVarSet` caller_scope
   guard (allVarSet (not . elemVarSet scrutinee . tyCoVarsOfType . varType) scope)
   let initial = mkEmptySubst (mkInScopeSet scope)
-  refine <- case (shape, coreFullView pat) of
+      valid_pat_tree ty = case coreFullView ty of
+        TyVarTy tv | tv `elemVarSet` pat_tvs -> Just [tv]
+        TyConApp tc all_args
+          | isPromotedDataCon tc
+          , length all_args == tyConArity tc -> do
+              let vis_n = count isVisibleTyConBinder (tyConBinders tc)
+                  (invis_args, field_args) = splitAt (length all_args - vis_n) all_args
+              guard (all isTyFamFree invis_args)
+              tvs <- concat <$> traverse valid_pat_tree field_args
+              guard (sizeVarSet (mkVarSet tvs) == length tvs)
+              pure tvs
+        _ -> Nothing
+  refine <- case (shape, coreFullView pat2) of
     (CasePatternField, TyVarTy _) -> pure initial
-    (CasePatternConstructor{}, TyConApp tc fields)
-      | isPromotedDataCon tc, all isTyVarTy fields ->
-          pure (extendTvSubst initial scrutinee pat)
+    (CasePatternConstructor{}, TyConApp tc _)
+      | isPromotedDataCon tc, isJust (valid_pat_tree pat2) ->
+          pure (extendTvSubst initial scrutinee pat2)
     _ -> Nothing
-  let lhs' = substTys refine lhs
+  let lhs'  = substTys refine lhs
       args' = substTys refine args
-  matched <- tcMatchTyKis pats args'
-  guard (eqTypes (substTys matched pats) args')
-  let rhs' = substTyUnchecked matched rhs
+  matched <- tcMatchTyKis pats2 args'
+  guard (eqTypes (substTys matched pats2) args')
+  let rhs' = substTyUnchecked matched rhs2
   guard (tyCoVarsOfType rhs' `subVarSet` tyCoVarsOfTypes lhs')
-  guard (isConstructorCaseType rhs' || direct_call rhs')
+  guard (valid_case_rhs rhs')
   pure (lhs', rhs')
   where
     direct_call ty
       | TyConApp callee actuals <- coreFullView ty =
           callee == owner && length actuals == tyConArity owner
       | otherwise = False
+    valid_case_rhs ty
+      | isConstructorCaseType ty || direct_call ty = True
+      | Just rhs_v <- coreView ty = valid_case_rhs rhs_v
+      | TyConApp tc tc_args <- ty =
+          not (isTypeSynonymTyCon tc) && not (isFamilyTyCon tc) && all valid_case_rhs tc_args
+      | FunTy _ ma mult a r <- ty =
+          all valid_case_rhs [ma, mult, a, r]
+      | ForAllTy ma bndr body <- ty =
+          valid_case_rhs ma && valid_case_rhs (binderType bndr) && valid_case_rhs body
+      | otherwise = False
 refineCaseCall _ _ _ _ = Nothing
 
--- | A case selector permits only constructor types, variables and literals.
+-- | A case selector permits only constructor types, arrows, variables and literals.
 -- In particular, an application of a captured variable can call a family.
 isConstructorCaseType :: Type -> Bool
 isConstructorCaseType = isCaseSelectorType (\_ _ -> False)
@@ -3604,7 +3640,10 @@ isCaseSelectorType check_selector = go
   where
     go ty | Just rhs <- coreView ty = go rhs
     go (TyVarTy _) = True
+    go (TermVarTy _) = True
     go (LitTy _) = True
+    go (FunTy _ ma mult arg res) = go ma && go mult && go arg && go res
+    go (ForAllTy ma bndr body) = go ma && go (binderType bndr) && go body
     go (TyConApp tc args) =
       not (isTypeSynonymTyCon tc) &&
       (not (isFamilyTyCon tc) || check_selector tc args) && all go args

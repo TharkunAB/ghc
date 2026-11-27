@@ -993,9 +993,13 @@ mkRecSelBinds tycons = concat <$> mapM make_selectors tycons
                  parameters = mkTyVarTys (dataConUnivTyVars con)
                  index = mkTyConApp table (parameters ++ [TermVarTy record])
                  (telescope, _) = splitForAllForAllTyBinders (idType selector)
-                 payload_sel fld result = mkRecordSelector Nothing
-                   (Just (mkForAllTys telescope (mkDepFunTy record (result index))))
-                   cons parent fld FieldSelectors
+                 payload_sel fld result =
+                   let res_ty = result index
+                   in if anyFreeVarsOfType (== record) res_ty
+                        then mkRecordSelector Nothing
+                               (Just (mkForAllTys telescope (mkDepFunTy record res_ty)))
+                               cons parent fld FieldSelectors
+                        else mkOneRecordSelector cons parent fld FieldSelectors
            ; pure (first_sel : zipWithEqual payload_sel rest payloads) }
       | [con] <- tyConDataCons tc
       , flds@(_ : _) <- tyConFieldLabels tc

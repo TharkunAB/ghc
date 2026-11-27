@@ -1,6 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DependentTypes #-}
-{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 {- | Explicit construction, constraint pairing, witness tokens, and
@@ -11,7 +11,7 @@ enabled.
 -}
 module GHC.Exists (
   Exists,
-  pattern Pack,
+  data Pack,
   type (/\) (..),
   discardEvidence,
   withEvidence,

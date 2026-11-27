@@ -66,6 +66,7 @@ import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 import GHC.Builtin.Modules ( gHC_INTERNAL_TYPENATS )
 import GHC.Builtin.WiredIn.Types ( oneDataConTy, unitTy, makeRecoveryTyCon
                                , boolTy, promotedTrueDataCon, promotedFalseDataCon
+                               , consDataCon, nilDataCon, tupleDataCon
                                , manyDataConTy, matchableDataConTy, unmatchableDataConTy, matchabilityTy
                                , liftedTypeKindTyConName, listTyConName, tYPETyConName )
 
@@ -4593,11 +4594,21 @@ typeCasePattern tc source_args rhs checked_args
                            , isVisibleTyConBinder b]
     source_case_pattern original = go [] original
       where
+        sp = getLocA original
         go args (L _ (HsParTy _ pat)) = go args pat
         go args (L _ (HsAppTy _ con field)) = go (field:args) con
+        go args (L _ (HsAppKindTy _ con _)) = go args con
+        go []   (L _ (HsOpTy _ lhs tyop rhs)) = go [lhs, rhs] tyop
+        go []   (L _ (HsExplicitListTy _ _ tys)) =
+          foldr (\hd acc -> CasePatternConstructor sp (dataConName consDataCon) [source_case_pattern hd, acc])
+                (CasePatternConstructor sp (dataConName nilDataCon) [])
+                tys
+        go []   (L _ (HsExplicitTupleTy _ _ tys))
+          | length tys /= 1 =
+              CasePatternConstructor sp (dataConName (tupleDataCon Boxed (length tys))) (map source_case_pattern tys)
         go args (L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))))
           | not (isTvOcc (nameOccName name)) =
-              CasePatternConstructor (getLocA original) name (map source_case_pattern args)
+              CasePatternConstructor sp name (map source_case_pattern args)
         go _ _ = CasePatternField
 
 -- | Does the equation retain a source case pattern?
