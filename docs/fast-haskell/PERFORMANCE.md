@@ -4,6 +4,21 @@ Use ordinary GHC for final builds. At each development-worker switch, compare wi
 
 ## 27 November 2026
 
+### Published importer rule on GHC 10.1.20261127
+
+The original Hadrian `56bb91d95f` used ordinary GHC. The optimized build used the published Hadrian rule, one Hadrian capability, and a warm `e0d203b` worker for dependency scans and compile checks. Both used the same Stage0 executable (SHA-256 prefix `cafe7121a8e6`), `perf+no_profiled_libs --freeze1 -j3`, and logical CPUs 20–23. Both targeted `stage2:exe:ghc-bin` and used the default compiler nursery.
+
+| Linked `-O2` rebuild | Original Hadrian | Published importer rule |
+| --- | ---: | ---: |
+| Change cutoff 32 to 31 | 76.75 s | 25.21 s (3.04×) |
+| Immediate repeat | 33.37 s | 4.14 s |
+| Revert 31 to 32 | 75.68 s | 27.91 s (2.71×) |
+| Immediate repeat | 25.57 s | 5.05 s |
+
+The edit and revert together took **152.43 s with the original build and 53.12 s with the optimized build (2.87×, 65.1% less time)**. The optimized build issued 54 compile requests per edit instead of 303 and regenerated one of 943 dependency rows. Only the edited producer generated code. The checked module artifacts, package archive, shared library, linked compiler and separately compiled dynamic API consumer matched ordinary GHC. Every immediate repeat ran zero build actions.
+
+Separate writable overlays used the same read-only build. Preparation and worker warm-up took place before each stopwatch interval. Each cell is one sample. After correcting the primer, the original windows ran before the optimized windows. Pueue recorded an overlapping small-group task during the original forward window. Whole-job memory peaks were 2,548 and 2,491 MiB for the original windows and 3,425 and 3,504 MiB for the optimized windows, including worker warm-up and verification.
+
 ### Cumulative comparison on GHC 10.1.20261127
 
 We built Hadrian from the branch point `56bb91d95f` and used ordinary GHC for both dependency scanning and compilation. The development configuration used the published Hadrian changes, one Hadrian capability, and a stage-matched worker for dependency scans and compile checks with its decoded-interface cache enabled. The pilot also used an importer's actual source options and interface usage records to decide whether a change to `GHC.Utils.Misc` required a compiler call. Hadrian still passed changed code to the ordinary compiler and relinked its library and executable.
@@ -220,6 +235,8 @@ We ran the retained GHC 10.1.20261115.1 compiler with its own threaded dynamic R
 | Four GHC.Cmm.Sink | 4 | 2.299 / 2.162 s | 2.148 / 1.586 s | 427 / 636 MiB |
 
 The 64 MiB nursery cut median wall time by 5–6%. Timing ranges overlapped. All objects and interfaces matched. The extra 209–216 MiB matters when several builds share a machine. We kept the existing defaults. The [individual samples](2026-11-27.csv) include smaller nursery settings.
+
+On the actual Stage1 `-O2 -dynamic-too` command for `GHC.Core.Opt.Simplify.Iteration`, the 64 MiB nursery saved 0.75 s of CPU at the median across three paired rounds. Median process peak RSS rose from 349 MiB to 369 MiB. All four emitted artifacts matched across the runs. Other builds were active, so these samples measure per-command CPU and RSS. The nursery has its own development opt-in. [Hadrian setup](../../hadrian/README.md#compiler-nursery-for-development-builds)
 
 In a separate Callgrind run, sequential evacuation in `evacuate1` used 474,394,570 of 3,386,978,025 instructions (14.0%) in the compiler process building `GHC.Data.Bool`. Both artifacts matched the uninstrumented build. Of 8,694,351 pointer classifications, 4,618,238 took the static path. Of 2,540,069 ordinary closure dispatches across 16 targets, the largest target received 743,727. Removing the suspected extra flag load would save at most 0.12% of the routine's instructions. This profile gives little support for specializing one closure type. The `GHC.Cmm.Sink` profile reached its 100 s limit without usable instruction counts. [Evacuation code](../../rts/sm/Evac.c)
 
