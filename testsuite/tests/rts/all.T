@@ -707,6 +707,10 @@ test('T25280', [unless(opsys('linux'),skip),req_process,js_skip], compile_and_ru
 test('T25560', [req_c_rts, ignore_stderr], compile_and_run, [''])
 
 test('TestProddableBlockSet', [req_c_rts], multimod_compile_and_run, ['TestProddableBlockSet.c', '-no-hs-main'])
+test('CheckVectorSupportClassifier',
+     [c_src, only_ways(['normal']),
+      extra_files(['../../../rts/CheckVectorSupportInternal.h'])],
+     compile_and_run, [''])
 test('T22859',
      [js_skip,
       # This test is vulnerable to changes in allocation behaviour, so we disable it in some ways
