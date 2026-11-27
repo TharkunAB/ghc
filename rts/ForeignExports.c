@@ -9,6 +9,36 @@
 #include "Rts.h"
 #include "RtsUtils.h"
 #include "ForeignExports.h"
+#include <stddef.h>
+
+#if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && !defined(TSAN_ENABLED)
+#define USE_RUST_FOREIGN_EXPORTS 1
+GHC_STATIC_ASSERT(sizeof(struct ForeignExportsList) == 32, "ForeignExportsList size");
+GHC_STATIC_ASSERT(offsetof(struct ForeignExportsList, next) == 0, "ForeignExportsList next");
+GHC_STATIC_ASSERT(offsetof(struct ForeignExportsList, n_entries) == 8, "ForeignExportsList n_entries");
+GHC_STATIC_ASSERT(offsetof(struct ForeignExportsList, oc) == 16, "ForeignExportsList oc");
+GHC_STATIC_ASSERT(offsetof(struct ForeignExportsList, stable_ptrs) == 24, "ForeignExportsList stable_ptrs");
+GHC_STATIC_ASSERT(offsetof(struct ForeignExportsList, exports) == 32, "ForeignExportsList exports");
+RTS_PRIVATE void ghc_rust_foreign_exports_enqueue(struct ForeignExportsList **pending,
+                                                  ObjectCode *loading_obj,
+                                                  struct ForeignExportsList *exports);
+RTS_PRIVATE void ghc_rust_foreign_exports_process(struct ForeignExportsList **pending,
+                                                  void (*check)(struct ForeignExportsList *),
+                                                  struct ForeignExportsList **(*head)(ObjectCode *));
+
+/* Keep the private ObjectCode layout in C. */
+static struct ForeignExportsList **foreignExportsHead(ObjectCode *oc)
+{
+    return &oc->foreign_exports;
+}
+
+#if defined(DEBUG)
+static void assertUnprocessedForeignExports(struct ForeignExportsList *exports)
+{
+    ASSERT(exports->stable_ptrs == NULL);
+}
+#endif
+#endif
 
 /* protected by linker_mutex after start-up */
 static struct ForeignExportsList *pending = NULL;
@@ -62,9 +92,13 @@ void registerForeignExports(struct ForeignExportsList *exports)
 {
     ASSERT(exports->next == NULL);
     ASSERT(exports->oc == NULL);
+#if defined(USE_RUST_FOREIGN_EXPORTS)
+    ghc_rust_foreign_exports_enqueue(&pending, loading_obj, exports);
+#else
     exports->next = pending;
     exports->oc = loading_obj;
     pending = exports;
+#endif
 }
 
 /* -----------------------------------------------------------------------------
@@ -94,6 +128,13 @@ void foreignExportsFinishedLoadingObject(void)
  * oc->stable_ptrs. */
 void processForeignExports(void)
 {
+#if defined(USE_RUST_FOREIGN_EXPORTS)
+#if defined(DEBUG)
+    ghc_rust_foreign_exports_process(&pending, assertUnprocessedForeignExports, foreignExportsHead);
+#else
+    ghc_rust_foreign_exports_process(&pending, NULL, foreignExportsHead);
+#endif
+#else
     while (pending) {
         struct ForeignExportsList *cur = pending;
         pending = cur->next;
@@ -126,4 +167,5 @@ void processForeignExports(void)
             }
         }
     }
+#endif
 }

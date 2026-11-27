@@ -26,6 +26,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/exec_page.rs"
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
+                , "rts/rust/foreign_exports.rs"
                 , "rts/rust/gc_budget.rs"
                 , "rts/rust/hash_chain.rs"
                 , "rts/rust/hash_insert.rs"

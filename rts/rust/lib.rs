@@ -7,6 +7,7 @@ mod encode;
 mod exec_page;
 mod eventlog_file_writer;
 mod file_lock;
+mod foreign_exports;
 mod gc_budget;
 mod hash_chain;
 mod hash_insert;

@@ -23,6 +23,7 @@ extra-source-files:
     rust/exec_page.rs
     rust/eventlog_file_writer.rs
     rust/file_lock.rs
+    rust/foreign_exports.rs
     rust/gc_budget.rs
     rust/hash_chain.rs
     rust/hash_insert.rs
