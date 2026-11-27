@@ -46,7 +46,7 @@ module GHC.Driver.Main.Hsc
 
 import GHC.Prelude
 
-import Data.Maybe (isNothing)
+import Data.Maybe (isNothing, maybeToList)
 
 import GHC.Driver.Plugins
 import GHC.Driver.Session
@@ -74,8 +74,8 @@ import GHC.Core
 import GHC.Core.Dependent
     ( supportsScopedDictionaryCore, hasNativeDependentProgram, rejectNativeDependentProgram
     , hasNativeDependentExpr, rejectNativeDependentExpr, hasRetainedRuleHead )
-import GHC.Core.DataCon ( dataConRepArgBinders, dataConWorkId )
-import GHC.Core.TyCon ( TyCon, tyConDataCons_maybe )
+import GHC.Core.DataCon ( dataConWorkId, dataConWrapId_maybe )
+import GHC.Core.TyCon ( TyCon, isTypeDataTyCon, tyConDataCons_maybe )
 import GHC.Types.Id ( idType )
 import GHC.Types.TyThing ( TyThing(AnId) )
 
@@ -212,11 +212,12 @@ hasNativeDependentModuleBody binds rules tycons =
 
 nativeDependentConstructors :: [TyCon] -> [CoreExpr]
 nativeDependentConstructors tycons =
-  [ Type (idType (dataConWorkId dc))
+  [ Type (idType cid)
   | tc <- tycons
+  , not (isTypeDataTyCon tc)
   , Just dcs <- [tyConDataCons_maybe tc]
   , dc <- dcs
-  , not (null (dataConRepArgBinders dc)) ]
+  , cid <- dataConWorkId dc : maybeToList (dataConWrapId_maybe dc) ]
 
 -- | Select a retained optimization level when optimization passes are active
 -- and no unsupported transformation flags are enabled.

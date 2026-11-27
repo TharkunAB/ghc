@@ -16,6 +16,7 @@ module GHC.CoreToStg ( CoreToStgOpts (..), coreToStg ) where
 import GHC.Prelude
 
 import GHC.Core
+import GHC.Core.Make        ( mkImpossibleExpr )
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity   ( manifestArity )
 import GHC.Core.Type
@@ -465,9 +466,16 @@ coreToStgExpr (Pack _ _ payload) = coreToStgExpr payload
 
 -- See Note [Erasing a lexical existential].
 coreToStgExpr (Unpack _ payload package body)
+  | isDeadBinder payload
+  = coreToStgExpr body
   | Just p <- unwrapPackageVar package
   = do { p' <- resolvePayloadAlias p
        ; extendVarEnvCts [(payload, PayloadAlias p')] (coreToStgExpr body) }
+  | isRubbishPackage package
+  = do { let err = mkImpossibleExpr (idType payload) "coreToStgExpr: absent existential payload"
+       ; rhs <- coreToStgRhs (payload, err)
+       ; body' <- extendVarEnvCts [(payload, LetBound NestedLet 0)] (coreToStgExpr body)
+       ; return (StgLet noExtFieldSilent (StgNonRec payload rhs) body') }
   | otherwise
   = do { rhs <- coreToStgRhs (payload, package)
        ; body' <- extendVarEnvCts [(payload, LetBound NestedLet 0)] (coreToStgExpr body)
@@ -477,6 +485,12 @@ coreToStgExpr (Unpack _ payload package body)
     unwrapPackageVar (Cast e _)   = unwrapPackageVar e
     unwrapPackageVar (Pack _ _ e) = unwrapPackageVar e
     unwrapPackageVar _            = Nothing
+
+    isRubbishPackage (Lit l)    = isLitRubbish l
+    isRubbishPackage (App f _)  = isRubbishPackage f
+    isRubbishPackage (Cast e _) = isRubbishPackage e
+    isRubbishPackage (Tick _ e) = isRubbishPackage e
+    isRubbishPackage _          = False
 
 coreToStgExpr (Cast expr _)
   = coreToStgExpr expr

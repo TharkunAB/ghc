@@ -109,7 +109,8 @@ import Language.Haskell.Syntax.Specificity (Specificity(SpecifiedSpec))
 import Data.Foldable (for_)
 import Data.List (nubBy, partition)
 import qualified Data.List.NonEmpty as NE
-import Data.Data (Data, cast, gmapQ)
+import Data.Data (Data, cast, gmapQ, gmapT)
+import Data.Typeable (eqT, (:~:)(Refl))
 import Control.Monad
 
 {-
@@ -2672,21 +2673,37 @@ rnRetainedHsRecordFields result ctxt fls
                    ; ((binders, payloads), fvs) <- rnRetainedTelescope env
                        (\e -> mapFvRn (rnField fl_env e)) [binder] rest
                    ; doc <- traverse rnLHsDoc (cdf_doc first_field)
-                   ; let domain = case binders of
-                           [L _ (HsTvb{tvb_kind = HsBndrKind _ ty})] -> ty
+                   ; let (local_witness, domain) = case binders of
+                           [L _ (HsTvb{tvb_var = HsBndrVar _ (L _ b_nm), tvb_kind = HsBndrKind _ ty})] -> (b_nm, ty)
                            _ -> panic "rnRetainedHsRecordFields: expected one witness"
+                         witness_fields = map (fmap (lookupField fl_env)) fields
+                         selector_name = case witness_fields of
+                           [L _ (FieldOcc _ (L _ sel))] -> sel
+                           _ -> panic "rnRetainedHsRecordFields: expected one field"
                          field = first_field
                            { cdf_multiplicity = HsModifiedFunArr noExtField []
                                (HsStandardArr noExtField)
                            , cdf_type = domain
                            , cdf_doc = doc }
-                         witness_field = L loc (HsConDeclRecField noExtField
-                                               (map (fmap (lookupField fl_env)) fields) field)
+                         witness_field = L loc (HsConDeclRecField noExtField witness_fields field)
+                         display_payloads = substWitnessName local_witness selector_name payloads
                          body = foldr (nlHsFunTy . cdf_type . cdrf_spec . unLoc) result payloads
                          sig = L loc (HsForEachTy (noEpTok, Left noEpUniTok) binders body)
-                   ; pure (Just (sig, witness_field : payloads, fvs)) }
+                   ; pure (Just (sig, witness_field : display_payloads, fvs)) }
            else pure Nothing }
   where
+    substWitnessName :: forall a. Data a => Name -> Name -> a -> a
+    substWitnessName old_nm new_nm x
+      | Just Refl <- eqT @a @Name
+      = if x == old_nm then new_nm else x
+      | Just _ <- (cast x :: Maybe SrcSpan)
+      = x
+      | Just _ <- (cast x :: Maybe NameSet)
+      = x
+      | Just _ <- (cast x :: Maybe Type)
+      = x
+      | otherwise
+      = gmapT (substWitnessName old_nm new_nm) x
     env = mkTyKiEnv ctxt TypeLevel RnTypeBody
     fl_env = mkFsEnv [(mkFastStringShortText (field_label (flLabel fl)), fl) | fl <- fls]
 

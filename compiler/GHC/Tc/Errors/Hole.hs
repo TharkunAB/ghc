@@ -99,7 +99,7 @@ import GHC.Tc.Utils.Unify
   )
 
 import GHC.HsToCore.Docs ( extractDocs )
-import GHC.Hs ( Match(..), HsMatchContext(..), GRHSs(..), GRHS(..) )
+import GHC.Hs ( Match(..), HsMatchContext(..), GRHSs(..), GRHS(..), Pat(InvisPat) )
 import GHC.Hs.Doc
 import Data.List.NonEmpty ( NonEmpty(..) )
 import GHC.Unit.Module.ModIface ( mi_docs )
@@ -726,19 +726,15 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; raw_cands <- if null candidatePlugins
                     then pure all_cands
                     else foldM (flip ($)) all_cands candidatePlugins
-     ; let has_vis_dep_fun ty = case coreFullView ty of
-             DepFunTy DepFunVisible _ _ -> True
-             ForAllTy _ _ b             -> has_vis_dep_fun b
-             FunTy _ _ _ _ b            -> has_vis_dep_fun b
-             DepDictTy _ b              -> has_vis_dep_fun b
-             _                          -> False
+     ; let is_invis_pat (L _ InvisPat{}) = True
+           is_invis_pat _                = False
            mb_self_loop_fun
              | dep_exts
-             , has_vis_dep_fun hole_ty || isGadtHoleTy hole_ty
              , MatchInCtxt (Match { m_ctxt = FunRhs { mc_fun = L _ fn }
-                                  , m_pats = L _ []
+                                  , m_pats = L _ pats
                                   , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } }) : _
                  <- ctl_ctxt (ctLocEnv ct_loc)
+             , all is_invis_pat pats
              = Just fn
              | otherwise = Nothing
            is_self_cand fn c =

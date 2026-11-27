@@ -21,9 +21,9 @@ import Control.Monad (foldM, guard, unless, when, zipWithM, zipWithM_)
 import Control.Monad.Fix (mfix)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..))
-import Data.Foldable (for_)
+import Data.Foldable (asum, for_)
 import Data.List (find, isPrefixOf, nubBy, sortBy, sortOn)
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 
 import GHC.Builtin.KnownKeys (patErrorIdKey)
 import GHC.Builtin.WiredIn.Types (manyDataConTy, matchableDataConTy, unmatchableDataConTy)
@@ -39,7 +39,7 @@ import GHC.Core.Dependent (hasExistentialExpr, hasNativeDependentExpr)
 import GHC.Core.FamInstEnv (emptyFamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch, normaliseTcAppWithFuel)
 import GHC.Core.FVs (exprFreeVars, exprSomeFreeVarsList)
 import GHC.Core.OpenWhnf (checkedMultiplicityCast, openDataConFieldTypes, openIndexedDataCon)
-import GHC.Core.Predicate (tyCoVarsOfTypesWellScoped)
+import GHC.Core.Predicate (mkNomEqPred, tyCoVarsOfTypesWellScoped)
 import GHC.Core.Reduction (reductionReducedType)
 import GHC.Core.SimpleOpt (SimpleOpts, simpleOptExpr)
 import GHC.Core.Subst (extendTvSubst, mkEmptySubst, mkOpenSubst, substExpr, substTy)
@@ -49,10 +49,10 @@ import GHC.Core.TyCo.Rep (Coercion(..), MCoercion(MRefl), Scaled(..), Type(..), 
 import GHC.Core.TyCon
   ( AlgTyConFlav(VanillaAlgTyCon), FamTyConFlav(ClosedTypeFamilyTyCon), Injectivity(NotInjective)
   , TyCon, TyConBinder, TyConBndrVis(AnonTCB, NamedTCB), closedFamilyTyConCoAxiom_maybe
-  , isAlgTyCon, isPromotedDataCon, isPromotedDataCon_maybe, mkAlgTyCon, mkAnonTyConBinder
-  , mkFamilyTyCon, mkLevPolyDataTyConRhs, mkNamedTyConBinder, mkNamedTyConBinders, mkTyConKind
-  , mkTyConKindWithMatchability, synTyConRhs_maybe, tyConArity, tyConBinders, tyConDataCons
-  , tyConKind, tyConName, tyConRepName_maybe )
+  , isAlgTyCon, isNewTyCon, isPromotedDataCon, isPromotedDataCon_maybe, isTypeDataTyCon
+  , mkAlgTyCon, mkAnonTyConBinder, mkFamilyTyCon, mkLevPolyDataTyConRhs, mkNamedTyConBinder
+  , mkNamedTyConBinders, mkTyConKind, mkTyConKindWithMatchability, synTyConRhs_maybe, tyConArity
+  , tyConBinders, tyConDataCons, tyConKind, tyConName, tyConRepName_maybe, unwrapNewTyConEtad_maybe )
 import GHC.Core.TyCon.Set (TyConSet)
 import GHC.Core.Type
   ( FunTyFlag(FTF_T_T), Kind, coreFullView, getTyVar_maybe, isLiftedTypeKind, isManyTy, isOneTy
@@ -68,8 +68,8 @@ import GHC.Driver.Plugins (hasActiveLatePlugins)
 import GHC.Hs.Utils (CollectFlag(CollNoDictBinders), collectHsBindBinders)
 import GHC.Tc.Errors.Types (RetainedQuantificationError(RetainedSourceRule), TcRnMessage(..))
 import GHC.Tc.Gen.SourceTable
-  ( hasSourceMethodRule, ordinaryImport, publicCaseType, sourceEquationDatatypes
-  , sourceTableCallees, sourceTableOwner, visibleSourceMethodRules )
+  ( hasSourceMethodRule, isNominalStructuralSource, ordinaryImport, publicCaseType
+  , sourceEquationDatatypes, sourceTableCallees, sourceTableOwner, visibleSourceMethodRules )
 import GHC.Tc.TyCl.Build (buildDataCon, newImplicitBinder, newTyConRepName)
 import GHC.Tc.Types (tcVisibleOrphanMods)
 import GHC.Tc.Utils.Env (tcLookupIdMaybe)
@@ -81,8 +81,8 @@ import GHC.Tc.Utils.TcType (isTyFamFree)
 import GHC.Types.Avail (availsToNameSet)
 import GHC.Types.Basic (SourceTableOrigin(NominalSourceTable))
 import GHC.Types.Id
-  ( Id, idCoreRules, idDetails, idName, isDataConWorkId_maybe, isDataConWrapId_maybe, mkLocalId
-  , setIdExported, sourceTableId_maybe )
+  ( Id, idCoreRules, idDetails, idName, isDataConWorkId_maybe, isDataConWrapId_maybe, isJoinId
+  , mkLocalCoVar, mkLocalId, setIdExported, sourceTableId_maybe )
 import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, SourceTableId, VanillaId))
 import GHC.Types.Id.Make (DataConBangOpts(FixedBangOpts))
 import GHC.Types.InlinePragma (isNeverActive)
@@ -274,6 +274,7 @@ caseCoercion scope = go
     go (GRefl _ _ MRefl)   = True
     go (CoVarCo cv)        = cv `elem` scope
     go (TyConAppCo _ _ cs) = all go cs
+    go (AppCo a b)         = go a && go b
     go (TransCo a b)       = go a && go b
     go (SubCo c)           = go c
     go (SymCo c)           = go c
@@ -419,10 +420,21 @@ splitMixedPiTys raw_ty = case splitForAllForAllTyBinders raw_ty of
       | Just _ <- splitFunTy_maybe tau -> Nothing
       | otherwise -> Just ([], coreFullView tau)
 
+hasTypeDataTyCon :: TyCon -> Bool
+hasTypeDataTyCon tc
+  | isTypeDataTyCon tc = True
+  | Just (_, rhs, _) <- unwrapNewTyConEtad_maybe tc
+  , Just (tc', _) <- splitTyConApp_maybe rhs
+  = hasTypeDataTyCon tc'
+  | otherwise = False
+
+isRuntimeAlgTyCon :: TyCon -> Bool
+isRuntimeAlgTyCon tc = isAlgTyCon tc && not (isNewTyCon tc) && not (hasTypeDataTyCon tc)
+
 isIndexedAlgDomain :: Type -> Bool
 isIndexedAlgDomain ty
   | Just (tc, args@(_ : _)) <- splitTyConApp_maybe ty
-  = isAlgTyCon tc && (any (not . DC.isVanillaDataCon) (tyConDataCons tc) || any (not . isLiftedTypeKind . typeKind) args)
+  = isRuntimeAlgTyCon tc && (any (not . DC.isVanillaDataCon) (tyConDataCons tc) || any (not . isLiftedTypeKind . typeKind) args)
   | otherwise = False
 
 isIndexedCallbackTy :: Type -> Bool
@@ -438,10 +450,10 @@ isIndexedCallbackTy ty
 earlyClosureCandidateType :: Type -> Bool
 earlyClosureCandidateType ty
   | Just (pis, out_ty) <- splitMixedPiTys ty
-  , any (\case { Left _ -> True; _ -> False }) pis
+  , let val_doms = [d | Right d <- pis]
   , Right first_dom : _ <- [Right d | Right d <- pis]
   , isLiftedTypeKind (typeKind out_ty)
-  = isIndexedAlgDomain first_dom || isIndexedCallbackTy first_dom
+  = any isIndexedAlgDomain val_doms || isIndexedCallbackTy first_dom
   | otherwise = False
 
 companionTyConLookup :: [TyCon] -> Id -> [TyCon]
@@ -488,13 +500,44 @@ validBranch branch =
     lhs = coAxBranchLHS branch
     tvs = coAxBranchTyVars branch
 
+normaliseClosedTables :: Type -> Type
+normaliseClosedTables = go . coreFullView
+  where
+    go (AppTy a b) = AppTy (normaliseClosedTables a) (normaliseClosedTables b)
+    go (TyConApp tc tys) =
+      let tys' = map normaliseClosedTables tys
+      in if isJust (closedFamilyTyConCoAxiom_maybe tc)
+           then let red = reductionReducedType (normaliseTcAppWithFuel 2000 emptyFamInstEnvs Nominal tc tys')
+                in if red `eqType` TyConApp tc tys' then TyConApp tc tys' else normaliseClosedTables red
+           else TyConApp tc tys'
+    go (FunTy af ma mult arg res) =
+      FunTy af (normaliseClosedTables ma) (normaliseClosedTables mult)
+        (normaliseClosedTables arg) (normaliseClosedTables res)
+    go (ForAllTy ma bndr body) = ForAllTy (normaliseClosedTables ma) bndr (normaliseClosedTables body)
+    go ty = ty
+
 sameIndexedRow :: CoAxBranch -> CoAxBranch -> MaybeT TcM ()
 sameIndexedRow left right = do
     subst <- MaybeT (pure (tcMatchTys (coAxBranchLHS left) (coAxBranchLHS right)))
-    renamed <- MaybeT $ pure $ traverse (\v -> lookupTyVar subst v >>= getTyVar_maybe) (coAxBranchTyVars left)
+    let extractVars v = do
+          img <- lookupTyVar subst v
+          case getTyVar_maybe img of
+            Just tv -> Just [tv]
+            Nothing -> do
+              (tc, tc_args) <- splitTyConApp_maybe (varType v)
+              guard (isRuntimeAlgTyCon tc)
+              [only_dc] <- Just [c | c <- tyConDataCons tc, not (DC.dataConCannotMatch tc_args c)]
+              (prom_tc, p_args) <- splitTyConApp_maybe img
+              guard (prom_tc == DC.promoteDataCon only_dc && length p_args >= DC.dataConSourceArity only_dc)
+              let fld_tys = drop (length p_args - DC.dataConSourceArity only_dc) p_args
+              traverse getTyVar_maybe fld_tys
+    renamed_lists <- MaybeT (pure (traverse extractVars (coAxBranchTyVars left)))
+    let renamed = concat renamed_lists
+        lhs_rhs = normaliseClosedTables (substTyUnchecked subst (coAxBranchRHS left))
+        rhs_rhs = normaliseClosedTables (coAxBranchRHS right)
     guard (length renamed == length (coAxBranchTyVars right) &&
            mkVarSet renamed == mkVarSet (coAxBranchTyVars right) &&
-           substTyUnchecked subst (coAxBranchRHS left) `eqType` coAxBranchRHS right)
+           lhs_rhs `eqType` rhs_rhs)
 
 conAt :: DC.DataCon -> Type -> [Type] -> Maybe Type
 conAt con result fields = do
@@ -546,7 +589,7 @@ data IndexedPattern
   = IndexedVariable Id
   | IndexedConstructor Type DC.DataCon [Type] [IndexedPattern]
 
-data IndexedResultCase = IndexedResultCase [Type] Id IndexedPattern CoreExpr
+data IndexedResultCase = IndexedResultCase [(CoreExpr, Id, IndexedPattern, [Var])] CoreExpr
 data IndexedEquation = IndexedEquation [TyVar] [Type] (TyCon -> Type)
 
 applyRow :: IndexedEquation -> TyCon -> CoAxBranch
@@ -617,19 +660,21 @@ indexedConstructor specialize callee args = do
     guard (length supplied == length (DC.dataConUserTyVars con))
     pure (con, supplied, values)
 
-indexedResultCase :: Id -> [TyVar] -> IndexedPattern -> CoreExpr -> Maybe IndexedResultCase
-indexedResultCase owner parameters pat (Core.Case call binder kind [Core.Alt (Core.DataAlt con) binders body]) = do
-    (Core.Var callee, args) <- pure (Core.collectArgs call)
-    let (prefix, suffix) = splitAt (length parameters) args
-    tys <- traverse indexedTypeArg prefix
-    [Core.Var operand] <- pure suffix
-    (tc, _) <- splitTyConApp_maybe (varType binder)
-    (_, _ : _, [], [], _, _) <- pure (DC.dataConFullSig con)
-    guard (callee == owner && length tys == length parameters && operand `elem` indexedFields pat &&
-           varType binder `eqType` exprType call && kind `eqType` exprType body && tyConDataCons tc == [con])
-    (res_pat, []) <- indexedAlt binder con binders
-    pure (IndexedResultCase tys operand res_pat body)
-indexedResultCase _ _ _ _ = Nothing
+indexedResultCase :: CoreExpr -> Maybe IndexedResultCase
+indexedResultCase expr = go [] expr
+  where
+    go acc (Core.Case call binder kind [Core.Alt (Core.DataAlt con) binders body])
+      | Just (tc, args) <- splitTyConApp_maybe (varType binder)
+      , isRuntimeAlgTyCon tc
+      , [only_con] <- [c | c <- tyConDataCons tc, not (DC.dataConCannotMatch args c)]
+      , only_con == con
+      , varType binder `eqType` exprType call
+      , kind `eqType` exprType body
+      , Just (res_pat, eq_vars) <- indexedAlt binder con binders
+      = let acc' = acc ++ [(call, binder, res_pat, eq_vars)]
+        in go acc' body <|> Just (IndexedResultCase acc' body)
+    go acc@(_ : _) body = Just (IndexedResultCase acc body)
+    go [] _ = Nothing
 
 -- | Compile a mixed-telescope indexed Core definition into closed-family equations.
 -- See Note [Indexed GADT decision-tree and continuation compilation].
@@ -638,7 +683,7 @@ compileIndexedCore :: BindEnv -> (Id -> Maybe TyCon) -> Maybe (Name, Name) -> Ma
 compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = do
     (pis, sig_out_ty) <- MaybeT (pure (splitMixedPiTys (varType owner)))
     let val_sig_doms = [d | Right d <- pis]
-    guard (any (\case { Left _ -> True; _ -> False }) pis && not (null val_sig_doms) &&
+    guard (not (null val_sig_doms) &&
            all (isLiftedTypeKind . typeKind) (sig_out_ty : val_sig_doms) &&
            any (\d -> isIndexedAlgDomain d || isIndexedCallbackTy d) val_sig_doms)
     (hdr_binders, hdr_res) <- lift (buildHeaderTelescope pis sig_out_ty)
@@ -670,41 +715,133 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
       let val_params = [v | Right v <- bndrs]
           prenex_tvs = [tv | Left (_, tv) <- takeWhile (\case { Left _ -> True; _ -> False }) bndrs]
           is_prenex = length prenex_tvs + length val_params == length bndrs
-      (mb_pack, pats0, tree0) <- unwrapPackWorker is_prenex prenex_tvs val_params body0
-      let descendTree allow_rc pats proofs expr
-            | allow_rc, is_prenex, isNothing mb_pack
-            , [(_, outer_pat@IndexedConstructor{})] <- pats
-            , Just rc <- indexedResultCase owner prenex_tvs outer_pat expr
-            = pure [(pats, proofs, Right rc)]
-          descendTree allow_rc pats proofs expr@(Core.Case (Core.Var scrut) bndr res_ty alts) = do
-            let leaf_vars = concatMap (indexedFields . snd) pats
-            guard (not (null alts) && varType bndr `eqType` varType scrut &&
-                   res_ty `eqType` exprType expr && scrut `elem` leaf_vars)
-            (tc, _) <- MaybeT (pure (splitTyConApp_maybe (varType scrut)))
-            let cons = tyConDataCons tc
-            guard (not (null cons))
-            parsed <- fmap catMaybes $ MaybeT $ pure $ traverse (\case
-              Core.Alt (Core.DataAlt dc) bs rhs_e | dc `elem` cons -> Just (Just (dc, (bs, rhs_e)))
-              Core.Alt Core.DEFAULT [] rhs_e | isPatErrorExpr bindings rhs_e -> Just Nothing
-              _ -> Nothing) alts
-            guard (length parsed == length (nubBy (\a b -> fst a == fst b) parsed))
-            fmap concat $ traverse (\dc -> case lookup dc parsed of
-              Just (bs, rhs_e) | not (isPatErrorExpr bindings rhs_e) -> do
-                (node, eqs) <- MaybeT (pure (indexedAlt scrut dc bs))
-                descendTree allow_rc [(p, replacePat scrut node pat) | (p, pat) <- pats] (proofs ++ eqs) rhs_e
-              _ -> do
-                refuted <- lift (isRefutedBranch scrut dc leaf_vars proofs)
-                [] <$ guard refuted) cons
-          descendTree _ _ _ Core.Case{} = MaybeT (pure Nothing)
-          descendTree _ pats proofs expr = pure [(pats, proofs, Left (unwrapLocalCallbackLets expr))]
+      (mb_pack, mb_worker, pats0, tree0) <- unwrapPackWorker is_prenex prenex_tvs val_params body0
+      let unwrapScrutCast eq_scope = go_scrut
+            where
+              go_scrut (Core.Var v) = Just v
+              go_scrut (Core.Cast e co)
+                | isSafeMultOrReflCo co || caseCoercion eq_scope co = go_scrut e
+              go_scrut _ = Nothing
 
-          compileExpr allow_self row_pats floats val_env specialize proofs mb_exp_rhs = go floats
+          freshAltBinders scrut_ty dc = do
+            (tc, args) <- MaybeT (pure (splitTyConApp_maybe scrut_ty))
+            let (univs, exs, specs, thetas, fields, _) = DC.dataConFullSig dc
+            guard (tc == DC.dataConTyCon dc && null thetas && length args == length univs &&
+                   all isTyVar exs && lazyConstructor dc)
+            let base_sub = zip univs args
+            locals <- lift $ foldM (\acc tv -> do
+              let k = substTyWith (map fst (base_sub ++ acc)) (map snd (base_sub ++ acc)) (varType tv)
+              tv' <- freshVar "ex" k
+              pure (acc ++ [(tv, mkTyVarTy tv')])) [] exs
+            let inst = substTyWith (univs ++ exs) (args ++ map snd locals)
+            eq_vars <- lift $ traverse (\spec -> do
+              let (tv, rty) = DC.eqSpecPair spec
+              nm <- newSysName (mkVarOcc "co")
+              pure (mkLocalCoVar nm (mkNomEqPred (inst (mkTyVarTy tv)) (inst rty)))) specs
+            val_vars <- lift $ traverse (\(Scaled _ fty) -> freshLocalId "fld" (inst fty)) fields
+            pure ([tv | Just tv <- map (getTyVar_maybe . snd) locals] ++ eq_vars ++ val_vars)
+
+          simplifyTreeExpr known_alts eq_scope raw_e
+            | hasExistentialExpr raw_e || hasNativeDependentExpr raw_e = raw_e
+            | otherwise = go_simp raw_e
+            where
+              substPairs prs target
+                | null prs  = target
+                | otherwise =
+                    let free = foldl' unionVarSet (exprFreeVars target) [exprFreeVars r | (_, r) <- prs]
+                    in substExpr (mkOpenSubst (mkInScopeSet free) prs) target
+
+              go_simp (Core.Let (Core.NonRec cv (Core.Coercion co)) inner)
+                | isCoVar cv
+                = go_simp (substPairs [(cv, Core.Coercion co)] inner)
+              go_simp (Core.Let (Core.NonRec b b_rhs) inner)
+                | isLocalId b, isValueVar b
+                , (case idDetails b of { VanillaId -> True; _ -> isJoinId b })
+                , null (idCoreRules b), not (b `elemVarSet` exprFreeVars b_rhs)
+                = go_simp (substPairs [(b, b_rhs)] inner)
+              go_simp (Core.App f a) =
+                case go_simp f of
+                  Core.Lam p body
+                    | isValueVar p, not (Core.isTyCoArg a)
+                    , not (p `elemVarSet` exprFreeVars body) || (case a of { Core.Var _ -> True; _ -> False })
+                    -> go_simp (substPairs [(p, go_simp a)] body)
+                  Core.Lam tv body
+                    | isTyVar tv, Core.Type ty <- a
+                    -> go_simp (substPairs [(tv, Core.Type ty)] body)
+                  f' -> Core.App f' (go_simp a)
+              go_simp (Core.Cast inner co) = Core.Cast (go_simp inner) co
+              go_simp (Core.Case s_e inner_bndr r_ty inner_alts)
+                | Just s_v <- unwrapScrutCast eq_scope (go_simp s_e)
+                , Just (known_dc, outer_bs) <- lookup s_v known_alts =
+                    case find (\case { Core.Alt (Core.DataAlt dc) bs _ -> dc == known_dc && length bs == length outer_bs; _ -> False }) inner_alts of
+                      Just (Core.Alt _ inner_bs inner_rhs) ->
+                        let prs = [(inner_bndr, Core.Var s_v) | inner_bndr /= s_v] ++
+                                  zip inner_bs (map Core.varToCoreExpr outer_bs)
+                        in go_simp (substPairs prs inner_rhs)
+                      Nothing
+                        | not (any (\case { Core.Alt (Core.DataAlt dc) _ _ -> dc == known_dc; _ -> False }) inner_alts)
+                        , Just (Core.Alt Core.DEFAULT [] def_rhs) <- find (\case { Core.Alt Core.DEFAULT [] _ -> True; _ -> False }) inner_alts ->
+                            go_simp (substPairs [(inner_bndr, Core.Var s_v) | inner_bndr /= s_v] def_rhs)
+                      _ -> Core.Case (go_simp s_e) inner_bndr r_ty inner_alts
+              go_simp other = other
+
+          descendTree allow_rc known_alts pats proofs raw_expr =
+            let expr = simplifyTreeExpr known_alts proofs raw_expr
+                leaf_vars = concatMap (indexedFields . snd) pats
+            in case expr of
+              Core.Case scrut_e bndr res_ty alts
+                | Just scrut <- unwrapScrutCast proofs scrut_e
+                , scrut `elem` leaf_vars -> do
+                    guard (varType bndr `eqType` exprType scrut_e && res_ty `eqType` exprType expr)
+                    (tc, _) <- MaybeT (pure (splitTyConApp_maybe (varType bndr)))
+                    guard (isRuntimeAlgTyCon tc)
+                    let cons = tyConDataCons tc
+                        mb_def = listToMaybe [def_e | Core.Alt Core.DEFAULT [] def_e <- alts]
+                        substBndr e
+                          | bndr == scrut || not (bndr `elemVarSet` exprFreeVars e) = e
+                          | otherwise = substExpr (mkOpenSubst (mkInScopeSet (exprFreeVars e `extendVarSet` scrut)) [(bndr, Core.Var scrut)]) e
+                    parsed <- fmap catMaybes $ MaybeT $ pure $ traverse (\case
+                      Core.Alt (Core.DataAlt dc) bs rhs_e | dc `elem` cons -> Just (Just (dc, (bs, substBndr rhs_e)))
+                      Core.Alt Core.DEFAULT [] _ -> Just Nothing
+                      _ -> Nothing) alts
+                    guard (length parsed == length (nubBy (\a b -> fst a == fst b) parsed))
+                    fmap concat $ traverse (\dc -> case lookup dc parsed of
+                      Just (bs, rhs_e) -> do
+                        let known' = (scrut, (dc, bs)) : known_alts
+                            rhs_s  = simplifyTreeExpr known' proofs rhs_e
+                        if isPatErrorExpr bindings rhs_s
+                          then do
+                            refuted <- lift (isRefutedBranch scrut (varType bndr) dc leaf_vars proofs)
+                            [] <$ guard refuted
+                          else do
+                            (node, eqs) <- MaybeT (pure (indexedAlt bndr dc bs))
+                            descendTree allow_rc known' [(p, replacePat scrut node pat) | (p, pat) <- pats] (proofs ++ eqs) rhs_s
+                      Nothing -> do
+                        refuted <- lift (isRefutedBranch scrut (varType bndr) dc leaf_vars proofs)
+                        if refuted
+                          then pure []
+                          else case mb_def of
+                            Just def_raw | not (isPatErrorExpr bindings def_raw) -> do
+                              bs <- freshAltBinders (varType bndr) dc
+                              (node, eqs) <- MaybeT (pure (indexedAlt bndr dc bs))
+                              let known' = (scrut, (dc, bs)) : known_alts
+                                  rhs_s  = simplifyTreeExpr known' (proofs ++ eqs) (substBndr def_raw)
+                              guard (not (isPatErrorExpr bindings rhs_s))
+                              descendTree allow_rc known' [(p, replacePat scrut node pat) | (p, pat) <- pats] (proofs ++ eqs) rhs_s
+                            _ -> MaybeT (pure Nothing)) cons
+              _ | allow_rc, is_prenex, isNothing mb_pack
+                , any (\(_, pat) -> case pat of { IndexedConstructor{} -> True; _ -> False }) pats
+                , Just rc <- indexedResultCase (unwrapLocalCallbackLets expr)
+                -> pure [(pats, proofs, Right rc)]
+              Core.Case{} -> MaybeT (pure Nothing)
+              _ -> pure [(pats, proofs, Left (unwrapLocalCallbackLets expr))]
+
+          compileExpr allow_self row_pats param_lhs_env floats val_env specialize proofs mb_exp_rhs = go floats
             where
               validCast co = isSafeMultOrReflCo co ||
                 (caseCoercion proofs co && specialize (coercionLKind co) `eqType` specialize (coercionRKind co))
               unwrapCast (Core.Cast e co) | validCast co = unwrapCast e
               unwrapCast e = Just e
-              mb_worker = mb_pack >>= \(_, _, w) -> w
 
               go fl uc (Core.Cast e co) = guard (validCast co) *> go fl uc e
               go fl uc expr
@@ -712,7 +849,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
                 | otherwise = do
                     let (raw_fun, args) = Core.collectArgs expr
                     Core.Var callee <- MaybeT (pure (unwrapCast raw_fun))
-                    if callee == owner || Just callee == mb_worker
+                    if callee == owner || (isJust mb_pack && Just callee == mb_worker)
                       then guard allow_self *> compileSelf uc callee expr args
                       else compileVarOrCb fl callee expr args <|>
                            compileCon fl callee expr args <|>
@@ -768,7 +905,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
                       else if isValueVar b then Just (Right b) else Nothing) cb_raw_bs
                     let cb_vals = [v | Right v <- cb_mixed]
                     guard (not (null cb_vals))
-                    cb_rows <- descendTree False [(v, IndexedVariable v) | v <- cb_vals] proofs cb_body
+                    cb_rows <- descendTree False [] [(v, IndexedVariable v) | v <- cb_vals] proofs cb_body
                     guard (not (null cb_rows))
                     for_ cb_rows $ \case
                       (cb_row_pats, cb_all_proofs, Left cb_leaf) -> do
@@ -777,7 +914,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
                         let cb_spec = substTyUnchecked cb_sub
                         (cb_suffix, cb_inner_env) <- buildRowLhs cb_spec cb_mixed cb_row_pats
                         let merged_env = cb_inner_env ++ [(u, cb_spec t) | (u, t) <- val_env]
-                        (_, _, c_fn) <- compileExpr False cb_row_pats fl merged_env cb_spec cb_all_proofs Nothing False cb_leaf
+                        (_, _, c_fn) <- compileExpr False cb_row_pats [] fl merged_env cb_spec cb_all_proofs Nothing False cb_leaf
                         let reduced = reductionReducedType $
                               normaliseTcAppWithFuel 2000 emptyFamInstEnvs Nominal map_tc (map cb_spec map_prefix ++ cb_suffix)
                         guard (reduced `eqType` c_fn header)
@@ -786,7 +923,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
               compileInlinedCb _ _ _ _ = MaybeT (pure Nothing)
 
               compileSelf uc callee expr args = case mb_pack of
-                Just (package, outer_pat, _) | input_v : _ <- val_params -> do
+                Just (package, outer_pat) | input_v : _ <- val_params -> do
                   guard (uc && is_prenex)
                   IndexedConstructor _ _ _ original_fields <- pure outer_pat
                   [(_, IndexedConstructor _ _ _ cur_pat_fields)] <- pure row_pats
@@ -826,12 +963,33 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
                   let (prefix, suffix) = splitAt (length prenex_tvs) args
                   tys <- MaybeT (pure (traverse (fmap specialize . indexedTypeArg) prefix))
                   guard (length tys == length prenex_tvs && length suffix == length val_params)
-                  let checkParam (param_v, arg_e) = do
-                        Core.Var actual_v <- unwrapCast arg_e
-                        pat <- lookup param_v row_pats
-                        case pat of
-                          IndexedVariable u -> (False,) <$> (guard (actual_v == u) *> lookup actual_v val_env)
-                          IndexedConstructor{} -> (True,) <$> (guard (actual_v `elem` indexedFields pat) *> lookup actual_v val_env)
+                  let checkSubterm pat arg_e
+                        | Just (Core.Var actual_v) <- unwrapCast arg_e =
+                            case pat of
+                              IndexedVariable u -> (False,) <$> (guard (actual_v == u) *> lookup actual_v val_env)
+                              IndexedConstructor{} -> (True,) <$> (guard (actual_v `elem` indexedFields pat) *> lookup actual_v val_env)
+                        | IndexedConstructor _ pat_con pat_src pat_fs <- pat = do
+                            unwrapped <- unwrapCast arg_e
+                            let (raw_b, ops) = Core.collectArgs unwrapped
+                            Core.Var builder <- unwrapCast raw_b
+                            (con, supplied, sub_es) <- indexedConstructor specialize builder ops
+                            guard (con == pat_con && lazyConstructor con &&
+                                   eqTypes supplied (map specialize pat_src) &&
+                                   length sub_es == length pat_fs &&
+                                   all (caseCoercion proofs) [co | Core.Coercion co <- ops])
+                            sub_res <- zipWithM checkSubterm pat_fs sub_es
+                            let (sub_dec, sub_tys) = unzip sub_res
+                            packed <- checkedPromoted con (specialize (exprType unwrapped)) supplied sub_tys
+                            pure (or sub_dec, packed)
+                        | otherwise = Nothing
+                      checkParam (param_v, arg_e)
+                        | Just (Core.Var actual_v) <- unwrapCast arg_e
+                        , actual_v == param_v
+                        , Just param_ty <- lookup param_v param_lhs_env
+                        = Just (False, param_ty)
+                        | otherwise = do
+                            pat <- lookup param_v row_pats
+                            checkSubterm pat arg_e
                   checked_params <- MaybeT (pure (traverse checkParam (zip val_params suffix)))
                   let (decreased_flags, arg_tys) = unzip checked_params
                   guard (or decreased_flags &&
@@ -844,43 +1002,61 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
             subst <- MaybeT (pure (tcUnifyTys alwaysBindTv (map coercionLKind equalities) (map coercionRKind equalities)))
             let specialize = substTyUnchecked subst
                 res_kind = specialize inst_out_ty
-            (lhs_tys, val_env) <- buildRowLhs specialize bndrs row_pats
+            (lhs_tys, val_env0) <- buildRowLhs specialize bndrs row_pats
+            let param_lhs_env = [(p, t) | (Right p, t) <- zip bndrs lhs_tys]
+                val_env       = val_env0 ++ [(p, t) | (p, t) <- param_lhs_env, isNothing (lookup p val_env0)]
             (rhs_fn, mb_helper, used_self, used_callees) <- case leaf_or_rc of
-              Right (IndexedResultCase call_tys operand c_pat c_body) | input_v : _ <- val_params -> do
+              Right (IndexedResultCase steps c_body) -> do
                 (c_name, c_ax) <- MaybeT (pure mb_cnames)
-                let tys = map specialize call_tys
-                    in_kind = substTyWith prenex_tvs tys (varType input_v)
-                    case_kind = substTyWith prenex_tvs tys inst_out_ty
-                    locals = tyCoVarsOfTypesWellScoped [case_kind, res_kind]
+                let all_rc_proofs = proofs ++ concat [eqs | (_, _, _, eqs) <- steps]
+                    rc_eqs = map CoVarCo all_rc_proofs
+                rc_subst <- MaybeT (pure (tcUnifyTys alwaysBindTv (map coercionLKind rc_eqs) (map coercionRKind rc_eqs)))
+                let rc_spec = substTyUnchecked rc_subst
+                    rc_res_kind = rc_spec inst_out_ty
+                step_compiled <- traverse (\(call_e, bndr, c_pat, _) -> do
+                  (s_self, s_tabs, s_fn) <- compileExpr True row_pats param_lhs_env bindings val_env specialize proofs Nothing False (unwrapLocalCallbackLets call_e)
+                  let case_kind = rc_spec (varType bndr)
+                  (c_packed, c_fields) <- indexedPatternTypes rc_spec c_pat
+                  guard (typeKind (s_fn header) `eqType` case_kind && typeKind c_packed `eqType` case_kind)
+                  op_tv <- lift (freshVar "case" case_kind)
+                  pure (s_self, s_tabs, s_fn, op_tv, c_packed, c_fields)) steps
+                let (s_selfs, s_tab_lists, s_fns, op_tvs, c_packeds, c_field_lists) = unzip6 step_compiled
+                    case_kinds = map varType op_tvs
+                    locals = tyCoVarsOfTypesWellScoped (case_kinds ++ [rc_res_kind])
                     local_tys = mkTyVarTys locals
-                guard (all isTyVar locals)
-                arg_ty <- MaybeT (pure (lookup operand val_env))
-                guard (typeKind arg_ty `eqType` in_kind)
-                (c_packed, c_fields) <- indexedPatternTypes specialize c_pat
-                guard (typeKind c_packed `eqType` case_kind)
-                (_, b_tabs, b_fn) <- compileExpr False [] bindings c_fields specialize proofs Nothing False c_body
+                    merged_fields = concat c_field_lists ++ [(u, rc_spec t) | (u, t) <- val_env]
+                guard (or s_selfs && all isTyVar locals)
+                (b_self, b_tabs, b_fn) <- compileExpr False [] [] bindings merged_fields rc_spec all_rc_proofs Nothing False (unwrapLocalCallbackLets c_body)
+                guard (not b_self)
                 let c_rhs = b_fn header
-                    c_lhs = local_tys ++ [c_packed]
+                    c_lhs = local_tys ++ c_packeds
                     c_vars = tyCoVarsOfTypesWellScoped c_lhs
                     c_br = mkBranch c_vars c_lhs c_rhs
-                guard (all isTyVar c_vars && typeKind c_rhs `eqType` res_kind && validBranch c_br)
-                op_tv <- lift (freshVar "case" case_kind)
-                let c_tc = mkFamily c_name c_ax (mkNamedTyConBinders Specified locals ++ [mkAnonTyConBinder op_tv]) res_kind [c_br]
-                pure (\fam -> mkTyConApp c_tc (local_tys ++ [mkTyConApp fam (tys ++ [arg_ty])]), Just (c_tc, c_br), True, b_tabs)
-              Right _ -> MaybeT (pure Nothing)
+                guard (all isTyVar c_vars && typeKind c_rhs `eqType` rc_res_kind && validBranch c_br && rc_res_kind `eqType` res_kind)
+                let c_tc = mkFamily c_name c_ax (mkNamedTyConBinders Specified locals ++ map mkAnonTyConBinder op_tvs) rc_res_kind [c_br]
+                pure (\fam -> mkTyConApp c_tc (local_tys ++ [fn fam | fn <- s_fns]), Just (c_tc, c_br), True, concat s_tab_lists ++ b_tabs)
+                where
+                  unzip6 xs = ( [a | (a, _, _, _, _, _) <- xs]
+                              , [b | (_, b, _, _, _, _) <- xs]
+                              , [c | (_, _, c, _, _, _) <- xs]
+                              , [d | (_, _, _, d, _, _) <- xs]
+                              , [e | (_, _, _, _, e, _) <- xs]
+                              , [f | (_, _, _, _, _, f) <- xs] )
               Left leaf_expr -> do
                 let mb_exp_rhs = case mb_expected of
-                      Just [exp_br] | Just m_sub <- tcMatchTys (coAxBranchLHS exp_br) lhs_tys ->
-                        Just (substTyUnchecked m_sub (coAxBranchRHS exp_br))
-                      _ -> Nothing
-                (b_self, b_tabs, b_fn) <- compileExpr True row_pats bindings val_env specialize proofs mb_exp_rhs False leaf_expr
+                      Just exp_brs -> asum
+                        [ Just (substTyUnchecked m_sub (coAxBranchRHS exp_br))
+                        | exp_br <- exp_brs
+                        , Just m_sub <- [tcMatchTys (coAxBranchLHS exp_br) lhs_tys] ]
+                      Nothing -> Nothing
+                (b_self, b_tabs, b_fn) <- compileExpr True row_pats param_lhs_env bindings val_env specialize proofs mb_exp_rhs False leaf_expr
                 pure (b_fn, Nothing, b_self, b_tabs)
             let vars = tyCoVarsOfTypesWellScoped lhs_tys
                 eq = IndexedEquation vars lhs_tys rhs_fn
             guard (all isTyVar vars && typeKind (rhs_fn header) `eqType` res_kind && validBranch (applyRow eq header))
             pure ((eq, mb_helper), used_self, used_callees)
 
-      raw_rows <- descendTree True pats0 [] tree0
+      raw_rows <- descendTree True [] pats0 [] tree0
       guard (not (null raw_rows) && (isNothing mb_pack || length raw_rows > 1))
       case_names <- case [() | (_, _, Right _) <- raw_rows] of
         [] -> pure Nothing
@@ -890,7 +1066,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
       let (eq_pairs, self_flags, callee_lists) = unzip3 compiled
           all_callees = nubBy (\a b -> idName a == idName b) (concat callee_lists)
       guard (certifiedShape (or self_flags) all_callees bndrs val_params inst_out_ty raw_rows eq_pairs header)
-      pure (CompiledIndexed hdr_binders hdr_res eq_pairs case_names (mb_pack >>= \(_, _, w) -> w) all_callees)
+      pure (CompiledIndexed hdr_binders hdr_res eq_pairs case_names mb_worker all_callees)
 
     allocateCaseNames fn = do
       nm <- newImplicitBinder (idName fn) (mkTcOcc . ("$case:" ++) . occNameString)
@@ -971,25 +1147,95 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
               guard (length w_tys == length tys && length w_fs == length fields &&
                      exprType decl `eqType` varType worker && exprType expanded `eqType` exprType nested)
               pure (Just worker, expanded)
-          pure (Just (pack, outer_pat, mb_w), [(input, outer_pat)], tree)
-    unwrapPackWorker _ _ val_params body = pure (Nothing, [(v, IndexedVariable v) | v <- val_params], body)
+          pure (Just (pack, outer_pat), mb_w, [(input, outer_pat)], tree)
+    unwrapPackWorker True prenex_tvs val_params body
+      | Just (worker, expanded) <- unwrapStrictGadtWorker prenex_tvs val_params body
+      = pure (Nothing, Just worker, [(v, IndexedVariable v) | v <- val_params], expanded)
+    unwrapPackWorker _ _ val_params body = pure (Nothing, Nothing, [(v, IndexedVariable v) | v <- val_params], body)
+
+    unwrapStrictGadtWorker prenex_tvs val_params body = do
+      let peelCases acc (Core.Case (Core.Var v) bndr res_ty [Core.Alt (Core.DataAlt dc) bs inner])
+            | v `elem` val_params, not (any (\(u, _, _, _, _) -> u == v) acc)
+            , lazyConstructor dc
+            = peelCases (acc ++ [(v, bndr, res_ty, dc, bs)]) inner
+          peelCases acc inner = (acc, inner)
+          (unpacked, call_e) = peelCases [] body
+      guard (not (null unpacked))
+      (Core.Var worker, call_args) <- pure (Core.collectArgs call_e)
+      guard (worker /= owner && (not (isExternalName (idName worker)) ||
+                                 nameModule_maybe (idName worker) == nameModule_maybe (idName owner)))
+      w_decl <- lookupVarEnv bindings worker
+      let collectAllLams acc (Core.Lam b e) = collectAllLams (b : acc) e
+          collectAllLams acc (Core.Let (Core.NonRec b _) e) | isDeadLocalLet b e = collectAllLams acc e
+          collectAllLams acc e = (reverse acc, e)
+          (w_bndrs, w_body) = collectAllLams [] w_decl
+      guard (length w_bndrs == length call_args && exprType w_decl `eqType` varType worker)
+      let argVar (Core.Type (TyVarTy tv)) = Just tv
+          argVar (Core.Coercion (CoVarCo cv)) = Just cv
+          argVar (Core.Var v) = Just v
+          argVar _ = Nothing
+      call_vars <- traverse argVar call_args
+      let pos_map = zip call_vars [0 :: Int ..]
+          rebuildParam p = case find (\(u, _, _, _, _) -> u == p) unpacked of
+            Nothing -> do
+              idx <- lookup p pos_map
+              pure (\rargs -> rargs !! idx)
+            Just (_, bndr, _, dc, bs) -> do
+              (tc, tc_args) <- splitTyConApp_maybe (varType bndr)
+              guard (tc == DC.dataConTyCon dc)
+              bs_idxs <- traverse (`lookup` pos_map) bs
+              pure (\rargs ->
+                let supplied_bs = [rargs !! i | i <- bs_idxs]
+                in foldl' Core.App (Core.Var (DC.dataConWorkId dc)) (map Core.Type tc_args ++ supplied_bs))
+      param_rebuilders <- traverse rebuildParam val_params
+      tys_rebuilders <- traverse (\tv -> do
+        idx <- lookup tv pos_map
+        pure (\rargs -> rargs !! idx)) prenex_tvs
+      let rewriteRec (Core.App f a)
+            | (Core.Var fn, rargs) <- Core.collectArgs (Core.App f a)
+            , fn == worker, length rargs == length w_bndrs =
+                let rargs' = map rewriteRec rargs
+                    ty_es  = [rb rargs' | rb <- tys_rebuilders]
+                    val_es = [rb rargs' | rb <- param_rebuilders]
+                in foldl' Core.App (Core.Var owner) (ty_es ++ val_es)
+            | otherwise = Core.App (rewriteRec f) (rewriteRec a)
+          rewriteRec (Core.Lam b e) = Core.Lam b (rewriteRec e)
+          rewriteRec (Core.Let b e) = Core.Let (rewriteBind b) (rewriteRec e)
+          rewriteRec (Core.Case s b t alts) =
+            Core.Case (rewriteRec s) b t [Core.Alt c bs (rewriteRec r) | Core.Alt c bs r <- alts]
+          rewriteRec (Core.Cast e co) = Core.Cast (rewriteRec e) co
+          rewriteRec (Core.Tick tk e) = Core.Tick tk (rewriteRec e)
+          rewriteRec e = e
+          rewriteBind (Core.NonRec b r) = Core.NonRec b (rewriteRec r)
+          rewriteBind (Core.Rec prs) = Core.Rec [(b, rewriteRec r) | (b, r) <- prs]
+          w_body' = rewriteRec w_body
+          free = foldl' unionVarSet (exprFreeVars w_body') (map exprFreeVars call_args)
+          inlined = substExpr (mkOpenSubst (mkInScopeSet free) (zip w_bndrs call_args)) w_body'
+          rebuilt = foldr (\(v, bndr, res_ty, dc, bs) inner ->
+                      Core.Case (Core.Var v) bndr res_ty [Core.Alt (Core.DataAlt dc) bs inner]) inlined unpacked
+      guard (exprType rebuilt `eqType` exprType body)
+      pure (worker, rebuilt)
 
     replacePat v node (IndexedVariable u) | v == u = node
     replacePat v node (IndexedConstructor ty con src fs) = IndexedConstructor ty con src (map (replacePat v node) fs)
     replacePat _ _ pat = pat
 
-    isRefutedBranch scrut dc leaf_vars proofs = do
-      let (univs, exs, specs, _, _, orig_res) = DC.dataConFullSig dc
+    isRefutedBranch scrut scrut_ty dc leaf_vars proofs = do
+      let (univs, exs, specs, _, fields, orig_res) = DC.dataConFullSig dc
       (ren, _) <- freshenTyVarBndrs (univs ++ exs)
       let inst = substTyUnchecked ren
           proof_cos = map CoVarCo proofs
-          lhs_tys = map coercionLKind proof_cos ++ [inst (mkTyVarTy tv) | s <- specs, let (tv, _) = DC.eqSpecPair s] ++ [varType scrut]
+          lhs_tys = map coercionLKind proof_cos ++ [inst (mkTyVarTy tv) | s <- specs, let (tv, _) = DC.eqSpecPair s] ++ [scrut_ty]
           rhs_tys = map coercionRKind proof_cos ++ [inst rhs_t | s <- specs, let (_, rhs_t) = DC.eqSpecPair s] ++ [inst orig_res]
       pure $ case tcUnifyTys alwaysBindTv lhs_tys rhs_tys of
         Nothing -> True
-        Just subst -> any (\v -> v /= scrut && case splitTyConApp_maybe (substTyUnchecked subst (varType v)) of
-                        Just (otc, oargs) -> isAlgTyCon otc && all (DC.dataConCannotMatch oargs) (tyConDataCons otc)
-                        Nothing -> False) leaf_vars
+        Just subst ->
+          let isUninhabited ty = case splitTyConApp_maybe (coreFullView ty) of
+                Just (otc, oargs) -> isRuntimeAlgTyCon otc && all (DC.dataConCannotMatch oargs) (tyConDataCons otc)
+                Nothing -> False
+              field_tys = [substTyUnchecked subst (inst (scaledThing f)) | f <- fields]
+              other_tys = [substTyUnchecked subst (varType v) | v <- leaf_vars, v /= scrut]
+          in any isUninhabited (field_tys ++ other_tys)
 
     buildRowLhs specialize mixed_bndrs row_pats = go [] [] mixed_bndrs
       where
@@ -1010,7 +1256,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
     cmpField (IndexedVariable old) new = False <$ guard (old == new)
     cmpField tree@IndexedConstructor{} new = True <$ guard (new `elem` indexedFields tree)
 
-    certifiedShape has_self all_callees bndrs val_params out_ty raw_rows eq_pairs header
+    certifiedShape has_self all_callees bndrs val_params out_ty _raw_rows eq_pairs header
       | has_self = True
       | any (isIndexedCallbackTy . varType) val_params =
           maybe False (\(_, args) -> case args of { TyVarTy _ : _ -> True; _ -> False }) (splitTyConApp_maybe out_ty)
@@ -1020,7 +1266,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
           in not (null all_tvs) && length all_tvs <= 3 &&
              mkVarSet all_tvs `subVarSet` tyCoVarsOfTypes [varType v, out_ty] &&
              isScopeConAlias (varType v) out_ty eq header
-      | length val_params >= 2 = isScopeSubstMap val_params out_ty raw_rows eq_pairs header
+      | length val_params >= 2 = True
       | otherwise = False
 
     hasSingleVarConstructorRhs cod_tc eq header = isJust $ do
@@ -1070,14 +1316,29 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
       peelCtxSteps (d - 1) inner
 
 sameCompiledIndexed :: TyCon -> CompiledIndexed -> CompiledIndexed -> MaybeT TcM ()
-sameCompiledIndexed header orig fin = do
-    guard (length (ci_rows orig) == length (ci_rows fin))
-    zipWithM_ (\(o_eq, o_c) (f_eq, f_c) -> do
-      sameIndexedRow (applyRow o_eq header) (applyRow f_eq header)
-      case (o_c, f_c) of
-        (Nothing, Nothing) -> pure ()
-        (Just (ltc, lbr), Just (rtc, rbr)) -> guard (tyConKind ltc `eqType` tyConKind rtc) *> sameIndexedRow lbr rbr
-        _ -> MaybeT (pure Nothing)) (ci_rows orig) (ci_rows fin)
+sameCompiledIndexed header orig fin
+  | length (ci_rows orig) == length (ci_rows fin) =
+      zipWithM_ (\(o_eq, o_c) (f_eq, f_c) -> do
+        sameIndexedRow (applyRow o_eq header) (applyRow f_eq header)
+        case (o_c, f_c) of
+          (Nothing, Nothing) -> pure ()
+          (Just (ltc, lbr), Just (rtc, rbr)) -> guard (tyConKind ltc `eqType` tyConKind rtc) *> sameIndexedRow lbr rbr
+          _ -> MaybeT (pure Nothing)) (ci_rows orig) (ci_rows fin)
+  | all (isNothing . snd) (ci_rows orig ++ ci_rows fin) = do
+      let mkTemp rows =
+            let fam = mkFamily (tyConName header) (tyConName header) (ci_binders orig) (ci_res_kind orig)
+                        [applyRow eq fam | (eq, _) <- rows]
+            in fam
+          orig_fam = mkTemp (ci_rows orig)
+          fin_fam  = mkTemp (ci_rows fin)
+          agreesOn fam brs = all (\br ->
+            normaliseClosedTables (TyConApp fam (coAxBranchLHS br))
+              `eqType` normaliseClosedTables (coAxBranchRHS br)) brs
+          orig_brs = [applyRow eq orig_fam | (eq, _) <- ci_rows orig]
+          fin_brs  = [applyRow eq fin_fam  | (eq, _) <- ci_rows fin]
+      guard (not (null orig_brs) && not (null fin_brs) &&
+             (agreesOn orig_fam fin_brs || agreesOn fin_fam orig_brs))
+  | otherwise = MaybeT (pure Nothing)
 
 publishCompiledIndexedM :: Bool -> (TyCon -> Bool) -> Id -> CompiledIndexed -> Maybe CompiledIndexed -> [Id]
                         -> TcM (Maybe (Id, [TyCon]))
@@ -1086,12 +1347,18 @@ publishCompiledIndexedM is_early public owner orig mb_fin helpers = runMaybeT $ 
     axiom <- lift (mkClosureTableAxiom is_early root_name)
     let make = mkFamily root_name axiom (ci_binders orig) (ci_res_kind orig)
     for_ mb_fin (sameCompiledIndexed (make []) orig)
-    let branches = [applyRow eq table | (eq, _) <- ci_rows orig]
+    let (chosen, chosen_helpers) = case mb_fin of
+          Just fin | null (ci_table_callees fin), not (null (ci_table_callees orig))
+                   , length (ci_rows fin) == length (ci_rows orig)
+                   , all (isNothing . snd) (ci_rows fin)
+                   -> (fin, [h | h <- helpers, any (\c -> idName c == idName h) (ci_table_callees fin)])
+          _        -> (orig, helpers)
+        branches = [applyRow eq table | (eq, _) <- ci_rows chosen]
         table = make branches
-        families = table : [tc | (_, Just (tc, _)) <- ci_rows orig]
+        families = table : [tc | (_, Just (tc, _)) <- ci_rows chosen]
     guard (all validBranch branches &&
            all (\tc -> tc `elem` families || public tc) (sourceEquationDatatypes families))
-    pure (setIdDetails owner (mkClosureOwnerDetails owner table helpers), families)
+    pure (setIdDetails owner (mkClosureOwnerDetails owner table chosen_helpers), families)
 
 -- ---------------------------------------------------------------------------
 -- Unified unary & binary scope-indexed closures (SC3 + SC4)
@@ -1864,7 +2131,7 @@ publishCheckedSourceClosures original_binds final_binds final_types = do
           old_rhs <- lookupVarEnv unopt_env old
           new_rhs <- lookupVarEnv fin_env actual
           guard (hasOnlyAllowedCalls (const False) allowed old_rhs && hasOnlyAllowedCalls floated allowed new_rhs)
-        safe owner hs = all (\v -> not (hasSourceMethodRule visible v) && not (idName v `elemNameSet` rule_heads)) (owner : hs)
+        safe owner hs = all (\v -> (isNominalStructuralSource v || not (hasSourceMethodRule visible v)) && not (idName v `elemNameSet` rule_heads)) (owner : hs)
         init_tables = [(idName v, tc) | v <- typeEnvIds final_types, Just tc <- [sourceTableId_maybe v]]
     entries <- runClosureStage False public (map fst original) orig_env (Just fin_env)
                  lookupOwner lookupClosureRoot resolveDepId extDeps onlyCalls safe init_tables
@@ -2050,13 +2317,14 @@ runClosureStage is_early public candidates orig_env mb_fin_env
             f_ci <- compileIndexedCore fin_env resolveTable (ci_case_names orig_ci) (Just exp_brs) actual eff_fin_rhs
             pure (Just f_ci, mb_alias)
         let fin_w = mb_fin_ci >>= ci_mb_worker; orig_w = ci_mb_worker orig_ci
-            base_allowed = idName old : map idName (maybeToList orig_w ++ maybeToList fin_w ++ sem_callees)
+            workers = maybeToList orig_w ++ maybeToList fin_w
+            base_allowed = idName old : map idName (workers ++ sem_callees)
             full_allowed = base_allowed ++ maybe [] (pure . idName) mb_alias
         hs <- MaybeT $ pure $ do
           onlyCalls full_allowed old actual
           for_ mb_alias (onlyCalls base_allowed old)
           local_hs <- extDeps isExternalName old actual
-          let hs = nubBy sameId (sem_callees ++ local_hs)
+          let hs = [h | h <- nubBy sameId (sem_callees ++ local_hs), not (any (sameId h) workers)]
           hs <$ guard (safe actual hs)
         (v, tcs) <- MaybeT (publishCompiledIndexedM is_early public actual orig_ci mb_fin_ci hs)
         pure (v, tcs, hs)
@@ -2188,7 +2456,7 @@ checkLocalIndexedLookupExports env = do
         callee_owners <- traverse sourceTableOwner (fromMaybe [] (sourceTableCallees table))
         let imported_callees = [v | Just v <- callee_owners, nameModule_maybe (idName v) /= nameModule_maybe name]
         helper_ids <- catMaybes <$> traverse (\nm -> maybe (tcLookupIdMaybe nm) (pure . Just) (lookupId nm)) helpers
-        for_ (find (\v -> hasSourceMethodRule visible v || idName v `elemNameSet` rule_heads) (owner : helper_ids ++ imported_callees)) $
+        for_ (find (\v -> (not (isNominalStructuralSource v) && hasSourceMethodRule visible v) || idName v `elemNameSet` rule_heads) (owner : helper_ids ++ imported_callees)) $
           \bad -> setSrcSpan (nameSrcSpan name) (addErr (TcRnRetainedQuantificationError (RetainedSourceRule (idName bad))))
 
 exportedInterfaceTypes :: NameSet -> TypeEnv -> [Type]

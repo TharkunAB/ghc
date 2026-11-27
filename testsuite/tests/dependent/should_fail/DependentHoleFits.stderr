@@ -61,7 +61,7 @@ DependentHoleFits.hs:38:26: error: [GHC-88464]
           with trans @(Succ (plus (plus m2 n2) p))
                      @b1
                      @(Succ (plus m2 (plus n2 p)))
-        cong (_ :: Nat %GHC.Internal.Types.Matchable -> Nat)
+        cong (_ :: Nat -> Nat)
              (_ :: plus (plus m2 n2) p :~: plus m2 (plus n2 p))
           where cong :: forall {a} {b} {m :: Matchability}.
                         forall (f :: a %m -> b) ->

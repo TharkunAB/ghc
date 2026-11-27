@@ -275,9 +275,11 @@ corePrepPgmWith scoped logger cp_cfg pgm_cfg this_mod binds =
             "Native dependent Core requires CorePrep program Lint before and after preparation.")
           Just lint_cfg -> do
             let checked_lint_cfg = lint_cfg { lpr_preSubst = False }
+                before_lint_flags = (lpr_makeLintFlags checked_lint_cfg) { lf_check_rubbish_lits = False }
             let lint = if scoped then lintScopedDictionaryPassResult else lintPassResult
             lint logger
-              (checked_lint_cfg { lpr_passPpr = text "before native CorePrep" })
+              (checked_lint_cfg { lpr_passPpr = text "before native CorePrep"
+                                , lpr_makeLintFlags = before_lint_flags })
               binds
             let lint_flags = (lpr_makeLintFlags checked_lint_cfg) { lf_after_core_prep = True }
             return (end_pass_cfg { ep_lintPassResult =
@@ -910,11 +912,22 @@ cpeBodyF env (Pack schema witness payload)
        ; return (floats, Pack (cpSubstTy env schema) (cpSubstTy env witness) payload') }
 
 cpeBodyF env (Unpack witness value package body)
-  = do { package' <- cpeBody env package
+  = do { let clean_pkg
+               | isRubbishPackageExpr package
+               = mkImpossibleExpr (exprType package) "cpeBodyF: absent existential package"
+               | otherwise
+               = package
+       ; package' <- cpeBody env clean_pkg
        ; (witness_env, witness') <- cpCloneBndr env witness
        ; (body_env, value') <- cpCloneBndr witness_env value
        ; body' <- cpeBody body_env body
        ; return (emptyFloats, Unpack witness' value' package' body') }
+  where
+    isRubbishPackageExpr (Lit l)    = isLitRubbish l
+    isRubbishPackageExpr (App f _)  = isRubbishPackageExpr f
+    isRubbishPackageExpr (Cast e _) = isRubbishPackageExpr e
+    isRubbishPackageExpr (Tick _ e) = isRubbishPackageExpr e
+    isRubbishPackageExpr _          = False
 
 cpeBodyF env (Cast expr co)
    = do { (floats, expr') <- cpeBodyF env expr

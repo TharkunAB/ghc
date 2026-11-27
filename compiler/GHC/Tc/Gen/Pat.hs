@@ -91,6 +91,7 @@ import GHC.Data.List.SetOps ( getNth )
 
 import Data.List( partition )
 import Data.Maybe (fromMaybe, isJust, maybeToList)
+import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Writer.CPS
 import Control.Monad.Trans.Class
 
@@ -1054,6 +1055,15 @@ AST is used for the subtraction operation.
 
     InvisPat _ _ -> panic "tc_pat: invisible pattern appears recursively in the pattern"
 
+    XPat (HsPatExpanded (VarPat _ (L _ tv_nm)) (VarPat x (L l var_nm)))
+      | isTyVarName tv_nm -> do
+      { (wrap, id) <- tcPatBndr penv var_nm scaled_exp_pat_ty
+      ; res <- tcCheckUsage var_nm w_pat $
+               tcExtendIdEnv1 var_nm id $
+               tcExtendIdEnv1 tv_nm id thing_inside
+      ; pat_ty <- readExpType exp_pat_ty
+      ; return (mkHsWrapPat wrap (VarPat x (L l id)) pat_ty, res) }
+
     XPat (HsPatExpanded lpat rpat) -> do
       { (rpat', res) <- tc_pat scaled_exp_pat_ty penv rpat thing_inside
       ; return (XPat $ ExpansionPat lpat rpat', res) }
@@ -1516,9 +1526,11 @@ tcDataConPatWithIndex index (L con_span con_name) data_con pat_ty_scaled
       = if isInferredRetainedBinder b
         then (genWildPat :) <$> align_rep_pats bs ps
         else case ps of
-          L ploc (InvisPat SpecifiedSpec tp) : ps'
-            | Just pat <- tyPatToRetainedPat ploc tp -> (pat :) <$> align_rep_pats bs ps'
-            | otherwise -> setSrcSpanA ploc bad_pkg_pat
+          L ploc (InvisPat SpecifiedSpec tp) : ps' -> do
+            mb_pat <- tyPatToRetainedPat ploc tp
+            case mb_pat of
+              Just pat -> (pat :) <$> align_rep_pats bs ps'
+              Nothing  -> setSrcSpanA ploc bad_pkg_pat
           _ -> (genWildPat :) <$> align_rep_pats bs ps
     align_rep_pats (_ : bs) (p : ps)
       | InvisPat _ tp <- unLoc p
@@ -1780,6 +1792,7 @@ retainedConPat pat = pat
 isRetainedVarPat :: LPat GhcRn -> Bool
 isRetainedVarPat (L _ VarPat{}) = True
 isRetainedVarPat (L _ WildPat{}) = True
+isRetainedVarPat (L _ (XPat (HsPatExpanded _ rpat))) = isRetainedVarPat (noLocA rpat)
 isRetainedVarPat _ = False
 
 -- | Bind an anonymous retained value at the identity used by its dependants.
@@ -1790,46 +1803,49 @@ bindRetainedWildcard _ pat = pat
 
 -- | Convert a renamed @\@pat@ ('HsTyPat') into the corresponding runtime pattern
 -- for a 'SpecifiedSpec' invisible @foreach@ binder.
-tyPatToRetainedPat :: SrcSpanAnnA -> HsTyPat GhcRn -> Maybe (LPat GhcRn)
-tyPatToRetainedPat outer_loc (HsTP _ body) = go_ty outer_loc body
+tyPatToRetainedPat :: SrcSpanAnnA -> HsTyPat GhcRn -> TcM (Maybe (LPat GhcRn))
+tyPatToRetainedPat outer_loc (HsTP _ body) = runMaybeT (go_ty outer_loc body)
   where
-    go_ty :: SrcSpanAnnA -> LHsType GhcRn -> Maybe (LPat GhcRn)
+    go_ty :: SrcSpanAnnA -> LHsType GhcRn -> MaybeT TcM (LPat GhcRn)
     go_ty ploc (L _ (HsParTy _ inner)) =
       L ploc . ParPat noExtField <$> go_ty (getLoc inner) inner
     go_ty ploc (L _ (HsKindSig _ inner _)) =
       go_ty ploc inner
     go_ty ploc (L _ (HsWildCardTy _)) =
-      Just (L ploc (WildPat noExtField))
+      pure (L ploc (WildPat noExtField))
     go_ty _ (L l (HsTyVar _ _ (L lv (WithUserRdr rdr nm))))
-      | isTyVarName nm =
-          let var_nm = mkInternalName (nameUnique nm)
+      | isTyVarName nm = do
+          uniq <- lift newUnique
+          let var_nm = mkInternalName uniq
                          (setOccNameSpace GHC.Types.Name.varName (nameOccName nm))
                          (nameSrcSpan nm)
-          in Just (L l (VarPat noExtField (L lv var_nm)))
+              orig_p = VarPat noExtField (L lv nm)
+              var_p  = VarPat noExtField (L lv var_nm)
+          pure (L l (XPat (HsPatExpanded orig_p var_p)))
       | isVarName nm =
-          Just (L l (VarPat noExtField (L lv nm)))
+          pure (L l (VarPat noExtField (L lv nm)))
       | isDataOcc (nameOccName nm) =
-          Just (L l (ConPat noExtField (L lv (WithUserRdr rdr nm)) (PrefixCon noExtField [])))
-      | otherwise = Nothing
+          pure (L l (ConPat noExtField (L lv (WithUserRdr rdr nm)) (PrefixCon noExtField [])))
+      | otherwise = MaybeT (pure Nothing)
     go_ty _ (L l (HsOpTy _ lhs (L _ (HsTyVar _ _ (L lo (WithUserRdr rdr nm)))) rhs))
       | isDataOcc (nameOccName nm) = do
           lhs' <- go_ty (getLoc lhs) lhs
           rhs' <- go_ty (getLoc rhs) rhs
-          Just (L l (ConPat noExtField (L lo (WithUserRdr rdr nm)) (PrefixCon noExtField [lhs', rhs'])))
+          pure (L l (ConPat noExtField (L lo (WithUserRdr rdr nm)) (PrefixCon noExtField [lhs', rhs'])))
     go_ty ploc ty
       | Just (L lc (WithUserRdr rdr nm), args) <- split_con_app ty []
       , isDataOcc (nameOccName nm) = do
           args' <- mapM (\a -> go_ty (getLoc a) a) args
-          Just (L ploc (ConPat noExtField (L lc (WithUserRdr rdr nm)) (PrefixCon noExtField args')))
+          pure (L ploc (ConPat noExtField (L lc (WithUserRdr rdr nm)) (PrefixCon noExtField args')))
     go_ty _ (L l (HsExplicitListTy _ _ tys)) = do
       pats <- mapM (\a -> go_ty (getLoc a) a) tys
       let nil_p = L l (ConPat noExtField (noLocA (noUserRdr (dataConName nilDataCon))) (PrefixCon noExtField []))
           cons_p a acc = L l (ConPat noExtField (noLocA (noUserRdr (dataConName consDataCon))) (PrefixCon noExtField [a, acc]))
-      Just (foldr cons_p nil_p pats)
+      pure (foldr cons_p nil_p pats)
     go_ty _ (L l (HsExplicitTupleTy _ _ tys)) = do
       pats <- mapM (\a -> go_ty (getLoc a) a) tys
-      Just (L l (TuplePat noExtField pats Boxed))
-    go_ty _ _ = Nothing
+      pure (L l (TuplePat noExtField pats Boxed))
+    go_ty _ _ = MaybeT (pure Nothing)
 
     split_con_app (L _ (HsAppTy _ f a)) acc     = split_con_app f (a : acc)
     split_con_app (L _ (HsAppKindTy _ f _)) acc = split_con_app f acc

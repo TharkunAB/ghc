@@ -165,16 +165,19 @@ tcFunBindMatches ctxt fun_name mult raw_matches invis_pat_tys source_exp_ty
     do  { source_matches <- desugarExistsPackMatchGroup raw_matches
         ; -- Check that they all have the same no of arguments
           source_arity <- checkArgCounts source_matches
-        ; let (visibility_wrap, matches, exp_ty, arity)
-                | Check ty <- source_exp_ty
-                , not (rhs_has_invis_lam source_matches)
-                , (indices@(_:_), co) <- exposeInvisibleRetained ty
-                = ( mkWpCastR co
-                  , source_matches { mg_alts = fmap (map (alignInvisibleRetainedPatterns True invis_pat_tys indices)) (mg_alts source_matches) }
-                  , mkCheckExpType (coercionLKind co)
-                  , source_arity + length indices )
-                | otherwise = (idHsWrapper, source_matches, source_exp_ty, source_arity)
-              herald = ExpectedFunTyMatches (NameThing fun_name) source_matches
+        ; (visibility_wrap, matches, exp_ty, arity)
+            <- case source_exp_ty of
+                 Check ty
+                   | not (rhs_has_invis_lam source_matches)
+                   , (indices@(_:_), co) <- exposeInvisibleRetained ty -> do
+                       alts' <- traverse (traverse (alignInvisibleRetainedPatterns True invis_pat_tys indices))
+                                  (mg_alts source_matches)
+                       pure ( mkWpCastR co
+                            , source_matches { mg_alts = alts' }
+                            , mkCheckExpType (coercionLKind co)
+                            , source_arity + length indices )
+                 _ -> pure (idHsWrapper, source_matches, source_exp_ty, source_arity)
+        ; let herald = ExpectedFunTyMatches (NameThing fun_name) source_matches
               tc_matches pat_tys rhs_ty = tcScalingUsage mult $
                 do { traceTc "tcFunBindMatches 2" $
                      vcat [ text "ctxt:" <+> pprUserTypeCtxt ctxt
@@ -217,14 +220,14 @@ exposeInvisibleRetained ty
 -- binders and insert implicit runtime patterns for omitted or 'InferredSpec'
 -- binders. See Note [Invisible retained definition patterns].
 alignInvisibleRetainedPatterns :: Bool -> [ExpPatType] -> [Id]
-                               -> LMatch GhcRn body -> LMatch GhcRn body
+                               -> LMatch GhcRn body -> TcM (LMatch GhcRn body)
 alignInvisibleRetainedPatterns from_fun_bind invis_pat_tys indices
                                (L loc match@Match { m_pats = L pat_loc pats })
-  = L loc (match { m_pats = L pat_loc (erased_invis ++ retained_pats ++ leftover_invis ++ values) })
+  = do { (retained_pats, leftover_invis) <- build_retained indices rem_invis
+       ; pure (L loc (match { m_pats = L pat_loc (erased_invis ++ retained_pats ++ leftover_invis ++ values) })) }
   where
     (leading_invis, values) = span (not . isVisArgLPat) pats
     (erased_invis, rem_invis) = split_erased invis_pat_tys leading_invis
-    (retained_pats, leftover_invis) = build_retained indices rem_invis
 
     split_erased [] ps = ([], ps)
     split_erased (ExpForAllPatTy _ (Bndr _ (Invisible spec)) : ptys)
@@ -238,18 +241,21 @@ alignInvisibleRetainedPatterns from_fun_bind invis_pat_tys indices
       | from_fun_bind = noLocA (VarPat noExtField (noLocA (idName b)))
       | otherwise     = noLocA (WildPat noExtField)
 
-    build_retained [] ps = ([], ps)
+    build_retained [] ps = pure ([], ps)
     build_retained (b : bs) ps
       | isInferredRetainedBinder b
-      = let (more, rest) = build_retained bs ps
-        in (implicit_pat b : more, rest)
+      = do { (more, rest) <- build_retained bs ps
+           ; pure (implicit_pat b : more, rest) }
       | L ploc (InvisPat SpecifiedSpec tp) : ps' <- ps
-      , Just pat <- tyPatToRetainedPat ploc tp
-      = let (more, rest) = build_retained bs ps'
-        in (pat : more, rest)
+      = do { mb_pat <- tyPatToRetainedPat ploc tp
+           ; case mb_pat of
+               Just pat -> do { (more, rest) <- build_retained bs ps'
+                              ; pure (pat : more, rest) }
+               Nothing  -> do { (more, rest) <- build_retained bs ps
+                              ; pure (implicit_pat b : more, rest) } }
       | otherwise
-      = let (more, rest) = build_retained bs ps
-        in (implicit_pat b : more, rest)
+      = do { (more, rest) <- build_retained bs ps
+           ; pure (implicit_pat b : more, rest) }
 
 -- | Desugar single-equation explicit @Pack@ patterns in function or lambda
 -- argument columns into nested @case@ expressions checked by 'tcExistsCase'.
@@ -456,11 +462,11 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
        ; case mb_desugared of
            Just (arg_pats, single_group) ->
              tcRetainedVarMatches herald ctxt ty arg_pats $ \pat_tys rhs_ty boundary names ->
-               let L g_loc [L m_loc m0@(Match { m_pats = L p_loc ps0 })] = mg_alts single_group
-                   m1 = m0 { m_pats = L p_loc (bindRetainedWildcards names ps0) }
-                   prepared = single_group { mg_alts = L g_loc [L m_loc m1] }
-               in tcExprMatchesWithWhereFrom id mctxt (invis_pat_tys ++ pat_tys) rhs_ty
-                    (maybe prepared (\(prefix, indices) -> splitRetainedSuffix prefix indices prepared) boundary)
+               do { let L g_loc [L m_loc m0@(Match { m_pats = L p_loc ps0 })] = mg_alts single_group
+                        m1 = m0 { m_pats = L p_loc (bindRetainedWildcards names ps0) }
+                        prepared = single_group { mg_alts = L g_loc [L m_loc m1] }
+                  ; group' <- maybe (pure prepared) (\(prefix, indices) -> splitRetainedSuffix prefix indices prepared) boundary
+                  ; tcExprMatchesWithWhereFrom id mctxt (invis_pat_tys ++ pat_tys) rhs_ty group' }
            Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedConstructorArguments) }
   | [source_column] <- filter (`elem` constructor_columns) (retained_columns 0 ty)
   , source_column > 0
@@ -495,10 +501,10 @@ tcRetainedMatches herald ctxt mctxt arity invis_pat_tys ty matches
       [L loc match@(Match { m_pats = L pat_loc pats })]
         | not (first_retained_constructor pats) ->
           tcRetainedVarMatches herald ctxt ty pats $ \pat_tys rhs_ty boundary names ->
-            let match' = match { m_pats = L pat_loc (bindRetainedWildcards names pats) }
-                prepared = matches { mg_alts = L (getLoc (mg_alts matches)) [L loc match'] }
-            in tcExprMatchesWithWhereFrom (const match) mctxt (invis_pat_tys ++ pat_tys) rhs_ty
-                 (maybe prepared (\(prefix, indices) -> splitRetainedSuffix prefix indices prepared) boundary)
+            do { let match' = match { m_pats = L pat_loc (bindRetainedWildcards names pats) }
+                     prepared = matches { mg_alts = L (getLoc (mg_alts matches)) [L loc match'] }
+               ; group' <- maybe (pure prepared) (\(prefix, indices) -> splitRetainedSuffix prefix indices prepared) boundary
+               ; tcExprMatchesWithWhereFrom (const match) mctxt (invis_pat_tys ++ pat_tys) rhs_ty group' }
       rows@(_ : _ : _)
         | plain_visible_arrows arity ty
         , not (null constructor_columns)
@@ -1245,13 +1251,17 @@ tcRetainedVarMatches herald ctxt initial_ty source_pats = go [] initial_ty initi
     go acc ty (pat : pats) thing_inside
       | DepFunTy DepFunVisible binder _ <- coreFullView ty
       = setSrcSpanA (getLoc pat) $
-        do { name <- case unLoc pat of
-               VarPat _ (L _ name) -> return name
-               WildPat{} -> newSysName (getOccName binder)
+        do { (name, mb_tv_alias) <- case unLoc pat of
+               VarPat _ (L _ name) -> return (name, Nothing)
+               XPat (HsPatExpanded (VarPat _ (L _ tv_nm)) (VarPat _ (L _ name)))
+                 | isTyVarName tv_nm -> return (name, Just tv_nm)
+               WildPat{} -> (, Nothing) <$> newSysName (getOccName binder)
                _ -> failWithTc (TcRnRetainedQuantificationError RetainedVariablePattern)
            ; let index = mkLocalId name (idMult binder) (varType binder)
                  pat_ty = mkCheckExpFunPatTy (Scaled (idMult binder) (varType binder))
+                 extend_tv = maybe id (`tcExtendIdEnv1` index) mb_tv_alias
            ; (wrap, result) <- tcExtendTermScopeBinders [index] $
+                               extend_tv $
                                go ((pat_ty, Just name) : acc)
                                   (applyTypeToArgs ty [Var index]) pats thing_inside
            ; return (liftRetainedLambdaWrap index wrap, result) }
@@ -1377,20 +1387,19 @@ wildcards to that column's shared index 'Name'.
 -- | Check an erased suffix as an expression inside its runtime prefix.
 -- See Note [Erased suffixes in retained matches].
 splitRetainedSuffix :: Int -> [Id] -> MatchGroup GhcRn (LHsExpr GhcRn)
-                     -> MatchGroup GhcRn (LHsExpr GhcRn)
+                     -> TcM (MatchGroup GhcRn (LHsExpr GhcRn))
 splitRetainedSuffix prefix indices group@(MG { mg_alts = L loc [L match_loc match]
                                      , mg_ext = ext })
-  = group { mg_alts = L loc [L match_loc outer] }
+  = do { let Match { m_pats = L pats_loc pats } = match
+             (before, after) = split_prefix prefix pats
+             inner = match { m_ctxt = LamAlt LamSingle, m_pats = L pats_loc after }
+       ; inner' <- alignInvisibleRetainedPatterns True [] indices (L match_loc inner)
+       ; let lambda = L match_loc (HsLam noAnn LamSingle
+                        (MG { mg_alts = L loc [inner'], mg_ext = ext }))
+             outer = match { m_pats = L pats_loc before
+                           , m_grhss = unguardedGRHSs (locA match_loc) lambda noAnn }
+       ; pure (group { mg_alts = L loc [L match_loc outer] }) }
   where
-    Match { m_pats = L pats_loc pats } = match
-    (before, after) = split_prefix prefix pats
-    inner = match { m_ctxt = LamAlt LamSingle, m_pats = L pats_loc after }
-    lambda = L match_loc (HsLam noAnn LamSingle
-               (MG { mg_alts = L loc [alignInvisibleRetainedPatterns True [] indices (L match_loc inner)]
-                   , mg_ext = ext }))
-    outer = match { m_pats = L pats_loc before
-                  , m_grhss = unguardedGRHSs (locA match_loc) lambda noAnn }
-
     split_prefix 0 ps = ([], ps)
     split_prefix n (pat : ps)
       = let (before, after) = split_prefix (if isVisArgLPat pat then n-1 else n) ps
@@ -2253,6 +2262,10 @@ checkRetainedRows (mb_motive_alias, capture_aliases) allow_linear allow_empty is
           VarPat _ (L _ name)
             | name /= idName shared -> ((name, idName shared) :) <$> check_columns cols (column+1) args pats
             | otherwise             -> check_columns cols (column+1) args pats
+          XPat (HsPatExpanded (VarPat _ (L _ tv_nm)) (VarPat _ (L _ name)))
+            | isTyVarName tv_nm -> do
+                let pairs = [(nm, idName shared) | nm <- [name, tv_nm], nm /= idName shared]
+                (pairs ++) <$> check_columns cols (column+1) args pats
           WildPat{}           -> check_columns cols (column+1) args pats
           _ | column `elem` cols -> check_columns cols (column+1) args pats
             | otherwise          -> failWithTc (TcRnRetainedQuantificationError RetainedVariablePattern)
@@ -2379,15 +2392,18 @@ tcLambdaMatches e lam_variant raw_matches invis_pat_tys source_res_ty
   =  do { source_matches <- desugarExistsPackMatchGroup raw_matches
         ; source_arity <- checkArgCounts source_matches
             -- Check argument counts since this is also used for \cases
-        ; let (visibility_wrap, matches, res_ty, arity)
-                | Check ty <- source_res_ty
-                , (indices@(_:_), co) <- exposeInvisibleRetained ty
-                = ( mkWpCastR co
-                  , source_matches { mg_alts = fmap (map (alignInvisibleRetainedPatterns False invis_pat_tys indices)) (mg_alts source_matches) }
-                  , mkCheckExpType (coercionLKind co)
-                  , source_arity + length indices )
-                | otherwise = (idHsWrapper, source_matches, source_res_ty, source_arity)
-              check_body
+        ; (visibility_wrap, matches, res_ty, arity)
+            <- case source_res_ty of
+                 Check ty
+                   | (indices@(_:_), co) <- exposeInvisibleRetained ty -> do
+                       alts' <- traverse (traverse (alignInvisibleRetainedPatterns False invis_pat_tys indices))
+                                  (mg_alts source_matches)
+                       pure ( mkWpCastR co
+                            , source_matches { mg_alts = alts' }
+                            , mkCheckExpType (coercionLKind co)
+                            , source_arity + length indices )
+                 _ -> pure (idHsWrapper, source_matches, source_res_ty, source_arity)
+        ; let check_body
                 | LamSingle <- lam_variant
                 , [L _ Match { m_pats = L _ pats
                              , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } }]

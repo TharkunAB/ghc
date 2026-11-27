@@ -1439,17 +1439,18 @@ pprIfaceDepFunArrow DepFunInvisible = dot
 {- Note [Ordinary arrow matchability in user output]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Proposal #242 (section "Showing matchabilities") introduces
--fprint-explicit-matchabilities. User output without Modifiers can
-omit fixed M and U on ordinary arrows. For example, show the kind of
-Maybe as Type -> Type. These arrows can have either matchability.
+-fprint-explicit-matchabilities. User output omits default M and U on
+ordinary arrows unless -fprint-explicit-matchabilities is active. For
+example, show the kind of Maybe as Type -> Type even when Modifiers is
+enabled directly or implied by DependentTypes.
 
 Show both annotations when the explicit flag is set. The mismatch
 reporter can also set that flag. See Note [Showing invisible bits of
-types in error messages] in GHC.Tc.Errors.Ppr. Modifiers output shows M
-and symbolic matchabilities. When user output shows a matchability,
-print it as a source modifier, even if Modifiers is disabled. For
-example, GHCi can show a matchability variable inferred in an imported
-family's kind. Keep the existing notation for debug and dump output.
+types in error messages] in GHC.Tc.Errors.Ppr. User output still shows
+symbolic matchabilities. When user output shows a matchability, print
+it as a source modifier, even if Modifiers is disabled. For example,
+GHCi can show a matchability variable inferred in an imported family's
+kind. Keep the existing notation for debug and dump output.
 
 https://ghc-proposals.readthedocs.io/en/latest/proposals/0242-unsaturated-type-families.html#showing-matchabilities
 -}
@@ -1464,7 +1465,7 @@ pprTypeArrow af ma mult =
         -- See Note [Ordinary arrow matchability in user output].
         show_ma
           | user_arrow && explicit = True
-          | user_arrow && not debug && not modifiers && ma == ifaceMatchable = False
+          | user_arrow && not debug && ma == ifaceMatchable = False
           | otherwise = ma /= ifaceUnmatchable
     in if user_arrow && (modifiers || not debug)
       then pprArrowWithModifiers ([pprPrecIfaceType appPrec ma | show_ma] ++ mods) af arr
@@ -1913,10 +1914,9 @@ pprDefaultUserForAll bndrs ordinary annotated
     getPprDebug $ \debug ->
     sdocOption sdocPrintExplicitKinds $ \print_kinds ->
     sdocOption sdocPrintExplicitMatchabilities $ \explicit ->
-    sdocOption sdocModifiers $ \modifiers ->
       let implicit_ma (ma, bndr) =
             ma == ifaceUnmatchable
-            || (ma == ifaceMatchable && not modifiers &&
+            || (ma == ifaceMatchable &&
                 (not print_kinds || isInvisibleForAllTyFlag (ifaceForAllTyFlag (binderFlag bndr))))
       in if userStyle style && not debug && not explicit
             && all implicit_ma bndrs
@@ -1924,15 +1924,15 @@ pprDefaultUserForAll bndrs ordinary annotated
 
 {- Note [Default forall matchability in diagnostics]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Without Modifiers, user output omits fixed M and U on forall binders
-as it does on ordinary arrows. For example, an ill-scoped data telescope
-still shows its required binders without exposing their internal matchability.
-Keep symbolic indices visible. With Modifiers, show a fixed M binder.
-Explicit kinds still show fixed M on visible binders in a telescope.
-A skolem escape diagnostic prints kind applications to show the escaping
-variable. This does not need to show fixed matchability on invisible
-binders. The explicit matchability flag and debug output show all annotations.
-See Note [Ordinary arrow matchability in user output].
+User output omits fixed M and U on forall binders unless
+-fprint-explicit-matchabilities is active, matching ordinary arrows.
+For example, an ill-scoped data telescope still shows its required
+binders without exposing their internal matchability. Keep symbolic
+indices visible. Explicit kinds still show fixed M on visible binders
+in a telescope. A skolem escape diagnostic prints kind applications to
+show the escaping variable. This does not need to show fixed matchability
+on invisible binders. The explicit matchability flag and debug output
+show all annotations. See Note [Ordinary arrow matchability in user output].
 -}
 
 -- | Apply the usual forall display rules when every binder has its contextual default.
@@ -2263,8 +2263,15 @@ pprLiftedTypeLambdaSite occurrence
       "$expression" -> text "type lambda in an expression annotation"
       "$type-argument" -> text "type lambda in a visible type argument"
       _ -> text "type lambda in the signature for" <+> quotes (text value)
+  | Just value <- stripLiftedTypeOwner "$signature-sum:" owner
+  = Just $ case value of
+      "$expression" -> text "retained sum in an expression annotation"
+      "$type-argument" -> text "retained sum in a visible type argument"
+      _ -> text "retained sum in the signature for" <+> quotes (text value)
   | Just constructor <- stripLiftedTypeOwner "$field-lambda:" owner
   = Just (text "type lambda in a field of" <+> quotes (text constructor))
+  | Just constructor <- stripLiftedTypeOwner "$field-sum:" owner
+  = Just (text "retained sum in a field of" <+> quotes (text constructor))
   | Just family <- stripLiftedTypeOwner "R:$callback:" owner
   = Just (text "type lambda in an instance of" <+> quotes (text family))
   | otherwise = Nothing
