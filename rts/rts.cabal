@@ -17,6 +17,7 @@ extra-source-files:
     rust/archive_member.rs
     rust/eventlog_file_writer.rs
     rust/file_lock.rs
+    rust/gc_budget.rs
     rust/lib.rs
     rust/profiler_json.rs
 

@@ -1984,6 +1984,14 @@ mark_root(void *user USED_IF_THREADS, StgClosure **root)
     SET_GCT(saved_gct);
 }
 
+#if defined(USE_RUST_RTS)
+#include "BeginPrivate.h"
+StgWord ghc_rust_limit_generation_size(StgWord size, StgWord max_heap,
+                                      StgWord min_alloc, StgWord generations,
+                                      bool in_place_oldest);
+#include "EndPrivate.h"
+#endif
+
 /* ----------------------------------------------------------------------------
    Reset the sizes of the older generations when we do a major
    collection.
@@ -2062,6 +2070,10 @@ resizeGenerations (void)
             heapOverflow();
         }
 
+#if defined(USE_RUST_RTS)
+        size = ghc_rust_limit_generation_size(size, max, min_alloc, gens,
+                                             oldest_gen->compact || RtsFlags.GcFlags.useNonmoving);
+#else
         if (oldest_gen->compact || RtsFlags.GcFlags.useNonmoving) {
             if ( (size + (size - 1) * (gens - 2) * 2) + min_alloc > max ) {
                 size = (max - min_alloc) / ((gens - 1) * 2 - 1);
@@ -2071,6 +2083,7 @@ resizeGenerations (void)
                 size = (max - min_alloc) / ((gens - 1) * 2);
             }
         }
+#endif
 
         if (size < live) {
             heapOverflow();
