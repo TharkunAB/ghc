@@ -742,6 +742,9 @@ stg_copyArray_barrier ( W_ hdr_size, gcptr dst, W_ dst_off, W_ n)
     W_ end, p;
     ASSERT(n > 0);  // Assumes n==0 is handled by caller
     p = dst + hdr_size + WDS(dst_off);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    foreign "C" ghc_rust_visit_pointer_range(BaseReg "ptr", p "ptr", n);
+#else
     end = p + WDS(n);
 
 again:
@@ -750,6 +753,7 @@ again:
     if (p < end) {
         goto again;
     }
+#endif
 
     return ();
 }

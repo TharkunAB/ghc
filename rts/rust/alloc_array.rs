@@ -10,6 +10,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_allocate_pinned_byte_array",
     ".hidden ghc_rust_publish_shrink",
     ".hidden ghc_rust_shrink_small_array_active",
+    ".hidden ghc_rust_visit_pointer_range",
 );
 
 unsafe extern "C" {
@@ -42,10 +43,27 @@ unsafe extern "C" fn ghc_rust_publish_shrink(
     }
 }
 
-// Note [Small-array shrink barrier]
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Note [Pointer-array remembered-set visit]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// See Note [Update remembered set] in rts/sm/NonMovingMark.c.
 // Visit each removed pointer before the marker overwrites its slot.
+// Visit old destination pointers before a copy overwrites their slots.
 // The non-moving collector can update a slot with CAS, so load it atomically.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_visit_pointer_range(
+    reg: *mut c_void,
+    start: *mut *mut c_void,
+    words: usize,
+) {
+    unsafe {
+        for i in 0..words {
+            let closure = AtomicPtr::from_ptr(start.add(i)).load(Ordering::Relaxed);
+            updateRemembSetPushClosure_(reg, closure);
+        }
+    }
+}
+
+// See Note [Pointer-array remembered-set visit].
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_shrink_small_array_active(
     reg: *mut c_void,
@@ -55,10 +73,7 @@ unsafe extern "C" fn ghc_rust_shrink_small_array_active(
     unsafe {
         let old_size = AtomicUsize::from_ptr(length).load(Ordering::Relaxed);
         let payload = length.add(1).cast::<*mut c_void>();
-        for i in new_size..old_size {
-            let closure = AtomicPtr::from_ptr(payload.add(i)).load(Ordering::Relaxed);
-            updateRemembSetPushClosure_(reg, closure);
-        }
+        ghc_rust_visit_pointer_range(reg, payload.add(new_size), old_size - new_size);
         let final_size = AtomicUsize::from_ptr(length).load(Ordering::Relaxed);
         ghc_rust_publish_shrink(
             length,
