@@ -1,7 +1,12 @@
 use core::ffi::{c_int, c_void};
 use core::mem::{offset_of, size_of};
 
-core::arch::global_asm!(".hidden ghc_rust_timeout_queue_insert");
+core::arch::global_asm!(
+    ".hidden ghc_rust_timeout_queue_insert",
+    ".hidden ghc_rust_timeout_queue_insert_release",
+);
+
+const RELEASE_PARENT_OFFSET: usize = 16;
 
 // See Note [Timeout insertion offsets] in rts/TimeoutQueue.c.
 #[repr(C)]
@@ -42,8 +47,8 @@ unsafe fn rank(node: *mut c_void, empty: *mut c_void, parent_offset: usize) -> u
 /// call exclusive access to the queue. The new node has rank one and empty
 /// children. `parent_offset` and the relative field offsets match the checked
 /// C layout. The optional counter pointers are valid for this call.
-#[unsafe(no_mangle)]
-pub(super) unsafe extern "C" fn ghc_rust_timeout_queue_insert(
+#[inline(always)]
+unsafe fn insert(
     root: *mut *mut c_void,
     new_node: *mut c_void,
     empty: *mut c_void,
@@ -115,5 +120,46 @@ pub(super) unsafe extern "C" fn ghc_rust_timeout_queue_insert(
     }
     if !leftify_count.is_null() {
         unsafe { *leftify_count += up_steps };
+    }
+}
+
+/// Insert with the offset and counters selected for the RTS way.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_timeout_queue_insert(
+    root: *mut *mut c_void,
+    new_node: *mut c_void,
+    empty: *mut c_void,
+    parent_offset: usize,
+    insert_down_count: *mut c_int,
+    leftify_count: *mut c_int,
+) {
+    unsafe {
+        insert(
+            root,
+            new_node,
+            empty,
+            parent_offset,
+            insert_down_count,
+            leftify_count,
+        )
+    }
+}
+
+/// Insert with the checked nonprofiling release layout.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_timeout_queue_insert_release(
+    root: *mut *mut c_void,
+    new_node: *mut c_void,
+    empty: *mut c_void,
+) {
+    unsafe {
+        insert(
+            root,
+            new_node,
+            empty,
+            RELEASE_PARENT_OFFSET,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
     }
 }

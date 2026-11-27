@@ -90,8 +90,9 @@ typedef uint32_t Rank; // type to match StgTimeoutQueue.rank
 /* Note [Timeout insertion offsets]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * The STG header has a different size in different RTS ways. Pass the offset
- * of parent to Rust for each insertion. The fields after parent have fixed
- * relative offsets on x86-64 Linux. Check each offset here. Rust does not
+ * of parent to Rust in debug and profiling builds. Other builds use the
+ * checked constant offset and omit the debug counters. The remaining fields
+ * have fixed relative offsets on x86-64 Linux. Check each offset here. Rust does not
  * read the STG header, notification, or EMPTY closure.
  */
 #if defined(USE_RUST_TIMEOUT_INSERT)
@@ -105,6 +106,13 @@ GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, rank) - offsetof(StgTimeoutQueue, pa
                   "Timeout rank offset mismatch");
 GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, waketime) - offsetof(StgTimeoutQueue, parent) == 32,
                   "Timeout waketime offset mismatch");
+#if !defined(PROFILING) && !defined(DEBUG)
+GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, parent) == 16,
+                  "Release timeout parent offset mismatch");
+RTS_PRIVATE void ghc_rust_timeout_queue_insert_release(StgTimeoutQueue **root,
+                                                        StgTimeoutQueue *hnew,
+                                                        StgTimeoutQueue *empty);
+#endif
 RTS_PRIVATE void ghc_rust_timeout_queue_insert(StgTimeoutQueue **root,
                                                 StgTimeoutQueue *hnew,
                                                 StgTimeoutQueue *empty,
@@ -182,12 +190,14 @@ void insertTimeoutQueue(StgTimeoutQueue **root, StgTimeout *hnew, Time waketime)
     *   | otherwise          = (...) (insert x b)
     */
 #if defined(USE_RUST_TIMEOUT_INSERT)
-    ghc_rust_timeout_queue_insert(root, hnew, EMPTY,
-                                  offsetof(StgTimeoutQueue, parent),
 #if defined(DEBUG)
+    ghc_rust_timeout_queue_insert(root, hnew, EMPTY, offsetof(StgTimeoutQueue, parent),
                                   &insert_down_count, &leftify_up_shortcut_count);
-#else
+#elif defined(PROFILING)
+    ghc_rust_timeout_queue_insert(root, hnew, EMPTY, offsetof(StgTimeoutQueue, parent),
                                   NULL, NULL);
+#else
+    ghc_rust_timeout_queue_insert_release(root, hnew, EMPTY);
 #endif
 #else
     insert_down(root, hnew);
