@@ -14,9 +14,10 @@
 /* Note [Closure table Rust layout]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * The table fields have the same layout in every RTS way. C checks that
- * layout against the small Rust record. Heap array headers vary by RTS way,
- * so C supplies the payload offset for growth and removal and the slots for
- * insertion.
+ * layout against the small Rust record. Heap array headers vary by RTS way.
+ * C selects fixed-layout removal only when both array offsets match.
+ * C supplies the payload offset for growth and other removal layouts.
+ * C supplies the slots for insertion.
  * Rust calls the RTS allocators and registers the new mutable array before
  * it publishes either array. The RTS retains the capability and heap layouts.
  */
@@ -68,6 +69,14 @@ RTS_PRIVATE void ghc_rust_closure_table_remove_sparse(
 RTS_PRIVATE void ghc_rust_closure_table_remove_compact(
     ClosureTable *t, Capability *barrier_cap, int gap,
     int *ix_from, int *ix_to, size_t slots_offset);
+RTS_PRIVATE void ghc_rust_closure_table_remove_sparse_native(
+    ClosureTable *t, Capability *barrier_cap, int ix);
+RTS_PRIVATE void ghc_rust_closure_table_remove_compact_native(
+    ClosureTable *t, Capability *barrier_cap, int gap,
+    int *ix_from, int *ix_to);
+#define CLOSURE_TABLE_NATIVE_LAYOUT \
+    (offsetof(StgMutArrPtrs, payload) == 3 * sizeof(void *) && \
+     offsetof(StgArrBytes, payload) == 2 * sizeof(void *))
 #if defined(THREADED_RTS)
 #define CLOSURE_TABLE_BARRIER_CAP(cap) (cap)
 #else
@@ -243,10 +252,11 @@ void removeClosureTable(Capability *cap STG_UNUSED, ClosureTable *t, int ix)
     /* Note [Closure table removal barrier in Rust]
      * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
      * The threaded C macro reads nonmoving_write_barrier_enabled as an
-     * ordinary word. Rust uses the same read when C passes a capability.
-     * The non-threaded C wrapper passes NULL, so Rust does not read the flag
-     * or call the barrier. The collector enables the flag during stop-the-world
-     * preparation, before mutators resume, and clears it after marking. Rust
+     * ordinary word. Rust uses a relaxed atomic read when C passes a
+     * capability. The non-threaded C wrapper passes NULL, so Rust does not
+     * read the flag or call the barrier. The collector enables the flag
+     * during stop-the-world preparation, before mutators resume. It clears
+     * the flag after marking. Rust
      * uses the C flag protocol and calls the native barrier before overwrite.
      */
 
@@ -270,9 +280,14 @@ void removeClosureTable(Capability *cap STG_UNUSED, ClosureTable *t, int ix)
      * the old element, we need to add it to the remembered set.
      */
 #if defined(USE_RUST_CLOSURE_TABLE)
-    ghc_rust_closure_table_remove_sparse(
-        t, CLOSURE_TABLE_BARRIER_CAP(cap), ix,
-        offsetof(StgMutArrPtrs, payload));
+    if (CLOSURE_TABLE_NATIVE_LAYOUT) {
+        ghc_rust_closure_table_remove_sparse_native(
+            t, CLOSURE_TABLE_BARRIER_CAP(cap), ix);
+    } else {
+        ghc_rust_closure_table_remove_sparse(
+            t, CLOSURE_TABLE_BARRIER_CAP(cap), ix,
+            offsetof(StgMutArrPtrs, payload));
+    }
 #else
     IF_NONMOVING_WRITE_BARRIER_ENABLED {
         updateRemembSetPushClosure(cap, t->arr->payload[ix]);
@@ -314,9 +329,14 @@ void removeCompactClosureTable(Capability *cap STG_UNUSED, ClosureTable *t,
 
 #if defined(USE_RUST_CLOSURE_TABLE)
     ASSERT(t->arr->ptrs == (StgWord)t->capacity);
-    ghc_rust_closure_table_remove_compact(
-        t, CLOSURE_TABLE_BARRIER_CAP(cap), ix, ix_from, ix_to,
-        offsetof(StgMutArrPtrs, payload));
+    if (CLOSURE_TABLE_NATIVE_LAYOUT) {
+        ghc_rust_closure_table_remove_compact_native(
+            t, CLOSURE_TABLE_BARRIER_CAP(cap), ix, ix_from, ix_to);
+    } else {
+        ghc_rust_closure_table_remove_compact(
+            t, CLOSURE_TABLE_BARRIER_CAP(cap), ix, ix_from, ix_to,
+            offsetof(StgMutArrPtrs, payload));
+    }
 #else
     int gap_ix = ix;
     int end_ix = t->elems - 1;

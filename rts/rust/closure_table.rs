@@ -1,6 +1,7 @@
 use core::ffi::{c_int, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr::{copy_nonoverlapping, write_bytes};
+use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 core::arch::global_asm!(
     ".hidden ghc_rust_closure_table_grow",
@@ -196,7 +197,11 @@ unsafe extern "C" {
 core::arch::global_asm!(
     ".hidden ghc_rust_closure_table_remove_sparse",
     ".hidden ghc_rust_closure_table_remove_compact",
+    ".hidden ghc_rust_closure_table_remove_sparse_native",
+    ".hidden ghc_rust_closure_table_remove_compact_native",
 );
+
+const NATIVE_SLOTS_OFFSET: usize = 3 * size_of::<usize>();
 
 /// Link the released index at the head of the free list.
 unsafe fn recycle(table: *mut ClosureTable, free_link: *mut c_int, ix: c_int) {
@@ -208,10 +213,41 @@ unsafe fn recycle(table: *mut ClosureTable, free_link: *mut c_int, ix: c_int) {
 }
 
 // See Note [Closure table removal barrier in Rust] in rts/ClosureTable.c.
-unsafe fn barrier_before_overwrite(barrier_cap: *mut c_void, slot: *mut *mut c_void) {
-    if !barrier_cap.is_null() && unsafe { (&raw const nonmoving_write_barrier_enabled).read() } != 0
-    {
-        unsafe { updateRemembSetPushClosure(barrier_cap, slot.read()) };
+unsafe fn barrier_enabled(cap: *mut c_void) -> bool {
+    !cap.is_null()
+        && unsafe {
+            AtomicUsize::from_ptr(&raw mut nonmoving_write_barrier_enabled).load(Relaxed) != 0
+        }
+}
+
+#[inline(always)]
+unsafe fn remove_sparse_body(
+    table: *mut ClosureTable,
+    cap: *mut c_void,
+    ix: c_int,
+    slots_offset: usize,
+    barrier_active: bool,
+) {
+    unsafe {
+        let slot = (*table)
+            .arr
+            .byte_add(slots_offset)
+            .cast::<*mut c_void>()
+            .add(ix as usize);
+        let free_link = (*table)
+            .free
+            .byte_add(slots_offset - size_of::<usize>())
+            .cast::<c_int>()
+            .add(ix as usize);
+        if barrier_active {
+            updateRemembSetPushClosure(cap, slot.read());
+        }
+        slot.write(
+            (&raw const stg_CLOSURE_TABLE_NULL_closure)
+                .cast_mut()
+                .cast(),
+        );
+        recycle(table, free_link, ix);
     }
 }
 
@@ -229,23 +265,73 @@ unsafe extern "C" fn ghc_rust_closure_table_remove_sparse(
     slots_offset: usize,
 ) {
     unsafe {
-        let slot = (*table)
-            .arr
-            .byte_add(slots_offset)
-            .cast::<*mut c_void>()
-            .add(ix as usize);
-        let free_link = (*table)
-            .free
-            .byte_add(slots_offset - size_of::<usize>())
-            .cast::<c_int>()
-            .add(ix as usize);
-        barrier_before_overwrite(barrier_cap, slot);
-        slot.write(
+        remove_sparse_body(
+            table,
+            barrier_cap,
+            ix,
+            slots_offset,
+            barrier_enabled(barrier_cap),
+        );
+    }
+}
+
+/// Remove with the native array layout. C checks both payload offsets.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_closure_table_remove_sparse_native(
+    table: *mut ClosureTable,
+    barrier_cap: *mut c_void,
+    ix: c_int,
+) {
+    unsafe {
+        if barrier_enabled(barrier_cap) {
+            remove_sparse_native_barrier(table, barrier_cap, ix);
+        } else {
+            remove_sparse_body(table, barrier_cap, ix, NATIVE_SLOTS_OFFSET, false);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn remove_sparse_native_barrier(table: *mut ClosureTable, cap: *mut c_void, ix: c_int) {
+    unsafe {
+        remove_sparse_body(table, cap, ix, NATIVE_SLOTS_OFFSET, true);
+    }
+}
+
+#[inline(always)]
+unsafe fn remove_compact_body(
+    table: *mut ClosureTable,
+    cap: *mut c_void,
+    gap: c_int,
+    last: c_int,
+    slots_offset: usize,
+    barrier_active: bool,
+) {
+    unsafe {
+        let payload = (*table).arr.byte_add(slots_offset).cast::<*mut c_void>();
+        let gap_slot = payload.add(gap as usize);
+        let last_slot = payload.add(last as usize);
+        if barrier_active {
+            updateRemembSetPushClosure(cap, gap_slot.read());
+        }
+        gap_slot.write(last_slot.read());
+        last_slot.write(
             (&raw const stg_CLOSURE_TABLE_NULL_closure)
                 .cast_mut()
                 .cast(),
         );
-        recycle(table, free_link, ix);
+        payload
+            .add((*table).capacity as usize)
+            .cast::<u8>()
+            .add((gap as usize) >> 7)
+            .write(1);
+        let free_link = (*table)
+            .free
+            .byte_add(slots_offset - size_of::<usize>())
+            .cast::<c_int>()
+            .add(last as usize);
+        recycle(table, free_link, last);
     }
 }
 
@@ -270,27 +356,49 @@ unsafe extern "C" fn ghc_rust_closure_table_remove_compact(
         let last = (*table).elems - 1;
         ix_from.write(last);
         ix_to.write(gap);
-        let payload = (*table).arr.byte_add(slots_offset).cast::<*mut c_void>();
-        let gap_slot = payload.add(gap as usize);
-        let last_slot = payload.add(last as usize);
-        barrier_before_overwrite(barrier_cap, gap_slot);
-        gap_slot.write(last_slot.read());
-        last_slot.write(
-            (&raw const stg_CLOSURE_TABLE_NULL_closure)
-                .cast_mut()
-                .cast(),
+        remove_compact_body(
+            table,
+            barrier_cap,
+            gap,
+            last,
+            slots_offset,
+            barrier_enabled(barrier_cap),
         );
-        payload
-            .add((*table).capacity as usize)
-            .cast::<u8>()
-            .add((gap as usize) >> 7)
-            .write(1);
-        let free_link = (*table)
-            .free
-            .byte_add(slots_offset - size_of::<usize>())
-            .cast::<c_int>()
-            .add(last as usize);
-        recycle(table, free_link, last);
+    }
+}
+
+/// Remove from a compact table with the native array layout.
+/// C checks both payload offsets.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_closure_table_remove_compact_native(
+    table: *mut ClosureTable,
+    barrier_cap: *mut c_void,
+    gap: c_int,
+    ix_from: *mut c_int,
+    ix_to: *mut c_int,
+) {
+    unsafe {
+        let last = (*table).elems - 1;
+        ix_from.write(last);
+        ix_to.write(gap);
+        if barrier_enabled(barrier_cap) {
+            remove_compact_native_barrier(table, barrier_cap, gap, last);
+        } else {
+            remove_compact_body(table, barrier_cap, gap, last, NATIVE_SLOTS_OFFSET, false);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn remove_compact_native_barrier(
+    table: *mut ClosureTable,
+    cap: *mut c_void,
+    gap: c_int,
+    last: c_int,
+) {
+    unsafe {
+        remove_compact_body(table, cap, gap, last, NATIVE_SLOTS_OFFSET, true);
     }
 }
 
