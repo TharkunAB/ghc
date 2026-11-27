@@ -5,6 +5,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_suspended_calls_insert",
     ".hidden ghc_rust_suspended_calls_remove",
     ".hidden ghc_rust_suspended_calls_visit",
+    ".hidden ghc_rust_suspended_calls_find",
 );
 
 // C checks that InCall.prev and InCall.next are adjacent pointer fields.
@@ -22,6 +23,10 @@ const _: () = {
 
 unsafe fn links(incall: *mut c_void, offset: usize) -> *mut Links {
     unsafe { incall.cast::<u8>().add(offset).cast::<Links>() }
+}
+
+unsafe fn suspended_tso_slot(incall: *mut c_void, offset: usize) -> *mut *mut c_void {
+    unsafe { incall.cast::<u8>().add(offset).cast::<*mut c_void>() }
 }
 
 /// Add an in-call to the front of one capability's suspended list.
@@ -97,9 +102,31 @@ pub(super) unsafe extern "C" fn ghc_rust_suspended_calls_visit(
     user: *mut c_void,
 ) {
     while !incall.is_null() {
-        let slot = unsafe { incall.cast::<u8>().add(tso_offset).cast::<*mut c_void>() };
+        let slot = unsafe { suspended_tso_slot(incall, tso_offset) };
         unsafe { evac(user, slot) };
         // Keep this read after evacuation, as in markCapability.
         incall = unsafe { (&raw const (*links(incall, links_offset)).next).read() };
     }
+}
+
+/// Find the first in-call whose suspended TSO matches the target.
+///
+/// # Safety
+///
+/// The caller owns the target capability. Its list and TSO slots are valid
+/// throughout the search. The offsets come from the active C layout.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_suspended_calls_find(
+    mut incall: *mut c_void,
+    target: *mut c_void,
+    links_offset: usize,
+    tso_offset: usize,
+) -> *mut c_void {
+    while !incall.is_null() {
+        if unsafe { suspended_tso_slot(incall, tso_offset).read() } == target {
+            break;
+        }
+        incall = unsafe { (*links(incall, links_offset)).next };
+    }
+    incall
 }

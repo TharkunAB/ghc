@@ -18,4 +18,6 @@ RTS_PRIVATE void ghc_rust_suspended_calls_visit(InCall *head,
                                                  size_t links_offset,
                                                  size_t tso_offset,
                                                  evac_fn evac, void *user);
+RTS_PRIVATE InCall *ghc_rust_suspended_calls_find(InCall *head, StgTSO *target,
+                                                   size_t links_offset, size_t tso_offset);
 #endif
