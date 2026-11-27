@@ -19,6 +19,7 @@ module GHC.Iface.Binary (
         TraceBinIFace(..),
         getIfaceWithExtFields,
         putIfaceWithExtFields,
+        fingerprintNormalizedIface,
         getWithUserData,
         putWithUserData,
 
@@ -39,6 +40,7 @@ import GHC.Builtin   ( knownKeyOccMap, wiredInNamesMap )
 import GHC.Builtin.Uniques( knownUniqueTupleName )
 
 import GHC.Utils.Panic
+import GHC.Utils.Fingerprint (Fingerprint)
 import GHC.Utils.Binary as Binary
 import GHC.Utils.Outputable
 
@@ -54,6 +56,7 @@ import GHC.Unit.Module.ModIface
 import GHC.Platform.Profile
 import GHC.Platform
 import GHC.Settings.Constants
+import GHC.Iface.Recomp.Binary (fingerprintBinMem)
 import GHC.Iface.Type (IfaceType(..), getIfaceType, putIfaceType, ifaceTypeSharedByte)
 
 import GHC.Data.FastMutInt
@@ -288,6 +291,22 @@ writeBinIface profile traceBinIface compressionLevel hi_path mod_iface = do
 
     -- And send the result to the file
     writeBinMem bh hi_path
+
+-- | Fingerprint the complete interface with its own source hash omitted.
+-- Return 'Nothing' if self-recompilation metadata is absent or the stored
+-- interface hash differs from the hash derived by the standard writer.
+-- Compare fingerprints only from the same compiler and interface way.
+-- See Note [Comparing interfaces without the source hash] in
+-- "GHC.Unit.Module.ModIface".
+fingerprintNormalizedIface :: ModIface -> IO (Maybe Fingerprint)
+fingerprintNormalizedIface iface
+  | Just normalized <- normalizeIfaceSourceHash iface
+  , computeIfaceHash (mi_mod_hash iface) iface == mi_iface_hash iface
+  = do
+      bh <- openBinMem initBinMemSize
+      putIfaceWithExtFields QuietBinIFace NormalCompression bh normalized
+      Just <$> fingerprintBinMem bh
+  | otherwise = pure Nothing
 
 -- | Puts the 'ModIface' to the 'WriteBinHandle'.
 --
