@@ -72,9 +72,15 @@ The active shared Stage1 worker `fd8d51d` uses GHC 10.1.20261115.1 (executable S
 
 The release also handles an up-to-date `-c -dynamic-too` command with Hadrian's optional `+RTS -O64M -A64m -RTS` block. Across six warm samples per executable on a single-file fixture, ordinary GHC took 210.1 ms, the previous worker took 209.4 ms, and the new worker took 19.6 ms at the median (10.7× versus ordinary GHC). A required compile delegated once with the original arguments and reproduced all four artifacts byte for byte.
 
-### Shared Stage0 worker on 27 November
+### Shared Stage0 worker 2baf1e8
 
-The shared Stage0 selector now uses `df96e32` and a complete GHC 10.1.20261127 toolchain on a durable path (executable SHA-256 prefix `cafe7121a8e6`). The ordinary 943-module dependency command took 9.527 and 10.041 s in the two reference source states. The warm worker took 0.436 s unchanged and 0.476 s after a one-import edit (20.6× versus the stock reference median). Both worker medians use six samples. Each edit regenerated one row. Makefiles, backups and diagnostics matched. A warm tuned `-c -dynamic-too` check on a single-file fixture took 6.1 ms with the worker and 21.6 ms with ordinary GHC across six alternating pairs. A required compile delegated once with the original arguments and reproduced all four outputs.
+The Stage0 selector uses worker `2baf1e8` with the same installed GHC 10.1.20261127 executable (`cafe7121a8e6`). On the actual 943-module dependency command, stock GHC took 7.648 s at the median of the two source states. With populated disk caches and fresh daemons, the previous worker `df96e32` took 8.322 s and the new worker took **4.865 s** across four alternating pairs. Both resumed all 835 certificates. The new restart is 36.4% shorter than stock and 41.5% shorter than the previous worker.
+
+The warm one-import edit took 0.465 s at the median across eight requests, **16.5× faster than stock**, versus 0.472 s with the previous worker. Each edit regenerated one row. Stock Makefiles, backups and diagnostics matched across the panel. The installed worker also passed the tuned compile-check and stock-fallback tests. The warmed single-file check took 6.17 ms versus 21.49 ms for stock across six alternating pairs.
+
+### Earlier Stage0 worker df96e32
+
+The earlier shared Stage0 release used `df96e32` and a complete GHC 10.1.20261127 toolchain on a durable path (executable SHA-256 prefix `cafe7121a8e6`). The ordinary 943-module dependency command took 9.527 and 10.041 s in the two reference source states. The warm worker took 0.436 s unchanged and 0.476 s after a one-import edit (20.6× versus the stock reference median). Both worker medians use six samples. Each edit regenerated one row. Makefiles, backups and diagnostics matched. A warm tuned `-c -dynamic-too` check on a single-file fixture took 6.1 ms with the worker and 21.6 ms with ordinary GHC across six alternating pairs. A required compile delegated once with the original arguments and reproduced all four outputs.
 
 The previous shared Stage0 worker pointed to a different installation with a missing Stage0 library directory. Hadrian enables the worker only when it targets the exact compiler path selected for that stage. The linked results above used the same GHC binary bytes in a separate installation.
 
