@@ -511,6 +511,24 @@ A controlled edit shows why replaying just those decisions can produce stale cod
 
 Adding a fingerprint for each expression selected for inlining detected the changed helper. Of six accepted inlining attempts, exactly the helper's fingerprint differed. These diagnostic fingerprints use GHC's printed Core. A reusable cache key still requires a stable encoding, the other inputs to each transformation, and validation against stock results. This experiment measured dependencies and did not skip optimization work. [Probe results and output hashes](simplifier-inputs.json) · [Simplifier](../../compiler/GHC/Core/Opt/Simplify/Iteration.hs)
 
+The next shadow probe recorded only whether each resolved identifier
+had an empty list of visible rules. Across the original source,
+repeat, cutoff edit and revert in `GHC.Utils.Misc`, the precheck
+allocated 4.38–4.41 MB and took 7.82–11.63 ms. It resolved all eight
+external first-visit identifiers. Resolving those identifiers and
+reading the rule environment accounted for 97.6–98.2% of the
+allocation. Four local lookups still prevent binding reuse. The
+diagnostic compiler and stock GHC produced identical objects,
+interfaces and diagnostics for all four runs.
+
+The orphan-rule fixture produced 6, 6 and 46 in both compilers.
+Adding the unrelated rule preserved the certificate. Adding the
+relevant rule changed exactly the target's empty-list result.
+Built-in heads had visible rules in all three cases, so the
+empty-only check declined reuse. The probe ran ordinary simplification
+throughout. Pueue job 7402 used the GHC 10.1.20261115.1 compiler
+relinked from revision `945ea7a737`.
+
 ### Cmm assignment sinking
 
 Research commit `96cbe8010a` skips conflict checks for a live destination with a nontrivial right-hand side. All outcomes of those checks retain the assignment. The candidate stays on the research branch.
