@@ -3,6 +3,7 @@ module Main (main) where
 
 import Development.Shake
 import Hadrian.Utilities
+import Settings (newFlavourCache)
 import Settings.Parser
 import System.Directory (getCurrentDirectory)
 import System.IO
@@ -36,6 +37,7 @@ main = do
     -- Provide access to command line arguments and some user settings through
     -- Shake's type-indexed map 'shakeExtra'.
     argsMap <- CommandLine.cmdLineArgsMap
+    flavourCache <- newFlavourCache
     case CommandLine.lookupBignum argsMap of
       Just _ -> hPutStrLn stderr $ unlines
         [ "Warning: --bignum is deprecated."
@@ -45,6 +47,7 @@ main = do
       Nothing -> return ()
     let extra = insertExtra UserSettings.buildProgressColour
               $ insertExtra UserSettings.successColour
+              $ insertExtra flavourCache
               $ argsMap
 
         BuildRoot buildRoot = CommandLine.lookupBuildRoot argsMap
