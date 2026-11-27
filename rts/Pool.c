@@ -43,6 +43,8 @@ struct Pool_ {
 #endif
 };
 
+static void free_available(Pool *pool, uint32_t size);
+
 Pool *poolInit(uint32_t max_size, uint32_t desired_size,
                alloc_thing_fn alloc_fn, free_thing_fn free_fn) {
     Pool *pool = stgMallocBytes(sizeof(Pool), "pool_init");
@@ -61,10 +63,14 @@ Pool *poolInit(uint32_t max_size, uint32_t desired_size,
 }
 
 int poolFree(Pool *pool) {
-    if (pool->taken != NULL)
+    ACQUIRE_LOCK(&pool->mutex);
+    if (pool->taken != NULL) {
+        RELEASE_LOCK(&pool->mutex);
         return 1;
+    }
 
-    poolSetMaxSize(pool, 0);
+    free_available(pool, 0);
+    RELEASE_LOCK(&pool->mutex);
 #if defined(THREADED_RTS)
     closeCondition(&pool->cond);
     closeMutex(&pool->mutex);

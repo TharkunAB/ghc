@@ -26,8 +26,8 @@ typedef struct Pool_ Pool;
 Pool *poolInit(uint32_t max_size, uint32_t desired_size,
                alloc_thing_fn alloc_fn, free_thing_fn free_fn);
 
-/* Free a pool. Returns 0 on success or 1 on failure due to things
- * belonging to the pool currently being claimed. */
+/* Free a pool. Returns 0 on success or 1 if resources are claimed.
+ * The caller must exclude concurrent operations before a successful free. */
 int poolFree(Pool *pool);
 
 /* Set the maximum size of a pool (0 indicates unbounded). desired_size will be
