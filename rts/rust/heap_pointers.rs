@@ -15,7 +15,7 @@ unsafe extern "C" {
     fn collect_pointers(c: Closure, out: *mut Closure) -> usize;
     fn allocateMutArrPtrs(cap: *mut u8, count: usize, init: Closure, ccs: *mut u8) -> *mut u8;
     static stg_MUT_ARR_PTRS_FROZEN_CLEAN_info: u8;
-    fn ghc_heap_checked_tso(c: Closure, out: *mut Closure) -> usize;
+    fn _assertFail(filename: *const c_char, linenum: u32) -> !;
     fn ghc_heap_unknown_type(kind: u32);
     fn barf(format: *const c_char, ...) -> !;
     #[link_name = "heap_view_closure_ptrs_in_pap_payload"]
@@ -290,21 +290,24 @@ unsafe extern "C" fn ghc_rust_collect_pointers(
             TAG_MVAR_CLEAN | TAG_MVAR_DIRTY => {
                 take_fields(c, out, [MVAR_HEAD, MVAR_TAIL, MVAR_VALUE])
             }
-            TAG_TSO if CHECK_TSO != 0 => ghc_heap_checked_tso(c, out),
             TAG_TSO => {
-                let count = take_fields(
-                    c,
-                    out,
-                    [
-                        TSO_LINK,
-                        TSO_GLOBAL,
-                        TSO_STACK,
-                        TSO_TREC,
-                        TSO_EXCEPTIONS,
-                        TSO_BQ,
-                    ],
-                );
-                optional(c, out, count, TSO_LABEL)
+                // Report the failed field and leave later output slots untouched.
+                let fields = [
+                    (TSO_LINK, line!()),
+                    (TSO_GLOBAL, line!()),
+                    (TSO_STACK, line!()),
+                    (TSO_TREC, line!()),
+                    (TSO_EXCEPTIONS, line!()),
+                    (TSO_BQ, line!()),
+                ];
+                for (slot, (offset, line)) in fields.into_iter().enumerate() {
+                    let pointer = field(c, offset);
+                    if CHECK_TSO != 0 && pointer.is_null() {
+                        _assertFail(concat!(file!(), "\0").as_ptr().cast(), line);
+                    }
+                    out.add(slot).write(pointer);
+                }
+                optional(c, out, fields.len(), TSO_LABEL)
             }
             TAG_WEAK => {
                 let count = take_fields(

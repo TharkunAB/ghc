@@ -91,13 +91,10 @@ void heap_view_closure_ptrs_in_pap_payload(StgClosure *ptrs[], StgWord *nptrs
 }
 #endif
 
-/* Use the RTS diagnostics for unsupported tags and failed TSO assertions. */
+/* Keep unsupported-tag reporting in the native RTS. */
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 #define HEAP_HELPER RTS_PRIVATE
 RTS_PRIVATE void ghc_heap_unknown_type(StgHalfWord type);
-#if defined(ASSERTS_ENABLED)
-RTS_PRIVATE StgWord ghc_heap_checked_tso(StgClosure *closure, StgClosure **ptrs);
-#endif
 RTS_PRIVATE StgWord ghc_rust_collect_pointers(StgClosure *, StgClosure **,
                                               const StgInfoTable *);
 #else
@@ -108,36 +105,6 @@ HEAP_HELPER void ghc_heap_unknown_type(StgHalfWord type)
 {
     fprintf(stderr, "closurePtrs: Cannot handle type %s yet\n", closure_type_names[type]);
 }
-
-#if !defined(USE_RUST_RTS) || defined(TSAN_ENABLED) || defined(ASSERTS_ENABLED)
-HEAP_HELPER StgWord ghc_heap_checked_tso(StgClosure *closure, StgClosure **ptrs)
-{
-    StgWord nptrs = 0;
-
-    ASSERT((StgClosure *)((StgTSO *)closure)->_link != NULL);
-    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->_link;
-
-    ASSERT((StgClosure *)((StgTSO *)closure)->global_link != NULL);
-    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->global_link;
-
-    ASSERT((StgClosure *)((StgTSO *)closure)->stackobj != NULL);
-    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->stackobj;
-
-    ASSERT((StgClosure *)((StgTSO *)closure)->trec != NULL);
-    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->trec;
-
-    ASSERT((StgClosure *)((StgTSO *)closure)->blocked_exceptions != NULL);
-    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->blocked_exceptions;
-
-    ASSERT((StgClosure *)((StgTSO *)closure)->bq != NULL);
-    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->bq;
-
-    if ((StgClosure *)((StgTSO *)closure)->label != NULL) {
-        ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->label;
-    }
-    return nptrs;
-}
-#endif
 
 #undef HEAP_HELPER
 
@@ -272,7 +239,29 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
             ptrs[nptrs++] = ((StgMVar *)closure)->value;
             break;
         case TSO:
-            return ghc_heap_checked_tso(closure, ptrs);
+            ASSERT((StgClosure *)((StgTSO *)closure)->_link != NULL);
+            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->_link;
+
+            ASSERT((StgClosure *)((StgTSO *)closure)->global_link != NULL);
+            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->global_link;
+
+            ASSERT((StgClosure *)((StgTSO *)closure)->stackobj != NULL);
+            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->stackobj;
+
+            ASSERT((StgClosure *)((StgTSO *)closure)->trec != NULL);
+            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->trec;
+
+            ASSERT((StgClosure *)((StgTSO *)closure)->blocked_exceptions != NULL);
+            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->blocked_exceptions;
+
+            ASSERT((StgClosure *)((StgTSO *)closure)->bq != NULL);
+            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->bq;
+
+            if ((StgClosure *)((StgTSO *)closure)->label != NULL) {
+                ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->label;
+            }
+
+            break;
         case WEAK: {
             StgWeak *w = (StgWeak *)closure;
             ptrs[nptrs++] = (StgClosure *) w->cfinalizers;
