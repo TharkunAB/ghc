@@ -472,3 +472,19 @@ launch. The option can be toggled on a clean target without rebuilding it.
 Use a worker with support for this RTS block, such as `fd8d51d` or later,
 if the build also uses `HADRIAN_COMPILE_CHECK_WORKER`. Fallback compiles
 use the same tuned command. Dependency scans keep their existing RTS block.
+
+
+### Persistent argument hashes for development builds
+
+Set `HADRIAN_PERSISTENT_ARGS=1` with the explicit flavour
+`perf+no_profiled_libs` to reuse tracked argument hashes for selected Stage1
+compile and C dependency rules. Keep the option unset for final builds.
+This option requires Linux and a build without hashed unit IDs, a bignum
+override, user-defined packages, or Shake shared caches. It uses the built-in
+flavour and falls back to ordinary argument resolution if a custom flavour can
+replace it.
+
+Reuse requires the same Hadrian executable, invocation arguments, settings,
+working directories, and effective environment. Changes to tracked build inputs
+can also invalidate a hash. Queue launchers can add a different environment to
+each job. Hadrian includes those fields in the witness if they reach the build.

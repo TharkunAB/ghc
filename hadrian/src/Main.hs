@@ -12,9 +12,17 @@ import System.Environment
 import Control.Concurrent (getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities)
 import Control.Exception
 import Data.IORef
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Data.ByteString.Base16 as Base16
+import qualified Data.ByteString.Builder as Bytes
+import qualified Data.ByteString.Char8 as Char8
+import Data.List (isPrefixOf, sortOn)
 
 import qualified Base
+import qualified Builder
 import qualified CommandLine
+import qualified Flavour.Type as Flavour
+import qualified Hadrian.Oracles.ArgsHash as ArgsHash
 import qualified Environment
 import qualified Rules
 import qualified Rules.Codes
@@ -76,6 +84,10 @@ main = do
           pure previous
 
     cwd <- getCurrentDirectory
+    rawArguments <- getArgs
+    persistent <- (== Just "1") <$> lookupEnv "HADRIAN_PERSISTENT_ARGS"
+    let invocation = ArgsHash.ArgsInvocation persistent
+            (invocationWitness cwd rawArguments (CommandLine.argumentSettingsSnapshot argsMap))
     shakeColor <- shouldUseColor
     let options :: ShakeOptions
         options = shakeOptions
@@ -91,7 +103,7 @@ main = do
             , shakeRebuild  = rebuild
             , shakeTimings  = False
             , shakeColor    = shakeColor
-            , shakeExtra    = extra
+            , shakeExtra    = insertExtra invocation extra
 
             -- Setting shakeSymlink to False ensures files are copied out of
             -- shake's cloud cache instead of hard linked. This is important as
@@ -156,6 +168,29 @@ main = do
             [] -> rules >> buildAction Rules.topLevelTargets
             _ | singleCapability -> buildAction (need targets') >> withoutActions rules
               | otherwise -> want targets' >> withoutActions rules)
+
+-- | Identify the inputs which argument expressions read outside Shake.
+-- Read the effective directory after Shake applies --directory.
+invocationWitness :: FilePath -> [String] -> String -> Action (Maybe String)
+invocationWitness initialDirectory argv settings = do
+    flavour <- CommandLine.cmdFlavour
+    unitHash <- CommandLine.cmdUnitIdHash
+    bignum <- CommandLine.cmdBignum
+    options <- getShakeOptions
+    let supported = "perf+no_profiled_libs"
+        customBase = any ((`isPrefixOf` supported) . Flavour.name) UserSettings.userFlavours
+    if flavour /= Just supported || customBase || not (null UserSettings.userPackages)
+        || unitHash || bignum /= Nothing
+        || shakeShare options /= Nothing || not (null (shakeCloud options))
+        then pure Nothing
+        else liftIO $ do
+            executable <- Builder.fileSHA256 "/proc/self/exe"
+            effectiveDirectory <- getCurrentDirectory
+            -- Preserve the first and last values of repeated names.
+            environment <- sortOn fst <$> getEnvironment
+            let digest identity = Char8.unpack . Base16.encode . SHA256.hashlazy . Bytes.toLazyByteString
+                    . Bytes.stringUtf8 $ show (identity, initialDirectory, effectiveDirectory, argv, settings, environment)
+            pure (digest <$> executable)
 
 {- Note [Hadrian RTS capabilities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

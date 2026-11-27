@@ -9,6 +9,7 @@ import qualified Hadrian.Oracles.DirectoryContents
 import qualified Hadrian.Oracles.Path
 import qualified Hadrian.Oracles.TextFile
 import qualified Hadrian.Haskell.Hash
+import qualified Hadrian.Target as HTarget
 
 import BindistConfig
 import Expression
@@ -143,7 +144,12 @@ buildRules = do
 
 oracleRules :: Rules ()
 oracleRules = do
-    Hadrian.Oracles.ArgsHash.argsHashOracle trackArgument getArgs
+    let cacheable t = case HTarget.builder t of
+            Ghc CompileHs Stage1 -> True
+            Ghc CompileCWithGhc Stage1 -> True
+            Cc (FindCDependencies CDep) Stage1 -> True
+            _ -> False
+    Hadrian.Oracles.ArgsHash.argsHashOracle trackArgument getArgs cacheable
     Hadrian.Oracles.Cabal.Rules.cabalOracle
     Hadrian.Haskell.Hash.pkgHashOracle
     Hadrian.Oracles.DirectoryContents.directoryContentsOracle
