@@ -87,7 +87,18 @@ header eligible. It also matched stock on parser warnings, CPP failure
 and escaped temporary paths. A separate fixture reused a receipt after
 crossing from a two-digit process ID to four digits in one directory.
 Pueue jobs 7286 and 7292 verified the private candidate. The paired job
-peaked at 547 MiB. The shared Stage0 selector is `ad8a24f`.
+peaked at 547 MiB.
+
+The packaged worker `8a03b68` is now the shared Stage0 release on the same
+GHC executable. Four alternating fresh-daemon pairs with changed
+temporary directories took **5.373 s with `ad8a24f` and 3.886 s with
+`8a03b68`** (27.7% less time). Stock controls took 10.144 s and 12.847 s.
+In the original temporary directory, one control per worker took 4.626 s
+and 4.756 s respectively. Both workers reused all 104 CPP records there.
+The packaged worker passed compile-check, fallback and diagnostic smoke.
+All 943-module outputs matched stock, and the timing job peaked at
+552 MiB (Pueue 7302). Use an existing mode-0700 directory with
+`GHC_WORKER_POSITIVE_CPP_CACHE` to enable the version-2 store.
 
 ### Cabal compiler-library installation
 
