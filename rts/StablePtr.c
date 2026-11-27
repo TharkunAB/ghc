@@ -181,7 +181,9 @@ initSpEntryFreeList(spEntry *table, uint32_t n)
 void
 initStablePtrTable(void)
 {
-    if (SPT_size > 0) return;
+    // stablePtrLock calls this before taking the mutex. Growth publishes
+    // the new table with a release store. See Note [Enlarging the stable pointer table].
+    if (ACQUIRE_LOAD(&stable_ptr_table) != NULL) return;
     SPT_size = INIT_SPT_SIZE;
     stable_ptr_table = stgMallocBytes(SPT_size * sizeof(spEntry),
                                       "initStablePtrTable");
