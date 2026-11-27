@@ -1,6 +1,5 @@
 NativeTypeLetQuoteBadRhs.hs:4:16: error: [GHC-83865]
-    • Expected kind ‘* %GHC.Internal.Types.Matchable -> k0’,
-        but ‘Int’ has kind ‘*’
+    • Expected kind ‘* -> k0’, but ‘Int’ has kind ‘*’
     • In the type ‘(let b_a1r5 = Int Bool in Int)’
       In the type synonym declaration for ‘BadRhs’
 

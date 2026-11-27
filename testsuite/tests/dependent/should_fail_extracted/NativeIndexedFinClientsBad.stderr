@@ -82,9 +82,7 @@ NativeIndexedFinClientsBad.hs:24:46: error: [GHC-25897]
 
 NativeIndexedFinClientsBad.hs:27:38: error: [GHC-83865]
     • Expecting one more argument to ‘Maybe’
-      Expected a type,
-      but ‘Maybe’ has kind
-      ‘* %GHC.Internal.Types.Matchable -> *’
+      Expected a type, but ‘Maybe’ has kind ‘* -> *’
     • In the type ‘Maybe’
       In the first argument of ‘toList’, namely
         ‘(zipWithExact @Maybe [1, 2] [10, 20] (+))’

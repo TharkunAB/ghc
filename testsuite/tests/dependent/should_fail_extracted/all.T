@@ -15,7 +15,7 @@ test('NativeCheckedClosureFail', extra_files(['../should_run/NativeCheckedClosur
 test('NativeCheckedClosureRulesFail', extra_files(['../should_run/NativeCheckedClosureProvider.hs', '../should_run/NativeCheckedClosureDoubleNamed.hs', '../should_run/NativeCheckedLookupProvider.hs', '../should_run/NativeCheckedPlugSubstUProvider.hs', '../should_run/NativeCheckedClosureNamedSubstProvider.hs']), multimod_compile_fail, ['NativeCheckedClosureRulesFail', '-v0 -fwrite-source-equations -fomit-interface-pragmas'])
 test('NativeCheckedClosureWithheldFail', extra_files(['NativeCheckedClosureHiddenProvider.hs']), multimod_compile_fail, ['NativeCheckedClosureWithheldFail', '-v0'])
 test('NativeCheckedClosureLocalLookupFail', normal, compile_fail, [''])
-test('NativeCheckedClosureLocalBodyFail', normal, compile_fail, [''])
+test('NativeCheckedClosureLocalBodyFail', normal, compile, [''])
 test('NativeLocalBooleanResultFail', extra_files(['../should_run/NativeLocalBooleanResultLib.hs']), multimod_compile_fail, ['NativeLocalBooleanResultFail', '-v0'])
 test('NativeLocalBooleanResultStagingFail', normal, compile_fail, [''])
 test('NativeLocalBooleanResultAbstractFail', normal, compile_fail, [''])

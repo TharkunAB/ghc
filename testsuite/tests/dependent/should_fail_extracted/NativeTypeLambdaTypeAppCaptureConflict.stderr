@@ -5,7 +5,7 @@ NativeTypeLambdaTypeAppCaptureConflict.hs:11:70: error: [GHC-25897]
           badSpliceCapture :: forall {k} (err :: k).
                               Proxy err -> Fields [Either String Int, Either String Bool]
         at NativeTypeLambdaTypeAppCaptureConflict.hs:10:1-92
-    • In the first argument of ‘(\tag_a21Z cell_a220 -> Either tag_a21Z cell_a220)’, namely
+    • In the first argument of ‘(\tag_a22x cell_a22y -> Either tag_a22x cell_a22y)’, namely
         ‘err’
       In the type ‘($([t| \tag cell -> Either tag cell |]) err)’
       In the expression:

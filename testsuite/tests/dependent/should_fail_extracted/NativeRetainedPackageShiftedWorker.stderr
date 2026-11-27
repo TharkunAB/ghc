@@ -2,8 +2,7 @@ NativeRetainedPackageShiftedWorker.hs:7:33: error: [GHC-05617]
     • Could not deduce ‘_ ~ PackedVecLibrary.S _’
       from the context: q ~ Retain _ val
         bound by a pattern with constructor:
-                   Retain :: forall (p :: PackedVecLibrary.Nat
-                                          %GHC.Internal.Types.Matchable -> *).
+                   Retain :: forall (p :: PackedVecLibrary.Nat -> *).
                              foreach (n :: PackedVecLibrary.Nat) -> p n -> Retained p,
                  in an equation for ‘projectShifted’
         at NativeRetainedPackageShiftedWorker.hs:7:1-35

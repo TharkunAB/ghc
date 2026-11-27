@@ -1,8 +1,6 @@
 NativeRetainedFunctionRulesBadScope.hs:20:69: error: [GHC-83865]
     • Expecting one more argument to ‘Maybe’
-      Expected a type,
-      but ‘Maybe’ has kind
-      ‘* %GHC.Internal.Types.Matchable -> *’
+      Expected a type, but ‘Maybe’ has kind ‘* -> *’
     • In the type ‘Maybe’
       In the expression: keepAfter ignored @Maybe m x
       When checking the rewrite rule "wrong kind after"

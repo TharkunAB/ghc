@@ -17,7 +17,8 @@ module GHC.Tc.Gen.Pat
    , tcMatchPats, tcMatchPatsWithIndex
    , implicitPayloadType, matchesImplicitPayloadPat
    , bindRetainedConFields, isRetainedVarPat
-   , tcRetainedCon, tcRetainedConScaled, retainedConPat, retainedConIndex, bindRetainedWildcard
+   , tcRetainedCon, tcRetainedConScaled, retainedConPat, expandRetainedPat
+   , retainedConIndex, bindRetainedWildcard
    , tyPatToRetainedPat
    , addDataConStupidTheta
    , zipPatsBndrs, zipConPatsBndrs
@@ -33,8 +34,8 @@ import GHC.Hs.Syn.Type
 import GHC.Rename.Utils
 import GHC.Tc.Errors.Types
 import GHC.Tc.Gen.Sig( TcPragEnv, lookupPragEnv, addInlinePrags )
-import GHC.Tc.Solver.Monad (bumpReductionDepthTcM, matchFamTcM, runTcS)
-import GHC.Tc.Solver.Rewrite (rewriteTyConAppArgsNom)
+import GHC.Tc.Solver.Monad (bumpReductionDepthTcM, matchFamTcM, runTcS, runTcSEqualities)
+import GHC.Tc.Solver.Rewrite (rewriteFamilyAxioms, rewriteTyConAppArgsNom)
 import GHC.Tc.Solver.Solve (solveSimpleGivens)
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Instantiate
@@ -110,16 +111,32 @@ tcLetPat :: (Name -> Maybe TcId)
          -> TcM (LPat GhcTc, a)
 tcLetPat sig_fn no_gen pat pat_ty thing_inside
   = do { bind_lvl <- getTcLevel
+       ; dflags <- getDynFlags
        ; let ctxt = LetPat { pc_lvl    = bind_lvl
                            , pc_sig_fn = sig_fn
                            , pc_new    = no_gen }
-             penv = PE { pe_lazy = True
+             penv = PE { pe_lazy = is_lazy_let dflags pat
                        , pe_ctxt = ctxt
                        , pe_orig = PatOrigin }
-       ; dflags <- getDynFlags
        ; manyIfLazy dflags pat
        ; tc_lpat pat_ty penv pat thing_inside }
   where
+    is_lazy_let dflags lpat
+      | xopt LangExt.Strict dflags = is_lazy_strict lpat
+      | otherwise                  = is_lazy_nonstrict lpat
+      where
+        is_lazy_strict (L _ (LazyPat _ _))  = True
+        is_lazy_strict (L _ (ParPat _ p))   = is_lazy_strict p
+        is_lazy_strict (L _ (AsPat _ _ p))  = is_lazy_strict p
+        is_lazy_strict (L _ (SigPat _ p _)) = is_lazy_strict p
+        is_lazy_strict _                    = False
+
+        is_lazy_nonstrict (L _ (BangPat _ _))  = False
+        is_lazy_nonstrict (L _ (ParPat _ p))   = is_lazy_nonstrict p
+        is_lazy_nonstrict (L _ (AsPat _ _ p))  = is_lazy_nonstrict p
+        is_lazy_nonstrict (L _ (SigPat _ p _)) = is_lazy_nonstrict p
+        is_lazy_nonstrict _                    = True
+
     -- The logic is partly duplicated from decideBangHood in
     -- GHC.HsToCore.Utils. Ugh…
     manyIfLazy dflags lpat
@@ -233,26 +250,62 @@ tcMatchPats match_ctxt pats pat_tys thing_inside
 -- | Check an indexed constructor row and pass its proof to the body checker.
 tcMatchPatsWithIndex :: Id -> HsMatchContextRn -> [LPat GhcRn] -> [ExpPatType]
                      -> (Maybe EvVar -> TcM a) -> TcM ([LPat GhcTc], a)
-tcMatchPatsWithIndex index ctxt pats pat_tys inside
-  | [p0] <- pats
-  , L loc pat@(ConPat { pat_con = L con_loc con, pat_args = args@PrefixCon{} }) <- strip_par p0
-  , [ExpFunPatTy pat_ty] <- pat_tys
-  = setSrcSpanA loc $
-      do { con_like <- tcLookupConLike con
-         ; case con_like of
-             RealDataCon dc ->
-               do { err_ctxt <- getErrCtxt
-                  ; (checked, result) <- addErrCtxt (PatCtxt pat) $
-                      tcDataConPatWithIndex (Just index) (L con_loc (getName con)) dc pat_ty penv args
-                        (setErrCtxt err_ctxt . inside)
-                  ; return ([L loc checked], result) }
-             PatSynCon{} -> ordinary }
-  | otherwise = ordinary
+tcMatchPatsWithIndex index ctxt [p0] [ExpFunPatTy pat_ty] inside
+  = go_pat p0 pat_ty
   where
-    strip_par (L _ (ParPat _ inner)) = strip_par inner
-    strip_par other = other
     penv = PE { pe_lazy = False, pe_ctxt = LamPat ctxt, pe_orig = PatOrigin }
-    ordinary = tcMatchPats ctxt pats pat_tys (inside Nothing)
+    ordinary p ty = tcMatchPats ctxt [p] [ExpFunPatTy ty] (inside Nothing)
+
+    go_pat (L loc (ParPat x inner)) ty = do
+      (ps, r) <- go_pat inner ty
+      pure $ case ps of
+        [p'] -> ([L loc (ParPat x p')], r)
+        _    -> (ps, r)
+    go_pat (L loc (BangPat x inner)) ty = do
+      (ps, r) <- go_pat inner ty
+      pure $ case ps of
+        [p'] -> ([L loc (BangPat x p')], r)
+        _    -> (ps, r)
+    go_pat orig@(L loc (AsPat x (L nm_loc name) inner)) ty@(Scaled w_pat exp_pat_ty) =
+      setSrcSpanA loc $ do
+        checkManyPattern OtherPatternReason orig ty
+        (wrap, bndr_id) <- setSrcSpanA nm_loc (tcPatBndr penv name ty)
+        (ps, r) <- tcExtendIdEnv1 name bndr_id $
+                     go_pat inner (Scaled w_pat (mkCheckExpType (idType bndr_id)))
+        res_ty <- readExpType exp_pat_ty
+        pure $ case ps of
+          [p'] -> ([L loc (mkHsWrapPat wrap (AsPat x (L nm_loc bndr_id) p') res_ty)], r)
+          _    -> (ps, r)
+    go_pat orig@(L loc pat@(ConPat { pat_con = L con_loc con, pat_args = raw_args })) ty =
+      setSrcSpanA loc $ do
+        con_like <- tcLookupConLike con
+        case con_like of
+          RealDataCon dc
+            | Just args <- to_prefix_con dc raw_args -> do
+                err_ctxt <- getErrCtxt
+                (checked, result) <- addErrCtxt (PatCtxt pat) $
+                  tcDataConPatWithIndex (Just index) (L con_loc (getName con)) dc ty penv args
+                    (setErrCtxt err_ctxt . inside)
+                pure ([L loc checked], result)
+          _ -> ordinary orig ty
+    go_pat orig ty = ordinary orig ty
+
+    to_prefix_con _ args@PrefixCon{} = Just args
+    to_prefix_con _ (InfixCon _ l r) = Just (PrefixCon noExtField [l, r])
+    to_prefix_con dc (RecCon _ rfields)
+      | let names = map flSelector (dataConFieldLabels dc)
+      , notNull names || (null (rec_flds rfields) && dataConSourceArity dc == 0) =
+          let supplied = [(sel, hfbRHS fld)
+                         | L _ fld <- rec_flds rfields
+                         , FieldOcc { foLabel = L _ sel } <- [unLoc (hfbLHS fld)]]
+              by_name  = mkNameEnv supplied
+          in if length supplied == length (rec_flds rfields)
+                && all ((`elem` names) . fst) supplied
+             then Just (PrefixCon noExtField [fromMaybe genWildPat (lookupNameEnv by_name nm) | nm <- names])
+             else Nothing
+    to_prefix_con _ _ = Nothing
+tcMatchPatsWithIndex _ ctxt pats pat_tys inside
+  = tcMatchPats ctxt pats pat_tys (inside Nothing)
 
 tcInferPat :: FixedRuntimeRepContext
            -> HsMatchContextRn
@@ -521,12 +574,21 @@ tc_lpat pat_ty@(Scaled mult expected) penv lpat@(L span pat) thing_inside
     do { (pat', res) <- maybeWrapPatCtxt (locA span) pat check thing_inside
        ; return (L span pat', res) }
   where
-    check
-      | Check ty <- expected
-      , matchesImplicitPayloadPat ty lpat
-      = tcImplicitPat penv lpat (Scaled mult ty)
+    is_wrapper ParPat{}      = True
+    is_wrapper BangPat{}     = True
+    is_wrapper LazyPat{}     = True
+    is_wrapper ModifiedPat{} = True
+    is_wrapper _             = False
+
+    check act
+      | Check raw_ty <- expected
+      , not (is_wrapper pat)
+      = do { ty <- liftZonkM (zonkTcType raw_ty)
+           ; if matchesImplicitPayloadPat ty lpat
+             then tcImplicitPat penv lpat (Scaled mult ty) act
+             else tc_pat pat_ty penv pat act }
       | otherwise
-      = tc_pat pat_ty penv pat
+      = tc_pat pat_ty penv pat act
 
 tc_lpats :: [Scaled ExpSigmaTypeFRR] -- ^ expected types (FRR because of Note [Patterns & FixedRuntimeRep])
          -> Checker [LPat GhcRn] [LPat GhcTc]
@@ -711,13 +773,14 @@ tc_pat scaled_exp_pat_ty@(Scaled w_pat exp_pat_ty) penv ps_pat thing_inside =
       ; return (BangPat x pat', res) }
 
     OrPat _ pats -> do -- See Note [Implementation of OrPatterns], Typechecker (1)
-      { let pats_list   = NE.toList pats
-            pat_exp_tys = map (const scaled_exp_pat_ty) pats_list
-      ; (pats_list', (res, pat_ct)) <- tc_lpats pat_exp_tys penv pats_list (captureConstraints thing_inside)
-      ; let pats' = NE.fromList pats_list' -- tc_lpats preserves non-emptiness
+      { let pats_list = NE.toList pats
+      ; pats_list' <- forM pats_list $ \p ->
+          fst <$> tc_lpat scaled_exp_pat_ty penv p (pure ())
+      ; (res, pat_ct) <- captureConstraints thing_inside
       ; emitConstraints pat_ct
           -- captureConstraints/extendConstraints:
           --   like in Note [Hopping the LIE in lazy patterns]
+      ; let pats' = NE.fromList pats_list'
       ; pat_ty <- expTypeToType exp_pat_ty
       ; return (OrPat pat_ty pats', res) }
 
@@ -747,7 +810,11 @@ tc_pat scaled_exp_pat_ty@(Scaled w_pat exp_pat_ty) penv ps_pat thing_inside =
     AsPat x (L nm_loc name) pat -> do
       { checkManyPattern OtherPatternReason (noLocA ps_pat) scaled_exp_pat_ty
       ; (wrap, bndr_id) <- setSrcSpanA nm_loc (tcPatBndr penv name scaled_exp_pat_ty)
-      ; (pat', res) <- tcExtendIdEnv1 name bndr_id $
+      ; let extend | isGeneratedSrcSpan (locA nm_loc)
+                   , (isSystemName name || isGeneratedSrcSpan (nameSrcSpan name))
+                   , name == idName bndr_id = tcExtendGeneratedIdEnv bndr_id
+                   | otherwise = tcExtendIdEnv1 name bndr_id
+      ; (pat', res) <- extend $
                        tc_lpat (Scaled w_pat (mkCheckExpType $ idType bndr_id))
                                penv pat thing_inside
           -- NB: if we do inference on:
@@ -1060,7 +1127,9 @@ AST is used for the subtraction operation.
       { (wrap, id) <- tcPatBndr penv var_nm scaled_exp_pat_ty
       ; res <- tcCheckUsage var_nm w_pat $
                tcExtendIdEnv1 var_nm id $
-               tcExtendIdEnv1 tv_nm id thing_inside
+               tcExtendIdEnv1 tv_nm id $
+               updLclCtxt (\c -> c { tcl_rdr = extendLocalRdrEnvWithAlias (tcl_rdr c) (nameOccName var_nm) tv_nm })
+                 thing_inside
       ; pat_ty <- readExpType exp_pat_ty
       ; return (mkHsWrapPat wrap (VarPat x (L l id)) pat_ty, res) }
 
@@ -1272,13 +1341,104 @@ tcConPat :: PatEnv -> LocatedN (WithUserRdr Name)
          -> TcM (Pat GhcTc, a)
 tcConPat penv (L loc qcon) pat_ty arg_pats thing_inside
   = do  { let con_lname = L loc (getName qcon)
-        ; con_like <- tcLookupConLike qcon
-        ; case con_like of
-            RealDataCon data_con -> tcDataConPat con_lname data_con pat_ty
-                                                 penv arg_pats thing_inside
-            PatSynCon pat_syn -> tcPatSynPat con_lname pat_syn pat_ty
-                                             penv arg_pats thing_inside
+        ; pack <- isExistsPackName (getName qcon)
+        ; if pack
+          then tcExistsPackPat penv loc pat_ty arg_pats thing_inside
+          else do
+            { con_like <- tcLookupConLike qcon
+            ; case con_like of
+                RealDataCon data_con -> tcDataConPat con_lname data_con pat_ty
+                                                     penv arg_pats thing_inside
+                PatSynCon pat_syn -> tcPatSynPat con_lname pat_syn pat_ty
+                                                 penv arg_pats thing_inside }
         }
+
+-- | Check an explicit existential @Pack@ pattern in any strict pattern position.
+tcExistsPackPat :: PatEnv -> SrcSpanAnnN -> Scaled ExpSigmaTypeFRR
+                -> HsConPatDetails GhcRn -> TcM a -> TcM (Pat GhcTc, a)
+tcExistsPackPat penv con_loc (Scaled mult exp_pat_ty) arg_pats thing_inside
+  = setSrcSpanA con_loc $
+    do { enabled <- xoptM LangExt.DependentTypes
+       ; unless enabled $ failWithTc (TcRnExistsPack ExistsPackExtension)
+       ; when (pe_lazy penv) $ failWithTc TcRnLazyGADTPattern
+       ; case pe_ctxt penv of
+           LamPat ArrowMatchCtxt{} -> failWithTc TcRnArrowProcGADTPattern
+           _ -> pure ()
+       ; (is_at, mb_name, payload_pat) <- case arg_pats of
+           PrefixCon _ [witness_pat, payload_pat] ->
+             parse_witness witness_pat payload_pat
+           _ -> failWithTc (TcRnExistsPack ExistsPackInvalidContext)
+       ; raw_ty <- expTypeToType exp_pat_ty
+       ; checkManyPattern OtherPatternReason payload_pat (Scaled mult raw_ty)
+       ; schema0 <- liftZonkM (zonkTcType raw_ty)
+       ; (fam_wrap, schema) <- reduce_exists_family schema0
+       ; (pat', res) <- open_layers is_at mb_name payload_pat schema
+       ; pure (mkHsWrapPat fam_wrap pat' raw_ty, res) }
+  where
+    strip_p (L _ (ParPat _ p)) = strip_p p
+    strip_p (L _ p)            = p
+
+    strip_t (L _ (HsParTy _ t)) = strip_t t
+    strip_t (L _ t)             = t
+
+    parse_witness witness_pat payload_pat = case strip_p witness_pat of
+      EmbTyPat _ HsTP{ hstp_ext = HsTPRn [] [] [name], hstp_body = witness_ty }
+        | HsTyVar{} <- strip_t witness_ty
+        -> pure (False, Just name, payload_pat)
+      InvisPat SpecifiedSpec HsTP{ hstp_ext = HsTPRn [] [] [name], hstp_body = witness_ty }
+        | HsTyVar{} <- strip_t witness_ty
+        -> pure (True, Just name, payload_pat)
+      WildPat{} -> pure (False, Nothing, payload_pat)
+      EmbTyPat _ HsTP{ hstp_body = ty }
+        | HsWildCardTy (HoleVar (L _ hole)) <- strip_t ty
+        , hole == unnamedHoleRdrName
+        -> pure (False, Nothing, payload_pat)
+      InvisPat SpecifiedSpec HsTP{ hstp_body = ty }
+        | HsWildCardTy (HoleVar (L _ hole)) <- strip_t ty
+        , hole == unnamedHoleRdrName
+        -> pure (True, Nothing, payload_pat)
+      _ -> setSrcSpanA (getLoc witness_pat) $
+             failWithTc (TcRnExistsPack ExistsPackInvalidContext)
+
+    reduce_exists_family ty
+      | Just (tc, _) <- tcSplitTyConApp_maybe ty
+      , isTypeFamilyTyCon tc
+      = do { ct_loc <- getCtLocM (OccurrenceOf (tyConName tc)) (Just TypeLevel)
+           ; Reduction co reduced <- runTcSEqualities (rewriteFamilyAxioms ct_loc ty)
+           ; pure (mkWpCastN co, reduced) }
+      | otherwise = pure (idHsWrapper, ty)
+
+    fresh_witness_name binder = do
+      u <- newUnique
+      pure (mkSystemNameAt u (getOccName binder) (locA con_loc))
+
+    open_layers is_at mb_name payload_pat cur_ty
+      | not is_at
+      , ExistsTy ImplicitExists binder inner <- coreFullView cur_ty
+      , ExistsTy ExplicitExists _ _ <- implicitPayloadType inner
+      = do { let origin = UnifyForAllSkol cur_ty
+           ; skol <- setSrcSpanA con_loc $ mkSkolemInfo origin
+           ; name <- fresh_witness_name binder
+           ; witness <- pushTcLevelM_ $ newSkolemTyVar skol name (tyVarKind binder)
+           ; let next_ty = substTyWith [binder] [mkTyVarTy witness] (expandTypeSynonyms inner)
+           ; payload <- newSysLocalId (fsLit "unpacked") ManyTy next_ty
+           ; (ev_binds, (inner_pat, res)) <- setSrcSpanA con_loc $
+               checkConstraints origin [witness] [] $
+                 open_layers is_at mb_name payload_pat next_ty
+           ; pure (XPat (NativeExistsPat cur_ty witness payload ev_binds inner_pat), res) }
+      | ExistsTy _ binder inner <- coreFullView cur_ty
+      = do { let origin = UnifyForAllSkol cur_ty
+           ; skol <- setSrcSpanA con_loc $ mkSkolemInfo origin
+           ; name <- maybe (fresh_witness_name binder) pure mb_name
+           ; witness <- pushTcLevelM_ $ newSkolemTyVar skol name (tyVarKind binder)
+           ; let payload_ty = substTyWith [binder] [mkTyVarTy witness] (expandTypeSynonyms inner)
+           ; payload <- newSysLocalId (fsLit "unpacked") ManyTy payload_ty
+           ; (ev_binds, (L _ inner_pat, res)) <- setSrcSpanA con_loc $
+               checkConstraints origin [witness] [] $
+                 tcExtendNameTyVarEnv [(n, witness) | n <- maybeToList mb_name] $
+                   tc_lpat (Scaled ManyTy (mkCheckExpType payload_ty)) penv payload_pat thing_inside
+           ; pure (XPat (NativeExistsPat cur_ty witness payload ev_binds inner_pat), res) }
+      | otherwise = failWithTc (TcRnExistsPack (ExistsPackInvalidSchema cur_ty))
 
 -- Warn when pattern matching on a GADT or a pattern synonym
 -- when MonoLocalBinds is off.
@@ -1334,9 +1494,9 @@ tcDataConPatWithIndex index (L con_span con_name) data_con pat_ty_scaled
                  ; fam_res <- maybe (pure Nothing) (match_family_result tycon) expected
                  ; (w, res_tys) <- case fam_res of
                      Just (co, tys, binds) -> pure (mkWpLet (EvBinds binds) <.> mkWpCastN co, tys)
-                     Nothing -> do { matched@(w0, _) <- matchExpectedConTy penv tycon pat_ty_scaled
-                                   ; unless (isIdHsWrapper w0) bad_pkg_pat
-                                   ; pure matched }
+                     Nothing -> do { case expected >>= tcSplitTyConApp_maybe of
+                                       Just (tc, _) | isTypeFamilyTyCon tc || isNewTyCon tc -> bad_pkg_pat
+                                       _ -> matchExpectedConTy penv tycon pat_ty_scaled }
                  ; pure (w, res_tys, u_args, e_args, v_pats, []) }
             else
               do { (w, res_tys) <- matchExpectedConTy penv tycon pat_ty_scaled
@@ -1410,8 +1570,11 @@ tcDataConPatWithIndex index (L con_span con_name) data_con pat_ty_scaled
                     ; index_vars   <- newEvVars (substTheta proof_subst index_preds)
                     ; context_vars <- newEvVars (substTheta tenv theta)
                     ; return (kind_vars ++ index_vars ++ context_vars) }
-              ; (body_pats, indexed_fields) <- case (index, val_arg_pats) of
-                  (Just scrut, PrefixCon ann fields)
+              ; let as_prefix (PrefixCon ann fields) = Just (ann, fields)
+                    as_prefix (InfixCon _ l r)       = Just (noExtField, [l, r])
+                    as_prefix _                      = Nothing
+              ; (body_pats, indexed_fields) <- case (index, as_prefix val_arg_pats) of
+                  (Just scrut, Just (ann, fields))
                     | not trailing_context, LegacyConOrder _ <- source_order
                     , isIdHsWrapper wrap, isNativeIndexedGadtCon data_con
                     , given `equalLength` eq_spec
@@ -1483,17 +1646,25 @@ tcDataConPatWithIndex index (L con_span con_name) data_con pat_ty_scaled
     -- See Note [Wildcards in indexed GADT cases].
     indexed_field :: LPat GhcRn -> Maybe (TcM (Name, LPat GhcRn))
     indexed_field pat@(L _ (VarPat _ (L _ name))) = Just (return (name, pat))
+    indexed_field pat@(L _ (XPat (HsPatExpanded (VarPat _ (L _ tv_nm)) (VarPat _ (L _ name)))))
+      | isTyVarName tv_nm = Just (return (name, pat))
     indexed_field pat@(L _ WildPat{}) = Just $
       do { name <- newSysName (mkVarOcc "_")
          ; return (name, bindRetainedWildcard name pat) }
     indexed_field (L loc (ParPat ann pat)) =
       fmap (second (L loc . ParPat ann)) <$> indexed_field pat
+    indexed_field (L loc (BangPat ann pat)) =
+      fmap (second (L loc . BangPat ann)) <$> indexed_field pat
+    indexed_field pat@(L _ (AsPat _ (L l name) inner))
+      | isGeneratedSrcSpan (locA l), L _ WildPat{} <- inner = Just (return (name, pat))
     indexed_field (L loc (SigPat ann pat sig)) =
       fmap (second (\p -> L loc (SigPat ann p sig))) <$> indexed_field pat
     indexed_field _ = Nothing
 
     zonk_field field = setIdType field <$> liftZonkM (zonkTcType (idType field))
 
+    split_rep_args rep_binders (InfixCon _ left right) =
+      split_rep_args rep_binders (PrefixCon noExtField [left, right])
     split_rep_args rep_binders (PrefixCon ann raw_pats) =
       do { let con_like = RealDataCon data_con
                ex_tvs = dataConExTyCoVars data_con
@@ -1718,6 +1889,9 @@ tcDataConPatWithIndex index (L con_span con_name) data_con pat_ty_scaled
 
     bind_rep_leaf wrap (L l (ParPat x inp))  = bind_rep_leaf (wrap . L l . ParPat x) inp
     bind_rep_leaf wrap (L l (BangPat x inp)) = bind_rep_leaf (wrap . L l . BangPat x) inp
+    bind_rep_leaf wrap (L l (SigPat x inp s)) = bind_rep_leaf (wrap . (\p -> L l (SigPat x p s))) inp
+    bind_rep_leaf wrap p@(L _ (XPat (HsPatExpanded (VarPat _ (L _ tv_nm)) (VarPat _ (L _ nm)))))
+      | isTyVarName tv_nm = pure (Just (nm, wrap p))
     bind_rep_leaf wrap p@(L _ (VarPat _ (L _ nm))) = pure (Just (nm, wrap p))
     bind_rep_leaf wrap p@(L _ WildPat{}) =
       do { nm <- newSysName (mkVarOcc "_")
@@ -1780,25 +1954,96 @@ McBride & McKinna 2006; Cockx, Devriese & Piessens, ICFP 2014; GHC Proposal
 retainedConPat :: LPat GhcRn -> LPat GhcRn
 retainedConPat (L loc (ParPat x pat))
   = L loc (ParPat x (retainedConPat pat))
+retainedConPat (L loc (BangPat x pat))
+  = L loc (BangPat x (retainedConPat pat))
+retainedConPat (L loc (AsPat x alias pat))
+  = L loc (AsPat x alias (retainedConPat pat))
+retainedConPat (L loc (SigPat x pat sig))
+  = L loc (SigPat x (retainedConPat pat) sig)
 retainedConPat (L loc (ListPat _ []))
   = L loc (unLoc (nlConPatName (dataConName nilDataCon) []))
-retainedConPat (L loc (TuplePat _ [first, second] Boxed))
-  = L loc (unLoc (nlConPatName (tupleDataConName Boxed 2) [first, second]))
+retainedConPat (L loc (ListPat _ (p : ps)))
+  = L loc (unLoc (nlConPatName (dataConName consDataCon)
+      [retainedConPat p, retainedConPat (L loc (ListPat noExtField ps))]))
+retainedConPat (L loc (TuplePat _ pats Boxed))
+  | length pats /= 1
+  = L loc (unLoc (nlConPatName (tupleDataConName Boxed (length pats)) (map retainedConPat pats)))
 retainedConPat (L loc pat@(ConPat { pat_args = InfixCon _ left right }))
-  = L loc (pat { pat_args = PrefixCon noExtField [left, right] })
+  = L loc (pat { pat_args = PrefixCon noExtField [retainedConPat left, retainedConPat right] })
+retainedConPat (L loc pat@(ConPat { pat_args = PrefixCon x subs }))
+  = L loc (pat { pat_args = PrefixCon x (map retainedConPat subs) })
 retainedConPat pat = pat
+
+-- | Like 'retainedConPat', also expanding positional record patterns via
+-- 'dataConFieldLabels' and guarding boxed tuple patterns against
+-- @-firrefutable-tuples@.
+expandRetainedPat :: LPat GhcRn -> TcM (LPat GhcRn)
+expandRetainedPat pat0 = do
+  irref_tuples <- goptM Opt_IrrefutableTuples
+  let go (L loc (ParPat x p))    = L loc . ParPat x <$> go p
+      go (L loc (BangPat x p))   = L loc . BangPat x <$> go p
+      go (L loc (AsPat x a p))   = L loc . AsPat x a <$> go p
+      go (L loc (SigPat x p s))  = (\p' -> L loc (SigPat x p' s)) <$> go p
+      go (L loc (ListPat _ []))  = pure (L loc (unLoc (nlConPatName (dataConName nilDataCon) [])))
+      go (L loc (ListPat _ (p : ps))) = do
+        p'  <- go p
+        ps' <- go (L loc (ListPat noExtField ps))
+        pure (L loc (unLoc (nlConPatName (dataConName consDataCon) [p', ps'])))
+      go orig@(L loc (TuplePat _ pats Boxed))
+        | not irref_tuples, length pats /= 1 = do
+            pats' <- mapM go pats
+            pure (L loc (unLoc (nlConPatName (tupleDataConName Boxed (length pats')) pats')))
+        | otherwise = pure orig
+      go (L loc pat@(ConPat { pat_args = InfixCon _ l r })) = do
+        l' <- go l
+        r' <- go r
+        pure (L loc (pat { pat_args = PrefixCon noExtField [l', r'] }))
+      go (L loc pat@(ConPat { pat_args = PrefixCon x subs })) = do
+        subs' <- mapM go subs
+        pure (L loc (pat { pat_args = PrefixCon x subs' }))
+      go orig@(L loc pat@(ConPat { pat_con = L _ cname, pat_args = RecCon _ rfields })) = do
+        cl <- tcLookupConLike cname
+        case cl of
+          RealDataCon dc
+            | let names = map flSelector (dataConFieldLabels dc)
+            , notNull names || (null (rec_flds rfields) && dataConSourceArity dc == 0) -> do
+                let supplied = [(sel, hfbRHS fld)
+                               | L _ fld <- rec_flds rfields
+                               , FieldOcc { foLabel = L _ sel } <- [unLoc (hfbLHS fld)]]
+                    by_name  = mkNameEnv supplied
+                if length supplied == length (rec_flds rfields)
+                   && all ((`elem` names) . fst) supplied
+                  then do
+                    let raw = [fromMaybe genWildPat (lookupNameEnv by_name nm) | nm <- names]
+                    subs' <- mapM go raw
+                    pure (L loc (pat { pat_args = PrefixCon noExtField subs' }))
+                  else pure orig
+          _ -> pure orig
+      go orig = pure orig
+  go pat0
 
 -- | A bare retained binder can bind a source variable or a wildcard.
 isRetainedVarPat :: LPat GhcRn -> Bool
 isRetainedVarPat (L _ VarPat{}) = True
 isRetainedVarPat (L _ WildPat{}) = True
+isRetainedVarPat (L _ (ParPat _ p)) = isRetainedVarPat p
+isRetainedVarPat (L _ (BangPat _ p)) = isRetainedVarPat p
+isRetainedVarPat (L _ (SigPat _ p _)) = isRetainedVarPat p
+isRetainedVarPat (L _ (AsPat _ _ p)) = isRetainedVarPat p
 isRetainedVarPat (L _ (XPat (HsPatExpanded _ rpat))) = isRetainedVarPat (noLocA rpat)
 isRetainedVarPat _ = False
 
 -- | Bind an anonymous retained value at the identity used by its dependants.
 -- See Note [Wildcard retained binders] in GHC.Tc.Gen.Match.
 bindRetainedWildcard :: Name -> LPat GhcRn -> LPat GhcRn
-bindRetainedWildcard name (L loc WildPat{}) = L loc (VarPat noExtField (noLocA name))
+bindRetainedWildcard name (L loc WildPat{})
+  = L loc (VarPat noExtField (noLocA name))
+bindRetainedWildcard name (L loc (ParPat x p))
+  = L loc (ParPat x (bindRetainedWildcard name p))
+bindRetainedWildcard name (L loc (BangPat x p))
+  = L loc (BangPat x (bindRetainedWildcard name p))
+bindRetainedWildcard name (L loc (SigPat x p s))
+  = L loc (SigPat x (bindRetainedWildcard name p) s)
 bindRetainedWildcard _ pat = pat
 
 -- | Convert a renamed @\@pat@ ('HsTyPat') into the corresponding runtime pattern
@@ -1855,16 +2100,25 @@ tyPatToRetainedPat outer_loc (HsTP _ body) = runMaybeT (go_ty outer_loc body)
     split_con_app _ _ = Nothing
 
 -- | Bind anonymous fields to the Ids used in the promoted constructor index.
+-- Outer user 'AsPat' wrappers on the constructor are stripped here because the
+-- enclosing match binds the shared index 'Id' and aliases the 'AsPat' name.
 -- See Note [Parameterized retained constructor patterns].
 bindRetainedConFields :: [Id] -> LPat GhcRn -> LPat GhcRn
 bindRetainedConFields fields = go . retainedConPat
   where
     go :: LPat GhcRn -> LPat GhcRn
-    go (L loc (ParPat x inner)) = L loc (ParPat x (go inner))
+    go (L loc (ParPat x inner))    = L loc (ParPat x (go inner))
+    go (L loc (BangPat x inner))   = L loc (BangPat x (go inner))
+    go (L _   (AsPat _ _ inner))   = go inner
+    go (L loc (SigPat x inner s))  = L loc (SigPat x (go inner) s)
     go (L loc con@(ConPat { pat_args = PrefixCon x pats }))
       = L loc (con { pat_args = PrefixCon x
-          (zipWithEqual (bindRetainedWildcard . idName) fields pats) })
+          (zipWithEqual bind_field fields pats) })
     go pat = pprPanic "bindRetainedConFields: not a checked constructor" (ppr pat)
+
+    bind_field fid (L _ (AsPat _ _ p))
+      | isRetainedVarPat p = bindRetainedWildcard (idName fid) p
+    bind_field fid p = bindRetainedWildcard (idName fid) p
 
 -- | Form the complete promoted constructor index of checked runtime fields.
 -- See Note [Parameterized retained constructor patterns].
@@ -1881,21 +2135,32 @@ tcRetainedCon domain = tcRetainedConScaled (Scaled ManyTy domain)
 
 -- | Like 'tcRetainedCon', scaling field multiplicities by the scrutinee multiplicity.
 tcRetainedConScaled :: Scaled Type -> LPat GhcRn -> TcM (Maybe (DataCon, [Id]))
-tcRetainedConScaled sdom@(Scaled scrut_mult domain) source_pat
-  | L _ (ParPat _ pat) <- source_pat = tcRetainedConScaled sdom pat
-  | otherwise = case unLoc (retainedConPat source_pat) of
-      ConPat { pat_con = L _ name, pat_args = PrefixCon _ pats } ->
-        do { lazy_tuple <- case unLoc source_pat of
-                 TuplePat{} -> goptM Opt_IrrefutableTuples
-                 _ -> pure False
-           ; if lazy_tuple then return Nothing else do
-           { con_like <- tcLookupConLike name
-           ; case con_like of
-               RealDataCon con | Just args <- nativeIndexDataConTyArgs domain con
-                 -> check_fields con args pats
-               _ -> return Nothing } }
-      _ -> return Nothing
+tcRetainedConScaled (Scaled scrut_mult domain) source_pat = do
+  lazy_tuple <- if is_non_unit_tuple source_pat then goptM Opt_IrrefutableTuples else pure False
+  if lazy_tuple then pure Nothing else do
+    expanded <- expandRetainedPat source_pat
+    case unLoc (strip_wrappers expanded) of
+      ConPat { pat_con = L _ name, pat_args = PrefixCon _ pats } -> do
+        con_like <- tcLookupConLike name
+        case con_like of
+          RealDataCon con | Just args <- nativeIndexDataConTyArgs domain con
+            -> check_fields con args pats
+          _ -> pure Nothing
+      _ -> pure Nothing
   where
+    is_non_unit_tuple (L _ (ParPat _ p))    = is_non_unit_tuple p
+    is_non_unit_tuple (L _ (BangPat _ p))   = is_non_unit_tuple p
+    is_non_unit_tuple (L _ (AsPat _ _ p))   = is_non_unit_tuple p
+    is_non_unit_tuple (L _ (SigPat _ p _))  = is_non_unit_tuple p
+    is_non_unit_tuple (L _ (TuplePat _ ps Boxed)) = not (null ps)
+    is_non_unit_tuple _                     = False
+
+    strip_wrappers (L _ (ParPat _ p))   = strip_wrappers p
+    strip_wrappers (L _ (BangPat _ p))  = strip_wrappers p
+    strip_wrappers (L _ (AsPat _ _ p))  = strip_wrappers p
+    strip_wrappers (L _ (SigPat _ p _)) = strip_wrappers p
+    strip_wrappers p                    = p
+
     check_fields con args pats
       | dataConHasPromotedRetained con
       , witness_pat : payload_pats <- pats
@@ -1915,6 +2180,13 @@ tcRetainedConScaled sdom@(Scaled scrut_mult domain) source_pat
            ; return (Just (con, fields)) }
       | otherwise = return Nothing
 
+    field (L _ (ParPat _ p)) sty   = field p sty
+    field (L _ (BangPat _ p)) sty  = field p sty
+    field (L _ (SigPat _ p _)) sty = field p sty
+    field (L loc (AsPat _ (L _ name) p)) (Scaled fmult ty)
+      | isRetainedVarPat p
+      = setSrcSpanA loc $ return (mkLocalId name (mkMultMul scrut_mult fmult) ty)
+    field (L _ (XPat (HsPatExpanded _ rpat))) sty = field (noLocA rpat) sty
     field (L loc (VarPat _ (L _ name))) (Scaled fmult ty)
       = setSrcSpanA loc $ return (mkLocalId name (mkMultMul scrut_mult fmult) ty)
     field (L _ WildPat{}) (Scaled fmult ty)
@@ -2721,6 +2993,10 @@ matchesImplicitPayloadPat schema
       BangPat _ nested -> go constructors nested
       LazyPat _ nested -> go constructors nested
       SigPat _ nested _ -> go constructors nested
+      ModifiedPat _ _ nested -> go constructors nested
+      OrPat _ pats -> any (go constructors) pats
+      ListPat _ _ -> dataConName nilDataCon `elem` constructors
+                     || dataConName consDataCon `elem` constructors
       ConPat { pat_con = L _ (WithUserRdr _ name) } -> name `elem` constructors
       TuplePat _ fields boxity -> tupleDataConName boxity (length fields) `elem` constructors
       _ -> False

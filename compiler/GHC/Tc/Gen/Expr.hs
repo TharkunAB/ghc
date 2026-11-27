@@ -74,7 +74,7 @@ import GHC.Core.DataCon
 import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.TyCo.Rep (Type(AppTy, CastTy, DepDictTy, DepFunTy, ExistsTy, ForAllTy, FunTy, TermAppTy, TermVarTy, TyConApp))
+import GHC.Core.TyCo.Rep (Type(AppTy, CastTy, DepDictTy, DepFunTy, ExistsTy, ForAllTy, FunTy, TermAppTy, TermVarTy, TyConApp, TyVarTy))
 import GHC.Core.Coercion
 import GHC.Core.Predicate( decomposeIPPred, getEqPredTys_maybe, mkNomEqPred )
 
@@ -82,7 +82,7 @@ import GHC.Types.Basic
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Map
 import GHC.Types.Unique.Set
-import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar )
+import GHC.Types.Var ( ExistsTyFlag(ImplicitExists), mkTyVar )
 import GHC.Types.Var.Set (TyCoVarSet, elemVarSet, mkVarSet, sizeVarSet, unionVarSet)
 import GHC.Types.Id
 import GHC.Types.Id.Info
@@ -841,17 +841,13 @@ tcExpr (HsCase ctxt scrut matches) res_ty
        ; return (HsCase ctxt scrut' matches') }
 
 tcExpr expr@(HsCase ctxt scrut matches) res_ty
-  = do { opened <- tcExistsCase expr res_ty
-       ; case opened of
-           Just unpack -> return unpack
-           Nothing -> do
-             { mult <- newFlexiTyVarTy multiplicityTy
-             ; head_app <- case unLoc (stripParensLHsExpr scrut) of
-                 HsApp{} -> split_implicit_head_call 0 id scrut
-                 _ -> return Nothing
-             ; case head_app of
-                 Just (package, rebuild) -> open_call mult package rebuild
-                 Nothing -> ordinary_case mult scrut res_ty } }
+  = do { mult <- newFlexiTyVarTy multiplicityTy
+       ; head_app <- case unLoc (stripParensLHsExpr scrut) of
+           HsApp{} -> split_implicit_head_call 0 id scrut
+           _ -> return Nothing
+       ; case head_app of
+           Just (package, rebuild) -> open_call mult package rebuild
+           Nothing -> ordinary_case mult scrut res_ty }
   where
     split_implicit_head_call :: Int -> (LHsExpr GhcRn -> LHsExpr GhcRn)
                              -> LHsExpr GhcRn
@@ -1525,10 +1521,11 @@ tcLexicalExistsLet :: HsExpr GhcRn -> LHsLocalBinds GhcRn -> LHsExpr GhcRn
 tcLexicalExistsLet original (L bind_loc (HsValBinds ann (XValBindsLR (HsVBG groups [])))) body expected
   | [(NonRecursive, [L pat_bind_loc binding@PatBind
       { pat_lhs = pat, pat_mods = [], pat_rhs = grhss }])] <- groups
-  , tuple_pattern pat
   , GRHSs { grhssGRHSs = L rhs_loc (GRHS rhs_ann [] rhs) NE.:| []
           , grhssLocalBinds = L _ EmptyLocalBinds{} } <- grhss
   = runMaybeT $ do
+      dflags <- liftMaybeT getDynFlags
+      guard (tuple_pattern pat || is_strict_let_pat dflags pat)
       (schema, check_schema) <- MaybeT (tcLexicalPackageOperand rhs)
       case coreFullView schema of
         ExistsTy ImplicitExists _ _ -> guard (matchesImplicitPayloadPat schema pat)
@@ -1559,19 +1556,39 @@ tcLexicalExistsLet original (L bind_loc (HsValBinds ann (XValBindsLR (HsVBG grou
           return (HsLet noExtField (L bind_loc decls) body')
         return (mkExpandedExprTc original opened)
   where
-    tuple_pattern (L _ (ParPat _ nested)) = tuple_pattern nested
+    tuple_pattern (L _ (ParPat _ nested))  = tuple_pattern nested
+    tuple_pattern (L _ (AsPat _ _ nested)) = tuple_pattern nested
     tuple_pattern (L _ (LazyPat _ nested)) = plain_tuple nested
     tuple_pattern (L _ (BangPat _ nested)) = plain_tuple nested
-    tuple_pattern pat = plain_tuple pat
+    tuple_pattern p                        = plain_tuple p
 
-    plain_tuple (L _ (ParPat _ nested)) = plain_tuple nested
+    plain_tuple (L _ (ParPat _ nested))  = plain_tuple nested
+    plain_tuple (L _ (AsPat _ _ nested)) = plain_tuple nested
     plain_tuple (L _ (TuplePat _ fields Boxed)) = all plain_field fields
     plain_tuple _ = False
 
-    plain_field (L _ (ParPat _ nested)) = plain_field nested
+    plain_field (L _ (ParPat _ nested))  = plain_field nested
+    plain_field (L _ (AsPat _ _ nested)) = plain_field nested
     plain_field (L _ VarPat{}) = True
     plain_field (L _ WildPat{}) = True
     plain_field _ = False
+
+    is_strict_let_pat dflags lpat
+      | xopt LangExt.Strict dflags = not (is_lazy_strict lpat)
+      | otherwise                  = has_outer_bang lpat
+      where
+        is_lazy_strict (L _ (LazyPat _ _))  = True
+        is_lazy_strict (L _ (VarPat _ _))   = True
+        is_lazy_strict (L _ (ParPat _ p))   = is_lazy_strict p
+        is_lazy_strict (L _ (AsPat _ _ p))  = is_lazy_strict p
+        is_lazy_strict (L _ (SigPat _ p _)) = is_lazy_strict p
+        is_lazy_strict _                    = False
+
+        has_outer_bang (L _ (BangPat _ _))  = True
+        has_outer_bang (L _ (ParPat _ p))   = has_outer_bang p
+        has_outer_bang (L _ (AsPat _ _ p))  = has_outer_bang p
+        has_outer_bang (L _ (SigPat _ p _)) = has_outer_bang p
+        has_outer_bang _                    = False
 tcLexicalExistsLet _ _ _ _ = return Nothing
 
 {- Note [Scope for a local erased package pattern]
@@ -1662,9 +1679,67 @@ tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) 
                    ; let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
                    ; return (L (getLoc body') (HsLet noExtField (L loc binds) body')) }
                  else tcNonRecLets [binding] b_sigs check_group rest } }
+      | [] <- b_sigs
+      , FunBind { fun_matches = matches } <- unLoc binding
+      , Just rhs <- lazyLetRhs matches
+      = do { mb_tau <- known_nested_exists_rhs rhs
+           ; case mb_tau of
+               Just tau -> do
+                 { (checked, body') <- tcNonRecLetAtType name tau binding rest
+                 ; let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
+                 ; return (L (getLoc body') (HsLet noExtField (L loc binds) body')) }
+               Nothing -> tcNonRecLets [binding] b_sigs check_group rest }
       | otherwise = tcNonRecLets [binding] b_sigs check_group rest
       where
         b_sigs = sigs_for name
+
+        known_nested_exists_rhs :: LHsExpr GhcRn -> TcM (Maybe TcType)
+        known_nested_exists_rhs e = case unLoc (stripParensLHsExpr e) of
+          HsVar _ lname -> do
+            let nm = unLocWithUserRdr lname
+            mb_id <- if isExternalName nm
+                     then discardErrs $ tryTcDiscardingErrs (pure Nothing) (tcLookupIdMaybe nm)
+                     else do
+                       lcl <- tcLookupLcl_maybe nm
+                       pure $ case lcl of
+                         Just (ATcId { tct_id = v }) -> Just v
+                         Just (AGlobal (AnId v))     -> Just v
+                         _                           -> Nothing
+            case mb_id of
+              Just ident -> do
+                ty <- liftZonkM (zonkTcType (varType ident))
+                pure $ if is_ground_nested_exists ty then Just ty else Nothing
+              Nothing -> pure Nothing
+          _ -> pure Nothing
+
+        is_ground_nested_exists :: TcType -> Bool
+        is_ground_nested_exists ty
+          | ExistsTy{} <- coreFullView ty = False
+          | otherwise = isFamFreeTy ty
+                        && all (\v -> isTyVar v && not (isMetaTyVar v)) (tyCoVarsOfTypeList ty)
+                        && has_exists_no_pi [] ty
+
+        has_exists_no_pi :: [TyVar] -> TcType -> Bool
+        has_exists_no_pi bound t = case coreFullView t of
+          ExistsTy _ b body -> no_pi_or_forall (b : bound) (tyVarKind b)
+                               && no_pi_or_forall (b : bound) body
+          TyConApp _ args   -> any (has_exists_no_pi bound) args
+                               && all (no_pi_or_forall bound) args
+          AppTy f a         -> (has_exists_no_pi bound f || has_exists_no_pi bound a)
+                               && no_pi_or_forall bound f && no_pi_or_forall bound a
+          _                 -> False
+
+        no_pi_or_forall :: [TyVar] -> TcType -> Bool
+        no_pi_or_forall bound t = case coreFullView t of
+          DepFunTy{}        -> False
+          ForAllTy{}        -> False
+          ExistsTy _ b body -> no_pi_or_forall (b : bound) (tyVarKind b)
+                               && no_pi_or_forall (b : bound) body
+          FunTy _ _ m a r   -> all (no_pi_or_forall bound) [m, a, r]
+          TyConApp _ args   -> all (no_pi_or_forall bound) args
+          AppTy f a         -> no_pi_or_forall bound f && no_pi_or_forall bound a
+          TyVarTy v         -> v `elem` bound || not (isMetaTyVar v)
+          _                 -> True
     check_binding binding rest = tcNonRecLets [binding] [] check_group rest
 
     check_group checked rest = do
@@ -1900,89 +1975,6 @@ and validate the eventual RULES. Desugaring must discharge that same proof
 by retained application at the canonical product. Otherwise desugar the
 written RHS once as an ordinary lazy let.
 -}
-
--- | Open an explicit existential in a single case alternative.
--- See Note [Checking a lexical existential case].
-tcExistsCase :: HsExpr GhcRn -> ExpRhoType -> TcM (Maybe (HsExpr GhcTc))
-tcExistsCase expr@(HsCase ctxt scrut matches)
-             expected
-  | MG { mg_alts = L _ [L _ match] } <- matches
-  , Match { m_pats = L _ [pat] } <- match
-  , ConPat { pat_con = L con_loc (WithUserRdr _ con), pat_args = args } <- strip_pat pat
-  = do { pack <- isExistsPackName con
-       ; if pack then Just <$> check_pack con_loc con args
-                 else return Nothing }
-  where
-    strip_pat (L _ (ParPat _ pat)) = strip_pat pat
-    strip_pat (L _ pat) = pat
-
-    check_pack con_loc con args
-      = do { enabled <- xoptM LangExt.DependentTypes
-           ; unless enabled $ failWithTc (TcRnExistsPack ExistsPackExtension)
-           ; case args of
-               PrefixCon _ [witness_pat, payload_pat]
-                 | EmbTyPat _ HsTP{ hstp_ext = HsTPRn [] [] [name], hstp_body = witness_ty }
-                     <- strip_pat witness_pat
-                 , HsTyVar{} <- unLoc (ignoreParens witness_ty)
-                 -> open_pack False con_loc con (Just name) payload_pat
-                 | InvisPat SpecifiedSpec HsTP{ hstp_ext = HsTPRn [] [] [name], hstp_body = witness_ty }
-                     <- strip_pat witness_pat
-                 , HsTyVar{} <- unLoc (ignoreParens witness_ty)
-                 -> open_pack True con_loc con (Just name) payload_pat
-                 | Just is_at <- wildcard_witness (strip_pat witness_pat)
-                 -> open_pack is_at con_loc con Nothing payload_pat
-                 | otherwise -> setSrcSpanA (getLoc witness_pat) $
-                                  failWithTc (TcRnExistsPack ExistsPackInvalidContext)
-               _ -> failWithTc (TcRnExistsPack ExistsPackInvalidContext) }
-
-    wildcard_witness :: Pat GhcRn -> Maybe Bool
-    wildcard_witness WildPat{} = Just False
-    wildcard_witness (EmbTyPat _ HsTP{ hstp_body = ty })
-      | HsWildCardTy (HoleVar (L _ hole)) <- unLoc (ignoreParens ty)
-      , hole == unnamedHoleRdrName
-      = Just False
-    wildcard_witness (InvisPat SpecifiedSpec HsTP{ hstp_body = ty })
-      | HsWildCardTy (HoleVar (L _ hole)) <- unLoc (ignoreParens ty)
-      , hole == unnamedHoleRdrName
-      = Just True
-    wildcard_witness _ = Nothing
-
-    open_pack is_at con_loc con mb_name payload_pat
-      = do { (scrut', scrut_ty) <- tcScalingUsage ManyTy $ tcInferRhoFRR FRRCase scrut
-           ; schema <- liftZonkM (zonkTcType scrut_ty)
-           ; result_ty <- expTypeToType expected
-           ; let open_bar = open_explicit is_at con_loc con mb_name payload_pat result_ty
-           ; opened <- case coreFullView schema of
-               ExistsTy ImplicitExists _ inner
-                 | not is_at
-                 , ExistsTy ExplicitExists _ _ <- implicitPayloadType inner
-                 -> tcOpenImplicitPackage (getLocA scrut) schema scrut' result_ty $ \bar ->
-                      open_bar (nlHsVar bar) (varType bar)
-               _ -> open_bar scrut' schema
-           ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA opened)))) }
-
-    open_explicit is_at con_loc con mb_name payload_pat result_ty scrut' schema
-      | ExistsTy ex_flag binder inner <- coreFullView schema
-      , ex_flag == ExplicitExists || is_at
-      = do { con_like <- RealDataCon <$> tcLookupDataCon con
-           ; let origin = PatSkol con_like ctxt
-           ; skol_info <- mkSkolemInfo origin
-           ; name <- maybe (newSysName (getOccName binder)) return mb_name
-           ; witness <- pushTcLevelM_ $ newSkolemTyVar skol_info name (tyVarKind binder)
-           ; let payload_ty = substTyWith [binder] [mkTyVarTy witness] inner
-                 replace_pat = fmap (\row -> row { m_pats = [payload_pat] <$ m_pats row })
-                 payload_matches = matches { mg_alts = fmap (map replace_pat) (mg_alts matches) }
-           ; payload <- newSysLocalId (fsLit "unpacked") ManyTy payload_ty
-           ; (ev_binds, body_matches) <- setSrcSpanA con_loc $
-               checkConstraints origin [witness] [] $
-                 tcExtendNameTyVarEnv [(n, witness) | n <- maybeToList mb_name] $
-                   tcExprCaseMatches ctxt tcBody (Scaled ManyTy payload_ty) payload_matches
-                     (mkCheckExpType result_ty)
-           ; let body = noLocA (HsCase ctxt (nlHsVar payload) body_matches)
-           ; return (XExpr (NativeExistsUnpack witness payload result_ty scrut'
-                              (mkHsDictLet ev_binds body))) }
-      | otherwise = failWithTc (TcRnExistsPack (ExistsPackInvalidSchema schema))
-tcExistsCase _ _ = return Nothing
 
 {- Note [Matching an implicit existential payload]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
