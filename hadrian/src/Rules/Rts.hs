@@ -22,6 +22,7 @@ rtsRules = priority 3 $ do
                     | otherwise = []
             buildRustRts stage "ghc_rts" "rts/rust/lib.rs"
                 [ "rts/rust/archive_member.rs"
+                , "rts/rust/encode.rs"
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
                 , "rts/rust/gc_budget.rs"

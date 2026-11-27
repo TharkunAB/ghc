@@ -46,6 +46,67 @@
 #define H 1
 #endif
 
+#if defined(USE_RUST_RTS)
+
+/* Note [Floating-point environment for encoders]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Use the C compiler's conversions to preserve the caller's rounding mode
+ * and floating-point exceptions. Rust clamps the exponent, calls libm, and
+ * applies the sign. The Float helpers round before scaling and after it.
+ */
+RTS_PRIVATE StgDouble ghc_rust_encode_to_double(W_ value, bool is_signed);
+RTS_PRIVATE StgDouble ghc_rust_encode_to_float_as_double(W_ value, bool is_signed);
+RTS_PRIVATE StgFloat ghc_rust_encode_narrow(StgDouble value);
+
+StgDouble
+ghc_rust_encode_to_double(W_ value, bool is_signed)
+{
+    return is_signed ? (StgDouble)(I_)value : (StgDouble)value;
+}
+
+StgDouble
+ghc_rust_encode_to_float_as_double(W_ value, bool is_signed)
+{
+    return is_signed ? (StgFloat)(I_)value : (StgFloat)value;
+}
+
+StgFloat
+ghc_rust_encode_narrow(StgDouble value)
+{
+    return (StgFloat)value;
+}
+
+RTS_PRIVATE StgDouble ghc_rust_word_encode_double(W_ value, I_ exponent);
+RTS_PRIVATE StgDouble ghc_rust_int_encode_double(I_ value, I_ exponent);
+RTS_PRIVATE StgFloat ghc_rust_word_encode_float(W_ value, I_ exponent);
+RTS_PRIVATE StgFloat ghc_rust_int_encode_float(I_ value, I_ exponent);
+
+StgDouble
+__word_encodeDouble (W_ j, I_ e)
+{
+    return ghc_rust_word_encode_double(j, e);
+}
+
+StgDouble
+__int_encodeDouble (I_ j, I_ e)
+{
+    return ghc_rust_int_encode_double(j, e);
+}
+
+StgFloat
+__int_encodeFloat (I_ j, I_ e)
+{
+    return ghc_rust_int_encode_float(j, e);
+}
+
+StgFloat
+__word_encodeFloat (W_ j, I_ e)
+{
+    return ghc_rust_word_encode_float(j, e);
+}
+
+#else
+
 #define __abs(a)                (( (a) >= 0 ) ? (a) : (-(a)))
 
 /** #15271: Some large ratios are converted into double incorrectly.
@@ -133,6 +194,8 @@ __word_encodeFloat (W_ j, I_ e)
 
   return r;
 }
+
+#endif /* USE_RUST_RTS */
 
 #if defined(USE_RUST_RTS)
 RTS_PRIVATE StgInt ghc_rust_decode_double_int64(StgInt64 *mantissa, StgDouble dbl);

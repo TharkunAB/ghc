@@ -15,6 +15,7 @@ extra-source-files:
     configure
     configure.ac
     rust/archive_member.rs
+    rust/encode.rs
     rust/eventlog_file_writer.rs
     rust/file_lock.rs
     rust/gc_budget.rs

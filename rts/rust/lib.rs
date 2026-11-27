@@ -1,6 +1,7 @@
 #![no_std]
 
 mod archive_member;
+mod encode;
 mod eventlog_file_writer;
 mod file_lock;
 mod gc_budget;
