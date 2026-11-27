@@ -95,6 +95,17 @@ was in use in both arms. Pueue job 7233 verified the direct calls, all
 1,763 installed files, diagnostic output and parity under umask 077. The
 prototype is private and the timings cover the install step alone.
 
+On the linked Stage2 compiler target, the direct-strip edit took 19.431 s
+versus 21.639 s with ordinary Cabal. The revert took 21.156 s versus
+20.270 s. The total fell from **41.909 s to 40.587 s** (3.2%, one sample
+per cell). Both modes used the same Hadrian executable, persistent
+arguments, worker `2baf1e8` and mold. A separate trace verified direct
+strip for the archive and shared library. Each edit ran 54 compiler
+requests and generated code for one module. Every immediate repeat ran
+zero builders. All 1,763 installed files, the package database, the
+linked compiler and the dynamic API consumer matched. Direct strip
+remains an experiment. Pueue job 7268 peaked at 4,325 MiB.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
@@ -139,7 +150,8 @@ restart controls had a median of 5.125 s.
 The Makefile, backup and diagnostics matched stock, and each warm edit
 regenerated one row. The exact packaged release passed ordinary
 compilation, unchanged checks and one required stock fallback. Pueue job
-7261 ran the paired timings. Preparation and activation checks passed
+7261 ran the paired timings and peaked at 1,101 MiB. Preparation and
+activation checks passed
 without replacing the ordinary Stage0 executable.
 
 ### Shared Stage0 worker 2baf1e8
