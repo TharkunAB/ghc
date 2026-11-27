@@ -87,3 +87,18 @@ pub(super) unsafe extern "C" fn ghc_rust_update_stable_names(
         });
     }
 }
+
+/// Return a dead name entry to the free list.
+/// C has determined that the name object died and holds the table lock.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_free_stable_name(
+    entry: *mut Entry,
+    head: *mut *mut Entry,
+    hash: *mut HashTable,
+) {
+    unsafe {
+        removeHashTable(hash, (*entry).old.addr(), ptr::null());
+        (*entry).addr = head.read().cast();
+        head.write(entry);
+    }
+}
