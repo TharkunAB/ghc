@@ -3,11 +3,19 @@
 
 #include "AllocArray.h"
 
+/* Note [Array allocation sizes]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Reject payloads that cannot fit in the address space with their header.
+ * This keeps the card count, word rounding, and header addition in range.
+ * The block allocator checks its own limits on the resulting word count.
+ */
 StgMutArrPtrs *allocateMutArrPtrs (Capability *cap,
                                    StgWord nelements,
                                    StgClosure *init,
                                    CostCentreStack *ccs USED_IF_PROFILING)
 {
+    if (RTS_UNLIKELY(nelements > (HS_WORD_MAX - sizeof(StgMutArrPtrs)) / sizeof(StgClosure *))) return NULL;
+
     /* All sizes in words */
 
     /* The card table contains one byte for each 2^MUT_ARR_PTRS_CARD_BITS words
@@ -44,6 +52,8 @@ StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
                                              CostCentreStack *ccs
                                                USED_IF_PROFILING)
 {
+    if (RTS_UNLIKELY(nelements > (HS_WORD_MAX - sizeof(StgSmallMutArrPtrs)) / sizeof(StgClosure *))) return NULL;
+
     /* All sizes in words */
     StgWord arrsize = nelements;                              /* array size */
     StgWord objsize = sizeofW(StgSmallMutArrPtrs) + arrsize;  /* +header size */
@@ -69,6 +79,8 @@ StgArrBytes *allocateArrBytes (Capability *cap,
                                StgWord arrbytes,
                                CostCentreStack *ccs USED_IF_PROFILING)
 {
+    if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
+
     /* All sizes in words */
     StgWord arrwords = ROUNDUP_BYTES_TO_WDS(arrbytes);
     StgWord objsize  = sizeofW(StgArrBytes) + arrwords;
@@ -87,6 +99,8 @@ StgArrBytes *allocateArrBytesPinned (Capability *cap,
                                      StgWord alignment,
                                      CostCentreStack *ccs USED_IF_PROFILING)
 {
+    if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
+
     /* we always supply at least word-aligned memory, so there's no
        need to allow extra space for alignment if the requirement is less
        than a word.  This also prevents mischief with alignment == 0. */
