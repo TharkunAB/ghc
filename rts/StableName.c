@@ -96,7 +96,11 @@ enlargeStableNameTable(void)
 {
     uint32_t old_SNT_size = SNT_size;
 
-    // 2nd and subsequent times
+    // Check both the entry count and the allocation size before doubling.
+    if (old_SNT_size > UINT32_MAX / 2 ||
+        (uint64_t)old_SNT_size * 2 * sizeof(snEntry) > SIZE_MAX) {
+        barf("enlargeStableNameTable: stable name table size overflow");
+    }
     SNT_size *= 2;
     stable_name_table =
         stgReallocBytes(stable_name_table,
