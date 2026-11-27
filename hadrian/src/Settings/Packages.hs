@@ -359,6 +359,7 @@ rtsPackageArgs = package rts ? do
           , arg $ "-DFS_NAMESPACE=rts"
 
           , arg $ "-DCOMPILING_RTS"
+          , not . null <$> staged rtsRustCompiler ? arg "-DUSE_RUST_RTS"
 
           , inputs ["**/RtsMessages.c", "**/Trace.c"] ?
             pure

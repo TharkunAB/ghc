@@ -1,4 +1,4 @@
-module Rules.Rts (rtsRules) where
+module Rules.Rts (rtsRules, rtsRustObjects) where
 
 import Hadrian.Utilities
 import Settings.Builders.Common
@@ -13,8 +13,34 @@ rtsRules = priority 3 $ do
     -- to be linked into the rts dll.
     forM_ [Stage1, Stage2, Stage3 ] $ \ stage -> do
         let buildPath = root -/- buildDir (rtsContext stage)
+        buildPath -/- "rust-rts.o" %> buildRustRts stage
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
         buildPath -/- "libHSghc-internal-*.dll.a" %> buildGhcInternalImportLib stage
+
+-- | Return the Rust objects to include in the RTS libraries for this stage.
+rtsRustObjects :: Stage -> Action [FilePath]
+rtsRustObjects stage = do
+    rustc <- rtsRustCompiler stage
+    if null rustc then pure [] else do
+        path <- rtsBuildPath stage
+        pure [path -/- "rust-rts.o"]
+
+-- | Compile the Rust RTS code to a PIC object used in all ways.
+buildRustRts :: Stage -> FilePath -> Action ()
+buildRustRts stage output = do
+    rustc <- rtsRustCompiler stage
+    when (null rustc) $ fail "The Rust RTS requires --enable-rust-rts."
+    _ <- setting RustRtsCompilerVersion
+    let source = "rts/rust/lib.rs"
+    need [rustc, source]
+    createDirectory (takeDirectory output)
+    prog <- exeSpawnPath rustc
+    cmdExe prog
+        [ "--edition=2024", "--crate-name=ghc_rts", "--crate-type=lib"
+        , "--target=x86_64-unknown-linux-gnu", "--emit=obj"
+        , "-Cpanic=abort", "-Crelocation-model=pic", "-Ccodegen-units=1"
+        , "-Copt-level=2", "-o", output, source
+        ]
 
 buildGhcInternalImportDef :: FilePath -> Action ()
 buildGhcInternalImportDef target = do
