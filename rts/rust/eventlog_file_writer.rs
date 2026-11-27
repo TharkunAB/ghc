@@ -5,7 +5,9 @@ use core::{
 };
 
 unsafe extern "C" {
-    fn ghc_rust_eventlog_open(filename: *mut c_char) -> *mut c_void;
+    fn __rts_fopen(filename: *const c_char, mode: *const c_char) -> *mut c_void;
+    fn ghc_rust_eventlog_open_failed(filename: *const c_char) -> !;
+    fn ghc_rust_eventlog_init_mutex();
     fn ghc_rust_eventlog_acquire();
     fn ghc_rust_eventlog_release();
     fn ghc_rust_eventlog_close_mutex();
@@ -21,8 +23,8 @@ unsafe extern "C" {
     fn fclose(file: *mut c_void) -> c_int;
 }
 
-// EventLog.c serializes init and stop with the writer callbacks. The RTS
-// mutex protects the whole write loop. libc serializes flushes with writes.
+// EventLog.c serializes init and stop with the writer callbacks. Rust owns the
+// stream from open to close. C owns the mutex. libc serializes flushes with writes.
 static EVENT_LOG_FILE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 // The child inherits this state from its parent. Reopening a default file in
@@ -81,7 +83,15 @@ pub(super) unsafe extern "C" fn ghc_rust_eventlog_init(
     output: *const c_char,
 ) {
     let filename = unsafe { output_filename(program, output) };
-    EVENT_LOG_FILE.store(unsafe { ghc_rust_eventlog_open(filename) }, Relaxed);
+    let file = unsafe { __rts_fopen(filename, c"wb+".as_ptr()) };
+    if file.is_null() {
+        unsafe { ghc_rust_eventlog_open_failed(filename) };
+    }
+    unsafe {
+        stgFree(filename.cast());
+        ghc_rust_eventlog_init_mutex();
+    }
+    EVENT_LOG_FILE.store(file, Relaxed);
 }
 
 /// Write all bytes, or return false when a write reports no progress.

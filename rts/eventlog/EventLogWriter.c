@@ -91,6 +91,7 @@ static char *outputFileName(void)
 
 #endif
 
+#if !defined(USE_RUST_RTS)
 static FILE *
 openEventLogFile(char *event_log_filename)
 {
@@ -108,6 +109,7 @@ openEventLogFile(char *event_log_filename)
 #endif
     return file;
 }
+#endif
 
 #if defined(USE_RUST_RTS)
 RTS_PRIVATE void ghc_rust_eventlog_init(const char *program, const char *output);
@@ -115,14 +117,23 @@ RTS_PRIVATE bool ghc_rust_eventlog_write(void *eventlog, size_t eventlog_size);
 RTS_PRIVATE void ghc_rust_eventlog_flush(void);
 RTS_PRIVATE void ghc_rust_eventlog_stop(void);
 
-RTS_PRIVATE FILE *ghc_rust_eventlog_open(char *filename);
+RTS_PRIVATE void ghc_rust_eventlog_open_failed(const char *filename) STG_NORETURN;
+RTS_PRIVATE void ghc_rust_eventlog_init_mutex(void);
 RTS_PRIVATE void ghc_rust_eventlog_acquire(void);
 RTS_PRIVATE void ghc_rust_eventlog_release(void);
 RTS_PRIVATE void ghc_rust_eventlog_close_mutex(void);
 
-RTS_PRIVATE FILE *ghc_rust_eventlog_open(char *filename)
+RTS_PRIVATE void ghc_rust_eventlog_open_failed(const char *filename)
 {
-    return openEventLogFile(filename);
+    sysErrorBelch("initEventLogFileWriter: can't open %s", filename);
+    stg_exit(EXIT_FAILURE);
+}
+
+RTS_PRIVATE void ghc_rust_eventlog_init_mutex(void)
+{
+#if defined(THREADED_RTS)
+    initMutex(&event_log_mutex);
+#endif
 }
 
 RTS_PRIVATE void ghc_rust_eventlog_acquire(void)
