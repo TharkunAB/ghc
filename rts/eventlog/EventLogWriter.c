@@ -22,10 +22,10 @@
 #include <unistd.h>
 #endif
 
+#if !defined(USE_RUST_RTS)
 // PID of the process that writes to event_log_filename (#4512)
 static pid_t event_log_pid = -1;
 
-#if !defined(USE_RUST_RTS)
 // File for logging events
 static FILE *event_log_file = NULL;
 #endif
@@ -41,6 +41,7 @@ static void acquire_event_log_lock(void) {}
 static void release_event_log_lock(void) {}
 #endif
 
+#if !defined(USE_RUST_RTS)
 static char *outputFileName(void)
 {
 
@@ -88,11 +89,11 @@ static char *outputFileName(void)
     }
 }
 
-static FILE *
-openEventLogFile(void)
-{
-    char *event_log_filename = outputFileName();
+#endif
 
+static FILE *
+openEventLogFile(char *event_log_filename)
+{
     /* Open event log file for writing. */
     FILE *file = __rts_fopen(event_log_filename, "wb+");
     if (file == NULL) {
@@ -109,19 +110,19 @@ openEventLogFile(void)
 }
 
 #if defined(USE_RUST_RTS)
-RTS_PRIVATE void ghc_rust_eventlog_init(void);
+RTS_PRIVATE void ghc_rust_eventlog_init(const char *program, const char *output);
 RTS_PRIVATE bool ghc_rust_eventlog_write(void *eventlog, size_t eventlog_size);
 RTS_PRIVATE void ghc_rust_eventlog_flush(void);
 RTS_PRIVATE void ghc_rust_eventlog_stop(void);
 
-RTS_PRIVATE FILE *ghc_rust_eventlog_open(void);
+RTS_PRIVATE FILE *ghc_rust_eventlog_open(char *filename);
 RTS_PRIVATE void ghc_rust_eventlog_acquire(void);
 RTS_PRIVATE void ghc_rust_eventlog_release(void);
 RTS_PRIVATE void ghc_rust_eventlog_close_mutex(void);
 
-RTS_PRIVATE FILE *ghc_rust_eventlog_open(void)
+RTS_PRIVATE FILE *ghc_rust_eventlog_open(char *filename)
 {
-    return openEventLogFile();
+    return openEventLogFile(filename);
 }
 
 RTS_PRIVATE void ghc_rust_eventlog_acquire(void)
@@ -142,13 +143,19 @@ RTS_PRIVATE void ghc_rust_eventlog_close_mutex(void)
 }
 #else
 static void flushEventLogFile(void);
+#endif
 
 static void
 initEventLogFileWriter(void)
 {
-    event_log_file = openEventLogFile();
+#if defined(USE_RUST_RTS)
+    ghc_rust_eventlog_init(prog_name, RtsFlags.TraceFlags.trace_output);
+#else
+    event_log_file = openEventLogFile(outputFileName());
+#endif
 }
 
+#if !defined(USE_RUST_RTS)
 static bool
 writeEventLogFile(void *eventlog, size_t eventlog_size)
 {
@@ -208,13 +215,12 @@ static void
 stopEventLogFileWriterNoop(void) {}
 
 const EventLogWriter FileEventLogWriter = {
+    .initEventLogWriter = initEventLogFileWriter,
 #if defined(USE_RUST_RTS)
-    .initEventLogWriter = ghc_rust_eventlog_init,
     .writeEventLog = ghc_rust_eventlog_write,
     .flushEventLog = ghc_rust_eventlog_flush,
     .stopEventLogWriter = ghc_rust_eventlog_stop
 #else
-    .initEventLogWriter = initEventLogFileWriter,
     .writeEventLog = writeEventLogFile,
     .flushEventLog = flushEventLogFile,
     .stopEventLogWriter = stopEventLogFileWriter
