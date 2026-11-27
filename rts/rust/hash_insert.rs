@@ -1,15 +1,17 @@
 use core::{
-    ffi::{c_int, c_void},
+    ffi::{c_char, c_int, c_void},
     mem::size_of,
     ptr,
 };
 
 use super::hash_walk::{Entry, SEGMENT_SIZE};
 
+const CHUNK_ENTRIES: usize = 1024 * size_of::<usize>() / size_of::<Entry>();
+
 const DIRECTORY_SIZE: usize = 1024;
 const LOAD: c_int = 5;
 
-// Hash.c checks this prefix layout and the constants used for expansion.
+// Hash.c checks this layout and the constants used for expansion.
 #[repr(C)]
 pub(super) struct Table {
     split: c_int,
@@ -20,20 +22,134 @@ pub(super) struct Table {
     bucket_count: c_int,
     directory: [*mut *mut Entry; DIRECTORY_SIZE],
     free_list: *mut Entry,
+    chunks: *mut Chunk,
+}
+
+#[repr(C)]
+struct Chunk {
+    next: *mut Chunk,
+    entries: [Entry; CHUNK_ENTRIES],
 }
 
 type Hash = unsafe extern "C" fn(*const Table, usize) -> c_int;
 
 unsafe extern "C" {
-    fn ghc_c_hash_alloc_segment(table: *mut Table, segment: c_int);
-    fn ghc_c_hash_alloc_entry(table: *mut Table) -> *mut Entry;
+    fn stgMallocBytes(size: usize, label: *const c_char) -> *mut c_void;
+    fn stgFree(ptr: *mut c_void);
+}
+
+unsafe fn segment_slot(table: *mut Table, segment: usize) -> *mut *mut *mut Entry {
+    let directory = unsafe { (&raw mut (*table).directory).cast::<*mut *mut Entry>() };
+    unsafe { directory.add(segment) }
+}
+
+unsafe fn alloc_segment(table: *mut Table, segment: usize) -> *mut *mut Entry {
+    unsafe {
+        let buckets = stgMallocBytes(
+            SEGMENT_SIZE * size_of::<*mut Entry>(),
+            c"allocSegment".as_ptr(),
+        )
+        .cast();
+        segment_slot(table, segment).write(buckets);
+        buckets
+    }
+}
+
+unsafe fn alloc_entry(table: *mut Table) -> *mut Entry {
+    unsafe {
+        let entry = (*table).free_list;
+        if !entry.is_null() {
+            (*table).free_list = (*entry).next;
+            return entry;
+        }
+
+        let chunk = stgMallocBytes(size_of::<Chunk>(), c"allocHashList".as_ptr()).cast::<Chunk>();
+        (*chunk).next = (*table).chunks;
+        (*table).chunks = chunk;
+        let entries = (&raw mut (*chunk).entries).cast::<Entry>();
+        // Return the first entry and link the rest in address order.
+        (*table).free_list = entries.add(1);
+        for index in 1..CHUNK_ENTRIES - 1 {
+            (*entries.add(index)).next = entries.add(index + 1);
+        }
+        (*entries.add(CHUNK_ENTRIES - 1)).next = ptr::null_mut();
+        entries
+    }
+}
+
+/// Return a detached entry to its table and return its value.
+/// The caller must own the table exclusively. A non-null entry must come from it.
+pub(super) unsafe fn recycle_entry(table: *mut Table, entry: *mut Entry) -> *const c_void {
+    if entry.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        (*entry).next = (*table).free_list;
+        (*table).free_list = entry;
+        (*table).key_count -= 1;
+        (*entry).value
+    }
+}
+
+/// Allocate an empty table and its initial segment.
+#[unsafe(no_mangle)]
+pub(super) extern "C" fn ghc_rust_hash_alloc() -> *mut Table {
+    unsafe {
+        let table = stgMallocBytes(size_of::<Table>(), c"allocHashTable".as_ptr()).cast::<Table>();
+        let buckets = alloc_segment(table, 0);
+        for index in 0..SEGMENT_SIZE {
+            buckets.add(index).write(ptr::null_mut());
+        }
+        (*table).split = 0;
+        (*table).max = SEGMENT_SIZE as c_int;
+        (*table).mask1 = SEGMENT_SIZE as c_int - 1;
+        (*table).mask2 = 2 * SEGMENT_SIZE as c_int - 1;
+        (*table).key_count = 0;
+        (*table).bucket_count = SEGMENT_SIZE as c_int;
+        (*table).free_list = ptr::null_mut();
+        (*table).chunks = ptr::null_mut();
+        table
+    }
+}
+
+/// Release all table storage and optionally visit each live value.
+/// The caller must own the table exclusively. The callback may free its value
+/// but must not mutate or free the table.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_hash_free(
+    table: *mut Table,
+    free_value: Option<unsafe extern "C" fn(*mut c_void)>,
+) {
+    unsafe {
+        let buckets = (*table).bucket_count as usize;
+        for segment in (0..buckets.div_ceil(SEGMENT_SIZE)).rev() {
+            let slots = segment_slot(table, segment).read();
+            if let Some(free_value) = free_value {
+                let count = (buckets - segment * SEGMENT_SIZE).min(SEGMENT_SIZE);
+                for index in (0..count).rev() {
+                    let mut entry = slots.add(index).read();
+                    while !entry.is_null() {
+                        let next = (*entry).next;
+                        free_value((*entry).value.cast_mut());
+                        entry = next;
+                    }
+                }
+            }
+            stgFree(slots.cast());
+        }
+        let mut chunk = (*table).chunks;
+        while !chunk.is_null() {
+            let next = (*chunk).next;
+            stgFree(chunk.cast());
+            chunk = next;
+        }
+        stgFree(table.cast());
+    }
 }
 
 unsafe fn bucket_slot(table: *mut Table, index: usize) -> *mut *mut Entry {
-    let directory = unsafe { (&raw mut (*table).directory).cast::<*mut *mut Entry>() };
     unsafe {
-        directory
-            .add(index / SEGMENT_SIZE)
+        segment_slot(table, index / SEGMENT_SIZE)
             .read()
             .add(index % SEGMENT_SIZE)
     }
@@ -48,7 +164,7 @@ unsafe fn expand(table: *mut Table, hash: impl Fn(*const Table, usize) -> c_int)
         }
 
         if new_bucket.is_multiple_of(SEGMENT_SIZE) {
-            ghc_c_hash_alloc_segment(table, (new_bucket / SEGMENT_SIZE) as c_int);
+            alloc_segment(table, new_bucket / SEGMENT_SIZE);
         }
         let old_slot = bucket_slot(table, old_bucket);
         let new_slot = bucket_slot(table, new_bucket);
@@ -100,12 +216,7 @@ unsafe fn insert(
         }
         let slot = bucket_slot(table, hash(table, key) as usize);
 
-        let mut entry = (*table).free_list;
-        if entry.is_null() {
-            entry = ghc_c_hash_alloc_entry(table);
-        } else {
-            (*table).free_list = (*entry).next;
-        }
+        let entry = alloc_entry(table);
         entry.write(Entry {
             key,
             value,

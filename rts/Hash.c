@@ -54,7 +54,7 @@ struct hashtable {
 };
 
 #if defined(USE_RUST_RTS)
-/* The Rust walker reads only the initialized buckets and their linked entries. */
+/* Rust and C share the table layout for C hash functions and Rust operations. */
 GHC_STATIC_ASSERT(HSEGSIZE == 1024 && HDIRSIZE == 1024 && HLOAD == 5,
                   "Rust hash growth constants");
 GHC_STATIC_ASSERT(sizeof(HashList) == 3 * sizeof(StgWord) &&
@@ -71,14 +71,18 @@ GHC_STATIC_ASSERT(offsetof(HashTable, split) == 0 &&
                   offsetof(HashTable, bcount) == 5 * sizeof(int) &&
                   offsetof(HashTable, dir) == 6 * sizeof(int) &&
                   offsetof(HashTable, freeList) ==
-                      offsetof(HashTable, dir) + sizeof(((HashTable *)NULL)->dir),
-                  "Rust hash table prefix layout");
+                      offsetof(HashTable, dir) + sizeof(((HashTable *)NULL)->dir) &&
+                  offsetof(HashTable, chunks) ==
+                      offsetof(HashTable, freeList) + sizeof(HashList *) &&
+                  sizeof(HashTable) == offsetof(HashTable, chunks) + sizeof(HashListChunk *) &&
+                  _Alignof(HashTable) == _Alignof(StgWord),
+                  "Rust hash table layout");
 
 RTS_PRIVATE void ghc_rust_hash_insert_word(HashTable *table, StgWord key, const void *data);
 RTS_PRIVATE void ghc_rust_hash_insert_custom(HashTable *table, StgWord key, const void *data,
                                               HashFunction hash);
-RTS_PRIVATE void ghc_c_hash_alloc_segment(HashTable *table, int segment);
-RTS_PRIVATE HashList *ghc_c_hash_alloc_entry(HashTable *table);
+RTS_PRIVATE HashTable *ghc_rust_hash_alloc(void);
+RTS_PRIVATE void ghc_rust_hash_free(HashTable *table, void (*freeDataFun)(void *));
 
 RTS_PRIVATE int ghc_rust_hash_keys(HashList ***dir, size_t buckets, StgWord *keys, int capacity);
 RTS_PRIVATE void ghc_rust_hash_map(HashList ***dir, size_t buckets, void *data, MapHashFn fn);
@@ -88,10 +92,13 @@ RTS_PRIVATE void ghc_rust_hash_iter(HashList ***dir, size_t buckets, void *data,
 RTS_PRIVATE const void *ghc_rust_hash_lookup_word(HashList *head, StgWord key);
 RTS_PRIVATE const void *ghc_rust_hash_lookup_str(HashList *head, StgWord key);
 RTS_PRIVATE const void *ghc_rust_hash_lookup_custom(HashList *head, StgWord key, CompareFunction cmp);
-RTS_PRIVATE HashList *ghc_rust_hash_unlink_word(HashList **head, StgWord key, const void *data);
-RTS_PRIVATE HashList *ghc_rust_hash_unlink_str(HashList **head, StgWord key, const void *data);
-RTS_PRIVATE HashList *ghc_rust_hash_unlink_custom(HashList **head, StgWord key, const void *data,
-                                                CompareFunction cmp);
+RTS_PRIVATE const void *ghc_rust_hash_remove_word(HashTable *table, HashList **head,
+                                                  StgWord key, const void *data);
+RTS_PRIVATE const void *ghc_rust_hash_remove_str(HashTable *table, HashList **head,
+                                                 StgWord key, const void *data);
+RTS_PRIVATE const void *ghc_rust_hash_remove_custom(HashTable *table, HashList **head,
+                                                    StgWord key, const void *data,
+                                                    CompareFunction cmp);
 #endif
 
 /* Create an identical structure, but is distinct on a type level,
@@ -167,6 +174,7 @@ compareStr(StgWord key1, StgWord key2)
  * Allocate a new segment of the dynamically growing hash table.
  * -------------------------------------------------------------------------- */
 
+#if !defined(USE_RUST_RTS)
 STATIC_INLINE void
 allocSegment(HashTable *table, int segment)
 {
@@ -175,13 +183,6 @@ allocSegment(HashTable *table, int segment)
 }
 
 
-#if defined(USE_RUST_RTS)
-void
-ghc_c_hash_alloc_segment(HashTable *table, int segment)
-{
-    allocSegment(table, segment);
-}
-#else
 /* -----------------------------------------------------------------------------
  * Expand the larger hash table by one bucket, and split one bucket
  * from the smaller table into two parts.  Only the bucket referenced
@@ -355,6 +356,7 @@ int keysHashTable(HashTable *table, StgWord keys[], int szKeys) {
  * they will all be freed when we free the HashListChunks.
  * -------------------------------------------------------------------------- */
 
+#if !defined(USE_RUST_RTS)
 static HashList *
 allocHashList (HashTable *table)
 {
@@ -398,13 +400,6 @@ freeHashList (HashTable *table, HashList *hl)
     table->freeList = hl;
 }
 
-#if defined(USE_RUST_RTS)
-HashList *
-ghc_c_hash_alloc_entry(HashTable *table)
-{
-    return allocHashList(table);
-}
-#else
 STATIC_INLINE void
 insertHashTable_inlined(HashTable *table, StgWord key,
                         const void *data, HashFunction f)
@@ -467,15 +462,10 @@ insertStrHashTable(StrHashTable *table, const char * key, const void *data)
 }
 
 #if defined(USE_RUST_RTS)
-STATIC_INLINE void *finishHashRemoval(HashTable *table, HashList *removed, const void *data STG_UNUSED)
+STATIC_INLINE void *finishHashRemoval(const void *result, const void *data STG_UNUSED)
 {
-    if (removed == NULL) {
-        ASSERT(data == NULL);
-        return NULL;
-    }
-    freeHashList(table, removed);
-    table->kcount--;
-    return (void *)removed->data;
+    ASSERT(result != NULL || data == NULL);
+    return (void *)result;
 }
 #else
 STATIC_INLINE void*
@@ -517,8 +507,9 @@ removeHashTable_(HashTable *table, StgWord key, const void *data,
                  HashFunction f, CompareFunction cmp)
 {
 #if defined(USE_RUST_RTS)
-    HashList *removed = ghc_rust_hash_unlink_custom(findHashBucket(table, key, f), key, data, cmp);
-    return finishHashRemoval(table, removed, data);
+    const void *result = ghc_rust_hash_remove_custom(table, findHashBucket(table, key, f),
+                                                     key, data, cmp);
+    return finishHashRemoval(result, data);
 #else
     return removeHashTable_inlined(table, key, data, f, cmp);
 #endif
@@ -528,8 +519,9 @@ void *
 removeHashTable(HashTable *table, StgWord key, const void *data)
 {
 #if defined(USE_RUST_RTS)
-    HashList *removed = ghc_rust_hash_unlink_word(findHashBucket(table, key, hashWord), key, data);
-    return finishHashRemoval(table, removed, data);
+    const void *result = ghc_rust_hash_remove_word(table, findHashBucket(table, key, hashWord),
+                                                     key, data);
+    return finishHashRemoval(result, data);
 #else
     return removeHashTable_inlined(table, key, data, hashWord, compareWord);
 #endif
@@ -540,8 +532,9 @@ removeStrHashTable(StrHashTable *table, const char * key, const void *data)
 {
 #if defined(USE_RUST_RTS)
     StgWord word = (StgWord)key;
-    HashList *removed = ghc_rust_hash_unlink_str(findHashBucket(&table->table, word, hashStr), word, data);
-    return finishHashRemoval(&table->table, removed, data);
+    const void *result = ghc_rust_hash_remove_str(&table->table, findHashBucket(&table->table, word, hashStr),
+                                                   word, data);
+    return finishHashRemoval(result, data);
 #else
     return removeHashTable_inlined(&table->table, (StgWord) key,
                                    data, hashStr, compareStr);
@@ -557,6 +550,9 @@ removeStrHashTable(StrHashTable *table, const char * key, const void *data)
 void
 freeHashTable(HashTable *table, void (*freeDataFun)(void *) )
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_free(table, freeDataFun);
+#else
     /* The last bucket with something in it is table->max + table->split - 1 */
     long segment = (table->max + table->split - 1) / HSEGSIZE;
     long index = (table->max + table->split - 1) % HSEGSIZE;
@@ -587,6 +583,7 @@ freeHashTable(HashTable *table, void (*freeDataFun)(void *) )
     }
 
     stgFree(table);
+#endif
 }
 
 /* -----------------------------------------------------------------------------
@@ -672,6 +669,9 @@ iterHashTable(HashTable *table, void *data, IterHashFn fn)
 HashTable *
 allocHashTable(void)
 {
+#if defined(USE_RUST_RTS)
+    return ghc_rust_hash_alloc();
+#else
     HashTable *table;
     HashList **hb;
 
@@ -692,6 +692,7 @@ allocHashTable(void)
     table->chunks = NULL;
 
     return table;
+#endif
 }
 
 int keyCountHashTable (HashTable *table)
