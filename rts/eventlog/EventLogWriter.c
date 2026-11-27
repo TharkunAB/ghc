@@ -25,8 +25,10 @@
 // PID of the process that writes to event_log_filename (#4512)
 static pid_t event_log_pid = -1;
 
+#if !defined(USE_RUST_RTS)
 // File for logging events
 static FILE *event_log_file = NULL;
+#endif
 
 #if defined(THREADED_RTS)
 // Protects event_log_file
@@ -38,11 +40,6 @@ static void release_event_log_lock(void) { RELEASE_LOCK(&event_log_mutex); }
 static void acquire_event_log_lock(void) {}
 static void release_event_log_lock(void) {}
 #endif
-
-static void initEventLogFileWriter(void);
-static bool writeEventLogFile(void *eventlog, size_t eventlog_size);
-static void flushEventLogFile(void);
-static void stopEventLogFileWriter(void);
 
 static char *outputFileName(void)
 {
@@ -91,13 +88,14 @@ static char *outputFileName(void)
     }
 }
 
-static void
-initEventLogFileWriter(void)
+static FILE *
+openEventLogFile(void)
 {
     char *event_log_filename = outputFileName();
 
     /* Open event log file for writing. */
-    if ((event_log_file = __rts_fopen(event_log_filename, "wb+")) == NULL) {
+    FILE *file = __rts_fopen(event_log_filename, "wb+");
+    if (file == NULL) {
         sysErrorBelch(
             "initEventLogFileWriter: can't open %s", event_log_filename);
         stg_exit(EXIT_FAILURE);
@@ -107,6 +105,48 @@ initEventLogFileWriter(void)
 #if defined(THREADED_RTS)
     initMutex(&event_log_mutex);
 #endif
+    return file;
+}
+
+#if defined(USE_RUST_RTS)
+RTS_PRIVATE void ghc_rust_eventlog_init(void);
+RTS_PRIVATE bool ghc_rust_eventlog_write(void *eventlog, size_t eventlog_size);
+RTS_PRIVATE void ghc_rust_eventlog_flush(void);
+RTS_PRIVATE void ghc_rust_eventlog_stop(void);
+
+RTS_PRIVATE FILE *ghc_rust_eventlog_open(void);
+RTS_PRIVATE void ghc_rust_eventlog_acquire(void);
+RTS_PRIVATE void ghc_rust_eventlog_release(void);
+RTS_PRIVATE void ghc_rust_eventlog_close_mutex(void);
+
+RTS_PRIVATE FILE *ghc_rust_eventlog_open(void)
+{
+    return openEventLogFile();
+}
+
+RTS_PRIVATE void ghc_rust_eventlog_acquire(void)
+{
+    acquire_event_log_lock();
+}
+
+RTS_PRIVATE void ghc_rust_eventlog_release(void)
+{
+    release_event_log_lock();
+}
+
+RTS_PRIVATE void ghc_rust_eventlog_close_mutex(void)
+{
+#if defined(THREADED_RTS)
+    closeMutex(&event_log_mutex);
+#endif
+}
+#else
+static void flushEventLogFile(void);
+
+static void
+initEventLogFileWriter(void)
+{
+    event_log_file = openEventLogFile();
 }
 
 static bool
@@ -151,6 +191,8 @@ stopEventLogFileWriter(void)
 #endif
 }
 
+#endif
+
 static void
 initEventLogFileWriterNoop(void) {}
 
@@ -166,10 +208,17 @@ static void
 stopEventLogFileWriterNoop(void) {}
 
 const EventLogWriter FileEventLogWriter = {
+#if defined(USE_RUST_RTS)
+    .initEventLogWriter = ghc_rust_eventlog_init,
+    .writeEventLog = ghc_rust_eventlog_write,
+    .flushEventLog = ghc_rust_eventlog_flush,
+    .stopEventLogWriter = ghc_rust_eventlog_stop
+#else
     .initEventLogWriter = initEventLogFileWriter,
     .writeEventLog = writeEventLogFile,
     .flushEventLog = flushEventLogFile,
     .stopEventLogWriter = stopEventLogFileWriter
+#endif
 };
 
 const EventLogWriter NullEventLogWriter = {

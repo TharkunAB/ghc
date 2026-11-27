@@ -14,6 +14,7 @@ build-type: Configure
 extra-source-files:
     configure
     configure.ac
+    rust/eventlog_file_writer.rs
     rust/file_lock.rs
     rust/lib.rs
     rust/profiler_json.rs

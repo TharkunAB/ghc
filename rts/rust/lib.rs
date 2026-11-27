@@ -1,5 +1,6 @@
 #![no_std]
 
+mod eventlog_file_writer;
 mod file_lock;
 
 /// Decode an IEEE binary32 value into GHC's signed mantissa and exponent.
