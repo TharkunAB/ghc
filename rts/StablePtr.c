@@ -158,8 +158,8 @@ STATIC_INLINE void
 initSpEntryFreeList(spEntry *table, uint32_t n)
 {
   spEntry* free = NULL;
-  spEntry *p;
-  for (p = table + n - 1; p >= table; p--) {
+  while (n != 0) {
+      spEntry *p = &table[--n];
       p->addr = (P_)free;
       free = p;
   }
