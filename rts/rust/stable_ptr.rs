@@ -1,6 +1,6 @@
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 use core::mem::{align_of, size_of};
-use core::ptr::null_mut;
+use core::ptr::{copy_nonoverlapping, null_mut};
 use core::sync::atomic::{
     AtomicPtr,
     Ordering::{Relaxed, Release},
@@ -18,7 +18,64 @@ core::arch::global_asm!(
     ".hidden ghc_rust_init_stable_ptr_free_list",
     ".hidden ghc_rust_take_stable_ptr",
     ".hidden ghc_rust_release_stable_ptr",
+    ".hidden ghc_rust_grow_stable_ptr_table",
+    ".hidden ghc_rust_free_old_stable_ptr_tables",
 );
+
+unsafe extern "C" {
+    fn stgMallocBytes(size: usize, label: *const c_char) -> *mut c_void;
+    fn stgFree(allocation: *mut c_void);
+}
+
+// See Note [Enlarging the stable pointer table] in StablePtr.c.
+static mut RETIRED: [*mut Entry; usize::BITS as usize] = [null_mut(); usize::BITS as usize];
+static mut RETIRED_COUNT: usize = 0;
+
+/// Double the full table and retain its previous storage until collection.
+/// C holds the table mutex. It checks capacity overflow before this call.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_grow_stable_ptr_table(
+    table: *mut *mut Entry,
+    head: *mut *mut Entry,
+    old_count: usize,
+) {
+    unsafe {
+        let active = AtomicPtr::from_ptr(table);
+        let old = active.load(Relaxed);
+        let new = stgMallocBytes(
+            2 * old_count * size_of::<Entry>(),
+            c"enlargeStablePtrTable".as_ptr(),
+        )
+        .cast::<Entry>();
+        copy_nonoverlapping(old, new, old_count);
+        let tail = new.add(old_count);
+        ghc_rust_init_stable_ptr_free_list(tail, old_count);
+        head.write(tail);
+
+        // Each outstanding retirement corresponds to a doubling. The checked
+        // capacity therefore bounds the index by the number of word bits.
+        (&raw mut RETIRED)
+            .cast::<*mut Entry>()
+            .add(RETIRED_COUNT)
+            .write(old);
+        RETIRED_COUNT += 1;
+
+        // Keep the previous storage valid for readers that loaded its base.
+        active.store(new, Release);
+    }
+}
+
+/// Reclaim retired storage after C stops readers, during mark or shutdown.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_free_old_stable_ptr_tables() {
+    unsafe {
+        let tables = (&raw const RETIRED).cast::<*mut Entry>();
+        for index in 0..RETIRED_COUNT {
+            stgFree(tables.add(index).read().cast());
+        }
+        RETIRED_COUNT = 0;
+    }
+}
 
 /// Link a new range of table entries in index order. None has a live handle.
 #[unsafe(no_mangle)]
