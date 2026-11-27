@@ -29,6 +29,16 @@ test('testarenaConcurrent',
       extra_run_opts('+RTS -N4 -I0 -A4m -RTS')],
      compile_and_run, ['-static -rtsopts'])
 
+test('testResourcePool', [extra_files(['../../../rts/Pool.h']),
+                          unless(in_tree_compiler(), skip), c_src,
+                          only_ways(['normal', 'threaded1', 'threaded2'])],
+     compile_and_run, [''])
+
+test('testResourcePoolWait', [extra_files(['../../../rts/Pool.h']),
+                              unless(in_tree_compiler() and opsys('linux'), skip),
+                              c_src, only_ways(['threaded1', 'threaded2'])],
+     compile_and_run, ['-static -optl-Wl,--wrap=waitCondition'])
+
 # See bug #101, test requires +RTS -c (or equivalently +RTS -M<something>)
 # only GHCi triggers the bug, but we run the test all ways for completeness.
 test('bug1010',
