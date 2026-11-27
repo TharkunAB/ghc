@@ -68,6 +68,7 @@ module GHC.Core.Type (
         primFamilyPatFieldKind, isPrimFamilyPatBinderKind, isPrimFamilyPatBinder,
         hasConstraintPremise,
         isNativeIndexFunctionId, nativeIndexFunctionTys_maybe,
+        isNativeDepFunctionId, nativeTermAppKind_maybe, nativeTypeCallStep_maybe,
         isNativeNamedOpaqueFunctionId,
         nativeIndexFunctionTypeTys_maybe, nativeCallSpine_maybe,
         isNativeOpaqueValueId, isNativeOpaqueValueType, isNativeClassDictionaryId,
@@ -2678,6 +2679,44 @@ nativeIndexFunctionTypeTys_maybe ty
 isNativeIndexFunctionId :: Id -> Bool
 isNativeIndexFunctionId = isJust . nativeIndexFunctionTys_maybe
 
+-- | Test whether a local runtime binder has a visible dependent function type
+-- eligible for type-level application via 'TermAppTy'.
+isNativeDepFunctionId :: Id -> Bool
+isNativeDepFunctionId f
+  = isLocalId f && not (isCoVar f)
+    && not (isJoinIdDetails (idDetails f))
+    && isManyTy (idMult f)
+    && case coreFullView (varType f) of
+         DepFunTy DepFunVisible bndr body ->
+           isManyTy (idMult bndr)
+           && isNativeOpaqueValueType (varType bndr)
+           && tcIsLiftedTypeKind (typeKind body)
+         _ -> False
+
+-- | Compute the expected argument domain and instantiated result kind of one
+-- type-level runtime call step across either an ordinary arrow or a visible
+-- dependent function type.
+nativeTypeCallStep_maybe :: Kind -> Type -> Maybe (Kind, Kind)
+nativeTypeCallStep_maybe kind arg
+  | Just (domain, result) <- nativeIndexFunctionTypeTys_maybe kind
+  = Just (domain, result)
+  | DepFunTy DepFunVisible bndr body <- coreFullView kind
+  , isManyTy (idMult bndr)
+  , isNativeOpaqueValueType (varType bndr)
+  , tcIsLiftedTypeKind (typeKind body)
+  = Just (varType bndr, replaceTermVarInType bndr arg body)
+  | otherwise = Nothing
+
+-- | Compute the domain and instantiated result kind of @TermAppTy f arg@.
+nativeTermAppKind_maybe :: Id -> Type -> Maybe (Kind, Kind)
+nativeTermAppKind_maybe f arg
+  | Just (domain, result) <- nativeIndexFunctionTys_maybe f
+  = Just (domain, result)
+  | isNativeDepFunctionId f
+  , DepFunTy DepFunVisible bndr body <- coreFullView (varType f)
+  = Just (varType bndr, replaceTermVarInType bndr arg body)
+  | otherwise = Nothing
+
 -- | Recover the lexical head, its checked arguments, and the final result kind.
 -- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
 nativeCallSpine_maybe :: Type -> Maybe (Id, [Type], Kind)
@@ -2686,18 +2725,24 @@ nativeCallSpine_maybe ty = do
     pure (f, reverse args, result)
   where
     collect (TermAppTy f arg)
-      | Just (domain, result) <- nativeIndexFunctionTys_maybe f
+      | Just (domain, result) <- nativeTermAppKind_maybe f arg
       , typeKind arg `eqType` domain
       = Just (f, [arg], result)
     collect (AppTy fun arg) = do
       (f, args, kind) <- collect fun
-      (domain, result) <- nativeIndexFunctionTypeTys_maybe kind
+      (domain, result) <- nativeTypeCallStep_maybe kind arg
       (f, arg : args, result) <$ guard (typeKind arg `eqType` domain)
     collect (CastTy prefix co) = do
       (f, args, kind) <- collect prefix
       let target = coercionRKind co
-      guard (coercionRole co == Nominal && coercionLKind co `eqType` kind)
-      (f, args, target) <$ nativeIndexFunctionTypeTys_maybe target
+          valid_target = isJust (nativeIndexFunctionTypeTys_maybe target)
+            || case coreFullView target of
+                 DepFunTy DepFunVisible b r ->
+                   isManyTy (idMult b) && isNativeOpaqueValueType (varType b)
+                   && tcIsLiftedTypeKind (typeKind r)
+                 _ -> False
+      guard (coercionRole co == Nominal && coercionLKind co `eqType` kind && valid_target)
+      pure (f, args, target)
     collect _ = Nothing
 
 -- | Check a function field in a structural index schema.
@@ -3015,7 +3060,7 @@ isNativeIndexedFieldDomain ty
                (isOneTy mult || isManyTy mult)
                && isNativeOpaqueValueType field_ty) fields
       , all (isNativeOpaqueValueType . scaledThing) (drop (length specs) rep_tys)
-      = length specs <= 1
+      = True
       | otherwise = False
 
 -- | Check a retained function field over closed or abstract endpoints.
@@ -3027,15 +3072,26 @@ isNativeRetainedFieldFunctionType ty
   = True
   | otherwise = isNativeStructuralFunctionType ty
 
--- | Test the head of an opaque value domain after expanding synonyms.
+-- | Test an opaque value domain after expanding synonyms.
 -- The caller checks the full domain's lifted kind.
 isNativeAlgebraicOrAbstractDomain :: Type -> Bool
-isNativeAlgebraicOrAbstractDomain ty = case coreFullView ty of
-  TyVarTy {} -> True
-  TyConApp tc args
-    | isDataFamilyTyCon tc -> tyConArity tc <= length args
-    | otherwise -> isVanillaAlgTyCon tc && isLiftedDataOrNewTyCon tc && tyConArity tc == length args
-  _ -> False
+isNativeAlgebraicOrAbstractDomain ty
+  = tcIsLiftedTypeKind (typeKind ty)
+    && not (is_type_data_domain [] ty)
+    && valid_arrow_endpoints ty
+  where
+    valid_arrow_endpoints t = case coreFullView t of
+      FunTy { ft_af = FTF_T_T, ft_arg = arg, ft_res = res } ->
+        isNativeOpaqueValueType arg && isNativeOpaqueValueType res
+      _ -> True
+
+    is_type_data_domain seen t = case coreFullView t of
+      TyConApp tc _
+        | isTypeDataTyCon tc -> True
+        | getUnique tc `elem` seen -> False
+        | Just (_, rhs, _) <- unwrapNewTyConEtad_maybe tc ->
+            is_type_data_domain (getUnique tc : seen) rhs
+      _ -> False
 
 {- Note [Opaque algebraic retained binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3230,9 +3286,9 @@ typeKind (TyConApp tc tys)      = piResultTys (tyConKind tc) tys
 typeKind (LitTy l)              = typeLiteralKind l
 typeKind (FunTy { ft_af = af }) = liftedTypeOrConstraintKind (funTyFlagResultTypeOrConstraint af)
 typeKind (TyVarTy tyvar)        = tyVarKind tyvar
-typeKind (TermAppTy f _)        = case nativeIndexFunctionTys_maybe f of
+typeKind (TermAppTy f arg)      = case nativeTermAppKind_maybe f arg of
   Just (_, res) -> res
-  Nothing -> pprPanic "typeKind: invalid native function" (ppr f)
+  Nothing -> pprPanic "typeKind: invalid native function" (ppr f <+> ppr arg)
 typeKind (TermVarTy v)          = varType v
 typeKind (ExistsTy {})           = liftedTypeKind
 typeKind (DepFunTy {})          = liftedTypeKind

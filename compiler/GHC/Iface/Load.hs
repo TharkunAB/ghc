@@ -52,7 +52,7 @@ module GHC.Iface.Load (
 import GHC.Prelude
 
 import GHC.Platform.Profile
-import GHC.Data.FastString (fastStringToShortText)
+import GHC.Data.FastString (fastStringToShortText, fsLit)
 
 import {-# SOURCE #-} GHC.IfaceToCore
    ( tcIfaceDeclsFromIface, tcIfaceRules, tcIfaceInst, tcIfaceFamInst
@@ -98,10 +98,21 @@ import GHC.Builtin.Modules( rEBINDABLE_MOD_NAME, eSSENTIALS_NAME, gHC_PRIM, isWi
 import GHC.Builtin.PrimOps
 import GHC.Builtin.PrimOps.Ids
 import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.WiredIn.Types
+  ( liftedRepTy, liftedDataConTy, runtimeRepTy, levityTy, unmatchableDataConTy )
 import GHC.Builtin.WiredIn.Ids( seqId )
 
 import GHC.Core.Rules
 import GHC.Core.TyCon
+import GHC.Core.Type
+  ( Type, splitPiTy_maybe, coreFullView, isLiftedTypeKind, typeKind
+  , isTyVarTy, isManyTy, isInvisibleForAllTyFlag, isInvisiblePiTyBinder
+  , mkTyVarTy, mkForAllTy, mkVisFunTyManyU )
+import GHC.Core.TyCo.Rep ( Type(FunTy), FunTyFlag(..) )
+import GHC.Core.TyCo.Compare ( eqType )
+import GHC.Core.TyCo.FVs ( tyCoVarsOfType )
+import qualified GHC.Core.TyCo.Subst as Subst
+import GHC.Core.Coercion.Axiom ( CoAxiom, ClosedTyFam(CTF) )
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
 
@@ -109,6 +120,9 @@ import GHC.Parser.Annotation( noLocA, noAnn )
 
 import GHC.Types.Annotations
 import GHC.Types.Id
+import GHC.Types.Var ( TyVar, VarBndr(..), PiTyBinder(Named), Specificity(..), ForAllTyFlag(..), mkTyVar, isTyVar, tyVarKind, varType )
+import GHC.Types.Var.Env ( mkInScopeSet )
+import GHC.Types.Unique.Supply ( getUniqueM )
 import GHC.Types.Name
 import GHC.Types.Name.Cache
 import GHC.Types.Name.Env
@@ -147,6 +161,9 @@ import GHC.Data.Maybe
 import Language.Haskell.Syntax.Lit (StringLiteral(..))
 
 import Control.Monad
+import Control.Monad.Trans.Class ( lift )
+import Control.Monad.Trans.Maybe ( MaybeT(..), runMaybeT )
+import Data.List ( stripPrefix )
 import qualified Data.Foldable as Foldable
 import Data.Function ((&))
 import Data.Map ( toList )
@@ -517,13 +534,86 @@ importDecl name
         { eps <- getEps
         ; case lookupTypeEnv (eps_PTE eps) name of
             Just thing -> return $ Succeeded thing
-            Nothing    -> return $ Failed $
-              Can'tFindNameInInterface name
-              (filter is_interesting $ nonDetNameEnvElts $ eps_PTE eps)
+            Nothing    -> do
+              mb_synth <- synthImportedUninterpretedTyCon name
+              case mb_synth of
+                Just tc -> return $ Succeeded (ATyCon tc)
+                Nothing -> return $ Failed $
+                  Can'tFindNameInInterface name
+                  (filter is_interesting $ nonDetNameEnvElts $ eps_PTE eps)
     }}}
   where
     nd_doc = text "Need decl for" <+> ppr name
     is_interesting thing = nameModule name == nameModule (getName thing)
+
+-- | Synthesize the canonical equationless closed type family @M.U:f@ on demand
+-- from @M.f@ when @M@ was compiled without a solver plugin, ensuring diamond
+-- imports across separate downstream modules resolve the identical 'TyCon'.
+synthImportedUninterpretedTyCon :: Name -> IfM lcl (Maybe TyCon)
+synthImportedUninterpretedTyCon name
+  | isExternalName name
+  , isTcClsNameSpace (nameNameSpace name)
+  , let mod = nameModule name
+  , not (isInteractiveModule mod)
+  , Just term_str <- stripPrefix "U:" (occNameString (nameOccName name))
+  , not (null term_str)
+  = runMaybeT $ do
+      hsc_env   <- lift getTopEnv
+      term_name <- lift (lookupOrig mod (mkVarOcc term_str))
+      mb_thing  <- liftIO (lookupType hsc_env term_name)
+      fun <- case mb_thing of
+        Just (AnId v) -> pure v
+        _             -> mzero
+      let init_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfType (varType fun)))
+      (p_tvs, rho) <- MaybeT (peel_invis init_subst (varType fun))
+      let (domains, res_kind) = peel_arrows rho
+      guard (not (null domains && isTyVarTy res_kind)
+             && not (isLiftedTypeKind res_kind)
+             && isLiftedTypeKind (typeKind res_kind)
+             && all (isLiftedTypeKind . typeKind) domains)
+      z_tvs <- lift $ mapM (\dom -> do
+                 u <- getUniqueM
+                 pure (mkTyVar (mkSystemName u (mkTyVarOccFS (fsLit "z"))) dom)) domains
+      let tc_binders = mkNamedTyConBinders (Invisible SpecifiedSpec) p_tvs
+                       ++ [Bndr tv AnonTCB | tv <- z_tvs]
+          mk_bndr_ki (Bndr tv (NamedTCB vis)) k = mkForAllTy unmatchableDataConTy (Bndr tv vis) k
+          mk_bndr_ki (Bndr tv AnonTCB)        k = mkVisFunTyManyU (tyVarKind tv) k
+          tc_kind = foldr mk_bndr_ki res_kind tc_binders
+          no_ax :: Maybe (CoAxiom a)
+          no_ax = Nothing
+          fam_tc = mkFamilyTyCon name tc_kind tc_binders 0 res_kind Nothing
+                     (ClosedTypeFamilyTyCon (CTF no_ax)) Nothing NotInjective
+      lift $ updateEps $ \e ->
+        case lookupTypeEnv (eps_PTE e) name of
+          Just (ATyCon existing) -> (e, existing)
+          _ -> (e { eps_PTE = extendTypeEnv (eps_PTE e) (ATyCon fam_tc) }, fam_tc)
+  | otherwise = pure Nothing
+  where
+    peel_invis :: Subst.Subst -> Type -> IfM lcl (Maybe ([TyVar], Type))
+    peel_invis subst ty = case splitPiTy_maybe ty of
+      Just (_, Named (Bndr tv0 vis), rest)
+        | isInvisibleForAllTyFlag vis, isTyVar tv0 -> do
+            let ki0 = Subst.substTy subst (tyVarKind tv0)
+            if ki0 `eqType` runtimeRepTy
+              then peel_invis (Subst.extendTvSubstAndInScope subst tv0 liftedRepTy) rest
+              else if ki0 `eqType` levityTy
+                then peel_invis (Subst.extendTvSubstAndInScope subst tv0 liftedDataConTy) rest
+                else if isLiftedTypeKind ki0 || isLiftedTypeKind (typeKind ki0)
+                  then do
+                    u <- getUniqueM
+                    let nm  = mkSystemName u (nameOccName (getName tv0))
+                        tv' = mkTyVar nm ki0
+                    fmap (\(tvs, r) -> (tv' : tvs, r)) <$>
+                      peel_invis (Subst.extendTvSubstAndInScope subst tv0 (mkTyVarTy tv')) rest
+                  else pure Nothing
+      Just (_, b, _) | isInvisiblePiTyBinder b -> pure Nothing
+      _ -> pure (Just ([], Subst.substTy subst ty))
+
+    peel_arrows :: Type -> ([Type], Type)
+    peel_arrows ty = case coreFullView ty of
+      FunTy FTF_T_T _ mult dom rest | isManyTy mult ->
+        let (doms, res) = peel_arrows rest in (dom : doms, res)
+      _ -> ([], ty)
 
 
 {-

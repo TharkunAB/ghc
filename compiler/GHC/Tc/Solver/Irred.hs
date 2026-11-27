@@ -28,7 +28,7 @@ import GHC.Tc.Utils.TcType ( isMetaTyVar )
 import GHC.Types.Basic( SwapFlag(..) )
 import GHC.Types.Unique ( getUnique, nonDetCmpUnique )
 import GHC.Types.Var ( Id )
-import GHC.Types.Var.Set ( isEmptyVarSet )
+import GHC.Types.Var.Set ( elemVarSet, isEmptyVarSet )
 
 import GHC.Utils.Misc ( equalLength )
 import GHC.Utils.Outputable
@@ -115,21 +115,21 @@ try_inert_irreds inerts irred_w@(IrredCt { ir_ev = ev_w, ir_reason = reason })
   -- See Note [Using a promoted head from a retained index Given].
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev_w
   , EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev_w)
-  , Just (swap, index, tc, metas, expected) <-
+  , Just (swap, index, tc, expected) <-
       promoted_wanted NotSwapped lhs rhs <|> promoted_wanted IsSwapped rhs lhs
   = do { binders <- getNativeBinderScope
-       ; unfilled <- mapM isUnfilledMetaTyVar metas
-       ; case if isEmptyVarSet binders && or unfilled
+       ; case if not (index `elemVarSet` binders)
               then findPromotedIndexGiven (inert_irreds inerts) index tc
               else Nothing of
-           Nothing -> continueWith ()
-           Just (known, known_co) ->
+           Just (known, known_co)
+             | not (known `tcEqType` expected) ->
              do { (child, hole) <- newWantedEq (ctEvLoc ev_w) (ctEvRewriters ev_w)
                                               Nominal known expected
                 ; emitChildEqs ev_w (unitBag (mkNonCanonical (CtWanted child)))
                 ; let co = maybeSymCo swap (known_co `mkTransCo` mkHoleCo hole)
                 ; setWantedEq dest (CPH co (unitCoHoleSet hole))
-                ; stopWith ev_w "Used promoted head from retained index Given" } }
+                ; stopWith ev_w "Used promoted head from retained index Given" }
+           _ -> continueWith () }
 
   | otherwise
   = continueWith ()
@@ -137,12 +137,11 @@ try_inert_irreds inerts irred_w@(IrredCt { ir_ev = ev_w, ir_reason = reason })
   where
     ct_w = CIrredCan irred_w
     promoted_wanted swap (TermVarTy index) ty@(TyConApp tc args)
-      | isNativeIndexId index
-      , isPromotedDataCon tc
+      | isNativeOpaqueValueId index
+      , isPromotedDataCon tc || isGenerativeTyCon tc Nominal
       , length args == tyConArity tc
-      , let metas = filter isMetaTyVar (mapMaybe getTyVar_maybe args)
-      , not (null metas)
-      = Just (swap, index, tc, metas, ty)
+      , not (anyFreeVarsOfType (== index) ty)
+      = Just (swap, index, tc, ty)
     promoted_wanted _ _ _ = Nothing
 
 orientGivenTermIndex :: CtEvidence -> Maybe (Id, Type, Coercion)

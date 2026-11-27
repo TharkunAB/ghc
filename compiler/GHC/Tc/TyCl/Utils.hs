@@ -640,7 +640,7 @@ irType = go
     go lcls ty                 | Just ty' <- coreView ty -- #14101
                                = go lcls ty'
     go lcls ty@(TermAppTy f arg)
-      | isNativeIndexFunctionId f
+      | isNativeIndexFunctionId f || isNativeDepFunctionId f
       , isNativeNamedOpaqueFunctionId f || f `elemVarSet` lcls
       = markNominal lcls (varType f) >> markNominal lcls arg
       | otherwise = pprPanic "irType: invalid native call scope" (ppr ty)
@@ -710,7 +710,7 @@ markNominal lcls ty = mapM_ (updateRole Nominal) $
     get_ty_vars :: VarSet -> Type -> VarSet
     get_ty_vars scope t | Just t' <- coreView t = get_ty_vars scope t' -- #20999
     get_ty_vars scope ty@(TermAppTy f arg)
-      | isNativeIndexFunctionId f
+      | isNativeIndexFunctionId f || isNativeDepFunctionId f
       , isNativeNamedOpaqueFunctionId f || f `elemVarSet` scope
       = get_ty_vars scope (varType f) `unionVarSet` get_ty_vars scope arg
       | otherwise = pprPanic "markNominal: invalid native call scope" (ppr ty)

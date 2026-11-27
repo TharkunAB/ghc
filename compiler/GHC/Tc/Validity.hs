@@ -1484,11 +1484,11 @@ check_type ve (ClassAppTy _ inst (TermVarTy dict) arg kind)
        ; mapM_ (check_type ve) [inst, arg, kind] }
 check_type _ ClassAppTy{} = failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex
 check_type ve (TermAppTy head_id arg)
-  = do { unless (isNativeIndexFunctionId head_id) $
+  = do { unless (isNativeIndexFunctionId head_id || isNativeDepFunctionId head_id) $
            failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex
        ; check_retained_index ve head_id
        ; check_type ve arg
-       ; case nativeIndexFunctionTys_maybe head_id of
+       ; case nativeTermAppKind_maybe head_id arg of
            Just (domain, _) | typeKind arg `eqType` domain -> return ()
            _ -> failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex }
 check_type ve (TermVarTy v)

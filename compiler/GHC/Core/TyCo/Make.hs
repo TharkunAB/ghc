@@ -95,7 +95,7 @@ import {-# SOURCE #-} GHC.Core.Coercion
     )
 
 import {-# SOURCE #-} GHC.Core.Type
-   ( mkCastTy, isNativeIndexFunctionId )
+   ( mkCastTy, isNativeIndexFunctionId, isNativeDepFunctionId, nativeTermAppKind_maybe )
 
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
    ( liftedTypeKind, unliftedTypeKind
@@ -380,7 +380,9 @@ mkAppTy (CastTy fun_ty co) arg_ty
 
 mkAppTy (TyConApp tc tys) ty2 = mkTyConApp tc (tys ++ [ty2])
 mkAppTy (TermVarTy f) arg
-  | isNativeIndexFunctionId f = TermAppTy f arg
+  | isNativeIndexFunctionId f
+    || case nativeTermAppKind_maybe f arg of { Just _ -> True; Nothing -> False }
+  = TermAppTy f arg
     -- See Note [Native function-value application].
 mkAppTy ty1               ty2 = AppTy ty1 ty2
         -- Note that the TyConApp could be an
@@ -802,7 +804,7 @@ of Coercion, and they perform very basic optimizations.
 -- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
 mkTermAppCo :: Id -> CoercionN -> CoercionN
 mkTermAppCo f co
-  = assertPpr (isNativeIndexFunctionId f && coercionRole co == Nominal)
+  = assertPpr ((isNativeIndexFunctionId f || isNativeDepFunctionId f) && coercionRole co == Nominal)
       (text "Invalid native call congruence:" <+> ppr f <+> ppr co) $
     case co of
       Refl ty -> mkNomReflCo (TermAppTy f ty)

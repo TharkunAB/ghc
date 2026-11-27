@@ -159,6 +159,7 @@ import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.Predicate ( getClassPredTys_maybe, isCTupleClass )
 import GHC.Core.Type
+import GHC.Core.TyCo.FVs (injectiveVarsOfType)
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Ppr
 import qualified GHC.Core.TyCo.Subst as Subst
@@ -193,7 +194,7 @@ import GHC.Types.SrcLoc
 import GHC.Types.Unique.FM (listToUFM_Directly)
 import GHC.Types.Unique.Supply
 
-import GHC.Unit.Module (Module, mkModule, mkModuleName, moduleName, moduleNameString, moduleUnit, stringToUnit, unitString)
+import GHC.Unit.Module (Module, isInteractiveModule, mkModule, mkModuleName, moduleName, moduleNameString, moduleUnit, stringToUnit, unitString)
 import GHC.Unit.Module.ModIface (mi_hash_fn)
 
 import GHC.Utils.Encoding (zEncodeString)
@@ -202,7 +203,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import GHC.Driver.DynFlags
-import GHC.Driver.Env (hsc_plugins, hsc_units)
+import GHC.Driver.Env (hsc_plugins, hsc_units, lookupType)
 import GHC.Driver.Plugins (mapPlugins, tcPlugin)
 import GHC.Driver.Ppr (showPpr, showSDocForUser)
 import qualified GHC.LanguageExtensions as LangExt
@@ -211,7 +212,7 @@ import GHC.Data.FastString
 import GHC.Data.List.Infinite ( Infinite (..) )
 import qualified GHC.Data.List.Infinite as Inf
 import GHC.Data.List.SetOps
-import GHC.Data.Maybe
+import GHC.Data.Maybe as Maybe
 import GHC.Data.Bag( unitBag, mapBagM_ )
 
 import Data.Function ( on )
@@ -695,7 +696,11 @@ tcRetainedAmbientIndices invalid_reason hs_ty
                           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedStaging
                       ; return (Just (name, index)) } }
              _ | isTyVarName name -> return Nothing
-               | otherwise -> invalid_index }
+               | otherwise -> do
+                   env <- getGblEnv
+                   if isInteractiveStmtTerm env name
+                     then return Nothing
+                     else invalid_index }
     invalid_index :: TcM a
     invalid_index = failWithTc $ TcRnRetainedQuantificationError invalid_reason
 
@@ -1367,7 +1372,10 @@ tcRetainedBinderDomain valid_domain mode domain
 inferRetainedCallbackKinds :: LHsType GhcRn -> TcType -> TcM TcType
 inferRetainedCallbackKinds source ty
   | FunTy { ft_arg = arg, ft_res = res } <- coreFullView ty
-  , let flexible = filter (maybe False isMetaTyVarTy . kindRep_maybe . typeKind) [arg, res]
+  , let is_flex ep =
+          let ki = typeKind ep
+          in isMetaTyVarTy ki || maybe False isMetaTyVarTy (kindRep_maybe ki)
+        flexible = filter is_flex [arg, res]
   , not (null flexible)
   = do { forM_ flexible $ \endpoint ->
            discardResult $ unifyKind (Just (HsTypeRnThing (unLoc source)))
@@ -2207,6 +2215,12 @@ tcInferLHsTypeUnsaturated hs_ty
     do { mode <- mkHoleMode TypeLevel HM_Sig  -- Allow and report holes
        ; case splitHsAppTys_maybe (unLoc hs_ty) of
            Just (hs_fun_ty, hs_args)
+              | L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm))) <- hs_fun_ty
+              , isVarName nm || isFieldOcc (nameOccName nm)
+              -> tc_infer_lhs_type
+                   (mode { mode_complete_type_arg = Just (hsTypeHasNoAnonWildcards hs_ty) })
+                   hs_ty
+              | otherwise
               -> do { (fun_ty, _ki) <- tcInferTyAppHead mode hs_fun_ty hs_args
                     ; tcInferTyApps_nosat TypeLevel Nothing mode hs_fun_ty fun_ty hs_args }
                       -- Notice the 'nosat'; do not instantiate trailing
@@ -3723,23 +3737,25 @@ tcTermAppInType mode rn_ty exp_kind
     stage1_runtime_or_external
       | L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))) <- hs_fun_ty
       , Just head_id <- lookupNameEnv (mode_indices mode) name
-      , isNativeIndexFunctionId head_id
+      , isNativeIndexFunctionId head_id || isNativeDepFunctionId head_id
       = tc_app_ty_runtime_head mode rn_ty exp_kind head_id
       | L _ (HsTyVar _ NotPromoted (L loc (WithUserRdr rdr name))) <- hs_fun_ty
-      = if (isVarName name || isFieldOcc (nameOccName name)) && isExternalName name
-          then do
-            enabled <- xoptM LangExt.DependentTypes
-            env <- getGblEnv
-            let field_ready = not (isFieldOcc (nameOccName name))
-                           || not (nameIsLocalOrFrom (tcg_semantic_mod env) name)
-                           || isJust (lookupTypeEnv (tcg_type_env env) name)
-                           || name `elemNameEnv` tcg_local_open_defs env
-            if enabled && field_ready
-              then setSrcSpanA loc (dispatch_term_head rdr name)
-              else tc_app_ty_generic mode rn_ty exp_kind
-          else if isSourceFamilyName name
-            then dispatch_source_family loc rdr name
-            else tc_app_ty_generic mode rn_ty exp_kind
+      = do env <- getGblEnv
+           let inter_term = isInteractiveStmtTerm env name
+           if (isVarName name || isFieldOcc (nameOccName name)) && (isExternalName name || inter_term)
+             then do
+               enabled <- xoptM LangExt.DependentTypes
+               let field_ready = not (isFieldOcc (nameOccName name))
+                              || inter_term
+                              || not (nameIsLocalOrFrom (tcg_semantic_mod env) name)
+                              || isJust (lookupTypeEnv (tcg_type_env env) name)
+                              || name `elemNameEnv` tcg_local_open_defs env
+               if enabled && field_ready
+                 then setSrcSpanA loc (dispatch_term_head rdr name)
+                 else tc_app_ty_generic mode rn_ty exp_kind
+             else if isSourceFamilyName name
+               then dispatch_source_family loc rdr name
+               else tc_app_ty_generic mode rn_ty exp_kind
       | otherwise = tc_app_ty_generic mode rn_ty exp_kind
 
     -- Stage 2-4 on a resolved T:f family head.
@@ -3801,7 +3817,8 @@ tcTermAppInType mode rn_ty exp_kind
       | not (isTypeLevel (mode_tyki mode)) = unsupported name
       | otherwise = do
           env <- getGblEnv
-          let is_local = nameIsLocalOrFrom (tcg_semantic_mod env) name
+          let inter_term = isInteractiveStmtTerm env name
+              is_local = not inter_term && nameIsLocalOrFrom (tcg_semantic_mod env) name
           mb_fun <- resolve_term_head env is_local name
           case (mb_fun, value_args) of
             (Nothing, _) -> unsupported name
@@ -3821,8 +3838,12 @@ tcTermAppInType mode rn_ty exp_kind
               -> checkExpKind mode rn_ty (TermVarTy fun) (varType fun) exp_kind
               | not is_local, ordinary_call
               , Just table <- imported_certified_table fun args
-              -> do when (lengthIs args 1) (void (tcOpenTypeContext mode name))
-                    use_source_table table
+              -> do prefer_uninterp <- hasImportedUninterpretedFamily fun
+                    let use_tbl = do when (lengthIs args 1) (void (tcOpenTypeContext mode name))
+                                     use_source_table table
+                    if prefer_uninterp
+                      then stage4_uninterp fun use_tbl
+                      else use_tbl
               | [arg] <- args, is_local || isQual rdr
               , Just defer <- defer_pending_call name fun arg
               -> defer
@@ -3867,10 +3888,13 @@ tcTermAppInType mode rn_ty exp_kind
         _ -> case lookupNameEnv (tcg_local_open_defs env) name of
           Just (fun, _) -> pure (Just fun)
           Nothing       -> tcLookupIdMaybe name
-    resolve_term_head _ False name
-      | ordinary_call || isJust (mode_pending_calls mode) = do
-          thing <- tcLookupGlobal name
-          pure $ case thing of { AnId fun -> Just fun; _ -> Nothing }
+    resolve_term_head env False name
+      | ordinary_call || isJust (mode_pending_calls mode) =
+          case lookupTypeEnv (tcg_type_env env) name of
+            Just (AnId fun) -> pure (Just fun)
+            _ -> do
+              thing <- tcLookupGlobal name
+              pure $ case thing of { AnId fun -> Just fun; _ -> Nothing }
       | otherwise = pure Nothing
 
     local_certified_table env fun args
@@ -3913,13 +3937,14 @@ tcTermAppInType mode rn_ty exp_kind
             Nothing
               | not is_local -> do
                   let run_closed = run_closed_tree (RunClosedFunction fun) args
-                  tc_plugins <- if ordinary_call then hasActiveTcPlugins else pure False
-                  staging <- if tc_plugins then closedOperandStaging args else pure (Just True)
+                  can_uninterp <- if ordinary_call then canUseUninterpretedTerm fun else pure False
+                  staging <- if can_uninterp then closedOperandStaging args else pure (Just True)
                   case staging of
                     Nothing -> stage4_uninterp fun run_closed
-                    Just _
-                      | tc_plugins -> tryTcDiscardingErrs (stage4_uninterp fun run_closed) run_closed
-                      | otherwise  -> run_closed
+                    Just True -> run_closed
+                    Just False
+                      | can_uninterp -> tryTcDiscardingErrs (stage4_uninterp fun run_closed) run_closed
+                      | otherwise    -> run_closed
               | otherwise -> do
                   staging <- closedOperandStaging args
                   if isJust staging
@@ -3942,8 +3967,8 @@ tcTermAppInType mode rn_ty exp_kind
     stage4_uninterp fun on_miss
       | not ordinary_call = on_miss
       | otherwise = do
-          tc_plugins <- hasActiveTcPlugins
-          if not tc_plugins
+          can_uninterp <- canUseUninterpretedTerm fun
+          if not can_uninterp
             then on_miss
             else tcUninterpretedTermCall mode rn_ty exp_kind (length val_args_only) fun
                    >>= maybe on_miss pure
@@ -4147,7 +4172,13 @@ tc_app_ty_runtime_head mode rn_ty exp_kind head_id
          ; case nativeIndexFunctionTypeTys_maybe arrow of
              Just (domain, result) -> do { ty <- tc_check_lhs_type mode arg domain
                                          ; return (mkAppTy fun' ty, result) }
-             Nothing | FunTy { ft_mult = mult } <- coreFullView arrow
+             Nothing | DepFunTy DepFunVisible bndr body <- coreFullView arrow
+                     , isManyTy (idMult bndr)
+                     , isNativeOpaqueValueType (varType bndr)
+                     , tcIsLiftedTypeKind (typeKind body)
+                     -> do { ty <- tc_check_lhs_type mode arg (varType bndr)
+                           ; return (mkAppTy fun' ty, replaceTermVarInType bndr ty body) }
+                     | FunTy { ft_mult = mult } <- coreFullView arrow
                      -> failWithTc $ TcRnRetainedQuantificationError $
                           if isManyTy mult then RetainedUnsupportedDomain arrow
                                            else RetainedIndexMultiplicity mult
@@ -4793,15 +4824,18 @@ tcPlanClosedTree mode ordinary hint root arguments = do
           then return (ClosedBoundary arg expected)
           else setSrcSpan loc $ do
             env <- getGblEnv
-            fun <- if nameIsLocalOrFrom (tcg_semantic_mod env) child
+            let inter_child = isInteractiveStmtTerm env child
+            fun <- if not inter_child && nameIsLocalOrFrom (tcg_semantic_mod env) child
               then case lookupNameEnv (tcg_local_open_defs env) child of
                      Just (f, _) -> pure f
                      Nothing     -> failWithTc (TcRnNoSourceTable child)
-              else do
-                thing <- tcLookupGlobal child
-                case thing of
-                  AnId f -> pure f
-                  _      -> failWithTc (TcRnNoSourceTable child)
+              else case lookupTypeEnv (tcg_type_env env) child of
+                     Just (AnId f) -> pure f
+                     _ -> do
+                       thing <- tcLookupGlobal child
+                       case thing of
+                         AnId f -> pure f
+                         _      -> failWithTc (TcRnNoSourceTable child)
             ch_hint <- child_hint outer_call is_unary raw_dom expected
             c <- collect deferred_ref False fun ch_hint args
             record_child_kind deferred_ref outer_call is_unary name raw_dom arg expected c
@@ -5154,7 +5188,8 @@ tcPlanClosedHead mode ordinary_call hint rdr name args
                 else failWithTc (TcRnNoSourceTable name)
   | otherwise = do
       env <- getGblEnv
-      if nameIsLocalOrFrom (tcg_semantic_mod env) name
+      let inter_term = isInteractiveStmtTerm env name
+      if not inter_term && nameIsLocalOrFrom (tcg_semantic_mod env) name
         then case lookupNameEnv (tcg_local_open_defs env) name of
                Just (fun, _) -> do
                  staging <- closedOperandStaging args
@@ -5162,11 +5197,20 @@ tcPlanClosedHead mode ordinary_call hint rdr name args
                    then tcPlanClosedTree mode ordinary_call hint (RunClosedFunction fun) args
                    else failWithTc (TcRnNoSourceTable name)
                Nothing -> failWithTc (TcRnNoSourceTable name)
-        else do
-          thing <- tcLookupGlobal name
-          case thing of
-            AnId fun -> tcPlanClosedTree mode ordinary_call hint (RunClosedFunction fun) args
-            _ -> failWithTc (TcRnNoSourceTable name)
+        else case lookupTypeEnv (tcg_type_env env) name of
+               Just (AnId fun) -> tcPlanClosedTree mode ordinary_call hint (RunClosedFunction fun) args
+               _ -> do
+                 thing <- tcLookupGlobal name
+                 case thing of
+                   AnId fun -> tcPlanClosedTree mode ordinary_call hint (RunClosedFunction fun) args
+                   _ -> failWithTc (TcRnNoSourceTable name)
+
+isInteractiveStmtTerm :: TcGblEnv -> Name -> Bool
+isInteractiveStmtTerm env nm =
+  isInteractiveModule (tcg_semantic_mod env)
+  && case lookupTypeEnv (tcg_type_env env) nm of
+       Just (AnId _) -> isInternalName nm || nameModule_maybe nm /= Just (tcg_semantic_mod env)
+       _             -> False
 
 -- | Resolve a local @T:f@ family occurrence when @f@ fell back to
 -- @tcg_local_open_defs@ for same-module closed evaluation.
@@ -5280,17 +5324,20 @@ tcClosedCallback rdr name = do
   unless imported $ failWithTc (TcRnClosedTypeEval owner
     "A closed callback needs an ordinary non-SOURCE import.")
   env <- getGblEnv
-  if nameIsLocalOrFrom (tcg_semantic_mod env) owner
+  let inter_owner = isInteractiveStmtTerm env owner
+  if not inter_owner && nameIsLocalOrFrom (tcg_semantic_mod env) owner
     then case lookupNameEnv (tcg_local_open_defs env) owner of
            Just (fun, _) -> return fun
            Nothing -> case lookupTypeEnv (tcg_type_env env) owner of
              Just (AnId fun) -> return fun
              _ -> failWithTc (TcRnNoSourceTable owner)
-    else do
-      thing <- tcLookupGlobal owner
-      case thing of
-        AnId fun -> return fun
-        _ -> failWithTc (TcRnNoSourceTable owner)
+    else case lookupTypeEnv (tcg_type_env env) owner of
+           Just (AnId fun) -> return fun
+           _ -> do
+             thing <- tcLookupGlobal owner
+             case thing of
+               AnId fun -> return fun
+               _ -> failWithTc (TcRnNoSourceTable owner)
 
 isClosedOrdinaryImport :: RdrName -> Name -> TcM Bool
 isClosedOrdinaryImport rdr name = do
@@ -5307,6 +5354,7 @@ isClosedOrdinaryImport rdr name = do
           _ -> False
       imported gre = greName gre == name &&
                      (any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre) ||
+                      maybe False isInteractiveModule (nameModule_maybe name) ||
                       (isLocalGRE gre && local_certified))
   return (any imported (lookupGRE rdr_env (LookupRdrName term_rdr (RelevantGREsFOS WantNormal))))
 
@@ -5910,7 +5958,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
     is_tycon_app_hs_ty (L _ (HsParTy _ inner))  = is_tycon_app_hs_ty inner
     is_tycon_app_hs_ty (L _ (HsAppTy _ f _))    = is_tycon_app_hs_ty f
     is_tycon_app_hs_ty (L _ (HsAppKindTy _ f _)) = is_tycon_app_hs_ty f
-    is_tycon_app_hs_ty (L _ (HsTyVar _ _ (L _ (WithUserRdr _ nm)))) = isTyConName nm
+    is_tycon_app_hs_ty (L _ (HsTyVar _ _ (L _ (WithUserRdr _ nm)))) = isTyConName nm || isTyVarName nm
     is_tycon_app_hs_ty _ = False
 
     -- This slot supplies the kind for a wildcard or an exact annotation.
@@ -6590,23 +6638,32 @@ data SynthClosedFamFlav
 -- | Construct a closed 'FamilyTyCon' from explicit 'TyConBinder's.
 mkSynthClosedFamilyTcbs :: Name -> [TyConBinder] -> Kind -> SynthClosedFamFlav -> TcM TyCon
 mkSynthClosedFamilyTcbs fam_name tc_binders res_kind flav = do
-  let tc_kind   = mkTyConKindWithMatchability unmatchableDataConTy tc_binders res_kind
-      mk_tc ctf = mkFamilyTyCon fam_name tc_kind tc_binders 0 res_kind Nothing
-                    (ClosedTypeFamilyTyCon ctf) Nothing NotInjective
+  let tc_kind      = mkTyConKindWithMatchability unmatchableDataConTy tc_binders res_kind
+      mk_tc inj ctf = mkFamilyTyCon fam_name tc_kind tc_binders 0 res_kind Nothing
+                        (ClosedTypeFamilyTyCon ctf) Nothing inj
   case flav of
-    SynthAbstractFam -> pure (mk_tc CTF_Abstract)
-    SynthUninterpFam -> pure (mk_tc (CTF Nothing))
-    SynthClosedEqns mb_scope [] -> pure (mk_tc (CTF Nothing))
+    SynthAbstractFam -> pure (mk_tc NotInjective CTF_Abstract)
+    SynthUninterpFam -> pure (mk_tc NotInjective (CTF Nothing))
+    SynthClosedEqns mb_scope [] -> pure (mk_tc NotInjective (CTF Nothing))
       where _ = mb_scope
     SynthClosedEqns mb_scope rows -> do
       ax_name <- newImplicitBinder fam_name mkInstTyCoOcc
       let branches = [ mkCoAxBranch qtvs [] [] lhs rhs (map (const Nominal) qtvs) loc
                      | (qtvs, lhs, rhs, loc) <- rows ]
+          inj = case rows of
+            [(qtvs, lhs, rhs, _)]
+              | Just lhs_tvs <- traverse getTyVar_maybe lhs
+              , lhs_tvs == qtvs
+              , equalLength qtvs tc_binders
+              -> let det   = injectiveVarsOfType False rhs
+                     flags = [binderVar tcb `elemVarSet` det | tcb <- tc_binders]
+                 in if or flags then Injective flags else NotInjective
+            _ -> NotInjective
           ctf = case mb_scope of
             Nothing      -> CTF (Just axiom)
             Just mk_root -> let (owner, is_sum) = mk_root fam_name
                             in CTF_Scoped owner is_sum axiom
-          fam_tc = mk_tc ctf
+          fam_tc = mk_tc inj ctf
           axiom  = mkBranchedCoAxiom Nominal ax_name fam_tc branches
       pure fam_tc
 
@@ -7036,11 +7093,12 @@ ambientMetaTyVars exp_kind = do
 -- runtime-index captures, preserving explicit declaration header binders when
 -- present.
 partitionSynthCaptures
-  :: Bool                     -- ^ Under an inner explicit @forall@
+  :: Bool                     -- ^ Retain unused header binders for reification
+  -> Bool                     -- ^ Under an inner explicit @forall@
   -> Maybe ([TyVar], [TyVar]) -- ^ Optional explicit declaration (invis, vis) header binders
   -> [Var]                    -- ^ Free variables referenced by the lowered construct
   -> TcM (Subst.Subst, [(TyVar, Specificity)], [TyVar], [Type], Type -> Type)
-partitionSynthCaptures under_forall mb_decl_hdr raw_fvs = do
+partitionSynthCaptures keep_unused_hdr under_forall mb_decl_hdr raw_fvs = do
   lcl_full <- getLclEnv
   lcl <- getLclTypeEnv
   let stack_vars =
@@ -7056,11 +7114,16 @@ partitionSynthCaptures under_forall mb_decl_hdr raw_fvs = do
         [ (tv, SpecifiedSpec)
         | ATyVar _ tv <- nonDetNameEnvElts lcl ]
       lcl_tv_set = mkVarSet [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
-      (hdr_invis, hdr_vis) = fromMaybe ([], []) mb_decl_hdr
+      (hdr_invis, hdr_vis0) = fromMaybe ([], []) mb_decl_hdr
+      raw_dedup     = dedup_vars raw_fvs
+      raw_fv_set    = mkVarSet (close_kinds raw_dedup)
+      hdr_vis       = if keep_unused_hdr
+                        then hdr_vis0
+                        else [tv | tv <- hdr_vis0, tv `elemVarSet` raw_fv_set]
+      hdr_all_vis   = mkVarSet hdr_vis0
       hdr_vis_set   = mkVarSet hdr_vis
       hdr_invis_set = mkVarSet hdr_invis
-      non_hdr_fvs   = sort_by_bind_loc stack_pos lcl_spans [v | v <- dedup_vars raw_fvs, not (v `elemVarSet` hdr_vis_set)]
-      -- Include all explicit visible header binders for SynDecl so reify sees full arity.
+      non_hdr_fvs   = sort_by_bind_loc stack_pos lcl_spans [v | v <- raw_dedup, not (v `elemVarSet` hdr_all_vis)]
       seed_vars     = dedup_vars (map (\v -> v :: Var) hdr_vis ++ non_hdr_fvs)
       base_vars     = scopedSort (close_kinds seed_vars)
       -- Distinguish kind-only variables and inferred metavariables from written visible variables:
@@ -7208,7 +7271,7 @@ tcSomeTypeInHsType mode rn_ty sigma_nm dom_hs lam_loc bndr body_hs exp_kind = do
                 || (not (null cap_ids) && not (allows_runtime_some site))) $
             failWithTc (TcRnRetainedQuantificationError RetainedSumContext)
           mb_hdr <- lookupDeclHeaderTyVars site
-          (subst1, invis_caps, vis_caps, cap_args0, _) <- partitionSynthCaptures (mode_under_forall mode) mb_hdr raw_fvs
+          (subst1, invis_caps, vis_caps, cap_args0, _) <- partitionSynthCaptures False (mode_under_forall mode) mb_hdr raw_fvs
           x_nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (unLoc bndr))))
           let rec_tenv = tcg_type_env gbl
               res_rec  = resolveRecTcTypes rec_tenv
@@ -7274,7 +7337,7 @@ tcSomeTypeInHsType mode rn_ty sigma_nm dom_hs lam_loc bndr body_hs exp_kind = do
     allows_runtime_some SynthConField{} = True
     allows_runtime_some SynthInSigma{}  = True
     allows_runtime_some SynthExprT2T    = True
-    allows_runtime_some (SynthLocalSig "$type-argument") = True
+    allows_runtime_some SynthLocalSig{} = True
     allows_runtime_some _               = False
 
     alloc_some_names in_kc site loc = do
@@ -7571,7 +7634,7 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
           pure (tcg_type_env gbl, subst_c, id_env, p_invis, p_vis, cap_args)
         Nothing -> do
           mb_hdr <- lookupDeclHeaderTyVars site
-          (_, invis_specs, vis_dummy, cap_args0, _) <- partitionSynthCaptures (mode_under_forall mode) mb_hdr raw_fvs0
+          (_, invis_specs, vis_dummy, cap_args0, _) <- partitionSynthCaptures False (mode_under_forall mode) mb_hdr raw_fvs0
           let ordered_orig = [ v | arg <- cap_args0
                              , Just v <- [case arg of { TyVarTy tv -> Just (tv :: Var); TermVarTy i -> Just (i :: Var); _ -> Nothing }] ]
               _ = vis_dummy
@@ -7870,7 +7933,7 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
                     let let_tvs = [tv | tv <- raw_fvs, isTyVar tv, tv `elemVarEnv` let_fam_env]
                     in Just (invis_h, vis_h ++ let_tvs)
                   _ -> mb_hdr
-            (_, invis_specs, _, cap_args0, _) <- partitionSynthCaptures (mode_under_forall mode) mb_hdr' raw_fvs
+            (_, invis_specs, _, cap_args0, _) <- partitionSynthCaptures True (mode_under_forall mode) mb_hdr' raw_fvs
             let ordered_orig = [ v | arg <- cap_args0
                                , Just v <- [case arg of { TyVarTy tv -> Just (tv :: Var); TermVarTy i -> Just (i :: Var); _ -> Nothing }] ]
             when (mode_under_forall mode) $
@@ -8534,23 +8597,26 @@ synthCheckedPattern path (CasePatternConstructor sp _ fields) ty =
 -- via a closed 1-equation eta-expansion family.
 -- See Note [Matchability forgetfulness in visible type applications].
 tcForgetMatchabilityArrows :: CtOrigin -> TcType -> TcKind -> TcKind -> TcM (Maybe TcType)
-tcForgetMatchabilityArrows origin res_ty act_kind0 exp_kind0 = do
+tcForgetMatchabilityArrows origin res_ty0 act_kind0 exp_kind0 = do
   dep <- xoptM LangExt.DependentTypes
   if not dep
     then pure Nothing
     else do
-      act_k <- liftZonkM (zonkTcType act_kind0)
-      exp_k <- liftZonkM (zonkTcType exp_kind0)
-      case (tcSplitTyConApp_maybe res_ty, plan_forget act_k exp_k) of
-        (Just (tc, tc_args), Just (flags, _doms, _final_res))
-          | or flags -> do
-              mb_eta_tc <- getOrCreateEtaForgetTyCon tc (length tc_args) flags
-              case mb_eta_tc of
-                Just eta_tc -> do
-                  let eta_app = mkTyConApp eta_tc tc_args
-                  co_k <- unifyTypeAndEmit KindLevel origin (typeKind eta_app) exp_kind0
-                  pure (Just (eta_app `mkCastTy` co_k))
-                Nothing -> pure Nothing
+      res_ty <- liftZonkM (zonkTcType res_ty0)
+      act_k  <- liftZonkM (zonkTcType act_kind0)
+      exp_k  <- liftZonkM (zonkTcType exp_kind0)
+      case plan_forget act_k exp_k of
+        Just (flags, _doms, _final_res)
+          | or flags -> case tcSplitTyConApp_maybe res_ty of
+              Just (tc, tc_args) -> do
+                mb_eta_tc <- getOrCreateEtaForgetTyCon tc (length tc_args) flags
+                case mb_eta_tc of
+                  Just eta_tc -> do
+                    let eta_app = mkTyConApp eta_tc tc_args
+                    co_k <- unifyTypeAndEmit KindLevel origin (typeKind eta_app) exp_kind0
+                    pure (Just (eta_app `mkCastTy` co_k))
+                  Nothing -> getOrCreateEtaForgetGeneral origin res_ty act_k exp_kind0 flags
+              Nothing -> getOrCreateEtaForgetGeneral origin res_ty act_k exp_kind0 flags
         _ -> pure Nothing
   where
     forget_step ma_a ma_e
@@ -8631,6 +8697,71 @@ getOrCreateEtaForgetTyCon tc n_prefix flags = do
       CastTy t _       -> has_matchable_arrow t
       _                -> False
 
+getOrCreateEtaForgetGeneral
+  :: CtOrigin -> TcType -> TcKind -> TcKind -> [Bool] -> TcM (Maybe TcType)
+getOrCreateEtaForgetGeneral origin res_ty act_k exp_kind0 flags
+  | let raw_fvs = tyCoVarsOfTypeList res_ty
+  , all (\v -> isTyVar v && not (isMetaTyVar v)) raw_fvs
+  , not (hasNativeDependentExpr (Core.Type res_ty))
+  = do
+      cur_mod <- tcg_mod <$> getGblEnv
+      ord <- allocSynthOrdinal (mkTcOcc "$eta$expr")
+      let pat_str = map (\b -> if b then 'M' else 'U') flags
+          occ     = mkTcOcc ("$eta$expr$" ++ show ord ++ "$" ++ pat_str)
+      fam_name <- newGlobalBinder cur_mod occ Nothing noSrcSpan
+      let cap_tvs = topo_sort_eta_tvs raw_fvs
+      mb_tc <- tcInternSynthClosedFamily fam_name (const True) $ runMaybeT $ do
+        let init_s = Subst.mkEmptySubst (mkInScopeSet (mkVarSet cap_tvs))
+        (p_tvs, clone_s) <- lift (clone_cap_tvs init_s cap_tvs)
+        let act_k_sub  = Subst.substTy clone_s act_k
+            res_ty_sub = Subst.substTy clone_s res_ty
+        (z_tvs, final_res_kind) <- MaybeT (peel_eta (length flags) act_k_sub)
+        guard (tcIsLiftedTypeKind (typeKind final_res_kind)
+               && all (tcIsLiftedTypeKind . typeKind . tyVarKind) (p_tvs ++ z_tvs))
+        let all_tvs  = p_tvs ++ z_tvs
+            lhs_pats = mkTyVarTys all_tvs
+            rhs_ty   = mkAppTys res_ty_sub (mkTyVarTys z_tvs)
+        pure (p_tvs, z_tvs, final_res_kind,
+              SynthClosedEqns Nothing [(all_tvs, lhs_pats, rhs_ty, noSrcSpan)])
+      case mb_tc of
+        Nothing -> pure Nothing
+        Just eta_tc -> do
+          let eta_app = mkTyConApp eta_tc (mkTyVarTys cap_tvs)
+          co_k <- unifyTypeAndEmit KindLevel origin (typeKind eta_app) exp_kind0
+          pure (Just (eta_app `mkCastTy` co_k))
+  | otherwise = pure Nothing
+  where
+    peel_eta 0 k = pure (Just ([], k))
+    peel_eta m k = case coreFullView k of
+      FunTy FTF_T_T _ mult dom rest_k | isManyTy mult -> do
+        nm <- newSysName (mkTyVarOcc "z")
+        fmap (\(tvs, rk) -> (mkTyVar nm dom : tvs, rk)) <$> peel_eta (m - 1) rest_k
+      _ -> pure Nothing
+
+    clone_cap_tvs subst [] = pure ([], subst)
+    clone_cap_tvs subst (tv : tvs) = do
+      let ki' = Subst.substTy subst (tyVarKind tv)
+      nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName tv))))
+      let tv'    = mkTyVar nm ki'
+          subst' = Subst.extendTvSubstAndInScope subst tv (mkTyVarTy tv')
+      (rest, final_s) <- clone_cap_tvs subst' tvs
+      pure (tv' : rest, final_s)
+
+    topo_sort_eta_tvs :: [TyVar] -> [TyVar]
+    topo_sort_eta_tvs vs0 =
+      let uniq_vs  = reverse (snd (foldl' (\(s, acc) v ->
+                       if v `elemVarSet` s then (s, acc) else (extendVarSet s v, v : acc))
+                       (emptyVarSet, []) vs0))
+          cand_set = mkVarSet uniq_vs
+          visit (seen, acc) tv
+            | tv `elemVarSet` seen = (seen, acc)
+            | otherwise =
+                let deps = [ d | d <- tyCoVarsOfTypeList (tyVarKind tv)
+                               , isTyVar d, d `elemVarSet` cand_set ]
+                    (s1, a1) = foldl' visit (extendVarSet seen tv, acc) deps
+                in (s1, tv : a1)
+      in reverse (snd (foldl' visit (emptyVarSet, []) uniq_vs))
+
 {- Note [Uninterpreted term applications for TcPlugins]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When no 'tcPlugin' is active, open term applications without a certified
@@ -8646,6 +8777,32 @@ hasActiveTcPlugins :: TcM Bool
 hasActiveTcPlugins = do
   hsc_env <- getTopEnv
   pure (not (null (catMaybes (mapPlugins (hsc_plugins hsc_env) tcPlugin))))
+
+canUseUninterpretedTerm :: Id -> TcM Bool
+canUseUninterpretedTerm fun = do
+  active <- hasActiveTcPlugins
+  if active
+    then pure True
+    else hasImportedUninterpretedFamily fun
+
+hasImportedUninterpretedFamily :: Id -> TcM Bool
+hasImportedUninterpretedFamily fun = do
+  gbl <- getGblEnv
+  let orig_name = idName fun
+      sem_mod   = tcg_semantic_mod gbl
+      local_occ = mkTcOcc ("U:" ++ occNameString (nameOccName orig_name))
+  case nameModule_maybe orig_name of
+    Just def_mod
+      | def_mod /= sem_mod, not (isInteractiveModule def_mod) -> do
+          hsc_env <- getTopEnv
+          ext_name <- lookupOrig def_mod local_occ
+          mb_loaded <- liftIO (lookupType hsc_env ext_name)
+          case mb_loaded of
+            Just (ATyCon _) -> pure True
+            _ -> do
+              iface <- loadInterfaceForName (text "uninterpreted term family") orig_name
+              pure (isJust (mi_hash_fn iface local_occ))
+    _ -> pure False
 
 tcUninterpretedTermCall :: TcTyMode -> HsType GhcRn -> ExpKind -> Int -> Id
                         -> TcM (Maybe TcType)
@@ -8674,25 +8831,19 @@ getOrCreateUninterpretedTyCon fun n_val_args = do
       cur_mod   = tcg_mod gbl
       sem_mod   = tcg_semantic_mod gbl
       occ_str   = occNameString (nameOccName orig_name)
-      local_occ = mkTcOcc ("U:" ++ occ_str)
+      local_occ = mkTcOcc ("U:" ++ occNameString (nameOccName orig_name))
+  let _ = occ_str
   case nameModule_maybe orig_name of
     Nothing -> pure Nothing
     Just def_mod
-      | def_mod == sem_mod -> intern_in_cur_mod cur_mod local_occ (nameSrcSpan orig_name)
+      | def_mod == sem_mod || isInteractiveModule def_mod ->
+          intern_in_cur_mod cur_mod local_occ (nameSrcSpan orig_name)
       | otherwise -> do
-          iface <- loadInterfaceForName (text "uninterpreted term family") orig_name
-          if isJust (mi_hash_fn iface local_occ)
-            then do
-              ext_name <- lookupOrig def_mod local_occ
-              thing <- tcLookupGlobal ext_name
-              pure $ case thing of
-                ATyCon existing | check_arity existing -> Just existing
-                _                                      -> Nothing
-            else do
-              let imp_occ = mkTcOcc ("U:@" ++ unitString (moduleUnit def_mod)
-                                           ++ ":" ++ moduleNameString (moduleName def_mod)
-                                           ++ ":" ++ occ_str)
-              intern_in_cur_mod cur_mod imp_occ noSrcSpan
+          ext_name <- lookupOrig def_mod local_occ
+          mb_thing <- tcLookupImported_maybe ext_name
+          pure $ case mb_thing of
+            Maybe.Succeeded (ATyCon existing) | check_arity existing -> Just existing
+            _                                                        -> Nothing
   where
     check_arity tc =
       let vis_count = length (filterOut isInvisibleTyConBinder (tyConBinders tc))

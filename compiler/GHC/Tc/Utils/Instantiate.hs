@@ -56,10 +56,15 @@ import GHC.Core.Subst ( extendIdSubst )
 import GHC.Core.Type
 import GHC.Core.Predicate ( getClassPredTys_maybe )
 import GHC.Core.TyCo.Rep ( Type(DepFunTy, DepDictTy, TermVarTy, TyVarTy), CoercionN )
-import GHC.Core.Utils ( isVacuousRetainedBinder )
+import GHC.Core.Utils ( applyTypeToArgs, isVacuousRetainedBinder )
 import GHC.Core.Coercion ( mkNomReflCo )
 import GHC.Core.TyCo.Ppr ( debugPprType )
-import GHC.Core.TyCo.Subst ( extendSubstInScopeSetFromSource )
+import GHC.Core.TyCo.Subst ( extendSubstInScopeSetFromSource, emptySubst, lookupTyVar )
+import GHC.Core.Unify ( tcMatchTyX_BM, BindFlag(..) )
+import GHC.Core.DataCon
+  ( dataConWorkId, dataConUnivTyVars, dataConRepArgBinders, isVanillaDataCon )
+import GHC.Core.TyCon ( isPromotedDataCon_maybe )
+import GHC.Core.UsageEnv ( singleUsageUE )
 import GHC.Core.Class( Class )
 import GHC.Core.Coercion.Axiom
 
@@ -73,6 +78,7 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Instance.FunDeps
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Zonk.TcType ( zonkId, zonkTcType )
 import GHC.Tc.Errors.Types
 
 import GHC.Rename.Utils( mkRnSyntaxExpr )
@@ -82,6 +88,7 @@ import GHC.Types.Arity ( VisArity )
 import GHC.Types.Basic ( TypeOrKind(..) )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set ( elemVarSet, mkVarSet )
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Var
@@ -423,6 +430,10 @@ tcInstInvisibleTypeWitness orig expected actual
   , isVacuousRetainedBinder binder body
   = do { instantiate <- maybe (pure True) wants_witness expected
        ; if instantiate then supply_witness tc tys body else pure Nothing }
+  | DepFunTy DepFunInvisible binder body <- coreFullView actual
+  , not (isVacuousRetainedBinder binder body)
+  , Just exp_ty <- expected
+  = supply_from_expected binder body exp_ty
   | otherwise = pure Nothing
   where
     supply_witness tc tys body
@@ -435,6 +446,62 @@ tcInstInvisibleTypeWitness orig expected actual
                                                 (map Core.Var wanteds)
                     ; return (Just (mkWpEvApps [EvExpr witness], body)) }
                _ -> return Nothing }
+
+    supply_from_expected binder body exp_ty0 = do
+      exp_ty <- liftZonkM (zonkTcType exp_ty0)
+      b_dom  <- liftZonkM (zonkTcType (varType binder))
+      b_mult <- liftZonkM (zonkTcType (idMult binder))
+      nm     <- newSysName (mkTyVarOcc "invis_retained")
+      let tmpl     = mkTyVar nm b_dom
+          abs_body = replaceTermVarInType binder (mkTyVarTy tmpl) body
+          bind v _
+            | v == tmpl = BindMe
+            | isTcTyVar v && isMetaTyVar v = BindMe
+            | otherwise = DontBindMe
+      case tcMatchTyX_BM bind emptySubst abs_body exp_ty of
+        Just subst
+          | Just idx <- lookupTyVar subst tmpl
+          , not (tmpl `elemVarSet` tyCoVarsOfType idx)
+          , typeKind idx `tcEqType` b_dom -> do
+              mb_op <- recover_operand idx
+              case mb_op of
+                Just (operand, record_use)
+                  | Just rec_idx <- Core.exprToNativeIndex operand
+                  , rec_idx `tcEqType` idx -> do
+                      tcScalingUsage b_mult record_use
+                      return (Just (mkWpEvApps [EvExpr operand],
+                                    applyTypeToArgs actual [operand]))
+                _ -> return Nothing
+        _ -> return Nothing
+
+    recover_operand (TermVarTy occ) = do
+      thing <- tcLookupLcl_maybe (getName occ)
+      case thing of
+        Just (ATcId { tct_id = actual_id }) -> do
+          actual_id' <- liftZonkM (zonkId actual_id)
+          if actual_id' == occ
+             && isNativeOpaqueValueId actual_id'
+             && varType actual_id' `tcEqType` varType occ
+            then return (Just (Core.Var actual_id',
+                               tcEmitBindingUsage (singleUsageUE actual_id')))
+            else return Nothing
+        _ -> return Nothing
+    recover_operand ty
+      | Just (tc, args) <- splitTyConApp_maybe ty
+      , Just dc <- isPromotedDataCon_maybe tc
+      , isVanillaDataCon dc
+      , null (dataConRepArgBinders dc)
+      , let n_univ = length (dataConUnivTyVars dc)
+      , args `lengthAtLeast` n_univ
+      = do { let (univ_tys, field_tys) = splitAt n_univ args
+           ; mb_fields <- traverse recover_operand field_tys
+           ; case sequence mb_fields of
+               Just fields ->
+                 let (ops, uses) = unzip fields
+                     app = Core.mkApps (Core.mkTyApps (Core.Var (dataConWorkId dc)) univ_tys) ops
+                 in return (Just (app, sequence_ uses))
+               Nothing -> return Nothing }
+      | otherwise = return Nothing
 
     wants_witness ty = case coreFullView tau of
       DepFunTy DepFunInvisible _ _ -> pure False

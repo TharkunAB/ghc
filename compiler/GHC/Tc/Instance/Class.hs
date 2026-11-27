@@ -27,6 +27,7 @@ import GHC.Rename.Env( addUsedGRE, addUsedDataCons, DeprecationWarnings (..) )
 import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.WiredIn.Prim
 import GHC.Builtin.KnownKeys
+import GHC.Builtin.CoercionRules ( proveScopedSigmaClosure, proveScopedLambdaClosure )
 import GHC.Builtin.PrimOps ( PrimOp(..) )
 import GHC.Builtin.PrimOps.Ids ( primOpId )
 
@@ -55,7 +56,7 @@ import GHC.Platform.Tag ( isSmallFamily )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Misc( splitAtList, fstOf3 )
+import GHC.Utils.Misc( equalLength, splitAtList, fstOf3 )
 import GHC.Data.FastString
 
 import GHC.Unit.Module.Warnings
@@ -65,6 +66,8 @@ import GHC.Hs
 import GHC.Tc.Errors.Types
 
 import Data.Maybe
+import Control.Applicative ( (<|>) )
+import Control.Monad ( zipWithM )
 
 {- *******************************************************************
 *                                                                    *
@@ -201,7 +204,7 @@ matchInstEnv dflags short_cut_solver clas tys
                               text "witness" <+> ppr dfun_id
                                              <+> ppr (idType dfun_id) ]
                                 -- Record that this dfun is needed
-                      ; match_one (null unsafeOverlaps) canonical dfun_id inst_tys warn }
+                      ; match_one pred (null unsafeOverlaps) canonical dfun_id inst_tys warn }
 
             -- More than one matches (or Safe Haskell fail!). Defer any
             -- reactions of a multitude until we learn more about the reagent
@@ -212,18 +215,48 @@ matchInstEnv dflags short_cut_solver clas tys
    where
      pred = mkClassPred clas tys
 
-match_one :: SafeOverlapping -> CanonicalEvidence -> DFunId -> [DFunInstType]
+match_one :: PredType -> SafeOverlapping -> CanonicalEvidence -> DFunId -> [DFunInstType]
           -> Maybe (WarningTxt GhcRn) -> TcM ClsInstResult
-match_one so canonical dfun_id mb_inst_tys warn
+match_one target_pred so canonical dfun_id mb_inst_tys warn
   = do { traceTc "match_one" (ppr dfun_id $$ ppr mb_inst_tys)
        ; (tys, theta) <- instDFunType dfun_id mb_inst_tys
        ; traceTc "match_one 2" (ppr dfun_id $$ ppr tys $$ ppr theta)
+       ; let (_, _, actual_pred) = tcSplitSigmaTy (piResultTys (idType dfun_id) tys)
+             mk_ev = case if actual_pred `tcEqType` target_pred
+                          then Nothing
+                          else proveClassPredClosureCo actual_pred target_pred of
+               Just co_n | not (isReflCo co_n) ->
+                 \evs -> case evDFunApp dfun_id tys evs of
+                   EvExpr e -> evCast e (mkSubCo co_n)
+               _ -> evDFunApp dfun_id tys
        ; return $ OneInst { cir_new_theta   = theta
-                          , cir_mk_ev       = evDFunApp dfun_id tys
+                          , cir_mk_ev       = mk_ev
                           , cir_canonical   = canonical
                           , cir_what        = TopLevInstance { iw_dfun_id = dfun_id
                                                              , iw_safe_over = so
                                                              , iw_warn = warn } } }
+
+proveClassPredClosureCo :: Type -> Type -> Maybe CoercionN
+proveClassPredClosureCo t1 t2
+  | t1 `tcEqType` t2 = Just (mkNomReflCo t1)
+  | Just co <- proveScopedSigmaClosure t1 t2 <|> proveScopedLambdaClosure t1 t2
+  = Just co
+  | TyConApp tc1 as1 <- coreFullView t1
+  , TyConApp tc2 as2 <- coreFullView t2
+  , tc1 == tc2, equalLength as1 as2
+  = mkTyConAppCo Nominal tc1 <$> zipWithM proveClassPredClosureCo as1 as2
+  | AppTy f1 a1 <- t1
+  , AppTy f2 a2 <- t2
+  = mkAppCo <$> proveClassPredClosureCo f1 f2 <*> proveClassPredClosureCo a1 a2
+  | FunTy af1 ma1 m1 a1 r1 <- coreFullView t1
+  , FunTy af2 ma2 m2 a2 r2 <- coreFullView t2
+  , af1 == af2
+  = mkFunCo Nominal af1
+      <$> proveClassPredClosureCo ma1 ma2
+      <*> proveClassPredClosureCo m1 m2
+      <*> proveClassPredClosureCo a1 a2
+      <*> proveClassPredClosureCo r1 r2
+  | otherwise = Nothing
 
 {- Note [Shortcut solving: overlap]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

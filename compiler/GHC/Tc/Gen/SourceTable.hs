@@ -273,6 +273,8 @@ sourceTableOwner table
       env <- getGblEnv
       owner <- if mod == tcg_semantic_mod env
         then pure $ case lookupTypeEnv (tcg_type_env env) name of { Just (AnId fun) -> Just fun; _ -> Nothing }
+        else if isInteractiveModule mod
+        then tcLookupIdMaybe name
         else do
           absent <- importedSourceOwnerAbsent table
           if absent then pure Nothing else tcLookupIdMaybe name
@@ -297,9 +299,10 @@ importedSourceOwnerAbsent :: TyCon -> TcM Bool
 importedSourceOwnerAbsent table = do
     env <- getGblEnv
     case (sourceEquationOwnerOcc (nameOccName (tyConName table)), nameModule_maybe (tyConName table)) of
-      (Just occ, Just mod) | mod /= tcg_semantic_mod env -> do
-        iface <- loadInterfaceForName (text "source table owner") (tyConName table)
-        pure (isNothing (mi_hash_fn iface occ))
+      (Just occ, Just mod)
+        | mod /= tcg_semantic_mod env, not (isInteractiveModule mod) -> do
+            iface <- loadInterfaceForName (text "source table owner") (tyConName table)
+            pure (isNothing (mi_hash_fn iface occ))
       _ -> pure False
 
 sourceFamilyTyCons :: [Type] -> [TyCon]
@@ -425,6 +428,8 @@ sourceTableFamilyUseAt table first
                 | absent || local_synth
                 , Just _ <- stripPrefix "T:$depfun$" (occNameString (nameOccName (tyConName table))) -> do
                     mapM_ (`sourceTableFamilyUseAt` Nothing) callees
+                    recordSourceTableUse env (tyConName table)
+              _ | local_synth, isJust (closedFamilyTyConCoAxiom_maybe table) ->
                     recordSourceTableUse env (tyConName table)
               _ -> failWithTc (TcRnRetainedQuantificationError
                                (RetainedUncheckedSourceCall (maybe (tyConName table) idName owner)))

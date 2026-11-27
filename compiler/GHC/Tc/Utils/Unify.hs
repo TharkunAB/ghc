@@ -121,7 +121,7 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Types.Name
 import GHC.Types.Name.Env ( lookupNameEnv )
 import GHC.Types.Name.Set ( extendNameSet )
-import GHC.Types.Id( idType, idInlineActivation )
+import GHC.Types.Id( idType, idMult, idInlineActivation )
 import GHC.Types.InlinePragma( isNeverActive )
 import GHC.Types.TypeEnv ( lookupTypeEnv )
 import GHC.Types.Var as Var
@@ -2097,7 +2097,25 @@ tc_sub_type_shallow unify inst_orig ty_actual sk_rho
        ; result_wrap <- case reflected of
            Just (witness, res) ->
              (<.> witness) <$> tc_sub_type_shallow unify inst_orig res sk_rho
-           Nothing -> mkWpCastN <$> unify_retained_rho unify rho_a sk_rho
+           Nothing
+             | DepFunTy DepFunVisible b_a _ <- coreFullView rho_a
+             , DepFunTy DepFunVisible b_e _ <- coreFullView sk_rho
+             , isNativeOpaqueValueId b_a, isNativeOpaqueValueId b_e
+             , idMult b_a `tcEqType` OneTy && not (idMult b_e `tcEqType` OneTy)
+             -> do { when (not (varType b_a `tcEqType` varType b_e)) $
+                       void (unify (varType b_a) (varType b_e))
+                   ; rho_a'  <- liftZonkM (zonkTcType rho_a)
+                   ; sk_rho' <- liftZonkM (zonkTcType sk_rho)
+                   ; let (b_e_m, b_e_ty) = case coreFullView sk_rho' of
+                           DepFunTy DepFunVisible be _ -> (idMult be, varType be)
+                           _ -> (idMult b_e, varType b_e)
+                   ; b <- newSysLocalId (fsLit "retained") b_e_m b_e_ty
+                   ; sub_w <- tcExtendIdEnv [b] $
+                       tc_sub_type_shallow unify inst_orig
+                         (applyTypeToArgs rho_a' [Core.Var b])
+                         (applyTypeToArgs sk_rho' [Core.Var b])
+                   ; return (WpRetainedFun True b sub_w) }
+             | otherwise -> mkWpCastN <$> unify_retained_rho unify rho_a sk_rho
        ; return (result_wrap <.> wrap) }
 
 {- Note [Retained domains after instantiation]
@@ -2726,18 +2744,27 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
            }
 
     -- See Note [Deep subsumption below a retained arrow].
-    go1 ty_a@(DepFunTy DepFunVisible b_a _) ty_e@(DepFunTy DepFunVisible b_e res_e)
-      | DeepSub <- ds_depth
-      , isNativeIndexId b_a, isNativeIndexId b_e
-      , idMult b_a `tcEqType` idMult b_e
-      , varType b_a `tcEqType` varType b_e
-      , (_, _ : _, _) <- tcSplitSigmaTy res_e
-      = do { b <- newSysLocalId (fsLit "retained") (idMult b_e) (varType b_e)
+    go1 ty_a@(DepFunTy DepFunVisible b_a res_a) ty_e@(DepFunTy DepFunVisible b_e res_e)
+      | isNativeOpaqueValueId b_a, isNativeOpaqueValueId b_e
+      , let mult_sub = idMult b_a `tcEqType` OneTy && not (idMult b_e `tcEqType` OneTy)
+            poly_sub = case ds_depth of
+              DeepSub -> idMult b_a `tcEqType` idMult b_e
+                         && (isSigmaTy res_a || isSigmaTy res_e)
+              TopSub  -> False
+      , mult_sub || poly_sub
+      = do { when (not (varType b_a `tcEqType` varType b_e)) $
+               void (unify (varType b_a) (varType b_e))
+           ; ty_a' <- liftZonkM (zonkTcType ty_a)
+           ; ty_e' <- liftZonkM (zonkTcType ty_e)
+           ; let (b_e_m, b_e_ty) = case coreFullView ty_e' of
+                   DepFunTy DepFunVisible be _ -> (idMult be, varType be)
+                   _ -> (idMult b_e, varType b_e)
+           ; b <- newSysLocalId (fsLit "retained") b_e_m b_e_ty
            ; let open ty = applyTypeToArgs ty [Core.Var b]
            ; wrap <- tcExtendIdEnv [b] $
-               tc_sub_type_ds (tc_fun, Result pos) (Deep DeepSub) unify inst_orig ctxt
-                 (open ty_a) (open ty_e)
-           ; return (mkWpRetainedFun b wrap) }
+               tc_sub_type_ds (tc_fun, Result pos) (Deep ds_depth) unify inst_orig ctxt
+                 (open ty_a') (open ty_e')
+           ; return (if mult_sub then WpRetainedFun True b wrap else mkWpRetainedFun b wrap) }
 
     go1 ty_a@DepFunTy{} ty_e@DepFunTy{}
       | DeepSub <- ds_depth

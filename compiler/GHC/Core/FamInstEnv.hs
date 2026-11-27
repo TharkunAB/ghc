@@ -1639,15 +1639,14 @@ normalise_type ty
     -- binder can have a fresh name. Lift only nominal argument evidence.
     -- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
     go ty@(TermAppTy f arg)
-      | Just (domain, _) <- nativeIndexFunctionTys_maybe f
-      , typeKind arg `eqType` domain
+      | Just _ <- nativeTermAppKind_maybe f arg
       = do { lc <- getLC
            ; role <- getRole
            ; let left = substTy (lcSubstLeft lc) ty
                  right = substTy (lcSubstRight lc) ty
            ; case (left, right) of
                (TermAppTy f' _, TermAppTy g' _)
-                 | f' == g', isNativeIndexFunctionId f'
+                 | f' == g', isNativeIndexFunctionId f' || isNativeDepFunctionId f'
                  , varType f' `eqType` varType g'
                  -> do { Reduction co arg' <- withRole Nominal $ go arg
                        ; return $ downgradeRedn role Nominal $

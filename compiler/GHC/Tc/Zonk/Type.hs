@@ -1365,8 +1365,8 @@ zonkCoFn (WpFun w arg res t1 t2) =
      ; t1' <- noBinders $ zonkTcTypeToTypeX t1
      ; t2' <- noBinders $ zonkTcTypeToTypeX t2
      ; return (WpFun w' arg' res' t1' t2') }
-zonkCoFn (WpRetainedFun b w) = noBinders $
-  runZonkBndrT (WpRetainedFun <$> zonkIdBndrX b <*> zonkCoFn w) return
+zonkCoFn (WpRetainedFun force_eta b w) = noBinders $
+  runZonkBndrT (WpRetainedFun force_eta <$> zonkIdBndrX b <*> zonkCoFn w) return
 zonkCoFn (WpExistsPack schema witness) = noBinders $
   WpExistsPack <$> zonkTcTypeToTypeX schema <*> zonkTcTypeToTypeX witness
 zonkCoFn (WpCast co)   = WpCast <$> noBinders

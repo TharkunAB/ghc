@@ -7690,7 +7690,7 @@ checkValidRoles tc
       = check_ty_roles env role ty'
 
     check_ty_roles env _ ty@(TermAppTy f arg)
-      | isNativeIndexFunctionId f
+      | isNativeIndexFunctionId f || isNativeDepFunctionId f
       , isNativeNamedOpaqueFunctionId f || lookupVarEnv env f == Just Nominal
       = check_ty_roles env Nominal (varType f) >> check_ty_roles env Nominal arg
       | otherwise = pprPanic "check_ty_roles: invalid native call scope" (ppr ty)

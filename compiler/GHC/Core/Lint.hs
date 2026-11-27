@@ -2456,6 +2456,21 @@ lintType (TermVarTy v)
        ; lintVarOcc v }
 
 lintType (TermAppTy f arg)
+  | isNativeDepFunctionId f
+  , DepFunTy DepFunVisible bndr _ <- coreFullView (varType f)
+  = do { in_scope <- getInScope
+       ; lintL (maybe False (\actual -> isNativeDepFunctionId actual
+                                 && varType actual `eqType` varType f
+                                 && idMult actual `eqType` idMult f)
+                            (lookupInScope in_scope f))
+           (text "Invalid dependent runtime call head:" <+> ppr f
+            <+> dcolon <+> ppr (varType f))
+       ; lintVarOcc f
+       ; lintType arg
+       ; lintL (typeKind arg `eqType` varType bndr)
+           (text "Dependent runtime call argument has the wrong kind:" <+> ppr arg
+            $$ text "Expected:" <+> ppr (varType bndr)) }
+  | otherwise
   = do { (domain, _) <- lintNativeIndexFunction f
        ; lintType arg
        ; lintL (typeKind arg `eqType` domain)
@@ -2509,7 +2524,7 @@ lintType ty@(AppTy t1 t2)
   | TyConApp {} <- t1
   = failWithL $ text "TyConApp to the left of AppTy:" <+> ppr ty
   | TermVarTy f <- t1
-  , isNativeIndexFunctionId f
+  , isNativeIndexFunctionId f || isNativeDepFunctionId f
   = failWithL $ text "Non-canonical native function application:" <+> ppr ty
     -- See Note [Native function-value application] in GHC.Core.TyCo.Make.
   | otherwise

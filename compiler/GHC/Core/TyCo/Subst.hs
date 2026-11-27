@@ -66,7 +66,7 @@ import {-# SOURCE #-} GHC.Core ( CoreExpr, retainedArgIndex, normaliseNativeInde
                                 nativeIndexFunctionArgIndex )
 import {-# SOURCE #-} GHC.Core.Subst ( substExpr )
 import {-# SOURCE #-} GHC.Core.Type( isCoercionTy, isNativeIndexFunctionId
-                                 , typeKind, coreFullView )
+                                 , isNativeDepFunctionId, typeKind, coreFullView )
 
 import GHC.Core.TyCo.Make
 import {-# SOURCE #-} GHC.Core.TyCo.Compare ( eqType )
@@ -976,11 +976,14 @@ substNativeIndexUsing subst_ty subst@(Subst in_scope ids _ _) v
           , varType target `eqType` subst_ty subst (varType v) -> target
         Nothing -> lookupInScope in_scope v `orElse` v
         _ -> pprPanic "substTy: unsupported experimental dictionary substitution" (ppr v)
-  | isNativeIndexFunctionId v
+  | isNativeIndexFunctionId v || isNativeDepFunctionId v
   = case lookupVarEnv ids v of
-      Nothing | isNativeIndexFunctionId actual -> check_function (TermVarTy actual)
+      Nothing | isNativeIndexFunctionId actual || isNativeDepFunctionId actual -> check_function (TermVarTy actual)
               | otherwise -> invalid_head (ppr actual)
-      Just rhs | Just index <- nativeIndexFunctionArgIndex rhs -> check_function index
+      Just rhs | Just index <- case nativeIndexFunctionArgIndex rhs of
+                                 Just i  -> Just i
+                                 Nothing -> retainedArgIndex rhs
+               -> check_function index
                | otherwise -> pprPanic "substTy: unsupported native function range"
                                  (ppr v <+> text ":=" <+> ppr rhs)
   | otherwise

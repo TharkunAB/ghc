@@ -29,7 +29,7 @@ import GHC.Core.FVs (orphNamesOfExprs)
 import GHC.Core.Class (classOpItems, classTyCon)
 import GHC.Core.Predicate (getClassPredTys_maybe, mkClassPred)
 import GHC.Core.Type (coreFullView, isNativeRetainedBinderType, isNativeIndexFunctionId
-                     , isNativeNamedOpaqueFunctionId
+                     , isNativeDepFunctionId, isNativeNamedOpaqueFunctionId
                      , isNativeClassDictionaryId, isNativeOpaqueValueId
                      , isNativeRetainedBinder, isNativeIndexDomainConversion
                      , mkForAllTys, mkInvisFunTys, mkTyVarTys, splitForAllTyCoVars, splitFunTy_maybe
@@ -575,7 +575,7 @@ scanRetainedIndex v = NativeScan $ \s ->
 
 -- | Check the head and its annotation without examining the function body.
 scanCallHead :: Id -> NativeScan
-scanCallHead f = unsupportedShape (not (isNativeIndexFunctionId f)) <> scanVarKind f
+scanCallHead f = unsupportedShape (not (isNativeIndexFunctionId f || isNativeDepFunctionId f)) <> scanVarKind f
 
 {- Note [Nominal domains in retained Gentle]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

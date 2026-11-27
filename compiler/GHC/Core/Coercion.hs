@@ -746,7 +746,7 @@ mkAppCo co arg
   = mkReflCo r (mkAppTy ty1 ty2)
 
   | Just (TermVarTy f, r) <- isReflCo_maybe co
-  , isNativeIndexFunctionId f
+  , isNativeIndexFunctionId f || isNativeDepFunctionId f
   = downgradeRole r Nominal (mkTermAppCo f arg)
 
   | Just (ty1, r) <- isReflCo_maybe co

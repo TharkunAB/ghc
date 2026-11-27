@@ -228,7 +228,7 @@ hsWrapperType wrap ty = prTypeType $ go wrap (ty,[])
           exp_res = hsWrapperType w2 act_res
           mult = subMultCoRKind mult_co
       in mkFunctionType unmatchableDataConTy mult exp_arg exp_res
-    go (WpRetainedFun b w) = liftPRType $ \t ->
+    go (WpRetainedFun _ b w) = liftPRType $ \t ->
       mkDepFunTy b (hsWrapperType w (applyTypeToArgs t [Var b]))
     go (WpExistsPack schema _) = liftPRType $ \_ -> schema
     go (WpCast co)        = liftPRType $ \_ -> coercionRKind co

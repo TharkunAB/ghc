@@ -75,7 +75,7 @@ import GHC.Unit.Module.Deps
 
 import Control.Monad
 import Control.Monad.Trans.State
-import Data.List (sortBy, sort, sortOn)
+import Data.List (sortBy, sort, sortOn, stripPrefix)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -1958,7 +1958,12 @@ mkHashFun hsc_env eps name
                             -- implementation.
                           $ loadInterface (text "lookupVers2") mod ImportBySystem
         return $ snd (mi_hash_fn iface occ `orElse`
-                  pprPanic "lookupVers1" (ppr mod <+> ppr occ))
+                  (do { guard (isTcClsNameSpace (occNameSpace occ))
+                      ; term_str <- stripPrefix "U:" (occNameString occ)
+                      ; guard (not (null term_str))
+                      ; mi_hash_fn iface (mkVarOcc term_str) }
+                   `orElse`
+                  pprPanic "lookupVers1" (ppr mod <+> ppr occ)))
 
 {- Note [Fingerprinting complete matches]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

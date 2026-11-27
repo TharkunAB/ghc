@@ -8,7 +8,7 @@ module GHC.Core.TyCo.Compare (
 
     -- * Type equality
     eqType, eqTypeIgnoringMultiplicity, eqTypeX, eqTypes,
-    eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures,
+    eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures, eqScopedClosureTyCons,
 
     pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck,
     tcEqTyConApps, tcEqTyConAppArgs,
@@ -29,7 +29,7 @@ import GHC.Prelude
 
 import GHC.Core.Type( typeKind, coreView, tcSplitAppTyNoView_maybe, splitAppTyNoView_maybe
                     , isLevityTy, isRuntimeRepTy, isMultiplicityTy
-                    , isUnsaturatedUserFamily, splitTyConApp_maybe )
+                    , isUnsaturatedUserFamily, splitTyConApp_maybe, getTyVar_maybe )
 import GHC.Core.Coercion.Axiom
 
 import GHC.Core.TyCo.Rep
@@ -333,10 +333,23 @@ eqScopedLambdaClosures :: Type -> Type -> Bool
 eqScopedLambdaClosures lhs rhs = eqScopedClosures lambdaRoot lhs rhs
                                && typeKind lhs `eqType` typeKind rhs
   where
-    lambdaRoot tc _
+    lambdaRoot tc args
       | Just (owner, False) <- closedFamilyScope_maybe tc
       , owner == tyConName tc = Just owner
+      | Just (owner, True) <- closedFamilyScope_maybe tc
+      , length args + 1 == tyConArity tc = Just owner
       | otherwise = Nothing
+
+-- | Check alpha-equivalence of two unsaturated scoped closure 'TyCon's.
+eqScopedClosureTyCons :: TyCon -> TyCon -> Bool
+eqScopedClosureTyCons tc1 tc2
+  | tc1 /= tc2
+  , Just (owner1, s1) <- closedFamilyScope_maybe tc1
+  , Just (owner2, s2) <- closedFamilyScope_maybe tc2
+  , s1 == s2
+  , tyConInjectivityInfo tc1 == tyConInjectivityInfo tc2
+  = evalState (sameScopedTyCons (owner1, owner2) [] tc1 tc2) Set.empty
+  | otherwise = False
 
 eqScopedClosures :: (TyCon -> [Type] -> Maybe Name) -> Type -> Type -> Bool
 eqScopedClosures scopeRoot lhs rhs
@@ -347,8 +360,86 @@ eqScopedClosures scopeRoot lhs rhs
   , Just owner2 <- scopeRoot tc2 as2
   , isUnsaturatedUserFamily tc1 as1
   , isUnsaturatedUserFamily tc2 as2
-  = evalState (eqScopedType (owner1, owner2) [] Nothing lhs rhs) Set.empty
+  = if equalLength as1 as2
+      then evalState (eqScopedType (owner1, owner2) [] Nothing lhs rhs) Set.empty
+      else eqInstantiatedScopedClosures (owner1, owner2) tc1 as1 tc2 as2
   | otherwise = False
+
+-- | Compare two partially applied scoped closures with different numbers of
+-- captured arguments but the same remaining arity by substituting each
+-- closure's applied capture prefix into its single branch before alpha-comparing
+-- the remaining lambda binders and RHS.
+eqInstantiatedScopedClosures :: (Name, Name) -> TyCon -> [Type] -> TyCon -> [Type] -> Bool
+eqInstantiatedScopedClosures owners tc1 as1 tc2 as2
+  | let rem_arity = tyConArity tc1 - length as1
+  , rem_arity >= 1
+  , rem_arity == tyConArity tc2 - length as2
+  , Just ax1 <- closedFamilyTyConCoAxiom_maybe tc1
+  , Just ax2 <- closedFamilyTyConCoAxiom_maybe tc2
+  , coAxiomRole ax1 == Nominal, coAxiomRole ax2 == Nominal
+  , [b1] <- fromBranches (coAxiomBranches ax1)
+  , [b2] <- fromBranches (coAxiomBranches ax2)
+  , null (cab_cvs b1), null (cab_cvs b2)
+  , null (cab_incomps b1), null (cab_incomps b2)
+  , null (cab_overlaps b1), null (cab_overlaps b2)
+  , Just lhs_tvs1 <- traverse getTyVar_maybe (cab_lhs b1)
+  , Just lhs_tvs2 <- traverse getTyVar_maybe (cab_lhs b2)
+  , lhs_tvs1 == cab_tvs b1, lhs_tvs2 == cab_tvs b2
+  = let (cap1, rem1) = splitAt (length as1) (cab_tvs b1)
+        (cap2, rem2) = splitAt (length as2) (cab_tvs b2)
+        sub1 = zipVarEnv cap1 as1
+        sub2 = zipVarEnv cap2 as2
+        in_scope = mkInScopeSet (tyCoVarsOfTypes (as1 ++ as2)
+                                 `unionVarSet` mkVarSet (rem1 ++ rem2))
+        env0 = mkRnEnv2 in_scope
+        step (env, acc) (tv1, tv2) =
+          let k1 = subst_cap sub1 (tyVarKind tv1)
+              k2 = subst_cap sub2 (tyVarKind tv2)
+          in (rnBndr2 env tv1 tv2, (env, k1, k2) : acc)
+        (env_final, rev_k_checks) = foldl' step (env0, []) (zip rem1 rem2)
+        rhs1 = subst_cap sub1 (cab_rhs b1)
+        rhs2 = subst_cap sub2 (cab_rhs b2)
+        check_all = foldr (\ (e, k1, k2) rest ->
+                            do { ok <- eqScopedType owners [(tc1, tc2)] (Just e) k1 k2
+                               ; if ok then rest else pure False })
+                          (eqScopedType owners [(tc1, tc2)] (Just env_final) rhs1 rhs2)
+                          (reverse rev_k_checks)
+    in evalState check_all Set.empty
+  | otherwise = False
+  where
+    app_ty (TyConApp tc tys) a = TyConApp tc (tys ++ [a])
+    app_ty f                 a = AppTy f a
+
+    subst_bndr env v = setVarType v (subst_cap env (varType v))
+
+    subst_cap env ty
+      | isEmptyVarEnv env = ty
+      | otherwise = case ty of
+          TyVarTy tv -> fromMaybe ty (lookupVarEnv env tv)
+          AppTy f a  -> app_ty (subst_cap env f) (subst_cap env a)
+          TyConApp tc tys -> TyConApp tc (map (subst_cap env) tys)
+          FunTy af ma w a r ->
+            FunTy af (subst_cap env ma) (subst_cap env w) (subst_cap env a) (subst_cap env r)
+          ForAllTy ma (Bndr tv vis) r ->
+            let env' = delVarEnv env tv
+            in ForAllTy (subst_cap env ma) (Bndr (subst_bndr env tv) vis) (subst_cap env' r)
+          ExistsTy fl tv r ->
+            let env' = delVarEnv env tv
+            in ExistsTy fl (subst_bndr env tv) (subst_cap env' r)
+          DepFunTy vis v r ->
+            let v' = setIdMult (subst_bndr env v) (subst_cap env (idMult v))
+            in DepFunTy vis v' (subst_cap env r)
+          DepDictTy v r ->
+            DepDictTy (subst_bndr env v) (subst_cap env r)
+          TermVarTy v ->
+            TermVarTy (setIdMult (subst_bndr env v) (subst_cap env (idMult v)))
+          TermAppTy f a ->
+            TermAppTy (setIdMult (subst_bndr env f) (subst_cap env (idMult f))) (subst_cap env a)
+          ClassAppTy f i d x k ->
+            ClassAppTy f (subst_cap env i) (subst_cap env d) (subst_cap env x) (subst_cap env k)
+          CastTy t co -> CastTy (subst_cap env t) co
+          LitTy{} -> ty
+          CoercionTy{} -> ty
 
 eqScopedType :: (Name, Name) -> [(TyCon, TyCon)] -> Maybe RnEnv2 -> Type -> Type
              -> State (Set (Word64, Word64)) Bool
@@ -427,8 +518,6 @@ sameScopedTyCons owners@(owner1, owner2) seen tc1 tc2
   | any (\(a, b) -> a == tc1 || b == tc2) seen = pure False
   | Just (scope1, _) <- closedFamilyScope_maybe tc1, scope1 == owner1
   , Just (scope2, _) <- closedFamilyScope_maybe tc2, scope2 == owner2
-  , NotInjective <- tyConInjectivityInfo tc1
-  , NotInjective <- tyConInjectivityInfo tc2
   , Just ax1 <- closedFamilyTyConCoAxiom_maybe tc1
   , Just ax2 <- closedFamilyTyConCoAxiom_maybe tc2
   , coAxiomRole ax1 == Nominal, coAxiomRole ax2 == Nominal

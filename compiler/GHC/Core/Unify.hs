@@ -32,7 +32,9 @@ import GHC.Core.TyCon
 import GHC.Core.Predicate( CanEqLHS(..), canEqLHS_maybe )
 import GHC.Core.TyCon.Env
 import GHC.Core.TyCo.Rep
-import GHC.Core.TyCo.Compare ( eqType, eqTypeX, tcEqType, tcEqTyConAppArgs )
+import GHC.Core.TyCo.Compare ( eqType, eqTypeX, tcEqType, tcEqTyConAppArgs
+                             , eqScopedSigmaClosures, eqScopedLambdaClosures
+                             , eqScopedClosureTyCons )
 import GHC.Core.TyCo.FVs ( tyCoVarsOfTypeList )
 import GHC.Core.TyCo.Subst   ( mkTvSubst, deepSubstTy )
 import GHC.Core.Map.Type
@@ -2182,6 +2184,17 @@ unify_opaque_app env ty1 ty2
   | not (anyFreeVarsOfTypes isTyCoVar [ty1, ty2])
   , eqTypeX (um_rn_env env) ty1 ty2
   = return ()
+  | not (anyFreeVarsOfTypes (const True) [ty1, ty2])
+  , eqScopedSigmaClosures ty1 ty2 || eqScopedLambdaClosures ty1 ty2
+  = return ()
+  | Just (tc1, as1) <- splitTyConApp_maybe ty1
+  , Just (tc2, as2) <- splitTyConApp_maybe ty2
+  , equalLength as1 as2
+  , isUnsaturatedUserFamily tc1 as1
+  , eqScopedClosureTyCons tc1 tc2
+  , Injective inj <- tyConInjectivityInfo tc1
+  , and (take (length as1) inj)
+  = unify_tys env as1 as2
   | otherwise
   = maybeApart MARTypeFamily
 

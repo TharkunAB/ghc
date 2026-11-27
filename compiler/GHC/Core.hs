@@ -3145,13 +3145,13 @@ nativeIndexExprWith allow_conversions extra = go emptyVarEnv
              then Just (Cast body' (SubCo delta'), CastTy index delta')
              else Nothing }
       | allow_conversions, App (Lam binder body) arg <- expr
-      , isNativeIndexId binder
+      , isNativeOpaqueValueId binder
       = do { arg_result@(arg', arg_index) <- go env arg
            ; if native_atom arg'
                 && sameNativeIndexDomain (varType binder) (typeKind arg_index)
              then do { body_result@(_, body_index)
                            <- go (extendVarEnv env binder arg_result) body
-                       ; if isNativeIndexType (typeKind body_index)
+                       ; if isNativeOpaqueValueType (typeKind body_index)
                          then Just body_result
                          else Nothing }
              else Nothing }

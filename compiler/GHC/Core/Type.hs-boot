@@ -23,7 +23,9 @@ typeTypeOrConstraint    :: HasDebugCallStack => Type -> TypeOrConstraint
 
 coreFullView :: Type -> Type
 isNativeIndexFunctionId :: Id -> Bool
+isNativeDepFunctionId :: Id -> Bool
 nativeIndexFunctionTys_maybe :: Id -> Maybe (Type, Type)
+nativeTermAppKind_maybe :: Id -> Type -> Maybe (Type, Type)
 
 -- | Check the consumed arrow kind for proven nominal matchability.
 isMatchableFunTy :: Type -> Bool

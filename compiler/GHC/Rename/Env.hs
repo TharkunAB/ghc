@@ -99,6 +99,9 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.Set
 import GHC.Types.TyThing ( tyThingGREInfo )
+import GHC.Types.Id ( sourceTableId_maybe )
+import GHC.Types.Id.Info ( IdDetails(SourceTableId) )
+import GHC.Types.Var ( idDetails )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name
 import GHC.Types.Name.Set
@@ -108,7 +111,7 @@ import GHC.Types.Hint
 import GHC.Types.CompleteMatch
 import GHC.Types.PkgQual
 import GHC.Types.GREInfo
-import GHC.Types.Basic  ( TupleSort(..), tupleSortBoxity )
+import GHC.Types.Basic  ( SourceTableOrigin(FinalCoreSourceTable), TupleSort(..), tupleSortBoxity )
 
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Lexeme (isLexVar, isLexVarSym)
@@ -1272,16 +1275,22 @@ lookupTypeOcc position rdr_name
         [(gre, Nothing)]
           | Just (open_operands, allow_local_closed) <- ordinaryPosition position
           , isVarOcc (greOccName gre)
-          -> do { this_mod <- tcg_semantic_mod <$> getGblEnv
+          -> do { gbl_env <- getGblEnv
+                ; let this_mod = tcg_semantic_mod gbl_env
                 ; level <- getThLevel
                 ; explicit_levels <- xoptM LangExt.ExplicitLevelImports
-                ; demands <- tcg_local_open_demands <$> getGblEnv
-                ; let name = greName gre
-                ; imported <- if isImportedGRE gre && not (nameIsLocalOrFrom this_mod name)
+                ; let demands = tcg_local_open_demands gbl_env
+                      name = greName gre
+                      from_prev_interactive =
+                        maybe (isInteractiveModule this_mod && name `elemNameEnv` tcg_type_env gbl_env)
+                              (\m -> isInteractiveModule m && m /= this_mod)
+                              (nameModule_maybe name)
+                ; imported <- if (isImportedGRE gre || from_prev_interactive)
+                                 && (from_prev_interactive || not (nameIsLocalOrFrom this_mod name))
                               then imported_head open_operands gre
                               else pure False
                 ; if imported
-                    then do { unless (any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)) $
+                    then do { unless (from_prev_interactive || any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)) $
                                 if isQual term_rdr
                                   then failWithTc (TcRnClosedTypeEval name
                                     "A SOURCE import does not provide executable code.")
@@ -1371,11 +1380,22 @@ lookupSourceTables legacy_identity (gbl, lcl) term_rdr
               let here = isJust (lookupGRE_Name gbl name) ||
                          name `elemNameEnv` tcg_type_env env
               return (if here then Just name else Nothing)
+            else if isInteractiveModule mod
+              then do
+                name <- lookupOrig mod occ
+                thing <- tcLookupGlobal term
+                pure $ case thing of
+                  AnId v | Just tc <- sourceTableId_maybe v, tyConName tc == name
+                         , not (legacy_identity && isFinalCoreIdentity v)
+                         , isNothing (indexedProjectionSource v)
+                         -> Just name
+                  _ -> Nothing
             else do
               iface <- loadInterfaceForName (text "finite source function") term
               name <- lookupOrig mod occ
               let present occurrence = isJust (mi_hash_fn iface occurrence)
                   term_occ = nameOccName term
+                  uninterp_occ = mkTcOcc ("U:" ++ occNameString term_occ)
               -- Keep the ordinary function available for executable calls.
               -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
               if present occ && not (present (mkSourceFstOcc term_occ) || present (mkSourceSndOcc term_occ))
@@ -1384,6 +1404,8 @@ lookupSourceTables legacy_identity (gbl, lcl) term_rdr
                   pure $ case thing of
                     AnId v | legacy_identity && isFinalCoreIdentity v -> Nothing
                            | isJust (indexedProjectionSource v) -> Nothing
+                           | present uninterp_occ
+                           , SourceTableId _ _ FinalCoreSourceTable <- idDetails v -> Nothing
                     _ -> Just name
                 else if term_occ == composeIdOcc && tcg_semantic_mod env /= gHC_INTERNAL_BASE
                   then do

@@ -216,6 +216,7 @@ import GHC.Types.Var
 import GHC.Types.Var.Env ( VarEnv, lookupVarEnv )
 import GHC.Types.Var.Set
 import GHC.Core.Coercion
+import GHC.Core.Coercion.Axiom ( coAxiomBranches, coAxBranchRHS, coAxBranchTyVars, fromBranches )
 import GHC.Core.Type as Type
 import GHC.Core.Predicate
 import GHC.Core.TyCon
@@ -1051,7 +1052,16 @@ tcTyFamInstsAndVisX = go
                                          ++ go True kind
     go is_invis_arg (TyConApp tc tys)
       | isTypeFamilyTyCon tc
-      = [(is_invis_arg, tc, take (tyConArity tc) tys)]
+      = case closedFamilyScope_maybe tc of
+          Just _
+            | isUnsaturatedUserFamily tc tys
+            , Just ax <- closedFamilyTyConCoAxiom_maybe tc
+            , [branch] <- fromBranches (coAxiomBranches ax) ->
+                let prefix_tvs = take (length tys) (coAxBranchTyVars branch)
+                    rhs_inst   = substTyWith prefix_tvs tys (coAxBranchRHS branch)
+                in tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys
+                   ++ go is_invis_arg rhs_inst
+          _ -> [(is_invis_arg, tc, take (tyConArity tc) tys)]
       | otherwise
       = tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys
     go _            (LitTy {})         = []

@@ -78,7 +78,7 @@ import GHC.Runtime.Context (extendInteractiveContextWithIds)
 import GHC.Runtime.Interpreter (Interp, evalString)
 import GHC.Types.SafeHaskell (SafeHaskellMode(..), getSafeMode)
 import GHC.Unit.Home (isHomeModule)
-import GHC.Unit.Module (Module, moduleUnit)
+import GHC.Unit.Module (Module, isInteractiveModule, moduleUnit)
 import GHC.Unit.Module.Deps (dep_trusted_pkgs, imp_mods)
 import GHC.Unit.Module.Imported (imv_is_safe, importedByUser)
 import GHC.Unit.Module.ModIface (ModIface, mi_deps, mi_hsc_src, mi_trust, mi_trust_pkg)
@@ -1438,6 +1438,7 @@ checkClosedTypeEvalStage hsc_env name = do
   dflags <- getDynFlags
   gbl_env <- getGblEnv
   if nameIsLocalOrFrom (tcg_semantic_mod gbl_env) name
+     || maybe False isInteractiveModule (nameModule_maybe name)
     then do
       boot <- tcIsHsBootOrSig
       when boot $
@@ -1493,9 +1494,16 @@ tcHasClosedCallExecutable name = do
       | not boot, not explicit, not (safeLanguageOn dflags) ->
           if mod == tcg_semantic_mod gbl_env
             then pure (name `elemNameEnv` tcg_local_open_defs gbl_env)
-            else do
-              loc <- getSrcSpanM
-              liftIO $ executableDependenciesAvailable interp env loc mod
+            else if isInteractiveModule mod
+              then pure True
+              else do
+                loc <- getSrcSpanM
+                liftIO $ executableDependenciesAvailable interp env loc mod
+    (Nothing, Just _, Comp)
+      | not boot, not explicit, not (safeLanguageOn dflags)
+      , isInteractiveModule (tcg_semantic_mod gbl_env)
+      , name `elemNameEnv` tcg_type_env gbl_env
+      -> pure True
     _ -> pure False
 
 -- | Check policy at the location where the call occurs.

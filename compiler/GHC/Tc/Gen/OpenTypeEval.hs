@@ -75,8 +75,8 @@ import GHC.Core.OpenWhnf
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.ModInfo (hm_iface)
 import GHC.Unit.Module (GenWithIsBoot(..), InstalledModule, IsBootInterface(..), Module,
-                        getModuleInstantiation, isHoleModule, lookupInstalledModuleEnv,
-                        moduleUnit, toUnitId)
+                        getModuleInstantiation, isHoleModule, isInteractiveModule,
+                        lookupInstalledModuleEnv, moduleUnit, toUnitId)
 import GHC.Unit.Module.Deps (imp_boot_mods)
 import GHC.Unit.Module.ModIface (ModIface, mi_decls, mi_hsc_src, mi_semantic_module)
 import GHC.Utils.Misc (equalLength)
@@ -696,6 +696,7 @@ readOpenIdInfo identifier = do
     Just mod
       | mod /= tcg_semantic_mod tcgEnv
       , not (isHoleModule mod)
+      , not (isInteractiveModule mod)
       , (installed, Nothing) <- getModuleInstantiation mod
       , not (isBootImport tcgEnv installed) -> do
           readResult <- liftIO (openDefinitionIface hscEnv mod installed)

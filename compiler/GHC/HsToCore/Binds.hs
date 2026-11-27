@@ -1739,7 +1739,7 @@ ds_hs_wrapper hs_wrap
                                    let app f a = mkCoreApp f a
                                        arg     = w1 (Var x)
                                    in k (\e -> (Lam x (w2 (app e arg)))) }
-    go (WpRetainedFun b w) k = go w $ \body ->
+    go (WpRetainedFun _ b w) k = go w $ \body ->
       k (\e -> Lam b (body (mkCoreApp e (Var b))))
     go (WpExistsPack schema witness) k =
       k (\e -> Pack schema witness e)

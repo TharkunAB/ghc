@@ -693,6 +693,20 @@ can_eq_nc ces _ _ ev eq_rel lhs _ rhs _
   = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
        ; stopWith ev "Checked scoped type lambda" }
 
+-- Decompose unsaturated injective scoped closure families at Nominal role.
+can_eq_nc ces _ _ ev NomEq ty1 _ ty2 _
+  | bothRewritten ces, isWanted ev
+  , Just (tc1, tys1) <- splitTyConApp_maybe ty1
+  , Just (tc2, tys2) <- splitTyConApp_maybe ty2
+  , tc1 == tc2
+  , isJust (closedFamilyScope_maybe tc1)
+  , equalLength tys1 tys2
+  , not (null tys1)
+  , isUnsaturatedUserFamily tc1 tys1
+  , Injective inj <- tyConInjectivityInfo tc1
+  , and (take (length tys1) inj)
+  = canDecomposableTyConAppOK ev NomEq tc1 (ty1, tys1) (ty2, tys2)
+
 -- Try spine-based Miller pattern unification for higher-order unmatchable
 -- motive variables (?m s_1 .. s_k ~ rhs) before AppTy or TyVarLHS handling.
 -- See Note [Miller pattern unification for higher-order motives].
@@ -877,7 +891,7 @@ can_eq_nc_post_miller ces _ _ ev eq_rel lhs _ rhs _
 -- See Note [Scoped retained sum codomains] in GHC.Core.TyCo.Compare.
 can_eq_nc_post_miller ces _ _ ev eq_rel lhs _ rhs _
   | bothRewritten ces, isWanted ev
-  , Just co <- proveScopedSigmaClosure lhs rhs
+  , Just co <- proveScopedSigmaClosure lhs rhs <|> proveScopedLambdaClosure lhs rhs
   = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
        ; stopWith ev "Checked scoped sum codomain" }
 
@@ -1475,6 +1489,14 @@ tryMillerPatternUnify ev ty1 ty2 = do
       , Just (fun, arg) <- tcSplitAppTyNoView_maybe ty
       = do { (hd, args) <- peel_trailing_apps (n - 1) fun
            ; Just (hd, args ++ [arg]) }
+      | n > 0
+      , TyConApp tc tc_args <- ty
+      , not (null tc_args)
+      , let init_args = init tc_args
+            last_arg  = last tc_args
+      , not (tyConMustBeSaturated tc) || isUnsaturatedUserFamily tc init_args
+      = do { (hd, args) <- peel_trailing_apps (n - 1) (mkTyConApp tc init_args)
+           ; Just (hd, args ++ [last_arg]) }
       | otherwise = Nothing
 
     kinds_compatible k1 k2
@@ -3972,6 +3994,7 @@ tryRetainedFamilyEquality ev lhs rhs
       | isJust (closedFamilyTyConCoAxiom_maybe tc)
       , not (saturatedSourceHead tc args)
       , lengthIs args (tyConArity tc)
+        || (isJust (closedFamilyScope_maybe tc) && isUnsaturatedUserFamily tc args)
       , any isOpaqueTermIndex args
       = Just (tc, args)
     family _ = Nothing
@@ -4014,6 +4037,8 @@ tryRetainedFamilyEquality ev lhs rhs
           results <- zipWithM (endpointProof irreds) as1 as2
           let (cos, uses) = unzip results
           pure (mkTyConAppCo Nominal tc1 cos, concat uses)
+      | Just co <- proveScopedSigmaClosure a b <|> proveScopedLambdaClosure a b
+      = Just (co, [])
       | otherwise = Nothing
 
     synonymStep (TyConApp tc _)
@@ -4026,11 +4051,18 @@ tryRetainedFamilyEquality ev lhs rhs
             seen' = unionVarSets (seen : refined)
       , any (not . isReflCo) proofs
       , wellKinded (tyConKind tc) targets
-      = do { (Reduction co_red ty', tables, uses) <-
-               rewriteFamilyAxiomsWithSourceProofs (ctEvLoc ev) (mkTyConApp tc targets)
-           ; let step_co = mkTyConAppCo Nominal tc proofs `mkTransCo` co_red
-           ; (rest_redn, tables', uses') <- specialize seen' irreds ty' (family ty')
-           ; pure (step_co `mkTransRedn` rest_redn, tables ++ tables', uses ++ uses') }
+      = if lengthIs targets (tyConArity tc)
+          then do
+            { (Reduction co_red ty', tables, uses) <-
+                rewriteFamilyAxiomsWithSourceProofs (ctEvLoc ev) (mkTyConApp tc targets)
+            ; let step_co = mkTyConAppCo Nominal tc proofs `mkTransCo` co_red
+            ; (rest_redn, tables', uses') <- specialize seen' irreds ty' (family ty')
+            ; pure (step_co `mkTransRedn` rest_redn, tables ++ tables', uses ++ uses') }
+          else do
+            { let ty'     = mkTyConApp tc targets
+                  step_co = mkTyConAppCo Nominal tc proofs
+            ; (rest_redn, tables', uses') <- specialize seen' irreds ty' (family ty')
+            ; pure (step_co `mkTransRedn` rest_redn, tables', uses') }
     specialize _ _ ty _ = pure (mkReflRedn Nominal ty, [], [])
 
     refine seen irreds a@(TermVarTy root)

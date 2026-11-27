@@ -309,9 +309,9 @@ data HsWrapper
   -- so that the identity 'HsWrapper' is always exactly 'WpHole'.
   | WpLet TcEvBinds
 
-  -- | @WpRetainedFun x w[e] = \x. w[e x]@. The binder scopes over @w@.
-  -- Both function types have the same visible retained domain.
-  | WpRetainedFun Id HsWrapper
+  -- | @WpRetainedFun force_eta x w[e] = \x. w[e x]@. The binder scopes over @w@.
+  -- When @force_eta@ is @True@, multiplicity changes so the lambda must be kept.
+  | WpRetainedFun Bool Id HsWrapper
 
   -- | @WpExistsPack schema witness[e] = Pack schema witness e@.
   -- Packs @e :: body[binder := witness]@ into @schema = ExistsTy ImplicitExists binder body@.
@@ -438,7 +438,7 @@ mkWpFun w1 w2 (wp_mult, t1) t2
 mkWpRetainedFun :: Id -> HsWrapper -> HsWrapper
 mkWpRetainedFun _ WpHole = WpHole
 mkWpRetainedFun b (WpCast co) = mkWpCastR (mkDepFunCo b co)
-mkWpRetainedFun b wrap = WpRetainedFun b wrap
+mkWpRetainedFun b wrap = WpRetainedFun False b wrap
 
 -- | Pack a payload into an implicit existential schema at a chosen witness.
 mkWpExistsPack :: TcType -> TcType -> HsWrapper
@@ -608,7 +608,9 @@ optSubTypeHsWrapper wrap
     opt1 w@(WpEvApp {})         ws = w : ws
     opt1 (WpFun mult_co arg_wrap res_wrap arg_ty res_ty) ws
       = opt_fun mult_co arg_wrap res_wrap arg_ty res_ty ws
-    opt1 (WpRetainedFun b w) ws
+    opt1 (WpRetainedFun True b w) ws
+      = WpRetainedFun True b (opt w) : ws
+    opt1 (WpRetainedFun False b w) ws
       = case mkWpRetainedFun b (opt w) of
           WpHole    -> ws
           WpCast co -> opt_co co ws
@@ -1481,7 +1483,7 @@ pprHsWrapper wrap pp_thing_inside
     help it (WpFun w arg_wrap res_wrap t1 _t2)
       = add_parens $ text "\\(x" <> dcolon <> brackets (ppr $ subMultCoRKind w) <> ppr t1 <> text ")." <+>
                      help (\_ -> it True <+> help (\_ -> text "x") arg_wrap True) res_wrap False
-    help it (WpRetainedFun b w)
+    help it (WpRetainedFun _ b w)
       = add_parens $ text "\\" <> pprLamBndr b <> dot <+>
                      help (\_ -> it True <+> ppr b) w False
     help it (WpExistsPack schema witness)
