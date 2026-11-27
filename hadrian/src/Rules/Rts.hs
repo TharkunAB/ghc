@@ -19,6 +19,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
                 , "rts/rust/gc_budget.rs"
+                , "rts/rust/prim_float.rs"
                 ]
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" []

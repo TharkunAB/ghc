@@ -1,15 +1,23 @@
 
 module Main(main) where
 
-import Data.Word (Word32)
-import GHC.Float (castWord32ToFloat)
+import Data.Word (Word32, Word64)
+import GHC.Float (castWord32ToFloat, castWord64ToDouble)
 
 -- | Decode runtime bits. Opacity keeps the Float primop in the test.
 {-# OPAQUE decodeBits #-}
 decodeBits :: Word32 -> (Integer, Int)
 decodeBits bits = decodeFloat (castWord32ToFloat bits)
 
+-- | Decode Double bit patterns through the runtime primop.
+{-# OPAQUE decodeDoubleBits #-}
+decodeDoubleBits :: Word64 -> (Integer, Int)
+decodeDoubleBits bits = decodeFloat (castWord64ToDouble bits)
+
 main = do
+    mapM_
+        (print . decodeDoubleBits)
+        [0x8000000000000000, 0x0000000000000001, 0x800fffffffffffff, 0x0010000000000000, 0x7fefffffffffffff]
     mapM_ (print . decodeBits)
         [0x00000000, 0x80000000, 0x00000001, 0x807fffff, 0x00800000, 0x7f7fffff]
     sequence_ [ f x y | x <- [0,

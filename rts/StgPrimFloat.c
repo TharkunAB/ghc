@@ -133,6 +133,22 @@ __word_encodeFloat (W_ j, I_ e)
   return r;
 }
 
+#if defined(USE_RUST_RTS)
+RTS_PRIVATE StgInt ghc_rust_decode_double_int64(StgInt64 *mantissa, StgDouble dbl);
+RTS_PRIVATE void ghc_rust_decode_double_2int(I_ *sign, W_ *high, W_ *low, I_ *exp, StgDouble dbl);
+
+StgInt
+__decodeDouble_Int64(StgInt64 *mantissa, StgDouble dbl)
+{
+    return ghc_rust_decode_double_int64(mantissa, dbl);
+}
+
+void
+__decodeDouble_2Int(I_ *sign, W_ *high, W_ *low, I_ *exp, StgDouble dbl)
+{
+    ghc_rust_decode_double_2int(sign, high, low, exp, dbl);
+}
+#else
 /* This only supports IEEE floating point */
 
 void
@@ -206,6 +222,8 @@ __decodeDouble_Int64 (StgInt64 *const mantissa, const StgDouble dbl)
     return exp;
 #endif
 }
+
+#endif
 
 /* Convenient union types for checking the layout of IEEE 754 types -
    based on defs in GNU libc <ieee754.h>
