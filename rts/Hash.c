@@ -53,6 +53,22 @@ struct hashtable {
     HashListChunk *chunks;      /* list of HashListChunks so we can later free them */
 };
 
+#if defined(USE_RUST_RTS)
+/* The Rust walker reads only the initialized buckets and their linked entries. */
+GHC_STATIC_ASSERT(HSEGSIZE == 1024, "Rust hash segment size");
+GHC_STATIC_ASSERT(sizeof(HashList) == 3 * sizeof(StgWord) &&
+                  _Alignof(HashList) == _Alignof(StgWord) &&
+                  offsetof(HashList, key) == 0 &&
+                  offsetof(HashList, data) == sizeof(StgWord) &&
+                  offsetof(HashList, next) == 2 * sizeof(StgWord),
+                  "Rust hash entry layout");
+
+RTS_PRIVATE int ghc_rust_hash_keys(HashList ***dir, size_t buckets, StgWord *keys, int capacity);
+RTS_PRIVATE void ghc_rust_hash_map(HashList ***dir, size_t buckets, void *data, MapHashFn fn);
+RTS_PRIVATE void ghc_rust_hash_map_keys(HashList ***dir, size_t buckets, void *data, MapHashFnKeys fn);
+RTS_PRIVATE void ghc_rust_hash_iter(HashList ***dir, size_t buckets, void *data, IterHashFn fn);
+#endif
+
 /* Create an identical structure, but is distinct on a type level,
  * for string hash table. Since it's a direct embedding of
  * a hashtable and not a reference, there shouldn't be
@@ -245,6 +261,9 @@ lookupStrHashTable(const StrHashTable* table, const char* key)
 // If the table is modified concurrently, the function behavior is undefined.
 //
 int keysHashTable(HashTable *table, StgWord keys[], int szKeys) {
+#if defined(USE_RUST_RTS)
+    return ghc_rust_hash_keys(table->dir, table->bcount, keys, szKeys);
+#else
     int segment, index;
     int k = 0;
     HashList *hl;
@@ -268,6 +287,7 @@ int keysHashTable(HashTable *table, StgWord keys[], int szKeys) {
         index = HSEGSIZE - 1;
     }
     return k;
+#endif
 }
 
 /* -----------------------------------------------------------------------------
@@ -468,6 +488,9 @@ freeHashTable(HashTable *table, void (*freeDataFun)(void *) )
 void
 mapHashTable(HashTable *table, void *data, MapHashFn fn)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_map(table->dir, table->bcount, data, fn);
+#else
     /* The last bucket with something in it is table->max + table->split - 1 */
     long segment = (table->max + table->split - 1) / HSEGSIZE;
     long index = (table->max + table->split - 1) % HSEGSIZE;
@@ -482,11 +505,15 @@ mapHashTable(HashTable *table, void *data, MapHashFn fn)
         segment--;
         index = HSEGSIZE - 1;
     }
+#endif
 }
 
 void
 mapHashTableKeys(HashTable *table, void *data, MapHashFnKeys fn)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_map_keys(table->dir, table->bcount, data, fn);
+#else
     /* The last bucket with something in it is table->max + table->split - 1 */
     long segment = (table->max + table->split - 1) / HSEGSIZE;
     long index = (table->max + table->split - 1) % HSEGSIZE;
@@ -501,11 +528,15 @@ mapHashTableKeys(HashTable *table, void *data, MapHashFnKeys fn)
         segment--;
         index = HSEGSIZE - 1;
     }
+#endif
 }
 
 void
 iterHashTable(HashTable *table, void *data, IterHashFn fn)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_iter(table->dir, table->bcount, data, fn);
+#else
     /* The last bucket with something in it is table->max + table->split - 1 */
     long segment = (table->max + table->split - 1) / HSEGSIZE;
     long index = (table->max + table->split - 1) % HSEGSIZE;
@@ -522,6 +553,7 @@ iterHashTable(HashTable *table, void *data, IterHashFn fn)
         segment--;
         index = HSEGSIZE - 1;
     }
+#endif
 }
 
 /* -----------------------------------------------------------------------------

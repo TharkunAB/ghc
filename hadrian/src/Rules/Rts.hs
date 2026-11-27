@@ -24,6 +24,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
                 , "rts/rust/gc_budget.rs"
+                , "rts/rust/hash_walk.rs"
                 , "rts/rust/mblock_extents.rs"
                 , "rts/rust/prim_float.rs"
                 ] rustCfg output
