@@ -251,6 +251,8 @@ GHC_STATIC_ASSERT(WEAK_FIELD_OFFSET(key) == sizeof(void *) &&
 #undef WEAK_FIELD_OFFSET
 RTS_PRIVATE void ghc_rust_collect_dead_weaks(StgWeak *old, StgWeak **pending,
     void *gc_thread_ptr, size_t payload_offset);
+RTS_PRIVATE void ghc_rust_mark_weak_list(StgWeak **head, void *gc_thread_ptr,
+    size_t payload_offset, void (*check)(StgWeak *));
 #endif
 
 static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
@@ -509,6 +511,20 @@ void collectFreshWeakPtrs( void )
    the link fields.
    -------------------------------------------------------------------------- */
 
+#if defined(ASSERTS_ENABLED)
+static inline void checkWeakBeforeEvacuation(StgWeak *w)
+{
+    // A parallel worker can replace the info pointer with a forwarding pointer.
+    const StgInfoTable *info = RELAXED_LOAD(&w->header.info);
+    ASSERT(IS_FORWARDING_PTR(info)
+           || info == &stg_DEAD_WEAK_info
+           || INFO_PTR_TO_STRUCT(info)->type == WEAK);
+}
+#define CHECK_WEAK_BEFORE_EVACUATION checkWeakBeforeEvacuation
+#else
+#define CHECK_WEAK_BEFORE_EVACUATION NULL
+#endif
+
 void
 markWeakPtrList ( void )
 {
@@ -516,6 +532,10 @@ markWeakPtrList ( void )
 
     for (g = 0; g <= N; g++) {
         generation *gen = &generations[g];
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+        ghc_rust_mark_weak_list(&gen->weak_ptr_list, gct, offsetof(StgWeak, cfinalizers),
+                                CHECK_WEAK_BEFORE_EVACUATION);
+#else
         StgWeak *w, **last_w;
 
         last_w = &gen->weak_ptr_list;
@@ -523,19 +543,14 @@ markWeakPtrList ( void )
             // w might be WEAK, EVACUATED, or DEAD_WEAK (actually CON_STATIC) here
 
 #if defined(ASSERTS_ENABLED)
-            {   // careful to do this assertion only reading the info ptr
-                // once, because during parallel GC it might change under our feet.
-                const StgInfoTable *info = RELAXED_LOAD(&w->header.info);
-                ASSERT(IS_FORWARDING_PTR(info)
-                       || info == &stg_DEAD_WEAK_info
-                       || INFO_PTR_TO_STRUCT(info)->type == WEAK);
-            }
+            checkWeakBeforeEvacuation(w);
 #endif
 
             evacuate((StgClosure **)last_w);
             w = *last_w;
             last_w = &(w->link);
         }
+#endif
     }
 }
 
