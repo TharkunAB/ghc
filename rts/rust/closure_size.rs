@@ -4,6 +4,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 include!(env!("CLOSURE_SIZE_LAYOUT_RS"));
+mod compact;
 mod nonmoving;
 
 unsafe extern "C" {

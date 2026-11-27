@@ -33,6 +33,7 @@ FIELD(BD_SCAN, bdescr, u.scan, StgPtr);
 FIELD(BD_LINK, bdescr, link, bdescr *);
 FIELD(BD_START, bdescr, start, StgPtr);
 FIELD(COMPACT_BLOCK_OWNER, StgCompactNFDataBlock, owner, StgCompactNFData *);
+FIELD(COMPACT_BLOCK_NEXT, StgCompactNFDataBlock, next, StgCompactNFDataBlock *);
 OFFSET(SEG_STRUCT_SIZE, sizeof(struct NonmovingSegment));
 FIELD(CAP_CURRENT_SEGMENTS, Capability, current_segments, struct NonmovingSegment **);
 FIELD(CENSUS_COLLECTED, struct NonmovingAllocCensus, collected_live_words, bool);
