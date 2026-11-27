@@ -2,7 +2,31 @@
 
 Start with `__decodeFloat_Int` to prove that Hadrian can put a Rust object into a working RTS. Then port the in-process file-lock registry to prove that Rust can own an entire subsystem. Each step should leave a compiler that can build and run ordinary Haskell programs.
 
-This roadmap uses upstream GHC `56bb91d95f89509cb351a5eb4a7406825675866c`, reviewed on 2026-11-27. The proposed first target is native `x86_64-unknown-linux-gnu` with Rust 1.100.0, the current stable release. The host used for research defaults to rustc 1.96.1. The worktree has no Rust implementation yet. [Rust release history](https://blog.rust-lang.org/releases/)
+The source baseline is upstream GHC `56bb91d95f89509cb351a5eb4a7406825675866c`. The first target is native `x86_64-unknown-linux-gnu` with Rust 1.100.0. The mixed build is opt-in with `./configure --enable-rust-rts`. GHC normalizes the platform triple to `x86_64-unknown-linux` during configure. The probe uses Autoconf’s `target_cpu` and `target_os` to distinguish the GNU ABI. [Configure](../../configure.ac) · [Rust release history](https://blog.rust-lang.org/releases/)
+
+## Current coverage
+
+| Behavior | Evidence on x86-64 GNU/Linux | Next check |
+| --- | --- | --- |
+| `__decodeFloat_Int` | The Rust adapter and the original C function agreed on both output words for all 4,294,967,296 binary32 bit patterns. The standalone harness compiled the C source with a small header shim. | Exercise the decoder from GHC and libraries built by this branch. |
+| Haskell `decodeFloat` | GHC 9.14.1 linked the branch’s adapter and Rust object into an optimized executable using its installed static RTS. It agreed with its C counterpart on 19,456 inputs. GDB reached Rust from `stg_decodeFloatzuIntzh`. The extended `num010` regression matched its golden output. | Repeat through Hadrian’s static, dynamic and threaded links. |
+| Recursive `fib` | With the installed RTS and a Rust object built by the branch’s Hadrian rule, integer `fib` followed by Float decoding gave the expected results for 0, 1, 10 and 30. `fib 30` produced `832040`, which decoded as `(13312640,-4)`. | Repeat on the branch-built compiler and qualify later RTS changes with the same smoke test. |
+
+The baseline has **180 tracked C translation units, 17 Cmm sources and 5 assembly sources** under `rts/`. As of the Float increment, 1 of 7 externally named functions in `StgPrimFloat.c` has a Rust implementation. Whole-file coverage is 0/180 C, 0/17 Cmm and 0/5 assembly. Count partial implementations by behavior. For a completed file, record the remaining ABI stubs and the targets and RTS ways in which the implementation ran.
+
+| C subsystem | Tracked units |
+| --- | ---: |
+| Startup, embedding, utilities and hooks | 20 |
+| STG bridge, foreign calls and bytecode execution | 13 |
+| Primitive helpers | 15 |
+| Scheduling, concurrency and STM | 14 |
+| Heap representation, storage and GC | 34 |
+| I/O, timers and platform services | 29 |
+| Native linker and symbol metadata | 27 |
+| Profiling, events and diagnostics | 22 |
+| Wasm runtime C sources | 6 |
+
+Use `git ls-tree -r --name-only 56bb91d95f89 rts` to reproduce the tracked source counts. The inventory also includes 230 headers (80 in `rts/include`) and 27 JavaScript sources. Track executable inline header code with its callers. The RTS package additionally builds `fs.c` from `utils/fs` and four generated `AutoApply` Cmm files. Record public layout, STG register or platform-specific assembly requirements with each affected unit. [RTS package](../../rts/rts.cabal) · [Generated code rules](../../hadrian/src/Rules/Generate.hs)
 
 ## 1. Put one Rust function on a real Haskell call path
 
