@@ -300,27 +300,8 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
 void
 traverseSparkQueue (evac_fn evac, void *user, Capability *cap)
 {
-    StgClosure **sparkp;
-    SparkPool *pool;
-    StgWord top,bottom, modMask;
-
-    pool = cap->sparks;
-
-    ASSERT_WSDEQUE_INVARIANTS(pool);
-
-    top = pool->top;
-    bottom = pool->bottom;
-    sparkp = (StgClosurePtr*)pool->elements;
-    modMask = pool->moduloSize;
-
-    while (top < bottom) {
-    /* call evac for all closures in range (wrap-around via modulo)
-     * In GHC-6.10, evac takes an additional 1st argument to hold a
-     * GC-specific register, see rts/sm/GC.c::mark_root()
-     */
-      evac( user , sparkp + (top & modMask) );
-      top++;
-    }
+    SparkPool *pool = cap->sparks;
+    visitWSDequeClosureSlots(pool, evac, user);
 
     debugTrace(DEBUG_sparks,
                "traversed spark queue, len=%ld; "

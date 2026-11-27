@@ -97,6 +97,26 @@ EXTERN_INLINE StgInt dequeElements   (WSDeque *q);
  * PRIVATE below here
  * -------------------------------------------------------------------------- */
 
+// Visit live closure slots in logical order. The visitor may update each
+// slot. The caller must exclude pushes, pops, and steals for the whole walk.
+INLINE_HEADER void
+visitWSDequeClosureSlots(WSDeque *q,
+                         void (*visit)(void *, StgClosure **), void *user)
+{
+    ASSERT_WSDEQUE_INVARIANTS(q);
+
+    StgWord top = q->top;
+    StgWord bottom = q->bottom;
+    StgClosure **slots = (StgClosure **)q->elements;
+    StgWord mask = q->moduloSize;
+
+    // Use logical bounds. The masked bounds coincide in a full deque.
+    while (top < bottom) {
+        visit(user, &slots[top & mask]);
+        top++;
+    }
+}
+
 EXTERN_INLINE StgInt
 dequeElements (WSDeque *q)
 {
