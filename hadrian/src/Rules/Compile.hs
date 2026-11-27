@@ -23,6 +23,8 @@ import qualified Data.Set as Set
 import Data.Char (isHexDigit)
 import GHC.Generics (Generic)
 import Packages (compiler)
+import System.IO (IOMode(ReadMode), withBinaryFile)
+import System.IO.Error (tryIOError)
 
 -- * Rules for building objects and Haskell interface files
 
@@ -218,6 +220,17 @@ the worker selection and records the helper digest in its content. If the mode i
 revert to raw bytes before Shake decides whether a stored consumer is clean.
 -}
 
+-- | Recognize common CPP pragmas before starting the interface helper.
+-- A match keeps the raw dependencies. The helper checks all other sources.
+hasCppPragmaPrefix :: FilePath -> IO Bool
+hasCppPragmaPrefix path = do
+    contents <- tryIOError (withBinaryFile path ReadMode (\h -> BSC.hGet h 4096))
+    pure (either (const False) (any cppLine . BSC.lines) contents)
+  where
+    cppLine line =
+        let trimmed = BSC.dropWhile (\c -> c == ' ' || c == '\t') line
+        in any (\prefix -> BSC.isPrefixOf prefix trimmed) (map BSC.pack ["{-# LANGUAGE CPP ", "{-# OPTIONS_GHC -cpp "])
+
 -- * Object file paths types and parsers
 
 {- We are using a non uniform representation that separates
@@ -387,9 +400,12 @@ compileHsObjectAndHi readReceipt rs objpath = do
     let ownHi = objpath -<.> "hi"
         ownDyn = objpath -<.> "dyn_hi"
     trackAllow [ownHi, ownDyn]
-    certificate <- Builder.ifaceWorkerQuery daemon
-      (["certify", "--evidence", libdir, src, ownHi, ownDyn, "--"] ++ args ++ [src])
-    case parseConsumer certificate of
+    cpp <- liftIO (hasCppPragmaPrefix src)
+    certificate <- if cpp
+      then pure Nothing
+      else parseConsumer <$> Builder.ifaceWorkerQuery daemon
+        (["certify", "--evidence", libdir, src, ownHi, ownDyn, "--"] ++ args ++ [src])
+    case certificate of
       Nothing -> need potential
       Just uses -> forM_ ready $ \(provider, stamp, record) -> do
         if matchesProvider uses record

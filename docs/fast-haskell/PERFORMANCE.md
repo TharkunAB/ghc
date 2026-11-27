@@ -88,6 +88,8 @@ A four-module follow-up compared one ordinary compile per module with two reside
 
 A separate stock replay inserted a header earlier in the CPP include path. The source hash and the old recorded header were unchanged. Fresh GHC selected the new header, discovered a different import and rebuilt. A compiler check that reuses preprocessing must also account for changes in header lookup.
 
+Hadrian now keeps the raw dependencies directly when a source begins with a common CPP pragma in its first 4 KiB. The linked replay removed 45 certificate subprocesses. It still ran 54 compile requests, skipped 53 code generations, matched the checked stock artifacts and followed with a zero-action no-op. In four isolated, alternating comparisons, the former 45 certificate subprocesses took 247 ms at the median and the source checks took 3.7 ms. The candidate linked edit took 27.86 s in a later, unpaired run.
+
 The changed `GHC.Utils.Misc` producer took 1.40–1.41 s wall in two replays of its actual command. The simplifier accounted for 0.56 s CPU, code generation for 0.34 s, and both interface writes for 0.24 ms. Four output files matched the archived stock hashes. These are compiler-command timings. The linked build also packs the compiler archive, links the shared library and executable, and registers the package.
 
 ### Development workers at 8ad5a4d
