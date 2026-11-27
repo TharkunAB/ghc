@@ -9,6 +9,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_allocate_byte_array",
     ".hidden ghc_rust_allocate_pinned_byte_array",
     ".hidden ghc_rust_publish_shrink",
+    ".hidden ghc_rust_shrink_small_array_active",
 );
 
 unsafe extern "C" {
@@ -18,6 +19,7 @@ unsafe extern "C" {
     fn mutArrPtrsCards(count: usize) -> usize;
     fn allocateMightFail(cap: *mut c_void, words: usize) -> *mut c_void;
     fn allocatePinned(cap: *mut c_void, words: usize, align: usize, offset: usize) -> *mut c_void;
+    fn updateRemembSetPushClosure_(reg: *mut c_void, closure: *mut c_void);
 }
 
 // See Note [shrink-array slop marker] in PrimOps.cmm and
@@ -37,6 +39,33 @@ unsafe extern "C" fn ghc_rust_publish_shrink(
             AtomicUsize::from_ptr(slop.add(1)).store(words - 2, Ordering::Release);
         }
         AtomicUsize::from_ptr(length).store(new_size, Ordering::Relaxed);
+    }
+}
+
+// Note [Small-array shrink barrier]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Visit each removed pointer before the marker overwrites its slot.
+// The non-moving collector can update a slot with CAS, so load it atomically.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_shrink_small_array_active(
+    reg: *mut c_void,
+    length: *mut usize,
+    new_size: usize,
+) {
+    unsafe {
+        let old_size = AtomicUsize::from_ptr(length).load(Ordering::Relaxed);
+        let payload = length.add(1).cast::<*mut c_void>();
+        for i in new_size..old_size {
+            let closure = AtomicPtr::from_ptr(payload.add(i)).load(Ordering::Relaxed);
+            updateRemembSetPushClosure_(reg, closure);
+        }
+        let final_size = AtomicUsize::from_ptr(length).load(Ordering::Relaxed);
+        ghc_rust_publish_shrink(
+            length,
+            new_size,
+            payload.add(new_size).cast::<usize>(),
+            final_size - new_size,
+        );
     }
 }
 
