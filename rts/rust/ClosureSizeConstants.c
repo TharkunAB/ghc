@@ -1,7 +1,6 @@
 #include "ClosureLayout.h"
 #include "Capability.h"
-#include "NonMoving.h"
-#include "NonMovingCensus.h"
+#include "sm/NonMovingCensus.h"
 
 /* Note [Closure size build constants]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
