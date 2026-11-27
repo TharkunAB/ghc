@@ -126,6 +126,15 @@ class TestConfig:
         self.way_flags = {}  # type: Dict[WayName, List[str]]
         self.way_rts_flags = {}  # type: Dict[WayName, List[str]]
 
+        # I/O managers (GHC's `--io-manager` RTS flag) supported by the threaded runtime.
+        self.io_managers_threaded = []  # type: List[str]
+
+        # I/O managers (GHC's `--io-manager` RTS flag) supported by the non-threaded runtime.
+        self.io_managers_nonthreaded = []  # type: List[str]
+
+        # All I/O managers (GHC's `--io-manager` RTS flag)
+        self.io_managers_all = []  # type: List[str]
+
         # Do we have a functional LLVM toolchain?
         self.have_llvm = False
 
@@ -182,6 +191,9 @@ class TestConfig:
         # Is gdb available?
         self.have_gdb = False
 
+        # Is ldd available?
+        self.have_ldd = False
+
         # Is readelf available?
         self.have_readelf = False
 
@@ -227,7 +239,7 @@ class TestConfig:
         self.allowed_perf_changes = {}
 
         # The test environment.
-        self.test_env = 'local'
+        self.test_env = TestEnv('local')
 
         # terminal supports colors
         self.supports_colors = False
@@ -291,12 +303,13 @@ class TestResult:
     expected_failures, framework_failures, framework_warnings, unexpected_passes,
     unexpected_failures, unexpected_stat_failures lists of TestRun.
     """
-    __slots__ = 'directory', 'testname', 'reason', 'way', 'stdout', 'stderr', 'diff', 'runtime'
+    __slots__ = 'directory', 'testname', 'reason', 'way', 'stdout', 'stderr', 'diff', 'runtime', 'io_manager'
     def __init__(self,
                  directory: str,
                  testname: TestName,
                  reason: str,
                  way: WayName,
+                 io_manager: Optional[str],
                  stdout: Optional[str]=None,
                  stderr: Optional[str]=None,
                  diff: Optional[str]=None,
@@ -309,6 +322,7 @@ class TestResult:
         self.stderr = stderr
         self.diff = diff
         self.runtime = runtime # Walltime
+        self.io_manager = io_manager # None means the default IO Manager
 
 # A performance metric measured in this test run.
 PerfMetric = NamedTuple('PerfMetric',
@@ -367,6 +381,14 @@ class TestOptions:
        # add these ways to the default set
        self.extra_ways = [] # type: List[WayName]
 
+       # IO Managers to test (passed as the --io-manager RTS option)
+       # * [None] - only default IO Manager
+       # * [...] - list of io managers e.g. "mio" or "poll"
+       self.io_managers = [None] # type: List[Optional[str]]
+
+       # IO Manager used in the current test case. Set before each test case. None means default IO Manager
+       self.io_manager_current = None # type: Optional[str]
+
        # the result we normally expect for this test
        self.expect = 'pass'
 
@@ -388,6 +410,11 @@ class TestOptions:
 
        # don't use the executable extension
        self.ignore_extension = False
+
+       # make_depend tests: which outputs to write and check
+       self.dep_makefile: DepMode = DepMode.NONE
+       self.dep_json: DepMode = DepMode.NONE
+       self.ignore_dep_outputs = False
 
        # Backpack test
        self.compile_backpack = False

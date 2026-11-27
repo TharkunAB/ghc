@@ -56,10 +56,18 @@ test('T25601',
 test('T27447',
      [ req_cmm
      , extra_ways(['optasm'])
-     , when(have_llvm(), extra_ways(['optasm', 'optllvm']))
+     , when(have_llvm(), extra_ways(['optllvm']))
      ],
      multi_compile_and_run,
      ['T27447', [('T27447_cmm.cmm', '')], ''])
 
 test('T27722', [req_cmm], multi_compile_and_run,
      ['T27722', [('T27722_cmm.cmm', '')], '-O'])
+
+test('T28101',
+     [ req_cmm
+     , when(wordsize(32), skip) # 64-bit Cmm literals returned in a Word#
+     , extra_ways(['optasm'])
+     ],
+     multi_compile_and_run,
+     ['T28101', [('T28101_cmm.cmm', '')], ''])

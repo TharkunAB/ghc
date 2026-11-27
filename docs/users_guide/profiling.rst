@@ -594,42 +594,6 @@ of your profiled program will be different to that of the unprofiled one.
     Process (or ignore) manual ``SCC`` annotations. Can be helpful to ignore annotations from libraries which
     are not desired.
 
-.. ghc-flag:: -auto-all
-    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-fprof-auto`
-    :type: dynamic
-
-    Deprecated alias for :ghc-flag:`-fprof-auto`
-
-.. ghc-flag:: -auto
-    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-fprof-auto-exported`
-    :type: dynamic
-
-    Deprecated alias for :ghc-flag:`-fprof-auto-exported`
-
-.. ghc-flag:: -caf-all
-    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-fprof-cafs`
-    :type: dynamic
-
-    Deprecated alias for :ghc-flag:`-fprof-cafs`
-
-.. ghc-flag:: -no-auto-all
-    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-fno-prof-auto`
-    :type: dynamic
-
-    Deprecated alias for :ghc-flag:`-fno-prof-auto`
-
-.. ghc-flag:: -no-auto
-    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-fno-prof-auto`
-    :type: dynamic
-
-    Deprecated alias for :ghc-flag:`-fno-prof-auto`
-
-.. ghc-flag:: -no-caf-all
-    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-fno-prof-cafs`
-    :type: dynamic
-
-    Deprecated alias for :ghc-flag:`-fno-prof-cafs`
-
 .. _prof-time-options:
 
 Time and allocation profiling
@@ -951,7 +915,43 @@ following RTS options select which break-down to use:
 
     *Requires* :ghc-flag:`-prof`. Breaks down the graph by type. For closures
     which have function type or unknown/polymorphic type, the string will
-    represent an approximation to the actual type.
+    represent an approximation to the actual type; see
+    :ref:`heap-prof-hy-type-strings`.
+
+.. _heap-prof-hy-type-strings:
+
+How ``-hy`` encodes types
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The compiler records a compact type label on each info table when building
+with profiling. The same string is used for :rts-flag:`-hy` bands and for
+type-restriction filters written as ``-hy ⟨type⟩`` (see the restriction options
+below).
+
+The label is **not** a source-syntax type. It is produced by walking the
+compiler's representation after dropping any top-level ``forall`` (existentials
+and other features are summarized similarly):
+
+* A concrete type constructor is shown by its name, for example ``Int`` or
+  ``Maybe``.
+
+* Type application keeps only the head constructor, so ``Maybe Int`` and
+  ``Maybe Bool`` both appear as ``Maybe``.
+
+* A type variable is shown as ``*``, so polymorphic heap cells share one bucket.
+
+* Function types are encoded by the nested function-arrow spine of the *result*
+  type only (constraints from a signature are not shown). The outermost function
+  arrow becomes a hyphen (``-``). Each nested
+  function arrow in the result adds one greater-than sign (``>``). The segment
+  after those symbols summarizes the final non-function type.
+
+  For example, ``Int -> Bool`` is ``->Bool``; ``Int -> Bool -> Char`` is
+  ``->>Char``; and ``Int -> Bool -> Char -> Double`` is ``->>>Double``.  The
+  sequence ``->>>`` therefore means “three function arrows” before the summary of
+  the final result type, not a fourth operator.  Because only the result spine is
+  walked, a higher-order type such as ``(Int -> Bool) -> Char`` is also shown as
+  ``->Char``---the argument function type is not reflected in the string.
 
 .. rts-flag:: -he
 

@@ -31,7 +31,7 @@ module GHC.Tc.Gen.HsType (
         bindOuterFamEqnTKBndrs_Q_Tv, bindOuterFamEqnTKBndrs,
         primFamilyPatKinds,
         tcOuterTKBndrs, scopedSortOuter, outerTyVars, outerTyVarBndrs,
-        tcGadtConTyVarBndrs, tcConDeclTelescope, tcCheckRetainedConType,
+        tcConDeclTelescope, tcCheckRetainedConType,
         bindOuterSigTKBndrs_Tv,
         tcExplicitTKBndrs, tcRuntimeInvisForAllTelescopes,
         tcCheckRuntimeForAllMatchability,
@@ -8473,9 +8473,8 @@ getOrCreateUninterpretedTyCon fun n_val_args = do
 
 ---------------------------
 
-tcHsContext :: Maybe (LHsContext GhcRn) -> TcM [PredType]
-tcHsContext Nothing    = return []
-tcHsContext (Just cxt) = tc_hs_context typeLevelMode cxt
+tcHsContext :: Foldable t => t (LHsContext GhcRn) -> TcM [PredType]
+tcHsContext = foldMapM (tc_hs_context typeLevelMode)
 
 tcLHsPredType :: LHsType GhcRn -> TcM PredType
 tcLHsPredType pred = tc_lhs_pred typeLevelMode pred
@@ -10080,20 +10079,6 @@ tcOuterTKBndrsX skol_mode skol_info outer_bndrs thing_inside
                                       , hso_matchability = ma
                                       , hso_bndrs     = exp_bndrs }
                     , thing) }
-
----------------
-tcGadtConTyVarBndrs :: SkolemInfo
-                    -> HsOuterSigTyVarBndrs GhcRn
-                    -> [LHsGadtTelescope GhcRn]
-                    -> TcM a -> TcM ([TcTyVarBinder], TcThetaType, a)
-tcGadtConTyVarBndrs skol_info outer inner thing_inside
-  = do { tcCheckRuntimeForAllMatchability (hsOuterMatchability outer)
-       ; (outer_bndrs, (inner_tvbs, theta, a)) <-
-            tcOuterTKBndrs skol_info outer $
-            tcConDeclTelescope skol_info inner thing_inside
-       ; outer_bndrs <- scopedSortOuter outer_bndrs
-       ; let outer_tvbs = tyVarSpecToBinders (outerTyVarBndrs outer_bndrs)
-       ; return (outer_tvbs ++ inner_tvbs, theta, a) }
 
 -- | Check constructor contexts before later groups enter scope.
 -- See Note [Constructor telescope contexts] in GHC.Hs.Decls.

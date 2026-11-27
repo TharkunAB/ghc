@@ -1473,6 +1473,11 @@ generator to locate any imported modules that come from packages. The
 package modules won't be included in the dependencies generated, though
 (but see the ``-include-pkg-deps`` option below).
 
+Since GHC 10.1, ``ghc -M`` supports dependency generation for multiple
+home units via :ghc-flag:`-unit @⟨filename⟩`.
+See :ref:`multi-home-units` for details and examples how to use
+``ghc -M`` with multiple home units.
+
 The dependency generation phase of GHC can take some additional options,
 which you may find useful. The options which affect dependency
 generation are:
@@ -1495,6 +1500,7 @@ generation are:
 .. ghc-flag:: -dep-makefile ⟨file⟩
     :shortdesc: Use ⟨file⟩ as the makefile
     :type: dynamic
+    :reverse: -no-dep-makefile
     :category: redirect-output
 
     Use ⟨file⟩ as the makefile, rather than ``makefile`` or
@@ -1502,6 +1508,68 @@ generation are:
     often use ``-dep-makefile .depend`` to put the dependencies in
     ``.depend`` and then ``include`` the file ``.depend`` into
     ``Makefile``.
+
+    Introduced in GHC 10.1, ``-no-dep-makefile`` disables the generation of a Makefile altogether.
+
+.. ghc-flag:: -dep-makefile-stdout
+    :shortdesc: Write dependency generation to stdout using makefile format
+    :type: dynamic
+    :reverse: -no-dep-makefile
+    :category: redirect-output
+
+    :since: 10.1
+
+    Stream the dependency generation of :ghc-flag:`-dep-makefile ⟨file⟩` to stdout instead of ⟨file⟩.
+
+    Contrary to :ghc-flag:`-dep-makefile ⟨file⟩`, the markers
+
+    * "``# DO NOT DELETE: Beginning of Haskell dependencies``" and
+    * "``# DO NOT DELETE: End of Haskell dependencies``"
+
+    are not emitted.
+
+.. ghc-flag:: -dep-json ⟨file⟩
+    :shortdesc: Write dependencies to ⟨file⟩ as a JSON Lines format
+    :type: dynamic
+    :reverse: -no-dep-json
+    :category: redirect-output
+
+    :since: 10.1
+
+    Emit ⟨file⟩ as a JSON Lines file containing the dependency info, similar to the Makefile produced by
+    :ghc-flag:`-dep-makefile ⟨file⟩`.
+
+    The format follows the `JSON Lines <https://jsonlines.org>`_ convention,
+    thus each line is a separate JSON object.
+
+    There are two kinds of objects:
+
+      * one object per module.
+        These objects contain the module name, boot status, source and its imports.
+        If :ghc-flag:`-include-cpp-deps` is given, it also includes filepaths that
+        are ``#include``\d.
+      * one object per external unit.
+        External units are only defined once, before the first module
+        that imports from it.
+        These objects are only emitted with :ghc-flag:`-include-pkg-deps`.
+
+    The schema can be downloaded :download:`here <make-depends-json-schema-1_0.json>`.
+
+    ``-no-dep-json`` disables the generation of the JSON file.
+
+    :ghc-flag:`-dep-json ⟨file⟩` and :ghc-flag:`-dep-json-stdout` disable the default generation of a Makefile.
+    To generate a Makefile for the dependency information, explicitly use :ghc-flag:`-dep-makefile ⟨file⟩` or
+    :ghc-flag:`-dep-makefile-stdout`.
+
+.. ghc-flag:: -dep-json-stdout
+    :shortdesc: Write dependency generation to stdout using JSON Lines format
+    :type: dynamic
+    :reverse: -no-dep-json
+    :category: redirect-output
+
+    :since: 10.1
+
+    Stream the dependency generation of :ghc-flag:`-dep-json ⟨file⟩` to stdout instead of ⟨file⟩.
 
 .. ghc-flag:: -dep-suffix ⟨suffix⟩
     :shortdesc: Make dependencies that declare that files with suffix

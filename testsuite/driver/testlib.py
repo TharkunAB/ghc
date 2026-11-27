@@ -20,13 +20,15 @@ from pathlib import Path, PurePath
 import collections
 import collections.abc
 import subprocess
+import json
 
 from testglobals import config, ghc_env, default_testopts, brokens, t, \
                         TestRun, TestResult, TestOptions, PerfMetric
-from testutil import strip_quotes, lndir, link_or_copy_file, passed, \
+from testutil import discover_io_managers, strip_quotes, lndir, link_or_copy_file, passed, \
                      failBecause, residency_testing_metrics, \
                      stable_perf_counters, \
-                     PassFail, badResult, str_warn, str_removeprefix
+                     PassFail, badResult, str_warn, str_removeprefix, \
+                     io_manager_test_name_suffix
 from term_color import Color, colored_if
 import testutil
 from cpu_features import have_cpu_feature
@@ -190,7 +192,7 @@ def no_lint( name, opts ):
 
 def stage1(name, opts):
     # See Note [Why is there no stage1 setup function?]
-    framework_fail(name, 'stage1 setup function does not exist',
+    framework_fail(name, None,
                    'add your test to testsuite/tests/stage1 instead')
 
 # Note [Why is there no stage1 setup function?]
@@ -341,7 +343,7 @@ def req_th( name, opts ):
     req_interp(name, opts);
 
     if ghc_dynamic():
-        return _omit_ways(name, opts, ['profasm', 'profthreaded'])
+        return _omit_ways(name, opts, [WayName('profasm'), WayName('profthreaded')])
 
 def req_plugins( name, opts ):
     """
@@ -355,7 +357,7 @@ def req_plugins( name, opts ):
     req_interp(name, opts)
 
     # Plugins aren't supported with the external interpreter (#14335)
-    expect_broken_for(14335,['ext-interp'])(name,opts)
+    expect_broken_for(IssueNumber(14335),[WayName('ext-interp')])(name,opts)
 
     if config.cross:
         opts.skip = True
@@ -431,6 +433,40 @@ def ignore_extension(name, opts):
 
 def combined_output( name, opts ):
     opts.combined_output = True
+
+def dep_makefile( name, opts ):
+    """
+    For make_depend tests: write the -dep-makefile output and
+    compare it against <name>.dep-makefile.
+    """
+    opts.dep_makefile = DepMode.FILE
+
+def dep_json( name, opts ):
+    """
+    For make_depend tests: write the -dep-json output and
+    compare it against <name>.dep-json.
+    """
+    opts.dep_json = DepMode.FILE
+
+def dep_makefile_stdout( name, opts ):
+    """
+    For make_depend tests: add -dep-makefile-stdout flag.
+    """
+    opts.dep_makefile = DepMode.STDOUT
+
+def dep_json_stdout( name, opts ):
+    """
+    For make_depend tests: add -dep-json-stdout flag.
+    """
+    opts.dep_json = DepMode.STDOUT
+
+def ignore_dep_outputs( name, opts ):
+    """
+    For make_depend tests: still write the outputs requested by 'dep_makefile'
+    and 'dep_json', but don't compare them against the expected files.
+    Useful for performance tests.
+    """
+    opts.ignore_dep_outputs = True
 
 def use_specs( specs ):
     """
@@ -565,10 +601,42 @@ def valid_way( way: WayName ) -> bool:
 def extra_ways( ways: List[WayName] ):
     def helper( name: TestName, opts ):
         _lint_ways(name, ways)
-        opts.extra_ways = [way for way in ways if valid_way(way)]
+        opts.extra_ways += [way for way in ways if valid_way(way) and way not in opts.extra_ways]
 
     return helper
 
+# -----
+
+def _io_managers( name: TestName, opts, io_mgrs: Union[List[str], str] ) -> None:
+    if isinstance(io_mgrs, str):
+        io_mgrs = [io_mgrs]
+    opts.io_managers = io_mgrs
+
+def io_managers( io_mgrs: List[str] ):
+    """
+    Further split test cases into the given IO Managers if available.
+    Available IO Managers are determined by the test case's way (threaded/non-threads) and OS.
+    You'll likely want to use `extra_ways(['threaded2'])` if you want to test threaded IO Managers (e.g. mio).
+    """
+    return lambda name, opts: _io_managers(name, opts, io_mgrs)
+
+def all_available_io_managers( name: TestName, opts ):
+    """
+    Further split test cases into all available IO Managers.
+    Available IO Managers are determined by the test case's way (threaded/non-threads) and OS.
+    You'll likely want to use `extra_ways(['threaded2'])` to ensure threaded IO Managers are tested (e.g. mio).
+    """
+    _io_managers(name, opts, config.io_managers_all)
+
+def all_available_io_managers_except(exclude: Union[List[str], str]):
+    """
+    Further split test cases into all available (except the given excluded) IO Managers.
+    Available IO Managers are determined by the test case's way (threaded/non-threads) and OS.
+    You'll likely want to use `extra_ways(['threaded2'])` to ensure threaded IO Managers are tested (e.g. mio).
+    """
+    if isinstance(exclude, str):
+        exclude = [exclude]
+    return lambda name, opts: _io_managers(name, opts, list(set(config.io_managers_all) - set(exclude)))
 
 # -----
 
@@ -661,18 +729,15 @@ def collect_size ( deviation, path ):
 def collect_size_func ( deviation, path_func ):
     return collect_generic_stat ( 'size', deviation, lambda way: os.path.getsize(in_testdir(path_func())) )
 
-def get_dir_size(path):
+def get_dir_size(path) -> int:
     total = 0
-    try:
-        with os.scandir(path) as it:
-            for entry in it:
-                if entry.is_file():
-                    total += entry.stat().st_size
-                elif entry.is_dir():
-                    total += get_dir_size(entry.path)
-        return total
-    except FileNotFoundError:
-        print("Exception: Could not find: " + path)
+    with os.scandir(path) as it:
+        for entry in it:
+            if entry.is_file():
+                total += entry.stat().st_size
+            elif entry.is_dir():
+                total += get_dir_size(entry.path)
+    return total
 
 def collect_size_dir ( deviation, path ):
     return collect_size_dir_func ( deviation, lambda: path )
@@ -790,7 +855,7 @@ def find_non_inplace_so(lib):
     return _find_so(lib,path_from_ghcPkg(lib, "dynamic-library-dirs"),False)
 
 
-def collect_generic_stat ( metric, deviation: Optional[int], get_stat: Callable[[WayName], str]):
+def collect_generic_stat ( metric, deviation: Optional[int], get_stat: Callable[[WayName], Any]):
     """
     Define a generic stat test, which computes the statistic by calling the function
     given as the third argument.
@@ -1067,6 +1132,9 @@ def have_dynamic_prof( ) -> bool:
 def have_profiling( ) -> bool:
     return config.have_profiling
 
+def have_smp() -> bool:
+    return config.ghc_has_smp
+
 def have_threaded( ) -> bool:
     return config.ghc_with_threaded_rts
 
@@ -1090,6 +1158,9 @@ def debug_rts( ) -> bool:
 
 def have_gdb( ) -> bool:
     return config.have_gdb
+
+def have_ldd( ) -> bool:
+    return config.have_ldd
 
 def have_readelf( ) -> bool:
     return config.have_readelf
@@ -1135,7 +1206,7 @@ def _collect_compiler_perf_counters(counters: Set[str], deviation: Optional[int]
         # Slightly hacky, we need the requested perf_counters in 'simple_run'.
         # Thus, we have to globally register these counters
         opts.compiler_perf_counters += list(counters)
-        _collect_stats(name, opts, counters, deviation, False, True, True)
+        _collect_stats(name, opts, counters, deviation, None, True, True)
     return f
 
 
@@ -1334,21 +1405,22 @@ def check_errmsg(needle):
 # grep_errmsg(regex,[groups])
 # If groups are given, return only the matched groups
 # that matches the regex.
-def grep_errmsg_norm(needle:str, groups = None):
+def grep_errmsg_norm(needle:str, groups_may = None):
 
-    def get_match(str:str):
-        m = re.search(needle,str)
-        if m:
-            return "".join([m.group(g) for g in groups if m.group(g) is not None])
-        else:
-            return None
-
-    def norm(str) -> str:
-        if groups == None:
+    def norm(string) -> str:
+        if groups_may == None:
             return "".join( filter(lambda l: re.search(needle,l),
-                                   str.splitlines(True)))
+                                   string.splitlines(True)))
         else:
-            matches = [get_match(x) for x in str.splitlines(True)]
+            groups = groups_may
+            def get_match(string: str):
+                m = re.search(needle, string)
+                if m:
+                    return "".join([m.group(g) for g in groups if m.group(g) is not None])
+                else:
+                    return None
+
+            matches = [get_match(x) for x in string.splitlines(True)]
             res = "\n".join([x for x in matches if x])
             return res
     return norm
@@ -1573,6 +1645,15 @@ do_not_copy = ('.hi', '.o', '.dyn_hi'
               , '.dyn_o', '.out'
               ,'.hi-boot', '.o-boot') # 12112
 
+def way_supports_io_manager(way: WayName, io_manager: Optional[str]) -> bool:
+    # All ways support a default IO Manager
+    if io_manager is None:
+        return True
+
+    way_is_threaded = '-threaded' in config.way_flags[way]
+    available_io_managers = config.io_managers_threaded if way_is_threaded else config.io_managers_nonthreaded
+    return io_manager in available_io_managers
+
 async def test_common_work(name: TestName, opts,
                      func, args) -> None:
     try:
@@ -1621,7 +1702,22 @@ async def test_common_work(name: TestName, opts,
         # A test itself can request extra ways by setting opts.extra_ways
         all_ways = list(OrderedDict.fromkeys(all_ways + [way for way in opts.extra_ways if way not in all_ways]))
 
-        t.total_test_cases += len(all_ways)
+        # We split each way over available io managers
+        if len(opts.io_managers) == 0:
+            framework_fail(name, None, 'opts.io_managers is empty')
+        all_ways_and_io_managers = dict(
+            (
+                way,
+                [io_manager
+                    for io_manager in opts.io_managers
+                    if way_supports_io_manager(way, io_manager)
+                ]
+            )
+            for way in all_ways
+        )
+
+        for io_managers in all_ways_and_io_managers.values():
+            t.total_test_cases += len(io_managers)
 
         only_ways = getTestOpts().only_ways
         ok_way = lambda way: \
@@ -1699,19 +1795,25 @@ async def test_common_work(name: TestName, opts,
 
         # Run the required tests...
         for way in do_ways:
-            if stopping():
-                break
-            start = time.monotonic()
-            try:
-                await do_test(name, way, func, args, files)
-            except KeyboardInterrupt:
-                stopNow()
-            except Exception as e:
-                traceback.print_exc()
-                framework_fail(name, way, traceback.format_exc(),
-                               runtime=time.monotonic() - start)
+            for io_manager in all_ways_and_io_managers[way]:
+                if stopping():
+                    break
+                start = time.monotonic()
+                try:
+                    getTestOpts().io_manager_current = io_manager
+                    await do_test(name ,way ,func ,args ,files)
+                except KeyboardInterrupt:
+                    stopNow()
+                except Exception as e:
+                    traceback.print_exc()
+                    framework_fail(name, way, traceback.format_exc(),
+                                runtime=time.monotonic() - start)
+                finally:
+                    getTestOpts().io_manager_current = None
 
-        t.n_tests_skipped += len(set(all_ways) - set(do_ways))
+        for skipped_way in set(all_ways) - set(do_ways):
+            t.n_tests_skipped += len(all_ways_and_io_managers[skipped_way])
+
         if getTestOpts().expect == 'missing-lib': t.n_missing_libs += 1
 
         if config.cleanup and do_ways:
@@ -1737,7 +1839,8 @@ async def do_test(name: TestName,
     opts = getTestOpts()
     start = time.monotonic()
 
-    full_name = name + '(' + way + ')'
+    io_manager = opts.io_manager_current
+    full_name = name + '(' + way + ')' + io_manager_test_name_suffix(io_manager)
     test_n = len(allTestNames)
     progress_args = [ full_name, t.total_tests, test_n,
         [len(t.unexpected_passes),
@@ -1831,22 +1934,21 @@ async def do_test(name: TestName,
     if way in opts.fragile_ways:
         if_verbose(1, '*** fragile test %s resulted in %s' % (full_name, 'pass' if result.passed else 'fail'))
         if result.passed:
-            t.fragile_passes.append(TestResult(directory, name, 'fragile', way,
-                                               runtime=runtime))
+            t.fragile_passes.append(TestResult(directory, name, 'fragile', way, io_manager, runtime=runtime))
         else:
             reason = '%s (fragile)' % result.reason if result.reason else 'fragile'
-            t.fragile_failures.append(TestResult(directory, name, reason, way,
+            t.fragile_failures.append(TestResult(directory, name, reason, way, io_manager,
                                                  stdout=result.stdout,
                                                  stderr=result.stderr,
                                                  diff=result.diff,
                                                  runtime=runtime))
     elif result.passed:
         if _expect_pass(way):
-            t.expected_passes.append(TestResult(directory, name, "", way,
+            t.expected_passes.append(TestResult(directory, name, "", way, io_manager,
                                                 runtime=runtime))
         else:
             if_verbose(1, '*** unexpected pass for %s' % full_name)
-            t.unexpected_passes.append(TestResult(directory, name, 'unexpected', way,
+            t.unexpected_passes.append(TestResult(directory, name, 'unexpected', way, io_manager,
                                                   runtime=runtime))
     else:
         if _expect_pass(way):
@@ -1854,11 +1956,11 @@ async def do_test(name: TestName,
             tag = result.tag
             if tag == 'stat':
                 if_verbose(1, '*** unexpected stat test failure for %s' % full_name)
-                t.unexpected_stat_failures.append(TestResult(directory, name, reason, way,
+                t.unexpected_stat_failures.append(TestResult(directory, name, reason, way, io_manager,
                                                              runtime=runtime))
             else:
                 if_verbose(1, '*** unexpected failure for %s' % full_name)
-                tr = TestResult(directory, name, reason, way,
+                tr = TestResult(directory, name, reason, way, io_manager,
                                 stdout=result.stdout,
                                 stderr=result.stderr,
                                 diff=result.diff,
@@ -1867,7 +1969,7 @@ async def do_test(name: TestName,
         else:
             # Only keep the reason: nothing reports the output of expected
             # failures.
-            t.expected_failures.append(TestResult(directory, name, result.reason, way,
+            t.expected_failures.append(TestResult(directory, name, result.reason, way, io_manager,
                                                   runtime=runtime))
 
 # Make is often invoked with -s, which means if it fails, we get
@@ -1892,21 +1994,23 @@ def framework_fail(name: Optional[TestName], way: Optional[WayName], reason: str
       directory = _result_directory(opts)
     except:
       directory = ''
-    full_name = '%s(%s)' % (name, way)
+    io_manager = opts.io_manager_current
+    full_name = '%s(%s)%s' % (name, way, io_manager_test_name_suffix(io_manager))
     if_verbose(1, '*** framework failure for %s %s ' % (full_name, reason))
     name2 = name if name is not None else TestName('none')
     way2 = way if way is not None else WayName('none')
     if way not in opts.fragile_ways:
         # If the test is fragile then we rather report this as a fragile test failure
-        t.framework_failures.append(TestResult(directory, name2, reason, way2,
+        t.framework_failures.append(TestResult(directory, name2, reason, way2, io_manager,
                                                runtime=runtime))
 
 def framework_warn(name: TestName, way: WayName, reason: str) -> None:
     opts = getTestOpts()
     directory = _result_directory(opts)
-    full_name = name + '(' + way + ')'
+    io_manager = opts.io_manager_current
+    full_name = name + '(' + way + ')' + io_manager_test_name_suffix(io_manager)
     if_verbose(1, '*** framework warning for %s %s ' % (full_name, reason))
-    t.framework_warnings.append(TestResult(directory, name, reason, way))
+    t.framework_warnings.append(TestResult(directory, name, reason, way, io_manager))
 
 # -----------------------------------------------------------------------------
 # Generic command tests
@@ -1920,13 +2024,15 @@ def framework_warn(name: TestName, way: WayName, reason: str) -> None:
 # run_command.
 
 async def run_command( name, way, cmd ):
-    return await simple_run( name, '', override_options(cmd), '' )
+    return await simple_run( name, WayName(''), override_options(cmd), '' )
 
 async def makefile_test( name, way, target=None ):
     if target is None:
         target = name
 
-    cmd = '$MAKE -s --no-print-directory {target}'.format(target=target)
+    way_flags = '"' + ' '.join(config.way_flags[way]).replace('"', '\\"') + '"'
+
+    cmd = '$MAKE -s --no-print-directory WAY_FLAGS={way_flags} {target}'.format(target=target, way_flags=way_flags)
     return await run_command(name, way, cmd)
 
 # -----------------------------------------------------------------------------
@@ -1994,10 +2100,10 @@ async def multimod_compile_filter( name, way, top_mod, extra_hc_opts, filter_wit
     return await do_compile( name, way, False, top_mod, [], [], extra_hc_opts, filter_with=filter_with, suppress_stdout=suppress_stdout )
 
 async def multiunit_compile( name, way, units, extra_hc_opts ):
-    return await do_compile( name, way, False, None, [], units, extra_hc_opts )
+    return await do_compile( name, way, False, None, [], units, extra_hc_opts, srcs = [] )
 
 async def multiunit_compile_fail( name, way, units, extra_hc_opts ):
-    return await do_compile( name, way, True, None, [], units, extra_hc_opts )
+    return await do_compile( name, way, True, None, [], units, extra_hc_opts, srcs = [] )
 
 async def multi_compile( name, way, top_mod, extra_mods, extra_hc_opts ):
     return await do_compile( name, way, False, top_mod, extra_mods, [], extra_hc_opts)
@@ -2006,7 +2112,75 @@ async def multi_compile_fail( name, way, top_mod, extra_mods, extra_hc_opts ):
     return await do_compile( name, way, True, top_mod, extra_mods, [], extra_hc_opts)
 
 async def make_depend( name, way, mods, extra_hc_opts ):
-    return await do_compile( name, way, False,  ' '.join(mods), [], [], extra_hc_opts, mode = '-M')
+    return await do_make_depend( name, way, mods, [], extra_hc_opts )
+
+async def make_depend_multiunit( name, way, units, extra_hc_opts ):
+    return await do_make_depend( name, way, [], units, extra_hc_opts )
+
+async def do_make_depend(name: TestName,
+                   way: WayName,
+                   srcs: List[str],
+                   units: List[str],
+                   extra_hc_opts: str
+                   ) -> PassFail:
+    """
+    Run `ghc -M`. Each output has to be requested explicitly:
+
+      * 'dep_makefile': write the -dep-makefile output and compare it
+        against <name>.dep-makefile. Otherwise, -no-dep-makefile is passed.
+      * 'dep_json': write the -dep-json output and compare it
+        against <name>.dep-json.
+      * 'dep_json_stdout': write the -dep-json-stdout and compare it with
+        <name>.stderr
+      * 'dep_makefile_stdout': write the -dep-makefile-stdout and compare it with
+        <name>.stderr
+    """
+    opts = getTestOpts()
+
+    def actual_file(kind: str) -> Path:
+        return add_suffix(name, 'comp.' + kind)
+
+    outputs = []
+    output_flags = []
+    if opts.dep_makefile == DepMode.FILE:
+        outputs.append(('dep-makefile', normalise_dep_makefile))
+        output_flags.append('-dep-makefile %s' % actual_file('dep-makefile'))
+    elif opts.dep_makefile == DepMode.STDOUT:
+        outputs.append(('stdout', normalise_dep_makefile))
+        output_flags.append('-dep-makefile-stdout')
+
+    if opts.dep_json == DepMode.FILE:
+        outputs.append(('dep-json', normalise_dep_json))
+        output_flags.append('-dep-json %s' % actual_file('dep-json'))
+    elif opts.dep_json == DepMode.STDOUT:
+        outputs.append(('stdout', normalise_dep_json))
+        output_flags.append('-dep-json-stdout')
+
+    # Somewhat non-sensical here, but `do_compile` outputs stdout and stderr into the same.
+    # Then, it only applies the `normalise_errmsg_fun` to the output, and compares it against
+    # <name>.stderr as the golden file.
+    #
+    # This is not really what we want in this situation, but it seems this requires more refactoring
+    # of the `do_compile` function than what fendor is ready to commit to.
+    # Thus, as a workaround, we simply add the normalisers for the stderr...
+    stdout_normalisers = [ n for (k, n) in outputs if k == 'stdout' ]
+    opts.extra_errmsg_normaliser = join_normalisers(opts.extra_errmsg_normaliser, normalise_slashes_, *stdout_normalisers)
+
+    result = await do_compile( name, way, False, None, [], units,
+                               ' '.join(output_flags + [extra_hc_opts]),
+                               mode = '-M', srcs = srcs )
+    if badResult(result) or opts.ignore_dep_outputs:
+        return result
+
+    for (kind, normaliser) in outputs:
+        output_match = await compare_outputs(way, kind,
+                           join_normalisers(opts.extra_normaliser, normalise_slashes_, normaliser),
+                           find_expected_file(name, kind, way),
+                           actual_file(kind))
+        if not output_match:
+            return failBecause(kind + ' mismatch', diff=output_match.diff)
+
+    return passed()
 
 async def do_compile(name: TestName,
                way: WayName,
@@ -2137,7 +2311,7 @@ async def compile_grep_core(name: TestName,
 
 async def compile_and_run__(name: TestName,
                       way: WayName,
-                      top_mod: Path,
+                      top_mod: Optional[Path],
                       extra_mods: List[str],
                       extra_hc_opts: str,
                       backpack: bool=False,
@@ -2295,22 +2469,31 @@ async def simple_build(name: Union[TestName, str],
                  suppress_stdout: bool = False,
                  filter_with: str = '',
                  # Override auto-detection of whether to use --make or -c etc.
-                 mode: Optional[str] = None) -> Any:
+                 mode: Optional[str] = None,
+                 # Override the source files passed to the compiler.
+                 # If None, then top_mod is used as the only source argument.
+                 # Otherwise, use the sources and pass them to the ghc invocation.
+                 srcs: Optional[List[str]] = None) -> Any:
     opts = getTestOpts()
 
     # Redirect stdout and stderr to the same file
     stdout = in_testdir(name, 'comp.stderr')
     stderr = subprocess.STDOUT if not suppress_stdout else None
 
-    if top_mod is not None:
-        srcname = top_mod
+    assert srcs is None or top_mod is None, 'srcs and top_mod are mutually exclusive'
+
+    src_args: Union[str, Path]
+    if srcs is not None:
+        src_args = ' '.join(srcs)
+    elif top_mod is not None:
+        src_args = top_mod
     elif addsuf:
         if backpack:
-            srcname = add_suffix(name, 'bkp')
+            src_args = add_suffix(name, 'bkp')
         else:
-            srcname = add_hs_lhs_suffix(name)
+            src_args = add_hs_lhs_suffix(name)
     else:
-        srcname = Path(name)
+        src_args = Path(name)
 
     if mode is not None:
         to_do = mode
@@ -2328,10 +2511,11 @@ async def simple_build(name: Union[TestName, str],
         to_do = '-o ' + name
     elif len(units) > 0:
         to_do = '--make'
-        for u in units:
-            to_do = to_do + ' -unit @%s' % u
     else:
         to_do = '-c' # just compile
+
+    for u in units:
+        to_do = to_do + ' -unit @%s' % u
 
     if isCompilerStatsTest():
         stats_file = statsFile(True, name)
@@ -2357,9 +2541,7 @@ async def simple_build(name: Union[TestName, str],
 
     flags = ' '.join(get_compiler_flags() + config.way_flags[way])
 
-    cmd = ('{cmd_prefix} '
-           '{{compiler}} {to_do} {srcname} {flags} {extra_hc_opts}'
-          ).format(**locals())
+    cmd = f'{cmd_prefix} {{compiler}} {to_do} {src_args} {flags} {extra_hc_opts}'
 
     if filter_with != '':
         cmd = cmd + ' | ' + filter_with
@@ -2420,6 +2602,9 @@ async def simple_run(name: TestName, way: WayName, prog: str, extra_run_opts: st
 
     my_rts_flags = rts_flags(way)
 
+    if opts.io_manager_current is not None:
+        my_rts_flags += ' +RTS --io-manager={0} -RTS '.format(opts.io_manager_current)
+
     # Collect runtime stats if necessary:
     # isStatsTest and not isCompilerStatsTest():
     #   assume we are running a ghc compiled program. Collect stats.
@@ -2444,6 +2629,12 @@ async def simple_run(name: TestName, way: WayName, prog: str, extra_run_opts: st
         cmd = opts.cmd_wrapper(cmd)
 
     output_file = perfStatsFile(False, name)
+
+    # Check that IO Manager is available
+    if opts.io_manager_current is not None:
+        available_io_managers = discover_io_managers(prog, opts.testdir)
+        if opts.io_manager_current not in available_io_managers:
+            framework_fail(name, way, 'IO Manager {} unexpectedly unavailable (available IO Managers: {}). `-non-threaded`/`-threaded` is only supported through way RTS flags (not manually added via test modifiers/args) when testing over IO Managers.'.format(opts.io_manager_current, available_io_managers))
 
     # run the command
     exit_code = await runCmdPerf(opts.compiler_perf_counters, cmd, output_file,
@@ -2506,7 +2697,7 @@ def rts_flags(way: WayName) -> str:
 async def interpreter_run(name: TestName,
                     way: WayName,
                     extra_hc_opts: str,
-                    top_mod: Path
+                    top_mod: Optional[Path]
                     ) -> PassFail:
     opts = getTestOpts()
 
@@ -2549,13 +2740,12 @@ async def interpreter_run(name: TestName,
 
     flags = ' '.join(get_compiler_flags() + config.way_flags[way])
 
-    cmd = ('{{compiler}} {srcname} {flags} {extra_hc_opts}'
-          ).format(**locals())
+    cmd = f'{{compiler}} {srcname} {flags} {extra_hc_opts}'
 
     if opts.cmd_wrapper is not None:
         cmd = opts.cmd_wrapper(cmd);
 
-    cmd = 'cd "{opts.testdir}" && {cmd}'.format(**locals())
+    cmd = f'cd "{opts.testdir}" && {cmd}'
 
     exit_code = await runCmd(cmd, script, stdout, stderr, timeout_multiplier=opts.run_timeout_multiplier)
 
@@ -2753,7 +2943,7 @@ async def check_hp_ok(name: TestName) -> bool:
     opts = getTestOpts()
 
     # do not qualify for hp2ps because we should be in the right directory
-    hp2psCmd = 'cd "{opts.testdir}" && {{hp2ps}} {name}'.format(**locals())
+    hp2psCmd = f'cd "{opts.testdir}" && {{hp2ps}} {name}'
 
     hp2psResult = await runCmd(hp2psCmd, print_output=True)
 
@@ -2877,11 +3067,11 @@ async def compare_outputs(
             if config.accept_platform:
                 if_verbose(1, 'Accepting new output for platform "'
                               + config.platform + '".')
-                expected_path += '-' + config.platform
+                expected_path = Path(str(expected_path) + '-' + config.platform)
             elif config.accept_os:
                 if_verbose(1, 'Accepting new output for os "'
                               + config.os + '".')
-                expected_path += '-' + config.os
+                expected_path = Path(str(expected_path) + '-' + config.os)
             else:
                 if_verbose(1, 'Accepting new output.')
 
@@ -3276,6 +3466,82 @@ def normalise_asm( s: str ) -> str:
           out.append(ins[0])
     return '\n'.join(out)
 
+_WHITESPACE = re.compile(r"\s*")
+
+def normalise_dep_json(s: str) -> str:
+    """
+    Normalise the jsonl output of `ghc -M -dep-json output.json`.
+
+    We format the jsonl nicely, and replace absolute file paths.
+    This also works on a formatted version of jsonl, e.g. when the json object is formatted
+    over multiple lines
+    """
+
+    def normalise_includes(j):
+        # only replace in jsonl objects that contain the "includes" key
+        if isinstance(j, dict) and "includes" in j:
+            # Absolute includes come from the toolchain (e.g. ghcversion.h, stdc-predef.h)
+            # and are platform dependent, so we drop them.
+            j["includes"] = sorted(
+                p for p in j["includes"] if not __is_absolute_path(p)
+            )
+        return j
+
+    decoder = json.JSONDecoder()
+    objects = []
+    m = _WHITESPACE.match(s)
+    assert m is not None
+    pos = m.end()
+    try:
+        while pos < len(s):
+            obj, pos = decoder.raw_decode(s, pos)
+            objects.append(normalise_includes(obj))
+            m = _WHITESPACE.match(s, pos)
+            assert m is not None
+            pos = m.end()
+    except json.JSONDecodeError:
+        return s
+
+    return "\n".join(
+        json.dumps(o, indent=2, sort_keys=True, ensure_ascii=False) for o in objects
+    )
+
+def normalise_dep_makefile(s: str) -> str:
+    """
+    Normalise the Makefile output of `ghc -M`.
+
+    We ensure the output is stable by sorting the rules and replacing absolute file paths.
+    We filter out system file dependencies, as they are very hard to record in a platform independent way.
+    """
+
+    lines = s.split("\n")
+    try:
+        begin = lines.index("# DO NOT DELETE: Beginning of Haskell dependencies") + 1
+        end = lines.index("# DO NOT DELETE: End of Haskell dependencies", begin)
+    except ValueError:
+        return s
+
+    def normalise_rule(rule: str) -> Optional[str]:
+        target, sep, dep = rule.partition(" : ")
+        if __is_absolute_path(dep):
+            if dep.endswith(("hi", "hi-boot")):
+                return target + sep + __replace_absolute_path(dep)
+            else:
+                return None # Filter out system paths
+        else:
+            return target + sep + dep
+
+    rules = sorted(r for r in map(normalise_rule, lines[begin:end]) if r is not None)
+    return "\n".join(lines[:begin] + rules + lines[end:])
+
+def __is_absolute_path(s: str) -> bool:
+    return s.startswith("/")
+
+def __replace_absolute_path(s: str) -> str:
+    if s.startswith("/"):
+        return "<absolute-path>/" + s.rsplit("/", 1)[-1]
+    return s
+
 def safe_print(s: str) -> None:
     s2 = s.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding)
     print(s2)
@@ -3511,7 +3777,7 @@ def find_expected_file(name: TestName, suff: str, way: WayName) -> Path:
 
     for f in files:
         if in_srcdir(f).exists():
-            return f
+            return Path(f)
 
     return basename
 
@@ -3725,21 +3991,24 @@ def strip_diff_header(diff: Optional[str]) -> Optional[str]:
     return diff
 
 def sorted_results(testInfos: List[TestResult]) -> List[TestResult]:
-    return sorted(testInfos, key=lambda r: (r.testname.lower(), r.directory, r.way))
+    return sorted(testInfos, key=lambda r: (r.testname.lower(), r.directory, r.way,
+                                            r.io_manager or ''))
 
 # A failure-output block: a representative result, its header-stripped diff,
 # and the ways that share it.
 OutputGroup = Tuple[TestResult, Optional[str], List[WayName]]
 
 # Tests that fail identically in several ways (e.g. normal and g1) share one
-# output block, with the ways collected in the header.
+# output block, with the ways collected in the header. Results from different
+# IO Managers are kept in separate blocks, so that each header can name its IO
+# Manager.
 def groupTestOutput(testInfos: List[TestResult]) -> List[OutputGroup]:
     # Relies on dicts preserving insertion order.
     groups = {} # type: Dict[Tuple, OutputGroup]
     for result in sorted_results(testInfos):
         diff = strip_diff_header(result.diff)
-        key = (result.testname, result.directory, result.reason,
-               diff, result.stdout, result.stderr)
+        key = (result.testname, result.directory, result.io_manager,
+               result.reason, diff, result.stdout, result.stderr)
         groups.setdefault(key, (result, diff, []))[2].append(result.way)
     return list(groups.values())
 
@@ -3754,8 +4023,9 @@ def printTestOutputSummary(file: TextIO,
 
     where = ', see {}'.format(junit_path) if junit_path else ''
     for result, diff, ways in groups:
-        header = '=====> {}({}) ({}) [{}]'.format(
-            result.testname, ', '.join(ways), result.directory + os.sep, result.reason)
+        header = '=====> {}({}){} ({}) [{}]'.format(
+            result.testname, ', '.join(ways), io_manager_test_name_suffix(result.io_manager),
+            result.directory + os.sep, result.reason)
         file.write(colored_if(color, Color.RED, header) + '\n')
         # See Note [Redundant output in test results] for why these don't overlap.
         for label, contents in [('Output diff (expected vs actual):', diff),
@@ -3779,7 +4049,8 @@ def printTestOutputSummary(file: TextIO,
 def printTestInfosSummary(file: TextIO, testInfos):
     for result in sorted_results(testInfos):
         path = os.path.join(result.directory, result.testname)
-        file.write('   {path} [{r.reason}] ({r.way})\n'.format(r=result, path=path))
+        file.write('   {path} [{r.reason}] ({r.way}){io}\n'.format(
+            r=result, path=path, io=io_manager_test_name_suffix(result.io_manager)))
     file.write('\n')
 
 def modify_lines(s: str, f: Callable[[str], str]) -> str:

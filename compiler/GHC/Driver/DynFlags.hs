@@ -73,6 +73,9 @@ module GHC.Driver.DynFlags (
         IncludeSpecs(..), addGlobalInclude, addQuoteInclude, flattenIncludes,
         addImplicitQuoteInclude,
 
+        -- * `ghc -M` specification
+        MkDependOutput(..),
+
         -- * SDoc
         initSDocContext, initDefaultSDocContext,
         initPromotionTickContext,
@@ -335,7 +338,8 @@ data DynFlags = DynFlags {
     -- ^ External plugins loaded from shared libraries
 
   --  For ghc -M
-  depMakefile           :: FilePath,
+  depMakefile           :: MkDependOutput,
+  depJson               :: MkDependOutput,
   depIncludePkgDeps     :: Bool,
   depIncludeCppDeps     :: Bool,
   depExcludeMods        :: [ModuleName],
@@ -669,7 +673,8 @@ defaultDynFlags mySettings =
         llvmOptLevel            = 0,
 
         -- ghc -M values
-        depMakefile       = "Makefile",
+        depMakefile       = MkDepend_Default "Makefile",
+        depJson           = MkDepend_None,
         depIncludePkgDeps = False,
         depIncludeCppDeps = False,
         depExcludeMods    = [],
@@ -763,6 +768,15 @@ flattenExtensionFlags ml = foldr g defaultExtensionFlags
     where g (On f)  flags = EnumSet.insert f flags
           g (Off f) flags = EnumSet.delete f flags
           defaultExtensionFlags = EnumSet.fromList (languageExtensions ml)
+
+-- -----------------------------------------------------------------------------
+-- -M -dep-*
+
+data MkDependOutput
+  = MkDepend_None
+  | MkDepend_Default !FilePath
+  | MkDepend_Explicit !FilePath
+  | MkDepend_StdOut
 
 -- -----------------------------------------------------------------------------
 -- -jN

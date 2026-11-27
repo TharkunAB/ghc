@@ -148,31 +148,53 @@ parseString = parseText . T.pack
 parseText :: Text -> DocH mod Identifier
 parseText = parseParagraph . T.dropWhile isSpace . T.filter (/= '\r')
 
+-- | Where inline markup is parsed. See Note [Backticks in code].
+data SpanContext
+  = -- | Normal text
+    Prose
+  | -- | Text between \@...\@
+    Code
+
 parseParagraph :: Text -> DocH mod Identifier
-parseParagraph = snd . parse p
+parseParagraph = parse_paragraph Prose
+
+parse_paragraph :: SpanContext -> Text -> DocH mod Identifier
+parse_paragraph ctx = snd . parse p
   where
     p :: Parser (DocH mod Identifier)
     p =
-      docConcat
+      docConcat . mark_infix
         <$> many
-          ( choice'
+          ( choice' $
               [ monospace
               , anchor
-              , identifier
-              , moduleName
-              , picture
-              , mathDisplay
-              , mathInline
-              , markdownImage
-              , markdownLink
-              , hyperlink
-              , bold
-              , emphasis
+              ]
+                ++ backtick_parsers
+                ++ [ backtickRun
+                   , moduleName
+                   , picture
+                   , mathDisplay
+                   , mathInline
+                   , markdownImage
+                   , markdownLink ctx
+                   , hyperlink
+                   , bold ctx
+                   , emphasis ctx
               , encodedChar
               , string'
-              , skipSpecialChar
-              ]
+                   , skipSpecialChar
+                   ]
           )
+
+    backtick_parsers :: [Parser (DocH mod Identifier)]
+    backtick_parsers = case ctx of
+      Prose -> [backtickSpan, identifier]
+      Code -> [identifier]
+
+    mark_infix :: [DocH mod Identifier] -> [DocH mod Identifier]
+    mark_infix = case ctx of
+      Prose -> id
+      Code -> infixInCode
 
 -- | Parses and processes
 -- <https://en.wikipedia.org/wiki/Numeric_character_reference Numeric character references>
@@ -230,17 +252,17 @@ skipSpecialChar = DocString . T.singleton <$> Parsec.oneOf specialChar
 --
 -- >>> parseString "/Hello world/"
 -- DocEmphasis (DocString "Hello world")
-emphasis :: Parser (DocH mod Identifier)
-emphasis =
-  DocEmphasis . parseParagraph
+emphasis :: SpanContext -> Parser (DocH mod Identifier)
+emphasis ctx =
+  DocEmphasis . parse_paragraph ctx
     <$> disallowNewline ("/" *> takeWhile1_ (/= '/') <* "/")
 
 -- | Bold parser.
 --
 -- >>> parseString "__Hello world__"
 -- DocBold (DocString "Hello world")
-bold :: Parser (DocH mod Identifier)
-bold = DocBold . parseParagraph <$> disallowNewline ("__" *> takeUntil "__")
+bold :: SpanContext -> Parser (DocH mod Identifier)
+bold ctx = DocBold . parse_paragraph ctx <$> disallowNewline ("__" *> takeUntil "__")
 
 disallowNewline :: Parser Text -> Parser Text
 disallowNewline = mfilter (T.all (/= '\n'))
@@ -273,8 +295,109 @@ anchor =
 -- DocMonospaced (DocString "cruel")
 monospace :: Parser (DocH mod Identifier)
 monospace =
-  DocMonospaced . parseParagraph
+  DocMonospaced . parse_paragraph Code
     <$> ("@" *> takeWhile1_ (/= '@') <* "@")
+
+-- Note [Backtick code spans]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- A backtick span has two readings:
+--
+--   `foo`      a hyperlinked identifier, same as 'foo'
+--   `foo bar`  a monospaced code span, same as @foo bar@
+--
+-- In prose, 'backtickSpan' is tried before 'identifier'. Text between @...@
+-- does not use it: see Note [Backticks in code]. 'backtickSpan' parses a
+-- closed code span (rules below) and then decides:
+--
+-- * If 'takeIdentifier' parses the whole span, the result is the
+--   identifier. Thus `foo`, `Foo.bar`, `(++)` and `foldl'` are links, and
+--   ``foo`` is the identifier foo in infix form, not code "foo".
+--
+-- * Else the result is code. This includes spans in which 'takeIdentifier'
+--   reads a shorter identifier closed by a single quote:
+--
+--     `foldl' f z xs`     code "foldl' f z xs", not identifier foldl
+--     `don't panic`       code "don't panic", not identifier don
+--
+-- If no closing run exists, 'backtickSpan' fails and 'identifier' gets the
+-- input. Thus the TeX-style form `foo' stays the identifier foo. Then
+-- 'backtickRun' makes the opening run plain text.
+--
+-- Code spans follow the CommonMark rules:
+--
+-- * A span opens with a run of N backticks and closes with the next run of
+--   exactly N backticks on the same line. A run of a different length is
+--   part of the content. Thus a code span that contains a backtick, such as
+--   an infix application, uses more backticks:
+--
+--     ``x `plus` y``      code "x `plus` y"
+--
+-- * If the content both starts and ends with a space, and is not only
+--   spaces, one space is removed at each end:
+--
+--     `` `foo` ``         code "`foo`"
+--
+-- * The content is literal: no markup is parsed and backslash escapes are
+--   not removed, so `\x -> x` keeps its backslash.
+--
+-- * If no closing run exists, the whole opening run is plain text. Thus
+--   "``" and a lone backtick keep their old meaning, and in "`` `a b`" only
+--   "`a b`" is a code span.
+--
+-- A closed code span wins over the mixed form `foo'. Thus a line such as
+-- "`Foldable') or `elem`" gives code "Foldable') or ". Write 'Foldable'
+-- there instead.
+
+-- | Backtick span parser: an identifier or a code span. Fails if the span
+-- is not closed. See Note [Backtick code spans].
+--
+-- >>> parseString "`foo bar`"
+-- DocMonospaced (DocString "foo bar")
+--
+-- >>> parseString "``x `plus` y``"
+-- DocMonospaced (DocString "x `plus` y")
+--
+-- >>> parseString "`foldl' f z xs`"
+-- DocMonospaced (DocString "foldl' f z xs")
+backtickSpan :: Parser (DocH mod Identifier)
+backtickSpan = do
+  (n, content) <- code_span
+  let fence = T.replicate n "`"
+  pure $ case takeIdentifier (fence <> content <> fence) of
+    Just (ns, op, ident, cl, rest)
+      | T.null rest -> DocIdentifier (Identifier ns op (T.unpack ident) cl)
+    _ -> DocMonospaced (DocString (strip_space content))
+  where
+    -- The length of the opening run and the content up to the closing run
+    -- of exactly as many backticks.
+    code_span :: Parser (Int, Text)
+    code_span = do
+      n <- T.length <$> takeWhile1 (== '`')
+      content <- T.concat <$> many (try (content_chunk n))
+      _ <- backtick_run n
+      if T.null content then empty else pure (n, content)
+
+    content_chunk :: Int -> Parser Text
+    content_chunk n =
+      takeWhile1 (\c -> c /= '`' && c /= '\n')
+        <|> mfilter ((/= n) . T.length) (takeWhile1 (== '`'))
+
+    backtick_run :: Int -> Parser Text
+    backtick_run n = mfilter ((== n) . T.length) (takeWhile1 (== '`'))
+
+    strip_space :: Text -> Text
+    strip_space t
+      | T.length t >= 2
+      , T.head t == ' '
+      , T.last t == ' '
+      , not (T.all (== ' ') t) =
+          T.init (T.tail t)
+      | otherwise = t
+
+-- | A run of backticks that opens neither a code span nor an identifier is
+-- plain text. See Note [Backtick code spans].
+backtickRun :: Parser (DocH mod a)
+backtickRun = DocString <$> takeWhile1 (== '`')
 
 -- | Module names.
 --
@@ -304,9 +427,9 @@ moduleNameString = modid `maybeFollowedBy` anchor_
 
 -- | A labeled link to an indentifier, module or url using markdown
 -- syntax.
-markdownLink :: Parser (DocH mod Identifier)
-markdownLink = do
-  lbl <- markdownLinkText
+markdownLink :: SpanContext -> Parser (DocH mod Identifier)
+markdownLink ctx = do
+  lbl <- markdownLinkText ctx
   choice' [markdownModuleName lbl, markdownURL lbl]
   where
     markdownModuleName lbl = do
@@ -361,7 +484,7 @@ mathDisplay =
 -- DocPic (Picture "www.site.com" (Just "some emphasis in a description"))
 markdownImage :: Parser (DocH mod Identifier)
 markdownImage = do
-  text <- markup stringMarkup <$> ("!" *> markdownLinkText)
+  text <- markup stringMarkup <$> ("!" *> markdownLinkText Prose)
   url <- markdownLinkTarget
   pure $ DocPic (Picture url (Just text))
   where
@@ -629,7 +752,7 @@ textParagraph :: Parser (DocH mod Identifier)
 textParagraph = parseText . T.intercalate "\n" <$> some nonEmptyLine
 
 textParagraphThatStartsWithMarkdownLink :: Parser (DocH mod Identifier)
-textParagraphThatStartsWithMarkdownLink = docParagraph <$> (docAppend <$> markdownLink <*> optionalTextParagraph)
+textParagraphThatStartsWithMarkdownLink = docParagraph <$> (docAppend <$> markdownLink Prose <*> optionalTextParagraph)
   where
     optionalTextParagraph :: Parser (DocH mod Identifier)
     optionalTextParagraph =
@@ -874,7 +997,7 @@ property = DocProperty . T.strip <$> ("prop>" *> takeWhile1 (/= '\n'))
 -- for markup.
 codeblock :: Parser (DocH mod Identifier)
 codeblock =
-  DocCodeBlock . parseParagraph . dropSpaces
+  DocCodeBlock . parse_paragraph Code . dropSpaces
     <$> ("@" *> skipHorizontalSpace *> "\n" *> block' <* "@")
   where
     dropSpaces xs = let ys = splitByNl xs in
@@ -919,8 +1042,8 @@ angleBracketLink =
     <$> disallowNewline ("<" *> takeUntil ">")
 
 -- | The text for a markdown link, enclosed in square brackets.
-markdownLinkText :: Parser (DocH mod Identifier)
-markdownLinkText = parseParagraph . T.strip <$> ("[" *> takeUntil "]")
+markdownLinkText :: SpanContext -> Parser (DocH mod Identifier)
+markdownLinkText ctx = parse_paragraph ctx . T.strip <$> ("[" *> takeUntil "]")
 
 -- | The target for a markdown link, enclosed in parenthesis.
 markdownLinkTarget :: Parser Text
@@ -956,3 +1079,134 @@ autoUrl = mkLink <$> url
 -- | Parses identifiers with help of 'parseValid'.
 identifier :: Parser (DocH mod Identifier)
 identifier = DocIdentifier <$> parseValid
+
+-- Note [Backticks in code]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~
+-- Text between @...@ is already code, so 'parse_paragraph' does not use
+-- 'backtickSpan' there. The backticks of a span stay as text:
+--
+--   @x <- f   -- of type `M Bool`@     code "x <- f   -- of type `M Bool`"
+--
+-- 'identifier' still parses `x`, and its backticks have two uses:
+--
+-- * A link marker, as in prose: @`foldlM` :: ...@ or @`seq`@. The
+--   backticks are not shown.
+--
+-- * The infix form of Haskell: @f `elem` xs@. The backticks must be shown,
+--   else the code reads "f elem xs".
+--
+-- 'infixInCode' uses the Haskell grammar to choose: `x` is infix only in
+-- an infix application or in an operator section. Thus, spaces excluded,
+-- one of these must be true:
+--
+-- * An operand ends before `x` (a name, a literal, a closing bracket or
+--   other markup) and an operand starts after it.
+--
+-- * A section: '(' is before `x` and an operand starts after it, or an
+--   operand ends before `x` and ')' is after it.
+--
+--   @f `elem` xs@          infix: link "`elem`", as if written ``elem``
+--   @(`elem` xs)@          infix (right section)
+--   @(x `elem`)@           infix (left section)
+--   @`foldlM` :: t@        link marker: link "foldlM"
+--   @(`elem`)@             link marker: no operand
+--   @`map` `show` xs@      link markers: `map` is not an operand
+--   @(op \``on`\` f)@      link marker: '`' does not end an operand
+--
+-- Only an alphanumeric identifier can be infix, so @`(<*>)`@ is always a
+-- link marker.
+--
+-- If GHC cannot parse an infix identifier (for example the keyword
+-- `case`), it becomes text with both pairs of backticks: "``case``".
+
+-- | Mark the infix identifiers of a code span. See Note [Backticks in code].
+--
+-- >>> parseString "@f `elem` xs@"
+-- DocMonospaced (DocAppend (DocString "f ") (DocAppend (DocIdentifier (Identifier None '`' "`elem`" '`')) (DocString " xs")))
+infixInCode :: [DocH mod Identifier] -> [DocH mod Identifier]
+infixInCode = go []
+  where
+    -- The first argument holds the previous pieces, nearest first.
+    go :: [DocH mod Identifier] -> [DocH mod Identifier] -> [DocH mod Identifier]
+    go _ [] = []
+    go before (d : after) = d' : go (d : before) after
+      where
+        d' = case d of
+          DocIdentifier (Identifier ns '`' x '`')
+            | is_alpha_ident x
+            , is_infix (side_before before) (side_after after) ->
+                DocIdentifier (Identifier ns '`' ("`" ++ x ++ "`") '`')
+          _ -> d
+
+    -- An infix application, or a left or right operator section.
+    is_infix :: InfixSide -> InfixSide -> Bool
+    is_infix l r = case (l, r) of
+      (Operand, Operand) -> True
+      (SectionParen, Operand) -> True
+      (Operand, SectionParen) -> True
+      _ -> False
+
+    -- Only an alphanumeric identifier, possibly qualified, can be infix.
+    is_alpha_ident :: String -> Bool
+    is_alpha_ident x = case x of
+      c : _ -> isAlpha c || c == '_'
+      [] -> False
+
+    side_before :: [DocH mod Identifier] -> InfixSide
+    side_before = infix_side (fmap snd . T.unsnoc . T.stripEnd) classify
+      where
+        classify c
+          | isAlphaNum c || c `elem` (")]}_'\"#" :: String) = Operand
+          | c == '(' = SectionParen
+          | otherwise = NoOperand
+
+    side_after :: [DocH mod Identifier] -> InfixSide
+    side_after = infix_side (fmap fst . T.uncons . T.stripStart) classify
+      where
+        classify c
+          | isAlphaNum c || c `elem` ("([_'\"\\" :: String) = Operand
+          | c == ')' = SectionParen
+          | otherwise = NoOperand
+
+-- | Classify the side of a backticked identifier in code. See
+-- 'infixInCode'.
+--
+-- The pieces are the ones on that side, nearest first. The first function
+-- gives the character of a text that is nearest to the identifier,
+-- spaces excluded; the second classifies it.
+--
+-- * A text of only spaces (or newlines, in a code block) says nothing,
+--   so the next piece decides. Thus @f   `elem`  xs@ is infix.
+--
+-- * An identifier between backticks is not an operand: next to it, the
+--   backticks are link markers. Thus in @`map` `show` xs@ both are links,
+--   and the code reads "map show xs".
+--
+-- * Any other piece comes from markup inside the code: an identifier, a
+--   module name, a link, emphasis, and so on. Such a piece stands for a
+--   name or an expression, so it is an operand. Thus @'f' `elem` xs@ is
+--   infix.
+--
+-- * No piece means the edge of the code span: there is no operand.
+infix_side
+  :: (Text -> Maybe Char)
+  -> (Char -> InfixSide)
+  -> [DocH mod Identifier]
+  -> InfixSide
+infix_side nearest_char classify = go
+  where
+    go ds = case ds of
+      DocString t : rest -> maybe (go rest) classify (nearest_char t)
+      DocIdentifier (Identifier _ '`' _ '`') : _ -> NoOperand
+      _ : _ -> Operand
+      [] -> NoOperand
+
+-- | What is on one side of a backticked identifier in code. See
+-- 'infixInCode'.
+data InfixSide
+  = -- | The end of an operand before, or the start of an operand after
+    Operand
+  | -- | The parenthesis of an operator section: '(' before or ')' after
+    SectionParen
+  | -- | Anything else, or the edge of the code span
+    NoOperand

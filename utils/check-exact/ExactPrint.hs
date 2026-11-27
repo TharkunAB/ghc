@@ -978,23 +978,17 @@ markExternalSourceTextA ann src txt = do
 
 -- ---------------------------------------------------------------------
 
-markLensBracketsO :: (Monad m, Monoid w)
-  => a -> Lens a AnnListBrackets -> EP w m a
-markLensBracketsO a l =
-  case view l a of
-    ListBraces o c -> do
-      o' <- markEpToken o
-      return (set l (ListBraces o' c) a)
-    ListNone -> return (set l ListNone a)
+markEpLayoutO :: (Monad m, Monoid w) => EpLayout -> EP w m EpLayout
+markEpLayoutO (EpExplicitBraces o c) = do
+  o' <- markEpToken o
+  return (EpExplicitBraces o' c)
+markEpLayoutO ep = return ep
 
-markLensBracketsC :: (Monad m, Monoid w)
-  => a -> Lens a AnnListBrackets -> EP w m a
-markLensBracketsC a l =
-  case view l a of
-    ListBraces o c -> do
-      c' <- markEpToken c
-      return (set l (ListBraces o c') a)
-    ListNone -> return (set l ListNone a)
+markEpLayoutC :: (Monad m, Monoid w) => EpLayout -> EP w m EpLayout
+markEpLayoutC (EpExplicitBraces o c) = do
+  c' <- markEpToken c
+  return (EpExplicitBraces o c')
+markEpLayoutC ep = return ep
 
 -- -------------------------------------
 
@@ -1156,26 +1150,6 @@ limportDeclAnnPackage k annImp = fmap (\new -> annImp { importDeclAnnPackage = n
 -- limportDeclAnnAs :: Lens EpAnnImportDecl (Maybe EpaLocation)
 -- limportDeclAnnAs k annImp = fmap (\new -> annImp { importDeclAnnAs = new })
 --                                      (k (importDeclAnnAs annImp))
-
--- -------------------------------------
-
--- data AnnList
---   = AnnList {
---       al_layout    :: !AnnListLayout,
---       al_brackets  :: !AnnListBrackets,
---       al_semis     :: [EpToken ";"], -- decls
---       al_trailing  :: [TrailingAnn] -- ^ items appearing after the
---                                     -- list, such as '=>' for a
---                                     -- context
---       } deriving (Data,Eq)
-
-lal_brackets :: Lens AnnList AnnListBrackets
-lal_brackets k parent = fmap (\new -> parent { al_brackets = new })
-                           (k (al_brackets parent))
-
-lal_semis :: Lens AnnList [EpToken ";"]
-lal_semis k parent = fmap (\new -> parent { al_semis = new })
-                           (k (al_semis parent))
 
 -- -------------------------------------
 
@@ -1438,12 +1412,6 @@ markLensFun a l f = do
 
 -- -------------------------------------
 
-markEpAnnAllLT :: (Monad m, Monoid w, KnownSymbol tok)
-  => ann -> Lens ann [EpToken tok] -> EP w m ann
-markEpAnnAllLT a l = do
-  anns <- mapM markEpToken (view l a)
-  return (set l anns a)
-
 markEpaLocationAll :: (Monad m, Monoid w)
   => [EpaLocation] -> String -> EP w m [EpaLocation]
 markEpaLocationAll locs str = mapM (\l -> printStringAtAA l str) locs
@@ -1479,12 +1447,12 @@ markAnnListA :: (Monad m, Monoid w)
   => AnnList
   -> EP w m a
   -> EP w m (AnnList, a)
-markAnnListA an action = do
-  an0 <- markLensBracketsO an lal_brackets
-  an1 <- markEpAnnAllLT an0 lal_semis
+markAnnListA (AnnList la semis) action = do
+  la0 <- markEpLayoutO la
+  semis' <- mapM markEpToken semis
   r <- action
-  an2 <- markLensBracketsC an1 lal_brackets
-  return (an2, r)
+  la1 <- markEpLayoutC la0
+  return ((AnnList la1 semis'), r)
 
 -- ---------------------------------------------------------------------
 
@@ -2649,7 +2617,7 @@ instance ExactPrint (HsLocalBinds GhcPs) where
     w' <- markEpToken w -- 'where'
 
     case al_layout an0 of
-      AnnListLayout anc -> do
+      EpVirtualBraces anc -> do
         when (not $ isEmptyValBinds valbinds) $ setExtraDP (Just anc)
       _ -> return ()
 
@@ -2660,7 +2628,7 @@ instance ExactPrint (HsLocalBinds GhcPs) where
              Nothing -> return an1
              Just (ss,dp) -> do
                  setExtraDPReturn Nothing
-                 return $ an1 { al_layout = AnnListLayout (EpaDelta ss dp []) }
+                 return $ an1 { al_layout = EpVirtualBraces (EpaDelta ss dp []) }
     return (HsValBinds (an2, w') valbinds')
 
   exact (HsIPBinds (an,w) bs) = do
@@ -3088,12 +3056,10 @@ instance ExactPrint (HsExpr GhcPs) where
     e3' <- markAnnotated e3
     return (HsIf an4 e1' e2' e3')
 
-  exact (HsMultiIf (i,o,c) mg) = do
+  exact (HsMultiIf (i,al) mg) = do
     i0 <- markEpToken i
-    o0 <- markEpToken o
-    mg' <- markAnnotated mg
-    c0 <- markEpToken c
-    return (HsMultiIf (i0,o0,c0) mg')
+    (al',mg') <- markAnnListA al $ setLayoutBoth $ markAnnotated mg
+    return (HsMultiIf (i0,al') mg')
 
   exact (HsLet (tkLet, tkIn) binds e) = do
     setLayoutBoth $ do -- Make sure the 'in' gets indented too
@@ -3191,13 +3157,11 @@ instance ExactPrint (HsExpr GhcPs) where
     c' <- markEpUniToken c
     return (HsUntypedBracket a (PatBr (o',c') e'))
 
-  exact (HsUntypedBracket a (DecBrL (o,c, (oc,cc)) e)) = do
+  exact (HsUntypedBracket a (DecBrL (o,c, al) e)) = do
     o' <- markEpToken o
-    oc' <- markEpToken oc
-    e' <- mapM markAnnotated e
-    cc' <- markEpToken cc
+    (al',e') <- markAnnListA al $ setLayoutBoth $ mapM markAnnotated e
     c' <- markEpUniToken c
-    return (HsUntypedBracket a (DecBrL (o',c',(oc',cc')) e'))
+    return (HsUntypedBracket a (DecBrL (o',c',al') e'))
 
   exact (HsUntypedBracket a (TypBr (o,c) e)) = do
     o' <- markEpToken o
@@ -4184,6 +4148,14 @@ instance ExactPrint (HsType GhcPs) where
     (ann', mt') <- exactBang (ann, mt) str
     ty' <- markAnnotated ty
     return (XHsType (HsBangTy ann' (HsSrcBang mt' up str) ty'))
+  -- mkGadtDecl sometimes leaves HsRecTy intact instead of converting
+  -- it to RecConGADT, counting on the renamer to reject it later on.
+  -- Exact printing must cope with it.
+  exact (XHsType (HsRecTy (o,c) flds)) = do
+    o' <- markEpToken o
+    flds' <- markAnnotated flds
+    c' <- markEpToken c
+    return (XHsType (HsRecTy (o',c') flds'))
   exact (HsExplicitListTy (sq,o,c) prom tys) = do
     sq' <- if (isPromoted prom)
              then markEpToken sq

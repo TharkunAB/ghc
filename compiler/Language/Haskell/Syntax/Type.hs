@@ -419,7 +419,7 @@ data HsGadtTelescope pass
   | HsGadtContext (LHsContext pass)
   | HsGadtPar !(XGadtPar pass)
     -- ^ `HsGadtPar` is only usefull for pretty-printing/exact-printing for recovering
-    -- parenthisis interleaved with foralls.
+    -- parentheses interleaved with foralls.
     --
     -- This approach differs from `HsPar`, which wraps the inner expression as if
     -- surrounding it with parentheses. We can ditch the `HsPar` approach because

@@ -963,6 +963,7 @@ test-primops-label:
       # where we do not have the normal validate jobs. We have the -nightly job
       # below to handle this case.
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*full-ci.*/'
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*marge_bot_batch_merge_job.*/'
 
 test-primops-nightly:
   extends: .test-primops
@@ -1293,17 +1294,15 @@ ghcup-metadata-nightly:
       artifacts: false
     - job: project-version
   script:
-    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" metadata_test.yaml
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --nightly-mode --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" metadata_test.yaml
   rules:
     - if: $NIGHTLY
 
 # Update the ghcup metadata with information about this nightly pipeline
 ghcup-metadata-nightly-push:
   stage: deploy
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora43:$DOCKER_REV"
+  image: debian:13
   dependencies: null
-  tags:
-    - x86_64-linux
   variables:
     BUILD_FLAVOUR: default
     GIT_SUBMODULE_STRATEGY: "none"

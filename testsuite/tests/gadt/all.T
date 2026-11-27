@@ -112,7 +112,8 @@ test('T7321', [], makefile_test, [])
 test('T7974', normal, compile, [''])
 test('T7558', normal, compile, [''])
 test('T9380', normal, compile_and_run, [''])
-test('T12087', normal, compile, [''])
+test('T12087a', normal, compile, [''])
+test('T12087b', normal, compile, [''])
 test('T12468', normal, compile_fail, [''])
 test('T14320', normal, compile, [''])
 test('T14719', normal, compile_fail, ['-fdiagnostics-show-caret'])
@@ -135,6 +136,8 @@ test('T23298', normal, compile_fail, [''])
 
 test('T27423a', normal, compile, [''])
 test('T27423b', normal, compile_fail, [''])
+test('T27424a', normal, compile, [''])
+test('T27424b', normal, compile_fail, [''])
 test('CurriedGadtContexts', extra_files(['CurriedGadtContextsProvider.hs']),
      multimod_compile_and_run, ['CurriedGadtContexts', '-dcore-lint -dstg-lint'])
 test('TerminalGadtForAll', extra_files(['TerminalGadtForAllProvider.hs']),

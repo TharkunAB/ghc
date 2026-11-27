@@ -881,9 +881,8 @@ getRecConArgs_maybe (ConDeclGADT{con_g_args = args}) = case args of
   PrefixConGADT{} -> Nothing
   RecConGADT _ flds -> Just flds
 
-hsConDeclTheta :: Maybe (LHsContext (GhcPass p)) -> [LHsType (GhcPass p)]
-hsConDeclTheta Nothing            = []
-hsConDeclTheta (Just (L _ (HsContext _ theta))) = theta
+hsConDeclTheta :: Foldable t => t (LHsContext (GhcPass p)) -> [LHsType (GhcPass p)]
+hsConDeclTheta = concatMap (hsc_ctxt . unLoc)
 
 ppDataDefnHeader
  :: (OutputableBndrId p)

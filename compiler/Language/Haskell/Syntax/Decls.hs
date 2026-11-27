@@ -989,7 +989,7 @@ data ConDecl pass
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The source types of both forms of GADT constructors are very structured, as they
 must consist of the quantified type variables (if provided), followed by the
-context (if provided), followed by the argument types (if provided), followed
+contexts (if provided), followed by the argument types (if provided), followed
 by the result type. (See "Wrinkle: No nested foralls or contexts" below for
 more discussion on the restrictions imposed here.) As a result, instead of
 storing the type of a GADT constructor as a single LHsType, we split it up
@@ -1067,6 +1067,8 @@ GHC.Core.DataCon. For instance:
       -- Rejected, `forall b` is nested
     MkT3 :: forall a b. Eq a => Eq b => a -> b -> T
       -- OK, consecutive contexts
+    MkT3' :: forall a b. Eq a => a -> Eq b => b -> T
+      -- Rejected unless DependentTypes or ordered GADT context applies
     MkT4 :: Int -> forall a. a -> T
       -- Rejected, `forall a` is nested
     MkT5 :: forall a. Int -> Eq a => a -> T

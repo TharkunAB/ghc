@@ -134,6 +134,7 @@ import Data.List (isPrefixOf)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
 import Data.Data (Data(..))
+import Data.Foldable ( toList )
 
 import qualified Data.Semigroup as S
 import GHC.Data.Bag
@@ -1831,10 +1832,9 @@ pprHsForAllTelescope tele =
 pprForAllMatchability :: OutputableBndrId p => Maybe (LHsType (GhcPass p)) -> SDoc
 pprForAllMatchability = maybe empty (\ma -> char '@' <> ppr (parenthesizeHsType appPrec ma))
 
-pprLHsContext :: (OutputableBndrId p)
-              => Maybe (LHsContext (GhcPass p)) -> SDoc
-pprLHsContext Nothing = empty
-pprLHsContext (Just lctxt) = pprLHsContextAlways lctxt
+pprLHsContext :: (Foldable t, OutputableBndrId p)
+              => t (LHsContext (GhcPass p)) -> SDoc
+pprLHsContext = sep . map pprLHsContextAlways . toList
 
 -- For use in a HsQualTy, which always gets printed if it exists.
 pprLHsContextAlways :: (OutputableBndrId p)

@@ -35,7 +35,6 @@ module GHC.Driver.Flags
    , validHoleFitsImpliedGFlags
    , impliedGFlags
    , impliedOffGFlags
-   , glasgowExtsFlags
 
    , ExtensionDeprecation(..)
    , Deprecation(..)
@@ -410,41 +409,6 @@ impliedOffGFlags :: [(GeneralFlag, TurnOnFlag, GeneralFlag)]
 impliedOffGFlags = [(Opt_Strictness, turnOff, Opt_WorkerWrapper)
                    ,(Opt_WriteSourceEquations, turnOn, Opt_SuppressSourceEquations)
                    ,(Opt_WriteSourceEquations, turnOff, Opt_ExplicitWriteSourceEquations)]
-
--- Please keep @docs/users_guide/what_glasgow_exts_does.rst@ up to date with this list.
-glasgowExtsFlags :: [LangExt.Extension]
-glasgowExtsFlags = [
-             LangExt.ConstrainedClassMethods
-           , LangExt.DeriveDataTypeable
-           , LangExt.DeriveFoldable
-           , LangExt.DeriveFunctor
-           , LangExt.DeriveGeneric
-           , LangExt.DeriveTraversable
-           , LangExt.EmptyDataDecls
-           , LangExt.ExistentialQuantification
-           , LangExt.ExplicitNamespaces
-           , LangExt.FlexibleContexts
-           , LangExt.FlexibleInstances
-           , LangExt.ForeignFunctionInterface
-           , LangExt.FunctionalDependencies
-           , LangExt.GeneralizedNewtypeDeriving
-           , LangExt.ImplicitParams
-           , LangExt.KindSignatures
-           , LangExt.LiberalTypeSynonyms
-           , LangExt.MagicHash
-           , LangExt.MultiParamTypeClasses
-           , LangExt.ParallelListComp
-           , LangExt.PatternGuards
-           , LangExt.PostfixOperators
-           , LangExt.RankNTypes
-           , LangExt.RecursiveDo
-           , LangExt.ScopedTypeVariables
-           , LangExt.StandaloneDeriving
-           , LangExt.TypeOperators
-           , LangExt.TypeSynonymInstances
-           , LangExt.UnboxedTuples
-           , LangExt.UnicodeSyntax
-           , LangExt.UnliftedFFITypes ]
 
 -- | Debugging flags
 data DumpFlag

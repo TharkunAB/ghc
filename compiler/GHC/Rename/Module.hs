@@ -30,7 +30,8 @@ import GHC.Rename.HsType
 import GHC.Rename.Bind
 import GHC.Rename.Doc
 import GHC.Rename.Env
-import GHC.Rename.Utils ( mapFvRn, bindLocalNames
+import GHC.Rename.Utils ( mapFvRn, mapMaybeFvRn
+                        , bindLocalNames
                         , checkDupRdrNames, bindLocalNamesFV
                         , warnUnusedTypePatterns, warnPunBindingsAgainst
                         , noNestedForallsContextsErr

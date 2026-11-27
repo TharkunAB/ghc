@@ -722,6 +722,16 @@ is_ip_bind decl             = Right decl
 --      Data types
 ---------------------------------------------------
 
+{- Note [Contexts of nested ForallC]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Record GADT constructors accept at most one context in source syntax, whereas
+Template Haskell can nest multiple context-only 'ForallC' wrappers around
+'RecGadtC' (test: th/T27424d). In 'cvtForallCon', 'merge_rec_contexts'
+coalesces adjacent 'HsGadtContext' nodes on 'RecConGADT' declarations so both
+typechecking and @-ddump-splices@ receive valid record GADT syntax, while
+preserving separate ordered telescope groups on prefix GADT constructors.
+-}
+
 cvtConstr :: Bool    -- ^ Is this a type data declaration?
           -> TH.Name -- ^ name of first constructor of parent type
           -> (TH.Name -> CvtM (LocatedN RdrName)) -- ^ convert constructor name
@@ -941,14 +951,15 @@ cvtForallCon type_data parent_con do_con_name ma tvs ctxt con =
     context_nodes cxt = [mkHsGadtContext cxt | not (null (hsc_ctxt (unLoc cxt)))]
     add_group tvs cxt con@ConDeclH98{con_telescope = teles} =
       con { con_telescope = [forall_node tvs | not (null tvs)] ++ context_nodes cxt ++ teles }
-    add_group tvs cxt con@ConDeclGADT{con_outer_bndrs = L l outer, con_telescope = inner}
+    add_group tvs cxt con@ConDeclGADT{con_outer_bndrs = L l outer, con_telescope = inner, con_g_args = g_args}
       | null tvs, null (hsc_ctxt (unLoc cxt)) = con
       | otherwise =
         con { con_outer_bndrs = L l new_outer
-            , con_telescope = context_nodes cxt ++ old_outer ++ inner }
+            , con_telescope = new_tele }
       where
         -- A context-only wrapper precedes the child's first explicit group.
-        -- See Note [Constructor telescope contexts] in GHC.Hs.Decls.
+        -- See Note [Constructor telescope contexts] in GHC.Hs.Decls and
+        -- Note [Contexts of nested ForallC].
         new_outer | null tvs = mkHsOuterImplicit
                   | otherwise = (mkHsOuterExplicit noAnn tvs) { hso_matchability = ma }
         old_outer = case outer of
@@ -956,6 +967,17 @@ cvtForallCon type_data parent_con do_con_name ma tvs ctxt con =
           HsOuterExplicit{hso_matchability = old_ma, hso_bndrs = old_tvs} ->
             [noLocA (HsGadtForAll noExtField
               ((mkHsForAllInvisTele noAnn old_tvs) { hsf_matchability = old_ma }))]
+        raw_tele = context_nodes cxt ++ old_outer ++ inner
+        new_tele = case g_args of
+          RecConGADT{} -> merge_rec_contexts raw_tele
+          _            -> raw_tele
+
+    merge_rec_contexts (L l (HsGadtContext (L cl (HsContext x1 c1)))
+                       : L _ (HsGadtContext (L _  (HsContext _  c2)))
+                       : rest)
+      = merge_rec_contexts (L l (HsGadtContext (L cl (HsContext x1 (c1 ++ c2)))) : rest)
+    merge_rec_contexts (g : rest) = g : merge_rec_contexts rest
+    merge_rec_contexts []         = []
 
 cvt_arg :: (TH.Bang, TH.Type) -> CvtM (HsConDeclField GhcPs)
 cvt_arg (Bang su ss, ty)

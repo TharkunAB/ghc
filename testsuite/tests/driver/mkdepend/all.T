@@ -1,0 +1,63 @@
+json_normalisers =  [ normalise_version('base', 'containers', 'template-haskell')
+                    , normalise_slashes
+                    , normalise_fun(normalise_dep_json)
+                    ]
+
+makefile_normalisers = [ normalise_slashes, normalise_fun(normalise_dep_makefile) ]
+
+T24384_extras = [ extra_files(['T24384/*'])
+                , pre_cmd('$MAKE -s --no-print-directory T24384_prep')
+                ]
+
+# These tests use a shell preprocessor that doesn't work on windows
+test('T24384a', [ *T24384_extras, when(opsys('mingw32'), skip), *makefile_normalisers ], makefile_test, [])
+test('T24384b', [ *T24384_extras, when(opsys('mingw32'), skip), *json_normalisers ], makefile_test, [])
+test('T24384c', [ *T24384_extras, when(opsys('mingw32'), skip), *json_normalisers ], makefile_test, [])
+
+# Multiple home units with explicit level imports.
+test('mkdepend_mhu01a',
+     [ extra_files(['mhu01/']), dep_makefile, dep_json ],
+     make_depend_multiunit, [['mhu01/unitA', 'mhu01/unitB', 'mhu01/unitC'], ''])
+# test the output streaming and writing to files
+test('mkdepend_mhu01b',
+     [ extra_files(['mhu01/']), dep_json_stdout ],
+     make_depend_multiunit, [['mhu01/unitA', 'mhu01/unitB', 'mhu01/unitC'], ''])
+test('mkdepend_mhu01c',
+     [ extra_files(['mhu01/']), dep_makefile_stdout ],
+     make_depend_multiunit, [['mhu01/unitA', 'mhu01/unitB', 'mhu01/unitC'], ''])
+test('mkdepend_mhu01d',
+     [ extra_files(['mhu01/']), dep_json_stdout, dep_makefile ],
+     make_depend_multiunit, [['mhu01/unitA', 'mhu01/unitB', 'mhu01/unitC'], ''])
+
+# Preprocessor must not be inherited by default active home unit
+test('mkdepend_mhu02',
+     [ extra_files(['mhu02/']), dep_json
+     , when(opsys('mingw32'), skip) # shell script preprocessor
+     ],
+     make_depend_multiunit, [['mhu02/unitA', 'mhu02/unitB'], ''])
+# A relative -pgmF with -working-dir
+test('mkdepend_mhu03',
+     [ extra_files(['mhu03/']), dep_json
+     , when(opsys('mingw32'), skip) # shell script preprocessor
+     ],
+     make_depend_multiunit, [['mhu03/unitA'], ''])
+# Link nodes
+test('mkdepend_mhu04',
+     [ extra_files(['mhu04/']), dep_makefile, dep_json ],
+     make_depend_multiunit, [['mhu04/unitLib', 'mhu04/unitApp'], ''])
+test('mkdepend_mhu05',
+     [ extra_files(['mhu05/']), dep_makefile, dep_json ],
+     make_depend_multiunit, [['mhu05/unitLib', 'mhu05/unitApp', 'mhu05/unitTest'], ''])
+
+# Honour -F
+test('mkdepend01',
+     [ extra_files(['mkdepend01/']), dep_makefile, dep_json ],
+     make_depend, [['mkdepend01/A.hs'], '-pgmF pp'])
+# Link nodes
+test('mkdepend02',
+     [ extra_files(['mkdepend02/']), dep_json ],
+     make_depend, [['mkdepend02/Main.hs'], ''])
+# Backpack
+test('mkdepend_bkp_01',
+     [ extra_files(['mkdepend_bkp_01/']), dep_json, expect_fail ],
+     make_depend, [['mkdepend_bkp_01/bkp01.bkp'], ''])

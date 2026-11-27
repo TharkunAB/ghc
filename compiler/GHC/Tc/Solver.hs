@@ -266,7 +266,7 @@ solveEqualitiesSelectingMetadata infer_arrows default_unresolved callsite thing_
                         indices <- TcM.readTcRef indices_ref
                         settleArrows owner arrows indices wanted
                   ; return (wanted,res) }
-       ; traceTc "pushLevelAndSolveEqualities }" (vcat [ text "Residual:" <+> ppr wanted
+       ; traceTc "pushLevelAndSolveEqualitiesX }" (vcat [ text "Residual:" <+> ppr wanted
                                                        , text "Level:" <+> ppr tclvl ])
        ; return (tclvl, wanted, res) }
 

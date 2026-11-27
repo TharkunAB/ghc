@@ -984,6 +984,5 @@ forallSym False = text "forall"
 
 pprFileHeaderPragmaType :: FileHeaderPragmaType -> SDoc
 pprFileHeaderPragmaType OptionsPrag    = text "OPTIONS"
-pprFileHeaderPragmaType IncludePrag    = text "INCLUDE"
 pprFileHeaderPragmaType LanguagePrag   = text "LANGUAGE"
 pprFileHeaderPragmaType DocOptionsPrag = text "OPTIONS_HADDOCK"

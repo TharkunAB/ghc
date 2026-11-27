@@ -143,6 +143,9 @@ Record GADT constructor signatures have a separate grammar.
   forall_telescope ::= 'forall' tv_bndrs_spec '.'
                     |  'forall' tv_bndrs      '->'
 
+  opt_forall ::= <empty>
+              |  'forall' tv_bndrs_spec '.'
+
   tv_bndrs      ::= <empty> | tv_bndr      tv_bndrs
   tv_bndrs_spec ::= <empty> | tv_bndr_spec tv_bndrs_spec
 

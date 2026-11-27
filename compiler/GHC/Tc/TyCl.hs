@@ -5641,9 +5641,11 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _ tag_map
            DDataType -> return ()
            _ -> failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration
        ; skol_info <- mkSkolemInfo (DataConSkol name)
-       ; (tclvl, wanted, (tvbs, ctxt, (retained, bangs, full_ty))) <-
+       ; tcCheckRuntimeForAllMatchability (hsOuterMatchability outer_bndrs)
+       ; (tclvl, wanted, (tc_outer, (inner_tvbs, ctxt, (retained, bangs, full_ty)))) <-
            pushLevelAndSolveEqualitiesX "tcConDecl:retained" $
-           tcGadtConTyVarBndrs skol_info outer_bndrs inner_bndrs $
+           tcOuterTKBndrs skol_info outer_bndrs $
+           tcConDeclTelescope skol_info inner_bndrs $
            do { prefix <- tcConGADTArgs (TheKind liftedTypeKind) args
               ; (retained, suffix_ty) <-
                   tcCheckRetainedConType True
@@ -5653,6 +5655,10 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _ tag_map
               ; return (replicate (length prefix) Nothing ++ retained,
                         map snd prefix ++ map (const suffix_bang) retained,
                         tcMkScaledFunTysU (map fst prefix) suffix_ty) }
+       -- Sort outer binders after solving equalities (#28135).
+       ; tc_outer <- scopedSortOuter tc_outer
+       ; let outer_tvbs = tyVarSpecToBinders (outerTyVarBndrs tc_outer)
+             tvbs       = outer_tvbs ++ inner_tvbs
        ; inf_tkvs <- kindGeneralizeAll skol_info $
            mkForAllTys (map (unmatchableDataConTy,) tvbs) (tcMkPhiTy ctxt full_ty)
        ; reportUnsolvedEqualities skol_info inf_tkvs tclvl wanted
@@ -5691,7 +5697,10 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
                        , con_g_args = hs_args
                        , con_res_ty = hs_res_ty })
   = addErrCtxt (DataConDefCtxt names) $
-    do { traceTc "tcConDecl 1 gadt" (ppr names)
+    do { traceTc "tcConDecl 1 gadt" $
+         vcat [ text "data con names:" <+> ppr names
+              , text "outer_bndrs:" <+> ppr outer_bndrs
+              , text "inner_bndrs:" <+> ppr inner_bndrs ]
        ; let L _ name :| _ = names
        ; let is_context (L _ HsGadtContext{}) = True
              is_context _ = False
@@ -5729,9 +5738,11 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
            setSrcSpanA (getLoc hs_res_ty) $
            failWithTc (TcRnNestedForallsContexts NFC_GadtConSig)
        ; skol_info <- mkSkolemInfo (DataConSkol name)
-       ; (tclvl, wanted, (tvbs, ctxt, (arg_tys, res_ty, field_lbls, stricts)))
+       ; tcCheckRuntimeForAllMatchability (hsOuterMatchability outer_bndrs)
+       ; (tclvl, wanted, (tc_outer, (inner_tvbs, ctxt, (arg_tys, res_ty, field_lbls, stricts))))
            <- pushLevelAndSolveKindArrowsX "tcConDecl:GADT" $
-              tcGadtConTyVarBndrs skol_info outer_bndrs (inner_bndrs ++ terminal) $
+              tcOuterTKBndrs skol_info outer_bndrs $
+              tcConDeclTelescope skol_info (inner_bndrs ++ terminal) $
               do { (res_ty, res_kind) <- tcInferLHsTypeKind hs_result
                          -- See Note [GADT return kinds]
 
@@ -5756,6 +5767,11 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
                  ; field_lbls <- lookupConstructorFields $ noUserRdr name
                  ; return (arg_tys, res_ty, field_lbls, stricts)
                  }
+
+       -- Must do this scopedSortOut /after/ solving the equalities (#28135)
+       ; tc_outer <- scopedSortOuter tc_outer
+       ; let outer_tvbs = tyVarSpecToBinders (outerTyVarBndrs tc_outer)
+             tvbs       = outer_tvbs ++ inner_tvbs
 
        ; inf_tkvs <- kindGeneralizeAll skol_info
                     (mkForAllTys (map (unmatchableDataConTy,) tvbs) $

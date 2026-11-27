@@ -3,6 +3,7 @@ module GHC.CmmToAsm.Instr
    ( Instruction(..)
    , RegUsage(..)
    , noUsage
+   , nubJumpDests
    )
 where
 
@@ -13,33 +14,14 @@ import GHC.Platform.Reg
 import GHC.Utils.Outputable (SDoc)
 
 import GHC.Cmm.BlockId
+import GHC.Cmm.Dataflow.Label
 
 import GHC.CmmToAsm.Config
 import GHC.Data.FastString
 import GHC.CmmToAsm.Format
+import GHC.CmmToAsm.RegUsage (RegUsage(..), noUsage)
 
 import GHC.Utils.Misc (HasDebugCallStack)
-
--- | Holds a list of source and destination registers used by a
---      particular instruction.
---
---   Machine registers that are pre-allocated to stgRegs are filtered
---      out, because they are uninteresting from a register allocation
---      standpoint.  (We wouldn't want them to end up on the free list!)
---
---   As far as we are concerned, the fixed registers simply don't exist
---      (for allocation purposes, anyway).
---
-data RegUsage
-        = RU    {
-                reads :: [RegWithFormat],
-                writes :: [RegWithFormat]
-                }
-        deriving Show
-
--- | No regs read or written to.
-noUsage :: RegUsage
-noUsage  = RU [] []
 
 -- | Common things that we can do with instructions, on all architectures.
 --      These are used by the shared parts of the native code generator,
@@ -78,6 +60,9 @@ class Instruction instr where
 
         -- | Give the possible *local block* destinations of this jump instruction.
         --      Must be defined for all jumpish instructions.
+        --      Each destination is listed once, even when a jump table names
+        --      it in several entries (see 'nubJumpDests'). The register
+        --      allocator makes one fixup block per destination.
         jumpDestsOfInstr
                 :: instr -> [BlockId]
 
@@ -178,3 +163,12 @@ class Instruction instr where
 
         -- Create a comment instruction
         mkComment :: FastString -> [instr]
+
+-- | Remove the repeated destinations of a jump table. The order is kept.
+nubJumpDests :: [BlockId] -> [BlockId]
+nubJumpDests = go setEmpty
+  where
+    go _ [] = []
+    go seen (d:ds)
+      | setMember d seen = go seen ds
+      | otherwise        = d : go (setInsert d seen) ds

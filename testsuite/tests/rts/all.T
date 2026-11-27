@@ -554,8 +554,11 @@ test('RestartEventLogging',
      compile_and_run, ['RestartEventLogging_c.c'])
 
 test('T17088',
-     [extra_ways(['compacting_gc']), extra_run_opts('+RTS -A256k -RTS')],
-     compile_and_run, ['-rtsopts -O2'])
+     [ only_ways(['compacting_gc'])
+     , extra_ways(['compacting_gc'])
+     , extra_run_opts('+RTS -A128k -RTS')
+     ],
+     compile_and_run, ['-rtsopts -O1'])
 
 test('T15427', js_broken(22374), compile_and_run, [''])
 
@@ -676,8 +679,10 @@ test('T23142', [unless(debug_rts(), skip), req_interp], makefile_test, ['T23142'
 test('T23400', [], compile_and_run, ['-with-rtsopts -A8k'])
 
 test('IOManager', [js_skip, when(arch('wasm32'), skip), when(opsys('mingw32'), skip),
-                   pre_cmd('$MAKE -s --no-print-directory IOManager.hs')],
-                  compile_and_run, [''])
+                   pre_cmd('$MAKE -s --no-print-directory IOManager.hs'),
+                   when(have_smp(), extra_ways(['threaded2'])),
+                   all_available_io_managers_except(['winio'])],
+                   compile_and_run, [''])
 
 test('T24142', [req_target_smp], compile_and_run, ['-threaded -with-rtsopts "-N2"'])
 

@@ -111,9 +111,8 @@
         (EpTok
          (EpaSpan { T15323.hs:5:21-25 }))
         (AnnList
-         (AnnListLayout
+         (EpVirtualBraces
           (EpaSpan { T15323.hs:6:5 }))
-         (ListNone)
          [])
         (EpTok
          (EpaSpan { <no location info> })))
@@ -192,8 +191,7 @@
                 (HsBndrNoKind
                  (NoExtField))))]))
            []
-           (Just
-            (L
+           [(L
              (EpAnn
               (EpaSpan { T15323.hs:6:31-36 })
               [(AddDarrowAnn
@@ -261,7 +259,7 @@
                        (EpaComments
                         []))
                       (Unqual
-                       {OccName: v}))))))))])))
+                       {OccName: v}))))))))]))]
            (PrefixConGADT
             (NoExtField)
             [])
