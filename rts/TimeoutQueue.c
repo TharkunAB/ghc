@@ -1,8 +1,13 @@
 #include "rts/PosixSource.h"
 #include "Rts.h"
 #include "RtsFlags.h" // needed by SET_HDR macro
+#include <stddef.h>
 
 #include "TimeoutQueue.h"
+
+#if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && !defined(TSAN_ENABLED)
+#define USE_RUST_TIMEOUT_INSERT 1
+#endif
 
 /* The implementation is a leftist heap. The reference implementation is the
    simple purely functional version, e.g. as described by Okasaki '98:
@@ -55,7 +60,9 @@ GHC_STATIC_ASSERT(sizeof(StgTimeoutQueue)
  * Forward declarations of the worker functions. See below.
  */
 
+#if !defined(USE_RUST_TIMEOUT_INSERT)
 static void insert_down (StgTimeoutQueue **root, StgTimeoutQueue *hnew);
+#endif
 
 static StgTimeoutQueue *merge_down (StgTimeoutQueue *h1,
                                     StgTimeoutQueue *h2,
@@ -79,6 +86,40 @@ static bool sanity_check_member  (StgTimeoutQueue *root, StgTimeout *h);
 #define EMPTY ((StgTimeoutQueue *) &stg_TIMEOUT_QUEUE_EMPTY_closure)
 
 typedef uint32_t Rank; // type to match StgTimeoutQueue.rank
+
+/* Note [Timeout insertion offsets]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The STG header has a different size in different RTS ways. Pass the offset
+ * of parent to Rust for each insertion. The fields after parent have fixed
+ * relative offsets on x86-64 Linux. Check each offset here. Rust does not
+ * read the STG header, notification, or EMPTY closure.
+ */
+#if defined(USE_RUST_TIMEOUT_INSERT)
+GHC_STATIC_ASSERT(sizeof(void *) == 8, "Timeout insertion requires 64-bit pointers");
+GHC_STATIC_ASSERT(sizeof(Time) == 8, "Timeout insertion requires 64-bit Time");
+GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, a) - offsetof(StgTimeoutQueue, parent) == 8,
+                  "Timeout child a offset mismatch");
+GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, b) - offsetof(StgTimeoutQueue, parent) == 16,
+                  "Timeout child b offset mismatch");
+GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, rank) - offsetof(StgTimeoutQueue, parent) == 24,
+                  "Timeout rank offset mismatch");
+GHC_STATIC_ASSERT(offsetof(StgTimeoutQueue, waketime) - offsetof(StgTimeoutQueue, parent) == 32,
+                  "Timeout waketime offset mismatch");
+RTS_PRIVATE void ghc_rust_timeout_queue_insert(StgTimeoutQueue **root,
+                                                StgTimeoutQueue *hnew,
+                                                StgTimeoutQueue *empty,
+                                                size_t parent_offset,
+                                                int *insert_down_steps,
+                                                int *leftify_steps);
+#endif
+
+/* Algorithmic performance counters count worker loop iterations. */
+#if defined(DEBUG)
+int insert_down_count;
+int merge_down_count;
+int leftify_up_to_count;
+int leftify_up_shortcut_count;
+#endif
 
 /******************************************************************************
  * The main functions, declared in the TimeoutQueue.h
@@ -140,6 +181,15 @@ void insertTimeoutQueue(StgTimeoutQueue **root, StgTimeout *hnew, Time waketime)
     *   | x <= y             = T 1 x h E
     *   | otherwise          = (...) (insert x b)
     */
+#if defined(USE_RUST_TIMEOUT_INSERT)
+    ghc_rust_timeout_queue_insert(root, hnew, EMPTY,
+                                  offsetof(StgTimeoutQueue, parent),
+#if defined(DEBUG)
+                                  &insert_down_count, &leftify_up_shortcut_count);
+#else
+                                  NULL, NULL);
+#endif
+#else
     insert_down(root, hnew);
 
    /* At this point the entry 'hnew' is linked into the right place.
@@ -155,6 +205,7 @@ void insertTimeoutQueue(StgTimeoutQueue **root, StgTimeout *hnew, Time waketime)
     * We start with the parent h of the new node (T 1 x E E) or (T 1 x h E).
     */
     leftify_up_shortcut(hnew->parent);
+#endif
 
    /* Note it is ok that we use leftify_up_shortcut here as an optimisation.
     * We do not have to use leftify_up_to(hnew->parent, EMPTY) all the way to
@@ -327,17 +378,8 @@ static inline void swap(StgTimeoutQueue **a, StgTimeoutQueue **b)
 }
 
 
-/* Algorithmic performance counters. Used to count the number of loop
- * iterations we do, to assess algorithmic optimisations. */
-#if defined(DEBUG)
-int insert_down_count;
-int merge_down_count;
-int leftify_up_to_count;
-int leftify_up_shortcut_count;
-#endif
-
-
-void insert_down (StgTimeoutQueue **root, StgTimeoutQueue *hnew)
+#if !defined(USE_RUST_TIMEOUT_INSERT)
+static void insert_down (StgTimeoutQueue **root, StgTimeoutQueue *hnew)
 {
     StgTimeoutQueue *hparent        = EMPTY;
     StgTimeoutQueue **hparent_child = root;
@@ -374,6 +416,7 @@ void insert_down (StgTimeoutQueue **root, StgTimeoutQueue *hnew)
     hnew->parent = hparent;
     *hparent_child = hnew;
 }
+#endif
 
 
 /* Merge together the trees h1 and h2, and link the result to a parent.
