@@ -286,8 +286,14 @@ stg_shrinkMutableByteArrayzh ( gcptr mba, W_ new_size )
           See Note [shrink-array slop marker] */
        W_ n;
        n = old_wds - new_wds;
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+       foreign "C" ghc_rust_shrink_byte_array_fallback(
+           mba + SIZEOF_StgHeader + OFFSET_StgArrBytes_bytes "ptr",
+           new_size, mba + WDS(new_wds) "ptr", n);
+#else
        foreign "C" stg_writeSlopMarker(mba + WDS(new_wds) "ptr", n);
        StgArrBytes_bytes(mba) = new_size;
+#endif
        // No need to call PROF_HEADER_CREATE. See Note [LDV profiling and resizing arrays]
        return ();
    }

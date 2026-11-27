@@ -1,13 +1,14 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 core::arch::global_asm!(
     ".hidden ghc_rust_allocate_mut_array",
     ".hidden ghc_rust_allocate_small_mut_array",
     ".hidden ghc_rust_allocate_byte_array",
     ".hidden ghc_rust_allocate_pinned_byte_array",
+    ".hidden ghc_rust_shrink_byte_array_fallback",
 );
 
 unsafe extern "C" {
@@ -17,6 +18,26 @@ unsafe extern "C" {
     fn mutArrPtrsCards(count: usize) -> usize;
     fn allocateMightFail(cap: *mut c_void, words: usize) -> *mut c_void;
     fn allocatePinned(cap: *mut c_void, words: usize, align: usize, offset: usize) -> *mut c_void;
+}
+
+// See Note [shrink-array slop marker] in PrimOps.cmm and
+// Note [Slop marker memory ordering] in ClosureMacros.h.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_shrink_byte_array_fallback(
+    length: *mut usize,
+    new_size: usize,
+    slop: *mut usize,
+    words: usize,
+) {
+    unsafe {
+        if words == 1 {
+            AtomicUsize::from_ptr(slop).store(0, Ordering::Relaxed);
+        } else if words >= 2 {
+            AtomicUsize::from_ptr(slop).store(usize::MAX, Ordering::Relaxed);
+            AtomicUsize::from_ptr(slop.add(1)).store(words - 2, Ordering::Release);
+        }
+        AtomicUsize::from_ptr(length).store(new_size, Ordering::Relaxed);
+    }
 }
 
 type ArrayInstrumentation = Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize)>;
