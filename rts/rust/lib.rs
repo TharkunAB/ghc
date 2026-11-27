@@ -1,5 +1,6 @@
 #![no_std]
 
+mod adjustor_slots;
 mod archive_member;
 mod arena;
 mod encode;
