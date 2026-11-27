@@ -34,6 +34,7 @@ struct Chunk {
 pub(super) type Hash = unsafe extern "C" fn(*const Table, usize) -> c_int;
 
 unsafe extern "C" {
+    fn barf(format: *const c_char, ...) -> !;
     fn stgMallocBytes(size: usize, label: *const c_char) -> *mut c_void;
     fn stgFree(ptr: *mut c_void);
     fn strlen(value: *const c_char) -> usize;
@@ -254,6 +255,9 @@ unsafe fn insert(
     hash: impl Fn(*const Table, usize) -> c_int + Copy,
 ) {
     unsafe {
+        if (*table).key_count == c_int::MAX {
+            barf(c"insertHashTable: too many entries".as_ptr());
+        }
         (*table).key_count += 1;
         if (*table).key_count >= LOAD * (*table).bucket_count {
             expand(table, hash);
