@@ -1,7 +1,13 @@
 use core::ffi::{c_int, c_void};
+use core::mem::{offset_of, size_of};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
-core::arch::global_asm!(".hidden ghc_rust_closure_table_init_growth");
+core::arch::global_asm!(
+    ".hidden ghc_rust_closure_table_init_growth",
+    ".hidden ghc_rust_closure_table_init",
+    ".hidden ghc_rust_closure_table_mark",
+    ".hidden ghc_rust_closure_table_insert",
+);
 
 /// Copy the old closure table data and initialize the new entries.
 ///
@@ -57,4 +63,101 @@ pub(super) unsafe extern "C" fn ghc_rust_closure_table_init_growth(
         unsafe { free_entries.add(index).write((index + 1) as c_int) };
     }
     unsafe { free_entries.add(new_capacity - 1).write(old_free_head) };
+}
+
+// See Note [Closure table Rust layout] in rts/ClosureTable.c.
+#[repr(C)]
+pub(super) struct ClosureTable {
+    arr: *mut c_void,
+    free: *mut c_void,
+    free_hd: c_int,
+    elems: c_int,
+    capacity: c_int,
+    compact: c_int,
+}
+
+unsafe extern "C" {
+    static stg_MUT_ARR_PTRS_DIRTY_info: u8;
+}
+
+const _: () = {
+    assert!(offset_of!(ClosureTable, arr) == 0);
+    assert!(offset_of!(ClosureTable, free) == size_of::<*mut c_void>());
+    assert!(offset_of!(ClosureTable, free_hd) == 2 * size_of::<*mut c_void>());
+    assert!(offset_of!(ClosureTable, elems) == 2 * size_of::<*mut c_void>() + size_of::<c_int>());
+    assert!(
+        offset_of!(ClosureTable, capacity) == 2 * size_of::<*mut c_void>() + 2 * size_of::<c_int>()
+    );
+    assert!(
+        offset_of!(ClosureTable, compact) == 2 * size_of::<*mut c_void>() + 3 * size_of::<c_int>()
+    );
+    assert!(size_of::<ClosureTable>() == 2 * size_of::<*mut c_void>() + 4 * size_of::<c_int>());
+};
+
+/// Initialize one table with the C-owned null closure sentinel.
+///
+/// # Safety
+///
+/// `table` is a valid, exclusively owned ClosureTable. C checks its layout.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_closure_table_init(
+    table: *mut ClosureTable,
+    mode: c_int,
+    sentinel: *mut c_void,
+) {
+    unsafe {
+        (&raw mut (*table).arr).write(sentinel);
+        (&raw mut (*table).free).write(sentinel);
+        (&raw mut (*table).free_hd).write(-1);
+        (&raw mut (*table).elems).write(0);
+        (&raw mut (*table).capacity).write(0);
+        (&raw mut (*table).compact).write(mode);
+    }
+}
+
+/// Visit both live root slots in the same order as C.
+///
+/// # Safety
+///
+/// `table` remains valid during both callbacks. The collector may replace
+/// either root pointer through its slot. C checks the table layout.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_closure_table_mark(
+    table: *mut ClosureTable,
+    evac: unsafe extern "C" fn(*mut c_void, *mut *mut c_void),
+    user: *mut c_void,
+) {
+    unsafe {
+        evac(user, &raw mut (*table).arr);
+        evac(user, &raw mut (*table).free);
+    }
+}
+
+/// Insert one closure into a free slot and update its GC metadata.
+///
+/// # Safety
+///
+/// C owns the table and checks that its free head names an empty slot. C
+/// supplies the live payload, card, and info slots using RTS array geometry.
+/// `next_free` is the current free-list link. C checks the table layout and
+/// marks the used free-list entry in DEBUG builds.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_closure_table_insert(
+    table: *mut ClosureTable,
+    value: *mut c_void,
+    slot: *mut *mut c_void,
+    card: *mut u8,
+    info_slot: *mut *const c_void,
+    next_free: c_int,
+) -> c_int {
+    let ix = unsafe { (&raw const (*table).free_hd).read() };
+    unsafe {
+        slot.write(value);
+        card.write(1);
+        info_slot.write((&raw const stg_MUT_ARR_PTRS_DIRTY_info).cast());
+        (&raw mut (*table).free_hd).write(next_free);
+        let elems = &raw mut (*table).elems;
+        elems.write(elems.read() + 1);
+    }
+    ix
 }

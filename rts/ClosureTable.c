@@ -10,11 +10,38 @@
 #include <string.h>
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-#define USE_RUST_CLOSURE_TABLE_GROWTH
+#define USE_RUST_CLOSURE_TABLE
+/* Note [Closure table Rust layout]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The table fields have the same layout in every RTS way. C checks that
+ * layout against the small Rust record. Heap array headers vary by RTS way,
+ * so C passes the payload, card, and info slots to Rust for insertion. Rust
+ * does not read a heap array header or a Capability.
+ */
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t),
                   "Closure table word must match Rust usize");
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(StgClosure *),
                   "Closure table card words must match pointer slots");
+GHC_STATIC_ASSERT(sizeof(enum ClosureTableMode) == sizeof(int),
+                  "Closure table mode must match Rust c_int");
+GHC_STATIC_ASSERT(offsetof(ClosureTable, arr) == 0 &&
+                  offsetof(ClosureTable, free) == sizeof(void *) &&
+                  offsetof(ClosureTable, free_hd) == 2 * sizeof(void *) &&
+                  offsetof(ClosureTable, elems) == 2 * sizeof(void *) + sizeof(int) &&
+                  offsetof(ClosureTable, capacity) == 2 * sizeof(void *) + 2 * sizeof(int) &&
+                  offsetof(ClosureTable, compact) == 2 * sizeof(void *) + 3 * sizeof(int) &&
+                  sizeof(ClosureTable) == 2 * sizeof(void *) + 4 * sizeof(int),
+                  "Closure table layout must match Rust");
+RTS_PRIVATE void ghc_rust_closure_table_init(ClosureTable *t,
+                                              enum ClosureTableMode mode,
+                                              StgClosure *sentinel);
+RTS_PRIVATE void ghc_rust_closure_table_mark(ClosureTable *t,
+                                              evac_fn evac, void *user);
+RTS_PRIVATE int ghc_rust_closure_table_insert(ClosureTable *t, void *v,
+                                               StgClosure **slot,
+                                               StgWord8 *card,
+                                               const StgInfoTable **info_slot,
+                                               int next_free);
 RTS_PRIVATE void ghc_rust_closure_table_init_growth(
     StgClosure *const *old_payload, StgClosure **new_payload,
     const StgWord *old_free, StgWord *new_free,
@@ -26,19 +53,27 @@ RTS_PRIVATE void ghc_rust_closure_table_init_growth(
 
 void initClosureTable(ClosureTable *t, enum ClosureTableMode mode)
 {
+#if defined(USE_RUST_CLOSURE_TABLE)
+    ghc_rust_closure_table_init(t, mode, &stg_CLOSURE_TABLE_NULL_closure);
+#else
     t->arr      = (StgMutArrPtrs *) &stg_CLOSURE_TABLE_NULL_closure;
     t->free     = (StgArrBytes   *) &stg_CLOSURE_TABLE_NULL_closure;
     t->free_hd  = FREELIST_IX_NULL;
     t->capacity = 0;
     t->elems    = 0;
     t->compact  = mode;
+#endif
 }
 
 
 void markClosureTable(evac_fn evac, void *user, ClosureTable *t)
 {
+#if defined(USE_RUST_CLOSURE_TABLE)
+    ghc_rust_closure_table_mark(t, evac, user);
+#else
     evac(user, (StgClosure **)&t->arr);
     evac(user, (StgClosure **)&t->free);
+#endif
 }
 
 
@@ -83,7 +118,7 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
     StgWord oldcardsize = mutArrPtrsCardTableSize(oldcapacity);
     StgWord newcardsize = mutArrPtrsCardTableSize(newcapacity);
     StgWord oldfreesizeW = ROUNDUP_BYTES_TO_WDS((StgWord)oldcapacity * sizeof(int));
-#if defined(USE_RUST_CLOSURE_TABLE_GROWTH)
+#if defined(USE_RUST_CLOSURE_TABLE)
     ghc_rust_closure_table_init_growth(
         oldcapacity == 0 ? NULL : oldarr->payload, newarr->payload,
         oldcapacity == 0 ? NULL : oldfree->payload, newfree->payload,
@@ -147,6 +182,15 @@ int insertClosureTable(Capability *cap STG_UNUSED,
      */
 
     /* Fill in the entry with the supplied closure. */
+#if defined(USE_RUST_CLOSURE_TABLE)
+    int next_free = StgArrBytesAsCInts(t->free)[ix];
+    int inserted = ghc_rust_closure_table_insert(
+        t, v, &t->arr->payload[ix],
+        mutArrPtrsCard(t->arr, ix >> MUT_ARR_PTRS_CARD_BITS),
+        &t->arr->header.info, next_free);
+    DEBUG_ONLY(StgArrBytesAsCInts(t->free)[inserted] = FREELIST_IX_USED);
+    return inserted;
+#else
     t->arr->payload[ix] = v;
 
     /* Mark the corresponding card table entry. */
@@ -164,6 +208,7 @@ int insertClosureTable(Capability *cap STG_UNUSED,
     DEBUG_ONLY(StgArrBytesAsCInts(t->free)[ix] = FREELIST_IX_USED);
 
     return ix;
+#endif
 }
 
 
