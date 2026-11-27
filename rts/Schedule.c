@@ -2419,18 +2419,17 @@ deleteAllThreads (void)
     // being GC'd, and we don't want the "main thread has been GC'd" panic.
 }
 
-/* -----------------------------------------------------------------------------
-   Managing the suspended_ccalls list.
-   Locks required: sched_mutex
-   -------------------------------------------------------------------------- */
-
 /* Note [Suspended in-call list in Rust]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * C owns each Capability and InCall. Rust changes only the list links and
- * count while C holds the capability. The collector visits the original
- * suspended_tso slots so that evacuation can replace their pointers. It
- * reads the next link after the callback. C keeps capability synchronization
- * and the fork reset. TSAN builds use the C list operations and visitor.
+ * A task owns the capability while it changes this list. suspendThread
+ * inserts the InCall under cap->lock before releasing the capability.
+ * resumeThread removes it after waitForCapability restores ownership.
+ *
+ * The collector visits the address of each suspended_tso slot so it can
+ * update the stored pointer when it moves a TSO. It reads the next link
+ * after the visit. An interruptible foreign call uses this same list to
+ * find the worker to interrupt. C owns the records and the fork reset.
+ * TSAN builds use the C implementation.
  */
 
 STATIC_INLINE void
