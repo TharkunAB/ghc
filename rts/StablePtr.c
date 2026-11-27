@@ -111,7 +111,8 @@ static unsigned int SPT_size = 0;
 /* Keep the C atomic operations visible to ThreadSanitizer. */
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 #define USE_RUST_STABLE_PTR_TABLE 1
-RTS_PRIVATE void ghc_rust_init_stable_ptr_free_list(spEntry *table, size_t count);
+RTS_PRIVATE void ghc_rust_init_stable_ptr_table(spEntry **table, spEntry **head, size_t count);
+RTS_PRIVATE void ghc_rust_exit_stable_ptr_table(spEntry **table, spEntry **head);
 RTS_PRIVATE StgWord ghc_rust_take_stable_ptr(spEntry *table, spEntry **head, StgPtr value);
 RTS_PRIVATE void ghc_rust_release_stable_ptr(spEntry **head, spEntry *slot);
 RTS_PRIVATE void ghc_rust_grow_stable_ptr_table(spEntry **table, spEntry **head, size_t old_count);
@@ -164,21 +165,19 @@ stablePtrUnlock(void)
  * Initialising the table
  * -------------------------------------------------------------------------- */
 
+#if !defined(USE_RUST_STABLE_PTR_TABLE)
 STATIC_INLINE void
 initSpEntryFreeList(spEntry *table, uint32_t n)
 {
-#if defined(USE_RUST_STABLE_PTR_TABLE)
-  ghc_rust_init_stable_ptr_free_list(table, n);
-#else
   spEntry* free = NULL;
   while (n != 0) {
       spEntry *p = &table[--n];
       p->addr = (P_)free;
       free = p;
   }
-#endif
   stable_ptr_free = table;
 }
+#endif
 
 void
 initStablePtrTable(void)
@@ -187,9 +186,13 @@ initStablePtrTable(void)
     // the new table with a release store. See Note [Enlarging the stable pointer table].
     if (ACQUIRE_LOAD(&stable_ptr_table) != NULL) return;
     SPT_size = INIT_SPT_SIZE;
+#if defined(USE_RUST_STABLE_PTR_TABLE)
+    ghc_rust_init_stable_ptr_table(&stable_ptr_table, &stable_ptr_free, INIT_SPT_SIZE);
+#else
     stable_ptr_table = stgMallocBytes(SPT_size * sizeof(spEntry),
                                       "initStablePtrTable");
     initSpEntryFreeList(stable_ptr_table,INIT_SPT_SIZE);
+#endif
 
 #if defined(THREADED_RTS)
     initMutex(&stable_ptr_mutex);
@@ -281,13 +284,19 @@ freeOldSPTs(void)
 void
 exitStablePtrTable(void)
 {
+#if defined(USE_RUST_STABLE_PTR_TABLE)
+    ghc_rust_exit_stable_ptr_table(&stable_ptr_table, &stable_ptr_free);
+    SPT_size = 0;
+#else
     if (stable_ptr_table)
         stgFree(stable_ptr_table);
 
     stable_ptr_table = NULL;
+    stable_ptr_free = NULL;
     SPT_size = 0;
 
     freeOldSPTs();
+#endif
 
 #if defined(THREADED_RTS)
     closeMutex(&stable_ptr_mutex);

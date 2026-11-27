@@ -15,7 +15,8 @@ const _: () = {
 
 // The common object is also linked when C retains its TSAN-instrumented path.
 core::arch::global_asm!(
-    ".hidden ghc_rust_init_stable_ptr_free_list",
+    ".hidden ghc_rust_init_stable_ptr_table",
+    ".hidden ghc_rust_exit_stable_ptr_table",
     ".hidden ghc_rust_take_stable_ptr",
     ".hidden ghc_rust_release_stable_ptr",
     ".hidden ghc_rust_grow_stable_ptr_table",
@@ -30,6 +31,42 @@ unsafe extern "C" {
 // See Note [Enlarging the stable pointer table] in StablePtr.c.
 static mut RETIRED: [*mut Entry; usize::BITS as usize] = [null_mut(); usize::BITS as usize];
 static mut RETIRED_COUNT: usize = 0;
+
+/// Allocate the first table before the RTS publishes any handles.
+/// C serializes initialization and passes a nonzero initialized capacity.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_init_stable_ptr_table(
+    table: *mut *mut Entry,
+    head: *mut *mut Entry,
+    count: usize,
+) {
+    unsafe {
+        let first = stgMallocBytes(count * size_of::<Entry>(), c"initStablePtrTable".as_ptr())
+            .cast::<Entry>();
+        link_free_entries(first, count);
+        head.write(first);
+        AtomicPtr::from_ptr(table).store(first, Release);
+    }
+}
+
+/// Release all table versions after shutdown stops table users.
+/// The current table may be null.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_exit_stable_ptr_table(
+    table: *mut *mut Entry,
+    head: *mut *mut Entry,
+) {
+    unsafe {
+        let active = AtomicPtr::from_ptr(table);
+        let current = active.load(Relaxed);
+        if !current.is_null() {
+            stgFree(current.cast());
+        }
+        active.store(null_mut(), Relaxed);
+        head.write(null_mut());
+        ghc_rust_free_old_stable_ptr_tables();
+    }
+}
 
 /// Double the full table and retain its previous storage until collection.
 /// C holds the table mutex. It checks capacity overflow before this call.
@@ -49,7 +86,7 @@ pub(super) unsafe extern "C" fn ghc_rust_grow_stable_ptr_table(
         .cast::<Entry>();
         copy_nonoverlapping(old, new, old_count);
         let tail = new.add(old_count);
-        ghc_rust_init_stable_ptr_free_list(tail, old_count);
+        link_free_entries(tail, old_count);
         head.write(tail);
 
         // Each outstanding retirement corresponds to a doubling. The checked
@@ -78,11 +115,7 @@ pub(super) unsafe extern "C" fn ghc_rust_free_old_stable_ptr_tables() {
 }
 
 /// Link a new range of table entries in index order. None has a live handle.
-#[unsafe(no_mangle)]
-pub(super) unsafe extern "C" fn ghc_rust_init_stable_ptr_free_list(
-    table: *mut Entry,
-    count: usize,
-) {
+unsafe fn link_free_entries(table: *mut Entry, count: usize) {
     let mut next = null_mut();
     for index in (0..count).rev() {
         let slot = unsafe { table.add(index) };
