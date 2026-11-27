@@ -14,6 +14,7 @@
 #define WORDS(name, type) const char ghc_rust_u32_##name[1 + sizeofW(type)] = {0}
 
 FIELD(CLOSURE_INFO_OFFSET, StgClosure, header.info, const StgInfoTable *);
+FIELD(CAF_SAVED_INFO, StgIndStatic, saved_info, const StgInfoTable *);
 #if defined(TABLES_NEXT_TO_CODE)
 OFFSET(INFO_TABLE_BIAS, sizeof(StgInfoTable));
 #else

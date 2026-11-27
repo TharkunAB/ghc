@@ -129,36 +129,57 @@ nonmovingSweepSegment(struct NonmovingSegment *seg)
 
 #if defined(DEBUG)
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+RTS_PRIVATE uint32_t ghc_rust_nonmoving_gc_cafs(
+    StgIndStatic *first, StgIndStatic *end, StgWord current_flag,
+    StgWord (*checked_flag)(StgIndStatic *),
+    void (*dead)(StgIndStatic *), void (*live)(StgIndStatic *));
+#endif
+
+static StgWord checkedCafFlag(StgIndStatic *caf)
+{
+    const StgInfoTable *info = get_itbl((StgClosure*)caf);
+    ASSERT(info->type == IND_STATIC);
+    return ((StgWord)caf->static_link) & STATIC_BITS;
+}
+
+static void stubDeadCaf(StgIndStatic *caf)
+{
+    debugTrace(DEBUG_gccafs, "CAF gc'd at 0x%p", caf);
+    SET_INFO((StgClosure*)caf, &stg_GCD_CAF_info);
+}
+
+static void retainLiveCaf(StgIndStatic *caf)
+{
+    debugTrace(DEBUG_gccafs, "CAF alive at 0x%p", caf);
+    ACQUIRE_SM_LOCK;
+    caf->saved_info = (const StgInfoTable*)debug_caf_list;
+    debug_caf_list = caf;
+    RELEASE_SM_LOCK;
+}
+
 void nonmovingGcCafs(void)
 {
-    uint32_t i = 0;
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    uint32_t live_count = ghc_rust_nonmoving_gc_cafs(
+        debug_caf_list_snapshot, (StgIndStatic*)END_OF_CAF_LIST, static_flag,
+        checkedCafFlag, stubDeadCaf, retainLiveCaf);
+#else
+    uint32_t live_count = 0;
     StgIndStatic *next;
-
     for (StgIndStatic *caf = debug_caf_list_snapshot;
-         caf != (StgIndStatic*) END_OF_CAF_LIST;
-         caf = next)
-    {
+         caf != (StgIndStatic*)END_OF_CAF_LIST; caf = next) {
         next = (StgIndStatic*)caf->saved_info;
-
-        const StgInfoTable *info = get_itbl((StgClosure*)caf);
-        ASSERT(info->type == IND_STATIC);
-
-        StgWord flag = ((StgWord) caf->static_link) & STATIC_BITS;
+        StgWord flag = checkedCafFlag(caf);
         if (flag != 0 && flag != static_flag) {
-            debugTrace(DEBUG_gccafs, "CAF gc'd at 0x%p", caf);
-            SET_INFO((StgClosure*)caf, &stg_GCD_CAF_info); // stub it
+            stubDeadCaf(caf);
         } else {
-            // CAF is alive, move it back to the debug_caf_list
-            ++i;
-            debugTrace(DEBUG_gccafs, "CAF alive at 0x%p", caf);
-            ACQUIRE_SM_LOCK; // debug_caf_list is global, locked by sm_mutex
-            caf->saved_info = (const StgInfoTable*)debug_caf_list;
-            debug_caf_list = caf;
-            RELEASE_SM_LOCK;
+            ++live_count;
+            retainLiveCaf(caf);
         }
     }
-
-    debugTrace(DEBUG_gccafs, "%d CAFs live", i);
+#endif
+    debugTrace(DEBUG_gccafs, "%d CAFs live", live_count);
     debug_caf_list_snapshot = (StgIndStatic*)END_OF_CAF_LIST;
 }
 

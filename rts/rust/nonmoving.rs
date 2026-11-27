@@ -1,8 +1,8 @@
 use super::{
-    BD_ALLOCATOR_IDX, BD_LINK, BD_NEXT_FREE_SNAP, BD_SCAN, BD_START, CAP_CURRENT_SEGMENTS,
-    CENSUS_ACTIVE, CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED, CENSUS_SIZE, CENSUS_WORDS,
-    COMPACT_BLOCK_OWNER, NM_ACTIVE, NM_BLOCK_COUNT, NM_BLOCK_SIZE, NM_FILLED, NM_STRUCT_SIZE,
-    SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE, SEG_STRUCT_SIZE, closure_words,
+    BD_ALLOCATOR_IDX, BD_LINK, BD_NEXT_FREE_SNAP, BD_SCAN, BD_START, CAF_SAVED_INFO,
+    CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE, CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED,
+    CENSUS_SIZE, CENSUS_WORDS, COMPACT_BLOCK_OWNER, NM_ACTIVE, NM_BLOCK_COUNT, NM_BLOCK_SIZE,
+    NM_FILLED, NM_STRUCT_SIZE, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE, SEG_STRUCT_SIZE, closure_words,
 };
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -135,8 +135,36 @@ unsafe extern "C" fn ghc_rust_stopped_allocator_census(
 }
 
 core::arch::global_asm!(
-    ".hidden ghc_rust_clear_segment_free_blocks\n.hidden ghc_rust_sweep_segments\n.hidden ghc_rust_free_large_groups\n.hidden ghc_rust_free_dead_compact_regions"
+    ".hidden ghc_rust_clear_segment_free_blocks\n.hidden ghc_rust_sweep_segments\n.hidden ghc_rust_free_large_groups\n.hidden ghc_rust_free_dead_compact_regions\n.hidden ghc_rust_nonmoving_gc_cafs"
 );
+
+/// Sweep the detached debug CAF snapshot after marking.
+/// C checks closure types and publishes surviving CAFs under sm_mutex.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_nonmoving_gc_cafs(
+    mut caf: *mut u8,
+    end: *mut u8,
+    current_flag: usize,
+    checked_flag: unsafe extern "C" fn(*mut u8) -> usize,
+    dead: unsafe extern "C" fn(*mut u8),
+    live: unsafe extern "C" fn(*mut u8),
+) -> u32 {
+    let mut live_count = 0u32;
+    unsafe {
+        while caf != end {
+            let next = read_ptr(caf, CAF_SAVED_INFO);
+            let flag = checked_flag(caf);
+            if flag != 0 && flag != current_flag {
+                dead(caf);
+            } else {
+                live(caf);
+                live_count = live_count.wrapping_add(1);
+            }
+            caf = next;
+        }
+    }
+    live_count
+}
 
 unsafe extern "C" {
     fn ghc_c_sweeping_descriptor(seg: *mut u8) -> *mut u8;
