@@ -55,13 +55,30 @@ struct hashtable {
 
 #if defined(USE_RUST_RTS)
 /* The Rust walker reads only the initialized buckets and their linked entries. */
-GHC_STATIC_ASSERT(HSEGSIZE == 1024, "Rust hash segment size");
+GHC_STATIC_ASSERT(HSEGSIZE == 1024 && HDIRSIZE == 1024 && HLOAD == 5,
+                  "Rust hash growth constants");
 GHC_STATIC_ASSERT(sizeof(HashList) == 3 * sizeof(StgWord) &&
                   _Alignof(HashList) == _Alignof(StgWord) &&
                   offsetof(HashList, key) == 0 &&
                   offsetof(HashList, data) == sizeof(StgWord) &&
                   offsetof(HashList, next) == 2 * sizeof(StgWord),
                   "Rust hash entry layout");
+GHC_STATIC_ASSERT(offsetof(HashTable, split) == 0 &&
+                  offsetof(HashTable, max) == sizeof(int) &&
+                  offsetof(HashTable, mask1) == 2 * sizeof(int) &&
+                  offsetof(HashTable, mask2) == 3 * sizeof(int) &&
+                  offsetof(HashTable, kcount) == 4 * sizeof(int) &&
+                  offsetof(HashTable, bcount) == 5 * sizeof(int) &&
+                  offsetof(HashTable, dir) == 6 * sizeof(int) &&
+                  offsetof(HashTable, freeList) ==
+                      offsetof(HashTable, dir) + sizeof(((HashTable *)NULL)->dir),
+                  "Rust hash table prefix layout");
+
+RTS_PRIVATE void ghc_rust_hash_insert_word(HashTable *table, StgWord key, const void *data);
+RTS_PRIVATE void ghc_rust_hash_insert_custom(HashTable *table, StgWord key, const void *data,
+                                              HashFunction hash);
+RTS_PRIVATE void ghc_c_hash_alloc_segment(HashTable *table, int segment);
+RTS_PRIVATE HashList *ghc_c_hash_alloc_entry(HashTable *table);
 
 RTS_PRIVATE int ghc_rust_hash_keys(HashList ***dir, size_t buckets, StgWord *keys, int capacity);
 RTS_PRIVATE void ghc_rust_hash_map(HashList ***dir, size_t buckets, void *data, MapHashFn fn);
@@ -158,6 +175,13 @@ allocSegment(HashTable *table, int segment)
 }
 
 
+#if defined(USE_RUST_RTS)
+void
+ghc_c_hash_alloc_segment(HashTable *table, int segment)
+{
+    allocSegment(table, segment);
+}
+#else
 /* -----------------------------------------------------------------------------
  * Expand the larger hash table by one bucket, and split one bucket
  * from the smaller table into two parts.  Only the bucket referenced
@@ -222,6 +246,7 @@ expand(HashTable *table, HashFunction f)
 
     return;
 }
+#endif
 
 #if defined(USE_RUST_RTS)
 STATIC_INLINE HashList **findHashBucket(const HashTable *table, StgWord key, HashFunction hash)
@@ -373,6 +398,13 @@ freeHashList (HashTable *table, HashList *hl)
     table->freeList = hl;
 }
 
+#if defined(USE_RUST_RTS)
+HashList *
+ghc_c_hash_alloc_entry(HashTable *table)
+{
+    return allocHashList(table);
+}
+#else
 STATIC_INLINE void
 insertHashTable_inlined(HashTable *table, StgWord key,
                         const void *data, HashFunction f)
@@ -401,24 +433,37 @@ insertHashTable_inlined(HashTable *table, StgWord key,
     hl->next = table->dir[segment][index];
     table->dir[segment][index] = hl;
 }
+#endif
 
 void
 insertHashTable_(HashTable *table, StgWord key,
                  const void *data, HashFunction f)
 {
-    return insertHashTable_inlined(table, key, data, f);
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_insert_custom(table, key, data, f);
+#else
+    insertHashTable_inlined(table, key, data, f);
+#endif
 }
 
 void
 insertHashTable(HashTable *table, StgWord key, const void *data)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_insert_word(table, key, data);
+#else
     insertHashTable_inlined(table, key, data, hashWord);
+#endif
 }
 
 void
 insertStrHashTable(StrHashTable *table, const char * key, const void *data)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_hash_insert_custom(&table->table, (StgWord)key, data, hashStr);
+#else
     insertHashTable_inlined(&table->table, (StgWord) key, data, hashStr);
+#endif
 }
 
 #if defined(USE_RUST_RTS)

@@ -21,6 +21,7 @@ extra-source-files:
     rust/file_lock.rs
     rust/gc_budget.rs
     rust/hash_chain.rs
+    rust/hash_insert.rs
     rust/hash_walk.rs
     rust/lib.rs
     rust/mblock_extents.rs

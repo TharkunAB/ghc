@@ -1,6 +1,6 @@
 use core::ffi::{c_int, c_void};
 
-const SEGMENT_SIZE: usize = 1024;
+pub(super) const SEGMENT_SIZE: usize = 1024;
 
 // Hash.c checks the entry layout and segment size at compile time.
 #[repr(C)]

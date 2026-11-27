@@ -26,6 +26,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/file_lock.rs"
                 , "rts/rust/gc_budget.rs"
                 , "rts/rust/hash_chain.rs"
+                , "rts/rust/hash_insert.rs"
                 , "rts/rust/hash_walk.rs"
                 , "rts/rust/mblock_extents.rs"
                 , "rts/rust/prim_float.rs"
