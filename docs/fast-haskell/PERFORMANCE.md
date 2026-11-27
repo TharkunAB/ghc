@@ -19,6 +19,21 @@ The edit and revert together took **152.43 s with the original build and 53.12 s
 
 Separate writable overlays used the same read-only build. Preparation and worker warm-up took place before each stopwatch interval. Each cell is one sample. After correcting the primer, the original windows ran before the optimized windows. Pueue recorded overlap with a small-group task in the original forward window and a build-group task in the optimized reverse window. Whole-job memory peaks were 2,548 and 2,491 MiB for the original windows and 3,425 and 3,504 MiB for the optimized windows, including worker warm-up and verification.
 
+### Linker choice on the published development route
+
+With the same optimized Hadrian rules, Stage0 `cafe7121a8e6` and worker `df96e32`, we compared GNU BFD 2.42 and mold 2.30.0. Both used `perf+no_profiled_libs --freeze1 -j3`, the default compile nursery and logical CPUs 20–23. The link flags applied to the Stage1 compiler library and executable. Worker warm-up and verification ran outside the timed edit. The forward pair ran BFD first. The reverse pair ran mold first.
+
+| Linked `-O2` rebuild | BFD | mold |
+| --- | ---: | ---: |
+| Change cutoff 32 to 31 | 26.644 s | 19.683 s |
+| Immediate repeat | 4.650 s | 4.778 s |
+| Revert 31 to 32 | 28.255 s | 19.579 s |
+| Immediate repeat | 4.064 s | 4.137 s |
+
+The two edits took **54.899 s with BFD and 39.262 s with mold (1.40×, 28.5% less time)**. Each edit ran 54 compile requests, skipped 53 code generations and regenerated one of 943 dependency rows. Every immediate repeat did zero builder actions. Each cell is one sample. Whole-job memory peaks were 4,290 and 4,538 MiB for the two paired windows, including warm-up and validation.
+
+Module artifacts, dependency files, compiler archives and the consumer's object and interface matched. The shared libraries had the same exported symbol descriptions, ordered library dependencies, runpath and library name. Each compiler and consumer loaded its newly linked library through the default loader and the consumer returned the same result. [Linker flags](rebuild-c33551f.md#fix-for-the-repeated-package-copy)
+
 ### Cumulative comparison on GHC 10.1.20261127
 
 We built Hadrian from the branch point `56bb91d95f` and used ordinary GHC for both dependency scanning and compilation. The development configuration used the published Hadrian changes, one Hadrian capability, and a stage-matched worker for dependency scans and compile checks with its decoded-interface cache enabled. The pilot also used an importer's actual source options and interface usage records to decide whether a change to `GHC.Utils.Misc` required a compiler call. Hadrian still passed changed code to the ordinary compiler and relinked its library and executable.
@@ -68,6 +83,8 @@ The previous shared Stage0 worker pointed to a different installation with a mis
 The normalized linked edit issued 53 up-to-date compile requests. Forty-eight used CPP and five were boot modules. A private default-CPP check replayed the 48 commands in four paired batches of three clients. The median fell from 3.30 s with ordinary GHC to 2.03 s with the worker. Diagnostics matched. One request delegated in one timed batch. The prototype ran default CPP again through ordinary GHC on an edit that required compilation, so we kept it private.
 
 The existing full-codegen worker ran CPP once per command while replaying the same producer with Hadrian's `-O2 -dynamic-too -fobject-determinism` flags. The original source, an edit, and its reversal each matched all four ordinary GHC artifacts. A separate header fixture matched the warning, the `#line` location of a type error, and the last successful artifacts after that error. The replay redirected outputs to scratch and enabled phase timing. It verifies these two workloads. Hadrian's published build continues to use the check-only worker.
+
+A four-module follow-up compared one ordinary compile per module with two resident compiles in opposite orders. `GHC.Data.FastString`, `GHC.Core.Opt.OccurAnal` and `GHC.Cmm.Pipeline` used their captured `-fobject-determinism` flag and matched all 24 static and dynamic object and interface comparisons. The driver control, `GHC.Driver.Session.Lint`, omitted the flag. Its interfaces matched, and both object variants differed among the three runs. The single ordinary sample leaves the source of that variance unresolved. All eight resident requests matched normal diagnostics, ran CPP once and made zero stock compiler calls.
 
 A separate stock replay inserted a header earlier in the CPP include path. The source hash and the old recorded header were unchanged. Fresh GHC selected the new header, discovered a different import and rebuilt. A compiler check that reuses preprocessing must also account for changes in header lookup.
 
