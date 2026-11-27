@@ -29,9 +29,38 @@
          It untags and (if needed) retags pointers to closures.
    -------------------------------------------------------------------------- */
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+GHC_STATIC_ASSERT(TAG_MASK == 7 && offsetof(StgHeader, info) == 0 &&
+                  sizeof(((StgInfoTable *)0)->type) == sizeof(uint32_t), "Rust closure layout");
+GHC_STATIC_ASSERT(BF_EVACUATED == 1 && BF_LARGE == 2 && BF_MARKED == 8 && BF_NONMOVING == 1024,
+                  "Rust liveness block flags");
+GHC_STATIC_ASSERT(IND == 27 && IND_STATIC == 28 && BLACKHOLE == 38, "Rust indirection types");
+RTS_PRIVATE StgClosure *ghc_rust_is_alive(StgClosure *p, const StgWord16 *(*flags)(StgClosure *),
+    bool (*marked)(StgClosure *), ptrdiff_t info_type_offset, size_t indirectee_offset);
+
+static const StgWord16 *livenessBlockFlags(StgClosure *q)
+{
+    ASSERT(LOOKS_LIKE_CLOSURE_PTR(q));
+    return HEAP_ALLOCED_GC(q) ? &Bdescr((P_)q)->flags : NULL;
+}
+
+static bool livenessMarked(StgClosure *q)
+{
+    return is_marked((P_)q, Bdescr((P_)q)) != 0;
+}
+#endif
+
 StgClosure *
 isAlive(StgClosure *p)
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ptrdiff_t type_offset = offsetof(StgInfoTable, type);
+#if defined(TABLES_NEXT_TO_CODE)
+    type_offset -= (ptrdiff_t)sizeof(StgInfoTable);
+#endif
+    return ghc_rust_is_alive(p, livenessBlockFlags, livenessMarked, type_offset,
+                             offsetof(StgInd, indirectee));
+#else
   const StgInfoTable *info;
   bdescr *bd;
   StgWord tag;
@@ -115,6 +144,7 @@ isAlive(StgClosure *p)
       return NULL;
     }
   }
+#endif
 }
 
 /* -----------------------------------------------------------------------------
