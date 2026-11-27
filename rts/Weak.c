@@ -20,12 +20,28 @@
 #include "AllocArray.h"
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_C_FINALIZERS
+/* Note [Weak finalizer traversal]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The closure header size depends on the RTS way. Rust reads the callback
+ * payload from the link offset. Check the other fields against that offset.
+ * At shutdown the scheduler has stopped. The registry can still contain
+ * DEAD_WEAK entries whose C finalizers already ran. Skip these entries.
+ * Each callback runs with the current task's running_finalizers flag set
+ * during the shutdown walk. Read each next link after the callback returns.
+ */
+#define FINALIZER_FIELD(field, index) \
+    (offsetof(StgCFinalizerList, field) == \
+     offsetof(StgCFinalizerList, link) + (index) * sizeof(void *))
+GHC_STATIC_ASSERT(FINALIZER_FIELD(fptr, 1) && FINALIZER_FIELD(ptr, 2) &&
+                  FINALIZER_FIELD(eptr, 3) && FINALIZER_FIELD(flag, 4),
+                  "Rust C finalizer payload layout");
 GHC_STATIC_ASSERT(sizeof(((StgCFinalizerList *)0)->flag) == sizeof(size_t),
                   "Rust C finalizer flag must fit in a native word");
-RTS_PRIVATE void ghc_rust_run_c_finalizers(
-    StgCFinalizerList *list, StgClosure *end,
-    size_t link_offset, size_t fptr_offset, size_t ptr_offset,
-    size_t eptr_offset, size_t flag_offset);
+GHC_STATIC_ASSERT(offsetof(StgWeak, header.info) == 0, "Rust weak info pointer layout");
+RTS_PRIVATE void ghc_rust_run_c_finalizers(StgCFinalizerList *list, size_t payload_offset);
+RTS_PRIVATE void ghc_rust_run_all_c_finalizers(StgWeak *list, bool *running,
+    size_t callbacks_offset, size_t link_offset, size_t payload_offset);
 #endif
 
 // List of dead weak pointers collected by the last GC
@@ -37,14 +53,8 @@ static uint32_t n_finalizers = 0;
 void
 runCFinalizers(StgCFinalizerList *list)
 {
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-    ghc_rust_run_c_finalizers(
-        list, &stg_NO_FINALIZER_closure,
-        offsetof(StgCFinalizerList, link),
-        offsetof(StgCFinalizerList, fptr),
-        offsetof(StgCFinalizerList, ptr),
-        offsetof(StgCFinalizerList, eptr),
-        offsetof(StgCFinalizerList, flag));
+#if defined(USE_RUST_C_FINALIZERS)
+    ghc_rust_run_c_finalizers(list, offsetof(StgCFinalizerList, link));
 #else
     StgCFinalizerList *head;
     for (head = list;
@@ -62,10 +72,13 @@ runCFinalizers(StgCFinalizerList *list)
 void
 runAllCFinalizers(StgWeak *list)
 {
+    Task *task = myTask();
+#if defined(USE_RUST_C_FINALIZERS)
+    ghc_rust_run_all_c_finalizers(list, task ? &task->running_finalizers : NULL,
+        offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
+        offsetof(StgCFinalizerList, link));
+#else
     StgWeak *w;
-    Task *task;
-
-    task = myTask();
     if (task != NULL) {
         task->running_finalizers = true;
     }
@@ -87,6 +100,7 @@ runAllCFinalizers(StgWeak *list)
     if (task != NULL) {
         task->running_finalizers = false;
     }
+#endif
 }
 
 /*
