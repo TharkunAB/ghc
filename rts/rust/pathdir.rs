@@ -9,6 +9,20 @@ unsafe extern "C" {
     fn stgFree(ptr: *mut c_void);
 }
 
+/// Copy a NUL-terminated POSIX path into an RTS allocation.
+///
+/// # Safety
+///
+/// `path` must point to a NUL-terminated string. The caller must free the
+/// returned allocation with `stgFree`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ghc_rust_pathdup(path: *const c_char) -> *mut c_char {
+    let input = unsafe { CStr::from_ptr(path) }.to_bytes_with_nul();
+    let result = unsafe { stgMallocBytes(input.len(), c"pathdup".as_ptr()) }.cast::<c_char>();
+    unsafe { ptr::copy_nonoverlapping(input.as_ptr().cast(), result, input.len()) };
+    result
+}
+
 /// Return the POSIX parent path with one trailing slash.
 ///
 /// # Safety

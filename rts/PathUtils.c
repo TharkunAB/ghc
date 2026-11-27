@@ -9,6 +9,7 @@
 #include <ctype.h>
 #if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && !defined(TSAN_ENABLED)
 RTS_PRIVATE pathchar *ghc_rust_pathdir(const pathchar *path);
+RTS_PRIVATE pathchar *ghc_rust_pathdup(const pathchar *path);
 #endif
 #if defined(mingw32_HOST_OS)
 /* Using Secure APIs */
@@ -21,6 +22,8 @@ pathchar* pathdup(const pathchar *path)
     pathchar *ret;
 #if defined(mingw32_HOST_OS)
     ret = wcsdup(path);
+#elif defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && !defined(TSAN_ENABLED)
+    ret = ghc_rust_pathdup(path);
 #else
     /* sigh, strdup() isn't a POSIX function, so do it the long way */
     ret = stgMallocBytes( strlen(path)+1, "pathdup" );
