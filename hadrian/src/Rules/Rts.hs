@@ -23,6 +23,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/alloc_array.rs"
                 , "rts/rust/archive_member.rs"
                 , "rts/rust/c_finalizers.rs"
+                , "rts/rust/cafs.rs"
                 , "rts/rust/closure_table.rs"
                 , "rts/rust/arena.rs"
                 , "rts/rust/encode.rs"

@@ -121,9 +121,23 @@ isAlive(StgClosure *p)
    Reverting CAFs
    -------------------------------------------------------------------------- */
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+GHC_STATIC_ASSERT(STATIC_BITS == 3 && STATIC_FLAG_LIST == STATIC_BITS,
+                  "Rust CAF list tags");
+GHC_STATIC_ASSERT(offsetof(StgIndStatic, header.info) == 0 &&
+                  offsetof(StgIndStatic, static_link) == offsetof(StgIndStatic, indirectee) + sizeof(void *) &&
+                  offsetof(StgIndStatic, saved_info) == offsetof(StgIndStatic, static_link) + sizeof(void *),
+                  "Rust CAF layout");
+RTS_PRIVATE void ghc_rust_mark_cafs(evac_fn evac, void *user, size_t payload_offset);
+RTS_PRIVATE void ghc_rust_revert_cafs(size_t payload_offset);
+#endif
+
 void
 revertCAFs( void )
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_revert_cafs(offsetof(StgIndStatic, indirectee));
+#else
     StgIndStatic *c = revertible_caf_list;
 
     while (c != (StgIndStatic *) END_OF_CAF_LIST) {
@@ -141,11 +155,15 @@ revertCAFs( void )
         c = next;
     }
     revertible_caf_list = (StgIndStatic*)END_OF_CAF_LIST;
+#endif
 }
 
 void
 markCAFs (evac_fn evac, void *user)
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_mark_cafs(evac, user, offsetof(StgIndStatic, indirectee));
+#else
     /* N.B. We must both ensure that the indirectee is
      * evacuated and that we let the linker know that the CAF
      * itself is still reachable, lest it be collected (see
@@ -170,4 +188,5 @@ markCAFs (evac_fn evac, void *user)
         // See Note [Object unloading] in CheckUnload.c
         if (unload_mark_needed) markObjectCode(c);
     }
+#endif
 }
