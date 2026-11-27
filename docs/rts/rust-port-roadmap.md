@@ -8,6 +8,8 @@ The source baseline is upstream GHC `56bb91d95f89509cb351a5eb4a7406825675866c`. 
 
 At `76ce10e8e0`, static programs exercised complete Rust implementations of **11/180 C units in threaded and threaded debug builds** and **10/180 in vanilla and debug builds** on native x86-64 GNU/Linux. The count includes the POSIX paths through `PathUtils.c`. Coverage remains **0/17 Cmm** and **0/5 assembly**.
 
+At `bb10fe93d3`, **28/180 C units** have at least one operation implemented in Rust across the supported build configurations. This includes the complete units above. Of these 28 files, 27 select an implementation with `USE_RUST_RTS`. The remaining file, `Sparks.c`, calls the Rust compaction loop through the inline `retainWSDequeClosureSlots` in `WSDeque.h`. This count measures source files. Each file's checks below identify the tested operations and builds.
+
 | Milestone | Status and next check |
 | --- | --- |
 | Build a working mixed RTS | A stage2 compiler built with the persistent worker runs Tiny and Fibonacci. The C-only rollback also passes in static, threaded static and dynamic builds. |
