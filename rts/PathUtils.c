@@ -7,6 +7,9 @@
 
 #include <libgen.h>
 #include <ctype.h>
+#if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && !defined(TSAN_ENABLED)
+RTS_PRIVATE pathchar *ghc_rust_pathdir(const pathchar *path);
+#endif
 #if defined(mingw32_HOST_OS)
 /* Using Secure APIs */
 #define MINGW_HAS_SECURE_API 1
@@ -39,6 +42,8 @@ pathchar* pathdir(const pathchar *path)
     pathprintf(ret, memberLen, WSTR("%" PATH_FMT "%" PATH_FMT), drive, dirName);
     stgFree(drive);
     stgFree(dirName);
+#elif defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && !defined(TSAN_ENABLED)
+    ret = ghc_rust_pathdir(path);
 #else
     pathchar *pathCopy = stgMallocBytes(pathsize * (pathlen(path) + 1), "pathdir(path)");
     pathcopy(pathCopy, path);
