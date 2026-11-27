@@ -33,6 +33,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/prim_float.rs"
                 , "rts/rust/stable_name.rs"
                 , "rts/rust/stable_ptr.rs"
+                , "rts/rust/static_ptr_table.rs"
                 ] rustCfg output
         buildPath -/- "rust-rts-prim-bits.o" %>
             buildRustRts stage "ghc_rts_prim_bits" "rts/rust/prim_bits.rs" [] []

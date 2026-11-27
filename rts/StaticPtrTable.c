@@ -14,6 +14,15 @@
 #include "Hash.h"
 #include "StablePtr.h"
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_SPT_ENTRIES 1
+GHC_STATIC_ASSERT(sizeof(StgStablePtr) == sizeof(void *) &&
+                  _Alignof(StgStablePtr) == _Alignof(void *),
+                  "Rust static pointer entry layout");
+RTS_PRIVATE StgStablePtr *ghc_rust_spt_new_entry(StgPtr closure);
+RTS_PRIVATE void ghc_rust_spt_free_entry(void *entry);
+#endif
+
 static HashTable * spt = NULL;
 
 /* Note [Static pointer table lock lifetime]
@@ -58,16 +67,24 @@ void hs_spt_insert(StgWord64 key[2], void *spe_closure) {
   // Cannot remove this indirection yet because getStablePtr()
   // might return NULL, in which case hs_spt_lookup() returns NULL
   // instead of the actual closure pointer.
+#if defined(USE_RUST_SPT_ENTRIES)
+  StgStablePtr *entry = ghc_rust_spt_new_entry(spe_closure);
+#else
   StgStablePtr * entry = stgMallocBytes( sizeof(StgStablePtr)
                                        , "hs_spt_insert: entry"
                                        );
   *entry = getStablePtr(spe_closure);
+#endif
   hs_spt_insert_stableptr(key, entry);
 }
 
 static void freeSptEntry(void* entry) {
+#if defined(USE_RUST_SPT_ENTRIES)
+  ghc_rust_spt_free_entry(entry);
+#else
   freeStablePtr(*(StgStablePtr*)entry);
   stgFree(entry);
+#endif
 }
 
 void hs_spt_remove(StgWord64 key[2]) {

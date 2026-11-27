@@ -15,6 +15,7 @@ mod mblock_extents;
 mod prim_float;
 mod stable_name;
 mod stable_ptr;
+mod static_ptr_table;
 
 mod hash_api {
     use core::ffi::{c_int, c_void};
