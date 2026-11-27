@@ -287,7 +287,7 @@ stg_shrinkMutableByteArrayzh ( gcptr mba, W_ new_size )
        W_ n;
        n = old_wds - new_wds;
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-       foreign "C" ghc_rust_shrink_byte_array_fallback(
+       foreign "C" ghc_rust_publish_shrink(
            mba + SIZEOF_StgHeader + OFFSET_StgArrBytes_bytes "ptr",
            new_size, mba + WDS(new_wds) "ptr", n);
 #else
@@ -492,12 +492,17 @@ again:
    old_size_sma = StgSmallMutArrPtrs_ptrs(mba);
    n_sma = old_size_sma - new_size;
    slop_start = mba + SIZEOF_StgSmallMutArrPtrs + WDS(new_size);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+   foreign "C" ghc_rust_publish_shrink(
+       mba + SIZEOF_StgHeader + OFFSET_StgSmallMutArrPtrs_ptrs "ptr",
+       new_size, slop_start "ptr", n_sma);
+#else
    foreign "C" stg_writeSlopMarker(slop_start "ptr", n_sma);
-
    // No ordering needed: the concurrent mark thread bounds the slop with the
    // marker's own release/acquire (Note [Slop marker memory ordering]), not
    // with this store, and reading the new size it never scans the slop.
    StgSmallMutArrPtrs_ptrs(mba) = new_size;
+#endif
    // No need to call PROF_HEADER_CREATE. See Note [LDV profiling and resizing arrays]
 
    return ();

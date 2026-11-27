@@ -8,7 +8,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_allocate_small_mut_array",
     ".hidden ghc_rust_allocate_byte_array",
     ".hidden ghc_rust_allocate_pinned_byte_array",
-    ".hidden ghc_rust_shrink_byte_array_fallback",
+    ".hidden ghc_rust_publish_shrink",
 );
 
 unsafe extern "C" {
@@ -23,7 +23,7 @@ unsafe extern "C" {
 // See Note [shrink-array slop marker] in PrimOps.cmm and
 // Note [Slop marker memory ordering] in ClosureMacros.h.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_shrink_byte_array_fallback(
+unsafe extern "C" fn ghc_rust_publish_shrink(
     length: *mut usize,
     new_size: usize,
     slop: *mut usize,
