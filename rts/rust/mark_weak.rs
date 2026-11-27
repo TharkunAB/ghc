@@ -11,6 +11,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_resurrect_unreachable_threads",
     ".hidden ghc_rust_scavenge_live_weak",
     ".hidden ghc_rust_tidy_weak_list",
+    ".hidden ghc_rust_tidy_thread_list",
 );
 
 unsafe extern "C" {
@@ -109,6 +110,33 @@ unsafe extern "C" fn ghc_rust_tidy_weak_list(
             weak = next;
         }
         found
+    }
+}
+
+// See Note [Tidy thread list ownership] in sm/MarkWeak.c.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_tidy_thread_list(
+    old: *mut *mut u8,
+    end: *mut u8,
+    link_offset: usize,
+    inspect: unsafe extern "C" fn(*mut *mut u8) -> *mut *mut u8,
+) {
+    unsafe {
+        let mut previous = old;
+        let mut tso = old.read();
+        while tso != end {
+            let destination = inspect(&raw mut tso);
+            let link = tso.add(link_offset).cast::<*mut u8>();
+            let next = link.read();
+            if destination.is_null() {
+                previous = link;
+            } else {
+                previous.write(next);
+                link.write(destination.read());
+                destination.write(tso);
+            }
+            tso = next;
+        }
     }
 }
 

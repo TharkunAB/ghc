@@ -35,6 +35,8 @@ RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
     size_t live_offset, size_t old_offset, uint32_t collected, uint32_t oldest, bool nonmoving);
 RTS_PRIVATE bool ghc_rust_traverse_weaks(void *context,
     bool (*run_pass)(void *context, uint8_t pass));
+RTS_PRIVATE void ghc_rust_tidy_thread_list(StgTSO **old, StgTSO *end,
+    size_t link_offset, StgTSO **(*inspect)(StgTSO **));
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -563,8 +565,37 @@ static bool tidyWeakList(generation *gen)
  * This has the side-effect of updating the global thread list to account for
  * indirections introduced by evacuation.
  */
+/* Note [Tidy thread list ownership]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * isAlive can return a relocated TSO. The C callback updates the pointer
+ * and finds its destination generation. Rust reads the next link from
+ * that TSO and updates the old list and the destination list. The callback
+ * uses isAlive from GCAux.c, which does not use the gct register.
+ */
+#if defined(USE_RUST_WEAK_GC)
+static StgTSO **inspectTidyThread(StgTSO **current)
+{
+    StgTSO *t = *current;
+    StgTSO *live = (StgTSO *)isAlive((StgClosure *)t);
+    if (live != NULL) t = live;
+
+    ASSERT(get_itbl((StgClosure *)t)->type == TSO);
+    ASSERT(t->blocked_exceptions == END_BLOCKED_EXCEPTIONS_QUEUE
+           || t->why_blocked == BlockedOnCCall
+           || t->why_blocked == BlockedOnCCall_Interruptible
+           || (t->flags & TSO_BLOCKEX));
+
+    *current = t;
+    return live != NULL ? &Bdescr((P_)t)->gen->threads : NULL;
+}
+#endif
+
 static void tidyThreadList (generation *gen)
 {
+#if defined(USE_RUST_WEAK_GC)
+    ghc_rust_tidy_thread_list(&gen->old_threads, END_TSO_QUEUE,
+        offsetof(StgTSO, global_link), inspectTidyThread);
+#else
     StgTSO *next;
     StgTSO **prev = &gen->old_threads;
 
@@ -603,6 +634,7 @@ static void tidyThreadList (generation *gen)
             new_gen->threads = t;
         }
     }
+#endif
 }
 
 #if defined(DEBUG)
