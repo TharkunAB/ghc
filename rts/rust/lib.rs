@@ -7,6 +7,7 @@ mod block_count;
 mod c_finalizers;
 mod cafs;
 mod closure_table;
+mod clone_stack;
 mod arena;
 mod encode;
 mod exec_page;

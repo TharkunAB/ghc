@@ -26,6 +26,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/c_finalizers.rs"
                 , "rts/rust/cafs.rs"
                 , "rts/rust/closure_table.rs"
+                , "rts/rust/clone_stack.rs"
                 , "rts/rust/arena.rs"
                 , "rts/rust/encode.rs"
                 , "rts/rust/exec_page.rs"
