@@ -208,6 +208,35 @@ All installed archives matched in bytes and mode. Pueue job 7350 peaked
 at 1,456 MiB. This replay measured static archive preparation independently
 of Hadrian and the rest of the package copy.
 
+The linked trial kept ordinary Cabal and the Stage1 registration
+overlap enabled in both arms. Only the candidate intercepted static
+archive stripping. The first attempt invalidated all 883 source
+stamps when it remounted the build overlay. The repaired cache checks
+the source digest on a stamp miss and verifies the cached output's
+stamp before reuse.
+
+| Linked `-O2` rebuild | GNU strip | Reuse stripped members |
+| --- | ---: | ---: |
+| Change cutoff 32 to 31 | 21.831 s | 15.932 s |
+| Immediate repeat | 3.174 s | 2.471 s |
+| Revert cutoff 31 to 32 | 23.562 s | 19.481 s |
+| Immediate repeat | 2.872 s | 3.926 s |
+
+In this single balanced pair the edit and revert took **45.393 s
+and 35.413 s**, respectively (22.0% less time). The candidate
+stripped only `GHC.Utils.Misc.o` in both edits. The forward edit
+checked one source digest and ran the cache wrapper in 0.969 s.
+The revert checked all 883 source digests after remount and ran
+the wrapper in 1.368 s. The linked savings exceed the isolated
+static-archive savings, so the pair includes other timing variation.
+
+Each edit ran 54 compile requests with 53 codegen skips and
+regenerated one of 943 dependency rows. The 1,763 installed files,
+package database, module artifacts, linked compiler, shared library
+and dynamic API consumer matched. All repeats ran zero builders.
+Pueue job 7420 used logical CPUs 20–23 and peaked at 4,269 MiB.
+The trial used private tool interposition on Hadrian at `be66a11a99`.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
@@ -547,6 +576,18 @@ Built-in heads had visible rules in all three cases, so the
 empty-only check declined reuse. The probe ran ordinary simplification
 throughout. Pueue job 7402 used the GHC 10.1.20261115.1 compiler
 relinked from revision `945ea7a737`.
+
+The demand-driven shadow resolver collected only requested names and
+stopped once it found them. It reduced resolver allocation from
+4.30 MB to 3.92 MB across four matched `GHC.Utils.Misc` requests.
+That still left about 4.0 MB of total validation allocation and four
+unresolved local lookups. The old and new resolvers produced the same
+tested certificates and verdicts. Both matched stock diagnostics and
+artifacts. The orphan-rule fixture again returned 6, 6 and 46 and
+matched stock. Timings varied. Early stopping still needs a guarantee
+that one stable name identifies the same `IdInfo` after substitution
+before it can support binding reuse. Pueue job 7445 used the same
+GHC 10.1.20261115.1 relink setup.
 
 ### Cmm assignment sinking
 
