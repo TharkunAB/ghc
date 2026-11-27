@@ -70,6 +70,25 @@ tests. Pueue jobs 7211 and 7214 collected these results. The optimized
 worker used a private API overlay. This experiment preceded qualification
 of the packaged Stage0 release.
 
+### CPP cache across temporary directories
+
+On the exact 943-module Stage0 command, a worker seeded its cache under
+one temporary directory and restarted under four longer paths. The
+released worker reused zero of 104 CPP records in each new directory.
+The candidate reused all 104 by hashing the bytes around the proven
+generated header marker and checking the current ordinary marker paths.
+The median fell from **5.371 s to 3.943 s** (26.6%) over four alternating
+pairs. Both reused 835 empty certificates and matched stock dependency
+files, backups and diagnostics. Stock controls in two directories had a
+median of 8.745 s. All 1,068 watched inputs stayed stable.
+
+The candidate missed when a different temporary prefix made an ordinary
+header eligible. It also matched stock on parser warnings, CPP failure
+and escaped temporary paths. A separate fixture reused a receipt after
+crossing from a two-digit process ID to four digits in one directory.
+Pueue jobs 7286 and 7292 verified the private candidate. The paired job
+peaked at 547 MiB. The shared Stage0 selector is `ad8a24f`.
+
 ### Cabal compiler-library installation
 
 We replayed the complete Stage1 GHC package copy with the original Cabal
