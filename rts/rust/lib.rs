@@ -1,6 +1,7 @@
 #![no_std]
 
 mod archive_member;
+mod arena;
 mod encode;
 mod eventlog_file_writer;
 mod file_lock;

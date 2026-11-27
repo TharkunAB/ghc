@@ -20,6 +20,7 @@ rtsRules = priority 3 $ do
             let rustCfg = if largeAddressSpace then ["--cfg", "ghc_use_large_address_space"] else []
             buildRustRts stage "ghc_rts" "rts/rust/lib.rs"
                 [ "rts/rust/archive_member.rs"
+                , "rts/rust/arena.rs"
                 , "rts/rust/encode.rs"
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
