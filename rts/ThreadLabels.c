@@ -37,7 +37,7 @@ setThreadLabel(Capability  *cap,
                StgTSO      *tso,
                char *label)
 {
-    int len = strlen(label);
+    size_t len = strlen(label);
     StgArrBytes *arr = allocateArrBytes(cap, len, cap->r.rCCCS);
     // On allocation failure don't perform the effect. It's not convenient to
     // propagate failure from here since there are multiple callers in the RTS.
