@@ -10,11 +10,13 @@ core::arch::global_asm!(
     ".hidden ghc_rust_traverse_weaks",
     ".hidden ghc_rust_resurrect_unreachable_threads",
     ".hidden ghc_rust_scavenge_live_weak",
+    ".hidden ghc_rust_tidy_weak_list",
 );
 
 unsafe extern "C" {
     fn mark_root(gc_thread: *mut c_void, slot: *mut *mut u8);
     static stg_NO_FINALIZER_closure: u8;
+    static stg_DEAD_WEAK_info: u8;
 }
 
 #[repr(C)]
@@ -46,6 +48,68 @@ unsafe extern "C" fn ghc_rust_scavenge_live_weak(
 struct WeakList {
     head: *mut u8,
     tail: *mut u8,
+}
+
+#[repr(C)]
+struct WeakListOps {
+    live_key: unsafe extern "C" fn(*mut u8, *const u8) -> *mut u8,
+    destination: unsafe extern "C" fn(*mut u8, *mut u32) -> *mut *mut u8,
+    remember: unsafe extern "C" fn(*mut c_void, *mut u8, u32),
+    trace: Option<unsafe extern "C" fn(*mut u8, u32, u32)>,
+}
+
+// This pass runs after scavenging stops. Move live weak objects to their owning generations.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_tidy_weak_list(
+    mut previous: *mut *mut u8,
+    from: u32,
+    worker: *mut c_void,
+    evac_gen: *mut u32,
+    failed: *mut bool,
+    payload_offset: usize,
+    ops: *const WeakListOps,
+) -> bool {
+    unsafe {
+        let mut found = false;
+        let mut weak = previous.read();
+        while !weak.is_null() {
+            let payload = weak.add(payload_offset).cast::<WeakPayload>();
+            let link = &raw mut (*payload).link;
+            let info = weak.cast::<*const u8>().read();
+            if info == &raw const stg_DEAD_WEAK_info {
+                weak = link.read();
+                previous.write(weak);
+                continue;
+            }
+            let key = ((*ops).live_key)(weak, info);
+            if key.is_null() {
+                previous = link;
+                weak = link.read();
+                continue;
+            }
+
+            (*payload).key = key;
+            let mut to = 0;
+            let destination = ((*ops).destination)(weak, &raw mut to);
+            evac_gen.write(to);
+            failed.write(false);
+            ghc_rust_scavenge_live_weak(weak, worker, payload_offset);
+            if failed.read() {
+                ((*ops).remember)(worker, weak, to);
+            }
+
+            let next = link.read();
+            previous.write(next);
+            link.write(destination.read());
+            destination.write(weak);
+            if let Some(trace) = (*ops).trace {
+                trace(weak, from, to);
+            }
+            found = true;
+            weak = next;
+        }
+        found
+    }
 }
 
 #[derive(Clone, Copy)]

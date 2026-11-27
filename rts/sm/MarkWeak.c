@@ -391,6 +391,63 @@ static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_t
 #endif
 }
 
+#if defined(USE_RUST_WEAK_GC)
+// Rust owns the list links. C supplies the heap layout and mutable-list operations.
+typedef struct {
+    StgClosure *(*liveKey)(StgWeak *, const StgInfoTable *);
+    StgWeak **(*destination)(StgWeak *, uint32_t *);
+    void (*remember)(gc_thread *, StgWeak *, uint32_t);
+    void (*trace)(StgWeak *, uint32_t, uint32_t);
+} WeakListOps;
+
+static StgClosure *liveWeakKey(StgWeak *w, const StgInfoTable *info)
+{
+    const StgInfoTable *table = INFO_PTR_TO_STRUCT(info);
+    if (table->type != WEAK) {
+        barf("tidyWeakList: not WEAK: %d, %p", table->type, w);
+    }
+    return isAlive(w->key);
+}
+
+static StgWeak **weakDestination(StgWeak *w, uint32_t *number)
+{
+    generation *dest = Bdescr((P_)w)->gen;
+    *number = dest->no;
+    return &dest->weak_ptr_list;
+}
+
+static void rememberUnpromotedWeak(gc_thread *worker USED_IF_THREADS, StgWeak *w, uint32_t gen)
+{
+#if defined(THREADED_RTS)
+    gc_thread *saved = gct;
+#endif
+    SET_GCT(worker);
+    debugTrace(DEBUG_weak, "putting weak pointer %p into mutable list", w);
+    gct->failed_to_evac = false;
+    recordMutableGen_GC((StgClosure *)w, gen);
+    SET_GCT(saved);
+}
+
+#if defined(DEBUG)
+static void traceLiveWeak(StgWeak *w, uint32_t from, uint32_t to)
+{
+    if (from != to) {
+        debugTrace(DEBUG_weak, "moving weak pointer %p from %d to %d", w, from, to);
+    }
+    debugTrace(DEBUG_weak, "weak pointer still alive at %p -> %p", w, w->key);
+}
+#define TRACE_LIVE_WEAK traceLiveWeak
+#else
+#define TRACE_LIVE_WEAK NULL
+#endif
+
+static const WeakListOps weakListOps = {
+    liveWeakKey, weakDestination, rememberUnpromotedWeak, TRACE_LIVE_WEAK
+};
+RTS_PRIVATE bool ghc_rust_tidy_weak_list(StgWeak **old, uint32_t from, gc_thread *worker,
+    uint32_t *evac_gen, bool *failed, size_t payload_offset, const WeakListOps *ops);
+#endif
+
 /*
  * Walk over the `old_weak_ptr_list` of the given generation and:
  *
@@ -406,6 +463,10 @@ static bool tidyWeakList(generation *gen)
         return false;
     }
 
+#if defined(USE_RUST_WEAK_GC)
+    return ghc_rust_tidy_weak_list(&gen->old_weak_ptr_list, gen->no, gct,
+        &gct->evac_gen_no, &gct->failed_to_evac, offsetof(StgWeak, cfinalizers), &weakListOps);
+#else
     StgWeak *w, **last_w, *next_w;
     const StgInfoTable *info;
     StgClosure *new;
@@ -491,6 +552,7 @@ static bool tidyWeakList(generation *gen)
     }
 
     return flag;
+#endif
 }
 
 /*
