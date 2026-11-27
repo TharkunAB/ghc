@@ -40,13 +40,15 @@ pathchar* pathdir(const pathchar *path)
     stgFree(drive);
     stgFree(dirName);
 #else
-    // N.B. cast is safe as we do not modify dirName
-    const pathchar* dirName = dirname((pathchar *) path);
+    pathchar *pathCopy = stgMallocBytes(pathsize * (pathlen(path) + 1), "pathdir(path)");
+    pathcopy(pathCopy, path);
+    const pathchar* dirName = dirname(pathCopy);
     size_t memberLen  = pathlen(dirName);
     ret = stgMallocBytes(pathsize * (memberLen + 2), "pathdir(path)");
     strcpy(ret, dirName);
     ret[memberLen  ] = '/';
     ret[memberLen+1] = '\0';
+    stgFree(pathCopy);
 #endif
     return ret;
 }
