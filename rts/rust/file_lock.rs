@@ -2,36 +2,12 @@ use core::ffi::{c_char, c_int, c_void};
 use core::mem::size_of;
 use core::ptr::{null, with_exposed_provenance};
 
-#[repr(C)]
-struct HashTable {
-    _private: [u8; 0],
-}
-
-type Hash = unsafe extern "C" fn(*const HashTable, usize) -> c_int;
-type Compare = unsafe extern "C" fn(usize, usize) -> c_int;
-type Free = unsafe extern "C" fn(*mut c_void);
+use super::hash_api::{
+    HashTable, allocHashTable, freeHashTable, hashWord, insertHashTable, insertHashTable_,
+    lookupHashTable_, removeHashTable, removeHashTable_,
+};
 
 unsafe extern "C" {
-    fn allocHashTable() -> *mut HashTable;
-    fn freeHashTable(table: *mut HashTable, free: Option<Free>);
-    fn hashWord(table: *const HashTable, key: usize) -> c_int;
-    fn insertHashTable(table: *mut HashTable, key: usize, data: *const c_void);
-    fn removeHashTable(table: *mut HashTable, key: usize, data: *const c_void) -> *mut c_void;
-    fn lookupHashTable_(
-        table: *const HashTable,
-        key: usize,
-        hash: Hash,
-        compare: Compare,
-    ) -> *mut c_void;
-    fn insertHashTable_(table: *mut HashTable, key: usize, data: *const c_void, hash: Hash);
-    fn removeHashTable_(
-        table: *mut HashTable,
-        key: usize,
-        data: *const c_void,
-        hash: Hash,
-        compare: Compare,
-    ) -> *mut c_void;
-
     fn stgMallocBytes(size: usize, msg: *const c_char) -> *mut c_void;
     fn stgFree(ptr: *mut c_void);
 }

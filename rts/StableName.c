@@ -228,6 +228,8 @@ GHC_STATIC_ASSERT(offsetof(snEntry, addr) == 0 &&
 RTS_PRIVATE void ghc_rust_remember_stable_names(snEntry *table, size_t count);
 RTS_PRIVATE void ghc_rust_thread_stable_names(snEntry *table, size_t count,
                                               evac_fn evac, void *user);
+RTS_PRIVATE void ghc_rust_update_stable_names(snEntry *table, size_t count,
+                                             HashTable **hash, bool full);
 #endif
 
 void
@@ -324,6 +326,9 @@ gcStableNameTable( void )
 void
 updateStableNameTable(bool full)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_update_stable_names(stable_name_table, SNT_size, &addrToStableHash, full);
+#else
     if (full && addrToStableHash != NULL && 0 != keyCountHashTable(addrToStableHash)) {
         freeHashTable(addrToStableHash,NULL);
         addrToStableHash = allocHashTable();
@@ -349,4 +354,5 @@ updateStableNameTable(bool full)
                 }
             });
     }
+#endif
 }

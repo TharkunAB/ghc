@@ -1,4 +1,8 @@
-use core::{ffi::c_void, mem::size_of};
+use core::{ffi::c_void, mem::size_of, ptr};
+
+use super::hash_api::{
+    HashTable, allocHashTable, freeHashTable, insertHashTable, keyCountHashTable, removeHashTable,
+};
 
 #[repr(C)]
 pub(super) struct Entry {
@@ -9,13 +13,13 @@ pub(super) struct Entry {
 
 // See Note [Stable name table visits] in StableName.h. Callers serialize
 // changes to the table and allow the collector to rewrite individual slots.
-unsafe fn visit_entries(table: *mut Entry, count: usize, mut visit: impl FnMut(*mut Entry)) {
+unsafe fn visit_entries(table: *mut Entry, count: usize, mut visit: impl FnMut(usize, *mut Entry)) {
     let bytes = count * size_of::<Entry>();
     for index in 1..count {
         let entry = unsafe { table.add(index) };
         let addr = unsafe { (*entry).addr };
         if addr.addr().wrapping_sub(table.addr()) >= bytes {
-            visit(entry);
+            visit(index, entry);
         }
     }
 }
@@ -23,7 +27,7 @@ unsafe fn visit_entries(table: *mut Entry, count: usize, mut visit: impl FnMut(*
 /// Save each visited address before the collector moves the pointee.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_remember_stable_names(table: *mut Entry, count: usize) {
-    unsafe { visit_entries(table, count, |entry| (*entry).old = (*entry).addr) };
+    unsafe { visit_entries(table, count, |_, entry| (*entry).old = (*entry).addr) };
 }
 
 /// Give the collector each non-null name slot, then its non-null pointee slot.
@@ -36,12 +40,49 @@ pub(super) unsafe extern "C" fn ghc_rust_thread_stable_names(
     user: *mut c_void,
 ) {
     unsafe {
-        visit_entries(table, count, |entry| {
+        visit_entries(table, count, |_, entry| {
             if !(*entry).sn_obj.is_null() {
                 evac.unwrap_unchecked()(user, &raw mut (*entry).sn_obj);
             }
             if !(*entry).addr.is_null() {
                 evac.unwrap_unchecked()(user, &raw mut (*entry).addr);
+            }
+        });
+    }
+}
+
+/// Update the address index after the collector visits stable names.
+/// C serializes access to the entries and the hash table.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_update_stable_names(
+    table: *mut Entry,
+    count: usize,
+    hash: *mut *mut HashTable,
+    full: bool,
+) {
+    unsafe {
+        let mut index_by_addr = hash.read();
+        if full && !index_by_addr.is_null() && keyCountHashTable(index_by_addr) != 0 {
+            freeHashTable(index_by_addr, None);
+            index_by_addr = allocHashTable();
+            hash.write(index_by_addr);
+        }
+
+        visit_entries(table, count, |index, entry| {
+            let addr = (*entry).addr;
+            if !full {
+                let old = (*entry).old;
+                if addr == old {
+                    return;
+                }
+                removeHashTable(index_by_addr, old.addr(), ptr::null());
+            }
+            if !addr.is_null() {
+                insertHashTable(
+                    index_by_addr,
+                    addr.addr(),
+                    ptr::with_exposed_provenance(index),
+                );
             }
         });
     }
