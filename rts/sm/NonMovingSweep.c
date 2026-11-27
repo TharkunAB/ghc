@@ -26,16 +26,56 @@ enum SweepResult {
 };
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-RTS_PRIVATE uint32_t ghc_rust_sweep_segment(struct NonmovingSegment *seg, bdescr *bd,
-                                            uint16_t block_size, uint16_t block_count,
-                                            uint8_t epoch);
 RTS_PRIVATE void ghc_rust_clear_segment_free_blocks(struct NonmovingSegment *seg,
                                                      uint32_t block_size,
                                                      uint32_t block_count);
+RTS_PRIVATE void ghc_rust_sweep_segments(struct NonmovingSegment **head,
+                                         const struct NonmovingAllocator *allocators,
+                                         uint8_t epoch);
+RTS_PRIVATE bdescr *ghc_c_sweeping_descriptor(struct NonmovingSegment *seg);
+RTS_PRIVATE void ghc_c_publish_swept_segment(struct NonmovingSegment *seg,
+                                              uint32_t ret);
 GHC_STATIC_ASSERT(SEGMENT_FREE == 0 && SEGMENT_PARTIAL == 1 && SEGMENT_FILLED == 2,
                   "Rust sweep result matches enum SweepResult");
 #endif
 
+static inline void publishSweptSegment(struct NonmovingSegment *seg, uint32_t ret)
+{
+    switch (ret) {
+    case SEGMENT_FREE:
+        ASSERT(seg->next_free == 0);
+        ASSERT(nonmovingSegmentInfo(seg)->next_free_snap == 0);
+        IF_DEBUG(sanity, nonmovingClearSegment(seg));
+        nonmovingPushFreeSegment(seg);
+        break;
+    case SEGMENT_PARTIAL:
+        IF_DEBUG(sanity, nonmovingClearSegmentFreeBlocks(seg));
+        nonmovingPushActiveSegment(seg);
+        break;
+    case SEGMENT_FILLED:
+        nonmovingPushFilledSegment(seg);
+        break;
+    default:
+        barf("nonmovingSweep: weird sweep return: %d\n", ret);
+    }
+}
+
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+// Preserve Bdescr's DEBUG heap assertion at the C boundary.
+RTS_PRIVATE bdescr *ghc_c_sweeping_descriptor(struct NonmovingSegment *seg)
+{
+    ASSERT_SEGMENT_STATE(seg, FILLED_SWEEPING);
+    return Bdescr((StgPtr)seg);
+}
+
+RTS_PRIVATE void ghc_c_publish_swept_segment(struct NonmovingSegment *seg,
+                                              uint32_t ret)
+{
+    publishSweptSegment(seg, ret);
+}
+#endif
+
+#if !defined(USE_RUST_RTS) || defined(TSAN_ENABLED)
 // Determine which list a marked segment should be placed on and initialize
 // next_free indices as appropriate. Additionally, we must clear the mark
 // bitmap entries associated with swept blocks.
@@ -43,16 +83,6 @@ GNUC_ATTR_HOT static enum SweepResult
 nonmovingSweepSegment(struct NonmovingSegment *seg)
 {
     ASSERT_SEGMENT_STATE(seg, FILLED_SWEEPING);
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-    bdescr *bd = Bdescr((StgPtr)seg);
-    const struct NonmovingAllocator *alloc =
-        &nonmovingHeap.allocators[bd->nonmoving_segment.allocator_idx];
-    enum SweepResult result = ghc_rust_sweep_segment(seg, bd, alloc->block_size,
-                                                     alloc->block_count, nonmovingMarkEpoch);
-    ASSERT(result != SEGMENT_FREE ||
-           (seg->next_free == 0 && bd->nonmoving_segment.next_free_snap == 0));
-    return result;
-#else
     const nonmoving_block_idx blk_cnt = nonmovingSegmentBlockCount(seg);
     bool found_free = false;
     bool found_live = false;
@@ -91,8 +121,8 @@ nonmovingSweepSegment(struct NonmovingSegment *seg)
         ASSERT(nonmovingSegmentInfo(seg)->next_free_snap == 0);
         return SEGMENT_FREE;
     }
-#endif
 }
+#endif
 
 #if defined(DEBUG)
 
@@ -157,6 +187,10 @@ nonmovingClearSegmentFreeBlocks(struct NonmovingSegment* seg)
 
 GNUC_ATTR_HOT void nonmovingSweep(void)
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_sweep_segments(&nonmovingHeap.sweep_list, nonmovingHeap.allocators,
+                            nonmovingMarkEpoch);
+#else
     while (nonmovingHeap.sweep_list) {
         struct NonmovingSegment *seg = nonmovingHeap.sweep_list;
 
@@ -166,22 +200,9 @@ GNUC_ATTR_HOT void nonmovingSweep(void)
 
         enum SweepResult ret = nonmovingSweepSegment(seg);
 
-        switch (ret) {
-        case SEGMENT_FREE:
-            IF_DEBUG(sanity, nonmovingClearSegment(seg));
-            nonmovingPushFreeSegment(seg);
-            break;
-        case SEGMENT_PARTIAL:
-            IF_DEBUG(sanity, nonmovingClearSegmentFreeBlocks(seg));
-            nonmovingPushActiveSegment(seg);
-            break;
-        case SEGMENT_FILLED:
-            nonmovingPushFilledSegment(seg);
-            break;
-        default:
-            barf("nonmovingSweep: weird sweep return: %d\n", ret);
-        }
+        publishSweptSegment(seg, ret);
     }
+#endif
 }
 
 /* Must a closure remain on the mutable list?

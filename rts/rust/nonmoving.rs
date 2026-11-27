@@ -1,7 +1,8 @@
 use super::{
-    BD_NEXT_FREE_SNAP, BD_SCAN, CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE, CENSUS_BLOCKS,
-    CENSUS_COLLECTED, CENSUS_FILLED, CENSUS_SIZE, CENSUS_WORDS, NM_ACTIVE, NM_BLOCK_COUNT,
-    NM_BLOCK_SIZE, NM_FILLED, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE, SEG_STRUCT_SIZE, closure_words,
+    BD_ALLOCATOR_IDX, BD_NEXT_FREE_SNAP, BD_SCAN, CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE,
+    CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED, CENSUS_SIZE, CENSUS_WORDS, NM_ACTIVE,
+    NM_BLOCK_COUNT, NM_BLOCK_SIZE, NM_FILLED, NM_STRUCT_SIZE, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE,
+    SEG_STRUCT_SIZE, closure_words,
 };
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -134,8 +135,13 @@ unsafe extern "C" fn ghc_rust_stopped_allocator_census(
 }
 
 core::arch::global_asm!(
-    ".hidden ghc_rust_sweep_segment\n.hidden ghc_rust_clear_segment_free_blocks"
+    ".hidden ghc_rust_clear_segment_free_blocks\n.hidden ghc_rust_sweep_segments"
 );
+
+unsafe extern "C" {
+    fn ghc_c_sweeping_descriptor(seg: *mut u8) -> *mut u8;
+    fn ghc_c_publish_swept_segment(seg: *mut u8, result: u32);
+}
 
 #[repr(u32)]
 enum SweepResult {
@@ -144,9 +150,29 @@ enum SweepResult {
     Filled,
 }
 
-/// Clear dead marks and record the first free block before the segment is published.
+/// Sweep each segment, then publish it to its destination list.
+/// The collector owns the sweep list until this function returns.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_sweep_segment(
+unsafe extern "C" fn ghc_rust_sweep_segments(head: *mut *mut u8, allocators: *const u8, epoch: u8) {
+    unsafe {
+        while !(*head).is_null() {
+            let seg = *head;
+            // Publication changes seg->link, so remove it from the sweep list first.
+            *head = read_ptr(seg, SEG_LINK);
+
+            let bd = ghc_c_sweeping_descriptor(seg);
+            let allocator_idx = bd.add(BD_ALLOCATOR_IDX).cast::<u16>().read() as usize;
+            let alloc = allocators.add(allocator_idx * NM_STRUCT_SIZE);
+            let block_size = alloc.add(NM_BLOCK_SIZE).cast::<u16>().read();
+            let block_count = alloc.add(NM_BLOCK_COUNT).cast::<u16>().read();
+            let result = sweep_segment(seg, bd, block_size, block_count, epoch);
+            ghc_c_publish_swept_segment(seg, result as u32);
+        }
+    }
+}
+
+/// Clear dead marks and record the first free block before the segment is published.
+unsafe fn sweep_segment(
     seg: *mut u8,
     bd: *mut u8,
     block_size: u16,
