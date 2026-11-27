@@ -87,6 +87,15 @@ fewer write calls. Pueue job 7210 used logical CPUs 20–23 and a 4 GiB
 cap. This was a private library install replay. The linked-build
 measurements use the existing Cabal copy code.
 
+A separate experiment let GNU strip 2.42 read the built archive and
+shared library directly and write to temporary files in the installation
+directory. Cabal then set the normal modes and renamed the files. Skipping
+the intermediate copies reduced the complete copy step from **4.414 s to
+3.700 s** (16.2%) across four alternating pairs. The original 4 KiB buffer
+was in use in both arms. Pueue job 7233 verified the direct calls, all
+1,763 installed files, diagnostic output and parity under umask 077. The
+prototype is private and the timings cover the install step alone.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
