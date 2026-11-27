@@ -45,12 +45,17 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
      */
     ASSERT(newcapacity > oldcapacity);
 
+    /* Keep the free-array size and its word rounding representable. */
+    if (newcapacity <= oldcapacity ||
+        (StgWord)newcapacity > (HS_WORD_MAX - (sizeof(W_) - 1)) / sizeof(int))
+        return false;
+
     StgMutArrPtrs *newarr;
     newarr = allocateMutArrPtrs(cap, newcapacity, NULL, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(newarr == NULL)) return false;
 
     StgArrBytes *newfree;
-    int arrsize = newcapacity * sizeof(int);
+    StgWord arrsize = (StgWord)newcapacity * sizeof(int);
     newfree = allocateArrBytes(cap, arrsize, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(newfree == NULL)) return false;
 
@@ -72,12 +77,12 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
         newarr->payload[i] = &stg_CLOSURE_TABLE_NULL_closure;
     }
     /* Copy the the mutable array's card table. And init extra elements to 0 */
-    int oldcardsize = mutArrPtrsCardTableSize(oldcapacity);
-    int newcardsize = mutArrPtrsCardTableSize(newcapacity);
-    for (int i = 0; i < oldcardsize; i++) {
+    StgWord oldcardsize = mutArrPtrsCardTableSize(oldcapacity);
+    StgWord newcardsize = mutArrPtrsCardTableSize(newcapacity);
+    for (StgWord i = 0; i < oldcardsize; i++) {
         newarr->payload[newcapacity+i] = oldarr->payload[oldcapacity+i];
     }
-    for (int i = oldcardsize; i < newcardsize; i++) {
+    for (StgWord i = oldcardsize; i < newcardsize; i++) {
         newarr->payload[newcapacity+i] = 0;
     }
     /* We conservatively assume the old array was dirty, so we marked the new
@@ -86,8 +91,8 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
     t->arr = newarr;
 
     /* Copy the free list. */
-    int oldfreesizeW = ROUNDUP_BYTES_TO_WDS(oldcapacity * sizeof(int));
-    for (int i = 0; i < oldfreesizeW; i++) {
+    StgWord oldfreesizeW = ROUNDUP_BYTES_TO_WDS((StgWord)oldcapacity * sizeof(int));
+    for (StgWord i = 0; i < oldfreesizeW; i++) {
         newfree->payload[i] = oldfree->payload[i];
     }
     /* Initialise the new free list entries.

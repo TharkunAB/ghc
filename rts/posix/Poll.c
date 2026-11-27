@@ -26,6 +26,7 @@
 #include "RtsSignals.h"
 
 #include <limits.h>
+#include <stdint.h>
 #include <errno.h>
 #if defined(HAVE_DECL_PPOLL) && HAVE_DECL_PPOLL == 1
 /* We prefer the ppoll() function if available since it allows more precise
@@ -596,7 +597,9 @@ void interruptIOManagerPoll(CapIOManager *iomgr)
 static bool enlargeTables(CapIOManager *iomgr)
 {
     int oldcapacity = capacityClosureTable(&iomgr->aiop_table);
+    if (oldcapacity > (INT_MAX - 1) / 2) return false;
     int newcapacity = (oldcapacity == 0) ? 1 : (oldcapacity * 2);
+    if ((size_t)(newcapacity + 1) > SIZE_MAX / sizeof(struct pollfd)) return false;
 
     bool ok = enlargeClosureTable(iomgr->cap, &iomgr->aiop_table, newcapacity);
     if (RTS_UNLIKELY(!ok)) return false;
