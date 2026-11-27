@@ -20,7 +20,7 @@
 #include "AllocArray.h"
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-#define USE_RUST_C_FINALIZERS
+#define USE_RUST_FINALIZERS
 /* Note [Weak finalizer traversal]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * The closure header size depends on the RTS way. Rust reads the callback
@@ -44,6 +44,9 @@ RTS_PRIVATE void ghc_rust_run_all_c_finalizers(StgWeak *list, bool *running,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset);
 RTS_PRIVATE StgWord ghc_rust_drain_c_finalizers(StgWeak **cursor, StgWord limit,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset);
+RTS_PRIVATE StgMutArrPtrs *ghc_rust_make_finalizer_batch(Capability *cap, StgWeak *list,
+    StgWord count, CostCentreStack *ccs, size_t finalizer_offset, size_t link_offset,
+    size_t payload_offset);
 #endif
 
 // List of dead weak pointers collected by the last GC
@@ -55,7 +58,7 @@ static StgWord n_finalizers = 0;
 void
 runCFinalizers(StgCFinalizerList *list)
 {
-#if defined(USE_RUST_C_FINALIZERS)
+#if defined(USE_RUST_FINALIZERS)
     ghc_rust_run_c_finalizers(list, offsetof(StgCFinalizerList, link));
 #else
     StgCFinalizerList *head;
@@ -75,7 +78,7 @@ void
 runAllCFinalizers(StgWeak *list)
 {
     Task *task = myTask();
-#if defined(USE_RUST_C_FINALIZERS)
+#if defined(USE_RUST_FINALIZERS)
     ghc_rust_run_all_c_finalizers(list, task ? &task->running_finalizers : NULL,
         offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
         offsetof(StgCFinalizerList, link));
@@ -181,6 +184,11 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
 
     debugTrace(DEBUG_weak, "weak: batching %" FMT_Word " finalizers", n);
 
+#if defined(USE_RUST_FINALIZERS)
+    StgMutArrPtrs *arr = ghc_rust_make_finalizer_batch(cap, list, n, CCS_SYSTEM_OR_NULL,
+        offsetof(StgWeak, finalizer), offsetof(StgWeak, link), offsetof(StgMutArrPtrs, payload));
+    if (RTS_UNLIKELY(arr == NULL)) exitHeapOverflow();
+#else
     StgMutArrPtrs *arr = allocateMutArrPtrs(cap, n, NULL, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(arr == NULL)) exitHeapOverflow();
     // No write barrier needed here; this array is only going to referred to by this core.
@@ -201,6 +209,7 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     for (i = n; i < size; i++) {
         arr->payload[i] = (StgClosure *)(W_)(-1);
     }
+#endif
 
     t = createIOThread(cap,
                        RtsFlags.GcFlags.initialStkSize,
@@ -278,7 +287,7 @@ bool runSomeFinalizers(bool all)
     }
 
     StgWeak *w = finalizer_list;
-#if defined(USE_RUST_C_FINALIZERS)
+#if defined(USE_RUST_FINALIZERS)
     StgWord count = ghc_rust_drain_c_finalizers(&w, all ? STG_WORD_MAX : finalizer_chunk,
         offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
         offsetof(StgCFinalizerList, link));

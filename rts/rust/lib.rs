@@ -10,6 +10,7 @@ mod encode;
 mod exec_page;
 mod eventlog_file_writer;
 mod file_lock;
+mod finalizer_batch;
 mod foreign_exports;
 mod gc_budget;
 mod hash_chain;
