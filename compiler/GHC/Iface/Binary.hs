@@ -11,6 +11,7 @@ module GHC.Iface.Binary (
         -- * Public API for interface file serialisation
         writeBinIface,
         readBinIface,
+        readBinIfaceWith,
         readBinIfaceHeader,
         CompressionIFace(..),
         getSymtabName,
@@ -31,6 +32,8 @@ module GHC.Iface.Binary (
     ) where
 
 import GHC.Prelude
+
+import Data.ByteString (ByteString)
 
 import GHC.Builtin   ( knownKeyOccMap, wiredInNamesMap )
 import GHC.Builtin.Uniques( knownUniqueTupleName )
@@ -110,9 +113,7 @@ data CompressionIFace
 instance Outputable CompressionIFace where
   ppr = text . show
 
--- | Read an interface file header, checking the magic number, version, and
--- way. Returns the hash of the source file and a BinHandle which points at the
--- start of the rest of the interface file data.
+-- | Read and check the header. Leave the cursor at the interface body.
 readBinIfaceHeader
   :: Profile
   -> NameCache
@@ -121,6 +122,13 @@ readBinIfaceHeader
   -> FilePath
   -> IO ReadBinHandle
 readBinIfaceHeader profile _name_cache checkHiWay traceBinIFace hi_path = do
+    bh <- Binary.readBinMem hi_path
+    checkBinIfaceHeader profile checkHiWay traceBinIFace bh
+    pure bh
+
+-- | Check the file format and requested way. Advance the cursor past the header.
+checkBinIfaceHeader :: Profile -> CheckHiWay -> TraceBinIFace -> ReadBinHandle -> IO ()
+checkBinIfaceHeader profile checkHiWay traceBinIFace bh = do
     let platform = profilePlatform profile
 
         wantedGot :: String -> a -> a -> (a -> SDoc) -> IO ()
@@ -139,7 +147,6 @@ readBinIfaceHeader profile _name_cache checkHiWay traceBinIFace hi_path = do
             when (wanted /= got) $ throwGhcExceptionIO $ ProgramError
                          (what ++ " (wanted " ++ show wanted
                                ++ ", got "    ++ show got ++ ")")
-    bh <- Binary.readBinMem hi_path
 
     -- Read the magic number to check that this really is a GHC .hi file
     -- (This magic number does not change when we change
@@ -161,8 +168,6 @@ readBinIfaceHeader profile _name_cache checkHiWay traceBinIFace hi_path = do
     when (checkHiWay == CheckHiWay) $
         errorOnMismatch "mismatched interface file profile tag" tag check_tag
 
-    pure bh
-
 -- | Read an interface file.
 --
 -- See Note [Deduplication during iface binary serialisation] for details.
@@ -179,6 +184,22 @@ readBinIface profile name_cache checkHiWay traceBinIface hi_path = do
     mod_iface <- getIfaceWithExtFields name_cache bh
 
     return $ mod_iface
+
+
+-- | Run a caller-supplied reader after the stock header checks. The byte
+-- string and the stock decoder use the same input buffer.
+readBinIfaceWith
+  :: Profile
+  -> NameCache
+  -> CheckHiWay
+  -> TraceBinIFace
+  -> FilePath
+  -> (ByteString -> IO ModIface -> IO ModIface)
+  -> IO ModIface
+readBinIfaceWith profile name_cache checkHiWay traceBinIface hi_path reader = do
+    (bh, bytes) <- Binary.readBinMemWithBuffer hi_path
+    checkBinIfaceHeader profile checkHiWay traceBinIface bh
+    reader bytes (getIfaceWithExtFields name_cache bh)
 
 
 getIfaceWithExtFields :: NameCache -> ReadBinHandle -> IO ModIface
