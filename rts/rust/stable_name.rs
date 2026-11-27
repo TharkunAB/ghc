@@ -13,6 +13,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_grow_stable_name_table",
     ".hidden ghc_rust_exit_stable_name_table",
     ".hidden ghc_rust_reserve_stable_name",
+    ".hidden ghc_rust_gc_stable_name_table",
 );
 
 unsafe extern "C" {
@@ -190,14 +191,57 @@ pub(super) unsafe extern "C" fn ghc_rust_update_stable_names(
     }
 }
 
-/// Return a dead name entry to the free list.
-/// C has determined that the name object died and holds the table lock.
+// See Note [Stable name liveness pass] in StableName.c.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_gc_stable_name_table(
+    table: *mut Entry,
+    count: usize,
+    free: *mut *mut Entry,
+    hash: *mut HashTable,
+    is_alive: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    trace_dead_name: Option<unsafe extern "C" fn(usize, *mut c_void)>,
+    trace_dead_pointee: Option<unsafe extern "C" fn(usize)>,
+) {
+    unsafe {
+        visit_entries(table, count, |index, entry| {
+            let name = (*entry).sn_obj;
+            if name.is_null() {
+                return;
+            }
+            let live_name = is_alive(name);
+            (*entry).sn_obj = live_name;
+            if live_name.is_null() {
+                if let Some(trace) = trace_dead_name {
+                    trace(index, (*entry).addr);
+                }
+                free_stable_name(entry, free, hash);
+            } else {
+                let addr = (*entry).addr;
+                if !addr.is_null() {
+                    let live_addr = is_alive(addr);
+                    (*entry).addr = live_addr;
+                    if live_addr.is_null() {
+                        if let Some(trace) = trace_dead_pointee {
+                            trace(index);
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Return a dead name entry to the free list. The caller holds the table lock.
 #[unsafe(no_mangle)]
 pub(super) unsafe extern "C" fn ghc_rust_free_stable_name(
     entry: *mut Entry,
     head: *mut *mut Entry,
     hash: *mut HashTable,
 ) {
+    unsafe { free_stable_name(entry, head, hash) }
+}
+
+unsafe fn free_stable_name(entry: *mut Entry, head: *mut *mut Entry, hash: *mut HashTable) {
     unsafe {
         removeHashTable(hash, (*entry).old.addr(), ptr::null());
         (*entry).addr = head.read().cast();

@@ -51,6 +51,11 @@ RTS_PRIVATE StgWord ghc_rust_reserve_stable_name(snEntry *table,
                                                 snEntry **free,
                                                 HashTable *hash,
                                                 StgPtr addr);
+RTS_PRIVATE void ghc_rust_gc_stable_name_table(snEntry *table, size_t count,
+    snEntry **free, HashTable *hash,
+    StgClosure *(*is_alive)(StgClosure *),
+    void (*trace_dead_name)(size_t, StgPtr),
+    void (*trace_dead_pointee)(size_t));
 #endif
 
 void
@@ -354,12 +359,41 @@ threadStableNameTable( evac_fn evac, void *user )
  * refer to the entry.
  * -------------------------------------------------------------------------- */
 
+/* Note [Stable name liveness pass]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * C holds the table lock during the serial pass and supplies isAlive.
+ * Rust visits entries in slot order and frees dead names directly.
+ * A dead name is traced before its entry joins the free list.
+ */
+#if defined(USE_RUST_STABLE_NAME_TABLE) && defined(DEBUG)
+static void traceDeadStableName(size_t index, StgPtr addr)
+{
+    debugTrace(DEBUG_stable, "GC'd StableName %td (addr=%p)",
+               (ptrdiff_t)index, addr);
+}
+
+static void traceDeadStablePointee(size_t index)
+{
+    debugTrace(DEBUG_stable, "GC'd pointee %ld", (long)index);
+}
+#define TRACE_DEAD_NAME traceDeadStableName
+#define TRACE_DEAD_POINTEE traceDeadStablePointee
+#else
+#define TRACE_DEAD_NAME NULL
+#define TRACE_DEAD_POINTEE NULL
+#endif
+
 void
 gcStableNameTable( void )
 {
     // We must take the stable name lock lest we race with the nonmoving
     // collector (namely nonmovingSweepStableNameTable).
     stableNameLock();
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+    ghc_rust_gc_stable_name_table(stable_name_table, SNT_size,
+        &stable_name_free, addrToStableHash, isAlive,
+        TRACE_DEAD_NAME, TRACE_DEAD_POINTEE);
+#else
     FOR_EACH_STABLE_NAME(
         p, {
             // FOR_EACH_STABLE_NAME traverses free entries too, so
@@ -383,6 +417,7 @@ gcStableNameTable( void )
                 }
             }
         });
+#endif
     stableNameUnlock();
 }
 
