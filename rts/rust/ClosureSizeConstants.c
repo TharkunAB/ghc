@@ -1,4 +1,4 @@
-#include "Rts.h"
+#include "ClosureLayout.h"
 
 /* Note [Closure size build constants]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -9,15 +9,7 @@
  * Hadrian reads the symbol sizes to generate Rust constants. Only the Rust
  * implementation goes into the RTS library.
  */
-#define FIELD(name, type, field, width)                                        \
-    GHC_STATIC_ASSERT(sizeof(((type *)0)->field) == sizeof(width),             \
-                      "Rust reads the native width of " #type "." #field);    \
-    const char ghc_rust_usize_##name[1 + offsetof(type, field)] = {0}
-
 #define WORDS(name, type) const char ghc_rust_u32_##name[1 + sizeofW(type)] = {0}
-#define TAG(name)         const char ghc_rust_u32_TAG_##name[1 + (name)] = {0}
-
-GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t), "Rust uses a native machine word");
 
 FIELD(INFO_TYPE_OFFSET, StgInfoTable, type, uint32_t);
 FIELD(INFO_PTRS_OFFSET, StgInfoTable, layout.payload.ptrs, uint32_t);

@@ -18,23 +18,26 @@ rtsRules = priority 3 $ do
         -- allWays omits these two combined RTS ways.
         -- See Note [Closure size build constants] in rts/rust/ClosureSizeConstants.c.
         forM_ (map wayFromUnits (subsequences [minBound .. maxBound])) $ \rtsWay -> do
-            let probe  = buildPath -/- "c/rust/ClosureSizeConstants." ++ osuf rtsWay
-                layout = buildPath -/- "closure-size-layout-" ++ show rtsWay ++ ".rs"
-                rustObject = buildPath -/- "rust-rts-closure-size-" ++ show rtsWay ++ ".o"
-            layout %> \output -> do
-                need [probe, sourcePath -/- "Rules/Rts.hs"]
-                nmPath <- builderPath (Nm stage)
-                nm <- exeSpawnPath nmPath
-                Stdout symbols <- cmdExe nm ["-P", "-t", "d", "-S", probe]
-                constants <- mapM parseClosureSizeConstant
-                    [line | line <- lines symbols, "ghc_rust_" `isPrefixOf` line]
-                when (null constants) $ fail "No Rust closure size constants in the target nm output"
-                writeFileAtomic output (unlines constants)
-            rustObject %> \output -> do
-                need [layout]
-                layoutPath <- liftIO $ makeAbsolute layout
-                buildRustRtsWithEnv [AddEnv "CLOSURE_SIZE_LAYOUT_RS" layoutPath]
-                    stage "ghc_rts_closure_size" "rts/rust/closure_size.rs" [] [] output
+            forM_ [ ("closure-size", "closure_size", "ClosureSizeConstants", "CLOSURE_SIZE_LAYOUT_RS")
+                  , ("heap-pointers", "heap_pointers", "HeapPointerConstants", "HEAP_POINTER_LAYOUT_RS")
+                  ] $ \(stem, crate, probeName, layoutEnv) -> do
+                let probe  = buildPath -/- ("c/rust/" ++ probeName ++ ".") ++ osuf rtsWay
+                    layout = buildPath -/- (stem ++ "-layout-") ++ show rtsWay ++ ".rs"
+                    rustObject = buildPath -/- ("rust-rts-" ++ stem ++ "-") ++ show rtsWay ++ ".o"
+                layout %> \output -> do
+                    need [probe, sourcePath -/- "Rules/Rts.hs"]
+                    nmPath <- builderPath (Nm stage)
+                    nm <- exeSpawnPath nmPath
+                    Stdout symbols <- cmdExe nm ["-P", "-t", "d", "-S", probe]
+                    constants <- mapM parseRustLayoutConstant
+                        [line | line <- lines symbols, "ghc_rust_" `isPrefixOf` line]
+                    when (null constants) $ fail $ "No Rust layout constants in " ++ probe
+                    writeFileAtomic output (unlines constants)
+                rustObject %> \output -> do
+                    need [layout]
+                    layoutPath <- liftIO $ makeAbsolute layout
+                    buildRustRtsWithEnv [AddEnv layoutEnv layoutPath]
+                        stage ("ghc_rts_" ++ crate) ("rts/rust/" ++ crate ++ ".rs") [] [] output
         buildPath -/- "rust-rts.o" %> \output -> do
             largeAddressSpace <- rtsConfigDefines buildPath "USE_LARGE_ADDRESS_SPACE"
             let rustCfg = if largeAddressSpace then ["--cfg", "ghc_use_large_address_space"] else []
@@ -108,6 +111,7 @@ rtsRustObjects stage way = do
         let rustDeque = Threaded `wayUnit` way && rustTsanSafe
         pure $ [path -/- "rust-rts.o", path -/- "rust-rts-prim-bits.o"]
             ++ [path -/- "rust-rts-closure-size-" ++ show way ++ ".o" | rustTsanSafe]
+            ++ [path -/- "rust-rts-heap-pointers-" ++ show way ++ ".o" | rustTsanSafe]
             ++ [path -/- "rust-rts-check-vector-support.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-pathdir.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-posix-getenv.o" | rustTsanSafe]
@@ -143,8 +147,8 @@ buildRustRtsWithEnv env stage crate source modules extraArgs output = do
         ] ++ extraArgs
 
 -- | Decode a size from one line of POSIX nm output with decimal values.
-parseClosureSizeConstant :: String -> Action String
-parseClosureSizeConstant line = case words line of
+parseRustLayoutConstant :: String -> Action String
+parseRustLayoutConstant line = case words line of
     [symbol, _kind, _address, rawSize]
         | Just typedName <- stripPrefix "ghc_rust_" symbol
         , (ty, '_':name) <- break (== '_') typedName
@@ -152,7 +156,7 @@ parseClosureSizeConstant line = case words line of
         , [(size, "")] <- reads rawSize
         , size > (0 :: Integer)
         -> pure $ "const " ++ name ++ ": " ++ ty ++ " = " ++ show (size - 1) ++ ";"
-    _ -> fail $ "Invalid Rust closure size constant in target nm output: " ++ line
+    _ -> fail $ "Invalid Rust layout constant in target nm output: " ++ line
 
 buildGhcInternalImportDef :: FilePath -> Action ()
 buildGhcInternalImportDef target = do

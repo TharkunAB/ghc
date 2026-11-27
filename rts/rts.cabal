@@ -21,7 +21,10 @@ extra-source-files:
     rust/block_count.rs
     rust/c_finalizers.rs
     rust/cafs.rs
+    rust/ClosureLayout.h
     rust/ClosureSizeConstants.c
+    rust/HeapPointerConstants.c
+    rust/heap_pointers.rs
     rust/closure_size.rs
     rust/closure_table.rs
     rust/clone_stack.rs

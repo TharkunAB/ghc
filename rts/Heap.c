@@ -99,8 +99,61 @@ void heap_view_closure_ptrs_in_pap_payload(StgClosure *ptrs[], StgWord *nptrs
     }
 }
 
+/* Use the RTS diagnostics for unsupported tags and failed TSO assertions. */
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define HEAP_HELPER RTS_PRIVATE
+RTS_PRIVATE void ghc_heap_unknown_type(StgHalfWord type);
+#if defined(ASSERTS_ENABLED)
+RTS_PRIVATE StgWord ghc_heap_checked_tso(StgClosure *closure, StgClosure **ptrs);
+#endif
+RTS_PRIVATE StgWord ghc_rust_collect_pointers(StgClosure *, StgClosure **,
+                                              const StgInfoTable *);
+#else
+#define HEAP_HELPER static
+#endif
+
+HEAP_HELPER void ghc_heap_unknown_type(StgHalfWord type)
+{
+    fprintf(stderr, "closurePtrs: Cannot handle type %s yet\n", closure_type_names[type]);
+}
+
+#if !defined(USE_RUST_RTS) || defined(TSAN_ENABLED) || defined(ASSERTS_ENABLED)
+HEAP_HELPER StgWord ghc_heap_checked_tso(StgClosure *closure, StgClosure **ptrs)
+{
+    StgWord nptrs = 0;
+
+    ASSERT((StgClosure *)((StgTSO *)closure)->_link != NULL);
+    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->_link;
+
+    ASSERT((StgClosure *)((StgTSO *)closure)->global_link != NULL);
+    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->global_link;
+
+    ASSERT((StgClosure *)((StgTSO *)closure)->stackobj != NULL);
+    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->stackobj;
+
+    ASSERT((StgClosure *)((StgTSO *)closure)->trec != NULL);
+    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->trec;
+
+    ASSERT((StgClosure *)((StgTSO *)closure)->blocked_exceptions != NULL);
+    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->blocked_exceptions;
+
+    ASSERT((StgClosure *)((StgTSO *)closure)->bq != NULL);
+    ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->bq;
+
+    if ((StgClosure *)((StgTSO *)closure)->label != NULL) {
+        ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->label;
+    }
+    return nptrs;
+}
+#endif
+
+#undef HEAP_HELPER
+
 // See Heap.h
 StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    return ghc_rust_collect_pointers(closure, ptrs, get_itbl(closure));
+#else
     StgClosure **end;
     const StgInfoTable *info = get_itbl(closure);
     StgWord nptrs = 0;
@@ -227,29 +280,7 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
             ptrs[nptrs++] = ((StgMVar *)closure)->value;
             break;
         case TSO:
-            ASSERT((StgClosure *)((StgTSO *)closure)->_link != NULL);
-            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->_link;
-
-            ASSERT((StgClosure *)((StgTSO *)closure)->global_link != NULL);
-            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->global_link;
-
-            ASSERT((StgClosure *)((StgTSO *)closure)->stackobj != NULL);
-            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->stackobj;
-
-            ASSERT((StgClosure *)((StgTSO *)closure)->trec != NULL);
-            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->trec;
-
-            ASSERT((StgClosure *)((StgTSO *)closure)->blocked_exceptions != NULL);
-            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->blocked_exceptions;
-
-            ASSERT((StgClosure *)((StgTSO *)closure)->bq != NULL);
-            ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->bq;
-
-            if ((StgClosure *)((StgTSO *)closure)->label != NULL) {
-                ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->label;
-            }
-
-            break;
+            return ghc_heap_checked_tso(closure, ptrs);
         case WEAK: {
             StgWeak *w = (StgWeak *)closure;
             ptrs[nptrs++] = (StgClosure *) w->cfinalizers;
@@ -278,12 +309,12 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
         }
 
         default:
-            fprintf(stderr,"closurePtrs: Cannot handle type %s yet\n",
-                           closure_type_names[info->type]);
+            ghc_heap_unknown_type(info->type);
             break;
     }
 
     return nptrs;
+#endif
 }
 
 StgMutArrPtrs *heap_view_closurePtrs(Capability *cap, StgClosure *closure) {
