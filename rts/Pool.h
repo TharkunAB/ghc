@@ -43,14 +43,12 @@ void poolSetDesiredSize(Pool *pool, uint32_t size);
 /* Get the desired size of a pool */
 uint32_t poolGetDesiredSize(Pool *pool);
 
-/* Try to grab an available thing from a pool, returning NULL if no things
- * are available.
+/* Try to get a resource. Return NULL if the pool is full or alloc_fn fails.
  */
 void *poolTryTake(Pool *pool);
 
-/* Grab an available thing from a pool. This will block if no elements are
- * available in the case of a threaded runtime or abort in a single-threaded
- * environment.
+/* Get a resource. Return NULL if alloc_fn fails. Wait if the pool is full in
+ * a threaded runtime. Abort if the pool is full in a single-threaded runtime.
  */
 void *poolTake(Pool *pool);
 

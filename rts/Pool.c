@@ -126,8 +126,9 @@ uint32_t poolGetDesiredSize(Pool *pool) {
 
 // Try taking a PoolEntry with an item from a pool,
 // returning NULL if no items are available.
-static PoolEntry *poolTryTake_(Pool *pool) {
+static PoolEntry *poolTryTake_(Pool *pool, bool *alloc_failed) {
     PoolEntry *ent = NULL;
+    *alloc_failed = false;
     if (pool->available != NULL) {
         ent = pool->available;
         pool->available = ent->next;
@@ -135,6 +136,11 @@ static PoolEntry *poolTryTake_(Pool *pool) {
         ent = stgMallocBytes(sizeof(PoolEntry), "pool_take");
         ent->flags = 0;
         ent->thing = pool->alloc_fn();
+        if (ent->thing == NULL) {
+            stgFree(ent);
+            *alloc_failed = true;
+            return NULL;
+        }
         pool->current_size++;
     } else {
         return NULL;
@@ -147,7 +153,12 @@ static PoolEntry *poolTryTake_(Pool *pool) {
 
 void *poolTryTake(Pool *pool) {
     ACQUIRE_LOCK(&pool->mutex);
-    PoolEntry *ent = poolTryTake_(pool);
+    bool alloc_failed;
+    PoolEntry *ent = poolTryTake_(pool, &alloc_failed);
+#if defined(THREADED_RTS)
+    if (alloc_failed)
+        signalCondition(&pool->cond);
+#endif
     RELEASE_LOCK(&pool->mutex);
     return ent ? ent->thing : NULL;
 }
@@ -156,8 +167,16 @@ void *poolTake(Pool *pool) {
     PoolEntry *ent = NULL;
     ACQUIRE_LOCK(&pool->mutex);
     while (ent == NULL) {
-        ent = poolTryTake_(pool);
+        bool alloc_failed;
+        ent = poolTryTake_(pool, &alloc_failed);
         if (!ent) {
+            if (alloc_failed) {
+#if defined(THREADED_RTS)
+                signalCondition(&pool->cond);
+#endif
+                RELEASE_LOCK(&pool->mutex);
+                return NULL;
+            }
 #if defined(THREADED_RTS)
             waitCondition(&pool->cond, &pool->mutex);
 #else
