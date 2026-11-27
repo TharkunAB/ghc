@@ -19,6 +19,12 @@ install -d -m 700 "$PWD/_build/worker-cpp-cache"
 
 `--freeze1` reuses the existing Stage0 prerequisites for this benchmark. For a final build, use ordinary GHC and leave the development settings unset.
 
+### Current development workers
+
+Both stages use `c33551f`. On the 956-module dependency scan, a fresh daemon with a populated cache reduced the Stage0 median from 9.98 s to 6.15 s (1.62×) and the Stage1 median from 25.65 s to 11.68 s (2.20×). The worker now recognizes line markers that GHC accepts in noncanonical UTF-8. See the [release and GHC 10 rebuild report](rebuild-c33551f.md) for individual workloads, the correction to the earlier consumer test, linker trials and experiments with reuse inside an optimized binding.
+
+Hadrian now writes each library stamp from one rule. This removed an extra package copy and database refresh that a faster linker exposed. With the fix, one capability and the active scan worker, the median linked compiler edit took 12.12 s with BFD and 9.33 s with mold. All four immediately following unchanged builds ran zero builders. [Matched linked-target measurements](rebuild-c33551f.md#fix-for-the-repeated-package-copy)
+
 ### Development workers at fa68e89
 
 A previous diagnostic-free parse can establish that a module has no CPP prerequisites or source line markers. The worker saves this result in a bounded file. After a restart it checks the preprocessed source and parser settings, then asks GHC to resolve imports and emit dependencies. Linux workers verify the executable and file-backed executable mappings before using the file. Replacing a library at the same path invalidated earlier records in the verification fixture.
@@ -66,8 +72,8 @@ A separate no-op run used four distinct physical cores. Disabling migration brou
 
 ### Research priorities
 
-1. **Extend restart reuse to more modules.** Start with the 128 modules that still require a parse. Verify generated header names, preprocessor output and newly created prerequisites against stock before extending eligibility. [Cold dependency scans](#cold-dependency-scans-after-worker-restart)
-2. **Validate reuse inside an optimized Core binding.** The `doesDirNameExist` experiment detected a changed unfolding behind an identical decision sequence. Extend the input record to unsuccessful lookups, substitution and floated bindings. Compare every proposed reuse with a fresh optimization. [Core measurements](#where-optimization-time-survives-a-small-edit)
+1. **Extend restart reuse to more modules.** Of the 108 modules that still required parsing, 104 produced preprocessed buffers with different temporary paths after restart. Their parses and the four other parses cost about 1.3 s combined. Measure validation overhead before extending cache eligibility. [Cold dependency scans](#cold-dependency-scans-after-worker-restart)
+2. **Validate reuse inside an optimized Core binding.** Recording transitive rule heads detected a change behind an inlined wrapper. Four local lookups from the first visit to `doesDirNameExist` could not be validated at binding entry. Account for those local dependencies, substitution and floated bindings. Compare every proposed reuse with a fresh optimization. [Core measurements](#where-optimization-time-survives-a-small-edit)
 3. **Measure thread migration on other builds.** The no-op traced most condition signals to cross-capability MVar wakeups. Repeat on another machine and at a wider job count before considering a default. The compiler worker and the GHC executable have different allocation and parallelism profiles. [Compiler RTS measurements](#rts-cost-during-compilation)
 
 ### Hadrian dependency caching
