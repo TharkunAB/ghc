@@ -2,7 +2,8 @@ use super::{
     BD_ALLOCATOR_IDX, BD_LINK, BD_NEXT_FREE_SNAP, BD_SCAN, BD_START, CAF_SAVED_INFO,
     CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE, CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED,
     CENSUS_SIZE, CENSUS_WORDS, COMPACT_BLOCK_OWNER, NM_ACTIVE, NM_BLOCK_COUNT, NM_BLOCK_SIZE,
-    NM_FILLED, NM_STRUCT_SIZE, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE, SEG_STRUCT_SIZE, closure_words,
+    NM_FILLED, NM_SEGMENT_BITS, NM_STRUCT_SIZE, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE,
+    SEG_STRUCT_SIZE, closure_words,
 };
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -135,7 +136,12 @@ unsafe extern "C" fn ghc_rust_stopped_allocator_census(
 }
 
 core::arch::global_asm!(
-    ".hidden ghc_rust_clear_segment_free_blocks\n.hidden ghc_rust_sweep_segments\n.hidden ghc_rust_free_large_groups\n.hidden ghc_rust_free_dead_compact_regions\n.hidden ghc_rust_nonmoving_gc_cafs"
+    ".hidden ghc_rust_clear_segment",
+    ".hidden ghc_rust_clear_segment_free_blocks",
+    ".hidden ghc_rust_sweep_segments",
+    ".hidden ghc_rust_free_large_groups",
+    ".hidden ghc_rust_free_dead_compact_regions",
+    ".hidden ghc_rust_nonmoving_gc_cafs",
 );
 
 /// Sweep the detached debug CAF snapshot after marking.
@@ -284,6 +290,16 @@ unsafe fn sweep_segment(
         } else {
             SweepResult::Free
         }
+    }
+}
+
+/// Clear the bitmap and payload of a free segment. Preserve its header.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_clear_segment(seg: *mut u8) {
+    let segment_bytes = 1usize << NM_SEGMENT_BITS;
+    unsafe {
+        seg.add(SEG_BITMAP)
+            .write_bytes(0, segment_bytes - SEG_BITMAP)
     }
 }
 

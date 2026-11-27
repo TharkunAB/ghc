@@ -29,6 +29,7 @@ enum SweepResult {
 RTS_PRIVATE void ghc_rust_clear_segment_free_blocks(struct NonmovingSegment *seg,
                                                      uint32_t block_size,
                                                      uint32_t block_count);
+RTS_PRIVATE void ghc_rust_clear_segment(struct NonmovingSegment *seg);
 RTS_PRIVATE void ghc_rust_sweep_segments(struct NonmovingSegment **head,
                                          const struct NonmovingAllocator *allocators,
                                          uint8_t epoch);
@@ -188,8 +189,12 @@ void nonmovingGcCafs(void)
 void
 nonmovingClearSegment(struct NonmovingSegment* seg)
 {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_clear_segment(seg);
+#else
     size_t end = ((size_t)seg) + NONMOVING_SEGMENT_SIZE;
     memset(&seg->bitmap, 0, end - (size_t)&seg->bitmap);
+#endif
 }
 
 void

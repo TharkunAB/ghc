@@ -27,6 +27,7 @@ FIELD(NM_BLOCK_COUNT, struct NonmovingAllocator, block_count, uint16_t);
 OFFSET(NM_STRUCT_SIZE, sizeof(struct NonmovingAllocator));
 FIELD(SEG_LINK, struct NonmovingSegment, link, struct NonmovingSegment *);
 FIELD(SEG_BITMAP, struct NonmovingSegment, bitmap[0], uint8_t);
+OFFSET(NM_SEGMENT_BITS, NONMOVING_SEGMENT_BITS);
 FIELD(SEG_NEXT_FREE, struct NonmovingSegment, next_free, uint16_t);
 FIELD(BD_NEXT_FREE_SNAP, bdescr, nonmoving_segment.next_free_snap, uint16_t);
 FIELD(BD_ALLOCATOR_IDX, bdescr, nonmoving_segment.allocator_idx, uint16_t);
