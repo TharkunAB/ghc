@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 core::arch::global_asm!(
     ".hidden ghc_rust_allocate_mut_array",
@@ -12,36 +13,80 @@ core::arch::global_asm!(
 unsafe extern "C" {
     static stg_MUT_ARR_PTRS_DIRTY_info: u8;
     static stg_SMALL_MUT_ARR_PTRS_DIRTY_info: u8;
+    static stg_ARR_WORDS_info: u8;
     fn mutArrPtrsCards(count: usize) -> usize;
-    fn ghc_rust_set_array_header(
-        array: *mut c_void,
-        info: *const u8,
-        ccs: *mut c_void,
-        header_words: usize,
-        payload_words: usize,
-    );
     fn allocateMightFail(cap: *mut c_void, words: usize) -> *mut c_void;
     fn allocatePinned(cap: *mut c_void, words: usize, align: usize, offset: usize) -> *mut c_void;
 }
 
-// The RTS way determines the header size. C writes the header after allocation.
-fn byte_array_words(bytes: usize, header_bytes: usize) -> Option<usize> {
-    if bytes > usize::MAX - header_bytes {
-        return None;
+type ArrayInstrumentation = Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize)>;
+
+// The RTS way determines the header size and optional instrumentation.
+unsafe fn set_array_header(
+    array: *mut c_void,
+    info: *const u8,
+    ccs: *mut c_void,
+    header_words: usize,
+    payload_words: usize,
+    instrument: ArrayInstrumentation,
+) {
+    if let Some(instrument) = instrument {
+        unsafe { instrument(array, ccs, header_words, payload_words) };
     }
-    Some(header_bytes / size_of::<usize>() + bytes.div_ceil(size_of::<usize>()))
+    unsafe {
+        AtomicPtr::from_ptr(array.cast::<*mut c_void>())
+            .store(info.cast_mut().cast(), Ordering::Relaxed);
+    }
+}
+
+unsafe fn allocate_byte_array(
+    cap: *mut c_void,
+    bytes: usize,
+    alignment: Option<usize>,
+    ccs: *mut c_void,
+    header_bytes: usize,
+    instrument: ArrayInstrumentation,
+) -> *mut c_void {
+    if bytes > usize::MAX - header_bytes {
+        return null_mut();
+    }
+
+    let word = size_of::<usize>();
+    let header_words = header_bytes / word;
+    let payload_words = bytes.div_ceil(word);
+    let words = header_words + payload_words;
+    unsafe {
+        let array = match alignment {
+            Some(align) => allocatePinned(cap, words, align.max(word), header_bytes),
+            None => allocateMightFail(cap, words),
+        };
+        if !array.is_null() {
+            set_array_header(
+                array,
+                &raw const stg_ARR_WORDS_info,
+                ccs,
+                header_words,
+                payload_words,
+                instrument,
+            );
+            array
+                .byte_add(header_bytes - word)
+                .cast::<usize>()
+                .write(bytes);
+        }
+        array
+    }
 }
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_allocate_byte_array(
     cap: *mut c_void,
     bytes: usize,
+    ccs: *mut c_void,
     header_bytes: usize,
+    instrument: ArrayInstrumentation,
 ) -> *mut c_void {
-    match byte_array_words(bytes, header_bytes) {
-        Some(words) => unsafe { allocateMightFail(cap, words) },
-        None => null_mut(),
-    }
+    unsafe { allocate_byte_array(cap, bytes, None, ccs, header_bytes, instrument) }
 }
 
 #[unsafe(no_mangle)]
@@ -49,14 +94,11 @@ unsafe extern "C" fn ghc_rust_allocate_pinned_byte_array(
     cap: *mut c_void,
     bytes: usize,
     alignment: usize,
+    ccs: *mut c_void,
     header_bytes: usize,
+    instrument: ArrayInstrumentation,
 ) -> *mut c_void {
-    match byte_array_words(bytes, header_bytes) {
-        Some(words) => unsafe {
-            allocatePinned(cap, words, alignment.max(size_of::<usize>()), header_bytes)
-        },
-        None => null_mut(),
-    }
+    unsafe { allocate_byte_array(cap, bytes, Some(alignment), ccs, header_bytes, instrument) }
 }
 
 /// Allocate a pointer array. Only the ordinary array has a card table.
@@ -66,6 +108,7 @@ unsafe fn allocate_pointer_array<const SMALL: bool>(
     init: *mut c_void,
     ccs: *mut c_void,
     header_bytes: usize,
+    instrument: ArrayInstrumentation,
 ) -> *mut c_void {
     let word = size_of::<usize>();
     if count > (usize::MAX - header_bytes) / word {
@@ -86,21 +129,23 @@ unsafe fn allocate_pointer_array<const SMALL: bool>(
         let slots = array.byte_add(header_bytes).cast::<*mut c_void>();
         let metadata_end = slots.cast::<usize>();
         if SMALL {
-            ghc_rust_set_array_header(
+            set_array_header(
                 array,
                 &raw const stg_SMALL_MUT_ARR_PTRS_DIRTY_info,
                 ccs,
                 header_words,
                 payload_words,
+                instrument,
             );
             metadata_end.sub(1).write(count);
         } else {
-            ghc_rust_set_array_header(
+            set_array_header(
                 array,
                 &raw const stg_MUT_ARR_PTRS_DIRTY_info,
                 ccs,
                 header_words,
                 payload_words,
+                instrument,
             );
             metadata_end.sub(2).write(count);
             metadata_end.sub(1).write(payload_words);
@@ -125,8 +170,9 @@ unsafe extern "C" fn ghc_rust_allocate_mut_array(
     init: *mut c_void,
     ccs: *mut c_void,
     header_bytes: usize,
+    instrument: ArrayInstrumentation,
 ) -> *mut c_void {
-    unsafe { allocate_pointer_array::<false>(cap, count, init, ccs, header_bytes) }
+    unsafe { allocate_pointer_array::<false>(cap, count, init, ccs, header_bytes, instrument) }
 }
 
 #[unsafe(no_mangle)]
@@ -136,6 +182,7 @@ unsafe extern "C" fn ghc_rust_allocate_small_mut_array(
     init: *mut c_void,
     ccs: *mut c_void,
     header_bytes: usize,
+    instrument: ArrayInstrumentation,
 ) -> *mut c_void {
-    unsafe { allocate_pointer_array::<true>(cap, count, init, ccs, header_bytes) }
+    unsafe { allocate_pointer_array::<true>(cap, count, init, ccs, header_bytes, instrument) }
 }

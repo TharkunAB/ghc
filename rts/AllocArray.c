@@ -6,8 +6,14 @@
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 #define USE_RUST_ARRAY_ALLOC
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t) &&
-                  sizeof(StgArrBytes) % sizeof(StgWord) == 0,
-                  "Rust byte array allocation requires a whole-word header");
+                  sizeof(StgArrBytes) % sizeof(StgWord) == 0 &&
+                  sizeof(StgMutArrPtrs) % sizeof(StgWord) == 0 &&
+                  sizeof(StgSmallMutArrPtrs) % sizeof(StgWord) == 0 &&
+                  offsetof(StgArrBytes, header.info) == 0 &&
+                  offsetof(StgMutArrPtrs, header.info) == 0 &&
+                  offsetof(StgSmallMutArrPtrs, header.info) == 0 &&
+                  offsetof(StgArrBytes, bytes) + sizeof(StgWord) == sizeof(StgArrBytes),
+                  "Rust array headers require a word-aligned info pointer and metadata");
 GHC_STATIC_ASSERT(offsetof(StgMutArrPtrs, payload) == sizeof(StgMutArrPtrs) &&
                   offsetof(StgMutArrPtrs, size) + sizeof(StgWord) == sizeof(StgMutArrPtrs) &&
                   offsetof(StgMutArrPtrs, ptrs) + 2 * sizeof(StgWord) == sizeof(StgMutArrPtrs) &&
@@ -15,28 +21,32 @@ GHC_STATIC_ASSERT(offsetof(StgMutArrPtrs, payload) == sizeof(StgMutArrPtrs) &&
                   offsetof(StgSmallMutArrPtrs, ptrs) + sizeof(StgWord) == sizeof(StgSmallMutArrPtrs) &&
                   sizeof(StgClosure *) == sizeof(StgWord),
                   "Rust pointer arrays require word-aligned metadata before the payload");
+typedef void (*ArrayInstrumentation)(StgClosure *, CostCentreStack *, size_t, size_t);
 RTS_PRIVATE StgMutArrPtrs *ghc_rust_allocate_mut_array(
-    Capability *cap, StgWord count, StgClosure *init, CostCentreStack *ccs, size_t header_bytes);
+    Capability *cap, StgWord count, StgClosure *init, CostCentreStack *ccs,
+    size_t header_bytes, ArrayInstrumentation instrument);
 RTS_PRIVATE StgSmallMutArrPtrs *ghc_rust_allocate_small_mut_array(
-    Capability *cap, StgWord count, StgClosure *init, CostCentreStack *ccs, size_t header_bytes);
+    Capability *cap, StgWord count, StgClosure *init, CostCentreStack *ccs,
+    size_t header_bytes, ArrayInstrumentation instrument);
 RTS_PRIVATE StgArrBytes *ghc_rust_allocate_byte_array(
-    Capability *cap, StgWord bytes, size_t header_bytes);
+    Capability *cap, StgWord bytes, CostCentreStack *ccs,
+    size_t header_bytes, ArrayInstrumentation instrument);
 RTS_PRIVATE StgArrBytes *ghc_rust_allocate_pinned_byte_array(
-    Capability *cap, StgWord bytes, StgWord alignment, size_t header_bytes);
-#endif
+    Capability *cap, StgWord bytes, StgWord alignment, CostCentreStack *ccs,
+    size_t header_bytes, ArrayInstrumentation instrument);
 
-#if defined(USE_RUST_RTS)
-/* The Rust object is common to all RTS ways. Use this way's profiling macros. */
-RTS_PRIVATE void ghc_rust_set_array_header(StgClosure *arr, const StgInfoTable *info,
-                                           CostCentreStack *ccs,
-                                           size_t header_words, size_t payload_words);
-void ghc_rust_set_array_header(StgClosure *arr, const StgInfoTable *info,
-                               CostCentreStack *ccs USED_IF_PROFILING,
-                               size_t header_words STG_UNUSED, size_t payload_words STG_UNUSED)
+#if defined(PROFILING) || defined(TICKY_TICKY)
+/* The Rust object is common to all RTS ways. Apply this way's instrumentation. */
+static void instrumentArray(StgClosure *arr STG_UNUSED, CostCentreStack *ccs USED_IF_PROFILING,
+                            size_t header_words STG_UNUSED, size_t payload_words STG_UNUSED)
 {
     TICK_ALLOC_PRIM(header_words, payload_words, 0);
-    SET_HDR(arr, info, ccs);
+    SET_PROF_HDR(arr, ccs);
 }
+#define ARRAY_INSTRUMENTATION instrumentArray
+#else
+#define ARRAY_INSTRUMENTATION NULL
+#endif
 #endif
 
 /* Note [Array allocation sizes]
@@ -51,7 +61,8 @@ StgMutArrPtrs *allocateMutArrPtrs (Capability *cap,
                                    CostCentreStack *ccs USED_IF_PROFILING)
 {
 #if defined(USE_RUST_ARRAY_ALLOC)
-    return ghc_rust_allocate_mut_array(cap, nelements, init, ccs, sizeof(StgMutArrPtrs));
+    return ghc_rust_allocate_mut_array(cap, nelements, init, ccs,
+                                       sizeof(StgMutArrPtrs), ARRAY_INSTRUMENTATION);
 #else
     if (RTS_UNLIKELY(nelements > (HS_WORD_MAX - sizeof(StgMutArrPtrs)) / sizeof(StgClosure *))) return NULL;
 
@@ -93,7 +104,8 @@ StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
                                                USED_IF_PROFILING)
 {
 #if defined(USE_RUST_ARRAY_ALLOC)
-    return ghc_rust_allocate_small_mut_array(cap, nelements, init, ccs, sizeof(StgSmallMutArrPtrs));
+    return ghc_rust_allocate_small_mut_array(cap, nelements, init, ccs,
+                                             sizeof(StgSmallMutArrPtrs), ARRAY_INSTRUMENTATION);
 #else
     if (RTS_UNLIKELY(nelements > (HS_WORD_MAX - sizeof(StgSmallMutArrPtrs)) / sizeof(StgClosure *))) return NULL;
 
@@ -119,6 +131,7 @@ StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
 #endif
 }
 
+#if !defined(USE_RUST_ARRAY_ALLOC)
 /* The header and allocation counters depend on the current RTS way. */
 static inline StgArrBytes *finishByteArray(StgArrBytes *arr, StgWord bytes,
                                           CostCentreStack *ccs USED_IF_PROFILING)
@@ -129,20 +142,21 @@ static inline StgArrBytes *finishByteArray(StgArrBytes *arr, StgWord bytes,
     arr->bytes = bytes;
     return arr;
 }
+#endif
 
 StgArrBytes *allocateArrBytes (Capability *cap,
                                StgWord arrbytes,
                                CostCentreStack *ccs USED_IF_PROFILING)
 {
-    StgArrBytes *arr;
 #if defined(USE_RUST_ARRAY_ALLOC)
-    arr = ghc_rust_allocate_byte_array(cap, arrbytes, sizeof(StgArrBytes));
+    return ghc_rust_allocate_byte_array(cap, arrbytes, ccs,
+                                        sizeof(StgArrBytes), ARRAY_INSTRUMENTATION);
 #else
     if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
     StgWord objsize = sizeofW(StgArrBytes) + ROUNDUP_BYTES_TO_WDS(arrbytes);
-    arr = (StgArrBytes *)allocateMightFail(cap, objsize);
-#endif
+    StgArrBytes *arr = (StgArrBytes *)allocateMightFail(cap, objsize);
     return finishByteArray(arr, arrbytes, ccs);
+#endif
 }
 
 StgArrBytes *allocateArrBytesPinned (Capability *cap,
@@ -150,16 +164,16 @@ StgArrBytes *allocateArrBytesPinned (Capability *cap,
                                      StgWord alignment,
                                      CostCentreStack *ccs USED_IF_PROFILING)
 {
-    StgArrBytes *arr;
 #if defined(USE_RUST_ARRAY_ALLOC)
-    arr = ghc_rust_allocate_pinned_byte_array(cap, arrbytes, alignment, sizeof(StgArrBytes));
+    return ghc_rust_allocate_pinned_byte_array(cap, arrbytes, alignment, ccs,
+                                               sizeof(StgArrBytes), ARRAY_INSTRUMENTATION);
 #else
     if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
     if (alignment <= sizeof(StgWord)) { alignment = sizeof(StgWord); }
 
     StgWord objsize = sizeofW(StgArrBytes) + ROUNDUP_BYTES_TO_WDS(arrbytes);
     /* The payload starts after the header and must satisfy the alignment. */
-    arr = (StgArrBytes *)allocatePinned(cap, objsize, alignment, sizeof(StgArrBytes));
-#endif
+    StgArrBytes *arr = (StgArrBytes *)allocatePinned(cap, objsize, alignment, sizeof(StgArrBytes));
     return finishByteArray(arr, arrbytes, ccs);
+#endif
 }
