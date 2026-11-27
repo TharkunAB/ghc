@@ -67,9 +67,8 @@ with its existing cache in separate single controls.
 A separate build against the ordinary toolchain omitted the new cache
 capability and passed the dependency, compile-check and fallback smoke
 tests. Pueue jobs 7211 and 7214 collected these results. The optimized
-worker used a private API overlay. The shared Stage0 selector stays on
-`2baf1e8` until the API can be packaged reproducibly and qualified for
-ordinary compile checks as well as dependency scans.
+worker used a private API overlay. This experiment preceded qualification
+of the packaged Stage0 release.
 
 ### Cabal compiler-library installation
 
@@ -116,6 +115,32 @@ install -d -m 700 "$PWD/_build/worker-cpp-cache"
 The active shared Stage1 worker `fd8d51d` uses GHC 10.1.20261115.1 (executable SHA-256 prefix `aac58b24`). It ran the 956-module dependency command in 0.577 s unchanged and 0.617 s after a one-import edit. The old worker `2a5a1d0` took 0.589 and 0.608 s in the same test. These are medians from six warm samples per worker per case. Ordinary GHC took 23.284 and 23.498 s in one reference run per case. The edit command was 38.1× faster and regenerated one row. All Makefiles, backups and diagnostics matched ordinary GHC.
 
 The release also handles an up-to-date `-c -dynamic-too` command with Hadrian's optional `+RTS -O64M -A64m -RTS` block. Across six warm samples per executable on a single-file fixture, ordinary GHC took 210.1 ms, the previous worker took 209.4 ms, and the new worker took 19.6 ms at the median (10.7× versus ordinary GHC). A required compile delegated once with the original arguments and reproduced all four artifacts byte for byte.
+
+### Shared Stage0 worker ad8a24f
+
+The shared Stage0 release targets the retained GHC 10.1.20261127 executable
+(`cafe7121a8e6`). The daemon links a static API companion compiled from
+`ea16a92be5` with the matching GHC 9.14.1 bootstrap. Independently built
+copies matched in all 882 archive and interface digests.
+
+| Exact 943-module scan | Stock GHC | Worker `2baf1e8` | Worker `ad8a24f` |
+| --- | ---: | ---: | ---: |
+| Fresh process, populated caches | 8.727 s | 5.548 s | 4.067 s |
+| Resident worker, one-import edit | 8.461 s | 0.459 s | 0.447 s |
+
+Both worker rows use four alternating pairs. Stock uses two unchanged
+controls and one edited control. The new restart took 26.7% less time
+than the preceding worker and 53.4% less than stock. Both worker arms
+used 835 empty certificates. The new arm also reused 104 CPP records.
+The cache requires an existing private directory set with
+`GHC_WORKER_POSITIVE_CPP_CACHE`. With the switch unset, two separate
+restart controls had a median of 5.125 s.
+
+The Makefile, backup and diagnostics matched stock, and each warm edit
+regenerated one row. The exact packaged release passed ordinary
+compilation, unchanged checks and one required stock fallback. Pueue job
+7261 ran the paired timings. Preparation and activation checks passed
+without replacing the ordinary Stage0 executable.
 
 ### Shared Stage0 worker 2baf1e8
 
