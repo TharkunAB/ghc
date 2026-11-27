@@ -16,6 +16,12 @@ test('testmblockalloc',
 # the leak detector is expecting.
 
 
+test('testarena', [extra_files(['../../../rts/Arena.h']),
+                   unless(in_tree_compiler(), skip),
+                   when(arch('wasm32'), skip),
+                   c_src, only_ways(['normal'])],
+                   compile_and_run, [''])
+
 # See bug #101, test requires +RTS -c (or equivalently +RTS -M<something>)
 # only GHCi triggers the bug, but we run the test all ways for completeness.
 test('bug1010',

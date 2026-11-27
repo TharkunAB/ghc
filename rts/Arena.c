@@ -33,7 +33,7 @@ struct _Arena {
 
 // We like to keep track of how many blocks we've allocated for
 // Storage.c:memInventory().
-static long arena_blocks = 0;
+static StgWord arena_blocks = 0;
 
 // Begin a new arena
 Arena *
@@ -63,9 +63,13 @@ void  *
 arenaAlloc( Arena *arena, size_t size )
 {
     void *p;
-    uint32_t size_w;
-    uint32_t req_blocks;
+    size_t size_w;
+    StgWord req_blocks;
     bdescr *bd;
+
+    if (RTS_UNLIKELY(size > arenaMaxSize())) {
+        exitHeapOverflow();
+    }
 
     // round up to nearest alignment chunk.
     size = ROUNDUP(size,MIN_ALIGN);
@@ -73,14 +77,14 @@ arenaAlloc( Arena *arena, size_t size )
     // size of allocated block in words.
     size_w = B_TO_W(size);
 
-    if ( arena->free + size_w < arena->lim ) {
+    if (size < (uintptr_t)arena->lim - (uintptr_t)arena->free) {
         // enough room in the current block...
         p = arena->free;
         arena->free += size_w;
         return p;
     } else {
         // allocate a fresh block...
-        req_blocks =  (W_)BLOCK_ROUND_UP(size) / BLOCK_SIZE;
+        req_blocks =  size_w / BLOCK_SIZE_W + (size_w % BLOCK_SIZE_W != 0);
         bd = allocGroup_lock(req_blocks);
         arena_blocks += bd->blocks;
 
@@ -92,7 +96,7 @@ arenaAlloc( Arena *arena, size_t size )
         bd->link    = arena->current;
         arena->current = bd;
         arena->free = bd->free + size_w;
-        arena->lim = bd->free + bd->blocks * BLOCK_SIZE_W;
+        arena->lim = bd->free + (size_t)bd->blocks * BLOCK_SIZE_W;
         return bd->start;
     }
 }
@@ -105,14 +109,14 @@ arenaFree( Arena *arena )
 
     for (bd = arena->current; bd != NULL; bd = next) {
         next = bd->link;
+        ASSERT(arena_blocks >= bd->blocks);
         arena_blocks -= bd->blocks;
-        ASSERT(arena_blocks >= 0);
         freeGroup_lock(bd);
     }
     stgFree(arena);
 }
 
-unsigned long
+StgWord
 arenaBlocks( void )
 {
     return arena_blocks;
@@ -131,7 +135,7 @@ void checkPtrInArena( StgPtr p, Arena *arena )
     // slop at the end). Again, free pointers are not updated so we can't use
     // those.
     for (bdescr *bd = arena->current->link; bd; bd = bd->link) {
-        if (p >= bd->start && p < bd->start + (bd->blocks*BLOCK_SIZE_W)) {
+        if (p >= bd->start && p < bd->start + ((size_t)bd->blocks * BLOCK_SIZE_W)) {
             return;
         }
     }
