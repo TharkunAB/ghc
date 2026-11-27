@@ -29,6 +29,8 @@ rtsRules = priority 3 $ do
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []
         buildPath -/- "rust-rts-poll-slots.o" %>
             buildRustRts stage "ghc_rts_poll_slots" "rts/rust/poll_slots.rs" [] []
+        buildPath -/- "rust-rts-spark-retain.o" %>
+            buildRustRts stage "ghc_rts_spark_retain" "rts/rust/spark_retain.rs" [] []
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
         buildPath -/- "libHSghc-internal-*.dll.a" %> buildGhcInternalImportLib stage
 
@@ -44,6 +46,7 @@ rtsRustObjects stage way = do
         pure $ [path -/- "rust-rts.o"]
             ++ [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
             ++ [path -/- "rust-rts-poll-slots.o" | poll]
+            ++ [path -/- "rust-rts-spark-retain.o" | Threaded `wayUnit` way]
 
 -- | Check an RTS feature macro in the generated configuration.
 rtsConfigDefines :: FilePath -> String -> Action Bool

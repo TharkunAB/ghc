@@ -24,6 +24,7 @@ extra-source-files:
     rust/poll_slots.rs
     rust/prim_float.rs
     rust/profiler_json.rs
+    rust/spark_retain.rs
 
 extra-tmp-files:
     autom4te.cache

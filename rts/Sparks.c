@@ -114,141 +114,81 @@ require a GC barrier but that seems to high a price to pay.
  * the spark pool only contains sparkable closures.
  * -------------------------------------------------------------------------- */
 
-void
-pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
+typedef struct {
+    Capability *cap;
+    bool nonmovingMarkFinished;
+    uint32_t pruned_sparks;
+} SparkPruning;
+
+// Keep policy here. The deque only decides where to write a retained spark.
+STATIC_INLINE StgClosure *
+retainSpark(void *user, StgClosure *spark)
 {
-    SparkPool *pool;
-    StgClosurePtr spark, tmp, *elements;
-    uint32_t pruned_sparks; // stats only
-    StgWord readIndex, writeIndex, oldBottom;
-    const StgInfoTable *info;
+    SparkPruning *pruning = user;
+    Capability *cap = pruning->cap;
 
-    pruned_sparks = 0;
+    // Another GC thread can evacuate the closure. Read its info pointer once.
+    if (GET_CLOSURE_TAG(spark) == 0) {
+        const StgInfoTable *info = ACQUIRE_LOAD(&spark->header.info);
+        if (IS_FORWARDING_PTR(info)) {
+            StgClosure *forwarded = (StgClosure *)UN_FORWARDING_PTR(info);
+            if (closure_SHOULD_SPARK(forwarded)) {
+                return forwarded;
+            }
+        } else if (HEAP_ALLOCED(spark)) {
+            bdescr *spark_bd = Bdescr((P_)spark);
+            bool is_alive;
+            if (pruning->nonmovingMarkFinished) {
+                // See Note [Spark management under the nonmoving collector]
+                // in NonMoving.c.
+                is_alive = !(spark_bd->flags & BF_NONMOVING) || nonmovingIsAlive(spark);
+            } else {
+                is_alive = spark_bd->flags & (BF_EVACUATED | BF_NONMOVING);
+            }
 
-    pool = cap->sparks;
-
-    // it is possible that top > bottom, indicating an empty pool.  We
-    // fix that here; this is only necessary because the loop below
-    // assumes it.
-    if (pool->top > pool->bottom)
-        pool->top = pool->bottom;
-
-    // Take this opportunity to reset top/bottom modulo the size of
-    // the array, to avoid overflow.  This is only possible because no
-    // stealing is happening during GC.
-    pool->bottom  -= pool->top & ~pool->moduloSize;
-    pool->top     &= pool->moduloSize;
-
-    debugTrace(DEBUG_sparks,
-               "markSparkQueue: current spark queue len=%ld; "
-               "(hd=%" FMT_Int "; tl=%" FMT_Int ")",
-               sparkPoolSize(pool), pool->bottom, pool->top);
-
-    ASSERT_WSDEQUE_INVARIANTS(pool);
-
-    elements = (StgClosurePtr *)pool->elements;
-
-    /* Scan the old logical bounds. The masked bounds coincide both when
-       the pool is empty and when it is full.
-
-       Write retained sparks from the old bottom in traversal order. The
-       destination can wrap into the old live range, but it cannot overtake
-       unread entries: each read produces at most one write. When the pool
-       is full, the first read and write refer to the same slot. */
-    readIndex = pool->top;
-    oldBottom = writeIndex = pool->bottom;
-    ASSERT(oldBottom - readIndex <= (StgWord)pool->size);
-
-    while (readIndex < oldBottom) {
-      spark = elements[readIndex & pool->moduloSize];
-
-      // We have to be careful here: in the parallel GC, another
-      // thread might evacuate this closure while we're looking at it,
-      // so grab the info pointer just once.
-      if (GET_CLOSURE_TAG(spark) != 0) {
-          // Tagged pointer is a value, so the spark has fizzled.  It
-          // probably never happens that we get a tagged pointer in
-          // the spark pool, because we would have pruned the spark
-          // during the previous GC cycle if it turned out to be
-          // evaluated, but it doesn't hurt to have this check for
-          // robustness.
-          pruned_sparks++;
-          cap->spark_stats.fizzled++;
-          traceEventSparkFizzle(cap);
-      } else {
-          info = ACQUIRE_LOAD(&spark->header.info);
-          if (IS_FORWARDING_PTR(info)) {
-              tmp = (StgClosure*)UN_FORWARDING_PTR(info);
-              /* if valuable work: shift inside the pool */
-              if (closure_SHOULD_SPARK(tmp)) {
-                  elements[writeIndex & pool->moduloSize] = tmp; // keep entry (new address)
-                  writeIndex++;
-              } else {
-                  pruned_sparks++; // discard spark
-                  cap->spark_stats.fizzled++;
-                  traceEventSparkFizzle(cap);
-              }
-          } else if (HEAP_ALLOCED(spark)) {
-              bdescr *spark_bd = Bdescr((P_) spark);
-              bool is_alive = false;
-              if (nonmovingMarkFinished) {
-                  // See Note [Spark management under the nonmoving collector]
-                  // in NonMoving.c.
-                  // If we just concluded concurrent marking then we can rely
-                  // on the mark bitmap to reflect whether sparks living in the
-                  // non-moving heap have died.
-                  if (spark_bd->flags & BF_NONMOVING) {
-                      is_alive = nonmovingIsAlive(spark);
-                  } else {
-                      // The nonmoving collector doesn't collect anything
-                      // outside of the non-moving heap.
-                      is_alive = true;
-                  }
-              } else if (spark_bd->flags & (BF_EVACUATED | BF_NONMOVING)) {
-                  is_alive = true;
-              }
-
-              if (is_alive) {
-                  if (closure_SHOULD_SPARK(spark)) {
-                      elements[writeIndex & pool->moduloSize] = spark; // keep entry (new address)
-                      writeIndex++;
-                  } else {
-                      pruned_sparks++; // discard spark
-                      cap->spark_stats.fizzled++;
-                      traceEventSparkFizzle(cap);
-                  }
-              } else {
-                  pruned_sparks++; // discard spark
-                  cap->spark_stats.gcd++;
-                  traceEventSparkGC(cap);
-              }
-          } else {
-              if (INFO_PTR_TO_STRUCT(info)->type == THUNK_STATIC) {
-                  // We can't tell whether a THUNK_STATIC is garbage or not.
-                  // See also Note [STATIC_LINK fields]
-                  // isAlive() also ignores static closures (see GCAux.c)
-                  elements[writeIndex & pool->moduloSize] = spark; // keep entry (new address)
-                  writeIndex++;
-              } else {
-                  pruned_sparks++; // discard spark
-                  cap->spark_stats.fizzled++;
-                  traceEventSparkFizzle(cap);
-              }
-          }
-      }
-
-      readIndex++;
+            if (!is_alive) {
+                pruning->pruned_sparks++;
+                cap->spark_stats.gcd++;
+                traceEventSparkGC(cap);
+                return NULL;
+            }
+            if (closure_SHOULD_SPARK(spark)) {
+                return spark;
+            }
+        } else if (INFO_PTR_TO_STRUCT(info)->type == THUNK_STATIC) {
+            // See Note [STATIC_LINK fields]. isAlive() also ignores statics.
+            return spark;
+        }
     }
 
-    pool->top = oldBottom & pool->moduloSize;
-    pool->bottom = pool->top + (writeIndex - oldBottom);
+    pruning->pruned_sparks++;
+    cap->spark_stats.fizzled++;
+    traceEventSparkFizzle(cap);
+    return NULL;
+}
 
-    debugTrace(DEBUG_sparks, "pruned %d sparks", pruned_sparks);
+void
+pruneSparkQueue(bool nonmovingMarkFinished, Capability *cap)
+{
+    SparkPool *pool = cap->sparks;
+    SparkPruning pruning = { cap, nonmovingMarkFinished, 0 };
 
+    IF_DEBUG(sparks, {
+        StgInt top = stg_min(pool->top, pool->bottom);
+        StgInt bottom = pool->bottom - (top & ~pool->moduloSize);
+        top &= pool->moduloSize;
+        debugTrace(DEBUG_sparks,
+                   "markSparkQueue: current spark queue len=%ld; "
+                   "(hd=%" FMT_Int "; tl=%" FMT_Int ")",
+                   (long)(bottom - top), bottom, top);
+    });
+
+    retainWSDequeClosureSlots(pool, retainSpark, &pruning);
+
+    debugTrace(DEBUG_sparks, "pruned %d sparks", pruning.pruned_sparks);
     debugTrace(DEBUG_sparks,
                "new spark queue len=%ld; (hd=%" FMT_Int "; tl=%" FMT_Int ")",
                sparkPoolSize(pool), pool->bottom, pool->top);
-
     ASSERT_WSDEQUE_INVARIANTS(pool);
 }
 
