@@ -117,7 +117,8 @@ module GHC.Tc.Utils.TcType (
   isImprovementPred,
 
   -- * Finding type instances
-  tcTyFamInsts, tcTyFamInstsAndVis, tcTyConAppTyFamInstsAndVis, isTyFamFree,
+  tcTyFamInsts, tcTyFamInstsAndVis, tcTyConAppTyFamInstsAndVis,
+  tcPatTyConAppTyFamInstsAndVis, isTyFamFree,
 
   -- * Finding "exact" (non-dead) type variables
   exactTyCoVarsOfType, exactTyCoVarsOfTypes,
@@ -216,7 +217,7 @@ import GHC.Types.Var
 import GHC.Types.Var.Env ( VarEnv, lookupVarEnv )
 import GHC.Types.Var.Set
 import GHC.Core.Coercion
-import GHC.Core.Coercion.Axiom ( coAxiomBranches, coAxBranchRHS, coAxBranchTyVars, fromBranches )
+import GHC.Core.Coercion.Axiom ( coAxiomBranches, coAxBranchLHS, coAxBranchRHS, fromBranches )
 import GHC.Core.Type as Type
 import GHC.Core.Predicate
 import GHC.Core.TyCon
@@ -1025,12 +1026,13 @@ tcTyFamInsts = map (\(_,b,c) -> (b,c)) . tcTyFamInstsAndVis
 -- See also Note [Showing invisible bits of types in error messages]
 -- in "GHC.Tc.Errors.Ppr".
 tcTyFamInstsAndVis :: Type -> [(Bool, TyCon, [Type])]
-tcTyFamInstsAndVis = tcTyFamInstsAndVisX False
+tcTyFamInstsAndVis = tcTyFamInstsAndVisX False False
 
 tcTyFamInstsAndVisX
-  :: Bool -- ^ Is this an invisible argument to some type application?
+  :: Bool -- ^ Unfold unsaturated single-equation scoped closure families?
+  -> Bool -- ^ Is this an invisible argument to some type application?
   -> Type -> [(Bool, TyCon, [Type])]
-tcTyFamInstsAndVisX = go
+tcTyFamInstsAndVisX unfold_scoped = go
   where
     go is_invis_arg ty
       | Just exp_ty <- coreView ty     = go is_invis_arg exp_ty
@@ -1054,16 +1056,19 @@ tcTyFamInstsAndVisX = go
       | isTypeFamilyTyCon tc
       = case closedFamilyScope_maybe tc of
           Just _
-            | isUnsaturatedUserFamily tc tys
+            | unfold_scoped
+            , isUnsaturatedUserFamily tc tys
             , Just ax <- closedFamilyTyConCoAxiom_maybe tc
-            , [branch] <- fromBranches (coAxiomBranches ax) ->
-                let prefix_tvs = take (length tys) (coAxBranchTyVars branch)
+            , [branch] <- fromBranches (coAxiomBranches ax)
+            , Just lhs_tvs <- traverse repGetTyVar_maybe (coAxBranchLHS branch)
+            , sizeVarSet (mkVarSet lhs_tvs) == length lhs_tvs ->
+                let prefix_tvs = take (length tys) lhs_tvs
                     rhs_inst   = substTyWith prefix_tvs tys (coAxBranchRHS branch)
-                in tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys
+                in tcTyConAppTyFamInstsAndVisX True is_invis_arg tc tys
                    ++ go is_invis_arg rhs_inst
           _ -> [(is_invis_arg, tc, take (tyConArity tc) tys)]
       | otherwise
-      = tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys
+      = tcTyConAppTyFamInstsAndVisX unfold_scoped is_invis_arg tc tys
     go _            (LitTy {})         = []
     go is_invis_arg (ForAllTy ma bndr ty) = go True ma
                                          ++ go is_invis_arg (binderType bndr)
@@ -1093,15 +1098,22 @@ tcTyFamInstsAndVisX = go
 -- See 'tcTyFamInstsAndVis' for more details on how this works (as this
 -- function is called inside of 'tcTyFamInstsAndVis').
 tcTyConAppTyFamInstsAndVis :: TyCon -> [Type] -> [(Bool, TyCon, [Type])]
-tcTyConAppTyFamInstsAndVis = tcTyConAppTyFamInstsAndVisX False
+tcTyConAppTyFamInstsAndVis = tcTyConAppTyFamInstsAndVisX False False
+
+-- | Find outermost type family applications in instance or family pattern
+-- arguments, unfolding unsaturated single-equation scoped closure families so
+-- dependent-sum patterns inspect their underlying payload.
+tcPatTyConAppTyFamInstsAndVis :: TyCon -> [Type] -> [(Bool, TyCon, [Type])]
+tcPatTyConAppTyFamInstsAndVis = tcTyConAppTyFamInstsAndVisX True False
 
 tcTyConAppTyFamInstsAndVisX
-  :: Bool -- ^ Is this an invisible argument to some type application?
+  :: Bool -- ^ Unfold unsaturated single-equation scoped closure families?
+  -> Bool -- ^ Is this an invisible argument to some type application?
   -> TyCon -> [Type] -> [(Bool, TyCon, [Type])]
-tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys =
+tcTyConAppTyFamInstsAndVisX unfold_scoped is_invis_arg tc tys =
   let (invis_tys, vis_tys) = partitionInvisibleTypes tc tys
-  in concat $ map (tcTyFamInstsAndVisX True)         invis_tys
-           ++ map (tcTyFamInstsAndVisX is_invis_arg) vis_tys
+  in concat $ map (tcTyFamInstsAndVisX unfold_scoped True)         invis_tys
+           ++ map (tcTyFamInstsAndVisX unfold_scoped is_invis_arg) vis_tys
 
 isTyFamFree :: Type -> Bool
 -- ^ Check that a type does not contain any type family applications.

@@ -8,7 +8,8 @@ module GHC.Core.TyCo.Compare (
 
     -- * Type equality
     eqType, eqTypeIgnoringMultiplicity, eqTypeX, eqTypes,
-    eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures, eqScopedClosureTyCons,
+    eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures,
+    eqScopedClosureTyCons, eqInstantiatedScopedClosures,
 
     pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck,
     tcEqTyConApps, tcEqTyConAppArgs,
@@ -29,7 +30,7 @@ import GHC.Prelude
 
 import GHC.Core.Type( typeKind, coreView, tcSplitAppTyNoView_maybe, splitAppTyNoView_maybe
                     , isLevityTy, isRuntimeRepTy, isMultiplicityTy
-                    , isUnsaturatedUserFamily, splitTyConApp_maybe, getTyVar_maybe )
+                    , isUnsaturatedUserFamily, splitTyConApp_maybe, repGetTyVar_maybe )
 import GHC.Core.Coercion.Axiom
 
 import GHC.Core.TyCo.Rep
@@ -377,26 +378,31 @@ eqInstantiatedScopedClosures owners tc1 as1 tc2 as2
   , Just ax1 <- closedFamilyTyConCoAxiom_maybe tc1
   , Just ax2 <- closedFamilyTyConCoAxiom_maybe tc2
   , coAxiomRole ax1 == Nominal, coAxiomRole ax2 == Nominal
+  , coAxiomTyCon ax1 == tc1, coAxiomTyCon ax2 == tc2
   , [b1] <- fromBranches (coAxiomBranches ax1)
   , [b2] <- fromBranches (coAxiomBranches ax2)
   , null (cab_cvs b1), null (cab_cvs b2)
+  , null (cab_eta_tvs b1), null (cab_eta_tvs b2)
   , null (cab_incomps b1), null (cab_incomps b2)
   , null (cab_overlaps b1), null (cab_overlaps b2)
-  , Just lhs_tvs1 <- traverse getTyVar_maybe (cab_lhs b1)
-  , Just lhs_tvs2 <- traverse getTyVar_maybe (cab_lhs b2)
-  , lhs_tvs1 == cab_tvs b1, lhs_tvs2 == cab_tvs b2
-  = let (cap1, rem1) = splitAt (length as1) (cab_tvs b1)
-        (cap2, rem2) = splitAt (length as2) (cab_tvs b2)
-        sub1 = zipVarEnv cap1 as1
-        sub2 = zipVarEnv cap2 as2
-        in_scope = mkInScopeSet (tyCoVarsOfTypes (as1 ++ as2)
-                                 `unionVarSet` mkVarSet (rem1 ++ rem2))
-        env0 = mkRnEnv2 in_scope
+  , all (== Nominal) (cab_roles b1), all (== Nominal) (cab_roles b2)
+  , Just lhs_tvs1 <- traverse repGetTyVar_maybe (cab_lhs b1)
+  , Just lhs_tvs2 <- traverse repGetTyVar_maybe (cab_lhs b2)
+  , length lhs_tvs1 == tyConArity tc1, length lhs_tvs2 == tyConArity tc2
+  , let set1 = mkVarSet lhs_tvs1
+        set2 = mkVarSet lhs_tvs2
+  , sizeVarSet set1 == length lhs_tvs1, sizeVarSet set2 == length lhs_tvs2
+  , set1 == mkVarSet (cab_tvs b1), set2 == mkVarSet (cab_tvs b2)
+  = let (cap1, rem1) = splitAt (length as1) lhs_tvs1
+        (cap2, rem2) = splitAt (length as2) lhs_tvs2
+        avoid = tyCoVarsOfTypes (as1 ++ as2)
+        in_sc0 = mkInScopeSet (avoid `unionVarSet` mkVarSet (rem1 ++ rem2))
+        (in_sc1, sub1, rem1') = freshen_rem avoid in_sc0 (zipVarEnv cap1 as1) rem1
+        (in_sc2, sub2, rem2') = freshen_rem avoid in_sc1 (zipVarEnv cap2 as2) rem2
+        env0 = mkRnEnv2 in_sc2
         step (env, acc) (tv1, tv2) =
-          let k1 = subst_cap sub1 (tyVarKind tv1)
-              k2 = subst_cap sub2 (tyVarKind tv2)
-          in (rnBndr2 env tv1 tv2, (env, k1, k2) : acc)
-        (env_final, rev_k_checks) = foldl' step (env0, []) (zip rem1 rem2)
+          (rnBndr2 env tv1 tv2, (env, tyVarKind tv1, tyVarKind tv2) : acc)
+        (env_final, rev_k_checks) = foldl' step (env0, []) (zip rem1' rem2')
         rhs1 = subst_cap sub1 (cab_rhs b1)
         rhs2 = subst_cap sub2 (cab_rhs b2)
         check_all = foldr (\ (e, k1, k2) rest ->
@@ -407,6 +413,17 @@ eqInstantiatedScopedClosures owners tc1 as1 tc2 as2
     in evalState check_all Set.empty
   | otherwise = False
   where
+    freshen_rem _ in_sc sub [] = (in_sc, sub, [])
+    freshen_rem avoid in_sc sub (tv : tvs) =
+      let k'  = subst_cap sub (tyVarKind tv)
+          tv0 = setVarType tv k'
+          tv' | tv `elemVarSet` avoid = uniqAway in_sc tv0
+              | otherwise             = tv0
+          in_sc' = extendInScopeSet in_sc tv'
+          sub'   = extendVarEnv sub tv (TyVarTy tv')
+          (in_sc_f, sub_f, rest) = freshen_rem avoid in_sc' sub' tvs
+      in (in_sc_f, sub_f, tv' : rest)
+
     app_ty (TyConApp tc tys) a = TyConApp tc (tys ++ [a])
     app_ty f                 a = AppTy f a
 

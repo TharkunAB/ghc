@@ -3337,7 +3337,9 @@ tcLocalOpenGroupWith prev_deriv demands group@HsGroup
           rest = group { hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs)
                        , hs_tyclds = rest_tys ++ map (uncurry make_instance_group) late_list
                        , hs_derivds = [], hs_defds = [] }
-      let rest_val_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rest))
+      let rest_ty_names = mkNameSet (hsTyClForeignBinders (hs_tyclds rest) [])
+          rest_val_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rest))
+                           `unionNameSet` rest_ty_names
           deferred_vals
             | not (null instances) || not (null prev_deriv) = Just rest_val_names
             | otherwise                                     = Nothing
@@ -3870,8 +3872,11 @@ tcTopSrcDeclGroupWithMethods deferred_val_names previous_deriving group@(HsGroup
                                       && isEmptyNameSet (tg_defs tg `intersectNameSet` needed_early_syns))
                                  tycl_decls
                   else ([], tycl_decls)
+            ; trailing_syn_names = unionNameSets (map tg_defs trailing_syn_decls)
             ; val_bind_names = mkNameSet (collectHsValBinders CollNoDictBinders hs_val_binds)
-            ; unready_val_names = val_bind_names `unionNameSet` fromMaybe emptyNameSet deferred_val_names } ;
+            ; unready_val_names = val_bind_names
+                                  `unionNameSet` trailing_syn_names
+                                  `unionNameSet` fromMaybe emptyNameSet deferred_val_names } ;
         (tcg_env0, inst_infos, th_bndrs0,
          XValBindsLR (HsVBG deriv_binds deriv_sigs), deferred_deriving)
             <- tcTyClsInstDecls previous_deriving main_tycl_decls deriv_decls default_decls val_binds ;

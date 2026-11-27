@@ -125,7 +125,7 @@ import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourc
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
                               recordSourceMethodUse, recordSourceProofAliasUse,
                               takeSourceProofRulesFor, withSourceProofSignature)
-import {-# SOURCE #-} GHC.Tc.Gen.ClosedEval (tcPrepareClosedApplication, tcPrepareClosedFunctionValue, tcPrepareClosedResult, tcPrepareClosedObservation, tcCheckClosedCallContext, tcPreflightClosedCall, tcDecodeClosedCallOperand, tcHasClosedCallExecutable)
+import {-# SOURCE #-} GHC.Tc.Gen.ClosedEval (tcPrepareClosedApplication, tcPrepareClosedFunctionValue, tcPrepareClosedResult, tcPrepareClosedObservation, tcCheckClosedCallContext, tcPreflightClosedCall, tcDecodeClosedCallOperand, tcHasClosedCallExecutable, tcHasClosedValueShape)
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Instance.Family (tcGetFamInstEnvs)
 import GHC.Iface.Env (lookupOrig, newGlobalBinder)
@@ -3792,8 +3792,15 @@ tcTermAppInType mode rn_ty exp_kind
                    | ordinary_call || (lengthIs args 1 && isQual rdr && ready_partial_call) -> do
                        staging <- closedOperandStaging args
                        executable <- tcClosedCaseExecutableOwner False rdr name args staging
+                       let run_or_generic act
+                             | ordinary_call = do
+                                 active <- hasActiveTcPlugins
+                                 if active
+                                   then tryTcDiscardingErrs (tc_app_ty_generic mode rn_ty exp_kind) act
+                                   else act
+                             | otherwise = act
                        case executable of
-                         Just owner -> setSrcSpanA loc (run_closed_tree (RunClosedFunction owner) args)
+                         Just owner -> run_or_generic $ setSrcSpanA loc (run_closed_tree (RunClosedFunction owner) args)
                          Nothing
                            | ordinary_call, isNothing staging, any (isJust . bareClosedCallback) args -> do
                                table <- tcLookupTyCon name
@@ -3806,7 +3813,7 @@ tcTermAppInType mode rn_ty exp_kind
                            | ordinary_call, staging == Just True -> do
                                table <- tcLookupTyCon name
                                if supportsClosedFamilyTree table args
-                                 then setSrcSpanA loc (run_closed_tree (CheckClosedCase table) args)
+                                 then run_or_generic $ setSrcSpanA loc (run_closed_tree (CheckClosedCase table) args)
                                  else tc_app_ty_generic mode rn_ty exp_kind
                            | otherwise -> tc_app_ty_generic mode rn_ty exp_kind
                    | otherwise -> tc_app_ty_generic mode rn_ty exp_kind
@@ -3941,8 +3948,7 @@ tcTermAppInType mode rn_ty exp_kind
                   staging <- if can_uninterp then closedOperandStaging args else pure (Just True)
                   case staging of
                     Nothing -> stage4_uninterp fun run_closed
-                    Just True -> run_closed
-                    Just False
+                    Just _
                       | can_uninterp -> tryTcDiscardingErrs (stage4_uninterp fun run_closed) run_closed
                       | otherwise    -> run_closed
               | otherwise -> do
@@ -4785,7 +4791,7 @@ tcPlanClosedTree mode ordinary hint root arguments = do
               (_, arrows, result) = splitFunTys rho
               domains = map scaledThing arrows
           unless (all isTyVar tvs && equalLength tvs binders &&
-                  not (null domains) && rho `tcEqType` foldr mkVisFunTyManyU result domains) $
+                  (null domains || rho `tcEqType` foldr mkVisFunTyManyU result domains)) $
             failWithTc (TcRnClosedTypeEval (getName callback)
               "A closed callback must have an ordinary function type without constraints.")
           (subst, _) <- newMetaTyVars tvs
@@ -4948,6 +4954,12 @@ tcPlanClosedTree mode ordinary hint root arguments = do
       unless (noFreeVarsOfType checked && isTyFamFree checked) $
         failWithTc (TcRnClosedTypeEval (getName fun)
           "The enclosing call does not determine the callback's ordinary type.")
+      let (_, arrows, _) = splitFunTys checked
+      when (null arrows) $ do
+        ok <- tcHasClosedValueShape (getName fun) checked
+        unless ok $
+          failWithTc (TcRnClosedTypeEval (getName fun)
+            "A closed callback must have an ordinary function type without constraints.")
       return (ClosedCallback loc fun checked)
     verify _ tree@CheckedBoundary{} = return tree
     verify _ ClosedBoundary{} = panic "tcPlanClosedTree: unprepared boundary"

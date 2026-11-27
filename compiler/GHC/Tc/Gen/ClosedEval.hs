@@ -16,6 +16,7 @@ module GHC.Tc.Gen.ClosedEval
   , tcPreflightClosedCall
   , tcDecodeClosedCallOperand
   , tcHasClosedCallExecutable
+  , tcHasClosedValueShape
   , rewriteSameModuleClosedExpr
   , desugarStagedExpr
   , tcTopSpliceExprWith
@@ -299,6 +300,10 @@ tcClosedCallValueShape owner kind = do
       updTcRef (tcg_source_check env) (\s -> s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) used })
       return (Just codec)
     Left err -> reportClosedShapeError owner err
+
+-- | Check whether a ground type has a supported closed value representation.
+tcHasClosedValueShape :: Name -> Kind -> TcM Bool
+tcHasClosedValueShape owner kind = isJust <$> tcClosedCallValueShape owner kind
 
 -- | Report inaccessible constructors without naming them.
 reportClosedShapeError :: Name -> ClosedShapeError -> TcM (Maybe a)

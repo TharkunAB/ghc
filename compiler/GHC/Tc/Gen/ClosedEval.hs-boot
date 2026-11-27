@@ -15,3 +15,4 @@ tcCheckClosedCallContext :: Name -> TcM ()
 tcPreflightClosedCall :: Name -> TcM ()
 tcDecodeClosedCallOperand :: Name -> Type -> TcM (Maybe CoreExpr)
 tcHasClosedCallExecutable :: Name -> TcM Bool
+tcHasClosedValueShape :: Name -> Kind -> TcM Bool

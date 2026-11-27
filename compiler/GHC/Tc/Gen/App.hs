@@ -6348,13 +6348,18 @@ tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
                  ; let actual_kind = typeKind index
                  ; if actual_kind `tcEqType` domain'
                    then return (inter_core0, checked_tc0, domain')
-                   else if isNativeIndexDomainConversion actual_kind domain'
+                   else if (anyFreeVarsOfType flexible domain'
+                            && isNativeOpaqueValueType actual_kind
+                            && isNativeOpaqueValueType domain')
+                           || isNativeIndexDomainConversion actual_kind domain'
                    then do { co <- unifyType Nothing actual_kind domain'
                            ; co' <- liftZonkM (zonkCo co)
                            ; domain'' <- liftZonkM (zonkTcType domain')
                            ; if isReflCo co' && actual_kind `tcEqType` domain''
                              then return (inter_core0, checked_tc0, domain'')
-                             else case nativeIndexCastCo_maybe (SubCo co') of
+                             else case if isNativeIndexDomainConversion actual_kind domain''
+                                       then nativeIndexCastCo_maybe (SubCo co')
+                                       else Nothing of
                                Just delta ->
                                  return (Core.Cast inter_core0 (SubCo delta),
                                          mkLHsWrap (WpCast (SubCo delta)) checked_tc0,
@@ -6580,24 +6585,19 @@ tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
                       _ -> return arg_id1
                     if isNativeOpaqueValueId (setIdMult arg_id2 ManyTy)
                       then do
-                        arg_id <- if isManyTy m_here
-                          then do
-                            let mult = idMult arg_id2
-                                flex_m = case coreFullView mult of
-                                  TyVarTy tv -> isMetaTyVar tv
-                                  _ -> False
-                            unless (isManyTy mult || flex_m) $ failWithTc $
-                              TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
-                            tcSubMult (OccurrenceOf (getName arg_id2)) ManyTy mult
-                            arg_id' <- liftZonkM (zonkId arg_id2)
-                            if isNativeOpaqueValueId arg_id' && isManyTy (idMult arg_id')
-                              then return arg_id'
-                              else failWithTc $ TcRnRetainedQuantificationError
-                                     (RetainedIndexMultiplicity (idMult arg_id'))
-                          else if isNativeOpaqueValueId arg_id2
-                            then return arg_id2
+                        arg_id <- do
+                          let mult = idMult arg_id2
+                              flex_m = case coreFullView mult of
+                                TyVarTy tv -> isMetaTyVar tv
+                                _ -> False
+                          unless (isManyTy mult || flex_m) $ failWithTc $
+                            TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
+                          tcSubMult (OccurrenceOf (getName arg_id2)) ManyTy mult
+                          arg_id' <- liftZonkM (zonkId arg_id2)
+                          if isNativeOpaqueValueId arg_id' && isManyTy (idMult arg_id')
+                            then return arg_id'
                             else failWithTc $ TcRnRetainedQuantificationError
-                                   (RetainedIndexMultiplicity (idMult arg_id2))
+                                   (RetainedIndexMultiplicity (idMult arg_id'))
                         tcEmitBindingUsage (singleUsageUE arg_id)
                         core <- tcRetainedArgVar (lexprCtOrigin original) expected arg_id
                         return (core, wrap_var_cast loc core arg_id)
@@ -6732,12 +6732,14 @@ tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
                Nothing    -> newSysName (mkVarOcc "$beta")
            ; let binder = mkLocalId name ManyTy arg_ty'
            ; unless (isNativeOpaqueValueId binder) unsupported
-           ; expected_body <- tcExtendIdEnv1 name binder (constructor_domain expected body)
-           ; (body_ue, (core_body, body_tc)) <- tcCollectingUsage $
-               resolve (case mb_lname of
-                          Just lname -> extendNameEnv env (unLoc lname) binder
-                          Nothing    -> env)
-                       ManyTy expected_body body
+           ; (expected_body, (body_ue, (core_body, body_tc))) <- tcExtendIdEnv1 name binder $ do
+               expected_b <- constructor_domain expected body
+               res_b <- tcCollectingUsage $
+                 resolve (case mb_lname of
+                            Just lname -> extendNameEnv env (unLoc lname) binder
+                            Nothing    -> env)
+                         ManyTy expected_b body
+               return (expected_b, res_b)
            ; tcEmitBindingUsage (snd (popUE body_ue binder))
            ; let pat_tc = case mb_lname of
                    Just lname -> L pat_loc (VarPat noExtField (L (getLoc lname) binder))

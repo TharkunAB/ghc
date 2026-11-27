@@ -22,7 +22,8 @@ import GHC.Core.DataCon
   , dataConRepArgBinders, isVanillaDataCon )
 import GHC.Core.TyCo.Rep (Coercion(AxiomCo), Scaled(..), Type(TyVarTy, TyConApp), scaledThing)
 import GHC.Core.TyCo.Compare
-  (eqType, eqTypeX, eqTypes, eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures)
+  ( eqType, eqTypeX, eqTypes, eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures
+  , eqInstantiatedScopedClosures )
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Data.FastString
@@ -166,45 +167,55 @@ if it is absent from the prefix, including its kinds. A single variable
 equation covers every application. A case split or a repeated pattern
 would require a separate proof.
 
-The named family's equations are opaque to this check. For example,
-'\a -> Discard e a' forwards to 'Discard e', while '\a -> e' has no
-forwarded argument. The equality gives no inverse inference for 'Discard'.
+The named family's equations are opaque to the forwarding check. For
+example, '\a -> Discard e a' forwards to 'Discard e', while '\a -> e' has
+no forwarded argument. The equality gives no inverse inference for 'Discard'.
 Opaque partial families still have the MaybeApart result.
+
+When the named family is a closed family with a single variable-pattern
+equation, reduction can rewrite the body before the closure is synthesized.
+In that case, compare the capture-instantiated remaining binders and
+right-hand sides of both single-equation families up to alpha-equivalence.
 See Note [Unmatchable applications in immutable unification] in GHC.Core.Unify.
 -}
 
--- | Check a single visible erased argument passed through to a named family.
+-- | Check whether a generated lambda is eta-equivalent to a named family.
 eqScopedLambdaEta :: Type -> Type -> Bool
 eqScopedLambdaEta lhs rhs
   | Just (lambda, args) <- splitTyConApp_maybe lhs
   , Just (scope, False) <- closedFamilyScope_maybe lambda
   , scope == tyConName lambda
   , isUnsaturatedUserFamily lambda args
-  , lengthIs args (tyConArity lambda - 1)
-  , Just (FTF_T_T, _, _, _, _) <- splitFunTy_maybe (typeKind lhs)
   , Just (family, expected) <- splitTyConApp_maybe rhs
   , Nothing <- closedFamilyScope_maybe family
   , isUnsaturatedUserFamily family expected
-  , Just ax <- closedFamilyTyConCoAxiom_maybe lambda
-  , coAxiomRole ax == Nominal, coAxiomTyCon ax == lambda
-  , Just branch <- coAxiomSingleBranch_maybe ax
-  , null (cab_cvs branch), null (cab_eta_tvs branch)
-  , null (cab_incomps branch), null (cab_overlaps branch)
-  , Just vars <- traverse repGetTyVar_maybe (cab_lhs branch)
-  , let var_set = mkVarSet vars
-  , sizeVarSet var_set == length vars
-  , var_set == mkVarSet (cab_tvs branch)
-  , all (== Nominal) (cab_roles branch)
-  , Just (captures, binder) <- snocView vars
-  , equalLength captures args
-  , TyConApp head_tc applied <- cab_rhs branch
-  , head_tc == family
-  , Just (prefix, TyVarTy final) <- snocView applied
-  , final == binder
-  , not (binder `elemVarSet` tyCoVarsOfTypes prefix)
   , typeKind lhs `eqType` typeKind rhs
-  = eqTypes (substTysWith captures args prefix) expected
+  = forwards_family lambda args family expected
+    || eqInstantiatedScopedClosures (scope, tyConName family) lambda args family expected
   | otherwise = False
+  where
+    forwards_family lambda args family expected
+      | lengthIs args (tyConArity lambda - 1)
+      , Just (FTF_T_T, _, _, _, _) <- splitFunTy_maybe (typeKind lhs)
+      , Just ax <- closedFamilyTyConCoAxiom_maybe lambda
+      , coAxiomRole ax == Nominal, coAxiomTyCon ax == lambda
+      , Just branch <- coAxiomSingleBranch_maybe ax
+      , null (cab_cvs branch), null (cab_eta_tvs branch)
+      , null (cab_incomps branch), null (cab_overlaps branch)
+      , Just vars <- traverse repGetTyVar_maybe (cab_lhs branch)
+      , let var_set = mkVarSet vars
+      , sizeVarSet var_set == length vars
+      , var_set == mkVarSet (cab_tvs branch)
+      , all (== Nominal) (cab_roles branch)
+      , Just (captures, binder) <- snocView vars
+      , equalLength captures args
+      , TyConApp head_tc applied <- cab_rhs branch
+      , head_tc == family
+      , Just (prefix, TyVarTy final) <- snocView applied
+      , final == binder
+      , not (binder `elemVarSet` tyCoVarsOfTypes prefix)
+      = eqTypes (substTysWith captures args prefix) expected
+      | otherwise = False
 
 -- | Produce nominal evidence for equal retained constructor case trees.
 proveScopedCaseTree :: Type -> Type -> Maybe Coercion

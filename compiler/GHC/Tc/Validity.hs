@@ -3861,7 +3861,7 @@ checkValidTypePatsWith mb_qtvs record tc pat_ty_args
          traverse_ (check_valid_mono_type checkNoConstrainedFamilyApps (Just (mb_qtvs, skol_info, record))) pat_ty_args
 
        -- Ensure that no type family applications occur a type pattern
-       ; case tcTyConAppTyFamInstsAndVis tc pat_ty_args of
+       ; case tcPatTyConAppTyFamInstsAndVis tc pat_ty_args of
             [] -> pure ()
             ((tf_is_invis_arg, tf_tc, tf_args):_) ->
               failWithTc $ TcRnIllegalInstance $

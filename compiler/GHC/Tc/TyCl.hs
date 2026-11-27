@@ -1608,51 +1608,66 @@ type SynonymMetadata = [(Name, [Type])]
 inferArrowIndices :: NameEnv SynonymMetadata -> [LTyClDecl GhcRn]
                   -> PolyTcTyCon -> TcM (PolyTcTyCon, Maybe SynonymMetadata)
 inferArrowIndices metadata decls tc
-  | Just raw <- lookupNameEnv metadata (tyConName tc), not (null raw) = do
-      choices <- traverse (\(name, tys) -> (name,) <$> liftZonkM (zonkTcTypes tys)) raw
-      let params = map (\v -> mkTyVar (getName v) matchabilityTy)
-                   $ nub [v | (_, tys) <- choices, ty <- tys, Just v <- [getTyVar_maybe ty]
-                            , isMetaTyVar v]
-          subst ty
-            | Just v <- getTyVar_maybe ty
-            , Just var <- lookupNameEnv (mkNameEnv [(getName a, a) | a <- params]) (getName v) =
-                mkTyVarTy var
-            | otherwise = ty
-      pure (prefix params, Just [(name, map subst tys) | (name, tys) <- choices])
   | isLiftedTypeKind (tyConResKind tc)
   , not (any inferredMatchabilityIndex (tyConBinders tc))
-  , [FamDecl { tcdFam = FamilyDecl
-       { fdInfo = ClosedTypeFamily _ (Just eqns), fdInjectivityAnn = injectivity } }] <-
-      [d | L _ d <- decls, tcdName d == tyConName tc]
-  , not (null (tyConVisibleTyVars tc)) || (tyConArity tc == 0 && isSingleton eqns)
-  , isNothing injectivity ||
-      (isSingleton (tyConVisibleTyVars tc) &&
-       all (structuralKindResult (tyConName tc) . caseAliasBody . feqn_rhs . unLoc) eqns)
-  , any (matchabilityArrow . caseAliasBody . feqn_rhs . unLoc) eqns = do
-      ma <- newFlexiTyVar matchabilityTy
-      pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
-  | isLiftedTypeKind (tyConResKind tc)
-  , tyConArity tc == 0
-  , null (tyConBinders tc)
   , [SynDecl { tcdRhs = rhs }] <- [d | L _ d <- decls, tcdName d == tyConName tc]
-  , legacyKindArrowTree rhs = do
+  , legacyKindArrowTree rhs
+  , can_share_legacy_index rhs (lookupNameEnv metadata (tyConName tc)) = do
       unsat <- unsaturatedTypeFamiliesEnabled
       if unsat
-        then pure (tc, Nothing)
+        then infer_default
         else do
           ma <- newFlexiTyVar matchabilityTy
           pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
-  | otherwise = pure (tc, Nothing)
+  | otherwise = infer_default
   where
+    can_share_legacy_index _ Nothing = True
+    can_share_legacy_index _ (Just []) = True
+    can_share_legacy_index rhs (Just [(head_tc, [_])]) =
+      app_head rhs == Just head_tc
+    can_share_legacy_index _ _ = False
+
+    app_head ty = case unLoc (ignoreParens ty) of
+      HsAppTy _ f _ -> app_head f
+      HsAppKindTy _ f _ -> app_head f
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> Just name
+      _ -> Nothing
+
+    infer_default
+      | Just raw <- lookupNameEnv metadata (tyConName tc), not (null raw) = do
+          choices <- traverse (\(name, tys) -> (name,) <$> liftZonkM (zonkTcTypes tys)) raw
+          let params = map (\v -> mkTyVar (getName v) matchabilityTy)
+                       $ nub [v | (_, tys) <- choices, ty <- tys, Just v <- [getTyVar_maybe ty]
+                                , isMetaTyVar v]
+              subst ty
+                | Just v <- getTyVar_maybe ty
+                , Just var <- lookupNameEnv (mkNameEnv [(getName a, a) | a <- params]) (getName v) =
+                    mkTyVarTy var
+                | otherwise = ty
+          pure (prefix params, Just [(name, map subst tys) | (name, tys) <- choices])
+      | isLiftedTypeKind (tyConResKind tc)
+      , not (any inferredMatchabilityIndex (tyConBinders tc))
+      , [FamDecl { tcdFam = FamilyDecl
+           { fdInfo = ClosedTypeFamily _ (Just eqns), fdInjectivityAnn = injectivity } }] <-
+          [d | L _ d <- decls, tcdName d == tyConName tc]
+      , not (null (tyConVisibleTyVars tc)) || (tyConArity tc == 0 && isSingleton eqns)
+      , isNothing injectivity ||
+          (isSingleton (tyConVisibleTyVars tc) &&
+           all (structuralKindResult (tyConName tc) . caseAliasBody . feqn_rhs . unLoc) eqns)
+      , any (matchabilityArrow . caseAliasBody . feqn_rhs . unLoc) eqns = do
+          ma <- newFlexiTyVar matchabilityTy
+          pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
+      | otherwise = pure (tc, Nothing)
+
     prefix [] = tc
     prefix indices = mkTcTyCon (tyConName tc)
       (foldr (\v -> mkForAllTy unmatchableDataConTy (Bndr v Inferred)) (tyConKind tc) indices)
       (mkNamedTyConBinders Inferred indices ++ tyConBinders tc)
       0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc)
 
--- | Recognize a quantifier-free nullary synonym RHS over Type that contains at
--- least one bare standard arrow (either at the root or nested in a kind constructor
--- application such as @TyFun (Type -> Type) (Maybe Type)@).
+-- | Recognize a quantifier-free synonym RHS over Type that contains at least
+-- one bare standard arrow (at the root or nested in a constructor application
+-- such as @TyFun (Type -> Type) (Maybe Type)@).
 -- See Note [Inferred matchability for ordinary kind-arrow synonyms].
 legacyKindArrowTree :: LHsType GhcRn -> Bool
 legacyKindArrowTree rhs =
@@ -1685,24 +1700,26 @@ legacyKindArrowTree rhs =
 {- Note [Inferred matchability for ordinary kind-arrow synonyms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In ordinary Haskell modules (where neither UnsaturatedTypeFamilies nor
-DependentTypes is enabled), programs often declare nullary
-higher-order kind synonyms using bare arrows, such as:
+DependentTypes is enabled), programs often declare higher-order kind synonyms
+with bare arrows, such as:
 
   type MTrans = (Type -> Type) -> (Type -> Type)
+  type TyFun a b = a -> b -> Type
+  type Pred = TyFun (Type -> Type) (Maybe Type)
 
 Proposal #242 defaults bare arrows on a synonym RHS to Unmatchable (U)
-when unsaturation is active. In an ordinary module, fixing MTrans to U
+when unsaturation is active. In an ordinary module, fixing MTrans or TyFun to U
 rejects standard class and datatype kind signatures such as
-`class LiftingMonad (trans :: MTrans)` and `newtype ComposeT :: MTrans -> MTrans`.
-Conversely, fixing MTrans unconditionally to Matchable (M) would reject an
-ordinary runtime function signature whose type is `Type -> Type`.
+`class LiftingMonad (trans :: MTrans)` and `class GLens (pred :: Pred)`.
+Conversely, fixing these synonyms unconditionally to Matchable (M) would reject
+an ordinary runtime function signature whose type is `Type -> Type`.
 
-Give an unannotated nullary synonym whose RHS is a tree of bare arrows over
-Type one inferred Matchability binder, just as `inferArrowIndices` already
-does for a nullary closed family equation. `tcCheckMatchabilitySynRhs`
-applies that binder to every bare arrow in the tree. Kind-level uses then
-select M and type-level uses select U. Modules that enable
-UnsaturatedTypeFamilies or DependentTypes retain Proposal #242's
+Give an unannotated synonym whose RHS is a tree of bare arrows over Type one
+inferred Matchability binder, just as `inferArrowIndices` already does for a
+closed family equation. `tcCheckMatchabilitySynRhs` applies that binder to
+every bare arrow in the tree and forwards it to a single indexed head when
+present. Kind-level uses then select M and type-level uses select U. Modules
+that enable UnsaturatedTypeFamilies or DependentTypes retain Proposal #242's
 fixed U default on synonym RHSs.
 -}
 
