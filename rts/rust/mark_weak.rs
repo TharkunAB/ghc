@@ -6,6 +6,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_collect_dead_weaks",
     ".hidden ghc_rust_mark_weak_list",
     ".hidden ghc_rust_collect_fresh_weaks",
+    ".hidden ghc_rust_init_weak_generations",
 );
 
 unsafe extern "C" {
@@ -26,6 +27,31 @@ struct WeakPayload {
 struct WeakList {
     head: *mut u8,
     tail: *mut u8,
+}
+
+// See Note [Weak pointer processing and the non-moving GC] in sm/MarkWeak.c.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_init_weak_generations(
+    generations: *mut u8,
+    stride: usize,
+    live_offset: usize,
+    old_offset: usize,
+    collected: u32,
+    oldest: u32,
+    nonmoving: bool,
+) {
+    unsafe {
+        for index in 0..=collected {
+            if nonmoving && index == oldest {
+                break;
+            }
+            let generation = generations.add(index as usize * stride);
+            let live = generation.add(live_offset).cast::<*mut u8>();
+            let old = generation.add(old_offset).cast::<*mut u8>();
+            old.write(live.read());
+            live.write(null_mut());
+        }
+    }
 }
 
 // Each capability contributes one list, in ascending capability order.

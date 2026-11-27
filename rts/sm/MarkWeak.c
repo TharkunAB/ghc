@@ -29,6 +29,12 @@
 #include "sm/MarkWeak.h"
 #include "sm/Sanity.h"
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_WEAK_GC
+RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
+    size_t live_offset, size_t old_offset, uint32_t collected, uint32_t oldest, bool nonmoving);
+#endif
+
 /* -----------------------------------------------------------------------------
    Weak Pointers
 
@@ -115,6 +121,11 @@ static void    tidyThreadList (generation *gen);
 void
 initWeakForGC(void)
 {
+#if defined(USE_RUST_WEAK_GC)
+    ghc_rust_init_weak_generations(generations, sizeof(generation),
+        offsetof(generation, weak_ptr_list), offsetof(generation, old_weak_ptr_list),
+        N, oldest_gen->no, RtsFlags.GcFlags.useNonmoving);
+#else
     uint32_t oldest = N;
     if (RtsFlags.GcFlags.useNonmoving && N == oldest_gen->no) {
         // See Note [Weak pointer processing and the non-moving GC].
@@ -127,6 +138,7 @@ initWeakForGC(void)
         gen->weak_ptr_list = NULL;
     }
 
+#endif
     weak_stage = WeakThreads;
 }
 
@@ -229,7 +241,7 @@ traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
  * This means marking the finalizer (and possibly value) in preparation for
  * later finalization.
  */
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#if defined(USE_RUST_WEAK_GC)
 /* Note [Visiting dead weak pointers from Rust]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * The main GC thread runs this pass after the weak keys reach a fixed point.
@@ -263,7 +275,7 @@ RTS_PRIVATE void ghc_rust_collect_fresh_weaks(StgWeak **nursery, Capability **ca
 
 static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
 {
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#if defined(USE_RUST_WEAK_GC)
     ghc_rust_collect_dead_weaks(gen->old_weak_ptr_list, dead_weak_ptr_list, gct,
         offsetof(StgWeak, cfinalizers));
 #else
@@ -494,7 +506,7 @@ static void checkWeakPtrSanity(StgWeak *hd, StgWeak *tl)
  * Traverse the capabilities' local new-weak-pointer lists at the beginning of
  * GC and move them to the nursery's weak_ptr_list.
  */
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED) && defined(ASSERTS_ENABLED)
+#if defined(USE_RUST_WEAK_GC) && defined(ASSERTS_ENABLED)
 static void checkFreshWeakList(StgWeak *head, StgWeak *tail)
 {
     if (tail == NULL) {
@@ -510,7 +522,7 @@ static void checkFreshWeakList(StgWeak *head, StgWeak *tail)
 
 void collectFreshWeakPtrs( void )
 {
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#if defined(USE_RUST_WEAK_GC)
     // GC owns all capability lists until scavenging starts.
     ghc_rust_collect_fresh_weaks(&g0->weak_ptr_list, capabilities, getNumCapabilities(),
         offsetof(Capability, weak_ptr_list_hd), offsetof(StgWeak, cfinalizers),
@@ -559,7 +571,7 @@ markWeakPtrList ( void )
 
     for (g = 0; g <= N; g++) {
         generation *gen = &generations[g];
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#if defined(USE_RUST_WEAK_GC)
         ghc_rust_mark_weak_list(&gen->weak_ptr_list, gct, offsetof(StgWeak, cfinalizers),
                                 CHECK_WEAK_BEFORE_EVACUATION);
 #else
