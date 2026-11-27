@@ -1,6 +1,6 @@
 # Incremental GHC builds after an edit with many importers
 
-The speedup patches live on `incremental-builds`. These measurements use the `dependent-haskell` compiler at `945ea7a737` (GHC 10.1.20261115.1). The target was `stage2:exe:ghc-bin` with `--flavour=quick --freeze1 -j3` on x86-64 WSL2. [Measurements and artifact comparisons](high-fanout.json)
+The speedup patches live on `incremental-builds`. The initial measurements use the `dependent-haskell` compiler at `945ea7a737` (GHC 10.1.20261115.1). The target was `stage2:exe:ghc-bin` with `--flavour=quick --freeze1 -j3` on x86-64 WSL2. [Measurements and artifact comparisons](high-fanout.json)
 
 ## Rechecking importers
 
@@ -35,6 +35,23 @@ For each source version, 1,196 ordinary module artifacts, all 207 existing boot 
 ### What an ABI fingerprint can tell Hadrian
 
 The `GHC.Cmm.Pipeline` body edit preserved its ABI hash while changing both its full interface hash and its object. A stock GHC 10 fixture changed a `NOINLINE` exported constant from 7 to 9. Its ABI hash stayed equal at both `-O0` and `-O2`. Ordinary importers kept their objects, and relinking produced the new result. A Template Haskell splice that evaluated the constant needed a new object in each configuration. Stock GHC reported the Template Haskell dependency and recompiled the importer. Skipping such a request solely because the imported ABI matched would preserve the old spliced value. [GHC recompilation checks](../../compiler/GHC/Iface/Recomp.hs) · [GHC guide to separate compilation](https://ghc.gitlab.haskell.org/ghc/doc/users_guide/separate_compilation.html)
+
+## Skipping importer checks on GHC 10.1.20261127
+
+The same cutoff edit changed the two producer objects and preserved the information used by its importers. A private Hadrian rule took the complete static and dynamic interfaces of `GHC.Utils.Misc`, removed the derived interface hash, and set the source hash to zero. It computed a fingerprint over the remaining serialized fields, including the usage records, docs, simplified Core, and extension fields. Hadrian still built and linked the changed objects.
+
+We selected 249 ordinary GHC modules from the 302 importer commands after reading their static and dynamic usage records. For these modules, Hadrian tracked the producer's normalized interfaces. Five boot modules and 48 modules with recorded file dependencies kept their ordinary prerequisites. Both arms used the same stage-matched worker (`ab53801`) with its validated interface cache enabled. The control tracked both complete producer interface files through the same Shake rule.
+
+| Cutoff edit | Full interfaces | Normalized interfaces | Wall time saved |
+| --- | ---: | ---: | ---: |
+| 32 to 31 | 35.32 s | 27.67 s | 21.7% |
+| 31 to 32 | 35.66 s | 28.75 s | 19.4% |
+
+Each cell is one linked `stage2:exe:ghc-bin` rebuild with `perf+no_profiled_libs --freeze1 -j3` and one Hadrian capability. The control ran first in both directions. Each edit regenerated one of 943 dependency rows. Haskell compile requests fell from 303 to 54. Only the producer generated code. Both builds matched ordinary GHC for all four artifacts of the 249 selected modules, the compiler archive and shared library, the stage compiler, and a separately built and executed GHC API consumer. All four immediate repeat builds ran zero actions.
+
+A direct ABI fingerprint would miss a re-export. In an `-O2` fixture, A used an inlined `C.f` through B. The dependency file listed only `A.o: B.hi`. Changing `f x = x + 1` to `f x = x + 2` preserved B's ABI but changed the recorded usage of C in B's interface. Skipping A on ABI equality left the executable printing 11. Stock GHC rebuilt A and printed 12. The normalized interface detected the change for both an explicit re-export and a whole-module re-export. It also detected separate changes to a documentation field and an opaque extension field. [GHC interface serialization](../../compiler/GHC/Unit/Module/ModIface.hs) · [GHC recompilation checks](../../compiler/GHC/Iface/Recomp.hs)
+
+The next step is to derive eligibility from the current compilation instead of a fixed list of modules. The rule must track imported code used at compile time, independent file and directory dependencies, and changes to flags or imports. Measure the cost of producing these fingerprints across the build before enabling the rule for other modules.
 
 ## Source edits before optimization
 
