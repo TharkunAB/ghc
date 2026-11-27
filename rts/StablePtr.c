@@ -207,7 +207,11 @@ enlargeStablePtrTable(void)
     uint32_t old_SPT_size = SPT_size;
     spEntry *new_stable_ptr_table;
 
-    // 2nd and subsequent times
+    // Check both the entry count and the allocation size before doubling.
+    if (old_SPT_size > UINT32_MAX / 2 ||
+        (uint64_t)old_SPT_size * 2 * sizeof(spEntry) > SIZE_MAX) {
+        barf("enlargeStablePtrTable: stable pointer table size overflow");
+    }
     SPT_size *= 2;
 
     /* We temporarily retain the old version instead of freeing it; see Note
