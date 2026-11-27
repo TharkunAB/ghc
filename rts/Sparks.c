@@ -120,7 +120,7 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
     SparkPool *pool;
     StgClosurePtr spark, tmp, *elements;
     uint32_t pruned_sparks; // stats only
-    StgInt botInd,oldBotInd,currInd; // indices in array (always < size)
+    StgWord readIndex, writeIndex, oldBottom;
     const StgInfoTable *info;
 
     pruned_sparks = 0;
@@ -148,52 +148,19 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
 
     elements = (StgClosurePtr *)pool->elements;
 
-    /* We have exclusive access to the structure here, so we can reset
-       bottom and top counters, and prune invalid sparks. Contents are
-       copied in-place if they are valuable, otherwise discarded. The
-       routine uses "real" indices t and b, starts by computing them
-       as the modulus size of top and bottom,
+    /* Scan the old logical bounds. The masked bounds coincide both when
+       the pool is empty and when it is full.
 
-       Copying:
+       Write retained sparks from the old bottom in traversal order. The
+       destination can wrap into the old live range, but it cannot overtake
+       unread entries: each read produces at most one write. When the pool
+       is full, the first read and write refer to the same slot. */
+    readIndex = pool->top;
+    oldBottom = writeIndex = pool->bottom;
+    ASSERT(oldBottom - readIndex <= (StgWord)pool->size);
 
-       At the beginning, the pool structure can look like this:
-       ( bottom % size >= top % size , no wrap-around)
-                  t          b
-       ___________***********_________________
-
-       or like this ( bottom % size < top % size, wrap-around )
-                  b         t
-       ***********__________******************
-       As we need to remove useless sparks anyway, we make one pass
-       between t and b, moving valuable content to b and subsequent
-       cells (wrapping around when the size is reached).
-
-                     b      t
-       ***********OOO_______XX_X__X?**********
-                     ^____move?____/
-
-       After this movement, botInd becomes the new bottom, and old
-       bottom becomes the new top index, both as indices in the array
-       size range.
-    */
-    // starting here
-    currInd = (pool->top) & (pool->moduloSize); // mod
-
-    // copies of evacuated closures go to space from botInd on
-    // we keep oldBotInd to know when to stop
-    oldBotInd = botInd = (pool->bottom) & (pool->moduloSize); // mod
-
-    // on entry to loop, we are within the bounds
-    ASSERT( currInd < pool->size && botInd  < pool->size );
-
-    while (currInd != oldBotInd ) {
-      /* must use != here, wrap-around at size
-         subtle: loop not entered if queue empty
-       */
-
-      /* check element at currInd. if valuable, evacuate and move to
-         botInd, otherwise move on */
-      spark = elements[currInd];
+    while (readIndex < oldBottom) {
+      spark = elements[readIndex & pool->moduloSize];
 
       // We have to be careful here: in the parallel GC, another
       // thread might evacuate this closure while we're looking at it,
@@ -214,8 +181,8 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
               tmp = (StgClosure*)UN_FORWARDING_PTR(info);
               /* if valuable work: shift inside the pool */
               if (closure_SHOULD_SPARK(tmp)) {
-                  elements[botInd] = tmp; // keep entry (new address)
-                  botInd++;
+                  elements[writeIndex & pool->moduloSize] = tmp; // keep entry (new address)
+                  writeIndex++;
               } else {
                   pruned_sparks++; // discard spark
                   cap->spark_stats.fizzled++;
@@ -243,8 +210,8 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
 
               if (is_alive) {
                   if (closure_SHOULD_SPARK(spark)) {
-                      elements[botInd] = spark; // keep entry (new address)
-                      botInd++;
+                      elements[writeIndex & pool->moduloSize] = spark; // keep entry (new address)
+                      writeIndex++;
                   } else {
                       pruned_sparks++; // discard spark
                       cap->spark_stats.fizzled++;
@@ -260,8 +227,8 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
                   // We can't tell whether a THUNK_STATIC is garbage or not.
                   // See also Note [STATIC_LINK fields]
                   // isAlive() also ignores static closures (see GCAux.c)
-                  elements[botInd] = spark; // keep entry (new address)
-                  botInd++;
+                  elements[writeIndex & pool->moduloSize] = spark; // keep entry (new address)
+                  writeIndex++;
               } else {
                   pruned_sparks++; // discard spark
                   cap->spark_stats.fizzled++;
@@ -270,21 +237,11 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
           }
       }
 
-      currInd++;
+      readIndex++;
+    }
 
-      // in the loop, we may reach the bounds, and instantly wrap around
-      ASSERT( currInd <= pool->size && botInd <= pool->size );
-      if ( currInd == pool->size ) { currInd = 0; }
-      if ( botInd == pool->size )  { botInd = 0;  }
-
-    } // while-loop over spark pool elements
-
-    ASSERT(currInd == oldBotInd);
-
-    pool->top = oldBotInd; // where we started writing
-
-    pool->bottom = (oldBotInd <= botInd) ? botInd : (botInd + pool->size);
-    // first free place we did not use (corrected by wraparound)
+    pool->top = oldBottom & pool->moduloSize;
+    pool->bottom = pool->top + (writeIndex - oldBottom);
 
     debugTrace(DEBUG_sparks, "pruned %d sparks", pruned_sparks);
 
