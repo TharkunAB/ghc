@@ -33,6 +33,7 @@ RTS_PRIVATE void ghc_rust_sweep_segments(struct NonmovingSegment **head,
                                          const struct NonmovingAllocator *allocators,
                                          uint8_t epoch);
 RTS_PRIVATE void ghc_rust_free_large_groups(bdescr *head, uint32_t max_groups);
+RTS_PRIVATE void ghc_rust_free_dead_compact_regions(bdescr *head);
 RTS_PRIVATE bdescr *ghc_c_sweeping_descriptor(struct NonmovingSegment *seg);
 RTS_PRIVATE void ghc_c_publish_swept_segment(struct NonmovingSegment *seg,
                                               uint32_t ret);
@@ -397,12 +398,16 @@ void nonmovingSweepLargeObjects(void)
 
 void nonmovingSweepCompactObjects(void)
 {
-    bdescr *next;
     ACQUIRE_SM_LOCK;
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_free_dead_compact_regions(nonmoving_compact_objects);
+#else
+    bdescr *next;
     for (bdescr *bd = nonmoving_compact_objects; bd; bd = next) {
         next = bd->link;
         compactFree(((StgCompactNFDataBlock*)bd->start)->owner);
     }
+#endif
     RELEASE_SM_LOCK;
     nonmoving_compact_objects = nonmoving_marked_compact_objects;
     n_nonmoving_compact_blocks = n_nonmoving_marked_compact_blocks;

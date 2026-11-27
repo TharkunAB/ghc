@@ -1,8 +1,8 @@
 use super::{
-    BD_ALLOCATOR_IDX, BD_LINK, BD_NEXT_FREE_SNAP, BD_SCAN, CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE,
-    CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED, CENSUS_SIZE, CENSUS_WORDS, NM_ACTIVE,
-    NM_BLOCK_COUNT, NM_BLOCK_SIZE, NM_FILLED, NM_STRUCT_SIZE, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE,
-    SEG_STRUCT_SIZE, closure_words,
+    BD_ALLOCATOR_IDX, BD_LINK, BD_NEXT_FREE_SNAP, BD_SCAN, BD_START, CAP_CURRENT_SEGMENTS,
+    CENSUS_ACTIVE, CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED, CENSUS_SIZE, CENSUS_WORDS,
+    COMPACT_BLOCK_OWNER, NM_ACTIVE, NM_BLOCK_COUNT, NM_BLOCK_SIZE, NM_FILLED, NM_STRUCT_SIZE,
+    SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE, SEG_STRUCT_SIZE, closure_words,
 };
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -135,14 +135,30 @@ unsafe extern "C" fn ghc_rust_stopped_allocator_census(
 }
 
 core::arch::global_asm!(
-    ".hidden ghc_rust_clear_segment_free_blocks\n.hidden ghc_rust_sweep_segments\n.hidden ghc_rust_free_large_groups"
+    ".hidden ghc_rust_clear_segment_free_blocks\n.hidden ghc_rust_sweep_segments\n.hidden ghc_rust_free_large_groups\n.hidden ghc_rust_free_dead_compact_regions"
 );
 
 unsafe extern "C" {
     fn ghc_c_sweeping_descriptor(seg: *mut u8) -> *mut u8;
     fn ghc_c_publish_swept_segment(seg: *mut u8, result: u32);
     fn freeGroup(bd: *mut u8);
+    fn compactFree(owner: *mut u8);
     fn ghc_c_yield_large_sweep_lock();
+}
+
+/// Free dead compact regions while the caller owns SM_LOCK.
+/// Read the descriptor link before compactFree invalidates the descriptor.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_free_dead_compact_regions(mut bd: *mut u8) {
+    unsafe {
+        while !bd.is_null() {
+            let next = read_ptr(bd, BD_LINK);
+            let block = read_ptr(bd, BD_START);
+            let owner = read_ptr(block, COMPACT_BLOCK_OWNER);
+            compactFree(owner);
+            bd = next;
+        }
+    }
 }
 
 /// Free the dead large-object groups while the caller owns SM_LOCK.

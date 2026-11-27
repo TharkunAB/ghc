@@ -31,6 +31,8 @@ FIELD(BD_NEXT_FREE_SNAP, bdescr, nonmoving_segment.next_free_snap, uint16_t);
 FIELD(BD_ALLOCATOR_IDX, bdescr, nonmoving_segment.allocator_idx, uint16_t);
 FIELD(BD_SCAN, bdescr, u.scan, StgPtr);
 FIELD(BD_LINK, bdescr, link, bdescr *);
+FIELD(BD_START, bdescr, start, StgPtr);
+FIELD(COMPACT_BLOCK_OWNER, StgCompactNFDataBlock, owner, StgCompactNFData *);
 OFFSET(SEG_STRUCT_SIZE, sizeof(struct NonmovingSegment));
 FIELD(CAP_CURRENT_SEGMENTS, Capability, current_segments, struct NonmovingSegment **);
 FIELD(CENSUS_COLLECTED, struct NonmovingAllocCensus, collected_live_words, bool);
