@@ -4,14 +4,39 @@
 #include "AllocArray.h"
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-#define USE_RUST_BYTE_ARRAY
+#define USE_RUST_ARRAY_ALLOC
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t) &&
                   sizeof(StgArrBytes) % sizeof(StgWord) == 0,
                   "Rust byte array allocation requires a whole-word header");
+GHC_STATIC_ASSERT(offsetof(StgMutArrPtrs, payload) == sizeof(StgMutArrPtrs) &&
+                  offsetof(StgMutArrPtrs, size) + sizeof(StgWord) == sizeof(StgMutArrPtrs) &&
+                  offsetof(StgMutArrPtrs, ptrs) + 2 * sizeof(StgWord) == sizeof(StgMutArrPtrs) &&
+                  offsetof(StgSmallMutArrPtrs, payload) == sizeof(StgSmallMutArrPtrs) &&
+                  offsetof(StgSmallMutArrPtrs, ptrs) + sizeof(StgWord) == sizeof(StgSmallMutArrPtrs) &&
+                  sizeof(StgClosure *) == sizeof(StgWord),
+                  "Rust pointer arrays require word-aligned metadata before the payload");
+RTS_PRIVATE StgMutArrPtrs *ghc_rust_allocate_mut_array(
+    Capability *cap, StgWord count, StgClosure *init, CostCentreStack *ccs, size_t header_bytes);
+RTS_PRIVATE StgSmallMutArrPtrs *ghc_rust_allocate_small_mut_array(
+    Capability *cap, StgWord count, StgClosure *init, CostCentreStack *ccs, size_t header_bytes);
 RTS_PRIVATE StgArrBytes *ghc_rust_allocate_byte_array(
     Capability *cap, StgWord bytes, size_t header_bytes);
 RTS_PRIVATE StgArrBytes *ghc_rust_allocate_pinned_byte_array(
     Capability *cap, StgWord bytes, StgWord alignment, size_t header_bytes);
+#endif
+
+#if defined(USE_RUST_RTS)
+/* The Rust object is common to all RTS ways. Use this way's profiling macros. */
+RTS_PRIVATE void ghc_rust_set_array_header(StgClosure *arr, const StgInfoTable *info,
+                                           CostCentreStack *ccs,
+                                           size_t header_words, size_t payload_words);
+void ghc_rust_set_array_header(StgClosure *arr, const StgInfoTable *info,
+                               CostCentreStack *ccs USED_IF_PROFILING,
+                               size_t header_words STG_UNUSED, size_t payload_words STG_UNUSED)
+{
+    TICK_ALLOC_PRIM(header_words, payload_words, 0);
+    SET_HDR(arr, info, ccs);
+}
 #endif
 
 /* Note [Array allocation sizes]
@@ -25,6 +50,9 @@ StgMutArrPtrs *allocateMutArrPtrs (Capability *cap,
                                    StgClosure *init,
                                    CostCentreStack *ccs USED_IF_PROFILING)
 {
+#if defined(USE_RUST_ARRAY_ALLOC)
+    return ghc_rust_allocate_mut_array(cap, nelements, init, ccs, sizeof(StgMutArrPtrs));
+#else
     if (RTS_UNLIKELY(nelements > (HS_WORD_MAX - sizeof(StgMutArrPtrs)) / sizeof(StgClosure *))) return NULL;
 
     /* All sizes in words */
@@ -55,6 +83,7 @@ StgMutArrPtrs *allocateMutArrPtrs (Capability *cap,
     memset(&(arr->payload[nelements]), 0, mutArrPtrsCards(nelements));
 
     return arr;
+#endif
 }
 
 StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
@@ -63,6 +92,9 @@ StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
                                              CostCentreStack *ccs
                                                USED_IF_PROFILING)
 {
+#if defined(USE_RUST_ARRAY_ALLOC)
+    return ghc_rust_allocate_small_mut_array(cap, nelements, init, ccs, sizeof(StgSmallMutArrPtrs));
+#else
     if (RTS_UNLIKELY(nelements > (HS_WORD_MAX - sizeof(StgSmallMutArrPtrs)) / sizeof(StgClosure *))) return NULL;
 
     /* All sizes in words */
@@ -84,6 +116,7 @@ StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
     }
 
     return arr;
+#endif
 }
 
 /* The header and allocation counters depend on the current RTS way. */
@@ -102,7 +135,7 @@ StgArrBytes *allocateArrBytes (Capability *cap,
                                CostCentreStack *ccs USED_IF_PROFILING)
 {
     StgArrBytes *arr;
-#if defined(USE_RUST_BYTE_ARRAY)
+#if defined(USE_RUST_ARRAY_ALLOC)
     arr = ghc_rust_allocate_byte_array(cap, arrbytes, sizeof(StgArrBytes));
 #else
     if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
@@ -118,7 +151,7 @@ StgArrBytes *allocateArrBytesPinned (Capability *cap,
                                      CostCentreStack *ccs USED_IF_PROFILING)
 {
     StgArrBytes *arr;
-#if defined(USE_RUST_BYTE_ARRAY)
+#if defined(USE_RUST_ARRAY_ALLOC)
     arr = ghc_rust_allocate_pinned_byte_array(cap, arrbytes, alignment, sizeof(StgArrBytes));
 #else
     if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
