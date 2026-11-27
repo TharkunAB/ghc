@@ -32,9 +32,11 @@ RTS_PRIVATE void ghc_rust_clear_segment_free_blocks(struct NonmovingSegment *seg
 RTS_PRIVATE void ghc_rust_sweep_segments(struct NonmovingSegment **head,
                                          const struct NonmovingAllocator *allocators,
                                          uint8_t epoch);
+RTS_PRIVATE void ghc_rust_free_large_groups(bdescr *head, uint32_t max_groups);
 RTS_PRIVATE bdescr *ghc_c_sweeping_descriptor(struct NonmovingSegment *seg);
 RTS_PRIVATE void ghc_c_publish_swept_segment(struct NonmovingSegment *seg,
                                               uint32_t ret);
+RTS_PRIVATE void ghc_c_yield_large_sweep_lock(void);
 GHC_STATIC_ASSERT(SEGMENT_FREE == 0 && SEGMENT_PARTIAL == 1 && SEGMENT_FILLED == 2,
                   "Rust sweep result matches enum SweepResult");
 #endif
@@ -345,12 +347,26 @@ void nonmovingSweepMutLists(void)
     }
 }
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+RTS_PRIVATE void ghc_c_yield_large_sweep_lock(void)
+{
+#if defined(THREADED_RTS)
+    RELEASE_SM_LOCK;
+    yieldThread();
+    ACQUIRE_SM_LOCK;
+#endif
+}
+#endif
+
 /* In the threaded RTS, release the lock after at most max_groups calls to
  * freeGroup. This prevents the sweep from starving other lock users.
  */
 static void freeChain_lock_max(bdescr *bd, int max_groups)
 {
   ACQUIRE_SM_LOCK;
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+  ghc_rust_free_large_groups(bd, max_groups);
+#else
   bdescr *next_bd;
   int groups = 0;
   while (bd != NULL) {
@@ -366,6 +382,7 @@ static void freeChain_lock_max(bdescr *bd, int max_groups)
         groups = 0;
     }
   }
+#endif
   RELEASE_SM_LOCK;
 }
 
