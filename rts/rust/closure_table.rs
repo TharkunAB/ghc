@@ -7,6 +7,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_closure_table_init",
     ".hidden ghc_rust_closure_table_mark",
     ".hidden ghc_rust_closure_table_insert",
+    ".hidden ghc_rust_closure_table_insert_debug",
 );
 
 // See Note [Closure table Rust layout] in rts/ClosureTable.c.
@@ -48,6 +49,8 @@ unsafe extern "C" {
     fn allocateArrBytes(cap: *mut c_void, bytes: usize, ccs: *mut c_void) -> *mut c_void;
     fn mutArrPtrsCardTableSize(count: usize) -> usize;
     fn recordClosureMutated(cap: *mut c_void, array: *mut c_void);
+    static mut nonmoving_write_barrier_enabled: usize;
+    fn updateRemembSetPushClosure(cap: *mut c_void, closure: *mut c_void);
 }
 
 /// Grow both heap arrays. Publish them only after initialization and GC registration.
@@ -204,19 +207,39 @@ unsafe fn recycle(table: *mut ClosureTable, free_link: *mut c_int, ix: c_int) {
     }
 }
 
-/// Clear an occupied slot. C runs the nonmoving write barrier first.
+// See Note [Closure table removal barrier in Rust] in rts/ClosureTable.c.
+unsafe fn barrier_before_overwrite(barrier_cap: *mut c_void, slot: *mut *mut c_void) {
+    if !barrier_cap.is_null() && unsafe { (&raw const nonmoving_write_barrier_enabled).read() } != 0
+    {
+        unsafe { updateRemembSetPushClosure(barrier_cap, slot.read()) };
+    }
+}
+
+/// Clear an occupied slot. Run the nonmoving write barrier first when enabled.
 ///
 /// # Safety
 ///
-/// The caller owns the table. The slot and free link belong to index `ix`.
+/// The caller owns the table. `slots_offset` is the checked payload offset for
+/// this RTS way. A null `barrier_cap` disables the barrier in the vanilla RTS.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_closure_table_remove_sparse(
     table: *mut ClosureTable,
-    slot: *mut *mut c_void,
-    free_link: *mut c_int,
+    barrier_cap: *mut c_void,
     ix: c_int,
+    slots_offset: usize,
 ) {
     unsafe {
+        let slot = (*table)
+            .arr
+            .byte_add(slots_offset)
+            .cast::<*mut c_void>()
+            .add(ix as usize);
+        let free_link = (*table)
+            .free
+            .byte_add(slots_offset - size_of::<usize>())
+            .cast::<c_int>()
+            .add(ix as usize);
+        barrier_before_overwrite(barrier_cap, slot);
         slot.write(
             (&raw const stg_CLOSURE_TABLE_NULL_closure)
                 .cast_mut()
@@ -231,27 +254,64 @@ unsafe extern "C" fn ghc_rust_closure_table_remove_sparse(
 ///
 /// # Safety
 ///
-/// The caller owns the table and has applied the nonmoving write barrier.
-/// Both indexes are occupied. The free link belongs to the last slot and
-/// the card belongs to the gap.
+/// The caller owns the table. `slots_offset` is the checked payload offset for
+/// this RTS way. The gap and last slots are occupied. The card belongs to the
+/// gap. A null `barrier_cap` disables the barrier in the vanilla RTS.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_closure_table_remove_compact(
     table: *mut ClosureTable,
-    payload: *mut *mut c_void,
-    free_link: *mut c_int,
+    barrier_cap: *mut c_void,
     gap: c_int,
-    last: c_int,
-    gap_card: *mut u8,
+    ix_from: *mut c_int,
+    ix_to: *mut c_int,
+    slots_offset: usize,
 ) {
     unsafe {
+        let last = (*table).elems - 1;
+        ix_from.write(last);
+        ix_to.write(gap);
+        let payload = (*table).arr.byte_add(slots_offset).cast::<*mut c_void>();
+        let gap_slot = payload.add(gap as usize);
         let last_slot = payload.add(last as usize);
-        payload.add(gap as usize).write(last_slot.read());
+        barrier_before_overwrite(barrier_cap, gap_slot);
+        gap_slot.write(last_slot.read());
         last_slot.write(
             (&raw const stg_CLOSURE_TABLE_NULL_closure)
                 .cast_mut()
                 .cast(),
         );
-        gap_card.write(1);
+        payload
+            .add((*table).capacity as usize)
+            .cast::<u8>()
+            .add((gap as usize) >> 7)
+            .write(1);
+        let free_link = (*table)
+            .free
+            .byte_add(slots_offset - size_of::<usize>())
+            .cast::<c_int>()
+            .add(last as usize);
         recycle(table, free_link, last);
     }
+}
+
+/// Insert one closure and mark its free-list entry as used in DEBUG builds.
+///
+/// # Safety
+///
+/// The insertion contract applies. `free_link` is the entry at the current
+/// free head. C checks that the entry is free before this call.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_closure_table_insert_debug(
+    table: *mut ClosureTable,
+    value: *mut c_void,
+    slot: *mut *mut c_void,
+    card: *mut u8,
+    info_slot: *mut *const c_void,
+    free_link: *mut c_int,
+) -> c_int {
+    let next_free = unsafe { free_link.read() };
+    let ix =
+        unsafe { ghc_rust_closure_table_insert(table, value, slot, card, info_slot, next_free) };
+    unsafe { free_link.write(-2) };
+    ix
 }

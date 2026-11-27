@@ -15,7 +15,8 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * The table fields have the same layout in every RTS way. C checks that
  * layout against the small Rust record. Heap array headers vary by RTS way,
- * so C supplies the payload offsets for growth and the slots for insertion.
+ * so C supplies the payload offset for growth and removal and the slots for
+ * insertion.
  * Rust calls the RTS allocators and registers the new mutable array before
  * it publishes either array. The RTS retains the capability and heap layouts.
  */
@@ -25,6 +26,15 @@ GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(StgClosure *),
                   "Closure table card words must match pointer slots");
 GHC_STATIC_ASSERT(sizeof(enum ClosureTableMode) == sizeof(int),
                   "Closure table mode must match Rust c_int");
+GHC_STATIC_ASSERT(offsetof(StgMutArrPtrs, payload) ==
+                  offsetof(StgArrBytes, payload) + sizeof(StgWord),
+                  "Closure table payload offsets must differ by one word");
+GHC_STATIC_ASSERT(offsetof(StgMutArrPtrs, header.info) == 0,
+                  "Closure table array info must be the first word");
+GHC_STATIC_ASSERT(MUT_ARR_PTRS_CARD_BITS == 7 && sizeof(StgWord8) == 1,
+                  "Closure table card geometry must match Rust");
+GHC_STATIC_ASSERT(FREELIST_IX_USED == -2,
+                  "Closure table used marker must match Rust");
 GHC_STATIC_ASSERT(offsetof(ClosureTable, arr) == 0 &&
                   offsetof(ClosureTable, free) == sizeof(void *) &&
                   offsetof(ClosureTable, free_hd) == 2 * sizeof(void *) &&
@@ -43,14 +53,26 @@ RTS_PRIVATE int ghc_rust_closure_table_insert(ClosureTable *t, void *v,
                                                StgWord8 *card,
                                                const StgInfoTable **info_slot,
                                                int next_free);
+#if defined(DEBUG)
+RTS_PRIVATE int ghc_rust_closure_table_insert_debug(ClosureTable *t, void *v,
+                                                     StgClosure **slot,
+                                                     StgWord8 *card,
+                                                     const StgInfoTable **info_slot,
+                                                     int *free_link);
+#endif
 RTS_PRIVATE bool ghc_rust_closure_table_grow(
     ClosureTable *t, Capability *cap, int capacity, CostCentreStack *ccs,
     size_t slots_offset, size_t links_offset);
 RTS_PRIVATE void ghc_rust_closure_table_remove_sparse(
-    ClosureTable *t, StgClosure **slot, int *free_link, int ix);
+    ClosureTable *t, Capability *barrier_cap, int ix, size_t slots_offset);
 RTS_PRIVATE void ghc_rust_closure_table_remove_compact(
-    ClosureTable *t, StgClosure **payload, int *free_link,
-    int gap, int last, StgWord8 *gap_card);
+    ClosureTable *t, Capability *barrier_cap, int gap,
+    int *ix_from, int *ix_to, size_t slots_offset);
+#if defined(THREADED_RTS)
+#define CLOSURE_TABLE_BARRIER_CAP(cap) (cap)
+#else
+#define CLOSURE_TABLE_BARRIER_CAP(cap) NULL
+#endif
 #endif
 
 
@@ -173,12 +195,18 @@ int insertClosureTable(Capability *cap STG_UNUSED,
 
     /* Fill in the entry with the supplied closure. */
 #if defined(USE_RUST_CLOSURE_TABLE)
+#if defined(DEBUG)
+    int inserted = ghc_rust_closure_table_insert_debug(
+        t, v, &t->arr->payload[ix],
+        mutArrPtrsCard(t->arr, ix >> MUT_ARR_PTRS_CARD_BITS),
+        &t->arr->header.info, &StgArrBytesAsCInts(t->free)[ix]);
+#else
     int next_free = StgArrBytesAsCInts(t->free)[ix];
     int inserted = ghc_rust_closure_table_insert(
         t, v, &t->arr->payload[ix],
         mutArrPtrsCard(t->arr, ix >> MUT_ARR_PTRS_CARD_BITS),
         &t->arr->header.info, next_free);
-    DEBUG_ONLY(StgArrBytesAsCInts(t->free)[inserted] = FREELIST_IX_USED);
+#endif
     return inserted;
 #else
     t->arr->payload[ix] = v;
@@ -202,7 +230,7 @@ int insertClosureTable(Capability *cap STG_UNUSED,
 }
 
 
-void removeClosureTable(Capability *cap, ClosureTable *t, int ix)
+void removeClosureTable(Capability *cap STG_UNUSED, ClosureTable *t, int ix)
 {
     /* removeClosureTable can only be used for non-compact tables */
     ASSERT(t->compact == ClosureTableNonCompact);
@@ -211,6 +239,16 @@ void removeClosureTable(Capability *cap, ClosureTable *t, int ix)
 
     /* in debug, was marked as used */
     ASSERT(StgArrBytesAsCInts(t->free)[ix] == FREELIST_IX_USED);
+
+    /* Note [Closure table removal barrier in Rust]
+     * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     * The threaded C macro reads nonmoving_write_barrier_enabled as an
+     * ordinary word. Rust uses the same read when C passes a capability.
+     * The non-threaded C wrapper passes NULL, so Rust does not read the flag
+     * or call the barrier. The collector enables the flag during stop-the-world
+     * preparation, before mutators resume, and clears it after marking. Rust
+     * uses the C flag protocol and calls the native barrier before overwrite.
+     */
 
     /* Normally when modifying an array element we would need to mark the card
      * table entry, if the whole array wasn't already marked as dirty then we
@@ -231,13 +269,14 @@ void removeClosureTable(Capability *cap, ClosureTable *t, int ix)
      * collector's snapshot invariant. Since we're potentially about to forget
      * the old element, we need to add it to the remembered set.
      */
+#if defined(USE_RUST_CLOSURE_TABLE)
+    ghc_rust_closure_table_remove_sparse(
+        t, CLOSURE_TABLE_BARRIER_CAP(cap), ix,
+        offsetof(StgMutArrPtrs, payload));
+#else
     IF_NONMOVING_WRITE_BARRIER_ENABLED {
         updateRemembSetPushClosure(cap, t->arr->payload[ix]);
     }
-#if defined(USE_RUST_CLOSURE_TABLE)
-    ghc_rust_closure_table_remove_sparse(t, &t->arr->payload[ix],
-                                         &StgArrBytesAsCInts(t->free)[ix], ix);
-#else
     t->arr->payload[ix] = &stg_CLOSURE_TABLE_NULL_closure;
 
     /* push ix onto the free list */
@@ -259,7 +298,7 @@ void removeClosureTable(Capability *cap, ClosureTable *t, int ix)
 static bool isCompactClosureTable(ClosureTable *t);
 
 
-void removeCompactClosureTable(Capability *cap, ClosureTable *t,
+void removeCompactClosureTable(Capability *cap STG_UNUSED, ClosureTable *t,
                                int ix, int *ix_from, int *ix_to)
 {
     /* removeCompactClosureTable can only be used for compact tables */
@@ -273,6 +312,12 @@ void removeCompactClosureTable(Capability *cap, ClosureTable *t,
     /* this action can only be used for compact tables */
     ASSERT(isCompactClosureTable(t));
 
+#if defined(USE_RUST_CLOSURE_TABLE)
+    ASSERT(t->arr->ptrs == (StgWord)t->capacity);
+    ghc_rust_closure_table_remove_compact(
+        t, CLOSURE_TABLE_BARRIER_CAP(cap), ix, ix_from, ix_to,
+        offsetof(StgMutArrPtrs, payload));
+#else
     int gap_ix = ix;
     int end_ix = t->elems - 1;
 
@@ -291,12 +336,6 @@ void removeCompactClosureTable(Capability *cap, ClosureTable *t,
         updateRemembSetPushClosure(cap, t->arr->payload[gap_ix]);
     }
 
-#if defined(USE_RUST_CLOSURE_TABLE)
-    ghc_rust_closure_table_remove_compact(t, t->arr->payload,
-                                          &StgArrBytesAsCInts(t->free)[end_ix],
-                                          gap_ix, end_ix,
-                                          mutArrPtrsCard(t->arr, gap_ix >> MUT_ARR_PTRS_CARD_BITS));
-#else
     /* move the end entry over the gap and mark the end as empty */
     t->arr->payload[gap_ix] = t->arr->payload[end_ix];
     t->arr->payload[end_ix] = &stg_CLOSURE_TABLE_NULL_closure;
