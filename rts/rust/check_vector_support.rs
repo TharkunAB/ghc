@@ -27,8 +27,18 @@ fn classify_vector_support(leaf1_ecx: u32, leaf1_edx: u32, leaf7_ebx: u32, xcr0:
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn ghc_rust_check_vector_support() -> c_int {
+#[unsafe(export_name = "vectorSupportGlobalVar")]
+pub static mut VECTOR_SUPPORT_GLOBAL: c_int = 0;
+
+/* Note [Vector support symbol preemption]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The dynamic RTS calls checkVectorSupport through its public symbol.
+ * It writes vectorSupportGlobalVar through its public symbol.
+ * Keep the detector out of setVectorSupport so the linker can replace it.
+ */
+#[unsafe(export_name = "checkVectorSupport")]
+#[inline(never)]
+pub extern "C" fn check_vector_support() -> c_int {
     // SAFETY: CPUID is available on x86_64. XGETBV is executed only when CPUID
     // reports OSXSAVE, which states that the operating system supports it.
     unsafe {
@@ -45,5 +55,13 @@ pub extern "C" fn ghc_rust_check_vector_support() -> c_int {
             0
         };
         classify_vector_support(leaf1.ecx, leaf1.edx, leaf7_ebx, xcr0)
+    }
+}
+
+#[unsafe(export_name = "setVectorSupport")]
+pub extern "C" fn set_vector_support() {
+    // SAFETY: RTS startup calls this before threads read vectorSupportGlobalVar.
+    unsafe {
+        VECTOR_SUPPORT_GLOBAL = check_vector_support();
     }
 }

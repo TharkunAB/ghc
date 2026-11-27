@@ -5,9 +5,9 @@
 
 #if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && !defined(TSAN_ENABLED)
 #define USE_RUST_VECTOR_SUPPORT
-RTS_PRIVATE int ghc_rust_check_vector_support(void);
 #endif
 
+#if !defined(USE_RUST_VECTOR_SUPPORT)
 // Check support for vector registers (conservative).
 //
 // 0: no support for vector registers
@@ -15,11 +15,6 @@ RTS_PRIVATE int ghc_rust_check_vector_support(void);
 // 2: support for 256-bit vector registers
 // 3: support for 512-bit vector registers
 int checkVectorSupport(void) {
-
-  #if defined(USE_RUST_VECTOR_SUPPORT)
-    return ghc_rust_check_vector_support();
-  #else
-
     int supports_V16;
     int supports_V32;
     int supports_V64;
@@ -126,10 +121,10 @@ int checkVectorSupport(void) {
       return 1;
     }
     return 0;
-  #endif
 }
 
 int vectorSupportGlobalVar;
 void setVectorSupport(void){
   vectorSupportGlobalVar = checkVectorSupport();
 }
+#endif
