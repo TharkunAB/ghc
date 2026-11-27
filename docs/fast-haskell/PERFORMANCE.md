@@ -229,6 +229,25 @@ The active shared Stage1 worker `fd8d51d` uses GHC 10.1.20261115.1 (executable S
 
 The release also handles an up-to-date `-c -dynamic-too` command with Hadrian's optional `+RTS -O64M -A64m -RTS` block. Across six warm samples per executable on a single-file fixture, ordinary GHC took 210.1 ms, the previous worker took 209.4 ms, and the new worker took 19.6 ms at the median (10.7× versus ordinary GHC). A required compile delegated once with the original arguments and reproduced all four artifacts byte for byte.
 
+### Shared Stage0 worker 7d77754
+
+The packaged worker reuses the decoded positive CPP store when a
+fresh read under the writer lock returns identical bytes. It decodes
+the latest bytes when another writer has updated the store. On the
+exact 943-module dependency command, the first request against a
+nearly full store took **5.138 s versus 5.338 s** with `3c6ed41`.
+The candidate won three of four alternating pairs. Median daemon
+CPU fell from 5.35 s to 5.05 s. Peak daemon RSS was 560.2 MiB and
+560.5 MiB, respectively.
+
+Fresh restarts after admission took 3.787 s versus 3.950 s. Normal
+populated-cache restarts took 3.838 s versus 4.013 s across two
+pairs. Stock GHC `cafe7121a8e6` took 8.424 s and 8.133 s. Both
+workers admitted all 104 current records into the same nearly full
+fixture and reused them at restart. Dependency files, backups,
+stdout and diagnostics matched stock. Release smoke passed.
+Pueue job 7418 peaked at 567 MiB. The opt-in store remains v3.
+
 ### Shared Stage0 worker 3c6ed41
 
 With a full positive CPP store and a held-out graph, the shared Stage0
