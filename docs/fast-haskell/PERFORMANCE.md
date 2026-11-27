@@ -17,7 +17,7 @@ The original Hadrian `56bb91d95f` used ordinary GHC. The optimized build used th
 
 The edit and revert together took **152.43 s with the original build and 53.12 s with the optimized build (2.87×, 65.1% less time)**. The optimized build issued 54 compile requests per edit instead of 303 and regenerated one of 943 dependency rows. Only the edited producer generated code. The checked module artifacts, package archive, shared library, linked compiler and separately compiled dynamic API consumer matched ordinary GHC. Every immediate repeat ran zero build actions.
 
-Separate writable overlays used the same read-only build. Preparation and worker warm-up took place before each stopwatch interval. Each cell is one sample. After correcting the primer, the original windows ran before the optimized windows. Pueue recorded an overlapping small-group task during the original forward window. Whole-job memory peaks were 2,548 and 2,491 MiB for the original windows and 3,425 and 3,504 MiB for the optimized windows, including worker warm-up and verification.
+Separate writable overlays used the same read-only build. Preparation and worker warm-up took place before each stopwatch interval. Each cell is one sample. After correcting the primer, the original windows ran before the optimized windows. Pueue recorded overlap with a small-group task in the original forward window and a build-group task in the optimized reverse window. Whole-job memory peaks were 2,548 and 2,491 MiB for the original windows and 3,425 and 3,504 MiB for the optimized windows, including worker warm-up and verification.
 
 ### Cumulative comparison on GHC 10.1.20261127
 
