@@ -53,7 +53,11 @@ install -d -m 700 "$PWD/_build/worker-cpp-cache"
 
 ### Shared Stage1 worker on 27 November
 
-The active Stage1 release `2a5a1d0` ran the 956-module dependency command in 0.552 s after a one-import edit. The matched stock median was 22.294 s (40.4×). This measures dependency generation. The shared Stage0 selector `1784b7a` pointed to a compiler installation with a missing Stage0 library directory when we checked. The linked measurements above used a complete private, stage-matched installation.
+The active shared Stage1 worker `fd8d51d` uses GHC 10.1.20261115.1 (executable SHA-256 prefix `aac58b24`). It ran the 956-module dependency command in 0.577 s unchanged and 0.617 s after a one-import edit. The old worker `2a5a1d0` took 0.589 and 0.608 s in the same test. These are medians from six warm samples per worker per case. Ordinary GHC took 23.284 and 23.498 s in one reference run per case. The edit command was 38.1× faster and regenerated one row. All Makefiles, backups and diagnostics matched ordinary GHC.
+
+The release also handles an up-to-date `-c -dynamic-too` command with Hadrian's optional `+RTS -O64M -A64m -RTS` block. Across six warm samples per executable on a single-file fixture, ordinary GHC took 210.1 ms, the previous worker took 209.4 ms, and the new worker took 19.6 ms at the median (10.7× versus ordinary GHC). A required compile delegated once with the original arguments and reproduced all four artifacts byte for byte.
+
+The shared Stage0 selector `1784b7a` pointed to a compiler installation with a missing Stage0 library directory when we checked. The linked measurements above used a complete private, stage-matched installation.
 
 ### Development workers at 8ad5a4d
 
@@ -237,6 +241,8 @@ We ran the retained GHC 10.1.20261115.1 compiler with its own threaded dynamic R
 The 64 MiB nursery cut median wall time by 5–6%. Timing ranges overlapped. All objects and interfaces matched. The extra 209–216 MiB matters when several builds share a machine. We kept the existing defaults. The [individual samples](2026-11-27.csv) include smaller nursery settings.
 
 On the actual Stage1 `-O2 -dynamic-too` command for `GHC.Core.Opt.Simplify.Iteration`, the 64 MiB nursery saved 0.75 s of CPU at the median across three paired rounds. Median process peak RSS rose from 349 MiB to 369 MiB. All four emitted artifacts matched across the runs. Other builds were active, so these samples measure per-command CPU and RSS. The nursery has its own development opt-in. [Hadrian setup](../../hadrian/README.md#compiler-nursery-for-development-builds)
+
+Across four paired samples per module, the same nursery setting saved a median 0.10 s CPU when emitting `GHC.Utils.Misc` and took a median 0.015 s more CPU when emitting `GHC.Tc.Gen.Expr`. Peak process RSS rose from 195 to 221 MiB and from 428 to 431 MiB, respectively. All four output files for each command matched ordinary GHC. This panel measured individual compiler processes.
 
 In a separate Callgrind run, sequential evacuation in `evacuate1` used 474,394,570 of 3,386,978,025 instructions (14.0%) in the compiler process building `GHC.Data.Bool`. Both artifacts matched the uninstrumented build. Of 8,694,351 pointer classifications, 4,618,238 took the static path. Of 2,540,069 ordinary closure dispatches across 16 targets, the largest target received 743,727. Removing the suspected extra flag load would save at most 0.12% of the routine's instructions. This profile gives little support for specializing one closure type. The `GHC.Cmm.Sink` profile reached its 100 s limit without usable instruction counts. [Evacuation code](../../rts/sm/Evac.c)
 
