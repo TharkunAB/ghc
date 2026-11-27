@@ -1,4 +1,7 @@
 #include "ClosureLayout.h"
+#include "Capability.h"
+#include "NonMoving.h"
+#include "NonMovingCensus.h"
 
 /* Note [Closure size build constants]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -17,6 +20,20 @@ OFFSET(INFO_TABLE_BIAS, sizeof(StgInfoTable));
 #else
 OFFSET(INFO_TABLE_BIAS, 0);
 #endif
+FIELD(NM_FILLED, struct NonmovingAllocator, filled, struct NonmovingSegment *);
+FIELD(NM_ACTIVE, struct NonmovingAllocator, active, struct NonmovingSegment *);
+FIELD(NM_BLOCK_SIZE, struct NonmovingAllocator, block_size, uint16_t);
+FIELD(NM_BLOCK_COUNT, struct NonmovingAllocator, block_count, uint16_t);
+FIELD(SEG_LINK, struct NonmovingSegment, link, struct NonmovingSegment *);
+FIELD(SEG_BITMAP, struct NonmovingSegment, bitmap[0], uint8_t);
+OFFSET(SEG_STRUCT_SIZE, sizeof(struct NonmovingSegment));
+FIELD(CAP_CURRENT_SEGMENTS, Capability, current_segments, struct NonmovingSegment **);
+FIELD(CENSUS_COLLECTED, struct NonmovingAllocCensus, collected_live_words, bool);
+FIELD(CENSUS_ACTIVE, struct NonmovingAllocCensus, n_active_segs, uint32_t);
+FIELD(CENSUS_FILLED, struct NonmovingAllocCensus, n_filled_segs, uint32_t);
+FIELD(CENSUS_BLOCKS, struct NonmovingAllocCensus, n_live_blocks, uint32_t);
+FIELD(CENSUS_WORDS, struct NonmovingAllocCensus, n_live_words, uint32_t);
+OFFSET(CENSUS_SIZE, sizeof(struct NonmovingAllocCensus));
 FIELD(INFO_TYPE_OFFSET, StgInfoTable, type, uint32_t);
 FIELD(INFO_PTRS_OFFSET, StgInfoTable, layout.payload.ptrs, uint32_t);
 FIELD(INFO_NPTRS_OFFSET, StgInfoTable, layout.payload.nptrs, uint32_t);

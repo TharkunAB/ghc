@@ -1,12 +1,10 @@
 #![no_std]
 
 use core::mem::size_of;
-use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 include!(env!("CLOSURE_SIZE_LAYOUT_RS"));
-core::arch::global_asm!(
-    ".hidden ghc_rust_filled_segment_words\n.hidden ghc_rust_marked_segment_words"
-);
+mod nonmoving;
 
 unsafe extern "C" {
     #[link_name = "closure_sizeW_"]
@@ -25,48 +23,6 @@ unsafe fn closure_words(closure: *const u8) -> u32 {
         .load(Ordering::Relaxed);
         interposable_closure_size(closure, raw.wrapping_sub(INFO_TABLE_BIAS))
     }
-}
-
-/// Sum the closure sizes in one filled nonmoving segment.
-/// The caller supplies the first block, block size, and number of used blocks.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ghc_rust_filled_segment_words(
-    first: *const u8,
-    stride: usize,
-    count: u32,
-) -> u32 {
-    let mut words = 0u32;
-    for index in 0..count as usize {
-        unsafe {
-            let closure = first.add(index * stride);
-            words = words.wrapping_add(closure_words(closure));
-        }
-    }
-    words
-}
-
-/// Count live blocks and words in an active or current nonmoving segment.
-/// An epoch of zero selects every nonzero mark in a current segment.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ghc_rust_marked_segment_words(
-    marks: *const AtomicU8,
-    first: *const u8,
-    stride: usize,
-    count: u32,
-    epoch: u8,
-    out_blocks: *mut u32,
-) -> u32 {
-    let mut blocks = 0u32;
-    let mut words = 0u32;
-    for index in 0..count as usize {
-        let mark = unsafe { (*marks.add(index)).load(Ordering::Relaxed) };
-        if mark != 0 && (epoch == 0 || mark == epoch) {
-            blocks = blocks.wrapping_add(1);
-            words = words.wrapping_add(unsafe { closure_words(first.add(index * stride)) });
-        }
-    }
-    unsafe { out_blocks.write(blocks) };
-    words
 }
 
 #[inline]

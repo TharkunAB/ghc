@@ -36,8 +36,11 @@ rtsRules = priority 3 $ do
                 rustObject %> \output -> do
                     need [layout]
                     layoutPath <- liftIO $ makeAbsolute layout
+                    let modules = if stem == "closure-size"
+                            then ["rts/rust/nonmoving.rs"]
+                            else []
                     buildRustRtsWithEnv [AddEnv layoutEnv layoutPath]
-                        stage ("ghc_rts_" ++ crate) ("rts/rust/" ++ crate ++ ".rs") [] [] output
+                        stage ("ghc_rts_" ++ crate) ("rts/rust/" ++ crate ++ ".rs") modules [] output
         buildPath -/- "rust-rts.o" %> \output -> do
             largeAddressSpace <- rtsConfigDefines buildPath "USE_LARGE_ADDRESS_SPACE"
             let rustCfg = if largeAddressSpace then ["--cfg", "ghc_use_large_address_space"] else []

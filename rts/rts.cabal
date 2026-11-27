@@ -26,6 +26,7 @@ extra-source-files:
     rust/HeapPointerConstants.c
     rust/heap_pointers.rs
     rust/closure_size.rs
+    rust/nonmoving.rs
     rust/closure_table.rs
     rust/clone_stack.rs
     rust/arena.rs
