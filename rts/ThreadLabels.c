@@ -20,18 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void
-threadLabelBeforeStore(Capability *cap, StgTSO *tso,
-                       StgArrBytes *old_label)
-{
-    if (old_label) {
-        IF_NONMOVING_WRITE_BARRIER_ENABLED {
-            updateRemembSetPushClosure(cap, (StgClosure *) old_label);
-        }
-    }
-    recordClosureMutated(cap, (StgClosure *) tso);
-}
-
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 #define USE_RUST_THREAD_LABELS
 #if defined(THREADED_RTS)
@@ -46,6 +34,20 @@ RTS_PRIVATE StgArrBytes *ghc_rust_make_thread_label(Capability *cap,
 RTS_PRIVATE void ghc_rust_label_thread(StgArrBytes **slot,
                                        Capability *cap, StgTSO *tso,
                                        StgArrBytes *label, int barrier_possible);
+#endif
+
+#if !defined(USE_RUST_THREAD_LABELS)
+static void
+threadLabelBeforeStore(Capability *cap, StgTSO *tso,
+                       StgArrBytes *old_label)
+{
+    if (old_label) {
+        IF_NONMOVING_WRITE_BARRIER_ENABLED {
+            updateRemembSetPushClosure(cap, (StgClosure *) old_label);
+        }
+    }
+    recordClosureMutated(cap, (StgClosure *) tso);
+}
 #endif
 
 /*
