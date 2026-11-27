@@ -39,7 +39,7 @@ unsafe extern "C" {
 }
 
 /// Append dead weak pointers, mark the new entries, and publish their count.
-/// The GC owns `list`. The idle drain can still hold entries in `head`.
+/// The GC owns `list`. Earlier entries can still await the idle drain.
 /// C supplies the weak link offset and any assertion or profiling header action.
 unsafe fn prepare_finalizers(
     list: *mut u8,
@@ -126,7 +126,7 @@ unsafe extern "C" fn ghc_rust_pending_finalizers() -> usize {
 /// C supplies a task flag and optional trace hooks after a successful claim.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_run_some_finalizers(
-    limit: usize,
+    all: bool,
     callbacks_offset: usize,
     link_offset: usize,
     payload_offset: usize,
@@ -152,6 +152,8 @@ unsafe extern "C" fn ghc_rust_run_some_finalizers(
             running.write(true);
         }
         let mut cursor = FINALIZER_LIST.load(Ordering::Relaxed);
+        // Bound each idle step so the capability can respond to new work.
+        let limit = if all { usize::MAX } else { 100 };
         let count = super::c_finalizers::drain_c_finalizers(
             &mut cursor,
             limit,

@@ -47,7 +47,7 @@ RTS_PRIVATE void ghc_rust_schedule_finalizers(Capability *cap, StgWeak *list,
     size_t payload_offset, StgClosure *(*runner)(void),
     void (*prepare_header)(StgWeak *), void (*trace_batch)(StgWord));
 RTS_PRIVATE StgWord ghc_rust_pending_finalizers(void);
-RTS_PRIVATE bool ghc_rust_run_some_finalizers(StgWord limit,
+RTS_PRIVATE bool ghc_rust_run_some_finalizers(bool all,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset,
     bool *(*running_flag)(void), void (*trace_begin)(StgWord),
     void (*trace_end)(StgWord));
@@ -105,8 +105,8 @@ static StgClosure *finalizerBatchRunner(void)
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Rust owns the queue head, count, and drain lock in the Rust RTS. The GC
  * appends and marks only the new list. The idle worker holds the drain lock
- * while it runs C callbacks. C keeps the task flag and traces around that
- * call. Rust uses the same count and lock order as the C path.
+ * while it runs C callbacks. Rust sets and clears the current task's flag.
+ * C supplies the flag address and debug trace hooks.
  */
 #if !defined(USE_RUST_FINALIZERS)
 // List of dead weak pointers collected by the last GC
@@ -325,7 +325,9 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
 // runSomeFinalizers(). This is so that we only tie up the capability
 // for a short time, and respond quickly if new work becomes
 // available.
+#if !defined(USE_RUST_FINALIZERS)
 static const StgWord finalizer_chunk = 100;
+#endif
 
 #if defined(USE_RUST_FINALIZERS)
 static bool *currentFinalizerRunningFlag(void)
@@ -364,7 +366,7 @@ static volatile StgWord finalizer_lock = 0;
 bool runSomeFinalizers(bool all)
 {
 #if defined(USE_RUST_FINALIZERS)
-    return ghc_rust_run_some_finalizers(all ? STG_WORD_MAX : finalizer_chunk,
+    return ghc_rust_run_some_finalizers(all,
         offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
         offsetof(StgCFinalizerList, link), currentFinalizerRunningFlag,
         TRACE_FINALIZER_DRAIN_BEGIN, TRACE_FINALIZER_DRAIN_END);
