@@ -100,6 +100,16 @@ Hadrian now keeps the raw dependencies directly when a source begins with a comm
 
 The changed `GHC.Utils.Misc` producer took 1.40–1.41 s wall in two replays of its actual command. The simplifier accounted for 0.56 s CPU, code generation for 0.34 s, and both interface writes for 0.24 ms. Four output files matched the archived stock hashes. These are compiler-command timings. The linked build also packs the compiler archive, links the shared library and executable, and registers the package.
 
+### Linked rebuild and no-op profiles
+
+A warm linked `-O2` edit on Stage0 `cafe7121a8e6`, worker `df96e32`, and mold ran 54 compile requests and skipped code generation for 53 of them. Shake traced 51 commands for compiler-library modules over an 8.20 s window. Archive creation took 1.36 s and overlapped the 0.96 s shared-library link. Cabal then spent 5.01 s copying the package and 1.14 s computing its ABI hash. Registration recache took 47 ms. The final driver link took 0.30 s. The linked compiler, objects, interfaces and dynamic consumer passed the ordinary-reference checks.
+
+The immediate no-op ran zero builders. Its Shake profile recorded 5,604 `ArgsHash` oracle evaluations, with 8.49 s of summed rule time out of 8.55 s. These durations can overlap. The no-op trace ended at 3.71 s and the command took 6.53 s with profile output enabled. The oracle recomputes the arguments for each target. A cache must also track argument settings that Hadrian reads outside Shake, including the ordered command-line overrides and `hadrian.settings`.
+
+A private Stage0 frontend read the stored ABI fingerprints without loading declarations and instances into the external package state. On Cabal's exact 880-module command, the same executable took a median 0.89 s with direct reads and 1.31 s with the ordinary loader across four alternating pairs. Both modes emitted the same hash as stock GHC. Controls matched for duplicate and reordered modules, an external module, a missing module, dynamic-interface validation and a malformed header. A damaged lazy interface section can require validation beyond the fields read by this experiment. The comparison used the capped GHC queue and shared the host.
+
+A private Hadrian candidate ran package copy and ABI calculation in parallel for the Stage1 compiler library. Shake recorded the entire 1.29 s ABI calculation inside the 5.14 s copy. The registration window fell from 6.20 s to 5.20 s in one forward edit per mode. The full profiled commands took 24.22 s and 21.74 s. Other build phases also varied between runs. Both modes ran the same 54 compile requests, regenerated one dependency row, and matched the checked artifacts and runtime consumer. Both immediate repeats ran zero builders. The experiment used the published worker and kept the two operations private.
+
 ### Development workers at 8ad5a4d
 
 Both stages use `8ad5a4d`. A warm edit of one import in a 956-module graph took **0.582 s versus 10.438 s stock at Stage0 (17.9×)** and **0.619 s versus 23.379 s stock at Stage1 (37.8×)**. The worker reused rendered dependency rows when their paths matched. The release also fixed stale single-file compilation results after package and environment changes. [Raw scan samples](release-8ad5a4d.json)
