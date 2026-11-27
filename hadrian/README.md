@@ -474,6 +474,14 @@ if the build also uses `HADRIAN_COMPILE_CHECK_WORKER`. Fallback compiles
 use the same tuned command. Dependency scans keep their existing RTS block.
 
 
+
+### Concurrent compiler package registration for development builds
+
+Set `HADRIAN_GHC_OVERLAP_REGISTRATION=1` to run the Stage1 compiler library's
+package copy and ABI calculation in parallel. Hadrian writes the package
+configuration and recaches the database after both operations finish.
+Leave the setting unset for final builds.
+
 ### Persistent argument hashes for development builds
 
 Set `HADRIAN_PERSISTENT_ARGS=1` with the explicit flavour

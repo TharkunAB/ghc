@@ -149,6 +149,35 @@ matched in bytes and mode, including the registration and package cache.
 Diagnostics matched. Pueue job 7290 peaked at 1,406 MiB.
 These timings cover the registration phase outside Hadrian.
 
+
+The linked Hadrian comparison used stock Cabal 3.16.0.0, Stage0
+`cafe7121a8e6`, worker `2baf1e8`, mold, persistent arguments and one
+Hadrian capability. Both modes used the same Hadrian executable and ran
+`perf+no_profiled_libs --freeze1 -j3 stage2:exe:ghc-bin` on logical CPUs
+20–23. The forward pair ran sequential registration first. The revert
+pair ran concurrent registration first. Only the separate preparation
+runs used Shake profiling.
+
+| Linked `-O2` rebuild | Sequential | Overlap |
+| --- | ---: | ---: |
+| Change cutoff 32 to 31 | 30.166 s | 21.279 s |
+| Immediate repeat | 4.078 s | 2.923 s |
+| Revert cutoff 31 to 32 | 23.963 s | 20.905 s |
+| Immediate repeat | 4.077 s | 3.826 s |
+
+The edit and revert took **54.129 s sequentially and 42.184 s with overlap**
+(22.1% less time, one sample per cell). Each edit ran 54 compile requests,
+skipped 53 code generations and regenerated one of 943 dependency rows.
+Every immediate repeat ran zero builder actions. All 1,763 installed files,
+the package database, module artifacts, and linked executable and shared
+library matched across the two modes. The dynamic API consumer loaded the
+new library and returned the same result in both modes. Preparation
+profiles recorded 0 s and 5.473 s of overlap, respectively, and recache
+started after both operations. Pueue job 7304 peaked at 4,313 MiB.
+
+Set `HADRIAN_GHC_OVERLAP_REGISTRATION=1` to select the concurrent
+Stage1 compiler registration rule for development builds.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
