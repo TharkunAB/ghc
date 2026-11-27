@@ -3,67 +3,11 @@ use core::mem::{offset_of, size_of};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 core::arch::global_asm!(
-    ".hidden ghc_rust_closure_table_init_growth",
+    ".hidden ghc_rust_closure_table_grow",
     ".hidden ghc_rust_closure_table_init",
     ".hidden ghc_rust_closure_table_mark",
     ".hidden ghc_rust_closure_table_insert",
 );
-
-/// Copy the old closure table data and initialize the new entries.
-///
-/// # Safety
-///
-/// C owns the arrays and has exclusive access to them. The old and new
-/// allocations do not overlap. Their payloads hold the given numbers of
-/// pointer slots, card words, and free-list words. Both old pointers may be
-/// null only when the old capacity is zero. The new capacity is greater than
-/// the old capacity and fits in `c_int`. C checks the word layout.
-#[unsafe(no_mangle)]
-pub(super) unsafe extern "C" fn ghc_rust_closure_table_init_growth(
-    old_payload: *const *mut c_void,
-    new_payload: *mut *mut c_void,
-    old_free: *const usize,
-    new_free: *mut usize,
-    old_capacity: usize,
-    new_capacity: usize,
-    old_card_words: usize,
-    new_card_words: usize,
-    old_free_words: usize,
-    old_free_head: c_int,
-    null_closure: *mut c_void,
-) {
-    if old_capacity != 0 {
-        unsafe {
-            copy_nonoverlapping(old_payload, new_payload, old_capacity);
-            copy_nonoverlapping(old_free, new_free, old_free_words);
-        }
-    }
-    for index in old_capacity..new_capacity {
-        unsafe { new_payload.add(index).write(null_closure) };
-    }
-    if old_card_words != 0 {
-        unsafe {
-            copy_nonoverlapping(
-                old_payload.add(old_capacity),
-                new_payload.add(new_capacity),
-                old_card_words,
-            );
-        }
-    }
-    unsafe {
-        write_bytes(
-            new_payload.add(new_capacity + old_card_words),
-            0,
-            new_card_words - old_card_words,
-        );
-    }
-
-    let free_entries = new_free.cast::<c_int>();
-    for index in old_capacity..new_capacity - 1 {
-        unsafe { free_entries.add(index).write((index + 1) as c_int) };
-    }
-    unsafe { free_entries.add(new_capacity - 1).write(old_free_head) };
-}
 
 // See Note [Closure table Rust layout] in rts/ClosureTable.c.
 #[repr(C)]
@@ -93,6 +37,86 @@ const _: () = {
     );
     assert!(size_of::<ClosureTable>() == 2 * size_of::<*mut c_void>() + 4 * size_of::<c_int>());
 };
+
+unsafe extern "C" {
+    fn allocateMutArrPtrs(
+        cap: *mut c_void,
+        count: usize,
+        init: *mut c_void,
+        ccs: *mut c_void,
+    ) -> *mut c_void;
+    fn allocateArrBytes(cap: *mut c_void, bytes: usize, ccs: *mut c_void) -> *mut c_void;
+    fn mutArrPtrsCardTableSize(count: usize) -> usize;
+    fn recordClosureMutated(cap: *mut c_void, array: *mut c_void);
+}
+
+/// Grow both heap arrays. Publish them only after initialization and GC registration.
+///
+/// # Safety
+///
+/// The caller owns the table and its capability. The offsets are the payload
+/// offsets of StgMutArrPtrs and StgArrBytes for this RTS way.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_closure_table_grow(
+    table: *mut ClosureTable,
+    cap: *mut c_void,
+    capacity: c_int,
+    ccs: *mut c_void,
+    slots_offset: usize,
+    links_offset: usize,
+) -> bool {
+    unsafe {
+        let old_capacity = (*table).capacity;
+        if capacity <= old_capacity {
+            return false;
+        }
+        let new_count = capacity as usize;
+        if new_count > (usize::MAX - (size_of::<usize>() - 1)) / size_of::<c_int>() {
+            return false;
+        }
+        let array = allocateMutArrPtrs(cap, new_count, core::ptr::null_mut(), ccs);
+        if array.is_null() {
+            return false;
+        }
+        let links_array = allocateArrBytes(cap, new_count * size_of::<c_int>(), ccs);
+        if links_array.is_null() {
+            return false;
+        }
+        let slots = array.byte_add(slots_offset).cast::<*mut c_void>();
+        let links = links_array.byte_add(links_offset);
+        let old_count = old_capacity as usize;
+        let old_cards = mutArrPtrsCardTableSize(old_count);
+        let new_cards = mutArrPtrsCardTableSize(new_count);
+        if old_count != 0 {
+            // An empty table points to static sentinels without array payloads.
+            let old_slots = (*table).arr.byte_add(slots_offset).cast::<*mut c_void>();
+            let old_links = (*table).free.byte_add(links_offset).cast::<usize>();
+            copy_nonoverlapping(old_slots, slots, old_count);
+            copy_nonoverlapping(old_slots.add(old_count), slots.add(new_count), old_cards);
+            // Copy complete words, including the padding of an odd-sized free list.
+            let link_words = (old_count * size_of::<c_int>()).div_ceil(size_of::<usize>());
+            copy_nonoverlapping(old_links, links.cast::<usize>(), link_words);
+        }
+        let sentinel = (&raw const stg_CLOSURE_TABLE_NULL_closure)
+            .cast_mut()
+            .cast();
+        for index in old_count..new_count {
+            slots.add(index).write(sentinel);
+        }
+        write_bytes(slots.add(new_count + old_cards), 0, new_cards - old_cards);
+        let next = links.cast::<c_int>();
+        for index in old_count..new_count - 1 {
+            next.add(index).write((index + 1) as c_int);
+        }
+        next.add(new_count - 1).write((*table).free_hd);
+        recordClosureMutated(cap, array);
+        (*table).arr = array;
+        (*table).free_hd = old_capacity;
+        (*table).free = links_array;
+        (*table).capacity = capacity;
+        true
+    }
+}
 
 /// Initialize one table with the C-owned null closure sentinel.
 ///

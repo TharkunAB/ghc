@@ -15,8 +15,9 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * The table fields have the same layout in every RTS way. C checks that
  * layout against the small Rust record. Heap array headers vary by RTS way,
- * so C passes the payload, card, and info slots to Rust for insertion. Rust
- * does not read a heap array header or a Capability.
+ * so C supplies the payload offsets for growth and the slots for insertion.
+ * Rust calls the RTS allocators and registers the new mutable array before
+ * it publishes either array. The RTS retains the capability and heap layouts.
  */
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t),
                   "Closure table word must match Rust usize");
@@ -42,12 +43,9 @@ RTS_PRIVATE int ghc_rust_closure_table_insert(ClosureTable *t, void *v,
                                                StgWord8 *card,
                                                const StgInfoTable **info_slot,
                                                int next_free);
-RTS_PRIVATE void ghc_rust_closure_table_init_growth(
-    StgClosure *const *old_payload, StgClosure **new_payload,
-    const StgWord *old_free, StgWord *new_free,
-    size_t old_capacity, size_t new_capacity,
-    size_t old_card_words, size_t new_card_words,
-    size_t old_free_words, int old_free_head, StgClosure *null_closure);
+RTS_PRIVATE bool ghc_rust_closure_table_grow(
+    ClosureTable *t, Capability *cap, int capacity, CostCentreStack *ccs,
+    size_t slots_offset, size_t links_offset);
 RTS_PRIVATE void ghc_rust_closure_table_remove_sparse(
     ClosureTable *t, StgClosure **slot, int *free_link, int ix);
 RTS_PRIVATE void ghc_rust_closure_table_remove_compact(
@@ -89,15 +87,16 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
      */
     ASSERT(t->compact == ClosureTableCompact ? isFullClosureTable(t) : true);
 
-    /* Stash the old info before we overwrite things */
-    StgMutArrPtrs *oldarr      = t->arr;
-    int            oldcapacity = t->capacity;
-    StgArrBytes   *oldfree     = t->free;
+    ASSERT(newcapacity > t->capacity);
 
-    /* We cannot shrink, and for sanity the caller should only ask us to make
-     * the capacity bigger. The table need not be full however.
-     */
-    ASSERT(newcapacity > oldcapacity);
+#if defined(USE_RUST_CLOSURE_TABLE)
+    return ghc_rust_closure_table_grow(t, cap, newcapacity, CCS_SYSTEM_OR_NULL,
+                                       offsetof(StgMutArrPtrs, payload),
+                                       offsetof(StgArrBytes, payload));
+#else
+    StgMutArrPtrs *oldarr = t->arr;
+    int oldcapacity = t->capacity;
+    StgArrBytes *oldfree = t->free;
 
     /* Keep the free-array size and its word rounding representable. */
     if (newcapacity <= oldcapacity ||
@@ -113,23 +112,9 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
     newfree = allocateArrBytes(cap, arrsize, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(newfree == NULL)) return false;
 
-    /* Note [Closure table growth initialization]
-     * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     * C allocates both arrays and publishes the completed table. Rust copies
-     * the old payload, card words, and free-list words. This copies the old
-     * padding too. Rust then initializes the new entries. C records the
-     * mutable array after initialization. The TSAN build keeps the C path.
-     */
     StgWord oldcardsize = mutArrPtrsCardTableSize(oldcapacity);
     StgWord newcardsize = mutArrPtrsCardTableSize(newcapacity);
     StgWord oldfreesizeW = ROUNDUP_BYTES_TO_WDS((StgWord)oldcapacity * sizeof(int));
-#if defined(USE_RUST_CLOSURE_TABLE)
-    ghc_rust_closure_table_init_growth(
-        oldcapacity == 0 ? NULL : oldarr->payload, newarr->payload,
-        oldcapacity == 0 ? NULL : oldfree->payload, newfree->payload,
-        oldcapacity, newcapacity, oldcardsize, newcardsize, oldfreesizeW,
-        t->free_hd, &stg_CLOSURE_TABLE_NULL_closure);
-#else
     /* Copy the old elements. */
     for (int i = 0; i < oldcapacity; i++) {
         newarr->payload[i] = oldarr->payload[i];
@@ -158,7 +143,6 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
         StgArrBytesAsCInts(newfree)[i] = i+1;
     }
     StgArrBytesAsCInts(newfree)[newcapacity-1] = t->free_hd;
-#endif
 
     /* The new array is dirty. Record it before publishing the table. */
     recordClosureMutated(cap, (StgClosure*)newarr);
@@ -168,6 +152,7 @@ bool enlargeClosureTable(Capability *cap, ClosureTable *t, int newcapacity)
     t->capacity = newcapacity;
 
     return true;
+#endif
 }
 
 int insertClosureTable(Capability *cap STG_UNUSED,
