@@ -13,16 +13,23 @@ rtsRules = priority 3 $ do
     -- to be linked into the rts dll.
     forM_ [Stage1, Stage2, Stage3 ] $ \ stage -> do
         let buildPath = root -/- buildDir (rtsContext stage)
-        buildPath -/- "rust-rts.o" %>
+        buildPath -/- "rust-rts.o" %> \output -> do
+            autoconf <- readFile' (buildPath -/- "include/ghcautoconf.h")
+            let largeAddressSpace = ["#define", "USE_LARGE_ADDRESS_SPACE", "1"]
+                rustCfg
+                    | any ((== largeAddressSpace) . words) (lines autoconf) =
+                        ["--cfg", "ghc_use_large_address_space"]
+                    | otherwise = []
             buildRustRts stage "ghc_rts" "rts/rust/lib.rs"
                 [ "rts/rust/archive_member.rs"
                 , "rts/rust/eventlog_file_writer.rs"
                 , "rts/rust/file_lock.rs"
                 , "rts/rust/gc_budget.rs"
+                , "rts/rust/mblock_extents.rs"
                 , "rts/rust/prim_float.rs"
-                ]
+                ] rustCfg output
         buildPath -/- "rust-rts-profiler-json.o" %>
-            buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" []
+            buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
         buildPath -/- "libHSghc-internal-*.dll.a" %> buildGhcInternalImportLib stage
 
@@ -36,8 +43,8 @@ rtsRustObjects stage way = do
             [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
 
 -- | Compile a Rust RTS crate to a PIC object.
-buildRustRts :: Stage -> String -> FilePath -> [FilePath] -> FilePath -> Action ()
-buildRustRts stage crate source modules output = do
+buildRustRts :: Stage -> String -> FilePath -> [FilePath] -> [String] -> FilePath -> Action ()
+buildRustRts stage crate source modules extraArgs output = do
     rustc <- rtsRustCompiler stage
     when (null rustc) $ fail "The Rust RTS requires --enable-rust-rts."
     _ <- setting RustRtsCompilerVersion
@@ -45,12 +52,12 @@ buildRustRts stage crate source modules output = do
     need (rustc : source : modules)
     createDirectory (takeDirectory output)
     prog <- exeSpawnPath rustc
-    cmdExe prog
+    cmdExe prog $
         [ "--edition=2024", "--crate-name=" ++ crate, "--crate-type=lib"
         , "--target=x86_64-unknown-linux-gnu", "--emit=obj"
         , "-Cpanic=abort", "-Crelocation-model=pic", "-Ccodegen-units=1"
         , "-Copt-level=2", "-o", output, source
-        ]
+        ] ++ extraArgs
 
 buildGhcInternalImportDef :: FilePath -> Action ()
 buildGhcInternalImportDef target = do
