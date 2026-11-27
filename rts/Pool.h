@@ -14,7 +14,8 @@
  * The pool will free resources such that there are at most desired_size
  * resources in the pool when all resources have been released.
  *
- * invariant: desired_size <= max_size
+ * The caller must keep desired_size <= max_size. poolSetDesiredSize does not
+ * clamp its argument. poolSetMaxSize lowers desired_size if necessary.
  *
  */
 

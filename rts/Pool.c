@@ -117,11 +117,17 @@ void poolSetMaxSize(Pool *pool, uint32_t size) {
 }
 
 uint32_t poolGetMaxSize(Pool *pool) {
-    return pool->max_size;
+    ACQUIRE_LOCK(&pool->mutex);
+    uint32_t size = pool->max_size;
+    RELEASE_LOCK(&pool->mutex);
+    return size;
 }
 
 uint32_t poolGetDesiredSize(Pool *pool) {
-    return pool->desired_size;
+    ACQUIRE_LOCK(&pool->mutex);
+    uint32_t size = pool->desired_size;
+    RELEASE_LOCK(&pool->mutex);
+    return size;
 }
 
 // Try taking a PoolEntry with an item from a pool,
@@ -159,8 +165,9 @@ void *poolTryTake(Pool *pool) {
     if (alloc_failed)
         signalCondition(&pool->cond);
 #endif
+    void *thing = ent ? ent->thing : NULL;
     RELEASE_LOCK(&pool->mutex);
-    return ent ? ent->thing : NULL;
+    return thing;
 }
 
 void *poolTake(Pool *pool) {
@@ -185,8 +192,9 @@ void *poolTake(Pool *pool) {
         }
     }
 
+    void *thing = ent->thing;
     RELEASE_LOCK(&pool->mutex);
-    return ent->thing;
+    return thing;
 }
 
 void poolRelease(Pool *pool, void *thing) {
