@@ -1,6 +1,6 @@
 # An incremental Rust port of the GHC RTS
 
-Start with `__decodeFloat_Int` to prove that Hadrian can put a Rust object into a working RTS. Then port the in-process file-lock registry to prove that Rust can own an entire subsystem. Each step should leave a compiler that can build and run ordinary Haskell programs.
+Start with `__decodeFloat_Int` to prove that Hadrian can put a Rust object into a working RTS. Then port the in-process file-lock registry to prove that Rust can own an entire subsystem. Each step should leave a compiler that can build and run ordinary Haskell programs. When the port reveals a bug in the existing C implementation, fix it in a separate C commit first. Add a regression for the failing behavior and compare Rust with the corrected C implementation.
 
 The source baseline is upstream GHC `56bb91d95f89509cb351a5eb4a7406825675866c`. The first target is native `x86_64-unknown-linux-gnu` with Rust 1.100.0. The mixed build is opt-in with `./configure --enable-rust-rts`. GHC normalizes the platform triple to `x86_64-unknown-linux` during configure. The probe uses Autoconf’s `target_cpu` and `target_os` to distinguish the GNU ABI. [Configure](../../configure.ac) · [Rust release history](https://blog.rust-lang.org/releases/)
 
