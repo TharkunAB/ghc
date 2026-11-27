@@ -4,6 +4,41 @@ Use ordinary GHC for final builds. At each development-worker switch, compare wi
 
 ## 27 November 2026
 
+### Development build on this host
+
+Run from a configured GHC development worktree with the matching Stage0 toolchain. The following command queues the linked-compiler workload in Pueue.
+
+```sh
+"$HOME/Code/heavy-management/bin/heavy" --mem 8G --time 20m env \
+  HADRIAN_SINGLE_CAPABILITY=1 \
+  HADRIAN_DEPENDENCY_WORKER="$HOME/Code/ghc-persistent-worker/_build/stage0-bin/current/ghc" \
+  hadrian/build -j3 --flavour=quick --docs=none --freeze1 stage2:exe:ghc-bin
+```
+
+`--freeze1` reuses the existing Stage0 prerequisites for this benchmark. For a final build, use ordinary GHC and leave both environment variables unset.
+
+### Linked rebuild with the Hadrian runtime option
+
+We ran the same `GHC.Cmm.Pipeline` edit and linked-compiler target in three rounds. Each configuration occupied the first, second and third position once. All used the same Hadrian executable and stock Shake 0.19.9. Setting `HADRIAN_SINGLE_CAPABILITY=1` changes the RTS running Hadrian. Shake still has three external job slots. The compiler and worker use their own RTS settings.
+
+| Configuration | Median edit to linked compiler | Median no-op |
+| --- | ---: | ---: |
+| Stock GHC, default Hadrian | 41.26 s | 25.20 s |
+| Stock GHC, one Hadrian capability | 19.64 s | 4.78 s |
+| Worker for scans, one Hadrian capability | 11.67 s | 4.84 s |
+
+Together the changes gave **3.54×** on the edited build. The Hadrian option alone gave **2.10×** on the edit and **5.27×** on the no-op. Each of the nine edits ran one dependency scan, three ordinary module compilations, one archive action, two link actions and one package recache. All nine no-ops ran zero builder actions. The worker regenerated one of 956 rows on each edit it handled. All modes produced the same 17 artifacts, including both dependency files, both GHC libraries and the linked compiler. The optimized consumer also matched stock and returned 156.
+
+We primed each arm with the original source before timing the edit. Across three rounds the primes took a median 40.33 s stock, 19.79 s with the Hadrian setting alone, and 50.38 s with both changes. Switching scanners caused extra package dependency rules to run in some priming builds. Those builds ran 43 actions, including 36 scans. The others ran eight actions, including one scan. During the first combined prime, three external GHC commands overlapped. Archive and link commands overlapped during its measured edit.
+
+The main comparison used four logical CPUs on two physical cores on WSL2. On no-ops, median system CPU dropped from 13.27 s to 0.57 s with the Hadrian option. A diagnostic build that set the capability count directly in Shake reduced median no-op wall time from 26.34 s to 5.00 s across three pairs. Median GC CPU rose from 0.74 s to 1.33 s. This points to time spent outside GC. With stock Shake and one logical CPU from each of four distinct physical cores, three further no-op pairs took **25.21 s** with default settings and **4.90 s** with one capability (5.15×). Both CPU layouts were on the same machine. [Timings, action counts and topology](hadrian-capabilities.json) · [Hadrian option](../../hadrian/src/Main.hs)
+
+### Research priorities
+
+1. **Reuse dependency rows after a worker restart.** Measure how many rows a fresh GHC process can validate on the 956-module graph. Record discovery and validation time alongside the cost of recreating the rows. [Cold dependency scans](#cold-dependency-scans-after-worker-restart)
+2. **Measure the inputs to one optimized Core binding.** Start with `doesDirNameExist` in `GHC.Utils.Misc`. Record the unfoldings and rules consulted during simplification, including unsuccessful lookups. Compare every proposed reuse with a fresh optimization. [Core measurements](#where-optimization-time-survives-a-small-edit)
+3. **Explain the runtime cost in Hadrian.** Profile scheduler activity and kernel waits during the matched one- and three-capability no-ops. Repeat on another machine and at a wider job count before considering a default. The compiler worker and the GHC executable have different allocation and parallelism profiles. [Compiler RTS measurements](#rts-cost-during-compilation)
+
 ### Hadrian dependency caching
 
 Set `HADRIAN_DEPENDENCY_WORKER` to the absolute path of a prepared worker's `ghc` executable for development builds. The retained stage0 compiler on this host uses the following setting.
@@ -18,9 +53,41 @@ Worker `21fb2cf` recognizes Hadrian's `+RTS -O64M -RTS` option and starts a sepa
 
 For the `--flavour=quick` (`-O0`) `GHC.Cmm.Pipeline.o` target, the same type of edit took 14.74 s stock and 2.97 s warm (4.96×). Each arm ran one `-M` and one `-c`. The worker handled the scan, and the ordinary compiler rebuilt the object. The edited interface changed from the primed one. The Makefile, static and dynamic objects, and both interfaces matched between arms. No-op times were 2.23 s and 1.69 s, with zero compiler invocations.
 
-For an optimized rebuild we changed a string on the right-hand side of `cpsTop`, from `Post CPS Cmm` to `Post CPS Cmm pass`. Hadrian appended `stage1.ghc.ghc.hs.opts+=-O2` to the quick flavour. Both actual compilation commands ended with `-O2`. For each arm we restored the same pre-edit Shake database and optimized objects. Across five pairs, stock took a median **16.38 s** and the worker **3.06 s**, a 5.35× ratio of medians (4.97× median paired speedup). No-ops took 1.83 s stock and 1.79 s with the worker. The edited object differed from the primed one. The Makefile, both objects and both interfaces matched stock in all five pairs. Each edit used one dependency scan and one ordinary GHC compilation. The benefit here came from dependency discovery. [Individual edit pairs and hashes](pipeline-o2.json)
+For an optimized rebuild we changed a string on the right-hand side of `cpsTop`, from `Post CPS Cmm` to `Post CPS Cmm pass`. Hadrian appended `stage1.ghc.ghc.hs.opts+=-O2` to the quick flavour. The last optimization flag in each compilation command was `-O2`. For each arm we restored the same pre-edit Shake database and optimized objects. With release `21fb2cf`, across five pairs, stock took a median **16.38 s** and the worker **3.06 s**, a 5.35× ratio of medians (4.97× median paired speedup). No-ops took 1.83 s stock and 1.79 s with the worker. The edited object differed from the primed one. The Makefile, both objects and both interfaces matched stock in all five pairs. Each edit used one dependency scan and one ordinary GHC compilation. The benefit here came from dependency discovery. [Individual edit pairs and hashes](pipeline-o2.json)
 
 The dependency-only and `-O0` measurements above are single pairs on a shared host. All three experiments retained prerequisites outside the target. A complete self-build also runs other package rules and linking.
+
+### Whole compiler target
+
+Hadrian built `stage2:exe:ghc-bin` with `--flavour=quick --freeze1 -j3` in a private copy of GHC 10. It ran the ordinary Stage1 prerequisite and link rules. The stock warm-up after relocating the tree took 405.51 s. We then added `&& splitting_proc_points` to the `cmmOptElimCommonBlks cfg` guard in `GHC.Cmm.Pipeline`. Each measured edit rebuilt the module and two direct importers, the static and dynamic GHC libraries, and the linked compiler.
+
+| Edit with worker 21fb2cf or its stock compiler | Wall time | Dependency scan |
+| --- | ---: | --- |
+| Stock | 48.70 s | Ordinary GHC |
+| Worker after scanning several packages | 59.61 s | Full, 956 modules |
+| Worker with the compiler graph resident | 32.97 s | Partial, 1/956 |
+
+These are single observations. The warm scan reduced end-to-end time by 32.3%. The first worker edit took 22.4% longer than stock. Another package scan can evict the compiler graph from this release's two entries. The full-target trace shows the miss. It does not record the precise eviction or argument change that caused it. Both worker builds matched the stock compiler executable, measured module artifacts and dependency file byte for byte. The resulting compilers built the same optimized test executable, which returned 156.
+
+The no-op took 31.74 s stock and 26.26 s with the warm worker. Neither ran a builder action. A separate Shake timing run at `-j3` put 30.44 of 31.82 s in rule evaluation. The process allocated 11.63 GB and spent 1.24 CPU seconds in GC. One `-j1` no-op completed in 6.12 s. Shake 0.19.9 also changes the number of RTS capabilities with the job count. That experiment varies both at once.
+
+Release `55f502b` retains the two recent scans and can retain one older graph larger than those two combined. This keeps the compiler graph after small package scans. It also tracks the appearance and disappearance of files named by raw, Haskell or CPP-generated source line markers.
+
+We repeated the full-target edit using the revised release. Stock took **42.46 s** and the worker **32.28 s** (1.32×, 24.0% less elapsed time). The worker regenerated 1 of 956 modules on the first measured edit after its cold package scans. Stock and worker no-ops took 26.66 and 25.90 s. Both ran zero builder actions. The priming builds took 46.70 s stock and 62.88 s worker. The scope was the linked GHC executable and its normal Stage1 prerequisites. There was one edit pair, so the timings include host variation.
+
+The linked compiler, both GHC libraries and the static and dynamic object and interface files for all three modules matched stock. The compiler built an optimized consumer whose interface, object and executable also matched. The consumer returned 156. [Whole-target timings and hashes](whole-55f502b.json)
+
+With the same release, we repeated the optimized `GHC.Cmm.Pipeline.o` target experiment. The five alternating pairs took a median **11.86 s stock and 2.49 s warm** (4.76× by medians, 4.86× median paired). Every edit ran one dependency scan and one stock compilation. All five output files matched in all ten runs. The corresponding no-ops took 1.46 s and 1.39 s and ran no compiler. Stock times also changed between releases. Use the matched stock result for each comparison. [Optimized object measurements](pipeline-o2-55f502b.json)
+
+The separate Stage1 worker served the same 956-module compiler dependency graph in a direct command benchmark. After two intervening small scans, one import edit took 26.912 s stock and 0.713 s warm (three-pair medians, 37.7×). The cold times were 27.088 s stock and 26.293 s worker. The warm daemon reached 749 MiB sampled RSS. Both promoted paths also passed response-file, tuned RTS and line-marker checks. Creating or removing a line-marker target refreshed one of three modules. An unchanged repeat reused all three. The Makefile, backup and diagnostics matched stock.
+
+### Cold dependency scans after worker restart
+
+We profiled the Stage1 compiler package's 956-module `-M -include-cpp-deps` command with its stock Stage0 GHC. Dependency discovery allocated 2.64 GB and took 1.40 CPU seconds. The 956 parser calls allocated 15.24 GB and took 9.18 CPU seconds in total. Building the Makefile requires GHC to collect the extra source files that CPP and source line markers name. The uninstrumented process allocated 24.06 GB and took 15.95 CPU seconds. These are compiler-process measurements. Clang implements a separate scanner for directives that affect include dependencies. GHC also reports parse errors through this path. Reusing a previous successful parse requires preserving those diagnostics after an edit. [Clang directive scanner](https://github.com/llvm/llvm-project/blob/main/clang/include/clang/Lex/DependencyDirectivesScanner.h) · [Dependency emitter](../../compiler/GHC/Driver/MakeFile.hs) · [Cold-scan phase totals](cold-scan.json)
+
+Two fresh Stage0 processes produced identical preprocessed-input fingerprints for **852 of 956 modules** with unchanged source. After adding `import GHC.Data.Bool ()` to `GHC.Cmm.Pipeline`, 851 matched. Dependency discovery took 3.52–3.53 s per process. Hashing all 32.6 MB took 37–39 ms. All 104 unchanged-source misses involved CPP output. We compared two 81,552-byte `GHC.hs` buffers directly. Only three PID digits in the filename of a generated header in a CPP line marker differed. The other 103 require separate investigation. This measures the cost and stability of one input to the cache key. Import resolution, diagnostics and output parity also need validation. [Fresh-process measurements](preprocessed-fingerprints.json)
+
+The next worker experiment is a disk cache of successful per-module dependency rows. Start a new daemon, run GHC's dependency discovery and check the discovered edges before reading saved rows. Key the cache on the worker format, exact compiler and libdir, package environment, working directory and arguments. Fingerprint the actual preprocessed Haskell input (`ms_hspp_buf` or `ms_hspp_file`). GHC's `ms_hs_hash` identifies the source before preprocessing. Resolve each import with the fresh Finder, including the selected external interface path. Two installed package layouts can select different prerequisites for the same module name. Check the existence of all recorded line-marker targets, including paths that did not exist. Restart with empty GHC session state. Regenerate rows that produced diagnostics. Initially record which rows the disk cache would have returned and continue to run the ordinary emitter so every predicted hit has a stock comparison. Verify the resulting bytes and diagnostics against stock after restarting the daemon and after changing each input. Include a generated module that begins to shadow an existing import. [Source hashing in the downsweep](../../compiler/GHC/Driver/Downsweep.hs)
 
 ### Reuse inside an edited module
 
@@ -34,7 +101,7 @@ Before Cmm optimization, 55 of 56 nonempty groups had identical printed contents
 
 The stock compiler's eventlog identified 59 timed Cmm pipeline calls. Three received empty groups. In two runs of each source, the 55 matching nonempty groups allocated exactly 7,638,912 bytes. This was 21.3% of the original Cmm pipeline allocation and 3.6% of total code-generation allocation. Their measured spans summed to 4.1–5.4 ms on the original. The single changed group took 78.5% of Cmm pipeline allocation. These timings cap the gross opportunity for skipping these calls on this edit. Cache lookup and validation still take time.
 
-A candidate reuse boundary is `cpsTop`, before the module-wide static reference table pass. Its result includes CAF information and an updated unique supply. A cache must validate or reproduce both, as well as platform settings and optimization flags. Rust's query system tracks dependencies and compares result fingerprints across builds. GHC already supports writing simplified Core to disk with `-fwrite-if-simplified-core`. It stores the result after optimization. To target repeated optimizer work, measure stable groups and phase costs before and during simplification. Validate cross-binding inlining, specialization and rule dependencies against a stock build. [Interface construction](../../compiler/GHC/Iface/Make.hs) [Cmm pipeline](../../compiler/GHC/Cmm/Pipeline.hs) · [Rust incremental compilation](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation-in-detail.html)
+A candidate reuse boundary is `cpsTop`, before the module-wide static reference table pass. Its result includes CAF information and an updated unique supply. A cache must validate or reproduce both, as well as platform settings and optimization flags. Rust's query system tracks dependencies and compares result fingerprints across builds. GHC already supports writing simplified Core to disk with `-fwrite-if-simplified-core`. It stores the result after optimization. To target repeated optimizer work, measure stable groups and phase costs before and during simplification. Validate cross-binding inlining, specialization and rule dependencies against a stock build. [Interface construction](../../compiler/GHC/Iface/Make.hs) · [Cmm pipeline](../../compiler/GHC/Cmm/Pipeline.hs) · [Rust incremental compilation](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation-in-detail.html)
 
 ### Where optimization time survives a small edit
 
@@ -43,6 +110,10 @@ In `GHC.Utils.Misc` we changed the edit-distance helper's `Word32` cutoff from 3
 Of 153 desugared groups, 152 matched after the edit. Of 309 final groups, 308 matched. The only textual difference in each unmatched group was the changed literal. The 1,142 rule-firing records and the printed local rules also matched. Repeated object and interface files agreed within each source version.
 
 The ten simplifier invocations took 3.39–3.69 CPU seconds and allocated 5.405 GB per baseline run. The first invocation alone took 566 ms and allocated 986 MB in the first run. Those are whole-pass costs. To establish the value of a cache, attribute the cost to candidate groups, then record which unfoldings, rewrite rules and other binder information the simplifier actually reads. An unchanged result can depend on a changed optimization input. LLVM ThinLTO includes imported functions and global analysis decisions in its incremental cache key. GHC would need a corresponding account of its own dependencies. [Simplifier iteration](../../compiler/GHC/Core/Opt/Simplify/Iteration.hs) · [ThinLTO design](https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html)
+
+We then instrumented the first simplifier invocation in a separate Stage0 GHC 10 compiler. The stock and uninstrumented relink had identical pass allocation (180.97 MB). The probe added 4.1% allocation. Across four iterations it attributed 158.27 MB to binding groups. Groups with no observed Core change accounted for 150.25 MB (94.9% of attributed allocation). The edited helper itself accounted for 1,024 bytes in iteration one, but the literal also reached `fuzzyLookup`, which accounted for 4.67 MB. The largest unchanged group in that iteration, `doesDirNameExist`, accounted for 15.52 MB. These measurements apply to the Stage0 compiler. The Stage1 timings above use a different build of GHC.
+
+Start by recording successful and failed unfolding and rewrite-rule lookups for one expensive, unchanged nonrecursive binding. Compare the complete result with ordinary simplification on every run. Track floated bindings, substitution, scope, fresh names and simplifier ticks before attempting to skip work. Identical printed output across one edit alone cannot establish cache validity.
 
 ### Cmm assignment sinking
 
@@ -61,6 +132,8 @@ We ran a 200-field consumer with stateful IO actions against each producer. The 
 
 A separate shortcut in Core simplifier rule lookup reduced total compiler allocation by 0.31% on `GHC.Utils.Misc` and 0.27% on `GHC.Data.FastString`. Median CPU times stayed within 1 ms of the controls. We discarded that candidate.
 
+A separate Stage1 experiment compiled only `GHC.Core.Opt.Simplify.Iteration` with `-O2` inside the otherwise quick compiler. Against matched static relinks using the original Stage1 interfaces, the median paired workload savings across four runs were 195 ms for `GHC.Utils.Misc` and 36 ms for `GHC.Data.Bool`. The objects and interfaces matched dynamic stock GHC. Simplifier allocation fell by about 0.7% in both cases. Rebuilding `Iteration` itself took an additional 1.14 s and 53 MiB peak RSS. We kept this as a local experiment because each workload included one nearly flat timing pair.
+
 ### RTS cost during compilation
 
 We ran the retained GHC 10.1.20261115.1 compiler with its own threaded dynamic RTS. Four concurrent processes used four physical cores in one Pueue job with a 2 GiB memory cap and swap disabled. Each process compiled a separate copy of its target. GC CPU is summed across the four processes. Peak memory is sampled for their cgroup.
@@ -73,3 +146,8 @@ We ran the retained GHC 10.1.20261115.1 compiler with its own threaded dynamic R
 The 64 MiB nursery cut median wall time by 5–6%. Timing ranges overlapped. All objects and interfaces matched. The extra 209–216 MiB matters when several builds share a machine. We kept the existing defaults. The [individual samples](2026-11-27.csv) include smaller nursery settings.
 
 In a separate Callgrind run, sequential evacuation in `evacuate1` used 474,394,570 of 3,386,978,025 instructions (14.0%) in the compiler process building `GHC.Data.Bool`. Both artifacts matched the uninstrumented build. Of 8,694,351 pointer classifications, 4,618,238 took the static path. Of 2,540,069 ordinary closure dispatches across 16 targets, the largest target received 743,727. Removing the suspected extra flag load would save at most 0.12% of the routine's instructions. This profile gives little support for specializing one closure type. The `GHC.Cmm.Sink` profile reached its 100 s limit without usable instruction counts. [Evacuation code](../../rts/sm/Evac.c)
+
+
+### Capability count in the worker daemon
+
+A separate test sent four simultaneous compilation requests to one warmed `21fb2cf` Stage0 worker on four physical cores. Each request compiled a different GHC module. With the daemon's default `-N`, the median wall time to finish all four was 9.00 s. Forcing `-N1` took 17.99 s, and `-N2` took 13.84 s. Median sampled daemon RSS peaks were 703, 534 and 625 MiB respectively. All 56 completed module compilations in the recorded trials produced the stock artifacts. The timings use the two complete rounds. A daemon expired during the third. We retained the worker's capability default. Hadrian and the compiler worker run in separate processes. [Worker capability samples](worker-capabilities.json) · [GHC runtime options](https://ghc.gitlab.haskell.org/ghc/doc/users_guide/runtime_control.html)
