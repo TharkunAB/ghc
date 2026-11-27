@@ -47,6 +47,34 @@ RTS_PRIVATE StgWord ghc_rust_drain_c_finalizers(StgWeak **cursor, StgWord limit,
 RTS_PRIVATE StgMutArrPtrs *ghc_rust_make_finalizer_batch(Capability *cap, StgWeak *list,
     StgWord count, CostCentreStack *ccs, size_t finalizer_offset, size_t link_offset,
     size_t payload_offset);
+RTS_PRIVATE StgWord ghc_rust_prepare_finalizers(StgWeak **head, StgWeak *list,
+    StgWord *pending, size_t link_offset, void (*prepare_header)(StgWeak *));
+GHC_STATIC_ASSERT(offsetof(StgWeak, finalizer) + sizeof(void *) ==
+                  offsetof(StgWeak, link), "Rust weak finalizer offset");
+GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t), "Rust pending count width");
+#endif
+
+/* Note [Weak finalizer producer]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The GC owns the new weak list when it calls scheduleFinalizers. Under the
+ * nonmoving collector, an older list can still wait for the idle drain.
+ * Rust appends the new list with a sequentially consistent store. It counts
+ * and marks only the new list, then adds its length to the pending count.
+ * The C callback keeps the assertion and profiling header update in the
+ * native RTS way. Rust stores the DEAD_WEAK info after that callback.
+ */
+#if defined(USE_RUST_FINALIZERS) && (defined(ASSERTS_ENABLED) || defined(PROFILING))
+static void
+prepareDeadWeakHeader(StgWeak *w)
+{
+    ASSERT(w->header.info != &stg_DEAD_WEAK_info);
+#if defined(PROFILING)
+    SET_PROF_HDR((StgClosure *)w, w->header.prof.ccs);
+#endif
+}
+#define PREPARE_DEAD_WEAK_HEADER prepareDeadWeakHeader
+#else
+#define PREPARE_DEAD_WEAK_HEADER NULL
 #endif
 
 // List of dead weak pointers collected by the last GC
@@ -126,9 +154,12 @@ runAllCFinalizers(StgWeak *list)
 void
 scheduleFinalizers(Capability *cap, StgWeak *list)
 {
-    StgWeak *w;
     StgTSO *t;
-    StgWord n, i;
+    StgWord n;
+#if !defined(USE_RUST_FINALIZERS)
+    StgWeak *w;
+    StgWord i;
+#endif
 
     // n_finalizers is not necessarily zero under non-moving collection
     // because non-moving collector does not wait for the list to be consumed
@@ -138,6 +169,10 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     // Append finalizer_list with the new list. TODO: Perhaps cache tail of the
     // list for faster append. NOTE: We can't append `list` here! Otherwise we
     // end up traversing already visited weaks in the loops below.
+#if defined(USE_RUST_FINALIZERS)
+    n = ghc_rust_prepare_finalizers(&finalizer_list, list, &n_finalizers,
+        offsetof(StgWeak, link), PREPARE_DEAD_WEAK_HEADER);
+#else
     StgWeak **tl = &finalizer_list;
     while (*tl) {
         tl = &(*tl)->link;
@@ -178,6 +213,7 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     }
 
     SEQ_CST_ADD(&n_finalizers, i);
+#endif
 
     // No Haskell finalizers to run?
     if (n == 0) return;
