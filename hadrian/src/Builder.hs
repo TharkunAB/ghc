@@ -31,6 +31,7 @@ import Hadrian.Oracles.Path
 import Hadrian.Oracles.TextFile
 import Hadrian.Utilities
 import qualified System.Directory as Dir
+import System.Environment (lookupEnv)
 import System.IO.Error (tryIOError)
 import System.Exit
 import System.IO (IOMode(ReadMode), stderr, withBinaryFile)
@@ -372,6 +373,17 @@ Use an order-only action for the selection. Keep the ordinary dependency
 on the stage compiler.
 -}
 
+-- | Set the compiler nursery for the standard Hadrian RTS block.
+-- Apply this at launch so changing the nursery does not invalidate build products.
+compileNurseryArgs :: [String] -> [String]
+compileNurseryArgs args =
+    case break isRtsMarker args of
+      (before, "+RTS" : "-O64M" : "-RTS" : after)
+        | not (any isRtsMarker after) -> before ++ ["+RTS", "-O64M", "-A64m", "-RTS"] ++ after
+      _ -> args
+  where
+    isRtsMarker arg = arg `elem` ["+RTS", "-RTS", "--RTS", "--"]
+
 -- | Select the check worker. See Note [Compile check worker dependencies].
 compileCheckWorker :: FilePath -> Action (Maybe FilePath)
 compileCheckWorker stageCompiler =
@@ -486,6 +498,12 @@ instance H.Builder Builder where
                 (Ghc CompileHs _, Just _) ->
                     [RemEnv "GHC_WORKER_DEPS_ONLY", AddEnv "GHC_WORKER_CHECK_ONLY" "1"]
                 _ -> []
+        launchArgs <- case (builder, buildInputs) of
+            (Ghc CompileHs Stage1, [source])
+              | "compiler/" `isPrefixOf` source, ".hs" `isSuffixOf` source -> do
+                  enabled <- liftIO $ lookupEnv "HADRIAN_GHC_COMPILE_NURSERY"
+                  pure $ if enabled == Just "1" then compileNurseryArgs buildArgs else buildArgs
+            _ -> pure buildArgs
         prog <- exeSpawnPath (fromMaybe path worker)
         withResources buildResources $ do
             verbosity <- getVerbosity
@@ -553,9 +571,10 @@ instance H.Builder Builder where
                   withResponseFileIfLongCmd
                     output
                     prog
-                    (toCmdArgument buildArgs)
+                    (toCmdArgument launchArgs)
                     buildInputs
-                    (toCmdArgument (buildOptions ++ dependencyWorkerOptions worker ++ modeOptions))
+                    (toCmdArgument (buildOptions ++ dependencyWorkerOptions worker ++ modeOptions
+                        ++ [RemEnv "HADRIAN_GHC_COMPILE_NURSERY"]))
 
                 HsCpp {}    -> captureStdout
 

@@ -462,3 +462,13 @@ Leave the setting unset for final builds. A previously used receipt
 reverts to raw content when the release is disabled or no longer matches.
 The rule still tracks the available static and dynamic interfaces. A missing
 dynamic interface is represented explicitly in the raw receipt.
+
+### Compiler nursery for development builds
+
+Set `HADRIAN_GHC_COMPILE_NURSERY=1` to give Stage1 compiler-package
+compilations of regular Haskell source files under `compiler/` a 64 MiB
+nursery. Hadrian adds `-A64m` to its standard `+RTS -O64M -RTS` block at
+launch. The option can be toggled on a clean target without rebuilding it.
+Use a worker with support for this RTS block, such as `fd8d51d` or later,
+if the build also uses `HADRIAN_COMPILE_CHECK_WORKER`. Fallback compiles
+use the same tuned command. Dependency scans keep their existing RTS block.
