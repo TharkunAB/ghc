@@ -1,5 +1,7 @@
 module Rules.Rts (rtsRules, rtsRustObjects) where
 
+import Hadrian.Oracles.ArgsHash (trackArgsHash)
+import Hadrian.Target (target)
 import Hadrian.Utilities
 import Settings.Builders.Common
 
@@ -31,6 +33,8 @@ rtsRules = priority 3 $ do
             buildRustRts stage "ghc_rts_poll_slots" "rts/rust/poll_slots.rs" [] []
         buildPath -/- "rust-rts-spark-retain.o" %>
             buildRustRts stage "ghc_rts_spark_retain" "rts/rust/spark_retain.rs" [] []
+        buildPath -/- "rust-rts-wsdeque.o" %>
+            buildRustRts stage "ghc_rts_wsdeque" "rts/rust/wsdeque.rs" [] []
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
         buildPath -/- "libHSghc-internal-*.dll.a" %> buildGhcInternalImportLib stage
 
@@ -43,10 +47,17 @@ rtsRustObjects stage way = do
         poll <- if Threaded `wayUnit` way
             then pure False
             else rtsConfigDefines path "IOMGR_BUILD_POLL"
+        rustDeque <- if Threaded `wayUnit` way
+            then do
+                let flags = target (rtsContext stage) (Cabal Flags stage) [] []
+                trackArgsHash flags
+                notElem "thread-sanitizer" <$> interpret flags getArgs
+            else pure False
         pure $ [path -/- "rust-rts.o"]
             ++ [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
             ++ [path -/- "rust-rts-poll-slots.o" | poll]
             ++ [path -/- "rust-rts-spark-retain.o" | Threaded `wayUnit` way]
+            ++ [path -/- "rust-rts-wsdeque.o" | rustDeque]
 
 -- | Check an RTS feature macro in the generated configuration.
 rtsConfigDefines :: FilePath -> String -> Action Bool
