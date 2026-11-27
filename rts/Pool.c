@@ -92,7 +92,7 @@ static void free_available(Pool *pool, uint32_t size) {
 
 void poolSetDesiredSize(Pool *pool, uint32_t size) {
     ACQUIRE_LOCK(&pool->mutex);
-    pool->desired_size = size;
+    RELAXED_STORE(&pool->desired_size, size);
     free_available(pool, size);
     RELEASE_LOCK(&pool->mutex);
 }
@@ -104,9 +104,9 @@ void poolSetMaxSize(Pool *pool, uint32_t size) {
 #if defined(THREADED_RTS)
     uint32_t old_size = pool->max_size;
 #endif
-    pool->max_size = size;
-    if (pool->desired_size > pool->max_size) {
-        pool->desired_size = size;
+    RELAXED_STORE(&pool->max_size, size);
+    if (pool->desired_size > size) {
+        RELAXED_STORE(&pool->desired_size, size);
         free_available(pool, size);
     }
 #if defined(THREADED_RTS)
@@ -116,18 +116,14 @@ void poolSetMaxSize(Pool *pool, uint32_t size) {
     RELEASE_LOCK(&pool->mutex);
 }
 
+/* Callbacks run with the pool mutex held. They can query either limit.
+ * Each query reads one value and does not publish other pool state. */
 uint32_t poolGetMaxSize(Pool *pool) {
-    ACQUIRE_LOCK(&pool->mutex);
-    uint32_t size = pool->max_size;
-    RELEASE_LOCK(&pool->mutex);
-    return size;
+    return RELAXED_LOAD(&pool->max_size);
 }
 
 uint32_t poolGetDesiredSize(Pool *pool) {
-    ACQUIRE_LOCK(&pool->mutex);
-    uint32_t size = pool->desired_size;
-    RELEASE_LOCK(&pool->mutex);
-    return size;
+    return RELAXED_LOAD(&pool->desired_size);
 }
 
 // Try taking a PoolEntry with an item from a pool,

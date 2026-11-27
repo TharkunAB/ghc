@@ -16,6 +16,7 @@
  *
  * The caller must keep desired_size <= max_size. poolSetDesiredSize does not
  * clamp its argument. poolSetMaxSize lowers desired_size if necessary.
+ * The allocation and release callbacks can query either size limit.
  *
  */
 
