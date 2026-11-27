@@ -67,6 +67,10 @@ The previous shared Stage0 worker pointed to a different installation with a mis
 
 The normalized linked edit issued 53 up-to-date compile requests. Forty-eight used CPP and five were boot modules. A private default-CPP check replayed the 48 commands in four paired batches of three clients. The median fell from 3.30 s with ordinary GHC to 2.03 s with the worker. Diagnostics matched. One request delegated in one timed batch. The prototype ran default CPP again through ordinary GHC on an edit that required compilation, so we kept it private.
 
+The existing full-codegen worker ran CPP once per command while replaying the same producer with Hadrian's `-O2 -dynamic-too -fobject-determinism` flags. The original source, an edit, and its reversal each matched all four ordinary GHC artifacts. A separate header fixture matched the warning, the `#line` location of a type error, and the last successful artifacts after that error. The replay redirected outputs to scratch and enabled phase timing. It verifies these two workloads. Hadrian's published build continues to use the check-only worker.
+
+A separate stock replay inserted a header earlier in the CPP include path. The source hash and the old recorded header were unchanged. Fresh GHC selected the new header, discovered a different import and rebuilt. A compiler check that reuses preprocessing must also account for changes in header lookup.
+
 The changed `GHC.Utils.Misc` producer took 1.40–1.41 s wall in two replays of its actual command. The simplifier accounted for 0.56 s CPU, code generation for 0.34 s, and both interface writes for 0.24 ms. Four output files matched the archived stock hashes. These are compiler-command timings. The linked build also packs the compiler archive, links the shared library and executable, and registers the package.
 
 ### Development workers at 8ad5a4d
