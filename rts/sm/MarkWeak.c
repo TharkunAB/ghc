@@ -242,17 +242,22 @@ traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
  * register before calling evacuate and restores the caller's register on
  * return. Rust can then link the weak object into the pending list.
  */
+// The header size depends on the RTS way. The payload contains five pointers.
+#define WEAK_FIELD_OFFSET(field) (offsetof(StgWeak, field) - offsetof(StgWeak, cfinalizers))
+GHC_STATIC_ASSERT(WEAK_FIELD_OFFSET(key) == sizeof(void *) &&
+                  WEAK_FIELD_OFFSET(value) == 2 * sizeof(void *) &&
+                  WEAK_FIELD_OFFSET(finalizer) == 3 * sizeof(void *) &&
+                  WEAK_FIELD_OFFSET(link) == 4 * sizeof(void *), "Rust weak payload layout");
+#undef WEAK_FIELD_OFFSET
 RTS_PRIVATE void ghc_rust_collect_dead_weaks(StgWeak *old, StgWeak **pending,
-    void *gc_thread_ptr, size_t cfinalizers_offset, size_t value_offset,
-    size_t finalizer_offset, size_t link_offset);
+    void *gc_thread_ptr, size_t payload_offset);
 #endif
 
 static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
 {
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
     ghc_rust_collect_dead_weaks(gen->old_weak_ptr_list, dead_weak_ptr_list, gct,
-        offsetof(StgWeak, cfinalizers), offsetof(StgWeak, value),
-        offsetof(StgWeak, finalizer), offsetof(StgWeak, link));
+        offsetof(StgWeak, cfinalizers));
 #else
     StgWeak *w, *next_w;
     for (w = gen->old_weak_ptr_list; w != NULL; w = next_w) {
