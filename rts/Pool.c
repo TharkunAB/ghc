@@ -101,11 +101,18 @@ void poolSetMaxSize(Pool *pool, uint32_t size) {
     ACQUIRE_LOCK(&pool->mutex);
     if (size == 0)
         size = (uint32_t) -1;
+#if defined(THREADED_RTS)
+    uint32_t old_size = pool->max_size;
+#endif
     pool->max_size = size;
     if (pool->desired_size > pool->max_size) {
         pool->desired_size = size;
         free_available(pool, size);
     }
+#if defined(THREADED_RTS)
+    if (size > old_size)
+        broadcastCondition(&pool->cond);
+#endif
     RELEASE_LOCK(&pool->mutex);
 }
 
@@ -174,13 +181,14 @@ void poolRelease(Pool *pool, void *thing) {
                 || ent->flags & FLAG_SHOULD_FREE) {
                 pool->free_fn(ent->thing);
                 stgFree(ent);
+                pool->current_size--;
             } else {
                 ent->next = pool->available;
                 pool->available = ent;
-#if defined(THREADED_RTS)
-                signalCondition(&pool->cond);
-#endif
             }
+#if defined(THREADED_RTS)
+            signalCondition(&pool->cond);
+#endif
 
             RELEASE_LOCK(&pool->mutex);
             return;

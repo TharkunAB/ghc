@@ -9,7 +9,7 @@
  * the pool with pool_take and, when finished can return it to the pool with
  * pool_release. Resources will be lazily allocated with alloc_fn as necessary.
  * If the pool is already at its maximum size when a request is made, pool_take
- * will block until a resource is freed.
+ * will block until a resource is released or the maximum size increases.
  *
  * The pool will free resources such that there are at most desired_size
  * resources in the pool when all resources have been released.
