@@ -15,7 +15,10 @@ rtsRules = priority 3 $ do
         let buildPath = root -/- buildDir (rtsContext stage)
         buildPath -/- "rust-rts.o" %>
             buildRustRts stage "ghc_rts" "rts/rust/lib.rs"
-                ["rts/rust/eventlog_file_writer.rs", "rts/rust/file_lock.rs"]
+                [ "rts/rust/archive_member.rs"
+                , "rts/rust/eventlog_file_writer.rs"
+                , "rts/rust/file_lock.rs"
+                ]
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" []
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
