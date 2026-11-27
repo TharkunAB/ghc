@@ -1,6 +1,7 @@
 #![no_std]
 
 mod adjustor_slots;
+mod alloc_array;
 mod archive_member;
 mod closure_table;
 mod arena;

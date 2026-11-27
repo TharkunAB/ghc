@@ -3,6 +3,17 @@
 
 #include "AllocArray.h"
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_BYTE_ARRAY
+GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t) &&
+                  sizeof(StgArrBytes) % sizeof(StgWord) == 0,
+                  "Rust byte array allocation requires a whole-word header");
+RTS_PRIVATE StgArrBytes *ghc_rust_allocate_byte_array(
+    Capability *cap, StgWord bytes, size_t header_bytes);
+RTS_PRIVATE StgArrBytes *ghc_rust_allocate_pinned_byte_array(
+    Capability *cap, StgWord bytes, StgWord alignment, size_t header_bytes);
+#endif
+
 /* Note [Array allocation sizes]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Reject payloads that cannot fit in the address space with their header.
@@ -75,23 +86,30 @@ StgSmallMutArrPtrs *allocateSmallMutArrPtrs (Capability *cap,
     return arr;
 }
 
+/* The header and allocation counters depend on the current RTS way. */
+static inline StgArrBytes *finishByteArray(StgArrBytes *arr, StgWord bytes,
+                                          CostCentreStack *ccs USED_IF_PROFILING)
+{
+    if (RTS_UNLIKELY(arr == NULL)) return NULL;
+    TICK_ALLOC_PRIM(sizeofW(StgArrBytes), ROUNDUP_BYTES_TO_WDS(bytes), 0);
+    SET_HDR(arr, &stg_ARR_WORDS_info, ccs);
+    arr->bytes = bytes;
+    return arr;
+}
+
 StgArrBytes *allocateArrBytes (Capability *cap,
                                StgWord arrbytes,
                                CostCentreStack *ccs USED_IF_PROFILING)
 {
-    if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
-
-    /* All sizes in words */
-    StgWord arrwords = ROUNDUP_BYTES_TO_WDS(arrbytes);
-    StgWord objsize  = sizeofW(StgArrBytes) + arrwords;
     StgArrBytes *arr;
+#if defined(USE_RUST_BYTE_ARRAY)
+    arr = ghc_rust_allocate_byte_array(cap, arrbytes, sizeof(StgArrBytes));
+#else
+    if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
+    StgWord objsize = sizeofW(StgArrBytes) + ROUNDUP_BYTES_TO_WDS(arrbytes);
     arr = (StgArrBytes *)allocateMightFail(cap, objsize);
-    if (RTS_UNLIKELY(arr == NULL)) return NULL;
-    TICK_ALLOC_PRIM(sizeofW(StgArrBytes), arrwords, 0);
-    /* No write barrier needed since this is a new allocation. */
-    SET_HDR(arr, &stg_ARR_WORDS_info, ccs);
-    arr->bytes = arrbytes;
-    return arr;
+#endif
+    return finishByteArray(arr, arrbytes, ccs);
 }
 
 StgArrBytes *allocateArrBytesPinned (Capability *cap,
@@ -99,23 +117,16 @@ StgArrBytes *allocateArrBytesPinned (Capability *cap,
                                      StgWord alignment,
                                      CostCentreStack *ccs USED_IF_PROFILING)
 {
+    StgArrBytes *arr;
+#if defined(USE_RUST_BYTE_ARRAY)
+    arr = ghc_rust_allocate_pinned_byte_array(cap, arrbytes, alignment, sizeof(StgArrBytes));
+#else
     if (RTS_UNLIKELY(arrbytes > HS_WORD_MAX - sizeof(StgArrBytes))) return NULL;
-
-    /* we always supply at least word-aligned memory, so there's no
-       need to allow extra space for alignment if the requirement is less
-       than a word.  This also prevents mischief with alignment == 0. */
     if (alignment <= sizeof(StgWord)) { alignment = sizeof(StgWord); }
 
-    /* All sizes in words */
-    StgWord arrwords = ROUNDUP_BYTES_TO_WDS(arrbytes);
-    StgWord objsize  = sizeofW(StgArrBytes) + arrwords;
-    StgWord alignoff = sizeof(StgArrBytes); // it's the payload to be aligned
-    StgArrBytes *arr;
-    arr = (StgArrBytes *)allocatePinned(cap, objsize, alignment, alignoff);
-    if (RTS_UNLIKELY(arr == NULL)) return NULL;
-    TICK_ALLOC_PRIM(sizeofW(StgArrBytes), arrwords, 0);
-    /* No write barrier needed since this is a new allocation. */
-    SET_HDR(arr, &stg_ARR_WORDS_info, ccs);
-    arr->bytes = arrbytes;
-    return arr;
+    StgWord objsize = sizeofW(StgArrBytes) + ROUNDUP_BYTES_TO_WDS(arrbytes);
+    /* The payload starts after the header and must satisfy the alignment. */
+    arr = (StgArrBytes *)allocatePinned(cap, objsize, alignment, sizeof(StgArrBytes));
+#endif
+    return finishByteArray(arr, arrbytes, ccs);
 }
