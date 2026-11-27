@@ -22,6 +22,7 @@ mod hash_walk;
 mod pool;
 mod incall;
 mod liveness;
+mod mark_count;
 mod mark_weak;
 #[cfg(ghc_use_large_address_space)]
 mod mblock_extents;

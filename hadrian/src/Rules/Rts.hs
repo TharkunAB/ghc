@@ -63,6 +63,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/hash_walk.rs"
                 , "rts/rust/incall.rs"
                 , "rts/rust/liveness.rs"
+                , "rts/rust/mark_count.rs"
                 , "rts/rust/mark_weak.rs"
                 , "rts/rust/mblock_extents.rs"
                 , "rts/rust/prim_float.rs"

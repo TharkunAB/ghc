@@ -14,6 +14,10 @@
 #include "Trace.h"
 #include "NonMovingCensus.h"
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+RTS_PRIVATE uint32_t ghc_rust_count_nonmoving_marks(const uint8_t *bits, uint32_t n, uint8_t epoch);
+#endif
+
 // N.B. This may miss segments in the event of concurrent mutation (e.g. if a
 // mutator retires its current segment to the filled list).
 //
@@ -49,6 +53,12 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
     {
         census.n_active_segs++;
         unsigned int n = nonmovingSegmentBlockCount(seg);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+        if (!collect_live_words) {
+            census.n_live_blocks += ghc_rust_count_nonmoving_marks(seg->bitmap, n, nonmovingMarkEpoch);
+            continue;
+        }
+#endif
         for (unsigned int i=0; i < n; i++) {
             if (nonmovingGetMark(seg, i) == nonmovingMarkEpoch) {
                 StgClosure *c = (StgClosure *) nonmovingSegmentGetBlock(seg, i);
@@ -65,6 +75,12 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
         Capability *cap = getCapability(cap_n);
         struct NonmovingSegment *seg = cap->current_segments[alloc_idx];
         unsigned int n = nonmovingSegmentBlockCount(seg);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+        if (!collect_live_words) {
+            census.n_live_blocks += ghc_rust_count_nonmoving_marks(seg->bitmap, n, 0);
+            continue;
+        }
+#endif
         for (unsigned int i=0; i < n; i++) {
             if (nonmovingGetMark(seg, i)) {
                 StgClosure *c = (StgClosure *) nonmovingSegmentGetBlock(seg, i);
