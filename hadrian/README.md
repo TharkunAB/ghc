@@ -50,6 +50,17 @@ Using the build system
 Once your first build is successful, simply run `build` to rebuild after some
 changes. Build results are placed into `_build` by default.
 
+#### Checking dependencies with one RTS capability
+
+For incremental builds, set `HADRIAN_SINGLE_CAPABILITY=1` to run Hadrian's
+target action with one GHC RTS capability. The `-j` option still sets the
+number of concurrent Shake jobs. For example, this command allows three
+jobs, including external compiler processes:
+
+```sh
+HADRIAN_SINGLE_CAPABILITY=1 hadrian/build -j3
+```
+
 #### Choosing a build flavour
 
 There are many different ways to build a compiler, each way is called a flavour.

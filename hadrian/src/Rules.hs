@@ -35,8 +35,8 @@ import UserSettings
 
 -- | This rule calls 'need' on all top-level build targets that Hadrian builds
 -- by default, respecting the 'finalStage' flag.
-topLevelTargets :: Rules ()
-topLevelTargets = action $ do
+topLevelTargets :: Action ()
+topLevelTargets = do
     verbosity <- getVerbosity
     forM_ [ Stage1, Stage2, Stage3] $ \stage -> do
       when (verbosity >= Verbose) $ do

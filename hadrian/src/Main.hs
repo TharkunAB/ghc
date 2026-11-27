@@ -8,6 +8,7 @@ import System.Directory (getCurrentDirectory)
 import System.IO
 import System.Exit
 import System.Environment
+import Control.Concurrent (getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities)
 import Control.Exception
 import Data.IORef
 
@@ -58,6 +59,18 @@ main = do
                   (if CommandLine.lookupSkipDepends argsMap
                    then [(RebuildLater, buildRoot -/- "**/.dependencies.mk"), (RebuildLater, buildRoot -/- "**/.dependencies")]
                    else [])
+
+    singleCapability <- (== Just "1") <$> lookupEnv "HADRIAN_SINGLE_CAPABILITY"
+    let buildAction build
+          -- See Note [Hadrian RTS capabilities].
+          | singleCapability && rtsSupportsBoundThreads =
+              action $ actionBracket enter setNumCapabilities (const build)
+          | otherwise = action build
+
+        enter = do
+          previous <- getNumCapabilities
+          setNumCapabilities 1
+          pure previous
 
     cwd <- getCurrentDirectory
     shakeColor <- shouldUseColor
@@ -125,7 +138,6 @@ main = do
             Rules.Changelog.changelogRules
             Rules.SourceDist.sourceDistRules
             Rules.Test.testRules
-            Rules.topLevelTargets
             Rules.toolArgsTarget
 
     -- This IORef is used to communicate the result of shake parsing
@@ -137,10 +149,19 @@ main = do
         writeIORef  shake_opts_var shake_opts
         let targets' = filter (not . null) $ removeKVs targets
         Environment.setupEnvironment
-        return . Just $ (shake_opts, if null targets'
-                                      then rules
-                                      else want targets' >> withoutActions rules)
+        return . Just $ (shake_opts, case targets' of
+            [] -> rules >> buildAction Rules.topLevelTargets
+            _ | singleCapability -> buildAction (need targets') >> withoutActions rules
+              | otherwise -> want targets' >> withoutActions rules)
 
+{- Note [Hadrian RTS capabilities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Shake sets the number of RTS capabilities to the job count before it runs the
+target actions. For incremental builds, a single capability can reduce the
+time Hadrian spends checking dependencies. Set the capability count inside
+the action so that Shake keeps its job pool. Restore the count when the
+action finishes or throws an exception.
+-}
 handleShakeException :: IORef ShakeOptions -> IO a -> IO a
 handleShakeException shake_opts_var shake_run = do
   args <- getArgs
