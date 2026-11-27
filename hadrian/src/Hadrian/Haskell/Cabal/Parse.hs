@@ -254,7 +254,7 @@ resolveContextData context@Context {..} = do
 
     -- Note: the @cPath@ is ignored. The path that's used is the 'buildDir' path
     -- from the local build info @lbi@.
-    pdi <- liftIO $ getHookedBuildInfo [pkgPath package, cPath -/- "build"]
+    pdi <- getHookedBuildInfo [pkgPath package, cPath -/- "build"]
 
     pkgDbPath <- packageDbPath (PackageDbLoc stage iplace)
     let pd'  = C.updatePackageDescription pdi (C.localPkgDescr lbi)
@@ -475,13 +475,17 @@ writeInplacePkgConf context = do
 
 -- | Look for a @.buildinfo@ in all of the specified directories, stopping on
 -- the first one we find.
-getHookedBuildInfo :: [FilePath] -> IO C.HookedBuildInfo
+getHookedBuildInfo :: [FilePath] -> Action C.HookedBuildInfo
 getHookedBuildInfo [] = return C.emptyHookedBuildInfo
 getHookedBuildInfo (baseDir:baseDirs) = do
-    maybeInfoFile <- C.findHookedPackageDesc C.normal Nothing (C.makeSymbolicPath baseDir)
+    -- Track additions and removals in every directory Cabal searches.
+    _ <- getDirectoryFiles baseDir ["*.buildinfo"]
+    maybeInfoFile <- liftIO $ C.findHookedPackageDesc C.normal Nothing (C.makeSymbolicPath baseDir)
     case maybeInfoFile of
         Nothing       -> getHookedBuildInfo baseDirs
-        Just infoFile -> C.readHookedBuildInfo C.silent Nothing infoFile
+        Just infoFile -> do
+            need [C.getSymbolicPath infoFile]
+            liftIO $ C.readHookedBuildInfo C.silent Nothing infoFile
 
 externalPackageDeps :: C.LocalBuildInfo -> [(C.UnitId, C.MungedPackageId)]
 externalPackageDeps lbi =
