@@ -25,7 +25,7 @@ RTS_PRIVATE StgTSO *ghc_rust_top_handler_thread(
     void (*invalid_weak)(StgWeak *, const StgInfoTable *));
 RTS_PRIVATE void ghc_rust_top_handler_exit(void);
 
-#if defined(DEBUG)
+#if defined(ASSERTS_ENABLED)
 static void checkThreadKey(StgTSO *key)
 {
     ASSERT(key && key->header.info == &stg_TSO_info);
