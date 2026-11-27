@@ -133,7 +133,9 @@ unsafe extern "C" fn ghc_rust_stopped_allocator_census(
     }
 }
 
-core::arch::global_asm!(".hidden ghc_rust_sweep_segment");
+core::arch::global_asm!(
+    ".hidden ghc_rust_sweep_segment\n.hidden ghc_rust_clear_segment_free_blocks"
+);
 
 #[repr(u32)]
 enum SweepResult {
@@ -190,6 +192,28 @@ unsafe extern "C" fn ghc_rust_sweep_segment(
             SweepResult::Partial
         } else {
             SweepResult::Free
+        }
+    }
+}
+
+/// Clear the payload of each unmarked block in one nonmoving segment.
+/// The sweep caller clears dead marks before it calls this function.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_clear_segment_free_blocks(
+    seg: *mut u8,
+    block_size: u32,
+    block_count: u32,
+) {
+    let first = first_block(seg, block_count as usize).cast_mut();
+    let marks = unsafe { seg.add(SEG_BITMAP).cast::<AtomicU8>() };
+    for index in 0..block_count as usize {
+        let mark = unsafe { (*marks.add(index)).load(Ordering::Relaxed) };
+        if mark == 0 {
+            unsafe {
+                first
+                    .add(index * block_size as usize)
+                    .write_bytes(0, block_size as usize);
+            }
         }
     }
 }

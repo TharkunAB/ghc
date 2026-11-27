@@ -29,6 +29,9 @@ enum SweepResult {
 RTS_PRIVATE uint32_t ghc_rust_sweep_segment(struct NonmovingSegment *seg, bdescr *bd,
                                             uint16_t block_size, uint16_t block_count,
                                             uint8_t epoch);
+RTS_PRIVATE void ghc_rust_clear_segment_free_blocks(struct NonmovingSegment *seg,
+                                                     uint32_t block_size,
+                                                     uint32_t block_count);
 GHC_STATIC_ASSERT(SEGMENT_FREE == 0 && SEGMENT_PARTIAL == 1 && SEGMENT_FILLED == 2,
                   "Rust sweep result matches enum SweepResult");
 #endif
@@ -139,6 +142,9 @@ void
 nonmovingClearSegmentFreeBlocks(struct NonmovingSegment* seg)
 {
     unsigned int block_size = nonmovingSegmentBlockSize(seg);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    ghc_rust_clear_segment_free_blocks(seg, block_size, nonmovingSegmentBlockCount(seg));
+#else
     for (unsigned int p_idx = 0; p_idx < nonmovingSegmentBlockCount(seg); ++p_idx) {
         // N.B. nonmovingSweepSegment helpfully clears the bitmap entries of
         // dead blocks
@@ -146,6 +152,7 @@ nonmovingClearSegmentFreeBlocks(struct NonmovingSegment* seg)
             memset(nonmovingSegmentGetBlock(seg, p_idx), 0, block_size);
         }
     }
+#endif
 }
 
 GNUC_ATTR_HOT void nonmovingSweep(void)
