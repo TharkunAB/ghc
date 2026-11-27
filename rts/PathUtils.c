@@ -10,6 +10,7 @@
 #if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && !defined(TSAN_ENABLED)
 RTS_PRIVATE pathchar *ghc_rust_pathdir(const pathchar *path);
 RTS_PRIVATE pathchar *ghc_rust_pathdup(const pathchar *path);
+RTS_PRIVATE HsBool ghc_rust_ends_with_path(const pathchar *base, const pathchar *str);
 #endif
 #if defined(mingw32_HOST_OS)
 /* Using Secure APIs */
@@ -78,7 +79,11 @@ pathchar* mkPath(const char* path)
 }
 
 HsBool endsWithPath(const pathchar* base, const pathchar* str) {
+#if defined(USE_RUST_RTS) && defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && !defined(TSAN_ENABLED)
+    return ghc_rust_ends_with_path(base, str);
+#else
     size_t blen = pathlen(base);
     size_t slen = pathlen(str);
     return (blen >= slen) && (0 == pathcmp(base + blen - slen, str));
+#endif
 }

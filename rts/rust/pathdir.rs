@@ -23,6 +23,21 @@ pub unsafe extern "C" fn ghc_rust_pathdup(path: *const c_char) -> *mut c_char {
     result
 }
 
+/// Test whether a POSIX path ends with the given bytes.
+///
+/// # Safety
+///
+/// `base` and `suffix` must point to NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ghc_rust_ends_with_path(
+    base: *const c_char,
+    suffix: *const c_char,
+) -> isize {
+    let base = unsafe { CStr::from_ptr(base) }.to_bytes();
+    let suffix = unsafe { CStr::from_ptr(suffix) }.to_bytes();
+    if base.ends_with(suffix) { 1 } else { 0 }
+}
+
 /// Return the POSIX parent path with one trailing slash.
 ///
 /// # Safety
