@@ -46,6 +46,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/stable_ptr.rs"
                 , "rts/rust/static_ptr_table.rs"
                 , "rts/rust/suspended_calls.rs"
+                , "rts/rust/sweep.rs"
                 , "rts/rust/thread_label.rs"
                 , "rts/rust/timeout_queue.rs"
                 , "rts/rust/top_handler.rs"

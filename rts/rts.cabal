@@ -50,6 +50,7 @@ extra-source-files:
     rust/stable_ptr.rs
     rust/static_ptr_table.rs
     rust/suspended_calls.rs
+    rust/sweep.rs
     rust/thread_label.rs
     rust/timeout_queue.rs
     rust/top_handler.rs
