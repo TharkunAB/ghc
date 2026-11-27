@@ -38,6 +38,21 @@ static void enlargeStableNameTable(void);
 
 static HashTable *addrToStableHash = NULL;
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_STABLE_NAME_TABLE 1
+RTS_PRIVATE void ghc_rust_init_stable_name_table(snEntry **table,
+                                                 snEntry **free,
+                                                 size_t count);
+RTS_PRIVATE void ghc_rust_grow_stable_name_table(snEntry **table,
+                                                 snEntry **free,
+                                                 size_t old_count);
+RTS_PRIVATE void ghc_rust_exit_stable_name_table(snEntry **table);
+RTS_PRIVATE StgWord ghc_rust_reserve_stable_name(snEntry *table,
+                                                snEntry **free,
+                                                HashTable *hash,
+                                                StgPtr addr);
+#endif
+
 void
 stableNameLock(void)
 {
@@ -55,6 +70,7 @@ stableNameUnlock(void)
  * Initialising the table
  * -------------------------------------------------------------------------- */
 
+#if !defined(USE_RUST_STABLE_NAME_TABLE)
 STATIC_INLINE void
 initSnEntryFreeList(snEntry *table, uint32_t n, snEntry *free)
 {
@@ -67,12 +83,17 @@ initSnEntryFreeList(snEntry *table, uint32_t n, snEntry *free)
   }
   stable_name_free = table;
 }
+#endif
 
 void
 initStableNameTable(void)
 {
     if (SNT_size > 0) return;
     SNT_size = INIT_SNT_SIZE;
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+    ghc_rust_init_stable_name_table(&stable_name_table, &stable_name_free,
+                                    INIT_SNT_SIZE);
+#else
     stable_name_table = stgMallocBytes(SNT_size * sizeof(snEntry),
                                        "initStableNameTable");
     /* we don't use index 0 in the stable name table, because that
@@ -80,6 +101,7 @@ initStableNameTable(void)
      * return NULL if an entry isn't found in the hash table.
      */
     initSnEntryFreeList(stable_name_table + 1,INIT_SNT_SIZE-1,NULL);
+#endif
     addrToStableHash = allocHashTable();
 
 #if defined(THREADED_RTS)
@@ -102,12 +124,17 @@ enlargeStableNameTable(void)
         barf("enlargeStableNameTable: stable name table size overflow");
     }
     SNT_size *= 2;
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+    ghc_rust_grow_stable_name_table(&stable_name_table, &stable_name_free,
+                                    old_SNT_size);
+#else
     stable_name_table =
         stgReallocBytes(stable_name_table,
                         SNT_size * sizeof(snEntry),
                         "enlargeStableNameTable");
 
     initSnEntryFreeList(stable_name_table + old_SNT_size, old_SNT_size, NULL);
+#endif
 }
 
 
@@ -122,9 +149,13 @@ exitStableNameTable(void)
         freeHashTable(addrToStableHash, NULL);
     addrToStableHash = NULL;
 
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+    ghc_rust_exit_stable_name_table(&stable_name_table);
+#else
     if (stable_name_table)
         stgFree(stable_name_table);
     stable_name_table = NULL;
+#endif
     SNT_size = 0;
 
 #if defined(THREADED_RTS)
@@ -135,13 +166,6 @@ exitStableNameTable(void)
 #if defined(USE_RUST_RTS)
 RTS_PRIVATE void ghc_rust_free_stable_name(snEntry *entry, snEntry **free,
                                           HashTable *hash);
-#endif
-
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
-RTS_PRIVATE StgWord ghc_rust_reserve_stable_name(snEntry *table,
-                                                snEntry **free,
-                                                HashTable *hash,
-                                                StgPtr addr);
 #endif
 
 void
@@ -236,7 +260,7 @@ makeStableName (Capability *cap, StgPtr p,
       return sn_obj;
     }
   } else {
-#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#if defined(USE_RUST_STABLE_NAME_TABLE)
     sn = ghc_rust_reserve_stable_name(stable_name_table, &stable_name_free,
                                       addrToStableHash, p);
 #else

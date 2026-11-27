@@ -1,16 +1,96 @@
-use core::{ffi::c_void, mem::size_of, ptr};
+use core::{
+    ffi::{c_char, c_void},
+    mem::size_of,
+    ptr,
+};
 
 use super::hash_api::{
     HashTable, allocHashTable, freeHashTable, insertHashTable, keyCountHashTable, removeHashTable,
 };
 
-core::arch::global_asm!(".hidden ghc_rust_reserve_stable_name");
+core::arch::global_asm!(
+    ".hidden ghc_rust_init_stable_name_table",
+    ".hidden ghc_rust_grow_stable_name_table",
+    ".hidden ghc_rust_exit_stable_name_table",
+    ".hidden ghc_rust_reserve_stable_name",
+);
+
+unsafe extern "C" {
+    fn stgMallocBytes(size: usize, label: *const c_char) -> *mut c_void;
+    fn stgReallocBytes(allocation: *mut c_void, size: usize, label: *const c_char) -> *mut c_void;
+    fn stgFree(allocation: *mut c_void);
+}
 
 #[repr(C)]
 pub(super) struct Entry {
     addr: *mut c_void,
     old: *mut c_void,
     sn_obj: *mut c_void,
+}
+
+/// Allocate the first table. Slot zero stays unused.
+/// C initializes the hash table and mutex after this call.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_init_stable_name_table(
+    table: *mut *mut Entry,
+    head: *mut *mut Entry,
+    count: usize,
+) {
+    unsafe {
+        let first = stgMallocBytes(count * size_of::<Entry>(), c"initStableNameTable".as_ptr())
+            .cast::<Entry>();
+        table.write(first);
+        let free = first.add(1);
+        link_free_entries(free, count - 1);
+        head.write(free);
+    }
+}
+
+/// Grow an exhausted table. C holds the table mutex and checks size overflow.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_grow_stable_name_table(
+    table: *mut *mut Entry,
+    head: *mut *mut Entry,
+    old_count: usize,
+) {
+    unsafe {
+        let grown = stgReallocBytes(
+            table.read().cast(),
+            2 * old_count * size_of::<Entry>(),
+            c"enlargeStableNameTable".as_ptr(),
+        )
+        .cast::<Entry>();
+        table.write(grown);
+        let free = grown.add(old_count);
+        link_free_entries(free, old_count);
+        head.write(free);
+    }
+}
+
+/// Free the table at shutdown. C frees the hash table first.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_exit_stable_name_table(table: *mut *mut Entry) {
+    unsafe {
+        let current = table.read();
+        if !current.is_null() {
+            stgFree(current.cast());
+        }
+        table.write(ptr::null_mut());
+    }
+}
+
+/// Link a new range in ascending slot order.
+unsafe fn link_free_entries(first: *mut Entry, count: usize) {
+    let mut next = ptr::null_mut();
+    for index in (0..count).rev() {
+        let slot = unsafe { first.add(index) };
+        unsafe {
+            (*slot).addr = next;
+            (*slot).old = ptr::null_mut();
+            (*slot).sn_obj = ptr::null_mut();
+        }
+        next = slot.cast();
+    }
 }
 
 /// Take one free slot and add its address to the index.
