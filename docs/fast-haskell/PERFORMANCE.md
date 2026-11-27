@@ -178,6 +178,36 @@ started after both operations. Pueue job 7304 peaked at 4,313 MiB.
 Set `HADRIAN_GHC_OVERLAP_REGISTRATION=1` to select the concurrent
 Stage1 compiler registration rule for development builds.
 
+
+### Reuse stripped static archive members
+
+A private replay matched all 883 members of the Stage1 GHC archive to
+their original build objects by name, size and content. The recovered
+order preserved duplicate basenames. GNU ar reproduced the original
+build archive byte for byte. Stripping each object and packing the
+results reproduced GNU strip's installed archive, including the symbol
+index and member headers.
+
+For timing, an ordinary Stage0 compile reproduced all four artifacts
+of the linked `GHC.Utils.Misc` cutoff edit. One static member changed.
+The stock arm stripped the complete raw archive. The candidate checked
+the input and cached member stamps, stripped the changed object and
+repacked all 883 members. The initial cache fill and production of the
+raw build archive were outside both timed arms.
+
+| Static archive installation | GNU strip | Reuse stripped members |
+| --- | ---: | ---: |
+| Change cutoff 32 to 31 | 3.087 s | 1.196 s |
+| Revert cutoff 31 to 32 | 3.243 s | 1.342 s |
+| Edit and revert per round | 6.237 s | 2.584 s |
+
+The two operations together took 58.6% less time at the median over four
+rounds. The candidate won seven of eight individual comparisons. The
+forward pair ran stock first and the reverse pair ran the candidate first.
+All installed archives matched in bytes and mode. Pueue job 7350 peaked
+at 1,456 MiB. This replay measured static archive preparation independently
+of Hadrian and the rest of the package copy.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
@@ -198,6 +228,25 @@ install -d -m 700 "$PWD/_build/worker-cpp-cache"
 The active shared Stage1 worker `fd8d51d` uses GHC 10.1.20261115.1 (executable SHA-256 prefix `aac58b24`). It ran the 956-module dependency command in 0.577 s unchanged and 0.617 s after a one-import edit. The old worker `2a5a1d0` took 0.589 and 0.608 s in the same test. These are medians from six warm samples per worker per case. Ordinary GHC took 23.284 and 23.498 s in one reference run per case. The edit command was 38.1× faster and regenerated one row. All Makefiles, backups and diagnostics matched ordinary GHC.
 
 The release also handles an up-to-date `-c -dynamic-too` command with Hadrian's optional `+RTS -O64M -A64m -RTS` block. Across six warm samples per executable on a single-file fixture, ordinary GHC took 210.1 ms, the previous worker took 209.4 ms, and the new worker took 19.6 ms at the median (10.7× versus ordinary GHC). A required compile delegated once with the original arguments and reproduced all four artifacts byte for byte.
+
+### Shared Stage0 worker 3c6ed41
+
+With a full positive CPP store and a held-out graph, the shared Stage0
+worker's fresh-daemon restart took **4.981 s versus 7.871 s** with
+`8a03b68` (36.7% less time). Stock GHC `cafe7121a8e6` took 16.024 s
+and 13.914 s. The first request against the full store took 7.924 s
+versus 7.773 s. Two normal populated-cache pairs gave medians of
+5.479 s and 5.575 s, respectively.
+
+The four alternating full-store pairs used the exact 943-module command.
+The fixture put real header lists under 5,193 synthetic historical keys
+and left 180 bytes free. The new worker retained the 104 current records
+and reused all of them at restart. The previous worker reused zero.
+Both reused 835 empty certificates and produced the stock dependency
+files, backups, stdout and diagnostics. All 1,068 watched inputs stayed
+stable. Pueue job 7345 peaked at 563 MiB. Release smoke also covered
+compile fallback, diagnostics, capacity and concurrent writes. The
+opt-in v3 store starts in a separate file.
 
 ### Shared Stage0 worker ad8a24f
 
