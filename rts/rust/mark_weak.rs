@@ -8,6 +8,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_collect_fresh_weaks",
     ".hidden ghc_rust_init_weak_generations",
     ".hidden ghc_rust_traverse_weaks",
+    ".hidden ghc_rust_resurrect_unreachable_threads",
 );
 
 unsafe extern "C" {
@@ -156,6 +157,44 @@ unsafe extern "C" fn ghc_rust_mark_weak_list(
             let moved = slot.read().add(payload_offset).cast::<WeakPayload>();
             slot = &raw mut (*moved).link;
         }
+    }
+}
+
+// Keep the original next link before marking. The root slot can move a live TSO.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_resurrect_unreachable_threads(
+    old: *mut *mut u8,
+    resurrected: *mut *mut u8,
+    gc_thread: *mut c_void,
+    end: *mut u8,
+    link_offset: usize,
+    what_next_offset: usize,
+    killed: u16,
+    complete: u16,
+) -> bool {
+    unsafe {
+        let mut tso = old.read();
+        let mut found = false;
+        while tso != end {
+            let link = tso.add(link_offset).cast::<*mut u8>();
+            let next = link.read();
+            let what_next = tso.add(what_next_offset).cast::<u16>().read();
+            if what_next == killed || what_next == complete {
+                link.write(end);
+            } else {
+                let mut moved = tso;
+                mark_root(gc_thread, &raw mut moved);
+                moved
+                    .add(link_offset)
+                    .cast::<*mut u8>()
+                    .write(resurrected.read());
+                resurrected.write(moved);
+                found = true;
+            }
+            tso = next;
+        }
+        old.write(end);
+        found
     }
 }
 

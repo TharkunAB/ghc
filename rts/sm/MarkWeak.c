@@ -306,6 +306,10 @@ GHC_STATIC_ASSERT(WEAK_FIELD_OFFSET(key) == sizeof(void *) &&
 #undef WEAK_FIELD_OFFSET
 RTS_PRIVATE void ghc_rust_collect_dead_weaks(StgWeak *old, StgWeak **pending,
     void *gc_thread_ptr, size_t payload_offset);
+RTS_PRIVATE bool ghc_rust_resurrect_unreachable_threads(StgTSO **old,
+    StgTSO **resurrected, void *gc_thread_ptr, StgTSO *end,
+    size_t link_offset, size_t what_next_offset,
+    StgWord16 killed, StgWord16 complete);
 RTS_PRIVATE void ghc_rust_mark_weak_list(StgWeak **head, void *gc_thread_ptr,
     size_t payload_offset, void (*check)(StgWeak *));
 GHC_STATIC_ASSERT(offsetof(Capability, weak_ptr_list_tl) ==
@@ -343,6 +347,12 @@ static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
  */
 static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads)
 {
+#if defined(USE_RUST_WEAK_GC)
+    return ghc_rust_resurrect_unreachable_threads(&gen->old_threads,
+        resurrected_threads, gct, END_TSO_QUEUE,
+        offsetof(StgTSO, global_link), offsetof(StgTSO, what_next),
+        ThreadKilled, ThreadComplete);
+#else
     StgTSO *t, *next;
     bool flag = false;
 
@@ -376,6 +386,7 @@ static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_t
 
     gen->old_threads = END_TSO_QUEUE;
     return flag;
+#endif
 }
 
 /*
