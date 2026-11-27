@@ -32,7 +32,7 @@ static void enlargeStableNameTable(void);
 
 /*
  * This hash table maps Haskell objects to stable names, so that every
- * call to lookupStableName on a given object will return the same
+ * call to makeStableName on a given object will return the same
  * stable name.
  */
 
@@ -187,8 +187,22 @@ removeIndirections (StgClosure* p)
     }
 }
 
-StgWord
-lookupStableName (StgPtr p)
+/* Note [Stable name creation]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Keep stable_name_mutex locked from the table lookup through publication of
+ * sn_obj. enlargeStableNameTable can move the table. Thus, no thread can keep
+ * an entry pointer or index while another thread changes the table. The lock
+ * also makes one thread responsible for the StgStableName allocation.
+ *
+ * The caller must perform its heap check before this function. allocate does
+ * not collect. This is required because the collector treats an entry with a
+ * NULL sn_obj as free. See #15906. Initialize the closure and its index before
+ * the release store publishes sn_obj.
+ */
+
+StgClosure *
+makeStableName (Capability *cap, StgPtr p,
+                CostCentreStack *ccs USED_IF_PROFILING)
 {
   stableNameLock();
 
@@ -209,22 +223,31 @@ lookupStableName (StgPtr p)
   if (sn != 0) {
     ASSERT(stable_name_table[sn].addr == p);
     debugTrace(DEBUG_stable, "cached stable name %" FMT_Word " at %p", sn, p);
-    stableNameUnlock();
-    return sn;
+    StgClosure *sn_obj = stable_name_table[sn].sn_obj;
+    if (sn_obj != NULL) {
+      stableNameUnlock();
+      return sn_obj;
+    }
+  } else {
+    sn = stable_name_free - stable_name_table;
+    stable_name_free  = (snEntry*)(stable_name_free->addr);
+    stable_name_table[sn].addr = p;
+    stable_name_table[sn].sn_obj = NULL;
+    /* debugTrace(DEBUG_stable, "new stable name %d at %p\n",sn,p); */
+
+    /* add the new stable name to the hash table */
+    insertHashTable(addrToStableHash, (W_)p, (void *)sn);
   }
 
-  sn = stable_name_free - stable_name_table;
-  stable_name_free  = (snEntry*)(stable_name_free->addr);
-  stable_name_table[sn].addr = p;
-  stable_name_table[sn].sn_obj = NULL;
-  /* debugTrace(DEBUG_stable, "new stable name %d at %p\n",sn,p); */
-
-  /* add the new stable name to the hash table */
-  insertHashTable(addrToStableHash, (W_)p, (void *)sn);
+  // See Note [Stable name creation].
+  StgStableName *sn_obj = (StgStableName *)allocate(
+      cap, sizeofW(StgStableName));
+  SET_HDR(sn_obj, &stg_STABLE_NAME_info, ccs);
+  sn_obj->sn = sn;
+  RELEASE_STORE(&stable_name_table[sn].sn_obj, (StgClosure *)sn_obj);
 
   stableNameUnlock();
-
-  return sn;
+  return (StgClosure *)sn_obj;
 }
 
 /* -----------------------------------------------------------------------------

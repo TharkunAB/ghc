@@ -44,7 +44,6 @@ import CLOSURE g0;
 import CLOSURE large_alloc_lim;
 import CLOSURE n_capabilities;
 import CLOSURE sleeping_queue;
-import CLOSURE stable_name_table;
 import CLOSURE stable_ptr_table;
 import CLOSURE stg_AP_STACK_info;
 import CLOSURE stg_AP_info;
@@ -70,7 +69,6 @@ import CLOSURE stg_NO_TREC_closure;
 import CLOSURE stg_SMALL_MUT_ARR_PTRS_DIRTY_info;
 import CLOSURE stg_SMALL_MUT_ARR_PTRS_FROZEN_CLEAN_info;
 import CLOSURE stg_SMALL_MUT_ARR_PTRS_FROZEN_DIRTY_info;
-import CLOSURE stg_STABLE_NAME_info;
 import CLOSURE stg_TREC_HEADER_info;
 import CLOSURE stg_TVAR_DIRTY_info;
 import CLOSURE stg_WEAK_info;
@@ -2208,35 +2206,11 @@ stg_tryReadMVarzh ( P_ mvar, /* :: MVar a */ )
 
 stg_makeStableNamezh ( P_ obj )
 {
-    W_ index, sn_obj;
+    W_ sn_obj;
 
     MAYBE_GC_P(stg_makeStableNamezh, obj);
 
-    (index) = ccall lookupStableName(obj "ptr");
-
-    /* Is there already a StableName for this heap object?
-     *  stable_name_table is a pointer to an array of snEntry structs.
-     */
-    sn_obj = %acquire snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry);
-    if (sn_obj  == NULL) {
-        // At this point we have a snEntry, but it doesn't look as used to the
-        // GC yet because we don't have a StableName object for the sn_obj field
-        // (remember that sn_obj == NULL means the entry is free). So if we call
-        // GC here we end up skipping the snEntry in gcStableNameTable(). This
-        // caused #15906. Solution: use allocate(), which does not call GC.
-        //
-        // (Alternatively we could use a special value for the sn_obj field to
-        // indicate that the entry is being allocated and not free, but that's
-        // too complicated and doesn't buy us much. See D5342?id=18700.)
-        ("ptr" sn_obj) = ccall allocate(MyCapability() "ptr",
-                                        BYTES_TO_WDS(SIZEOF_StgStableName));
-        SET_HDR(sn_obj, stg_STABLE_NAME_info, CCCS);
-        StgStableName_sn(sn_obj) = index;
-        // This will make the StableName# object visible to other threads;
-        // be sure that its completely visible to other cores.
-        // See Note [Heap memory barriers] in SMP.h.
-        %release snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry) = sn_obj;
-    }
+    ("ptr" sn_obj) = ccall makeStableName(MyCapability() "ptr", obj "ptr", CCCS);
 
     return (sn_obj);
 }

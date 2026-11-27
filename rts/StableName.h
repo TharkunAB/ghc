@@ -13,7 +13,8 @@
 void    initStableNameTable   ( void );
 void    freeSnEntry           ( snEntry *sn );
 void    exitStableNameTable   ( void );
-StgWord lookupStableName      ( StgPtr p );
+StgClosure *makeStableName    ( Capability *cap, StgPtr p,
+                                CostCentreStack *ccs );
 
 void    rememberOldStableNameAddresses ( void );
 
