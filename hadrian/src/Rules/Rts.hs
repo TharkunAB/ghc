@@ -38,7 +38,7 @@ rtsRules = priority 3 $ do
                     layoutPath <- liftIO $ makeAbsolute layout
                     let modules = if stem == "closure-size"
                             then ["rts/rust/compact.rs", "rts/rust/nonmoving.rs"]
-                            else []
+                            else ["rts/rust/mutable_list.rs"]
                     buildRustRtsWithEnv [AddEnv layoutEnv layoutPath]
                         stage ("ghc_rts_" ++ crate) ("rts/rust/" ++ crate ++ ".rs") modules [] output
         buildPath -/- "rust-rts.o" %> \output -> do

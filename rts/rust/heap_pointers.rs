@@ -4,6 +4,7 @@ use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 include!(env!("HEAP_POINTER_LAYOUT_RS"));
+mod mutable_list;
 core::arch::global_asm!(
     ".hidden ghc_rust_collect_pointers\n.hidden ghc_rust_heap_view_closure_ptrs"
 );

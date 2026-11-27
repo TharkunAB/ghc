@@ -208,6 +208,19 @@ GNUC_ATTR_HOT void nonmovingSweep(void)
 #endif
 }
 
+/* Note [Nonmoving mutable-list sweep]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * All capabilities are stopped. For each capability, install a fresh list
+ * before scanning the old blocks. Check liveness before inspecting a closure's
+ * info table. Record each live, dirty closure in the order of the old slots.
+ * Release the old blocks after all entries have been visited.
+ *
+ * Rust appends directly while the fresh block has room. C allocates and links
+ * a new block on rollover. With a reserved heap range, release builds compare
+ * the pointer with the range before reading its block descriptor. Other builds
+ * use the native heap membership test and its assertions.
+ */
+
 /* Must a closure remain on the mutable list?
  *
  * A closure must remain if any of the following applies:
@@ -215,6 +228,33 @@ GNUC_ATTR_HOT void nonmovingSweep(void)
  *  1. it contains references to a younger generation
  *  2. it's a mutable closure (e.g. mutable array or MUT_PRIM)
  */
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+RTS_PRIVATE bool ghc_c_mut_list_pointer_clean(StgClosure *ptr);
+RTS_PRIVATE bool ghc_c_mut_list_alive_checked(StgClosure *closure);
+RTS_PRIVATE void ghc_c_record_mutable(StgClosure *closure, Capability *cap);
+RTS_PRIVATE void ghc_rust_sweep_mut_list_blocks(bdescr *old, Capability *cap,
+                                                StgWord heap_begin, StgWord heap_end,
+                                                generation *oldest,
+                                                bdescr **active_list);
+
+RTS_PRIVATE bool ghc_c_mut_list_pointer_clean(StgClosure *ptr)
+{
+    return !HEAP_ALLOCED(ptr) || Bdescr((StgPtr)ptr)->gen == oldest_gen;
+}
+
+RTS_PRIVATE bool ghc_c_mut_list_alive_checked(StgClosure *closure)
+{
+    ASSERT(Bdescr((StgPtr)closure)->gen == oldest_gen);
+    return nonmovingIsAlive(closure);
+}
+
+RTS_PRIVATE void ghc_c_record_mutable(StgClosure *closure, Capability *cap)
+{
+    recordMutableCap(closure, cap, oldest_gen->no);
+}
+#endif
+
+#if !defined(USE_RUST_RTS) || defined(TSAN_ENABLED)
 static bool is_closure_clean(StgClosure *p)
 {
     const StgInfoTable *info = get_itbl(p);
@@ -327,6 +367,7 @@ dirty_BLOCKING_QUEUE:
     }
 #undef CLEAN
 }
+#endif
 
 /* N.B. This happens during the pause so we own all capabilities. */
 void nonmovingSweepMutLists(void)
@@ -335,6 +376,18 @@ void nonmovingSweepMutLists(void)
         Capability *cap = getCapability(n);
         bdescr *old_mut_list = cap->mut_lists[oldest_gen->no];
         cap->mut_lists[oldest_gen->no] = allocBlockOnNode_lock(cap->node);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#if defined(USE_LARGE_ADDRESS_SPACE)
+        StgWord heap_begin = mblock_address_space.begin;
+        StgWord heap_end = mblock_address_space.end;
+#else
+        StgWord heap_begin = 0;
+        StgWord heap_end = 0;
+#endif
+        ghc_rust_sweep_mut_list_blocks(old_mut_list, cap, heap_begin,
+                                      heap_end, oldest_gen,
+                                      &cap->mut_lists[oldest_gen->no]);
+#else
         for (bdescr *bd = old_mut_list; bd; bd = bd->link) {
             for (StgPtr p = bd->start; p < bd->free; p++) {
                 StgClosure **q = (StgClosure**)p;
@@ -344,6 +397,7 @@ void nonmovingSweepMutLists(void)
                 }
             }
         }
+#endif
         freeChain_lock(old_mut_list);
     }
 }
