@@ -15,6 +15,26 @@ rtsRules = priority 3 $ do
     -- to be linked into the rts dll.
     forM_ [Stage1, Stage2, Stage3 ] $ \ stage -> do
         let buildPath = root -/- buildDir (rtsContext stage)
+        -- allWays omits these two combined RTS ways.
+        -- See Note [Closure size build constants] in rts/rust/ClosureSizeConstants.c.
+        forM_ (map wayFromUnits (subsequences [minBound .. maxBound])) $ \rtsWay -> do
+            let probe  = buildPath -/- "c/rust/ClosureSizeConstants." ++ osuf rtsWay
+                layout = buildPath -/- "closure-size-layout-" ++ show rtsWay ++ ".rs"
+                rustObject = buildPath -/- "rust-rts-closure-size-" ++ show rtsWay ++ ".o"
+            layout %> \output -> do
+                need [probe, sourcePath -/- "Rules/Rts.hs"]
+                nmPath <- builderPath (Nm stage)
+                nm <- exeSpawnPath nmPath
+                Stdout symbols <- cmdExe nm ["-P", "-t", "d", "-S", probe]
+                constants <- mapM parseClosureSizeConstant
+                    [line | line <- lines symbols, "ghc_rust_" `isPrefixOf` line]
+                when (null constants) $ fail "No Rust closure size constants in the target nm output"
+                writeFileAtomic output (unlines constants)
+            rustObject %> \output -> do
+                need [layout]
+                layoutPath <- liftIO $ makeAbsolute layout
+                buildRustRtsWithEnv [AddEnv "CLOSURE_SIZE_LAYOUT_RS" layoutPath]
+                    stage "ghc_rts_closure_size" "rts/rust/closure_size.rs" [] [] output
         buildPath -/- "rust-rts.o" %> \output -> do
             largeAddressSpace <- rtsConfigDefines buildPath "USE_LARGE_ADDRESS_SPACE"
             let rustCfg = if largeAddressSpace then ["--cfg", "ghc_use_large_address_space"] else []
@@ -86,6 +106,7 @@ rtsRustObjects stage way = do
         rustTsanSafe <- notElem "thread-sanitizer" <$> interpret flags getArgs
         let rustDeque = Threaded `wayUnit` way && rustTsanSafe
         pure $ [path -/- "rust-rts.o", path -/- "rust-rts-prim-bits.o"]
+            ++ [path -/- "rust-rts-closure-size-" ++ show way ++ ".o" | rustTsanSafe]
             ++ [path -/- "rust-rts-check-vector-support.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-pathdir.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-posix-getenv.o" | rustTsanSafe]
@@ -102,7 +123,10 @@ rtsConfigDefines path name = do
 
 -- | Compile a Rust RTS crate to a PIC object.
 buildRustRts :: Stage -> String -> FilePath -> [FilePath] -> [String] -> FilePath -> Action ()
-buildRustRts stage crate source modules extraArgs output = do
+buildRustRts = buildRustRtsWithEnv []
+
+buildRustRtsWithEnv :: [CmdOption] -> Stage -> String -> FilePath -> [FilePath] -> [String] -> FilePath -> Action ()
+buildRustRtsWithEnv env stage crate source modules extraArgs output = do
     rustc <- rtsRustCompiler stage
     when (null rustc) $ fail "The Rust RTS requires --enable-rust-rts."
     _ <- setting RustRtsCompilerVersion
@@ -110,12 +134,24 @@ buildRustRts stage crate source modules extraArgs output = do
     need (rustc : source : modules)
     createDirectory (takeDirectory output)
     prog <- exeSpawnPath rustc
-    cmdExe prog $
+    cmdExe prog env $
         [ "--edition=2024", "--crate-name=" ++ crate, "--crate-type=lib"
         , "--target=x86_64-unknown-linux-gnu", "--emit=obj"
         , "-Cpanic=abort", "-Crelocation-model=pic", "-Ccodegen-units=1"
         , "-Copt-level=2", "-o", output, source
         ] ++ extraArgs
+
+-- | Decode a size from one line of POSIX nm output with decimal values.
+parseClosureSizeConstant :: String -> Action String
+parseClosureSizeConstant line = case words line of
+    [symbol, _kind, _address, rawSize]
+        | Just typedName <- stripPrefix "ghc_rust_" symbol
+        , (ty, '_':name) <- break (== '_') typedName
+        , ty `elem` ["u32", "usize"]
+        , [(size, "")] <- reads rawSize
+        , size > (0 :: Integer)
+        -> pure $ "const " ++ name ++ ": " ++ ty ++ " = " ++ show (size - 1) ++ ";"
+    _ -> fail $ "Invalid Rust closure size constant in target nm output: " ++ line
 
 buildGhcInternalImportDef :: FilePath -> Action ()
 buildGhcInternalImportDef target = do

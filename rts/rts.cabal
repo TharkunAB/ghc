@@ -21,6 +21,8 @@ extra-source-files:
     rust/block_count.rs
     rust/c_finalizers.rs
     rust/cafs.rs
+    rust/ClosureSizeConstants.c
+    rust/closure_size.rs
     rust/closure_table.rs
     rust/clone_stack.rs
     rust/arena.rs
