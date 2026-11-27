@@ -332,20 +332,27 @@ getStablePtr(StgPtr p)
  * Treat stable pointers as roots for the garbage collector.
  * -------------------------------------------------------------------------- */
 
-#define FOR_EACH_STABLE_PTR(p, CODE)                                    \
-    do {                                                                \
-        spEntry *p;                                                     \
-        spEntry *__end_ptr = &stable_ptr_table[SPT_size];               \
-        for (p = stable_ptr_table; p < __end_ptr; p++) {                \
-            /* Internal pointers are free slots. NULL is last in free */ \
-            /* list. */                                                 \
-            if (p->addr &&                                              \
-                (p->addr < (P_)stable_ptr_table || p->addr >= (P_)__end_ptr)) \
-            {                                                           \
-                do { CODE } while(0);                                   \
-            }                                                           \
-        }                                                               \
-    } while(0)
+/* Note [Stable pointer root slots]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * A free entry holds the address of the next free entry, or NULL.
+ * A live entry holds a heap pointer. Compare numerical addresses because
+ * the heap object and the stable pointer table are separate allocations.
+ * The collector needs the address of the live slot to update it in place.
+ */
+static void
+visitStablePtrTable(evac_fn evac, void *user)
+{
+    spEntry *table = stable_ptr_table;
+    const unsigned int count = SPT_size;
+    const size_t bytes = (size_t)count * sizeof(*table);
+
+    for (unsigned int i = 0; i < count; i++) {
+        StgPtr addr = table[i].addr;
+        if (addr != NULL && (uintptr_t)addr - (uintptr_t)table >= bytes) {
+            evac(user, (StgClosure **)&table[i].addr);
+        }
+    }
+}
 
 void
 markStablePtrTable(evac_fn evac, void *user)
@@ -355,7 +362,7 @@ markStablePtrTable(evac_fn evac, void *user)
      */
     freeOldSPTs();
 
-    FOR_EACH_STABLE_PTR(p, evac(user, (StgClosure **)&p->addr););
+    visitStablePtrTable(evac, user);
 }
 
 /* -----------------------------------------------------------------------------
@@ -369,5 +376,5 @@ markStablePtrTable(evac_fn evac, void *user)
 void
 threadStablePtrTable( evac_fn evac, void *user )
 {
-    FOR_EACH_STABLE_PTR(p, evac(user, (StgClosure **)&p->addr););
+    visitStablePtrTable(evac, user);
 }
