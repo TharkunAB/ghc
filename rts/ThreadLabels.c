@@ -32,6 +32,15 @@
  * determined by the ByteArray# length.
  */
 
+/* Note [Thread label publication]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * A label can be read from another capability. The writer initializes its
+ * ByteArray before the release store to tso->label. Cross-capability readers
+ * acquire-load the pointer once and use that value to read the ByteArray.
+ * The writer also acquire-loads the old pointer before the nonmoving barrier.
+ * Stop-the-world collectors use the GC entry synchronization instead.
+ */
+
 void
 setThreadLabel(Capability  *cap,
                StgTSO      *tso,
@@ -51,9 +60,10 @@ labelThread(Capability  *cap,
             StgTSO      *tso,
             StgArrBytes *label)
 {
-    if (tso->label) {
+    StgArrBytes *old_label = ACQUIRE_LOAD(&tso->label);
+    if (old_label) {
         IF_NONMOVING_WRITE_BARRIER_ENABLED {
-            updateRemembSetPushClosure(cap, (StgClosure *) tso->label);
+            updateRemembSetPushClosure(cap, (StgClosure *) old_label);
         }
     }
     recordClosureMutated(cap, (StgClosure*)tso);

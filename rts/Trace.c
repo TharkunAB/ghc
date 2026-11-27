@@ -247,9 +247,11 @@ static void traceSchedEvent_stderr (Capability *cap, EventTypeNum tag,
     tracePreface();
     int threadLabelLen = 0;
     char *threadLabel = "";
-    if (tso->label) {
-        threadLabelLen = (int) tso->label->bytes;
-        threadLabel = (char *) tso->label->payload;
+    // See Note [Thread label publication] in ThreadLabels.c.
+    StgArrBytes *label = ACQUIRE_LOAD(&tso->label);
+    if (label) {
+        threadLabelLen = (int) label->bytes;
+        threadLabel = (char *) label->payload;
     }
 
     switch (tag) {
