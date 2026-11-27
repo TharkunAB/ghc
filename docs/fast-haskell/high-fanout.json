@@ -1500,5 +1500,263 @@
         }
       }
     ]
+  },
+  "stock_codegen_worker_check": {
+    "runs": {
+      "first-check-B": {
+        "wall_s": 29.9,
+        "compile_routes": {
+          "delegate:source-flags": 46,
+          "shim:stock": 52,
+          "T_HscRecomp:up-to-date": 253,
+          "delegate:cli-flags": 6
+        },
+        "compile_actions": 305,
+        "compile_boot_actions": 6,
+        "links": 2,
+        "archives": 1,
+        "dependency_worker": [
+          "partial 1/956"
+        ],
+        "noop_counts": [
+          "compile=0 dep=0 link=0"
+        ],
+        "build-ids": [
+          "971f10b2fc928af6827a4f7c9d6b7a5cd80126c9",
+          "971f10b2fc928af6827a4f7c9d6b7a5cd80126c9"
+        ],
+        "value": [
+          "156"
+        ]
+      },
+      "first-stock-A": {
+        "wall_s": 34.24,
+        "compile_routes": {},
+        "compile_actions": 305,
+        "compile_boot_actions": 6,
+        "links": 2,
+        "archives": 1,
+        "dependency_worker": [
+          "partial 1/956"
+        ],
+        "noop_counts": [
+          "compile=0 dep=0 link=0"
+        ],
+        "build-ids": [
+          "2b5db923e5cde1624ee40a52a09c1cf9482fb3a6",
+          "2b5db923e5cde1624ee40a52a09c1cf9482fb3a6"
+        ],
+        "value": [
+          "156"
+        ]
+      },
+      "second-stock-B": {
+        "wall_s": 35.55,
+        "compile_routes": {},
+        "compile_actions": 305,
+        "compile_boot_actions": 6,
+        "links": 2,
+        "archives": 1,
+        "dependency_worker": [
+          "partial 1/956"
+        ],
+        "noop_counts": [
+          "compile=0 dep=0 link=0"
+        ],
+        "build-ids": [
+          "971f10b2fc928af6827a4f7c9d6b7a5cd80126c9",
+          "971f10b2fc928af6827a4f7c9d6b7a5cd80126c9"
+        ],
+        "value": [
+          "156"
+        ]
+      },
+      "second-check-A": {
+        "wall_s": 33.49,
+        "compile_routes": {
+          "delegate:source-flags": 46,
+          "shim:stock": 52,
+          "T_HscRecomp:up-to-date": 253,
+          "delegate:cli-flags": 6
+        },
+        "compile_actions": 305,
+        "compile_boot_actions": 6,
+        "links": 2,
+        "archives": 1,
+        "dependency_worker": [
+          "partial 1/956"
+        ],
+        "noop_counts": [
+          "compile=0 dep=0 link=0"
+        ],
+        "build-ids": [
+          "2b5db923e5cde1624ee40a52a09c1cf9482fb3a6",
+          "2b5db923e5cde1624ee40a52a09c1cf9482fb3a6"
+        ],
+        "value": [
+          "156"
+        ]
+      }
+    },
+    "comparisons": {
+      "A": {
+        "module_count": 299,
+        "module_file_count": 1196,
+        "module_differences": [],
+        "boot_count": 207,
+        "boot_differences": [],
+        "products_count": 3,
+        "products_differences": [],
+        "cross_arm_build_id_match": true,
+        "stock_over_check_wall_ratio": 1.0223947446999104
+      },
+      "B": {
+        "module_count": 299,
+        "module_file_count": 1196,
+        "module_differences": [],
+        "boot_count": 207,
+        "boot_differences": [],
+        "products_count": 3,
+        "products_differences": [],
+        "cross_arm_build_id_match": true,
+        "stock_over_check_wall_ratio": 1.1889632107023411
+      },
+      "stock_median_s": 34.894999999999996,
+      "check_median_s": 31.695
+    }
+  },
+  "check_only_exact_command": {
+    "initial": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "",
+      "phase": [],
+      "seconds": 0.6643105660332367
+    },
+    "unchanged": [
+      {
+        "exit": 0,
+        "stdout": "compilation IS NOT required\n",
+        "stderr": "",
+        "phase": [],
+        "seconds": 0.08213261503260583,
+        "artifacts": [
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.o",
+            "47faade2e8e47b6d456e60f8939a6c11174c586a6cd54828bf06833b382333af",
+            false
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.hi",
+            "e2b0c282489f4832d52c20b1f18124f9328929e4bd3d9f4fbe141529b67eccd5",
+            false
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_o",
+            "da2df89b7ecc872a0aeca4904acecda63353736d21bb69611b48461fb832738d",
+            false
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_hi",
+            "75d67e9379c19b998c5c7335fbd60e85e92ee074314513eff1d2df91951fb2d9",
+            false
+          ]
+        ]
+      },
+      {
+        "exit": 0,
+        "stdout": "compilation IS NOT required\n",
+        "stderr": "",
+        "phase": [
+          "T_HscRecomp:up-to-date"
+        ],
+        "seconds": 0.123667370993644,
+        "artifacts": [
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.o",
+            "47faade2e8e47b6d456e60f8939a6c11174c586a6cd54828bf06833b382333af",
+            false
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.hi",
+            "e2b0c282489f4832d52c20b1f18124f9328929e4bd3d9f4fbe141529b67eccd5",
+            false
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_o",
+            "da2df89b7ecc872a0aeca4904acecda63353736d21bb69611b48461fb832738d",
+            false
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_hi",
+            "75d67e9379c19b998c5c7335fbd60e85e92ee074314513eff1d2df91951fb2d9",
+            false
+          ]
+        ]
+      }
+    ],
+    "rhs_edit": [
+      {
+        "exit": 0,
+        "stdout": "",
+        "stderr": "",
+        "phase": [],
+        "seconds": 0.3846564529812895,
+        "artifacts": [
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.o",
+            "fa61020dfcdde224b3c839edd82f1f9ea20a659a8be6613771916149dd099ccc",
+            true
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.hi",
+            "f623ff87df7b934b1fe1a0fd3538dbd1608dd09c7a29129c100a1ae339ff6f13",
+            true
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_o",
+            "326f829afe43069cf646a6b749de019e0feeb849074eceabfa5163cab9a75aa9",
+            true
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_hi",
+            "72a8d4a11106e44185e6895e740b264b492d49190cdbfca408f34673b0b6db5c",
+            true
+          ]
+        ]
+      },
+      {
+        "exit": 0,
+        "stdout": "",
+        "stderr": "",
+        "phase": [
+          "T_HscRecomp:needed",
+          "shim:stock"
+        ],
+        "seconds": 0.3976743429666385,
+        "artifacts": [
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.o",
+            "fa61020dfcdde224b3c839edd82f1f9ea20a659a8be6613771916149dd099ccc",
+            true
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.hi",
+            "f623ff87df7b934b1fe1a0fd3538dbd1608dd09c7a29129c100a1ae339ff6f13",
+            true
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_o",
+            "326f829afe43069cf646a6b749de019e0feeb849074eceabfa5163cab9a75aa9",
+            true
+          ],
+          [
+            "_build/stage1/compiler/build/GHC/Cmm/Pipeline.dyn_hi",
+            "72a8d4a11106e44185e6895e740b264b492d49190cdbfca408f34673b0b6db5c",
+            true
+          ]
+        ]
+      }
+    ]
   }
 }

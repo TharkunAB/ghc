@@ -21,11 +21,19 @@ install -d -m 700 "$PWD/_build/worker-cpp-cache"
 
 ### Current development workers
 
-Both stages use `c33551f`. On the 956-module dependency scan, a fresh daemon with a populated cache reduced the Stage0 median from 9.98 s to 6.15 s (1.62×) and the Stage1 median from 25.65 s to 11.68 s (2.20×). The worker now recognizes line markers that GHC accepts in noncanonical UTF-8. See the [release and GHC 10 rebuild report](rebuild-c33551f.md) for individual workloads, the correction to the earlier consumer test, linker trials and experiments with reuse inside an optimized binding.
+Both stages use `8ad5a4d`. A warm edit of one import in a 956-module graph took **0.582 s versus 10.438 s stock at Stage0 (17.9×)** and **0.619 s versus 23.379 s stock at Stage1 (37.8×)**. The worker reused rendered dependency rows when their paths matched. The release also fixed stale single-file compilation results after package and environment changes. [Raw scan samples](release-8ad5a4d.json)
 
-Hadrian now writes each library stamp from one rule. This removed an extra package copy and database refresh that a faster linker exposed. With the fix, one capability and the active scan worker, the median linked compiler edit took 12.12 s with BFD and 9.33 s with mold. All four immediately following unchanged builds ran zero builders. [Matched linked-target measurements](rebuild-c33551f.md#fix-for-the-repeated-package-copy)
+| 956-module scan | Stage0 stock | Stage0 worker | Stage1 stock | Stage1 worker |
+| --- | ---: | ---: | ---: | ---: |
+| Warm repeat | 10.232 s | 0.566 s | — | 0.597 s |
+| Empty disk cache, first scan | 11.845 s | 10.638 s | — | 23.174 s |
+| Restart with populated disk cache | 11.845 s | 6.586 s | 23.586 s | 10.929 s |
 
-An edit to `GHC.Utils.Misc` triggered 305 compiler invocations. GHC skipped code generation for 304 importers. In a separate experiment, routing these requests through the worker reduced the median linked rebuild from 33.44 s to 26.01 s. Both producer object hashes differed. [High-fanout rebuild and artifact checks](high-fanout.md)
+Warm Stage0 timings are medians from three balanced comparisons. The prior worker took 0.648 s on a warm repeat and 0.583 s on the edit. Stage0 median sampled peak RSS was approximately 576 MiB for the candidate and 294 MiB for stock. Stage0 cold fill and restart each used one sample per worker, between two stock controls. Stage1 restart and edit used two order-balanced pairs. Restarts reused all 848 eligible records at both stages. Makefiles, backups and diagnostics matched stock.
+
+A linked compiler edit in `GHC.Cmm.Pipeline` took 41.26 s with stock defaults, 19.64 s with one Hadrian capability, and 11.67 s when a warm worker also handled the dependency scan. Those three-run medians used an earlier release. A separate experiment gave each library stamp one writer and measured BFD and mold at 12.12 and 9.33 s on the same edit. [Linked-target comparison](#linked-rebuild-with-the-hadrian-runtime-option) · [Library stamp and linker experiments](rebuild-c33551f.md)
+
+A `GHC.Utils.Misc` edit triggered 305 compiler invocations. In a private trial the worker completed 253 of GHC's recompilation checks and delegated the remaining requests to ordinary GHC. The median linked rebuild took 31.70 s versus 34.90 s with ordinary compilation throughout. The compiler, libraries and measured module artifacts matched byte for byte in both source states. [High-fanout timings and artifact checks](high-fanout.md)
 
 ### Development workers at fa68e89
 

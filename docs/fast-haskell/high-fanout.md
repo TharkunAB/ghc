@@ -19,6 +19,19 @@ The median linked rebuild was **1.29× faster** with compilation routed to the w
 
 For the same source, both producer interfaces and all 1,192 measured importer artifacts matched across these two routes. The producer's ordinary and dynamic object hashes differed, as did the linked library hashes. The development integration still routes dependency scans through the worker. A narrower experiment can serve GHC's up-to-date decision in a daemon and give actual code generation to the ordinary executable.
 
+### Let the worker check and stock GHC compile
+
+A separate GHC 10 prototype intercepted the one-shot `T_HscRecomp` phase. When GHC reported that a module was up to date, the daemon finished the ordinary up-to-date path. Otherwise the shim ran stock GHC with the original arguments. The prototype also delegated boot modules and requests with unsupported source or compiler flags.
+
+| Edit direction | Stock compiler | Worker checks, stock code generation |
+| --- | ---: | ---: |
+| Cutoff 32 to 31 | 35.55 s | 29.90 s |
+| Cutoff 31 to 32 | 34.24 s | 33.49 s |
+
+Median wall time fell from **34.90 s to 31.70 s (9.2%)** across two order-balanced pairs. Each arm used the same `c33551f` scan worker and regenerated one of 956 dependency rows. Of 305 compile requests, the daemon completed 253 up-to-date checks and delegated the other 52. The two immediate no-ops took 5.14 and 5.25 s with stock and 5.03 and 6.54 s with worker checks. Each ran zero compile, dependency, or link actions.
+
+For each source version, 1,196 ordinary module artifacts, all 207 existing boot artifacts, the archive, shared library and compiler executable matched byte for byte. The default loader resolved the expected library in each arm, and each GHC API consumer returned 156. In a separate replay of the real `GHC.Cmm.Pipeline -O2 -dynamic-too` command, the daemon preserved stock diagnostics and artifact modification times on an unchanged compile. After an RHS edit, stock generated all four artifacts. This mode remains a private prototype. The normal Hadrian integration continues to use the worker only for dependency scans.
+
 ### What an ABI fingerprint can tell Hadrian
 
 The `GHC.Cmm.Pipeline` body edit preserved its ABI hash while changing both its full interface hash and its object. A stock GHC 10 fixture changed a `NOINLINE` exported constant from 7 to 9. Its ABI hash stayed equal at both `-O0` and `-O2`. Ordinary importers kept their objects, and relinking produced the new result. A Template Haskell splice that evaluated the constant needed a new object in each configuration. Stock GHC reported the Template Haskell dependency and recompiled the importer. Skipping such a request solely because the imported ABI matched would preserve the old spliced value. [GHC recompilation checks](../../compiler/GHC/Iface/Recomp.hs) · [GHC guide to separate compilation](https://ghc.gitlab.haskell.org/ghc/doc/users_guide/separate_compilation.html)
