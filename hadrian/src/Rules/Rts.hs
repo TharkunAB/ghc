@@ -35,6 +35,8 @@ rtsRules = priority 3 $ do
                 ] rustCfg output
         buildPath -/- "rust-rts-prim-bits.o" %>
             buildRustRts stage "ghc_rts_prim_bits" "rts/rust/prim_bits.rs" [] []
+        buildPath -/- "rust-rts-check-vector-support.o" %>
+            buildRustRts stage "ghc_rts_check_vector_support" "rts/rust/check_vector_support.rs" [] []
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []
         buildPath -/- "rust-rts-poll-slots.o" %>
@@ -55,13 +57,12 @@ rtsRustObjects stage way = do
         poll <- if Threaded `wayUnit` way
             then pure False
             else rtsConfigDefines path "IOMGR_BUILD_POLL"
-        rustDeque <- if Threaded `wayUnit` way
-            then do
-                let flags = target (rtsContext stage) (Cabal Flags stage) [] []
-                trackArgsHash flags
-                notElem "thread-sanitizer" <$> interpret flags getArgs
-            else pure False
+        let flags = target (rtsContext stage) (Cabal Flags stage) [] []
+        trackArgsHash flags
+        rustTsanSafe <- notElem "thread-sanitizer" <$> interpret flags getArgs
+        let rustDeque = Threaded `wayUnit` way && rustTsanSafe
         pure $ [path -/- "rust-rts.o", path -/- "rust-rts-prim-bits.o"]
+            ++ [path -/- "rust-rts-check-vector-support.o" | rustTsanSafe]
             ++ [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
             ++ [path -/- "rust-rts-poll-slots.o" | poll]
             ++ [path -/- "rust-rts-spark-retain.o" | Threaded `wayUnit` way]

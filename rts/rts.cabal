@@ -16,6 +16,7 @@ extra-source-files:
     configure.ac
     rust/archive_member.rs
     rust/arena.rs
+    rust/check_vector_support.rs
     rust/prim_bits.rs
     rust/encode.rs
     rust/eventlog_file_writer.rs
