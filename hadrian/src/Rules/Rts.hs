@@ -30,6 +30,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/hash_walk.rs"
                 , "rts/rust/mblock_extents.rs"
                 , "rts/rust/prim_float.rs"
+                , "rts/rust/stable_ptr.rs"
                 ] rustCfg output
         buildPath -/- "rust-rts-profiler-json.o" %>
             buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" [] []

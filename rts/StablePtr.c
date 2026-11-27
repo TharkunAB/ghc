@@ -332,6 +332,15 @@ getStablePtr(StgPtr p)
  * Treat stable pointers as roots for the garbage collector.
  * -------------------------------------------------------------------------- */
 
+#if defined(USE_RUST_RTS)
+GHC_STATIC_ASSERT(offsetof(spEntry, addr) == 0 &&
+                  sizeof(spEntry) == sizeof(StgPtr) &&
+                  _Alignof(spEntry) == _Alignof(StgPtr),
+                  "Rust stable pointer entry layout");
+RTS_PRIVATE void ghc_rust_visit_stable_ptrs(spEntry *table, size_t count,
+                                             evac_fn evac, void *user);
+#endif
+
 /* Note [Stable pointer root slots]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * A free entry holds the address of the next free entry, or NULL.
@@ -342,6 +351,9 @@ getStablePtr(StgPtr p)
 static void
 visitStablePtrTable(evac_fn evac, void *user)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_visit_stable_ptrs(stable_ptr_table, SPT_size, evac, user);
+#else
     spEntry *table = stable_ptr_table;
     const unsigned int count = SPT_size;
     const size_t bytes = (size_t)count * sizeof(*table);
@@ -352,6 +364,7 @@ visitStablePtrTable(evac_fn evac, void *user)
             evac(user, (StgClosure **)&table[i].addr);
         }
     }
+#endif
 }
 
 void
