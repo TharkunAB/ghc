@@ -42,18 +42,23 @@ GHC_STATIC_ASSERT(offsetof(StgWeak, header.info) == 0, "Rust weak info pointer l
 RTS_PRIVATE void ghc_rust_run_c_finalizers(StgCFinalizerList *list, size_t payload_offset);
 RTS_PRIVATE void ghc_rust_run_all_c_finalizers(StgWeak *list, bool *running,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset);
-RTS_PRIVATE StgMutArrPtrs *ghc_rust_make_finalizer_batch(Capability *cap, StgWeak *list,
-    StgWord count, CostCentreStack *ccs, size_t finalizer_offset, size_t link_offset,
-    size_t payload_offset);
-RTS_PRIVATE StgWord ghc_rust_prepare_finalizers(StgWeak *list,
-    size_t link_offset, void (*prepare_header)(StgWeak *));
+RTS_PRIVATE void ghc_rust_schedule_finalizers(Capability *cap, StgWeak *list,
+    uint32_t stack_size, CostCentreStack *ccs, size_t link_offset,
+    size_t payload_offset, StgClosure *(*runner)(void),
+    void (*prepare_header)(StgWeak *), void (*trace_batch)(StgWord));
 RTS_PRIVATE StgWord ghc_rust_pending_finalizers(void);
 RTS_PRIVATE bool ghc_rust_run_some_finalizers(StgWord limit,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset,
-    void *(*begin)(StgWord), void (*end)(void *, StgWord));
+    bool *(*running_flag)(void), void (*trace_begin)(StgWord),
+    void (*trace_end)(StgWord));
 GHC_STATIC_ASSERT(offsetof(StgWeak, finalizer) + sizeof(void *) ==
                   offsetof(StgWeak, link), "Rust weak finalizer offset");
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t), "Rust pending count width");
+GHC_STATIC_ASSERT(sizeof(HsInt) == sizeof(StgWord), "Rust finalizer count HsInt width");
+GHC_STATIC_ASSERT(sizeof(RtsFlags.GcFlags.initialStkSize) == sizeof(uint32_t),
+                  "Rust finalizer stack size width");
+GHC_STATIC_ASSERT(sizeof(((Task *)0)->running_finalizers) == sizeof(bool),
+                  "Rust finalizer task flag width");
 #endif
 
 /* Note [Weak finalizer producer]
@@ -77,6 +82,23 @@ prepareDeadWeakHeader(StgWeak *w)
 #define PREPARE_DEAD_WEAK_HEADER prepareDeadWeakHeader
 #else
 #define PREPARE_DEAD_WEAK_HEADER NULL
+#endif
+
+#if defined(USE_RUST_FINALIZERS) && defined(DEBUG)
+static void traceFinalizerBatch(StgWord count)
+{
+    debugTrace(DEBUG_weak, "weak: batching %" FMT_Word " finalizers", count);
+}
+#define TRACE_FINALIZER_BATCH traceFinalizerBatch
+#else
+#define TRACE_FINALIZER_BATCH NULL
+#endif
+
+#if defined(USE_RUST_FINALIZERS)
+static StgClosure *finalizerBatchRunner(void)
+{
+    return (StgClosure *)runFinalizerBatch_closure;
+}
 #endif
 
 /* Note [Weak finalizer queue ownership]
@@ -165,9 +187,9 @@ runAllCFinalizers(StgWeak *list)
 void
 scheduleFinalizers(Capability *cap, StgWeak *list)
 {
+#if !defined(USE_RUST_FINALIZERS)
     StgTSO *t;
     StgWord n;
-#if !defined(USE_RUST_FINALIZERS)
     StgWeak *w;
     StgWord i;
 #endif
@@ -177,17 +199,17 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     // (by doIdleGcWork()) before appending the list with more finalizers.
 #if defined(USE_RUST_FINALIZERS)
     ASSERT(RtsFlags.GcFlags.useNonmoving || ghc_rust_pending_finalizers() == 0);
+    ghc_rust_schedule_finalizers(cap, list, RtsFlags.GcFlags.initialStkSize,
+        CCS_SYSTEM_OR_NULL, offsetof(StgWeak, link),
+        offsetof(StgMutArrPtrs, payload),
+        finalizerBatchRunner,
+        PREPARE_DEAD_WEAK_HEADER, TRACE_FINALIZER_BATCH);
 #else
     ASSERT(RtsFlags.GcFlags.useNonmoving || SEQ_CST_LOAD(&n_finalizers) == 0);
-#endif
 
     // Append finalizer_list with the new list. TODO: Perhaps cache tail of the
     // list for faster append. NOTE: We can't append `list` here! Otherwise we
     // end up traversing already visited weaks in the loops below.
-#if defined(USE_RUST_FINALIZERS)
-    n = ghc_rust_prepare_finalizers(list, offsetof(StgWeak, link),
-        PREPARE_DEAD_WEAK_HEADER);
-#else
     StgWeak **tl = &finalizer_list;
     while (*tl) {
         tl = &(*tl)->link;
@@ -228,18 +250,12 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     }
 
     SEQ_CST_ADD(&n_finalizers, i);
-#endif
 
     // No Haskell finalizers to run?
     if (n == 0) return;
 
     debugTrace(DEBUG_weak, "weak: batching %" FMT_Word " finalizers", n);
 
-#if defined(USE_RUST_FINALIZERS)
-    StgMutArrPtrs *arr = ghc_rust_make_finalizer_batch(cap, list, n, CCS_SYSTEM_OR_NULL,
-        offsetof(StgWeak, finalizer), offsetof(StgWeak, link), offsetof(StgMutArrPtrs, payload));
-    if (RTS_UNLIKELY(arr == NULL)) exitHeapOverflow();
-#else
     StgMutArrPtrs *arr = allocateMutArrPtrs(cap, n, NULL, CCS_SYSTEM_OR_NULL);
     if (RTS_UNLIKELY(arr == NULL)) exitHeapOverflow();
     // No write barrier needed here; this array is only going to referred to by this core.
@@ -260,7 +276,6 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     for (i = n; i < size; i++) {
         arr->payload[i] = (StgClosure *)(W_)(-1);
     }
-#endif
 
     t = createIOThread(cap,
                        RtsFlags.GcFlags.initialStkSize,
@@ -272,6 +287,7 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
         );
 
     scheduleThread(cap,t);
+#endif
 }
 
 /* -----------------------------------------------------------------------------
@@ -312,20 +328,28 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
 static const StgWord finalizer_chunk = 100;
 
 #if defined(USE_RUST_FINALIZERS)
-static void *beginFinalizerDrain(StgWord pending)
+static bool *currentFinalizerRunningFlag(void)
 {
-    debugTrace(DEBUG_sched, "running C finalizers, %" FMT_Word " remaining", pending);
     Task *task = myTask();
-    if (task != NULL) task->running_finalizers = true;
-    return task;
+    return task ? &task->running_finalizers : NULL;
 }
 
-static void endFinalizerDrain(void *owner, StgWord count)
+#if defined(DEBUG)
+static void traceFinalizerDrainBegin(StgWord pending)
 {
-    Task *task = owner;
-    if (task != NULL) task->running_finalizers = false;
+    debugTrace(DEBUG_sched, "running C finalizers, %" FMT_Word " remaining", pending);
+}
+
+static void traceFinalizerDrainEnd(StgWord count)
+{
     debugTrace(DEBUG_sched, "ran %" FMT_Word " C finalizers", count);
 }
+#define TRACE_FINALIZER_DRAIN_BEGIN traceFinalizerDrainBegin
+#define TRACE_FINALIZER_DRAIN_END traceFinalizerDrainEnd
+#else
+#define TRACE_FINALIZER_DRAIN_BEGIN NULL
+#define TRACE_FINALIZER_DRAIN_END NULL
+#endif
 #endif
 
 // non-zero if a thread is already in runSomeFinalizers(). This
@@ -342,7 +366,8 @@ bool runSomeFinalizers(bool all)
 #if defined(USE_RUST_FINALIZERS)
     return ghc_rust_run_some_finalizers(all ? STG_WORD_MAX : finalizer_chunk,
         offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
-        offsetof(StgCFinalizerList, link), beginFinalizerDrain, endFinalizerDrain);
+        offsetof(StgCFinalizerList, link), currentFinalizerRunningFlag,
+        TRACE_FINALIZER_DRAIN_BEGIN, TRACE_FINALIZER_DRAIN_END);
 #else
     if (RELAXED_LOAD(&n_finalizers) == 0)
         return false;
