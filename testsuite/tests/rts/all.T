@@ -771,6 +771,11 @@ test('T19048',
 
 test('census_pinned', [js_skip], makefile_test, [])
 
+test('census_block_sizes',
+     [unless(debug_rts(), skip), req_target_smp, req_ghc_with_threaded_rts,
+      js_skip, ignore_stdout, ignore_stderr],
+     makefile_test, [])
+
 test('T27585',
      [ omit_ghci
      , no_check_hp

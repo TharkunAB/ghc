@@ -111,23 +111,24 @@ nonmovingAllocatorCensus(uint32_t alloc_idx)
 
 static void print_alloc_census(int i, struct NonmovingAllocCensus census)
 {
-    uint32_t blk_size = 1 << (i + NONMOVING_ALLOCA0);
-    int sz_min = 1 << (i + NONMOVING_ALLOCA0 - 1);
-    int sz_max = 1 << (i + NONMOVING_ALLOCA0);
-    (void) sz_min; (void) sz_max;
+    unsigned int blk_size = nonmovingHeap.allocators[i].block_size;
+    unsigned int sz_min = i == 0 ? 0 : nonmovingHeap.allocators[i - 1].block_size;
+    (void) sz_min; (void) blk_size;
 
     if (census.collected_live_words) {
         // We define occupancy as the fraction of space that is used for useful
         // data (that is, live and not slop).
-        double occupancy = 100.0 * census.n_live_words * sizeof(W_)
-            / (census.n_live_blocks * blk_size);
-        if (census.n_live_blocks == 0) occupancy = 100;
+        double occupancy = 100.0;
+        if (census.n_live_blocks != 0) {
+            occupancy = 100.0 * census.n_live_words * sizeof(W_)
+                / ((double)census.n_live_blocks * blk_size);
+        }
         (void) occupancy; // silence warning if !DEBUG
         debugTrace(DEBUG_nonmoving_gc,
-                   "Allocator %d (%d bytes - %d bytes): "
+                   "Allocator %d (%u bytes - %u bytes): "
                    "%"PRIu32" active segs, %"PRIu32" filled segs, %"PRIu32" live blocks, "
                    "%"PRIu32" live words (%2.1f%% occupancy)",
-                   i, sz_min, sz_max,
+                   i, sz_min, blk_size,
                    census.n_active_segs,
                    census.n_filled_segs,
                    census.n_live_blocks,
@@ -135,9 +136,9 @@ static void print_alloc_census(int i, struct NonmovingAllocCensus census)
                    occupancy);
     } else {
         debugTrace(DEBUG_nonmoving_gc,
-                   "Allocator %d (%d bytes - %d bytes): "
+                   "Allocator %d (%u bytes - %u bytes): "
                    "%"PRIu32" active segs, %"PRIu32" filled segs, %"PRIu32" live blocks",
-                   i, sz_min, sz_max,
+                   i, sz_min, blk_size,
                    census.n_active_segs,
                    census.n_filled_segs,
                    census.n_live_blocks);
