@@ -48,6 +48,11 @@ RTS_PRIVATE void ghc_rust_closure_table_init_growth(
     size_t old_capacity, size_t new_capacity,
     size_t old_card_words, size_t new_card_words,
     size_t old_free_words, int old_free_head, StgClosure *null_closure);
+RTS_PRIVATE void ghc_rust_closure_table_remove_sparse(
+    ClosureTable *t, StgClosure **slot, int *free_link, int ix);
+RTS_PRIVATE void ghc_rust_closure_table_remove_compact(
+    ClosureTable *t, StgClosure **payload, int *free_link,
+    int gap, int last, StgWord8 *gap_card);
 #endif
 
 
@@ -244,6 +249,10 @@ void removeClosureTable(Capability *cap, ClosureTable *t, int ix)
     IF_NONMOVING_WRITE_BARRIER_ENABLED {
         updateRemembSetPushClosure(cap, t->arr->payload[ix]);
     }
+#if defined(USE_RUST_CLOSURE_TABLE)
+    ghc_rust_closure_table_remove_sparse(t, &t->arr->payload[ix],
+                                         &StgArrBytesAsCInts(t->free)[ix], ix);
+#else
     t->arr->payload[ix] = &stg_CLOSURE_TABLE_NULL_closure;
 
     /* push ix onto the free list */
@@ -251,6 +260,7 @@ void removeClosureTable(Capability *cap, ClosureTable *t, int ix)
     t->free_hd = ix;
 
     t->elems--;
+#endif
 }
 
 
@@ -296,6 +306,12 @@ void removeCompactClosureTable(Capability *cap, ClosureTable *t,
         updateRemembSetPushClosure(cap, t->arr->payload[gap_ix]);
     }
 
+#if defined(USE_RUST_CLOSURE_TABLE)
+    ghc_rust_closure_table_remove_compact(t, t->arr->payload,
+                                          &StgArrBytesAsCInts(t->free)[end_ix],
+                                          gap_ix, end_ix,
+                                          mutArrPtrsCard(t->arr, gap_ix >> MUT_ARR_PTRS_CARD_BITS));
+#else
     /* move the end entry over the gap and mark the end as empty */
     t->arr->payload[gap_ix] = t->arr->payload[end_ix];
     t->arr->payload[end_ix] = &stg_CLOSURE_TABLE_NULL_closure;
@@ -315,6 +331,7 @@ void removeCompactClosureTable(Capability *cap, ClosureTable *t,
     t->free_hd = end_ix;
 
     t->elems--;
+#endif
 
     ASSERT(isCompactClosureTable(t));
     ASSERT(t->arr->payload[*ix_from] == &stg_CLOSURE_TABLE_NULL_closure);

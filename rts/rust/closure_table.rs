@@ -161,3 +161,73 @@ pub(super) unsafe extern "C" fn ghc_rust_closure_table_insert(
     }
     ix
 }
+
+unsafe extern "C" {
+    static stg_CLOSURE_TABLE_NULL_closure: u8;
+}
+
+core::arch::global_asm!(
+    ".hidden ghc_rust_closure_table_remove_sparse",
+    ".hidden ghc_rust_closure_table_remove_compact",
+);
+
+/// Link the released index at the head of the free list.
+unsafe fn recycle(table: *mut ClosureTable, free_link: *mut c_int, ix: c_int) {
+    unsafe {
+        free_link.write((*table).free_hd);
+        (*table).free_hd = ix;
+        (*table).elems -= 1;
+    }
+}
+
+/// Clear an occupied slot. C runs the nonmoving write barrier first.
+///
+/// # Safety
+///
+/// The caller owns the table. The slot and free link belong to index `ix`.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_closure_table_remove_sparse(
+    table: *mut ClosureTable,
+    slot: *mut *mut c_void,
+    free_link: *mut c_int,
+    ix: c_int,
+) {
+    unsafe {
+        slot.write(
+            (&raw const stg_CLOSURE_TABLE_NULL_closure)
+                .cast_mut()
+                .cast(),
+        );
+        recycle(table, free_link, ix);
+    }
+}
+
+/// Move the last entry into the gap. Mark the destination card even when
+/// the caller removes the last entry itself.
+///
+/// # Safety
+///
+/// The caller owns the table and has applied the nonmoving write barrier.
+/// Both indexes are occupied. The free link belongs to the last slot and
+/// the card belongs to the gap.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_closure_table_remove_compact(
+    table: *mut ClosureTable,
+    payload: *mut *mut c_void,
+    free_link: *mut c_int,
+    gap: c_int,
+    last: c_int,
+    gap_card: *mut u8,
+) {
+    unsafe {
+        let last_slot = payload.add(last as usize);
+        payload.add(gap as usize).write(last_slot.read());
+        last_slot.write(
+            (&raw const stg_CLOSURE_TABLE_NULL_closure)
+                .cast_mut()
+                .cast(),
+        );
+        gap_card.write(1);
+        recycle(table, free_link, last);
+    }
+}
