@@ -132,13 +132,22 @@ exitStableNameTable(void)
 #endif
 }
 
+#if defined(USE_RUST_RTS)
+RTS_PRIVATE void ghc_rust_free_stable_name(snEntry *entry, snEntry **free,
+                                          HashTable *hash);
+#endif
+
 void
 freeSnEntry(snEntry *sn)
 {
   ASSERT(sn->sn_obj == NULL);
+#if defined(USE_RUST_RTS)
+  ghc_rust_free_stable_name(sn, &stable_name_free, addrToStableHash);
+#else
   removeHashTable(addrToStableHash, (W_)sn->old, NULL);
   sn->addr = (P_)stable_name_free;
   stable_name_free = sn;
+#endif
 }
 
 /* -----------------------------------------------------------------------------
