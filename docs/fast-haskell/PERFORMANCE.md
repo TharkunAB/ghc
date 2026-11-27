@@ -4,22 +4,43 @@ Use ordinary GHC for final builds. At each development-worker switch, compare wi
 
 ## 27 November 2026
 
+### Cumulative comparison on GHC 10.1.20261127
+
+We built Hadrian from the branch point `56bb91d95f` and used ordinary GHC for both dependency scanning and compilation. The development configuration used the published Hadrian changes, one Hadrian capability, and a stage-matched worker for dependency scans and compile checks with its decoded-interface cache enabled. The pilot also used an importer's actual source options and interface usage records to decide whether a change to `GHC.Utils.Misc` required a compiler call. Hadrian still passed changed code to the ordinary compiler and relinked its library and executable.
+
+| Linked `-O2` rebuild | Starting Hadrian + ordinary GHC | Published development options | Automatic importer pilot |
+| --- | ---: | ---: | ---: |
+| Change cutoff 32 to 31 | 63.46 s | 30.65 s (2.07×) | 26.36 s (2.41×) |
+| Revert 31 to 32 | 59.70 s | 33.85 s (1.76×) | 25.90 s (2.31×) |
+| No-op after forward edit | 23.54 s | 4.00 s | 3.82 s |
+| No-op after revert | 23.95 s | 4.43 s | 3.85 s |
+
+Across the edit and revert together, the published options cut wall time by 47.6% (1.91×). The pilot cut it by 57.6% (2.36×).
+
+Each cell is one run on the same previously built source tree, native Stage0 compiler, four CPUs, `-j3`, and `perf+no_profiled_libs --freeze1`. All arms ran the normal `stage2:exe:ghc-bin` target. The starting compiler executable was held constant so these comparisons measure the build system and worker. The development worker was warm. It regenerated one of 943 dependency rows on each edit. The starting configuration ran an ordinary dependency scan. The development and pilot windows ran before the branch-point control, so the ratios include run-to-run noise.
+
+The starting and published configurations ran 303 Haskell compile commands. The pilot ran 54. Only the edited producer generated code. The module artifacts of all 249 skipped importers, the compiler archive, shared library, compiler executable, and a separately compiled and executed GHC API consumer matched the ordinary reference. Each immediate no-op ran zero builder actions. The two separate starting benchmark jobs peaked at 2,564 and 2,578 MiB in their cgroups. The two-direction worker and pilot jobs peaked at 5,772 and 4,680 MiB. These are whole-job peaks, including the compiler and resident workers.
+
 ### Development build on this host
 
-Run from a configured GHC development worktree with the matching Stage0 toolchain. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
+Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
 
 ```sh
 install -d -m 700 "$PWD/_build/worker-cpp-cache"
 "$HOME/Code/heavy-management/bin/heavy" --mem 8G --time 20m env \
   GHC_WORKER_CPP_CACHE="$PWD/_build/worker-cpp-cache" \
   HADRIAN_SINGLE_CAPABILITY=1 \
-  HADRIAN_DEPENDENCY_WORKER="$HOME/Code/ghc-persistent-worker/_build/stage0-bin/current/ghc" \
+  HADRIAN_DEPENDENCY_WORKER="$WORKER_RELEASE/ghc" \
   hadrian/build -j3 --flavour=quick --docs=none --freeze1 stage2:exe:ghc-bin
 ```
 
 `--freeze1` reuses the existing Stage0 prerequisites for this benchmark. For a final build, use ordinary GHC and leave the development settings unset.
 
-### Current development workers
+### Shared Stage1 worker on 27 November
+
+The active Stage1 release `2a5a1d0` ran the 956-module dependency command in 0.552 s after a one-import edit. The matched stock median was 22.294 s (40.4×). This measures dependency generation. The shared Stage0 selector `1784b7a` pointed to a compiler installation with a missing Stage0 library directory when we checked. The linked measurements above used a complete private, stage-matched installation.
+
+### Development workers at 8ad5a4d
 
 Both stages use `8ad5a4d`. A warm edit of one import in a 956-module graph took **0.582 s versus 10.438 s stock at Stage0 (17.9×)** and **0.619 s versus 23.379 s stock at Stage1 (37.8×)**. The worker reused rendered dependency rows when their paths matched. The release also fixed stale single-file compilation results after package and environment changes. [Raw scan samples](release-8ad5a4d.json)
 
@@ -91,7 +112,7 @@ A separate no-op run used four distinct physical cores. Disabling migration brou
 Set `HADRIAN_DEPENDENCY_WORKER` to the absolute path of a prepared worker's `ghc` executable for development builds. The retained stage0 compiler on this host uses the following setting.
 
 ```sh
-export HADRIAN_DEPENDENCY_WORKER="$HOME/Code/ghc-persistent-worker/_build/stage0-bin/current/ghc"
+export HADRIAN_DEPENDENCY_WORKER="$WORKER_RELEASE/ghc"
 ```
 
 Run the usual Hadrian target through Pueue. Hadrian selects the worker for Haskell dependency scans when its recorded compiler path and executable hash match the stage compiler. Other stages use their own compiler. Leave the variable unset for final builds. The digest covers the executable. Prepare a new worker after separately replacing shared libraries.
