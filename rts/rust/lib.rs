@@ -26,6 +26,7 @@ mod suspended_calls;
 mod thread_label;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod timeout_queue;
+mod top_handler;
 
 mod hash_api {
     use core::ffi::{c_int, c_void};

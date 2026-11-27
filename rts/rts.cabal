@@ -47,6 +47,7 @@ extra-source-files:
     rust/suspended_calls.rs
     rust/thread_label.rs
     rust/timeout_queue.rs
+    rust/top_handler.rs
     rust/wsdeque.rs
 
 extra-tmp-files:

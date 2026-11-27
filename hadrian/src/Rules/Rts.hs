@@ -43,6 +43,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/suspended_calls.rs"
                 , "rts/rust/thread_label.rs"
                 , "rts/rust/timeout_queue.rs"
+                , "rts/rust/top_handler.rs"
                 ] rustCfg output
         buildPath -/- "rust-rts-prim-bits.o" %>
             buildRustRts stage "ghc_rts_prim_bits" "rts/rust/prim_bits.rs" [] []
