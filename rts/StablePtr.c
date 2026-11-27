@@ -132,6 +132,14 @@ Mutex stable_ptr_mutex;
 
 static void enlargeStablePtrTable(void);
 
+/* Keep the C atomic operations visible to ThreadSanitizer. */
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+#define USE_RUST_STABLE_PTR_FREE_LIST 1
+RTS_PRIVATE void ghc_rust_init_stable_ptr_free_list(spEntry *table, size_t count);
+RTS_PRIVATE StgWord ghc_rust_take_stable_ptr(spEntry *table, spEntry **head, StgPtr value);
+RTS_PRIVATE void ghc_rust_release_stable_ptr(spEntry **head, spEntry *slot);
+#endif
+
 /* -----------------------------------------------------------------------------
  * We must lock the StablePtr table during GC, to prevent simultaneous
  * calls to freeStablePtr().
@@ -157,12 +165,16 @@ stablePtrUnlock(void)
 STATIC_INLINE void
 initSpEntryFreeList(spEntry *table, uint32_t n)
 {
+#if defined(USE_RUST_STABLE_PTR_FREE_LIST)
+  ghc_rust_init_stable_ptr_free_list(table, n);
+#else
   spEntry* free = NULL;
   while (n != 0) {
       spEntry *p = &table[--n];
       p->addr = (P_)free;
       free = p;
   }
+#endif
   stable_ptr_free = table;
 }
 
@@ -269,8 +281,12 @@ exitStablePtrTable(void)
 STATIC_INLINE void
 freeSpEntry(spEntry *sp)
 {
+#if defined(USE_RUST_STABLE_PTR_FREE_LIST)
+    ghc_rust_release_stable_ptr(&stable_ptr_free, sp);
+#else
     RELAXED_STORE(&sp->addr, (P_)stable_ptr_free);
     stable_ptr_free = sp;
+#endif
 }
 
 void
@@ -312,6 +328,9 @@ getStablePtr(StgPtr p)
   if (!stable_ptr_free)
       enlargeStablePtrTable();
 
+#if defined(USE_RUST_STABLE_PTR_FREE_LIST)
+  StgWord sp = ghc_rust_take_stable_ptr(stable_ptr_table, &stable_ptr_free, p);
+#else
   // find the index of free stable ptr
   StgWord sp = stable_ptr_free - stable_ptr_table;
 
@@ -320,6 +339,7 @@ getStablePtr(StgPtr p)
 
   // release store to pair with acquire load in deRefStablePtr
   RELEASE_STORE(&stable_ptr_table[sp].addr, p);
+#endif
 
   stablePtrUnlock();
 
