@@ -52,9 +52,12 @@ StgStack* cloneStack(Capability* capability, const StgStack* stack)
   StgStack *top_stack = cloneStackChunk(capability, stack);
   StgStack *last_stack = top_stack;
   while (true) {
-    // check whether the stack ends in an underflow frame
-    StgUnderflowFrame *frame = (StgUnderflowFrame *) (last_stack->stack
-      + last_stack->stack_size - sizeofW(StgUnderflowFrame));
+    StgPtr end = last_stack->stack + last_stack->stack_size;
+    // The collector copies only the live words from sp to end.
+    if ((size_t)(end - last_stack->sp) < sizeofW(StgUnderflowFrame)) {
+      break;
+    }
+    StgUnderflowFrame *frame = (StgUnderflowFrame *)(end - sizeofW(StgUnderflowFrame));
     if (frame->info == &stg_stack_underflow_frame_d_info
       ||frame->info == &stg_stack_underflow_frame_v16_info
       ||frame->info == &stg_stack_underflow_frame_v32_info
