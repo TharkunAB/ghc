@@ -14,7 +14,17 @@ decodeBits bits = decodeFloat (castWord32ToFloat bits)
 decodeDoubleBits :: Word64 -> (Integer, Int)
 decodeDoubleBits bits = decodeFloat (castWord64ToDouble bits)
 
+-- | Check the sign when encoding the minimum native Int.
+{-# OPAQUE encodeNativeMinSigns #-}
+encodeNativeMinSigns :: Int -> (Bool, Bool)
+encodeNativeMinSigns power =
+    let mantissa = toInteger (minBound :: Int)
+     in ( encodeFloat mantissa power < (0 :: Float)
+        , encodeFloat mantissa power < (0 :: Double)
+        )
+
 main = do
+    print (encodeNativeMinSigns (-1))
     mapM_
         (print . decodeDoubleBits)
         [0x8000000000000000, 0x0000000000000001, 0x800fffffffffffff, 0x0010000000000000, 0x7fefffffffffffff]

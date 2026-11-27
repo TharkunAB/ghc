@@ -86,7 +86,8 @@ __int_encodeDouble (I_ j, I_ e)
 {
   StgDouble r;
 
-  r = (StgDouble)__abs(j);
+  /* Only the minimum signed word needs unsigned negation. */
+  r = j == STG_INT_MIN ? (StgDouble)(-(W_)j) : (StgDouble)__abs(j);
 
   /* Now raise to the exponent */
   if ( r != 0.0 ) /* Lennart suggests this avoids a bug in MIPS's ldexp */
@@ -105,7 +106,7 @@ __int_encodeFloat (I_ j, I_ e)
 {
   StgFloat r;
 
-  r = (StgFloat)__abs(j);
+  r = j == STG_INT_MIN ? (StgFloat)(-(W_)j) : (StgFloat)__abs(j);
 
   /* Now raise to the exponent */
   if ( r != 0.0 ) /* Lennart suggests this avoids a bug in MIPS's ldexp */
