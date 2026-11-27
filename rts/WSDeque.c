@@ -67,6 +67,8 @@ _Static_assert(offsetof(WSDeque, top) == 16 && offsetof(WSDeque, bottom) == 24,
 _Static_assert(offsetof(WSDeque, elements) == 32, "WSDeque array ABI");
 
 #include "BeginPrivate.h"
+WSDeque *ghc_rust_new_wsdeque(uint32_t size);
+void ghc_rust_free_wsdeque(WSDeque *q);
 bool ghc_rust_push_wsdeque(WSDeque *q, void *elem);
 void *ghc_rust_pop_wsdeque(WSDeque *q);
 void *ghc_rust_steal_wsdeque_once(WSDeque *q);
@@ -87,8 +89,7 @@ cas_top(WSDeque *q, StgInt old, StgInt new)
  * newWSDeque
  * -------------------------------------------------------------------------- */
 
-/* internal helpers ... */
-
+#if !defined(USE_RUST_WSDEQUE)
 static StgWord
 roundUp2(StgWord val)
 {
@@ -104,10 +105,14 @@ roundUp2(StgWord val)
     } while (0 != (val = val>>1));
     return rounded;
 }
+#endif
 
 WSDeque *
 newWSDeque (uint32_t size)
 {
+#if defined(USE_RUST_WSDEQUE)
+    WSDeque *q = ghc_rust_new_wsdeque(size);
+#else
     StgWord realsize;
     WSDeque *q;
 
@@ -122,6 +127,7 @@ newWSDeque (uint32_t size)
 
     q->top=0;
     RELEASE_STORE(&q->bottom, 0); /* read by writer, updated each time top is read */
+#endif
 
     ASSERT_WSDEQUE_INVARIANTS(q);
     return q;
@@ -134,8 +140,12 @@ newWSDeque (uint32_t size)
 void
 freeWSDeque (WSDeque *q)
 {
+#if defined(USE_RUST_WSDEQUE)
+    ghc_rust_free_wsdeque(q);
+#else
     stgFree(q->elements);
     stgFree(q);
+#endif
 }
 
 /* -----------------------------------------------------------------------------

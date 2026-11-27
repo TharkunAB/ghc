@@ -1,7 +1,7 @@
 #![no_std]
 
-use core::ffi::c_void;
-use core::mem::align_of;
+use core::ffi::{c_char, c_void};
+use core::mem::{align_of, size_of};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicIsize, AtomicPtr, Ordering::*, fence};
 
@@ -21,9 +21,10 @@ const _: () = {
 
 // Note [Concurrent deque storage]
 // -------------------------------
-// C allocates and frees the deque. C layout checks cover this x86-64 mirror
-// and the atomic alignment. Concurrent operations access indices and slots
-// atomically at their original widths. The size, mask and array pointer are
+// Layout checks cover the x86-64 C layout and the atomic alignment. The
+// deque and its separate slot buffer use the RTS allocator. Concurrent
+// operations access indices and slots atomically at their original widths.
+// The size, mask and array pointer are
 // immutable after publication. Each atomic reference covers one field or slot.
 // The caller excludes concurrent operations during collection and destruction.
 // The array size is a positive power of two. Live counters are nonnegative
@@ -34,11 +35,66 @@ const _: () = {
 // In that case C omits its references. Keep these ELF symbols private even
 // if the Rust object is still selected in a shared RTS.
 core::arch::global_asm!(
+    ".hidden ghc_rust_new_wsdeque",
+    ".hidden ghc_rust_free_wsdeque",
     ".hidden ghc_rust_push_wsdeque",
     ".hidden ghc_rust_pop_wsdeque",
     ".hidden ghc_rust_steal_wsdeque_once",
     ".hidden ghc_rust_steal_wsdeque",
 );
+
+unsafe extern "C" {
+    fn barf(format: *const c_char, ...) -> !;
+    fn stgMallocBytes(size: usize, name: *const c_char) -> *mut c_void;
+    fn stgFree(pointer: *mut c_void);
+}
+
+// The queue has the first power-of-two capacity strictly greater than size.
+fn capacity(size: u32) -> usize {
+    1usize << (u32::BITS - size.leading_zeros())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ghc_rust_new_wsdeque(size: u32) -> *mut WSDeque {
+    unsafe {
+        if size == 0 {
+            barf(c"DeQue,roundUp2: invalid size 0 requested".as_ptr());
+        }
+
+        let capacity = capacity(size);
+        // Nonzero RTS allocations return aligned storage or terminate.
+        let q = stgMallocBytes(size_of::<WSDeque>(), c"newWSDeque".as_ptr()).cast::<WSDeque>();
+        let elements = stgMallocBytes(
+            capacity * size_of::<*mut c_void>(),
+            c"newWSDeque:data space".as_ptr(),
+        )
+        .cast::<*mut c_void>();
+
+        // Leave the slots uninitialized. Push initializes a slot before
+        // publishing it. Initialize the header before taking the atomic view
+        // of bottom for the release store.
+        q.write(WSDeque {
+            size: capacity as isize,
+            modulo_size: capacity - 1,
+            top: 0,
+            bottom: 0,
+            elements,
+        });
+        AtomicIsize::from_ptr(&raw mut (*q).bottom).store(0, Release);
+        q
+    }
+}
+
+/// # Safety
+/// The deque must be live and no other operation may access it during or
+/// after this call. The caller may free each deque only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ghc_rust_free_wsdeque(q: *mut WSDeque) {
+    unsafe {
+        stgFree((*q).elements.cast());
+        stgFree(q.cast());
+    }
+}
 
 #[inline(always)]
 unsafe fn slot(q: *mut WSDeque, index: usize) -> *mut *mut c_void {
