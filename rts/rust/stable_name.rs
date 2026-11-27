@@ -2,6 +2,7 @@ use core::{
     ffi::{c_char, c_void},
     mem::size_of,
     ptr,
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 use super::hash_api::{
@@ -14,6 +15,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_exit_stable_name_table",
     ".hidden ghc_rust_reserve_stable_name",
     ".hidden ghc_rust_gc_stable_name_table",
+    ".hidden ghc_rust_stable_name_key",
 );
 
 unsafe extern "C" {
@@ -27,6 +29,40 @@ pub(super) struct Entry {
     addr: *mut c_void,
     old: *mut c_void,
     sn_obj: *mut c_void,
+}
+
+// StableName.c checks these against the native closure layout.
+const TAG_MASK: usize = 7;
+const IND: u32 = 27;
+const IND_STATIC: u32 = 28;
+const BLACKHOLE: u32 = 38;
+
+// See Note [Stable name key] in StableName.c.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_stable_name_key(
+    mut current: *mut c_void,
+    info_type_offset: isize,
+    indirectee_offset: usize,
+) -> *mut c_void {
+    unsafe {
+        loop {
+            let untagged = current.map_addr(|addr| addr & !TAG_MASK);
+            let info = AtomicPtr::<u8>::from_ptr(untagged.cast()).load(Ordering::Relaxed);
+            let closure_kind = info.wrapping_offset(info_type_offset).cast::<u32>().read();
+            if closure_kind == IND || closure_kind == IND_STATIC || closure_kind == BLACKHOLE {
+                let indirectee = AtomicPtr::from_ptr(
+                    untagged.cast::<u8>().add(indirectee_offset).cast::<*mut c_void>(),
+                )
+                .load(Ordering::Acquire);
+                if closure_kind != BLACKHOLE || indirectee.addr() & TAG_MASK != 0 {
+                    current = indirectee;
+                    continue;
+                }
+                return indirectee;
+            }
+            return untagged;
+        }
+    }
 }
 
 /// Allocate the first table. Slot zero stays unused.

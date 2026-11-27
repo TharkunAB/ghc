@@ -56,6 +56,8 @@ RTS_PRIVATE void ghc_rust_gc_stable_name_table(snEntry *table, size_t count,
     StgClosure *(*is_alive)(StgClosure *),
     void (*trace_dead_name)(size_t, StgPtr),
     void (*trace_dead_pointee)(size_t));
+RTS_PRIVATE StgClosure *ghc_rust_stable_name_key(StgClosure *p,
+    ptrdiff_t info_type_offset, size_t indirectee_offset);
 #endif
 
 void
@@ -190,9 +192,20 @@ freeSnEntry(snEntry *sn)
  * Looking up
  * -------------------------------------------------------------------------- */
 
-/*
- * get at the real stuff...remove indirections.
+/* Note [Stable name key]
+ * ~~~~~~~~~~~~~~~~~~~~~~
+ * Follow indirections before looking up a stable name. Read each indirectee
+ * with acquire ordering. A BLACKHOLE with an untagged indirectee names its
+ * owner: return that indirectee without examining the owner as a closure.
+ * The stable name table stores the final pointer without its tag.
  */
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+GHC_STATIC_ASSERT(TAG_MASK == 7 && offsetof(StgHeader, info) == 0 &&
+                  sizeof(((StgInfoTable *)0)->type) == sizeof(uint32_t) &&
+                  offsetof(StgInd, indirectee) == offsetof(StgIndStatic, indirectee) &&
+                  IND == 27 && IND_STATIC == 28 && BLACKHOLE == 38,
+                  "Rust stable name key closure layout");
+#else
 static StgClosure*
 removeIndirections (StgClosure* p)
 {
@@ -222,6 +235,7 @@ removeIndirections (StgClosure* p)
         return p;
     }
 }
+#endif
 
 /* Note [Stable name creation]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -249,13 +263,31 @@ makeStableName (Capability *cap, StgPtr p,
   /* removing indirections increases the likelihood
    * of finding a match in the stable name hash table.
    */
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+  StgClosure *q = UNTAG_CLOSURE((StgClosure *)p);
+  switch (get_itbl(q)->type) {
+  case IND:
+  case IND_STATIC:
+  case BLACKHOLE: {
+    ptrdiff_t type_offset = offsetof(StgInfoTable, type);
+#if defined(TABLES_NEXT_TO_CODE)
+    type_offset -= (ptrdiff_t)sizeof(StgInfoTable);
+#endif
+    p = (StgPtr)ghc_rust_stable_name_key((StgClosure *)p, type_offset,
+        offsetof(StgInd, indirectee));
+    break;
+  }
+  default:
+    p = (StgPtr)q;
+  }
+#else
   p = (StgPtr)removeIndirections((StgClosure*)p);
 
   // register the untagged pointer.  This just makes things simpler.
   p = (StgPtr)UNTAG_CLOSURE((StgClosure*)p);
+#endif
 
-  StgWord sn = (StgWord)lookupHashTable(addrToStableHash,(W_)p);
-
+  StgWord sn = (StgWord)lookupHashTable(addrToStableHash, (W_)p);
   if (sn != 0) {
     ASSERT(stable_name_table[sn].addr == p);
     debugTrace(DEBUG_stable, "cached stable name %" FMT_Word " at %p", sn, p);
