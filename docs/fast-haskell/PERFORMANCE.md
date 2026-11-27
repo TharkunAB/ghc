@@ -51,6 +51,22 @@ Each cell is one run on the same previously built source tree, native Stage0 com
 
 The starting and published configurations ran 303 Haskell compile commands. The pilot ran 54. Only the edited producer generated code. The module artifacts of all 249 skipped importers, the compiler archive, shared library, compiler executable, and a separately compiled and executed GHC API consumer matched the ordinary reference. Each immediate no-op ran zero builder actions. The two separate starting benchmark jobs peaked at 2,564 and 2,578 MiB in their cgroups. The two-direction worker and pilot jobs peaked at 5,772 and 4,680 MiB. These are whole-job peaks, including the compiler and resident workers.
 
+### Cabal compiler-library installation
+
+We replayed the complete Stage1 GHC package copy with the original Cabal
+3.16.0.0 setup configuration and built libraries. Both timed arms used
+the same private Cabal executable and the same strip program. Changing
+the atomic copy buffer from 4 KiB to 128 KiB reduced the median from
+**4.188 s to 3.921 s** (6.4%) across four alternating pairs. It saved
+0.236–0.288 s per run. All 1,763 installed files matched ordinary Cabal
+in bytes and permissions, including the stripped archive and shared
+library. Diagnostics also matched.
+
+An untimed I/O check measured about 61,600 fewer read calls and 61,600
+fewer write calls. Pueue job 7210 used logical CPUs 20–23 and a 4 GiB
+cap. This was a private library install replay. The linked-build
+measurements use the existing Cabal copy code.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
