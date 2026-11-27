@@ -3,7 +3,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 core::arch::global_asm!(
-    ".hidden ghc_rust_collect_dead_weaks",
+    ".hidden ghc_rust_collect_dead_weak_generations",
     ".hidden ghc_rust_mark_weak_list",
     ".hidden ghc_rust_collect_fresh_weaks",
     ".hidden ghc_rust_init_weak_generations",
@@ -308,8 +308,7 @@ unsafe extern "C" fn ghc_rust_resurrect_unreachable_threads(
 }
 
 // See Note [Visiting dead weak pointers from Rust] in sm/MarkWeak.c.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_collect_dead_weaks(
+unsafe fn collect_dead_weaks(
     mut weak: *mut u8,
     pending: *mut *mut u8,
     gc_thread: *mut c_void,
@@ -326,6 +325,26 @@ unsafe extern "C" fn ghc_rust_collect_dead_weaks(
             (*payload).link = pending.read();
             pending.write(weak);
             weak = next;
+        }
+    }
+}
+
+// Visit each collected generation's old weak list in generation order.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_collect_dead_weak_generations(
+    generations: *mut u8,
+    stride: usize,
+    old_offset: usize,
+    collected: u32,
+    pending: *mut *mut u8,
+    gc_thread: *mut c_void,
+    payload_offset: usize,
+) {
+    unsafe {
+        for index in 0..=collected {
+            let generation = generations.add(index as usize * stride);
+            let old = generation.add(old_offset).cast::<*mut u8>().read();
+            collect_dead_weaks(old, pending, gc_thread, payload_offset);
         }
     }
 }

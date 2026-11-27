@@ -35,6 +35,9 @@ RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
     size_t live_offset, size_t old_offset, uint32_t collected, uint32_t oldest, bool nonmoving);
 RTS_PRIVATE bool ghc_rust_traverse_weaks(void *context,
     bool (*run_pass)(void *context, uint8_t pass));
+RTS_PRIVATE void ghc_rust_collect_dead_weak_generations(generation *gens,
+    size_t stride, size_t old_offset, uint32_t collected, StgWeak **pending,
+    void *gc_thread_ptr, size_t payload_offset);
 RTS_PRIVATE void ghc_rust_tidy_thread_list(StgTSO **old, StgTSO *end,
     size_t link_offset, StgTSO **(*inspect)(StgTSO **));
 #endif
@@ -89,7 +92,9 @@ typedef enum { WeakPtrs, WeakThreads, WeakDone } WeakStage;
 static WeakStage weak_stage;
 #endif
 
+#if !defined(USE_RUST_WEAK_GC)
 static void    collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list);
+#endif
 static bool tidyWeakList (generation *gen);
 static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads);
 static void    tidyThreadList (generation *gen);
@@ -162,6 +167,12 @@ static bool runWeakPass(void *user, uint8_t pass)
 {
     WeakPassContext *ctx = user;
     bool changed = false;
+    if (pass == CollectDeadWeaks) {
+        ghc_rust_collect_dead_weak_generations(generations, sizeof(generation),
+            offsetof(generation, old_weak_ptr_list), N, ctx->dead, ctx->worker,
+            offsetof(StgWeak, cfinalizers));
+        return false;
+    }
     // The Rust caller uses the platform ABI. See mark_root in GC.c.
 #if defined(THREADED_RTS)
     gc_thread *saved = gct;
@@ -173,7 +184,6 @@ static bool runWeakPass(void *user, uint8_t pass)
         case TidyThreads: tidyThreadList(gen); break;
         case TidyWeakKeys: changed |= tidyWeakList(gen); break;
         case ResurrectThreads: changed |= resurrectUnreachableThreads(gen, ctx->resurrected); break;
-        case CollectDeadWeaks: collectDeadWeakPtrs(gen, ctx->dead); break;
         default: barf("runWeakPass: unknown pass %u", (unsigned)pass);
         }
     }
@@ -306,8 +316,6 @@ GHC_STATIC_ASSERT(WEAK_FIELD_OFFSET(key) == sizeof(void *) &&
                   WEAK_FIELD_OFFSET(finalizer) == 3 * sizeof(void *) &&
                   WEAK_FIELD_OFFSET(link) == 4 * sizeof(void *), "Rust weak payload layout");
 #undef WEAK_FIELD_OFFSET
-RTS_PRIVATE void ghc_rust_collect_dead_weaks(StgWeak *old, StgWeak **pending,
-    void *gc_thread_ptr, size_t payload_offset);
 RTS_PRIVATE bool ghc_rust_resurrect_unreachable_threads(StgTSO **old,
     StgTSO **resurrected, void *gc_thread_ptr, StgTSO *end,
     size_t link_offset, size_t what_next_offset,
@@ -324,12 +332,9 @@ RTS_PRIVATE void ghc_rust_collect_fresh_weaks(StgWeak **nursery, Capability **ca
     void (*check)(StgWeak *, StgWeak *));
 #endif
 
+#if !defined(USE_RUST_WEAK_GC)
 static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
 {
-#if defined(USE_RUST_WEAK_GC)
-    ghc_rust_collect_dead_weaks(gen->old_weak_ptr_list, dead_weak_ptr_list, gct,
-        offsetof(StgWeak, cfinalizers));
-#else
     StgWeak *w, *next_w;
     for (w = gen->old_weak_ptr_list; w != NULL; w = next_w) {
         // If we have C finalizers, keep the value alive for this GC.
@@ -342,8 +347,8 @@ static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
         w->link = *dead_weak_ptr_list;
         *dead_weak_ptr_list = w;
     }
-#endif
 }
+#endif
 
 /*
  * Deal with threads left on the old_threads list after GC has concluded,
