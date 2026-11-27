@@ -20,6 +20,7 @@ void    rememberOldStableNameAddresses ( void );
 
 void    threadStableNameTable ( evac_fn evac, void *user );
 void    gcStableNameTable     ( void );
+RTS_PRIVATE void sweepStableNameTableNonmoving ( bool (*is_alive)(StgClosure *) );
 void    updateStableNameTable ( bool full );
 
 void    stableNameLock            ( void );

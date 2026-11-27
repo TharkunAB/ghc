@@ -457,19 +457,5 @@ void nonmovingSweepStableNameTable(void)
     // a stable name can die during moving heap collection and we can't use
     // nonmovingIsAlive on those objects. Inefficient.
 
-    stableNameLock();
-    FOR_EACH_STABLE_NAME(
-        p, {
-            if (p->sn_obj != NULL) {
-                if (!is_alive((StgClosure*)p->sn_obj)) {
-                    p->sn_obj = NULL; // Just to make an assertion happy
-                    freeSnEntry(p);
-                } else if (p->addr != NULL) {
-                    if (!is_alive((StgClosure*)p->addr)) {
-                        p->addr = NULL;
-                    }
-                }
-            }
-        });
-    stableNameUnlock();
+    sweepStableNameTableNonmoving(is_alive);
 }

@@ -15,6 +15,7 @@ core::arch::global_asm!(
     ".hidden ghc_rust_exit_stable_name_table",
     ".hidden ghc_rust_reserve_stable_name",
     ".hidden ghc_rust_gc_stable_name_table",
+    ".hidden ghc_rust_sweep_stable_names",
     ".hidden ghc_rust_stable_name_key",
 );
 
@@ -261,6 +262,35 @@ pub(super) unsafe extern "C" fn ghc_rust_gc_stable_name_table(
                             trace(index);
                         }
                     }
+                }
+            }
+        });
+    }
+}
+
+/// Sweep names from the nonmoving snapshot without rewriting live slots.
+/// C holds the table lock and supplies the snapshot liveness predicate.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_sweep_stable_names(
+    table: *mut Entry,
+    count: usize,
+    free: *mut *mut Entry,
+    hash: *mut HashTable,
+    is_alive: unsafe extern "C" fn(*mut c_void) -> bool,
+) {
+    unsafe {
+        visit_entries(table, count, |_, entry| {
+            let name = (*entry).sn_obj;
+            if name.is_null() {
+                return;
+            }
+            if !is_alive(name) {
+                (*entry).sn_obj = ptr::null_mut();
+                free_stable_name(entry, free, hash);
+            } else {
+                let addr = (*entry).addr;
+                if !addr.is_null() && !is_alive(addr) {
+                    (*entry).addr = ptr::null_mut();
                 }
             }
         });

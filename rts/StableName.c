@@ -56,6 +56,8 @@ RTS_PRIVATE void ghc_rust_gc_stable_name_table(snEntry *table, size_t count,
     StgClosure *(*is_alive)(StgClosure *),
     void (*trace_dead_name)(size_t, StgPtr),
     void (*trace_dead_pointee)(size_t));
+RTS_PRIVATE void ghc_rust_sweep_stable_names(snEntry *table, size_t count,
+    snEntry **free, HashTable *hash, bool (*is_alive)(StgClosure *));
 RTS_PRIVATE StgClosure *ghc_rust_stable_name_key(StgClosure *p,
     ptrdiff_t info_type_offset, size_t indirectee_offset);
 #endif
@@ -446,6 +448,30 @@ gcStableNameTable( void )
                         debugTrace(DEBUG_stable, "GC'd pointee %ld",
                                    (long)(p - stable_name_table));
                     }
+                }
+            }
+        });
+#endif
+    stableNameUnlock();
+}
+
+void
+sweepStableNameTableNonmoving(bool (*is_alive)(StgClosure *))
+{
+    stableNameLock();
+#if defined(USE_RUST_STABLE_NAME_TABLE)
+    ghc_rust_sweep_stable_names(stable_name_table, SNT_size,
+        &stable_name_free, addrToStableHash, is_alive);
+#else
+    FOR_EACH_STABLE_NAME(
+        p, {
+            if (p->sn_obj != NULL) {
+                if (!is_alive((StgClosure *)p->sn_obj)) {
+                    p->sn_obj = NULL;
+                    freeSnEntry(p);
+                } else if (p->addr != NULL &&
+                           !is_alive((StgClosure *)p->addr)) {
+                    p->addr = NULL;
                 }
             }
         });
