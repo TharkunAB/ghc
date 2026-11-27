@@ -16,6 +16,7 @@ extra-source-files:
     configure.ac
     rust/file_lock.rs
     rust/lib.rs
+    rust/profiler_json.rs
 
 extra-tmp-files:
     autom4te.cache

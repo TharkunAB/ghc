@@ -13,30 +13,33 @@ rtsRules = priority 3 $ do
     -- to be linked into the rts dll.
     forM_ [Stage1, Stage2, Stage3 ] $ \ stage -> do
         let buildPath = root -/- buildDir (rtsContext stage)
-        buildPath -/- "rust-rts.o" %> buildRustRts stage
+        buildPath -/- "rust-rts.o" %>
+            buildRustRts stage "ghc_rts" "rts/rust/lib.rs" ["rts/rust/file_lock.rs"]
+        buildPath -/- "rust-rts-profiler-json.o" %>
+            buildRustRts stage "ghc_rts_profiler_json" "rts/rust/profiler_json.rs" []
         buildPath -/- "libHSghc-internal-*.def" %> buildGhcInternalImportDef
         buildPath -/- "libHSghc-internal-*.dll.a" %> buildGhcInternalImportLib stage
 
--- | Return the Rust objects to include in the RTS libraries for this stage.
-rtsRustObjects :: Stage -> Action [FilePath]
-rtsRustObjects stage = do
+-- | Return the Rust objects for an RTS library way.
+rtsRustObjects :: Stage -> Way -> Action [FilePath]
+rtsRustObjects stage way = do
     rustc <- rtsRustCompiler stage
     if null rustc then pure [] else do
         path <- rtsBuildPath stage
-        pure [path -/- "rust-rts.o"]
+        pure $ (path -/- "rust-rts.o") :
+            [path -/- "rust-rts-profiler-json.o" | Profiling `wayUnit` way]
 
--- | Compile the Rust RTS code to a PIC object used in all ways.
-buildRustRts :: Stage -> FilePath -> Action ()
-buildRustRts stage output = do
+-- | Compile a Rust RTS crate to a PIC object.
+buildRustRts :: Stage -> String -> FilePath -> [FilePath] -> FilePath -> Action ()
+buildRustRts stage crate source modules output = do
     rustc <- rtsRustCompiler stage
     when (null rustc) $ fail "The Rust RTS requires --enable-rust-rts."
     _ <- setting RustRtsCompilerVersion
-    let source = "rts/rust/lib.rs"
-    need [rustc, source, "rts/rust/file_lock.rs"]
+    need (rustc : source : modules)
     createDirectory (takeDirectory output)
     prog <- exeSpawnPath rustc
     cmdExe prog
-        [ "--edition=2024", "--crate-name=ghc_rts", "--crate-type=lib"
+        [ "--edition=2024", "--crate-name=" ++ crate, "--crate-type=lib"
         , "--target=x86_64-unknown-linux-gnu", "--emit=obj"
         , "-Cpanic=abort", "-Crelocation-model=pic", "-Ccodegen-units=1"
         , "-Copt-level=2", "-o", output, source

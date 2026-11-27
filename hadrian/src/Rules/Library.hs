@@ -205,7 +205,7 @@ extraObjects context
             _     -> return []
 
     | package context == rts = do
-          rustObjs <- rtsRustObjects (stage context)
+          rustObjs <- rtsRustObjects (stage context) (way context)
           target   <- interpretInContext context getStagedTarget
           if not (archOS_OS (tgtArchOs target) == OSMinGW32
                 && Dynamic `wayUnit` way context)
