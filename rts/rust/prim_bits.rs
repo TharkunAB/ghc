@@ -49,6 +49,11 @@ transform!(usize, u16, hs_bswap16, swap_bytes);
 transform!(usize, u32, hs_bswap32, swap_bytes);
 transform!(u64, u64, hs_bswap64, swap_bytes);
 
+#[unsafe(no_mangle)]
+pub extern "C" fn hs_mulIntMayOflo(a: usize, b: usize) -> usize {
+    (a as isize).overflowing_mul(b as isize).1 as usize
+}
+
 fn deposit(mut value: u64, mut mask: u64) -> u64 {
     let mut result = 0;
     while mask != 0 {
