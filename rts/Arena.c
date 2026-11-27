@@ -60,7 +60,8 @@ void ghc_rust_arena_acquire(bdescr *previous, size_t words, ArenaGroup *out)
         bd = allocBlock_lock();
     } else {
         StgWord blocks = words / BLOCK_SIZE_W + (words % BLOCK_SIZE_W != 0);
-        bd = allocGroup_lock(blocks);
+        // A zero-size request still needs a group if the current one is full.
+        bd = allocGroup_lock(stg_max(blocks, 1));
         bd->gen_no  = 0;
         bd->gen     = NULL;
         bd->dest_no = 0;

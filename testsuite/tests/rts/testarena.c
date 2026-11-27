@@ -44,6 +44,18 @@ int main(int argc, char **argv)
     assert(large[2 * BLOCK_SIZE] == 5);
 
     arenaFree(arena);
+
+    // A full group must leave a valid cursor for the next zero-size request.
+    arena = newArena();
+    unsigned char *full = arenaAlloc(arena, BLOCK_SIZE);
+    full[BLOCK_SIZE - 1] = 42;
+    zero = arenaAlloc(arena, 0);
+    small = arenaAlloc(arena, 1);
+    assert(zero == small);
+    assert((uintptr_t)small % 8 == 0);
+    *small = 71;
+    assert(full[BLOCK_SIZE - 1] == 42);
+    arenaFree(arena);
     hs_exit();
     return 0;
 }
