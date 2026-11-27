@@ -25,6 +25,8 @@ Both stages use `c33551f`. On the 956-module dependency scan, a fresh daemon wit
 
 Hadrian now writes each library stamp from one rule. This removed an extra package copy and database refresh that a faster linker exposed. With the fix, one capability and the active scan worker, the median linked compiler edit took 12.12 s with BFD and 9.33 s with mold. All four immediately following unchanged builds ran zero builders. [Matched linked-target measurements](rebuild-c33551f.md#fix-for-the-repeated-package-copy)
 
+An edit to `GHC.Utils.Misc` triggered 305 compiler invocations. GHC skipped code generation for 304 importers. In a separate experiment, routing these requests through the worker reduced the median linked rebuild from 33.44 s to 26.01 s. Both producer object hashes differed. [High-fanout rebuild and artifact checks](high-fanout.md)
+
 ### Development workers at fa68e89
 
 A previous diagnostic-free parse can establish that a module has no CPP prerequisites or source line markers. The worker saves this result in a bounded file. After a restart it checks the preprocessed source and parser settings, then asks GHC to resolve imports and emit dependencies. Linux workers verify the executable and file-backed executable mappings before using the file. Replacing a library at the same path invalidated earlier records in the verification fixture.
