@@ -43,6 +43,7 @@ extra-source-files:
     rust/liveness.rs
     rust/mark_weak.rs
     rust/mblock_extents.rs
+    rust/pap_bitmap.rs
     rust/poll_slots.rs
     rust/pool.rs
     rust/posix_getenv.rs

@@ -62,6 +62,7 @@ rtsRules = priority 3 $ do
                 , "rts/rust/liveness.rs"
                 , "rts/rust/mark_weak.rs"
                 , "rts/rust/mblock_extents.rs"
+                , "rts/rust/pap_bitmap.rs"
                 , "rts/rust/prim_float.rs"
                 , "rts/rust/pool.rs"
                 , "rts/rust/stable_name.rs"
