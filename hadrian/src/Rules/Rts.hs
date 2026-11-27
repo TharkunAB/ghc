@@ -36,6 +36,7 @@ buildRustRts stage crate source modules output = do
     rustc <- rtsRustCompiler stage
     when (null rustc) $ fail "The Rust RTS requires --enable-rust-rts."
     _ <- setting RustRtsCompilerVersion
+    need [sourcePath -/- "Rules/Rts.hs"]
     need (rustc : source : modules)
     createDirectory (takeDirectory output)
     prog <- exeSpawnPath rustc
