@@ -1,7 +1,7 @@
 use super::{
-    CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE, CENSUS_BLOCKS, CENSUS_COLLECTED, CENSUS_FILLED,
-    CENSUS_SIZE, CENSUS_WORDS, NM_ACTIVE, NM_BLOCK_COUNT, NM_BLOCK_SIZE, NM_FILLED, SEG_BITMAP,
-    SEG_LINK, SEG_STRUCT_SIZE, closure_words,
+    BD_NEXT_FREE_SNAP, BD_SCAN, CAP_CURRENT_SEGMENTS, CENSUS_ACTIVE, CENSUS_BLOCKS,
+    CENSUS_COLLECTED, CENSUS_FILLED, CENSUS_SIZE, CENSUS_WORDS, NM_ACTIVE, NM_BLOCK_COUNT,
+    NM_BLOCK_SIZE, NM_FILLED, SEG_BITMAP, SEG_LINK, SEG_NEXT_FREE, SEG_STRUCT_SIZE, closure_words,
 };
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -130,5 +130,66 @@ unsafe extern "C" fn ghc_rust_stopped_allocator_census(
             census.n_live_words = census.n_live_words.wrapping_add(words);
         }
         out.write(census);
+    }
+}
+
+core::arch::global_asm!(".hidden ghc_rust_sweep_segment");
+
+#[repr(u32)]
+enum SweepResult {
+    Free,
+    Partial,
+    Filled,
+}
+
+/// Clear dead marks and record the first free block before the segment is published.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_sweep_segment(
+    seg: *mut u8,
+    bd: *mut u8,
+    block_size: u16,
+    block_count: u16,
+    epoch: u8,
+) -> SweepResult {
+    unsafe {
+        let count = usize::from(block_count);
+        let marks = seg.add(SEG_BITMAP).cast::<AtomicU8>();
+        // Only the sweeper writes these marks until it publishes the segment.
+        let mut first_free = 0;
+        while first_free < count && (*marks.add(first_free)).load(Ordering::Relaxed) == epoch {
+            first_free += 1;
+        }
+        if first_free == count {
+            return if count == 0 {
+                SweepResult::Free
+            } else {
+                SweepResult::Filled
+            };
+        }
+
+        (*marks.add(first_free)).store(0, Ordering::Relaxed);
+        seg.add(SEG_NEXT_FREE)
+            .cast::<u16>()
+            .write(first_free as u16);
+        bd.add(BD_NEXT_FREE_SNAP)
+            .cast::<u16>()
+            .write(first_free as u16);
+        let block = first_block(seg, count).add(first_free * usize::from(block_size));
+        bd.add(BD_SCAN).cast::<*const u8>().write(block);
+
+        let mut live = first_free != 0;
+        for index in first_free + 1..count {
+            let mark = &*marks.add(index);
+            if mark.load(Ordering::Relaxed) == epoch {
+                live = true;
+            } else {
+                mark.store(0, Ordering::Relaxed);
+            }
+        }
+        if live {
+            SweepResult::Partial
+        } else {
+            SweepResult::Free
+        }
     }
 }

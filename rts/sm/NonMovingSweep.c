@@ -25,6 +25,14 @@ enum SweepResult {
     SEGMENT_FILLED    // segment is full: place on filled list
 };
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+RTS_PRIVATE uint32_t ghc_rust_sweep_segment(struct NonmovingSegment *seg, bdescr *bd,
+                                            uint16_t block_size, uint16_t block_count,
+                                            uint8_t epoch);
+GHC_STATIC_ASSERT(SEGMENT_FREE == 0 && SEGMENT_PARTIAL == 1 && SEGMENT_FILLED == 2,
+                  "Rust sweep result matches enum SweepResult");
+#endif
+
 // Determine which list a marked segment should be placed on and initialize
 // next_free indices as appropriate. Additionally, we must clear the mark
 // bitmap entries associated with swept blocks.
@@ -32,6 +40,16 @@ GNUC_ATTR_HOT static enum SweepResult
 nonmovingSweepSegment(struct NonmovingSegment *seg)
 {
     ASSERT_SEGMENT_STATE(seg, FILLED_SWEEPING);
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    bdescr *bd = Bdescr((StgPtr)seg);
+    const struct NonmovingAllocator *alloc =
+        &nonmovingHeap.allocators[bd->nonmoving_segment.allocator_idx];
+    enum SweepResult result = ghc_rust_sweep_segment(seg, bd, alloc->block_size,
+                                                     alloc->block_count, nonmovingMarkEpoch);
+    ASSERT(result != SEGMENT_FREE ||
+           (seg->next_free == 0 && bd->nonmoving_segment.next_free_snap == 0));
+    return result;
+#else
     const nonmoving_block_idx blk_cnt = nonmovingSegmentBlockCount(seg);
     bool found_free = false;
     bool found_live = false;
@@ -70,6 +88,7 @@ nonmovingSweepSegment(struct NonmovingSegment *seg)
         ASSERT(nonmovingSegmentInfo(seg)->next_free_snap == 0);
         return SEGMENT_FREE;
     }
+#endif
 }
 
 #if defined(DEBUG)
