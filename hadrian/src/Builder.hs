@@ -8,10 +8,11 @@ module Builder (
     -- * Builder properties
     builderProvenance, systemBuilderPath, builderPath, isSpecified, needBuilders,
     runBuilder, runBuilderWith, runBuilderWithCmdOptions, getBuilderPath,
-    builderEnvironment, remBuilderEnvironment, dependencyWorkerRules
+    builderEnvironment, remBuilderEnvironment, dependencyWorkerRules,
+    normalizedIfaceWorker, ifaceWorkerQuery, fileSHA256
     ) where
 
-import Control.Exception (evaluate)
+import Control.Exception (IOException, evaluate)
 import Control.Exception.Extra (Partial)
 import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString.Base16 as Base16
@@ -231,6 +232,13 @@ instance Hashable CompileCheckWorker
 instance NFData CompileCheckWorker
 type instance RuleResult CompileCheckWorker = Maybe (FilePath, FilePath, String)
 
+-- | Stage compiler selected for the opt-in normalized import rules.
+newtype IfaceWorker = IfaceWorker FilePath deriving (Eq, Generic, Show)
+instance Binary IfaceWorker
+instance Hashable IfaceWorker
+instance NFData IfaceWorker
+type instance RuleResult IfaceWorker = Maybe (FilePath, FilePath, String)
+
 -- | Shake key for the SHA-256 digest of a stage compiler executable.
 newtype CompilerHash = CompilerHash FilePath deriving (Eq, Generic, Show)
 instance Binary CompilerHash
@@ -255,12 +263,70 @@ dependencyWorkerRules = do
         getEnv "HADRIAN_DEPENDENCY_WORKER" >>= maybe (pure Nothing) (preparedWorker False)
     void $ addOracle $ \CompileCheckWorker ->
         getEnv "HADRIAN_COMPILE_CHECK_WORKER" >>= maybe (pure Nothing) (preparedWorker True)
+    void $ addOracle $ \(IfaceWorker compiler) -> do
+        getEnv "HADRIAN_NORMALIZED_IFACE_WORKER" >>= maybe (pure Nothing) (prepareIface compiler)
     void $ addOracleCache $ \(CompilerHash compiler) -> do
         need [compiler]
-        liftIO $ either (const Nothing) Just <$> tryIOError
-            (withBinaryFile compiler ReadMode $ \handle -> do
-                digest <- evaluate . SHA256.hashlazy =<< BSL.hGetContents handle
-                pure . BSC.unpack $ Base16.encode digest)
+        liftIO $ fileSHA256 compiler
+
+-- | SHA-256 of the bytes read from a file.
+fileSHA256 :: FilePath -> IO (Maybe String)
+fileSHA256 file =
+    either (const Nothing) Just <$> tryIOError
+        (withBinaryFile file ReadMode $ \handle -> do
+            digest <- evaluate . SHA256.hashlazy =<< BSL.hGetContents handle
+            pure . BSC.unpack $ Base16.encode digest)
+
+-- | Match the helper to the stage compiler and the compiler's actual target libdir.
+normalizedIfaceWorker :: FilePath -> Action (Maybe (FilePath, FilePath, String))
+normalizedIfaceWorker = askOracle . IfaceWorker
+
+prepareIface :: FilePath -> FilePath -> Action (Maybe (FilePath, FilePath, String))
+prepareIface compiler requested = do
+    opt <- preparedWorker False requested >>= matchWorker compiler
+    case opt of
+      Nothing -> pure Nothing
+      Just worker -> do
+        let release = takeDirectory worker
+            daemon = release -/- "ghc-worker-daemon"
+            verified = release -/- "verified"
+            metadata = release -/- "metadata"
+        available <- allM doesFileExist [daemon, verified]
+        if not available then pure Nothing else do
+          need [daemon, verified]
+          fields <- readFileLines metadata
+          case (filter (isPrefixOf "iface_capability=") fields,
+                mapMaybe (stripPrefix "compiler_libdir=") fields) of
+            (["iface_capability=yes"], [expected]) | isAbsolute expected -> do
+              executable <- liftIO $ tryIOError (Dir.executable <$> Dir.getPermissions daemon)
+              case executable of
+                Right True -> do
+                  reported <- queryCommand compiler ["--print-libdir"]
+                  case reported of
+                    [actual] | isAbsolute actual -> do
+                      paths <- liftIO $ tryIOError $
+                        (,) <$> Dir.canonicalizePath actual <*> Dir.canonicalizePath expected
+                      case paths of
+                        Right (actual', expected') | actual' == expected' -> do
+                          version <- ifaceWorkerQuery daemon ["--iface-capability-version"]
+                          if version == ["2"]
+                            then fmap (\digest -> (daemon, actual', digest)) <$> askOracle (CompilerHash daemon)
+                            else pure Nothing
+                        _ -> pure Nothing
+                    _ -> pure Nothing
+                _ -> pure Nothing
+            _ -> pure Nothing
+
+-- | Run a read-only interface capability request.
+ifaceWorkerQuery :: FilePath -> [String] -> Action [String]
+ifaceWorkerQuery daemon args = queryCommand daemon (["+RTS", "-N1", "--RTS"] ++ args)
+
+queryCommand :: FilePath -> [String] -> Action [String]
+queryCommand program args =
+    actionCatch (do
+      (Exit code, Stdout out, Stderr err) <- command [Timeout 20] program args
+      pure $ if code == ExitSuccess && null (err :: String) then lines out else [])
+      (\(_ :: IOException) -> pure [])
 
 -- | Read the selected release and require the check capability when requested.
 preparedWorker :: Bool -> FilePath -> Action (Maybe (FilePath, FilePath, String))

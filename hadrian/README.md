@@ -441,3 +441,24 @@ projects), as well as Well-Typed.
 [dynamic-windows-issue]: https://github.com/snowleopard/hadrian/issues/343
 [bin-dist-issue]: https://github.com/snowleopard/hadrian/issues/219
 [contributors]: https://github.com/snowleopard/hadrian/graphs/contributors
+
+### Experimental normalized interface dependencies
+
+For a local Stage1 compiler library rebuild, set
+`HADRIAN_NORMALIZED_IFACE_WORKER` to the absolute path of a prepared `ghc`
+worker shim with interface capability version 2. The release must match
+the stage compiler's executable and target library directory. This setting
+does not change which command compiles a module.
+
+This experiment applies to regular vanilla Haskell module builds that
+produce both static and dynamic interfaces. Hadrian considers providers
+with at least 64 distinct regular vanilla importers in the compiler package's
+dependency file. After the normal compilation action succeeds, a compatible
+worker checks both consumer interfaces and the current source and options.
+Hadrian uses a normalized receipt only for providers the consumer records
+in both ways. Other dependencies keep their ordinary paths.
+
+Leave the setting unset for final builds. A previously used receipt
+reverts to raw content when the release is disabled or no longer matches.
+The rule still tracks the available static and dynamic interfaces. A missing
+dynamic interface is represented explicitly in the raw receipt.
