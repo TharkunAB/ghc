@@ -1663,10 +1663,15 @@ checkedSourceLiteral dfun selector target top_evidence evs match = do
       ops <- integer_op mod occ (expression fun)
       HsOverLit _ (OverLit (OverLitTc False witness lit_ty) (HsIntegral lit)) <- pure (expression arg)
       guard (not (il_neg lit) && il_value lit == k && lit_ty `eqType` integerTy)
-      HsApp _ convert raw <- pure witness
-      HsLit _ (XLit (HsInteger _ k' raw_ty)) <- pure (expression raw)
-      guard (k == k' && raw_ty `eqType` integerTy)
-      (ops ++) <$> integer_op num_module fromIntegerClassOpOcc (expression convert)
+      case expression witness of
+        HsLit _ (XLit (HsInteger _ k' raw_ty)) -> do
+          guard (k == k' && raw_ty `eqType` integerTy)
+          pure ops
+        HsApp _ convert raw -> do
+          HsLit _ (XLit (HsInteger _ k' raw_ty)) <- pure (expression raw)
+          guard (k == k' && raw_ty `eqType` integerTy)
+          (ops ++) <$> integer_op num_module fromIntegerClassOpOcc (expression convert)
+        _ -> Nothing
 
 {- Note [Certifying a source literal conversion]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

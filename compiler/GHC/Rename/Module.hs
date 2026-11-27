@@ -344,7 +344,7 @@ A unary list result can use the same element parameter, as in
 rev :: [a] -> [a]. Use the domain dependency check for that result.
 The row scan recognizes bracket list literals. The typed source checker
 still decides whether they desugar directly to constructors and checks
-each helper call. See Note [Composed source equations] in GHC.Tc.Gen.SourceTable.
+each helper call. See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
 
 For nodes :: forall a k. Tree k a -> Size, record Tree separately from
 the worker's bound parameters. The order of the forall does not control

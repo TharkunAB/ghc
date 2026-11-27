@@ -1250,7 +1250,8 @@ tcRetainedVarMatches herald ctxt initial_ty source_pats = go [] initial_ty initi
                _ -> failWithTc (TcRnRetainedQuantificationError RetainedVariablePattern)
            ; let index = mkLocalId name (idMult binder) (varType binder)
                  pat_ty = mkCheckExpFunPatTy (Scaled (idMult binder) (varType binder))
-           ; (wrap, result) <- go ((pat_ty, Just name) : acc)
+           ; (wrap, result) <- tcExtendTermScopeBinders [index] $
+                               go ((pat_ty, Just name) : acc)
                                   (applyTypeToArgs ty [Var index]) pats thing_inside
            ; return (liftRetainedLambdaWrap index wrap, result) }
       | FunTy { ft_af = af } <- coreFullView ty
@@ -1995,7 +1996,8 @@ checkRetainedRows (mb_motive_alias, capture_aliases) allow_linear allow_empty is
                   invis_pat_tys pat_tys plan rhs_ty
                   group@(MG { mg_alts = L loc _, mg_ext = (origin, ext_ann) })
                   written_rows synthesized
-  = maybe id (\(_, mid) -> tcCheckUsage (idName mid) ManyTy) mb_motive_alias $
+  = tcExtendTermScopeBinders [idx | RetainedConIndex idx <- plan] $
+    maybe id (\(_, mid) -> tcCheckUsage (idName mid) ManyTy) mb_motive_alias $
     do { arg_tys <- mapM argument_type pat_tys
        ; result_ty <- readExpType rhs_ty >>= liftZonkM . zonkTcType
        ; strict <- xoptM LangExt.Strict
@@ -2111,6 +2113,7 @@ checkRetainedRows (mb_motive_alias, capture_aliases) allow_linear allow_empty is
 
     check_row strict operands row arg_tys result_ty (L match_loc source_match)
       = setSrcSpanA match_loc $
+        tcExtendTermScopeBinders [f | (_, _, (_, fs)) <- row, f <- fs] $
         do { cvs <- forM row $ \(column, index, (con, fields)) ->
                do { cv <- newEvVar (mkNomEqPred (TermVarTy index)
                                      (retainedConIndex (varType index) con fields))

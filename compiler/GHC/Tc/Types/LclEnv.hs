@@ -11,6 +11,8 @@ module GHC.Tc.Types.LclEnv (
   , getLclEnvLoc
   , getLclEnvRdrEnv
   , getLclEnvTcLevel
+  , getLclEnvTermDepth
+  , getLclEnvIdDepths
   , getLclEnvThLevel
   , setLclEnvTcLevel
   , setLclEnvLoc
@@ -35,7 +37,7 @@ module GHC.Tc.Types.LclEnv (
 
 import GHC.Prelude
 
-import GHC.Tc.Utils.TcType ( TcLevel, TcType, TcTyVar )
+import GHC.Tc.Utils.TcType ( TcLevel, TcType, TcTyVar, TermScopeDepth )
 import GHC.Tc.Errors.Types ( TcRnMessage )
 
 import GHC.Core.UsageEnv ( UsageEnv )
@@ -100,12 +102,12 @@ data TcLclCtxt
         tcl_in_gen_code :: Bool,            -- Are we type checking a generated expression?
         tcl_err_ctxt    :: ErrCtxtStack,
         tcl_tclvl       :: TcLevel,
+        tcl_term_depth  :: !TermScopeDepth,
+        tcl_id_depths   :: !(VarEnv TermScopeDepth),
         tcl_lexical_givens :: LexicalGivens, -- Evidence parameters and written premises.
                                             -- See Note [Lexical Givens]
                                             -- in GHC.Tc.Utils.Monad.
         tcl_source_let_views :: VarEnv TcType, -- Candidates for argument selection.
-                                            -- See Note [Inferring through local definitions]
-                                            -- in GHC.Tc.Gen.App.
         tcl_bndrs       :: TcBinderStack,   -- Used for reporting relevant bindings,
                                             -- and for tidying type
 
@@ -164,6 +166,12 @@ modifyLclEnvTcLevel f = modifyLclCtxt (\env -> env { tcl_tclvl = f (tcl_tclvl en
 
 getLclEnvTcLevel :: TcLclEnv -> TcLevel
 getLclEnvTcLevel = tcl_tclvl . tcl_lcl_ctxt
+
+getLclEnvTermDepth :: TcLclEnv -> TermScopeDepth
+getLclEnvTermDepth = tcl_term_depth . tcl_lcl_ctxt
+
+getLclEnvIdDepths :: TcLclEnv -> VarEnv TermScopeDepth
+getLclEnvIdDepths = tcl_id_depths . tcl_lcl_ctxt
 
 setLclEnvLoc :: RealSrcSpan -> TcLclEnv -> TcLclEnv
 setLclEnvLoc loc = modifyLclCtxt (\lenv -> lenv { tcl_loc = loc })
@@ -269,3 +277,4 @@ cannot capture dictionaries introduced inside the proc.
 data ArrowCtxt   -- Note [Escaping the arrow scope]
   = NoArrowCtxt
   | ArrowCtxt LocalRdrEnv (TcRef WantedConstraints) LexicalGivens (VarEnv TcType)
+              TermScopeDepth (VarEnv TermScopeDepth)

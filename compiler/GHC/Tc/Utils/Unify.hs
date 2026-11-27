@@ -47,14 +47,16 @@ module GHC.Tc.Utils.Unify (
   checkTyEqRhs, recurseIntoTyConApp, recurseIntoFamTyConApp,
   PuResult(..), okCheckRefl, mapCheck,
   TyEqFlags(..),
-  notUnifying_TEFTask, unifyingLHSMetaTyVar_TEFTask, defaulting_TEFTask,
+  notUnifying_TEFTask, unifyingLHSMetaTyVar_TEFTask,
+  unifyingLHSMetaTyVarWithDepths_TEFTask, defaulting_TEFTask,
   pureTyEqFlags_LHSMetaTyVar, mkTEFA_Break,
 
   OccursCheck(..), LevelCheck(..), ConcreteCheck(..),
   TyEqFamApp(..), FamAppBreaker(..),
-  checkPromoteFreeVars,
+  checkPromoteFreeVars, checkPromoteFreeVarsWithDepths,
 
-  simpleUnifyCheck, UnifyCheckCaller(..), SimpleUnifyResult(..),
+  simpleUnifyCheck, simpleUnifyCheckWithDepths,
+  UnifyCheckCaller(..), SimpleUnifyResult(..),
 
   fillInferResult, fillInferResultNoInst,
 
@@ -83,7 +85,7 @@ import GHC.Tc.Utils.TcType
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.CtLoc
-  ( CtLoc
+  ( CtLoc, ctLocEnv, extendCtLocTermScope
   , mkKindEqLoc, adjustCtLoc, updateCtLocOrigin, ctLocOrigin
   , tyConAppRoleExplanation, appTyRoleExplanation
   )
@@ -119,7 +121,8 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Types.Name
 import GHC.Types.Name.Env ( lookupNameEnv )
 import GHC.Types.Name.Set ( extendNameSet )
-import GHC.Types.Id( idType )
+import GHC.Types.Id( idType, idInlineActivation )
+import GHC.Types.InlinePragma( isNeverActive )
 import GHC.Types.TypeEnv ( lookupTypeEnv )
 import GHC.Types.Var as Var
 import GHC.Types.Var.FV ( FV(..), runFV )
@@ -1317,9 +1320,7 @@ Use the reduced parameters only when the result has the required algebraic
 TyCon. Return the inverse reduction as the required nominal coercion. Do not
 unwrap a newtype, recheck an expression, or assign a native type to a metavariable.
 Other shapes keep the existing fallback and diagnostic context. This evaluates
-type-family equations, not term definitions. Cached argument selection uses the
-same nominal matching view; see Note [Family views in native argument inference] in
-GHC.Tc.Gen.App.
+type-family equations, not term definitions.
 -}
 
 ----------------------
@@ -3479,6 +3480,55 @@ uType env@(UE { u_role = role }) orig_ty1 orig_ty2
     go ty1@DepFunTy{} ty2@DepFunTy{}
       | ty1 `tcEqType` ty2 = return $ mkReflCo role ty1
 
+    -- Cross-decompose visible DepFunTy against ordinary visible FunTy.
+    -- When the binder does not occur in the non-dependent result, mkDepFunTyWithVis
+    -- collapses the unused DepFunVisible endpoint to a standard FunTy.
+    go (DepFunTy DepFunVisible b1 body1)
+       (FunTy { ft_af = FTF_T_T, ft_ma = ma2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
+      | isNativeOpaqueValueId b1
+      = do { co_ma  <- uType (env { u_role = funRole role SelMatch }) unmatchableDataConTy ma2
+           ; co_w   <- uType (env { u_role = funRole role SelMult  }) (idMult b1) w2
+           ; co_arg <- uType (env { u_role = funRole role SelArg   }) (varType b1) arg2
+           ; b_mult <- liftZonkM (zonkTcType (idMult b1))
+           ; b_ty   <- liftZonkM (zonkTcType (varType b1))
+           ; binder <- newSysLocalId (fsLit "retained") b_mult b_ty
+           ; if not (isNativeOpaqueValueId binder)
+             then defer orig_ty1 orig_ty2
+             else do
+               { let left_body = replaceTermVarInType b1 (TermVarTy binder) body1
+               ; co_body <- tcExtendTermScopeBinders [binder] $
+                            do { d' <- getTermScopeDepth
+                               ; let env_b = (updUEnvLoc env (extendCtLocTermScope binder d'))
+                                               { u_role = Nominal }
+                               ; uType env_b left_body res2 }
+               ; let dep_co = mkDepFunCoWithVis DepFunVisible DepFunVisible binder MRefl co_body
+                     fun_co = mkNakedFunCo role FTF_T_T co_ma co_w co_arg
+                                (mkReflCo (funRole role SelRes) res2)
+               ; return (mkTransCo (downgradeRole role Nominal dep_co) fun_co) } }
+
+    go (FunTy { ft_af = FTF_T_T, ft_ma = ma1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
+       (DepFunTy DepFunVisible b2 body2)
+      | isNativeOpaqueValueId b2
+      = do { co_ma  <- uType (env { u_role = funRole role SelMatch }) ma1 unmatchableDataConTy
+           ; co_w   <- uType (env { u_role = funRole role SelMult  }) w1 (idMult b2)
+           ; co_arg <- uType (env { u_role = funRole role SelArg   }) arg1 (varType b2)
+           ; b_mult <- liftZonkM (zonkTcType (idMult b2))
+           ; b_ty   <- liftZonkM (zonkTcType (varType b2))
+           ; binder <- newSysLocalId (fsLit "retained") b_mult b_ty
+           ; if not (isNativeOpaqueValueId binder)
+             then defer orig_ty1 orig_ty2
+             else do
+               { let right_body = replaceTermVarInType b2 (TermVarTy binder) body2
+               ; co_body <- tcExtendTermScopeBinders [binder] $
+                            do { d' <- getTermScopeDepth
+                               ; let env_b = (updUEnvLoc env (extendCtLocTermScope binder d'))
+                                               { u_role = Nominal }
+                               ; uType env_b res1 right_body }
+               ; let fun_co = mkNakedFunCo role FTF_T_T co_ma co_w co_arg
+                                (mkReflCo (funRole role SelRes) res1)
+                     dep_co = mkDepFunCoWithVis DepFunVisible DepFunVisible binder MRefl co_body
+               ; return (mkTransCo fun_co (downgradeRole role Nominal dep_co)) } }
+
     -- Functions (t1 -> t2) just check the two parts
     go (FunTy { ft_af = af1, ft_ma = ma1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
        (FunTy { ft_af = af2, ft_ma = ma2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
@@ -3746,56 +3796,84 @@ uUnfilledVar2 :: UnifyEnv       -- Precondition: u_role==Nominal
                                 --    definitely not a /filled/ meta-tyvar
               -> TcTauType      -- Type 2, zonked
               -> TcM CoercionN
-uUnfilledVar2 env@(UE { u_defer = def_eq_ref, u_given_eq_lvl = given_eq_lvl })
+uUnfilledVar2 env@(UE { u_defer = def_eq_ref, u_given_eq_lvl = given_eq_lvl, u_loc = loc })
               swapped tv1 ty2
-  | simpleUnifyCheck UC_OnTheFly given_eq_lvl tv1 ty2 /= SUC_CanUnify
-  = -- Simple unification check fails, so defer
-    do { traceTc "uUnfilledVar2 not ok" $
-             vcat [ text "tv1:" <+> ppr tv1
-                  , text "ty2:" <+> ppr ty2
-                  , text "given_eq_lvl:" <+> ppr given_eq_lvl
-                  , text "simple-unify-chk:" <+> ppr (simpleUnifyCheck UC_OnTheFly given_eq_lvl tv1 ty2)
-                  ]
-               -- Occurs check or an untouchable: just defer
-               -- NB: occurs check isn't necessarily fatal:
-               --     eg tv1 occurred in type family parameter
-       ; defer }
+  = do { lcl_depths <- getIdTermDepths
+       ; let id_depths = plusVarEnv (ctl_id_depths (ctLocEnv loc)) lcl_depths
+             suc       = simpleUnifyCheckWithDepths id_depths UC_OnTheFly given_eq_lvl tv1 ty2
+       ; if suc /= SUC_CanUnify
+         then do
+           { traceTc "uUnfilledVar2 not ok" $
+               vcat [ text "tv1:" <+> ppr tv1
+                    , text "ty2:" <+> ppr ty2
+                    , text "given_eq_lvl:" <+> ppr given_eq_lvl
+                    , text "simple-unify-chk:" <+> ppr suc
+                    ]
+           ; defer }
+         else do
+           { def_eqs <- readTcRef def_eq_ref  -- Capture current state of def_eqs
 
-  | otherwise
-  = do { def_eqs <- readTcRef def_eq_ref  -- Capture current state of def_eqs
+           -- Attempt to unify kinds
+           -- When doing so, be careful to preserve orientation;
+           --    see Note [Kind Equality Orientation] in GHC.Tc.Solver.Equality
+           --    and wrinkle (W2) in Note [Fundeps with instances, and equality orientation]
+           --        in GHC.Tc.Solver.Dict
+           -- Failing to preserve orientation led to #25597.
+           ; let kind_env = unSwap swapped (mkKindEnv env) ty1 ty2
+           ; co_k <- unSwap swapped (uType kind_env) (tyVarKind tv1) (typeKind ty2)
 
-       -- Attempt to unify kinds
-       -- When doing so, be careful to preserve orientation;
-       --    see Note [Kind Equality Orientation] in GHC.Tc.Solver.Equality
-       --    and wrinkle (W2) in Note [Fundeps with instances, and equality orientation]
-       --        in GHC.Tc.Solver.Dict
-       -- Failing to preserve orientation led to #25597.
-       ; let kind_env = unSwap swapped (mkKindEnv env) ty1 ty2
-       ; co_k <- unSwap swapped (uType kind_env) (tyVarKind tv1) (typeKind ty2)
+           ; traceTc "uUnfilledVar2 ok" $
+             vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
+                  , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
+                  , ppr (isReflCo co_k), ppr co_k ]
 
-       ; traceTc "uUnfilledVar2 ok" $
-         vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
-              , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
-              , ppr (isReflCo co_k), ppr co_k ]
+           ; if isReflCo co_k
+               -- Only proceed if the kinds match
+               -- NB: tv1 should still be unfilled, despite the kind unification
+               --     because tv1 is not free in ty2' (or, hence, in its kind)
+             then do { ty2' <- narrowMetaTermDepths env (metaTyVarTermDepth tv1) ty2
+                     ; unifyTyVar env tv1 ty2'
+                     ; return (mkNomReflCo ty2') }  -- Unification is always Nominal
 
-       ; if isReflCo co_k
-           -- Only proceed if the kinds match
-           -- NB: tv1 should still be unfilled, despite the kind unification
-           --     because tv1 is not free in ty2' (or, hence, in its kind)
-         then do { unifyTyVar env tv1 ty2
-                 ; return (mkNomReflCo ty2) }  -- Unification is always Nominal
-
-         else -- The kinds don't match yet, so defer instead.
-              do { writeTcRef def_eq_ref def_eqs
-                     -- Since we are discarding co_k, also discard any constraints
-                     -- emitted by kind unification; they are just useless clutter.
-                     -- Do this dicarding by simply restoring the previous state
-                     -- of def_eqs; a bit imperative/yukky but works fine.
-                 ; defer }
-         }
+             else -- The kinds don't match yet, so defer instead.
+                  do { writeTcRef def_eq_ref def_eqs
+                         -- Since we are discarding co_k, also discard any constraints
+                         -- emitted by kind unification; they are just useless clutter.
+                         -- Do this dicarding by simply restoring the previous state
+                         -- of def_eqs; a bit imperative/yukky but works fine.
+                     ; defer }
+           } }
   where
     ty1 = mkTyVarTy tv1
     defer = unSwap swapped (uType_defer env) ty1 ty2
+
+-- | Narrow any unfilled 'MetaTv' occurring free in 'ty' whose 'TermScopeDepth'
+-- exceeds 'dest_depth', preserving transitive scope safety during eager unification.
+-- See Note [Level-checked unification of runtime indices].
+narrowMetaTermDepths :: UnifyEnv -> TermScopeDepth -> TcType -> TcM TcType
+narrowMetaTermDepths env dest_depth ty
+  | not (anyFreeVarsOfType needs_narrow ty) = return ty
+  | otherwise = do
+      mapM_ narrow_one (tyCoVarsOfTypeList ty)
+      liftZonkM (zonkTcType ty)
+  where
+    needs_narrow v
+      | isTcTyVar v, Just d <- metaTyVarTermDepth_maybe v = d > dest_depth
+      | otherwise = False
+
+    narrow_one v
+      | isPromotableMetaTyVar v
+      , MetaTv { mtv_info = info, mtv_tclvl = lvl, mtv_term_depth = d } <- tcTyVarDetails v
+      , d > dest_depth
+      = do { mb_filled <- isFilledMetaTyVar_maybe v
+           ; case mb_filled of
+               Just rhs -> void (narrowMetaTermDepths env dest_depth rhs)
+               Nothing  -> do
+                 { v_kind' <- narrowMetaTermDepths env dest_depth (tyVarKind v)
+                 ; new_v <- TcM.cloneMetaTyVarWithInfoAndDepth info lvl dest_depth
+                              (setTyVarKind v v_kind')
+                 ; unifyTyVar env v (mkTyVarTy new_v) } }
+      | otherwise = return ()
 
 unifyTyVar :: UnifyEnv -> TcTyVar -> TcType -> TcM ()
 -- Actually do the unification, and record it in WhatUnifications
@@ -3817,6 +3895,12 @@ swapOverTyVars is_given tv1 tv2
   -- Priority: see Note [TyVar/TyVar orientation]
   | pri1 > pri2 = False
   | pri2 > pri1 = True
+
+  -- Term-scope depth: eliminate the deeper MetaTv first to avoid cloning.
+  | Just d1 <- metaTyVarTermDepth_maybe tv1
+  , Just d2 <- metaTyVarTermDepth_maybe tv2
+  , d1 /= d2
+  = d2 > d1
 
   -- Names: see Note [TyVar/TyVar orientation]
   | isSystemName tv2_name, not (isSystemName tv1_name) = True
@@ -4429,23 +4513,61 @@ and application, and Schmidt-Schauß, Sabel and Machkasova (LMCS 2015) for
 Haskell call-by-need evaluation.
 -}
 
+{- Note [Level-checked unification of runtime indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unification variables may bind types containing runtime indices ('TermVarTy',
+'TermAppTy') and visible retained dependent function types ('DepFunTy'
+'DepFunVisible') when every free runtime 'Id' is in scope at the unification
+variable's birth site (Gundry, McBride, and McKinna, "Type Inference in
+Context", MSFP 2010, pp. 43-54; Gundry, PhD thesis, University of Strathclyde,
+2013, §§6.2-6.3).
+
+Ordinary value binders in lambdas, patterns, and local @let@ groups do not bump
+'TcLevel'. Each unification variable therefore carries an immutable contextual
+birth depth 'mtv_term_depth', and 'TcLclCtxt' / 'CtLocEnv' record the birth
+depth of each local value 'Id' in 'tcl_id_depths' / 'ctl_id_depths'. Top-level
+bindings and imported 'GlobalId's have 'topTermScopeDepth' (0).
+
+Three rules maintain scope soundness:
+1. Direct assignment @alpha := rhs@ requires @depth(v) <= mtv_term_depth alpha@
+   for every free runtime 'Id' @v@ in @rhs@. In 'simpleUnifyCheckWithDepths', a
+   deeper 'Id' returns 'SUC_NotSure' rather than 'SUC_CannotUnify' so that
+   'checkTyEqRhs' can expand forgetful type synonyms (such as
+   @type Ignore x = Int@) before reporting 'cteSkolemEscape'.
+2. Assigning @alpha@ to a type mentioning an unfilled @beta@ with
+   @mtv_term_depth beta > mtv_term_depth alpha@ narrows @beta@ to
+   @mtv_term_depth alpha@ in both 'checkTyVar' and 'narrowMetaTermDepths'.
+3. Invisible retained functions ('DepFunTy' 'DepFunInvisible') do not unify
+   with 'TauTv' variables. Restricting 'TauTv' to predicative monotypes and
+   visible arrows preserves implicit instantiation confluence (Kovács,
+   "Elaboration with First-Class Implicit Function Types", ICFP 2020,
+   PACMPL 4(ICFP):101).
+-}
+
 simpleUnifyCheck :: UnifyCheckCaller -> TcLevel -> TcTyVar -> TcType -> SimpleUnifyResult
+simpleUnifyCheck = simpleUnifyCheckWithDepths emptyVarEnv
+
+simpleUnifyCheckWithDepths
+  :: VarEnv TermScopeDepth
+  -> UnifyCheckCaller -> TcLevel -> TcTyVar -> TcType -> SimpleUnifyResult
 -- ^ A fast check for unification. May return "not sure", in which case
 -- unification might still be OK, but it'll take more work to do
 -- (use the full 'checkTyEqRhs').
 --
--- See Note [simpleUnifyCheck]
+-- See Note [simpleUnifyCheck] and Note [Level-checked unification of runtime indices].
 --
 -- This function is pretty heavily used, so it's optimised not to allocate
-simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
+simpleUnifyCheckWithDepths id_depths caller given_eq_lvl lhs_tv rhs
   | not $ touchabilityTest given_eq_lvl lhs_tv = SUC_CannotUnify
   | not $ checkTopShape lhs_info rhs           = SUC_CannotUnify
-  | not (rhs_is_bad rhs)                       = SUC_CanUnify
+  | not (rhs_is_bad False emptyVarSet rhs)     = SUC_CanUnify
   | otherwise                                  = SUC_NotSure
   where
     lhs_info           = metaTyVarInfo lhs_tv
     lhs_tv_lvl         = tcTyVarLevel lhs_tv
+    lhs_depth          = metaTyVarTermDepth lhs_tv
     lhs_tv_is_concrete = isConcreteTyVar lhs_tv
+    lhs_tv_is_tyvartv  = isTyVarTyVar lhs_tv
     lhs_tv_nm          = tyVarName lhs_tv
 
     -- See Note [RuntimeUnkTv] in GHC.Runtime.Heap.Inspect, esp (RUT1).
@@ -4460,60 +4582,118 @@ simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
                UC_Solver     -> True
                UC_OnTheFly   -> False
 
-    rhs_tcv_is_bad tcv
+    deeper_meta_bad = case caller of
+                        UC_Solver   -> True
+                        UC_OnTheFly -> False
+
+    rhs_id_is_bad bound_ids v
+      | v `elemVarSet` bound_ids
+      = rhs_is_bad False bound_ids (varType v) || rhs_is_bad False bound_ids (idMult v)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv || forall_ok
+      = True
+      | not (isNativeOpaqueValueId v || isNativeIndexFunctionId v)
+      = True
+      | Just d <- lookupIdTermDepth id_depths v
+      , d <= lhs_depth
+      = rhs_is_bad False bound_ids (varType v) || rhs_is_bad False bound_ids (idMult v)
+      | otherwise
+      = True
+
+    rhs_tcv_is_bad bound_ids tcv
        -- c.f. checkTyVar, the TEFTyVar case
        | isCoVar tcv                                      = occ_check
-       | isId tcv                                        = True
+       | isId tcv                                         = rhs_id_is_bad bound_ids tcv
+       | tcv `elemVarSet` bound_ids                       = rhs_is_bad False bound_ids (tyVarKind tcv)
        | tcTyVarLevel tcv `strictlyDeeperThan` lhs_tv_lvl = True
+       | deeper_meta_bad
+       , Just d <- metaTyVarTermDepth_maybe tcv
+       , d > lhs_depth                                    = True
        | lhs_tv_is_concrete, not (isConcreteTyVar tcv)    = True
        | occ_check                                        = True
        | otherwise                                        = False
        where
          occ_check = simpleOccursCheck lhs_tv_nm tcv
 
-    rhs_is_bad (TermAppTy {}) = True
-    rhs_is_bad (TermVarTy {}) = True
-    rhs_is_bad (DepFunTy {})  = True
-    rhs_is_bad (ClassAppTy {}) = True
-    rhs_is_bad (DepDictTy {})  = True
-    rhs_is_bad ty@ExistsTy{}
-      = lhs_tv_is_concrete
-        || (not forall_ok && not (isPredicativeExistsTy ty))
-        || any rhs_tcv_is_bad (tyCoVarsOfTypeList ty)
-    rhs_is_bad (TyVarTy tv) = rhs_tcv_is_bad tv
+    rhs_dict_is_bad bound_ids (TermVarTy d)
+      | d `elemVarSet` bound_ids
+      = rhs_is_bad False bound_ids (varType d)
+      | isNativeClassDictionaryId d
+      , case lookupIdTermDepth id_depths d of
+          Just vd -> vd <= lhs_depth
+          Nothing -> isNeverActive (idInlineActivation d)
+      = rhs_is_bad False bound_ids (varType d)
+    rhs_dict_is_bad _ _ = True
 
-    rhs_is_bad (FunTy {ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = r})
-      | not forall_ok, isInvisibleFunArg af = True
-      | otherwise                           = rhs_is_bad ma || rhs_is_bad w || rhs_is_bad a || rhs_is_bad r
+    rhs_is_bad _ bound_ids (TermVarTy v) = rhs_id_is_bad bound_ids v
+    rhs_is_bad _ bound_ids (TermAppTy f arg)
+      | Just (dom, _) <- nativeIndexFunctionTys_maybe f
+      , typeKind arg `eqType` dom
+      = rhs_id_is_bad bound_ids f || rhs_is_bad False bound_ids arg
+      | otherwise = True
+    rhs_is_bad _ bound_ids (DepFunTy DepFunVisible b body)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv || forall_ok = True
+      | (isNativeOpaqueValueId b || isNativeIndexFunctionId b)
+      , tcIsLiftedTypeKind (typeKind body)
+      = rhs_is_bad False bound_ids (idMult b)
+        || rhs_is_bad False bound_ids (varType b)
+        || rhs_is_bad True (extendVarSet bound_ids b) body
+      | otherwise = True
+    rhs_is_bad _ _ (DepFunTy DepFunInvisible _ _) = True
+    rhs_is_bad _ bound_ids (ClassAppTy sel inst dict operand kind)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv || forall_ok = True
+      | not (isExternalName (getName sel)) = True
+      | otherwise = rhs_is_bad False bound_ids inst
+                    || rhs_dict_is_bad bound_ids dict
+                    || rhs_is_bad False bound_ids operand
+                    || rhs_is_bad False bound_ids kind
+    rhs_is_bad _ _ (DepDictTy {})  = True
+    rhs_is_bad _ bound_ids ty@(ExistsTy _ binder body)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv = True
+      | not forall_ok && not (isPredicativeExistsTy ty) = True
+      | rhs_is_bad False bound_ids (tyVarKind binder) = True
+      | binder /= lhs_tv
+      , rhs_is_bad False (extendVarSet bound_ids binder) body = True
+      | otherwise = False
+    rhs_is_bad _ bound_ids (TyVarTy tv) = rhs_tcv_is_bad bound_ids tv
 
-    rhs_is_bad ty@(TyConApp tc tys)
+    rhs_is_bad under_pi bound_ids (FunTy {ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = r})
+      | not (forall_ok || under_pi), isInvisibleFunArg af = True
+      | otherwise = rhs_is_bad False bound_ids ma || rhs_is_bad False bound_ids w
+                    || rhs_is_bad under_pi bound_ids a || rhs_is_bad under_pi bound_ids r
+
+    rhs_is_bad under_pi bound_ids ty@(TyConApp tc tys)
       | lhs_tv_is_concrete, not (isConcreteTyCon tc) = True
       | not forall_ok, not (isTauTyCon tc)           = True
-      | not fam_ok,    not (isFamFreeTyCon tc || is_unsat_scoped_fam_or_syn tc tys ty) = True
-      | otherwise                                    = any rhs_is_bad tys
+      | not fam_ok,    not (isFamFreeTyCon tc || is_unsat_scoped_fam_or_syn under_pi bound_ids tc tys ty) = True
+      | otherwise                                    = any (rhs_is_bad under_pi' bound_ids) tys
+      where
+        under_pi' = under_pi && isAlgTyCon tc && not (isClassTyCon tc)
+                      && length tys == tyConArity tc
+                      && tcIsLiftedTypeKind (typeKind ty)
 
-    rhs_is_bad (ForAllTy ma (Bndr tv _) ty)
-      | rhs_is_bad ma               = True
-      | not forall_ok               = True
-      | rhs_is_bad (tyVarKind tv)   = True
-      | tv /= lhs_tv, rhs_is_bad ty = True
-      | otherwise                   = False
+    rhs_is_bad under_pi bound_ids (ForAllTy ma (Bndr tv vis) ty)
+      | rhs_is_bad False bound_ids ma                           = True
+      | not (forall_ok || (under_pi && isInvisibleForAllTyFlag vis)) = True
+      | rhs_is_bad False bound_ids (tyVarKind tv)               = True
+      | tv /= lhs_tv
+      , rhs_is_bad under_pi (extendVarSet bound_ids tv) ty      = True
+      | otherwise                                               = False
 
-    rhs_is_bad (AppTy t1 t2)    = rhs_is_bad t1 || rhs_is_bad t2
-    rhs_is_bad (CastTy ty co)   = co_is_bad co || rhs_is_bad ty
-    rhs_is_bad (CoercionTy co)  = co_is_bad co
-    rhs_is_bad (LitTy {})       = False
+    rhs_is_bad _ bound_ids (AppTy t1 t2)  = rhs_is_bad False bound_ids t1 || rhs_is_bad False bound_ids t2
+    rhs_is_bad _ bound_ids (CastTy ty co) = co_is_bad bound_ids co || rhs_is_bad False bound_ids ty
+    rhs_is_bad _ bound_ids (CoercionTy co)= co_is_bad bound_ids co
+    rhs_is_bad _ _         (LitTy {})     = False
 
     -- An unsaturated scoped closed family (or a synonym over one) represents
     -- a codomain closure. It does not reduce before it receives its binder
     -- argument. Unify it on the fly. See Note [Prevent unification with type families].
-    is_unsat_scoped_fam_or_syn tc tys ty
+    is_unsat_scoped_fam_or_syn under_pi bound_ids tc tys ty
       | Just _ <- closedFamilyScope_maybe tc = tys `lengthLessThan` tyConArity tc
-      | isTypeSynonymTyCon tc, Just ty' <- coreView ty = not (rhs_is_bad ty')
+      | isTypeSynonymTyCon tc, Just ty' <- coreView ty = not (rhs_is_bad under_pi bound_ids ty')
       | otherwise = False
 
     -- Coercions: see Note [Occurs check and coercions]
-    co_is_bad co = anyFreeVarsOfCo rhs_tcv_is_bad co
+    co_is_bad bound_ids co = anyFreeVarsOfCo (rhs_tcv_is_bad bound_ids) co
 
 {- Note [simpleUnifyCheck]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4682,6 +4862,10 @@ data TyEqFlags m a
     , tefTyVar_allowNativeGivenRhs :: Bool
         -- ^ Check an existing native Given without assigning a metavariable.
         -- See Note [Rigid retained indices].
+    , tefTyVar_isTyVarTv :: Bool
+        -- ^ Reject non-variable types on a 'TyVarTv'.
+    , tefTyVar_forAllOK :: Bool
+        -- ^ Allow impredicative polytypes / invisible 'DepFunTy's.
     , tef_fam_app :: TyEqFamApp m a
         -- ^ How to deal with type family applications
     }
@@ -4728,8 +4912,10 @@ data LevelCheck m where
   -- True <=> lenient check, e.g. the levels have a chance of working out
   -- after promotion.
   LC_Check ::
-    { lc_lvlc    :: TcLevel
-    , lc_lenient :: Bool
+    { lc_lvlc       :: TcLevel
+    , lc_term_depth :: TermScopeDepth
+    , lc_id_depthsc :: VarEnv TermScopeDepth
+    , lc_lenient    :: Bool
     } -> LevelCheck m
 
   -- | Do a level check between the LHS tyvar and the occurrence tyvar.
@@ -4741,8 +4927,10 @@ data LevelCheck m where
   --   -  True <=> promote even under type families
   --             (see Note [Defaulting equalities] in GHC.Tc.Solver)
   LC_Promote
-    :: { lc_lvlp :: TcLevel
-       , lc_deep :: Bool
+    :: { lc_lvlp        :: TcLevel
+       , lc_term_depthp :: TermScopeDepth
+       , lc_id_depthsp  :: VarEnv TermScopeDepth
+       , lc_deep        :: Bool
        } -> LevelCheck TcM
 
 data ConcreteCheck m where
@@ -4845,6 +5033,8 @@ notUnifying_TEFTask occ_prob = \case
       , tefTyVar_levelCheck    = LC_None
       , tefTyVar_concreteCheck = CC_None
       , tefTyVar_allowNativeGivenRhs = False
+      , tefTyVar_isTyVarTv     = False
+      , tefTyVar_forAllOK      = True
       , tef_fam_app            = TEFA_Recurse
      }
     -- We need an occurs-check here, but no level check.
@@ -4856,12 +5046,21 @@ notUnifying_TEFTask occ_prob = \case
 -- Invariant: the argument 'TcTyVar' is a 'MetaTv'.
 unifyingLHSMetaTyVar_TEFTask :: CtEvidence -> TcTyVar -> TyEqFlags TcM Ct
 unifyingLHSMetaTyVar_TEFTask ev lhs_tv =
+  unifyingLHSMetaTyVarWithDepths_TEFTask (ctl_id_depths (ctLocEnv (ctEvLoc ev))) ev lhs_tv
+
+unifyingLHSMetaTyVarWithDepths_TEFTask
+  :: VarEnv TermScopeDepth -> CtEvidence -> TcTyVar -> TyEqFlags TcM Ct
+unifyingLHSMetaTyVarWithDepths_TEFTask id_depths ev lhs_tv =
   TEFTyVar
     { tefTyVar_occursCheck   = OC_Check (tyVarName lhs_tv) cteInsolubleOccurs
-    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp = tcTyVarLevel lhs_tv
-                                          , lc_deep = False }
+    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp        = tcTyVarLevel lhs_tv
+                                          , lc_term_depthp = metaTyVarTermDepth lhs_tv
+                                          , lc_id_depthsp  = id_depths
+                                          , lc_deep        = False }
     , tefTyVar_concreteCheck = mkConcreteCheck lhs_tv
     , tefTyVar_allowNativeGivenRhs = False
+    , tefTyVar_isTyVarTv     = isTyVarTyVar lhs_tv
+    , tefTyVar_forAllOK      = isRuntimeUnkTyVar lhs_tv || isQLInstTyVar lhs_tv
     , tef_fam_app            = mkTEFA_Break ev NomEq (BreakWanted ev lhs_tv)
     }
 
@@ -4871,12 +5070,16 @@ defaulting_TEFTask :: TcTyVar -> TyEqFlags TcM a
 defaulting_TEFTask lhs_tv =
   TEFTyVar
     { tefTyVar_occursCheck   = OC_Check (tyVarName lhs_tv) cteInsolubleOccurs
-    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp = tcTyVarLevel lhs_tv
-                                          , lc_deep = True }
+    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp        = tcTyVarLevel lhs_tv
+                                          , lc_term_depthp = metaTyVarTermDepth lhs_tv
+                                          , lc_id_depthsp  = emptyVarEnv
+                                          , lc_deep        = True }
               -- LC_Promote: promote deeper unification variables (DE4)
               -- lc_deep =  True: ...including under type families (DE5)
     , tefTyVar_concreteCheck = mkConcreteCheck lhs_tv
     , tefTyVar_allowNativeGivenRhs = False
+    , tefTyVar_isTyVarTv     = isTyVarTyVar lhs_tv
+    , tefTyVar_forAllOK      = isRuntimeUnkTyVar lhs_tv || isQLInstTyVar lhs_tv
     , tef_fam_app = TEFA_Recurse
     }
 
@@ -4894,12 +5097,18 @@ pureTyEqFlags_LHSMetaTyVar :: TyVar -> TyEqFlags Identity ()
 pureTyEqFlags_LHSMetaTyVar lhs_tv =
   TEFTyVar
     { tefTyVar_occursCheck   = OC_Check (tyVarName lhs_tv) cteInsolubleOccurs
-    , tefTyVar_levelCheck    = LC_Check { lc_lvlc = tcTyVarLevel lhs_tv
-                                        , lc_lenient = True }
+    , tefTyVar_levelCheck    = LC_Check { lc_lvlc       = tcTyVarLevel lhs_tv
+                                        , lc_term_depth = if isMetaTyVar lhs_tv
+                                                          then metaTyVarTermDepth lhs_tv
+                                                          else topTermScopeDepth
+                                        , lc_id_depthsc = emptyVarEnv
+                                        , lc_lenient    = True }
     , tefTyVar_concreteCheck = case isConcreteTyVar_maybe lhs_tv of
                                   Nothing -> CC_None
                                   Just {} -> CC_Check   -- No promotion
     , tefTyVar_allowNativeGivenRhs = False
+    , tefTyVar_isTyVarTv     = isTyVarTyVar lhs_tv
+    , tefTyVar_forAllOK      = isRuntimeUnkTyVar lhs_tv || isQLInstTyVar lhs_tv
     , tef_fam_app = TEFA_Recurse }
 
 
@@ -4942,13 +5151,15 @@ famAppBreaker BreakGiven fam_app    -- Givens
 
 famAppBreaker (BreakWanted ev lhs_tv) fam_app   -- Wanteds
   -- Occurs check or skolem escape; so flatten
-  = do { reason <- checkPromoteFreeVars cteInsolubleOccurs
-                     (tyVarName lhs_tv) lhs_tv_lvl
+  = do { lcl_depths <- getIdTermDepths
+       ; let id_depths = plusVarEnv (ctl_id_depths (ctLocEnv (ctEvLoc ev))) lcl_depths
+       ; reason <- checkPromoteFreeVarsWithDepths cteInsolubleOccurs
+                     (tyVarName lhs_tv) lhs_tv_lvl lhs_term_depth id_depths
                      (tyCoVarsOfType fam_app_kind)
        ; if not (cterHasNoProblem reason)  -- Failed to promote free vars
          then return $ PuFail reason
          else
-    do { new_tv_ty <-
+    do { new_tv_ty0 <-
           case lhs_tv_info of
             ConcreteTv conc_info ->
               -- Make a concrete tyvar if lhs_tv is concrete
@@ -4958,6 +5169,9 @@ famAppBreaker (BreakWanted ev lhs_tv) fam_app   -- Wanteds
               --       gamma[2,conc] ~ F beta[4]
               TcM.newConcreteTyVarTyAtLevel conc_info lhs_tv_lvl fam_app_kind
             _ -> TcM.newMetaTyVarTyAtLevel lhs_tv_lvl fam_app_kind
+       ; let new_tv_ty = case getTyVar_maybe new_tv_ty0 of
+               Just ntv -> mkTyVarTy (setMetaTyVarTermDepth ntv lhs_term_depth)
+               Nothing  -> new_tv_ty0
 
        ; (new_ev, hole) <- newWantedEqWithLoc cb_loc (ctEvRewriters ev)
                                                Nominal fam_app new_tv_ty
@@ -4965,9 +5179,9 @@ famAppBreaker (BreakWanted ev lhs_tv) fam_app   -- Wanteds
                       (mkReduction (HoleCo hole) new_tv_ty)) } }
   where
     fam_app_kind = typeKind fam_app
-    (lhs_tv_info, lhs_tv_lvl) =
+    (lhs_tv_info, lhs_tv_lvl, lhs_term_depth) =
       case tcTyVarDetails lhs_tv of
-         MetaTv { mtv_info = info, mtv_tclvl = lvl } -> (info,lvl)
+         MetaTv { mtv_info = info, mtv_tclvl = lvl, mtv_term_depth = d } -> (info, lvl, d)
          -- lhs_tv should be a meta-tyvar
          _ -> pprPanic "famAppBreaker BreakWanted: lhs_tv is not a meta-tyvar"
                 (ppr lhs_tv)
@@ -4982,7 +5196,7 @@ instance Outputable (TyEqFlags m a) where
              , ppr (mkTyConApp tc tys)
              , text "RetainedIds:" <+> ppr retained
              , ppr fam_app ] )
-    TEFTyVar occ lc conc native fam_app ->
+    TEFTyVar occ lc conc native _ _ fam_app ->
       text "TEFTyVar" <> braces (hcat (punctuate comma fields))
       where
         fields = [ text "OccursCheck:" <+> ppr occ ]
@@ -5012,8 +5226,8 @@ instance Outputable (ConcreteCheck m) where
   ppr (CC_Promote {}) = text "CC_Promote"
 instance Outputable (LevelCheck m) where
   ppr (LC_None) = text "LC_None"
-  ppr (LC_Check lvl lenient) = text "LC_Check" <+> ppr lvl <+> ppWhen lenient (text "(lenient)")
-  ppr (LC_Promote lvl deep)  = text "LC_Promote" <+> ppr lvl <+> ppWhen deep (text "(deep)")
+  ppr (LC_Check lvl _ _ lenient) = text "LC_Check" <+> ppr lvl <+> ppWhen lenient (text "(lenient)")
+  ppr (LC_Promote lvl _ _ deep)  = text "LC_Promote" <+> ppr lvl <+> ppWhen deep (text "(deep)")
 
 -- | Adjust the 'TyEqFlags' when going under a type family:
 --
@@ -5040,9 +5254,9 @@ famAppArgFlags flags = case flags of
       OC_Check tv _ -> OC_Check tv cteSolubleOccurs
       OC_None -> OC_None
     zap_lc = \case
-      LC_Promote { lc_lvlp = lvl, lc_deep = deeply }
+      LC_Promote { lc_lvlp = lvl, lc_term_depthp = td, lc_id_depthsp = ids, lc_deep = deeply }
         | not deeply
-        -> LC_Check { lc_lvlc = lvl, lc_lenient = False }
+        -> LC_Check { lc_lvlc = lvl, lc_term_depth = td, lc_id_depthsc = ids, lc_lenient = False }
       lc -> lc
 
 {- Note [checkTyEqRhs]
@@ -5151,83 +5365,189 @@ check_ty_eq_rhs :: forall m a
                 -> TcType           -- Already zonked
                 -> m (PuResult a Reduction)
 {-# INLINEABLE check_ty_eq_rhs #-}
-check_ty_eq_rhs flags ty
+check_ty_eq_rhs = check_ty_eq_rhs_bvs False emptyVarSet
+
+check_ty_eq_rhs_bvs :: forall m a
+                    .  Monad m
+                    => Bool
+                    -> VarSet
+                    -> TyEqFlags m a
+                    -> TcType
+                    -> m (PuResult a Reduction)
+{-# INLINEABLE check_ty_eq_rhs_bvs #-}
+check_ty_eq_rhs_bvs under_pi bound_ids flags ty
   = case ty of
-      -- See Note [Rigid retained indices]
+      -- See Note [Level-checked unification of runtime indices]
+      -- and Note [Rigid retained indices].
       TermAppTy f arg
-        | native_given || family_given
-        , Just (domain, _) <- nativeIndexFunctionTys_maybe f
+        | Just (domain, _) <- nativeIndexFunctionTys_maybe f
         , typeKind arg `eqType` domain
-        -> do { head_res <- check_runtime_id f
-              ; arg_res <- check_ty_eq_rhs flags arg
-              ; return ((\(Reduction co arg') ->
-                           mkReduction (mkTermAppCo f co) (TermAppTy f arg'))
-                         <$> (head_res *> arg_res)) }
+        -> if not (native_given || family_given) && tefConcrete flags
+           then return $ PuFail (cteProblem cteConcrete)
+           else if not (native_given || family_given) && is_tyvartv
+           then return $ PuFail impredicativeProblem
+           else do
+             { head_res <- check_runtime_id f
+             ; arg_res  <- check_ty_eq_rhs_bvs False bound_ids flags arg
+             ; return $ (\f' (Reduction co arg') ->
+                          mkReduction (mkTermAppCo f' co) (TermAppTy f' arg'))
+                        <$> head_res <*> arg_res }
         | otherwise
         -> return $ PuFail (cteProblem cteSkolemEscape)
+
       TermVarTy v
+        | v `elemVarSet` bound_ids
+        -> do { v_res <- check_bound_id v
+              ; return (mkReflRedn Nominal . TermVarTy <$> v_res) }
         | native_given || family_given
         , isNativeRetainedBinder v
         -> do { checked <- check_runtime_id v
-              ; return (mkReflRedn Nominal ty <$ checked) }
+              ; return (mkReflRedn Nominal . TermVarTy <$> checked) }
+        | tefConcrete flags
+        -> return $ PuFail (cteProblem cteConcrete)
+        | is_tyvartv
+        -> return $ PuFail impredicativeProblem
+        | isNativeOpaqueValueId v || isNativeIndexFunctionId v
+        , term_id_in_scope v
+        -> do { v_res <- check_bound_id v
+              ; return (mkReflRedn Nominal . TermVarTy <$> v_res) }
         | otherwise
         -> return $ PuFail (cteProblem cteSkolemEscape)
+
       DepFunTy vis index body
-        | native_given
-        , isNativeRetainedBinder index
-        , typeKind body `eqType` liftedTypeKind
-        -> do { body_res <- check_ty_eq_rhs flags body
-              ; return (mkDepFunRedn vis index <$> body_res) }
+        | tefConcrete flags
+        -> return $ PuFail (cteProblem cteConcrete)
+        | is_tyvartv
+        -> return $ PuFail impredicativeProblem
+        | isInvisibleDepFunFlag vis
+        , not (native_given || forall_ok)
+        -> return $ PuFail impredicativeProblem
+        | isNativeOpaqueValueId index || isNativeIndexFunctionId index
+        , tcIsLiftedTypeKind (typeKind body)
+        -> let body_under_pi = under_pi || not (isInvisibleDepFunFlag vis) in
+           if native_given
+           then do { body_res <- check_ty_eq_rhs_bvs body_under_pi (extendVarSet bound_ids index) flags body
+                   ; return (mkDepFunRedn vis index <$> body_res) }
+           else do { dom_res  <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType index)
+                   ; mult_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (idMult index)
+                   ; body_res <- check_ty_eq_rhs_bvs body_under_pi (extendVarSet bound_ids index) flags body
+                   ; case (dom_res, mult_res, body_res) of
+                       (PuOK c1 r_dom, PuOK c2 r_mult, PuOK c3 r_body)
+                         | isReflRedn r_dom, isReflRedn r_mult ->
+                         let dom'   = reductionReducedType r_dom
+                             mult'  = reductionReducedType r_mult
+                             index' = setVarType (setIdMult index mult') dom'
+                             r_body'
+                               | dom' `eqType` varType index && mult' `eqType` idMult index
+                               = r_body
+                               | otherwise
+                               = mkReduction
+                                   (reductionCoercion r_body)
+                                   (replaceTermVarInType index (TermVarTy index')
+                                     (reductionReducedType r_body))
+                         in return $ PuOK (c1 S.<> c2 S.<> c3) (mkDepFunRedn vis index' r_body')
+                       _ -> return $ ((\_ _ b -> mkDepFunRedn vis index b) <$> dom_res <*> mult_res <*> body_res)
+                              `seq_fail` PuFail (cteProblem cteSkolemEscape) }
         | otherwise
         -> return $ PuFail impredicativeProblem
-      -- The immutable Given exception above does not validate dictionary scope.
-      ClassAppTy {}   -> return $ PuFail (cteProblem cteSkolemEscape)
+
+      ClassAppTy sel inst dict operand kind
+        | not (native_given || family_given) && tefConcrete flags
+        -> return $ PuFail (cteProblem cteConcrete)
+        | not (native_given || family_given) && is_tyvartv
+        -> return $ PuFail impredicativeProblem
+        | isExternalName (getName sel)
+        -> do { inst_r <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) inst
+              ; dict_r <- check_dict_arg dict
+              ; op_r   <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) operand
+              ; kind_r <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) kind
+              ; case (inst_r, dict_r, op_r, kind_r) of
+                  (PuOK c1 r1, PuOK c2 r2, PuOK c3 r3, PuOK c4 r4)
+                    | isReflRedn r1, isReflRedn r2, isReflRedn r3, isReflRedn r4 ->
+                    return $ PuOK (c1 S.<> c2 S.<> c3 S.<> c4) $
+                      mkReflRedn Nominal $
+                        ClassAppTy sel (reductionReducedType r1) (reductionReducedType r2)
+                                       (reductionReducedType r3) (reductionReducedType r4)
+                  _ -> return $ ((\_ _ _ _ -> mkReflRedn Nominal ty) <$> inst_r <*> dict_r <*> op_r <*> kind_r)
+                         `seq_fail` PuFail (cteProblem cteSkolemEscape) }
+        | otherwise
+        -> return $ PuFail (cteProblem cteSkolemEscape)
       DepDictTy {}    -> return $ PuFail impredicativeProblem
       LitTy {}        -> return $ okCheckRefl ty
-      TyConApp tc tys -> checkTyConApp flags ty tc tys
-      TyVarTy tv      -> checkTyVar flags tv
+      TyConApp tc tys -> checkTyConApp_bvs under_pi bound_ids flags ty tc tys
+      TyVarTy tv
+        | tv `elemVarSet` bound_ids
+        -> do { k_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (tyVarKind tv)
+              ; case k_res of
+                  PuOK c r_k | isReflRedn r_k ->
+                    return $ PuOK c $ mkReflRedn Nominal $
+                      mkTyVarTy (setTyVarKind tv (reductionReducedType r_k))
+                  _ -> return $ k_res `seq_fail` PuFail impredicativeProblem }
+        | otherwise
+        -> checkTyVar flags tv
         -- Don't worry about foralls inside the kind; see Note [Checking for foralls]
         -- Nor can we expand synonyms; see Note [Occurrence checking: look inside kinds]
         --                             in GHC.Core.FVs
 
       FunTy {ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = r}
        | isInvisibleFunArg af  -- e.g.  Num a => blah
-       , not native_given     -- See Note [Rigid retained indices]
+       , not (native_given || forall_ok || under_pi)
        -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
        | otherwise
-       -> do { ma_res <- check_ty_eq_rhs flags ma
-             ; w_res <- check_ty_eq_rhs flags w
-             ; a_res <- check_ty_eq_rhs flags a
-             ; r_res <- check_ty_eq_rhs flags r
+       -> do { ma_res <- check_ty_eq_rhs_bvs False bound_ids flags ma
+             ; w_res  <- check_ty_eq_rhs_bvs False bound_ids flags w
+             ; a_res  <- check_ty_eq_rhs_bvs under_pi bound_ids flags a
+             ; r_res  <- check_ty_eq_rhs_bvs under_pi bound_ids flags r
              ; return (mkFunRedn Nominal af <$> ma_res <*> w_res <*> a_res <*> r_res) }
 
-      AppTy fun arg -> do { fun_res <- check_ty_eq_rhs flags fun
-                          ; arg_res <- check_ty_eq_rhs flags arg
+      AppTy fun arg -> do { fun_res <- check_ty_eq_rhs_bvs False bound_ids flags fun
+                          ; arg_res <- check_ty_eq_rhs_bvs False bound_ids flags arg
                           ; return (mkAppRedn <$> fun_res <*> arg_res) }
 
-      CastTy ty co  -> do { ty_res <- check_ty_eq_rhs flags ty
+      CastTy ty co  -> do { ty_res <- check_ty_eq_rhs_bvs False bound_ids flags ty
                           ; co_res <- checkCo flags co
                           ; return (mkCastRedn1 Nominal ty <$> co_res <*> ty_res) }
 
       CoercionTy co -> do { co_res <- checkCo flags co
                           ; return (mkReflCoRedn Nominal <$> co_res) }
 
-      ExistsTy {}
+      ExistsTy mode binder body
         | tefConcrete flags -> return $ PuFail (cteProblem cteConcrete)
-        | not (isPredicativeExistsTy ty)
+        | is_tyvartv        -> return $ PuFail impredicativeProblem
+        | not forall_ok, not (isPredicativeExistsTy ty)
         -> return $ PuFail impredicativeProblem
         | otherwise
-        -> do { let fuvs = filter isTcTyVar (tyCoVarsOfTypeList ty)
-                    mk_redn redns =
-                      let fuv_tys  = map reductionReducedType redns
-                          in_scope = mkInScopeSet (tyCoVarsOfTypes (ty : fuv_tys))
-                          subst    = zipTvSubst fuvs fuv_tys `Subst.setInScope` in_scope
-                          ty'      = substTy subst ty
-                      in mkReflRedn Nominal ty'
-              ; fuv_res <- mapM (checkTyVar flags) fuvs
-              ; return (mk_redn <$> sequenceA fuv_res) }
-      ForAllTy {}   -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
-         -- No need to worry about RuntimeUnkTv
+        -> do { kind_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (tyVarKind binder)
+              ; body_res <- check_ty_eq_rhs_bvs False (extendVarSet bound_ids binder) flags body
+              ; case (kind_res, body_res) of
+                  (PuOK c1 r_k, PuOK c2 r_b)
+                    | isReflRedn r_k, isReflRedn r_b ->
+                    let k'      = reductionReducedType r_k
+                        binder' = setTyVarKind binder k'
+                        b_raw   = reductionReducedType r_b
+                        body'   | k' `eqType` tyVarKind binder = b_raw
+                                | otherwise = substTyWith [binder] [mkTyVarTy binder'] b_raw
+                    in return $ PuOK (c1 S.<> c2) $
+                         mkReflRedn Nominal $
+                           ExistsTy mode binder' body'
+                  _ -> return $ ((\_ b -> b) <$> kind_res <*> body_res)
+                         `seq_fail` PuFail impredicativeProblem }
+      ForAllTy ma (Bndr tv vis) body
+        | forall_ok || (under_pi && isInvisibleForAllTyFlag vis)
+        -> do { ma_res   <- check_ty_eq_rhs_bvs False bound_ids flags ma
+              ; kind_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (tyVarKind tv)
+              ; body_res <- check_ty_eq_rhs_bvs under_pi (extendVarSet bound_ids tv) flags body
+              ; case (ma_res, kind_res, body_res) of
+                  (PuOK c1 r_ma, PuOK c2 r_k, PuOK c3 r_b)
+                    | isReflRedn r_ma, isReflRedn r_k, isReflRedn r_b ->
+                    let tv' = setTyVarKind tv (reductionReducedType r_k)
+                    in return $ PuOK (c1 S.<> c2 S.<> c3) $
+                         mkReflRedn Nominal $
+                           ForAllTy (reductionReducedType r_ma) (Bndr tv' vis) (reductionReducedType r_b)
+                  _ -> return $ ((\_ _ b -> b) <$> ma_res <*> kind_res <*> body_res)
+                         `seq_fail` PuFail impredicativeProblem }
+        | otherwise
+        -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
   where
     native_given = case flags of
       TEFTyVar { tefTyVar_allowNativeGivenRhs = True } -> True
@@ -5237,9 +5557,80 @@ check_ty_eq_rhs flags ty
       TEFTyFam { tefTyFam_allowRetainedIds = True } -> True
       _ -> False
 
+    is_tyvartv = case flags of
+      TEFTyVar { tefTyVar_isTyVarTv = b } -> b
+      _ -> False
+
+    forall_ok = case flags of
+      TEFTyVar { tefTyVar_forAllOK = b } -> b
+      _ -> False
+
+    no_break f = f { tef_fam_app = TEFA_Recurse }
+
+    seq_fail (PuFail r) _ = PuFail r
+    seq_fail _ fallback   = fallback
+
+    term_id_in_scope v = case flags of
+      TEFTyFam {} -> True
+      TEFTyVar { tefTyVar_levelCheck = lc } -> case lc of
+        LC_None -> True
+        LC_Check { lc_term_depth = d, lc_id_depthsc = ids, lc_lenient = lenient } ->
+          case lookupIdTermDepth ids v of
+            Just vd -> vd <= d
+            Nothing -> lenient && isLocalId v
+        LC_Promote { lc_term_depthp = d, lc_id_depthsp = ids } ->
+          case lookupIdTermDepth ids v of
+            Just vd -> vd <= d
+            Nothing -> False
+
+    check_bound_id v = do
+      vt_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType v)
+      vm_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (idMult v)
+      case (vt_res, vm_res) of
+        (PuOK c1 r_vt, PuOK c2 r_vm) | isReflRedn r_vt, isReflRedn r_vm ->
+          return $ PuOK (c1 S.<> c2) $
+            setVarType (setIdMult v (reductionReducedType r_vm)) (reductionReducedType r_vt)
+        (PuFail r1, PuFail r2) -> return $ PuFail (r1 S.<> r2)
+        (PuFail r1, _)         -> return $ PuFail r1
+        (_, PuFail r2)         -> return $ PuFail r2
+        _                      -> return $ PuFail (cteProblem cteSkolemEscape)
+
+    dict_id_in_scope d = case flags of
+      TEFTyFam {} -> True
+      TEFTyVar { tefTyVar_levelCheck = lc } -> case lc of
+        LC_None -> True
+        LC_Check { lc_term_depth = td, lc_id_depthsc = ids, lc_lenient = lenient } ->
+          case lookupIdTermDepth ids d of
+            Just vd -> vd <= td
+            Nothing -> isNeverActive (idInlineActivation d) || (lenient && isLocalId d)
+        LC_Promote { lc_term_depthp = td, lc_id_depthsp = ids } ->
+          case lookupIdTermDepth ids d of
+            Just vd -> vd <= td
+            Nothing -> isNeverActive (idInlineActivation d)
+
+    check_dict_arg (TermVarTy d)
+      | d `elemVarSet` bound_ids
+      = do { d_res <- check_bound_id d
+           ; return (mkReflRedn Nominal . TermVarTy <$> d_res) }
+      | family_given
+      = do { vt_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType d)
+           ; return (mkReflRedn Nominal (TermVarTy d) <$ vt_res) }
+      | native_given
+      = return (okCheckRefl (TermVarTy d))
+      | isNativeClassDictionaryId d && dict_id_in_scope d
+      = do { d_res <- check_bound_id d
+           ; return (mkReflRedn Nominal . TermVarTy <$> d_res) }
+    check_dict_arg _ = return $ PuFail (cteProblem cteSkolemEscape)
+
     check_runtime_id v
-      | family_given = check_ty_eq_rhs flags (varType v)
-      | otherwise = return (okCheckRefl (varType v))
+      | v `elemVarSet` bound_ids = check_bound_id v
+      | family_given = do
+          vt_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType v)
+          return (v <$ vt_res)
+      | native_given = return (PuOK mempty v)
+      | isNativeOpaqueValueId v || isNativeIndexFunctionId v
+      , term_id_in_scope v = check_bound_id v
+      | otherwise = return $ PuFail (cteProblem cteSkolemEscape)
 
 -------------------
 checkCo :: Monad m => TyEqFlags m a -> Coercion -> m (PuResult a Coercion)
@@ -5262,8 +5653,8 @@ checkCo flags co =
 
         -- Occurs check (can promote)
         | OC_Check lhs_tv occ_prob <- occ
-        , LC_Promote { lc_lvlp = lhs_tv_lvl } <- lc
-        -> do { reason <- checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl $
+        , LC_Promote { lc_lvlp = lhs_tv_lvl, lc_term_depthp = lhs_td, lc_id_depthsp = id_ds } <- lc
+        -> do { reason <- checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl lhs_td id_ds $
                           tyCoVarsOfCo co
                            -- See Note [Occurs check and coercions]
                           --  and Note [checkCo] (2)
@@ -5405,73 +5796,99 @@ says what to do:
 -}
 
 -------------------
-checkTyConApp :: Monad m
-              => TyEqFlags m a
-              -> TcType -> TyCon -> [TcType]
-              -> m (PuResult a Reduction)
-checkTyConApp flags tc_app tc tys
+checkTyConApp_bvs :: Monad m
+                  => Bool
+                  -> VarSet
+                  -> TyEqFlags m a
+                  -> TcType -> TyCon -> [TcType]
+                  -> m (PuResult a Reduction)
+checkTyConApp_bvs under_pi bound_ids flags tc_app tc tys
   | isTypeFamilyTyCon tc
   , let arity = tyConArity tc
   , tys `lengthAtLeast` arity
     -- See Note [Unsaturated family applications in kick-out and RHS checks]
     -- in GHC.Tc.Solver.InertSet.
   = if tys `lengthIs` arity
-    then checkFamApp flags tc_app tc tys  -- Common case
+    then checkFamApp_bvs bound_ids flags tc_app tc tys  -- Common case
     else do { let (fun_args, extra_args) = splitAt arity tys
                   fun_app                = mkTyConApp tc fun_args
-            ; fun_res   <- checkFamApp flags fun_app tc fun_args
-            ; extra_res <- mapCheck (check_ty_eq_rhs flags) extra_args
+            ; fun_res   <- checkFamApp_bvs bound_ids flags fun_app tc fun_args
+            ; extra_res <- mapCheck (check_ty_eq_rhs_bvs False bound_ids flags) extra_args
             ; return (mkAppRedns <$> fun_res <*> extra_res) }
 
   | Just ty' <- rewriterView tc_app
        -- e.g. S a  where  type S a = F [a]
        --             or   type S a = Int
        -- See Note [Forgetful synonyms in checkTyConApp]
-  = check_ty_eq_rhs flags ty'
+  = check_ty_eq_rhs_bvs under_pi bound_ids flags ty'
 
   | TEFTyVar { tefTyVar_allowNativeGivenRhs = True } <- flags
   , Just ty' <- coreView tc_app
        -- See Note [Rigid retained indices].
-  = check_ty_eq_rhs flags ty'
+  = check_ty_eq_rhs_bvs under_pi bound_ids flags ty'
 
   | not (isTauTyCon tc)
   = case coreView tc_app of
-      Just ty' -> check_ty_eq_rhs flags ty'
-      Nothing  -> return $ PuFail impredicativeProblem
+      Just ty' -> do
+        res <- check_ty_eq_rhs_bvs under_pi bound_ids flags ty'
+        return $ case res of
+          PuOK c r | isReflRedn r -> PuOK c (mkReflRedn Nominal tc_app)
+          other -> other
+      Nothing -> return $ PuFail impredicativeProblem
 
   | tefConcrete flags
   , not (isConcreteTyCon tc)
   = return $ PuFail (cteProblem cteConcrete)
 
   | otherwise  -- Recurse on arguments
-  = recurseIntoTyConApp flags tc tys
+  = recurseIntoTyConApp_bvs under_pi' bound_ids flags tc tys
+  where
+    under_pi' = under_pi && isAlgTyCon tc && not (isClassTyCon tc)
+                  && length tys == tyConArity tc
+                  && tcIsLiftedTypeKind (typeKind tc_app)
 
 -------------------
 recurseIntoTyConApp :: Monad m
                     => TyEqFlags m a
                     -> TyCon -> [TcType]
                     -> m (PuResult a Reduction)
-recurseIntoTyConApp flags tc tys
-  = do { tys_res <- mapCheck (check_ty_eq_rhs flags) tys
+recurseIntoTyConApp = recurseIntoTyConApp_bvs False emptyVarSet
+
+recurseIntoTyConApp_bvs :: Monad m
+                        => Bool
+                        -> VarSet
+                        -> TyEqFlags m a
+                        -> TyCon -> [TcType]
+                        -> m (PuResult a Reduction)
+recurseIntoTyConApp_bvs under_pi bound_ids flags tc tys
+  = do { tys_res <- mapCheck (check_ty_eq_rhs_bvs under_pi bound_ids flags) tys
        ; return (mkTyConAppRedn Nominal tc <$> tys_res) }
 
 recurseIntoFamTyConApp :: Monad m
                        => TyEqFlags m a
                        -> TyCon -> [TcType]
                        -> m (PuResult a Reduction)
-recurseIntoFamTyConApp flags tc tys
-  = recurseIntoTyConApp (famAppArgFlags flags) tc tys
+recurseIntoFamTyConApp = recurseIntoFamTyConApp_bvs emptyVarSet
+
+recurseIntoFamTyConApp_bvs :: Monad m
+                           => VarSet
+                           -> TyEqFlags m a
+                           -> TyCon -> [TcType]
+                           -> m (PuResult a Reduction)
+recurseIntoFamTyConApp_bvs bound_ids flags tc tys
+  = recurseIntoTyConApp_bvs False bound_ids (famAppArgFlags flags) tc tys
     -- famAppArgFlags: adjust flags when going under fam app
 
 -------------------
 
 -- | See Note [Family applications in canonical constraints]
-checkFamApp :: forall m a.
-               Monad m
-            => TyEqFlags m a
-            -> TcType -> TyCon -> [TcType]  -- Saturated family application
-            -> m (PuResult a Reduction)
-checkFamApp flags fam_app tc tys =
+checkFamApp_bvs :: forall m a.
+                   Monad m
+                => VarSet
+                -> TyEqFlags m a
+                -> TcType -> TyCon -> [TcType]
+                -> m (PuResult a Reduction)
+checkFamApp_bvs bound_ids flags fam_app tc tys =
   case flags of
     TEFTyFam { tefTyFam_tyCon = lhs_tc, tefTyFam_args = lhs_tys
              , tefTyFam_occursCheck = occ_prob }
@@ -5492,7 +5909,7 @@ checkFamApp flags fam_app tc tys =
           TEFA_Recurse   ->
             -- Simply recurse into the arguments.
             -- See (CFA4) in Note [Family applications in canonical constraints]
-            recurseIntoFamTyConApp flags tc tys
+            recurseIntoFamTyConApp_bvs bound_ids flags tc tys
           TEFA_Break brk ->
             -- Recurse into the arguments, and cycle-break if that fails
             --
@@ -5501,7 +5918,7 @@ checkFamApp flags fam_app tc tys =
             --
             -- NB: in the latter case, don't promote beta[4]; use 'recurseIntoFamTyConApp'
             -- which modifies the flags with 'famAppArgFlags'.
-            do { rec_res <- recurseIntoFamTyConApp flags tc tys
+            do { rec_res <- recurseIntoFamTyConApp_bvs bound_ids flags tc tys
                ; case rec_res of
                    PuOK {}   -> return rec_res
                    PuFail {} -> famAppBreaker brk fam_app
@@ -5526,6 +5943,8 @@ data TyVarCheckResult m where
   TyVarCheck_Promote
     :: Maybe TcLevel
          -- ^ @Just lvl@ <=> 'TyVar' needs to be promoted to @lvl@
+    -> Maybe TermScopeDepth
+         -- ^ @Just depth@ <=> 'MetaTv' needs its 'TermScopeDepth' narrowed
     -> Maybe ConcreteTvOrigin
          -- ^ @Just conc_orig@ <=> 'TyVar' needs to be make concrete
     -> TyVarCheckResult TcM
@@ -5543,9 +5962,10 @@ instance Semigroup (TyVarCheckResult m) where
     TyVarCheck_Error (e1 S.<> e2)
   e@(TyVarCheck_Error {}) <> _ = e
   _ <> e@(TyVarCheck_Error {}) = e
-  TyVarCheck_Promote l1 c1 <> TyVarCheck_Promote l2 c2 =
+  TyVarCheck_Promote l1 d1 c1 <> TyVarCheck_Promote l2 d2 c2 =
     TyVarCheck_Promote
       (combineMaybe minTcLevel l1 l2)
+      (combineMaybe minTermScopeDepth d1 d2)
       (combineMaybe const c1 c2) -- pick one 'ConcreteTvOrigin' arbitrarily
 
 combineMaybe :: (a -> a -> a) -> Maybe a -> Maybe a -> Maybe a
@@ -5585,16 +6005,17 @@ checkTyVar flags occ_tv
     do_rhs_checks :: [TyVarCheckResult m] -> m (PuResult a Reduction)
     do_rhs_checks checks =
       case mconcat checks of
-        TyVarCheck_Success                -> success
-        TyVarCheck_Promote mb_lvl mb_conc -> promote flags mb_lvl mb_conc
-        TyVarCheck_Error cte_prob         -> return $ PuFail cte_prob
+        TyVarCheck_Success                      -> success
+        TyVarCheck_Promote mb_lvl mb_d mb_conc  -> promote flags mb_lvl mb_d mb_conc
+        TyVarCheck_Error cte_prob               -> return $ PuFail cte_prob
 
     ---------------------
     -- occ_tv is definitely a MetaTyVar; we need to promote it/make it concrete
-    promote :: TyEqFlags TcM a -> Maybe TcLevel -> Maybe ConcreteTvOrigin
+    promote :: TyEqFlags TcM a -> Maybe TcLevel -> Maybe TermScopeDepth -> Maybe ConcreteTvOrigin
             -> TcM (PuResult a Reduction)
-    promote flags mb_lhs_tv_lvl mb_conc
-      | MetaTv { mtv_info = info_occ, mtv_tclvl = lvl_occ } <- tcTyVarDetails occ_tv
+    promote flags mb_lhs_tv_lvl mb_lhs_depth mb_conc
+      | MetaTv { mtv_info = info_occ, mtv_tclvl = lvl_occ, mtv_term_depth = d_occ }
+          <- tcTyVarDetails occ_tv
       = do { let new_info | Just conc <- mb_conc = ConcreteTv conc
                           | otherwise            = info_occ
                  new_lvl =
@@ -5603,6 +6024,10 @@ checkTyVar flags occ_tv
                       Just lhs_tv_lvl -> lhs_tv_lvl `minTcLevel` lvl_occ
                         -- c[conc,3] ~ p[tau,2]: want to clone p:=p'[conc,2]
                         -- c[tau,2]  ~ p[tau,3]: want to clone p:=p'[tau,2]
+                 new_depth =
+                    case mb_lhs_depth of
+                      Nothing    -> d_occ
+                      Just lhs_d -> lhs_d `minTermScopeDepth` d_occ
 
            -- Check the kind of occ_tv
            --
@@ -5619,7 +6044,7 @@ checkTyVar flags occ_tv
         do { let kind_co  = reductionCoercion kind_redn
                  new_kind = reductionReducedType kind_redn
                  occ_tv'  = setTyVarKind occ_tv new_kind
-           ; new_tv_ty <- promote_meta_tyvar new_info new_lvl occ_tv'
+           ; new_tv_ty <- promote_meta_tyvar new_info new_lvl new_depth occ_tv'
            ; return $ mkGReflLeftRedn Nominal new_tv_ty (mkSymCo kind_co)
            } }
 
@@ -5656,9 +6081,9 @@ tyVarLevelCheck :: LevelCheck m -> TcTyVar -> TyVarCheckResult m
 -- ^ The "interpreter" for 'LevelCheck'
 tyVarLevelCheck LC_None _ = TyVarCheck_Success
 tyVarLevelCheck lc occ_tv
-  | not occ_is_deeper
+  | not lvl_is_deeper && not depth_is_deeper
   = TyVarCheck_Success
-  | isSkolemTyVar occ_tv
+  | lvl_is_deeper && isSkolemTyVar occ_tv
   = TyVarCheck_Error (cteProblem cteSkolemEscape)
   | otherwise
   = case lc of
@@ -5666,15 +6091,20 @@ tyVarLevelCheck lc occ_tv
         if lenient
         then TyVarCheck_Success
         else TyVarCheck_Error (cteProblem cteSkolemEscape)
-      LC_Promote { lc_lvlp = lhs_tv_lvl } ->
-        TyVarCheck_Promote (Just lhs_tv_lvl) Nothing
+      LC_Promote { lc_lvlp = lhs_tv_lvl, lc_term_depthp = lhs_td } ->
+        TyVarCheck_Promote
+          (if lvl_is_deeper then Just lhs_tv_lvl else Nothing)
+          (if depth_is_deeper then Just lhs_td else Nothing)
+          Nothing
   where
-    occ_is_deeper =
+    (lvl_is_deeper, depth_is_deeper) =
       case lc of
-        LC_Check { lc_lvlc = lhs_tv_lvl } ->
-          tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
-        LC_Promote { lc_lvlp = lhs_tv_lvl } ->
-          tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
+        LC_Check { lc_lvlc = lhs_tv_lvl, lc_term_depth = lhs_td } ->
+          ( tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
+          , maybe False (> lhs_td) (metaTyVarTermDepth_maybe occ_tv) )
+        LC_Promote { lc_lvlp = lhs_tv_lvl, lc_term_depthp = lhs_td } ->
+          ( tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
+          , maybe False (> lhs_td) (metaTyVarTermDepth_maybe occ_tv) )
 
 -------------------------
 tyVarConcretenessCheck :: ConcreteCheck m -> TcTyVar -> TyVarCheckResult m
@@ -5690,29 +6120,48 @@ tyVarConcretenessCheck cc occ_tv
   | otherwise  -- It's a non-concrete meta-tyvar
   = case cc of
        CC_Check -> TyVarCheck_Success
-       CC_Promote conc_orig -> TyVarCheck_Promote Nothing (Just conc_orig)
+       CC_Promote conc_orig -> TyVarCheck_Promote Nothing Nothing (Just conc_orig)
        -- CC_None is dealt with at the top
 
 -------------------------
 checkPromoteFreeVars :: CheckTyEqProblem    -- What occurs check problem to report
                      -> Name -> TcLevel
                      -> TyCoVarSet -> TcM CheckTyEqResult
+checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs = do
+  id_depths <- getIdTermDepths
+  checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl topTermScopeDepth id_depths vs
+
+checkPromoteFreeVarsWithDepths
+  :: CheckTyEqProblem
+  -> Name -> TcLevel -> TermScopeDepth -> VarEnv TermScopeDepth
+  -> TyCoVarSet -> TcM CheckTyEqResult
 -- Check this set of TyCoVars for
 --   (a) occurs check
 --   (b) promote if necessary, or report skolem escape
-checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs
+checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl lhs_td id_depths vs
   = do { oks <- mapM do_one (nonDetEltsUniqSet vs)
        ; return (mconcat oks) }
   where
     do_one :: TyCoVar -> TcM CheckTyEqResult
     do_one v | isCoVar v             = return cteOK
-             | isId v                = return (cteProblem cteSkolemEscape)
+             | isId v                = check_id v
              | tyVarName v == lhs_tv = return (cteProblem occ_prob)
              | no_promotion          = return cteOK
              | not (isMetaTyVar v)   = return (cteProblem cteSkolemEscape)
              | otherwise             = promote_one v
       where
-        no_promotion = not (tcTyVarLevel v `strictlyDeeperThan` lhs_tv_lvl)
+        lvl_deeper   = tcTyVarLevel v `strictlyDeeperThan` lhs_tv_lvl
+        depth_deeper = maybe False (> lhs_td) (metaTyVarTermDepth_maybe v)
+        no_promotion = not lvl_deeper && not depth_deeper
+
+    check_id v
+      | isNativeOpaqueValueId v || isNativeIndexFunctionId v
+      , Just vd <- lookupIdTermDepth id_depths v
+      , vd <= lhs_td
+      = checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl lhs_td id_depths
+          (tyCoVarsOfTypes [varType v, idMult v])
+      | otherwise
+      = return (cteProblem cteSkolemEscape)
 
     -- isCoVar case: coercion variables are not an escape risk
     -- If an implication binds a coercion variable, it'll have equalities,
@@ -5721,11 +6170,14 @@ checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs
 
     promote_one :: TyVar -> TcM CheckTyEqResult
     promote_one tv =
-      do { _ <- promote_meta_tyvar TauTv lhs_tv_lvl tv
+      do { _ <- promote_meta_tyvar TauTv
+                  (lhs_tv_lvl `minTcLevel` tcTyVarLevel tv)
+                  (lhs_td `minTermScopeDepth` metaTyVarTermDepth tv)
+                  tv
          ; return cteOK }
 
-promote_meta_tyvar :: MetaInfo -> TcLevel -> TcTyVar -> TcM TcType
-promote_meta_tyvar info dest_lvl occ_tv
+promote_meta_tyvar :: MetaInfo -> TcLevel -> TermScopeDepth -> TcTyVar -> TcM TcType
+promote_meta_tyvar info dest_lvl dest_depth occ_tv
   = do { -- Check whether occ_tv is already unified. The rhs-type
          -- started zonked, but we may have promoted one of its type
          -- variables, and we then encounter it for the second time.
@@ -5736,7 +6188,7 @@ promote_meta_tyvar info dest_lvl occ_tv
            Nothing ->
 
     -- OK, not done already, so clone/promote it
-    do { new_tv <- cloneMetaTyVarWithInfo info dest_lvl occ_tv
+    do { new_tv <- cloneMetaTyVarWithInfoAndDepth info dest_lvl dest_depth occ_tv
        ; liftZonkM $ writeMetaTyVar occ_tv (mkTyVarTy new_tv)
        ; traceTc "promoteTyVar" (ppr occ_tv <+> text "-->" <+> ppr new_tv)
        ; return (mkTyVarTy new_tv) } } }
@@ -5815,6 +6267,8 @@ makeTypeConcrete occ_fs conc_orig ty =
               , tefTyVar_levelCheck    = LC_None
               , tefTyVar_concreteCheck = CC_Promote conc_orig
               , tefTyVar_allowNativeGivenRhs = False
+              , tefTyVar_isTyVarTv     = False
+              , tefTyVar_forAllOK      = False
               , tef_fam_app            = TEFA_Recurse
               }
 
@@ -6172,14 +6626,17 @@ isPredicativeExistsTy (ExistsTy _ b r)
   = is_tau (tyVarKind b) && is_tau r
   where
     is_tau t | Just t' <- coreView t = is_tau t'
-    is_tau (TyVarTy _)               = True
-    is_tau (LitTy _)                 = True
-    is_tau (AppTy f a)               = is_tau f && is_tau a
-    is_tau (CastTy t _)              = is_tau t
-    is_tau (ExistsTy _ vb vr)        = is_tau (tyVarKind vb) && is_tau vr
-    is_tau (TyConApp tc tys)         = isTauTyCon tc && isFamFreeTyCon tc && all is_tau tys
-    is_tau (FunTy af ma mult a r)    = isVisibleFunArg af && all is_tau [ma, mult, a, r]
-    is_tau _                         = False
+    is_tau (TyVarTy _)                          = True
+    is_tau (TermVarTy _)                        = True
+    is_tau (TermAppTy _ arg)                    = is_tau arg
+    is_tau (ClassAppTy _ inst dict operand knd) = all is_tau [inst, dict, operand, knd]
+    is_tau (LitTy _)                            = True
+    is_tau (AppTy f a)                          = is_tau f && is_tau a
+    is_tau (CastTy t _)                         = is_tau t
+    is_tau (ExistsTy _ vb vr)                   = is_tau (tyVarKind vb) && is_tau vr
+    is_tau (TyConApp tc tys)                    = isTauTyCon tc && isFamFreeTyCon tc && all is_tau tys
+    is_tau (FunTy af ma mult a r)               = isVisibleFunArg af && all is_tau [ma, mult, a, r]
+    is_tau _                                    = False
 isPredicativeExistsTy _ = False
 
 -- | Right-instantiate leading implicit existential binders on the expected
@@ -6521,7 +6978,8 @@ qlMonoTcType ty
 
     go_tv :: TcTyVar -> TcMUnit
     go_tv tv
-      | MetaTv { mtv_ref = ref, mtv_tclvl = lvl, mtv_info = info } <- tcTyVarDetails tv
+      | MetaTv { mtv_ref = ref, mtv_tclvl = lvl, mtv_info = info
+               , mtv_term_depth = depth } <- tcTyVarDetails tv
       = assertPpr (case lvl of QLInstVar -> True; _ -> False) (ppr tv) $
         TCMU $ do { traceZonk "qlMonoTcType" (ppr tv)
                   ; flex <- readTcRef ref
@@ -6532,9 +6990,10 @@ qlMonoTcType ty
                   ; go_ty kind  -- See (MIV1) in Note [Monomorphise instantiation variables]
                   ; ref2  <- newTcRef Flexi
                   ; lvl2  <- getZonkTcLevel
-                  ; let details = MetaTv { mtv_info  = info
-                                         , mtv_ref   = ref2
-                                         , mtv_tclvl = lvl2 }
+                  ; let details = MetaTv { mtv_info       = info
+                                         , mtv_ref        = ref2
+                                         , mtv_tclvl      = lvl2
+                                         , mtv_term_depth = depth }
                         tv2  = mkTcTyVar (tyVarName tv) kind details
                  ; writeTcRef ref (Indirect (mkTyVarTy tv2)) }}}
       | otherwise

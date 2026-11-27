@@ -140,6 +140,7 @@ import GHC.Types.Id.Info ( RecSelParent(..) )
 import GHC.Types.Name.Reader
 import GHC.Types.TyThing
 import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
+import GHC.Types.Var.Env ( elemVarEnv, extendVarEnvList )
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Iface.Errors.Types
@@ -946,10 +947,12 @@ tc_extend_local_env top_lvl extra_env thing_inside
   = do  { traceTc "tc_extend_local_env" (ppr extra_env)
         ; updLclCtxt upd_lcl_env thing_inside }
   where
-    upd_lcl_env env0@(TcLclCtxt { tcl_th_ctxt  = th_lvl
-                               , tcl_rdr      = rdr_env
-                               , tcl_th_bndrs = th_bndrs
-                               , tcl_env      = lcl_type_env })
+    upd_lcl_env env0@(TcLclCtxt { tcl_th_ctxt    = th_lvl
+                               , tcl_rdr        = rdr_env
+                               , tcl_th_bndrs   = th_bndrs
+                               , tcl_term_depth = term_depth
+                               , tcl_id_depths  = id_depths
+                               , tcl_env        = lcl_type_env })
        = env0 { tcl_rdr = extendLocalRdrEnvList rdr_env
                           [ n | (n, _) <- extra_env, isInternalName n ]
                           -- The LocalRdrEnv contains only non-top-level names
@@ -958,17 +961,35 @@ tc_extend_local_env top_lvl extra_env thing_inside
               , tcl_th_bndrs = extendNameEnvList th_bndrs
                                [(n, thlvl) | (n, _) <- extra_env]
 
+              , tcl_term_depth = term_depth'
+              , tcl_id_depths  = id_depths'
+
               , tcl_env = extendNameEnvList lcl_type_env extra_env }
               -- tcl_rdr and tcl_th_bndrs: extend the local LocalRdrEnv and
               -- Template Haskell staging env simultaneously. Reason for extending
               -- LocalRdrEnv: after running a TH splice we need to do renaming.
       where
-        thlvl = (top_lvl, thLevelIndex th_lvl)
+        thlvl   = (top_lvl, thLevelIndex th_lvl)
+        new_ids = [ v | (_, ATcId { tct_id = v }) <- extra_env
+                      , not (v `elemVarEnv` id_depths) ]
+        (term_depth', id_depths')
+          | null new_ids
+          = (term_depth, id_depths)
+          | isTopLevel top_lvl
+          = (term_depth, extendVarEnvList id_depths [(v, topTermScopeDepth) | v <- new_ids])
+          | otherwise
+          = let !d' = bumpTermScopeDepth term_depth
+            in (d', extendVarEnvList id_depths [(v, d') | v <- new_ids])
 
 
 tcExtendLocalTypeEnv :: [(Name, TcTyThing)] -> TcLclCtxt -> TcLclCtxt
-tcExtendLocalTypeEnv tc_ty_things lcl_env@(TcLclCtxt { tcl_env = lcl_type_env })
-  = lcl_env { tcl_env = extendNameEnvList lcl_type_env tc_ty_things }
+tcExtendLocalTypeEnv tc_ty_things lcl_env@(TcLclCtxt { tcl_env = lcl_type_env
+                                                     , tcl_id_depths = id_depths })
+  = lcl_env { tcl_env = extendNameEnvList lcl_type_env tc_ty_things
+            , tcl_id_depths = extendVarEnvList id_depths
+                [ (v, topTermScopeDepth)
+                | (_, ATcId { tct_id = v }) <- tc_ty_things
+                , not (v `elemVarEnv` id_depths) ] }
 
 {- *********************************************************************
 *                                                                      *

@@ -620,7 +620,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                    restoreEnvs (tcg_env, tcl_env) $
                    do { lie_main <- checkMainType tcg_env
                       ; ev_binds <- simplifyTop (lie `andWC` lie_main)
-                      ; return (tcg_env `addEvBinds` ev_binds) }
+                      ; installForgetMTyCons (tcg_env `addEvBinds` ev_binds) }
 
         -- Prune unused speculative tables before generating Typeable bindings
       ; tcg_env <- pruneUnusedIndexedLookups tcg_env
@@ -677,7 +677,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
               do { (tcg_env, lie) <- captureTopConstraints $
                                      checkMain explicit_mod_hdr export_ies
                  ; ev_binds <- simplifyTop lie
-                 ; return (tcg_env `addEvBinds` ev_binds) }
+                 ; installForgetMTyCons (tcg_env `addEvBinds` ev_binds) }
 
       ; failIfErrsM    -- Stop now if if there have been errors
                        -- Continuing is a waste of time; and we may get debug
@@ -1020,7 +1020,8 @@ run_th_modfinalizers = do
       -- (see #12777).
       new_ev_binds <- {-# SCC "simplifyTop2" #-}
                       simplifyTop (lie_th `andWC` lie_top_decls)
-      addTopEvBinds new_ev_binds run_th_modfinalizers
+      tcg_env' <- installForgetMTyCons =<< getGblEnv
+      setGblEnv tcg_env' $ addTopEvBinds new_ev_binds run_th_modfinalizers
         -- addTopDecls can add declarations which add new finalizers.
 
 tc_rn_src_decls :: [LHsDecl GhcPs]

@@ -915,10 +915,6 @@ rewrite_one ty@(TermAppTy f arg)
   = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
 
 rewrite_one ty@(TermVarTy v)
-  -- The imported function keeps its identity without a source equation.
-  | isNativeNamedOpaqueFunctionId v
-  = do { role <- getRole
-       ; return $! mkReflRedn role ty }
   | isNativeOpaqueValueId v
   = do { role <- getRole
        ; env <- getRewriteEnv
@@ -927,12 +923,20 @@ rewrite_one ty@(TermVarTy v)
              rewrite_source_let env ty role v proof (mkCoVarCo proof)
            _ -> return $! mkReflRedn role
                   (coercionLKind (liftCoSubstNative (re_native_lifting env) role v)) }
+  -- Certified functions keep their identity unless unfolded via re_source_lets.
+  | isNativeIndexFunctionId v
+  = do { role <- getRole
+       ; env <- getRewriteEnv
+       ; case lookupVarEnv (re_source_lets env) v of
+           Just proof | allowSourceLet env v ->
+             rewrite_source_let env ty role v proof (mkCoVarCo proof)
+           _ -> return $! mkReflRedn role ty }
   | otherwise
   = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
 rewrite_one ty@(DepFunTy vis b body)
   -- See Note [Rewriting retained dependent functions].
-  | isNativeOpaqueValueId b
-  , isLiftedTypeKind (typeKind body)
+  | isNativeOpaqueValueId b || isNativeIndexFunctionId b
+  , tcIsLiftedTypeKind (typeKind body)
   = do { lc <- getRewriteEnvField re_native_lifting
        ; domain <- case retainedReflDomain_maybe lc (varType b) of
              Just ty -> return (mkReflRedn Nominal ty)

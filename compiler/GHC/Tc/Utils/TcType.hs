@@ -37,11 +37,13 @@ module GHC.Tc.Utils.TcType (
   SyntaxOpType(..), synKnownType, mkSynFunTys,
 
   --------------------------------
-  -- TcLevel
+  -- TcLevel & TermScopeDepth
   TcLevel(..), topTcLevel, pushTcLevel, isTopTcLevel,
   strictlyDeeperThan, deeperThanOrSame, sameDepthAs,
   tcTypeLevel, tcTyVarLevel, maxTcLevel, minTcLevel,
   infiniteTcLevel, isInfiniteTcLevel,
+  TermScopeDepth(..), topTermScopeDepth, bumpTermScopeDepth, minTermScopeDepth,
+  lookupIdTermDepth,
 
   --------------------------------
   -- MetaDetails
@@ -56,6 +58,7 @@ module GHC.Tc.Utils.TcType (
   isFlexi, isIndirect, isRuntimeUnkSkol,
   isQLInstTyVar, isRuntimeUnkTyVar,
   metaTyVarTcLevel, setMetaTyVarTcLevel, metaTyVarTcLevel_maybe,
+  metaTyVarTermDepth, setMetaTyVarTermDepth, metaTyVarTermDepth_maybe,
   isTouchableMetaTyVar, isPromotableMetaTyVar,
   findDupTyVarTvs, mkTyVarNamePairs,
 
@@ -210,6 +213,7 @@ import GHC.Core.TyCo.FVs
 import GHC.Core.TyCo.Ppr
 import GHC.Core.Class
 import GHC.Types.Var
+import GHC.Types.Var.Env ( VarEnv, lookupVarEnv )
 import GHC.Types.Var.Set
 import GHC.Core.Coercion
 import GHC.Core.Type as Type
@@ -652,9 +656,10 @@ data TcTyVarDetails
   | RuntimeUnk    -- Stands for an as-yet-unknown type in the GHCi
                   -- interactive context
 
-  | MetaTv { mtv_info  :: MetaInfo
-           , mtv_ref   :: IORef MetaDetails
-           , mtv_tclvl :: TcLevel }  -- See Note [TcLevel invariants]
+  | MetaTv { mtv_info       :: MetaInfo
+           , mtv_ref        :: IORef MetaDetails
+           , mtv_tclvl      :: TcLevel
+           , mtv_term_depth :: !TermScopeDepth }  -- See Note [TcLevel invariants]
 
 vanillaSkolemTvUnk :: HasDebugCallStack => TcTyVarDetails
 vanillaSkolemTvUnk = SkolemTv unkSkol topTcLevel False
@@ -942,6 +947,30 @@ tcTypeLevel ty
 instance Outputable TcLevel where
   ppr (TcLevel n) = ppr n
   ppr QLInstVar   = text "qlinst"
+
+-- | Contextual birth depth for local value 'Id's and unification variables.
+-- Prevents runtime value binders from escaping lambda, pattern, or local @let@
+-- scopes without allocating per-binder implications.
+newtype TermScopeDepth = TermScopeDepth Int
+  deriving (Eq, Ord, Outputable)
+
+topTermScopeDepth :: TermScopeDepth
+topTermScopeDepth = TermScopeDepth 0
+
+bumpTermScopeDepth :: TermScopeDepth -> TermScopeDepth
+bumpTermScopeDepth (TermScopeDepth d) = TermScopeDepth (d + 1)
+
+minTermScopeDepth :: TermScopeDepth -> TermScopeDepth -> TermScopeDepth
+minTermScopeDepth = min
+
+-- | Look up the contextual birth depth of a runtime 'Id'.
+-- Imported 'GlobalId's and module-level 'ExternalName' bindings have depth 0;
+-- local 'InternalName' bindings absent from the lexical depth map are out of scope.
+lookupIdTermDepth :: VarEnv TermScopeDepth -> Id -> Maybe TermScopeDepth
+lookupIdTermDepth id_depths v
+  | Just d <- lookupVarEnv id_depths v = Just d
+  | isGlobalId v || isExternalName (getName v) = Just topTermScopeDepth
+  | otherwise = Nothing
 
 {- *********************************************************************
 *                                                                      *
@@ -1396,6 +1425,24 @@ setMetaTyVarTcLevel tv tclvl
   = case tcTyVarDetails tv of
       details@(MetaTv {}) -> setTcTyVarDetails tv (details { mtv_tclvl = tclvl })
       _ -> pprPanic "metaTyVarTcLevel" (ppr tv)
+
+metaTyVarTermDepth :: TcTyVar -> TermScopeDepth
+metaTyVarTermDepth tv
+  = case tcTyVarDetails tv of
+      MetaTv { mtv_term_depth = d } -> d
+      _ -> pprPanic "metaTyVarTermDepth" (ppr tv)
+
+metaTyVarTermDepth_maybe :: TcTyVar -> Maybe TermScopeDepth
+metaTyVarTermDepth_maybe tv
+  = case tcTyVarDetails tv of
+      MetaTv { mtv_term_depth = d } -> Just d
+      _                             -> Nothing
+
+setMetaTyVarTermDepth :: TcTyVar -> TermScopeDepth -> TcTyVar
+setMetaTyVarTermDepth tv d
+  = case tcTyVarDetails tv of
+      details@(MetaTv {}) -> setTcTyVarDetails tv (details { mtv_term_depth = d })
+      _ -> pprPanic "setMetaTyVarTermDepth" (ppr tv)
 
 isTyVarTyVar :: Var -> Bool
 isTyVarTyVar tv

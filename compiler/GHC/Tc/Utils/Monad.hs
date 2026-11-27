@@ -20,6 +20,7 @@ module GHC.Tc.Utils.Monad(
   setGblEnv, getLclEnv, updLclEnv, updLclCtxt, setLclEnv, restoreLclEnv,
   tcExtendLexicalGivens, getLexicalGivens, getNativeGivens, tcWithSourceLetView,
   tcWithPartialSigContext, getPartialSigPredicates,
+  getTermScopeDepth, getIdTermDepths, tcExtendTermScopeBinders,
   updTopFlags,
   getEnvs, setEnvs, updEnvs, restoreEnvs,
   xoptM, unsaturatedTypeFamiliesEnabled, doptM, goptM, woptM,
@@ -247,7 +248,7 @@ import GHC.Types.Name
 import GHC.Types.SafeHaskell
 import GHC.Types.Id
 import GHC.Types.TypeEnv
-import GHC.Types.Var ( EvVar, varType )
+import GHC.Types.Var ( EvVar, isNonCoVarId, varType )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.SrcLoc
@@ -505,7 +506,9 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 tcl_bndrs      = [],
                 tcl_lexical_givens = emptyLexicalGivens,
                 tcl_source_let_views = emptyVarEnv,
-                tcl_tclvl      = topTcLevel
+                tcl_tclvl      = topTcLevel,
+                tcl_term_depth = topTermScopeDepth,
+                tcl_id_depths  = emptyVarEnv
                 },
                 tcl_usage      = usage_var,
                 tcl_lie        = lie_var,
@@ -609,7 +612,6 @@ updLclCtxt :: (TcLclCtxt -> TcLclCtxt) -> TcRnIf gbl TcLclEnv a -> TcRnIf gbl Tc
 updLclCtxt = updLclEnv . modifyLclCtxt
 
 -- | Scope a checked definition for choosing an omitted argument.
--- See Note [Inferring through local definitions] in GHC.Tc.Gen.App.
 tcWithSourceLetView :: Id -> TcType -> TcM a -> TcM a
 tcWithSourceLetView value rhs = updLclCtxt $ \ctxt ->
     ctxt { tcl_source_let_views = extendVarEnv (tcl_source_let_views ctxt) value rhs }
@@ -628,9 +630,42 @@ tcWithPartialSigContext TISI { sig_inst_sig = TcPartialSig{}, sig_inst_theta = t
   updLexicalGivens $ \scope -> scope { partialSigPredicates = theta ++ partialSigPredicates scope }
 tcWithPartialSigContext _ = id
 
--- | Update the Given context without changing the enclosing scope.
+-- | Update the Given context without changing the enclosing scope, registering
+-- any newly introduced local runtime index prototypes in 'tcl_id_depths'.
 updLexicalGivens :: (LexicalGivens -> LexicalGivens) -> TcM a -> TcM a
-updLexicalGivens f = updLclCtxt $ \ctxt -> ctxt { tcl_lexical_givens = f (tcl_lexical_givens ctxt) }
+updLexicalGivens f = updLclCtxt $ \ctxt ->
+  let next_lg  = f (tcl_lexical_givens ctxt)
+      id_ds    = tcl_id_depths ctxt
+      ev_ids   = [ v | ev <- lexicalEvidence next_lg
+                     , v <- ev : tyCoVarsOfTypeList (varType ev)
+                     , isNonCoVarId v, isLocalId v
+                     , not (v `elemVarEnv` id_ds) ]
+  in case ev_ids of
+       [] -> ctxt { tcl_lexical_givens = next_lg }
+       _  -> let !d' = bumpTermScopeDepth (tcl_term_depth ctxt)
+             in ctxt { tcl_lexical_givens = next_lg
+                     , tcl_term_depth     = d'
+                     , tcl_id_depths      = extendVarEnvList id_ds [(v, d') | v <- ev_ids] }
+
+getTermScopeDepth :: TcM TermScopeDepth
+getTermScopeDepth = getLclEnvTermDepth <$> getLclEnv
+
+getIdTermDepths :: TcM (VarEnv TermScopeDepth)
+getIdTermDepths = getLclEnvIdDepths <$> getLclEnv
+
+-- | Bump 'tcl_term_depth' and record fresh local value binders in 'tcl_id_depths'.
+tcExtendTermScopeBinders :: [Id] -> TcM a -> TcM a
+tcExtendTermScopeBinders [] thing_inside = thing_inside
+tcExtendTermScopeBinders bndrs thing_inside =
+  updLclCtxt (\ctxt ->
+    let id_ds   = tcl_id_depths ctxt
+        new_ids = [b | b <- bndrs, not (b `elemVarEnv` id_ds)]
+    in case new_ids of
+         [] -> ctxt
+         _  -> let !d' = bumpTermScopeDepth (tcl_term_depth ctxt)
+               in ctxt { tcl_term_depth = d'
+                       , tcl_id_depths  = extendVarEnvList id_ds [(b, d') | b <- new_ids] })
+    thing_inside
 
 -- | Get only the written premises of enclosing partial signatures.
 getPartialSigPredicates :: TcM TcThetaType
@@ -1073,7 +1108,9 @@ newArrowScope
   = updLclEnv $ \env ->
       modifyLclCtxt (\ctx -> ctx { tcl_arrow_ctxt = ArrowCtxt (getLclEnvRdrEnv env)
                                                   (tcl_lie env) (tcl_lexical_givens ctx)
-                                                  (tcl_source_let_views ctx) }) env
+                                                  (tcl_source_let_views ctx)
+                                                  (tcl_term_depth ctx)
+                                                  (tcl_id_depths ctx) }) env
 
 -- Return to the stored environment (from the enclosing proc)
 escapeArrowScope :: TcM a -> TcM a
@@ -1081,11 +1118,13 @@ escapeArrowScope
   = updLclEnv $ \ env ->
     case getLclEnvArrowCtxt env of
       NoArrowCtxt       -> env
-      ArrowCtxt rdr_env lie givens views -> env
+      ArrowCtxt rdr_env lie givens views term_depth id_depths -> env
         { tcl_lcl_ctxt = (tcl_lcl_ctxt env) { tcl_arrow_ctxt = NoArrowCtxt
                                           , tcl_rdr = rdr_env
                                           , tcl_lexical_givens = givens
-                                          , tcl_source_let_views = views }
+                                          , tcl_source_let_views = views
+                                          , tcl_term_depth = term_depth
+                                          , tcl_id_depths = id_depths }
         , tcl_lie = lie }
 
 {-
@@ -1698,6 +1737,8 @@ mkCtLocEnv lcl_env =
            , ctl_ctxt  = getLclEnvErrCtxt lcl_env
            , ctl_loc = getLclEnvLoc lcl_env
            , ctl_tclvl = getLclEnvTcLevel lcl_env
+           , ctl_term_depth = getLclEnvTermDepth lcl_env
+           , ctl_id_depths = getLclEnvIdDepths lcl_env
            , ctl_in_gen_code = lclEnvInGeneratedCode lcl_env
            , ctl_rdr = getLclEnvRdrEnv lcl_env
            }

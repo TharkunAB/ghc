@@ -744,6 +744,10 @@ mkAppCo co arg
   , Just (ty2, _) <- isReflCo_maybe arg
   = mkReflCo r (mkAppTy ty1 ty2)
 
+  | Just (TermVarTy f, r) <- isReflCo_maybe co
+  , isNativeIndexFunctionId f
+  = downgradeRole r Nominal (mkTermAppCo f arg)
+
   | Just (ty1, r) <- isReflCo_maybe co
   , Just (tc, tys) <- splitTyConApp_maybe ty1
     -- Expand the synonym once the arguments reach its arity (#9102).

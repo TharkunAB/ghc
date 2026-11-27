@@ -27,7 +27,7 @@ module GHC.Tc.Utils.TcMType (
   newMetaKindVar, newMetaKindVars,
   newMetaTyVarTyAtLevel, newConcreteTyVarTyAtLevel, substConcreteTvOrigin,
   newAnonMetaTyVar, newConcreteTyVar, mkConcreteInfo,
-  cloneMetaTyVar, cloneMetaTyVarWithInfo,
+  cloneMetaTyVar, cloneMetaTyVarWithInfo, cloneMetaTyVarWithInfoAndDepth,
   newCycleBreakerTyVar,
   newMultiplicityVar,
 
@@ -832,23 +832,29 @@ newMetaDetails :: MetaInfo -> TcM TcTyVarDetails
 newMetaDetails info
   = do { ref <- newMutVar Flexi
        ; tclvl <- getTcLevel
-       ; return (MetaTv { mtv_info = info
-                        , mtv_ref = ref
-                        , mtv_tclvl = tclvl }) }
+       ; depth <- getTermScopeDepth
+       ; return (MetaTv { mtv_info       = info
+                        , mtv_ref        = ref
+                        , mtv_tclvl      = tclvl
+                        , mtv_term_depth = depth }) }
 
 newTauTvDetailsAtLevel :: TcLevel -> TcM TcTyVarDetails
 newTauTvDetailsAtLevel tclvl
   = do { ref <- newMutVar Flexi
-       ; return (MetaTv { mtv_info  = TauTv
-                        , mtv_ref   = ref
-                        , mtv_tclvl = tclvl }) }
+       ; depth <- getTermScopeDepth
+       ; return (MetaTv { mtv_info       = TauTv
+                        , mtv_ref        = ref
+                        , mtv_tclvl      = tclvl
+                        , mtv_term_depth = depth }) }
 
 newConcreteTvDetailsAtLevel :: ConcreteTvOrigin -> TcLevel -> TcM TcTyVarDetails
 newConcreteTvDetailsAtLevel conc_orig tclvl
   = do { ref <- newMutVar Flexi
-       ; return (MetaTv { mtv_info  = ConcreteTv conc_orig
-                        , mtv_ref   = ref
-                        , mtv_tclvl = tclvl }) }
+       ; depth <- getTermScopeDepth
+       ; return (MetaTv { mtv_info       = ConcreteTv conc_orig
+                        , mtv_ref        = ref
+                        , mtv_tclvl      = tclvl
+                        , mtv_term_depth = depth }) }
 
 cloneMetaTyVar :: TcTyVar -> TcM TcTyVar
 cloneMetaTyVar tv
@@ -864,12 +870,17 @@ cloneMetaTyVar tv
 
 cloneMetaTyVarWithInfo :: MetaInfo -> TcLevel -> TcTyVar -> TcM TcTyVar
 cloneMetaTyVarWithInfo info tc_lvl tv
+  = cloneMetaTyVarWithInfoAndDepth info tc_lvl (metaTyVarTermDepth tv) tv
+
+cloneMetaTyVarWithInfoAndDepth :: MetaInfo -> TcLevel -> TermScopeDepth -> TcTyVar -> TcM TcTyVar
+cloneMetaTyVarWithInfoAndDepth info tc_lvl term_depth tv
   = assert (isTcTyVar tv) $
     do  { ref  <- newMutVar Flexi
         ; name' <- cloneMetaTyVarName (tyVarName tv)
-        ; let details = MetaTv { mtv_info  = info
-                               , mtv_ref   = ref
-                               , mtv_tclvl = tc_lvl }
+        ; let details = MetaTv { mtv_info       = info
+                               , mtv_ref        = ref
+                               , mtv_tclvl      = tc_lvl
+                               , mtv_term_depth = term_depth }
               tyvar = mkTcTyVar name' (tyVarKind tv) details
         ; traceTc "cloneMetaTyVarWithInfo" (ppr tyvar)
         ; return tyvar }

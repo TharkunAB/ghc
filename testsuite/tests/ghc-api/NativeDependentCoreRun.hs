@@ -3588,7 +3588,7 @@ runNatClassSourceChecks = do
             )
         ,
             ( "NativeSourceEqualityWithoutProof"
-            , 18872
+            , 83865
             , "Add"
             ,
                 [ "badEquality :: foreach (n :: Nat) -> Vec Int (Add n Z) -> Vec Int n"

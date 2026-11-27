@@ -17,6 +17,8 @@ module GHC.Tc.Solver.Monad (
     nestTcS, nestImplicTcS, tryShortCutTcS, nestFunDepsTcS,
     setEvBindsTcS, setTcLevelTcS,
     getNativeBinderScope, withNativeBinderScope, getSourceLetScope, withSourceLetProof,
+    getTcSTermDepth, getTcSIdDepths, getSolverIdDepthsFor, withImplicTermScope,
+    withPendingImplics, hasPendingImplics,
 
     selectNextWorkItem, deferOpenAppEq,
     getWorkList,
@@ -189,7 +191,7 @@ import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.DefaultEnv ( DefaultEnv )
 import GHC.Types.Var
-import GHC.Types.Var.Env (VarEnv, emptyVarEnv, extendVarEnv)
+import GHC.Types.Var.Env (VarEnv, elemVarEnv, emptyVarEnv, extendVarEnv, extendVarEnvList, plusVarEnv)
 import GHC.Types.Var.Set
 import GHC.Types.Unique.Supply
 import GHC.Types.Id
@@ -1101,7 +1103,10 @@ data TcSEnv
       tcs_mode :: TcSMode,
 
       -- See Note [Native runtime binder scopes].
-      tcs_native_binders :: VarSet,
+      tcs_native_binders  :: VarSet,
+      tcs_term_depth      :: !TermScopeDepth,
+      tcs_id_depths       :: !(VarEnv TermScopeDepth),
+      tcs_pending_implics :: !Bool,
 
       -- See Note [Rewriting checked local indices] in GHC.Tc.Solver.Rewrite.
       tcs_source_lets :: VarEnv CoVar,
@@ -1147,13 +1152,63 @@ withSourceLetProof proof inside
 getNativeBinderScope :: TcS VarSet
 getNativeBinderScope = mkTcS $ \env -> return (tcs_native_binders env)
 
--- | Scope one runtime binder over a retained equality comparison.
+-- | Scope one runtime binder over a retained equality comparison, bumping
+-- 'TermScopeDepth' in both 'TcSEnv' and 'TcLclCtxt'.
 -- See Note [Native runtime binder scopes].
-withNativeBinderScope :: Id -> TcS a -> TcS a
-withNativeBinderScope binder thing_inside
+withNativeBinderScope :: CtLoc -> [Type] -> Id -> (CtLoc -> TcS a) -> TcS a
+withNativeBinderScope loc tys binder thing_inside
   = mkTcS $ \env ->
-      unTcS thing_inside
-        (env { tcs_native_binders = extendVarSet (tcs_native_binders env) binder })
+      let mtv_max = foldl' max topTermScopeDepth
+                      [ d | v <- tyCoVarsOfTypesList tys
+                          , isTcTyVar v
+                          , Just d <- [metaTyVarTermDepth_maybe v] ]
+          base_d  = max (tcs_term_depth env) (max (getCtLocEnvTermDepth (ctLocEnv loc)) mtv_max)
+          !d'     = bumpTermScopeDepth base_d
+          loc'    = extendCtLocTermScope binder d' loc
+          env'    = env { tcs_native_binders = extendVarSet (tcs_native_binders env) binder
+                        , tcs_term_depth     = d'
+                        , tcs_id_depths      = extendVarEnv (tcs_id_depths env) binder d' }
+      in TcM.updLclCtxt (\ctxt -> ctxt { tcl_term_depth = d'
+                                       , tcl_id_depths  = extendVarEnv (tcl_id_depths ctxt) binder d' }) $
+           unTcS (thing_inside loc') env'
+
+getTcSTermDepth :: TcS TermScopeDepth
+getTcSTermDepth = mkTcS $ \env -> return (tcs_term_depth env)
+
+getTcSIdDepths :: TcS (VarEnv TermScopeDepth)
+getTcSIdDepths = mkTcS $ \env -> return (tcs_id_depths env)
+
+-- | Combine the constraint's lexical 'ctl_id_depths' with any active solver
+-- runtime binders from 'withNativeBinderScope'.
+getSolverIdDepthsFor :: CtLoc -> TcS (VarEnv TermScopeDepth)
+getSolverIdDepthsFor loc = mkTcS $ \env ->
+  return (plusVarEnv (ctl_id_depths (ctLocEnv loc)) (tcs_id_depths env))
+
+-- | Enter an 'Implication' scope, restoring its lexical 'TermScopeDepth' and
+-- recording any local runtime index prototypes introduced by its Given evidence.
+withImplicTermScope :: CtLocEnv -> [EvVar] -> TcS a -> TcS a
+withImplicTermScope ct_loc_env givens thing_inside
+  = mkTcS $ \env ->
+      let base_d  = max (tcs_term_depth env) (ctl_term_depth ct_loc_env)
+          base_ds = plusVarEnv (ctl_id_depths ct_loc_env) (tcs_id_depths env)
+          ev_ids  = [ v | ev <- givens
+                        , v <- tyCoVarsOfTypeList (varType ev)
+                        , isNonCoVarId v, isLocalId v
+                        , not (v `elemVarEnv` base_ds) ]
+          (!next_d, next_ds)
+            | null ev_ids = (base_d, base_ds)
+            | otherwise   = let !d' = bumpTermScopeDepth base_d
+                            in (d', extendVarEnvList base_ds [(v, d') | v <- ev_ids])
+          env' = env { tcs_term_depth = next_d, tcs_id_depths = next_ds }
+      in TcM.updLclCtxt (\ctxt -> ctxt { tcl_term_depth = next_d, tcl_id_depths = next_ds }) $
+           unTcS thing_inside env'
+
+withPendingImplics :: Bool -> TcS a -> TcS a
+withPendingImplics flag (TcS thing_inside)
+  = TcS $ \env -> thing_inside (env { tcs_pending_implics = flag })
+
+hasPendingImplics :: TcS Bool
+hasPendingImplics = mkTcS $ \env -> return (tcs_pending_implics env)
 
 {- Note [Native runtime binder scopes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1334,6 +1389,8 @@ runTcSWithEvBinds' mode ev_binds_var thing_inside
 
        ; wl_var      <- TcM.newTcRef emptyWorkList
        ; unif_lvl_var <- TcM.newTcRef infiniteTcLevel
+       ; term_depth  <- TcM.getTermScopeDepth
+       ; id_depths   <- TcM.getIdTermDepths
        ; let env = TcSEnv { tcs_ev_binds = ev_binds_var
                           , tcs_outer_ev_binds = []
                           , tcs_what     = WU_Coarse unif_lvl_var
@@ -1342,6 +1399,9 @@ runTcSWithEvBinds' mode ev_binds_var thing_inside
                           , tcs_mode     = mode
                           , tcs_source_lets = emptyVarEnv
                           , tcs_native_binders = emptyVarSet
+                          , tcs_term_depth = term_depth
+                          , tcs_id_depths  = id_depths
+                          , tcs_pending_implics = False
                           , tcs_covar_level = Nothing
                           , tcs_worklist = wl_var }
 
@@ -1432,6 +1492,7 @@ nestImplicTcS skol_info ev_binds_var inner_tclvl (TcS thing_inside)
                                                   else tcs_ev_binds env : tcs_outer_ev_binds env
                             , tcs_source_lets = if isStaticSkolInfo skol_info then emptyVarEnv
                                                 else tcs_source_lets env
+                            , tcs_pending_implics = False
                             , tcs_inerts   = new_inert_var
                             , tcs_worklist = new_wl_var }
        ; res <- TcM.setTcLevel inner_tclvl $

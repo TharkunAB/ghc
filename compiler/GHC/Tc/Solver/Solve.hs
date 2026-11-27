@@ -123,8 +123,10 @@ simplify_loop n limit definitely_redo_implications
        ; traceTcS "simplify_loop: wc =" (ppr wc)
 
        ; ambient_lvl <- getTcLevel
-       ; (simple_unif_lvl, wc1)
+       ; let wait_for_implics = n == 0 && definitely_redo_implications && not (isEmptyBag implics)
+       ; (simple_unif_lvl, wc1_raw)
              <- reportCoarseGrainUnifications $  -- See Note [Superclass iteration]
+                withPendingImplics wait_for_implics $
                 solveSimpleWanteds simples
                 -- Any insoluble constraints are in 'simples' and so get rewritten
                 -- See Note [Rewrite insolubles] in GHC.Tc.Solver.InertSet
@@ -138,6 +140,14 @@ simplify_loop n limit definitely_redo_implications
                 else reportCoarseGrainUnifications $
                      solveNestedImplications implics
 
+       ; let implic_unif_happened = implic_unif_lvl `sameDepthAs` ambient_lvl
+             has_irreds = anyBag (\case { CIrredCan{} -> True; _ -> False }) (wc_simple wc1_raw)
+       ; wc1 <- if wait_for_implics && not implic_unif_happened && has_irreds
+                then do { wc1_re <- solveSimpleWanteds (wc_simple wc1_raw)
+                        ; return (wc1_re { wc_impl   = wc_impl wc1_raw `unionBags` wc_impl wc1_re
+                                         , wc_errors = wc_errors wc1_raw `unionBags` wc_errors wc1_re }) }
+                else return wc1_raw
+
        ; let wc' = wc1 { wc_impl = wc_impl wc1 `unionBags` implics' }
 
          -- We iterate the loop only if the /implications/ did some relevant
@@ -147,7 +157,6 @@ simplify_loop n limit definitely_redo_implications
          -- the current level; if it is less , we'll iterate some outer level,
          -- which will bring us back here anyway.
          -- See Note [When to iterate the solver: unifications]
-       ; let implic_unif_happened = implic_unif_lvl `sameDepthAs` ambient_lvl
        ; csTraceTcS $ text "implic_unif_happened" <+> ppr implic_unif_happened
        ; maybe_simplify_again (n+1) limit implic_unif_happened wc' }
 
@@ -408,7 +417,8 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
        ; (selected_givens, has_given_eqs, given_insols, residual_wanted)
             <- nestImplicTcS info ev_binds_var tclvl $
                do { selected_givens <- select_source_let
-                  ; let loc    = mkGivenLoc tclvl info ct_loc_env
+                  ; TcS.withImplicTermScope ct_loc_env selected_givens $
+               do { let loc    = mkGivenLoc tclvl info ct_loc_env
                         givens = mkGivens loc selected_givens
 
                   ; residual_wanted <- case ic_source_let imp of
@@ -424,7 +434,7 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
                         -- solveWanteds can augment the givens, via expandSuperClasses,
                         -- to reveal given superclass equalities
 
-                  ; return (selected_givens, has_eqs, given_insols, residual_wanted) }
+                  ; return (selected_givens, has_eqs, given_insols, residual_wanted) } }
 
        ; traceTcS "solveImplication 2"
            (ppr given_insols $$ ppr residual_wanted)

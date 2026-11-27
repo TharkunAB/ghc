@@ -2199,7 +2199,7 @@ tcIfaceType = go
       = failIfM (text "Scoped class selector in interface requires two lexical references")
     go (IfaceDepFunTy vis bndr@(mult, name, domain) body)
       -- See Note [Retained binders in interfaces].
-      -- See Note [Exported function-valued retained signatures] in GHC.Tc.Gen.HsType.
+      -- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
       = do { mult_shape <- tcIfaceDomainShape mult
            ; domain_shape <- tcIfaceDomainShape domain
            ; precheckIfaceNativeDomain

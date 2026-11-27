@@ -63,6 +63,7 @@ import GHC.Types.Name
 import GHC.Types.Id
 
 import GHC.Types.Var
+import GHC.Types.Var.Env ( VarEnv )
 import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Types.Error
@@ -477,18 +478,19 @@ floatKindEqualities :: WantedConstraints -> Maybe (Bag Ct, Bag DelayedError)
 -- Precondition 2: the 'wanteds' are zonked, since floatKindEqualities
 --    is not monadic
 -- See Note [floatKindEqualities vs approximateWC]
-floatKindEqualities wc = float_wc emptyVarSet wc
+floatKindEqualities wc = float_wc emptyVarSet Nothing wc
   where
-    float_wc :: TcTyCoVarSet -> WantedConstraints -> Maybe (Bag Ct, Bag DelayedError)
-    float_wc trapping_tvs (WC { wc_simple = simples
-                              , wc_impl = implics
-                              , wc_errors = errs })
+    float_wc :: TcTyCoVarSet -> Maybe (TermScopeDepth, VarEnv TermScopeDepth)
+             -> WantedConstraints -> Maybe (Bag Ct, Bag DelayedError)
+    float_wc trapping_tvs mb_outer (WC { wc_simple = simples
+                                       , wc_impl = implics
+                                       , wc_errors = errs })
       -- Keep the dictionary choice in its original evidence scope.
       -- See Note [Checked source method evidence] in GHC.Tc.Solver.Solve.
       | anyBag is_source_method errs = Nothing
       | all is_floatable simples
       = do { (inner_simples, inner_errs)
-                <- flatMapBagPairM (float_implic trapping_tvs) implics
+                <- flatMapBagPairM (float_implic trapping_tvs mb_outer) implics
            ; return ( simples `unionBags` inner_simples
                     , errs `unionBags` inner_errs) }
       | otherwise
@@ -498,15 +500,21 @@ floatKindEqualities wc = float_wc emptyVarSet wc
         is_source_method _ = False
         is_floatable ct
            | insolubleCt ct = False
+           | Just (max_d, id_ds) <- mb_outer
+           , anyFreeVarsOfType (\v -> isNonCoVarId v
+                                   && maybe True (> max_d) (lookupIdTermDepth id_ds v))
+                               (ctPred ct)
+           = False
            | otherwise      = tyCoVarsOfCt ct `disjointVarSet` trapping_tvs
 
-    float_implic :: TcTyCoVarSet -> Implication -> Maybe (Bag Ct, Bag DelayedError)
-    float_implic trapping_tvs (Implic { ic_wanted = wanted, ic_given_eqs = given_eqs
-                                      , ic_skols = skols, ic_status = status })
+    float_implic :: TcTyCoVarSet -> Maybe (TermScopeDepth, VarEnv TermScopeDepth)
+                 -> Implication -> Maybe (Bag Ct, Bag DelayedError)
+    float_implic trapping_tvs mb_outer (Implic { ic_wanted = wanted, ic_given_eqs = given_eqs
+                                               , ic_skols = skols, ic_env = env, ic_status = status })
       | isInsolubleStatus status
       = Nothing   -- A short cut /plus/ we must keep track of IC_BadTelescope
       | otherwise
-      = do { (simples, holes) <- float_wc new_trapping_tvs wanted
+      = do { (simples, holes) <- float_wc new_trapping_tvs new_outer wanted
            ; when (not (isEmptyBag simples) && given_eqs == MaybeGivenEqs) $
              Nothing
                  -- If there are some constraints to float out, but we can't
@@ -515,6 +523,9 @@ floatKindEqualities wc = float_wc emptyVarSet wc
            ; return (simples, holes) }
       where
         new_trapping_tvs = trapping_tvs `extendVarSetList` skols
+        new_outer = Just $ case mb_outer of
+          Nothing    -> (ctl_term_depth env, ctl_id_depths env)
+          Just outer -> outer
 
 
 {- Note [Failure in local type signatures]

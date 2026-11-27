@@ -1187,7 +1187,8 @@ outcomes hit miss scope argument captures expr = do
     body <- branchBody scope expr
     case captures of
       [] -> do
-        (con, [Core.Var x]) <- constructorCall body
+        (con, [field]) <- constructorCall body
+        Core.Var x <- branchBody scope field
         (hit, miss, con) <$ guard (x == argument)
       capture : rest -> do
         rows <- caseOn argument body
@@ -1215,10 +1216,16 @@ findTraversalVarCon is_subst cb rows =
     find $ \con -> case [(bs, e) | (dc, bs, e) <- rows, dc == con] of
       [(bs, e)] | [field] <- filter isValueVar bs, Just checked <- branchBody bs e ->
         if is_subst
-          then case application checked of { Just (Core.Var use, [Core.Var x]) -> use == cb && x == field; _ -> False }
+          then case application checked of
+                 Just (Core.Var use, [arg]) | Just (Core.Var x) <- branchBody bs arg -> use == cb && x == field
+                 _ -> False
           else case constructorCall checked of
-                 Just (vh, [renamed]) | vh == con, Just (Core.Var use, [Core.Var x]) <- application renamed ->
-                   use == cb && x == field
+                 Just (vh, [renamed0])
+                   | vh == con
+                   , Just renamed <- branchBody bs renamed0
+                   , Just (Core.Var use, [arg]) <- application renamed
+                   , Just (Core.Var x) <- branchBody bs arg ->
+                     use == cb && x == field
                  _ -> False
       _ -> False
 
@@ -1315,7 +1322,9 @@ checkedScopeRow is_typed bindings var hit miss traversal callback (con, binders,
     pure ((con, map length owners), owners)
   where
     recursiveField original field = do
-      (Core.Var owner, [captured, Core.Var subterm]) <- application field
+      field' <- branchBody binders field
+      (Core.Var owner, [captured, sub_expr]) <- application field'
+      Core.Var subterm <- branchBody binders sub_expr
       guard (traversal == owner && original == subterm && isLiftedTypeKind (typeKind (varType original)))
       lifts captured
 
@@ -1349,7 +1358,7 @@ checkedScopeRow is_typed bindings var hit miss traversal callback (con, binders,
       guard (length rows == 2 && all (not . isValueVar) hit_bs)
       fresh <- expandTypeHelper bindings <$> branchBody hit_bs hit_rhs
       forwarded <- branchBody miss_bs miss_rhs
-      (lift_step, see_older) <- inlineStep fresh forwarded
+      (lift_step, see_older) <- inlineStep hit_bs miss_bs fresh forwarded
       [older] <- pure (filter isValueVar miss_bs)
       if is_typed
         then do
@@ -1365,14 +1374,16 @@ checkedScopeRow is_typed bindings var hit miss traversal callback (con, binders,
           guard (input == older)
           (lift_step :) <$> lifts (Core.Var fn)
 
-    inlineStep fresh forwarded = do
+    inlineStep hit_bs miss_bs fresh forwarded = do
       (fresh_con, fields) <- constructorCall fresh
       case fields of
         [] -> do
-          (forward_con, [lookup_older]) <- constructorCall forwarded
+          (forward_con, [lo0]) <- constructorCall forwarded
+          lookup_older <- branchBody miss_bs lo0
           (InlinedRename, lookup_older) <$ guard (fresh_con == hit && forward_con == miss)
         [v] -> do
-          (fresh_index, []) <- constructorCall v
+          v' <- branchBody hit_bs v
+          (fresh_index, []) <- constructorCall v'
           guard (fresh_con == var && fresh_index == hit)
           (Core.Var rename, [weakening, lookup_older]) <- application forwarded
           _ <- checkedScopeWeakening is_typed bindings miss weakening
@@ -1411,12 +1422,14 @@ checkScopeExt is_typed bindings mb_var hit miss rhs = do
     (res, lookup_older) <- case mb_var of
       Nothing -> do
         (fresh, []) <- constructorCall hit_body
-        (successor, [lo]) <- constructorCall miss_body
+        (successor, [lo0]) <- constructorCall miss_body
+        lo <- branchBody miss_bs lo0
         guard (fresh == hit && successor == miss)
         pure (Nothing, lo)
       Just var -> do
         (term, [v]) <- constructorCall hit_body
-        (fresh, []) <- constructorCall v
+        v' <- branchBody hit_bs v
+        (fresh, []) <- constructorCall v'
         guard (term == var && fresh == hit)
         (Core.Var rename, [weakening, lo]) <- application miss_body
         _ <- lookupVarEnv bindings rename

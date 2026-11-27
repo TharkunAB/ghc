@@ -90,6 +90,7 @@ module GHC.Tc.Gen.HsType (
         withLocalSynthFunIds,
         setLocalSimpleFunBinds,
         lookupLocalSimpleFunBind,
+        tcSynthesizeMillerMotive,
 
    ) where
 
@@ -1139,7 +1140,7 @@ tcCheckRetainedType allow_function witness_skol = go
                          do { check_not_fun domain_ty
                             ; let index = mark_id (mkLocalId name bndr_mult domain_ty)
                                   mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name index }
-                            ; body_ty <- check_bndrs mode' rest
+                            ; body_ty <- tcExtendTermScopeBinders [index] (check_bndrs mode' rest)
                             ; return (mkDepFunTyWithVis (hsForEachVisibility ann) index body_ty) } }
               (HsBndrWildCard _, HsBndrKind _ domain)
                 | visible ->
@@ -1161,15 +1162,15 @@ tcCheckRetainedType allow_function witness_skol = go
                              mk_type_witness bndr_mult skol chosen $ \_ -> check_bndrs mode rest
                            _ ->
                              do { check_not_fun domain_ty
-                                ; body_ty <- check_bndrs mode rest
                                 ; let index = mark_id (mkLocalId chosen bndr_mult domain_ty)
+                                ; body_ty <- tcExtendTermScopeBinders [index] (check_bndrs mode rest)
                                 ; return (mkDepFunTyWithVis DepFunInvisible index body_ty) } }
               (HsBndrVar _ (L _ name), HsBndrNoKind _) ->
                 do { bndr_mult <- tc_bndr_mult
                    ; domain_meta <- newFlexiTyVarTy liftedTypeKind
                    ; let temp_index = mark_id (mkLocalId name bndr_mult domain_meta)
                          mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name temp_index }
-                   ; raw_body_ty <- check_bndrs mode' rest
+                   ; raw_body_ty <- tcExtendTermScopeBinders [temp_index] (check_bndrs mode' rest)
                    ; domain_ty0 <- liftZonkM (zonkTcType domain_meta)
                    ; domain_ty1 <- default_unannotated_domain domain_ty0
                    ; domain_ty <- if valid_domain domain_ty1
@@ -1312,7 +1313,8 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
                      mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name index }
                      vis'  | isInvisibleDepFunFlag vis, isInferredForEachBndr bndr = DepFunInferred
                            | otherwise = vis
-               ; (binders, body_ty) <- bind_indices allow vis mode' rest body
+               ; (binders, body_ty) <- tcExtendTermScopeBinders [index] $
+                                         bind_indices allow vis mode' rest body
                ; return (Just index : binders, mkDepFunTyWithVis vis' index body_ty) }
           HsTvb _ () (HsBndrWildCard _) (HsBndrKind _ domain)
             | isInvisibleDepFunFlag vis ->
@@ -1321,7 +1323,8 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
                  ; let index = mark_bndr (mkLocalId sys_name ManyTy domain_ty)
                        vis'  | isInferredForEachBndr bndr = DepFunInferred
                              | otherwise                 = DepFunInvisible
-                 ; (binders, body_ty) <- bind_indices allow vis mode rest body
+                 ; (binders, body_ty) <- tcExtendTermScopeBinders [index] $
+                                           bind_indices allow vis mode rest body
                  ; return (Just index : binders, mkDepFunTyWithVis vis' index body_ty) }
             | otherwise ->
               do { domain_ty <- tc_check_lhs_type mode domain liftedTypeKind
@@ -1331,7 +1334,8 @@ tcCheckRetainedConType validate_domain allow_result tc_field_mult
             do { domain_meta <- newFlexiTyVarTy liftedTypeKind
                ; let temp_index = mark_bndr (mkLocalId name ManyTy domain_meta)
                      mode' = mode { mode_indices = extendNameEnv (mode_indices mode) name temp_index }
-               ; (binders, raw_body_ty) <- bind_indices allow vis mode' rest body
+               ; (binders, raw_body_ty) <- tcExtendTermScopeBinders [temp_index] $
+                                             bind_indices allow vis mode' rest body
                ; domain_ty <- liftZonkM (zonkTcType domain_meta)
                ; unless (valid_field_domain domain_ty) $
                    failWithTc $ TcRnRetainedQuantificationError (RetainedUnsupportedDomain domain_ty)
@@ -3437,7 +3441,7 @@ tc_vis_forall_type mode ty tele check_body exp_kind
        ; checkExpKind mode ty (mkForAllTys tv_bndrs body) ek exp_kind }
 
 -- | Check an ordinary arrow with the supplied checker for its child types.
--- See Note [Higher-order retained signatures].
+-- See Note [Source retained signatures].
 tc_fun_type_x :: (LHsType GhcRn -> TcKind -> TcM TcType)
               -> TcM Type -> TcTyMode -> HsModifiedFunArr GhcRn -> LHsType GhcRn -> LHsType GhcRn
               -> ExpKind -> TcM TcType
@@ -6423,6 +6427,78 @@ tcInternSynthClosedFamily fam_name valid build_spec = do
           tc <- mkSynthClosedFamily fam_name invis_tvs vis_tvs res_kind flav
           Just <$> registerSynthTyCon tc
 
+-- | Synthesize a 1-equation closed 'FamilyTyCon' @$motive@ for higher-order
+-- Miller pattern unification @?m s_1 .. s_k ~ rhs@, abstracting ambient free
+-- type variables and local runtime index 'Id's in dependency order.
+tcSynthesizeMillerMotive
+  :: SrcSpan -> [Var] -> Kind -> Type
+  -> TcM (Maybe (Type, CoAxiom Branched, [Type]))
+tcSynthesizeMillerMotive loc spine_vars res_kind0 rhs_ty0 = runMaybeT $ do
+  guard (not (null spine_vars) && not (any isCoVar spine_vars))
+  let spine_set = mkVarSet spine_vars
+      all_inputs = rhs_ty0 : res_kind0 : map varType spine_vars
+      seed_fvs  = filterOut (`elemVarSet` spine_set) $
+                    tyCoVarsOfTypesList all_inputs ++ concatMap collect_global_term_ids all_inputs
+      close_caps vs =
+        let k_fvs = filterOut (`elemVarSet` spine_set) $
+                      tyCoVarsOfTypesList (map varType vs)
+                        ++ concatMap (collect_global_term_ids . varType) vs
+            more  = filterOut (`elemVarSet` mkVarSet vs) k_fvs
+        in if null more then vs else close_caps (more ++ vs)
+      cap_vars = scopedSort (close_caps (dedup emptyVarSet seed_fvs))
+  guard (not (any isCoVar cap_vars))
+  guard (not (any (\v -> anyFreeVarsOfType (`elemVarSet` spine_set) (varType v)) cap_vars))
+  (_, all_pairs, subst_all) <- liftMaybeT (abstractSynthCaptures (cap_vars ++ spine_vars) [])
+  gbl <- liftMaybeT getGblEnv
+  let res_rec = resolveRecTcTypes (tcg_type_env gbl)
+      (cap_pairs, spine_pairs) = splitAt (length cap_vars) all_pairs
+      invis_tvs = [setTyVarKind tv (res_rec (tyVarKind tv)) | (tv, _) <- cap_pairs]
+      vis_tvs   = [setTyVarKind tv (res_rec (tyVarKind tv)) | (tv, _) <- spine_pairs]
+      all_tvs   = invis_tvs ++ vis_tvs
+      res_kind' = res_rec (subst_all res_kind0)
+      rhs_ty'   = res_rec (subst_all rhs_ty0)
+      tcbs      = mkDependentTyConBinders (map (, SpecifiedSpec) invis_tvs) vis_tvs [] [] res_kind'
+      cap_args  = [ res_rec (if isTyVar orig_v then mkTyVarTy orig_v else TermVarTy orig_v)
+                  | (_, orig_v) <- cap_pairs ]
+      cur_mod   = tcg_mod gbl
+  uniq   <- liftMaybeT getUniqueM
+  fam_nm <- liftMaybeT (newGlobalBinder cur_mod (mkTcOcc ("$motive$" ++ show uniq)) Nothing loc)
+  fam_tc <- liftMaybeT $ mkSynthClosedFamilyTcbs fam_nm tcbs res_kind'
+              (SynthClosedEqns (Just (\nm -> (nm, False)))
+                [(all_tvs, mkTyVarTys all_tvs, rhs_ty', loc)])
+  _      <- liftMaybeT (registerSynthTyCon fam_tc)
+  ax     <- MaybeT (pure (closedFamilyTyConCoAxiom_maybe fam_tc))
+  pure (mkTyConApp fam_tc cap_args, ax, cap_args)
+  where
+    dedup _ [] = []
+    dedup seen (v : vs)
+      | v `elemVarSet` seen = dedup seen vs
+      | otherwise           = v : dedup (extendVarSet seen v) vs
+
+    collect_global_term_ids (TermVarTy v)
+      | isGlobalId v = [v]
+      | otherwise    = []
+    collect_global_term_ids (TermAppTy f a) =
+      (if isGlobalId f then [f] else []) ++ collect_global_term_ids a
+    collect_global_term_ids (AppTy f a) =
+      collect_global_term_ids f ++ collect_global_term_ids a
+    collect_global_term_ids (TyConApp _ as) =
+      concatMap collect_global_term_ids as
+    collect_global_term_ids (FunTy _ ma m a r) =
+      concatMap collect_global_term_ids [ma, m, a, r]
+    collect_global_term_ids (ForAllTy ma b r) =
+      collect_global_term_ids ma ++ collect_global_term_ids (binderType b)
+        ++ collect_global_term_ids r
+    collect_global_term_ids (DepFunTy _ b r) =
+      collect_global_term_ids (varType b) ++ filter (/= b) (collect_global_term_ids r)
+    collect_global_term_ids (ExistsTy _ b r) =
+      collect_global_term_ids (varType b) ++ collect_global_term_ids r
+    collect_global_term_ids (DepDictTy b r) =
+      collect_global_term_ids (varType b) ++ filter (/= b) (collect_global_term_ids r)
+    collect_global_term_ids (CastTy t _) =
+      collect_global_term_ids t
+    collect_global_term_ids _ = []
+
 freshAnonArgTyVars :: [Kind] -> TcM [TyVar]
 freshAnonArgTyVars = zipWithM
   (\i dom -> (`mkTyVar` dom) <$> newSysName (mkTyVarOcc ("arg" ++ show i)))
@@ -6435,18 +6511,18 @@ abstractSynthCaptures raw_fvs extra_in_scope = do
   let ordered_fvs = scopedSort raw_fvs
       init_subst  = Subst.mkEmptySubst (mkInScopeSet (mkVarSet (ordered_fvs ++ extra_in_scope)))
       alloc (subst, id_acc) v = do
-        let ki = replaceTypeTermIds id_acc (Subst.substTy subst (varType v))
+        let ki = Subst.substTy subst (replaceTypeTermIds id_acc (varType v))
         nm <- newSysName (mkTyVarOccFS (occNameFS (nameOccName (getName v))))
         let tv      = mkTyVar nm ki
             subst'  = if isTyVar v
                         then Subst.extendTvSubstAndInScope subst v (mkTyVarTy tv)
-                        else subst
+                        else Subst.extendSubstInScope subst tv
             id_acc' = if isId v
                         then extendVarEnv id_acc v (mkTyVarTy tv)
                         else id_acc
         pure ((subst', id_acc'), (tv, v))
   ((subst1, id_map), pairs) <- mapAccumLM alloc (init_subst, emptyVarEnv) ordered_fvs
-  let subst_all s ty = replaceTypeTermIds id_map (Subst.substTy s ty)
+  let subst_all s ty = Subst.substTy s (replaceTypeTermIds id_map ty)
   pure (subst1, pairs, subst_all subst1)
 
 -- | Queue a post-knot validity check for a synthesized family or synonym in the
