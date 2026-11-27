@@ -32,7 +32,7 @@ buildRustRts stage output = do
     when (null rustc) $ fail "The Rust RTS requires --enable-rust-rts."
     _ <- setting RustRtsCompilerVersion
     let source = "rts/rust/lib.rs"
-    need [rustc, source]
+    need [rustc, source, "rts/rust/file_lock.rs"]
     createDirectory (takeDirectory output)
     prog <- exeSpawnPath rustc
     cmdExe prog

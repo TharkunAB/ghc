@@ -1,5 +1,7 @@
 #![no_std]
 
+mod file_lock;
+
 /// Decode an IEEE binary32 value into GHC's signed mantissa and exponent.
 ///
 /// # Safety
