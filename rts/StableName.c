@@ -218,11 +218,27 @@ lookupStableName (StgPtr p)
  * Remember old stable name addresses
  * -------------------------------------------------------------------------- */
 
+#if defined(USE_RUST_RTS)
+GHC_STATIC_ASSERT(offsetof(snEntry, addr) == 0 &&
+                  offsetof(snEntry, old) == sizeof(StgPtr) &&
+                  offsetof(snEntry, sn_obj) == 2 * sizeof(StgPtr) &&
+                  sizeof(snEntry) == 3 * sizeof(StgPtr) &&
+                  _Alignof(snEntry) == _Alignof(StgPtr),
+                  "Rust stable name entry layout");
+RTS_PRIVATE void ghc_rust_remember_stable_names(snEntry *table, size_t count);
+RTS_PRIVATE void ghc_rust_thread_stable_names(snEntry *table, size_t count,
+                                              evac_fn evac, void *user);
+#endif
+
 void
 rememberOldStableNameAddresses(void)
 {
     /* TODO: Only if !full GC */
+#if defined(USE_RUST_RTS)
+    ghc_rust_remember_stable_names(stable_name_table, SNT_size);
+#else
     FOR_EACH_STABLE_NAME(p, p->old = p->addr;);
+#endif
 }
 
 /* -----------------------------------------------------------------------------
@@ -236,6 +252,9 @@ rememberOldStableNameAddresses(void)
 void
 threadStableNameTable( evac_fn evac, void *user )
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_thread_stable_names(stable_name_table, SNT_size, evac, user);
+#else
     FOR_EACH_STABLE_NAME(p, {
         if (p->sn_obj != NULL) {
             evac(user, (StgClosure **)&p->sn_obj);
@@ -244,6 +263,7 @@ threadStableNameTable( evac_fn evac, void *user )
             evac(user, (StgClosure **)&p->addr);
         }
     });
+#endif
 }
 
 /* -----------------------------------------------------------------------------

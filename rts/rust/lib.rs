@@ -12,4 +12,5 @@ mod hash_walk;
 #[cfg(ghc_use_large_address_space)]
 mod mblock_extents;
 mod prim_float;
+mod stable_name;
 mod stable_ptr;
