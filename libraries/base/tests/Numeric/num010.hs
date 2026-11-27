@@ -1,7 +1,18 @@
 
 module Main(main) where
 
-main = sequence_ [ f x y | x <- [0,
+import Data.Word (Word32)
+import GHC.Float (castWord32ToFloat)
+
+-- | Decode runtime bits. Opacity keeps the Float primop in the test.
+{-# OPAQUE decodeBits #-}
+decodeBits :: Word32 -> (Integer, Int)
+decodeBits bits = decodeFloat (castWord32ToFloat bits)
+
+main = do
+    mapM_ (print . decodeBits)
+        [0x00000000, 0x80000000, 0x00000001, 0x807fffff, 0x00800000, 0x7f7fffff]
+    sequence_ [ f x y | x <- [0,
                                  1000,
                                  1000000000000,              -- > 2^32
                                  1000000000000000000000000,  -- > 2^64

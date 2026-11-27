@@ -211,9 +211,16 @@ __decodeDouble_Int64 (StgInt64 *const mantissa, const StgDouble dbl)
    based on defs in GNU libc <ieee754.h>
 */
 
+#if defined(USE_RUST_RTS)
+RTS_PRIVATE void ghc_rust_decode_float_int(I_ *man, I_ *exp, StgFloat flt);
+#endif
+
 void
 __decodeFloat_Int (I_ *man, I_ *exp, StgFloat flt)
 {
+#if defined(USE_RUST_RTS)
+    ghc_rust_decode_float_int(man, exp, flt);
+#else
     /* Do some bit fiddling on IEEE */
     int high, sign;                 /* assuming 32 bit ints */
     union { float f; int i; } u;    /* assuming 32 bit float and int */
@@ -247,4 +254,5 @@ __decodeFloat_Int (I_ *man, I_ *exp, StgFloat flt)
         if (sign < 0)
             *man = - *man;
     }
+#endif
 }
