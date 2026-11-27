@@ -8,10 +8,10 @@ core::arch::global_asm!(
     ".hidden ghc_rust_collect_fresh_weaks",
     ".hidden ghc_rust_init_weak_generations",
     ".hidden ghc_rust_traverse_weaks",
-    ".hidden ghc_rust_resurrect_unreachable_threads",
+    ".hidden ghc_rust_resurrect_thread_generations",
     ".hidden ghc_rust_scavenge_live_weak",
     ".hidden ghc_rust_tidy_weak_list",
-    ".hidden ghc_rust_tidy_thread_list",
+    ".hidden ghc_rust_tidy_thread_generations",
 );
 
 unsafe extern "C" {
@@ -49,6 +49,15 @@ unsafe extern "C" fn ghc_rust_scavenge_live_weak(
 struct WeakList {
     head: *mut u8,
     tail: *mut u8,
+}
+
+// See Note [Thread generation traversal from Rust] in sm/MarkWeak.c.
+#[repr(C)]
+struct ThreadGenerations {
+    generations: *mut u8,
+    stride: usize,
+    old_threads_offset: usize,
+    collected: u32,
 }
 
 #[repr(C)]
@@ -114,8 +123,7 @@ unsafe extern "C" fn ghc_rust_tidy_weak_list(
 }
 
 // See Note [Tidy thread list ownership] in sm/MarkWeak.c.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_tidy_thread_list(
+unsafe fn tidy_thread_list(
     old: *mut *mut u8,
     end: *mut u8,
     link_offset: usize,
@@ -136,6 +144,23 @@ unsafe extern "C" fn ghc_rust_tidy_thread_list(
                 destination.write(tso);
             }
             tso = next;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_tidy_thread_generations(
+    generations: *const ThreadGenerations,
+    end: *mut u8,
+    link_offset: usize,
+    inspect: unsafe extern "C" fn(*mut *mut u8) -> *mut *mut u8,
+) {
+    unsafe {
+        let layout = &*generations;
+        for index in 0..=layout.collected {
+            let generation = layout.generations.add(index as usize * layout.stride);
+            let old = generation.add(layout.old_threads_offset).cast::<*mut u8>();
+            tidy_thread_list(old, end, link_offset, inspect);
         }
     }
 }
@@ -270,8 +295,7 @@ unsafe extern "C" fn ghc_rust_mark_weak_list(
 }
 
 // Keep the original next link before marking. The root slot can move a live TSO.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_resurrect_unreachable_threads(
+unsafe fn resurrect_unreachable_threads(
     old: *mut *mut u8,
     resurrected: *mut *mut u8,
     gc_thread: *mut c_void,
@@ -304,6 +328,31 @@ unsafe extern "C" fn ghc_rust_resurrect_unreachable_threads(
         }
         old.write(end);
         found
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_resurrect_thread_generations(
+    generations: *const ThreadGenerations,
+    resurrected: *mut *mut u8,
+    gc_thread: *mut c_void,
+    end: *mut u8,
+    link_offset: usize,
+    what_next_offset: usize,
+    killed: u16,
+    complete: u16,
+) -> bool {
+    unsafe {
+        let layout = &*generations;
+        let mut changed = false;
+        for index in 0..=layout.collected {
+            let generation = layout.generations.add(index as usize * layout.stride);
+            let old = generation.add(layout.old_threads_offset).cast::<*mut u8>();
+            changed |= resurrect_unreachable_threads(
+                old, resurrected, gc_thread, end, link_offset, what_next_offset, killed, complete,
+            );
+        }
+        changed
     }
 }
 

@@ -31,6 +31,19 @@
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 #define USE_RUST_WEAK_GC
+/* Note [Thread generation traversal from Rust]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * C supplies the generation stride and the old_threads offset. Rust visits
+ * collected generations in order and calls its thread-list operations.
+ * inspectTidyThread uses isAlive without the gct register. Resurrection
+ * passes the GC worker to mark_root, which installs that worker for evacuation.
+ */
+typedef struct {
+    generation *generations;
+    size_t stride;
+    size_t old_threads_offset;
+    uint32_t collected;
+} ThreadGenerations;
 RTS_PRIVATE void ghc_rust_init_weak_generations(generation *gens, size_t stride,
     size_t live_offset, size_t old_offset, uint32_t collected, uint32_t oldest, bool nonmoving);
 RTS_PRIVATE bool ghc_rust_traverse_weaks(void *context,
@@ -38,8 +51,11 @@ RTS_PRIVATE bool ghc_rust_traverse_weaks(void *context,
 RTS_PRIVATE void ghc_rust_collect_dead_weak_generations(generation *gens,
     size_t stride, size_t old_offset, uint32_t collected, StgWeak **pending,
     void *gc_thread_ptr, size_t payload_offset);
-RTS_PRIVATE void ghc_rust_tidy_thread_list(StgTSO **old, StgTSO *end,
-    size_t link_offset, StgTSO **(*inspect)(StgTSO **));
+RTS_PRIVATE void ghc_rust_tidy_thread_generations(const ThreadGenerations *gens,
+    StgTSO *end, size_t link_offset, StgTSO **(*inspect)(StgTSO **));
+RTS_PRIVATE bool ghc_rust_resurrect_thread_generations(const ThreadGenerations *gens,
+    StgTSO **resurrected, void *gc_thread_ptr, StgTSO *end,
+    size_t link_offset, size_t what_next_offset, StgWord16 killed, StgWord16 complete);
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -94,10 +110,10 @@ static WeakStage weak_stage;
 
 #if !defined(USE_RUST_WEAK_GC)
 static void    collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list);
+static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads);
+static void tidyThreadList (generation *gen);
 #endif
 static bool tidyWeakList (generation *gen);
-static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads);
-static void    tidyThreadList (generation *gen);
 
 /*
  * Note [Weak pointer processing and the non-moving GC]
@@ -161,31 +177,39 @@ typedef struct {
     gc_thread *worker;
     StgWeak **dead;
     StgTSO **resurrected;
+    ThreadGenerations threads;
 } WeakPassContext;
+static StgTSO **inspectTidyThread(StgTSO **current);
 
 static bool runWeakPass(void *user, uint8_t pass)
 {
     WeakPassContext *ctx = user;
-    bool changed = false;
+    if (pass == TidyThreads) {
+        ghc_rust_tidy_thread_generations(&ctx->threads, END_TSO_QUEUE,
+            offsetof(StgTSO, global_link), inspectTidyThread);
+        return false;
+    }
+    if (pass == ResurrectThreads) {
+        return ghc_rust_resurrect_thread_generations(&ctx->threads,
+            ctx->resurrected, ctx->worker, END_TSO_QUEUE,
+            offsetof(StgTSO, global_link), offsetof(StgTSO, what_next),
+            ThreadKilled, ThreadComplete);
+    }
     if (pass == CollectDeadWeaks) {
         ghc_rust_collect_dead_weak_generations(generations, sizeof(generation),
             offsetof(generation, old_weak_ptr_list), N, ctx->dead, ctx->worker,
             offsetof(StgWeak, cfinalizers));
         return false;
     }
+    if (pass != TidyWeakKeys) barf("runWeakPass: unknown pass %u", (unsigned)pass);
     // The Rust caller uses the platform ABI. See mark_root in GC.c.
 #if defined(THREADED_RTS)
     gc_thread *saved = gct;
 #endif
     SET_GCT(ctx->worker);
+    bool changed = false;
     for (uint32_t i = 0; i <= N; i++) {
-        generation *gen = &generations[i];
-        switch (pass) {
-        case TidyThreads: tidyThreadList(gen); break;
-        case TidyWeakKeys: changed |= tidyWeakList(gen); break;
-        case ResurrectThreads: changed |= resurrectUnreachableThreads(gen, ctx->resurrected); break;
-        default: barf("runWeakPass: unknown pass %u", (unsigned)pass);
-        }
+        changed |= tidyWeakList(&generations[i]);
     }
     SET_GCT(saved);
     return changed;
@@ -204,7 +228,8 @@ bool
 traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
 {
 #if defined(USE_RUST_WEAK_GC)
-  WeakPassContext ctx = { gct, dead_weak_ptr_list, resurrected_threads };
+  WeakPassContext ctx = { gct, dead_weak_ptr_list, resurrected_threads,
+      { generations, sizeof(generation), offsetof(generation, old_threads), N } };
   return ghc_rust_traverse_weaks(&ctx, runWeakPass);
 #else
   bool flag = false;
@@ -316,10 +341,6 @@ GHC_STATIC_ASSERT(WEAK_FIELD_OFFSET(key) == sizeof(void *) &&
                   WEAK_FIELD_OFFSET(finalizer) == 3 * sizeof(void *) &&
                   WEAK_FIELD_OFFSET(link) == 4 * sizeof(void *), "Rust weak payload layout");
 #undef WEAK_FIELD_OFFSET
-RTS_PRIVATE bool ghc_rust_resurrect_unreachable_threads(StgTSO **old,
-    StgTSO **resurrected, void *gc_thread_ptr, StgTSO *end,
-    size_t link_offset, size_t what_next_offset,
-    StgWord16 killed, StgWord16 complete);
 RTS_PRIVATE void ghc_rust_mark_weak_list(StgWeak **head, void *gc_thread_ptr,
     size_t payload_offset, void (*check)(StgWeak *));
 RTS_PRIVATE void ghc_rust_scavenge_live_weak(StgWeak *w, void *gc_thread_ptr,
@@ -354,14 +375,9 @@ static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
  * Deal with threads left on the old_threads list after GC has concluded,
  * moving them onto the resurrected_threads list where appropriate.
  */
+#if !defined(USE_RUST_WEAK_GC)
 static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads)
 {
-#if defined(USE_RUST_WEAK_GC)
-    return ghc_rust_resurrect_unreachable_threads(&gen->old_threads,
-        resurrected_threads, gct, END_TSO_QUEUE,
-        offsetof(StgTSO, global_link), offsetof(StgTSO, what_next),
-        ThreadKilled, ThreadComplete);
-#else
     StgTSO *t, *next;
     bool flag = false;
 
@@ -395,8 +411,8 @@ static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_t
 
     gen->old_threads = END_TSO_QUEUE;
     return flag;
-#endif
 }
+#endif
 
 #if defined(USE_RUST_WEAK_GC)
 // Rust owns the list links. C supplies the heap layout and mutable-list operations.
@@ -595,12 +611,9 @@ static StgTSO **inspectTidyThread(StgTSO **current)
 }
 #endif
 
+#if !defined(USE_RUST_WEAK_GC)
 static void tidyThreadList (generation *gen)
 {
-#if defined(USE_RUST_WEAK_GC)
-    ghc_rust_tidy_thread_list(&gen->old_threads, END_TSO_QUEUE,
-        offsetof(StgTSO, global_link), inspectTidyThread);
-#else
     StgTSO *next;
     StgTSO **prev = &gen->old_threads;
 
@@ -639,8 +652,8 @@ static void tidyThreadList (generation *gen)
             new_gen->threads = t;
         }
     }
-#endif
 }
+#endif
 
 #if defined(DEBUG)
 static void checkWeakPtrSanity(StgWeak *hd, StgWeak *tl)
