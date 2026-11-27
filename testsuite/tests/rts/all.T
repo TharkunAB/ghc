@@ -833,6 +833,11 @@ test('T26169',
       extra_run_opts('+RTS -T -qn2 -RTS')],
      compile_and_run, [''])
 
+test('nonmoving_large_sweep_yield',
+     [c_src, unless(in_tree_compiler() and opsys('linux'), skip),
+      only_ways(['threaded1'])],
+     compile_and_run, ['-static -optl-Wl,--wrap=freeGroup -optl-Wl,--wrap=yieldThread'])
+
 test('T27376',
      [ req_target_smp,
        extra_ways(['nonmoving_thr', 'nonmoving_thr_sanity']),

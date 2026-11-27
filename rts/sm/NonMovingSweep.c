@@ -345,28 +345,26 @@ void nonmovingSweepMutLists(void)
     }
 }
 
-/* A variant of freeChain_lock that will only hold the lock for at most max_dur
- * freed blocks to ensure that we don't starve other lock users (e.g. the
- * mutator).
+/* In the threaded RTS, release the lock after at most max_groups calls to
+ * freeGroup. This prevents the sweep from starving other lock users.
  */
-static void freeChain_lock_max(bdescr *bd, int max_dur)
+static void freeChain_lock_max(bdescr *bd, int max_groups)
 {
   ACQUIRE_SM_LOCK;
   bdescr *next_bd;
-  int i = 0;
+  int groups = 0;
   while (bd != NULL) {
     next_bd = bd->link;
     freeGroup(bd);
     bd = next_bd;
-    if (i == max_dur) {
+    if (++groups == max_groups) {
 #if defined(THREADED_RTS)
         RELEASE_SM_LOCK;
         yieldThread();
         ACQUIRE_SM_LOCK;
 #endif
-        i = 0;
+        groups = 0;
     }
-    i++;
   }
   RELEASE_SM_LOCK;
 }
