@@ -18,6 +18,7 @@
 
 #include "xxhash.h"
 
+#include <limits.h>
 #include <string.h>
 
 #if !defined(USE_RUST_RTS)
@@ -410,6 +411,10 @@ insertHashTable_inlined(HashTable *table, StgWord key,
     // Disable this assert; sometimes it's useful to be able to
     // overwrite entries in the hash table.
     // ASSERT(lookupHashTable(table, key) == NULL);
+
+    if (table->kcount == INT_MAX) {
+        barf("insertHashTable: too many entries");
+    }
 
     /* When the average load gets too high, we expand the table */
     if (++table->kcount >= HLOAD * table->bcount)
