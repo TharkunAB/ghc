@@ -6,6 +6,8 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 core::arch::global_asm!(
     ".hidden ghc_rust_make_finalizer_batch",
     ".hidden ghc_rust_prepare_finalizers",
+    ".hidden ghc_rust_pending_finalizers",
+    ".hidden ghc_rust_run_some_finalizers",
 );
 
 const _: () = {
@@ -14,6 +16,10 @@ const _: () = {
     assert!(size_of::<AtomicUsize>() == size_of::<usize>());
     assert!(align_of::<AtomicUsize>() == align_of::<usize>());
 };
+
+static FINALIZER_LIST: AtomicPtr<u8> = AtomicPtr::new(null_mut());
+static PENDING_FINALIZERS: AtomicUsize = AtomicUsize::new(0);
+static FINALIZER_LOCK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn allocateMutArrPtrs(
@@ -30,19 +36,17 @@ unsafe extern "C" {
 
 /// Append dead weak pointers, mark the new entries, and publish their count.
 /// The GC owns `list`. The idle drain can still hold entries in `head`.
-/// C supplies the weak link offset and any DEBUG or profiling header action.
+/// C supplies the weak link offset and any assertion or profiling header action.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ghc_rust_prepare_finalizers(
-    head: *mut *mut u8,
     list: *mut u8,
-    pending: *mut usize,
     link_offset: usize,
     prepare_header: Option<unsafe extern "C" fn(*mut u8)>,
 ) -> usize {
     unsafe {
-        let mut tail = head;
+        let mut tail = FINALIZER_LIST.as_ptr();
         loop {
-            let weak = tail.read();
+            let weak = AtomicPtr::from_ptr(tail).load(Ordering::Relaxed);
             if weak.is_null() {
                 break;
             }
@@ -71,9 +75,54 @@ unsafe extern "C" fn ghc_rust_prepare_finalizers(
             );
             weak = weak.byte_add(link_offset).cast::<*mut u8>().read();
         }
-        AtomicUsize::from_ptr(pending).fetch_add(entries, Ordering::SeqCst);
+        PENDING_FINALIZERS.fetch_add(entries, Ordering::SeqCst);
         actions
     }
+}
+
+/// Read the pending count for the GC assertion and native trace.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_pending_finalizers() -> usize {
+    PENDING_FINALIZERS.load(Ordering::SeqCst)
+}
+
+/// Claim the drain lock, run callbacks, and release the lock.
+/// C supplies task and trace hooks. They run only after a successful claim.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_run_some_finalizers(
+    limit: usize,
+    callbacks_offset: usize,
+    link_offset: usize,
+    payload_offset: usize,
+    begin: unsafe extern "C" fn(usize) -> *mut c_void,
+    end: unsafe extern "C" fn(*mut c_void, usize),
+) -> bool {
+    if PENDING_FINALIZERS.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    if FINALIZER_LOCK
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    unsafe {
+        let owner = begin(PENDING_FINALIZERS.load(Ordering::Relaxed));
+        let mut cursor = FINALIZER_LIST.load(Ordering::Relaxed);
+        let count = super::c_finalizers::drain_c_finalizers(
+            &mut cursor,
+            limit,
+            callbacks_offset,
+            link_offset,
+            payload_offset,
+        );
+        FINALIZER_LIST.store(cursor, Ordering::Relaxed);
+        PENDING_FINALIZERS.fetch_sub(count, Ordering::SeqCst);
+        end(owner, count);
+    }
+    let more = PENDING_FINALIZERS.load(Ordering::Relaxed) != 0;
+    FINALIZER_LOCK.store(0, Ordering::Release);
+    more
 }
 
 // The GC has counted the Haskell finalizers in this list and still owns it.

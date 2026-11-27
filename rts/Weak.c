@@ -42,13 +42,15 @@ GHC_STATIC_ASSERT(offsetof(StgWeak, header.info) == 0, "Rust weak info pointer l
 RTS_PRIVATE void ghc_rust_run_c_finalizers(StgCFinalizerList *list, size_t payload_offset);
 RTS_PRIVATE void ghc_rust_run_all_c_finalizers(StgWeak *list, bool *running,
     size_t callbacks_offset, size_t link_offset, size_t payload_offset);
-RTS_PRIVATE StgWord ghc_rust_drain_c_finalizers(StgWeak **cursor, StgWord limit,
-    size_t callbacks_offset, size_t link_offset, size_t payload_offset);
 RTS_PRIVATE StgMutArrPtrs *ghc_rust_make_finalizer_batch(Capability *cap, StgWeak *list,
     StgWord count, CostCentreStack *ccs, size_t finalizer_offset, size_t link_offset,
     size_t payload_offset);
-RTS_PRIVATE StgWord ghc_rust_prepare_finalizers(StgWeak **head, StgWeak *list,
-    StgWord *pending, size_t link_offset, void (*prepare_header)(StgWeak *));
+RTS_PRIVATE StgWord ghc_rust_prepare_finalizers(StgWeak *list,
+    size_t link_offset, void (*prepare_header)(StgWeak *));
+RTS_PRIVATE StgWord ghc_rust_pending_finalizers(void);
+RTS_PRIVATE bool ghc_rust_run_some_finalizers(StgWord limit,
+    size_t callbacks_offset, size_t link_offset, size_t payload_offset,
+    void *(*begin)(StgWord), void (*end)(void *, StgWord));
 GHC_STATIC_ASSERT(offsetof(StgWeak, finalizer) + sizeof(void *) ==
                   offsetof(StgWeak, link), "Rust weak finalizer offset");
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t), "Rust pending count width");
@@ -77,11 +79,20 @@ prepareDeadWeakHeader(StgWeak *w)
 #define PREPARE_DEAD_WEAK_HEADER NULL
 #endif
 
+/* Note [Weak finalizer queue ownership]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Rust owns the queue head, count, and drain lock in the Rust RTS. The GC
+ * appends and marks only the new list. The idle worker holds the drain lock
+ * while it runs C callbacks. C keeps the task flag and traces around that
+ * call. Rust uses the same count and lock order as the C path.
+ */
+#if !defined(USE_RUST_FINALIZERS)
 // List of dead weak pointers collected by the last GC
 static StgWeak *finalizer_list = NULL;
 
 // Use the same count width as the heap array that holds the finalizers.
 static StgWord n_finalizers = 0;
+#endif
 
 void
 runCFinalizers(StgCFinalizerList *list)
@@ -164,14 +175,18 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
     // n_finalizers is not necessarily zero under non-moving collection
     // because non-moving collector does not wait for the list to be consumed
     // (by doIdleGcWork()) before appending the list with more finalizers.
+#if defined(USE_RUST_FINALIZERS)
+    ASSERT(RtsFlags.GcFlags.useNonmoving || ghc_rust_pending_finalizers() == 0);
+#else
     ASSERT(RtsFlags.GcFlags.useNonmoving || SEQ_CST_LOAD(&n_finalizers) == 0);
+#endif
 
     // Append finalizer_list with the new list. TODO: Perhaps cache tail of the
     // list for faster append. NOTE: We can't append `list` here! Otherwise we
     // end up traversing already visited weaks in the loops below.
 #if defined(USE_RUST_FINALIZERS)
-    n = ghc_rust_prepare_finalizers(&finalizer_list, list, &n_finalizers,
-        offsetof(StgWeak, link), PREPARE_DEAD_WEAK_HEADER);
+    n = ghc_rust_prepare_finalizers(list, offsetof(StgWeak, link),
+        PREPARE_DEAD_WEAK_HEADER);
 #else
     StgWeak **tl = &finalizer_list;
     while (*tl) {
@@ -296,15 +311,39 @@ scheduleFinalizers(Capability *cap, StgWeak *list)
 // available.
 static const StgWord finalizer_chunk = 100;
 
+#if defined(USE_RUST_FINALIZERS)
+static void *beginFinalizerDrain(StgWord pending)
+{
+    debugTrace(DEBUG_sched, "running C finalizers, %" FMT_Word " remaining", pending);
+    Task *task = myTask();
+    if (task != NULL) task->running_finalizers = true;
+    return task;
+}
+
+static void endFinalizerDrain(void *owner, StgWord count)
+{
+    Task *task = owner;
+    if (task != NULL) task->running_finalizers = false;
+    debugTrace(DEBUG_sched, "ran %" FMT_Word " C finalizers", count);
+}
+#endif
+
 // non-zero if a thread is already in runSomeFinalizers(). This
 // protects the globals finalizer_list and n_finalizers.
+#if !defined(USE_RUST_FINALIZERS)
 static volatile StgWord finalizer_lock = 0;
+#endif
 
 //
 // Run some C finalizers.  Returns true if there's more work to do.
 //
 bool runSomeFinalizers(bool all)
 {
+#if defined(USE_RUST_FINALIZERS)
+    return ghc_rust_run_some_finalizers(all ? STG_WORD_MAX : finalizer_chunk,
+        offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
+        offsetof(StgCFinalizerList, link), beginFinalizerDrain, endFinalizerDrain);
+#else
     if (RELAXED_LOAD(&n_finalizers) == 0)
         return false;
 
@@ -323,11 +362,6 @@ bool runSomeFinalizers(bool all)
     }
 
     StgWeak *w = finalizer_list;
-#if defined(USE_RUST_FINALIZERS)
-    StgWord count = ghc_rust_drain_c_finalizers(&w, all ? STG_WORD_MAX : finalizer_chunk,
-        offsetof(StgWeak, cfinalizers), offsetof(StgWeak, link),
-        offsetof(StgCFinalizerList, link));
-#else
     StgWord count = 0;
     while (w != NULL) {
         runCFinalizers((StgCFinalizerList *)w->cfinalizers);
@@ -335,8 +369,6 @@ bool runSomeFinalizers(bool all)
         ++count;
         if (!all && count >= finalizer_chunk) break;
     }
-#endif
-
     RELAXED_STORE(&finalizer_list, w);
     SEQ_CST_ADD(&n_finalizers, -count);
 
@@ -348,4 +380,5 @@ bool runSomeFinalizers(bool all)
     bool ret = n_finalizers != 0;
     RELEASE_STORE(&finalizer_lock, 0);
     return ret;
+#endif
 }

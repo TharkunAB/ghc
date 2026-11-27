@@ -4,7 +4,6 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 core::arch::global_asm!(
     ".hidden ghc_rust_run_c_finalizers",
     ".hidden ghc_rust_run_all_c_finalizers",
-    ".hidden ghc_rust_drain_c_finalizers",
 );
 
 unsafe extern "C" {
@@ -75,9 +74,8 @@ unsafe extern "C" fn ghc_rust_run_all_c_finalizers(
     }
 }
 
-// The scheduler holds finalizer_lock. GC has already marked these entries DEAD_WEAK.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn ghc_rust_drain_c_finalizers(
+// The queue owner holds its drain lock. GC has marked these entries DEAD_WEAK.
+pub(super) unsafe fn drain_c_finalizers(
     cursor: *mut *mut u8,
     limit: usize,
     callbacks_offset: usize,
