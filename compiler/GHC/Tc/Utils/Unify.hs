@@ -56,7 +56,14 @@ module GHC.Tc.Utils.Unify (
 
   simpleUnifyCheck, UnifyCheckCaller(..), SimpleUnifyResult(..),
 
-  fillInferResult, fillInferResultNoInst
+  fillInferResult, fillInferResultNoInst,
+
+  -- Implicit existentials and Quick Look helpers
+  tcSubTypeImplicitExists, unwrapMetaView, isPredicativeExistsTy,
+  qlUnify, qlMonoTcType, foldQLInstVars, anyFreeKappa,
+  rejectNativeQuickLook, noQuickLookVars,
+  matchExactPolytypeWitness, matchBarPackageWitnesses,
+  matchMixedExistsResult, matchRetainedExistsWitness
   ) where
 
 import GHC.Prelude
@@ -65,7 +72,7 @@ import {-# SOURCE #-} GHC.Tc.Solver ( tcRewriteFamilyAxioms )
 
 import GHC.Hs
 import GHC.Tc.Errors.Types ( HsCtxt(..), TcRnMessage(TcRnRetainedQuantificationError)
-                           , RetainedQuantificationError(RetainedPatternType, RetainedSolverType) )
+                           , RetainedQuantificationError(RetainedPatternType, RetainedQuickLook, RetainedSolverType) )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
 import GHC.Tc.Utils.Concrete
 import GHC.Tc.Utils.Env
@@ -92,11 +99,12 @@ import GHC.Core.ConLike (ConLike(..))
 import GHC.Core.DataCon (dataConContextFieldCount, dataConSourceOrder)
 import GHC.Core.FamInstEnv ( reduceScopedSumPayload_maybe, reduceTyFamApp_maybe )
 import qualified GHC.Core as Core
-import GHC.Core.Dependent ( hasNativeDependentExpr )
+import GHC.Core.Dependent ( hasNativeDependentExpr, supportsQuickLookType )
 import GHC.Core.Utils ( applyTypeToArgs )
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep hiding (Refl)
 import GHC.Core.TyCo.FVs
+import qualified GHC.Core.TyCo.Subst as Subst
 import GHC.Core.TyCo.Ppr( debugPprType {- pprTyVar -} )
 import GHC.Core.TyCon
 import GHC.Core.Coercion
@@ -109,9 +117,12 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Types.Name
+import GHC.Types.Name.Env ( lookupNameEnv )
 import GHC.Types.Name.Set ( extendNameSet )
 import GHC.Types.Id( idType )
+import GHC.Types.TypeEnv ( lookupTypeEnv )
 import GHC.Types.Var as Var
+import GHC.Types.Var.FV ( FV(..), runFV )
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Basic
@@ -126,7 +137,7 @@ import GHC.Driver.DynFlags
 
 import GHC.Data.Bag
 import GHC.Data.FastString
-import GHC.Data.Maybe (firstJusts, isJust)
+import GHC.Data.Maybe (MaybeT(..), firstJusts, isJust, liftMaybeT)
 
 import Control.Monad
 import Data.Functor.Identity (Identity(..))
@@ -1699,6 +1710,13 @@ tcWrapResultMono :: HasDebugCallStack
                  -> ExpRhoType  -- ^ Expected
                  -> TcM (HsExpr GhcTc)
 tcWrapResultMono rn_expr expr act_ty res_ty
+  | Check exp_ty <- res_ty
+  = do { exp_view <- unwrapMetaView exp_ty
+       ; case exp_view of
+           ExistsTy ImplicitExists _ _ -> tcWrapResult rn_expr expr act_ty res_ty
+           _ -> do { co <- tcSubTypeMono rn_expr act_ty res_ty
+                   ; return (mkHsWrapCo co expr) } }
+  | otherwise
   = do { co <- tcSubTypeMono rn_expr act_ty res_ty
        ; return (mkHsWrapCo co expr) }
 
@@ -1757,22 +1775,27 @@ tcSubTypeApp rn_expr tc_fun app_res_rho (Check exp_rho)
                , text "app_res_rho:" <+> ppr app_res_rho
                , text "exp_rho:"  <+> ppr exp_rho
                , text "ds_flag:" <+> ppr ds_flag ]
-      ; wrap <- case ds_flag of
-          Shallow -- No deep subsumption
-            -- app_res_rho and exp_rho are both rho-types,
-            -- so with simple subsumption we can unify them.
-            -- See Note [Retained domains after instantiation].
-            -> mkWpCastN <$> unify_retained_rho (unifyExprType rn_expr)
-                             app_res_rho exp_rho
+      ; mb_pack <- tcSubTypeImplicitExists (Just tc_fun, Top) ds_flag
+                     (unifyExprType rn_expr) (exprCtOrigin rn_expr)
+                     GenSigCtxt app_res_rho exp_rho
+      ; wrap <- case mb_pack of
+          Just pack_wrap -> return pack_wrap
+          Nothing -> case ds_flag of
+            Shallow -- No deep subsumption
+              -- app_res_rho and exp_rho are both rho-types,
+              -- so with simple subsumption we can unify them.
+              -- See Note [Retained domains after instantiation].
+              -> mkWpCastN <$> unify_retained_rho (unifyExprType rn_expr)
+                               app_res_rho exp_rho
 
-          Deep ds_depth -- Deep subsumption is ON
-            -- Even though both app_res_rho and res_ty are rho-types,
-            -- they may have nested polymorphism, so if deep subsumption
-            -- is on we must call tcSubType.
-            -> tc_sub_type_deep (Just tc_fun, Top) ds_depth
-                                (unifyExprType rn_expr)
-                                (exprCtOrigin rn_expr)
-                                GenSigCtxt app_res_rho exp_rho
+            Deep ds_depth -- Deep subsumption is ON
+              -- Even though both app_res_rho and res_ty are rho-types,
+              -- they may have nested polymorphism, so if deep subsumption
+              -- is on we must call tcSubType.
+              -> tc_sub_type_deep (Just tc_fun, Top) ds_depth
+                                  (unifyExprType rn_expr)
+                                  (exprCtOrigin rn_expr)
+                                  GenSigCtxt app_res_rho exp_rho
 
        ; traceTc "tcSubTypeApp }" $
           vcat [ text "tc_fun:" <+> ppr tc_fun
@@ -2034,11 +2057,15 @@ tc_sub_type_ds pos ds_flag unify inst_orig ctxt ty_actual ty_expected
 
        ; (sk_wrap, inner_wrap)
             <- tcSkolemise ds_flag ctxt ty_expected $ \sk_rho ->
-               case ds_flag of
-                 Deep ds_depth ->
-                    tc_sub_type_deep pos ds_depth unify inst_orig ctxt ty_actual sk_rho
-                 Shallow ->
-                    tc_sub_type_shallow unify inst_orig ty_actual sk_rho
+               do { mb_pack <- tcSubTypeImplicitExists pos ds_flag unify
+                                 inst_orig ctxt ty_actual sk_rho
+                  ; case mb_pack of
+                      Just pack_wrap -> return pack_wrap
+                      Nothing -> case ds_flag of
+                        Deep ds_depth ->
+                           tc_sub_type_deep pos ds_depth unify inst_orig ctxt ty_actual sk_rho
+                        Shallow ->
+                           tc_sub_type_shallow unify inst_orig ty_actual sk_rho }
 
        ; return (sk_wrap <.> inner_wrap) }
 
@@ -2652,6 +2679,15 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
       | isSigmaTy ty_a
       = instantiate_actual ty_a ty_e
 
+    -- Introduce an implicit existential package when expected under deep subsumption.
+    -- See Note [Introducing an implicit existential].
+    go1 ty_a ty_e@(ExistsTy ImplicitExists _ _)
+      = do { mb_pack <- tcSubTypeImplicitExists (tc_fun, pos) (Deep ds_depth)
+                          unify inst_orig ctxt ty_a ty_e
+           ; case mb_pack of
+               Just pack_wrap -> return pack_wrap
+               Nothing        -> just_unify ty_a ty_e }
+
     -- Main case: FunTy vs FunTy. go_fun does the work.
     go1 (FunTy { ft_af = af1, ft_ma = act_ma, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res })
         (FunTy { ft_af = af2, ft_ma = exp_ma, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res })
@@ -2883,10 +2919,11 @@ mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_ma act_mult act_arg act_res exp
 
 -- | Recover coercion evidence from a wrapper with no term operation.
 getWpCo_maybe :: HsWrapper -> Type -> Maybe CoercionR
-getWpCo_maybe WpHole        ty = Just (mkRepReflCo ty)
-getWpCo_maybe (WpCast co)   _  = Just co
-getWpCo_maybe (WpSubType w) ty = getWpCo_maybe w ty
-getWpCo_maybe _             _  = Nothing
+getWpCo_maybe WpHole            ty = Just (mkRepReflCo ty)
+getWpCo_maybe (WpCast co)       _  = Just co
+getWpCo_maybe (WpSubType w)     ty = getWpCo_maybe w ty
+getWpCo_maybe (WpExistsPack {}) _  = Nothing
+getWpCo_maybe _                 _  = Nothing
 
 -----------------------
 deeplySkolemise :: SkolemInfo -> TcSigmaType
@@ -4439,7 +4476,10 @@ simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
     rhs_is_bad (DepFunTy {})  = True
     rhs_is_bad (ClassAppTy {}) = True
     rhs_is_bad (DepDictTy {})  = True
-    rhs_is_bad ty@ExistsTy{} = lhs_tv_is_concrete || not (isTauTy ty)
+    rhs_is_bad ty@ExistsTy{}
+      = lhs_tv_is_concrete
+        || (not forall_ok && not (isPredicativeExistsTy ty))
+        || any rhs_tcv_is_bad (tyCoVarsOfTypeList ty)
     rhs_is_bad (TyVarTy tv) = rhs_tcv_is_bad tv
 
     rhs_is_bad (FunTy {ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = r})
@@ -5173,9 +5213,19 @@ check_ty_eq_rhs flags ty
                           ; return (mkReflCoRedn Nominal <$> co_res) }
 
       ExistsTy {}
-        | not (isTauTy ty) -> return $ PuFail impredicativeProblem
         | tefConcrete flags -> return $ PuFail (cteProblem cteConcrete)
-        | otherwise -> return $ okCheckRefl ty
+        | not (isPredicativeExistsTy ty)
+        -> return $ PuFail impredicativeProblem
+        | otherwise
+        -> do { let fuvs = filter isTcTyVar (tyCoVarsOfTypeList ty)
+                    mk_redn redns =
+                      let fuv_tys  = map reductionReducedType redns
+                          in_scope = mkInScopeSet (tyCoVarsOfTypes (ty : fuv_tys))
+                          subst    = zipTvSubst fuvs fuv_tys `Subst.setInScope` in_scope
+                          ty'      = substTy subst ty
+                      in mkReflRedn Nominal ty'
+              ; fuv_res <- mapM (checkTyVar flags) fuvs
+              ; return (mk_redn <$> sequenceA fuv_res) }
       ForAllTy {}   -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
          -- No need to worry about RuntimeUnkTv
   where
@@ -5385,7 +5435,9 @@ checkTyConApp flags tc_app tc tys
   = check_ty_eq_rhs flags ty'
 
   | not (isTauTyCon tc)
-  = return $ PuFail impredicativeProblem
+  = case coreView tc_app of
+      Just ty' -> check_ty_eq_rhs flags ty'
+      Nothing  -> return $ PuFail impredicativeProblem
 
   | tefConcrete flags
   , not (isConcreteTyCon tc)
@@ -6090,3 +6142,630 @@ lookupCycleBreakerVar cbv (IS { inert_cycle_breakers = cbvs_stack })
   = tyfam_app
   | otherwise
   = pprPanic "lookupCycleBreakerVar found an unbound cycle breaker" (ppr cbv $$ ppr cbvs_stack)
+
+{- *********************************************************************
+*                                                                      *
+          Implicit existential right-packing and Quick Look
+*                                                                      *
+********************************************************************* -}
+
+-- | Expand top-level type synonyms and filled metavariables without zonking
+-- subtrees.
+unwrapMetaView :: TcType -> TcM TcType
+unwrapMetaView ty
+  | Just ty' <- coreView ty = unwrapMetaView ty'
+unwrapMetaView ty@(TyVarTy tv)
+  | isTcTyVar tv
+  = do { mb <- isFilledMetaTyVar_maybe tv
+       ; case mb of
+           Just ty' -> unwrapMetaView ty'
+           Nothing  -> return ty }
+unwrapMetaView ty = return ty
+
+-- | Test whether an existential package has a predicative, family-free tau
+-- structure, allowing in-scope free type variables that 'check_ty_eq_rhs'
+-- validates separately.
+isPredicativeExistsTy :: Type -> Bool
+isPredicativeExistsTy ty
+  | Just ty' <- coreView ty = isPredicativeExistsTy ty'
+isPredicativeExistsTy (ExistsTy _ b r)
+  = is_tau (tyVarKind b) && is_tau r
+  where
+    is_tau t | Just t' <- coreView t = is_tau t'
+    is_tau (TyVarTy _)               = True
+    is_tau (LitTy _)                 = True
+    is_tau (AppTy f a)               = is_tau f && is_tau a
+    is_tau (CastTy t _)              = is_tau t
+    is_tau (ExistsTy _ vb vr)        = is_tau (tyVarKind vb) && is_tau vr
+    is_tau (TyConApp tc tys)         = isTauTyCon tc && isFamFreeTyCon tc && all is_tau tys
+    is_tau (FunTy af ma mult a r)    = isVisibleFunArg af && all is_tau [ma, mult, a, r]
+    is_tau _                         = False
+isPredicativeExistsTy _ = False
+
+-- | Right-instantiate leading implicit existential binders on the expected
+-- type into 'WpExistsPack' wrappers when the actual type is a payload rather
+-- than an implicit existential package.
+-- See Note [Introducing an implicit existential].
+tcSubTypeImplicitExists
+  :: (Maybe (HsExpr GhcTc), Position p)
+  -> DeepSubsumptionFlag
+  -> (TcType -> TcType -> TcM TcCoercionN)
+  -> CtOrigin
+  -> UserTypeCtxt
+  -> TcSigmaType
+  -> TcRhoType
+  -> TcM (Maybe HsWrapper)
+tcSubTypeImplicitExists pos ds_flag unify inst_orig ctxt ty_actual ty_expected
+  | AmbiguityCheckOrigin {} <- inst_orig
+  = return Nothing
+  | otherwise
+  = do { exp_view <- unwrapMetaView ty_expected
+       ; case exp_view of
+           ExistsTy ImplicitExists _ _ -> pack_if_payload exp_view
+           _                           -> return Nothing }
+  where
+    pack_if_payload exp_view =
+      do { act_view0 <- unwrapMetaView ty_actual
+         ; mb_inst <- if isSigmaTy act_view0
+                      then do { let (_, _, raw_body) = tcSplitSigmaTy act_view0
+                              ; body_view <- unwrapMetaView raw_body
+                              ; case body_view of
+                                  ExistsTy ImplicitExists _ _ -> return Nothing
+                                  TyVarTy _                   -> return Nothing
+                                  _ -> Just <$> topInstantiate inst_orig act_view0 }
+                      else return (Just (idHsWrapper, act_view0))
+         ; case mb_inst of
+             Nothing -> return Nothing
+             Just (inst_wrap, rho_a) ->
+               do { payload <- liftZonkM (zonkTcType rho_a)
+                  ; schema  <- liftZonkM (zonkTcType exp_view)
+                  ; is_pkg_fam <- reduces_to_implicit_pkg payload
+                  ; case coreFullView schema of
+                      ExistsTy ImplicitExists _ _
+                        | ExistsTy ImplicitExists _ _ <- coreFullView payload
+                        -> return Nothing
+                        | TyVarTy tv <- coreFullView payload
+                        , isTcTyVar tv && isMetaTyVar tv
+                        -> return Nothing
+                        | is_pkg_fam
+                        -> return Nothing
+                        | ExistsTy ExplicitExists _ _ <- coreFullView payload
+                        -> case matchMixedExistsResult schema payload of
+                             Just (witness, inner) ->
+                               do { inner_wrap <- tc_sub_type_ds pos ds_flag unify inst_orig ctxt rho_a inner
+                                  ; return (Just (mkWpExistsPack schema witness <.> inner_wrap <.> inst_wrap)) }
+                             Nothing -> return Nothing
+                        | otherwise
+                        -> do { impred <- xoptM LangExt.ImpredicativeTypes
+                              ; let inner_body = peel_implicit_body schema
+                                    is_deep_fun = case (ds_flag, coreFullView inner_body, coreFullView payload) of
+                                                    (Deep {}, FunTy{}, FunTy{}) -> True
+                                                    _                           -> False
+                                    quick = not is_deep_fun
+                                            && impred
+                                            && supportsQuickLookType schema
+                                            && supportsQuickLookType payload
+                                            && noQuickLookVars schema
+                                            && noQuickLookVars payload
+                              ; (witnesses, inst_body, pack_wrap) <- peel_pack quick payload schema
+                              ; when quick $
+                                  do { qlUnify inst_body payload
+                                     ; forM_ witnesses $ \w ->
+                                         do { rejectNativeQuickLook w
+                                            ; liftZonkM (qlMonoTcType w) } }
+                              ; inst_body' <- liftZonkM (zonkTcType inst_body)
+                              ; sub_wrap <- tc_sub_type_ds pos ds_flag unify inst_orig ctxt rho_a inst_body'
+                              ; return (Just (pack_wrap <.> sub_wrap <.> inst_wrap)) }
+                      _ -> return Nothing } }
+
+    reduces_to_implicit_pkg ty
+      | TyConApp tc args <- coreFullView ty
+      , isTypeFamilyTyCon tc
+      = do { envs <- tcGetFamInstEnvs
+           ; return $ case reduceTyFamApp_maybe envs Nominal tc args of
+               Just (Reduction _ red)
+                 | ExistsTy ImplicitExists _ _ <- coreFullView red -> True
+               _ -> False }
+      | otherwise
+      = return False
+
+    peel_implicit_body ty
+      | ExistsTy ImplicitExists _ b <- coreFullView ty = peel_implicit_body b
+      | otherwise                                      = ty
+
+    peel_pack :: Bool -> TcType -> TcType -> TcM ([TcType], TcType, HsWrapper)
+    peel_pack quick payload cur_schema
+      | ExistsTy ImplicitExists binder body <- coreFullView cur_schema
+      = do { witness <- if quick
+               then case (coreFullView body, coreFullView payload) of
+                      (FunTy{}, FunTy{})
+                        -- See Note [Matching a witness below forall].
+                        | Just exact <- matchExactPolytypeWitness binder body payload
+                        , ForAllTy{} <- coreFullView exact
+                        -> return exact
+                      _ -> newMetaTyVarTyAtLevel QLInstVar (tyVarKind binder)
+               else do { -- Fallback until TauTv unifies directly with level-checked runtime indices.
+                         -- Remove matchRetainedExistsWitness once level-checked runtime index unification lands.
+                         retained <- runMaybeT $
+                           matchRetainedExistsWitness inst_orig binder body payload
+                       ; maybe (newFlexiTyVarTy (tyVarKind binder)) return retained }
+           ; let next_schema = substTyWith [binder] [witness] body
+           ; (ws, final_body, inner_wrap) <- peel_pack quick payload next_schema
+           ; return (witness : ws, final_body, mkWpExistsPack cur_schema witness <.> inner_wrap) }
+      | otherwise
+      = return ([], cur_schema, idHsWrapper)
+
+{- Note [Introducing an implicit existential]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Subsumption introduces an implicit existential package when the expected type
+starts with 'ExistsTy ImplicitExists' and the actual type is a payload rather
+than an existing implicit existential package. This implements right
+instantiation from Eisenberg, Duboc, Weirich & Lee, "An Existential Crisis
+Resolved: Type Inference for First-Class Existential Types", ICFP 2021
+(PACMPL 5(ICFP):64), Figs. 6, 7 & 10, and GHC Proposal #473.
+
+Guard package-to-package identity first:
+1. When both actual and expected types are 'ExistsTy ImplicitExists', fall
+   through to nominal equality ('WpCast' or 'WpHole') without unpacking and
+   repacking. This preserves package laziness in forwarding calls.
+2. When the actual type is an unfilled metavariable (or a polymorphic variable
+   whose body is an unfilled metavariable or an implicit package), fall through
+   to unification so polymorphic selectors such as 'choose flag p q' instantiate
+   directly at the package schema.
+
+When the actual type is a payload, peel consecutive 'ExistsTy ImplicitExists'
+binders in telescope order, substituting each witness into the remaining schema
+and composing 'WpExistsPack' wrappers from outside in. Desugaring lowers each
+'WpExistsPack schema witness' directly to 'Core.Pack schema witness'.
+
+With 'ImpredicativeTypes' enabled, follow 'GenImpredicative' (Eisenberg et al.,
+ICFP 2021, Fig. 10; Serrano, Hage, Peyton Jones & Vytiniotis, "A Quick Look at
+Impredicativity", ICFP 2020, PACMPL 4(ICFP):89): allocate Quick Look
+instantiation variables for the existential binders, run 'qlUnify' between the
+instantiated body and the actual payload type, and monomorphise any remaining
+instantiation variables before checking subsumption on the payload. Under
+'DeepSubsumption', outer function arrows require co/contravariant subsumption
+rather than invariant 'qlUnify', so outer arrows use ordinary tau witnesses.
+
+For a nested explicit existential 'exists a. exists b | body' checked against
+an already packed 'exists b | actual_body', 'matchMixedExistsResult' selects a
+candidate outer witness via scoped matching before checking the explicit
+package equality.
+-}
+
+{- Note [Matching a witness below forall]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under shallow subsumption with 'ImpredicativeTypes', a declared payload can
+determine a polytype witness beneath a callback's 'forall'. For example, to
+pack
+
+  (forall r. (PolyId -> r) -> Maybe r) -> Int
+
+at 'exists t. (forall r. (t -> r) -> Maybe r) -> Int', choose
+'PolyId = forall a. a -> a'.
+
+'qlUnify' does not look beneath 'forall'; see (UQL4) in
+Note [QuickLook unification]. When neither type contains Quick Look variables,
+'tcMatchTyX_BM' renames bound variables and rejects any substitution that
+mentions a locally bound variable; see (CU2) in Note [The Core unifier] in
+GHC.Core.Unify. Check the matched witness kind and verify nominal equality of
+the substituted payload before checking the expression.
+-}
+
+-- | Test that a type contains no Quick Look instantiation variables.
+noQuickLookVars :: Type -> Bool
+noQuickLookVars = not . any (\v -> isTcTyVar v && isQLInstTyVar v) . tyCoVarsOfTypeList
+
+-- | Build a 'BindTvFun' that binds only the supplied outer template variables.
+bindOuterExistsTvs :: [TyVar] -> BindTvFun
+bindOuterExistsTvs [] _ _   = DontBindMe
+bindOuterExistsTvs [v] tv _ = if tv == v then BindMe else DontBindMe
+bindOuterExistsTvs tvs tv _ = if tv `elemVarSet` s then BindMe else DontBindMe
+  where
+    !s = mkVarSet tvs
+
+-- | Choose an implicit existential witness for an already checked explicit
+-- existential package.
+-- See Note [Introducing an implicit existential].
+matchMixedExistsResult :: Type -> Type -> Maybe (Type, Type)
+matchMixedExistsResult schema actual
+  | ExistsTy ImplicitExists outer formal <- coreFullView schema
+  = do { ([witness], [inner]) <- matchBarPackageWitnesses [outer] [(formal, actual)]
+       ; return (witness, inner) }
+  | otherwise = Nothing
+
+-- | Match free template variables across explicit existential packages.
+matchBarPackageWitnesses :: [TyVar] -> [(Type, Type)] -> Maybe ([Type], [Type])
+matchBarPackageWitnesses binders packages
+  | all supportsQuickLookType types
+  , all noQuickLookVars types
+  = do { templates <- traverse barPackageSignature formals
+       ; targets <- traverse barPackageSignature actuals
+       ; let empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes (templates ++ targets)))
+             actual_fvs = tyCoVarsOfTypes actuals
+       ; subst <- foldM (\s (template, target) ->
+                          tcMatchTyX_BM (bindOuterExistsTvs binders) s template target)
+                        empty_subst (zip templates targets)
+       ; witnesses <- traverse (Subst.lookupTyVar subst) binders
+       ; guard (all (`elemVarSet` actual_fvs) (tyCoVarsOfTypesList witnesses))
+       ; let kinds = map (Subst.substTy subst . tyVarKind) binders
+             inners = map (Subst.substTy subst) formals
+       ; guard (eqTypes (map typeKind witnesses) kinds && eqTypes inners actuals)
+       ; return (witnesses, inners) }
+  | otherwise = Nothing
+  where
+    (formals, actuals) = unzip packages
+    types = formals ++ actuals
+
+    barPackageSignature :: Type -> Maybe Type
+    barPackageSignature ty
+      | ExistsTy ExplicitExists binder body <- coreFullView ty
+      = Just (mkTyCoForAllTy unmatchableDataConTy binder (Invisible SpecifiedSpec) body)
+      | otherwise = Nothing
+
+-- | Match one fixed polytype witness without binding any other variables.
+-- See Note [Matching a witness below forall].
+matchExactPolytypeWitness :: TyVar -> Type -> Type -> Maybe Type
+matchExactPolytypeWitness binder formal actual
+  | all supportsQuickLookType [tyVarKind binder, formal, actual]
+  , all noQuickLookVars [tyVarKind binder, formal, actual]
+  = do { subst <- tcMatchTyX_BM bind_witness empty_subst formal actual
+       ; witness <- Subst.lookupTyVar subst binder
+       ; guard (not (isTauTy witness)
+                && eqType (typeKind witness) (tyVarKind binder)
+                && eqType (substTyWith [binder] [witness] formal) actual)
+       ; return witness }
+  | otherwise = Nothing
+  where
+    empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes [formal, actual]))
+    bind_witness tv _ | tv == binder = BindMe
+                      | otherwise    = DontBindMe
+
+-- | Match a stored runtime index for an existential witness.
+-- Fallback until TauTv unifies directly with level-checked runtime indices;
+-- remove once level-checked runtime index unification lands.
+matchRetainedExistsWitness :: CtOrigin -> TyVar -> Type -> Type -> MaybeT TcM Type
+matchRetainedExistsWitness ct_origin binder body actual = do
+  guard (hasNativeDependentExpr (Core.Type actual))
+  loc <- liftMaybeT $ getCtLocM ct_origin (Just TypeLevel)
+  view <- liftMaybeT $ reductionReducedType <$> tcRewriteFamilyAxioms loc actual
+  witness <- MaybeT $ return $ do
+    let bind = bindOuterExistsTvs [binder]
+    s1 <- tcMatchRetainedTyX_BM bind Subst.emptySubst (typeKind body) (typeKind view)
+    s2 <- tcMatchRetainedTyX_BM bind s1 body view
+    Subst.lookupTyVar s2 binder
+  guard (hasNativeDependentExpr (Core.Type witness)
+         && eqType (typeKind witness) (tyVarKind binder)
+         && eqType (substTyWith [binder] [witness] body) view)
+  scoped <- liftMaybeT (check_retained_witness_scope witness)
+  guard scoped
+  return witness
+  where
+    check_retained_witness_scope :: Type -> TcM Bool
+    check_retained_witness_scope ty
+      | null runtime_ids = return True
+      | otherwise = do
+          local_env  <- getLclTypeEnv
+          global_env <- tcg_type_env <$> getGblEnv
+          givens     <- mapM (liftZonkM . zonkId) =<< getNativeGivens
+          let given_preds = map varType givens
+              given_protos = filter isNonCoVarId (concatMap tyCoVarsOfTypeList given_preds)
+              valid_bind lexical occ bnd =
+                occ == bnd
+                && ((isNativeIndexId occ && isNativeIndexId bnd)
+                    || (lexical && not (isExternalName (getName occ))
+                        && isNativeOpaqueValueId occ && isNativeOpaqueValueId bnd))
+                && eqType (varType occ) (varType bnd)
+                && eqType (idMult occ) (idMult bnd)
+              check_id v
+                | isNativeClassDictionaryId v = do
+                    scoped <- getLexicalGivens
+                    occ <- liftZonkM (zonkId v)
+                    acts <- mapM (liftZonkM . zonkId) (filter (== v) scoped)
+                    return $ case acts of
+                      [act] -> isNativeClassDictionaryId act && varType occ `eqType` varType act
+                      _     -> False
+                | isNativeNamedOpaqueFunctionId v = do
+                    act <- tcLookupIdMaybe (getName v)
+                    return $ maybe False (\b -> b == v && isNativeNamedOpaqueFunctionId b
+                                             && varType b `eqType` varType v) act
+                | otherwise = do
+                    occ <- liftZonkM (zonkId v)
+                    case lookupNameEnv local_env (getName v) of
+                      Just (ATcId { tct_id = lid }) -> valid_bind True occ <$> liftZonkM (zonkId lid)
+                      Just _                        -> return False
+                      Nothing -> case lookupTypeEnv global_env (getName v) of
+                        Just (AnId mid) -> valid_bind False occ <$> liftZonkM (zonkId mid)
+                        Just _          -> return False
+                        Nothing -> do
+                          protos <- mapM (liftZonkM . zonkId) (filter (== v) given_protos)
+                          let bad_proto p = isNonCoVarId p && p == occ && not (valid_bind True occ p)
+                          return (not (null protos)
+                                  && all (valid_bind True occ) protos
+                                  && not (any (anyFreeVarsOfType bad_proto) given_preds))
+          and <$> mapM check_id runtime_ids
+      where
+        runtime_ids = filter isNonCoVarId (tyCoVarsOfTypeList ty)
+
+{- Note [Monomorphise instantiation variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When Quick Look finishes on a call or existential witness check, convert any
+un-unified instantiation variables into ordinary unification variables at the
+ambient level. This implements the mono-substitution 'theta' in rule APP-DOWN
+of Serrano, Hage, Peyton Jones & Vytiniotis, "A Quick Look at
+Impredicativity", ICFP 2020 (PACMPL 4(ICFP):89), Fig. 5.
+
+Wrinkles:
+
+(MIV1) When monomorphising an instantiation variable, monomorphise its kind
+  first, because it may have kind 'TYPE k' where 'k' is also an instantiation
+  variable.
+
+(MIV2) In 'qlUnify', heterogeneous kind unification can create a coercion hole
+  whose kind mentions an instantiation variable that occurs nowhere else in the
+  type. 'foldQLInstVars' traverses coercion hole kinds so such variables are
+  monomorphised too.
+-}
+
+qlMonoTcType :: TcType -> ZonkM ()
+-- Monomorphise any free instantiation variables of `ty`
+-- This function zonks as it goes
+-- See Note [Monomorphise instantiation variables]
+qlMonoTcType ty
+  = do { traceZonk "monomorphiseQLInstVars {" (ppr ty)
+       ; go_ty ty
+       ; traceZonk "monomorphiseQLInstVars }" empty }
+  where
+    go_ty :: TcType -> ZonkM ()
+    go_ty ty = unTcMUnit (foldQLInstVars go_tv ty)
+
+    go_tv :: TcTyVar -> TcMUnit
+    go_tv tv
+      | MetaTv { mtv_ref = ref, mtv_tclvl = lvl, mtv_info = info } <- tcTyVarDetails tv
+      = assertPpr (case lvl of QLInstVar -> True; _ -> False) (ppr tv) $
+        TCMU $ do { traceZonk "qlMonoTcType" (ppr tv)
+                  ; flex <- readTcRef ref
+                  ; case flex of {
+                      Indirect ty -> go_ty ty ;
+                      Flexi       ->
+               do { let kind = tyVarKind tv
+                  ; go_ty kind  -- See (MIV1) in Note [Monomorphise instantiation variables]
+                  ; ref2  <- newTcRef Flexi
+                  ; lvl2  <- getZonkTcLevel
+                  ; let details = MetaTv { mtv_info  = info
+                                         , mtv_ref   = ref2
+                                         , mtv_tclvl = lvl2 }
+                        tv2  = mkTcTyVar (tyVarName tv) kind details
+                 ; writeTcRef ref (Indirect (mkTyVarTy tv2)) }}}
+      | otherwise
+      = pprPanic "qlMonoTcType" (ppr tv)
+
+newtype TcMUnit = TCMU { unTcMUnit :: ZonkM () }
+instance Semigroup TcMUnit where
+  TCMU ml <> TCMU mr = TCMU (ml >> mr)
+instance Monoid TcMUnit where
+  mempty = TCMU (return ())
+
+{- Note [The fiv test in quickLookArg]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In rule APP-lightning-bolt in Fig. 5 of Serrano et al. (ICFP 2020), 'anyFreeKappa'
+tests whether an inferred argument result type has no free Quick Look
+instantiation variables after zonking. When none remain, 'qlUnify' can propagate
+polytypes from the argument result into the enclosing call.
+-}
+
+anyFreeKappa :: TcType -> TcM Bool
+-- True if there is a free instantiation variable in the type, after zonking.
+-- See Note [The fiv test in quickLookArg]
+anyFreeKappa ty = do { rejectNativeQuickLook ty
+                     ; unTcMBool (foldQLInstVars go_tv ty) }
+  where
+    go_tv tv = TCMB $ do { info <- readMetaTyVar tv
+                         ; case info of
+                             Indirect ty -> anyFreeKappa ty
+                             Flexi       -> return True }
+
+newtype TcMBool = TCMB { unTcMBool :: TcM Bool }
+instance Semigroup TcMBool where
+  TCMB ml <> TCMB mr = TCMB (do { l <- ml; if l then return True else mr })
+instance Monoid TcMBool where
+  mempty = TCMB (return False)
+
+foldQLInstVars :: forall a. Monoid a => (TcTyVar -> a) -> TcType -> a
+{-# INLINE foldQLInstVars #-}
+foldQLInstVars check_tv ty
+  = runFV (do_ty ty) ()
+  where
+    (do_ty, _, _, _) = foldTyCo folder
+
+    folder :: TyCoFolder (FV () a)
+    folder = TyCoFolder { tcf_view = noView  -- See Note [Free vars and synonyms]
+                                             -- in GHC.Core.TyCo.FVs
+                        , tcf_lit        = mempty
+                        , tcf_tyvar      = do_tv
+                        , tcf_termvar    = \v -> pprPanic "foldQLInstVars: native term index not implemented" (ppr v)
+                        , tcf_termbinder = \v _ -> pprPanic "foldQLInstVars: native dependent binder not implemented" (ppr v)
+                        , tcf_covar      = mempty
+                        , tcf_hole       = do_hole
+                        , tcf_tycobinder = do_bndr }
+
+    do_bndr _ = id
+
+    do_hole hole = do_ty (coVarKind (coHoleCoVar hole))
+                     -- See (MIV2) in Note [Monomorphise instantiation variables]
+
+    do_tv :: TcTyVar -> FV () a
+    do_tv tv | isQLInstTyVar tv = MkFV $ \_ -> check_tv tv
+             | otherwise        = mempty
+
+-- | Reject retained types before Quick Look inspects or assigns them.
+-- See Note [Retained types and Quick Look].
+rejectNativeQuickLook :: TcType -> TcM ()
+rejectNativeQuickLook ty
+  = do { ty <- liftZonkM $ zonkTcType ty
+       ; unless (supportsQuickLookType ty) $
+           failWithTc (TcRnRetainedQuantificationError (RetainedQuickLook ty)) }
+
+{- Note [Retained types and Quick Look]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An erased existential binds a type variable. 'foldQLInstVars' visits its kind
+and body with the same type-binder operation it uses for 'forall'. 'qlUnify'
+can assign the entire package to an instantiation variable under its ordinary
+occurs and concreteness checks without opening the package or equating
+witnesses; see Eisenberg et al., ICFP 2021, §8, and Note [QuickLook unification].
+
+Quick Look assigns instantiation variables without the runtime-index scope
+check, and its instantiation-variable folders do not traverse retained term
+indices or 'DepFunTy' binders. Reject runtime indices and retained binders
+after zonking before either operation runs. See Note [Rigid retained indices].
+-}
+
+qlUnify :: TcType -> TcType -> TcM ()
+-- Unify ty1 with ty2:
+--   * Unifies only Quick Look instantiation variables; see Note [QuickLook unification].
+--   * Never reports errors; makes best effort to fill instantiation variables.
+qlUnify ty1 ty2
+  = do { rejectNativeQuickLook ty1
+       ; rejectNativeQuickLook ty2
+       ; lvl <- getTcLevel
+       ; traceTc "qlUnify" (ppr lvl $$ ppr ty1 $$ ppr ty2)
+       ; go ty1 ty2 }
+  where
+    go :: TcType -> TcType -> TcM ()
+    go t1 t2 = do { traceTc "qlUinfy:go" (ppr t1 <+> char '~' <+> ppr t2)
+                  ; go' t1 t2 }
+
+    go' (FunTy { ft_af = af1, ft_ma = ma1, ft_arg = arg1, ft_res = res1 })
+        (FunTy { ft_af = af2, ft_ma = ma2, ft_arg = arg2, ft_res = res2 })
+      | af1 == af2
+      = do { traceTc "go_fun" (ppr arg1 $$ ppr arg2)
+           ; go ma1 ma2
+           ; when (isVisibleFunArg af1) (go arg1 arg2)
+           ; go res1 res2 }
+
+    -- Make sure not to unify "kappa := (a %1 -> b)". See (UQL5).
+    go' (FunTy { ft_mult = OneTy }) _ = return ()
+    go' _ (FunTy { ft_mult = OneTy }) = return ()
+
+    -- Type variables; see (UQL6) in Note [QuickLook unification]
+    go' (TyVarTy tv) ty2 | isMetaTyVar tv = go_meta tv ty2
+    go' ty1 (TyVarTy tv) | isMetaTyVar tv = go_meta tv ty1
+
+    go' (CastTy ty1 _) ty2 = go ty1 ty2
+    go' ty1 (CastTy ty2 _) = go ty1 ty2
+
+    go' (TyConApp tc1 []) (TyConApp tc2 [])
+      | tc1 == tc2 -- See Note [Expanding synonyms during unification]
+      = return ()
+
+    go' rho1 rho2
+      | Just rho1 <- coreView rho1 = go rho1 rho2
+      | Just rho2 <- coreView rho2 = go rho1 rho2
+
+    go' (TyConApp tc1 tys1) (TyConApp tc2 tys2)
+      | tc1 == tc2
+      , not (isTypeFamilyTyCon tc1)
+      , tys1 `equalLength` tys2
+      = zipWithM_ go tys1 tys2
+
+    -- See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality.
+    go' (AppTy t1a t1b) ty2
+      | Just (t2a, t2b) <- tcSplitAppTyNoView_maybe ty2
+      = go_app t1a t1b t2a t2b
+    go' ty1 (AppTy t2a t2b)
+      | Just (t1a, t1b) <- tcSplitAppTyNoView_maybe ty1
+      = go_app t1a t1b t2a t2b
+
+    go' (TyConApp tc1 _) ty2 | isTypeFamilyTyCon tc1 = monomorphise ty2
+    go' ty1 (TyConApp tc2 _) | isTypeFamilyTyCon tc2 = monomorphise ty1
+
+    go' _ _ = return ()
+       -- Don't look under foralls; see (UQL4) of Note [QuickLook unification]
+
+    go_app f1 a1 f2 a2 =
+      do { m1 <- matchable_arrow f1
+         ; when m1 $
+           do { m2 <- matchable_arrow f2
+              ; when m2 $ do { go f1 f2; go a1 a2 } } }
+
+    matchable_arrow fun
+      | isMatchableFunTy kind = return True
+      | otherwise = isMatchableFunTy <$> liftZonkM (zonkTcType kind)
+      where kind = typeKind fun
+
+    go_meta tv1 ty2
+      = assertPpr (isMetaTyVar tv1) (ppr tv1) $
+        do { info <- readMetaTyVar tv1
+           ; case info of  -- See (UQL9)
+               Indirect ty1 -> go ty1 ty2
+               Flexi        -> do { ty2 <- liftZonkM $ zonkTcType ty2
+                                  ; go_flexi tv1 ty2 } }
+
+    go_flexi tv1 ty2
+      | TyVarTy tv2 <- ty2
+      , lhsPriority tv2 > lhsPriority tv1
+      = go_flexi1 tv2 (TyVarTy tv1)
+      | otherwise
+      = go_flexi1 tv1 ty2
+
+    go_flexi1 tv1 ty2
+      | isQLInstTyVar tv1 = go_kappa tv1 ty2
+      | otherwise         = monomorphise ty2
+
+    go_kappa kappa ty2
+      | isConcreteTyVar kappa  -- See (UQL7) in Note [QuickLook unification]
+      = return ()
+      | anyFreeVarsOfType (== kappa) ty2
+      = return ()  -- Occurs check. See (UQL10) in Note [QuickLook unification]
+      | otherwise
+      = do { co <- unifyKind (Just (TypeThing ty2)) ty2_kind kappa_kind
+                   -- unifyKind: see (UQL2) in Note [QuickLook unification]
+                   --            and (MIV2) in Note [Monomorphise instantiation variables]
+           ; let ty2' = mkCastTy ty2 co
+           ; traceTc "qlUnify:update" $
+             ppr kappa <+> text ":=" <+> ppr ty2
+           ; liftZonkM $ writeMetaTyVar kappa ty2'
+           ; return () }
+      where
+        kappa_kind = tyVarKind kappa
+        ty2_kind   = typeKind ty2
+
+    monomorphise :: TcType -> TcM ()
+    monomorphise ty  -- See (UQL8)
+      = do { _ <- liftZonkM $ qlMonoTcType ty; return () }
+
+{- Note [QuickLook unification]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In 'qlUnify', if we find 'kappa ~ ty', we update 'kappa := ty' following
+Serrano, Hage, Peyton Jones & Vytiniotis, "A Quick Look at Impredicativity",
+ICFP 2020 (PACMPL 4(ICFP):89). Wrinkles:
+
+(UQL1) Check the occurs check and concreteness precondition before assigning
+  an instantiation variable in 'go_kappa'. No level check is needed because
+  instantiation variables have level 'QLInstVar'; see Note [QuickLook
+  instantiation variables] in GHC.Tc.Utils.TcType.
+
+(UQL2) Unify kinds with 'unifyKind' and cast 'ty2' by the resulting coercion.
+
+(UQL3) Instantiation variables have level infinity and are monomorphised before
+  leaving the Quick Look step, preventing skolem escape.
+
+(UQL4) Do not decompose beneath 'ForAllTy' or 'ExistsTy'.
+
+(UQL5) Do not unify an instantiation variable directly with a linear arrow
+  'a %1 -> b'; see Note [Multiplicity in deep subsumption].
+
+(UQL6) Update only Quick Look instantiation variables ('isQLInstTyVar'), not
+  ordinary unification variables.
+
+(UQL7) Skip concrete instantiation variables, which never unify with polytypes.
+
+(UQL8) When 'kappa' meets an ordinary unification variable or a type family
+  application, monomorphise the other side via 'qlMonoTcType'.
+
+(UQL9) Look through filled metavariables before deciding between decomposition
+  and monomorphisation.
+
+(UQL10) Use 'anyFreeVarsOfType' for the occurs check; see Note [Occurs check
+  and coercions].
+-}

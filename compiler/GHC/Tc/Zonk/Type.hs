@@ -1303,6 +1303,8 @@ zonkCoFn (WpFun w arg res t1 t2) =
      ; return (WpFun w' arg' res' t1' t2') }
 zonkCoFn (WpRetainedFun b w) = noBinders $
   runZonkBndrT (WpRetainedFun <$> zonkIdBndrX b <*> zonkCoFn w) return
+zonkCoFn (WpExistsPack schema witness) = noBinders $
+  WpExistsPack <$> zonkTcTypeToTypeX schema <*> zonkTcTypeToTypeX witness
 zonkCoFn (WpCast co)   = WpCast <$> noBinders
                           (mapNativeIndexCastCoM zonkCoToCo co)
   -- See Note [Zonking nominal native index casts] in GHC.Core.Coercion.

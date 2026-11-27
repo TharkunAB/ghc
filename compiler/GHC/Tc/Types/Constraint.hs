@@ -2212,6 +2212,8 @@ checkSkolInfoAnon sk1 sk2 = go sk1 sk2
     go (PatSkol c1 _)       (PatSkol c2 _)       = getName c1 == getName c2
        -- Too tedious to compare the HsMatchContexts
     go (UnifyForAllSkol t1) (UnifyForAllSkol t2) = t1 `tcEqType` t2
+    go ExistsUnpackSkol     ExistsUnpackSkol     = True
+    go ExistsUnpackSkol     (UnifyForAllSkol _)  = True
     go ReifySkol            ReifySkol            = True
     go RuntimeUnkSkol       RuntimeUnkSkol       = True
     go ArrowReboundIfSkol   ArrowReboundIfSkol   = True

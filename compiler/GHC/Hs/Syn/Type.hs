@@ -230,6 +230,7 @@ hsWrapperType wrap ty = prTypeType $ go wrap (ty,[])
       in mkFunctionType unmatchableDataConTy mult exp_arg exp_res
     go (WpRetainedFun b w) = liftPRType $ \t ->
       mkDepFunTy b (hsWrapperType w (applyTypeToArgs t [Var b]))
+    go (WpExistsPack schema _) = liftPRType $ \_ -> schema
     go (WpCast co)        = liftPRType $ \_ -> coercionRKind co
     go (WpEvLam v)        = liftPRType $ \body ->
       if isNativeClassDictionaryId v && anyFreeVarsOfType (== v) body

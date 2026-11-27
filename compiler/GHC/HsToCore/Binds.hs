@@ -1741,6 +1741,8 @@ ds_hs_wrapper hs_wrap
                                    in k (\e -> (Lam x (w2 (app e arg)))) }
     go (WpRetainedFun b w) k = go w $ \body ->
       k (\e -> Lam b (body (mkCoreApp e (Var b))))
+    go (WpExistsPack schema witness) k =
+      k (\e -> Pack schema witness e)
 
 --------------------------------------
 dsTcEvBinds_s :: [TcEvBinds] -> ([CoreBind] -> DsM a) -> DsM a

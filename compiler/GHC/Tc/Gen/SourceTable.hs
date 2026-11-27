@@ -519,6 +519,7 @@ localSourceRuleApart owner checked (L _ HsRule{rd_lhs = lhs})
     transparent allow WpLet{} = allow
     transparent allow (WpCompose a b) = transparent allow a && transparent allow b
     transparent allow (WpSubType w) = transparent allow w
+    transparent _ (WpExistsPack {}) = False
     transparent _ _ = False
 
 {- Note [Certified list fusion rules]
@@ -1629,6 +1630,7 @@ sourceRuleOwnersWith zonk arg rules = unionNameSets <$> sequence
     first_arg WpLet{}      = Just Nothing
     first_arg WpEvApp{}    = Just Nothing
     first_arg (WpSubType w) = first_arg w
+    first_arg (WpExistsPack {}) = Nothing
     first_arg _            = Nothing
 -- ---------------------------------------------------------------------------
 -- Core telescope, datatype, and source-table classification predicates

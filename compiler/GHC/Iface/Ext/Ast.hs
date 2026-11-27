@@ -708,6 +708,7 @@ instance ToHie (LocatedA HsWrapper) where
         (WpFun _mult_co arg_wrap res_wrap _arg_ty _res_ty) -> concatM $
           [toHie (L osp arg_wrap), toHie (L osp res_wrap)]
         (WpRetainedFun _ w) -> toHie (L osp w)
+        (WpExistsPack _ _)  -> pure []
         (WpEvLam a) ->
           toHie $ C (EvidenceVarBind EvWrapperBind (mkScope osp) (getRealSpanA osp))
                 $ L osp a

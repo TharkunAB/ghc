@@ -248,7 +248,7 @@ The user supplies the semantic equality, as for an ordinary Haskell RULE.
 -}
 
 -- | Check whether Quick Look can traverse a type and its coercions.
--- See Note [Retained types and Quick Look] in GHC.Tc.Gen.App.
+-- See Note [Retained types and Quick Look] in GHC.Tc.Utils.Unify.
 supportsQuickLookType :: Type -> Bool
 supportsQuickLookType = not . runScanFor CheckErasedTypes NoMetadata . scanType
 

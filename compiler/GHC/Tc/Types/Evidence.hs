@@ -6,7 +6,7 @@ module GHC.Tc.Types.Evidence (
   -- * HsWrapper
   HsWrapper(..),
   (<.>), mkWpTyApps, mkWpEvApps, mkWpEvVarApps, mkWpTyLams, mkWpForAllCast,
-  mkWpEvLams, mkWpLet, mkWpFun, mkWpRetainedFun, mkWpCastN, mkWpCastR, mkWpEta, mkWpSubType,
+  mkWpEvLams, mkWpLet, mkWpFun, mkWpRetainedFun, mkWpExistsPack, mkWpCastN, mkWpCastR, mkWpEta, mkWpSubType,
   SubMultCo(..), mkSubMultFunCo, subMultCoRKind,
   collectHsWrapBinders,
   idHsWrapper, isIdHsWrapper, hsWrapperCast_maybe,
@@ -313,6 +313,10 @@ data HsWrapper
   -- Both function types have the same visible retained domain.
   | WpRetainedFun Id HsWrapper
 
+  -- | @WpExistsPack schema witness[e] = Pack schema witness e@.
+  -- Packs @e :: body[binder := witness]@ into @schema = ExistsTy ImplicitExists binder body@.
+  | WpExistsPack TcType TcType
+
   deriving Data.Data
 
 -- | The Semigroup instance is a bit fishy, since @WpCompose@, as a data
@@ -436,6 +440,10 @@ mkWpRetainedFun _ WpHole = WpHole
 mkWpRetainedFun b (WpCast co) = mkWpCastR (mkDepFunCo b co)
 mkWpRetainedFun b wrap = WpRetainedFun b wrap
 
+-- | Pack a payload into an implicit existential schema at a chosen witness.
+mkWpExistsPack :: TcType -> TcType -> HsWrapper
+mkWpExistsPack = WpExistsPack
+
 mkWpSubType :: HsWrapper -> HsWrapper
 -- See (DSST2) in Note [Deep subsumption and WpSubType]
 mkWpSubType WpHole      = WpHole
@@ -555,6 +563,7 @@ hsWrapDictBinders wrap = go wrap
    go (WpTyApp {})        = emptyBag
    go (WpLet   {})        = emptyBag
    go (WpRetainedFun {})  = emptyBag
+   go (WpExistsPack {})   = emptyBag
 
 collectHsWrapBinders :: HsWrapper -> ([Var], HsWrapper)
 -- Collect the outer lambda binders of a HsWrapper,
@@ -604,6 +613,7 @@ optSubTypeHsWrapper wrap
           WpHole    -> ws
           WpCast co -> opt_co co ws
           w'        -> w' : ws
+    opt1 w@(WpExistsPack {}) ws = w : ws
 
     -----------------
     -- (WpTyLam a <.> WpTyApp a <.> w) = w
@@ -678,6 +688,7 @@ optSubTypeHsWrapper wrap
     not_in _ (WpEvLam {}) = False    -- Ditto
     not_in _ (WpLet {})   = False    -- Ditto
     not_in _ (WpRetainedFun {}) = False
+    not_in v (WpExistsPack s w) = not (anyFreeVarsOfType (== v) s) && not (anyFreeVarsOfType (== v) w)
 
     not_in_submult :: TyVar -> SubMultCo -> Bool
     not_in_submult v = \case
@@ -1473,6 +1484,8 @@ pprHsWrapper wrap pp_thing_inside
     help it (WpRetainedFun b w)
       = add_parens $ text "\\" <> pprLamBndr b <> dot <+>
                      help (\_ -> it True <+> ppr b) w False
+    help it (WpExistsPack schema witness)
+      = add_parens $ sep [text "pack" <> braces (ppr schema <> comma <+> ppr witness), it True]
     help it (WpCast co)   = add_parens $ sep [it False, nest 2 (text "|>"
                                               <+> pprParendCo co)]
     help it (WpEvApp id)  = no_parens  $ sep [it True, nest 2 (ppr id)]

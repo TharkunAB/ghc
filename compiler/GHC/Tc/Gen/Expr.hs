@@ -74,7 +74,7 @@ import GHC.Core.DataCon
 import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.TyCo.Rep (Type(AppTy, CastTy, DepFunTy, ExistsTy, ForAllTy, FunTy, TermAppTy, TermVarTy, TyConApp))
+import GHC.Core.TyCo.Rep (Type(AppTy, CastTy, DepDictTy, DepFunTy, ExistsTy, ForAllTy, FunTy, TermAppTy, TermVarTy, TyConApp))
 import GHC.Core.Coercion
 import GHC.Core.Predicate( decomposeIPPred, getEqPredTys_maybe, mkNomEqPred )
 
@@ -82,9 +82,8 @@ import GHC.Types.Basic
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Map
 import GHC.Types.Unique.Set
-import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar
-                     , isInferredForAllTyFlag, isSpecifiedForAllTyFlag )
-import GHC.Types.Var.Set (TyCoVarSet, elemVarSet, isEmptyVarSet, mkVarSet, sizeVarSet, unionVarSet)
+import GHC.Types.Var ( ExistsTyFlag(ExplicitExists, ImplicitExists), mkTyVar )
+import GHC.Types.Var.Set (TyCoVarSet, elemVarSet, mkVarSet, sizeVarSet, unionVarSet)
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name
@@ -121,7 +120,7 @@ import GHC.Data.FastString (bytesFS, fastStringToShortText, fsLit, mkFastString)
 
 import Control.Monad
 import Data.Data (Data, cast, gmapQ)
-import Data.List (partition, transpose)
+import Data.List (partition)
 import qualified Data.List.NonEmpty as NE
 
 import qualified GHC.LanguageExtensions as LangExt
@@ -404,310 +403,91 @@ tcCollectApp the_app res_ty
   = do { (fun, args) <- splitHsApps the_app
        ; tcApp the_app fun args res_ty }
 
--- | Check a lambda and introduce a dot package when its payload is an arrow.
+-- | Peel leading implicit existential binders on an expected type into
+-- 'WpExistsPack' wrappers before checking an introduction form.
+-- See Note [Introducing an implicit existential] in GHC.Tc.Utils.Unify.
+peelCheckImplicitExists :: ExpType -> TcM (ExpType, HsWrapper)
+peelCheckImplicitExists expected@(Check orig_ty)
+  = do { view0 <- unwrapMetaView orig_ty
+       ; case view0 of
+           ExistsTy ImplicitExists _ _ ->
+             do { schema <- liftZonkM (zonkTcType view0)
+                ; (body_ty, wrap) <- peel schema
+                ; return (mkCheckExpType body_ty, wrap) }
+           _ -> return (expected, idHsWrapper) }
+  where
+    peel cur_schema
+      | ExistsTy ImplicitExists binder body <- coreFullView cur_schema
+      = do { witness <- newFlexiTyVarTy (tyVarKind binder)
+           ; let next_schema = substTyWith [binder] [witness] body
+           ; (final_body, inner_wrap) <- peel next_schema
+           ; return (final_body, mkWpExistsPack cur_schema witness <.> inner_wrap) }
+      | otherwise
+      = return (cur_schema, idHsWrapper)
+peelCheckImplicitExists expected = return (expected, idHsWrapper)
+
+-- | Check a lambda and introduce an implicit existential package when its
+-- payload is a visible function arrow.
 -- See Note [Implicit existential lambda payloads].
 tcLambdaExpr :: XLam GhcRn -> HsLamVariant -> MatchGroup GhcRn (LHsExpr GhcRn)
              -> [ExpPatType] -> ExpSigmaType -> TcM (HsExpr GhcTc)
 tcLambdaExpr x lam_variant matches pat_tys expected
-  | Check schema <- expected
-  , ExistsTy ImplicitExists binder body <- coreFullView schema
-  , Just _ <- splitVisibleFunTy_maybe (implicitPayloadType body)
-  = do { impred <- xoptM LangExt.ImpredicativeTypes
-       ; chosen <- if impred then tcDeclaredLambdaTelescope schema matches else return Nothing
-       ; case chosen of
-           Just witnesses -> check_selected schema witnesses
-           Nothing ->
-             do { declared <- if impred
-                              then tcDeclaredLambdaWitness binder body matches
-                              else return Nothing
-                ; witness <- maybe (newFlexiTyVarTy (tyVarKind binder)) return declared
-                ; check_pack schema binder body witness $ \payload_ty ->
-                    tcLambdaExpr x lam_variant matches pat_tys (mkCheckExpType payload_ty) } }
+  | Check orig_ty <- expected
+  = do { view0 <- unwrapMetaView orig_ty
+       ; case view0 of
+           ExistsTy ImplicitExists _ body0
+             | Just _ <- splitVisibleFunTy_maybe (implicitPayloadType body0)
+             -> do { schema <- liftZonkM (zonkTcType view0)
+                   ; impred <- xoptM LangExt.ImpredicativeTypes
+                   ; ds_flag <- getDeepSubsumptionFlag
+                   ; let quick = impred
+                                 && (case ds_flag of Shallow -> True; Deep{} -> False)
+                                 && supportsQuickLookType schema
+                                 && noQuickLookVars schema
+                   ; (binders, witnesses, payload_ty, pack_wrap) <- peel_lambda quick schema
+                   ; when quick $
+                       tcQuickLookLambdaMatches matches binders witnesses payload_ty
+                   ; payload_ty' <- if quick then liftZonkM (zonkTcType payload_ty) else pure payload_ty
+                   ; lam_expr <- check_lambda (mkCheckExpType payload_ty')
+                   ; return (mkHsWrap pack_wrap lam_expr) }
+           _ -> check_lambda expected }
   | otherwise = check_lambda expected
   where
     check_lambda expected_ty
       = do { (wrap, matches') <- tcLambdaMatches (HsLam x lam_variant matches)
-                                                lam_variant matches pat_tys expected_ty
+                                                 lam_variant matches pat_tys expected_ty
            ; return (mkHsWrap wrap (HsLam x lam_variant matches')) }
 
-    check_pack schema binder body witness check =
-      do { payload <- check (substTyWith [binder] [witness] body)
-         ; return (XExpr (NativeExistsPack schema witness (noLocA payload))) }
-
-    check_selected schema [] = check_lambda (mkCheckExpType schema)
-    check_selected schema (witness : rest)
-      | ExistsTy ImplicitExists binder body <- coreFullView schema
-      = check_pack schema binder body witness (\payload_ty -> check_selected payload_ty rest)
-      | otherwise = pprPanic "tcLambdaExpr: witness telescope" (ppr schema)
-
--- | Read a declared application result before entering any lambda equation.
--- See Note [Implicit existential lambda payloads].
-tcDeclaredLambdaWitness :: TyVar -> Type -> MatchGroup GhcRn (LHsExpr GhcRn)
-                        -> TcM (Maybe Type)
-tcDeclaredLambdaWitness binder body matches
-  = firstJustsM (declaredLambdaResults False results match_witness ++
-                 (tcDeclaredLambdaInput binder body matches : map quick_look results))
-  where
-    results = lambdaResultArms body matches
-
-    match_witness formal consumed actual =
-      do { guard (not (any (`elemVarSet` tyCoVarsOfType actual) consumed))
-         ; matchPolytypeExistsWitness binder formal actual }
-
-    quick_look (formal, rhs) =
-      do { formal <- liftZonkM (zonkTcType formal)
-         ; actual <- tcPreviewQuickLookResult rhs
-         ; return (actual >>= match_witness formal []) }
-
--- | Use the closed declaration of a function that receives the lambda's only
--- argument. See Note [Implicit existential lambda payloads].
-tcDeclaredLambdaInput :: TyVar -> Type -> MatchGroup GhcRn (LHsExpr GhcRn)
-                      -> TcM (Maybe Type)
-tcDeclaredLambdaInput binder formal matches
-  | Just (input, _) <- splitVisibleFunTy_maybe formal
-  , ForAllTy{} <- coreFullView input
-  , [L _ Match { m_pats = L _ [L _ (VarPat _ (L _ param))], m_grhss = grhss }]
-      <- unLoc (mg_alts matches)
-  , Just rhs <- unguardedRhs grhss
-  , HsApp _ fun arg <- unLoc (stripParensLHsExpr rhs)
-  , HsVar _ arg_name <- unLoc (stripParensLHsExpr arg)
-  , unLocWithUserRdr arg_name == param
-  , HsVar _ fun_name <- unLoc (stripParensLHsExpr fun)
-  , let name = unLocWithUserRdr fun_name
-  , name /= param
-  = do { subsumption <- getDeepSubsumptionFlag
-       ; case subsumption of
-           Deep{} -> return Nothing
-           Shallow -> do
-             { ident <- tcLookupIdMaybe name
-             ; actual <- traverse (liftZonkM . zonkTcType . varType) ident
-             ; formal' <- liftZonkM (zonkTcType formal)
-             ; return $ do
-                 ty <- actual
-                 guard (noFreeVarsOfType ty)
-                 witness <- matchExactPolytypeWitness binder formal' ty
-                 case coreFullView witness of
-                   ForAllTy{} -> Just witness
-                   _          -> Nothing } }
-tcDeclaredLambdaInput _ _ _ = return Nothing
-
--- | Select closed witnesses for consecutive dot binders from independent result fields.
--- See Note [Implicit existential lambda payloads].
-tcDeclaredLambdaTelescope :: Type -> MatchGroup GhcRn (LHsExpr GhcRn)
-                          -> TcM (Maybe [Type])
-tcDeclaredLambdaTelescope schema matches
-  | (binders@(_ : _ : _), body) <- telescope schema
-  , all (\v -> eqType (tyVarKind v) liftedTypeKind) binders
-  = do { rows <- mapMaybeM id
-                   (declaredLambdaResults True (lambdaResultArms body matches) (match_row binders))
-       ; return $ case rows of
-           [] -> Nothing
-           _ -> traverse agree (transpose rows) }
-  | otherwise = return Nothing
-  where
-    telescope ty
-      | ExistsTy ImplicitExists binder body <- coreFullView ty
-      = let (binders, rest) = telescope body in (binder : binders, rest)
-      | otherwise = ([], ty)
-
-    match_row binders formal consumed actual
-      | TyConApp tc fields <- coreFullView formal
-      , TyConApp actual_tc values <- coreFullView actual
-      , tc == actual_tc, isGenerativeTyCon tc Nominal
-      , traverse getTyVar_maybe fields == Just binders
-      , fields `equalLength` values
-      = traverse (candidate consumed) values
-      | otherwise = Nothing
-
-    candidate consumed value
-      | Just var <- getTyVar_maybe value, var `elem` consumed
-      = Just Nothing
-      | isEmptyVarSet (tyCoVarsOfType value), supportsQuickLookType value
-      = Just (Just value)
-      | otherwise = Nothing
-
-    agree candidates
-      | witness : rest <- catMaybes candidates
-      , not (isTauTy witness), all (eqType witness) rest
-      = Just witness
-      | otherwise = Nothing
-
--- | Pair each eligible result arm with its formal type.
-lambdaResultArms :: Type -> MatchGroup GhcRn (LHsExpr GhcRn) -> [(Type, LHsExpr GhcRn)]
-lambdaResultArms body (MG { mg_alts = L _ matches }) =
-    concatMap match_results matches
-  where
-    match_results (L _ (Match { m_pats = L _ pats
-                             , m_grhss = GRHSs _ rhss (L _ EmptyLocalBinds{}) }))
-      | all isVisArgLPat pats
-      , Just formal <- result_after (length pats) body
-      = foldr (rhs_results formal) [] rhss
-    match_results _ = []
-
-    rhs_results formal (L _ (GRHS _ _ rhs)) = result_arms rhs
-      where
-        result_arms expr rest
-          = case unLoc (stripParensLHsExpr expr) of
-              HsIf _ _ yes no -> result_arms yes (result_arms no rest)
-              HsMultiIf _ rhss -> foldr (rhs_results formal) rest rhss
-              HsCase _ _ (MG { mg_alts = L _ alts }) ->
-                foldr (case_results formal) rest alts
-              _ -> (formal, expr) : rest
-
-    case_results formal (L _ (Match { m_grhss = GRHSs _ rhss (L _ EmptyLocalBinds{}) })) rest
-      = foldr (rhs_results formal) rest rhss
-    case_results _ _ rest = rest
-
-    result_after :: Int -> Type -> Maybe Type
-    result_after 0 ty = Just ty
-    result_after n ty = splitVisibleFunTy_maybe ty >>= result_after (n - 1) . snd
-
--- | Inspect named RHS applications using the ordinary result declaration.
-declaredLambdaResults :: Bool -> [(Type, LHsExpr GhcRn)]
-                      -> (Type -> [TyVar] -> Type -> Maybe a) -> [TcM (Maybe a)]
-declaredLambdaResults skip_invisible results select = map (uncurry rhs_result) results
-  where
-    rhs_result formal rhs
-      | Just (name, ntypes, args) <- application 0 [] rhs
-      = do { mb_id <- if isExternalName name
-                     then tcLookupIdMaybe name
-                     else fmap local_id (tcLookupLcl_maybe name)
-           ; declared <- traverse (liftZonkM . zonkTcType . varType) mb_id
-           ; formal' <- liftZonkM (zonkTcType formal)
-           ; case declared >>= type_prefix ntypes of
-               Just (consumed, residual) ->
-                 let (skipped, result) = if skip_invisible
-                                         then tcSplitForAllInvisTyVars residual
-                                         else ([], residual)
-                 in fmap (>>= uncurry (select formal'))
-                         (result_from (map snd skipped ++ consumed) args result)
-               Nothing -> return Nothing }
-    rhs_result _ _ = return Nothing
-
-    application ntypes args expr = case unLoc (stripParensLHsExpr expr) of
-      HsApp _ fun arg | ntypes == 0 -> application ntypes (arg : args) fun
-      HsAppType _ fun _             -> application (ntypes + 1) args fun
-      HsVar _ name -> Just (unLocWithUserRdr name, ntypes, args)
-      _ -> Nothing
-
-    type_prefix :: Int -> Type -> Maybe ([TyVar], Type)
-    type_prefix 0 ty = Just ([], ty)
-    type_prefix n ty
-      = do { let (inferred, sigma) = tcSplitSomeForAllTyVars isInferredForAllTyFlag ty
-           ; (_, specified, rest) <- tcSplitForAllTyVarBinder_maybe sigma
-           ; guard (isSpecifiedForAllTyFlag (binderFlag specified))
-           ; (consumed, residual) <- type_prefix (n - 1) rest
-           ; return (map snd inferred ++ binderVar specified : consumed, residual) }
-
-    result_from consumed [] ty = return (Just (consumed, ty))
-    result_from consumed (arg : args) ty
-      | HsEmbTy _ written <- unLoc (stripParensLHsExpr arg)
-      , ForAllTy ma bndr rest <- coreFullView ty
-      , isVisibleForAllTyFlag (binderFlag bndr)
-      , let var = binderVar bndr
-      , isTyVar var, eqType ma unmatchableDataConTy
-      = do { known <- required_synonym written
-           ; case known of
-               Just supplied | eqType (typeKind supplied) (tyVarKind var) ->
-                 result_from consumed args (substTyWith [var] [supplied] rest)
-               _ -> result_from (var : consumed) args rest }
-      | Just (_, rest) <- splitVisibleFunTy_maybe ty
-      = result_from consumed args rest
-      | otherwise = return Nothing
-
-    required_synonym :: LHsWcType GhcRn -> TcM (Maybe Type)
-    required_synonym (HsWC [] ty)
-      | HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) <- unLoc (ignoreParens ty)
-      , isExternalName name, isTcOcc (nameOccName name)
-      = do { thing <- tcLookup name
-           ; return $ case thing of
-               AGlobal (ATyCon tc) | tyConArity tc == 0 -> synTyConRhs_maybe tc
-               _ -> Nothing }
-    required_synonym _ = return Nothing
-
-    local_id (Just (ATcId { tct_id = ident })) = Just ident
-    local_id _ = Nothing
+    peel_lambda quick cur_schema
+      | ExistsTy ImplicitExists binder body <- coreFullView cur_schema
+      = do { witness <- if quick
+                        then newMetaTyVarTyAtLevel QLInstVar (tyVarKind binder)
+                        else newFlexiTyVarTy (tyVarKind binder)
+           ; let next_schema = substTyWith [binder] [witness] body
+           ; (bs, ws, final_body, inner_wrap) <- peel_lambda quick next_schema
+           ; return (binder : bs, witness : ws, final_body,
+                     mkWpExistsPack cur_schema witness <.> inner_wrap) }
+      | otherwise
+      = return ([], [], cur_schema, idHsWrapper)
 
 {- Note [Implicit existential lambda payloads]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An expected dot package can hold a function. Choose a fresh witness before
-checking the lambda patterns. Check the lambda once against the instantiated
-payload type. A witness introduced by a pattern cannot escape its implication
-to fill that metavariable. The existential binder does not enter source scope.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an expected type starts with 'ExistsTy ImplicitExists' over a visible
+function arrow, instantiate the existential binders before checking the lambda
+equations and wrap the checked lambda with 'WpExistsPack'; see Eisenberg,
+Duboc, Weirich & Lee, "An Existential Crisis Resolved: Type Inference for
+First-Class Existential Types", ICFP 2021 (PACMPL 5(ICFP):64), Figs. 6 & 10,
+and GHC Proposal #473. Allocating the witness variables outside the lambda's
+pattern scope prevents pattern-bound existential or GADT variables from
+escaping into the package witness.
 
-With ImpredicativeTypes, a lambda can take a higher-rank witness from a
-declared result type. For example, check (\b -> prepare b) against
-  exists t. Bool -> Callback t
-when prepare :: Bool -> Callback PolyId. Match the invariant result types
-and check the lambda at Bool -> Callback PolyId.
-
-Figure 10 of Eisenberg et al., "An Existential Crisis Resolved", uses the
-expected payload to guide witness selection. Here the result declaration
-fixes the choice before the lambda patterns enter scope. Read the head's
-declared type and follow its written ordinary application arrows. The
-ordinary check instantiates types, checks operands and records usage.
-For a guarded or multi-equation lambda, read the first matching result
-declaration in source order. An ordinary if adds its two result arms
-in that order. It introduces no binders, so both arms can use the same
-declaration lookup. The predicate and the result arms still go through
-the ordinary expression check. Rebindable if is already an expanded
-application at this stage. The selected declaration supplies no local
-evidence. A head bound by a pattern or guard is unavailable at this
-point. A multi-way if adds its result arms in guard order. Pattern guards
-bring their binders and Givens into scope during the ordinary check.
-A case adds the right-hand sides of its alternatives in source order.
-Skip alternatives with local bindings. The probe uses the outer environment
-for every lookup. Case patterns and their Givens enter scope during normal
-checking, after the witness is selected. Every result checks with the same
-witness. Exact invariant matching chooses a type without filling any
-Quick Look variables. Runtime indices use their existing checks.
-
-An unguarded forwarding lambda (\receive -> produce receive) can use
-the closed declared type of produce. Its forall input can determine a
-polytype witness. Use the same immutable match as for a named payload.
-Check the entire arrow under shallow subsumption. The witness cannot
-refer to a binder local to the input. The probe uses no constraints
-from the lambda body. The usual checker still checks the lambda.
-
-The head can have a leading visible type application prefix. For example,
-  \b -> configured @Bool id b
-can use the result of configured :: forall t. (t -> Bool) -> t -> Callback PolyId.
-Walk the declared inferred and specified binders in IALL/ITYARG order.
-Their choices can affect the domains of later value arguments. Require the
-result type to be independent of those binders, including in its kinds.
-The ordinary application checker instantiates the binders and checks each
-written operand at its original location.
-See Note [Visible type application and abstraction] in GHC.Tc.Gen.App.
-
-If no result declaration fixes the single witness, Quick Look can use a
-call's arguments to find its result type. This covers
-`\b -> id (prepare b)` with the same declaration for prepare. Try the
-declarations first. A result may need a pattern equality to check at
-the witness another arm declares.
-See Note [Quick Look before lambda patterns] in GHC.Tc.Gen.App.
-
-An explicitly marked required argument, such as (type PolyId), can
-also fix the result type. Read only a closed, saturated type synonym
-of the binder's kind. This inspects the declaration before entering
-the lambda's pattern scope. An unread argument can still leave a
-result that is independent of its binder. The ordinary checker
-validates the type argument and checks the application in both cases.
-
-For consecutive lifted dot binders, the same declared results can
-determine separate witnesses. For example, one result can have the
-form Callback PolyId r and another Callback l PolyMaybe. The
-payload must use the binders as distinct direct parameters of one
-nominally generative type constructor, in binder order. A bare
-producer type variable supplies no candidate. Each selected field
-must have one agreed closed polytype. This probe introduces no
-constraints and does not check a lambda branch. Check the original
-match group once at the selected payload type, and then build the
-Packs in telescope order.
-
-Keep the ordinary match checker, including its deep skolemisation and usage
-checks. The outer forall wrapper remains outside the package when tcPolyExprCheck
-skolemises the expected type. Pack erases to the checked lambda in CoreToStg.
-The lambda body still waits for application.
+With 'ImpredicativeTypes' under shallow subsumption, 'tcQuickLookLambdaMatches'
+in GHC.Tc.Gen.App allocates Quick Look instantiation variables for the leading
+existential binders and runs Quick Look over the outer-scoped result arms
+before 'tcLambdaMatches' enters the pattern scope (Serrano et al., ICFP 2020).
+Remaining instantiation variables are monomorphised at the outer level before
+checking the matches once. 'WpExistsPack' lowers to 'Core.Pack', which erases
+in CoreToStg without forcing the lambda body.
 -}
 
 ---------------
@@ -928,9 +708,11 @@ Polymorphic variables and checking-only expressions do not select this route.
 tcExpr expr@(ExplicitTuple x tup_args boxity) res_ty
   | all tupArgPresent tup_args
   = do { as_application <- case res_ty of
-             Check expected | Boxed <- boxity
-                            , ExistsTy ImplicitExists _ _ <- coreFullView expected
-               -> return True
+             Check expected | Boxed <- boxity -> do
+               exp_view <- unwrapMetaView expected
+               return $ case exp_view of
+                 ExistsTy ImplicitExists _ _ -> True
+                 _                           -> False
              Infer _ | Boxed <- boxity
                -> snd <$> tcRetainedInferableArg (noLocA expr)
              _ -> return False
@@ -959,7 +741,8 @@ tcExpr expr@(ExplicitTuple x tup_args boxity) res_ty
 
   | otherwise
   = -- The tup_args are a mixture of Present and Missing (for tuple sections).
-    do { known_tys <- case (boxity, res_ty) of
+    do { (res_ty', pack_wrap) <- peelCheckImplicitExists res_ty
+       ; known_tys <- case (boxity, res_ty') of
              (Boxed, Check expected)
                -> do { expected <- liftZonkM (zonkTcType expected)
                      ; let known
@@ -985,9 +768,9 @@ tcExpr expr@(ExplicitTuple x tup_args boxity) res_ty
              -- See Note [Don't flatten tuples from HsSyn] in GHC.Core.Make
              act_res_ty = mkScaledFunTysU missing_tys (mkTupleTy1 boxity arg_tys)
 
-       ; traceTc "ExplicitTuple" (ppr act_res_ty $$ ppr res_ty)
+       ; traceTc "ExplicitTuple" (ppr act_res_ty $$ ppr res_ty')
 
-       ; tcWrapResultMono expr expr' act_res_ty res_ty }
+       ; mkHsWrap pack_wrap <$> tcWrapResultMono expr expr' act_res_ty res_ty' }
 
 tcExpr (ExplicitSum _ alt arity expr) res_ty
   = do { let sum_tc = sumTyCon arity
@@ -1064,12 +847,55 @@ tcExpr expr@(HsCase ctxt scrut matches) res_ty
            Nothing -> do
              { mult <- newFlexiTyVarTy multiplicityTy
              ; head_app <- case unLoc (stripParensLHsExpr scrut) of
-                 HsApp{} -> tcImplicitOperand scrut
+                 HsApp{} -> split_implicit_head_call 0 id scrut
                  _ -> return Nothing
              ; case head_app of
-                 Just (package, Just rebuild) -> open_call mult package rebuild
-                 _ -> ordinary_case mult scrut res_ty } }
+                 Just (package, rebuild) -> open_call mult package rebuild
+                 Nothing -> ordinary_case mult scrut res_ty } }
   where
+    split_implicit_head_call :: Int -> (LHsExpr GhcRn -> LHsExpr GhcRn)
+                             -> LHsExpr GhcRn
+                             -> TcM (Maybe (LHsExpr GhcRn, LHsExpr GhcRn -> LHsExpr GhcRn))
+    split_implicit_head_call n rebuild (L loc (HsApp x fun operand)) =
+      split_implicit_head_call (n + 1) (\f -> rebuild (L loc (HsApp x f operand))) fun
+    split_implicit_head_call n rebuild (L loc (HsPar x fun)) =
+      split_implicit_head_call n (\f -> rebuild (L loc (HsPar x f))) fun
+    split_implicit_head_call n rebuild head_expr
+      | n > 0
+      , HsVar _ name <- unLoc (strip_ty_apps head_expr)
+      , let id_name = unLocWithUserRdr name
+      , not (isDataOcc (nameOccName id_name))
+      = do { ident <- if isExternalName id_name
+                      then discardErrs $ tryTcDiscardingErrs (pure Nothing) (tcLookupIdMaybe id_name)
+                      else do
+                        local <- tcLookupLcl_maybe id_name
+                        pure $ case local of
+                          Just (ATcId { tct_id = lid }) -> Just lid
+                          Just (AGlobal (AnId gid))     -> Just gid
+                          _                             -> Nothing
+           ; ident_ty <- traverse (liftZonkM . zonkTcType . varType) ident
+           ; return $ case implicit_spine_head <$> ident_ty of
+               Just (ExistsTy ImplicitExists _ body)
+                 | Just _ <- drop_vis_funs n (implicitPayloadType body)
+                 -> Just (head_expr, rebuild)
+               _ -> Nothing }
+      | otherwise = return Nothing
+      where
+        strip_ty_apps (L _ (HsAppType _ f _)) = strip_ty_apps f
+        strip_ty_apps (L _ (HsPar _ f))       = strip_ty_apps f
+        strip_ty_apps e                       = e
+
+        implicit_spine_head ty = case coreFullView ty of
+          DepDictTy _ b -> implicit_spine_head b
+          view
+            | (tvs, theta, b) <- tcSplitSigmaTy view
+            , not (null tvs && null theta)
+            -> implicit_spine_head b
+            | otherwise
+            -> view
+
+        drop_vis_funs 0 ty = Just ty
+        drop_vis_funs k ty = splitVisibleFunTy_maybe ty >>= drop_vis_funs (k - 1) . snd
     -- See Note [Case on a call with an implicit package head].
     open_call mult package rebuild
       = do { (checked, schema) <- tcScalingUsage mult $ tcInferRho package
@@ -1449,7 +1275,8 @@ tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
         [] -> missing_witness Nothing
 
     tc_ordinary_record con_like
-      = do { (con_expr, con_sigma) <- tcInferConLike con_like
+      = do { (res_ty', pack_wrap) <- peelCheckImplicitExists res_ty
+        ; (con_expr, con_sigma) <- tcInferConLike con_like
         ; (con_wrap, con_tau)   <- topInstantiate orig con_sigma
               -- a shallow instantiation should really be enough for
               -- a data constructor.
@@ -1466,7 +1293,7 @@ tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
                                 , rcon_con = L loc con_like
                                 , rcon_flds = rbinds' }
 
-        ; ret <- tcWrapResultMono expr expr' actual_res_ty res_ty
+        ; ret <- mkHsWrap pack_wrap <$> tcWrapResultMono expr expr' actual_res_ty res_ty'
 
         -- Check for missing fields.  We do this after type-checking to get
         -- better types in error messages (cf #18869).  For example:
