@@ -1,4 +1,5 @@
 #include "ClosureLayout.h"
+#include "Capability.h"
 
 /* See Note [Closure size build constants] in ClosureSizeConstants.c. */
 FIELD(INFO_TYPE, StgInfoTable, type, uint32_t);
@@ -18,7 +19,9 @@ FIELD(BCO_LITERALS, StgBCO, literals, StgClosure *);
 FIELD(BCO_PTRS, StgBCO, ptrs, StgClosure *);
 FIELD(INDIRECTEE, StgInd, indirectee, StgClosure *);
 FIELD(ARRAY_PTRS, StgMutArrPtrs, ptrs, size_t);
+FIELD(ARRAY_INFO, StgMutArrPtrs, header.info, const StgInfoTable *);
 FIELD(ARRAY_PAYLOAD, StgMutArrPtrs, payload[0], StgClosure *);
+FIELD(CAPABILITY_CCCS, Capability, r.rCCCS, CostCentreStack *);
 FIELD(SMALL_PTRS, StgSmallMutArrPtrs, ptrs, size_t);
 FIELD(SMALL_PAYLOAD, StgSmallMutArrPtrs, payload[0], StgClosure *);
 FIELD(MUT_VAR, StgMutVar, var, StgClosure *);

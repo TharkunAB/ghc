@@ -1,11 +1,19 @@
 #![no_std]
-use core::ffi::c_char;
+use core::ffi::{c_char, c_void};
+use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 include!(env!("HEAP_POINTER_LAYOUT_RS"));
-core::arch::global_asm!(".hidden ghc_rust_collect_pointers");
+core::arch::global_asm!(
+    ".hidden ghc_rust_collect_pointers\n.hidden ghc_rust_heap_view_closure_ptrs"
+);
 type Closure = *mut u8;
 unsafe extern "C" {
+    fn stgMallocBytes(bytes: usize, message: *const c_char) -> *mut c_void;
+    fn stgFree(ptr: *mut c_void);
+    fn collect_pointers(c: Closure, out: *mut Closure) -> usize;
+    fn allocateMutArrPtrs(cap: *mut u8, count: usize, init: Closure, ccs: *mut u8) -> *mut u8;
+    static stg_MUT_ARR_PTRS_FROZEN_CLEAN_info: u8;
     fn heap_view_closure_ptrs_in_pap_payload(
         out: *mut Closure,
         n: *mut usize,
@@ -17,6 +25,38 @@ unsafe extern "C" {
     fn ghc_heap_unknown_type(kind: u32);
     fn barf(format: *const c_char, ...) -> !;
 }
+
+// The closure size bounds the temporary array. Scan before allocating the
+// result so the allocator receives the exact pointer count and current CCS.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ghc_rust_heap_view_closure_ptrs(
+    cap: *mut u8,
+    closure: Closure,
+    size: usize,
+) -> *mut u8 {
+    unsafe {
+        let temp = stgMallocBytes(
+            size.wrapping_mul(size_of::<Closure>()),
+            c"heap_view_closurePtrs".as_ptr(),
+        )
+        .cast::<Closure>();
+        let count = collect_pointers(closure, temp);
+        let ccs = cap.add(CAPABILITY_CCCS).cast::<*mut u8>().read();
+        let array = allocateMutArrPtrs(cap, count, ptr::null_mut(), ccs);
+        if !array.is_null() {
+            array
+                .add(ARRAY_INFO)
+                .cast::<*const u8>()
+                .write(ptr::addr_of!(stg_MUT_ARR_PTRS_FROZEN_CLEAN_info));
+            if count != 0 {
+                ptr::copy_nonoverlapping(temp, array.add(ARRAY_PAYLOAD).cast::<Closure>(), count);
+            }
+        }
+        stgFree(temp.cast());
+        array
+    }
+}
+
 #[inline]
 unsafe fn field(c: Closure, off: usize) -> Closure {
     unsafe { c.add(off).cast::<Closure>().read() }

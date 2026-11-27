@@ -25,6 +25,8 @@ RTS_PRIVATE void ghc_rust_heap_pap_large(StgClosure **ptrs, StgWord *nptrs,
 GHC_STATIC_ASSERT(sizeof(StgWord) == sizeof(size_t) &&
                   sizeof(StgClosure *) == sizeof(StgWord),
                   "Rust PAP bitmap uses native stack words");
+RTS_PRIVATE StgMutArrPtrs *ghc_rust_heap_view_closure_ptrs(
+    Capability *cap, StgClosure *closure, StgWord size);
 #endif
 
 StgWord heap_view_closureSize(StgClosure *closure) {
@@ -320,6 +322,10 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
 StgMutArrPtrs *heap_view_closurePtrs(Capability *cap, StgClosure *closure) {
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(closure));
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    return ghc_rust_heap_view_closure_ptrs(cap, closure,
+                                           heap_view_closureSize(closure));
+#else
     StgWord size = heap_view_closureSize(closure);
 
     // First collect all pointers here, with the comfortable memory bound
@@ -340,4 +346,5 @@ StgMutArrPtrs *heap_view_closurePtrs(Capability *cap, StgClosure *closure) {
 end:
     stgFree(ptrs);
     return arr;
+#endif
 }
