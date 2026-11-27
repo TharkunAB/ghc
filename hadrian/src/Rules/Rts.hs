@@ -22,6 +22,7 @@ rtsRules = priority 3 $ do
                 [ "rts/rust/adjustor_slots.rs"
                 , "rts/rust/alloc_array.rs"
                 , "rts/rust/archive_member.rs"
+                , "rts/rust/block_count.rs"
                 , "rts/rust/c_finalizers.rs"
                 , "rts/rust/cafs.rs"
                 , "rts/rust/closure_table.rs"

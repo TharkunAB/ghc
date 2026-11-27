@@ -18,6 +18,7 @@ extra-source-files:
     rust/adjustor_slots.rs
     rust/alloc_array.rs
     rust/archive_member.rs
+    rust/block_count.rs
     rust/c_finalizers.rs
     rust/cafs.rs
     rust/closure_table.rs

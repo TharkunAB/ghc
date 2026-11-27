@@ -3,6 +3,7 @@
 mod adjustor_slots;
 mod alloc_array;
 mod archive_member;
+mod block_count;
 mod c_finalizers;
 mod cafs;
 mod closure_table;
