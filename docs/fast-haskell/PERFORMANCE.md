@@ -125,6 +125,19 @@ zero builders. All 1,763 installed files, the package database, the
 linked compiler and the dynamic API consumer matched. Direct strip
 remains an experiment. Pueue job 7268 peaked at 4,325 MiB.
 
+### Overlap compiler package copy and ABI calculation
+
+The package registration replay used the exact Cabal copy driver and
+the captured 880-module Stage0 ABI command. Both modes used the
+direct-strip prototype. Running copy and ABI calculation concurrently
+reduced the median copy-to-recache time from **5.903 s to 4.374 s**
+(25.9%) across four alternating pairs. Every concurrent pair improved.
+The replay wrote the retained package configuration after the computed
+ABI matched. It then ran the usual recache. All 1,765 output files
+matched in bytes and mode, including the registration and package cache.
+Diagnostics matched. Pueue job 7290 peaked at 1,406 MiB.
+These timings cover the registration phase outside Hadrian.
+
 ### Development build on this host
 
 Run from a configured GHC development worktree. Set `WORKER_RELEASE` to the prepared worker for that worktree's Stage0 compiler. The worker's `ghc.real-ghc` must resolve to that compiler, and its `ghc.libdir` must exist. The following command queues a linked-compiler rebuild in Pueue. The private directory retains parse records when the worker exits.
