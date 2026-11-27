@@ -14,6 +14,7 @@ import BindistConfig
 import Expression
 import qualified Oracles.Flavour
 import qualified Oracles.ModuleFiles
+import qualified Oracles.Setting
 import Packages
 import qualified Rules.BinaryDist
 import qualified Rules.CabalReinstall
@@ -150,3 +151,4 @@ oracleRules = do
     Hadrian.Oracles.TextFile.textFileOracle
     Oracles.Flavour.oracles
     Oracles.ModuleFiles.moduleFilesOracle
+    Oracles.Setting.topDirectoryOracle
