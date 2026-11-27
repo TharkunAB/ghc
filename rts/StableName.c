@@ -137,6 +137,13 @@ RTS_PRIVATE void ghc_rust_free_stable_name(snEntry *entry, snEntry **free,
                                           HashTable *hash);
 #endif
 
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+RTS_PRIVATE StgWord ghc_rust_reserve_stable_name(snEntry *table,
+                                                snEntry **free,
+                                                HashTable *hash,
+                                                StgPtr addr);
+#endif
+
 void
 freeSnEntry(snEntry *sn)
 {
@@ -229,6 +236,10 @@ makeStableName (Capability *cap, StgPtr p,
       return sn_obj;
     }
   } else {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+    sn = ghc_rust_reserve_stable_name(stable_name_table, &stable_name_free,
+                                      addrToStableHash, p);
+#else
     sn = stable_name_free - stable_name_table;
     stable_name_free  = (snEntry*)(stable_name_free->addr);
     stable_name_table[sn].addr = p;
@@ -237,6 +248,7 @@ makeStableName (Capability *cap, StgPtr p,
 
     /* add the new stable name to the hash table */
     insertHashTable(addrToStableHash, (W_)p, (void *)sn);
+#endif
   }
 
   // See Note [Stable name creation].

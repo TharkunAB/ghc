@@ -4,11 +4,33 @@ use super::hash_api::{
     HashTable, allocHashTable, freeHashTable, insertHashTable, keyCountHashTable, removeHashTable,
 };
 
+core::arch::global_asm!(".hidden ghc_rust_reserve_stable_name");
+
 #[repr(C)]
 pub(super) struct Entry {
     addr: *mut c_void,
     old: *mut c_void,
     sn_obj: *mut c_void,
+}
+
+/// Take one free slot and add its address to the index.
+/// C holds the table lock and publishes the name object after this call.
+#[unsafe(no_mangle)]
+pub(super) unsafe extern "C" fn ghc_rust_reserve_stable_name(
+    table: *mut Entry,
+    head: *mut *mut Entry,
+    hash: *mut HashTable,
+    addr: *mut c_void,
+) -> usize {
+    unsafe {
+        let slot = head.read();
+        head.write((*slot).addr.cast());
+        (*slot).addr = addr;
+        (*slot).sn_obj = ptr::null_mut();
+        let index = slot.offset_from_unsigned(table);
+        insertHashTable(hash, addr.addr(), ptr::with_exposed_provenance(index));
+        index
+    }
 }
 
 // See Note [Stable name table visits] in StableName.h. Callers serialize
