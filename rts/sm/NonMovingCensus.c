@@ -16,6 +16,7 @@
 
 #if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
 RTS_PRIVATE uint32_t ghc_rust_count_nonmoving_marks(const uint8_t *bits, uint32_t n, uint8_t epoch);
+RTS_PRIVATE uint32_t ghc_rust_filled_segment_words(const StgClosure *first, size_t stride, uint32_t count);
 #endif
 
 // N.B. This may miss segments in the event of concurrent mutation (e.g. if a
@@ -39,10 +40,18 @@ nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
         census.n_filled_segs++;
         census.n_live_blocks += n;
         if (collect_live_words) {
+#if defined(USE_RUST_RTS) && !defined(TSAN_ENABLED)
+            if (n != 0) {
+                census.n_live_words += ghc_rust_filled_segment_words(
+                    (StgClosure *) nonmovingSegmentGetBlock(seg, 0),
+                    alloc->block_size, n);
+            }
+#else
             for (unsigned int i=0; i < n; i++) {
                 StgClosure *c = (StgClosure *) nonmovingSegmentGetBlock(seg, i);
                 census.n_live_words += closure_sizeW(c);
             }
+#endif
         }
     }
 

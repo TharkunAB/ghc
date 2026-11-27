@@ -1,8 +1,41 @@
 #![no_std]
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 include!(env!("CLOSURE_SIZE_LAYOUT_RS"));
+core::arch::global_asm!(".hidden ghc_rust_filled_segment_words");
+
+unsafe extern "C" {
+    #[link_name = "closure_sizeW_"]
+    fn interposable_closure_size(p: *const u8, info: *const u8) -> u32;
+}
+
+/// Sum the closure sizes in one filled nonmoving segment.
+/// The caller supplies the first block, block size, and number of used blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ghc_rust_filled_segment_words(
+    first: *const u8,
+    stride: usize,
+    count: u32,
+) -> u32 {
+    let mut words = 0u32;
+    for index in 0..count as usize {
+        unsafe {
+            let closure = first.add(index * stride);
+            let raw = AtomicPtr::from_ptr(
+                closure
+                    .add(CLOSURE_INFO_OFFSET)
+                    .cast_mut()
+                    .cast::<*mut u8>(),
+            )
+            .load(Ordering::Relaxed);
+            let info = raw.wrapping_sub(INFO_TABLE_BIAS);
+            words = words.wrapping_add(interposable_closure_size(closure, info));
+        }
+    }
+    words
+}
 
 #[inline]
 unsafe fn read_u32(base: *const u8, offset: usize) -> u32 {
