@@ -14,7 +14,7 @@ import GHC.Hs
 import GHC.HsToCore.Pmc.Solver.Types
 import GHC.Types.Error
 import GHC.Types.Id
-import GHC.Types.InlinePragma (ActivationGhc)
+import GHC.Types.InlinePragma (ActivationGhc, InlineSpec)
 import GHC.Types.Name (Name)
 import qualified GHC.LanguageExtensions as LangExt
 
@@ -29,6 +29,7 @@ type MaxPmCheckModels = Int
 data DsMessage
   -- | Simply wraps a generic 'Diagnostic' message.
   = DsUnknownMessage (UnknownDiagnosticFor DsMessage)
+  | DsRetainedPackagePatterns
 
     {-| DsEmptyEnumeration is a warning (controlled by the -Wempty-enumerations flag) that is
         emitted if an enumeration is empty.
@@ -97,7 +98,7 @@ data DsMessage
   | DsNonExhaustivePatterns !HsMatchContextRn
                             !ExhaustivityCheckType
                             !MaxUncoveredPatterns
-                            [Id]
+                            [(Id, Type)] -- Match variables and their display types
                             [Nabla]
 
   | DsTopLevelBindsNotAllowed !BindsType !(HsBindLR GhcTc GhcTc)
@@ -171,6 +172,12 @@ data DsMessage
                                ![ConLike]  -- ^ The partial constructors
                                !Int        -- ^ The max number of constructors reported
 
+  -- | The unfolding of an ordinary signature still contains retained Core.
+  | DsRetainedInlinePragma !Name !InlineSpec
+
+  -- | Separate equations would match a linear retained package more than once.
+  | DsLinearRetainedPackageRows
+
   deriving Generic
 
 -- The positional number of the argument for an expression (first, second, third, etc)
@@ -202,8 +209,10 @@ data ThRejectionReason
   | ThSplicesWithinDeclBrackets
   | ThNonLinearDataCon
   | ThDataConVisibleForall
+  | ThUnclassifiedArrowModifier (LHsModifier GhcRn)
   | ThUnexpectedModifier [LHsModifier GhcRn]
   | ThUnexpectedModifierExpr [LHsModifierOf (LocatedA (HsExpr GhcRn)) GhcRn]
+  | ThTypeCase
 
 -- | Why is a @SPECIALISE@ pragmas useless?
 data UselessSpecialisePragmaReason
