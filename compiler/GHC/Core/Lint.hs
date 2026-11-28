@@ -2085,8 +2085,9 @@ lintCoreAlt scrut_index case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt (DataAlt 
       { let indices = map TermVarTy fields
       ; lintL (nativeIndexArgKinds con ty_args indices)
           (text "Invalid field kinds in native index evidence:" <+> ppr fields)
-      ; let expected = mkNomEqPred index
-                         (mkTyConApp (promoteDataCon con) (ty_args ++ indices))
+      ; let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+            expected = mkNomEqPred index
+                         (mkTyConApp (promoteDataCon con) (ma_args ++ ty_args ++ indices))
       ; ensureEqTys (varType cv) expected
           (text "Invalid nominal index branch evidence:" <+> ppr cv <+> dcolon <+> ppr (varType cv))
       ; lintBinder CasePatBind cv $ do

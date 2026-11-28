@@ -67,7 +67,8 @@ module GHC.Core.DataCon (
         specialPromotedDc,
 
         -- ** Promotion related functions
-        promoteDataCon, promotedRetainedFields, dataConHasPromotedRetained,
+        promoteDataCon, promotedDataConMatchabilityArity,
+        promotedRetainedFields, dataConHasPromotedRetained,
         dataConHasPromotedRetainedSiblings, validRetainedRecordFields
     ) where
 
@@ -90,7 +91,7 @@ import GHC.Types.SourceText
 import GHC.Core.Class
 import GHC.Types.Name
 import GHC.Builtin.KnownKeys
-import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (matchabilityTy, unmatchableDataConTy)
 import GHC.Core.Predicate
 import {-# SOURCE #-} GHC.Types.Id.Info ( invisibleRetainedIdInfo )
 import GHC.Types.Var
@@ -1565,15 +1566,31 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
         -- See Note [The HEq# evidence telescope] in GHC.Builtin.WiredIn.Types.
 
       -- See Note [Promoted data constructors] in GHC.Core.TyCon
+      -- and Note [Matchability of promoted constructor function fields].
     prom_tv_bndrs = [ mkNamedTyConBinder vis tv
                     | Bndr tv vis <- user_tvbs ]
 
-    fresh_names = freshNames (map getName user_tvbs)
-      -- fresh_names: make sure that the "anonymous" tyvars don't
-      -- clash in name or unique with the universal/existential ones.
-      -- Tiresome!  And unnecessary because these tyvars are never looked at
+    fresh_names = freshNames (map getName user_tvbs ++ map getName (univ_tvs ++ ex_tvs))
+      -- fresh_names: make sure that the "anonymous" tyvars and promoted
+      -- matchability tyvars don't clash in name or unique with the
+      -- universal/existential ones.
+    can_gen_prom_matchability
+      = null arg_binders
+        && null theta
+        && not (isWiredInName name)
+        && not (isTypeDataCon con)
+        && not (isClassTyCon rep_tycon)
+        && case source_order of
+             LegacyConOrder 0 -> True
+             _                -> False
+    (prom_ma_tvs, prom_arg_tys, arg_fresh_names)
+      | can_gen_prom_matchability
+      = generalisePromotedArgTys (dropList theta fresh_names) (map scaledThing orig_arg_tys)
+      | otherwise
+      = ([], map scaledThing orig_arg_tys, dropList theta fresh_names)
+    prom_ma_bndrs    = mkNamedTyConBinders Inferred prom_ma_tvs
     prom_arg_bndrs   = [ mkAnonTyConBinder (mkTyVar n t)
-     {- Visible -}     | (n,t) <- dropList theta fresh_names `zip` map scaledThing orig_arg_tys ]
+     {- Visible -}     | (n,t) <- arg_fresh_names `zip` prom_arg_tys ]
     late_tyvar_count = legacyConOrder source_order
     (early_prom_bndrs, late_prom_bndrs)
       | late_tyvar_count <= 0 = (prom_tv_bndrs, [])
@@ -1581,7 +1598,7 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
     prom_bndrs
       | OrderedConArgs groups <- source_order
       = foldConSourceGroups (++) (const id) (++) groups prom_tv_bndrs theta prom_arg_bndrs []
-      | otherwise = early_prom_bndrs ++ prom_arg_bndrs ++ late_prom_bndrs
+      | otherwise = prom_ma_bndrs ++ early_prom_bndrs ++ prom_arg_bndrs ++ late_prom_bndrs
     prom_res_kind    = orig_res_ty
     promoted
       | null arg_binders
@@ -1607,7 +1624,8 @@ mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
         ++ map (const field_role) prom_arg_bndrs
         ++ map (const Nominal) late_prom_bndrs
       | otherwise
-      = map (\tv -> if isTyVar tv then Nominal else Phantom) (univ_tvs ++ ex_tvs)
+      = replicate (length prom_ma_tvs) Nominal
+        ++ map (\tv -> if isTyVar tv then Nominal else Phantom) (univ_tvs ++ ex_tvs)
         ++ map (const field_role) (theta ++ map scaledThing orig_arg_tys)
 
 {- Note [Promoting one retained witness]
@@ -2796,6 +2814,100 @@ and Note [Required foralls in Core].
 
 promoteDataCon :: DataCon -> TyCon
 promoteDataCon (MkData { dcPromoted = tc }) = tc
+
+-- | Return the number of leading inferred 'Matchability' binders added to
+-- 'promoteDataCon' for function-valued constructor fields.
+-- See Note [Matchability of promoted constructor function fields].
+promotedDataConMatchabilityArity :: DataCon -> Arity
+promotedDataConMatchabilityArity con
+  | not (null (dataConRepArgBinders con)) = 0
+  | otherwise =
+      max 0 (tyConArity (promoteDataCon con)
+             - length (dataConUserTyVars con)
+             - dataConSourceArity con)
+
+-- | Replace unmatchable value-arrow annotations on constructor field spines
+-- with fresh 'Matchability' type variables for the promoted constructor kind.
+-- See Note [Matchability of promoted constructor function fields].
+generalisePromotedArgTys :: [Name] -> [Type] -> ([TyVar], [Type], [Name])
+generalisePromotedArgTys names0 tys = go_list names0 [] tys
+  where
+    go_list ns acc [] = (reverse acc, [], ns)
+    go_list ns acc (t : ts) =
+      let (ns1, acc1, t') = go ns acc t
+          (tvs, ts', ns2) = go_list ns1 acc1 ts
+      in (tvs, t' : ts', ns2)
+
+    go ns acc (FunTy af ma mult dom res)
+      | af == FTF_T_T
+      = let (ns1, acc1, ma')
+              | ma `eqType` unmatchableDataConTy
+              , n : rest <- ns
+              = let tv = mkTyVar n matchabilityTy
+                in (rest, tv : acc, mkTyVarTy tv)
+              | otherwise
+              = (ns, acc, ma)
+            (ns2, acc2, dom') = go ns1 acc1 dom
+            (ns3, acc3, res') = go ns2 acc2 res
+        in (ns3, acc3, FunTy af ma' mult dom' res')
+    go ns acc ty@(TyConApp tc (ma : rest))
+      | isTypeSynonymTyCon tc
+      , b : _ <- tyConBinders tc
+      , isInferredTyConBinder b
+      , tyVarKind (binderVar b) `eqType` matchabilityTy
+      , not (any has_unmatchable_fun rest)
+      , Just expanded <- coreView ty
+      , Just (FTF_T_T, _, _, _, _) <- splitFunTy_maybe expanded
+      , ma `eqType` unmatchableDataConTy
+      , n : ns_rest <- ns
+      = let tv = mkTyVar n matchabilityTy
+        in (ns_rest, tv : acc, TyConApp tc (mkTyVarTy tv : rest))
+    go ns acc ty
+      | Just expanded <- coreView ty
+      , has_unmatchable_fun expanded
+      = go ns acc expanded
+      | otherwise
+      = (ns, acc, ty)
+
+    has_unmatchable_fun (FunTy af ma _ dom res)
+      | af == FTF_T_T
+      = ma `eqType` unmatchableDataConTy
+        || has_unmatchable_fun dom
+        || has_unmatchable_fun res
+    has_unmatchable_fun ty
+      | Just expanded <- coreView ty = has_unmatchable_fun expanded
+      | otherwise = False
+
+{- Note [Matchability of promoted constructor function fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A value constructor declaration checks its field types at TypeLevel, where bare
+function arrows get Unmatchable (U). For example:
+
+  type Exp a = a -> Type
+  newtype Endo a = Endo (a -> Exp a)
+
+The runtime constructor `Endo` must keep `(a %U -> Exp @{U} a) %U -> Endo a` so
+that runtime lambdas inhabit the field and the newtype coercion stays sound.
+When `Endo` is promoted to a kind constructor `'Endo` under DataKinds, however,
+type-level defunctionalization libraries apply `'Endo` to matchable type
+constructors (`'Endo Pure`) and match `'Endo f` in type families whose result
+kind uses matchable arrows (`type family UnEndo (e :: Endo a) :: a -> Exp a`).
+
+`generalisePromotedArgTys` replaces `Unmatchable` on `FTF_T_T` function arrows
+along each constructor field's function spine with fresh inferred `Matchability`
+parameters at the front of `dcPromoted`:
+
+  'Endo :: forall {m1 :: Matchability} {m2 :: Matchability} {k} (a :: k).
+           (a %m1 -> Exp @{m2} a) %M -> Endo a
+
+Only `FTF_T_T` function arrows on the field spine (and synonyms with a leading
+inferred `Matchability` binder that expand to an `FTF_T_T` arrow) are
+generalized. Arguments to generative or family type constructors inside a field
+type keep their declared matchability so kindedness of nested applications is
+preserved. Runtime lifting and evaluation paths (`OpenWhnf`, `OpenTypeEval`,
+`ClosedEval`, and `SourceTable`) instantiate these leading binders to `U` via
+`promotedDataConMatchabilityArity`.
+-}
 
 {-
 ************************************************************************

@@ -40,5 +40,6 @@ dataConWrapId_maybe :: DataCon -> Maybe Id
 dataConRepArgTys :: DataCon -> [Scaled Type]
 dataConRepArgBinders :: DataCon -> [Maybe Id]
 promoteDataCon :: DataCon -> TyCon
+promotedDataConMatchabilityArity :: DataCon -> Arity
 
 dataConHasPromotedRetained :: DataCon -> Bool

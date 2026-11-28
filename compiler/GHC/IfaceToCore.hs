@@ -3008,7 +3008,8 @@ tcIfaceAlt scrut scrut_index case_bndr (tycon, inst_tys) (DataAlt con, names, rh
        ; unless (null ex && all isNativeOpaqueValueId fields && nativeIndexArgKinds con tys indices) $
            failIfM (text "Invalid constructor fields in native index interface evidence:" <+> ppr con <+> ppr fields)
        ; fresh <- newIfaceName (mkVarOccFS (ifLclNameFS proof_name))
-       ; let cv = mkCoVar fresh (mkNomEqPred index (mkTyConApp (promoteDataCon con) (tys ++ indices)))
+       ; let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+             cv = mkCoVar fresh (mkNomEqPred index (mkTyConApp (promoteDataCon con) (ma_args ++ tys ++ indices)))
              binders = fields ++ [cv]
        ; rhs' <- extendIfaceIdEnv binders (tcIfaceExpr rhs)
        ; return (Alt (DataAlt con) binders rhs') }

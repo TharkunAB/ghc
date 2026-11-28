@@ -2127,7 +2127,9 @@ bindRetainedConFields fields = go . retainedConPat
 retainedConIndex :: Type -> DataCon -> [Id] -> Type
 retainedConIndex domain con fields
   = case nativeIndexDataConTyArgs domain con of
-      Just args -> mkTyConApp (promoteDataCon con) (args ++ map TermVarTy fields)
+      Just args ->
+        let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+        in mkTyConApp (promoteDataCon con) (ma_args ++ args ++ map TermVarTy fields)
       Nothing -> pprPanic "retainedConIndex: unchecked domain" (ppr domain $$ ppr con)
 
 -- | Resolve an index constructor and instantiate its bare runtime field types.

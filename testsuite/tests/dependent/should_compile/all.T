@@ -122,3 +122,5 @@ test('NoPolyKindsOpenFamMatchability',
      [extra_files(['NoPolyKindsOpenFamMatchabilityA.hs'])],
      multimod_compile, ['NoPolyKindsOpenFamMatchability', '-v0 -dcore-lint'])
 test('DefunKindSynonymMatchability', normal, compile, ['-dcore-lint'])
+test('PromotedConCallbackMatchability', normal, compile, ['-dcore-lint'])
+test('ForeachConCallbackMatchability', normal, compile, ['-O1 -dcore-lint'])

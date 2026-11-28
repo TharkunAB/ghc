@@ -2130,8 +2130,11 @@ isPartialConstructorCaseTable table = isJust $ do
           lhs : carried <- pure (coAxBranchLHS br)
           (promoted, args) <- splitTyConApp_maybe lhs
           con <- isPromotedDataCon_maybe promoted
-          let fields = drop (length (dataConUnivTyVars con)) args
-          con <$ guard (equalLength domains (lhs : carried) && dataConTyCon con == root &&
+          let n_ma = promotedDataConMatchabilityArity con
+              (ma_args, rest_args) = splitAt n_ma args
+              fields = drop (length (dataConUnivTyVars con)) rest_args
+          con <$ guard (length ma_args == n_ma && all (`eqType` unmatchableDataConTy) ma_args &&
+                        equalLength domains (lhs : carried) && dataConTyCon con == root &&
                         lengthIs fields (dataConSourceArity con) &&
                         eqTypes (fields ++ carried) (mkTyVarTys (coAxBranchTyVars br)))
     roots <- traverse branchRoot (fromBranches (coAxiomBranches axiom))
@@ -2246,7 +2249,8 @@ sourceCaseVisibleArity table
                 ([pattern_ty], _) <- branchPatterns tele branch
                 (_, args) <- splitTyConApp_maybe pattern_ty
                 let arity = length tele
-                1 <$ guard (con == expected && eqTypes (take arity args) (mkTyVarTys (take arity (coAxBranchTyVars branch))) &&
+                    rest_args = drop (promotedDataConMatchabilityArity con) args
+                1 <$ guard (con == expected && eqTypes (take arity rest_args) (mkTyVarTys (take arity (coAxBranchTyVars branch))) &&
                             coAxBranchRHS branch `eqType` witness)
             | otherwise -> case constructorCaseType kind <|> monomorphicGuardedListCaseType kind of
                 Just (ConstructorCaseType tele tc _ domains pos _)
@@ -2296,7 +2300,10 @@ sourceCaseVisibleArity table
     constructorPattern pattern_ty = do
       (promoted, args) <- splitTyConApp_maybe pattern_ty
       con <- isPromotedDataCon_maybe promoted
-      let (params, fields) = splitAt (length (dataConUserTyVars con)) args
+      let n_ma = promotedDataConMatchabilityArity con
+          (ma_args, rest_args) = splitAt n_ma args
+          (params, fields) = splitAt (length (dataConUserTyVars con)) rest_args
+      guard (length ma_args == n_ma && all (`eqType` unmatchableDataConTy) ma_args)
       guard (lengthIs params (length (dataConUserTyVars con)))
       unless (null (dataConRepArgBinders con)) $
         guard (isRetainedCaseRoot (mkTyConApp (dataConTyCon con) params) (dataConTyCon con) &&
@@ -3056,14 +3063,17 @@ publishCompiledWithGuard owner cct = do
       pure (mkTyVarTy field, (ident, field) : scoped)
     publishPat instantiate scoped (PatCon dc params children) = do
       (fs, s') <- publishPats instantiate scoped children
-      pure (mkTyConApp (promoteDataCon dc) (map instantiate params ++ fs), s')
+      let ma_args = replicate (promotedDataConMatchabilityArity dc) unmatchableDataConTy
+      pure (mkTyConApp (promoteDataCon dc) (ma_args ++ map instantiate params ++ fs), s')
 
 translateRhs :: TyCon -> (TyCon, TyCon) -> (Type -> Type) -> [(Id, TyVar)] -> CoreRhs -> Type
 translateRhs family (fst_tc, snd_tc) instantiate fields = go
   where
     fieldTy sel = maybe (panic "translateRhs: unbound field") mkTyVarTy (lookup sel fields)
     go (RhsVar sel)               = fieldTy sel
-    go (RhsCon dc args children)  = mkTyConApp (promoteDataCon dc) (map instantiate args ++ map go children)
+    go (RhsCon dc args children)  =
+      let ma_args = replicate (promotedDataConMatchabilityArity dc) unmatchableDataConTy
+      in mkTyConApp (promoteDataCon dc) (ma_args ++ map instantiate args ++ map go children)
     go (RhsCall tc args children) = mkTyConApp tc (map instantiate args ++ map go children)
     go (RhsSelf args children)    = mkTyConApp family (map instantiate args ++ map go children)
     go (RhsApply fn args)         = mkAppTys (fieldTy fn) (map go args)
@@ -3179,7 +3189,9 @@ matchesCompiledTable table mb_guard cct = isJust $ do
           inst = substTyWith (binderVars telescope) (mkTyVarTys params)
           f_map = zip ids fields
           patToTy (PatVar v)          = mkTyVarTy <$> lookup v f_map
-          patToTy (PatCon dc c_as cs) = mkTyConApp (promoteDataCon dc) . (map inst c_as ++) <$> traverse patToTy cs
+          patToTy (PatCon dc c_as cs) =
+            let ma_args = replicate (promotedDataConMatchabilityArity dc) unmatchableDataConTy
+            in mkTyConApp (promoteDataCon dc) . ((ma_args ++ map inst c_as) ++) <$> traverse patToTy cs
           rhsToTy (RhsGuard (PredicateGuard pr) nr yr) | Just sel <- mb_sel =
             mkTyConApp sel (map (translateRhs fam projs inst f_map) [pr, nr, yr])
           rhsToTy r = translateRhs fam projs inst f_map r
@@ -3467,7 +3479,8 @@ publishIndexedProjection owner projection@(IndexedProjection telescope (left, ri
         specialize = instantiate . substTyWith [slot] [index]
         hidden = map (specialize . mkTyVarTy) (binderVars telescope)
         branch_params = [v | (old, v) <- zip (binderVars telescope) parameters, old /= slot]
-        constructor = mkTyConApp (promoteDataCon con) (map specialize con_args)
+        ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+        constructor = mkTyConApp (promoteDataCon con) (ma_args ++ map specialize con_args)
         term = idName owner
     families <- tcGetFamInstEnvs
     case projectionResultCoercion families (specialize right) (specialize result) of
@@ -3565,11 +3578,12 @@ publishIndexedRecursion families projection@(IndexedProjection telescope (left, 
       (recur_args, result_args, rebuilt_kind) <- indexedRecursionResult projection row hidden p_ty
       cast <- projectionResultCoercion families rebuilt_kind (specialize result)
       let h = mkTyVarTy hd; t = mkTyVarTy tl; ys = mkTyVarTy carried
-          pat = mkTyConApp (promoteDataCon con) (map (specialize . specialized) args ++ [h, t])
+          ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+          pat = mkTyConApp (promoteDataCon con) (ma_args ++ map (specialize . specialized) args ++ [h, t])
           vars = [v | (old, v) <- zip (binderVars telescope) parameters, old /= slot] ++ [p, hd, tl, carried]
       guard (typeKind pat `eqType` specialize left && typeKind ys `eqType` specialize right)
       pure $ \family ->
-        let rhs = mkTyConApp (promoteDataCon con) (result_args ++ [h, mkTyConApp family (recur_args ++ [t, ys])])
+        let rhs = mkTyConApp (promoteDataCon con) (ma_args ++ result_args ++ [h, mkTyConApp family (recur_args ++ [t, ys])])
         in mkCoAxBranch vars [] [] (hidden ++ [pat, ys]) (mkCastTy rhs cast)
                         (map (const Nominal) vars) (nameSrcSpan (tyConName family))
 
@@ -3602,20 +3616,23 @@ checkIndexedSourceBranch projection@(IndexedProjection telescope (left, right) r
     hidden_vars <- traverse getTyVar_maybe [arg | (v, arg) <- zip parameters hidden, v /= slot]
     (local_vars, wanted) <- case recursion of
       Nothing -> ([] , carried) <$ guard (index `eqType` refined &&
-                                          mkTyConApp (promoteDataCon nil) (map specialize con_args) `eqType` constructor)
+                                          mkTyConApp (promoteDataCon nil) (replicate (promotedDataConMatchabilityArity nil) unmatchableDataConTy ++ map specialize con_args) `eqType` constructor)
       Just row@(IndexedRecursion con predecessor result_index args head_kind) -> do
         (_, [pred_ty]) <- splitTyConApp_maybe refined
         pred_var <- getTyVar_maybe pred_ty
         (promoted, constructor_args) <- splitTyConApp_maybe constructor
-        let inst = specialize . substTyWith [predecessor] [pred_ty]
-            (promoted_params, fields) = splitAt (length args) constructor_args
+        let n_ma = promotedDataConMatchabilityArity con
+            (ma_args, rest_con_args) = splitAt n_ma constructor_args
+            inst = specialize . substTyWith [predecessor] [pred_ty]
+            (promoted_params, fields) = splitAt (length args) rest_con_args
         [hd, tl] <- pure fields
         field_vars <- traverse getTyVar_maybe fields
-        guard (promoted == promoteDataCon con && inst result_index `eqType` refined &&
+        guard (promoted == promoteDataCon con && length ma_args == n_ma && all (`eqType` unmatchableDataConTy) ma_args &&
+               inst result_index `eqType` refined &&
                eqTypes (map inst args) promoted_params && typeKind hd `eqType` inst head_kind &&
                typeKind tl `eqType` specialize (substTyWith [slot] [pred_ty] left))
         (recur_args, result_args, _) <- indexedRecursionResult projection row hidden pred_ty
-        pure (pred_var : field_vars, mkTyConApp promoted (result_args ++ [hd, mkTyConApp table (recur_args ++ [tl, carried])]))
+        pure (pred_var : field_vars, mkTyConApp promoted (ma_args ++ result_args ++ [hd, mkTyConApp table (recur_args ++ [tl, carried])]))
     let rhs = coAxBranchRHS branch; vars = hidden_vars ++ local_vars ++ [carried_var]
     guard (coAxBranchTyVars branch == vars && sizeUniqSet (mkUniqSet vars) == length vars &&
            eqTypes (map typeKind hidden) (map (specialize . varType) parameters) &&
@@ -4312,7 +4329,8 @@ certifyEmbSpec strict final_exports env lookup_callee emb_callees (EmbSpec fun a
                     pure $ do
                       subs <- sequence mb_subs
                       let (sub_lhs_tys, sub_scopes) = unzip subs
-                      pure (mkTyConApp (promoteDataCon dc) (exp_tc_args ++ sub_lhs_tys), concat sub_scopes)
+                          ma_args = replicate (promotedDataConMatchabilityArity dc) unmatchableDataConTy
+                      pure (mkTyConApp (promoteDataCon dc) (ma_args ++ exp_tc_args ++ sub_lhs_tys), concat sub_scopes)
               _ -> pure Nothing
       mb_elab <- elabEmbPat (inst dom) c_pat
       case mb_elab of

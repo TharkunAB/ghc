@@ -60,7 +60,7 @@ import GHC.Tc.Zonk.TcType
 
 import GHC.Core.Class ( Class, classTyVars )
 import GHC.Core.ConLike ( ConLike(..) )
-import GHC.Core.DataCon ( DataCon, dataConConcreteTyVars, dataConFieldLabels, dataConFullSig, dataConName, isNewDataCon, dataConOrigArgTys, dataConOrigResTy, dataConSourceArity, dataConHasRetainedResult, dataConRepArgBinders, dataConTyCon, dataConUnivTyVars, dataConUserTyVars, dataConWorkId, dataConWrapId )
+import GHC.Core.DataCon ( DataCon, dataConConcreteTyVars, dataConFieldLabels, dataConFullSig, dataConName, isNewDataCon, dataConOrigArgTys, dataConOrigResTy, dataConSourceArity, dataConHasRetainedResult, dataConRepArgBinders, dataConTyCon, dataConUnivTyVars, dataConUserTyVars, dataConWorkId, dataConWrapId, promotedDataConMatchabilityArity )
 import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr, hasScopedDictionaryType
                           , isScopedSelectorReceiver, supportsQuickLookType )
@@ -2622,7 +2622,7 @@ tcInvisibleOperand index
       , not (isTypeDataTyCon (dataConTyCon con))
       , Just gre <- lookupGRE_Name env (dataConName con)
       , Just tys <- nativeIndexDataConTyArgs (typeKind ty) con
-      = do { fields <- mapM (recover env) (drop (length tys) args)
+      = do { fields <- mapM (recover env) (drop (promotedDataConMatchabilityArity con + length tys) args)
            ; return $ do { (values, uses) <- unzip <$> sequence fields
                          ; let worker = Core.mkTyApps (Core.Var (dataConWorkId con)) tys
                          ; return (Core.mkApps worker values,

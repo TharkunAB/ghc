@@ -1377,14 +1377,16 @@ nameNativeConFields platform result_ty con tys build (witness_field : payload_fi
        ; named_payloads <- mapM name_payload (zip payloads payload_fields)
        ; let named = (witness_atom, witness_co, wrap_witness) : named_payloads
              scrut = build [atom | (atom, _, _) <- named]
+             ma_cos = replicate (promotedDataConMatchabilityArity con) (mkNomReflCo unmatchableDataConTy)
              co = mkTyConAppCo Nominal (promoteDataCon con)
-                    (map mkNomReflCo tys ++ [field_co | (_, field_co, _) <- named])
+                    (ma_cos ++ map mkNomReflCo tys ++ [field_co | (_, field_co, _) <- named])
        ; return (scrut, co, foldr (.) id [wrap | (_, _, wrap) <- named]) }
 nameNativeConFields platform result_ty con tys build fields
   = do { named <- mapM (nameNativeIndexArg platform result_ty) fields
        ; let scrut = build [atom | (atom, _, _) <- named]
+             ma_cos = replicate (promotedDataConMatchabilityArity con) (mkNomReflCo unmatchableDataConTy)
              co = mkTyConAppCo Nominal (promoteDataCon con)
-                    (map mkNomReflCo tys ++ [field_co | (_, field_co, _) <- named])
+                    (ma_cos ++ map mkNomReflCo tys ++ [field_co | (_, field_co, _) <- named])
        ; return (scrut, co, foldr (.) id [wrap | (_, _, wrap) <- named]) }
 
 -- | Prepare a scrutinee whose branch proofs refer to its original index.
