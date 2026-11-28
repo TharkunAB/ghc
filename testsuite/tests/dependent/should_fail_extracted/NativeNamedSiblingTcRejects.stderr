@@ -2,17 +2,20 @@ NativeNamedSiblingTcRejects.hs:13:45: error: [GHC-83605]
     • GHC cannot use this expression as a retained index.
       Build the index from local variables, supported constructors, and fully applied functions with checked equations.
       An immediate application of a supported lambda is also allowed.
-    • In the expression: replicateNative (counted p) '-'
-      In the first argument of ‘toList’, namely
+    • In the first argument of ‘toList’, namely
         ‘(replicateNative (counted p) '-')’
       In the expression: toList (replicateNative (counted p) '-')
+      In an equation for ‘badOrdinarySel’:
+          badOrdinarySel p = toList (replicateNative (counted p) '-')
 
 NativeNamedSiblingTcRejects.hs:16:69: error: [GHC-83605]
     • No checked source equations are available for ‘storedLength’ in this retained argument.
-    • In the expression: replicateNative (storedLength p) '-'
-      In the first argument of ‘toList’, namely
+    • In the first argument of ‘toList’, namely
         ‘(replicateNative (storedLength p) '-')’
       In the expression: toList (replicateNative (storedLength p) '-')
+      In the expression:
+        let storedLength _ = Z
+        in toList (replicateNative (storedLength p) '-')
 
 NativeNamedSiblingTcRejects.hs:24:24: error: [GHC-83865]
     • Couldn't match type: PC.storedLength q3
@@ -161,29 +164,14 @@ NativeNamedSiblingTcRejects.hs:63:72: error: [GHC-83865]
       In the expression:
         p {namedLetters = namedLetters p, namedFlags = namedFlags q}
 
-NativeNamedSiblingTcRejects.hs:66:29: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘storedLength p’
-      Expected: Vec Char n0
-        Actual: Vec Char (storedLength p)
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeNamedSiblingTcRejects.hs:66:22-59
-    • In the first argument of ‘zipVec’, namely ‘(namedLetters p)’
-      In the expression: zipVec (namedLetters p) (namedFlags q)
-      In the first argument of ‘toList’, namely
-        ‘(zipVec (namedLetters p) (namedFlags q))’
-
-NativeNamedSiblingTcRejects.hs:66:46: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘storedLength q’
-      Expected: Vec Bool n0
+NativeNamedSiblingTcRejects.hs:66:47: error: [GHC-83865]
+    • Couldn't match type: storedLength q
+                     with: storedLength p
+      Expected: Vec Bool (storedLength p)
         Actual: Vec Bool (storedLength q)
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeNamedSiblingTcRejects.hs:66:22-59
+      Note: GHC cannot determine the arguments of the function ‘storedLength’ from its result.
     • In the second argument of ‘zipVec’, namely ‘(namedFlags q)’
-      In the expression: zipVec (namedLetters p) (namedFlags q)
       In the first argument of ‘toList’, namely
         ‘(zipVec (namedLetters p) (namedFlags q))’
+      In the expression: toList (zipVec (namedLetters p) (namedFlags q))
 

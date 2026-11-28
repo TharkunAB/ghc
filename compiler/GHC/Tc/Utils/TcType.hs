@@ -1035,10 +1035,20 @@ tcTyFamInstsAndVisX = go
       | Just exp_ty <- coreView ty     = go is_invis_arg exp_ty
     go _ (TyVarTy _)                   = []
     go is_invis_arg (TermVarTy v)      = go is_invis_arg (varType v)
+                                         ++ go is_invis_arg (idMult v)
     go is_invis_arg (TermAppTy f arg)  = go is_invis_arg (varType f)
                                          ++ go is_invis_arg arg
     go is_invis_arg (DepFunTy _ v ty)    = go is_invis_arg (varType v)
+                                         ++ go is_invis_arg (idMult v)
                                          ++ go is_invis_arg ty
+    go is_invis_arg (DepDictTy d ty)     = go True (varType d)
+                                         ++ go is_invis_arg ty
+    go is_invis_arg (ClassAppTy sel inst dict arg kind)
+                                       = go True (varType sel)
+                                         ++ go True inst
+                                         ++ go True dict
+                                         ++ go is_invis_arg arg
+                                         ++ go True kind
     go is_invis_arg (TyConApp tc tys)
       | isTypeFamilyTyCon tc
       = [(is_invis_arg, tc, take (tyConArity tc) tys)]
@@ -1134,9 +1144,18 @@ any_rewritable role tv_pred tc_pred ty
     -- Opaque call arguments have nominal role and are not injective positions.
     go _ bvs _ (TermAppTy _ arg) = go True bvs NomEq arg
     go uf bvs rl (DepFunTy _ v ty)
-      = go uf bvs NomEq (varType v) || go uf (bvs `extendVarSet` v) rl ty
-    -- GHC.Tc.Solver.Rewrite keeps the checked package opaque.
-    go _  _   _  (ExistsTy {})       = False
+      = go uf bvs NomEq (varType v) || go uf bvs NomEq (idMult v) || go uf (bvs `extendVarSet` v) rl ty
+    go uf bvs rl (DepDictTy d ty)
+      = go uf bvs NomEq (varType d) || go uf (bvs `extendVarSet` d) rl ty
+    go _ bvs _ (ClassAppTy sel inst dict arg kind)
+      = any (go True bvs NomEq) [varType sel, inst, dict, arg, kind]
+    go uf bvs rl (ExistsTy _ tv body)
+      | isTyVar tv
+      , typeKind (varType tv) `eqType` liftedTypeKind
+      , typeKind body `eqType` liftedTypeKind
+      = go uf (bvs `extendVarSet` tv) rl body
+      | otherwise
+      = False
     go uf bvs rl (TyVarTy tv)        = go_tv uf bvs rl tv
     go _  _    _ (LitTy {})          = False
     go uf bvs rl (AppTy fun arg)     = go under bvs rl fun || go under bvs NomEq arg
@@ -1533,9 +1552,11 @@ getDFunTyKey :: Type -> OccName -- Get some string from a type, to be used to
                                 -- construct a dictionary function name
 getDFunTyKey ty | Just ty' <- coreView ty = getDFunTyKey ty'
 getDFunTyKey (TyVarTy tv)            = getOccName tv
-getDFunTyKey ty@(TermAppTy {})       = pprPanic "getDFunTyKey: unsupported runtime call index" (ppr ty)
-getDFunTyKey ty@(TermVarTy {})       = pprPanic "getDFunTyKey: unsupported runtime index" (ppr ty)
-getDFunTyKey ty@(DepFunTy {})        = pprPanic "getDFunTyKey: unsupported retained function" (ppr ty)
+getDFunTyKey (TermAppTy f _)         = getOccName f
+getDFunTyKey (TermVarTy v)           = getOccName v
+getDFunTyKey (DepFunTy {})           = mkVarOcc "foreach"
+getDFunTyKey (DepDictTy _ t)         = getDFunTyKey t
+getDFunTyKey (ClassAppTy sel _ _ _ _) = getOccName sel
 -- See Note [Existential types in instance arguments].
 getDFunTyKey ExistsTy{}              = mkVarOcc "exists"
 getDFunTyKey (TyConApp tc _)         = getOccName tc
@@ -2141,6 +2162,8 @@ isOverloadedTy :: Type -> Bool
 -- Used by bindLocalMethods and for -fprof-late-overloaded
 isOverloadedTy ty | Just ty' <- coreView ty = isOverloadedTy ty'
 isOverloadedTy (ForAllTy _ _ ty)             = isOverloadedTy ty
+isOverloadedTy (DepFunTy _ _ ty)             = isOverloadedTy ty
+isOverloadedTy DepDictTy{}                   = True
 isOverloadedTy (FunTy { ft_af = af })       = isInvisibleFunArg af
 isOverloadedTy _                            = False
 
@@ -2476,12 +2499,20 @@ pSizeTypes = pSizeTypesX emptyVarSet pSizeZero
 -- This ignores coercions, as coercions aren't user-written
 pSizeTypeX :: VarSet -> Type -> PatersonSize
 pSizeTypeX bvs ty | Just exp_ty <- coreView ty = pSizeTypeX bvs exp_ty
-pSizeTypeX _ ty@(TermAppTy {})
-  = pprPanic "pSizeTypeX: unsupported runtime call index" (ppr ty)
-pSizeTypeX _ ty@(TermVarTy {})
-  = pprPanic "pSizeTypeX: unsupported runtime index" (ppr ty)
-pSizeTypeX _ ty@(DepFunTy {})
-  = pprPanic "pSizeTypeX: unsupported retained function" (ppr ty)
+pSizeTypeX bvs (TermAppTy f arg)
+  = pSizeTypeX bvs (varType f) `addPSize` pSizeTypeX bvs arg
+pSizeTypeX bvs (TermVarTy v)
+  | v `elemVarSet` bvs = pSizeOne
+  | otherwise          = pSizeOne `addPSize` pSizeTypeX bvs (varType v)
+pSizeTypeX bvs (DepFunTy _ v body)
+  = pSizeTypeX bvs (idMult v) `addPSize`
+    pSizeTypeX bvs (varType v) `addPSize`
+    pSizeTypeX (bvs `extendVarSet` v) body
+pSizeTypeX bvs (DepDictTy d body)
+  = pSizeTypeX bvs (varType d) `addPSize`
+    pSizeTypeX (bvs `extendVarSet` d) body
+pSizeTypeX bvs (ClassAppTy _ inst dict arg kind)
+  = pSizeTypesX bvs pSizeOne [inst, dict, arg, kind]
 pSizeTypeX bvs (TyVarTy tv)
   | tv `elemVarSet` bvs                  = pSizeOne
   | otherwise                            = PS_Vanilla { ps_tvs = [tv], ps_size = 1 }

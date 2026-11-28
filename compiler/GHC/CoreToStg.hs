@@ -457,7 +457,7 @@ coreToStgExpr expr@(Lam {})
 
 coreToStgExpr (Tick tick expr)
   = do
-       let !stg_tick = coreToStgTick (exprType expr) tick
+       !stg_tick <- coreToStgTickM (exprType expr) tick
        !expr2 <- coreToStgExpr expr
        return (StgTick stg_tick expr2)
 
@@ -465,13 +465,18 @@ coreToStgExpr (Pack _ _ payload) = coreToStgExpr payload
 
 -- See Note [Erasing a lexical existential].
 coreToStgExpr (Unpack _ payload package body)
-  | Var p <- package
+  | Just p <- unwrapPackageVar package
   = do { p' <- resolvePayloadAlias p
        ; extendVarEnvCts [(payload, PayloadAlias p')] (coreToStgExpr body) }
   | otherwise
   = do { rhs <- coreToStgRhs (payload, package)
        ; body' <- extendVarEnvCts [(payload, LetBound NestedLet 0)] (coreToStgExpr body)
        ; return (StgLet noExtFieldSilent (StgNonRec payload rhs) body') }
+  where
+    unwrapPackageVar (Var p)      = Just p
+    unwrapPackageVar (Cast e _)   = unwrapPackageVar e
+    unwrapPackageVar (Pack _ _ e) = unwrapPackageVar e
+    unwrapPackageVar _            = Nothing
 
 coreToStgExpr (Cast expr _)
   = coreToStgExpr expr
@@ -652,8 +657,12 @@ getStgArgFromTrivialArg :: HasDebugCallStack => CoreArg -> StgArg
 -- CoreArgs may not immediately look trivial, e.g., `case e of {}` or
 -- `case unsafeequalityProof of UnsafeRefl -> e` might intervene.
 -- Good thing we can just call `trivial_expr_fold` here.
-getStgArgFromTrivialArg e = trivial_expr_fold StgVarArg StgLitArg panic panic e
+getStgArgFromTrivialArg e = go e
   where
+    go (Pack _ _ p)                       = go p
+    go (Cast p _)                         = go p
+    go (Tick t p) | not (tickishIsCode t) = go p
+    go p                                  = trivial_expr_fold StgVarArg StgLitArg panic panic p
     panic = pprPanic "getStgArgFromTrivialArg" (ppr e)
 
 coreToStgArgs :: [CoreArg] -> CtsM ([StgArg], [StgTickish], [StgBinding])
@@ -734,6 +743,10 @@ coreToStgTick _ty (HpcTick m i)           = HpcTick m i
 coreToStgTick _ty (SourceNote span nm)    = SourceNote span nm
 coreToStgTick _ty (ProfNote cc cnt scope) = ProfNote cc cnt scope
 coreToStgTick !ty (Breakpoint _ bid fvs)  = Breakpoint ty bid fvs
+
+coreToStgTickM :: Type -> CoreTickish -> CtsM StgTickish
+coreToStgTickM !ty (Breakpoint _ bid fvs) = Breakpoint ty bid <$> mapM resolvePayloadAlias fvs
+coreToStgTickM !ty tick                   = pure (coreToStgTick ty tick)
 
 -- ---------------------------------------------------------------------------
 -- The magic for lets:
@@ -974,8 +987,9 @@ myCollectArgs expr res_ty
       | otherwise
       = (h, as, ts)
 
-    go (App f a)  as ts = go f (a:as) ts
-    go (Cast e _) as ts = go e as ts
+    go (App f a)    as ts = go f (a:as) ts
+    go (Cast e _)   as ts = go e as ts
+    go (Pack _ _ e) as ts = go e as ts
     go (Tick t e) as ts = assertPpr (not (tickishIsCode t) || all isTypeArg as)
                                     (ppr e $$ ppr as $$ ppr ts) $
                           -- See Note [Ticks in applications]

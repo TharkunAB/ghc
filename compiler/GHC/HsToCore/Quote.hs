@@ -1696,7 +1696,10 @@ repRetainedTelescope tyki vis
     vis_name = case vis of
       DepFunVisible   -> bndrReqName
       DepFunInvisible -> bndrInvisName
-repRetainedTelescope _ _ _ _ = panic "repRetainedTelescope: invalid retained binder"
+repRetainedTelescope _ vis bndrs body =
+  notHandled $ ThExoticFormOfType $ HsForEachTy
+    (noAnn, case vis of { DepFunVisible -> Left noAnn; DepFunInvisible -> Right noAnn })
+    bndrs body
 
 -- | Allocate a fresh term name after quoting its domain.
 repRetainedBinder :: Name -> LHsType GhcRn
@@ -3277,7 +3280,8 @@ repRetainedGadt names prefix = go (reverse prefix)
       repRetainedBinder name domain $ \(MkC n) (MkC d) -> do
         arg <- rep2 gadtIndexArgOcc [n, d]
         bind (arg : args) rest body
-    bind _ _ _ = panic "repRetainedGadt: invalid retained binder"
+    bind _ bndrs body =
+      notHandled $ ThExoticFormOfType $ HsForEachTy (noAnn, Left noAnn) bndrs body
 
 -- | Use the GADT arrow default in scope at the quotation site.
 repGadtValueArg :: SrcUnpackedness -> SrcStrictness -> HsModifiedFunArr GhcRn

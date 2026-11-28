@@ -981,10 +981,22 @@ isOpenTypeOperandWith variable constructor = (== Just True) . symbolic
     symbolic ty = case unLoc (ignoreParens ty) of
       HsKindSig _ operand _ -> symbolic operand
       HsTyVar _ NotPromoted (L _ name) | variable name -> Just True
-      HsExplicitTupleTy _ _ [x, y] -> or <$> traverse symbolic [x, y]
+      HsExplicitTupleTy _ _ elems -> or <$> traverse symbolic elems
+      HsTupleTy _ _ elems -> or <$> traverse symbolic elems
+      HsExplicitListTy _ _ elems -> or <$> traverse symbolic elems
+      HsListTy _ elem_ty -> symbolic elem_ty
+      HsOpTy _ lhs op rhs
+        | HsTyVar _ _ (L _ name) <- unLoc (ignoreParens op) ->
+            if constructor name
+              then or <$> traverse symbolic [lhs, rhs]
+              else if variable name && any (== Just True) [symbolic lhs, symbolic rhs]
+                then Just True
+                else Nothing
+        | otherwise -> Nothing
       _ -> case spine ty [] of
-        (HsTyVar _ _ (L _ name), fields) | constructor name ->
-          or <$> traverse symbolic fields
+        (HsTyVar _ _ (L _ name), fields)
+          | constructor name -> or <$> traverse symbolic fields
+          | variable name, not (null fields), any (== Just True) (map symbolic fields) -> Just True
         _ -> Nothing
 
     spine ty fields = case unLoc (ignoreParens ty) of
@@ -2084,7 +2096,9 @@ hsTypeNeedsParens p = go_hs_ty
     go_core_ty (TyVarTy{})    = False
     go_core_ty (TermVarTy{})  = False
     go_core_ty (TermAppTy{})  = p >= appPrec
+    go_core_ty (ClassAppTy{}) = p >= appPrec
     go_core_ty (DepFunTy{})   = p >= funPrec
+    go_core_ty (DepDictTy{})  = p >= funPrec
     go_core_ty (AppTy{})      = p >= appPrec
     go_core_ty (TyConApp _ args)
       | null args             = False

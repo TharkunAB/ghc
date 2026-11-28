@@ -2,29 +2,32 @@ NativeLiftedCallbackWrongDomain.hs:8:43: error: [GHC-83865]
     • Couldn't match type ‘Bit’ with ‘Bool’
       Expected: Bool -> Result True
         Actual: Bit -> Bool -> Ordering
-    • In the expression: keepFamilyCompare f x y
-      In the first argument of ‘print’, namely
+    • In the first argument of ‘print’, namely
         ‘(keepFamilyCompare f x y)’
       In the expression: print (keepFamilyCompare f x y)
+      In an equation for ‘badInput’:
+          badInput f x y = print (keepFamilyCompare f x y)
 
 NativeLiftedCallbackWrongDomain.hs:11:44: error: [GHC-83865]
     • Couldn't match type ‘Bool’ with ‘Ordering’
       Expected: Bool -> Result True
         Actual: Bool -> Bool -> Bool
-    • In the expression: keepFamilyCompare f x y
-      In the first argument of ‘print’, namely
+    • In the first argument of ‘print’, namely
         ‘(keepFamilyCompare f x y)’
       In the expression: print (keepFamilyCompare f x y)
+      In an equation for ‘badResult’:
+          badResult f x y = print (keepFamilyCompare f x y)
 
 NativeLiftedCallbackWrongDomain.hs:14:48: error: [GHC-83865]
     • Couldn't match type: Result tag
                      with: Bool -> Ordering
       Expected: Bool -> Result True
         Actual: Bool -> Result tag
-    • In the expression: keepFamilyCompare f x y
-      In the first argument of ‘print’, namely
+    • In the first argument of ‘print’, namely
         ‘(keepFamilyCompare f x y)’
       In the expression: print (keepFamilyCompare f x y)
+      In an equation for ‘badAbstract’:
+          badAbstract _ f x y = print (keepFamilyCompare f x y)
     • Relevant bindings include
         f :: Bool -> Result tag
           (bound at NativeLiftedCallbackWrongDomain.hs:14:15)

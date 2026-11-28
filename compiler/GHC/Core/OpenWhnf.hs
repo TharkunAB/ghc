@@ -20,6 +20,9 @@ import Control.Monad (foldM, guard)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE, withExceptT)
 import Control.Monad.Trans.State.Strict (StateT, evalStateT, get, mapStateT, put)
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
+import Data.Maybe (isJust, isNothing)
 import GHC.Builtin.WiredIn.Types
   (charDataCon, mkPromotedPairTy, pairTyCon, tupleDataCon, unboxedUnitDataCon, unboxedUnitTy, unmatchableDataConTy)
 import GHC.Core.Coercion (coercionLKind, coercionRKind, coercionType, isReflCo, mkNomReflCo)
@@ -39,7 +42,7 @@ import GHC.Core.Subst (Subst, extendCvSubst, extendTvSubst, mkEmptySubst, substE
 import GHC.Core.TyCo.Compare (eqType)
 import GHC.Core.TyCon (closedFamilyTyConCoAxiom_maybe, isBoxedDataTyCon)
 import GHC.Core.TyCo.Rep
-  ( Coercion(..), MCoercion(MRefl), UnivCoProvenance(SubMultProv)
+  ( Coercion(..), MCoercion(MRefl), Type(TermVarTy), UnivCoProvenance(SubMultProv)
   , UnivCoDeps(NoUnivCoDeps), scaledThing )
 import GHC.Core.Type
   ( FunTyFlag(FTF_T_T), Kind, Type, isLiftedTypeKind, isManyTy, isOneTy
@@ -47,9 +50,8 @@ import GHC.Core.Type
   , repGetTyVar_maybe, splitFunTy_maybe, splitTyConApp_maybe, substTyWith, tyCoVarsOfType, typeKind )
 import GHC.Core.Utils (exprType, findAlt)
 import GHC.Types.Basic (Boxity(Boxed), IntWithInf, intGtLimit)
-import GHC.Types.Id (dataConWrapUnfolding_maybe, isDataConWorkId_maybe)
+import GHC.Types.Id (dataConWrapUnfolding_maybe, isDataConWorkId_maybe, isJoinId)
 import GHC.Types.Literal (Literal(LitChar))
-import GHC.Types.Tickish (GenTickish(Breakpoint))
 import GHC.Types.Var (Var, eqForAllVis, isCoVar, isId, isTyVar, varType)
 import GHC.Types.Var.Env (VarEnv, emptyVarEnv, extendVarEnv, extendVarEnvList, lookupVarEnv,
                           mkInScopeSet)
@@ -64,8 +66,17 @@ data EvalFailure
 
 type Env = VarEnv Suspension
 
--- | Save the expression and the environment at its point of origin.
-data Suspension = Suspension Env CoreExpr
+-- | Save the expression, the environment at its point of origin, and an
+-- optional thunk key for memoized local bindings.
+data Suspension = Suspension Env CoreExpr !(Maybe Int)
+
+mkSuspension :: Env -> CoreExpr -> Suspension
+mkSuspension env expr = Suspension env expr Nothing
+
+data EvalState = EvalState !Int !Int !(IntMap Whnf)
+
+initEvalState :: EvalState
+initEvalState = EvalState 1 1 IntMap.empty
 
 -- | Preserve a case and its environment while its scrutinee is unknown.
 data CaseContinuation = CaseContinuation Env Var Type [CoreAlt]
@@ -126,7 +137,7 @@ openWhnfTraceM limit obtain = openWhnfTraceWithLocalM limit (\v _ -> obtain v) (
 openWhnfTraceWithLocalM :: Monad m => IntWithInf -> (Var -> Maybe Type -> m (Maybe CoreExpr)) -> (Var -> m ())
                        -> (CaseStep -> m ()) -> VarSet -> CoreExpr -> m (Either EvalFailure Whnf)
 openWhnfTraceWithLocalM limit obtain local record unsolved expr =
-  runExceptT $ evalStateT (evaluate False False limit obtain local record unsolved Nothing (Suspension emptyVarEnv expr)) 1
+  runExceptT $ evalStateT (evaluate False False limit obtain local record unsolved Nothing (mkSuspension emptyVarEnv expr)) initEvalState
 
 -- | Reflect a finite ordinary constructor value or a supplied rigid symbol.
 -- The first observation and every demanded field share one reduction budget.
@@ -135,7 +146,7 @@ openReadbackM :: Monad m => Bool -> Bool -> IntWithInf -> (Var -> Maybe Type -> 
               -> Kind -> CoreExpr
               -> m (Either OpenReadbackFailure (Type, [DataCon]))
 openReadbackM local_families indexed limit obtain local origin visible expected expr =
-  runExceptT $ evalStateT (readback [] expected (Suspension emptyVarEnv expr)) 1
+  runExceptT $ evalStateT (readback [] expected (mkSuspension emptyVarEnv expr)) initEvalState
   where
     observe = mapStateT (withExceptT ReadbackEvaluation)
             . evaluate local_families indexed limit obtain local (const (pure ())) emptyVarSet Nothing
@@ -149,7 +160,7 @@ openReadbackM local_families indexed limit obtain local origin visible expected 
           if typeKind ty `eqType` kind
             then pure (ty, used')
             else lift (throwE (ReadbackOpaque whnf))
-        BoxedPair first@(Suspension _ x) second@(Suspension _ y)
+        BoxedPair first@(Suspension _ x _) second@(Suspension _ y _)
           | Just (con, [ka, kb]) <- splitTyConApp_maybe kind, con == pairTyCon
           , exprType x `eqType` ka, exprType y `eqType` kb -> do
               (a, used') <- readback used ka first
@@ -177,9 +188,10 @@ openReadbackM local_families indexed limit obtain local origin visible expected 
     -- See Note [Readback of a rigid callback application].
     readApplication used neutral = case neutral of
       Rigid v
-        | Just f <- origin v, Just _ <- repGetTyVar_maybe f
+        | Just f <- origin v
+        , isJust (repGetTyVar_maybe f) || isTermVarOrigin f
         , varType v `eqType` typeKind f -> pure (f, used)
-      Applied head_neutral field@(Suspension _ operand) -> do
+      Applied head_neutral field@(Suspension _ operand _) -> do
         (f, used') <- readApplication used head_neutral
         case splitFunTy_maybe (typeKind f) of
           Just (FTF_T_T, ma, mult, domain, _)
@@ -191,6 +203,8 @@ openReadbackM local_families indexed limit obtain local origin visible expected 
       _ -> opaque
       where
         opaque = lift (throwE (ReadbackOpaque (Neutral neutral)))
+        isTermVarOrigin (TermVarTy _) = True
+        isTermVarOrigin _             = False
 
     readField (rev_tys, used) (kind, field) = do
       (ty, used') <- readback used kind field
@@ -241,140 +255,154 @@ same promoted constructor. Other observations leave casts unsupported.
 
 evaluate :: Monad m => Bool -> Bool -> IntWithInf -> (Var -> Maybe Type -> m (Maybe CoreExpr)) -> (Var -> m ())
          -> (CaseStep -> m ()) -> VarSet -> Maybe Type -> Suspension
-         -> StateT Int (ExceptT EvalFailure m) Whnf
-evaluate local_families indexed limit obtain local record unsolved first_type (Suspension env expr) = do
-  steps <- get
-  if intGtLimit steps limit then lift (throwE Exhausted) else put (steps + 1)
-  case expr of
-    _ | Just (con, arguments, fields, missing) <- constructorApplication expr
-      , missing > 0 || con /= pairCon ->
-          if missing > 0
-          then recur (Suspension env (etaExpand missing expr))
-          else pure (BoxedData con arguments (map (Suspension env) fields))
-    _ | indexed
-      , Just (con, arguments, locals, proofs, fields) <- indexedConstructorApplication expr ->
-          pure (IndexedData con arguments locals proofs (map (Suspension env) fields))
-    Var v
-      | Just binding <- lookupVarEnv env v -> do
-          lift (lift (local v))
-          recur binding
-      | indexed, Just wrapper <- dataConWrapUnfolding_maybe v
-      , exprType wrapper `eqType` varType v ->
-          recur (Suspension emptyVarEnv wrapper)
-      | otherwise -> do
-          definition <- lift (lift (obtain v first_type))
-          case definition of
-            Just rhs@(Var target)
-              | varType target `eqType` varType v ->
-                  recurHead first_type (Suspension emptyVarEnv rhs)
-            Just rhs -> recur (Suspension emptyVarEnv rhs)
-            Nothing
-              | v `elemVarSet` unsolved -> pure (Neutral (Unsolved v))
-              | otherwise -> pure (Neutral (Rigid v))
-    Cast body co
-      | indexed
-      , coercionLKind co `eqType` coercionRKind co || checkedMultiplicityCast co ->
-          recurHead first_type (Suspension env body)
-      | local_families
-      , let lhs = openFamilyReduction (coercionLKind co)
-            rhs = openFamilyReduction (coercionRKind co)
-      , not (isReflRedn lhs && isReflRedn rhs)
-      , reductionReducedType lhs `eqType` reductionReducedType rhs ->
-          recurHead first_type (Suspension env body)
-    Tick Breakpoint{} body -> recurHead first_type (Suspension env body)
-    Lit lit -> pure (Literal lit)
-    Lam binder body -> pure (Lambda binder (Suspension env body))
-    App (Var worker) arg
-      | worker == dataConWorkId charDataCon -> do
-          payload <- recur (Suspension env arg)
-          case payload of
-            Literal (LitChar c) -> pure (BoxedChar c)
-            _ -> lift (throwE UnsupportedCore)
-    App (App (App (App (Var worker) (Type a)) (Type b)) x) y
-      | worker == pairWorker
-      , not (isTyCoArg x), not (isTyCoArg y)
-      , isLiftedTypeKind (typeKind a), isLiftedTypeKind (typeKind b)
-      , exprType x `eqType` a, exprType y `eqType` b ->
-          pure (BoxedPair (Suspension env x) (Suspension env y))
-    App fun arg -> do
-      let head_type = case arg of
-            Type ty -> Just ty
-            _ -> Nothing
-      headValue <- recurHead head_type (Suspension env fun)
-      case headValue of
-        Lambda binder (Suspension closure body)
-          | Type argTy <- arg, isTyVar binder ->
-              let inScope = mkInScopeSet (exprFreeVars body `unionVarSet` tyCoVarsOfType argTy)
-                  subst = extendTvSubst (mkEmptySubst inScope) binder argTy
-              in recur (Suspension closure (substExpr subst body))
-          | liftedBinder binder ->
-              recur (Suspension (extendVarEnv closure binder (Suspension env arg)) body)
-          | isId binder
-          , varType binder `eqType` unboxedUnitTy
-          , Var worker <- arg
-          , worker == dataConWorkId unboxedUnitDataCon
-          , not (binder `elemVarSet` exprFreeVars body) -> do
-              -- See Note [Observing open Core].
-              lift (lift (record ContinueWithUnit))
-              recur (Suspension closure body)
-        Neutral neutral -> pure (Neutral (Applied neutral (Suspension env arg)))
-        _ -> lift (throwE UnsupportedCore)
-    Let (NonRec binder rhs) body
-      | liftedBinder binder ->
-          recur (Suspension (extendVarEnv env binder (Suspension env rhs)) body)
-      | indexed, isCoVar binder, Coercion co <- rhs
-      , varType binder `eqType` coercionType co ->
-          let inScope = mkInScopeSet (exprFreeVars body `unionVarSet` exprFreeVars rhs)
-              subst = extendCvSubst (mkEmptySubst inScope) binder co
-          in recur (Suspension env (substExpr subst body))
-    Let (Rec bindings) body
-      | all (liftedBinder . fst) bindings ->
-          let recEnv = extendVarEnvList env [(binder, Suspension recEnv rhs) | (binder, rhs) <- bindings]
-          in recur (Suspension recEnv body)
-    Case scrutinee binder resultType alts -> do
-      let suspended = Suspension env scrutinee
-      headValue <- recur suspended
-      case headValue of
-        Neutral neutral ->
-          pure (Neutral (CaseBlocked neutral (CaseContinuation env binder resultType alts)))
-        BoxedChar c
-          | Just (Alt (DataAlt con) [field] body) <- findAlt (DataAlt charDataCon) alts
-          , con == charDataCon -> do
-              lift (lift (record (SelectBoxedChar c (DataAlt con))))
-              let payload = Suspension emptyVarEnv (Lit (LitChar c))
-                  bodyEnv = extendVarEnvList env [(binder, suspended), (field, payload)]
-              recur (Suspension bodyEnv body)
-          | Just (Alt DEFAULT [] body) <- findAlt (DataAlt charDataCon) alts -> do
-              lift (lift (record (SelectBoxedChar c DEFAULT)))
-              recur (Suspension (extendVarEnv env binder suspended) body)
-          | otherwise -> lift (throwE MissingAlternative)
-        BoxedPair first second ->
-          selectData SelectBoxedPair pairCon [first, second] binder suspended alts
-        BoxedData con _ fields ->
-          selectData (SelectBoxedData con) con fields binder suspended alts
-        IndexedData con _ local_tys proofs fields
-          | Just (Alt key binders body) <- findAlt (DataAlt con) alts ->
-              case key of
-                DEFAULT | null binders ->
-                  recur (Suspension (extendVarEnv env binder suspended) body)
-                DataAlt chosen | chosen == con
-                  , Just (subst, bindings) <- indexedAltBindings body binders local_tys proofs fields ->
-                    recur (Suspension (extendVarEnvList env ((binder, suspended) : bindings))
-                                      (substExpr subst body))
-                _ -> lift (throwE UnsupportedCore)
-        Literal lit
-          | Just (Alt key [] body) <- findAlt (LitAlt lit) alts -> do
-              lift (lift (record (SelectLiteral lit key)))
-              let bodyEnv = extendVarEnv env binder (Suspension emptyVarEnv (Lit lit))
-              recur (Suspension bodyEnv body)
-          | otherwise -> lift (throwE MissingAlternative)
-        Lambda{}
-          | Just (Alt DEFAULT [] body) <- findAlt DEFAULT alts -> do
-              lift (lift (record SelectLambdaDefault))
-              recur (Suspension (extendVarEnv env binder suspended) body)
-        _ -> lift (throwE UnsupportedCore)
-    _ -> lift (throwE UnsupportedCore)
+         -> StateT EvalState (ExceptT EvalFailure m) Whnf
+evaluate local_families indexed limit obtain local record unsolved first_type (Suspension env expr mb_tid) = do
+  EvalState steps next_tid memo <- get
+  if intGtLimit steps limit
+    then lift (throwE Exhausted)
+    else put (EvalState (steps + 1) next_tid memo)
+  case mb_tid of
+    Just tid | isNothing first_type, Just cached <- IntMap.lookup tid memo -> pure cached
+    _ -> do
+      whnf <- eval_step
+      case mb_tid of
+        Just tid | isNothing first_type -> do
+          EvalState s' n' m' <- get
+          put (EvalState s' n' (IntMap.insert tid whnf m'))
+        _ -> pure ()
+      pure whnf
   where
+    eval_step = case expr of
+      _ | Just (con, arguments, fields, missing) <- constructorApplication expr
+        , missing > 0 || con /= pairCon ->
+            if missing > 0
+            then recur (mkSuspension env (etaExpand missing expr))
+            else pure (BoxedData con arguments (map (mkSuspension env) fields))
+      _ | indexed
+        , Just (con, arguments, locals, proofs, fields) <- indexedConstructorApplication expr ->
+            pure (IndexedData con arguments locals proofs (map (mkSuspension env) fields))
+      Var v
+        | Just binding <- lookupVarEnv env v -> do
+            lift (lift (local v))
+            recur binding
+        | indexed, Just wrapper <- dataConWrapUnfolding_maybe v
+        , exprType wrapper `eqType` varType v ->
+            recur (mkSuspension emptyVarEnv wrapper)
+        | otherwise -> do
+            definition <- lift (lift (obtain v first_type))
+            case definition of
+              Just rhs@(Var target)
+                | varType target `eqType` varType v ->
+                    recurHead first_type (mkSuspension emptyVarEnv rhs)
+              Just rhs -> recur (mkSuspension emptyVarEnv rhs)
+              Nothing
+                | v `elemVarSet` unsolved -> pure (Neutral (Unsolved v))
+                | otherwise -> pure (Neutral (Rigid v))
+      Cast body co
+        | indexed
+        , coercionLKind co `eqType` coercionRKind co || checkedMultiplicityCast co ->
+            recurHead first_type (mkSuspension env body)
+        | local_families
+        , let lhs = openFamilyReduction (coercionLKind co)
+              rhs = openFamilyReduction (coercionRKind co)
+        , not (isReflRedn lhs && isReflRedn rhs)
+        , reductionReducedType lhs `eqType` reductionReducedType rhs ->
+            recurHead first_type (mkSuspension env body)
+      Tick _ body -> recurHead first_type (mkSuspension env body)
+      Lit lit -> pure (Literal lit)
+      Lam binder body -> pure (Lambda binder (mkSuspension env body))
+      App (Var worker) arg
+        | worker == dataConWorkId charDataCon -> do
+            payload <- recur (mkSuspension env arg)
+            case payload of
+              Literal (LitChar c) -> pure (BoxedChar c)
+              _ -> lift (throwE UnsupportedCore)
+      App (App (App (App (Var worker) (Type a)) (Type b)) x) y
+        | worker == pairWorker
+        , not (isTyCoArg x), not (isTyCoArg y)
+        , isLiftedTypeKind (typeKind a), isLiftedTypeKind (typeKind b)
+        , exprType x `eqType` a, exprType y `eqType` b ->
+            pure (BoxedPair (mkSuspension env x) (mkSuspension env y))
+      App fun arg -> do
+        let head_type = case arg of
+              Type ty -> Just ty
+              _ -> Nothing
+        headValue <- recurHead head_type (mkSuspension env fun)
+        case headValue of
+          Lambda binder (Suspension closure body _)
+            | Type argTy <- arg, isTyVar binder ->
+                let inScope = mkInScopeSet (exprFreeVars body `unionVarSet` tyCoVarsOfType argTy)
+                    subst = extendTvSubst (mkEmptySubst inScope) binder argTy
+                in recur (mkSuspension closure (substExpr subst body))
+            | liftedOrJoinBinder binder ->
+                recur (mkSuspension (extendVarEnv closure binder (mkSuspension env arg)) body)
+            | isId binder
+            , varType binder `eqType` unboxedUnitTy
+            , Var worker <- arg
+            , worker == dataConWorkId unboxedUnitDataCon
+            , not (binder `elemVarSet` exprFreeVars body) -> do
+                -- See Note [Observing open Core].
+                lift (lift (record ContinueWithUnit))
+                recur (mkSuspension closure body)
+          Neutral neutral -> pure (Neutral (Applied neutral (mkSuspension env arg)))
+          _ -> lift (throwE UnsupportedCore)
+      Let (NonRec binder rhs) body
+        | liftedOrJoinBinder binder -> do
+            EvalState s n m <- get
+            put (EvalState s (n + 1) m)
+            recur (mkSuspension (extendVarEnv env binder (Suspension env rhs (Just n))) body)
+        | indexed, isCoVar binder, Coercion co <- rhs
+        , varType binder `eqType` coercionType co ->
+            let inScope = mkInScopeSet (exprFreeVars body `unionVarSet` exprFreeVars rhs)
+                subst = extendCvSubst (mkEmptySubst inScope) binder co
+            in recur (mkSuspension env (substExpr subst body))
+      Let (Rec bindings) body
+        | all (liftedOrJoinBinder . fst) bindings ->
+            let recEnv = extendVarEnvList env [(binder, mkSuspension recEnv rhs) | (binder, rhs) <- bindings]
+            in recur (mkSuspension recEnv body)
+      Case scrutinee binder resultType alts -> do
+        let suspended = mkSuspension env scrutinee
+        headValue <- recur suspended
+        case headValue of
+          Neutral neutral ->
+            pure (Neutral (CaseBlocked neutral (CaseContinuation env binder resultType alts)))
+          BoxedChar c
+            | Just (Alt (DataAlt con) [field] body) <- findAlt (DataAlt charDataCon) alts
+            , con == charDataCon -> do
+                lift (lift (record (SelectBoxedChar c (DataAlt con))))
+                let payload = mkSuspension emptyVarEnv (Lit (LitChar c))
+                    bodyEnv = extendVarEnvList env [(binder, suspended), (field, payload)]
+                recur (mkSuspension bodyEnv body)
+            | Just (Alt DEFAULT [] body) <- findAlt (DataAlt charDataCon) alts -> do
+                lift (lift (record (SelectBoxedChar c DEFAULT)))
+                recur (mkSuspension (extendVarEnv env binder suspended) body)
+            | otherwise -> lift (throwE MissingAlternative)
+          BoxedPair first second ->
+            selectData SelectBoxedPair pairCon [first, second] binder suspended alts
+          BoxedData con _ fields ->
+            selectData (SelectBoxedData con) con fields binder suspended alts
+          IndexedData con _ local_tys proofs fields
+            | Just (Alt key binders body) <- findAlt (DataAlt con) alts ->
+                case key of
+                  DEFAULT | null binders ->
+                    recur (mkSuspension (extendVarEnv env binder suspended) body)
+                  DataAlt chosen | chosen == con
+                    , Just (subst, bindings) <- indexedAltBindings body binders local_tys proofs fields ->
+                      recur (mkSuspension (extendVarEnvList env ((binder, suspended) : bindings))
+                                          (substExpr subst body))
+                  _ -> lift (throwE UnsupportedCore)
+          Literal lit
+            | Just (Alt key [] body) <- findAlt (LitAlt lit) alts -> do
+                lift (lift (record (SelectLiteral lit key)))
+                let bodyEnv = extendVarEnv env binder (mkSuspension emptyVarEnv (Lit lit))
+                recur (mkSuspension bodyEnv body)
+            | otherwise -> lift (throwE MissingAlternative)
+          Lambda{}
+            | Just (Alt DEFAULT [] body) <- findAlt DEFAULT alts -> do
+                lift (lift (record SelectLambdaDefault))
+                recur (mkSuspension (extendVarEnv env binder suspended) body)
+          _ -> lift (throwE UnsupportedCore)
+      _ -> lift (throwE UnsupportedCore)
     recurHead = evaluate local_families indexed limit obtain local record unsolved
     recur = recurHead Nothing
     pairCon = tupleDataCon Boxed 2
@@ -383,7 +411,7 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
       | Just (Alt key binders body) <- findAlt (DataAlt con) alts
       , Just bindings <- altBindings key con binders fields = do
           lift (lift (record (step key)))
-          recur (Suspension (extendVarEnvList env ((binder, suspended) : bindings)) body)
+          recur (mkSuspension (extendVarEnvList env ((binder, suspended) : bindings)) body)
       | otherwise = lift (throwE MissingAlternative)
 
     altBindings (DataAlt chosen) con binders fields
@@ -392,7 +420,7 @@ evaluate local_families indexed limit obtain local record unsolved first_type (S
     altBindings DEFAULT _ [] _ = Just []
     altBindings _ _ _ _ = Nothing
 
-    matches field (Suspension _ body) =
+    matches field (Suspension _ body _) =
       liftedBinder field && varType field `eqType` exprType body
 
 -- | Check a compiler-generated weakening of an otherwise unchanged arrow.
@@ -426,7 +454,7 @@ indexedAltBindings body binders local_tys proofs fields = do
     guard (length cvs == length proofs && all isCoVar cvs)
     guard (and (zipWith (\cv co -> substTy types (varType cv) `eqType` coercionType co) cvs proofs))
     guard (length ids == length fields && all liftedBinder ids)
-    guard (and (zipWith (\v (Suspension _ e) -> substTy subst (varType v) `eqType` exprType e) ids fields))
+    guard (and (zipWith (\v (Suspension _ e _) -> substTy subst (varType v) `eqType` exprType e) ids fields))
     pure (subst, zip ids fields)
 
 -- | Read a fully applied ordinary constructor worker and its suspended fields.
@@ -562,9 +590,12 @@ openDataConFieldTypes con parameters
   = Just field_types
   | otherwise = Nothing
 
--- | Only lifted term binders can enter the lazy environment.
+-- | Only lifted term binders (and join points in local lets) can enter the lazy environment.
 liftedBinder :: Var -> Bool
 liftedBinder binder = isId binder && isLiftedTypeKind (typeKind (varType binder))
+
+liftedOrJoinBinder :: Var -> Bool
+liftedOrJoinBinder binder = liftedBinder binder || isJoinId binder
 
 {- Note [Observing open Core]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

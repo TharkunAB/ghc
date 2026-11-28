@@ -38,10 +38,11 @@ NativeRetainedPackageDepBad.hs:31:54: error: [GHC-83865]
     • Couldn't match type ‘m’ with ‘n3’
       Expected: Vec Int n3
         Actual: Vec Int m
-    • In the expression: keepPkg (PackVec n xs)
-      In the first argument of ‘consumePkg’, namely
+    • In the first argument of ‘consumePkg’, namely
         ‘(keepPkg (PackVec n xs))’
       In the expression: consumePkg (keepPkg (PackVec n xs))
+      In an equation for ‘wrongWitness’:
+          wrongWitness n _ xs = consumePkg (keepPkg (PackVec n xs))
     • Relevant bindings include
         xs :: Vec Int m (bound at NativeRetainedPackageDepBad.hs:31:18)
 

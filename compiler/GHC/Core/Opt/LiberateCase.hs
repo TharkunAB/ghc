@@ -13,11 +13,16 @@ module GHC.Core.Opt.LiberateCase
 import GHC.Prelude
 
 import GHC.Core
+import GHC.Core.TyCo.FVs ( tyCoVarsOfCo, tyCoVarsOfType )
+import GHC.Core.Type ( isNativeIndexFunctionId )
 import GHC.Core.Unfold
 import GHC.Core.Opt.Simplify.Inline
 import GHC.Builtin.WiredIn.Types ( unitDataConId )
 import GHC.Types.Id
+import GHC.Types.Name ( isExternalName )
+import GHC.Types.Var ( varType )
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set ( VarSet, elemVarSet, emptyVarSet, filterVarSet, unionVarSet, unionVarSets )
 import GHC.Utils.Misc    ( notNull )
 
 {-
@@ -105,21 +110,48 @@ and the level of @h@ is zero (NB not one).
 -}
 
 liberateCase :: LibCaseOpts -> CoreProgram -> CoreProgram
-liberateCase opts binds = do_prog (initLiberateCaseEnv opts) binds
+liberateCase opts binds = do_prog (initLiberateCaseEnv opts binds) binds
   where
     do_prog _   [] = []
     do_prog env (bind:binds) = bind' : do_prog env' binds
                              where
                                (env', bind') = libCaseBind env bind
 
-initLiberateCaseEnv :: LibCaseOpts -> LibCaseEnv
-initLiberateCaseEnv opts = LibCaseEnv
+initLiberateCaseEnv :: LibCaseOpts -> CoreProgram -> LibCaseEnv
+initLiberateCaseEnv opts binds = LibCaseEnv
    { lc_opts      = opts
    , lc_lvl       = 0
    , lc_lvl_env   = emptyVarEnv
    , lc_rec_env   = emptyVarEnv
    , lc_scruts    = []
+   , lc_type_ids  = progTypeTermIds binds
    }
+
+-- | Collect local term 'Id's that appear inside types or coercions so
+-- 'liberateCase' does not duplicate a local index function referenced in types.
+progTypeTermIds :: CoreProgram -> VarSet
+progTypeTermIds = filterVarSet isId . unionVarSets . map bind_fvs
+  where
+    bndr_fvs b = tyCoVarsOfType (varType b)
+    bind_fvs (NonRec b r) = bndr_fvs b `unionVarSet` expr_fvs r
+    bind_fvs (Rec prs)    = unionVarSets [bndr_fvs b `unionVarSet` expr_fvs r | (b, r) <- prs]
+
+    expr_fvs (Var _)        = emptyVarSet
+    expr_fvs (Lit _)        = emptyVarSet
+    expr_fvs (Type ty)      = tyCoVarsOfType ty
+    expr_fvs (Coercion co)  = tyCoVarsOfCo co
+    expr_fvs (App f a)      = expr_fvs f `unionVarSet` expr_fvs a
+    expr_fvs (Lam b e)      = bndr_fvs b `unionVarSet` expr_fvs e
+    expr_fvs (Let bd e)     = bind_fvs bd `unionVarSet` expr_fvs e
+    expr_fvs (Case s b t alts) =
+      expr_fvs s `unionVarSet` bndr_fvs b `unionVarSet` tyCoVarsOfType t
+      `unionVarSet` unionVarSets [unionVarSets (map bndr_fvs bs) `unionVarSet` expr_fvs r
+                                 | Alt _ bs r <- alts]
+    expr_fvs (Cast e co)    = expr_fvs e `unionVarSet` tyCoVarsOfCo co
+    expr_fvs (Tick _ e)     = expr_fvs e
+    expr_fvs (Pack s w e)   = tyCoVarsOfType s `unionVarSet` tyCoVarsOfType w `unionVarSet` expr_fvs e
+    expr_fvs (Unpack w p pkg body) =
+      bndr_fvs w `unionVarSet` bndr_fvs p `unionVarSet` expr_fvs pkg `unionVarSet` expr_fvs body
 
 {-
 ************************************************************************
@@ -168,8 +200,11 @@ libCaseBind env (Rec pairs)
                                    Let (Rec dup_pairs) (Var unitDataConId)
 
     ok_pair (id,_)
-        =  idArity id > 0       -- Note [Only functions!]
-        && not (isDeadEndId id) -- Note [Not bottoming Ids]
+        =  idArity id > 0                   -- Note [Only functions!]
+        && not (isDeadEndId id)             -- Note [Not bottoming Ids]
+        && not (isNativeIndexFunctionId id
+                && (isGlobalId id || isExternalName (idName id)
+                    || id `elemVarSet` lc_type_ids env))
 
 {- Note [Not bottoming Ids]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -445,7 +480,7 @@ data LibCaseEnv
                 -- ^ Binds *only* recursively defined ids, to their own
                 -- binding group, and *only* in their own RHSs
 
-        lc_scruts :: [(Id, LibCaseLevel, LibCaseLevel)]
+        lc_scruts :: [(Id, LibCaseLevel, LibCaseLevel)],
                 -- ^ Each of these Ids was scrutinised by an enclosing
                 -- case expression, at a level deeper than its binding
                 -- level.
@@ -463,4 +498,7 @@ data LibCaseEnv
                 --    in principle the same Id may appear multiple times,
                 --    although that'd be unusual:
                 --       case x of { (a,b) -> ....(case x of ...) .. }
+
+        lc_type_ids :: !VarSet
+                -- ^ Local term Ids occurring in types or coercions of the program
         }

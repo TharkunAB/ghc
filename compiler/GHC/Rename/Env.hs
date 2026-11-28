@@ -111,7 +111,7 @@ import GHC.Types.GREInfo
 import GHC.Types.Basic  ( TupleSort(..), tupleSortBoxity )
 
 import GHC.Utils.Outputable as Outputable
-import GHC.Utils.Lexeme (isLexVar, isLexVarId, isLexVarSym)
+import GHC.Utils.Lexeme (isLexVar, isLexVarSym)
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 
@@ -1292,7 +1292,7 @@ lookupTypeOcc position rdr_name
                     else case level of
                       Comp | allow_local_closed || isQual term_rdr || open_operands
                            , isLocalGRE gre, not explicit_levels
-                           , isLexVarId (occNameFS (greOccName gre))
+                           , isVarOcc (greOccName gre)
                            , nameModule_maybe name == Just this_mod ->
                         case demands of
                           Just ref -> do
@@ -1314,7 +1314,7 @@ lookupTypeOcc position rdr_name
     -- A class operator gets its source table from the selected dictionary.
     -- Leave the kind, dictionary and saturation checks to the type checker.
     imported_head open_operands gre
-      | isLexVarId (occNameFS (greOccName gre)) = pure True
+      | isVarOcc (greOccName gre) = pure True
       | TypeApplicationHead{} <- position, open_operands = do
           thing <- tcLookupGlobal (greName gre)
           pure $ case thing of

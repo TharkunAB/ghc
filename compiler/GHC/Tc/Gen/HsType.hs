@@ -111,9 +111,10 @@ import GHC.Tc.Types.Constraint
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Validity
-import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(InvalidInput, UnavailableDefinition),
+import GHC.Core.OpenWhnf (EvalFailure(Exhausted))
+import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(CannotReduce, InvalidInput, UnavailableDefinition),
                                DefinitionFailure(MissingTemplate), instantiateOpenMethod,
-                               instantiateOpenTypeFunction, observeOpenType,
+                               openTypeFunctionSignature, observeOpenType,
                                openTypeFailureReason, readOpenMethodWorker)
 import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourceTableFamilyUse, sourceTableTypeUses,
                               sourceCaseKindUse, sourceTableOccurrence, sourceTableReferenceUse, indexedProjectionSource, isSourceConstructorCase, monomorphicEnumCaseArity, sourceCaseVisibleArity, sourceTableOwner, sourcePairBuilderField,
@@ -152,7 +153,7 @@ import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Class
 import GHC.Core.FamInstEnv (familyNameInstances, famInstTyCon, lookupFamInstEnv, fim_instance,
-                            mkBranchedCoAxiom, mkCoAxBranch, normaliseType, reduceTyFamApp_maybe)
+                            mkBranchedCoAxiom, mkCoAxBranch, reduceTyFamApp_maybe)
 import GHC.Tc.TyCl.Build (newImplicitBinder)
 import qualified GHC.Core as Core
 import GHC.Core.Dependent ( hasNativeDependentExpr )
@@ -2916,7 +2917,7 @@ tcConvertedNumeral mode (Check expected) raw
         target <- liftZonkM (zonkTcType expected)
         case splitTyConApp_maybe target of
           Just (tc, args)
-            | tc /= naturalTyCon, isVanillaAlgTyCon tc, isLiftedAlgTyCon tc
+            | tc /= naturalTyCon, isAlgTyCon tc, isLiftedAlgTyCon tc
             , length args == tyConArity tc, noFreeVarsOfType target ->
                 registered target
           _ -> pure Nothing
@@ -3798,18 +3799,23 @@ tcTermAppInType mode rn_ty exp_kind
               -- Stage 3: Pure OpenTypeEval with ClosedEval bytecode fallback.
               | ordinary_call
               , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name)
-              , Just (instantiated, domains, result_kind) <- instantiateOpenTypeFunction is_local fun
+              , Just sig@(_, domains, _, _) <- openTypeFunctionSignature is_local fun
               , equalLength domains args
-              , all (if is_local then is_local_open_operand else isOpenTypeOperand) args
-              -> do outcome <- tcTryOpenTypeCall mode name instantiated (zip args domains) result_kind
+              , let is_open_arg = if is_local then is_local_open_operand else isOpenTypeOperand mode
+              , any is_open_arg args
+              , all (\a -> is_open_arg a || isClosedConTypeOperand a) args
+              -> do outcome <- tcTryOpenTypeCall mode name fun sig args
                     case outcome of
-                      Right result -> checkExpKind mode rn_ty result result_kind exp_kind
-                      Left err     -> stage4_uninterp fun (reportOpenTypeFailure name err)
+                      Right (result, result_kind) -> checkExpKind mode rn_ty result result_kind exp_kind
+                      Left err@(CannotReduce Exhausted) -> reportOpenTypeFailure name err
+                      Left (UnavailableDefinition _ MissingTemplate)
+                        | not is_local -> stage3_closed_or_uninterp is_local rdr name fun args
+                      Left err -> stage4_uninterp fun (reportOpenTypeFailure name err)
               | ordinary_call
               , not is_local || isJust (lookupNameEnv (tcg_local_open_defs env) name)
               , Just telescope@(_, inputs, _) <- indexedOpenTypeFunction fun
               , equalLength inputs args
-              , all (\a -> known_constructor a || isOpenTypeOperand a) args
+              , all (\a -> known_constructor a || isOpenTypeOperand mode a) args
               , any known_constructor args, any open_indexed_operand args
               -> do observed <- tcIndexedOpenTypeCall mode fun telescope args
                     case observed of
@@ -3859,7 +3865,7 @@ tcTermAppInType mode rn_ty exp_kind
     imported_certified_table fun [arg]
       | Just table <- sourceTableId_maybe fun
       , (isFinalCoreIdentity fun && retained_identity_operand arg) ||
-        (isFinalCoreReverseWrapper fun && open_indexed_operand arg && not (isOpenTypeOperand arg))
+        (isFinalCoreReverseWrapper fun && open_indexed_operand arg && not (isOpenTypeOperand mode arg))
       = Just table
     imported_certified_table _ _ = Nothing
 
@@ -3946,7 +3952,7 @@ tcTermAppInType mode rn_ty exp_kind
       | otherwise = Nothing
 
     ordinary_source_arity fun table
-      | SourceTableId _ _ NominalSourceTable <- idDetails fun
+      | Just _ <- sourceTableId_maybe fun
       , let vis = count isVisibleTyConBinder (tyConBinders table)
       , vis > 0
       = Just vis
@@ -3957,7 +3963,7 @@ tcTermAppInType mode rn_ty exp_kind
       sourceTableTypeUses head_ty
       tc_app_ty_with_head mode rn_ty exp_kind head_ty
 
-    is_local_open_operand arg = isOpenTypeOperand arg || is_type_constructor_app arg
+    is_local_open_operand arg = isOpenTypeOperand mode arg || is_type_constructor_app arg
 
     is_type_constructor_app arg = case unLoc (ignoreParens arg) of
       HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm)) -> isTyConName nm
@@ -3990,7 +3996,7 @@ tcTermAppInType mode rn_ty exp_kind
 
     checkedClassMethod fun args@[_, _, receiver]
       | Just _ <- isClassOpId_maybe fun
-      , any isOpenTypeOperand args = do
+      , any (isOpenTypeOperand mode) args = do
           (_, kind) <- tc_infer_lhs_type mode receiver
           actual <- zonkTcTypeIfNeeded kind
           case splitTyConApp_maybe actual of
@@ -4012,8 +4018,8 @@ tcTermAppInType mode rn_ty exp_kind
                   ground <- lookupSourceContainerMethod fun domain
                   case ground of
                     Just checked -> pure (Just (checkTableMethod fun checked))
-                    Nothing | isOpenTypeOperand left
-                            , isOpenTypeOperand right || promotedReceiver receiver ->
+                    Nothing | isOpenTypeOperand mode left
+                            , isOpenTypeOperand mode right || promotedReceiver receiver ->
                       fmap (checkOpenMethod fun left receiver) <$> lookupSourceGroundDFun cls domain
                     Nothing -> pure Nothing
             Nothing -> pure Nothing
@@ -4160,19 +4166,55 @@ tc_app_ty_with_head mode rn_ty exp_kind fun_ty
 
 -- | Check named rigid operands and attempt pure symbolic reduction.
 -- See Note [Open source calls] in GHC.Tc.Gen.OpenTypeEval.
-tcTryOpenTypeCall :: TcTyMode -> Name -> Core.CoreExpr -> [(LHsType GhcRn, Kind)] -> Kind
-                  -> TcM (Either OpenTypeFailure Type)
-tcTryOpenTypeCall mode name instantiated args result_kind = do
+tcTryOpenTypeCall
+  :: TcTyMode -> Name -> Id
+  -> ([TyVar], [Kind], Kind, Core.CoreExpr -> Core.CoreExpr)
+  -> [LHsType GhcRn]
+  -> TcM (Either OpenTypeFailure (Type, Kind))
+tcTryOpenTypeCall mode name fun (tvs, domains, result_tpl, wrap) args = do
   local <- tcOpenTypeContext mode name
-  operands <- mapM (checkOperand local) args
-  tcObserveOpenTypeCall local False instantiated result_kind operands
-  where
-    checkOperand local (arg, kind) = setSrcSpanA (getLoc arg) $ do
-      let check = tc_check_lhs_type mode arg kind
-      checked <- if local then solveEqualities "tcTryOpenTypeCall operand" check else check
-      liftZonkM (zonkTcType checked)
+  (meta_tvs, res_k0, raw_ops) <- solveEqualities "tcTryOpenTypeCall" $ do
+    (subst, mvs) <- newMetaTyVars tvs
+    let exp_doms = map (Subst.substTy subst) domains
+    ops <- zipWithM (\arg kd -> setSrcSpanA (getLoc arg) (tc_check_lhs_type mode arg kd)) args exp_doms
+    pure (mvs, Subst.substTy subst result_tpl, ops)
+  ty_args0  <- liftZonkM (zonkTcTypes (mkTyVarTys meta_tvs))
+  res_k1    <- liftZonkM (zonkTcType res_k0)
+  operands1 <- liftZonkM (zonkTcTypes raw_ops)
+  let kind_Pool ts ops =
+        ts ++ map typeKind ops ++ [varType v | v <- tyCoVarsOfTypesList ops]
+      rep_metas =
+        [ mv | mv <- tyCoVarsOfTypesList (kind_Pool (res_k1 : ty_args0) operands1)
+             , isTcTyVar mv, isMetaTyVar mv, not (isTyVarTyVar mv) ]
+  forM_ rep_metas $ \mv -> do
+    cts <- readMetaTyVar mv
+    case cts of
+      Flexi | tyVarKind mv `tcEqType` runtimeRepTy ->
+        liftZonkM (writeMetaTyVar mv liftedRepTy)
+      _ -> pure ()
+  ty_args1  <- liftZonkM (zonkTcTypes ty_args0)
+  res_k2    <- liftZonkM (zonkTcType res_k1)
+  operands2 <- liftZonkM (zonkTcTypes operands1)
+  let def_metas =
+        [ mv | mv <- tyCoVarsOfTypesList (kind_Pool (res_k2 : ty_args1) operands2)
+             , isTcTyVar mv, isMetaTyVar mv, not (isTyVarTyVar mv) ]
+  forM_ def_metas $ \mv -> do
+    cts <- readMetaTyVar mv
+    case cts of
+      Flexi | tcIsLiftedTypeKind (tyVarKind mv) ->
+        liftZonkM (writeMetaTyVar mv liftedTypeKind)
+      _ -> pure ()
+  ty_args     <- liftZonkM (zonkTcTypes ty_args1)
+  result_kind <- liftZonkM (zonkTcType res_k2)
+  operands    <- liftZonkM (zonkTcTypes operands2)
+  if anyVarSet isMetaTyVar (tyCoVarsOfTypes (result_kind : ty_args))
+     || not (all (tcIsLiftedTypeKind . typeKind) ty_args)
+    then pure (Left InvalidInput)
+    else do
+      let applied = wrap (foldl' Core.App (Core.Var fun) (map Core.Type ty_args))
+      fmap (, result_kind) <$> tcObserveOpenTypeCall local False applied result_kind operands
 
--- | Find the erased telescope of a unary or binary indexed source call with ordinary arrows.
+-- | Find the erased telescope of an indexed source call with ordinary arrows.
 -- See Note [Known indexed operands in source calls].
 indexedOpenTypeFunction :: Id -> Maybe ([TyVar], [Kind], Kind)
 indexedOpenTypeFunction fun = do
@@ -4181,7 +4223,7 @@ indexedOpenTypeFunction fun = do
         domains = map scaledThing arrows
     tvs <- traverse namedPiTyBinder_maybe binders
     guard (all isTyVar tvs && any (not . isLiftedTypeKind . varType) tvs &&
-           (lengthIs domains 1 || lengthIs domains 2) &&
+           not (null domains) &&
            rho `tcEqType` foldr mkVisFunTyManyU result domains)
     guard (any indexed_domain domains)
     pure (tvs, domains, result)
@@ -4215,7 +4257,7 @@ tcIndexedOpenTypeCall mode fun (tvs, domains, result) args = do
         case observed of
           Left InvalidInput -> return Nothing
           Left (UnavailableDefinition owner MissingTemplate)
-            | owner == name, Just _ <- sourceTableId_maybe fun -> return Nothing
+            | not local || (owner == name && isJust (sourceTableId_maybe fun)) -> return Nothing
           Left reason -> reportOpenTypeFailure name reason
           Right ty -> return (Just (ty, kind))
 
@@ -4273,9 +4315,27 @@ reportOpenTypeFailure name reason =
   in failWithTc (TcRnOpenTypeEval name definition message)
 
 -- | Admit a rigid variable or a promoted constructor with symbolic fields.
-isOpenTypeOperand :: LHsType GhcRn -> Bool
-isOpenTypeOperand = isOpenTypeOperandWith (\(WithUserRdr _ name) -> isTyVarName name)
-                                          (\(WithUserRdr _ name) -> isDataConName name)
+isOpenTypeOperand :: TcTyMode -> LHsType GhcRn -> Bool
+isOpenTypeOperand mode =
+  isOpenTypeOperandWith
+    (\(WithUserRdr _ name) -> isTyVarName name || isJust (lookupNameEnv (mode_indices mode) name))
+    (\(WithUserRdr _ name) -> isDataConName name)
+
+isClosedConTypeOperand :: LHsType GhcRn -> Bool
+isClosedConTypeOperand ty = case unLoc (ignoreParens ty) of
+  HsKindSig _ operand _ -> isClosedConTypeOperand operand
+  HsExplicitTupleTy _ _ elems -> length elems /= 1 && all isClosedConTypeOperand elems
+  HsTupleTy _ _ elems -> length elems /= 1 && all isClosedConTypeOperand elems
+  HsExplicitListTy _ _ elems -> all isClosedConTypeOperand elems
+  HsOpTy _ lhs op rhs
+    | HsTyVar _ _ (L _ (WithUserRdr _ nm)) <- unLoc (ignoreParens op) ->
+        isDataConName nm && all isClosedConTypeOperand [lhs, rhs]
+    | otherwise -> False
+  _ -> case splitHsAppTys (unLoc (ignoreParens ty)) of
+    (L _ (HsTyVar _ _ (L _ (WithUserRdr _ nm))), args)
+      | isDataConName nm, Just fields <- hsValArgsOnly args ->
+          all isClosedConTypeOperand fields
+    _ -> False
 
 isHsArgPar :: HsArg p tm ty -> Bool
 isHsArgPar HsArgPar{} = True
@@ -6258,8 +6318,32 @@ replaceTypeTermIds env
     go (ExistsTy vis b r) = ExistsTy vis (setTyVarKind b (go (tyVarKind b))) (go r)
     go (DepDictTy b r)    = DepDictTy (updateIdTypeAndMult go b)
                               (replaceTypeTermIds (delVarEnv env b) r)
-    go (CastTy t co)      = CastTy (go t) co
+    go (ClassAppTy s a d x k) =
+      ClassAppTy (updateIdTypeAndMult go s) (go a) (go d) (go x) (go k)
+    go (CastTy t co)      = CastTy (go t) (go_co co)
+    go (CoercionTy co)    = CoercionTy (go_co co)
     go t                  = t
+
+    go_mco MRefl    = MRefl
+    go_mco (MCo co) = MCo (go_co co)
+
+    go_co co
+      | isEmptyVarSet (filterVarSet (`elemVarEnv` env) (tyCoVarsOfCo co)) = co
+    go_co (Refl ty)              = Refl (go ty)
+    go_co (GRefl r ty mco)       = GRefl r (go ty) (go_mco mco)
+    go_co (TyConAppCo r tc cos)  = TyConAppCo r tc (map go_co cos)
+    go_co (AppCo c1 c2)          = AppCo (go_co c1) (go_co c2)
+    go_co (SymCo c)              = SymCo (go_co c)
+    go_co (TransCo c1 c2)        = TransCo (go_co c1) (go_co c2)
+    go_co (SelCo sel c)          = SelCo sel (go_co c)
+    go_co (LRCo lr c)            = LRCo lr (go_co c)
+    go_co (InstCo c1 c2)         = InstCo (go_co c1) (go_co c2)
+    go_co (KindCo c)             = KindCo (go_co c)
+    go_co (SubCo c)              = SubCo (go_co c)
+    go_co (AxiomCo ax cos)       = AxiomCo ax (map go_co cos)
+    go_co (FunCo r af1 af2 ma w c1 c2) =
+      FunCo r af1 af2 (go_co ma) (go_co w) (go_co c1) (go_co c2)
+    go_co co                     = co
 
 -- | Per-module state for synthesized closed type families, synonyms, and
 -- retained function helpers, stored in 'tcg_th_state' and mirrored to
@@ -6755,6 +6839,10 @@ letUsedInCaseRn target = go
         mentions target scrut || any (\(ns, _, r) -> target `notElem` ns && mentions target r) rows
       XHsType (HsTypeLetRn _ (L _ b) r body) ->
         go r || (target /= b && (go body || (mentions target r && letUsedInCaseRn b body)))
+      XHsType (HsTypeLambdaQuoteRn vs body) ->
+        target `notElem` mapMaybe hsLTyVarName vs && go body
+      XHsType (HsTypeLambdaCheckRn vs body helper) ->
+        (target `notElem` mapMaybe hsLTyVarName vs && go body) || go helper
       HsParTy _ t            -> go t
       HsKindSig _ t k        -> go t || go k
       HsAppTy _ f a          -> go f || go a
@@ -6878,10 +6966,9 @@ lookupDeclHeaderTyVars (SynthTySyn syn_nm) = do
           , Just (ATyCon tc) <- lookupTypeEnv (tcg_type_env gbl) syn_nm
           -> Just tc
         _ -> Nothing
-      lcl_by_occ = mkOccEnv [(nameOccName nm, lcl_tv) | ATyVar nm lcl_tv <- nonDetNameEnvElts lcl]
       resolve_lcl tv = case lookupNameEnv lcl (getName tv) of
         Just (ATyVar _ lcl_tv) -> Just lcl_tv
-        _                      -> lookupOccEnv lcl_by_occ (nameOccName (getName tv))
+        _                      -> Nothing
   case mb_tc of
     Just poly_tc ->
       let bndrs = tyConBinders poly_tc
@@ -7020,7 +7107,9 @@ tcSomeTypeInHsType mode rn_ty sigma_nm dom_hs lam_loc bndr body_hs exp_kind = do
               pure (mkTyConApp syn_tc cap_args)
             Nothing -> pure sigma_app
           case site of
-            SynthExprT2T -> pure ()
+            SynthExprT2T ->
+              setXOptM LangExt.UndecidableInstances $
+                checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
             SynthLocalSig{} ->
               setXOptM LangExt.UndecidableInstances $
                 checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
@@ -7385,7 +7474,10 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
           tcbs     = mkDependentTyConBinders p_invis p_vis mid_out z_tvs res_k'
           leaked   = filterOut (`elemVarSet` mkVarSet qtvs) $
                        tyCoVarsOfTypesList (res_k' : rhs_ty' : map tyVarKind qtvs)
-      unless (null leaked) $ failWithTc TcRnTypeLambdaContext
+      unless (null leaked
+              && tcIsLiftedTypeKind (typeKind res_k')
+              && all (tcIsLiftedTypeKind . typeKind . tyVarKind) qtvs) $
+        failWithTc TcRnTypeLambdaContext
       ax_name <- newImplicitBinder fam_name mkInstTyCoOcc
       let branch = mkCoAxBranch qtvs [] [] (mkTyVarTys qtvs) rhs_ty' (map (const Nominal) qtvs) lam_loc
           proof_rules = [(0, proof_deps) | not (null proof_deps)]
@@ -7394,9 +7486,10 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
                      (ClosedTypeFamilyTyCon (CTF_Scoped root_fam False axiom)) Nothing NotInjective
           axiom  = (mkBranchedCoAxiom Nominal ax_name fam_tc [branch])
                      { co_ax_source_proof_rules = proof_rules }
-      _ <- registerSynthTyCon fam_tc
       case site of
-        SynthExprT2T -> pure ()
+        SynthExprT2T ->
+          setXOptM LangExt.UndecidableInstances $
+            checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
         SynthLocalSig{} ->
           setXOptM LangExt.UndecidableInstances $
             checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
@@ -7405,6 +7498,7 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
           runOrDeferSynthCheck $
             (if undec then setXOptM LangExt.UndecidableInstances else id) $
               checkSynthFamValidity fam_tc qtvs (mkTyVarTys qtvs) rhs_ty' lam_loc Nothing
+      _ <- registerSynthTyCon fam_tc
       finish_lambda_app site wrap_syn_mb fam_tc p_invis p_vis (map res_rec cap_args0)
 
     check_lambda_case_rows solve_row body_mode fam_name mid_skols0 z_skols0 dom_kinds0 scrut_col scrut_nm res_kind0 rows = do
@@ -7472,9 +7566,13 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
           fam_kind  = mkTyConKindWithMatchability unmatchableDataConTy tcbs res_k'
           abs_col   = length p_invis + length p_vis + length mid_tvs + scrut_col
           cap_vs    = map fst p_invis ++ p_vis
+          all_tcbs  = cap_vs ++ mid_tvs ++ z_tvs
           pre_z_vs  = take scrut_col z_tvs
           suf_z_vs  = drop (scrut_col + 1) z_tvs
           orig_bound_set = mkVarSet ([tv | TyVarTy tv <- cap_args0] ++ map fst mid_invis ++ z_skols)
+      unless (tcIsLiftedTypeKind (typeKind res_k')
+              && all (tcIsLiftedTypeKind . typeKind . tyVarKind) all_tcbs) $
+        failWithTc TcRnTypeLambdaContext
       built_rows <- forM checked_rows $ \(rloc, pat_hs, _, row_mid_tys0, row_z_tys0, pat_ty0, rhs_ty0, deps) -> do
         let pat_fvs = scopedSort $
                         filterOut (\v -> isId v || v `elemVarSet` orig_bound_set) $
@@ -7490,7 +7588,9 @@ tcHsTypeLambda mb_pre_syn mode src binders0 body0 exp_kind = do
                        | (tv, sk) <- zip suf_z_vs (drop (scrut_col + 1) row_z_tys0) ]
             lhs_tys  = mkTyVarTys cap_vs ++ mid_tys' ++ pre_tys ++ [pat_ty'] ++ suf_tys
             qtvs     = scopedSort (tyCoVarsOfTypesList (rhs_ty' : lhs_tys))
-            vi       = VI { vi_loc = rloc
+        unless (all (\v -> isTyVar v && tcIsLiftedTypeKind (typeKind (tyVarKind v))) qtvs) $
+          failWithTc TcRnTypeCaseContext
+        let vi       = VI { vi_loc = rloc
                           , vi_qtvs = qtvs
                           , vi_non_user_tvs = emptyVarSet
                           , vi_pats = lhs_tys
@@ -7555,8 +7655,8 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
         case_loc <- getSrcSpanM
         (wrap_syn_mb, owner_for_nodes, fam_name, is_scoped_sig) <- alloc_case_names in_kc site case_loc
         res_k0 <- expTypeToType exp_kind >>= liftZonkM . zonkTcType
-        fam_envs <- tcGetFamInstEnvs
-        let Reduction _ scrut_k_norm = normaliseType fam_envs Nominal scrut_k
+        norm_loc <- getCtLocM AnnOrigin Nothing
+        Reduction _ scrut_k_norm <- tcRewriteFamilyAxioms norm_loc scrut_k
         (pat_scrut_k0, fam_abs_pairs0) <- abstract_scrut_fam_apps fam_name scrut_k_norm
         raw_fields <- xoptM LangExt.DependentTypes
         pat_mode   <- mkHoleMode TypeLevel (HM_FamPat raw_fields)
@@ -7612,7 +7712,9 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
                                                           , isTcTyVar v, isMetaTyVar v, not (v `elemVarSet` sig_fvs) ] ]
                 raw_fvs = filterOut (\v -> v `elemVarSet` pat_tv_set || v `elemVarSet` abs_tv_set) $
                             tyCoVarsOfTypesList (pat_scrut_k : res_k : map snd fam_abs_pairs ++ row_tys)
-            when (any isCoVar raw_fvs) $ failWithTc TcRnTypeCaseContext
+                disallows_ids = case site of { SynthTySyn{} -> True; _ -> False }
+            when (any isCoVar raw_fvs || (disallows_ids && any isId raw_fvs)) $
+              failWithTc TcRnTypeCaseContext
             mb_hdr <- lookupDeclHeaderTyVars site
             let mb_hdr' = case mb_hdr of
                   Just (invis_h, vis_h) | not (isEmptyVarEnv let_fam_env) ->
@@ -7646,6 +7748,9 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
                 abs_col  = length fam_invis + length p_vis
                 cap_tvs        = map fst fam_invis ++ p_vis
                 orig_bound_set = mkVarSet ([tv | TyVarTy tv <- cap_args0] ++ map fst fam_abs_pairs)
+            unless (tcIsLiftedTypeKind (typeKind res_k_sub)
+                    && all (tcIsLiftedTypeKind . typeKind . tyVarKind) (cap_tvs ++ [scrut_tv])) $
+              failWithTc TcRnTypeCaseContext
             built_rows <- forM checked_rows $ \(rloc, pat_hs, pat_tvs', pat_ty0, rhs_ty0, deps) -> do
               let user_pat_set = mkVarSet pat_tvs'
                   pat_vs = scopedSort $
@@ -7663,7 +7768,9 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
                   lhs_tys = mkTyVarTys cap_tvs ++ [pat_ty']
                   qtvs    = scopedSort (tyCoVarsOfTypesList (rhs_ty' : lhs_tys))
                   non_usr = mkVarSet [tv' | (tv, tv') <- pat_pairs, not (tv `elemVarSet` user_pat_set)]
-                  vi      = VI { vi_loc = rloc
+              unless (all (\v -> isTyVar v && tcIsLiftedTypeKind (typeKind (tyVarKind v))) qtvs) $
+                failWithTc TcRnTypeCaseContext
+              let vi      = VI { vi_loc = rloc
                                , vi_qtvs = qtvs
                                , vi_non_user_tvs = non_usr
                                , vi_pats = lhs_tys
@@ -7678,10 +7785,9 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
                   | otherwise = Nothing
             fam_tc <- finalizeCaseFamily fam_name fam_kind tcbs res_k_sub mb_scope built_rows
             _ <- registerSynthTyCon fam_tc
-            let exp_let_ty ty
-                  | Just tv <- getTyVar_maybe ty
-                  , Just lt <- lookupVarEnv let_fam_env tv = lt
-                  | otherwise = ty
+            let exp_let_ty
+                  | null let_fam_pairs = id
+                  | otherwise = Subst.substTyWith (map fst let_fam_pairs) (map snd let_fam_pairs)
                 cap_args_resolved = [res_rec (exp_let_ty a) | a <- cap_args0]
                 (invis_cap_args, vis_cap_args) = splitAt (length p_invis) cap_args_resolved
                 abs_call_args = [ res_rec (Subst.substTyWith (map fst let_fam_pairs) (map snd let_fam_pairs) fapp)
@@ -7800,14 +7906,16 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
     lookup_shared_sig_case (SynthTopSig val_nm) scrut_ty rws = do
       st <- getSynthTypeState
       lcl <- getLclTypeEnv
-      let active_tvs = scopedSort [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
+      let has_type_let = any (\case { ATcTypeLet{} -> True; _ -> False }) (nonDetNameEnvElts lcl)
+          active_tvs = scopedSort [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
           entries    = fromMaybe [] (lookupNameEnv (sts_sig_cases st) val_nm)
           same_rows r1 r2 = length r1 == length r2 && and (zipWith same_row r1 r2)
           same_row (ns1, p1, b1) (ns2, p2, b2) =
             length ns1 == length ns2 && showSDocUnsafe (ppr p1) == showSDocUnsafe (ppr p2)
             && showSDocUnsafe (ppr b1) == showSDocUnsafe (ppr b2)
       case [ (syn_tc, scrut_ty)
-           | (uf, tvs, s_ty, old_rws, syn_tc) <- entries
+           | not has_type_let
+           , (uf, tvs, s_ty, old_rws, syn_tc) <- entries
            , uf == mode_under_forall mode
            , tvs == active_tvs
            , s_ty `tcEqType` scrut_ty
@@ -7820,13 +7928,15 @@ tcHsTypeCase mode src scrut_hs rows exp_kind = do
     record_shared_sig_case (SynthTopSig val_nm) scrut_ty rws syn_tc [_] = do
       cur_mod <- tcg_mod <$> getGblEnv
       lcl <- getLclTypeEnv
-      let active_tvs = scopedSort [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
+      let has_type_let = any (\case { ATcTypeLet{} -> True; _ -> False }) (nonDetNameEnvElts lcl)
+          active_tvs = scopedSort [tv | ATyVar _ tv <- nonDetNameEnvElts lcl]
           entry = (mode_under_forall mode, active_tvs, scrut_ty, rws, syn_tc)
-      modifySynthTypeState cur_mod
-        (\st ->
-           let prev = fromMaybe [] (lookupNameEnv (sts_sig_cases st) val_nm)
-           in (st { sts_sig_cases = extendNameEnv (sts_sig_cases st) val_nm (entry : prev) }, ()))
-        ()
+      unless has_type_let $
+        modifySynthTypeState cur_mod
+          (\st ->
+             let prev = fromMaybe [] (lookupNameEnv (sts_sig_cases st) val_nm)
+             in (st { sts_sig_cases = extendNameEnv (sts_sig_cases st) val_nm (entry : prev) }, ()))
+          ()
     record_shared_sig_case _ _ _ _ _ = pure ()
 
     alloc_case_names in_kc site loc = do
@@ -7911,16 +8021,20 @@ finalizeCaseFamily fam_name fam_kind tcbs res_kind mb_scope built_rows = do
       pure fam_tc
     else do
       in_decl <- isInDeclKnotM
-      let run_ord_val =
-            setErrCtxt [] $
-              addErrCtxt (TyConInstCtxt fam_name flav) $
-                addErrCtxt (ClosedFamEqnCtxt fam_tc) $
-                  mapM_ (checkTyFamEqnValidityInfo fam_tc) infos
-      if in_decl then deferSynthCheck run_ord_val else checkNoErrs run_ord_val
       (ord_ax0, node_tcs) <- compileOrderedSynthCase fam_tc infos
       let ord_ax = ord_ax0 { co_ax_source_proof_rules = proof_rules }
           ord_tc = mkFamilyTyCon fam_name fam_kind tcbs 0 res_kind Nothing
                      (ClosedTypeFamilyTyCon (mk_ctf mb_scope (Just ord_ax))) Nothing NotInjective
+          run_ord_val =
+            setErrCtxt [] $
+              addErrCtxt (TyConInstCtxt fam_name flav) $
+                addErrCtxt (ClosedFamEqnCtxt ord_tc) $ do
+                  mapM_ (checkTyFamEqnValidityInfo fam_tc) infos
+                  setXOptM LangExt.UndecidableInstances $ do
+                    checkValidCoAxiom emptyNameEnv ord_ax
+                    forM_ node_tcs $ \ntc ->
+                      forM_ (closedFamilyTyConCoAxiom_maybe ntc) (checkValidCoAxiom emptyNameEnv)
+      if in_decl then deferSynthCheck run_ord_val else checkNoErrs run_ord_val
       mapM_ registerSynthTyCon node_tcs
       pure ord_tc
 
@@ -7936,7 +8050,8 @@ synthNeedsOrderedCase root infos
 
     has_expanded vi@VI { vi_case_pattern = Just (_, _, pat, ty) }
       | may_expand ty = do
-          checkNoErrs (checkTyFamEqnValidityInfo root vi)
+          in_decl <- isInDeclKnotM
+          unless in_decl $ checkNoErrs (checkTyFamEqnValidityInfo root vi)
           checked <- synthCheckedPattern [] pat ty
           pure $ case checked of
             SynthCaseConstructor _ _ _ fields -> any is_ctor fields

@@ -33,14 +33,18 @@ import GHC.Types.Var.Env (emptyInScopeSet, mkRnEnv2)
 import GHC.Types.Var.Set
 import GHC.Types.Name (Name, nameModule_maybe, nameOccName, stableNameCmp)
 import GHC.Types.Name.Occurrence (mkTcOcc, occNameString, sourceTableTermOcc)
+import GHC.Types.Unique (getKey, getUnique)
 import GHC.Types.Unique.FM (UniqFM, addToUFM)
 
 import GHC.Utils.Encoding (zEncodeString)
 import GHC.Utils.Misc (equalLength, lengthIs, snocView)
 
 import Control.Monad (guard, zipWithM, zipWithM_)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.State.Strict (evalStateT, get, modify')
 import Data.Char (isDigit)
 import Data.List (isPrefixOf, sortBy, stripPrefix)
+import qualified Data.Set as Set
 
 -- | Resolve the stable names written to the interface by CoreToIface.
 builtInCoAxiomRules :: UniqFM FastString CoAxiomRule
@@ -270,7 +274,7 @@ eqScopedCaseTrees lhs rhs
   , isSignatureCase tc1 == isSignatureCase tc2
   , as1 `lengthIs` tyConArity tc1, as2 `lengthIs` tyConArity tc2
   , as1 `eqTypes` as2
-  , Just () <- same_node left right [] tc1 tc2
+  , Just () <- evalStateT (same_node left right [] tc1 tc2) Set.empty
   = True
   | otherwise = False
   where
@@ -283,23 +287,29 @@ eqScopedCaseTrees lhs rhs
       pure (tc, args)
 
     same_node left right seen tc1 tc2 = do
-      guard (not (any (\(a, b) -> a == tc1 || b == tc2) seen))
-      guard (tyConKind tc1 `eqType` tyConKind tc2)
-      rows1 <- checkedCaseRows tc1
-      rows2 <- checkedCaseRows tc2
-      guard (equalLength rows1 rows2)
-      let has_same_rhs env a b =
-            case (owned_rhs left a, owned_rhs right b) of
-              (Just (child1, args1), Just (child2, args2)) -> do
-                guard (equalLength args1 args2 && and (zipWith (eqTypeX env) args1 args2))
-                same_node left right ((tc1, tc2) : seen) child1 child2
-              (Nothing, Nothing) -> guard (eqTypeX env a b)
-              _ -> Nothing
-          same_row (test1, vars1, a) (test2, vars2, b) = do
-            guard (test1 == test2)
-            env <- eqVarBndrs (mkRnEnv2 emptyInScopeSet) vars1 vars2
-            has_same_rhs env a b
-      zipWithM_ same_row rows1 rows2
+      lift $ guard (not (any (\(a, b) -> a == tc1 || b == tc2) seen))
+      let key = (getKey (getUnique tc1), getKey (getUnique tc2))
+      verified <- get
+      if Set.member key verified
+        then pure ()
+        else do
+          lift $ guard (tyConKind tc1 `eqType` tyConKind tc2)
+          rows1 <- lift $ checkedCaseRows tc1
+          rows2 <- lift $ checkedCaseRows tc2
+          lift $ guard (equalLength rows1 rows2)
+          let has_same_rhs env a b =
+                case (owned_rhs left a, owned_rhs right b) of
+                  (Just (child1, args1), Just (child2, args2)) -> do
+                    lift $ guard (equalLength args1 args2 && and (zipWith (eqTypeX env) args1 args2))
+                    same_node left right ((tc1, tc2) : seen) child1 child2
+                  (Nothing, Nothing) -> lift $ guard (eqTypeX env a b)
+                  _ -> lift Nothing
+              same_row (test1, vars1, a) (test2, vars2, b) = do
+                lift $ guard (test1 == test2)
+                env <- lift $ eqVarBndrs (mkRnEnv2 emptyInScopeSet) vars1 vars2
+                has_same_rhs env a b
+          zipWithM_ same_row rows1 rows2
+          modify' (Set.insert key)
 
 -- | Recheck that a generated node is an exhaustive constructor test or a leaf.
 checkedCaseRows :: TyCon -> Maybe [(Maybe (Int, DataCon), [TyVar], Type)]

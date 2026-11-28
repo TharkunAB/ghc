@@ -747,7 +747,8 @@ rewrite_arg_at_role Representational ty
 rewrite_arg_at_role Phantom ty
   -- See Note [Phantoms in the rewriter]
   = do { ty' <- liftTcS $ zonkTcType ty
-       ; return $! mkReflRedn Phantom ty' }
+       ; lc <- getRewriteEnvField re_native_lifting
+       ; return $! mkReflRedn Phantom (lcSubstLeftRefl lc ty') }
 
 {-# INLINE rewrite_args_slow #-}
 -- | Slow path, compared to rewrite_args_fast, because this one must track
@@ -889,12 +890,23 @@ rewrite_one ty
       = rewriteExactFamAppWithOrigins origins family args
       | otherwise = rewrite_one expanded
 
--- A dictionary index has no checked rewrite or congruence rule. Only
--- reflexivity in the equality checker can discharge an obligation on it.
+-- Dictionary and class-method index nodes have no checked rewrite rule; keep
+-- them reflexive under the active native lifting context so constraints
+-- mentioning them do not abort the solver.
 rewrite_one ty@ClassAppTy{}
-  = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
+  = do { ty' <- liftTcS $ zonkTcType ty
+       ; role <- getRole
+       ; lc <- getRewriteEnvField re_native_lifting
+       ; case lcOpaqueTypeRefl_maybe lc ty' of
+           Just left -> return $! mkReflRedn role left
+           Nothing   -> liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty') }
 rewrite_one ty@DepDictTy{}
-  = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
+  = do { ty' <- liftTcS $ zonkTcType ty
+       ; role <- getRole
+       ; lc <- getRewriteEnvField re_native_lifting
+       ; case lcOpaqueTypeRefl_maybe lc ty' of
+           Just left -> return $! mkReflRedn role left
+           Nothing   -> liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty') }
 
 -- Nominal argument evidence gives forward congruence under the same head,
 -- or unfolds a checked local function definition from re_source_lets.
@@ -949,12 +961,30 @@ rewrite_one ty@(DepFunTy vis b body)
   | otherwise
   = liftTcS $ failTcS $ TcRnRetainedQuantificationError (RetainedSolverType ty)
 
--- Keep the checked package opaque. Rewriting its payload would require
--- existential coercion evidence. Its outer kind is already Type.
+-- Lift payload rewriting and enclosing runtime-binder domain rewrites under
+-- an erased existential via existsCoRule.
 rewrite_one ty@ExistsTy{}
   = do { ty' <- liftTcS $ zonkTcType ty
        ; role <- getRole
-       ; return $! mkReflRedn role ty' }
+       ; lc <- getRewriteEnvField re_native_lifting
+       ; case ty' of
+           ExistsTy flag tv body
+             | role /= Phantom
+             , isTyVar tv
+             , typeKind (varType tv) `eqType` liftedTypeKind
+             , typeKind body `eqType` liftedTypeKind
+             -> do { let in_scope = lcInScopeSet lc `extendInScopeSetSet` tyCoVarsOfType ty'
+                         tv1 = uniqAway in_scope tv
+                         body1 | tv1 == tv = body
+                               | otherwise = substTyWith [tv] [mkTyVarTy tv1] body
+                   ; Reduction scoped_co _ <- rewrite_one (existsCoScope tv1 body1)
+                   ; if isReflCo scoped_co
+                     then return $! mkReflRedn role (lcSubstLeftRefl lc ty')
+                     else if typeKind (coercionRKind scoped_co) `eqType` liftedTypeKind
+                          then let co = mkExistsCo flag role scoped_co
+                               in return $! mkReduction co (coercionRKind co)
+                          else return $! mkReflRedn role (lcSubstLeftRefl lc ty') }
+           _ -> return $! mkReflRedn role (lcSubstLeftRefl lc ty') }
 
 rewrite_one xi@(LitTy {})
   = do { role <- getRole
@@ -2466,7 +2496,7 @@ runTcPluginRewriters rewriteEnv rewriterFunctions tys
     = return Nothing
   runRewriters givens (rewriter:rewriters)
     = do
-        rewriteResult <- wrapTcS . runTcPluginM $ rewriter rewriteEnv givens tys
+        rewriteResult <- runTcPluginTcS $ rewriter rewriteEnv givens tys
         case rewriteResult of
            TcPluginRewriteTo
              { tcPluginReduction    = redn

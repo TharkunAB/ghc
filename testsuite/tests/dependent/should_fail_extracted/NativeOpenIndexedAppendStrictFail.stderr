@@ -1,7 +1,6 @@
-NativeOpenIndexedAppendStrictFail.hs:11:11: error: [GHC-70566]
-    • Cannot reduce the open call to ‘P.appendStrictNil’ in a type.
-        While reading the definition of ‘P.appendStrictNil’.
-        The interface for a referenced definition contains no usable Core unfolding. Use an interface that exposes the unfolding or provides a checked equation for this call.
+NativeOpenIndexedAppendStrictFail.hs:11:37: error: [GHC-70565]
+    • Cannot evaluate ‘P.appendStrictNil’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
     • In the first argument of ‘(:~:)’, namely
         ‘P.appendStrictNil 'P.VNil xs’
       In the type signature:

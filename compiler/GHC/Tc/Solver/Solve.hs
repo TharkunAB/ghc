@@ -37,6 +37,7 @@ import GHC.Core.Type ( splitForAllForAllTyBinders, substTyWith )
 import GHC.Core.Predicate
 import GHC.Core.Reduction
 import GHC.Core.Coercion
+import GHC.Core.TyCo.FVs ( addUnivCoDep, emptyUnivCoDeps, univCoDepsHoles )
 import GHC.Core.Class( classHasSCs )
 
 import GHC.Types.Id( idType, isDFunId )
@@ -2092,13 +2093,15 @@ runTcPluginsWanted wanted
 setPluginEv :: (EvTerm,Ct) -> TcS ()
 setPluginEv (tm,ct)
   = case ctEvidence ct of
-      CtWanted (WantedCt { ctev_dest = dest })
+      CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rewriters })
         -> case dest of
               EvVarDest {} -> setWantedDict dest EvCanonical tm
                               -- TODO: plugins should be able to signal non-canonicity
-              HoleDest {}  -> setWantedEq dest (CPH { cph_co = evTermCoercion tm
-                                                    , cph_holes = emptyCoHoleSet })
-                              -- TODO: cph_holes: should we try to track rewriters?
+              HoleDest {}  ->
+                let co    = evTermCoercion tm
+                    holes = foldl' addRewriter rewriters
+                                   (univCoDepsHoles (addUnivCoDep emptyUnivCoDeps co))
+                in setWantedEq dest (CPH { cph_co = co, cph_holes = holes })
 
       CtGiven {} -> panic "runTcPluginsWanted.setEv: attempt to solve non-wanted!"
 

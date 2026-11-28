@@ -69,7 +69,7 @@ import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy (tidyCbvInfoTop)
 import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.FVs (tyCoVarsOfTypeList, tyConsOfTypes)
-import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, FunTy, TyVarTy, TermVarTy, DepFunTy, ForAllTy, CastTy))
+import GHC.Core.TyCo.Rep (Coercion, Type(TyConApp, FunTy, TyVarTy, TermVarTy, DepFunTy, DepDictTy, ForAllTy, ExistsTy, CastTy))
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Unify (alwaysBindTv, tcMatchTys, tcUnifyTys)
@@ -110,12 +110,12 @@ import GHC.Tc.Utils.Monad
   , readTcRef, recordHomeRuleDependencies, setSrcSpan, setSrcSpanA, updTcRef, xoptM )
 import GHC.Tc.Utils.TcType (isMetaTyVar, isTyFamFree)
 import GHC.Tc.Zonk.TcType (zonkTcType, zonkTcTypes)
-import GHC.Tc.Zonk.Type (zonkTopDecls)
+import GHC.Tc.Zonk.Type (withReadOnlyFinalZonk, zonkTopDecls)
 import GHC.Types.Avail (availsToNameSet)
 import GHC.Types.Basic (LeftOrRight(..), Origin(..), SourceTableOrigin(..), UnfoldingSource(VanillaSrc), isMarkedCbv, pickLR)
 import GHC.Types.Error (errorsFound)
 import GHC.Types.Id
-  ( globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo, idInlineActivation, idInlinePragma, idName
+  ( globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo, idInlineActivation, idInlinePragma, idMult, idName
   , idUnfolding, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isJoinId, mkSysLocal, mkSysLocalM
   , mkVanillaGlobal, realIdUnfolding, setIdExported, setIdInfo, setIdType, setSourceMethodIds
   , sourceLiteralCons_maybe, sourceMethodAliases, sourceMethodDFunClass, sourceMethodTarget_maybe, sourceTableId_maybe )
@@ -142,7 +142,7 @@ import GHC.Types.Unique.Set (elementOfUniqSet, mkUniqSet, nonDetEltsUniqSet, siz
 import GHC.Types.Unique.Supply (UniqSupply)
 import GHC.Types.Var (CoVar, Id, VarBndr(..), idDetails, isCoVar, isId, mkTyVar, setIdDetails, varName)
 import GHC.Types.Var.Env (InScopeSet, extendInScopeSet, mkInScopeSet, uniqAway)
-import GHC.Types.Var.Set (elemVarSet, mkVarSet)
+import GHC.Types.Var.Set (TyCoVarSet, delVarSet, elemVarSet, emptyVarSet, intersectVarSet, isEmptyVarSet, mkVarSet)
 import GHC.Unit.External (eps_rule_base)
 import GHC.Unit.Home (homeUnitId)
 import GHC.Unit.Home.Graph (lookupHugByModule)
@@ -1826,6 +1826,7 @@ ordinaryDataType :: Type -> Maybe (TyCon, [Type])
 ordinaryDataType ty
   | Just (tc, args) <- caseDatatype ty, null (tyConStupidTheta tc)
   , all (tcIsLiftedTypeKind . tyVarKind) (tyConTyVars tc), all ordinaryField args
+  , strictlyPositiveSourceField (unitNameSet (tyConName tc)) emptyVarSet ty
   , let cons = tyConDataCons tc
   , (null args && isEnumerationTyCon tc) || all (ordinaryCon args) cons = Just (tc, args)
   | otherwise = Nothing
@@ -1852,8 +1853,11 @@ polySourceTypeWith seen allowed_tvs ty
   , all (polySourceArgTypeWith seen allowed_tvs) args =
       tyConName tc `elemNameSet` seen || (null args && isEnumerationTyCon tc) ||
       let seen' = extendNameSet seen (tyConName tc); formal = mkTyVarTys tc_tvs
-      in all (\con -> isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con &&
-                      maybe False (all (polySourceArgTypeWith seen' tc_tvs)) (openDataConFieldTypes con formal))
+      in strictlyPositiveSourceField seen' emptyVarSet (mkTyConApp tc formal) &&
+         all (\con -> isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con &&
+                      maybe False (all (\f -> strictlyPositiveSourceField seen' emptyVarSet f &&
+                                              polySourceArgTypeWith seen' tc_tvs f))
+                            (openDataConFieldTypes con formal))
              (tyConDataCons tc)
   | otherwise = False
 
@@ -1862,9 +1866,57 @@ polySourceArgType = polySourceArgTypeWith emptyNameSet
 
 polySourceArgTypeWith :: NameSet -> [TyVar] -> Type -> Bool
 polySourceArgTypeWith seen allowed_tvs ty =
-    polySourceTypeWith seen allowed_tvs ty ||
+    (strictlyPositiveSourceField seen emptyVarSet ty && polySourceTypeWith seen allowed_tvs ty) ||
     (tcIsLiftedTypeKind (typeKind ty) && isTyFamFree ty && isTauTy ty &&
+     strictlyPositiveSourceField seen emptyVarSet ty &&
      all (\tv -> tv `elem` allowed_tvs && tcIsLiftedTypeKind (tyVarKind tv)) (tyCoVarsOfTypeList ty))
+
+-- | Hereditary strict positivity check for datatypes scrutinized by certified
+-- source equations. Rejects negative recursive occurrences such as
+-- @data Loop = MkLoop (Loop -> Nat)@ or indirect contravariant containers
+-- @data Contra a = MkContra (a -> Nat); data Ind = MkInd (Contra Ind)@.
+strictlyPositiveSourceField :: NameSet -> TyCoVarSet -> Type -> Bool
+strictlyPositiveSourceField rec_tcs pos_tvs ty0
+  | Just ty' <- coreView ty0 = strictlyPositiveSourceField rec_tcs pos_tvs ty'
+  | no_target ty0 = True
+  | otherwise = case ty0 of
+      TyVarTy _ -> True
+      FunTy _ _ _ a b ->
+        no_target a && strictlyPositiveSourceField rec_tcs pos_tvs b
+      DepFunTy _ b body ->
+        no_target (varType b) && no_target (idMult b) &&
+        strictlyPositiveSourceField rec_tcs pos_tvs body
+      DepDictTy d body ->
+        no_target (varType d) &&
+        strictlyPositiveSourceField rec_tcs pos_tvs body
+      ForAllTy _ b body ->
+        no_target (binderType b) &&
+        strictlyPositiveSourceField rec_tcs (delVarSet pos_tvs (binderVar b)) body
+      ExistsTy _ b body ->
+        no_target (varType b) &&
+        strictlyPositiveSourceField rec_tcs (delVarSet pos_tvs b) body
+      CastTy t _ -> strictlyPositiveSourceField rec_tcs pos_tvs t
+      TyConApp tc args
+        | isAlgTyCon tc, isBoxedDataTyCon tc, not (isAbstractTyCon tc), null (tyConStupidTheta tc)
+        , let tc_tvs = tyConTyVars tc
+        , equalLength args tc_tvs
+        , all (\con -> isVanillaDataCon con && dataConUserTyVars con == dataConUnivTyVars con)
+              (tyConDataCons tc)
+        -> if tyConName tc `elemNameSet` rec_tcs
+             then all no_target args || eqTypes args (mkTyVarTys tc_tvs)
+             else all (strictlyPositiveSourceField rec_tcs pos_tvs) args &&
+                  let active_tvs = mkVarSet [ tv | (tv, arg) <- zip tc_tvs args, not (no_target arg) ]
+                      rec_tcs'   = extendNameSet rec_tcs (tyConName tc)
+                      formal     = mkTyVarTys tc_tvs
+                  in isEmptyVarSet active_tvs ||
+                     all (\con -> maybe False
+                                    (all (strictlyPositiveSourceField rec_tcs' active_tvs))
+                                    (openDataConFieldTypes con formal))
+                         (tyConDataCons tc)
+      _ -> False
+  where
+    no_target t = isEmptyVarSet (tyCoVarsOfType t `intersectVarSet` pos_tvs)
+               && not (any ((`elemNameSet` rec_tcs) . tyConName) (nonDetEltsUniqSet (tyConsOfType t)))
 
 isPairPermutationType :: Type -> Bool
 isPairPermutationType ty = isJust $ do
@@ -4270,7 +4322,7 @@ sourceTableTyCons local final_exports binds = do
             ty <- liftZonkM (zonkTcType (varType fun))
             if any isMetaTyVar (tyCoVarsOfTypeList ty) then pure Nothing else do
               zonked_bind <- if final_exports then pure bind else do
-                (_, _, [zb], _, _, _, _) <- zonkTopDecls emptyBag [bind] [] [] [] []
+                (_, _, [zb], _, _, _, _) <- withReadOnlyFinalZonk $ zonkTopDecls emptyBag [bind] [] [] [] []
                 pure zb
               let owner = setIdType fun ty
               mb_rhs <- bindingCore zonked_bind owner
@@ -4405,11 +4457,11 @@ sourceCaseTables nominal_owners binds = do
                                              gopt Opt_WriteSourceEquations dflags && not (gopt Opt_Hpc dflags))
       can_struct = generates_code || no_code_structural
       exported = availsToNameSet (tcg_exports env); ruled = sourceRuleOwners (tcg_rules env)
-      enum_enabled = not char_tables; imported = ordinaryImport rdr_env
+      imported = ordinaryImport rdr_env
       public = publicCaseType env exported imported
       eligible_case owner
         | Just kinds <- monomorphicEnumCaseKinds (varType owner) =
-            enum_enabled && all (maybe False (public . fst) . caseDatatype) kinds
+            all (maybe False (public . fst) . caseDatatype) kinds
         | Just (con, _) <- monomorphicRetainedWitnessType (varType owner) = public (dataConTyCon con)
         | Just sig@(ConstructorCaseType _ tc _ domains pos _) <- constructorCaseType (varType owner)
         , not (isBinaryListCase sig || isTwoStructuralCase sig || isSizeListCase sig) =

@@ -10,9 +10,9 @@ NativeOpenInstalledDropWhileWalkFail.hs:12:39: error: [GHC-70565]
     • In the type ‘BW.strictSuffix p xs’
       In the type synonym declaration for ‘BadSuffix’
 
-NativeOpenInstalledDropWhileWalkFail.hs:15:35: error: [GHC-70565]
-    • Cannot evaluate ‘BW.ruledWalk’ in a type.
-        This argument is a type variable. Closed evaluation requires a known value.
+NativeOpenInstalledDropWhileWalkFail.hs:15:22: error: [GHC-70566]
+    • Cannot reduce the open call to ‘BW.ruledWalk’ in a type.
+        Reduction stopped at a case on the rigid argument xs. A checked equation can retain this case until the argument's constructor is known.
     • In the type ‘BW.ruledWalk p xs’
       In the type synonym declaration for ‘BadRuled’
 

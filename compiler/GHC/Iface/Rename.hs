@@ -46,6 +46,7 @@ import qualified Data.Traversable as T
 
 import Data.IORef
 import Data.Function ((&))
+import Data.List (isPrefixOf)
 
 tcRnMsgMaybe :: IO (Either (Messages TcRnMessage) a) -> TcM a
 tcRnMsgMaybe do_this = do
@@ -304,7 +305,36 @@ rnIfaceGlobal n = do
     hmap <- getHoleSubst
     let m = nameModule n
         m' = renameHoleModule unit_state hmap m
+        occ = nameOccName n
     case () of
+     _ | isNeverExportedDepOcc occ
+      -> setNameModule (Just m') n
+       | Just term_occ <- sourceTableTermOcc occ
+      -> if not (isHoleModule m)
+           then setNameModule (Just m') n
+           else if m' == iface_semantic_mod && isHoleModule m'
+             then do
+               let probe = mkExternalName (nameUnique n) m' term_occ (nameSrcSpan n)
+               case mb_nsubst >>= (`maybeSubstNameShape` probe) of
+                 Just term' ->
+                   let fam_occ = mkSourceTableOcc (nameOccName term')
+                       fam_tmp = mkExternalName (nameUnique n) (nameModule term') fam_occ (nameSrcSpan n)
+                   in setNameModule (Just (nameModule term')) fam_tmp
+                 Nothing -> setNameModule (Just m') n
+             else do
+               let m'' = if isHoleModule m'
+                           then mkHomeModule home_unit (moduleName m')
+                           else m'
+               iface <- liftIO . initIfaceCheck (text "rnIfaceGlobal") hsc_env
+                               $ loadSysInterface (text "rnIfaceGlobal") m''
+               let nsubst = mkNameShape (moduleName m) (mi_exports iface)
+                   probe  = mkExternalName (nameUnique n) m term_occ (nameSrcSpan n)
+               case maybeSubstNameShape nsubst probe of
+                 Just term' ->
+                   let fam_occ = mkSourceTableOcc (nameOccName term')
+                       fam_tmp = mkExternalName (nameUnique n) (nameModule term') fam_occ (nameSrcSpan n)
+                   in setNameModule (Just (nameModule term')) fam_tmp
+                 Nothing -> setNameModule (Just m') n
        -- Did we encounter {A.T} while renaming p[A=<B>]:A? If so,
        -- do NOT assume B.hi is available.
        -- In this case, rename {A.T} to {B.T} but don't look up exports.
@@ -361,6 +391,26 @@ rnIfaceNeverExported name = do
     -- Doublecheck that this DFun/coercion axiom was, indeed, locally defined.
     massertPpr (iface_semantic_mod == m) (ppr iface_semantic_mod <+> ppr m)
     setNameModule (Just m) name
+
+isNeverExportedDepOcc :: OccName -> Bool
+isNeverExportedDepOcc occ =
+    any (`isPrefixOf` s)
+      [ "$some"
+      , "$lambda"
+      , "$case:"
+      , "$case-node:"
+      , "$case-let-rhs:"
+      , "$signature-lambda:"
+      , "$signature-sum:"
+      , "$depfun$"
+      , "T:#"
+      , "T:$"
+      , "U:"
+      , "D:R:"
+      , "TFCo:R:"
+      ]
+  where
+    s = occNameString occ
 
 -- Note [rnIfaceNeverExported]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -950,7 +1000,7 @@ rnIfaceCo (IfaceInstCo c1 c2)           = IfaceInstCo <$> rnIfaceCo c1 <*> rnIfa
 rnIfaceCo (IfaceSelCo d c)              = IfaceSelCo d <$> rnIfaceCo c
 rnIfaceCo (IfaceLRCo lr c)              = IfaceLRCo lr <$> rnIfaceCo c
 rnIfaceCo (IfaceSubCo c)                = IfaceSubCo <$> rnIfaceCo c
-rnIfaceCo (IfaceAxiomCo ax cos)         = IfaceAxiomCo ax <$> mapM rnIfaceCo cos
+rnIfaceCo (IfaceAxiomCo ax cos)         = IfaceAxiomCo <$> rnIfaceAxiomRule ax <*> mapM rnIfaceCo cos
 rnIfaceCo (IfaceKindCo c)               = IfaceKindCo <$> rnIfaceCo c
 rnIfaceCo (IfaceForAllCo bndr visL visR ma co1 co2)
     = (\ma' bndr' co1' co2' -> IfaceForAllCo bndr' visL visR ma' co1' co2')
@@ -959,6 +1009,18 @@ rnIfaceCo (IfaceUnivCo s r t1 t2 deps)
     = IfaceUnivCo s r <$> rnIfaceType t1 <*> rnIfaceType t2 <*> pure deps
       -- The dependencies are either coercion variables or holes.
       -- These are all local, and thus need no renaming.
+
+rnIfaceAxiomRule :: Rename IfaceAxiomRule
+rnIfaceAxiomRule (IfaceAR_X lcl)    = pure (IfaceAR_X lcl)
+rnIfaceAxiomRule (IfaceAR_B ax idx) = flip IfaceAR_B idx <$> rnIfaceAxiomName ax
+rnIfaceAxiomRule (IfaceAR_U ax)     = IfaceAR_U <$> rnIfaceAxiomName ax
+
+rnIfaceAxiomName :: Name -> ShIfM Name
+rnIfaceAxiomName name = do
+    hmap <- getHoleSubst
+    unit_state <- hsc_units <$> getTopEnv
+    let m' = renameHoleModule unit_state hmap (nameModule name)
+    setNameModule (Just m') name
 
 rnIfaceTyCon :: Rename IfaceTyCon
 rnIfaceTyCon (IfaceTyCon n info)
@@ -972,6 +1034,8 @@ rnIfaceIdDetails (IfRecSelId parent con naughty fl table)
   = IfRecSelId <$> either (fmap Left . rnIfaceTyCon) (fmap Right . rnIfaceDecl) parent
                 <*> rnIfaceGlobal con <*> pure naughty <*> rnFieldLabel fl <*> traverse rnIfaceGlobal table
 rnIfaceIdDetails (IfSourceTableId table origin) = flip IfSourceTableId origin <$> rnIfaceGlobal table
+rnIfaceIdDetails (IfCheckedClosureSourceTableId table helpers) =
+  IfCheckedClosureSourceTableId <$> rnIfaceGlobal table <*> mapM rnIfaceGlobal helpers
 rnIfaceIdDetails (IfSourceDFunId methods literal) =
   IfSourceDFunId <$> mapM (\(sel, target) -> (,) <$> rnIfaceGlobal sel <*> rnIfaceGlobal target) methods
                  <*> traverse (\(sel, z, s) -> (,,) <$> rnIfaceGlobal sel <*> rnIfaceGlobal z <*> rnIfaceGlobal s) literal

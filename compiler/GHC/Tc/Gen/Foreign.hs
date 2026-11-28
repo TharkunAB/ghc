@@ -53,6 +53,7 @@ import GHC.Core.FamInstEnv
 import GHC.Core.Coercion
 import GHC.Core.Reduction
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep
 import GHC.Core.Multiplicity
 import GHC.Core.DataCon
 import GHC.Core.TyCon
@@ -402,6 +403,8 @@ tcCheckFIType mas arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) m
   | cconv == JavaScriptCallConv = do
       cconv' <- checkCConv (Right idecl) cconv
       checkCg (Right idecl) backendValidityOfCImport
+      checkForeignArgs checkNoNativeForeignTy arg_tys
+      checkForeignRes nonIOok checkSafe checkNoNativeForeignTy res_ty
       -- leave the rest to the JS backend (at least for now)
       return $ cImport' cconv'
   | otherwise = do              -- Normal foreign import
@@ -757,6 +760,28 @@ checkRepTyCon check_tc ty
       Nothing -> NotValid NotADataType
   where
     mk_nt_reason tc tys = NewtypeDataConNotInScope tc tys
+
+checkNoNativeForeignTy :: Type -> Validity' IllegalForeignTypeReason
+checkNoNativeForeignTy ty
+  | hasNativeForeignTy ty = NotValid (TypeCannotBeMarshaled ty NotADataType)
+  | otherwise             = IsValid
+
+hasNativeForeignTy :: Type -> Bool
+hasNativeForeignTy = go
+  where
+    go ty | Just ty' <- coreView ty = go ty'
+    go (DepFunTy {})              = True
+    go (DepDictTy {})             = True
+    go (ExistsTy {})              = True
+    go (TermVarTy {})             = True
+    go (TermAppTy {})             = True
+    go (ClassAppTy {})            = True
+    go (ForAllTy ma b body)       = go ma || go (varType (binderVar b)) || go body
+    go (FunTy _ ma mult arg res)  = go ma || go mult || go arg || go res
+    go (AppTy f a)                = go f || go a
+    go (TyConApp _ args)          = any go args
+    go (CastTy t _)               = go t
+    go _                          = False
 
 {-
 Note [Foreign import dynamic]

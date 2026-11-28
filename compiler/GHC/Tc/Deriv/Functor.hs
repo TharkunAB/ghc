@@ -538,8 +538,14 @@ functorLikeTraverse var (FT { ft_triv = caseTrivial,     ft_var = caseVar
        | isVisibleForAllTyFlag vis = panic "unexpected visible binder"
        | v /= var && xc            = (caseForAll v xr,True)
        where (xr,xc) = go co x
-
-    go _ _ = (caseTrivial,False)
+    go _ ty@(ExistsTy _ tv body)
+       | var /= tv && (anyFreeVarsOfType (== var) (varType tv) || anyFreeVarsOfType (== var) body)
+       = (caseWrongArg, True)
+       | otherwise
+       = (caseTrivial, False)
+    go _ ty
+       | anyFreeVarsOfType (== var) ty = (caseWrongArg, True)
+       | otherwise                     = (caseTrivial, False)
 
 -- | Return all syntactic subterms of a 'Type' that are applied to the 'TyVar'
 -- argument. This determines what constraints should be inferred for derived

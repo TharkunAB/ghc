@@ -28,6 +28,7 @@ module GHC.Core.FamInstEnv (
         -- Normalisation
         topNormaliseType, topNormaliseType_maybe,
         normaliseType, normaliseTcApp,
+        normaliseTypeWithFuel, normaliseTcAppWithFuel,
         topReduceTyFamApp_maybe, reduceTyFamApp_maybe, reduceScopedSumPayload_maybe
     ) where
 
@@ -1548,11 +1549,20 @@ normaliseType :: FamInstEnvs
 normaliseType env role ty
   = initNormM env role (tyCoVarsOfType ty) $ normalise_type ty
 
+normaliseTypeWithFuel :: Int -> FamInstEnvs -> Role -> Type -> Reduction
+normaliseTypeWithFuel fuel env role ty
+  = initNormMWithFuel (Just fuel) env role (tyCoVarsOfType ty) $ normalise_type ty
+
 ---------------
 normaliseTcApp :: FamInstEnvs -> Role -> TyCon -> [Type] -> Reduction
 -- See comments on normaliseType for the arguments of this function
 normaliseTcApp env role tc tys
   = initNormM env role (tyCoVarsOfTypes tys) $
+    normalise_tc_app tc tys
+
+normaliseTcAppWithFuel :: Int -> FamInstEnvs -> Role -> TyCon -> [Type] -> Reduction
+normaliseTcAppWithFuel fuel env role tc tys
+  = initNormMWithFuel (Just fuel) env role (tyCoVarsOfTypes tys) $
     normalise_tc_app tc tys
 
 -------------------------------------------------------
@@ -1567,14 +1577,20 @@ normalise_tc_app tc tys
   = -- A synonym with type families in the RHS
     -- Expand and try again
     -- See Note [Normalisation and type synonyms]
-    normalise_type (mkAppTys (substTy (mkTvSubstPrs tenv) rhs) tys')
+    do { ok <- consumeNormFuel
+       ; if ok
+         then normalise_type (mkAppTys (substTy (mkTvSubstPrs tenv) rhs) tys')
+         else do { ArgsReductions redns res_co <- normalise_tc_args tc tys
+                 ; role <- getRole
+                 ; return $ assemble_result role (mkTyConAppRedn role tc redns) res_co } }
 
   | isFamilyTyCon tc
   = -- A type-family application
     do { env <- getEnv
        ; role <- getRole
        ; ArgsReductions redns@(Reductions args_cos ntys) res_co <- normalise_tc_args tc tys
-       ; case reduceTyFamApp_maybe env role tc ntys of
+       ; ok <- consumeNormFuel
+       ; case (if ok then reduceTyFamApp_maybe env role tc ntys else Nothing) of
            Just redn1
              -> do { redn2 <- normalise_reduction redn1
                    ; let redn3 = mkTyConAppCo role tc args_cos `mkTransRedn` redn2
@@ -1653,10 +1669,11 @@ normalise_type ty
       , typeKind body `eqType` liftedTypeKind
       = do { lc <- getLC
            ; env <- getEnv
+           ; fuel0 <- getFuel
            ; let callback ctx domain
                    -- See Note [Closed retained domains].
                    | Just ty <- retainedReflDomain_maybe ctx domain = mkReflRedn Nominal ty
-                   | otherwise = runNormM (normalise_type domain) env ctx Nominal
+                   | otherwise = fst (runNormM (normalise_type domain) env ctx Nominal fuel0)
                  (lc', v', domain) = liftCoSubstNativeBndrUsing reductionCoercion callback lc v
            ; Reduction body_co _ <- withLC lc' $ normalise_type body
            ; let co = mkDepFunCoWithVis vis vis v' (coToMCo (reductionCoercion domain)) body_co
@@ -1664,16 +1681,36 @@ normalise_type ty
       | otherwise
       = pprPanic "normalise_type: invalid retained function"
           (ppr v $$ ppr (varType v) $$ ppr body)
-    -- See Note [Keeping existential types opaque during normalisation].
-    go ty@ExistsTy{} =
-      do { lc <- getLC
-         ; role <- getRole
-         ; let left = substTy (lcSubstLeft lc) ty
-               right = substTy (lcSubstRight lc) ty
-         ; if eqType left right
-           then return (mkReflRedn role right)
-           else pprPanic "normalise_type: existential changed by lifting context"
-                  (ppr left $$ ppr right) }
+    go ty@(DepDictTy {})
+      = do { lc <- getLC
+           ; role <- getRole
+           ; case lcOpaqueTypeRefl_maybe lc ty of
+               Just left -> return (mkReflRedn role left)
+               Nothing -> pprPanic "normalise_type: dependent dictionary changed by lifting context"
+                            (ppr ty) }
+    go ty@(ClassAppTy {})
+      = do { lc <- getLC
+           ; role <- getRole
+           ; case lcOpaqueTypeRefl_maybe lc ty of
+               Just left -> return (mkReflRedn role left)
+               Nothing -> pprPanic "normalise_type: class application changed by lifting context"
+                            (ppr ty) }
+    -- Lift family normalisation and outer binder coercions under an erased
+    -- existential via existsCoRule.
+    go ty@(ExistsTy flag tv body)
+      = do { r <- getRole
+           ; if r /= Phantom
+                && isTyVar tv
+                && typeKind (varType tv) `eqType` liftedTypeKind
+                && typeKind body `eqType` liftedTypeKind
+             then do { Reduction scoped_co _ <- go (existsCoScope tv body)
+                     ; if isReflCo scoped_co
+                       then do { lc <- getLC
+                               ; return (mkReflRedn r (lcSubstLeftRefl lc ty)) }
+                       else let co = mkExistsCo flag r scoped_co
+                            in return (mkReduction co (coercionRKind co)) }
+             else do { lc <- getLC
+                     ; return (mkReflRedn r (lcSubstLeftRefl lc ty)) } }
     go (TyConApp tc tys) = normalise_tc_app tc tys
     go ty@(LitTy {})
       = do { r <- getRole
@@ -1837,44 +1874,60 @@ normalise_var_bndr tcvar
   -- works for both tvar and covar
   = do { lc1 <- getLC
        ; env <- getEnv
-       ; let callback lc ki = runNormM (normalise_type ki) env lc Nominal
+       ; fuel0 <- getFuel
+       ; let callback lc ki = fst (runNormM (normalise_type ki) env lc Nominal fuel0)
        ; return $ liftCoSubstVarBndrUsing reductionCoercion callback lc1 tcvar }
 
 -- | a monad for the normalisation functions, reading 'FamInstEnvs',
--- a 'LiftingContext', and a 'Role'.
+-- a 'LiftingContext', a 'Role', and an optional reduction fuel counter.
 newtype NormM a = NormM { runNormM ::
-                            FamInstEnvs -> LiftingContext -> Role -> a }
+                            FamInstEnvs -> LiftingContext -> Role -> Maybe Int -> (a, Maybe Int) }
     deriving (Functor)
 
 initNormM :: FamInstEnvs -> Role
           -> TyCoVarSet   -- the in-scope variables
           -> NormM a -> a
-initNormM env role vars (NormM thing_inside)
-  = thing_inside env lc role
+initNormM = initNormMWithFuel Nothing
+
+initNormMWithFuel :: Maybe Int -> FamInstEnvs -> Role
+                  -> TyCoVarSet
+                  -> NormM a -> a
+initNormMWithFuel mb_fuel env role vars (NormM thing_inside)
+  = fst (thing_inside env lc role mb_fuel)
   where
     in_scope = mkInScopeSet vars
     lc       = emptyLiftingContext in_scope
 
+consumeNormFuel :: NormM Bool
+consumeNormFuel = NormM $ \ _ _ _ mb_fuel -> case mb_fuel of
+  Nothing -> (True, Nothing)
+  Just n
+    | n <= 0    -> (False, Just 0)
+    | otherwise -> let !n' = n - 1 in (True, Just n')
+
+getFuel :: NormM (Maybe Int)
+getFuel = NormM (\ _ _ _ f -> (f, f))
+
 getRole :: NormM Role
-getRole = NormM (\ _ _ r -> r)
+getRole = NormM (\ _ _ r f -> (r, f))
 
 getLC :: NormM LiftingContext
-getLC = NormM (\ _ lc _ -> lc)
+getLC = NormM (\ _ lc _ f -> (lc, f))
 
 getEnv :: NormM FamInstEnvs
-getEnv = NormM (\ env _ _ -> env)
+getEnv = NormM (\ env _ _ f -> (env, f))
 
 withRole :: Role -> NormM a -> NormM a
-withRole r thing = NormM $ \ envs lc _old_r -> runNormM thing envs lc r
+withRole r thing = NormM $ \ envs lc _old_r f -> runNormM thing envs lc r f
 
 withLC :: LiftingContext -> NormM a -> NormM a
-withLC lc thing = NormM $ \ envs _old_lc r -> runNormM thing envs lc r
+withLC lc thing = NormM $ \ envs _old_lc r f -> runNormM thing envs lc r f
 
 instance Monad NormM where
-  ma >>= fmb = NormM $ \env lc r ->
-               let a = runNormM ma env lc r in
-               runNormM (fmb a) env lc r
+  ma >>= fmb = NormM $ \env lc r f ->
+               case runNormM ma env lc r f of
+                 (a, f') -> runNormM (fmb a) env lc r f'
 
 instance Applicative NormM where
-  pure x = NormM $ \ _ _ _ -> x
+  pure x = NormM $ \ _ _ _ f -> (x, f)
   (<*>)  = ap

@@ -1,7 +1,6 @@
-NativeProposal378NoWriteSourceEqs.hs:6:14: error: [GHC-70566]
-    • Cannot reduce the open call to ‘replace’ in a type.
-        While reading the definition of ‘replace’.
-        The interface for a referenced definition contains no usable Core unfolding. Use an interface that exposes the unfolding or provides a checked equation for this call.
+NativeProposal378NoWriteSourceEqs.hs:6:22: error: [GHC-70565]
+    • Cannot evaluate ‘replace’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
     • In the first argument of ‘(:~:)’, namely
         ‘replace (Bind @(Push g a) @b (At (Old New))) (At s)’
       In the type signature:

@@ -696,6 +696,8 @@ kindIsTypeable (TermVarTy {})       = return False
 kindIsTypeable (TermAppTy {})       = return False
 kindIsTypeable (DepFunTy {})        = return False
 kindIsTypeable (ExistsTy {})        = return False
+kindIsTypeable (DepDictTy {})       = return False
+kindIsTypeable (ClassAppTy {})      = return False
 kindIsTypeable (AppTy a b)          = allM kindIsTypeable [a,b]
 kindIsTypeable (FunTy _ ma w a b)   = allM kindIsTypeable [ma,w,a,b]
 kindIsTypeable (TyConApp tc args)
@@ -835,6 +837,10 @@ mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep_shortcut
       = pprPanic "mkKindRepRhs: unsupported retained function" (ppr ki)
     new_kind_rep ki@(ExistsTy {})
       = pprPanic "mkKindRepRhs: unsupported erased existential" (ppr ki)
+    new_kind_rep ki@(DepDictTy {})
+      = pprPanic "mkKindRepRhs: unsupported dependent dictionary" (ppr ki)
+    new_kind_rep ki@(ClassAppTy {})
+      = pprPanic "mkKindRepRhs: unsupported class application" (ppr ki)
 
     new_kind_rep (TyVarTy v)
       | Just idx <- lookupCME in_scope v

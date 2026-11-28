@@ -1249,7 +1249,11 @@ matchHasField dflags short_cut clas tys mb_ct_loc
                      -- responsible for the error messages in cases of unsolved
                      -- HasField constraints when the field type runs afoul
                      -- of these conditions.
-                   ; if (isNaughtyRecordSelector sel_id) || not (isTauTy sel_ty)
+                   ; let (_, _, sel_res_ty) = tcSplitFunTys sel_ty
+                         is_exists_ty t | Just t' <- coreView t = is_exists_ty t'
+                         is_exists_ty ExistsTy{} = True
+                         is_exists_ty _          = False
+                   ; if isNaughtyRecordSelector sel_id || not (isTauTy sel_ty) || is_exists_ty sel_res_ty
                      then try_user_instances
                      else
                 do { case mb_ct_loc of

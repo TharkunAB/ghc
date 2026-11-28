@@ -5034,7 +5034,7 @@ notUnifying_TEFTask occ_prob = \case
       , tefTyVar_concreteCheck = CC_None
       , tefTyVar_allowNativeGivenRhs = False
       , tefTyVar_isTyVarTv     = False
-      , tefTyVar_forAllOK      = True
+      , tefTyVar_forAllOK      = not (isMetaTyVar tv) || isRuntimeUnkTyVar tv || isQLInstTyVar tv
       , tef_fam_app            = TEFA_Recurse
      }
     -- We need an occurs-check here, but no level check.

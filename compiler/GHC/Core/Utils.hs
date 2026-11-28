@@ -783,6 +783,8 @@ stripTicksE p expr = go expr
         go (Let b e)        = Let (go_bs b) (go e)
         go (Case e b t as)  = Case (go e) b t (map go_a as)
         go (Cast e c)       = Cast (go e) c
+        go (Pack s w e)     = Pack s w (go e)
+        go (Unpack w p pkg body) = Unpack w p (go pkg) (go body)
         go (Tick t e)
           | p t             = go e
           | otherwise       = Tick t (go e)
@@ -799,6 +801,8 @@ stripTicksT p expr = fromOL $ go expr
         go (Let b e)        = go_bs b `appOL` go e
         go (Case e _ _ as)  = go e `appOL` concatOL (map go_a as)
         go (Cast e _)       = go e
+        go (Pack _ _ e)     = go e
+        go (Unpack _ _ pkg body) = go pkg `appOL` go body
         go (Tick t e)
           | p t             = t `consOL` go e
           | otherwise       = go e
@@ -2304,6 +2308,9 @@ expr_ok _ _ (Coercion _) = True
 
 expr_ok fun_ok primop_ok (Var v)    = app_ok fun_ok primop_ok v []
 expr_ok fun_ok primop_ok (Cast e _) = expr_ok fun_ok primop_ok e
+expr_ok fun_ok primop_ok (Pack _ _ e) = expr_ok fun_ok primop_ok e
+expr_ok fun_ok primop_ok (Unpack _ _ pkg body) =
+  expr_ok fun_ok primop_ok pkg && expr_ok fun_ok primop_ok body
 expr_ok fun_ok primop_ok (Lam b e)
                  | isTyVar b = expr_ok fun_ok primop_ok  e
                  | otherwise = True
@@ -2763,6 +2770,8 @@ exprIsHNFlike is_con is_con_unf rubbish_lit_result e
                                    && is_hnf_like e
                                       -- See Note [exprIsHNF Tick]
     is_hnf_like (Cast e _)       = is_hnf_like e
+    is_hnf_like (Pack _ _ e)     = is_hnf_like e
+    is_hnf_like (Unpack _ _ _ e) = is_hnf_like e
     is_hnf_like (App e a)
       | isValArg a               = app_is_value e [a]
       | otherwise                = is_hnf_like e
@@ -2774,9 +2783,10 @@ exprIsHNFlike is_con is_con_unf rubbish_lit_result e
 
     -- Collect arguments through Casts and Ticks and call id_app_is_value
     app_is_value :: CoreExpr -> [CoreArg] -> Bool
-    app_is_value (Var f)    as = id_app_is_value f as
-    app_is_value (Tick _ f) as = app_is_value f as
-    app_is_value (Cast f _) as = app_is_value f as
+    app_is_value (Var f)      as = id_app_is_value f as
+    app_is_value (Tick _ f)   as = app_is_value f as
+    app_is_value (Cast f _)   as = app_is_value f as
+    app_is_value (Pack _ _ f) as = app_is_value f as
     app_is_value (App f a)  as | isValArg a = app_is_value f (a:as)
                                | otherwise  = app_is_value f as
     app_is_value _          _  = False

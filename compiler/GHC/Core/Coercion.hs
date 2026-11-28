@@ -107,6 +107,7 @@ module GHC.Core.Coercion (
         LiftCoEnv, NativeLiftEnv, LiftingContext(..), liftEnvSubstLeft, liftEnvSubstRight,
         extendLiftingContextNative, liftCoSubstNative, liftCoSubstNativeBndrUsing,
         prepareNativeLiftingContext, retainedReflDomain_maybe,
+        lcSubstLeftRefl, lcOpaqueTypeRefl_maybe,
         abstractNativeIndices,
         substRightCo, substLeftCo, swapLiftCoEnv, lcSubstLeft, lcSubstRight,
 
@@ -1552,7 +1553,12 @@ mkFunResCo role ma id res_co
   , id `elemVarSet` tyCoVarsOfCo res_co
   = if isNativeOpaqueValueId id && ma `eqType` unmatchableDataConTy
     then mkDepFunCo id res_co
-    else pprPanic "mkFunResCo: unsupported dependent runtime binder" (ppr id)
+    else if isNativeClassDictionaryId id
+         && ma `eqType` unmatchableDataConTy
+         && isReflexiveCo res_co
+         && typeKind (coercionLKind res_co) `eqType` liftedTypeKind
+         then mkReflCo role (DepDictTy id (coercionLKind res_co))
+         else pprPanic "mkFunResCo: unsupported dependent runtime binder" (ppr id)
   | otherwise
   = mkFunCoNoFTF role (mkReflCo (funRole role SelMatch) ma) mult arg_co res_co
   where
@@ -2047,6 +2053,12 @@ ty_co_subst !lc role ty
         in mkDepFunCoWithVis vis vis b' (coToMCo delta) (ty_co_subst lc' r body)
       | otherwise
       = pprPanic "ty_co_subst: invalid retained binder" (ppr b)
+    go r ty@(DepDictTy {})
+      | Just left <- lcOpaqueTypeRefl_maybe lc ty = mkReflCo r left
+      | otherwise = pprPanic "ty_co_subst: dependent dictionary changed" (ppr ty)
+    go r ty@(ClassAppTy {})
+      | Just left <- lcOpaqueTypeRefl_maybe lc ty = mkReflCo r left
+      | otherwise = pprPanic "ty_co_subst: class application changed" (ppr ty)
     go r (AppTy ty1 ty2)    = mkAppCo (go r ty1) (go Nominal ty2)
     go r (TyConApp tc tys)  = mkTyConAppCo r tc (zipWith go (tyConRoleListX r tc) tys)
     go r (FunTy af ma w t1 t2) = mkFunCo r af (go (funRole r SelMatch) ma) (go (funRole r SelMult) w) (go r t1) (go r t2)
@@ -2147,7 +2159,11 @@ prepareNativeLiftingContext initial template = foldl' prepare initial (runtime_v
       | otherwise =
           let prefix = foldl' prepare lc (runtime_vars (varType source) ++ runtime_vars (idMult source))
               delta = liftCoSubst Nominal prefix (varType source)
-              target = setVarType source (coercionLKind delta)
+              left_mult = substTy (lcSubstLeft prefix) (idMult source)
+              right_mult = substTy (lcSubstRight prefix) (idMult source)
+              target = assertPpr (left_mult `eqType` right_mult)
+                                 (ppr source $$ ppr left_mult $$ ppr right_mult) $
+                       setIdMult (setVarType source (coercionLKind delta)) left_mult
           in extendLiftingContextNative prefix source target (coToMCo delta)
 
 -- | Lift one runtime source occurrence without inferring its variable sort.
@@ -2169,17 +2185,48 @@ liftCoSubstNative lc@(LC _ _ native) role source
     left = substTy (lcSubstLeft lc) (TermVarTy source)
     right = substTy (lcSubstRight lc) (TermVarTy source)
 
+-- | Apply the left-hand substitution of a 'LiftingContext' without allocating
+-- when the lifting context is empty.
+lcSubstLeftRefl :: LiftingContext -> Type -> Type
+lcSubstLeftRefl lc@(LC (Subst _ ids tvs cvs) env native) ty
+  | isEmptyVarEnv ids && isEmptyVarEnv tvs && isEmptyVarEnv cvs
+    && isEmptyVarEnv env && isEmptyVarEnv native
+  = ty
+  | otherwise
+  = substTy (lcSubstLeft lc) ty
+
+-- | Return the left-substituted type when no free variable in the type has a
+-- non-reflexive coercion in the lifting context. Avoids constructing a
+-- right-hand substitution when an enclosing retained binder domain was
+-- rewritten outside 'LiftCoEnv'.
+lcOpaqueTypeRefl_maybe :: LiftingContext -> Type -> Maybe Type
+lcOpaqueTypeRefl_maybe lc@(LC _ env native) ty
+  | isEmptyVarEnv env && isEmptyVarEnv native
+  = Just (lcSubstLeftRefl lc ty)
+  | nonDetStrictFoldVarSet (\v acc -> acc || changed v) False (tyCoVarsOfType ty)
+  = Nothing
+  | otherwise
+  = Just (lcSubstLeftRefl lc ty)
+  where
+    changed v
+      | isId v, not (isCoVar v)
+      = case lookupVarEnv native v of
+          Just (NativeBndrLift _ _ (MCo co)) ->
+            not (coercionLKind co `eqType` coercionRKind co)
+          _ -> False
+      | otherwise
+      = case lookupVarEnv env v of
+          Just co -> not (coercionLKind co `eqType` coercionRKind co)
+          Nothing -> False
+
 -- | Keep a closed domain or a fixed callback type in its enclosing scope.
 -- See Note [Closed retained domains] in GHC.Core.FamInstEnv.
 retainedReflDomain_maybe :: LiftingContext -> Type -> Maybe Type
 retainedReflDomain_maybe lc ty
   | noFreeVarsOfType ty = Just ty
   | Just {} <- nativeIndexFunctionTypeTys_maybe ty
-  , left `eqType` right = Just left
+  = lcOpaqueTypeRefl_maybe lc ty
   | otherwise = Nothing
-  where
-    left  = substTy (lcSubstLeft lc) ty
-    right = substTy (lcSubstRight lc) ty
 
 -- | Lift a runtime domain before introducing its binder.
 liftCoSubstNativeBndrUsing :: (a -> CoercionN)
@@ -2193,12 +2240,15 @@ liftCoSubstNativeBndrUsing view fun lc@(LC subst env native) source
     delta = view stuff
     left = coercionLKind delta
     right = coercionRKind delta
-    free = tyCoVarsOfCo delta `unionVarSet` tyCoVarsOfType (idMult source)
+    left_mult = substTy (lcSubstLeft lc) (idMult source)
+    right_mult = substTy (lcSubstRight lc) (idMult source)
+    free = tyCoVarsOfCo delta `unionVarSet` tyCoVarsOfType left_mult
     scope = substInScopeSet subst `extendInScopeSetSet` free
     target = assertPpr (coercionRole delta == Nominal
+                         && left_mult `eqType` right_mult
                          && isNativeIndexDomainConversion left right)
-                       (ppr source $$ ppr delta) $
-             uniqAway scope (setVarType source left)
+                       (ppr source $$ ppr delta $$ ppr left_mult $$ ppr right_mult) $
+             uniqAway scope (setIdMult (setVarType source left) left_mult)
     subst' = case extendSubstInScope subst target of
       Subst scope ids tvs cvs -> Subst scope (delVarEnv ids source) tvs cvs
 

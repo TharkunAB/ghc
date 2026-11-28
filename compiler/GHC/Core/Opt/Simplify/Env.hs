@@ -64,7 +64,8 @@ import GHC.Core
 import GHC.Core.Utils
 import GHC.Core.Subst( cloneBndr, substExprSC )
 import GHC.Core.Unfold
-import GHC.Core.TyCo.Rep (Type(DepFunTy))
+import GHC.Core.TyCo.Compare (eqType)
+import GHC.Core.TyCo.Rep (Type(DepFunTy, TermVarTy))
 import GHC.Core.TyCo.Subst (emptyIdSubstEnv, mkSubst)
 import GHC.Core.Multiplicity( Scaled(..), mkMultMul )
 import GHC.Core.Make            ( mkWildValBinder, mkCoreLet )
@@ -1251,6 +1252,8 @@ subst_id_bndr env@(SimplEnv { seInScope = in_scope, seIdSubst = id_subst })
     new_index_subst
       | sm_core_mode (seMode env) == RetainedCore
       , new_id /= old_id
+        || not (idMult new_id `eqType` idMult old_id)
+        || not (idType new_id `eqType` idType old_id)
       = extendVarEnv (seIndexSubst env) old_id (Var new_id)
       | otherwise = delVarEnv (seIndexSubst env) old_id
 
@@ -1361,7 +1364,9 @@ adjustJoinPointType mult new_res_ty join_id
 
       -- See Note [Retained arguments of join points] in GHC.Core.Type.
       | DepFunTy vis index body_ty <- coreFullView ty
-      = mkDepFunTyWithVis vis (scaleIdBy mult index) (go (n-1) body_ty)
+      , let !index'   = scaleIdBy mult index
+            !body_ty' = replaceTermVarInType index (TermVarTy index') body_ty
+      = mkDepFunTyWithVis vis index' (go (n-1) body_ty')
 
       | Just (ma, arg_bndr, body_ty) <- splitPiTy_maybe ty
       , let body_ty' = go (n-1) body_ty

@@ -303,7 +303,8 @@ eqDeBruijnType env_t1@(D env1 t1) env_t2@(D env2 t2) =
           (DepFunTy vis v ty, DepFunTy vis' v' ty')
               -> liftEquality (vis `eqDepFunVis` vis') `andEq`
                  go (D env (varType v)) (D env' (varType v')) `andEq`
-                 go (D (extendCME env v) ty) (D (extendCME env' v') ty')
+                 go (D (extendCME env v) ty) (D (extendCME env' v') ty') `andEq`
+                 go (D env (idMult v)) (D env' (idMult v'))
 
           (ClassAppTy f inst dict arg kind, ClassAppTy f' inst' dict' arg' kind')
               -> liftEquality (f == f') `andEq`
@@ -341,7 +342,7 @@ eqDeBruijnType env_t1@(D env1 t1) env_t2@(D env2 t2) =
                  go (D env (varType tv)) (D env' (varType tv')) `andEq`
                  go (D (extendCME env tv) ty) (D (extendCME env' tv') ty')
           (CoercionTy {}, CoercionTy {})
-              -> TEQ
+              -> TEQX
           _ -> TNEQ
 
     -- These bangs make 'gos' strict in the CMEnv, which in turn

@@ -782,14 +782,19 @@ loadDeclsWithOptionalName interp hsc_env span optional linkable = do
     initLoaderState interp hsc_env
     modifyLoaderState interp $ \pls0 -> do
       let bco_st = bco_loader_state pls0
+          in_bco_st n = isJust (lookupNameBytecodeState bco_st n)
+                        || isJust (lookupInfoTableBytecodeState bco_st n)
+          loaded_home_mod m = not (isInteractiveModule m)
+                              && (isJust (lookupModuleEnv (bcos_loaded pls0) m)
+                                  || isJust (lookupModuleEnv (objs_loaded pls0) m))
           needed_mods =
-            [ nameModule n
+            [ mod
             | n <- free_names
             , isExternalName n       -- Names from other modules
             , not (isWiredInName n)  -- Exclude wired-in names (see note below)
             , not (n `elemNameSet` local_itbls)
-            , isNothing (lookupNameBytecodeState bco_st n)
-            , isNothing (lookupInfoTableBytecodeState bco_st n)
+            , let mod = nameModule n
+            , not (in_bco_st n) || loaded_home_mod mod
             ]
       (pls, ok, links, packages) <- loadDependencies interp hsc_env pls0 span needed_mods
       when (failed ok) $

@@ -214,6 +214,8 @@ classify tok =
     ITwhere -> TkKeyword
     ITforall{} -> TkKeyword
     ITforeach -> TkKeyword
+    ITexists -> TkKeyword
+    ITsome -> TkKeyword
     ITexport -> TkKeyword
     ITlabel -> TkKeyword
     ITdynamic -> TkKeyword

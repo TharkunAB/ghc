@@ -119,14 +119,14 @@ NativeRetainedFamilyGivenFail.hs:44:42: error: [GHC-05617]
           (bound at NativeRetainedFamilyGivenFail.hs:44:12)
 
 NativeRetainedFamilyGivenFail.hs:50:22: error: [GHC-05617]
-    • Could not deduce ‘b2 ~ True’
-      from the context: b2 ~ Closed b2
+    • Could not deduce ‘b1 ~ True’
+      from the context: b1 ~ Closed b1
         bound by a pattern with constructor:
                    Refl :: forall {k} (a :: k). a :~: a,
                  in an equation for ‘closedWrong’
         at NativeRetainedFamilyGivenFail.hs:50:15-18
-      Expected: Just (Closed b2) :~: Just True
-        Actual: Just (Closed b2) :~: Just (Closed b2)
+      Expected: Just (Closed b1) :~: Just True
+        Actual: Just (Closed b1) :~: Just (Closed b1)
     • In the expression: Refl
       In an equation for ‘closedWrong’: closedWrong _ Refl = Refl
 
@@ -144,17 +144,16 @@ NativeRetainedFamilyGivenFail.hs:54:47: error: [GHC-05617]
       In an equation for ‘wrongContinuation’:
           wrongContinuation _ _ proof = gcastWith proof Refl
 
-NativeRetainedFamilyGivenFail.hs:63:48: error: [GHC-83865]
-    • Couldn't match type: W (F xs)
-                     with: W (G xs)
-      Expected: W (F xs) :~: W (G xs)
-        Actual: W (F xs) :~: W (F xs)
+NativeRetainedFamilyGivenFail.hs:63:59: error: [GHC-83865]
+    • Couldn't match type: W (G xs)
+                     with: W (F xs)
+      Expected: W (F xs) :~: G xs
+        Actual: W (G xs) :~: G xs
       Note: ‘W’ is a non-injective type family.
-    • In the second argument of ‘eliminate’, namely ‘Refl’
-      In the second argument of ‘trans’, namely
-        ‘(eliminate (id proof) Refl)’
-      In the first argument of ‘trans’, namely
-        ‘(trans (id left) (eliminate (id proof) Refl))’
+    • In the first argument of ‘id’, namely ‘right’
+      In the second argument of ‘trans’, namely ‘(id right)’
+      In the expression:
+        trans (trans (id left) (eliminate (id proof) Refl)) (id right)
     • Relevant bindings include
         right :: W (G xs) :~: G xs
           (bound at NativeRetainedFamilyGivenFail.hs:62:24)
@@ -163,15 +162,15 @@ NativeRetainedFamilyGivenFail.hs:63:48: error: [GHC-83865]
         left :: F xs :~: W (F xs)
           (bound at NativeRetainedFamilyGivenFail.hs:62:13)
 
-NativeRetainedFamilyGivenFail.hs:67:20: error: [GHC-83865]
-    • Couldn't match type ‘b0’ with ‘G xs1’
-      Expected: a0 :~: b0
-        Actual: F xs1 :~: G xs1
+NativeRetainedFamilyGivenFail.hs:67:31: error: [GHC-83865]
+    • Couldn't match type ‘b0’ with ‘W (G xs1)’
+      Expected: W (F xs1) :~: b0
+        Actual: W (F xs1) :~: W (F xs1)
       ‘b0’ is untouchable
         inside the constraints: ()
         bound by a retained application
-        at NativeRetainedFamilyGivenFail.hs:67:10-34
-    • In the first argument of ‘eliminate’, namely ‘(id proof)’
+        at NativeRetainedFamilyGivenFail.hs:67:31-34
+    • In the second argument of ‘eliminate’, namely ‘Refl’
       In the first argument of ‘trans’, namely
         ‘(eliminate (id proof) Refl)’
       In the expression:
@@ -180,15 +179,15 @@ NativeRetainedFamilyGivenFail.hs:67:20: error: [GHC-83865]
         proof :: F xs1 :~: G xs1
           (bound at NativeRetainedFamilyGivenFail.hs:66:17)
 
-NativeRetainedFamilyGivenFail.hs:67:48: error: [GHC-83865]
-    • Couldn't match type ‘b1’ with ‘G xs1’
-      Expected: a1 :~: b1
-        Actual: F xs1 :~: G xs1
-      ‘b1’ is untouchable
+NativeRetainedFamilyGivenFail.hs:67:59: error: [GHC-83865]
+    • Couldn't match type ‘b0’ with ‘W (G xs1)’
+      Expected: b0 :~: W (G xs1)
+        Actual: b0 :~: b0
+      ‘b0’ is untouchable
         inside the constraints: ()
         bound by a retained application
-        at NativeRetainedFamilyGivenFail.hs:67:38-62
-    • In the first argument of ‘eliminate’, namely ‘(id proof)’
+        at NativeRetainedFamilyGivenFail.hs:67:59-62
+    • In the second argument of ‘eliminate’, namely ‘Refl’
       In the second argument of ‘trans’, namely
         ‘(eliminate (id proof) Refl)’
       In the expression:
@@ -196,22 +195,6 @@ NativeRetainedFamilyGivenFail.hs:67:48: error: [GHC-83865]
     • Relevant bindings include
         proof :: F xs1 :~: G xs1
           (bound at NativeRetainedFamilyGivenFail.hs:66:17)
-
-NativeRetainedFamilyGivenFail.hs:67:59: error: [GHC-05617]
-    • Could not deduce ‘W a0 ~ W b1’
-      from the context: a1 ~ b1
-        bound by a type expected by the context:
-                   (a1 ~ b1) => W a0 :~: W b1
-        at NativeRetainedFamilyGivenFail.hs:67:59-62
-      Expected: W a0 :~: W b1
-        Actual: W a0 :~: W a0
-      Note: ‘W’ is a non-injective type family.
-      The type variables ‘a0’, ‘b1’ are ambiguous
-    • In the second argument of ‘eliminate’, namely ‘Refl’
-      In the second argument of ‘trans’, namely
-        ‘(eliminate (id proof) Refl)’
-      In the expression:
-        trans (eliminate (id proof) Refl) (eliminate (id proof) Refl)
 
 NativeRetainedFamilyGivenFail.hs:73:55: error: [GHC-83865]
     • Couldn't match type: W (F xs2)
@@ -226,7 +209,7 @@ NativeRetainedFamilyGivenFail.hs:73:55: error: [GHC-83865]
         proof :: F xs2 :~: G xs2
           (bound at NativeRetainedFamilyGivenFail.hs:73:16)
 
-NativeRetainedFamilyGivenFail.hs:80:49: error: [GHC-05617]
+NativeRetainedFamilyGivenFail.hs:80:50: error: [GHC-05617]
     • Could not deduce ‘extent ~ S n0’
       from the context: extent ~ Z
         bound by a type expected by the context:

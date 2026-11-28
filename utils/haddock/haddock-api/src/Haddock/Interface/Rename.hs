@@ -446,9 +446,21 @@ renameType t = case t of
     return (HsDocTy noAnn ty' doc')
   HsTyLit _ x -> return (HsTyLit noAnn (renameTyLit x))
   XHsType (HsCoreTyRn ty) -> pure (XHsType (HsCoreTy ty))
+  XHsType (HsGadtFieldRn cdf) ->
+    case cdf_doc cdf of
+      Just doc -> HsDocTy noAnn <$> renameLType (cdf_type cdf) <*> renameLDocHsSyn doc
+      Nothing  -> renameType (unLoc (cdf_type cdf))
   XHsType (HsTypeExistsRn flag binder body) ->
     XHsType <$> (HsErasedExists flag <$> renameLTyVarBndr pure binder <*> renameLType body)
+  XHsType (HsTypeCaseRn scrut rows) ->
+    XHsType <$> (HsCheckedTypeCase <$> renameLType scrut
+                   <*> mapM (\(_, pat, rhs) -> (,) <$> renameLType pat <*> renameLType rhs) rows)
+  XHsType (HsTypeLambdaCheckRn _ _ lowered) ->
+    renameType (unLoc lowered)
+  XHsType (HsTypeLetProductCheckRn _ _ rhs) ->
+    renameType (unLoc rhs)
   -- See Note [Checked types in Haddock].
+  XHsType HsTypeLambdaQuoteRn{} -> throwE "Cannot document a source type lambda without its checked type."
   XHsType HsTypeLetRn{} -> throwE "Cannot document a source type let without its checked type."
   XHsType HsTypeCaseAliasRn{} -> throwE "Cannot document a source type case alias without its checked type."
   HsExplicitListTy _ a b -> HsExplicitListTy noAnn a <$> mapM renameLType b

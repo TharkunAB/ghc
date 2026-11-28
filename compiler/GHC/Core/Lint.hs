@@ -46,7 +46,7 @@ import GHC.Platform
 import GHC.Core
 import GHC.Core.FVs
 import GHC.Core.Utils
-import GHC.Core.Dependent (isScopedSelectorReceiver)
+import GHC.Core.Dependent (hasScopedDictionaryExpr, isScopedSelectorReceiver)
 import GHC.Core.Stats ( coreBindsStats )
 import GHC.Core.Class (classMethods)
 import GHC.Core.DataCon
@@ -514,7 +514,8 @@ lintUnfolding is_compulsory cfg locn expr
                        -- See Note [Checking for representation polymorphism]
                      then noFixedRuntimeRepChecks linter
                      else linter
-    linter = addLoc (ImportedUnfolding locn) $
+    linter = withScopedDictionaryLint (hasScopedDictionaryExpr expr) $
+             addLoc (ImportedUnfolding locn) $
              lintCoreExpr expr
 
 lintExpr :: LintConfig
@@ -526,7 +527,8 @@ lintExpr cfg expr
   | otherwise       = Just errs
   where
     (_warns, errs) = initL cfg linter
-    linter = addLoc TopLevelBindings $
+    linter = withScopedDictionaryLint (hasScopedDictionaryExpr expr) $
+             addLoc TopLevelBindings $
              lintCoreExpr expr
 
 -- | Check the scope of experimental dictionary indices in a standalone type.
@@ -2007,7 +2009,7 @@ lintCoreAlt :: Maybe Type -- Supported native index of the scrutinee
             -> LintM UsageEnv
 -- If you edit this function, you may need to update the GHC formalism
 -- See Note [GHC Formalism]
-lintCoreAlt scrut_index case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt DEFAULT args rhs)
+lintCoreAlt scrut_index case_bndr scrut_ty scrut_mult alt_ty alt@(Alt DEFAULT args rhs)
   | isNativeIndexAliasAlt alt
   = addLoc (CaseAlt alt) $ do
     { index <- case scrut_index of
@@ -2026,7 +2028,11 @@ lintCoreAlt scrut_index case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt DEFAULT a
         (text "Invalid nominal index alias evidence:" <+> ppr cv <+> dcolon <+> ppr (varType cv))
     ; lintBinder CasePatBind cv $ do
       { rhs_ue <- lintAltExpr rhs alt_ty
-      ; return (deleteUE (deleteUE rhs_ue cv) case_bndr) }
+      ; let (case_bndr_usage, rhs_ue') = popUE (deleteUE rhs_ue cv) case_bndr
+            err_msg = vcat [ text "Linearity failure in the DEFAULT clause:" <+> ppr case_bndr
+                           , ppr case_bndr_usage <+> text "⊈" <+> ppr scrut_mult ]
+      ; ensureSubUsage case_bndr_usage scrut_mult err_msg
+      ; return rhs_ue' }
     }
     -- See Note [Native index alias evidence].
 lintCoreAlt _ case_bndr _ scrut_mult alt_ty (Alt DEFAULT args rhs) =
@@ -3423,6 +3429,7 @@ lintCoercion_InScope
 lintCoercion_InScope cfg in_scope co
   = initL (cfg { l_vars = nonDetEltsUniqSet (getInScopeVars in_scope) }) $
       -- nonDet is fine: 'initL' only builds a 'VarEnv' from these.
+    withScopedDictionaryLint (hasScopedDictionaryExpr (Coercion co)) $
     addLoc (InCo co) $
     lintCoercion co
 

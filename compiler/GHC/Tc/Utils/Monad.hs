@@ -1995,22 +1995,29 @@ tryTcDiscardingErrs' :: (WantedConstraints -> Messages TcRnMessage -> r -> Bool)
 --      otherwise discard everything from 'thing_inside', including errors,
 --          and try 'recover' instead.
 tryTcDiscardingErrs' validate recover_invalid recover_error thing_inside
-  = do { ((mb_res, lie), msgs) <- captureMessagesTcM    $
+  = do { gbl <- getGblEnv
+       ; th_st <- readTcRef (tcg_th_state gbl)
+       ; sc_st <- readTcRef (tcg_source_check gbl)
+       ; let restore = do { writeTcRef (tcg_th_state gbl) th_st
+                          ; writeTcRef (tcg_source_check gbl) sc_st }
+       ; ((mb_res, lie), msgs) <- captureMessagesTcM    $
                                   captureConstraintsTcM $
                                   tcTryM thing_inside
-        ; case mb_res of
-            Just res | not (errorsFound msgs)
-                     , not (insolubleWC lie)
-                    -- 'thing_inside' succeeded with no errors
-              -> if validate lie msgs res
-                 then do { addMessages msgs  -- msgs might still have warnings
-                         ; emitConstraints lie
-                         ; return res }
-                 else recover_invalid
+       ; case mb_res of
+           Just res | not (errorsFound msgs)
+                    , not (insolubleWC lie)
+                   -- 'thing_inside' succeeded with no errors
+             -> if validate lie msgs res
+                then do { addMessages msgs  -- msgs might still have warnings
+                        ; emitConstraints lie
+                        ; return res }
+                else do { restore
+                        ; recover_invalid }
 
-            _ -> -- 'thing_inside' failed, or produced an error message
-                 recover_error
-        }
+           _ -> -- 'thing_inside' failed, or produced an error message
+                do { restore
+                   ; recover_error }
+       }
 
 {- Note [Constraints and errors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

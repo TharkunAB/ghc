@@ -2093,10 +2093,17 @@ eta_expand in_scope one_shots orig_expr
       | otherwise = go (in_scope `extendInScopeSet` v) oss1 (v:vs) body
 
     go in_scope oss rev_vs expr
-      = -- pprTrace "ee" (
-        --    vcat [ text "top_bndrs:" <+> ppr top_bndrs
-        --         , text "top-eis:" <+> ppr top_eis
-        --         , text "eis:" <+> ppr eis]) $
+      | MCo co <- mco
+      , let co_vars = tyCoVarsOfCo co
+            bad b   = b `elemVarSet` co_vars
+                      && (isCoVar b || (isNonCoVarId b && not (isNativeOpaqueValueId b)))
+      , any bad top_bndrs
+      = mkLams top_bndrs $
+        retick $
+        etaInfoAbs eis $
+        etaInfoApp in_scope' sexpr eis
+      | otherwise
+      = -- pprTrace "ee" (vcat [ppr in_scope', ppr top_bndrs, ppr eis]) $
         retick $
         etaInfoAbs top_eis $
         etaInfoApp in_scope' sexpr eis
@@ -2880,6 +2887,7 @@ tryEtaReduce rec_ids bndrs body eval_sd
                                 $$ text "fun_ty:" <+> ppr fun_ty)
     ok_arg bndr (Var v) co fun_ty
        | bndr == v
+       , isNativeOpaqueValueId bndr || not (bndr `elemVarSet` tyCoVarsOfCo co)
        , let mult = idMult bndr
        , Just (_af, ma, fun_mult, _, _) <- splitFunTy_maybe fun_ty
        , ma `eqType` unmatchableDataConTy

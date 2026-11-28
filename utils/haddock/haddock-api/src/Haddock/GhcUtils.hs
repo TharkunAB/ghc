@@ -799,6 +799,9 @@ typeNames ty = go ty Set.empty
         TermVarTy v -> go (varType v) acc
         TermAppTy fun arg -> go arg $ go (varType fun) acc
         DepFunTy _ b body -> go body $ go (varType b) $ go (idMult b) acc
+        DepDictTy b body -> go body $ go (varType b) acc
+        ClassAppTy sel inst dict arg kind ->
+          go kind $ go arg $ go dict $ go inst (Set.insert (getName sel) acc)
         AppTy t1 t2 -> go t2 $ go t1 acc
         -- See Note [Arrow matchability in Haddock] in Haddock.Convert.
         FunTy _ ma w t1 t2 -> go t2 $ go t1 $ go w $ go ma acc
@@ -881,6 +884,10 @@ defaultRuntimeRepVars = go emptyVarEnv
     go subs (DepFunTy vis binder body) =
       -- See Note [Retained types in Haddock] in Haddock.Convert.
       DepFunTy vis (go_id subs binder) (go subs body)
+    go subs (DepDictTy binder body) =
+      DepDictTy (go_id subs binder) (go subs body)
+    go subs (ClassAppTy sel inst dict arg kind) =
+      ClassAppTy (go_id subs sel) (go subs inst) (go subs dict) (go subs arg) (go subs kind)
     go subs (ExistsTy flag binder body) =
       ExistsTy flag (updateTyVarKind (go subs) binder) (go subs body)
     go subs (TyConApp tc tc_args) =

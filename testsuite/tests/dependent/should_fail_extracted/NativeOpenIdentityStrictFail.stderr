@@ -20,10 +20,9 @@ NativeOpenIdentityStrictFail.hs:16:60: error: [GHC-70566]
         stuckPair :: forall (p :: (Type, Type)). Proxy p
                                                  -> Proxy (OpenProducer.strictPairFirst p)
 
-NativeOpenIdentityStrictFail.hs:19:35: error: [GHC-70566]
-    • Cannot reduce the open call to ‘Omitted.identity’ in a type.
-        While reading the definition of ‘Omitted.identity’.
-        The interface for a referenced definition contains no usable Core unfolding. Use an interface that exposes the unfolding or provides a checked equation for this call.
+NativeOpenIdentityStrictFail.hs:19:52: error: [GHC-70565]
+    • Cannot evaluate ‘Omitted.identity’ in a type.
+        The argument must be a closed literal of one of these kinds: Natural, Char, Bool, [Natural], [Char], [Bool].
     • In the type signature:
         missingBody :: forall a. Num a => Omitted.identity a
 

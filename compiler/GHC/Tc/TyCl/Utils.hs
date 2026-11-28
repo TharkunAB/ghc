@@ -96,9 +96,13 @@ synonymTyConsOfType payloads ty
   = nonDetNameEnvElts (go ty)
   where
      go :: Type -> NameEnv TyCon  -- The NameEnv does duplicate elim
-     go (TermVarTy v)     = go (varType v)
+     go (TermVarTy v)     = go (varType v) `plusNameEnv` go (idMult v)
      go (TermAppTy f arg) = go (varType f) `plusNameEnv` go arg
-     go (DepFunTy _ v ty) = go (varType v) `plusNameEnv` go ty
+     go (DepFunTy _ v ty) = go (varType v) `plusNameEnv` go (idMult v) `plusNameEnv` go ty
+     go (DepDictTy d ty)  = go (varType d) `plusNameEnv` go ty
+     go (ClassAppTy sel inst dict arg kind)
+                          = go (varType sel) `plusNameEnv` go inst `plusNameEnv` go dict
+                            `plusNameEnv` go arg `plusNameEnv` go kind
      go (ExistsTy _ v ty)   = go (varType v) `plusNameEnv` go ty
      go (TyConApp tc tys) = go_tc tc `plusNameEnv` go_s tys
      go (LitTy _)         = emptyNameEnv
@@ -134,7 +138,7 @@ synonymTyConsOfType payloads ty
      go_mco (MCo co) = go_co co
 
      go_co (TermAppCo f co)     = go (varType f) `plusNameEnv` go_co co
-     go_co (DepFunCo _ _ v domain co) = go (varType v) `plusNameEnv` go_mco domain `plusNameEnv` go_co co
+     go_co (DepFunCo _ _ v domain co) = go (varType v) `plusNameEnv` go (idMult v) `plusNameEnv` go_mco domain `plusNameEnv` go_co co
      go_co (Refl ty)            = go ty
      go_co (GRefl _ ty mco)     = go ty `plusNameEnv` go_mco mco
      go_co (TyConAppCo _ tc cs) = go_tc tc `plusNameEnv` go_co_s cs
@@ -338,8 +342,20 @@ checkClassCycles cls
        = go_tc so_far pred tc tys
        | hasTyVarHead pred
        = Just (False, [SCD_HeadTyVar pred])
+       | isOpaqueConstraintHead pred
+       = Just (False, [SCD_HeadTyFam pred])
        | otherwise
        = Nothing
+
+    isOpaqueConstraintHead ty
+      | Just ty' <- coreView ty = isOpaqueConstraintHead ty'
+      | otherwise = case ty of
+          TermVarTy {}  -> True
+          TermAppTy {}  -> True
+          ClassAppTy {} -> True
+          AppTy f _     -> isOpaqueConstraintHead f
+          CastTy t _    -> isOpaqueConstraintHead t
+          _             -> False
 
     go_tc :: ClassSet -> PredType -> TyCon -> [Type] -> Maybe (Bool, [SuperclassCycleDetail])
     go_tc so_far pred tc tys
@@ -630,14 +646,22 @@ irType = go
       | otherwise = pprPanic "irType: invalid native call scope" (ppr ty)
     go lcls ty@(TermVarTy v)
       | isNativeNamedOpaqueFunctionId v = pure ()
-      | v `elemVarSet` lcls, isNativeRetainedBinder v = markNominal lcls (varType v)
+      | v `elemVarSet` lcls, isNativeRetainedBinder v
+      = markNominal lcls (varType v) >> markNominal lcls (idMult v)
       | otherwise = pprPanic "irType: invalid runtime index scope" (ppr ty)
     go lcls ty@(DepFunTy _ v body)
       | isNativeRetainedBinder v
-      = markNominal lcls (varType v) >> go (extendVarSet lcls v) body
+      = markNominal lcls (varType v) >> markNominal lcls (idMult v) >> go (extendVarSet lcls v) body
       | otherwise = pprPanic "irType: invalid retained binder" (ppr ty)
-    -- Keep existential parameters nominal until Core has an ExistsCo.
+    go lcls (DepDictTy d body)
+      = markNominal lcls (varType d) >> go (extendVarSet lcls d) body
+    go lcls (ClassAppTy sel inst dict operand kind)
+      = mapM_ (markNominal lcls) [varType sel, inst, dict, operand, kind]
     go lcls (ExistsTy _ v body)
+      | typeKind (varType v) `eqType` liftedTypeKind
+      , typeKind body `eqType` liftedTypeKind
+      = markNominal lcls (varType v) >> go (extendVarSet lcls v) body
+      | otherwise
       = markNominal lcls (varType v) >> markNominal (extendVarSet lcls v) body
     go lcls (TyVarTy tv)       = unless (tv `elemVarSet` lcls) $
                                  updateRole Representational tv
@@ -692,13 +716,20 @@ markNominal lcls ty = mapM_ (updateRole Nominal) $
       | otherwise = pprPanic "markNominal: invalid native call scope" (ppr ty)
     get_ty_vars scope ty@(TermVarTy v)
       | isNativeNamedOpaqueFunctionId v = emptyVarSet
-      | v `elemVarSet` scope, isNativeRetainedBinder v = get_ty_vars scope (varType v)
+      | v `elemVarSet` scope, isNativeRetainedBinder v
+      = get_ty_vars scope (varType v) `unionVarSet` get_ty_vars scope (idMult v)
       | otherwise = pprPanic "markNominal: invalid runtime index scope" (ppr ty)
     get_ty_vars scope ty@(DepFunTy _ v body)
       | isNativeRetainedBinder v
       = get_ty_vars scope (varType v) `unionVarSet`
+          get_ty_vars scope (idMult v) `unionVarSet`
           get_ty_vars (extendVarSet scope v) body
       | otherwise = pprPanic "markNominal: invalid retained binder" (ppr ty)
+    get_ty_vars scope (DepDictTy d body)
+      = get_ty_vars scope (varType d) `unionVarSet`
+          get_ty_vars (extendVarSet scope d) body
+    get_ty_vars scope (ClassAppTy sel inst dict operand kind)
+      = mapUnionVarSet (get_ty_vars scope) [varType sel, inst, dict, operand, kind]
     get_ty_vars scope (ExistsTy _ v body)
       = get_ty_vars scope (varType v) `unionVarSet`
           (get_ty_vars (extendVarSet scope v) body `delVarSet` v)

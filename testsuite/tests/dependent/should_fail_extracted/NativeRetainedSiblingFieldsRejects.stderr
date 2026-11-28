@@ -1,28 +1,13 @@
-NativeRetainedSiblingFieldsRejects.hs:11:33: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘size p1’
-      Expected: Vec Char n0
-        Actual: Vec Char (size p1)
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeRetainedSiblingFieldsRejects.hs:11:26-53
-    • In the first argument of ‘zipVec’, namely ‘(letters p)’
-      In the expression: zipVec (letters p) (flags q)
-      In the first argument of ‘toList’, namely
-        ‘(zipVec (letters p) (flags q))’
-
-NativeRetainedSiblingFieldsRejects.hs:11:45: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘size q1’
-      Expected: Vec Bool n0
+NativeRetainedSiblingFieldsRejects.hs:11:46: error: [GHC-83865]
+    • Couldn't match type: size q1
+                     with: size p1
+      Expected: Vec Bool (size p1)
         Actual: Vec Bool (size q1)
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeRetainedSiblingFieldsRejects.hs:11:26-53
+      Note: GHC cannot determine the arguments of the function ‘size’ from its result.
     • In the second argument of ‘zipVec’, namely ‘(flags q)’
-      In the expression: zipVec (letters p) (flags q)
       In the first argument of ‘toList’, namely
         ‘(zipVec (letters p) (flags q))’
+      In the expression: toList (zipVec (letters p) (flags q))
 
 NativeRetainedSiblingFieldsRejects.hs:15:42: error: [GHC-83865]
     • Couldn't match type: size q

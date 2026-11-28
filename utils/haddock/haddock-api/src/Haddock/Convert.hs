@@ -68,7 +68,8 @@ import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Hs
 import GHC.Types.Basic (DefMethSpec (..), TupleSort (..))
-import GHC.Types.Id (idType, setIdType)
+import GHC.Types.Id (idInfo, idType, setIdType)
+import GHC.Types.Id.Info (invisibleRetainedIdInfo)
 import GHC.Types.Name
 import GHC.Types.Name.Reader (mkVarUnqual)
 import GHC.Types.Name.Set (emptyNameSet)
@@ -265,11 +266,44 @@ hasPrivateTypeCase = any (hasPrefix casePrefixes) . typeNames
 
 -- | Name prefixes reserved for type-case families and their helpers.
 casePrefixes :: [String]
-casePrefixes = ["$case:", "$case-node:", "$case-let-rhs:"]
+casePrefixes =
+  [ "$case:"
+  , "$case-node:"
+  , "$case-let-rhs:"
+  , "$lambda:"
+  , "$signature-lambda:"
+  , "$signature-sum:"
+  , "T:#guard:"
+  , "T:$depfun$"
+  ]
 
 -- | Check whether a name has one of the supplied prefixes.
 hasPrefix :: [String] -> Name -> Bool
 hasPrefix prefixes name = any (`isPrefixOf` getOccString name) prefixes
+
+-- | Strip internal source-equation ("T:") and uninterpreted-head ("U:")
+-- prefixes from family names when rendering user-facing documentation.
+unmangleSourceTyConName :: Name -> Name
+unmangleSourceTyConName n
+  | Just term_occ <- sourceTableTermOcc (nameOccName n)
+  , let s = occNameString term_occ
+  , not ("#" `isPrefixOf` s || "$" `isPrefixOf` s)
+  = replace_occ term_occ
+  | 'U' : ':' : rest <- getOccString n
+  , let raw = case rest of
+          '@' : after_at
+            | (_, ':' : after_unit) <- break (== ':') after_at
+            , (_, ':' : after_mod)  <- break (== ':') after_unit
+            -> after_mod
+          _ -> rest
+  , not (null raw)
+  = replace_occ (mkVarOcc raw)
+  | otherwise
+  = n
+  where
+    replace_occ occ
+      | isExternalName n = mkExternalName (nameUnique n) (nameModule n) occ (nameSrcSpan n)
+      | otherwise        = mkInternalName (nameUnique n) occ (nameSrcSpan n)
 
 {- Note [Checked type cases in Haddock]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -701,7 +735,25 @@ synifyDataCon use_gadt_syntax dc =
     -- finally we get synifyDataCon's result!
     if use_gadt_syntax
       then do
-        let hat = mk_gadt_arg_tys
+        let rep_arg_binders = dataConRepArgBinders dc
+            has_retained_args = not use_named_field_syntax && any isJust rep_arg_binders
+            hat
+              | has_retained_args = PrefixConGADT noExtField []
+              | otherwise = mk_gadt_arg_tys
+            gadt_res_ty
+              | has_retained_args = mk_retained_arg_tys rep_arg_binders arg_tys res_ty
+              | otherwise = res_ty
+            mk_retained_arg_tys [] args res = mkScaledFunTysU args res
+            mk_retained_arg_tys (mb : bs) (arg : args) res =
+              let body = mk_retained_arg_tys bs args res
+               in case mb of
+                    Nothing -> mkScaledFunTysU [arg] body
+                    Just b ->
+                      mkDepFunTyWithVis
+                        (if invisibleRetainedIdInfo (idInfo b) then DepFunInvisible else DepFunVisible)
+                        b
+                        body
+            mk_retained_arg_tys _ args res = mkScaledFunTysU args res
         return $
           noLocA $
             ConDeclGADT
@@ -710,7 +762,7 @@ synifyDataCon use_gadt_syntax dc =
               , con_outer_bndrs = noLocA outer_bndrs
               , con_telescope = inner_bndrs ++ maybe [] (pure . noLocA . HsGadtContext) ctx
               , con_g_args = hat
-              , con_res_ty = synifyType WithinType emptyVarSet res_ty
+              , con_res_ty = synifyType WithinType emptyVarSet gadt_res_ty
               , con_modifiers = []
               , con_doc = Nothing
               }
@@ -933,6 +985,16 @@ synifyType _ boundTvs (TermAppTy fun arg) =
   noLocA $ HsAppTy noExtField
     (noLocA $ HsTyVar noAnn NotPromoted $ noLocA (noUserRdr $ getName fun))
     (synifyType WithinType boundTvs arg)
+synifyType _ boundTvs (ClassAppTy sel _ _ arg _) =
+  noLocA $ HsAppTy noExtField
+    (noLocA $ HsTyVar noAnn NotPromoted $ noLocA (noUserRdr $ getName sel))
+    (synifyType WithinType boundTvs arg)
+synifyType _ boundTvs (DepDictTy dict body) =
+  noLocA $ HsQualTy
+    { hst_xqual = noExtField
+    , hst_ctxt = noLocA (HsContext noAnn [synifyType WithinType boundTvs (varType dict)])
+    , hst_body = synifyType WithinType (extendVarSet boundTvs dict) body
+    }
 synifyType _ boundTvs (DepFunTy vis binder body) =
   -- See Note [Retained types in Haddock].
   noLocA $ HsForEachTy
@@ -1021,23 +1083,24 @@ synifyType _ boundTvs (TyConApp tc tys) =
               (noLocA $ HsTyVar noAnn NotPromoted (noLocA $ noUserRdr eqTyConName))
               (synifyType WithinType boundTvs ty2)
       -- and infix type operators
-      | isSymOcc (nameOccName (getName tc))
+      | isSymOcc (nameOccName display_tc_name)
       , ty1 : ty2 : tys_rest <- vis_tys =
           mk_app_tys
             ( HsOpTy
                 noExtField
                 (synifyType WithinType boundTvs ty1)
-                (noLocA $ HsTyVar noAnn prom (noLocA $ noUserRdr $ getName tc))
+                (noLocA $ HsTyVar noAnn prom (noLocA $ noUserRdr display_tc_name))
                 (synifyType WithinType boundTvs ty2)
             )
             tys_rest
       -- Most TyCons:
       | otherwise =
           mk_app_tys
-            (HsTyVar noAnn prom $ noLocA (noUserRdr $ getName tc))
+            (HsTyVar noAnn prom $ noLocA (noUserRdr display_tc_name))
             vis_tys
       where
         !prom = if isPromotedDataCon tc then IsPromoted else NotPromoted
+        display_tc_name = unmangleSourceTyConName (getName tc)
         mk_app_tys ty_app ty_args =
           foldl
             (\t1 t2 -> noLocA $ HsAppTy noExtField t1 t2)

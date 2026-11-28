@@ -1663,7 +1663,7 @@ checkedSourceLiteral dfun selector target top_evidence evs match = do
       ops <- integer_op mod occ (expression fun)
       HsOverLit _ (OverLit (OverLitTc False witness lit_ty) (HsIntegral lit)) <- pure (expression arg)
       guard (not (il_neg lit) && il_value lit == k && lit_ty `eqType` integerTy)
-      case expression witness of
+      case witness of
         HsLit _ (XLit (HsInteger _ k' raw_ty)) -> do
           guard (k == k' && raw_ty `eqType` integerTy)
           pure ops

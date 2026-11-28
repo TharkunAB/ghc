@@ -4429,8 +4429,10 @@ runMatchingChecks dflags = do
     check
         "different retained-function targets of a repeated template are only maybe apart"
         (retainedApart [wholeTy, wholeTy] [closedPi, differentPi])
-    check "a constructor type versus a retained function is only maybe apart" (retainedApart [intTy] [closedPi])
-    check "a retained function versus a constructor type is only maybe apart" (retainedApart [closedPi] [intTy])
+    check "a constructor type versus a retained function is surely apart" $
+        case fine [intTy] [closedPi] of SurelyApart -> True; _ -> False
+    check "a retained function versus a constructor type is surely apart" $
+        case fine [closedPi] [intTy] of SurelyApart -> True; _ -> False
 
     let outer = mkTyVar (mkSystemName (unique 204) (mkTyVarOcc "outer")) liftedTypeKind
         inner = mkTyVar (mkSystemName (unique 205) (mkTyVarOcc "inner")) liftedTypeKind

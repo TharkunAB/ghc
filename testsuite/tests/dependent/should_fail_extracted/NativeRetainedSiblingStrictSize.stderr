@@ -1,9 +1,6 @@
-NativeRetainedSiblingStrictSize.hs:10:56: error: [GHC-68947]
-    • No checked equations are available for ‘forceLetters’ in a type.
-      Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields.
-      Build the result from constructors, bound variables, or fully applied functions with checked equations.
-      In a recursive call, pass a field of the matched argument directly.
-      Bind any other arguments with variables and pass them unchanged in recursive calls.
+NativeRetainedSiblingStrictSize.hs:10:56: error: [GHC-70566]
+    • Cannot reduce the open call to ‘forceLetters’ in a type.
+        Reduction stopped at a case on the rigid argument p. A checked equation can retain this case until the argument's constructor is known.
     • In the second argument of ‘Vec’, namely ‘(forceLetters p)’
       In the type signature:
         strictSizeProof :: foreach (p :: Columns) ->

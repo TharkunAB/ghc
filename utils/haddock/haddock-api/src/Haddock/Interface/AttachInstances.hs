@@ -355,7 +355,12 @@ argCount :: Type -> Int
 argCount (AppTy t _) = argCount t + 1
 argCount (TyConApp _ ts) = length ts
 argCount (FunTy _ _ _ _ _) = 2
+argCount (DepFunTy _ _ _) = 2
+argCount (DepDictTy _ t) = argCount t
 argCount (ForAllTy _ _ t) = argCount t
+argCount (ExistsTy _ _ t) = argCount t
+argCount (TermAppTy _ _) = 1
+argCount (ClassAppTy {}) = 1
 argCount (CastTy t _) = argCount t
 argCount _ = 0
 
@@ -364,17 +369,24 @@ simplify (FunTy _ ma _ t1 t2)
   -- See Note [Arrow matchability in Haddock] in Haddock.Convert.
   = SimpleType (SName unrestrictedFunTyConName) [simplify t1, simplify t2, simplify ma]
 simplify (ForAllTy _ _ t) = simplify t
+simplify (ExistsTy _ _ t) = simplify t
+simplify (DepDictTy _ t) = simplify t
+simplify (DepFunTy _ b t) =
+  SimpleType (SName unrestrictedFunTyConName) [simplify (varType b), simplify t]
 simplify (AppTy t1 t2) = SimpleType s (ts ++ maybeToList (simplify_maybe t2))
   where
     (SimpleType s ts) = simplify t1
 simplify (TyVarTy v) = SimpleType (SName (tyVarName v)) []
-simplify (TermVarTy{}) = error "simplify: native runtime index is not supported"
-simplify (DepFunTy{}) = error "simplify: native dependent function is not supported"
+simplify (TermVarTy v) = SimpleType (SName (getName v)) []
+simplify (TermAppTy f a) = SimpleType (SName (getName f)) (maybeToList (simplify_maybe a))
+simplify (ClassAppTy f _ _ a _) = SimpleType (SName (getName f)) (maybeToList (simplify_maybe a))
 simplify (TyConApp tc ts) =
   SimpleType
     (SName (tyConName tc))
     (mapMaybe simplify_maybe ts)
 simplify (LitTy (NumTyLit n)) = SimpleIntTyLit n
+simplify (LitTy (IntPrimTyLit n)) = SimpleIntTyLit n
+simplify (LitTy (WordPrimTyLit n)) = SimpleIntTyLit n
 simplify (LitTy (StrTyLit s)) = SimpleStringTyLit (fastStringToText s)
 simplify (LitTy (CharTyLit c)) = SimpleCharTyLit c
 simplify (CastTy ty _) = simplify ty

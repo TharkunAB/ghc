@@ -1,6 +1,6 @@
 NativeMixedPackageInterfaceIncompatible.hs:11:30: error: [GHC-83865]
     • Couldn't match type ‘_’ with ‘True’
-      Expected: (Proxy w0, Proxy True)
+      Expected: (Proxy _, Proxy True)
         Actual: (Proxy _, Proxy _)
     • In the expression: fields
       In the expression: Pack _ fields

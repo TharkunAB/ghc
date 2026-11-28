@@ -2069,7 +2069,8 @@ rebuildLam env bndrs@(bndr:_) body cont
       = mkCast (mk_lams bndrs body) (mkPiCos Representational [(unmatchableDataConTy,b) | b <- bndrs] co)
       where
         co_vars  = tyCoVarsOfCo co
-        bad bndr = isCoVar bndr && bndr `elemVarSet` co_vars
+        bad bndr = bndr `elemVarSet` co_vars
+                   && (isCoVar bndr || (isId bndr && not (isNativeOpaqueValueId bndr)))
 
     mk_lams bndrs body
       = mkLams bndrs body

@@ -550,8 +550,8 @@ checkConstrainedSignature ctxt ty
     checkNested (TyConApp _ args) = traverse_ checkNested args
     checkNested (AppTy f a) = checkNested f >> checkNested a
     checkNested (CastTy ty _) = checkNested ty
-    checkNested ty@DepFunTy{} = checkNoConstrainedFamilyApps ty
-    checkNested ty@ExistsTy{} = checkNoConstrainedFamilyApps ty
+    checkNested (DepFunTy _ b body) = checkNested (varType b) >> checkNested body
+    checkNested (ExistsTy _ b body) = checkNested (varType b) >> checkNested body
     checkNested _ = pure ()
 
 -- | Emit one domain Wanted inside the binders of the written family use.
@@ -961,7 +961,15 @@ familyDomainObligations ty = State.evalStateT (go ty) emptyUFM
       binder_uses <- go (varType v)
       body_uses <- go body >>= close_retained v
       pure (binder_uses ++ body_uses)
-    go (ExistsTy _ v body) = forbidden [varType v, body]
+    go (ExistsTy _ v body) = do
+      binder_uses <- go (varType v)
+      body_uses <- map close_existential <$> go body
+      pure (binder_uses ++ body_uses)
+      where
+        close_existential (ScopedFamily fam _ sigma)
+          | v `elemVarSet` tyCoVarsOfType sigma
+          = UnsupportedFamily fam unsupportedFamilySite
+        close_existential use = use
     go (TermAppTy _ arg) = go arg
     go (CastTy t _) = go t
     go _ = pure []
@@ -1461,8 +1469,11 @@ check_type :: ValidityEnv -> Type -> TcM ()
 -- Rank 0 means no for-alls anywhere
 
 -- See Note [Validity of retained binders]
-check_type ve (DepDictTy dict body)
-  = do { unless (isNativeClassDictionaryId dict && not (dict `elemVarSet` ve_indices ve)) $
+check_type ve ty@(DepDictTy dict body)
+  = do { checkTcM (forAllAllowed (ve_rank ve)) $
+           let (env1, tidy_ty) = tidyOpenTypeX (ve_tidy_env ve) ty
+           in (env1, TcRnForAllRankErr (ve_rank ve) tidy_ty)
+       ; unless (isNativeClassDictionaryId dict && not (dict `elemVarSet` ve_indices ve)) $
            failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder dict)
        ; check_type ve (varType dict)
        ; check_type (ve { ve_indices = ve_indices ve `extendVarSet` dict }) body }
@@ -1483,8 +1494,12 @@ check_type ve (TermVarTy v)
   = do { unless (isNativeOpaqueValueId v || isNativeNamedOpaqueFunctionId v) $
            failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
        ; check_retained_index ve v }
-check_type ve (DepFunTy _ v body)
-  = do { unless (isNativeOpaqueValueId v && not (v `elemVarSet` ve_indices ve)) $
+check_type ve ty@(DepFunTy vis v body)
+  = do { when (vis == DepFunInvisible) $
+           checkTcM (forAllAllowed (ve_rank ve)) $
+             let (env1, tidy_ty) = tidyOpenTypeX (ve_tidy_env ve) ty
+             in (env1, TcRnForAllRankErr (ve_rank ve) tidy_ty)
+       ; unless (isNativeOpaqueValueId v && not (v `elemVarSet` ve_indices ve)) $
            failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
        ; unless (typeKind body `eqType` liftedTypeKind) $
            failWithTc $ TcRnRetainedQuantificationError (RetainedResultKind body)
@@ -2671,7 +2686,13 @@ dropCasts ty@(FunTy _ ma w t1 t2)
        , ft_arg = dropCasts t1, ft_res = dropCasts t2 }
 dropCasts (TyConApp tc tys)   = mkTyConApp tc (map dropCasts tys)
 dropCasts (ForAllTy ma b ty)  = ForAllTy (dropCasts ma) (dropCastsB b) (dropCasts ty)
-dropCasts ty                  = ty  -- LitTy, TyVarTy, CoercionTy
+dropCasts (ExistsTy fl tv ty) = ExistsTy fl tv (dropCasts ty)
+dropCasts (DepFunTy vis b ty) = DepFunTy vis b (dropCasts ty)
+dropCasts (DepDictTy d ty)    = DepDictTy d (dropCasts ty)
+dropCasts (ClassAppTy sel inst dict arg kind)
+                              = ClassAppTy sel (dropCasts inst) (dropCasts dict) (dropCasts arg) (dropCasts kind)
+dropCasts (TermAppTy f arg)   = TermAppTy f (dropCasts arg)
+dropCasts ty                  = ty  -- LitTy, TyVarTy, TermVarTy, CoercionTy
 
 dropCastsB :: TyVarBinder -> TyVarBinder
 dropCastsB b = b   -- Don't bother in the kind of a forall

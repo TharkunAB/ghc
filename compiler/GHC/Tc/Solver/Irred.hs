@@ -13,7 +13,7 @@ import GHC.Core.Coercion
 import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.Map.Type ( emptyTypeMap, extendTypeMap, lookupTypeMap )
 import GHC.Core.Predicate
-import GHC.Core.TyCon ( TyCon, TyConBndrVis(..), isPromotedDataCon, tyConBinders )
+import GHC.Core.TyCon ( TyCon, isGenerativeTyCon, isPromotedDataCon, tyConArity )
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare ( tcEqType )
 import GHC.Core.TyCo.FVs ( mkUnivCoDeps, univCoDepsHoles )
@@ -26,9 +26,11 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.TcType ( isMetaTyVar )
 
 import GHC.Types.Basic( SwapFlag(..) )
-import GHC.Types.Var ( Id, VarBndr(..) )
+import GHC.Types.Unique ( getUnique, nonDetCmpUnique )
+import GHC.Types.Var ( Id )
 import GHC.Types.Var.Set ( isEmptyVarSet )
 
+import GHC.Utils.Misc ( equalLength )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
@@ -36,7 +38,8 @@ import GHC.Data.Bag
 import GHC.Data.TrieMap ( alterTM )
 
 import Control.Applicative ( (<|>) )
-import Data.Maybe ( fromMaybe, isJust, listToMaybe )
+import Control.Monad ( zipWithM )
+import Data.Maybe ( fromMaybe, isJust, listToMaybe, mapMaybe )
 import Data.Void( Void )
 
 
@@ -90,6 +93,16 @@ try_inert_irreds inerts irred_w@(IrredCt { ir_ev = ev_w, ir_reason = reason })
                             ; updInertCans (updIrreds (\_ -> others))
                             ; continueWith () } }
 
+  | CtGiven {} <- ev_w
+  , Just (v, rhs_w, co_w) <- orientGivenTermIndex ev_w
+  , Just (_rhs_i, co_i, keep_inert, remaining) <- findInertGivenTermIndex (inert_irreds inerts) v rhs_w
+  = do { let derived_co = mkSymCo co_i `mkTransCo` co_w
+       ; emitNewGivens (ctEvLoc ev_w) [(Nominal, derived_co)]
+       ; if keep_inert
+         then stopWith ev_w "Interacted Given runtime-index equality"
+         else do { updInertCans (updIrreds (\_ -> remaining))
+                 ; continueWith () } }
+
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev_w
   , EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev_w)
   , isOpaqueTermIndex lhs || isOpaqueTermIndex rhs
@@ -102,11 +115,11 @@ try_inert_irreds inerts irred_w@(IrredCt { ir_ev = ev_w, ir_reason = reason })
   -- See Note [Using a promoted head from a retained index Given].
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev_w
   , EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev_w)
-  , Just (swap, index, tc, meta, expected) <-
+  , Just (swap, index, tc, metas, expected) <-
       promoted_wanted NotSwapped lhs rhs <|> promoted_wanted IsSwapped rhs lhs
   = do { binders <- getNativeBinderScope
-       ; unfilled <- isUnfilledMetaTyVar meta
-       ; case if isEmptyVarSet binders && unfilled
+       ; unfilled <- mapM isUnfilledMetaTyVar metas
+       ; case if isEmptyVarSet binders && or unfilled
               then findPromotedIndexGiven (inert_irreds inerts) index tc
               else Nothing of
            Nothing -> continueWith ()
@@ -123,13 +136,51 @@ try_inert_irreds inerts irred_w@(IrredCt { ir_ev = ev_w, ir_reason = reason })
 
   where
     ct_w = CIrredCan irred_w
-    promoted_wanted swap (TermVarTy index) ty@(TyConApp tc [TyVarTy meta])
+    promoted_wanted swap (TermVarTy index) ty@(TyConApp tc args)
       | isNativeIndexId index
       , isPromotedDataCon tc
-      , [Bndr _ AnonTCB] <- tyConBinders tc
-      , isMetaTyVar meta
-      = Just (swap, index, tc, meta, ty)
+      , length args == tyConArity tc
+      , let metas = filter isMetaTyVar (mapMaybe getTyVar_maybe args)
+      , not (null metas)
+      = Just (swap, index, tc, metas, ty)
     promoted_wanted _ _ _ = Nothing
+
+orientGivenTermIndex :: CtEvidence -> Maybe (Id, Type, Coercion)
+orientGivenTermIndex ev
+  | EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev)
+  , typeKind lhs `tcEqType` typeKind rhs
+  = let co = ctEvCoercion ev
+    in case (lhs, rhs) of
+         (TermVarTy v1, TermVarTy v2)
+           | isNativeOpaqueValueId v1, isNativeOpaqueValueId v2, v1 /= v2 ->
+               if nonDetCmpUnique (getUnique v1) (getUnique v2) == GT
+               then Just (v1, rhs, co)
+               else Just (v2, lhs, mkSymCo co)
+         (TermVarTy v, r)
+           | isNativeOpaqueValueId v, not (anyFreeVarsOfType (== v) r) ->
+               Just (v, r, co)
+         (l, TermVarTy v)
+           | isNativeOpaqueValueId v, not (anyFreeVarsOfType (== v) l) ->
+               Just (v, l, mkSymCo co)
+         _ -> Nothing
+  | otherwise = Nothing
+
+findInertGivenTermIndex :: InertIrreds -> Id -> Type -> Maybe (Type, Coercion, Bool, InertIrreds)
+findInertGivenTermIndex irreds target rhs_w = go [] (bagToList irreds)
+  where
+    prefer_rhs r
+      | Just (tc, _) <- splitTyConApp_maybe r = isPromotedDataCon tc
+      | otherwise = False
+    go _ [] = Nothing
+    go acc (irred : rest)
+      | ev_i@CtGiven {} <- irredCtEvidence irred
+      , Just (v, rhs_i, co_i) <- orientGivenTermIndex ev_i
+      , v == target
+      , not (rhs_i `tcEqType` rhs_w)
+      = let keep_inert = prefer_rhs rhs_i || not (prefer_rhs rhs_w)
+            others = listToBag (reverse acc ++ rest)
+        in Just (rhs_i, co_i, keep_inert, others)
+      | otherwise = go (irred : acc) rest
 
 -- | Find the nominal Given that fixes an argument of this promoted head.
 -- See Note [Using a promoted head from a retained index Given].
@@ -144,9 +195,10 @@ findPromotedIndexGiven irreds index head_tc =
         in orient lhs rhs co <|> orient rhs lhs (mkSymCo co)
       | otherwise = Nothing
 
-    orient (TermVarTy witness) ty@(TyConApp tc [arg]) co
+    orient (TermVarTy witness) ty@(TyConApp tc args) co
       | witness == index, tc == head_tc
-      , not (hasNativeDependentExpr (Core.Type arg))
+      , length args == tyConArity tc
+      , all (not . hasNativeDependentExpr . Core.Type) args
       = Just (ty, co)
     orient _ _ _ = Nothing
 
@@ -185,16 +237,18 @@ findRetainedIndexProof irreds lhs rhs = direct <|> chained
           , right `sameEndpoint` rhs ]
 
     chained
-      | isOpaqueTermIndex lhs = findPath lhs rhs
-      | otherwise = mkSymCo <$> findPath rhs lhs
+      | isOpaqueTermIndex lhs = findPath (8 :: Int) lhs rhs
+      | otherwise = mkSymCo <$> findPath (8 :: Int) rhs lhs
 
-    findPath start target = go emptyTypeMap [(start, [])]
+    findPath :: Int -> Type -> Type -> Maybe Coercion
+    findPath fuel start target = go emptyTypeMap [(start, [])]
       where
         go _ [] = Nothing
         go seen ((current, path) : pending)
-          | sameEndpoint current target
+          | Just tail_co <- finishEndpoint fuel current target
           , co:rest <- path
-          = Just (foldl' (flip mkTransCo) co rest)
+          = let path_co = foldl' (flip mkTransCo) co rest
+            in Just (if isReflCo tail_co then path_co else path_co `mkTransCo` tail_co)
           | not (isOpaqueTermIndex current) || isJust (lookupTypeMap seen current)
           = go seen pending
           | otherwise
@@ -202,6 +256,33 @@ findRetainedIndexProof irreds lhs rhs = direct <|> chained
           where
             next = fromMaybe [] (lookupTypeMap graph current)
             push (endpoint, co) todo = (endpoint, co:path) : todo
+
+    finishEndpoint :: Int -> Type -> Type -> Maybe Coercion
+    finishEndpoint _ cur tgt
+      | sameEndpoint cur tgt = Just (mkNomReflCo cur)
+    finishEndpoint fuel cur tgt
+      | fuel > 0
+      , typeKind cur `tcEqType` typeKind tgt
+      = case (splitTyConApp_maybe cur, splitTyConApp_maybe tgt) of
+          (Just (tc1, args1), Just (tc2, args2))
+            | tc1 == tc2
+            , isGenerativeTyCon tc1 Nominal
+            , equalLength args1 args2 ->
+                mkTyConAppCo Nominal tc1 <$> zipWithM (proveSub (fuel - 1)) args1 args2
+          _ -> case (splitAppTy_maybe cur, splitAppTy_maybe tgt) of
+            (Just (f1, a1), Just (f2, a2))
+              | typeKind a1 `tcEqType` typeKind a2 ->
+                  mkAppCo <$> proveSub (fuel - 1) f1 f2 <*> proveSub (fuel - 1) a1 a2
+            _ -> Nothing
+      | otherwise = Nothing
+
+    proveSub :: Int -> Type -> Type -> Maybe Coercion
+    proveSub fuel a b
+      | sameEndpoint a b = Just (mkNomReflCo a)
+      | fuel <= 0 = Nothing
+      | isOpaqueTermIndex a = findPath fuel a b
+      | isOpaqueTermIndex b = mkSymCo <$> findPath fuel b a
+      | otherwise = finishEndpoint fuel a b
 
     graph = foldl' addArc emptyTypeMap edges
 

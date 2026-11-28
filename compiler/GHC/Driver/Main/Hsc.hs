@@ -46,8 +46,7 @@ module GHC.Driver.Main.Hsc
 
 import GHC.Prelude
 
-import Data.List (find)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isNothing)
 
 import GHC.Driver.Plugins
 import GHC.Driver.Session
@@ -192,15 +191,13 @@ checkNativeDependentModule hsc_env binds rules tycons = do
       reject "module compilation without an object or bytecode backend"
     when (backendUseJSLinker (backend dflags) || platformArch (targetPlatform dflags) == ArchJavaScript) $
       reject "JavaScript code generation"
-    when (sccProfilingEnabled dflags || profAuto dflags /= NoProfAuto
+    when (profAuto dflags /= NoProfAuto
           || not (null (callerCcFilters dflags))
           || any (`gopt` dflags) [ Opt_ProfLateInlineCcs, Opt_ProfLateCcs
                                 , Opt_ProfLateOverloadedCcs, Opt_ProfLateoverloadedCallsCCs ]) $
       reject "profiling or late cost-centre insertion"
     when (usesOptimizedFlags dflags && isNothing opt_level) $
       reject "optimized module compilation with these options (use -O0 or a standard -O1 or -O2 native object pipeline)"
-    unless (gopt Opt_OmitInterfacePragmas dflags || isJust opt_level) $
-      reject "interface unfolding generation (use -fomit-interface-pragmas)"
     when (gopt Opt_WriteIfSimplifiedCore dflags && not (supportsScopedDictionaryCore binds)) $
       reject "Core interface serialization (use -fno-write-if-simplified-core)"
     -- See Note [Plugin hooks and Dependent Haskell pipelines] in GHC.Driver.Plugins.
@@ -221,27 +218,20 @@ nativeDependentConstructors tycons =
   , dc <- dcs
   , not (null (dataConRepArgBinders dc)) ]
 
--- | Select a standard -O1 or -O2 object-code schedule.
+-- | Select a retained optimization level when optimization passes are active
+-- and no unsupported transformation flags are enabled.
 -- See Note [Disabling rewrite rules in retained modules].
--- Native modules still require the interface and plugin checks above.
 nativeOptLevel :: DynFlags -> Maybe Int
 nativeOptLevel dflags
-  | backendNeedsPlatformNcgSupport (backend dflags)
-    && simplPhases dflags == 2
-    && maxSimplIterations dflags == 4
-    && null (strictnessBefore dflags)
-    && floatLamArgs dflags == Just 0
-    && not (any (`gopt` dflags)
-          [ Opt_ByteCodeAndObjectCode, Opt_WriteByteCode,
-            Opt_LateDmdAnal, Opt_LateSpecialise, Opt_StaticArgumentTransformation,
-            Opt_WorkerWrapperUnlift, Opt_SpecEvalDictFun ])
-  = find (\level -> all (matchesLevel level) optLevelFlags) [1, 2]
+  | usesOptimizedFlags dflags
+  , not (any (`gopt` dflags)
+      [ Opt_LateSpecialise, Opt_WorkerWrapperUnlift, Opt_SpecEvalDictFun ])
+  = Just (if uses_o2_flag then 2 else 1)
   | otherwise = Nothing
   where
-    matchesLevel level (levels, flag)
-      | flag == Opt_OmitInterfacePragmas = True
-      | flag == Opt_EnableRewriteRules, not (gopt flag dflags) = True
-      | otherwise = gopt flag dflags == (level `elem` levels)
+    uses_o2_flag =
+      any (\(levels, flag) -> 2 `elem` levels && 1 `notElem` levels && gopt flag dflags)
+          optLevelFlags
 
 {- Note [Disabling rewrite rules in retained modules]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

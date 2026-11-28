@@ -49,6 +49,7 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint (WantedConstraints(wc_simple, wc_impl), emptyWC, andWC, isEmptyWC, CtEvidence(CtWanted), TcEvDest(EvVarDest),
                                 ctPred, ctEvLoc, ctEvEvId, mkWantedCt,
                                 mkNonCanonical, DelayedError(DE_SourceMethod), Implication(..))
+import GHC.Tc.Types.CtLoc ( CtLoc )
 import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..), ReportRedundantConstraints(NoRRC) )
 import GHC.Tc.Types.LclEnv ( getLclEnvBinderStack, getLclEnvTypeEnv )
 import GHC.Tc.Types.Origin
@@ -633,7 +634,8 @@ demoteAppMetas outer_lvl app_lvl wanted mb_ty = do
     do_tv :: TcTyVar -> FV () ZonkUnit
     do_tv tv
       | isTcTyVar tv
-      , MetaTv { mtv_ref = ref, mtv_tclvl = lvl, mtv_info = info } <- tcTyVarDetails tv
+      , MetaTv { mtv_ref = ref, mtv_tclvl = lvl, mtv_info = info
+               , mtv_term_depth = depth } <- tcTyVarDetails tv
       = MkFV $ \_ -> ZU $ do
           flex <- readTcRef ref
           case flex of
@@ -643,7 +645,10 @@ demoteAppMetas outer_lvl app_lvl wanted mb_ty = do
                   let kind = tyVarKind tv
                   go_ty kind
                   ref2 <- newTcRef Flexi
-                  let details = MetaTv { mtv_info = info, mtv_ref = ref2, mtv_tclvl = outer_lvl }
+                  let details = MetaTv { mtv_info       = info
+                                       , mtv_ref        = ref2
+                                       , mtv_tclvl      = outer_lvl
+                                       , mtv_term_depth = depth }
                       tv2 = mkTcTyVar (tyVarName tv) kind details
                   writeTcRef ref (Indirect (mkTyVarTy tv2))
               | otherwise -> pure ()
@@ -2077,6 +2082,45 @@ tcRetainedDeclaredArgType view (L _ (ExplicitList _ fields))
   = fmap (fmap mkListTy) (tcRetainedListElementType (tcRetainedDeclaredArgType view) fields)
 tcRetainedDeclaredArgType _ (L _ (HsLit _ HsChar{})) = return (Just charTy)
 tcRetainedDeclaredArgType _ (L _ (HsLit _ HsString{})) = return (Just (mkListTy charTy))
+tcRetainedDeclaredArgType view_type expr@(L loc HsAppType{})
+  | Just (name, written@(_:_)) <- retainedSourceHead expr
+  = setSrcSpan (locA loc) $
+    do { mb_id <- tcLookupIdMaybe name
+       ; case mb_id of
+           Just var -> do
+             { ty0 <- zonkAppTypeIfNeeded (varType var)
+             ; (mb_ty, w) <- captureConstraints $
+                 discardErrs $ tryTcDiscardingErrs (return Nothing) $
+                   runMaybeT $ foldM (step_vta var) ty0 written
+             ; case mb_ty of
+                 Just ty
+                   | isEmptyWC w -> do
+                       { valid <- tcRetainedInstScope [ty]
+                       ; let (tvs, theta, _) = tcRetainedInstTelescope ty
+                       ; if valid && null tvs && null theta && isRetainedValueType ty
+                                  && noQuickLookVars ty
+                         then do { view <- view_type ty
+                                 ; return (if isRetainedValueType view && noQuickLookVars view
+                                           then Just view else Nothing) }
+                         else return Nothing }
+                 _ -> return Nothing }
+           Nothing -> return Nothing }
+  where
+    step_vta var sigma hs_ty = do
+      let (inf_tvs, body0)   = tcSplitSomeForAllTyVars isInferredForAllTyFlag sigma
+          (inf_theta, body1) = tcSplitPhiTy body0
+      sigma1 <- if null inf_tvs && null inf_theta
+                then return sigma
+                else snd <$> liftMaybeT (instantiateSigmaQLWithAcc [] NoQL
+                               (OccurrenceOf (idName var)) (idConcreteTvs var) inf_tvs inf_theta body1)
+      case tcSplitForAllTyVarBinder_maybe sigma1 of
+        Just (_, binder, _)
+          | isSpecifiedForAllTyFlag (binderFlag binder) -> do
+              (_, body) <- liftMaybeT (tcVTA (idConcreteTvs var) sigma1 Nothing hs_ty)
+              body' <- liftMaybeT (liftZonkM (zonkTcType body))
+              guard (not (any (\v -> isTcTyVar v && isMetaTyVar v) (tyCoVarsOfTypeList body')))
+              return body'
+        _ -> mzero
 tcRetainedDeclaredArgType view_type (L loc (HsVar _ lname))
   | not (isDataOcc (nameOccName (unLocWithUserRdr lname)))
   = setSrcSpan (locA loc) $
@@ -2111,13 +2155,6 @@ tcRetainedDeclaredArgType view_type (L loc (HsVar _ lname))
                 ; return (if valid then Just fun_ty else Nothing) }
         _ -> return Nothing
 tcRetainedDeclaredArgType _ _ = return Nothing
-
--- | Use the ordinary constructor application for a complete boxed pair.
--- See Note [Erased parameters of a retained constructor argument].
-retainedPairApplication :: HsExpr GhcRn -> Maybe (LHsExpr GhcRn)
-retainedPairApplication (ExplicitTuple _ [Present _ first, Present _ second] Boxed)
-  = Just (nlHsApps (dataConName (tupleDataCon Boxed 2)) [first, second])
-retainedPairApplication _ = Nothing
 
 -- | Read a visible retained argument's type from its constructor fields or
 -- saturated certified source calls.

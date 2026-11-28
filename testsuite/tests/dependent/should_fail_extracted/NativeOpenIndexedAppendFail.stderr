@@ -23,7 +23,7 @@ NativeOpenIndexedAppendFail.hs:13:13: error: [GHC-25897]
 NativeOpenIndexedAppendFail.hs:17:20: error: [GHC-83865]
     • Couldn't match type ‘xs2’ with ‘ys2’
       Expected: P.appendVec P.VNil xs2 :~: ys2
-        Actual: P.appendVec P.VNil xs2 :~: P.appendVec P.VNil xs2
+        Actual: xs2 :~: xs2
     • In the expression: Refl
       In an equation for ‘wrongRuntime’: wrongRuntime _ _ = Refl
 
@@ -44,8 +44,8 @@ NativeOpenIndexedAppendFail.hs:25:38: error: [GHC-05617]
           P.S k
             -> (appendEmptyAt @a @('P.S k) xs, appendEmptyAt @a @('P.S k) ys)
     • Relevant bindings include
-        xs_a4F4 :: P.Vec a n1 (bound at <no location info>)
-        ys_a4F5 :: P.Vec a n1 (bound at <no location info>)
+        xs_a4GC :: P.Vec a n1 (bound at <no location info>)
+        ys_a4GD :: P.Vec a n1 (bound at <no location info>)
         wrongAppendPair :: foreach (n :: P.Nat)
                            -> foreach (xs :: P.Vec a n)
                               -> foreach (ys :: P.Vec a n) -> (EmptyLaw a n xs, EmptyLaw a n ys)
@@ -55,8 +55,8 @@ NativeOpenIndexedAppendFail.hs:31:23: error: [GHC-83865]
     • Couldn't match type ‘x1’ with ‘y’
       Expected: P.appendVec (P.VCons x1 xs) ys
                 :~: P.VCons y (P.appendVec xs ys)
-        Actual: P.appendVec (P.VCons x1 xs) ys
-                :~: P.appendVec (P.VCons x1 xs) ys
+        Actual: P.VCons x1 (P.appendVec xs ys)
+                :~: P.VCons x1 (P.appendVec xs ys)
     • In the expression: Refl
       In an equation for ‘wrongConsAt’: wrongConsAt _ _ _ _ = Refl
 

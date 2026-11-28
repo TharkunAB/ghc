@@ -1,5 +1,5 @@
 NativeCertifiedSplitReject.hs:19:47: error: [GHC-05617]
-    • Could not deduce ‘P.appendVec left right ~ xs1’
+    • Could not deduce ‘P.appendVec left right ~ xs2’
       from the context: (cut ~ P.S k,
                          P.Vec a (P.plus cut m) ~ P.Vec a (P.plus (P.S k) m))
         bound by a pattern with constructor: P.S :: P.Nat -> P.Nat,
@@ -11,26 +11,33 @@ NativeCertifiedSplitReject.hs:19:47: error: [GHC-05617]
                               a -> P.Vec a n -> P.Vec a (P.S n),
                  in a case alternative
         at NativeCertifiedSplitReject.hs:16:25-36
-      Expected: P.appendVec (P.VCons x left) right :~: P.VCons x xs1
-        Actual: P.appendVec (P.VCons x left) right
-                :~: P.appendVec (P.VCons x left) right
+      Expected: P.appendVec (P.VCons x left) right :~: P.VCons x xs2
+        Actual: P.VCons x xs2 :~: P.VCons x xs2
     • In the second argument of ‘Pair’, namely ‘Refl’
       In the second argument of ‘Pair’, namely ‘(Pair right Refl)’
       In the expression: Pair (P.VCons x left) (Pair right Refl)
     • Relevant bindings include
-        _premise :: P.appendVec left right :~: xs1
+        _premise :: P.appendVec left right :~: xs2
           (bound at NativeCertifiedSplitReject.hs:18:31)
         right :: P.Vec a m (bound at NativeCertifiedSplitReject.hs:18:25)
         left :: P.Vec a k (bound at NativeCertifiedSplitReject.hs:18:14)
         xs :: P.Vec a n (bound at NativeCertifiedSplitReject.hs:16:35)
         x :: a (bound at NativeCertifiedSplitReject.hs:16:33)
-        missingPremise :: foreach (cut :: P.Nat)
-                          -> foreach (v :: P.Vec a (P.Add cut m)) -> SplitAtValue a cut m v
-          (bound at NativeCertifiedSplitReject.hs:15:1)
+        retained_case :: P.Vec a (P.Add cut3 m)
+          (bound at <no location info>)
+        (Some bindings suppressed; use -fmax-relevant-binds=N or -fno-max-relevant-binds)
 
-NativeCertifiedSplitReject.hs:27:42: error: [GHC-83865]
-    • Couldn't match expected type: SplitAtValue a cut2 suffix2 v
-                  with actual type: SplitAtValue a cut2 suffix2 other
+NativeCertifiedSplitReject.hs:27:42: error: [GHC-05617]
+    • Could not deduce ‘CertifiedSplit.$lambda:SplitAtValue:0-sigma
+                          a cut2 suffix2 other
+                        ~ CertifiedSplit.$lambda:SplitAtValue:0-sigma a cut2 suffix2 v’
+      from the context: total2 ~ P.plus cut2 suffix2
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeCertifiedSplitReject.hs:26:23-26
+      Expected: SplitAtValue a cut2 suffix2 v
+        Actual: SplitAtValue a cut2 suffix2 other
       Note: GHC cannot infer the captured indices of this retained sum from its payload type.
     • In the first argument of ‘SplitAtWidth’, namely
         ‘(splitAtValue cut other)’
@@ -47,9 +54,17 @@ NativeCertifiedSplitReject.hs:27:42: error: [GHC-83865]
                              -> P.Vec a total -> Maybe (CheckedSplitAtValue a cut total v)
           (bound at NativeCertifiedSplitReject.hs:24:1)
 
-NativeCertifiedSplitReject.hs:36:14: error: [GHC-83865]
-    • Couldn't match expected type: SplitAtValue a cut1 suffix1 xs
-                  with actual type: SplitAtValue a cut1 suffix1 ys
+NativeCertifiedSplitReject.hs:36:14: error: [GHC-05617]
+    • Could not deduce ‘CertifiedSplit.$lambda:SplitAtValue:0-sigma
+                          a cut1 suffix1 ys1
+                        ~ CertifiedSplit.$lambda:SplitAtValue:0-sigma a cut1 suffix1 xs1’
+      from the context: total1 ~ P.plus cut1 suffix1
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeCertifiedSplitReject.hs:34:23-26
+      Expected: SplitAtValue a cut1 suffix1 xs1
+        Actual: SplitAtValue a cut1 suffix1 ys1
       Note: GHC cannot infer the captured indices of this retained sum from its payload type.
     • In the first argument of ‘SplitBothAtWidth’, namely
         ‘(splitAtValue cut ys)’
@@ -69,9 +84,17 @@ NativeCertifiedSplitReject.hs:36:14: error: [GHC-83865]
                                    -> Maybe (CheckedSplitBoth a a cut total xs ys)
           (bound at NativeCertifiedSplitReject.hs:32:1)
 
-NativeCertifiedSplitReject.hs:36:36: error: [GHC-83865]
-    • Couldn't match expected type: SplitAtValue a cut1 suffix1 ys
-                  with actual type: SplitAtValue a cut1 suffix1 xs
+NativeCertifiedSplitReject.hs:36:36: error: [GHC-05617]
+    • Could not deduce ‘CertifiedSplit.$lambda:SplitAtValue:0-sigma
+                          a cut1 suffix1 xs1
+                        ~ CertifiedSplit.$lambda:SplitAtValue:0-sigma a cut1 suffix1 ys1’
+      from the context: total1 ~ P.plus cut1 suffix1
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeCertifiedSplitReject.hs:34:23-26
+      Expected: SplitAtValue a cut1 suffix1 ys1
+        Actual: SplitAtValue a cut1 suffix1 xs1
       Note: GHC cannot infer the captured indices of this retained sum from its payload type.
     • In the second argument of ‘SplitBothAtWidth’, namely
         ‘(splitAtValue cut xs)’
@@ -93,9 +116,9 @@ NativeCertifiedSplitReject.hs:36:36: error: [GHC-83865]
 
 NativeCertifiedSplitReject.hs:44:28: error: [GHC-83865]
     • Couldn't match kind ‘P.plus cut suffix’ with ‘total’
-      Expected: SplitBothAtWidth a b cut suffix total xs2 ys1
+      Expected: SplitBothAtWidth a b cut suffix total xs ys
         Actual: SplitBothAtWidth
-                  a b cut suffix (P.plus cut suffix) xs2 ys1
+                  a b cut suffix (P.plus cut suffix) xs0 ys0
     • In the second argument of ‘Pair’, namely
         ‘(SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys))’
       In the first argument of ‘Just’, namely
@@ -110,6 +133,29 @@ NativeCertifiedSplitReject.hs:44:28: error: [GHC-83865]
     • Relevant bindings include
         ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
         xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
+
+NativeCertifiedSplitReject.hs:45:14: error: [GHC-83865]
+    • Couldn't match expected type: SplitAtValue a cut suffix xs0
+                  with actual type: SplitAtValue a cut suffix xs
+      Note: GHC cannot infer the captured indices of this retained sum from its payload type.
+      The type variable ‘xs0’ is ambiguous
+    • In the first argument of ‘SplitBothAtWidth’, namely
+        ‘(splitAtValue cut xs)’
+      In the second argument of ‘Pair’, namely
+        ‘(SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys))’
+      In the first argument of ‘Just’, namely
+        ‘(Pair
+            suffix
+            (SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys)))’
+    • Relevant bindings include
+        ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
+        xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
+        noLengthProof :: foreach (cut :: P.Nat)
+                         -> foreach (total :: P.Nat)
+                            -> foreach (xs :: P.Vec a total)
+                               -> foreach (ys :: P.Vec b total)
+                                  -> Maybe (CheckedSplitBoth a b cut total xs ys)
+          (bound at NativeCertifiedSplitReject.hs:41:1)
 
 NativeCertifiedSplitReject.hs:45:31: error: [GHC-83865]
     • Couldn't match type ‘P.plus cut suffix’ with ‘total’
@@ -126,6 +172,29 @@ NativeCertifiedSplitReject.hs:45:31: error: [GHC-83865]
     • Relevant bindings include
         ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
         xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
+
+NativeCertifiedSplitReject.hs:45:36: error: [GHC-83865]
+    • Couldn't match expected type: SplitAtValue b cut suffix ys0
+                  with actual type: SplitAtValue b cut suffix ys
+      Note: GHC cannot infer the captured indices of this retained sum from its payload type.
+      The type variable ‘ys0’ is ambiguous
+    • In the second argument of ‘SplitBothAtWidth’, namely
+        ‘(splitAtValue cut ys)’
+      In the second argument of ‘Pair’, namely
+        ‘(SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys))’
+      In the first argument of ‘Just’, namely
+        ‘(Pair
+            suffix
+            (SplitBothAtWidth (splitAtValue cut xs) (splitAtValue cut ys)))’
+    • Relevant bindings include
+        ys :: P.Vec b total (bound at NativeCertifiedSplitReject.hs:41:28)
+        xs :: P.Vec a total (bound at NativeCertifiedSplitReject.hs:41:25)
+        noLengthProof :: foreach (cut :: P.Nat)
+                         -> foreach (total :: P.Nat)
+                            -> foreach (xs :: P.Vec a total)
+                               -> foreach (ys :: P.Vec b total)
+                                  -> Maybe (CheckedSplitBoth a b cut total xs ys)
+          (bound at NativeCertifiedSplitReject.hs:41:1)
 
 NativeCertifiedSplitReject.hs:45:53: error: [GHC-83865]
     • Couldn't match type ‘P.plus cut suffix’ with ‘total’

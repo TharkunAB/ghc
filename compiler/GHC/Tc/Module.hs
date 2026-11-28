@@ -137,6 +137,7 @@ import GHC.Core.DataCon
 import GHC.Core.ConLike (ConLike(RealDataCon))
 import GHC.Core.OpenWhnf (openDataConFieldTypes)
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Compare ( eqScopedSigmaClosures, eqScopedLambdaClosures )
 import GHC.Core.Type
 import GHC.Core.Class
 import GHC.Core.Coercion (coercionLKind, coercionRKind)
@@ -146,7 +147,7 @@ import GHC.Core.TyCo.Ppr( debugPprType )
 import GHC.Core.TyCo.Tidy( tidyTopType )
 import GHC.Core.FamInstEnv
    ( FamInst, pprFamInst, famInstsRepTyCons, orphNamesOfFamInst
-   , famInstEnvElts, extendFamInstEnvList, emptyFamInstEnvs, normaliseType )
+   , famInstEnvElts, extendFamInstEnvList, emptyFamInstEnvs, normaliseType, normaliseTypeWithFuel )
 
 import GHC.Parser.Header       ( mkImplicitImports, mkUnresolvedImport )
 
@@ -1413,6 +1414,8 @@ checkHiBootIface'
             for mb_fld_id $ \ fld_id -> do
               let local_boot_var =
                     Id.mkExportedVanillaId missing_name (idType fld_id)
+              for_ (lookupTypeEnv boot_type_env missing_name) $ \ boot_val ->
+                checkBootDeclM HsBoot boot_val (AnId local_boot_var)
               return (local_boot_var, fld_id)
 
           -- Otherwise: report that the hs file does not export something
@@ -1560,11 +1563,15 @@ wrapErrs f w =
 -- code. Returns @Nothing@ on success or @Just "some helpful info for user"@
 -- failure. If the difference will be apparent to the user, @Just empty@ is
 -- perfectly suitable.
+bootEqType :: Type -> Type -> Bool
+bootEqType t1 t2
+  = eqType t1 t2 || eqScopedSigmaClosures t1 t2 || eqScopedLambdaClosures t1 t2
+
 checkBootDecl :: HsBootOrSig -> TyThing -> TyThing -> BootErrsM BootMismatchWhat
 
 checkBootDecl _ (AnId id1) (AnId id2)
   = assert (id1 == id2) $
-    check (idType id1 `eqType` idType id2)
+    check (idType id1 `bootEqType` idType id2)
           (BootMismatchedIdTypes id1 id2)
 
 checkBootDecl boot_or_sig (ATyCon tc1) (ATyCon tc2)
@@ -1627,7 +1634,8 @@ checkBootTyCon boot_or_sig tc1 tc2
   , Just env <- eqVarBndrs emptyRnEnv2 (tyConTyVars tc1) (tyConTyVars tc2)
   = assert (tc1 == tc2) $
   do { check_roles
-     ; check (eqTypeX env syn_rhs1 syn_rhs2) $
+     ; let syn_rhs1' = substTyWith (tyConTyVars tc1) (mkTyVarTys (tyConTyVars tc2)) syn_rhs1
+     ; check (eqTypeX env syn_rhs1 syn_rhs2 || bootEqType syn_rhs1' syn_rhs2) $
         TyConSynonymMismatch syn_rhs1 syn_rhs2 }
 
   -- This allows abstract 'data T a' to be implemented using 'type T = ...'
@@ -1677,7 +1685,7 @@ compatClassOp :: RnEnv2 -> HsBootOrSig -> ClassOpItem -> ClassOpItem -> BootErrs
 compatClassOp env boot_or_sig (id1, def_meth1) (id2, def_meth2)
   = do { check (name1 == name2) $
            MismatchedMethodNames
-       ; check (eqTypeX env op_ty1 op_ty2) $
+       ; check (eqTypeX env op_ty1 op_ty2 || bootEqType (idType id1) (idType id2)) $
            MismatchedMethodTypes op_ty1 op_ty2
        ; case boot_or_sig of
            HsBoot ->
@@ -1780,7 +1788,7 @@ compatCon c1 c2
            MismatchedDataConBangs
        ; check (map flSelector (dataConFieldLabels c1) == map flSelector (dataConFieldLabels c2))
            MismatchedDataConFieldLabels
-       ; check (eqType (dataConWrapperType c1) (dataConWrapperType c2))
+       ; check (bootEqType (dataConWrapperType c1) (dataConWrapperType c2))
            MismatchedDataConTypes }
 
 eqClosedFamilyAx :: Maybe (CoAxiom br) -> Maybe (CoAxiom br1)
@@ -2195,6 +2203,11 @@ tcIndependentFamilyProducersWith prev_deriv demands group@HsGroup
         closed_family_uses _ = Nothing
         early_type_dependencies name
           | not (nameIsLocalOrFrom this_mod name) = Right emptyNameSet
+          -- An earlier source-table stage can move a local TyClGroup into
+          -- tcg_type_env while remaining groups still list it in group_ext.
+          | not (name `elemNameEnv` data_groups)
+          , Just (ATyCon tc) <- lookupTypeEnv (tcg_type_env env) name
+          , independentDataKind tc = Right emptyNameSet
           | otherwise = case lookupNameEnv data_groups name of
               Just tg
                 | Just fv_sets <- traverse early_decl_uses (group_tyclds tg)
@@ -3395,7 +3408,11 @@ tcLocalOpenGroupWith prev_deriv demands group@HsGroup
           typeDeps lv ("local dependency " ++ getOccString owner) (valueNeedsTerm root owner) dep
 
     typeDeps :: (forall a. Data a => a -> [Name]) -> String -> (Name -> Name -> String) -> Name -> Either String NameSet
-    typeDeps _ _ _ dep | dep `elemNameSet` instance_binders = Right emptyNameSet
+    -- An earlier stage of this HsGroup can check a local TyClGroup and remove
+    -- it from group_names while remaining groups still list it in group_ext.
+    typeDeps _ _ _ dep
+      | dep `elemNameSet` instance_binders || not (dep `elemNameSet` group_names)
+      = Right emptyNameSet
     typeDeps lv owner needs_term dep = case lookupNameEnv types dep of
       Just (leader, tg)
         | dep /= leader -> Right (unitNameSet leader)
@@ -3505,7 +3522,7 @@ localOpenDefinitions demands evidence binds = do
         definition_names = unionNameSets (map fst relevant_binds)
     when (any hasPendingTypedSplice relevant) $
       rejectLocalOpen demands "This earlier definition contains a pending typed splice."
-    (_, zonked_ev_binds, zonked, _, _, _, _) <- zonkTopDecls evidence relevant [] [] [] []
+    (_, zonked_ev_binds, zonked, _, _, _, _) <- withReadOnlyFinalZonk $ zonkTopDecls evidence relevant [] [] [] []
     let collect_lets (Core.Let b e) = let (bs, body) = collect_lets e in (b : bs, body)
         collect_lets e              = ([], e)
     (messages, proposal) <- initDsTc $
@@ -4691,7 +4708,7 @@ tcRnExpr hsc_env mode rdr_expr
 
     -- See Note [Normalising the type in :type]
     fam_envs <- tcGetFamInstEnvs ;
-    let { normalised_type = reductionReducedType $ normaliseType fam_envs Nominal ty
+    let { normalised_type = reductionReducedType $ normaliseTypeWithFuel 2000 fam_envs Nominal ty
           -- normaliseType returns a coercion which we discard, so the Role is irrelevant.
         ; final_type = if isSigmaTy res_ty then ty else normalised_type } ;
     return final_type }

@@ -1,4 +1,4 @@
-NativeSourceLengthEmpty.hs:11:18: error: [GHC-83865]
+NativeSourceLengthEmpty.hs:11:19: error: [GHC-83865]
     • Couldn't match type ‘Z’ with ‘S n0’
       Expected: Vec Int ((1 :: Nat) + n0)
         Actual: Vec Int (sourceLength '[])
@@ -7,7 +7,7 @@ NativeSourceLengthEmpty.hs:11:18: error: [GHC-83865]
       In the expression: safeHead (sourceVector @Int [])
       In an equation for ‘empty’: empty = safeHead (sourceVector @Int [])
 
-NativeSourceLengthEmpty.hs:16:20: error: [GHC-83865]
+NativeSourceLengthEmpty.hs:16:21: error: [GHC-83865]
     • Couldn't match type: sourceLength xs
                      with: S n1
       Expected: Vec Int ((1 :: Nat) + n1)
@@ -17,7 +17,7 @@ NativeSourceLengthEmpty.hs:16:20: error: [GHC-83865]
         ‘(safeHead (sourceVector xs))’
       In a stmt of a 'do' block: pure (safeHead (sourceVector xs))
 
-NativeSourceLengthEmpty.hs:19:29: error: [GHC-83865]
+NativeSourceLengthEmpty.hs:19:30: error: [GHC-83865]
     • Couldn't match type: plus n (S Z)
                      with: S n2
       Expected: Vec Bool ((1 :: Nat) + n2)
@@ -40,10 +40,11 @@ NativeSourceLengthEmpty.hs:22:44: error: [GHC-25897]
         the type signature for:
           badCell :: forall a b. a -> [b] -> a
         at NativeSourceLengthEmpty.hs:21:1-24
-    • In the expression: sourceVector (x : ys)
-      In the first argument of ‘safeHead’, namely
+    • In the first argument of ‘safeHead’, namely
         ‘(sourceVector (x : ys))’
       In the expression: safeHead (sourceVector (x : ys))
+      In an equation for ‘badCell’:
+          badCell x ys = safeHead (sourceVector (x : ys))
     • Relevant bindings include
         ys :: [b] (bound at NativeSourceLengthEmpty.hs:22:11)
         x :: a (bound at NativeSourceLengthEmpty.hs:22:9)

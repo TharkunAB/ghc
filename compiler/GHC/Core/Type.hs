@@ -1709,6 +1709,8 @@ splitUninstantiatedValArgTys ty = go ty
   where
     go (ForAllTy _ (Bndr b _) res) | isCoVar b  = varType b : go res
                                  | otherwise  = go res
+    go (DepFunTy _ b res) = varType b : go res
+    go (DepDictTy d res)  = varType d : go res
     go (FunTy { ft_arg = arg, ft_res = res }) = arg : go res
     go ty | Just ty' <- coreView ty = go ty'
     go _ = []
@@ -1744,6 +1746,10 @@ getRuntimeArgTys = go
     go :: Type -> [(Scaled Type, FunTyFlag)]
     go (ForAllTy _ _ res)
       = go res
+    go (DepFunTy _ b res)
+      = (Scaled (idMult b) (varType b), FTF_T_T) : go res
+    go (DepDictTy d res)
+      = (Scaled ManyTy (varType d), FTF_C_T) : go res
     go (FunTy { ft_mult = w, ft_arg = arg, ft_res = res, ft_af = af })
       = (Scaled w arg, af) : go res
     go ty

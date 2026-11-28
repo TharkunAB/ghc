@@ -52,11 +52,15 @@ import GHC.Utils.Panic
 import GHC.Base (reallyUnsafePtrEquality#)
 
 import Control.Monad ( unless )
+import Control.Monad.Trans.State.Strict ( State, evalState )
+import qualified Control.Monad.Trans.State.Strict as State
 import Control.Monad.Trans.Writer.CPS ( Writer )
 import qualified Control.Monad.Trans.Writer.CPS as Writer
+import Data.Maybe ( fromMaybe )
 import qualified Data.Semigroup as S
 import Data.Set ( Set )
 import qualified Data.Set as Set
+import Data.Word ( Word64 )
 
 {- GHC.Core.TyCo.Compare overview
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -343,15 +347,86 @@ eqScopedClosures scopeRoot lhs rhs
   , Just owner2 <- scopeRoot tc2 as2
   , isUnsaturatedUserFamily tc1 as1
   , isUnsaturatedUserFamily tc2 as2
-  = fullEq (generic_eq_type_x (ScopedClosures (owner1, owner2) [])
-                              RespectMultiplicities Nothing) lhs rhs
+  = evalState (eqScopedType (owner1, owner2) [] Nothing lhs rhs) Set.empty
   | otherwise = False
 
-sameScopedTyCons :: (Name, Name) -> [(TyCon, TyCon)] -> TyCon -> TyCon -> Bool
+eqScopedType :: (Name, Name) -> [(TyCon, TyCon)] -> Maybe RnEnv2 -> Type -> Type
+             -> State (Set (Word64, Word64)) Bool
+eqScopedType owners active mb_env = go_full
+  where
+    andM m1 m2 = do { b1 <- m1; if b1 then m2 else pure False }
+    gos [] []             = pure True
+    gos (t1:ts1) (t2:ts2) = go t1 t2 `andM` gos ts1 ts2
+    gos _ _               = pure False
+
+    go_full t1 t2 = go t1 t2 `andM` go (typeKind t1) (typeKind t2)
+
+    go t1 t2 = case (t1, t2) of
+      _ | Nothing <- mb_env
+        , 1# <- reallyUnsafePtrEquality# t1 t2 -> pure True
+      (TyConApp tc1 ts1, TyConApp tc2 ts2)
+        | tc1 == tc2, not (isForgetfulSynTyCon tc1) -> gos ts1 ts2
+      _ | Just t1' <- coreView t1 -> go t1' t2
+        | Just t2' <- coreView t2 -> go t1 t2'
+      (TyConApp tc1 ts1, TyConApp tc2 ts2)
+        | tc1 == tc2 -> gos ts1 ts2
+        | otherwise  -> gos ts1 ts2 `andM` sameScopedTyCons owners active tc1 tc2
+      (TyVarTy tv1, TyVarTy tv2) ->
+        pure $ case mb_env of
+          Nothing  -> tv1 == tv2
+          Just env -> rnOccL env tv1 == rnOccR env tv2
+      (ClassAppTy f1 a1 d1 x1 k1, ClassAppTy f2 a2 d2 x2 k2)
+        | f1 == f2  -> gos [a1, d1, x1, k1] [a2, d2, x2, k2]
+        | otherwise -> pure False
+      (DepDictTy v1 body1, DepDictTy v2 body2) ->
+        let env = fromMaybe (initRnEnv t1 t2) mb_env
+        in eqScopedType owners active (Just env) (varType v1) (varType v2)
+           `andM` eqScopedType owners active (Just (rnBndr2 env v1 v2)) body1 body2
+      (TermAppTy f1 a1, TermAppTy f2 a2) ->
+        let eq_hd = case mb_env of { Nothing -> f1 == f2; Just env -> rnOccL env f1 == rnOccR env f2 }
+        in if eq_hd then go a1 a2 else pure False
+      (TermVarTy v1, TermVarTy v2) ->
+        pure $ case mb_env of
+          Nothing  -> v1 == v2
+          Just env -> rnOccL env v1 == rnOccR env v2
+      (ExistsTy flag1 v1 ty1, ExistsTy flag2 v2 ty2)
+        | flag1 == flag2 ->
+            let env = fromMaybe (initRnEnv t1 t2) mb_env
+            in eqScopedType owners active (Just env) (varType v1) (varType v2)
+               `andM` eqScopedType owners active (Just (rnBndr2 env v1 v2)) ty1 ty2
+        | otherwise -> pure False
+      (DepFunTy vis1 v1 ty1, DepFunTy vis2 v2 ty2)
+        | vis1 `eqDepFunVis` vis2 ->
+            let env = fromMaybe (initRnEnv t1 t2) mb_env
+            in eqScopedType owners active (Just env) (idMult v1) (idMult v2)
+               `andM` eqScopedType owners active (Just env) (varType v1) (varType v2)
+               `andM` eqScopedType owners active (Just (rnBndr2 env v1 v2)) ty1 ty2
+        | otherwise -> pure False
+      (LitTy l1, LitTy l2)       -> pure (l1 == l2)
+      (CastTy t1' _, _)          -> go t1' t2
+      (_, CastTy t2' _)          -> go t1 t2'
+      (CoercionTy{}, CoercionTy{}) -> pure True
+      (FunTy _ ma1 w1 a1 r1, FunTy _ ma2 w2 a2 r2) ->
+        gos [w1, typeKind a1, typeKind r1, ma1, a1, r1]
+            [w2, typeKind a2, typeKind r2, ma2, a2, r2]
+      (AppTy f1 a1, _)
+        | Just (f2, a2) <- tcSplitAppTyNoView_maybe t2 -> gos [f1, a1] [f2, a2]
+      (_, AppTy f2 a2)
+        | Just (f1, a1) <- tcSplitAppTyNoView_maybe t1 -> gos [f1, a1] [f2, a2]
+      (ForAllTy ma1 (Bndr tv1 vis1) ty1, ForAllTy ma2 (Bndr tv2 vis2) ty2)
+        | vis1 `eqForAllVis` vis2 ->
+            let env = fromMaybe (initRnEnv t1 t2) mb_env
+            in eqScopedType owners active (Just env) ma1 ma2
+               `andM` eqScopedType owners active (Just env) (tyVarKind tv1) (tyVarKind tv2)
+               `andM` eqScopedType owners active (Just (rnBndr2 env tv1 tv2)) ty1 ty2
+      _ -> pure False
+
+sameScopedTyCons :: (Name, Name) -> [(TyCon, TyCon)] -> TyCon -> TyCon
+                 -> State (Set (Word64, Word64)) Bool
 sameScopedTyCons owners@(owner1, owner2) seen tc1 tc2
+  | any (\(a, b) -> a == tc1 || b == tc2) seen = pure False
   | Just (scope1, _) <- closedFamilyScope_maybe tc1, scope1 == owner1
   , Just (scope2, _) <- closedFamilyScope_maybe tc2, scope2 == owner2
-  , (tc1, tc2) `notElem` seen
   , NotInjective <- tyConInjectivityInfo tc1
   , NotInjective <- tyConInjectivityInfo tc2
   , Just ax1 <- closedFamilyTyConCoAxiom_maybe tc1
@@ -359,26 +434,38 @@ sameScopedTyCons owners@(owner1, owner2) seen tc1 tc2
   , coAxiomRole ax1 == Nominal, coAxiomRole ax2 == Nominal
   , coAxiomTyCon ax1 == tc1, coAxiomTyCon ax2 == tc2
   , tyConKind tc1 `eqType` tyConKind tc2
-  = same_rows same_branch (fromBranches (coAxiomBranches ax1))
-                          (fromBranches (coAxiomBranches ax2))
-  | otherwise = False
+  = do let key = (getKey (getUnique tc1), getKey (getUnique tc2))
+       verified <- State.get
+       if Set.member key verified
+         then pure True
+         else do
+           ok <- same_rowsM same_branch (fromBranches (coAxiomBranches ax1))
+                                        (fromBranches (coAxiomBranches ax2))
+           if ok
+             then State.modify' (Set.insert key) >> pure True
+             else pure False
+  | otherwise = pure False
   where
-    same_rows same as bs = equalLength as bs && and (zipWith same as bs)
-    same_branch a b = same_equation a b
-      && same_rows same_equation (cab_incomps a) (cab_incomps b)
-      && same_rows same_equation (cab_overlaps a) (cab_overlaps b)
+    andM m1 m2 = do { b1 <- m1; if b1 then m2 else pure False }
+    same_rowsM _ [] []         = pure True
+    same_rowsM f (a:as) (b:bs) = f a b `andM` same_rowsM f as bs
+    same_rowsM _ _ _           = pure False
+
+    same_branch a b =
+      same_equation a b
+      `andM` same_rowsM same_equation (cab_incomps a) (cab_incomps b)
+      `andM` same_rowsM same_equation (cab_overlaps a) (cab_overlaps b)
 
     same_equation a b
       | cab_roles a == cab_roles b
       , null (cab_eta_tvs a), null (cab_eta_tvs b)
       , Just env <- eqVarBndrs (mkRnEnv2 emptyInScopeSet)
                     (cab_tvs a ++ cab_cvs a) (cab_tvs b ++ cab_cvs b)
-      = same_rows (eq_scoped env) (cab_lhs a) (cab_lhs b)
-        && eq_scoped env (cab_rhs a) (cab_rhs b)
-      | otherwise = False
+      = same_rowsM (eq_scoped env) (cab_lhs a) (cab_lhs b)
+        `andM` eq_scoped env (cab_rhs a) (cab_rhs b)
+      | otherwise = pure False
 
-    eq_scoped env = fullEq (generic_eq_type_x (ScopedClosures owners ((tc1, tc2) : seen))
-                                                 RespectMultiplicities (Just env))
+    eq_scoped env = eqScopedType owners ((tc1, tc2) : seen) (Just env)
 
 eqTypeIgnoringMultiplicity :: Type -> Type -> Bool
 -- See Note [Respecting multiplicity when comparing types]
@@ -424,7 +511,7 @@ See #19226.
 -}
 
 -- | This flag controls whether we expand synonyms during comparison
-data SynFlag = ExpandSynonyms | KeepSynonyms | ScopedClosures (Name, Name) [(TyCon, TyCon)]
+data SynFlag = ExpandSynonyms | KeepSynonyms
 
 expandsSynonyms :: SynFlag -> Bool
 expandsSynonyms KeepSynonyms = False
@@ -495,8 +582,6 @@ inline_generic_eq_type_x syn_flag mult_flag mb_env
 
       (TyConApp tc1 ts1, TyConApp tc2 ts2)
         | tc1 == tc2 -> gos ts1 ts2
-        | ScopedClosures owners seen <- syn_flag
-        -> gos ts1 ts2 && sameScopedTyCons owners seen tc1 tc2
         | otherwise -> False
 
       (TyVarTy tv1, TyVarTy tv2)

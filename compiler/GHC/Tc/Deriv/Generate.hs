@@ -53,6 +53,7 @@ import GHC.Tc.Zonk.Type
 import GHC.Tc.Validity
 
 import GHC.Core.DataCon
+import GHC.Core.Multiplicity ( scaledThing )
 import GHC.Core.FamInstEnv
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom ( coAxiomSingleBranch )
@@ -2892,8 +2893,14 @@ buildDataConInstArgEnv :: TyCon -> [Type] -> DataConEnv [Type]
 buildDataConInstArgEnv rep_tc rep_tc_args =
   listToUFM [ (dc, inst_arg_tys)
             | dc <- tyConDataCons rep_tc
-            , let (_, _, inst_arg_tys) =
-                    dataConInstSig dc $ dataConInstUnivs dc rep_tc_args
+            , let univ_tys = dataConInstUnivs dc rep_tc_args
+                  inst_arg_tys
+                    | not (null (dataConRepArgBinders dc))
+                    = substTys (zipTvSubst (dataConUnivTyVars dc) univ_tys)
+                               (map scaledThing (dataConOrigArgTys dc))
+                    | otherwise
+                    = let (_, _, args) = dataConInstSig dc univ_tys
+                      in args
             ]
 
 -- | Apply a substitution to all of the 'Type's contained in a 'DerivInstTys'.

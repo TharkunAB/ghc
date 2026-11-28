@@ -24,7 +24,7 @@ import GHC.Core.Utils
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.FVs      ( rulesRhsFreeIds, bndrRuleAndUnfoldingVars, idRuleVars )
-import GHC.Core.Coercion ( Coercion )
+import GHC.Core.Coercion ( Coercion, isCoVar )
 import GHC.Core.TyCo.FVs     ( coVarsOfCos )
 import GHC.Core.TyCo.Compare ( eqType )
 import GHC.Core.Multiplicity ( scaledThing )
@@ -528,11 +528,14 @@ dmdAnal' env dmd (Case scrut case_bndr ty [Alt alt_con bndrs rhs])
   | want_precise_field_dmds alt_con
   = let
         rhs_env = addInScopeAnalEnvs env (case_bndr:bndrs)
+        (real_bndrs, virt_cvs)            = splitAltRealBndrs alt_con bndrs
         -- See Note [Bringing a new variable into scope]
         WithDmdType rhs_ty rhs'           = dmdAnal rhs_env dmd rhs
-        WithDmdType alt_ty1 fld_dmds      = findBndrsDmds env rhs_ty bndrs
+        WithDmdType alt_ty0 virt_dmds     = findBndrsDmds env rhs_ty virt_cvs
+        WithDmdType alt_ty1 fld_dmds      = findBndrsDmds env alt_ty0 real_bndrs
         WithDmdType alt_ty2 case_bndr_dmd = findBndrDmd env alt_ty1 case_bndr
         !case_bndr'                       = setIdDemandInfo case_bndr case_bndr_dmd
+        !virt_cvs'                        = setBndrsDemandInfo virt_cvs virt_dmds
 
         -- Evaluation cardinality on the case binder is irrelevant and a no-op.
         -- What matters is its nested sub-demand!
@@ -549,12 +552,12 @@ dmdAnal' env dmd (Case scrut case_bndr ty [Alt alt_con bndrs rhs])
           , let !scrut_sd = scrutSubDmd case_bndr_sd fld_dmds
           -- See Note [Demand on case-alternative binders]
           , let !fld_dmds' = fieldBndrDmds scrut_sd (length fld_dmds)
-          , let !bndrs' = setBndrsDemandInfo bndrs fld_dmds'
-          = (bndrs', scrut_sd)
+          , let !real_bndrs' = setBndrsDemandInfo real_bndrs fld_dmds'
+          = (real_bndrs' ++ virt_cvs', scrut_sd)
           | otherwise
           -- DEFAULT alts. Simply add demands and discard the evaluation
           -- cardinality, as we evaluate the scrutinee exactly once.
-          = assert (null bndrs) (bndrs, case_bndr_sd)
+          = assert (null real_bndrs) (virt_cvs', case_bndr_sd)
 
         alt_ty3
           -- See Note [Precise exceptions and strictness analysis] in "GHC.Types.Demand"
@@ -686,12 +689,27 @@ dmdAnalSumAlts env dmd case_bndr (alt:alts)
     in WithDmdType (lubDmdType cur_ty rest_ty) (alt':alts')
 
 
+-- | Separate real constructor field binders from any trailing index alias
+-- coercion variable in a case alternative.
+splitAltRealBndrs :: AltCon -> [Var] -> ([Var], [Var])
+splitAltRealBndrs (DataAlt dc) bndrs
+  | Just (real_bndrs, cv) <- snocView bndrs
+  , isCoVar cv
+  , count isId real_bndrs == dataConRepArity dc
+  = (real_bndrs, [cv])
+splitAltRealBndrs DEFAULT bndrs
+  = assert (all isCoVar bndrs) ([], bndrs)
+splitAltRealBndrs _ bndrs
+  = (bndrs, [])
+
 dmdAnalSumAlt :: AnalEnv -> SubDemand -> Id -> CoreAlt -> WithDmdType CoreAlt
 dmdAnalSumAlt env dmd case_bndr (Alt con bndrs rhs)
   | let rhs_env = addInScopeAnalEnvs env (case_bndr:bndrs)
+        (real_bndrs, virt_cvs) = splitAltRealBndrs con bndrs
     -- See Note [Bringing a new variable into scope]
   , WithDmdType rhs_ty rhs' <- dmdAnal rhs_env dmd rhs
-  , WithDmdType alt_ty dmds <- findBndrsDmds env rhs_ty bndrs
+  , WithDmdType alt_ty0 virt_dmds <- findBndrsDmds env rhs_ty virt_cvs
+  , WithDmdType alt_ty dmds <- findBndrsDmds env alt_ty0 real_bndrs
   , let (_ :* case_bndr_sd) = findIdDemand alt_ty case_bndr
         -- See Note [Demand on case-alternative binders]
         -- we can't use the scrut_sd, because it says 'Prod' and we'll use
@@ -699,7 +717,9 @@ dmdAnalSumAlt env dmd case_bndr (Alt con bndrs rhs)
         scrut_sd = scrutSubDmd case_bndr_sd dmds
         dmds' = fieldBndrDmds scrut_sd (length dmds)
         -- Do not put a thunk into the Alt
-        !new_ids            = setBndrsDemandInfo bndrs dmds'
+        !real_bndrs'        = setBndrsDemandInfo real_bndrs dmds'
+        !virt_cvs'          = setBndrsDemandInfo virt_cvs virt_dmds
+        !new_ids            = real_bndrs' ++ virt_cvs'
   = -- pprTrace "dmdAnalSumAlt" (ppr con $$ ppr case_bndr $$ ppr dmd $$ ppr alt_ty) $
     WithDmdType alt_ty (Alt con new_ids rhs')
 

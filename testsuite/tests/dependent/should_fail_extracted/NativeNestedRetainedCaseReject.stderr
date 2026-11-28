@@ -10,7 +10,7 @@ NativeNestedRetainedCaseReject.hs:12:34: error: [GHC-05617]
       In the first argument of ‘Just’, namely ‘(MkArrow b a x)’
       In the expression: Just (MkArrow b a x)
     • Relevant bindings include
-        x_a1dW :: Term g (Arr a2 b1) (bound at <no location info>)
+        x_a1ez :: Term g (Arr a2 b1) (bound at <no location info>)
 
 NativeNestedRetainedCaseReject.hs:19:34: error: [GHC-83865]
     • Couldn't match type ‘_’ with ‘Arr a1 b’

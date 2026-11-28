@@ -934,10 +934,10 @@ retainedGivenEquiv inert = do
         (TermVarTy v, rhs) -> bind_term fuel uf terms roots (findRep uf v) rhs rest
         (lhs, TermVarTy v) -> bind_term fuel uf terms roots (findRep uf v) lhs rest
         (lhs, rhs)
-          | Just (dc1, args1) <- split_promoted_con lhs
-          , Just (dc2, args2) <- split_promoted_con rhs -> do
+          | Just (dc1, all1, _) <- split_promoted_con lhs
+          , Just (dc2, all2, _) <- split_promoted_con rhs -> do
               guard (dc1 == dc2)
-              let sub = if args1 `equalLength` args2 then zip args1 args2 else []
+              let sub = if all1 `equalLength` all2 then zip all1 all2 else []
               go (fuel - 1) uf terms roots (sub ++ rest)
           | otherwise -> go fuel uf terms roots rest
 
@@ -953,37 +953,47 @@ retainedGivenEquiv inert = do
               pairs  = [(rhs, p) | p <- prev]
           in go (fuel - 1) uf terms' roots' (pairs ++ rest)
 
-    split_promoted_con :: Type -> Maybe (DataCon, [Type])
+    split_promoted_con :: Type -> Maybe (DataCon, [Type], [(Type, Bool)])
     split_promoted_con ty
       | Just (tc, args) <- splitTyConApp_maybe ty
       , Just dc <- isPromotedDataCon_maybe tc
+      , not (isNewDataCon dc)
+      , lengthIs args (tyConArity tc)
       , let arity = dataConSourceArity dc
       , length args >= arity
-      = Just (dc, drop (length args - arity) args)
+      , let val_args = drop (length args - arity) args
+            bangs    = map isBanged (dataConImplBangs dc)
+            strict_fields = zip val_args (bangs ++ repeat False)
+      = Just (dc, args, strict_fields)
       | otherwise = Nothing
 
     acyclic :: VarEnv Id -> VarEnv [Type] -> [Id] -> Bool
     acyclic uf terms roots =
-      all (\r -> let r' = findRep uf r in not (reaches_strict uf terms emptyVarSet r' r')) roots
+      all (\r -> let r' = findRep uf r in not (reaches_strict uf terms emptyVarSet False r' r')) roots
 
-    reaches_strict :: VarEnv Id -> VarEnv [Type] -> VarSet -> Id -> Id -> Bool
-    reaches_strict uf terms visited target cur
+    reaches_strict :: VarEnv Id -> VarEnv [Type] -> VarSet -> Bool -> Id -> Id -> Bool
+    reaches_strict uf terms visited saw_strict target cur
       | cur `elemVarSet` visited = False
       | otherwise =
           let visited' = extendVarSet visited cur
               step_vars =
-                [ findRep uf v
+                [ (findRep uf v, saw_strict || edge_strict)
                 | rhs <- lookupWithDefaultVarEnv terms [] cur
-                , Just (_, field_args) <- [split_promoted_con rhs]
-                , arg <- field_args
-                , v <- term_vars_under uf arg ]
-          in any (\next -> next == target || reaches_strict uf terms visited' target next) step_vars
+                , Just (_, _, field_args) <- [split_promoted_con rhs]
+                , (arg, field_strict) <- field_args
+                , (v, sub_strict) <- term_vars_under uf field_strict arg
+                , let edge_strict = sub_strict ]
+          in any (\(next, strict_now) ->
+                    (next == target && strict_now) ||
+                    reaches_strict uf terms visited' strict_now target next)
+                 step_vars
 
-    term_vars_under :: VarEnv Id -> Type -> [Id]
-    term_vars_under uf ty = case coreFullView ty of
-      TermVarTy v -> [findRep uf v]
+    term_vars_under :: VarEnv Id -> Bool -> Type -> [(Id, Bool)]
+    term_vars_under uf path_strict ty = case coreFullView ty of
+      TermVarTy v -> [(findRep uf v, path_strict)]
       other
-        | Just (_, args) <- split_promoted_con other -> concatMap (term_vars_under uf) args
+        | Just (_, _, args) <- split_promoted_con other ->
+            concatMap (\(a, f_strict) -> term_vars_under uf (path_strict || f_strict) a) args
         | otherwise -> []
 
 {- Note [Coverage of retained constructor results]
@@ -1608,6 +1618,11 @@ varNeedsTesting _         _                              vi
 varNeedsTesting old_ty_st MkNabla{nabla_ty_st=new_ty_st} _
   -- Same type state => still inhabited
   | not (tyStateRefined old_ty_st new_ty_st) = pure False
+varNeedsTesting _ _ vi
+  -- Runtime-index Givens live in inert_irreds rather than inert_eqs, so
+  -- re-test any variable whose type mentions a runtime Id when TyState refines.
+  | anyFreeVarsOfType (\v -> isId v && not (isCoVar v)) (idType (vi_id vi))
+  = pure True
 varNeedsTesting old_ty_st MkNabla{nabla_ty_st=new_ty_st} vi = do
   -- These normalisations are relatively expensive, but still better than having
   -- to perform a full inhabitation test

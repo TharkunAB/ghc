@@ -1139,6 +1139,7 @@ tcImpSpec this_mod prag
  , not (nameIsLocalOrFrom this_mod name)  -- The Id is imported
  = do { id <- tcLookupId name
       ; if hasSomeUnfolding (realIdUnfolding id)
+           && not (hasNativeDependentExpr (Type (idType id)))
            -- See Note [SPECIALISE pragmas for imported Ids]
         then tcSpecPrag id prag
         else do { let dia = TcRnSpecialiseNotVisible name

@@ -343,7 +343,7 @@ writeConsumer env u path core = do
         name = mkExternalName u mdl (mkVarOcc "consumer") noSrcSpan
         cache = UnfoldingCache False False False False
         unfolding = HsUnfold False (IfCoreUnfold VanillaSrc cache (IfWhen 1 False False) (toIfaceExpr core))
-        entry = IfaceId name (toIfaceType (exprType core)) IfVanillaId [unfolding]
+        entry = IfaceId name (toIfaceType (exprType core)) IfVanillaId [unfolding] []
         iface = set_mi_decls [(fingerprint0, entry)] (emptyFullModIface mdl)
         profile = targetProfile (hsc_dflags env)
     writeBinIface profile QuietBinIFace NormalCompression path iface

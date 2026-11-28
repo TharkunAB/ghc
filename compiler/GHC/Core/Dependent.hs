@@ -23,22 +23,24 @@ module GHC.Core.Dependent (
 
 import GHC.Prelude
 
+import GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
 import GHC.Core
 import GHC.Core.FVs (orphNamesOfExprs)
-import GHC.Core.Class (classOpItems)
-import GHC.Core.Predicate (getClassPredTys_maybe)
+import GHC.Core.Class (classOpItems, classTyCon)
+import GHC.Core.Predicate (getClassPredTys_maybe, mkClassPred)
 import GHC.Core.Type (coreFullView, isNativeRetainedBinderType, isNativeIndexFunctionId
                      , isNativeNamedOpaqueFunctionId
                      , isNativeClassDictionaryId, isNativeOpaqueValueId
                      , isNativeRetainedBinder, isNativeIndexDomainConversion
-                     , splitForAllTyCoVars, splitFunTy_maybe)
+                     , mkForAllTys, mkInvisFunTys, mkTyVarTys, splitForAllTyCoVars, splitFunTy_maybe
+                     , tyVarSpecToBinders)
 import GHC.Core.TyCo.Compare (eqType)
 import GHC.Core.Coercion (coercionLKind, coercionRKind, coercionRole, isExistsCoRule)
 import GHC.Core.DataCon (dataConRepType)
 import GHC.Core.TyCo.Rep
-import GHC.Core.TyCon (TyCon, synTyConRhs_maybe)
+import GHC.Core.TyCon (TyCon, synTyConRhs_maybe, tyConBinders, tyConInvisTVBinders)
 import GHC.Core.TyCon.Set
-import GHC.Types.Basic (DefMethSpec(VanillaDM))
+import GHC.Types.Basic (DefMethSpec(VanillaDM, GenericDM))
 import GHC.Types.Id (idCoreRules, idType, isJoinId, isImplicitId, realIdUnfolding)
 import GHC.Types.Literal (literalType)
 import GHC.Types.Name (Name, isDefaultMethodOcc, isExternalName, nameIsLocalOrFrom, nameModule_maybe, nameOccName)
@@ -128,8 +130,7 @@ supportsNativeDepFunUnfolding expr =
 -- Other retained proofs and computations still require separate validation.
 supportsScopedDictionaryCore :: CoreProgram -> Bool
 supportsScopedDictionaryCore binds =
-    hasScopedDictionaryProgram binds
-    && not (runScanFor CheckScopedDictionaryCore AllMetadata (scanList scanBind binds))
+    not (runScanFor CheckScopedDictionaryCore AllMetadata (scanList scanBind binds))
 
 -- | Check whether a function telescope binds a native dependent value or dictionary.
 hasNativeDepFunType :: Type -> Bool
@@ -285,7 +286,7 @@ Do not force unstable nested unfolding templates.
 hasNativeDependentUnfolding :: CoreExpr -> Bool
 hasNativeDependentUnfolding = runScan StableMetadata . scanExpr
 
--- | Check that a retained signature belongs to its class's vanilla default.
+-- | Check that a retained signature belongs to its class's vanilla or generic default.
 -- See Note [Compulsory retained defaults] in GHC.Iface.Tidy.
 isRetainedVanillaDefaultMethod :: Name -> Type -> Bool
 isRetainedVanillaDefaultMethod name ty
@@ -295,9 +296,16 @@ isRetainedVanillaDefaultMethod name ty
   , isInvisibleFunArg vis
   , Just (cls, _) <- getClassPredTys_maybe dict_ty
   , hasNativeDependentExprRhs (Type ty)
-  = or [name == method && ty `eqType` idType selector
-       | (selector, Just (method, VanillaDM)) <- classOpItems cls]
+  = or [name == method && ty `eqType` expected_dm_ty cls selector dm_spec
+       | (selector, Just (method, dm_spec)) <- classOpItems cls]
   | otherwise = False
+  where
+    expected_dm_ty _   selector VanillaDM         = idType selector
+    expected_dm_ty cls _        (GenericDM dm_ty) =
+      let cls_bndrs = tyConBinders (classTyCon cls)
+          tv_bndrs  = tyVarSpecToBinders (tyConInvisTVBinders cls_bndrs)
+          pred      = mkClassPred cls (mkTyVarTys (binderVars cls_bndrs))
+      in mkForAllTys [(unmatchableDataConTy, b) | b <- tv_bndrs] (mkInvisFunTys [pred] dm_ty)
 
 -- | Reject native dependent Core before an unsupported program pass.
 rejectNativeDependentProgram :: String -> CoreProgram -> [CoreRule] -> IO ()

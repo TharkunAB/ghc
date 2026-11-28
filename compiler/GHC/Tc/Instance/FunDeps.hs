@@ -269,7 +269,7 @@ improveClsFD clas_tvs fd
                equalLength tys_inst clas_tvs)
               (ppr tys_inst <+> ppr tys_actual) $
 
-    case tcMatchTyKisX init_subst ltys1 ltys2 of
+    case tcMatchInstanceTyKisX init_subst ltys1 ltys2 of
         Nothing  -> []
         Just subst | isJust (tcMatchTyKisX subst rtys1 rtys2)
                         -- Don't include any equations that already hold.
@@ -405,7 +405,7 @@ checkInstCoverage be_liberal clas theta inst_taus
        = NotValid not_covered_msg
        where
          (ls,rs) = instFD fd tyvars inst_taus
-         ls_tvs = tyCoVarsOfTypes ls
+         ls_tvs = closeOverKinds (injectiveVarsOfTypes True ls)
          rs_tvs = visVarsOfTypes rs
 
          undetermined_tvs | be_liberal = liberal_undet_tvs
@@ -663,12 +663,15 @@ checkFunDeps inst_envs (ClsInst { is_tvs = qtvs1, is_cls = cls
       | instanceCantMatch trimmed_tcs rough_tcs2
       = False
       | otherwise
-      = case tcUnifyFunDeps qtvs ltys1 ltys2 of
+      = case tcUnifyFunDepsLHS qtvs ltys1 ltys2 of
           Nothing         -> False
           Just subst
-            -> isNothing $   -- Bogus legacy test (#10675)
+            -> let rtys1' = substTysUnchecked subst rtys1
+                   rtys2' = substTysUnchecked subst rtys2
+               in not (eqTypes rtys1' rtys2') &&
+                  isNothing (tcUnifyFunDeps qtvs rtys1' rtys2')
+                             -- Bogus legacy test (#10675)
                              -- See Note [Bogus consistency check]
-               tcUnifyFunDeps qtvs (substTysUnchecked subst rtys1) (substTysUnchecked subst rtys2)
 
       where
         trimmed_tcs    = trimRoughMatchTcs cls_tvs fd rough_tcs1

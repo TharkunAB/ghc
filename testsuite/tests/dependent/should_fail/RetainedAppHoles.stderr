@@ -12,9 +12,9 @@ RetainedAppHoles.hs:33:34: error: [GHC-88464]
                          -> foreach (n :: Nat) -> plus m n :~: plus n m
           (bound at RetainedAppHoles.hs:32:1)
       Constraints include n ~ Succ k (from RetainedAppHoles.hs:33:1-36)
-    Suggested fix:
-      Pattern-match on ‘m’ (constructors: ‘Zero’,
-                                          ‘Succ’) to reduce ‘plus’.
+      Valid hole fits include
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @(plus m1 (Succ k))
 
 RetainedAppHoles.hs:33:36: error: [GHC-88464]
     • Found hole: _ :: b0 :~: Succ (plus k m1)
@@ -30,9 +30,10 @@ RetainedAppHoles.hs:33:36: error: [GHC-88464]
                          -> foreach (n :: Nat) -> plus m n :~: plus n m
           (bound at RetainedAppHoles.hs:32:1)
       Constraints include n ~ Succ k (from RetainedAppHoles.hs:33:1-36)
-    Suggested fix:
-      Pattern-match on ‘k’ (constructors: ‘Zero’,
-                                          ‘Succ’) to reduce ‘plus’.
+      Valid hole fits include
+        invisId :: foreach (n :: Nat). plus n Zero :~: n
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @b0
 
 RetainedAppHoles.hs:38:59: error: [GHC-88464]
     • Found hole: _ :: plus m2 k1 :~: plus k1 m2
@@ -83,9 +84,10 @@ RetainedAppHoles.hs:43:48: error: [GHC-88464]
                           -> foreach (n :: Nat) -> plus m n :~: plus n m
           (bound at RetainedAppHoles.hs:42:1)
       Constraints include n ~ Succ k2 (from RetainedAppHoles.hs:43:1-49)
-    Suggested fix:
-      Pattern-match on ‘k’ (constructors: ‘Zero’,
-                                          ‘Succ’) to reduce ‘plus’.
+      Valid hole fits include
+        invisId :: foreach (n :: Nat). plus n Zero :~: n
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @x0
 
 RetainedAppHoles.hs:48:64: error: [GHC-88464]
     • Found hole: _ :: Nat

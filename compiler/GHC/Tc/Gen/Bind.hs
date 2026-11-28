@@ -54,7 +54,7 @@ import GHC.Tc.Validity (checkValidType, checkEscapingKind)
 import GHC.Tc.Zonk.TcType
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Multiplicity
-import GHC.Core.FamInstEnv( normaliseType )
+import GHC.Core.FamInstEnv( normaliseTypeWithFuel )
 import GHC.Core.Class   ( Class )
 import GHC.Core.Coercion( hasCoercionHole, mkSymCo )
 import GHC.Core.Type (anyFreeVarsOfType, mkStrLitTy, mkCastTy, coreFullView, isFamFreeTy)
@@ -998,7 +998,7 @@ mkInferredPolyId residual insoluble qtvs inferred_theta poly_name mb_sig_inst mo
                    -- a duplicate ambiguity error.  There is a similar
                    -- checkNoErrs for complete type signatures too.
     do { fam_envs <- tcGetFamInstEnvs
-       ; let mono_ty' = reductionReducedType $ normaliseType fam_envs Nominal mono_ty
+       ; let mono_ty' = reductionReducedType $ normaliseTypeWithFuel 2000 fam_envs Nominal mono_ty
                -- Unification may not have normalised the type,
                -- so do it here to make it as uncomplicated as possible.
                -- Example: f :: [F Int] -> Bool

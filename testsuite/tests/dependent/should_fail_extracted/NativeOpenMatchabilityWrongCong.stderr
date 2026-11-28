@@ -1,5 +1,5 @@
 NativeOpenMatchabilityWrongCong.hs:16:32: error: [GHC-05617]
-    • Could not deduce ‘add (add n m1) p1 ~ add (add m1 n) p1’
+    • Could not deduce ‘add n (add m1 p1) ~ add m1 (add n p1)’
       from the context: m ~ S m1
         bound by a pattern with constructor: S :: Nat -> Nat,
                  in an equation for ‘wrongAssoc’

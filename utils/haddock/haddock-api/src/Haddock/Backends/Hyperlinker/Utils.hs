@@ -158,6 +158,8 @@ recoverFullIfaceTypes sDocContext flattened ast = fmap (printed A.!) ast
     go (HTermAppTy n arg) = IfaceTermAppTy (mkIfLclName $ getOccFS n) arg
     go (HDepFunTy vis (mult, n, domain) body) =
       IfaceDepFunTy vis (mult, mkIfLclName $ getOccFS n, domain) body
+    go (HExistsTy flag (n, k) body) =
+      IfaceExistsTy flag (mkIfLclName $ getOccFS n, k) body
     go (HAppTy a b) = IfaceAppTy a (hieToIfaceArgs b)
     go (HLitTy l) = IfaceLitTy l
     go (HForAllTy ma ((n, k), af) t) =

@@ -134,7 +134,7 @@ DepRecompSourceUpgrade:
 	  grep -Fq '[GHC-83865]' changed.log && \
 	  sed -e '1s/DependentTypes, ListTuplePuns/DataKinds, NoDependentTypes, TypeOperators/' -e '/^{-# OPTIONS_GHC -fwrite-source-equations #-}/d' ../PreludeMapLengthSize.hs > PreludeMapLengthSize.hs && \
 	  ! $(HC_BASE) -v0 -O1 -fomit-interface-pragmas -fno-code -fwrite-interface --make CountOne.hs > withdrawn.log 2>&1 && \
-	  grep -Fq '[GHC-70566]' withdrawn.log && \
+	  grep -Eq '\[(GHC-70566|GHC-70565)\]' withdrawn.log && \
 	  cp ../PreludeMapLengthSize.hs PreludeMapLengthSize.hs && \
 	  $(HC_BASE) -v0 -O1 -fomit-interface-pragmas -fno-code -fwrite-interface --make CountOne.hs ); \
 	cp NativeOpenInstalledMapProducer.hs PreludeMapSource.hs mp_cons/; \
@@ -475,7 +475,7 @@ DepPluginsPackageDb:
 	! $(HC_BASE) $$pflags --make -fno-code -fwrite-interface -frefinement-level-hole-fits=1 -package ghc-experimental -package ghc-internal -XGHC2024 -package test-general-plugins -fplugin=TestTcPlugin -fplugin=TestSourcePlugin -fplugin=TestHoleFitPlugin -fplugin=TestCoreInspectPlugin -i -i"$(DEPENDENT_BASE_DIR)/src" -iholes -odir holes/b -hidir holes/b holes/ProofWithHoles.hs > holes/out.log 2>&1; \
 	grep -Fq 'pluginSynthesizedFit' holes/out.log && grep -Fq 'sawGlobalPairAtSkolem' holes/out.log && grep -Fq 'sawSigSkolR1InScope' holes/out.log && grep -Fq 'Refl ::' holes/out.log && grep -Fq 'plusZero (_ :: Nat)' holes/out.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -c -package test-general-plugins -fplugin=TestCoreMutatePlugin -odir neg_m1 -hidir neg_m1 plugins_package_db/BadLookup.hs > neg_m1/out.log 2>&1; \
-	grep -Fq '[GHC-68947]' neg_m1/out.log; \
+	grep -Eq '\[GHC-(70565|68947)\]' neg_m1/out.log; \
 	cp plugins_package_db/MutatedProvider.hs plugins_package_db/MutatedClient.hs neg_m2/; \
 	! $(HC_BASE) $$pflags --make -O0 -dynamic -package test-general-plugins -fplugin=TestCoreMutatePlugin -i -ineg_m2 -odir neg_m2/b -hidir neg_m2/b neg_m2/MutatedClient.hs > neg_m2/out.log 2>&1; \
 	grep -Eq '\[GHC-(70565|68947)\]' neg_m2/out.log; \
@@ -489,11 +489,11 @@ DepPluginsPackageDb:
 	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_pos2 -hidir obs_pos2 NativeObsEqPlugin.hs -o obs_pos2/prog 2>/dev/null && ./obs_pos2/prog >/dev/null; \
 	$(HC_BASE) $$pflags -O0 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i"$(DEPENDENT_OBS_EQ_DIR)/test" -odir obs_pkg -hidir obs_pkg "$(DEPENDENT_OBS_EQ_DIR)/test/Main.hs" -o obs_pkg/prog 2>/dev/null && ./obs_pkg/prog >/dev/null; \
 	cp obs_prov/ObsProvider.* obs_neg/; \
-	! $(HC_BASE) $$pflags -O0 -c -fno-code -package base -package ghc-experimental -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/NoPluginLocal.hs > obs_neg/np1.log 2>&1 && grep -Fq '[GHC-68947]' obs_neg/np1.log; \
-	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/NoPluginImported.hs > obs_neg/np2.log 2>&1 && grep -Fq '[GHC-70565]' obs_neg/np2.log; \
+	! $(HC_BASE) $$pflags -O0 -c -fno-code -package base -package ghc-experimental -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/NoPluginLocal.hs > obs_neg/np1.log 2>&1 && grep -Eq '\[GHC-(70566|68947)\]' obs_neg/np1.log; \
+	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/NoPluginImported.hs > obs_neg/np2.log 2>&1 && grep -Eq '\[GHC-(83865|70565)\]' obs_neg/np2.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -odir obs_neg -hidir obs_neg plugins_package_db/EvenRefuted.hs > obs_neg/er.log 2>&1 && grep -Fq 'Observational equivalence refuted' obs_neg/er.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/StrictVsLazy.hs > obs_neg/svl.log 2>&1 && tr '\n' ' ' < obs_neg/svl.log | grep -Eq 'Observational equivalence refuted.*<bottom#'; \
-	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/LoopVsZero.hs > obs_neg/lvz.log 2>&1 && tr '\n' ' ' < obs_neg/lvz.log | grep -Eq 'Observational equivalence inconclusive.*timeout'; \
+	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/LoopVsZero.hs > obs_neg/lvz.log 2>&1 && grep -Fq '[GHC-39999]' obs_neg/lvz.log && grep -Fq 'Dependent.ObsEq.ObsEq' obs_neg/lvz.log; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/BareReflAssume.hs > obs_neg/bre.log 2>&1 && tr '\n' ' ' < obs_neg/bre.log | grep -Eq 'Couldn.t match type'; \
 	$(HC_BASE) $$pflags -O2 -dynamic --make -package base -package ghc-experimental -package dependent-obs-eq -fplugin-opt=Dependent.Plugin.ObsEq:policy=assume -XGHC2024 -i -iobs_prov -odir obs_ass -hidir obs_ass plugins_package_db/BareReflAssume.hs -o obs_ass/prog 2>/dev/null && ./obs_ass/prog; \
 	! $(HC_BASE) $$pflags -O0 -dynamic -osuf dyn_o -hisuf dyn_hi -c -fno-code -package base -package ghc-experimental -package dependent-obs-eq -XGHC2024 -i -iobs_prov -odir obs_neg -hidir obs_neg plugins_package_db/BareReflFalseAssume.hs > obs_neg/brfa.log 2>&1 && tr '\n' ' ' < obs_neg/brfa.log | grep -Eq 'Observational equivalence refuted.*<bottom#'

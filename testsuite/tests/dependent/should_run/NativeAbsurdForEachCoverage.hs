@@ -90,8 +90,11 @@ absurdFinLam = \case {}
 absurdFinUnderEq :: foreach (n :: Nat) -> (n :~: 'Zero) -> Fin n -> a
 absurdFinUnderEq _ Refl i = case i of {}
 
--- | Empty @case@ on cyclic @n :~: Succ n@ refuted by strict constructor occurs check.
-absurdCyclicEq :: foreach (n :: Nat) -> (n :~: 'Succ n) -> a
+-- | Strict Peano natural numbers.
+data StrictNat = SZero | SSucc !StrictNat
+
+-- | Empty @case@ on cyclic @n :~: SSucc n@ refuted by strict constructor occurs check.
+absurdCyclicEq :: foreach (n :: StrictNat) -> (n :~: 'SSucc n) -> a
 absurdCyclicEq _ eq = case eq of {}
 
 main :: IO ()
@@ -110,7 +113,7 @@ main = do
       c2 = vZipCountByGadt n2 n2 Refl vA vB
       f1 = finToInt (FS FZ :: Fin ('Succ ('Succ 'Zero)))
       _unused :: (Int, Int, Int, Int)
-      _unused = (absurdFin, absurdFinLam, absurdFinUnderEq Zero Refl, absurdCyclicEq Zero)
+      _unused = (absurdFin, absurdFinLam, absurdFinUnderEq Zero Refl, absurdCyclicEq SZero)
         `seq` (0, 0, 0, 0)
   ok <- evaluate
     ( z1 == [('a', 10), ('b', 20)]

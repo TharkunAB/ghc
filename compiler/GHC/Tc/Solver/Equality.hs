@@ -996,6 +996,10 @@ isOpaqueIndexEquality allow_apart_opaque ty1 ty2 =
     _                   -> False
   where
     opaque_app ty
+      | Just (tc, args) <- tcSplitTyConApp_maybe ty
+      , tyConMustBeSaturated tc
+      , args `lengthLessThan` tyConArity tc
+      = True
       | Just (hd, _) <- tcSplitAppTy_maybe ty = not (isMatchableFunTy (typeKind hd))
       | otherwise = False
     same_domain v ty =
@@ -1243,7 +1247,7 @@ can_eq_nc_depfun ev eq_rel ty1@(DepFunTy vis1 b1 body1) ty2@(DepFunTy vis2 b2 bo
            withNativeBinderScope loc [ty1, ty2, lhs, rhs, b_ty] binder $ \loc' ->
            do { (level, (body_co, wanteds)) <-
                   pushLevelNoWorkList (text "retained function equality") $
-                    wrapUnifier rws loc' Nominal $ \uenv ->
+                    wrapUnifier rws loc' (eqRelRole eq_rel) $ \uenv ->
                       uType uenv left_body right_body
               ; residual <- nestImplicTcS (UnifyForAllSkol ty1) nested_binds level $
                     solveSimpleWanteds wanteds
@@ -1258,7 +1262,7 @@ can_eq_nc_depfun ev eq_rel ty1@(DepFunTy vis1 b1 body1) ty2@(DepFunTy vis2 b2 bo
                    then do { -- Keep outer Given evidence live after the local solve.
                              outer_binds <- getTcEvBindsVar
                            ; combineTcEvBinds outer_binds nested_binds
-                           ; setWantedEq dest (CPH { cph_co = downgradeRole (eqRelRole eq_rel) Nominal all_co
+                           ; setWantedEq dest (CPH { cph_co = all_co
                                                   , cph_holes = emptyCoHoleSet })
                            ; stopWith ev "Retained function equality: solved" }
                    else canEqSoftFailure IrredShapeReason ev ty1 ty2 }

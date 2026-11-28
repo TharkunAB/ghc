@@ -9,11 +9,13 @@ NativeParamRecUpdatePinnedMismatch.hs:5:9: error: [GHC-83865]
       In an equation for ‘bad’:
           bad s = s {firstCells = mapVec (== 'a') (firstCells s)}
 
-NativeParamRecUpdatePinnedMismatch.hs:5:33: error: [GHC-83865]
-    • Couldn't match type ‘Bool’ with ‘Char’
-      Expected: Char -> Char
-        Actual: Char -> Bool
-    • In the first argument of ‘mapVec’, namely ‘(== 'a')’
+NativeParamRecUpdatePinnedMismatch.hs:5:43: error: [GHC-83865]
+    • Couldn't match type: sameLength @Bool s
+                     with: sameLength @Char s
+      Expected: Vec Char (sameLength @Bool s)
+        Actual: Vec Char (sameLength @Char s)
+      Note: GHC cannot determine the arguments of the function ‘sameLength’ from its result.
+    • In the second argument of ‘mapVec’, namely ‘(firstCells s)’
       In the expression: mapVec (== 'a') (firstCells s)
       In a record update at field ‘firstCells’,
       with type constructor ‘SameCols’

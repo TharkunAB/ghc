@@ -30,7 +30,7 @@ import GHC.Driver.Errors (printMessages)
 import GHC.Driver.Main (hscCompileCoreExpr)
 import GHC.Driver.Main.Passes (hscCompileCoreExprWithOptionalName, hscLoadSameModuleClosedBcos)
 import GHC.Driver.Ppr (showPpr, showSDocForUser)
-import GHC.Driver.Session (safeInferOn, safeLanguageOn)
+import GHC.Driver.Session (packageTrustOn, safeInferOn, safeLanguageOn)
 
 import GHC.Hs
 
@@ -75,7 +75,13 @@ import GHC.Linker.Loader (executableDependenciesAvailable)
 import GHC.Rename.Env (DeprecationWarnings(..), addUsedGREs)
 import GHC.Runtime.Context (extendInteractiveContextWithIds)
 import GHC.Runtime.Interpreter (Interp, evalString)
-import GHC.Unit.Module.ModIface (mi_hsc_src)
+import GHC.Types.SafeHaskell (SafeHaskellMode(..), getSafeMode)
+import GHC.Unit.Home (isHomeModule)
+import GHC.Unit.Module (Module, moduleUnit)
+import GHC.Unit.Module.Deps (dep_trusted_pkgs, imp_mods)
+import GHC.Unit.Module.Imported (imv_is_safe, importedByUser)
+import GHC.Unit.Module.ModIface (ModIface, mi_deps, mi_hsc_src, mi_trust, mi_trust_pkg)
+import GHC.Unit.State (isUnitIdTrusted, isUnitTrusted)
 
 import GHC.Types.Error (errorsOrFatalWarningsFound, emptyMessages)
 import GHC.Types.Id
@@ -105,8 +111,11 @@ import Control.Monad
 import qualified Control.Monad.Trans.Class as Trans
 import qualified Control.Monad.Trans.State.Strict as State
 import Data.List (find, stripPrefix)
+import qualified Data.Map.Strict as Map
 import Data.Maybe
+import qualified Data.Set as Set
 import Numeric.Natural (Natural)
+import System.Timeout (timeout)
 import Text.Read (readMaybe)
 
 -- | Check a staged expression and attach the evidence from the supplied solver.
@@ -417,10 +426,11 @@ closedCallValueShape rdr_env kind = do
       | tc == maybeTyCon =
           Just [(Just "0;", nothingDataCon, []), (Just "1;", justDataCon, [arg])]
     builtin_constructors tc [a, b]
-      | tc == pairTyCon =
-          Just [(Nothing, tupleDataCon Boxed 2, [a, b])]
       | closedEitherTyCon tc, [left_con, right_con] <- tyConDataCons tc =
           Just [(Just "0;", left_con, [a]), (Just "1;", right_con, [b])]
+    builtin_constructors tc args
+      | isBoxedTupleTyCon tc, length args == tyConArity tc, length args /= 1 =
+          Just [(Nothing, tupleDataCon Boxed (length args), args)]
     builtin_constructors _ _ = Nothing
 
     field_indices indices ty = filter (`elemVarSet` tyCoVarsOfType ty) indices
@@ -585,7 +595,7 @@ closedConstructorTag con = show (dataConTagZ con) ++ ";"
 -- | Canonical fixed datatypes do not require client constructor imports.
 closedBuiltinData :: TyCon -> Bool
 closedBuiltinData tc =
-  tc == listTyCon || tc == maybeTyCon || tc == pairTyCon || closedEitherTyCon tc
+  tc == listTyCon || tc == maybeTyCon || (isBoxedTupleTyCon tc && tyConArity tc /= 1) || closedEitherTyCon tc
 
 closedEitherTyCon :: TyCon -> Bool
 closedEitherTyCon tc =
@@ -900,12 +910,13 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
     (value, links, packages) <- either (bad . displayException) pure compiled
     recordThNeededRuntimeDeps links packages
     forM value $ \val -> do
-      outcome <- tryAllM $ liftIO $ evalString interp val
+      outcome <- tryAllM $ liftIO $ timeout 10000000 (evalString interp val)
       rendered <- case outcome of
         Left exn | Just async <- (fromException exn :: Maybe SomeAsyncException) ->
           liftIO $ throwIO async
         Left exn -> bad (displayException exn)
-        Right rendered -> pure rendered
+        Right Nothing -> bad "Compile-time evaluation exceeded the time limit."
+        Right (Just rendered) -> pure rendered
       case decodeClosedCallResult shape rendered of
         Just ty | typeKind ty `tcEqType` result_kind -> return ty
         _ -> bad "The value returned by the interpreter does not match the checked result type."
@@ -1094,11 +1105,14 @@ specializeClosedFunction fun expected = do
   when (any unavailable free) $
     failWithTc (TcRnClosedTypeEval name
       "The specialization uses an unfinished local binding or dictionary.")
+  let external_free =
+        [ getName v
+        | v <- free, isGlobalId v
+        , not (nameIsLocalOrFrom this_mod (getName v)) ]
+  hsc_env <- getTopEnv
+  mapM_ (checkClosedTypeEvalStage hsc_env) external_free
   updTcRef (tcg_source_check env) $ \s ->
-    s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s)
-          [ getName v
-          | v <- free, isGlobalId v
-          , not (nameIsLocalOrFrom this_mod (getName v)) ] }
+    s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) external_free }
   method <- closedMethodProof env fun free
   pure (core, method)
 
@@ -1420,11 +1434,38 @@ checkClosedTypeEvalStage hsc_env name = do
       iface <- loadInterfaceForName (text "closed call in a type") name
       when (isHsBootOrSig (mi_hsc_src iface)) $
         reject "The defining interface is a boot file or a module signature and provides no executable definition."
+      case nameModule_maybe name of
+        Just m
+          | let user_imps = importedByUser (Map.findWithDefault [] m (imp_mods (tcg_imports gbl_env)))
+          , any imv_is_safe user_imps
+          , not (isTrustedSafeImport hsc_env dflags m iface) ->
+              reject "Safe import disallows executing code from an untrusted module in types."
+        _ -> pure ()
   when (safeInferOn dflags) $
     recordUnsafeInfer emptyMessages
   case hsc_interp hsc_env of
     Just interp -> return interp
     Nothing -> reject "Compile-time evaluation requires a GHC interpreter for the target."
+
+isTrustedSafeImport :: HscEnv -> DynFlags -> Module -> ModIface -> Bool
+isTrustedSafeImport hsc_env dflags m iface =
+  let trust = getSafeMode (mi_trust iface)
+      trust_own_pkg = mi_trust_pkg iface
+      unit_state = hsc_units hsc_env
+      home_unit = hsc_home_unit hsc_env
+      safe_mod = trust `elem` [Sf_Safe, Sf_SafeInferred, Sf_Trustworthy]
+      safe_pkg = case trust of
+        Sf_None   -> False
+        Sf_Ignore -> False
+        Sf_Unsafe -> False
+        _ | not (packageTrustOn dflags) -> True
+        Sf_Safe | not trust_own_pkg -> True
+        Sf_SafeInferred | not trust_own_pkg -> True
+        _ | isHomeModule home_unit m -> True
+        _ -> isUnitTrusted unit_state (moduleUnit m)
+      deps_ok = not (packageTrustOn dflags)
+                || all (isUnitIdTrusted unit_state) (Set.toList (dep_trusted_pkgs (mi_deps iface)))
+  in safe_mod && safe_pkg && deps_ok
 
 -- | Test the execution route without preflighting, linking, or running code.
 tcHasClosedCallExecutable :: Name -> TcM Bool

@@ -36,7 +36,7 @@ NativeGadtRetainedSumPayloadRejects.hs:15:40: error: [GHC-25897]
         badBranch :: Later a b -> Vec a requested
           (bound at NativeGadtRetainedSumPayloadRejects.hs:15:1)
 
-NativeGadtRetainedSumPayloadRejects.hs:18:25: error: [GHC-25897]
+NativeGadtRetainedSumPayloadRejects.hs:18:33: error: [GHC-25897]
     • Couldn't match type ‘caller’ with ‘_4’
       Expected: Vec Bool caller
         Actual: Vec Bool _4
@@ -44,7 +44,8 @@ NativeGadtRetainedSumPayloadRejects.hs:18:25: error: [GHC-25897]
         the type signature for:
           badEscape :: forall (caller :: Nat). Packed Bool -> Vec Bool caller
         at NativeGadtRetainedSumPayloadRejects.hs:17:1-43
-    • In the expression: forward xs
+    • In the first argument of ‘forward’, namely ‘xs’
+      In the expression: forward xs
       In an equation for ‘badEscape’: badEscape (Pair _ xs) = forward xs
     • Relevant bindings include
         xs :: Vec Bool _4
@@ -52,37 +53,19 @@ NativeGadtRetainedSumPayloadRejects.hs:18:25: error: [GHC-25897]
         badEscape :: Packed Bool -> Vec Bool caller
           (bound at NativeGadtRetainedSumPayloadRejects.hs:18:1)
 
-NativeGadtRetainedSumPayloadRejects.hs:21:53: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘_2’
-      Expected: Vec Bool n0
-        Actual: Vec Bool _2
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeGadtRetainedSumPayloadRejects.hs:21:42-57
-    • In the first argument of ‘sameLength’, namely ‘xs’
-      In the expression: sameLength xs ys
-      In an equation for ‘badIndependent’:
-          badIndependent (Pair _ xs) (Pair _ ys) = sameLength xs ys
-    • Relevant bindings include
-        xs :: Vec Bool _2
-          (bound at NativeGadtRetainedSumPayloadRejects.hs:21:24)
-
 NativeGadtRetainedSumPayloadRejects.hs:21:56: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘_3’
-      Expected: Vec Bool n0
-        Actual: Vec Bool _3
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeGadtRetainedSumPayloadRejects.hs:21:42-57
+    • Couldn't match type ‘_2’ with ‘_3’
+      Expected: Vec Bool _3
+        Actual: Vec Bool _2
     • In the second argument of ‘sameLength’, namely ‘ys’
       In the expression: sameLength xs ys
       In an equation for ‘badIndependent’:
           badIndependent (Pair _ xs) (Pair _ ys) = sameLength xs ys
     • Relevant bindings include
-        ys :: Vec Bool _3
+        ys :: Vec Bool _2
           (bound at NativeGadtRetainedSumPayloadRejects.hs:21:36)
+        xs :: Vec Bool _3
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:21:24)
 
 NativeGadtRetainedSumPayloadRejects.hs:24:45: error: [GHC-25897]
     • Could not deduce ‘b ~ a’

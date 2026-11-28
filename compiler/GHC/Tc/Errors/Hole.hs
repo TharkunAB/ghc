@@ -30,7 +30,7 @@ where
 import GHC.Prelude
 
 import GHC.Tc.Errors.Types ( HoleFitDispConfig(..), FitsMbSuppressed(..)
-                           , ValidHoleFits(..), noValidHoleFits )
+                           , HsCtxt(MatchInCtxt), ValidHoleFits(..), noValidHoleFits )
 import GHC.Tc.Types
 import GHC.Tc.Types.LclEnv ( setLclEnvRdrEnv )
 import GHC.Tc.Utils.Monad
@@ -99,7 +99,9 @@ import GHC.Tc.Utils.Unify
   )
 
 import GHC.HsToCore.Docs ( extractDocs )
+import GHC.Hs ( Match(..), HsMatchContext(..), GRHSs(..), GRHS(..) )
 import GHC.Hs.Doc
+import Data.List.NonEmpty ( NonEmpty(..) )
 import GHC.Unit.Module.ModIface ( mi_docs )
 import GHC.Iface.Load  ( loadInterfaceForName )
 
@@ -724,11 +726,30 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; raw_cands <- if null candidatePlugins
                     then pure all_cands
                     else foldM (flip ($)) all_cands candidatePlugins
-     ; let cands = filter keep_builtin_cand raw_cands
+     ; let has_vis_dep_fun ty = case coreFullView ty of
+             DepFunTy DepFunVisible _ _ -> True
+             ForAllTy _ _ b             -> has_vis_dep_fun b
+             FunTy _ _ _ _ b            -> has_vis_dep_fun b
+             DepDictTy _ b              -> has_vis_dep_fun b
+             _                          -> False
+           mb_self_loop_fun
+             | dep_exts
+             , has_vis_dep_fun hole_ty || isGadtHoleTy hole_ty
+             , MatchInCtxt (Match { m_ctxt = FunRhs { mc_fun = L _ fn }
+                                  , m_pats = L _ []
+                                  , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] _) :| [] } }) : _
+                 <- ctl_ctxt (ctLocEnv ct_loc)
+             = Just fn
+             | otherwise = Nothing
+           is_self_cand fn c =
+             let nm = getName c
+             in nm == fn || (isInternalName nm && nameOccName nm == nameOccName fn)
+           cands  = filter keep_builtin_cand raw_cands
+           cands0 = maybe cands (\fn -> filter (not . is_self_cand fn) cands) mb_self_loop_fun
      ; lookup_fn <- mkCachedCandLookup gadt_proof_hole
      ; traceTc "numPlugins are:" $ ppr (length candidatePlugins)
      ; (searchDiscards, subs0) <-
-        tcFilterHoleFitsWith lookup_fn findVLimit hole (hole_ty, []) cands
+        tcFilterHoleFitsWith lookup_fn findVLimit hole (hole_ty, []) cands0
      ; (tidy_env, tidy_subs) <- liftZonkM $ zonkSubs tidy_env subs0
      ; tidy_sorted_subs <- sortFits sortingAlg tidy_subs
      ; (tidy_env, tidy_hole_ty) <- liftZonkM $ zonkTidyTcType tidy_env hole_ty
@@ -1219,14 +1240,18 @@ tcCheckHoleFit ds_flag (TypedHole {..}) hole_ty cand_ty = discardErrs $
                         = d { reductionDepth = min (reductionDepth d) (mkIntWithInf 24) }
                         | otherwise
                         = d
+                ; gbl <- getGblEnv
+                ; th_st <- readTcRef (tcg_th_state gbl)
+                ; sc_st <- readTcRef (tcg_source_check gbl)
                 ; (rem, _) <- tryTc $ updTopFlags cap_depth
                                     $ runTcSEarlyAbort
                                     $ simplifyTopWanteds final_wc
                 ; traceTc "}" empty
-                ; return $
-                    if any isSolvedWC rem
-                    then Just wrap
-                    else Nothing
+                ; if any isSolvedWC rem
+                  then return (Just wrap)
+                  else do { writeTcRef (tcg_th_state gbl) th_st
+                          ; writeTcRef (tcg_source_check gbl) sc_st
+                          ; return Nothing }
                 } }
   where
     orig = ExprHoleOrigin (hole_occ <$> th_hole)

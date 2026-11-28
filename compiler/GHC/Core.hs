@@ -2730,7 +2730,8 @@ nativeDeferredArgIndex e
 computedIndexExpr :: CoreExpr -> Maybe (CoreExpr, Type)
 computedIndexExpr = nativeIndexExprWith False extra
   where
-    extra (Tick tick@HpcTick{} body) = do
+    extra (Tick tick body)
+      | case tick of { HpcTick{} -> True; SourceNote{} -> True; _ -> False } = do
       (body', index) <- computedIndexExpr body
       return (Tick tick body', index)
     extra (Cast body co)
@@ -4037,9 +4038,11 @@ isNativeIndexAliasAlt _ = False
 -- | Check the binder of an alias for a supported runtime index.
 -- See Notes [Indexed GADT constructor operands] and [Boxed character literal indices].
 isNativeIndexAliasBinder :: CoreExpr -> Id -> Bool
-isNativeIndexAliasBinder expr binder = isNativeIndexId binder
-  || (isNativeOpaqueValueId binder &&
-      maybe False boxed_index (exprToNativeCaseIndex expr))
+isNativeIndexAliasBinder expr binder =
+  isManyTy (idMult binder)
+    && (isNativeIndexId binder
+        || (isNativeOpaqueValueId binder &&
+            maybe False boxed_index (exprToNativeCaseIndex expr)))
   where
     boxed_index index = isNativeConstructedGadtIndex index
       || isJust (isCharLitTy index) || isJust (isNumLitTy index)

@@ -93,9 +93,9 @@ NativeTypeNumeralWrong.hs:66:8: error: [GHC-05617]
                 count = S area
               in replicateNative count True
 
-NativeTypeNumeralWrong.hs:76:20: error: [GHC-83865]
-    • Couldn't match type ‘size’ with ‘S extent’
-      Expected: Vec Char ((1 :: Nat) + extent)
+NativeTypeNumeralWrong.hs:76:21: error: [GHC-83865]
+    • Couldn't match type ‘size’ with ‘S n0’
+      Expected: Vec Char ((1 :: Nat) + n0)
         Actual: Vec Char size
     • In the first argument of ‘headOfLocal’, namely
         ‘(replicateNative size 'x')’
@@ -106,9 +106,9 @@ NativeTypeNumeralWrong.hs:76:20: error: [GHC-83865]
           size = 1 + extent
         in headOfLocal (replicateNative size 'x')
 
-NativeTypeNumeralWrong.hs:80:27: error: [GHC-83865]
-    • Couldn't match type ‘Z’ with ‘S n0’
-      Expected: Vec Char ((1 :: Nat) + n0)
+NativeTypeNumeralWrong.hs:80:28: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S n1’
+      Expected: Vec Char ((1 :: Nat) + n1)
         Actual: Vec Char size1
     • In the first argument of ‘headOfLocal’, namely
         ‘(replicateNative size x)’
@@ -119,3 +119,4 @@ NativeTypeNumeralWrong.hs:80:27: error: [GHC-83865]
             where
                 size :: Nat
                 size = 0
+

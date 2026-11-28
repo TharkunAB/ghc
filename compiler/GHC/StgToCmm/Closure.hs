@@ -928,12 +928,15 @@ getTyDescription ty
   = case (tcSplitSigmaTy ty) of { (_, _, tau_ty) ->
     case tau_ty of
       TyVarTy _              -> "*"
-      TermVarTy {}           -> pprPanic "getTyDescription: unsupported runtime index" (ppr tau_ty)
-      TermAppTy {}           -> pprPanic "getTyDescription: unsupported runtime call index" (ppr tau_ty)
-      DepFunTy {}            -> pprPanic "getTyDescription: unsupported retained function" (ppr tau_ty)
+      TermVarTy v            -> getOccString v
+      TermAppTy f _          -> getOccString f
+      ClassAppTy sel _ _ _ _ -> getOccString sel
+      DepFunTy {}            -> '-' : fun_result tau_ty
+      DepDictTy _ body       -> getTyDescription body
+      ExistsTy _ _ body      -> getTyDescription body
       AppTy fun _            -> getTyDescription fun
       TyConApp tycon _       -> getOccString tycon
-      FunTy {}              -> '-' : fun_result tau_ty
+      FunTy {}               -> '-' : fun_result tau_ty
       ForAllTy _ _ ty        -> getTyDescription ty
       LitTy n                -> getTyLitDescription n
       CastTy ty _            -> getTyDescription ty
@@ -941,6 +944,7 @@ getTyDescription ty
     }
   where
     fun_result (FunTy { ft_res = res }) = '>' : fun_result res
+    fun_result (DepFunTy _ _ res)       = '>' : fun_result res
     fun_result other                    = getTyDescription other
 
 getTyLitDescription :: TyLit -> String

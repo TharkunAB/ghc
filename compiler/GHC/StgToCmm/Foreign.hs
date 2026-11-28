@@ -769,6 +769,9 @@ collectStgFArgTypes = go []
     go  _ (TermVarTy{}) = panic "collectStgFArgTypes: native dependent FFI types are not implemented"
     go  _ (TermAppTy{}) = panic "collectStgFArgTypes: native call FFI types are not implemented"
     go  _ (DepFunTy{}) = panic "collectStgFArgTypes: native dependent FFI types are not implemented"
+    go  _ (DepDictTy{}) = panic "collectStgFArgTypes: native dependent FFI types are not implemented"
+    go  _ (ExistsTy{}) = panic "collectStgFArgTypes: existential FFI types are not implemented"
+    go  _ (ClassAppTy{}) = panic "collectStgFArgTypes: class method FFI types are not implemented"
     go  _ (CastTy{}) = panic "myCollectTypeArgs: CastTy"
     go  _ (CoercionTy{}) = panic "myCollectTypeArgs: CoercionTy"
     go bs (FunTy {ft_arg = arg, ft_res=res}) =

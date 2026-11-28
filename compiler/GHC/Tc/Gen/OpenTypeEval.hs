@@ -4,6 +4,7 @@ module GHC.Tc.Gen.OpenTypeEval
   , openTypeFailureReason
   , observeOpenType
   , instantiateOpenTypeFunction
+  , openTypeFunctionSignature
   , instantiateOpenMethod
   , readOpenMethodWorker
   , readOpenDefinition
@@ -16,19 +17,19 @@ import Control.Monad (foldM, guard)
 import Data.List (sortBy)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (runExceptT, throwE)
-import GHC.Builtin.WiredIn.Types (liftedTypeKind, manyDataConTy, mkBoxedTupleTy,
-                                  promotedTupleDataCon, tupleTyCon, unmatchableDataConTy)
+import GHC.Builtin.WiredIn.Types (liftedTypeKind, manyDataConTy, unmatchableDataConTy)
 import GHC.Core.Class (classAllSelIds)
 import GHC.Core (CoreExpr, Expr(..), mkApps)
 import GHC.Core.Coercion (mkSubCo)
 import GHC.Core.Reduction (Reduction(..))
-import GHC.Core.DataCon (DataCon, dataConName, dataConTyCon, dataConUserTyVars, dataConWorkId)
-import GHC.Core.TyCon (isBoxedDataTyCon, isPromotedDataCon_maybe, isTupleTyCon, tyConName)
-import GHC.Core.Make (mkCoreBoxedTuple)
+import GHC.Core.DataCon (DataCon, dataConName, dataConTyCon, dataConUserTyVars, dataConWorkId, isVanillaDataCon)
+import GHC.Core.TyCon (isBoxedDataTyCon, isPromotedDataCon_maybe, tyConArity, tyConDataCons, tyConName)
 import GHC.Core.Predicate (classMethodInstTy, getClassPredTys_maybe)
-import GHC.Core.Type (Kind, Type, FunTyFlag(FTF_T_T), getTyVar_maybe, isLiftedTypeKind, isManyTy,
-                      mkTyConApp, mkTyVarTy, mkVisFunTyManyU, splitForAllForAllTyBinders,
-                      splitAppTysNoView, splitFunTy_maybe, splitTyConApp_maybe, typeKind)
+import GHC.Core.TyCo.Rep (Type(AppTy, TermAppTy, TermVarTy, TyVarTy))
+import GHC.Core.Type (Kind, Type, FunTyFlag(FTF_T_T), isLiftedTypeKind, isManyTy,
+                      isNativeOpaqueValueId, mkTyConApp, mkTyVarTy, mkVisFunTyManyU,
+                      splitForAllForAllTyBinders, splitFunTy_maybe, splitTyConApp_maybe,
+                      substTyWith, typeKind)
 import GHC.Core.Utils (exprType, mkCast)
 import GHC.Core.TyCo.Subst (lookupTyVar, substTy)
 import GHC.Core.Unify (tcMatchTys)
@@ -46,7 +47,7 @@ import GHC.Tc.Utils.Monad (TcM, getGblEnv, getTopEnv, initIfaceLcl, initIfaceTcR
                            liftIO, newTcRef, newUnique, readTcRef, tcg_imports,
                            tcg_rdr_env, tcg_semantic_mod, tcg_local_open_defs, tcg_local_open_owners, updTcRef)
 import GHC.Tc.Utils.TcType (TcTyVarDetails(SkolemTv), isTyFamFree, noFreeVarsOfType, tcEqType)
-import GHC.Types.Basic (Boxity(Boxed), mkIntWithInf)
+import GHC.Types.Basic (mkIntWithInf)
 import GHC.Types.Id (Id, idName, idType, isClassOpId_maybe, mkSysLocal)
 import GHC.Types.Name (Name, getOccString, nameModule_maybe, stableNameCmp)
 import GHC.Types.Name.Env (emptyNameEnv, extendNameEnv_C, lookupNameEnv, nonDetNameEnvElts)
@@ -54,8 +55,8 @@ import GHC.Types.Name.Reader (gre_imp, isLocalGRE, is_decl, is_isboot, lookupGRE
 import GHC.Types.Name.Set (NameSet, emptyNameSet, isEmptyNameSet, mkNameSet, nameSetElemsStable,
                            unionNameSet, unitNameSet)
 import GHC.Types.SourceFile (isHsBootOrSig)
-import GHC.Types.Var (TyVar, ForAllTyFlag(Invisible), VarBndr(..), isGlobalId, isTcTyVar, isTyVar,
-                      tcTyVarDetails, tyVarKind, varName)
+import GHC.Types.Var (TyVar, Var, ForAllTyFlag(Invisible), VarBndr(..), isGlobalId, isTcTyVar, isTyVar,
+                      tcTyVarDetails, tyVarKind, varName, varType)
 import GHC.Types.Var.Env (VarEnv, emptyVarEnv, extendVarEnv, lookupVarEnv)
 import GHC.Core.OpenWhnf
 import qualified GHC.Unit.Home.Graph as HUG
@@ -80,9 +81,8 @@ data OpenTypeFailure
 
 -- | A checked source argument and its lazy constructor fields.
 data OpenArgument
-  = OpenRigid TyVar [OpenArgument]
+  = OpenRigid Var [OpenArgument]
   | OpenGroundType Type
-  | OpenPair TyVar TyVar
   | OpenConstructor DataCon [CoreExpr] [OpenArgument]
 
 -- | Symbol table mapping rigid skolems to Core operand Ids and back to source types.
@@ -157,9 +157,10 @@ observeOpenType local_call indexed instantiated result_kind operands
             Left (ReadbackHidden con) -> throwE (HiddenConstructor (tyConName (dataConTyCon con)))
             Left (ReadbackOpaque (Neutral (CaseBlocked (Rigid actual) _)))
               | Just ty <- origin actual ->
-                  case getTyVar_maybe ty of
-                    Just skolem -> throwE (RigidCase (varName skolem))
-                    Nothing -> throwE GroundTypeCase
+                  case ty of
+                    TyVarTy skolem -> throwE (RigidCase (varName skolem))
+                    TermVarTy idx  -> throwE (RigidCase (varName idx))
+                    _              -> throwE GroundTypeCase
             Left (ReadbackOpaque _) -> throwE UnexpectedNeutral
             Right (result, constructors) -> do
               dependencies <- lift (readTcRef uses)
@@ -174,26 +175,28 @@ observeOpenType local_call indexed instantiated result_kind operands
               pure (result, concatMap flatten ordered, declarations)
         else throwE InvalidInput
   where
-    rigid skolem
-      | isTcTyVar skolem, SkolemTv{} <- tcTyVarDetails skolem
-      = isLiftedTypeKind (typeKind (tyVarKind skolem))
-      | otherwise = False
+    rigid v
+      | isTyVar v
+      = isTcTyVar v && (case tcTyVarDetails v of { SkolemTv{} -> True; _ -> False })
+        && isLiftedTypeKind (typeKind (tyVarKind v))
+      | otherwise
+      = isNativeOpaqueValueId v && isLiftedTypeKind (typeKind (varType v))
+
+    splitOpenRigid (TyVarTy tv) | rigid tv = Just (tv, [])
+    splitOpenRigid (TermVarTy v) | rigid v = Just (v, [])
+    splitOpenRigid (TermAppTy f a) | rigid f = Just (f, [a])
+    splitOpenRigid (AppTy fun arg) = do
+      (hd, args) <- splitOpenRigid fun
+      pure (hd, args ++ [arg])
+    splitOpenRigid _ = Nothing
 
     kindsMatch tys expected =
       equalLength tys expected &&
       and (zipWith (\t exp_k -> typeKind t `tcEqType` exp_k) tys expected)
 
     checkedOperand ty
-      | (head_ty, args) <- splitAppTysNoView ty
-      , Just skolem <- getTyVar_maybe head_ty, rigid skolem
-      = OpenRigid skolem <$> checkArgs (tyVarKind skolem) args
-      | Just (tuple, [ka, kb, a, b]) <- splitTyConApp_maybe ty
-      , tuple == promotedTupleDataCon Boxed 2
-      , ka `tcEqType` liftedTypeKind, kb `tcEqType` liftedTypeKind
-      , Just x <- getTyVar_maybe a, rigid x
-      , Just y <- getTyVar_maybe b, rigid y
-      , tyVarKind x `tcEqType` ka, tyVarKind y `tcEqType` kb
-      = Just (OpenPair x y)
+      | Just (v, args) <- splitOpenRigid ty
+      = OpenRigid v <$> checkArgs (varType v) args
       | Just (promoted, args) <- splitTyConApp_maybe ty
       , Just con <- isPromotedDataCon_maybe promoted
       , Just (parent, parameters) <- splitTyConApp_maybe (typeKind ty)
@@ -228,29 +231,26 @@ observeOpenType local_call indexed instantiated result_kind operands
       (!state', arg) <- buildOperand state operand
       pure (state', arg : args)
 
-    buildOperand state (OpenRigid skolem args) = do
-      (state', head_expr) <- symbolFor state skolem
+    buildOperand state (OpenRigid v args) = do
+      (state', head_expr) <- symbolFor state v
       (final, revArgs) <- foldM buildArgument (state', []) args
       pure (final, mkApps head_expr (reverse revArgs))
     -- See Note [Ground type operands of local calls].
     buildOperand (OperandState symbols origins) (OpenGroundType ty) = do
       symbol <- freshSymbol liftedTypeKind
       pure (OperandState symbols (extendVarEnv origins symbol ty), Var symbol)
-    buildOperand state (OpenPair x y) = do
-      (state', first) <- symbolFor state x
-      (state'', second) <- symbolFor state' y
-      pure (state'', mkCoreBoxedTuple [first, second])
     buildOperand state (OpenConstructor con erased fields) = do
       (state', revFields) <- foldM buildArgument (state, []) fields
       pure (state', mkApps (Var (dataConWorkId con)) (erased ++ reverse revFields))
 
-    symbolFor state@(OperandState symbols origins) skolem =
-      case lookupVarEnv symbols skolem of
+    symbolFor state@(OperandState symbols origins) v =
+      case lookupVarEnv symbols v of
         Just symbol -> pure (state, Var symbol)
         Nothing -> do
-          symbol <- freshSymbol (tyVarKind skolem)
-          pure (OperandState (extendVarEnv symbols skolem symbol)
-                             (extendVarEnv origins symbol (mkTyVarTy skolem)),
+          symbol <- freshSymbol (varType v)
+          let src_ty = if isTyVar v then mkTyVarTy v else TermVarTy v
+          pure (OperandState (extendVarEnv symbols v symbol)
+                             (extendVarEnv origins symbol src_ty),
                 Var symbol)
 
     freshSymbol kind = do
@@ -278,49 +278,56 @@ data DefinitionFailure
   | WrongTemplateType
   deriving (Eq, Show)
 
--- | The kind of a pair whose fields are both types.
-openPairKind :: Type
-openPairKind = mkBoxedTupleTy [liftedTypeKind, liftedTypeKind]
-
--- | Instantiate the type binders and recover the checked input and result kinds.
-instantiateOpenTypeFunction :: Bool -> Id -> Maybe (CoreExpr, [Kind], Kind)
-instantiateOpenTypeFunction local_families function
-  | not (null binders), all liftedUniversal binders
-  = do let instantiated = foldl' (\expr _ -> App expr (Type liftedTypeKind)) (Var function) binders
-       (checked, (domains, result)) <- case termKinds body of
-         Just kinds -> Just (instantiated, kinds)
+-- | Recover the polymorphic or monomorphic signature of an open source function.
+openTypeFunctionSignature :: Bool -> Id -> Maybe ([TyVar], [Kind], Kind, CoreExpr -> CoreExpr)
+openTypeFunctionSignature local_families function
+  | all liftedUniversal binders
+  = do (wrap, (domains, result)) <- case termKinds body of
+         Just kinds -> Just (id, kinds)
          Nothing | local_families -> do
            let Reduction _ reduced = openFamilyReduction body
            kinds <- termKinds reduced
-           let Reduction co _ = openFamilyReduction (exprType instantiated)
-           pure (mkCast instantiated (mkSubCo co), kinds)
+           let wrap expr =
+                 let Reduction co _ = openFamilyReduction (exprType expr)
+                 in mkCast expr (mkSubCo co)
+           pure (wrap, kinds)
          _ -> Nothing
        guard (not (null domains))
-       pure (checked, domains, result)
+       pure (tvs, domains, result, wrap)
   | otherwise = Nothing
   where
     (binders, body) = splitForAllForAllTyBinders (idType function)
-    binder_tys = [mkTyVarTy v | (_, Bndr v _) <- binders]
+    tvs = [v | (_, Bndr v _) <- binders]
+    binder_tys = map mkTyVarTy tvs
     bound ty = any (tcEqType ty) binder_tys
-    domainKind allow_tuples ty
-      | bound ty = Just liftedTypeKind
-      | Just (tuple, [a, b]) <- splitTyConApp_maybe ty
-      , tuple == tupleTyCon Boxed 2
-      , bound a, bound b = Just openPairKind
+    domainKind ty
+      | bound ty = Just ty
+      | Just (FTF_T_T, ma, mult, a, b) <- splitFunTy_maybe ty
+      , ma `tcEqType` unmatchableDataConTy
+      , isManyTy mult
+      = mkVisFunTyManyU <$> domainKind a <*> domainKind b
       | Just (con, parameters) <- splitTyConApp_maybe ty
       , isBoxedDataTyCon con
-      , allow_tuples || not (isTupleTyCon con)
-      , all bound parameters
-      = Just (mkTyConApp con (liftedTypeKind <$ parameters))
+      , tyConArity con == length parameters
+      , all isVanillaDataCon (tyConDataCons con)
+      = mkTyConApp con <$> traverse domainKind parameters
       | otherwise = Nothing
     termKinds ty
       | Just (FTF_T_T, matchability, multiplicity, domain, result) <- splitFunTy_maybe ty
       , matchability `tcEqType` unmatchableDataConTy
       , isManyTy multiplicity = do
-          input <- domainKind True domain
+          input <- domainKind domain
           (inputs, output) <- termKinds result
           pure (input : inputs, output)
-      | otherwise = ([],) <$> domainKind False ty
+      | otherwise = ([],) <$> domainKind ty
+
+-- | Instantiate the type binders at 'Type' and recover the checked input and result kinds.
+instantiateOpenTypeFunction :: Bool -> Id -> Maybe (CoreExpr, [Kind], Kind)
+instantiateOpenTypeFunction local_families function = do
+  (tvs, domains, result, wrap) <- openTypeFunctionSignature local_families function
+  let inst = substTyWith tvs (liftedTypeKind <$ tvs)
+      applied = foldl' (\expr _ -> App expr (Type liftedTypeKind)) (Var function) tvs
+  pure (wrap applied, map inst domains, inst result)
 
 -- | Instantiate a selected binary method using the kinds of both operands.
 instantiateOpenMethod :: Id -> Kind -> Kind -> Maybe (CoreExpr, Kind)

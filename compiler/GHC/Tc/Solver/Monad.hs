@@ -140,6 +140,7 @@ import qualified GHC.Tc.Utils.Env      as TcM
        ( tcGetDefaultTys, tcLookupIdMaybe, tcLookupKnownKeyId, tcLookupKnownKeyTyCon )
 import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Zonk.Monad ( ZonkM )
+import GHC.Tc.Zonk.Type ( withReadOnlyFinalZonk )
 import qualified GHC.Tc.Zonk.TcType  as TcM
 
 import GHC.Driver.DynFlags
@@ -1290,8 +1291,9 @@ traceTcS :: String -> SDoc -> TcS ()
 traceTcS herald doc = wrapTcS (TcM.traceTc herald doc)
 {-# INLINE traceTcS #-}  -- see Note [INLINE conditional tracing utilities]
 
+-- See Note [Read-only final zonking during constraint solving] in GHC.Tc.Zonk.Type.
 runTcPluginTcS :: TcPluginM a -> TcS a
-runTcPluginTcS = wrapTcS . runTcPluginM
+runTcPluginTcS = wrapTcS . withReadOnlyFinalZonk . runTcPluginM
 
 instance HasDynFlags TcS where
     getDynFlags = wrapTcS getDynFlags

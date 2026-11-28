@@ -99,6 +99,7 @@ dropHsDocTy = drop_sig_ty
     drop_lty (L src x) = L src (drop_ty x)
 
     drop_ty (HsForAllTy x a e) = HsForAllTy x a (drop_lty e)
+    drop_ty (HsForEachTy x bndrs e) = HsForEachTy x bndrs (drop_lty e)
     drop_ty (HsQualTy x a e) = HsQualTy x a (drop_lty e)
     drop_ty (HsAppTy x a b) = HsAppTy x (drop_lty a) (drop_lty b)
     drop_ty (HsAppKindTy x a b) = HsAppKindTy x (drop_lty a) (drop_lty b)

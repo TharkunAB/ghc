@@ -1,5 +1,5 @@
 NativeIrredIndexEvidence.hs:21:35: error: [GHC-05617]
-    • Could not deduce ‘other1 ~ v1’
+    • Could not deduce ‘v1 ~ other1’
       from the context: b1 ~ Flip a
         bound by a pattern with constructor:
                    Refl :: forall {k} (a :: k). a :~: a,
@@ -16,7 +16,7 @@ NativeIrredIndexEvidence.hs:21:35: error: [GHC-05617]
         v :: Token b1 (bound at NativeIrredIndexEvidence.hs:21:11)
 
 NativeIrredIndexEvidence.hs:33:45: error: [GHC-05617]
-    • Could not deduce ‘other ~ v’
+    • Could not deduce ‘v ~ other’
       from the context: b ~ Flip a
         bound by a pattern with constructor:
                    Refl :: forall {k} (a :: k). a :~: a,
@@ -33,3 +33,4 @@ NativeIrredIndexEvidence.hs:33:45: error: [GHC-05617]
     • Relevant bindings include
         other :: Token b (bound at NativeIrredIndexEvidence.hs:33:18)
         v :: Token b (bound at NativeIrredIndexEvidence.hs:33:16)
+

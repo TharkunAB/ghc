@@ -36,7 +36,7 @@ import GHC.Core.Coercion.Axiom
 import GHC.Core.ConLike (ConLike(RealDataCon))
 import qualified GHC.Core.DataCon as DC
 import GHC.Core.Dependent (hasExistentialExpr, hasNativeDependentExpr)
-import GHC.Core.FamInstEnv (emptyFamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch, normaliseTcApp)
+import GHC.Core.FamInstEnv (emptyFamInstEnvs, mkBranchedCoAxiom, mkCoAxBranch, normaliseTcAppWithFuel)
 import GHC.Core.FVs (exprFreeVars, exprSomeFreeVarsList)
 import GHC.Core.OpenWhnf (checkedMultiplicityCast, openDataConFieldTypes, openIndexedDataCon)
 import GHC.Core.Predicate (tyCoVarsOfTypesWellScoped)
@@ -779,7 +779,7 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
                         let merged_env = cb_inner_env ++ [(u, cb_spec t) | (u, t) <- val_env]
                         (_, _, c_fn) <- compileExpr False cb_row_pats fl merged_env cb_spec cb_all_proofs Nothing False cb_leaf
                         let reduced = reductionReducedType $
-                              normaliseTcApp emptyFamInstEnvs Nominal map_tc (map cb_spec map_prefix ++ cb_suffix)
+                              normaliseTcAppWithFuel 2000 emptyFamInstEnvs Nominal map_tc (map cb_spec map_prefix ++ cb_suffix)
                         guard (reduced `eqType` c_fn header)
                       _ -> MaybeT (pure Nothing)
                     pure (False, [], const (mkTyConApp map_tc map_prefix))
@@ -2125,7 +2125,7 @@ rewriteEarlyClosureApps early_set = go
     go (TyConApp tc tys) =
       let tys' = map go tys
       in if tc `elementOfUniqSet` early_set
-           then reductionReducedType (normaliseTcApp emptyFamInstEnvs Nominal tc tys')
+           then reductionReducedType (normaliseTcAppWithFuel 2000 emptyFamInstEnvs Nominal tc tys')
            else TyConApp tc tys'
     go (FunTy af ma mult arg res) = FunTy af (go ma) (go mult) (go arg) (go res)
     go ty = ty
@@ -2168,8 +2168,6 @@ checkLocalIndexedLookupExports env = do
           type_env = tcg_type_env env
           all_early_fams = [tc | (_, table, _, comps) <- candidates, tc <- table : comps]
           exported_tycons = survivingEarlyExportedTyCons all_early_fams (exportedInterfaceTypes exported type_env)
-          partially_exported tc = tyConName tc `elemNameSet` exported ||
-                                  any ((`elemNameSet` exported) . DC.dataConName) (tyConDataCons tc)
           lookupId nm = case lookupTypeEnv type_env nm of { Just (AnId v) -> Just v; _ -> Nothing }
       for_ candidates $ \(owner, table, helpers, companions) -> do
         let name = idName owner; all_families = table : companions
@@ -2177,7 +2175,8 @@ checkLocalIndexedLookupExports env = do
                                  , nameModule_maybe (tyConName tc) == Just (tcg_semantic_mod env)]
             unexported_types = sortBy stableNameCmp [tyConName tc | tc <- local_eq_types, not (publicCaseType env exported (const False) tc)]
             in_iface = any (`elementOfUniqSet` exported_tycons) all_families
-            needs_pub = in_iface || name `elemNameSet` exported || any partially_exported local_eq_types
+            needs_pub = in_iface || name `elemNameSet` exported
+            _ = lookupId
             local_hs = filter (\h -> nameModule_maybe h == Just (tcg_semantic_mod env)) helpers
             unexported_vals = filter (not . (`elemNameSet` exported)) (name : local_hs)
             emitErr detail = setSrcSpan (nameSrcSpan name) $

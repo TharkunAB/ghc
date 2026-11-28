@@ -12,6 +12,7 @@ module GHC.Tc.Zonk.Type (
         -- * Zonking
         -- | For a description of "zonking", see Note [What is zonking?].
         ZonkTcM,
+        withReadOnlyFinalZonk,
         zonkTopDecls, zonkTopExpr, zonkTopLExpr,
         zonkTopBndrs,
         zonkTyVarBindersX, zonkTyVarBinderX,
@@ -39,12 +40,12 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Hs
 
 import {-# SOURCE #-} GHC.Tc.Gen.Splice (runTopSplice)
-import GHC.Tc.Types ( TcM )
+import GHC.Tc.Types ( TcM, TcGblEnv(tcg_th_state) )
 import GHC.Tc.Types.TcRef
 import GHC.Tc.TyCl.Build ( TcMethInfo, MethInfo )
 import GHC.Tc.Utils.Env ( tcLookupGlobalOnly )
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Utils.Monad ( newUnusedType, setSrcSpanA, liftZonkM, traceTc, addErr )
+import GHC.Tc.Utils.Monad ( newUnusedType, setSrcSpanA, liftZonkM, traceTc, addErr, getGblEnv, tryM )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Errors.Types
 import GHC.Tc.Zonk.Env
@@ -91,11 +92,16 @@ import GHC.Tc.Types.BasicTypes
 import GHC.Data.Maybe
 import GHC.Data.Bag
 
+import Control.Exception ( throwIO )
 import Control.Monad
 import Control.Monad.Trans.Class ( lift )
+import Data.Dynamic ( fromDynamic, toDyn )
 import Data.List.NonEmpty ( NonEmpty )
 import Data.Foldable ( toList )
+import qualified Data.Map as Map
+import Data.Proxy ( Proxy(..) )
 import Data.Traversable ( for )
+import Data.Typeable ( typeRep )
 
 {- Note [What is zonking?]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -389,9 +395,11 @@ zonkTyVarOcc tv
 
              zonk_meta ref Flexi
                = do { kind <- zonkTcTypeToTypeX (tyVarKind tv)
-                    ; ty <- lift $ commitFlexi zonk_flexi tv kind
-
-                    ; lift $ liftZonkM $ writeMetaTyVarRef tv ref ty  -- Belt and braces
+                    ; ro <- lift isReadOnlyFinalZonk
+                    ; ty <- lift $ commitFlexi ro zonk_flexi tv kind
+                    -- See Note [Read-only final zonking during constraint solving].
+                    ; unless ro $
+                        lift $ liftZonkM $ writeMetaTyVarRef tv ref ty  -- Belt and braces
                     ; finish_meta ty }
 
              zonk_meta _ (Indirect ty)
@@ -437,16 +445,65 @@ lookupTyVarX tv
                       Nothing -> pprPanic "lookupTyVarOcc" (ppr tv $$ ppr tv_env)
        ; return res }
 
-commitFlexi :: ZonkFlexi -> TcTyVar -> Kind -> TcM Type
-commitFlexi NoFlexi tv zonked_kind
+{- Note [Read-only final zonking during constraint solving]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Typechecker plugins and intermediate source-table checks can call 'zonkTopDecls'
+on 'tcg_binds' before 'simplifyTop' finishes solving all nested implications in
+the module. At that point, sibling bindings in 'tcg_binds' can still contain
+live unfilled 'MetaTv' unification variables and 'HoleExprRef' references.
+
+Writing defaulted types ('UnusedType', 'Many', or 'LiftedRep') back into those
+'MetaTv' references would clobber active unification variables before the
+constraint solver reaches their implications. 'withReadOnlyFinalZonk' sets a
+scoped flag in 'tcg_th_state'. When that flag is active:
+1. 'zonkTyVarOcc' records the defaulted 'Type' in 'ze_meta_tv_env' without
+   calling 'writeMetaTyVarRef'. Every occurrence within the 'ZonkEnv' receives
+   the same 'Type', and live solver 'MetaTv' references remain 'Flexi'.
+2. 'commitFlexi' suppresses premature 'ZonkerCannotDefaultConcrete' diagnostics.
+3. 'zonkExpr' clones 'HoleExprRef' cells instead of mutating them in place.
+-}
+
+newtype ReadOnlyFinalZonk = ReadOnlyFinalZonk Bool
+
+isReadOnlyFinalZonk :: TcM Bool
+isReadOnlyFinalZonk = do
+  gbl <- getGblEnv
+  st_map <- readTcRef (tcg_th_state gbl)
+  let rep = typeRep (Proxy :: Proxy ReadOnlyFinalZonk)
+  pure $ case Map.lookup rep st_map >>= fromDynamic of
+    Just (ReadOnlyFinalZonk b) -> b
+    Nothing                    -> False
+
+-- | Run a final-zonking action without mutating live 'MetaTv' or 'HoleExprRef'
+-- cells or emitting concrete-defaulting errors.
+-- See Note [Read-only final zonking during constraint solving].
+withReadOnlyFinalZonk :: TcM a -> TcM a
+withReadOnlyFinalZonk thing_inside = do
+  gbl <- getGblEnv
+  let ref = tcg_th_state gbl
+      rep = typeRep (Proxy :: Proxy ReadOnlyFinalZonk)
+  st_map0 <- readTcRef ref
+  let prev :: ReadOnlyFinalZonk
+      prev = fromMaybe (ReadOnlyFinalZonk False)
+                       (Map.lookup rep st_map0 >>= fromDynamic)
+  writeTcRef ref (Map.insert rep (toDyn (ReadOnlyFinalZonk True)) st_map0)
+  res <- tryM thing_inside
+  st_map1 <- readTcRef ref
+  writeTcRef ref (Map.insert rep (toDyn prev) st_map1)
+  case res of
+    Right val -> pure val
+    Left ex   -> liftIO $ throwIO ex
+
+commitFlexi :: Bool -> ZonkFlexi -> TcTyVar -> Kind -> TcM Type
+commitFlexi _ NoFlexi tv zonked_kind
   = pprPanic "NoFlexi" (ppr tv <+> dcolon <+> ppr zonked_kind)
 
-commitFlexi (SkolemiseFlexi tvs_ref) tv zonked_kind
+commitFlexi _ (SkolemiseFlexi tvs_ref) tv zonked_kind
   = do { let skol_tv = mkTyVar (tyVarName tv) zonked_kind
        ; updTcRef tvs_ref (skol_tv :)
        ; return (mkTyVarTy skol_tv) }
 
-commitFlexi RuntimeUnkFlexi tv zonked_kind
+commitFlexi _ RuntimeUnkFlexi tv zonked_kind
   = do { traceTc "Defaulting flexi tyvar to RuntimeUnk:" (pprTyVar tv)
        ; return (mkTyVarTy (mkTcTyVar (tyVarName tv) zonked_kind RuntimeUnk)) }
             -- This is where RuntimeUnks are born:
@@ -454,7 +511,7 @@ commitFlexi RuntimeUnkFlexi tv zonked_kind
             -- turned into RuntimeUnks as they leave the
             -- typechecker's monad
 
-commitFlexi DefaultFlexi tv zonked_kind
+commitFlexi ro DefaultFlexi tv zonked_kind
   -- Normally, RuntimeRep variables are defaulted in GHC.Tc.Utils.TcMType.defaultTyVar
   -- But that sees only type variables that appear in, say, an inferred type.
   -- Defaulting here, in the zonker, is needed to catch e.g.
@@ -472,7 +529,8 @@ commitFlexi DefaultFlexi tv zonked_kind
   = do { traceTc "Defaulting flexi tyvar to Many:" (pprTyVar tv)
        ; return manyDataConTy }
   | Just (ConcreteFRR origin) <- isConcreteTyVar_maybe tv
-  = do { addErr $ TcRnZonkerMessage (ZonkerCannotDefaultConcrete origin)
+  = do { unless ro $
+           addErr $ TcRnZonkerMessage (ZonkerCannotDefaultConcrete origin)
        ; newUnusedType tv.varName zonked_kind }
   | otherwise
   = do { traceTc "Defaulting flexi tyvar to UnusedType:" (pprTyVar tv)
@@ -936,9 +994,15 @@ zonkExpr (HsHole (h, her))
   where
     zonk_her :: HoleExprRef -> ZonkTcM HoleExprRef
     zonk_her (HER ref ty u)
-      = do updTcRefM ref zonkEvTerm
+      = do ro <- lift isReadOnlyFinalZonk
+           -- See Note [Read-only final zonking during constraint solving].
+           ref' <- if ro
+                   then do { ev <- readTcRef ref
+                           ; ev' <- zonkEvTerm ev
+                           ; lift $ newTcRef ev' }
+                   else do { updTcRefM ref zonkEvTerm; return ref }
            ty'  <- zonkTcTypeToTypeX ty
-           return (HER ref ty' u)
+           return (HER ref' ty' u)
 
 zonkExpr (HsIPVar x _) = dataConCantHappen x
 

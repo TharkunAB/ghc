@@ -2858,8 +2858,11 @@ prepareBreakTick tick_id result fvs
       AppTy f x             -> calls f ++ calls x
       FunTy _ ma w a b      -> concatMap calls [ma, w, a, b]
       ForAllTy ma b body    -> concatMap calls [ma, varType (binderVar b), body]
-      DepFunTy _ v body     -> concatMap calls (body : local_types v)
-      CastTy t _            -> calls t
+      DepFunTy _ v body          -> concatMap calls (body : local_types v)
+      DepDictTy v body           -> concatMap calls (body : local_types v)
+      ExistsTy _ v body          -> concatMap calls [varType v, body]
+      ClassAppTy _ inst d a kind -> concatMap calls [inst, d, a, kind]
+      CastTy t _                 -> calls t
       _                     -> []
 
     -- Opaque call results have closed kinds. The remaining indices are

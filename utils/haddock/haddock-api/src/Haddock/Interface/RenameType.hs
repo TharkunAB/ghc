@@ -115,6 +115,8 @@ renameType (HsIParamTy x ip lt) = HsIParamTy x ip <$> renameLType lt
 renameType (HsKindSig x lt lk) = HsKindSig x <$> renameLType lt <*> pure lk
 renameType t@(HsSpliceTy _ _) = pure t
 renameType (HsDocTy x lt doc) = HsDocTy x <$> renameLType lt <*> pure doc
+renameType (XHsType (HsTypeExistsRn flag bndr body)) =
+  XHsType <$> (HsTypeExistsRn flag <$> renameLBinder bndr <*> renameLType body)
 renameType t@(XHsType _) = pure t
 renameType (HsExplicitListTy x ip ltys) =
   HsExplicitListTy x ip <$> renameLTypes ltys

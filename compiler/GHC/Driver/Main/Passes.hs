@@ -108,7 +108,7 @@ import qualified GHC.ByteCode.Serialize as ByteCode
 
 import GHC.Core
 import GHC.Core.Dependent ( hasExistentialExpr, hasNativeDependentExpr, rejectNativeDependentExpr
-                          , hasScopedDictionaryProgram, supportsScopedDictionaryCore
+                          , hasScopedDictionaryExpr, hasScopedDictionaryProgram, supportsScopedDictionaryCore
                           , supportsNativeGentle, supportsNativeRuleBinds, supportsLocalUserRule
                           , supportsNativeUserUnfolding )
 import GHC.Core.Lint ( endScopedDictionaryPassIO )
@@ -925,8 +925,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
           let no_late_plugins = not (hasActiveLatePlugins hsc_env)
               exported_names = availsToNameSet (tcg_exports tc_result)
               want_closures = gopt Opt_WriteSourceEquations dflags &&
-                              xopt LangExt.DependentTypes dflags &&
-                              no_late_plugins && null (tcg_rules tc_result)
+                              no_late_plugins
           checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
             no_late_plugins local_eval_terms mutated_names
             (mg_rules desugared_guts ++ mg_rules simplified_guts)
@@ -1011,8 +1010,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
                                 gopt Opt_WriteSourceEquations dflags &&
                                 null (tcg_rules tc_result) &&
                                 not (gopt Opt_Hpc dflags)
-            want_closures = want_source_iface &&
-                            xopt LangExt.DependentTypes dflags
+            want_closures = want_source_iface
         checked_tc <- case mb_desugar of
           Just guts
             | let no_rules = null (mg_rules guts)
@@ -1933,7 +1931,13 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
               finish = endScopedDictionaryPassIO (hsc_logger env)
                 . initEndPassConfig (hsc_dflags env) (interactiveInScope (hsc_IC env)) alwaysQualify
               module_loc = mg_loc ds_result
-          unless (null rules && all (all (null . idCoreRules) . bindersOf) binds) $
+          let flat_binds = flattenBinds binds
+              scoped_pair (b, rhs) = hasScopedDictionaryProgram [NonRec b rhs]
+              scoped_rule (Rule { ru_fn = fn, ru_args = args, ru_rhs = rhs }) =
+                any hasScopedDictionaryExpr (rhs : args)
+                || any (\p@(b, _) -> idName b == fn && scoped_pair p) flat_binds
+              scoped_rule (BuiltinRule {}) = False
+          when (any scoped_rule rules || any (\p@(b, _) -> scoped_pair p && not (null (idCoreRules b))) flat_binds) $
             throwGhcExceptionIO (Sorry "Private dependent dictionaries do not support Core rules.")
           finish CoreDesugar binds rules
           let simplified = simpleOptNativeProgram binds
@@ -1988,7 +1992,8 @@ hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
                 allowed <- checkImportedPackageRule lint_env (mg_module ds_result) simplified rule
                 unless allowed $
                   report module_loc (DriverUnsupportedRetainedRule (ru_name rule) level)
-              check_binds_supported supportsNativeRuleBinds level simplified
+              check_binds_supported supportsNativeRuleBinds level
+                (stripSupportedAutoRules simplified)
               optimized <- core2coreRetainedWithPluginMutations mb_mut_ref lint_env result
               endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
               when (hasActiveCorePlugins lint_env) $

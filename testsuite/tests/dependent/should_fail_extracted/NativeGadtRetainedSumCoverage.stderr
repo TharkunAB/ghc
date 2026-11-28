@@ -6,12 +6,35 @@ NativeGadtRetainedSumCoverage.hs:14:1: error: [GHC-62161] [-Wincomplete-patterns
 NativeGadtRetainedSumCoverage.hs:17:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
     Pattern match has inaccessible right hand side
     In an equation for ‘knownUnreachable’:
-        knownUnreachable (DirectVec (S __a22E) _) = ...
+        knownUnreachable (DirectVec (S __a22F) _) = ...
+
+NativeGadtRetainedSumCoverage.hs:17:35: error: [GHC-40564] [-Winaccessible-code (in -Wdefault), Werror=inaccessible-code]
+    • Inaccessible code in
+        a pattern with constructor:
+          DirectVec :: forall a.
+                       foreach (n1 :: Nat) -> Vec a n1 -> DirectVec a n1,
+        in an equation for ‘knownUnreachable’
+      Couldn't match type ‘S _’ with ‘Z’
+    • In the pattern: DirectVec (S _) _
+      In an equation for ‘knownUnreachable’:
+          knownUnreachable (DirectVec (S _) _) = False
 
 NativeGadtRetainedSumCoverage.hs:34:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
     Pattern match has inaccessible right hand side
     In an equation for ‘disjointSquareMatch’:
-        disjointSquareMatch (Square __a20T _) = ...
+        disjointSquareMatch (Square __a20U _) = ...
+
+NativeGadtRetainedSumCoverage.hs:34:31: error: [GHC-40564] [-Winaccessible-code (in -Wdefault), Werror=inaccessible-code]
+    • Inaccessible code in
+        a pattern with constructor:
+          Square :: forall a.
+                    foreach (side :: Nat)
+                    -> Vec (Vec a side) side -> SquareMatrix a side side,
+        in an equation for ‘disjointSquareMatch’
+      Couldn't match type ‘Z’ with ‘S Z’
+    • In the pattern: Square _ _
+      In an equation for ‘disjointSquareMatch’:
+          disjointSquareMatch (Square _ _) = ()
 
 NativeGadtRetainedSumCoverage.hs:43:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
     Pattern match(es) are non-exhaustive
@@ -39,8 +62,23 @@ NativeGadtRetainedSumCoverage.hs:61:1: error: [GHC-62161] [-Wincomplete-patterns
 NativeGadtRetainedSumCoverage.hs:64:1: error: [GHC-94210] [-Woverlapping-patterns (in -Wdefault), Werror=overlapping-patterns]
     Pattern match has inaccessible right hand side
     In an equation for ‘knownNestedInaccessible’:
-        knownNestedInaccessible (Blocked __a1XU __a1XV __a1XW (VCons _ _)
+        knownNestedInaccessible (Blocked __a1XV __a1XW __a1XX (VCons _ _)
                                          _) = ...
+
+NativeGadtRetainedSumCoverage.hs:64:52: error: [GHC-40564] [-Winaccessible-code (in -Wdefault), Werror=inaccessible-code]
+    • Inaccessible code in
+        a pattern with constructor:
+          Blocked :: forall a.
+                     foreach (mark :: Bool)
+                     -> foreach (depth :: Nat)
+                        -> foreach (width :: Nat)
+                           -> Vec a width
+                              -> Vec a depth -> Blocked a (Block width mark depth),
+        in an equation for ‘knownNestedInaccessible’
+      Couldn't match type ‘S n’ with ‘Z’
+    • In the pattern: Blocked _ _ _ (VCons _ _) _
+      In an equation for ‘knownNestedInaccessible’:
+          knownNestedInaccessible (Blocked _ _ _ (VCons _ _) _) = False
 
 NativeGadtRetainedSumCoverage.hs:68:1: error: [GHC-62161] [-Wincomplete-patterns (in -Wextra), Werror=incomplete-patterns]
     Pattern match(es) are non-exhaustive

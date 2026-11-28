@@ -8,9 +8,11 @@ module GHC.Tc.Gen.Totality
 import GHC.Prelude
 
 import GHC.Core.ConLike (ConLike (..))
-import GHC.Core.DataCon (DataCon, dataConOrigArgTys, dataConTyCon)
+import GHC.Core.DataCon (DataCon, dataConFullSig, dataConOrigArgTys, dataConTyCon, eqSpecPreds)
 import GHC.Core.Multiplicity (scaledThing)
 import GHC.Core.Predicate (isPredTy)
+import GHC.Core.TyCo.Compare (eqTypes)
+import GHC.Core.TyCo.FVs (tyCoVarsOfType, tyConsOfType)
 import GHC.Core.TyCo.Rep (FunTyFlag (..), Type (..))
 import GHC.Core.TyCon
   ( TyCon
@@ -20,8 +22,10 @@ import GHC.Core.TyCon
   , isFamilyTyCon
   , isNewTyCon
   , tyConDataCons
+  , tyConName
+  , tyConTyVars
   )
-import GHC.Core.Type (coreFullView, isUnliftedType)
+import GHC.Core.Type (coreFullView, isUnliftedType, mkTyVarTys)
 import GHC.Data.Bag (bagToList)
 import GHC.Data.Graph.Directed
   ( Node (..)
@@ -50,7 +54,7 @@ import GHC.Types.Error
   , getWarningMessages
   , mkLocMessage
   )
-import GHC.Types.Id (Id, idName, idType, isClassOpId_maybe, isDataConId_maybe)
+import GHC.Types.Id (Id, idMult, idName, idType, isClassOpId_maybe, isDataConId_maybe)
 import GHC.Types.Name
   ( Name
   , getOccName
@@ -61,24 +65,30 @@ import GHC.Types.Name
   )
 import GHC.Types.Name.Env (NameEnv, extendNameEnv, extendNameEnvList, lookupNameEnv, mkNameEnv)
 import GHC.Types.Name.Ppr (mkNamePprCtx)
-import GHC.Types.Name.Set (NameSet, elemNameSet, emptyNameSet, extendNameSet, mkNameSet)
+import GHC.Types.Name.Set (NameSet, elemNameSet, emptyNameSet, extendNameSet, mkNameSet, unitNameSet)
+import GHC.Types.Unique.Set (nonDetEltsUniqSet)
 import GHC.Types.SrcLoc
   ( GenLocated (..)
   , SrcSpan (..)
   , isGeneratedSrcSpan
   , unLoc
   )
-import GHC.Types.Var (varType)
+import GHC.Types.Var (binderType, binderVar, varType)
 import GHC.Types.Var.Set
   ( VarSet
+  , delVarSet
   , elemVarSet
   , emptyVarSet
   , extendVarSet
+  , intersectVarSet
+  , isEmptyVarSet
+  , mkVarSet
   , unionVarSet
   , unionVarSets
   )
 import GHC.Unit.Module (Module)
 import GHC.Utils.Logger (logFlags, putLogMsg)
+import GHC.Utils.Misc (equalLength)
 import GHC.Utils.Outputable
   ( Depth (AllTheWay)
   , Outputable (..)
@@ -999,30 +1009,71 @@ isClosedPositiveAlgTyCon tc =
   where
     strictlyPositiveCon :: DataCon -> Bool
     strictlyPositiveCon dc =
-      all (strictlyPositiveIn tc . scaledThing) (dataConOrigArgTys dc)
+      let (_, _, eq_spec, _, _, _) = dataConFullSig dc
+      in all (not . mentionsTyCon tc) (eqSpecPreds eq_spec)
+           && all (strictlyPositiveIn tc . scaledThing) (dataConOrigArgTys dc)
 
--- | Check that 'tc' never occurs to the left of an arrow or under a type variable.
+-- | Check that 'tc' never occurs to the left of an arrow, inside a binder kind,
+-- under a type family, or in a non-strictly-positive container argument.
 strictlyPositiveIn :: TyCon -> Type -> Bool
-strictlyPositiveIn target ty0 = case coreFullView ty0 of
-  FunTy _ _ _ a b       -> not (mentionsTyCon target a) && strictlyPositiveIn target b
-  DepFunTy _ bndr b     -> not (mentionsTyCon target (varType bndr)) && strictlyPositiveIn target b
-  ForAllTy _ _ b        -> strictlyPositiveIn target b
-  ExistsTy _ _ b        -> strictlyPositiveIn target b
-  DepDictTy _ b         -> strictlyPositiveIn target b
-  TyConApp _ args       -> all (strictlyPositiveIn target) args
-  AppTy f a             -> not (mentionsTyCon target f) && not (mentionsTyCon target a)
-  CastTy t _            -> strictlyPositiveIn target t
-  _                     -> True
+strictlyPositiveIn target = go (unitNameSet (tyConName target)) emptyVarSet
+  where
+    no_occ rec_tcs pos_tvs ty =
+      isEmptyVarSet (tyCoVarsOfType ty `intersectVarSet` pos_tvs)
+        && not (any ((`elemNameSet` rec_tcs) . tyConName) (nonDetEltsUniqSet (tyConsOfType ty)))
+
+    go rec_tcs pos_tvs ty0
+      | no_occ rec_tcs pos_tvs ty0 = True
+      | otherwise = case coreFullView ty0 of
+          TyVarTy _ -> True
+          FunTy _ _ _ a b -> no_occ rec_tcs pos_tvs a && go rec_tcs pos_tvs b
+          DepFunTy _ bndr b ->
+            no_occ rec_tcs pos_tvs (varType bndr)
+              && no_occ rec_tcs pos_tvs (idMult bndr)
+              && go rec_tcs pos_tvs b
+          ForAllTy _ bndr b ->
+            no_occ rec_tcs pos_tvs (binderType bndr)
+              && go rec_tcs (delVarSet pos_tvs (binderVar bndr)) b
+          ExistsTy _ tv b ->
+            no_occ rec_tcs pos_tvs (varType tv)
+              && go rec_tcs (delVarSet pos_tvs tv) b
+          DepDictTy d b ->
+            no_occ rec_tcs pos_tvs (varType d) && go rec_tcs pos_tvs b
+          CastTy t _ -> go rec_tcs pos_tvs t
+          TyConApp tc args
+            | isAlgTyCon tc
+            , not (isNewTyCon tc)
+            , not (isClassTyCon tc)
+            , not (isFamilyTyCon tc)
+            , not (isAbstractTyCon tc)
+            , let tc_tvs = tyConTyVars tc
+            , equalLength args tc_tvs
+            , all (\dc -> let (_, _, eq_spec, _, _, _) = dataConFullSig dc
+                          in all (no_occ rec_tcs pos_tvs) (eqSpecPreds eq_spec))
+                  (tyConDataCons tc)
+            -> if tyConName tc `elemNameSet` rec_tcs
+                 then all (no_occ rec_tcs pos_tvs) args || eqTypes args (mkTyVarTys tc_tvs)
+                 else all (go rec_tcs pos_tvs) args &&
+                      let active_tvs = mkVarSet [ tv | (tv, arg) <- zip tc_tvs args
+                                                     , not (no_occ rec_tcs pos_tvs arg) ]
+                          rec_tcs'   = extendNameSet rec_tcs (tyConName tc)
+                      in isEmptyVarSet active_tvs ||
+                         all (\dc -> all (go rec_tcs' active_tvs . scaledThing) (dataConOrigArgTys dc))
+                             (tyConDataCons tc)
+          _ -> False
 
 -- | Test whether 'target' appears anywhere in a type.
 mentionsTyCon :: TyCon -> Type -> Bool
 mentionsTyCon target ty0 = case coreFullView ty0 of
   TyConApp tc args  -> tc == target || any (mentionsTyCon target) args
   FunTy _ _ _ a b   -> mentionsTyCon target a || mentionsTyCon target b
-  DepFunTy _ bndr b -> mentionsTyCon target (varType bndr) || mentionsTyCon target b
-  ForAllTy _ _ b    -> mentionsTyCon target b
-  ExistsTy _ _ b    -> mentionsTyCon target b
-  DepDictTy _ b     -> mentionsTyCon target b
+  DepFunTy _ bndr b -> mentionsTyCon target (varType bndr) || mentionsTyCon target (idMult bndr) || mentionsTyCon target b
+  ForAllTy _ bndr b -> mentionsTyCon target (binderType bndr) || mentionsTyCon target b
+  ExistsTy _ tv b   -> mentionsTyCon target (varType tv) || mentionsTyCon target b
+  DepDictTy d b     -> mentionsTyCon target (varType d) || mentionsTyCon target b
+  ClassAppTy _ i d a k -> any (mentionsTyCon target) [i, d, a, k]
+  TermAppTy f a     -> mentionsTyCon target (varType f) || mentionsTyCon target a
+  TermVarTy v       -> mentionsTyCon target (varType v)
   AppTy f a         -> mentionsTyCon target f || mentionsTyCon target a
   CastTy t _        -> mentionsTyCon target t
   _                 -> False

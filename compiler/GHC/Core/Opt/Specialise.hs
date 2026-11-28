@@ -31,7 +31,7 @@ import GHC.Core.Unify     ( tcMatchTy )
 import GHC.Core.Rules
 import GHC.Core.Subst (substTickish)
 import GHC.Core.TyCon (tyConClass_maybe)
-import GHC.Core.TyCo.Rep (Type(DepFunTy, DepDictTy))
+import GHC.Core.TyCo.Rep (Type(DepFunTy, DepDictTy, ForAllTy, FunTy), ft_res)
 import GHC.Core.Utils     ( exprIsTrivial, exprIsTopLevelBindable
                           , applyTypeToArgs, isVacuousRetainedBinder
                           , mkCast, exprType, exprIsHNF
@@ -1657,7 +1657,7 @@ type SpecInfo = ( [CoreRule]       -- Specialisation rules
 specCalls spec_imp env existing_rules calls_for_me fn rhs
   | RetainedCore <- se_core_mode env
   , notNull calls_for_me
-  , hasScopedDictionaryProgram [NonRec fn rhs]
+  , hasScopedDictionaryProgram [NonRec fn rhs] || hasInvisibleDepFun (idType fn)
   = return ([], [], emptyUDs)
     -- See Note [Specialising functions with scoped class methods].
 
@@ -1803,8 +1803,10 @@ specCalls spec_imp env existing_rules calls_for_me fn rhs
                  -- arguments, not forgetting to wrap the dx_binds around the outside (#22358)
                  simpl_opts = initSimpleOpts dflags
                  wrap_unf_body body = foldr (Let . db_bind) (body `mkApps` spec_args) dx_binds
-                 spec_unf = specUnfolding simpl_opts rule_rhs_args1 wrap_unf_body
-                                          rule_lhs_args fn_unf
+                 spec_unf
+                   | RetainedCore <- se_core_mode env = noUnfolding
+                   | otherwise = specUnfolding simpl_opts rule_rhs_args1 wrap_unf_body
+                                               rule_lhs_args fn_unf
 
                  --------------------------------------
                  -- Adding arity information just propagates it a bit faster
@@ -1863,6 +1865,17 @@ alreadyCovered :: SpecEnv
                -> (ActivationGhc -> Bool) -- Which rules are active
                -> [CoreRule] -> Bool
 -- Note [Specialisations already covered] esp (SC2)
+
+hasInvisibleDepFun :: Type -> Bool
+hasInvisibleDepFun = go
+  where
+    go ty = case coreFullView ty of
+      DepFunTy DepFunInvisible _ _ -> True
+      DepFunTy _ _ b               -> go b
+      ForAllTy _ _ b               -> go b
+      FunTy { ft_res = b }         -> go b
+      DepDictTy _ b                -> go b
+      _                            -> False
 alreadyCovered env bndrs fn args is_active rules
   = case specLookupRule env fn args is_active rules of
       Nothing             -> False

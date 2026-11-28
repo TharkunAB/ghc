@@ -21,18 +21,18 @@ NativeRetainedPackageClientBad.hs:19:27: error: [GHC-25897]
         escapePair :: DPair a p -> p w
           (bound at NativeRetainedPackageClientBad.hs:19:1)
 
-NativeRetainedPackageClientBad.hs:23:41: error: [GHC-25897]
+NativeRetainedPackageClientBad.hs:23:53: error: [GHC-25897]
     • Couldn't match type ‘m’ with ‘n2’
-      Expected: Vec Int m
-        Actual: Vec Int n2
+      Expected: Box m
+        Actual: Box n2
       ‘m’ is a rigid type variable bound by
         the type signature for:
           escapeBox :: forall (m :: Nat). Retained Box -> Vec Int m
         at NativeRetainedPackageClientBad.hs:22:1-38
-    • In the expression: boxContents box
+    • In the first argument of ‘boxContents’, namely ‘box’
+      In the expression: boxContents box
       In the second argument of ‘withRetained’, namely
         ‘(\ _ box -> boxContents box)’
-      In the expression: withRetained p (\ _ box -> boxContents box)
     • Relevant bindings include
         box :: Box n2 (bound at NativeRetainedPackageClientBad.hs:23:34)
         escapeBox :: Retained Box -> Vec Int m

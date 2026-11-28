@@ -1656,6 +1656,7 @@ match_alts _ subst [] [] _
   = return subst
 match_alts renv subst (Alt c1 vs1 r1:alts1) (Alt c2 vs2 r2:alts2) mco
   | c1 == c2
+  , equalLength vs1 vs2
   = do  { subst1 <- match renv' subst r1 r2 mco
         ; match_alts renv subst1 alts1 alts2 mco }
   where

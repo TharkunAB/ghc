@@ -6,7 +6,7 @@ import Dependent.ObsEq (obsEq)
 import ObsProvider (Nat(..))
 
 loop :: Nat -> Nat
-loop n = loop n
+loop n = n `seq` loop n
 
 badLoop :: foreach (n :: Nat) -> loop n :~: Zero
 badLoop n = obsEq

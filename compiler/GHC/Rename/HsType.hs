@@ -1755,7 +1755,13 @@ rnHsAppTy env (eligible, has_sym) fun arg = do
     isClosedConOperand :: (IdOccP (GhcPass p) -> Bool) -> LHsType (GhcPass p) -> Bool
     isClosedConOperand constructor ty = case unLoc (ignoreParens ty) of
       HsKindSig _ operand _ -> isClosedConOperand constructor operand
-      HsExplicitTupleTy _ _ [x, y] -> all (isClosedConOperand constructor) [x, y]
+      HsExplicitTupleTy _ _ elems -> length elems /= 1 && all (isClosedConOperand constructor) elems
+      HsTupleTy _ _ elems -> length elems /= 1 && all (isClosedConOperand constructor) elems
+      HsExplicitListTy _ _ elems -> all (isClosedConOperand constructor) elems
+      HsOpTy _ lhs op rhs
+        | HsTyVar _ _ (L _ name) <- unLoc (ignoreParens op) ->
+            constructor name && all (isClosedConOperand constructor) [lhs, rhs]
+        | otherwise -> False
       _ -> case app_spine ty [] of
         (HsTyVar _ _ (L _ name), fields) ->
           constructor name && all (isClosedConOperand constructor) fields

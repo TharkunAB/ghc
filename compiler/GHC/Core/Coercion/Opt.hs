@@ -16,7 +16,7 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs( mkUnivCoDeps, mapUnivCoDeps, unionUnivCoDeps, addUnivCoTypeDeps
                         , addUnivCoDep, univCoDepsDeepCoVars )
 import GHC.Core.TyCo.Subst
-import GHC.Core.TyCo.Compare( eqTypeIgnoringMultiplicity )
+import GHC.Core.TyCo.Compare( eqType, eqTypeIgnoringMultiplicity )
 import GHC.Core.Coercion
 import GHC.Core.Type as Type hiding( substTyVarBndr, substTy )
 import GHC.Core.TyCon
@@ -379,13 +379,17 @@ opt_co4' opts env sym rep r (AppCo co1 co2)
   = mkAppCo (opt_co4 opts env sym rep r co1)
             (opt_co4 opts env sym False Nominal co2)
 
-opt_co4' opts env@(LC subst _ _) sym _rep r (TermAppCo f co)
+opt_co4' opts env sym rep r (TermAppCo f co)
   -- The child proof is nominal even when the result is used representationally.
   -- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
-  = case substTy subst (TermAppTy f (coercionLKind co)) of
-      TermAppTy f' _ -> downgradeRole r Nominal $
-        mkTermAppCo f' (opt_co4 opts env sym False Nominal co)
-      ty -> pprPanic "opt_co4: native function substitution" (ppr ty)
+  = assert (r == Nominal) $
+    case ( substTy (lcSubstLeft  env) (TermAppTy f (coercionLKind co))
+         , substTy (lcSubstRight env) (TermAppTy f (coercionRKind co)) ) of
+      (TermAppTy fL _, TermAppTy fR _)
+        | fL == fR, varType fL `eqType` varType fR
+        -> wrapRole rep Nominal $
+             mkTermAppCo fL (opt_co4 opts env sym False Nominal co)
+      other -> pprPanic "opt_co4: native function substitution" (ppr other)
 
 opt_co4' opts env sym rep r (DepFunCo visL visR b domain co)
   -- The common body relates the two lifted versions of A. The complete
@@ -574,6 +578,7 @@ opt_co4' opts env sym rep r (InstCo fun_co arg_co)
         tv_co = mk_coherence_right_co Nominal s2' (mkSymCo k_co') arg_co'
                    -- mkSymCo kind_co :: k2 ~ k1
                    -- tv_co   :: (s1 :: k1) ~ (((s2 :: k2) |> (sym kind_co)) :: k1)
+  , canPushInstIntoDepMult tv tv_co body_co
   = opt_co4 opts (extendLiftingContext env tv tv_co) sym rep r body_co
 
     -- See Note [Forall over coercion]
@@ -590,6 +595,7 @@ opt_co4' opts env sym rep r (InstCo fun_co arg_co)
   , let s2'   = coercionRKind arg_co'
         tv_co = mk_coherence_right_co Nominal s2' (mkSymCo k_co') arg_co'
         env'  = extendLiftingContext (zapLiftingContext env) tv' tv_co
+  , canPushInstIntoDepMult tv' tv_co body_co'
   = opt_co4 opts env' sym False r' body_co'
 
     -- See Note [Forall over coercion]
@@ -632,6 +638,35 @@ opt_co4' opts env sym _rep r (KindCo co)
 opt_co4' opts env sym _ r (SubCo co)
   = assert (r == Representational) $
     opt_co4 opts env sym True Nominal co
+
+-- | DepFunCo carries one shared binder multiplicity on both endpoints, so do
+-- not push a non-reflexive type instantiation into a coercion that mentions
+-- the quantified variable inside a DepFunCo binder multiplicity.
+canPushInstIntoDepMult :: TyVar -> Coercion -> Coercion -> Bool
+canPushInstIntoDepMult tv tv_co body_co
+  | coercionLKind tv_co `eqType` coercionRKind tv_co = True
+  | otherwise = go body_co
+  where
+    go (DepFunCo _ _ b dom body) =
+      not (tv `elemVarSet` tyCoVarsOfType (idMult b)) && go_m dom && go body
+    go (ForAllCo { fco_tcv = v, fco_ma = ma, fco_kind = k, fco_body = body }) =
+      go ma && go_m k && (v == tv || go body)
+    go (FunCo _ _ _ ma w a b) = go ma && go w && go a && go b
+    go (TyConAppCo _ _ cs) = all go cs
+    go (AppCo a b) = go a && go b
+    go (TermAppCo _ c) = go c
+    go (AxiomCo _ cs) = all go cs
+    go (SymCo c) = go c
+    go (TransCo a b) = go a && go b
+    go (SelCo _ c) = go c
+    go (LRCo _ c) = go c
+    go (InstCo a b) = go a && go b
+    go (KindCo c) = go c
+    go (SubCo c) = go c
+    go (GRefl _ _ m) = go_m m
+    go _ = True
+    go_m MRefl = True
+    go_m (MCo c) = go c
 
 {- Note [Optimise CoVarCo to Refl]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -1,8 +1,8 @@
 NativeOpenIndexedAppendSigFail.hs:11:14: error: [GHC-83865]
     • Couldn't match type: P.plus cut m0
                      with: P.plus cut m
-      Expected: EmptyLaw a (P.Add cut m) xs
-        Actual: EmptyLaw a (P.Add cut m0) xs
+      Expected: P.Vec a (P.Add cut m)
+        Actual: P.Vec a (P.Add cut m0)
       Note: GHC cannot determine the arguments of the function ‘P.plus’ from its result.
       The type variable ‘m0’ is ambiguous
     • In the ambiguity check for ‘ambiguous’
@@ -11,8 +11,6 @@ NativeOpenIndexedAppendSigFail.hs:11:14: error: [GHC-83865]
         ambiguous :: forall m a. foreach (cut :: P.Nat) ->
                                  foreach (xs :: P.Vec a (P.Add cut m)) ->
                                  EmptyLaw a (P.Add cut m) xs
-    • Relevant bindings include
-        xs_a4oJ :: P.Vec a (P.Add cut m) (bound at <no location info>)
 
 NativeOpenIndexedAppendSigFail.hs:16:28: error: [GHC-83865]
     • Couldn't match kind ‘P.Z’ with ‘P.S P.Z’

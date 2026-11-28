@@ -1,9 +1,6 @@
-NativeGadtImplicitSourcePartialFail.hs:10:19: error: [GHC-68947]
-    • No checked equations are available for ‘worker’ in a type.
-      Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields.
-      Build the result from constructors, bound variables, or fully applied functions with checked equations.
-      In a recursive call, pass a field of the matched argument directly.
-      Bind any other arguments with variables and pass them unchanged in recursive calls.
+NativeGadtImplicitSourcePartialFail.hs:10:19: error: [GHC-70566]
+    • Cannot reduce the open call to ‘worker’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
     • In the second argument of ‘Edge’, namely ‘(worker a)’
       In the type ‘Edge a (worker a)’
       In the definition of data constructor ‘Step’

@@ -30,10 +30,11 @@ NativeRetainedNaturalRejects.hs:22:41: error: [GHC-83605]
     • GHC cannot use this expression as a retained index.
       Build the index from local variables, supported constructors, and fully applied functions with checked equations.
       An immediate application of a supported lambda is also allowed.
-    • In the expression: remember (C# raw)
-      In the first argument of ‘rememberedChar’, namely
+    • In the first argument of ‘rememberedChar’, namely
         ‘(remember (C# raw))’
       In the expression: rememberedChar (remember (C# raw))
+      In an equation for ‘rawChar’:
+          rawChar raw = rememberedChar (remember (C# raw))
 
 NativeRetainedNaturalRejects.hs:25:13: error: [GHC-83865]
     • Couldn't match type ‘'\NUL'’ with ‘'\128578'’

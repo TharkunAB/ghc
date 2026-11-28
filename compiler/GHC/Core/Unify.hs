@@ -4,13 +4,13 @@
 
 module GHC.Core.Unify (
         tcMatchTy, tcMatchTyKi,
-        tcMatchTys, tcMatchInstanceTys, tcMatchTyKis, tcMatchTysWithRepeated,
+        tcMatchTys, tcMatchInstanceTys, tcMatchInstanceTyKisX, tcMatchTyKis, tcMatchTysWithRepeated,
         tcMatchTyX, tcMatchTysX, tcMatchTyKisX,
         tcMatchTyX_BM, tcMatchRetainedTyX_BM, ruleMatchTyKiX,
 
         -- Side-effect free unification
         AmIUnifying(..),
-        tcUnifyTy, tcUnifyTys, tcUnifyFunDeps, tcUnifyDebugger,
+        tcUnifyTy, tcUnifyTys, tcUnifyFunDeps, tcUnifyFunDepsLHS, tcUnifyDebugger,
         tcUnifyTysFG, tcUnifyTysForInjectivity,
         BindTvFun, BindFamFun, BindFlag(..),
         matchBindTv, alwaysBindTv, alwaysBindFam, dontCareBindFam,
@@ -32,7 +32,7 @@ import GHC.Core.TyCon
 import GHC.Core.Predicate( CanEqLHS(..), canEqLHS_maybe )
 import GHC.Core.TyCon.Env
 import GHC.Core.TyCo.Rep
-import GHC.Core.TyCo.Compare ( eqType, eqTypes, eqTypeX, tcEqType, tcEqTyConAppArgs )
+import GHC.Core.TyCo.Compare ( eqType, eqTypeX, tcEqType, tcEqTyConAppArgs )
 import GHC.Core.TyCo.FVs ( tyCoVarsOfTypeList )
 import GHC.Core.TyCo.Subst   ( mkTvSubst, deepSubstTy )
 import GHC.Core.Map.Type
@@ -657,6 +657,12 @@ tcMatchInstanceTys templates targets
   where
     in_scope = mkInScopeSet (tyCoVarsOfTypes templates `unionVarSet` tyCoVarsOfTypes targets)
 
+-- | Like 'tcMatchTyKisX', but also matches opaque existential packages whose
+-- free template variables are determined by other arguments.
+tcMatchInstanceTyKisX :: HasDebugCallStack => Subst -> [Type] -> [Type] -> Maybe Subst
+tcMatchInstanceTyKisX subst templates targets
+  = fst <$> tc_match_tys_x_with MatchInstance alwaysBindTv CheckOuterKinds subst templates targets
+
 -- | Match a closed-family pattern with an additional check for repeated
 -- template variables. The result records whether that check was used.
 -- In that case, the caller must prove the equality between the instantiated
@@ -734,18 +740,28 @@ tc_match_tys_x_with mode bind_tv match_kis (Subst in_scope id_env tv_env cv_env)
                       False     -- Not an injectivity check
                       match_kis
                       RespectMultiplicities
-                      (mkRnEnv2 in_scope) tv_env cv_env tys1 tys2 of
+                      rn_env tv_env cv_env tys1 tys2 of
       Unifiable result -> Just (final_subst result, um_extra_match result)
       MaybeApart MARExistential result
-        | MatchInstance <- mode
+        | allow_opaque_exists
         , let subst = final_subst result
         , all (all (determined result) . tyCoVarsOfTypeList) tys1
-        , eqTypes (substTys subst tys1) tys2
+        , all2 (eqTypeX rn_env) (substTys subst tys1) tys2
         -> Just (subst, False)
       _ -> Nothing
   where
+    rn_env = mkRnEnv2 in_scope
+    allow_opaque_exists = case mode of
+      MatchInstance -> True
+      MatchRetained -> True
+      _             -> False
     final_subst result = Subst in_scope id_env (um_tv_env result) (um_cv_env result)
-    determined result v = isTyVar v && v `elemVarEnv` um_tv_env result
+    determined result v
+      | not (isTyVar v)                         = True
+      | DontBindMe <- bind_tv v' (mkTyVarTy v') = True
+      | otherwise                               = v' `elemVarEnv` um_tv_env result
+      where
+        v' = rnOccL rn_env v
 
 -- | This one is called from the expression matcher,
 -- which already has a MatchEnv in hand
@@ -758,7 +774,7 @@ ruleMatchTyKiX
   -> Maybe TvSubstEnv
 ruleMatchTyKiX tmpl_tvs rn_env tenv tmpl target
 -- See Note [Kind coercions in Unify]
-  = case tc_unify_tys MatchRule neverBindFam (matchBindTv tmpl_tvs)
+  = case tc_unify_tys MatchRule neverBindFam bind_fn
       -- neverBindFam: a type family probably shouldn't appear
       -- on the LHS of a RULE, although we don't currently prevent it.
       -- But even if it did, (ATF8) in Note [Apartness and type families]
@@ -771,7 +787,24 @@ ruleMatchTyKiX tmpl_tvs rn_env tenv tmpl target
                         -- See Note [Rewrite rules ignore multiplicities in FunTy]
                       rn_env tenv emptyCvSubstEnv [tmpl] [target] of
       Unifiable result -> Just (um_tv_env result)
+      MaybeApart MARExistential result
+        | let vars  = tyCoVarsOfTypeList tmpl
+              args  = [rhs | v <- vars, Just rhs <- [lookupVarEnv (um_tv_env result) (rnOccL rn_env v)]]
+              in_sc = extendInScopeSetSet (rnInScopeSet rn_env) (tyCoVarsOfTypes (tmpl : target : args))
+              subst = mkTvSubst in_sc (um_tv_env result)
+        , all (determined result) vars
+        , not (anyInRnEnvR rn_env (tyCoVarsOfTypes (target : args)))
+        , eqTypeX rn_env (substTy subst tmpl) target
+        -> Just (um_tv_env result)
       _                    -> Nothing
+  where
+    bind_fn = matchBindTv tmpl_tvs
+    determined result v
+      | not (isTyVar v)                         = True
+      | DontBindMe <- bind_fn v' (mkTyVarTy v') = True
+      | otherwise                               = v' `elemVarEnv` um_tv_env result
+      where
+        v' = rnOccL rn_env v
 
 {-
 ************************************************************************
@@ -857,11 +890,28 @@ tcUnifyFunDeps :: TyCoVarSet
 tcUnifyFunDeps qtvs tys1 tys2
   = case tc_unify_tys_fg
              CheckOuterKinds    -- Unify kinds
-             dontCareBindFam    -- Class-instance heads never mention type families
+             alwaysBindFam
              (matchBindTv qtvs)
              tys1 tys2 of
       Unifiable subst -> Just subst
       _               -> Nothing
+
+-- | Pre-unify functional-dependency LHS patterns when checking instance
+-- consistency: treat non-infinite 'MaybeApart' results (such as existential
+-- packages or unsaturated type families) as potentially overlapping.
+tcUnifyFunDepsLHS :: TyCoVarSet
+                  -> [Type] -> [Type]
+                  -> Maybe Subst
+tcUnifyFunDepsLHS qtvs tys1 tys2
+  = case tc_unify_tys_fg
+             CheckOuterKinds
+             alwaysBindFam
+             (matchBindTv qtvs)
+             tys1 tys2 of
+      Unifiable subst          -> Just subst
+      MaybeApart MARInfinite _ -> Nothing
+      MaybeApart _ subst       -> Just subst
+      SurelyApart              -> Nothing
 
 -- | Unify or match a type-family RHS with a type (possibly another type-family RHS)
 -- Precondition: kinds are the same
@@ -1871,25 +1921,61 @@ unify_ty env (CoercionTy co1) (CoercionTy co2) kco
 -- See Note [Matching retained function types].
 unify_ty env (DepFunTy vis1 b1 body1) (DepFunTy vis2 b2 body2) kco
   | vis1 == vis2
-  , Matching <- um_unif env
-  , MatchRetained <- um_match_mode env
+  , allow_dep_decomp
   , isNativeRetainedBinder b1, isNativeRetainedBinder b2
-  , tcEqType (varType b1) (varType b2)
+  , typeKind (varType b1) `eqType` typeKind (varType b2)
   , typeKind body1 `eqType` liftedTypeKind
   , typeKind body2 `eqType` liftedTypeKind
   , isReflCo kco
-  = unify_ty (umRnBndr2 env b1 b2) body1 body2 kco
-unify_ty _ ty1@(DepFunTy {}) ty2@(DepFunTy {}) _
+  = do { case um_arr_mult env of
+           RespectMultiplicities ->
+             unify_ty env (idMult b1) (idMult b2) (mkNomReflCo (typeKind (idMult b1)))
+           IgnoreMultiplicities ->
+             return ()
+       ; unify_ty env (varType b1) (varType b2) (mkNomReflCo (typeKind (varType b1)))
+       ; unify_ty (umRnBndr2 env b1 b2) body1 body2 kco }
+  where
+    allow_dep_decomp
+      | Matching <- um_unif env, MatchRetained <- um_match_mode env = True
+      | um_inj_tf env = True
+      | otherwise = False
+unify_ty env ty1@(DepFunTy {}) ty2@(DepFunTy {}) _
   | not (anyFreeVarsOfTypes isTyCoVar [ty1, ty2])
-  , tcEqType ty1 ty2
+  , eqTypeX (um_rn_env env) ty1 ty2
   = return ()
-unify_ty _ (DepFunTy {}) _ _ = maybeApart MARRetainedFunction
-unify_ty _ _ (DepFunTy {}) _ = maybeApart MARRetainedFunction
+unify_ty _ (DepFunTy vis1 _ _) other _ = apartFromDepFun vis1 other
+unify_ty _ other (DepFunTy vis2 _ _) _ = apartFromDepFun vis2 other
+
+unify_ty env (DepDictTy d1 body1) (DepDictTy d2 body2) kco
+  | Matching <- um_unif env
+  , MatchRetained <- um_match_mode env
+  , typeKind (varType d1) `eqType` typeKind (varType d2)
+  , isReflCo kco
+  = do { unify_ty env (varType d1) (varType d2) (mkNomReflCo (typeKind (varType d1)))
+       ; unify_ty (umRnBndr2 env d1 d2) body1 body2 kco }
+unify_ty env ty1@(DepDictTy {}) ty2@(DepDictTy {}) _
+  | not (anyFreeVarsOfTypes isTyCoVar [ty1, ty2])
+  , eqTypeX (um_rn_env env) ty1 ty2
+  = return ()
+unify_ty _ DepDictTy{} _ _ = maybeApart MARRetainedFunction
+unify_ty _ _ DepDictTy{} _ = maybeApart MARRetainedFunction
+
+unify_ty env ty1@(ClassAppTy sel1 i1 d1 a1 k1) ty2@(ClassAppTy sel2 i2 d2 a2 k2) _
+  | not (anyFreeVarsOfTypes isTyCoVar [ty1, ty2])
+  , sel1 == sel2
+  , eqTypeX (um_rn_env env) i1 i2
+  , eqTypeX (um_rn_env env) d1 d2
+  , eqTypeX (um_rn_env env) a1 a2
+  , eqTypeX (um_rn_env env) k1 k2
+  = return ()
+unify_ty _ ClassAppTy{} _ _ = maybeApart MARRuntimeIndex
+unify_ty _ _ ClassAppTy{} _ = maybeApart MARRuntimeIndex
 
 -- Opaque calls have forward congruence, not inverse decomposition.
 -- See Note [Apartness of retained runtime indices].
 unify_ty env (TermAppTy f1 a1) (TermAppTy f2 a2) _
-  | rnOccL (um_rn_env env) f1 == rnOccR (um_rn_env env) f2
+  | not (anyFreeVarsOfTypes isTyCoVar [a1, a2])
+  , rnOccL (um_rn_env env) f1 == rnOccR (um_rn_env env) f2
   , eqTypeX (um_rn_env env) a1 a2
   = return ()
 unify_ty _ (TermAppTy {}) _ _ = maybeApart MARRuntimeIndex
@@ -1983,23 +2069,49 @@ unify_ty env ty1 ty2 kco
 unify_ty env ty1@(ExistsTy flag1 tv1 body1) ty2@(ExistsTy flag2 tv2 body2) _
   | closed, eqTypeX (um_rn_env env) ty1 ty2
   = return ()
-  | closed, flag1 == flag2
+  | not (anyFreeVarsOfTypes (const True) [ty1, ty2]), flag1 == flag2
   , typesCantMatch [(varType tv1, varType tv2), (body1, body2)]
   = surelyApart
   | MatchRule <- um_match_mode env
-  , let vars = tyCoVarsOfTypeList ty1
-  , all isTyVar vars
   = do { tenv <- getTvSubstEnv
-       ; case traverse (lookupVarEnv tenv . umRnOccL env) vars of
-           Just args
-             | not (anyInRnEnvR (um_rn_env env) (tyCoVarsOfTypes (ty2 : args)))
-             , eqType (substTyWith vars args ty1) ty2 -> return ()
-           _ -> maybeApart MARExistential }
+       ; let rn_env = um_rn_env env
+             vars   = tyCoVarsOfTypeList ty1
+             args   = [rhs | v <- vars, Just rhs <- [lookupVarEnv tenv (umRnOccL env v)]]
+             in_sc  = extendInScopeSetSet (rnInScopeSet rn_env) (tyCoVarsOfTypes (ty1 : ty2 : args))
+             subst  = mkTvSubst in_sc tenv
+             determined v
+               | not (isTyVar v) = True
+               | DontBindMe <- um_bind_tv_fun env v' (mkTyVarTy v') = True
+               | otherwise = v' `elemVarEnv` tenv
+               where
+                 v' = umRnOccL env v
+       ; if all determined vars
+            && not (anyInRnEnvR rn_env (tyCoVarsOfTypes (ty2 : args)))
+            && eqTypeX rn_env (substTy subst ty1) ty2
+         then return ()
+         else maybeApart MARExistential }
   where
     closed = not (anyFreeVarsOfTypes isTyCoVar [ty1, ty2])
 unify_ty _ ExistsTy{} other _ = apartFromPackage other
 unify_ty _ other ExistsTy{} _ = apartFromPackage other
 unify_ty _ _ _ _ = surelyApart
+
+-- | A generative nominal head (other than FUN for visible foreach, which can
+-- vacuously collapse to an ordinary arrow under substitution) cannot equal a
+-- retained dependent function type.
+apartFromDepFun :: DepFunTyFlag -> Type -> UM ()
+apartFromDepFun vis ty
+  | Just ty' <- coreView ty = apartFromDepFun vis ty'
+  | DepFunTy vis2 _ _ <- ty, vis /= vis2 = surelyApart
+  | LitTy {} <- ty = surelyApart
+  | ForAllTy {} <- ty = surelyApart
+  | ExistsTy {} <- ty = surelyApart
+  | CoercionTy {} <- ty = surelyApart
+  | Just (tc, _) <- splitTyConApp_maybe ty
+  , isGenerativeTyCon tc Nominal
+  , not (vis == DepFunVisible && tc == fUNTyCon)
+  = surelyApart
+  | otherwise = maybeApart MARRetainedFunction
 
 -- | A generative nominal head cannot reduce to an existential binder.
 -- See Note [Opaque existential matching].
@@ -2718,6 +2830,8 @@ ty_co_match :: MatchEnv   -- ^ ambient helpful info
 ty_co_match _ _ (TermAppTy {}) _ _ _ = Nothing
 ty_co_match _ _ (TermVarTy {}) _ _ _ = Nothing
 ty_co_match _ _ (DepFunTy {}) _ _ _ = Nothing
+ty_co_match _ _ (DepDictTy {}) _ _ _ = Nothing
+ty_co_match _ _ (ClassAppTy {}) _ _ _ = Nothing
 ty_co_match _ _ (ExistsTy {}) _ _ _ = Nothing
 ty_co_match menv subst ty co lkco rkco
   | Just ty' <- coreView ty = ty_co_match menv subst ty' co lkco rkco

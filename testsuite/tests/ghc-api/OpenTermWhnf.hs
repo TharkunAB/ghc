@@ -209,14 +209,18 @@ callbackReadbackControls = do
       xType = tyvar xUnique "x" boolTy
       call = App (Var f) (Var x)
       observe head_ty expr = runIdentity $
-        openReadbackM False 32 (\_ _ -> pure Nothing) (\_ -> pure ())
+        openReadbackM False False 32 (\_ _ -> pure Nothing) (\_ -> pure ())
           (\v -> lookup v [(f, head_ty), (x, xType)]) (\_ -> pure True) boolTy expr
   expect "read an erased callback at its source argument"
     (case observe fType call of
        Right (ty, []) -> ty `eqType` mkAppTy fType xType
        _ -> False)
-  expect "keep a runtime callback opaque in a lazy field"
+  expect "read a retained callback at its source argument"
     (case observe (TermVarTy f) call of
+       Right (ty, []) -> ty `eqType` mkAppTy (TermVarTy f) xType
+       _ -> False)
+  expect "keep a non-variable callback origin opaque"
+    (case observe arrow call of
        Left ReadbackOpaque{} -> True
        _ -> False)
   expect "reject a type argument in a value application"

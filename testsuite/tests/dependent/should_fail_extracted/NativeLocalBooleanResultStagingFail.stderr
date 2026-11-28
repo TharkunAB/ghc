@@ -1,20 +1,14 @@
-NativeLocalBooleanResultStagingFail.hs:28:33: error: [GHC-68947]
-    • No checked equations are available for ‘subPartial’ in a type.
-      Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields.
-      Build the result from constructors, bound variables, or fully applied functions with checked equations.
-      In a recursive call, pass a field of the matched argument directly.
-      Bind any other arguments with variables and pass them unchanged in recursive calls.
+NativeLocalBooleanResultStagingFail.hs:28:33: error: [GHC-70566]
+    • Cannot reduce the open call to ‘subPartial’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
     • In the fourth argument of ‘StepPartial’, namely
         ‘(subPartial t x v)’
       In the type ‘StepPartial x t v (subPartial t x v)’
       In the definition of data constructor ‘ReduceP’
 
-NativeLocalBooleanResultStagingFail.hs:31:30: error: [GHC-68947]
-    • No checked equations are available for ‘subLoop’ in a type.
-      Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields.
-      Build the result from constructors, bound variables, or fully applied functions with checked equations.
-      In a recursive call, pass a field of the matched argument directly.
-      Bind any other arguments with variables and pass them unchanged in recursive calls.
+NativeLocalBooleanResultStagingFail.hs:31:30: error: [GHC-70566]
+    • Cannot reduce the open call to ‘subLoop’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
     • In the fourth argument of ‘StepLoop’, namely ‘(subLoop t x v)’
       In the type ‘StepLoop x t v (subLoop t x v)’
       In the definition of data constructor ‘ReduceL’

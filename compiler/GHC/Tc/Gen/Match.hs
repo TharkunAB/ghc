@@ -88,6 +88,7 @@ import GHC.Core.Coercion ( CoercionR, MCoercion(MRefl, MCo), mkCoVarCo, mkCoCast
                          , mkFunCo, mkFunResCo, mkHomoForAllCos
                          , mkTransCo, mkNomReflCo, mkRepReflCo, mkDepFunCoWithVis )
 import GHC.Core.DataCon ( DataCon, dataConCannotMatch, dataConName, dataConSourceArity, dataConTyCon, dataConUnivTyVars, dataConWorkId )
+import GHC.Types.Var ( setVarName )
 import GHC.Core.ConLike ( ConLike(RealDataCon) )
 import GHC.Core.Predicate ( getEqPredTys_maybe, mkNomEqPred )
 import GHC.Core.Reduction ( Reduction(..) )
@@ -1546,11 +1547,13 @@ tcRetainedVarGroupMatches herald ctxt mctxt arity invis_pat_tys ty
     case lookup c dep_cols of
       Nothing -> pure (Nothing, nlWildPatName)
       Just binder -> do
-        let occ = fromMaybe (getOccName binder) $
-                    listToMaybe [ nameOccName nm
-                                | p <- fromMaybe [] (listToMaybe (drop c col_pats))
-                                , L _ (VarPat _ (L _ nm)) <- [stripParPat p] ]
-        nm <- newSysName occ
+        let mb_usr = listToMaybe
+                       [ (locA vloc, nameOccName nm)
+                       | p <- fromMaybe [] (listToMaybe (drop c col_pats))
+                       , L _ (VarPat _ (L vloc nm)) <- [stripParPat p] ]
+        nm <- case mb_usr of
+                Just (vspan, occ) -> newNameAt occ vspan
+                Nothing           -> newSysName (getOccName binder)
         pure (Just nm, nlVarPat nm)
   let shared_names  = map fst shared_spec
       template_pats = map snd shared_spec
@@ -2183,9 +2186,14 @@ checkRetainedRows (mb_motive_alias, capture_aliases) allow_linear allow_empty is
                      Just (src_nms, mid) -> do
                        actual_mid <- lookup_lcl (idName mid) mid
                        pure [(nm, actual_mid) | nm <- nub (idName mid : src_nms)]
-                   let all_prs  = motive_prs ++ cap_prs
-                       with_ids = if null all_prs then id else tcExtendIdEnv2 all_prs
-                   foldr bind_view (with_ids act) row
+                   var_bndrs <- forM names $ \(orig_nm, sh_nm) -> do
+                     bndr <- tcLookupId sh_nm
+                     let restored_nm = mkInternalName (nameUnique (idName bndr)) (nameOccName orig_nm) (nameSrcSpan orig_nm)
+                     pure (setVarName bndr restored_nm)
+                   let all_prs   = motive_prs ++ cap_prs
+                       with_ids  = if null all_prs then id else tcExtendIdEnv2 all_prs
+                       with_vars = if null var_bndrs then id else tcExtendIdEnv var_bndrs
+                   foldr bind_view (with_vars (with_ids act)) row
                  check = do
                    clause <- if source_count == 1
                      then prepareUnguardedWhere (mkCheckExpType (pSnd (coercionKind result_co)))

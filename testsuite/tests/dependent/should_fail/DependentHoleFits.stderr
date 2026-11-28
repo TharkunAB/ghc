@@ -41,6 +41,8 @@ DependentHoleFits.hs:38:26: error: [GHC-88464]
         _ :: Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p))
     • In an equation for ‘plusAssoc’: plusAssoc (Succ m) n p = _
     • Relevant bindings include
+        n :: Nat (bound at DependentHoleFits.hs:38:20)
+        p :: Nat (bound at DependentHoleFits.hs:38:22)
         m :: Nat (bound at DependentHoleFits.hs:38:17)
         plusAssoc :: foreach (m :: Nat)
                      -> foreach (n :: Nat)
@@ -81,9 +83,11 @@ DependentHoleFits.hs:38:26: error: [GHC-88464]
           with snd @a0
                    @(Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p)))
         (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
-    Suggested fix:
-      Pattern-match on ‘m’ (constructors: ‘Zero’,
-                                          ‘Succ’) to reduce ‘plus’.
+    Suggested fixes:
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘n’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
 
 DependentHoleFits.hs:42:23: error: [GHC-88464]
     • Found hole: _ :: plus m6 n5 :~: plus n5 m6
@@ -352,8 +356,6 @@ DependentHoleFits.hs:98:13: error: [GHC-88464]
                      -> size (reverse xs) :~: size xs
           (bound at DependentHoleFits.hs:98:1)
       Valid hole fits include
-        lengthRev :: foreach (xs :: List a)
-                     -> size (reverse xs) :~: size xs
         lengthReverse :: forall a.
                          foreach (xs :: List a) -> size (reverse xs) :~: size xs
           with lengthReverse @a
@@ -371,13 +373,12 @@ DependentHoleFits.hs:101:22: error: [GHC-88464]
     • Relevant bindings include
         reverseIdPointfree :: foreach (xs :: List a) -> reverse xs :~: xs
           (bound at DependentHoleFits.hs:101:1)
-      Valid hole fits include
-        reverseIdPointfree :: foreach (xs :: List a) -> reverse xs :~: xs
 
 DependentHoleFits.hs:119:23: error: [GHC-88464]
     • Found hole: _ :: add2 m3 (Succ k) :~: Succ (add2 k m3)
     • In an equation for ‘add2Comm’: add2Comm m (Succ k) = _
     • Relevant bindings include
+        m :: Nat (bound at DependentHoleFits.hs:119:10)
         k :: Nat (bound at DependentHoleFits.hs:119:18)
         add2Comm :: foreach (m :: Nat)
                     -> foreach (k :: Nat) -> add2 m k :~: add2 k m
@@ -408,9 +409,11 @@ DependentHoleFits.hs:119:23: error: [GHC-88464]
           with InternalList.errorEmptyList @(add2 m3 (Succ k)
                                              :~: Succ (add2 k m3))
         (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
-    Suggested fix:
-      Pattern-match on ‘k’ (constructors: ‘Zero’,
-                                          ‘Succ’) to reduce ‘add2’.
+    Suggested fixes:
+      • Pattern-match on ‘k’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘add2’.
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘add2’.
 
 DependentHoleFits.hs:126:19: error: [GHC-88464]
     • Found hole: _ :: u :~: v

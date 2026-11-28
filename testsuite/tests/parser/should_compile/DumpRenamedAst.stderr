@@ -201,7 +201,7 @@
              (EpaComments
               []))
             (ConDeclH98
-             (NoExtField)
+             (Nothing)
              []
              (L
               (EpAnn
@@ -211,9 +211,7 @@
                (EpaComments
                 []))
               {Name: DumpRenamedAst.Zero})
-             (False)
              []
-             (Nothing)
              (PrefixCon
               (NoExtField)
               [])
@@ -225,7 +223,7 @@
              (EpaComments
               []))
             (ConDeclH98
-             (NoExtField)
+             (Nothing)
              []
              (L
               (EpAnn
@@ -235,9 +233,7 @@
                (EpaComments
                 []))
               {Name: DumpRenamedAst.Succ})
-             (False)
              []
-             (Nothing)
              (PrefixCon
               (NoExtField)
               [(CDF
@@ -315,10 +311,12 @@
           (EpTok
            (EpaSpan { <no location info> })))
          (ClosedTypeFamily
-          (AnnList
-           (EpVirtualBraces
-            (EpaSpan { DumpRenamedAst.hs:13:3 }))
-           [])
+          ((,)
+           (AnnList
+            (EpVirtualBraces
+             (EpaSpan { DumpRenamedAst.hs:13:3 }))
+            [])
+           (Nothing))
           (Just
            [(L
              (EpAnn
@@ -1059,7 +1057,7 @@
              (EpaComments
               []))
             (ConDeclH98
-             (NoExtField)
+             (Nothing)
              []
              (L
               (EpAnn
@@ -1069,9 +1067,7 @@
                (EpaComments
                 []))
               {Name: DumpRenamedAst.MkT})
-             (False)
              []
-             (Nothing)
              (PrefixCon
               (NoExtField)
               [(CDF
@@ -1189,10 +1185,12 @@
           (EpTok
            (EpaSpan { <no location info> })))
          (ClosedTypeFamily
-          (AnnList
-           (EpVirtualBraces
-            (EpaSpan { DumpRenamedAst.hs:26:3 }))
-           [])
+          ((,)
+           (AnnList
+            (EpVirtualBraces
+             (EpaSpan { DumpRenamedAst.hs:26:3 }))
+            [])
+           (Nothing))
           (Just
            [(L
              (EpAnn
@@ -2453,7 +2451,6 @@
                 [{Name: f}
                 ,{Name: g}]))
               []
-              []
               (PrefixConGADT
                (NoExtField)
                [(CDF
@@ -2492,12 +2489,14 @@
                      (HsForAllInvis
                       (EpAnn
                        (EpaDelta { <no location info> } (SameLine 0) [])
-                       ((,)
+                       ((,,)
                         (EpUniTok (EpaSpan { <no location info> }) NormalSyntax)
                         (EpTok
-                         (EpaSpan { <no location info> })))
+                         (EpaSpan { <no location info> }))
+                        (Nothing))
                        (EpaComments
                         []))
+                      (Nothing)
                       [(L
                         (EpAnn
                          (EpaSpan { DumpRenamedAst.hs:20:18-19 })

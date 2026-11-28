@@ -906,8 +906,8 @@ cpeBodyF env (Tick tickish expr)
              = tickish
 
 cpeBodyF env (Pack schema witness payload)
-  = do { payload' <- cpeBody env payload
-       ; return (emptyFloats, Pack (cpSubstTy env schema) (cpSubstTy env witness) payload') }
+  = do { (floats, payload') <- cpeBodyF env payload
+       ; return (floats, Pack (cpSubstTy env schema) (cpSubstTy env witness) payload') }
 
 cpeBodyF env (Unpack witness value package body)
   = do { package' <- cpeBody env package
@@ -1841,11 +1841,13 @@ cpeApp top_env expr
         where
           prepare_computation (App f a) = App (prepare_computation f) (prepare_computation a)
           prepare_computation (Tick tick@HpcTick{} body) = Tick tick (prepare_computation body)
+          prepare_computation (Tick tick body)
+            | not (tickishIsCode tick) = Tick tick (prepare_computation body)
           prepare_computation (Type ty) = Type (cpSubstTy env ty)
           prepare_computation (Coercion co) = Coercion (cpSubstCo env co)
           prepare_computation (Cast body co) = Cast (prepare_computation body) (cpSubstCo env co)
           prepare_computation (Var v) = lookupCorePrepEnv env v
-          prepare_computation literal@(Lit LitChar{}) = literal
+          prepare_computation literal@Lit{} = literal
           prepare_computation e = pprPanic "CorePrep: malformed retained computation" (ppr e)
 
       AIApp arg -> do

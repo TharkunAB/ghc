@@ -59,33 +59,16 @@ NativeNamedSplitScope.hs:19:23: error: [GHC-83865]
       In the pattern: _ :: Token suffix
       In the pattern: Pair _ (_ :: Token suffix)
 
-NativeNamedSplitScope.hs:23:69: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘_4’
-      Expected: Vec Bool n0
-        Actual: Vec Bool _4
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeNamedSplitScope.hs:23:62-71
-    • In the first argument of ‘zipVec’, namely ‘a’
-      In the expression: zipVec a b
-      In the first argument of ‘toList’, namely ‘(zipVec a b)’
-    • Relevant bindings include
-        a :: Vec Bool _4 (bound at NativeNamedSplitScope.hs:23:26)
-
 NativeNamedSplitScope.hs:23:71: error: [GHC-83865]
-    • Couldn't match type ‘n0’ with ‘_5’
-      Expected: Vec Bool n0
-        Actual: Vec Bool _5
-      ‘n0’ is untouchable
-        inside the constraints: ()
-        bound by a retained application
-        at NativeNamedSplitScope.hs:23:62-71
+    • Couldn't match type ‘_4’ with ‘_5’
+      Expected: Vec Bool _5
+        Actual: Vec Bool _4
     • In the second argument of ‘zipVec’, namely ‘b’
-      In the expression: zipVec a b
       In the first argument of ‘toList’, namely ‘(zipVec a b)’
+      In the expression: toList (zipVec a b)
     • Relevant bindings include
-        b :: Vec Bool _5 (bound at NativeNamedSplitScope.hs:23:45)
+        b :: Vec Bool _4 (bound at NativeNamedSplitScope.hs:23:45)
+        a :: Vec Bool _5 (bound at NativeNamedSplitScope.hs:23:26)
 
 NativeNamedSplitScope.hs:29:56: error: [GHC-83865]
     • Couldn't match type: Fold _3
