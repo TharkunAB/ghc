@@ -25,6 +25,7 @@ where
 import GHC.Prelude
 
 import GHC.Driver.DynFlags
+import GHC.Driver.Ppr ( showSDoc )
 import GHC.Driver.Config
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Unit.Module
@@ -35,6 +36,7 @@ import {-# SOURCE #-}   GHC.HsToCore.Match ( matchWrapper )
 import GHC.HsToCore.Pmc.Utils( tracePm )
 
 import GHC.HsToCore.Monad
+import GHC.HsToCore.Types ( ds_type_env )
 import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.GuardedRHSs
 import GHC.HsToCore.Utils
@@ -42,6 +44,9 @@ import GHC.HsToCore.Pmc ( addTyCs, pmcGRHSs )
 
 import GHC.Hs             -- lots of things
 import GHC.Core           -- lots of things
+import GHC.Core.Dependent
+  ( hasExistentialExpr, hasNativeDepFunType, hasNativeDependentExpr, hasNativeDependentExprRhs
+  , hasNativeDependentUnfolding, isRetainedVanillaDefaultMethod, supportsNativeRuleBinds )
 import GHC.Core.SimpleOpt
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
 import GHC.Core.InstEnv ( CanonicalEvidence(..) )
@@ -58,20 +63,23 @@ import GHC.Core.Coercion
 import GHC.Core.Rules
 import GHC.Core.Ppr( pprCoreBinders )
 import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCo.Rep ( Type(DepDictTy, DepFunTy) )
 
 import GHC.Builtin.KnownKeys( typeableClassKey )
 import GHC.Builtin.KnownOccs
 import GHC.Builtin.WiredIn.Types ( naturalTy, typeSymbolKind, charTy )
 
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Utils.Monad ( getGblEnv )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.InlinePragma
 import GHC.Types.Name
+import GHC.Types.TypeEnv (TypeEnv, restoreSourceTableId)
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
-import GHC.Types.Var( EvVar, mkLocalVar, isRuntimePiTyBinder )
+import GHC.Types.Var( EvVar, mkLocalVar, isRuntimePiTyBinder, coreTyLamForAllTyFlag, isInvisibleDepFunFlag )
 import GHC.Types.SrcLoc
 import GHC.Types.Basic
 import GHC.Types.Unique.Set( nonDetEltsUniqSet )
@@ -113,7 +121,9 @@ dsTopLHsBinds binds
             ; massertPpr (null force_vars || xstrict) (ppr binds $$ ppr force_vars) }
               -- with -XStrict, even top-level vars are listed as force vars.
 
-       ; return (toOL prs) }
+       ; env <- getGblEnv
+       ; let prs' = mapFst (restoreSourceTableId (ds_type_env env)) prs
+       ; return (toOL prs') }
 
   where
     unlifted_binds = filter (isUnliftedHsBind . unLoc) binds
@@ -198,8 +208,8 @@ dsHsBind dflags (VarBind { var_id = var
   = do  { core_expr <- dsLExpr expr
                 -- Dictionary bindings are always VarBinds,
                 -- so we only need do this here
-        ; let core_bind@(id,_) = makeCorePair dflags var False core_expr
-              force_var = if xopt LangExt.Strict dflags
+        ; core_bind@(id,_) <- makeCorePair dflags False (idName var) var False core_expr
+        ; let force_var = if xopt LangExt.Strict dflags
                           then [id]
                           else []
         ; return (force_var, [core_bind]) }
@@ -213,8 +223,8 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
 
       ; let body' = mkOptTickBox tick body
             rhs   = core_wrap (mkLams args body')
-            core_binds@(id,_) = makeCorePair dflags fun False rhs
-            force_var
+      ; core_binds@(id,_) <- makeCorePair dflags False (idName fun) fun False rhs
+      ; let force_var
                 -- Bindings are strict when -XStrict is enabled
               | xopt LangExt.Strict dflags
               , matchGroupVisArity matches == 0 -- no need to force lambdas
@@ -303,9 +313,7 @@ dsAbsBinds dflags tyvars dicts exports
        ; (spec_binds, rules) <- dsSpecs rhs prags
 
        ; let global_id' = addIdSpecialisations global_id rules
-             main_bind  = makeCorePair dflags global_id'
-                                       (isDefaultMethod prags)
-                                       rhs
+       ; main_bind <- makeCorePair dflags False (idName global_id) global_id' (isDefaultMethod prags) rhs
 
        ; return (force_vars', fromOL spec_binds ++ [main_bind]) } }
 
@@ -329,7 +337,9 @@ dsAbsBinds dflags tyvars dicts exports
                     { return ( gbl_id `setInlinePragma` defaultInlinePragma
                              , core_wrap (Var lcl_id)) } }
        ; main_prs <- mapM mk_main exports
-       ; let bind_prs' = map mk_aux_bind bind_prs
+       ; let direct_workers = mkVarSet [worker | (_, Var worker) <- main_prs]
+       ; bind_prs' <- mapM (mk_aux_bind (`elemVarSet` direct_workers)) bind_prs
+       ; let
              -- When there's a single source binding, we wrap the evidence binding in a
              -- separate let-rec (DSB1) inside the first desugared binding (DSB2).
              -- See Note [The no-tyvar no-dict case].
@@ -340,9 +350,14 @@ dsAbsBinds dflags tyvars dicts exports
     -- The general case
     -- See Note [Desugaring AbsBinds]
   | otherwise
-  = do { let aux_binds = Rec (map mk_aux_bind bind_prs)
+  = do { aux_prs <- mapM (mk_aux_bind (const True)) bind_prs
+       ; let aux_binds = Rec aux_prs
                 -- Monomorphic recursion possible, hence Rec
 
+             package_workers = mkVarSet
+               [ worker | (worker, _) <- aux_prs
+                        , CoreUnfolding { uf_src = RetainedUserSrc, uf_tmpl = tmpl } <- [realIdUnfolding worker]
+                        , hasExistentialExpr tmpl ]
              new_force_vars = get_new_force_vars force_vars
              locals       = map abe_mono exports
              all_locals   = locals ++ new_force_vars
@@ -372,12 +387,13 @@ dsAbsBinds dflags tyvars dicts exports
                      ; let rhs = core_wrap $ mkLams tyvars $ mkLams dicts sel_body
                            rhs_for_spec = Let (NonRec poly_tup_id poly_tup_rhs) rhs
                      ; (spec_binds, rules) <- dsSpecs rhs_for_spec spec_prags
-                     ; let global' = (global `setInlinePragma` defaultInlinePragma)
-                                             `addIdSpecialisations` rules
-                           -- Kill the INLINE pragma because it applies to
-                           -- the user written (local) function.  The global
-                           -- Id is just the selector.  Hmm.
-                     ; return (fromOL spec_binds ++ [(global', rhs)]) } }
+                     ; selector <- if local `elemVarSet` package_workers
+                           then do
+                             let template = core_wrap $ mkLams tyvars $ mkLams dicts $
+                                            mkCoreLets ds_ev_binds $ mkLet aux_binds (Var local)
+                             fst <$> makeCorePair dflags False (idName global) global False template
+                           else pure (global `setInlinePragma` defaultInlinePragma)
+                     ; return (fromOL spec_binds ++ [(addIdSpecialisations selector rules, rhs)]) } }
 
        ; export_binds_s <- mapM mk_bind (exports ++ extra_exports)
 
@@ -385,11 +401,11 @@ dsAbsBinds dflags tyvars dicts exports
                 , (poly_tup_id, poly_tup_rhs) :
                    concat export_binds_s) }
   where
-    mk_aux_bind :: (Id,CoreExpr) -> (Id,CoreExpr)
-    mk_aux_bind (lcl_id, rhs) = let lcl_w_inline = lookupVarEnv inline_env lcl_id
-                                                   `orElse` lcl_id
-                                 in
-                                 makeCorePair dflags lcl_w_inline False rhs
+    mk_aux_bind :: (Id -> Bool) -> (Id,CoreExpr) -> DsM (Id,CoreExpr)
+    mk_aux_bind allow_package (lcl_id, rhs) =
+      let lcl_w_inline = lookupVarEnv inline_env lcl_id `orElse` lcl_id
+          pragma_name = idName (lookupVarEnv global_env lcl_id `orElse` lcl_id)
+      in makeCorePair dflags (allow_package lcl_id) pragma_name lcl_w_inline False rhs
 
     inline_env :: IdEnv Id -- Maps a monomorphic local Id to one with
                            -- the inline pragma from the source
@@ -440,62 +456,133 @@ dsAbsBinds dflags tyvars dicts exports
 -- the unfolding in the interface file is made in `GHC.Iface.Tidy.addExternal`
 -- using this information.
 ------------------------
-makeCorePair :: DynFlags -> Id -> Bool -> CoreExpr
-             -> (Id, CoreExpr)
-makeCorePair dflags gbl_id is_default_method rhs
+makeCorePair :: DynFlags -> Bool -> Name -> Id -> Bool -> CoreExpr
+             -> DsM (Id, CoreExpr)
+makeCorePair dflags allow_worker_package pragma_name gbl_id is_default_method rhs
+  | is_default_method
+  , native_rhs
+  , isRetainedVanillaDefaultMethod (idName gbl_id) (idType gbl_id)
+  = pure (gbl_id `setIdUnfolding` mkRetainedDefaultUnfolding rhs, rhs)
+
+  | is_default_method
+  , hasNativeDependentExpr rhs
+  -- See Note [Compulsory retained defaults] in GHC.Iface.Tidy.
+  = throwGhcException (Sorry
+      ("Native dependent Core cannot enter default-method unfolding construction while desugaring binding "
+       ++ showSDoc dflags (ppr gbl_id)
+       ++ ". This operation does not support retained Boolean types or branch proofs."))
+
   | is_default_method    -- Default methods are *always* inlined
                          -- See Note [INLINE and default methods] in GHC.Tc.TyCl.Instance
-  = (gbl_id `setIdUnfolding` mkCompulsoryUnfolding' simpl_opts rhs, rhs)
+  = pure (gbl_id `setIdUnfolding` mkCompulsoryUnfolding' simpl_opts rhs, rhs)
+
+  | isInlinePragma inline_prag || isInlinablePragma inline_prag
+  , native_rhs
+  , not (hasNativeDependentExprRhs (Type (idType gbl_id)))
+  , unf@CoreUnfolding { uf_tmpl = tmpl } <- realIdUnfolding (fst pair)
+  , hasNativeDependentUnfolding tmpl
+  -- See Note [Written retained unfolding pragmas].
+  = if (allow_worker_package || isInternalName pragma_name || pragma_name == idName gbl_id
+        || not (hasExistentialExpr tmpl))
+       && supportsNativeRuleBinds [NonRec (fst pair) tmpl]
+    then pure (setIdUnfolding (fst pair) unf{uf_src = RetainedUserSrc}, snd pair)
+    else putSrcSpanDs (nameSrcSpan pragma_name) $
+           failWithDs (DsRetainedInlinePragma pragma_name inline_spec)
 
   | otherwise
-  = case inlinePragmaSpec inline_prag of
+  = pure pair
+  where
+    simpl_opts    = initSimpleOpts dflags
+    inline_prag   = idInlinePragma gbl_id
+    inline_spec   = inlinePragmaSpec inline_prag
+    native_rhs    = hasNativeDependentUnfolding rhs
+    pair = case inline_spec of
           NoUserInlinePrag -> (gbl_id, rhs)
           NoInline  {}     -> (gbl_id, rhs)
           Opaque    {}     -> (gbl_id, rhs)
           Inlinable {}     -> (gbl_id `setIdUnfolding` inlinable_unf, rhs)
           Inline    {}     -> inline_pair
-  where
-    simpl_opts    = initSimpleOpts dflags
-    inline_prag   = idInlinePragma gbl_id
     inlinable_unf = mkInlinableUnfolding simpl_opts StableUserSrc rhs
     inline_pair
        | AppliedToAtLeast vis_arity <- inlinePragmaSaturation inline_prag
         -- Add an Unfolding for an INLINE (but not for NOINLINE)
-        -- And eta-expand the RHS; see Note [Eta-expanding INLINE things]
+        -- Eta-expand ordinary RHSs. See Note [Eta-expanding INLINE things]
+        -- and Note [Written retained unfolding pragmas].
        , let runtime_arity = findSatArity vis_arity (idType gbl_id)
         -- NB: runtime_arity: the arity passed to mkInlineUnfoldingWithArity
         --     must take account of dictionaries and required type args
        = ( gbl_id `setIdUnfolding` mkInlineUnfoldingWithArity simpl_opts StableUserSrc
                                                               runtime_arity rhs
-         , etaExpand runtime_arity rhs)
+         , if native_rhs || hasNativeDepFunType (idType gbl_id)
+             then rhs
+             else etaExpand runtime_arity rhs)
 
        | otherwise
        = pprTrace "makeCorePair: arity missing" (ppr gbl_id) $
          (gbl_id `setIdUnfolding` mkInlineUnfoldingNoArity simpl_opts StableUserSrc rhs, rhs)
 
+{- Note [Written retained unfolding pragmas]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+INLINE counts the arguments supplied at the source binding head. A visible
+retained binder consumes one such position and one Core argument. An
+invisible retained binder consumes only a Core argument. The ordinary
+dictionary and erased-binder rules still apply.
+
+Use this arity for INLINE guidance. Keep the retained RHS unchanged.
+Moving a returned lambda outside a case can change what a partial call
+evaluates. The unfolding builder uses native SimpleOpt and preserves
+dependencies in the template.
+
+Native SimpleOpt can remove all retained Core from a template. When
+retained Core remains in a checked template at an ordinary signature,
+mark its unfolding source. Clients use the tag to select the retained
+pipeline before reading the template. The module interface checks these
+exports. See Note [Retained Core across module boundaries] in
+GHC.Iface.Tidy.
+
+A local binding uses the same tag. The retained optimizer sees the
+stable template when it scans the binding. The tag stays attached if
+the binding floats without abstraction or occurs inside an exported template.
+Permit package operations in a local template or the template of the
+top-level binding that owns the pragma. In the monomorphic AbsBinds path
+also accept a worker whose wrapper is a direct alias. The simplifier can
+move the unfolding and pragma to the exported Id with the worker RHS.
+See Note [Transferring IdInfo] in GHC.Core.Opt.Simplify. Occurrence analysis
+still chooses loop breakers for the recursive group.
+
+In the general AbsBinds case the workers are local to the tuple function.
+Its type and dictionary lambdas bind the variables in the worker template.
+Use the local unfolding policy for those workers. Leave the pragma on the
+worker that owns the definition. For its export, close the selected worker
+over those same binders and evidence bindings. This gives the client a
+stable unfolding with all of the group's free variables in scope.
+The runtime selector still calls the shared tuple function.
+See Note [Desugaring AbsBinds].
+See Note [Erased package unfoldings] in GHC.IfaceToCore.
+Compulsory default-method unfoldings still use their separate check.
+An ordinary binding without an unfolding request needs no native scan here.
+-}
+
+-- | Convert the arity of the written patterns to Core call saturation.
 findSatArity :: VisArity -> Type -> Arity
--- Given the VisArity, find the value Arity of the function.
--- This is the number of runtime-value arguments the function must be applied
--- to before the INLINE pragma fires and inlines the function
--- We must:
---    add one for each invisible dictionary arg; and
---    subtract one for each required type argment
-findSatArity vis_arity ty
-  = go vis_arity pi_bndrs
+findSatArity vis_arity ty = go vis_arity ty
   where
-    (pi_bndrs, _) = splitPiTys ty
+    go ar next
+      | DepFunTy vis _ res <- coreFullView next
+      = step ar (isInvisibleDepFunFlag vis) True res
+      | DepDictTy _ res <- coreFullView next
+      = step ar True True res
+      | Just (_, bndr, res) <- splitPiTy_maybe next
+      = step ar (isInvisiblePiTyBinder bndr) (isRuntimePiTyBinder bndr) res
+      | ar == 0 = 0
+      | otherwise = pprPanic "findSatArity" (ppr vis_arity $$ ppr ty)
 
-    go vis_arity (bndr : bndrs)
-      | isInvisiblePiTyBinder bndr = add_bndr bndr (go vis_arity     bndrs)
-      | vis_arity == 0             = 0
-      | otherwise                  = add_bndr bndr (go (vis_arity-1) bndrs)
-    go vis_arity []
-      | vis_arity == 0 = 0
-      | otherwise      = pprPanic "findSatArity" (ppr vis_arity $$ ppr ty)
-
-    add_bndr :: PiTyBinder -> Arity -> Arity
-    add_bndr bndr ar | isRuntimePiTyBinder bndr = ar+1
-                     | otherwise                = ar
+    step ar invisible runtime res
+      | invisible = count_arg + go ar res
+      | ar == 0   = 0
+      | otherwise = count_arg + go (ar-1) res
+      where
+        count_arg = if runtime then 1 else 0
 
 {-
 Note [Desugaring AbsBinds]
@@ -1043,7 +1130,12 @@ dsSpec_help poly_nm poly_id poly_rhs spec_inl orig_bndrs ds_call
 
              simpl_opts = initSimpleOpts dflags
              fn_unf     = realIdUnfolding poly_id
-             spec_unf   = specUnfolding simpl_opts spec_bndrs mk_spec_body rule_lhs_args fn_unf
+             spec_unf
+               | isInlinablePragma id_inl, isRetainedUserUnfolding fn_unf = noUnfolding
+               | otherwise = specUnfolding simpl_opts spec_bndrs mk_spec_body rule_lhs_args fn_unf
+               -- Publish the ordinary specialized call in the user's rule.
+               -- Do not inherit a marked wrapper template on that call.
+               -- See Note [Retained user unfoldings across modules] in GHC.Iface.Tidy.
              spec_info  = vanillaIdInfo
                           `setInlinePragInfo` specFunInlinePrag poly_id id_inl spec_inl
                           `setUnfoldingInfo`  spec_unf
@@ -1647,6 +1739,10 @@ ds_hs_wrapper hs_wrap
                                    let app f a = mkCoreApp f a
                                        arg     = w1 (Var x)
                                    in k (\e -> (Lam x (w2 (app e arg)))) }
+    go (WpRetainedFun _ b w) k = go w $ \body ->
+      k (\e -> Lam b (body (mkCoreApp e (Var b))))
+    go (WpExistsPack schema witness) k =
+      k (\e -> Pack schema witness e)
 
 --------------------------------------
 dsTcEvBinds_s :: [TcEvBinds] -> ([CoreBind] -> DsM a) -> DsM a
@@ -1747,15 +1843,43 @@ dsEvBind (EvBind { eb_lhs = v, eb_rhs = r, eb_info = info }) = do
 *                                                                      *
 **********************************************************************-}
 
+-- | Restore 'SourceTableId' details on local binders inside evidence expressions
+-- after 'zonkCoreExpr' replaced occurrences with the pre-table 'LocalId'.
+restoreSourceTableExpr :: TypeEnv -> CoreExpr -> CoreExpr
+restoreSourceTableExpr type_env = go
+  where
+    go (Var v)                 = Var (restoreSourceTableId type_env v)
+    go (App f x)               = App (go f) (go x)
+    go (Lam b body)            = Lam b (go body)
+    go (Let bind body)         = Let (go_bind bind) (go body)
+    go (Case scrut b ty alts)  = Case (go scrut) b ty [Alt c bs (go rhs) | Alt c bs rhs <- alts]
+    go (Cast expr co)          = Cast (go expr) co
+    go (Tick t expr)           = Tick t (go expr)
+    go (Pack ty w body)        = Pack ty w (go body)
+    go (Unpack w p scrut body) = Unpack w p (go scrut) (go body)
+    go other                   = other
+
+    go_bind (NonRec b r) = NonRec (restoreSourceTableId type_env b) (go r)
+    go_bind (Rec pairs)  = Rec [(restoreSourceTableId type_env b, go r) | (b, r) <- pairs]
+
 dsEvTerm :: EvTerm -> DsM CoreExpr
-dsEvTerm (EvExpr e)          = return e
+dsEvTerm (EvExpr e)          = do { env <- getGblEnv
+                                  ; return (restoreSourceTableExpr (ds_type_env env) e) }
 dsEvTerm (EvTypeable ty ev)  = dsEvTypeable ty ev
 dsEvTerm (EvFun { et_tvs = tvs, et_given = given
                 , et_binds = ev_binds, et_body = wanted_id })
-  = do { dsTcEvBinds ev_binds $ \ds_ev_binds ->
-         return $ (mkLams (tvs ++ given) $
-                   mkCoreLets ds_ev_binds $
-                   Var wanted_id) }
+  = do { body <- dsTcEvBinds ev_binds $ \ds_ev_binds ->
+                   return $ mkLams given $ mkCoreLets ds_ev_binds $ Var wanted_id
+       ; forall_lams tvs body }
+  where
+    -- Keep each metadata proof outside its own binder and inside its prefix.
+    forall_lams [] body = return body
+    forall_lams ((prefix_binds, ma_co, tv) : rest) body
+      = dsTcEvBinds prefix_binds $ \binds ->
+        do { inner <- forall_lams rest body
+           ; let co = mkForAllCo tv coreTyLamForAllTyFlag coreTyLamForAllTyFlag
+                                ma_co MRefl (mkRepReflCo (exprType inner))
+           ; return $ mkCoreLets binds $ mkCast (Lam tv inner) co }
 
 
 {-**********************************************************************
@@ -1817,28 +1941,28 @@ ds_ev_typeable ty (EvTypeableTyApp ev1 ev2)
   = do { e1  <- getRep ev1 t1
        ; e2  <- getRep ev2 t2
        ; mkTrAppChecked <- dsLookupKnownOccId mkTrAppCheckedOcc
-                    -- mkTrAppChecked :: forall k1 k2 (a :: k1 -> k2) (b :: k1).
-                    --                   TypeRep a -> TypeRep b -> TypeRep (a b)
-       ; let (_, k1, k2) = splitFunTy (typeKind t1)  -- drop the multiplicity,
-                                                     -- since it's a kind
-       ; let expr =  mkApps (mkTyApps (Var mkTrAppChecked) [ k1, k2, t1, t2 ])
+                    -- The first type argument is the consumed kind arrow's
+                    -- matchability. The value arguments remain unchanged.
+       ; let (ma, _, k1, k2) = splitFunTy (typeKind t1)
+       ; let expr =  mkApps (mkTyApps (Var mkTrAppChecked) [ ma, k1, k2, t1, t2 ])
                             [ e1, e2 ]
        -- ; pprRuntimeTrace "Trace mkTrAppChecked" (ppr expr) expr
        ; return expr
        }
 
-ds_ev_typeable ty (EvTypeableTrFun evm ev1 ev2)
-  | Just (_af,m,t1,t2) <- splitFunTy_maybe ty
+ds_ev_typeable ty (EvTypeableTrFun evma evm ev1 ev2)
+  | Just (_af,ma,m,t1,t2) <- splitFunTy_maybe ty
   = do { e1 <- getRep ev1 t1
        ; e2 <- getRep ev2 t2
        ; em <- getRep evm m
+       ; ema <- getRep evma ma
        ; mkTrFun <- dsLookupKnownOccId mkTrFunOcc
-                    -- mkTrFun :: forall (m :: Multiplicity) r1 r2 (a :: TYPE r1) (b :: TYPE r2).
-                    --            TypeRep m -> TypeRep a -> TypeRep b -> TypeRep (a % m -> b)
+                    -- See Note [Matchability in reflection] in
+                    -- GHC.Internal.Data.Typeable.Internal.
        ; let r1 = getRuntimeRep t1
              r2 = getRuntimeRep t2
-       ; return $ mkApps (mkTyApps (Var mkTrFun) [m, r1, r2, t1, t2])
-                         [ em, e1, e2 ]
+       ; return $ mkApps (mkTyApps (Var mkTrFun) [ma, m, r1, r2, t1, t2])
+                         [ ema, em, e1, e2 ]
        }
 
 ds_ev_typeable ty (EvTypeableTyLit ev)

@@ -53,6 +53,7 @@ import GHC.Tc.Zonk.Type
 import GHC.Tc.Validity
 
 import GHC.Core.DataCon
+import GHC.Core.Multiplicity ( scaledThing )
 import GHC.Core.FamInstEnv
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom ( coAxiomSingleBranch )
@@ -1462,7 +1463,7 @@ gen_Data_binds loc (DerivInstTys{dit_rep_tc = rep_tc})
 
 kind1, kind2 :: Kind
 kind1 = typeToTypeKind
-kind2 = liftedTypeKind `mkVisFunTyMany` kind1
+kind2 = liftedTypeKind `mkVisFunTyManyM` kind1
 
 {-
 ************************************************************************
@@ -1898,7 +1899,7 @@ gen_Newtype_binds loc' cls inst_tvs inst_tys rhs_ty
         --                  op
         mkRdrFunBind loc_meth_RDR [mkSimpleMatch
                                       (mkPrefixFunRhs loc_meth_RDR noAnn)
-                                      (noLocA (map mk_ty_pat to_tvbs)) rhs_expr]
+                                      (noLocA (map (mk_ty_pat . snd) to_tvbs)) rhs_expr]
 
       where
         Pair from_ty to_ty = mkCoerceClassMethEqn cls inst_tvs inst_tys rhs_ty meth_id
@@ -1931,7 +1932,7 @@ gen_Newtype_binds loc' cls inst_tvs inst_tys rhs_ty
         -- See Note [GND and ambiguity].
         meth_app = foldl' nlHsAppType (nlHsVar meth_RDR) $
                    filterOutInferredTypes (classTyCon cls) underlying_inst_tys ++ -- (1)
-                   [mkTyVarTy tv | Bndr tv spec <- to_tvbs, spec /= InferredSpec] -- (2)
+                   [mkTyVarTy tv | (_, Bndr tv spec) <- to_tvbs, spec /= InferredSpec] -- (2)
                      -- Filter out any inferred arguments, since they can't be
                      -- applied with visible type application.
 
@@ -2110,8 +2111,8 @@ genAuxBindSpecSig :: SrcSpan -> AuxBindSpec -> LHsSigWcType GhcPs
 genAuxBindSpecSig loc spec = case spec of
   DerivTag2Con tycon _
     -> mk_sig $ L (noAnnSrcSpan loc) $
-       XHsType $ HsCoreTy $ mkSpecForAllTys (tyConTyVars tycon) $
-       intTy `mkVisFunTyMany` mkParentType tycon
+       XHsType $ HsCoreTy $ mkSpecForAllTys [(unmatchableDataConTy,tv) | tv <- tyConTyVars tycon] $
+       intTy `mkVisFunTyManyU` mkParentType tycon
   DerivMaxTag _ _
     -> mk_sig (L (noAnnSrcSpan loc) (XHsType (HsCoreTy intTy)))
   DerivDataDataType _ _ _
@@ -2892,8 +2893,14 @@ buildDataConInstArgEnv :: TyCon -> [Type] -> DataConEnv [Type]
 buildDataConInstArgEnv rep_tc rep_tc_args =
   listToUFM [ (dc, inst_arg_tys)
             | dc <- tyConDataCons rep_tc
-            , let (_, _, inst_arg_tys) =
-                    dataConInstSig dc $ dataConInstUnivs dc rep_tc_args
+            , let univ_tys = dataConInstUnivs dc rep_tc_args
+                  inst_arg_tys
+                    | not (null (dataConRepArgBinders dc))
+                    = substTys (zipTvSubst (dataConUnivTyVars dc) univ_tys)
+                               (map scaledThing (dataConOrigArgTys dc))
+                    | otherwise
+                    = let (_, _, args) = dataConInstSig dc univ_tys
+                      in args
             ]
 
 -- | Apply a substitution to all of the 'Type's contained in a 'DerivInstTys'.

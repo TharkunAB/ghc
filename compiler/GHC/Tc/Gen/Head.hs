@@ -56,8 +56,10 @@ import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
+import GHC.Builtin.WiredIn.Types ( unmatchableDataConTy )
 
 import GHC.Types.Id
+import GHC.Types.Id.Info (sourceProofRuleInfo)
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
@@ -71,6 +73,8 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 
 import GHC.Data.Maybe
+
+import Control.Monad (when)
 
 {- *********************************************************************
 *                                                                      *
@@ -177,19 +181,38 @@ data HsExprArg (p :: TcPass) where -- See Note [HsExprArg]
 
   ETypeArg :: { ea_loc_span :: HsExprLoc
               , ea_hs_ty    :: LHsWcType GhcRn  -- The type arg
-              , ea_ty_arg   :: !(XETAType p) }  -- Kind-checked type arg
+              , ea_ty_source :: Maybe HsAppTypeSource
+              , ea_ty_arg   :: !(XCheckedType p) }  -- Kind-checked type arg
            -> HsExprArg p
+
+  -- Kept separate from the ordinary argument cache and its positions.
+  ERetainedArg :: { ea_retained_vis :: DepFunTyFlag
+                  , ea_loc_span     :: HsExprLoc
+                  , ea_arg_ty       :: !(XEVAType p)
+                  , ea_arg          :: LHsExpr (GhcPass (XPass p))
+                  , ea_retained_res :: !(XCheckedType p)
+                  , ea_retained_co  :: !(XRetainedCo p)
+                  , ea_retained_tc  :: !(XRetainedTc p) }
+               -> HsExprArg p
 
   EPrag :: HsExprLoc -> (HsPragE (GhcPass (XPass p))) -> HsExprArg p
   EWrap :: EWrap                                      -> HsExprArg p
 
-type family XETAType (p :: TcPass) where  -- Type arguments
-  XETAType 'TcpRn = NoExtField
-  XETAType _      = Type
+type family XCheckedType (p :: TcPass) where
+  XCheckedType 'TcpRn = NoExtField
+  XCheckedType _      = Type
 
 type family XEVAType (p :: TcPass) where   -- Value arguments
   XEVAType 'TcpInst = Scaled TcSigmaTypeFRR
   XEVAType _        = NoExtField
+
+type family XRetainedCo (p :: TcPass) where
+  XRetainedCo 'TcpInst = Maybe CoercionN
+  XRetainedCo _        = NoExtField
+
+type family XRetainedTc (p :: TcPass) where
+  XRetainedTc 'TcpInst = Maybe (LHsExpr GhcTc, UsageEnv)
+  XRetainedTc _        = NoExtField
 
 data QLFlag = DoQL | NoQL
 
@@ -211,10 +234,11 @@ mkEValArg :: HsExprLoc -> LHsExpr GhcRn -> HsExprArg 'TcpRn
 mkEValArg src_loc e = EValArg { ea_arg = e, ea_loc_span = src_loc
                               , ea_arg_ty = noExtField }
 
-mkETypeArg :: HsExprLoc -> LHsWcType GhcRn -> HsExprArg 'TcpRn
-mkETypeArg src_loc hs_ty =
+mkETypeArg :: HsExprLoc -> Maybe HsAppTypeSource -> LHsWcType GhcRn -> HsExprArg 'TcpRn
+mkETypeArg src_loc original hs_ty =
   ETypeArg { ea_loc_span = src_loc
            , ea_hs_ty = hs_ty
+           , ea_ty_source = original
            , ea_ty_arg = noExtField }
 
 addArgWrap :: HsWrapper -> [HsExprArg p] -> [HsExprArg p]
@@ -228,6 +252,7 @@ getFunSrcSpan :: [HsExprArg 'TcpRn] -> TcM SrcSpan
 getFunSrcSpan [] = getSrcSpanM
 getFunSrcSpan (ETypeArg { ea_loc_span = l }    : _)    = return (locA l)
 getFunSrcSpan (EValArg  { ea_loc_span = l }    : _)    = return (locA l)
+getFunSrcSpan (ERetainedArg { ea_loc_span = l } : _)   = return (locA l)
 getFunSrcSpan (EPrag l _                       : _)    = return (locA l)
 getFunSrcSpan (EWrap (EPar l)                  : _)    = return (locA l)
 getFunSrcSpan (EWrap (EExpand l _)             : _)    = return (locA l)
@@ -244,19 +269,24 @@ leadingValArgs (EValArg { ea_arg = arg } : args) = arg : leadingValArgs args
 leadingValArgs (EWrap {}    : args)              = leadingValArgs args
 leadingValArgs (EPrag {}    : args)              = leadingValArgs args
 leadingValArgs (ETypeArg {} : _)                 = []
+leadingValArgs (ERetainedArg {} : _)             = []
 
 isValArg :: HsExprArg id -> Bool
 isValArg (EValArg {}) = True
+isValArg (ERetainedArg {}) = True
 isValArg _            = False
 
 isVisibleArg :: HsExprArg id -> Bool
 isVisibleArg (EValArg {})  = True
 isVisibleArg (ETypeArg {}) = True
+isVisibleArg (ERetainedArg {}) = True
 isVisibleArg _             = False
 
 instance OutputableBndrId (XPass p) => Outputable (HsExprArg p) where
   ppr (EPrag _ p)                     = text "EPrag" <+> ppr p
   ppr (ETypeArg { ea_hs_ty = hs_ty }) = char '@' <> ppr hs_ty
+  ppr (ERetainedArg { ea_retained_vis = DepFunVisible, ea_arg = arg }) = ppr arg
+  ppr (ERetainedArg { ea_arg = arg }) = char '@' <> braces (ppr arg)
   ppr (EWrap wrap)                    = ppr wrap
   ppr (EValArg { ea_arg = arg, ea_loc_span = sloc })
     = text "EValArg" <> braces (ppr sloc) <+> ppr arg
@@ -268,6 +298,7 @@ pprArgInst :: HsExprArg 'TcpInst -> SDoc
 -- Ugh!  A special version for 'TcpInst, se we can print the arg_ty of EValArg
 pprArgInst (EPrag _ p)                     = text "EPrag" <+> ppr p
 pprArgInst (ETypeArg { ea_hs_ty = hs_ty }) = char '@' <> ppr hs_ty
+pprArgInst arg@ERetainedArg{}             = ppr arg
 pprArgInst (EWrap wrap)                    = ppr wrap
 pprArgInst (EValArg { ea_arg = arg, ea_arg_ty = ty })
   = hang (text "EValArg" <+> ppr arg)
@@ -297,7 +328,9 @@ splitHsApps e = go e []
   where
     go (HsPar _ (L l fun))        args = go fun (EWrap (EPar l)   : args)
     go (HsPragE _ p (L l fun))    args = go fun (EPrag      l p   : args)
-    go (HsAppType _ (L l fun) ty) args = go fun (mkETypeArg l ty  : args)
+    go (HsAppType source (L l fun) ty) args = go fun (mkETypeArg l source ty : args)
+    go (HsAppRetained _ (L l fun) arg) args
+      = go fun (ERetainedArg DepFunInvisible l noExtField arg noExtField noExtField noExtField : args)
     go (HsApp _ (L l fun) arg)    args = go fun (mkEValArg  l arg : args)
     go fun args = do { mb_hse <- tcExpand fun
                      ; case mb_hse of
@@ -321,6 +354,8 @@ rebuildHsApps fun (arg : args)
         -> rebuildHsApps (HsApp noExtField (L l fun) arg) args
       ETypeArg { ea_hs_ty = hs_ty, ea_ty_arg = ty, ea_loc_span = l }
         -> rebuildHsApps (HsAppType ty (L l fun) hs_ty) args
+      ERetainedArg { ea_retained_vis = vis, ea_arg = arg, ea_retained_res = ty, ea_loc_span = l }
+        -> rebuildHsApps (HsAppRetained (vis, ty) (L l fun) arg) args
       EPrag l p
         -> rebuildHsApps (HsPragE noExtField p (L l fun)) args
       EWrap (EPar l)
@@ -433,7 +468,9 @@ tcInferAppHead_maybe :: HsExpr GhcRn
 -- XExpr's although complicated needs to be looked through, useful for QL things when
 -- the argument is an XExpr
 tcInferAppHead_maybe fun = case fun of
-      HsVar _ nm              -> Just <$> tcInferId nm
+      HsVar _ nm@(L _ (WithUserRdr _ name)) ->
+        do { pack <- isExistsPackName name
+           ; if pack then return Nothing else Just <$> tcInferId nm }
       ExprWithTySig _ e hs_ty -> Just <$> tcExprWithSig e hs_ty
       HsOverLit _ lit         -> Just <$> tcInferOverLit lit
       XExpr (HsRecSelRn f)    -> Just <$> tcInferRecSelId f
@@ -527,8 +564,9 @@ tcExprSig expr sig@(TcPartialSig (PSig { psig_name = name, psig_loc = loc }))
   = setSrcSpan loc $   -- Sets the location for the implication constraint
     do { (tclvl, wanted, (expr', sig_inst))
              <- pushLevelAndCaptureConstraints  $
-                do { sig_inst <- tcInstSig sig
-                   ; expr' <- tcExtendNameTyVarEnv (mapSnd binderVar $ sig_inst_skols sig_inst) $
+                do { sig_inst <- tcInstSig RetrySigCalls sig
+                   ; expr' <- tcWithPartialSigContext sig_inst $
+                              tcExtendNameTyVarEnv (mapSnd (binderVar . snd) $ sig_inst_skols sig_inst) $
                               tcExtendNameTyVarEnv (sig_inst_wcs   sig_inst) $
                               tcCheckPolyExprNC expr (sig_inst_tau sig_inst)
                    ; return (expr', sig_inst) }
@@ -550,7 +588,7 @@ tcExprSig expr sig@(TcPartialSig (PSig { psig_name = name, psig_loc = loc }))
              tau_tvs        = tyCoVarsOfType tau
        ; (binders, my_theta) <- chooseInferredQuantifiers residual inferred_theta
                                    tau_tvs qtvs (Just sig_inst)
-       ; let inferred_sigma = mkInfSigmaTy qtvs inferred_theta tau
+       ; let inferred_sigma = mkInfSigmaTy [(unmatchableDataConTy,tv) | tv <- qtvs] inferred_theta tau
              my_sigma       = mkInvisForAllTys binders (mkPhiTy  my_theta tau)
        ; wrap <- if inferred_sigma `eqType` my_sigma -- NB: eqType ignores vis.
                  then return idHsWrapper  -- Fast path; also avoids complaint when we infer
@@ -618,7 +656,7 @@ tcInferOverLit lit@(OverLit { ol_val = val
            thing    = NameThing from_name
            mb_thing = Just thing
            herald   = ExpectedFunTyArg thing (HsLit noExtField hs_lit)
-       ; (co2, sarg_ty, res_ty) <- matchActualFunTy herald mb_thing (1, from_ty) from_ty
+       ; (co2, _ma, sarg_ty, res_ty) <- matchActualFunTy herald mb_thing (1, from_ty) from_ty
 
        ; co <- unifyType mb_thing (hsLitType hs_lit) (scaledThing sarg_ty)
        -- See Note [Source locations for implicit function calls] in GHC.Iface.Ext.Ast
@@ -667,13 +705,19 @@ tcInferId lname@(L loc (WithUserRdr rdr id_name))
 
 tc_infer_id :: LocatedN (WithUserRdr Name) -> TcM (HsExpr GhcTc, TcSigmaType)
 tc_infer_id (L loc (WithUserRdr rdr id_name))
- = do { thing <- tcLookup id_name
+ = do { pack <- isExistsPackName id_name
+      ; when pack $ failWithTc (TcRnExistsPack ExistsPackInvalidContext)
+      ; thing <- tcLookup id_name
       ; (expr,ty) <- case thing of
              ATcId { tct_id = id }
                -> do { check_local_id id
                      ; return_id id }
 
-             AGlobal (AnId id) -> return_id id
+             AGlobal (AnId id)
+               | deps@(_ : _) <- sourceProofRuleInfo (idInfo id)
+               -> do { recordSourceProofUse (locA loc) (idName id) deps
+                     ; return_id id }
+               | otherwise -> return_id id
                -- A global cannot possibly be ill-staged
                -- nor does it need the 'lifting' treatment
                -- Hence no checkTh stuff here

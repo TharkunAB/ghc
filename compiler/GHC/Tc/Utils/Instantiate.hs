@@ -9,8 +9,9 @@
 -}
 
 module GHC.Tc.Utils.Instantiate (
-     topSkolemise, skolemiseRequired,
-     topInstantiate,
+     topSkolemise, topSkolemiseWith, SkolemisePurpose(..),
+     skolemiseRequired, tcRuntimeForAllBndrs,
+     topInstantiate, tcInstInvisibleTypeWitness,
      instCall, instDFunType, instStupidTheta, instTyVarsWith,
      newWanted, newWanteds,
 
@@ -40,21 +41,35 @@ import GHC.Prelude
 import GHC.Driver.Session
 import GHC.Driver.Env
 
-import GHC.Builtin.KnownOccs( rationalTyConOcc )
-import GHC.Builtin.WiredIn.Types( integerTy )
+import GHC.Builtin.KnownOccs( rationalTyConOcc, typeRepIdOcc )
+import GHC.Builtin.WiredIn.Types( boolTy, eqClass, integerTy, matchabilityTy,
+                                matchableDataConTy, unmatchableDataConTy )
 
 import GHC.Hs
 import GHC.Hs.Syn.Type   ( hsLitType )
 
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Core ( isOrphan ) -- For the Coercion constructor
+import GHC.Core ( Expr(Coercion, Var), isOrphan )
+import qualified GHC.Core as Core
+import GHC.Core.Subst ( extendIdSubst )
 import GHC.Core.Type
+import GHC.Core.Predicate ( getClassPredTys_maybe )
+import GHC.Core.TyCo.Rep ( Type(DepFunTy, DepDictTy, TermVarTy, TyVarTy), CoercionN )
+import GHC.Core.Utils ( applyTypeToArgs, isVacuousRetainedBinder )
+import GHC.Core.Coercion ( mkNomReflCo )
 import GHC.Core.TyCo.Ppr ( debugPprType )
+import GHC.Core.TyCo.Subst ( extendSubstInScopeSetFromSource, emptySubst, lookupTyVar )
+import GHC.Core.Unify ( tcMatchTyX_BM, BindFlag(..) )
+import GHC.Core.DataCon
+  ( dataConWorkId, dataConUnivTyVars, dataConRepArgBinders, isVanillaDataCon )
+import GHC.Core.TyCon ( isPromotedDataCon_maybe )
+import GHC.Core.UsageEnv ( singleUsageUE )
 import GHC.Core.Class( Class )
 import GHC.Core.Coercion.Axiom
 
 import {-# SOURCE #-}   GHC.Tc.Gen.Expr( tcSyntaxOp )
+import {-# SOURCE #-} GHC.Tc.Utils.Unify (unifyType)
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
@@ -63,6 +78,7 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Instance.FunDeps
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Zonk.TcType ( zonkId, zonkTcType )
 import GHC.Tc.Errors.Types
 
 import GHC.Rename.Utils( mkRnSyntaxExpr )
@@ -72,10 +88,13 @@ import GHC.Types.Arity ( VisArity )
 import GHC.Types.Basic ( TypeOrKind(..) )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set ( elemVarSet, mkVarSet )
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Var
 import qualified GHC.LanguageExtensions as LangExt
+
+import GHC.Data.Bag (Bag, emptyBag, unitBag, unionBags)
 
 import GHC.Utils.Misc
 import GHC.Utils.Panic
@@ -193,67 +212,112 @@ This is also relevant when Required foralls are involved; see #24810, and
 the loop in `skolemiseRequired`.
 -}
 
+-- | Distinguish runtime abstraction from analysis that introduces no value.
+-- See Note [Ambiguity skolemisation is not runtime abstraction].
+data SkolemisePurpose = RuntimeSkolemisation | AmbiguitySkolemisation
+
 topSkolemise :: SkolemInfo
              -> TcSigmaType
              -> TcM ( HsWrapper
-                    , [(Name,TcInvisTVBinder)]     -- All skolemised variables
+                    , [(Name,(Matchability,TcInvisTVBinder))] -- All skolemised variables
                     , [EvVar]                      -- All "given"s
-                    , TcRhoType )
+                    , TcRhoType
+                    , Bag Implication )
 -- See Note [Skolemisation]
-topSkolemise skolem_info ty
-  = go init_subst idHsWrapper [] [] ty
+topSkolemise = topSkolemiseWith RuntimeSkolemisation
+
+-- | Skolemise a sigma type for runtime abstraction or ambiguity analysis.
+-- The analysis wrapper is an unused identity marker.
+-- See Note [Ambiguity skolemisation is not runtime abstraction].
+topSkolemiseWith :: SkolemisePurpose -> SkolemInfo -> TcSigmaType
+                -> TcM ( HsWrapper
+                       , [(Name,(Matchability,TcInvisTVBinder))]
+                       , [EvVar], TcRhoType, Bag Implication )
+topSkolemiseWith purpose skolem_info ty
+  = go init_subst idHsWrapper [] [] emptyBag ty
   where
     init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     -- Why recursive?  See Note [Skolemisation en-bloc]
-    go subst wrap tv_prs ev_vars ty
+    go subst wrap tv_prs ev_vars pending ty
       | (bndrs, theta, inner_ty) <- tcSplitSigmaTyBndrs ty
-      , let tvs = binderVars bndrs
+      , let tvs = map (binderVar . snd) bndrs
       , not (null tvs && null theta)
       = do { (subst', bndrs1) <- tcInstSkolTyVarBndrsX skolem_info subst bndrs
-           ; let tvs1 = binderVars bndrs1
+           ; (forall_wrap, prefix_implics) <- case purpose of
+               RuntimeSkolemisation -> tcRuntimeForAllBndrs skolem_info
+                 (map (binderVar . snd . snd) tv_prs) ev_vars
+                 [(ma, Bndr tv (Invisible spec)) | (ma, Bndr tv spec) <- bndrs1]
+                 (mkPhiTy (substTheta subst' theta) (substTy subst' inner_ty))
+               AmbiguitySkolemisation -> pure (idHsWrapper, emptyBag)
+           ; let tvs1 = map (binderVar . snd) bndrs1
            ; traceTc "topSkol" (vcat [ ppr tvs <+> vcat (map (ppr . getSrcSpan) tvs)
                                      , ppr tvs1 <+> vcat (map (ppr . getSrcSpan) tvs1) ])
            ; ev_vars1 <- newEvVars (substTheta subst' theta)
-           ; go subst'
-                (wrap <.> mkWpTyLams tvs1 <.> mkWpEvLams ev_vars1)
+           ; let wrap' = case purpose of
+                   RuntimeSkolemisation -> wrap <.> forall_wrap <.> mkWpEvLams ev_vars1
+                   AmbiguitySkolemisation -> idHsWrapper
+           ; go subst' wrap'
                 (tv_prs ++ (map tyVarName tvs `zip` bndrs1))
                 (ev_vars ++ ev_vars1)
+                (pending `unionBags` prefix_implics)
                 inner_ty }
 
+      | DepDictTy previous body <- coreFullView ty
+      = do { given <- newEvVar (substTy subst (varType previous))
+           ; let subst' = extendIdSubst (extendSubstInScope subst given) previous (Var given)
+                 wrap' = case purpose of
+                   RuntimeSkolemisation -> wrap <.> mkWpEvLams [given]
+                   AmbiguitySkolemisation -> idHsWrapper
+           ; go subst' wrap' tv_prs (ev_vars ++ [given]) pending body }
+
       | otherwise
-      = return (wrap, tv_prs, ev_vars, substTy subst ty)
+      = return (wrap, tv_prs, ev_vars, substTy subst ty, pending)
         -- substTy is a quick no-op on an empty substitution
 
+{- Note [Ambiguity skolemisation is not runtime abstraction]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An ambiguity check skolemises the expected type, introduces its Givens,
+instantiates the actual type, and solves the resulting constraints. It does
+not construct a value. In particular, a kind annotation can quantify with M
+metadata without introducing an M runtime type lambda.
+
+Keep the full skolemisation and instantiation checks. Omit only the runtime
+U-to-annotation obligations and the unused lambda wrappers. Retain every
+annotation in the skolemised telescope. The ambiguity caller discards the
+identity wrapper marker; it must not use it to wrap an expression.
+
+Runtime callers use RuntimeSkolemisation and still need all U obligations.
+Do not replace analysis with the equal-types subsumption fast path. That
+would also skip the constraints that detect genuine ambiguity.
+-}
+
 skolemiseRequired :: SkolemInfo -> VisArity -> TcSigmaType
-                  -> TcM (VisArity, HsWrapper, [Name], [ForAllTyBinder], [EvVar], TcRhoType)
+                  -> TcM (VisArity, HsWrapper, [Name], [(Matchability,ForAllTyBinder)], [EvVar], TcRhoType, Bag Implication)
 -- Skolemise up to N required (visible) binders,
 --    plus any invisible ones "in the way",
 --    /and/ any trailing invisible ones.
 -- So the result has no top-level invisible quantifiers.
 -- Return the depleted arity.
 skolemiseRequired skolem_info n_req sigma
-  = go n_req init_subst idHsWrapper [] [] [] sigma
+  = go n_req init_subst idHsWrapper [] [] [] emptyBag sigma
   where
     init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType sigma))
 
     -- Why recursive?  See Note [Skolemisation en-bloc]
-    go n_req subst wrap acc_nms acc_bndrs ev_vars ty
+    go n_req subst wrap acc_nms acc_bndrs ev_vars pending ty
       | (n_req', bndrs, inner_ty) <- tcSplitForAllTyVarsReqTVBindersN n_req ty
       , not (null bndrs)
       = do { (subst', bndrs1) <- tcInstSkolTyVarBndrsX skolem_info subst bndrs
-           ; let tvs1 = binderVars bndrs1
-                 -- fix_up_vis: see Note [Required foralls in Core]
-                 --             in GHC.Core.TyCo.Rep
-                 fix_up_vis | n_req == n_req'
-                            = idHsWrapper
-                            | otherwise
-                            = mkWpForAllCast bndrs1 (substTy subst' inner_ty)
+           ; (forall_wrap, prefix_implics) <- tcRuntimeForAllBndrs skolem_info
+               (map (binderVar . snd) acc_bndrs) ev_vars
+               bndrs1 (substTy subst' inner_ty)
            ; go n_req' subst'
-                (wrap <.> fix_up_vis <.> mkWpTyLams tvs1)
-                (acc_nms   ++ map (tyVarName . binderVar) bndrs)
+                (wrap <.> forall_wrap)
+                (acc_nms   ++ map (tyVarName . binderVar . snd) bndrs)
                 (acc_bndrs ++ bndrs1)
                 ev_vars
+                (pending `unionBags` prefix_implics)
                 inner_ty }
 
       | (theta, inner_ty) <- tcSplitPhiTy ty
@@ -264,10 +328,11 @@ skolemiseRequired skolem_info n_req sigma
                 acc_nms
                 acc_bndrs
                 (ev_vars ++ ev_vars1)
+                pending
                 inner_ty }
 
       | otherwise
-      = return (n_req, wrap, acc_nms, acc_bndrs, ev_vars, substTy subst ty)
+      = return (n_req, wrap, acc_nms, acc_bndrs, ev_vars, substTy subst ty, pending)
         -- substTy is a quick no-op on an empty substitution
 
 topInstantiate :: CtOrigin -> TcSigmaType -> TcM (HsWrapper, TcRhoType)
@@ -280,7 +345,7 @@ topInstantiate orig sigma
   | (tvs,   phi_ty)  <- tcSplitSomeForAllTyVars isInvisibleForAllTyFlag sigma
   , (theta, body_ty) <- tcSplitPhiTy phi_ty
   , not (null tvs && null theta)
-  = do { (subst, inst_tvs) <- newMetaTyVarsX empty_subst tvs
+  = do { (subst, inst_tvs) <- newMetaTyVarsX empty_subst (map snd tvs)
            -- No need to worry about concrete tyvars here (c.f. instantiateSigmaQL)
            -- See Note [Representation-polymorphism checking built-ins]
            -- in GHC.Tc.Utils.Concrete.
@@ -354,6 +419,114 @@ So we simply check for this case and make the right boxing of evidence.
 -}
 
 ----------------
+-- | Instantiate a leading retained TypeRep binder when an ordinary argument
+-- follows or the expected result calls for instantiation.
+-- See Note [Instantiating a retained Type witness].
+tcInstInvisibleTypeWitness :: CtOrigin -> Maybe TcType -> TcType
+                           -> TcM (Maybe (HsWrapper, TcRhoType))
+tcInstInvisibleTypeWitness orig expected actual
+  | DepFunTy DepFunInvisible binder body <- coreFullView actual
+  , Just (tc, tys@[_, _]) <- splitTyConApp_maybe (varType binder)
+  , isVacuousRetainedBinder binder body
+  = do { instantiate <- maybe (pure True) wants_witness expected
+       ; if instantiate then supply_witness tc tys body else pure Nothing }
+  | DepFunTy DepFunInvisible binder body <- coreFullView actual
+  , not (isVacuousRetainedBinder binder body)
+  , Just exp_ty <- expected
+  = supply_from_expected binder body exp_ty
+  | otherwise = pure Nothing
+  where
+    supply_witness tc tys body
+      = do { selector <- tcLookupKnownOccId typeRepIdOcc
+           ; let (theta, rep) = tcSplitPhiTy (piResultTys (varType selector) tys)
+           ; case splitTyConApp_maybe rep of
+               Just (rep_tc, _) | tc == rep_tc ->
+                 do { wanteds <- mapM (emitWantedEvVar orig) theta
+                    ; let witness = Core.mkApps (Core.mkTyApps (Core.Var selector) tys)
+                                                (map Core.Var wanteds)
+                    ; return (Just (mkWpEvApps [EvExpr witness], body)) }
+               _ -> return Nothing }
+
+    supply_from_expected binder body exp_ty0 = do
+      exp_ty <- liftZonkM (zonkTcType exp_ty0)
+      b_dom  <- liftZonkM (zonkTcType (varType binder))
+      b_mult <- liftZonkM (zonkTcType (idMult binder))
+      nm     <- newSysName (mkTyVarOcc "invis_retained")
+      let tmpl     = mkTyVar nm b_dom
+          abs_body = replaceTermVarInType binder (mkTyVarTy tmpl) body
+          bind v _
+            | v == tmpl = BindMe
+            | isTcTyVar v && isMetaTyVar v = BindMe
+            | otherwise = DontBindMe
+      case tcMatchTyX_BM bind emptySubst abs_body exp_ty of
+        Just subst
+          | Just idx <- lookupTyVar subst tmpl
+          , not (tmpl `elemVarSet` tyCoVarsOfType idx)
+          , typeKind idx `tcEqType` b_dom -> do
+              mb_op <- recover_operand idx
+              case mb_op of
+                Just (operand, record_use)
+                  | Just rec_idx <- Core.exprToNativeIndex operand
+                  , rec_idx `tcEqType` idx -> do
+                      tcScalingUsage b_mult record_use
+                      return (Just (mkWpEvApps [EvExpr operand],
+                                    applyTypeToArgs actual [operand]))
+                _ -> return Nothing
+        _ -> return Nothing
+
+    recover_operand (TermVarTy occ) = do
+      thing <- tcLookupLcl_maybe (getName occ)
+      case thing of
+        Just (ATcId { tct_id = actual_id }) -> do
+          actual_id' <- liftZonkM (zonkId actual_id)
+          if actual_id' == occ
+             && isNativeOpaqueValueId actual_id'
+             && varType actual_id' `tcEqType` varType occ
+            then return (Just (Core.Var actual_id',
+                               tcEmitBindingUsage (singleUsageUE actual_id')))
+            else return Nothing
+        _ -> return Nothing
+    recover_operand ty
+      | Just (tc, args) <- splitTyConApp_maybe ty
+      , Just dc <- isPromotedDataCon_maybe tc
+      , isVanillaDataCon dc
+      , null (dataConRepArgBinders dc)
+      , let n_univ = length (dataConUnivTyVars dc)
+      , args `lengthAtLeast` n_univ
+      = do { let (univ_tys, field_tys) = splitAt n_univ args
+           ; mb_fields <- traverse recover_operand field_tys
+           ; case sequence mb_fields of
+               Just fields ->
+                 let (ops, uses) = unzip fields
+                     app = Core.mkApps (Core.mkTyApps (Core.Var (dataConWorkId dc)) univ_tys) ops
+                 in return (Just (app, sequence_ uses))
+               Nothing -> return Nothing }
+      | otherwise = return Nothing
+
+    wants_witness ty = case coreFullView tau of
+      DepFunTy DepFunInvisible _ _ -> pure False
+      TyVarTy tv | isMetaTyVar tv ->
+        isFilledMetaTyVar_maybe tv >>= maybe (pure False) wants_witness
+      _ -> pure True
+      where (_, _, tau) = tcSplitSigmaTy ty
+
+{- Note [Instantiating a retained Type witness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An invisible retained Type binder elaborates to an erased type variable
+and a following runtime TypeRep argument. The result can refer to the type
+variable. It does not refer to the value of the witness.
+
+A following value argument requests instantiation. Subsumption can also
+request it when a known expected type has no invisible retained binder.
+Leave the binder intact when the expected type retains it or has no known
+shape. The witness comes from an ordinary Typeable wanted. The result or
+later arguments can determine its type. During subsumption the wanted is
+emitted inside the expected type's skolem scope, where its Typeable givens
+are available. See Note [Vacuous retained applications] in GHC.Core.Utils.
+-}
+
+----------------
+
 instCall :: CtOrigin -> [TcType] -> TcThetaType -> TcM HsWrapper
 -- Instantiate the constraints of a call
 --      (instCall o tys theta)
@@ -374,10 +547,38 @@ instCallConstraints orig preds
   | null preds
   = return idHsWrapper
   | otherwise
-  = do { evs <- mapM (emitWanted orig) preds
+  = do { evs <- mapM inst_pred preds
                 -- See Note [Possible fast path for equality constraints]
        ; traceTc "instCallConstraints" (ppr evs)
        ; return (mkWpEvApps evs) }
+  where
+    -- See Note [Reflexive retained equality evidence].
+    inst_pred pred
+      | Just (cls, [kind, lhs@(TermVarTy v1), TermVarTy v2])
+          <- getClassPredTys_maybe pred
+      , cls == eqClass
+      , tcEqType kind boolTy
+      , isBoolIndexId v1, isBoolIndexId v2
+      , v1 == v2
+      = return (evDictApp cls [kind, lhs, TermVarTy v2]
+                  [Coercion (mkNomReflCo lhs)])
+      | otherwise
+      = emitWanted orig pred
+
+{- Note [Reflexive retained equality evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For the restricted retained Boolean source fragment, instantiate (b ~ b)
+with direct boxed reflexivity evidence. A runtime binder does not establish
+an ordinary type-variable implication. A Wanted dictionary can therefore
+receive an evidence binding outside that runtime binder. Its type would then
+contain an out-of-scope index.
+
+Use the same dictionary constructor as solveEqualityDict. Keep the expression
+in WpEvApp at the call site, within the runtime binder's scope. Check both
+Boolean Ids and their identity. This rule does not unify indices, introduce
+bindings, or solve other native constraints; see GHC Proposal #378 (§4.7) and
+Serrano et al. (ICFP 2020). Ordinary constraint instantiation is unchanged.
+-}
 
 {- Note [Possible fast path for equality constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -420,7 +621,8 @@ instDFunType dfun_id dfun_inst_tys
        ; return (inst_tys, substTheta subst dfun_theta) }
   where
     dfun_ty = idType dfun_id
-    (dfun_tvs, dfun_theta, _) = tcSplitSigmaTy dfun_ty
+    (dfun_bndrs, dfun_theta, _) = tcSplitSigmaTy dfun_ty
+    dfun_tvs = map snd dfun_bndrs
     empty_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType dfun_ty))
                   -- With quantified constraints, the
                   -- type of a dfun may not be closed
@@ -456,9 +658,9 @@ instStupidTheta orig theta
 -- | Given ty::forall k1 k2. k, instantiate all the invisible forall-binders
 --   returning ty @kk1 @kk2 :: k[kk1/k1, kk2/k1]
 -- Called only to instantiate kinds, in user-written type signatures
-tcInstInvisibleTyBinders :: TcType -> TcKind -> TcM (TcType, TcKind)
-tcInstInvisibleTyBinders ty kind
-  = do { (extra_args, kind') <- tcInstInvisibleTyBindersN n_invis kind
+tcInstInvisibleTyBinders :: Maybe TypeOrKind -> TcType -> TcKind -> TcM (TcType, TcKind)
+tcInstInvisibleTyBinders mode ty kind
+  = do { (extra_args, kind') <- tcInstInvisibleTyBindersN mode n_invis kind
        ; return (mkAppTys ty extra_args, kind') }
   where
     n_invis = invisibleBndrCount kind
@@ -467,29 +669,38 @@ tcInstInvisibleTyBinders ty kind
        -- is big enough! Does not matter if it is too big.
        -- 10,000 would do equally well :-)
 
-tcInstInvisibleTyBindersN :: Int -> TcKind -> TcM ([TcType], TcKind)
+tcInstInvisibleTyBindersN :: Maybe TypeOrKind -> Int -> TcKind -> TcM ([TcType], TcKind)
 -- Called only to instantiate kinds, in user-written type signatures
-tcInstInvisibleTyBindersN 0 kind
+tcInstInvisibleTyBindersN _ 0 kind
   = return ([], kind)
-tcInstInvisibleTyBindersN n ty
+tcInstInvisibleTyBindersN mode n ty
   = go n empty_subst ty
   where
     empty_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     go n subst kind
       | n > 0
-      , Just (bndr, body) <- tcSplitForAllTyVarBinder_maybe kind
+      , Just (_ma, bndr, body) <- tcSplitForAllTyVarBinder_maybe kind
       , isInvisibleForAllTyFlag (binderFlag bndr)
-      = do { (subst', arg) <- tcInstInvisibleTyBinder subst (binderVar bndr)
+      = do { (subst', arg) <- tcInstInvisibleTyBinder mode subst (binderVar bndr)
            ; (args, inner_ty) <- go (n-1) subst' body
            ; return (arg:args, inner_ty) }
       | otherwise
       = return ([], substTy subst kind)
 
-tcInstInvisibleTyBinder :: Subst -> TyVar -> TcM (Subst, TcType)
+tcInstInvisibleTyBinder :: Maybe TypeOrKind -> Subst -> TyVar -> TcM (Subst, TcType)
 -- Called only to instantiate kinds, in user-written type signatures
 
-tcInstInvisibleTyBinder subst tv
+tcInstInvisibleTyBinder mode subst tv
+  -- See Note [Implicit ordinary-arrow matchability] in GHC.Tc.Gen.HsType.
+  -- Nothing defers the default for a checked declaration kind.
+  | tcEqType (substTy subst (tyVarKind tv)) matchabilityTy
+  , Just tyki <- mode
+  = let ma = case tyki of
+               TypeLevel -> unmatchableDataConTy
+               KindLevel -> matchableDataConTy
+    in return (extendTvSubstAndInScope subst tv ma, ma)
+  | otherwise
   = do { (subst', tv') <- newMetaTyVarX subst tv
        ; return (subst', mkTyVarTy tv') }
 
@@ -510,14 +721,16 @@ tcInstType inst_tyvars id
   = return ([], theta, tau)
   | otherwise
   = do { (subst, tyvars') <- inst_tyvars tyvars
+       -- See Note [Source and target substitution scopes] in GHC.Core.TyCo.Subst.
        ; let tv_prs  = map tyVarName tyvars `zip` tyvars'
-             subst'  = extendSubstInScopeSet subst (tyCoVarsOfType rho)
+             subst'  = extendSubstInScopeSetFromSource subst (tyCoVarsOfType (idType id))
        ; return (tv_prs, substTheta subst' theta, substTy subst' tau) }
   where
-    (tyvars, rho) = tcSplitForAllInvisTyVars (idType id)
+    (ma_tyvars, rho) = tcSplitForAllInvisTyVars (idType id)
+    tyvars = map snd ma_tyvars
     (theta, tau)  = tcSplitPhiTy rho
 
-tcInstTypeBndrs :: Type -> TcM ([(Name, InvisTVBinder)], TcThetaType, TcType)
+tcInstTypeBndrs :: Type -> TcM ([(Name, (Matchability, InvisTVBinder))], TcThetaType, TcType)
                      -- (type vars, preds (incl equalities), rho)
 -- Instantiate the binders of a type signature with TyVarTvs
 tcInstTypeBndrs poly_ty
@@ -526,18 +739,20 @@ tcInstTypeBndrs poly_ty
   = return ([], theta, tau)
   | otherwise
   = do { (subst, tyvars') <- mapAccumLM inst_invis_bndr emptySubst tyvars
-       ; let tv_prs  = map (tyVarName . binderVar) tyvars `zip` tyvars'
-             subst'  = extendSubstInScopeSet subst (tyCoVarsOfType rho)
+       -- See Note [Source and target substitution scopes] in GHC.Core.TyCo.Subst.
+       ; let tv_prs  = map (tyVarName . binderVar . snd) tyvars `zip` tyvars'
+             subst'  = extendSubstInScopeSetFromSource subst (tyCoVarsOfType poly_ty)
        ; return (tv_prs, substTheta subst' theta, substTy subst' tau) }
   where
     (tyvars, rho) = tcSplitForAllInvisTVBinders poly_ty
     (theta, tau)  = tcSplitPhiTy rho
 
-    inst_invis_bndr :: Subst -> InvisTVBinder
-                    -> TcM (Subst, InvisTVBinder)
-    inst_invis_bndr subst (Bndr tv spec)
-      = do { (subst', tv') <- newMetaTyVarTyVarX subst tv
-           ; return (subst', Bndr tv' spec) }
+    inst_invis_bndr :: Subst -> (Matchability, InvisTVBinder)
+                    -> TcM (Subst, (Matchability, InvisTVBinder))
+    inst_invis_bndr subst (ma, Bndr tv spec)
+      = do { let ma' = substTy subst ma
+           ; (subst', tv') <- newMetaTyVarTyVarX subst tv
+           ; return (subst', (ma', Bndr tv' spec)) }
 
 --------------------------
 tcSkolDFunType :: Type -> TcM (SkolemInfoAnon, [TcTyVar], TcThetaType, Class, [TcType])
@@ -549,7 +764,7 @@ tcSkolDFunType dfun_ty
          -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
          --           in GHC.Tc.Utils.TcType
        ; rec { skol_info <- mkSkolemInfo skol_info_anon
-             ; (subst, inst_tvs) <- tcInstSuperSkolTyVars skol_info tvs
+             ; (subst, inst_tvs) <- tcInstSuperSkolTyVars skol_info (map snd tvs)
                      -- We instantiate the dfun_tyd with superSkolems.
                      -- See Note [Subtle interaction of recursion and overlap]
                      -- and Note [Super skolems: binding when looking up instances]
@@ -589,12 +804,65 @@ tcInstSkolTyVarsX :: SkolemInfo -> Subst -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- See Note [Skolemising type variables]
 tcInstSkolTyVarsX skol_info = tcInstSkolTyVarsPushLevel skol_info False
 
-tcInstSkolTyVarBndrsX :: SkolemInfo -> Subst -> [VarBndr TyCoVar vis] -> TcM (Subst, [VarBndr TyCoVar vis])
-tcInstSkolTyVarBndrsX skol_info subs bndrs = do
-  (subst', bndrs') <- tcInstSkolTyVarsX skol_info subs (binderVars bndrs)
-  pure (subst', zipWith mkForAllTyBinder flags bndrs')
+-- | Skolemize a telescope and substitute each annotation before its binder.
+-- See Note [Forall matchability metadata] in GHC.Core.TyCo.Rep.
+tcInstSkolTyVarBndrsX :: SkolemInfo -> Subst
+                     -> [(Matchability, VarBndr TyCoVar vis)]
+                     -> TcM (Subst, [(Matchability, VarBndr TyCoVar vis)])
+tcInstSkolTyVarBndrsX skol_info = mapAccumLM step
   where
-    flags = binderFlags bndrs
+    step subst (ma, Bndr tv vis)
+      = do { let ma' = substTy subst ma
+           ; (subst', tvs') <- tcInstSkolTyVarsX skol_info subst [tv]
+           ; case tvs' of
+               [tv'] -> pure (subst', (ma', Bndr tv' vis))
+               _ -> pprPanic "tcInstSkolTyVarBndrsX" (ppr tvs') }
+
+{- Note [Runtime forall matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A runtime type lambda has U matchability. A source signature can contain
+another annotation. Each introduced binder needs nominal U-to-annotation
+evidence. Its metadata is outside its own scope, so only earlier skolems and
+Given evidence can justify that proof. Later constraints must not justify it.
+
+Build a separate implication for each non-trivial prefix obligation. Put its
+evidence let before the current cast and type lambda. Then extend the prefix
+for the next binder. Keep the body-checking implication separate: its en-bloc
+Givens are valid for the body but can be too late for an outer annotation.
+Invisible foralls need the same checks as required foralls.
+
+SkolemInfo can refer recursively to the final skolem list. Return the prefix
+implications without forcing that information. The caller validates and emits
+them after its recursive skolem-info binding has completed. Do not omit the
+invariant checks or emit these obligations in the body implication.
+-}
+
+-- | Introduce runtime type lambdas with evidence from their lexical prefixes.
+-- Return pending implications for validation after the SkolemInfo knot closes.
+tcRuntimeForAllBndrs :: SkolemInfo -> [TcTyVar] -> [EvVar]
+                    -> [(Matchability, ForAllTyBinder)] -> Type
+                    -> TcM (HsWrapper, Bag Implication)
+tcRuntimeForAllBndrs skol_info = go
+  where
+    go _ _ [] _ = pure (idHsWrapper, emptyBag)
+    go prefix_tvs prefix_given ((ma, bndr@(Bndr tv _)):bndrs) body
+      = do { (level, wanted, ma_co) <- pushLevelAndCaptureConstraints $
+               unifyType Nothing unmatchableDataConTy ma
+           ; (ev_binds, pending) <- if isEmptyWC wanted
+               then pure (emptyTcEvBinds, emptyBag)
+               else do { binds <- newTcEvBinds
+                       ; implic <- newImplication
+                       ; let prefix_implic = implic
+                               { ic_tclvl = level, ic_info = getSkolemInfo skol_info
+                               , ic_skols = prefix_tvs, ic_given = prefix_given
+                               , ic_wanted = wanted, ic_binds = binds }
+                       ; pure (TcEvBinds binds, unitBag prefix_implic) }
+           ; (inner, pending_inner) <- go (prefix_tvs ++ [tv]) prefix_given bndrs body
+           ; let inner_ty = mkForAllTys bndrs body
+           ; pure (mkWpLet ev_binds
+                   <.> mkWpForAllCast [(ma_co, bndr)] inner_ty
+                   <.> mkWpTyLams [tv] <.> inner,
+                   pending `unionBags` pending_inner) }
 
 tcInstSuperSkolTyVars :: SkolemInfo -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- See Note [Skolemising type variables]
@@ -640,7 +908,7 @@ tcSkolemiseInvisibleBndrs skol_info ty
        ; skol_info     <- mkSkolemInfo skol_info
        ; let details = SkolemTv skol_info lvl False
              mk_skol_tv name kind = return (mkTcTyVar name kind details)  -- No freshening
-       ; (subst, tvs') <- instantiateTyVarsX mk_skol_tv emptySubst tvs
+       ; (subst, tvs') <- instantiateTyVarsX mk_skol_tv emptySubst (map snd tvs)
        ; return (tvs', substTy subst body_ty) }
 
 instantiateTyVarsX :: (Name -> Kind -> TcM TcTyVar)

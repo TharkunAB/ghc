@@ -14,6 +14,7 @@ module GHC.Tc.TyCl.Instance
    ( tcInstDecls1
    , tcInstDeclsDeriv
    , tcInstDecls2
+   , checkedSourceMethods, CheckedSourceMethod(..)
    )
 where
 
@@ -46,25 +47,32 @@ import GHC.Tc.Instance.Family
 
 import GHC.Tc.Deriv
 import GHC.Tc.Utils.Env
+import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Types.Evidence
 
-import GHC.Builtin.KnownKeys ( unsatisfiableIdKey )
+import GHC.Builtin.KnownKeys ( numClassKey, unsatisfiableIdKey )
+import GHC.Types.Unique ( hasKey )
+import GHC.Builtin.KnownOccs ( eqClassOpOcc, fromIntegerClassOpOcc, minusClassOpOcc )
+import GHC.Builtin.Modules ( gHC_CLASSES, gHC_INTERNAL_BASE, gHC_INTERNAL_NUM_INTEGER, gHC_INTERNAL_TYPENATS, mkGhcInternalModule )
+import GHC.Builtin.WiredIn.TypeLits ( typeNatSubTyCon )
 
 import GHC.Core        ( Expr(..), mkVarApps )
 import GHC.Core.Make   ( nO_METHOD_BINDING_ERROR_ID )
 import GHC.Core.Unfold.Make ( mkDFunUnfolding )
 import GHC.Core.FamInstEnv
 import GHC.Core.Type
+import GHC.Types.Name.Env (emptyNameEnv)
 import GHC.Core.Multiplicity
 import GHC.Core.InstEnv
-import GHC.Core.Predicate( classMethodInstTy, isCoVarType )
+import GHC.Core.Predicate( classMethodInstTy, getClassPredTys_maybe, isCoVarType )
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
 import GHC.Core.ConLike
 import GHC.Core.Class
+import GHC.Builtin.WiredIn.Types ( integerTy, integerTyConName, matchableDataConTy, naturalTy, unmatchableDataConTy )
 
 import GHC.Types.Var as Var
 import GHC.Types.Var.Env
@@ -77,8 +85,11 @@ import GHC.Types.InlinePragma
 import GHC.Types.SourceFile
 import GHC.Types.SourceText
 import GHC.Types.Name
+import GHC.Types.Name.Reader ( WithUserRdr(..) )
 import GHC.Types.Name.Set
+import GHC.Types.TypeEnv (lookupTypeEnv)
 import GHC.Types.SrcLoc
+import GHC.Unit.Types ( Module )
 
 import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
@@ -97,7 +108,8 @@ import qualified GHC.LanguageExtensions as LangExt
 import Control.Monad
 import Data.Tuple
 import GHC.Data.Maybe
-import Data.List( mapAccumL )
+import Data.List( find, mapAccumL )
+import Data.List.NonEmpty (NonEmpty(..))
 
 
 {-
@@ -400,24 +412,29 @@ Gather up the instance declarations from their various sources
 -}
 
 tcInstDecls1    -- Deal with both source-code and imported instance decls
-   :: [LInstDecl GhcRn]         -- Source code instance decls
+   :: Maybe NameSet             -- Explicit FromNatural targets across all TyClGroups
+   -> [LInstDecl GhcRn]         -- Source code instance decls
    -> TcM (TcGblEnv,            -- The full inst env
            [InstInfo GhcRn],    -- Source-code instance decls to process;
                                 -- contains all dfuns for this module
            [DerivInfo],         -- From data family instances
            ThBindEnv)           -- TH binding levels
 
-tcInstDecls1 inst_decls
+tcInstDecls1 mb_explicit_from_nat inst_decls
   = do {    -- Do class and family instance declarations
        ; stuff <- mapAndRecoverM tcLocalInstDecl inst_decls
 
        ; let (local_infos_s, fam_insts_s, datafam_deriv_infos) = unzip3 stuff
-             fam_insts   = concat fam_insts_s
+             fam_insts0  = concat fam_insts_s
              local_infos = concat local_infos_s
+
+       ; (auto_helpers, auto_fam_insts) <-
+           synthesizeCertifiedFromNatural mb_explicit_from_nat local_infos fam_insts0
+       ; let fam_insts = fam_insts0 ++ auto_fam_insts
 
        ; (gbl_env, th_bndrs) <-
            addClsInsts local_infos $
-           addFamInsts fam_insts
+           addFamInstsWithHelpers auto_helpers fam_insts
 
        ; return ( gbl_env
                 , local_infos
@@ -443,14 +460,14 @@ addClsInsts :: [InstInfo GhcRn] -> TcM a -> TcM a
 addClsInsts infos thing_inside
   = tcExtendLocalInstEnv (map iSpec infos) thing_inside
 
-addFamInsts :: [FamInst] -> TcM (TcGblEnv, ThBindEnv)
+addFamInstsWithHelpers :: [TyCon] -> [FamInst] -> TcM (TcGblEnv, ThBindEnv)
 -- Extend (a) the family instance envt
---        (b) the type envt with stuff from data type decls
-addFamInsts fam_insts
+--        (b) the type envt with stuff from data type decls and helper families
+addFamInstsWithHelpers helper_tycons fam_insts
   = tcExtendLocalFamInstEnv fam_insts $
     tcExtendGlobalEnv axioms $
     do { traceTc "addFamInsts" (pprFamInsts fam_insts)
-       ; (gbl_env, th_bndrs) <- addTyConsToGblEnv data_rep_tycons
+       ; (gbl_env, th_bndrs) <- addTyConsToGblEnv (data_rep_tycons ++ helper_tycons)
                     -- NB: this does not add the data family instance axioms;
                     -- those are added separately above.
        ; return (gbl_env, th_bndrs)
@@ -459,6 +476,153 @@ addFamInsts fam_insts
     axioms = map (ACoAxiom . toBranchedAxiom . famInstAxiom) fam_insts
     data_rep_tycons = famInstsRepTyCons fam_insts
       -- The representation tycons for data family instance declarations.
+
+{- Note [Automatic FromNatural synthesis for certified Num instances]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under DependentTypes (and DependentTypes), a Peano datatype with
+a ground Num instance whose fromInteger method follows the certified 3-guard
+zero/successor definition can interpret type-level numerals directly without
+a separate `type instance FromNatural T n = ...` declaration.
+
+During tcInstDecls1, inspect local ground Num instances before checking value
+signatures. When an instance has the certified Peano fromInteger shape and no
+imported or local FromNatural equation overlaps with `FromNatural T n`,
+synthesize a closed 2-branch helper family `$fromNatural:dfun` together with
+`type instance FromNatural T n = $fromNatural:dfun n`. Modules that already
+declare an explicit FromNatural instance keep their user-written equation
+unchanged.
+-}
+
+-- | Synthesize default FromNatural equations for certified ground Num instances
+-- when no explicit FromNatural equation already covers the target type.
+-- See Note [Automatic FromNatural synthesis for certified Num instances].
+synthesizeCertifiedFromNatural :: Maybe NameSet -> [InstInfo GhcRn] -> [FamInst] -> TcM ([TyCon], [FamInst])
+synthesizeCertifiedFromNatural Nothing _ _ = pure ([], [])
+synthesizeCertifiedFromNatural (Just excluded_targets) local_infos explicit_fams = do
+  experimental <- xoptM LangExt.DependentTypes
+  rebindable   <- xoptM LangExt.RebindableSyntax
+  hs_src       <- tcHscSource
+  case hs_src of
+    HsSrcFile
+      | experimental, not rebindable
+      , candidates@(_ : _) <- mapMaybe (candidate excluded_targets) local_infos -> do
+          from_nat_name <- lookupOrig gHC_INTERNAL_TYPENATS (mkTcOcc "FromNatural")
+          from_nat_tc   <- tcLookupTyCon from_nat_name
+          (eps_env, local_env0) <- tcGetFamInstEnvs
+          let step (helpers, acc_fams) (ispec, target, zero_con, succ_con) = do
+                n_name <- newSysName (mkTyVarOcc "n")
+                let n_tv     = mkTyVar n_name naturalTy
+                    binders  = mkAnonTyConBinders [n_tv]
+                    dfun_id  = instanceDFunId ispec
+                    inst_loc = getSrcSpan dfun_id
+                helper_name    <- newImplicitBinder (getName dfun_id)
+                                    (\occ -> mkTcOcc ("$fromNatural:" ++ occNameString occ))
+                helper_ax_name <- newImplicitBinder helper_name mkInstTyCoOcc
+                let zero_ty  = mkTyConApp (promoteDataCon zero_con) []
+                    pred_ty  = mkTyConApp typeNatSubTyCon [mkTyVarTy n_tv, mkNumLitTy 1]
+                    branch0  = mkCoAxBranch [] [] [] [mkNumLitTy 0] zero_ty [] inst_loc
+                    branch1 fam =
+                      mkCoAxBranch [n_tv] [] [] [mkTyVarTy n_tv]
+                        (mkTyConApp (promoteDataCon succ_con) [mkTyConApp fam [pred_ty]])
+                        [Nominal] inst_loc
+                    helper_kind = mkTyConKindWithMatchability unmatchableDataConTy binders target
+                    helper_tc   = mkFamilyTyCon helper_name helper_kind binders 0 target Nothing
+                                    (ClosedTypeFamilyTyCon (CTF (Just helper_ax))) Nothing NotInjective
+                    helper_ax   = mkBranchedCoAxiom Nominal helper_ax_name helper_tc
+                                    [branch0, branch1 helper_tc]
+                ax_name <- newFamInstAxiomName (L (noAnnSrcSpan inst_loc) from_nat_name)
+                             [[target, mkTyVarTy n_tv]]
+                let single_ax = mkSingleCoAxiom Nominal ax_name [n_tv] [] [] from_nat_tc
+                                  [target, mkTyVarTy n_tv] (mkTyConApp helper_tc [mkTyVarTy n_tv])
+                (subst, tvs') <- freshenTyVarBndrs [n_tv]
+                let lhs'     = substTys subst [target, mkTyVarTy n_tv]
+                    rhs'     = substTy  subst (mkTyConApp helper_tc [mkTyVarTy n_tv])
+                    fam_inst = mkLocalFamInst SynFamilyInst single_ax tvs' [] lhs' rhs'
+                    combined = (eps_env, extendFamInstEnvList local_env0 (explicit_fams ++ acc_fams))
+                if null (lookupFamInstEnvConflicts combined fam_inst)
+                  then pure (helpers ++ [helper_tc], acc_fams ++ [fam_inst])
+                  else pure (helpers, acc_fams)
+          foldM step ([], []) candidates
+    _ -> pure ([], [])
+  where
+    num_module = mkGhcInternalModule (fsLit "GHC.Internal.Num")
+
+    candidate :: NameSet -> InstInfo GhcRn -> Maybe (ClsInst, Type, DataCon, DataCon)
+    candidate excluded InstInfo{iSpec = ispec, iBinds = InstBindings{ib_binds = binds, ib_derived = False}} = do
+      (cls, [target]) <- getClassPredTys_maybe (idType (instanceDFunId ispec))
+      guard (cls `hasKey` numClassKey && noFreeVarsOfType target)
+      (tc, []) <- splitTyConApp_maybe target
+      guard (not (tyConName tc `elemNameSet` excluded))
+      guard (isNativeIndexType target && not (isGadtSyntaxTyCon tc))
+      sel_id <- find (\m -> getOccName m == fromIntegerClassOpOcc
+                         && nameModule_maybe (idName m) == Just num_module)
+                     (classMethods cls)
+      (zero_con, succ_con) <- renamedSourceLiteralCons (idName sel_id) tc binds
+      pure (ispec, target, zero_con, succ_con)
+    candidate _ _ = Nothing
+
+    renamedSourceLiteralCons :: Name -> TyCon -> LHsBinds GhcRn -> Maybe (DataCon, DataCon)
+    renamedSourceLiteralCons sel_name tc binds = do
+      [c1, c2] <- pure (tyConDataCons tc)
+      (L _ FunBind{fun_matches = MG{mg_alts = L _ [L _ match]}}, _, _)
+        <- findMethodBind sel_name binds emptyPragEnv
+      Match{m_pats = L _ [pat],
+            m_grhss = GRHSs _ (negative :| [zero_grhs, positive]) (L _ EmptyLocalBinds{})} <- pure match
+      n <- var_pat pat
+      (lt_test, _)      <- guarded negative
+      (eq_test, z_rhs)  <- guarded zero_grhs
+      (pos_test, s_rhs) <- guarded positive
+      guard (binary_rn n gHC_CLASSES (mkVarOcc "<") 0 lt_test)
+      guard (binary_rn n gHC_CLASSES eqClassOpOcc 0 eq_test)
+      oth <- var_expr pos_test
+      guard (getOccName oth == mkVarOcc "otherwise" && nameModule_maybe oth == Just gHC_INTERNAL_BASE)
+      z_name <- var_expr z_rhs
+      HsApp _ succ_e rec_e <- pure (strip_parens s_rhs)
+      s_name <- var_expr succ_e
+      HsApp _ conv_e sub_e <- pure (strip_parens rec_e)
+      conv <- var_expr conv_e
+      guard (conv == sel_name)
+      guard (binary_rn n num_module minusClassOpOcc 1 sub_e)
+      let (zero_con, succ_con) = if z_name == dataConName c1 then (c1, c2) else (c2, c1)
+      guard (z_name == dataConName zero_con && s_name == dataConName succ_con)
+      guard (null (dataConOrigArgTys zero_con))
+      [Scaled _ field] <- pure (dataConOrigArgTys succ_con)
+      [HsLazy] <- pure (dataConImplBangs succ_con)
+      (field_tc, []) <- splitTyConApp_maybe field
+      guard (field_tc == tc)
+      pure (zero_con, succ_con)
+
+    var_pat :: LPat GhcRn -> Maybe Name
+    var_pat (L _ (ParPat _ p)) = var_pat p
+    var_pat (L _ (VarPat _ (L _ n))) = Just n
+    var_pat _ = Nothing
+
+    guarded :: LGRHS GhcRn (LHsExpr GhcRn) -> Maybe (LHsExpr GhcRn, LHsExpr GhcRn)
+    guarded (L _ (GRHS _ [L _ (BodyStmt _ test _ _)] rhs)) = Just (test, rhs)
+    guarded _ = Nothing
+
+    strip_parens :: LHsExpr GhcRn -> HsExpr GhcRn
+    strip_parens (L _ (HsPar _ e)) = strip_parens e
+    strip_parens (L _ e) = e
+
+    var_expr :: LHsExpr GhcRn -> Maybe Name
+    var_expr e
+      | HsVar _ (L _ (WithUserRdr _ name)) <- strip_parens e = Just name
+      | otherwise = Nothing
+
+    binary_rn :: Name -> Module -> OccName -> Integer -> LHsExpr GhcRn -> Bool
+    binary_rn n mod occ k e = isJust $ do
+      (lhs, op_e, arg) <- case strip_parens e of
+        OpApp _ l op r -> Just (l, op, r)
+        HsApp _ l r
+          | HsApp _ op l' <- strip_parens l -> Just (l', op, r)
+        _ -> Nothing
+      x <- var_expr lhs
+      guard (x == n)
+      op <- var_expr op_e
+      guard (getOccName op == occ && nameModule_maybe op == Just mod)
+      HsOverLit _ (OverLit _ (HsIntegral lit)) <- pure (strip_parens arg)
+      guard (not (il_neg lit) && il_value lit == k)
 
 {-
 Note [Deriving inside TH brackets]
@@ -509,17 +673,28 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty
   = setSrcSpanA loc                   $
     addErrCtxt (instDeclCtxt1 hs_ty)  $
     do  { dfun_ty <- tcHsClsInstType (InstDeclCtxt False) hs_ty
-        ; let (tyvars, theta, clas, inst_tys) = tcSplitDFunTy dfun_ty
+        ; let (ma_tyvars, theta, clas, inst_tys) = tcSplitDFunTy dfun_ty
+              tyvars = map snd ma_tyvars
              -- NB: tcHsClsInstType does checkValidInstance
         ; skol_info <- mkSkolemInfo (InstSkol IsClsInst pSizeZero)
                        -- pSizeZero: here the size part of InstSkol is irrelevant
         ; (subst, skol_tvs) <- tcInstSkolTyVars skol_info tyvars
+        ; let (ma_bndrs, rho) = splitForAllForAllTyBinders dfun_ty
+              skol_bndrs = zipWith (\(ma, Bndr _ vis) tv ->
+                               (substTy subst ma, Bndr tv vis)) ma_bndrs skol_tvs
+        -- A new dictionary function has runtime U quantifiers. Check each
+        -- source annotation before introducing its binder or instance Givens.
+        -- See Note [Runtime forall matchability] in GHC.Tc.Utils.Instantiate.
+        ; (_, prefix_implics) <- tcRuntimeForAllBndrs skol_info [] [] skol_bndrs
+                                  (substTy subst rho)
+        ; mapBagM_ checkImplicationInvariants prefix_implics
+        ; emitImplications prefix_implics
         ; let tv_skol_prs = [ (tyVarName tv, skol_tv)
                             | (tv, skol_tv) <- tyvars `zip` skol_tvs ]
               -- Map from the skolemized Names to the original Names.
               -- See Note [Associated data family instances and di_scoped_tvs].
               tv_skol_env = mkVarEnv $ map swap tv_skol_prs
-              n_inferred = countWhile (isInferredForAllTyFlag . binderFlag) $
+              n_inferred = countWhile (isInferredForAllTyFlag . binderFlag . snd) $
                            fst $ splitForAllForAllTyBinders dfun_ty
               visible_skol_tvs = drop n_inferred skol_tvs
 
@@ -741,7 +916,7 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
              post_eta_qtvs = filterOut (`elem` eta_tvs) qtvs
 
              full_tcbs = mkTyConBindersPreferAnon post_eta_qtvs
-                            (tyCoVarsOfType (mkSpecForAllTys eta_tvs tc_res_kind))
+                            (tyCoVarsOfType (mkSpecForAllTys [(matchableDataConTy,tv) | tv <- eta_tvs] tc_res_kind))
                          ++ eta_tcbs
                  -- Put the eta-removed tyvars at the end
                  -- Remember, qtvs is in arbitrary order, except kind vars are
@@ -953,11 +1128,11 @@ tcDataFamInstHeader mb_clsinfo skol_info fam_tc hs_outer_bndrs fixity
   = do { traceTc "tcDataFamInstHeader {" (ppr fam_tc <+> ppr hs_pats)
        ; (tclvl, wanted, (outer_bndrs, (stupid_theta, lhs_ty, master_res_kind, instance_res_kind)))
             <- pushLevelAndSolveEqualitiesX "tcDataFamInstHeader" $
-               bindOuterFamEqnTKBndrs skol_info hs_outer_bndrs    $  -- Binds skolem TcTyVars
+               bindOuterFamEqnTKBndrs skol_info emptyNameEnv hs_outer_bndrs $  -- Binds skolem TcTyVars
                do { stupid_theta <- tcHsContext hs_ctxt
                   ; (lhs_ty, lhs_kind) <- tcFamTyPats fam_tc hs_pats
                   ; (lhs_applied_ty, lhs_applied_kind)
-                      <- tcInstInvisibleTyBinders lhs_ty lhs_kind
+                      <- tcInstInvisibleTyBinders (Just TypeLevel) lhs_ty lhs_kind
                       -- See Note [Data family/instance return kinds]
                       -- in GHC.Tc.TyCl point (DF3)
 
@@ -1323,6 +1498,244 @@ So right here in tcInstDecls2 we must re-extend the type envt with
 the default method Ids replete with their INLINE pragmas.  Urk.
 -}
 
+-- | The checked RHS of an instance method. A literal conversion also records
+-- the operations it uses and the head of any known first type argument.
+data CheckedSourceMethod
+  = SourceMethodAlias Id
+  | SourceLiteralMethod DataCon DataCon [(Id, Maybe Name)]
+
+-- | Find ground dictionaries whose checked method fields have known equations.
+-- Each result records the class selector, the instance method and its equations.
+-- See Note [Certifying a source method alias].
+checkedSourceMethods :: (Id -> Bool) -> TcGblEnv -> [(DFunId, [(Id, Id, CheckedSourceMethod)])]
+checkedSourceMethods wanted env = mapMaybe dictionary binds
+  where
+    binds = map unLoc (tcg_binds env)
+    instances = mkVarSet (map instanceDFunId (tcg_insts env))
+    bodies = mkVarEnv (mapMaybe method_body binds)
+    top_evidence = mkVarEnv [(eb_lhs b, eb_rhs b) | b <- bagToList (tcg_ev_binds env)]
+
+    dictionary binding = do
+      (dfun, local, _, VarBind{var_id = bound, var_rhs = L _ rhs}) <- abstraction isDFunId binding
+      guard (dfun `elemVarSet` instances && local == bound)
+      (cls, [inst_ty]) <- getClassPredTys_maybe (idType dfun)
+      guard (noFreeVarsOfType inst_ty && isTyFamFree inst_ty)
+      (con, con_ty, fields) <- dictionary_args [] rhs
+      let selectors = classAllSelIds cls
+      guard (con == tyConSingleDataCon (classTyCon cls) && con_ty `eqType` inst_ty
+             && selectors `equalLength` fields && all lazy_id fields)
+      let methods = [(sel, meth, body) | (sel, meth) <- zip selectors fields
+                    , sel `elem` classMethods cls, wanted sel
+                    , InstMethId owner <- [idDetails meth], owner == idName dfun
+                    , idType meth `eqType` classMethodInstTy sel [inst_ty]
+                    , let cur_meth = case lookupTypeEnv (tcg_type_env env) (idName meth) of
+                            Just (AnId actual) -> actual
+                            _                  -> meth
+                    , Just body <- [case lookupVarEnv bodies meth of
+                        Just (tvs, evs, match) ->
+                          case checked_alias meth tvs match of
+                            Just target -> Just (SourceMethodAlias target)
+                            Nothing
+                              | null tvs, isJust (sourceTableId_maybe cur_meth) ->
+                                  Just (SourceMethodAlias cur_meth)
+                              | otherwise ->
+                                  guard (null tvs) >> checkedSourceLiteral dfun sel inst_ty top_evidence evs match
+                        Nothing
+                          | isJust (sourceTableId_maybe cur_meth) ->
+                              Just (SourceMethodAlias cur_meth)
+                          | otherwise -> Nothing]]
+      guard (not (null methods))
+      pure (dfun, methods)
+
+    dictionary_args :: [Id] -> HsExpr GhcTc -> Maybe (DataCon, Type, [Id])
+    dictionary_args fields (HsApp _ f (L _ (HsVar _ (L _ v)))) =
+      dictionary_args (v : fields) (unLoc f)
+    dictionary_args fields (XExpr (WrapExpr (WpTyApp ty) (XExpr (ConLikeTc (RealDataCon con))))) =
+      Just (con, ty, fields)
+    dictionary_args _ _ = Nothing
+
+    checked_alias meth tvs match = do
+      Match{m_pats = L _ [], m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| [])
+                                                 (L _ EmptyLocalBinds{})} <- pure match
+      let (apps, head_expr) = case unLoc (stripParensLHsExpr rhs) of
+            XExpr (WrapExpr wrap expr) -> (wrap, expr)
+            expr                       -> (WpHole, expr)
+      HsVar _ (L _ value) <- pure head_expr
+      applied <- type_args apps []
+      guard (applied == tvs)
+      guard (isExternalName (idName value) && idType meth `eqType` idType value)
+      target <- if nameIsLocalOrFrom (tcg_semantic_mod env) (idName value)
+                then case lookupTypeEnv (tcg_type_env env) (idName value) of
+                       Just (AnId actual) | actual == value -> Just actual
+                       _ -> Nothing
+                else Just value
+      guard (isJust (sourceTableId_maybe target))
+      pure target
+
+    -- In w1[w2[e]], applications in w2 are closest to the worker.
+    type_args (WpCompose w1 w2) acc = type_args w1 acc >>= type_args w2
+    type_args (WpTyApp ty) acc = (:acc) <$> getTyVar_maybe ty
+    type_args WpHole acc = Just acc
+    type_args _ _ = Nothing
+
+    method_body binding = do
+      (meth, local, outer_evs, inner) <- abstraction is_method binding
+      (_, mono, inner_evs, FunBind{fun_id = L _ bound, fun_ext = (wrapper, []),
+                           fun_matches = MG{mg_ext = MatchGroupTc{mg_origin = FromSource},
+                                            mg_alts = L _ [L _ match]}}) <- abstraction (== local) inner
+      let (tvs, rest) = collectHsWrapBinders wrapper
+      guard (mono == bound && all isTyVar tvs && isIdHsWrapper rest)
+      pure (meth, (tvs, inner_evs ++ outer_evs, match))
+
+    is_method v = case idDetails v of { InstMethId{} -> True; _ -> False }
+
+    abstraction :: (Id -> Bool) -> HsBind GhcTc -> Maybe (Id, Id, [TcEvBinds], HsBind GhcTc)
+    abstraction wanted (XHsBindsLR AbsBinds{abs_tvs = [], abs_ev_vars = [], abs_sig = True,
+                  abs_exports = [ABE{abe_poly = poly, abe_mono = mono, abe_wrap = WpHole,
+                                     abe_prags = SpecPrags []}],
+                  abs_ev_binds = evs, abs_binds = [L _ inner]})
+      | wanted poly, idType poly `eqType` idType mono, all lazy_evidence evs = Just (poly, mono, evs, inner)
+    abstraction _ _ = Nothing
+
+    lazy_id v = isCoVar v || typeLevity_maybe (idType v) == Just Lifted
+    lazy_evidence (EvBinds bs) = allBag (lazy_id . eb_lhs) bs
+    lazy_evidence (TcEvBinds {}) = False
+
+-- | Check the selected fromInteger method on nonnegative Integer inputs.
+-- See Note [Certifying a source literal conversion].
+checkedSourceLiteral :: DFunId -> Id -> Type -> VarEnv EvTerm -> [TcEvBinds]
+                     -> Match GhcTc (LHsExpr GhcTc) -> Maybe CheckedSourceMethod
+checkedSourceLiteral dfun selector target top_evidence evs match = do
+    guard (in_module num_module fromIntegerClassOpOcc selector)
+    Match{m_pats = L _ [L _ (VarPat _ (L _ n))],
+          m_grhss = GRHSs _ (negative :| [zero, positive]) (L _ EmptyLocalBinds{})} <- pure match
+    guard (idType n `eqType` integerTy)
+    (lt, _) <- guarded negative
+    (eq, zero_expr) <- guarded zero
+    (yes, step_expr) <- guarded positive
+    lt_ops <- binary n gHC_CLASSES (mkVarOcc "<") 0 lt
+    eq_ops <- binary n gHC_CLASSES eqClassOpOcc 0 eq
+    HsVar _ (L _ otherwise_id) <- pure (expression yes)
+    guard (in_module gHC_INTERNAL_BASE (mkVarOcc "otherwise") otherwise_id)
+    XExpr (ConLikeTc (RealDataCon z)) <- pure (expression zero_expr)
+    HsApp _ successor rec <- pure (expression step_expr)
+    XExpr (ConLikeTc (RealDataCon s)) <- pure (expression successor)
+    HsApp _ convert arg <- pure (expression rec)
+    (op, actual) <- selection target (expression convert)
+    guard (op == selector && actual == dfun)
+    sub_ops <- binary n num_module minusClassOpOcc 1 arg
+    pure (SourceLiteralMethod z s ((otherwise_id, Nothing) : lt_ops ++ eq_ops ++ sub_ops))
+  where
+    num_module = mkGhcInternalModule (fsLit "GHC.Internal.Num")
+    in_module mod occ v = getOccName v == occ && nameModule_maybe (idName v) == Just mod
+
+    guarded (L _ (GRHS _ [L _ (BodyStmt _ test NoSyntaxExprTc NoSyntaxExprTc)] rhs)) =
+      Just (test, rhs)
+    guarded _ = Nothing
+
+    expression :: LHsExpr GhcTc -> HsExpr GhcTc
+    expression (L _ (HsPar _ e)) = expression e
+    expression (L _ (XExpr (ExpandedThingTc (HSE _ e)))) = expression e
+    expression (L _ e) = e
+
+    evidence = extendVarEnvList top_evidence
+      [(eb_lhs b, eb_rhs b) | EvBinds bs <- evs, b <- bagToList bs]
+    -- Follow only variables. A cast, an application or a cyclic binding
+    -- supplies no certificate for the selected runtime dictionary.
+    resolve visited d
+      | isDFunId d = Just d
+      | d `elemVarSet` visited = Nothing
+      | Just (EvExpr (Var next)) <- lookupVarEnv evidence d =
+          resolve (extendVarSet visited d) next
+      | otherwise = Nothing
+
+    selection ty (XExpr (WrapExpr (WpCompose (WpEvApp (EvExpr (Var ev))) (WpTyApp arg))
+                                  (HsVar _ (L _ op)))) = do
+      guard (arg `eqType` ty)
+      dict <- resolve emptyVarSet ev
+      cls <- isClassOpId_maybe op
+      (actual_cls, [actual_ty]) <- getClassPredTys_maybe (idType dict)
+      guard (actual_cls == cls && actual_ty `eqType` ty)
+      pure (op, dict)
+    selection _ _ = Nothing
+
+    integer_op mod occ e = do
+      (op, dict) <- selection integerTy e
+      guard (in_module mod occ op)
+      let dict_mod | mod == num_module = num_module
+                   | otherwise = gHC_INTERNAL_NUM_INTEGER
+      guard (nameModule_maybe (idName dict) == Just dict_mod)
+      pure [(op, Just integerTyConName), (dict, Nothing)]
+
+    binary n mod occ k e = do
+      HsApp _ lhs arg <- pure (expression e)
+      HsApp _ fun var <- pure (expression lhs)
+      HsVar _ (L _ x) <- pure (expression var)
+      guard (x == n)
+      ops <- integer_op mod occ (expression fun)
+      HsOverLit _ (OverLit (OverLitTc False witness lit_ty) (HsIntegral lit)) <- pure (expression arg)
+      guard (not (il_neg lit) && il_value lit == k && lit_ty `eqType` integerTy)
+      case witness of
+        HsLit _ (XLit (HsInteger _ k' raw_ty)) -> do
+          guard (k == k' && raw_ty `eqType` integerTy)
+          pure ops
+        HsApp _ convert raw -> do
+          HsLit _ (XLit (HsInteger _ k' raw_ty)) <- pure (expression raw)
+          guard (k == k' && raw_ty `eqType` integerTy)
+          (ops ++) <$> integer_op num_module fromIntegerClassOpOcc (expression convert)
+        _ -> Nothing
+
+{- Note [Certifying a source literal conversion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For a nonnegative literal, follow the checked implementation of the selected
+Num.fromInteger field. Its negative guard must compare the same Integer input
+with zero. That branch is unreachable and can, for example, throw Underflow.
+The zero branch must return a nullary constructor. The remaining branch must
+apply a unary constructor to the same method at the same dictionary on n - 1.
+setSourceLiteralCons checks both constructors against the result datatype.
+
+Each Integer operation must use its GHC.Internal class selector and ground
+Integer dictionary. Follow variable evidence aliases from the zonked method
+and module. Check the literal witnesses for both 0 and 1. RebindableSyntax
+can otherwise give a different value to the same literal text. Refuse rules
+on these operations that can match their Integer arguments.
+
+The certificate describes zero and successor for this ground Num instance.
+It makes no claim about negative inputs or any FromNatural type instance.
+-}
+
+{- Note [Certifying a source method alias]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For an instance such as Num Nat, tcInstDecl2 applies the dictionary constructor
+to its superclass fields and methods in classAllSelIds order. Match that checked
+application and use its actual field Id to find the instance method binding.
+A polymorphic alias can bind type variables around the method and apply the
+worker to those same variables. Match them in order. A cast, a dictionary
+argument, or a change of type arguments gives no alias. This check also
+works when the compiler only typechecks the producer.
+
+Check the parent DFun in InstMethId. Generated method names can share a spelling.
+buildClass gives dictionary fields HsLazy. Check that each runtime field is
+lifted so that selecting one method cannot force another field.
+
+For (+) = plus, tcMethodBody and tcPolyCheck each add an AbsBinds. Follow the
+exported and local Ids through both bindings. Require a source equation with
+no patterns, guards or local bindings and an RHS that refers directly to the
+certified function. The shared instance evidence may contain lazy dictionary
+bindings for other methods. The matched RHS refers only to an external Id.
+Erased evidence and unused lifted evidence therefore add no runtime demand.
+
+Check the final zonked bindings after all local source tables and rewrite
+rules are known. This also supplies the certificate for a no-code interface.
+An importer can then check the actual selected DFun and selector. A local
+value can precede instance method checking and cannot use that certificate.
+
+A client can add an orphan rewrite rule for an imported selector, DFun or
+source function. Check the visible rules at each retained use. Save these
+three Names as recompilation dependencies. Check them again after the last
+declaration group because a splice can introduce a later rule.
+-}
+
 tcInstDecl2 :: InstInfo GhcRn -> TcM (LHsBinds GhcTc)
             -- Returns a binding for the dfun
 tcInstDecl2 (InstInfo { iSpec = ispec, iBinds = ibinds })
@@ -1348,6 +1761,7 @@ tcInstDecl2 (InstInfo { iSpec = ispec, iBinds = ibinds })
        ; let dfun_ev_binds = TcEvBinds dfun_ev_binds_var
        ; (tclvl, (sc_meth_ids, sc_meth_binds, sc_meth_implics))
              <- pushTcLevelM $
+                tcExtendLexicalGivens dfun_ev_vars $
                 do { (sc_ids, sc_binds, sc_implics)
                         <- tcSuperClasses skol_info dfun_id clas inst_tyvars
                                           dfun_ev_vars dfun_ev_binds sc_theta'
@@ -1444,7 +1858,7 @@ addDFunPrags dfun_id sc_meth_ids
 
    (dfun_tvs, dfun_theta, clas, inst_tys) = tcSplitDFunTy (idType dfun_id)
    ev_ids      = mkTemplateLocalsNum 1                    dfun_theta
-   dfun_bndrs  = dfun_tvs ++ ev_ids
+   dfun_bndrs  = map snd dfun_tvs ++ ev_ids
    clas_tc     = classTyCon clas
    dict_con    = tyConSingleDataCon clas_tc
 
@@ -2184,7 +2598,7 @@ mkMethIds dfun_id clas tyvars dfun_ev_vars inst_tys sel_id
     -- Force so that a thunk doesn't end up in a Name (#19619)
     !sel_occ      = nameOccName sel_name
     local_meth_ty = instantiateMethod clas sel_id inst_tys
-    poly_meth_ty  = mkSpecSigmaTy tyvars theta local_meth_ty
+    poly_meth_ty  = mkSpecSigmaTy [(unmatchableDataConTy,tv) | tv <- tyvars] theta local_meth_ty
     theta         = map idType dfun_ev_vars
 
 
@@ -2309,14 +2723,14 @@ mkDefMethBind loc dfun_id clas sel_id dm_name dm_spec
         -- visible type application (visible_sel_tys). See Note [Default methods
         -- in instances] (Wrinkle: Ambiguous types from vanilla method type
         -- signatures).
-        VanillaDM -> filter (\tvb -> binderFlag tvb /= InferredSpec) sel_tvbs
+        VanillaDM -> filter (\(_,tvb) -> binderFlag tvb /= InferredSpec) sel_tvbs
         -- If we are dealing with a generic default method, on the other hand,
         -- don't bother doing any of this. See Note [Default methods
         -- in instances] (Wrinkle: Ambiguous types from generic default method
         -- type signatures).
         GenericDM {} -> []
-    visible_sel_pats = map mk_ty_pat visible_sel_tvbs
-    visible_sel_tys = map (mkTyVarTy . binderVar) visible_sel_tvbs
+    visible_sel_pats = map (mk_ty_pat . snd) visible_sel_tvbs
+    visible_sel_tys = map (mkTyVarTy . binderVar . snd) visible_sel_tvbs
 
     fn   = noLocA (idName sel_id)
     rhs  = foldl' mk_vta (nlHsVar dm_name) $
@@ -2334,13 +2748,13 @@ mkDefMethBind loc dfun_id clas sel_id dm_name dm_spec
       tyVarName tv
 
     mk_vta :: LHsExpr GhcRn -> Type -> LHsExpr GhcRn
-    mk_vta fun ty = noLocA (HsAppType noExtField fun
+    mk_vta fun ty = noLocA (HsAppType Nothing fun
         (mkEmptyWildCardBndrs $ type_to_hs_type ty))
        -- NB: use visible type application
        -- See Note [Default methods in instances]
 
     type_to_hs_type :: Type -> LHsType GhcRn
-    type_to_hs_type = parenthesizeHsType appPrec . noLocA . XHsType
+    type_to_hs_type = parenthesizeHsType appPrec . noLocA . XHsType . HsCoreTyRn
 
 ----------------------
 

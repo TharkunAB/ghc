@@ -18,9 +18,12 @@ module GHC.Tc.Utils.Monad(
   discardResult,
   getTopEnv, updTopEnv, updTopEnvIO, getGblEnv, updGblEnv,
   setGblEnv, getLclEnv, updLclEnv, updLclCtxt, setLclEnv, restoreLclEnv,
+  tcExtendLexicalGivens, getLexicalGivens, getNativeGivens, tcWithSourceLetView,
+  tcWithPartialSigContext, getPartialSigPredicates,
+  getTermScopeDepth, getIdTermDepths, tcExtendTermScopeBinders,
   updTopFlags,
   getEnvs, setEnvs, updEnvs, restoreEnvs,
-  xoptM, doptM, goptM, woptM,
+  xoptM, unsaturatedTypeFamiliesEnabled, doptM, goptM, woptM,
   setXOptM, setWOptM,
   unsetXOptM, unsetGOptM, unsetWOptM,
   whenDOptM, whenGOptM, whenWOptM,
@@ -46,6 +49,7 @@ module GHC.Tc.Utils.Monad(
 
   -- * Accessing input/output
   newTcRef, readTcRef, writeTcRef, updTcRef, updTcRefM,
+  recordSourceProofUse,
 
   -- * Debugging
   traceTc, traceRn, traceOptTcRn, dumpOptTcRn,
@@ -62,6 +66,8 @@ module GHC.Tc.Utils.Monad(
   getFixityEnv, extendFixityEnv,
   getDeclaredDefaultTys,
   addDependentFiles, addDependentDirectories,
+  recordHomeRuleDependencies,
+  tcHasDepImports, tcHasSourceProofEnv,
 
   -- * Error management
   getSrcSpanM, getRealSrcSpanM, setSrcSpan, setSrcSpanA, addLocM,
@@ -191,8 +197,12 @@ import GHC.Unit
 import GHC.Unit.Env
 import GHC.Unit.External
 import GHC.Unit.Module.Warnings
+import GHC.Unit.Module.ModIface (ModIface, mi_hsc_src, mi_module, mi_iface_hash)
+import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
 
+import qualified GHC.Core as Core
+import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.UsageEnv
 import GHC.Core.Coercion ( isReflCo )
 import GHC.Core.Multiplicity
@@ -238,6 +248,7 @@ import GHC.Types.Name
 import GHC.Types.SafeHaskell
 import GHC.Types.Id
 import GHC.Types.TypeEnv
+import GHC.Types.Var ( EvVar, isNonCoVarId, varType )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.SrcLoc
@@ -347,7 +358,9 @@ initTc plugin_handling hsc_env hsc_src keep_rn_syntax mod loc do_this
 initTcGblEnv :: HscEnv -> HscSource -> Bool -> Module -> RealSrcSpan -> IO TcGblEnv
 initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
   do { keep_var             <- newIORef emptyNameSet
+     ; has_dep_imports      <- newIORef False
      ; used_gre_var         <- newIORef []
+     ; source_check         <- newIORef emptySourceCheckState
      ; th_var               <- newIORef False
      ; infer_var            <- newIORef True
      ; infer_reasons_var    <- newIORef emptyMessages
@@ -418,6 +431,11 @@ initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
           , tcg_imports            = emptyImportAvails
           , tcg_import_decls       = []
           , tcg_used_gres          = used_gre_var
+          , tcg_has_dep_imports    = has_dep_imports
+          , tcg_source_check        = source_check
+          , tcg_local_open_demands  = Nothing
+          , tcg_local_open_defs     = emptyNameEnv
+          , tcg_local_open_owners   = emptyNameEnv
           , tcg_dus                = emptyDUs
 
           , tcg_rn_imports = []
@@ -427,6 +445,7 @@ initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
                              then Just []
                              else maybe_rn_syntax []
           , tcg_rn_decls            = maybe_rn_syntax emptyRnGroup
+          , tcg_rn_local_lambdas    = Nothing
           , tcg_tr_module           = Nothing
           , tcg_binds               = emptyLHsBinds
           , tcg_imp_specs           = []
@@ -475,16 +494,25 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 -- tcl_loc should be over-ridden very soon!
                 tcl_in_gen_code = False,
                 tcl_err_ctxt   = [],
-                tcl_rdr        = emptyLocalRdrEnv,
+                tcl_rdr        = if wopt Opt_WarnPunUses (hsc_dflags hsc_env)
+                                    || wopt Opt_WarnPunBindings (hsc_dflags hsc_env)
+                                 then trackPunScopes emptyLocalRdrEnv
+                                 else emptyLocalRdrEnv,
                 tcl_th_ctxt    = topLevel,
                 tcl_th_bndrs   = emptyNameEnv,
+                tcl_th_retained_indices = [],
                 tcl_arrow_ctxt = NoArrowCtxt,
                 tcl_env        = emptyNameEnv,
                 tcl_bndrs      = [],
-                tcl_tclvl      = topTcLevel
+                tcl_lexical_givens = emptyLexicalGivens,
+                tcl_source_let_views = emptyVarEnv,
+                tcl_tclvl      = topTcLevel,
+                tcl_term_depth = topTermScopeDepth,
+                tcl_id_depths  = emptyVarEnv
                 },
                 tcl_usage      = usage_var,
                 tcl_lie        = lie_var,
+                tcl_kind_arrow_defaults = Nothing,
                 tcl_errs       = errs_var
                 }
 
@@ -583,6 +611,101 @@ updLclEnv upd = updEnv (\ env@(Env { env_lcl = lcl }) ->
 updLclCtxt :: (TcLclCtxt -> TcLclCtxt) -> TcRnIf gbl TcLclEnv a -> TcRnIf gbl TcLclEnv a
 updLclCtxt = updLclEnv . modifyLclCtxt
 
+-- | Scope a checked definition for choosing an omitted argument.
+tcWithSourceLetView :: Id -> TcType -> TcM a -> TcM a
+tcWithSourceLetView value rhs = updLclCtxt $ \ctxt ->
+    ctxt { tcl_source_let_views = extendVarEnv (tcl_source_let_views ctxt) value rhs }
+
+-- | Record Given evidence parameters in their lexical scope.
+-- See Note [Lexical Givens].
+tcExtendLexicalGivens :: [EvVar] -> TcM a -> TcM a
+tcExtendLexicalGivens [] thing_inside = thing_inside
+tcExtendLexicalGivens givens thing_inside =
+  updLexicalGivens (\scope -> scope { lexicalEvidence = givens ++ lexicalEvidence scope }) thing_inside
+
+-- | Scope the premises written in a partial signature over its right-hand side.
+-- See Note [Lexical Givens].
+tcWithPartialSigContext :: TcIdSigInst -> TcM a -> TcM a
+tcWithPartialSigContext TISI { sig_inst_sig = TcPartialSig{}, sig_inst_theta = theta@(_:_) } =
+  updLexicalGivens $ \scope -> scope { partialSigPredicates = theta ++ partialSigPredicates scope }
+tcWithPartialSigContext _ = id
+
+-- | Update the Given context without changing the enclosing scope, registering
+-- any newly introduced local runtime index prototypes in 'tcl_id_depths'.
+updLexicalGivens :: (LexicalGivens -> LexicalGivens) -> TcM a -> TcM a
+updLexicalGivens f = updLclCtxt $ \ctxt ->
+  let next_lg  = f (tcl_lexical_givens ctxt)
+      id_ds    = tcl_id_depths ctxt
+      ev_ids   = [ v | ev <- lexicalEvidence next_lg
+                     , v <- ev : tyCoVarsOfTypeList (varType ev)
+                     , isNonCoVarId v, isLocalId v
+                     , not (v `elemVarEnv` id_ds) ]
+  in case ev_ids of
+       [] -> ctxt { tcl_lexical_givens = next_lg }
+       _  -> let !d' = bumpTermScopeDepth (tcl_term_depth ctxt)
+             in ctxt { tcl_lexical_givens = next_lg
+                     , tcl_term_depth     = d'
+                     , tcl_id_depths      = extendVarEnvList id_ds [(v, d') | v <- ev_ids] }
+
+getTermScopeDepth :: TcM TermScopeDepth
+getTermScopeDepth = getLclEnvTermDepth <$> getLclEnv
+
+getIdTermDepths :: TcM (VarEnv TermScopeDepth)
+getIdTermDepths = getLclEnvIdDepths <$> getLclEnv
+
+-- | Bump 'tcl_term_depth' and record fresh local value binders in 'tcl_id_depths'.
+tcExtendTermScopeBinders :: [Id] -> TcM a -> TcM a
+tcExtendTermScopeBinders [] thing_inside = thing_inside
+tcExtendTermScopeBinders bndrs thing_inside =
+  updLclCtxt (\ctxt ->
+    let id_ds   = tcl_id_depths ctxt
+        new_ids = [b | b <- bndrs, not (b `elemVarEnv` id_ds)]
+    in case new_ids of
+         [] -> ctxt
+         _  -> let !d' = bumpTermScopeDepth (tcl_term_depth ctxt)
+               in ctxt { tcl_term_depth = d'
+                       , tcl_id_depths  = extendVarEnvList id_ds [(b, d') | b <- new_ids] })
+    thing_inside
+
+-- | Get only the written premises of enclosing partial signatures.
+getPartialSigPredicates :: TcM TcThetaType
+getPartialSigPredicates = partialSigPredicates . tcl_lexical_givens . tcl_lcl_ctxt <$> getLclEnv
+
+-- | Get the evidence parameters of the enclosing implications.
+getLexicalGivens :: TcM [EvVar]
+getLexicalGivens = lexicalEvidence . tcl_lexical_givens . tcl_lcl_ctxt <$> getLclEnv
+
+-- | Get the lexical evidence parameters with native-dependent predicates.
+getNativeGivens :: TcM [EvVar]
+getNativeGivens =
+  filter (hasNativeDependentExpr . Core.Type . varType) <$> getLexicalGivens
+
+{- Note [Lexical Givens]
+~~~~~~~~~~~~~~~~~~~~~~~
+A retained source case must transport lexical evidence whose predicate depends
+on its runtime index. A constrained family in a local signature can use the
+evidence of an enclosing implication to prove its domain. A source use of a
+class method in a type checks which dictionary the implication selects.
+Record the actual evidence parameters while checking the implication body.
+We build the implication after checking that body.
+
+The source name environment and the pending Wanteds do not contain all these
+parameters. Use TcS to derive superclass evidence and solve constraints.
+Retained source cases select native-dependent predicates, including equality
+CoVars. Mutable metavariables cannot be filled with native syntax.
+
+For a partial signature, simplifyInfer binds the evidence after checking
+the right-hand side. Record its written predicates while checking that
+expression. A family formation check can assume them in its own implication.
+That check discards its evidence. Keep those predicates separate from the
+evidence parameters used to build Core. An extra-constraints wildcard cannot
+supply a premise.
+
+Static forms clear the context because StaticFormSkol excludes enclosing Givens.
+Arrow scope escape restores the enclosing list with the original constraint
+accumulator. Nested typed splices restore the list saved at bracket entry.
+-}
+
 setLclEnv :: lcl' -> TcRnIf gbl lcl' a -> TcRnIf gbl lcl a
 setLclEnv lcl_env = updEnv (\ env -> env { env_lcl = lcl_env })
 
@@ -592,6 +715,7 @@ restoreLclEnv new_lcl_env = updLclEnv upd
   where
     upd old_lcl_env =  new_lcl_env { tcl_errs  = tcl_errs  old_lcl_env
                                    , tcl_lie   = tcl_lie   old_lcl_env
+                                   , tcl_kind_arrow_defaults = tcl_kind_arrow_defaults old_lcl_env
                                    , tcl_usage = tcl_usage old_lcl_env }
 
 getEnvs :: TcRnIf gbl lcl (gbl, lcl)
@@ -639,13 +763,19 @@ This led to #19470 and #20981.
 
 Solution: instead of setLclEnv use restoreLclEnv, which preserves from
 the /parent/ context these mutable collection IORefs:
-      tcl_errs, tcl_lie, tcl_usage
+      tcl_errs, tcl_lie, tcl_usage and tcl_kind_arrow_defaults
 -}
 
 -- Command-line flags
 
 xoptM :: LangExt.Extension -> TcRnIf gbl lcl Bool
 xoptM flag = xopt flag <$> getDynFlags
+
+-- | Keep the umbrella's existing admission without applying the standalone
+-- extension's TypeFamilies and printing implications to umbrella modules.
+unsaturatedTypeFamiliesEnabled :: TcM Bool
+unsaturatedTypeFamiliesEnabled =
+  xoptM LangExt.UnsaturatedTypeFamilies <||> xoptM LangExt.DependentTypes
 
 doptM :: DumpFlag -> TcRnIf gbl lcl Bool
 doptM flag = do
@@ -976,7 +1106,11 @@ holeFitTcMPlugins =
 newArrowScope :: TcM a -> TcM a
 newArrowScope
   = updLclEnv $ \env ->
-      modifyLclCtxt (\ctx -> ctx { tcl_arrow_ctxt = ArrowCtxt (getLclEnvRdrEnv env) (tcl_lie env) } ) env
+      modifyLclCtxt (\ctx -> ctx { tcl_arrow_ctxt = ArrowCtxt (getLclEnvRdrEnv env)
+                                                  (tcl_lie env) (tcl_lexical_givens ctx)
+                                                  (tcl_source_let_views ctx)
+                                                  (tcl_term_depth ctx)
+                                                  (tcl_id_depths ctx) }) env
 
 -- Return to the stored environment (from the enclosing proc)
 escapeArrowScope :: TcM a -> TcM a
@@ -984,9 +1118,14 @@ escapeArrowScope
   = updLclEnv $ \ env ->
     case getLclEnvArrowCtxt env of
       NoArrowCtxt       -> env
-      ArrowCtxt rdr_env lie -> env { tcl_lcl_ctxt = (tcl_lcl_ctxt env) { tcl_arrow_ctxt = NoArrowCtxt
-                                                                       , tcl_rdr = rdr_env }
-                                   , tcl_lie = lie }
+      ArrowCtxt rdr_env lie givens views term_depth id_depths -> env
+        { tcl_lcl_ctxt = (tcl_lcl_ctxt env) { tcl_arrow_ctxt = NoArrowCtxt
+                                          , tcl_rdr = rdr_env
+                                          , tcl_lexical_givens = givens
+                                          , tcl_source_let_views = views
+                                          , tcl_term_depth = term_depth
+                                          , tcl_id_depths = id_depths }
+        , tcl_lie = lie }
 
 {-
 ************************************************************************
@@ -1237,6 +1376,25 @@ addDependentDirectories ds = do
   dep_dirs <- readTcRef ref
   writeTcRef ref (ds ++ dep_dirs)
 
+-- | Record the exact home interfaces inspected by an accepted source proof.
+-- Pass only source ancestors of the module in the current build. A usage
+-- does not add a build dependency. Call this after committing to the proof.
+recordHomeRuleDependencies :: [ModIface] -> TcM ()
+recordHomeRuleDependencies ifaces = do
+  env <- getGblEnv
+  unit_env <- hsc_unit_env <$> getTopEnv
+  let home_units = HUG.allUnits (ue_home_unit_graph unit_env)
+      checked = Map.fromList
+        [ (mod, mi_iface_hash iface)
+        | iface <- ifaces
+        , mi_hsc_src iface == HsSrcFile
+        , let mod = mi_module iface
+        , mod /= tcg_mod env
+        , toUnitId (moduleUnit mod) `Set.member` home_units
+        ]
+  updTcRef (tcg_source_check env) $ \s ->
+    s { scs_home_rule_deps = Map.union (scs_home_rule_deps s) checked }
+
 {-
 ************************************************************************
 *                                                                      *
@@ -1244,6 +1402,14 @@ addDependentDirectories ds = do
 *                                                                      *
 ************************************************************************
 -}
+
+-- | Record source proof use until the module's rewrite rules are known.
+recordSourceProofUse :: SrcSpan -> Name -> [SourceProofRule] -> TcM ()
+recordSourceProofUse loc name deps = do
+    env <- getGblEnv
+    updTcRef (tcg_source_check env) $ \s ->
+      let r = scs_rule_uses s
+      in s { scs_rule_uses = r { sourceProofOccurrences = (name, loc, deps) : sourceProofOccurrences r } }
 
 getSrcSpanM :: TcRn SrcSpan
         -- Avoid clash with Name.getSrcLoc
@@ -1571,6 +1737,8 @@ mkCtLocEnv lcl_env =
            , ctl_ctxt  = getLclEnvErrCtxt lcl_env
            , ctl_loc = getLclEnvLoc lcl_env
            , ctl_tclvl = getLclEnvTcLevel lcl_env
+           , ctl_term_depth = getLclEnvTermDepth lcl_env
+           , ctl_id_depths = getLclEnvIdDepths lcl_env
            , ctl_in_gen_code = lclEnvInGeneratedCode lcl_env
            , ctl_rdr = getLclEnvRdrEnv lcl_env
            }
@@ -1827,22 +1995,29 @@ tryTcDiscardingErrs' :: (WantedConstraints -> Messages TcRnMessage -> r -> Bool)
 --      otherwise discard everything from 'thing_inside', including errors,
 --          and try 'recover' instead.
 tryTcDiscardingErrs' validate recover_invalid recover_error thing_inside
-  = do { ((mb_res, lie), msgs) <- captureMessagesTcM    $
+  = do { gbl <- getGblEnv
+       ; th_st <- readTcRef (tcg_th_state gbl)
+       ; sc_st <- readTcRef (tcg_source_check gbl)
+       ; let restore = do { writeTcRef (tcg_th_state gbl) th_st
+                          ; writeTcRef (tcg_source_check gbl) sc_st }
+       ; ((mb_res, lie), msgs) <- captureMessagesTcM    $
                                   captureConstraintsTcM $
                                   tcTryM thing_inside
-        ; case mb_res of
-            Just res | not (errorsFound msgs)
-                     , not (insolubleWC lie)
-                    -- 'thing_inside' succeeded with no errors
-              -> if validate lie msgs res
-                 then do { addMessages msgs  -- msgs might still have warnings
-                         ; emitConstraints lie
-                         ; return res }
-                 else recover_invalid
+       ; case mb_res of
+           Just res | not (errorsFound msgs)
+                    , not (insolubleWC lie)
+                   -- 'thing_inside' succeeded with no errors
+             -> if validate lie msgs res
+                then do { addMessages msgs  -- msgs might still have warnings
+                        ; emitConstraints lie
+                        ; return res }
+                else do { restore
+                        ; recover_invalid }
 
-            _ -> -- 'thing_inside' failed, or produced an error message
-                 recover_error
-        }
+           _ -> -- 'thing_inside' failed, or produced an error message
+                do { restore
+                   ; recover_error }
+       }
 
 {- Note [Constraints and errors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2583,9 +2758,24 @@ initIfaceTcRn thing_inside
               if_env = IfGblEnv { if_doc = text "initIfaceTcRn"
                                 , if_rec_types = if is_instantiate
                                                  then emptyKnotVars
-                                                 else readTcRef <$> knot_vars }
+                                                 else readTcRef <$> knot_vars
+                                , if_has_dep_imports = Just (tcg_has_dep_imports tcg_env) }
 
         ; setEnvs (if_env, ()) thing_inside }
+
+-- | Return @True@ once an imported interface with dependent constructs is loaded.
+tcHasDepImports :: TcRn Bool
+tcHasDepImports = getGblEnv >>= readTcRef . tcg_has_dep_imports
+{-# INLINE tcHasDepImports #-}
+
+-- | Return @True@ when source-proof or retained family checks can be active.
+tcHasSourceProofEnv :: TcRn Bool
+tcHasSourceProofEnv = do
+  dflags <- getDynFlags
+  if gopt Opt_WriteSourceEquations dflags || gopt Opt_SuppressSourceEquations dflags
+    then return True
+    else tcHasDepImports
+{-# INLINE tcHasSourceProofEnv #-}
 
 -- | 'initIfaceLoad' can be used when there's no chance that the action will
 -- call 'typecheckIface' when inside a module loop and hence 'tcIfaceGlobal'.
@@ -2593,7 +2783,8 @@ initIfaceLoad :: HscEnv -> IfG a -> IO a
 initIfaceLoad hsc_env do_this
  = do let gbl_env = IfGblEnv {
                         if_doc = text "initIfaceLoad",
-                        if_rec_types = emptyKnotVars
+                        if_rec_types = emptyKnotVars,
+                        if_has_dep_imports = Nothing
                     }
       initTcRnIf IfaceTag (hsc_env { hsc_type_env_vars = emptyKnotVars }) gbl_env () do_this
 
@@ -2604,7 +2795,8 @@ initIfaceLoadModule :: HscEnv -> Module -> IfG a -> IO a
 initIfaceLoadModule hsc_env this_mod do_this
  = do let gbl_env = IfGblEnv {
                         if_doc = text "initIfaceLoadModule",
-                        if_rec_types = readTcRef <$> knotVarsWithout this_mod (hsc_type_env_vars hsc_env)
+                        if_rec_types = readTcRef <$> knotVarsWithout this_mod (hsc_type_env_vars hsc_env),
+                        if_has_dep_imports = Nothing
                     }
       initTcRnIf IfaceTag hsc_env gbl_env () do_this
 
@@ -2614,7 +2806,8 @@ initIfaceCheck :: SDoc -> HscEnv -> IfG a -> IO a
 initIfaceCheck doc hsc_env do_this
  = do let gbl_env = IfGblEnv {
                         if_doc = text "initIfaceCheck" <+> doc,
-                        if_rec_types = readTcRef <$> hsc_type_env_vars hsc_env
+                        if_rec_types = readTcRef <$> hsc_type_env_vars hsc_env,
+                        if_has_dep_imports = Nothing
                     }
       initTcRnIf IfaceTag hsc_env gbl_env () do_this
 

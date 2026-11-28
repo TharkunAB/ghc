@@ -14,6 +14,7 @@ module GHC.Tc.TyCl.Utils(
         RolesInfo,
         inferRoles,
         checkSynCycles,
+        checkSynCyclesWithPayloads,
         checkClassCycles,
 
         -- * Implicits
@@ -29,9 +30,10 @@ import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Bind( tcValBinds )
+import GHC.Tc.Gen.SourceTable (publishPlainRecordFieldSelector, publishRetainedRecordWitness, sourceTableReferenceUse)
 import GHC.Tc.Utils.TcType
 
-import GHC.Builtin.WiredIn.Types( unitTy )
+import GHC.Builtin.WiredIn.Types( unitTy, unmatchableDataConTy )
 import GHC.Builtin.Uniques ( mkBuiltinUnique )
 
 import GHC.Hs
@@ -57,7 +59,7 @@ import GHC.Data.FastString
 
 import GHC.Unit.Module
 
-import GHC.Rename.Utils (genHsVar, genLHsApp, genLHsLit, genWildPat, wrapGenSpan)
+import GHC.Rename.Utils (genHsVar, genLHsApp, genLHsLit, genSimpleConPat, genWildPat, wrapGenSpan)
 
 import GHC.Types.Basic
 import GHC.Types.FieldLabel
@@ -86,20 +88,28 @@ import Control.Monad
 ************************************************************************
 -}
 
-synonymTyConsOfType :: Type -> [TyCon]
+synonymTyConsOfType :: NameEnv [Type] -> Type -> [TyCon]
 -- Does not look through type synonyms at all.
 -- Returns a list of synonym tycons in nondeterministic order.
 -- Keep this synchronized with 'expandTypeSynonyms'
-synonymTyConsOfType ty
+synonymTyConsOfType payloads ty
   = nonDetNameEnvElts (go ty)
   where
      go :: Type -> NameEnv TyCon  -- The NameEnv does duplicate elim
+     go (TermVarTy v)     = go (varType v) `plusNameEnv` go (idMult v)
+     go (TermAppTy f arg) = go (varType f) `plusNameEnv` go arg
+     go (DepFunTy _ v ty) = go (varType v) `plusNameEnv` go (idMult v) `plusNameEnv` go ty
+     go (DepDictTy d ty)  = go (varType d) `plusNameEnv` go ty
+     go (ClassAppTy sel inst dict arg kind)
+                          = go (varType sel) `plusNameEnv` go inst `plusNameEnv` go dict
+                            `plusNameEnv` go arg `plusNameEnv` go kind
+     go (ExistsTy _ v ty)   = go (varType v) `plusNameEnv` go ty
      go (TyConApp tc tys) = go_tc tc `plusNameEnv` go_s tys
      go (LitTy _)         = emptyNameEnv
      go (TyVarTy _)       = emptyNameEnv
      go (AppTy a b)       = go a `plusNameEnv` go b
-     go (FunTy _ w a b)   = go w `plusNameEnv` go a `plusNameEnv` go b
-     go (ForAllTy _ ty)   = go ty
+     go (FunTy _ ma w a b) = go ma `plusNameEnv` go w `plusNameEnv` go a `plusNameEnv` go b
+     go (ForAllTy _ _ ty) = go ty
      go (CastTy ty co)    = go ty `plusNameEnv` go_co co
      go (CoercionTy co)   = go_co co
 
@@ -127,14 +137,16 @@ synonymTyConsOfType ty
      go_mco MRefl    = emptyNameEnv
      go_mco (MCo co) = go_co co
 
+     go_co (TermAppCo f co)     = go (varType f) `plusNameEnv` go_co co
+     go_co (DepFunCo _ _ v domain co) = go (varType v) `plusNameEnv` go (idMult v) `plusNameEnv` go_mco domain `plusNameEnv` go_co co
      go_co (Refl ty)            = go ty
      go_co (GRefl _ ty mco)     = go ty `plusNameEnv` go_mco mco
      go_co (TyConAppCo _ tc cs) = go_tc tc `plusNameEnv` go_co_s cs
      go_co (AppCo co co')       = go_co co `plusNameEnv` go_co co'
      go_co (ForAllCo { fco_kind = kind_co, fco_body = body_co })
                                 = go_mco kind_co `plusNameEnv` go_co body_co
-     go_co (FunCo { fco_mult = m, fco_arg = a, fco_res = r })
-                                = go_co m `plusNameEnv` go_co a `plusNameEnv` go_co r
+     go_co (FunCo { fco_ma = ma, fco_mult = m, fco_arg = a, fco_res = r })
+                                = go_co ma `plusNameEnv` go_co m `plusNameEnv` go_co a `plusNameEnv` go_co r
      go_co (CoVarCo _)          = emptyNameEnv
      go_co (HoleCo {})          = emptyNameEnv
      go_co (AxiomCo _ cs)       = go_co_s cs
@@ -148,8 +160,11 @@ synonymTyConsOfType ty
      go_co (KindCo co)          = go_co co
      go_co (SubCo co)           = go_co co
 
-     go_tc tc | isTypeSynonymTyCon tc = unitNameEnv (tyConName tc) tc
-              | otherwise             = emptyNameEnv
+     go_tc tc
+       | let name = tyConName tc
+       , isTypeSynonymTyCon tc || name `elemNameEnv` payloads
+       = unitNameEnv name tc
+       | otherwise = emptyNameEnv
      go_s tys = foldr (plusNameEnv . go) emptyNameEnv tys
      go_co_s cos = foldr (plusNameEnv . go_co) emptyNameEnv cos
 
@@ -196,13 +211,18 @@ checkTyConIsAcyclic tc m = SynCycleM $ \s ->
 -- the corresponding @LTyClDecl Name@ for each 'TyCon', so we
 -- can give better error messages.
 checkSynCycles :: Unit -> [TyCon] -> [LTyClDecl GhcRn] -> TcM ()
-checkSynCycles this_uid tcs tyclds =
+checkSynCycles = checkSynCyclesWithPayloads emptyNameEnv
+
+-- | Treat generated sum payload equations as part of their source synonym.
+-- See Note [Termination of lifted sum payloads] in GHC.Tc.Validity.
+checkSynCyclesWithPayloads :: NameEnv [Type] -> Unit -> [TyCon] -> [LTyClDecl GhcRn] -> TcM ()
+checkSynCyclesWithPayloads payloads this_uid tcs tyclds =
     case runSynCycleM (mapM_ (go emptyTyConSet []) tcs) emptyTyConSet of
         Left (loc, err) -> setSrcSpan loc $ failWithTc (TcRnTypeSynonymCycle err)
         Right _  -> return ()
   where
     -- Try our best to print the LTyClDecl for locally defined things
-    lcl_decls = mkNameEnv (zip (map tyConName tcs) tyclds)
+    lcl_decls = mkNameEnv [(tcdName (unLoc decl), decl) | decl <- tyclds]
 
     -- Short circuit if we've already seen this Name and concluded
     -- it was acyclic.
@@ -215,7 +235,9 @@ checkSynCycles this_uid tcs tyclds =
     go' :: TyConSet -> [TyCon] -> TyCon -> SynCycleM ()
     go' so_far seen_tcs tc
         | tc `elemTyConSet` so_far
-            = failSynCycleM (getSrcSpan (head seen_tcs)) (lookup_decl <$> seen_tcs)
+            = let aliases = filter isTypeSynonymTyCon seen_tcs
+                  cycle_tcs = if null aliases then seen_tcs else aliases
+              in failSynCycleM (getSrcSpan (head cycle_tcs)) (lookup_decl <$> cycle_tcs)
         -- Optimization: we don't allow cycles through external packages,
         -- so once we find a non-local name we are guaranteed to not
         -- have a cycle.
@@ -228,6 +250,8 @@ checkSynCycles this_uid tcs tyclds =
             = return ()
         | Just ty <- synTyConRhs_maybe tc =
             go_ty (extendTyConSet so_far tc) (tc:seen_tcs) ty
+        | Just tys <- lookupNameEnv payloads n =
+            mapM_ (go_ty (extendTyConSet so_far tc) (tc:seen_tcs)) tys
         | otherwise = return ()
       where
         n = tyConName tc
@@ -239,7 +263,7 @@ checkSynCycles this_uid tcs tyclds =
 
     go_ty :: TyConSet -> [TyCon] -> Type -> SynCycleM ()
     go_ty so_far seen_tcs ty =
-        mapM_ (go so_far seen_tcs) (synonymTyConsOfType ty)
+        mapM_ (go so_far seen_tcs) (synonymTyConsOfType payloads ty)
 
 {- Note [Superclass cycle check]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -318,8 +342,20 @@ checkClassCycles cls
        = go_tc so_far pred tc tys
        | hasTyVarHead pred
        = Just (False, [SCD_HeadTyVar pred])
+       | isOpaqueConstraintHead pred
+       = Just (False, [SCD_HeadTyFam pred])
        | otherwise
        = Nothing
+
+    isOpaqueConstraintHead ty
+      | Just ty' <- coreView ty = isOpaqueConstraintHead ty'
+      | otherwise = case ty of
+          TermVarTy {}  -> True
+          TermAppTy {}  -> True
+          ClassAppTy {} -> True
+          AppTy f _     -> isOpaqueConstraintHead f
+          CastTy t _    -> isOpaqueConstraintHead t
+          _             -> False
 
     go_tc :: ClassSet -> PredType -> TyCon -> [Type] -> Maybe (Bool, [SuperclassCycleDetail])
     go_tc so_far pred tc tys
@@ -575,28 +611,70 @@ irDataCon :: DataCon -> RoleM ()
 irDataCon datacon
   = setRoleInferenceVars univ_tvs $
     irExTyVars ex_tvs $ \ ex_var_set ->
-      do mapM_ (irType ex_var_set) (eqSpecPreds eq_spec ++ theta ++ map scaledThing arg_tys)
-         mapM_ (markNominal ex_var_set) (map tyVarKind ex_tvs ++ map scaledMult arg_tys)  -- Field multiplicities are nominal (#18799)
+      do let result_scope = extendVarSetList ex_var_set [field | Just field <- field_binders]
+         mapM_ (irType result_scope) (eqSpecPreds eq_spec)
+         mapM_ (irType ex_var_set) theta
+         if null field_binders
+         then do mapM_ (irType ex_var_set) (map scaledThing arg_tys)
+                 mapM_ (markNominal ex_var_set) (map tyVarKind ex_tvs ++ map scaledMult arg_tys)
+         else do mapM_ (markNominal ex_var_set) (map tyVarKind ex_tvs)
+                 ir_fields ex_var_set field_binders arg_tys
+         -- Field multiplicities are nominal (#18799).
       -- See Note [Role-checking data constructor arguments]
   where
     (univ_tvs, ex_tvs, eq_spec, theta, arg_tys, _res_ty)
       = dataConFullSig datacon
+    field_binders = dataConRepArgBinders datacon
+
+    -- See Note [Roles of retained constructor fields].
+    ir_fields _ [] [] = return ()
+    ir_fields scope (binder : binders) (Scaled mult ty : tys)
+      = do { irType scope ty
+           ; markNominal scope mult
+           ; ir_fields (maybe scope (extendVarSet scope) binder) binders tys }
+    ir_fields _ _ _ = pprPanic "irDataCon: misaligned retained fields" (ppr datacon)
 
 irType :: VarSet -> Type -> RoleM ()
 irType = go
   where
     go lcls ty                 | Just ty' <- coreView ty -- #14101
                                = go lcls ty'
+    go lcls ty@(TermAppTy f arg)
+      | isNativeIndexFunctionId f || isNativeDepFunctionId f
+      , isNativeNamedOpaqueFunctionId f || f `elemVarSet` lcls
+      = markNominal lcls (varType f) >> markNominal lcls arg
+      | otherwise = pprPanic "irType: invalid native call scope" (ppr ty)
+    go lcls ty@(TermVarTy v)
+      | isNativeNamedOpaqueFunctionId v = pure ()
+      | v `elemVarSet` lcls, isNativeRetainedBinder v
+      = markNominal lcls (varType v) >> markNominal lcls (idMult v)
+      | otherwise = pprPanic "irType: invalid runtime index scope" (ppr ty)
+    go lcls ty@(DepFunTy _ v body)
+      | isNativeRetainedBinder v
+      = markNominal lcls (varType v) >> markNominal lcls (idMult v) >> go (extendVarSet lcls v) body
+      | otherwise = pprPanic "irType: invalid retained binder" (ppr ty)
+    go lcls (DepDictTy d body)
+      = markNominal lcls (varType d) >> go (extendVarSet lcls d) body
+    go lcls (ClassAppTy sel inst dict operand kind)
+      = mapM_ (markNominal lcls) [varType sel, inst, dict, operand, kind]
+    go lcls (ExistsTy _ v body)
+      | typeKind (varType v) `eqType` liftedTypeKind
+      , typeKind body `eqType` liftedTypeKind
+      = markNominal lcls (varType v) >> go (extendVarSet lcls v) body
+      | otherwise
+      = markNominal lcls (varType v) >> markNominal (extendVarSet lcls v) body
     go lcls (TyVarTy tv)       = unless (tv `elemVarSet` lcls) $
                                  updateRole Representational tv
     go lcls (AppTy t1 t2)      = go lcls t1 >> markNominal lcls t2
     go lcls (TyConApp tc tys)  = do { roles <- lookupRolesX tc
                                     ; zipWithM_ (go_app lcls) roles tys }
-    go lcls (ForAllTy tvb ty)  = do { let tv = binderVar tvb
-                                          lcls' = extendVarSet lcls tv
-                                    ; markNominal lcls (tyVarKind tv)
-                                    ; go lcls' ty }
-    go lcls (FunTy _ w arg res)  = markNominal lcls w >> go lcls arg >> go lcls res
+    go lcls (ForAllTy ma tvb ty)
+      = do { let tv = binderVar tvb
+                 lcls' = extendVarSet lcls tv
+           ; markNominal lcls ma
+           ; markNominal lcls (varType tv)
+           ; go lcls' ty }
+    go lcls (FunTy _ ma w arg res) = markNominal lcls ma >> markNominal lcls w >> go lcls arg >> go lcls res
     go _    (LitTy {})         = return ()
       -- See Note [Coercions in role inference]
     go lcls (CastTy ty _)      = go lcls ty
@@ -621,27 +699,65 @@ irExTyVars orig_tvs thing = go emptyVarSet orig_tvs
     go lcls (tv:tvs) = do { markNominal lcls (tyVarKind tv)
                           ; go (extendVarSet lcls tv) tvs }
 
-markNominal :: TyVarSet   -- local variables
+markNominal :: VarSet     -- Local erased variables and runtime indices
             -> Type -> RoleM ()
 markNominal lcls ty = mapM_ (updateRole Nominal) $
-                      nonDetVarSetElems (get_ty_vars ty `minusVarSet` lcls)
+                      nonDetVarSetElems (get_ty_vars lcls ty `minusVarSet` lcls)
   where
      -- get_ty_vars gets all the tyvars (no covars!) from a type *without*
      -- recurring into coercions. Recall: coercions are totally ignored during
      -- role inference. See [Coercions in role inference]
-    get_ty_vars :: Type -> VarSet
-    get_ty_vars t                 | Just t' <- coreView t -- #20999
-                                  = get_ty_vars t'
-    get_ty_vars (TyVarTy tv)      = unitVarSet tv
-    get_ty_vars (AppTy t1 t2)     = get_ty_vars t1 `unionVarSet` get_ty_vars t2
-    get_ty_vars (FunTy _ w t1 t2) = get_ty_vars w `unionVarSet` get_ty_vars t1
-                                                  `unionVarSet` get_ty_vars t2
-    get_ty_vars (TyConApp _ tys)  = mapUnionVarSet get_ty_vars tys
-    get_ty_vars (ForAllTy (Bndr v _) ty) = get_ty_vars (varType v) `unionVarSet`
-                                           (get_ty_vars ty `delVarSet` v)
-    get_ty_vars (LitTy {})        = emptyVarSet
-    get_ty_vars (CastTy ty _)     = get_ty_vars ty
-    get_ty_vars (CoercionTy _)    = emptyVarSet
+    get_ty_vars :: VarSet -> Type -> VarSet
+    get_ty_vars scope t | Just t' <- coreView t = get_ty_vars scope t' -- #20999
+    get_ty_vars scope ty@(TermAppTy f arg)
+      | isNativeIndexFunctionId f || isNativeDepFunctionId f
+      , isNativeNamedOpaqueFunctionId f || f `elemVarSet` scope
+      = get_ty_vars scope (varType f) `unionVarSet` get_ty_vars scope arg
+      | otherwise = pprPanic "markNominal: invalid native call scope" (ppr ty)
+    get_ty_vars scope ty@(TermVarTy v)
+      | isNativeNamedOpaqueFunctionId v = emptyVarSet
+      | v `elemVarSet` scope, isNativeRetainedBinder v
+      = get_ty_vars scope (varType v) `unionVarSet` get_ty_vars scope (idMult v)
+      | otherwise = pprPanic "markNominal: invalid runtime index scope" (ppr ty)
+    get_ty_vars scope ty@(DepFunTy _ v body)
+      | isNativeRetainedBinder v
+      = get_ty_vars scope (varType v) `unionVarSet`
+          get_ty_vars scope (idMult v) `unionVarSet`
+          get_ty_vars (extendVarSet scope v) body
+      | otherwise = pprPanic "markNominal: invalid retained binder" (ppr ty)
+    get_ty_vars scope (DepDictTy d body)
+      = get_ty_vars scope (varType d) `unionVarSet`
+          get_ty_vars (extendVarSet scope d) body
+    get_ty_vars scope (ClassAppTy sel inst dict operand kind)
+      = mapUnionVarSet (get_ty_vars scope) [varType sel, inst, dict, operand, kind]
+    get_ty_vars scope (ExistsTy _ v body)
+      = get_ty_vars scope (varType v) `unionVarSet`
+          (get_ty_vars (extendVarSet scope v) body `delVarSet` v)
+    get_ty_vars _ (TyVarTy tv) = unitVarSet tv
+    get_ty_vars scope (AppTy t1 t2) = get_ty_vars scope t1 `unionVarSet` get_ty_vars scope t2
+    get_ty_vars scope (FunTy _ ma w t1 t2)
+      = mapUnionVarSet (get_ty_vars scope) [ma,w,t1,t2]
+    get_ty_vars scope (TyConApp _ tys) = mapUnionVarSet (get_ty_vars scope) tys
+    get_ty_vars scope (ForAllTy ma (Bndr v _) ty)
+      = get_ty_vars scope ma `unionVarSet` get_ty_vars scope (varType v) `unionVarSet`
+          (get_ty_vars (extendVarSet scope v) ty `delVarSet` v)
+    get_ty_vars _ (LitTy {}) = emptyVarSet
+    get_ty_vars scope (CastTy ty _) = get_ty_vars scope ty
+    get_ty_vars _ (CoercionTy _) = emptyVarSet
+
+{- Note [Roles of retained constructor fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Check constructor fields in telescope order. Extend the local scope after each
+named runtime field. A valid index has a closed native domain, so it contributes
+no ordinary type-parameter role. Check that domain and continue through the
+payload type. In particular, do not omit the element parameter of Vec a n.
+An eligible function-value index keeps the same scope and nominal domain
+traversal. See Note [Function fields in native index domains] in GHC.Core.Type.
+
+Use the same scope rule for retained Pi binders inside field types. Nominal
+traversal returns type variables only; a bound runtime Id is not a role variable.
+Keep this traversal aligned with checkValidRoles in GHC.Tc.TyCl.
+-}
 
 -- like lookupRoles, but with Nominal tags at the end for oversaturated TyConApps
 lookupRolesX :: TyCon -> RoleM [Role]
@@ -764,7 +880,11 @@ addTyConsToGblEnv tyclss
     do { traceTc "tcAddTyCons" $ vcat
             [ text "tycons" <+> ppr tyclss
             , text "implicits" <+> ppr implicit_things ]
-       ; gbl_env <- tcRecSelBinds (mkRecSelBinds tyclss)
+       ; selectors <- mkRecSelBinds tyclss
+       ; let tables = mapMaybe (sourceTableId_maybe . fst) selectors
+       ; gbl_env <- tcExtendTyConEnv tables $
+                    tcExtendGlobalEnvImplicit (concatMap implicitTyConThings tables) $
+                    tcRecSelBinds selectors
        ; th_bndrs <- tcTyThBinders implicit_things
        ; return (gbl_env, th_bndrs)
        }
@@ -786,7 +906,8 @@ mkDefaultMethodIds tycons
 mkDefaultMethodType :: Class -> Id -> DefMethSpec Type -> Type
 -- Returns the top-level type of the default method
 mkDefaultMethodType _ sel_id VanillaDM        = idType sel_id
-mkDefaultMethodType cls _   (GenericDM dm_ty) = mkSigmaTy tv_bndrs [pred] dm_ty
+mkDefaultMethodType cls _   (GenericDM dm_ty)
+  = mkSigmaTy [(unmatchableDataConTy, b) | b <- tv_bndrs] [pred] dm_ty
    where
      pred      = mkClassPred cls (mkTyVarTys (binderVars cls_bndrs))
      cls_bndrs = tyConBinders (classTyCon cls)
@@ -843,7 +964,8 @@ early in the pipeline.
 tcRecSelBinds :: [(Id, LHsBind GhcRn)] -> TcM TcGblEnv
 tcRecSelBinds sel_bind_prs
   = tcExtendGlobalValEnv [sel_id | (L _ (XSig (IdSig sel_id))) <- sigs] $
-    do { (rec_sel_binds, tcg_env) <- discardWarnings $
+    do { mapM_ sourceTableReferenceUse (mapMaybe (sourceTableId_maybe . fst) sel_bind_prs)
+       ; (rec_sel_binds, tcg_env) <- discardWarnings $
                                        -- See Note [Impredicative record selectors]
                                      setXOptM LangExt.ImpredicativeTypes $
                                      tcValBinds TopLevel binds sigs getGblEnv
@@ -854,11 +976,44 @@ tcRecSelBinds sel_bind_prs
                                              , let loc = getSrcSpan sel_id ]
     binds = [(NonRecursive, [bind]) | (_, bind) <- sel_bind_prs]
 
-mkRecSelBinds :: [TyCon] -> [(Id, LHsBind GhcRn)]
+mkRecSelBinds :: [TyCon] -> TcM [(Id, LHsBind GhcRn)]
 -- See Note [Record selectors]
-mkRecSelBinds tycons
-  = map mkRecSelBind [ (tc,fld) | tc <- tycons
-                                , fld <- tyConFieldLabels tc ]
+mkRecSelBinds tycons = concat <$> mapM make_selectors tycons
+  where
+    make_selectors tc
+      | [con] <- tyConDataCons tc
+      , first : rest <- dataConFieldLabels con
+      , Just (_, payloads) <- promotedRetainedFields con
+      = do { let cons = [RealDataCon con]
+                 parent = RecSelData tc
+                 selector = fst (mkOneRecordSelector cons parent first FieldSelectors)
+           ; table <- publishRetainedRecordWitness con selector
+           ; record <- mkSysLocalM (fsLit "record") ManyTy (dataConOrigResTy con)
+           ; let first_sel = mkRecordSelector (Just table) Nothing cons parent first FieldSelectors
+                 parameters = mkTyVarTys (dataConUnivTyVars con)
+                 index = mkTyConApp table (parameters ++ [TermVarTy record])
+                 (telescope, _) = splitForAllForAllTyBinders (idType selector)
+                 payload_sel fld result =
+                   let res_ty = result index
+                   in if anyFreeVarsOfType (== record) res_ty
+                        then mkRecordSelector Nothing
+                               (Just (mkForAllTys telescope (mkDepFunTy record res_ty)))
+                               cons parent fld FieldSelectors
+                        else mkOneRecordSelector cons parent fld FieldSelectors
+           ; pure (first_sel : zipWithEqual payload_sel rest payloads) }
+      | [con] <- tyConDataCons tc
+      , flds@(_ : _) <- tyConFieldLabels tc
+      = do { let cons   = [RealDataCon con]
+                 parent = RecSelData tc
+           ; traverse (\(idx, fl) -> do
+               { let plain@(sel0, _) = mkOneRecordSelector cons parent fl FieldSelectors
+               ; if isNaughtyRecordSelector sel0
+                   then pure plain
+                   else do
+                     { mb_table <- publishPlainRecordFieldSelector con idx sel0
+                     ; pure $ maybe plain (\tbl -> mkRecordSelector (Just tbl) Nothing cons parent fl FieldSelectors) mb_table } })
+               (zip [0..] flds) }
+      | otherwise = pure (map (mkRecSelBind . (tc,)) (tyConFieldLabels tc))
 
 mkRecSelBind :: (TyCon, FieldLabel) -> (Id, LHsBind GhcRn)
 mkRecSelBind (tycon, fl)
@@ -869,7 +1024,14 @@ mkRecSelBind (tycon, fl)
 
 mkOneRecordSelector :: [ConLike] -> RecSelParent -> FieldLabel -> FieldSelectors
                     -> (Id, LHsBind GhcRn)
-mkOneRecordSelector all_cons idDetails fl has_sel
+mkOneRecordSelector = mkRecordSelector Nothing Nothing
+
+-- | Make a selector, with the checked witness equation or dependent result.
+-- See Note [Selectors of retained records].
+mkRecordSelector :: Maybe TyCon -> Maybe Type
+                 -> [ConLike] -> RecSelParent -> FieldLabel -> FieldSelectors
+                 -> (Id, LHsBind GhcRn)
+mkRecordSelector source_table dependent_type all_cons idDetails fl has_sel
   = (sel_id, L (noAnnSrcSpan loc) sel_bind)
   where
     loc      = getSrcSpan sel_name
@@ -892,6 +1054,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
     rec_details = RecSelId { sel_tycon      = idDetails
                            , sel_naughty    = is_naughty
                            , sel_fieldLabel = fl
+                           , sel_sourceTable = source_table
                            , sel_cons       = rec_sel_info }
                              -- See (IRS1) in Note [Detecting incomplete record selectors]
                              -- in GHC.HsToCore.Pmc
@@ -908,7 +1071,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                    conLikeUserTyVarBinders con1
 
     -- is_naughty: see Note [Naughty record selectors]
-    is_naughty = isExistentialRecordField field_ty con1 || no_selectors
+    is_naughty = (isNothing dependent_type && isExistentialRecordField field_ty con1) || no_selectors
 
     no_selectors   = has_sel == NoFieldSelectors
       -- For PatternSynonyms with -XNoFieldSelectors, pretend the fields
@@ -917,12 +1080,13 @@ mkOneRecordSelector all_cons idDetails fl has_sel
       -- See Note [NoFieldSelectors and naughty record selectors]
 
     sel_ty | is_naughty = unitTy  -- See Note [Naughty record selectors]
-           | otherwise  = mkForAllTys sel_tvbs $
+           | Just ty <- dependent_type = ty
+           | otherwise  = mkForAllTys [(unmatchableDataConTy, b) | b <- sel_tvbs] $
                           -- Urgh! See Note [The stupid context] in GHC.Core.DataCon
                           mkPhiTy (conLikeStupidTheta con1) $
                           -- req_theta is empty for normal DataCon
                           mkPhiTy req_theta                 $
-                          mkVisFunTyMany data_ty            $
+                          mkVisFunTyManyU data_ty            $
                             -- Record selectors are always typed with Many. We
                             -- could improve on it in the case where all the
                             -- fields in all the constructor have multiplicity Many.
@@ -936,19 +1100,24 @@ mkOneRecordSelector all_cons idDetails fl has_sel
         alts | is_naughty = [mkSimpleMatch match_ctxt (noLocA []) unit_rhs]
              | otherwise =  map mk_match cons_w_field ++ deflt
     mk_match con = mkSimpleMatch match_ctxt
-                                 (L (l2l loc') [L loc' (mk_sel_pat con)])
+                                 (L (l2l loc') [mk_sel_pat con])
                                  (L loc' (mkHsVar (L locn field_var)))
-    mk_sel_pat con =
-      let con_lname = L locn (noUserRdr (getName con))
-      in ConPat NoExtField con_lname (RecCon noAnn rec_fields)
+    mk_sel_pat con
+      | isJust source_table || isJust dependent_type
+      = genSimpleConPat (getName con)
+          [ if flSelector field == sel_name then field_pat else genWildPat
+          | field <- conLikeFieldLabels con ]
+      | otherwise =
+          let con_lname = L locn (noUserRdr (getName con))
+          in L loc' (ConPat NoExtField con_lname (RecCon noAnn rec_fields))
     rec_fields = HsRecFields { rec_ext = noAnn, rec_flds = [rec_field], rec_dotdot = Nothing }
     rec_field  = noLocA (HsFieldBind
                         { hfbAnn = noAnn
                         , hfbLHS
                            = L locc (FieldOcc (mkRdrUnqual $ nameOccName sel_name) (L locn sel_name))
-                        , hfbRHS
-                           = L loc' (VarPat noExtField (L locn field_var))
+                        , hfbRHS = field_pat
                         , hfbPun = False })
+    field_pat = L loc' (VarPat noExtField (L locn field_var))
     field_var = mkInternalName (mkBuiltinUnique 1) (getOccName sel_name) loc
 
     -- Add catch-all default case unless the case is exhaustive
@@ -978,6 +1147,24 @@ mkOneRecordSelector all_cons idDetails fl has_sel
 
     unit_rhs = mkLHsTupleExpr [] noExtField
     msg_lit = HsStringPrim NoSourceText (bytesFS (mkFastStringShortText (field_label lbl)))
+
+{- Note [Selectors of retained records]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Generate both kinds of selectors from the exact constructor. The first
+selector returns the witness. Its checked source equation describes the
+same case. Keep the equation with the selector's field metadata.
+Read the fields in constructor order. The datatype's label map is sorted.
+
+For a payload selector, substitute the first selector's checked family
+applied to a fresh record binder. Its result can depend on that same
+record value. The ordinary HasField solver already refuses a selector
+whose type fails isTauTy, including a retained arrow.
+
+Generate positional matches so the retained pattern checker can relate
+the payload type to the input record. Source record patterns preserve
+their field order when expanded. See Note [Named retained record fields]
+in GHC.Rename.HsType.
+-}
 
 {-
 Note [Polymorphic selectors]
@@ -1039,12 +1226,52 @@ so that the later type-check will add them to the environment, and they'll be
 exported.  The function is never called, because the typechecker spots the
 sel_naughty field.
 
-To determine naughtiness we distingish two cases:
+To determine naughtiness we distinguish two cases:
 
 * For RealDataCons, a field is "naughty" if its type mentions a
-  type variable that isn't in the (original, user-written) result type
-  of the constructor. Note that this *allows* GADT record selectors
-  (Note [GADT record selectors]) whose types may look like sel :: T [a] -> a
+  variable that is absent from recordSelectorResultVars of the original result
+  type. This function uses the existing syntactic free-variable rule, but it
+  skips AppTy subtrees whose consumed kind arrow is U or unknown. It also checks
+  oversaturated TyConApp arguments through their consumed result-kind arrows.
+  It preserves binder scopes, kind dependencies, and coercion free variables.
+  Ordinary GADT selectors such as sel :: T [a] -> a remain available.
+  See Note [GADT record selectors].
+
+  A variable can occur in the result without being recoverable. For example,
+  T (f a) does not determine f or a when f consumes a U or unknown kind arrow.
+  A selector must not obtain these variables by inverting a Given equality of
+  application results. Matching the constructor can still expose the field
+  inside its existential scope. See Note [Matchability and injective variables]
+  in GHC.Core.TyCo.FVs.
+
+  A type synonym can hide an opaque application. For example, A f a = f a
+  must not make a field of type a selectable from T f (A f a) at U. The walker
+  returns a flag with its variable set. It uses a synonym expansion when that
+  expansion reports an opaque application. Otherwise it keeps the original
+  syntactic argument variables. Thus S a = Int retains a in T (S a), as before.
+  Expanding every synonym would lose this variable and reject an existing
+  selector whose field type is S a.
+
+  Before expansion, scan the uninstantiated synonym bodies for a possible
+  opaque application. Visit each referenced synonym once in this scan. If
+  none exists, keep the compact applied synonym and visit its arguments only.
+  For example, Twice a = (a,a) must not duplicate an argument that contains
+  more Twice applications. See Note [Using synonyms to compress types] in
+  GHC.Core.Type. The scan does not substitute arguments into synonym bodies.
+
+  Keep the existing treatment of saturated type families. For
+  example, a field of type F a in a constructor result T (F a) can be selected
+  by transporting the complete field type. This does not require inverse
+  evidence for a. Using injectiveVarsOfType here would reject this selector.
+  The generated selector binding still has to typecheck. A user-defined family
+  injectivity annotation alone does not provide Given inverse evidence; see
+  (INJFAM:Given) in Note [Type inference for type families with injectivity]
+  in GHC.Tc.Solver.FunDeps.
+
+  This is a bounded extension of the existing classification. It can reject a
+  new U application field whose complete type could be transported without
+  recovering its free variables. It does not implement a complete field-type
+  transport analysis.
 
 * For a PatSynCon, a field is "naughty" if its type mentions a type variable
   that isn't in the universal type variables.

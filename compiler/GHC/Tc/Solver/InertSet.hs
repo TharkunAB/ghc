@@ -15,7 +15,7 @@ module GHC.Tc.Solver.InertSet (
     InertCans(..),
     emptyInertSet, emptyInertCans, resetInertCans,
 
-    noGivenNewtypeReprEqs, updGivenEqs,
+    noGivenNewtypeReprEqs, updGivenEqs, updGivenEqLevel,
     prohibitedSuperClassSolve,
 
     -- * Inert equalities
@@ -67,7 +67,7 @@ import qualified GHC.Core.TyCo.Rep as Rep
 import GHC.Core.TyCon
 import GHC.Core.Class( Class, classTyCon )
 import GHC.Builtin.KnownKeys( eqPrimTyConKey, heqTyConKey, eqTyConKey, coercibleTyConKey )
-import GHC.Utils.Misc       ( partitionWith )
+import GHC.Utils.Misc       ( lengthAtLeast, partitionWith )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Data.Bag
@@ -75,6 +75,7 @@ import GHC.Data.Bag
 import Control.Monad      ( forM_ )
 import qualified Data.List.NonEmpty as NE
 import Data.Function      ( on )
+import qualified Data.Sequence as Seq
 
 {-
 ************************************************************************
@@ -95,7 +96,14 @@ consider using this depth for prioritization as well in the future.
 As a simple form of priority queue, our worklist separates out
 
 * equalities (wl_eqs); see Note [Prioritise equalities]
-* all the rest (wl_rest)
+* other ordinary work (wl_rest)
+* application equalities that can still choose a flexible head (wl_open_apps)
+  See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality.
+
+The last group runs after the other work. Retry its equalities in the order
+in which they were deferred. Picking the oldest first avoids reversing
+the order of independent inference choices merely because they had to wait.
+The sequence supports adding work at the back and taking it from the front.
 
 Note [Prioritise equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -173,6 +181,9 @@ data WorkList
          -- in GHC.Tc.Types.Constraint for more details.
 
        , wl_rest :: [Ct]
+       , wl_open_apps :: Seq.Seq Ct
+           -- Wanteds that could choose a still-open function head.
+           -- See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality.
     }
 
 isNominalEqualityCt :: Ct -> Bool
@@ -187,16 +198,20 @@ isNominalEqualityCt ct
 
 appendWorkList :: WorkList -> WorkList -> WorkList
 appendWorkList
-    (WL { wl_eqs_N = eqs1_N, wl_eqs_X = eqs1_X, wl_rw_eqs = rw_eqs1, wl_rest = rest1 })
-    (WL { wl_eqs_N = eqs2_N, wl_eqs_X = eqs2_X, wl_rw_eqs = rw_eqs2, wl_rest = rest2 })
+    (WL { wl_eqs_N = eqs1_N, wl_eqs_X = eqs1_X, wl_rw_eqs = rw_eqs1, wl_rest = rest1
+        , wl_open_apps = apps1 })
+    (WL { wl_eqs_N = eqs2_N, wl_eqs_X = eqs2_X, wl_rw_eqs = rw_eqs2, wl_rest = rest2
+        , wl_open_apps = apps2 })
    = WL { wl_eqs_N   = eqs1_N   ++ eqs2_N
         , wl_eqs_X   = eqs1_X   ++ eqs2_X
         , wl_rw_eqs  = rw_eqs1  ++ rw_eqs2
-        , wl_rest    = rest1    ++ rest2 }
+        , wl_rest    = rest1    ++ rest2
+        , wl_open_apps = apps1 Seq.>< apps2 }
 
 workListSize :: WorkList -> Int
-workListSize (WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs, wl_rest = rest })
-  = length eqs_N + length eqs_X + length rw_eqs + length rest
+workListSize (WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs
+                 , wl_rest = rest, wl_open_apps = apps })
+  = length eqs_N + length eqs_X + length rw_eqs + length rest + Seq.length apps
 
 extendWorkListEq :: CoHoleSet -> Ct -> WorkList -> WorkList
 extendWorkListEq rewriters ct
@@ -253,7 +268,7 @@ extendWorkListNonEq ct wl = wl { wl_rest = ct : wl_rest wl }
 extendWorkListCt :: Ct -> WorkList -> WorkList
 -- Agnostic about what kind of constraint
 extendWorkListCt ct wl
- = case classifyPredType (ctEvPred ev) of
+ = case classifyCtEvidence ev of
      EqPred {}
        -> extendWorkListEq rewriters ct wl
 
@@ -274,17 +289,17 @@ extendWorkListCts cts wl = foldr extendWorkListCt wl cts
 
 isEmptyWorkList :: WorkList -> Bool
 isEmptyWorkList (WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X
-                    , wl_rw_eqs = rw_eqs, wl_rest = rest })
-  = null eqs_N && null eqs_X && null rw_eqs && null rest
+                    , wl_rw_eqs = rw_eqs, wl_rest = rest, wl_open_apps = apps })
+  = null eqs_N && null eqs_X && null rw_eqs && null rest && Seq.null apps
 
 emptyWorkList :: WorkList
 emptyWorkList = WL { wl_eqs_N = [], wl_eqs_X = []
-                   , wl_rw_eqs = [], wl_rest = [] }
+                   , wl_rw_eqs = [], wl_rest = [], wl_open_apps = Seq.empty }
 
 -- Pretty printing
 instance Outputable WorkList where
   ppr (WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X
-          , wl_rw_eqs = rw_eqs, wl_rest = rest })
+          , wl_rw_eqs = rw_eqs, wl_rest = rest, wl_open_apps = apps })
    = text "WL" <+> (braces $
      vcat [ ppUnless (null eqs_N) $
             text "Eqs_N =" <+> vcat (map ppr eqs_N)
@@ -294,6 +309,8 @@ instance Outputable WorkList where
             text "RwEqs =" <+> vcat (map ppr rw_eqs)
           , ppUnless (null rest) $
             text "Non-eqs =" <+> vcat (map ppr rest)
+          , ppUnless (Seq.null apps) $
+            text "Open application eqs =" <+> ppr (Seq.length apps)
           ])
 
 {- *********************************************************************
@@ -1603,8 +1620,12 @@ updGivenEqs tclvl ct inerts
 
   -- At this point we are left with a constraint that either
   -- is an equality (F a ~ ty), or /might/ be, like (c a)
-  | otherwise = inerts { inert_given_eq_lvl = tclvl
-                       , inert_given_eqs    = True }
+  | otherwise = updGivenEqLevel tclvl inerts
+
+-- | Record a Given equality that makes outer metavariables untouchable.
+updGivenEqLevel :: TcLevel -> InertCans -> InertCans
+updGivenEqLevel tclvl inerts
+  = inerts { inert_given_eq_lvl = tclvl, inert_given_eqs = True }
 
 isLetBoundSkolemCt :: TcLevel -> Ct -> Bool
 -- See Note [Let-bound skolems]
@@ -1700,10 +1721,13 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
     fr_tf_can_rewrite_ty where_to_look new_tf new_tf_args role ty
       = anyRewritableTyFamApp role can_rewrite ty
       where
+        -- See Note [Unsaturated family applications in kick-out and RHS checks].
         can_rewrite :: UnderFam -> EqRel -> TyCon -> [TcType] -> Bool
         can_rewrite is_under_famapp old_role old_tf old_tf_args
           = (where_to_look == LookEverywhere || is_under_famapp) &&
             new_role `eqCanRewrite` old_role &&
+            new_tf == old_tf &&
+            old_tf_args `lengthAtLeast` length new_tf_args &&
             tcEqTyConApps new_tf new_tf_args old_tf old_tf_args
               -- it's possible for old_tf_args to have too many. This is fine;
               -- we'll only check what we need to.
@@ -1799,6 +1823,12 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
     tv_at_head is_tv = go
       where
         go (Rep.TyVarTy tv)    = is_tv tv
+        go (Rep.TermVarTy {})  = False
+        go (Rep.TermAppTy {})  = False
+        go (Rep.DepFunTy {})   = False
+        go (Rep.ExistsTy {})   = False
+        go (Rep.DepDictTy {})  = False
+        go (Rep.ClassAppTy {}) = False
         go (Rep.AppTy fun _)   = go fun
         go (Rep.CastTy ty _)   = go ty
         go (Rep.TyConApp {})   = False
@@ -1811,13 +1841,52 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
     fam_at_head fun_tc fun_args = go
       where
         go (Rep.TyVarTy {})       = False
+        go (Rep.TermVarTy {})     = False
+        go (Rep.TermAppTy {})     = False
+        go (Rep.DepFunTy {})      = False
+        go (Rep.ExistsTy {})      = False
+        go (Rep.DepDictTy {})     = False
+        go (Rep.ClassAppTy {})    = False
         go (Rep.AppTy {})         = False  -- no TyConApp to the left of an AppTy
         go (Rep.CastTy ty _)      = go ty
-        go (Rep.TyConApp tc args) = tcEqTyConApps fun_tc fun_args tc args
+        -- See Note [Unsaturated family applications in kick-out and RHS checks].
+        go (Rep.TyConApp tc args) = tc == fun_tc
+                                 && args `lengthAtLeast` length fun_args
+                                 && tcEqTyConApps fun_tc fun_args tc args
         go (Rep.LitTy {})         = False
         go (Rep.ForAllTy {})      = False
         go (Rep.FunTy {})         = False
         go (Rep.CoercionTy {})    = False
+
+{- Note [Unsaturated family applications in kick-out and RHS checks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A canonical type-family equality `TyFamLHS F lhs_args` is always saturated,
+so `length lhs_args == tyConArity F`. Under `UnsaturatedTypeFamilies` or
+`DependentTypes` (for example, when a higher-order family `T:foldr` receives
+an unsaturated family `T:plus` as `TyConApp T:plus []`), a type can contain
+`TyConApp F args` with `length args < tyConArity F`.
+
+`GHC.Tc.Solver.Rewrite.rewrite_one` reduces `TyConApp F args` only when
+`args` has at least `tyConArity F` arguments. `tcEqTyConApps` compares two
+argument lists with `zipWith`, so it returns `True` when the shorter list is
+a prefix of the longer list (including `[]`). Without an explicit length
+guard:
+
+1. `kickOutRewritableLHS` (`fr_tf_can_rewrite_ty` and `fam_at_head`) treats
+   `TyFamLHS F lhs_args` as able to rewrite an unsaturated `TyConApp F args`.
+   Rewriting leaves the unsaturated application unchanged. Two inert
+   `TyFamLHS` equalities for `F` that each mention an unsaturated `F`
+   callback then kick each other out without termination.
+2. `GHC.Tc.Utils.Unify.checkTyConApp` routes an unsaturated `TyConApp F args`
+   into `checkFamApp`. In `TEFTyFam` mode, `tcEqTyConApps` reports a false
+   occurs-check failure against `TyFamLHS F lhs_args`. In `TEFA_Break` mode,
+   `famAppBreaker` emits `F args ~ cbv`, which is not a `TyFamLHS` and
+   triggers unification again.
+
+Require `old_tf_args` to have at least `length new_tf_args` arguments in
+`fr_tf_can_rewrite_ty` and `fam_at_head`, and enter `checkFamApp` in
+`checkTyConApp` only when `tys` has at least `tyConArity tc` arguments.
+-}
 
 {- Note [kickOutRewritable]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1907,7 +1976,7 @@ noGivenNewtypeReprEqs tc (IS { inert_cans = inerts })
     -- Look in both inert_irreds /and/ inert_qcis (#26020)
   where
     might_help_irred (IrredCt { ir_ev = ev })
-      | EqPred ReprEq t1 t2 <- classifyPredType (ctEvPred ev)
+      | EqPred ReprEq t1 t2 <- classifyCtEvidence ev
       = headed_by_tc t1 t2
       | otherwise
       = False

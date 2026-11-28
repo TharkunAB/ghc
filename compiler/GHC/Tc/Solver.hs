@@ -4,15 +4,18 @@ module GHC.Tc.Solver(
        InferMode(..), simplifyInfer, findInferredDiff,
        growThetaTyVars,
        simplifyAmbiguityCheck,
-       simplifyTop, simplifyTopImplic,
+       simplifyTop, simplifyTopNoDefaulting, simplifyTopImplic,
        simplifyInteractive,
        solveEqualities,
        pushLevelAndSolveEqualities, pushLevelAndSolveEqualitiesX,
+       pushLevelAndSolveKindArrows, pushLevelAndSolveKindArrowsX,
+       inferSynonymMatchabilities,
        reportUnsolvedEqualities,
        simplifyWantedsTcM,
        tcCheckGivens,
        tcCheckWanteds,
        tcNormalise,
+       tcRewriteFamilyAxioms,
        approximateWC,    -- Exported for plugins to use
 
        captureTopConstraints, emitResidualConstraints,
@@ -26,6 +29,7 @@ module GHC.Tc.Solver(
 import GHC.Prelude
 
 import GHC.Tc.Errors
+import {-# SOURCE #-} GHC.Tc.Gen.Splice (tcRunClosedCall, tcDecodeClosedCallOperand)
 import GHC.Tc.Errors.Types
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Solver.Solve   ( solveSimpleGivens, solveSimpleWanteds
@@ -33,28 +37,33 @@ import GHC.Tc.Solver.Solve   ( solveSimpleGivens, solveSimpleWanteds
 import GHC.Tc.Solver.Default ( tryDefaulting, tryDefaultingForAmbiguityCheck
                              , isInteractiveClass )
 import GHC.Tc.Solver.Dict    ( makeSuperClasses )
-import GHC.Tc.Solver.Rewrite ( rewriteType )
+import GHC.Tc.Solver.Rewrite ( rewriteType, rewriteFamilyAxioms )
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.TcMType as TcM
 import GHC.Tc.Utils.Monad   as TcM
 import GHC.Tc.Zonk.TcType     as TcM
 import GHC.Tc.Solver.InertSet
 import GHC.Tc.Solver.Monad  as TcS
+import GHC.Tc.Types.LclEnv (tcl_kind_arrow_defaults)
 import GHC.Tc.Types.Constraint
-import GHC.Tc.Types.CtLoc( mkGivenLoc )
+import GHC.Tc.Types.CtLoc( CtLoc, mkGivenLoc )
 import GHC.Tc.Instance.FunDeps
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType
 
+import GHC.Builtin.WiredIn.Types (matchabilityTy, matchableDataConTy, unmatchableDataConTy)
 import GHC.Core.Predicate
+import GHC.Core.Reduction ( Reduction )
 import GHC.Core.Type
 import GHC.Core.Ppr
-import GHC.Core.TyCon    ( TyConBinder )
+import GHC.Driver.Ppr (showPpr)
+import GHC.Core.TyCon    ( TyConBinder, isTypeFamilyTyCon, isInferredTyConBinder, tyConArity, tyConBinders )
 
 import GHC.Types.Name
 import GHC.Types.Id
 
 import GHC.Types.Var
+import GHC.Types.Var.Env ( VarEnv )
 import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Types.Error
@@ -79,6 +88,31 @@ import GHC.Data.Maybe     ( mapMaybe )
 *                           External interface                                  *
 *                                                                               *
 *********************************************************************************
+-}
+
+-- | Reduce family axioms with nominal evidence and the solver depth limit.
+-- See Note [Bounded frontend family views].
+tcRewriteFamilyAxioms :: CtLoc -> TcType -> TcM Reduction
+tcRewriteFamilyAxioms loc ty
+  = runTcSEqualities (rewriteFamilyAxioms loc ty)
+
+{- Note [Bounded frontend family views]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Native shape matching and cached argument selection need a nominal family
+view before ordinary unification. The pure family normalizer has no solver
+reduction-depth state. Use the existing family-only rewrite instead.
+Its proof relates the original type to the reduced type. It uses no ambient
+Given equality, plugin rewrite or family-cache evidence.
+
+Create the location inside the original source context. The depth diagnostic
+restores that location, including its span and error context. In particular,
+cached argument selection must restore addArgCtxt before creating the location.
+runRewrite starts each view at depth zero. Family RHS reduction increments
+that same location. This is a per-view limit, not a global work budget.
+
+Keep the wrapper in TcM. GHC.Tc.Utils.Unify SOURCE-imports its narrow boot
+signature because the solver normally imports the unifier. Do not expose TcS
+internals through two boot interfaces for this frontend operation.
 -}
 
 captureTopConstraints :: TcM a -> TcM (a, WantedConstraints)
@@ -130,10 +164,19 @@ simplifyTop :: WantedConstraints -> TcM (Bag EvBind)
 -- Usually these will be implications,
 -- but when there is nothing to quantify we don't wrap
 -- in a degenerate implication, so we do that here instead
-simplifyTop wanteds
+simplifyTop = simplifyTopWith simplifyTopWanteds
+
+-- | Solve compile-time dictionary requirements without choosing default types.
+simplifyTopNoDefaulting :: WantedConstraints -> TcM (Bag EvBind)
+simplifyTopNoDefaulting = simplifyTopWith (nestTcS . solveWanteds)
+
+-- | Solve top-level constraints and report unsolved or unsafe instance uses.
+simplifyTopWith :: (WantedConstraints -> TcS WantedConstraints)
+                -> WantedConstraints -> TcM (Bag EvBind)
+simplifyTopWith solve wanteds
   = do { traceTc "simplifyTop {" $ text "wanted = " <+> ppr wanteds
        ; ((final_wc, unsafe_ol), binds1) <- runTcS $
-            do { final_wc <- simplifyTopWanteds wanteds
+            do { final_wc <- solve wanteds
                ; unsafe_ol <- getSafeOverlapFailures
                ; return (final_wc, unsafe_ol) }
        ; traceTc "End simplifyTop }" empty
@@ -180,16 +223,201 @@ pushLevelAndSolveEqualitiesX :: String -> TcM a
 --
 -- Panics if we solve any non-equality constraints.  (In runTCSEqualities
 -- we use an error thunk for the evidence bindings.)
-pushLevelAndSolveEqualitiesX callsite thing_inside
+pushLevelAndSolveEqualitiesX = solveEqualitiesAtLevel False
+
+-- | Own omitted matchability in kind-valued arguments in a complete declaration.
+pushLevelAndSolveKindArrows :: SkolemInfoAnon -> [TyConBinder] -> TcM a -> TcM a
+pushLevelAndSolveKindArrows skol_info tcbs action =
+  do { (level, wanted, result) <- pushLevelAndSolveKindArrowsX "kind-valued arguments" action
+     ; report_unsolved_equalities skol_info (binderVars tcbs) level wanted
+     ; return result }
+
+-- | Leave residual equalities to the declaration's normal reporting path.
+pushLevelAndSolveKindArrowsX :: String -> TcM a -> TcM (TcLevel, WantedConstraints, a)
+pushLevelAndSolveKindArrowsX = solveEqualitiesAtLevel True
+
+-- | Solve justified metadata choices while leaving undetermined slots for
+-- synonym generalization.
+inferSynonymMatchabilities :: TcM a -> TcM a
+inferSynonymMatchabilities action = do
+  (_, wanted, result) <- solveEqualitiesSelectingMetadata True False "synonym metadata" action
+  emitConstraints wanted
+  return result
+
+solveEqualitiesAtLevel :: Bool -> String -> TcM a -> TcM (TcLevel, WantedConstraints, a)
+solveEqualitiesAtLevel infer_arrows = solveEqualitiesSelectingMetadata infer_arrows True
+
+solveEqualitiesSelectingMetadata :: Bool -> Bool -> String -> TcM a -> TcM (TcLevel, WantedConstraints, a)
+solveEqualitiesSelectingMetadata infer_arrows default_unresolved callsite thing_inside
   = do { traceTc "pushLevelAndSolveEqualitiesX {" (text "Called from" <+> text callsite)
        ; (tclvl, (wanted, res))
             <- pushTcLevelM $
-               do { (res, wanted) <- captureConstraints thing_inside
+               do { owner <- TcM.getTcLevel
+                  ; defaults <- if infer_arrows
+                                then Just <$> ((,) <$> TcM.newTcRef [] <*> TcM.newTcRef [])
+                                else pure Nothing
+                  ; (res, wanted) <- captureConstraints $
+                      TcM.updLclEnv (setDefaults defaults) thing_inside
                   ; wanted <- runTcSEqualities (simplifyTopWanteds wanted)
+                  ; wanted <- case defaults of
+                      Nothing -> return wanted
+                      Just (ref, indices_ref) -> do
+                        arrows <- TcM.readTcRef ref
+                        indices <- TcM.readTcRef indices_ref
+                        settleArrows owner arrows indices wanted
                   ; return (wanted,res) }
        ; traceTc "pushLevelAndSolveEqualitiesX }" (vcat [ text "Residual:" <+> ppr wanted
                                                        , text "Level:" <+> ppr tclvl ])
        ; return (tclvl, wanted, res) }
+
+  where
+    setDefaults Nothing env | Nothing <- tcl_kind_arrow_defaults env = env
+    setDefaults defaults env = env { tcl_kind_arrow_defaults = defaults }
+
+    settleArrows _ [] [] wanted = return wanted
+    settleArrows owner arrows indices wanted = do
+      residual <- TcM.liftZonkM $ mapM TcM.zonkTcType (residualPredicates wanted)
+      owned <- familyIndexRoots owner indices
+      let keep = mkVarSet owned
+          vars = map fst arrows
+      chosen <- or <$> mapM (chooseArrow Nothing owner residual) (vars ++ owned)
+      linked <- if chosen || null owned then pure False else do
+        defaults <- familyIndexRoots owner vars
+        linkFamilyIndices keep (mkVarSet defaults) residual
+      if chosen || linked
+        then solveAgain wanted >>= settleArrows owner arrows indices
+        else if default_unresolved
+          then do
+            defaulted <- or <$> mapM (\(v,lvl) -> chooseArrow (Just (keep,lvl)) owner [] v) arrows
+            if defaulted then solveAgain wanted else return wanted
+          else return wanted
+
+    solveAgain wanted
+      | isSolvedWC wanted = return wanted
+      | otherwise = runTcSEqualities (simplifyTopWanteds wanted)
+
+    chooseArrow fallback owner residual original = do
+      current <- TcM.liftZonkM (TcM.zonkTcType (mkTyVarTy original))
+      case getTyVar_maybe current of
+        Just tv | isPromotableMetaTyVar tv, not (isTyVarTyVar tv)
+                , not (owner `strictlyDeeperThan` tcTyVarLevel tv) -> do
+          let candidates = concatMap (familyArrowChoices tv) residual
+              wants_m = any (`tcEqType` matchableDataConTy) candidates
+              wants_u = any (`tcEqType` unmatchableDataConTy) candidates
+              choice | wants_m && not wants_u = Just matchableDataConTy
+                     | wants_u && not wants_m = Just unmatchableDataConTy
+                     | Just (keep, lvl) <- fallback, not (tv `elemVarSet` keep)
+                               = Just (defaultForAllMatchability lvl)
+                     | otherwise = Nothing
+          case choice of
+            Just ma -> TcM.liftZonkM (TcM.writeMetaTyVar tv ma) >> return True
+            Nothing -> return False
+        _ -> return False
+
+-- | Inspect residual wanteds under explicit skolems too. The only value
+-- this check can select is a closed metadata constructor.
+residualPredicates :: WantedConstraints -> [PredType]
+residualPredicates wanted =
+  map ctPred (bagToList (wc_simple wanted)) ++
+  concatMap (residualPredicates . ic_wanted) (bagToList (wc_impl wanted))
+
+-- | Keep only representatives allocated by this declaration.
+familyIndexRoots :: TcLevel -> [TcTyVar] -> TcM [TcTyVar]
+familyIndexRoots owner indices = do
+  roots <- TcM.liftZonkM $ mapM (TcM.zonkTcType . mkTyVarTy) indices
+  let registered = mkVarSet indices
+  pure [tv | Just tv <- map getTyVar_maybe roots
+           , tv `elemVarSet` registered
+           , isPromotableMetaTyVar tv, not (isTyVarTyVar tv)
+           , tcTyVarLevel tv `sameDepthAs` owner]
+
+-- | Share a choice only when both fresh indices belong to this declaration.
+linkFamilyIndices :: TyVarSet -> TyVarSet -> [PredType] -> TcM Bool
+linkFamilyIndices owned defaults residual =
+  case [(a, b) | pred_ty <- residual
+               , Just (lhs, rhs) <- [familyArrowPair pred_ty]
+               , Just x <- [getTyVar_maybe lhs]
+               , Just y <- [getTyVar_maybe rhs]
+               , (a,b) <- [(x,y), (y,x)]
+               , b `elemVarSet` owned
+               , a `elemVarSet` owned || a `elemVarSet` defaults] of
+    (a, b) : _ -> TcM.liftZonkM (TcM.writeMetaTyVar a (mkTyVarTy b)) >> pure True
+    [] -> pure False
+
+-- | Find a default that makes a residual nominal family equality reflexive.
+-- The ordinary solver must still check the whole wanted after defaulting.
+familyArrowChoices :: TcTyVar -> PredType -> [Type]
+familyArrowChoices tv pred_ty
+  | Just (a, b) <- familyArrowPair pred_ty
+  = [concrete | (var, concrete) <- [(a,b), (b,a)]
+              , getTyVar_maybe var == Just tv
+              , tcEqType concrete matchableDataConTy || tcEqType concrete unmatchableDataConTy]
+  | otherwise = []
+
+-- | Compare saturated applications with exactly one differing inferred index.
+familyArrowPair :: PredType -> Maybe (Type, Type)
+familyArrowPair pred_ty
+  | Just (Nominal, lhs, rhs) <- getEqPredTys_maybe pred_ty
+  , Just (f, as) <- tcSplitTyConApp_maybe lhs
+  , Just (g, bs) <- tcSplitTyConApp_maybe rhs
+  , f == g, isTypeFamilyTyCon f
+  , length as == tyConArity f, length as == length bs
+  , [(binder, a, b)] <- filter (\(_, a, b) -> not (tcEqType a b))
+                                (zip3 (tyConBinders f) as bs)
+  , isInferredTyConBinder binder
+  , varType (binderVar binder) `tcEqType` matchabilityTy
+  = Just (a, b)
+  | otherwise = Nothing
+
+{- Note [Owning omitted arrows in kind-valued arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A complete kind check of a declaration owns the arrows recorded in its local
+environment. First solve the whole declaration, including later arguments,
+so that an equality can choose M or U. Keep the previous U default for an
+occurrence without enough information to infer M. Default variables owned by
+this scope, then re-solve any residual obligations. A metavariable already
+promoted out to an outer scope belongs to that scope. Do not fix its value
+here. Nested complete checks replace the owner. Nested solveEqualities calls
+can float constraints to it. An application spine has neither the expected
+kind of its enclosing context nor the rest of the declaration's constraints.
+It must not default on its own.
+
+Family telescope kinds record a separate set of choices. An occurrence
+of a dependent family may leave a wanted such as K ?m b ~ K ?n b.
+When the saturated heads and all other arguments already agree, and
+both representatives are still registered at this level, we can give
+the two fresh choices one representative. Recheck the entire wanted.
+Do not identify specified or rigid indices. In particular, zonking a
+registered metavariable to an unregistered one does not transfer
+ownership. Do not apply the U fallback to a telescope index. A remaining
+index may become an inferred binder.
+
+The left side of a family instance also owns its telescope indices. An
+application on its right side may create a defaultable index. Link that
+index to the left side when the other family arguments agree. Preserve
+the left-side representative during defaulting so the equation can
+quantify it. Recheck the unchanged wanted after each link.
+
+When checking an application against TYPE r, its result must classify
+values. Prefer M for an unresolved selector in the family's telescope.
+For example, zero's result I a in KindEqualities2 needs the constructor
+Maybe. During kind inference there is no such expected sort. Keep the
+ordinary U default there. In T15346 the kind of PFrom a at a visible
+type argument must agree with Rep k in the SDecide constraint. Both
+refer to the same unknown kind. Selectors that describe the result
+type itself keep their type-level default. Explicit choices and solved
+constraints take precedence.
+
+Repeat constrained choices and identifications before the fallback.
+Each successful pass either fills an owned metavariable with concrete
+metadata or reduces the number of distinct owned representatives.
+
+A stuck wanted can still select an owned default. For K ?m b ~ K M b,
+choosing M makes the application reflexive when its other arguments
+already agree. Recheck the unchanged wanted after defaulting. This rule
+does not justify an inverse conclusion from equality of two families.
+It only selects an unfilled variable's default while checking a wanted.
+-}
 
 -- | Type-check a thing that emits only equality constraints, solving any
 -- constraints we can and re-emitting constraints that we can't.
@@ -250,31 +478,43 @@ floatKindEqualities :: WantedConstraints -> Maybe (Bag Ct, Bag DelayedError)
 -- Precondition 2: the 'wanteds' are zonked, since floatKindEqualities
 --    is not monadic
 -- See Note [floatKindEqualities vs approximateWC]
-floatKindEqualities wc = float_wc emptyVarSet wc
+floatKindEqualities wc = float_wc emptyVarSet Nothing wc
   where
-    float_wc :: TcTyCoVarSet -> WantedConstraints -> Maybe (Bag Ct, Bag DelayedError)
-    float_wc trapping_tvs (WC { wc_simple = simples
-                              , wc_impl = implics
-                              , wc_errors = errs })
+    float_wc :: TcTyCoVarSet -> Maybe (TermScopeDepth, VarEnv TermScopeDepth)
+             -> WantedConstraints -> Maybe (Bag Ct, Bag DelayedError)
+    float_wc trapping_tvs mb_outer (WC { wc_simple = simples
+                                       , wc_impl = implics
+                                       , wc_errors = errs })
+      -- Keep the dictionary choice in its original evidence scope.
+      -- See Note [Checked source method evidence] in GHC.Tc.Solver.Solve.
+      | anyBag is_source_method errs = Nothing
       | all is_floatable simples
       = do { (inner_simples, inner_errs)
-                <- flatMapBagPairM (float_implic trapping_tvs) implics
+                <- flatMapBagPairM (float_implic trapping_tvs mb_outer) implics
            ; return ( simples `unionBags` inner_simples
                     , errs `unionBags` inner_errs) }
       | otherwise
       = Nothing
       where
+        is_source_method DE_SourceMethod {} = True
+        is_source_method _ = False
         is_floatable ct
            | insolubleCt ct = False
+           | Just (max_d, id_ds) <- mb_outer
+           , anyFreeVarsOfType (\v -> isNonCoVarId v
+                                   && maybe True (> max_d) (lookupIdTermDepth id_ds v))
+                               (ctPred ct)
+           = False
            | otherwise      = tyCoVarsOfCt ct `disjointVarSet` trapping_tvs
 
-    float_implic :: TcTyCoVarSet -> Implication -> Maybe (Bag Ct, Bag DelayedError)
-    float_implic trapping_tvs (Implic { ic_wanted = wanted, ic_given_eqs = given_eqs
-                                      , ic_skols = skols, ic_status = status })
+    float_implic :: TcTyCoVarSet -> Maybe (TermScopeDepth, VarEnv TermScopeDepth)
+                 -> Implication -> Maybe (Bag Ct, Bag DelayedError)
+    float_implic trapping_tvs mb_outer (Implic { ic_wanted = wanted, ic_given_eqs = given_eqs
+                                               , ic_skols = skols, ic_env = env, ic_status = status })
       | isInsolubleStatus status
       = Nothing   -- A short cut /plus/ we must keep track of IC_BadTelescope
       | otherwise
-      = do { (simples, holes) <- float_wc new_trapping_tvs wanted
+      = do { (simples, holes) <- float_wc new_trapping_tvs new_outer wanted
            ; when (not (isEmptyBag simples) && given_eqs == MaybeGivenEqs) $
              Nothing
                  -- If there are some constraints to float out, but we can't
@@ -283,6 +523,9 @@ floatKindEqualities wc = float_wc emptyVarSet wc
            ; return (simples, holes) }
       where
         new_trapping_tvs = trapping_tvs `extendVarSetList` skols
+        new_outer = Just $ case mb_outer of
+          Nothing    -> (ctl_term_depth env, ctl_id_depths env)
+          Just outer -> outer
 
 
 {- Note [Failure in local type signatures]
@@ -942,11 +1185,12 @@ simplifyInfer :: TopLevelFlag          -- Syntactically top-level
                       Bool)         -- True <=> the residual constraints are insoluble
 
 simplifyInfer top_lvl rhs_tclvl infer_mode sigs name_taus wanteds
-  | isEmptyWC wanteds
+  | null pending, isEmptyWC wanteds
    = do { -- When quantifying, we want to preserve any order of variables as they
           -- appear in partial signatures. cf. decideQuantifiedTyVars
-          let psig_tv_tys = [ mkTyVarTy tv | sig <- partial_sigs
-                                           , (_,Bndr tv _) <- sig_inst_skols sig ]
+          let psig_tv_tys = [ ty | sig <- partial_sigs
+                                , (_, (ma, Bndr tv _)) <- sig_inst_skols sig
+                                , ty <- [ma, mkTyVarTy tv] ]
               psig_theta  = [ pred | sig <- partial_sigs
                                    , pred <- sig_inst_theta sig ]
 
@@ -992,6 +1236,7 @@ simplifyInfer top_lvl rhs_tclvl infer_mode sigs name_taus wanteds
        --      the psig_theta; it's just the extra bit
        -- NB2: We do not do any defaulting when inferring a type, this can lead
        --      to less polymorphic types, see Note [Default while Inferring]
+       ; wanted_transformed <- retryTypeCalls rhs_tclvl ev_binds_var pending wanted_transformed
        ; wanted_transformed <- TcM.liftZonkM $ TcM.zonkWC wanted_transformed
        ; let definite_error = insolubleWC wanted_transformed
                               -- See Note [Quantification with errors]
@@ -1038,6 +1283,72 @@ simplifyInfer top_lvl rhs_tclvl infer_mode sigs name_taus wanteds
          -- NB: bound_theta_vars must be fully zonked
   where
     partial_sigs = filter isPartialSig sigs
+    pending = concatMap sig_inst_calls partial_sigs
+
+{- Note [Pending calls in partial signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A pattern or expression can fix a signature wildcard after the signature
+is checked. When a checked imported call consumes that wildcard, put an
+ordinary result metavariable at the owner level in the signature. Keep
+the computation obligation on that signature instance. Only named
+wildcards owned by the signature and calls in its unqualified body are
+eligible. Existing staging checks apply before recording the obligation.
+
+Solve the owner's ordinary constraints first. Evaluate a call only when
+its operand is a checked literal. Its result can constrain a later input
+through ordinary equality. Each successful step removes one obligation.
+If none of the remaining operands is ready, report the first blocked
+call. Never infer an operand by reversing its own call.
+
+Use an ordinary nominal equality between the result metavariable and
+the decoded literal. Verify that its solve completed and that the
+metavariable zonks to the literal. Resume the remaining ordinary
+constraints with the same evidence bindings. No application endpoint
+or unfinished computation enters an inferred type, even when the
+caller requested deferred type errors.
+-}
+
+-- | Finish the admitted calls before generalizing the owners. No
+-- application type survives this checkpoint. The same evidence environment
+-- handles the original constraints and the new literal equalities.
+retryTypeCalls :: TcLevel -> EvBindsVar -> [TcPendingTypeCall]
+               -> WantedConstraints -> TcM WantedConstraints
+retryTypeCalls _ _ [] wanteds = pure wanteds
+retryTypeCalls lvl binds calls wanteds = TcM.setTcLevel lvl (go calls wanteds)
+  where
+    go [] residual = pure residual
+    go remaining@(TcPendingTypeCall call_span fun _ _ : _) residual = do
+      ready <- findReady [] remaining
+      case ready of
+        Nothing -> TcM.setSrcSpan call_span $ failWithTc (TcRnClosedTypeEval (idName fun)
+          "The type call is blocked because inference did not determine a literal argument.")
+        Just (TcPendingTypeCall location function _ result, argument, rest) -> do
+          TcM.setSrcSpan location $ checkResult function argument result
+          residual' <- solve residual
+          go rest residual'
+
+    findReady _ [] = pure Nothing
+    findReady skipped (call@(TcPendingTypeCall location fun input _) : rest) = do
+      checked <- TcM.liftZonkM (TcM.zonkTcType input)
+      argument <- TcM.setSrcSpan location (tcDecodeClosedCallOperand (idName fun) checked)
+      case argument of
+        Just value -> pure (Just (call, value, reverse skipped ++ rest))
+        Nothing -> findReady (call : skipped) rest
+
+    checkResult fun argument result = do
+      value <- tcRunClosedCall fun argument (typeKind result)
+      (_, equality) <- captureConstraints $
+        TcM.emitWantedEq AnnOrigin TypeLevel Nominal result value
+      residual <- solve equality
+      inferred <- TcM.liftZonkM (TcM.zonkTcType result)
+      unless (isEmptyWC residual && inferred `tcEqType` value) $ do
+        dflags <- getDynFlags
+        failWithTc (TcRnClosedTypeEval (idName fun)
+          ("The call returned " ++ showPpr dflags value ++
+           ". The binding requires " ++ showPpr dflags inferred ++ "."))
+
+    solve wanted = runTcSWithEvBinds binds $
+      setTcLevelTcS lvl $ solveWanteds wanted
 
 --------------------
 emitResidualConstraints :: TcLevel -> SkolemInfoAnon -> EvBindsVar
@@ -1927,17 +2238,19 @@ getSeedTys :: [(Name,TcType)]    -- The type of each RHS in the group
            -> [TcIdSigInst]      -- Any partial type signatures
            -> TcM ( [TcTyVar]    -- Zonked partial-sig quantified tyvars
                   , ThetaType    -- Zonked partial signature thetas
-                  , [TcType] )   -- Zonked tau-tys from the bindings
+                  , [TcType] )   -- Zonked tau-types and forall metadata
 getSeedTys name_taus psigs
   = TcM.liftZonkM $
     do { psig_tv_tys <- mapM TcM.zonkTcTyVar [ tv | TISI{ sig_inst_skols = skols } <- psigs
-                                                  , (_, Bndr tv _) <- skols ]
+                                                  , (_, (_, Bndr tv _)) <- skols ]
+       ; psig_mas <- mapM TcM.zonkTcType [ ma | TISI{ sig_inst_skols = skols } <- psigs
+                                            , (_, (ma, _)) <- skols ]
        ; psig_theta  <- mapM TcM.zonkTcType [ pred | TISI{ sig_inst_theta = theta } <- psigs
                                                    , pred <- theta ]
        ; tau_tys     <- mapM (TcM.zonkTcType . snd) name_taus
        ; return ( map getTyVar psig_tv_tys
                 , psig_theta
-                , tau_tys ) }
+                , psig_mas ++ tau_tys ) }
 
 ------------------
 predMentions :: TcTyVarSet -> TcPredType -> Bool

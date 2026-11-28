@@ -29,6 +29,7 @@ import GHC.Tc.Utils.Unify( uType, mightEqualLater )
 import GHC.Core
 import GHC.Core.Make
 import GHC.Core.Type
+import GHC.Builtin.WiredIn.Types ( heqClass, unmatchableDataConTy )
 import GHC.Core.Class
 import GHC.Core.Predicate
 import GHC.Core.InstEnv( DFunInstType )
@@ -526,11 +527,11 @@ There are two more similar "equality classes" like this.  The full list is
   on the grounds of Note [Instance and Given overlap], because many good
   things flow from [W] t1 ~# t2.
 
-Conclusion: we have a special solver pipeline for equality-class constraints,
-`solveEqualityDict`.  It aggressively decomposes the boxed equality constraint
-into an unboxed coercion, both for Givens and Wanteds, and /replaces/ the
-boxed equality constraint with the unboxed one, so that the inert set never
-contains the boxed one.
+The solver replaces equality-class Givens with primitive Givens and
+solves equality-class Wanteds via primitive equality. The inert set
+never contains a boxed equality. For a (~~) Given, the solver emits
+both the kind and the transported index equality. See Note [Projecting
+HEq# evidence] in GHC.Tc.Solver.Monad.
 
 Note [Solving tuple constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -570,15 +571,24 @@ solveEqualityDict :: CtEvidence -> Class -> [Type] -> SolverStage Void
 -- Precondition: (isEqualityClass cls) True, so cls is (~), (~~), or Coercible
 solveEqualityDict ev cls tys
   | CtGiven (GivenCt { ctev_evar = ev_id }) <- ev
-  , [sel_id] <- classSCSelIds cls  -- Equality classes have just one superclass
+  , cls == heqClass
+  , [_,_,lhs,rhs] <- tys
+  = Stage $
+    do { let loc = ctEvLoc ev
+             kind_loc = mkKindEqLoc lhs rhs loc
+       ; (kind_var, index_var) <- newHEqEvVars mkGivenEvBind tys ev_id
+       ; emitWorkNC [mkGivenEqCt loc index_var]
+       ; startAgainWith (mkNonCanonical (mkGivenEqCt kind_loc kind_var)) }
+
+  | CtGiven (GivenCt { ctev_evar = ev_id }) <- ev
+  , [sel_id] <- classSCSelIds cls  -- (~) and Coercible have one superclass
   = Stage $
     do { let loc = ctEvLoc ev
              sc_pred = classMethodInstTy sel_id tys
              ev_expr = EvExpr $ Var sel_id `mkTyApps` tys `App` evId ev_id
        -- See (EQC1) in Note [Solving equality classes]
-       -- This call to newGivenEv makes the evidence binding for the (unboxed) coercion
-       ; given_ev <- newGivenEv loc (sc_pred, ev_expr)
-       ; startAgainWith (mkNonCanonical $ CtGiven given_ev) }
+       ; co_id <- newBoundEvVarId sc_pred ev_expr
+       ; startAgainWith (mkNonCanonical (mkGivenEqCt loc co_id)) }
 
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev
   = Stage $
@@ -589,7 +599,8 @@ solveEqualityDict ev cls tys
                                 uType uenv t1 t2
          -- Set  d :: (t1~t2) = Eq# co
        ; setWantedDict dest EvCanonical $
-         evDictApp cls tys [Coercion co]
+         if cls == heqClass then evHEqDict tys co
+                            else evDictApp cls tys [Coercion co]
        ; stopWith ev "Solved wanted lifted equality" }
 
   | otherwise
@@ -866,11 +877,17 @@ tryShortCutSolver :: DynFlags
 -- Note that we only do this for the sake of performance. Exactly the same
 -- programs should typecheck regardless of whether we take this step or
 -- not. See Note [Shortcut solving]
+tryShortCutSolver _ _ DictCt { di_ev = ev }
+  | RetainedMethodOrigin{} <- ctLocOrigin (ctEvLoc ev)
+  = return False
+    -- A retained index depends on this evidence. Use the same lexical Given
+    -- at every optimization level. See Note [Checked source method evidence]
+    -- in GHC.Tc.Solver.Solve.
 tryShortCutSolver dflags try_short_cut dict_w
   | try_short_cut
   , DictCt { di_ev = ev_w } <- dict_w
-  , CtWanted (WantedCt { ctev_pred = pred_w }) <- ev_w
-  , not (couldBeIPLike pred_w)   -- Not for implicit parameters (#18627)
+  , CtWanted wanted <- ev_w
+  , not (couldBeIPLike (wantedCtPredType wanted))   -- Not for implicit parameters (#18627)
 
   , not (xopt LangExt.IncoherentInstances dflags)
               -- If IncoherentInstances is on then we cannot rely on coherence of proofs
@@ -933,12 +950,13 @@ try_instances inerts work_item@(DictCt { di_ev = ev@(CtWanted wev), di_cls = cls
 
 chooseInstance :: WantedCtEvidence -> ClsInstResult -> TcS ()
 chooseInstance work_item@(WantedCt { ctev_dest = dest, ctev_rewriters = rws
-                                   , ctev_loc = loc, ctev_pred = pred })
+                                   , ctev_loc = loc })
                (OneInst { cir_new_theta   = theta
                         , cir_what        = what
                         , cir_mk_ev       = mk_ev
                         , cir_canonical   = canonical })
-  = do { traceTcS "doTopReact/found instance for" $ ppr work_item
+  = do { let pred = wantedCtPredType work_item
+       ; traceTcS "doTopReact/found instance for" $ ppr work_item
 
       -- Check that the dfun is well-staged in the Template Haskell sense
        ; checkWellLevelledDFun loc what pred
@@ -1018,8 +1036,8 @@ noMatchableGivenDicts inerts@(IS { inert_cans = inert_cans }) loc_w clas tys
 
     matchable_given :: DictCt -> Bool
     matchable_given (DictCt { di_ev = ev })
-      | CtGiven (GivenCt { ctev_loc = loc_g, ctev_pred = pred_g }) <- ev
-      = isJust $ mightEqualLater inerts pred_g loc_g pred_w loc_w
+      | CtGiven (GivenCt { ctev_loc = loc_g }) <- ev
+      = isJust $ mightEqualLater inerts (ctEvPred ev) loc_g pred_w loc_w
 
       | otherwise
       = False
@@ -1244,7 +1262,7 @@ matchLocalInst body_pred loc
       | let in_scope = mkInScopeSet (qtv_set `unionVarSet` body_pred_tv_set)
       , Just tv_subst <- ruleMatchTyKiX qtv_set (mkRnEnv2 in_scope)
                                         emptyTvSubstEnv qbody body_pred
-      , let match = (qev, map (lookupVarEnv tv_subst) qtvs)
+      , let match = (qev, map (lookupVarEnv tv_subst . snd) qtvs)
       = (match:matches, unifs)
 
       | otherwise
@@ -1255,11 +1273,11 @@ matchLocalInst body_pred loc
         (matches, this_unif `combine` unifs)
       where
         qloc = ctEvLoc qev
-        qtv_set = mkVarSet qtvs
+        qtv_set = mkVarSet (map snd qtvs)
         (matches, unifs) = match_local_inst inerts qcis
         this_unif
           | Just subst <- mightEqualLater inerts qbody qloc body_pred loc
-          = Just (qev, map  (lookupTyVar subst) qtvs)
+          = Just (qev, map (lookupTyVar subst . snd) qtvs)
           | otherwise
           = Nothing
 
@@ -1697,6 +1715,12 @@ the sc_theta_ids at all. So our final construction is
      g_sc = /\ tvs. sel_id tys (g0 tvs)
   and if tvs=[] we get the straight superclass selection
      g_sc = sel_id tys g0
+
+New runtime lambdas have U matchability. Use U for the new superclass
+evidence telescope, even when g0 has M or unknown annotations. Applying
+g0 does not require U. The original quantified constraint keeps its
+annotations. The direct selection case creates no lambdas and keeps
+the selected type unchanged.
 -}
 
 makeSuperClasses :: [Ct] -> TcS [Ct]
@@ -1727,7 +1751,7 @@ makeSuperClasses cts = concatMapM go cts
 
 mkStrictSuperClasses
     :: ExpansionFuel -> CtEvidence
-    -> [TyVar] -> ThetaType  -- These two args are non-empty only when taking
+    -> [(Matchability, TyVar)] -> ThetaType  -- These two args are non-empty only when taking
                              -- superclasses of a /quantified/ constraint
     -> Class -> [Type] -> TcS [Ct]
 -- Return constraints for the strict superclasses of
@@ -1739,7 +1763,7 @@ mkStrictSuperClasses fuel ev tvs theta cls tys
                            ev tvs theta cls tys
 
 mk_strict_superclasses :: ExpansionFuel -> NameSet -> CtEvidence
-                       -> [TyVar] -> ThetaType
+                       -> [(Matchability, TyVar)] -> ThetaType
                        -> Class -> [Type] -> TcS [Ct]
 -- Always return the immediate superclasses of (cls tys);
 -- and expand their superclasses, provided none of them are in rec_clss
@@ -1758,6 +1782,7 @@ mk_strict_superclasses fuel rec_clss ev@(CtGiven (GivenCt { ctev_evar = evar }))
     loc  = ctEvLoc ev
     dict_ids  = mkTemplateLocals theta
     this_size = pSizeClassPred cls tys
+    runtime_tvs = [(unmatchableDataConTy,tv) | (_,tv) <- tvs]
 
     do_one_given sel_id
       | isUnliftedType sc_pred
@@ -1770,7 +1795,7 @@ mk_strict_superclasses fuel rec_clss ev@(CtGiven (GivenCt { ctev_evar = evar }))
       = do { given_ev <- newGivenEv sc_loc $
                          mk_given_desc sel_id sc_pred
            ; assertFuelPrecondition fuel $
-             mk_superclasses fuel rec_clss (CtGiven given_ev) tvs theta sc_pred }
+             mk_superclasses fuel rec_clss (CtGiven given_ev) runtime_tvs theta sc_pred }
       where
         sc_pred = classMethodInstTy sel_id tys
 
@@ -1780,11 +1805,14 @@ mk_strict_superclasses fuel rec_clss ev@(CtGiven (GivenCt { ctev_evar = evar }))
       = (swizzled_pred, EvExpr swizzled_evterm)
       where
         (sc_tvs, sc_rho)          = splitForAllTyCoVars sc_pred
-        (sc_theta, sc_inner_pred) = splitFunTys sc_rho
+        (_sc_mas, sc_theta, sc_inner_pred) = splitFunTys sc_rho
 
         all_tvs       = tvs `chkAppend` sc_tvs
         all_theta     = theta `chkAppend` (map scaledThing sc_theta)
-        swizzled_pred = mkInfSigmaTy all_tvs all_theta sc_inner_pred
+        swizzled_pred
+          | null tvs, null theta = sc_pred
+          | otherwise = mkInfSigmaTy [(unmatchableDataConTy,tv) | (_,tv) <- all_tvs]
+                                      all_theta sc_inner_pred
 
         -- evar   :: forall tvs. theta => cls tys
         -- sel_id :: forall cls_tvs. cls cls_tvs
@@ -1794,10 +1822,10 @@ mk_strict_superclasses fuel rec_clss ev@(CtGiven (GivenCt { ctev_evar = evar }))
           | null tvs, null theta -- See wrinkle (NQCS1)
           = Var sel_id `mkTyApps` tys `App` evId evar
           | otherwise
-          = mkLams all_tvs $ mkLams dict_ids $
+          = mkLams (map snd all_tvs) $ mkLams dict_ids $
             Var sel_id `mkTyApps` tys
-                       `App` (evId evar `mkVarApps` (tvs ++ dict_ids))
-                       `mkVarApps` sc_tvs
+                       `App` (evId evar `mkVarApps` (map snd tvs ++ dict_ids))
+                       `mkVarApps` (map snd sc_tvs)
 
     sc_loc | isCTupleClass cls = loc
            | otherwise         = loc { ctl_origin = mk_sc_origin (ctLocOrigin loc) }
@@ -1828,7 +1856,7 @@ mk_strict_superclasses fuel rec_clss ev@(CtGiven (GivenCt { ctev_evar = evar }))
 
 -- Wanted case
 mk_strict_superclasses fuel rec_clss
-  (CtWanted (WantedCt { ctev_pred = pty, ctev_loc = loc0, ctev_rewriters = rws }))
+  (CtWanted wanted@(WantedCt { ctev_loc = loc0, ctev_rewriters = rws }))
   tvs theta cls tys
   | all noFreeVarsOfType tys
   = return [] -- Wanteds with no variables yield no superclass constraints.
@@ -1839,7 +1867,7 @@ mk_strict_superclasses fuel rec_clss
   = assertPpr (null tvs && null theta) (ppr tvs $$ ppr theta) $
     concatMapM do_one (immSuperClasses cls tys)
   where
-    loc = loc0 `updateCtLocOrigin` WantedSuperclassOrigin pty
+    loc = loc0 `updateCtLocOrigin` WantedSuperclassOrigin (wantedCtPredType wanted)
 
     do_one sc_pred
       = do { traceTcS "mk_strict_superclasses Wanted" (ppr (mkClassPred cls tys) $$ ppr sc_pred)
@@ -1860,7 +1888,7 @@ But no variables means no improvement; case closed.
 -}
 
 mk_superclasses :: ExpansionFuel -> NameSet -> CtEvidence
-                -> [TyVar] -> ThetaType -> PredType -> TcS [Ct]
+                -> [(Matchability, TyVar)] -> ThetaType -> PredType -> TcS [Ct]
 -- Return this constraint, plus its superclasses, if any
 -- Precondition: fuel >= 0
 mk_superclasses fuel rec_clss ev tvs theta pred
@@ -1872,7 +1900,7 @@ mk_superclasses fuel rec_clss ev tvs theta pred
   = return [mkNonCanonical ev]
 
 mk_superclasses_of :: ExpansionFuel -> NameSet -> CtEvidence
-                   -> [TyVar] -> ThetaType -> Class -> [Type]
+                   -> [(Matchability, TyVar)] -> ThetaType -> Class -> [Type]
                    -> TcS [Ct]
 -- Always return this class constraint,
 -- and expand its superclasses

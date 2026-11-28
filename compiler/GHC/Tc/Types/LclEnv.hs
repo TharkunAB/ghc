@@ -11,6 +11,8 @@ module GHC.Tc.Types.LclEnv (
   , getLclEnvLoc
   , getLclEnvRdrEnv
   , getLclEnvTcLevel
+  , getLclEnvTermDepth
+  , getLclEnvIdDepths
   , getLclEnvThLevel
   , setLclEnvTcLevel
   , setLclEnvLoc
@@ -35,15 +37,17 @@ module GHC.Tc.Types.LclEnv (
 
 import GHC.Prelude
 
-import GHC.Tc.Utils.TcType ( TcLevel )
+import GHC.Tc.Utils.TcType ( TcLevel, TcType, TcTyVar, TermScopeDepth )
 import GHC.Tc.Errors.Types ( TcRnMessage )
 
 import GHC.Core.UsageEnv ( UsageEnv )
 
+import GHC.Types.Name ( Name )
 import GHC.Types.Name.Reader ( LocalRdrEnv )
 import GHC.Types.Name.Env ( NameEnv )
 import GHC.Types.SrcLoc ( RealSrcSpan )
-import GHC.Types.Basic ( TopLevelFlag )
+import GHC.Types.Basic ( TopLevelFlag, TypeOrKind )
+import GHC.Types.Var.Env ( VarEnv )
 
 import GHC.Types.Error ( Messages )
 
@@ -86,6 +90,8 @@ data TcLclEnv           -- Changes as we move inside an expression
 
         tcl_usage :: TcRef UsageEnv, -- Required multiplicity of bindings is accumulated here.
         tcl_lie  :: TcRef WantedConstraints,    -- Place to accumulate type constraints
+        -- Omitted arrows default at their source level. Telescope indices can generalize.
+        tcl_kind_arrow_defaults :: Maybe (TcRef [(TcTyVar, TypeOrKind)], TcRef [TcTyVar]),
         tcl_errs :: TcRef (Messages TcRnMessage)     -- Place to accumulate diagnostics
     }
 
@@ -96,6 +102,12 @@ data TcLclCtxt
         tcl_in_gen_code :: Bool,            -- Are we type checking a generated expression?
         tcl_err_ctxt    :: ErrCtxtStack,
         tcl_tclvl       :: TcLevel,
+        tcl_term_depth  :: !TermScopeDepth,
+        tcl_id_depths   :: !(VarEnv TermScopeDepth),
+        tcl_lexical_givens :: LexicalGivens, -- Evidence parameters and written premises.
+                                            -- See Note [Lexical Givens]
+                                            -- in GHC.Tc.Utils.Monad.
+        tcl_source_let_views :: VarEnv TcType, -- Candidates for argument selection.
         tcl_bndrs       :: TcBinderStack,   -- Used for reporting relevant bindings,
                                             -- and for tidying type
 
@@ -113,6 +125,8 @@ data TcLclCtxt
 
 
         tcl_th_ctxt    :: ThLevel,         -- Template Haskell context
+        tcl_th_retained_indices :: [Name], -- See Note [Retained indices in meta hooks]
+                                           -- in GHC.Tc.Gen.Splice.
         tcl_th_bndrs   :: ThBindEnv,       -- and binder info
             -- The ThBindEnv records the TH binding level of in-scope Names
             -- defined in this module (not imported)
@@ -152,6 +166,12 @@ modifyLclEnvTcLevel f = modifyLclCtxt (\env -> env { tcl_tclvl = f (tcl_tclvl en
 
 getLclEnvTcLevel :: TcLclEnv -> TcLevel
 getLclEnvTcLevel = tcl_tclvl . tcl_lcl_ctxt
+
+getLclEnvTermDepth :: TcLclEnv -> TermScopeDepth
+getLclEnvTermDepth = tcl_term_depth . tcl_lcl_ctxt
+
+getLclEnvIdDepths :: TcLclEnv -> VarEnv TermScopeDepth
+getLclEnvIdDepths = tcl_id_depths . tcl_lcl_ctxt
 
 setLclEnvLoc :: RealSrcSpan -> TcLclEnv -> TcLclEnv
 setLclEnvLoc loc = modifyLclCtxt (\lenv -> lenv { tcl_loc = loc })
@@ -250,8 +270,11 @@ Here the call of 'foo' gives rise to a (Foo a) constraint that should not
 be captured by the pattern match on 'Bar'.  Rather it should join the
 constraints from further out.  So we must capture the constraint bag
 from further out in the ArrowCtxt that we push inwards.
+Restore the lexical native Givens as well, so generated evidence applications
+cannot capture dictionaries introduced inside the proc.
 -}
 
 data ArrowCtxt   -- Note [Escaping the arrow scope]
   = NoArrowCtxt
-  | ArrowCtxt LocalRdrEnv (TcRef WantedConstraints)
+  | ArrowCtxt LocalRdrEnv (TcRef WantedConstraints) LexicalGivens (VarEnv TcType)
+              TermScopeDepth (VarEnv TermScopeDepth)

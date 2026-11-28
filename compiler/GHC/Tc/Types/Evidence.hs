@@ -6,7 +6,7 @@ module GHC.Tc.Types.Evidence (
   -- * HsWrapper
   HsWrapper(..),
   (<.>), mkWpTyApps, mkWpEvApps, mkWpEvVarApps, mkWpTyLams, mkWpForAllCast,
-  mkWpEvLams, mkWpLet, mkWpFun, mkWpCastN, mkWpCastR, mkWpEta, mkWpSubType,
+  mkWpEvLams, mkWpLet, mkWpFun, mkWpRetainedFun, mkWpExistsPack, mkWpCastN, mkWpCastR, mkWpEta, mkWpSubType,
   SubMultCo(..), mkSubMultFunCo, subMultCoRKind,
   collectHsWrapBinders,
   idHsWrapper, isIdHsWrapper, hsWrapperCast_maybe,
@@ -28,7 +28,7 @@ module GHC.Tc.Types.Evidence (
 
   -- * EvTerm (already a CoreExpr)
   EvTerm(..), EvExpr,
-  evId, evCoercion, evCast, evCastE, evDFunApp,  evDictApp, evSelector, evDelayedError,
+  evId, evCoercion, evCast, evCastE, evDFunApp, evDictApp, evHEqDict, evSelector, evDelayedError,
   mkEvScSelectors, evTypeable,
   evWrapIPE, evUnwrapIPE, evUnaryDictAppE,
   mkEvCast,
@@ -62,17 +62,18 @@ import GHC.Core.Coercion
 import GHC.Core.Ppr ()   -- Instance OutputableBndr TyVar
 import GHC.Core.Predicate
 import GHC.Core.Type
-import GHC.Core.TyCo.Rep (UnivCoProvenance(..))
+import GHC.Core.TyCo.Rep (Coercion(SubCo), UnivCoProvenance(..))
 import GHC.Core.TyCon
 import GHC.Core.Make    ( mkWildCase, mkRuntimeErrorApp, tYPE_ERROR_ID )
 import GHC.Core.Class   ( classTyCon )
-import GHC.Core.DataCon ( dataConWrapId )
+import GHC.Core.DataCon ( dataConWrapId, dataConWorkId )
 import GHC.Core.Class (Class, classSCSelId )
 import GHC.Core.FVs
 import GHC.Core.InstEnv ( CanonicalEvidence(..) )
 
 import GHC.Types.Unique.DFM
 import GHC.Types.Unique.FM
+import GHC.Types.Unique ( hasKey )
 import GHC.Types.Name( isInternalName )
 import GHC.Types.Var
 import GHC.Types.Id( idType )
@@ -82,8 +83,9 @@ import GHC.Types.Var.FV
 import GHC.Types.Basic
 
 import GHC.Builtin.KnownKeys
-import GHC.Builtin.WiredIn.Types( unitTy )
+import GHC.Builtin.WiredIn.Types( heqDataCon, unitTy, unmatchableDataConTy )
 
+import GHC.Data.Pair ( Pair(..) )
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Outputable
@@ -307,6 +309,14 @@ data HsWrapper
   -- so that the identity 'HsWrapper' is always exactly 'WpHole'.
   | WpLet TcEvBinds
 
+  -- | @WpRetainedFun force_eta x w[e] = \x. w[e x]@. The binder scopes over @w@.
+  -- When @force_eta@ is @True@, multiplicity changes so the lambda must be kept.
+  | WpRetainedFun Bool Id HsWrapper
+
+  -- | @WpExistsPack schema witness[e] = Pack schema witness e@.
+  -- Packs @e :: body[binder := witness]@ into @schema = ExistsTy ImplicitExists binder body@.
+  | WpExistsPack TcType TcType
+
   deriving Data.Data
 
 -- | The Semigroup instance is a bit fishy, since @WpCompose@, as a data
@@ -367,25 +377,29 @@ subMultCoRKind (OneSubMult w) = w
 -- | Like 'mkFunCo2' except that it allows for sub-multiplicity instead of
 -- a multiplicity coercion.
 mkSubMultFunCo :: FunTyFlag -> FunTyFlag
+               -> TcCoercionN -- ^ act_matchability ~N exp_matchability
                -> SubMultCo   -- ^ act_mult ~~> exp_mult
                -> TcCoercionR -- ^ act_arg  ~~> exp_arg
                -> TcCoercionR -- ^ act_res  ~~> exp_res
                -> TcCoercionR
-mkSubMultFunCo act_af exp_af (EqMultCo w_co) arg_co res_co =
+mkSubMultFunCo act_af exp_af ma_co (EqMultCo w_co) arg_co res_co =
   mkFunCo2 Representational act_af exp_af
+    ma_co
     w_co
     arg_co
     res_co
-mkSubMultFunCo act_af exp_af (OneSubMult w2) arg_co res_co =
+mkSubMultFunCo act_af exp_af ma_co (OneSubMult w2) arg_co res_co =
   mkUnivCo SubMultProv [] Representational
-    (mkFunTy act_af OneTy act_arg act_res)
-    (mkFunTy exp_af w2    act_arg act_res)
+    (mkFunTy act_af act_ma OneTy act_arg act_res)
+    (mkFunTy exp_af act_ma w2 act_arg act_res)
     `mkTransCo`
   mkFunCo2 Representational act_af exp_af
+    ma_co
     (mkNomReflCo w2)
     arg_co
     res_co
   where
+    act_ma  = coercionLKind ma_co
     act_arg = coercionLKind arg_co
     act_res = coercionLKind res_co
 
@@ -416,8 +430,19 @@ mkWpFun w1 w2 (wp_mult, t1) t2
                  , arg_wrap = w1, res_wrap = w2
                  , arg_type = t1, res_type = t2 }
   where
-    mk_wp_fun_co = mkSubMultFunCo FTF_T_T FTF_T_T wp_mult
+    mk_wp_fun_co = mkSubMultFunCo FTF_T_T FTF_T_T
+                    (mkNomReflCo unmatchableDataConTy) wp_mult
       -- FTF_T_T: WpFun is always (->)
+
+-- | Adapt the result of a visible retained function at its actual argument.
+mkWpRetainedFun :: Id -> HsWrapper -> HsWrapper
+mkWpRetainedFun _ WpHole = WpHole
+mkWpRetainedFun b (WpCast co) = mkWpCastR (mkDepFunCo b co)
+mkWpRetainedFun b wrap = WpRetainedFun False b wrap
+
+-- | Pack a payload into an implicit existential schema at a chosen witness.
+mkWpExistsPack :: TcType -> TcType -> HsWrapper
+mkWpExistsPack = WpExistsPack
 
 mkWpSubType :: HsWrapper -> HsWrapper
 -- See (DSST2) in Note [Deep subsumption and WpSubType]
@@ -454,8 +479,9 @@ mkWpCastN :: TcCoercionN -> HsWrapper
 mkWpCastN co
   | isReflCo co = WpHole
   | otherwise   = assertPpr (coercionRole co == Nominal) (ppr co) $
-                  WpCast (mkSubCo co)
-    -- The mkTcSubCo converts Nominal to Representational
+                  WpCast (SubCo co)
+    -- Keep the nominal proof until final zonking checks the scalar domains.
+    -- See Note [Zonking nominal native index casts] in GHC.Core.Coercion.
 
 mkWpTyApps :: [Type] -> HsWrapper
 mkWpTyApps tys = mk_co_app_fn WpTyApp tys
@@ -473,11 +499,15 @@ mkWpTyLams ids = mk_co_lam_fn WpTyLam ids
 --   forall tv. res  ~R#   forall tv{vis} res`.
 -- See Note [Required foralls in Core] in GHC.Core.TyCo.Rep
 --
--- It's a no-op if all binders are invisible;
--- but in that case we refrain from calling it.
-mkWpForAllCast :: [ForAllTyBinder] -> Type -> HsWrapper
+-- The metadata proof goes from runtime U to the target annotation.
+-- Invisible binders can also require a metadata cast.
+mkWpForAllCast :: [(CoercionN, ForAllTyBinder)] -> Type -> HsWrapper
 mkWpForAllCast bndrs res_ty
-  = mkWpCastR (mkForAllVisCos bndrs (mkRepReflCo res_ty))
+  = mkWpCastR (foldr step (mkRepReflCo res_ty) bndrs)
+  where
+    -- See Note [Runtime forall matchability] in GHC.Tc.Utils.Instantiate.
+    step (ma_co, Bndr tv vis) co
+      = mkForAllCo tv coreTyLamForAllTyFlag vis ma_co MRefl co
 
 mkWpEvLams :: [Var] -> HsWrapper
 mkWpEvLams ids = mk_co_lam_fn WpEvLam ids
@@ -532,6 +562,8 @@ hsWrapDictBinders wrap = go wrap
    go (WpTyLam {})        = emptyBag
    go (WpTyApp {})        = emptyBag
    go (WpLet   {})        = emptyBag
+   go (WpRetainedFun {})  = emptyBag
+   go (WpExistsPack {})   = emptyBag
 
 collectHsWrapBinders :: HsWrapper -> ([Var], HsWrapper)
 -- Collect the outer lambda binders of a HsWrapper,
@@ -576,6 +608,14 @@ optSubTypeHsWrapper wrap
     opt1 w@(WpEvApp {})         ws = w : ws
     opt1 (WpFun mult_co arg_wrap res_wrap arg_ty res_ty) ws
       = opt_fun mult_co arg_wrap res_wrap arg_ty res_ty ws
+    opt1 (WpRetainedFun True b w) ws
+      = WpRetainedFun True b (opt w) : ws
+    opt1 (WpRetainedFun False b w) ws
+      = case mkWpRetainedFun b (opt w) of
+          WpHole    -> ws
+          WpCast co -> opt_co co ws
+          w'        -> w' : ws
+    opt1 w@(WpExistsPack {}) ws = w : ws
 
     -----------------
     -- (WpTyLam a <.> WpTyApp a <.> w) = w
@@ -592,7 +632,7 @@ optSubTypeHsWrapper wrap
     -- (WpTyLam a <.> WpCastCo co <.> w)
     --    = WpCast (ForAllCo a co) (WpTyLam <.> w)
     opt_ty_lam tv (WpCast co : ws)
-      = opt_co (mkHomoForAllCo tv co) (opt_ty_lam tv ws)
+      = opt_co (mkHomoForAllCo (mkNomReflCo unmatchableDataConTy) tv co) (opt_ty_lam tv ws)
 
     opt_ty_lam tv ws
       = WpTyLam tv : ws
@@ -612,6 +652,7 @@ optSubTypeHsWrapper wrap
       = opt_co fun_co (opt_ev_lam ev ws)
       where
         fun_co = mkFunCo Representational FTF_C_T
+                        (mkNomReflCo unmatchableDataConTy)
                         (mkNomReflCo ManyTy)
                         (mkRepReflCo (idType ev))
                         co
@@ -648,6 +689,8 @@ optSubTypeHsWrapper wrap
     not_in _ (WpTyLam {}) = False    -- Give  up; conservative
     not_in _ (WpEvLam {}) = False    -- Ditto
     not_in _ (WpLet {})   = False    -- Ditto
+    not_in _ (WpRetainedFun {}) = False
+    not_in v (WpExistsPack s w) = not (anyFreeVarsOfType (== v) s) && not (anyFreeVarsOfType (== v) w)
 
     not_in_submult :: TyVar -> SubMultCo -> Bool
     not_in_submult v = \case
@@ -907,7 +950,7 @@ data EvTerm
   | EvTypeable Type EvTypeable   -- Dictionary for (Typeable ty)
 
   | EvFun     -- /\as \ds. let binds in v
-      { et_tvs   :: [TyVar]
+      { et_tvs   :: [(TcEvBinds, CoercionN, TyCoVar)] -- Prefix binds and nominal U-to-target proofs.
       , et_given :: [EvVar]
       , et_binds :: TcEvBinds  -- This field is why we need an EvFun
                                -- constructor, and can't just use EvExpr
@@ -954,7 +997,25 @@ evDFunAppE df tys ets = Var df `mkTyApps` tys `mkApps` ets
 evDictApp :: Class -> [Type] -> [EvExpr] -> EvTerm
 evDictApp cls tys args = EvExpr (evDictAppE cls tys args)
 
+-- | Pack nominal evidence for the endpoints of a boxed heterogeneous equality.
+-- See Note [The HEq# evidence telescope] in GHC.Builtin.WiredIn.Types.
+evHEqDict :: [Type] -> TcCoercionN -> EvTerm
+evHEqDict tys co = EvExpr (evHEqDictE tys co)
+
+evHEqDictE :: [Type] -> TcCoercionN -> EvExpr
+evHEqDictE tys co
+  = assert (coercionRole co == Nominal) $
+    evDFunAppE (dataConWorkId heqDataCon) tys [Coercion kind_co, Coercion index_co]
+  where
+    Pair lhs _ = coercionKind co
+    kind_co = mkKindCo co
+    index_co = mkGReflLeftCo Nominal lhs kind_co `mkTransCo` co
+
 evDictAppE :: Class -> [Type] -> [EvExpr] -> EvExpr
+evDictAppE cls tys [arg]
+  | cls `hasKey` heqTyConKey
+  = evHEqDictE tys (evExprCoercion arg)
+    -- Keep the evidence builder for callers with one coercion term.
 evDictAppE cls tys args
   = case tyConSingleDataCon_maybe (classTyCon cls) of
       Just dc -> evDFunAppE (dataConWrapId dc) tys args
@@ -1007,9 +1068,9 @@ data EvTypeable
     -- ^ Dictionary for @Typeable (s t)@,
     -- given a dictionaries for @s@ and @t@.
 
-  | EvTypeableTrFun EvTerm EvTerm EvTerm
-    -- ^ Dictionary for @Typeable (s % w -> t)@,
-    -- given a dictionaries for @w@, @s@, and @t@.
+  | EvTypeableTrFun EvTerm EvTerm EvTerm EvTerm
+    -- ^ Dictionary for an arrow. The evidence fields represent matchability,
+    -- multiplicity, argument and result, in that order.
 
   | EvTypeableTyLit EvTerm
     -- ^ Dictionary for a type literal,
@@ -1069,6 +1130,11 @@ evidence
 where
     d :: Typeable a
 is the lambda-bound dictionary passed into f.
+
+EvTypeableTrFun includes evidence for matchability before multiplicity. Its
+producer, free-variable traversal, zonker and desugarer preserve all four
+fields. See Note [Matchability in reflection] in
+GHC.Internal.Data.Typeable.Internal.
 
 Note [Coercion evidence terms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1343,12 +1409,22 @@ evTermFVs (EvExpr e)         = exprFVs e
 evTermFVs (EvTypeable _ ev)  = evFVsOfTypeable ev
 evTermFVs (EvFun { et_tvs = tvs, et_given = given
                  , et_binds = tc_ev_binds, et_body = v })
-  = case tc_ev_binds of
-      TcEvBinds {}  -> mempty  -- See Note [Free vars of EvFun]
+  = foldr forall_fvs body_fvs tvs
+  where
+    -- The proof is outside the current binder and all later Given evidence.
+    -- See Note [Runtime forall matchability] in GHC.Tc.Utils.Instantiate.
+    forall_fvs (prefix_binds, ma_co, tv) fvs
+      = let inner = exprFVs (Coercion ma_co) `mappend` addCoreBndrFV tv fvs
+        in case prefix_binds of
+          TcEvBinds {} -> inner
+          EvBinds binds -> addBndrsSelectiveFV (map eb_lhs (bagToList binds)) $
+            foldr (mappend . evTermFVs . eb_rhs) inner binds
+    body_fvs = case tc_ev_binds of
+      TcEvBinds {} -> mempty -- See Note [Free vars of EvFun].
       EvBinds binds -> addBndrsSelectiveFV bndrs fvs
         where
           fvs = foldr (mappend . evTermFVs . eb_rhs) (unitFV v) binds
-          bndrs = foldr ((:) . eb_lhs) (tvs ++ given) binds
+          bndrs = foldr ((:) . eb_lhs) given binds
 
 evTermFVss :: [EvTerm] -> SelectiveDFV
 evTermFVss = mapUnionFV evTermFVs
@@ -1358,7 +1434,7 @@ evFVsOfTypeable ev =
   case ev of
     EvTypeableTyCon _ e      -> mapUnionFV evTermFVs e
     EvTypeableTyApp e1 e2    -> evTermFVss [e1,e2]
-    EvTypeableTrFun em e1 e2 -> evTermFVss [em,e1,e2]
+    EvTypeableTrFun ema em e1 e2 -> evTermFVss [ema,em,e1,e2]
     EvTypeableTyLit e        -> evTermFVs e
 
 {- Note [Free vars of EvFun]
@@ -1372,7 +1448,8 @@ can just squeeze by.  Here's how.
     ic_binds field of an Implication
   * So we can track usage via the processing for that implication,
     (see Note [Tracking needed EvIds] in GHC.Tc.Solver).
-    We can ignore usage from the EvFun altogether.
+    We can ignore body usage from the EvFun. Metadata proofs are outside
+    et_binds, so evTermFVs must still visit them in prefix scope.
 
 * /After/ typechecking `evTermFVs` is used by `GHC.Iface.Ext.Ast`, but by
   then it has been zonked so we can get at the bindings.
@@ -1406,6 +1483,11 @@ pprHsWrapper wrap pp_thing_inside
     help it (WpFun w arg_wrap res_wrap t1 _t2)
       = add_parens $ text "\\(x" <> dcolon <> brackets (ppr $ subMultCoRKind w) <> ppr t1 <> text ")." <+>
                      help (\_ -> it True <+> help (\_ -> text "x") arg_wrap True) res_wrap False
+    help it (WpRetainedFun _ b w)
+      = add_parens $ text "\\" <> pprLamBndr b <> dot <+>
+                     help (\_ -> it True <+> ppr b) w False
+    help it (WpExistsPack schema witness)
+      = add_parens $ sep [text "pack" <> braces (ppr schema <> comma <+> ppr witness), it True]
     help it (WpCast co)   = add_parens $ sep [it False, nest 2 (text "|>"
                                               <+> pprParendCo co)]
     help it (WpEvApp id)  = no_parens  $ sep [it True, nest 2 (ppr id)]
@@ -1449,8 +1531,10 @@ instance Outputable EvTerm where
   ppr (EvExpr e)         = ppr e
   ppr (EvTypeable ty ev) = ppr ev <+> dcolon <+> text "Typeable" <+> ppr ty
   ppr (EvFun { et_tvs = tvs, et_given = gs, et_binds = bs, et_body = w })
-      = hang (text "\\" <+> sep (map pprLamBndr (tvs ++ gs)) <+> arrow)
+      = hang (text "\\" <+> sep (map ppr_tv tvs ++ map pprLamBndr gs) <+> arrow)
            2 (ppr bs $$ ppr w)   -- Not very pretty
+    where ppr_tv (prefix_binds, ma_co, tv)
+            = brackets (ppr prefix_binds) <+> pprLamBndr tv <> braces (ppr ma_co)
 
 instance Outputable EvCallStack where
   ppr EvCsEmpty
@@ -1462,9 +1546,10 @@ instance Outputable EvTypeable where
   ppr (EvTypeableTyCon ts _)     = text "TyCon" <+> ppr ts
   ppr (EvTypeableTyApp t1 t2)    = parens (ppr t1 <+> ppr t2)
   ppr (EvTypeableTyLit t1)       = text "TyLit" <> ppr t1
-  ppr (EvTypeableTrFun tm t1 t2) = parens (ppr t1 <+> arr <+> ppr t2)
+  ppr (EvTypeableTrFun ma tm t1 t2) = parens (ppr t1 <+> arr <+> ppr t2)
     where
       arr = pprArrowWithModifiers [ppr tm] visArgTypeLike Many
+            <+> char '@' <> parens (ppr ma)
 
 ----------------------------------------------------------------------
 -- A datatype used to pass information when desugaring quotations

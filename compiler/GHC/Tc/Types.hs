@@ -23,7 +23,9 @@ module GHC.Tc.Types(
 
         -- The environment types
         Env(..),
-        TcGblEnv(..), TcLclEnv(..), modifyLclCtxt, TcLclCtxt(..),
+        TcGblEnv(..), SourceRuleUses(..), emptySourceRuleUses,
+        SourceCheckState(..), emptySourceCheckState,
+        TcLclEnv(..), modifyLclCtxt, TcLclCtxt(..),
         setLclEnvTcLevel, getLclEnvTcLevel,
         setLclEnvLoc, getLclEnvLoc, lclEnvInGeneratedCode,
         IfGblEnv(..), IfLclEnv(..),
@@ -35,6 +37,7 @@ module GHC.Tc.Types(
 
         -- Renamer types
         HsCtxt,
+        LocalSignatureKinds,
         ImportAvails(..), emptyImportAvails, plusImportAvails,
         ImportUserSpec(..),
         ImpUserList(..), isDependOnlyImport,
@@ -68,9 +71,10 @@ module GHC.Tc.Types(
 
         -- TcSigInfo
         TcSigFun,
+        LexicalGivens(..), emptyLexicalGivens,
         TcSigInfo(..), TcIdSig(..),
         TcCompleteSig(..), TcPartialSig(..), TcPatSynSig(..),
-        TcIdSigInst(..),
+        TcIdSigInst(..), TcPendingTypeCall(..),
         isPartialSig, hasCompleteSig, tcSigInfoName, tcIdSigLoc,
         completeSigPolyId_maybe,
 
@@ -140,6 +144,9 @@ import {-# SOURCE #-} GHC.Tc.Errors.Hole.Plugin ( HoleFitPlugin )
 import GHC.Tc.Errors.Types
 
 import GHC.Core.Reduction ( Reduction(..) )
+import GHC.Core.Coercion (LiftingContext)
+import GHC.Core.Coercion.Axiom (CoAxiomRule)
+import GHC.Core (CoreExpr)
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep ( UnivCoDeps )
 import GHC.Core.TyCon  ( TyCon )
@@ -159,6 +166,8 @@ import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Types.Avail
 import GHC.Types.Var
+import GHC.Types.Var.Env (VarEnv)
+import GHC.Types.Var.Set (VarSet)
 import GHC.Types.TypeEnv
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
@@ -295,6 +304,9 @@ type IfL        = IfM IfLclEnv                --    Nested
 -- | Historical "renaming monad" (now it's just 'TcRn').
 type RnM  = TcRn
 
+-- | Erased binders and their optional written kinds in enclosing value signatures.
+type LocalSignatureKinds = [(LocatedN Name, Maybe (LHsType GhcRn))]
+
 -- | Historical "type-checking monad" (now it's just 'TcRn').
 type TcM  = TcRn
 
@@ -369,6 +381,37 @@ data RewriteEnv
           --
           -- See Note [Computing coercion dependencies] in GHC.Tc.Solver.Rewrite.
 
+       , re_source_proof :: !(Maybe (TcRef (Bool, [(CoAxiomRule, TcCoercion, Name, [SourceProofRule])])))
+          -- ^ Active source-proof tracking for nominal Wanteds when dependent
+          -- constructs are active; 'Nothing' during ordinary rewriting.
+          -- See Note [Committing checked source family branches]
+          -- in GHC.Tc.Solver.Rewrite.
+
+       , re_evidence_path :: ![(EqRel, TcType)]
+          -- ^ Family evidence already used on the current rewrite path.
+          -- See Note [Mixed-flavour family rewrite cycles]
+          -- in GHC.Tc.Solver.Rewrite.
+
+       , re_native_lifting :: !LiftingContext
+          -- ^ Source runtime binder relations in the common rewriting prefix.
+          -- See Note [Lifting runtime binder domains] in GHC.Core.Coercion.
+
+       , re_source_lets :: !(VarEnv CoVar)
+          -- ^ Selected source definitions in this implication.
+          -- See Note [Rewriting checked local indices] in GHC.Tc.Solver.Rewrite.
+
+       , re_native_binders :: !VarSet
+          -- ^ Retained runtime binders in scope during normalization.
+          -- Imported Given evidence must not depend on these Ids.
+          -- New evidence and cache effects remain disabled in this scope.
+          -- See Note [Rewriting retained dependent functions]
+          -- in GHC.Tc.Solver.Rewrite.
+
+       , re_fam_axioms_only :: !Bool
+          -- ^ Reduce family axioms without inert evidence, plugins or caches.
+          -- See Note [Solving retained function equalities]
+          -- in GHC.Tc.Solver.Equality.
+
        , re_zap_coercions :: !Bool
           -- ^ Whether to perform coercion zapping.
           --
@@ -400,9 +443,12 @@ data IfGblEnv
         -- We need the module name so we can test when it's appropriate
         -- to look in this env.
         -- See Note [Tying the knot] in GHC.IfaceToCore
-        if_rec_types :: KnotVars (IfG TypeEnv)
+        if_rec_types :: KnotVars (IfG TypeEnv),
                 -- Allows a read effect, so it can be in a mutable
                 -- variable; c.f. handling the external package type env
+
+        if_has_dep_imports :: !(Maybe (TcRef Bool))
+                -- Records whether any loaded interface contains dependent constructs.
     }
 
 data IfLclEnv
@@ -502,6 +548,49 @@ data FrontendResult
 --        since that will actually say the specific interface you
 --        want to track (and recompile if it changes)
 
+-- | Rewrite dependencies from checked source applications and imported proofs.
+data SourceRuleUses = SourceRuleUses
+  { sourceRuleTypes :: NameEnv NameSet
+  , sourceProofSignature :: Maybe Name
+  , sourceProofDefinitions :: NameEnv [SourceProofRule]
+  , sourceProofOccurrences :: [(Name, SrcSpan, [SourceProofRule])]
+  , sourceProofClosedResults :: NameSet
+  }
+
+-- | No checked source applications or imported proof occurrences.
+emptySourceRuleUses :: SourceRuleUses
+emptySourceRuleUses = SourceRuleUses emptyNameEnv Nothing emptyNameEnv [] emptyNameSet
+
+-- | Accumulated source-equation, evaluated-term, and rewrite-rule dependencies
+-- for the module being typechecked.
+data SourceCheckState = SourceCheckState
+  { scs_table_uses     :: !NameSet
+    -- ^ Type Names record missing imported tables and tables used by retained
+    -- calls. A local table Name records an actual use. Term Names record the
+    -- DFun, selector and source target of a retained method application.
+    -- See Note [Source table usage fingerprints] in GHC.Unit.Module.ModIface.
+  , scs_evaluated_uses :: !NameSet
+    -- ^ Definitions and constructors used in compile-time type evaluation.
+  , scs_rule_uses      :: !SourceRuleUses
+    -- ^ Known first type arguments to retained rule heads and proof occurrences.
+  , scs_home_rule_deps :: !(Map Module Fingerprint)
+    -- ^ Complete home interfaces inspected by accepted source proofs.
+  , scs_optional_uses  :: ![(TcEvBinds, CoVar, [Id], [(Id, Maybe Name)], [Name])]
+    -- ^ Deferred source dependencies: evidence, proof, term owners,
+    -- rule heads with known type arguments, and table Names.
+    -- See Note [Optional source dependencies] in GHC.Tc.Gen.SourceTable.
+  }
+
+-- | Initial empty 'SourceCheckState'.
+emptySourceCheckState :: SourceCheckState
+emptySourceCheckState = SourceCheckState
+  { scs_table_uses     = emptyNameSet
+  , scs_evaluated_uses = emptyNameSet
+  , scs_rule_uses      = emptySourceRuleUses
+  , scs_home_rule_deps = M.empty
+  , scs_optional_uses  = []
+  }
+
 -- | 'TcGblEnv' describes the top-level of the module at the
 -- point at which the typechecker is finished work.
 -- It is this structure that is handed on to the desugarer
@@ -600,6 +689,22 @@ data TcGblEnv
           -- they all have a non-empty gre_imp field.
         tcg_keep      :: TcRef NameSet,
 
+        tcg_has_dep_imports :: !(TcRef Bool),
+          -- ^ @True@ once an imported interface with dependent constructs is loaded.
+
+        tcg_source_check :: !(TcRef SourceCheckState),
+          -- ^ Accumulated source-equation, evaluated-term, and rewrite-rule
+          -- dependencies for this module.
+
+        tcg_local_open_demands :: Maybe (TcRef [(Name, SrcSpan)]),
+          -- ^ Record only the local term heads admitted by the source group renamer.
+
+        tcg_local_open_defs :: NameEnv (Id, CoreExpr),
+          -- ^ Solved local producers. Scope this map to the rest of their group.
+
+        tcg_local_open_owners :: NameEnv Id,
+          -- ^ Source owners of demanded monomorphic binders inside checked Core.
+
         tcg_th_used :: TcRef Bool,
           -- ^ @True@ \<=> Template Haskell syntax used.
           --
@@ -642,6 +747,12 @@ data TcGblEnv
         tcg_rn_decls :: Maybe (HsGroup GhcRn),
           -- ^ Renamed decls, maybe.  @Nothing@ \<=> Don't retain renamed
           -- decls.
+
+        tcg_rn_local_lambdas
+          :: Maybe (LocalSignatureKinds, LocalSignatureKinds -> HsDocContext
+                    -> LHsSigWcType GhcPs -> RnM (Maybe (LHsSigWcType GhcRn, FreeNames))),
+          -- ^ Scope and helper accumulator for local type lambdas.
+          -- Set only while renaming value bindings in one declaration group.
 
         tcg_dependent_files :: TcRef [FilePath], -- ^ dependencies from addDependentFile
         tcg_dependent_dirs  :: TcRef [FilePath], -- ^ dependencies from addDependentDirectory

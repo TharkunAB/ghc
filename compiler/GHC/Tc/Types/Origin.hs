@@ -188,6 +188,14 @@ data SkolemInfoAnon
   | StaticFormSkol      -- Attached to an implication constraint that captures
                         -- the constraints from (static e)
 
+  | SourceLetSkol Name  -- Conditional equality in the body of this local definition.
+
+  | RetainedAppSkol     -- Keep evidence within a runtime index's scope.
+                        -- See Note [Retained application evidence] in GHC.Tc.Gen.App.
+
+  | ExistsUnpackSkol    -- Application-scoped implicit existential opening.
+                        -- See Note [Implicit existential arguments] in GHC.Tc.Gen.App.
+
 
 -- | Use this when you can't specify a helpful origin for
 -- some skolem type variable.
@@ -248,6 +256,9 @@ pprSkolInfo ReifySkol             = text "the type being reified"
 pprSkolInfo RuntimeUnkSkol     = text "Unknown type from GHCi runtime"
 pprSkolInfo ArrowReboundIfSkol = text "the expected type of a rebound if-then-else command"
 pprSkolInfo StaticFormSkol     = text "a static expression"
+pprSkolInfo (SourceLetSkol n)  = text "the local definition of" <+> quotes (ppr n)
+pprSkolInfo RetainedAppSkol    = text "a retained application"
+pprSkolInfo ExistsUnpackSkol   = text "an existential package opening"
 pprSkolInfo DefaultSkol        = text "a constraint being defaulted"
 
 -- unkSkol
@@ -521,6 +532,8 @@ data CtOrigin
       Type   -- the instantiated type of the method
   | AmbiguityCheckOrigin UserTypeCtxt
   | ImplicitLiftOrigin HsImplicitLiftSplice
+  | RetainedMethodOrigin Name -- ^ A dictionary that justifies a retained index.
+  | TypeOperandOrigin (LHsWcType GhcRn)
 
 
 data NonLinearPatternReason
@@ -605,6 +618,7 @@ exprCtOrigin (HsQualLit _ lit)    = QualLiteralOrigin lit
 exprCtOrigin (HsLam _ _ ms)       = matchesCtOrigin ms
 exprCtOrigin (HsApp _ e1 _)       = lexprCtOrigin e1
 exprCtOrigin (HsAppType _ e1 _)   = lexprCtOrigin e1
+exprCtOrigin (HsAppRetained _ e1 _) = lexprCtOrigin e1
 exprCtOrigin (OpApp _ _ op _)     = lexprCtOrigin op
 exprCtOrigin (NegApp _ e _)       = lexprCtOrigin e
 exprCtOrigin (HsPar _ e)          = lexprCtOrigin e
@@ -626,7 +640,7 @@ exprCtOrigin (HsTypedSplice {})    = Shouldn'tHappenOrigin "TH typed splice"
 exprCtOrigin (HsUntypedSplice {})  = Shouldn'tHappenOrigin "TH untyped splice"
 exprCtOrigin (HsProc {})         = Shouldn'tHappenOrigin "proc"
 exprCtOrigin (HsStatic {})       = Shouldn'tHappenOrigin "static expression"
-exprCtOrigin (HsEmbTy {})        = Shouldn'tHappenOrigin "type expression"
+exprCtOrigin (HsEmbTy _ ty)      = TypeOperandOrigin ty
 exprCtOrigin (HsStar {})         = Shouldn'tHappenOrigin "star expression"
 exprCtOrigin (HsHole _)          = Shouldn'tHappenOrigin "hole expression"
 exprCtOrigin (HsForAll {})       = Shouldn'tHappenOrigin "forall telescope"    -- See Note [Types in terms]
@@ -790,8 +804,10 @@ pprCtOriginBriefly = ppr_br  -- ppr_br is a local function with a short name!
 
 ppr_br :: CtOrigin -> SDoc
 ppr_br (OccurrenceOf name)   = hsep [text "a use of", quotes (ppr name)]
+ppr_br (RetainedMethodOrigin name) = ppr_br (OccurrenceOf name)
 ppr_br (OccurrenceOfRecSel name) = hsep [text "a use of", quotes (ppr name)]
 ppr_br AppOrigin             = text "an application"
+ppr_br (TypeOperandOrigin ty) = text "the type operand" <+> quotes (text "type" <+> ppr ty)
 ppr_br (IPOccOrigin name)    = hsep [text "a use of implicit parameter", quotes (ppr name)]
 ppr_br (PushedCallStackOrigin fs) = hsep [text "a use of", quotes (ftext fs)]
 ppr_br (OverLabelOrigin l)   = hsep [text "the overloaded label"
@@ -900,6 +916,7 @@ foldMapCtOrigin f = go
         GivenOrigin {} -> f orig
         GivenSCOrigin {} -> f orig
         OccurrenceOf {} -> f orig
+        RetainedMethodOrigin {} -> f orig
         OccurrenceOfRecSel {} -> f orig
         AppOrigin {} -> f orig
         SpecPragOrigin {} -> f orig
@@ -907,6 +924,7 @@ foldMapCtOrigin f = go
         IPOccOrigin {} -> f orig
         PushedCallStackOrigin {} -> f orig
         OverLabelOrigin {} -> f orig
+        TypeOperandOrigin {} -> f orig
         LiteralOrigin {} -> f orig
         QualLiteralOrigin {} -> f orig
         NegateOrigin {} -> f orig

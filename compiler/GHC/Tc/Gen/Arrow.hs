@@ -306,8 +306,8 @@ tc_cmd env cmd@(HsCmdArrForm fixity expr f cmd_args) (cmd_stk, res_ty)
   = addErrCtxt (CmdCtxt cmd)
     do  { (cmd_args', cmd_tys) <- mapAndUnzipM tc_cmd_arg cmd_args
                               -- We use alphaTyVar for 'w'
-        ; let e_ty = mkInfForAllTy alphaTyVar $
-                     mkVisFunTysMany cmd_tys $
+        ; let e_ty = mkInfForAllTy unmatchableDataConTy alphaTyVar $
+                     mkVisFunTysManyU cmd_tys $
                      mkCmdArrTy env (mkPairTy alphaTy cmd_stk) res_ty
         ; expr' <- tcCheckPolyExpr expr e_ty
         ; return (HsCmdArrForm fixity expr' f cmd_args') }
@@ -452,7 +452,7 @@ tcCmdSyntaxTable loc orig ty (CST tbl)
             ; hasFixedRuntimeRepRes std_occ user_nm_expr sigma1
             ; return (std_occ, unLoc expr) }
        where
-         ([tv], _, tau) = tcSplitSigmaTy (idType std_id)
+         ([(_ma,tv)], _, tau) = tcSplitSigmaTy (idType std_id)
          sigma1         = substTyWith [tv] [ty] tau
          -- Actually, the "tau-type" might be a sigma-type in the
          -- case of locally-polymorphic methods.
@@ -468,7 +468,7 @@ hasFixedRuntimeRepRes std_occ user_expr ty
    do_check arity
      = hasFixedRuntimeRep_syntactic (FRRArrow $ ArrowFun user_expr) res_ty
      where
-       res_ty = nTimes arity (snd . splitPiTy) ty
+       res_ty = nTimes arity (\ty -> case splitPiTy ty of (_,_,res) -> res) ty
 
 arity_map :: OccEnv Arity
 -- Arity of the arrow operation, counting type-level arguments
@@ -572,4 +572,4 @@ mkPairTy :: Type -> Type -> Type
 mkPairTy t1 t2 = mkTyConApp pairTyCon [t1,t2]
 
 arrowTyConKind :: Kind          --  *->*->*
-arrowTyConKind = mkVisFunTysMany [liftedTypeKind, liftedTypeKind] liftedTypeKind
+arrowTyConKind = mkVisFunTysManyM [liftedTypeKind, liftedTypeKind] liftedTypeKind

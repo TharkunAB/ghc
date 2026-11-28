@@ -22,6 +22,7 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 
 import GHC.Core.FamInstEnv
+import GHC.Core.Type( isMatchableFunTy, typeKind )
 import GHC.Core.Coercion
 import GHC.Core.TyCo.Rep( Type(..) )
 import GHC.Core.TyCo.Subst( deepSubstTy, elemSubst, extendTvSubstWithClone )
@@ -448,7 +449,11 @@ insolubleFunDep is_top ev
 tryDictFunDepsTop :: DictCt -> SolverStage ()
 tryDictFunDepsTop dict_ct@(DictCt { di_ev = ev, di_cls = cls, di_tys = xis })
   = Stage $
-    do { inst_envs <- getInstEnvs
+    do { mode <- getTcSMode
+       ; if tcsmGivenOnly mode then continueWith () else improve }
+  where
+    improve = do
+       { inst_envs <- getInstEnvs
 
        ; traceTcS "tryDictFunDepsTop {" (ppr dict_ct)
        ; let eqns :: [FunDepEqns]
@@ -663,15 +668,20 @@ mkTopClosedFamEqFDs ax work_args (EqCt { eq_ev = ev, eq_rhs = work_rhs })
   = Stage $ continueWith []
 
 isGenerativeType :: Type -> Bool
--- True <=> This type cannot rewrite to, or be substituted to,
---          a saturated type-family application
+-- True if the outer head rules out a saturated type-family application.
 -- See (CF5) in Note [Exploiting closed type families]
 isGenerativeType ty | Just ty' <- coreView ty = isGenerativeType ty'
+isGenerativeType (TermAppTy {}) = False
+isGenerativeType (TermVarTy {})  = False
+isGenerativeType (ClassAppTy {}) = False
+isGenerativeType (DepFunTy {})   = False
+isGenerativeType (DepDictTy {})  = False
+isGenerativeType (ExistsTy {})   = False
 isGenerativeType (FunTy {})      = True
 isGenerativeType (CastTy ty _)   = isGenerativeType ty
 isGenerativeType (ForAllTy {})   = True
 isGenerativeType (TyConApp tc _) = isGenerativeTyCon tc Nominal
-isGenerativeType (AppTy {})      = True
+isGenerativeType (AppTy fun _)   = isMatchableFunTy (typeKind fun)
 isGenerativeType (LitTy {})      = True
 isGenerativeType (TyVarTy {})    = False
 isGenerativeType (CoercionTy {}) = False
@@ -714,7 +724,8 @@ getRelevantBranches ax work_args work_rhs
                             -- See (RW1)-(RW3) in Note [Relevance]
             , let lhs_tys' = map (deepSubstTy subst) lhs_tys
                   -- deepSubstTy: see (CF8) in Note [Exploiting closed type families]
-            , noEarlierMatchCheck lhs_tys' branch  -- See (RW4) in Note [Relevance]
+            , noEarlierMatchCheck (coAxiomTyCon ax) lhs_tys' branch
+                -- See (RW4) in Note [Relevance]
             = -- Ignore the substitution, except for `noEarlierMatchCheck`
               Just $
               if all (`elemSubst` subst) qtvs
@@ -1380,6 +1391,14 @@ Key point: equations that are not relevant do not need to be considered for fund
   rhs we must be sure that `rhs` can't turn into `F tys`.  The only way to be
   sure of that is if `rhs` is headed by a generative type constructor. See
   `isGenerativeType`.
+
+  A retained variable can stand for the result of a family application.
+  For example, the induction hypothesis for right identity of addition
+  relates the runtime index m to Plus m Zero. Seeing m does not tell us
+  which equation of Plus produced it. The same applies to an opaque
+  callback or selector result. For an application, check the matchability
+  of the consumed binder before relying on its head. We also skip this
+  optional improvement for retained, dictionary and existential binders.
 
   Otherwise prinicple (FUNDEP-COMPLETENESS) is threatened.
 

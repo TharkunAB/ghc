@@ -16,8 +16,11 @@ module GHC.Tc.Solver.Monad (
     runTcSEqualities,
     nestTcS, nestImplicTcS, tryShortCutTcS, nestFunDepsTcS,
     setEvBindsTcS, setTcLevelTcS,
+    getNativeBinderScope, withNativeBinderScope, getSourceLetScope, withSourceLetProof,
+    getTcSTermDepth, getTcSIdDepths, getSolverIdDepthsFor, withImplicTermScope,
+    withPendingImplics, hasPendingImplics,
 
-    selectNextWorkItem,
+    selectNextWorkItem, deferOpenAppEq,
     getWorkList,
     updWorkListTcS,
     pushLevelNoWorkList, pushTcLevelM_,
@@ -45,19 +48,19 @@ module GHC.Tc.Solver.Monad (
     CanonicalEvidence(..),
 
     newTcEvBinds, newNoTcEvBinds,
-    newWantedEq,
+    newWantedEq, newWantedEqEvidence,
     newWanted,
     newWantedNC, newWantedEvVarNC,
-    newBoundEvVarId,
+    newBoundEvVarId, newHEqEvVars,
     unifyTyVar, reportFineGrainUnifications, reportCoarseGrainUnifications,
     setEvBind, setWantedEq, setWantedDict, setEqIfWanted, setDictIfWanted,
     fillCoercionHole,
     newEvVar, newGivenEv, emitNewGivens,
-    emitChildEqs, bumpReductionDepth,
+    emitChildEqs, bumpReductionDepth, bumpReductionDepthTcM,
 
     getInstEnvs, getFamInstEnvs,                -- Getting the environments
     getTopEnv, getGblEnv, getLclEnv, setSrcSpan,
-    getTcEvBindsVar, getTcLevel,
+    getTcEvBindsVar, getInScopeEvBindsVars, getTcLevel,
     getTcEvBindsMap, setTcEvBindsMap, getTcEvBindsState, combineTcEvBinds,
     tcLookupKnownKeyId,
 
@@ -65,7 +68,7 @@ module GHC.Tc.Solver.Monad (
     updInertSet, updInertCans,
     getHasGivenEqs, setInertCans,
     getInertEqs, getInertCans, getInertGivens,
-    getInertInsols, getInnermostGivenEqLevel,
+    getInertInsols, getInnermostGivenEqLevel, withCoVarTouchabilityBoundary,
     getInertSet, setInertSet,
     getUnsolvedInerts,
     removeInertCts, getPendingGivenScs,
@@ -127,14 +130,17 @@ import GHC.Driver.Env
 import qualified GHC.Tc.Utils.Instantiate as TcM
 import GHC.Core.InstEnv
 import GHC.Tc.Instance.Family as FamInst
+import GHC.Tc.Gen.SourceTable (recordSourceLiteralUse, sourceTableFamilyAppUse)
 import GHC.Core.FamInstEnv
 
 import qualified GHC.Tc.Utils.Monad    as TcM
 import qualified GHC.Tc.Utils.TcMType  as TcM
 import qualified GHC.Tc.Instance.Class as TcM( matchGlobalInst, ClsInstResult(..) )
 import qualified GHC.Tc.Utils.Env      as TcM
-       ( tcGetDefaultTys, tcLookupKnownKeyId, tcLookupKnownKeyTyCon )
+       ( tcGetDefaultTys, tcLookupIdMaybe, tcLookupKnownKeyId, tcLookupKnownKeyTyCon )
+import GHC.Iface.Env ( lookupOrig )
 import GHC.Tc.Zonk.Monad ( ZonkM )
+import GHC.Tc.Zonk.Type ( withReadOnlyFinalZonk )
 import qualified GHC.Tc.Zonk.TcType  as TcM
 
 import GHC.Driver.DynFlags
@@ -156,8 +162,15 @@ import GHC.Tc.Types.Origin
 import GHC.Tc.Types.CtLoc
 import GHC.Tc.Types.Constraint
 
+import GHC.Builtin.CoercionRules ( proveFromNaturalNum )
 import GHC.Builtin.KnownKeys ( callStackTyConKey, exceptionContextTyConKey )
+import GHC.Builtin.KnownOccs ( fromIntegerClassOpOcc )
+import GHC.Builtin.Modules ( gHC_INTERNAL_TYPENATS, mkGhcInternalModule )
+import GHC.Builtin.WiredIn.Types ( heqDataCon )
 
+import GHC.Core ( Expr(Var,Coercion), Alt(..), AltCon(DataAlt) )
+import GHC.Core.DataCon ( promoteDataCon )
+import GHC.Core.Make ( mkWildCase )
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep as Rep
 import GHC.Core.TyCo.Tidy
@@ -167,6 +180,8 @@ import GHC.Core.Predicate
 import GHC.Core.Reduction
 import GHC.Core.Class
 import GHC.Core.TyCon
+import GHC.Data.FastString ( fsLit )
+import Data.Maybe ( fromMaybe )
 import GHC.Core.Unify (typesAreApart)
 
 import GHC.LanguageExtensions as LangExt
@@ -177,6 +192,7 @@ import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.DefaultEnv ( DefaultEnv )
 import GHC.Types.Var
+import GHC.Types.Var.Env (VarEnv, elemVarEnv, emptyVarEnv, extendVarEnv, extendVarEnvList, plusVarEnv)
 import GHC.Types.Var.Set
 import GHC.Types.Unique.Supply
 import GHC.Types.Id
@@ -197,6 +213,8 @@ import GHC.Data.Pair
 import GHC.Utils.Monad
 
 import GHC.Exts (oneShot)
+
+import qualified Data.Sequence as Seq
 
 import Control.Monad
 import Data.Foldable hiding ( foldr1 )
@@ -330,8 +348,7 @@ addInertQCI new_qci
                   -- A qci_body like (f a) might be an equality
 
              ics2 | not_equality = ics1
-                  | otherwise    = ics1 { inert_given_eq_lvl = tclvl
-                                        , inert_given_eqs    = True }
+                  | otherwise    = updGivenEqLevel tclvl ics1
 
        ; setInertCans ics2 }
   where
@@ -552,12 +569,12 @@ kickOutAfterFillingCoercionHole hole (CPH { cph_holes = new_holes })
 
     kick_out_eq :: EqCt -> Either EqCt EqCt
     kick_out_eq eq_ct@(EqCt { eq_ev = ev })
-      | CtWanted (wev@(WantedCt { ctev_rewriters = rewriters })) <- ev
+      | CtWanted (WantedCt { ctev_rewriters = rewriters }) <- ev
       , hole `elemCoHoleSet` rewriters
       , is_meta_tv_equality eq_ct
       , let rewriters' = (rewriters `delCoHoleSet` hole) `mappend` new_holes
                          -- Adding new_holes and deleting hole: see (KOC2)
-            eq_ct' = eq_ct { eq_ev = CtWanted (wev { ctev_rewriters = rewriters' }) }
+            eq_ct' = eq_ct { eq_ev = setCtEvRewriters ev rewriters' }
       = if isEmptyCoHoleSet rewriters'
         then Left eq_ct'    -- Kick out, if new rewriter set is empty (KOC1)
         else Right eq_ct'   -- Keep, but with trimmed holes see (KOC2)
@@ -718,7 +735,51 @@ getInertEqs = do { inert <- getInertCans; return (inert_eqs inert) }
 
 getInnermostGivenEqLevel :: TcS TcLevel
 getInnermostGivenEqLevel = do { inert <- getInertCans
-                              ; return (inert_given_eq_lvl inert) }
+                              ; touchabilityLevel (inert_given_eq_lvl inert) }
+
+-- | Include the lexical CoVar boundary in the unification level.
+touchabilityLevel :: TcLevel -> TcS TcLevel
+touchabilityLevel given_level = mkTcS $ \env ->
+  return (maybe given_level (maxTcLevel given_level) (tcs_covar_level env))
+
+-- | Keep outer metavariables untouchable while comparing a CoVar body.
+-- See Note [CoVar forall touchability].
+withCoVarTouchabilityBoundary :: TcS a -> TcS a
+withCoVarTouchabilityBoundary (TcS thing_inside)
+  = TcS $ \env@(TcSEnv { tcs_inerts = old_inert_var }) ->
+    do { level <- TcM.getTcLevel
+       ; old_inerts <- TcM.readTcRef old_inert_var
+       ; new_inert_var <- TcM.newTcRef $
+           pushCycleBreakerVarStack (resetInertCans old_inerts)
+       ; new_wl_var <- TcM.newTcRef emptyWorkList
+       ; let boundary = maybe level (maxTcLevel level) (tcs_covar_level env)
+       ; result <- thing_inside (env { tcs_covar_level = Just boundary
+                                     , tcs_inerts = new_inert_var
+                                     , tcs_worklist = new_wl_var })
+       ; final_inerts <- TcM.readTcRef new_inert_var
+       ; restoreTyVarCycles final_inerts
+       ; return result }
+
+{- Note [CoVar forall touchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A ForAllCo body can use its CoVar only in Refl and GRefl (FC6). Do not add
+that CoVar as a usable Given equality when comparing the bodies. However,
+unification normally relies on a Given-equality boundary to prevent a
+CoVar from escaping into an outer metavariable. CoVars have no TcLevel.
+See checkPromoteFreeVars in GHC.Tc.Utils.Unify.
+
+Keep a lexical touchability level for this body instead. Nested solver
+scopes inherit it. The level restricts unification and floating, but it
+does not add Given evidence or enable rewriting. The eager unifier uses
+the same level after crossing the CoVar binder. Before scoped solving,
+can_eq_nc_forall solves constraints with no free local CoVar outside this
+boundary. This permits safe updates such as alpha := Int.
+
+Keep body inerts and caches local as well. A solved dictionary can refer
+to the bound proof even when proof irrelevance makes its predicate equal
+to a predicate outside this scope. Restore local cycle breakers before
+discarding the local inert set. Keep the shared evidence bindings.
+-}
 
 -- | Retrieves all insoluble constraints from the inert set,
 -- specifically including Given constraints.
@@ -859,8 +920,9 @@ getHasGivenEqs :: TcLevel             -- TcLevel of this implication
 getHasGivenEqs tclvl
   = do { inerts@(IC { inert_irreds       = irreds
                     , inert_given_eqs    = given_eqs
-                    , inert_given_eq_lvl = ge_lvl })
+                    , inert_given_eq_lvl = given_level })
               <- getInertCans
+       ; ge_lvl <- touchabilityLevel given_level
        ; let given_insols = filterBag insoluble_given_equality irreds
                       -- Specifically includes ones that originated in some
                       -- outer context but were refined to an insoluble by
@@ -974,6 +1036,8 @@ data TcSMode
                    -- ^ Abort early on insoluble constraints
             , tcsmSkipOverlappable :: Bool
                    -- ^ Do not select an OVERLAPPABLE instance
+            , tcsmGivenOnly        :: Bool
+                   -- ^ Restrict evidence to the local implication.
             , tcsmFullySolveQCIs   :: Bool
                    -- ^ Fully solve quantified constraints
             }
@@ -982,14 +1046,15 @@ vanillaTcSMode :: TcSMode
 vanillaTcSMode = TcSMode { tcsmResumable        = False
                          , tcsmEarlyAbort       = False
                          , tcsmSkipOverlappable = False
+                         , tcsmGivenOnly        = False
                          , tcsmFullySolveQCIs   = False }
 
 instance Outputable TcSMode where
   ppr (TcSMode { tcsmResumable = pm, tcsmEarlyAbort = ea
-               , tcsmSkipOverlappable = so, tcsmFullySolveQCIs = fs })
+               , tcsmSkipOverlappable = so, tcsmGivenOnly = go, tcsmFullySolveQCIs = fs })
     = text "TcSMode" <> (braces $ cat $ punctuate comma $ catMaybes $
                          [ pp_one pm "Resumable", pp_one ea "EarlyAbort"
-                         , pp_one so "SkipOverlappable", pp_one fs "FullySolveQCIs" ])
+                         , pp_one so "SkipOverlappable", pp_one go "GivenOnly", pp_one fs "FullySolveQCIs" ])
       -- We get something like TcSMode{EarlyAbort,FullySolveQCIs},
       -- mentioning just the flags that are on
     where
@@ -1011,6 +1076,10 @@ The constraint solver can operate in different modes:
 * `tcsmSkipOverlappable`: don't use OVERLAPPABLE instances.  Used by the
   short-cut solver.  See Note [Shortcut solving] in GHC.Tc.Solver.Dict
 
+* `tcsmGivenOnly`: check a class implication without selecting or improving
+  from global class instances or running external evidence providers.
+  See Note [Class evidence in associated family equations] in GHC.Tc.Validity.
+
 * `tcsmFullSolveQCIs`: fully solve quantified constraints, or leave them alone.
   Used (only) for SPECIALISE pragmas;
   see (NFS1) in Note [Handling new-form SPECIALISE pragmas] in GHC.Tc.Gen.Sig
@@ -1019,6 +1088,8 @@ The constraint solver can operate in different modes:
 data TcSEnv
   = TcSEnv {
       tcs_ev_binds  :: EvBindsVar,
+      -- See Note [Checked source method evidence] in GHC.Tc.Solver.Solve.
+      tcs_outer_ev_binds :: [EvBindsVar],
 
       tcs_what  :: WhatUnifications,
          -- Level of the outermost meta-tyvar that we have unified
@@ -1031,6 +1102,18 @@ data TcSEnv
       -- | The mode of operation for the constraint solver.
       -- See Note [TcSMode]
       tcs_mode :: TcSMode,
+
+      -- See Note [Native runtime binder scopes].
+      tcs_native_binders  :: VarSet,
+      tcs_term_depth      :: !TermScopeDepth,
+      tcs_id_depths       :: !(VarEnv TermScopeDepth),
+      tcs_pending_implics :: !Bool,
+
+      -- See Note [Rewriting checked local indices] in GHC.Tc.Solver.Rewrite.
+      tcs_source_lets :: VarEnv CoVar,
+
+      -- See Note [CoVar forall touchability].
+      tcs_covar_level :: Maybe TcLevel,
 
       tcs_worklist :: TcRef WorkList
     }
@@ -1046,6 +1129,102 @@ instance MonadFix TcS where
 -- monad trick] in "GHC.Utils.Monad".
 mkTcS :: (TcSEnv -> TcM a) -> TcS a
 mkTcS f = TcS (oneShot f)
+
+-- | Read the selected definitions in the lexical scope of this solve.
+getSourceLetScope :: TcS (VarEnv CoVar)
+getSourceLetScope = mkTcS $ \env -> return (tcs_source_lets env)
+
+-- | Scope the equality of a checked source definition over its suffix.
+-- The inert set must contain Givens only.
+-- See Note [Demand-driven source-let Givens] in GHC.Tc.Solver.Solve.
+withSourceLetProof :: CoVar -> TcS a -> TcS a
+withSourceLetProof proof inside
+  | coVarRole proof == Nominal, TermVarTy value <- coVarLType proof
+  = mkTcS $ \env -> unTcS
+      (do { level <- getTcLevel
+          ; updInertSet $ \inerts ->
+              let givens = updGivenEqLevel level (inert_cans inerts)
+              in inerts { inert_cans = givens, inert_givens = givens }
+          ; inside })
+        (env { tcs_source_lets = extendVarEnv (tcs_source_lets env) value proof })
+  | otherwise = pprPanic "withSourceLetProof" (ppr proof)
+
+-- | Return the runtime binders of the current retained equality comparison.
+getNativeBinderScope :: TcS VarSet
+getNativeBinderScope = mkTcS $ \env -> return (tcs_native_binders env)
+
+-- | Scope one runtime binder over a retained equality comparison, bumping
+-- 'TermScopeDepth' in both 'TcSEnv' and 'TcLclCtxt'.
+-- See Note [Native runtime binder scopes].
+withNativeBinderScope :: CtLoc -> [Type] -> Id -> (CtLoc -> TcS a) -> TcS a
+withNativeBinderScope loc tys binder thing_inside
+  = mkTcS $ \env ->
+      let mtv_max = foldl' max topTermScopeDepth
+                      [ d | v <- tyCoVarsOfTypesList tys
+                          , isTcTyVar v
+                          , Just d <- [metaTyVarTermDepth_maybe v] ]
+          base_d  = max (tcs_term_depth env) (max (getCtLocEnvTermDepth (ctLocEnv loc)) mtv_max)
+          !d'     = bumpTermScopeDepth base_d
+          loc'    = extendCtLocTermScope binder d' loc
+          env'    = env { tcs_native_binders = extendVarSet (tcs_native_binders env) binder
+                        , tcs_term_depth     = d'
+                        , tcs_id_depths      = extendVarEnv (tcs_id_depths env) binder d' }
+      in TcM.updLclCtxt (\ctxt -> ctxt { tcl_term_depth = d'
+                                       , tcl_id_depths  = extendVarEnv (tcl_id_depths ctxt) binder d' }) $
+           unTcS (thing_inside loc') env'
+
+getTcSTermDepth :: TcS TermScopeDepth
+getTcSTermDepth = mkTcS $ \env -> return (tcs_term_depth env)
+
+getTcSIdDepths :: TcS (VarEnv TermScopeDepth)
+getTcSIdDepths = mkTcS $ \env -> return (tcs_id_depths env)
+
+-- | Combine the constraint's lexical 'ctl_id_depths' with any active solver
+-- runtime binders from 'withNativeBinderScope'.
+getSolverIdDepthsFor :: CtLoc -> TcS (VarEnv TermScopeDepth)
+getSolverIdDepthsFor loc = mkTcS $ \env ->
+  return (plusVarEnv (ctl_id_depths (ctLocEnv loc)) (tcs_id_depths env))
+
+-- | Enter an 'Implication' scope, restoring its lexical 'TermScopeDepth' and
+-- recording any local runtime index prototypes introduced by its Given evidence.
+withImplicTermScope :: CtLocEnv -> [EvVar] -> TcS a -> TcS a
+withImplicTermScope ct_loc_env givens thing_inside
+  = mkTcS $ \env ->
+      let base_d  = max (tcs_term_depth env) (ctl_term_depth ct_loc_env)
+          base_ds = plusVarEnv (ctl_id_depths ct_loc_env) (tcs_id_depths env)
+          ev_ids  = [ v | ev <- givens
+                        , v <- tyCoVarsOfTypeList (varType ev)
+                        , isNonCoVarId v, isLocalId v
+                        , not (v `elemVarEnv` base_ds) ]
+          (!next_d, next_ds)
+            | null ev_ids = (base_d, base_ds)
+            | otherwise   = let !d' = bumpTermScopeDepth base_d
+                            in (d', extendVarEnvList base_ds [(v, d') | v <- ev_ids])
+          env' = env { tcs_term_depth = next_d, tcs_id_depths = next_ds }
+      in TcM.updLclCtxt (\ctxt -> ctxt { tcl_term_depth = next_d, tcl_id_depths = next_ds }) $
+           unTcS thing_inside env'
+
+withPendingImplics :: Bool -> TcS a -> TcS a
+withPendingImplics flag (TcS thing_inside)
+  = TcS $ \env -> thing_inside (env { tcs_pending_implics = flag })
+
+hasPendingImplics :: TcS Bool
+hasPendingImplics = mkTcS $ \env -> return (tcs_pending_implics env)
+
+{- Note [Native runtime binder scopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Comparing retained function bodies can generate Wanteds that mention a fresh
+runtime Id. See Note [Solving retained function equalities] in
+GHC.Tc.Solver.Equality. Keep these Ids in a lexical, immutable TcSEnv field.
+Nested solver scopes inherit the field. A root solver starts with no such Ids.
+Leaving withNativeBinderScope restores the enclosing scope.
+
+Each rewriter starts with this set, so the existing retained-body restrictions
+also cover separate body Wanteds. Solver plugins must not see these Wanteds or
+the local Givens. The caller uses nestImplicTcS to isolate the inerts and work
+list. This field does not bind an Id in an Implication or permit residual body
+Wanteds to escape. Only a fully solved body proof can enter the DepFunCo.
+-}
 
 instance Applicative TcS where
   pure x = mkTcS $ \_ -> return x
@@ -1112,8 +1291,9 @@ traceTcS :: String -> SDoc -> TcS ()
 traceTcS herald doc = wrapTcS (TcM.traceTc herald doc)
 {-# INLINE traceTcS #-}  -- see Note [INLINE conditional tracing utilities]
 
+-- See Note [Read-only final zonking during constraint solving] in GHC.Tc.Zonk.Type.
 runTcPluginTcS :: TcPluginM a -> TcS a
-runTcPluginTcS = wrapTcS . runTcPluginM
+runTcPluginTcS = wrapTcS . withReadOnlyFinalZonk . runTcPluginM
 
 instance HasDynFlags TcS where
     getDynFlags = wrapTcS getDynFlags
@@ -1211,11 +1391,20 @@ runTcSWithEvBinds' mode ev_binds_var thing_inside
 
        ; wl_var      <- TcM.newTcRef emptyWorkList
        ; unif_lvl_var <- TcM.newTcRef infiniteTcLevel
+       ; term_depth  <- TcM.getTermScopeDepth
+       ; id_depths   <- TcM.getIdTermDepths
        ; let env = TcSEnv { tcs_ev_binds = ev_binds_var
+                          , tcs_outer_ev_binds = []
                           , tcs_what     = WU_Coarse unif_lvl_var
                           , tcs_count    = step_count
                           , tcs_inerts   = inert_var
                           , tcs_mode     = mode
+                          , tcs_source_lets = emptyVarEnv
+                          , tcs_native_binders = emptyVarSet
+                          , tcs_term_depth = term_depth
+                          , tcs_id_depths  = id_depths
+                          , tcs_pending_implics = False
+                          , tcs_covar_level = Nothing
                           , tcs_worklist = wl_var }
 
              -- Run the computation
@@ -1301,6 +1490,11 @@ nestImplicTcS skol_info ev_binds_var inner_tclvl (TcS thing_inside)
        ; new_inert_var <- TcM.newTcRef nest_inert
        ; new_wl_var    <- TcM.newTcRef emptyWorkList
        ; let nest_env = env { tcs_ev_binds = ev_binds_var
+                            , tcs_outer_ev_binds = if isStaticSkolInfo skol_info then []
+                                                  else tcs_ev_binds env : tcs_outer_ev_binds env
+                            , tcs_source_lets = if isStaticSkolInfo skol_info then emptyVarEnv
+                                                else tcs_source_lets env
+                            , tcs_pending_implics = False
                             , tcs_inerts   = new_inert_var
                             , tcs_worklist = new_wl_var }
        ; res <- TcM.setTcLevel inner_tclvl $
@@ -1396,6 +1590,7 @@ tryShortCutTcS (TcS thing_inside)
        ; new_ev_binds_var <- TcM.cloneEvBindsVar old_ev_binds_var
        ; let nest_env = env { tcs_mode     = mode { tcsmSkipOverlappable = True }
                             , tcs_ev_binds = new_ev_binds_var
+                            , tcs_source_lets = emptyVarEnv
                             , tcs_inerts   = new_inert_var
                             , tcs_worklist = new_wl_var }
 
@@ -1497,6 +1692,10 @@ updTcRef ref upd_fn = wrapTcS (TcM.updTcRef ref upd_fn)
 
 getTcEvBindsVar :: TcS EvBindsVar
 getTcEvBindsVar = TcS (return . tcs_ev_binds)
+
+-- | The current evidence bindings followed by lexically enclosing implications.
+getInScopeEvBindsVars :: TcS [EvBindsVar]
+getInScopeEvBindsVars = TcS (\env -> return (tcs_ev_binds env : tcs_outer_ev_binds env))
 
 getTcLevel :: TcS TcLevel
 getTcLevel = wrapTcS TcM.getTcLevel
@@ -1820,7 +2019,7 @@ selectNextWorkItem
        ; wl     <- readTcRef wl_var
 
        ; case wl of { WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X
-                         , wl_rw_eqs = rw_eqs, wl_rest = rest }
+                         , wl_rw_eqs = rw_eqs, wl_rest = rest, wl_open_apps = apps }
            | ct:cts <- eqs_N  -> pick_me ct (wl { wl_eqs_N  = cts })
            | ct:cts <- eqs_X  -> pick_me ct (wl { wl_eqs_X  = cts })
            | otherwise        -> try_rws [] rw_eqs
@@ -1842,9 +2041,23 @@ selectNextWorkItem
              try_rest zonked_rws
                | ct:cts <- rest       = pick_me ct (wl { wl_rw_eqs = zonked_rws, wl_rest = cts })
                | ct:cts <- zonked_rws = pick_me ct (wl { wl_rw_eqs = cts })
+               | ct Seq.:< more <- Seq.viewl apps
+               = do { ct' <- liftZonkTcS (TcM.zonkCtCoHoleSet ct)
+                    ; pick_me ct' (wl { wl_rw_eqs = [], wl_open_apps = more }) }
                | otherwise            = return Nothing
      } }
 
+
+-- | Postpone a choice of open head while ordinary work is pending.
+-- See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality.
+deferOpenAppEq :: CtEvidence -> TcS Bool
+deferOpenAppEq ev =
+  do { ref <- getTcSWorkListRef
+     ; wl <- readTcRef ref
+     ; if isEmptyWorkList (wl { wl_open_apps = Seq.empty })
+       then return False
+       else do { writeTcRef ref (wl { wl_open_apps = wl_open_apps wl Seq.|> mkNonCanonical ev })
+               ; return True } }
 
 pushTcLevelM_ :: TcS a -> TcS a
 pushTcLevelM_ (TcS thing_inside)
@@ -2004,7 +2217,8 @@ matchGlobalInst :: DynFlags -> Class -> [Type] -> CtLoc -> TcS TcM.ClsInstResult
 matchGlobalInst dflags cls tys loc
   = do { mode <- getTcSMode
        ; let skip_overlappable = tcsmSkipOverlappable mode
-       ; wrapTcS $ TcM.matchGlobalInst dflags skip_overlappable cls tys (Just loc) }
+       ; if tcsmGivenOnly mode then return TcM.NoInstance else
+         wrapTcS $ TcM.matchGlobalInst dflags skip_overlappable cls tys (Just loc) }
 
 tcInstSkolTyVarsX :: SkolemInfo -> Subst -> [TyVar] -> TcS (Subst, [TcTyVar])
 tcInstSkolTyVarsX skol_info subst tvs = wrapTcS $ TcM.tcInstSkolTyVarsX skol_info subst tvs
@@ -2082,7 +2296,7 @@ newGivenEv :: CtLoc -> (TcPredType, EvTerm) -> TcS GivenCtEvidence
 --   see (EQC1) in Note [Solving equality classes] in GHC.Tc.Solver.Dict
 newGivenEv loc (pred, rhs)
   = do { new_ev <- newBoundEvVarId pred rhs
-       ; return $ GivenCt { ctev_pred = pred, ctev_evar = new_ev, ctev_loc = loc } }
+       ; return $ mkGivenCt loc pred new_ev }
 
 -- | Make a new 'Id' of the given type, bound (in the monad's EvBinds) to the
 -- given term
@@ -2091,6 +2305,45 @@ newBoundEvVarId pred rhs
   = do { new_ev <- newEvVar pred
        ; setEvBind (mkGivenEvBind new_ev rhs)
        ; return new_ev }
+
+-- | Bind the two homogeneous coercions from a boxed heterogeneous equality.
+-- See Note [Projecting HEq# evidence].
+newHEqEvVars :: (EvVar -> EvTerm -> EvBind) -> [Type] -> EvVar -> TcS (CoVar, CoVar)
+newHEqEvVars mk_bind [k,l,a,b] dict
+  = do { kind_var <- newEvVar kind_pred
+       ; kind_rhs <- project kind_pred const
+       ; setEvBind (mk_bind kind_var kind_rhs)
+       ; index_var <- newEvVar (index_pred kind_var)
+       ; index_rhs <- project (index_pred kind_var) (flip const)
+       ; setEvBind (mk_bind index_var index_rhs)
+       ; return (kind_var, index_var) }
+  where
+    kind_pred = mkNomEqPred k l
+    index_pred co = mkNomEqPred (mkCastTy a (mkCoVarCo co)) b
+
+    project result_pred pick
+      = do { inner_kind <- newEvVar kind_pred
+           ; inner_index <- newEvVar (index_pred inner_kind)
+           ; return $ EvExpr $
+               mkWildCase (Var dict) (unrestricted (varType dict)) result_pred
+                 [Alt (DataAlt heqDataCon) [inner_kind, inner_index]
+                      (Coercion (mkCoVarCo (pick inner_kind inner_index)))] }
+newHEqEvVars _ tys _ = pprPanic "newHEqEvVars" (ppr tys)
+
+{- Note [Projecting HEq# evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+See Note [The HEq# evidence telescope] in GHC.Builtin.WiredIn.Types.
+The solver stores each component in an ordinary evidence binding. Each
+projection matches both fields of the same dictionary.
+
+  ck = case d of HEq# kc vc -> kc
+  cv = case d of HEq# kc vc -> vc :: (a |> ck) ~# b
+
+In the second case, the field has type (a |> kc) ~# b. Its type equals
+the result type (a |> ck) ~# b by proof irrelevance. The type of cv
+depends on ck, so evidence desugaring places ck in scope first. This
+keeps the two coercions in scope without binding a heterogeneous CoVar.
+-}
 
 emitNewGivens :: CtLoc -> [(Role,TcCoercion)] -> TcS ()
 emitNewGivens loc pts
@@ -2119,15 +2372,17 @@ emitChildEqs ev eqs
 -- for an equality between the two types at the given 'Role'.
 newWantedEq :: CtLoc -> CoHoleSet -> Role -> TcType -> TcType
             -> TcS (WantedCtEvidence, CoercionHole)
-newWantedEq loc rewriters role ty1 ty2
-  = do { hole <- wrapTcS $ TcM.newCoercionHole pty
-       ; let wtd = WantedCt { ctev_pred      = pty
-                            , ctev_dest      = HoleDest hole
-                            , ctev_loc       = loc
-                            , ctev_rewriters = rewriters }
-       ; return (wtd, hole) }
+newWantedEq loc rewriters role lhs rhs =
+  do { hole <- wrapTcS $ TcM.newCoercionHole pred
+     ; return (mkWantedCt loc rewriters pred (HoleDest hole), hole) }
   where
-    pty = mkEqPredRole role ty1 ty2
+    pred = mkEqPredRole role lhs rhs
+
+-- | Create structured evidence for a Wanted equality from its endpoints.
+newWantedEqEvidence :: CtLoc -> CoHoleSet -> Role -> TcType -> TcType
+                    -> TcS (CtEvidence, CoercionHole)
+newWantedEqEvidence loc rewriters role lhs rhs =
+  wrapTcS $ TcM.newWantedEqWithLoc loc rewriters role lhs rhs
 
 -- | Create a new Wanted constraint holding an evidence variable.
 --
@@ -2140,11 +2395,7 @@ newWantedEvVarNC loc rewriters pty
     do { new_ev <- newEvVar pty
        ; traceTcS "Emitting new wanted" (ppr new_ev <+> dcolon <+> ppr pty $$
                                          pprCtLoc loc)
-       ; return $ WantedCt { ctev_pred      = pty
-                           , ctev_dest      = EvVarDest new_ev
-                           , ctev_loc       = loc
-                           , ctev_rewriters = rewriters }
-       }
+       ; return $ mkWantedCt loc rewriters pty (EvVarDest new_ev) }
 
 -- | `newWantedEvVar` makes up a fresh evidence variable for the given predicate.
 -- For ClassPred, check if this exact predicate type is in the solved dicts
@@ -2201,10 +2452,14 @@ newWantedNC loc rewriters pty
 bumpReductionDepth :: CtLoc
                    -> TcType   -- ^ type or constraint being reduced
                    -> TcS CtLoc
-bumpReductionDepth loc ty
+bumpReductionDepth loc ty = wrapTcS (bumpReductionDepthTcM loc ty)
+
+-- | Check and advance the solver's reduction depth in the type checker.
+bumpReductionDepthTcM :: CtLoc -> TcType -> TcM CtLoc
+bumpReductionDepthTcM loc ty
   = do { dflags <- getDynFlags
        ; when (subGoalDepthExceeded (reductionDepth dflags) (ctLocDepth loc)) $
-         wrapErrTcS $ solverDepthError loc ty
+         solverDepthError loc ty
        ; return (bumpCtLocDepth loc) }
 
 matchFam :: TyCon -> [Type] -> TcS (Maybe ReductionN)
@@ -2214,8 +2469,10 @@ matchFamTcM :: TyCon -> [Type] -> TcM (Maybe ReductionN)
 -- Given (F tys) return (ty, co), where co :: F tys ~N ty
 matchFamTcM tycon args
   = do { fam_envs <- FamInst.tcGetFamInstEnvs
-       ; let match_fam_result
-              = reduceTyFamApp_maybe fam_envs Nominal tycon args
+       ; match_fam_result <- case reduceTyFamApp_maybe fam_envs Nominal tycon args of
+           Just redn -> do { sourceTableFamilyAppUse tycon args
+                           ; return (Just redn) }
+           Nothing   -> matchCertifiedFromNatural tycon args
        ; TcM.traceTc "matchFamTcM" $
          vcat [ text "Matching:" <+> ppr (mkTyConApp tycon args)
               , ppr_res match_fam_result ]
@@ -2226,6 +2483,43 @@ matchFamTcM tycon args
       = hang (text "Match succeeded:")
           2 (vcat [ text "Rewrites to:" <+> ppr ty
                   , text "Coercion:" <+> ppr co ])
+
+-- | Reduce FromNatural at a concrete literal using a certified ground Num
+-- dictionary when no explicit FromNatural family instance matches.
+matchCertifiedFromNatural :: TyCon -> [Type] -> TcM (Maybe ReductionN)
+matchCertifiedFromNatural tycon args@[target, lit_ty]
+  | nameOccName (tyConName tycon) == mkTcOcc "FromNatural"
+  , nameModule_maybe (tyConName tycon) == Just gHC_INTERNAL_TYPENATS
+  , Just k <- isNumLitTy lit_ty
+  , k >= 0
+  , noFreeVarsOfType target
+  = do { enabled <- TcM.xoptM LangExt.DependentTypes
+       ; if not enabled then return Nothing else
+         do { let num_mod = mkGhcInternalModule (fsLit "GHC.Internal.Num")
+            ; from_int <- lookupOrig num_mod fromIntegerClassOpOcc
+            ; mb_sel <- TcM.tcLookupIdMaybe from_int
+            ; case mb_sel >>= (\sel -> (sel,) <$> isClassOpId_maybe sel) of
+                Nothing -> return Nothing
+                Just (sel, num_cls) ->
+                  do { inst_envs <- TcM.tcGetInstEnvs
+                     ; case lookupUniqueInstEnv inst_envs num_cls [target] of
+                         Right (inst, []) ->
+                           do { let raw_dfun = instanceDFunId inst
+                              ; dfun <- fromMaybe raw_dfun <$> TcM.tcLookupIdMaybe (getName raw_dfun)
+                              ; case sourceLiteralCons_maybe dfun sel of
+                                  Just (zero_con, succ_con) ->
+                                    do { recordSourceLiteralUse dfun sel
+                                       ; let lhs_ty = mkTyConApp tycon args
+                                             rhs_ty
+                                               | k == 0
+                                               = mkTyConApp (promoteDataCon zero_con) []
+                                               | otherwise
+                                               = mkTyConApp (promoteDataCon succ_con)
+                                                   [mkTyConApp tycon [target, mkNumLitTy (k - 1)]]
+                                       ; return (flip mkReduction rhs_ty <$> proveFromNaturalNum lhs_ty rhs_ty) }
+                                  Nothing -> return Nothing }
+                         _ -> return Nothing } } }
+matchCertifiedFromNatural _ _ = return Nothing
 
 solverDepthError :: CtLoc -> TcType -> TcM a
 solverDepthError loc ty

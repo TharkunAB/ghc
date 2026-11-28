@@ -51,6 +51,7 @@ import GHC.Core.DataCon
 import GHC.Core.FamInstEnv
 import GHC.Core.InstEnv
 import GHC.Core.TyCon
+import GHC.Core.TyCo.Rep ( Type(ExistsTy) )
 import GHC.Core.Type
 
 import GHC.Hs
@@ -998,7 +999,11 @@ cond_stdOK deriv_ctxt permissive dflags
 
     valid_misc
       = case deriv_ctxt of
-         SupplyContext _ -> IsValid
+         SupplyContext _
+           | not (null retained_con_whys)
+           -> NotValid $ DerivErrBadConstructor Nothing retained_con_whys
+           | otherwise
+           -> IsValid
                 -- Don't check these conservative conditions for
                 -- standalone deriving; just generate the code
                 -- and let the typechecker handle the result
@@ -1018,16 +1023,22 @@ cond_stdOK deriv_ctxt permissive dflags
           Nothing -> NoHasWildcard
     data_cons  = tyConDataCons rep_tc
     con_whys   = getInvalids (map check_con data_cons)
+    retained_con_whys
+      = [ DerivErrBadConHasExistentials con
+        | con <- data_cons
+        , not (null (dataConRepArgBinders con)) ]
 
     check_con :: DataCon -> Validity' DeriveInstanceBadConstructor
     check_con con
+      | not (null (dataConRepArgBinders con))
+      = bad DerivErrBadConHasExistentials
       | not (null eq_spec) -- 2.
       = bad DerivErrBadConIsGADT
       | not (null ex_tvs) -- 3.
       = bad DerivErrBadConHasExistentials
       | not (null theta) -- 4.
       = bad DerivErrBadConHasConstraints
-      | not (permissive || all isTauTy (derivDataConInstArgTys con dit)) -- 5.
+      | not (permissive || all (\t -> isTauTy t && not (is_exists_data_arg t)) (derivDataConInstArgTys con dit)) -- 5.
       = bad DerivErrBadConHasHigherRankType
       | otherwise
       = IsValid
@@ -1075,10 +1086,18 @@ cond_args cls _ dit@(DerivInstTys{dit_rep_tc = rep_tc})
   where
     bad_args = [ arg_ty | con <- tyConDataCons rep_tc
                         , arg_ty <- derivDataConInstArgTys con dit
-                        , mightBeUnliftedType arg_ty
-                        , not (ok_ty arg_ty) ]
+                        , bad_arg_ty arg_ty ]
 
     cls_key = classKey cls
+    bad_arg_ty arg_ty
+      | (cls_key == dataClassKey || cls_key == liftClassKey)
+      , not (isTauTy arg_ty) || is_exists_data_arg arg_ty
+      = True
+      | mightBeUnliftedType arg_ty
+      = not (ok_ty arg_ty)
+      | otherwise
+      = False
+
     ok_ty arg_ty
      | cls_key == eqClassKey   = check_in arg_ty ordOpTbl
      | cls_key == ordClassKey  = check_in arg_ty ordOpTbl
@@ -1088,6 +1107,11 @@ cond_args cls _ dit@(DerivInstTys{dit_rep_tc = rep_tc})
 
     check_in :: Type -> [(Type,a)] -> Bool
     check_in arg_ty tbl = any (eqType arg_ty . fst) tbl
+
+is_exists_data_arg :: Type -> Bool
+is_exists_data_arg t | Just t' <- coreView t = is_exists_data_arg t'
+is_exists_data_arg ExistsTy{} = True
+is_exists_data_arg _          = False
 
 
 cond_isEnumeration :: Condition

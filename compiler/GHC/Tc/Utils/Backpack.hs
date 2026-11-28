@@ -35,6 +35,7 @@ import GHC.Types.SourceFile
 import GHC.Types.Var
 import GHC.Types.Id( idType )
 import GHC.Types.Unique.DSet
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Types.UnresolvedImport ( UnresolvedImport )
 import GHC.Types.Name.Shape
 import GHC.Types.PkgQual
@@ -221,11 +222,7 @@ check_inst sig_inst@(ClsInst { is_dfun = dfun_id }) = do
     (tclvl,cts) <- pushTcLevelM $ do
        given_ids <- mapM newEvVar inst_theta
        let given_loc = mkGivenLoc topTcLevel skol_info (mkCtLocEnv lcl_env)
-           givens = [ CtGiven $
-                      GivenCt { ctev_pred = idType given_id
-                              -- Doesn't matter, make something up
-                              , ctev_evar = given_id
-                              , ctev_loc  = given_loc  }
+           givens = [ CtGiven (mkGivenCt given_loc (idType given_id) given_id)
                     | given_id <- given_ids ]
            origin    = InstProvidedOrigin (tcg_semantic_mod tcg_env) sig_inst
        wanted <- newWanted origin (Just TypeLevel) (mkClassPred cls inst_tys)
@@ -393,14 +390,30 @@ thinModIface avails iface =
                              , n <- availNames a ]
     exported_decls = filter_decls exported_occs
 
-    non_exported_occs = mkOccSet [ occName n
-                                 | (_, d) <- exported_decls
-                                 , n <- ifaceDeclNeverExportedRefs d ]
-    non_exported_decls = filter_decls non_exported_occs
+    non_exported_decls = close_non_exported seed_occs seed_decls
 
     dfun_pred IfaceId{ ifIdDetails = IfDFunId } = True
+    dfun_pred IfaceId{ ifIdDetails = IfSourceDFunId{} } = True
     dfun_pred _ = False
     dfun_decls = filter (dfun_pred . snd) (mi_decls iface)
+
+    seed_decls = exported_decls ++ dfun_decls
+    seed_occs  = mkOccSet (map (nameOccName . ifName . snd) seed_decls)
+    local_mods = [mi_module iface, mi_semantic_module iface]
+
+    close_non_exported seen frontier
+      | null next_decls = []
+      | otherwise       = next_decls ++ close_non_exported seen' next_decls
+      where
+        new_occs = mkOccSet
+          [ occ
+          | (_, d) <- frontier
+          , n <- ifaceDeclNeverExportedRefs d ++ nonDetEltsUniqSet (freeNamesIfDecl d)
+          , isInternalName n || nameModule n `elem` local_mods
+          , let occ = occName n
+          , not (occ `elemOccSet` seen) ]
+        next_decls = filter_decls new_occs
+        seen'      = unionOccSets seen new_occs
 
 -- | The list of 'Name's of *non-exported* 'IfaceDecl's which this
 -- 'IfaceDecl' may refer to.  A non-exported 'IfaceDecl' should be kept
@@ -411,8 +424,9 @@ thinModIface avails iface =
 ifaceDeclNeverExportedRefs :: IfaceDecl -> [Name]
 ifaceDeclNeverExportedRefs d@IfaceFamily{} =
     case ifFamFlav d of
-        IfaceClosedTypeFamilyTyCon (IfaceClosedTyFamTyCon (Just (n, _)))
-            -> [n]
+        IfaceClosedTypeFamilyTyCon (IfaceScopedClosedTyFamTyCon owner _ (n, _))
+            -> [owner, n]
+        family | Just (n, _) <- ifaceClosedFamilyAxiom_maybe family -> [n]
         _   -> []
 ifaceDeclNeverExportedRefs _ = []
 

@@ -9,6 +9,7 @@ import {-# SOURCE #-} GHC.Core.TyCon (TyCon)
 import {-# SOURCE #-} GHC.Core.TyCo.Rep (Type)
 
 data MetaDetails
+data TermScopeDepth
 
 data TcTyVarDetails
 pprTcTyVarDetails :: TcTyVarDetails -> SDoc

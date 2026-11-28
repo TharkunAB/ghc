@@ -87,7 +87,7 @@ dsJsFExport fn_id co ext_name cconv isDyn = do
     let
        ty                              = coercionRKind co
        (_tvs,sans_foralls)             = tcSplitForAllTyVars ty
-       (fe_arg_tys', orig_res_ty)      = tcSplitFunTys sans_foralls
+       (_, fe_arg_tys', orig_res_ty)      = tcSplitFunTys sans_foralls
        -- We must use tcSplits here, because we want to see
        -- the (IO t) in the corner of the type!
        (fe_arg_tys, m_fn_id) = case isDyn of
@@ -266,8 +266,9 @@ dsJsFExportDynamic :: Id
 dsJsFExportDynamic id co0 cconv = do
     let
       ty                            = coercionLKind co0
-      (tvs,sans_foralls)            = tcSplitForAllTyVars ty
-      ([scaled_arg_ty], fn_res_ty)  = tcSplitFunTys sans_foralls
+      (ma_tvs,sans_foralls)         = tcSplitForAllTyVars ty
+      tvs                          = map snd ma_tvs
+      (_, [scaled_arg_ty], fn_res_ty)  = tcSplitFunTys sans_foralls
       arg_ty                        = scaledThing scaled_arg_ty
       (io_tc, res_ty)               = expectJust
                                         -- Must have an IO type; hence Just
@@ -282,7 +283,7 @@ dsJsFExportDynamic id co0 cconv = do
     stable_ptr_tycon <- dsLookupKnownKeyTyCon stablePtrTyConKey
     let
         stable_ptr_ty = mkTyConApp stable_ptr_tycon [arg_ty]
-        export_ty     = mkVisFunTyMany stable_ptr_ty arg_ty
+        export_ty     = mkVisFunTyManyU stable_ptr_ty arg_ty
     bindIOId <- dsLookupKnownOccId bindIOIdOcc
     stbl_value <- newSysLocalMDs stable_ptr_ty
     (h_code, c_code, typestring) <- dsJsFExport id (mkRepReflCo export_ty) fe_nm cconv ExportIsDynamic
@@ -329,7 +330,7 @@ dsJsCall fn_id co (CCall (CCallSpec target cconv safety)) _mDeclHeader = do
     let
         ty                   = coercionLKind co
         (tv_bndrs, rho)      = tcSplitForAllTyVarBinders ty
-        (arg_tys, io_res_ty) = tcSplitFunTys rho
+        (_, arg_tys, io_res_ty) = tcSplitFunTys rho
 
     args <- newSysLocalsDs arg_tys  -- no FFI levity-polymorphism
     (val_args, arg_wrappers) <- mapAndUnzipM unboxJsArg (map Var args)
@@ -347,8 +348,8 @@ dsJsCall fn_id co (CCall (CCallSpec target cconv safety)) _mDeclHeader = do
     let
         -- Build the worker
         fcall         = CCall (CCallSpec target cconv safety)
-        worker_ty     = mkForAllTys tv_bndrs (mkVisFunTysMany (map idType work_arg_ids) ccall_result_ty)
-        tvs           = map binderVar tv_bndrs
+        worker_ty     = mkForAllTys tv_bndrs (mkVisFunTysManyU (map idType work_arg_ids) ccall_result_ty)
+        tvs           = map (binderVar . snd) tv_bndrs
         the_ccall_app = mkFCall ccall_uniq fcall val_args ccall_result_ty
         work_rhs      = mkLams tvs (mkLams work_arg_ids the_ccall_app)
         work_id       = mkSysLocal (fsLit "$wccall") work_uniq ManyTy worker_ty
@@ -495,7 +496,7 @@ boxJsResult result_ty
                                              [the_alt]
                                      ]
 
-        ; return (realWorldStatePrimTy `mkVisFunTyMany` ccall_res_ty, wrap) }
+        ; return (realWorldStatePrimTy `mkVisFunTyManyU` ccall_res_ty, wrap) }
 
 boxJsResult result_ty
   = do -- It isn't IO, so do unsafePerformIO
@@ -507,7 +508,7 @@ boxJsResult result_ty
                                            (unrestricted ccall_res_ty)
                                            (coreAltType the_alt)
                                            [the_alt]
-       return (realWorldStatePrimTy `mkVisFunTyMany` ccall_res_ty, wrap)
+       return (realWorldStatePrimTy `mkVisFunTyManyU` ccall_res_ty, wrap)
   where
     return_result _ ans = ans
 
@@ -627,7 +628,7 @@ jsResultWrapper result_ty
 
   -- The type might contain foralls (eg. for dummy type arguments,
   -- referring to 'Ptr a' is legal).
-  | Just (tyvar, rest) <- splitForAllTyCoVar_maybe result_ty
+  | Just (_ma, tyvar, rest) <- splitForAllTyCoVar_maybe result_ty
   = do (maybe_ty, wrapper) <- jsResultWrapper rest
        return (maybe_ty, \e -> Lam tyvar (wrapper e))
 

@@ -27,7 +27,7 @@ module GHC.Tc.Utils.TcMType (
   newMetaKindVar, newMetaKindVars,
   newMetaTyVarTyAtLevel, newConcreteTyVarTyAtLevel, substConcreteTvOrigin,
   newAnonMetaTyVar, newConcreteTyVar, mkConcreteInfo,
-  cloneMetaTyVar, cloneMetaTyVarWithInfo,
+  cloneMetaTyVar, cloneMetaTyVarWithInfo, cloneMetaTyVarWithInfoAndDepth,
   newCycleBreakerTyVar,
   newMultiplicityVar,
 
@@ -38,7 +38,7 @@ module GHC.Tc.Utils.TcMType (
   --------------------------------
   -- Creating new evidence variables
   newEvVar, newEvVars, newDict,
-  newWantedWithLoc, newWanted, newWanteds, cloneWanted, cloneWC, cloneWantedCtEv,
+  newWantedWithLoc, newWantedEqWithLoc, newWanted, newWanteds, cloneWanted, cloneWC, cloneWantedCtEv,
   emitWanted, emitWantedEq, emitWantedEvVar,
   emitWantedEqs, emitNewExprHole,
   newTcEvBinds, newNoTcEvBinds, addTcEvBind,
@@ -197,11 +197,14 @@ newWantedWithLoc loc pty
   = do dst <- case classifyPredType pty of
                 EqPred {} -> HoleDest  <$> newCoercionHole pty
                 _         -> EvVarDest <$> newEvVar pty
-       return $ CtWanted $
-         WantedCt { ctev_dest      = dst
-                  , ctev_pred      = pty
-                  , ctev_loc       = loc
-                  , ctev_rewriters = emptyCoHoleSet }
+       return $ CtWanted $ mkWantedCt loc emptyCoHoleSet pty dst
+
+-- | Create a Wanted equality and its coercion hole.
+newWantedEqWithLoc :: CtLoc -> CoHoleSet -> Role -> TcType -> TcType
+                   -> TcM (CtEvidence, CoercionHole)
+newWantedEqWithLoc loc rewriters role lhs rhs =
+  do { hole <- newCoercionHole (mkEqPredRole role lhs rhs)
+     ; return (mkWantedEqCt loc rewriters role lhs rhs hole, hole) }
 
 -- | Create a new Wanted constraint with the given 'CtOrigin', and
 -- location information taken from the 'TcM' environment.
@@ -221,12 +224,14 @@ newWanteds orig = mapM (newWanted orig Nothing)
 ----------------------------------------------
 
 cloneWantedCtEv :: CtEvidence -> TcM CtEvidence
-cloneWantedCtEv (CtWanted ctev@(WantedCt { ctev_pred = pty, ctev_dest = HoleDest _ }))
+cloneWantedCtEv ev@(CtWanted ctev@(WantedCt { ctev_dest = HoleDest _ }))
   | isEqPred pty
   = do { co_hole <- newCoercionHole pty
-       ; return $ CtWanted (ctev { ctev_dest = HoleDest co_hole }) }
+       ; return $ setCtEvDest ev (HoleDest co_hole) }
   | otherwise
   = pprPanic "cloneWantedCtEv" (ppr pty)
+  where
+    pty = wantedCtPredType ctev
 cloneWantedCtEv ctev = return ctev
 
 cloneWanted :: Ct -> TcM Ct
@@ -247,6 +252,9 @@ cloneImplication :: Implication -> TcM Implication
 cloneImplication implic@(Implic { ic_binds = binds, ic_wanted = inner_wanted })
   = do { binds'        <- cloneEvBindsVar binds
        ; inner_wanted' <- cloneWC inner_wanted
+       -- Keep ic_source_let immutable. Dictionary Wanted Ids are preserved
+       -- by cloneWantedCtEv; only their evidence maps are cloned.
+       -- See Note [Conditional source let evidence] in GHC.Tc.Solver.Solve.
        ; return (implic { ic_binds = binds', ic_wanted = inner_wanted' }) }
 
 ----------------------------------------------
@@ -271,16 +279,10 @@ emitWantedEqs origin pairs
 -- | Emits a new equality constraint
 emitWantedEq :: CtOrigin -> TypeOrKind -> Role -> TcType -> TcType -> TcM Coercion
 emitWantedEq origin t_or_k role ty1 ty2
-  = do { hole <- newCoercionHole pty
-       ; loc  <- getCtLocM origin (Just t_or_k)
-       ; emitSimple $ mkNonCanonical $ CtWanted $
-           WantedCt { ctev_pred      = pty
-                    , ctev_dest      = HoleDest hole
-                    , ctev_loc       = loc
-                    , ctev_rewriters = emptyCoHoleSet }
+  = do { loc <- getCtLocM origin (Just t_or_k)
+       ; (wanted, hole) <- newWantedEqWithLoc loc emptyCoHoleSet role ty1 ty2
+       ; emitSimple $ mkNonCanonical wanted
        ; return (HoleCo hole) }
-  where
-    pty = mkEqPredRole role ty1 ty2
 
 -- | Creates a new EvVar and immediately emits it as a Wanted.
 -- No equality predicates here.
@@ -288,10 +290,7 @@ emitWantedEvVar :: CtOrigin -> TcPredType -> TcM EvVar
 emitWantedEvVar origin ty
   = do { new_cv <- newEvVar ty
        ; loc <- getCtLocM origin Nothing
-       ; let ctev = WantedCt { ctev_pred      = ty
-                             , ctev_dest      = EvVarDest new_cv
-                             , ctev_loc       = loc
-                             , ctev_rewriters = emptyCoHoleSet }
+       ; let ctev = mkWantedCt loc emptyCoHoleSet ty (EvVarDest new_cv)
        ; emitSimple $ mkNonCanonical $ CtWanted ctev
        ; return new_cv }
 
@@ -833,23 +832,29 @@ newMetaDetails :: MetaInfo -> TcM TcTyVarDetails
 newMetaDetails info
   = do { ref <- newMutVar Flexi
        ; tclvl <- getTcLevel
-       ; return (MetaTv { mtv_info = info
-                        , mtv_ref = ref
-                        , mtv_tclvl = tclvl }) }
+       ; depth <- getTermScopeDepth
+       ; return (MetaTv { mtv_info       = info
+                        , mtv_ref        = ref
+                        , mtv_tclvl      = tclvl
+                        , mtv_term_depth = depth }) }
 
 newTauTvDetailsAtLevel :: TcLevel -> TcM TcTyVarDetails
 newTauTvDetailsAtLevel tclvl
   = do { ref <- newMutVar Flexi
-       ; return (MetaTv { mtv_info  = TauTv
-                        , mtv_ref   = ref
-                        , mtv_tclvl = tclvl }) }
+       ; depth <- getTermScopeDepth
+       ; return (MetaTv { mtv_info       = TauTv
+                        , mtv_ref        = ref
+                        , mtv_tclvl      = tclvl
+                        , mtv_term_depth = depth }) }
 
 newConcreteTvDetailsAtLevel :: ConcreteTvOrigin -> TcLevel -> TcM TcTyVarDetails
 newConcreteTvDetailsAtLevel conc_orig tclvl
   = do { ref <- newMutVar Flexi
-       ; return (MetaTv { mtv_info  = ConcreteTv conc_orig
-                        , mtv_ref   = ref
-                        , mtv_tclvl = tclvl }) }
+       ; depth <- getTermScopeDepth
+       ; return (MetaTv { mtv_info       = ConcreteTv conc_orig
+                        , mtv_ref        = ref
+                        , mtv_tclvl      = tclvl
+                        , mtv_term_depth = depth }) }
 
 cloneMetaTyVar :: TcTyVar -> TcM TcTyVar
 cloneMetaTyVar tv
@@ -865,12 +870,17 @@ cloneMetaTyVar tv
 
 cloneMetaTyVarWithInfo :: MetaInfo -> TcLevel -> TcTyVar -> TcM TcTyVar
 cloneMetaTyVarWithInfo info tc_lvl tv
+  = cloneMetaTyVarWithInfoAndDepth info tc_lvl (metaTyVarTermDepth tv) tv
+
+cloneMetaTyVarWithInfoAndDepth :: MetaInfo -> TcLevel -> TermScopeDepth -> TcTyVar -> TcM TcTyVar
+cloneMetaTyVarWithInfoAndDepth info tc_lvl term_depth tv
   = assert (isTcTyVar tv) $
     do  { ref  <- newMutVar Flexi
         ; name' <- cloneMetaTyVarName (tyVarName tv)
-        ; let details = MetaTv { mtv_info  = info
-                               , mtv_ref   = ref
-                               , mtv_tclvl = tc_lvl }
+        ; let details = MetaTv { mtv_info       = info
+                               , mtv_ref        = ref
+                               , mtv_tclvl      = tc_lvl
+                               , mtv_term_depth = term_depth }
               tyvar = mkTcTyVar name' (tyVarKind tv) details
         ; traceTc "cloneMetaTyVarWithInfo" (ppr tyvar)
         ; return tyvar }
@@ -1108,7 +1118,7 @@ substConcreteTvOrigin subst body_ty (ConcreteFRR frr_orig)
   -- for the justification of this extra complication.
   = let subst' = case splitForAllTyCoVars body_ty of
                    ([], _) -> subst
-                   (bndrs, _) -> fst $ substTyVarBndrs subst bndrs
+                   (bndrs, _) -> fst $ substTyVarBndrs subst (map snd bndrs)
     in ConcreteFRR $ substFRROrigin subst' frr_orig
 
 substFRROrigin :: Subst -> FixedRuntimeRepOrigin -> FixedRuntimeRepOrigin
@@ -1421,9 +1431,28 @@ collect_cand_qtvs orig_ty is_dep cur_lvl bound dvs ty
     -----------------
     go :: CandidatesQTvs -> TcType -> TcM CandidatesQTvs
     -- Uses accumulating-parameter style
+    go dv (TermAppTy f arg)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType f)
+           ; go dv1 arg }
+    go dv (ClassAppTy _ inst dict operand kind)
+      = foldlM (collect_cand_qtvs orig_ty True cur_lvl bound) dv
+          [inst, dict, operand, kind]
+    go dv (DepDictTy v ty)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
+           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` v) dv1 ty }
+    go dv (TermVarTy v)
+      = collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
+        -- The Id is rigid. Only its type can contain quantification candidates.
+    go dv (DepFunTy _ v ty)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
+           ; dv2 <- collect_cand_qtvs orig_ty True cur_lvl bound dv1 (idMult v)
+           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` v) dv2 ty }
+    go dv (ExistsTy _ v ty)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
+           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` v) dv1 ty }
     go dv (AppTy t1 t2)       = foldlM go dv [t1, t2]
     go dv (TyConApp tc tys)   = go_tc_args dv (tyConBinders tc) tys
-    go dv (FunTy _ w arg res) = foldlM go dv [arg, w, res]
+    go dv (FunTy _ ma w arg res) = foldlM go dv [ma, arg, w, res]
     go dv (LitTy {})          = return dv
     go dv (CastTy ty co)      = do { dv1 <- go dv ty
                                    ; collect_cand_qtvs_co orig_ty cur_lvl bound dv1 co }
@@ -1436,9 +1465,10 @@ collect_cand_qtvs orig_ty is_dep cur_lvl bound dvs ty
                              Just ind_ty -> go dv ind_ty
                              Nothing     -> go_tv dv tv }
 
-    go dv (ForAllTy (Bndr tv _) ty)
-      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (tyVarKind tv)
-           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` tv) dv1 ty }
+    go dv (ForAllTy ma (Bndr tv _) ty)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv ma
+           ; dv2 <- collect_cand_qtvs orig_ty True cur_lvl bound dv1 (tyVarKind tv)
+           ; collect_cand_qtvs orig_ty is_dep cur_lvl (bound `extendVarSet` tv) dv2 ty }
 
       -- This makes sure that we default e.g. the alpha in Proxy alpha (Any alpha).
       -- Tested in polykinds/NestedProxies.
@@ -1514,12 +1544,20 @@ collect_cand_qtvs_co :: TcType -- original type at top of recursion; for errors
                      -> TcM CandidatesQTvs
 collect_cand_qtvs_co orig_ty cur_lvl bound = go_co
   where
+    go_co dv (TermAppCo f co)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType f)
+           ; go_co dv1 co }
+    go_co dv (DepFunCo _ _ v domain co)
+      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv (varType v)
+           ; dv2 <- collect_cand_qtvs orig_ty True cur_lvl bound dv1 (idMult v)
+           ; dv3 <- go_mco dv2 domain
+           ; collect_cand_qtvs_co orig_ty cur_lvl (bound `extendVarSet` v) dv3 co }
     go_co dv (Refl ty)               = collect_cand_qtvs orig_ty True cur_lvl bound dv ty
     go_co dv (GRefl _ ty mco)        = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv ty
                                           ; go_mco dv1 mco }
     go_co dv (TyConAppCo _ _ cos)    = foldlM go_co dv cos
     go_co dv (AppCo co1 co2)         = foldlM go_co dv [co1, co2]
-    go_co dv (FunCo _ _ _ w co1 co2) = foldlM go_co dv [w, co1, co2]
+    go_co dv (FunCo _ _ _ ma w co1 co2) = foldlM go_co dv [ma, w, co1, co2]
     go_co dv (AxiomCo _ cos)         = foldlM go_co dv cos
     go_co dv (UnivCo { uco_lty = t1, uco_rty = t2, uco_deps = deps })
                                      = do { dv1 <- collect_cand_qtvs orig_ty True cur_lvl bound dv t1
@@ -1536,9 +1574,10 @@ collect_cand_qtvs_co orig_ty cur_lvl bound = go_co
     go_co dv (HoleCo hole)           = go_hole dv hole
     go_co dv (CoVarCo cv)            = go_cv dv cv
 
-    go_co dv (ForAllCo { fco_tcv = tcv, fco_kind = kind_co, fco_body = co })
-      = do { dv1 <- go_mco dv kind_co
-           ; collect_cand_qtvs_co orig_ty cur_lvl (bound `extendVarSet` tcv) dv1 co }
+    go_co dv (ForAllCo { fco_tcv = tcv, fco_ma = ma_co, fco_kind = kind_co, fco_body = co })
+      = do { dv1 <- go_co dv ma_co
+           ; dv2 <- go_mco dv1 kind_co
+           ; collect_cand_qtvs_co orig_ty cur_lvl (bound `extendVarSet` tcv) dv2 co }
 
     go_mco dv MRefl    = return dv
     go_mco dv (MCo co) = go_co dv co
