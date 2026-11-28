@@ -554,7 +554,8 @@ checkedPromoted :: DC.DataCon -> Type -> [Type] -> [Type] -> Maybe Type
 checkedPromoted con kind source fields = do
     (tc, parameters) <- splitTyConApp_maybe kind
     guard (tc == DC.dataConTyCon con)
-    let value = mkTyConApp (DC.promoteDataCon con) (source ++ fields)
+    let ma_args = replicate (DC.promotedDataConMatchabilityArity con) unmatchableDataConTy
+        value   = mkTyConApp (DC.promoteDataCon con) (ma_args ++ source ++ fields)
         vanilla = do
           expected <- traverse (`lookup` zip (DC.dataConUnivTyVars con) parameters) (DC.dataConUserTyVars con)
           guard (eqTypes expected source)
@@ -874,7 +875,8 @@ compileIndexedCore bindings resolveTable mb_case_names mb_expected owner rhs = d
                 children <- traverse (go fl True) val_args
                 let (s_flags, t_lists, fns) = unzip3 children
                 _ <- MaybeT (pure (checkedPromoted con (specialize (exprType expr)) supplied [f header | f <- fns]))
-                pure (or s_flags, concat t_lists, \fam -> mkTyConApp (DC.promoteDataCon con) (supplied ++ [f fam | f <- fns]))
+                let ma_args = replicate (DC.promotedDataConMatchabilityArity con) unmatchableDataConTy
+                pure (or s_flags, concat t_lists, \fam -> mkTyConApp (DC.promoteDataCon con) (ma_args ++ supplied ++ [f fam | f <- fns]))
 
               compileTableCall fl callee expr args = do
                 guard (callee /= owner)

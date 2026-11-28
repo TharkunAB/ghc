@@ -29,7 +29,8 @@ import GHC.Core.Coercion.Axiom (Role(Representational), coAxBranchLHS, coAxBranc
 import GHC.Core.Reduction (Reduction(..))
 import GHC.Core.DataCon
   ( DataCon, classDataCon, dataConName, dataConRepArgTys, dataConTyCon, dataConUnivTyVars, dataConUserTyVars
-  , dataConWorkId, dataConWrapId, isVanillaDataCon, promoteDataCon )
+  , dataConWorkId, dataConWrapId, isVanillaDataCon
+  , promoteDataCon, promotedDataConMatchabilityArity )
 import GHC.Core.InstEnv (instanceDFunId, isIncoherent, lookupUniqueInstEnv)
 import GHC.Core.TyCon
   ( TyCon, closedFamilyTyConCoAxiom_maybe, isBoxedDataTyCon, isNewTyCon, isPromotedDataCon_maybe
@@ -236,7 +237,11 @@ observeOpenType local_call indexed instantiated result_kind operands
       , Just (parent, parameters) <- splitTyConApp_maybe (typeKind ty)
       , parent == dataConTyCon con
       , Just field_types <- openDataConFieldTypes con parameters
-      , let (prefix, fields) = splitAt (length parameters) args
+      , let n_ma = promotedDataConMatchabilityArity con
+            (ma_args, rest_args) = splitAt n_ma args
+            (prefix, fields) = splitAt (length parameters) rest_args
+      , length ma_args == n_ma
+      , all (`tcEqType` unmatchableDataConTy) ma_args
       , equalLength prefix parameters
       , and (zipWith tcEqType prefix parameters)
       , kindsMatch fields field_types
@@ -244,7 +249,11 @@ observeOpenType local_call indexed instantiated result_kind operands
       | indexed
       , Just (promoted, args) <- splitTyConApp_maybe ty
       , Just con <- isPromotedDataCon_maybe promoted
-      , let (source, fields) = splitAt (length (dataConUserTyVars con)) args
+      , let n_ma = promotedDataConMatchabilityArity con
+            (ma_args, rest_args) = splitAt n_ma args
+            (source, fields) = splitAt (length (dataConUserTyVars con)) rest_args
+      , length ma_args == n_ma
+      , all (`tcEqType` unmatchableDataConTy) ma_args
       , Just (worker, proofs, field_types) <- openIndexedDataCon con (typeKind ty) source
       , kindsMatch fields field_types
       = OpenConstructor con (map Type worker ++ map Coercion proofs) <$> traverse checkedOperand fields
@@ -661,7 +670,11 @@ sourceTableCoreTemplate owner table
       , Just (prom_dc, dc_all_args) <- splitTyConApp_maybe (lhs_pats !! col_idx)
       , Just dc <- isPromotedDataCon_maybe prom_dc
       , dataConTyCon dc == tc
-      , let (dc_univ, dc_field_pats) = splitAt (length tc_args) dc_all_args
+      , let n_ma = promotedDataConMatchabilityArity dc
+            (dc_ma, dc_rest) = splitAt n_ma dc_all_args
+            (dc_univ, dc_field_pats) = splitAt (length tc_args) dc_rest
+      , length dc_ma == n_ma
+      , all (`tcEqType` unmatchableDataConTy) dc_ma
       , equalLength dc_univ tc_args
       , Just field_tvs <- traverse getTyVar_maybe dc_field_pats
       , Just other_tvs <- sequence [ getTyVar_maybe p | (i, p) <- zip [0 ..] lhs_pats, i /= col_idx ]
@@ -683,7 +696,10 @@ sourceTableCoreTemplate owner table
       | Just tv <- getTyVar_maybe rhs_ty = lookup tv term_env
       | Just (prom_c, c_args) <- splitTyConApp_maybe rhs_ty
       , Just c <- isPromotedDataCon_maybe prom_c = do
-          let (c_univ, c_fields) = splitAt (length (dataConUnivTyVars c)) c_args
+          let n_ma = promotedDataConMatchabilityArity c
+              (c_ma, c_rest) = splitAt n_ma c_args
+          guard (length c_ma == n_ma && all (`tcEqType` unmatchableDataConTy) c_ma)
+          let (c_univ, c_fields) = splitAt (length (dataConUnivTyVars c)) c_rest
           val_args <- traverse (trans_rhs ty_subst term_env) c_fields
           pure (mkApps (Var (dataConWorkId c)) (map (Type . substTy ty_subst) c_univ ++ val_args))
       | Just (fam, f_args) <- splitTyConApp_maybe rhs_ty

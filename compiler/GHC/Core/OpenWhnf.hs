@@ -35,7 +35,8 @@ import GHC.Core.DataCon
   ( DataCon, dataConWorkId, dataConTyCon, dataConFullSig, dataConRepArity
   , dataConRepArgTys, dataConExTyCoVars, dataConTagZ, eqSpecPair
   , dataConRepArgBinders, dataConStupidTheta, dataConImplBangs
-  , dataConWrapId_maybe, dataConUserTyVars, dataConUnivTyVars, promoteDataCon
+  , dataConWrapId_maybe, dataConUserTyVars, dataConUnivTyVars
+  , promoteDataCon, promotedDataConMatchabilityArity
   , isBanged, isTypeDataCon )
 import GHC.Core (Alt(..), AltCon(..), Bind(..), CoreAlt, CoreExpr, Expr(..), collectArgs, isTyCoArg)
 import GHC.Core.FVs (exprFreeVars)
@@ -195,7 +196,8 @@ openReadbackM local_families indexed limit obtain local origin visible expected 
           in_scope <- lift (lift (visible con))
           if not in_scope then lift (throwE (ReadbackHidden con)) else do
             (rev_tys, used') <- foldM readField ([], con : used) (zip field_kinds fields)
-            let result = mkTyConApp (promoteDataCon con) (arguments ++ reverse rev_tys)
+            let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+                result  = mkTyConApp (promoteDataCon con) (ma_args ++ arguments ++ reverse rev_tys)
             if typeKind result `eqType` kind
               then pure (result, used')
               else lift (throwE (ReadbackOpaque whnf))

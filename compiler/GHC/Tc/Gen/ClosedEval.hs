@@ -173,7 +173,10 @@ tcDecodeClosedCallOperand owner operand = do
               case closedImportedGRE rdr_env con of
                 Just gre -> return (unitNameEnv (dataConName con) gre)
                 Nothing -> Left (InaccessibleClosedOperand tc)
-          let (type_args, values) = splitAt (length (dataConUserTyVars con)) args
+          let n_ma = promotedDataConMatchabilityArity con
+              (ma_args, rest_args) = splitAt n_ma args
+          ensure (length ma_args == n_ma && all (`tcEqType` unmatchableDataConTy) ma_args)
+          let (type_args, values) = splitAt (length (dataConUserTyVars con)) rest_args
           (ClosedConstructorPlan source_args _, fields) <-
             closedConstructorPlan (Just type_args) kind kinds con
           ensure (closedConstructorArgumentsMatch fields values)
@@ -1246,7 +1249,8 @@ decodeClosedCallResult (ClosedCodec shape nodes) rendered = case shape of
         case fields of
           ClosedStaticFields (ClosedConstructorPlan source_args _) codecs -> do
             (values, rest) <- decodeArguments decodeFields codecs encoded
-            let value = mkTyConApp (promoteDataCon con) (source_args ++ values)
+            let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+                value   = mkTyConApp (promoteDataCon con) (ma_args ++ source_args ++ values)
             guard (typeKind value `tcEqType` kind)
             return (value, rest)
           ClosedWitnessedFields templates codecs -> do
@@ -1313,7 +1317,8 @@ decodeClosedCallResult (ClosedCodec shape nodes) rendered = case shape of
       (ClosedConstructorPlan _ _, fields) <-
         either (const Nothing) Just (closedConstructorPlan (Just source_args) kind kinds con)
       guard (closedConstructorArgumentsMatch fields values)
-      let promoted = mkTyConApp (promoteDataCon con) (source_args ++ values)
+      let ma_args  = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+          promoted = mkTyConApp (promoteDataCon con) (ma_args ++ source_args ++ values)
       guard (typeKind promoted `tcEqType` kind)
       return promoted
 

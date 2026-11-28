@@ -2728,6 +2728,7 @@ tcHsType mode rn_ty@(HsOpTy{})      exp_kind = tc_app_ty mode rn_ty exp_kind
 
 tcHsType mode rn_ty@(HsKindSig _ ty sig) exp_kind
   = do { let mode' = mode { mode_tyki = KindLevel
+                            , mode_synonym_metadata = Nothing
                             , mode_pending_calls = Nothing
                             , mode_complete_type_arg = Nothing }
        ; checked_kind <- tc_lhs_kind_sig mode' KindSigCtxt sig
@@ -3355,12 +3356,10 @@ familyKindUsesMatchability tc b =
 
 -- | Does the index annotate a curried arrow in a synonym parameter's kind?
 synonymCallbackIndex :: TyVar -> Kind -> Bool
-synonymCallbackIndex tv (FunTy { ft_af = af, ft_ma = arrow, ft_res = result })
-  | isVisibleFunArg af =
-      case arrow of
-        TyVarTy index | index == tv -> True
-        _ -> synonymCallbackIndex tv result
-synonymCallbackIndex _ _ = False
+synonymCallbackIndex tv kind
+  | Just (arrow, _, result) <- tcSplitFunTy_maybe kind
+  = getTyVar_maybe arrow == Just tv || synonymCallbackIndex tv result
+  | otherwise = False
 
 -- | Check a synonym RHS with controlled instantiation of metadata.
 -- The flag for each index records whether it occurs on a callback arrow.
@@ -5395,7 +5394,8 @@ closedOperandStaging = runMaybeT . fmap or . traverse contains_staged_call
     closed_value ty = case splitTyConApp_maybe ty of
       Just (con, args)
         | Just dc <- isPromotedDataCon_maybe con
-        -> let (_, fields) = splitAt (length (dataConUserTyVars dc)) args
+        -> let (_, rest) = splitAt (promotedDataConMatchabilityArity dc) args
+               (_, fields) = splitAt (length (dataConUserTyVars dc)) rest
            in all closed_value fields
       _ -> isJust (isNumLitTy ty) || isJust (isCharLitTy ty)
 
@@ -5691,6 +5691,8 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
       ---------------- No user-written args left
       ([], Just (_, Named (Bndr kv flag), inner_ki))
         | isInvisibleForAllTyFlag flag
+        , Just expected <- expected_kind
+        , invisibleBndrCount (substTy subst fun_ki) > invisibleBndrCount expected
         , expects_promoted_callback fun
         -> instantiate kv flag inner_ki
 
@@ -5842,9 +5844,31 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
           , tyVarKind tv `tcEqType` matchabilityTy
           , Just (tc, _) <- tcSplitTyConApp_maybe fun
           , (isPromotedDataCon tc &&
-             any (curried_callback_index tv . varType . binderVar) (tyConBinders tc)) ||
+             any (curried_callback_index tv . varType . binderVar)
+                 (filter isNamedTyConBinder (tyConBinders tc))) ||
             (isSourceFamilyName (tyConName tc) && quantified_callback tv inner_ki)
           = fresh
+          -- See Note [Matchability of promoted constructor function fields]
+          -- in GHC.Core.DataCon.
+          | Inferred <- flag
+          , TypeLevel <- mode_tyki mode
+          , tyVarKind tv `tcEqType` matchabilityTy
+          , Just (tc, _) <- tcSplitTyConApp_maybe fun
+          , isPromotedDataCon tc
+          , let from_expected = supplied_args == 0 && expects_promoted_callback fun
+                visible = if from_expected
+                          then length (visible_domains inner_ki)
+                          else supplied_args
+          , any (promoted_field_callback_index tv) (take visible (visible_domains inner_ki))
+          = case mode_holes mode of
+              Just (_, HM_FamPat{}) -> fresh
+              Nothing -> case mode_synonym_metadata mode of
+                Just (_, Just outer_arrow) | from_expected -> bind <$> outer_arrow KindLevel
+                _ -> do { owner <- tcl_kind_arrow_defaults <$> getLclEnv
+                        ; case owner of
+                            Just (defaults, _) -> bind <$> fresh_kind_arrow TypeLevel defaults
+                            Nothing -> default_binder tv }
+              _ -> default_binder tv
           -- See Note [Omitted matchability in higher-order arguments].
           | Specified <- flag
           , TypeLevel <- mode_tyki mode
@@ -5856,7 +5880,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
                 visible = if from_expected then 1 else supplied_args
           , any (curried_callback_index tv) (take visible (visible_domains inner_ki))
           = case mode_synonym_metadata mode of
-              Just (_, Just outer_arrow) | from_expected -> bind <$> outer_arrow TypeLevel
+              Just (_, Just outer_arrow) | from_expected -> bind <$> outer_arrow KindLevel
               _ -> do { owner <- tcl_kind_arrow_defaults <$> getLclEnv
                       ; case owner of
                           Just (defaults, _) -> bind <$> fresh_kind_arrow TypeLevel defaults
@@ -5891,6 +5915,13 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
         curried_callback_index tv domain
           | Just (arrow, _, result) <- tcSplitFunTy_maybe domain
           = getTyVar_maybe arrow == Just tv || curried_callback_index tv result
+          | otherwise = False
+
+        promoted_field_callback_index tv domain
+          | Just (arrow, Scaled _ arg, result) <- tcSplitFunTy_maybe domain
+          = getTyVar_maybe arrow == Just tv
+            || promoted_field_callback_index tv arg
+            || promoted_field_callback_index tv result
           | otherwise = False
 
         quantified_callback tv kind
@@ -5994,7 +6025,7 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
       | TypeLevel <- mode_tyki mode
       , Nothing <- mode_holes mode
       , Just expected <- expected_kind
-      , Just {} <- tcSplitFunTy_maybe expected
+      , Just {} <- tcSplitFunTy_maybe (snd (tcSplitForAllInvisTyVars expected))
       , Just (tc, _) <- tcSplitTyConApp_maybe ty
       = isPromotedDataCon tc
       | otherwise = False

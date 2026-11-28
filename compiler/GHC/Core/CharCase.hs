@@ -21,7 +21,7 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Core (Alt (..), AltCon (..), Bind (..), CoreExpr, Expr (..), collectArgs)
 import GHC.Core.DataCon
     ( dataConInstOrigArgTys, dataConTyCon, dataConUnivTyVars, dataConUserTyVars
-    , dataConWorkId, isVanillaDataCon, promoteDataCon
+    , dataConWorkId, isVanillaDataCon, promoteDataCon, promotedDataConMatchabilityArity
     )
 import GHC.Core.FVs (exprFreeVars)
 import GHC.Core.Multiplicity (scaledThing)
@@ -217,6 +217,7 @@ literalResult expected expr
                && mkTyConApp tc args `eqType` expected)
         let field_tys = map scaledThing (dataConInstOrigArgTys dc args)
         guard (length val_args == length field_tys)
+        guard (promotedDataConMatchabilityArity dc == 0)
         children <- zipWithM literalResult field_tys val_args
         pure (mkTyConApp (promoteDataCon dc) (args ++ children))
 literalResult _ _ = Nothing

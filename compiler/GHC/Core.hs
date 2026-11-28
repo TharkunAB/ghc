@@ -3161,8 +3161,9 @@ nativeIndexExprWith allow_conversions extra = go emptyVarEnv
            ; return (build fields', index) }
       | Just (con, tys, build, field) <- splitNativeNewtypeConApp expr
       = do { (field', index) <- go env field
+           ; let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
            ; if nativeIndexArgKinds con tys [index]
-             then Just (build field', mkTyConApp (promoteDataCon con) (tys ++ [index]))
+             then Just (build field', mkTyConApp (promoteDataCon con) (ma_args ++ tys ++ [index]))
              else Nothing }
       | Just (con, tys, fields) <- splitNativeIndexedConApp expr
       , (builder, args) <- collectArgs expr
@@ -3177,9 +3178,10 @@ nativeIndexExprWith allow_conversions extra = go emptyVarEnv
       , fields `lengthIs` dataConSourceArity con
       = do { results <- traverse (go env) fields
            ; let (fields', indices) = unzip results
+           ; let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
            ; if nativeIndexArgKinds con tys indices
              then Just (mkApps (Var worker) (type_args ++ fields'),
-                        mkTyConApp (promoteDataCon con) (tys ++ indices))
+                        mkTyConApp (promoteDataCon con) (ma_args ++ tys ++ indices))
              else Nothing }
       | otherwise = extra expr
 
@@ -3288,7 +3290,8 @@ sameNativeIndexDomain left right
 nativeIndexArgKinds :: DataCon -> [Type] -> [Type] -> Bool
 nativeIndexArgKinds con tys indices
   | dataConHasPromotedRetained con
-  = check (piResultTys (tyConKind (promoteDataCon con)) tys) indices
+  , let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+  = check (piResultTys (tyConKind (promoteDataCon con)) (ma_args ++ tys)) indices
   | otherwise = indices `equalLength` fields && and (zipWith same_domain indices fields)
   where
     check kind [] = kind `eqType` mkTyConApp (dataConTyCon con) tys
@@ -3345,8 +3348,12 @@ nativeIndexedOperandSignature_maybe con
 isNativeConstructedGadtIndex :: Type -> Bool
 isNativeConstructedGadtIndex (TyConApp tc args)
   | Just con <- isPromotedDataCon_maybe tc
-  , let (params, fields) = splitAt (length (dataConUserTyVars con)) args
-  = isJust (nativeIndexedPromotedCon_maybe con params fields)
+  , let n_ma = promotedDataConMatchabilityArity con
+        (ma_args, rest_args) = splitAt n_ma args
+        (params, fields) = splitAt (length (dataConUserTyVars con)) rest_args
+  = length ma_args == n_ma
+    && all (`eqType` unmatchableDataConTy) ma_args
+    && isJust (nativeIndexedPromotedCon_maybe con params fields)
 isNativeConstructedGadtIndex _ = False
 
 -- | Substitute in a supported runtime index without evaluating its value.
@@ -3381,19 +3388,28 @@ mapNativeIndexWithNatural mk_natural subst expr
            ; return (Cast expr (SubCo delta)) }
     from_index (TyConApp tc args)
       | Just con <- isPromotedDataCon_maybe tc
-      , let (tys, fields) = splitAt (length (dataConUserTyVars con)) args
+      , let n_ma = promotedDataConMatchabilityArity con
+            (ma_args, rest_args) = splitAt n_ma args
+      , length ma_args == n_ma && all (`eqType` unmatchableDataConTy) ma_args
+      , let (tys, fields) = splitAt (length (dataConUserTyVars con)) rest_args
       , Just (prefix, _, _, cast) <- nativeFamilyConArgs con tys
       , Just _ <- nativeFamilyPromotedCon_maybe con tys fields
       = do { values <- traverse from_index fields
            ; pure (Cast (mkConApp con (prefix ++ values)) cast) }
       | Just con <- isPromotedDataCon_maybe tc
-      , let (params, fields) = splitAt (length (dataConUserTyVars con)) args
+      , let n_ma = promotedDataConMatchabilityArity con
+            (ma_args, rest_args) = splitAt n_ma args
+      , length ma_args == n_ma && all (`eqType` unmatchableDataConTy) ma_args
+      , let (params, fields) = splitAt (length (dataConUserTyVars con)) rest_args
       , Just (prefix, _) <- nativeIndexedConArgs con params
       , Just _ <- nativeIndexedPromotedCon_maybe con params fields
       = do { values <- traverse from_index fields
            ; return (mkConApp con (prefix ++ values)) }
       | Just con <- isPromotedDataCon_maybe tc
-      , let (tys, fields) = splitAt (length (dataConUnivTyVars con)) args
+      , let n_ma = promotedDataConMatchabilityArity con
+            (ma_args, rest_args) = splitAt n_ma args
+      , length ma_args == n_ma && all (`eqType` unmatchableDataConTy) ma_args
+      , let (tys, fields) = splitAt (length (dataConUnivTyVars con)) rest_args
       , Just _ <- nativeIndexDataConTyArgs (mkTyConApp (dataConTyCon con) tys) con
       , fields `lengthIs` dataConSourceArity con
       , nativeIndexArgKinds con tys fields
@@ -3480,7 +3496,8 @@ nativeFamilyPromotedCon_maybe :: DataCon -> [Type] -> [Type] -> Maybe Type
 nativeFamilyPromotedCon_maybe con tys fields = do
   (_, domains, result, _) <- nativeFamilyConArgs con tys
   guard (fields `equalLength` domains && and (zipWith sameNativeIndexDomain (map typeKind fields) domains))
-  let index = mkTyConApp (promoteDataCon con) (tys ++ fields)
+  let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+      index = mkTyConApp (promoteDataCon con) (ma_args ++ tys ++ fields)
   guard (sameNativeIndexDomain (typeKind index) result)
   return index
 
@@ -3735,9 +3752,11 @@ nativeIndexedPromotedCon_maybe con tys fields = do
   guard (and (zipWith sameNativeIndexDomain (map typeKind fields) domains))
   let promoted = promoteDataCon con
       user_vars = dataConUserTyVars con
-  result <- foldM apply (tyConKind promoted) (tys ++ fields)
+      ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+      all_args = ma_args ++ tys ++ fields
+  result <- foldM apply (tyConKind promoted) all_args
   guard (sameNativeIndexDomain result (substTyWith user_vars tys (dataConOrigResTy con)))
-  return (mkTyConApp promoted (tys ++ fields))
+  return (mkTyConApp promoted all_args)
   where
     apply kind arg = do
       (_, binder, _) <- splitPiTy_maybe kind
@@ -3939,7 +3958,8 @@ nativeIndexedCon_maybe domain con binders
   , all isNativeOpaqueValueId fields
   , and (zipWith (\field (Scaled _ ty) -> varType field `eqType` instantiate ty)
                  fields (dataConOrigArgTys con))
-  , let constructor = mkTyConApp (promoteDataCon con) (con_args ++ map TermVarTy fields)
+  , let ma_args = replicate (promotedDataConMatchabilityArity con) unmatchableDataConTy
+        constructor = mkTyConApp (promoteDataCon con) (ma_args ++ con_args ++ map TermVarTy fields)
         kind_co = mkTyConAppCo Nominal tc
           [fromMaybe (mkNomReflCo ty) (lookup tv refinements) | (tv, ty) <- params]
   , coercionLKind kind_co `eqType` domain
