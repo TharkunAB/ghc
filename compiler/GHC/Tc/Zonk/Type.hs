@@ -1787,10 +1787,13 @@ zonk_pat (XPat ext) = case ext of
     do { pat' <- zonk_pat pat
        ; return $ XPat $ ExpansionPat orig pat' }
   ; CoPat co_fn pat ty ->
+    -- See Note [Eliminating reflexive CoPats] in GHC.HsToCore.Match.
     do { co_fn'   <- zonkCoFn co_fn
        ; pat'     <- zonk_pat pat
        ; ty'      <- noBinders $ zonkTcTypeToTypeX ty
-       ; return (XPat $ CoPat co_fn' pat' ty') }
+       ; return $ if is_refl_wrap co_fn'
+                  then pat'
+                  else XPat $ CoPat co_fn' pat' ty' }
   ; NativeExistsPat ty witness payload ev_binds pat ->
     do { ty' <- noBinders $ zonkTcTypeToTypeX ty
        ; witness' <- zonkTyBndrX witness
@@ -1801,6 +1804,14 @@ zonk_pat (XPat ext) = case ext of
 
 zonk_pat pat@(SplicePat {}) = pprPanic "zonk_pat" (ppr pat)
 zonk_pat pat@(QualLitPat {}) = pprPanic "zonk_pat" (ppr pat)
+
+is_refl_wrap :: HsWrapper -> Bool
+is_refl_wrap WpHole            = True
+is_refl_wrap (WpCast co)       = isReflCo co
+is_refl_wrap (WpCompose w1 w2) = is_refl_wrap w1 && is_refl_wrap w2
+is_refl_wrap (WpSubType w)     = is_refl_wrap w
+is_refl_wrap (WpLet evs)       = isEmptyTcEvBinds evs
+is_refl_wrap _                 = False
 
 ---------------------------
 zonkConStuff :: HsConPatDetails GhcTc

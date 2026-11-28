@@ -56,7 +56,7 @@ import GHC.Core.DataCon
 import GHC.Core.PatSyn
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare( eqType, eqTypes )
-import GHC.Core.Coercion ( eqCoercion )
+import GHC.Core.Coercion ( eqCoercion, isReflCo )
 import GHC.Core.TyCon    ( isNewTyCon )
 import GHC.Core.Multiplicity
 import GHC.Builtin.WiredIn.Types
@@ -662,9 +662,43 @@ tidyLPat _ (L loc (OrPat ty lpats))
     single_grhs e = GRHSs emptyComments [noLocA $ GRHS noAnn [] e]
                           (noLocA $ EmptyLocalBinds noExtField)
 
+-- Unwrap reflexive CoPats before pattern classification.
+-- See Note [Eliminating reflexive CoPats].
+tidyLPat v (L loc (XPat (CoPat wrap pat _)))
+  | is_refl_wrap wrap
+  = tidyLPat v (L loc pat)
+  where
+    is_refl_wrap WpHole            = True
+    is_refl_wrap (WpCast co)       = isReflCo co
+    is_refl_wrap (WpCompose w1 w2) = is_refl_wrap w1 && is_refl_wrap w2
+    is_refl_wrap (WpSubType w)     = is_refl_wrap w
+    is_refl_wrap (WpLet evs)       = isEmptyTcEvBinds evs
+    is_refl_wrap _                 = False
+
 -- Everything else goes through unchanged...
 tidyLPat _ non_interesting_pat
   = return (idDsWrapper, non_interesting_pat)
+
+{- Note [Eliminating reflexive CoPats]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+During pattern typechecking, `matchExpectedConTy` can defer an equality on an
+unfilled type metavariable (such as `(:+:) f1 g1 a ~# h0 a`) into a coercion
+hole and wrap the constructor pattern in `CoPat (WpCast (SubCo hole))`. If a
+later branch unifies `h0` directly, `matchExpectedConTy` sees the resolved
+`TyConApp` and emits a bare `ConPat` with no `CoPat`.
+
+After constraint solving and zonking fill `hole` with `Refl`, keeping the
+no-op `CoPat` around the earlier constructor pattern classifies that branch as
+`PgCo` while the later branch is `PgCon`. `groupEquations` then splits an
+exhaustive constructor match across two separate `case` expressions. Under
+`-XLinearTypes`, the first `case` acquires an unreachable `__DEFAULT` branch
+that does not consume its multiplicity-polymorphic scrutinee, which fails Core
+Lint's linearity check.
+
+Both `zonk_pat` and `tidyLPat` strip `CoPat` wrappers whose zonked `HsWrapper`
+is reflexive (`isReflCo`, where the left and right types are identical) so that
+all constructor branches stay in the same `PgCon` group.
+-}
 
 --------------------
 tidy_bang_pat :: MatchId -> LPat GhcTc
