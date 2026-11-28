@@ -116,3 +116,4 @@ test('DepIfaceSerialization',
      extra_files(['DepIfaceSerialization.hs',
                   'DepIfaceSerializationClient.hs']),
      makefile_test, ['DepIfaceSerialization'])
+test('NativeSameModNonStructuralOpen', normal, compile, ['-dcore-lint -dstg-lint'])

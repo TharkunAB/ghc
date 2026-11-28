@@ -112,14 +112,14 @@ import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Validity
 import GHC.Core.OpenWhnf (EvalFailure(Exhausted))
-import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(CannotReduce, InvalidInput, UnavailableDefinition),
+import GHC.Tc.Gen.OpenTypeEval (OpenTypeFailure(CannotReduce, GroundTypeCase, InvalidInput, UnavailableDefinition),
                                DefinitionFailure(MissingTemplate), instantiateOpenDictMethod, instantiateOpenMethod,
                                openTypeFunctionSignature, observeOpenType,
                                openTypeFailureReason, readOpenMethodWorker)
 import GHC.Tc.Gen.SourceTable (recordSourceUses, recordUnfoldedSourceUses, sourceTableFamilyUse, sourceTableTypeUses,
                               sourceCaseKindUse, sourceTableOccurrence, sourceTableReferenceUse, indexedProjectionSource, isSourceConstructorCase, monomorphicEnumCaseArity, sourceCaseVisibleArity, sourceTableOwner, sourcePairBuilderField,
                               isFinalCoreIdentity, isFinalCoreReverseWrapper, isFinalStructuralSource,
-                              isLargeElimResultKind, toKindMatchableArrows,
+                              isLargeElimResultKind, isSafeLocalUninterpretedRhs, toKindMatchableArrows,
                               lookupObservedPairField, lookupPairObserver, lookupPairRecipe, canObservePairSource,
                               lookupSourceUnaryMethod, lookupSourceBinaryMethod, sourceMapSelector, lookupSourceContainerMethod,
                               lookupSourceGroundDFun, lookupSourceCheckedMapMethod,
@@ -3866,6 +3866,11 @@ tcTermAppInType mode rn_ty exp_kind
                     case outcome of
                       Right (result, result_kind) -> checkExpKind mode rn_ty result result_kind exp_kind
                       Left err@(CannotReduce Exhausted) -> reportOpenTypeFailure name err
+                      Left err@GroundTypeCase -> do
+                        active <- hasActiveTcPlugins
+                        if active
+                          then stage4_uninterp fun (reportOpenTypeFailure name err)
+                          else reportOpenTypeFailure name err
                       Left (UnavailableDefinition _ MissingTemplate)
                         | not is_local -> stage3_closed_or_uninterp is_local rdr name fun args
                       Left err -> stage4_uninterp fun (reportOpenTypeFailure name err)
@@ -8786,13 +8791,19 @@ getOrCreateEtaForgetGeneral origin res_ty act_k exp_kind0 flags
 
 {- Note [Uninterpreted term applications for TcPlugins]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When no 'tcPlugin' is active, open term applications without a certified
-'SourceTable' or 'OpenTypeEval' reduction report 'TcRnNoSourceTable' or
-'TcRnClosedTypeEval'. When a 'tcPlugin' is active and an open call has no
-certified reduction, 'getOrCreateUninterpretedTyCon' interns an equationless
-closed type family @U:<occ>@ (or @U:@<unit>:<mod>:<occ>@ for imported terms)
-via 'tcInternSynthClosedFamily' so solver plugins can inspect or discharge
-nominal equalities over that application.
+When an open term application has no certified 'SourceTable' or 'OpenTypeEval'
+reduction, 'getOrCreateUninterpretedTyCon' can intern an equationless closed
+type family @U:<occ>@ (or @U:@<unit>:<mod>:<occ>@ for imported terms) via
+'tcInternSynthClosedFamily'.
+
+When a 'tcPlugin' is active, any eligible term application can elaborate to
+@U:<occ>@ so solver plugins can inspect or discharge nominal equalities over
+that application. When no 'tcPlugin' is active, 'canUseUninterpretedTerm'
+accepts imported functions that export @U:<occ>@ in their interface and safe
+local functions selected by 'isSafeLocalUninterpretedRhs' (see
+Note [Fallback for uncertified local source functions] in
+"GHC.Tc.Gen.SourceTable"). Other unreduced open calls report 'TcRnNoSourceTable'
+or 'TcRnOpenTypeEval'.
 -}
 
 hasActiveTcPlugins :: TcM Bool
@@ -8805,7 +8816,20 @@ canUseUninterpretedTerm fun = do
   active <- hasActiveTcPlugins
   if active
     then pure True
-    else hasImportedUninterpretedFamily fun
+    else do
+      gbl <- getGblEnv
+      let orig_name = idName fun
+          sem_mod   = tcg_semantic_mod gbl
+      case nameModule_maybe orig_name of
+        Just def_mod
+          | def_mod == sem_mod || isInteractiveModule def_mod ->
+              case lookupNameEnv (tcg_local_open_defs gbl) orig_name of
+                Just (owner, rhs) -> do
+                  strict_mode <- xoptM LangExt.Strict
+                  hpc_mode    <- goptM Opt_Hpc
+                  pure (isSafeLocalUninterpretedRhs strict_mode hpc_mode (idName owner) rhs)
+                Nothing -> pure False
+        _ -> hasImportedUninterpretedFamily fun
 
 hasImportedUninterpretedFamily :: Id -> TcM Bool
 hasImportedUninterpretedFamily fun = do
