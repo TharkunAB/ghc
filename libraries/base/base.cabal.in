@@ -179,6 +179,7 @@ Library
         , GHC.Exception
         , GHC.Exception.Type
         , GHC.ExecutionStack
+        , GHC.Exists
         , GHC.Exts
         , GHC.Fingerprint
         , GHC.Fingerprint.Type
@@ -224,6 +225,7 @@ Library
         , GHC.IsList
         , GHC.Ix
         , GHC.List
+        , GHC.Matchability
         , GHC.Maybe
         , GHC.MVar
         , GHC.Natural
@@ -242,6 +244,8 @@ Library
         , GHC.StaticPtr
         , GHC.STRef
         , GHC.Show
+        , GHC.Sigma
+        , GHC.Sigma.Projection
         , GHC.Stable
         , GHC.StableName
         , GHC.Stack

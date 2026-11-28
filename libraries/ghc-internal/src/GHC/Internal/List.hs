@@ -34,7 +34,7 @@ module GHC.Internal.List (
    head, last, tail, init, uncons, unsnoc, (!?), (!!),
    scanl, scanl1, scanl', scanr, scanr1,
    iterate, iterate', repeat, replicate, cycle,
-   take, drop, splitAt, takeWhile, dropWhile, span, break, reverse,
+   take, drop, splitAt, takeWhile, dropWhile, span, break, reverse, reverseOnto,
    zip, zip3, zipWith, zipWith3, unzip, unzip3,
    errorEmptyList,
 
@@ -45,6 +45,7 @@ module GHC.Internal.List (
 
 import GHC.Internal.Base
 import GHC.Internal.Data.Maybe
+import GHC.Internal.Data.Tuple () -- Checked pair projections for span
 import GHC.Internal.Err (error)
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Bignum.Integer (Integer)
@@ -1353,10 +1354,12 @@ break p xs@(x:xs')
 -- >>> reverse [1..]
 -- * Hangs forever *
 reverse                 :: [a] -> [a]
-reverse l =  rev l []
-  where
-    rev []     a = a
-    rev (x:xs) a = rev xs (x:a)
+reverse xs = reverseOnto xs []
+
+-- | Reverse the first list onto the second list.
+reverseOnto :: [a] -> [a] -> [a]
+reverseOnto [] acc = acc
+reverseOnto (x : xs) acc = reverseOnto xs (x : acc)
 
 -- | 'and' returns the conjunction of a Boolean list. For the result to be
 -- 'True', the list must be finite; 'False', however, results from a 'False'
