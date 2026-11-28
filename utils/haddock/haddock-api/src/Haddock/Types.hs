@@ -64,7 +64,7 @@ import GHC.Types.ForeignCall (CType)
 import GHC.Types.Name (stableNameCmp)
 import GHC.Types.Name.Occurrence
 import GHC.Types.SrcLoc (srcSpanToRealSrcSpan)
-import GHC.Types.Var (Specificity)
+import GHC.Types.Var (ExistsTyFlag, Specificity)
 import GHC.Utils.Outputable hiding ((<>))
 
 import Documentation.Haddock.Types
@@ -848,7 +848,26 @@ type XRecCond a =
   , MapXRec a
   , UnXRec a
   , WrapXRec a (HsType a)
+  , MapHsExists a
   )
+
+-- | Traverse an erased existential while inserting parentheses.
+class MapHsExists a where
+  mapHsExists
+    :: (LHsTyVarBndr Specificity a -> LHsTyVarBndr Specificity a)
+    -> (LHsType a -> LHsType a)
+    -> HsType a
+    -> Maybe (HsType a)
+
+instance MapHsExists GhcRn where
+  mapHsExists mapBinder mapBody (XHsType (HsTypeExistsRn flag binder body)) =
+    Just (XHsType (HsTypeExistsRn flag (mapBinder binder) (mapBody body)))
+  mapHsExists _ _ _ = Nothing
+
+instance MapHsExists DocNameI where
+  mapHsExists mapBinder mapBody (XHsType (HsErasedExists flag binder body)) =
+    Just (XHsType (HsErasedExists flag (mapBinder binder) (mapBody body)))
+  mapHsExists _ _ _ = Nothing
 
 type instance XValArg DocNameI = NoExtField
 type instance XTypeArg DocNameI = NoExtField
@@ -865,6 +884,7 @@ type instance XHsStandardArr DocNameI = NoExtField
 type instance XHsLinearArr DocNameI = NoExtField
 
 type instance XForAllTy DocNameI = EpAnn NoEpAnns
+type instance XForEachTy DocNameI = (EpToken "foreach", Either TokRarrow (EpToken "."))
 type instance XQualTy DocNameI = EpAnn NoEpAnns
 type instance XTyVar DocNameI = EpAnn NoEpAnns
 type instance XStarTy DocNameI = EpAnn NoEpAnns
@@ -893,6 +913,10 @@ data HsTypeDocNameIExt
                 (LHsType DocNameI)
 
   | HsRecTy     [LHsConDeclRecField DocNameI]
+
+  | HsCheckedTypeCase (LHsType DocNameI) [(LHsType DocNameI, LHsType DocNameI)]
+
+  | HsErasedExists ExistsTyFlag (LHsTyVarBndr Specificity DocNameI) (LHsType DocNameI)
 
   | HsRedacted  (HsType DocNameI) -- ^ contains the kind of the redacted type
 

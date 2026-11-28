@@ -269,6 +269,14 @@ instance Diagnostic PsMessage where
                   2 (pprWithCommas ppr vs)
                 , text "See https://gitlab.haskell.org/ghc/ghc/issues/16754 for details."
                 ]
+    PsErrTypeLetSignatureMismatch sig binder
+      -> mkSimpleDecorated $
+           text "The signature for" <+> quotes (ppr sig)
+           <+> text "must immediately precede its binding."
+           $$ text "The next binding is for" <+> quotes (ppr binder) <> dot
+    PsErrTypeLetDuplicatePairField field
+      -> mkSimpleDecorated $
+           text "The pattern in this type let binds" <+> quotes (ppr field) <+> text "twice."
     PsErrIllegalExplicitNamespace kw
       -> mkSimpleDecorated $
            text "Illegal keyword" <+> quotes kw_doc
@@ -479,6 +487,7 @@ instance Diagnostic PsMessage where
       -> let msg  = parse_error_in_pat
              body = case details of
                  PEIP_NegApp -> text "-" <> ppr s
+                 PEIP_RetainedArg e -> ppr s <+> char '@' <> braces (ppr e)
                  PEIP_OtherPatDetails (ParseContext (Just fun) _)
                   -> ppr s <+> text "In a function binding for the"
                                      <+> quotes (ppr fun)
@@ -636,6 +645,8 @@ instance Diagnostic PsMessage where
     PsErrNoSingleWhereBindInPatSynDecl{}          -> ErrorWithoutFlag
     PsErrDeclSpliceNotAtTopLevel{}                -> ErrorWithoutFlag
     PsErrMultipleNamesInStandaloneKindSignature{} -> ErrorWithoutFlag
+    PsErrTypeLetSignatureMismatch{}               -> ErrorWithoutFlag
+    PsErrTypeLetDuplicatePairField{}              -> ErrorWithoutFlag
     PsErrIllegalExplicitNamespace{}               -> ErrorWithoutFlag
     PsErrUnsupportedExplicitNamespace{}           -> ErrorWithoutFlag
     PsErrPlainWildcardImport{}                    -> ErrorWithoutFlag
@@ -783,6 +794,8 @@ instance Diagnostic PsMessage where
     PsErrNoSingleWhereBindInPatSynDecl{}          -> noHints
     PsErrDeclSpliceNotAtTopLevel{}                -> noHints
     PsErrMultipleNamesInStandaloneKindSignature{} -> noHints
+    PsErrTypeLetSignatureMismatch{}               -> noHints
+    PsErrTypeLetDuplicatePairField{}              -> noHints
     PsErrIllegalExplicitNamespace{}               -> [suggestExtension LangExt.ExplicitNamespaces]
     PsErrUnsupportedExplicitNamespace{}           -> noHints
     PsErrPlainWildcardImport{}                    -> [SuggestRemoveImportList]

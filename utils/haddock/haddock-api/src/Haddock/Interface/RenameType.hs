@@ -92,6 +92,10 @@ renameType (HsForAllTy x tele lt) =
   HsForAllTy x
     <$> renameForAllTelescope tele
     <*> renameLType lt
+renameType (HsForEachTy x bndrs lt) =
+  HsForEachTy x
+    <$> mapM renameLBinder bndrs
+    <*> renameLType lt
 renameType (HsQualTy x lctxt lt) =
   HsQualTy x
     <$> renameLContext lctxt
@@ -111,6 +115,8 @@ renameType (HsIParamTy x ip lt) = HsIParamTy x ip <$> renameLType lt
 renameType (HsKindSig x lt lk) = HsKindSig x <$> renameLType lt <*> pure lk
 renameType t@(HsSpliceTy _ _) = pure t
 renameType (HsDocTy x lt doc) = HsDocTy x <$> renameLType lt <*> pure doc
+renameType (XHsType (HsTypeExistsRn flag bndr body)) =
+  XHsType <$> (HsTypeExistsRn flag <$> renameLBinder bndr <*> renameLType body)
 renameType t@(XHsType _) = pure t
 renameType (HsExplicitListTy x ip ltys) =
   HsExplicitListTy x ip <$> renameLTypes ltys
@@ -153,10 +159,10 @@ renameContext (HsContext ac tys) = do
 renameForAllTelescope
   :: HsForAllTelescope GhcRn
   -> Rename (IdP GhcRn) (HsForAllTelescope GhcRn)
-renameForAllTelescope (HsForAllVis x bndrs) =
-  HsForAllVis x <$> mapM renameLBinder bndrs
-renameForAllTelescope (HsForAllInvis x bndrs) =
-  HsForAllInvis x <$> mapM renameLBinder bndrs
+renameForAllTelescope (HsForAllVis x ma bndrs) =
+  HsForAllVis x <$> traverse renameLType ma <*> mapM renameLBinder bndrs
+renameForAllTelescope (HsForAllInvis x ma bndrs) =
+  HsForAllInvis x <$> traverse renameLType ma <*> mapM renameLBinder bndrs
 
 renameBinder :: HsTyVarBndr flag GhcRn -> Rename (IdP GhcRn) (HsTyVarBndr flag GhcRn)
 renameBinder (HsTvb x fl bvar lkind) =

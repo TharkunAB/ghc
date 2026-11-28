@@ -31,6 +31,7 @@ import qualified Data.Map as Map
 import qualified Data.Maybe as Maybe
 import GHC hiding (HsTypeGhcPsExt (..), LexicalFixity (..), fromMaybeContext)
 import GHC.Core.Type (Specificity (..))
+import GHC.Types.Var (ExistsTyFlag(..))
 import GHC.Data.BooleanFormula
 import GHC.Exts hiding (toList)
 import GHC.Types.Name
@@ -316,10 +317,8 @@ ppSubSigLike unicode qual typ argDocs subdocs sep emptyCtxts = do_sig_args 0 sep
     do_sig_args :: Int -> Html -> HsSigType DocNameI -> [SubDecl]
     do_sig_args n leader (HsSig{sig_bndrs = outer_bndrs, sig_body = ltype}) =
       case outer_bndrs of
-        HsOuterExplicit{hso_bndrs = bndrs} -> do_largs n (leader' bndrs) ltype
+        HsOuterExplicit{} -> do_largs n (leader <+> ppHsOuterTyVarBndrs unicode qual outer_bndrs) ltype
         HsOuterImplicit{} -> do_largs n leader ltype
-      where
-        leader' bndrs = leader <+> ppForAllPart unicode qual (mkHsForAllInvisTeleI bndrs)
 
     argDoc n = Map.lookup n argDocs
 
@@ -327,6 +326,14 @@ ppSubSigLike unicode qual typ argDocs subdocs sep emptyCtxts = do_sig_args 0 sep
     do_largs n leader (L _ t) = do_args n leader t
 
     do_args :: Int -> Html -> HsType DocNameI -> [SubDecl]
+    do_args n leader (HsForEachTy (_, Right _) bndrs ltype) =
+      do_largs n (leader <+> (ppForEachBinders unicode qual bndrs +++ dot)) ltype
+    do_args n leader (HsForEachTy _ bndrs ltype)
+      | not (null bndrs) =
+          [ (ldr <+> ppForEachBinders unicode qual [bndr], argDoc i, [])
+          | (i, ldr, bndr) <- zip3 [n ..] (leader : repeat (arrow unicode)) bndrs
+          ]
+            ++ do_largs (n + length bndrs) (arrow unicode) ltype
     do_args n leader (HsForAllTy _ tele ltype) =
       do_largs n leader' ltype
       where
@@ -1347,12 +1354,9 @@ ppShortConstrParts summary dataInst con unicode qual =
   case con of
     ConDeclH98
       { con_args = det
-      , con_ex_tvs = tyVars
-      , con_forall = forall_
-      , con_mb_cxt = cxt
+      , con_telescope = telescope
       } ->
-        let context = fromMaybeContext cxt
-            header_ = ppConstrHdr forall_ tyVars context unicode qual
+        let header_ = ppConstrHdr telescope unicode qual
          in case det of
               -- Prefix constructor, e.g. 'Just a'
               PrefixCon _ args ->
@@ -1424,12 +1428,9 @@ ppSideBySideConstr subdocs fixities unicode pkg qual (L _ con) =
     decl = case con of
       ConDeclH98
         { con_args = det
-        , con_ex_tvs = tyVars
-        , con_forall = forall_
-        , con_mb_cxt = cxt
+        , con_telescope = telescope
         } ->
-          let context = fromMaybeContext cxt
-              header_ = ppConstrHdr forall_ tyVars context unicode qual
+          let header_ = ppConstrHdr telescope unicode qual
            in case det of
                 -- Prefix constructor, e.g. 'Just a'
                 PrefixCon _ args
@@ -1511,27 +1512,21 @@ ppSideBySideConstr subdocs fixities unicode pkg qual (L _ con) =
 
 -- ppConstrHdr is for (non-GADT) existentials constructors' syntax
 ppConstrHdr
-  :: Bool
-  -- ^ print explicit foralls
-  -> [LHsTyVarBndr Specificity DocNameI]
-  -- ^ type variables
-  -> HsContext DocNameI
-  -- ^ context
+  :: [LHsGadtTelescope DocNameI]
+  -- ^ Quantifiers and contexts in source order.
   -> Unicode
   -> Qualification
   -> Html
-ppConstrHdr forall_ tvs ctxt unicode qual = ppForall +++ ppCtxt
+ppConstrHdr telescope unicode qual = hsep (map ppPrefix telescope)
   where
-    ppForall
-      | null tvs || not forall_ = noHtml
-      | otherwise = ppForAllPart unicode qual (HsForAllInvis noExtField tvs)
-
-    ppCtxt
-      | null (hsc_ctxt ctxt) = noHtml
+    ppPrefix (L _ (HsGadtForAll _ tele)) = ppForAllPart unicode qual tele
+    ppPrefix (L _ (HsGadtContext ctxt))
+      | null (hsc_ctxt (unLoc ctxt)) = noHtml
       | otherwise =
-          ppContextNoArrow ctxt unicode qual HideEmptyContexts
+          ppContextNoArrow (unLoc ctxt) unicode qual HideEmptyContexts
             <+> darrow unicode
             +++ toHtml (" " :: LText)
+    ppPrefix (L _ HsGadtPar{}) = noHtml
 
 -- | Pretty-print a record field
 ppSideBySideField
@@ -1766,6 +1761,7 @@ patSigContext sig_typ
     hasNonEmptyContext :: LHsType DocNameI -> Bool
     hasNonEmptyContext t =
       case unLoc t of
+        HsForEachTy _ _ s -> hasNonEmptyContext s
         HsForAllTy _ _ s -> hasNonEmptyContext s
         HsQualTy _ cxt s -> if null (hsc_ctxt $ unLoc cxt) then hasNonEmptyContext s else True
         HsFunTy _ _ _ s -> hasNonEmptyContext s
@@ -1773,6 +1769,7 @@ patSigContext sig_typ
     isFirstContextEmpty :: LHsType DocNameI -> Bool
     isFirstContextEmpty t =
       case unLoc t of
+        HsForEachTy _ _ s -> isFirstContextEmpty s
         HsForAllTy _ _ s -> isFirstContextEmpty s
         HsQualTy _ cxt _ -> null (hsc_ctxt $ unLoc cxt)
         HsFunTy _ _ _ s -> isFirstContextEmpty s
@@ -1792,17 +1789,30 @@ ppHsOuterTyVarBndrs
   -> Html
 ppHsOuterTyVarBndrs unicode qual outer_bndrs = case outer_bndrs of
   HsOuterImplicit{} -> noHtml
-  HsOuterExplicit{hso_bndrs = bndrs} ->
+  HsOuterExplicit{hso_matchability = ma, hso_bndrs = bndrs} ->
     hsep (forallSymbol unicode : ppTyVars unicode qual bndrs) +++ dot
+      +++ ppForAllMatchability unicode qual ma
 
 ppForAllPart :: Unicode -> Qualification -> HsForAllTelescope DocNameI -> Html
 ppForAllPart unicode qual tele = case tele of
-  HsForAllVis{hsf_vis_bndrs = bndrs} ->
+  HsForAllVis{hsf_matchability = ma, hsf_vis_bndrs = bndrs} ->
     hsep (forallSymbol unicode : ppTyVars unicode qual bndrs)
       +++ spaceHtml
       +++ arrow unicode
-  HsForAllInvis{hsf_invis_bndrs = bndrs} ->
+      +++ ppForAllMatchability unicode qual ma
+  HsForAllInvis{hsf_matchability = ma, hsf_invis_bndrs = bndrs} ->
     hsep (forallSymbol unicode : ppTyVars unicode qual bndrs) +++ dot
+      +++ ppForAllMatchability unicode qual ma
+
+-- | Print the annotation after the forall separator.
+ppForAllMatchability :: Unicode -> Qualification -> Maybe (LHsType DocNameI) -> Html
+ppForAllMatchability unicode qual =
+  maybe noHtml (\ma -> spaceHtml +++ (atSign <> ppLParendType unicode qual HideEmptyContexts ma))
+
+-- | Print retained value binders without the result arrow.
+ppForEachBinders :: Unicode -> Qualification -> [LHsTyVarBndr () DocNameI] -> Html
+ppForEachBinders unicode qual bndrs =
+  hsep (toHtml ("foreach" :: LText) : ppTyVars unicode qual bndrs)
 
 ppr_sig_ty :: HsSigType DocNameI -> Unicode -> Qualification -> HideEmptyContexts -> Html
 ppr_sig_ty (HsSig{sig_bndrs = outer_bndrs, sig_body = ltype}) unicode qual emptyCtxts =
@@ -1812,6 +1822,13 @@ ppr_mono_lty :: LHsType DocNameI -> Unicode -> Qualification -> HideEmptyContext
 ppr_mono_lty ty = ppr_mono_ty (unLoc ty)
 
 ppr_mono_ty :: HsType DocNameI -> Unicode -> Qualification -> HideEmptyContexts -> Html
+ppr_mono_ty (HsForEachTy (_, visibility) bndrs ty) unicode qual emptyCtxts =
+  prefix <+> ppr_mono_lty ty unicode qual emptyCtxts
+  where
+    binders = ppForEachBinders unicode qual bndrs
+    prefix = case visibility of
+      Left _ -> binders <+> arrow unicode
+      Right _ -> binders +++ dot
 ppr_mono_ty (HsForAllTy _ tele ty) unicode qual emptyCtxts =
   ppForAllPart unicode qual tele <+> ppr_mono_lty ty unicode qual emptyCtxts
 ppr_mono_ty (HsQualTy _ ctxt ty) unicode qual emptyCtxts =
@@ -1846,6 +1863,19 @@ ppr_mono_ty (HsSpliceTy v _) _ _ _ = dataConCantHappen v
 ppr_mono_ty (XHsType (HsBangTy b ty)) u q _ =
   ppBang b +++ ppLParendType u q HideEmptyContexts ty
 ppr_mono_ty (XHsType (HsRecTy{})) _ _ _ = toHtml ("{..}" :: LText)
+ppr_mono_ty (XHsType (HsErasedExists flag binder body)) u q e =
+  keyword "exists" <+> binder' <+> ppr_mono_lty body u q e
+  where
+    name = ppHsTyVarBndr u q (unLoc binder)
+    binder' = case flag of
+      ExplicitExists -> name <+> char '|'
+      ImplicitExists -> name +++ dot
+ppr_mono_ty (XHsType (HsCheckedTypeCase scrutinee rows)) u q e =
+  keyword "case" <+> pp scrutinee <+> keyword "of"
+    <+> braces (hsep (intersperse (stringToHtml ";") (map row rows)))
+  where
+    pp ty = ppr_mono_lty ty u q e
+    row (pat, rhs) = pp pat <+> arrow u <+> pp rhs
 -- Can now legally occur in ConDeclGADT, the output here is to provide a
 -- placeholder in the signature, which is followed by the field
 -- declarations.

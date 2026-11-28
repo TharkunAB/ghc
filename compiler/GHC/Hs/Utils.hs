@@ -33,6 +33,7 @@ module GHC.Hs.Utils(
   mkHsPar, mkHsApp, mkHsAppWith, mkHsApps, mkHsAppsWith, mkHsSyntaxApps,
   mkHsAppType, mkHsAppTypes, mkHsCaseAlt,
   mkSimpleMatch, unguardedGRHSs, unguardedRHS,
+  lazyLetRhs, unguardedRhs, returnsLocal,
   mkMatchGroup, mkLamCaseMatchGroup, mkMatch, mkPrefixFunRhs, mkHsLam, mkHsIf,
   mkHsWrap, mkLHsWrap, mkHsWrapCo, mkHsWrapCoR, mkLHsWrapCo,
   mkHsDictLet, mkHsLams,
@@ -201,6 +202,27 @@ unguardedRHS :: Anno (GRHS (GhcPass p) (LocatedA (body (GhcPass p))))
              -> NonEmpty (LGRHS (GhcPass p) (LocatedA (body (GhcPass p))))
 unguardedRHS an loc rhs = NE.singleton $ L (noAnnSrcSpan loc) (GRHS an [] rhs)
 
+-- | Read a single lazy value equation without guards or local declarations.
+lazyLetRhs :: MatchGroup (GhcPass p) (LHsExpr (GhcPass p)) -> Maybe (LHsExpr (GhcPass p))
+lazyLetRhs MG { mg_alts = L _ [L _ match] }
+  | Match { m_ctxt = FunRhs { mc_strictness = NoSrcStrict }, m_pats = L _ []
+          , m_grhss = grhss } <- match
+  = unguardedRhs grhss
+lazyLetRhs _ = Nothing
+
+-- | Read one right-hand side without guards or local declarations.
+unguardedRhs :: GRHSs (GhcPass p) (LHsExpr (GhcPass p)) -> Maybe (LHsExpr (GhcPass p))
+unguardedRhs GRHSs { grhssGRHSs = L _ (GRHS _ [] rhs) NE.:| []
+                   , grhssLocalBinds = L _ EmptyLocalBinds{} } = Just rhs
+unguardedRhs _ = Nothing
+
+-- | Recognise the result of a forwarding let or case.
+-- See Note [Repacking through a local binding] in GHC.Tc.Gen.Expr.
+returnsLocal :: Name -> LHsExpr GhcRn -> Bool
+returnsLocal name expr = case unLoc (stripParensLHsExpr expr) of
+  HsVar _ ref -> unLocWithUserRdr ref == name
+  _ -> False
+
 type AnnoBody p body
   = ( XMG (GhcPass p) (LocatedA (body (GhcPass p))) ~ (Origin, MatchGroupAnn)
     , Anno [LocatedA (Match (GhcPass p) (LocatedA (body (GhcPass p))))] ~ SrcSpanAnnA
@@ -253,7 +275,7 @@ mkHsAppsWith
 mkHsAppsWith mkLocated = foldl' (mkHsAppWith mkLocated)
 
 mkHsAppType :: LHsExpr GhcRn -> LHsWcType GhcRn -> LHsExpr GhcRn
-mkHsAppType e t = addCLocA t_body e (HsAppType noExtField e paren_wct)
+mkHsAppType e t = addCLocA t_body e (HsAppType Nothing e paren_wct)
   where
     t_body    = hswc_body t
     paren_wct = t { hswc_body = t_body }
@@ -737,9 +759,10 @@ mkBigLHsPatTup = mkChunkified mkLHsPatTup
 hsTypeToHsSigType :: LHsType GhcPs -> LHsSigType GhcPs
 hsTypeToHsSigType lty@(L loc ty) = case ty of
   HsForAllTy { hst_tele = HsForAllInvis { hsf_xinvis = an
+                                        , hsf_matchability = ma
                                         , hsf_invis_bndrs = bndrs }
              , hst_body = body }
-    -> L loc $ mkHsExplicitSigType an bndrs body
+    -> L loc $ HsSig noExtField (HsOuterExplicit an ma bndrs) body
   _ -> L (l2l loc) $ mkHsImplicitSigType lty -- The annotations are in lty, erase them from loc
 
 -- | Convert an 'LHsType' to an 'LHsSigWcType'.
@@ -1240,6 +1263,7 @@ collectPatsBinders flag pats = foldr (collect_lpat flag) [] pats
 -- CollNoDictBinders   |  no      |    no     |    yes    |  any  |
 -- CollWithDictBinders |  yes     |    no     |    yes    | GhcTc |
 -- CollVarTyVarBinders |  no      |    yes    |    yes    | GhcRn |
+-- CollExplicitBinders | no      |  explicit |    yes    | GhcRn |
 --
 -- See Note [Dictionary binders in ConPatOut]
 data CollectFlag p where
@@ -1249,6 +1273,8 @@ data CollectFlag p where
     CollWithDictBinders :: CollectFlag GhcTc
     -- | Collect variable and type variable binders, but no evidence binders
     CollVarTyVarBinders :: CollectFlag GhcRn
+    -- | Collect term variables and explicit type variables in type patterns
+    CollExplicitBinders :: CollectFlag GhcRn
 
 
 collect_lpat :: forall p. CollectPass p
@@ -1283,9 +1309,8 @@ collect_pat flag pat bndrs = case pat of
   NPat {}               -> bndrs
   NPlusKPat _ n _ _ _ _ -> unXRec @p n : bndrs
   SigPat _ pat sig      -> case flag of
-    CollNoDictBinders   -> collect_lpat flag pat bndrs
-    CollWithDictBinders -> collect_lpat flag pat bndrs
     CollVarTyVarBinders -> collect_lpat flag pat bndrs ++ collectPatSigBndrs sig
+    _                   -> collect_lpat flag pat bndrs
   XPat ext              -> collectXXPat @p flag ext bndrs
   SplicePat ext _       -> collectXSplicePat @p flag ext bndrs
   EmbTyPat _ tp         -> collect_ty_pat_bndrs flag tp bndrs
@@ -1294,10 +1319,10 @@ collect_pat flag pat bndrs = case pat of
 
   -- See Note [Dictionary binders in ConPatOut]
   ConPat {pat_args=ps}  -> case flag of
-    CollNoDictBinders   -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
     CollWithDictBinders -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
                            ++ collectEvBinders (cpt_binds (pat_con_ext pat))
-    CollVarTyVarBinders -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
+                           ++ concatMap (collectEvBinders . snd) (cpt_ordered_binds (pat_con_ext pat))
+    _                   -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
 
 collectEvBinders :: TcEvBinds -> [Id]
 collectEvBinders (EvBinds bs)   = foldr add_ev_bndr [] bs
@@ -1307,6 +1332,7 @@ collect_ty_pat_bndrs :: CollectFlag p -> HsTyPat (NoGhcTc p) -> [IdP p] -> [IdP 
 collect_ty_pat_bndrs CollNoDictBinders _ bndrs = bndrs
 collect_ty_pat_bndrs CollWithDictBinders _ bndrs = bndrs
 collect_ty_pat_bndrs CollVarTyVarBinders tp bndrs = collectTyPatBndrs tp ++ bndrs
+collect_ty_pat_bndrs CollExplicitBinders (HsTP (HsTPRn _ _ exp_tvs) _) bndrs = exp_tvs ++ bndrs
 
 collectTyPatBndrs :: HsTyPat GhcRn -> [Name]
 collectTyPatBndrs (HsTP (HsTPRn nwcs imp_tvs exp_tvs) _) = nwcs ++ imp_tvs ++ exp_tvs
@@ -1341,6 +1367,7 @@ instance IsPass p => CollectPass (GhcPass p) where
       GhcTc -> case ext of
         CoPat _ pat _      -> collect_pat flag pat
         ExpansionPat _ pat -> collect_pat flag pat
+        NativeExistsPat _ _ _ _ pat -> collect_pat flag pat
   collectXXHsBindsLR ext =
     case ghcPass @p of
       GhcPs -> dataConCantHappen ext

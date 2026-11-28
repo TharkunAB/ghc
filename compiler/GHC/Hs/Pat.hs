@@ -298,6 +298,10 @@ data XXPatGhcTc
   -- See Note [Rebindable syntax and XXExprGhcRn].
   | ExpansionPat (Pat GhcRn) (Pat GhcTc)
 
+  -- | Open an implicit package while matching its payload pattern.
+  -- The witness and payload scope over the pattern and its match continuation.
+  | NativeExistsPat Type TyVar Id TcEvBinds (Pat GhcTc)
+
 
 -- See Note [Rebindable syntax and XXExprGhcRn].
 data HsPatExpansion a b
@@ -327,9 +331,16 @@ data ConPatTc
       cpt_binds :: TcEvBinds
 
     , -- | Extra wrapper to pass to the matcher
-      -- Only relevant for pattern-synonyms;
-      --   ignored for data cons
+      -- For a pattern synonym, apply the required arguments.
+      -- For a constructor with a trailing context, bind evidence from
+      -- checking its fields before the trailing context enters scope.
+      -- See Note [Trailing constructor evidence] in GHC.HsToCore.Match.Constructor.
       cpt_wrap  :: HsWrapper
+
+    , -- | Solved bindings after the indicated number of field patterns.
+      -- The entries are in source order. See Note [Trailing constructor evidence]
+      -- in GHC.HsToCore.Match.Constructor.
+      cpt_ordered_binds :: [(Int, TcEvBinds)]
     }
 
 
@@ -394,6 +405,16 @@ pprParendPat :: forall p. OutputableBndrId p
              => PprPrec
              -> Pat (GhcPass p)
              -> SDoc
+-- Retained constructor checks bind the whole argument with a generated alias.
+-- Keep that alias in elaboration dumps. Use the written pattern in diagnostics.
+pprParendPat p (AsPat _ (L l name) pat)
+  | GhcTc <- ghcPass @p
+  , isGeneratedSrcSpan (locA l)
+  = sdocOption sdocPrintTypecheckerElaboration $ \print_tc_elab ->
+      if print_tc_elab then ppr_alias else pprParendLPat p pat
+  | otherwise = ppr_alias
+  where
+    ppr_alias = hcat [pprPrefixOcc name, char '@', pprParendLPat appPrec pat]
 pprParendPat p pat = sdocOption sdocPrintTypecheckerElaboration $ \ print_tc_elab ->
     if need_parens print_tc_elab pat
     then parens (pprPat pat)
@@ -412,12 +433,18 @@ pprParendPat p pat = sdocOption sdocPrintTypecheckerElaboration $ \ print_tc_ela
       -- is the pattern inside that matters.  Sigh.
 
 pprPat :: forall p. (OutputableBndrId p) => Pat (GhcPass p) -> SDoc
-pprPat (VarPat _ lvar)          = pprPatBndr (unLoc lvar)
+pprPat (VarPat _ (L l var))
+  | GhcTc <- ghcPass @p
+  , isGeneratedSrcSpan (locA l)
+  = sdocOption sdocPrintTypecheckerElaboration $ \print_tc_elab ->
+      if print_tc_elab
+        then pprPatBndr var
+        else getPprDebug $ \dbg -> if dbg then pprPatBndr var else char '_'
+  | otherwise                   = pprPatBndr var
 pprPat (WildPat _)              = char '_'
 pprPat (LazyPat _ pat)          = char '~' <> pprParendLPat appPrec pat
 pprPat (BangPat _ pat)          = char '!' <> pprParendLPat appPrec pat
-pprPat (AsPat _ name pat)       = hcat [pprPrefixOcc (unLoc name), char '@',
-                                        pprParendLPat appPrec pat]
+pprPat pat@AsPat{}              = pprParendPat topPrec pat
 pprPat (ViewPat _ expr pat)     = hcat [pprLExpr expr, text " -> ", ppr pat]
 pprPat (ParPat _ pat)           = parens (ppr pat)
 pprPat (LitPat _ s)             = ppr s
@@ -462,11 +489,12 @@ pprPat (ConPat { pat_con = con
           -- error message, and we want to make sure it prints nicely
           ppr con
             <> braces (sep [ hsep (map pprPatBndr (tvs ++ dicts))
-                           , ppr binds ])
+                           , ppr binds, if null ordered_binds then empty else ppr ordered_binds ])
             <+> pprConArgs details
         where ConPatTc { cpt_tvs = tvs
                        , cpt_dicts = dicts
                        , cpt_binds = binds
+                       , cpt_ordered_binds = ordered_binds
                        } = ext
 pprPat (EmbTyPat _ tp) = text "type" <+> ppr tp
 pprPat (InvisPat x tp) = char '@' <> delimit (ppr tp)
@@ -492,6 +520,7 @@ pprPat (XPat ext) = case ghcPass @p of
         then pprParendPat appPrec pat
         else pprPat pat
     ExpansionPat orig _ -> pprPat orig
+    NativeExistsPat _ _ _ _ pat -> pprPat pat
 
 pprUserCon :: (OutputableBndr con, OutputableBndrId p,
                      Outputable (Anno (IdGhcP p)))
@@ -527,6 +556,7 @@ mkPrefixConPat dc pats tys
                       , cpt_binds = emptyTcEvBinds
                       , cpt_arg_tys = tys
                       , cpt_wrap = idHsWrapper
+                      , cpt_ordered_binds = []
                       }
                     }
 
@@ -697,6 +727,7 @@ isIrrefutableHsPat is_strict irref_conLike pat = go (unLoc pat)
       GhcTc -> case ext of
         CoPat _ pat _ -> go pat
         ExpansionPat _ pat -> go pat
+        NativeExistsPat _ _ _ _ pat -> go pat
 
 -- | Is the pattern any of combination of:
 --
@@ -768,6 +799,7 @@ isBoringHsPat = goL
          GhcTc -> case ext of
            CoPat _ pat _      -> go pat
            ExpansionPat _ pat -> go pat
+           NativeExistsPat _ _ _ _ pat -> go pat
 
 isPatSyn :: LPat GhcTc -> Bool
 isPatSyn (L _ (ConPat {pat_con = L _ (PatSynCon{})})) = True
@@ -1076,6 +1108,7 @@ patNeedsParens p = go @p
         HsPatExpanded orig _ -> go orig
       GhcTc -> case ext of
         CoPat _ inner _ -> go inner
+        NativeExistsPat _ _ _ _ inner -> go inner
         ExpansionPat orig _ -> go orig
           --                   ^^^^^^^
           -- NB: recursive call of go at a different GhcPass.
@@ -1164,6 +1197,7 @@ collectEvVarsPat pat =
     XPat ext -> case ext of
       CoPat _ p _      -> collectEvVarsPat p
       ExpansionPat _ p -> collectEvVarsPat p
+      NativeExistsPat _ _ _ _ p -> collectEvVarsPat p
     _other_pat       -> emptyBag
 
 {-

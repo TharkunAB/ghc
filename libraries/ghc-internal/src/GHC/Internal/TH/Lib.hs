@@ -435,6 +435,14 @@ forallE tvars body = ForallE <$> sequenceA tvars <*> body
 forallVisE :: Quote m => [m (TyVarBndr ())] -> m Exp -> m Exp
 forallVisE tvars body = ForallVisE <$> sequenceA tvars <*> body
 
+-- | Set the matchability of an immediate, nonempty expression forall group.
+-- See Note [Forall matchability wrappers] in GHC.Internal.TH.Syntax.
+forallMatchE :: Quote m => m Type -> m Exp -> m Exp
+forallMatchE ma body = do
+  ma' <- ma
+  body' <- body
+  pure (ForallMatchE ma' body')
+
 constrainedE :: Quote m => [m Exp] -> m Exp -> m Exp
 constrainedE ctx body = ConstrainedE <$> sequenceA ctx <*> body
 
@@ -751,11 +759,44 @@ forallC ns ctxt con = do
   con'  <- con
   pure $ ForallC ns' ctxt' con'
 
+-- | Set the matchability of an immediate, nonempty constructor forall group.
+-- See Note [Forall matchability wrappers] in GHC.Internal.TH.Syntax.
+forallMatchC :: Quote m => m Type -> m Con -> m Con
+forallMatchC ma con = do
+  ma' <- ma
+  con' <- con
+  pure (ForallMatchC ma' con')
+
 gadtC :: Quote m => [Name] -> [m StrictType] -> m Type -> m Con
 gadtC cons strtys ty = liftA2 (GadtC cons) (sequenceA strtys) ty
 
 recGadtC :: Quote m => [Name] -> [m VarStrictType] -> m Type -> m Con
 recGadtC cons varstrtys ty = liftA2 (RecGadtC cons) (sequenceA varstrtys) ty
+
+-- | Build a prefix GADT constructor with retained arguments.
+retainedGadtC :: Quote m => [Name] -> [m RetainedGadtArg] -> m Type -> m Con
+retainedGadtC names args result =
+  RetainedGadtC names <$> sequenceA args <*> result
+
+-- | Build an ordinary field with its source bang and multiplicity.
+gadtValueArg :: Quote m => m Bang -> m Type -> m Type -> m RetainedGadtArg
+gadtValueArg bang mult ty = GadtValueArg <$> bang <*> mult <*> ty
+
+-- | Build a retained field that binds a name in the remaining signature.
+gadtIndexArg :: Quote m => Name -> m Type -> m RetainedGadtArg
+gadtIndexArg name domain = GadtIndexArg name <$> domain
+
+-- | Build an invisible forall group in an ordered GADT signature.
+gadtInvisibleArgs :: Quote m => m Type -> [m (TyVarBndr Specificity)] -> m RetainedGadtArg
+gadtInvisibleArgs ma tvs = GadtInvisibleArgs <$> ma <*> sequenceA tvs
+
+-- | Build a required forall group in an ordered GADT signature.
+gadtRequiredArgs :: Quote m => m Type -> [m (TyVarBndr ())] -> m RetainedGadtArg
+gadtRequiredArgs ma tvs = GadtRequiredArgs <$> ma <*> sequenceA tvs
+
+-- | Build a context group in an ordered GADT signature.
+gadtContextArgs :: Quote m => m Cxt -> m RetainedGadtArg
+gadtContextArgs = fmap GadtContextArgs
 
 -------------------------------------------------------------------------------
 -- *   Type
@@ -769,6 +810,38 @@ forallT tvars ctxt ty = do
 
 forallVisT :: Quote m => [m (TyVarBndr ())] -> m Type -> m Type
 forallVisT tvars ty = ForallVisT <$> sequenceA tvars <*> ty
+
+-- | Construct a retained function type.
+forEachT :: Quote m => BndrVis -> Name -> m Type -> m Type -> m Type
+forEachT vis name domain body = ForEachT vis name <$> domain <*> body
+
+-- | Refer to a retained term variable in a type.
+indexVarT :: Quote m => Name -> m Type
+indexVarT = pure . IndexVarT
+
+-- | Construct an ordered type case.
+caseT :: Quote m => m Type -> [m TypeCaseAlt] -> m Type
+caseT scrutinee rows = CaseT <$> scrutinee <*> sequenceA rows
+
+-- | Construct a nonrecursive type let. The name is in scope in the body.
+letT :: Quote m => Name -> m Type -> m Type -> m Type
+letT name rhs body = LetT name <$> rhs <*> body
+
+-- | An anonymous type-level function with one or more bound variables.
+lamT :: Quote m => [Name] -> m Type -> m Type
+lamT names body = LamT names <$> body
+
+-- | Construct one pattern and result of an ordered type case.
+typeCaseAlt :: Quote m => m Type -> m Type -> m TypeCaseAlt
+typeCaseAlt pat rhs = TypeCaseAlt <$> pat <*> rhs
+
+-- | Set the matchability of an immediate, nonempty type forall group.
+-- See Note [Forall matchability wrappers] in GHC.Internal.TH.Syntax.
+forallMatchT :: Quote m => m Type -> m Type -> m Type
+forallMatchT ma ty = do
+  ma' <- ma
+  ty' <- ty
+  pure (ForallMatchT ma' ty')
 
 varT :: Quote m => Name -> m Type
 varT = pure . VarT

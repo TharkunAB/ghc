@@ -326,6 +326,11 @@ deriving instance Lift a => Lift (TyVarBndr a)
 deriving instance Lift TyLit
 -- | @since template-haskell-2.22.1.0
 deriving instance Lift Type
+-- | @since template-haskell-2.25.0.0
+deriving instance Lift TypeCaseAlt
+-- Derived Lift retains both children of ForallMatchT. The Con and Exp
+-- instances below do the same for their wrappers.
+-- See Note [Forall matchability wrappers] in GHC.Internal.TH.Syntax.
 -- | @since template-haskell-2.22.1.0
 instance Lift Bytes where
   liftTyped x = unsafeCodeCoerce (lift x)
@@ -384,6 +389,7 @@ deriving instance Lift DecidedStrictness
 deriving instance Lift Bang
 -- | @since template-haskell-2.22.1.0
 deriving instance Lift Con
+deriving instance Lift RetainedGadtArg
 -- | @since template-haskell-2.22.1.0
 deriving instance Lift TySynEqn
 -- | @since template-haskell-2.22.1.0

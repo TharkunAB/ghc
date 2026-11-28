@@ -9,7 +9,7 @@
 -- compiler/GHC/Runtime/Interpreter.hs.
 --
 module GHCi.Run
-  ( run, redirectInterrupts
+  ( run, redirectInterrupts, evalStringWith
   ) where
 
 import Prelude -- See note [Why do we import Prelude here?]
@@ -71,6 +71,7 @@ run m = case m of
   FindSystemLibrary {}        -> notSupportedJS m
   CreateBCOs {}               -> notSupportedJS m
   LookupClosure str           -> lookupJSClosure str
+  HasSymbol {}                -> pure False
 #else
   InitLinker -> initObjLinker RetainCAFs
   LoadDLLs strs -> fmap (map toRemotePtr) <$> loadDLLs strs
@@ -85,6 +86,7 @@ run m = case m of
   FindSystemLibrary str -> findSystemLibrary str
   CreateBCOs bcos -> createBCOs bcos
   LookupClosure str -> lookupClosure str
+  HasSymbol str -> hasSymbol str
 #endif
   RtsRevertCAFs -> rts_revertCAFs
   LookupSymbol str -> fmap toRemotePtr <$> lookupSymbol str
@@ -224,9 +226,13 @@ evalIO r = do
   tryEval (unsafeCoerce io :: IO ())
 
 evalString :: HValueRef -> IO (EvalResult String)
-evalString r = do
+evalString = evalStringWith id
+
+-- | Run a string action with the supplied masking state.
+evalStringWith :: (IO String -> IO String) -> HValueRef -> IO (EvalResult String)
+evalStringWith restore r = do
   io <- localRef r
-  tryEval $ do
+  tryEval $ restore $ do
     r <- unsafeCoerce io :: IO String
     evaluate (force r)
 

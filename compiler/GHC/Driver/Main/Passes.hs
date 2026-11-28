@@ -2,7 +2,7 @@
 {-# LANGUAGE MultiWayIf #-}
 
 {-# OPTIONS_GHC -fprof-auto-top #-}
-{-# OPTIONS_GHC -Wwarn=x-internalPprMessages #-}
+{-# OPTIONS_GHC -Wno-x-internalPprMessages #-}
 
 -------------------------------------------------------------------------------
 -- | Aspects of GHC.Driver.Main dealing with running particular passes.
@@ -15,6 +15,8 @@ module GHC.Driver.Main.Passes
 
       hscCompileCoreExpr'
     , hscCompileCoreExpr
+    , hscCompileCoreExprWithOptionalName
+    , hscLoadSameModuleClosedBcos
 
     -- * Running passes separately
     , hscRecompStatus
@@ -30,7 +32,7 @@ module GHC.Driver.Main.Passes
     , hscSimplify
     , hscSimplify'
     , hscDesugarAndSimplify
-    , hscTidy
+    , hscTidy, hscTidyScopedDictionary
 
     ) where
 
@@ -43,9 +45,14 @@ import GHC.Driver.Main.Hsc
       iface_core_bindings,
       handleWarningsThrowErrors,
       ioMsgMaybe,
+      nativeOptLevel,
+      checkNativeDependentModule,
+      hasNativeDependentModuleBody,
+      nativeCodeGenFlags,
       hscSimpleIface )
 
 import GHC.Driver.Plugins
+import GHC.Driver.DynFlags ( optLevelFlags )
 import GHC.Driver.Session
 import GHC.Driver.Backend
 import GHC.Driver.Env
@@ -53,8 +60,8 @@ import GHC.Driver.Errors
 import GHC.Driver.Messager
 import GHC.Driver.Errors.Types
 import GHC.Driver.Config.Core.Opt.Simplify ( initSimplifyExprOpts )
-import GHC.Driver.Config.Core.Lint ( endPassHscEnvIO )
-import GHC.Driver.Config.Core.Lint.Interactive ( lintInteractiveExpr )
+import GHC.Driver.Config.Core.Lint ( endPassHscEnvIO, initEndPassConfig )
+import GHC.Driver.Config.Core.Lint.Interactive ( lintInteractiveExpr, lintInteractiveExprAfterPrep )
 import GHC.Driver.Config.CoreToStg
 import GHC.Driver.Config.CoreToStg.Prep
 import GHC.Driver.Config.Parser   (initParserOpts)
@@ -75,6 +82,7 @@ import GHC.Linker.Types
 import GHC.Linker.Deps
 
 import GHC.Hs
+import qualified GHC.LanguageExtensions as LangExt
 import GHC.Hs.Dump
 import GHC.Hs.Stats         ( ppSourceStats )
 
@@ -99,14 +107,27 @@ import GHC.Iface.Ext.Debug  ( diffFile, validateScopes )
 import qualified GHC.ByteCode.Serialize as ByteCode
 
 import GHC.Core
+import GHC.Core.Dependent ( hasExistentialExpr, hasNativeDependentExpr, rejectNativeDependentExpr
+                          , hasScopedDictionaryExpr, hasScopedDictionaryProgram, supportsScopedDictionaryCore
+                          , supportsNativeGentle, supportsNativeRuleBinds, supportsLocalUserRule
+                          , supportsNativeUserUnfolding )
+import GHC.Core.Lint ( endScopedDictionaryPassIO )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
+import GHC.Core.TyCon (TyCon, tyConName, tyConDataCons, isBoxedDataTyCon, isTypeDataTyCon)
+import GHC.Core.DataCon (dataConName)
+import GHC.Core.FVs            ( exprSomeFreeVarsList, mkRuleInfo )
 import GHC.Core.Tidy           ( tidyExpr )
 import GHC.Core.Utils          ( exprType )
 import GHC.Core.Opt.Pipeline
+import GHC.Core.Opt.Simplify (simplifyPgm)
+import GHC.Core.Opt.Simplify.Env (SimplMode(..))
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
+import GHC.Driver.Config.Core.Opt.Simplify (initSimplifyOpts, initGentleSimplMode)
 import GHC.Core.Opt.Pipeline.Types      ( CoreToDo (..))
 import GHC.Core.InstEnv
 import GHC.Core.Rules
 import GHC.Core.Stats
+import GHC.Core.SimpleOpt ( simpleOptNativeExpr, simpleOptNativeProgram )
 
 
 import GHC.CoreToStg.Prep( corePrepExpr )
@@ -116,6 +137,7 @@ import GHC.Parser.Errors.Types
 import GHC.Parser
 import GHC.Parser.Lexer as Lexer
 
+import GHC.Tc.Errors.Types (TcRnMessage(TcRnNoSourceTable))
 import GHC.Tc.Module
 import GHC.Tc.Utils.Monad
 
@@ -138,22 +160,37 @@ import GHC.Unit.Module.Status
 import GHC.Unit.Home.ModInfo
 
 import GHC.Types.CostCentre
+import GHC.Types.Avail (availsToNameSet)
 import GHC.Types.Error
 import GHC.Types.ForeignStubs
 import GHC.Types.Id
+import GHC.Types.Id.Info (IdDetails(DFunId, VanillaId))
+import GHC.Types.Var (setIdDetails)
+import GHC.Types.Name.Cache (NameCache)
+import GHC.Types.Name.Env (elemNameEnv, filterNameEnv, lookupNameEnv, mapNameEnv, mkNameEnv)
+import GHC.Types.Name.Set (NameSet, emptyNameSet, mkNameSet, elemNameSet, extendNameSet, extendNameSetList, isEmptyNameSet, nameSetElemsStable, unionNameSet)
 import GHC.Types.IPE
 import GHC.Types.Name
 import GHC.Types.Name.Ppr
+import GHC.Types.Unique.DFM (emptyUDFM)
 import GHC.Types.SourceError
 import GHC.Types.SafeHaskell
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
-import GHC.Types.Unique.Supply ( uniqFromTag, UniqueTag(BcoTag) )
+import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, plusTypeEnv, typeEnvFromEntities, typeEnvIds)
+import GHC.Types.TyThing (TyThing(..), implicitTyConThings)
+import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, splitUniqSupply, uniqFromTag, UniqueTag(BcoTag, HscTag) )
 import GHC.Types.Unique.Set
-import GHC.Types.Var.Env       ( mkEmptyTidyEnv )
+import GHC.Types.Var.Env       ( emptyVarEnv, extendVarEnv, lookupVarEnv, mkEmptyTidyEnv )
 import GHC.Types.Var.Set
 
 import GHC.Utils.Fingerprint ( Fingerprint )
+import GHC.Tc.Gen.SourceClosure
+  ( earlyIndexedLookups, finalizeEarlyClosureTypes, publishCheckedSourceClosures
+  , validateEarlyIndexedLookups )
+import GHC.Tc.Gen.SourceTable (finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables,
+                               finalCoreSourceFamilies, sourceRuleOwners, sourceTableCallees, publishListFoldMethods,
+                               keepCheckedMapWorkers, publishCheckedMapMethods)
 import GHC.Utils.Panic
 import GHC.Utils.Error
 import GHC.Utils.Outputable
@@ -168,7 +205,7 @@ import GHC.Data.Maybe
 import qualified GHC.Data.Strict as Strict
 
 import qualified Data.Array as A
-import Data.List ( nub, isPrefixOf, partition )
+import Data.List ( nub, isPrefixOf, partition, sortBy )
 import qualified Data.List.NonEmpty as NE
 import Control.Monad
 import Data.IORef
@@ -183,7 +220,7 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Time
 
 import System.IO.Unsafe ( unsafeInterleaveIO )
-import GHC.Iface.Env ( trace_if )
+import GHC.Iface.Env ( allocateGlobalBinder, trace_if )
 import GHC.Types.Unique.DSet ( uniqDSetToList )
 
 
@@ -866,20 +903,59 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
   -- Simplify, if appropriate, and (whether we simplified or not) generate an
   -- interface file.
+  local_eval_terms <- liftIO $ localEvaluatedTermUses tc_result
+  th_core_plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
+  mb_mut_ref <- if null local_eval_terms && null th_core_plugins && not (hasActiveCorePlugins hsc_env)
+    then pure Nothing
+    else Just <$> liftIO (newIORef emptyNameSet)
+  let read_plugin_mutations = maybe (pure emptyNameSet) (liftIO . readIORef) mb_mut_ref
   case mb_desugar of
       -- Just cause we desugared doesn't mean we are generating code, see above.
       Just desugared_guts | backendGeneratesCode bcknd -> do
-          plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
-          simplified_guts <- hscSimplify' plugins desugared_guts
+          let plugins = th_core_plugins
+          optimized <- hscSimplifyWithPluginMutations mb_mut_ref plugins desugared_guts
+          mutated_names <- read_plugin_mutations
+          (before_tidy, after_tidy) <- splitUniqSupply <$> liftIO (mkSplitUniqSupply HscTag)
+          let checked = keepValidatedSourceMappers mutated_names desugared_guts optimized
+              simplified_guts = checked { mg_binds = keepCheckedMapWorkers before_tidy tc_result $
+                                              publishListFoldMethods (mg_module checked) (mg_binds checked) }
 
-          (cg_guts, details) <-
+          (cg_guts, original_details) <-
               liftIO $ hscTidy hsc_env simplified_guts
+
+          let no_late_plugins = not (hasActiveLatePlugins hsc_env)
+              exported_names = availsToNameSet (tcg_exports tc_result)
+              want_closures = gopt Opt_WriteSourceEquations dflags &&
+                              no_late_plugins
+          checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+            no_late_plugins local_eval_terms mutated_names
+            (mg_rules desugared_guts ++ mg_rules simplified_guts)
+            (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
+          let base_types = finalizeEarlyClosureTypes (Just (cg_binds cg_guts)) exported_names
+                             (md_types original_details)
+          (method_pub, closure_pub) <- liftIO $
+            finalizeSimplifiedSourceTables hsc_env hsc_src after_tidy True want_closures
+              (mg_module checked) (mg_binds desugared_guts) (cg_binds cg_guts) tc_result base_types
+          let method_details = case method_pub of
+                Just (ids, fams) ->
+                  let types = base_types `plusTypeEnv` typeEnvFromEntities ids fams [] []
+                  in original_details { md_types = types
+                                      , md_insts = updateClsInstDFuns
+                                          (\d -> case lookupTypeEnv types (idName d) of { Just (AnId n) -> n; _ -> d })
+                                          (md_insts original_details) }
+                Nothing -> original_details { md_types = base_types }
+              details = case closure_pub of
+                Just (ids, fams) | not (null ids) ->
+                  method_details { md_types = md_types method_details `plusTypeEnv` typeEnvFromEntities ids fams [] [] }
+                _ -> method_details
 
           !partial_iface <- liftIO $
                 {-# SCC "GHC.Driver.Main.mkPartialIface" #-}
                 -- This `force` saves 2M residency in test T10370
                 -- See Note [Avoiding space leaks in toIface*] for details.
-                fmap force (mkPartialIface hsc_env (cg_binds cg_guts) details summary (tcg_import_decls tc_result) simplified_guts)
+                fmap force (mkPartialIfaceWithRuleHeads hsc_env (cg_binds cg_guts) details summary
+                              (tcg_import_decls tc_result) simplified_guts
+                              (sourceRuleOwners (tcg_rules tc_result)))
 
           return HscRecomp { hscs_guts = cg_guts,
                              hscs_mod_location = ms_location summary,
@@ -893,12 +969,23 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
           -- in order to inline data con wrappers but we honour whatever level of simplificication the
           -- user requested. See #22008 for some discussion.
           plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
-          simplified_guts <- hscSimplify' plugins desugared_guts
+          simplified_guts <- hscSimplifyWithPluginMutations mb_mut_ref plugins desugared_guts
+          mutated_names <- read_plugin_mutations
           (cg_guts, _) <-
               liftIO $ hscTidy hsc_env simplified_guts
 
+          let no_late_plugins = not (hasActiveLatePlugins hsc_env)
+              exported_names = availsToNameSet (tcg_exports tc_result)
+          checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+            no_late_plugins local_eval_terms mutated_names
+            (mg_rules desugared_guts ++ mg_rules simplified_guts)
+            (mg_binds desugared_guts) (Just (mg_binds simplified_guts)) (Just (cg_binds cg_guts))
+          let tc_result_final = tc_result
+                { tcg_type_env = finalizeEarlyClosureTypes (Just (cg_binds cg_guts)) exported_names
+                                   (tcg_type_env tc_result) }
+
           (iface, _details) <- liftIO $
-            hscSimpleIface hsc_env (Just $ cg_binds cg_guts) (cg_modBreaks cg_guts) tc_result summary
+            hscSimpleIface hsc_env (Just $ cg_binds cg_guts) (cg_modBreaks cg_guts) tc_result_final summary
 
           liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
@@ -909,11 +996,70 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
             else return $ HscUpdate iface
 
 
-      -- We are not generating code or writing an interface with simplified core so we can skip simplification
-      -- and generate a simple interface.
+      -- Check a provisional source equation against optimized Core even
+      -- when the interface will not contain a Core program.
+      -- See Note [Checked source equations in typecheck-only interfaces].
       _ -> do
+        added_plugins0 <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
+        let no_late_plugins = not (hasActiveLatePlugins hsc_env)
+            has_early_lookups = not (null (earlyIndexedLookups tc_result))
+            has_local_eval_plugins =
+              not (null local_eval_terms) &&
+              (hasActiveCorePlugins hsc_env || not (null added_plugins0) || not no_late_plugins)
+            produces_iface = gopt Opt_WriteInterface dflags || not (isOneShot (ghcMode dflags))
+            want_source_iface = produces_iface &&
+                                gopt Opt_WriteSourceEquations dflags &&
+                                null (tcg_rules tc_result) &&
+                                not (gopt Opt_Hpc dflags)
+            want_closures = want_source_iface
+        checked_tc <- case mb_desugar of
+          Just guts
+            | let no_rules = null (mg_rules guts)
+                  can_publish_methods = want_source_iface && no_late_plugins && no_rules &&
+                                        not (null (tcg_insts tc_result))
+                  can_publish_closures = want_closures && no_late_plugins && no_rules
+                  has_mappers = not (null (finalCoreMappers (mg_binds guts)))
+            , has_mappers || has_early_lookups || has_local_eval_plugins ||
+              can_publish_methods || can_publish_closures -> do
+                let retained = hasNativeDependentModuleBody (mg_binds guts) [] (mg_tcs guts)
+                    need_opt = has_early_lookups || has_local_eval_plugins ||
+                               (has_mappers && no_rules) ||
+                               can_publish_methods || can_publish_closures
+                active_opt <- if not need_opt
+                  then pure Nothing
+                  else if not retained
+                    then Just <$> hscSimplifyWithPluginMutations mb_mut_ref added_plugins0 guts
+                    else if no_late_plugins
+                      then do
+                        hsc_env_p <- if null added_plugins0
+                          then pure hsc_env
+                          else liftIO $ initializePlugins $
+                                 hscUpdateFlags (\df -> foldr addPluginModuleName df added_plugins0) hsc_env
+                        liftIO $ validateRetainedLookupBodies mb_mut_ref hsc_env_p guts
+                      else pure Nothing
+                mutated_names <- read_plugin_mutations
+                checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+                  no_late_plugins local_eval_terms mutated_names
+                  (mg_rules guts ++ maybe [] mg_rules active_opt)
+                  (mg_binds guts) (mg_binds <$> active_opt) Nothing
+                let checked_mappers_tc
+                      | has_mappers = validateSimpleSourceTables guts (if no_rules then active_opt else Nothing) tc_result
+                      | otherwise   = tc_result
+                case active_opt of
+                  Just opt_guts | null (mg_rules opt_guts) ->
+                    liftIO $ finalizeNoCodeSourceTables hsc_env hsc_src can_publish_methods
+                               can_publish_closures guts opt_guts checked_mappers_tc
+                  _ -> pure checked_mappers_tc
+          _ -> do
+            checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+              False local_eval_terms emptyNameSet [] [] Nothing Nothing
+            pure tc_result
+        let final_tc = checked_tc
+              { tcg_type_env = finalizeEarlyClosureTypes Nothing
+                                 (availsToNameSet (tcg_exports checked_tc))
+                                 (tcg_type_env checked_tc) }
         (iface, _details) <- liftIO $
-          hscSimpleIface hsc_env Nothing Nothing tc_result summary
+          hscSimpleIface hsc_env Nothing Nothing final_tc summary
 
         liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
@@ -922,6 +1068,338 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
         if ms_mod summary == gHC_PRIM
           then return $ HscUpdate (getGhcPrimIface (hsc_hooks hsc_env))
           else return $ HscUpdate iface
+
+-- | Drop provisional certificates whose exact owner or callee no longer checks.
+-- The typechecker creates them after checking all source uses.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+keepValidatedSourceMappers :: NameSet -> ModGuts -> ModGuts -> ModGuts
+keepValidatedSourceMappers mutated_names original final
+  | isEmptyNameSet owners && isEmptyNameSet families = final
+  | otherwise = final { mg_binds = map clearBind (mg_binds final)
+                      , mg_tcs = filter (not . invalidFamily) (mg_tcs final) }
+  where
+    (owners, families) = invalidSourceMappers mutated_names original (Just final)
+    invalidFamily tc = tyConName tc `elemNameSet` families
+    clearOwner = clearInvalidSourceOwner owners families
+    clearBind (NonRec v rhs) = NonRec (clearOwner v) rhs
+    clearBind (Rec pairs) = Rec [(clearOwner v, rhs) | (v, rhs) <- pairs]
+
+-- | Withdraw invalid provisional equations before emitting a simple interface.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+validateSimpleSourceTables :: ModGuts -> Maybe ModGuts -> TcGblEnv -> TcGblEnv
+validateSimpleSourceTables original final env
+  | isEmptyNameSet owners && isEmptyNameSet families = env
+  | otherwise = env { tcg_tcs = filter (not . invalidName . tyConName) (tcg_tcs env)
+                    , tcg_type_env = mapNameEnv clearOwner
+                        (filterNameEnv (not . invalidName . getName) (tcg_type_env env)) }
+  where
+    (owners, families) = invalidSourceMappers emptyNameSet original final
+    invalidName name = name `elemNameSet` families
+    clearOwner (AnId owner) = AnId (clearInvalidSourceOwner owners families owner)
+    clearOwner thing = thing
+
+{- Note [Checked source equations in typecheck-only interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When `NoBackend` is active (`-fno-code`), GHC builds a `ModIface` that
+downstream modules read when `-fwrite-interface` writes an `.hi` file or
+when multi-module compilation (`not (isOneShot (ghcMode dflags))`) stores
+the `ModIface` in the home package table.
+
+When `Opt_WriteSourceEquations` is also enabled, a typecheck-only module
+must publish the same checked source equations, method workers, and source
+closures as an `-O0` compilation. Without this parity, downstream modules
+that compile at `-O0` fail in `-fno-code -fwrite-interface` or `--make
+-fno-code` when they reduce an imported function such as a list accumulator
+wrapper, an indexed GADT traversal, or a derived comparison method.
+
+GHC keeps one-shot `-fno-code` without `-fwrite-interface` on the fast path
+because no consumer reads the resulting `ModIface`. Ordinary modules with
+`Opt_WriteSourceEquations` disabled also keep their existing `-fno-code`
+candidate set. When a typecheck-only module produces a source-equation
+interface and has no local `RULES`, coverage ticks (`Opt_Hpc`), or active
+late plugins:
+
+  1. `sourceTableTyCons` and `sourceCaseTables` in `GHC.Tc.Gen.SourceTable`
+     propose the same provisional `FinalCoreSourceTable` candidates as code
+     generation.
+  2. `hscDesugarAndSimplify` simplifies the desugared `ModGuts` and validates
+     all provisional tables through `validateSimpleSourceTables`.
+  3. On retained modules at `-O0` that do not enter `simplifyRetainedGentle`,
+     `validateRetainedSourceBodies` validates against `simpleOptNativeProgram`
+     (after any active Core plugin passes), matching `hscSimplifyWithPluginMutations`.
+  4. `finalizeNoCodeSourceTables` externalises fresh exported method workers in
+     the `NameCache` and runs `publishListFoldMethods` and `finalizeSimplifiedSourceTables`
+     before `hscSimpleIface`.
+-}
+
+-- | Run a post-desugaring 'TcM' action under an existing 'TcGblEnv'.
+runPostTcMaybe :: HscEnv -> HscSource -> Module -> TcGblEnv -> TcM a -> IO (Maybe a)
+runPostTcMaybe hsc_env hsc_src mod tc_env action =
+  fmap snd $ initTc NoTcMPlugins hsc_env hsc_src False mod (tcg_top_loc tc_env) (setGblEnv tc_env action)
+
+-- | Publish certified instance methods and source closures across simplified Core.
+finalizeSimplifiedSourceTables
+  :: HscEnv -> HscSource -> UniqSupply -> Bool -> Bool
+  -> Module -> CoreProgram -> CoreProgram -> TcGblEnv -> TypeEnv
+  -> IO (Maybe ([Id], [TyCon]), Maybe ([Id], [TyCon]))
+finalizeSimplifiedSourceTables hsc_env hsc_src after_tidy want_methods want_closures
+                               mod desugared_binds final_binds tc_env base_types = do
+  method_pub <- maybe (pure Nothing) (runPostTcMaybe hsc_env hsc_src mod tc_env)
+                  (guard want_methods *> publishCheckedMapMethods after_tidy tc_env final_binds)
+  let add_ents env (ids, fams) = env `plusTypeEnv` typeEnvFromEntities ids fams [] []
+      types_with_methods = maybe base_types (add_ents base_types) method_pub
+      tc_with_methods = case method_pub of
+        Just ents@(_, fams) -> tc_env { tcg_type_env = add_ents (tcg_type_env tc_env) ents
+                                      , tcg_tcs      = tcg_tcs tc_env ++ fams }
+        Nothing -> tc_env
+  closure_pub <- if not want_closures
+    then pure Nothing
+    else runPostTcMaybe hsc_env hsc_src mod tc_with_methods $
+           publishCheckedSourceClosures desugared_binds final_binds types_with_methods
+  pure (method_pub, closure_pub)
+
+-- | Finalize 'TcGblEnv' for a typecheck-only interface after simplification.
+-- See Note [Checked source equations in typecheck-only interfaces].
+finalizeNoCodeSourceTables
+  :: HscEnv -> HscSource -> Bool -> Bool -> ModGuts -> ModGuts -> TcGblEnv -> IO TcGblEnv
+finalizeNoCodeSourceTables hsc_env hsc_src want_methods want_closures original_guts opt_guts tc_env = do
+  (before_tidy, after_tidy) <- splitUniqSupply <$> mkSplitUniqSupply HscTag
+  let mod = mg_module opt_guts
+  (final_binds, fold_dfuns) <- if not want_methods
+    then pure (mg_binds opt_guts, [])
+    else do
+      let valid_guts = keepValidatedSourceMappers emptyNameSet original_guts opt_guts
+          marked_binds = keepCheckedMapWorkers before_tidy tc_env $
+                           publishListFoldMethods mod (mg_binds valid_guts)
+      ext_binds <- externaliseExportedMethodWorkers (hsc_NC hsc_env) mod (mg_tcs valid_guts) marked_binds
+      let dfuns = [ b | b <- bindersOfBinds ext_binds, DFunId _ (Just _) <- [idDetails b] ]
+      pure (ext_binds, dfuns)
+  let exported_names = availsToNameSet (tcg_exports tc_env)
+      keep_exported (AnId v) = isExportedId v || idName v `elemNameSet` exported_names
+      keep_exported _        = True
+      base_types = filterNameEnv keep_exported $
+                     tcg_type_env tc_env `plusTypeEnv` typeEnvFromEntities fold_dfuns [] [] []
+  (method_pub, closure_pub) <-
+    finalizeSimplifiedSourceTables hsc_env hsc_src after_tidy want_methods want_closures
+      mod (mg_binds original_guts) final_binds tc_env base_types
+  let (pub_ids, pub_families) = fromMaybe ([], []) method_pub
+      pub_names = mkNameSet (map idName pub_ids)
+      extra_dfuns = filter (\b -> not (idName b `elemNameSet` pub_names)) fold_dfuns
+      (clos_ids, clos_families) = case closure_pub of
+        Just (ids, fams) | not (null ids) -> (ids, fams)
+        _                                 -> ([], [])
+      all_ids = extra_dfuns ++ pub_ids ++ clos_ids
+      all_families = pub_families ++ clos_families
+  pure $ if null all_ids && null all_families
+    then tc_env
+    else tc_env
+      { tcg_type_env = tcg_type_env tc_env `plusTypeEnv`
+                       typeEnvFromEntities all_ids all_families [] []
+      , tcg_tcs = tcg_tcs tc_env ++ all_families }
+
+-- | Assign deterministic external `Name`s to exported local method workers
+-- before `publishCheckedMapMethods` inspects a typecheck-only Core program.
+-- See Note [Checked source equations in typecheck-only interfaces].
+externaliseExportedMethodWorkers :: NameCache -> Module -> [TyCon] -> CoreProgram -> IO CoreProgram
+externaliseExportedMethodWorkers name_cache mod tcs binds
+  | null targets = pure binds
+  | otherwise = do
+      (_, env) <- foldM allocate (init_occ_env, emptyVarEnv) targets
+      let rename_bndr b = fromMaybe b (lookupVarEnv env b)
+          rename_expr (GHC.Core.Var v)   = GHC.Core.Var (rename_bndr v)
+          rename_expr (App f a)          = App (rename_expr f) (rename_expr a)
+          rename_expr (Lam b e)          = Lam b (rename_expr e)
+          rename_expr (Let bind body)    = Let (rename_bind bind) (rename_expr body)
+          rename_expr (Case s b ty alts) = Case (rename_expr s) b ty
+                                             [ Alt con bs (rename_expr r) | Alt con bs r <- alts ]
+          rename_expr (Cast e co)        = Cast (rename_expr e) co
+          rename_expr (Tick t e)         = Tick t (rename_expr e)
+          rename_expr (Pack s w e)       = Pack s w (rename_expr e)
+          rename_expr (Unpack w p pkg e) = Unpack w p (rename_expr pkg) (rename_expr e)
+          rename_expr e                  = e
+          rename_bind (NonRec b r)       = NonRec (rename_bndr b) (rename_expr r)
+          rename_bind (Rec pairs)        = Rec [ (rename_bndr b, rename_expr r) | (b, r) <- pairs ]
+      pure (map rename_bind binds)
+  where
+    binders = bindersOfBinds binds
+    targets = sortBy (\a b -> compare (getOccName a) (getOccName b))
+                [ b | b <- binders, isExportedId b, not (isExternalName (idName b)) ]
+    avoids  = [ getOccName name | b <- binders, let name = idName b, isExternalName name ]
+           ++ [ getOccName thing | tc <- tcs, thing <- implicitTyConThings tc ]
+    init_occ_env = initTidyOccEnv avoids
+    allocate (occ_env, env) b = do
+      let old_name = idName b
+          (occ_env', occ') = tidyOccName occ_env (nameOccName old_name)
+      ext_name <- allocateGlobalBinder name_cache mod occ' Nothing (nameSrcSpan old_name)
+      let !b' = setIdName b ext_name
+      pure (occ_env', extendVarEnv env b b')
+
+-- | Prepare a checked retained body for equation validation without a backend.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable and
+-- Note [Checked source equations in typecheck-only interfaces].
+validateRetainedSourceBodies :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO (Maybe ModGuts)
+validateRetainedSourceBodies mb_mut_ref env guts
+  | supportsNativeGentle simplified = do
+      gentle <- simplifyRetainedGentle lint_env result
+      after_plugins <- if hasActiveCorePlugins lint_env
+        then runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env gentle
+        else pure gentle
+      pure $ if supportsNativeGentle (mg_binds after_plugins)
+             then Just after_plugins
+             else Nothing
+  | hasScopedDictionaryProgram simplified
+  , not (supportsScopedDictionaryCore simplified && no_binder_rules)
+  = pure Nothing
+  | hasActiveCorePlugins lint_env = do
+      after_plugins <- runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env result
+      pure $ if not (hasScopedDictionaryProgram (mg_binds after_plugins))
+                || supportsScopedDictionaryCore (mg_binds after_plugins)
+             then Just after_plugins
+             else Nothing
+  | no_binder_rules = pure (Just result)
+  | otherwise = pure Nothing
+  where
+    simplified = simpleOptNativeProgram (mg_binds guts)
+    result = guts { mg_binds = simplified }
+    no_binder_rules = all (null . idCoreRules) (bindersOfBinds simplified)
+    lint_env = hscUpdateFlags
+      (\df -> gopt_set (gopt_unset df Opt_EnableRewriteRules) Opt_DoCoreLinting) env
+
+-- | Run the active optimization pipeline on a no-code retained module with early lookups.
+validateRetainedLookupBodies :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO (Maybe ModGuts)
+validateRetainedLookupBodies mb_mut_ref env guts
+  | platformNcgSupported (targetPlatform dflags)
+  , Just _ <- nativeOptLevel (dflags { backend = ncgBackend })
+  , null (mg_rules guts)
+  , supportsNativeRuleBinds simplified
+  = Just <$> core2coreRetainedWithPluginMutations mb_mut_ref
+                               (hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) env)
+                               (guts { mg_binds = simplified })
+  | not (any (\(levels, flag) -> 0 `notElem` levels && gopt flag dflags) optLevelFlags)
+  , null (mg_rules guts)
+  = validateRetainedSourceBodies mb_mut_ref env guts
+  | otherwise = pure Nothing
+  where
+    dflags = hsc_dflags env
+    simplified = simpleOptNativeProgram (mg_binds guts)
+
+-- | Extract local value bindings from 'scs_evaluated_uses' that were
+-- evaluated at compile time during typechecking.
+localEvaluatedTermUses :: TcGblEnv -> IO [Name]
+localEvaluatedTermUses tc_result = do
+  scs <- readIORef (tcg_source_check tc_result)
+  let this_mod = tcg_semantic_mod tc_result
+      eval_uses = scs_evaluated_uses scs
+      table_uses = scs_table_uses scs
+      local_table_owners = mkNameSet
+        [ idName fn
+        | fn <- typeEnvIds (tcg_type_env tc_result)
+        , Just tbl <- [sourceTableId_maybe fn]
+        , tyConName tbl `elemNameSet` table_uses ]
+  pure [ nm
+       | nm <- nameSetElemsStable (eval_uses `unionNameSet` local_table_owners)
+       , nameIsLocalOrFrom this_mod nm
+       , isVarName nm ]
+
+-- | Run both post-simplification plugin-mutation and early-closure checks.
+checkSimplifiedSourceInvariants
+  :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts
+  -> TcGblEnv -> Bool -> [Name] -> NameSet -> [CoreRule] -> [CoreBind]
+  -> Maybe [CoreBind] -> Maybe [CoreBind] -> Hsc ()
+checkSimplifiedSourceInvariants hsc_env hsc_src logger print_config diag_opts tc_result
+                                no_plugins local_eval_terms mutated_names
+                                rules desugared_binds mb_simplified mb_tidy = do
+  checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts tc_result
+    no_plugins local_eval_terms desugared_binds mutated_names
+  unless (null (earlyIndexedLookups tc_result)) $
+    runPostTcDiagnostics hsc_env hsc_src logger print_config diag_opts tc_result $
+      validateEarlyIndexedLookups no_plugins rules desugared_binds mb_simplified mb_tidy
+
+runPostTcDiagnostics
+  :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts -> TcGblEnv -> TcM () -> Hsc ()
+runPostTcDiagnostics hsc_env hsc_src logger print_config diag_opts tc_result action = do
+  (msgs, _) <- liftIO $
+    initTc NoTcMPlugins hsc_env hsc_src False (tcg_mod tc_result) (tcg_top_loc tc_result) $
+      setGblEnv tc_result action
+  liftIO $ printOrThrowDiagnostics logger print_config diag_opts (GhcTcRnMessage <$> msgs)
+
+-- | Reject same-module evaluated bindings when a 'latePlugin' is active or when
+-- a 'CoreDoPluginPass' mutated the binding or one of its local helpers.
+-- See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
+checkLocalEvaluatedPluginMutations
+  :: HscEnv -> HscSource -> Logger -> GhcMessageOpts -> DiagOpts
+  -> TcGblEnv -> Bool -> [Name] -> [CoreBind] -> NameSet -> Hsc ()
+checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts
+                                   tc_result no_late_plugins local_eval_terms
+                                   desugared_binds mutated_names
+  | null local_eval_terms = pure ()
+  | no_late_plugins && isEmptyNameSet mutated_names = pure ()
+  | otherwise = do
+      let bad_owners
+            | not no_late_plugins = local_eval_terms
+            | otherwise =
+                let bind_map = mkNameEnv [ (idName b, rhs) | (b, rhs) <- flattenBinds desugared_binds ]
+                    reachesMutated !_ [] = False
+                    reachesMutated !seen (n : ns)
+                      | n `elemNameSet` mutated_names = True
+                      | n `elemNameSet` seen = reachesMutated seen ns
+                      | Just rhs <- lookupNameEnv bind_map n =
+                          let deps = [ idName v
+                                     | v <- exprSomeFreeVarsList isId rhs
+                                     , idName v `elemNameEnv` bind_map ]
+                          in reachesMutated (extendNameSet seen n) (deps ++ ns)
+                      | otherwise = reachesMutated (extendNameSet seen n) ns
+                in filter (reachesMutated emptyNameSet . (: [])) local_eval_terms
+      unless (null bad_owners) $
+        runPostTcDiagnostics hsc_env hsc_src logger print_config diag_opts tc_result $ do
+          forM_ bad_owners $ \nm ->
+            setSrcSpan (nameSrcSpan nm) (addErr (TcRnNoSourceTable nm))
+          failIfErrsM
+
+-- | Collect rejected owners and families, including equations that refer to them.
+invalidSourceMappers :: NameSet -> ModGuts -> Maybe ModGuts -> (NameSet, NameSet)
+invalidSourceMappers mutated_names original final =
+    (mkNameSet (map idName (failed ++ mutated_owners)),
+     close (mkNameSet (map tyConName
+            (rejected_list_tables ++ mutated_tables ++ concatMap finalCoreSourceFamilies failed))))
+  where
+    orig_pairs = flattenBinds (mg_binds original)
+    bind_map = mkNameEnv [ (idName b, rhs) | (b, rhs) <- orig_pairs ]
+    reaches_mutated !_ [] = False
+    reaches_mutated !seen (n : ns)
+      | n `elemNameSet` mutated_names = True
+      | n `elemNameSet` seen = reaches_mutated seen ns
+      | Just rhs <- lookupNameEnv bind_map n =
+          let deps = [ idName v | v <- exprSomeFreeVarsList isId rhs, idName v `elemNameEnv` bind_map ]
+          in reaches_mutated (extendNameSet seen n) (deps ++ ns)
+      | otherwise = reaches_mutated (extendNameSet seen n) ns
+    mutated_owners
+      | isEmptyNameSet mutated_names = []
+      | otherwise = [ b | (b, _) <- orig_pairs, isJust (sourceTableId_maybe b), reaches_mutated emptyNameSet [idName b] ]
+    mutated_tables = mapMaybe sourceTableId_maybe mutated_owners
+    candidates = finalCoreMappers (mg_binds original)
+    failed = case final of
+      Just guts -> filter (not . verifyFinalCoreMapper (mg_binds guts)) candidates
+      Nothing -> candidates
+    rejected_list_tables = case final of
+      Just guts -> failedFinalListTables (mg_binds original) (mg_binds guts) (mg_tcs guts)
+      Nothing -> []
+    tycons = maybe (mg_tcs original) mg_tcs final
+    invalidFamily invalid tc = tyConName tc `elemNameSet` invalid
+    close invalid =
+      case [tyConName tc | tc <- tycons
+                        , not (invalidFamily invalid tc)
+                        , maybe False (any (invalidFamily invalid)) (sourceTableCallees tc)] of
+        [] -> invalid
+        callers -> close (extendNameSetList invalid callers)
+
+-- | Remove an Id's source certificate when its family is withdrawn.
+clearInvalidSourceOwner :: NameSet -> NameSet -> Id -> Id
+clearInvalidSourceOwner owners families owner
+  | idName owner `elemNameSet` owners ||
+    maybe False (\table -> tyConName table `elemNameSet` families) (sourceTableId_maybe owner)
+  = setIdDetails owner VanillaId
+  | otherwise = owner
 
 {- Note [Stop TcM plugins after desugaring]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1446,15 +1924,244 @@ hscSimplify hsc_env plugins modguts =
 -- | Run Core2Core simplifier. The list of String is a list of (Core) plugin
 -- module names added via TH (cf 'addCorePlugin').
 hscSimplify' :: [String] -> ModGuts -> Hsc ModGuts
-hscSimplify' plugins ds_result = do
+hscSimplify' = hscSimplifyWithPluginMutations Nothing
+
+-- | Run Core2Core simplifier while optionally recording top-level bindings
+-- mutated by 'CoreDoPluginPass'.
+hscSimplifyWithPluginMutations :: Maybe (IORef NameSet) -> [String] -> ModGuts -> Hsc ModGuts
+hscSimplifyWithPluginMutations mb_mut_ref plugins ds_result = do
     hsc_env <- getHscEnv
     hsc_env_with_plugins <- if null plugins -- fast path
         then return hsc_env
         else liftIO $ initializePlugins
                     $ hscUpdateFlags (\dflags -> foldr addPluginModuleName dflags plugins)
                       hsc_env
-    {-# SCC "Core2Core" #-}
-      liftIO $ core2core hsc_env_with_plugins ds_result
+    liftIO $ do
+      let throw_driver env loc message =
+            throwOneError (initSourceErrorContext (hsc_dflags env)) $
+              mkPlainErrorMsgEnvelope loc (GhcDriverMessage message)
+          binder_loc module_loc b =
+            let src = nameSrcSpan (idName b)
+            in if isGoodSrcSpan src then src else module_loc
+      native <- checkNativeDependentModule hsc_env_with_plugins (mg_binds ds_result) (mg_rules ds_result) (mg_tcs ds_result)
+      -- See Note [Private dictionary programs].
+      if native && hasScopedDictionaryProgram (mg_binds ds_result)
+        then do
+          let binds = mg_binds ds_result
+              rules = mg_rules ds_result
+              env = hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) hsc_env_with_plugins
+              finish = endScopedDictionaryPassIO (hsc_logger env)
+                . initEndPassConfig (hsc_dflags env) (interactiveInScope (hsc_IC env)) alwaysQualify
+              module_loc = mg_loc ds_result
+          let flat_binds = flattenBinds binds
+              scoped_pair (b, rhs) = hasScopedDictionaryProgram [NonRec b rhs]
+              scoped_rule (Rule { ru_fn = fn, ru_args = args, ru_rhs = rhs }) =
+                any hasScopedDictionaryExpr (rhs : args)
+                || any (\p@(b, _) -> idName b == fn && scoped_pair p) flat_binds
+              scoped_rule (BuiltinRule {}) = False
+          when (any scoped_rule rules || any (\p@(b, _) -> scoped_pair p && not (null (idCoreRules b))) flat_binds) $
+            throwGhcExceptionIO (Sorry "Private dependent dictionaries do not support Core rules.")
+          finish CoreDesugar binds rules
+          let simplified = simpleOptNativeProgram binds
+          finish CoreDesugarOpt simplified rules
+          let result = ds_result { mg_binds = simplified }
+              report_bad level binds' =
+                case [b | (b, rhs) <- flattenBinds binds'
+                        , hasScopedDictionaryProgram [NonRec b rhs]
+                        , not (supportsScopedDictionaryCore [NonRec b rhs])] of
+                  b : _ -> throw_driver env (binder_loc module_loc b)
+                             (DriverUnsupportedRetainedBinding (Just (getOccName b)) level)
+                  []    -> throw_driver env module_loc
+                             (DriverUnsupportedRetainedBinding Nothing level)
+          optimized <- case nativeOptLevel (hsc_dflags env) of
+            Just _ -> core2coreRetainedWithPluginMutations mb_mut_ref env result
+            Nothing
+              | hasActiveCorePlugins env -> runRetainedCorePluginPassesWithPluginMutations mb_mut_ref env result
+              | otherwise                -> return result
+          when (hasActiveCorePlugins env) $ do
+            finish CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
+            when (hasScopedDictionaryProgram (mg_binds optimized)
+                  && not (supportsScopedDictionaryCore (mg_binds optimized))) $
+              report_bad (fromMaybe 0 (nativeOptLevel (hsc_dflags env))) (mg_binds optimized)
+          return optimized
+      else if native
+        then do
+          let lint_env = hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) hsc_env_with_plugins
+              name_ppr_ctx = alwaysQualify
+              binds = mg_binds ds_result
+              rules = mg_rules ds_result
+              report = throw_driver lint_env
+              module_loc = mg_loc ds_result
+              check_binds_supported pred_fn level candidate_binds =
+                unless (pred_fn candidate_binds) $
+                  case [b | (b, rhs) <- flattenBinds candidate_binds,
+                            not (pred_fn [NonRec b rhs])] of
+                    b : _ -> do
+                      let message = case filter (not . supportsLocalUserRule b) (idCoreRules b) of
+                            rule : _ -> DriverUnsupportedRetainedRule (ru_name rule) level
+                            [] -> DriverUnsupportedRetainedBinding (Just (getOccName b)) level
+                      report (binder_loc module_loc b) message
+                    [] -> report module_loc (DriverUnsupportedRetainedBinding Nothing level)
+          -- Desugaring can bind a GADT's existential with a type let.
+          -- See Note [Substituting type-lets] in GHC.Core.Lint.SubstTypeLets.
+          endPassHscEnvIO lint_env name_ppr_ctx CoreDesugar binds rules
+          let simplified = simpleOptNativeProgram binds
+          endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt simplified rules
+          let result = ds_result { mg_binds = simplified }
+          case nativeOptLevel (hsc_dflags lint_env) of
+            Just level -> do
+              forM_ rules $ \rule -> do
+                allowed <- checkImportedPackageRule lint_env (mg_module ds_result) simplified rule
+                unless allowed $
+                  report module_loc (DriverUnsupportedRetainedRule (ru_name rule) level)
+              check_binds_supported supportsNativeRuleBinds level
+                (stripSupportedAutoRules simplified)
+              optimized <- core2coreRetainedWithPluginMutations mb_mut_ref lint_env result
+              endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
+              when (hasActiveCorePlugins lint_env) $
+                check_binds_supported supportsNativeRuleBinds level
+                  (stripSupportedAutoRules (mg_binds optimized))
+              return optimized
+            Nothing | null rules && supportsNativeGentle simplified -> do
+              gentle <- simplifyRetainedGentle lint_env result
+              endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds gentle) rules
+              if hasActiveCorePlugins lint_env
+                then do
+                  optimized <- runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env gentle
+                  endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
+                  check_binds_supported supportsNativeGentle 0 (mg_binds optimized)
+                  return optimized
+                else return gentle
+            Nothing
+              | hasActiveCorePlugins lint_env -> do
+                  optimized <- runRetainedCorePluginPassesWithPluginMutations mb_mut_ref lint_env result
+                  endPassHscEnvIO lint_env name_ppr_ctx CoreDesugarOpt (mg_binds optimized) (mg_rules optimized)
+                  return optimized
+              | otherwise -> return result
+        else {-# SCC "Core2Core" #-} core2coreWithPluginMutations mb_mut_ref hsc_env_with_plugins ds_result
+
+-- | Strip compiler-generated @ru_auto@ rules (such as 'SpecConstr' and
+-- 'Specialise' rules added during 'core2coreRetained') whose expressions satisfy
+-- 'supportsNativeUserUnfolding' before running the post-plugin 'supportsNativeRuleBinds'
+-- check. User or plugin rules (@ru_auto = False@) and unsupported @ru_auto@
+-- rules remain attached so unsupported forms are still diagnosed.
+stripSupportedAutoRules :: CoreProgram -> CoreProgram
+stripSupportedAutoRules = map strip_bind
+  where
+    is_supported_auto (Rule { ru_auto = True, ru_bndrs = bs, ru_args = args, ru_rhs = rhs }) =
+      all (supportsNativeUserUnfolding . mkLams bs) (rhs : args)
+    is_supported_auto _ = False
+
+    strip_id b
+      | isId b
+      , let rules = idCoreRules b
+      , not (null rules)
+      = setIdSpecialisation b (mkRuleInfo (filter (not . is_supported_auto) rules))
+      | otherwise = b
+
+    strip_bind (NonRec b rhs) = NonRec (strip_id b) (strip_expr rhs)
+    strip_bind (Rec pairs)    = Rec [ (strip_id b, strip_expr rhs) | (b, rhs) <- pairs ]
+
+    strip_expr (App f a)          = App (strip_expr f) (strip_expr a)
+    strip_expr (Lam b e)          = Lam (strip_id b) (strip_expr e)
+    strip_expr (Let bind body)    = Let (strip_bind bind) (strip_expr body)
+    strip_expr (Case s b ty alts) = Case (strip_expr s) (strip_id b) ty
+                                      [ Alt con (map strip_id bs) (strip_expr rhs)
+                                      | Alt con bs rhs <- alts ]
+    strip_expr (Cast e co)        = Cast (strip_expr e) co
+    strip_expr (Tick t e)         = Tick t (strip_expr e)
+    strip_expr (Unpack w p pkg e) = Unpack w (strip_id p) (strip_expr pkg) (strip_expr e)
+    strip_expr (Pack s w e)       = Pack s w (strip_expr e)
+    strip_expr e                  = e
+
+-- | Run one retained Gentle iteration and simplify the resulting RHSs.
+-- See Note [Retained Core in the Gentle simplifier].
+simplifyRetainedGentle :: HscEnv -> ModGuts -> IO ModGuts
+simplifyRetainedGentle env result = do
+  let df = hsc_dflags env
+      mode = (initGentleSimplMode df) { sm_core_mode = RetainedCore }
+      opts = initSimplifyOpts df [] 1 mode emptyRuleBase
+  (_, optimized) <- simplifyPgm (hsc_logger env) (hsc_unit_env env) alwaysQualify opts result
+  pure (optimized { mg_binds = simpleOptNativeProgram (mg_binds optimized) })
+
+{- Note [Private dictionary programs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Use retained SimpleOpt at every optimization level. Run the retained
+Core pipeline at the requested optimization level when it is enabled.
+Check private dictionary forms with scoped lint throughout the pipeline.
+An ordinary module can call a function whose imported type binds a
+dictionary in the result. Select the lint, tidy and CorePrep paths from
+the checked Core of that module. The syntax extension governs what the
+module can write. An interface describes the types that it imports.
+A dependent dictionary application keeps its evidence argument in scope.
+The retained simplifier preserves the binder, and SimpleOpt substitutes
+only a matching evidence variable into a private selector type.
+
+An exported signature can contain a scoped dictionary binder and selector.
+Omit interface pragmas for the module. The experimental interface stores
+signatures and does not store expressions that apply these binders.
+See Note [Scoped class selectors in interfaces] in GHC.Iface.Type.
+-}
+
+{- Note [Retained Core in the Gentle simplifier]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+At -O0, hscSimplify' runs one Gentle iteration after native SimpleOpt
+when the module has no local rules and supportsNativeGentle accepts its
+bindings. The scan checks retained binders, their proofs, and nominal
+conversions between eligible endpoints.
+See Note [Nominal domains in retained Gentle] in GHC.Core.Dependent.
+The standard -O1 and -O2 schedules also check any local user rules.
+See Note [Compiling native dependent modules].
+
+A local Id can occur only in a type or coercion. Occurrence analysis must
+keep this Id in scope without adding runtime demand. A type or multiplicity
+on a later lambda binder can refer to an earlier retained binder.
+The same rule applies to let signatures, case result types and alternative
+fields. Process alternative binder annotations from right to left so a
+later field can keep an earlier binder in scope.
+
+The simplifier's ordinary beta substitution can replace a value occurrence
+without updating the corresponding index in a type. Keep a retained
+lambda applied and simplify the binders from left to right. Rebuild its
+application outside the lambda scope.
+
+The ordinary alternative path installs facts about the scrutinee. A fact
+can replace a scrutinee with a constructor while a nested nominal proof
+still names the retained Id. A virtual proof binder is also not a constructor
+argument. In retained mode preserve virtual-proof alternatives and skip the
+ordinary alternative facts throughout the pass. One module check suffices.
+The ordinary mode does not inspect each alternative RHS for native forms.
+-}
+
+{- Note [Compiling native dependent modules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Start with native SimpleOpt and preserve top-level binding identities.
+At -O0, omit interface pragmas. At standard native-object -O1, accept
+the default interface settings. Check the simplified bindings and local
+rules before running core2coreRetained. For a package rule with an imported head, resolve
+the head and lint the arguments and RHS against its type.
+An unsupported binding or rule
+gets a source diagnostic. See Note [Native dependent unfolding templates]
+in GHC.Core.Unfold.Make for the handling of exported unfoldings.
+
+Force Core Lint around simplification and tidying. CorePrep disables
+speculation on the native path. Force STG Lint after erasure. Repeat the
+option check at the object and bytecode entries for direct API callers.
+Reject module plugins, profiling, JavaScript code generation, and
+-fwrite-if-simplified-core before those paths can consume dependent Core.
+GHCi declarations, loaded source modules, and -fbyte-code -no-link share
+the checked CorePrep and STG pipeline. The optional .gbc writer serializes
+the resulting bytecode.
+
+Include retained constructor worker types from the module's type constructors
+in each option check. A declaration-only module can have no native explicit
+binding. addImplicitBinds generates its constructor worker later. Classify
+that module before simplification and tidying, then use the checked native
+CorePrep path for its generated worker. Keep the late-plugin output guard.
+This adds no singleton or index evaluation. It carries the existing dependent
+application and constructor rules through the module driver; see Weirich et al.
+(ICFP 2017) and docs/dependent-haskell/CORE.md.
+-}
 
 --------------------------------------------------------------
 -- CoreToStg
@@ -1483,12 +2190,29 @@ myCoreToStg logger dflags ic_inscope for_bytecode this_mod ml prepd_binds = do
     return (stg_binds_with_fvs, denv, cost_centre_info, stg_cg_info)
 
 
+-- | Tidy a checked dictionary program supplied through the GHC API.
+hscTidyScopedDictionary :: HscEnv -> ModGuts -> IO (CgGuts, ModDetails)
+hscTidyScopedDictionary = hscTidy
+
 hscTidy :: HscEnv -> ModGuts -> IO (CgGuts, ModDetails)
 hscTidy hsc_env guts = do
-  let logger   = hsc_logger hsc_env
+  native <- checkNativeDependentModule hsc_env (mg_binds guts) (mg_rules guts) (mg_tcs guts)
+  let scoped = native && hasScopedDictionaryProgram (mg_binds guts)
+      logger   = hsc_logger hsc_env
   let this_mod = mg_module guts
+  let lint_env | native = hscUpdateFlags (`gopt_set` Opt_DoCoreLinting) hsc_env
+               | otherwise = hsc_env
+      end_pass ppr_ctx pass
+        | scoped = endScopedDictionaryPassIO logger $
+            initEndPassConfig (hsc_dflags lint_env) (interactiveInScope (hsc_IC lint_env)) ppr_ctx pass
+        | otherwise = endPassHscEnvIO lint_env ppr_ctx pass
 
-  opts <- initTidyOpts hsc_env guts
+  when native $
+    end_pass alwaysQualify CoreDesugarOpt (mg_binds guts) (mg_rules guts)
+
+  -- See Note [Private dictionary programs] and
+  -- Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
+  opts <- initTidyOpts native scoped hsc_env guts
   (cgguts, details) <- withTiming logger
     (text "CoreTidy"<+>brackets (ppr this_mod))
     (const ())
@@ -1500,7 +2224,7 @@ hscTidy hsc_env guts = do
   let name_ppr_ctx   = mkNamePprCtx ptc (hsc_unit_env hsc_env) (mg_rdr_env guts)
       ptc            = initPromotionTickContext (hsc_dflags hsc_env)
 
-  endPassHscEnvIO hsc_env name_ppr_ctx CoreTidy all_tidy_binds tidy_rules
+  end_pass name_ppr_ctx CoreTidy all_tidy_binds tidy_rules
 
   -- If the endPass didn't print the rules, but ddump-rules is
   -- on, print now
@@ -1529,6 +2253,25 @@ hscTidy hsc_env guts = do
 %*                                                                      *
 %********************************************************************* -}
 
+{- Note [Compiling native dependent Core]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The native bytecode entry uses the restricted SimpleOpt mode. See
+Note [Restricted dependent simplification] in GHC.Core.SimpleOpt. The ordinary
+simplifier does not preserve runtime index substitutions or virtual Bool proofs.
+Do not send native expressions through that path.
+
+Force Core Lint before and after simplification and CorePrep. Force STG Lint
+after lowering. Keep speculative evaluation and optional arity analysis disabled
+in CorePrep. A retained Bool is an ordinary lazy argument. An occurrence in a
+type must not force it. The strict case supplies branch evidence; CoreToStg
+removes that evidence after checking its scope and runtime representations.
+
+Report an unsupported backend as Sorry. It is a feature restriction, not an
+internal compiler error. The checked module path is separate; see
+Note [Compiling native dependent modules]. Native unfoldings remain gated.
+See Weirich et al. (ICFP 2017) and docs/dependent-haskell/CORE.md.
+-}
+
 hscCompileCoreExpr :: HscEnv -> SrcSpan -> CoreExpr -> IO (ForeignHValue, [LinkableUsage], PkgsLoaded)
 hscCompileCoreExpr hsc_env loc expr =
   case hscCompileCoreExprHook (hsc_hooks hsc_env) of
@@ -1537,16 +2280,47 @@ hscCompileCoreExpr hsc_env loc expr =
 
 hscCompileCoreExpr' :: HscEnv -> SrcSpan -> CoreExpr -> IO (ForeignHValue, [LinkableUsage], PkgsLoaded)
 hscCompileCoreExpr' hsc_env srcspan ds_expr = do
+  (value, links, packages) <- compileCoreExpr hsc_env srcspan Nothing ds_expr
+  pure (expectJust value, links, packages)
+
+-- | Compile an optional observation in the native interpreter.
+-- A custom hook cannot make the optional link decision.
+hscCompileCoreExprWithOptionalName
+  :: HscEnv -> SrcSpan -> Name -> CoreExpr
+  -> IO (Maybe ForeignHValue, [LinkableUsage], PkgsLoaded)
+hscCompileCoreExprWithOptionalName hsc_env loc name expr =
+  case (hscCompileCoreExprHook (hsc_hooks hsc_env), interpInstance (hscInterp hsc_env)) of
+    (Just _, _) -> pure (Nothing, [], emptyUDFM)
+    (_, ExternalInterp (ExtJS _)) -> pure (Nothing, [], emptyUDFM)
+    _ -> compileCoreExpr hsc_env loc (Just name) expr
+
+compileCoreExpr :: HscEnv -> SrcSpan -> Maybe Name -> CoreExpr
+                -> IO (Maybe ForeignHValue, [LinkableUsage], PkgsLoaded)
+compileCoreExpr hsc_env srcspan optional ds_expr = do
   {- Simplify it -}
-  -- Question: should we call SimpleOpt.simpleOptExpr here instead?
-  -- It is, well, simpler, and does less inlining etc.
-  let dflags = hsc_dflags hsc_env
+  -- See Note [Compiling native dependent Core].
+  let native = hasNativeDependentExpr ds_expr
+      dflags = nativeCodeGenFlags native (hsc_dflags hsc_env)
+      lint_env = hsc_env { hsc_dflags = dflags }
   let logger = hsc_logger hsc_env
   let ic = hsc_IC hsc_env
   let unit_env = hsc_unit_env hsc_env
   let simplify_expr_opts = initSimplifyExprOpts dflags ic
 
-  simpl_expr <- simplifyExpr logger (ue_eps unit_env) simplify_expr_opts ds_expr
+  simpl_expr <- if native
+    then do
+      case hscInterp hsc_env of
+        Interp { interpInstance = ExternalInterp (ExtJS _) } ->
+          rejectNativeDependentExpr "JavaScript code generation" ds_expr
+        _ -> return ()
+      lintInteractiveExpr (text "native Core before simplification") lint_env ds_expr
+      -- The lexical existential path enters through the Core API. Keep its
+      -- binders intact until CorePrep and do not run an unchecked optimizer.
+      let simplified | hasExistentialExpr ds_expr = ds_expr
+                     | otherwise = simpleOptNativeExpr ds_expr
+      lintInteractiveExpr (text "native Core after simplification") lint_env simplified
+      return simplified
+    else simplifyExpr logger (ue_eps unit_env) simplify_expr_opts ds_expr
 
   -- Create a unique temporary binding
   --
@@ -1562,13 +2336,13 @@ hscCompileCoreExpr' hsc_env srcspan ds_expr = do
   let tidy_expr    = tidyExpr tidy_env simpl_expr
 
   {- Prepare for codegen -}
-  cp_cfg <- initCorePrepConfig hsc_env
+  cp_cfg <- initCorePrepConfigFor native hsc_env
   prepd_expr <- corePrepExpr
    logger cp_cfg
    tidy_expr
 
   {- Lint if necessary -}
-  lintInteractiveExpr (text "hscCompileCoreExpr") hsc_env prepd_expr
+  lintInteractiveExprAfterPrep (text "hscCompileCoreExpr") lint_env prepd_expr
   let this_loc = OsPathModLocation
           { ml_hs_file_ospath   = Nothing,
             ml_hi_file_ospath   = panic "hscCompileCoreExpr':ml_hi_file_ospath",
@@ -1608,7 +2382,8 @@ hscCompileCoreExpr' hsc_env srcspan ds_expr = do
   case interp of
     -- always generate JS code for the JS interpreter (no bytecode!)
     Interp { interpInstance = ExternalInterp (ExtJS i) } ->
-      jsCodeGen hsc_env srcspan i this_mod stg_binds_with_deps binding_id
+      do (value, links, packages) <- jsCodeGen hsc_env srcspan i this_mod stg_binds_with_deps binding_id
+         pure (Just value, links, packages)
 
     _ -> do
       {- Convert to BCOs -}
@@ -1623,12 +2398,111 @@ hscCompileCoreExpr' hsc_env srcspan ds_expr = do
       {- load it -}
       bco_time <- getCurrentTime
       mbc <- ByteCode.mkModuleByteCode this_mod bcos []
-      (mods_needed, units_needed) <- loadDecls interp hsc_env srcspan $
+      (available, links, packages) <- loadDeclsWithOptionalName interp hsc_env srcspan optional $
         Linkable bco_time this_mod $ NE.singleton (DotGBC mbc)
-      -- Get the foreign reference to the name we should have just loaded.
-      mhvs <- lookupFromLoadedEnv interp (idName binding_id)
-      {- Get the HValue for the root -}
-      return (expectJust mhvs, mods_needed, units_needed)
+      if available then do
+        value <- lookupFromLoadedEnv interp (idName binding_id)
+        pure (Just (expectJust value), links, packages)
+      else pure (Nothing, links, packages)
+
+-- | Byte-compile and cache uncached same-module top-level bindings and local
+-- algebraic datatype info tables in the active interpreter for closed type
+-- evaluation. See Note [Same-module closed term evaluation] in GHC.Tc.Gen.HsType.
+hscLoadSameModuleClosedBcos
+  :: HscEnv
+  -> SrcSpan
+  -> [TyCon]
+  -> [(Id, CoreExpr)]
+  -> IO ([LinkableUsage], PkgsLoaded)
+hscLoadSameModuleClosedBcos hsc_env srcspan tycons binds = do
+  let interp = hscInterp hsc_env
+  initLoaderState interp hsc_env
+  pls <- getLoaderState interp
+  let bco_st = maybe emptyBytecodeLoaderState bco_loader_state pls
+      missing_tycons =
+        [ tc
+        | tc <- tycons
+        , isBoxedDataTyCon tc && not (isTypeDataTyCon tc)
+        , any (\dc -> isNothing (lookupInfoTableBytecodeState bco_st (dataConName dc)))
+              (tyConDataCons tc)
+        ]
+      missing_binds =
+        [ (v, rhs)
+        | (v, rhs) <- binds
+        , isNothing (lookupNameBytecodeState bco_st (idName v))
+        ]
+  if null missing_tycons && null missing_binds
+    then pure ([], emptyUDFM)
+    else do
+      let localised_ids = mkNameEnv
+            [ (nm, mkExportedVanillaId nm (idType v))
+            | (v, _) <- missing_binds
+            , let nm = idName v ]
+          localise_id v = fromMaybe v (lookupNameEnv localised_ids (idName v))
+          localise_expr (GHC.Core.Var v)    = GHC.Core.Var (localise_id v)
+          localise_expr e@Lit{}             = e
+          localise_expr (App f a)           = App (localise_expr f) (localise_expr a)
+          localise_expr (Lam b body)        = Lam b (localise_expr body)
+          localise_expr (Let (NonRec b r) body) =
+            Let (NonRec b (localise_expr r)) (localise_expr body)
+          localise_expr (Let (Rec prs) body) =
+            Let (Rec [(b, localise_expr r) | (b, r) <- prs]) (localise_expr body)
+          localise_expr (Case s b ty alts)  =
+            Case (localise_expr s) b ty [Alt c bs (localise_expr r) | Alt c bs r <- alts]
+          localise_expr (Cast e co)         = Cast (localise_expr e) co
+          localise_expr (Tick t e)          = Tick t (localise_expr e)
+          localise_expr (Pack ex_ty wit_ty e) =
+            Pack ex_ty wit_ty (localise_expr e)
+          localise_expr (Unpack tv pv s body) =
+            Unpack tv pv (localise_expr s) (localise_expr body)
+          localise_expr e@Type{}            = e
+          localise_expr e@Coercion{}        = e
+          localised_binds =
+            [ (localise_id v, rhs', is_native)
+            | (v, rhs) <- missing_binds
+            , let rhs' = localise_expr rhs
+                  !is_native = hasNativeDependentExpr rhs' ]
+          native = any (\(_, _, is_nat) -> is_nat) localised_binds
+          dflags = nativeCodeGenFlags native (hsc_dflags hsc_env)
+          logger = hsc_logger hsc_env
+          ic = hsc_IC hsc_env
+          unit_env = hsc_unit_env hsc_env
+          simplify_expr_opts = initSimplifyExprOpts dflags ic
+      simplified <- forM localised_binds $ \(v, rhs, is_native) -> do
+        simpl_rhs <- if is_native
+          then pure (if hasExistentialExpr rhs then rhs else simpleOptNativeExpr rhs)
+          else simplifyExpr logger (ue_eps unit_env) simplify_expr_opts rhs
+        pure (v, simpl_rhs)
+      let tidy_occ_env = initTidyOccEnv (map (occName . fst) simplified)
+          tidy_env     = mkEmptyTidyEnv tidy_occ_env
+          tidied       = [ (v, tidyExpr tidy_env rhs) | (v, rhs) <- simplified ]
+      cp_cfg <- initCorePrepConfigFor native hsc_env
+      prepd <- forM tidied $ \(v, rhs) -> do
+        prepd_rhs <- corePrepExpr logger cp_cfg rhs
+        pure (v, prepd_rhs)
+      u <- uniqFromTag BcoTag
+      let this_mod = mkInteractiveModule ("SameModClosed_" ++ show u)
+          this_loc = OsPathModLocation
+            { ml_hs_file_ospath       = Nothing
+            , ml_hi_file_ospath       = panic "hscLoadSameModuleClosedBcos:ml_hi_file_ospath"
+            , ml_obj_file_ospath      = panic "hscLoadSameModuleClosedBcos:ml_obj_file_ospath"
+            , ml_dyn_obj_file_ospath  = panic "hscLoadSameModuleClosedBcos:ml_dyn_obj_file_ospath"
+            , ml_dyn_hi_file_ospath   = panic "hscLoadSameModuleClosedBcos:ml_dyn_hi_file_ospath"
+            , ml_hie_file_ospath      = panic "hscLoadSameModuleClosedBcos:ml_hie_file_ospath"
+            , ml_bytecode_file_ospath = panic "hscLoadSameModuleClosedBcos:ml_bytecode_file_ospath"
+            }
+          core_binds = if null prepd then [] else [Rec prepd]
+      (stg_binds_with_deps, _, _, _) <-
+        myCoreToStg logger dflags (interactiveInScope ic) True this_mod this_loc core_binds
+      let (stg_binds, _) = unzip stg_binds_with_deps
+      case interp of
+        Interp { interpInstance = ExternalInterp (ExtJS _) } ->
+          throwGhcExceptionIO (ProgramError "Same-module closed type evaluation is not supported on the JS external interpreter.")
+        _ -> do
+          bcos <- byteCodeGen hsc_env this_mod stg_binds missing_tycons Nothing [] Strict.Nothing
+          bco_time <- getCurrentTime
+          mbc <- ByteCode.mkModuleByteCode this_mod bcos []
+          loadDecls interp hsc_env srcspan (Linkable bco_time this_mod (NE.singleton (DotGBC mbc)))
 
 
 

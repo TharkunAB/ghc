@@ -2417,6 +2417,9 @@ wWarningFlagsDeps = [minBound..maxBound] >>= \x -> case x of
   Opt_WarnSemaphoreOpenFailure -> warnSpec x
   Opt_WarnDefaultedCallStack -> warnSpec x
   Opt_WarnImplicitFieldStrictness -> warnSpec x
+  Opt_WarnPunBindings -> warnSpec x
+  Opt_WarnPunUses -> warnSpec x
+  Opt_WarnCusks -> warnSpec x
 
 warningGroupsDeps :: [(Deprecation, FlagSpec WarningGroup)]
 warningGroupsDeps = map mk warningGroups
@@ -2563,6 +2566,7 @@ fFlagsDeps = [
   flagSpec "print-explicit-kinds"             Opt_PrintExplicitKinds,
   flagSpec "print-explicit-coercions"         Opt_PrintExplicitCoercions,
   flagSpec "print-explicit-runtime-reps"      Opt_PrintExplicitRuntimeReps,
+  flagSpec "print-explicit-matchabilities"   Opt_PrintExplicitMatchabilities,
   flagSpec "print-equality-relations"         Opt_PrintEqualityRelations,
   flagSpec "print-axiom-incomps"              Opt_PrintAxiomIncomps,
   flagSpec "print-unicode-syntax"             Opt_PrintUnicodeSyntax,
@@ -2597,6 +2601,8 @@ fFlagsDeps = [
   flagSpec "use-rpaths"                       Opt_RPath,
   flagSpec "write-interface"                  Opt_WriteInterface,
   flagSpec "write-if-simplified-core"         Opt_WriteIfSimplifiedCore,
+  flagSpec "write-source-equations"           Opt_WriteSourceEquations,
+  flagSpec "report-totality"                  Opt_ReportTotality,
   flagSpec "write-if-self-recomp"             Opt_WriteSelfRecompInfo,
   flagSpec "write-if-self-recomp-flags"       Opt_WriteSelfRecompFlags,
   flagSpec "write-ide-info"                   Opt_WriteHie,
@@ -2727,6 +2733,65 @@ makeExtensionFlags ext = [ makeExtensionFlag name depr ext | (depr, name) <- ext
 
 xFlagsDeps :: [(Deprecation, FlagSpec LangExt.Extension)]
 xFlagsDeps = concatMap makeExtensionFlags [minBound .. maxBound]
+          ++ [ (NotDeprecated, FlagSpec "ExistentialTypes" LangExt.DependentTypes nop AllModes)
+             , (NotDeprecated, FlagSpec "ExtendedLet" LangExt.DependentTypes nop AllModes)
+             ]
+
+-- | Enable the core dependent-types extension bundle and disable list and tuple puns.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes].
+setDependentTypesBundle :: TurnOnFlag -> DynP ()
+setDependentTypesBundle False = return ()
+setDependentTypesBundle True  = do
+  mapM_ setExtensionFlag
+    [ LangExt.GADTs
+    , LangExt.DataKinds
+    , LangExt.PolyKinds
+    , LangExt.TypeOperators
+    , LangExt.RankNTypes
+    , LangExt.ScopedTypeVariables
+    , LangExt.TypeApplications
+    , LangExt.TypeAbstractions
+    , LangExt.StandaloneKindSignatures
+    , LangExt.EmptyCase
+    , LangExt.Modifiers
+    , LangExt.RequiredTypeArguments
+    , LangExt.ExplicitNamespaces
+    ]
+  unSetExtensionFlag LangExt.ListTuplePuns
+  upd $ \dflags ->
+    let in_ghc_internal =
+          homeUnitId_ dflags == ghcInternalUnitId ||
+          homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
+    in if not in_ghc_internal && not (gopt Opt_SuppressSourceEquations dflags)
+         then gopt_set dflags Opt_WriteSourceEquations
+         else dflags
+
+{- Note [Proposal #378 DependentTypes bundle and telescopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC Proposal #378 (Section 4.12) and GHC Proposal #102 specify one umbrella
+extension, -XDependentTypes. Enabling -XDependentTypes activates
+the standard dependent-types extension bundle
+in setDependentTypesBundle. It also disables ListTuplePuns so that list and
+tuple syntax in types follows GHC Proposal #475. Users can re-enable
+ListTuplePuns with a later pragma or flag.
+
+MakeDynFlagsConsistent also enables Opt_WriteSourceEquations by default when
+DependentTypes is active outside the ghc-internal home unit. When
+the home unit is ghc-internal, makeDynFlagsConsistent leaves
+Opt_WriteSourceEquations disabled by default so early boot modules do not
+request sibling ghc-internal interfaces before they exist. See
+Note [Cold ghc-internal interface lookups] in GHC.Tc.Gen.SourceTable. An
+explicit -fno-write-source-equations flag sets Opt_SuppressSourceEquations and
+overrides that default. An explicit -fwrite-source-equations flag sets
+Opt_ExplicitWriteSourceEquations.
+
+In GHC.Parser, shared-type binder groups such as (m n :: Nat) expand in source
+order across forall, foreach, exists, and some telescopes. CheckForEachBndrs
+rejects inferred brace specificity on visible foreach -> telescopes and strips
+specificity annotations on invisible foreach . telescopes. MkHsExistsTelescope
+and mkHsSomeTelescope desugar multi-binder telescopes right-associatively into
+nested HsTypeExists and HsTypeSome nodes.
+-}
 
 makeExtensionFlag :: String -> ExtensionDeprecation -> LangExt.Extension -> (Deprecation, FlagSpec LangExt.Extension)
 makeExtensionFlag name depr ext = (deprecation depr, spec)
@@ -2755,6 +2820,10 @@ extensionEffect = \case
     -> setIncoherentInsts
   LangExt.DerivingVia
     -> setDeriveVia
+  LangExt.DependentTypes
+    -> setDependentTypesBundle
+  LangExt.UnsaturatedTypeFamilies
+    -> \enabled -> when enabled (setGeneralFlag Opt_PrintExplicitMatchabilities)
   _ -> nop
 
 -- | Things you get with `-dlint`.
@@ -3870,6 +3939,19 @@ makeDynFlagsConsistent dflags
  | gopt Opt_InfoTableMap dflags
  , NotValid msg <- backendInfoTableMapValidity (backend dflags)
     = loop (gopt_unset dflags Opt_InfoTableMap) msg
+
+ | let in_ghc_internal =
+         homeUnitId_ dflags == ghcInternalUnitId ||
+         homeUnitId_ dflags == unitSettings_ghcInternalUnitId (unitSettings dflags)
+       want_source_eqs
+         | gopt Opt_ExplicitWriteSourceEquations dflags = True
+         | gopt Opt_SuppressSourceEquations dflags      = False
+         | in_ghc_internal                              = False
+         | otherwise = xopt LangExt.DependentTypes dflags
+ , gopt Opt_WriteSourceEquations dflags /= want_source_eqs
+    = let dflags' | want_source_eqs = gopt_set dflags Opt_WriteSourceEquations
+                  | otherwise       = gopt_unset dflags Opt_WriteSourceEquations
+      in makeDynFlagsConsistent dflags'
 
  | otherwise = (dflags, mempty, mempty)
     where loc = mkGeneralSrcSpan (fsLit "when making flags consistent")

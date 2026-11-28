@@ -20,7 +20,9 @@ module GHC.Hs.Type (
         pprHsModifiedFunArr, pprHsModifier, pprLHsModifiers,
 
         HsType(..), HsCoreTy, LHsType, HsKind, LHsKind,
-        HsTypeGhcPsExt(..),
+        HsTypeGhcPsExt(..), HsTypeCaseAlt(..), HsTypeLetBind(..), HsTypeLetPair(..), HsTypeLetPat(..),
+        HsTypeGhcRnExt(..), HsTypeLetSource, HsAppTypeSource(..), hsExistsTyFlag,
+        mkHsSingleTypeLet, splitHsTypeLet, isTypeLetPairOcc, typeLetSource, preserveTypeLetSource,
         HsForAllTelescope(..), EpAnnForallVis, EpAnnForallInvis,
         HsTyVarBndr(..), LHsTyVarBndr, AnnTyVarBndr(..),
         HsBndrKind(..),
@@ -39,7 +41,7 @@ module GHC.Hs.Type (
         HsLit(..),
         HsIPName(..), hsIPNameFS,
         HsArg(..), numVisibleArgs, pprHsArgsApp,
-        HsGadtTelescope(..),
+        HsGadtTelescope(..), LHsGadtTelescope,
         LHsTypeArg, lhsTypeArgSrcSpan,
         OutputableBndrFlag,
 
@@ -59,7 +61,7 @@ module GHC.Hs.Type (
         pprAnonWildCard,
 
         hsOuterTyVarNames, hsOuterExplicitBndrs, mapHsOuterImplicit,
-        mkHsOuterImplicit, mkHsOuterExplicit,
+        mkHsOuterImplicit, mkHsOuterExplicit, hsOuterMatchability,
         mkHsImplicitSigType, mkHsExplicitSigType,
         mkHsWildCardBndrs, mkHsPatSigType, mkHsTyPat,
         mkEmptyWildCardBndrs,
@@ -72,7 +74,8 @@ module GHC.Hs.Type (
         hsLTyVarName, hsLTyVarNames,
         hsForAllTelescopeBndrs,
         hsForAllTelescopeNames,
-        gadtArgTelescopes, gadtTelescopeBndrs, mkHsGadtForAlls,
+        gadtArgTelescopes, gadtTelescopeBndrs, gadtTelescopeContexts,
+        mkHsGadtForAlls, mkHsGadtContext,
         hsLTyVarLocName, hsExplicitLTyVarNames,
         splitLHsInstDeclTy, getLHsInstDeclHead, getLHsInstDeclClass_maybe,
         splitLHsPatSynTy,
@@ -80,7 +83,8 @@ module GHC.Hs.Type (
         splitLHsSigmaTyInvis, splitLHsGadtTy,
         splitHsFunType, hsTyGetAppHead_maybe,
         mkHsOpTy, mkHsAppTy, mkHsAppTys, mkHsAppKindTy,
-        ignoreParens, hsSigWcType, hsPatSigType,
+        ignoreParens, isOpenTypeOperandWith, hsHasForEachTy, hsForEachVisibility, hsSigWcType, hsPatSigType,
+        hsTypeHasNoAnonWildcards, hsTyVarBndrHasNoAnonWildcards,
         hsTyKindSig,
         setHsTyVarBndrFlag, hsTyVarBndrFlag, updateHsTyVarBndrFlag,
 
@@ -110,10 +114,11 @@ import GHC.Base ( Multiplicity(..) )
 import GHC.Types.Fixity ( LexicalFixity(..) )
 import GHC.Types.SourceText
 import GHC.Types.Name
-import GHC.Types.Name.Reader ( RdrName, WithUserRdr(..) )
-import GHC.Types.Var ( VarBndr, visArgTypeLike )
+import GHC.Types.Name.Reader ( RdrName, WithUserRdr(..), getRdrName, mkOrig, mkRdrUnqual )
+import GHC.Types.Var ( DepFunTyFlag(..), ExistsTyFlag(..), VarBndr, visArgTypeLike, pprExistsTy )
 import GHC.Core.TyCo.Rep ( Type(..) )
-import GHC.Builtin.WiredIn.Types( mkTupleStr )
+import GHC.Builtin.Modules ( mkGhcInternalModule )
+import GHC.Builtin.WiredIn.Types( anyTyCon, mkTupleStr )
 import GHC.Core.Ppr ( pprOccWithTick)
 import GHC.Core.Type
 import GHC.Core.Multiplicity( pprArrowWithModifiers )
@@ -122,10 +127,13 @@ import GHC.Types.Basic
 import GHC.Types.SrcLoc
 import GHC.Data.FastString
 import GHC.Utils.Outputable
-import GHC.Utils.Misc (count)
+import GHC.Utils.Misc (abstractConstr, count, mkNoRepType)
 
 import Data.Maybe
-import Data.Data (Data)
+import Data.List (isPrefixOf)
+import Data.List.NonEmpty (NonEmpty(..))
+import qualified Data.List.NonEmpty as NE
+import Data.Data (Data(..))
 import Data.Foldable ( toList )
 
 import qualified Data.Semigroup as S
@@ -148,15 +156,43 @@ emptyContext = HsContext noAnn []
 type instance XHsContext  (GhcPass _) = ([EpToken "("], [EpToken ")"])
 type instance XXHsContextDetails (GhcPass _) = DataConCantHappen
 
-type instance XHsForAllVis   (GhcPass _) = EpAnn (TokForall, TokRarrow)
+type instance XHsForAllVis   (GhcPass _) = EpAnn (TokForall, TokRarrow, Maybe (EpToken "@"))
                                            -- Location of 'forall' and '->'
-type instance XHsForAllInvis (GhcPass _) = EpAnn (TokForall, EpToken ".")
+type instance XHsForAllInvis (GhcPass _) = EpAnn (TokForall, EpToken ".", Maybe (EpToken "@"))
                                            -- Location of 'forall' and '.'
 
 type instance XXHsForAllTelescope (GhcPass _) = DataConCantHappen
 
-type EpAnnForallVis   = EpAnn (TokForall, TokRarrow)
-type EpAnnForallInvis = EpAnn (TokForall, EpToken ".")
+type EpAnnForallVis   = EpAnn (TokForall, TokRarrow, Maybe (EpToken "@"))
+type EpAnnForallInvis = EpAnn (TokForall, EpToken ".", Maybe (EpToken "@"))
+
+{- Note [Source forall matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A forall annotation follows the group separator:
+
+  forall a b. @ma body
+  forall a b -> @ma body
+
+The annotation is a type of kind Matchability. Its scope is outside the
+whole binder group. Rename and check it before binding a or b. Use its
+value for each semantic binder in the group. Keep groups separate when an
+annotation refers to a binder from an earlier group.
+
+An omitted annotation uses the enclosing type-or-kind context. Type-level
+foralls use U. Kind-level foralls use M. Checked declaration kinds defer
+omitted metadata until the actual declaration prefix supplies constraints.
+Explicit metadata is never replaced by these defaults. Names used only in
+an annotation do not introduce implicit binders. They must be in lexical
+scope before the group. Renamed free-name sets still include them.
+
+Runtime constructor,
+pattern-synonym and foreign declaration prefixes require U. Check an explicit
+annotation by ordinary equality, so a computed annotation can reduce to U.
+
+Keep the annotation in source split views and in signature outer binders.
+TH wrappers freeze an annotation before reuse in another context. The @
+token belongs to the telescope annotation, after its separator token.
+-}
 
 type HsQTvsRn = [Name]  -- Implicit variables
   -- For example, in   data T (a :: k1 -> k2) = ...
@@ -171,12 +207,12 @@ type instance XXLHsQTyVars  (GhcPass _) = DataConCantHappen
 mkHsForAllVisTele ::EpAnnForallVis ->
   [LHsTyVarBndr () (GhcPass p)] -> HsForAllTelescope (GhcPass p)
 mkHsForAllVisTele an vis_bndrs =
-  HsForAllVis { hsf_xvis = an, hsf_vis_bndrs = vis_bndrs }
+  HsForAllVis { hsf_xvis = an, hsf_matchability = Nothing, hsf_vis_bndrs = vis_bndrs }
 
 mkHsForAllInvisTele :: EpAnnForallInvis
   -> [LHsTyVarBndr Specificity (GhcPass p)] -> HsForAllTelescope (GhcPass p)
 mkHsForAllInvisTele an invis_bndrs =
-  HsForAllInvis { hsf_xinvis = an, hsf_invis_bndrs = invis_bndrs }
+  HsForAllInvis { hsf_xinvis = an, hsf_matchability = Nothing, hsf_invis_bndrs = invis_bndrs }
 
 mkHsQTvs :: [LHsTyVarBndr (HsBndrVis GhcPs) GhcPs] -> LHsQTyVars GhcPs
 mkHsQTvs tvs = HsQTvs { hsq_ext = noExtField, hsq_explicit = tvs }
@@ -307,9 +343,16 @@ hsOuterExplicitBndrs (HsOuterImplicit{})                  = []
 mkHsOuterImplicit :: HsOuterTyVarBndrs flag GhcPs
 mkHsOuterImplicit = HsOuterImplicit{hso_ximplicit = noExtField}
 
+-- | Read the annotation on an explicit outer forall group.
+hsOuterMatchability :: HsOuterTyVarBndrs flag (GhcPass p)
+                   -> Maybe (LHsType (GhcPass (NoGhcTcPass p)))
+hsOuterMatchability HsOuterImplicit{} = Nothing
+hsOuterMatchability HsOuterExplicit{hso_matchability = ma} = ma
+
 mkHsOuterExplicit :: EpAnnForallInvis -> [LHsTyVarBndr flag GhcPs]
                   -> HsOuterTyVarBndrs flag GhcPs
 mkHsOuterExplicit an bndrs = HsOuterExplicit { hso_xexplicit = an
+                                             , hso_matchability = Nothing
                                              , hso_bndrs     = bndrs }
 
 mkHsImplicitSigType :: LHsType GhcPs -> HsSigType GhcPs
@@ -453,6 +496,7 @@ type instance XModifier GhcRn = ModifierPrintsAs
 type instance XModifier GhcTc = ModifierPrintsAs
 
 type instance XForAllTy        (GhcPass _) = NoExtField
+type instance XForEachTy       (GhcPass _) = (EpToken "foreach", Either TokRarrow (EpToken "."))
 type instance XQualTy          (GhcPass _) = NoExtField
 type instance XTyVar           (GhcPass _) = EpToken "'"
 type instance XAppTy           (GhcPass _) = NoExtField
@@ -493,10 +537,26 @@ type instance XWildCardTy      GhcRn = HoleKind
 type instance XWildCardTy      GhcTc = NoExtField
 
 type instance XXType           GhcPs = HsTypeGhcPsExt
-type instance XXType           GhcRn = HsCoreTy
+type instance XXType           GhcRn = HsTypeGhcRnExt
 type instance XXType           GhcTc = DataConCantHappen
 
 type HsCoreTy = Type
+
+-- | Renamed type extensions that need kind checking.
+data HsTypeGhcRnExt
+  = HsCoreTyRn HsCoreTy
+  | HsGadtFieldRn (HsConDeclField GhcRn)
+    -- See Note [Late GADT field annotations] in GHC.Rename.HsType.
+  | HsTypeExistsRn !ExistsTyFlag (LHsTyVarBndr Specificity GhcRn) (LHsType GhcRn)
+  | HsTypeLetRn (Maybe HsTypeLetSource) (LocatedN Name) (LHsType GhcRn) (LHsType GhcRn)
+  | HsTypeCaseAliasRn (Name, Int, Maybe (LocatedN Name)) (LHsType GhcRn)
+  | HsTypeCaseRn (LHsType GhcRn) [([Name], LHsType GhcRn, LHsType GhcRn)]
+    -- Quoted case. Each row carries its pattern binders, pattern and result.
+  | HsTypeLetProductCheckRn (LocatedN Name) !Int (LHsType GhcRn)
+  | HsTypeLambdaQuoteRn [LHsTyVarBndr () GhcRn] (LHsType GhcRn)
+  | HsTypeLambdaCheckRn [LHsTyVarBndr () GhcRn] (LHsType GhcRn) (LHsType GhcRn)
+    -- Original body and lowered application. See Note [Checking local lambda captures]
+    -- in GHC.Tc.Gen.HsType.
 
 -- Extension of HsType during parsing.
 -- see Note [Trees That Grow] in Language.Haskell.Syntax.Extension
@@ -514,9 +574,242 @@ data HsTypeGhcPsExt
                 (LHsType GhcPs)
     -- See Note [Parsing data type declarations]
 
+  | HsTypeLambda (EpToken "\\", EpUniToken "->" "→")
+                 [LHsTyVarBndr () GhcPs] (LHsType GhcPs)
+
+  | HsTypeLambdaCheck [LHsTyVarBndr () GhcPs] (LHsType GhcPs) (LHsType GhcPs)
+
+  | HsTypeExists (EpToken "exists", Either (EpToken "|") (EpToken "."))
+      (LHsTyVarBndr Specificity GhcPs) (LHsType GhcPs)
+  | HsTypeLet (EpToken "let", EpToken "in") (Maybe (EpToken "{", EpToken "}"))
+              (Maybe HsTypeLetSource) (NonEmpty (LocatedA HsTypeLetBind)) (LHsType GhcPs)
+
+  | HsTypeCase (EpToken "case", EpToken "of")
+               (Maybe (EpToken "{", EpToken "}"))
+               (LHsType GhcPs) [LocatedA HsTypeCaseAlt]
+
   | HsRecTy     (EpToken "{", EpToken "}")
                 (Located [LHsConDeclRecField GhcPs])
     -- See Note [Parsing data type declarations]
+
+  | HsTypeCaseAlias [RdrName] (LocatedN RdrName, Int, Maybe (LocatedN RdrName)) (LHsType GhcPs)
+
+  -- An unquoted constructor head in a lifted type-case equation.
+  | HsTypeCaseHead (LocatedN RdrName)
+
+  | HsTypeSome (EpToken "some", EpToken "(", EpUniToken "::" "∷", EpToken ")", EpToken "|")
+               (LocatedN RdrName) (LHsType GhcPs) (LHsType GhcPs)
+  | HsTypeLetProductCheck (LocatedN RdrName) !Int (LHsType GhcPs)
+
+-- | One abbreviation in a source type let.
+data HsTypeLetBind
+  = HsTypeLetBind
+      (Maybe (LocatedN RdrName, TokDcolon, LHsKind GhcPs, EpToken ";"))
+      (LocatedN RdrName) (EpToken "=") (LHsType GhcPs)
+  | HsTypeLetPairBind HsTypeLetPair (EpToken "=") (LHsType GhcPs)
+  | HsTypeLetProductBind (LocatedN RdrName) (NonEmpty HsTypeLetPat)
+                        (EpToken "=") (LHsType GhcPs)
+
+-- | One boxed pair in a type let pattern.
+data HsTypeLetPair = HsTypeLetPair (EpToken "(", EpToken ",", EpToken ")")
+  HsTypeLetPat HsTypeLetPat
+
+-- | One field in a type let pattern.
+data HsTypeLetPat
+  = HsTypeLetPatVar (LocatedN RdrName)
+  | HsTypeLetPatWild (EpToken "_")
+  | HsTypeLetPatPair (Located HsTypeLetPair)
+
+-- | Construct one binding during renaming or TH conversion.
+mkHsSingleTypeLet :: (EpToken "let", EpToken "in") -> LocatedN RdrName
+                  -> LHsType GhcPs -> LHsType GhcPs -> HsTypeGhcPsExt
+mkHsSingleTypeLet ann name rhs body =
+  HsTypeLet ann Nothing Nothing (noLocA (HsTypeLetBind Nothing name noAnn rhs) :| []) body
+
+-- | Written type let used for display. Generic traversals skip this copy.
+newtype HsTypeLetSource = HsTypeLetSource (HsType GhcPs)
+
+instance Data HsTypeLetSource where
+  toConstr _ = abstractConstr "HsTypeLetSource"
+  gunfold _ _ = error "gunfold:HsTypeLetSource"
+  dataTypeOf _ = mkNoRepType "HsTypeLetSource"
+
+-- | The visible type argument before lifting. Generic traversals skip this copy.
+newtype HsAppTypeSource = HsAppTypeSource (LHsWcType GhcPs)
+
+instance Data HsAppTypeSource where
+  toConstr _ = abstractConstr "HsAppTypeSource"
+  gunfold _ _ = error "gunfold:HsAppTypeSource"
+  dataTypeOf _ = mkNoRepType "HsAppTypeSource"
+
+instance Outputable HsAppTypeSource where
+  ppr (HsAppTypeSource written) =
+    updSDocContext (\ctx -> ctx { sdocSuppressUniques = True }) (ppr written)
+
+-- | Find the written pair let for display. See Note [Ordered type let bindings].
+typeLetSource :: HsTypeGhcPsExt -> Maybe HsTypeLetSource
+typeLetSource (HsTypeLet _ _ source@(Just _) _ _) = source
+typeLetSource source@(HsTypeLet (let_kw, _) _ Nothing binds _)
+  | isGoodSrcSpan (getEpTokenSrcSpan let_kw)
+  , any is_pattern binds = Just (HsTypeLetSource (XHsType source))
+  where
+    is_pattern (L _ HsTypeLetPairBind{}) = True
+    is_pattern (L _ HsTypeLetProductBind{}) = True
+    is_pattern _ = False
+typeLetSource _ = Nothing
+
+-- | Preserve the source when lifting a type case or lambda through a pair let.
+preserveTypeLetSource :: HsTypeGhcPsExt -> LHsType GhcPs -> LHsType GhcPs
+preserveTypeLetSource original (L loc (XHsType (HsTypeLet ann braces _ binds body)))
+  | Just source <- typeLetSource original =
+      L loc (XHsType (HsTypeLet ann braces (Just source) binds body))
+preserveTypeLetSource _ result = result
+
+typeLetPairPrefix :: String
+typeLetPairPrefix = "$type-let-pair:"
+
+-- | Is this a private scrutinee binder for a type let pair?
+isTypeLetPairOcc :: OccName -> Bool
+isTypeLetPairOcc occ = isTvOcc occ && typeLetPairPrefix `isPrefixOf` occNameString occ
+
+-- | Expose the first binding and its scope. See Note [Ordered type let bindings].
+splitHsTypeLet :: NonEmpty (LocatedA HsTypeLetBind) -> LHsType GhcPs
+               -> (LocatedN RdrName, LHsType GhcPs, LHsType GhcPs)
+splitHsTypeLet (first :| binds) body = case unLoc first of
+  HsTypeLetBind signature name _ rhs ->
+    (name, ascribe signature rhs, rest)
+  HsTypeLetProductBind con fields _ rhs ->
+    (product_name, checked_rhs, foldr bind rest bindings)
+    where
+      loc = getLoc rhs
+      product_name = L (l2l loc) (mkRdrUnqual (mkTyVarOcc "$type-let-product"))
+      arity = NE.length fields
+      checked_rhs = L loc (XHsType (HsTypeLetProductCheck con arity rhs))
+
+      bindings
+        | null field_binds = []
+        | otherwise = witness_binds ++ split_binds ++ field_binds
+      field_binds =
+        [ (name, project "ProductField"
+            [type_var (witness 0), first_split 0, project "PairSecond" [type_var (split i)]])
+        | (i, HsTypeLetPatVar name) <- zip [0 ..] (NE.toList fields) ]
+      witness_binds =
+        (witness 0, L loc (HsTyVar noAnn IsPromoted con)) :
+        [ (witness i, app (type_var (witness (i - 1))) any_argument)
+        | i <- [1 .. arity - 1] ]
+      split_binds =
+        [ (split i, project "ProductUnapply" [type_var (witness i), receiver i])
+        | i <- [arity - 1, arity - 2 .. 0] ]
+      receiver i
+        | i == arity - 1 = type_var product_name
+        | otherwise = first_split (i + 1)
+      first_split i = project "PairFirst" [type_var (split i)]
+      any_argument = type_var (L (l2l loc) (getRdrName anyTyCon))
+      witness = private "$type-let-witness:"
+      split = private "$type-let-split:"
+      private prefix i = L (l2l loc) (mkRdrUnqual (mkTyVarOcc (prefix ++ show i)))
+      project selector = foldl app (type_var (L (l2l loc) (mkOrig projection_module (mkTcOcc selector))))
+      app f x = L loc (HsAppTy noExtField f x)
+      type_var name = L loc (HsTyVar noAnn NotPromoted name)
+      bind (name, rhs') result = L loc (XHsType (mkHsSingleTypeLet noAnn name rhs' result))
+  HsTypeLetPairBind pair_pat _ rhs ->
+    (pair, rhs, bind_fields rest)
+    where
+      loc = getLoc rhs
+      pair = pairName 0 loc
+      (bind_fields, _) = bindPair pair 1 loc pair_pat
+
+      first_field = mkOrig projection_module (mkTcOcc "PairFirst")
+      second_field = mkOrig projection_module (mkTcOcc "PairSecond")
+
+      pairName :: Int -> SrcSpanAnnA -> LocatedN RdrName
+      pairName i field_loc =
+        L (l2l field_loc) (mkRdrUnqual (mkTyVarOcc (typeLetPairPrefix ++ show i)))
+
+      bindPair saved i pair_loc (HsTypeLetPair _ left right)
+        | HsTypeLetPatWild{} <- left
+        , HsTypeLetPatWild{} <- right =
+            let discard = L (l2l pair_loc) (mkRdrUnqual (mkTyVarOcc "_"))
+            in (bindProjection pair_loc discard saved first_field, i)
+        | otherwise =
+            let (bind_left, j) = bindField saved i pair_loc first_field left
+                (bind_right, k) = bindField saved j pair_loc second_field right
+            in (bind_left . bind_right, k)
+
+      bindField saved i pair_loc selector field = case field of
+        HsTypeLetPatVar name -> (bindProjection pair_loc name saved selector, i)
+        HsTypeLetPatWild{} -> (id, i)
+        HsTypeLetPatPair (L nested_span nested) ->
+          let field_loc = noAnnSrcSpan nested_span
+              child = pairName i field_loc
+              (bind_children, j) = bindPair child (i + 1) field_loc nested
+          in (bindProjection field_loc child saved selector . bind_children, j)
+
+      bindProjection field_loc name saved selector result =
+        let tyvar :: LocatedN RdrName -> LHsType GhcPs
+            tyvar n = L field_loc (HsTyVar noAnn NotPromoted n)
+            projected = L field_loc (HsAppTy noExtField (tyvar (L (l2l field_loc) selector)) (tyvar saved))
+        in L field_loc (XHsType (mkHsSingleTypeLet noAnn name projected result))
+  where
+    projection_module = mkGhcInternalModule (fsLit "GHC.Internal.TupleProjection")
+    rest = case binds of
+      [] -> body
+      b : bs -> L (noAnnSrcSpan (getLocA b `combineSrcSpans` getLocA body))
+                  (XHsType (HsTypeLet noAnn Nothing Nothing (b :| bs) body))
+    ascribe signature rhs = case signature of
+      Nothing -> rhs
+      Just (_, colon, kind, _) -> L (getLoc rhs) (HsKindSig colon rhs kind)
+
+{- Note [Ordered type let bindings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The parser keeps the binding group, braces and separators for exact printing.
+In a braced group, the pretty-printer puts the separator before the next
+binding. Dedenting first closes any layout case in the preceding RHS.
+Each RHS sees the enclosing scope and the preceding binders. A later binder
+can shadow an earlier one. For example,
+
+  let { x = a; x = Maybe x } in x
+
+has the scope of `let x = a in let x = Maybe x in x`. Expose one binding
+at a time to free-variable collection, declaration lifting and renaming.
+This gives each of them the same scope, including in signatures with
+implicit quantification. The renamed tree already represents nested lets,
+so kind checking and Template Haskell use their existing single-binder rules.
+
+The parser keeps an adjacent signature with its binding. When splitting the
+group, put the signature on the RHS as an HsKindSig. The kind and RHS then
+use the same scope and checks as a written RHS kind ascription.
+
+For a pair pattern, bind the RHS to one private name before binding its
+fields. Give each nested pair a separate name. A later projection from
+the parent must still refer to the parent after binding the nested pair.
+The internal closed families select fields only when they see the promoted
+pair constructor. An unknown pair can remain in the type. With two
+wildcards, keep a private projection. It checks the pair kind when
+Template Haskell splices the ordinary LetT binders.
+
+For a named product pattern, keep the constructor and field count on the
+RHS until kind checking. Check the datatype and the scrutinee kind even
+when all fields are wildcards. Split the scrutinee application from right
+to left with ProductUnapply and the pair selectors. Each partial constructor
+supplies the input and field kinds of one split. Any supplies the kinds of
+its already applied arguments and is never selected as a field. ProductField
+checks that the actual head is the written constructor. This needs no product
+eta rule or equality for a stuck selector. Reject the pattern in a quotation
+because LetT cannot represent the constructor check.
+
+Keep the written group when lifting a type case or lambda through a pair
+let. These passes can replace the pattern with private bindings before
+renaming. The renamed let displays the source in error contexts. Kind
+checking, scoping and quotation still use the lowered bindings. Check
+for a pair only at a source let token. The generated single binds and
+the tails of binding groups need no search for the written group. Keep
+this copy out of generic traversals so they see only the lowered syntax.
+-}
+
+-- | A parsed constructor alternative in a type case.
+data HsTypeCaseAlt
+  = HsTypeCaseAlt (LHsType GhcPs) (EpUniToken "->" "→") (LHsType GhcPs)
 
 {- Note [Parsing data type declarations]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -617,18 +910,26 @@ hsQTvExplicit :: LHsQTyVars (GhcPass p) -> [LHsTyVarBndr (HsBndrVis (GhcPass p))
 hsQTvExplicit = hsq_explicit
 
 hsForAllTelescopeBndrs :: HsForAllTelescope (GhcPass p) -> [LHsTyVarBndr ForAllTyFlag (GhcPass p)]
-hsForAllTelescopeBndrs (HsForAllVis   _ bndrs) = map (fmap (setHsTyVarBndrFlag Required)) bndrs
-hsForAllTelescopeBndrs (HsForAllInvis _ bndrs) = map (fmap (updateHsTyVarBndrFlag Invisible)) bndrs
+hsForAllTelescopeBndrs (HsForAllVis   _ _ bndrs) = map (fmap (setHsTyVarBndrFlag Required)) bndrs
+hsForAllTelescopeBndrs (HsForAllInvis _ _ bndrs) = map (fmap (updateHsTyVarBndrFlag Invisible)) bndrs
 
 hsForAllTelescopeNames :: HsForAllTelescope (GhcPass p) -> [IdP (GhcPass p)]
-hsForAllTelescopeNames (HsForAllVis _ bndrs) = hsLTyVarNames bndrs
-hsForAllTelescopeNames (HsForAllInvis _ bndrs) = hsLTyVarNames bndrs
+hsForAllTelescopeNames (HsForAllVis _ _ bndrs) = hsLTyVarNames bndrs
+hsForAllTelescopeNames (HsForAllInvis _ _ bndrs) = hsLTyVarNames bndrs
 
 gadtArgTelescopes :: [LHsGadtTelescope (GhcPass p)] -> [HsForAllTelescope (GhcPass p)]
 gadtArgTelescopes args = [ tele | L _ (HsGadtForAll _ tele) <- args ]
 
 gadtTelescopeBndrs :: [LHsGadtTelescope (GhcPass p)] -> [LHsTyVarBndr ForAllTyFlag (GhcPass p)]
 gadtTelescopeBndrs = concatMap hsForAllTelescopeBndrs . gadtArgTelescopes
+
+-- | Observe all constructor contexts without changing their scopes.
+gadtTelescopeContexts :: [LHsGadtTelescope (GhcPass p)] -> [LHsContext (GhcPass p)]
+gadtTelescopeContexts args = [ctxt | L _ (HsGadtContext ctxt) <- args]
+
+-- | Put the arrow token and comments on the context child only.
+mkHsGadtContext :: LHsContext (GhcPass p) -> LHsGadtTelescope (GhcPass p)
+mkHsGadtContext ctxt = L (noAnnSrcSpan (getLocA ctxt)) (HsGadtContext ctxt)
 
 mkHsGadtForAlls :: [HsForAllTelescope (GhcPass p)] -> [HsGadtTelescope (GhcPass p)]
 mkHsGadtForAlls = map (HsGadtForAll noExtField)
@@ -670,9 +971,117 @@ hsTyKindSig lty =
     _                 -> Nothing
 
 ---------------------
+-- | Recognize a symbolic operand. A constructor spine must contain at least
+-- one variable. Leave fully closed constructor operands on the closed path.
+-- The caller identifies constructors from the Names available in its phase.
+isOpenTypeOperandWith :: (IdOccP (GhcPass p) -> Bool) -> (IdOccP (GhcPass p) -> Bool)
+                      -> LHsType (GhcPass p) -> Bool
+isOpenTypeOperandWith variable constructor = (== Just True) . symbolic
+  where
+    symbolic ty = case unLoc (ignoreParens ty) of
+      HsKindSig _ operand _ -> symbolic operand
+      HsTyVar _ NotPromoted (L _ name) | variable name -> Just True
+      HsExplicitTupleTy _ _ elems -> or <$> traverse symbolic elems
+      HsTupleTy _ _ elems -> or <$> traverse symbolic elems
+      HsExplicitListTy _ _ elems -> or <$> traverse symbolic elems
+      HsListTy _ elem_ty -> symbolic elem_ty
+      HsOpTy _ lhs op rhs
+        | HsTyVar _ _ (L _ name) <- unLoc (ignoreParens op) ->
+            if constructor name
+              then or <$> traverse symbolic [lhs, rhs]
+              else if variable name && any (== Just True) [symbolic lhs, symbolic rhs]
+                then Just True
+                else Nothing
+        | otherwise -> Nothing
+      _ -> case spine ty [] of
+        (HsTyVar _ _ (L _ name), fields)
+          | constructor name -> or <$> traverse symbolic fields
+          | variable name, not (null fields), any (== Just True) (map symbolic fields) -> Just True
+        _ -> Nothing
+
+    spine ty fields = case unLoc (ignoreParens ty) of
+      HsAppTy _ fun field -> spine fun (field : fields)
+      head_ty -> (head_ty, fields)
+
 ignoreParens :: LHsType (GhcPass p) -> LHsType (GhcPass p)
 ignoreParens (L _ (HsParTy _ ty)) = ignoreParens ty
 ignoreParens ty                   = ty
+
+-- | Find retained binders through parentheses, contexts and function arrows.
+-- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
+hsHasForEachTy :: HsType (GhcPass p) -> Bool
+hsHasForEachTy HsForEachTy{} = True
+hsHasForEachTy (HsParTy _ ty) = hsHasForEachTy (unLoc ty)
+hsHasForEachTy (HsQualTy _ _ ty) = hsHasForEachTy (unLoc ty)
+hsHasForEachTy (HsFunTy _ _ arg res)
+  = hsHasForEachTy (unLoc arg) || hsHasForEachTy (unLoc res)
+hsHasForEachTy _ = False
+
+-- | Read a retained telescope's visibility from its delimiter.
+hsForEachVisibility :: XForEachTy (GhcPass p) -> DepFunTyFlag
+hsForEachVisibility (_, Left {}) = DepFunVisible
+hsForEachVisibility (_, Right {}) = DepFunInvisible
+
+-- | Check anonymous-wildcard absence throughout a renamed type.
+-- See Note [Anonymous wildcards in complete types].
+hsTypeHasNoAnonWildcards :: LHsType GhcRn -> Bool
+hsTypeHasNoAnonWildcards lty = go lty
+  where
+    go (L _ ty) = case ty of
+      HsWildCardTy _                 -> False
+      HsAppTy _ ty1 ty2              -> go ty1 && go ty2
+      HsAppKindTy _ ty ki            -> go ty && go ki
+      HsFunTy _ w ty1 ty2            -> go ty1 && go ty2 && go_mult w
+        where
+          go_mult (HsModifiedFunArr _ mods _) = all go_mod mods
+          go_mod (L _ (HsModifier _ ty)) = go ty
+      HsListTy _ ty                  -> go ty
+      HsTupleTy _ _ tys              -> gos tys
+      HsSumTy _ tys                  -> gos tys
+      HsOpTy _ ty1 tyop ty2          -> go tyop && go ty1 && go ty2
+      HsParTy _ ty                   -> go ty
+      HsIParamTy _ _ ty              -> go ty
+      HsKindSig _ ty kind            -> go ty && go kind
+      HsDocTy _ ty _                 -> go ty
+      HsExplicitListTy _ _ tys       -> gos tys
+      HsExplicitTupleTy _ _ tys      -> gos tys
+      HsForAllTy { hst_tele = tele
+                 , hst_body = ty } -> no_anon_wc_tele tele && go ty
+      HsForEachTy { hst_bndrs = bndrs
+                  , hst_body = ty } -> all hsTyVarBndrHasNoAnonWildcards bndrs && go ty
+      HsQualTy { hst_ctxt = ctxt
+               , hst_body = ty }  -> gos (hsc_ctxt $ unLoc ctxt) && go ty
+      HsSpliceTy (HsUntypedSpliceTop _ ty) _ -> go ty
+      HsSpliceTy (HsUntypedSpliceNested _) _ -> True
+      HsTyLit{} -> True
+      HsTyVar{} -> True
+      HsStarTy{} -> True
+      XHsType (HsTypeExistsRn _ binder body) -> hsTyVarBndrHasNoAnonWildcards binder && go body
+      XHsType{} -> True
+
+    gos = all go
+
+    no_anon_wc_tele (HsForAllVis { hsf_matchability = ma, hsf_vis_bndrs = bndrs })
+      = maybe True hsTypeHasNoAnonWildcards ma && all hsTyVarBndrHasNoAnonWildcards bndrs
+    no_anon_wc_tele (HsForAllInvis { hsf_matchability = ma, hsf_invis_bndrs = bndrs })
+      = maybe True hsTypeHasNoAnonWildcards ma && all hsTyVarBndrHasNoAnonWildcards bndrs
+
+-- | Check anonymous-wildcard absence in a renamed binder's kind.
+-- See Note [Anonymous wildcards in complete types].
+hsTyVarBndrHasNoAnonWildcards :: LHsTyVarBndr flag GhcRn -> Bool
+hsTyVarBndrHasNoAnonWildcards (L _ tvb) = case hsBndrKind tvb of
+  HsBndrNoKind _  -> True
+  HsBndrKind _ ki -> hsTypeHasNoAnonWildcards ki
+
+{- Note [Anonymous wildcards in complete types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Complete signatures and retained-function type arguments use the same syntax
+check. Inspect the whole type, including binder kinds, multiplicities and
+constraints. A wildcard outside a retained telescope still makes that type
+argument incomplete. Named wildcards are recorded separately by the renamer;
+the caller must also check that list. HsCoreTy contains no syntax wildcard.
+See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
+-}
 
 {-
 ************************************************************************
@@ -852,27 +1261,23 @@ instance (Outputable tm, Outputable ty) => Outputable (HsArg (GhcPass p) tm ty) 
 -- type (parentheses and all) from them.
 splitLHsPatSynTy ::
      LHsSigType (GhcPass p)
-  -> ( [LHsTyVarBndr Specificity (GhcPass (NoGhcTcPass p))] -- universals
+  -> ( (Maybe (LHsType (GhcPass (NoGhcTcPass p))), [LHsTyVarBndr Specificity (GhcPass (NoGhcTcPass p))]) -- universals
      , Maybe (LHsContext (GhcPass p))                       -- required constraints
-     , [LHsTyVarBndr Specificity (GhcPass p)]               -- existentials
+     , [HsForAllTelescope (GhcPass p)]                     -- existentials
      , Maybe (LHsContext (GhcPass p))                       -- provided constraints
      , LHsType (GhcPass p))                                 -- body type
 splitLHsPatSynTy ty = (univs, reqs, exis, provs, ty4)
   where
-    -- split_sig_ty ::
-    --      LHsSigType (GhcPass p)
-    --   -> ([LHsTyVarBndr Specificity (GhcPass (NoGhcTcPass p))], LHsType (GhcPass p))
     split_sig_ty (L _ HsSig{sig_bndrs = outer_bndrs, sig_body = body}) =
       case outer_bndrs of
         -- NB: Use ignoreParens here in order to be consistent with the use of
         -- splitLHsForAllTyInvis below, which also looks through parentheses.
-        HsOuterImplicit{}                      -> ([], ignoreParens body)
-        HsOuterExplicit{hso_bndrs = exp_bndrs} -> (exp_bndrs, body)
+        HsOuterImplicit{}                      -> ((Nothing, []), ignoreParens body)
+        HsOuterExplicit{hso_matchability = ma, hso_bndrs = exp_bndrs} -> ((ma, exp_bndrs), body)
 
     (univs, ty1) = split_sig_ty ty
     (reqs,  ty2) = splitLHsQualTy ty1
-    (exis,  ty3) = splitLHsForAllTyInvis ty2
-    (provs, ty4) = splitLHsQualTy ty3
+    (exis, provs, ty4) = splitLHsSigmaTyInvis ty2
 
 -- | Decompose a sigma type (of the form @forall <tvs>. context => body@)
 -- into its constituent parts.
@@ -889,15 +1294,17 @@ splitLHsPatSynTy ty = (univs, reqs, exis, provs, ty4)
 -- generally possible to take the returned types and reconstruct the original
 -- type (parentheses and all) from them.
 splitLHsSigmaTyInvis :: LHsType (GhcPass p)
-                     -> ([LHsTyVarBndr Specificity (GhcPass p)]
+                     -> ([HsForAllTelescope (GhcPass p)]
                         , Maybe (LHsContext (GhcPass p)), LHsType (GhcPass p))
 splitLHsSigmaTyInvis ty
-  | (tvs,  ty1) <- splitLHsForAllTyInvis ty
-  , (ctxt, ty2) <- splitLHsQualTy ty1
-  = (tvs, ctxt, ty2)
+  | (Just tele, body) <- splitLHsForAllTyInvis ty
+  , (teles, ctxt, tau) <- splitLHsSigmaTyInvis body
+  = (tele : teles, ctxt, tau)
+  | (ctxt, tau) <- splitLHsQualTy ty
+  = ([], ctxt, tau)
 
 -- | Decompose a GADT type into its constituent parts.
--- Returns @(outer_bndrs, inner_bndrs, ctxts, body)@, where:
+-- Returns @(outer_bndrs, telescope, body)@, where:
 --
 -- * @outer_bndrs@ are 'HsOuterExplicit' if the type has explicit, outermost
 --   type variable binders. Otherwise, they are 'HsOuterImplicit'.
@@ -905,7 +1312,8 @@ splitLHsSigmaTyInvis ty
 -- * @inner_bndrs@ are the remaining @forall@ telescopes, interleaved with the
 --   parentheses that enclose them.
 --
--- * @ctxts@ are the contexts adjacent to the @forall@s, if any.
+-- * Each consecutive context is a telescope node. Record constructors
+--   allow one context. See Note [Constructor telescope contexts] in "GHC.Hs.Decls".
 --
 -- * @body@ is the body of the type after the optional @forall@s and contexts.
 --
@@ -915,22 +1323,27 @@ splitLHsSigmaTyInvis ty
 -- in "GHC.Hs.Decls" for why this is important.
 splitLHsGadtTy ::
      LHsSigType GhcPs
-  -> (HsOuterSigTyVarBndrs GhcPs, [LHsGadtTelescope GhcPs], [LHsContext GhcPs], LHsType GhcPs)
+  -> (HsOuterSigTyVarBndrs GhcPs, [LHsGadtTelescope GhcPs], LHsType GhcPs)
 splitLHsGadtTy (L _ sig_ty)
   | (outer_bndrs, sigma_ty) <- split_outer_bndrs sig_ty
   , (inner_bndrs, phi_ty)   <- split_inner_bndrs sigma_ty
-  , (outer_theta, phi_ty')  <- splitLHsQualTy_KP phi_ty
-  , (inner_theta, rho_ty)   <- split_ctxts phi_ty'
-  = case rho_ty of
-      -- Record GADTs are not allowed to have multiple foralls or contexts.
-      -- Detect and undo the split to get a proper error message later.
-      L _ (HsFunTy _ _ (L _ (XHsType HsRecTy{})) _)
-        | not (null inner_bndrs) -> (outer_bndrs, [], [], sigma_ty)
-        | not (null inner_theta) -> (outer_bndrs, inner_bndrs, toList outer_theta, phi_ty')
-      -- All good: either a prefix GADT con, or a record GADT con with at most
-      -- one forall and at most one context.
-      _ -> let theta_tys = toList outer_theta ++ inner_theta
-           in (outer_bndrs, inner_bndrs, theta_tys, rho_ty)
+  , (mb_ctxt, rho_ty)       <- splitLHsQualTy_KP phi_ty
+  = if is_gadt_rec_ty rho_ty && not (null inner_bndrs)
+        -- Bad! Record GADTs are not allowed to have inner_bndrs,
+        -- undo the split to get a proper error message later
+      then (outer_bndrs, [], sigma_ty)
+      else let prefix = inner_bndrs ++ maybe [] (pure . mkHsGadtContext) mb_ctxt
+           in case split_contexts rho_ty of
+                (_, body)
+                  | Just _ <- mb_ctxt
+                  , HsForAllTy{} <- unLoc (ignoreParens body)
+                  -- See Note [GADT contexts before nested foralls].
+                  -> (outer_bndrs, inner_bndrs, phi_ty)
+                (contexts, body)
+                  | not (null contexts)
+                  , not (is_gadt_rec_ty (ignoreParens body))
+                  -> (outer_bndrs, prefix ++ contexts, body)
+                _ -> (outer_bndrs, prefix, rho_ty)
   where
     split_outer_bndrs :: HsSigType GhcPs -> (HsOuterSigTyVarBndrs GhcPs, LHsType GhcPs)
     split_outer_bndrs (HsSig{sig_bndrs = outer_bndrs, sig_body = body_ty}) =
@@ -947,52 +1360,45 @@ splitLHsGadtTy (L _ sig_ty)
         in (L l (HsGadtPar toks) : args, t)
     split_inner_bndrs t = ([], t)
 
-    split_ctxts :: LHsType GhcPs -> ([LHsContext GhcPs], LHsType GhcPs)
-    split_ctxts (L _ HsQualTy { hst_ctxt = ctxt, hst_body = body })
-      = let { ~(ctxts, t) = split_ctxts body } in (ctxt : ctxts, t)
-    split_ctxts t = ([], t)
+    split_contexts :: LHsType GhcPs -> ([LHsGadtTelescope GhcPs], LHsType GhcPs)
+    split_contexts (L _ HsQualTy { hst_ctxt = ctxt, hst_body = body })
+      = let ~(contexts, t) = split_contexts body
+        in (mkHsGadtContext ctxt : contexts, t)
+    split_contexts (L l (HsParTy toks body))
+      | (context : contexts, t) <- split_contexts body
+      = (L l (HsGadtPar toks) : context : contexts, t)
+    split_contexts t = ([], t)
 
--- | Decompose a type of the form @forall <tvs>. body@ into its constituent
--- parts. Only splits type variable binders that
--- were quantified invisibly (e.g., @forall a.@, with a dot).
---
--- This function is used to split apart certain types, such as instance
--- declaration types, which disallow visible @forall@s. For instance, if GHC
--- split apart the @forall@ in @instance forall a -> Show (Blah a)@, then that
--- declaration would mistakenly be accepted!
---
--- Note that this function looks through parentheses, so it will work on types
--- such as @(forall a. <...>)@. The downside to this is that it is not
--- generally possible to take the returned types and reconstruct the original
--- type (parentheses and all) from them.
--- Unlike 'splitLHsSigmaTyInvis', this function does not look through
--- parentheses, hence the suffix @_KP@ (short for \"Keep Parentheses\").
+    -- type of form {fld :: ty, ...} -> ResTy
+    is_gadt_rec_ty (L _ (HsFunTy _ _ (L _ (XHsType HsRecTy{})) _)) = True
+    is_gadt_rec_ty _ = False
+
+{- Note [GADT contexts before nested foralls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In a prefix constructor such as
+
+  K :: forall a. Eq a => forall b. a -> forall c. b -> c -> Box a
+
+the outer forall binds a before the context. Keep the context and the
+remaining quantifiers and fields together in the ordered suffix.
+Otherwise the suffix starts at forall b. with no preceding fields.
+splitGadtInterior in GHC.Hs.Decls then cannot recover the source order.
+The same rule applies to visible and invisible leading binders.
+-}
+
+-- | Split one invisible forall group. Look through outer parentheses.
+-- Keep the complete telescope, including its matchability annotation.
 splitLHsForAllTyInvis ::
-  LHsType (GhcPass pass) -> ( [LHsTyVarBndr Specificity (GhcPass pass)]
-                            , LHsType (GhcPass pass))
-splitLHsForAllTyInvis ty
-  | ((mb_tvbs), body) <- splitLHsForAllTyInvis_KP (ignoreParens ty)
-  = (fromMaybe [] mb_tvbs, body)
+  LHsType (GhcPass pass) -> (Maybe (HsForAllTelescope (GhcPass pass)), LHsType (GhcPass pass))
+splitLHsForAllTyInvis = splitLHsForAllTyInvis_KP . ignoreParens
 
--- | Decompose a type of the form @forall <tvs>. body@ into its constituent
--- parts. Only splits type variable binders that
--- were quantified invisibly (e.g., @forall a.@, with a dot).
---
--- This function is used to split apart certain types, such as instance
--- declaration types, which disallow visible @forall@s. For instance, if GHC
--- split apart the @forall@ in @instance forall a -> Show (Blah a)@, then that
--- declaration would mistakenly be accepted!
---
--- Unlike 'splitLHsForAllTyInvis', this function does not look through
--- parentheses, hence the suffix @_KP@ (short for \"Keep Parentheses\").
+-- | Split one invisible forall group. Retain its annotation and parentheses.
 splitLHsForAllTyInvis_KP ::
-  LHsType (GhcPass pass) -> (Maybe ([LHsTyVarBndr Specificity (GhcPass pass)])
-                            , LHsType (GhcPass pass))
+  LHsType (GhcPass pass) -> (Maybe (HsForAllTelescope (GhcPass pass)), LHsType (GhcPass pass))
 splitLHsForAllTyInvis_KP lty@(L _ ty) =
   case ty of
-    HsForAllTy { hst_tele = HsForAllInvis {hsf_invis_bndrs = tvs }
-               , hst_body = body }
-      -> (Just tvs, body)
+    HsForAllTy { hst_tele = tele@HsForAllInvis{}, hst_body = body }
+      -> (Just tele, body)
     _ -> (Nothing, lty)
 
 -- | Decompose a type of the form @context => body@ into its constituent parts.
@@ -1310,19 +1716,20 @@ instance (OutputableBndrFlag flag p,
         GhcPs -> ppr imp_tvs
         GhcRn -> ppr imp_tvs
         GhcTc -> ppr imp_tvs
-    ppr (HsOuterExplicit{hso_bndrs = exp_tvs}) =
-      text "HsOuterExplicit:" <+> ppr exp_tvs
+    ppr (HsOuterExplicit{hso_matchability = ma, hso_bndrs = exp_tvs}) =
+      text "HsOuterExplicit:" <+> ppr exp_tvs <+> ppr ma
 
 instance OutputableBndrId p
        => Outputable (HsForAllTelescope (GhcPass p)) where
-    ppr (HsForAllVis { hsf_vis_bndrs = bndrs }) =
-      text "HsForAllVis:" <+> ppr bndrs
-    ppr (HsForAllInvis { hsf_invis_bndrs = bndrs }) =
-      text "HsForAllInvis:" <+> ppr bndrs
+    ppr (HsForAllVis { hsf_matchability = ma, hsf_vis_bndrs = bndrs }) =
+      text "HsForAllVis:" <+> ppr bndrs <+> ppr ma
+    ppr (HsForAllInvis { hsf_matchability = ma, hsf_invis_bndrs = bndrs }) =
+      text "HsForAllInvis:" <+> ppr bndrs <+> ppr ma
 
 instance OutputableBndrId p
        => Outputable (HsGadtTelescope (GhcPass p)) where
     ppr (HsGadtForAll _ tele) = text "HsGadtForAll" <+> ppr tele
+    ppr (HsGadtContext ctxt) = text "HsGadtContext" <+> ppr ctxt
     ppr (HsGadtPar _)         = text "HsGadtPar"
 
 instance (OutputableBndrId p, OutputableBndrFlag flag p)
@@ -1397,16 +1804,16 @@ pprAnonWildCard = char '_'
 pprHsOuterFamEqnTyVarBndrs :: OutputableBndrId p
                            => HsOuterFamEqnTyVarBndrs (GhcPass p) -> SDoc
 pprHsOuterFamEqnTyVarBndrs (HsOuterImplicit{}) = empty
-pprHsOuterFamEqnTyVarBndrs (HsOuterExplicit{hso_bndrs = qtvs}) =
-  forAllLit <+> interppSP qtvs <> dot
+pprHsOuterFamEqnTyVarBndrs (HsOuterExplicit{hso_matchability = ma, hso_bndrs = qtvs}) =
+  forAllLit <+> interppSP qtvs <> dot <+> pprForAllMatchability ma
 
 -- | Prints the outermost @forall@ in a type signature if one is written.
 -- If there is no outermost @forall@, nothing is printed.
 pprHsOuterSigTyVarBndrs :: OutputableBndrId p
                         => HsOuterSigTyVarBndrs (GhcPass p) -> SDoc
 pprHsOuterSigTyVarBndrs (HsOuterImplicit{}) = empty
-pprHsOuterSigTyVarBndrs (HsOuterExplicit{hso_bndrs = bndrs}) =
-  pprHsForAllTelescope (mkHsForAllInvisTele noAnn bndrs)
+pprHsOuterSigTyVarBndrs (HsOuterExplicit{hso_matchability = ma, hso_bndrs = bndrs}) =
+  pprHsForAllTelescope ((mkHsForAllInvisTele noAnn bndrs) { hsf_matchability = ma })
 
 -- | Prints a forall; When passed an empty list, prints @forall .@/@forall ->@
 -- only when @-dppr-debug@ is enabled.
@@ -1427,11 +1834,15 @@ pprHsForAllTelescope tele =
     pp_forall :: forall flag p. (OutputableBndrId p, OutputableBndrFlag flag p)
               => SDoc -> [LHsTyVarBndr flag (GhcPass p)] -> SDoc
     pp_forall separator qtvs
-      | null qtvs = whenPprDebug (forAllLit <> separator)
+      | null qtvs, Nothing <- hsf_matchability tele = whenPprDebug (forAllLit <> separator)
   -- Note: to fix the PprRecordDotSyntax1 ppr roundtrip test, the <>
   -- below needs to be <+>. But it means 94 other test results need to
   -- be updated to match.
-      | otherwise = forAllLit <+> interppSP qtvs <> separator
+      | otherwise = forAllLit <+> interppSP qtvs <> separator <+> pprForAllMatchability (hsf_matchability tele)
+
+-- | Print an annotation after the forall separator.
+pprForAllMatchability :: OutputableBndrId p => Maybe (LHsType (GhcPass p)) -> SDoc
+pprForAllMatchability = maybe empty (\ma -> char '@' <> ppr (parenthesizeHsType appPrec ma))
 
 pprLHsContext :: (Foldable t, OutputableBndrId p)
               => t (LHsContext (GhcPass p)) -> SDoc
@@ -1462,6 +1873,14 @@ ppr_mono_lty ty = ppr_mono_ty (unLoc ty)
 ppr_mono_ty :: forall p. (OutputableBndrId p) => HsType (GhcPass p) -> SDoc
 ppr_mono_ty (HsForAllTy { hst_tele = tele, hst_body = ty })
   = sep [pprHsForAll tele Nothing, ppr_mono_lty ty]
+
+ppr_mono_ty (HsForEachTy { hst_xforeach = ann, hst_bndrs = bndrs, hst_body = ty })
+  = sep [prefix, ppr_mono_lty ty]
+  where
+    binders = text "foreach" <+> interppSP bndrs
+    prefix = case hsForEachVisibility ann of
+      DepFunVisible   -> binders <+> arrow
+      DepFunInvisible -> binders <> dot
 
 ppr_mono_ty (HsQualTy { hst_ctxt = ctxt, hst_body = ty })
   = sep [pprLHsContextAlways ctxt, ppr_mono_lty ty]
@@ -1532,7 +1951,64 @@ ppr_mono_ty (XHsType t) = case ghcPass @p of
     HsCoreTy ty     -> ppr ty
     HsBangTy _ b ty -> ppr b <> ppr_mono_lty ty
     HsRecTy _ flds  -> pprHsConDeclRecFields (unLoc flds)
-  GhcRn -> ppr t
+    HsTypeLambda _ vars body -> char '\\' <> hsep (map ppr vars) <+> arrow <+> ppr_mono_lty body
+    HsTypeCase _ _ scrutinee alts ->
+      text "case" <+> ppr_mono_lty scrutinee <+> text "of"
+        $$ nest 2 (vcat [ppr_mono_lty pat <+> arrow <+> ppr_mono_lty rhs
+                       | L _ (HsTypeCaseAlt pat _ rhs) <- alts])
+    HsTypeCaseHead name -> ppr name
+    HsTypeSome _ binder domain body ->
+      text "some" <+> parens (ppr binder <+> dcolon <+> ppr_mono_lty domain)
+        <+> char '|' <+> ppr_mono_lty body
+    HsTypeCaseAlias _ _ body -> ppr_mono_lty body
+    HsTypeLambdaCheck vars body _ -> char '\\' <> hsep (map ppr vars) <+> arrow <+> ppr_mono_lty body
+    HsTypeLetProductCheck _ _ body -> ppr_mono_lty body
+    HsTypeExists (_, sep_tok) b body -> pprExistsTy (hsExistsTyFlag sep_tok) (ppr b) (ppr_mono_lty body)
+    HsTypeLet _ brackets _ binds body ->
+      let binding (L _ (HsTypeLetBind signature v _ rhs)) =
+            [ppr sig <+> dcolon <+> ppr_mono_lty kind | (sig, _, kind, _) <- maybeToList signature]
+              ++ [ppr v <+> equals <+> ppr_typelet_rhs rhs]
+          binding (L _ (HsTypeLetPairBind pair_pat _ rhs)) =
+            [pair pair_pat <+> equals <+> ppr_typelet_rhs rhs]
+          binding (L _ (HsTypeLetProductBind con fields _ rhs)) =
+            [hsep (ppr con : map field (NE.toList fields)) <+> equals <+> ppr_typelet_rhs rhs]
+          pair (HsTypeLetPair _ left right) = parens (pprWithCommas field [left, right])
+          field (HsTypeLetPatVar name) = ppr name
+          field HsTypeLetPatWild{} = char '_'
+          field (HsTypeLetPatPair nested) = pair (unLoc nested)
+          bindings = concatMap binding (NE.toList binds)
+          group = case brackets of
+            Nothing -> vcat bindings
+            Just _  -> vcat (zipWith (<+>) (lbrace : repeat semi) bindings ++ [rbrace])
+      in sep [hang (text "let") 2 group, hang (text "in") 2 (ppr_mono_lty body)]
+  GhcRn -> case t of
+    HsCoreTyRn ty -> ppr ty
+    HsGadtFieldRn field -> pprHsConDeclFieldNoMult field
+    HsTypeCaseAliasRn _ body -> ppr_mono_lty body
+    HsTypeLambdaQuoteRn vars body -> char '\\' <> hsep (map ppr vars) <+> arrow <+> ppr_mono_lty body
+    HsTypeLambdaCheckRn vars body _ -> char '\\' <> hsep (map ppr vars) <+> arrow <+> ppr_mono_lty body
+    HsTypeLetProductCheckRn _ _ body -> ppr_mono_lty body
+    HsTypeCaseRn scrutinee rows ->
+      text "case" <+> ppr_mono_lty scrutinee <+> text "of"
+        <+> braces (sep (punctuate semi [ppr_mono_lty pat <+> arrow <+> ppr_mono_lty rhs
+                                       | (_, pat, rhs) <- rows]))
+    HsTypeExistsRn flag b body -> pprExistsTy flag (ppr b) (ppr_mono_lty body)
+    HsTypeLetRn source v rhs body ->
+      let lowered = text "let" <+> ppr v <+> equals <+> ppr_typelet_rhs rhs
+                      <+> text "in" <+> ppr_mono_lty body
+      in case source of
+           Just (HsTypeLetSource original) -> ifPprDebug lowered (ppr_mono_ty original)
+           Nothing -> lowered
+
+-- | Parenthesize a lowered kind signature on a type let RHS.
+ppr_typelet_rhs :: OutputableBndrId p => LHsType (GhcPass p) -> SDoc
+ppr_typelet_rhs rhs@(L _ HsKindSig{}) = parens (ppr_mono_lty rhs)
+ppr_typelet_rhs rhs = ppr_mono_lty rhs
+
+-- | Classify the parsed existential separator.
+hsExistsTyFlag :: Either (EpToken "|") (EpToken ".") -> ExistsTyFlag
+hsExistsTyFlag (Left _) = ExplicitExists
+hsExistsTyFlag (Right _) = ImplicitExists
 
 ppr_infix_ty :: (OutputableBndrId p) => LHsType (GhcPass p) -> Maybe SDoc
 ppr_infix_ty (L _ (HsTyVar _ prom (L _ op))) = Just (pprOccWithTick Infix prom op)
@@ -1560,6 +2036,7 @@ hsTypeNeedsParens :: forall p. IsPass p => PprPrec -> HsType (GhcPass p) -> Bool
 hsTypeNeedsParens p = go_hs_ty
   where
     go_hs_ty (HsForAllTy{})           = p >= funPrec
+    go_hs_ty (HsForEachTy{})          = p >= funPrec
     go_hs_ty (HsQualTy{})             = p >= funPrec
     go_hs_ty (HsTyVar{})              = False
     go_hs_ty (HsFunTy{})              = p >= funPrec
@@ -1596,13 +2073,37 @@ hsTypeNeedsParens p = go_hs_ty
         HsCoreTy ty -> go_core_ty ty
         HsBangTy{}  -> p > topPrec
         HsRecTy{}   -> False
-      GhcRn -> go_core_ty t
+        HsTypeLambda{} -> p >= topPrec
+        HsTypeLambdaCheck{} -> p >= topPrec
+        HsTypeCaseHead{} -> False
+        HsTypeSome{} -> p >= topPrec
+        HsTypeCaseAlias{} -> p >= topPrec
+        HsTypeLetProductCheck _ _ body -> hsTypeNeedsParens p (unLoc body)
+        HsTypeExists{} -> p >= funPrec
+        HsTypeLet{} -> p >= topPrec
+        HsTypeCase{} -> p >= topPrec
+      GhcRn -> case t of
+        HsCoreTyRn ty -> go_core_ty ty
+        HsGadtFieldRn{} -> False
+        HsTypeCaseAliasRn{} -> p >= topPrec
+        HsTypeLambdaQuoteRn{} -> p >= topPrec
+        HsTypeLambdaCheckRn{} -> p >= topPrec
+        HsTypeLetProductCheckRn _ _ body -> hsTypeNeedsParens p (unLoc body)
+        HsTypeCaseRn{} -> p >= topPrec
+        HsTypeExistsRn{} -> p >= funPrec
+        HsTypeLetRn{} -> p >= topPrec
 
     go_core_ty (TyVarTy{})    = False
+    go_core_ty (TermVarTy{})  = False
+    go_core_ty (TermAppTy{})  = p >= appPrec
+    go_core_ty (ClassAppTy{}) = p >= appPrec
+    go_core_ty (DepFunTy{})   = p >= funPrec
+    go_core_ty (DepDictTy{})  = p >= funPrec
     go_core_ty (AppTy{})      = p >= appPrec
     go_core_ty (TyConApp _ args)
       | null args             = False
       | otherwise             = p >= appPrec
+    go_core_ty (ExistsTy{})   = p >= funPrec
     go_core_ty (ForAllTy{})   = p >= funPrec
     go_core_ty (FunTy{})      = p >= funPrec
     go_core_ty (LitTy{})      = False

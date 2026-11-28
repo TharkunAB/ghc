@@ -14,6 +14,7 @@ import GHC.Driver.Config.Diagnostic
 
 import GHC.Core
 import GHC.Core.Lint
+import GHC.Core.Dependent (hasScopedDictionaryProgram)
 import GHC.Core.Lint.Interactive
 import GHC.Core.Opt.Pipeline.Types
 import GHC.Core.Opt.Simplify ( SimplifyOpts(..) )
@@ -42,8 +43,11 @@ endPass pass binds rules
 endPassHscEnvIO :: HscEnv -> NamePprCtx
           -> CoreToDo -> CoreProgram -> [CoreRule] -> IO ()
 endPassHscEnvIO hsc_env name_ppr_ctx pass binds rules
-  = do { let dflags  = hsc_dflags hsc_env
-       ; endPassIO
+  = do { let dflags = hsc_dflags hsc_env
+             finish | gopt Opt_DoCoreLinting dflags
+                    , hasScopedDictionaryProgram binds = endScopedDictionaryPassIO
+                    | otherwise = endPassIO
+       ; finish
            (hsc_logger hsc_env)
            (initEndPassConfig dflags (interactiveInScope $ hsc_IC hsc_env) name_ppr_ctx pass)
            binds rules
@@ -180,5 +184,6 @@ defaultLintFlags dflags = LF { lf_check_global_ids = False
                              , lf_allow_weak_joins = False
                              , lf_allow_beta_joins = False
                              , lf_allow_dead_occs  = False
+                             , lf_after_core_prep  = False
                              , lf_tc_coercion      = False
                              }

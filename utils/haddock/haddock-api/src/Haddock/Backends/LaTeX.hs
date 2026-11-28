@@ -30,6 +30,7 @@ import qualified Data.Maybe as Maybe
 import qualified Data.Text as T
 import GHC hiding (HsTypeGhcPsExt (..), fromMaybeContext)
 import GHC.Core.Type (Specificity (..))
+import GHC.Types.Var (ExistsTyFlag(..))
 import GHC.Data.FastString (unpackFS)
 import Language.Haskell.Syntax.Text (unpackHText)
 import GHC.Types.Name (getOccString, nameOccName, tidyNameOcc)
@@ -576,10 +577,10 @@ ppSubSigLike unicode typ argDocs subdocs leader = do_sig_args 0 leader typ
     do_sig_args :: Int -> LaTeX -> HsSigType DocNameI -> [(LaTeX, LaTeX)]
     do_sig_args n leader (HsSig{sig_bndrs = outer_bndrs, sig_body = ltype}) =
       case outer_bndrs of
-        HsOuterExplicit{hso_bndrs = bndrs} ->
+        HsOuterExplicit{} ->
           [
             ( decltt leader
-            , decltt (ppHsForAllTelescope (mkHsForAllInvisTeleI bndrs) unicode)
+            , decltt (ppHsOuterTyVarBndrs outer_bndrs unicode)
                 <+> ppLType unicode ltype
             )
           ]
@@ -591,6 +592,14 @@ ppSubSigLike unicode typ argDocs subdocs leader = do_sig_args 0 leader typ
     arg_doc n = rDoc . fmap _doc $ Map.lookup n argDocs
 
     do_args :: Int -> LaTeX -> HsType DocNameI -> [(LaTeX, LaTeX)]
+    do_args n leader (HsForEachTy (_, Right _) bndrs ltype) =
+      do_largs n (leader <+> (ppHsForEachBinders bndrs unicode <> dot)) ltype
+    do_args n leader (HsForEachTy _ bndrs ltype)
+      | not (null bndrs) =
+          [ (decltt ldr, decltt (ppHsForEachBinders [bndr] unicode) <-> arg_doc i <+> nl)
+          | (i, ldr, bndr) <- zip3 [n ..] (leader : repeat (arrow unicode)) bndrs
+          ]
+            ++ do_largs (n + length bndrs) (arrow unicode) ltype
     do_args _n leader (HsForAllTy _ tele ltype) =
       [
         ( decltt leader
@@ -632,15 +641,28 @@ ppTypeSig nms ty unicode =
 
 ppHsOuterTyVarBndrs :: RenderableBndrFlag flag => HsOuterTyVarBndrs flag DocNameI -> Bool -> LaTeX
 ppHsOuterTyVarBndrs (HsOuterImplicit{}) _ = empty
-ppHsOuterTyVarBndrs (HsOuterExplicit{hso_bndrs = bndrs}) unicode =
+ppHsOuterTyVarBndrs (HsOuterExplicit{hso_matchability = ma, hso_bndrs = bndrs}) unicode =
   hsep (forallSymbol unicode : ppTyVars unicode bndrs) <> dot
+    <> ppForAllMatchability unicode ma
 
 ppHsForAllTelescope :: HsForAllTelescope DocNameI -> Bool -> LaTeX
 ppHsForAllTelescope tele unicode = case tele of
-  HsForAllVis{hsf_vis_bndrs = bndrs} ->
+  HsForAllVis{hsf_matchability = ma, hsf_vis_bndrs = bndrs} ->
     hsep (forallSymbol unicode : ppTyVars unicode bndrs) <> text "\\" <> arrow unicode
-  HsForAllInvis{hsf_invis_bndrs = bndrs} ->
+      <> ppForAllMatchability unicode ma
+  HsForAllInvis{hsf_matchability = ma, hsf_invis_bndrs = bndrs} ->
     hsep (forallSymbol unicode : ppTyVars unicode bndrs) <> dot
+      <> ppForAllMatchability unicode ma
+
+-- | Print the annotation after the forall separator.
+ppForAllMatchability :: Bool -> Maybe (LHsType DocNameI) -> LaTeX
+ppForAllMatchability unicode =
+  maybe empty (\ma -> space <> atSign <> ppr_mono_ty (reparenTypePrec PREC_CON (unLoc ma)) unicode)
+
+-- | Print retained value binders without the result arrow.
+ppHsForEachBinders :: [LHsTyVarBndr () DocNameI] -> Bool -> LaTeX
+ppHsForEachBinders bndrs unicode =
+  hsep (text "foreach" : ppTyVars unicode bndrs)
 
 ppTyVars :: RenderableBndrFlag flag => Bool -> [LHsTyVarBndr flag DocNameI] -> [LaTeX]
 ppTyVars unicode tvs = map (ppHsTyVarBndr unicode . unLoc) tvs
@@ -905,24 +927,18 @@ ppDataDecl _ _ _ _ _ _ = error "ppDataDecl"
 
 -- ppConstrHdr is for (non-GADT) existentials constructors' syntax
 ppConstrHdr
-  :: Bool
-  -- ^ print explicit foralls
-  -> [LHsTyVarBndr Specificity DocNameI]
-  -- ^ type variables
-  -> HsContext DocNameI
-  -- ^ context
+  :: [LHsGadtTelescope DocNameI]
+  -- ^ Quantifiers and contexts in source order.
   -> Bool
   -- ^ unicode
   -> LaTeX
-ppConstrHdr forall_ tvs ctxt unicode = ppForall <> ppCtxt
+ppConstrHdr telescope unicode = hsep (map ppPrefix telescope)
   where
-    ppForall
-      | null tvs || not forall_ = empty
-      | otherwise = ppHsForAllTelescope (mkHsForAllInvisTeleI tvs) unicode
-
-    ppCtxt
-      | null (hsc_ctxt ctxt) = empty
-      | otherwise = ppContextNoArrow ctxt unicode <+> darrow unicode <> space
+    ppPrefix (L _ (HsGadtForAll _ tele)) = ppHsForAllTelescope tele unicode
+    ppPrefix (L _ (HsGadtContext ctxt))
+      | null (hsc_ctxt (unLoc ctxt)) = empty
+      | otherwise = ppContextNoArrow (unLoc ctxt) unicode <+> darrow unicode <> space
+    ppPrefix (L _ HsGadtPar{}) = empty
 
 -- | Pretty-print a constructor
 ppSideBySideConstr
@@ -956,12 +972,9 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
     decl = case con of
       ConDeclH98
         { con_args = det
-        , con_ex_tvs = tyVars
-        , con_forall = forall_
-        , con_mb_cxt = cxt
+        , con_telescope = telescope
         } ->
-          let context = fromMaybeContext cxt
-              header_ = ppConstrHdr forall_ tyVars context unicode
+          let header_ = ppConstrHdr telescope unicode
            in case det of
                 -- Prefix constructor, e.g. 'Just a'
                 PrefixCon _ args
@@ -1307,6 +1320,16 @@ ppr_mono_lty :: LHsType DocNameI -> Bool -> LaTeX
 ppr_mono_lty ty unicode = ppr_mono_ty (unLoc ty) unicode
 
 ppr_mono_ty :: HsType DocNameI -> Bool -> LaTeX
+ppr_mono_ty (HsForEachTy (_, visibility) bndrs ty) unicode =
+  sep
+    [ prefix
+    , ppr_mono_lty ty unicode
+    ]
+  where
+    binders = ppHsForEachBinders bndrs unicode
+    prefix = case visibility of
+      Left _ -> binders <+> arrow unicode
+      Right _ -> binders <> dot
 ppr_mono_ty (HsForAllTy _ tele ty) unicode =
   sep
     [ ppHsForAllTelescope tele unicode
@@ -1336,6 +1359,19 @@ ppr_mono_ty (HsIParamTy _ (L _ n) ty) u = ppIPName n <+> dcolon u <+> ppr_mono_l
 ppr_mono_ty (HsSpliceTy v _) _ = dataConCantHappen v
 ppr_mono_ty (XHsType (HsBangTy b ty)) u = ppBang b <> ppLParendType u ty
 ppr_mono_ty (XHsType HsRecTy{}) _ = text "{..}"
+ppr_mono_ty (XHsType (HsErasedExists flag binder body)) u =
+  keyword "exists" <+> binder' <+> ppr_mono_lty body u
+  where
+    name = ppHsTyVarBndr u (unLoc binder)
+    binder' = case flag of
+      ExplicitExists -> name <+> char '|'
+      ImplicitExists -> name <> dot
+ppr_mono_ty (XHsType (HsCheckedTypeCase scrutinee rows)) u =
+  keyword "case" <+> pp scrutinee <+> keyword "of"
+    <+> (char '{' <> hsep (punctuate semi (map row rows)) <> char '}')
+  where
+    pp ty = ppr_mono_lty ty u
+    row (pat, rhs) = pp pat <+> arrow u <+> pp rhs
 ppr_mono_ty (XHsType HsCoreTy{}) _ = error "ppr_mono_ty HsCoreTy"
 ppr_mono_ty (HsExplicitListTy _ IsPromoted tys) u = Pretty.quote $ brackets $ hsep $ punctuate comma $ map (ppLType u) tys
 ppr_mono_ty (HsExplicitListTy _ NotPromoted tys) u = brackets $ hsep $ punctuate comma $ map (ppLType u) tys

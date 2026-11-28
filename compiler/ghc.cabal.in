@@ -198,6 +198,7 @@ Library
     Exposed-Modules:
         GHC
         GHC.Builtin
+        GHC.Builtin.CoercionRules
         GHC.Builtin.KnownKeys
         GHC.Builtin.KnownOccs
         GHC.Builtin.Modules
@@ -354,12 +355,14 @@ Library
         GHC.Cmm.Type
         GHC.Cmm.Utils
         GHC.Core
+        GHC.Core.CharCase
         GHC.Core.Class
         GHC.Core.Coercion
         GHC.Core.Coercion.Axiom
         GHC.Core.Coercion.Opt
         GHC.Core.ConLike
         GHC.Core.DataCon
+        GHC.Core.Dependent
         GHC.Core.FamInstEnv
         GHC.Core.FVs
         GHC.Core.InstEnv
@@ -377,6 +380,7 @@ Library
         GHC.Core.Map.Expr
         GHC.Core.Map.Type
         GHC.Core.Multiplicity
+        GHC.Core.OpenWhnf
         GHC.Core.Opt.Arity
         GHC.Core.Opt.CallArity
         GHC.Core.Opt.CallerCC
@@ -850,6 +854,7 @@ Library
         GHC.Tc.Gen.App
         GHC.Tc.Gen.Arrow
         GHC.Tc.Gen.Bind
+        GHC.Tc.Gen.ClosedEval
         GHC.Tc.Gen.Default
         GHC.Tc.Gen.Do
         GHC.Tc.Gen.Expand
@@ -859,9 +864,13 @@ Library
         GHC.Tc.Gen.Head
         GHC.Tc.Gen.HsType
         GHC.Tc.Gen.Match
+        GHC.Tc.Gen.OpenTypeEval
         GHC.Tc.Gen.Pat
         GHC.Tc.Gen.Sig
+        GHC.Tc.Gen.SourceClosure
+        GHC.Tc.Gen.SourceTable
         GHC.Tc.Gen.Splice
+        GHC.Tc.Gen.Totality
         GHC.Tc.Instance.Class
         GHC.Tc.Instance.Family
         GHC.Tc.Instance.FunDeps

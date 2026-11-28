@@ -24,19 +24,25 @@ module Haddock.Convert
   , synifyInstHead
   , synifyFamInst
   , synifyKindSig
+  , hasPrivateTypeCase
+  , synifyTypeCase
   , PrintRuntimeReps (..)
   ) where
 
 import Control.DeepSeq (force)
+import Control.Monad (guard)
 import Data.Either (lefts, partitionEithers, rights)
-import Data.Maybe (catMaybes, mapMaybe, maybeToList)
+import Data.List (isPrefixOf, unsnoc)
+import Data.Maybe (catMaybes, isJust, mapMaybe)
 import GHC.Builtin.KnownKeys
   ( boxedRepDataConKey
   , eqTyConKey
+  , fUNTyConKey
   , hasKey
   , ipClassKey
   , liftedDataConKey
   , tYPETyConKey
+  , unrestrictedFunTyConKey
   )
 import GHC.Builtin.WiredIn.Types
   ( eqTyConName
@@ -45,22 +51,25 @@ import GHC.Builtin.WiredIn.Types
   , promotedConsDataCon
   , promotedNilDataCon
   , unitTy
+  , unmatchableDataConTy
   )
 
-import GHC.Builtin.WiredIn.Prim (alphaTyVars)
+import GHC.Builtin.WiredIn.Prim (alphaTyVars, fUNTyConName)
 import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.FamInstEnv
 import GHC.Core.PatSyn
-import GHC.Core.TyCo.Compare (eqTypes)
+import GHC.Core.TyCo.Compare (eqType, eqTypes)
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Tidy (tidyOpenTypes, tidyOpenTypesX)
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Hs
 import GHC.Types.Basic (DefMethSpec (..), TupleSort (..))
-import GHC.Types.Id (idType, setIdType)
+import GHC.Types.Id (idInfo, idType, setIdType)
+import GHC.Types.Id.Info (invisibleRetainedIdInfo)
 import GHC.Types.Name
 import GHC.Types.Name.Reader (mkVarUnqual)
 import GHC.Types.Name.Set (emptyNameSet)
@@ -69,6 +78,7 @@ import GHC.Types.SrcLoc
 import GHC.Types.TyThing
 import GHC.Types.Unique (getUnique)
 import GHC.Types.Var
+import GHC.Types.Var.Env (emptyTidyEnv)
 import GHC.Types.Var.Set
 import GHC.Unit.Types
 import GHC.Utils.Misc
@@ -80,7 +90,7 @@ import GHC.Utils.Misc
   )
 import GHC.Utils.Panic.Plain (assert)
 
-import Haddock.GhcUtils (defaultRuntimeRepVars, mkEmptySigType, orderedFVs)
+import Haddock.GhcUtils (defaultRuntimeRepVars, mkEmptySigType, orderedFVs, reparenLType, typeNames)
 import Haddock.Interface.RenameType
 import Haddock.Types
 
@@ -250,6 +260,106 @@ synifyAxiom ax@(CoAxiom{co_ax_tc = tc})
   | otherwise =
       Left "synifyAxiom: closed/open family confusion"
 
+-- | Detect references to private type-case helpers without expanding synonyms.
+hasPrivateTypeCase :: Type -> Bool
+hasPrivateTypeCase = any (hasPrefix casePrefixes) . typeNames
+
+-- | Name prefixes reserved for type-case families and their helpers.
+casePrefixes :: [String]
+casePrefixes =
+  [ "$case:"
+  , "$case-node:"
+  , "$case-let-rhs:"
+  , "$lambda:"
+  , "$signature-lambda:"
+  , "$signature-sum:"
+  , "T:#guard:"
+  , "T:$depfun$"
+  ]
+
+-- | Check whether a name has one of the supplied prefixes.
+hasPrefix :: [String] -> Name -> Bool
+hasPrefix prefixes name = any (`isPrefixOf` getOccString name) prefixes
+
+-- | Strip internal source-equation ("T:") and uninterpreted-head ("U:")
+-- prefixes from family names when rendering user-facing documentation.
+unmangleSourceTyConName :: Name -> Name
+unmangleSourceTyConName n
+  | Just term_occ <- sourceTableTermOcc (nameOccName n)
+  , let s = occNameString term_occ
+  , not ("#" `isPrefixOf` s || "$" `isPrefixOf` s)
+  = replace_occ term_occ
+  | 'U' : ':' : rest <- getOccString n
+  , let raw = case rest of
+          '@' : after_at
+            | (_, ':' : after_unit) <- break (== ':') after_at
+            , (_, ':' : after_mod)  <- break (== ':') after_unit
+            -> after_mod
+          _ -> rest
+  , not (null raw)
+  = replace_occ (mkVarOcc raw)
+  | otherwise
+  = n
+  where
+    replace_occ occ
+      | isExternalName n = mkExternalName (nameUnique n) (nameModule n) occ (nameSrcSpan n)
+      | otherwise        = mkInternalName (nameUnique n) occ (nameSrcSpan n)
+
+{- Note [Checked type cases in Haddock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The checked RHS of a synonym can apply a private case family. A flat
+case passes its captures before its last argument, the scrutinee. See
+liftTypeCases in GHC.Rename.Module. Each axiom row
+has the same captures followed by a constructor pattern. Substitute the
+actual captures into the row. This preserves uses of the scrutinee in
+the body as well as the order of the alternatives. The scrutinee
+supplies the kind of each pattern.
+
+The interface stores checked equations. For example, it drops source
+parentheses and can replace nested cases with decision-tree families.
+Reconstruct only the flat shape described above. When this view is
+unavailable, render the synonym's kind without exposing a helper.
+-}
+
+-- | Reconstruct a flat type case from its checked family equations.
+synifyTypeCase :: Type -> Maybe (LHsType GhcRn, [(LHsType GhcRn, LHsType GhcRn)])
+synifyTypeCase (TyConApp tc args)
+  | "$case:" `isPrefixOf` getOccString tc
+  , length args == tyConArity tc
+  , Just (_, binder) <- unsnoc (tyConBinders tc)
+  , isVisibleTyConBinder binder
+  = do
+      (captures, scrutinee) <- unsnoc args
+      axiom <- closedFamilyTyConCoAxiom_maybe tc
+      let branches = fromBranches (coAxiomBranches axiom)
+      guard (not (null branches) && userType scrutinee)
+      let (tidyEnv, _) = tidyOpenTypesX emptyTidyEnv (scrutinee : captures)
+      rows <- traverse (synifyRow tidyEnv captures) branches
+      pure (synifyPart scrutinee, rows)
+  where
+    synifyRow tidyEnv captures branch = do
+      (lhs, pat) <- unsnoc (coAxBranchLHS branch)
+      vars <- traverse getTyVar_maybe lhs
+      (con, fields) <- splitTyConAppNoView_maybe pat
+      guard (length vars == length captures && (isAlgTyCon con || isJust (isPromotedDataCon_maybe con)))
+      fieldVars <- traverse getTyVar_maybe (filterOutInvisibleTypes con fields)
+      let patternVars = vars ++ fieldVars
+      guard (sizeVarSet (mkVarSet patternVars) == length patternVars)
+      guard (userType pat && all (not . ("$" `isPrefixOf`) . getOccString) fieldVars)
+      let subst = substTyWith vars captures
+          rhs = subst (coAxBranchRHS branch)
+      guard (userType rhs)
+      [tidyPat, tidyRhs] <- pure (tidyOpenTypes tidyEnv [subst pat, rhs])
+      pure (synifyPat tidyPat, synifyPart tidyRhs)
+
+    synifyPat ty = reparenLType $ case synifyKindSig ty of
+      L _ (HsKindSig _ pat _) -> pat
+      pat -> pat
+    synifyPart = reparenLType . synifyKindSig
+
+    userType = not . any (hasPrefix ("$lambda:" : casePrefixes)) . typeNames
+synifyTypeCase _ = Nothing
+
 -- | Turn type constructors into data declarations, type families, or type synonyms
 synifyTyCon
   :: PrintRuntimeReps
@@ -301,7 +411,9 @@ synifyTyCon prr _coax tc
                          then HsBndrNoKind noExtField
                          else HsBndrKind noExtField (synifyKindSig realKind) }
     conKind = defaultType prr (tyConKind tc)
-    tyVarKinds = fst . splitFunTys . snd . splitInvisPiTys $ conKind
+    tyVarKinds = let (_, _, body) = splitInvisPiTys conKind
+                     (_, kinds, _) = splitFunTys body
+                 in kinds
 synifyTyCon _prr _coax tc
   | Just flav <- famTyConFlav_maybe tc =
       case flav of
@@ -350,7 +462,10 @@ synifyTyCon _prr coax tc
           , tcdLName = synifyNameN tc
           , tcdTyVars = synifyTyVars (tyConVisibleTyVars tc)
           , tcdFixity = synifyFixity tc
-          , tcdRhs = synifyType WithinType emptyVarSet ty
+          , tcdRhs =
+              if hasPrivateTypeCase ty
+                then noLocA (XHsType (HsCoreTyRn ty))
+                else synifyType WithinType emptyVarSet ty
           }
   -- (closed) newtype and data
   | otherwise = do
@@ -563,6 +678,7 @@ synifyDataCon use_gadt_syntax dc =
       | otherwise =
           HsOuterExplicit
             { hso_xexplicit = noExtField
+            , hso_matchability = Just $ synifyKindSig unmatchableDataConTy
             , hso_bndrs = map synifyTyVarBndr outer_tvbs
             }
 
@@ -570,10 +686,12 @@ synifyDataCon use_gadt_syntax dc =
 
     mk_telescopes bs
       | (invis, other) <- split_invis_tvbs bs, not (null invis)
-      = mkHsForAllInvisTele noAnn (map synifyTyVarBndr invis) : mk_telescopes other
+      = (mkHsForAllInvisTele noAnn (map synifyTyVarBndr invis))
+          { hsf_matchability = Just $ synifyKindSig unmatchableDataConTy } : mk_telescopes other
 
       | (req, other) <- split_req_tvbs bs, not (null req)
-      = mkHsForAllVisTele noAnn (map synifyTyVarBndr req) : mk_telescopes other
+      = (mkHsForAllVisTele noAnn (map synifyTyVarBndr req))
+          { hsf_matchability = Just $ synifyKindSig unmatchableDataConTy } : mk_telescopes other
 
       | otherwise = []
 
@@ -617,17 +735,34 @@ synifyDataCon use_gadt_syntax dc =
     -- finally we get synifyDataCon's result!
     if use_gadt_syntax
       then do
-        let hat = mk_gadt_arg_tys
+        let rep_arg_binders = dataConRepArgBinders dc
+            has_retained_args = not use_named_field_syntax && any isJust rep_arg_binders
+            hat
+              | has_retained_args = PrefixConGADT noExtField []
+              | otherwise = mk_gadt_arg_tys
+            gadt_res_ty
+              | has_retained_args = mk_retained_arg_tys rep_arg_binders arg_tys res_ty
+              | otherwise = res_ty
+            mk_retained_arg_tys [] args res = mkScaledFunTysU args res
+            mk_retained_arg_tys (mb : bs) (arg : args) res =
+              let body = mk_retained_arg_tys bs args res
+               in case mb of
+                    Nothing -> mkScaledFunTysU [arg] body
+                    Just b ->
+                      mkDepFunTyWithVis
+                        (if invisibleRetainedIdInfo (idInfo b) then DepFunInvisible else DepFunVisible)
+                        b
+                        body
+            mk_retained_arg_tys _ args res = mkScaledFunTysU args res
         return $
           noLocA $
             ConDeclGADT
               { con_g_ext = noExtField
               , con_names = pure name
               , con_outer_bndrs = noLocA outer_bndrs
-              , con_inner_bndrs = inner_bndrs
-              , con_cxts = maybeToList ctx
+              , con_telescope = inner_bndrs ++ maybe [] (pure . noLocA . HsGadtContext) ctx
               , con_g_args = hat
-              , con_res_ty = synifyType WithinType emptyVarSet res_ty
+              , con_res_ty = synifyType WithinType emptyVarSet gadt_res_ty
               , con_modifiers = []
               , con_doc = Nothing
               }
@@ -636,11 +771,15 @@ synifyDataCon use_gadt_syntax dc =
         return $
           noLocA $
             ConDeclH98
-              { con_ext = noExtField
+              { con_ext = Nothing
               , con_name = name
-              , con_forall = False
-              , con_ex_tvs = map (synifyTyVarBndr . (mkForAllTyBinder InferredSpec)) ex_tvs
-              , con_mb_cxt = ctx
+              , con_telescope =
+                  [ noLocA $ HsGadtForAll noExtField $
+                    (mkHsForAllInvisTele noAnn
+                      (map (synifyTyVarBndr . (mkForAllTyBinder InferredSpec)) ex_tvs))
+                      { hsf_matchability = Just $ synifyKindSig unmatchableDataConTy }
+                  | not (null ex_tvs)
+                  ] ++ maybe [] (pure . noLocA . HsGadtContext) ctx
               , con_args = hat
               , con_modifiers = []
               , con_doc = Nothing
@@ -759,7 +898,9 @@ tyConArgsPolyKinded tc =
     tc_vis_tvs = tyConVisibleTyVars tc
 
     tc_res_kind_vis_bndrs :: [PiTyBinder]
-    tc_res_kind_vis_bndrs = filter isVisiblePiTyBinder $ fst $ splitPiTys $ tyConResKind tc
+    tc_res_kind_vis_bndrs =
+      let (_, binders, _) = splitPiTys (tyConResKind tc)
+       in filter isVisiblePiTyBinder binders
 
 -- states of what to do with foralls:
 data SynifyTypeState
@@ -797,6 +938,37 @@ defaultType :: PrintRuntimeReps -> Type -> Type
 defaultType ShowRuntimeRep = id
 defaultType HideRuntimeRep = defaultRuntimeRepVars
 
+{- Note [Arrow matchability in Haddock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The source HsFunTy node has no matchability field. Keep ordinary U arrows in
+arrow notation. Print other metadata as FUN @ma mult arg res. The explicit
+application retains metadata variables and computations without changing the
+runtime argument list. HIE recovery uses IfaceFunTy, which stores metadata.
+Partial FUN and (->) applications remain TyConApps. Preserve their leading
+specified metadata with HsAppKindTy before filtering invisible arguments.
+See Note [Printing partial arrow matchability] in GHC.Iface.Type.
+
+Include metadata in type-name collection and runtime-representation defaulting.
+Instance sorting keeps its existing argument and result keys before metadata.
+This distinguishes arrows with the same endpoints and different metadata.
+-}
+
+{- Note [Retained types in Haddock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Use HsForEachTy for a retained binder. Its arrow or dot preserves visibility.
+Keep the explicit domain annotation, including a function domain. Convert
+the domain before extending the binder scope. The binder scopes over the
+result only. Runtime variable and opaque application nodes use the original
+Id Names. Do not convert a retained binder to erased forall syntax.
+
+Runtime-representation defaulting updates the domain and multiplicity of
+each runtime Id without changing its Name. It applies the same transformation
+to runtime occurrences. Valid retained binders have Many multiplicity; the
+source foreach syntax does not need a separate multiplicity annotation.
+The DocNameI annotation keeps the arrow or dot through renaming. HTML and
+LaTeX use that annotation when they render both signatures and argument docs.
+-}
+
 -- | Convert a core type into an 'HsType'.
 synifyType
   :: SynifyTypeState
@@ -807,11 +979,54 @@ synifyType
   -- ^ the type to convert
   -> LHsType GhcRn
 synifyType _ _ (TyVarTy tv) = noLocA $ HsTyVar noAnn NotPromoted $ noLocA (noUserRdr $ getName tv)
+synifyType _ _ (TermVarTy var) =
+  noLocA $ HsTyVar noAnn NotPromoted $ noLocA (noUserRdr $ getName var)
+synifyType _ boundTvs (TermAppTy fun arg) =
+  noLocA $ HsAppTy noExtField
+    (noLocA $ HsTyVar noAnn NotPromoted $ noLocA (noUserRdr $ getName fun))
+    (synifyType WithinType boundTvs arg)
+synifyType _ boundTvs (ClassAppTy sel _ _ arg _) =
+  noLocA $ HsAppTy noExtField
+    (noLocA $ HsTyVar noAnn NotPromoted $ noLocA (noUserRdr $ getName sel))
+    (synifyType WithinType boundTvs arg)
+synifyType _ boundTvs (DepDictTy dict body) =
+  noLocA $ HsQualTy
+    { hst_xqual = noExtField
+    , hst_ctxt = noLocA (HsContext noAnn [synifyType WithinType boundTvs (varType dict)])
+    , hst_body = synifyType WithinType (extendVarSet boundTvs dict) body
+    }
+synifyType _ boundTvs (DepFunTy vis binder body) =
+  -- See Note [Retained types in Haddock].
+  noLocA $ HsForEachTy
+    { hst_xforeach = (noAnn, case vis of
+        DepFunVisible -> Left noAnn
+        DepFunInvisible -> Right noAnn)
+    , hst_bndrs = [noLocA $ HsTvb noAnn ()
+        (HsBndrVar noExtField (noLocA $ getName binder))
+        (HsBndrKind noExtField $ synifyType WithinType boundTvs (varType binder))]
+    , hst_body = synifyType WithinType (extendVarSet boundTvs binder) body
+    }
+synifyType _ boundTvs (ExistsTy flag binder body) =
+  -- See Note [Erased existentials in Haddock].
+  noLocA $ XHsType $ HsTypeExistsRn flag tvb body'
+  where
+    tvb = noLocA $ HsTvb noAnn SpecifiedSpec
+      (HsBndrVar noExtField (noLocA (getName binder)))
+      (HsBndrKind noExtField (synifyType WithinType boundTvs (tyVarKind binder)))
+    body' = synifyType WithinType (extendVarSet boundTvs binder) body
 synifyType _ boundTvs (TyConApp tc tys) =
   maybe_sig res_ty
   where
     res_ty :: LHsType GhcRn
     res_ty
+      -- See Note [Arrow matchability in Haddock].
+      | tc `hasKey` fUNTyConKey || tc `hasKey` unrestrictedFunTyConKey
+      , ma : _ <- tys =
+          foldl (\f a -> noLocA $ HsAppTy noExtField f a)
+            (noLocA $ HsAppKindTy noExtField
+              (noLocA $ HsTyVar noAnn NotPromoted (noLocA $ noUserRdr $ getName tc))
+              (synifyType WithinType boundTvs ma))
+            (map (synifyType WithinType boundTvs) vis_tys)
       -- Use */# instead of TYPE 'Lifted/TYPE 'Unlifted (#473)
       | tc `hasKey` tYPETyConKey
       , [TyConApp rep [TyConApp lev []]] <- tys
@@ -868,23 +1083,24 @@ synifyType _ boundTvs (TyConApp tc tys) =
               (noLocA $ HsTyVar noAnn NotPromoted (noLocA $ noUserRdr eqTyConName))
               (synifyType WithinType boundTvs ty2)
       -- and infix type operators
-      | isSymOcc (nameOccName (getName tc))
+      | isSymOcc (nameOccName display_tc_name)
       , ty1 : ty2 : tys_rest <- vis_tys =
           mk_app_tys
             ( HsOpTy
                 noExtField
                 (synifyType WithinType boundTvs ty1)
-                (noLocA $ HsTyVar noAnn prom (noLocA $ noUserRdr $ getName tc))
+                (noLocA $ HsTyVar noAnn prom (noLocA $ noUserRdr display_tc_name))
                 (synifyType WithinType boundTvs ty2)
             )
             tys_rest
       -- Most TyCons:
       | otherwise =
           mk_app_tys
-            (HsTyVar noAnn prom $ noLocA (noUserRdr $ getName tc))
+            (HsTyVar noAnn prom $ noLocA (noUserRdr display_tc_name))
             vis_tys
       where
         !prom = if isPromotedDataCon tc then IsPromoted else NotPromoted
+        display_tc_name = unmangleSourceTyConName (getName tc)
         mk_app_tys ty_app ty_args =
           foldl
             (\t1 t2 -> noLocA $ HsAppTy noExtField t1 t2)
@@ -915,14 +1131,20 @@ synifyType _ boundTvs ty@(AppTy{}) =
             ty_args
    in
     foldl (\t1 t2 -> noLocA $ HsAppTy noExtField t1 t2) ty_head' ty_args'
-synifyType s boundTvs funty@(FunTy af w t1 t2)
+synifyType s boundTvs funty@(FunTy af ma w t1 t2)
   | isInvisibleFunArg af = synifySigmaType s boundTvs funty
-  | otherwise = noLocA $ HsFunTy noExtField w' s1 s2
+  | ma `eqType` unmatchableDataConTy = noLocA $ HsFunTy noExtField w' s1 s2
+  -- See Note [Arrow matchability in Haddock].
+  | otherwise = foldl (\f a -> noLocA $ HsAppTy noExtField f a)
+      (noLocA $ HsAppKindTy noExtField
+        (noLocA $ HsTyVar noAnn NotPromoted (noLocA $ noUserRdr fUNTyConName))
+        (synifyType WithinType boundTvs ma))
+      [synifyType WithinType boundTvs w, s1, s2]
   where
     s1 = synifyType WithinType boundTvs t1
     s2 = synifyType WithinType boundTvs t2
     w' = synifyMultArrow boundTvs w
-synifyType s boundTvs forallty@(ForAllTy (Bndr _ argf) _ty) =
+synifyType s boundTvs forallty@(ForAllTy _ma (Bndr _ argf) _ty) =
   case argf of
     Required -> synifyVisForAllType boundTvs forallty
     Invisible _ -> synifySigmaType s boundTvs forallty
@@ -930,69 +1152,69 @@ synifyType _ _ (LitTy t) = noLocA $ HsTyLit noExtField $ synifyTyLit t
 synifyType s boundTvs (CastTy t _) = synifyType s boundTvs t
 synifyType _ _ (CoercionTy{}) = error "synifyType:Coercion"
 
--- | Process a 'Type' which starts with a visible @forall@ into an 'HsType'
-synifyVisForAllType
-  :: TyVarSet
-  -- ^ bound type variables
-  -> Type
-  -- ^ the forall type to convert
-  -> LHsType GhcRn
-synifyVisForAllType boundTvs ty =
-  let (tvs, rho) = tcSplitForAllTysReqPreserveSynonyms ty
+{- Note [Erased existentials in Haddock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Render the source separator stored in the checked binder. The binder
+is in scope in the body. Its own kind is outside that scope. Keep the
+kind, including Type, so the signature shows the witness the checker
+expects.
+-}
 
-      sTvs = map (synifyTyVarBndr' noKindSigTvs) tvs
-      noKindSigTvs = noKindSigTyVars ty
+{- Note [Forall matchability in Haddock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Keep each annotation with its binder. An annotation can refer to an earlier
+binder, but not to its own binder. Emit one source telescope per binder to
+preserve this scope. Print U explicitly when a forall remains explicit.
+Only known-U quantification can use the runtime implicit-quantification
+policy. Other annotations must remain explicit.
+-}
 
-      -- Figure out what the type variable order would be inferred in the
-      -- absence of an explicit forall
-      tvs' = orderedFVs boundTvs [rho]
-   in noLocA $
-        HsForAllTy
-          { hst_tele = mkHsForAllVisTele noAnn sTvs
-          , hst_xforall = noExtField
-          , hst_body = synifyType WithinType (extendVarSetList boundTvs tvs') rho
-          }
-
--- | Process a 'Type' which starts with an invisible @forall@ or a constraint
--- into an 'HsType'
-synifySigmaType
-  :: SynifyTypeState
-  -- ^ what to do with the 'forall'
+-- | Convert annotated binders to nested source forall groups.
+synifyForAll
+  :: ([LHsTyVarBndr flag GhcRn] -> HsForAllTelescope GhcRn)
   -> TyVarSet
-  -- ^ bound type variables
-  -> Type
-  -- ^ the forall type to convert
+  -> VarSet
+  -> [(Type, VarBndr TyVar flag)]
   -> LHsType GhcRn
+  -> LHsType GhcRn
+synifyForAll mkTele = go
+  where
+    go _ _ [] body = body
+    go boundTvs noKinds ((ma, tvb) : tvbs) body =
+      noLocA $ HsForAllTy
+        { hst_tele = (mkTele [synifyTyVarBndr' noKinds tvb])
+            { hsf_matchability = Just $ synifyType WithinType boundTvs ma }
+        , hst_xforall = noExtField
+        , hst_body = go (extendVarSet boundTvs (binderVar tvb)) noKinds tvbs body
+        }
+
+-- | Convert a type which starts with a visible forall.
+synifyVisForAllType :: TyVarSet -> Type -> LHsType GhcRn
+synifyVisForAllType boundTvs ty =
+  let (ma_tvs, rho) = tcSplitForAllTysReqPreserveSynonyms ty
+      bodyBoundTvs = extendVarSetList boundTvs (map (binderVar . snd) ma_tvs)
+   in synifyForAll (mkHsForAllVisTele noAnn) boundTvs (noKindSigTyVars ty) ma_tvs
+        (synifyType WithinType bodyBoundTvs rho)
+
+-- | Convert a type which starts with an invisible forall or a constraint.
+synifySigmaType :: SynifyTypeState -> TyVarSet -> Type -> LHsType GhcRn
 synifySigmaType s boundTvs ty =
-  let (tvs, ctx, tau) = tcSplitSigmaTyPreserveSynonyms ty
-      sPhi =
-        HsQualTy
-          { hst_ctxt = synifyCtx ctx
-          , hst_xqual = noExtField
-          , hst_body = synifyType WithinType (extendVarSetList boundTvs tvs' ) tau
-          }
-
-      sTy =
-        HsForAllTy
-          { hst_tele = mkHsForAllInvisTele noAnn sTvs
-          , hst_xforall = noExtField
-          , hst_body = noLocA sPhi
-          }
-
-      sTvs = map (synifyTyVarBndr' noKindSigTvs) tvs
-
-      noKindSigTvs = noKindSigTyVars ty
-
-      -- Figure out what the type variable order would be inferred in the
-      -- absence of an explicit forall
-      tvs' = orderedFVs boundTvs (ctx ++ [tau])
+  let (ma_tvs, ctx, tau) = tcSplitSigmaTyPreserveSynonyms ty
+      bodyBoundTvs = extendVarSetList boundTvs (map (binderVar . snd) ma_tvs)
+      sPhi = HsQualTy
+        { hst_ctxt = synifyCtx ctx
+        , hst_xqual = noExtField
+        , hst_body = synifyType WithinType bodyBoundTvs tau
+        }
+      explicit = synifyForAll (mkHsForAllInvisTele noAnn)
+                   boundTvs (noKindSigTyVars ty) ma_tvs (noLocA sPhi)
    in case s of
-        DeleteTopLevelQuantification -> synifyType ImplicitizeForAll (extendVarSetList boundTvs tvs') tau
-        -- Put a forall in if there are any type variables
-        WithinType
-          | not (null tvs) -> noLocA sTy
-          | otherwise -> noLocA sPhi
-        ImplicitizeForAll -> implicitForAll boundTvs tvs ctx (synifyType WithinType) tau
+        DeleteTopLevelQuantification
+          | all (\(ma, _) -> ma `eqType` unmatchableDataConTy) ma_tvs ->
+              synifyType ImplicitizeForAll bodyBoundTvs tau
+          | otherwise -> explicit
+        WithinType -> explicit
+        ImplicitizeForAll -> implicitForAll boundTvs ma_tvs ctx (synifyType WithinType) tau
 
 -- | Use an explicit forall if there are any type variables which require
 -- explicit kind annotations or if the inferred type variable quantification
@@ -1000,8 +1222,8 @@ synifySigmaType s boundTvs ty =
 implicitForAll
   :: TyVarSet
   -- ^ bound type variables (e.g. bound from an outer scope)
-  -> [InvisTVBinder]
-  -- ^ type variable binders in the forall
+  -> [(Type, InvisTVBinder)]
+  -- ^ annotated type variable binders in the forall
   -> ThetaType
   -- ^ constraints right after the forall
   -> (TyVarSet -> Type -> LHsType GhcRn)
@@ -1009,19 +1231,23 @@ implicitForAll
   -> Type
   -- ^ inner type
   -> LHsType GhcRn
-implicitForAll boundTvs tvbs ctx synInner tau
+implicitForAll boundTvs ma_tvbs ctx synInner tau
+  | any (\(ma, _) -> not (ma `eqType` unmatchableDataConTy)) ma_tvbs
+  -- Explicit forall: the annotation cannot use the runtime default.
+  = sTy
   | any (isHsKindedTyVar . unLoc) sTvs
   -- Explicit forall: some type variable needs an explicit kind annotation.
-  = noLocA sTy
+  = sTy
   | tvs /= inferredFreeTvs
   -- Explicit forall: the inferred quantification order would be different.
-  = noLocA sTy
+  = sTy
   | otherwise
   -- Implicit forall.
   = noLocA sPhi
   where
+    tvbs = map snd ma_tvbs
     tvs = binderVars tvbs
-    sRho = synInner (extendVarSetList boundTvs inferredFreeTvs) tau
+    sRho = synInner (extendVarSetList boundTvs tvs) tau
     sPhi
       | null ctx = unLoc sRho
       | otherwise =
@@ -1030,12 +1256,8 @@ implicitForAll boundTvs tvbs ctx synInner tau
             , hst_xqual = noExtField
             , hst_body = sRho
             }
-    sTy =
-      HsForAllTy
-        { hst_tele = mkHsForAllInvisTele noAnn sTvs
-        , hst_xforall = noExtField
-        , hst_body = noLocA sPhi
-        }
+    sTy = synifyForAll (mkHsForAllInvisTele noAnn)
+            boundTvs no_kinds_needed ma_tvbs (noLocA sPhi)
 
     no_kinds_needed = noKindSigTyVars tau
     sTvs = map (synifyTyVarBndr' no_kinds_needed) tvbs
@@ -1068,7 +1290,7 @@ noKindSigTyVars ty
   -- i-th argument of the kind of 'T' is monomorphic, then the kind of 'tv'
   -- is fully determined by its occurrence in the TyConApp.
   | Just (tc, args) <- splitTyConApp_maybe ty
-  , let (tcArgBndrs, _tcResKi) = splitPiTys (tyConKind tc)
+  , let (_, tcArgBndrs, _tcResKi) = splitPiTys (tyConKind tc)
         tcArgKis = map (\case { Named (Bndr b _) -> tyVarKind b; Anon (Scaled _ t) _ -> t}) tcArgBndrs
   = mono_tvs tcArgKis args `unionVarSet` (mapUnionVarSet noKindSigTyVars args)
   -- If we have 'f ty_1 ... ty_n' where 'f :: ki_1 -> ... -> ki_n -> Type'
@@ -1078,7 +1300,7 @@ noKindSigTyVars ty
   -- with type signatures such as '(a -> b) -> (f a -> f b)'.
   | (TyVarTy fun, args) <- splitAppTys ty
   , not (null args)
-  , (funArgKinds, funResKind) <- splitFunTys (tyVarKind fun)
+  , (_, funArgKinds, funResKind) <- splitFunTys (tyVarKind fun)
   , map scaledThing funArgKinds `eqTypes` map typeKind args
   , isLiftedTypeKind funResKind
   = ( `extendVarSet` fun ) $ mapUnionVarSet noKindSigTyVars args
@@ -1091,7 +1313,7 @@ noKindSigTyVars ty
       | otherwise
       = mono_tvs tcArgKis args
     mono_tvs _ _ = emptyVarSet
-noKindSigTyVars (ForAllTy _ t) = noKindSigTyVars t
+noKindSigTyVars (ForAllTy _ _ t) = noKindSigTyVars t
 noKindSigTyVars (CastTy t _) = noKindSigTyVars t
 noKindSigTyVars _ = emptyVarSet
 
@@ -1156,16 +1378,16 @@ Remarks:
 
    in implicitForAll
         ex_tvs    -- consider the ex_tvs non-free, so that we don't quantify over them here
-        univ_tvbs -- quantify only over the universals
+        (map (\tvb -> (unmatchableDataConTy, tvb)) univ_tvbs) -- quantify only over the universals
         req_theta'
         ( \_ ->
           implicitForAll
             univ_tvs -- the univ_tvs are already bound
-            ex_tvbs  -- quantify only over the existentials
+            (map (\tvb -> (unmatchableDataConTy, tvb)) ex_tvbs) -- quantify only over the existentials
             prov_theta
             (synifyType WithinType)
         )
-        (mkScaledFunTys arg_tys res_ty)
+        (mkScaledFunTysU arg_tys res_ty)
 
 synifyTyLit :: TyLit -> HsLit GhcRn
 synifyTyLit (NumTyLit n) = HsNatural noExtField (mkIntegralLit n)
@@ -1179,8 +1401,8 @@ stripKindSig :: LHsType GhcRn -> LHsType GhcRn
 stripKindSig (L _ (HsKindSig _ t _)) = t
 stripKindSig t = t
 
-synifyInstHead :: ([TyVar], [PredType], Class, [Type]) -> [(FamInst, Bool, Maybe (MDoc Name), Located Name, Maybe Module)] -> InstHead GhcRn
-synifyInstHead (vs, preds, cls, types) associated_families =
+synifyInstHead :: ([(Type, TyVar)], [PredType], Class, [Type]) -> [(FamInst, Bool, Maybe (MDoc Name), Located Name, Maybe Module)] -> InstHead GhcRn
+synifyInstHead (ma_vs, preds, cls, types) associated_families =
   InstHead
     { ihdClsName = getName cls
     , ihdTypes = map unLoc annot_ts
@@ -1197,6 +1419,7 @@ synifyInstHead (vs, preds, cls, types) associated_families =
           }
     }
   where
+    vs = map snd ma_vs -- The instance variables are already bound here.
     cls_tycon = classTyCon cls
     ts = filterOutInvisibleTypes cls_tycon types
     ts' = map (synifyType WithinType $ mkVarSet vs) ts
@@ -1263,7 +1486,7 @@ invariant didn't hold.
 -- 2. Returns 'InvisTVBinder's instead of 'TyVar's.
 --
 -- See Note [Invariant: Never expand type synonyms]
-tcSplitSigmaTyPreserveSynonyms :: Type -> ([InvisTVBinder], ThetaType, Type)
+tcSplitSigmaTyPreserveSynonyms :: Type -> ([(Type, InvisTVBinder)], ThetaType, Type)
 tcSplitSigmaTyPreserveSynonyms ty =
   case tcSplitForAllTysInvisPreserveSynonyms ty of
     (tvs, rho) -> case tcSplitPhiTyPreserveSynonyms rho of
@@ -1271,15 +1494,15 @@ tcSplitSigmaTyPreserveSynonyms ty =
 
 -- | See Note [Invariant: Never expand type synonyms]
 tcSplitSomeForAllTysPreserveSynonyms
-  :: (ForAllTyFlag -> Bool) -> Type -> ([ForAllTyBinder], Type)
+  :: (ForAllTyFlag -> Bool) -> Type -> ([(Type, ForAllTyBinder)], Type)
 tcSplitSomeForAllTysPreserveSynonyms argf_pred ty = split ty ty []
   where
-    split _ (ForAllTy tvb@(Bndr _ argf) ty') tvs
-      | argf_pred argf = split ty' ty' (tvb : tvs)
+    split _ (ForAllTy ma tvb@(Bndr _ argf) ty') tvs
+      | argf_pred argf = split ty' ty' ((ma,tvb) : tvs)
     split orig_ty _ tvs = (reverse tvs, orig_ty)
 
 -- | See Note [Invariant: Never expand type synonyms]
-tcSplitForAllTysReqPreserveSynonyms :: Type -> ([ReqTVBinder], Type)
+tcSplitForAllTysReqPreserveSynonyms :: Type -> ([(Type, ReqTVBinder)], Type)
 tcSplitForAllTysReqPreserveSynonyms ty =
   let (all_bndrs, body) = tcSplitSomeForAllTysPreserveSynonyms isVisibleForAllTyFlag ty
       req_bndrs = mapMaybe mk_req_bndr_maybe all_bndrs
@@ -1287,13 +1510,13 @@ tcSplitForAllTysReqPreserveSynonyms ty =
         (req_bndrs `equalLength` all_bndrs)
         (req_bndrs, body)
   where
-    mk_req_bndr_maybe :: ForAllTyBinder -> Maybe ReqTVBinder
-    mk_req_bndr_maybe (Bndr tv argf) = case argf of
-      Required -> Just $ Bndr tv ()
+    mk_req_bndr_maybe :: (Type, ForAllTyBinder) -> Maybe (Type, ReqTVBinder)
+    mk_req_bndr_maybe (ma, Bndr tv argf) = case argf of
+      Required -> Just (ma, Bndr tv ())
       Invisible _ -> Nothing
 
 -- | See Note [Invariant: Never expand type synonyms]
-tcSplitForAllTysInvisPreserveSynonyms :: Type -> ([InvisTVBinder], Type)
+tcSplitForAllTysInvisPreserveSynonyms :: Type -> ([(Type, InvisTVBinder)], Type)
 tcSplitForAllTysInvisPreserveSynonyms ty =
   let (all_bndrs, body) = tcSplitSomeForAllTysPreserveSynonyms isInvisibleForAllTyFlag ty
       inv_bndrs = mapMaybe mk_inv_bndr_maybe all_bndrs
@@ -1301,9 +1524,9 @@ tcSplitForAllTysInvisPreserveSynonyms ty =
         (inv_bndrs `equalLength` all_bndrs)
         (inv_bndrs, body)
   where
-    mk_inv_bndr_maybe :: ForAllTyBinder -> Maybe InvisTVBinder
-    mk_inv_bndr_maybe (Bndr tv argf) = case argf of
-      Invisible s -> Just $ Bndr tv s
+    mk_inv_bndr_maybe :: (Type, ForAllTyBinder) -> Maybe (Type, InvisTVBinder)
+    mk_inv_bndr_maybe (ma, Bndr tv argf) = case argf of
+      Invisible s -> Just (ma, Bndr tv s)
       Required -> Nothing
 
 -- | See Note [Invariant: Never expand type synonyms]
@@ -1319,6 +1542,6 @@ tcSplitPhiTyPreserveSynonyms ty0 = split ty0 []
 
 -- | See Note [Invariant: Never expand type synonyms]
 tcSplitPredFunTyPreserveSynonyms_maybe :: Type -> Maybe (PredType, Type)
-tcSplitPredFunTyPreserveSynonyms_maybe (FunTy af _ arg res)
+tcSplitPredFunTyPreserveSynonyms_maybe (FunTy af _ _ arg res)
   | isInvisibleFunArg af = Just (arg, res)
 tcSplitPredFunTyPreserveSynonyms_maybe _ = Nothing

@@ -43,6 +43,8 @@ import qualified Data.List.NonEmpty as NE
 import qualified Prelude -- for happy-generated code
 
 import GHC.Hs
+import GHC.Hs.Type (HsTypeGhcPsExt(HsTypeLambda, HsTypeLet, HsTypeCase, HsTypeExists, HsTypeSome),
+                    HsTypeCaseAlt(..), HsTypeLetBind(..), HsTypeLetPair(..), HsTypeLetPat(..))
 import GHC.Hs.Decls.Overlap ( OverlapMode(..) )
 
 import GHC.Driver.Backpack.Syntax
@@ -64,7 +66,9 @@ import GHC.Prelude hiding ( head, init, last, tail )
 import qualified GHC.Data.Strict as Strict
 
 import GHC.Types.Name.Reader
-import GHC.Types.Name.Occurrence ( varName, dataName, tcClsName, tvName, occNameFS, occNameString, mkVarOccFS )
+import GHC.Utils.Lexeme        ( isLexCon )
+import GHC.Types.Name.Occurrence ( varName, dataName, tcClsName, tvName, occNameFS, occNameString,
+                                   mkVarOccFS, emptyOccSet, elemOccSet, extendOccSet )
 import GHC.Types.UnresolvedImport ( ImportDeclOrigin(..) )
 import GHC.Types.SrcLoc
 import GHC.Types.Basic
@@ -85,6 +89,7 @@ import GHC.Parser.PostProcess.Haddock
 import GHC.Parser.Lexer
 import GHC.Parser.HaddockLex
 import GHC.Parser.Annotation
+import GHC.Parser.Types        ( ExplicitNamespaceKeyword(ExplicitDataNamespace) )
 import GHC.Parser.Errors.Types
 import GHC.Parser.Errors.Ppr ()
 import GHC.Parser.String
@@ -618,6 +623,9 @@ are the most common patterns, rewritten as regular expressions for clarity:
  'where'        { L _ ITwhere }
 
  'forall'       { L _ (ITforall _) }                -- GHC extension keywords
+ 'foreach'      { L _ ITforeach }
+ 'exists'       { L _ ITexists }
+ 'some'         { L _ ITsome }
  'foreign'      { L _ ITforeign }
  'export'       { L _ ITexport }
  'label'        { L _ ITlabel }
@@ -696,6 +704,7 @@ are the most common patterns, rewritten as regular expressions for clarity:
  PREFIX_PROJ    { L _ (ITproj True) }               -- RecordDotSyntax
  TIGHT_INFIX_PROJ { L _ (ITproj False) }            -- RecordDotSyntax
  PREFIX_AT      { L _ ITtypeApp }
+ RETAINED_AT    { L _ ITretainedApp }
  PREFIX_PERCENT { L _ ITpercent }                   -- for linear types
 
  '{'            { L _ ITocurly }                        -- special symbols
@@ -1554,12 +1563,12 @@ ty_fam_inst_eqns :: { Located [LTyFamInstEqn GhcPs] }
         | {- empty -}                 { noLoc [] }
 
 ty_fam_inst_eqn :: { LTyFamInstEqn GhcPs }
-        : 'forall' tv_bndrs '.' type '=' ktype
+        : 'forall' tv_bndrs '.' forall_matchability type '=' ktype
               {% do { hintExplicitForall $1
                     ; tvbs <- fromSpecTyVarBndrs $2
                     ; let loc = comb2 $1 $>
                     ; !cs <- getCommentsFor loc
-                    ; mkTyFamInstEqn loc (mkHsOuterExplicit (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3) cs) tvbs) $4 $6 (epTok $5) }}
+                    ; mkTyFamInstEqn loc ((mkHsOuterExplicit (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3, fst (unLoc $4)) cs) tvbs) { hso_matchability = snd (unLoc $4) }) $5 $7 (epTok $6) }}
         | type '=' ktype
               {% mkTyFamInstEqn (comb2 $1 $>) mkHsOuterImplicit $1 $3 (epTok $2) }
               -- Note the use of type for the head; this allows
@@ -1693,18 +1702,18 @@ tycl_hdr :: { Located (Maybe (LHsContext GhcPs), LHsType GhcPs) }
         | type                      { sL1 $1 (Nothing, $1) }
 
 datafam_inst_hdr :: { Located (Maybe (LHsContext GhcPs), HsOuterFamEqnTyVarBndrs GhcPs, LHsType GhcPs) }
-        : 'forall' tv_bndrs '.' context '=>' type   {% hintExplicitForall $1
+        : 'forall' tv_bndrs '.' forall_matchability context '=>' type   {% hintExplicitForall $1
                                                        >> fromSpecTyVarBndrs $2
                                                          >>= \tvbs ->
                                                              (acs (comb2 $1 $>) (\loc cs -> (L loc
-                                                                                  (Just ( addTrailingDarrowA $4 (epUniTok $5) cs)
-                                                                                        , mkHsOuterExplicit (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3) emptyComments) tvbs, $6))))
+                                                                                  (Just ( addTrailingDarrowA $5 (epUniTok $6) cs)
+                                                                                        , (mkHsOuterExplicit (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3, fst (unLoc $4)) emptyComments) tvbs) { hso_matchability = snd (unLoc $4) }, $7))))
                                                     }
-        | 'forall' tv_bndrs '.' type   {% do { hintExplicitForall $1
+        | 'forall' tv_bndrs '.' forall_matchability type   {% do { hintExplicitForall $1
                                              ; tvbs <- fromSpecTyVarBndrs $2
                                              ; let loc = comb2 $1 $>
                                              ; !cs <- getCommentsFor loc
-                                             ; return (sL loc (Nothing, mkHsOuterExplicit (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3) cs) tvbs, $4))
+                                             ; return (sL loc (Nothing, (mkHsOuterExplicit (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3, fst (unLoc $4)) cs) tvbs) { hso_matchability = snd (unLoc $4) }, $5))
                                        } }
         | context '=>' type         {% acs (comb2 $1 $>) (\loc cs -> (L loc (Just (addTrailingDarrowA $1 (epUniTok $2) cs), mkHsOuterImplicit, $3))) }
         | type                      { sL1 $1 (Nothing, mkHsOuterImplicit, $1) }
@@ -1913,7 +1922,7 @@ where_inst :: { Located ((EpToken "where", AnnList)
 -- Declarations in binding groups other than classes and instances
 --
 decls   :: { Located (EpaLocation, [EpToken ";"], OrdList (LHsDecl GhcPs)) }
-        : decls ';' decl    {% if isNilOL (thdOf3 $ unLoc $1)
+        : decls ';' decl_bind {% if isNilOL (thdOf3 $ unLoc $1)
                                  then return (sLL $2 $> (glR $3, (sndOf3 $ unLoc $1) ++ (msemiA $2)
                                                         , unitOL $3))
                                  else case (thdOf3 $ unLoc $1) of
@@ -1931,8 +1940,12 @@ decls   :: { Located (EpaLocation, [EpToken ";"], OrdList (LHsDecl GhcPs)) }
                                     SnocOL hs t -> do
                                        t' <- addTrailingSemiA t (epTok $2)
                                        return (sLZ $1 $> (glEEz $1 $2, sndOf3 $ unLoc $1, snocOL hs t')) }
-        | decl                          { sL1 $1 (glR $1,  [], unitOL $1) }
+        | decl_bind                     { sL1 $1 (glR $1,  [], unitOL $1) }
         | {- empty -}                   { noLoc (noAnn, [],nilOL) }
+
+decl_bind :: { LHsDecl GhcPs }
+        : decl                  { $1 }
+        | 'type' type '=' ktype {% liftM mkTyClD (mkTySynonym (comb2 $1 $4) $2 $4 (epTok $1) (epTok $3)) }
 
 decllist :: { Located (AnnList,Located (OrdList (LHsDecl GhcPs))) }
         : '{'            decls '}'     { sLL $1 $> (AnnList (EpExplicitBraces (epTok $1) (epTok $3)) (sndOf3 $ unLoc $2)
@@ -2263,14 +2276,25 @@ unpackedness :: { Located UnpackednessPragma }
         : '{-# UNPACK' '#-}'   { sLL $1 $> (UnpackednessPragma (glR $1, epTok $2) (getUNPACK_PRAGs $1) SrcUnpack) }
         | '{-# NOUNPACK' '#-}' { sLL $1 $> (UnpackednessPragma (glR $1, epTok $2) (getNOUNPACK_PRAGs $1) SrcNoUnpack) }
 
+-- The annotation is atomic, as in visible type application.
+forall_matchability :: { Located (Maybe (EpToken "@"), Maybe (LHsType GhcPs)) }
+        : PREFIX_AT atype { sLL $1 $> (Just (epTok $1), Just $2) }
+        | {- empty -}     { noLoc (Nothing, Nothing) }
+
 forall_telescope :: { Located (HsForAllTelescope GhcPs) }
-        : 'forall' tv_bndrs '.'  {% do { hintExplicitForall $1
-                                       ; acs (comb2 $1 $>) (\loc cs -> (L loc $
-                                           mkHsForAllInvisTele (EpAnn (glEE $1 $>) (epUniTok $1,epTok $3) cs) $2 )) }}
-        | 'forall' tv_bndrs '->' {% do { hintExplicitForall $1
-                                       ; req_tvbs <- fromSpecTyVarBndrs $2
-                                       ; acs (comb2 $1 $>) (\loc cs -> (L loc $
-                                           mkHsForAllVisTele (EpAnn (glEE $1 $>) (epUniTok $1,epUniTok $3) cs) req_tvbs )) }}
+        : 'forall' tv_bndrs '.' forall_matchability
+             {% do { hintExplicitForall $1
+                   ; acs (comb3 $1 $3 $4) (\loc cs -> L loc $
+                       (mkHsForAllInvisTele
+                         (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3, fst (unLoc $4)) cs) $2)
+                         { hsf_matchability = snd (unLoc $4) }) }}
+        | 'forall' tv_bndrs '->' forall_matchability
+             {% do { hintExplicitForall $1
+                   ; req_tvbs <- fromSpecTyVarBndrs $2
+                   ; acs (comb3 $1 $3 $4) (\loc cs -> L loc $
+                       (mkHsForAllVisTele
+                         (EpAnn (glEE $1 $3) (epUniTok $1, epUniTok $3, fst (unLoc $4)) cs) req_tvbs)
+                         { hsf_matchability = snd (unLoc $4) }) }}
 
 -- A ktype is a ctype, possibly with a kind annotation
 ktype :: { LHsType GhcPs }
@@ -2283,6 +2307,20 @@ ctype   :: { LHsType GhcPs }
                                               HsForAllTy { hst_tele = unLoc $1
                                                          , hst_xforall = noExtField
                                                          , hst_body = $2 } }
+        | 'exists' tv_bndrs1 exists_separator ctype
+                                     {% mkHsExistsTelescope $1 $2 $3 $4 }
+        | 'foreach' foreach_bndrs foreach_separator ctype
+                                     {% do { bndrs <- checkForEachBndrs $3 $2
+                                           ; amsA' (sLL $1 $> $
+                                               HsForEachTy { hst_xforeach = (epTok $1, $3)
+                                                           , hst_bndrs = bndrs
+                                                           , hst_body = $4 }) } }
+        | '\\' type_lambda_binders '->' ctype
+                                     {% amsA' (sLL $1 $> $
+                                          XHsType (HsTypeLambda (epTok $1, epUniTok $3) $2 $4)) }
+        | 'data' atype               {% mkHsDataHeraldTy (comb2 $1 $>) (epTok $1) $2 }
+        | 'some' some_bndrs1 some_separator ctype
+                                     {% mkHsSomeTelescope $1 $2 $3 $4 }
         | context '=>' ctype          {% acsA (comb2 $1 $>) (\loc cs -> (L loc $
                                             HsQualTy { hst_ctxt = addTrailingDarrowA $1 (epUniTok $2) cs
                                                      , hst_xqual = NoExtField
@@ -2324,6 +2362,22 @@ is connected to the first type too.
 type :: { LHsType GhcPs }
         -- See Note [%shift: type -> btype]
         : btype %shift                 { $1 }
+        | 'case' ctype 'of' vocurly typecase_alts close
+                                       {% amsA' (sLL $1 $5 $ XHsType
+                                           (HsTypeCase (epTok $1, epTok $3) Nothing
+                                                $2 (reverse (unLoc $5)))) }
+        | 'case' ctype 'of' '{' typecase_alts '}'
+                                       {% amsA' (sLL $1 $6 $ XHsType
+                                           (HsTypeCase (epTok $1, epTok $3) (Just (epTok $4, epTok $6))
+                                                $2 (reverse (unLoc $5)))) }
+        | 'let' vocurly typelet_binds close 'in' ctype
+                                       {% amsA' (sLL $1 $> $ XHsType
+                                            (HsTypeLet (epTok $1, epTok $5) Nothing Nothing
+                                               (NE.reverse (unLoc $3)) $6)) }
+        | 'let' '{' typelet_binds '}' 'in' ctype
+                                       {% amsA' (sLL $1 $> $ XHsType
+                                            (HsTypeLet (epTok $1, epTok $5) (Just (epTok $2, epTok $4)) Nothing
+                                               (NE.reverse (unLoc $3)) $6)) }
         | btype '->' ctype             {% let arr = HsModifiedFunArr noExtField
                                                                      []
                                                                      (HsStandardArr $ EpArrow $ epUniTok $2)
@@ -2341,6 +2395,62 @@ type :: { LHsType GhcPs }
                                                                      (reverse $ unLoc $2)
                                                                      (HsLinearArr $ epTok $3)
                                           in amsA' (sLL $1 $> $ HsFunTy noExtField arr $1 $4) }
+
+-- In reverse source order. Literal separators belong to the preceding binding.
+typelet_binds :: { Located (NonEmpty (LocatedA HsTypeLetBind)) }
+        : typelet_bind                   { sL1 $1 (NE.singleton $1) }
+        | typelet_binds ';' typelet_bind {% case unLoc $1 of
+              b :| bs -> do { b' <- addTrailingSemiA b (mzEpTok $2)
+                            ; return (sLL $1 $> ($3 :| b' : bs)) } }
+        | typelet_binds ';'              {% case unLoc $1 of
+              b :| bs -> do { b' <- addTrailingSemiA b (mzEpTok $2)
+                            ; return (sLL $1 $> (b' :| bs)) } }
+
+typelet_bind :: { LocatedA HsTypeLetBind }
+        : tyvar '=' ctype                {% amsA' (sLL $1 $> (HsTypeLetBind Nothing $1 (epTok $2) $3)) }
+        | tyvar '::' kind ';' tyvar '=' ctype
+                                         {% do { when (unLoc $1 /= unLoc $5) $
+                                                   addError $ mkPlainErrorMsgEnvelope (locA (getLoc $1)) $
+                                                     PsErrTypeLetSignatureMismatch (unLoc $1) (unLoc $5)
+                                               ; amsA' (sLL $1 $> (HsTypeLetBind
+                                                   (Just ($1, epUniTok $2, $3, mzEpTok $4)) $5 (epTok $6) $7)) } }
+        | typelet_pair '=' ctype          {% do { checkTypeLetPairBinders (unLoc $1)
+                                               ; amsA' (sLL $1 $> (HsTypeLetPairBind
+                                                   (unLoc $1) (epTok $2) $3)) } }
+        | qconid typelet_fields '=' ctype
+                                         {% do { checkTypeLetBinders (NE.toList $2)
+                                               ; amsA' (sLL $1 $> (HsTypeLetProductBind
+                                                   $1 $2 (epTok $3) $4)) } }
+
+typelet_pair :: { Located HsTypeLetPair }
+        : '(' typelet_pair_field ',' typelet_pair_field ')'
+                                         { sLL $1 $> (HsTypeLetPair (epTok $1, epTok $3, epTok $5) $2 $4) }
+
+typelet_pair_field :: { HsTypeLetPat }
+        : typelet_field                  { $1 }
+        | typelet_pair                   { HsTypeLetPatPair $1 }
+
+typelet_field :: { HsTypeLetPat }
+        : tyvar                          { HsTypeLetPatVar $1 }
+        | '_'                            { HsTypeLetPatWild (epTok $1) }
+
+typelet_fields :: { NonEmpty HsTypeLetPat }
+        : typelet_field                  { NE.singleton $1 }
+        | typelet_field typelet_fields   { $1 NE.<| $2 }
+
+typecase_alts :: { Located [LocatedA HsTypeCaseAlt] }
+        : typecase_alt                   { sL1 $1 [$1] }
+        | typecase_alts ';' typecase_alt {% case unLoc $1 of
+              a:as -> do { a' <- addTrailingSemiA a (mzEpTok $2)
+                         ; return (sLL $1 $> ($3 : a' : as)) }
+              [] -> return (sL1 $3 [$3]) }
+        | typecase_alts ';'              {% case unLoc $1 of
+              a:as -> do { a' <- addTrailingSemiA a (mzEpTok $2)
+                         ; return (sLL $1 $> (a' : as)) }
+              [] -> return $1 }
+
+typecase_alt :: { LocatedA HsTypeCaseAlt }
+        : btype '->' ctype               {% amsA' (sLL $1 $> (HsTypeCaseAlt $1 (epUniTok $2) $3)) }
 
 btype :: { LHsType GhcPs }
         : infixtype                     {% runPV $1 }
@@ -2462,8 +2572,117 @@ bar_types2    :: { [LHsType GhcPs] }  -- Two or more:  ty|ty|ty
                                              ; return (h : $3) }}
 
 tv_bndrs :: { [LHsTyVarBndr Specificity GhcPs] }
-         : tv_bndr tv_bndrs             { $1 : $2 }
+         : tv_bndr_group tv_bndrs       { $1 ++ $2 }
          | {- empty -}                  { [] }
+
+tv_bndrs1 :: { [LHsTyVarBndr Specificity GhcPs] }
+         : tv_bndr_group tv_bndrs       { $1 ++ $2 }
+
+tv_bndr_group :: { [LHsTyVarBndr Specificity GhcPs] }
+         : tv_bndr                      { [$1] }
+         | '(' tyvar_wc tyvar_wcs1 '::' kind ')'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = SpecifiedSpec
+                         , tvb_var  = unLoc v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+         | '{' tyvar tyvars1 '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrNoKind noExtField })))
+                ($2 : $3) }
+         | '{' tyvar tyvars1 '::' kind '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+
+tyvar_wcs1 :: { [Located (HsBndrVar GhcPs)] }
+         : tyvar_wc                     { [$1] }
+         | tyvar_wc tyvar_wcs1          { $1 : $2 }
+
+tyvars1 :: { [LocatedN RdrName] }
+         : tyvar                        { [$1] }
+         | tyvar tyvars1                { $1 : $2 }
+
+exists_separator :: { Either (EpToken "|") (EpToken ".") }
+         : '|' { Left (epTok $1) }
+         | '.' { Right (epTok $1) }
+
+some_bndrs1 :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "\8759", LHsType GhcPs, EpToken ")")] }
+         : some_bndr_group              { $1 }
+         | some_bndr_group some_bndrs1  { $1 ++ $2 }
+
+some_bndr_group :: { [(EpToken "(", LocatedN RdrName, EpUniToken "::" "\8759", LHsType GhcPs, EpToken ")")] }
+         : '(' tyvar '::' ctype ')'
+             { [(epTok $1, $2, epUniTok $3, $4, epTok $5)] }
+         | '(' tyvar tyvars1 '::' ctype ')'
+             { [ (epTok $1, v, epUniTok $4, $5, epTok $6) | v <- $2 : $3 ] }
+
+some_separator :: { EpToken "|" }
+         : '|'                          { epTok $1 }
+         | '.'                          { EpTok (EpaSpan (gl $1)) }
+
+foreach_separator :: { Either TokRarrow (EpToken ".") }
+         : '->' { Left (epUniTok $1) }
+         | '.'  { Right (epTok $1) }
+
+foreach_bndrs :: { [LHsTyVarBndr Specificity GhcPs] }
+         : foreach_bndr_group foreach_bndrs { $1 ++ $2 }
+         | {- empty -}                      { [] }
+
+foreach_bndr_group :: { [LHsTyVarBndr Specificity GhcPs] }
+         : foreach_bndr                     { [$1] }
+         | '(' tyvar_wc tyvar_wcs1 '::' kind ')'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = SpecifiedSpec
+                         , tvb_var  = unLoc v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+         | '(' tyvar_wc tyvar_wcs1 modifiers1 '::' kind ')'
+             {% do { hintLinear (getLoc $4)
+                   ; mapM (\v -> mkModifiedForEachBndr (getLoc v) [] [] SpecifiedSpec
+                                   (unLoc v) $4 (Just (noAnn, $6)))
+                          ($2 : $3) } }
+         | '{' tyvar tyvars1 '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrNoKind noExtField })))
+                ($2 : $3) }
+         | '{' tyvar tyvars1 '::' kind '}'
+             {% mapM (\v -> amsA' (sL1 v
+                  (HsTvb { tvb_ext  = noAnn
+                         , tvb_flag = InferredSpec
+                         , tvb_var  = HsBndrVar noExtField v
+                         , tvb_kind = HsBndrKind noExtField $5 })))
+                ($2 : $3) }
+
+foreach_bndr :: { LHsTyVarBndr Specificity GhcPs }
+         : tv_bndr                          { $1 }
+         | '(' tyvar_wc modifiers1 '::' kind ')'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $6] SpecifiedSpec
+                       (unLoc $2) $3 (Just (epUniTok $4, $5)) } }
+         | '(' tyvar_wc modifiers1 ')'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $4] SpecifiedSpec
+                       (unLoc $2) $3 Nothing } }
+         | '{' tyvar modifiers1 '::' kind '}'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $6] InferredSpec
+                       (HsBndrVar noExtField $2) $3 (Just (epUniTok $4, $5)) } }
+         | '{' tyvar modifiers1 '}'
+             {% do { hintLinear (getLoc $3)
+                   ; mkModifiedForEachBndr (comb2 $1 $>) [glR $1] [glR $4] InferredSpec
+                       (HsBndrVar noExtField $2) $3 Nothing } }
 
 tv_bndr :: { LHsTyVarBndr Specificity GhcPs }
         : tv_bndr_no_braces             { $1 }
@@ -2639,27 +2858,27 @@ constrs1 :: { Located [LConDecl GhcPs] }
 constr :: { LConDecl GhcPs }
         : modifiers forall context '=>' constr_stuff
                 {% unless (null $ unLoc $1) (hintModifiers (getLoc $1))
-                >> amsA' (let (con,details) = unLoc $5 in
-                  (L (comb5 $1 $2 $3 $4 $5) (mkConDeclH98
-                                                       (epUniTok $4,(fst $ unLoc $2))
-                                                       (reverse $ unLoc $1)
-                                                       con
-                                                       (snd $ unLoc $2)
-                                                       (Just $3)
-                                                       details))) }
+                >> amsA' (let { (con,details) = unLoc $5
+                             ; ctxt = addTrailingDarrowA $3 (epUniTok $4) emptyComments }
+                          in L (comb5 $1 $2 $3 $4 $5)
+                               (mkConDeclH98 (reverse $ unLoc $1) con
+                                 (unLoc $2 ++ [mkHsGadtContext ctxt]) details)) }
         | modifiers forall constr_stuff
                 {% unless (null $ unLoc $1) (hintModifiers (getLoc $1))
-                >> amsA' (let (con,details) = unLoc $3 in
-                  (L (comb3 $1 $2 $3) (mkConDeclH98 (noAnn, fst $ unLoc $2)
-                                                      (reverse $ unLoc $1)
-                                                      con
-                                                      (snd $ unLoc $2)
-                                                      Nothing   -- No context
-                                                      details))) }
+                >> amsA' (let (con,details) = unLoc $3
+                          in L (comb3 $1 $2 $3)
+                               (mkConDeclH98 (reverse $ unLoc $1) con (unLoc $2) details)) }
 
-forall :: { Located ((TokForall, EpToken "."), Maybe [LHsTyVarBndr Specificity GhcPs]) }
-        : 'forall' tv_bndrs '.'       { sLL $1 $> ((epUniTok $1,epTok $3), Just $2) }
-        | {- empty -}                 { noLoc (noAnn, Nothing) }
+forall :: { Located [LHsGadtTelescope GhcPs] }
+        : 'forall' tv_bndrs '.' forall_matchability forall
+            {% do { hintExplicitForall $1
+                  ; acs (comb4 $1 $3 $4 $5) (\loc cs -> L loc $
+                      L (noAnnSrcSpan (comb3 $1 $3 $4))
+                        (HsGadtForAll noExtField
+                          ((mkHsForAllInvisTele
+                            (EpAnn (glEE $1 $3) (epUniTok $1, epTok $3, fst (unLoc $4)) cs) $2)
+                            { hsf_matchability = snd (unLoc $4) })) : unLoc $5) }}
+        | {- empty -} { noLoc [] }
 
 constr_stuff :: { Located (LocatedN RdrName, HsConDeclH98Details GhcPs) }
         : infixtype       {% do { b <- runPV $1
@@ -2944,6 +3163,11 @@ exp_gen(IEXP) :: { ECP }
 
         -- Embed types into expressions and patterns for required type arguments
         | 'type' atype             { ECP $ mkHsEmbTyPV (comb2 $1 $>) (epTok $1) $2 }
+        | 'data' aexp              {% do { requireDataHerald (epTok $1)
+                                         ; return $ ECP $
+                                             unECP $2 >>= \ inner ->
+                                             fmap markDataHeraldLoc
+                                                  (mkHsParPV (comb2 $1 inner) noEpTok inner noEpTok) } }
 
 infixexp2s :: { ECP }
 infixexp2s
@@ -2995,6 +3219,19 @@ infixexp2 :: { ECP }
                                 { ECP $
                                   unECP $2 >>= \ $2 ->
                                   mkHsForallPV (comb2 $1 $>) (unLoc $1) $2 }
+        | 'foreach' foreach_bndrs foreach_separator ctype
+                                {% do { bndrs <- checkForEachBndrs $3 $2
+                                      ; ty <- amsA' (sLL $1 $> $
+                                          HsForEachTy { hst_xforeach = (epTok $1, $3)
+                                                      , hst_bndrs = bndrs
+                                                      , hst_body = $4 })
+                                      ; return $ ECP $ mkHsEmbTyPV (comb2 $1 $>) noEpTok ty } }
+        | 'exists' tv_bndrs1 exists_separator ctype
+                                {% do { ty <- mkHsExistsTelescope $1 $2 $3 $4
+                                      ; return $ ECP $ mkHsEmbTyPV (comb2 $1 $>) noEpTok ty } }
+        | 'some' some_bndrs1 some_separator ctype
+                                {% do { ty <- mkHsSomeTelescope $1 $2 $3 $4
+                                      ; return $ ECP $ mkHsEmbTyPV (comb2 $1 $>) noEpTok ty } }
 
 infixexp :: { ECP }
         : exp10 { $1 }
@@ -3101,6 +3338,13 @@ fexp    :: { ECP }
         | fexp PREFIX_AT atype       { ECP $
                                         unECP $1 >>= \ $1 ->
                                         mkHsAppTypePV (noAnnSrcSpan $ comb2 $1 $>) $1 (epTok $2) $3 }
+
+        | fexp RETAINED_AT '{' exp '}' { ECP $
+                                        unECP $1 >>= \ $1 ->
+                                        unECP $4 >>= \ $4 ->
+                                        spanWithComments (comb2 $1 $>) >>= \l ->
+                                        mkHsAppRetainedPV l $1
+                                          (epTok $2, epTok $3, epTok $5) $4 }
 
         | 'static' aexp              {% runPV (unECP $2) >>= \ $2 ->
                                         fmap ecpFromExp $
@@ -4068,6 +4312,22 @@ qvaropm :: { LocatedN RdrName }
 -----------------------------------------------------------------------------
 -- Type variables
 
+type_lambda_binders :: { [LHsTyVarBndr () GhcPs] }
+        : type_lambda_bndr                      { [$1] }
+        | type_lambda_bndr type_lambda_binders  { $1 : $2 }
+
+type_lambda_bndr :: { LHsTyVarBndr () GhcPs }
+        : tyvar_wc                      {% amsA' (sL1 $1
+                                                (HsTvb { tvb_ext  = noAnn
+                                                       , tvb_flag = ()
+                                                       , tvb_var  = unLoc $1
+                                                       , tvb_kind = HsBndrNoKind noExtField })) }
+        | '(' tyvar_wc '::' kind ')'    {% amsA' (sLL $1 $>
+                                                (HsTvb { tvb_ext  = AnnTyVarBndr [glR $1] [glR $5] noAnn (epUniTok $3)
+                                                       , tvb_flag = ()
+                                                       , tvb_var  = unLoc $2
+                                                       , tvb_kind = HsBndrKind noExtField $4 })) }
+
 tyvar   :: { LocatedN RdrName }
 tyvar   : tyvarid               { $1 }
 
@@ -4526,6 +4786,23 @@ fileSrcSpan = do
   let loc = mkSrcLoc (srcLocFile l) 1 1;
   return (mkSrcSpan loc loc)
 
+-- | Check the simultaneous binders in one type let pattern.
+checkTypeLetPairBinders :: HsTypeLetPair -> P ()
+checkTypeLetPairBinders (HsTypeLetPair _ left right) = checkTypeLetBinders [left, right]
+
+checkTypeLetBinders :: [HsTypeLetPat] -> P ()
+checkTypeLetBinders = check emptyOccSet
+  where
+    check _ [] = pure ()
+    check seen (field : rest) = case field of
+      HsTypeLetPatWild{} -> check seen rest
+      HsTypeLetPatPair (L _ (HsTypeLetPair _ l r)) -> check seen (l : r : rest)
+      HsTypeLetPatVar (L loc name) -> do
+        let occ = rdrNameOcc name
+        when (elemOccSet occ seen) $
+          addError $ mkPlainErrorMsgEnvelope (locA loc) $ PsErrTypeLetDuplicatePairField name
+        check (extendOccSet seen occ) rest
+
 -- Hint about linear types. These can be parsed given either -XLinearTypes or
 -- -XModifiers.
 hintLinear :: MonadP m => SrcSpan -> m ()
@@ -4836,6 +5113,154 @@ combineHasLocs a b = combineSrcSpans (getHasLoc a) (getHasLoc b)
 fromTrailingN :: SrcSpanAnnN -> SrcSpanAnnA
 fromTrailingN (EpAnn anc ann cs)
     = EpAnn anc (nann_trailing ann) cs
+
+-- | Build a @foreach@ binder carrying multiplicity modifiers without changing
+-- the 'HsTyVarBndr' constructor layout.
+-- See Note [Multiplicity annotations on retained foreach binders] in GHC.Rename.HsType.
+mkModifiedForEachBndr :: SrcSpan
+                      -> [EpaLocation] -> [EpaLocation]
+                      -> Specificity
+                      -> HsBndrVar GhcPs
+                      -> Located [LHsModifier GhcPs]
+                      -> Maybe (TokDcolon, LHsKind GhcPs)
+                      -> P (LHsTyVarBndr Specificity GhcPs)
+mkModifiedForEachBndr span opens closes spec bvar mods mb_kind =
+  amsA' $ L (noAnnSrcSpan span) $
+    HsTvb { tvb_ext  = AnnTyVarBndr opens closes (EpTok (EpaDelta noSrcSpan (SameLine tag) [])) dcol
+          , tvb_flag = spec
+          , tvb_var  = bvar
+          , tvb_kind = HsBndrKind noExtField payload }
+  where
+    unit_ty = noLocA (HsTupleTy noAnn HsBoxedOrConstraintTuple [])
+    arr     = HsModifiedFunArr noExtField (reverse (unLoc mods)) (HsStandardArr (EpColon noAnn))
+    (tag, dcol, dom) = case mb_kind of
+      Just (dc, k) -> (if spec == InferredSpec then 3 else 2, dc, k)
+      Nothing      -> (if spec == InferredSpec then 5 else 4, noAnn, unit_ty)
+    payload = L (noAnnSrcSpan span) (HsFunTy noExtField arr dom unit_ty)
+
+-- | Validate specificity annotations on a parsed @foreach@ binder list.
+-- Reject @InferredSpec@ braces on visible @foreach ->@ telescopes, and record
+-- @InferredSpec@ in @atv_tv@ on invisible @foreach .@ binders.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
+checkForEachBndrs :: Either TokRarrow (EpToken ".")
+                  -> [LHsTyVarBndr Specificity GhcPs]
+                  -> P [LHsTyVarBndr () GhcPs]
+checkForEachBndrs (Left _)  bndrs = fromSpecTyVarBndrs bndrs
+checkForEachBndrs (Right _) bndrs = pure
+  [ L loc (b { tvb_ext  = case atv_tv (tvb_ext b) of
+                            EpTok (EpaDelta _ (SameLine n) _) | n >= 2 -> tvb_ext b
+                            _ -> case tvb_flag b of
+                              InferredSpec  -> (tvb_ext b) { atv_tv = EpTok (EpaDelta noSrcSpan (SameLine 1) []) }
+                              SpecifiedSpec -> (tvb_ext b) { atv_tv = noEpTok }
+             , tvb_flag = () })
+  | L loc b <- bndrs ]
+
+-- | Fold a non-empty @exists@ binder list right-associatively into nested 'HsTypeExists' nodes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
+mkHsExistsTelescope :: Located Token
+                    -> [LHsTyVarBndr Specificity GhcPs]
+                    -> Either (EpToken "|") (EpToken ".")
+                    -> LHsType GhcPs
+                    -> P (LHsType GhcPs)
+mkHsExistsTelescope kw bndrs sep body = case bndrs of
+  [b] -> amsA' (sLL kw body (XHsType (HsTypeExists (epTok kw, sep) b body)))
+  b : rest -> do
+    inner <- go rest
+    amsA' (sLL kw body (XHsType (HsTypeExists (epTok kw, sep) b inner)))
+  [] -> panic "mkHsExistsTelescope: empty"
+  where
+    go [b] = amsA' (L (comb2 b body) (XHsType (HsTypeExists (noEpTok, sep) b body)))
+    go (b : rest) = do
+      inner <- go rest
+      amsA' (L (comb2 b body) (XHsType (HsTypeExists (noEpTok, sep) b inner)))
+    go [] = panic "mkHsExistsTelescope.go: empty"
+
+-- | Fold a non-empty @some@ binder list right-associatively into nested 'HsTypeSome' nodes.
+-- See Note [Proposal #378 DependentTypes bundle and telescopes] in GHC.Driver.Session.
+mkHsSomeTelescope :: Located Token
+                  -> [(EpToken "(", LocatedN RdrName, EpUniToken "::" "\8759", LHsType GhcPs, EpToken ")")]
+                  -> EpToken "|"
+                  -> LHsType GhcPs
+                  -> P (LHsType GhcPs)
+mkHsSomeTelescope kw bndrs sep body = case bndrs of
+  [(lpar, v, dcol, dom, rpar)] ->
+    amsA' (sLL kw body $ XHsType (HsTypeSome (epTok kw, lpar, dcol, rpar, sep) v dom body))
+  (lpar, v, dcol, dom, rpar) : rest -> do
+    inner <- go rest
+    amsA' (sLL kw body $ XHsType (HsTypeSome (epTok kw, lpar, dcol, rpar, sep) v dom inner))
+  [] -> panic "mkHsSomeTelescope: empty"
+  where
+    go [(lpar, v, dcol, dom, rpar)] =
+      amsA' (L (comb2 v body) $ XHsType (HsTypeSome (noEpTok, lpar, dcol, rpar, sep) v dom body))
+    go ((lpar, v, dcol, dom, rpar) : rest) = do
+      inner <- go rest
+      amsA' (L (comb2 v body) $ XHsType (HsTypeSome (noEpTok, lpar, dcol, rpar, sep) v dom inner))
+    go [] = panic "mkHsSomeTelescope.go: empty"
+
+-- | Require @-XExplicitNamespaces@ at an explicit @data@ herald keyword.
+requireDataHerald :: EpToken "data" -> P ()
+requireDataHerald data_tok = do
+  allowed <- getBit ExplicitNamespacesBit
+  unless allowed $
+    addError $ mkPlainErrorMsgEnvelope (getEpTokenSrcSpan data_tok) $
+      PsErrIllegalExplicitNamespace (ExplicitDataNamespace data_tok)
+
+-- | Rewrite a parsed type atom under an explicit @data@ herald so the renamer
+-- resolves constructors and variables in the data/value namespace first.
+-- See Note [Explicit data herald in type syntax] in GHC.Rename.HsType.
+mkHsDataHeraldTy :: SrcSpan -> EpToken "data" -> LHsType GhcPs -> P (LHsType GhcPs)
+mkHsDataHeraldTy span data_tok lty = do
+  requireDataHerald data_tok
+  let L _ rewritten = rewrite lty
+  amsA' (L (noAnnSrcSpan span) rewritten)
+  where
+    herald_ann :: EpToken "'"
+    herald_ann = EpTok (EpaDelta noSrcSpan (SameLine 1) [])
+
+    rewrite :: LHsType GhcPs -> LHsType GhcPs
+    rewrite (L l ty) = L l $ case ty of
+      HsParTy ann inner -> HsParTy ann (rewrite inner)
+      HsAppTy x f a -> HsAppTy x (rewrite f) (rewrite a)
+      HsAppKindTy x f k -> HsAppKindTy x (rewrite f) k
+      HsOpTy x lhs op rhs -> HsOpTy x (rewrite lhs) (rewrite op) (rewrite rhs)
+      HsKindSig x body k -> HsKindSig x (rewrite body) k
+      HsDocTy x body doc -> HsDocTy x (rewrite body) doc
+      HsListTy (o, c) elem_ty ->
+        HsExplicitListTy (noEpTok, o, c) IsPromoted [rewrite elem_ty]
+      HsExplicitListTy ann_list _ elems ->
+        HsExplicitListTy ann_list IsPromoted (map rewrite elems)
+      HsTupleTy (AnnParens o c) HsBoxedOrConstraintTuple elems ->
+        HsExplicitTupleTy (noEpTok, AnnParens o c) IsPromoted (map rewrite elems)
+      HsExplicitTupleTy ann_tup _ elems ->
+        HsExplicitTupleTy ann_tup IsPromoted (map rewrite elems)
+      HsTyVar ann prom (L nloc rdr)
+        | NotPromoted <- prom -> rewrite_var nloc rdr
+        | otherwise           -> HsTyVar ann prom (L nloc rdr)
+      other -> other
+
+    rewrite_var :: SrcSpanAnnN -> RdrName -> HsType GhcPs
+    rewrite_var nloc rdr
+      | rdr == nameRdrName listTyConName
+      = HsTyVar herald_ann IsPromoted (L nloc (getRdrName nilDataCon))
+      | NameAnnCommas (NameParens _ _) commas _ <- anns nloc
+      = HsTyVar herald_ann IsPromoted
+          (L nloc (getRdrName (tupleDataCon Boxed (length commas + 1))))
+      | isUnqual rdr || isQual rdr
+      = let occ = rdrNameOcc rdr
+        in if isLexCon (occNameFS occ)
+           then HsTyVar herald_ann IsPromoted (L nloc (setRdrNameSpace rdr dataName))
+           else HsTyVar herald_ann NotPromoted (L nloc (setRdrNameSpace rdr varName))
+      | otherwise
+      = HsTyVar herald_ann NotPromoted (L nloc rdr)
+
+-- | Attach a @data@-herald marker to a synthesized parenthesized expression or
+-- pattern so 'expr_to_type' skips pun-ambiguity rejection under @data@.
+-- See Note [Explicit data herald in type syntax] in GHC.Rename.HsType.
+markDataHeraldLoc :: LocatedA b -> LocatedA b
+markDataHeraldLoc (L (EpAnn anc items cs) node) =
+  L (EpAnn anc (mark : items) cs) node
+  where
+    mark = AddSemiAnn (EpTok (EpaDelta noSrcSpan (SameLine 1) []))
 
 startLocSpan ::EpaLocation -> EpaLocation
 startLocSpan l@(EpaDelta{}) = l
