@@ -8,7 +8,7 @@ NativeRetainedCastDomainBranchWrong.hs:14:48: error: [GHC-25897]
                                foreach (cut1 :: Nat)
                                -> foreach (xs1 :: Vec Bool (Add cut1 m)) -> BranchVector xs1
         at NativeRetainedCastDomainBranchWrong.hs:13:1-110
-    • In the expression: observeVector @('S m) xs_a4pK
+    • In the expression: observeVector @('S m) xs_a4pG
       In an equation for ‘wrongBranchLength’:
           wrongBranchLength Z xs = observeVector @('S m) xs
     • Relevant bindings include
@@ -34,8 +34,8 @@ NativeRetainedCastDomainBranchWrong.hs:21:13: error: [GHC-05617]
           Z -> (observeVector @'Z xs, observeVector @'Z ys)
           S k -> (observeVector @('S k) ys, observeVector @('S k) xs)
     • Relevant bindings include
-        xs_a4qj :: Vec Bool n (bound at <no location info>)
-        ys_a4qk :: Vec Bool n (bound at <no location info>)
+        xs_a4qf :: Vec Bool n (bound at <no location info>)
+        ys_a4qg :: Vec Bool n (bound at <no location info>)
 
 NativeRetainedCastDomainBranchWrong.hs:21:39: error: [GHC-05617]
     • Could not deduce ‘xs ~ ys’
@@ -53,6 +53,6 @@ NativeRetainedCastDomainBranchWrong.hs:21:39: error: [GHC-05617]
           Z -> (observeVector @'Z xs, observeVector @'Z ys)
           S k -> (observeVector @('S k) ys, observeVector @('S k) xs)
     • Relevant bindings include
-        xs_a4qj :: Vec Bool n (bound at <no location info>)
-        ys_a4qk :: Vec Bool n (bound at <no location info>)
+        xs_a4qf :: Vec Bool n (bound at <no location info>)
+        ys_a4qg :: Vec Bool n (bound at <no location info>)
 

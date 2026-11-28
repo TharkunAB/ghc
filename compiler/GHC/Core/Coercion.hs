@@ -1119,6 +1119,7 @@ nativeIndexCastCo_maybe co
   | coercionRole co == Representational
   , Just delta <- setNominalRole_maybe Representational co
   , coercionRole delta == Nominal
+  , not (isReflCo delta)
   , nativeIndexCastEndpoints (coercionLKind delta) (coercionRKind delta)
   = Just delta
   | otherwise = Nothing
@@ -1155,7 +1156,8 @@ mapNativeIndexCastCoM rewrite co
   = rewrite co
   where
     preserve delta
-      | nativeIndexCastEndpoints (coercionLKind delta) (coercionRKind delta)
+      | not (isReflCo delta)
+      , nativeIndexCastEndpoints (coercionLKind delta) (coercionRKind delta)
       = SubCo delta
       | otherwise
       = mkSubCo delta
@@ -1171,9 +1173,10 @@ See Note [Nominal native index casts] in GHC.Core.
 mkWpCastN therefore retains a raw SubCo until final zonking. At that point,
 mapNativeIndexCastCoM recovers the nominal proof before the generic zonker
 can rebuild SubCo with mkSubCo. It zonks the proof at Nominal, then checks
-the endpoints. It retains raw SubCo for an admitted value conversion or a
-callback cast. See Note [Function-valued retained binders] in
-GHC.Core.Type. R-only evidence follows the ordinary zonking path.
+the endpoints. It retains raw SubCo for a non-reflexive admitted value
+conversion or callback cast, and simplifies reflexive proofs with mkSubCo.
+See Note [Function-valued retained binders] in GHC.Core.Type. R-only evidence
+follows the ordinary zonking path.
 
 The domain check must follow zonking. An assigned type metavariable can
 still occur syntactically in an endpoint before zonking. Checking that

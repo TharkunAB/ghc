@@ -124,3 +124,4 @@ test('NoPolyKindsOpenFamMatchability',
 test('DefunKindSynonymMatchability', normal, compile, ['-dcore-lint'])
 test('PromotedConCallbackMatchability', normal, compile, ['-dcore-lint'])
 test('ForeachConCallbackMatchability', normal, compile, ['-O1 -dcore-lint'])
+test('LinearPolyMultSumCase', normal, compile, ['-O1 -dcore-lint'])
