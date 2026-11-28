@@ -1,0 +1,36 @@
+NativeUnsaturatedPatternRejects.hs:10:43: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected: GHC.Internal.Types.Matchable
+        Actual: U
+    • In the instance declaration for ‘C (f x)’
+
+NativeUnsaturatedPatternRejects.hs:16:49: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected: GHC.Internal.Types.Matchable
+        Actual: ToU M
+    • In the instance declaration for ‘Computed (f x)’
+
+NativeUnsaturatedPatternRejects.hs:19:3: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected: GHC.Internal.Types.Matchable
+        Actual: U
+    • In the equations for closed type family ‘UnApp’
+      In the type family declaration for ‘UnApp’
+
+NativeUnsaturatedPatternRejects.hs:22:74: error: [GHC-25897]
+    • Couldn't match expected kind ‘GHC.Internal.Types.Matchable’
+                  with actual kind ‘m’
+      ‘m’ is a (rigid, skolem) type variable
+        of unknown origin
+        bound at NativeUnsaturatedPatternRejects.hs:22:18
+      No skolem info - we could not find the origin of the following variables [(UnkSkol (please report this as a bug)
+                                                                                 Call stack:,
+                                                                                 [m])]
+      This should not happen, please report it as a bug following the instructions at:
+      https://gitlab.haskell.org/ghc/ghc/wikis/report-a-bug
+      Call stack:
+    • In the instance declaration for ‘CRigid (f x)’
+

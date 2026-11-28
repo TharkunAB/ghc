@@ -1,0 +1,63 @@
+NativeNestedRetainedCaseReject.hs:12:34: error: [GHC-05617]
+    • Could not deduce ‘b1 ~ a2’
+      from the context: t ~ Arr a2 b1
+        bound by a pattern with constructor: Arr :: Ty %1 -> Ty %1 -> Ty,
+                 in a lambda abstraction
+        at NativeNestedRetainedCaseReject.hs:12:5-35
+      Expected: Term g (Arr b1 a2)
+        Actual: Term g (Arr a2 b1)
+    • In the third argument of ‘MkArrow’, namely ‘x’
+      In the first argument of ‘Just’, namely ‘(MkArrow b a x)’
+      In the expression: Just (MkArrow b a x)
+    • Relevant bindings include
+        x_a1eE :: Term g (Arr a2 b1) (bound at <no location info>)
+
+NativeNestedRetainedCaseReject.hs:19:34: error: [GHC-83865]
+    • Couldn't match type ‘_’ with ‘Arr a1 b’
+      Expected: Term g (Arr a1 b)
+        Actual: Term g _
+    • In the third argument of ‘MkArrow’, namely ‘y’
+      In the first argument of ‘Just’, namely ‘(MkArrow a b y)’
+      In the expression: Just (MkArrow a b y)
+    • Relevant bindings include
+        y :: Term g _ (bound at NativeNestedRetainedCaseReject.hs:17:26)
+
+NativeNestedRetainedCaseReject.hs:25:9: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from multiplicity of ‘box’
+    • In an equation for ‘discard’:
+          discard box
+            = case box of
+                Nothing -> Nothing
+                Just (LinearPack t x)
+                  -> case t of
+                       Nat -> Nothing
+                       Arr a b -> Just (MkArrow ...)
+
+NativeNestedRetainedCaseReject.hs:32:45: error: [GHC-83865]
+    • Couldn't match type ‘B’ with ‘A B B’
+      Expected: J (A B B) B Eq.:~: J (A B B) (A B B)
+        Actual: J (A B B) B Eq.:~: J (A B B) B
+    • In the second argument of ‘nestedEquality’, namely ‘Eq.Refl’
+      In the expression: nestedEquality (J (A B B) B) Eq.Refl
+      In an equation for ‘wrongWitness’:
+          wrongWitness = nestedEquality (J (A B B) B) Eq.Refl
+
+NativeNestedRetainedCaseReject.hs:36:45: error: [GHC-25897]
+    • Couldn't match type ‘other’ with ‘Eq.Refl’
+      Expected: Eq.Refl Eq.:~: other
+        Actual: Eq.Refl Eq.:~: Eq.Refl
+      ‘other’ is a rigid type variable bound by
+        the type signature for:
+          otherProof :: forall a (x :: a) (other :: x Eq.:~: x).
+                        foreach (proof :: x Eq.:~: x) -> proof Eq.:~: other
+        at NativeNestedRetainedCaseReject.hs:(34,1)-(35,65)
+    • In the expression: Eq.Refl
+      In a case alternative: Eq.Refl -> Eq.Refl
+      In the expression: case proof of Eq.Refl -> Eq.Refl
+    • Relevant bindings include
+        proof :: x Eq.:~: x
+          (bound at NativeNestedRetainedCaseReject.hs:36:12)
+        otherProof :: foreach (proof :: x Eq.:~: x) -> proof Eq.:~: other
+          (bound at NativeNestedRetainedCaseReject.hs:36:1)
+

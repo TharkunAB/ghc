@@ -162,15 +162,15 @@ parseFFIPattern' callback javascriptCc pat t ret args
 genFFIArg :: Bool -> StgArg -> G (JStgStat, [JStgExpr])
 genFFIArg _isJavaScriptCc (StgLitArg l) = (mempty,) <$> genLit l
 genFFIArg isJavaScriptCc a@(StgVarArg i)
-    | not isJavaScriptCc &&
-      (tycon == byteArrayPrimTyCon || tycon == mutableByteArrayPrimTyCon) =
+    | not isJavaScriptCc
+    , Just tycon <- tyConAppTyCon_maybe (unwrapType arg_ty)
+    , tycon == byteArrayPrimTyCon || tycon == mutableByteArrayPrimTyCon =
         (\x -> (mempty,[x, zero_])) <$> varForId i
     | isVoid r                  = return (mempty, [])
 --    | Just x <- marshalFFIArg a = x
     | isMultiVar r              = (mempty,) <$> mapM (varForIdN i) [1..varSize r]
     | otherwise                 = (\x -> (mempty,[x])) <$> varForId i
    where
-     tycon  = tyConAppTyCon (unwrapType arg_ty)
      arg_ty = stgArgType a
      r      = unaryTypeJSRep arg_ty
 

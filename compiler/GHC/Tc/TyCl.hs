@@ -33,10 +33,12 @@ import GHC.Driver.DynFlags
 import GHC.Driver.Config.HsToCore
 
 import GHC.Hs
+import qualified GHC.Hs.Decls as HsDecls
 
 import GHC.Tc.Errors.Types
 import GHC.Tc.TyCl.Build
 import GHC.Tc.Solver( pushLevelAndSolveEqualities, pushLevelAndSolveEqualitiesX
+                    , pushLevelAndSolveKindArrows, pushLevelAndSolveKindArrowsX, inferSynonymMatchabilities
                     , reportUnsolvedEqualities )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Env
@@ -50,6 +52,7 @@ import GHC.Tc.TyCl.Class
 import {-# SOURCE #-} GHC.Tc.TyCl.Instance( tcInstDecls1 )
 import {-# SOURCE #-} GHC.Tc.Module( checkBootDeclM )
 import GHC.Tc.Deriv (DerivInfo(..))
+import GHC.Tc.Gen.SourceTable (withSourceProofSignature, sourceProofRulesFor, takeSourceProofRulesFor)
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Instance.Class( AssocInstInfo(..) )
 import GHC.Tc.Utils.TcMType
@@ -60,15 +63,22 @@ import GHC.Tc.Types.LclEnv
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 
-import GHC.Builtin.WiredIn.Types ( oneDataConTy,  unitTy, makeRecoveryTyCon, manyDataConTy )
+import GHC.Builtin.Modules ( gHC_INTERNAL_TYPENATS )
+import GHC.Builtin.WiredIn.Types ( oneDataConTy, unitTy, makeRecoveryTyCon
+                               , boolTy, promotedTrueDataCon, promotedFalseDataCon
+                               , consDataCon, nilDataCon, tupleDataCon
+                               , manyDataConTy, matchableDataConTy, unmatchableDataConTy, matchabilityTy
+                               , liftedTypeKindTyConName, listTyConName, tYPETyConName )
 
 import GHC.Rename.Env( lookupConstructorFields )
 
 import GHC.Core.Multiplicity
-import GHC.Core.FamInstEnv ( mkBranchedCoAxiom, mkCoAxBranch )
+import GHC.Core.FamInstEnv ( mkBranchedCoAxiom, mkCoAxBranch, reduceTyFamApp_maybe )
+import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Coercion
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep   -- for checkValidRoles
+import GHC.Core.TyCo.Subst (extendSubstInScopeSetFromSource)
 import GHC.Core.TyCo.Ppr( pprTyVars )
 import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
@@ -76,6 +86,7 @@ import GHC.Core.TyCon
 import GHC.Core.DataCon
 import GHC.Core.Unify
 
+import GHC.Types.SourceText ( SourceText(NoSourceText) )
 import GHC.Types.ForeignCall ( typeCheckCType )
 import GHC.Types.Id
 import GHC.Types.Id.Make
@@ -83,6 +94,7 @@ import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Name
+import GHC.Types.Name.Reader (WithUserRdr(..), lookupGRE_Name)
 import GHC.Types.Name.Set
 import GHC.Types.Name.Env
 import GHC.Types.SrcLoc
@@ -93,6 +105,7 @@ import GHC.Types.Basic
 import GHC.Types.Error
 import qualified GHC.LanguageExtensions as LangExt
 
+import GHC.Data.Graph.Directed (Node(..), flattenSCC, stronglyConnCompFromEdgedVerticesUniq)
 import GHC.Data.FastString
 import GHC.Data.Maybe
 import GHC.Data.List.SetOps( minusList, equivClasses )
@@ -101,6 +114,7 @@ import GHC.Data.OrdList
 import GHC.Unit
 import GHC.Unit.Module.ModDetails
 
+import GHC.Utils.Encoding (zEncodeString)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
@@ -109,7 +123,8 @@ import GHC.Utils.Misc
 import Control.Monad
 import Data.Foldable ( toList, traverse_ )
 import GHC.Utils.Monad.StrictIdentity
-import Data.List ( partition)
+import qualified Data.List as List
+import Data.List ( nub, partition)
 import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.List.NonEmpty as NE
 import Data.Traversable ( for )
@@ -361,6 +376,8 @@ tcTyAndClassDecls tyclds_s
   -- Type check each group in dependency order folding the global env
   = checkNoErrs $ go mempty tyclds_s
   where
+    open_indices = openFamilyMatchabilityCandidates tyclds_s
+
     go :: TcTyClGroupsAccum
        -> [TyClGroup GhcRn]
        -> TcM (TcGblEnv, [InstInfo GhcRn], [DerivInfo], ThBindEnv)
@@ -372,11 +389,11 @@ tcTyAndClassDecls tyclds_s
           th_bndrs   = ttcga_th_bndrs acc
       return (tcg_env, inst_info, deriv_info, th_bndrs)
     go acc gs =
-      tcTyClGroupsPass gs $ \acc' n gs' ->
+      tcTyClGroupsPass open_indices gs $ \acc' n gs' ->
         if n == 0 then
           -- Case (3b) of the algorithm in Note [Retrying TyClGroups]
           -- The pass made no progress. We are stuck. Report errors and exit.
-          tcFailedTyClGroups gs'
+          tcFailedTyClGroups open_indices gs'
         else
           -- Case (3b) of the algorithm in Note [Retrying TyClGroups]
           -- The pass made some progress. Iterate.
@@ -385,27 +402,28 @@ tcTyAndClassDecls tyclds_s
 -- Check the remaining TyClGroups that are known to fail,
 -- extending the environment with fake tycons to report more errors.
 -- See Note [Recover from validity error]
-tcFailedTyClGroups :: [TyClGroup GhcRn] -> TcM a
-tcFailedTyClGroups [] = failM
-tcFailedTyClGroups (g:gs) = do
+tcFailedTyClGroups :: OpenFamilyCandidates -> [TyClGroup GhcRn] -> TcM a
+tcFailedTyClGroups _ [] = failM
+tcFailedTyClGroups open_indices (g:gs) = do
   tcg_env <- getGblEnv
   m_result <-
     if isReadyTyClGroup tcg_env g
-    then attemptM (tcTyClGroup g)
+    then attemptM (tcTyClGroup open_indices g)
     else return Nothing
   let tcg_env' = maybe tcg_env fst m_result
-  setGblEnv tcg_env' $ tcFailedTyClGroups gs
+  setGblEnv tcg_env' $ tcFailedTyClGroups open_indices gs
 
 -- Type check as many TyClGroups as possible, skipping any failures.
 -- thing_inside runs in the extended environment.
 tcTyClGroupsPass :: forall a.
-     [TyClGroup GhcRn]     -- Mutually-recursive groups in lexical dependency order
+     OpenFamilyCandidates
+  -> [TyClGroup GhcRn]     -- Mutually-recursive groups in lexical dependency order
   -> (TcTyClGroupsAccum
       -> Int               -- Number of successfully checked groups
       -> [TyClGroup GhcRn] -- Remaining groups in lexical dependency order
       -> TcM a)
   -> TcM a
-tcTyClGroupsPass all_gs thing_inside = go True ttcgs_zero mempty nilOL all_gs
+tcTyClGroupsPass open_indices all_gs thing_inside = go True ttcgs_zero mempty nilOL all_gs
   where
     go :: Bool                -- Strict pass, True <=> fail on unusable {-# UNPACK #-}
        -> TcTyClGroupsStats
@@ -461,7 +479,7 @@ tcTyClGroupsPass all_gs thing_inside = go True ttcgs_zero mempty nilOL all_gs
         tryTcDiscardingErrs' validate
                              (return on_flawed)
                              (return on_failed)
-                             (on_success <$> set_opts (tcTyClGroup g))
+                             (on_success <$> set_opts (tcTyClGroup open_indices g))
 
 data TcTyClGroupsStats =
   TcTyClGroupsStats
@@ -521,30 +539,32 @@ isReadyTyClGroup :: TcGblEnv -> TyClGroup GhcRn -> Bool
 isReadyTyClGroup tcg_env TyClGroup{group_ext = deps} =
   nameSetAll (\n -> n `elemNameEnv` tcg_type_env tcg_env) deps
 
-tcTyClGroup :: TyClGroup GhcRn
+tcTyClGroup :: OpenFamilyCandidates -> TyClGroup GhcRn
             -> TcM (TcGblEnv, TcTyClGroupsAccum)
 -- Typecheck one strongly-connected component of type, class, and instance decls
 -- See Note [TyClGroups and dependency analysis] in GHC.Hs.Decls
-tcTyClGroup (TyClGroup { group_tyclds = tyclds
+tcTyClGroup open_indices (TyClGroup { group_tyclds = tyclds
                        , group_roles  = roles
                        , group_kisigs = kisigs
                        , group_instds = instds })
-  = do { let role_annots = mkRoleAnnotEnv roles
+  = withRollbackSynthTypeState $
+    do { let role_annots = mkRoleAnnotEnv roles
 
            -- Step 1: Typecheck the standalone kind signatures and type/class declarations
        ; traceTc "---- tcTyClGroup ---- {" empty
        ; traceTc "Decls for" (ppr (map (tcdName . unLoc) tyclds))
-       ; (tyclss_with_validity_infos, data_deriv_info, kindless) <-
+       ; (tyclss_with_validity_infos, data_deriv_info, kindless, (case_axioms, decision_helpers)) <-
            tcExtendKindEnv (mkPromotionErrorEnv tyclds) $ -- See Note [Type environment evolution]
-           do { kisig_env <- mkNameEnv <$> traverse tcStandaloneKindSig kisigs
-              ; tcTyClDecls tyclds kisig_env role_annots }
+           do { let decl_env = mkNameEnv [ (tcdName decl, decl)
+                                         | L _ decl <- tyclds ]
+                    check_kisig kisig@(L _ (StandaloneKindSig _ (L _ name) _))
+                      = tcStandaloneKindSigWithDomain (lookupNameEnv_NF decl_env name) kisig
+              ; checked_kisigs <- traverse check_kisig kisigs
+              ; let kisig_env  = mkNameEnv [ (n, ki)  | (n, ki, _)       <- checked_kisigs ]
+                    domain_env = mkNameEnv [ (n, cki) | (n, _, Just cki) <- checked_kisigs ]
+              ; tcTyClDecls open_indices tyclds kisig_env domain_env role_annots }
        ; let tyclss = map fst tyclss_with_validity_infos
-           -- Step 1.5: Make sure we don't have any type synonym cycles
-
-       ; traceTc "Starting synonym cycle check" (ppr tyclss)
-       ; home_unit <- hsc_home_unit <$> getTopEnv
-       ; checkSynCycles (homeUnitAsUnit home_unit) tyclss tyclds
-       ; traceTc "Done synonym cycle check" (ppr tyclss)
+             cases = caseHelperOwners tyclss_with_validity_infos
 
            -- Step 2: Perform the validity check on those types/classes
            -- We can do this now because we are done with the recursive knot
@@ -555,17 +575,29 @@ tcTyClGroup (TyClGroup { group_tyclds = tyclds
            -- NB: put the TyCons in the environment for validity checking,
            -- as we might look them up in checkTyConConsistentWithBoot.
            -- See Note [TyCon boot consistency checking].
-          fmap concat . for tyclss_with_validity_infos $ \ (tycls, ax_validity_infos) ->
+          do { runPendingSynthChecks
+             ; fmap concat . for tyclss_with_validity_infos $ \ (tycls, ax_validity_infos) ->
           do { let inst_flav =
                      TyConInstFlavour
                        { tyConInstFlavour = tyConFlavour tycls
                        , tyConInstIsDefault = False
                        }
-             ; tcAddFamInstCtxt inst_flav (tyConName tycls) $
-               addErrCtxt (ClosedFamEqnCtxt tycls) $
-                 mapM_ (checkTyFamEqnValidityInfo tycls) ax_validity_infos
-             ; checkValidTyCl tycls }
+             ; let ordered_case = tyConName tycls `elemNameEnv` case_axioms
+             ; unless ordered_case $
+                 tcAddFamInstCtxt inst_flav (tyConName tycls) $
+                   addErrCtxt (ClosedFamEqnCtxt tycls) $
+                     mapM_ (checkTyFamEqnValidityInfo tycls) ax_validity_infos
+             ; if ordered_case
+               then do { forM_ ax_validity_infos $ \case
+                           VI{vi_loc = loc, vi_pats = pats, vi_rhs = rhs} ->
+                             setSrcSpan loc $ checkValidTyFamEqn tycls pats rhs
+                           NoVI -> pure ()
+                       ; setXOptM LangExt.UndecidableInstances (checkValidTyCl emptyNameEnv tycls) }
+               else checkValidTyCl (mkNameEnv [(helper, rows) | (owner, helper, rows) <- cases
+                                                             , owner == tyConName tycls]) tycls } }
 
+       ; setXOptM LangExt.UndecidableInstances (mapM_ (checkValidTyCl emptyNameEnv) decision_helpers)
+       ; let tyclss_and_helpers = tyclss ++ decision_helpers
        ; traceTc "Done validity check" (ppr tyclss)
        ; mapM_ (recoverM (return ()) . checkValidRoleAnnots role_annots) tyclss
            -- See Note [Check role annotations in a second pass]
@@ -575,12 +607,12 @@ tcTyClGroup (TyClGroup { group_tyclds = tyclds
            -- Step 3: Add the implicit things;
            -- we want them in the environment because
            -- they may be mentioned in interface files
-       ; (gbl_env, th_bndrs) <- addTyConsToGblEnv tyclss
+       ; (gbl_env, th_bndrs) <- addTyConsToGblEnv tyclss_and_helpers
 
            -- Step 4: check instance declarations
        ; (gbl_env', inst_info, datafam_deriv_info, th_bndrs') <-
          setGblEnv gbl_env $
-         tcInstDecls1 instds
+         tcInstDecls1 (explicit_from_natural open_indices) instds
 
        ; let deriv_info = datafam_deriv_info ++ data_deriv_info
        ; let gbl_env'' = gbl_env'
@@ -594,21 +626,40 @@ tcTyClGroup (TyClGroup { group_tyclds = tyclds
 type KindSigEnv = NameEnv Kind
 
 tcTyClDecls
-  :: [LTyClDecl GhcRn]
+  :: OpenFamilyCandidates
+  -> [LTyClDecl GhcRn]
+  -> KindSigEnv
   -> KindSigEnv
   -> RoleAnnotEnv
-  -> TcM ([(TyCon, [TyFamEqnValidityInfo])], [DerivInfo], NameSet)
-tcTyClDecls tyclds kisig_env role_annots
+  -> TcM ([(TyCon, [TyFamEqnValidityInfo])], [DerivInfo], NameSet, (NameEnv (CoAxiom Branched), [TyCon]))
+tcTyClDecls open_indices tyclds kisig_env domain_env role_annots
   = do {    -- Step 1: kind-check this group and returns the final
             -- (possibly-polymorphic) kind of each TyCon and Class
             -- See Note [Kind checking for type and class decls]
-         (tc_tycons, kindless) <- checkNoErrs $
-                                  kcTyClGroup kisig_env tyclds
+         (tc_tycons, kindless, metadata) <- checkNoErrs $
+                                  kcTyClGroup open_indices kisig_env tyclds
             -- checkNoErrs: If the TyCons are ill-kinded, stop now.  Else we
             -- can get follow-on errors. Example: #23252, where the TyCon
             -- had an ill-scoped kind forall (d::k) k (a::k). blah
             -- and that ill-scoped kind made role inference fall over.
 
+       ; let inferred = mkNameEnv [(tyConName tc, tc) | tc <- tc_tycons]
+       ; forM_ tyclds $ \(L loc decl) -> case decl of
+           SynDecl{tcdLName = L _ name, tcdRhs = rhs}
+             | "$case-let-rhs:" `List.isPrefixOf` occNameString (nameOccName name)
+             , Just tc <- lookupNameEnv inferred name
+             , not (all (determinedCaseLetBinder (tyConBinders tc)) (tyConBinders tc)) ->
+                 setSrcSpanA (getLoc rhs) $
+                   failWithTc (mkTcRnUnknownMessage (mkPlainError []
+                     (text "A type let used in a case body cannot generalize the kind of its right-hand side.")))
+           FamDecl{tcdFam = FamilyDecl{fdLName = L _ name}}
+             | isDependentCaseFamily name
+             , Just tc <- lookupNameEnv inferred name
+             , not (tyCoVarsOfType (tyConResKind tc) `subVarSet` mkVarSet (tyConVisibleTyVars tc)) ->
+                 setSrcSpanA loc $
+                   failWithTc (mkTcRnUnknownMessage (mkPlainError []
+                     (text "The result kind of this type case needs an explicit kind annotation.")))
+           _ -> pure ()
        ; traceTc "tcTyAndCl generalized kinds" (vcat (map ppr_tc_tycon tc_tycons))
 
             -- Step 2: type-check all groups together, returning
@@ -617,29 +668,72 @@ tcTyClDecls tyclds kisig_env role_annots
             -- NB: We have to be careful here to NOT eagerly unfold
             -- type synonyms, as we have not tested for type synonym
             -- loops yet and could fall into a black hole.
-       ; fixM $ \ ~(rec_tyclss_with_validity_infos, _, _) -> do
-           { tcg_env <- getGblEnv
-                 -- Forced so we don't retain a reference to the TcGblEnv
-           ; let !src  = tcg_src tcg_env
-                 rec_tyclss = map fst rec_tyclss_with_validity_infos
-                 roles = inferRoles src role_annots rec_tyclss
+            -- See Note [Publishing ordered type cases].
+       ; edt <- xoptM LangExt.DependentTypes
+       ; let check_declarations rec_case_axioms =
+               fixM $ \ ~(rec_tyclss_with_validity_infos, _) -> do
+               { tcg_env <- getGblEnv
+                     -- Forced so we don't retain a reference to the TcGblEnv
+               ; let !src  = tcg_src tcg_env
+                     rec_tyclss = map fst rec_tyclss_with_validity_infos
+                     roles = inferRoles src role_annots rec_tyclss
 
-                 -- Populate environment with knot-tied ATyCon for TyCons
-                 -- NB: if the decls mention any ill-staged data cons
-                 -- (see Note [Recursion and promoting data constructors])
-                 -- we will have failed already in kcTyClGroup, so no worries here
-           ; (tycons, data_deriv_infos) <-
-             tcExtendRecEnv (zipRecTyClss tc_tycons rec_tyclss) $
+                     -- Populate environment with knot-tied ATyCon for TyCons
+                     -- NB: if the decls mention any ill-staged data cons
+                     -- (see Note [Recursion and promoting data constructors])
+                     -- we will have failed already in kcTyClGroup, so no worries here
+               ; (tycons, data_deriv_infos) <-
+                 tcExtendRecEnv (zipRecTyClss tc_tycons rec_tyclss) $
 
-                 -- Also extend the local type envt with bindings giving
-                 -- a TcTyCon for each knot-tied TyCon or Class
-                 -- See Note [Type checking recursive type and class declarations]
-                 -- and Note [Type environment evolution]
-             tcExtendKindEnvWithTyCons tc_tycons $
-
-                 -- Kind and type check declarations for this group
-               mapAndUnzipM (tcTyClDecl roles) tyclds
-           ; return (tycons, concat data_deriv_infos, kindless)
+                     -- Also extend the local type envt with bindings giving
+                     -- a TcTyCon for each knot-tied TyCon or Class
+                     -- See Note [Type checking recursive type and class declarations]
+                     -- and Note [Type environment evolution]
+                 tcExtendKindEnvWithTyCons tc_tycons $ do
+                   let (helpers, remaining) = partition isCaseLet tyclds
+                       check = tcTyClDecl rec_case_axioms domain_env metadata roles
+                       checked ((tc, _), _) =
+                         [(tyConName tc, ATcCaseLet (binderVars (tyConBinders tc))
+                             rhs (tyConResKind tc) (Just tc))
+                         | Just rhs <- [synTyConRhs_maybe tc]]
+                   withCaseLets check checked helpers $ \checked_helpers -> do
+                     (other_tcs, other_derivs) <- mapAndUnzipM check remaining
+                     let (helper_tcs, helper_derivs) = unzip checked_helpers
+                     pure (helper_tcs ++ other_tcs, helper_derivs ++ other_derivs)
+               ; pure (tycons, data_deriv_infos) }
+             check_syn_cycles tycons = do
+               home_unit <- hsc_home_unit <$> getTopEnv
+               synth_payloads <- pendingSynthSigmaPayloads
+               let scoped = mkNameSet
+                     [ unLoc name
+                     | L _ (FamDecl _ FamilyDecl{fdLName = name,
+                           fdInfo = ClosedTypeFamily (_, Just _) _}) <- tyclds ]
+                   payloads = mkNameEnv
+                     [ (name, [rhs | VI{vi_rhs = rhs} <- infos])
+                     | (tc, infos) <- tycons
+                     , let name = tyConName tc
+                     , name `elemNameSet` scoped ] `plusNameEnv` synth_payloads
+               checkSynCyclesWithPayloads payloads (homeUnitAsUnit home_unit) (map fst tycons) tyclds
+       ; if not edt
+         then do { (tycons, derives) <- check_declarations emptyNameEnv
+                 ; check_syn_cycles tycons
+                 ; pure (tycons, concat derives, kindless, (emptyNameEnv, [])) }
+         else fixM $ \ ~(_, _, _, ~(rec_case_axioms, _)) -> do
+         { (tycons, data_deriv_infos) <- check_declarations rec_case_axioms
+           ; check_syn_cycles tycons
+           ; decisions <- fmap catMaybes $ forM tycons $
+                 \(root, infos) -> do
+                   ordered <- needsOrderedCase root infos
+                   if not ordered then pure Nothing else do
+                     let flavour = TyConInstFlavour (tyConFlavour root) False
+                     checkNoErrs $
+                       tcAddFamInstCtxt flavour (tyConName root) $
+                         addErrCtxt (ClosedFamEqnCtxt root) $
+                           mapM_ (checkTyFamEqnValidityInfo root) infos
+                     (ax, helpers) <- buildOrderedTypeCase root infos
+                     pure (Just ((tyConName root, ax), helpers))
+           ; let (axioms, ordered_helpers) = unzip decisions
+           ; return (tycons, concat data_deriv_infos, kindless, (mkNameEnv axioms, concat ordered_helpers))
            } }
   where
     ppr_tc_tycon tc = parens (sep [ ppr (tyConName tc) <> comma
@@ -730,8 +824,10 @@ A TcTyCon is one of the variants of TyCon.  First, here are its invariants:
     unification variables.
 
   - tyConKind: the Monomorphic Recursion Principle:
-       a MonoTcTyCon has a /monomorphic kind/.
+       a MonoTcTyCon has a /monomorphic kind/, except for the visible
+       dependencies of a generated sum payload family.
     See Note [No polymorphic recursion in type decls].
+    See also Note [Provisional kinds of sum payloads].
     But the tyConKind may contain free unification variables.
 
   - tyConScopedTyVars is important; maps a Name to a TyVarTv unification variable
@@ -755,8 +851,8 @@ A TcTyCon is one of the variants of TyCon.  First, here are its invariants:
         tyConScopedTyVars.
       * at construction time (mkTcTyCon) for a MonoTcTyCon (the call to mkTcTyCon
         in GHC.Tc.Gen.HsType.kcInferDeclHeader) the tyConBinders are used to
-        construct the tyConKind; all must have AnonTCB visiblity so we we get
-        a monokind.
+        construct the tyConKind. Ordinary declarations use AnonTCB visibility
+        for a monokind.
 
 * PolyTcTyCon: a form of TcTyCon
   - Flag tcTyConIsPoly = True; this is used only to short-cut zonking
@@ -936,6 +1032,33 @@ But notice that (#16344 comment:3)
      data T3 ka (a::ka) = forall b. MkT3 (T3 Type b)
   although T3 is really polymorphic-recursive too.
   Perhaps we should somehow reject that.
+
+Note [Provisional kinds of sum payloads]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The renamer lifts the payload of `some` to a private family. An inner
+payload family can capture the same variables as its enclosing family:
+
+  type Keep a (n :: N) (m :: N) (v :: Vec a (Add n m)) =
+    some (left :: Vec a n) | (some (right :: Vec a m) | v :~: v)
+
+The inner header binds a, n, m, v, and left, in that order. If its
+provisional kind has only anonymous binders, the inner application in
+the outer equation checks v against a kind containing the inner
+header's n and m. The solver cannot identify those variables from
+Add n m because Add is non-injective.
+
+Keep visible binders that the checked header uses in later kinds.
+Then each helper application substitutes a, n, and m before it checks
+v. As with Agda's telescopes, each domain refers to the binders that
+precede it. For the lowering of dependent sum payloads, see
+Note [Post-renaming lowering of lambdas, sums, and cases] in GHC.Tc.Gen.HsType.
+
+Use the renamer's sum payload provenance to select this path. The
+generated applications pass the same lexical captures in order. Their
+visible dependencies come from the header, before the body can
+constrain its metas. The normal kind generalizer still determines
+which remaining variables to quantify. Ordinary declarations keep
+the monomorphic recursion principle.
 
 Note [No inference for invisible binders in type decls]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1210,7 +1333,7 @@ been generalized.
 
 -}
 
-kcTyClGroup :: KindSigEnv -> [LTyClDecl GhcRn] -> TcM ([PolyTcTyCon], NameSet)
+kcTyClGroup :: OpenFamilyCandidates -> KindSigEnv -> [LTyClDecl GhcRn] -> TcM ([PolyTcTyCon], NameSet, NameEnv SynonymMetadata)
 
 -- Kind check this group, kind generalize, and return the resulting local env
 -- This binds the TyCons and Classes of the group, but not the DataCons
@@ -1218,7 +1341,7 @@ kcTyClGroup :: KindSigEnv -> [LTyClDecl GhcRn] -> TcM ([PolyTcTyCon], NameSet)
 -- and Note [Inferring kinds for type declarations]
 --
 -- The NameSet returned contains kindless tycon names, without CUSK or SAKS.
-kcTyClGroup kisig_env decls
+kcTyClGroup open_indices kisig_env decls
   = do  { mod <- getModule
         ; traceTc "---- kcTyClGroup ---- {"
                   (text "module" <+> ppr mod $$ vcat (map ppr decls))
@@ -1252,9 +1375,9 @@ kcTyClGroup kisig_env decls
                          -- knock-on errors if we have tycons with
                          -- malformed kinds
 
-        ; inferred_tcs
+        ; (inferred_tcs, metadata0, case_lets)
             <- tcExtendKindEnvWithTyCons checked_tcs  $
-               pushLevelAndSolveEqualities unkSkolAnon [] $
+               pushLevelAndSolveKindArrows unkSkolAnon [] $
                      -- We are going to kind-generalise, so unification
                      -- variables in here must be one level in
                do {  -- Step 1: Bind kind variables for all decls
@@ -1267,11 +1390,26 @@ kcTyClGroup kisig_env decls
                     -- NB: the environment extension overrides the tycon
                     --     promotion-errors bindings
                     --     See Note [Type environment evolution]
-                  ; checkNoErrs $
-                    tcExtendKindEnvWithTyCons mono_tcs $
-                    mapM_ kcLTyClDecl kindless_decls
+                  ; (metadata, case_lets) <- checkNoErrs $
+                    tcExtendKindEnvWithTyCons mono_tcs $ do
+                      let (helpers, remaining) = partition isCaseLet kindless_decls
+                          checked (_, name, params, rhs, kind) =
+                            [(name, ATcCaseLet params rhs kind Nothing)]
+                      withCaseLets kcCaseLet checked helpers $ \case_lets -> do
+                        results <- mapM (kcLTyClDecl (isSingleton decls)) remaining
+                        pure (results, case_lets)
 
-                  ; return mono_tcs }
+                  ; return (mono_tcs, mkNameEnv (catMaybes metadata), case_lets) }
+
+        ; forM_ case_lets $ \(loc, _, params, rhs, kind) -> do
+            (params', rhs', kind') <- liftZonkM $
+              (,,) <$> mapM (zonkTcType . mkTyVarTy) params <*> zonkTcType rhs <*> zonkTcType kind
+            let captured = tyCoVarsOfTypes params'
+                owned = tyCoVarsOfTypes [rhs', kind']
+            unless (owned `subVarSet` captured) $
+              setSrcSpanA loc $
+                failWithTc (mkTcRnUnknownMessage (mkPlainError []
+                  (text "A type let used in a case body cannot generalize the kind of its right-hand side.")))
 
         -- Step 3: generalisation
         -- Finally, go through each tycon and give it its final kind,
@@ -1279,15 +1417,600 @@ kcTyClGroup kisig_env decls
         -- in order.
         ; let inferred_tc_env = mkNameEnv $
                                 map (\tc -> (tyConName tc, tc)) inferred_tcs
-        ; generalized_tcs <- concatMapM (generaliseTyClDecl inferred_tc_env)
+        ; generalized_tcs0 <- concatMapM (generaliseTyClDecl inferred_tc_env)
                                         kindless_decls
 
-        ; let poly_tcs = checked_tcs ++ generalized_tcs
+        ; with_metadata <- traverse (inferArrowIndices metadata0 kindless_decls . prefixFamilyMetadata)
+                                    generalized_tcs0
+        ; let (generalized_tcs, plans) = unzip with_metadata
+              metadata = mkNameEnv [(tyConName tc, plan)
+                                   | (tc, Just plan) <- zip generalized_tcs plans]
+        ; poly_tcs <- traverse (inferOpenMatchability open_indices kisig_env)
+                    (checked_tcs ++ generalized_tcs)
+        ; whenWOptM Opt_WarnCusks $ do
+            dflags <- getDynFlags
+            rdr_env <- getGlobalRdrEnv
+            name_ctx <- getNamePprCtx
+            let cusk_decls = mkNameEnv [(get_name decl, unLoc decl) | (decl, CUSK) <- kinded_decls]
+                missing_extensions = filter (not . (`xopt` dflags))
+                  [LangExt.StandaloneKindSignatures, LangExt.ExplicitForAll]
+                in_scope name =
+                  isExternalName name && isJust (lookupGRE_Name rdr_env name) &&
+                  case queryQualifyName name_ctx (nameModule name) Nothing (nameOccName name) of
+                    NameUnqual -> True
+                    NameQual _ -> True
+                    _ -> False
+            forM_ poly_tcs $ \tc -> do
+              let name = tyConName tc
+              case lookupNameEnv cusk_decls name of
+                Just decl | any isNamedTyConBinder (tyConBinders tc) ->
+                  addDiagnosticAt (getSrcSpan name) (TcRnCusk tc
+                    (if cuskCanSuggest decl tc && sourceCuskKind dflags in_scope (tyConKind tc)
+                     then Just missing_extensions else Nothing))
+                _ -> pure ()
         ; traceTc "---- kcTyClGroup end ---- }" (ppr_tc_kinds poly_tcs)
-        ; return (poly_tcs, kindless_names) }
+        ; return (poly_tcs, kindless_names, metadata) }
   where
     ppr_tc_kinds tcs = vcat (map pp_tc tcs)
     pp_tc tc = ppr (tyConName tc) <+> dcolon <+> ppr (tyConKind tc)
+
+-- | Limit edits to declarations whose explicit kind can describe their arity.
+-- For example, adding @type F :: forall k. k@ to @type family F :: k@
+-- can change how many arguments the family must consume.
+cuskCanSuggest :: TyClDecl GhcRn -> TyCon -> Bool
+cuskCanSuggest DataDecl{} _ = True
+cuskCanSuggest FamDecl{tcdFam = FamilyDecl{fdInfo = ClosedTypeFamily{}}} tc =
+  any isVisibleTyConBinder (tyConBinders tc)
+cuskCanSuggest _ _ = False
+
+-- | Check the source forms supported by the CUSK warning's suggested edit.
+-- The warning prints the current kind for forms outside this subset.
+sourceCuskKind :: DynFlags -> (Name -> Bool) -> Kind -> Bool
+sourceCuskKind dflags in_scope kind =
+    not (any (`gopt` dflags) [Opt_PrintExplicitKinds, Opt_PrintExplicitMatchabilities,
+                            Opt_PrintExplicitRuntimeReps, Opt_PrintExpandedSynonyms]) &&
+    go kind
+  where
+    enabled ext = xopt ext dflags
+    ordinary ma = eqType ma unmatchableDataConTy ||
+      (not (enabled LangExt.Modifiers) && eqType ma matchableDataConTy)
+
+    go (TyVarTy _) = True
+    go (AppTy fun arg) = go fun && go arg
+    go (ForAllTy ma (Bndr tv _) body) =
+      isTyVar tv && ordinary ma && go (tyVarKind tv) && go body
+    go (FunTy af ma mult arg res) =
+      isFUNArg af && ordinary ma && isManyTy mult && go arg && go res
+    go ty@(TyConApp tc args)
+      | name == liftedTypeKindTyConName ||
+        (name == tYPETyConName && isLiftedTypeKind ty)
+      = enabled LangExt.StarIsType || in_scope liftedTypeKindTyConName
+      | name == listTyConName, enabled LangExt.ListTuplePuns = all go args
+      | otherwise = isTyConName name && in_scope name &&
+          (not (isSymOcc (nameOccName name)) || enabled LangExt.TypeOperators) &&
+          all isVisibleTyConBinder (take (length args) (tyConBinders tc)) && all go args
+      where name = tyConName tc
+    go _ = False
+
+{- Note [Checked RHSs for cases in type lets]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Check a lifted let RHS before checking the other declarations in its
+owning SCC. An inner helper can refer to an earlier helper. Use the
+renamed free names to check in dependency order and extend the local
+environment after each check. These dependencies point only from an
+inner let to an enclosing let. During kind checking, each row receives
+the checked RHS with its original metas. Instantiate only the
+explicit lexical captures. All rows can then constrain the same
+inferred kind. After the solver runs, reject any RHS variable
+outside that capture scope.
+
+During final checking, check the private synonyms first by the
+ordinary synonym rules. Make their returned RHSs available to the
+other declarations in this pass. This uses the checked synonyms
+directly without forcing the recursive type environment. The local
+environment is keyed by the generated Name. Nothing in this
+environment persists beyond the pass.
+-}
+
+-- | Check each lifted RHS once, with its enclosing let helpers in scope.
+-- See Note [Checked RHSs for cases in type lets].
+withCaseLets :: (LTyClDecl GhcRn -> TcM a) -> (a -> [(Name, TcTyThing)])
+             -> [LTyClDecl GhcRn] -> ([a] -> TcM b) -> TcM b
+withCaseLets check binding helpers body =
+  foldr extend (body . reverse) ordered []
+  where
+    edges = [DigraphNode h (tcdName decl) (nameSetElemsStable fvs)
+            | h@(L _ decl@SynDecl{tcdSExt = fvs}) <- helpers]
+    ordered = concatMap flattenSCC (stronglyConnCompFromEdgedVerticesUniq edges)
+    extend helper rest checked = do
+      rhs <- check helper
+      updLclCtxt (tcExtendLocalTypeEnv (binding rhs)) $
+        rest (rhs : checked)
+
+-- | Select the private RHS synonyms generated by the case lifter.
+isCaseLet :: LTyClDecl GhcRn -> Bool
+isCaseLet (L _ SynDecl{tcdLName = L _ name}) =
+  "$case-let-rhs:" `List.isPrefixOf` occNameString (nameOccName name)
+isCaseLet _ = False
+
+{- Note [Result kinds of dependent type cases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a private family generalizes before its owner, its kind inference
+can add a parameter that the source case does not bind. For example, a
+branch of kind TYPE r can make ordinary family inference add an
+invisible representation parameter. The owner's arrow can default that
+parameter to LiftedRep, independently of the captured r.
+
+Require the result kind to depend only on visible captures. A written
+case annotation supplies that kind, and the normal family checker
+checks each equation against it.
+-}
+-- | The private family for a case with a dependent forall capture.
+isDependentCaseFamily :: Name -> Bool
+isDependentCaseFamily name =
+  "$case:" `List.isPrefixOf` occ && "-forall" `List.isSuffixOf` occ
+  where occ = occNameString (nameOccName name)
+
+-- | An inferred parameter may be the kind of an explicit capture.
+-- The checked argument determines this kind at each helper application.
+determinedCaseLetBinder :: [TyConBinder] -> TyConBinder -> Bool
+determinedCaseLetBinder binders binder
+  | isVisibleTyConBinder binder = True
+  | isInferredTyConBinder binder =
+      any (\p -> isVisibleTyConBinder p &&
+                varType (binderVar p) `tcEqType` mkTyVarTy (binderVar binder)) binders
+  | otherwise = False
+
+-- | Keep the checked RHS in the owning kind-checking scope.
+-- See Note [Checked RHSs for cases in type lets].
+kcCaseLet :: LTyClDecl GhcRn -> TcM (SrcSpanAnnA, Name, [TyVar], TcType, TcKind)
+kcCaseLet (L _ SynDecl{tcdLName = L _ name, tcdRhs = source}) =
+  setSrcSpanA (getLoc source) $ do
+    tc <- tcLookupTcTyCon name
+    let kind = tyConResKind tc
+    rhs <- tcExtendNameTyVarEnv (tcTyConScopedTyVars tc) $
+             tcCheckLHsTypeInContext source (TheKind kind)
+    pure (getLoc source, name, binderVars (tyConBinders tc), rhs, kind)
+kcCaseLet _ = panic "kcCaseLet: not a synonym"
+
+{- Note [Inferred synonym matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An indexed family can occur below an ordinary type constructor. Do not
+default its omitted metadata while checking a synonym RHS. The result
+kind may be Type and need not mention any of the choices in the RHS.
+
+The initial kind check records each checked instantiation. First solve
+its ordinary constraints, including justified choices for opaque
+family applications. Add the remaining variables to the inferred
+TyCon prefix. The final synonym check consumes the same plan. It
+checks the resolved head and the number of arguments at each site.
+Explicit visible arguments still use the ordinary application checker.
+
+This inference currently applies to a synonym without a complete kind
+signature in a singleton SCC. A mutually dependent kind check would
+have to make its schemes available to other declarations before
+checking their uses. The closed-family index similarly requires a
+definition in the current declaration. An open family cannot inspect
+the equations in other modules before its kind is published.
+
+A nullary closed family with one bare-arrow equation can use the same
+index. The checked equation binds that index in its LHS. This lets
+`Kind` reduce to a matchable arrow in a kind and an unmatchable arrow in
+a term signature. Preserve any written matchability on the RHS.
+-}
+
+-- Checked application sites and their metadata, in application order.
+type SynonymMetadata = [(Name, [Type])]
+
+-- | Add the still-unconstrained RHS indices to the inferred prefix.
+-- See Note [Inferred synonym matchability] and
+-- Note [Inferred matchability for ordinary kind-arrow synonyms].
+inferArrowIndices :: NameEnv SynonymMetadata -> [LTyClDecl GhcRn]
+                  -> PolyTcTyCon -> TcM (PolyTcTyCon, Maybe SynonymMetadata)
+inferArrowIndices metadata decls tc
+  | isLiftedTypeKind (tyConResKind tc)
+  , not (any inferredMatchabilityIndex (tyConBinders tc))
+  , [SynDecl { tcdRhs = rhs }] <- [d | L _ d <- decls, tcdName d == tyConName tc]
+  , (tyConArity tc == 0 && null (tyConBinders tc) && legacyKindArrowTree rhs)
+    || pureKindArrowChain rhs
+  , can_share_legacy_index rhs (lookupNameEnv metadata (tyConName tc)) = do
+      unsat <- unsaturatedTypeFamiliesEnabled
+      mods  <- xoptM LangExt.Modifiers
+      if unsat || mods
+        then infer_default
+        else do
+          ma <- newFlexiTyVar matchabilityTy
+          pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
+  | otherwise = infer_default
+  where
+    can_share_legacy_index _ Nothing = True
+    can_share_legacy_index _ (Just []) = True
+    can_share_legacy_index rhs (Just [(head_tc, [_])]) =
+      app_head rhs == Just head_tc
+    can_share_legacy_index _ _ = False
+
+    app_head ty = case unLoc (ignoreParens ty) of
+      HsAppTy _ f _ -> app_head f
+      HsAppKindTy _ f _ -> app_head f
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> Just name
+      _ -> Nothing
+
+    infer_default
+      | Just raw <- lookupNameEnv metadata (tyConName tc), not (null raw) = do
+          choices <- traverse (\(name, tys) -> (name,) <$> liftZonkM (zonkTcTypes tys)) raw
+          let params = map (\v -> mkTyVar (getName v) matchabilityTy)
+                       $ nub [v | (_, tys) <- choices, ty <- tys, Just v <- [getTyVar_maybe ty]
+                                , isMetaTyVar v]
+              subst ty
+                | Just v <- getTyVar_maybe ty
+                , Just var <- lookupNameEnv (mkNameEnv [(getName a, a) | a <- params]) (getName v) =
+                    mkTyVarTy var
+                | otherwise = ty
+          pure (prefix params, Just [(name, map subst tys) | (name, tys) <- choices])
+      | isLiftedTypeKind (tyConResKind tc)
+      , not (any inferredMatchabilityIndex (tyConBinders tc))
+      , [FamDecl { tcdFam = FamilyDecl
+           { fdInfo = ClosedTypeFamily _ (Just eqns), fdInjectivityAnn = injectivity } }] <-
+          [d | L _ d <- decls, tcdName d == tyConName tc]
+      , not (null (tyConVisibleTyVars tc)) || (tyConArity tc == 0 && isSingleton eqns)
+      , isNothing injectivity ||
+          (isSingleton (tyConVisibleTyVars tc) &&
+           all (structuralKindResult (tyConName tc) . caseAliasBody . feqn_rhs . unLoc) eqns)
+      , any (matchabilityArrow . caseAliasBody . feqn_rhs . unLoc) eqns = do
+          ma <- newFlexiTyVar matchabilityTy
+          pure (prefix [mkTyVar (getName ma) matchabilityTy], Nothing)
+      | otherwise = pure (tc, Nothing)
+
+    prefix [] = tc
+    prefix indices = mkTcTyCon (tyConName tc)
+      (foldr (\v -> mkForAllTy unmatchableDataConTy (Bndr v Inferred)) (tyConKind tc) indices)
+      (mkNamedTyConBinders Inferred indices ++ tyConBinders tc)
+      0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc)
+
+-- | Recognize a quantifier-free synonym RHS over Type that contains at least
+-- one bare standard arrow (at the root or nested in a constructor application
+-- such as @TyFun (Type -> Type) (Maybe Type)@).
+-- See Note [Inferred matchability for ordinary kind-arrow synonyms].
+legacyKindArrowTree :: LHsType GhcRn -> Bool
+legacyKindArrowTree rhs =
+    let (has_arrow, has_star, ok) = go rhs
+    in ok && has_arrow && has_star
+  where
+    combine (a1, s1, ok1) (a2, s2, ok2) = (a1 || a2, s1 || s2, ok1 && ok2)
+    go ty
+      | L _ (HsFunTy _ arr domain result) <- ignoreParens ty
+      = case arr of
+          HsModifiedFunArr _ [] HsStandardArr{} ->
+            let (a1, s1, ok1) = go domain
+                (a2, s2, ok2) = go result
+            in (True || a1 || a2, s1 || s2, ok1 && ok2)
+          _ -> combine (go domain) (go result)
+      | otherwise = case unLoc (ignoreParens ty) of
+          HsStarTy{} -> (False, True, True)
+          HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) ->
+            (False, name == liftedTypeKindTyConName, True)
+          HsAppTy _ f a -> combine (go f) (go a)
+          HsAppKindTy _ f k -> combine (go f) (go k)
+          HsOpTy _ l _ r -> combine (go l) (go r)
+          HsTupleTy _ _ ts -> foldr (combine . go) (False, False, True) ts
+          HsListTy _ t -> go t
+          HsKindSig _ t k -> combine (go t) (go k)
+          HsForAllTy{} -> (False, False, False)
+          HsQualTy{} -> (False, False, False)
+          _ -> (False, False, True)
+
+-- | Recognize a parameterized synonym RHS consisting solely of bare standard
+-- arrows over type variables and Type, ending in Type (such as @a -> b -> Type@).
+pureKindArrowChain :: LHsType GhcRn -> Bool
+pureKindArrowChain rhs = matchabilityArrow rhs && go False rhs
+  where
+    go seen_arr ty
+      | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom res) <- ignoreParens ty
+      = leaf dom && go True res
+      | otherwise = seen_arr && end_star ty
+    leaf ty
+      | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom res) <- ignoreParens ty
+      = leaf dom && leaf res
+      | otherwise = case unLoc (ignoreParens ty) of
+          HsStarTy{} -> True
+          HsTyVar _ NotPromoted _ -> True
+          _ -> False
+    end_star ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> name == liftedTypeKindTyConName
+      _ -> False
+
+{- Note [Inferred matchability for ordinary kind-arrow synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In ordinary Haskell modules (where neither UnsaturatedTypeFamilies nor
+DependentTypes is enabled), programs often declare higher-order kind synonyms
+with bare arrows, such as:
+
+  type MTrans = (Type -> Type) -> (Type -> Type)
+  type TyFun a b = a -> b -> Type
+  type Pred = TyFun (Type -> Type) (Maybe Type)
+
+Proposal #242 defaults bare arrows on a synonym RHS to Unmatchable (U)
+when unsaturation is active. In an ordinary module, fixing MTrans or TyFun to U
+rejects standard class and datatype kind signatures such as
+`class LiftingMonad (trans :: MTrans)` and `class GLens (pred :: Pred)`.
+Conversely, fixing these synonyms unconditionally to Matchable (M) would reject
+an ordinary runtime function signature whose type is `Type -> Type`.
+
+Give an unannotated synonym whose RHS is a tree of bare arrows over Type one
+inferred Matchability binder, just as `inferArrowIndices` already does for a
+closed family equation. `tcCheckMatchabilitySynRhs` applies that binder to
+every bare arrow in the tree and forwards it to a single indexed head when
+present. Kind-level uses then select M and type-level uses select U. Modules
+that enable UnsaturatedTypeFamilies or DependentTypes retain Proposal #242's
+fixed U default on synonym RHSs.
+-}
+
+{- Note [Defunctionalization kind-arrow synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Defunctionalization libraries declare an empty data type and a parameterized
+synonym that pairs it with an arrow to Type:
+
+  data TyFun :: Type -> Type -> Type
+  type (~>) :: Type -> Type -> Type
+  type a ~> b = TyFun a b -> Type
+
+Unlike `type Exp a = a -> Type`, a standalone kind signature often fixes the
+kind of `(~>)` to `Type -> Type -> Type`. Adding an inferred Matchability
+binder to `(~>)` would violate that standalone kind signature, break injectivity
+of type families such as `type Demote (k1 ~> k2) = Demote k1 -> Demote k2`, and
+mismatch `TypeLevel` class heads (`instance SingKind (k1 ~> k2)`) against
+`KindLevel` indices (`SLambda :: (k1 ~> k2) -> Type`).
+
+Because `TyFun` is an empty algebraic data type with no runtime constructors,
+`TyFun a b -> Type` encodes a defunctionalized kind arrow rather than an
+inhabited runtime function type. When DataKinds is enabled and neither
+UnsaturatedTypeFamilies, DependentTypes, nor Modifiers is active,
+`isDefunKindSynRhs` recognizes a bare standard arrow chain to Type whose
+domains are headed by empty algebraic data types. `tcTySynRhs` checks those
+arrows as Matchable (M).
+-}
+
+-- | Test whether a synonym RHS is a defunctionalization kind arrow over an
+-- empty algebraic data type (such as @TyFun a b -> Type@).
+-- See Note [Defunctionalization kind-arrow synonyms].
+isDefunKindSynRhs :: LHsType GhcRn -> TcM Bool
+isDefunKindSynRhs rhs = do
+  unsat      <- unsaturatedTypeFamiliesEnabled
+  mods       <- xoptM LangExt.Modifiers
+  data_kinds <- xoptM LangExt.DataKinds
+  if unsat || mods || not data_kinds
+    then pure False
+    else check_chain False rhs
+  where
+    check_chain seen_arr ty
+      | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom res) <- ignoreParens ty
+      = do { ok_dom <- is_empty_data_app dom
+           ; if ok_dom
+             then check_chain True res
+             else pure False }
+      | otherwise
+      = pure (seen_arr && is_star ty)
+
+    is_star ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm)) -> nm == liftedTypeKindTyConName
+      _ -> False
+
+    app_head ty = case unLoc (ignoreParens ty) of
+      HsAppTy _ f _ -> app_head f
+      HsAppKindTy _ f _ -> app_head f
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm)) -> Just nm
+      _ -> Nothing
+
+    is_empty_data_app ty
+      | Just nm <- app_head ty
+      , isTyConName nm
+      = do { thing <- tcLookup nm
+           ; pure $ case thing of
+               AGlobal (ATyCon head_tc) ->
+                 isAlgTyCon head_tc
+                 && not (isNewTyCon head_tc)
+                 && not (isClassTyCon head_tc)
+                 && not (isTypeDataTyCon head_tc)
+                 && not (isDataFamInstTyCon head_tc)
+                 && not (isAbstractTyCon head_tc)
+                 && null (tyConDataCons head_tc)
+               _ -> False }
+      | otherwise = pure False
+
+-- | Select results whose constructor shape is independent of matchability.
+-- See Note [Inferred injective kind family results].
+structuralKindResult :: Name -> LHsType GhcRn -> Bool
+structuralKindResult owner rhs
+  | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) domain result) <- ignoreParens rhs
+  = operand domain && operand result
+  | otherwise = liftedType rhs
+  where
+    operand ty
+      | L _ (HsAppTy _ f arg) <- ignoreParens ty
+      , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ name))) <- ignoreParens f
+      , L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ var))) <- ignoreParens arg
+      = name == owner && isTyVarName var
+      | otherwise = liftedType ty
+
+    liftedType ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> name == liftedTypeKindTyConName
+      _ -> False
+
+{- Note [Inferred injective kind family results]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An injective closed family can use arrow matchability to distinguish
+equations. For example:
+
+  Select False = Bool -> Bool
+  Select True  = Bool %M -> Bool
+
+The first ordinary RHS has U. Adding an index would let that branch
+also return M and violate the written injectivity.
+
+Infer an index only for Type leaves and bare arrows whose operands
+are Type or recursive applications to pattern variables. Type is
+apart from every arrow. Every produced arrow uses the same index at
+its root, so changing the index preserves the structural distinctions
+between results. A caller's kind or type can then constrain that
+index. The ordinary injectivity checker still verifies the variables
+named by the user. No annotation names the new index.
+-}
+
+{- Note [Matchability schemes for open families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An open family's arity is fixed before its instances are checked. If a
+local declaration uses it as a kind, an inferred index lets a later
+instance interpret a written bare arrow both as an ordinary function
+type and as a kind for an applicable type constructor.
+
+The declaration pass collects the resolved family heads before checking
+the SCCs. This lets a later declaration select a scheme for an earlier
+family. Also inspect bare arrows in the owner's type instances, as for
+closed family equations. A later declaration group can then use the
+exported result as a kind. An importer cannot change a family's arity.
+An owner can declare the index in a standalone signature when its
+declarations provide neither use. Preserve explicit signatures and
+injectivity annotations.
+
+An equation can return an application of the same family that appears in
+its result kind. For example:
+  type family DX (a :: k) :: D k
+  type instance DX (a :: Type) = D a
+Suppose D has an inferred matchability argument and D Type reduces to Type.
+The argument to D a controls the returned type. The argument to D k
+controls its kind. Give DX a separate result selector so its equation
+can return D @{m} a at kind D @{n} Type. A caller can use a two-argument
+constructor at matchable arrows or a runtime callback at unmatchable arrows.
+Using one selector for both positions wrongly equates them at a rigid k.
+-}
+
+-- | Uses that can establish a result selector before checking instances.
+data OpenFamilyCandidates = OpenFamilyCandidates
+  { arrow_candidates :: NameSet
+  , result_aliases :: NameEnv Name
+  , explicit_from_natural :: Maybe NameSet
+  }
+
+-- | Collect local family heads that need an inferred result selector.
+-- Imported families keep the scheme that their owner has published.
+openFamilyMatchabilityCandidates :: [TyClGroup GhcRn] -> OpenFamilyCandidates
+openFamilyMatchabilityCandidates groups =
+  OpenFamilyCandidates
+    (intersectNameSet local_open_families (referenced_families `unionNameSet` arrow_equations))
+    (mkNameEnv [(family, head_name) | (family, rhs) <- equations_rhs,
+                 Just head_name <- [lookupNameEnv result_heads family],
+                 kindHead rhs == Just head_name])
+    explicit_from_nat
+  where
+    all_equations = concatMap groupEquations groups
+    nullary_syns = mkNameEnv
+      [ (name, target)
+      | tg <- groups
+      , L _ SynDecl{tcdLName = L _ name, tcdTyVars = HsQTvs{hsq_explicit = []}, tcdRhs = rhs} <- group_tyclds tg
+      , Just target <- [kindHead rhs] ]
+    resolve_syn :: Int -> Name -> Name
+    resolve_syn 0 n = n
+    resolve_syn k n = case lookupNameEnv nullary_syns n of
+      Just next | next /= n -> resolve_syn (k - 1) next
+      _ -> n
+    explicit_from_nat = fmap unionNameSets $ sequence
+      [ case [pat | HsValArg _ pat <- pats] of
+          pat1 : _ | Just tc_name <- kindHead pat1, isTyConName tc_name ->
+            Just (mkNameSet [tc_name, resolve_syn 8 tc_name])
+          _ -> Nothing
+      | FamEqn{feqn_tycon = L _ family, feqn_pats = pats} <- all_equations
+      , nameOccName family == mkTcOcc "FromNatural"
+      , nameModule_maybe family == Just gHC_INTERNAL_TYPENATS ]
+    declarations = [fam | tg <- groups, L _ decl <- group_tyclds tg, fam <- families decl]
+    local_open_families = mkNameSet
+      [unLoc name | FamilyDecl{fdInfo = OpenTypeFamily{}, fdLName = name,
+                                fdInjectivityAnn = Nothing} <- declarations]
+    referenced_families = mkNameSet
+      [name | fam <- declarations, kind <- declaredKinds fam, Just name <- [kindHead kind]]
+
+    equations_rhs = [(family, caseAliasBody rhs) | group <- groups,
+                      FamEqn{feqn_tycon = L _ family, feqn_rhs = rhs} <- groupEquations group]
+    arrow_equations = mkNameSet [family | (family, rhs) <- equations_rhs, matchabilityArrow rhs]
+    result_heads = mkNameEnv [(name, head_name) | FamilyDecl{fdLName = L _ name,
+                                fdResultSig = L _ result} <- declarations,
+                              name `elemNameSet` local_open_families,
+                              Just kind <- [famResultKindSignature result], Just head_name <- [kindHead kind]]
+
+    groupEquations :: TyClGroup GhcRn -> [TyFamInstEqn GhcRn]
+    groupEquations group =
+      concatMap (equations . unLoc) (group_instds group) ++
+      concat [associated nested | L _ ClassDecl{tcdCExt = (nested, _)} <- group_tyclds group]
+
+    equations :: InstDecl GhcRn -> [TyFamInstEqn GhcRn]
+    equations (TyFamInstD{tfid_inst = inst}) = [tfid_eqn inst]
+    equations (ClsInstD{cid_inst = ClsInstDecl{cid_ext = (_, nested)}}) = associated nested
+    equations _ = []
+
+    associated :: HsNestedGroup GhcRn -> [TyFamInstEqn GhcRn]
+    associated nested = map (tfid_eqn . unLoc) (ng_tyfam_insts nested)
+
+    families (FamDecl{tcdFam = f}) = [f]
+    families (ClassDecl{tcdCExt = (HsNestedGroup{ng_ats = ats}, _)}) = map unLoc ats
+    families _ = []
+
+    declaredKinds FamilyDecl{fdTyVars = HsQTvs{hsq_explicit = args},
+                             fdResultSig = L _ result} =
+      [kind | L _ HsTvb{tvb_kind = HsBndrKind _ kind} <- args] ++
+      maybeToList (famResultKindSignature result)
+
+    kindHead kind = case unLoc (ignoreParens kind) of
+      HsAppTy _ f _ -> kindHead f
+      HsAppKindTy _ f _ -> kindHead f
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> Just name
+      _ -> Nothing
+
+-- | The inferred indices have closed kinds. Keep them ahead of the
+-- other inferred binders so equations can instantiate the checked prefix.
+prefixFamilyMetadata :: PolyTcTyCon -> PolyTcTyCon
+prefixFamilyMetadata tc
+  | OpenFamilyFlavour _ _ <- tyConFlavour tc
+  , (indices@(_:_), rest) <- partition inferredMatchabilityIndex (tyConBinders tc)
+  = let binders = indices ++ rest
+        ma = tyConFlavourMatchability (tyConFlavour tc)
+    in mkTcTyCon (tyConName tc) (mkTyConKindWithMatchability ma binders (tyConResKind tc))
+         binders 0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc)
+  | otherwise = tc
+
+-- | Install one inferred index when the local family will be used as a kind.
+inferOpenMatchability :: OpenFamilyCandidates -> KindSigEnv -> PolyTcTyCon -> TcM PolyTcTyCon
+inferOpenMatchability candidates signatures tc
+  | not (tyConName tc `elemNameEnv` signatures)
+  , OpenFamilyFlavour IAmType _ <- tyConFlavour tc
+  , needs_result_selector
+  , not (null (tyConVisibleTyVars tc))
+  , not (any reserves_matchability (tyConBinders tc)) = do
+      ma <- newFlexiTyVar matchabilityTy
+      let index = mkTyVar (getName ma) matchabilityTy
+      pure (mkTcTyCon (tyConName tc)
+              (mkForAllTy unmatchableDataConTy (Bndr index Inferred) (tyConKind tc))
+              (mkNamedTyConBinders Inferred [index] ++ tyConBinders tc)
+              0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc))
+  | otherwise = pure tc
+  where
+    needs_result_selector
+      | tyConResKind tc `eqType` liftedTypeKind =
+          tyConName tc `elemNameSet` arrow_candidates candidates
+      | Just name <- lookupNameEnv (result_aliases candidates) (tyConName tc)
+      , Just (owner, _) <- tcSplitTyConApp_maybe (tyConResKind tc)
+      , isTypeFamilyTyCon owner
+      , tyConName owner == name
+      , b : _ <- tyConBinders owner =
+          inferredMatchabilityIndex b && not (familyKindUsesMatchability owner b)
+      | otherwise = False
+
+    -- A receiver index used in its telescope is independent of the selector
+    -- for the result arrow. Explicit metadata takes precedence.
+    reserves_matchability b =
+      tyVarKind (binderVar b) `eqType` matchabilityTy &&
+      not (inferredMatchabilityIndex b && familyKindUsesMatchability tc b)
 
 type ScopedPairs = [(Name, TcTyVar)]
   -- The ScopedPairs for a TcTyCon are precisely
@@ -1389,6 +2112,8 @@ swizzleTcTyConBndrs tc_infos
 
     swizzleMapper :: TyCoMapper StrictIdentity
     swizzleMapper = TyCoMapper { tcm_tyvar = swizzle_tv
+                               , tcm_termvar = \v -> pprPanic "swizzleMapper: native term index not implemented" (ppr v)
+                               , tcm_termbinder = \v _ -> pprPanic "swizzleMapper: native dependent binder not implemented" (ppr v)
                                , tcm_covar = swizzle_cv
                                , tcm_hole  = swizzle_hole
                                , tcm_tycobinder = swizzle_bndr
@@ -1445,13 +2170,34 @@ generaliseTcTyCon (tc, tc_kind, skol_info, scoped_prs, tc_res_kind)
                  --     Maintain the L-R order of scoped_tvs
 
        -- Step 2a: find all the Inferred variables we want to quantify over
-       ; dvs1 <- candidateQTyVarsOfKinds $
-                 (tc_res_kind : map tyVarKind spec_req_tvs)
+       ; let arg_kinds = map tyVarKind spec_req_tvs
+       ; dvs1 <- candidateQTyVarsOfKinds (tc_res_kind : arg_kinds)
+       ; generalise_callbacks <- generaliseSynonymCallbackArrows
        ; let dvs2 = dvs1 `delCandidates` spec_req_tvs
+             callback_indices
+               | generalise_callbacks, TypeSynonymFlavour <- tyConFlavour tc
+               = [tv | tv <- tyCoVarsOfTypesList arg_kinds
+                     , tv `elemVarSet` candidateKindVars dvs2
+                     , tyVarKind tv `eqType` matchabilityTy
+                     , any (synonymCallbackIndex tv) arg_kinds]
+               | otherwise = []
 
        -- Step 2b: quantify, mainly meaning skolemise the free variables
        -- Returned 'inferred' are scope-sorted and skolemised
-       ; inferred <- quantifyTyVars skol_info DefaultNonStandardTyVars dvs2
+       -- See Note [Callback arrows in inferred synonym kinds].
+       ; inferred_indices <- liftZonkM $
+           mapM (skolemiseQuantifiedTyVar skol_info) callback_indices
+       ; quantified <- quantifyTyVars skol_info DefaultNonStandardTyVars
+                         (dvs2 `delCandidates` callback_indices)
+       -- Matchability has a closed kind, so its inferred binders have no
+       -- predecessors. Keep them together for tcInferredMatchabilityFamPats.
+       -- The relative order of other inferred binders and of all written
+       -- binders stays the same.
+       ; let inferred = case tyConFlavour tc of
+               ClosedTypeFamilyFlavour ->
+                 let (metadata, others) = partition ((`eqType` matchabilityTy) . tyVarKind) quantified
+                 in metadata ++ others
+               _ -> inferred_indices ++ quantified
 
        ; traceTc "generaliseTcTyCon: pre zonk"
            (vcat [ text "tycon =" <+> ppr tc
@@ -1490,6 +2236,7 @@ generaliseTcTyCon (tc, tc_kind, skol_info, scoped_prs, tc_res_kind)
 
              user_kind =
                generaliseTcTyConKind
+                 (tyConFlavourMatchability flav)
                  inferred sorted_spec_tvs required_tcbs
                  tc_kind
 
@@ -1525,16 +2272,17 @@ generaliseTcTyCon (tc, tc_kind, skol_info, scoped_prs, tc_res_kind)
 -- | Generalise the kind of a 'TyCon', by inserting the appropriate
 -- inferred/specified/required foralls.
 generaliseTcTyConKind
-  :: [TcTyCoVar]   -- ^ inferred binders
+  :: Matchability -- ^ generated declaration-prefix quantifiers
+  -> [TcTyCoVar]   -- ^ inferred binders
   -> [TcTyCoVar]   -- ^ specified binders
   -> [TyConBinder] -- ^ required binders
   -> TcKind        -- ^ pre-generalisation monomorphic 'TyCon' kind
   -> TcKind
-generaliseTcTyConKind inferred_tvs sorted_spec_tvs req_bndrs0 ki0 =
+generaliseTcTyConKind ma inferred_tvs sorted_spec_tvs req_bndrs0 ki0 =
   mkForAllTys
-    ( mkForAllTyBinders Inferred inferred_tvs
+    ( map (ma,) (mkForAllTyBinders Inferred inferred_tvs)
         ++
-      mkForAllTyBinders Specified sorted_spec_tvs
+      map (ma,) (mkForAllTyBinders Specified sorted_spec_tvs)
     ) $ mk_req_foralls req_bndrs0 ki0
   where
 
@@ -1550,13 +2298,13 @@ generaliseTcTyConKind inferred_tvs sorted_spec_tvs req_bndrs0 ki0 =
       = ty
     mk_req_foralls (Bndr tv vis:bndrs) ty =
       case ty of
-        FunTy af w arg res ->
+        FunTy af ma w arg res ->
           case vis of
             NamedTCB ftf ->
-              mkForAllTy (Bndr tv ftf) $ mk_req_foralls bndrs res
-            _ -> mkFunTy af w arg $ mk_req_foralls bndrs res
-        ForAllTy bndr' ty' ->
-          mkForAllTy bndr' $ mk_req_foralls bndrs ty'
+              mkForAllTy ma (Bndr tv ftf) $ mk_req_foralls bndrs res
+            _ -> mkFunTy af ma w arg $ mk_req_foralls bndrs res
+        ForAllTy ma' bndr' ty' ->
+          mkForAllTy ma' bndr' $ mk_req_foralls bndrs ty'
         _ ->
           pprPanic "generaliseTcTyConKind" $
             vcat [ text "ki:" <+> ppr ki0
@@ -2020,17 +2768,21 @@ get_fam_decl_initial_kind mb_parent_tycon
                , fdTyVars    = ktvs
                , fdResultSig = L _ resultSig
                , fdInfo      = info }
-  = kcDeclHeader InitialKindInfer name flav ktvs $
+  = kc_header $
     case resultSig of
-      KindSig _ ki                          -> TheKind <$> tcLHsKindSig ctxt ki
+      KindSig _ ki                          -> TheKind <$> tcLHsFamilyResultKindSig ctxt ki
       TyVarSig _ (L _ tvb) | HsTvb { tvb_kind = HsBndrKind _ ki } <- tvb
-                                            -> TheKind <$> tcLHsKindSig ctxt ki
+                                            -> TheKind <$> tcLHsFamilyResultKindSig ctxt ki
       _ -- open type families have * return kind by default
         | tcFlavourIsOpen flav              -> return (TheKind liftedTypeKind)
                -- closed type families have their return kind inferred
                -- by default
         | otherwise                         -> return AnyKind
   where
+    kc_header = case info of
+      -- See Note [Provisional kinds of sum payloads].
+      ClosedTypeFamily (_, Just (_, True)) _ -> kcInferSumPayloadHeader name ktvs
+      _ -> kcDeclHeader InitialKindInfer name flav ktvs
     flav = familyInfoTyConFlavour mb_parent_tycon info
     ctxt = TyFamResKindCtxt name
 
@@ -2136,18 +2888,80 @@ However, there are two twists:
 
 -}
 
+{- Note [Callback arrows in inferred synonym kinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider `type S f = (f Bool, D (Type %U -> Type) f)`, where D's
+second argument has the kind given by its first argument. Checking
+`f Bool` needs an arrow shape before the enclosing kind solver can
+use the second occurrence of `f` to fix its matchability.
+
+Give the missing arrow a matchability variable. Register it with the
+enclosing kind solver, which solves the constraints on the inferred
+binder kinds and defaults an unresolved kind arrow to M. The nested
+synonym solver still handles RHS metadata separately. An arrow whose
+shape is already known needs no variable. Rechecking the RHS uses the
+inferred kind, including the selected matchability.
+
+When DependentTypes enables unsaturation, `type Apply f a = f a`
+can accept either a constructor or a type family. Proposal #242 generalises
+an unresolved matchability in an inferred higher-order argument kind.
+LiberalTypeSynonyms already does this for calls that become saturated after
+expansion. Preserve that behavior when unsaturation is disabled.
+Use the same flag check when collecting defaults and generalising binders.
+These indices have the closed kind Matchability, independent of
+PolyKinds. Quantify them before the other inferred kind variables.
+At a use site, kind-check the argument against the instantiated kind.
+Keep the existing M default when both flags are off. Written kind
+signatures and TypeLevel defaults keep their own rules.
+-}
+
+-- | Enable inference of a synonym's higher-order argument matchability.
+generaliseSynonymCallbackArrows :: TcM Bool
+generaliseSynonymCallbackArrows =
+  unsaturatedTypeFamiliesEnabled <||> xoptM LangExt.LiberalTypeSynonyms
+
 ------------------------------------------------------------------------
-kcLTyClDecl :: LTyClDecl GhcRn -> TcM ()
+kcLTyClDecl :: Bool -> LTyClDecl GhcRn -> TcM (Maybe (Name, SynonymMetadata))
   -- See Note [Kind checking for type and class decls]
   -- Called only for declarations without a signature (no CUSKs or SAKs here)
-kcLTyClDecl (L loc decl)
+kcLTyClDecl collect_metadata (L loc decl)
   = setSrcSpanA loc $
     do { tycon <- tcLookupTcTyCon tc_name   -- Always a MonoTcTyCon
        ; traceTc "kcTyClDecl {" (ppr tc_name)
-       ; addVDQNote tycon $   -- See Note [Inferring visible dependent quantification]
+       ; metadata <- addVDQNote tycon $   -- See Note [Inferring visible dependent quantification]
          addErrCtxt (tcMkDeclCtxt decl) $
-         kcTyClDecl decl tycon
-       ; traceTc "kcTyClDecl done }" (ppr tc_name) }
+         case decl of
+           SynDecl{tcdRhs = rhs} | collect_metadata -> do
+             is_defun <- isDefunKindSynRhs rhs
+             if is_defun
+               then kcTyClDecl decl tycon >> pure Nothing
+               else tcExtendNameTyVarEnv (tcTyConScopedTyVars tycon) $ do
+                 outer_owner <- tcl_kind_arrow_defaults <$> getLclEnv
+                 generalise_callbacks <- generaliseSynonymCallbackArrows
+                 -- See Note [Callback arrows in inferred synonym kinds]
+                 let callback_arrow = fmap (\(defaults, _) level -> do
+                       ma <- newFlexiTyVar matchabilityTy
+                       unless (generalise_callbacks && level == KindLevel) $
+                         updTcRef defaults ((ma, level) :)
+                       pure (mkTyVarTy ma)) outer_owner
+                 inferSynonymMatchabilities $ do
+                   ref <- newTcRef []
+                   let choose name callbacks = do
+                         indices <- mapM (const (newFlexiTyVar matchabilityTy)) callbacks
+                         owner <- tcl_kind_arrow_defaults <$> getLclEnv
+                         forM_ (zip callbacks indices) $ \(callback, ma) -> do
+                           let (default_owner, level)
+                                 | callback && not generalise_callbacks = (outer_owner, KindLevel)
+                                 | otherwise = (owner, TypeLevel)
+                           forM_ default_owner $ \(defaults, _) -> updTcRef defaults ((ma, level) :)
+                         let vars = mkTyVarTys indices
+                         updTcRef ref ((name, vars) :)
+                         pure vars
+                   _ <- tcCheckSynonymMetadata Nothing choose callback_arrow rhs (tyConResKind tycon)
+                   Just . (tc_name,) . reverse <$> readTcRef ref
+           _ -> kcTyClDecl decl tycon >> pure Nothing
+       ; traceTc "kcTyClDecl done }" (ppr tc_name)
+       ; return metadata }
   where
     tc_name = tcdName decl
 
@@ -2173,7 +2987,13 @@ kcTyClDecl (DataDecl { tcdLName    = (L _ _name)
        -- (conceivably) shadowed.
     do { traceTc "kcTyClDecl" (ppr tycon $$ ppr (tyConTyVars tycon) $$ ppr (tyConResKind tycon))
        ; _ <- tcHsContext ctxt
-       ; kcConDecls (tyConResKind tycon) cons
+       ; enabled <- unsaturatedTypeFamiliesEnabled
+       ; poly_kinds <- xoptM LangExt.PolyKinds
+       ; let check_field
+               | enabled && poly_kinds =
+                   tcCheckDatatypeField (mkNameSet (map fst (tcTyConScopedTyVars tycon)))
+               | otherwise = tcCheckLHsTypeInContext
+       ; kcConDeclsWith check_field (tyConResKind tycon) cons
        }
 
 kcTyClDecl (SynDecl { tcdLName = L _ _name, tcdRhs = rhs }) tycon
@@ -2205,23 +3025,26 @@ kcTyClDecl (FamDecl _ (FamilyDecl { fdInfo   = fd_info })) fam_tc
 -- This includes doing kind unification if the type is a newtype.
 -- See Note [Implementation of UnliftedNewtypes] for why we need
 -- the first two arguments.
-kcConArgTys :: ConArgKind                      -- Expected kind of the argument(s)
+kcConArgTys :: (LHsType GhcRn -> ContextKind -> TcM TcType)
+            -> ConArgKind                      -- Expected kind of the argument(s)
+            -> IsPrefixConGADT
             -> [HsConDeclField GhcRn]          -- User-written argument types
             -> TcM ()
-kcConArgTys exp_kind arg_tys
+kcConArgTys check_field exp_kind con_form arg_tys
   = forM_ arg_tys $ \(CDF { cdf_multiplicity, cdf_type }) ->
-    do { _ <- tcCheckLHsTypeInContext cdf_type exp_kind
-       ; void $ tcMult cdf_multiplicity }
+    do { _ <- check_field cdf_type exp_kind
+       ; void $ tcFieldModifiers con_form cdf_multiplicity }
     -- See Note [Implementation of UnliftedNewtypes], STEP 2
 
 -- Kind-check the types of arguments to a Haskell98 data constructor.
-kcConH98Args :: ConArgKind                       -- Expected kind of the argument(s)
+kcConH98Args :: (LHsType GhcRn -> ContextKind -> TcM TcType)
+             -> ConArgKind                       -- Expected kind of the argument(s)
              -> HsConDeclH98Details GhcRn
              -> TcM ()
-kcConH98Args exp_kind con_args = case con_args of
-  PrefixCon _ tys     -> kcConArgTys exp_kind tys
-  InfixCon _ ty1 ty2  -> kcConArgTys exp_kind [ty1, ty2]
-  RecCon _ (L _ flds) -> kcConArgTys exp_kind $
+kcConH98Args check_field exp_kind con_args = case con_args of
+  PrefixCon _ tys     -> kcConArgTys check_field exp_kind IsNotPrefixConGADT tys
+  InfixCon _ ty1 ty2  -> kcConArgTys check_field exp_kind IsNotPrefixConGADT [ty1, ty2]
+  RecCon _ (L _ flds) -> kcConArgTys check_field exp_kind IsNotPrefixConGADT $
                          map (cdrf_spec . unLoc) flds
 
 -- Kind-check the types of arguments to a GADT data constructor.
@@ -2229,16 +3052,20 @@ kcConGADTArgs :: ConArgKind                       -- Expected kind of the argume
               -> HsConDeclGADTDetails GhcRn
               -> TcM ()
 kcConGADTArgs exp_kind con_args = case con_args of
-  PrefixConGADT _ tys     -> kcConArgTys exp_kind tys
-  RecConGADT _ (L _ flds) -> kcConArgTys exp_kind $
+  PrefixConGADT _ tys     -> kcConArgTys tcCheckLHsTypeInContext exp_kind IsPrefixConGADT tys
+  RecConGADT _ (L _ flds) -> kcConArgTys tcCheckLHsTypeInContext exp_kind IsNotPrefixConGADT $
                              map (cdrf_spec . unLoc) flds
 
 kcConDecls :: TcKind  -- Result kind of tycon
                       -- Used only in H98 case
            -> DataDefnCons (LConDecl GhcRn) -> TcM ()
 -- See Note [kcConDecls: kind-checking data type decls]
-kcConDecls tc_res_kind cons
-  = traverse_ (wrapLocMA_ (kcConDecl new_or_data tc_res_kind)) cons
+kcConDecls = kcConDeclsWith tcCheckLHsTypeInContext
+
+kcConDeclsWith :: (LHsType GhcRn -> ContextKind -> TcM TcType)
+               -> TcKind -> DataDefnCons (LConDecl GhcRn) -> TcM ()
+kcConDeclsWith check_field tc_res_kind cons
+  = traverse_ (wrapLocMA_ (kcConDecl check_field new_or_data tc_res_kind)) cons
   where
     new_or_data = dataDefnConsNewOrData cons
 
@@ -2247,40 +3074,72 @@ kcConDecls tc_res_kind cons
 -- declared with data or newtype, and we need to know the result kind of
 -- this type. See Note [Implementation of UnliftedNewtypes] for why
 -- we need the first two arguments.
-kcConDecl :: NewOrData -> TcKind -> ConDecl GhcRn -> TcM ()
-kcConDecl new_or_data tc_res_kind
-          (ConDeclH98 { con_name = name, con_ex_tvs = ex_tvs
-                      , con_mb_cxt = ex_ctxt, con_args = args })
+kcConDecl :: (LHsType GhcRn -> ContextKind -> TcM TcType)
+          -> NewOrData -> TcKind -> ConDecl GhcRn -> TcM ()
+kcConDecl _ _ _ (ConDeclH98 { con_name = name, con_ext = Just sig })
   = addErrCtxt (DataConDefCtxt (NE.singleton name)) $
-    discardResult                   $
-    bindExplicitTKBndrs_Tv ex_tvs $
-    do { _ <- tcHsContext ex_ctxt
-       ; let arg_exp_kind = getArgExpKind new_or_data tc_res_kind
+    void (tcCheckRetainedConType False False (tcDataConMult IsNotPrefixConGADT) sig)
+
+kcConDecl check_field new_or_data tc_res_kind
+          (ConDeclH98 { con_name = name, con_telescope = teles
+                      , con_args = args })
+  = addErrCtxt (DataConDefCtxt (NE.singleton name)) $
+    kcRuntimeConTelescope teles $
+    do { let arg_exp_kind = getArgExpKind new_or_data tc_res_kind
              -- getArgExpKind: for newtypes, check that the argument kind
              -- is the same as the tc_res_kind.  See (KCD1)
              -- in Note [kcConDecls: kind-checking data type decls]
-       ; kcConH98Args arg_exp_kind args
+       ; kcConH98Args check_field arg_exp_kind args
          -- We don't need to check the telescope here,
          -- because that's done in tcConDecl
        }
 
-kcConDecl new_or_data _tc_res_kind
+kcConDecl _ new_or_data _
+          (ConDeclGADT { con_names = names
+                       , con_outer_bndrs = L _ outer_bndrs
+                       , con_telescope = inner_bndrs
+                       , con_g_args = args
+                       , con_res_ty = res_ty })
+  | hsHasForEachTy (unLoc res_ty)
+  = addErrCtxt (DataConDefCtxt names) $
+    kcRuntimeGadtConBndrs outer_bndrs inner_bndrs $
+    do { checkRetainedConShape new_or_data inner_bndrs args res_ty
+       ; case args of
+           PrefixConGADT _ _ -> do
+             { _ <- kcConGADTArgs (TheKind liftedTypeKind) args
+             ; _ <- tcCheckRetainedConType False
+                      (retainedResultAllowed outer_bndrs inner_bndrs args)
+                      (tcDataConMult IsPrefixConGADT) res_ty
+             ; return () }
+           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration }
+
+kcConDecl _ new_or_data _tc_res_kind
                       -- NB: _tc_res_kind is unused.   See (KCD3) in
                       -- Note [kcConDecls: kind-checking data type decls]
           (ConDeclGADT { con_names = names
                        , con_outer_bndrs = L _ outer_bndrs
-                       , con_inner_bndrs = inner_bndrs
-                       , con_cxts = cxts
+                       , con_telescope = inner_bndrs
                        , con_g_args = args
                        , con_res_ty = res_ty })
   = -- See Note [kcConDecls: kind-checking data type decls]
     addErrCtxt (DataConDefCtxt names) $
     -- Not sure this is right, should just extend rather than skolemise but no test
-    bind_con_tvbs outer_bndrs inner_bndrs $
-    do { _ <- tcHsContext cxts
-       ; traceTc "kcConDecl:GADT {" (ppr names $$ ppr res_ty)
+    kcRuntimeGadtConBndrs outer_bndrs inner_bndrs $
+    do { traceTc "kcConDecl:GADT {" (ppr names $$ ppr res_ty)
        ; con_res_kind <- newOpenTypeKind
-       ; _ <- tcCheckLHsTypeInContext res_ty (TheKind con_res_kind)
+       ; case HsDecls.splitGadtTerminal args res_ty of
+           Nothing
+             | Just (groups, result) <- HsDecls.splitGadtInterior args res_ty ->
+               let check_group (Left group) rest = kcRuntimeConTelescope [group] rest
+                   check_group (Right field) rest =
+                     do { discardResult $ tcConArg (getArgExpKind new_or_data con_res_kind) IsPrefixConGADT field
+                        ; rest }
+               in foldr check_group
+                    (discardResult $ tcCheckLHsTypeInContext result (TheKind con_res_kind)) groups
+             | otherwise -> discardResult $ tcCheckLHsTypeInContext res_ty (TheKind con_res_kind)
+           Just (nodes, _, result) ->
+             kcRuntimeConTelescope nodes $
+             discardResult $ tcCheckLHsTypeInContext result (TheKind con_res_kind)
 
        ; let arg_exp_kind = getArgExpKind new_or_data con_res_kind
              -- getArgExpKind: for newtypes, check that the argument kind
@@ -2290,12 +3149,31 @@ kcConDecl new_or_data _tc_res_kind
 
        ; traceTc "kcConDecl:GADT }" (ppr names $$ ppr arg_exp_kind)
        ; return () }
-  where
-    bind_con_tvbs outer_bndrs inner_bndrs thing_inside
-      -- Why "_Tv"? See Note [Using TyVarTvs for kind-checking GADTs]
-      = discardResult $ bindOuterSigTKBndrs_Tv outer_bndrs $
-                        bindExplicitTKBndrs_Tv (gadtTelescopeBndrs inner_bndrs) $
-                        thing_inside
+
+-- | Keep constructor contexts and annotations in their lexical scopes.
+kcRuntimeGadtConBndrs :: HsOuterSigTyVarBndrs GhcRn
+                     -> [LHsGadtTelescope GhcRn] -> TcM () -> TcM ()
+kcRuntimeGadtConBndrs outer inner inside =
+  do { tcCheckRuntimeForAllMatchability (hsOuterMatchability outer)
+     ; discardResult $ bindOuterSigTKBndrs_Tv outer $
+         kcRuntimeConTelescope inner inside }
+
+-- | Infer a constructor prefix in source order.
+-- See Note [Constructor telescope contexts] in GHC.Hs.Decls.
+kcRuntimeConTelescope :: [LHsGadtTelescope GhcRn] -> TcM () -> TcM ()
+kcRuntimeConTelescope [] action = action
+kcRuntimeConTelescope (L _ HsGadtPar{} : rest) action =
+  kcRuntimeConTelescope rest action
+kcRuntimeConTelescope (L _ (HsGadtContext ctxt) : rest) action =
+  do { _ <- tcHsContext (Just ctxt)
+     ; kcRuntimeConTelescope rest action }
+kcRuntimeConTelescope (L _ (HsGadtForAll _ tele) : rest) action =
+  do { tcCheckRuntimeForAllMatchability (hsf_matchability tele)
+     ; case tele of
+         HsForAllInvis{hsf_invis_bndrs = bndrs} ->
+           discardResult $ bindExplicitTKBndrs_Tv bndrs (kcRuntimeConTelescope rest action)
+         HsForAllVis{hsf_vis_bndrs = bndrs} ->
+           discardResult $ bindExplicitTKBndrs_Tv bndrs (kcRuntimeConTelescope rest action) }
 
 {- Note [kcConDecls: kind-checking data type decls]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2988,8 +3866,8 @@ The IRs are already well-equipped to handle unlifted types, and unlifted
 datatypes are just a new sub-class thereof.
 -}
 
-tcTyClDecl :: RolesInfo -> LTyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
-tcTyClDecl roles_info (L loc decl)
+tcTyClDecl :: NameEnv (CoAxiom Branched) -> KindSigEnv -> NameEnv SynonymMetadata -> RolesInfo -> LTyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
+tcTyClDecl case_axioms domain_env metadata roles_info (L loc decl)
   | Just thing <- wiredInNameTyThing_maybe (tcdName decl)
   = case thing of -- See Note [Declarations for wired-in things]
       ATyCon tc -> return ((tc, []), wiredInDerivInfo tc decl)
@@ -2998,7 +3876,11 @@ tcTyClDecl roles_info (L loc decl)
   | otherwise
   = setSrcSpanA loc $ tcAddDeclCtxt decl $
     do { traceTc "---- tcTyClDecl ---- {" (ppr decl)
-       ; (tc_vi@(tc, _), deriv_infos) <- tcTyClDecl1 Nothing roles_info decl
+       ; (tc_vi@(tc, _), deriv_infos) <-
+           tcTyClDecl1 case_axioms
+             (lookupNameEnv domain_env (tcdName decl))
+             (lookupNameEnv metadata (tcdName decl))
+             roles_info decl
        ; traceTc "---- tcTyClDecl end ---- }" (ppr tc)
        ; return (tc_vi, deriv_infos) }
 
@@ -3022,28 +3904,27 @@ wiredInDerivInfo tycon decl
 wiredInDerivInfo _ _ = []
 
   -- "type family" declarations
-tcTyClDecl1 :: Maybe Class -> RolesInfo -> TyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
-tcTyClDecl1 parent _roles_info (FamDecl { tcdFam = fd })
+tcTyClDecl1 :: NameEnv (CoAxiom Branched) -> Maybe Kind -> Maybe SynonymMetadata -> RolesInfo -> TyClDecl GhcRn -> TcM ((TyCon, [TyFamEqnValidityInfo]), [DerivInfo])
+tcTyClDecl1 case_axioms mb_domain _ _roles_info (FamDecl { tcdFam = fd })
   = fmap noDerivInfos $
-    tcFamDecl1 parent fd
+    tcFamDecl1 case_axioms mb_domain Nothing fd
 
   -- "type" synonym declaration
-tcTyClDecl1 _parent roles_info
+tcTyClDecl1 _ _ metadata roles_info
             (SynDecl { tcdLName = L _ tc_name
                      , tcdRhs   = rhs })
-  = assert (isNothing _parent )
-    fmap ( noDerivInfos . noEqnValidityInfos ) $
-    tcTySynRhs roles_info tc_name rhs
+  = fmap ( noDerivInfos . noEqnValidityInfos ) $
+    tcTySynRhs metadata roles_info tc_name rhs
 
   -- "data/newtype" declaration
-tcTyClDecl1 _parent roles_info
+tcTyClDecl1 _ _ _parent roles_info
             decl@(DataDecl { tcdLName = L _ tc_name
                            , tcdDataDefn = defn })
   = assert (isNothing _parent) $
     fmap (\(tc, deriv_info) -> ((tc, []), deriv_info)) $
     tcDataDefn (tcMkDeclCtxt decl) roles_info tc_name defn
 
-tcTyClDecl1 _parent roles_info
+tcTyClDecl1 _ _ _parent roles_info
             (ClassDecl { tcdLName = L _ class_name
                        , tcdCtxt = hs_ctxt
                        , tcdFDs = fundeps
@@ -3194,7 +4075,7 @@ tcClassATs class_name cls ats at_defs
                                           (at_def_tycon at_def) [at_def])
                         emptyNameEnv at_defs
 
-    tc_at at = do { (fam_tc, val_infos) <- addLocM (tcFamDecl1 (Just cls)) at
+    tc_at at = do { (fam_tc, val_infos) <- addLocM (tcFamDecl1 emptyNameEnv Nothing (Just cls)) at
                   ; mapM_ (checkTyFamEqnValidityInfo fam_tc) val_infos
                   ; let at_defs = lookupNameEnv at_defs_map (at_fam_name at)
                                   `orElse` []
@@ -3279,6 +4160,7 @@ tcDefaultAssocDecl fam_tc
                           , vi_qtvs         = qtvs
                           , vi_non_user_tvs = non_user_tvs
                           , vi_pats         = pats
+                          , vi_case_pattern = Nothing
                           , vi_rhs          = rhs_ty } )
            -- We perform checks for well-formedness and validity later, in
            -- GHC.Tc.Validity.checkValidAssocTyFamDeflt.
@@ -3382,8 +4264,8 @@ any damage is done.
 *                                                                      *
 ********************************************************************* -}
 
-tcFamDecl1 :: Maybe Class -> FamilyDecl GhcRn -> TcM (TyCon, [TyFamEqnValidityInfo])
-tcFamDecl1 parent (FamilyDecl { fdInfo = fam_info
+tcFamDecl1 :: NameEnv (CoAxiom Branched) -> Maybe Kind -> Maybe Class -> FamilyDecl GhcRn -> TcM (TyCon, [TyFamEqnValidityInfo])
+tcFamDecl1 case_axioms mb_domain parent (FamilyDecl { fdInfo = fam_info
                               , fdLName = tc_lname@(L _ tc_name)
                               , fdResultSig = L _ sig
                               , fdInjectivityAnn = inj })
@@ -3419,12 +4301,23 @@ tcFamDecl1 parent (FamilyDecl { fdInfo = fam_info
   ; checkFamFlag tc_name
   ; inj' <- tcInjectivity tc_bndrs inj
   ; checkResultSigFlag tc_name sig  -- check after injectivity for better errors
-  ; let tycon = mkFamilyTyCon tc_name kind tc_bndrs 0 res_kind
-                               (resultVariableName sig) OpenTypeFamilyTyCon
-                               parent inj'
+  ; enabled <- xoptM LangExt.DependentTypes
+  ; is_boot <- tcIsHsBootOrSig
+  ; let flav
+          | enabled, Just _ <- parent = ConstrainedTypeFamilyTyCon
+          | otherwise = OpenTypeFamilyTyCon
+        effective_kind = fromMaybe kind mb_domain
+        is_constrained = case parent of
+          Just _  -> enabled
+          Nothing -> isJust mb_domain
+        tycon = mkFamilyTyCon tc_name effective_kind tc_bndrs 0 res_kind
+                               (resultVariableName sig) flav parent inj'
+  ; when (is_boot && is_constrained) $
+      failWithTc $ TcRnConstrainedFamilyUnsupported tycon $
+        text "Constrained associated families in hs-boot files and signatures are unsupported."
   ; return (tycon, []) }
 
-  | ClosedTypeFamily _ mb_eqns <- fam_info
+  | ClosedTypeFamily (_, scope) mb_eqns <- fam_info
   = -- Closed type families are a little tricky, because they contain the definition
     -- of both the type family and the equations for a CoAxiom.
     do { traceTc "tcFamDecl1 Closed type family:" (ppr tc_name)
@@ -3437,17 +4330,22 @@ tcFamDecl1 parent (FamilyDecl { fdInfo = fam_info
 
        ; checkFamFlag tc_name -- make sure we have -XTypeFamilies
        ; checkResultSigFlag tc_name sig
+       ; is_boot <- tcIsHsBootOrSig
+       ; let effective_kind = fromMaybe kind mb_domain
 
          -- If Nothing, this is an abstract family in a hs-boot file;
          -- but eqns might be empty in the Just case as well
        ; case mb_eqns of
-           Nothing   ->
-              let tc = mkFamilyTyCon tc_name kind tc_bndrs 0 res_kind
+           Nothing   -> do
+              let tc = mkFamilyTyCon tc_name effective_kind tc_bndrs 0 res_kind
                                      (resultVariableName sig)
                                      (ClosedTypeFamilyTyCon CTF_Abstract)
                                      parent
                                      inj'
-              in return (tc, [])
+              when (is_boot && isJust mb_domain) $
+                failWithTc $ TcRnConstrainedFamilyUnsupported tc $
+                  text "Constrained type families in hs-boot files and signatures are unsupported."
+              return (tc, [])
            Just eqns -> do {
 
          -- Process the equations, creating CoAxBranches
@@ -3456,27 +4354,51 @@ tcFamDecl1 parent (FamilyDecl { fdInfo = fam_info
                                    False {- this doesn't matter here -}
                                    ClosedTypeFamilyFlavour
 
-       ; (branches, axiom_validity_infos) <-
-           unzip <$> mapAndReportM (tcTyFamInstEqn tc_fam_tc NotAssociated) eqns
+       ; co_ax_name <- newFamInstAxiomName tc_lname []
+       ; let check_equation = tcTyFamInstEqn tc_fam_tc NotAssociated
+       ; track_proofs <- xoptM LangExt.DependentTypes
+       ; checked <- mapAndReportM (\eqn ->
+           if track_proofs
+           then do result <- withSourceProofSignature (Just co_ax_name) (check_equation eqn)
+                   deps <- takeSourceProofRulesFor co_ax_name
+                   return (result, deps)
+           else (, []) <$> check_equation eqn) eqns
+       ; let (results, deps_by_branch) = unzip checked
+             (branches, axiom_validity_infos) = unzip results
+             -- Use the same order as mkBranchedCoAxiom and chooseBranch.
+             proof_rules = [(index, deps) | (index, deps@(_ : _)) <- zip [0..] deps_by_branch]
          -- Do not attempt to drop equations dominated by earlier
          -- ones here; in the case of mutual recursion with a data
          -- type, we get a knot-tying failure.  Instead we check
          -- for this afterwards, in GHC.Tc.Validity.checkValidCoAxiom
          -- Example: tc265
 
-         -- Create a CoAxiom, with the correct src location.
-       ; co_ax_name <- newFamInstAxiomName tc_lname []
-
        ; let mb_co_ax
+              | any hasCasePattern axiom_validity_infos
+              , Just ax <- lookupNameEnv case_axioms tc_name
+              = Just ax
               | null eqns = Nothing   -- mkBranchedCoAxiom fails on empty list
-              | otherwise = Just (mkBranchedCoAxiom Nominal co_ax_name fam_tc branches)
+              | otherwise = Just ((mkBranchedCoAxiom Nominal co_ax_name fam_tc branches)
+                                  { co_ax_source_proof_rules = proof_rules })
 
-             fam_tc = mkFamilyTyCon tc_name kind tc_bndrs 0 res_kind (resultVariableName sig)
-                      (ClosedTypeFamilyTyCon $ CTF mb_co_ax) parent inj'
+             fam_tc = mkFamilyTyCon tc_name effective_kind tc_bndrs 0 res_kind (resultVariableName sig)
+                      (ClosedTypeFamilyTyCon closed) parent inj'
+
+             closed
+               | Just (owner, is_sum) <- scope, Just ax <- mb_co_ax
+               = CTF_Scoped owner is_sum ax
+               | Just ax <- mb_co_ax
+               , let ordered = isJust (lookupNameEnv case_axioms tc_name)
+               , Just owner <- signatureCaseOwner ordered axiom_validity_infos
+               = CTF_Scoped owner False ax
+               | otherwise = CTF mb_co_ax
 
          -- We check for instance validity later, when doing validity
          -- checking for the tycon. Exception: checking equations
          -- overlap done by dropDominatedAxioms
+       ; when (is_boot && isJust mb_domain) $
+           failWithTc $ TcRnConstrainedFamilyUnsupported fam_tc $
+             text "Constrained type families in hs-boot files and signatures are unsupported."
        ; return (fam_tc, axiom_validity_infos) } }
 
 -- | Maybe return a list of Bools that say whether a type family was declared
@@ -3525,14 +4447,41 @@ tcInjectivity tcbs (Just (L loc (InjectivityAnn _ _ lInjNames)))
                                        , ppr inj_ktvs, ppr inj_bools ])
        ; return $ Injective inj_bools }
 
-tcTySynRhs :: RolesInfo -> Name
+tcTySynRhs :: Maybe SynonymMetadata -> RolesInfo -> Name
            -> LHsType GhcRn -> TcM TyCon
-tcTySynRhs roles_info tc_name hs_ty
+tcTySynRhs metadata roles_info tc_name hs_ty
   = bindTyClTyVars tc_name $ \ kind tc_bndrs _nb_eta res_kind ->
     do { env <- getLclEnv
        ; traceTc "tc-syn" (ppr tc_name $$ ppr (getLclEnvRdrEnv env))
-       ; rhs_ty <- pushLevelAndSolveEqualities skol_info tc_bndrs $
-                   tcCheckLHsTypeInContext hs_ty (TheKind res_kind)
+       ; rhs_ty <- withSourceProofSignature (Just tc_name) $
+                   pushLevelAndSolveKindArrows skol_info tc_bndrs $
+                   case metadata of
+                     Just plan -> do
+                       ref <- newTcRef plan
+                       let choose name callbacks = do
+                             rest <- readTcRef ref
+                             case rest of
+                               (owner, tys) : next | owner == name, equalLength tys callbacks ->
+                                 writeTcRef ref next >> pure tys
+                               _ -> pprPanic "synonym metadata sites changed" (ppr name)
+                       ty <- tcCheckSynonymMetadata (Just tc_name) choose Nothing hs_ty res_kind
+                       rest <- readTcRef ref
+                       unless (null rest) $ pprPanic "unused synonym metadata sites" (ppr tc_name)
+                       pure ty
+                     Nothing -> case tc_bndrs of
+                       b : rest
+                         | inferredMatchabilityIndex b
+                         , not (binderVar b `elemVarSet`
+                                  tyCoVarsOfTypes (res_kind : map (tyVarKind . binderVar) rest)) ->
+                           tcCheckMatchabilitySynRhs (mkTyVarTy (binderVar b)) hs_ty res_kind
+                       _ -> do
+                         -- See Note [Defunctionalization kind-arrow synonyms].
+                         is_defun <- if isLiftedTypeKind res_kind
+                                     then isDefunKindSynRhs hs_ty
+                                     else pure False
+                         if is_defun
+                           then tcCheckMatchabilitySynRhs matchableDataConTy hs_ty res_kind
+                           else tcCheckSynonymRhs tc_name hs_ty res_kind
 
          -- See Note [Error on unconstrained meta-variables] in GHC.Tc.Utils.TcMType
          -- Example: (typecheck/should_fail/T17567)
@@ -3549,7 +4498,9 @@ tcTySynRhs roles_info tc_name hs_ty
            do { rhs_ty <- zonkTcTypeToTypeX rhs_ty
               ; return (kind, bndrs, rhs_ty) }
        ; let roles = roles_info tc_name
-       ; return (buildSynTyCon tc_name kind bndrs res_kind roles rhs_ty) }
+             syn = buildSynTyCon tc_name kind bndrs res_kind roles rhs_ty
+       ; deps <- sourceProofRulesFor tc_name
+       ; return (setSynTyConSourceProofRules syn deps) }
   where
     skol_info = TyConSkol TypeSynonymFlavour tc_name
 
@@ -3656,6 +4607,33 @@ tcDataDefn err_ctxt roles_info tc_name
                           data_cons
           NewTypeCon data_con -> mkNewTyConRhs tc_name tycon data_con
 
+-- | Expose the written RHS for checks which inspect its outer syntax.
+caseAliasBody :: LHsType GhcRn -> LHsType GhcRn
+caseAliasBody (L _ (XHsType (HsTypeCaseAliasRn _ body))) = body
+caseAliasBody rhs = rhs
+
+-- | Bind the checked scrutinee in its branch. See Note [Type case aliases].
+withCaseAlias :: TyCon -> TcType -> LHsType GhcRn -> (LHsType GhcRn -> TcM a) -> TcM a
+withCaseAlias owner lhs (L _ (XHsType (HsTypeCaseAliasRn (_, index, Just (L _ name)) body))) check
+  | Just (tc, args) <- tcSplitTyConApp_maybe lhs
+  , tc == owner
+  , arg : _ <- drop index [arg | (b, arg) <- zip (tyConBinders tc) args
+                               , isVisibleTyConBinder b]
+  = updLclCtxt (tcExtendLocalTypeEnv [(name, ATcTypeLet name arg (typeKind arg))]) $
+      check body
+  | otherwise = pprPanic "withCaseAlias" (ppr lhs)
+withCaseAlias _ _ rhs check = check (caseAliasBody rhs)
+
+{- Note [Type case aliases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A generated family equation checks the constructor pattern as an argument
+to its family. Keep that checked Type, including its inferred kind
+arguments, as the whole scrutinee in the branch RHS. Rechecking a source
+constructor can infer independent kind arguments even when it has no
+fields. The alias scopes over one RHS and never enters the family axiom
+as a separate argument. A branch field with the same name shadows it.
+-}
+
 -------------------------
 kcTyFamInstEqn :: TcTyCon -> LTyFamInstEqn GhcRn -> TcM ()
 -- Used for the equations of a closed type family only
@@ -3674,10 +4652,12 @@ kcTyFamInstEqn tc_fam_tc
 
        ; checkTyFamInstEqn tc_fam_tc eqn_tc_name hs_pats
 
+       ; raw_kinds <- primFamilyPatKinds tc_fam_tc hs_pats
        ; discardResult $
-         bindOuterFamEqnTKBndrs_Q_Tv outer_bndrs $
-         do { (_fam_app, res_kind) <- tcFamTyPats tc_fam_tc hs_pats
-            ; tcCheckLHsTypeInContext hs_rhs_ty (TheKind res_kind) }
+         bindOuterFamEqnTKBndrs_Q_Tv raw_kinds outer_bndrs $
+         do { (fam_app, res_kind) <- tcFamTyPats tc_fam_tc hs_pats
+            ; withCaseAlias tc_fam_tc fam_app hs_rhs_ty $ \rhs ->
+                tcCheckInferredFamilyRhs rhs res_kind }
              -- Why "_Tv" here?  Consider (#14066)
              --  type family Bar x y where
              --      Bar (x :: a) (y :: b) = Int
@@ -3719,9 +4699,586 @@ tcTyFamInstEqn fam_tc mb_clsinfo
                      , vi_qtvs         = qtvs
                      , vi_non_user_tvs = non_user_tvs
                      , vi_pats         = pats
+                     , vi_case_pattern = typeCasePattern fam_tc hs_pats hs_rhs_ty pats
                      , vi_rhs          = rhs_ty }
 
        ; return (ax, vi) }
+
+-- | Keep the source location of the scrutinee pattern until validity checking.
+-- See Note [Constructor heads in type cases] in GHC.Tc.Validity.
+typeCasePattern :: TyCon -> [LHsTypeArg GhcRn] -> LHsType GhcRn -> [Type]
+                -> Maybe (Name, Int, TypeCasePattern, Type)
+typeCasePattern tc source_args rhs checked_args
+  | L _ (XHsType (HsTypeCaseAliasRn (owner, index, _) _)) <- rhs
+  , pat:_ <- drop index [p | HsValArg _ p <- source_args]
+  = let column = visible_positions !! index
+    in Just (owner, column, source_case_pattern pat, checked_args !! column)
+  | otherwise = Nothing
+  where
+    visible_positions = [i | (i,b) <- zip [0..] (tyConBinders tc)
+                           , isVisibleTyConBinder b]
+    source_case_pattern original = go [] original
+      where
+        sp = getLocA original
+        go args (L _ (HsParTy _ pat)) = go args pat
+        go args (L _ (HsAppTy _ con field)) = go (field:args) con
+        go args (L _ (HsAppKindTy _ con _)) = go args con
+        go []   (L _ (HsOpTy _ lhs tyop rhs)) = go [lhs, rhs] tyop
+        go []   (L _ (HsExplicitListTy _ _ tys)) =
+          foldr (\hd acc -> CasePatternConstructor sp (dataConName consDataCon) [source_case_pattern hd, acc])
+                (CasePatternConstructor sp (dataConName nilDataCon) [])
+                tys
+        go []   (L _ (HsExplicitTupleTy _ _ tys))
+          | length tys /= 1 =
+              CasePatternConstructor sp (dataConName (tupleDataCon Boxed (length tys))) (map source_case_pattern tys)
+        go args (L _ (HsTyVar _ _ (L _ (WithUserRdr _ name))))
+          | not (isTvOcc (nameOccName name)) =
+              CasePatternConstructor sp name (map source_case_pattern args)
+        go _ _ = CasePatternField
+
+-- | Does the equation retain a source case pattern?
+hasCasePattern :: TyFamEqnValidityInfo -> Bool
+hasCasePattern VI{vi_case_pattern = Just _} = True
+hasCasePattern _ = False
+
+{- Note [Termination of lifted case selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A closed type family equation can dispatch through a fresh case helper.
+The helper can repeat a capture as its scrutinee, so the call can fail
+the size check even when each alternative is just a constructor type.
+
+Use the original checked rows, before any ordered case decision nodes
+replace them. Every row must have the same source owner and scrutinee
+column. A selector's branch results must contain only constructor
+types, variables and literals. Its actual arguments can also contain
+saturated selectors of the same owner in the same checking group.
+For example, a type let can pass one case result to a second case.
+
+Check each nested call in the argument syntax. Each selector can
+reuse parts of an argument, but its checked branches introduce no
+family calls of their own. Thus the nested calls come from the
+finite argument expression. Require a constructor-headed result
+kind at each call, so a later argument cannot apply a returned function.
+
+For a direct recursive result, specialize the original LHS and all
+the helper arguments to each case pattern. Use those arguments to
+instantiate the checked branch. Then compare its recursive call
+with the specialized source LHS. For example, refining the LHS of
+`F ('S n) = case n of { S _ -> F ('S n); ... }` gives another `S`
+in the LHS. The call must receive that same refinement through the
+captured `n`. Its size stays equal to the LHS.
+
+Use a source LHS variable of closed kind as the scrutinee. Match
+a flat promoted constructor pattern or a variable pattern. The
+recursive check requires constructor-only actuals and reuses the
+normal Paterson checks for the source and generated equations.
+See 'refineCaseCall' in GHC.Tc.Validity.
+-}
+
+-- | Collect original checked case rows by source owner and private Name.
+-- See Note [Termination of lifted case selectors].
+caseHelperOwners :: [(TyCon, [TyFamEqnValidityInfo])]
+                 -> [(Name, Name, [TyFamEqnValidityInfo])]
+caseHelperOwners declarations =
+  [ (owner, tyConName helper, rows)
+  | (helper, rows) <- declarations
+  , Just (owner, column) : rest <- [map caseRow rows]
+  , all (== Just (owner, column)) rest ]
+  where
+    caseRow VI{vi_case_pattern = Just (owner, column, _, _)} = Just (owner, column)
+    caseRow _ = Nothing
+
+-- | Keep the owner of an elaborated retained signature case.
+-- See Note [Equality of retained case trees] in GHC.Builtin.CoercionRules.
+signatureCaseOwner :: Bool -> [TyFamEqnValidityInfo] -> Maybe Name
+signatureCaseOwner ordered infos = do
+  ((owner, column) : rest) <- traverse case_owner infos
+  guard ("$signature-case:" `List.isPrefixOf` occNameString (nameOccName owner))
+  guard (all (== (owner, column)) rest)
+  pure owner
+  where
+    case_owner VI{vi_case_pattern = Just (owner, column, pat, _)}
+      | ordered = Just (owner, column)
+      | CasePatternConstructor{} <- pat
+      , not (nestedTypeCasePattern pat) = Just (owner, column)
+    case_owner _ = Nothing
+
+hasOrderedPattern :: TyFamEqnValidityInfo -> Bool
+hasOrderedPattern VI{vi_case_pattern = Just (_, _, CasePatternField, _)} = True
+hasOrderedPattern VI{vi_case_pattern = Just (_, _, pat, _)} = nestedTypeCasePattern pat
+hasOrderedPattern _ = False
+
+-- | Decide after the synonym cycle check. An alias can add a test even
+-- when every written row appears to test only one constructor.
+needsOrderedCase :: TyCon -> [TyFamEqnValidityInfo] -> TcM Bool
+needsOrderedCase root infos
+  | any hasOrderedPattern infos = pure True
+  | _:_:_ <- infos = or <$> mapM has_expanded_test infos
+  | otherwise = pure False
+  where
+    has_expanded_test vi@VI{vi_case_pattern = Just (_, _, pat, ty)}
+      | may_expand ty
+      = do checkNoErrs (checkTyFamEqnValidityInfo root vi)
+           checked <- checkedCasePattern [] pat ty
+           pure $ case checked of
+             CheckedCaseConstructor _ _ _ fields -> any is_test fields
+             CheckedCaseField -> False
+    has_expanded_test _ = pure False
+
+    may_expand (CastTy ty _) = may_expand ty
+    may_expand ty = maybe False (isTypeSynonymTyCon . fst) (splitTyConAppNoView_maybe ty)
+
+    is_test CheckedCaseConstructor{} = True
+    is_test CheckedCaseField = False
+
+{- Note [Publishing ordered type cases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Keep each source row through renaming, kind checking and validity checking.
+The rows contain full patterns and branch kinds. Their flat family equations
+could skip earlier constructor demands, so never publish those equations.
+
+The ordinary declaration knot gives a lifted case its final TyCon identity.
+Use a separate axiom knot so the node builder can read the zonked source
+rows after the ordinary knot returns. Add the private decision families
+to the normal interface environment with the root.
+
+A node tests one constructor column. Its equations use distinct actual
+constructors, including a constructor reached through a wildcard row.
+The first surviving row determines the next test and the order of its
+fields. Every synthetic edge consumes a test. Check the written RHSs for
+ordinary family termination and check the generated axiom shapes without
+retesting the syntactic termination condition on those finite edges.
+
+An alias can put a written field in a different constructor slot.
+Store the checked canonical slot and the written path separately. Use
+the latter to choose the next test in the first surviving row. A
+discarded field cannot supply a test or an RHS binding. Also inspect
+aliases after synonym cycle checking. An alias can introduce a test
+even when the written pattern is flat. Such a case must use ordered
+nodes whenever it has a fallback. Assign an added layer its canonical
+field path. Expand a copy of the alias with a distinct marker for each
+visible argument to distinguish written subpatterns from equal types
+introduced by the alias. With extra layers, use canonical order only
+when it visits surviving written tests at most once and in source order. A lone flat row can
+keep its ordinary axiom because no alternative can bypass its tests.
+
+A Type column has no finite set of constructors. Test one checked
+constructor at a time through a classifier with distinct Boolean results.
+A decision family branches on that result. Its successful branch also
+matches the exact tested constructor to bind its fields. The classifier
+default cannot bypass a test on an unknown input with a compatible RHS.
+
+Use the same test for an ordinary constructor of a datatype with a
+family index. A wildcard can cover a different constructor even when
+its index is stuck. Enumerating that constructor can require an unsolved
+equality or place a family application in the generated LHS. Give the
+classifier the captured variables of the scrutinee kind. The checked
+constructor pattern must have that kind without refining the captures.
+
+A promoted constructor result kind can contain a closed type family.
+After ordinary unification fails, try one checked reduction at each
+index of the same nominally generative kind constructor. Use only a
+completed family's axiom. Build the nodes after leaving
+`tcExtendRecEnv`, so the global type environment contains local
+families from completed groups. A family from the current group may
+depend on the new decision families. Its axiom is still unavailable.
+
+Use the ordinary closed-family branch matcher for this step. Unify the
+reduced kind with the scrutinee kind. This can refine another index of
+the same constructor, including an index that occurs in a field kind.
+Check the kinds of the reduced arguments against the constructor kind
+before unification. A reduction can change the kind expected by a later
+argument. Lift each binder kind with the nominal proofs for the arguments
+before it. Cast the argument with that proof and extend the lifting
+context with the argument's reduction and cast. This is the same
+transport as in Note [extendLiftingContextEx] in GHC.Core.Coercion.
+Apply that refinement and the field renaming to the nominal kind
+coercion before casting the constructor. A reduced index can also
+establish apartness when its kind agrees with the scrutinee index kind.
+The case still tests the constructor when the indices agree. The source
+pattern can carry a kind cast from ordinary kind checking. Read the constructor
+under that cast, including casts reached by expanding an alias. The
+generated branch constructs its own evidence. The checked source
+pattern, with its casts, still determines the substitution for the RHS.
+
+A family index can need a refinement from another index of the same
+constructor. For example, the result kind Gate (Index tag) seed tag
+can match Gate Bool seed 'True when Index 'True reduces to Bool.
+The indices of the nominally generative Gate head must agree in this
+branch. Use the family-free pairs of indices to find a substitution.
+Apply it to both kinds before retrying the closed-family steps. Only
+a complete unification proves the equality needed for the branch.
+This substitution is local to this constructor and its nested tests.
+The retry starts from the original arguments and still takes only one
+family step per index. It never reduces the result of a previous step.
+-}
+
+data CheckedCasePattern
+  = CheckedCaseField
+  | CheckedCaseConstructor [Int] SrcSpan TyCon [CheckedCasePattern]
+
+-- | Compile all checked rows of one lifted case. A node has one distinct
+-- branch per constructor. A failed test does not examine later columns.
+buildOrderedTypeCase :: TyCon -> [TyFamEqnValidityInfo]
+                     -> TcM (CoAxiom Branched, [TyCon])
+buildOrderedTypeCase root infos = do
+  let vars = binderVars (tyConBinders root)
+      args = mkTyVarTys vars
+      res = tyConResKind root
+      loc = case infos of
+        VI{vi_loc = span} : _ -> span
+        _ -> getSrcSpan root
+      unsupported :: TcM a
+      unsupported = setSrcSpan loc $
+        failWithTc (mkTcRnUnknownMessage (mkPlainError []
+          (text "This nested type case needs an unsupported constructor telescope.")))
+  checked_rows <- forM infos $ \case
+    vi@VI{vi_case_pattern = Just (owner, i, pat, ty)} -> do
+      checked <- checkedCasePattern [] pat ty
+      pure ((owner, i), (vi, [checked]))
+    _ -> unsupported
+  ((owner, column), rows) <- case unzip checked_rows of
+    (first:rest, rows) | all (== first) rest -> pure (first, rows)
+    _ -> unsupported
+  scrutinee <- case drop column args of
+    scrutinee:_ -> pure scrutinee
+    _ -> unsupported
+  next <- newTcRef (0 :: Int)
+  let fresh kind = flip mkTyVar kind <$> newSysName (mkTyVarOcc "field")
+      axiom base family branches = do
+        name <- newImplicitBinder base mkInstTyCoOcc
+        pure (mkBranchedCoAxiom Nominal name family branches)
+      makeFamily bs result branches = do
+        i <- readTcRef next
+        writeTcRef next (i+1)
+        let suffix = zEncodeString (occNameString (nameOccName (tyConName root))) ++ "." ++ show i
+        name <- newImplicitBinder owner $ \occ ->
+          mkTcOcc ("$case-node:" ++ occNameString occ ++ ":" ++ suffix)
+        let kind = mkTyConKindWithMatchability unmatchableDataConTy bs result
+        ax_name <- newImplicitBinder name mkInstTyCoOcc
+        let fam = mkFamilyTyCon name kind bs 0 result Nothing
+                    (ClosedTypeFamilyTyCon closed) Nothing NotInjective
+            closed
+              | Just (owner, _) <- closedFamilyScope_maybe root = CTF_Scoped owner False ax
+              | otherwise = CTF (Just ax)
+            ax = mkBranchedCoAxiom Nominal ax_name fam branches
+        pure fam
+
+      bindersFor = mkNamedTyConBinders (Invisible InferredSpec)
+      -- A child takes the variables needed to reconstruct the source patterns.
+      makeChild sourceArgs slots result liveRows = do
+        let ts = scopedSort (tyCoVarsOfTypesList (result : sourceArgs ++ slots))
+        unless (all isTyVar ts) unsupported
+        (branches, helpers) <- build sourceArgs ts slots result liveRows
+        fam <- makeFamily (bindersFor ts) result branches
+        pure (mkTyConApp fam (mkTyVarTys ts), fam : helpers)
+
+      true = mkTyConTy promotedTrueDataCon
+      false = mkTyConTy promotedFalseDataCon
+
+      branch lhs rhs =
+        let ts = scopedSort (tyCoVarsOfTypesList lhs)
+        in mkCoAxBranch ts [] [] lhs rhs (replicate (length ts) Nominal) loc
+
+      -- Test the current column before choosing a branch.
+      build sourceArgs variables slots result
+        liveRows@((VI{vi_loc = row_loc, vi_pats = row_pats, vi_rhs = row_rhs}, first):_) =
+        case [(path, (field, span, con))
+             | (field, CheckedCaseConstructor path span con _) <- zip [0..] first] of
+          [] -> do
+            case tcMatchTyKis row_pats sourceArgs of
+              Just subst
+                | let rhs = substTyUnchecked subst row_rhs
+                , typeKind rhs `eqType` result ->
+                    pure ([branch (mkTyVarTys variables) rhs], [])
+              _ -> unsupported
+          demands -> do
+            let (_, (field, span, con)) =
+                  List.minimumBy (\(p, _) (q, _) -> compare p q) demands
+            case drop field slots of
+              slot:_ | Just scrut <- getTyVar_maybe slot ->
+                if varType scrut `eqType` liftedTypeKind
+                  then classifyColumn sourceArgs variables slots result liveRows row_loc span field scrut con
+                  else closedColumn sourceArgs variables slots result liveRows row_loc span field scrut con
+              _ -> unsupported
+        where
+          specialize field con (row, pats) = case splitAt field pats of
+            (prefix, CheckedCaseField : suffix) ->
+              Just (row, prefix ++ replicate arity CheckedCaseField ++ suffix)
+            (prefix, CheckedCaseConstructor _ _ expected fields : suffix)
+              | expected == con, length fields == arity ->
+                  Just (row, prefix ++ fields ++ suffix)
+            _ -> Nothing
+            where arity = count isVisibleTyConBinder (tyConBinders con)
+
+          closedColumn sourceArgs variables slots result liveRows row_loc span field scrut con = do
+            (parent, _) <- maybe unsupported pure (tcSplitTyConApp_maybe (varType scrut))
+            cs <- maybe unsupported pure (tyConDataCons_maybe parent)
+            case isPromotedDataCon_maybe con of
+              Just dc
+                | isVanillaDataCon dc, null (dataConRepArgBinders dc)
+                , any (not . isFamFreeTy . dataConOrigResTy) cs ->
+                    classifyColumn sourceArgs variables slots result liveRows row_loc span field scrut con
+              _ -> do
+                let promotable dc = case dataConFullSig dc of
+                      (_, _, _, theta, _, _) -> null theta
+                results <- forM (filter promotable cs) $ \dc -> do
+                  let promoted = promoteDataCon dc
+                      selected = mapMaybe (specialize field promoted) liveRows
+                  if null selected then pure Nothing else do
+                    unless (null (dataConRepArgBinders dc)) unsupported
+                    onConstructor sourceArgs variables slots result row_loc field scrut promoted selected
+                let branches = catMaybes results
+                if null branches then unsupported else
+                  pure ([branch lhs rhs | (_, lhs, rhs, _) <- branches],
+                        concat [helpers | (_, _, _, helpers) <- branches])
+
+          -- The classifier returns distinct Bool constructors. In particular
+          -- its default cannot become compatible with its test even if both
+          -- branches of the original case return an identical value.
+          classifyColumn sourceArgs variables slots result liveRows row_loc span field scrut con = do
+            unless (isGenerativeTyCon con Nominal && not (isTypeFamilyTyCon con)) $
+              setSrcSpan span $ failWithTc (TcRnNestedTypeCasePattern (mkTyVarTy scrut))
+            let matchRows = mapMaybe (specialize field con) liveRows
+                missRow (_, pats) = case drop field pats of
+                  CheckedCaseConstructor _ _ expected _ : _ -> expected /= con
+                  _ -> True
+                missRows = filter missRow liveRows
+                args = mkTyVarTys variables
+                kind = varType scrut
+                kindVars = scopedSort (tyCoVarsOfTypesList [kind])
+                testArgs arg = mkTyVarTys kindVars ++ [arg]
+            unless (all isTyVar kindVars) unsupported
+            matched <- onConstructor sourceArgs variables slots result row_loc field scrut con matchRows
+            (pattern, lhs, matchedRhs, matchedHelpers) <- maybe unsupported pure matched
+            unless (typeKind pattern `eqType` kind) unsupported
+            testArg <- fresh kind
+            classify <- makeFamily (bindersFor kindVars ++ [mkAnonTyConBinder testArg]) boolTy
+              [branch (testArgs pattern) true, branch (testArgs (mkTyVarTy testArg)) false]
+            (missBranches, missHelpers) <- if null missRows then pure ([], []) else do
+              (missRhs, helpers) <- makeChild sourceArgs slots result missRows
+              pure ([branch (false : args) missRhs], helpers)
+            selector <- fresh boolTy
+            decision <- makeFamily (mkAnonTyConBinder selector : bindersFor variables) result
+              (branch (true : lhs) matchedRhs : missBranches)
+            pure ([branch args (mkTyConApp decision (mkTyConApp classify (testArgs (mkTyVarTy scrut)) : args))],
+                  classify : decision : matchedHelpers ++ missHelpers)
+
+      build _ _ _ _ _ = unsupported
+
+      onConstructor sourceArgs variables slots result row_loc field scrut con selected = do
+        let bndrs = tyConBinders con
+        binders <- map snd <$> foldM (freshBinder fresh) [] bndrs
+        let instantiated = substTyWith (binderVars bndrs) (mkTyVarTys binders)
+            con_kind = instantiated (tyConResKind con)
+        let scrut_kind = varType scrut
+        refinement <- case tcUnifyTy con_kind scrut_kind of
+          Just refine -> pure (Just (refine, Nothing))
+          Nothing
+            | typeListsAreApart [con_kind] [scrut_kind] -> pure Nothing
+            | otherwise -> do
+                (reduced_refinement, apart) <- checkedCaseKindRefinement con_kind scrut_kind
+                case reduced_refinement of
+                  Just (refine, co) -> pure (Just (refine, Just co))
+                  Nothing
+                    | apart -> pure Nothing
+                    | otherwise -> setSrcSpan row_loc $
+                        failWithTc (TcRnTypeCaseIndexApartness scrut_kind)
+        case refinement of
+          Nothing -> pure Nothing
+          Just (refine, kind_co) -> do
+            (before, after) <- case splitAt field slots of
+              (before, _:after) -> pure (before, after)
+              _ -> unsupported
+            let refineTy = substTyUnchecked refine
+                extras = result : sourceArgs ++ slots ++ mkTyVarTys binders
+                liveVars = scopedSort (tyCoVarsOfTypesList (map refineTy extras))
+                renameVar subst v
+                  | v == scrut = pure subst
+                  | otherwise =
+                      let newKind = substTyUnchecked subst (refineTy (varType v))
+                      in if newKind `eqType` varType v then pure subst
+                         else do v' <- fresh newKind
+                                 pure (extendTvSubstAndInScope subst v (mkTyVarTy v'))
+                initial = mkEmptySubst (mkInScopeSet (mkVarSet liveVars))
+            renaming <- foldM renameVar initial liveVars
+            let retag = substTyUnchecked renaming . refineTy
+                con_pat = mkTyConApp con (map (retag . mkTyVarTy) binders)
+                pat = case kind_co of
+                  Nothing -> con_pat
+                  Just co -> mkCastTy con_pat (substCo renaming (substCo refine co))
+                replace = substTyWith [scrut] [pat] . retag
+                fields = [replace (mkTyVarTy v) | (b, v) <- zip bndrs binders
+                                               , isVisibleTyConBinder b]
+                source = map replace sourceArgs
+                child_slots = map replace before ++ fields ++ map replace after
+                lhs = map (replace . mkTyVarTy) variables
+            (rhs, helpers) <- makeChild source child_slots (replace result) selected
+            pure (Just (pat, lhs, rhs, helpers))
+  (branches, helpers) <- build args vars [scrutinee] res rows
+  ax <- axiom (tyConName root) root branches
+  pure (ax, helpers)
+  where
+    freshBinder fresh previous (Bndr var _) = do
+      let subst = substTyWith (map fst previous) (mkTyVarTys (map snd previous))
+      field <- fresh (subst (varType var))
+      pure (previous ++ [(var, field)])
+
+-- | Try one checked closed-family step per index. The refinement
+-- makes the nominal coercion prove equality with the scrutinee kind.
+-- See Note [Publishing ordered type cases].
+checkedCaseKindRefinement :: Kind -> Kind -> TcM (Maybe (Subst, CoercionN), Bool)
+checkedCaseKindRefinement actual expected
+  | Just (tc, as) <- tcSplitTyConApp_maybe actual
+  , Just (tc', bs) <- tcSplitTyConApp_maybe expected
+  , tc == tc'
+  , isGenerativeTyCon tc Nominal
+  , as `equalLength` bs
+  = do env <- getGblEnv
+       fams <- tcGetFamInstEnvs
+       let index_step a b
+             | not (a `eqType` b)
+             , Just (family, args) <- tcSplitTyConApp_maybe a
+             , let name = tyConName family
+             , not (nameIsLocalOrFrom (tcg_mod env) name)
+               || name `elemNameEnv` tcg_type_env env
+             , Just _ <- closedFamilyTyConCoAxiom_maybe family
+             , Just redn <- reduceTyFamApp_maybe fams Nominal family args
+             = redn
+             | otherwise = Reduction (mkNomReflCo a) a
+           binders = binderVars (tyConBinders tc)
+           check_indices prior actual_args expected_args =
+             let index_steps = zipWith index_step actual_args expected_args
+                 redns
+                   | binders `equalLength` index_steps, all isTyVar binders
+                   = snd (List.mapAccumL transport (emptyLiftingContext emptyInScopeSet)
+                                         (zip binders index_steps))
+                   | otherwise = index_steps
+                 reduced = map reductionReducedType redns
+                 refinement = do
+                   guard (kinded_args (tyConKind tc) reduced)
+                   tcUnifyTy (mkTyConApp tc reduced) (mkTyConApp tc expected_args)
+             in case refinement of
+               Just refine ->
+                 let co = mkTyConAppCo Nominal tc (map reductionCoercion redns)
+                     complete = maybe refine (composeTCvSubst refine) prior
+                     -- A reduction can discard an argument that is still in its proof.
+                     scoped = extendSubstInScopeSetFromSource complete (tyCoVarsOfCo co)
+                 in (Just (scoped, co), False)
+               Nothing -> (Nothing, or (zipWith index_apart reduced expected_args))
+
+           transport lc (binder, Reduction co arg) =
+             let kind_co = liftCoSubst Nominal lc (varType binder)
+                 arg_co = co `mkTransCo` mkGReflRightMCo Nominal arg (MCo kind_co)
+                 lc' = extendLiftingContextAndInScope lc binder arg_co
+             in (lc', Reduction arg_co (mkCastTy arg kind_co))
+           index_apart a b = typeKind a `eqType` typeKind b && typesAreApart a b
+           kinded_args _ [] = True
+           kinded_args kind (arg:args)
+             | Just (_, bndr, _) <- splitPiTy_maybe kind
+             , typeKind arg `eqType` piTyBinderType bndr
+             = kinded_args (piResultTy kind arg) args
+             | otherwise = False
+           structural_pair (a, b) =
+             isFamFreeTy a && isFamFreeTy b && typeKind a `eqType` typeKind b
+
+       pure $ case check_indices Nothing as bs of
+         (Nothing, False)
+           | let (lhs, rhs) = unzip (filter structural_pair (zip as bs))
+           , Just prior <- tcUnifyTys alwaysBindTv lhs rhs
+           , not (isEmptySubst prior)
+           -> check_indices (Just prior) (substTys prior as) (substTys prior bs)
+         result -> result
+  | otherwise = pure (Nothing, False)
+
+-- | Align nominal fields with the checked arguments written at the alias.
+-- See Note [Publishing ordered type cases].
+checkedCasePattern :: [Int] -> TypeCasePattern -> Type -> TcM CheckedCasePattern
+checkedCasePattern _ CasePatternField _ = pure CheckedCaseField
+checkedCasePattern path pat (CastTy ty _) = checkedCasePattern path pat ty
+checkedCasePattern path (CasePatternConstructor span _ fields) ty =
+  setSrcSpan span $ case (splitTyConAppNoView_maybe ty, split_pattern ty) of
+    (Just (written, original), Just (resolved, canonical))
+      | let old = visible written original
+            new = visible resolved canonical
+      , length fields == length old
+      , isGenerativeTyCon resolved Nominal
+      , not (isTypeFamilyTyCon resolved)
+      -> do
+          children <- if written == resolved
+            then sequence [checkedCasePattern (path ++ [i]) field arg
+                          | (i, field, arg) <- zip3 [0..] fields old]
+            else synonym_fields written original resolved new
+          pure (CheckedCaseConstructor path span resolved children)
+    (_, Nothing) -> failWithTc (TcRnTypeCasePattern (Just ty))
+    _ -> failWithTc (TcRnNestedTypeCasePattern ty)
+
+  where
+    -- Expand a copy with markers for the visible arguments. A marker
+    -- identifies a source occurrence even when its checked argument is
+    -- equal to a constant elsewhere in the expansion.
+    synonym_fields written original resolved new = do
+      markers <- forM (visible written original) $ \arg ->
+        flip mkTyVar (typeKind arg) <$> newSysName (mkTyVarOcc "case_argument")
+      let marker_args [] args = map snd args
+          marker_args _ [] = []
+          marker_args pending ((binder, arg):args)
+            | isVisibleTyConBinder binder, marker:more <- pending =
+                mkTyVarTy marker : marker_args more args
+            | otherwise = arg : marker_args pending args
+          expanded = mkTyConApp written
+            (marker_args markers (zip (tyConBinders written) original))
+          marked = zip markers (zip [0..] fields)
+      case split_pattern expanded of
+        Just (head_tc, args)
+          | head_tc == resolved
+          , let shape = visible head_tc args
+          , length shape == length new ->
+            case traverse (find_marker marked) shape of
+              Just aligned
+                | let used = [i | (i, field) <- aligned, is_test field]
+                , length used == length (nub used) ->
+                    sequence [checkedCasePattern (path ++ [i]) field actual
+                             | ((i, field), actual) <- zip aligned new]
+              _ -> do
+                aligned <- sequence [expand_field marked (path ++ [i]) shape actual
+                                    | (i, shape, actual) <- zip3 [0..] shape new]
+                let used = concatMap snd aligned
+                unless (used == List.sort (nub used)) unsupported
+                pure (map fst aligned)
+        _ -> unsupported
+
+    is_test CasePatternField = False
+    is_test CasePatternConstructor{} = True
+
+    find_marker marked shape = do
+      var <- getTyVar_maybe (typeCasePatternView shape)
+      lookup var marked
+
+    expand_field marked position shape actual
+      | Just (i, field) <- find_marker marked shape = do
+          checked <- checkedCasePattern position field actual
+          pure (checked, [i | is_test field])
+      | Just (con, shape_args) <- split_pattern shape
+      , Just (actual_con, actual_args) <- split_pattern actual
+      , actual_con == con
+      , isGenerativeTyCon con Nominal
+      , not (isTypeFamilyTyCon con)
+      , let shape_fields = visible con shape_args
+            actual_fields = visible con actual_args
+      , length shape_fields == length actual_fields = do
+          children <- sequence
+            [expand_field marked (position ++ [i]) field arg
+            | (i, field, arg) <- zip3 [0..] shape_fields actual_fields]
+          pure (CheckedCaseConstructor position span con (map fst children),
+                concatMap snd children)
+      | otherwise = unsupported
+
+    split_pattern = tcSplitTyConApp_maybe . typeCasePatternView
+    visible tc args = [a | (b, a) <- zip (tyConBinders tc) args
+                         , isVisibleTyConBinder b]
+    unsupported :: TcM a
+    unsupported = failWithTc (TcRnNestedTypeCasePattern ty)
 
 checkTyFamInstEqn :: TcTyCon -> Name -> [HsArg p tm ty] -> TcM ()
 checkTyFamInstEqn tc_fam_tc eqn_tc_name hs_pats =
@@ -3819,17 +5376,33 @@ tcTyFamInstEqnGuts fam_tc mb_clsinfo outer_hs_bndrs hs_pats hs_rhs_ty
        -- By now, for type families (but not data families) we should
        -- have checked that the number of patterns matches tyConArity
        ; skol_info <- mkSkolemInfo FamInstSkol
+       ; raw_kinds <- primFamilyPatKinds fam_tc hs_pats
 
        -- This code is closely related to the code
        -- in GHC.Tc.Gen.HsType.kcCheckDeclHeader_cusk
        ; (tclvl, wanted, (outer_bndrs, (lhs_ty, rhs_ty)))
-               <- pushLevelAndSolveEqualitiesX "tcTyFamInstEqnGuts" $
-                  bindOuterFamEqnTKBndrs skol_info outer_hs_bndrs   $
-                  do { (lhs_ty, rhs_kind) <- tcFamTyPats fam_tc hs_pats
+               <- pushLevelAndSolveKindArrowsX "tcTyFamInstEqnGuts" $
+                  bindOuterFamEqnTKBndrs skol_info raw_kinds outer_hs_bndrs $
+                  do { (lhs_ty, rhs_kind, index) <- case tyConBinders fam_tc of
+                           b : _ | inferredMatchabilityIndex b -> do
+                             (lhs, kind, mas) <- tcInferredMatchabilityFamPats fam_tc hs_pats
+                             let output = [ma | (bv, ma) <- zip (tyConBinders fam_tc) mas
+                                              , not (familyKindUsesMatchability fam_tc bv)]
+                             pure (lhs, kind, listToMaybe output)
+                           _ -> do
+                             (lhs, kind) <- tcFamTyPats fam_tc hs_pats
+                             pure (lhs, kind, Nothing)
                        -- Ensure that the instance is consistent with its
                        -- parent class (#16008)
                      ; addConsistencyConstraints mb_clsinfo lhs_ty
-                     ; rhs_ty <- tcCheckLHsTypeInContext hs_rhs_ty (TheKind rhs_kind)
+                     ; rhs_ty <- withCaseAlias fam_tc lhs_ty hs_rhs_ty $ \rhs -> case index of
+                           Just ma -> tcCheckMatchabilitySynRhs ma rhs rhs_kind
+                           Nothing
+                             | ClosedTypeFamilyFlavour <- tyConFlavour fam_tc
+                             , b : _ <- tyConBinders fam_tc
+                             , inferredMatchabilityIndex b
+                             -> tcCheckInferredFamilyRhs rhs rhs_kind
+                             | otherwise -> tcCheckFamilyRhs rhs rhs_kind
                      ; return (lhs_ty, rhs_ty) }
 
        ; outer_bndrs <- scopedSortOuter outer_bndrs
@@ -4080,10 +5653,38 @@ tcConDecl :: NewOrData
           -> ConDecl GhcRn
           -> TcM (NonEmpty DataCon)
 
+tcConDecl _ dd_info rep_tycon tc_bndrs _ tag_map
+          (ConDeclH98 { con_name = lname@(L _ name), con_ext = Just sig })
+  = addErrCtxt (DataConDefCtxt (NE.singleton lname)) $
+    do { case dd_info of
+           DDataType | all (\tv -> varType tv `eqType` liftedTypeKind) (binderVars tc_bndrs)
+                     -> pure ()
+           _ -> failWithTc (TcRnRetainedQuantificationError RetainedPackageDeclaration)
+       ; skol_info <- mkSkolemInfo (DataConSkol name)
+       ; (tclvl, wanted, (retained, full_ty)) <-
+           pushLevelAndSolveEqualitiesX "tcConDecl:retained record" $
+             tcCheckRetainedConType True False (tcDataConMult IsNotPrefixConGADT) sig
+       ; reportUnsolvedEqualities skol_info (binderVars tc_bndrs) tclvl wanted
+       ; (parameters, zonked) <- initZonkEnv NoFlexi $
+           runZonkBndrT (zonkTyVarBindersX tc_bndrs) $ \parameters ->
+             (parameters,) <$> zonkTcTypeToTypeX full_ty
+       ; let (arg_tys, res_ty) = splitRetainedConFields retained zonked
+             univs = binderVars parameters
+             user_tvbs = tyVarSpecToBinders (tyConInvisTVBinders parameters)
+             unbanged = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
+       ; field_lbls <- lookupConstructorFields (noUserRdr name)
+       ; rep_nm <- newTyConRepName name
+       ; fam_envs <- tcGetFamInstEnvs
+       ; dflags <- getDynFlags
+       ; con <- buildDataConWithTelescope (LegacyConOrder 0) retained fam_envs
+                   (SrcBangOpts (initBangOpts dflags)) name False rep_nm
+                   (map (const unbanged) retained) field_lbls univs [] user_tvbs [] []
+                   arg_tys res_ty rep_tycon tag_map
+       ; pure (NE.singleton con) }
+
 tcConDecl new_or_data dd_info rep_tycon tc_bndrs res_kind tag_map
           (ConDeclH98 { con_name = lname@(L _ name)
-                      , con_ex_tvs = explicit_tkv_nms
-                      , con_mb_cxt = hs_ctxt
+                      , con_telescope = explicit_teles
                       , con_args = hs_args })
   = addErrCtxt (DataConDefCtxt (NE.singleton lname)) $
     do { -- NB: the tyvars from the declaration header are in scope
@@ -4094,28 +5695,29 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs res_kind tag_map
          --      hs_qvars = HsQTvs { hsq_implicit = {k}
          --                        , hsq_explicit = {f,b} }
 
+       ; let explicit_tkv_nms = concatMap invis_bndrs (gadtArgTelescopes explicit_teles)
        ; traceTc "tcConDecl 1" (vcat [ ppr name
                                      , text "explicit_tkv_nms" <+> ppr explicit_tkv_nms
                                      , text "tc_bndrs" <+> ppr tc_bndrs ])
        ; skol_info <- mkSkolemInfo (ForAllSkol (HsTyVarBndrsRn (unLoc <$> explicit_tkv_nms)))
 
-       ; (tclvl, wanted, (exp_tvbndrs, (ctxt, arg_tys, field_lbls, stricts)))
-           <- pushLevelAndSolveEqualitiesX "tcConDecl:H98"  $
-              tcExplicitTKBndrs skol_info explicit_tkv_nms  $
-              do { ctxt <- tcHsContext hs_ctxt
-                 ; let exp_kind = getArgExpKind new_or_data res_kind
+       ; (tclvl, wanted, (exp_tvbs, ctxt, (arg_tys, field_lbls, stricts)))
+           <- pushLevelAndSolveKindArrowsX "tcConDecl:H98"  $
+              tcConDeclTelescope skol_info explicit_teles $
+              do { let exp_kind = getArgExpKind new_or_data res_kind
                  ; btys <- tcConH98Args exp_kind hs_args
                  ; field_lbls <- lookupConstructorFields $ noUserRdr name
                  ; let (arg_tys, stricts) = unzip btys
-                 ; return (ctxt, arg_tys, field_lbls, stricts)
+                 ; return (arg_tys, field_lbls, stricts)
                  }
 
 
-       ; let tc_tvs   = binderVars tc_bndrs
-             fake_ty  = mkSpecForAllTys  tc_tvs      $
-                        mkInvisForAllTys exp_tvbndrs $
+       ; let exp_tvbndrs = map invis_bndr exp_tvbs
+             tc_tvs   = binderVars tc_bndrs
+             fake_ty  = mkSpecForAllTys (map (unmatchableDataConTy,) tc_tvs) $
+                        mkInvisForAllTys (map (unmatchableDataConTy,) exp_tvbndrs) $
                         tcMkPhiTy ctxt               $
-                        tcMkScaledFunTys arg_tys     $
+                        tcMkScaledFunTysU arg_tys     $
                         unitTy
              -- That type is a lie, of course. (It shouldn't end in ()!)
              -- And we could construct a proper result type from the info
@@ -4175,14 +5777,81 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs res_kind tag_map
                   --      that way checkValidDataCon can complain if it's wrong.
 
        ; return (NE.singleton dc) }
+  where
+    invis_bndrs :: HsForAllTelescope GhcRn -> [LHsTyVarBndr Specificity GhcRn]
+    invis_bndrs HsForAllInvis{hsf_invis_bndrs = bndrs} = bndrs
+    invis_bndrs HsForAllVis{} = pprPanic "tcConDecl: visible H98 group" empty
+    invis_bndr (Bndr tv (Invisible spec)) = Bndr tv spec
+    invis_bndr bndr = pprPanic "tcConDecl: visible H98 binder" (ppr bndr)
+
+tcConDecl new_or_data dd_info rep_tycon tc_bndrs _ tag_map
+          (ConDeclGADT { con_names = names
+                       , con_outer_bndrs = L _ outer_bndrs
+                       , con_telescope = inner_bndrs
+                       , con_g_args = args
+                       , con_res_ty = hs_res_ty })
+  | hsHasForEachTy (unLoc hs_res_ty)
+  = addErrCtxt (DataConDefCtxt names) $
+    do { let L _ name :| _ = names
+       ; checkRetainedConShape new_or_data inner_bndrs args hs_res_ty
+       ; case dd_info of
+           DDataType -> return ()
+           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration
+       ; skol_info <- mkSkolemInfo (DataConSkol name)
+       ; tcCheckRuntimeForAllMatchability (hsOuterMatchability outer_bndrs)
+       ; (tclvl, wanted, (tc_outer, (inner_tvbs, ctxt, (retained, bangs, full_ty)))) <-
+           pushLevelAndSolveEqualitiesX "tcConDecl:retained" $
+           tcOuterTKBndrs skol_info outer_bndrs $
+           tcConDeclTelescope skol_info inner_bndrs $
+           do { prefix <- tcConGADTArgs (TheKind liftedTypeKind) args
+              ; (retained, suffix_ty) <-
+                  tcCheckRetainedConType True
+                    (retainedResultAllowed outer_bndrs inner_bndrs args)
+                    (tcDataConMult IsPrefixConGADT) hs_res_ty
+              ; let suffix_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
+              ; return (replicate (length prefix) Nothing ++ retained,
+                        map snd prefix ++ map (const suffix_bang) retained,
+                        tcMkScaledFunTysU (map fst prefix) suffix_ty) }
+       -- Sort outer binders after solving equalities (#28135).
+       ; tc_outer <- scopedSortOuter tc_outer
+       ; let outer_tvbs = tyVarSpecToBinders (outerTyVarBndrs tc_outer)
+             tvbs       = outer_tvbs ++ inner_tvbs
+       ; inf_tkvs <- kindGeneralizeAll skol_info $
+           mkForAllTys (map (unmatchableDataConTy,) tvbs) (tcMkPhiTy ctxt full_ty)
+       ; reportUnsolvedEqualities skol_info inf_tkvs tclvl wanted
+       ; let inf_bndrs = mkTyVarBinders Inferred inf_tkvs
+       ; (inf_bndrs, tvbs, ctxt, full_ty) <- initZonkEnv NoFlexi $
+           runZonkBndrT (zonkTyVarBindersX inf_bndrs) $ \ inf_bndrs ->
+           runZonkBndrT (zonkTyVarBindersX tvbs) $ \ tvbs ->
+             do { ctxt <- zonkTcTypesToTypesX ctxt
+                ; full_ty <- zonkTcTypeToTypeX full_ty
+                ; return (inf_bndrs, tvbs, ctxt, full_ty) }
+       ; let (arg_tys, res_ty) = splitRetainedConFields retained full_ty
+             res_tmpl = mkDDHeaderTy dd_info rep_tycon tc_bndrs
+             (univ_tvs, ex_tvs, user_bndrs, eq_preds, arg_subst)
+               = rejigConRes tc_bndrs res_tmpl inf_bndrs tvbs res_ty
+             ctxt' = substTys arg_subst ctxt
+             arg_tys' = map (substScaledTy arg_subst) arg_tys
+             res_ty' = substTy arg_subst res_ty
+             -- Keep the field list spine independent of the knot-tied rejig.
+             -- See Note [Source retained constructor declarations].
+       ; fam_envs <- tcGetFamInstEnvs
+       ; dflags <- getDynFlags
+       ; let build_one (L loc con_name) = setSrcSpanA loc $
+               do { rep_nm <- newTyConRepName con_name
+                  ; buildDataConWithTelescope (LegacyConOrder 0) retained fam_envs
+                      (SrcBangOpts (initBangOpts dflags)) con_name False rep_nm
+                      bangs
+                      [] univ_tvs ex_tvs user_bndrs eq_preds ctxt' arg_tys' res_ty' rep_tycon tag_map }
+       ; mapM build_one names }
 
 tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
   -- NB: don't use res_kind here, as it's ill-scoped. Instead,
   -- we get the res_kind by typechecking the result type.
           (ConDeclGADT { con_names = names
                        , con_outer_bndrs = L _ outer_bndrs
-                       , con_inner_bndrs = inner_bndrs
-                       , con_cxts = cxts, con_g_args = hs_args
+                       , con_telescope = inner_bndrs
+                       , con_g_args = hs_args
                        , con_res_ty = hs_res_ty })
   = addErrCtxt (DataConDefCtxt names) $
     do { traceTc "tcConDecl 1 gadt" $
@@ -4190,13 +5859,48 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
               , text "outer_bndrs:" <+> ppr outer_bndrs
               , text "inner_bndrs:" <+> ppr inner_bndrs ]
        ; let L _ name :| _ = names
+       ; let is_context (L _ HsGadtContext{}) = True
+             is_context _ = False
+             is_required (L _ (HsGadtForAll _ HsForAllVis{})) = True
+             is_required _ = False
+             (terminal, terminal_order, remaining, hs_result)
+               = case HsDecls.splitGadtInterior hs_args hs_res_ty of
+                   Just (groups, result) -> ([g | Left g <- groups], 0, groups, result)
+                   Nothing -> case HsDecls.splitGadtTerminal hs_args hs_res_ty of
+                     Nothing -> ([], 0, [], hs_res_ty)
+                     Just (groups, count, result)
+                       -- The historical layout stores one context position.
+                       -- For a required group it stores the context first.
+                       | any is_context groups
+                       , any is_context inner_bndrs || any is_required groups
+                       -> (groups, 0, map Left groups, result)
+                       | otherwise -> (groups, count, [], result)
+             suffix = map source_group
+                        [group | group <- remaining, not (empty_source_group group)]
+             -- See Note [Empty groups in prefix constructor signatures].
+             ordered = case hs_args of
+               PrefixConGADT _ [] ->
+                 let (leading, after_first_field) = break is_field suffix
+                 in any is_type_group (dropWhile (not . is_context_group) leading) ||
+                    any (not . is_field) after_first_field
+               _ -> any (not . is_field) suffix
+             is_forall (L _ HsGadtForAll{}) = True
+             is_forall _ = False
+             fields = case hs_args of
+               PrefixConGADT ann prefix -> PrefixConGADT ann (prefix ++ [f | Right f <- remaining])
+               _ -> hs_args
+             semantic_prefix = [g | g@(L _ group) <- inner_bndrs
+                                  , not (HsDecls.isEmptyGadtGroup group)]
+       ; when (ordered && any is_forall (dropWhile (not . is_context) semantic_prefix)) $
+           setSrcSpanA (getLoc hs_res_ty) $
+           failWithTc (TcRnNestedForallsContexts NFC_GadtConSig)
        ; skol_info <- mkSkolemInfo (DataConSkol name)
-       ; (tclvl, wanted, (tc_outer, (inner_tvbs, (ctxt, arg_tys, res_ty, field_lbls, stricts))))
-           <- pushLevelAndSolveEqualitiesX "tcConDecl:GADT"                $
-              tcOuterTKBndrs skol_info outer_bndrs                         $
-              tcExplicitTKBndrs skol_info (gadtTelescopeBndrs inner_bndrs) $
-              do { ctxt <- tcHsContext cxts
-                 ; (res_ty, res_kind) <- tcInferLHsTypeKind hs_res_ty
+       ; tcCheckRuntimeForAllMatchability (hsOuterMatchability outer_bndrs)
+       ; (tclvl, wanted, (tc_outer, (inner_tvbs, ctxt, (arg_tys, res_ty, field_lbls, stricts))))
+           <- pushLevelAndSolveKindArrowsX "tcConDecl:GADT" $
+              tcOuterTKBndrs skol_info outer_bndrs $
+              tcConDeclTelescope skol_info (inner_bndrs ++ terminal) $
+              do { (res_ty, res_kind) <- tcInferLHsTypeKind hs_result
                          -- See Note [GADT return kinds]
 
                  -- For data instances (only), ensure that the return type,
@@ -4214,11 +5918,11 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
 
                    -- See Note [Datatype return kinds]
                  ; let exp_kind = getArgExpKind new_or_data res_kind
-                 ; btys <- tcConGADTArgs exp_kind hs_args
+                 ; btys <- tcConGADTArgs exp_kind fields
 
                  ; let (arg_tys, stricts) = unzip btys
                  ; field_lbls <- lookupConstructorFields $ noUserRdr name
-                 ; return (ctxt, arg_tys, res_ty, field_lbls, stricts)
+                 ; return (arg_tys, res_ty, field_lbls, stricts)
                  }
 
        -- Must do this scopedSortOut /after/ solving the equalities (#28135)
@@ -4227,10 +5931,10 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
              tvbs       = outer_tvbs ++ inner_tvbs
 
        ; inf_tkvs <- kindGeneralizeAll skol_info
-                     (mkForAllTys tvbs         $
-                      tcMkPhiTy ctxt           $
-                      tcMkScaledFunTys arg_tys $
-                      res_ty)
+                    (mkForAllTys (map (unmatchableDataConTy,) tvbs) $
+                     tcMkPhiTy ctxt           $
+                     tcMkScaledFunTysU arg_tys $
+                     res_ty)
        ; traceTc "tcConDecl:GADT" (ppr names $$ ppr res_ty $$ ppr inf_tkvs)
        ; reportUnsolvedEqualities skol_info inf_tkvs tclvl wanted
 
@@ -4260,11 +5964,31 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
        ; dflags <- getDynFlags
        ; let
            buildOneDataCon (L _ name) = do
-             { is_infix <- tcConIsInfixGADT name hs_args
+             { is_infix <- tcConIsInfixGADT name fields
              ; rep_nm   <- newTyConRepName name
 
              ; let bang_opts = SrcBangOpts (initBangOpts dflags)
-             ; buildDataCon fam_envs bang_opts name is_infix
+             ; let order
+                     -- The legacy terminal forall layout is restricted to
+                     -- constructors without existential binders. A terminal
+                     -- context alone already supports existential types.
+                     -- Use the ordered layout for refined results as well.
+                     -- See Note [Result equalities of ordered constructors]
+                     -- in GHC.Tc.Gen.Pat.
+                     | ordered || (terminal_order /= 0 &&
+                                   (new_or_data == NewType || not (null eq_preds) ||
+                                    (terminal_order > 0 && not (null ex_tvs)))) =
+                         let encoded_suffix = if ordered then suffix else map (source_group . Left) terminal
+                             late_count = sum [n | ConTypeArgs n <- encoded_suffix]
+                             leading_context = sum [length (hsConDeclTheta (Just ctxt))
+                                                    | L _ (HsGadtContext ctxt) <- inner_bndrs]
+                             initial = ConTypeArgs (length tvbndrs' - late_count) :
+                               [ConContextArgs leading_context | leading_context /= 0]
+                             (leading_types, rest) = span is_type_group
+                               (initial ++ prefix_group hs_args ++ encoded_suffix)
+                         in OrderedConArgs (ConTypeArgs (sum [n | ConTypeArgs n <- leading_types]) : rest)
+                     | otherwise = LegacyConOrder terminal_order
+             ; buildDataConWithTelescope order [] fam_envs bang_opts name is_infix
                             rep_nm stricts field_lbls
                             univ_tvs ex_tvs tvbndrs' eq_preds
                             ctxt' arg_tys' res_ty' rep_tycon tag_map
@@ -4273,6 +5997,120 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
                   --      that way checkValidDataCon can complain if it's wrong.
              }
        ; mapM buildOneDataCon names }
+  where
+    empty_source_group (Left (L _ group)) = HsDecls.isEmptyGadtGroup group
+    empty_source_group _ = False
+
+    is_field ConValueArgs{} = True
+    is_field _ = False
+
+    is_context_group ConContextArgs{} = True
+    is_context_group _ = False
+
+    is_type_group ConTypeArgs{} = True
+    is_type_group _ = False
+
+    prefix_group (PrefixConGADT _ fields@(_ : _)) = [ConValueArgs (length fields)]
+    prefix_group _ = []
+
+    source_group (Right _) = ConValueArgs 1
+    source_group (Left (L _ (HsGadtContext ctxt))) =
+      ConContextArgs (length (hsConDeclTheta (Just ctxt)))
+    source_group (Left (L _ (HsGadtForAll _ HsForAllInvis { hsf_invis_bndrs = bs }))) =
+      ConTypeArgs (length bs)
+    source_group (Left (L _ (HsGadtForAll _ HsForAllVis { hsf_vis_bndrs = bs }))) =
+      ConTypeArgs (length bs)
+    source_group _ = panic "tcConDecl: invalid interior telescope group"
+
+{- Note [Empty groups in prefix constructor signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A nested forall can bind no variables, and a context can have no
+predicates. Keep those groups in the source telescope. They consume no
+arguments, so the quoted and compiled constructor omit them. If only
+fields remain after omitting empty groups, use the ordinary worker. A real group after a field, or a real binder after
+a leading context, still needs the ordered constructor layout. An empty
+leading context can leave adjacent type groups. Combine those groups in
+the initial binder count so that the interface starts its ordered groups
+at the first field or real context.
+-}
+
+-- | Check the syntax admitted for a retained constructor field telescope.
+checkRetainedConShape :: NewOrData -> [LHsGadtTelescope GhcRn]
+                      -> HsConDeclGADTDetails GhcRn -> LHsType GhcRn -> TcM ()
+checkRetainedConShape new_or_data telescope args res_ty
+  = setSrcSpanA (getLoc res_ty) $
+    do { strict_data <- xoptM LangExt.StrictData
+       ; unless (not strict_data && new_or_data /= NewType
+                 && not (any is_forall (dropWhile (not . has_context) telescope))
+                 && plain_prefix args) $
+           failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration }
+  where
+    has_context (L _ (HsGadtContext (L _ (HsContext _ ctxt)))) = not (null ctxt)
+    has_context _ = False
+
+    is_forall (L _ HsGadtForAll{}) = True
+    is_forall _ = False
+
+    plain_prefix (PrefixConGADT _ fields) = all plain_field fields
+    plain_prefix _ = False
+    plain_field (CDF _ unpack strict _ _ _)
+      = not (isSrcUnpacked unpack) && not (isSrcStrict strict)
+
+-- | A retained result has no erased binders or context.
+retainedResultAllowed :: HsOuterSigTyVarBndrs GhcRn
+                      -> [LHsGadtTelescope GhcRn] -> HsConDeclGADTDetails GhcRn
+                      -> Bool
+retainedResultAllowed HsOuterImplicit{} [] PrefixConGADT{} = True
+retainedResultAllowed _ _ _ = False
+
+-- | Split fields with their explicit metadata, including vacuous binders.
+splitRetainedConFields :: [Maybe Id] -> Type -> ([Scaled Type], Type)
+splitRetainedConFields [] ty = ([], ty)
+splitRetainedConFields (mb : rest) ty
+  = case (mb, coreFullView ty) of
+      (Just b, DepFunTy _ b' body)
+        | b == b' -> add (Scaled ManyTy (varType b)) body
+      (_, FunTy { ft_mult = mult, ft_arg = arg, ft_res = body })
+        -> add (Scaled mult arg) body
+      _ -> pprPanic "splitRetainedConFields" (ppr ty)
+  where
+    add arg body = let (args, result) = splitRetainedConFields rest body
+                   in (arg : args, result)
+
+{- Note [Source retained constructor declarations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The parser leaves a foreach suffix intact in con_res_ty. Check that suffix
+as a telescope, not as the constructor result. Keep explicit field metadata:
+mkDepFunTy turns an unused retained binder into an ordinary arrow. Carry the
+full telescope through generalisation and zonking. Native domains are closed
+and zonked before metadata allocation, so zonking preserves each metadata Id
+and its domain.
+
+Split the zonked telescope before applying the result substitution. Map that
+substitution lazily over the field types. Field counts and list spines must
+not force rejigConRes while the parent TyCon is still knot-tied.
+rejigConRes substitutes only erased type variables. It cannot rename or
+capture a retained field Id. Keep its existential and equality metadata until
+checkValidDataCon can check it after the parent knot is complete.
+
+For an Haskell98 retained record, keep the same lazy field spine.
+Splitting an arrow can inspect the kind of its result, which still refers
+to the unfinished parent. Check the record's payload shape in
+checkValidDataCon after the parent TyCon is available.
+
+Kind inference checks domain kinds without inspecting unfinished datatype
+constructor graphs. Final checking validates the fixed native index domain.
+Erased outer quantifiers keep their ordinary GADT scope. The retained Ids
+are fields. An ordinary retained package has no EqSpec and can carry erased
+existential binders and class contexts. A retained result gets one EqSpec per
+result argument that uses a retained field, with no existential binders or
+class contexts.
+See Note [Retained constructor result equality] in GHC.Core.DataCon.
+Neither form permits strict fields or newtypes.
+Reject StrictData rather than changing its field evaluation rules.
+See Note [Retained constructor field telescopes] in GHC.Core.DataCon and
+Note [Source retained signatures] in GHC.Tc.Gen.HsType.
+-}
 
 {- Note [GADT return types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4455,7 +6293,14 @@ unannotatedMultIsLinear isPrefixConGADT = do
 tcDataConMult :: IsPrefixConGADT -> HsModifiedFunArr GhcRn -> TcM Mult
 tcDataConMult isPrefixConGADT mult = do
   isLinear <- unannotatedMultIsLinear isPrefixConGADT
-  tcMultDefault (if isLinear then oneDataConTy else manyDataConTy) mult
+  annotation <- tcFieldModifiers isPrefixConGADT mult
+  pure (fromMaybe (if isLinear then oneDataConTy else manyDataConTy) annotation)
+
+-- | A prefix GADT declaration attaches its modifiers to an arrow.
+-- Record declarations attach theirs to the field name.
+tcFieldModifiers :: IsPrefixConGADT -> HsModifiedFunArr GhcRn -> TcM (Maybe Mult)
+tcFieldModifiers IsPrefixConGADT    = tcConArrowMult
+tcFieldModifiers IsNotPrefixConGADT = tcMult
 
 {-
 Note [Function arrows in GADT constructors]
@@ -4860,17 +6705,18 @@ Validity checking is done once the mutually-recursive knot has been
 tied, so we can look at things freely.
 -}
 
-checkValidTyCl :: TyCon -> TcM [TyCon]
+checkValidTyCl :: NameEnv [TyFamEqnValidityInfo] -> TyCon -> TcM [TyCon]
 -- The returned list is either a singleton (if valid)
 -- or a list of "fake tycons" (if not); the fake tycons
 -- include any implicits, like promoted data constructors
 -- See Note [Recover from validity error]
-checkValidTyCl tc
+checkValidTyCl selectors tc
   = setSrcSpan (getSrcSpan tc) $
     addTyConCtxt tc            $
     recoverM recovery_code     $
     do { traceTc "Starting validity for tycon" (ppr tc)
-       ; checkValidTyCon tc
+       ; checkValidTyConWithSelectors selectors tc
+       ; checkStandaloneFamilyCoverage tc
        ; checkTyConConsistentWithBoot tc -- See Note [TyCon boot consistency checking]
        ; traceTc "Done validity for tycon" (ppr tc)
        ; return [tc] }
@@ -4884,7 +6730,12 @@ checkValidTyCl tc
       | isClassTyCon tc = tc   -- Ugh! Note [Recover from validity error]
       | otherwise       = makeRecoveryTyCon tc
 
-    child_tycons tc = tyConATs tc ++ map promoteDataCon (tyConDataCons tc)
+    child_tycons tc = tyConATs tc ++
+                      [ promoteDataCon dc
+                      | dc <- tyConDataCons tc
+                      , null (dataConRepArgBinders dc) ]
+      -- Retained fields have no promoted TyCon, including during recovery.
+      -- See Note [Retained constructor field telescopes] in GHC.Core.DataCon.
 
 {- Note [Recover from validity error]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4992,7 +6843,10 @@ are validity checking, so they need to be in the environment.
 -}
 
 checkValidTyCon :: TyCon -> TcM ()
-checkValidTyCon tc
+checkValidTyCon = checkValidTyConWithSelectors emptyNameEnv
+
+checkValidTyConWithSelectors :: NameEnv [TyFamEqnValidityInfo] -> TyCon -> TcM ()
+checkValidTyConWithSelectors selectors tc
   | isPrimTyCon tc   -- Happens when Haddock'ing GHC.Prim
   = return ()
 
@@ -5015,15 +6869,15 @@ checkValidTyCon tc
               -> case fam_flav of
                { ClosedTypeFamilyTyCon ctf ->
                  case ctf of
-                   { CTF (Just ax) ->
-                       addErrCtxt (ClosedFamEqnCtxt tc) $ checkValidCoAxiom ax
-                   ; CTF Nothing -> return ()
+                   { _ | Just ax <- closedTyFamCoAxiom_maybe ctf ->
+                       addErrCtxt (ClosedFamEqnCtxt tc) $ checkValidCoAxiom selectors ax
                    ; CTF_Abstract ->
                      do { hsBoot <- tcIsHsBootOrSig
                         ; checkTc hsBoot $ TcRnAbstractClosedTyFamDecl }
-                   ; CTF_BuiltIn {} -> return () }
+                   ; _ -> return () }
                ; DataFamilyTyCon {}  -> return ()
-               ; OpenTypeFamilyTyCon -> return () }
+               ; OpenTypeFamilyTyCon -> return ()
+               ; ConstrainedTypeFamilyTyCon -> return () }
 
              | otherwise -> do
                { -- Check the context on the data decl
@@ -5161,6 +7015,27 @@ checkValidDataCon dflags existential_ok tc con
               arg_tys     = dataConOrigArgTys con
               orig_res_ty = dataConOrigResTy  con
 
+        ; unless (null (dataConRepArgBinders con)) $
+          do { let univ_tvs = dataConUnivTyVars con
+                   ex_tvs   = dataConExTyCoVars con
+                   user_tvs = binderVars (dataConUserTyVarBinders con)
+                   (_, _, eq_spec, theta, _, _) = dataConFullSig con
+                   retained_fields = [field | Just field <- dataConRepArgBinders con]
+                   valid_eq_spec = null eq_spec ||
+                     validRetainedResultEqSpec univ_tvs retained_fields eq_spec
+             ; unless (isBoxedDataTyCon tc && isLiftedAlgTyCon tc
+                       && isVanillaAlgTyCon tc && not (isTypeDataTyCon tc)
+                       && all isTyVar ex_tvs
+                       && validRetainedConTheta theta
+                       && ((null theta && null ex_tvs)
+                           || (null eq_spec && user_tvs == univ_tvs ++ ex_tvs))
+                       && valid_eq_spec && checkDataConTyVars con
+                       && sizeVarSet (mkVarSet user_tvs) == length user_tvs) $
+                 failWithTc $ TcRnRetainedQuantificationError RetainedPackageDeclaration
+             ; unless (null (dataConFieldLabels con) ||
+                       validRetainedRecordFields (dataConRepArgBinders con) arg_tys) $
+                 failWithTc $ TcRnRetainedQuantificationError RetainedRecordDeclaration }
+
         ; traceTc "checkValidDataCon" (vcat
               [ ppr con, ppr tc, ppr tc_tvs
               , ppr res_ty_tmpl <+> dcolon <+> ppr (typeKind res_ty_tmpl)
@@ -5190,12 +7065,40 @@ checkValidDataCon dflags existential_ok tc con
             --    type family Star where Star = Type
             --    newtype T :: Type where MkT :: Int -> (T :: Star)
 
+        ; let is_ordered = case dataConSourceOrder con of
+                 OrderedConArgs _ -> True
+                 LegacyConOrder _ -> False
+        ; when (dataConTerminalOrder con /= 0 || is_ordered) $
+            do { let (early, late) = dataConUserTyVarGroups con
+                     (_, ex_tvs, eq_spec, theta, _, _) = dataConFullSig con
+                     res_kind = tyConResKind tc
+                     valid_res_kind
+                       | isNewTyCon tc = True
+                       | otherwise = maybe False isBoxedRuntimeRep (kindRep_maybe res_kind)
+                     prefix_theta = if dataConHasTrailingContext con then [] else theta
+                     prefix_types = map (varType . binderVar) early ++ prefix_theta ++
+                       concatMap (\(Scaled mult ty) -> [mult, ty]) arg_tys
+                     scope_ok
+                       | OrderedConArgs groups <- dataConSourceOrder con
+                       = orderedConArgsHaveScope groups (early ++ late) theta arg_tys
+                       | otherwise = disjointVarSet (mkVarSet (binderVars late)) (tyCoVarsOfTypes prefix_types)
+               ; checkTc ((null ex_tvs ||
+                            ((dataConTerminalOrder con == gadtTrailingContextOnly || is_ordered) &&
+                             all isTyVar ex_tvs))
+                          && (is_ordered || null eq_spec)
+                          && null (dataConStupidTheta con)
+                          && valid_res_kind
+                          && scope_ok)
+                         (TcRnNestedForallsContexts NFC_GadtConSig) }
         ; traceTc "checkValidDataCon 2" $ ppr (dataConWrapperType con)
 
           -- Check that the result type is a *monotype*
           --  e.g. reject this:   MkT :: T (forall a. a->a)
           -- Reason: it's really the argument of an equality constraint
-        ; checkValidMonoType orig_res_ty
+        ; unless (dataConHasRetainedResult con) $
+            checkValidMonoType orig_res_ty
+            -- Check the retained result in the wrapper type where the field
+            -- and the unchanged erased arguments are bound.
         ; checkEscapingKind (dataConWrapperType con)
 
         -- For /data/ types check that each argument has a fixed runtime rep
@@ -5239,6 +7142,8 @@ checkValidDataCon dflags existential_ok tc con
               check_bang orig_arg_ty bang rep_bang n
                | HsSrcBang _  _ SrcLazy <- bang
                , not (xopt LangExt.LazyFieldAnnotations dflags)
+               -- Retained constructors already accept an explicit lazy prefix.
+               , null (dataConRepArgBinders con)
                = addErrTc (bad_bang n LazyFieldsDisabled)
 
                -- Warn about UNPACK without "!"
@@ -5396,8 +7301,9 @@ checkValidClass cls
         -- Check the class operations.
         -- But only if there have been no earlier errors
         -- See Note [Abort when superclass cycle is detected]
-        ; whenNoErrs $
-          mapM_ (check_op constrained_class_methods) op_stuff
+        ; whenNoErrs $ do
+            forM_ at_stuff $ \(ATI fam_tc _) -> checkAssociatedFamilyCoverage cls fam_tc
+            mapM_ (check_op constrained_class_methods) op_stuff
 
         -- Check the associated type defaults are well-formed and instantiated
         ; mapM_ check_at at_stuff  }
@@ -5545,8 +7451,10 @@ checkValidClass cls
           --
           --    foo2         :: a -> Int
           --    default foo2 :: a -> b
-          unless (isJust (tcMatchTy dm_phi_ty vanilla_phi_ty) &&
-                  isJust (tcMatchTy vanilla_phi_ty dm_phi_ty)) $
+          unless (let in_scope = mkInScopeSet (tyCoVarsOfTypes [dm_phi_ty, vanilla_phi_ty])
+                      init_sub = mkEmptySubst in_scope
+                  in isJust (tcMatchRetainedTyX_BM alwaysBindTv init_sub dm_phi_ty vanilla_phi_ty) &&
+                     isJust (tcMatchRetainedTyX_BM alwaysBindTv init_sub vanilla_phi_ty dm_phi_ty)) $
             addErrTc $
             TcRnDefaultSigMismatch sel_id dm_ty
 
@@ -5560,7 +7468,12 @@ checkFamFlag :: Name -> TcM ()
 -- client might have a go!
 checkFamFlag tc_name
   = do { idx_tys <- xoptM LangExt.TypeFamilies
-       ; unless idx_tys $ addErrTc (TcRnTyFamsDisabled (TyFamsDisabledFamily tc_name)) }
+       ; lifted_lambda <- if any (`List.isPrefixOf` occNameString (nameOccName tc_name))
+                                  ["$lambda:", "$case:"]
+                          then xoptM LangExt.DependentTypes
+                          else pure False
+       ; unless (idx_tys || lifted_lambda) $
+           addErrTc (TcRnTyFamsDisabled (TyFamsDisabledFamily tc_name)) }
 
 checkResultSigFlag :: Name -> FamilyResultSig GhcRn -> TcM ()
 checkResultSigFlag tc_name (TyVarSig _ tvb)
@@ -5882,8 +7795,11 @@ checkValidRoles tc
   where
     check_dc_roles datacon
       = do { traceTc "check_dc_roles" (ppr datacon <+> ppr (tyConRoles tc))
-           ; mapM_ (check_ty_roles role_env Representational) $
-             eqSpecPreds eq_spec ++ theta ++ map scaledThing arg_tys }
+           ; mapM_ (check_ty_roles result_env Representational) (eqSpecPreds eq_spec)
+           ; mapM_ (check_ty_roles role_env Representational) theta
+           ; if null field_binders
+             then mapM_ (check_ty_roles role_env Representational) (map scaledThing arg_tys)
+             else check_fields role_env field_binders arg_tys }
                     -- See Note [Role-checking data constructor arguments] in GHC.Tc.TyCl.Utils
       where
         (univ_tvs, ex_tvs, eq_spec, theta, arg_tys, _res_ty)
@@ -5892,10 +7808,55 @@ checkValidRoles tc
               -- zipVarEnv uses zipEqual, but we don't want that for ex_tvs
         ex_roles   = mkVarEnv (map (, Nominal) ex_tvs)
         role_env   = univ_roles `plusVarEnv` ex_roles
+        field_binders = dataConRepArgBinders datacon
+        result_env = foldl' (\env field -> extendVarEnv env field Nominal)
+                            role_env [field | Just field <- field_binders]
+
+    -- See Note [Roles of retained constructor fields] in GHC.Tc.TyCl.Utils.
+    check_fields _ [] [] = return ()
+    check_fields env (binder : binders) (Scaled mult ty : tys)
+      = do { check_ty_roles env Nominal mult
+           ; check_ty_roles env Representational ty
+           ; let env' = maybe env (\v -> extendVarEnv env v Nominal) binder
+           ; check_fields env' binders tys }
+    check_fields _ _ _ = pprPanic "checkValidRoles: misaligned retained fields" (ppr tc)
 
     check_ty_roles env role ty
       | Just ty' <- coreView ty -- #14101
       = check_ty_roles env role ty'
+
+    check_ty_roles env _ ty@(TermAppTy f arg)
+      | isNativeIndexFunctionId f || isNativeDepFunctionId f
+      , isNativeNamedOpaqueFunctionId f || lookupVarEnv env f == Just Nominal
+      = check_ty_roles env Nominal (varType f) >> check_ty_roles env Nominal arg
+      | otherwise = pprPanic "check_ty_roles: invalid native call scope" (ppr ty)
+    check_ty_roles env _ ty@(TermVarTy v)
+      | isNativeNamedOpaqueFunctionId v = pure ()
+      | Just Nominal <- lookupVarEnv env v, isNativeRetainedBinder v
+      = check_ty_roles env Nominal (varType v) >> check_ty_roles env Nominal (idMult v)
+      | otherwise = pprPanic "check_ty_roles: invalid runtime index scope" (ppr ty)
+    check_ty_roles env role ty@(DepFunTy _ v body)
+      | isNativeRetainedBinder v
+      = check_ty_roles env Nominal (varType v) >>
+          check_ty_roles env Nominal (idMult v) >>
+          check_ty_roles (extendVarEnv env v Nominal) role body
+      | otherwise = pprPanic "check_ty_roles: invalid retained binder" (ppr ty)
+
+    check_ty_roles env role (ExistsTy _ v body)
+      | typeKind (varType v) `eqType` liftedTypeKind
+      , typeKind body `eqType` liftedTypeKind
+      = check_ty_roles env Nominal (varType v)
+      >> check_ty_roles (extendVarEnv env v Nominal) role body
+      | otherwise
+      = check_ty_roles env Nominal (varType v)
+      >> check_ty_roles (extendVarEnv env v Nominal) Nominal body
+
+    check_ty_roles env role (DepDictTy d body)
+      = check_ty_roles env Nominal (varType d)
+      >> check_ty_roles (extendVarEnv env d Nominal) role body
+
+    check_ty_roles env _ (ClassAppTy sel inst dict operand kind)
+      = mapM_ (check_ty_roles env Nominal) [varType sel, inst, dict, operand, kind]
 
     check_ty_roles env role (TyVarTy tv)
       = case lookupVarEnv env tv of
@@ -5917,13 +7878,15 @@ checkValidRoles tc
       =  check_ty_roles env role    ty1
       >> check_ty_roles env Nominal ty2
 
-    check_ty_roles env role (FunTy _ w ty1 ty2)
-      =  check_ty_roles env Nominal w
+    check_ty_roles env role (FunTy _ ma w ty1 ty2)
+      =  check_ty_roles env Nominal ma
+      >> check_ty_roles env Nominal w
       >> check_ty_roles env role ty1
       >> check_ty_roles env role ty2
 
-    check_ty_roles env role (ForAllTy (Bndr tv _) ty)
-      =  check_ty_roles env Nominal (tyVarKind tv)
+    check_ty_roles env role (ForAllTy ma (Bndr tv _) ty)
+      =  check_ty_roles env Nominal ma
+      >> check_ty_roles env Nominal (tyVarKind tv)
       >> check_ty_roles (extendVarEnv env tv Nominal) role ty
 
     check_ty_roles _   _    (LitTy {}) = return ()
@@ -5960,6 +7923,7 @@ addVDQNote :: TcTyCon -> TcM a -> TcM a
 addVDQNote tycon thing_inside
   | assertPpr (isMonoTcTyCon tycon) (ppr tycon $$ ppr tc_kind)
     has_vdq
+  , not (isDependentCaseFamily (tyConName tycon))
   = addErrCtxt (VDQWarningCtxt tycon) thing_inside
   | otherwise
   = thing_inside
@@ -5967,9 +7931,9 @@ addVDQNote tycon thing_inside
       -- Check whether a tycon has visible dependent quantification.
       -- This will *always* be a TcTyCon. Furthermore, it will *always*
       -- be an ungeneralised TcTyCon, straight out of kcInferDeclHeader.
-      -- Thus, all the TyConBinders will be anonymous. Thus, the
-      -- free variables of the tycon's kind will be the same as the free
-      -- variables from all the binders.
+      -- Look for dependencies still expressed as free variables. This
+      -- excludes the visible dependencies bound in private sum payloads.
+      -- See Note [Provisional kinds of sum payloads].
     has_vdq  = any is_vdq_tcb (tyConBinders tycon)
     tc_kind  = tyConKind tycon
     kind_fvs = tyCoVarsOfType tc_kind

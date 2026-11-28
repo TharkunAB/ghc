@@ -1,0 +1,7 @@
+NativeDataFamilyConstrainedCon.hs:9:19: error: [GHC-64578]
+    • Data constructor ‘MkStored’ cannot be used here
+        (it comes from a data family instance)
+    • In the first argument of ‘Proxy’, namely ‘('MkStored 'True)’
+      In the type ‘Proxy ('MkStored 'True)’
+      In the type synonym declaration for ‘Bad’
+

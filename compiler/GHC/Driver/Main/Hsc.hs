@@ -37,13 +37,20 @@ module GHC.Driver.Main.Hsc
     , hscSimpleIface'
     , writeInterfaceOnlyMode
     , genModDetails
+    , nativeOptLevel
+    , checkNativeDependentModule
+    , hasNativeDependentModuleBody
+    , nativeCodeGenFlags
 
     ) where
 
 import GHC.Prelude
 
+import Data.Maybe (isNothing, maybeToList)
+
 import GHC.Driver.Plugins
 import GHC.Driver.Session
+import GHC.Driver.DynFlags ( optLevelFlags )
 import GHC.Driver.Backend
 import GHC.Driver.Env
 import GHC.Driver.Env.KnotVars
@@ -64,8 +71,16 @@ import GHC.Iface.Tidy
 import GHC.HsToCore.Breakpoints.Types (ModBreaks)
 
 import GHC.Core
+import GHC.Core.Dependent
+    ( supportsScopedDictionaryCore, hasNativeDependentProgram, rejectNativeDependentProgram
+    , hasNativeDependentExpr, rejectNativeDependentExpr, hasRetainedRuleHead )
+import GHC.Core.DataCon ( dataConWorkId, dataConWrapId_maybe )
+import GHC.Core.TyCon ( TyCon, isTypeDataTyCon, tyConDataCons_maybe )
+import GHC.Types.Id ( idType )
+import GHC.Types.TyThing ( TyThing(AnId) )
 
 import GHC.Parser.Errors.Types
+import GHC.Platform ( platformArch, Arch(ArchJavaScript) )
 
 import GHC.Tc.Utils.Monad
 
@@ -152,6 +167,90 @@ initHscEnv mb_top_dir = do
 
 
 -- -----------------------------------------------------------------------------
+
+-- | Check the supported options for a module containing native dependent Core.
+-- Return whether the module needs the checked native pipeline.
+checkNativeDependentModule :: HscEnv -> CoreProgram -> [CoreRule] -> [TyCon] -> IO Bool
+checkNativeDependentModule hsc_env binds rules tycons = do
+  let native_body = hasNativeDependentModuleBody binds rules tycons
+  -- A closed user rule can mention its imported retained function only
+  -- through ru_fn. See Note [Rules at a retained function head].
+  retained_heads <- if native_body then pure [] else
+    fmap concat $ forM [fn | Rule{ru_auto = False, ru_fn = fn} <- rules] $ \name -> do
+      thing <- GHC.Driver.Env.lookupType hsc_env name
+      pure [Type (idType fun) | Just (AnId fun) <- [thing], hasRetainedRuleHead fun]
+  let native = native_body || not (null retained_heads)
+      dflags = hsc_dflags hsc_env
+      opt_level = nativeOptLevel dflags
+      reject phase = do
+        rejectNativeDependentProgram phase binds rules
+        mapM_ (rejectNativeDependentExpr phase) (nativeDependentConstructors tycons ++ retained_heads)
+  when native $ do
+    -- See Note [Compiling native dependent modules] in GHC.Driver.Main.Passes.
+    unless (backendGeneratesCode (backend dflags)) $
+      reject "module compilation without an object or bytecode backend"
+    when (backendUseJSLinker (backend dflags) || platformArch (targetPlatform dflags) == ArchJavaScript) $
+      reject "JavaScript code generation"
+    when (profAuto dflags /= NoProfAuto
+          || not (null (callerCcFilters dflags))
+          || any (`gopt` dflags) [ Opt_ProfLateInlineCcs, Opt_ProfLateCcs
+                                , Opt_ProfLateOverloadedCcs, Opt_ProfLateoverloadedCallsCCs ]) $
+      reject "profiling or late cost-centre insertion"
+    when (usesOptimizedFlags dflags && isNothing opt_level) $
+      reject "optimized module compilation with these options (use -O0 or a standard -O1 or -O2 native object pipeline)"
+    when (gopt Opt_WriteIfSimplifiedCore dflags && not (supportsScopedDictionaryCore binds)) $
+      reject "Core interface serialization (use -fno-write-if-simplified-core)"
+    -- See Note [Plugin hooks and Dependent Haskell pipelines] in GHC.Driver.Plugins.
+    when (hasActiveLatePlugins hsc_env) $
+      reject "late plugins"
+  return native
+
+-- | Detect retained Core in the checked module, including implicit constructors.
+hasNativeDependentModuleBody :: CoreProgram -> [CoreRule] -> [TyCon] -> Bool
+hasNativeDependentModuleBody binds rules tycons =
+  hasNativeDependentProgram binds rules || any hasNativeDependentExpr (nativeDependentConstructors tycons)
+
+nativeDependentConstructors :: [TyCon] -> [CoreExpr]
+nativeDependentConstructors tycons =
+  [ Type (idType cid)
+  | tc <- tycons
+  , not (isTypeDataTyCon tc)
+  , Just dcs <- [tyConDataCons_maybe tc]
+  , dc <- dcs
+  , cid <- dataConWorkId dc : maybeToList (dataConWrapId_maybe dc) ]
+
+-- | Select a retained optimization level when optimization passes are active
+-- and no unsupported transformation flags are enabled.
+-- See Note [Disabling rewrite rules in retained modules].
+nativeOptLevel :: DynFlags -> Maybe Int
+nativeOptLevel dflags
+  | usesOptimizedFlags dflags
+  , not (any (`gopt` dflags)
+      [ Opt_LateSpecialise, Opt_WorkerWrapperUnlift, Opt_SpecEvalDictFun ])
+  = Just (if uses_o2_flag then 2 else 1)
+  | otherwise = Nothing
+  where
+    uses_o2_flag =
+      any (\(levels, flag) -> 2 `elem` levels && 1 `notElem` levels && gopt flag dflags)
+          optLevelFlags
+
+{- Note [Disabling rewrite rules in retained modules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A module can use an imported source equation with user rewrite rules
+disabled. Its proof may also bind a runtime value. Such a module needs
+the retained simplifier at -O1 or -O2. core2coreRetained uses the module's
+DynFlags to build the pass schedule and set sm_rules. Recognise this flag
+combination here and pass the original DynFlags to the simplifier.
+-}
+
+usesOptimizedFlags :: DynFlags -> Bool
+usesOptimizedFlags dflags =
+    any (\(levels, flag) -> 0 `notElem` levels && gopt flag dflags) optLevelFlags
+
+-- | Enable the mandatory Core and STG checks for native code generation.
+nativeCodeGenFlags :: Bool -> DynFlags -> DynFlags
+nativeCodeGenFlags True dflags = gopt_set (gopt_set dflags Opt_DoCoreLinting) Opt_DoStgLinting
+nativeCodeGenFlags False dflags = dflags
 
 getDiagnostics :: Hsc (Messages GhcMessage)
 getDiagnostics = Hsc $ \_ w -> return (w, w)

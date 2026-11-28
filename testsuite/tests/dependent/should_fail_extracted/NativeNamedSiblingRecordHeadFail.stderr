@@ -1,0 +1,14 @@
+NativeNamedSiblingRecordHeadFail.hs:7:51: error: [GHC-45510]
+    • Term variable ‘selH’ cannot be used here
+        (term variables cannot be promoted)
+    • In the first argument of ‘ResultHead’, namely ‘(selH 'True)’
+      In the type ‘ResultHead (selH 'True)’
+      In the definition of data constructor ‘MkResultHead’
+
+NativeNamedSiblingRecordHeadFail.hs:10:55: error: [GHC-45510]
+    • Term variable ‘selF’ cannot be used here
+        (term variables cannot be promoted)
+    • In the first argument of ‘Indexed’, namely ‘(selF 'True)’
+      In the type ‘Indexed (selF 'True)’
+      In the definition of data constructor ‘MkFieldHead’
+

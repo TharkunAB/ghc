@@ -1,0 +1,22 @@
+NativeTypeLambdaWrongTarget.hs:7:20: error: [GHC-25897]
+    • Couldn't match type ‘y’ with ‘x’
+      Expected: p y -> p x
+        Actual: (type lambda in a visible type argument) a p y y
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          leibnizUSymAt :: forall {a} (x :: a) (y :: a) (p :: a %U -> *).
+                           LeibnizU x y -> p y -> p x
+        at NativeTypeLambdaWrongTarget.hs:6:1-93
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          leibnizUSymAt :: forall {a} (x :: a) (y :: a) (p :: a %U -> *).
+                           LeibnizU x y -> p y -> p x
+        at NativeTypeLambdaWrongTarget.hs:6:1-93
+    • In the expression: xy @(\z -> p z -> p y) (\ px -> px)
+      In an equation for ‘leibnizUSymAt’:
+          leibnizUSymAt xy = xy @(\z -> p z -> p y) (\ px -> px)
+    • Relevant bindings include
+        xy :: LeibnizU x y (bound at NativeTypeLambdaWrongTarget.hs:7:15)
+        leibnizUSymAt :: LeibnizU x y -> p y -> p x
+          (bound at NativeTypeLambdaWrongTarget.hs:7:1)
+

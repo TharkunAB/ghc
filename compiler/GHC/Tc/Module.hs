@@ -74,9 +74,30 @@ import GHC.Tc.Gen.Annotation
 import GHC.Tc.Gen.Bind
 import GHC.Tc.Gen.Default
 import GHC.Tc.Utils.Env
-import GHC.Tc.Gen.Sig( tcRules )
+import GHC.Tc.Gen.Sig( TcSigInfo(..), completeSigPolyId_maybe, isCompleteHsSig, tcUserTypeSig, tcRules )
+import {-# SOURCE #-} GHC.HsToCore.Binds (dsHsWrapper, dsTopLHsBinds)
+import GHC.HsToCore.Monad (initDsTc)
+import GHC.Core (CoreExpr, flattenBinds)
+import qualified GHC.Core as Core
+import GHC.Core.FVs (exprSomeFreeVarsList)
+import GHC.Core.Utils (exprType)
+import GHC.Builtin.WiredIn.Types (unitDataConId)
+import GHC.Data.OrdList (fromOL)
+import GHC.Tc.Gen.SourceClosure
+  ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
+  , pruneUnusedIndexedLookups, sourceEarlyClosureTables )
+import GHC.Tc.Gen.SourceTable (hasExprHole, hasPendingTypedSplice, sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
+                               isStructuralSourceTable, isNominalStructuralSource, isSimpleNominalTable, isLargeElimTable, isLargeElimResultKind, pruneDeadNonRecLets, isSafeLocalUninterpretedRhs, rebuildSourceFamilyWith,
+                               isSourceFilterGuard, sourceTableCallees, sourceTableFamilyUse,
+                               sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
+                               hasSourceMethodRule, hasSourceMethodRuleAt, sourceLiteralWorkers, checkSourceMethodUses,
+                               checkOptionalSourceUses, checkAndInstallSourceProofs,
+                               addSourceMethods, certifyLocalInstanceMethods,
+                               sourceMapSelector, sourceTableDependencies)
 import GHC.Tc.Gen.Foreign
+import GHC.Tc.Deriv (DerivInfo)
 import GHC.Tc.TyCl.Instance
+import GHC.Tc.TyCl.Utils ( addTyConsToGblEnv )
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Solver
@@ -100,7 +121,7 @@ import GHC.Iface.Decl    ( coAxiomToIfaceDecl )
 import GHC.Iface.Env     ( externaliseName )
 import GHC.Iface.Load
 
-import GHC.Builtin.WiredIn.Types ( mkListTy, anyTypeOfKind )
+import GHC.Builtin.WiredIn.Types ( mkListTy, anyTypeOfKind, manyDataConTy, matchableDataConTy, unmatchableDataConTy )
 import GHC.Builtin.Modules( mAIN_NAME, gHC_PRIM, rOOT_MAIN, isWiredInOnlyModule )
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs
@@ -114,16 +135,20 @@ import GHC.Core.Predicate ( classMethodTy )
 import GHC.Core.InstEnv
 import GHC.Core.TyCon
 import GHC.Core.DataCon
+import GHC.Core.ConLike (ConLike(RealDataCon))
+import GHC.Core.OpenWhnf (openDataConFieldTypes)
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Compare ( eqScopedSigmaClosures, eqScopedLambdaClosures )
 import GHC.Core.Type
 import GHC.Core.Class
+import GHC.Core.Coercion (coercionLKind, coercionRKind)
 import GHC.Core.Coercion.Axiom
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.TyCo.Ppr( debugPprType )
 import GHC.Core.TyCo.Tidy( tidyTopType )
 import GHC.Core.FamInstEnv
    ( FamInst, pprFamInst, famInstsRepTyCons, orphNamesOfFamInst
-   , famInstEnvElts, extendFamInstEnvList, normaliseType )
+   , famInstEnvElts, extendFamInstEnvList, emptyFamInstEnvs, normaliseType, normaliseTypeWithFuel )
 
 import GHC.Parser.Header       ( mkImplicitImports, mkUnresolvedImport )
 
@@ -143,7 +168,9 @@ import GHC.Types.DefaultEnv
 import GHC.Types.Fixity.Env
 import GHC.Types.Id as Id
 import GHC.Types.Id.Info( IdDetails(..) )
+import GHC.Types.Var (VarBndr(Bndr), isCoVar, setIdDetails)
 import GHC.Types.Var.Env
+import GHC.Types.Unique.FM (isNullUFM)
 import GHC.Types.TypeEnv
 import GHC.Types.Name
 import GHC.Types.Name.Env
@@ -180,10 +207,10 @@ import Control.Arrow ( second )
 import Control.DeepSeq
 import Control.Monad
 import Control.Monad.Trans.Writer.CPS
-import Data.Data ( Data )
+import Data.Data (Data, cast, gmapQ)
 import Data.Function (on)
 import Data.Functor.Classes ( liftEq )
-import Data.List ( sort, sortBy )
+import Data.List (find, partition, sort, sortBy)
 import Data.List.NonEmpty ( NonEmpty (..) )
 import qualified Data.List.NonEmpty as NE
 import Data.Ord
@@ -595,7 +622,10 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                    restoreEnvs (tcg_env, tcl_env) $
                    do { lie_main <- checkMainType tcg_env
                       ; ev_binds <- simplifyTop (lie `andWC` lie_main)
-                      ; return (tcg_env `addEvBinds` ev_binds) }
+                      ; installForgetMTyCons (tcg_env `addEvBinds` ev_binds) }
+
+        -- Prune unused speculative tables before generating Typeable bindings
+      ; tcg_env <- pruneUnusedIndexedLookups tcg_env
 
         -- Emit Typeable bindings
       ; tcg_env <- restoreEnvs (tcg_env, tcl_env) $
@@ -629,8 +659,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                                    , tcg_rules     = []
                                    , tcg_fords     = []
                                    , tcg_patsyns   = []
-                                   , tcg_type_env  = tcg_type_env tcg_env
-                                                     `plusTypeEnv` id_env }
+                                   , tcg_type_env  = mergeZonkedTypes (tcg_type_env tcg_env) id_env }
       ; (tcg_env, tcl_env) <- setGblEnv init_tcg_env
                               run_th_modfinalizers
       ; finishTH
@@ -650,7 +679,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
               do { (tcg_env, lie) <- captureTopConstraints $
                                      checkMain explicit_mod_hdr export_ies
                  ; ev_binds <- simplifyTop lie
-                 ; return (tcg_env `addEvBinds` ev_binds) }
+                 ; installForgetMTyCons (tcg_env `addEvBinds` ev_binds) }
 
       ; failIfErrsM    -- Stop now if if there have been errors
                        -- Continuing is a waste of time; and we may get debug
@@ -663,9 +692,11 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
       ; (id_env_mf, ev_binds_mf, binds_mf, fords_mf, imp_specs_mf, rules_mf, patsyns_mf)
             <- zonkTcGblEnv tcg_env
 
-      ; let { !final_type_env = tcg_type_env tcg_env
-                                `plusTypeEnv` id_env_mf
+      ; let { !final_type_env = mergeZonkedTypes (tcg_type_env tcg_env) id_env_mf
               -- Add the zonked Ids from the value bindings (they were in tcl_env)
+              -- Keep the origin of tables used before final zonking. The same
+              -- family can already occur in a local signature. A provisional
+              -- final-Core check must not replace or remove it.
               -- Force !final_type_env, lest we retain an old reference
               -- to the previous tcg_env
 
@@ -678,7 +709,303 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                           , tcg_fords     = fords'     ++ fords_mf
                           , tcg_patsyns   = pat_syns'  ++ patsyns_mf } } ;
 
-      ; return tcg_env' }
+        -- The interface also carries the equations of eligible source functions.
+        -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+      ; tcg_env' <- setGblEnv tcg_env' $ do
+          checkSourceMethodUses tcg_env'
+          checkAndInstallSourceProofs tcg_env'
+      ; failIfErrsM
+      ; tables_enabled <- xoptM LangExt.DependentTypes
+      ; write_equations <- goptM Opt_WriteSourceEquations
+      ; setGblEnv tcg_env' $ do
+          let binds = tcg_binds tcg_env'
+          local_used_tables <- scs_table_uses <$> readTcRef (tcg_source_check tcg_env')
+          let pre_installed = mkNameSet
+                [ idName v
+                | v <- typeEnvIds (tcg_type_env tcg_env')
+                , Just tbl <- [sourceTableId_maybe v]
+                , tyConName tbl `elemNameSet` local_used_tables ]
+          tables <- if tables_enabled || write_equations
+                    then sourceTableTyCons False True binds else pure []
+          -- Keep complete single-column source equations and already-staged
+          -- local tables ahead of final-Core equations for the same owner.
+          let is_final_table owner = case idDetails owner of
+                SourceTableId _ _ FinalCoreSourceTable -> True
+                _ -> False
+              keep_ahead (owner, table) =
+                idName owner `elemNameSet` pre_installed ||
+                isSimpleNominalTable owner table
+              complete_owners = mkNameSet
+                [ idName owner
+                | pair@(owner, _) <- tables
+                , not (is_final_table owner)
+                , keep_ahead pair ]
+              nominal_owners = if tables_enabled
+                then mkNameSet [ idName owner | pair@(owner, _) <- tables, keep_ahead pair ]
+                else emptyNameSet
+          (cases0, fields) <- sourceCaseTables nominal_owners binds
+          -- Keep the existing ordinary certificates when both checkers
+          -- accept the same owner. Enumeration cases retain executable origin,
+          -- while complete source equations stay ahead of final-Core ones.
+          let cases = filter (\(owner, _) ->
+                not (is_final_table owner && idName owner `elemNameSet` complete_owners)) cases0
+              case_owners = mkNameSet (map (idName . fst) cases)
+              new_tables = filter (\(owner, _) -> not (idName owner `elemNameSet` case_owners)) tables
+              all_table_owners = mkNameSet (map (idName . fst) new_tables) `unionNameSet` case_owners
+          with_fields0 <- if null fields then getGblEnv else fst <$> addTyConsToGblEnv fields
+          with_fields <- pruneUnusedIndexedLookups with_fields0
+          let installed = typeEnvIds (tcg_type_env with_fields)
+              early_closures = earlyIndexedLookups with_fields
+              early_closure_owners = mkNameSet (map (idName . fst) early_closures)
+              early_nominal = early_closures ++
+                [(fun, table) | fun <- installed
+                              , not (idName fun `elemNameSet` early_closure_owners)
+                              , not (idName fun `elemNameSet` all_table_owners)
+                              , SourceTableId _ table NominalSourceTable <- [idDetails fun]
+                              , tyConName table `elemNameSet` local_used_tables
+                                || isNominalStructuralSource fun
+                                || isLargeElimTable table
+                                || sourceMapperType (idType fun)]
+          setGblEnv with_fields $ do
+            checkLocalRetainedWitnessExports with_fields installed
+            checkLocalIndexedLookupExports with_fields
+            failIfErrsM
+            env <- installSourceTables (early_nominal ++ new_tables ++ cases)
+            installSourceMethods (\sel -> tables_enabled || sourceMapSelector sel) env }
+
+-- | Publish only checked method aliases that user rules cannot replace.
+-- See Note [Certifying a source method alias] in GHC.Tc.TyCl.Instance.
+installSourceMethods :: (Id -> Bool) -> TcGblEnv -> TcM TcGblEnv
+installSourceMethods wanted env
+  | null (tcg_insts env) = pure env
+  | otherwise = case checkedSourceMethods wanted env of
+      [] -> pure env
+      methods -> setGblEnv env $ do
+        let literals = [() | (_, fields) <- methods, (_, _, SourceLiteralMethod{}) <- fields]
+        -- Load the workers before collecting rules from their interfaces.
+        mb_workers <- if null literals then pure (Just []) else sourceLiteralWorkers
+        rules <- visibleSourceMethodRules env
+        unloaded <- unloadedSourceRuleHeads env
+        let local_rules = sourceRuleOwners (tcg_rules env)
+            plain v = not (idName v `elemNameSet` local_rules
+                           || idName v `elemNameSet` unloaded
+                           || hasSourceMethodRule rules v)
+            workers_ok = maybe False (all plain) mb_workers
+            plain_at (v, first) = not (idName v `elemNameSet` sourceRuleOwnersAt first (tcg_rules env)
+                                       || idName v `elemNameSet` unloaded
+                                       || hasSourceMethodRuleAt rules first v)
+            checked = [(dfun, pairs, literal) | (dfun, fields) <- methods, plain dfun
+                      , let pairs = [(sel, target) | (sel, meth, SourceMethodAlias target) <- fields
+                                                 , all plain [sel, meth, target]]
+                            literal = listToMaybe [(sel, z, s) | (sel, meth, SourceLiteralMethod z s ops) <- fields
+                                      , workers_ok, plain meth, plain_at (sel, Just (tyConName (dataConTyCon z))), all plain_at ops]
+                      , not (null pairs) || isJust literal]
+        for_ checked $ \(_, pairs, _) -> for_ pairs $ \(_, target) ->
+          when (nameIsLocalOrFrom (tcg_semantic_mod env) (idName target)) $
+            keepAlive (idName target)
+        let current_dfun d = case lookupTypeEnv (tcg_type_env env) (idName d) of
+              Just (AnId existing) -> existing
+              _                    -> d
+        tcExtendGlobalValEnv [setSourceLiteralCons (addSourceMethods (current_dfun dfun) pairs) literal
+                             | (dfun, pairs, literal) <- checked] getGblEnv
+
+{- Note [Source table dependency closure]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A source equation can call another certified function. Its family RHS keeps
+that function's family identity. Recover the transitive term owners before
+checking rules. A rule on any owner invalidates the caller's certificate.
+Keep each local callee alive so its Id remains available to importers.
+An unused runtime function needs no certificate and produces no rule error.
+-}
+
+-- | Add the families and their axioms to the module interface. A local use
+-- may already have required the family before we finished checking the module.
+-- See Note [Source table dependency closure].
+installSourceTables :: [(Id, TyCon)] -> TcM TcGblEnv
+installSourceTables [] = getGblEnv
+installSourceTables tables = do
+    env <- getGblEnv
+    let types = tcg_type_env env
+        new_tables = [tc | (_, tc) <- tables, isNothing (lookupTypeEnv types (tyConName tc))]
+        prepare (fun, candidate) =
+          let table = case lookupTypeEnv types (tyConName candidate) of
+                        Just (ATyCon installed) -> installed
+                        _ -> candidate
+              owner = case lookupTypeEnv types (idName fun) of
+                        Just (AnId existing) -> existing
+                        _ -> fun
+              closure_helpers = case idDetails owner of
+                        CheckedClosureSourceTableId _ _ hs -> Just hs
+                        _ -> case idDetails fun of
+                               CheckedClosureSourceTableId _ _ hs -> Just hs
+                               _ -> Nothing
+              ordinary = case idDetails owner of
+                           SourceTableId {} -> setIdDetails owner VanillaId
+                           CheckedClosureSourceTableId {} -> setIdDetails owner VanillaId
+                           _ -> owner
+              origin = case idDetails owner of
+                         SourceTableId _ _ prior -> prior
+                         _ -> case idDetails fun of
+                                SourceTableId _ _ proposed -> proposed
+                                _ -> NominalSourceTable
+              target_details = case closure_helpers of
+                         Just hs -> CheckedClosureSourceTableId (idName fun) table hs
+                         Nothing -> SourceTableId (idName fun) table origin
+          in (ordinary, table, origin, target_details)
+        prepared = map prepare tables
+        candidates = [setIdDetails fun details
+                     | (fun, _, _, details) <- prepared]
+    -- Make all checked owners available while recovering the dependency closure.
+    tcExtendGlobalValEnv candidates $ do
+      dependencies <- mapM (\(_, table, _, _) -> sourceTableDependencies table) prepared
+      -- Dependency lookup can load interfaces that contain rules.
+      rewriting <- goptM Opt_EnableRewriteRules
+      visible <- if rewriting then Just <$> visibleSourceMethodRules env else pure Nothing
+      unloaded <- if rewriting then unloadedSourceRuleHeads env else pure emptyNameSet
+      used <- scs_table_uses <$> readTcRef (tcg_source_check env)
+      let ruled = sourceRuleOwners (tcg_rules env)
+          changed fun = idName fun `elemNameSet` ruled
+                        || idName fun `elemNameSet` unloaded
+                        || maybe False (`hasSourceMethodRule` fun) visible
+      ids <- forM (zip prepared dependencies) $ \((fun, table, origin, target_details), callees) -> do
+        let name = idName fun
+            reject diagnostic = do
+              when (tyConName table `elemNameSet` used) $
+                setSrcSpan (nameSrcSpan name) (addErr diagnostic)
+              pure fun
+        case callees of
+          Nothing -> reject (TcRnNoSourceTable name)
+          Just deps | Just bad <- find changed (case origin of
+                        FinalCoreSourceTable -> deps
+                        NominalSourceTable | not rewriting, isStructuralSourceTable table -> deps
+                        _ -> fun : deps)
+            -> reject (TcRnRetainedQuantificationError (RetainedSourceRule (idName bad)))
+          Just deps -> do
+            for_ (fun : deps) $ \callee ->
+              when (nameIsLocalOrFrom (tcg_semantic_mod env) (idName callee)) $
+                keepAlive (idName callee)
+            pure $ case idDetails fun of
+              VanillaId -> setIdDetails fun target_details
+              _ -> fun
+      let accepted = mkNameSet
+            [ tyConName tbl
+            | ((_, tbl, _, _), fn') <- zip prepared ids
+            , isJust (sourceTableId_maybe fn') ]
+          existing_new_set = mkNameSet (map tyConName new_tables)
+          accepted_guards =
+            [ g
+            | ((_, tbl, _, _), fn') <- zip prepared ids
+            , isJust (sourceTableId_maybe fn')
+            , g <- fromMaybe [] (sourceTableCallees tbl)
+            , isSourceFilterGuard g
+            , nameIsLocalOrFrom (tcg_semantic_mod env) (tyConName g)
+            , not (tyConName g `elemNameSet` existing_new_set)
+            , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName g)) ]
+          accepted_new_tables = [tc | tc <- new_tables, tyConName tc `elemNameSet` accepted] ++ accepted_guards
+      tcExtendGlobalValEnv ids $
+        if null accepted_new_tables then getGblEnv else fst <$> addTyConsToGblEnv accepted_new_tables
+
+-- | Check only the bindings in the declaration group that is now in scope.
+sourceTablesFor :: Bool -> NameSet -> TcGblEnv -> TcM [(Id, TyCon)]
+sourceTablesFor structural names env = sourceTableTyCons structural False (filter requested (tcg_binds env))
+  where
+    requested bind = any ((`elemNameSet` names) . idName)
+                         (collectHsBindBinders CollNoDictBinders (unLoc bind))
+
+{- Note [Early constructor mapper equations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A dependent type can need the equations of a local mapper. Schedule
+the signed worker in the ordinary value dependency order. After the
+group's constraints are solved, check its desugared body with the
+existing constructor-case checker. Keep the actual callback binder and
+the checked identities of constructor fields and recursive calls.
+
+An empty declaration splice also makes a solved worker available to
+later declarations. The local observer checks for pending typed
+splices before zonking. The mapper pass checks only the current group's
+mapping signature. It adds no table when the checked body fails.
+
+The table has ordinary nominal source authority. Its uses record the
+same rule dependencies as a table published at module finish. A later
+rule can invalidate an unused early table as well. Pass early mapper
+owners back to installSourceTables before writing the interface, so
+the final rule environment can withdraw that authority.
+-}
+
+-- | Check the requested constructor cases after solving their value group.
+-- See Note [Early constructor mapper equations].
+sourceTablesWithMappers :: Bool -> NameSet -> Bag EvBind -> TcGblEnv
+                        -> TcM ([(Id, TyCon)], [TyCon], [Id])
+sourceTablesWithMappers structural names evidence env = do
+    ordinary <- sourceTablesFor structural names env
+    let ordinary_owners = mkNameSet (map (idName . fst) ordinary)
+        ordinary_ids = [setIdDetails fn (SourceTableId (idName fn) tbl NominalSourceTable)
+                       | (fn, tbl) <- ordinary]
+        ord_guards = [g | (_, tc) <- ordinary
+                        , g <- fromMaybe [] (sourceTableCallees tc)
+                        , isSourceFilterGuard g
+                        , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName g))]
+        new_ord_tcs = [tc | (_, tc) <- ordinary
+                          , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))] ++ ord_guards
+        in_group = [owner | bind <- tcg_binds env
+                          , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind)
+                          , idName owner `elemNameSet` names
+                          , not (idName owner `elemNameSet` ordinary_owners)]
+    tcExtendGlobalValEnv ordinary_ids $ do
+      env1 <- if null new_ord_tcs then getGblEnv else fst <$> addTyConsToGblEnv new_ord_tcs
+      setGblEnv env1 $ do
+        mapper_cands <- fmap catMaybes $ forM in_group $ \owner -> do
+          ty <- liftZonkM (zonkTcType (idType owner))
+          pure (owner <$ guard (sourceMapperType ty))
+        mappers <- forM mapper_cands $ \owner ->
+          tryTcDiscardingErrs (pure Nothing) $ do
+            let name = idName owner
+            (definitions, _) <- localOpenDefinitions [(name, nameSrcSpan name)]
+                                  (tcg_ev_binds env `unionBags` evidence) (tcg_binds env)
+            case lookupNameEnv definitions name of
+              Just (actual, rhs) | actual == owner -> sourceMapperTable actual rhs
+              _ -> pure Nothing
+        let mapper_done = mkNameSet [idName v | Just (v, _) <- mappers]
+            mapper_ids = [setIdDetails fn (SourceTableId (idName fn) tbl NominalSourceTable)
+                         | Just (fn, tbl) <- mappers]
+            mapper_tcs = [tc | Just (_, tc) <- mappers
+                             , isNothing (lookupTypeEnv (tcg_type_env env1) (tyConName tc))]
+        tcExtendGlobalValEnv mapper_ids $ do
+          env2 <- if null mapper_tcs then getGblEnv else fst <$> addTyConsToGblEnv mapper_tcs
+          setGblEnv env2 $ do
+            closure_cands <- fmap catMaybes $ forM in_group $ \owner ->
+              if idName owner `elemNameSet` mapper_done
+                then pure Nothing
+                else do
+                  ty <- liftZonkM (zonkTcType (idType owner))
+                  pure (owner <$ guard (earlyClosureCandidateType ty))
+            (closures, companions, helpers) <-
+              if null closure_cands
+                then pure ([], [], [])
+                else tryTcDiscardingErrs (pure ([], [], [])) $ do
+                  let demands = [(idName owner, nameSrcSpan (idName owner)) | owner <- closure_cands]
+                  checkLocalOpenDeferrals demands
+                  (definitions, _) <- localOpenDefinitions demands
+                                        (tcg_ev_binds env `unionBags` evidence) (tcg_binds env)
+                  sourceEarlyClosureTables closure_cands definitions
+            pure (ordinary ++ catMaybes mappers ++ closures, ord_guards ++ companions, helpers)
+
+installEarlyTables :: ([(Id, TyCon)], [TyCon], [Id]) -> TcM TcGblEnv
+installEarlyTables (tables, companions, helpers) = do
+    env0 <- getGblEnv
+    let missing_helpers = [h | h <- helpers, isNothing (lookupTypeEnv (tcg_type_env env0) (idName h))]
+        missing_companions = [tc | tc <- companions, isNothing (lookupTypeEnv (tcg_type_env env0) (tyConName tc))]
+    tcExtendGlobalValEnv missing_helpers $ do
+      env1 <- if null missing_companions then getGblEnv else fst <$> addTyConsToGblEnv missing_companions
+      setGblEnv env1 (installSourceTables tables)
+
+-- | Merge the finalised types and retain a source table already attached to
+-- its exact owner. A local signature can already use the table's equations.
+mergeZonkedTypes :: TypeEnv -> TypeEnv -> TypeEnv
+mergeZonkedTypes original zonked = original `plusTypeEnv` mapNameEnv restore zonked
+  where
+    restore (AnId fun) = AnId (restoreSourceTableId original fun)
+    restore thing = thing
 
 zonkTcGblEnv :: TcGblEnv
              -> TcM (TypeEnv, Bag EvBind, LHsBinds GhcTc,
@@ -720,7 +1047,8 @@ run_th_modfinalizers = do
       -- (see #12777).
       new_ev_binds <- {-# SCC "simplifyTop2" #-}
                       simplifyTop (lie_th `andWC` lie_top_decls)
-      addTopEvBinds new_ev_binds run_th_modfinalizers
+      tcg_env' <- installForgetMTyCons =<< getGblEnv
+      setGblEnv tcg_env' $ addTopEvBinds new_ev_binds run_th_modfinalizers
         -- addTopDecls can add declarations which add new finalizers.
 
 tc_rn_src_decls :: [LHsDecl GhcPs]
@@ -734,7 +1062,10 @@ tc_rn_src_decls ds
                 -- If ds is [] we get ([], Nothing)
 
         -- Deal with decls up to, but not including, the first splice
-      ; (tcg_env, rn_decls) <- rnTopSrcDecls first_group
+      ; experimental <- xoptM LangExt.DependentTypes
+      ; local_demands <- if experimental then Just <$> newTcRef [] else pure Nothing
+      ; (tcg_env, rn_decls) <- updGblEnv (\env -> env { tcg_local_open_demands = local_demands }) $
+                              rnTopSrcDecls first_group
                 -- rnTopSrcDecls fails if there are any errors
 
       ; traceRn "tc_rn_src_decls 77" empty
@@ -776,9 +1107,10 @@ tc_rn_src_decls ds
       -- get reported w.r.t. the right GlobalRdrEnv. It is for this reason that
       -- the captureTopConstraints must go here, not in tcRnSrcDecls.
       ; traceRn "about to typechecke decls" (ppr rn_decls)
-      ; ((tcg_env, tcl_env), lie1) <- setGblEnv tcg_env $
+      ; demands <- maybe (pure []) (fmap reverse . readTcRef) local_demands
+      ; ((tcg_env, tcl_env), lie1) <- setGblEnv (tcg_env { tcg_local_open_demands = Nothing }) $
                                       captureTopConstraints $
-                                      tcTopSrcDecls rn_decls
+                                      tcTopSrcDecls demands rn_decls
 
         -- If there is no splice, we're nearly done
       ; restoreEnvs (tcg_env, tcl_env) $
@@ -792,8 +1124,15 @@ tc_rn_src_decls ds
                  -- group, or else we might reify metavariables, as in #16980.
                ; ev_binds1 <- simplifyTop lie1
 
+                 -- The next group can use a table that this group defines.
+               ; enabled <- xoptM LangExt.DependentTypes
+               ; let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rn_decls))
+               ; tcg_env <- if enabled
+                            then sourceTablesWithMappers False names ev_binds1 tcg_env >>= installEarlyTables
+                            else return tcg_env
+
                  -- Rename the splice expression, and get its supporting decls
-               ; (spliced_decls, splice_fvs) <- rnTopSpliceDecls splice
+               ; (spliced_decls, splice_fvs) <- setGblEnv tcg_env (rnTopSpliceDecls splice)
 
                  -- Glue them on the front of the remaining decls and loop
                ; setGblEnv (tcg_env `addTcgDUs` usesOnly splice_fvs) $
@@ -840,8 +1179,8 @@ tcRnHsBootDecls boot_or_sig decls
 
                 -- Typecheck type/class/instance decls
         ; traceTc "Tc2 (boot)" empty
-        ; (tcg_env, inst_infos, _deriv_binds, _th_bndrs)
-             <- tcTyClsInstDecls tycl_decls deriv_decls def_decls val_binds
+        ; (tcg_env, inst_infos, _th_bndrs, _deriv_binds, _)
+             <- tcTyClsInstDecls (Just []) tycl_decls deriv_decls def_decls val_binds
         ; setGblEnv tcg_env     $ do {
 
         -- Emit (signatures for) Typeable bindings
@@ -1101,6 +1440,8 @@ checkHiBootIface'
             for mb_fld_id $ \ fld_id -> do
               let local_boot_var =
                     Id.mkExportedVanillaId missing_name (idType fld_id)
+              for_ (lookupTypeEnv boot_type_env missing_name) $ \ boot_val ->
+                checkBootDeclM HsBoot boot_val (AnId local_boot_var)
               return (local_boot_var, fld_id)
 
           -- Otherwise: report that the hs file does not export something
@@ -1248,11 +1589,15 @@ wrapErrs f w =
 -- code. Returns @Nothing@ on success or @Just "some helpful info for user"@
 -- failure. If the difference will be apparent to the user, @Just empty@ is
 -- perfectly suitable.
+bootEqType :: Type -> Type -> Bool
+bootEqType t1 t2
+  = eqType t1 t2 || eqScopedSigmaClosures t1 t2 || eqScopedLambdaClosures t1 t2
+
 checkBootDecl :: HsBootOrSig -> TyThing -> TyThing -> BootErrsM BootMismatchWhat
 
 checkBootDecl _ (AnId id1) (AnId id2)
   = assert (id1 == id2) $
-    check (idType id1 `eqType` idType id2)
+    check (idType id1 `bootEqType` idType id2)
           (BootMismatchedIdTypes id1 id2)
 
 checkBootDecl boot_or_sig (ATyCon tc1) (ATyCon tc2)
@@ -1315,7 +1660,8 @@ checkBootTyCon boot_or_sig tc1 tc2
   , Just env <- eqVarBndrs emptyRnEnv2 (tyConTyVars tc1) (tyConTyVars tc2)
   = assert (tc1 == tc2) $
   do { check_roles
-     ; check (eqTypeX env syn_rhs1 syn_rhs2) $
+     ; let syn_rhs1' = substTyWith (tyConTyVars tc1) (mkTyVarTys (tyConTyVars tc2)) syn_rhs1
+     ; check (eqTypeX env syn_rhs1 syn_rhs2 || bootEqType syn_rhs1' syn_rhs2) $
         TyConSynonymMismatch syn_rhs1 syn_rhs2 }
 
   -- This allows abstract 'data T a' to be implemented using 'type T = ...'
@@ -1365,7 +1711,7 @@ compatClassOp :: RnEnv2 -> HsBootOrSig -> ClassOpItem -> ClassOpItem -> BootErrs
 compatClassOp env boot_or_sig (id1, def_meth1) (id2, def_meth2)
   = do { check (name1 == name2) $
            MismatchedMethodNames
-       ; check (eqTypeX env op_ty1 op_ty2) $
+       ; check (eqTypeX env op_ty1 op_ty2 || bootEqType (idType id1) (idType id2)) $
            MismatchedMethodTypes op_ty1 op_ty2
        ; case boot_or_sig of
            HsBoot ->
@@ -1433,12 +1779,15 @@ eqFD env (as1,bs1) (as2,bs2) =
 compatFamFlav :: FamTyConFlav -> FamTyConFlav -> BootErrsM BootTyConMismatch
 compatFamFlav (DataFamilyTyCon {}) (DataFamilyTyCon {}) = checkSuccess
 compatFamFlav OpenTypeFamilyTyCon OpenTypeFamilyTyCon = checkSuccess
+compatFamFlav ConstrainedTypeFamilyTyCon ConstrainedTypeFamilyTyCon = checkSuccess
 compatFamFlav flav1@(ClosedTypeFamilyTyCon ctf1) flav2@(ClosedTypeFamilyTyCon ctf2) =
   case (ctf1, ctf2) of
     (CTF_Abstract, CTF_Abstract) -> checkSuccess -- This case only happens for hsig merging
     (CTF {}, CTF_Abstract) -> checkSuccess
     (CTF_Abstract, CTF {}) -> checkSuccess
     (CTF ax1, CTF ax2) -> eqClosedFamilyAx ax1 ax2
+    (CTF_Scoped owner1 sum1 ax1, CTF_Scoped owner2 sum2 ax2)
+      | owner1 == owner2, sum1 == sum2 -> eqClosedFamilyAx (Just ax1) (Just ax2)
     (CTF_BuiltIn {}, CTF_BuiltIn {}) -> checkSuccess
     _ -> bootErr $ TyConFlavourMismatch flav1 flav2
 compatFamFlav flav1 flav2 = bootErr $ TyConFlavourMismatch flav1 flav2
@@ -1465,7 +1814,7 @@ compatCon c1 c2
            MismatchedDataConBangs
        ; check (map flSelector (dataConFieldLabels c1) == map flSelector (dataConFieldLabels c2))
            MismatchedDataConFieldLabels
-       ; check (eqType (dataConWrapperType c1) (dataConWrapperType c2))
+       ; check (bootEqType (dataConWrapperType c1) (dataConWrapperType c2))
            MismatchedDataConTypes }
 
 eqClosedFamilyAx :: Maybe (CoAxiom br) -> Maybe (CoAxiom br1)
@@ -1660,6 +2009,18 @@ invalidAbsDataSubTypes = execWriter . go
     go ty
       | Just ty' <- coreView ty
       = go ty'
+    go ty@(TermAppTy {})
+      = invalid ty
+    go ty@(TermVarTy {})
+      = invalid ty
+    go ty@(DepFunTy {})
+      = invalid ty
+    go ty@(ExistsTy {})
+      = invalid ty
+    go ty@(DepDictTy {})
+      = invalid ty
+    go ty@(ClassAppTy {})
+      = invalid ty
     go TyVarTy{}
       = ok -- We report an error at the binding site of type variables,
            -- e.g. in the TySyn LHS or in the forall.
@@ -1673,9 +2034,9 @@ invalidAbsDataSubTypes = execWriter . go
       = mapM_ go tys
     go ty@(ForAllTy{})
       = invalid ty
-    go ty@(FunTy af w t1 t2)
+    go ty@(FunTy af ma w t1 t2)
       | af == FTF_T_T
-      = do { go w
+      = do { go ma; go w
            ; go (typeKind t1) ; go t1
            ; go (typeKind t2) ; go t2
            }
@@ -1721,8 +2082,1882 @@ rnTopSrcDecls group
         return (tcg_env', rn_decls)
    }
 
-tcTopSrcDecls :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
-tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
+tcTopSrcDecls :: [(Name, SrcSpan)] -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcDecls demands group = tcTopSrcDeclsThen demands group pure
+
+-- | Finish inside the scopes of all local definitions checked for this group.
+tcTopSrcDeclsThen :: [(Name, SrcSpan)] -> HsGroup GhcRn
+                  -> ((TcGblEnv, TcLclEnv) -> TcM (TcGblEnv, TcLclEnv))
+                  -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcDeclsThen = tcTopSrcDeclsThenWith []
+
+-- | Check local definitions for this group and preserve deferred deriving information.
+tcTopSrcDeclsThenWith :: [DerivInfo] -> [(Name, SrcSpan)] -> HsGroup GhcRn
+                      -> ((TcGblEnv, TcLclEnv) -> TcM (TcGblEnv, TcLclEnv))
+                      -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcDeclsThenWith prev_deriv [] group finish = tcTopSrcTablesWith prev_deriv group >>= finish
+tcTopSrcDeclsThenWith prev_deriv requests group finish = do
+    experimental <- xoptM LangExt.DependentTypes
+    let selectors = mkNameSet
+          [unLoc name
+          | grp <- hs_tyclds group
+          , L _ ClassDecl{tcdCExt = (HsNestedGroup{ng_sigs = sigs}, _)} <- group_tyclds grp
+          , L _ (ClassOpSig _ _ names _) <- sigs
+          , name <- names]
+        demands | experimental = filter (not . (`elemNameSet` selectors) . fst) requests
+                | otherwise = requests
+    checkLocalOpenDeferrals demands
+    env <- getGblEnv
+    let checked = mkNameSet
+          [ idName owner | bind <- tcg_binds env
+                         , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind) ]
+        (previous, current) = partition ((`elemNameSet` checked) . fst) demands
+        check_current
+          | null current = tcTopSrcTablesWith prev_deriv group >>= finish
+          | otherwise =
+              tcTopSrcTablesCont True prev_deriv
+                (\derivs extra_demands rest_grp ->
+                  let merged_current = current ++
+                        [ d | d@(nm, _) <- extra_demands, not (any ((== nm) . fst) current) ]
+                      checked_early = mkNameSet
+                        [ idName owner
+                        | bind <- tcg_binds env
+                        , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind) ]
+                  in do
+                    env_after <- getGblEnv
+                    let all_checked = checked_early `unionNameSet` mkNameSet
+                          [ idName owner
+                          | bind <- tcg_binds env_after
+                          , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind) ]
+                        (done_early, rem_current) = partition ((`elemNameSet` all_checked) . fst) merged_current
+                        run_rem
+                          | null rem_current = do
+                              (envs, _, _) <- tcTopSrcDeclGroupWithMethods Nothing (Just derivs) rest_grp
+                              finish envs
+                          | otherwise = tcIndependentFamilyProducersWith derivs rem_current rest_grp finish
+                    if null done_early
+                      then run_rem
+                      else do
+                        failIfErrsM
+                        defs <- localOpenDefinitions done_early (tcg_ev_binds env_after) (tcg_binds env_after)
+                        withLocalCaseTables done_early defs run_rem)
+                group
+    if null previous then check_current else do
+      -- tc_rn_src_decls has solved these bindings before running each splice.
+      failIfErrsM
+      definitions <- localOpenDefinitions previous (tcg_ev_binds env) (tcg_binds env)
+      withLocalCaseTables previous definitions check_current
+
+-- | Do not observe a solved definition whose errors may have been deferred.
+checkLocalOpenDeferrals :: [(Name, SrcSpan)] -> TcM ()
+checkLocalOpenDeferrals [] = pure ()
+checkLocalOpenDeferrals demands = do
+    defer <- goptM Opt_DeferTypeErrors
+    holes <- goptM Opt_DeferTypedHoles
+    not_in_scope <- goptM Opt_DeferOutOfScopeVariables
+    when (defer || holes || not_in_scope) $
+      rejectLocalOpen demands "Disable deferred errors before observing a local definition."
+
+-- | Publish the demanded cases inside the solved binding scope.
+-- See Note [Checked local character cases].
+withLocalCaseTables :: [(Name, SrcSpan)] -> (NameEnv (Id, CoreExpr), NameEnv Id)
+                    -> TcM (TcGblEnv, TcLclEnv) -> TcM (TcGblEnv, TcLclEnv)
+withLocalCaseTables demands definitions@(cores, _) check = do
+    let alias_target name = pure $ case lookupNameEnv cores name of
+          Just (_, Core.Var target) -> unitNameSet (idName target)
+          _ -> emptyNameSet
+    demanded <- closeLocalNames alias_target emptyNameSet (map fst demands)
+    let selected (owner, _) = idName owner `elemNameSet` demanded
+        cases = filterNameEnv selected cores
+    tables <- sourceCharacterTables cases
+    witnesses <- sourceRetainedWitnessTables cases
+    (boolean_cases, selectors) <- sourceLocalBooleanCases cases cores
+    with_selectors <- if null selectors then getGblEnv else fst <$> addTyConsToGblEnv selectors
+    checked <- setGblEnv with_selectors (installSourceTables (tables ++ witnesses ++ boolean_cases))
+    setGblEnv checked (withLocalOpenDefinitions definitions check)
+
+{- Note [Checked local character cases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Renaming resolves the call to the ordinary term Name. For a same-group
+demand, tcLocalOpenGroup checks its dependency closure in an early batch.
+For an earlier-group demand, the splice path has already solved the
+bindings. localOpenDefinitions checks the resolved bindings and rejects
+pending typed splices before zonking.
+
+Certify only demanded bindings and their exact alias targets. Give the
+type checker the installed family for the same owner. Checking stays
+inside the solved scope and uses the terms already in scope. Record family
+use through the usual rule checks so a later rule can invalidate the proof.
+-}
+
+-- | Check only an independent producer fragment before family equations.
+-- See Note [Independent producers for family equations].
+tcIndependentFamilyProducersWith :: [DerivInfo] -> [(Name, SrcSpan)] -> HsGroup GhcRn
+                                 -> ((TcGblEnv, TcLclEnv) -> TcM (TcGblEnv, TcLclEnv))
+                                 -> TcM (TcGblEnv, TcLclEnv)
+tcIndependentFamilyProducersWith prev_deriv demands group@HsGroup
+  { hs_valds = XValBindsLR (HsVBG binds sigs), hs_tyclds = groups } finish = do
+    env <- getGblEnv
+    plugins <- readTcRef (tcg_plugins env)
+    let roots = mkNameSet (map fst demands)
+        pending = concatMap instance_uses (concatMap group_instds groups)
+        instance_uses inst = case unLoc inst of
+          TyFamInstD {tfid_inst = equation@TyFamInstDecl
+            {tfid_eqn = FamEqn {feqn_tycon = L _ family}}}
+            | not (nameIsLocalOrFrom (tcg_semantic_mod env) family) ->
+                [(getLocA inst, localUses roots equation)]
+          ClsInstD {cid_inst = ClsInstDecl
+            {cid_ext = (_, HsNestedGroup {ng_tyfam_insts = equations})}} ->
+              [(getLocA rhs, localUses roots rhs)
+              | L _ TyFamInstDecl {tfid_eqn = FamEqn {feqn_rhs = rhs}} <- equations]
+          _ -> []
+        in_equation (name, loc) (inst_loc, uses) = loc `isSubspanOf` inst_loc && name `elem` uses
+        selected = [d | d <- demands, any (in_equation d) pending]
+        ordinary_solver = null (solverTcMPlugins plugins) && null (defaultingTcMPlugins plugins) &&
+                          isNullUFM (rewriterTcMPlugins plugins)
+    let this_mod = tcg_semantic_mod env
+        data_groups = mkNameEnv
+          [(tcdName (unLoc decl), tg) | tg <- groups, decl <- group_tyclds tg]
+        constructor_owners = mkNameEnv
+          [(con, tcdName (unLoc decl))
+          | tg <- groups, decl@(L _ DataDecl{tcdDataDefn = defn}) <- group_tyclds tg
+          , DataTypeCons False cons <- [dd_cons defn], con_decl <- cons, L _ con <- getConNames (unLoc con_decl)]
+        value_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds group))
+        closed_family_uses decl@(L _ FamDecl{tcdFam = FamilyDecl
+          {fdLName = L _ family, fdInfo = ClosedTypeFamily _ (Just equations)}})
+          | null (localUses value_names decl)
+          , all (not . elemNameSet family . externalDeclUses . feqn_rhs . unLoc) equations =
+              Just (delFromNameSet (externalDeclUses decl) family)
+        closed_family_uses _ = Nothing
+        early_type_dependencies name
+          | not (nameIsLocalOrFrom this_mod name) = Right emptyNameSet
+          -- An earlier source-table stage can move a local TyClGroup into
+          -- tcg_type_env while remaining groups still list it in group_ext.
+          | not (name `elemNameEnv` data_groups)
+          , Just (ATyCon tc) <- lookupTypeEnv (tcg_type_env env) name
+          , independentDataKind tc = Right emptyNameSet
+          | otherwise = case lookupNameEnv data_groups name of
+              Just tg
+                | Just fv_sets <- traverse early_decl_uses (group_tyclds tg)
+                , null (group_instds tg)
+                , let decls = group_tyclds tg
+                      signatures = group_kisigs tg
+                , isSingleton decls || all (not . isFamilyDecl . unLoc) decls
+                , null (localUses value_names signatures)
+                , not (hasSplice (decls, signatures)) ->
+                    Right (unionNameSets (group_ext tg : externalDeclUses signatures : fv_sets))
+              _ -> Left "a type declaration dependency"
+        early_decl_uses decl
+          | Just refs <- closed_family_uses decl = Just refs
+          | L _ SynDecl{tcdTyVars = tvs, tcdRhs = rhs} <- decl
+          , Just params <- traverse ordinary_parameter (hsQTvExplicit tvs) =
+              independentTypeRefs (mkNameSet params) rhs
+          | otherwise = independentDataDecl decl
+        ordinary_parameter (L _ b@HsTvb{tvb_flag = HsBndrRequired{}, tvb_kind = HsBndrNoKind{}}) =
+          hsTyVarName b
+        ordinary_parameter _ = Nothing
+        type_prerequisites constructors signature_types =
+          either (const Nothing) Just $
+            closeLocalNames early_type_dependencies emptyNameSet
+              (nameSetElemsStable signature_types ++
+               mapMaybe (lookupNameEnv constructor_owners) (nameSetElemsStable constructors))
+        check_data_import name
+          | name `hasKey` liftedTypeKindTyConKey = pure True
+          | isTyConName name = do
+              thing <- tcLookupGlobal name
+              pure $ case thing of
+                ATyCon tc -> independentDataKind tc
+                _ -> False
+          | otherwise = pure False
+    candidate <- case independentClosure this_mod constructor_owners binds sigs (map fst selected) of
+      Just (names, constructors, imported, signature_types)
+        | not (null selected), ordinary_solver
+        , Just prerequisites <- type_prerequisites constructors signature_types -> do
+            let local_data = filterNameSet (nameIsLocalOrFrom this_mod) prerequisites
+                imported_data = prerequisites `minusNameSet` local_data
+            checked_data <- and <$> traverse check_data_import (nameSetElemsStable imported_data)
+            if checked_data then do
+              verified <- traverse independentImport (nameSetElemsStable imported)
+              pure ((names, constructors, local_data,) . mkNameSet <$> sequence verified)
+            else pure Nothing
+      _ -> pure Nothing
+    case candidate of
+      Just (names, constructors, data_names, imported) -> do
+        let (early_groups, rest_groups) = partition
+              (any ((`elemNameSet` data_names) . tcdName . unLoc) . group_tyclds) groups
+            (early_binds, rest_binds) = partition (any (selectedBind names) . snd) binds
+            (early_sigs, rest_sigs) = splitSignatures names sigs
+            early = emptyRnGroup { hs_tyclds = early_groups
+                                 , hs_valds = XValBindsLR (HsVBG early_binds early_sigs) }
+            rest = group { hs_tyclds = rest_groups
+                         , hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs) }
+        (envs@(early_env, _), wanted) <- captureTopConstraints (tcTopSrcDeclGroup early)
+        restoreEnvs envs $ do
+          evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanted (checkNoErrs (simplifyTop wanted))
+          checked@(definitions, _) <- localOpenDefinitions selected
+            (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+          workers <- traverse independentImport (nameSetElemsStable constructors)
+          let allowed = unionNameSets [names, imported, mkNameSet (catMaybes workers)]
+              planned_types = mkNameSet
+                [tcdName decl | tg <- early_groups, L _ decl <- group_tyclds tg,
+                               isFamilyDecl decl || isSynDecl decl]
+          unless (all isJust workers && isEmptyBag evs &&
+                    all (independentCore planned_types allowed . snd)
+                        (nonDetNameEnvElts definitions)) $
+            rejectLocalOpen selected "The checked producer requires evidence outside the independent fragment."
+          addTopEvBinds evs $ withLocalOpenDefinitions checked $
+            tcTopSrcDeclsThenWith prev_deriv (filter (not . (`elemNameSet` names) . fst) demands) rest finish
+      _ -> tcLocalOpenGroupWith prev_deriv demands group finish
+tcIndependentFamilyProducersWith prev_deriv demands group finish =
+  tcLocalOpenGroupWith prev_deriv demands group finish
+
+-- | Select ordinary declarations and retain resolved dependencies omitted
+-- from the local SCC graph, including references to imported families.
+independentDataDecl :: LTyClDecl GhcRn -> Maybe NameSet
+independentDataDecl (L _ DataDecl
+  { tcdDExt = DataDeclRn{tcdFVs = fvs}, tcdModifiers = []
+  , tcdTyVars = HsQTvs{hsq_explicit = params}
+  , tcdDataDefn = HsDataDefn{dd_derivs = [], dd_ctxt = Nothing, dd_kindSig = Nothing,
+                            dd_cons = DataTypeCons False cons} })
+  | all bare_binder params, all vanilla_con cons =
+      let bound = mkNameSet (mapMaybe (hsTyVarName . unLoc) params)
+      in Just (fvs `minusNameSet` bound)
+  where
+    bare_binder (L _ HsTvb{tvb_kind = HsBndrNoKind _}) = True
+    bare_binder _ = False
+    vanilla_con (L _ ConDeclH98{con_modifiers = [], con_telescope = []}) = True
+    vanilla_con _ = False
+independentDataDecl _ = Nothing
+
+-- | Close a producer over independent signatures and lexical applications.
+independentClosure :: Module -> NameEnv Name -> [(RecFlag, [LHsBind GhcRn])] -> [LSig GhcRn]
+                   -> [Name] -> Maybe (NameSet, NameSet, NameSet, NameSet)
+independentClosure this_mod constructors binds sigs roots = do
+    names <- foldM (visit emptyNameSet) emptyNameSet roots
+    let local = filterNameSet (nameIsLocalOrFrom this_mod) names
+    let local_cons = filterNameSet (`elemNameEnv` constructors) local
+        local_binds = local `minusNameSet` local_cons
+    signature_types <- traverse (fmap snd . signature) (nameSetElemsStable local_binds)
+    pure (local_binds, local_cons, names `minusNameSet` local, unionNameSets signature_types)
+  where
+    signatures = signaturesByOwner sigs
+    functions = mkNameEnv
+      [(name, matches) | (NonRecursive, [L _ FunBind{fun_id = L _ name, fun_matches = matches}]) <- binds]
+
+    -- Complete signatures can split a mutually recursive group for typing.
+    -- Check cycles in the resolved body dependencies too.
+    visit active done name
+      | name `elemNameSet` done = Just done
+      | name `elemNameSet` active = Nothing
+      | otherwise = do
+          refs <- deps name
+          checked <- foldM (visit (extendNameSet active name)) done (nameSetElemsStable refs)
+          pure (extendNameSet checked name)
+
+    deps name
+      | name `elemNameEnv` constructors = Just emptyNameSet
+      | isExternalName name, not (nameIsLocalOrFrom this_mod name) = Just emptyNameSet
+      | Just matches <- lookupNameEnv functions name
+      , Just (tyvars, _) <- signature name
+      , Just refs <- match_refs tyvars emptyNameSet matches
+      = Just refs
+      | otherwise = Nothing
+
+    signature name
+      | let pragmas = fromMaybe [] (lookupNameEnv signatures name)
+      , all ordinary_pragma pragmas = independent_signature (filter is_type_sig pragmas)
+      | otherwise = Nothing
+
+    is_type_sig TypeSig{} = True
+    is_type_sig _ = False
+    ordinary_pragma TypeSig{} = True
+    ordinary_pragma InlineSig{} = True
+    ordinary_pragma _ = False
+
+    independent_signature [] = Just (emptyNameSet, emptyNameSet)
+    independent_signature [TypeSig _ [] _ (HsWC _ (L _ HsSig
+      { sig_bndrs = outer, sig_body = body }))]
+      | Just params <- signature_binders outer
+      , let bound = mkNameSet params
+      , Just refs <- independentTypeRefs bound body = Just (bound, refs)
+    independent_signature _ = Nothing
+    signature_binders HsOuterImplicit{hso_ximplicit = quantified} = Just quantified
+    signature_binders HsOuterExplicit{hso_matchability = Nothing, hso_bndrs = quantified} =
+      traverse bare_binder quantified
+    signature_binders _ = Nothing
+    bare_binder (L _ b@HsTvb {tvb_kind = HsBndrNoKind _}) = hsTyVarName b
+    bare_binder _ = Nothing
+    arrow_type params ty = case unLoc (ignoreParens ty) of
+      HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) input result ->
+        arrow_type params input && arrow_type params result
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ n)) -> n `elemNameSet` params
+      _ -> False
+
+    match_refs tyvars locals (MG {mg_alts = L _ [L _ Match
+      { m_pats = L _ pats
+      , m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{}) }]}) = do
+      binders <- traverse pat_binders pats
+      expr_refs tyvars (locals `unionNameSet` mkNameSet (catMaybes binders)) rhs
+    match_refs _ _ _ = Nothing
+    pat_binders (L _ (VarPat _ (L _ n))) = Just (Just n)
+    pat_binders (L _ WildPat{}) = Just Nothing
+    pat_binders (L _ (ParPat _ p)) = pat_binders p
+    pat_binders _ = Nothing
+    expr_refs tyvars locals (L _ expr) = case expr of
+      HsVar _ (L _ (WithUserRdr _ n)) ->
+        Just (if n `elemNameSet` locals then emptyNameSet else unitNameSet n)
+      HsPar _ e -> recur e
+      HsApp _ fun arg -> unionNameSet <$> recur fun <*> recur arg
+      HsLam _ LamSingle matches -> match_refs tyvars locals matches
+      ExprWithTySig _ e (HsWC [] (L _ HsSig
+        { sig_bndrs = HsOuterImplicit{hso_ximplicit = []}, sig_body = ty }))
+        | arrow_type tyvars ty -> recur e
+      _ -> Nothing
+      where
+        recur = expr_refs tyvars locals
+
+-- | Read dependencies in an ordinary producer signature or synonym RHS.
+independentTypeRefs :: NameSet -> LHsType GhcRn -> Maybe NameSet
+independentTypeRefs params ty = case unLoc (ignoreParens ty) of
+  HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) input result ->
+    unionNameSet <$> recur input <*> recur result
+  HsAppTy _ fun arg -> unionNameSet <$> recur fun <*> recur arg
+  HsTyVar _ NotPromoted (L _ (WithUserRdr _ n))
+    | n `elemNameSet` params -> Just emptyNameSet
+    | isTyConName n, isExternalName n -> Just (unitNameSet n)
+  _ -> Nothing
+  where
+    recur = independentTypeRefs params
+
+-- | Verify an imported occurrence and return the name found in checked Core.
+independentImport :: Name -> TcM (Maybe Name)
+independentImport name = do
+    thing <- tcLookupGlobal name
+    pure $ case thing of
+      AnId ident
+        | independentType emptyNameSet (idType ident) -> Just (idName ident)
+      AConLike (RealDataCon con)
+        | isJust (independentDataFields con (mkTyVarTys (dataConUnivTyVars con))) ->
+            Just (idName (dataConWorkId con))
+      _ -> Nothing
+
+-- | Admit only boxed ordinary datatypes with a telescope of Type binders.
+independentDataKind :: TyCon -> Bool
+independentDataKind tc =
+  isVanillaAlgTyCon tc && isBoxedDataTyCon tc && isGenerativeTyCon tc Nominal &&
+  independentConstant liftedTypeKind (tyConResKind tc) &&
+  all (\v -> isTyVar v && independentConstant liftedTypeKind (varType v)) (tyConTyVars tc)
+
+-- | Match a constructor whose user arguments and worker arguments agree.
+independentDataFields :: DataCon -> [Type] -> Maybe [Type]
+independentDataFields con parameters
+  | independentDataKind (dataConTyCon con)
+  , dataConUserTyVars con == dataConUnivTyVars con =
+      openDataConFieldTypes con parameters
+  | otherwise = Nothing
+
+-- | Recheck pre-optimisation Core emitted by the source fragment.
+independentCore :: NameSet -> NameSet -> CoreExpr -> Bool
+independentCore planned_types producers = go emptyNameSet emptyNameSet
+  where
+    valid_type = independentTypeWith planned_types
+
+    go tyvars locals expression
+      | (Core.Var worker, args) <- Core.collectArgs expression
+      , Just con <- isDataConWorkId_maybe worker =
+          getName worker `elemNameSet` producers &&
+          let (types, fields) = span Core.isTyCoArg args
+          in case traverse core_type types of
+            Just parameters
+              | Just field_types <- independentDataFields con parameters ->
+                  equalLength fields field_types &&
+                  and (zipWith (\expr kind -> exprType expr `eqType` kind) fields field_types) &&
+                  all (valid_type tyvars) parameters &&
+                  all (go tyvars locals) fields
+            _ -> False
+    go tyvars locals (Core.Var v)
+      | getName v `elemNameSet` locals =
+          valid_type tyvars (varType v)
+      | getName v `elemNameSet` producers =
+          valid_type emptyNameSet (varType v)
+      | otherwise = False
+    go tyvars locals (Core.Lam v body)
+      | isTyVar v, independentConstant liftedTypeKind (varType v) =
+          go (extendNameSet tyvars (getName v)) locals body
+      | term_binder tyvars v = go tyvars (extendNameSet locals (getName v)) body
+      | otherwise = False
+    go tyvars locals (Core.App fun operand) = go tyvars locals fun && go tyvars locals operand
+    go tyvars locals (Core.Let (Core.NonRec v rhs) body) =
+      independent_let tyvars locals v rhs body
+    -- The singleton inferred AbsBinds path in dsAbsBinds emits mkLetRec.
+    -- Check its RHS without the monomorphic binder in scope.
+    go tyvars locals (Core.Let (Core.Rec [(v, rhs)]) body) =
+      independent_let tyvars locals v rhs body
+    go tyvars locals (Core.Cast body co)
+      | not (isEmptyNameSet planned_types)
+      , let lhs = coercionLKind co
+            rhs = coercionRKind co
+            normalize = reductionReducedType . normaliseType
+                          emptyFamInstEnvs Nominal
+      , valid_type tyvars lhs
+      , valid_type tyvars rhs
+      , normalize lhs `eqType` normalize rhs =
+          go tyvars locals body
+    go tyvars locals (Core.Case scrut binder case_ty alts@(_ : _))
+      | term_binder tyvars binder
+      , exprType scrut `eqType` varType binder
+      , valid_type tyvars case_ty
+      , go tyvars locals scrut
+      , Just (tc, tc_args) <- splitTyConApp_maybe (varType binder)
+      , independentDataKind tc && equalLength tc_args (tyConTyVars tc) && all (valid_type tyvars) tc_args
+      , let expected_cons = tyConDataCons tc
+            check_alt (Core.Alt (Core.DataAlt dc) fs rhs)
+              | Just ftys <- independentDataFields dc tc_args
+              , equalLength fs ftys && all (term_binder tyvars) fs
+              , and (zipWith eqType (map varType fs) ftys)
+              = Just (dc, go tyvars (extendNameSetList locals (map getName fs)) rhs)
+            check_alt _ = Nothing
+      , Just pairs <- traverse check_alt alts
+      , let (dcs, ok_rhss) = unzip pairs
+      , equalLength dcs expected_cons && mkNameSet (map getName dcs) == mkNameSet (map getName expected_cons)
+      = and ok_rhss
+    go tyvars _ (Core.Type ty) = valid_type tyvars ty
+    go _ _ _ = False
+
+    independent_let tyvars locals v rhs body =
+      term_binder tyvars v && not (getName v `elemNameSet` producers) &&
+      go tyvars locals rhs &&
+      go tyvars (extendNameSet locals (getName v)) body
+
+    term_binder tyvars v =
+      isId v && not (isCoVar v) && independentConstant manyDataConTy (idMult v) &&
+      valid_type tyvars (varType v)
+
+    core_type (Core.Type ty) = Just ty
+    core_type _ = Nothing
+
+-- | Check variables, ordinary arrows and generative boxed data types.
+independentType :: NameSet -> Type -> Bool
+independentType = independentTypeWith emptyNameSet
+
+independentTypeWith :: NameSet -> NameSet -> Type -> Bool
+independentTypeWith planned_types = check
+  where
+    check tyvars (TyVarTy var) = getName var `elemNameSet` tyvars
+    check tyvars FunTy{ft_af = FTF_T_T, ft_ma = ma, ft_mult = mult,
+                                 ft_arg = input, ft_res = result} =
+      independentConstant unmatchableDataConTy ma && independentConstant manyDataConTy mult &&
+      check tyvars input && check tyvars result
+    check tyvars (ForAllTy ma (Bndr var (Invisible _)) body) =
+      independentConstant unmatchableDataConTy ma && isTyVar var &&
+      independentConstant liftedTypeKind (varType var) &&
+      check (extendNameSet tyvars (getName var)) body
+    check tyvars ty@(TyConApp tc args)
+      | tyConName tc `elemNameSet` planned_types
+      , Just expanded <- coreView ty =
+          check tyvars expanded
+      | lengthIs args (tyConArity tc)
+      , independentDataKind tc ||
+        (isTypeFamilyTyCon tc && tyConName tc `elemNameSet` planned_types) =
+          all (check tyvars) args
+    check _ ty = independentConstant liftedTypeKind ty
+
+-- | Match a wired-in type constant without ignoring casts in its arguments.
+independentConstant :: Type -> Type -> Bool
+independentConstant expected actual
+  | TyConApp left xs <- coreFullView expected
+  , TyConApp right ys <- coreFullView actual =
+      left == right && equalLength xs ys && and (zipWith independentConstant xs ys)
+  | otherwise = False
+
+{- Note [Independent producers for family equations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An imported family can be named by an imported signature or a class
+instance. A renamed name closure alone cannot justify moving an ordinary
+producer ahead of that family's equation. Check a separate early batch
+with lexical lambda/application bindings. An expression signature may
+mention only ordinary arrows and the producer's scoped type variables.
+Reject named types, wildcards and newly quantified annotation variables,
+and syntax with overloaded operations. An imported Id
+can enter this batch if its entire declared type is independent.
+Check all binder kinds, argument types and arrow metadata. This
+check uses its interface, without evaluating or certifying its body.
+Imported data constructors have a source DataCon Name and a distinct
+Core worker Name. Match that worker at its exact saturated application,
+and check the representation and lazy field types. A generative boxed
+datatype can appear in an imported type when the constructor kind
+telescope is independent too. The observer checks the body and source
+RULE dependencies only if the checked producer needs the imported Id.
+
+For example, in "keep x = const x (hidden Proxy)", the dictionary for
+hidden may change when the family equation comes into scope. Observing
+that keep returns x cannot establish which dictionary GHC selected.
+Even an ignored type annotation may use the very equation we are
+checking. Inspect the renamed syntax before desugaring can erase it.
+Compare resolved names. A type with the same spelling as a producer's
+type variable can resolve to a different binder.
+
+Check the ordinary bindings and solve them without the candidate
+equation. Keep normal top-level inference for an unsigned binding.
+The source dependency graph still excludes recursive SCCs. Check
+each inferred monomorphic binding and its wrapper in the solved Core
+before observing the actual producer body.
+
+A constructor in the producer can require a local datatype. Move its
+entire renamed type SCC, including role annotations, before checking
+the producer. Follow the local dependencies in group_ext. Also check
+DataDeclRn.tcdFVs, which retains imported references omitted from
+group_ext. An imported family in a field can depend on the pending
+equation. Reject it before moving any group. The regular source checker
+then receives the remaining type groups and all instances, methods,
+defaults and deriving declarations.
+
+An associated equation can also use an independent local producer.
+Select calls in the right-hand side only. Keep the entire class instance
+in the regular pass. That pass checks its head and equations before
+its methods. The early producer cannot use a dictionary that would
+depend on the pending equation.
+A signed producer can name a closed type family in an input or result.
+Use those resolved names as additional roots of the same type SCC
+closure. Check the family's declaration, its standalone kind signature
+and their external references. Keep the signature with its group.
+The wired-in Type synonym in the signature has no declaration dependency.
+A recursive family or a cycle through another family blocks the split.
+A local synonym with ordinary binders and a checked RHS can also
+belong to the closure. Follow every dependency in it before moving
+the group, including arguments that synonym expansion could erase.
+The ordinary type checker still checks arity and synonym cycles.
+Expand only the planned synonyms when validating the solved Core.
+An imported open family in the transitive closure blocks the split,
+even when it occurs only in a field of an unused constructor.
+
+The checked Core may contain a cast from a planned closed family to
+its reduced type. Validate the endpoints by nominal normalization with
+empty open family instance environments. This check cannot use the
+postponed equation or an unrelated instance. Restrict the planned
+closed families to nonrecursive declarations before normalizing.
+The source annotation and imported Id checks still use the original
+family-free fragment.
+
+With a typechecker plugin, the early batch could have effects or solve
+constraints differently. Use the ordinary declaration order in that case.
+-}
+
+-- | Stage non-mutual and mutual local source tables while accumulating deferred deriving.
+-- See Note [Deriving for early source tables] and
+-- Note [Staging mutually recursive large eliminations].
+tcTopSrcTablesWith :: [DerivInfo] -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcTablesWith prev_deriv =
+  tcTopSrcTablesCont False prev_deriv $ \derivs extra_demands g ->
+    if null extra_demands
+      then do
+        (envs, _, _) <- tcTopSrcDeclGroupWithMethods Nothing (Just derivs) g
+        pure envs
+      else do
+        checkLocalOpenDeferrals extra_demands
+        tcIndependentFamilyProducersWith derivs extra_demands g pure
+
+tcTopSrcTablesCont :: Bool -> [DerivInfo]
+                   -> ([DerivInfo] -> [(Name, SrcSpan)] -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv))
+                   -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
+    enabled <- xoptM LangExt.DependentTypes
+    env <- getGblEnv
+    has_tc_plugins <- not . null . catMaybes . flip mapPlugins tcPlugin . hsc_plugins <$> getTopEnv
+    strict_mode <- xoptM LangExt.Strict
+    hpc_mode <- goptM Opt_Hpc
+    defer_on <- or <$> sequence
+      [ goptM Opt_DeferTypeErrors
+      , goptM Opt_DeferTypedHoles
+      , goptM Opt_DeferOutOfScopeVariables ]
+    let use = TableInType (sourceTableExternalTyConOk env)
+        finish = finish_cont prev_deriv []
+        specialised_in grp = mkNameSet
+          [ b
+          | XValBindsLR (HsVBG _ sigs) <- [hs_valds grp]
+          , L _ s <- sigs
+          , b <- case s of
+                   SpecSig _ (L _ n) _ _ -> [n]
+                   SpecSigE n _ _ _      -> [n]
+                   _                     -> [] ]
+        returns_type_sig seen_arrow ty = case unLoc (ignoreParens ty) of
+          HsForAllTy{hst_body = inner} -> returns_type_sig seen_arrow inner
+          HsFunTy _ _ _ cod            -> returns_type_sig True cod
+          HsStarTy{}                   -> seen_arrow
+          HsTyVar _ _ (L _ (WithUserRdr _ nm)) ->
+            seen_arrow && isLiftedTypeKindTyConName nm
+          _ -> False
+        large_elim_sigs_in grp = mkNameSet
+          [ unLoc lnm
+          | XValBindsLR (HsVBG _ sigs) <- [hs_valds grp]
+          , L _ (TypeSig _ _ ns wc) <- sigs
+          , let L _ HsSig{sig_body = body} = hswc_body wc
+          , returns_type_sig False body
+          , lnm <- ns ]
+    case if enabled then splitLocalSourceTables use (tcg_dus env) group else Nothing of
+      Nothing -> finish group
+      Just (needed, early, rest) -> do
+        let early_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds early))
+        if isEmptyNameSet early_names
+          then case splitMutualLargeElim env needed group of
+                 Just stage -> tcMutualLargeElimStageCont has_open_demands prev_deriv finish_cont stage
+                 Nothing
+                   | has_open_demands -> finish group
+                   | otherwise -> do
+                       let unresolved =
+                             [ (term, family)
+                             | (term, family) <- needed
+                             , not (family `elemNameEnv` tcg_type_env env) ]
+                           grp_spec = specialised_in group
+                           grp_large = large_elim_sigs_in group
+                           can_demote =
+                             not (null unresolved)
+                             && not defer_on
+                             && all (\(t, _) -> not (t `elemNameSet` grp_large)) unresolved
+                             && (has_tc_plugins
+                                 || (not strict_mode
+                                     && not hpc_mode
+                                     && all (\(t, _) -> not (t `elemNameSet` grp_spec)) unresolved))
+                       if can_demote
+                         then finish_cont prev_deriv [(t, nameSrcSpan t) | (t, _) <- unresolved] group
+                         else do
+                           for_ needed $ \(term, family) ->
+                             unless (family `elemNameEnv` tcg_type_env env) $
+                               setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+                           failIfErrsM
+                           finish group
+          else do
+            -- See Note [Deriving for early source tables].
+            ((envs@(early_env, _), _, deriving_info), wanteds) <- captureTopConstraints $
+              tcTopSrcDeclGroupWithMethods Nothing Nothing early
+            restoreEnvs envs $ do
+              evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanteds (simplifyTop wanteds)
+              (ordinary, companions, helpers) <- sourceTablesWithMappers True early_names evs early_env
+              let known = mkNameSet (map (tyConName . snd) ordinary)
+                  witness_owners = mkNameSet
+                    [idName owner | bind <- tcg_binds early_env
+                                  , owner <- collectHsBindBinders CollNoDictBinders (unLoc bind)
+                                  , idName owner `elemNameSet` early_names
+                                  , isMonomorphicRetainedWitness owner]
+                  witnesses = [(term, nameSrcSpan term)
+                              | (term, family) <- needed, not (family `elemNameSet` known)
+                              , term `elemNameSet` witness_owners]
+              cases <- if null witnesses then pure [] else do
+                -- See Note [Scheduling a retained witness projection].
+                checkLocalOpenDeferrals witnesses
+                failIfErrsM
+                (cores, _) <- localOpenDefinitions witnesses (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+                let wanted_names = mkNameSet (map fst witnesses)
+                    selected (owner, _) = idName owner `elemNameSet` wanted_names
+                sourceRetainedWitnessTables (filterNameEnv selected cores)
+              let tables = ordinary ++ cases
+                  found = mkNameSet (map (tyConName . snd) tables)
+                  used_in_early = mkNameSet (localUses (mkNameSet (map snd needed)) early)
+              local_defs@(local_def_map, _) <-
+                if not defer_on
+                  then tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                         (opportunisticOpenDefinitions
+                           (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
+                  else pure (emptyNameEnv, emptyNameEnv)
+              let early_spec = specialised_in early
+                  is_large_elim_owner nm = case lookupTypeEnv (tcg_type_env early_env) nm of
+                    Just (AnId fn) ->
+                      let (_, body_ty) = splitForAllTyCoVars (idType fn)
+                          (_, _, res_ty) = splitFunTys body_ty
+                      in isLargeElimResultKind res_ty && not (res_ty `eqType` body_ty)
+                    _ -> False
+                  no_pat_error nm = case lookupNameEnv local_def_map nm of
+                    Just (_, rhs) ->
+                      not (any (`hasKey` patErrorIdKey) (exprSomeFreeVarsList isId (pruneDeadNonRecLets rhs)))
+                    Nothing       -> False
+                  -- See Note [Fallback for uncertified local source functions]
+                  -- in GHC.Tc.Gen.SourceTable.
+                  safe_open_fallback nm =
+                    not (nm `elemNameSet` early_spec)
+                    && case lookupNameEnv local_def_map nm of
+                         Just (_, rhs) -> isSafeLocalUninterpretedRhs strict_mode hpc_mode nm rhs
+                         Nothing       -> False
+                  only_closed_in_rest fam = closedSourceFamilyUsesIn rest fam
+              for_ needed $ \(term, family) ->
+                when (term `elemNameSet` early_names || family `elemNameSet` used_in_early) $
+                  unless (family `elemNameSet` found
+                          || (not (family `elemNameSet` used_in_early)
+                              && not (is_large_elim_owner term)
+                              && term `elemNameEnv` local_def_map
+                              && (has_tc_plugins
+                                  || safe_open_fallback term
+                                  || (no_pat_error term && only_closed_in_rest family)))) $
+                    setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+              failIfErrsM
+              addTopEvBinds evs $ do
+                tables_env <- installEarlyTables (tables, companions, helpers)
+                setGblEnv tables_env $
+                  withLocalOpenDefinitions local_defs $
+                    tcTopSrcTablesCont has_open_demands (prev_deriv ++ deriving_info) finish_cont rest
+
+closedSourceFamilyUsesIn :: HsGroup GhcRn -> Name -> Bool
+closedSourceFamilyUsesIn grp fam = check_closed_uses grp
+  where
+    rest_local_vals = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds grp))
+    check_closed_uses :: Data a => a -> Bool
+    check_closed_uses node = case cast node :: Maybe (LHsType GhcRn) of
+      Just lty -> check_lty [] lty
+      Nothing  -> and (gmapQ check_closed_uses node)
+    check_lty acc (L _ t) = case t of
+      HsParTy _ inner -> check_lty acc inner
+      HsAppTy _ fn arg -> check_lty (arg : acc) fn && check_lty [] arg
+      HsAppKindTy _ fn k -> check_lty acc fn && check_lty [] k
+      HsTyVar _ _ (L _ (WithUserRdr _ nm))
+        | nm == fam -> not (null acc) && all closed_ty_arg acc
+        | otherwise -> True
+      _ -> and (gmapQ check_closed_uses t)
+    closed_ty_arg arg =
+      not (any (\n -> isInternalName n || isTyVarName n || n `elemNameSet` rest_local_vals)
+               (local_ty_names arg))
+    local_ty_names :: Data a => a -> [Name]
+    local_ty_names node = maybeToList (cast node) ++ concat (gmapQ local_ty_names node)
+
+-- | One mutually recursive stage of local types and a Type-valued source equation.
+-- See Note [Staging mutually recursive large eliminations].
+data MutualLargeElimStage = MutualLargeElimStage
+  { mles_term         :: Name
+  , mles_family       :: Name
+  , mles_sig_loc      :: SrcSpanAnnA
+  , mles_sig          :: LHsSigWcType GhcRn
+  , mles_pre_tycls    :: [TyClGroup GhcRn]
+  , mles_mutual_tycls :: [TyClGroup GhcRn]
+  , mles_binds        :: [(RecFlag, LHsBinds GhcRn)]
+  , mles_sigs         :: [LSig GhcRn]
+  , mles_rest         :: HsGroup GhcRn
+  }
+
+{- Note [Staging mutually recursive large eliminations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A logical relation can eliminate an earlier datatype into Type while a
+mutual datatype stores that relation in a constructor field:
+
+  data Val = Bot | Arr Val Val | Join Val Val
+  data HaltsV (v :: Val) where
+    MkHaltsV :: logVLam v -> HaltsV v
+  newtype LogArr (v :: Val) (w :: Val) =
+    MkLogArr { runLogArr :: HaltsV v -> HaltsV w }
+  logVLam :: Val -> Type
+  logVLam Bot        = type ()
+  logVLam (Arr v w)  = type (LogArr v w)
+  logVLam (Join u v) = type (logVLam u, logVLam v)
+
+This cycle is well-founded at the kind level when two conditions hold:
+1. Every type in the signature of logVLam is an earlier declaration.
+2. Every datatype or synonym in the mutual cycle has a header kind that
+   depends only on earlier declarations, not on logVLam.
+
+splitMutualLargeElim selects one such stage when no non-mutual early
+source table is ready. First, tcMutualLargeElimStage checks any
+prerequisite TyClGroups (such as Val). Second, it checks the explicit
+signature of logVLam to build an abstract closed family placeholder
+(CTF_Abstract) and a TcTyCon of the same kind. Third, it runs a trial
+pass over the mutual TyClGroups and logVLam under CTF_Abstract with no
+lazy thunks, and certifies the closed equations of logVLam. If equation
+certification fails, GHC reports GHC-68947 and stops before publishing
+any table. Fourth, it runs fixM over the mutual TyClGroups with the
+final closed family rebuilt to point to the knot-tied mutual TyCons, and
+checks logVLam once against those final TyCons before installing the
+table and recursing on the rest of the declaration group.
+-}
+
+-- | Identify a mutually recursive stage between local types and a Type-valued function.
+-- See Note [Staging mutually recursive large eliminations].
+splitMutualLargeElim :: TcGblEnv -> [(Name, Name)] -> HsGroup GhcRn -> Maybe MutualLargeElimStage
+splitMutualLargeElim env needed group@HsGroup
+  { hs_valds = XValBindsLR (HsVBG binds sigs)
+  , hs_tyclds = tycls }
+  = listToMaybe (mapMaybe try_candidate needed)
+  where
+    value_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds group))
+    sigs_by_owner = signaturesByOwner sigs
+    indexed_tgs =
+      [ (idx, orig_idx, tg { group_instds = [] })
+      | (orig_idx, tg) <- zip [0 :: Int ..] tycls
+      , not (null (group_tyclds tg))
+      , let idx = orig_idx ]
+    all_tg_binders = mkNameSet
+      [ b | (_, _, tg) <- indexed_tgs, b <- hsTyClForeignBinders [tg] [] ]
+    binder_to_tg = mkNameEnv
+      [ (b, orig_idx)
+      | (_, orig_idx, tg) <- indexed_tgs
+      , b <- hsTyClForeignBinders [tg] [] ]
+    tg_map = M.fromList [(orig_idx, tg) | (_, orig_idx, tg) <- indexed_tgs]
+
+    tg_direct_deps :: Int -> [Int]
+    tg_direct_deps idx = case M.lookup idx tg_map of
+      Nothing -> []
+      Just tg ->
+        let raw = nameSetElemsStable (group_ext tg)
+                  ++ localUses all_tg_binders (group_tyclds tg, group_kisigs tg)
+        in [ j | nm <- raw, Just j <- [lookupNameEnv binder_to_tg nm], j /= idx ]
+
+    close_tgs :: S.Set Int -> [Int] -> S.Set Int
+    close_tgs = foldl' visit
+      where
+        visit seen i
+          | S.member i seen = seen
+          | otherwise = foldl' visit (S.insert i seen) (tg_direct_deps i)
+
+    reaches :: (Int -> Bool) -> Int -> Bool
+    reaches p start = any p (S.toList (close_tgs S.empty [start]))
+
+    try_candidate :: (Name, Name) -> Maybe MutualLargeElimStage
+    try_candidate (term, fam_name) = do
+      guard (not (fam_name `elemNameEnv` tcg_type_env env))
+      fb@FunBind{fun_matches = MG{mg_alts = L _ alts}, fun_ext = fvs} <- find_singleton_bind term
+      guard (not (hasSplice fb) && not (hasRnExprHole fb) && not (null alts) && all is_emb_ty_match alts)
+      (sig_loc, sig_wc) <- find_large_elim_sig term
+      let other_values = value_names `delFromNameSet` term
+          other_tables = mkNameSet
+            [ f | (_, f) <- needed, f /= fam_name, not (f `elemNameEnv` tcg_type_env env) ]
+          unfinished = other_values `unionNameSet` other_tables
+      guard (isEmptyNameSet (fvs `intersectNameSet` other_values))
+      guard (all (\n -> n == fam_name || n `elemNameEnv` tcg_type_env env)
+                 [ n | n <- nameSetElemsStable fvs
+                     , isJust (sourceTableTermOcc (nameOccName n))
+                     , nameModule_maybe n == nameModule_maybe term ])
+      guard (null (localUses (unfinished `extendNameSet` fam_name) sig_wc))
+      let uses_self idx = case M.lookup idx tg_map of
+            Nothing -> False
+            Just tg -> not (null (localUses (unitNameSet fam_name) (group_tyclds tg, group_kisigs tg)))
+          depends_on_self = S.fromList
+            [ idx | (_, idx, _) <- indexed_tgs, reaches uses_self idx ]
+          sig_roots = [ j | nm <- localUses all_tg_binders sig_wc
+                          , Just j <- [lookupNameEnv binder_to_tg nm] ]
+          sig_tgs = close_tgs S.empty sig_roots
+      guard (S.null (S.intersection sig_tgs depends_on_self))
+      let rhs_roots = [ j | nm <- nameSetElemsStable fvs
+                          , Just j <- [lookupNameEnv binder_to_tg nm] ]
+          all_tgs = close_tgs sig_tgs rhs_roots
+          (mutual_set, pre_set) = S.partition (`S.member` depends_on_self) all_tgs
+      guard (not (S.null mutual_set))
+      guard (all (valid_pre_tg unfinished) (S.toList pre_set))
+      guard (all (valid_mutual_tg unfinished fam_name) (S.toList mutual_set))
+      let pre_tycls    = [ tg | (_, idx, tg) <- indexed_tgs, S.member idx pre_set ]
+          mutual_tycls = [ tg | (_, idx, tg) <- indexed_tgs, S.member idx mutual_set ]
+          moved_set    = S.union pre_set mutual_set
+          rest_tycls   = mapMaybe (keep_rest_tg moved_set) (zip [0 :: Int ..] tycls)
+          unit_term    = unitNameSet term
+          (m_binds, r_binds) = partition (any (selectedBind unit_term) . snd) binds
+          (m_sigs, r_sigs)   = splitSignatures unit_term sigs
+          rest_group = group { hs_valds = XValBindsLR (HsVBG r_binds r_sigs)
+                             , hs_tyclds = rest_tycls }
+      pure MutualLargeElimStage
+        { mles_term         = term
+        , mles_family       = fam_name
+        , mles_sig_loc      = sig_loc
+        , mles_sig          = sig_wc
+        , mles_pre_tycls    = pre_tycls
+        , mles_mutual_tycls = mutual_tycls
+        , mles_binds        = m_binds
+        , mles_sigs         = m_sigs
+        , mles_rest         = rest_group
+        }
+
+    find_singleton_bind :: Name -> Maybe (HsBind GhcRn)
+    find_singleton_bind target = listToMaybe
+      [ fb
+      | (_, [L _ fb@FunBind{fun_id = L _ b}]) <- binds
+      , b == target ]
+
+    is_emb_ty_match :: LMatch GhcRn (LHsExpr GhcRn) -> Bool
+    is_emb_ty_match (L _ Match{m_pats = L _ (_ : _), m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})}) =
+      case unLoc (stripParensLHsExpr rhs) of
+        HsEmbTy{}         -> True
+        HsFunArr{}        -> True
+        HsForAll{}        -> True
+        HsQual{}          -> True
+        HsStar{}          -> True
+        HsVar{}           -> True
+        HsApp{}           -> True
+        HsAppType{}       -> True
+        ExplicitTuple{}   -> True
+        ExplicitList{}    -> True
+        ExprWithTySig{}   -> True
+        _                 -> False
+    is_emb_ty_match _ = False
+
+    find_large_elim_sig :: Name -> Maybe (SrcSpanAnnA, LHsSigWcType GhcRn)
+    find_large_elim_sig target = do
+      owner_sigs <- lookupNameEnv sigs_by_owner target
+      guard (all allowed_owner_sig owner_sigs)
+      [(sig_loc, sig_wc)] <- pure
+        [ (loc, wc)
+        | L loc (TypeSig _ [] ns wc) <- sigs
+        , any ((== target) . unLoc) ns ]
+      guard (isCompleteHsSig sig_wc && not (hasSplice sig_wc))
+      let L _ HsSig{sig_body = body} = hswc_body sig_wc
+      guard (has_arrow_to_type False body)
+      pure (sig_loc, sig_wc)
+      where
+        allowed_owner_sig TypeSig{}   = True
+        allowed_owner_sig InlineSig{} = True
+        allowed_owner_sig SCCFunSig{} = True
+        allowed_owner_sig _           = False
+
+        has_arrow_to_type seen_arrow ty = case unLoc (ignoreParens ty) of
+          HsForAllTy{hst_body = inner} -> has_arrow_to_type seen_arrow inner
+          HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) _ cod ->
+            has_arrow_to_type True cod
+          HsStarTy{} -> seen_arrow
+          HsTyVar _ _ (L _ (WithUserRdr _ nm)) ->
+            seen_arrow && isLiftedTypeKindTyConName nm
+          _ -> False
+
+    valid_pre_tg :: NameSet -> Int -> Bool
+    valid_pre_tg unfinished idx = case M.lookup idx tg_map of
+      Nothing -> False
+      Just tg ->
+        let decls = (group_tyclds tg, group_kisigs tg)
+        in not (hasSplice decls)
+           && null (localUses unfinished decls)
+           && all (ordinary_pre_decl . unLoc) (group_tyclds tg)
+      where
+        ordinary_pre_decl SynDecl{}   = True
+        ordinary_pre_decl FamDecl{}   = True
+        ordinary_pre_decl DataDecl{}  = True
+        ordinary_pre_decl ClassDecl{} = True
+        ordinary_pre_decl _           = False
+
+    valid_mutual_tg :: NameSet -> Name -> Int -> Bool
+    valid_mutual_tg unfinished fam_name idx = case M.lookup idx tg_map of
+      Nothing -> False
+      Just tg ->
+        let decls = (group_tyclds tg, group_kisigs tg)
+            unit_fam = unitNameSet fam_name
+        in not (hasSplice decls)
+           && null (localUses unfinished decls)
+           && null (localUses unit_fam (group_kisigs tg))
+           && all (valid_mutual_decl unit_fam . unLoc) (group_tyclds tg)
+
+    valid_mutual_decl :: NameSet -> TyClDecl GhcRn -> Bool
+    valid_mutual_decl unit_fam DataDecl{tcdTyVars = tvs, tcdDataDefn = HsDataDefn{dd_ctxt = ctxt, dd_kindSig = ksig, dd_cons = cons}}
+      | valid_cons cons
+      = null (localUses unit_fam (tvs, ctxt, ksig))
+      where
+        valid_cons (DataTypeCons False _) = True
+        valid_cons NewTypeCon{}           = True
+        valid_cons _                      = False
+    valid_mutual_decl unit_fam SynDecl{tcdTyVars = tvs}
+      = null (localUses unit_fam tvs)
+    valid_mutual_decl _ _ = False
+
+    keep_rest_tg :: S.Set Int -> (Int, TyClGroup GhcRn) -> Maybe (TyClGroup GhcRn)
+    keep_rest_tg moved_set (idx, tg)
+      | not (S.member idx moved_set) = Just tg
+      | null (group_instds tg)       = Nothing
+      | otherwise                    = Just tg { group_tyclds = [], group_kisigs = [], group_roles = [] }
+splitMutualLargeElim _ _ _ = Nothing
+
+-- | Typecheck one mutually recursive large-elimination stage and continue on the remainder.
+-- See Note [Staging mutually recursive large eliminations].
+tcMutualLargeElimStageCont :: Bool -> [DerivInfo]
+                           -> ([DerivInfo] -> [(Name, SrcSpan)] -> HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv))
+                           -> MutualLargeElimStage -> TcM (TcGblEnv, TcLclEnv)
+tcMutualLargeElimStageCont has_open_demands prev_deriv finish_cont MutualLargeElimStage
+  { mles_term         = term
+  , mles_family       = fam_name
+  , mles_sig_loc      = sig_loc
+  , mles_sig          = sig_wc
+  , mles_pre_tycls    = pre_tycls
+  , mles_mutual_tycls = mutual_tycls
+  , mles_binds        = mutual_binds
+  , mles_sigs         = mutual_sigs
+  , mles_rest         = rest_group }
+  = do
+      (env_pre, th_pre, deriv_pre, evs_pre) <- if null pre_tycls
+        then do
+          e <- getGblEnv
+          pure (e, emptyNameEnv, [], emptyBag)
+        else do
+          ((e_pre, _, th_p, _, d_pre), wanteds_pre) <-
+            captureTopConstraints (tcTyClsInstDecls Nothing pre_tycls [] [] [])
+          evs_p <- setGblEnv e_pre (simplifyTop wanteds_pre)
+          failIfErrsM
+          pure (e_pre, th_p, d_pre, evs_p)
+
+      let mb_syn_arity = listToMaybe
+            [ length pats
+            | (_, bs) <- mutual_binds
+            , L _ FunBind{fun_id = L _ fn, fun_matches = MG{mg_alts = L _ (L _ Match{m_pats = L _ pats} : _)}} <- bs
+            , fn == term ]
+
+      updLclCtxt (\lcl -> lcl { tcl_th_bndrs = th_pre `plusNameEnv` tcl_th_bndrs lcl }) $
+        setGblEnv env_pre $
+        addTopEvBinds evs_pre $ do
+          sig_ty <- setSrcSpanA sig_loc (tcHsSigWcType True (FunSigCtxt term NoRRC) sig_wc)
+          failIfErrsM
+          mb_hdr <- buildPendingLargeElimHeaderWithArity mb_syn_arity fam_name sig_ty
+          (abstract_fam, tc_fam) <- case mb_hdr of
+            Just hdr -> pure hdr
+            Nothing -> do
+              setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+              failM
+
+          let with_abstract e = e { tcg_type_env = extendTypeEnv (tcg_type_env e) (ATyCon abstract_fam) }
+          -- Phase A: validate mutual declarations and certify equations under CTF_Abstract.
+          table_A <- checkNoErrs $ do
+            (phaseA_env, wanteds_A) <-
+              setGblEnv (with_abstract env_pre) $
+              captureTopConstraints $ do
+                (ty_env_A, _, th_A, _, _) <- tcTyClsInstDecls Nothing mutual_tycls [] [] []
+                updLclCtxt (\lcl -> lcl { tcl_th_bndrs = th_A `plusNameEnv` tcl_th_bndrs lcl }) $
+                  setGblEnv ty_env_A $
+                  fst <$> tcTopBinds mutual_binds mutual_sigs
+            setGblEnv phaseA_env $ do
+              _ <- simplifyTop wanteds_A
+              failIfErrsM
+              certified <- sourceTablesFor True (unitNameSet term) phaseA_env
+              case [tbl | (owner, tbl) <- certified, idName owner == term] of
+                tbl : _ -> pure tbl
+                [] -> do
+                  setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+                  failM
+
+          -- Phase B: knot-tie mutual TyCons with the rebuilt closed family, then check the term once.
+          let mutual_tc_names = mkNameSet [tcdName (unLoc d) | tg <- mutual_tycls, d <- group_tyclds tg]
+              mutual_dc_names = mkNameSet
+                [ b | tg <- mutual_tycls, b <- hsTyClForeignBinders [tg] [], isDataConName b ]
+          ((ty_env_B, th_B, deriv_mutual, final_fam), ty_wanteds_B) <-
+            captureTopConstraints $
+            fixM $ \ ~(rec_ty_env, _, _, _) -> do
+              let rec_types = tcg_type_env rec_ty_env
+                  subst_tc tc
+                    | tyConName tc `elemNameSet` mutual_tc_names =
+                        case lookupTypeEnv rec_types (tyConName tc) of
+                          Just (ATyCon tc') -> tc'
+                          _ -> tc
+                    | Just dc <- isPromotedDataCon_maybe tc
+                    , dataConName dc `elemNameSet` mutual_dc_names =
+                        case lookupTypeEnv rec_types (dataConName dc) of
+                          Just (AConLike (RealDataCon dc')) -> promoteDataCon dc'
+                          _ -> tc
+                    | otherwise = tc
+                  fam_B = rebuildSourceFamilyWith subst_tc table_A
+                  start_env = env_pre { tcg_type_env = extendTypeEnv (tcg_type_env env_pre) (ATyCon fam_B) }
+              (checked_ty_env, _, th_bndrs_B, _, derivs_B) <-
+                setGblEnv start_env $
+                tcExtendKindEnvList [(fam_name, ATcTyCon tc_fam)] $
+                tcTyClsInstDecls Nothing mutual_tycls [] [] []
+              pure (checked_ty_env, th_bndrs_B, derivs_B, fam_B)
+
+          updLclCtxt (\lcl -> lcl { tcl_th_bndrs = th_B `plusNameEnv` tcl_th_bndrs lcl }) $
+            setGblEnv ty_env_B $ do
+              ty_evs_B <- simplifyTop ty_wanteds_B
+              failIfErrsM
+              addTopEvBinds ty_evs_B $ do
+                ((val_env_B, val_lcl_B), val_wanteds_B) <-
+                  setGblEnv (with_abstract ty_env_B) $
+                  captureTopConstraints $
+                  tcTopBinds mutual_binds mutual_sigs
+                restoreEnvs (val_env_B, val_lcl_B) $ do
+                  val_evs_B <- simplifyTop val_wanteds_B
+                  certified_B <- sourceTablesFor True (unitNameSet term) val_env_B
+                  owner_B <- case [owner | (owner, _) <- certified_B, idName owner == term] of
+                    owner : _ -> pure owner
+                    [] -> do
+                      setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+                      failM
+                  failIfErrsM
+                  let clean_val_env = val_env_B { tcg_type_env = delFromNameEnv (tcg_type_env val_env_B) fam_name }
+                  addTopEvBinds val_evs_B $
+                    setGblEnv clean_val_env $ do
+                      tables_env <- installEarlyTables ([(owner_B, final_fam)], [], [])
+                      setGblEnv tables_env $ do
+                        sourceTableFamilyUse final_fam
+                        tcTopSrcTablesCont has_open_demands (prev_deriv ++ deriv_pre ++ deriv_mutual) finish_cont rest_group
+
+{- Note [Scheduling a retained witness projection]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A dependent result signature can name a local ordinary witness
+projection. The renamer's existing source-table dependency selects
+the typed worker before the consumer signature, even in reversed
+source order. Read its identity from the checked bindings. The
+early group's value Ids may not be in the global type environment.
+
+After solving the early group, obtain the demanded Core definitions
+through the local observer. This checks for pending typed splices
+before zonking. Use the same direct witness check as the final
+interface writer. Install the resulting table through the normal
+dependency and RULE checks. The renamer still owns group and cycle
+eligibility.
+-}
+
+{- Note [Deriving for early source tables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A checked source worker can use a local datatype before the rest of its
+declaration group. Check the datatype and worker first, then install the
+worker's equations. Keep the datatype's DerivInfo for the regular instance
+pass. The ordinary deriving code needs the explicit instances, defaults
+and other deriving declarations in the same group. Run it once with all
+the DerivInfo.
+
+For example, deriving Show for a datatype with an imported field can use
+a local Show instance for the field type. The source certificate checks
+the early worker without this instance environment. It accepts only
+checked matches and constructor equations without dictionary evidence.
+-}
+
+-- | Check that an external 'TyCon' referenced by an early source-table
+-- candidate is family-free and non-boot, or an already-installed source table.
+-- See Note [Ordering local source tables] in GHC.Rename.Module.
+sourceTableExternalTyConOk :: TcGblEnv -> Name -> Bool
+sourceTableExternalTyConOk env name
+  | isWiredInName name || isLiftedTypeKindTyConName name = True
+  | isVarName name, nameModule_maybe name == Just (tcg_semantic_mod env)
+  = case lookupTypeEnv (tcg_type_env env) name of
+      Just (AnId fn) -> isJust (sourceTableId_maybe fn)
+      _              -> False
+  | Just (ATyCon tc) <- lookupTypeEnv (tcg_type_env env) name
+  = isAlgTyCon tc
+    || (isTypeSynonymTyCon tc && isFamFreeTyCon tc)
+    || isJust (sourceTableTermOcc (nameOccName name))
+  | Just gre <- lookupGRE_Name (tcg_rdr_env env) name
+  = any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
+  | otherwise = True
+
+{- Note [Scheduling local open definitions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Only the new application-head fallback records a demand. It keeps the
+resolved local term Name and the call's source span. Pass the group's
+demands to the scheduler before checking its type declarations. A standalone
+kind signature can make a synonym's binder rigid. The term producer still
+needs a checked body. Its ordinary forall
+is erased and does not bind a retained term in the caller's type.
+
+Follow the producer's resolved RHS dependencies in renamed SCC order.
+The producer and any unsigned helper use ordinary inference. Include
+every member of a recursive value SCC. Ordinary checking handles the
+recursive term bindings. A type dependency on an unavailable declaration
+still prevents early checking. Observation uses the existing reduction
+limit when it demands a divergent member. Check
+selected signatures for dependencies on declarations that have not
+been checked. If a signature or RHS needs a local datatype or synonym,
+include its whole renamed TyClGroup and lexical prerequisites. A reference
+to a constructor or field selects its parent group. group_ext omits term
+names: inspect the declarations and standalone kind signatures before
+moving them ahead of the value group. A dependency back to the requested
+function is a mixed cycle. If a type needs a different local function,
+stage the ready functions first, then retry the remaining calls with their
+checked definitions in scope. Each pass removes at least one demand.
+See Note [Prepare TyClGroup FVs] in GHC.Rename.Module.
+Instance selection and defaulting can affect expressions that never
+name the relevant declaration. Bring all deriving clauses, standalone
+deriving declarations and default declarations into the first pass along
+with their required type groups. tcTyClsInstDecls installs the defaults
+and derives the instances before checking the selected functions.
+Later groups inherit both environments. If an instance or default
+needs a type that depends on an unfinished local value, report the edge.
+Keep INLINE pragmas with their bindings. Split a shared
+signature between the groups at its original location. Check the ordinary
+instance heads with the early group. Their original instance groups can
+depend on method bodies. Build dependencies from the heads, modifiers
+and associated type equations before moving them. The first pass checks
+these equations with the instance heads and saves the InstInfo for each
+instance. Check the methods after the remaining value bindings and before
+returning to the enclosing splice group. Run that pass inside the
+continuations of all scheduled batches. A method can then use a producer
+whose checked Core becomes available in a later batch.
+
+Schedule family instances with the types in their equations, constructor
+fields and deriving clauses. The ordinary instance pass introduces data
+constructors, record selectors and derived instances before checking
+the early value bindings. These constructors and selectors belong to
+the instance. They do not need a separate type declaration group.
+This order concerns term uses of constructors. See Note [No dependencies
+on data instances] in GHC.Rename.Module for the limits on promotion.
+
+The ordinary late source RULE check validates the owners the observer
+actually uses. An unrelated RULE does not stop the split. A producer
+after a splice cannot be renamed
+from the group's prefix. For a producer in an earlier group, use the binds
+and evidence solved before the splice. Build the Core map on demand.
+
+Solve and zonk the early binds before desugaring. Drop duplicate
+desugaring messages and keep ordinary runtime compilation unchanged.
+Follow the checked bindings' resolved term references to find helpers
+from earlier groups. Inspect only the resulting closure for pending
+typed splices. Pass only its checked Core to the observer. The type
+checker cannot execute an object for the current module.
+
+For observation, desugar each AbsBinds export separately. Keep the full
+monomorphic binding group, evidence and export wrapper. This uses the
+single-export desugaring path instead of building a synthetic tuple
+and selecting its field. Ordinary Core generation still receives the
+original AbsBinds. When observation demands a monomorphic binder, its
+ABExport identifies the source owner. Record that owner for RULE checks.
+-}
+
+-- | Check the independently schedulable local definitions first.
+tcLocalOpenGroupWith :: [DerivInfo] -> [(Name, SrcSpan)] -> HsGroup GhcRn
+                     -> ((TcGblEnv, TcLclEnv) -> TcM (TcGblEnv, TcLclEnv))
+                     -> TcM (TcGblEnv, TcLclEnv)
+tcLocalOpenGroupWith prev_deriv demands group@HsGroup
+  { hs_valds = XValBindsLR (HsVBG binds sigs)
+  , hs_tyclds = tycls
+  , hs_derivds = standalone, hs_defds = defaults } finish
+  = do
+      init_env <- getGblEnv
+      let returns_type_sig seen_arrow ty = case unLoc (ignoreParens ty) of
+            HsForAllTy{hst_body = inner} -> returns_type_sig seen_arrow inner
+            HsFunTy _ _ _ cod -> returns_type_sig True cod
+            HsStarTy{} -> seen_arrow
+            HsTyVar _ _ (L _ (WithUserRdr _ nm)) ->
+              seen_arrow && isLiftedTypeKindTyConName nm
+            _ -> False
+          large_elim_owners = mkNameSet
+            [ unLoc lnm
+            | L _ (TypeSig _ _ ns wc) <- sigs
+            , let L _ HsSig{sig_body = body} = hswc_body wc
+            , returns_type_sig False body
+            , lnm <- ns ]
+          hole_owners = mkNameSet
+            [ b
+            | (_, bs) <- binds
+            , L _ fb@FunBind{fun_id = L _ b} <- bs
+            , hasRnExprHole fb ]
+          failed_large_elims =
+            nameSetElemsStable ((mkNameSet (map fst demands) `intersectNameSet` large_elim_owners) `minusNameSet` hole_owners)
+          local_val_by_occ = mkOccEnv
+            [ (nameOccName v, v) | v <- nameSetElemsStable value_names ]
+          demote_local_table nm
+            | nameModule_maybe nm == Just (tcg_semantic_mod init_env)
+            , not (nm `elemNameEnv` tcg_type_env init_env)
+            , Just term_occ <- sourceTableTermOcc (nameOccName nm)
+            , Just v <- lookupOccEnv local_val_by_occ term_occ
+            = Just v
+            | otherwise = Nothing
+          localValueUses :: Data a => a -> [Name]
+          localValueUses node =
+            [ v
+            | nm <- externalDeclUsesList node
+            , Just v <- [if nm `elemNameSet` value_names then Just nm else demote_local_table nm] ]
+      for_ failed_large_elims $ \term ->
+        setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+      failIfErrsM
+      instances <- traverse (instance_group localValueUses . snd) (early_instancesWith localValueUses)
+      for_ (late localValueUses) $ \(_, inst) ->
+        when (hasSplice inst) $
+          rejectLocalOpen (instance_calls (getLocA inst)) "This deferred type instance contains a splice."
+      when (hasSplice (standalone, defaults)) $
+        rejectLocalOpen demands "A splice prevents checking a standalone deriving or default declaration early."
+      let late_list = late localValueUses
+          late_call_list = late_calls localValueUses
+          late_fam_leaders = mkNameSet [leader | (_, _, leader) <- late_call_list]
+          heads = concatMap (nameSetElemsStable . group_ext) instances
+          prerequisite_types = do
+            with_heads <- closeLocalNames (typeDeps localValueUses "the instance declarations" instanceNeedsTerm)
+                                          emptyNameSet heads
+            closeLocalNames (typeDeps localValueUses "the deriving and default declarations" needsTerm)
+                            with_heads instance_default_roots
+      prerequisites <- case prerequisite_types of
+        Left reason -> rejectLocalOpen demands reason
+        Right names -> pure names
+      for_ late_call_list $ \(inst, family, leader) ->
+        when (leader `elemNameSet` prerequisites) $
+          rejectLocalOpen (instance_calls (getLocA inst))
+            ("Cannot defer this type instance because the earlier declarations require "
+             ++ getOccString family ++ ". This may form a type dependency cycle.")
+      let (selected, ready, blocked) = foldl' (tryDemand localValueUses late_fam_leaders) (prerequisites, [], []) demands
+      case (ready, reverse blocked) of
+        ([], (demand, reason) : _) -> rejectLocalOpen [demand] reason
+        _ -> pure ()
+      let (early_binds, rest_binds) = partition (any (selectedBind selected) . snd) binds
+          (early_sigs, rest_sigs) = splitSignatures selected sigs
+          type_groups = [tg { group_instds = [] } | tg <- tycls, not (null (group_tyclds tg))]
+          (early_tys, rest_tys) = partition (any ((`elemNameSet` selected) . tcdName . unLoc)
+                                                 . group_tyclds) type_groups
+          early = emptyRnGroup { hs_valds = XValBindsLR (HsVBG early_binds early_sigs)
+                               , hs_tyclds = early_tys ++ instances
+                               , hs_derivds = standalone, hs_defds = defaults }
+          rest = group { hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs)
+                       , hs_tyclds = rest_tys ++ map (uncurry make_instance_group) late_list
+                       , hs_derivds = [], hs_defds = [] }
+      let rest_ty_names = mkNameSet (hsTyClForeignBinders (hs_tyclds rest) [])
+          rest_val_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds rest))
+                           `unionNameSet` rest_ty_names
+          deferred_vals
+            | not (null instances) || not (null prev_deriv) = Just rest_val_names
+            | otherwise                                     = Nothing
+      ((envs@(early_env, _), methods, _), wanted) <- captureTopConstraints $
+        tcTopSrcDeclGroupWithMethods deferred_vals (Just prev_deriv) early
+      restoreEnvs envs $ do
+        evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanted (checkNoErrs (simplifyTop wanted))
+        let checked_demands = reverse ready
+        (req_defs, req_owners) <- localOpenDefinitions checked_demands
+                                    (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
+        (opp_defs, opp_owners) <- tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                                    (opportunisticOpenDefinitions
+                                      (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env))
+        let definitions@(def_map, _) = (opp_defs `plusNameEnv` req_defs, opp_owners `plusNameEnv` req_owners)
+        has_tc_plugins <- not . null . catMaybes . flip mapPlugins tcPlugin . hsc_plugins <$> getTopEnv
+        strict_mode <- xoptM LangExt.Strict
+        hpc_mode <- goptM Opt_Hpc
+        let demoted_in_rest = M.toList $ M.fromList
+              [ (term, fam_nm)
+              | fam_nm <- externalDeclUsesList rest
+              , Just term <- [demote_local_table fam_nm]
+              , term `elemNameSet` selected ]
+            demoted_ok (term, fam_nm) = case lookupNameEnv def_map term of
+              Just (_, rhs) ->
+                has_tc_plugins
+                || isSafeLocalUninterpretedRhs strict_mode hpc_mode term rhs
+                || (not (any (`hasKey` patErrorIdKey) (exprSomeFreeVarsList isId (pruneDeadNonRecLets rhs)))
+                    && closedSourceFamilyUsesIn rest fam_nm)
+              Nothing -> False
+        addTopEvBinds evs $ withLocalCaseTables checked_demands definitions $ do
+          env_with_cases <- getGblEnv
+          for_ demoted_in_rest $ \(term, fam_nm) ->
+            unless (fam_nm `elemNameEnv` tcg_type_env env_with_cases || demoted_ok (term, fam_nm)) $
+              setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
+          failIfErrsM
+          tcTopSrcDeclsThen (map fst (reverse blocked)) rest $ \rest_envs ->
+            case methods of
+              Nothing -> finish rest_envs
+              Just (dm_ids, classes, infos) -> restoreEnvs rest_envs $
+                tcExtendGlobalValEnv dm_ids $ do
+                  bindings <- tcInstDecls2 classes infos
+                  (env, lcl) <- getEnvs
+                  env' <- installForgetMTyCons (env { tcg_binds = tcg_binds env ++ bindings })
+                  finish (env', lcl)
+  where
+    externalDeclUsesList :: Data a => a -> [Name]
+    externalDeclUsesList node
+      | Just name <- cast node = [name]
+      | otherwise = concat (gmapQ externalDeclUsesList node)
+
+    group_names = mkNameSet (hsGroupBinders group)
+    value_names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds group))
+    all_instances = [(group_ext tg, inst) | tg <- tycls, inst <- group_instds tg]
+    early_instancesWith :: (forall a. Data a => a -> [Name]) -> [((NameSet, LInstDecl GhcRn))]
+    early_instancesWith lv = snd (partition (belongs_to_late_family lv . snd) all_instances)
+    late :: (forall a. Data a => a -> [Name]) -> [(NameSet, LInstDecl GhcRn)]
+    late lv = fst (partition (belongs_to_late_family lv . snd) all_instances)
+    late_calls :: (forall a. Data a => a -> [Name]) -> [(LInstDecl GhcRn, Name, Name)]
+    late_calls lv = mapMaybe (late_family_instance lv . snd) all_instances
+    belongs_to_late_family :: (forall a. Data a => a -> [Name]) -> LInstDecl GhcRn -> Bool
+    belongs_to_late_family lv inst =
+      let lfs = mkNameSet [family | (_, family, _) <- late_calls lv]
+      in case unLoc inst of
+           TyFamInstD{tfid_inst = TyFamInstDecl{tfid_eqn = FamEqn{feqn_tycon = L _ family}}} ->
+             family `elemNameSet` lfs
+           _ -> False
+
+    instance_group :: (forall a. Data a => a -> [Name]) -> LInstDecl GhcRn -> TcM (TyClGroup GhcRn)
+    instance_group lv inst = do
+      names <- case unLoc inst of
+        ClsInstD{cid_inst = ClsInstDecl
+          { cid_poly_ty = head_ty, cid_modifiers = modifiers
+          , cid_ext = (_, HsNestedGroup { ng_tyfam_insts = equations
+                                       , ng_datafam_insts = data_instances }) }} ->
+          concat <$> sequence [ instance_part lv "This instance head"
+                                  (getLocA head_ty : map getLocA modifiers) (head_ty, modifiers)
+                              , instance_part lv "An associated type equation" (map getLocA equations) equations
+                              , instance_part lv "An associated data instance" (map getLocA data_instances) data_instances ]
+        TyFamInstD{tfid_inst = equation} -> instance_part lv "This type instance" [getLocA inst] equation
+        DataFamInstD{dfid_inst = data_inst} -> instance_part lv "This data instance" [getLocA inst] data_inst
+      let deps = [leader | name <- names, Just (leader, _) <- [lookupNameEnv types name]]
+      pure (make_instance_group (mkNameSet deps) inst)
+
+    make_instance_group deps inst =
+      TyClGroup { group_ext = deps, group_tyclds = []
+                , group_kisigs = [], group_roles = [], group_instds = [inst] }
+
+    -- See Note [Deferring a local type instance].
+    late_family_instance :: (forall a. Data a => a -> [Name]) -> LInstDecl GhcRn -> Maybe (LInstDecl GhcRn, Name, Name)
+    late_family_instance lv inst
+      | TyFamInstD{tfid_inst = equation@TyFamInstDecl
+           {tfid_eqn = FamEqn{feqn_tycon = L _ family}}} <- unLoc inst
+      , not (hasSplice equation)
+      , not (null (lv equation))
+      , Just (leader, tg) <- lookupNameEnv types family
+      , any (declares_open_family family . unLoc) (group_tyclds tg) = Just (inst, family, leader)
+      | otherwise = Nothing
+    declares_open_family name FamDecl{tcdFam = FamilyDecl{fdLName = L _ family, fdInfo = info}} =
+      name == family && isOpenTypeFamilyInfo info
+    declares_open_family _ _ = False
+
+    instance_calls loc =
+      case filter ((`isSubspanOf` loc) . snd) demands of
+        [] -> demands
+        calls -> calls
+
+    instance_part :: Data a => (forall b. Data b => b -> [Name]) -> String -> [SrcSpan] -> a -> TcM [Name]
+    instance_part lv what locations part
+      | hasSplice part = rejectLocalOpen demands (what ++ " contains a splice.")
+      | term : _ <- lv part = do
+          let calls = [d | d@(n, loc) <- demands, n == term, any (loc `isSubspanOf`) locations]
+              reason = what ++ " requires the unfinished local function " ++ getOccString term ++ "."
+          -- A generated declaration can have no real source span.
+          rejectLocalOpen (if null calls then demands else calls) reason
+      | otherwise = pure (localUses group_names part)
+
+    instance_default_roots =
+      [tcdName (unLoc decl) | decl <- tyClGroupTyClDecls tycls, not (no_deriving decl)]
+      ++ localUses group_names (standalone, defaults)
+    instanceNeedsTerm dep term = "Checking an instance declaration requires "
+                              ++ getOccString dep
+                              ++ ", whose declaration uses the local function "
+                              ++ getOccString term ++ "."
+    needsTerm dep term = "Checking the deriving and default declarations requires "
+                      ++ getOccString dep ++ ", whose declaration uses the local function "
+                      ++ getOccString term ++ "."
+    types = mkNameEnv [(binder, (leader, tg)) | tg <- tycls, first : _ <- [group_tyclds tg]
+                                             , let leader = tcdName (unLoc first)
+                                             , binder <- hsTyClForeignBinders [tg { group_instds = [] }] []]
+    instance_binders = mkNameSet (hsTyClForeignBinders [tg { group_tyclds = [] } | tg <- tycls] [])
+    graph = mkNameEnv
+      [ (owner, (bind, fvs, group_edge))
+      | (_, scc_binds) <- binds
+      , Just definitions <- [traverse functionBinding scc_binds]
+      , (representative, _, _) : _ <- [definitions]
+      , let members = mkNameSet [name | (name, _, _) <- definitions]
+      , (owner, bind, fvs) <- definitions
+      , let group_edge = if owner == representative then members else unitNameSet representative ]
+    functionBinding bind@(L _ FunBind{fun_id = L _ name, fun_ext = fvs}) =
+      Just (name, bind, fvs)
+    functionBinding _ = Nothing
+    signatures = signaturesByOwner sigs
+
+    tryDemand :: (forall a. Data a => a -> [Name]) -> NameSet
+              -> (NameSet, [(Name, SrcSpan)], [((Name, SrcSpan), String)])
+              -> (Name, SrcSpan)
+              -> (NameSet, [(Name, SrcSpan)], [((Name, SrcSpan), String)])
+    tryDemand lv late_fam_leaders (selected, ready, blocked) demand@(name, _) =
+      case visit lv late_fam_leaders name selected name of
+        Right result -> (result, demand : ready, blocked)
+        Left reason -> (selected, ready, (demand, reason) : blocked)
+
+    visit :: (forall a. Data a => a -> [Name]) -> NameSet -> Name -> NameSet -> Name -> Either String NameSet
+    visit lv late_fam_leaders root selected name
+      | name `elemNameSet` selected = Right selected
+      | otherwise = case lookupNameEnv graph name of
+          Just (bind, fvs, members)
+            | hasSplice bind -> Left ("A pending splice prevents observing " ++ getOccString name ++ ".")
+            | otherwise -> do
+                sig_deps <- mapM (signatureDeps lv name) (fromMaybe [] (lookupNameEnv signatures name))
+                let rhs_val_uses = mkNameSet (lv bind) `delFromNameSet` name
+                    rhs_deps = (fvs `intersectNameSet` group_names) `minusNameSet` value_names
+                    required = unionNameSets (rhs_deps : sig_deps)
+                    values = members `unionNameSet` (fvs `intersectNameSet` value_names) `unionNameSet` rhs_val_uses
+                checked <- closeLocalNames (producerTypeDeps lv late_fam_leaders root name)
+                                           (extendNameSet selected name)
+                                           (nameSetElemsStable required)
+                foldM (visit lv late_fam_leaders root) checked (nameSetElemsStable values)
+          _ -> Left ("The local dependency " ++ getOccString name
+                     ++ " is not an ordinary function binding.")
+    signatureDeps :: (forall a. Data a => a -> [Name]) -> Name -> Sig GhcRn -> Either String NameSet
+    signatureDeps lv name sig = case sig of
+      TypeSig _ [] _ tau
+        | not (isCompleteHsSig tau) ->
+            Left ("The signature of " ++ getOccString name ++ " contains a wildcard.")
+        | hasSplice tau ->
+            Left ("The signature of " ++ getOccString name ++ " contains a splice.")
+        | dep : _ <- lv tau ->
+            Left ("The signature of " ++ getOccString name ++ " requires the local function "
+                  ++ getOccString dep ++ " before it can be observed.")
+        | otherwise -> Right (mkNameSet (localUses group_names tau))
+      InlineSig{} -> Right emptyNameSet
+      _ -> Left ("The local dependency " ++ getOccString name
+                 ++ " has a signature or pragma that cannot be checked early.")
+
+    valueNeedsTerm root owner dep term
+      | term == root = "This call forms a type dependency cycle through " ++ getOccString owner
+                       ++ " and " ++ getOccString dep ++ "."
+      | otherwise = "The declaration of " ++ getOccString dep ++ " requires the local function "
+                    ++ getOccString term ++ " before it can be observed."
+
+    producerTypeDeps :: (forall a. Data a => a -> [Name]) -> NameSet -> Name -> Name -> Name -> Either String NameSet
+    producerTypeDeps lv late_fam_leaders root owner dep
+      | dep `elemNameSet` late_fam_leaders =
+          Left ("The local function " ++ getOccString owner ++ " requires "
+                ++ getOccString dep ++ " before the dependent type instance can be checked.")
+      | otherwise =
+          typeDeps lv ("local dependency " ++ getOccString owner) (valueNeedsTerm root owner) dep
+
+    typeDeps :: (forall a. Data a => a -> [Name]) -> String -> (Name -> Name -> String) -> Name -> Either String NameSet
+    -- An earlier stage of this HsGroup can check a local TyClGroup and remove
+    -- it from group_names while remaining groups still list it in group_ext.
+    typeDeps _ _ _ dep
+      | dep `elemNameSet` instance_binders || not (dep `elemNameSet` group_names)
+      = Right emptyNameSet
+    typeDeps lv owner needs_term dep = case lookupNameEnv types dep of
+      Just (leader, tg)
+        | dep /= leader -> Right (unitNameSet leader)
+        | let decls = (group_tyclds tg, group_kisigs tg)
+        , term : _ <- lv decls -> Left (needs_term dep term)
+        | all (ordinaryType . unLoc) (group_tyclds tg)
+        , not (hasSplice (group_tyclds tg, group_kisigs tg)) ->
+            -- group_ext contains type dependencies. A class default method
+            -- can also use a local constructor, selector or class method.
+            Right (group_ext tg `unionNameSet` mkNameSet
+                    [use | L _ decl@ClassDecl{} <- group_tyclds tg, use <- localUses group_names decl])
+      _ -> Left ("Cannot check " ++ owner ++ " before the same-group declaration "
+                 ++ getOccString dep ++ ".")
+    ordinaryType SynDecl{} = True
+    ordinaryType FamDecl{} = True
+    ordinaryType DataDecl{} = True
+    ordinaryType ClassDecl{} = True
+    ordinaryType _ = False
+
+    no_deriving (L _ DataDecl{tcdDataDefn = HsDataDefn{dd_derivs = ds}}) =
+      all empty_deriving ds
+    no_deriving _ = True
+    empty_deriving (L _ HsDerivingClause{deriv_clause_tys = L _ (DctMulti _ [])}) = True
+    empty_deriving _ = False
+tcLocalOpenGroupWith _ demands _ _ =
+    rejectLocalOpen demands
+      "Early checking of local definitions requires renamed value bindings."
+
+{- Note [Deferring a local type instance]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A standalone type instance can need a local function in its RHS.
+Delay an equation only for an open type family declared in the same
+group. Keep class instances, data instances, deriving and defaults in
+their ordinary early pass. The earlier batches must not check the
+family declaration. This excludes references from their signatures,
+bodies and instance environments, including transitive references.
+Imported or earlier declarations cannot refer to the fresh family.
+
+Keep all same-group equations for that family together and retain each
+equation's renamed dependencies. Put the singleton instance groups after
+the remaining type groups, in their original order. See Note [Put instances
+at the end] in GHC.Rename.Module. The ordinary family instance checker
+checks the LHS, RHS and consistency with other equations. The continuation keeps
+the needed, solved Core in scope. This split does not move a splice or
+change the class instance environment used to check an early producer.
+-}
+
+-- | Return the owners of signatures and pragmas relevant to scheduling.
+signatureOwners :: Sig GhcRn -> [Name]
+signatureOwners (TypeSig _ _ ns _) = map unLoc ns
+signatureOwners (InlineSig _ (L _ n) _) = [n]
+signatureOwners (SCCFunSig _ (L _ n) _) = [n]
+signatureOwners (SpecSig _ (L _ n) _ _) = [n]
+signatureOwners (SpecSigE n _ _ _) = [n]
+signatureOwners _ = []
+
+-- | Collect the signatures and pragmas that move with each producer.
+signaturesByOwner :: [LSig GhcRn] -> NameEnv [Sig GhcRn]
+signaturesByOwner = foldr add emptyNameEnv
+  where
+    add (L _ sig) env =
+      foldr (\owner acc -> extendNameEnv_C (++) acc owner [sig]) env (signatureOwners sig)
+
+-- | Select the function bindings that belong to an early group.
+selectedBind :: NameSet -> LHsBind GhcRn -> Bool
+selectedBind names (L _ FunBind{fun_id = L _ b}) = b `elemNameSet` names
+selectedBind _ _ = False
+
+-- | Keep each shared signature with its corresponding set of owners.
+splitSignatures :: NameSet -> [LSig GhcRn] -> ([LSig GhcRn], [LSig GhcRn])
+splitSignatures selected = foldr split ([], [])
+  where
+    split sig@(L loc (TypeSig ext mods owners tau)) (early, rest) =
+      case partition ((`elemNameSet` selected) . unLoc) owners of
+        ([], _) -> (early, sig : rest)
+        (_, []) -> (sig : early, rest)
+        (before, after) ->
+          (L loc (TypeSig ext mods before tau) : early,
+           L loc (TypeSig ext mods after tau) : rest)
+    split sig@(L _ decl) (early, rest)
+      | any (`elemNameSet` selected) (signatureOwners decl) = (sig : early, rest)
+      | otherwise = (early, sig : rest)
+
+-- | Desugar only demanded bindings after their owning group has solved.
+localOpenDefinitions :: [(Name, SrcSpan)] -> Bag EvBind -> LHsBinds GhcTc
+                     -> TcM (NameEnv (Id, CoreExpr), NameEnv Id)
+localOpenDefinitions demands evidence binds = do
+    let requested = mkNameSet (map fst demands)
+        named_binds =
+          [ (mkNameSet (map idName owners), bind)
+          | bind <- binds
+          , let owners = collectHsBindBinders CollNoDictBinders (unLoc bind)
+          , not (null owners) ]
+        local_names = unionNameSets (map fst named_binds)
+        by_owner = mkNameEnv
+          [ (owner, bind) | (owners, bind) <- named_binds, owner <- nameSetElemsStable owners ]
+        dependencies name = do
+          case lookupNameEnv by_owner name of
+            Just bind -> Right (mkNameSet (localOpenReferences bind) `intersectNameSet` local_names)
+            Nothing -> Left "No checked Core definition is available for this call."
+    selected <- case closeLocalNames dependencies emptyNameSet (nameSetElemsStable requested) of
+      Right names -> pure names
+      Left reason -> rejectLocalOpen demands reason
+    let relevant_binds = [(owners, bind) | (owners, bind) <- named_binds
+                                       , intersectsNameSet owners selected]
+        relevant = map snd relevant_binds
+        definition_names = unionNameSets (map fst relevant_binds)
+    when (any hasPendingTypedSplice relevant) $
+      rejectLocalOpen demands "This earlier definition contains a pending typed splice."
+    when (any hasExprHole relevant) $
+      rejectLocalOpen demands "This earlier definition contains an expression hole."
+    (_, zonked_ev_binds, zonked, _, _, _, _) <- withReadOnlyFinalZonk $ zonkTopDecls evidence relevant [] [] [] []
+    let collect_lets (Core.Let b e) = let (bs, body) = collect_lets e in (b : bs, body)
+        collect_lets e              = ([], e)
+    (messages, proposal) <- initDsTc $
+      dsHsWrapper (WpLet (EvBinds zonked_ev_binds)) $ \wrap_ev -> do
+        core_prs <- dsTopLHsBinds (concatMap singleExport zonked)
+        let (ev_core_binds, _) = collect_lets (wrap_ev (Core.Var unitDataConId))
+        return (flattenBinds ev_core_binds ++ fromOL core_prs)
+    let owners = mkNameEnv (concatMap monoOwners zonked)
+        all_pairs =
+          [ (idName owner, (owner, rhs))
+          | pairs <- maybeToList proposal, not (errorsFound messages)
+          , (owner, rhs) <- pairs
+          , exprType rhs `eqType` idType owner ]
+        all_map = mkNameEnv all_pairs
+        pair_deps nm = pure $ case lookupNameEnv all_map nm of
+          Just (_, rhs) ->
+            mkNameSet [ idName v | v <- exprSomeFreeVarsList (const True) rhs
+                                 , idName v `elemNameEnv` all_map ]
+          Nothing -> emptyNameSet
+    reachable <- closeLocalNames pair_deps emptyNameSet
+                   [ nm | nm <- nameSetElemsStable definition_names, nm `elemNameEnv` all_map ]
+    let definitions = filterNameEnv (\(owner, _) -> idName owner `elemNameSet` reachable) all_map
+        missing = filter (not . (`elemNameEnv` definitions) . fst) demands
+    unless (null missing) $
+      rejectLocalOpen missing "No checked Core definition is available for this call."
+    pure (definitions, owners)
+  where
+    singleExport :: LHsBind GhcTc -> LHsBinds GhcTc
+    singleExport (L loc (XHsBindsLR (abs_binds@AbsBinds{abs_exports = exports@(_ : _ : _)}))) =
+      [L loc (XHsBindsLR (abs_binds { abs_exports = [owner] })) | owner <- exports]
+    singleExport bind = [bind]
+
+    monoOwners :: LHsBind GhcTc -> [(Name, Id)]
+    monoOwners (L _ (XHsBindsLR AbsBinds{abs_exports = exports})) =
+      [(idName mono, poly) | ABE{abe_mono = mono, abe_poly = poly} <- exports]
+    monoOwners _ = []
+
+-- | Close the requested names over the eligible bindings in the graph.
+closeLocalNames :: Monad m => (Name -> m NameSet) -> NameSet -> [Name] -> m NameSet
+closeLocalNames dependencies = foldM visit
+  where
+    visit checked name
+      | name `elemNameSet` checked = pure checked
+      | otherwise = do
+          uses <- dependencies name
+          foldM visit (extendNameSet checked name) (nameSetElemsStable uses)
+
+-- | Opportunistically desugar solved bindings (such as early source-table
+-- candidates, derived instances, and independent class instances) without
+-- failing when an unrelated binding cannot be observed.
+opportunisticOpenDefinitions :: Bag EvBind -> LHsBinds GhcTc
+                             -> TcM (NameEnv (Id, CoreExpr), NameEnv Id)
+opportunisticOpenDefinitions evidence binds = do
+    let safe_binds = [ bind | bind <- binds, not (hasPendingTypedSplice bind), not (hasExprHole bind) ]
+    if null safe_binds
+      then pure (emptyNameEnv, emptyNameEnv)
+      else do
+        (_, zonked_ev_binds, zonked, _, _, _, _) <-
+          withReadOnlyFinalZonk $ zonkTopDecls evidence safe_binds [] [] [] []
+        let collect_lets (Core.Let b e) = let (bs, body) = collect_lets e in (b : bs, body)
+            collect_lets e              = ([], e)
+            single_export (L loc (XHsBindsLR (abs_binds@AbsBinds{abs_exports = exports@(_ : _ : _)}))) =
+              [L loc (XHsBindsLR (abs_binds { abs_exports = [owner] })) | owner <- exports]
+            single_export bind = [bind]
+            mono_owners (L _ (XHsBindsLR AbsBinds{abs_exports = exports})) =
+              [(idName mono, poly) | ABE{abe_mono = mono, abe_poly = poly} <- exports]
+            mono_owners _ = []
+        (messages, proposal) <- initDsTc $
+          dsHsWrapper (WpLet (EvBinds zonked_ev_binds)) $ \wrap_ev -> do
+            core_prs <- dsTopLHsBinds (concatMap single_export zonked)
+            let (ev_core_binds, _) = collect_lets (wrap_ev (Core.Var unitDataConId))
+            return (flattenBinds ev_core_binds ++ fromOL core_prs)
+        let owners = mkNameEnv (concatMap mono_owners zonked)
+            definitions = mkNameEnv
+              [ (idName owner, (owner, rhs))
+              | pairs <- maybeToList proposal, not (errorsFound messages)
+              , (owner, rhs) <- pairs
+              , exprType rhs `eqType` idType owner ]
+        pure (definitions, owners)
+
+-- | Collect resolved term and evidence references from one checked binding.
+localOpenReferences :: Data a => a -> [Name]
+localOpenReferences node = case cast node :: Maybe (HsExpr GhcTc) of
+    Just (HsVar _ (L _ v)) -> [idName v]
+    Just HsTypedSplice{} -> []
+    _ -> maybe [] (\v -> [idName (v :: Id)]) (cast node)
+      ++ concat (gmapQ localOpenReferences node)
+
+-- | Confine the checked definitions to the current typechecking continuation.
+withLocalOpenDefinitions :: (NameEnv (Id, CoreExpr), NameEnv Id)
+                         -> TcM (TcGblEnv, TcLclEnv) -> TcM (TcGblEnv, TcLclEnv)
+withLocalOpenDefinitions (definitions, owners) check = do
+    env <- getGblEnv
+    let old_defs = tcg_local_open_defs env
+        old_owners = tcg_local_open_owners env
+    (checked_env, checked_lcl) <- setGblEnv
+      (env { tcg_local_open_defs = old_defs `plusNameEnv` definitions
+           , tcg_local_open_owners = old_owners `plusNameEnv` owners }) check
+    pure (checked_env { tcg_local_open_defs = old_defs
+                      , tcg_local_open_owners = old_owners }, checked_lcl)
+
+-- | Retain resolved external references that the local SCC graph omits.
+externalDeclUses :: Data a => a -> NameSet
+externalDeclUses node
+  | Just name <- cast node =
+      if isExternalName name && (isTyConName name || isDataConName name || isVarName name)
+      then unitNameSet name else emptyNameSet
+  | otherwise = unionNameSets (gmapQ externalDeclUses node)
+
+-- | Find resolved local names in a renamed declaration or signature.
+localUses :: Data a => NameSet -> a -> [Name]
+localUses names node
+  | Just name <- cast node = [name | name `elemNameSet` names]
+  | otherwise = concat (gmapQ (localUses names) node)
+
+hasSplice :: Data a => a -> Bool
+hasSplice node =
+    isJust (cast node :: Maybe (HsTypedSplice GhcRn))
+    || isJust (cast node :: Maybe (HsUntypedSplice GhcRn))
+    || or (gmapQ hasSplice node)
+
+hasRnExprHole :: Data a => a -> Bool
+hasRnExprHole node = case cast node :: Maybe (HsExpr GhcRn) of
+    Just HsHole{}          -> True
+    Just HsTypedSplice{}   -> False
+    Just HsUntypedSplice{} -> False
+    _                      -> or (gmapQ hasRnExprHole node)
+
+{- Note [Complete signatures from later groups at early holes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an early-staged binding group contains an expression hole, the remaining
+declaration group can still hold top-level bindings with complete user type
+signatures. Ordinary top-level checking puts every complete signature of the
+group into tcl_env before checking any binding SCC. Mirror that scope around
+simplifyTop when the captured constraints contain an expression hole, for each
+complete signature in the remaining group whose local references are already in
+scope.
+-}
+
+hsGroupTopSigs :: HsGroup GhcRn -> [LSig GhcRn]
+hsGroupTopSigs HsGroup{hs_valds = XValBindsLR (HsVBG _ sigs)} = sigs
+hsGroupTopSigs _ = []
+
+wcHasExprHole :: WantedConstraints -> Bool
+wcHasExprHole WC{wc_impl = implics, wc_errors = errors} =
+    anyBag is_expr_hole errors || anyBag (wcHasExprHole . ic_wanted) implics
+  where
+    is_expr_hole (DE_Hole Hole{hole_sort = ExprHole _}) = True
+    is_expr_hole _                                      = False
+
+-- | Bring complete user type signatures from the remaining group into scope
+-- when simplifying an early group that contains an expression hole.
+-- See Note [Complete signatures from later groups at early holes].
+withLaterHoleSigIds :: [LSig GhcRn] -> WantedConstraints -> TcM a -> TcM a
+withLaterHoleSigIds rest_sigs wanteds action
+  | null rest_sigs || not (wcHasExprHole wanteds) = action
+  | otherwise = do
+      gbl_env <- getGblEnv
+      lcl_env <- getLclTypeEnv
+      let sem_mod  = tcg_semantic_mod gbl_env
+          type_env = tcg_type_env gbl_env
+          local_ref_ready nm
+            | nameModule_maybe nm /= Just sem_mod = True
+            | otherwise = nm `elemNameEnv` lcl_env || nm `elemNameEnv` type_env
+          sig_refs :: Data d => d -> [Name]
+          sig_refs node =
+            [ nm | nm <- maybeToList (cast node), isExternalName nm ]
+            ++ concat (gmapQ sig_refs node)
+          check_one loc sig_wc (L _ nm)
+            | nm `elemNameEnv` lcl_env || nm `elemNameEnv` type_env = pure Nothing
+            | not (all local_ref_ready (sig_refs sig_wc))           = pure Nothing
+            | otherwise =
+                tryTcDiscardingErrs (pure Nothing) $ do
+                  (mb_id, sig_cts) <- captureTopConstraints $
+                    completeSigPolyId_maybe . TcIdSig <$> tcUserTypeSig (locA loc) sig_wc (Just nm)
+                  if isEmptyWC sig_cts
+                    then pure mb_id
+                    else do
+                      _ <- simplifyTop sig_cts
+                      errs <- ifErrsM (pure True) (pure False)
+                      pure (if errs then Nothing else mb_id)
+      poly_ids <- fmap catMaybes $ sequence
+        [ check_one loc sig_wc lnm
+        | L loc (TypeSig _ [] lnames sig_wc) <- rest_sigs
+        , isCompleteHsSig sig_wc
+        , not (hasSplice sig_wc)
+        , lnm <- lnames ]
+      if null poly_ids
+        then action
+        else tcExtendSigIds TopLevel poly_ids action
+
+rejectLocalOpen :: [(Name, SrcSpan)] -> String -> TcM a
+rejectLocalOpen demands reason = do
+    for_ demands $ \(name, loc) ->
+      setSrcSpan loc (addErr (TcRnOpenTypeEval name Nothing reason))
+    failM
+
+-- | Solve independent source functions before retained calls in the same value group.
+-- See Note [Ordering local source tables] in GHC.Rename.Module.
+tcSourceValueBinds :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+tcSourceValueBinds group = do
+    enabled <- xoptM LangExt.DependentTypes
+    env <- getGblEnv
+    let cur_mod = tcg_mod env
+        simple_funs = if enabled then collect_simple_funs (hs_valds group) else emptyNameEnv
+    prev_simple <- setLocalSimpleFunBinds cur_mod simple_funs
+    let restore_simple res = do
+          _ <- setLocalSimpleFunBinds cur_mod (fromMaybe emptyNameEnv prev_simple)
+          pure res
+    res <- case if enabled then splitLocalSourceTables TableInTerm (tcg_dus env) (group { hs_tyclds = [] }) else Nothing of
+      Nothing -> check_group group
+      Just (_, first, rest) -> do
+        (envs@(first_env, _), wanteds) <- captureTopConstraints (check_group first)
+        restoreEnvs envs $ do
+          evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanteds (simplifyTop wanteds)
+          let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds first))
+          tables <- sourceTablesFor False names first_env
+          let new_tcs = [ tc | (_, tbl) <- tables
+                             , tc <- tbl : [g | g <- fromMaybe [] (sourceTableCallees tbl), isSourceFilterGuard g]
+                             , isNothing (lookupTypeEnv (tcg_type_env first_env) (tyConName tc)) ]
+          addTopEvBinds evs $ do
+            env_tcs <- if null new_tcs then getGblEnv else fst <$> addTyConsToGblEnv new_tcs
+            env' <- setGblEnv env_tcs (installSourceTables tables)
+            setGblEnv env' (check_group rest)
+    restore_simple res
+  where
+    check_group :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+    check_group HsGroup{hs_valds = XValBindsLR (HsVBG binds sigs)} = tcTopBinds binds sigs
+    check_group _ = panic "tcSourceValueBinds: expected renamed value bindings"
+
+    collect_simple_funs :: HsValBinds GhcRn -> NameEnv (Maybe (LocatedN Name), LHsExpr GhcRn)
+    collect_simple_funs (XValBindsLR (HsVBG binds _)) = mkNameEnv
+      [ (fn, (mb_pat, rhs))
+      | (NonRecursive, [L _ FunBind { fun_id = L _ fn, fun_ext = fvs
+                                    , fun_matches = MG { mg_alts = L _ [L _ Match
+                                        { m_pats = L _ [pat]
+                                        , m_grhss = GRHSs { grhssGRHSs = L _ (GRHS _ [] rhs) :| []
+                                                          , grhssLocalBinds = L _ EmptyLocalBinds{} } }] } }])
+          <- binds
+      , isExternalName fn
+      , not (fn `elemNameSet` fvs)
+      , Just mb_pat <- [simple_pat (unLoc pat)] ]
+    collect_simple_funs _ = emptyNameEnv
+
+    simple_pat (ParPat _ inner) = simple_pat (unLoc inner)
+    simple_pat (VarPat _ lname) = Just (Just lname)
+    simple_pat WildPat{}        = Just Nothing
+    simple_pat _                = Nothing
+
+tcTopSrcDeclGroup :: HsGroup GhcRn -> TcM (TcGblEnv, TcLclEnv)
+tcTopSrcDeclGroup group = do
+    (envs, _, _) <- tcTopSrcDeclGroupWithMethods Nothing (Just []) group
+    pure envs
+
+-- | Check a source batch. If deriving info is absent, save the attached
+-- deriving clauses for a later batch. When @deferred_val_names@ is 'Just',
+-- defer only class and instance methods that reference those later value bindings.
+tcTopSrcDeclGroupWithMethods :: Maybe NameSet -> Maybe [DerivInfo] -> HsGroup GhcRn
+  -> TcM ((TcGblEnv, TcLclEnv), Maybe ([Id], [LTyClDecl GhcRn], [InstInfo GhcRn]), [DerivInfo])
+tcTopSrcDeclGroupWithMethods deferred_val_names previous_deriving group@(HsGroup { hs_tyclds = tycl_decls,
                          hs_derivds = deriv_decls,
                          hs_fords  = foreign_decls,
                          hs_defds  = default_decls,
@@ -1737,11 +3972,141 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
                 -- Source-language instances, including derivings,
                 -- and import the supporting declarations
         traceTc "Tc3" empty ;
-        (tcg_env, inst_infos, th_bndrs,
-         XValBindsLR (HsVBG deriv_binds deriv_sigs))
-            <- tcTyClsInstDecls tycl_decls deriv_decls default_decls val_binds ;
+        dep_types <- xoptM LangExt.DependentTypes ;
+        let { is_syn_only_group tg =
+                null (group_instds tg) && null (group_roles tg)
+                && all (isSynDecl . unLoc) (group_tyclds tg)
+            ; tg_defs tg = mkNameSet (map (tcdName . unLoc) (group_tyclds tg))
+            ; tg_uses tg = group_ext tg `unionNameSet` externalDeclUses (group_tyclds tg, group_kisigs tg, group_instds tg)
+            ; close_needed needed
+                | let more = unionNameSets [ tg_uses tg | tg <- tycl_decls, is_syn_only_group tg
+                                           , not (isEmptyNameSet (tg_defs tg `intersectNameSet` needed)) ]
+                , not (isEmptyNameSet (more `minusNameSet` needed))
+                = close_needed (needed `unionNameSet` more)
+                | otherwise = needed
+            ; non_syn_uses = externalDeclUses (deriv_decls, default_decls) `unionNameSet`
+                             unionNameSets [ tg_uses tg | tg <- tycl_decls, not (is_syn_only_group tg) ]
+            ; needed_early_syns = close_needed non_syn_uses
+            ; val_bind_names = mkNameSet (collectHsValBinders CollNoDictBinders hs_val_binds)
+            ; group_method_names = mkNameSet [ b | t <- tycl_decls, b <- hsTyClForeignBinders [t] [], isVarName b ]
+            ; syn_val_triggers = val_bind_names `unionNameSet` group_method_names
+                                 `unionNameSet` fromMaybe emptyNameSet deferred_val_names
+            ; close_trailing deferred
+                | let more = unionNameSets
+                        [ tg_defs tg | tg <- tycl_decls, is_syn_only_group tg
+                        , not (isEmptyNameSet (tg_uses tg `intersectNameSet` (syn_val_triggers `unionNameSet` deferred))) ]
+                , not (isEmptyNameSet (more `minusNameSet` deferred))
+                = close_trailing (deferred `unionNameSet` more)
+                | otherwise = deferred
+            ; wanted_trailing_syns = close_trailing emptyNameSet
+            ; (trailing_syn_decls, main_tycl_decls) =
+                if dep_types && isJust previous_deriving && not (isEmptyNameSet wanted_trailing_syns)
+                  then partition (\tg -> is_syn_only_group tg
+                                      && not (isEmptyNameSet (tg_defs tg `intersectNameSet` wanted_trailing_syns))
+                                      && isEmptyNameSet (tg_defs tg `intersectNameSet` needed_early_syns))
+                                 tycl_decls
+                  else ([], tycl_decls)
+            ; trailing_syn_names = unionNameSets (map tg_defs trailing_syn_decls)
+            ; unready_val_names = val_bind_names
+                                  `unionNameSet` trailing_syn_names
+                                  `unionNameSet` fromMaybe emptyNameSet deferred_val_names } ;
+        (tcg_env0, inst_infos, th_bndrs0,
+         XValBindsLR (HsVBG deriv_binds deriv_sigs), deferred_deriving)
+            <- tcTyClsInstDecls previous_deriving main_tycl_decls deriv_decls default_decls val_binds ;
 
-        updLclCtxt (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs `plusNameEnv` tcl_th_bndrs tcl_env }) $
+        updLclCtxt (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs0 `plusNameEnv` tcl_th_bndrs tcl_env }) $
+        setGblEnv tcg_env0 $ do {
+        let { all_method_classes = tyClGroupTyClDecls main_tycl_decls
+            ; (early_deriv_binds, early_deriv_sigs, late_deriv_binds, late_deriv_sigs)
+                | dep_types, isJust previous_deriving
+                , null (localUses unready_val_names (deriv_binds, deriv_sigs))
+                = (deriv_binds, deriv_sigs, [], [])
+                | otherwise = ([], [], deriv_binds, deriv_sigs)
+            ; (early_classes, late_classes)
+                | dep_types, isJust previous_deriving
+                = partition (null . localUses unready_val_names) all_method_classes
+                | otherwise = ([], all_method_classes)
+            ; late_class_names = mkNameSet (map (tcdName . unLoc) late_classes)
+            ; (early_insts, late_insts)
+                | dep_types, isJust previous_deriving
+                = partition (\info ->
+                    null (localUses unready_val_names (ib_binds (iBinds info)))
+                    && null (localUses late_class_names (idType (instanceDFunId (iSpec info)))))
+                    inst_infos
+                | otherwise = ([], inst_infos) } ;
+
+        (tcg_env_staged, early_dm_ids, early_open_defs, early_staged_binds) <-
+          if null early_deriv_binds && null early_classes && null early_insts
+            then do { g <- getGblEnv ; pure (g, [], (emptyNameEnv, emptyNameEnv), []) }
+            else do {
+              let { prev_bind_count = length (tcg_binds tcg_env0) } ;
+              ((g1, l1, e_inst_binds), wanteds_inst) <- captureTopConstraints $ do {
+                envs_d <- discardWarnings (tcTopBinds early_deriv_binds early_deriv_sigs) ;
+                restoreEnvs envs_d $ do {
+                  ib <- tcInstDecls2 early_classes early_insts ;
+                  (g_cur, l_cur) <- getEnvs ;
+                  pure (g_cur, l_cur, ib) } } ;
+              let { new_deriv_binds = drop prev_bind_count (tcg_binds g1)
+                  ; staged_binds = new_deriv_binds ++ e_inst_binds
+                  ; dm_ids =
+                      [ v
+                      | bind <- e_inst_binds
+                      , v <- collectHsBindBinders CollNoDictBinders (unLoc bind)
+                      , take 3 (getOccString v) == "$dm" ] } ;
+              evs_inst <- restoreEnvs (g1, l1) (simplifyTop wanteds_inst) ;
+              let { g2 = (g1 `addEvBinds` evs_inst) { tcg_binds = tcg_binds tcg_env0 ++ staged_binds } } ;
+              errs <- ifErrsM (pure True) (pure False) ;
+              if errs
+                then pure (g2, dm_ids, (emptyNameEnv, emptyNameEnv), staged_binds)
+                else restoreEnvs (g2, l1) $ do {
+                  (_, zonked_ev, zonked_staged, _, _, _, _) <-
+                    withReadOnlyFinalZonk (zonkTopDecls (tcg_ev_binds g2) staged_binds [] [] [] []) ;
+                  defer_on <- or <$> sequence
+                    [ goptM Opt_DeferTypeErrors
+                    , goptM Opt_DeferTypedHoles
+                    , goptM Opt_DeferOutOfScopeVariables ] ;
+                  meth_tables0 <- sourceTableTyCons True False zonked_staged ;
+                  g3 <- installSourceTables meth_tables0 ;
+                  (inst_defs, extra_meth_binds, extra_meth_tables, extra_dfuns) <-
+                    if not defer_on && not (null staged_binds)
+                      then do {
+                        defs@(def_map, _) <- tryTcDiscardingErrs (pure (emptyNameEnv, emptyNameEnv))
+                                               (opportunisticOpenDefinitions zonked_ev zonked_staged) ;
+                        let { ds_pairs = nonDetNameEnvElts def_map } ;
+                        (m_binds, m_tables, m_dfuns) <- certifyLocalInstanceMethods g3 ds_pairs ;
+                        pure (defs, m_binds, m_tables, m_dfuns) }
+                      else pure ((emptyNameEnv, emptyNameEnv), [], [], []) ;
+                  g3b <- setGblEnv g3 (installSourceTables extra_meth_tables) ;
+                  for_ extra_dfuns $ \(_, m_pairs) -> for_ m_pairs $ \(_, target) ->
+                    keepAlive (idName target) ;
+                  let { upd_dfuns =
+                          [ let cur = case lookupTypeEnv (tcg_type_env g3b) (idName dfun) of
+                                  Just (AnId existing) -> existing
+                                  _                    -> dfun
+                            in addSourceMethods cur m_pairs
+                          | (dfun, m_pairs) <- extra_dfuns ] } ;
+                  g3c <- setGblEnv g3b (tcExtendGlobalValEnv upd_dfuns getGblEnv) ;
+                  let { all_staged = staged_binds ++ extra_meth_binds
+                      ; all_zonked = zonked_staged ++ extra_meth_binds } ;
+                  g4 <- installSourceMethods (const True) (g3c { tcg_binds = all_zonked, tcg_ev_binds = zonked_ev }) ;
+                  let { g5 = g4 { tcg_binds = tcg_binds tcg_env0, tcg_ev_binds = tcg_ev_binds g2 } } ;
+                  pure (g5, dm_ids, inst_defs, all_staged) } } ;
+
+        setGblEnv tcg_env_staged $ do {
+        (tcg_env, th_bndrs_syn) <-
+          if null trailing_syn_decls
+            then pure (tcg_env_staged, emptyNameEnv)
+            else do {
+              th_ref <- newTcRef emptyNameEnv ;
+              (g_syn, _) <- withLocalOpenDefinitions early_open_defs $ do {
+                (g_s, _, _, th_s) <- tcTyAndClassDecls trailing_syn_decls ;
+                writeTcRef th_ref th_s ;
+                l_s <- getLclEnv ;
+                pure (g_s, l_s) } ;
+              th_s <- readTcRef th_ref ;
+              pure (g_syn, th_s) } ;
+
+        updLclCtxt (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs_syn `plusNameEnv` tcl_th_bndrs tcl_env }) $
         setGblEnv tcg_env       $ do {
 
                 -- Foreign import declarations next.
@@ -1755,20 +4120,23 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
                 -- may be defined in terms of the former. (For instance,
                 -- the bindings produced in a Data instance.)
         traceTc "Tc5" empty ;
-        tc_envs <- tcTopBinds val_binds val_sigs;
+        tc_envs <- withLocalOpenDefinitions early_open_defs (tcSourceValueBinds group);
         restoreEnvs tc_envs $ do {
 
                 -- Now GHC-generated derived bindings, generics, and selectors
                 -- Do not generate warnings from compiler-generated code;
                 -- hence the use of discardWarnings
         tc_envs@(tcg_env, tcl_env)
-            <- discardWarnings (tcTopBinds deriv_binds deriv_sigs) ;
+            <- discardWarnings (tcTopBinds late_deriv_binds late_deriv_sigs) ;
         restoreEnvs tc_envs $ do {  -- Environment doesn't change now
 
                 -- Second pass over class and instance declarations,
                 -- now using the kind-checked decls
         traceTc "Tc6" empty ;
-        inst_binds <- tcInstDecls2 (tyClGroupTyClDecls tycl_decls) inst_infos ;
+        (inst_binds, pending_methods) <- case deferred_val_names of {
+          Just _  -> pure ([], Just (early_dm_ids, late_classes, late_insts)) ;
+          Nothing -> tcExtendGlobalValEnv early_dm_ids $
+                       (, Nothing) <$> tcInstDecls2 late_classes late_insts } ;
 
                 -- Foreign exports
         traceTc "Tc7" empty ;
@@ -1782,7 +4150,7 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
 
                 -- Wrap up
         traceTc "Tc7a" empty ;
-        let { all_binds = inst_binds ++ foe_binds
+        let { all_binds = early_staged_binds ++ inst_binds ++ foe_binds
 
             ; fo_gres = fi_gres `unionBags` foe_gres
             ; fo_fvs = foldr (\gre fvs -> fvs `addOneFN` (greName gre))
@@ -1806,13 +4174,34 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
         -- See Note [Newtype constructor usage in foreign declarations]
         addUsedGREs NoDeprecationWarnings (bagToList fo_gres) ;
 
-        return (tcg_env', tcl_env)
-    }}}}}
+        tcg_env'' <- installForgetMTyCons tcg_env' ;
+        return ((tcg_env'', tcl_env), pending_methods, deferred_deriving)
+    }}}}}}}
 
-tcTopSrcDecls _ = panic "tcTopSrcDecls: ValBindsIn"
+tcTopSrcDeclGroupWithMethods _ _ _ = panic "tcTopSrcDeclGroup: ValBindsIn"
+
+installForgetMTyCons :: TcGblEnv -> TcM TcGblEnv
+installForgetMTyCons env = do
+  forget_tcs <- drainForgetMTyCons (tcg_mod env)
+  synth_funs <- drainSynthesizedSourceFuns (tcg_mod env)
+  let synth_ids   = [fid | (fid, _, _) <- synth_funs]
+      synth_binds = [fb  | (_, fb, _)  <- synth_funs]
+      synth_tcs   = [ftc | (_, _, ftc) <- synth_funs]
+      all_cands   = forget_tcs ++ synth_tcs
+      new_tcs     = [tc | tc <- all_cands
+                        , isNothing (lookupTypeEnv (tcg_type_env env) (tyConName tc))]
+  env1 <- if null new_tcs
+          then pure env
+          else setGblEnv env (fst <$> addTyConsToGblEnv new_tcs)
+  if null synth_funs
+    then pure env1
+    else setGblEnv env1 $ do
+      env2 <- tcExtendGlobalValEnv synth_ids getGblEnv
+      pure (env2 `addTypecheckedBinds` [synth_binds])
 
 ---------------------------
-tcTyClsInstDecls :: [TyClGroup GhcRn]
+tcTyClsInstDecls :: Maybe [DerivInfo]  -- Nothing defers attached deriving
+                 -> [TyClGroup GhcRn]
                  -> [LDerivDecl GhcRn]
                  -> [LDefaultDecl GhcRn]
                  -> [(RecFlag, LHsBinds GhcRn)]
@@ -1821,10 +4210,10 @@ tcTyClsInstDecls :: [TyClGroup GhcRn]
                                               -- process; contains all dfuns for
                                               -- this module
                           ThBindEnv,          -- TH binding levels
-                          HsValBinds GhcRn)   -- Supporting bindings for derived
-                                              -- instances
+                          HsValBinds GhcRn,  -- Supporting bindings for derived instances
+                         [DerivInfo])        -- Attached deriving for a later batch
 
-tcTyClsInstDecls tycl_decls deriv_decls default_decls binds
+tcTyClsInstDecls previous_deriving tycl_decls deriv_decls default_decls binds
  = tcAddDataFamConPlaceholders (tycl_decls >>= group_instds) $
    tcAddPatSynPlaceholders (getPatSynBinds binds) $
    do { (tcg_env, inst_info, deriv_info, th_bndrs)
@@ -1844,12 +4233,15 @@ tcTyClsInstDecls tycl_decls deriv_decls default_decls binds
           -- Careful to quit now in case there were instance errors, so that
           -- the deriving errors don't pile up as well.
           ; failIfErrsM
-          ; (tcg_env', inst_info', val_binds)
-              <- tcInstDeclsDeriv deriv_info deriv_decls
-          ; setGblEnv tcg_env' $ do {
-                failIfErrsM
-              ; pure ( tcg_env', inst_info' ++ inst_info, th_bndrs, val_binds )
-      }}}}
+          ; case previous_deriving of
+              Nothing -> pure (tcg_env, inst_info, th_bndrs, emptyValBindsRn, deriv_info)
+              Just earlier -> do
+                (tcg_env', inst_info', val_binds)
+                    <- tcInstDeclsDeriv (deriv_info ++ earlier) deriv_decls
+                setGblEnv tcg_env' $ do
+                  failIfErrsM
+                  pure (tcg_env', inst_info' ++ inst_info, th_bndrs, val_binds, [])
+      }}}
 
 {- *********************************************************************
 *                                                                      *
@@ -2128,6 +4520,15 @@ module graph will be empty. Therefore `downsweepInteractiveImports` will perform
 for the unit portion of the graph, if it's not already been performed.
 
 
+Note [Interactive family instance visibility]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The home family instance environment also contains instances from modules
+that GHCi has loaded but the prompt has not imported. Collect the family
+instance modules from each interactive import, just as rnImports does for
+a source module. Include instances from earlier prompt declarations. A
+type numeral in Vec Bool (n + 1) can then use a visible FromNatural instance.
+See Note [Registered type numerals] in GHC.Tc.Gen.HsType.
+
 *********************************************************
 *                                                       *
                 GHCi stuff
@@ -2161,24 +4562,21 @@ runTcInteractive tcm_plugin_handling hsc_env thing_inside
                                                  , let local_gres = filter isLocalGRE gres
                                                  , not (null local_gres) ]) ]
 
-       ; let getOrphansForModuleName m mb_pkg = do
-              iface <- loadSrcInterface (text "runTcInteractive") LookupUser m NotBoot mb_pkg
-              pure $ mi_module iface : dep_orphs (mi_deps iface)
-
-             getOrphansForModule m = do
-              iface <- loadModuleInterface (text "runTcInteractive") m
-              pure $ mi_module iface : dep_orphs (mi_deps iface)
-
-       ; !orphs <- fmap (force . concat) . forM (ic_imports icxt) $ \i ->
-            case i of                   -- force above: see #15111
-                IIModule n -> getOrphansForModule n
-                IIDecl i   -> getOrphansForModuleName (hsModuleName (unLoc (ideclName i)))
-                                         (renameRawPkgQual (hsc_unit_env hsc_env) (hsModuleName $ unLoc $ ideclName i) (ideclPkgQual i))
-
+       ; !(orphs, finsts) <- fmap (force . mconcat) . forM (ic_imports icxt) $ \i -> do
+             -- Force the result to release the imported interfaces. See #15111.
+             iface <- case i of
+               IIModule m -> loadModuleInterface (text "runTcInteractive") m
+               IIDecl decl -> do
+                 let m = hsModuleName (unLoc (ideclName decl))
+                     pkg = renameRawPkgQual (hsc_unit_env hsc_env) m (ideclPkgQual decl)
+                 loadSrcInterface (text "runTcInteractive") LookupUser m NotBoot pkg
+             pure (mi_module iface : dep_orphs (mi_deps iface), importedFamInstModules iface)
 
        ; (home_insts, home_fam_insts) <- liftIO $ UnitEnv.hugAllInstances (hsc_unit_env hsc_env)
 
-       ; let imports = emptyImportAvails { imp_orphs = orphs }
+       ; let prompt_finsts = map (nameModule . getName) ic_finsts
+             imports = emptyImportAvails { imp_orphs = orphs
+                                         , imp_finsts = moduleSetElts (mkModuleSet (prompt_finsts ++ finsts)) }
 
              upd_envs (gbl_env, lcl_env) = (gbl_env', lcl_env')
 
@@ -2193,8 +4591,7 @@ runTcInteractive tcm_plugin_handling hsc_env thing_inside
                               home_fam_insts
                    , tcg_fix_env      = ic_fix_env icxt
                    , tcg_default      = ic_default icxt
-                        -- must calculate imp_orphs of the ImportAvails
-                        -- so that instance visibility is done correctly
+                        -- See Note [Interactive family instance visibility].
                    , tcg_imports      = imports }
 
                  lcl_env' = modifyLclCtxt (tcExtendLocalTypeEnv lcl_ids) lcl_env
@@ -2266,8 +4663,12 @@ tcRnStmt hsc_env rdr_stmt
 
     -- The real work is done here
     ((bound_ids, tc_expr), fix_env) <- tcUserStmt rdr_stmt ;
+    _ <- drainForgetMTyCons =<< getModule ;
+    _ <- drainSynthesizedSourceFuns =<< getModule ;
     zonked_expr <- zonkTopLExpr tc_expr ;
     zonked_ids  <- zonkTopBndrs bound_ids ;
+    env <- getGblEnv ;
+    checkOptionalSourceUses env ;
 
     failIfErrsM ;  -- we can't do the next step if there are
                    -- representation polymorphism errors
@@ -2708,13 +5109,13 @@ tcRnExpr hsc_env mode rdr_expr
     _ <- perhaps_disable_default_warnings $
          simplifyInteractive residual ;
 
-    let { all_expr_ty = mkInfForAllTys qtvs $
+    let { all_expr_ty = mkInfForAllTys [(unmatchableDataConTy,tv) | tv <- qtvs] $
                         mkPhiTy (map idType dicts) res_ty } ;
     ty <- liftZonkM $ zonkTcType all_expr_ty ;
 
     -- See Note [Normalising the type in :type]
     fam_envs <- tcGetFamInstEnvs ;
-    let { normalised_type = reductionReducedType $ normaliseType fam_envs Nominal ty
+    let { normalised_type = reductionReducedType $ normaliseTypeWithFuel 2000 fam_envs Nominal ty
           -- normaliseType returns a coercion which we discard, so the Role is irrelevant.
         ; final_type = if isSigmaTy res_ty then ty else normalised_type } ;
     return final_type }
@@ -2849,7 +5250,7 @@ tcRnType hsc_env flexi normalise rdr_type
                  | otherwise = ty
 
        ; traceTc "tcRnExpr" (debugPprType ty $$ debugPprType ty')
-       ; return (ty', mkInfForAllTys kvs (typeKind ty')) }
+       ; return (ty', mkInfForAllTys [(matchableDataConTy,kv) | kv <- kvs] (typeKind ty')) }
 
 
 {- Note [TcRnExprMode]
@@ -3159,6 +5560,7 @@ ppr_types debug type_env
       | otherwise = hasTopUserName id
                     && case idDetails id of
                          VanillaId              -> True
+                         SourceTableId {}       -> True
                          WorkerLikeId {}        -> True
                          RecSelId {}            -> True
                          ClassOpId {}           -> True

@@ -8,7 +8,8 @@ module GHC.Core.TyCo.Compare (
 
     -- * Type equality
     eqType, eqTypeIgnoringMultiplicity, eqTypeX, eqTypes,
-    eqVarBndrs,
+    eqVarBndrs, eqScopedSigmaClosures, eqScopedLambdaClosures,
+    eqScopedClosureTyCons, eqInstantiatedScopedClosures,
 
     pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck,
     tcEqTyConApps, tcEqTyConAppArgs,
@@ -28,13 +29,16 @@ module GHC.Core.TyCo.Compare (
 import GHC.Prelude
 
 import GHC.Core.Type( typeKind, coreView, tcSplitAppTyNoView_maybe, splitAppTyNoView_maybe
-                    , isLevityTy, isRuntimeRepTy, isMultiplicityTy )
+                    , isLevityTy, isRuntimeRepTy, isMultiplicityTy
+                    , isUnsaturatedUserFamily, splitTyConApp_maybe, repGetTyVar_maybe )
+import GHC.Core.Coercion.Axiom
 
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs
 import GHC.Core.TyCon
 import GHC.Core.Multiplicity( MultiplicityFlag(..) )
 
+import GHC.Types.Name (Name)
 import GHC.Types.Var
 import GHC.Types.Unique
 import GHC.Types.Var.Env
@@ -49,11 +53,15 @@ import GHC.Utils.Panic
 import GHC.Base (reallyUnsafePtrEquality#)
 
 import Control.Monad ( unless )
+import Control.Monad.Trans.State.Strict ( State, evalState )
+import qualified Control.Monad.Trans.State.Strict as State
 import Control.Monad.Trans.Writer.CPS ( Writer )
 import qualified Control.Monad.Trans.Writer.CPS as Writer
+import Data.Maybe ( fromMaybe )
 import qualified Data.Semigroup as S
 import Data.Set ( Set )
 import qualified Data.Set as Set
+import Data.Word ( Word64 )
 
 {- GHC.Core.TyCo.Compare overview
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -203,6 +211,10 @@ in the heap. We can take advantage of this by shortcutting the equality
 check if two types are represented by the same pointer under the hood.
 In some cases this reduces compiler allocations by ~2%.
 
+The shortcut requires an absent renaming environment. Under a dependent binder,
+the same runtime index node can refer to a bound identifier on one side and a
+free identifier on the other. Compare those occurrences through RnEnv2.
+
 See Note [Pointer comparison operations] in GHC.Builtin.primops.txt.pp
 
 Note [Respecting multiplicity when comparing types]
@@ -217,6 +229,9 @@ to ensure that Core is always type-correct when it comes to linearity.  So
     - in Core Lint: see Note [Linting linearity] in GHC.Core.Lint
     - in rule matching: see Note [Rewrite rules ignore multiplicities in FunTy]
       in GHC.Core.Unify
+
+Matchability remains part of equality when multiplicities are ignored. It
+controls inverse application evidence. Ignoring it would identify M and U arrows.
 -}
 
 
@@ -279,6 +294,285 @@ eqType ta tb = fullEq eq_type_expand_respect ta tb
 eqTypeX :: HasCallStack => RnEnv2 -> Type -> Type -> Bool
 eqTypeX env ta tb = fullEq (eq_type_expand_respect_x env) ta tb
 
+{- Note [Scoped retained sum codomains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An elaborated retained sum has type Sigma A p. Its codomain is a
+partially applied private family. The missing argument is the witness.
+A checked nominal rule compares two such codomains. It uses each checked
+branch telescope to rename locally bound variables. The ordered patterns,
+roles, incompatible and overlapping rows, and right-hand sides must
+agree. In particular, this rule never equates different source family
+names solely because they give equal results at selected indices.
+
+The renamer attaches one lexical owner Name to the families it generates
+inside each sum. The checked family and its interface keep that Name.
+The comparison follows private decisions only within the two owners
+it started with. An imported closure from another scope keeps its
+nominal identity. A cycle stops comparison. Ordinary eqType uses the
+nominal names of all families.
+See GHC.Builtin.CoercionRules for construction and rechecking of its
+nominal evidence.
+
+A type lambda outside a retained sum uses the same scope record. Its
+generated root has its own Name as the owner and the sum flag is False.
+Its generated decisions can carry that owner, but each has a different
+Name. A retained-sum root still has the sum flag. The interface has a
+separate tag for a type lambda root, which restores its own Name as the
+owner when GHC reads the declaration.
+-}
+-- | Check alpha-equivalence of two generated retained-sum codomains.
+eqScopedSigmaClosures :: Type -> Type -> Bool
+eqScopedSigmaClosures = eqScopedClosures sigmaRoot
+  where
+    sigmaRoot tc args
+      | Just (owner, True) <- closedFamilyScope_maybe tc
+      , length args + 1 == tyConArity tc = Just owner
+      | otherwise = Nothing
+
+-- | Check alpha-equivalence of two generated, partially applied type lambdas.
+eqScopedLambdaClosures :: Type -> Type -> Bool
+eqScopedLambdaClosures lhs rhs = eqScopedClosures lambdaRoot lhs rhs
+                               && typeKind lhs `eqType` typeKind rhs
+  where
+    lambdaRoot tc args
+      | Just (owner, False) <- closedFamilyScope_maybe tc
+      , owner == tyConName tc = Just owner
+      | Just (owner, True) <- closedFamilyScope_maybe tc
+      , length args + 1 == tyConArity tc = Just owner
+      | otherwise = Nothing
+
+-- | Check alpha-equivalence of two unsaturated scoped closure 'TyCon's.
+eqScopedClosureTyCons :: TyCon -> TyCon -> Bool
+eqScopedClosureTyCons tc1 tc2
+  | tc1 /= tc2
+  , Just (owner1, s1) <- closedFamilyScope_maybe tc1
+  , Just (owner2, s2) <- closedFamilyScope_maybe tc2
+  , s1 == s2
+  , tyConInjectivityInfo tc1 == tyConInjectivityInfo tc2
+  = evalState (sameScopedTyCons (owner1, owner2) [] tc1 tc2) Set.empty
+  | otherwise = False
+
+eqScopedClosures :: (TyCon -> [Type] -> Maybe Name) -> Type -> Type -> Bool
+eqScopedClosures scopeRoot lhs rhs
+  | Just (tc1, as1) <- splitTyConApp_maybe lhs
+  , Just (tc2, as2) <- splitTyConApp_maybe rhs
+  , tc1 /= tc2
+  , Just owner1 <- scopeRoot tc1 as1
+  , Just owner2 <- scopeRoot tc2 as2
+  , isUnsaturatedUserFamily tc1 as1
+  , isUnsaturatedUserFamily tc2 as2
+  = if equalLength as1 as2
+      then evalState (eqScopedType (owner1, owner2) [] Nothing lhs rhs) Set.empty
+      else eqInstantiatedScopedClosures (owner1, owner2) tc1 as1 tc2 as2
+  | otherwise = False
+
+-- | Compare two partially applied scoped closures with different numbers of
+-- captured arguments but the same remaining arity by substituting each
+-- closure's applied capture prefix into its single branch before alpha-comparing
+-- the remaining lambda binders and RHS.
+eqInstantiatedScopedClosures :: (Name, Name) -> TyCon -> [Type] -> TyCon -> [Type] -> Bool
+eqInstantiatedScopedClosures owners tc1 as1 tc2 as2
+  | let rem_arity = tyConArity tc1 - length as1
+  , rem_arity >= 1
+  , rem_arity == tyConArity tc2 - length as2
+  , Just ax1 <- closedFamilyTyConCoAxiom_maybe tc1
+  , Just ax2 <- closedFamilyTyConCoAxiom_maybe tc2
+  , coAxiomRole ax1 == Nominal, coAxiomRole ax2 == Nominal
+  , coAxiomTyCon ax1 == tc1, coAxiomTyCon ax2 == tc2
+  , [b1] <- fromBranches (coAxiomBranches ax1)
+  , [b2] <- fromBranches (coAxiomBranches ax2)
+  , null (cab_cvs b1), null (cab_cvs b2)
+  , null (cab_eta_tvs b1), null (cab_eta_tvs b2)
+  , null (cab_incomps b1), null (cab_incomps b2)
+  , null (cab_overlaps b1), null (cab_overlaps b2)
+  , all (== Nominal) (cab_roles b1), all (== Nominal) (cab_roles b2)
+  , Just lhs_tvs1 <- traverse repGetTyVar_maybe (cab_lhs b1)
+  , Just lhs_tvs2 <- traverse repGetTyVar_maybe (cab_lhs b2)
+  , length lhs_tvs1 == tyConArity tc1, length lhs_tvs2 == tyConArity tc2
+  , let set1 = mkVarSet lhs_tvs1
+        set2 = mkVarSet lhs_tvs2
+  , sizeVarSet set1 == length lhs_tvs1, sizeVarSet set2 == length lhs_tvs2
+  , set1 == mkVarSet (cab_tvs b1), set2 == mkVarSet (cab_tvs b2)
+  = let (cap1, rem1) = splitAt (length as1) lhs_tvs1
+        (cap2, rem2) = splitAt (length as2) lhs_tvs2
+        avoid = tyCoVarsOfTypes (as1 ++ as2)
+        in_sc0 = mkInScopeSet (avoid `unionVarSet` mkVarSet (rem1 ++ rem2))
+        (in_sc1, sub1, rem1') = freshen_rem avoid in_sc0 (zipVarEnv cap1 as1) rem1
+        (in_sc2, sub2, rem2') = freshen_rem avoid in_sc1 (zipVarEnv cap2 as2) rem2
+        env0 = mkRnEnv2 in_sc2
+        step (env, acc) (tv1, tv2) =
+          (rnBndr2 env tv1 tv2, (env, tyVarKind tv1, tyVarKind tv2) : acc)
+        (env_final, rev_k_checks) = foldl' step (env0, []) (zip rem1' rem2')
+        rhs1 = subst_cap sub1 (cab_rhs b1)
+        rhs2 = subst_cap sub2 (cab_rhs b2)
+        check_all = foldr (\ (e, k1, k2) rest ->
+                            do { ok <- eqScopedType owners [(tc1, tc2)] (Just e) k1 k2
+                               ; if ok then rest else pure False })
+                          (eqScopedType owners [(tc1, tc2)] (Just env_final) rhs1 rhs2)
+                          (reverse rev_k_checks)
+    in evalState check_all Set.empty
+  | otherwise = False
+  where
+    freshen_rem _ in_sc sub [] = (in_sc, sub, [])
+    freshen_rem avoid in_sc sub (tv : tvs) =
+      let k'  = subst_cap sub (tyVarKind tv)
+          tv0 = setVarType tv k'
+          tv' | tv `elemVarSet` avoid = uniqAway in_sc tv0
+              | otherwise             = tv0
+          in_sc' = extendInScopeSet in_sc tv'
+          sub'   = extendVarEnv sub tv (TyVarTy tv')
+          (in_sc_f, sub_f, rest) = freshen_rem avoid in_sc' sub' tvs
+      in (in_sc_f, sub_f, tv' : rest)
+
+    app_ty (TyConApp tc tys) a = TyConApp tc (tys ++ [a])
+    app_ty f                 a = AppTy f a
+
+    subst_bndr env v = setVarType v (subst_cap env (varType v))
+
+    subst_cap env ty
+      | isEmptyVarEnv env = ty
+      | otherwise = case ty of
+          TyVarTy tv -> fromMaybe ty (lookupVarEnv env tv)
+          AppTy f a  -> app_ty (subst_cap env f) (subst_cap env a)
+          TyConApp tc tys -> TyConApp tc (map (subst_cap env) tys)
+          FunTy af ma w a r ->
+            FunTy af (subst_cap env ma) (subst_cap env w) (subst_cap env a) (subst_cap env r)
+          ForAllTy ma (Bndr tv vis) r ->
+            let env' = delVarEnv env tv
+            in ForAllTy (subst_cap env ma) (Bndr (subst_bndr env tv) vis) (subst_cap env' r)
+          ExistsTy fl tv r ->
+            let env' = delVarEnv env tv
+            in ExistsTy fl (subst_bndr env tv) (subst_cap env' r)
+          DepFunTy vis v r ->
+            let v' = setIdMult (subst_bndr env v) (subst_cap env (idMult v))
+            in DepFunTy vis v' (subst_cap env r)
+          DepDictTy v r ->
+            DepDictTy (subst_bndr env v) (subst_cap env r)
+          TermVarTy v ->
+            TermVarTy (setIdMult (subst_bndr env v) (subst_cap env (idMult v)))
+          TermAppTy f a ->
+            TermAppTy (setIdMult (subst_bndr env f) (subst_cap env (idMult f))) (subst_cap env a)
+          ClassAppTy f i d x k ->
+            ClassAppTy f (subst_cap env i) (subst_cap env d) (subst_cap env x) (subst_cap env k)
+          CastTy t co -> CastTy (subst_cap env t) co
+          LitTy{} -> ty
+          CoercionTy{} -> ty
+
+eqScopedType :: (Name, Name) -> [(TyCon, TyCon)] -> Maybe RnEnv2 -> Type -> Type
+             -> State (Set (Word64, Word64)) Bool
+eqScopedType owners active mb_env = go_full
+  where
+    andM m1 m2 = do { b1 <- m1; if b1 then m2 else pure False }
+    gos [] []             = pure True
+    gos (t1:ts1) (t2:ts2) = go t1 t2 `andM` gos ts1 ts2
+    gos _ _               = pure False
+
+    go_full t1 t2 = go t1 t2 `andM` go (typeKind t1) (typeKind t2)
+
+    go t1 t2 = case (t1, t2) of
+      _ | Nothing <- mb_env
+        , 1# <- reallyUnsafePtrEquality# t1 t2 -> pure True
+      (TyConApp tc1 ts1, TyConApp tc2 ts2)
+        | tc1 == tc2, not (isForgetfulSynTyCon tc1) -> gos ts1 ts2
+      _ | Just t1' <- coreView t1 -> go t1' t2
+        | Just t2' <- coreView t2 -> go t1 t2'
+      (TyConApp tc1 ts1, TyConApp tc2 ts2)
+        | tc1 == tc2 -> gos ts1 ts2
+        | otherwise  -> gos ts1 ts2 `andM` sameScopedTyCons owners active tc1 tc2
+      (TyVarTy tv1, TyVarTy tv2) ->
+        pure $ case mb_env of
+          Nothing  -> tv1 == tv2
+          Just env -> rnOccL env tv1 == rnOccR env tv2
+      (ClassAppTy f1 a1 d1 x1 k1, ClassAppTy f2 a2 d2 x2 k2)
+        | f1 == f2  -> gos [a1, d1, x1, k1] [a2, d2, x2, k2]
+        | otherwise -> pure False
+      (DepDictTy v1 body1, DepDictTy v2 body2) ->
+        let env = fromMaybe (initRnEnv t1 t2) mb_env
+        in eqScopedType owners active (Just env) (varType v1) (varType v2)
+           `andM` eqScopedType owners active (Just (rnBndr2 env v1 v2)) body1 body2
+      (TermAppTy f1 a1, TermAppTy f2 a2) ->
+        let eq_hd = case mb_env of { Nothing -> f1 == f2; Just env -> rnOccL env f1 == rnOccR env f2 }
+        in if eq_hd then go a1 a2 else pure False
+      (TermVarTy v1, TermVarTy v2) ->
+        pure $ case mb_env of
+          Nothing  -> v1 == v2
+          Just env -> rnOccL env v1 == rnOccR env v2
+      (ExistsTy flag1 v1 ty1, ExistsTy flag2 v2 ty2)
+        | flag1 == flag2 ->
+            let env = fromMaybe (initRnEnv t1 t2) mb_env
+            in eqScopedType owners active (Just env) (varType v1) (varType v2)
+               `andM` eqScopedType owners active (Just (rnBndr2 env v1 v2)) ty1 ty2
+        | otherwise -> pure False
+      (DepFunTy vis1 v1 ty1, DepFunTy vis2 v2 ty2)
+        | vis1 `eqDepFunVis` vis2 ->
+            let env = fromMaybe (initRnEnv t1 t2) mb_env
+            in eqScopedType owners active (Just env) (idMult v1) (idMult v2)
+               `andM` eqScopedType owners active (Just env) (varType v1) (varType v2)
+               `andM` eqScopedType owners active (Just (rnBndr2 env v1 v2)) ty1 ty2
+        | otherwise -> pure False
+      (LitTy l1, LitTy l2)       -> pure (l1 == l2)
+      (CastTy t1' _, _)          -> go t1' t2
+      (_, CastTy t2' _)          -> go t1 t2'
+      (CoercionTy{}, CoercionTy{}) -> pure True
+      (FunTy _ ma1 w1 a1 r1, FunTy _ ma2 w2 a2 r2) ->
+        gos [w1, typeKind a1, typeKind r1, ma1, a1, r1]
+            [w2, typeKind a2, typeKind r2, ma2, a2, r2]
+      (AppTy f1 a1, _)
+        | Just (f2, a2) <- tcSplitAppTyNoView_maybe t2 -> gos [f1, a1] [f2, a2]
+      (_, AppTy f2 a2)
+        | Just (f1, a1) <- tcSplitAppTyNoView_maybe t1 -> gos [f1, a1] [f2, a2]
+      (ForAllTy ma1 (Bndr tv1 vis1) ty1, ForAllTy ma2 (Bndr tv2 vis2) ty2)
+        | vis1 `eqForAllVis` vis2 ->
+            let env = fromMaybe (initRnEnv t1 t2) mb_env
+            in eqScopedType owners active (Just env) ma1 ma2
+               `andM` eqScopedType owners active (Just env) (tyVarKind tv1) (tyVarKind tv2)
+               `andM` eqScopedType owners active (Just (rnBndr2 env tv1 tv2)) ty1 ty2
+      _ -> pure False
+
+sameScopedTyCons :: (Name, Name) -> [(TyCon, TyCon)] -> TyCon -> TyCon
+                 -> State (Set (Word64, Word64)) Bool
+sameScopedTyCons owners@(owner1, owner2) seen tc1 tc2
+  | any (\(a, b) -> a == tc1 || b == tc2) seen = pure False
+  | Just (scope1, _) <- closedFamilyScope_maybe tc1, scope1 == owner1
+  , Just (scope2, _) <- closedFamilyScope_maybe tc2, scope2 == owner2
+  , Just ax1 <- closedFamilyTyConCoAxiom_maybe tc1
+  , Just ax2 <- closedFamilyTyConCoAxiom_maybe tc2
+  , coAxiomRole ax1 == Nominal, coAxiomRole ax2 == Nominal
+  , coAxiomTyCon ax1 == tc1, coAxiomTyCon ax2 == tc2
+  , tyConKind tc1 `eqType` tyConKind tc2
+  = do let key = (getKey (getUnique tc1), getKey (getUnique tc2))
+       verified <- State.get
+       if Set.member key verified
+         then pure True
+         else do
+           ok <- same_rowsM same_branch (fromBranches (coAxiomBranches ax1))
+                                        (fromBranches (coAxiomBranches ax2))
+           if ok
+             then State.modify' (Set.insert key) >> pure True
+             else pure False
+  | otherwise = pure False
+  where
+    andM m1 m2 = do { b1 <- m1; if b1 then m2 else pure False }
+    same_rowsM _ [] []         = pure True
+    same_rowsM f (a:as) (b:bs) = f a b `andM` same_rowsM f as bs
+    same_rowsM _ _ _           = pure False
+
+    same_branch a b =
+      same_equation a b
+      `andM` same_rowsM same_equation (cab_incomps a) (cab_incomps b)
+      `andM` same_rowsM same_equation (cab_overlaps a) (cab_overlaps b)
+
+    same_equation a b
+      | cab_roles a == cab_roles b
+      , null (cab_eta_tvs a), null (cab_eta_tvs b)
+      , Just env <- eqVarBndrs (mkRnEnv2 emptyInScopeSet)
+                    (cab_tvs a ++ cab_cvs a) (cab_tvs b ++ cab_cvs b)
+      = same_rowsM (eq_scoped env) (cab_lhs a) (cab_lhs b)
+        `andM` eq_scoped env (cab_rhs a) (cab_rhs b)
+      | otherwise = pure False
+
+    eq_scoped env = eqScopedType owners ((tc1, tc2) : seen) (Just env)
+
 eqTypeIgnoringMultiplicity :: Type -> Type -> Bool
 -- See Note [Respecting multiplicity when comparing types]
 eqTypeIgnoringMultiplicity ta tb = fullEq eq_type_expand_ignore ta tb
@@ -324,6 +618,10 @@ See #19226.
 
 -- | This flag controls whether we expand synonyms during comparison
 data SynFlag = ExpandSynonyms | KeepSynonyms
+
+expandsSynonyms :: SynFlag -> Bool
+expandsSynonyms KeepSynonyms = False
+expandsSynonyms _ = True
 
 eq_type_expand_respect, eq_type_expand_ignore, eq_type_keep_respect
   :: Type -> Type -> Bool
@@ -377,24 +675,65 @@ inline_generic_eq_type_x syn_flag mult_flag mb_env
         gos _ _               = False
 
     in case (t1,t2) of
-      _ | 1# <- reallyUnsafePtrEquality# t1 t2 -> True
+      _ | Nothing <- mb_env
+        , 1# <- reallyUnsafePtrEquality# t1 t2 -> True
       -- See Note [Type comparisons using object pointer comparisons]
 
       (TyConApp tc1 tys1, TyConApp tc2 tys2)
         | tc1 == tc2, not (isForgetfulSynTyCon tc1)   -- See Note [Comparing type synonyms]
         -> gos tys1 tys2
 
-      _ | ExpandSynonyms <- syn_flag, Just t1' <- coreView t1 -> go t1' t2
-        | ExpandSynonyms <- syn_flag, Just t2' <- coreView t2 -> go t1 t2'
+      _ | expandsSynonyms syn_flag, Just t1' <- coreView t1 -> go t1' t2
+        | expandsSynonyms syn_flag, Just t2' <- coreView t2 -> go t1 t2'
 
       (TyConApp tc1 ts1, TyConApp tc2 ts2)
         | tc1 == tc2 -> gos ts1 ts2
-        | otherwise  -> False
+        | otherwise -> False
 
       (TyVarTy tv1, TyVarTy tv2)
         -> case mb_env of
               Nothing  -> tv1 == tv2
               Just env -> rnOccL env tv1 == rnOccR env tv2
+
+      (ClassAppTy f1 a1 d1 x1 k1, ClassAppTy f2 a2 d2 x2 k2)
+        -> f1 == f2 && gos [a1, d1, x1, k1] [a2, d2, x2, k2]
+
+      (DepDictTy v1 body1, DepDictTy v2 body2)
+        -> case mb_env of
+             Nothing -> generic_eq_type_x syn_flag mult_flag (Just (initRnEnv t1 t2)) t1 t2
+             Just env -> go (varType v1) (varType v2)
+                      && generic_eq_type_x syn_flag mult_flag (Just (rnBndr2 env v1 v2)) body1 body2
+
+      (TermAppTy f1 a1, TermAppTy f2 a2)
+        -> (case mb_env of
+              Nothing -> f1 == f2
+              Just env -> rnOccL env f1 == rnOccR env f2)
+           && go a1 a2
+
+      (TermVarTy v1, TermVarTy v2)
+        -> case mb_env of
+              Nothing  -> v1 == v2
+              Just env -> rnOccL env v1 == rnOccR env v2
+
+      (ExistsTy flag1 v1 body1, ExistsTy flag2 v2 body2)
+        -> flag1 == flag2 && case mb_env of
+             Nothing -> generic_eq_type_x syn_flag mult_flag
+                          (Just (initRnEnv t1 t2)) t1 t2
+             Just env -> go (varType v1) (varType v2)
+                      && generic_eq_type_x syn_flag mult_flag
+                           (Just (rnBndr2 env v1 v2)) body1 body2
+
+      (DepFunTy vis1 v1 body1, DepFunTy vis2 v2 body2)
+        -> vis1 `eqDepFunVis` vis2 && case mb_env of
+              Nothing -> generic_eq_type_x syn_flag mult_flag
+                            (Just (initRnEnv t1 t2)) t1 t2
+              Just env
+                -> go (varType v1) (varType v2)
+                   && (case mult_flag of
+                         RespectMultiplicities -> go (idMult v1) (idMult v2)
+                         IgnoreMultiplicities  -> True)
+                   && generic_eq_type_x syn_flag mult_flag
+                        (Just (rnBndr2 env v1 v2)) body1 body2
 
       (LitTy lit1,    LitTy lit2)    -> lit1 == lit2
       (CastTy t1' _,   _)            -> go t1' t2 -- Ignore casts
@@ -406,8 +745,9 @@ inline_generic_eq_type_x syn_flag mult_flag mb_env
     -- kind variable, which causes things to blow up.
     -- See Note [Equality on FunTys] in GHC.Core.TyCo.Rep: we must check
     -- kinds here
-      (FunTy _ w1 arg1 res1, FunTy _ w2 arg2 res2)
-        ->   fullEq go arg1 arg2
+      (FunTy _ ma1 w1 arg1 res1, FunTy _ ma2 w2 arg2 res2)
+        ->   go ma1 ma2
+          && fullEq go arg1 arg2
           && fullEq go res1 res2
           && (case mult_flag of
                   RespectMultiplicities -> go w1 w2
@@ -421,13 +761,14 @@ inline_generic_eq_type_x syn_flag mult_flag mb_env
         | Just (s1, t1') <- tcSplitAppTyNoView_maybe t1
         -> go s1 s2 && go t1' t2'
 
-      (ForAllTy (Bndr tv1 vis1) body1, ForAllTy (Bndr tv2 vis2) body2)
+      (ForAllTy ma1 (Bndr tv1 vis1) body1, ForAllTy ma2 (Bndr tv2 vis2) body2)
         -> case mb_env of
               Nothing -> generic_eq_type_x syn_flag mult_flag
                             (Just (initRnEnv t1 t2)) t1 t2
               Just env
                 | vis1 `eqForAllVis` vis2         -- See Note [ForAllTy and type equality]
-                -> go (varType tv1) (varType tv2)  -- Always do kind-check
+                -> go ma1 ma2
+                   && go (varType tv1) (varType tv2)  -- Always do kind-check
                    && generic_eq_type_x syn_flag mult_flag
                              (Just (rnBndr2 env tv1 tv2)) body1 body2
                 | otherwise
@@ -452,8 +793,13 @@ hasCasts :: Type -> Bool
 hasCasts (CastTy {})     = True
 hasCasts (CoercionTy {}) = True
 hasCasts (AppTy t1 t2)   = hasCasts t1 || hasCasts t2
-hasCasts (ForAllTy _ ty) = hasCasts ty
-hasCasts _               = False   -- TyVarTy, TyConApp, FunTy, LitTy
+hasCasts (ClassAppTy _ inst dict operand kind) = any hasCasts [inst, dict, operand, kind]
+hasCasts (DepDictTy b body) = hasCasts (varType b) || hasCasts body
+hasCasts (TermAppTy _ arg) = hasCasts arg
+hasCasts (ForAllTy ma _ ty) = hasCasts ma || hasCasts ty
+hasCasts (ExistsTy _ v ty) = hasCasts (varType v) || hasCasts ty
+hasCasts (DepFunTy _ v ty) = hasCasts (varType v) || hasCasts ty
+hasCasts _               = False   -- TyVarTy, TermVarTy, TyConApp, FunTy, LitTy
 
 
 {- *********************************************************************
@@ -694,8 +1040,27 @@ nonDetCmpTypeX env orig_t1 orig_t2 =
 
     go env (TyVarTy tv1)       (TyVarTy tv2)
       = liftOrdering $ rnOccL env tv1 `nonDetCmpVar` rnOccR env tv2
-    go env (ForAllTy (Bndr tv1 vis1) t1) (ForAllTy (Bndr tv2 vis2) t2)
+    go env (ClassAppTy f1 a1 d1 x1 k1) (ClassAppTy f2 a2 d2 x2 k2)
+      = liftOrdering (f1 `nonDetCmpVar` f2) `thenCmpTy` gos env [a1, d1, x1, k1] [a2, d2, x2, k2]
+    go env (DepDictTy v1 t1) (DepDictTy v2 t2)
+      = go env (varType v1) (varType v2) `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
+    go env (TermAppTy f1 a1) (TermAppTy f2 a2)
+      = liftOrdering (rnOccL env f1 `nonDetCmpVar` rnOccR env f2)
+        `thenCmpTy` go env a1 a2
+    go env (TermVarTy v1)      (TermVarTy v2)
+      = liftOrdering $ rnOccL env v1 `nonDetCmpVar` rnOccR env v2
+    go env (ExistsTy flag1 v1 t1) (ExistsTy flag2 v2 t2)
+      = liftOrdering (compare flag1 flag2)
+        `thenCmpTy` go env (varType v1) (varType v2)
+        `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
+    go env (DepFunTy vis1 v1 t1) (DepFunTy vis2 v2 t2)
+      = liftOrdering (vis1 `cmpDepFunVis` vis2)
+        `thenCmpTy` go env (idMult v1) (idMult v2)
+        `thenCmpTy` go env (varType v1) (varType v2)
+        `thenCmpTy` go (rnBndr2 env v1 v2) t1 t2
+    go env (ForAllTy ma1 (Bndr tv1 vis1) t1) (ForAllTy ma2 (Bndr tv2 vis2) t2)
       = liftOrdering (vis1 `cmpForAllVis` vis2)   -- See Note [ForAllTy and type equality]
+        `thenCmpTy` go env ma1 ma2
         `thenCmpTy` go env (varType tv1) (varType tv2)
         `thenCmpTy` go (rnBndr2 env tv1 tv2) t1 t2
 
@@ -707,10 +1072,11 @@ nonDetCmpTypeX env orig_t1 orig_t2 =
       | Just (s1, t1) <- splitAppTyNoView_maybe ty1
       = go env s1 s2 `thenCmpTy` go env t1 t2
 
-    go env (FunTy _ w1 s1 t1) (FunTy _ w2 s2 t2)
+    go env (FunTy _ ma1 w1 s1 t1) (FunTy _ ma2 w2 s2 t2)
         -- NB: nonDepCmpTypeX does the kind check requested by
         -- Note [Equality on FunTys] in GHC.Core.TyCo.Rep
       = liftOrdering (nonDetCmpTypeX env s1 s2 S.<> nonDetCmpTypeX env t1 t2)
+          `thenCmpTy` go env ma1 ma2
           `thenCmpTy` go env w1 w2
         -- Comparing multiplicities last because the test is usually true
 
@@ -731,11 +1097,17 @@ nonDetCmpTypeX env orig_t1 orig_t2 =
               = pprPanic "nonDetCmpTypeX.get_rank" (ppr [ty1,ty2])
             get_rank (TyVarTy {})    = 0
             get_rank (CoercionTy {}) = 1
+            get_rank (TermAppTy {})  = 9
+            get_rank (TermVarTy {})  = 2
             get_rank (AppTy {})      = 3
             get_rank (LitTy {})      = 4
             get_rank (TyConApp {})   = 5
             get_rank (FunTy {})      = 6
             get_rank (ForAllTy {})   = 7
+            get_rank (DepFunTy {})   = 8
+            get_rank (ExistsTy {})   = 11
+            get_rank (DepDictTy {})  = 12
+            get_rank (ClassAppTy {}) = 13
 
     gos :: RnEnv2 -> [Type] -> [Type] -> TypeOrdering
     gos _   []         []         = TEQ
@@ -775,6 +1147,7 @@ data InvisibleBit
   = InvisibleKind
   | InvisibleRuntimeRep
   | InvisibleMultiplicity
+  | InvisibleMatchability
   deriving stock (Eq, Ord, Show)
 instance Outputable InvisibleBit where
   ppr thing = text (show thing)
@@ -794,6 +1167,8 @@ pprWithInvisibleBits invis_bits
               = show_reps  || sdocPrintExplicitRuntimeReps ctx
           , sdocLinearTypes
               = show_mults || sdocLinearTypes ctx
+          , sdocPrintExplicitMatchabilities
+              = show_matchabilities || sdocPrintExplicitMatchabilities ctx
   -- Question: what about 'sdocPrintExplicitCoercions'?
   -- Currently, we never enable that automatically; it's always up to the user
   -- to enable it.
@@ -802,12 +1177,14 @@ pprWithInvisibleBits invis_bits
     show_kinds = InvisibleKind         `Set.member` invis_bits
     show_reps  = InvisibleRuntimeRep   `Set.member` invis_bits
     show_mults = InvisibleMultiplicity `Set.member` invis_bits
+    show_matchabilities = InvisibleMatchability `Set.member` invis_bits
 
 mayLookIdentical :: Type -> Type -> InvisibleBits
 -- | 'mayLookIdentical' returns:
 --
 --  - An empty set if the two types are distinct unequal, and remain distinct
---    even if we hide explicit kinds, runtime-reps, multiplicities.
+--    even if we hide explicit kinds, runtime reps, multiplicities and
+--    ordinary arrow matchabilities.
 --  - A non-empty set of 'invis_bits', if the two types might look equal, but
 --    are in fact distinct in the returned 'invis_bits'.
 --
@@ -881,27 +1258,54 @@ mayLookIdentical orig_ty1 orig_ty2
              ; return $ not kind_ok }
     go _ _ (TyVarTy {}) (TyVarTy {}) = return False
 
+    go env _top t1@ClassAppTy{} t2@ClassAppTy{} = return (eqTypeX env t1 t2)
+    go env _top t1@DepDictTy{} t2@DepDictTy{} = return (eqTypeX env t1 t2)
+
+    go env _top (TermAppTy f1 a1) (TermAppTy f2 a2)
+      | rnOccL env f1 == rnOccR env f2 = go env False a1 a2
+      | otherwise = return False
+
+    go env _top (TermVarTy v1) (TermVarTy v2)
+      = return $ rnOccL env v1 == rnOccR env v2
+
+    go env _top (ExistsTy flag1 v1 ty1) (ExistsTy flag2 v2 ty2)
+      | flag1 == flag2
+      = (&&) <$> go env False (varType v1) (varType v2)
+             <*> go (rnBndr2 env v1 v2) False ty1 ty2
+      | otherwise = return False
+
+    go env _top (DepFunTy vis1 v1 ty1) (DepFunTy vis2 v2 ty2)
+      | vis1 `eqDepFunVis` vis2
+      = (\m k b -> m && k && b)
+          <$> go env False (idMult v1) (idMult v2)
+          <*> go env False (varType v1) (varType v2)
+          <*> go (rnBndr2 env v1 v2) False ty1 ty2
+      | otherwise = return False
+
     go _   _   (LitTy lit1)    (LitTy lit2)    = return $ lit1 == lit2
     go top vis (CastTy t1 _)   t2              = go top vis t1 t2
     go top vis t1              (CastTy t2 _)   = go top vis t1 t2
     go _   _   (CoercionTy {}) (CoercionTy {}) = return True
 
-    go env _top (ForAllTy (Bndr tv1 vis1) ty1)
-                (ForAllTy (Bndr tv2 vis2) ty2)
+    go env _top (ForAllTy ma1 (Bndr tv1 vis1) ty1)
+                (ForAllTy ma2 (Bndr tv2 vis2) ty2)
       = if vis1 `eqForAllVis` vis2  -- See Note [ForAllTy and type equality]
-        then do { _kind_ok <- tell_on_mismatch InvisibleKind $ go env False (tyVarKind tv1) (tyVarKind tv2)
-                ; go (rnBndr2 env tv1 tv2) False ty1 ty2 }
+        then do { ma_ok <- go env False ma1 ma2
+                ; _kind_ok <- tell_on_mismatch InvisibleKind $ go env False (tyVarKind tv1) (tyVarKind tv2)
+                ; body_ok <- go (rnBndr2 env tv1 tv2) False ty1 ty2
+                ; return (ma_ok && body_ok) }
         else return False
 
     -- See Note [Defaultable tyvars in mayLookIdentical]
-    go _ _ (ForAllTy b@(Bndr tv _) _) _ | isDefaultableBndr b = discard_defaultable_tyvar tv
-    go _ _ _ (ForAllTy b@(Bndr tv _) _) | isDefaultableBndr b = discard_defaultable_tyvar tv
+    go _ _ (ForAllTy _ b@(Bndr tv _) _) _ | isDefaultableBndr b = discard_defaultable_tyvar tv
+    go _ _ _ (ForAllTy _ b@(Bndr tv _) _) | isDefaultableBndr b = discard_defaultable_tyvar tv
 
-    go env _top (FunTy _ w1 arg1 res1) (FunTy _ w2 arg2 res2)
+    go env _top (FunTy _ ma1 w1 arg1 res1) (FunTy _ ma2 w2 arg2 res2)
       = do { _mult_ok <- tell_on_mismatch InvisibleMultiplicity $ go env False w1 w2
            ; _reps_ok <- tell_on_mismatch InvisibleRuntimeRep $
                (&&) <$> go env False (typeKind arg1) (typeKind arg2)
                     <*> go env False (typeKind res1) (typeKind res2)
+           ; _ma_ok <- tell_on_mismatch InvisibleMatchability $ go env False ma1 ma2
            ; (&&) <$> go env False arg1 arg2 <*> go env False res1 res2 }
 
       -- See Note [Equality on AppTys] in GHC.Core.Type
@@ -941,7 +1345,8 @@ mayLookIdentical orig_ty1 orig_ty2
 As described in Note [Showing invisible bits of types in error messages]
 in GHC.Tc.Errors.Ppr, the job of 'mayLookIdentical' is to compute whether two
 types that are not equal may in fact look identical when pretty-printed to the
-user, due to the hiding of explicit kinds, runtime-reps or multiplicities.
+user, due to the hiding of explicit kinds, runtime reps, multiplicities or
+ordinary arrow matchabilities.
 
 'mayLookIdentical' can return:
 

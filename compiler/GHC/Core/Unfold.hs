@@ -581,6 +581,13 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
                       -- on nullary constructors
                     | otherwise       = size_up_call f [] 0
 
+    -- See Note [Erasing a lexical existential] in GHC.CoreToStg.
+    size_up (Pack _ _ payload) = size_up payload
+    size_up (Unpack _ payload package body)
+      | Var{} <- package = size_up body
+      | otherwise = size_up package `addSizeNSD` size_up body
+                    `addSizeN` size_up_alloc payload
+
     size_up (App fun arg)
       | isTyCoArg arg = size_up fun
       | otherwise     = size_up arg  `addSizeNSD`

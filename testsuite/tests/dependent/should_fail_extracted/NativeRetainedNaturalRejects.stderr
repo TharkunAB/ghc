@@ -1,0 +1,45 @@
+NativeRetainedNaturalRejects.hs:10:12: error: [GHC-83865]
+    • Couldn't match type ‘5’ with ‘6’
+      Expected: Reading 6
+        Actual: Reading 5
+    • In the expression: rememberNatural 5
+      In an equation for ‘wrongNat’: wrongNat = rememberNatural 5
+
+NativeRetainedNaturalRejects.hs:13:33: error: [GHC-83605]
+    • GHC cannot use the cast required for this argument as a retained index.
+      Expected: Natural
+        Actual: Integer
+    • In the expression: rememberNatural (5 :: Integer)
+      In an equation for ‘wrongInteger’:
+          wrongInteger = rememberNatural (5 :: Integer)
+
+NativeRetainedNaturalRejects.hs:16:30: error: [GHC-83605]
+    • GHC cannot use method ‘fromInteger’ as a retained index.
+      This call needs a known ‘Num Natural’ dictionary.
+    • In the expression: rememberNatural 5
+      In an equation for ‘wrongGiven’: wrongGiven = rememberNatural 5
+
+NativeRetainedNaturalRejects.hs:19:13: error: [GHC-83865]
+    • Couldn't match type ‘'\955'’ with ‘'x'’
+      Expected: RememberedChar 'x'
+        Actual: RememberedChar '\955'
+    • In the expression: remember 'λ'
+      In an equation for ‘wrongChar’: wrongChar = remember 'λ'
+
+NativeRetainedNaturalRejects.hs:22:41: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the first argument of ‘rememberedChar’, namely
+        ‘(remember (C# raw))’
+      In the expression: rememberedChar (remember (C# raw))
+      In an equation for ‘rawChar’:
+          rawChar raw = rememberedChar (remember (C# raw))
+
+NativeRetainedNaturalRejects.hs:25:13: error: [GHC-83865]
+    • Couldn't match type ‘'\NUL'’ with ‘'\128578'’
+      Expected: RememberedList Char ['\955', '\128578']
+        Actual: RememberedList Char ['\955', '\NUL', '\128578']
+    • In the expression: rememberList "λ\0🙂"
+      In an equation for ‘wrongWord’: wrongWord = rememberList "λ\0🙂"
+

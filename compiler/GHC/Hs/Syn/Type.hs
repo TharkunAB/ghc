@@ -14,12 +14,14 @@ import GHC.Prelude
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.WiredIn.Prim
+import GHC.Core (Expr(Var))
 import GHC.Core.Coercion
 import GHC.Core.ConLike
 import GHC.Core.DataCon (dataConWrapperType)
 import GHC.Core.PatSyn
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
+import GHC.Core.Utils (applyTypeToArgs, mkLamType)
 import GHC.Hs
 import GHC.Tc.Types.Evidence
 import GHC.Types.Id
@@ -72,6 +74,7 @@ hsPatType (XPat ext) =
   case ext of
     CoPat _ _ ty       -> ty
     ExpansionPat _ pat -> hsPatType pat
+    NativeExistsPat ty _ _ _ _ -> ty
 hsPatType (SplicePat v _)               = dataConCantHappen v
 
 hsLitType :: forall p. IsPass p => HsLit (GhcPass p) -> Type
@@ -115,6 +118,7 @@ hsExprType (HsQualLit _ lit) = case lit of
 hsExprType (HsLam _ _ (MG { mg_ext = match_group })) = matchGroupTcType match_group
 hsExprType (HsApp _ f _) = funResultTy $ lhsExprType f
 hsExprType (HsAppType x f _) = piResultTy (lhsExprType f) x
+hsExprType (HsAppRetained (_, ty) _ _) = ty
 hsExprType (OpApp v _ _ _) = dataConCantHappen v
 hsExprType (NegApp _ _ se) = syntaxExpr_wrappedFunResTy se
 hsExprType (HsPar _ e) = lhsExprType e
@@ -122,7 +126,7 @@ hsExprType (SectionL v _ _) = dataConCantHappen v
 hsExprType (SectionR v _ _) = dataConCantHappen v
 hsExprType (ExplicitTuple _ args box) =
   -- Deal with tuple sections: one function arrow per missing argument
-  mkScaledFunTys [s | Missing s <- args] $
+  mkScaledFunTysU [s | Missing s <- args] $
     -- Use 'mkTupleTy1' to avoid flattening 1-tuples, as per
     -- Note [Don't flatten tuples from HsSyn] in GHC.Core.Make.
     mkTupleTy1 box (map hsTupArgType args)
@@ -133,7 +137,7 @@ hsExprType (HsMultiIf ty _) = ty
 hsExprType (HsLet _ _ body) = lhsExprType body
 hsExprType (HsDo ty _ _) = ty
 hsExprType (ExplicitList ty _) = mkListTy ty
-hsExprType (RecordCon con_expr _ _) = snd (splitFunTys (hsExprType con_expr))
+hsExprType (RecordCon con_expr _ _) = let (_, _, res) = splitFunTys (hsExprType con_expr) in res
 hsExprType (RecordUpd v _ _) = dataConCantHappen v
 hsExprType (HsGetField { gf_ext = v }) = dataConCantHappen v
 hsExprType (HsProjection { proj_ext = v }) = dataConCantHappen v
@@ -166,6 +170,10 @@ hsExprType (HsForAll x _ _) = dataConCantHappen x
 hsExprType (HsFunArr x _ _ _) = dataConCantHappen x
 hsExprType (XExpr (WrapExpr wrap e)) = hsWrapperType wrap $ hsExprType e
 hsExprType (XExpr (ExpandedThingTc (HSE _ e)))  = lhsExprType e
+hsExprType (XExpr (NativeExistsPack schema _ _)) = schema
+hsExprType (XExpr (NativeExistsUnpack _ _ result_ty _ _)) = result_ty
+hsExprType (XExpr (NativeCaseAlias _ _ _ result_ty _)) = result_ty
+hsExprType (XExpr (NativeLetAlias _ _ _ _ result_ty _)) = result_ty
 hsExprType (XExpr (ConLikeTc con)) = conLikeType con
 hsExprType (XExpr (HsTick _ e)) = lhsExprType e
 hsExprType (XExpr (HsBinTick _ _ e)) = lhsExprType e
@@ -219,13 +227,34 @@ hsWrapperType wrap ty = prTypeType $ go wrap (ty,[])
       let act_res = funResultTy t
           exp_res = hsWrapperType w2 act_res
           mult = subMultCoRKind mult_co
-      in mkFunctionType mult exp_arg exp_res
+      in mkFunctionType unmatchableDataConTy mult exp_arg exp_res
+    go (WpRetainedFun _ b w) = liftPRType $ \t ->
+      mkDepFunTy b (hsWrapperType w (applyTypeToArgs t [Var b]))
+    go (WpExistsPack schema _) = liftPRType $ \_ -> schema
     go (WpCast co)        = liftPRType $ \_ -> coercionRKind co
-    go (WpEvLam v)        = liftPRType $ mkInvisFunTy (idType v)
+    go (WpEvLam v)        = liftPRType $ \body ->
+      if isNativeClassDictionaryId v && anyFreeVarsOfType (== v) body
+      then mkLamType v body
+      else mkInvisFunTy (idType v) body
+    -- See Note [Invisible retained operands in wrappers].
+    go (WpEvApp (EvExpr arg)) = liftPRType $ \t -> case coreFullView t of
+      DepFunTy DepFunInvisible _ _ -> applyTypeToArgs t [arg]
+      DepDictTy{}                  -> applyTypeToArgs t [arg]
+      _ -> funResultTy t
     go (WpEvApp _)        = liftPRType $ funResultTy
-    go (WpTyLam tv)       = liftPRType $ mkForAllTy (Bndr tv Inferred)
+    go (WpTyLam tv)       = liftPRType $ mkTyCoForAllTy unmatchableDataConTy tv Inferred
     go (WpTyApp ta)       = \(ty,tas) -> (ty, ta:tas)
     go (WpLet _)          = id
 
+{- Note [Invisible retained operands in wrappers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An inferred invisible retained argument uses WpEvApp with its checked
+Core operand. See Note [Inferring an invisible retained argument] in
+GHC.Tc.Gen.App. This wrapper applies a runtime operand, so substitute its
+index into the result with applyTypeToArgs. funResultTy handles ordinary
+evidence arrows. A dependent dictionary arrow uses the same substitution
+with its checked evidence Id.
+-}
+
 matchGroupTcType :: MatchGroupTc -> Type
-matchGroupTcType (MatchGroupTc args res _) = mkScaledFunTys args res
+matchGroupTcType (MatchGroupTc args res _) = mkScaledFunTysU args res

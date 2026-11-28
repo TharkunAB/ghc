@@ -20,7 +20,7 @@ module GHC.HsToCore.Monad (
         newUnique,
         UniqSupply, newUniqueSupply,
         getGhcModeDs, dsGetFamInstEnvs, dsGetGlobalRdrEnv,
-        getCCIndexDsM,
+        getCCIndexDsM, withRuntimeIndexTypes, getRuntimeIndices,
 
         -- Looking up in the environment
         dsLookupGlobal, dsLookupGlobalId, dsLookupTyCon,
@@ -50,7 +50,7 @@ module GHC.HsToCore.Monad (
         -- Data types
         DsMatchContext(..),
         EquationInfo(..), EquationInfoNE, prependPats, mkEqnInfo, eqnMatchResult,
-        MatchId(..), mkMatchId, castMatchId,
+        MatchId(..), mkMatchId, castMatchId, cloneMatchId,
         matchIdExpr, matchIdType, matchIdMult, matchIdScaledType,
         MatchResult (..), runMatchResult, DsWrapper, idDsWrapper,
 
@@ -75,7 +75,7 @@ import GHC.HsToCore.Pmc.Solver.Types (initNablas)
 import GHC.Core.FamInstEnv
 import GHC.Core
 import GHC.Core.Coercion ( MCoercionR, MCoercion(..), coercionRKind, mkTransMCo )
-import GHC.Core.Make  ( unitExpr )
+import GHC.Core.Make  ( mkCoreLets, unitExpr )
 import GHC.Core.Utils ( exprType )
 import GHC.Core.DataCon
 import GHC.Core.ConLike
@@ -102,8 +102,8 @@ import GHC.Unit.Module.ModGuts
 import GHC.Types.Name.Reader
 import GHC.Types.SourceFile
 import GHC.Types.Id
-import GHC.Types.Var (EvVar)
-import GHC.Types.Var.Set( VarSet, emptyVarSet, extendVarSetList )
+import GHC.Types.Var (EvVar, isNonCoVarId)
+import GHC.Types.Var.Set( VarSet, emptyVarSet, extendVarSetList, filterVarSet, unionVarSet )
 import GHC.Types.SrcLoc
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.Supply
@@ -166,9 +166,13 @@ data EquationInfo
             (MatchResult CoreExpr)
             -- ^ What to do after match
 
+  | EqnScope [CoreBind] EquationInfo
+    -- ^ Evidence in scope after the preceding patterns.
+    -- See Note [Trailing constructor evidence] in GHC.HsToCore.Match.Constructor.
+
 type EquationInfoNE = EquationInfo
 -- An EquationInfo which has at least one pattern
---   i.e. it's an EqnMatch, not EqnDone
+--   The head is an EqnMatch after removing any EqnScope nodes.
 
 prependPats :: [LPat GhcTc] -> EquationInfo -> EquationInfo
 prependPats [] eqn = eqn
@@ -179,11 +183,13 @@ mkEqnInfo pats = prependPats pats . EqnDone
 
 eqnMatchResult :: EquationInfo -> MatchResult CoreExpr
 eqnMatchResult (EqnDone rhs) = rhs
+eqnMatchResult (EqnScope binds rest) = mkCoreLets binds <$> eqnMatchResult rest
 eqnMatchResult (EqnMatch { eqn_rest = eq }) = eqnMatchResult eq
 
 instance Outputable EquationInfo where
     ppr = ppr . allEqnPats where
       allEqnPats (EqnDone {}) = []
+      allEqnPats (EqnScope _ rest) = allEqnPats rest
       allEqnPats (EqnMatch { eqn_pat = pat, eqn_rest = eq }) = unLoc pat : allEqnPats eq
 
 type DsWrapper = CoreExpr -> CoreExpr
@@ -240,6 +246,8 @@ data MatchId
       { matchId :: Id
         -- ^ The match variable.
       , matchCo :: MCoercionR
+      , matchInLinearPackage :: Bool
+        -- ^ Separate retained cases here can recapture a linear field.
       }
 
 instance Outputable MatchId where
@@ -247,22 +255,26 @@ instance Outputable MatchId where
 
 -- | Create a 'MatchId' from a match variable.
 mkMatchId :: Id -> MatchId
-mkMatchId v = MatchId { matchId = v, matchCo = MRefl }
+mkMatchId v = MatchId { matchId = v, matchCo = MRefl, matchInLinearPackage = False }
+
+-- | Use a new scrutinee with the same package matching context.
+cloneMatchId :: MatchId -> Id -> MatchId
+cloneMatchId mid v = (mkMatchId v) { matchInLinearPackage = matchInLinearPackage mid }
 
 -- | Cast a 'MatchId'.
 castMatchId :: MatchId -> MCoercionR -> MatchId
-castMatchId (MatchId v mco) mco' = MatchId v (mco `mkTransMCo` mco')
+castMatchId mid mco = mid { matchCo = matchCo mid `mkTransMCo` mco }
 
 -- | Compute the scrutinee expression corresponding to a 'MatchId': the casted
 -- match varible.
 matchIdExpr :: MatchId -> CoreExpr
-matchIdExpr (MatchId v MRefl)    = Var v
-matchIdExpr (MatchId v (MCo co)) = Var v `Cast` co
+matchIdExpr MatchId{ matchId = v, matchCo = MRefl }    = Var v
+matchIdExpr MatchId{ matchId = v, matchCo = MCo co } = Var v `Cast` co
 
 -- | The type of the scrutinee expression ('matchIdExpr').
 matchIdType :: MatchId -> Type
-matchIdType (MatchId v MRefl)    = idType v
-matchIdType (MatchId _ (MCo co)) = coercionRKind co
+matchIdType MatchId{ matchId = v, matchCo = MRefl }    = idType v
+matchIdType MatchId{ matchCo = MCo co } = coercionRKind co
 
 -- | The multiplicity at which this column of the pattern match was typechecked.
 matchIdMult :: MatchId -> Mult
@@ -549,8 +561,9 @@ mkDsEnvs :: UnitEnv -> Module -> GlobalRdrEnv -> TypeEnv -> FamInstEnv
 mkDsEnvs unit_env mod rdr_env type_env fam_inst_env tcm_plugins ptc msg_var
          cc_st_var statics_var next_wrapper_num known_key_maps_var
          complete_matches
-  = let if_genv = IfGblEnv { if_doc       = text "mkDsEnvs"
-                           , if_rec_types = KnotVars [mod] knot_var_fun }
+  = let if_genv = IfGblEnv { if_doc             = text "mkDsEnvs"
+                           , if_rec_types       = KnotVars [mod] knot_var_fun
+                           , if_has_dep_imports = Nothing }
                   -- Failing tests here are `ghci` and `T11985` if you get this wrong.
                   -- This is very very "at a distance" because the reason for this check
                   -- is that the type_env in interactive mode is the smushed together
@@ -583,6 +596,7 @@ mkDsEnvs unit_env mod rdr_env type_env fam_inst_env tcm_plugins ptc msg_var
         lcl_env = DsLclEnv { dsl_meta        = emptyNameEnv
                            , dsl_loc         = real_span
                            , dsl_nablas      = Ldi initNablas
+                           , dsl_runtime_indices = emptyVarSet
                            , dsl_unspecables = Just emptyVarSet
                            , dsl_in_generated_code = False
                            }
@@ -650,6 +664,18 @@ the @SrcSpan@ being carried around.
 
 getGhcModeDs :: DsM GhcMode
 getGhcModeDs =  getDynFlags >>= return . ghcMode
+
+-- | Add the runtime identities mentioned in the types of this scope.
+-- See Note [Forcing a runtime index] in GHC.HsToCore.Utils.
+withRuntimeIndexTypes :: [Type] -> DsM a -> DsM a
+withRuntimeIndexTypes tys = updLclEnv $ \env ->
+  env { dsl_runtime_indices = dsl_runtime_indices env `unionVarSet` indices }
+  where
+    indices = filterVarSet isNonCoVarId (tyCoVarsOfTypes tys)
+
+-- | Read the runtime identities to keep in scope when forcing a variable.
+getRuntimeIndices :: DsM VarSet
+getRuntimeIndices = dsl_runtime_indices <$> getLclEnv
 
 -- | Get the current pattern match oracle state. See 'dsl_nablas'.
 getPmNablas :: DsM LdiNablas

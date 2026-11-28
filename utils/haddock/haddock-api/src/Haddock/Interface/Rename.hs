@@ -34,10 +34,11 @@ import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Traversable (mapM)
 
-import GHC hiding (NoLink, HsTypeGhcPsExt (..))
+import GHC hiding (NoLink, HsTypeGhcPsExt (..), typeKind)
 import GHC.Builtin.WiredIn.Types ( tupleDataConName, tupleTyConName)
 import GHC.Builtin.KnownKeys ( eqTyConKey )
 import GHC.Core.TyCon (tyConResKind)
+import GHC.Core.Type (typeKind)
 import GHC.Driver.DynFlags (getDynFlags)
 import GHC.Hs.Decls.Overlap (OverlapMode(..))
 import GHC.Types.Basic (TupleSort (..))
@@ -47,7 +48,7 @@ import GHC.Types.Name
 import Language.Haskell.Syntax.BooleanFormula(BooleanFormula(..))
 
 import Haddock.Backends.Hoogle (ppExportD)
-import Haddock.Convert (synifyKindSig)
+import Haddock.Convert (hasPrivateTypeCase, synifyKindSig, synifyTypeCase)
 import Haddock.GhcUtils
 import Haddock.Types
 
@@ -379,6 +380,16 @@ renameModifiedFunArr (HsModifiedFunArr _ mods arr) = do
 
 renameType :: HsType GhcRn -> RnM (HsType DocNameI)
 renameType t = case t of
+  HsForEachTy{hst_xforeach = ann, hst_bndrs = bndrs, hst_body = ltype} -> do
+    bndrs' <- mapM (renameLTyVarBndr return) bndrs
+    ltype' <- renameLType ltype
+    return
+      ( HsForEachTy
+          { hst_xforeach = ann
+          , hst_bndrs = bndrs'
+          , hst_body = ltype'
+          }
+      )
   HsForAllTy{hst_tele = tele, hst_body = ltype} -> do
     tele' <- renameHsForAllTelescope tele
     ltype' <- renameLType ltype
@@ -434,7 +445,24 @@ renameType t = case t of
     doc' <- renameLDocHsSyn doc
     return (HsDocTy noAnn ty' doc')
   HsTyLit _ x -> return (HsTyLit noAnn (renameTyLit x))
-  XHsType a -> pure (XHsType (HsCoreTy a))
+  XHsType (HsCoreTyRn ty) -> pure (XHsType (HsCoreTy ty))
+  XHsType (HsGadtFieldRn cdf) ->
+    case cdf_doc cdf of
+      Just doc -> HsDocTy noAnn <$> renameLType (cdf_type cdf) <*> renameLDocHsSyn doc
+      Nothing  -> renameType (unLoc (cdf_type cdf))
+  XHsType (HsTypeExistsRn flag binder body) ->
+    XHsType <$> (HsErasedExists flag <$> renameLTyVarBndr pure binder <*> renameLType body)
+  XHsType (HsTypeCaseRn scrut rows) ->
+    XHsType <$> (HsCheckedTypeCase <$> renameLType scrut
+                   <*> mapM (\(_, pat, rhs) -> (,) <$> renameLType pat <*> renameLType rhs) rows)
+  XHsType (HsTypeLambdaCheckRn _ _ lowered) ->
+    renameType (unLoc lowered)
+  XHsType (HsTypeLetProductCheckRn _ _ rhs) ->
+    renameType (unLoc rhs)
+  -- See Note [Checked types in Haddock].
+  XHsType HsTypeLambdaQuoteRn{} -> throwE "Cannot document a source type lambda without its checked type."
+  XHsType HsTypeLetRn{} -> throwE "Cannot document a source type let without its checked type."
+  XHsType HsTypeCaseAliasRn{} -> throwE "Cannot document a source type case alias without its checked type."
   HsExplicitListTy _ a b -> HsExplicitListTy noAnn a <$> mapM renameLType b
   -- Special-case unary boxed tuples so that they are pretty-printed as
   -- `'MkSolo x`, not `'(x)`
@@ -447,6 +475,15 @@ renameType t = case t of
   HsSpliceTy (HsUntypedSpliceTop _ st) _ -> renameType (unLoc st)
   HsSpliceTy (HsUntypedSpliceNested _) _ -> error "renameType: not an top level type splice"
   HsWildCardTy _ -> pure (HsWildCardTy noAnn)
+
+{- Note [Checked types in Haddock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Haddock.Interface.Create obtains declarations from checked TyThings.
+Haddock.Interface.AttachInstances converts checked class and family instances.
+Both paths rebuild syntax from checked types before this renaming pass.
+A renamed source type let or type case alias still has a local binding.
+Report it if it reaches this pass, since dropping the binding changes the type.
+-}
 
 renameTyLit :: HsLit GhcRn -> HsLit DocNameI
 renameTyLit t = case t of
@@ -480,15 +517,19 @@ renameHsGadtTelescope :: LHsGadtTelescope GhcRn -> RnM (LHsGadtTelescope DocName
 renameHsGadtTelescope (L l HsGadtPar{}) = pure $ L l $ HsGadtPar noExtField
 renameHsGadtTelescope (L l (HsGadtForAll _ tele)) =
   L l . HsGadtForAll noExtField <$> renameHsForAllTelescope tele
+renameHsGadtTelescope (L l (HsGadtContext ctxt)) =
+  L l . HsGadtContext <$> renameLContext ctxt
 
 renameHsForAllTelescope :: HsForAllTelescope GhcRn -> RnM (HsForAllTelescope DocNameI)
 renameHsForAllTelescope tele = case tele of
-  HsForAllVis _ bndrs -> do
+  HsForAllVis _ ma bndrs -> do
+    ma' <- traverse renameLType ma
     bndrs' <- mapM (renameLTyVarBndr return) bndrs
-    pure $ HsForAllVis noExtField bndrs'
-  HsForAllInvis _ bndrs -> do
+    pure $ HsForAllVis noExtField ma' bndrs'
+  HsForAllInvis _ ma bndrs -> do
+    ma' <- traverse renameLType ma
     bndrs' <- mapM (renameLTyVarBndr return) bndrs
-    pure $ HsForAllInvis noExtField bndrs'
+    pure $ HsForAllInvis noExtField ma' bndrs'
 
 renameLTyVarBndr :: (flag -> RnM flag') -> LHsTyVarBndr flag GhcRn -> RnM (LHsTyVarBndr flag' DocNameI)
 renameLTyVarBndr rn_flag (L loc (HsTvb _ fl n kind)) =
@@ -574,7 +615,7 @@ renameTyClD d = case d of
   SynDecl{tcdLName = lname, tcdTyVars = tyvars, tcdFixity = fixity, tcdRhs = rhs} -> do
     lname' <- renameNameL lname
     tyvars' <- renameLHsQTyVars tyvars
-    rhs' <- maybe (renameLType rhs) pure <=< runMaybeT $ do
+    rhs' <- maybe (renameSynonymRhs rhs) pure <=< runMaybeT $ do
       expInfo <- MaybeT $ asks rnExportInfo
       -- Given that we have matched on a 'SynDecl', this lookup /really should/
       -- be 'ATyCon', and the 'synTyConRhs_maybe' result /really should/ be
@@ -656,6 +697,18 @@ renameTyClD d = case d of
 
     renameLSig (L loc sig) = return . L (locA loc) =<< renameSig sig
 
+-- | Reconstruct a checked type case or show the kind of the synonym RHS.
+-- See Note [Checked type cases in Haddock] in Haddock.Convert.
+renameSynonymRhs :: LHsType GhcRn -> RnM (LHsType DocNameI)
+renameSynonymRhs (L _ (XHsType (HsCoreTyRn ty)))
+  | Just (scrutinee, rows) <- synifyTypeCase ty = do
+      scrutinee' <- renameLType scrutinee
+      rows' <- traverse (\(pat, rhs) -> (,) <$> renameLType pat <*> renameLType rhs) rows
+      pure (noLocA (XHsType (HsCheckedTypeCase scrutinee' rows')))
+  | hasPrivateTypeCase ty =
+      fmap (XHsType . HsRedacted) <$> renameLType (synifyKindSig (typeKind ty))
+renameSynonymRhs rhs = renameLType rhs
+
 renameFamilyDecl :: FamilyDecl GhcRn -> RnM (FamilyDecl DocNameI)
 renameFamilyDecl
   ( FamilyDecl
@@ -688,10 +741,10 @@ renameFamilyDecl
 renameFamilyInfo :: FamilyInfo GhcRn -> RnM (FamilyInfo DocNameI)
 renameFamilyInfo (DataFamily x) = return (DataFamily x)
 renameFamilyInfo (OpenTypeFamily x) = return (OpenTypeFamily x)
-renameFamilyInfo (ClosedTypeFamily x eqns) =
+renameFamilyInfo (ClosedTypeFamily (anns, _) eqns) =
   do
     eqns' <- mapM (mapM (mapM renameTyFamInstEqn)) eqns
-    return $ ClosedTypeFamily x eqns'
+    return $ ClosedTypeFamily anns eqns'
 
 renameDataDefn :: HsDataDefn GhcRn -> RnM (HsDataDefn DocNameI)
 renameDataDefn
@@ -727,17 +780,14 @@ renameCon :: ConDecl GhcRn -> RnM (ConDecl DocNameI)
 renameCon
   decl@( ConDeclH98
           { con_name = lname
-          , con_ex_tvs = ltyvars
-          , con_mb_cxt = lcontext
+          , con_telescope = telescope
           , con_args = details
           , con_doc = mbldoc
-          , con_forall = forall_
           , con_modifiers = mods
           }
         ) = do
     lname' <- renameNameL lname
-    ltyvars' <- mapM (renameLTyVarBndr return) ltyvars
-    lcontext' <- traverse renameLContext lcontext
+    telescope' <- mapM renameHsGadtTelescope telescope
     details' <- renameH98Details details
     mods' <- renameModifiers mods
     mbldoc' <- mapM (renameLDocHsSyn) mbldoc
@@ -745,9 +795,7 @@ renameCon
       ( decl
           { con_ext = noExtField
           , con_name = lname'
-          , con_ex_tvs = ltyvars'
-          , con_mb_cxt = lcontext'
-          , con_forall = forall_ -- Remove when #18311 is fixed
+          , con_telescope = telescope'
           , con_args = details'
           , con_modifiers = mods'
           , con_doc = mbldoc'
@@ -757,8 +805,7 @@ renameCon
   ConDeclGADT
     { con_names = lnames
     , con_outer_bndrs = outer_bndrs
-    , con_inner_bndrs = inner_bndrs
-    , con_cxts = lcontexts
+    , con_telescope = telescope
     , con_g_args = details
     , con_res_ty = res_ty
     , con_modifiers = mods
@@ -766,8 +813,7 @@ renameCon
     } = do
     lnames' <- mapM renameNameL lnames
     outer_bndrs' <- mapM renameOuterTyVarBndrs outer_bndrs
-    inner_bndrs' <- mapM renameHsGadtTelescope inner_bndrs
-    lcontexts' <- traverse renameLContext lcontexts
+    telescope' <- mapM renameHsGadtTelescope telescope
     details' <- renameGADTDetails details
     res_ty' <- renameLType res_ty
     mods' <- renameModifiers mods
@@ -777,8 +823,7 @@ renameCon
           { con_g_ext = noExtField
           , con_names = lnames'
           , con_outer_bndrs = outer_bndrs'
-          , con_inner_bndrs = inner_bndrs'
-          , con_cxts = lcontexts'
+          , con_telescope = telescope'
           , con_g_args = details'
           , con_res_ty = res_ty'
           , con_modifiers = mods'
@@ -1048,8 +1093,8 @@ renameOuterTyVarBndrs
   -> RnM (HsOuterTyVarBndrs flag DocNameI)
 renameOuterTyVarBndrs (HsOuterImplicit{}) =
   pure $ HsOuterImplicit{hso_ximplicit = noExtField}
-renameOuterTyVarBndrs (HsOuterExplicit{hso_bndrs = exp_bndrs}) =
-  HsOuterExplicit noExtField <$> mapM (renameLTyVarBndr return) exp_bndrs
+renameOuterTyVarBndrs (HsOuterExplicit{hso_matchability = ma, hso_bndrs = exp_bndrs}) =
+  HsOuterExplicit noExtField <$> traverse renameLType ma <*> mapM (renameLTyVarBndr return) exp_bndrs
 
 renameWc
   :: (in_thing -> RnM out_thing)

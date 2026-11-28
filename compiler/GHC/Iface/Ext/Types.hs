@@ -28,7 +28,7 @@ import GHC.Core.Type              ( coreFullView, isFunTy, Var (..) )
 import GHC.Core.TyCon             ( isTypeSynonymTyCon, isClassTyCon, isFamilyTyCon )
 import GHC.Types.Id               ( Id, isRecordSelector, isClassOpId )
 import GHC.Types.TyThing          ( TyThing (..) )
-import GHC.Types.Var              ( isTyVar, isFUNArg, cmpForAllTyFlagExactly )
+import GHC.Types.Var              ( isTyVar, isFUNArg, cmpForAllTyFlagExactly, DepFunTyFlag, ExistsTyFlag(..), pprExistsTy )
 
 import qualified Data.Array as A
 import qualified Data.Map as M
@@ -45,9 +45,15 @@ import Language.Haskell.Syntax.Module.Name
 
 type Span = RealSrcSpan
 
--- | Current version of @.hie@ files
+-- | Current version of @.hie@ files.
+-- See Note [HIE arrow matchability].
+-- See Note [Retained types in HIE].
 hieVersion :: Integer
-hieVersion = read (cProjectVersionInt ++ cProjectPatchLevel) :: Integer
+hieVersion = read (cProjectVersionInt ++ cProjectPatchLevel ++ "66") :: Integer
+
+-- | A type table with dot existentials has a separate version.
+hieImplicitExistsVersion :: Integer
+hieImplicitExistsVersion = hieVersion + 1
 
 {- |
 GHC builds up a wealth of information about Haskell source as it compiles it.
@@ -132,7 +138,7 @@ making an effort to deduplicate this shared structure. The trick is to define
 a new data type that is a flattened version of 'Type':
 
     data HieType a = HAppTy a a  -- data Type = AppTy Type Type
-                   | HFunTy a a  --           | FunTy Type Type
+                   | HFunTy a a a a  --       | FunTy Matchability Mult Type Type
                    | ...
 
     type TypeIndex = Int
@@ -145,15 +151,43 @@ form with sharing of subtrees.
 
 type TypeIndex = Int
 
+{- Note [HIE arrow matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+HFunTy stores matchability before multiplicity, argument and result. Include
+matchability in equality, traversal and binary serialization. Otherwise HIE
+sharing can identify different arrow types or omit metadata dependencies.
+
+HForAllTy stores matchability before the binder and body. Its metadata is
+outside the binder scope. Include this child in the same operations and in
+the type-table key. See Note [Forall interface metadata] in GHC.Iface.Type.
+
+The metadata fields change the existing HFunTy and HForAllTy payloads. The suffix in
+hieVersion rejects earlier files before their type tables are decoded. This
+version is separate from the ordinary interface version. Both HIE readers
+check it. The predicate passed to readHieFileWithVersion can further restrict
+accepted files, but it cannot enable an unsupported payload. HQualTy keeps
+its fixed U matchability and Many multiplicity.
+-}
+
 -- | A flattened version of 'Type'.
 --
 -- See Note [Efficient serialization of redundant type info]
+--
+-- See Note [Retained types in HIE].
 data HieType a
   = HTyVarTy Name
+  | HTermVarTy Name
+  | HTermAppTy Name a
+  | HDepFunTy !DepFunTyFlag (a, Name, a) a
+    -- ^ Visibility, (multiplicity, runtime binder, domain), and result.
+    -- See Note [Retained types in HIE].
   | HAppTy a (HieArgs a)
   | HTyConApp IfaceTyCon (HieArgs a)
-  | HForAllTy ((Name, a),ForAllTyFlag) a
-  | HFunTy a a a
+  | HForAllTy a ((Name, a),ForAllTyFlag) a
+  | HExistsTy ExistsTyFlag (Name, a) a -- ^ Erased binder with its kind, and payload type.
+  | HFunTy a a a a
+    -- ^ Matchability, multiplicity, argument and result.
+    -- See Note [HIE arrow matchability].
   | HQualTy a a           -- ^ type with constraint: @t1 => t2@ (see 'IfaceDFunTy')
   | HLitTy IfaceTyLit
   | HCastTy a
@@ -167,12 +201,16 @@ data HieType a
 -- We compare flags exactly, as the derived instance used to.
 instance Eq a => Eq (HieType a) where
   HTyVarTy n1         == HTyVarTy n2         = n1 == n2
+  HTermVarTy n1      == HTermVarTy n2       = n1 == n2
+  HTermAppTy n1 a1   == HTermAppTy n2 a2    = n1 == n2 && a1 == a2
+  HDepFunTy v1 b1 r1 == HDepFunTy v2 b2 r2  = v1 == v2 && b1 == b2 && r1 == r2
+  HExistsTy f1 b1 t1 == HExistsTy f2 b2 t2 = f1 == f2 && b1 == b2 && t1 == t2
   HAppTy f1 as1       == HAppTy f2 as2       = f1 == f2 && as1 == as2
   HTyConApp tc1 as1   == HTyConApp tc2 as2   = tc1 == tc2 && as1 == as2
-  HForAllTy ((n1,k1),vis1) b1 == HForAllTy ((n2,k2),vis2) b2
-    = n1 == n2 && k1 == k2 && b1 == b2
+  HForAllTy ma1 ((n1,k1),vis1) b1 == HForAllTy ma2 ((n2,k2),vis2) b2
+    = ma1 == ma2 && n1 == n2 && k1 == k2 && b1 == b2
       && cmpForAllTyFlagExactly vis1 vis2 == EQ
-  HFunTy w1 a1 r1     == HFunTy w2 a2 r2     = w1 == w2 && a1 == a2 && r1 == r2
+  HFunTy m1 w1 a1 r1  == HFunTy m2 w2 a2 r2  = m1 == m2 && w1 == w2 && a1 == a2 && r1 == r2
   HQualTy c1 t1       == HQualTy c2 t2       = c1 == c2 && t1 == t2
   HLitTy l1           == HLitTy l2           = l1 == l2
   HCastTy t1          == HCastTy t2          = t1 == t2
@@ -181,15 +219,44 @@ instance Eq a => Eq (HieType a) where
 
 instance Outputable a => Outputable (HieType a) where
   ppr (HTyVarTy name) = ppr name
+  ppr (HTermVarTy name) = ppr name
+  ppr (HTermAppTy name arg) = parens $ ppr name <+> ppr arg
+  ppr (HDepFunTy vis (mult, name, domain) body) =
+    text "foreach" <+> ppr name O.<> text ":" <+> ppr domain
+      <+> brackets (text (show vis)) <+> ppr body <+> ppr mult
   ppr (HAppTy fun arg) = parens $ ppr fun <+> ppr arg
   ppr (HTyConApp tc args) = parens $ ppr tc <+> ppr args
-  ppr (HForAllTy ((name, ty), flag) body) =
-    text "forall" <+> ppr flag <+> ppr name O.<> text ":" <+> ppr ty O.<> text "." <+> ppr body
-  ppr (HFunTy mult arg res) = parens $ ppr arg <+> arrow <+> ppr res <+> ppr mult
+  ppr (HExistsTy flag (name, ty) body) =
+    pprExistsTy flag (parens (ppr name <+> dcolon <+> ppr ty)) (ppr body)
+  ppr (HForAllTy ma ((name, ty), flag) body) =
+    text "forall" <+> ppr flag <+> ppr name O.<> text ":" <+> ppr ty O.<> text "."
+      <+> text "@" O.<> ppr ma <+> ppr body
+  ppr (HFunTy ma mult arg res)
+    = parens $ ppr arg <+> arrow <+> brackets (ppr ma) <+> ppr res <+> ppr mult
   ppr (HQualTy ctxt ty) = parens $ ppr ctxt <+> text "=>" <+> ppr ty
   ppr (HLitTy lit) = ppr lit
   ppr (HCastTy ty) = text "cast" <+> ppr ty
   ppr HCoercionTy = text "<coercion>"
+
+{- Note [Retained types in HIE]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Keep runtime indices separate from type variables. HTermVarTy stores the
+runtime Name. HTermAppTy stores the runtime function Name and its index
+argument. These Names preserve identifier identity in the HIE name table.
+The corresponding IfaceTermVar and IfaceTermAppTy forms render these nodes.
+
+HDepFunTy stores visibility, multiplicity, binder Name, domain and result.
+The binder scopes over the result only. Multiplicity and domain are outside
+its scope. Do not encode a retained binder as HForAllTy: its argument is a
+runtime value. Both visible and invisible retained binders use this format.
+Derived traversals visit multiplicity, domain and result. Equality and binary
+serialization retain every field. The HIE and Haddock renderers recover
+IfaceDepFunTy with the same visibility and binder fields.
+
+Tags 9 through 11 extend the type table. The suffix in hieVersion changes
+from 64 to 65. Both HIE readers reject previous versions before decoding the
+type table. The ordinary interface format does not change.
+-}
 
 type HieTypeFlat = HieType TypeIndex
 
@@ -209,12 +276,14 @@ instance Binary (HieType TypeIndex) where
     putByte bh 2
     put_ bh n
     put_ bh xs
-  put_ bh (HForAllTy bndr a) = do
+  put_ bh (HForAllTy ma bndr a) = do
     putByte bh 3
+    put_ bh ma
     put_ bh bndr
     put_ bh a
-  put_ bh (HFunTy w a b) = do
+  put_ bh (HFunTy ma w a b) = do
     putByte bh 4
+    put_ bh ma
     put_ bh w
     put_ bh a
     put_ bh b
@@ -229,6 +298,23 @@ instance Binary (HieType TypeIndex) where
     putByte bh 7
     put_ bh a
   put_ bh (HCoercionTy) = putByte bh 8
+  put_ bh (HTermVarTy name) = do
+    putByte bh 9
+    put_ bh name
+  put_ bh (HTermAppTy name arg) = do
+    putByte bh 10
+    put_ bh name
+    put_ bh arg
+  put_ bh (HDepFunTy vis bndr body) = do
+    putByte bh 11
+    put_ bh vis
+    put_ bh bndr
+    put_ bh body
+
+  put_ bh (HExistsTy flag bndr body) = do
+    putByte bh (case flag of ExplicitExists -> 12; ImplicitExists -> 13)
+    put_ bh bndr
+    put_ bh body
 
   get bh = do
     (t :: Word8) <- get bh
@@ -236,12 +322,17 @@ instance Binary (HieType TypeIndex) where
       0 -> HTyVarTy <$> get bh
       1 -> HAppTy <$> get bh <*> get bh
       2 -> HTyConApp <$> get bh <*> get bh
-      3 -> HForAllTy <$> get bh <*> get bh
-      4 -> HFunTy <$> get bh <*> get bh <*> get bh
+      3 -> HForAllTy <$> get bh <*> get bh <*> get bh
+      4 -> HFunTy <$> get bh <*> get bh <*> get bh <*> get bh
       5 -> HQualTy <$> get bh <*> get bh
       6 -> HLitTy <$> get bh
       7 -> HCastTy <$> get bh
       8 -> return HCoercionTy
+      9 -> HTermVarTy <$> get bh
+      10 -> HTermAppTy <$> get bh <*> get bh
+      11 -> HDepFunTy <$> get bh <*> get bh <*> get bh
+      12 -> HExistsTy ExplicitExists <$> get bh <*> get bh
+      13 -> HExistsTy ImplicitExists <$> get bh <*> get bh
       _ -> panic "Binary (HieArgs Int): invalid tag"
 
 
@@ -878,7 +969,7 @@ idEntityInfo vid = S.fromList $ [EntityTypeVariable | isTyVar vid] <> [EntityFun
   <> [EntityRecordField | isRecordSelector vid] <> [EntityClassMethod | isClassOpId vid] <> [EntityVariable]
   where
     isFunType a = case coreFullView a of
-      ForAllTy _ t    -> isFunType t
+      ForAllTy _ _ t  -> isFunType t
       FunTy { ft_af = flg, ft_res = rhs } -> isFUNArg flg || isFunType rhs
       _x              -> isFunTy a
 

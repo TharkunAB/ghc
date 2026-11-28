@@ -30,6 +30,7 @@ import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Monad
 
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep ( Type(ExistsTy) )
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.FamInstEnv ( FamInst, FamFlavor(..), mkSingleCoAxiom )
@@ -193,7 +194,9 @@ canDoGenerics dit@(DerivInstTys{dit_rep_tc = tc})
         -- it relies on instantiating *polymorphic* sum and product types
         -- at the argument types of the constructors
     bad_con :: DataCon -> Validity' DeriveGenericsErrReason
-    bad_con dc = if any bad_arg_type (derivDataConInstArgTys dc dit)
+    bad_con dc = if not (null (dataConRepArgBinders dc))
+                  then NotValid $ DerivErrGenericsMustBeVanillaDataCon dc
+                  else if any bad_arg_type (derivDataConInstArgTys dc dit)
                   then NotValid $ DerivErrGenericsMustNotHaveExoticArgs dc
                   else if not (isVanillaDataCon dc)
                           then NotValid $ DerivErrGenericsMustBeVanillaDataCon dc
@@ -203,6 +206,10 @@ canDoGenerics dit@(DerivInstTys{dit_rep_tc = tc})
         -- Nor if the args are polymorphic types (I don't think)
     bad_arg_type ty = (mightBeUnliftedType ty && not (allowedUnliftedTy ty))
                       || not (isTauTy ty)
+                      || is_exists_ty ty
+    is_exists_ty t | Just t' <- coreView t = is_exists_ty t'
+    is_exists_ty ExistsTy{} = True
+    is_exists_ty _          = False
 
 -- Returns True the Type argument is an unlifted type which has a
 -- corresponding generic representation type. For example,

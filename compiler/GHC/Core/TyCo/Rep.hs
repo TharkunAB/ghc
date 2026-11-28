@@ -62,13 +62,13 @@ module GHC.Core.TyCo.Rep (
 
         TyLit(..),
         KindOrType, Kind,
-        RuntimeRepType, LevityType,
+        RuntimeRepType, LevityType, Matchability,
         KnotTied,
         PredType, ThetaType, FRRType,     -- Synonyms
-        ForAllTyFlag(..), FunTyFlag(..),
+        ForAllTyFlag(..), FunTyFlag(..), DepFunTyFlag(..),
 
         -- * Coercions
-        Coercion(..), CoSel(..), FunSel(..), Role(..),
+        Coercion(..), CoSel(..), ForAllSel(..), FunSel(..), Role(..),
         UnivCoProvenance(..),
 
         UnivCoDeps(..),
@@ -89,9 +89,12 @@ module GHC.Core.TyCo.Rep (
         mkVisFunTy, mkScaledFunTys,
         mkInvisFunTy, mkInvisFunTys,
         tcMkVisFunTy, tcMkInvisFunTy, tcMkScaledFunTy, tcMkScaledFunTys,
-        mkForAllTy, mkForAllTys, mkInvisForAllTys,
-        mkPiTy, mkPiTys,
+        mkForAllTy, mkForAllTys, mkInvisForAllTys, mkTyCoForAllTy,
+        mkPiTy, mkPiTys, mkDepFunTy, mkDepFunTyWithVis,
         mkVisFunTyMany, mkVisFunTysMany,
+        mkVisFunTyManyM, mkVisFunTyManyU, mkVisFunTysManyM, mkVisFunTysManyU,
+        mkScaledFunTysM, mkScaledFunTysU, tcMkScaledFunTysM, tcMkScaledFunTysU,
+        mkPiTysM, mkPiTysU,
         nonDetCmpTyLit, cmpTyLit,
 
         -- * Functions over coercions
@@ -109,10 +112,11 @@ module GHC.Core.TyCo.Rep (
 
 import GHC.Prelude
 
+import {-# SOURCE #-} GHC.Core.TyCo.Compare (eqType)
 import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprType, pprCo, pprTyLit )
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
 import {-# SOURCE #-} GHC.Core.TyCo.FVs( tyCoVarsOfType, univCoDepsCoercions, univCoDepsSize )
-import {-# SOURCE #-} GHC.Core.Type( chooseFunTyFlag, typeKind, typeTypeOrConstraint )
+import {-# SOURCE #-} GHC.Core.Type( chooseFunTyFlag, typeKind, typeTypeOrConstraint, mkFunctionType )
 
    -- Transitively pulls in a LOT of stuff, better to break the loop
 
@@ -120,6 +124,7 @@ import {-# SOURCE #-} GHC.Core.Type( chooseFunTyFlag, typeKind, typeTypeOrConstr
 import GHC.Types.Var
 import GHC.Types.Var.Set
   ( elemVarSet, DCoVarSet, dVarSetElems )
+import GHC.Types.Unique ( Uniquable(..) )
 import GHC.Types.Unique.DSet
   ( UniqDSet, uniqDSetToList )
 import GHC.Types.Unique.Set
@@ -127,8 +132,6 @@ import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 
 -- others
-import GHC.Builtin.KnownKeys
-
 import GHC.Types.Basic ( LeftOrRight(..), pickLR )
 import GHC.Utils.Outputable
 import GHC.Data.FastString
@@ -173,6 +176,16 @@ data Type
   -- See Note [Non-trivial definitional equality]
   = TyVarTy Var -- ^ Vanilla type or kind variable (*never* a coercion variable)
 
+  | TermAppTy Id Type -- ^ An opaque runtime call index. See Note [Opaque native call indices].
+
+  | TermVarTy Id -- ^ The value index of a local runtime identifier.
+                 -- See Note [Restricted retained dependent types].
+
+  | DepFunTy !DepFunTyFlag Id Type
+      -- ^ A retained runtime binder and its dependent result.
+      -- See Note [Restricted retained dependent types]
+      -- and Note [Retained function visibility].
+
   | AppTy
         Type
         Type            -- ^ Type application to something other than a 'TyCon'. Parameters:
@@ -201,23 +214,24 @@ data Type
                         --    for example unsaturated type synonyms
                         --    can appear as the right hand side of a type synonym.
 
-  | ForAllTy  -- See Note [ForAllTy]
+  | ForAllTy  -- See Note [ForAllTy] and Note [Forall matchability metadata].
+        Matchability
         {-# UNPACK #-} !ForAllTyBinder
            -- ForAllTyBinder: see GHC.Types.Var
            --    Note [VarBndrs, ForAllTyBinders, TyConBinders, and visibility]
         Type
-           -- INVARIANT: If the binder is a coercion variable, it must
-           --            be mentioned in the Type.
+           -- INVARIANT: A known-U coercion binder must occur in the body.
            --            See Note [Unused coercion variable in ForAllTy]
            -- See Note [Why ForAllTy can quantify over a coercion variable]
 
-  | FunTy      -- ^ FUN m t1 t2   Very common, so an important special case
+  | FunTy      -- ^ FUN @ma m t1 t2. A common special case.
                 -- See Note [Function types]
      { ft_af   :: FunTyFlag    -- Is this (->/FUN) or (=>) or (==>)?
                                  -- This info is fully specified by the kinds in
                                  --      ft_arg and ft_res
                                  -- Note [FunTyFlag] in GHC.Types.Var
 
+     , ft_ma   :: Matchability   -- See Note [Ordinary arrow matchability]
      , ft_mult :: Mult           -- Multiplicity; always Many for (=>) and (==>)
      , ft_arg  :: Type           -- Argument type
      , ft_res  :: Type }         -- Result type
@@ -238,7 +252,172 @@ data Type
                     -- in the list of a TyConApp, when applying a promoted
                     -- GADT data constructor
 
+  | ExistsTy !ExistsTyFlag !TyVar Type -- ^ See Note [Lifted erased existentials].
+
+  | DepDictTy Id Type
+      -- ^ Private dependent dictionary binder. See Note [Scoped selector applications].
+  | ClassAppTy Id Type Type Type Type
+      -- ^ Selector, type argument, dictionary index, operand index, checked kind.
+
   deriving Data.Data
+
+{- Note [Scoped selector applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+DepDictTy binds the given dictionary Id in its result, not in its
+predicate. The result has kind Type. ClassAppTy records an opaque
+selector application to a type, a local dictionary and a local operand.
+The final field is the instantiated result kind. Core Lint recomputes
+it from the selector and validates the metadata of both occurrences.
+
+A dictionary application passes ordinary evidence at runtime. The scoped
+interface format records the selector and the names of its two local
+arguments. CorePrep erases the type dependency. See Note [Scoped selector
+application prototype] in GHC.Core.Lint. DepFunInvisible describes a
+retained value with different source application rules.
+-}
+
+{- Note [Lifted erased existentials]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ExistsTy flag a body binds a in body. The binder kind can be Type or an index
+kind such as Nat. The body must have kind Type.
+The witness has no runtime representation. The package has the same lifted
+representation as its payload. ExistsTy is not a Pi type, so Core type
+application and forall coercion projections cannot eliminate it.
+
+The flag preserves where the source checker may insert Pack and Unpack.
+It has no runtime representation. The equality checker compares the flag,
+so an explicit package cannot acquire implicit elimination through a cast.
+Proposal #473's Core rule has one existential form. The flag keeps both
+source modes distinct in this implementation.
+
+See Note [Lifting under an erased existential] in GHC.Core.Coercion
+and draft GHC proposal #473, alternative Core.
+-}
+
+{- Note [Restricted retained dependent types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TermVarTy and DepFunTy implement an internal experiment. An opaque runtime
+index remains an actual local, non-CoVar, non-join Many Id of lifted value type.
+Its complete type can contain outer erased variables and earlier runtime
+indices. Check the actual lexical binding and its type and multiplicity
+metadata. See Note [Opaque runtime index values] in GHC.Core.Type.
+TermVarTy has the identifier's type as its kind. A DepFunTy result has kind
+Type. Constraint has a lifted representation but is not a supported result
+kind here.
+
+Source foreach roots keep a separate rule. They can bind a lifted type
+parameter, a supported algebraic value or an eligible call head. Derive opaque
+parameter fields from the original constructor telescope before instantiation. Fixed concrete fields
+keep their structural or eligible function-field checks. See Notes
+[Algebraic runtime index domains] and [Function-valued retained binders] in
+GHC.Core.Type. Opaque function-value identity does not grant call permission.
+Native calls use a visible U/Many function type with lifted argument and
+result types. Their application uses
+TermAppTy/TermAppCo. See Note [Native function-value application] in
+GHC.Core.TyCo.Make.
+
+The binder scopes over the result. Use mkDepFunTyWithVis to preserve the
+canonical forms in Note [Retained function visibility]. Index occurrences are
+scope dependencies. They add no runtime uses. Type-variable and coercion-variable
+callbacks must not process runtime index variables.
+
+Index expressions and substitution keep their checked variable, constructor,
+nominal-cast and selected beta grammar. Stored ranges are used once. This is
+not arbitrary Core expression substitution. The restricted bytecode and module
+entries check these forms with Core Lint before and after preparation.
+Interface signatures use scoped local Ids. The ordinary optimizer remains
+unsupported. Native interface templates retain their separate checks and
+module writer gate. These rules add no evaluator or totality assumption.
+See Weirich et al. (ICFP 2017) and docs/dependent-haskell/CORE.md.
+-}
+
+{- Note [Retained dependent function coercions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+DepFunCo visL visR b domain co binds one unrestricted runtime binder throughout co.
+The optional domain proof is outside that binder. MRefl keeps its complete
+lifted domain A unchanged. MCo delta requires nominal evidence A ~ B between
+lifted value types. The type of b is A. Both body endpoints have kind Type.
+If either domain is an eligible native-call function type, require identical
+complete types. Other opaque function-value domains can be transported with
+nominal evidence; that transport grants no native call permission. See
+Note [Opaque runtime index values] in GHC.Core.Type.
+
+If co relates S and T at role r, the left endpoint binds b at A in S.
+The right endpoint binds a fresh Id at type B and substitutes its backward
+conversion for the old b in T. Freshen against the domain proof's deep free
+variables and the body's free variables other than b. The domain proof is
+outside b's scope and can refer to an outer Id with the same Unique. CastTy
+carries this nominal kind conversion. The runtime bridge uses
+Cast value (SubCo (sym delta)). Preserve the nominal proof structure.
+See Note [Nominal native index casts] in GHC.Core. An eligible call head keeps
+its complete fixed type and its dedicated bare-Id head slot. Each visible
+endpoint can become an ordinary arrow when b is unused.
+
+The binder scopes over the proof as well as its endpoints. Keep DepFunCo even
+when both endpoints omit b: an intermediate proof can still use that index.
+The smart constructor simplifies a reflexive body at a fixed domain and
+visibility.
+Substitution, lifting, free variables and tidying use runtime binder callbacks.
+ForAllCo binds type and coercion variables. DepFunCo binds runtime Ids.
+
+This follows System DC's asymmetric An-PiCong rule (Weirich et al., ICFP 2017,
+Fig. 8) and System DR's role propagation (Weirich et al., ICFP 2019). The right
+body uses the inverse domain conversion.
+The body inherits an FC role; domain evidence remains nominal at every role.
+
+Checked application of explicit congruence casts the actual argument back to A
+and substitutes that same argument in co. Symmetry reverses the transport.
+Transitivity composes the checked argument and result conversions. Preserve a
+cast on a function value until application: eta expansion can hide bottom.
+The Arity and CorePrep paths implement this selected An-Push specialization.
+Arity accepts a nominally cast lexical callback at an unchanged binder domain.
+Use the checked callback index and substitute the original operand in the body
+proof. This keeps the lexical Id and the evidence for the callback cast.
+Keep this case out of scoped dictionary proof bodies. A selector can require a
+bare receiver in an intermediate type of the proof.
+Opaque coercion projections, changed multiplicities, native coercion encoding
+and general optimization remain separate gates.
+-}
+
+{- Note [Opaque native call indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TermAppTy f arg represents an opaque call to an unrestricted non-join
+function. Its visible unrestricted arrow has lifted argument and result types
+A and B. The argument is a scoped Type of kind A. The call has kind B.
+The head is either a lexical Id or a checked imported Id with a closed type.
+Only the lexical form participates in binder substitution. Do not unfold f
+or infer argument equality from equality of calls.
+
+For a curried call f x y, use AppTy (TermAppTy f x) y. Check y against
+the domain of the next unrestricted arrow. AppCo lifts forward equality
+at that argument. The unmatchable arrow supplies no inverse projection.
+
+TermAppCo f co lifts a nominal argument proof through the same checked head.
+Both child endpoints have kind A. Both result endpoints have kind B. There
+is no inverse projection or extensional function equality rule. The head is a
+free occurrence. Substitution can use a nominal cast on a lexical callback.
+See Note [Function-valued retained binders] in GHC.Core.Type. Runtime
+reification is partial and has a narrower grammar than this Type constructor.
+
+An outer erased binder can occur in either endpoint of the head. Apply the
+source substitution to the head's type before checking it against the
+target Id. The target Id is already in scope at the new type. See Note
+[Substituting runtime Id metadata] in GHC.Core.TyCo.Subst. Keep matchability
+and multiplicity closed. Only the two checked endpoints can account for
+free variables in the raw function type.
+
+TermVarTy can also record an eligible function value stored in a closed
+algebraic index. Applying this index through the smart makers produces the
+same TermAppTy. A generic AppCo can retain a nonreflexive proof for the head,
+such as transport through a saturated family. Do not replace that complete
+proof with argument-only TermAppCo. See Note [Native function-value application]
+in GHC.Core.TyCo.Make.
+
+Agda's neutral application and scoped substitution (Norell, 2007) are the
+precedent. See also GHC Proposal #378 (§4.4 and §4.7) on retention and
+substitution at dependent application.
+This rule does not add an evaluator to type equality.
+-}
 
 instance Outputable Type where
   ppr = pprType
@@ -249,6 +428,8 @@ data TyLit
   = NumTyLit Integer
   | StrTyLit FastString
   | CharTyLit Char
+  | IntPrimTyLit Integer  -- ^ A signed machine integer of kind @Int#@.
+  | WordPrimTyLit Integer -- ^ An unsigned machine integer of kind @Word#@.
   deriving (Eq, Data.Data)
 
 -- Non-determinism arises due to uniqCompareFS
@@ -264,12 +445,16 @@ cmpTyLitWith :: Ord r => (FastString -> r) -> TyLit -> TyLit -> Ordering
 cmpTyLitWith _ (NumTyLit  x) (NumTyLit  y) = compare x y
 cmpTyLitWith w (StrTyLit  x) (StrTyLit  y) = compare (w x) (w y)
 cmpTyLitWith _ (CharTyLit x) (CharTyLit y) = compare x y
+cmpTyLitWith _ (IntPrimTyLit x) (IntPrimTyLit y) = compare x y
+cmpTyLitWith _ (WordPrimTyLit x) (WordPrimTyLit y) = compare x y
 cmpTyLitWith _ a b = compare (tag a) (tag b)
   where
     tag :: TyLit -> Int
     tag NumTyLit{}  = 0
     tag StrTyLit{}  = 1
     tag CharTyLit{} = 2
+    tag IntPrimTyLit{} = 3
+    tag WordPrimTyLit{} = 4
 
 instance Outputable TyLit where
    ppr = pprTyLit
@@ -285,7 +470,7 @@ FunTy is the constructor for a function type.  Here are the details:
             TYPE r2 ->
             Type
   mkTyConApp ensures that we convert a saturated application
-    TyConApp FUN [m,r1,r2,t1,t2] into FunTy FTF_T_T m t1 t2
+    TyConApp FUN [ma,m,r1,r2,t1,t2] into FunTy FTF_T_T ma m t1 t2
   dropping the 'r1' and 'r2' arguments; they are easily recovered
   from 't1' and 't2'. The FunTyFlag is always FTF_T_T, because
   we build constraint arrows (=>) with e.g. mkPhiTy and friends,
@@ -317,15 +502,18 @@ Note [Weird typing rule for ForAllTy]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Here are the typing rules for ForAllTy:
 
+ma : Matchability
 tyvar : Type
 inner : TYPE r
 tyvar does not occur in r
 ------------------------------------
-ForAllTy (Bndr tyvar vis) inner : TYPE r
+ForAllTy ma (Bndr tyvar vis) inner : TYPE r
 
+ma : Matchability
 inner : TYPE r
-------------------------------------
-ForAllTy (Bndr covar vis) inner : Type
+if ma is known U, covar is free in inner
+------------------------------------------
+ForAllTy ma (Bndr covar vis) inner : Type
 
 Note that the kind of the result depends on whether the binder is a
 tyvar or a covar. The kind of a forall-over-tyvar is the same as
@@ -503,7 +691,7 @@ This is (EQ3) below.
 One other troublesome case is ForAllTy. See Note [Weird typing rule for ForAllTy].
 The kind of the body is the same as the kind of the ForAllTy. Accordingly,
 
-  ForAllTy tv (ty |> co)     and     (ForAllTy tv ty) |> co
+  ForAllTy ma tv (ty |> co)     and     (ForAllTy ma tv ty) |> co
 
 are `eqType`. But only the first can be split by splitForAllTy. So we forbid
 the second form, instead pushing the coercion inside to get the first form.
@@ -516,15 +704,15 @@ In sum, in order to uphold (EQ), we need the following invariants:
         either a FunTy to a FunTy, or a ForAllTy to a ForAllTy.
   (EQ2) No reflexive casts in CastTy.
   (EQ3) No nested CastTys.
-  (EQ4) No CastTy over (ForAllTy (Bndr tyvar vis) body).
+  (EQ4) No CastTy over (ForAllTy ma (Bndr tyvar vis) body).
         See Note [Weird typing rule for ForAllTy]
 
 These invariants are all documented above, in the declaration for Type.
 
 Note [Equality on FunTys]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-A (FunTy vis mult arg res) is just an abbreviation for a
-  TyConApp funTyCon [mult, arg_rep, res_rep, arg, res]
+A (FunTy vis ma mult arg res) is just an abbreviation for a
+  TyConApp funTyCon [ma, mult, arg_rep, res_rep, arg, res]
 where
   arg :: TYPE arg_rep
   res :: TYPE res_rep
@@ -542,17 +730,30 @@ the kinds of the arg and the res.
 
 Note [ForAllTy]
 ~~~~~~~~~~~~~~~
-A (ForAllTy (Bndr tcv vis) ty) can quantify over a TyVar or, less commonly, a CoVar.
+A (ForAllTy ma (Bndr tcv vis) ty) can quantify over a TyVar or, less commonly, a CoVar.
 See Note [Why ForAllTy can quantify over a coercion variable] for why we need the latter.
 
 (FT1) Invariant: See Note [Weird typing rule for ForAllTy]
 
-(FT2) Invariant: in (ForAllTy (Bndr tcv vis) ty),
+(FT2) Invariant: in (ForAllTy ma (Bndr tcv vis) ty),
       if tcv is a CoVar, then vis = coreTyLamForAllTyFlag.
    Visibility is not important for coercion abstractions,
    because they are not user-visible.
 
 (FT3) Invariant: see Note [Unused coercion variable in ForAllTy]
+
+Note [Forall matchability metadata]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ForAllTy ma binder body stores a type of kind Matchability. The annotation
+is outside the binder scope. It can mention earlier telescope binders.
+Visibility does not determine matchability. Runtime type and coercion lambdas
+use U. Generic construction and reconstruction preserve their supplied ma.
+
+ForAllCo stores a nominal metadata proof at every body role, including P.
+That proof is outside the binder scope, like its binder-kind proof. Mapping,
+folding, substitution and tidying must process it before binding fco_tcv.
+Each telescope binder has its own annotation. Plural makers retain these
+annotations as pairs instead of assigning one annotation to the whole group.
 
 Note [Why ForAllTy can quantify over a coercion variable]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -590,37 +791,26 @@ Core does *not* mean we have it in source Haskell.  See #15710 about that.
 
 Note [Unused coercion variable in ForAllTy]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Suppose we have
-  \(co:t1 ~# t2). e
+An unused CoVar binder with known U matchability uses an anonymous arrow.
+mkTyCoForAllTy calls the sort-aware mkFunctionType for this case. Primitive
+proof domains have sort Constraint, so this can produce FTF_C_T or FTF_C_C.
+The arrow keeps U matchability and a Many multiplicity.
 
-What type should we give to the above expression?
-  (1) forall (co:t1 ~# t2) -> t
-  (2) (t1 ~# t2) -> t
-
-If co is used in t, (1) should be the right choice.
-if co is not used in t, we would like to have (1) and (2) equivalent.
-
-However, we want to keep eqType simple and don't want eqType (1) (2) to return
-True in any case.
-
-We decide to always construct (2) if co is not used in t.
-
-Thus in mkLamType, we check whether the variable is a coercion
-variable (of type (t1 ~# t2), and whether it is un-used in the
-body. If so, it returns a FunTy instead of a ForAllTy.
-
-There are cases we want to skip the check. For example, the check is
-unnecessary when it is known from the context that the input variable
-is a type variable.  In those cases, we use mkForAllTy.
+A vacuous CoVar forall with M or unresolved metadata remains a ForAllTy.
+The anonymous constraint arrows have fixed U metadata. Converting an M or
+unresolved annotation to such an arrow would discard that annotation.
+Substitution and normalization must repeat the known-U check after mapping.
+See Note [Forall matchability metadata].
 
 Note [Weird typing rule for ForAllTy]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Here is the (truncated) typing rule for the dependent ForAllTy:
 
+  ma : Matchability
   inner : TYPE r
   tyvar is not free in r
   ----------------------------------------
-  ForAllTy (Bndr tyvar vis) inner : TYPE r
+  ForAllTy ma (Bndr tyvar vis) inner : TYPE r
 
 Note that the kind of `inner` is the kind of the overall ForAllTy. This is
 necessary because every ForAllTy over a type variable is erased at runtime.
@@ -640,13 +830,14 @@ problem.
 
 If the bound variable is a coercion variable:
 
+  ma : Matchability
   inner : TYPE r
-  covar is free in inner
-  ------------------------------------
-  ForAllTy (Bndr covar vis) inner : Type
+  if ma is known U, covar is free in inner
+  ------------------------------------------
+  ForAllTy ma (Bndr covar vis) inner : Type
 
 Here, the kind of the ForAllTy is just Type, because coercion abstractions
-are *not* erased. The "covar is free in inner" premise is solely to maintain
+are *not* erased. The conditional occurrence premise maintains
 the representation invariant documented in
 Note [Unused coercion variable in ForAllTy]. Though there is surface similarity
 between this free-var check and the one in the tyvar rule, these two restrictions
@@ -732,93 +923,178 @@ mkTyCoVarTy v
 mkTyCoVarTys :: [TyCoVar] -> [Type]
 mkTyCoVarTys = map mkTyCoVarTy
 
-infixr 3 `mkFunTy`, `mkInvisFunTy`, `mkVisFunTyMany`
+infixr 3 `mkFunTy`, `mkInvisFunTy`, `mkVisFunTyMany`, `mkVisFunTyManyM`, `mkVisFunTyManyU`
 
-mkNakedFunTy :: FunTyFlag -> Kind -> Kind -> Kind
--- See Note [Naked FunTy] in GHC.Builtin.WiredIn.Types
--- Always Many multiplicity; kinds have no linearity
-mkNakedFunTy af arg res
- =  FunTy { ft_af   = af, ft_mult = manyDataConTy
-          , ft_arg  = arg, ft_res  = res }
+{- Note [Ordinary arrow matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An arrow carries a type of kind Matchability independently of visibility and
+multiplicity. Matchable permits nominal inverse application evidence.
+Unmatchable permits forward congruence, but not inverse projection. A stuck
+metadata type does not establish matchability. See isMatchableFunTy in
+GHC.Core.Type and the consumers in GHC.Core.Lint and GHC.Tc.Solver.Equality.
 
-mkFunTy :: HasDebugCallStack => FunTyFlag -> Mult -> Type -> Type -> Type
-mkFunTy af mult arg res
+Use type-valued metadata, as in proposal #242 and its prototype. Maps and
+substitution must retain its variables and proof dependencies. Ordinary
+runtime arrows use U. Constructor kind arrows use M. Constraint arrows use
+fixed U/Many. DepFunTy is intrinsically U; removing vacuous dependence must
+produce the same arrow as an ordinary runtime lambda.
+
+ForAllTy also carries explicit metadata. See Note [Forall matchability metadata].
+Keep the native polymorphic-value and family-saturation gates unchanged.
+-}
+
+-- | Build a kind arrow without inspecting its endpoints' kinds.
+mkNakedFunTy :: Matchability -> FunTyFlag -> Kind -> Kind -> Kind
+mkNakedFunTy ma af arg res
+ = FunTy { ft_af = af, ft_ma = ma, ft_mult = manyDataConTy
+         , ft_arg = arg, ft_res = res }
+
+mkFunTy :: HasDebugCallStack => FunTyFlag -> Matchability -> Mult -> Type -> Type -> Type
+mkFunTy af ma mult arg res
   = assertPpr (af == chooseFunTyFlag arg res) (vcat
       [ text "af" <+> ppr af
       , text "chooseAAF" <+> ppr (chooseFunTyFlag arg res)
       , text "arg" <+> ppr arg <+> dcolon <+> ppr (typeKind arg)
       , text "res" <+> ppr res <+> dcolon <+> ppr (typeKind res) ]) $
-    FunTy { ft_af   = af
-          , ft_mult = mult
-          , ft_arg  = arg
-          , ft_res  = res }
+    FunTy { ft_af = af, ft_ma = ma, ft_mult = mult
+          , ft_arg = arg, ft_res = res }
 
 mkInvisFunTy :: HasDebugCallStack => Type -> Type -> Type
 mkInvisFunTy arg res
-  = mkFunTy (invisArg (typeTypeOrConstraint res)) manyDataConTy arg res
+  = mkFunTy (invisArg (typeTypeOrConstraint res)) unmatchableDataConTy manyDataConTy arg res
 
 mkInvisFunTys :: HasDebugCallStack => [Type] -> Type -> Type
 mkInvisFunTys args res
-  = foldr (mkFunTy af manyDataConTy) res args
+  = foldr (mkFunTy af unmatchableDataConTy manyDataConTy) res args
   where
     af = invisArg (typeTypeOrConstraint res)
 
-mkVisFunTy :: HasDebugCallStack => Mult -> Type -> Type -> Type
--- Always TypeLike, user-specified multiplicity.
+mkVisFunTy :: HasDebugCallStack => Matchability -> Mult -> Type -> Type -> Type
 mkVisFunTy = mkFunTy visArgTypeLike
 
--- | Make nested arrow types
--- | Special, common, case: Arrow type with mult Many
-mkVisFunTyMany :: HasDebugCallStack => Type -> Type -> Type
--- Always TypeLike, multiplicity Many
-mkVisFunTyMany = mkVisFunTy manyDataConTy
+-- | Build a visible unrestricted arrow with explicit matchability.
+mkVisFunTyMany :: HasDebugCallStack => Matchability -> Type -> Type -> Type
+mkVisFunTyMany ma = mkVisFunTy ma manyDataConTy
 
-mkVisFunTysMany :: [Type] -> Type -> Type
--- Always TypeLike, multiplicity Many
-mkVisFunTysMany tys ty = foldr mkVisFunTyMany ty tys
+-- | Build a matchable unrestricted arrow.
+mkVisFunTyManyM :: HasDebugCallStack => Type -> Type -> Type
+mkVisFunTyManyM = mkVisFunTyMany matchableDataConTy
+
+-- | Build an ordinary runtime unrestricted arrow.
+mkVisFunTyManyU :: HasDebugCallStack => Type -> Type -> Type
+mkVisFunTyManyU = mkVisFunTyMany unmatchableDataConTy
+
+-- | Build visible arrows with their individual matchabilities.
+mkVisFunTysMany :: [(Matchability, Type)] -> Type -> Type
+mkVisFunTysMany tys ty = foldr (uncurry mkVisFunTyMany) ty tys
+
+-- | Build matchable unrestricted arrows.
+mkVisFunTysManyM :: [Type] -> Type -> Type
+mkVisFunTysManyM tys ty = foldr mkVisFunTyManyM ty tys
+
+-- | Build ordinary runtime unrestricted arrows.
+mkVisFunTysManyU :: [Type] -> Type -> Type
+mkVisFunTysManyU tys ty = foldr mkVisFunTyManyU ty tys
 
 ---------------
-mkScaledFunTy :: HasDebugCallStack => FunTyFlag -> Scaled Type -> Type -> Type
-mkScaledFunTy af (Scaled mult arg) res = mkFunTy af mult arg res
+mkScaledFunTy :: HasDebugCallStack => FunTyFlag -> Matchability -> Scaled Type -> Type -> Type
+mkScaledFunTy af ma (Scaled mult arg) res = mkFunTy af ma mult arg res
 
-mkScaledFunTys :: HasDebugCallStack => [Scaled Type] -> Type -> Type
--- All visible args
--- Result type can be TypeLike or ConstraintLike
--- Example of the latter: dataConWrapperType for the data con of a class
-mkScaledFunTys tys ty = foldr (mkScaledFunTy af) ty tys
+mkScaledFunTys :: HasDebugCallStack => [(Matchability, Scaled Type)] -> Type -> Type
+mkScaledFunTys tys ty = foldr (uncurry (mkScaledFunTy af)) ty tys
   where
     af = visArg (typeTypeOrConstraint ty)
 
+-- | Build matchable arrows from scaled arguments.
+mkScaledFunTysM :: HasDebugCallStack => [Scaled Type] -> Type -> Type
+mkScaledFunTysM tys = mkScaledFunTys [(matchableDataConTy,ty) | ty <- tys]
+
+-- | Build runtime arrows from scaled arguments.
+mkScaledFunTysU :: HasDebugCallStack => [Scaled Type] -> Type -> Type
+mkScaledFunTysU tys = mkScaledFunTys [(unmatchableDataConTy,ty) | ty <- tys]
+
 ---------------
--- | Like 'mkTyCoForAllTy', but does not check the occurrence of the binder
+-- | Preserve explicit metadata and assume a canonical coercion binder.
 -- See Note [Unused coercion variable in ForAllTy]
-mkForAllTy :: ForAllTyBinder -> Type -> Type
-mkForAllTy bndr body
-  = assertPpr (good_bndr bndr) (ppr bndr <+> ppr body) $
-    ForAllTy bndr body
+mkForAllTy :: Matchability -> ForAllTyBinder -> Type -> Type
+mkForAllTy ma bndr body
+  = assertPpr (good_bndr bndr) (ppr ma <+> ppr bndr <+> ppr body) $
+    ForAllTy ma bndr body
   where
-    -- Check ForAllTy invariants
+    -- See Note [Forall matchability metadata].
+    known_u = ma `eqType` unmatchableDataConTy
     good_bndr (Bndr cv vis)
       | isCoVar cv = isCoreTyLamForAllTyFlag vis
-                     -- See (FT2) in Note [ForAllTy]
-                  && (cv `elemVarSet` tyCoVarsOfType body)
-                     -- See (FT3) in Note [ForAllTy]
+                  && (not known_u || cv `elemVarSet` tyCoVarsOfType body)
       | otherwise = True
 
--- | Wraps foralls over the type using the provided 'TyCoVar's from left to right
-mkForAllTys :: [ForAllTyBinder] -> Type -> Type
-mkForAllTys tyvars ty = foldr ForAllTy ty tyvars
+-- | Make a dependent forall over a TyCoVar
+mkTyCoForAllTy :: Matchability -> TyCoVar -> ForAllTyFlag -> Type -> Type
+mkTyCoForAllTy ma tv vis ty
+  | isCoVar tv
+  , ma `eqType` unmatchableDataConTy
+  , not (tv `elemVarSet` tyCoVarsOfType ty)
+  = mkFunctionType ma manyDataConTy (varType tv) ty
+    -- See Note [Unused coercion variable in ForAllTy] in GHC.Core.TyCo.Rep.
+  | otherwise
+  = mkForAllTy ma (mkForAllTyBinder vis tv) ty
 
--- | Wraps foralls over the type using the provided 'InvisTVBinder's from left to right
-mkInvisForAllTys :: [InvisTVBinder] -> Type -> Type
-mkInvisForAllTys tyvars = mkForAllTys (tyVarSpecToBinders tyvars)
+-- | Wrap a telescope with one matchability for each binder.
+mkForAllTys :: [(Matchability, ForAllTyBinder)] -> Type -> Type
+mkForAllTys bndrs ty = foldr (uncurry mkForAllTy) ty bndrs
 
-mkPiTy :: HasDebugCallStack => PiTyBinder -> Type -> Type
-mkPiTy (Anon ty1 af) ty2  = mkScaledFunTy af ty1 ty2
-mkPiTy (Named bndr) ty    = mkForAllTy bndr ty
+-- | Wrap invisible binders and preserve each supplied matchability.
+mkInvisForAllTys :: [(Matchability, InvisTVBinder)] -> Type -> Type
+mkInvisForAllTys bndrs = mkForAllTys
+  [(ma, Bndr tv (Invisible spec)) | (ma, Bndr tv spec) <- bndrs]
 
-mkPiTys :: HasDebugCallStack => [PiTyBinder] -> Type -> Type
-mkPiTys tbs ty = foldr mkPiTy ty tbs
+mkPiTy :: HasDebugCallStack => Matchability -> PiTyBinder -> Type -> Type
+mkPiTy ma (Anon ty1 af) ty2 = mkScaledFunTy af ma ty1 ty2
+mkPiTy ma (Named (Bndr tv vis)) ty = mkTyCoForAllTy ma tv vis ty
+
+mkPiTys :: HasDebugCallStack => [(Matchability, PiTyBinder)] -> Type -> Type
+mkPiTys tbs ty = foldr (uncurry mkPiTy) ty tbs
+
+-- | Build a telescope with M on every binder.
+mkPiTysM :: HasDebugCallStack => [PiTyBinder] -> Type -> Type
+mkPiTysM tbs = mkPiTys [(matchableDataConTy,tb) | tb <- tbs]
+
+-- | Build a runtime telescope with U on every binder.
+mkPiTysU :: HasDebugCallStack => [PiTyBinder] -> Type -> Type
+mkPiTysU tbs = mkPiTys [(unmatchableDataConTy,tb) | tb <- tbs]
+
+-- | Construct a visible retained dependent function.
+mkDepFunTy :: Id -> Type -> Type
+mkDepFunTy = mkDepFunTyWithVis DepFunVisible
+
+-- | Construct a retained function without losing its source visibility.
+-- See Note [Retained function visibility].
+mkDepFunTyWithVis :: DepFunTyFlag -> Id -> Type -> Type
+mkDepFunTyWithVis vis b body
+  | isInvisibleDepFunFlag vis || b `elemVarSet` tyCoVarsOfType body
+  = DepFunTy vis b body
+  | otherwise = tcMkVisFunTy unmatchableDataConTy (idMult b) (varType b) body
+
+{- Note [Retained function visibility]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained binder takes a value argument in Core. Its visibility describes
+how the argument is supplied in source. Keep an invisible binder even when
+its Id is absent from the result type. A visible binder with no dependency
+still collapses to an ordinary visible U/Many arrow. An invisible FunTy
+represents a predicate argument and cannot represent this value binder.
+
+Core Lam has a canonical visible type. A DepFunCo can relate it to an
+invisible type at Representational role, with no extra lambda or argument.
+The nominal domain proof and dependent body proof still determine the
+endpoints. Each endpoint uses mkDepFunTyWithVis independently. For example,
+the visible endpoint of a vacuous function can be a FunTy and the invisible
+endpoint a DepFunTy. Different flags are never nominally equal.
+
+This follows the shape of Note [Required foralls in Core]. Retained
+visibility does not erase the value argument. Both endpoints have the same
+runtime calling convention. Preserve both flags until the cast is erased.
+See Note [Retained dependent function coercions].
+-}
 
 -- | 'mkNakedTyConTy' creates a nullary 'TyConApp'. In general you
 -- should rather use 'GHC.Core.Type.mkTyConTy', which picks the shared
@@ -828,30 +1104,29 @@ mkPiTys tbs ty = foldr mkPiTy ty tbs
 mkNakedTyConTy :: TyCon -> Type
 mkNakedTyConTy tycon = TyConApp tycon []
 
-tcMkVisFunTy :: Mult -> Type -> Type -> Type
--- Always TypeLike result, user-specified multiplicity.
--- Does not have the assert-checking in mkFunTy: used by the typechecker
--- to avoid looking at the result kind, which may not be zonked
-tcMkVisFunTy mult arg res
-  = FunTy { ft_af = visArgTypeLike, ft_mult = mult
+tcMkVisFunTy :: Matchability -> Mult -> Type -> Type -> Type
+tcMkVisFunTy ma mult arg res
+  = FunTy { ft_af = visArgTypeLike, ft_ma = ma, ft_mult = mult
           , ft_arg = arg, ft_res = res }
 
 tcMkInvisFunTy :: TypeOrConstraint -> Type -> Type -> Type
--- Always invisible (constraint) argument, result specified by res_torc
--- Does not have the assert-checking in mkFunTy: used by the typechecker
--- to avoid looking at the result kind, which may not be zonked
 tcMkInvisFunTy res_torc arg res
-  = FunTy { ft_af = invisArg res_torc, ft_mult = manyDataConTy
-          , ft_arg = arg, ft_res = res }
+  = FunTy { ft_af = invisArg res_torc, ft_ma = unmatchableDataConTy
+          , ft_mult = manyDataConTy, ft_arg = arg, ft_res = res }
 
-tcMkScaledFunTys :: [Scaled Type] -> Type -> Type
--- All visible args
--- Result type must be TypeLike
--- No mkFunTy assert checking; result kind may not be zonked
-tcMkScaledFunTys tys ty = foldr tcMkScaledFunTy ty tys
+tcMkScaledFunTys :: [(Matchability, Scaled Type)] -> Type -> Type
+tcMkScaledFunTys tys ty = foldr (uncurry tcMkScaledFunTy) ty tys
 
-tcMkScaledFunTy :: Scaled Type -> Type -> Type
-tcMkScaledFunTy (Scaled mult arg) res = tcMkVisFunTy mult arg res
+tcMkScaledFunTy :: Matchability -> Scaled Type -> Type -> Type
+tcMkScaledFunTy ma (Scaled mult arg) res = tcMkVisFunTy ma mult arg res
+
+-- | Build checked matchable arrows without inspecting endpoint kinds.
+tcMkScaledFunTysM :: [Scaled Type] -> Type -> Type
+tcMkScaledFunTysM tys = tcMkScaledFunTys [(matchableDataConTy,ty) | ty <- tys]
+
+-- | Build checked runtime arrows without inspecting endpoint kinds.
+tcMkScaledFunTysU :: [Scaled Type] -> Type -> Type
+tcMkScaledFunTysU tys = tcMkScaledFunTys [(unmatchableDataConTy,ty) | ty <- tys]
 
 {-
 %************************************************************************
@@ -922,13 +1197,22 @@ data Coercion
   -- TyConAppCo :: "e" -> _ -> ?? -> e
   -- See Note [TyConAppCo roles]
   | TyConAppCo Role TyCon [Coercion]    -- lift TyConApp
-               -- The TyCon is never a synonym;
-               -- we expand synonyms eagerly
+               -- Expand synonyms at saturation. A partial synonym can
+               -- carry congruence over its supplied arguments.
+               -- See Note [Partial type family applications] in GHC.Core.Type.
                -- But it can be a type function
                -- TyCon is never a saturated (->); use FunCo instead
 
   | AppCo Coercion CoercionN             -- lift AppTy
           -- AppCo :: e -> N -> e
+
+  | TermAppCo Id CoercionN
+      -- ^ Nominal argument congruence for the same runtime function.
+
+  | DepFunCo !DepFunTyFlag !DepFunTyFlag Id MCoercionN Coercion
+      -- Left and right endpoint visibility.
+      -- The optional nominal domain proof is outside the runtime binder scope.
+      -- See Note [Retained dependent function coercions].
 
   -- See Note [ForAllCo]
   | ForAllCo
@@ -936,15 +1220,17 @@ data Coercion
       , fco_visL :: !ForAllTyFlag -- Visibility of coercionLKind
       , fco_visR :: !ForAllTyFlag -- Visibility of coercionRKind
                                   -- See (FC7) of Note [ForAllCo]
+      , fco_ma   :: CoercionN    -- Outside the binder scope at every body role.
       , fco_kind :: KindMCoercion -- See (FC8) of Note [ForAllCo]
       , fco_body :: Coercion }
-         -- ForAllCo :: _ -> N -> e -> e
+         -- ForAllCo :: _ -> _ -> _ -> N -> N -> r -> r
 
-  | FunCo  -- FunCo :: "e" -> N/P -> e -> e -> e
+  | FunCo  -- Congruence for matchability, multiplicity and both endpoints.
            -- See Note [FunCo] for fco_afl, fco_afr
         { fco_role         :: Role
         , fco_afl          :: FunTyFlag   -- Arrow for coercionLKind
         , fco_afr          :: FunTyFlag   -- Arrow for coercionRKind
+        , fco_ma           :: Coercion
         , fco_mult         :: CoercionN
         , fco_arg, fco_res :: Coercion }
        -- (if the role "e" is Phantom, the first coercion is, too)
@@ -1020,12 +1306,19 @@ data CoSel  -- See Note [SelCo]
 
   | SelFun FunSel      -- Decomposes (co1 -> co2)
 
-  | SelForAll          -- Decomposes (forall a. co)
+  | SelForAll ForAllSel -- Decomposes forall metadata or its binder kind.
 
   deriving( Eq, Data.Data, Ord )
 
+-- | Select the matchability or binder-kind proof of a forall coercion.
+data ForAllSel
+  = SelFAMatch
+  | SelKind
+  deriving( Eq, Data.Data, Ord )
+
 data FunSel  -- See Note [SelCo]
-  = SelMult  -- Multiplicity
+  = SelMatch -- Matchability
+  | SelMult  -- Multiplicity
   | SelArg   -- Argument of function
   | SelRes   -- Result of function
   deriving( Eq, Data.Data, Ord )
@@ -1038,7 +1331,7 @@ instance Outputable UnivCoDeps where
 
 instance Outputable CoSel where
   ppr (SelTyCon n r) = text "Tc" <> parens (int n <> comma <> pprOneCharRole r)
-  ppr SelForAll      = text "All"
+  ppr (SelForAll fs) = text "All" <> parens (ppr fs)
   ppr (SelFun fs)    = text "Fun" <> parens (ppr fs)
 
 pprOneCharRole :: Role -> SDoc
@@ -1046,34 +1339,48 @@ pprOneCharRole Nominal          = char 'N'
 pprOneCharRole Representational = char 'R'
 pprOneCharRole Phantom          = char 'P'
 
+instance Outputable ForAllSel where
+  ppr SelFAMatch = text "match"
+  ppr SelKind = text "kind"
+
+instance NFData ForAllSel where
+  rnf SelFAMatch = ()
+  rnf SelKind = ()
+
 instance Outputable FunSel where
+  ppr SelMatch = text "match"
   ppr SelMult = text "mult"
   ppr SelArg  = text "arg"
   ppr SelRes  = text "res"
 
 instance NFData FunSel where
+  rnf SelMatch = ()
   rnf SelMult = ()
   rnf SelArg  = ()
   rnf SelRes  = ()
 
 instance Binary CoSel where
    put_ bh (SelTyCon n r)   = do { putByte bh 0; put_ bh n; put_ bh r }
-   put_ bh SelForAll        = putByte bh 1
+   put_ bh (SelForAll SelKind) = putByte bh 1
+   put_ bh (SelForAll SelFAMatch) = putByte bh 6
    put_ bh (SelFun SelMult) = putByte bh 2
    put_ bh (SelFun SelArg)  = putByte bh 3
    put_ bh (SelFun SelRes)  = putByte bh 4
+   put_ bh (SelFun SelMatch) = putByte bh 5
 
    get bh = do { h <- getByte bh
                ; case h of
                    0 -> do { n <- get bh; r <- get bh; return (SelTyCon n r) }
-                   1 -> return SelForAll
+                   1 -> return (SelForAll SelKind)
+                   6 -> return (SelForAll SelFAMatch)
                    2 -> return (SelFun SelMult)
                    3 -> return (SelFun SelArg)
+                   5 -> return (SelFun SelMatch)
                    _ -> return (SelFun SelRes) }
 
 instance NFData CoSel where
   rnf (SelTyCon n r) = rnf n `seq` rnf r `seq` ()
-  rnf SelForAll      = ()
+  rnf (SelForAll fs) = rnf fs
   rnf (SelFun fs)    = rnf fs `seq` ()
 
 instance Outputable MCoercion where
@@ -1161,12 +1468,21 @@ checked by the SelCo case of GHC.Core.Lint.lintCoercion.
 
    See Note [SelCo Cached Roles]
 
-* SelForAll:
-      co : forall (a:k1).t1 ~r0 forall (a:k2).t2
+* SelForAll SelFAMatch:
+      co : forall @ma1 (a:k1).t1 ~r0 forall @ma2 (a:k2).t2
+      r0 is Nominal or Representational
       ----------------------------------
-      SelCo SelForAll co : k1 ~N k2
+      SelCo (SelForAll SelFAMatch) co : ma1 ~N ma2
 
-  NB: SelForAll always gives a Nominal coercion.
+* SelForAll SelKind:
+      co : forall @ma1 (a:k1).t1 ~r0 forall @ma2 (a:k2).t2
+      r0 is Nominal or Representational
+      ----------------------------------
+      SelCo (SelForAll SelKind) co : k1 ~N k2
+
+  Both forall selectors give nominal coercions. SelFAMatch selects the
+  stored metadata proof. SelKind selects the binder-kind proof.
+  See Note [Phantom forall selectors].
 
 * The SelFun form, for functions, has three sub-forms for the three
   components of the function type (multiplicity, argument, result).
@@ -1185,6 +1501,30 @@ checked by the SelCo case of GHC.Core.Lint.lintCoercion.
       r = funRole r0 SelRes
       ----------------------------------
       SelCo (SelFun SelRes) co : t1 ~r t2
+
+Note [Phantom forall selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A phantom coercion between forall types does not imply nominal equality
+between their binder kinds or their matchability annotations. For example, both (forall (a :: Type). Int)
+and (forall (b :: Bool). Int) have kind Type. A phantom coercion can relate
+these types, but it cannot justify a nominal coercion between Type and Bool.
+The residual SelForAll rule therefore requires a nominal or representational
+parent. Representational parents are needed when pushing type arguments
+through casts; see pushCoTyArg in GHC.Core.Opt.Arity.
+
+This restriction does not prevent returning an existing nominal proof.
+A structural ForAllCo stores a nominal binder-kind proof even when its body
+has phantom role. mkSelCo_maybe can return this proof, including under SymCo.
+The same structural reduction can return its nominal metadata proof.
+It can also return nominal Refl when the selected endpoints are equal.
+These reductions must precede the residual selector's role check. If they
+cannot simplify a phantom parent, mkSelCo_maybe returns Nothing.
+
+mkSelCo checks the residual role with a debug assertion, in the same way as
+its other smart-maker preconditions. This is not an all-build rejection.
+Core Lint rejects a residual phantom-parent SelForAll. Forall eta expansion
+also checks this premise in its opaque-parent path. Its structural and
+reflexive fast paths can still return existing evidence at phantom role.
 
 Note [FunCo]
 ~~~~~~~~~~~~
@@ -1274,15 +1614,16 @@ because the kinds of the bound tyvars can be different.
 
 The typing rule is:
 
+  G |- ma_co : ma1 ~N ma2
   G |- kind_co : k1 ~N k2
   tv1 \not\in fv(typeKind(t1),typeKind(t2))  -- Skolem escape
   G, tv1:k1 |- co : t1 ~r t2
   if r=N, then vis1=vis2
   ------------------------------------
-  G |- ForAllCo (tv1:k1) vis1 vis2 kind_co co
-         : forall (tv1:k1) <vis1>. t1
+  G |- ForAllCo (tv1:k1) vis1 vis2 ma_co kind_co co
+         : forall (tv1:k1) <vis1>. @ma1 t1
               ~r
-           forall (tv1:k2) <vis2>. (t2[tv1 |-> (tv1:k2) |> sym kind_co])
+           forall (tv1:k2) <vis2>. @ma2 (t2[tv1 |-> (tv1:k2) |> sym kind_co])
 
 Several things to note here
 
@@ -1310,11 +1651,11 @@ Several things to note here
   there generally is just an impedance mismatch in a bunch of places. So we
   use tv1. When we need tv2, we can use setTyVarKind.
 
-(FC2) Note that the kind coercion must be Nominal; and that the role `r` of
+(FC2) Both the metadata and kind coercions must be nominal. The role `r` of
   the final coercion is the same as that of the body coercion.
 
 (FC3) A ForAllCo allows casting between visibilities.  For example:
-         ForAllCo a Required Specified (SubCo (Refl ty))
+         ForAllCo a Required Specified (Refl U) MRefl (SubCo (Refl ty))
            : (forall a -> ty) ~R (forall a. ty)
   But you can only cast between visiblities at Representational role;
   Hence the premise
@@ -1324,10 +1665,9 @@ Several things to note here
 
 (FC4) See Note [Required foralls in Core].
 
-(FC5) In a /type/, in (ForAllTy cv ty) where cv is a CoVar, we insist that
-  `cv` must appear free in `ty`; see Note [Unused coercion variable in ForAllTy]
-  in GHC.Core.TyCo.Rep for the motivation.  If it does not appear free,
-  use FunTy.
+(FC5) In a /type/, in (ForAllTy ma (Bndr cv vis) ty) where cv is a CoVar, we insist that
+  `cv` must appear free in `ty` when its metadata is known U. Otherwise
+  a vacuous forall is permitted. See Note [Unused coercion variable in ForAllTy].
 
   However we do /not/ impose the same restriction on ForAllCo in /coercions/.
   Instead, in coercionLKind and coercionRKind, we use mkTyCoForAllTy to perform
@@ -2136,6 +2476,9 @@ data TyCoFolder a
       , tcf_tyvar :: TyVar -> a    -- Does not automatically recur
       , tcf_covar :: CoVar -> a    -- into kinds of variables
 
+      , tcf_termvar :: Id -> a
+      , tcf_termbinder :: Id -> a -> a
+
       , tcf_hole  :: CoercionHole -> a   -- ^ What to do with coercion holes.
                                          -- See Note [Coercion holes]
 
@@ -2150,6 +2493,8 @@ foldTyCo :: Monoid a => TyCoFolder a
 foldTyCo (TyCoFolder { tcf_view       = view
                      , tcf_lit        = lit
                      , tcf_tyvar      = tyvar
+                     , tcf_termvar    = termvar
+                     , tcf_termbinder = termbinder
                      , tcf_tycobinder = tycobinder
                      , tcf_covar      = covar
                      , tcf_hole       = cohole })
@@ -2157,16 +2502,23 @@ foldTyCo (TyCoFolder { tcf_view       = view
   where
     go_ty ty | Just ty' <- view ty = go_ty ty'
     go_ty (TyVarTy tv)        = tyvar tv
+    go_ty (TermVarTy v)       = termvar v
+    go_ty (TermAppTy f arg)   = termvar f M.<> go_ty arg
+    go_ty (ClassAppTy _ inst dict operand kind)
+      = go_ty inst M.<> go_ty dict M.<> go_ty operand M.<> go_ty kind
+    go_ty (DepDictTy b body) = go_ty (varType b) M.<> termbinder b (go_ty body)
+    go_ty (ExistsTy _ b body) = go_ty (varType b) M.<> tycobinder b (go_ty body)
+    go_ty (DepFunTy _ b body) = go_ty (varType b) M.<> go_ty (idMult b) M.<> termbinder b (go_ty body)
     go_ty (LitTy l)           = lit l
     go_ty (AppTy t1 t2)       = go_ty t1 M.<> go_ty t2
     go_ty (CastTy ty co)      = go_ty ty M.<> go_co co
     go_ty (CoercionTy co)     = go_co co
     go_ty (TyConApp tc tys)   = lit tc M.<> go_tys tys
-    go_ty (FunTy { ft_af = af, ft_mult =  w, ft_arg = arg, ft_res = res })
-      = lit af M.<> go_ty arg M.<> go_ty w M.<> go_ty res
+    go_ty (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res })
+      = lit af M.<> go_ty ma M.<> go_ty arg M.<> go_ty w M.<> go_ty res
         -- As per #23764, ordering is [arg, w, res]
-    go_ty (ForAllTy (Bndr tv _) inner)
-      = go_ty (varType tv) M.<> tycobinder tv (go_ty inner)
+    go_ty (ForAllTy ma (Bndr tv _) inner)
+      = go_ty ma M.<> go_ty (varType tv) M.<> tycobinder tv (go_ty inner)
 
     -- See Note [Use explicit recursion in foldTyCo]
     go_tys []     = mempty
@@ -2181,6 +2533,8 @@ foldTyCo (TyCoFolder { tcf_view       = view
     go_co (GRefl ro ty (MCo co))   = lit ro M.<> go_ty ty M.<> go_co co
     go_co (TyConAppCo ro tc args)  = lit ro M.<> lit tc M.<> go_cos args
     go_co (AppCo c1 c2)            = go_co c1 M.<> go_co c2
+    go_co (TermAppCo f co)         = termvar f M.<> go_co co
+    go_co (DepFunCo _ _ b domain co) = go_ty (varType b) M.<> go_ty (idMult b) M.<> go_mco domain M.<> termbinder b (go_co co)
     go_co (CoVarCo cv)             = covar cv
     go_co (AxiomCo ax cos)         = lit ax M.<> go_cos cos
     go_co (HoleCo hole)            = cohole hole
@@ -2197,13 +2551,13 @@ foldTyCo (TyCoFolder { tcf_view       = view
       -- due to Note [UnivCoDepsInv].
        = lit prov M.<> lit ro M.<> go_ty t1 M.<> go_ty t2 M.<> go_deps deps
     go_co (FunCo { fco_role = ro, fco_afl = afl, fco_afr = afr
-                 , fco_mult = cw, fco_arg = c1, fco_res = c2 })
-       = lit ro M.<> lit afl M.<> lit afr M.<> go_co cw M.<> go_co c1 M.<> go_co c2
+                 , fco_ma = cm, fco_mult = cw, fco_arg = c1, fco_res = c2 })
+       = lit ro M.<> lit afl M.<> lit afr M.<> go_co cm M.<> go_co cw M.<> go_co c1 M.<> go_co c2
 
     go_co (ForAllCo { fco_tcv = tcv, fco_visL = visL, fco_visR = visR
-                    , fco_kind = kind_co, fco_body = co })
+                    , fco_ma = ma_co, fco_kind = kind_co, fco_body = co })
       = lit visL M.<> lit visR
-        M.<> go_mco kind_co M.<> go_ty (varType tcv)
+        M.<> go_co ma_co M.<> go_mco kind_co M.<> go_ty (varType tcv)
         M.<> tycobinder tcv (go_co co)
 
     go_mco MRefl    = mempty
@@ -2249,8 +2603,14 @@ typeSize :: Type -> Int
 typeSize (LitTy {})                 = 1
 typeSize (TyVarTy {})               = 1
 typeSize (AppTy t1 t2)              = typeSize t1 + typeSize t2
-typeSize (FunTy _ _ t1 t2)          = typeSize t1 + typeSize t2
-typeSize (ForAllTy (Bndr tv _) t)   = typeSize (varType tv) + typeSize t
+typeSize (FunTy _ ma _ t1 t2)       = typeSize ma + typeSize t1 + typeSize t2
+typeSize (ForAllTy ma (Bndr tv _) t) = typeSize ma + typeSize (varType tv) + typeSize t
+typeSize (ClassAppTy _ inst dict operand kind) = 1 + sum (map typeSize [inst, dict, operand, kind])
+typeSize (DepDictTy b t) = 1 + typeSize (varType b) + typeSize t
+typeSize (TermAppTy f arg)         = 1 + typeSize (varType f) + typeSize arg
+typeSize (TermVarTy v)             = 1 + typeSize (varType v)
+typeSize (ExistsTy _ b t)            = 1 + typeSize (varType b) + typeSize t
+typeSize (DepFunTy _ b t)          = 1 + typeSize (varType b) + typeSize t
 typeSize (TyConApp _ ts)            = 1 + typesSize ts
 typeSize (CastTy ty co)             = typeSize ty + coercionSize co
 typeSize (CoercionTy co)            = coercionSize co
@@ -2263,9 +2623,11 @@ coercionSize (Refl ty)             = typeSize ty
 coercionSize (GRefl _ ty mco)      = typeSize ty + mCoercionSize mco
 coercionSize (TyConAppCo _ _ args) = 1 + sum (map coercionSize args)
 coercionSize (AppCo co arg)        = coercionSize co + coercionSize arg
-coercionSize (ForAllCo { fco_kind = h, fco_body = co })
-                                   = 1 + coercionSize co + mCoercionSize h
-coercionSize (FunCo _ _ _ w c1 c2) = 1 + coercionSize c1 + coercionSize c2
+coercionSize (TermAppCo f co)      = 1 + typeSize (varType f) + coercionSize co
+coercionSize (DepFunCo _ _ b domain co) = 1 + typeSize (varType b) + mCoercionSize domain + coercionSize co
+coercionSize (ForAllCo { fco_ma = ma, fco_kind = h, fco_body = co })
+                                   = 1 + coercionSize ma + coercionSize co + mCoercionSize h
+coercionSize (FunCo _ _ _ ma w c1 c2) = 1 + coercionSize ma + coercionSize c1 + coercionSize c2
                                                          + coercionSize w
 coercionSize (CoVarCo _)         = 1
 coercionSize (HoleCo _)          = 1
@@ -2339,4 +2701,7 @@ Multiplicities can be formed with:
 So that Mult feels a bit more structured, we provide pattern synonyms and smart
 constructors for these.
 -}
+-- | Type-valued arrow matchability. See Note [Ordinary arrow matchability].
+type Matchability = Type
+
 type Mult = Type

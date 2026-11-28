@@ -1,0 +1,36 @@
+NativeConstrainedSumPatternRejects.hs:14:28: error: [GHC-83605]
+    • A retained package pattern requires prefix constructor syntax and unrestricted multiplicity.
+      Retained fields require variables, wildcards, or constructor patterns for their index domain.
+      A retained variable or wildcard can be parenthesized or have a bang. Fields of an index constructor must be bare variables or wildcards.
+      Lazy patterns and pattern bindings are not supported yet.
+    • In the pattern: Pair tag _
+      In a case alternative: Pair tag _ -> tag
+      In the expression: case pkg of Pair tag _ -> tag
+
+NativeConstrainedSumPatternRejects.hs:17:30: error: [GHC-83605]
+    • A retained package pattern requires prefix constructor syntax and unrestricted multiplicity.
+      Retained fields require variables, wildcards, or constructor patterns for their index domain.
+      A retained variable or wildcard can be parenthesized or have a bang. Fields of an index constructor must be bare variables or wildcards.
+      Lazy patterns and pattern bindings are not supported yet.
+    • In the pattern: Pair tag _
+      In a case alternative: Pair tag _ -> tag
+      In the expression: case pkg of Pair tag _ -> tag
+
+NativeConstrainedSumPatternRejects.hs:20:39: error: [GHC-83605]
+    • A retained package pattern requires prefix constructor syntax and unrestricted multiplicity.
+      Retained fields require variables, wildcards, or constructor patterns for their index domain.
+      A retained variable or wildcard can be parenthesized or have a bang. Fields of an index constructor must be bare variables or wildcards.
+      Lazy patterns and pattern bindings are not supported yet.
+    • In the pattern: Pair tag _
+      In a case alternative: Pair tag _ -> tag
+      In the expression: case pkg of Pair tag _ -> tag
+
+NativeConstrainedSumPatternRejects.hs:26:50: error: [GHC-83865]
+    • Couldn't match type ‘True’ with ‘False’
+      Expected: Tagged False Char
+        Actual: Tagged True Char
+    • In the second argument of ‘Pair’, namely ‘(Yes 'x')’
+      In the first argument of ‘readPayload’, namely
+        ‘(Pair False (Yes 'x'))’
+      In the expression: readPayload (Pair False (Yes 'x'))
+

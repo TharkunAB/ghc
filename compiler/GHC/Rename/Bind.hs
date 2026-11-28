@@ -13,7 +13,7 @@ they may be affected by renaming (which isn't fully worked out yet).
 
 module GHC.Rename.Bind (
    -- Renaming top-level bindings
-   rnTopBindsLHS, rnTopBindsLHSBoot, rnTopBindsBoot, rnValBindsRHS,
+   rnTopBindsLHS, rnTopBindsLHSBoot, rnTopBindsBoot, rnValBindsRHS, rnValBindsRHSWith,
 
    -- Renaming local bindings
    rnLocalBindsAndThen, rnLocalValBindsLHS, rnLocalValBindsRHS,
@@ -48,8 +48,8 @@ import GHC.Driver.DynFlags
 
 import GHC.Data.BooleanFormula ( bfTraverse )
 import GHC.Data.FastString     ( FastString )
-import GHC.Data.Graph.Directed ( SCC(..) )
-import GHC.Data.Maybe          ( orElse, mapMaybe )
+import GHC.Data.Graph.Directed ( Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq )
+import GHC.Data.Maybe          ( isJust, isNothing, orElse, mapMaybe )
 import GHC.Data.OrdList
 import GHC.Data.List.SetOps    ( findDupsEq )
 import GHC.Data.FastString (mkFastStringShortText)
@@ -64,7 +64,9 @@ import GHC.Types.Name.Set
 import GHC.Types.Name.Reader
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc as SrcLoc
-import GHC.Types.Basic         ( RecFlag(..), TypeOrKind(..) )
+import GHC.Types.Basic         ( RecFlag(..), TypeOrKind(..), VisArity )
+import GHC.Types.Unique        ( getUnique )
+import GHC.Types.Var           ( isInvisibleDepFunFlag, Specificity(..) )
 
 import GHC.Types.CompleteMatch
 import GHC.Types.Hint ( SigLike(..) )
@@ -80,6 +82,8 @@ import GHC.Utils.Panic
 import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
+import Data.Data          ( Data, cast, gmapQ )
+import Data.Either        ( partitionEithers )
 import Data.List          ( partition )
 import Data.List.NonEmpty ( NonEmpty(..) )
 
@@ -330,17 +334,27 @@ rnValBindsRHS :: HsSigCtxt
               -> HsValBindsLR GhcRn GhcPs
               -> RnM (HsValBinds GhcRn, DefUses)
 
-rnValBindsRHS ctxt (ValBinds _ vbinds)
+rnValBindsRHS = rnValBindsRHSWith rnHsSigWcType
+
+-- | Supply a value signature renamer without moving it ahead of other splices.
+rnValBindsRHSWith
+  :: (HsDocContext -> LHsSigWcType GhcPs -> RnM (LHsSigWcType GhcRn, FreeNames))
+  -> HsSigCtxt -> HsValBindsLR GhcRn GhcPs
+  -> RnM (HsValBinds GhcRn, DefUses)
+rnValBindsRHSWith rename_type ctxt (ValBinds _ vbinds)
   = do { let (mbinds, sigs) = val_binds_and_sigs vbinds
-       ; (sigs', sig_fvs) <- renameSigs ctxt sigs
+       ; (sigs', sig_fvs) <- renameSigsWith (renameValueSig rename_type ctxt) ctxt sigs
 
        -- Update the TcGblEnv with renamed COMPLETE pragmas from the current
        -- module, for pattern irrefutability checking in do notation.
        ; let localCompletePrags = localCompletePragmas sigs'
        ; updGblEnv (\gblEnv -> gblEnv { tcg_complete_matches = tcg_complete_matches gblEnv ++ localCompletePrags
                                       , tcg_complete_match_env = tcg_complete_match_env gblEnv ++ localCompletePrags }) $
-    do { binds_w_dus <- mapM (rnLBind (mkScopedTvFn sigs')) mbinds
-       ; let !(anal_binds, anal_dus) = depAnalBinds binds_w_dus
+    do { binds_w_dus0 <- mapM (rnLBind (mkScopedSigBndrs sigs')) mbinds
+       ; let binds_w_dus = case ctxt of
+               LocalBindCtxt bound_names -> addLocalSigBindDeps bound_names sigs' binds_w_dus0
+               _                         -> binds_w_dus0
+             !(anal_binds, anal_dus) = depAnalBinds binds_w_dus
 
        ; let patsyn_fvs = foldr (unionNameSet . psb_ext) emptyNameSet $
                           getPatSynBinds anal_binds
@@ -359,7 +373,53 @@ rnValBindsRHS ctxt (ValBinds _ vbinds)
 
         ; return (XValBindsLR (HsVBG anal_binds sigs'), valbind'_dus) } }
 
-rnValBindsRHS _ b = pprPanic "rnValBindsRHS" (ppr b)
+rnValBindsRHSWith _ _ b = pprPanic "rnValBindsRHS" (ppr b)
+
+-- | Record dependencies from a local binding's type signature to earlier local
+-- value bindings in the same @let@/@where@ block so 'depAnalBinds' orders index
+-- bindings ahead of signatures that reference them.
+addLocalSigBindDeps
+  :: NameSet
+  -> [LSig GhcRn]
+  -> [(LHsBind GhcRn, [Name], Uses)]
+  -> [(LHsBind GhcRn, [Name], Uses)]
+addLocalSigBindDeps _ [] binds = binds
+addLocalSigBindDeps bound_names sigs binds
+  | isEmptyNameSet bound_names || isEmptyNameEnv sig_env = binds
+  | otherwise = map add_deps binds
+  where
+    sig_env = mkHsSigEnv get_sig sigs
+    get_sig (L _ (TypeSig _ _ names sig_ty)) =
+      let deps = intersectNameSet bound_names (mkNameSet (collect_names sig_ty []))
+      in if isEmptyNameSet deps then Nothing else Just (names, deps)
+    get_sig _ = Nothing
+
+    collect_names :: Data a => a -> [Name] -> [Name]
+    collect_names x acc
+      | Just (WithUserRdr _ nm) <- (cast x :: Maybe (WithUserRdr Name)) = nm : acc
+      | Just nm <- (cast x :: Maybe Name) = nm : acc
+      | Just _  <- (cast x :: Maybe SrcSpanAnnA) = acc
+      | Just _  <- (cast x :: Maybe SrcSpan) = acc
+      | Just _  <- (cast x :: Maybe RdrName) = acc
+      | otherwise = foldr ($) acc (gmapQ collect_names x)
+
+    add_deps entry@(L loc bind, defs, uses)
+      | isEmptyNameSet extra = entry
+      | otherwise =
+          let uses' = uses `unionNameSet` extra
+              bind' = case bind of
+                FunBind { fun_ext = fvs } ->
+                  let fvs' = fvs `unionNameSet` extra
+                  in fvs' `seq` bind { fun_ext = fvs' }
+                PatBind { pat_ext = fvs } ->
+                  let fvs' = fvs `unionNameSet` extra
+                  in fvs' `seq` bind { pat_ext = fvs' }
+                other -> other
+          in uses' `seq` (L loc bind', defs, uses')
+      where
+        extra = minusNameSet
+                  (unionNameSets [lookupNameEnv sig_env d `orElse` emptyNameSet | d <- defs])
+                  (mkNameSet defs)
 
 -- Wrapper for local binds
 --
@@ -382,6 +442,38 @@ rnLocalValBindsAndThen
   :: HsValBinds GhcPs
   -> (HsValBinds GhcRn -> FreeNames -> RnM (result, FreeNames))
   -> RnM (result, FreeNames)
+rnLocalValBindsAndThen (ValBinds x vbinds) thing_inside
+  | (local_syns@((first_syn_loc, _, _, _, _) : _), ordinary_vbinds)
+      <- partitionEithers (map splitLocalTySynVb vbinds)
+  = do  { enabled <- xoptM LangExt.DependentTypes
+        ; unless enabled $
+            setSrcSpanA first_syn_loc $ failWithTc TcRnTypeLetDisabled
+        ; let ordinary_binds = ValBinds x ordinary_vbinds
+              sigs = val_sigs ordinary_vbinds
+        ; new_fixities <- makeMiniFixityEnv [ L loc sig
+                                            | L loc (FixSig _ sig) <- sigs ]
+        ; (bound_names, (binds_lhs, sigs_ps)) <- rnLocalValBindsLHS new_fixities ordinary_binds
+        ; syn_names <- mapM (\(_, _, tc, _, _) -> newLocalBndrRn tc) local_syns
+        ; envs <- getRdrEnvs
+        ; checkDupAndShadowedNames envs syn_names
+        ; bindLocalNamesFV bound_names              $
+          addLocalFixities new_fixities bound_names $
+          bindLocalNamesFV syn_names                $ do
+        { let bound_set = mkNameSet bound_names
+        ; (syn_sigs_rn, syn_fvs) <- rnLocalTySyns bound_set (zip syn_names local_syns)
+        ; let new_lhs :: HsValBindsLR GhcRn GhcPs =
+                ValBinds noExtField (map VbBind binds_lhs ++ map VbSig sigs_ps)
+        ; (XValBindsLR (HsVBG anal_binds val_sigs_rn), dus) <-
+            rnLocalValBindsRHS bound_set new_lhs
+        ; let combined_binds = XValBindsLR (HsVBG anal_binds (syn_sigs_rn ++ val_sigs_rn))
+        ; (result, result_fvs) <- thing_inside combined_binds (allUses dus `plusFN` syn_fvs)
+        ; let real_uses = findUses dus result_fvs
+              rec_uses = hsValBindsImplicits (XValBindsLR (HsVBG anal_binds val_sigs_rn))
+              implicit_uses = mkNameSet $ concatMap (concatMap implFlBndr_binders . snd) rec_uses
+        ; mapM_ (\(loc, ns) -> checkUnusedRecordWildcard loc real_uses (Just ns)) rec_uses
+        ; warnUnusedLocalBinds bound_names (real_uses `unionNameSet` implicit_uses)
+        ; let all_uses = allUses dus `plusFN` syn_fvs `plusFN` result_fvs
+        ; return (result, all_uses) }}
 rnLocalValBindsAndThen binds@(ValBinds _ vbinds) thing_inside
  = do   { let sigs = val_sigs vbinds
              -- (A) Create the local fixity environment
@@ -441,6 +533,117 @@ rnLocalValBindsAndThen binds@(ValBinds _ vbinds) thing_inside
 
 rnLocalValBindsAndThen bs _ = pprPanic "rnLocalValBindsAndThen" (ppr bs)
 
+-- | Separate a parsed local @type@ synonym from ordinary value bindings and signatures.
+-- See Note [Local type synonyms in let and where].
+splitLocalTySynVb
+  :: ValBind GhcPs GhcPs
+  -> Either (SrcSpanAnnA, LexicalFixity, LocatedN RdrName, [LHsTyVarBndr Specificity GhcPs], LHsType GhcPs)
+            (ValBind GhcPs GhcPs)
+splitLocalTySynVb
+  (VbSig (L loc (TypeSig ann [] [tc]
+                  (HsWC _ (L _ (HsSig _ (HsOuterExplicit { hso_bndrs = tvbs }) rhs))))))
+  | isTcClsNameSpace (rdrNameSpace (unLoc tc))
+  = let fixity = if isJust (asPattern ann) then Infix else Prefix
+    in Left (loc, fixity, tc, tvbs, rhs)
+splitLocalTySynVb other = Right other
+
+-- | Rename local @type@ synonyms in a @let@ or @where@ block, reject cycles,
+-- and return topologically ordered 'LSig' entries for 'tcWithLocalTySyns'.
+-- See Note [Local type synonyms in let and where].
+rnLocalTySyns
+  :: NameSet
+  -> [(Name, (SrcSpanAnnA, LexicalFixity, LocatedN RdrName, [LHsTyVarBndr Specificity GhcPs], LHsType GhcPs))]
+  -> RnM ([LSig GhcRn], FreeNames)
+rnLocalTySyns bound_set items = do
+  entries <- mapM rn_one items
+  let syn_name_set = mkNameSet (map fst items)
+      nodes =
+        [ DigraphNode (sig_rn, decl_rn) (getUnique nm)
+            [ getUnique u | u <- nonDetEltsUniqSet fvs, u `elemNameSet` syn_name_set ]
+        | (nm, sig_rn, decl_rn, fvs) <- entries ]
+      sccs = stronglyConnCompFromEdgedVerticesUniq nodes
+  case [ cyc | CyclicSCC cyc <- sccs ] of
+    (((_, L cyc_loc _) : _) : _) ->
+      let cyc_decls = concat [ map snd c | CyclicSCC c <- sccs ]
+      in setSrcSpanA cyc_loc $
+           failWithTc $ TcRnTypeSynonymCycle (map Right cyc_decls)
+    _ ->
+      let ordered = [ sig_rn | AcyclicSCC (sig_rn, _) <- sccs ]
+          total_fvs = plusFNs [ fvs | (_, _, _, fvs) <- entries ]
+      in pure (ordered, total_fvs)
+  where
+    rn_one (syn_name, (loc, fixity, tc_rdr@(L tc_loc _), spec_tvbs, rhs_ps)) = setSrcSpanA loc $ do
+      let bndr_rdrs =
+            [ rdr
+            | L _ (HsTvb _ _ (HsBndrVar _ (L _ rdr)) _) <- spec_tvbs ]
+          bndr_kinds_ps =
+            [ k
+            | L _ (HsTvb _ _ _ (HsBndrKind _ k)) <- spec_tvbs ]
+      raw_all_fvs <- filterInScopeM (extractHsTysRdrTyVars (rhs_ps : bndr_kinds_ps) [])
+      let alias_candidates = [ v | v <- raw_all_fvs, unLoc v `notElem` bndr_rdrs ]
+      rnWithRetainedAliases bound_set RetainedPartialSignature alias_candidates rhs_ps $ do
+        raw_bndr_fvs <- filterInScopeM (nubN (extractHsTysRdrTyVars bndr_kinds_ps []))
+        let bndr_k_rdrs = [ v | v <- raw_bndr_fvs, unLoc v `notElem` bndr_rdrs ]
+        bndr_k_names <- mapM (newTyVarNameRn Nothing) bndr_k_rdrs
+        let doc = TySynCtx tc_rdr
+        ((spec_tvbs_rn, rhs_rn), syn_fvs) <-
+          bindLocalNamesFV bndr_k_names $
+            bindLHsTyVarBndrs doc WarnUnusedForalls Nothing spec_tvbs $ \tvbs_rn -> do
+              (rhs', fvs) <- rnLHsType doc rhs_ps
+              pure ((tvbs_rn, rhs'), fvs)
+        let kvs_tvbs =
+              [ noLocA (HsTvb noAnn InferredSpec
+                         (HsBndrVar noExtField (noLocA kv))
+                         (HsBndrNoKind noExtField))
+              | kv <- bndr_k_names ]
+            vis_tvbs_rn =
+              [ L bl (HsTvb xb bvis bvar bkind)
+              | L bl (HsTvb xb spec bvar bkind) <- spec_tvbs_rn
+              , let bvis = case spec of
+                      SpecifiedSpec -> HsBndrRequired noExtField
+                      InferredSpec  -> HsBndrInvisible noExtField ]
+            outer_rn = HsOuterExplicit
+              { hso_xexplicit    = noExtField
+              , hso_bndrs        = kvs_tvbs ++ spec_tvbs_rn
+              , hso_matchability = Nothing }
+            wc_sig  = HsWC [] (L loc (HsSig noExtField outer_rn rhs_rn))
+            sig_rn  = L loc (TypeSig noAnn [] [L tc_loc syn_name] wc_sig)
+            decl_rn = L loc $ SynDecl
+              { tcdSExt   = syn_fvs
+              , tcdLName  = L tc_loc syn_name
+              , tcdTyVars = HsQTvs bndr_k_names vis_tvbs_rn
+              , tcdFixity = fixity
+              , tcdRhs    = rhs_rn }
+        pure (syn_name, sig_rn, decl_rn, syn_fvs)
+
+{- Note [Local type synonyms in let and where]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #523 (-XExtendedLet, implied by -XDependentTypes) allows non-recursive
+type synonym declarations inside term-level let and where binding groups:
+
+  let type PairOf a = (a, a)
+      x :: PairOf Int
+      x = (1, 2)
+  in fst x
+
+The parser accepts `type lhs = rhs` in `decls` and wraps each declaration as a
+tcClsName-headed TypeSig so ValBind and HsLocalBinds keep their existing layouts.
+In rnLocalValBindsAndThen:
+
+1. Check that -XExtendedLet (implied by -XDependentTypes) is active.
+2. Allocate fresh local Names for all local type synonyms in the group, check
+   for duplicates and shadowing, and scope those Names over the group's type
+   synonyms, value signatures, value bindings, and body.
+3. Rename each synonym RHS with aliases for enclosing runtime indices and reject
+   self-recursive or mutually recursive synonyms via TcRnTypeSynonymCycle.
+4. Emit topologically sorted entries to tcWithLocalTySyns in GHC.Tc.Gen.HsType.
+
+During typechecking, nullary synonyms bind ATcTypeLet directly in TcLclEnv, and
+parameterized synonyms build an internal SynonymTyCon that mkAppTyM expands
+immediately upon saturation. No local TyCon escapes GHC.Tc.Gen.HsType into Core
+or interface files, and undersaturated uses report TcRnArityMismatch.
+-}
+
 
 ---------------------
 
@@ -487,7 +690,7 @@ rnBindLHS name_maker _ (PatSynBind x psb@PSB{ psb_id = rdrname })
 
 rnBindLHS _ _ b = pprPanic "rnBindHS" (ppr b)
 
-rnLBind :: (Name -> [Name])      -- Signature tyvar function
+rnLBind :: (Name -> ScopedSignatureBinders)
         -> LHsBindLR GhcRn GhcPs
         -> RnM (LHsBind GhcRn, [Name], Uses)
 rnLBind sig_fn (L loc bind)
@@ -496,7 +699,7 @@ rnLBind sig_fn (L loc bind)
        ; return (L loc bind', bndrs, dus) }
 
 -- assumes the left-hands-side vars are in scope
-rnBind :: (Name -> [Name])        -- Signature tyvar function
+rnBind :: (Name -> ScopedSignatureBinders)
        -> HsBindLR GhcRn GhcPs
        -> RnM (HsBind GhcRn, [Name], Uses)
 rnBind _ bind@(PatBind { pat_lhs = pat
@@ -530,11 +733,14 @@ rnBind sig_fn bind@(FunBind { fun_id = name
                             , fun_matches = matches })
        -- invariant: no free vars here when it's a FunBind
   = do  { let plain_name = unLoc name
+              (ty_names, runtime_scopes, written_kinds) = sig_fn plain_name
+              (leading, interior) = span ((== 0) . fst) runtime_scopes
 
-        ; (matches', rhs_fvs) <- bindSigTyVarsFV (sig_fn plain_name) $
-                                -- bindSigTyVars tests for LangExt.ScopedTyVars
-                                 rnMatchGroup (mkPrefixFunRhs name noAnn)
-                                              rnLExpr matches
+        ; (matches', rhs_fvs) <- bindSigTyVarsFV ty_names $
+                                  withWrittenSignatureKinds written_kinds $
+                                  bindLocalNamesFV (concatMap snd leading) $
+                                    rnMatchGroupWithScopes interior
+                                        (mkPrefixFunRhs name noAnn) rnLExpr matches
         ; let is_infix = isInfixFunBind bind
         ; when is_infix $ checkPrecMatch plain_name matches'
 
@@ -551,7 +757,7 @@ rnBind sig_fn bind@(FunBind { fun_id = name
       }
 
 rnBind sig_fn (PatSynBind x bind)
-  = do  { (bind', name, fvs) <- rnPatSynBind sig_fn bind
+  = do  { (bind', name, fvs) <- rnPatSynBind (fstOf3 . sig_fn) bind
         ; return (PatSynBind x bind', name, fvs) }
 
 rnBind _ (VarBind { var_ext = x }) = dataConCantHappen x
@@ -679,22 +885,56 @@ depAnalBinds binds_w_dus
 --           (x,y) = e
 --      In e, 'a' will be in scope, and it'll be the one from 'y'!
 
-mkScopedTvFn :: [LSig GhcRn] -> (Name -> [Name])
--- Return a lookup function that maps an Id Name to the names
--- of the type variables that should scope over its body.
-mkScopedTvFn sigs = \n -> lookupNameEnv env n `orElse` []
-  where
-    env = mkHsSigEnv get_scoped_tvs sigs
+-- | The erased names, retained names, and written kinds scoped over a definition.
+type ScopedSignatureBinders = ([Name], [(VisArity, [Name])], LocalSignatureKinds)
 
-    get_scoped_tvs :: LSig GhcRn -> Maybe ([LocatedN Name], [Name])
-    -- Returns (binders, scoped tvs for those binders)
-    get_scoped_tvs (L _ (ClassOpSig _ _ names sig_ty))
-      = Just (names, hsScopedTvs sig_ty)
-    get_scoped_tvs (L _ (TypeSig _ _ names sig_ty))
-      = Just (names, hsWcScopedTvs sig_ty)
-    get_scoped_tvs (L _ (PatSynSig _ names sig_ty))
-      = Just (names, hsScopedTvs sig_ty)
-    get_scoped_tvs _ = Nothing
+-- | Find erased and invisible retained names that scope over a definition.
+-- See Note [Invisible retained definitions].
+mkScopedSigBndrs :: [LSig GhcRn] -> Name -> ScopedSignatureBinders
+mkScopedSigBndrs sigs = \n -> lookupNameEnv env n `orElse` ([], [], [])
+  where
+    env = mkHsSigEnv get_scoped sigs
+
+    get_scoped (L _ (ClassOpSig _ _ names sig_ty))
+      = Just (names, (hsScopedTvs sig_ty, [], []))
+    get_scoped (L _ (TypeSig _ _ names sig_ty@HsWC{hswc_body = sig}))
+      = let scoped = hsWcScopedTvs sig_ty
+        in Just (names, (scoped, after_context (hsSigWcType sig_ty), signatureWrittenKinds scoped sig))
+    get_scoped (L _ (PatSynSig _ names sig_ty))
+      = Just (names, (hsScopedTvs sig_ty, [], []))
+    get_scoped _ = Nothing
+
+    after_context ty
+      | L _ (HsQualTy _ _ body) <- ignoreParens ty = after_context body
+      | otherwise = retained_scopes 0 ty
+
+    retained_scopes pos ty
+      | L _ (HsForEachTy ann bndrs body) <- ignoreParens ty
+      , isInvisibleDepFunFlag (hsForEachVisibility ann)
+      = (pos, mapMaybe hsLTyVarName bndrs) : retained_scopes pos body
+      | L _ (HsForEachTy _ bndrs body) <- ignoreParens ty
+      = retained_scopes (pos + length bndrs) body
+      | otherwise = []
+
+{- Note [Invisible retained definitions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #378 scopes a signature's invisible retained binder over its
+definition. Bind its existing term Name around the source equations. Written
+patterns can shadow it. The runtime Name follows retained quantification's
+scope rule. ScopedTypeVariables still controls the separate erased names.
+
+Use the prefix after the outer context because complete-signature checking
+skolemises that context before checking value patterns. GHC.Tc.Gen.Match
+adds runtime patterns for this prefix once it has the checked domains.
+The renamed equations keep their written pattern list.
+
+A contiguous retained telescope can also put an invisible binder after
+visible retained binders. Count the preceding visible binders. Add the
+invisible names to the renamer's scope at that position when the equation
+has a later visible pattern. This keeps the preceding patterns outside
+the scope of the invisible names. See Note [Erased suffixes in retained
+matches] in GHC.Tc.Gen.Match.
+-}
 
 -- Process the fixity declarations, making a FastString -> (Located Fixity) map
 -- (We keep the location around for reporting duplicate fixity declarations.)
@@ -970,7 +1210,7 @@ rnMethodBinds is_cls_decl cls ktv_names binds sigs
        -- type variables from the class/instance head are in scope.
        -- Answer no in Haskell 2010, but yes if you have -XScopedTypeVariables
        ; (binds'', bind_fvs) <- bindSigTyVarsFV ktv_names $
-              do { binds_w_dus <- mapM (rnLBind (mkScopedTvFn other_sigs')) binds'
+              do { binds_w_dus <- mapM (rnLBind (mkScopedSigBndrs other_sigs')) binds'
                  ; let bind_fvs = foldr (\(_,_,fv1) fv2 -> fv1 `plusFN` fv2)
                                            emptyFNs binds_w_dus
                  ; return (map fstOf3 binds_w_dus, bind_fvs) }
@@ -1058,27 +1298,46 @@ renameSigs :: HsSigCtxt
            -> [LSig GhcPs]
            -> RnM ([LSig GhcRn], FreeNames)
 -- Renames the signatures and performs error checks
-renameSigs ctxt sigs
+renameSigs ctxt = renameSigsWith (renameSig ctxt) ctxt
+
+-- | Use the supplied signature renamer and keep ordinary signature checks.
+renameSigsWith :: (Sig GhcPs -> RnM (Sig GhcRn, FreeNames)) -> HsSigCtxt
+               -> [LSig GhcPs] -> RnM ([LSig GhcRn], FreeNames)
+renameSigsWith rename_sig ctxt sigs
   = do  { mapM_ dupSigDeclErr (findDupSigs sigs)
 
         ; checkDupMinimalSigs sigs
 
-        ; (sigs', sig_fvs) <- mapFvRn (wrapLocFstMA (renameSig ctxt)) sigs
+        ; (sigs', sig_fvs) <- mapFvRn (wrapLocFstMA rename_sig) sigs
 
         ; let (good_sigs, bad_sigs) = partition (okHsSig ctxt) sigs'
         ; mapM_ misplacedSigErr bad_sigs                 -- Misplaced
 
         ; return (good_sigs, sig_fvs) }
 
-----------------------
-renameSig :: HsSigCtxt -> Sig GhcPs -> RnM (Sig GhcRn, FreeNames)
-renameSig ctxt sig@(TypeSig _ mods vs ty)
+-- | Check a value signature with the supplied type renamer.
+renameValueSig
+  :: (HsDocContext -> LHsSigWcType GhcPs -> RnM (LHsSigWcType GhcRn, FreeNames))
+  -> HsSigCtxt -> Sig GhcPs -> RnM (Sig GhcRn, FreeNames)
+renameValueSig rename_type ctxt sig@(TypeSig _ mods vs ty)
   = do  { new_vs <- mapM (lookupSigOccRn ctxt sig) vs
         ; let doc = TypeSigCtx vs
-        ; (new_ty, fvs) <- rnHsSigWcType doc ty
+        ; retained <- xoptM LangExt.DependentTypes
+        ; (new_ty, fvs) <- case ctxt of
+            LocalBindCtxt bound_names | retained ->
+              let own_names = mkNameSet (map unLoc new_vs)
+                  sig_has_foreach = hsHasForEachTy (unLoc (sig_body (unLoc (hswc_body ty))))
+                  excluded = own_names `unionNameSet`
+                             (if sig_has_foreach then bound_names else emptyNameSet)
+              in rnLocalHsSigWcType excluded doc ty
+            _ -> rename_type doc ty
         ; (mods', mods_fvs) <- rnModifiersContext doc mods
         ; return (TypeSig noAnn mods' new_vs new_ty, fvs `plusFN` mods_fvs) }
+renameValueSig _ ctxt sig = renameSig ctxt sig
 
+----------------------
+renameSig :: HsSigCtxt -> Sig GhcPs -> RnM (Sig GhcRn, FreeNames)
+renameSig ctxt sig@TypeSig{} = renameValueSig rnHsSigWcType ctxt sig
 renameSig ctxt sig@(ClassOpSig _ is_deflt vs ty)
   = do  { defaultSigs_on <- xoptM LangExt.DefaultSignatures
         ; when (is_deflt && not defaultSigs_on) $
@@ -1323,20 +1582,46 @@ bindRuleTmVars doc tyvs vars names thing_inside
     bindLocalNamesFV names (thing_inside vars')
   where
     go ((L l (RuleBndr _ (L loc _))) : vars) (n : ns) thing_inside
-      = go vars ns $ \ vars' ->
+      = scope_index n $ go vars ns $ \ vars' ->
         thing_inside (L l (RuleBndr noAnn (L loc n)) : vars')
 
     go ((L l (RuleBndrSig _ (L loc _) bsig)) : vars)
        (n : ns) thing_inside
       = rnHsPatSigType bind_free_tvs doc bsig $ \ bsig' ->
-        go vars ns $ \ vars' ->
+        scope_index n $ go vars ns $ \ vars' ->
         thing_inside (L l (RuleBndrSig noAnn (L loc n) bsig') : vars')
 
     go [] [] thing_inside = thing_inside []
     go vars names _ = pprPanic "bindRuleVars" (ppr vars $$ ppr names)
 
+    -- See Note [Runtime indices in RULE binders].
+    scope_index name inside
+      | RuleCtx{} <- doc
+      = do { enabled <- xoptM LangExt.DependentTypes
+           ; env <- getLocalRdrEnv
+           ; let occ = setOccNameSpace tvName (nameOccName name)
+           ; if enabled && isNothing (lookupLocalRdrEnv env (Unqual occ))
+             then setLocalRdrEnv (extendLocalRdrEnvWithAlias env occ name) $
+                  bindLocalNamesFV [name] inside
+             else inside }
+      | otherwise = inside
+
     bind_free_tvs = case tyvs of Nothing -> AlwaysBind
                                  Just _  -> NeverBind
+
+{- Note [Runtime indices in RULE binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In forall (b :: Bool) (xs :: Vec (Length b)). keep b xs = xs, both
+occurrences of b denote the same term. Give an earlier rule variable a
+type-lookup alias after checking its own annotation. An explicit type
+binder with the same spelling keeps its scope. Without the alias the
+second annotation can quantify a fresh b, and rule checking discards
+the rule because the two lengths might differ.
+
+tcRuleBndrs in GHC.Tc.Gen.Sig already brings each Id into scope before
+checking the following binder. Use that Id as the runtime index when
+checking the renamed annotation in GHC.Tc.Gen.HsType.
+-}
 
 bindRuleTyVars :: HsDocContext -> Maybe [LHsTyVarBndr () GhcPs]
                -> (Maybe [LHsTyVarBndr () GhcRn]  -> RnM (b, FreeNames))
@@ -1390,10 +1675,18 @@ rnMatchGroup :: (Outputable (body GhcPs), AnnoBody body) => HsMatchContextRn
              -> (LocatedA (body GhcPs) -> RnM (LocatedA (body GhcRn), FreeNames))
              -> MatchGroup GhcPs (LocatedA (body GhcPs))
              -> RnM (MatchGroup GhcRn (LocatedA (body GhcRn)), FreeNames)
-rnMatchGroup ctxt rnBody (MG { mg_alts = L lm ms, mg_ext = (origin, mann) })
+rnMatchGroup = rnMatchGroupWithScopes []
+
+-- | Rename a match group with implicit runtime names from its signature.
+rnMatchGroupWithScopes :: (Outputable (body GhcPs), AnnoBody body)
+                       => [(VisArity, [Name])] -> HsMatchContextRn
+                       -> (LocatedA (body GhcPs) -> RnM (LocatedA (body GhcRn), FreeNames))
+                       -> MatchGroup GhcPs (LocatedA (body GhcPs))
+                       -> RnM (MatchGroup GhcRn (LocatedA (body GhcRn)), FreeNames)
+rnMatchGroupWithScopes scopes ctxt rnBody (MG { mg_alts = L lm ms, mg_ext = (origin, mann) })
          -- see Note [Empty MatchGroups]
   = do { when (null ms) $ checkEmptyCase ctxt
-       ; (new_ms, ms_fvs) <- mapFvRn (rnMatch ctxt rnBody) ms
+       ; (new_ms, ms_fvs) <- mapFvRn (rnMatch scopes ctxt rnBody) ms
        ; return (mkMatchGroup origin mann (L lm new_ms), ms_fvs) }
 
 -- Check the validity of a MatchGroup with an empty list of alternatives.
@@ -1426,19 +1719,19 @@ checkEmptyCase ctxt
         _ -> False
 
 rnMatch :: AnnoBody body
-        => HsMatchContextRn
+        => [(VisArity, [Name])] -> HsMatchContextRn
         -> (LocatedA (body GhcPs) -> RnM (LocatedA (body GhcRn), FreeNames))
         -> LMatch GhcPs (LocatedA (body GhcPs))
         -> RnM (LMatch GhcRn (LocatedA (body GhcRn)), FreeNames)
-rnMatch ctxt rnBody = wrapLocFstMA (rnMatch' ctxt rnBody)
+rnMatch scopes ctxt rnBody = wrapLocFstMA (rnMatch' scopes ctxt rnBody)
 
 rnMatch' :: (AnnoBody body)
-         => HsMatchContextRn
+         => [(VisArity, [Name])] -> HsMatchContextRn
          -> (LocatedA (body GhcPs) -> RnM (LocatedA (body GhcRn), FreeNames))
          -> Match GhcPs (LocatedA (body GhcPs))
          -> RnM (Match GhcRn (LocatedA (body GhcRn)), FreeNames)
-rnMatch' ctxt rnBody (Match { m_ctxt = mf, m_pats = L l pats, m_grhss = grhss })
-  = rnPats ctxt pats $ \ pats' -> do
+rnMatch' scopes ctxt rnBody (Match { m_ctxt = mf, m_pats = L l pats, m_grhss = grhss })
+  = rnPats ctxt scopes pats $ \ pats' -> do
         { (grhss', grhss_fvs) <- rnGRHSs ctxt rnBody grhss
         ; let mf' = case (ctxt, mf) of
                       (FunRhs { mc_fun = L _ funid }, FunRhs { mc_fun = L lf _ })

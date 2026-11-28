@@ -21,24 +21,45 @@ import {-# SOURCE #-} GHC.HsToCore.Match ( match )
 import GHC.Hs
 import GHC.HsToCore.Binds
 import GHC.Core.ConLike
-import GHC.Core.Coercion ( MCoercion(..), coercionLKind, mkUnbranchedAxInstCo )
-import GHC.Core.DataCon ( dataConTyCon )
-import GHC.Core.TyCon ( isNewTyCon, newTyConCo )
-import GHC.Tc.Types.Evidence ( isEmptyTcEvBinds, isIdHsWrapper )
+import GHC.Core.Coercion ( MCoercion(..), coVarRole, coercionKind, coercionLKind
+                         , mkCoVarCo, mkUnbranchedAxInstCo, mkUnivCo )
+import GHC.Core.DataCon ( DataCon, dataConRepType, dataConTyCon, dataConTag
+                       , dataConRepArgBinders, dataConRepArity, dataConContextFieldCount
+                       , dataConHasRetainedResult, dataConSourceArity
+                       , dataConUnivTyVars, dataConUserTyVarBinders )
+import GHC.Core.Type ( binderVar, coreFullView, isManyTy, isNativeIndexType
+                     , piResultTys, splitInvisPiTys, substTyVar )
+import GHC.Core.TyCon ( isNewTyCon, newTyConCo, tyConDataCons )
+import GHC.Core.FVs ( exprFreeVars )
+import qualified GHC.Core.Subst as Subst
+import GHC.Core.TyCo.Subst ( deepSubstCo, deepSubstTy )
+import GHC.Tc.Types.Evidence ( EvBind(..), TcEvBinds(EvBinds), isIdHsWrapper )
 import GHC.Tc.Utils.TcType
 import GHC.Core.Multiplicity
 import GHC.HsToCore.Monad
+import GHC.HsToCore.Errors.Types (DsMessage(DsRetainedPackagePatterns, DsLinearRetainedPackageRows))
 import GHC.HsToCore.Utils
-import GHC.Core ( CoreExpr )
+import GHC.Core ( Bind(NonRec), CoreExpr, Expr(Coercion, Var), splitNativeIndexedPatternEvidence )
+import GHC.Core.TyCo.Rep ( Type(DepFunTy, FunTy, ft_mult), UnivCoProvenance(PluginProv) )
+import GHC.Data.Pair ( Pair(..) )
+import GHC.Core.Utils ( applyTypeToArgs )
 import GHC.Core.Make ( mkCoreLets )
 import GHC.Utils.Misc
 import GHC.Types.Id
+import GHC.Types.Var ( isCoVar, isTyVar, updateVarType, varType )
+import GHC.Types.Var.Env ( mkInScopeSetList )
+import GHC.Types.Var.Set ( mapVarSet, nonDetStrictFoldVarSet )
 import GHC.Types.Name.Env
 import GHC.Types.FieldLabel ( flSelector )
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import Control.Monad(liftM)
+import Control.Monad(liftM, join)
+import Data.Data ( Data, cast, gmapT )
+import Data.Foldable ( find )
+import Data.List ( nub, sort )
+import Data.Maybe ( fromMaybe, isJust, isNothing )
+import Data.Typeable ( Typeable )
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
 
@@ -108,17 +129,84 @@ matchConFamily (var :| vars) ty groups@(group1 :| other_groups)
   = assertPpr (null other_groups) (ppr con1) $
     matchNewtypeCon var vars ty group1
 
+  -- See Note [Retained package equation scope].
+  -- See Note [Retained constructor equation scope].
+  | Just rows <- find needs_separate_rows groups
+  = if isManyTy (matchIdMult var) && not (matchInLinearPackage var)
+    then do { results <- mapM match_retained_row (join groups)
+            ; return (foldr1 combineMatchResults results) }
+    else putSrcSpanDsA (eqnPatLoc (NE.head rows)) $
+           failWithDs DsLinearRetainedPackageRows
+
   | otherwise
-  = do let mult = matchIdMult var
-           -- Each variable in the argument list correspond to one column in the
-           -- pattern matching equations. Its multiplicity is the context
-           -- multiplicity of the pattern. We extract that multiplicity, so that
-           -- 'matchOneconLike' knows the context multiplicity, in case it needs
-           -- to come up with new variables.
-       alts <- mapM (fmap toRealAlt . matchOneConLike vars ty mult) groups
+  = do alts <- mapM (fmap toRealAlt . matchOneConLike var vars ty . share_native_rows) groups
        return (mkDataConCase var ty alts)
   where
     ConPat { pat_con = L _ con1 } = firstPat (NE.head group1)
+
+    needs_separate_rows group@(first :| rest)
+      | null rest = False
+      | any has_native_proof group = isNothing (native_row_substs group)
+      | otherwise = has_retained_fields first && not (linear_retained_group group)
+
+    -- See Note [Sharing linear package fields].
+    linear_retained_group rows
+      | not (isManyTy (matchIdMult var))
+      , Just cons@(dc :| _) <- traverse first_index_constructor rows
+      = let family = dataConTyCon dc
+            tags = sort . map dataConTag
+        in all ((== family) . dataConTyCon) cons
+             && tags (nub (NE.toList cons)) == tags (tyConDataCons family)
+      | otherwise = False
+
+    first_index_constructor row
+      | ConPat {pat_con = L _ (RealDataCon con), pat_args = PrefixCon _ (L _ pat : _)} <- firstPat row
+      , Just _ : _ <- dataConRepArgBinders con
+      , AsPat _ _ inner <- pat
+      , ConPat{pat_con = L _ (RealDataCon index_con)} <- strip_index_parens (unLoc inner)
+      = Just index_con
+      | otherwise = Nothing
+
+    strip_index_parens (ParPat _ pat) = strip_index_parens (unLoc pat)
+    strip_index_parens pat = pat
+
+    share_native_rows rows@(first :| rest)
+      | not (null rest), Just substs <- native_row_substs rows
+      = first :| zipWithEqual rename_if_needed substs rest
+      | otherwise = rows
+
+    rename_if_needed subst row
+      | Subst.isEmptySubst subst = row
+      | otherwise = renameEquation subst row
+
+    native_row_substs rows@(first :| _)
+      | has_retained_fields first, not (matchInLinearPackage var) = Nothing
+      | otherwise = indexPatternSubsts (fmap firstPat rows)
+
+    -- Compile one equation with its own runtime index binders.
+    match_retained_row :: EquationInfoNE -> DsM (MatchResult CoreExpr)
+    match_retained_row eqn
+      = do { alt <- matchOneConLike var vars ty (eqn :| [])
+           ; return (mkDataConCase var ty (toRealAlt alt :| [])) }
+
+    -- | Detect a retained telescope in any constructor group.
+    has_retained_fields :: EquationInfoNE -> Bool
+    has_retained_fields eqn
+      | ConPat { pat_con = L _ (RealDataCon con) } <- firstPat eqn
+      = not (null (dataConRepArgBinders con))
+      | otherwise = False
+
+    -- Identify a checked native constructor pattern with its virtual proof.
+    has_native_proof :: EquationInfoNE -> Bool
+    has_native_proof eqn
+      | ConPat { pat_con = L _ (RealDataCon con)
+               , pat_con_ext = ConPatTc { cpt_tvs = tvs, cpt_dicts = dicts
+                                       , cpt_arg_tys = tys } }
+          <- firstPat eqn
+      = isJust (splitNativeIndexedPatternEvidence con dicts) || case dicts of
+          [cv] -> null tvs && isCoVar cv && isNativeIndexType (mkTyConApp (dataConTyCon con) tys)
+          _ -> False
+      | otherwise = False
 
     toRealAlt alt = case alt_pat alt of
         RealDataCon dcon -> alt{ alt_pat = dcon }
@@ -134,9 +222,10 @@ matchNewtypeCon var vars ty eqns
               (ppr var $$ ppr nt_co) $
 
     -- Push the newtype coercion into the 'MatchId' and continue with
-    -- the inner pattern.
-    match (var `castMatchId` MCo nt_co : vars) ty
-          (NE.toList (field_pat <$> eqns))
+    -- the inner pattern, scoping any retained nominal constructor proof
+    -- and branch evidence immediately after the inner field pattern.
+    do { eqns' <- traverse field_pat eqns
+       ; match (var `castMatchId` MCo nt_co : vars) ty (NE.toList eqns') }
   where
     ConPat { pat_con = L _ con1
            , pat_con_ext = ConPatTc { cpt_arg_tys = arg_tys } }
@@ -151,37 +240,34 @@ matchNewtypeCon var vars ty eqns
               (newTyConCo (dataConTyCon dc)) arg_tys []
       -- nt_co :: N arg_tys ~R# fld_ty
 
-    -- Replace the constructor pattern with its inner field pattern.
-    field_pat :: EquationInfoNE -> EquationInfoNE
+    -- Replace the constructor pattern with its inner field pattern,
+    -- binding any retained constructor coercion after the field pattern.
+    field_pat :: EquationInfoNE -> DsM EquationInfoNE
     field_pat ( EqnMatch { eqn_pat = L _ p, eqn_rest = rest })
       | ConPat
-        { pat_con_ext = _con_pat_tc
+        { pat_con_ext = ConPatTc _arg_tys tvs dicts binds wrap ordered_binds
         , pat_args    = args
         } <- p
-      = assertPpr (isTrivialConPatTc _con_pat_tc) (ppr con1) $
-        prependPats (conArgPats fld_tys args) rest
+      = assertPpr (null tvs && isIdHsWrapper wrap && null ordered_binds && all isCoVar dicts)
+                  (ppr con1 $$ ppr dicts) $
+        dsTcEvBinds binds $ \ds_binds -> do
+          let proof_binds =
+                [ NonRec cv (Coercion (mkUnivCo (PluginProv "dependent-newtype") [] (coVarRole cv) lhs rhs))
+                | cv <- dicts
+                , let Pair lhs rhs = coercionKind (mkCoVarCo cv) ]
+              all_binds = proof_binds ++ ds_binds
+              scoped_rest
+                | null all_binds = rest
+                | otherwise      = EqnScope all_binds rest
+          return (prependPats (conArgPats fld_tys args) scoped_rest)
     field_pat eqn = pprPanic "matchNewtypeCon" (ppr eqn)
-
--- | Is this 'ConPatTc' trivial, in that it contains no existentials, no
--- dictionaries or evidence bindings, only identity 'HsWrapper's, etc?
-isTrivialConPatTc :: ConPatTc -> Bool
-isTrivialConPatTc (ConPatTc _arg_tys tvs dicts binds wrap) =
-  -- NB: Use a positional pattern match in order to guarantee that all fields
-  --     will continue to be handled if new fields are added.
-  and
-    [ null tvs
-    , null dicts
-    , isEmptyTcEvBinds binds
-    , isIdHsWrapper wrap
-    ]
 
 matchPatSyn :: NonEmpty MatchId
             -> Type
             -> NonEmpty EquationInfoNE
             -> DsM (MatchResult CoreExpr)
 matchPatSyn (var :| vars) ty eqns
-  = do let mult = matchIdMult var
-       alt <- fmap toSynAlt $ matchOneConLike vars ty mult eqns
+  = do alt <- fmap toSynAlt $ matchOneConLike var vars ty eqns
        return (mkCoSynCaseMatchResult var ty alt)
   where
     toSynAlt alt = case alt_pat alt of
@@ -190,19 +276,113 @@ matchPatSyn (var :| vars) ty eqns
 
 type ConArgPats = HsConPatDetails GhcTc
 
-matchOneConLike :: [MatchId]
+
+{- Note [Retained constructor field scope]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A native index constructor has no existential variables or ordinary evidence.
+Its ConPatTc can carry one virtual branch proof in cpt_dicts. That proof can
+mention the actual runtime fields, as in n ~# 'S k. Put the fields before this
+proof in the Core alternative. Core Lint checks the field identities and the
+exact proof type. CoreToStg erases only the trailing virtual proof.
+
+Bare field patterns retain their renamed Unique values through tcPatBndr and
+selectConMatchVars. The proof therefore names the actual alternative fields.
+For an indexed GADT proof, keep the ordinary existentials and equalities first.
+Select the exact named fields, including a variable named by a signature pattern.
+Append the virtual proof after those fields.
+See Note [Retained constructor matches] in GHC.Tc.Gen.Match and Cockx and Abel
+(ICFP 2018).
+-}
+
+{- Note [Retained package equation scope]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each package equation binds its own runtime index Id. Later field types and
+the typed RHS refer to that Id. Sharing the first equation's fields with a
+later equation through ordinary let aliases does not substitute those types.
+
+A singleton group keeps all its original fields and evidence. Use one outer
+case when each retained constructor has a singleton group. This also works
+when the constructor family contains ordinary constructors.
+
+With several rows, a linear package can share its fields in the case described
+in Note [Sharing linear package fields]. Otherwise compile each equation with
+its own constructor case on the original shared scrutinee. Keep the group order
+and the source order within each group. Different constructors do not overlap.
+A singleton case in a multi-constructor family keeps its DEFAULT failure
+continuation. A failed field pattern or guard then tries the next row outside
+the current row's field scope. An earlier infallible match discards later rows.
+Each case keeps its actual retained source field Ids. selectMatchVar chooses
+ordinary fields from their checked outer pattern types. Their nested patterns
+use the usual match compiler.
+
+Re-casing the shared scrutinee does not repeat its evaluation. The fields stay
+lazy until their patterns or RHS demand them. This can generate more cases
+than field sharing. Ordinary constructor families retain their current path.
+Instantiate the constructor telescope with each selected pattern Id before
+selecting the next field. This preserves dependencies on the actual Ids.
+For a linear case, multiply each ordinary field's declared multiplicity by
+the case multiplicity. The retained index field stays unrestricted.
+Separate cases preserve Haskell's field demand and source clause order; see
+GHC Proposal #378 (§4.5 and §4.9), GHC Proposal #473, and Cockx and Abel (ICFP 2018).
+-}
+
+{- Note [Retained constructor equation scope]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Several rows can match the same native index constructor. Each row's virtual
+proof names that row's actual fields. For example, two S patterns bind distinct
+fields k1 and k2 and proofs n ~# 'S k1 and n ~# 'S k2. Ordinary constructor
+grouping shares the first row's fields and introduces evidence aliases. Those
+aliases do not substitute the runtime Ids in later proof types or RHS types.
+
+Rows can use the usual evidence aliases when their field and proof types
+agree after substitution. See Note [Sharing retained index constructor fields].
+Otherwise use the separate-row strategy from Note [Retained package equation scope].
+Compile each row with its own fields and proof. Keep source order within each
+constructor group.
+Different constructors do not overlap. Each case uses the existing DEFAULT
+failure path for other constructors. A failed later column or guard tries the
+next row. An infallible row discards later rows for the same constructor.
+
+All cases inspect the same shared scrutinee. Re-casing does not evaluate its
+fields. Later pattern columns keep their ordinary demand and failure order.
+Ordinary GADT constructors keep the existing shared-field path: the native
+index-domain predicate excludes their existentials and equality constraints.
+-}
+
+-- | Extract the source location of the leading pattern in an 'EquationInfoNE'.
+eqnPatLoc :: EquationInfoNE -> SrcSpanAnnA
+eqnPatLoc (EqnMatch { eqn_pat = p }) = getLoc p
+eqnPatLoc _                          = noAnn
+
+matchOneConLike :: MatchId
+                -> [MatchId]
                 -> Type
-                -> Mult
                 -> NonEmpty EquationInfoNE
                 -> DsM (CaseAlt ConLike)
-matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single constructor
-  = do  { let inst_tys = assert (all tcIsTcTyVar ex_tvs) $
+matchOneConLike scrut vars ty (eqn1 :| eqns)   -- All eqns for a single constructor
+  = do  { retained_vars <- case con1 of
+            RealDataCon con | not (null (dataConRepArgBinders con)) ->
+              putSrcSpanDsA (eqnPatLoc eqn1) $
+                  case args1 of
+                    PrefixCon _ pats ->
+                      let rep_ty_args
+                            | dataConHasRetainedResult con = arg_tys
+                            | let subst = zipTvSubst (dataConUnivTyVars con ++ ex_tvs)
+                                                     (arg_tys ++ mkTyVarTys tvs1)
+                            = [substTyVar subst (binderVar b) | b <- dataConUserTyVarBinders con]
+                          (_, _, fields) = splitInvisPiTys (piResultTys (dataConRepType con) rep_ty_args)
+                      in Just <$> retained_fields fields pats
+                    _ -> package_error
+            _ -> return Nothing
+        ; let inst_tys = assert (all tcIsTcTyVar ex_tvs) $
                            -- ex_tvs can only be tyvars as data types in source
                            -- Haskell cannot mention covar yet (Aug 2018).
                          assert (tvs1 `equalLength` ex_tvs) $
                          arg_tys ++ mkTyVarTys tvs1
 
-              val_arg_tys = conLikeInstOrigArgTys con1 inst_tys
+              val_arg_tys = case retained_vars of
+                Just fields -> map (\v -> Scaled (idMult v) (idType v)) fields
+                Nothing -> conLikeInstOrigArgTys con1 inst_tys
         -- dataConInstOrigArgTys takes the univ and existential tyvars
         -- and returns the types of the *value* args, which is what we want
 
@@ -213,7 +393,13 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
               match_group arg_vars arg_eqn_prs
                 = do { (wraps, eqns') <- liftM NE.unzip (mapM shift arg_eqn_prs)
                      ; let group_arg_vars = select_arg_vars arg_vars arg_eqn_prs
-                     ; match_result <- match (map mkMatchId group_arg_vars ++ vars) ty (NE.toList eqns')
+                     ; let field v = (mkMatchId v) { matchInLinearPackage = linear_package }
+                           linear_package = matchInLinearPackage scrut
+                                         || (isJust retained_vars && not (isManyTy mult))
+                           match_fields = match (map field group_arg_vars ++ vars) ty (NE.toList eqns')
+                     ; match_result <- case retained_vars of
+                         Just fields -> withRuntimeIndexTypes (map idType (fields ++ dicts1)) match_fields
+                         Nothing -> match_fields
                      ; return $ foldr1 (.) wraps <$> match_result
                      }
 
@@ -223,14 +409,39 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
                                     , pat_con_ext = ConPatTc
                                       { cpt_tvs = tvs
                                       , cpt_dicts = ds
-                                      , cpt_binds = bind }})
+                                      , cpt_binds = bind
+                                      , cpt_wrap = pat_wrap
+                                      , cpt_ordered_binds = ordered_binds }})
                     , eqn_rest = rest })
-                = do dsTcEvBinds bind $ \ds_bind ->
-                       return ( wrapBinds (tvs `zip` tvs1)
-                              . wrapBinds (ds  `zip` dicts1)
-                              . mkCoreLets ds_bind
-                              , prependPats (conArgPats val_arg_tys args) rest
-                              )
+                | not (null ordered_binds)
+                = dsTcEvBinds bind $ \early -> do
+                    row <- scope_contexts 0 fields ordered_binds
+                    return (wrap . mkCoreLets early, row)
+                | RealDataCon con <- con1
+                , Just n <- if dataConHasRetainedResult con
+                            then Just (dataConSourceArity con)
+                            else dataConContextFieldCount con
+                , (before, after) <- splitAt n fields
+                = dsHsWrapper pat_wrap $ \early_wrap ->
+                  dsTcEvBinds bind $ \ds_bind ->
+                    let remaining = prependPats after rest
+                        scoped
+                          | null ds_bind = remaining
+                          | otherwise = EqnScope ds_bind remaining
+                    in return (wrap . early_wrap, prependPats before scoped)
+                | otherwise
+                = dsTcEvBinds bind $ \ds_bind ->
+                    return (wrap . mkCoreLets ds_bind, prependPats fields rest)
+                where
+                  wrap = wrapBinds (tvs `zip` tvs1) . wrapBinds (ds `zip` dicts1)
+                  fields = conArgPats val_arg_tys args
+                  scope_contexts _ fields [] = return (prependPats fields rest)
+                  scope_contexts entered fields ((n, binds) : groups) =
+                    dsTcEvBinds binds $ \dbinds -> do
+                      let (before, after) = splitAt (n - entered) fields
+                      following <- scope_contexts n after groups
+                      let scoped = if null dbinds then following else EqnScope dbinds following
+                      return (prependPats before scoped)
               shift (_, eqn) = pprPanic "matchOneCon/shift" (ppr eqn)
         ; let scaled_arg_tys = map (scaleScaled mult) val_arg_tys
             -- The 'val_arg_tys' are taken from the data type definition, they
@@ -240,22 +451,66 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
             -- multiplicity because of the invariant that, in Core, binders in a
             -- constructor pattern must be scaled by the multiplicity of the
             -- case. See Note [Case expression invariants].
-        ; arg_vars <- selectConMatchVars scaled_arg_tys args1
+        ; arg_vars <- case retained_vars of
+            Just fields -> return fields
+            Nothing | Just _ <- indexed_proof
+                    , PrefixCon _ fields <- args1 ->
+                mapM select_indexed_field fields
+            Nothing -> selectConMatchVars scaled_arg_tys args1
                 -- Use the first equation as a source of
                 -- suggestions for the new variables
+
+        ; shared_eqns <- case (con1, retained_vars) of
+            (RealDataCon con, Just fields) -> mapM (shareRowFields con fields) eqns
+            _ -> return eqns
 
         -- Divide into sub-groups; see Note [Record patterns]
         ; let groups :: NonEmpty (NonEmpty (ConArgPats, EquationInfoNE))
               groups = NE.groupBy1 compatible_pats
-                     $ fmap (\eqn -> (con_pat_args (firstPat eqn), eqn)) (eqn1 :| eqns)
+                     $ fmap (\eqn -> (con_pat_args (firstPat eqn), eqn)) (eqn1 :| shared_eqns)
 
         ; match_results <- mapM (match_group arg_vars) groups
 
         ; return $ MkCaseAlt{ alt_pat = con1,
-                              alt_bndrs = tvs1 ++ dicts1 ++ arg_vars,
+                              alt_bndrs = case con1 of
+                                RealDataCon con
+                                  | dataConHasRetainedResult con
+                                  -> arg_vars ++ dicts1
+                                  | null tvs1, [proof] <- dicts1, isCoVar proof
+                                  , isNativeIndexType (mkTyConApp (dataConTyCon con) arg_tys)
+                                  -- See Note [Retained constructor field scope].
+                                  -> arg_vars ++ dicts1
+                                _ | Just (eqs, proof) <- indexed_proof
+                                  -> tvs1 ++ eqs ++ arg_vars ++ [proof]
+                                _ -> tvs1 ++ dicts1 ++ arg_vars,
                               alt_wrapper = wrapper1,
                               alt_result = foldr1 combineMatchResults match_results } }
   where
+    mult = matchIdMult scrut
+
+    indexed_proof
+      | RealDataCon con <- con1 = splitNativeIndexedPatternEvidence con dicts1
+      | otherwise = Nothing
+
+    -- See Note [Retained package equation scope].
+    retained_fields _ [] = return []
+    retained_fields ty (L _ pat : pats)
+      = case coreFullView ty of
+          DepFunTy _ b _ -> select (mkMultMul mult (idMult b))
+          FunTy { ft_mult = w } -> select (mkMultMul mult w)
+          _ -> package_error
+      where
+        select w = do { field <- selectMatchVar w pat
+                      ; fields <- retained_fields (applyTypeToArgs ty [Var field]) pats
+                      ; return (field : fields) }
+
+    select_indexed_field (L _ (ParPat _ pat)) = select_indexed_field pat
+    select_indexed_field (L _ (SigPat _ pat _)) = select_indexed_field pat
+    select_indexed_field (L _ pat) = selectMatchVar ManyTy pat
+
+    package_error :: DsM a
+    package_error = failWithDs DsRetainedPackagePatterns
+
     con_pat_args :: Pat GhcTc -> HsConPatDetails GhcTc
     con_pat_args (ConPat { pat_args = args }) = args
     con_pat_args p = pprPanic "matchOneConLike" (ppr p)  -- All patterns are ConPats
@@ -289,6 +544,163 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
         fld_var_env = mkNameEnv $ zipEqual fields1 arg_vars
         lookup_fld (L _ rpat) = lookupNameEnv_NF fld_var_env
                                             (idName (hsRecFieldId rpat))
+
+{- Note [Sharing linear package fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Testing the same linear package in separate cases can use its scrutinee twice
+or capture a linear field in a failure continuation. Use one outer case if
+the first retained field covers all constructors in its family. The ordinary
+matcher processes the remaining columns in order. Mark the match variables
+for the fields of a linear retained package. Keep this mark when the matcher
+introduces new columns. Report a source error if a marked column would
+need separate cases to keep its proofs in scope.
+
+Use the first row's runtime field Ids in the outer case. Replace the retained
+field Ids of each later row before matching the inner columns. The substitution
+also updates the field types, the virtual proofs and the desugared RHS. Keep the
+proof binders in their inner constructor patterns. The matcher still selects
+ordinary field aliases and scales their multiplicities in the usual way.
+-}
+
+{- Note [Trailing constructor evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The fields can supply dictionaries to the solver before the constructor's
+trailing context enters scope. A solved binding from that context can refer
+to a field dictionary. For example:
+
+  Combined :: Evidence a -> forall b. Eq b => Combined a b
+  compareFields (Combined Evidence) x y = compare x y
+
+The outer constructor case binds the stored Eq dictionary. The Evidence case
+binds Ord. Bind the solved evidence after all field patterns, before any
+following argument patterns or guards. EqnScope records this point in the
+row. Its bindings are available only after the preceding patterns match.
+
+For an ordered telescope, store one boundary and solved binding group per
+context. For example, an equality after one field can transport that
+field's dictionary. Later fields may introduce more Givens before a second
+context. Keep each group's bindings at its own boundary during zonking and
+desugaring. The Core alternative can bind all the stored dictionaries
+before the value fields.
+
+For a context after fields without a late forall, early existential binders
+are in scope during field checking. Check the fields under those skolems
+and bring in the trailing Givens in a separate implication. The pattern
+wrapper binds evidence from field checking before matching the fields.
+
+A retained result binds its nominal equality after the fields. It relates
+the public index to the retained field Id. A pattern on that field can
+supply a second equality, for example when it matches Z. Evidence that
+combines the two equalities can only enter scope after the field patterns.
+Use the same trailing scope for this evidence.
+-}
+
+-- | Rename a later row's retained fields to the fields bound by the shared case.
+shareRowFields :: DataCon -> [Id] -> EquationInfoNE -> DsM EquationInfoNE
+shareRowFields con shared row
+  | ConPat{pat_args = PrefixCon _ pats} <- firstPat row
+  = do { let columns = [(new, pat) | (Just _, new, L _ pat) <-
+                          zip3 (dataConRepArgBinders con) shared pats]
+       ; pairs <- mapM (\(new, pat) -> (, Var new) <$> selectMatchVar ManyTy pat) columns
+       ; let subst = Subst.mkOpenSubst (mkInScopeSetList shared) pairs
+       ; return (renameEquation subst row) }
+  | otherwise = pprPanic "shareRowFields: expected a prefix constructor" (ppr row)
+
+{- Note [Sharing retained index constructor fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For example, two S rows have proofs n ~# 'S k1 and n ~# 'S k2. The case binds
+one runtime predecessor. Check that replacing k2 with k1 makes the checked
+field and proof types agree. Substitute in the typed row with the same map.
+The usual evidence aliases can then use the first proof for both rows. Keep
+both rows' evidence bindings in the constructor alternative. Source field
+patterns are bare variables, so sharing a binder does not force that field.
+
+Check this condition when the ordinary matcher reaches the index column. The
+whole-index Id has already been shared by the outer package case. Earlier
+constructor alternatives have also shared their fields and scoped their proofs.
+Only admit a prefix constructor with one virtual proof and no existentials or
+result wrapper. In a linear package, the checked index constructor may have
+its own retained witness. Include that witness and its dependent payload in
+the same field substitution. Check both field types before sharing the proof.
+The index schema check admits only the supported promoted telescope.
+-}
+
+-- | Check the predicate and field types after renaming each later row's fields.
+indexPatternSubsts :: NonEmpty (Pat GhcTc) -> Maybe [Subst.Subst]
+indexPatternSubsts patterns = do
+  first :| later <- traverse fields_and_proof patterns
+  traverse (align first) later
+  where
+    fields_and_proof ConPat
+        { pat_con = L _ (RealDataCon con), pat_args = PrefixCon _ pats
+        , pat_con_ext = ConPatTc { cpt_tvs = [], cpt_dicts = [cv]
+                                , cpt_arg_tys = tys, cpt_wrap = wrapper } }
+      | isCoVar cv, isIdHsWrapper wrapper
+      , length pats == dataConRepArity con
+      , isNativeIndexType (mkTyConApp (dataConTyCon con) tys)
+      = do fields <- traverse bare_field pats
+           return (con, fields, varType cv)
+    fields_and_proof _ = Nothing
+
+    bare_field (L _ (VarPat _ (L _ v))) = Just v
+    bare_field _ = Nothing
+
+    align (first_con, fields, proof) (row_con, row_fields, row_proof)
+      | first_con == row_con, fields `equalLength` row_fields
+      , let pairs = zip row_fields fields
+            subst = Subst.mkOpenSubst (mkInScopeSetList fields)
+                       [(old, Var new) | (old, new) <- pairs, old /= new]
+      , all (same_field subst) pairs
+      , eqType (deepSubstTy subst row_proof) proof
+      = Just subst
+      | otherwise = Nothing
+
+    same_field subst (old, new) =
+      eqType (deepSubstTy subst (idType old)) (idType new)
+      && eqType (deepSubstTy subst (idMult old)) (idMult new)
+
+-- | Substitute types and evidence before compiling later pattern columns.
+renameEquation :: Subst.Subst -> EquationInfo -> EquationInfo
+renameEquation subst (EqnMatch pat rest) = EqnMatch (renamePattern subst pat) (renameEquation subst rest)
+renameEquation subst (EqnScope binds rest)
+  = EqnScope (renamePattern subst binds) (renameEquation subst rest)
+renameEquation subst (EqnDone result) = EqnDone (renameCore subst <$> result)
+
+-- | Substitute in typed pattern annotations, including evidence wrappers.
+renamePattern :: forall a. Data a => Subst.Subst -> a -> a
+renamePattern subst thing
+  | Just v <- cast thing = put (renameRowVar subst v)
+  | Just ty <- cast thing = put (deepSubstTy subst ty)
+  | Just co <- cast thing = put (deepSubstCo subst co)
+  | Just e <- cast thing = put (renameCore subst e)
+  -- The Data instances for TcEvBinds and EvBind are opaque. In a zonked
+  -- pattern, the evidence binder's type can name an earlier runtime field.
+  | Just (EvBinds binds) <- cast thing = put (EvBinds (fmap rename_bind binds))
+  | otherwise = gmapT (renamePattern subst) thing
+  where
+    put :: Typeable b => b -> a
+    put updated = fromMaybe thing (cast updated)
+
+    rename_bind bind = bind { eb_lhs = renameRowVar subst (eb_lhs bind)
+                            , eb_rhs = renamePattern subst (eb_rhs bind) }
+
+-- | Keep each variable's identity, except for a retained field being shared.
+renameRowVar :: Subst.Subst -> Var -> Var
+renameRowVar subst v
+  | isTyVar v || isCoVar v = updateVarType (deepSubstTy subst) v
+  | Just (Var new) <- Subst.lookupIdSubst_maybe subst v = new
+  | otherwise = updateIdTypeAndMult (deepSubstTy subst) v
+
+-- | Use the renamed free variables when substituting in a row's Core.
+renameCore :: Subst.Subst -> CoreExpr -> CoreExpr
+renameCore subst expr = Subst.substExpr combined expr
+  where
+    free = exprFreeVars expr
+    scope = mapVarSet (renameRowVar subst) free
+    combined = nonDetStrictFoldVarSet refresh (Subst.extendSubstInScopeSet subst scope) free
+    refresh v env
+      | isCoVar v = Subst.extendSubstWithVar env v (renameRowVar subst v)
+      | otherwise = env
 
 -----------------
 compatible_pats :: (ConArgPats,a) -> (ConArgPats,a) -> Bool

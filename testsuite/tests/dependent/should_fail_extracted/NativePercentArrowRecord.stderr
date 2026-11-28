@@ -1,0 +1,10 @@
+NativePercentArrowRecord.hs:4:10: error: [GHC-49969] [-Wunrecognised-modifiers (in -Wdefault), Werror=unrecognised-modifiers]
+    • Unrecognised modifier %M
+    • In the definition of data constructor ‘R’
+      In the data type declaration for ‘R’
+
+NativePercentArrowRecord.hs:4:10: error: [GHC-49969] [-Wunrecognised-modifiers (in -Wdefault), Werror=unrecognised-modifiers]
+    • Unrecognised modifier %M
+    • In the definition of data constructor ‘R’
+      In the data type declaration for ‘R’
+

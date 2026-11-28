@@ -1,0 +1,9 @@
+NativeStoredDictCompeting.hs:10:26: error: [GHC-83605]
+    • Constraint solving for this retained function type is not supported yet:
+      ($dPick :: StoredEvidence.Pick Bool) =>
+      foreach (x :: Bool) -> Tagged (StoredEvidence.pick @Bool $dPick x)
+    • In the expression: observe x
+      In the expression: case observe x of Tagged b -> At b
+      In a case alternative:
+          Stored _ -> case observe x of Tagged b -> At b
+

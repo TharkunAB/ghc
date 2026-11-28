@@ -112,6 +112,7 @@ import GHC.Types.Unique.DSet
 import GHC.Unit
 import GHC.Unit.Env
 import GHC.Unit.Finder
+import GHC.Unit.Module.ModDetails ( md_types )
 import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.Status
@@ -253,7 +254,12 @@ compileOne' mHscMessage
    (iface, linkable) <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
    -- See Note [ModDetails and --make mode]
    details <- initModDetails plugin_hsc_env iface
-   linkable' <- initWholeCoreBindings plugin_hsc_env iface details linkable
+   linkable0 <- initWholeCoreBindings plugin_hsc_env iface details linkable
+   linkable' <- case homeMod_bytecode linkable0 of
+     Just _  -> pure linkable0
+     Nothing -> do
+       mb_bc <- loadIfaceByteCodeLazy plugin_hsc_env iface location (md_types details)
+       pure $! linkable0 { homeMod_bytecode = mb_bc }
    return $! HomeModInfo iface details linkable'
 
  where lcl_dflags  = ms_hspp_opts summary

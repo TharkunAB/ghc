@@ -16,7 +16,7 @@ module GHC.Tc.Types.ErrCtxt
 import GHC.Prelude
 import {-# SOURCE #-} GHC.Hs.Expr (SplicePointName, HsMatchContextRn, HsStmtContextRn)
 import {-# SOURCE #-} GHC.Hs.Expr () -- for outputable instances
-import GHC.Hs.Type () -- for outputable instances
+import GHC.Hs.Type (HsAppTypeSource)
 import GHC.Hs.Extension
 
 import GHC.Parser.Annotation ( LocatedN, SrcSpanAnnA )
@@ -28,7 +28,7 @@ import GHC.Tc.Utils.TcType   ( TcType, TcTyCon, ExpType )
 import GHC.Types.Basic       ( TyConFlavour )
 import GHC.Types.Name        ( Name )
 import GHC.Types.SrcLoc      ( SrcSpan, noSrcSpan )
-import GHC.Types.Var         ( Id, TyCoVar )
+import GHC.Types.Var         ( Id, TyCoVar, ForAllTyFlag )
 
 import GHC.Unit.Types ( Module, InstantiatedModule, ModuleName )
 
@@ -305,7 +305,7 @@ data HsCtxt
   -- | In a record field.
   | FieldCtxt !FieldLabelString
   -- | In a type.
-  | TypeCtxt !(LHsType GhcRn)
+  | TypeCtxt !(Maybe HsAppTypeSource) !(LHsType GhcRn)
   -- | In a kind.
   | KindCtxt !(LHsKind GhcRn)
   -- | In an ambiguity check.
@@ -376,6 +376,9 @@ data HsCtxt
   | MergeSignaturesCtxt !UnitState !ModuleName ![InstantiatedModule]
   -- | While checking that a module implements a Backpack signature.
   | CheckImplementsCtxt !UnitState !Module !InstantiatedModule
+  -- | A declaration consumes a synonym's unmatchable arrow or forall.
+  | DeclKindSynonymCtxt !Name !(Maybe ForAllTyFlag)
+                       !Bool -- ^ True for a synonym defined in this module
 
 
 isHsCtxtLandmark :: HsCtxt -> Bool

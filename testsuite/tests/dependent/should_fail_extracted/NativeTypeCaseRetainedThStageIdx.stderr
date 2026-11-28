@@ -1,0 +1,5 @@
+NativeTypeCaseRetainedThStageIdx.hs:4:44: error: [GHC-28914]
+    • Level error:
+      ‘flag’ is used at level -1 but it is bound at level 0
+    • In the untyped splice: $(if flag then [t| Int |] else [t| Int |])
+

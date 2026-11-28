@@ -130,6 +130,7 @@ addTicksToBinds logger cfg
                                                              GeneratedSrcSpan{} -> Nothing
                                                              UnhelpfulSpan{} -> Nothing)
                                                 tyCons
+                      , insideIndex  = False
                       , density      = mkDensity tickish $ ticks_profAuto cfg
                       , this_mod     = mod
                       , tickishType  = tickish
@@ -481,6 +482,21 @@ addTickLHsExpr e@(L pos e0) = do
                   $ addTickHsExpr e0
    dont_tick_it = addTickLHsExprNever e
 
+-- | Record the free variables of an index without adding a breakpoint to it.
+-- See Note [Breakpoints in retained operands].
+addTickIndex :: LHsExpr GhcTc -> TM (LHsExpr GhcTc)
+addTickIndex = withEnv (\env -> env { insideIndex = True }) . addTickLHsExpr
+
+{- Note [Breakpoints in retained operands]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In fill (S n), Core checks the runtime operand against the index S n.
+A breakpoint inside that operand would change the expression used to
+recover the index. The same applies to the scrutinee of a checked opaque
+call case. Keep traversing these expressions to record their free variables
+for surrounding breakpoints. The containing application or case and the
+definitions of the called functions retain their ordinary breakpoint sites.
+-}
+
 -- Add a tick to an expression which is the RHS of an equation or a binding.
 -- We always consider these to be breakpoints, unless the expression is a 'let'
 -- (because the body will definitely have a tick somewhere).  ToDo: perhaps
@@ -546,7 +562,12 @@ isGoodBreakExpr e = isCallSite e
 isCallSite :: HsExpr GhcTc -> Bool
 isCallSite HsApp{}     = True
 isCallSite HsAppType{} = True
+isCallSite HsAppRetained{} = True
 isCallSite HsCase{}    = True
+isCallSite (XExpr NativeExistsPack{}) = True
+isCallSite (XExpr NativeExistsUnpack{}) = True
+isCallSite (XExpr NativeCaseAlias{}) = True
+isCallSite (XExpr NativeLetAlias{}) = True
 isCallSite (XExpr (ExpandedThingTc (HSE _ e)))
   = isCallSite (unLoc e)
 
@@ -595,6 +616,8 @@ addTickHsExpr (HsApp x e1 e2)          = liftM2 (HsApp x) (addTickLHsExprNever e
 addTickHsExpr (HsAppType x e ty) = do
         e' <- addTickLHsExprNever e
         return (HsAppType x e' ty)
+addTickHsExpr (HsAppRetained info fun arg)
+  = liftM2 (HsAppRetained info) (addTickLHsExprNever fun) (addTickIndex arg)
 addTickHsExpr (OpApp fix e1 e2 e3) =
         liftM4 OpApp
                 (return fix)
@@ -695,6 +718,21 @@ addTickHsExpr (XExpr (WrapExpr w e)) =
         liftM (XExpr . WrapExpr w) $
               (addTickHsExpr e)        -- Explicitly no tick on inside
 addTickHsExpr (XExpr (ExpandedThingTc hse)) = addTickHsExpanded hse
+addTickHsExpr (XExpr (NativeExistsPack schema witness payload)) =
+  XExpr . NativeExistsPack schema witness <$> addTickLHsExpr payload
+addTickHsExpr (XExpr (NativeExistsUnpack witness payload result_ty package body))
+  = do { package' <- addTickLHsExpr package
+       ; body' <- bindNativeCaseIds [payload] (addTickLHsExpr body)
+       ; return (XExpr (NativeExistsUnpack witness payload result_ty package' body')) }
+addTickHsExpr (XExpr (NativeCaseAlias scrut value proof result_ty body))
+  = do { scrut' <- addTickIndex scrut
+       ; body' <- bindNativeCaseIds [value, proof] (addTickLHsExpr body)
+       ; return (XExpr (NativeCaseAlias scrut' value proof result_ty body')) }
+
+addTickHsExpr (XExpr (NativeLetAlias rhs canonical value proof result_ty body))
+  = do { rhs' <- addTickLHsExpr rhs
+       ; body' <- bindNativeCaseIds [value, proof] (addTickLHsExpr body)
+       ; return (XExpr (NativeLetAlias rhs' canonical value proof result_ty body')) }
 
 addTickHsExpr e@(XExpr (ConLikeTc {})) = return e
   -- We used to do a freeVar on a pat-syn builder, but actually
@@ -1147,6 +1185,7 @@ data TickTransEnv = TTE { fileName     :: FastString
                         , inlines      :: VarSet
                         , declPath     :: [String]
                         , inScope      :: VarSet
+                        , insideIndex  :: !Bool -- See Note [Breakpoints in retained operands]
                         , blackList    :: Set RealSrcSpan
                         , this_mod     :: Module
                         , tickishType  :: TickishType
@@ -1256,9 +1295,6 @@ addPathEntry nm = withEnv (\ env -> env { declPath = declPath env ++ [nm] })
 getPathEntry :: TM [String]
 getPathEntry = declPath `liftM` getEnv
 
-getFileName :: TM FastString
-getFileName = fileName `liftM` getEnv
-
 isGoodSrcSpan' :: SrcSpan -> Bool
 isGoodSrcSpan' pos@(RealSrcSpan _ _) = srcSpanStart pos /= srcSpanEnd pos
 isGoodSrcSpan' UnhelpfulSpan{} = False
@@ -1266,12 +1302,14 @@ isGoodSrcSpan' GeneratedSrcSpan{} = False
 
 isGoodTickSrcSpan :: SrcSpan -> TM Bool
 isGoodTickSrcSpan pos = do
-  file_name <- getFileName
-  tickish <- tickishType `liftM` getEnv
+  env <- getEnv
+  let file_name = fileName env
+      tickish = tickishType env
   let need_same_file = tickSameFileOnly tickish
       same_file      = Just file_name == srcSpanFileName_maybe pos
   isBL <- isBlackListed pos
-  return (isGoodSrcSpan' pos && not isBL && (not need_same_file || same_file))
+  return (not (tickish == Breakpoints && insideIndex env)
+          && isGoodSrcSpan' pos && not isBL && (not need_same_file || same_file))
 
 ifGoodTickSrcSpan :: SrcSpan -> TM a -> TM a -> TM a
 ifGoodTickSrcSpan pos then_code else_code = do
@@ -1285,6 +1323,13 @@ bindLocals from (TM m) = TM $ \env st ->
   where with_bnds e = e{ inScope = inScope e `extendVarSetList` new_bnds
                        , recSelBinds = recSelBinds e `plusVarEnv` collectFldBinds from }
         new_bnds = collectBinds from
+
+-- | Scope the generated case binders without inventing source patterns.
+-- See Note [Checked opaque case alias] in GHC.Hs.Expr.
+bindNativeCaseIds :: [Id] -> TM a -> TM a
+bindNativeCaseIds ids (TM m) = TM $ \env st ->
+  case m (env { inScope = inScope env `extendVarSetList` ids }) st of
+    (r, fv, st') -> (r, fv `delListFromOccEnv` map (nameOccName . idName) ids, st')
 
 withBlackListed :: SrcSpan -> TM a -> TM a
 withBlackListed (RealSrcSpan ss _) = withEnv (\ env -> env { blackList = Set.insert ss (blackList env) })
@@ -1495,6 +1540,7 @@ instance CollectFldBinders (Pat GhcTc) where
     go sels (SumPat _ (L _ p) _ _)  = go sels p
     go sels (XPat (CoPat _ p _)) = go sels p
     go sels (XPat (ExpansionPat _ p)) = go sels p
+    go sels (XPat (NativeExistsPat _ _ _ _ p)) = go sels p
     go sels (ListPat _ ps) = plusVarEnvList (map (go sels . unLoc) ps)
     go sels (TuplePat _ ps _) = plusVarEnvList (map (go sels . unLoc) ps)
     go sels (ModifiedPat _ _ (L _ p)) = go sels p

@@ -76,3 +76,222 @@ test('T15076', normal, compile_fail, [''])
 test('T15076b', normal, compile_fail, [''])
 test('T17687', normal, compile_fail, [''])
 test('T18271', normal, compile_fail, [''])
+test('NativeSourceTableWrong',
+     extra_files(['../should_compile/ClosedTableLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeSourceTableWrong', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeIndexedListContents',
+     extra_files(['IndexedPrefix.hs']),
+     multimod_compile_fail, ['NativeIndexedListContents', '-v0'])
+test('NativeSourceTablePartial', normal, compile_fail, [''])
+test('NativeListBoundaryPartial',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeListBoundaryPartial', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeListIndexDiagnostics',
+     extra_files(['../should_compile/PackedVecLibrary.hs',
+                  'ParameterizedIndexLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeListIndexDiagnostics', '-v0 -fwrite-source-equations'])
+test('NativeSourceFieldCoverage', normal, compile_fail, [''])
+test('NativeSourceLengthRecursion', normal, compile_fail, [''])
+test('NativeSourcePlusRecursion', normal, compile, [''])
+test('NativeSourceProductRecursion',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeSourceProductRecursion', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeSourceProductRule',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeSourceProductRule', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeLetMethodRule',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeLetMethodRule', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeSourceLengthFamily', req_th, compile_fail, [''])
+test('NativeOpenTermLimit', normal, compile_fail, [''])
+retry_chars = extra_files(['RetryCharacters.hs'])
+test('NativeOpenRetryWrong', [req_interp, req_rts_linker, only_ways(['normal']), retry_chars],
+     multimod_compile_fail,
+     ['NativeOpenRetryWrong', '-v0 -fdefer-type-errors -Wno-partial-type-signatures ' + config.ghc_th_way_flags])
+test('NativeOpenRetryUnknown', [normal, retry_chars], multimod_compile_fail,
+     ['NativeOpenRetryUnknown', '-v0 -fdefer-type-errors -Wno-partial-type-signatures'])
+test('NativeOpenRetryGiven', [normal, retry_chars], multimod_compile_fail,
+     ['NativeOpenRetryGiven', '-v0 -Wno-partial-type-signatures'])
+test('NativeOpenRetryNoGen', [normal, retry_chars], multimod_compile_fail,
+     ['NativeOpenRetryNoGen', '-v0 -Wno-partial-type-signatures'])
+test('NativeOpenRetrySafe', [normal, retry_chars], multimod_compile_fail,
+     ['NativeOpenRetrySafe', '-v0 -Wno-partial-type-signatures'])
+test('NativeOpenRetryQuote', [req_th, retry_chars], multimod_compile_fail,
+     ['NativeOpenRetryQuote', '-v0 -Wno-partial-type-signatures'])
+test('NativeClosedEvalSafe',
+     extra_files(['ClosedLengthProducer.hs']),
+     multimod_compile_fail, ['NativeClosedEvalSafe', '-v0'])
+test('NativeClosedCharRigid', normal, compile_fail, [''])
+test('NativeClosedCharResult', normal, compile_fail, [''])
+test('NativeClosedCharWildcard', normal, compile_fail, [''])
+test('NativeClosedCharWrong', [req_interp, req_rts_linker, only_ways(['normal'])],
+     compile_fail, [config.ghc_th_way_flags])
+test('NativeClosedListsWrong',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs'])],
+     multimod_compile_fail, ['NativeClosedListsWrong', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedListsBottom',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs'])],
+     multimod_compile_fail, ['NativeClosedListsBottom', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedSourceMixed', normal, compile_fail, [''])
+for name in ['NativeClosedSourceAmbiguous', 'NativeClosedLengthNoCast', 'NativeClosedResultDictionary']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal'])],
+         compile_fail, [config.ghc_th_way_flags])
+test('NativeClosedComputedEmpty',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs'])],
+     multimod_compile_fail, ['NativeClosedComputedEmpty', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedNestedKind',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs'])],
+     multimod_compile_fail, ['NativeClosedNestedKind', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedNestedResultAmbiguous',
+     [req_interp, req_rts_linker, only_ways(['normal'])],
+     compile_fail, [config.ghc_th_way_flags])
+for name in ['NativeClosedNestedResultDictionary', 'NativeClosedNestedResultNoCast']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['../should_run/NativeClosedSumLib.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedNestedMissing',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs', '../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail, ['NativeClosedNestedMissing', '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedCompoundListBottom', 'NativeClosedCompoundListUnsupported',
+             'NativeClosedConstructorAmbiguous', 'NativeClosedConstructorEvidence']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['../should_run/NativeClosedCompoundListsLib.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedEnumAbstract', 'NativeClosedEnumPartial', 'NativeClosedEnumField',
+             'NativeClosedEnumOperand', 'NativeClosedExpanding']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['../should_run/NativeClosedEnumA.hs'])],
+         multimod_compile_fail, [name, '-O1 -v0 ' + config.ghc_th_way_flags])
+test('NativeClosedEnumKind',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedEnumA.hs', '../should_run/NativeClosedEnumB.hs'])],
+     multimod_compile_fail, ['NativeClosedEnumKind', '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedLazyParcelDemand', 'NativeClosedLazyParcelEscape', 'NativeClosedLazyParcelKind']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['LazyParcel.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedPresentBottom', 'NativeClosedUnsupportedAlternative', 'NativeClosedOtherEither']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['../should_run/NativeClosedChoiceLib.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedIndexedContext',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['NativeClosedIndexedContextLib.hs'])],
+     multimod_compile_fail, ['NativeClosedIndexedContext', '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedIndexedVecEmpty', 'NativeClosedIndexHidden', 'NativeClosedIndexFamily',
+             'NativeClosedSomeVecAmbiguous']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['NativeClosedIndexFailures.hs',
+                             'IndexedVec.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedSomeVecIndexVisibility', 'NativeClosedWitnessMismatch',
+             'NativeClosedWitnessMissing']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['NativeClosedWitnessFailures.hs'] +
+                            ['IndexedVec.hs', 'ExistentialVec.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+for name in ['NativeClosedIndexedWrongKind', 'NativeClosedIndexedWrongValue', 'NativeClosedIndexedPartial']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal']),
+                extra_files(['IndexedMark.hs'])],
+         multimod_compile_fail, [name, '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedWrongAlternative', [req_interp, req_rts_linker, only_ways(['normal'])],
+     compile_fail, [config.ghc_th_way_flags])
+test('NativeClosedSaturatedKinds',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs'])],
+     multimod_compile_fail, ['NativeClosedSaturatedKinds', '-v0 ' + config.ghc_th_way_flags])
+for test_name in ['NativeClosedSaturatedUnder', 'NativeClosedSaturatedOver']:
+    test(test_name, [req_interp, req_rts_linker, only_ways(['normal'])],
+         compile_fail, [config.ghc_th_way_flags])
+test('NativeClosedSaturatedMissing',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs', '../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail, ['NativeClosedSaturatedMissing', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedSaturatedAmbiguous',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail, ['NativeClosedSaturatedAmbiguous', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedNestedStrict',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedListsLib.hs'])],
+     multimod_compile_fail, ['NativeClosedNestedStrict', '-v0 ' + config.ghc_th_way_flags])
+test('NativeSplitResult',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail, ['NativeSplitResult', '-v0 -fomit-interface-pragmas'])
+test('NativeSourceLengthEmpty',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeSourceLengthEmpty', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeTypeNumeralWrong',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeTypeNumeralWrong', '-v0 -fomit-interface-pragmas -fno-write-if-simplified-core'])
+test('NativeMethodGiven',
+     extra_files(['../should_compile/PackedVecLibrary.hs']),
+     multimod_compile_fail,
+     ['NativeMethodGiven', '-v0 -fdefer-type-errors -Wno-simplifiable-class-constraints -fomit-interface-pragmas'])
+test('NativeClosedSumMissing',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail,
+     ['NativeClosedSumMissing', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedSumLocal',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail,
+     ['NativeClosedSumLocal', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedSumHidden',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail,
+     ['NativeClosedSumHidden', '-v0 ' + config.ghc_th_way_flags])
+test('NativeClosedSumAmbiguous',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedSumLib.hs'])],
+     multimod_compile_fail,
+     ['NativeClosedSumAmbiguous', '-v0 ' + config.ghc_th_way_flags])
+
+for name in ['NativeClosedComputedSiblingsAmbiguous', 'NativeClosedComputedSiblingsMismatch']:
+    test(name, [req_interp, req_rts_linker, only_ways(['normal'])],
+         compile_fail, [config.ghc_th_way_flags])
+
+test('NativeClosedCallbackKinds',
+     [req_interp, req_rts_linker, only_ways(['normal']),
+      extra_files(['../should_run/NativeClosedCallbackLib.hs'])],
+     multimod_compile_fail, ['NativeClosedCallbackKinds', '-v0 ' + config.ghc_th_way_flags])
+
+test('NativePercentArrowQuoteUnknown', [req_th, only_ways(['normal'])],
+     compile_fail, ['-fdiagnostics-show-caret'])
+
+test('NativeTypeCaseRetainedReify', [req_th, only_ways(['normal'])],
+     compile_fail, ['-fdiagnostics-show-caret ' + config.ghc_th_way_flags])
+test('NativeNestedSumCaptureWrong', normal, compile_fail, [''])
+test('NativeIrredIndexEvidence', normal, compile_fail, [''])
+test('NativeFamilyIndexEvidence', normal, compile_fail, [''])
+test('NativeRetainedSumInference', normal, compile_fail, [''])
+test('NativeIndexOperandFamily', normal, compile_fail, [''])
+test('NativeExprSigWrongReceiver', normal, compile_fail, [''])
+test('NativeRetainedSecondColumn', normal, compile_fail, [''])
+test('NativeRetainedSecondGuard', normal, compile_fail, ['-Werror=incomplete-patterns'])
+test('NativeRetainedTypeDomain', normal, compile, [''])
+test('NativeRetainedTypeWitnessMismatch', normal, compile_fail, [''])
+test('NativeRetainedTypeOperandContext', normal, compile_fail, [''])
+test('NativeRetainedTypeWitnessSynthesis', normal, compile_fail, [''])
+test('NativeNestedSumRecursiveAlias', normal, compile_fail, [''])
+test('NativeNestedSumFamilyReturn', normal, compile_fail, [''])
+test('DependentHoleFits', normal, compile_fail, ['-fno-show-provenance-of-hole-fits -frefinement-level-hole-fits=2 -fabstract-refinement-hole-fits'])
+test('RetainedAppHoles', normal, compile_fail, ['-fno-show-provenance-of-hole-fits -dsuppress-uniques'])
+test('NativeCalledHoleNoPanic', normal, compile_fail, ['-fno-show-valid-hole-fits'])
+test('NativeHoleLaterSignedFit', normal, compile_fail, ['-fno-show-provenance-of-hole-fits'])
+test('NativeEarlyHoleLaterSignedFit', normal, compile_fail, ['-fno-show-provenance-of-hole-fits'])

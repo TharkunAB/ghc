@@ -1,0 +1,15 @@
+NativeKnownPairRejects.hs:8:20: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: Payload True
+        Actual: Payload False
+    • In the second argument of ‘Pair’, namely ‘(No 9)’
+      In the expression: Pair True (No 9)
+      In an equation for ‘wrong’: wrong = Pair True (No 9)
+
+NativeKnownPairRejects.hs:11:15: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      forall a (p :: a %GHC.Internal.Types.U -> *).
+      foreach (x :: a) -> p x -> Sigma a p
+    • In the expression: Pair True (Yes 1)
+      In an equation for ‘independent’: independent = Pair True (Yes 1)
+

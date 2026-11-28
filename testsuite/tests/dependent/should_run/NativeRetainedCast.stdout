@@ -1,0 +1,14 @@
+([7,7],[7,7],[7,7])
+worker bottom: forced
+"eta function stays lazy"
+worker bottom: forced
+proof bottom: forced
+worker bottom: forced
+length bottom: forced
+([7,7],[7,7],[42,42])
+missing worker
+demanded token
+(True,True)
+True
+(True,True,True)
+(41,42,43,44)

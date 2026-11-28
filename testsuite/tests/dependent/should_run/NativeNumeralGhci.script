@@ -1,0 +1,40 @@
+:set -fbyte-code -O0 -fomit-interface-pragmas -fno-write-if-simplified-core
+:load *PackedVecLibrary.hs
+:seti -XDataKinds -XDependentTypes -XListTuplePuns -XTypeOperators -XTypeFamilies -XNoStarIsType
+let { fill :: foreach (n :: Nat) -> Vec Bool (n + 1); fill n = replicateNative (n + 1) True } in print (toList (fill 2))
+import Data.Proxy
+import GHC.TypeNats.Experimental (FromNatural)
+data Tone = Blue
+type instance FromNatural Tone n = 'Blue
+let witness :: Proxy (3 :: Tone); witness = Proxy
+case witness of Proxy -> putStrLn "prompt numeral"
+import Data.IORef
+let fill :: foreach (n :: Nat) -> Vec Bool (1 + n); fill n = replicateNative (1 + n) True
+ref <- newIORef (2 :: Nat)
+do { n <- readIORef ref; print (toList (fill n)) }
+let previous = toList (fill 1)
+:{
+fill :: foreach (n :: Nat) -> Vec Bool (1 + n)
+fill n = replicateNative (1 + n) False
+:}
+print (previous, toList (fill 1))
+:{
+keep :: foreach (n :: Nat) -> Vec Bool n -> Int
+keep _ _ = 42
+:}
+do { r <- newIORef (error "forced index" :: Nat); n <- readIORef r; print (keep n (replicateNative n False)) }
+:break PackedVecLibrary.appendNative
+do { n <- readIORef ref; m <- readIORef ref; print (toList (appendNative n m (replicateNative n True) (replicateNative m False))) }
+:type (xs, ys, _result)
+:delete *
+:continue
+let reserve :: foreach (r :: Nat) -> foreach (c :: Nat) -> Vec Bool (1 + r * c); reserve r c = replicateNative (1 + r * c) True
+print (length (toList (reserve 2 3)))
+let named :: foreach (r :: Nat) -> foreach (c :: Nat) -> Vec Bool (1 + r * c); named r c = let cells = r * c in replicateNative (1 + cells) True
+print (toList (named 0 8))
+do { r <- newIORef (error "forced product" :: Nat); n <- readIORef r; print (take 1 (toList (named n 2))) }
+let signed :: foreach (r :: Nat) -> foreach (c :: Nat) -> Vec Bool (1 + r * c); signed r c = let { size, area :: Nat; size = 1 + area; area = r * c } in replicateNative size True
+print (length (toList (signed 2 3)))
+let localFirst :: Vec a (1 + n) -> a; localFirst (VCons x _) = x
+let prefixHead :: foreach (n :: Nat) -> Char; prefixHead n = let { count :: Nat; count = 1 + n } in localFirst (replicateNative count 'p')
+do { ref <- newIORef (error "forced tail length" :: Nat); n <- readIORef ref; print (prefixHead n) }

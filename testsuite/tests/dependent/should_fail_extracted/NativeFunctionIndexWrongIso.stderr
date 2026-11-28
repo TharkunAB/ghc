@@ -1,0 +1,70 @@
+NativeFunctionIndexWrongIso.hs:9:55: error: [GHC-83865]
+    • Couldn't match expected type: foreach (x :: a)
+                                    -> to (from x) :~: x
+                  with actual type: foreach (x :: a) -> from (to x) :~: x
+    • In the third argument of ‘MkIso’, namely ‘left’
+      In the expression: MkIso from to left right
+      In an equation for ‘wrongField’:
+          wrongField (MkIso to from left right) = MkIso from to left right
+    • Relevant bindings include
+        right :: foreach (y :: a) -> to (from y) :~: y
+          (bound at NativeFunctionIndexWrongIso.hs:9:32)
+        left :: foreach (x :: a) -> from (to x) :~: x
+          (bound at NativeFunctionIndexWrongIso.hs:9:27)
+        from :: a -> a (bound at NativeFunctionIndexWrongIso.hs:9:22)
+        to :: a -> a (bound at NativeFunctionIndexWrongIso.hs:9:19)
+        wrongField :: Iso a a -> Iso a a
+          (bound at NativeFunctionIndexWrongIso.hs:9:1)
+
+NativeFunctionIndexWrongIso.hs:9:60: error: [GHC-83865]
+    • Couldn't match expected type: foreach (y :: a)
+                                    -> from (to y) :~: y
+                  with actual type: foreach (y :: a) -> to (from y) :~: y
+    • In the fourth argument of ‘MkIso’, namely ‘right’
+      In the expression: MkIso from to left right
+      In an equation for ‘wrongField’:
+          wrongField (MkIso to from left right) = MkIso from to left right
+    • Relevant bindings include
+        right :: foreach (y :: a) -> to (from y) :~: y
+          (bound at NativeFunctionIndexWrongIso.hs:9:32)
+        left :: foreach (x :: a) -> from (to x) :~: x
+          (bound at NativeFunctionIndexWrongIso.hs:9:27)
+        from :: a -> a (bound at NativeFunctionIndexWrongIso.hs:9:22)
+        to :: a -> a (bound at NativeFunctionIndexWrongIso.hs:9:19)
+        wrongField :: Iso a a -> Iso a a
+          (bound at NativeFunctionIndexWrongIso.hs:9:1)
+
+NativeFunctionIndexWrongIso.hs:12:20: error: [GHC-83865]
+    • Couldn't match type ‘x’ with ‘True’
+      Expected: identity (identity x) :~: True
+        Actual: identity (identity x) :~: identity (identity x)
+    • In the expression: Refl
+      In an equation for ‘wrongRoundTrip’: wrongRoundTrip _ = Refl
+
+NativeFunctionIndexWrongIso.hs:26:56: error: [GHC-83865]
+    • Couldn't match type: foreach (x :: a) -> g (k (h (f x))) :~: x
+                     with: foreach (y :: a) -> h (f (g (k y))) :~: y
+      Expected: foreach (y :: a) -> (.) h f ((.) g k y) :~: y
+        Actual: foreach (x :: a) -> g (k (h (f x))) :~: x
+    • In the fourth argument of ‘MkIso’, namely
+        ‘(composeLeft f g h k gf kh)’
+      In the expression:
+        MkIso
+          (h . f) (g . k) (composeLeft f g h k gf kh)
+          (composeLeft f g h k gf kh)
+      In an equation for ‘wrongComposition’:
+          wrongComposition (MkIso f g gf _) (MkIso h k kh _)
+            = MkIso
+                (h . f) (g . k) (composeLeft f g h k gf kh)
+                (composeLeft f g h k gf kh)
+    • Relevant bindings include
+        kh :: foreach (x :: a) -> k (h x) :~: x
+          (bound at NativeFunctionIndexWrongIso.hs:25:46)
+        k :: a -> a (bound at NativeFunctionIndexWrongIso.hs:25:44)
+        h :: a -> a (bound at NativeFunctionIndexWrongIso.hs:25:42)
+        gf :: foreach (x :: a) -> g (f x) :~: x
+          (bound at NativeFunctionIndexWrongIso.hs:25:29)
+        g :: a -> a (bound at NativeFunctionIndexWrongIso.hs:25:27)
+        f :: a -> a (bound at NativeFunctionIndexWrongIso.hs:25:25)
+        (Some bindings suppressed; use -fmax-relevant-binds=N or -fno-max-relevant-binds)
+

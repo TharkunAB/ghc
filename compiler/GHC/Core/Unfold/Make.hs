@@ -13,6 +13,7 @@ module GHC.Core.Unfold.Make
    , mkInlinableUnfolding
    , mkWrapperUnfolding
    , mkCompulsoryUnfolding, mkCompulsoryUnfolding'
+   , mkRetainedDefaultUnfolding
    , mkDFunUnfolding
    , mkDataConUnfolding
    , specUnfolding
@@ -23,9 +24,10 @@ where
 import GHC.Prelude
 import GHC.Core
 import GHC.Core.Unfold
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
+import GHC.Core.Opt.OccurAnal ( SimplCoreMode(..), occurAnalyseExpr )
 import GHC.Core.Opt.Arity   ( manifestArity )
 import GHC.Core.DataCon
+import GHC.Core.Dependent ( hasNativeDependentUnfolding )
 import GHC.Core.Utils
 import GHC.Types.Basic
 import GHC.Types.Id
@@ -67,8 +69,15 @@ mkCompulsoryUnfolding' opts expr = mkCompulsoryUnfolding (simpleOptExpr opts exp
 
 -- | Used for things that absolutely must be unfolded
 mkCompulsoryUnfolding :: CoreExpr -> Unfolding
-mkCompulsoryUnfolding expr
-  = mkCoreUnfolding CompulsorySrc True
+mkCompulsoryUnfolding = mkCompulsoryUnfoldingWithSource CompulsorySrc
+
+-- | Construct the compulsory template for a checked retained default method.
+mkRetainedDefaultUnfolding :: CoreExpr -> Unfolding
+mkRetainedDefaultUnfolding = mkCompulsoryUnfoldingWithSource RetainedDefaultSrc . simpleOptNativeExpr
+
+mkCompulsoryUnfoldingWithSource :: UnfoldingSource -> CoreExpr -> Unfolding
+mkCompulsoryUnfoldingWithSource src expr
+  = mkCoreUnfolding src True
                     expr Nothing
                     (UnfWhen { ug_arity = 0    -- Arity of unfolding doesn't matter
                              , ug_unsat_ok = unSaturatedOk, ug_boring_ok = boringCxtOk })
@@ -113,28 +122,39 @@ mkDataConUnfolding expr
             --    \@a p q. K @a <coercion> p q
             -- and then we definitely want to inline it #25713
 
-mkWrapperUnfolding :: SimpleOpts -> CoreExpr -> Arity -> Unfolding
+mkWrapperUnfolding :: SimplCoreMode -> SimpleOpts -> UnfoldingSource -> CoreExpr -> Arity -> Unfolding
 -- Make the unfolding for the wrapper in a worker/wrapper split
 -- after demand/CPR analysis
-mkWrapperUnfolding opts expr arity
-  = mkCoreUnfolding StableSystemSrc True
-                    (simpleOptExpr opts expr) Nothing
+mkWrapperUnfolding mode opts src expr arity
+  = mkCoreUnfolding src True
+                    (simpleOptWwTemplate mode opts expr) Nothing
                     (UnfWhen { ug_arity     = arity
                              , ug_unsat_ok  = unSaturatedOk
                              , ug_boring_ok = boringCxtNotOk })
 
-mkWorkerUnfolding :: SimpleOpts -> (CoreExpr -> CoreExpr) -> Unfolding -> Unfolding
+mkWorkerUnfolding :: SimplCoreMode -> SimpleOpts -> (CoreExpr -> CoreExpr) -> Unfolding -> Unfolding
 -- See Note [Worker/wrapper for INLINABLE functions] in GHC.Core.Opt.WorkWrap
-mkWorkerUnfolding opts work_fn
+mkWorkerUnfolding mode opts work_fn
                   (CoreUnfolding { uf_src = src, uf_tmpl = tmpl
                                  , uf_is_top = top_lvl })
   | isStableSource src
   = mkCoreUnfolding src top_lvl new_tmpl Nothing guidance
   where
-    new_tmpl = simpleOptExpr opts (work_fn tmpl)
+    new_tmpl = simpleOptWwTemplate mode opts (work_fn tmpl)
     guidance = calcUnfoldingGuidance (so_uf_opts opts) False False new_tmpl
 
-mkWorkerUnfolding _ _ _ = noUnfolding
+mkWorkerUnfolding _ _ _ _ = noUnfolding
+
+simpleOptWwTemplate :: SimplCoreMode -> SimpleOpts -> CoreExpr -> CoreExpr
+simpleOptWwTemplate RetainedCore _ = simpleOptNativeExpr
+simpleOptWwTemplate OrdinaryCore opts = simpleOptExpr opts
+
+-- | Simplify an optional template in the mode required by its contents.
+-- See Note [Written retained unfolding pragmas] in GHC.HsToCore.Binds.
+simpleOptUnfolding :: SimpleOpts -> CoreExpr -> CoreExpr
+simpleOptUnfolding opts expr
+  | hasNativeDependentUnfolding expr = simpleOptNativeExpr expr
+  | otherwise                       = simpleOptExpr opts expr
 
 -- | Make an INLINE unfolding that may be used unsaturated
 -- (ug_unsat_ok = unSaturatedOk) and that is reported as having its
@@ -146,7 +166,7 @@ mkInlineUnfoldingNoArity opts src expr
                     True         -- Note [Top-level flag on inline rules]
                     expr' Nothing guide
   where
-    expr' = simpleOptExpr opts expr
+    expr' = simpleOptUnfolding opts expr
     guide = UnfWhen { ug_arity = manifestArity expr'
                     , ug_unsat_ok = unSaturatedOk
                     , ug_boring_ok = boring_ok }
@@ -160,7 +180,7 @@ mkInlineUnfoldingWithArity opts src arity expr
                     True         -- Note [Top-level flag on inline rules]
                     expr' Nothing guide
   where
-    expr' = simpleOptExpr opts expr
+    expr' = simpleOptUnfolding opts expr
     guide = UnfWhen { ug_arity = arity
                     , ug_unsat_ok = needSaturated
                     , ug_boring_ok = boring_ok }
@@ -173,7 +193,7 @@ mkInlinableUnfolding :: SimpleOpts -> UnfoldingSource -> CoreExpr -> Unfolding
 mkInlinableUnfolding opts src expr
   = mkUnfolding (so_uf_opts opts) src False False False expr' Nothing
   where
-    expr' = simpleOptExpr opts expr
+    expr' = simpleOptUnfolding opts expr
 
 specUnfolding :: SimpleOpts
               -> [Var] -> (CoreExpr -> CoreExpr)
@@ -211,10 +231,9 @@ specUnfolding opts spec_bndrs spec_app rule_lhs_args
  = mkCoreUnfolding src top_lvl new_tmpl Nothing
                    (old_guidance { ug_arity = old_arity - arity_decrease })
  where
-   new_tmpl = simpleOptExpr opts $
+   new_tmpl = simpleOptUnfolding opts $
               mkLams spec_bndrs  $
-              spec_app tmpl  -- The beta-redexes created by spec_app
-                             -- will be simplified away by simplOptExpr
+              spec_app tmpl  -- Simplify the beta-redexes from spec_app.
    arity_decrease = count isValArg rule_lhs_args - count isId spec_bndrs
 
 
@@ -341,7 +360,7 @@ mkUnfolding :: UnfoldingOpts
             -> Maybe UnfoldingCache
             -> Unfolding
 -- Calculates unfolding guidance
--- Occurrence-analyses the expression before capturing it
+-- Occurrence-analyse ordinary templates. Preserve native templates.
 mkUnfolding opts src top_lvl is_bottoming is_join expr cache
   = mkCoreUnfolding src top_lvl expr cache guidance
   where
@@ -352,10 +371,12 @@ mkUnfolding opts src top_lvl is_bottoming is_join expr cache
 
 mkCoreUnfolding :: UnfoldingSource -> Bool -> CoreExpr
                 -> Maybe UnfoldingCache -> UnfoldingGuidance -> Unfolding
--- Occurrence-analyses the expression before capturing it
+-- Occurrence-analyse ordinary templates. Preserve native templates.
 mkCoreUnfolding src top_lvl expr precomputed_cache guidance
   = CoreUnfolding { uf_tmpl = cache `seq`
-                              occurAnalyseExpr expr
+                              if hasNativeDependentUnfolding expr
+                                then expr
+                                else occurAnalyseExpr expr
       -- occAnalyseExpr: see Note [OccInfo in unfoldings and rules] in GHC.Core
       -- See #20905 for what a discussion of this 'seq'.
       -- We are careful to make sure we only
@@ -379,13 +400,40 @@ mkCoreUnfolding src top_lvl expr precomputed_cache guidance
 
     cache = fromMaybe recomputed_cache precomputed_cache
 
+{- Note [Native dependent unfolding templates]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Ordinary occurrence analysis does not preserve runtime indices or virtual
+Boolean proof binders. Keep a native template unchanged. The native module
+and expression paths use their checked simplification and lowering passes.
+This does not enable native Core in the ordinary optimizer.
+
+Inspect the RHS and the stable unfoldings, rules, and dictionary unfoldings
+that ordinary occurrence analysis would traverse. A native stable template in
+bound-Id metadata must also preserve its parent template. Do not force unused
+unstable unfolding templates. Validate each native imported RHS inside its own
+forkM thunk in GHC.IfaceToCore, using a separate scan that skips bound metadata.
+That validation checks Core and compares its type with the declared signature.
+
+Core Tidy also regenerates non-stable templates. Ordinary occurrence analysis
+can replace a nested case scrutinee with the enclosing case binder while the
+payload type still names the original argument. On interface import, the fresh
+constructor proof would then start at the wrong index. Use the tidied RHS of a
+native binding directly. Classify the original RHS before the top-level Ids
+are tied. See Note [tidyTopUnfolding: avoiding black holes] in GHC.Iface.Tidy.
+
+Keep classification inside uf_tmpl. Inspecting uf_src must not force expr.
+Preserve the precomputed cache and its forcing contract. See
+Note [Lazily checking Unfoldings] and Note [Tying the 'CoreUnfolding' knot]
+in GHC.IfaceToCore. Module unfolding generation remains separately gated.
+-}
+
 ----------------
-certainlyWillInline :: UnfoldingOpts -> IdInfo -> CoreExpr -> Maybe Unfolding
+certainlyWillInline :: SimplCoreMode -> UnfoldingOpts -> IdInfo -> CoreExpr -> Maybe Unfolding
 -- ^ Sees if the unfolding is pretty certain to inline.
 -- If so, return a *stable* unfolding for it, that will always inline.
 -- The CoreExpr is the WW'd and simplified RHS. In contrast, the unfolding
 -- template might not have been WW'd yet.
-certainlyWillInline opts fn_info rhs'
+certainlyWillInline mode opts fn_info rhs'
   = case fn_unf of
       CoreUnfolding { uf_guidance = guidance, uf_src = src }
         | noinline -> Nothing       -- See Note [Worker/wrapper for NOINLINE functions]
@@ -398,9 +446,11 @@ certainlyWillInline opts fn_info rhs'
                         -> do_cunf size args src' tmpl'
         where
           src' | isCompulsorySource src = src  -- Do not change InlineCompulsory!
+               | RetainedUserSrc <- src = src
                | otherwise              = StableSystemSrc
 
           tmpl' | isStableSource src = uf_tmpl fn_unf
+                | RetainedCore <- mode = rhs'
                 | otherwise          = occurAnalyseExpr rhs'
                 -- Do not overwrite stable unfoldings!
 

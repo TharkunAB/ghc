@@ -1,0 +1,30 @@
+NativeOpenInstalledReverseBadWorkersFail.hs:6:23: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Prod.wrongTail’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘Prod.wrongTail xs acc’
+      In the type synonym declaration for ‘BadTail’
+
+NativeOpenInstalledReverseBadWorkersFail.hs:7:22: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Prod.wrongAcc’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘Prod.wrongAcc xs acc’
+      In the type synonym declaration for ‘BadAcc’
+
+NativeOpenInstalledReverseBadWorkersFail.hs:8:24: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Prod.wrongOwner’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘Prod.wrongOwner xs acc’
+      In the type synonym declaration for ‘BadOwner’
+
+NativeOpenInstalledReverseBadWorkersFail.hs:9:22: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Prod.wrongWrapper’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘Prod.wrongWrapper xs’
+      In the type synonym declaration for ‘BadWrapper’
+
+NativeOpenInstalledReverseBadWorkersFail.hs:10:27: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Prod.forceAcc’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type ‘Prod.forceAcc xs acc’
+      In the type synonym declaration for ‘BadForceAcc’
+

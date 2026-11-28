@@ -32,7 +32,7 @@ module GHC.Core.Opt.Simplify.Env (
 
         -- * Simplifying 'Id' binders
         simplNonRecBndr, simplNonRecJoinBndr, simplRecBndrs, simplRecJoinBndrs,
-        simplBinder, simplBinders,
+        simplBinder, simplBinders, cloneRetainedAltBinders, cloneRetainedCaseBinder,
         substTy, substTyVar, getFullSubst, getTCvSubst,
         substCo, substCoVar,
 
@@ -52,6 +52,7 @@ module GHC.Core.Opt.Simplify.Env (
         wrapJoinFloats, wrapJoinFloatsX, unitJoinFloat, addJoinFlts
     ) where
 
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
 import GHC.Prelude
 
 import GHC.Core.Coercion.Opt ( OptCoercionOpts )
@@ -61,8 +62,10 @@ import GHC.Core.Opt.Simplify.Monad
 import GHC.Core.Rules.Config ( RuleOpts(..) )
 import GHC.Core
 import GHC.Core.Utils
-import GHC.Core.Subst( substExprSC )
+import GHC.Core.Subst( cloneBndr, substExprSC )
 import GHC.Core.Unfold
+import GHC.Core.TyCo.Compare (eqType)
+import GHC.Core.TyCo.Rep (Type(DepFunTy, TermVarTy))
 import GHC.Core.TyCo.Subst (emptyIdSubstEnv, mkSubst)
 import GHC.Core.Multiplicity( Scaled(..), mkMultMul )
 import GHC.Core.Make            ( mkWildValBinder, mkCoreLet )
@@ -78,7 +81,8 @@ import GHC.Types.Var.Set
 import GHC.Types.Id as Id
 import GHC.Types.InlinePragma ( ActivationGhc, CompilerPhase, isActiveInPhase )
 import GHC.Types.Basic
-import GHC.Types.Unique.FM      ( pprUniqFM )
+import GHC.Types.Unique.FM      ( mapMaybeUFM, pprUniqFM )
+import GHC.Types.Unique.Supply  ( getUniqueM )
 
 import GHC.Data.OrdList
 import GHC.Data.Graph.UnVar
@@ -186,6 +190,7 @@ data SimplEnv
       , seTvSubst   :: TvSubstEnv      -- InTyVar |--> OutType
       , seCvSubst   :: CvSubstEnv      -- InCoVar |--> OutCoercion
       , seIdSubst   :: SimplIdSubst    -- InId    |--> OutExpr
+      , seIndexSubst :: IdSubstEnv     -- Runtime binder renamings in annotations
 
         -- | Fast OutVarSet tracking which recursive RHSs we are analysing.
         -- See Note [Eta reduction in recursive RHSs] in GHC.Core.Opt.Arity.
@@ -272,7 +277,8 @@ seUnfoldingOpts env = sm_uf_opts (seMode env)
 
 -- See Note [The environments of the Simplify pass]
 data SimplMode = SimplMode -- See comments in GHC.Core.Opt.Simplify.Monad
-  { sm_phase        :: !SimplPhase    -- ^ The phase of the simplifier
+  { sm_core_mode    :: !SimplCoreMode -- ^ Core forms the pass may encounter
+  , sm_phase        :: !SimplPhase    -- ^ The phase of the simplifier
   , sm_names        :: ![String]      -- ^ Name(s) of the phase
   , sm_rules        :: !Bool          -- ^ Whether RULES are enabled
   , sm_inline       :: !Bool          -- ^ Whether inlining is enabled
@@ -595,6 +601,7 @@ mkSimplEnv mode fam_envs
              , seTvSubst     = emptyVarEnv
              , seCvSubst     = emptyVarEnv
              , seIdSubst     = emptyVarEnv
+             , seIndexSubst  = emptyVarEnv
              , seRecIds      = emptyUnVarSet
              , seCaseDepth   = 0
              , seInlineDepth = 0 }
@@ -640,7 +647,8 @@ reSimplifying (SimplEnv { seInlineDepth = n }) = n>0
 extendIdSubst :: SimplEnv -> Id -> SimplSR -> SimplEnv
 extendIdSubst env@(SimplEnv {seIdSubst = subst}) var res
   = assertPpr (isId var && not (isCoVar var)) (ppr var) $
-    env { seIdSubst = extendVarEnv subst var res }
+    env { seIdSubst = extendVarEnv subst var res
+        , seIndexSubst = delVarEnv (seIndexSubst env) var }
 
 extendTvSubst :: SimplEnv -> TyVar -> Type -> SimplEnv
 extendTvSubst env@(SimplEnv {seTvSubst = tsubst}) var res
@@ -678,7 +686,8 @@ addNewInScopeIds env@(SimplEnv { seInScope = in_scope, seIdSubst = id_subst }) v
         !id_subst1 = id_subst `delVarEnvList` vs
     in
     env { seInScope = in_scope1,
-          seIdSubst = id_subst1 }
+          seIdSubst = id_subst1
+        , seIndexSubst = seIndexSubst env `delVarEnvList` vs }
         -- Why delete?  Consider
         --      let x = a*b in (x, \x -> x+3)
         -- We add [x |-> a*b] to the substitution, but we must
@@ -730,10 +739,18 @@ zapSubstEnv :: SimplEnv -> SimplEnv
 -- simplify an already-simplified term
 zapSubstEnv env@(SimplEnv { seInlineDepth = n })
   = env { seTvSubst = emptyVarEnv, seCvSubst = emptyVarEnv, seIdSubst = emptyVarEnv
-        , seInlineDepth = n+1 }
+        , seIndexSubst = emptyVarEnv, seInlineDepth = n+1 }
 
 setSubstEnv :: SimplEnv -> TvSubstEnv -> CvSubstEnv -> SimplIdSubst -> SimplEnv
-setSubstEnv env tvs cvs ids = env { seTvSubst = tvs, seCvSubst = cvs, seIdSubst = ids }
+setSubstEnv env tvs cvs ids =
+    env { seTvSubst = tvs, seCvSubst = cvs, seIdSubst = ids
+        , seIndexSubst = getRenames ids }
+  where
+    getRenames
+      | sm_core_mode (seMode env) == RetainedCore = mapMaybeUFM rename
+      | otherwise = const emptyVarEnv
+    rename (DoneId v) = Just (Var v)
+    rename _ = Nothing
 
 {-
 ************************************************************************
@@ -810,6 +827,7 @@ doFloatFromRhs fe lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs 
       && not (isNilOL fs)
       && want_to_float
       && can_float
+      && not_escaping_runtime_index
   where
      want_to_float = isTopLevel lvl || exprIsExpandable rhs
                      -- See Note [Float when expandable]
@@ -818,6 +836,12 @@ doFloatFromRhs fe lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs 
                    FltLifted  -> True
                    FltOkSpec  -> isNotTopLevel lvl && isNonRec rec
                    FltCareful -> isNotTopLevel lvl && isNonRec rec && strict_bind
+
+     not_escaping_runtime_index
+       | isTopLevel lvl
+       = not (any (anyFreeVarsOfType isNonCoVarId . idType) (bindersOfBinds (fromOL fs)))
+       | otherwise
+       = True
 
      -- Whether any floating is allowed by flags.
      floatEnabled :: TopLevelFlag -> FloatEnable -> Bool
@@ -1107,6 +1131,28 @@ See also Note [Scaling join point arguments].
 simplBinders :: SimplEnv -> [InBndr] -> SimplM (SimplEnv, [OutBndr])
 simplBinders  !env bndrs = mapAccumLM simplBinder  env bndrs
 
+-- | Freshen a whole retained field telescope when copying an unfolding.
+-- See Note [Inlining retained constructor alternatives] in GHC.Core.Opt.Simplify.Iteration.
+cloneRetainedAltBinders :: SimplEnv -> [InBndr] -> SimplM (SimplEnv, [OutBndr])
+cloneRetainedAltBinders = mapAccumLM cloneRetainedCaseBinder
+
+-- | Freshen a case or field binder from a copied retained alternative.
+-- See Note [Inlining retained constructor alternatives] in GHC.Core.Opt.Simplify.Iteration.
+cloneRetainedCaseBinder :: SimplEnv -> InBndr -> SimplM (SimplEnv, OutBndr)
+cloneRetainedCaseBinder env old = do
+    unique <- getUniqueM
+    let (Subst scope indices tvs cvs, fresh) =
+            cloneBndr (getTCvSubst env) unique binder
+        ids | isNonCoVarId old = extendVarEnv (seIdSubst env) old (DoneId fresh)
+            | otherwise = seIdSubst env
+    return (env { seInScope = scope, seIndexSubst = indices, seTvSubst = tvs,
+                  seCvSubst = cvs, seIdSubst = ids }, fresh)
+  where
+    -- An indexed GADT alternative starts with erased existential binders.
+    -- Clone them before the equality and fields that mention them.
+    binder | isTyVar old = old
+           | otherwise = zapFragileIdInfo old
+
 -------------
 simplBinder :: SimplEnv -> InBndr -> SimplM (SimplEnv, OutBndr)
 -- Used for lambda and case-bound variables
@@ -1180,7 +1226,8 @@ subst_id_bndr env@(SimplEnv { seInScope = in_scope, seIdSubst = id_subst })
               old_id adjust_type
   = assertPpr (not (isCoVar old_id)) (ppr old_id)
     (env { seInScope = new_in_scope,
-           seIdSubst = new_subst }, new_id)
+           seIdSubst = new_subst,
+           seIndexSubst = new_index_subst }, new_id)
     -- It's important that both seInScope and seIdSubst are updated with
     -- the new_id, /after/ applying adjust_type. That's why adjust_type
     -- is done here.  If we did adjust_type in simplJoinBndr (the only
@@ -1201,6 +1248,14 @@ subst_id_bndr env@(SimplEnv { seInScope = in_scope, seIdSubst = id_subst })
               = extendVarEnv id_subst old_id (DoneId new_id)
               | otherwise
               = delVarEnv id_subst old_id
+
+    new_index_subst
+      | sm_core_mode (seMode env) == RetainedCore
+      , new_id /= old_id
+        || not (idMult new_id `eqType` idMult old_id)
+        || not (idType new_id `eqType` idType old_id)
+      = extendVarEnv (seIndexSubst env) old_id (Var new_id)
+      | otherwise = delVarEnv (seIndexSubst env) old_id
 
     !new_in_scope = in_scope `extendInScopeSet` new_id
 
@@ -1307,11 +1362,17 @@ adjustJoinPointType mult new_res_ty join_id
       | n == 0
       = new_res_ty
 
-      | Just (arg_bndr, body_ty) <- splitPiTy_maybe ty
+      -- See Note [Retained arguments of join points] in GHC.Core.Type.
+      | DepFunTy vis index body_ty <- coreFullView ty
+      , let !index'   = scaleIdBy mult index
+            !body_ty' = replaceTermVarInType index (TermVarTy index') body_ty
+      = mkDepFunTyWithVis vis index' (go (n-1) body_ty')
+
+      | Just (ma, arg_bndr, body_ty) <- splitPiTy_maybe ty
       , let body_ty' = go (n-1) body_ty
       = case arg_bndr of
-          Named b                          -> mkForAllTy b body_ty'
-          Anon (Scaled arg_mult arg_ty) af -> mkFunTy af' arg_mult' arg_ty body_ty'
+          Named b                          -> mkTyCoForAllTy ma (binderVar b) (binderFlag b) body_ty'
+          Anon (Scaled arg_mult arg_ty) af -> mkFunTy af' ma arg_mult' arg_ty body_ty'
               where
                 -- Using "!": See Note [Bangs in the Simplifier]
                 -- mkMultMul: see Note [Scaling join point arguments]
@@ -1359,8 +1420,9 @@ See also Note [Return type for join points] and Note [Join points and case-of-ca
 -}
 
 getTCvSubst :: SimplEnv -> Subst
-getTCvSubst (SimplEnv { seInScope = in_scope, seTvSubst = tv_env, seCvSubst = cv_env })
-  = mkSubst in_scope emptyVarEnv tv_env cv_env
+getTCvSubst (SimplEnv { seInScope = in_scope, seIndexSubst = indices
+                         , seTvSubst = tv_env, seCvSubst = cv_env })
+  = mkSubst in_scope indices tv_env cv_env
 
 getFullSubst :: InScopeSet -> SimplEnv -> Subst
 getFullSubst in_scope (SimplEnv { seIdSubst = id_env, seTvSubst = tv_env, seCvSubst = cv_env })
@@ -1400,7 +1462,9 @@ substCo env co = Coercion.substCo (getTCvSubst env) co
 
 ------------------
 substIdType :: SimplEnv -> Id -> Id
-substIdType (SimplEnv { seInScope = in_scope, seTvSubst = tv_env, seCvSubst = cv_env }) id
+substIdType env@(SimplEnv { seInScope = in_scope, seTvSubst = tv_env, seCvSubst = cv_env }) id
+  | sm_core_mode (seMode env) == RetainedCore
+  = Id.updateIdTypeAndMult (Type.substTyUnchecked (getTCvSubst env)) id
   | (isEmptyVarEnv tv_env && isEmptyVarEnv cv_env)
     || no_free_vars
   = id

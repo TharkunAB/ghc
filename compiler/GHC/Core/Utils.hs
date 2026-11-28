@@ -43,7 +43,7 @@ module GHC.Core.Utils (
 
         -- * Manipulating data constructors and types
         exprToType,
-        applyTypeToArgs,
+        applyTypeToArgs, isVacuousRetainedBinder,
         dataConRepInstPat, dataConRepFSInstPat,
         isEmptyTy, normSplitTyConApp_maybe,
 
@@ -74,10 +74,12 @@ import GHC.Prelude
 import GHC.Platform
 
 import GHC.Core
+import GHC.Core.Dependent (isScopedSelectorReceiver)
 import GHC.Core.Ppr
 import GHC.Core.FVs( exprFreeVars, bindFreeVars )
 import GHC.Core.DataCon
 import GHC.Core.Type as Type
+import GHC.Core.TyCo.Rep ( Type(DepDictTy, DepFunTy, TermVarTy) )
 import GHC.Core.Predicate( isEqPred )
 import GHC.Core.Predicate( isUnaryClass )
 import GHC.Core.FamInstEnv
@@ -89,6 +91,7 @@ import GHC.Core.Multiplicity
 
 import GHC.Builtin.KnownKeys ( makeStaticKey, unsafeEqualityProofIdKey, unsafeReflDataConKey )
 import GHC.Builtin.PrimOps
+import GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
 
 import GHC.Types.Var
 import GHC.Types.SrcLoc
@@ -119,7 +122,7 @@ import GHC.Utils.Misc
 import Control.Monad       ( guard )
 import Data.ByteString     ( ByteString )
 import Data.Function       ( on )
-import Data.List           ( sort, sortBy, partition, zipWith4, mapAccumL )
+import Data.List           ( sort, sortBy, partition, zipWith4, zip4, mapAccumL )
 import qualified Data.List.NonEmpty as NE
 import Data.Ord            ( comparing )
 import qualified Data.Set as Set
@@ -142,8 +145,14 @@ exprType (Coercion co)       = coercionType co
 exprType (Let bind body)
   | NonRec tv rhs <- bind    -- See Note [Type bindings]
   , Type ty <- rhs           = substTyWithUnchecked [tv] [ty] (exprType body)
-  | otherwise                = exprType body
+  | otherwise
+  = let body_ty = exprType body
+    in if any (\b -> isNonCoVarId b && b `elemVarSet` tyCoVarsOfType body_ty) (bindersOf bind)
+       then pprPanic "exprType: let-bound runtime index escapes its scope" (ppr body_ty)
+       else body_ty
 exprType (Case _ _ ty _)     = ty
+exprType (Pack package_ty _ _) = package_ty
+exprType (Unpack _ _ _ body)   = exprType body
 exprType (Cast _ co)         = coercionRKind co
 exprType (Tick _ e)          = exprType e
 exprType (Lam binder expr)   = mkLamType binder (exprType expr)
@@ -177,17 +186,35 @@ mkLamTypes :: [Var] -> Type -> Type
 
 mkLamType v body_ty
    | isTyVar v
-   = mkForAllTy (Bndr v coreTyLamForAllTyFlag) body_ty
+   = mkForAllTy unmatchableDataConTy (Bndr v coreTyLamForAllTyFlag) body_ty
      -- coreTyLamForAllTyFlag: see Note [Required foralls in Core]
      --                        in GHC.Core.TyCo.Rep
 
    | isCoVar v
    , v `elemVarSet` tyCoVarsOfType body_ty
      -- See Note [Unused coercion variable in ForAllTy] in GHC.Core.TyCo.Rep
-   = mkForAllTy (Bndr v coreTyLamForAllTyFlag) body_ty
+   = mkForAllTy unmatchableDataConTy (Bndr v coreTyLamForAllTyFlag) body_ty
+
+   | depends_on_v
+   , isNativeClassDictionaryId v
+   , typeKind body_ty `eqType` liftedTypeKind
+   = DepDictTy v body_ty
+
+   | depends_on_v
+   , isNativeOpaqueValueId v
+     -- See Note [Opaque runtime index values] in GHC.Core.Type.
+   = assertPpr (isNativeOpaqueValueId v && typeKind body_ty `eqType` liftedTypeKind)
+       (text "Unsupported retained dependent lambda:" <+> ppr v <+> dcolon <+> ppr body_ty) $
+     DepFunTy DepFunVisible v body_ty
+
+   | depends_on_v
+   = pprPanic "mkLamType: unsupported runtime dependency"
+       (ppr v $$ ppr body_ty)
 
    | otherwise
-   = mkFunctionType (idMult v) (idType v) body_ty
+   = mkFunctionType unmatchableDataConTy (idMult v) (idType v) body_ty
+  where
+    depends_on_v = anyFreeVarsOfType (== v) body_ty
 
 mkLamTypes vs ty = foldr mkLamType ty vs
 
@@ -237,9 +264,45 @@ applyTypeToArgs op_ty args
     go op_ty []                   = op_ty
     go op_ty (Type ty : args)     = go_ty_args op_ty [ty] args
     go op_ty (Coercion co : args) = go_ty_args op_ty [mkCoercionTy co] args
-    go op_ty (_ : args)           | Just (_, _, _, res_ty) <- splitFunTy_maybe op_ty
+    go op_ty (arg : args)
+      | DepDictTy b res_ty <- coreFullView op_ty
+      = case arg of
+          Var dict
+            | isNativeClassDictionaryId b
+            , isNativeClassDictionaryId dict
+            , varType b `eqType` varType dict
+            -> let in_scope = mkInScopeSet (tyCoVarsOfType res_ty `unionVarSet` exprFreeVars arg)
+               in go (substTy (Subst in_scope (unitVarEnv b arg) emptyVarEnv emptyVarEnv) res_ty) args
+          _ -> panic "applyTypeToArgs: invalid dependent dictionary argument"
+    go op_ty (arg : args)
+      | DepFunTy _ b res_ty <- coreFullView op_ty
+      , isNativeOpaqueValueId b
+      , retained_arg b res_ty arg
+      = let in_scope = mkInScopeSet (tyCoVarsOfType res_ty `unionVarSet` exprFreeVars arg)
+        in go (substTy (Subst in_scope (unitVarEnv b arg) emptyVarEnv emptyVarEnv) res_ty) args
+    -- See Note [Vacuous retained applications].
+    go op_ty (_ : args)
+      | DepFunTy _ b res_ty <- coreFullView op_ty
+      , isVacuousRetainedBinder b res_ty
+      = go res_ty args
+    go op_ty (_ : args)           | Just (_, _, _, _, res_ty) <- splitFunTy_maybe op_ty
                                   = go res_ty args
     go _ args = pprPanic "applyTypeToArgs" (panic_msg args)
+
+    -- See Notes [Function-valued retained binders] and
+    -- [Opaque runtime index values] in GHC.Core.Type.
+    retained_arg b body arg
+      | isNativeIndexFunctionId b
+      = case nativeIndexFunctionArgIndex arg of
+          Just index -> typeKind index `eqType` varType b
+                        && case index of
+                             TermVarTy{} -> True
+                             _ -> not (isScopedSelectorReceiver b body)
+          Nothing -> False
+      | isNativeOpaqueValueId b
+      , Just index <- retainedArgIndex arg
+      = typeKind index `eqType` varType b
+      | otherwise = False
 
     -- go_ty_args: accumulate type arguments so we can
     -- instantiate all at once with piResultTys
@@ -260,9 +323,9 @@ mkCastMCo e (MCo co) = mkCast e co
   -- We are careful to use (MCo co) only when co is not reflexive
   -- Hence (Cast e co) rather than (mkCast e co)
 
-mkPiMCo :: Var -> MCoercionR -> MCoercionR
-mkPiMCo _  MRefl   = MRefl
-mkPiMCo v (MCo co) = MCo (mkPiCo Representational v co)
+mkPiMCo :: Matchability -> Var -> MCoercionR -> MCoercionR
+mkPiMCo _ _ MRefl = MRefl
+mkPiMCo ma v (MCo co) = MCo (mkPiCo Representational ma v co)
 
 
 {- *********************************************************************
@@ -270,6 +333,26 @@ mkPiMCo v (MCo co) = MCo (mkPiCo Representational v co)
              Casts
 *                                                                      *
 ********************************************************************* -}
+
+-- | Whether an opaque retained application needs no index substitution.
+-- See Note [Vacuous retained applications].
+isVacuousRetainedBinder :: Id -> Type -> Bool
+isVacuousRetainedBinder binder body =
+    isNativeOpaqueValueId binder && not (binder `elemVarSet` tyCoVarsOfType body)
+
+{- Note [Vacuous retained applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An invisible retained binder takes a runtime argument even when its value
+does not occur in the result type. For example, the elaboration of
+`foreach (a :: Type). a -> a` takes a witness of type `TypeRep a`.
+The value of the witness is absent from the result `a -> a`.
+
+When the result does not mention the value, application needs no
+conversion of the argument to a type index. The argument can be any
+expression of the domain type. Core Lint checks the expression, its
+domain and its usage before returning the result type. A dependent
+result still requires a checked index for substitution.
+-}
 
 -- | Wrap the given expression in the coercion safely, dropping
 -- identity coercions and coalescing nested coercions
@@ -700,6 +783,8 @@ stripTicksE p expr = go expr
         go (Let b e)        = Let (go_bs b) (go e)
         go (Case e b t as)  = Case (go e) b t (map go_a as)
         go (Cast e c)       = Cast (go e) c
+        go (Pack s w e)     = Pack s w (go e)
+        go (Unpack w p pkg body) = Unpack w p (go pkg) (go body)
         go (Tick t e)
           | p t             = go e
           | otherwise       = Tick t (go e)
@@ -716,6 +801,8 @@ stripTicksT p expr = fromOL $ go expr
         go (Let b e)        = go_bs b `appOL` go e
         go (Case e _ _ as)  = go e `appOL` concatOL (map go_a as)
         go (Cast e _)       = go e
+        go (Pack _ _ e)     = go e
+        go (Unpack _ _ pkg body) = go pkg `appOL` go body
         go (Tick t e)
           | p t             = t `consOL` go e
           | otherwise       = go e
@@ -1914,6 +2001,8 @@ exprIsCheapX ok_app expandable e
     ok e = go 0 e
 
     -- n is the number of value arguments
+    go n (Pack _ _ payload)           = go n payload
+    go _ Unpack{}                     = False
     go n (Var v)                      = ok_app v n
     go _ (Lit {})                     = True
     go _ (Type {})                    = True
@@ -2001,7 +2090,7 @@ isExpandableApp fn n_val_args
        | n_val_args == 0
        = True
 
-       | Just (bndr, ty) <- splitPiTy_maybe ty
+       | Just (_, bndr, ty) <- splitPiTy_maybe ty
        = case bndr of
            Named {}  -> all_pred_args n_val_args ty
            Anon _ af -> isInvisibleFunArg af && all_pred_args (n_val_args-1) ty
@@ -2219,6 +2308,9 @@ expr_ok _ _ (Coercion _) = True
 
 expr_ok fun_ok primop_ok (Var v)    = app_ok fun_ok primop_ok v []
 expr_ok fun_ok primop_ok (Cast e _) = expr_ok fun_ok primop_ok e
+expr_ok fun_ok primop_ok (Pack _ _ e) = expr_ok fun_ok primop_ok e
+expr_ok fun_ok primop_ok (Unpack _ _ pkg body) =
+  expr_ok fun_ok primop_ok pkg && expr_ok fun_ok primop_ok body
 expr_ok fun_ok primop_ok (Lam b e)
                  | isTyVar b = expr_ok fun_ok primop_ok  e
                  | otherwise = True
@@ -2270,7 +2362,7 @@ app_ok fun_ok primop_ok fun val_args
 
   | otherwise
   = case idDetails fun of
-      DFunId terminating -> terminating
+      DFunId terminating _ -> terminating
          -- DFuns terminate, unless the dict is implemented
          -- by a no-op in which case they may not
          -- See (UCM3) in Note [Unary class magic] in GHC.Core.TyCon
@@ -2678,6 +2770,8 @@ exprIsHNFlike is_con is_con_unf rubbish_lit_result e
                                    && is_hnf_like e
                                       -- See Note [exprIsHNF Tick]
     is_hnf_like (Cast e _)       = is_hnf_like e
+    is_hnf_like (Pack _ _ e)     = is_hnf_like e
+    is_hnf_like (Unpack _ _ _ e) = is_hnf_like e
     is_hnf_like (App e a)
       | isValArg a               = app_is_value e [a]
       | otherwise                = is_hnf_like e
@@ -2689,9 +2783,10 @@ exprIsHNFlike is_con is_con_unf rubbish_lit_result e
 
     -- Collect arguments through Casts and Ticks and call id_app_is_value
     app_is_value :: CoreExpr -> [CoreArg] -> Bool
-    app_is_value (Var f)    as = id_app_is_value f as
-    app_is_value (Tick _ f) as = app_is_value f as
-    app_is_value (Cast f _) as = app_is_value f as
+    app_is_value (Var f)      as = id_app_is_value f as
+    app_is_value (Tick _ f)   as = app_is_value f as
+    app_is_value (Cast f _)   as = app_is_value f as
+    app_is_value (Pack _ _ f) as = app_is_value f as
     app_is_value (App f a)  as | isValArg a = app_is_value f (a:as)
                                | otherwise  = app_is_value f as
     app_is_value _          _  = False
@@ -2902,7 +2997,7 @@ dataConInstPat fss uniqs mult con inst_tys
     univ_tvs = dataConUnivTyVars con
     ex_tvs   = dataConExTyCoVars con
     arg_tys  = dataConRepArgTys con
-    arg_strs = dataConRepStrictness con  -- 1-1 with arg_tys
+    arg_strs = drop (count isCoVar ex_tvs) (dataConRepStrictness con)
     n_ex = length ex_tvs
 
       -- split the Uniques and FastStrings
@@ -2928,11 +3023,46 @@ dataConInstPat fss uniqs mult con inst_tys
         kind   = Type.substTyUnchecked subst (varType tv)
 
       -- Make value vars, instantiating types
-    arg_ids = zipWith4 mk_id_var id_uniqs id_fss arg_tys arg_strs
-    mk_id_var uniq fs (Scaled m ty) str
+    arg_ids
+      | null retained_binders
+      = zipWith4 (mk_id_var full_subst) id_uniqs id_fss arg_tys arg_strs
+      | otherwise
+      = snd $ mapAccumL mk_retained_field full_subst $
+          zip retained_binders (zip4 id_uniqs id_fss arg_tys arg_strs)
+    retained_binders = case dataConRepArgBinders con of
+      [] -> []
+      binders -> [Nothing | _ <- dataConOtherTheta con] ++ binders
+                 ++ [Nothing | dataConHasRetainedResult con, _ <- dataConTheta con]
+      -- See Note [Retained constructor result equality] in GHC.Core.DataCon.
+
+    mk_id_var subst uniq fs (Scaled m ty) str
       = setCaseBndrEvald str $  -- See Note [Mark evaluated arguments]
         mkUserLocalOrCoVar (mkVarOccFS fs) uniq
-                           (mult `mkMultMul` m) (Type.substTy full_subst ty) noSrcSpan
+                           (mult `mkMultMul` m) (Type.substTy subst ty) noSrcSpan
+
+    -- See Note [Instantiating retained constructor fields].
+    mk_retained_field subst (mb, (uniq, fs, ty, str))
+      = (subst', field)
+      where
+        field = mk_id_var subst uniq fs ty str
+        Subst in_scope ids tvs cvs = subst
+        subst' = Subst (extendInScopeSet in_scope field) ids' tvs cvs
+        ids' = case mb of
+                 Nothing  -> ids
+                 Just old -> extendVarEnv ids old (Var field)
+
+{- Note [Instantiating retained constructor fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained constructor field binds a runtime Id over the types of later fields.
+Freshen fields from left to right. After each retained field, substitute its
+actual pattern Id for the template Id in the remaining field types. Extend the
+in-scope set too, so substitution avoids capture under nested retained binders.
+Do not put these runtime fields among the erased existential binders.
+
+Keep the ordinary constructor path unchanged. The retained subset has no
+representation wrapper. The dictionary prefix has no retained binders.
+See Note [Retained constructor field telescopes] in GHC.Core.DataCon.
+-}
 
 {-
 Note [Mark evaluated arguments]

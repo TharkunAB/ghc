@@ -1,0 +1,6 @@
+NativeOpenUserGuardedTailFail.hs:8:38: error: [GHC-70565]
+    • Cannot evaluate ‘User.dropOneIf’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the type ‘User.dropOneIf p xs’
+      In the type synonym declaration for ‘Remainder’
+

@@ -16,6 +16,7 @@ module GHC.CoreToStg ( CoreToStgOpts (..), coreToStg ) where
 import GHC.Prelude
 
 import GHC.Core
+import GHC.Core.Make        ( mkImpossibleExpr )
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity   ( manifestArity )
 import GHC.Core.Type
@@ -28,6 +29,7 @@ import GHC.Stg.Make
 import GHC.Stg.Utils (allowTopLevelConApp)
 
 import GHC.Types.RepType
+import GHC.Types.Var ( isCoVar )
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.CostCentre
@@ -456,9 +458,39 @@ coreToStgExpr expr@(Lam {})
 
 coreToStgExpr (Tick tick expr)
   = do
-       let !stg_tick = coreToStgTick (exprType expr) tick
+       !stg_tick <- coreToStgTickM (exprType expr) tick
        !expr2 <- coreToStgExpr expr
        return (StgTick stg_tick expr2)
+
+coreToStgExpr (Pack _ _ payload) = coreToStgExpr payload
+
+-- See Note [Erasing a lexical existential].
+coreToStgExpr (Unpack _ payload package body)
+  | isDeadBinder payload
+  = coreToStgExpr body
+  | Just p <- unwrapPackageVar package
+  = do { p' <- resolvePayloadAlias p
+       ; extendVarEnvCts [(payload, PayloadAlias p')] (coreToStgExpr body) }
+  | isRubbishPackage package
+  = do { let err = mkImpossibleExpr (idType payload) "coreToStgExpr: absent existential payload"
+       ; rhs <- coreToStgRhs (payload, err)
+       ; body' <- extendVarEnvCts [(payload, LetBound NestedLet 0)] (coreToStgExpr body)
+       ; return (StgLet noExtFieldSilent (StgNonRec payload rhs) body') }
+  | otherwise
+  = do { rhs <- coreToStgRhs (payload, package)
+       ; body' <- extendVarEnvCts [(payload, LetBound NestedLet 0)] (coreToStgExpr body)
+       ; return (StgLet noExtFieldSilent (StgNonRec payload rhs) body') }
+  where
+    unwrapPackageVar (Var p)      = Just p
+    unwrapPackageVar (Cast e _)   = unwrapPackageVar e
+    unwrapPackageVar (Pack _ _ e) = unwrapPackageVar e
+    unwrapPackageVar _            = Nothing
+
+    isRubbishPackage (Lit l)    = isLitRubbish l
+    isRubbishPackage (App f _)  = isRubbishPackage f
+    isRubbishPackage (Cast e _) = isRubbishPackage e
+    isRubbishPackage (Tick _ e) = isRubbishPackage e
+    isRubbishPackage _          = False
 
 coreToStgExpr (Cast expr _)
   = coreToStgExpr expr
@@ -486,9 +518,27 @@ coreToStgExpr (Case scrut bndr _ alts)
        ; return (StgCase scrut2 bndr (mkStgAltType bndr alts) alts2) }
   where
     vars_alt :: CoreAlt -> CtsM StgAlt
-    vars_alt (Alt con binders rhs)
-      = let     -- Remove type variables
-            binders' = filterStgBinders binders
+    vars_alt alt@(Alt con binders rhs)
+      = let -- Core Lint checks the final virtual proof. Keep real fields.
+            -- Keep ordinary coercion argument slots; see Note [Coercion tokens].
+            binders'
+              | isNativeIndexAliasAlt alt
+              , [cv] <- binders
+              , isCoVar cv
+              -- See Note [Native index alias evidence] in GHC.Core.Lint.
+              -- Mandatory native Core Lint checks this exact proof binder.
+              = []
+              | DataAlt dc <- con
+              , Just (ordinary, cv) <- splitNativeIndexedDataAlt dc binders
+              , isCoVar cv
+              = filterStgBinders ordinary
+              | DataAlt dc <- con
+              , isNativeIndexDataAlt dc binders
+              , (fields, [cv]) <- splitAt (dataConRepArity dc) binders
+              , isCoVar cv
+              = filterStgBinders fields
+              | otherwise
+              = filterStgBinders binders
         in
         extendVarEnvCts [(b, LambdaBound) | b <- binders'] $ do
         rhs2 <- coreToStgExpr rhs
@@ -548,15 +598,16 @@ coreToStgApp :: Id            -- Function
              -> [StgTickish]  -- From the application nodes
              -> Type          -- Type of the whole application
              -> CtsM StgExpr
-coreToStgApp f core_args app_ticks res_ty
-  = do { how_bound             <- lookupVarCts f
-       ; (stg_args, arg_ticks) <- coreToStgArgs core_args
+coreToStgApp fun core_args app_ticks res_ty
+  = do { f <- resolvePayloadAlias fun
+       ; how_bound <- lookupVarCts f
+       ; (stg_args, arg_ticks, arg_binds) <- coreToStgArgs core_args
        ; let app = mkStgApp f how_bound core_args stg_args res_ty
              all_ticks =  app_ticks ++ arg_ticks
 
        -- Forcing these fixes a leak in the code generator,
        -- noticed while profiling for #4367
-       ; app `seq` return (foldr add_tick app all_ticks)}
+       ; app `seq` return (foldr (StgLet noExtFieldSilent) (foldr add_tick app all_ticks) arg_binds)}
   where
     add_tick !t !e = StgTick t e
 
@@ -620,24 +671,38 @@ getStgArgFromTrivialArg :: HasDebugCallStack => CoreArg -> StgArg
 -- CoreArgs may not immediately look trivial, e.g., `case e of {}` or
 -- `case unsafeequalityProof of UnsafeRefl -> e` might intervene.
 -- Good thing we can just call `trivial_expr_fold` here.
-getStgArgFromTrivialArg e = trivial_expr_fold StgVarArg StgLitArg panic panic e
+getStgArgFromTrivialArg e = go e
   where
+    go (Pack _ _ p)                       = go p
+    go (Cast p _)                         = go p
+    go (Tick t p) | not (tickishIsCode t) = go p
+    go p                                  = trivial_expr_fold StgVarArg StgLitArg panic panic p
     panic = pprPanic "getStgArgFromTrivialArg" (ppr e)
 
-coreToStgArgs :: [CoreArg] -> CtsM ([StgArg], [StgTickish])
+coreToStgArgs :: [CoreArg] -> CtsM ([StgArg], [StgTickish], [StgBinding])
 coreToStgArgs []
-  = return ([], [])
+  = return ([], [], [])
 
-coreToStgArgs (Type _ : args) = do     -- Type argument
-    (args', ts) <- coreToStgArgs args
-    return (args', ts)
+coreToStgArgs (Pack _ _ payload : args) = coreToStgArgs (payload : args)
+
+coreToStgArgs (Type _ : args) = coreToStgArgs args
 
 coreToStgArgs (Coercion _ : args) -- Coercion argument; See Note [Coercion tokens]
-  = do { (args', ts) <- coreToStgArgs args
-       ; return (StgVarArg coercionTokenId : args', ts) }
+  = do { (args', ts, binds) <- coreToStgArgs args
+       ; return (StgVarArg coercionTokenId : args', ts, binds) }
+
+-- See Note [Naming computed retained arguments at erasure] in GHC.CoreToStg.Prep.
+coreToStgArgs (call : args)
+  | Just {} <- if exprIsTrivial call then nativeComputedIndex call else nativeDeferredArgIndex call
+  = do { uniq <- getCtsUnique
+       ; let thunk = mkSysLocal (fsLit "retained_arg") uniq ManyTy (exprType call)
+       ; call' <- nameComputedOperands call
+       ; rhs <- coreToStgRhs (thunk, call')
+       ; (args', ts, binds) <- coreToStgArgs args
+       ; return (StgVarArg thunk : args', ts, StgNonRec thunk rhs : binds) }
 
 coreToStgArgs (arg : args) = do         -- Non-type argument
-    (stg_args, ticks) <- coreToStgArgs args
+    (stg_args, ticks, binds) <- coreToStgArgs args
     -- We know that `arg` must be trivial, but it may contain Ticks.
     -- Example from test case `decodeMyStack`:
     --   $ @... ((src<decodeMyStack.hs:18:26-28> Data.Tuple.snd) @Int @[..])
@@ -648,9 +713,11 @@ coreToStgArgs (arg : args) = do         -- Non-type argument
     -- Since the argument is trivial, the only place the Tick can occur is
     -- somehow wrapping a variable (give or take type args, as above).
     platform <- getPlatform
+    arg' <- case getStgArgFromTrivialArg arg of
+              StgVarArg var -> StgVarArg <$> resolvePayloadAlias var
+              literal -> pure literal
     let arg_ty = exprType arg
         ticks' = map (coreToStgTick arg_ty) (stripTicksT (not . tickishIsCode) arg)
-        arg' = getStgArgFromTrivialArg arg
         arg_rep = typePrimRep arg_ty
         stg_arg_rep = stgArgRep arg'
         bad_args = not (primRepsCompatible platform arg_rep stg_arg_rep)
@@ -663,7 +730,25 @@ coreToStgArgs (arg : args) = do         -- Non-type argument
     () <- warnPprTraceM bad_args
             "Dangerous-looking argument. Probable cause: bad unsafeCoerce#" (ppr arg)
 
-    return (arg' : stg_args, ticks' ++ ticks)
+    return (arg' : stg_args, ticks' ++ ticks, binds)
+
+-- | Name each non-atomic operand inside its enclosing computation thunk.
+-- See Note [Naming computed retained arguments at erasure] in GHC.CoreToStg.Prep.
+nameComputedOperands :: CoreExpr -> CtsM CoreExpr
+nameComputedOperands (Tick tick body) = Tick tick <$> nameComputedOperands body
+nameComputedOperands (Cast body co) = (`Cast` co) <$> nameComputedOperands body
+nameComputedOperands call = do
+    let (fun, args) = collectArgs call
+    (rev_binds, atoms) <- mapAccumLM name_operand [] args
+    return (mkLets (reverse rev_binds) (mkApps fun atoms))
+  where
+    name_operand binds arg
+      | exprIsTrivial arg = return (binds, arg)
+      | otherwise = do
+          rhs <- nameComputedOperands arg
+          uniq <- getCtsUnique
+          let cell = mkSysLocal (fsLit "retained_operand") uniq ManyTy (exprType arg)
+          return (NonRec cell rhs : binds, Var cell)
 
 coreToStgTick :: Type -- type of the ticked expression
               -> CoreTickish
@@ -672,6 +757,10 @@ coreToStgTick _ty (HpcTick m i)           = HpcTick m i
 coreToStgTick _ty (SourceNote span nm)    = SourceNote span nm
 coreToStgTick _ty (ProfNote cc cnt scope) = ProfNote cc cnt scope
 coreToStgTick !ty (Breakpoint _ bid fvs)  = Breakpoint ty bid fvs
+
+coreToStgTickM :: Type -> CoreTickish -> CtsM StgTickish
+coreToStgTickM !ty (Breakpoint _ bid fvs) = Breakpoint ty bid <$> mapM resolvePayloadAlias fvs
+coreToStgTickM !ty tick                   = pure (coreToStgTick ty tick)
 
 -- ---------------------------------------------------------------------------
 -- The magic for lets:
@@ -770,6 +859,8 @@ data HowBound
         LetInfo         -- Whether top level or nested
         Arity           -- Its arity (local Ids don't have arity info at this point)
 
+  | PayloadAlias Id     -- The lifted package Id that owns an unpacked value.
+
   | LambdaBound         -- Used for both lambda and case
   deriving (Eq)
 
@@ -837,6 +928,26 @@ extendVarEnvCts ids_w_howbound expr
    =    CtsM $   \platform env
    -> unCtsM expr platform (extendVarEnvList env ids_w_howbound)
 
+{- Note [Erasing a lexical existential]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Pack has the payload's lifted representation. Unpack of an already named
+package aliases that same runtime variable. Use the payload type for the
+STG occurrence's calling/representation information. The package Id keeps
+its identity and binder. Typed Core never substitutes a package for a
+payload variable at an incompatible type.
+
+An arbitrary package expression is a normal lazy RHS. Use a single STG
+binding and do not introduce a data constructor or a strict case. An
+ordinary case inside the body can still demand the payload.
+-}
+
+resolvePayloadAlias :: Id -> CtsM Id
+resolvePayloadAlias var = do
+    env <- getCtsEnv
+    case lookupVarEnv env var of
+      Just (PayloadAlias owner) -> return (setIdType owner (idType var))
+      _ -> return var
+
 lookupVarCts :: Id -> CtsM HowBound
 lookupVarCts v = CtsM $ \_ env -> return (lookupBinding env v)
 
@@ -890,8 +1001,9 @@ myCollectArgs expr res_ty
       | otherwise
       = (h, as, ts)
 
-    go (App f a)  as ts = go f (a:as) ts
-    go (Cast e _) as ts = go e as ts
+    go (App f a)    as ts = go f (a:as) ts
+    go (Cast e _)   as ts = go e as ts
+    go (Pack _ _ e) as ts = go e as ts
     go (Tick t e) as ts = assertPpr (not (tickishIsCode t) || all isTypeArg as)
                                     (ppr e $$ ppr as $$ ppr ts) $
                           -- See Note [Ticks in applications]
@@ -936,6 +1048,7 @@ stgArity :: Id -> HowBound -> Arity
 stgArity _ (LetBound _ arity) = arity
 stgArity f ImportBound        = idArity f
 stgArity _ LambdaBound        = 0
+stgArity _ (PayloadAlias _)   = 0
 
 data CoreToStgOpts = CoreToStgOpts
   { coreToStg_platform :: Platform

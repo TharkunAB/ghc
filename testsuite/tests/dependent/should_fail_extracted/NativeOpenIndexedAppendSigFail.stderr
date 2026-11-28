@@ -1,0 +1,27 @@
+NativeOpenIndexedAppendSigFail.hs:11:14: error: [GHC-83865]
+    • Couldn't match type: P.plus cut m0
+                     with: P.plus cut m
+      Expected: P.Vec a (P.Add cut m)
+        Actual: P.Vec a (P.Add cut m0)
+      Note: GHC cannot determine the arguments of the function ‘P.plus’ from its result.
+      The type variable ‘m0’ is ambiguous
+    • In the ambiguity check for ‘ambiguous’
+      To defer the ambiguity check to use sites, enable AllowAmbiguousTypes
+      In the type signature:
+        ambiguous :: forall m a. foreach (cut :: P.Nat) ->
+                                 foreach (xs :: P.Vec a (P.Add cut m)) ->
+                                 EmptyLaw a (P.Add cut m) xs
+
+NativeOpenIndexedAppendSigFail.hs:16:28: error: [GHC-83865]
+    • Couldn't match kind ‘P.Z’ with ‘P.S P.Z’
+      Expected kind ‘P.Vec Bool (P.S P.Z)’,
+        but ‘'P.VNil’ has kind ‘P.Vec Bool P.Z’
+    • In the first argument of ‘P.appendVec’, namely
+        ‘('P.VNil :: P.Vec Bool ('P.S 'P.Z))’
+      In the first argument of ‘(:~:)’, namely
+        ‘P.appendVec ('P.VNil :: P.Vec Bool ('P.S 'P.Z)) xs’
+      In the type signature:
+        wrongIndex :: forall (n :: P.Nat)
+                             (xs :: P.Vec Bool n). P.appendVec ('P.VNil :: P.Vec Bool ('P.S 'P.Z)) xs
+                                                   :~: xs
+

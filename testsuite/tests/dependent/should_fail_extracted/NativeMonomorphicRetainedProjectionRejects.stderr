@@ -1,0 +1,27 @@
+NativeMonomorphicRetainedProjectionRejects.hs:9:70: error: [GHC-83865]
+    • Couldn't match type: lengthOf source
+                     with: lengthOf target
+      Expected: Vec Char (lengthOf target)
+        Actual: Vec Char (lengthOf source)
+      Note: GHC cannot determine the arguments of the function ‘lengthOf’ from its result.
+    • In the second argument of ‘CharVector’, namely ‘(cellsOf source)’
+      In the first argument of ‘Just’, namely
+        ‘(CharVector (lengthOf target) (cellsOf source))’
+      In the expression:
+        Just (CharVector (lengthOf target) (cellsOf source))
+
+NativeMonomorphicRetainedProjectionRejects.hs:12:32: error: [GHC-05617]
+    • Could not deduce ‘_ ~ S _’
+      from the context: r ~ 'CharVector _ xs
+        bound by a pattern with constructor:
+                   CharVector :: foreach (n :: Nat) -> Vec Char n -> CharVector,
+                 in an equation for ‘wrongIndex’
+        at NativeMonomorphicRetainedProjectionRejects.hs:12:1-33
+      Expected: Vec Char (S (storedLength ('CharVector _ xs)))
+        Actual: Vec Char _
+    • In the expression: xs
+      In an equation for ‘wrongIndex’: wrongIndex (CharVector _ xs) = xs
+    • Relevant bindings include
+        xs :: Vec Char _
+          (bound at NativeMonomorphicRetainedProjectionRejects.hs:12:26)
+

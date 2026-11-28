@@ -11,6 +11,7 @@
 -- recompilation is required.
 module GHC.Iface.Make
    ( mkPartialIface
+   , mkPartialIfaceWithRuleHeads
    , mkFullIface
    , mkIfaceTc
    , mkRecompUsageInfo
@@ -27,6 +28,7 @@ import GHC.StgToCmm.Types (CmmCgInfos (..))
 
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
+import GHC.Tc.Gen.SourceTable (sourceRuleOwners)
 
 import GHC.Iface.Warnings
 import GHC.Iface.Decl
@@ -41,6 +43,7 @@ import GHC.CoreToIface
 import GHC.Core
 import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
+import GHC.Core.Dependent (hasNativeDependentProgram, hasRetainedRuleHead)
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
 import GHC.Core.Ppr
@@ -51,9 +54,12 @@ import GHC.Driver.Env
 import GHC.Driver.DynFlags
 import GHC.Driver.Plugins
 
+import GHC.Types.Basic (isStableUserSource)
 import GHC.Types.Id
+import GHC.Types.Var ( VarBndr(..) )
 import GHC.Types.Fixity.Env
 import GHC.Types.ForeignStubs (ForeignStubs (NoStubs))
+import GHC.Types.InlinePragma (isNeverActive)
 import GHC.Types.SafeHaskell
 import GHC.Types.Annotations
 import GHC.Types.Name
@@ -90,11 +96,14 @@ import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.Deps
 import GHC.Unit.Module.WholeCoreBindings (encodeIfaceForeign, emptyIfaceForeign)
 
+import qualified Data.Bits as Bits
 import Data.Function
 import Data.List ( sortBy )
 import Data.Ord
 import Data.IORef
+import qualified Data.Set as Set
 import Data.Traversable
+import Data.Word ( Word8 )
 
 {-
 ************************************************************************
@@ -111,7 +120,21 @@ mkPartialIface :: HscEnv
                -> [ImportUserSpec]
                -> ModGuts
                -> IO PartialModIface
-mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
+mkPartialIface hsc_env core_prog mod_details mod_summary import_decls guts =
+  mkPartialIfaceWithRuleHeads hsc_env core_prog mod_details mod_summary import_decls guts emptyNameSet
+
+-- | Variant of 'mkPartialIface' preserving typechecked source-rule heads even
+-- when interface pragmas are omitted.
+mkPartialIfaceWithRuleHeads
+  :: HscEnv
+  -> CoreProgram
+  -> ModDetails
+  -> ModSummary
+  -> [ImportUserSpec]
+  -> ModGuts
+  -> NameSet
+  -> IO PartialModIface
+mkPartialIfaceWithRuleHeads hsc_env core_prog mod_details mod_summary import_decls
   ModGuts{ mg_module       = this_mod
          , mg_hsc_src      = hsc_src
          , mg_usages       = usages
@@ -124,10 +147,11 @@ mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
          , mg_docs         = docs
          , mg_modBreaks    = modBreaks
          }
+  source_rule_owners
   = do
       self_recomp <- traverse (mkSelfRecomp hsc_env this_mod (ms_hs_hash mod_summary)) usages
-      return $ mkIface_ hsc_env this_mod core_prog hsc_src deps rdr_env import_decls fix_env warns self_trust
-                safe_mode self_recomp docs mod_details modBreaks
+      mkIface_ hsc_env this_mod core_prog hsc_src deps rdr_env import_decls fix_env warns self_trust
+                safe_mode self_recomp docs mod_details modBreaks source_rule_owners
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
 -- generator produced information.
@@ -201,19 +225,19 @@ updateDecl decls m_stg_infos m_cmm_infos
                                 m_cmm_infos
     tag_sigs = fromMaybe mempty m_stg_infos
 
-    update_decl (IfaceId nm ty details infos)
+    update_decl decl@(IfaceId { ifName = nm, ifIdInfo = infos })
       | let not_caffy = elemNameSet nm non_cafs
       , let mb_lf_info = lookupNameEnv lf_infos nm
       , let sig = lookupNameEnv tag_sigs nm
       , warnPprTrace (isNothing mb_lf_info) "updateDecl" (text "Name without LFInfo:" <+> ppr nm) True
         -- Only allocate a new IfaceId if we're going to update the infos
       , isJust mb_lf_info || not_caffy || isJust sig
-      = IfaceId nm ty details $
+      = decl { ifIdInfo =
           (if not_caffy then (HsNoCafRefs :) else id) $
           (if isJust sig then (HsTagSig (fromJust sig):) else id) $
           (case mb_lf_info of
              Nothing -> infos -- LFInfos not available when building .cmm files
-             Just lf_info -> HsLFInfo (toIfaceLFInfo nm lf_info) : infos)
+             Just lf_info -> HsLFInfo (toIfaceLFInfo nm lf_info) : infos) }
 
     update_decl decl
       = decl
@@ -253,7 +277,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program mb_modBreaks
           docs  <- extractDocs dflags tc_result
           self_recomp <- traverse (mkSelfRecomp hsc_env this_mod (ms_hs_hash mod_summary)) usage
 
-          let partial_iface = mkIface_ hsc_env
+          partial_iface <- mkIface_ hsc_env
                    this_mod (fromMaybe [] mb_program) hsc_src
                    deps rdr_env import_decls
                    fix_env warns
@@ -261,6 +285,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program mb_modBreaks
                    docs
                    mod_details
                    mb_modBreaks
+                   (sourceRuleOwners (tcg_rules tc_result))
 
           mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
 
@@ -270,7 +295,11 @@ mkRecompUsageInfo hsc_env tc_result = do
   if not (gopt Opt_WriteSelfRecompInfo dflags)
     then return Nothing
     else do
-     let used_names = mkUsedNames tc_result
+     scs <- readIORef (tcg_source_check tc_result)
+     let tables = scs_table_uses scs
+         evaluated_terms = scs_evaluated_uses scs
+         home_rule_deps = scs_home_rule_deps scs
+     let used_names = mkUsedNames tc_result `unionNameSet` tables `unionNameSet` evaluated_terms
      dep_files <- (readIORef (tcg_dependent_files tc_result))
      dep_dirs  <- (readIORef (tcg_dependent_dirs tc_result))
      (needed_links, needed_pkgs) <- readIORef (tcg_th_needed_deps tc_result)
@@ -297,7 +326,7 @@ mkRecompUsageInfo hsc_env tc_result = do
           (tcg_merged tc_result)
           needed_links
           needed_pkgs
-     return (Just usages)
+     return (Just (addHomeRuleUsageInfo home_rule_deps usages))
 
 mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> Dependencies -> GlobalRdrEnv -> [ImportUserSpec]
@@ -308,7 +337,8 @@ mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> Maybe Docs
          -> ModDetails
          -> Maybe ModBreaks
-         -> PartialModIface
+         -> NameSet
+         -> IO PartialModIface
 mkIface_ hsc_env
          this_mod core_prog hsc_src deps rdr_env import_decls fix_env src_warns
          pkg_trust_req safe_mode self_recomp
@@ -326,7 +356,9 @@ mkIface_ hsc_env
 --      put exactly the info into the TypeEnv that we want
 --      to expose in the interface
         modBreaks
+        source_rule_owners
   = do
+    iface_rules <- traverse (coreRuleToIfaceRule hsc_env type_env) rules
     let home_unit    = hsc_home_unit hsc_env
         semantic_mod = homeModuleNameInstantiation home_unit (moduleName this_mod)
         entities = typeEnvElts type_env
@@ -355,7 +387,6 @@ mkIface_ hsc_env
           -- deterministic, so we sort by OccName to canonicalize it.
           -- See Note [Deterministic UniqFM] in GHC.Types.Unique.DFM for more details.
         warns       = toIfaceWarnings src_warns
-        iface_rules = map coreRuleToIfaceRule rules
         iface_insts = map instanceToIfaceInst $ fixSafeInstances safe_mode (instEnvElts insts)
         iface_fam_insts = map famInstToIfaceFamInst fam_insts
         trust_info  = setSafeMode safe_mode
@@ -363,13 +394,45 @@ mkIface_ hsc_env
         icomplete_matches = map mkIfaceCompleteMatch complete_matches
         !rdrs = mkIfaceTopEnv rdr_env
 
-    emptyPartialModIface this_mod
+    let iface_rule_heads = mkNameSet
+          [ ifRuleHead rule
+          | rule <- iface_rules
+          , not (ifRuleAuto rule)
+          , not (isNeverActive (ifActivation rule)) ]
+        all_rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
+          source_rule_owners `unionNameSet` iface_rule_heads
+        stripped_rule_heads = nameSetElemsStable $ filterNameSet isExternalName $
+          source_rule_owners `minusNameSet` iface_rule_heads
+    fields <- if null all_rule_heads
+      then pure emptyExtensibleFields
+      else writeFieldWith sourceRuleHeadsField
+             (\bh -> putWithUserData QuietBinIFace NormalCompression bh
+                       (all_rule_heads, stripped_rule_heads))
+             emptyExtensibleFields
+    direct_dep_has_dep <- fmap or $ forM (Set.toList (dep_direct_mods deps)) $ \(_, uid, gwib) -> do
+      let mod = mkModule (RealUnit (Definite uid)) (gwib_mod gwib)
+      maybe False mi_has_dep_constructs <$> lookupIfaceByModuleHsc hsc_env mod
+    let has_existential = any decl_has_existential decls || any rule_has_existential iface_rules
+        has_depfun_unfold = any has_special_depfun_unfold decls
+        has_dep_constructs = has_existential
+                          || has_depfun_unfold
+                          || not (null all_rule_heads)
+                          || any decl_has_dep decls
+                          || any rule_has_dep iface_rules
+                          || direct_dep_has_dep
+        dep_flags :: Word8
+        !dep_flags = (if has_dep_constructs then Bits.bit ifaceHasDepConstructsBit else 0)
+                 .|. (if has_existential then Bits.bit ifaceHasExistentialBit else 0)
+                 .|. (if has_depfun_unfold then Bits.bit ifaceHasDepFunUnfoldingBit else 0)
+
+    pure $ emptyPartialModIface this_mod
           -- Need to record this because it depends on the -instantiated-with flag
           -- which could change
           & set_mi_sig_of           (if semantic_mod == this_mod
                                       then Nothing
                                       else Just semantic_mod)
           & set_mi_hsc_src          hsc_src
+          & set_mi_dep_flags        dep_flags
           & set_mi_self_recomp      self_recomp
           & set_mi_deps             deps
           & set_mi_exports          (mkIfaceExports exports)
@@ -393,7 +456,7 @@ mkIface_ hsc_env
           & set_mi_complete_matches (icomplete_matches)
           & set_mi_docs             docs
           & set_mi_abi_hashes       ()
-          & set_mi_ext_fields       emptyExtensibleFields
+          & set_mi_ext_fields       fields
           & set_mi_hi_bytes         PartialIfaceBinHandle
 
   where
@@ -418,6 +481,167 @@ mkIface_ hsc_env
            in IfaceTopEnv exports imports
 
      ifFamInstTcName = ifFamInstFam
+
+     has_special_depfun_unfold (IfaceId { ifType = ty, ifIdInfo = infos })
+       | hasIfaceDepFunType ty = any is_special infos
+       where
+         is_special (HsUnfold _ (IfCoreUnfold src _ _ rhs))
+           = isStableUserSource src
+             && (hasIfacePackageExpr rhs
+                 || hasIfaceScopedDictType ty
+                 || has_iface_scoped_dict_expr rhs)
+         is_special _ = False
+     has_special_depfun_unfold _ = False
+
+     has_iface_scoped_dict_expr = go_expr
+       where
+         go_expr IfaceDictApp{} = True
+         go_expr (IfaceType ty) = hasIfaceScopedDictType ty
+         go_expr (IfaceCo co) = hasIfaceScopedDictCo co
+         go_expr (IfaceTuple _ args) = any go_expr args
+         go_expr (IfaceLam (bndr, _) rhs) = go_bndr bndr || go_expr rhs
+         go_expr (IfaceApp fun arg) = go_expr fun || go_expr arg
+         go_expr (IfaceIndexedConArg _ arg) = go_expr arg
+         go_expr (IfaceRetainedCharArg arg) = go_expr arg
+         go_expr (IfaceRetainedNaturalArg arg) = go_expr arg
+         go_expr (IfaceCase scrut _ alts) =
+           go_expr scrut || any (\(IfaceAlt _ _ rhs) -> go_expr rhs) alts
+         go_expr (IfaceECase scrut ty) = go_expr scrut || hasIfaceScopedDictType ty
+         go_expr (IfaceLet binding rhs) = go_bind binding || go_expr rhs
+         go_expr (IfaceCast rhs co) = go_expr rhs || hasIfaceScopedDictCo co
+         go_expr (IfaceLitRubbish _ ty) = hasIfaceScopedDictType ty
+         go_expr (IfaceFCall _ ty) = hasIfaceScopedDictType ty
+         go_expr (IfaceTick (IfaceBreakpoint _ args) rhs) =
+           any go_expr args || go_expr rhs
+         go_expr (IfaceTick _ rhs) = go_expr rhs
+         go_expr (IfacePack s w rhs) =
+           hasIfaceScopedDictType s || hasIfaceScopedDictType w || go_expr rhs
+         go_expr (IfaceUnpack (_, k) (w, _, ty) pkg body) =
+           hasIfaceScopedDictType k || hasIfaceScopedDictType w
+             || hasIfaceScopedDictType ty || go_expr pkg || go_expr body
+         go_expr _ = False
+
+         go_bndr (IfaceTvBndr (_, k)) = hasIfaceScopedDictType k
+         go_bndr (IfaceIdBndr (w, _, ty)) =
+           hasIfaceScopedDictType w || hasIfaceScopedDictType ty
+
+         go_bind (IfaceNonRec binder rhs) = go_pair (binder, rhs)
+         go_bind (IfaceRec pairs) = any go_pair pairs
+
+         go_pair (IfLetBndr _ ty info _, rhs) =
+           hasIfaceScopedDictType ty || go_expr rhs || any go_info info
+
+         go_info (HsUnfold _ (IfCoreUnfold _ _ _ rhs)) = go_expr rhs
+         go_info (HsUnfold _ (IfDFunUnfold bs args)) =
+           any go_bndr bs || any go_expr args
+         go_info _ = False
+
+     type_has_exists (IfaceExistsTy {}) = True
+     type_has_exists (IfaceDepFunTy _ (w, _, dom) res) =
+       type_has_exists w || type_has_exists dom || type_has_exists res
+     type_has_exists (IfaceDepDictTy (w, _, dom) res) =
+       type_has_exists w || type_has_exists dom || type_has_exists res
+     type_has_exists (IfaceForAllTy ma (Bndr b _) body) =
+       type_has_exists ma || bndr_has_exists b || type_has_exists body
+     type_has_exists (IfaceFunTy _ ma w arg res) =
+       type_has_exists ma || type_has_exists w || type_has_exists arg || type_has_exists res
+     type_has_exists (IfaceAppTy f args) =
+       type_has_exists f || any type_has_exists (appArgsIfaceTypes args)
+     type_has_exists (IfaceTyConApp _ args) =
+       any type_has_exists (appArgsIfaceTypes args)
+     type_has_exists (IfaceTupleTy _ _ args) =
+       any type_has_exists (appArgsIfaceTypes args)
+     type_has_exists (IfaceCastTy ty _) = type_has_exists ty
+     type_has_exists _ = False
+
+     bndr_has_exists (IfaceTvBndr (_, k)) = type_has_exists k
+     bndr_has_exists (IfaceIdBndr (w, _, t)) = type_has_exists w || type_has_exists t
+
+     decl_has_existential (IfaceId { ifType = ty, ifIdInfo = infos }) =
+       type_has_exists ty || any info_has_pkg infos
+       where
+         info_has_pkg (HsUnfold _ (IfCoreUnfold _ _ _ rhs)) = hasIfacePackageExpr rhs
+         info_has_pkg _ = False
+     decl_has_existential (IfaceSynonym { ifSynRhs = rhs }) = type_has_exists rhs
+     decl_has_existential (IfaceData { ifCons = cons }) =
+       any (any (type_has_exists . snd) . ifConArgTys) (visibleIfConDecls cons)
+     decl_has_existential (IfaceAxiom { ifAxBranches = bs }) =
+       any (type_has_exists . ifaxbRHS) bs
+     decl_has_existential _ = False
+
+     rule_has_existential r =
+       isLexicalPackageRule r || any expr_has_exists (ifRuleRhs r : ifRuleArgs r)
+       where
+         expr_has_exists (IfaceType t) = type_has_exists t
+         expr_has_exists e = hasIfacePackageExpr e
+
+     type_has_dep (IfaceDepFunTy {}) = True
+     type_has_dep (IfaceDepDictTy {}) = True
+     type_has_dep (IfaceExistsTy {}) = True
+     type_has_dep (IfaceTermVar {}) = True
+     type_has_dep (IfaceNamedTermVar {}) = True
+     type_has_dep (IfaceTermAppTy {}) = True
+     type_has_dep (IfaceClassAppTy {}) = True
+     type_has_dep (IfaceForAllTy ma (Bndr b _) body) =
+       type_has_dep ma || bndr_has_dep b || type_has_dep body
+     type_has_dep (IfaceFunTy _ ma w arg res) =
+       type_has_dep ma || type_has_dep w || type_has_dep arg || type_has_dep res
+     type_has_dep (IfaceAppTy f args) =
+       type_has_dep f || any type_has_dep (appArgsIfaceTypes args)
+     type_has_dep (IfaceTyConApp tc args) =
+       isJust (sourceTableTermOcc (nameOccName (ifaceTyConName tc)))
+       || any type_has_dep (appArgsIfaceTypes args)
+     type_has_dep (IfaceTupleTy _ _ args) =
+       any type_has_dep (appArgsIfaceTypes args)
+     type_has_dep (IfaceCastTy ty _) = type_has_dep ty
+     type_has_dep _ = False
+
+     bndr_has_dep (IfaceTvBndr (_, k)) = type_has_dep k
+     bndr_has_dep (IfaceIdBndr (w, _, t)) = type_has_dep w || type_has_dep t
+
+     vbndr_has_dep (Bndr b _) = bndr_has_dep b
+
+     decl_has_dep (IfaceId { ifType = ty, ifIdDetails = dets, ifIdSourceProofRules = prfs }) =
+       not (null prfs) || dets_has_dep dets || type_has_dep ty
+       where
+         dets_has_dep (IfCheckedClosureSourceTableId {}) = True
+         dets_has_dep (IfRecSelId { ifRecSelSourceTable = Just _ }) = True
+         dets_has_dep _ = False
+     decl_has_dep (IfaceData { ifKind = k, ifBinders = bs, ifResKind = rk, ifCtxt = ctxt, ifCons = cons }) =
+       type_has_dep k || any vbndr_has_dep bs || type_has_dep rk
+       || any type_has_dep ctxt || any con_has_dep (visibleIfConDecls cons)
+       where
+         con_has_dep c = not (null (ifConArgBinders c))
+                      || any (type_has_dep . snd) (ifConArgTys c)
+                      || any (type_has_dep . snd) (ifConEqSpec c)
+                      || any type_has_dep (ifConCtxt c)
+     decl_has_dep (IfaceSynonym { ifKind = k, ifBinders = bs, ifResKind = rk, ifSynRhs = rhs, ifSynSourceProofRules = prfs }) =
+       not (null prfs) || type_has_dep k || any vbndr_has_dep bs || type_has_dep rk || type_has_dep rhs
+     decl_has_dep (IfaceFamily { ifKind = k, ifBinders = bs, ifResKind = rk, ifFamFlav = flav }) =
+       flav_has_dep flav || type_has_dep k || any vbndr_has_dep bs || type_has_dep rk
+       where
+         flav_has_dep IfaceConstrainedTypeFamilyTyCon = True
+         flav_has_dep (IfaceClosedTypeFamilyTyCon IfaceScopedClosedTyFamTyCon{}) = True
+         flav_has_dep (IfaceClosedTypeFamilyTyCon IfaceLambdaClosedTyFamTyCon{}) = True
+         flav_has_dep _ = False
+     decl_has_dep (IfaceAxiom { ifTyCon = tc, ifAxBranches = bs, ifAxSourceProofRules = prfs }) =
+       not (null prfs)
+       || (isNothing (sourceTableTermOcc (nameOccName (ifaceTyConName tc)))
+           && any (\b -> any type_has_dep (appArgsIfaceTypes (ifaxbLHS b)) || type_has_dep (ifaxbRHS b)) bs)
+     decl_has_dep (IfaceClass { ifKind = k, ifBinders = bs, ifBody = body }) =
+       type_has_dep k || any vbndr_has_dep bs || body_has_dep body
+       where
+         body_has_dep IfAbstractClass = False
+         body_has_dep (IfConcreteClass { ifClassCtxt = ctxt, ifATs = ats, ifSigs = sigs }) =
+           any type_has_dep ctxt
+           || any (\(IfaceAT d defs) -> decl_has_dep d || any type_has_dep defs) ats
+           || any (\(IfaceClassOp _ ty _) -> type_has_dep ty) sigs
+     decl_has_dep (IfacePatSyn { ifPatArgs = args, ifPatTy = pat_ty }) =
+       any type_has_dep (pat_ty : args)
+
+     rule_has_dep r =
+       ifRuleKind r `notElem` [IfaceUserRule, IfaceAutoRule]
+       || hasIfacePackageExpr (ifRuleRhs r)
 
 --------------------------
 defaultsToIfaceDefaults :: DefaultEnv -> [IfaceDefault]
@@ -465,27 +689,43 @@ ifaceRoughMatchTcs tcs = map do_rough tcs
     do_rough (RM_KnownTc n) = Just (toIfaceTyCon_name n)
 
 --------------------------
-coreRuleToIfaceRule :: CoreRule -> IfaceRule
+coreRuleToIfaceRule :: HscEnv -> TypeEnv -> CoreRule -> IO IfaceRule
 -- A plugin that installs a BuiltinRule in a CoreDoPluginPass should
 -- ensure that there's another CoreDoPluginPass that removes the rule.
 -- Otherwise a module using the plugin and compiled with -fno-omit-interface-pragmas
 -- would cause panic when the rule is attempted to be written to the interface file.
-coreRuleToIfaceRule rule@(BuiltinRule {})
+coreRuleToIfaceRule _ _ rule@(BuiltinRule {})
   = pprPanic "toHsRule:" (pprRule rule)
 
-coreRuleToIfaceRule (Rule { ru_name = name, ru_fn = fn,
+coreRuleToIfaceRule hsc_env type_env rule@(Rule { ru_name = name, ru_fn = fn,
                             ru_act = act, ru_bndrs = bndrs,
                             ru_args = args, ru_rhs = rhs,
-                            ru_orphan = orph, ru_auto = auto })
-  = IfaceRule { ifRuleName   = name,
+                            ru_orphan = orph, ru_auto = auto, ru_origin = origin })
+  = do
+    head_thing <- if not auto && imported
+                  then GHC.Driver.Env.lookupType hsc_env fn
+                  else pure (lookupTypeEnv type_env fn)
+    pure IfaceRule { ifRuleName   = name,
                 ifActivation = act,
                 ifRuleBndrs  = map toIfaceBndr bndrs,
                 ifRuleHead   = fn,
                 ifRuleArgs   = map do_arg args,
                 ifRuleRhs    = toIfaceExpr rhs,
-                ifRuleAuto   = auto,
+                ifRuleKind   = kind head_thing,
                 ifRuleOrph   = orph }
   where
+    imported = maybe False (/= origin) (nameModule_maybe fn)
+    kind head_thing
+         | not auto, Just (AnId fun) <- head_thing, hasRetainedRuleHead fun =
+             if imported then IfaceImportedRetainedRule else IfaceRetainedUserRule
+         | hasNativeDependentProgram [] [rule] =
+             if auto then IfaceRetainedAutoRule
+             else case nameModule_maybe fn of
+               Just owner | owner /= origin, NotOrphan{} <- orph -> IfaceAnchoredErasedRule
+               _ -> IfaceErasedUserRule
+         | auto = IfaceAutoRule
+         | otherwise = IfaceUserRule
+
         -- For type args we must remove synonyms from the outermost
         -- level.  Reason: so that when we read it back in we'll
         -- construct the same ru_rough field as we have right now;

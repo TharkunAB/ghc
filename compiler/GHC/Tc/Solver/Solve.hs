@@ -31,14 +31,17 @@ import GHC.Tc.Solver.Monad  as TcS
 import qualified GHC.Tc.Utils.Monad   as TcM
 import qualified GHC.Tc.Zonk.TcType   as TcM
 
-import GHC.Core.TyCo.FVs( tyCoVarsOfQuant )
+import GHC.Builtin.WiredIn.Types ( unmatchableDataConTy )
+import GHC.Core ( Expr(Type, Var), collectArgs )
+import GHC.Core.Type ( splitForAllForAllTyBinders, substTyWith )
 import GHC.Core.Predicate
 import GHC.Core.Reduction
 import GHC.Core.Coercion
+import GHC.Core.TyCo.FVs ( addUnivCoDep, emptyUnivCoDeps, univCoDepsHoles )
 import GHC.Core.Class( classHasSCs )
 
-import GHC.Types.Id(  idType )
-import GHC.Types.Var( EvVar, tyVarKind )
+import GHC.Types.Id( idType, isDFunId )
+import GHC.Types.Var( DFunId, EvVar, ForAllTyFlag(Invisible), VarBndr(..), isTyVar, tyVarKind )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Basic ( IntWithInf, intGtLimit )
@@ -56,6 +59,7 @@ import GHC.Driver.Session
 
 import Control.Monad
 
+import Data.Foldable ( asum )
 import Data.List( deleteFirstsBy )
 import qualified Data.Semigroup as S
 import Data.Void( Void )
@@ -120,8 +124,10 @@ simplify_loop n limit definitely_redo_implications
        ; traceTcS "simplify_loop: wc =" (ppr wc)
 
        ; ambient_lvl <- getTcLevel
-       ; (simple_unif_lvl, wc1)
+       ; let wait_for_implics = n == 0 && definitely_redo_implications && not (isEmptyBag implics)
+       ; (simple_unif_lvl, wc1_raw)
              <- reportCoarseGrainUnifications $  -- See Note [Superclass iteration]
+                withPendingImplics wait_for_implics $
                 solveSimpleWanteds simples
                 -- Any insoluble constraints are in 'simples' and so get rewritten
                 -- See Note [Rewrite insolubles] in GHC.Tc.Solver.InertSet
@@ -135,6 +141,14 @@ simplify_loop n limit definitely_redo_implications
                 else reportCoarseGrainUnifications $
                      solveNestedImplications implics
 
+       ; let implic_unif_happened = implic_unif_lvl `sameDepthAs` ambient_lvl
+             has_irreds = anyBag (\case { CIrredCan{} -> True; _ -> False }) (wc_simple wc1_raw)
+       ; wc1 <- if wait_for_implics && not implic_unif_happened && has_irreds
+                then do { wc1_re <- solveSimpleWanteds (wc_simple wc1_raw)
+                        ; return (wc1_re { wc_impl   = wc_impl wc1_raw `unionBags` wc_impl wc1_re
+                                         , wc_errors = wc_errors wc1_raw `unionBags` wc_errors wc1_re }) }
+                else return wc1_raw
+
        ; let wc' = wc1 { wc_impl = wc_impl wc1 `unionBags` implics' }
 
          -- We iterate the loop only if the /implications/ did some relevant
@@ -144,7 +158,6 @@ simplify_loop n limit definitely_redo_implications
          -- the current level; if it is less , we'll iterate some outer level,
          -- which will bring us back here anyway.
          -- See Note [When to iterate the solver: unifications]
-       ; let implic_unif_happened = implic_unif_lvl `sameDepthAs` ambient_lvl
        ; csTraceTcS $ text "implic_unif_happened" <+> ppr implic_unif_happened
        ; maybe_simplify_again (n+1) limit implic_unif_happened wc' }
 
@@ -402,20 +415,27 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
        -- ; when debugIsOn check_tc_level
 
          -- Solve the nested constraints
-       ; (has_given_eqs, given_insols, residual_wanted)
+       ; (selected_givens, has_given_eqs, given_insols, residual_wanted)
             <- nestImplicTcS info ev_binds_var tclvl $
+               do { selected_givens <- select_source_let
+                  ; TcS.withImplicTermScope ct_loc_env selected_givens $
                do { let loc    = mkGivenLoc tclvl info ct_loc_env
-                        givens = mkGivens loc given_ids
-                  ; solveSimpleGivens givens
+                        givens = mkGivens loc selected_givens
 
-                  ; residual_wanted <- solveWanteds wanteds
+                  ; residual_wanted <- case ic_source_let imp of
+                      Just (_, proof) | proof `elem` selected_givens ->
+                        withSourceLetProof proof $
+                          do { solveSimpleGivens (mkGivens loc (filter (/= proof) selected_givens))
+                             ; solveWanteds wanteds }
+                      _ -> do { solveSimpleGivens givens
+                              ; solveWanteds wanteds }
 
                   ; (has_eqs, given_insols) <- getHasGivenEqs tclvl
                         -- Call getHasGivenEqs /after/ solveWanteds, because
                         -- solveWanteds can augment the givens, via expandSuperClasses,
                         -- to reveal given superclass equalities
 
-                  ; return (has_eqs, given_insols, residual_wanted) }
+                  ; return (selected_givens, has_eqs, given_insols, residual_wanted) } }
 
        ; traceTcS "solveImplication 2"
            (ppr given_insols $$ ppr residual_wanted)
@@ -429,8 +449,11 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
              -- Don't lose track of the insoluble givens,
              -- which signal unreachable code; put them in ic_wanted
 
-       ; res_implic <- setImplicationStatus (imp { ic_given_eqs = has_given_eqs
-                                                 , ic_wanted = final_wanted })
+       ; let selected_imp = imp { ic_given = selected_givens
+                                , ic_given_eqs = has_given_eqs
+                                , ic_wanted = final_wanted }
+       ; record_source_let_need selected_imp
+       ; res_implic <- setImplicationStatus selected_imp
 
        ; evbinds <- TcS.getTcEvBindsMap ev_binds_var
        ; traceTcS "solveImplication end }" $ vcat
@@ -439,6 +462,46 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
              , text "evbinds =" <+> ppr evbinds ]
 
        ; return res_implic }
+  where
+    -- See Note [Demand-driven source-let Givens].
+    select_source_let = case ic_source_let imp of
+      Nothing -> return given_ids
+      Just (_, proof) | proof `elem` given_ids -> return given_ids
+      Just (guards, proof) -> do
+        bindings <- getInScopeEvBindsVars >>= traverse TcS.getTcEvBindsMap
+        selected <- and <$> mapM (\(wanted, dfun) ->
+                      sourceMethodEvidenceMatches bindings wanted dfun) guards
+        traceTcS "select source let equality" (ppr proof <+> ppr selected)
+        return (if selected then proof : given_ids else given_ids)
+
+    -- Record partial evidence too, before deferred errors can accept the body.
+    record_source_let_need selected_imp
+      | Just (_, proof) <- ic_source_let selected_imp
+      , proof `elem` ic_given selected_imp
+      , not (isSolvedWC (ic_wanted selected_imp)) -- Solved bodies use computeSolvedStatus.
+      = do { needs <- implication_needs selected_imp
+           ; when (proof `elemVarSet` needs) $
+               wrapTcS $ TcM.addNeededEvIds (ic_binds selected_imp) (unitVarSet proof) }
+      | otherwise = return ()
+
+    implication_needs child = do
+      EBS { ebs_binds = binds, ebs_needs = local_needs } <-
+        TcS.getTcEvBindsState (ic_binds child)
+      nested <- mapM implication_needs (bagToList (wc_impl (ic_wanted child)))
+      let solved_needs = case ic_status child of
+            IC_Solved { ics_dm = dm, ics_non_dm = non_dm } -> dm `unionVarSet` non_dm
+            _ -> emptyVarSet
+          -- A residual implication can reach desugaring under deferred errors.
+          -- Its unpruned Given bindings may refer to a source-let CoVar even
+          -- when no Wanted uses the Given. See Note [Conditional source let evidence].
+          retained_givens
+            | isSolvedWC (ic_wanted child) = emptyVarSet
+            | otherwise = foldEvBindsMap given_rhs emptyVarSet binds
+          given_rhs EvBind { eb_info = EvBindGiven, eb_rhs = rhs } acc =
+            nestedEvIdsOfTerm rhs `unionVarSet` acc
+          given_rhs _ acc = acc
+      return (findNeededGivenEvVars binds
+        (unionVarSets (local_needs : solved_needs : retained_givens : nested)))
 
     -- TcLevels must be strictly increasing (see (ImplicInv) in
     -- Note [TcLevel invariants] in GHC.Tc.Utils.TcType),
@@ -497,6 +560,59 @@ pruneImplications wc@(WC { wc_impl = implics })
       = False
       | otherwise
       = True        -- Otherwise, keep it
+
+{- Note [Demand-driven source-let Givens]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Keep a selected source-let proof in ic_given and the lexical definition
+map. Do not pass that synthetic proof to solveSimpleGivens. Normalizing
+its own RHS can reduce source families and record RULE or ABI dependencies
+even when no body constraint uses the definition.
+
+withSourceLetProof installs the ordinary Given-equality touchability
+barrier with updGivenEqLevel. It also snapshots the given-only inerts.
+This snapshot is necessary when the remaining Given list is empty:
+solveSimpleGivens then returns without updating inert_givens. Nested
+implications must inherit the barrier as well as the lexical definition.
+
+Check all ordinary Givens and Wanteds inside this scope. Their predicates
+can still normalize through selected definitions, including inside GADT
+matches. Only a real evidence use commits the synthetic proof. The proof
+does not need an inert entry: local-definition rewriting and direct
+equality preference read its lexical map. Needed-evidence tracking still
+uses ic_given and the actual coercions.
+-}
+
+{- Note [Conditional source let evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A checked local alias can use the certified equations of an overloaded method
+only when its actual dictionary Wanted selects the certified DFun. Record the
+Wanted Ids and expected DFuns on the body's implication. Outer simple Wanteds
+are solved before nested implications. At entry to this implication, inspect
+only evidence maps in lexical scope with sourceMethodEvidenceMatches. Missing,
+Given, cyclic or different evidence supplies no alias Given and no extra error.
+The ordinary body constraints remain responsible for diagnostics.
+
+Do not put the optional proof in tcl_lexical_givens while checking the body.
+Once selected, add it to ic_given without discarding the immutable candidate.
+Do not add it twice on subsequent solver iterations. This keeps equality levels
+and needed CoVars under the ordinary implication rules. An unresolved candidate can be
+retried when the solver revisits an unsolved implication. A body solved without
+the proof needs no later activation. The candidate has no mutable selection
+state: cloneWC preserves its Ids and clones the evidence maps independently.
+When computeSolvedStatus finds the optional proof in need_full, retain that
+proof in this implication's ebs_needs. This includes uses in solved child
+implications before their needs are trimmed and their records are pruned.
+Before setting the implication status, also collect needs from residual child
+implications and their actual evidence maps. This records partial evidence when
+an unrelated residual error is deferred. Solved equality holes record their
+free CoVars through addTcEvCoBind. Deferred errors do not introduce a use of the
+optional proof. A caller can inspect the original evidence state after committed
+solving; a speculative clone updates only its own evidence state.
+
+The producer must emit a checked lazy alias scope for every occurrence of this
+CoVar in the final body or its evidence. Selection checks the dictionary, not
+the alias equation. Core Lint must check that equation from the actual binding.
+-}
 
 warnRedundantGivens :: SkolemInfoAnon -> Bool
 warnRedundantGivens (SigSkol ctxt _ _)
@@ -579,6 +695,7 @@ computeSolvedStatus :: Implication -> TcS ImplicStatus
 computeSolvedStatus (Implic { ic_info        = info
                             , ic_binds       = ev_binds_var
                             , ic_given       = givens
+                            , ic_source_let  = source_let
                             , ic_wanted      = WC { wc_impl = implics } })
  = do { ev_binds_state <- TcS.getTcEvBindsState ev_binds_var
 
@@ -609,6 +726,10 @@ computeSolvedStatus (Implic { ic_info        = info
       ; let need_full       = need_dm1 `unionVarSet` need_non_dm1
             pruned_ev_binds = filterEvBindsMap (keep_ev_bind need_full) ev_binds
       ; TcS.setTcEvBindsMap ev_binds_var pruned_ev_binds
+      ; case source_let of
+          Just (_, proof) | proof `elemVarSet` need_full ->
+            wrapTcS $ TcM.addNeededEvIds ev_binds_var (unitVarSet proof)
+          _ -> return ()
 
       ; traceTcS "computeSolvedStatus" $
         vcat [ text "local_needs:" <+> ppr local_needs
@@ -731,6 +852,10 @@ simplifyDelayedErrors = mapMaybeBagM simpl_err
                return Nothing
              else
                return $ Just (DE_Multiplicity mult_co' loc) }
+    simpl_err err@(DE_SourceMethod ev dfun _ _)
+      = do { bindings <- getInScopeEvBindsVars >>= traverse TcS.getTcEvBindsMap
+           ; checked <- sourceMethodEvidenceMatches bindings ev dfun
+           ; return (if checked then Nothing else Just err) }
 
     simpl_hole :: Hole -> TcS Hole
 
@@ -744,6 +869,71 @@ simplifyDelayedErrors = mapMaybeBagM simpl_err
       = do { ty' <- rewriteType loc ty
            ; traceTcS "simpl_hole" (ppr ty $$ ppr ty')
            ; return (h { hole_ty = ty' }) }
+
+{- Note [Checked source method evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained method application can provisionally use a concrete instance's
+checked source equations. Its dictionary Wanted must still be solved in its
+original implication. Check that same Wanted's actual evidence after solving.
+A separate instance lookup cannot account for lexical Givens or local instances.
+
+Accept only a context-free DFun instantiated at the exact dictionary predicate.
+Its free variables must be rigid. Follow exact variable aliases in Wanted
+evidence bindings. The DFun application can pass erased type arguments.
+A Given, cast, evidence argument or arbitrary unfolding cannot prove the
+obligation. Keep an unproved check for a later
+solver pass or error reporting. Never replace its evidence with another DFun.
+
+cloneWC preserves these checks and dictionary EvVars, while it clones evidence
+maps. A nested implication can reuse a solved dictionary from its parent.
+For example, a closed literal can solve Num Nat in the outer scope and
+both methods in n + 1 can refer to that binding. Read only maps in lexical
+scope, following actual variable occurrences. A sibling implication cannot
+supply evidence. This check does not publish a certificate or
+change evidence when a speculative solve succeeds. Constraint recovery retains
+unproved checks. Do not float them across a lexical evidence scope during kind
+checking. Do not suppress them in Template Haskell brackets. Error reporting
+must reject them even with deferred type errors: the provisional source
+equations have already been used in the result type.
+-}
+
+-- | Check the actual solved dictionary without performing instance search.
+-- See Note [Checked source method evidence].
+sourceMethodEvidenceMatches :: [EvBindsMap] -> EvVar -> DFunId -> TcS Bool
+sourceMethodEvidenceMatches bindings dictionary expected
+  = do { dictionary <- zonk_id dictionary
+       ; expected <- zonk_id expected
+       ; if isDFunId expected && isClassPred (idType dictionary)
+            && all rigid (tyCoVarsOfTypeList (idType dictionary))
+         then go emptyVarSet (idType dictionary) expected dictionary
+         else return False }
+  where
+    zonk_id var = wrapTcS (TcM.liftZonkM (TcM.zonkId var))
+    rigid tv = isTyVar tv && isSkolemTyVar tv && not (isRuntimeUnkSkol tv)
+    go seen predicate expected current
+      | current `elemVarSet` seen = return False
+      | Just EvBind { eb_info = EvBindWanted {}, eb_rhs = EvExpr rhs }
+          <- asum [lookupEvBind scope current | scope <- bindings]
+      , (Var next, args) <- collectArgs rhs
+      = do { next <- zonk_id next
+           ; if isDFunId next then
+               if next == expected then matches predicate next args else return False
+             else if null args && idType next `tcEqType` predicate
+               then go (extendVarSet seen current) predicate expected next
+               else return False }
+      | otherwise = return False
+
+    matches predicate dfun args
+      | (binders, body) <- splitForAllForAllTyBinders (idType dfun)
+      , Just variables <- traverse erasedBinder binders
+      , Just types <- traverse (\case Type ty -> Just ty; _ -> Nothing) args
+      , equalLength variables types, isClassPred body
+      = do { actual <- wrapTcS (TcM.liftZonkM (TcM.zonkTcTypes types))
+           ; return (substTyWith variables actual body `tcEqType` predicate) }
+      | otherwise = return False
+    erasedBinder (ma, Bndr v (Invisible _))
+      | isTyVar v, ma `tcEqType` unmatchableDataConTy = Just v
+    erasedBinder _ = Nothing
 
 {- Note [Delete dead Given evidence bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1300,7 +1490,7 @@ solveCt (CQuantCan qci@(QCI { qci_ev = ev }))
          -- It is (much) easier to rewrite and re-classify than to
          -- rewrite the pieces and build a Reduction that will rewrite
          -- the whole constraint
-       ; case classifyPredType (ctEvPred ev') of
+       ; case classifyCtEvidence ev' of
            ForAllPred tvs theta body_pred
              -> solveForAll (qci { qci_ev = ev', qci_tvs = tvs
                                  , qci_theta = theta, qci_body = body_pred })
@@ -1311,7 +1501,7 @@ solveCt (CDictCan (DictCt { di_ev = ev, di_pend_sc = pend_sc }))
          -- It is easier to rewrite and re-classify than to rewrite
          -- the pieces and build a Reduction that will rewrite the
          -- whole constraint
-       ; case classifyPredType (ctEvPred ev) of
+       ; case classifyCtEvidence ev of
            ClassPred cls tys
              -> solveDict (DictCt { di_ev = ev, di_cls = cls
                                   , di_tys = tys, di_pend_sc = pend_sc })
@@ -1327,7 +1517,7 @@ solveNC ev
     -- type function expansion.  Instead, canEqNC just applies
     -- the substitution to the predicate, and may do decomposition;
     --    e.g. a ~ [a], where [G] a ~ [Int], can decompose
-    case classifyPredType (ctEvPred ev) of {
+    case classifyCtEvidence ev of {
         EqPred eq_rel ty1 ty2 -> solveEquality ev eq_rel ty1 ty2 ;
         _ ->
 
@@ -1335,7 +1525,7 @@ solveNC ev
     do { ev <- rewriteDictEvidence ev
 
     -- And then re-classify
-       ; case classifyPredType (ctEvPred ev) of
+       ; case classifyCtEvidence ev of
            ClassPred cls tys     -> solveDictNC ev cls tys
            ForAllPred tvs th p   -> solveForAllNC ev tvs th p
            IrredPred {}          -> solveIrred (IrredCt { ir_ev = ev, ir_reason = IrredShapeReason })
@@ -1506,6 +1696,15 @@ Wrinkles:
     lacks a type signature #26376.  Again, if the forall-constraint is not
     turned into an implication `approximateWC` gives a less-good answer.
 
+(WFA6) Runtime forall lambdas have U matchability. For each target annotation,
+  generate nominal U-to-annotation evidence before introducing its binder.
+  Use nested implications to keep each obligation outside its own binder
+  and all later body Givens. Store each prefix evidence binding with its
+  proof in EvFun. The body implication keeps the body evidence bindings.
+  A telescope tail with known U annotations needs no metadata obligations.
+  Skolemize that tail together, as in the ordinary quantified-constraint path.
+  See Note [Runtime forall matchability] in GHC.Tc.Utils.Instantiate.
+
 Note [Solving Wanted QCs from Given QCs]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When we are about to solve a Wanted quantified constraint, and there is a
@@ -1545,7 +1744,7 @@ SPECIALISE pragmas).
 -- that superclasses have not yet been expanded).
 --
 -- Precondition: the constraint has already been rewritten by the inert set.
-solveForAllNC :: CtEvidence -> [TcTyVar] -> TcThetaType -> TcPredType
+solveForAllNC :: CtEvidence -> [(Matchability, TcTyVar)] -> TcThetaType -> TcPredType
               -> SolverStage Void
 solveForAllNC ev tvs theta body_pred
   = do { fuel <- simpleStage mk_super_classes
@@ -1635,12 +1834,11 @@ solveWantedQCI :: TcSMode
 solveWantedQCI mode ct@(CQuantCan (QCI { qci_ev =  ev, qci_tvs = tvs
                                        , qci_theta = theta, qci_body = body_pred }))
   -- A worry: This quantified constraint is not fully zonked.  Does that matter?
-  | CtWanted (WantedCt { ctev_pred = forall_pred, ctev_dest = dest
-                       , ctev_rewriters = rewriters, ctev_loc = loc }) <- ev
-  , let is_qc = IsQC forall_pred (ctLocOrigin loc)
-        empty_subst = mkEmptySubst $ mkInScopeSet $
-                      tyCoVarsOfQuant tvs $
-                      tyCoVarsOfTypes (body_pred:theta)
+  | CtWanted wanted@(WantedCt { ctev_dest = dest
+                              , ctev_rewriters = rewriters, ctev_loc = loc }) <- ev
+  , let forall_pred = wantedCtPredType wanted
+        is_qc = IsQC forall_pred (ctLocOrigin loc)
+        empty_subst = mkEmptySubst $ mkInScopeSet $ tyCoVarsOfType forall_pred
   = TcS.setSrcSpan (getCtLocEnvLoc $ ctLocEnv loc) $
     -- This setSrcSpan is important: the TcM.newImplication uses that
     -- TcLclEnv for the implication, and that in turn sets the location
@@ -1648,31 +1846,63 @@ solveWantedQCI mode ct@(CQuantCan (QCI { qci_ev =  ev, qci_tvs = tvs
     do { -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
          --           in GHC.Tc.Utils.TcType
          -- Very like the code in tcSkolDFunType
+       ; let build_prefix skol_info subst new_skols remaining
+               | not (null remaining)
+               , all ((`tcEqType` unmatchableDataConTy) . fst) remaining
+               = do { (subst', fresh_tvs) <- tcInstSkolTyVarsX skol_info subst (map snd remaining)
+                    ; (imp, (proof_tvs, givens, binds, wanted, inst_pred)) <-
+                        build_prefix skol_info subst' (new_skols ++ fresh_tvs) []
+                    ; let refl_tvs = [(emptyTcEvBinds, mkNomReflCo unmatchableDataConTy, tv)
+                                     | tv <- fresh_tvs]
+                    ; return (imp, (refl_tvs ++ proof_tvs, givens, binds, wanted, inst_pred)) }
+               | otherwise
+               = do { ev_binds_var <- TcS.newTcEvBinds
+                    ; (lvl, (givens, wanted, result)) <-
+                        pushLevelNoWorkList (ppr forall_pred) $
+                        case remaining of
+                          [] ->
+                            do { let inst_pred = substTy subst body_pred
+                                     inst_theta = substTheta subst theta
+                                     loc' = setCtLocOrigin loc (ScOrigin is_qc NakedSc)
+                               ; given_ev_vars <- mapM TcS.newEvVar inst_theta
+                               ; wanted_ev <- newWantedNC loc' rewriters inst_pred
+                               ; return (given_ev_vars, mkSimpleWC [CtWanted wanted_ev],
+                                   ([], given_ev_vars, ev_binds_var, wanted_ev, inst_pred)) }
+                          (ma,tv):rest ->
+                            do { let ma' = substTy subst ma
+                               ; (ma_co, ma_wanted) <-
+                                   if ma' `tcEqType` unmatchableDataConTy
+                                   then return (mkNomReflCo ma', emptyWC)
+                                   else do
+                                     { wanted_ma <- newWantedNC loc rewriters $
+                                         mkNomEqPred unmatchableDataConTy ma'
+                                     ; return (ctEvCoercion (CtWanted wanted_ma),
+                                               mkSimpleWC [CtWanted wanted_ma]) }
+                               ; (subst', fresh_tvs) <- tcInstSkolTyVarsX skol_info subst [tv]
+                               ; case fresh_tvs of
+                                   [fresh_tv] ->
+                                     do { (child, (proof_tvs, body_givens, body_binds,
+                                                   body_wanted, inst_pred)) <-
+                                            build_prefix skol_info subst' [fresh_tv] rest
+                                        ; return ([], ma_wanted `andWC` mkImplicWC (unitBag child),
+                                            ((TcEvBinds ev_binds_var, ma_co, fresh_tv):proof_tvs,
+                                             body_givens, body_binds, body_wanted, inst_pred)) }
+                                   _ -> panic "solveWantedQCI: freshen binder" }
+                    ; let (_, _, _, _, inst_pred) = result
+                          imp = (implicationPrototype (ctLocEnv loc))
+                            { ic_tclvl = lvl
+                            , ic_skols = new_skols
+                            , ic_given = givens
+                            , ic_wanted = wanted
+                            , ic_binds = ev_binds_var
+                            , ic_warn_inaccessible = False
+                            , ic_info = InstSkol is_qc (pSizeHead inst_pred) }
+                    ; return (imp, result) }
+
        ; rec { skol_info <- mkSkolemInfo skol_info_anon
-             ; (subst, skol_tvs) <- tcInstSkolTyVarsX skol_info empty_subst tvs
-             ; let inst_pred  = substTy    subst body_pred
-                   inst_theta = substTheta subst theta
-                   skol_info_anon = InstSkol is_qc (pSizeHead inst_pred) }
-
-       ; given_ev_vars <- mapM TcS.newEvVar inst_theta
-       ; (lvl, wanted_ev)
-             <- pushLevelNoWorkList (ppr skol_info) $
-                do { let loc' = setCtLocOrigin loc (ScOrigin is_qc NakedSc)
-                         -- Set the thing to prove to have a ScOrigin, so we are
-                         -- careful about its termination checks.
-                         -- See (QC-INV) in Note [Solving a Wanted forall-constraint]
-                   ; newWantedNC loc' rewriters inst_pred }
-
-       ; ev_binds_var <- TcS.newTcEvBinds
-       ; let imp :: Implication
-             imp = (implicationPrototype (ctLocEnv loc))
-                     { ic_tclvl  = lvl
-                     , ic_skols  = skol_tvs
-                     , ic_given  = given_ev_vars
-                     , ic_wanted = mkSimpleWC [CtWanted wanted_ev]
-                     , ic_binds  = ev_binds_var
-                     , ic_warn_inaccessible = False
-                     , ic_info   = skol_info_anon }
+             ; (imp, (proof_tvs, given_ev_vars, ev_binds_var, wanted_ev, inst_pred)) <-
+                 build_prefix skol_info empty_subst [] tvs
+             ; let skol_info_anon = InstSkol is_qc (pSizeHead inst_pred) }
 
       ; imp' <- solveImplication imp
 
@@ -1692,7 +1922,7 @@ solveWantedQCI mode ct@(CQuantCan (QCI { qci_ev =  ev, qci_tvs = tvs
               --     carrying a record of which evidence variables are used
               --     See Note [Free vars of EvFun] in GHC.Tc.Types.Evidence
              do { setWantedDict dest EvCanonical $
-                  EvFun { et_tvs   = skol_tvs
+                  EvFun { et_tvs   = proof_tvs
                         , et_given = given_ev_vars
                         , et_binds = TcEvBinds ev_binds_var
                         , et_body  = wantedCtEvEvId wanted_ev }
@@ -1863,13 +2093,15 @@ runTcPluginsWanted wanted
 setPluginEv :: (EvTerm,Ct) -> TcS ()
 setPluginEv (tm,ct)
   = case ctEvidence ct of
-      CtWanted (WantedCt { ctev_dest = dest })
+      CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rewriters })
         -> case dest of
               EvVarDest {} -> setWantedDict dest EvCanonical tm
                               -- TODO: plugins should be able to signal non-canonicity
-              HoleDest {}  -> setWantedEq dest (CPH { cph_co = evTermCoercion tm
-                                                    , cph_holes = emptyCoHoleSet })
-                              -- TODO: cph_holes: should we try to track rewriters?
+              HoleDest {}  ->
+                let co    = evTermCoercion tm
+                    holes = foldl' addRewriter rewriters
+                                   (univCoDepsHoles (addUnivCoDep emptyUnivCoDeps co))
+                in setWantedEq dest (CPH { cph_co = co, cph_holes = holes })
 
       CtGiven {} -> panic "runTcPluginsWanted.setEv: attempt to solve non-wanted!"
 
@@ -1895,9 +2127,13 @@ data TcPluginProgress = TcPluginProgress
 
 getTcPluginSolvers :: TcS [TcPluginSolver]
 getTcPluginSolvers
-  = do { tcg_env <- TcS.getGblEnv
+  = do { mode <- getTcSMode
+       ; native_binders <- getNativeBinderScope
+       ; if tcsmGivenOnly mode || not (isEmptyVarSet native_binders) then return [] else
+    -- See Note [Native runtime binder scopes] in GHC.Tc.Solver.Monad.
+    do { tcg_env <- TcS.getGblEnv
        ; plugins <- TcS.readTcRef (tcg_plugins tcg_env)
-       ; return $ TcM.solverTcMPlugins plugins }
+       ; return $ TcM.solverTcMPlugins plugins } }
 
 -- | Starting from a pair of (given, wanted) constraints,
 -- invoke each of the typechecker constraint-solving plugins in turn and return

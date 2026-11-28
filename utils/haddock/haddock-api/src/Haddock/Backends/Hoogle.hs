@@ -30,8 +30,9 @@ import Data.List (intercalate, isPrefixOf)
 import Data.Maybe
 import qualified Data.Text as T
 import Data.Version
-import GHC
+import GHC hiding (typeKind)
 import GHC.Core.InstEnv
+import GHC.Core.Type (typeKind)
 import qualified GHC.Driver.DynFlags as DynFlags
 import GHC.Driver.Ppr
 import GHC.Types.SourceText
@@ -42,6 +43,7 @@ import System.Directory
 import System.FilePath
 
 import Documentation.Haddock.Markup
+import Haddock.Convert (hasPrivateTypeCase, synifyKindSig, synifyTypeCase)
 import Haddock.GhcUtils
 import Haddock.Types hiding (Version)
 import Haddock.Utils hiding (out)
@@ -97,6 +99,7 @@ dropHsDocTy = drop_sig_ty
     drop_lty (L src x) = L src (drop_ty x)
 
     drop_ty (HsForAllTy x a e) = HsForAllTy x a (drop_lty e)
+    drop_ty (HsForEachTy x bndrs e) = HsForEachTy x bndrs (drop_lty e)
     drop_ty (HsQualTy x a e) = HsQualTy x a (drop_lty e)
     drop_ty (HsAppTy x a b) = HsAppTy x (drop_lty a) (drop_lty b)
     drop_ty (HsAppKindTy x a b) = HsAppKindTy x (drop_lty a) (drop_lty b)
@@ -106,6 +109,8 @@ dropHsDocTy = drop_sig_ty
     drop_ty (HsOpTy x a b c) = HsOpTy x (drop_lty a) (drop_lty b) (drop_lty c)
     drop_ty (HsParTy x a) = HsParTy x (drop_lty a)
     drop_ty (HsKindSig x a b) = HsKindSig x (drop_lty a) b
+    drop_ty (XHsType (HsTypeExistsRn flag binder body)) =
+      XHsType (HsTypeExistsRn flag binder (drop_lty body))
     drop_ty (HsDocTy _ a _) = drop_ty $ unL a
     drop_ty x = x
 
@@ -276,6 +281,21 @@ ppInstance dflags unit_state x =
         }
 
 ppSynonym :: SDocContext -> TyClDecl GhcRn -> [String]
+ppSynonym sDocContext SynDecl{tcdLName = name, tcdTyVars = tyvars, tcdRhs = L _ (XHsType (HsCoreTyRn ty))}
+  | hasPrivateTypeCase ty =
+      [Outputable.renderWithContext sDocContext (header <+> rhs)]
+  where
+    header =
+      text "type" <+> pprPrefixOcc (unLoc name)
+        <+> hsep (map (ppr . reparenTyVar . unLoc) (hsq_explicit tyvars))
+    rhs
+      | Just (scrutinee, rows) <- synifyTypeCase ty =
+          equals <+> text "case" <+> ppr scrutinee <+> text "of"
+            <+> braces (hsep (punctuate semi (map row rows)))
+      | otherwise = dcolon <+> ppr (reparenLType (synifyKindSig (typeKind ty)))
+    row (pat, body) = ppr pat <+> arrow <+> ppr body
+ppSynonym sDocContext x@SynDecl{tcdRhs = rhs} =
+  [out sDocContext x{tcdRhs = reparenLType rhs}]
 ppSynonym sDocContext x = [out sDocContext x]
 
 ppData :: SDocContext -> TyClDecl GhcRn -> [(Name, DocForDecl Name)] -> [String]
@@ -295,23 +315,31 @@ ppCtor sDocContext dat subdocs con@ConDeclH98{con_args = con_args'} =
   -- AZ:TODO get rid of the concatMap
   concatMap (lookupCon sDocContext subdocs) [con_name con] ++ f con_args'
   where
-    f (PrefixCon _ args) = [typeSig name $ (map cdf_type args) ++ [resType]]
+    f (PrefixCon _ args) =
+      [typeSig name $ foldr
+        addPrefix
+        (funs $ map cdf_type args ++ [resType])
+        (con_telescope con)]
     f (InfixCon x a1 a2) = f $ PrefixCon x [a1, a2]
     f (RecCon _ (L _ recs)) =
       f (PrefixCon noExtField $ map (cdrf_spec . unLoc) recs)
         ++ concat
           [ (concatMap (lookupCon sDocContext subdocs . noLocA . unLoc . foLabel . unLoc) (cdrf_names r))
-            ++ [out sDocContext (map (foExt . unLoc) $ cdrf_names r) `typeSig` [resType, cdf_type $ cdrf_spec r]]
+            ++ [out sDocContext (map (foExt . unLoc) $ cdrf_names r) `typeSig` funs [resType, cdf_type $ cdrf_spec r]]
           | r <- map unLoc recs
           ]
 
     funs = foldr1 (\x y -> reL $ HsFunTy noExtField (HsModifiedFunArr noExtField [] $ HsStandardArr noExtField) x y)
     apps = foldl1 (\x y -> reL $ HsAppTy noExtField x y)
 
-    typeSig nm flds =
+    addPrefix (L _ (HsGadtForAll _ tele)) body = reL $ HsForAllTy noExtField tele body
+    addPrefix (L _ (HsGadtContext ctxt)) body = reL $ HsQualTy noExtField ctxt body
+    addPrefix (L _ HsGadtPar{}) body = reL $ HsParTy noAnn body
+
+    typeSig nm ty =
       operator nm
         ++ " :: "
-        ++ outHsSigType sDocContext (unL $ mkEmptySigType $ funs flds)
+        ++ outHsSigType sDocContext (unL $ mkEmptySigType ty)
 
     -- We print the constructors as comma-separated list. See GHC
     -- docs for con_names on why it is a list to begin with.
@@ -339,8 +367,7 @@ ppCtor
   ( ConDeclGADT
       { con_names = names
       , con_outer_bndrs = L _ outer_bndrs
-      , con_inner_bndrs = inner_bndrs
-      , con_cxts = cxts
+      , con_telescope = telescope
       , con_g_args = args
       , con_res_ty = res_ty
       }
@@ -350,9 +377,8 @@ ppCtor
       typeSig = operator name ++ " :: " ++ outHsSigType sDocContext con_sig_ty
       name = out sDocContext $ unL <$> names
       con_sig_ty = HsSig noExtField outer_bndrs $
-                   mkGadtArgTys inner_bndrs phi_ty
+                   mkGadtArgTys telescope tau_ty
         where
-          phi_ty = foldr mkQualTy tau_ty cxts
           tau_ty = foldr mkFunTy res_ty $
             case args of
               PrefixConGADT _ pos_args -> map cdf_type pos_args
@@ -370,6 +396,7 @@ ppCtor
             L l (HsForAllTy { hst_xforall = noExtField
                                , hst_tele = tele, hst_body = body })
           mkGadtArgTy (L l HsGadtPar{}) body = L l (HsParTy noAnn body)
+          mkGadtArgTy (L _ (HsGadtContext ctxt)) body = mkQualTy ctxt body
 
           mkGadtArgTys :: [LHsGadtTelescope GhcRn] -> LHsType GhcRn -> LHsType GhcRn
           mkGadtArgTys = flip (foldr mkGadtArgTy)

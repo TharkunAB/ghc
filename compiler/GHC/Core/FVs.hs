@@ -16,7 +16,9 @@ module GHC.Core.FVs (
         exprFreeIds,      exprsFreeIds,
         exprFreeIdsDSet,  exprsFreeIdsDSet,
         exprFreeIdsList,  exprsFreeIdsList,
-        bindFreeVars,
+        bindFreeVars, hasFreeVarInCoreAnnotations, hasFreeVarInCoreAnnotationsWith,
+        exprAnnotationFreeVars, coreAnnotationVarSets,
+        bindsAnnotationFreeVars, bindsAnnotationVars, bindsAnnotationVarsWith,
 
         -- * Selective free variables of expressions
         InterestingVarFun,
@@ -74,6 +76,7 @@ import GHC.Data.Maybe( orElse )
 
 import GHC.Utils.Misc
 import GHC.Utils.Panic.Plain
+import Data.Monoid (Any(..), (<>))
 
 {-
 ************************************************************************
@@ -261,6 +264,10 @@ exprFVs (Lit _)         = mempty
 exprFVs (Tick t expr)   = tickish_fvs t `mappend` exprFVs expr
 exprFVs (App fun arg)   = exprFVs fun `mappend` exprFVs arg
 exprFVs (Lam bndr body) = addCoreBndrFV bndr (exprFVs body)
+exprFVs (Pack package_ty witness payload) =
+  deepSelTypeFV package_ty `mappend` deepSelTypeFV witness `mappend` exprFVs payload
+exprFVs (Unpack witness payload package body) =
+  exprFVs package `mappend` addCoreBndrFV witness (addCoreBndrFV payload (exprFVs body))
 exprFVs (Cast expr co)  = exprFVs expr `mappend` deepSelCoFV co
 exprFVs (Case scrut bndr ty alts)
   = exprFVs scrut `mappend` deepSelTypeFV ty `mappend`
@@ -272,6 +279,88 @@ exprFVs (Let (NonRec bndr rhs) body)
 exprFVs (Let (Rec pairs) body)
   = addCoreBndrsFV (map fst pairs) $
     mapUnionFV rhs_fvs pairs `mappend` exprFVs body
+
+-- | Check for a free occurrence in a type, coercion or binder annotation.
+-- A term occurrence contributes its type and multiplicity, but not its Id.
+-- Inspect stable unfolding templates and skip ordinary duplicates of RHSs.
+hasFreeVarInCoreAnnotations :: Var -> CoreExpr -> Bool
+hasFreeVarInCoreAnnotations = hasFreeVarInCoreAnnotationsWith (\_ _ -> False)
+
+-- | Also check the selected application operands during the same traversal.
+hasFreeVarInCoreAnnotationsWith :: (CoreExpr -> CoreExpr -> Bool) -> Var -> CoreExpr -> Bool
+hasFreeVarInCoreAnnotationsWith app target = getAny . expr
+  where
+    (expr, _) = coreAnnotationFVs (\fun arg -> Any (app fun arg)) (Any . anyFreeVarsOfType (== target))
+                                  (Any . anyFreeVarsOfCo (== target))
+                                  (\b uses -> if b == target then mempty else uses)
+
+-- | Collect the free variables of an expression's Core annotations.
+exprAnnotationFreeVars :: CoreExpr -> VarSet
+exprAnnotationFreeVars = fst (coreAnnotationVarSets (\_ _ -> emptyVarSet))
+
+-- | Collect references from binder annotations, RHSs and stable unfoldings.
+-- Include references between the supplied bindings.
+bindsAnnotationFreeVars :: CoreProgram -> VarSet
+bindsAnnotationFreeVars = foldMap (snd (coreAnnotationVarSets (\_ _ -> emptyVarSet)))
+
+-- | Collect every variable named in annotations, even under its binder.
+-- This protects binder identities in a single traversal of a Core program.
+bindsAnnotationVars :: CoreProgram -> VarSet
+bindsAnnotationVars = bindsAnnotationVarsWith (\_ _ -> emptyVarSet)
+
+-- | Also collect references in selected application operands.
+bindsAnnotationVarsWith :: (CoreExpr -> CoreExpr -> VarSet) -> CoreProgram -> VarSet
+bindsAnnotationVarsWith app = foldMap bind
+  where
+    (_, bind) = coreAnnotationFVs app tyCoVarsOfType tyCoVarsOfCo (const id)
+
+-- | Collect free annotation variables and the selected application operands.
+coreAnnotationVarSets :: (CoreExpr -> CoreExpr -> VarSet)
+                      -> (CoreExpr -> VarSet, CoreBind -> VarSet)
+coreAnnotationVarSets app =
+    coreAnnotationFVs app tyCoVarsOfType tyCoVarsOfCo (flip delVarSet)
+
+coreAnnotationFVs
+    :: Monoid refs
+    => (CoreExpr -> CoreExpr -> refs)
+    -> (Type -> refs) -> (Coercion -> refs) -> (Var -> refs -> refs)
+    -> (CoreExpr -> refs, CoreBind -> refs)
+coreAnnotationFVs app ty co hide = (expr, bind)
+  where
+    annotation b = ty (varType b) <> foldMap ty (varMultMaybe b)
+
+    under [] body = body
+    under (b : bs) body = annotation b <> hide b (under bs body)
+
+    expr (Type t) = ty t
+    expr (Coercion c) = co c
+    expr (Var v) = annotation v
+    expr Lit{} = mempty
+    expr (Tick tick body) = tickAnn tick <> expr body
+    expr (App fun arg) = app fun arg <> expr fun <> expr arg
+    expr (Lam b body) = under [b] (expr body)
+    expr (Cast body c) = expr body <> co c
+    expr (Pack schema witness payload) = ty schema <> ty witness <> expr payload
+    expr (Unpack witness payload package body) =
+        expr package <> under [witness, payload] (expr body)
+    expr (Case scrut b t alts) = expr scrut <> ty t <> under [b] (foldMap alt alts)
+    expr (Let (NonRec b rhs) body) = expr rhs <> unfolding b <> under [b] (expr body)
+    expr (Let (Rec pairs) body) =
+        under (map fst pairs) (expr body <> foldMap (\(b, rhs) -> expr rhs <> unfolding b) pairs)
+
+    alt (Alt _ bs rhs) = under bs (expr rhs)
+
+    bind (NonRec b rhs) = annotation b <> unfolding b <> expr rhs
+    bind (Rec pairs) = foldMap (\(b, rhs) -> bind (NonRec b rhs)) pairs
+
+    tickAnn (Breakpoint _ _ ids) = foldMap annotation ids
+    tickAnn _ = mempty
+
+    unfolding b
+      | isId b
+      , CoreUnfolding { uf_src = src, uf_tmpl = rhs } <- realIdUnfolding b
+      , isStableSource src = expr rhs
+      | otherwise = mempty
 
 ---------
 rhs_fvs :: (Id, CoreExpr) -> SelectiveDFV
@@ -426,8 +515,15 @@ orphNamesOfType :: Type -> NameSet
 orphNamesOfType ty | Just ty' <- coreView ty = orphNamesOfType ty'
                 -- Look through type synonyms (#4912)
 orphNamesOfType (TyVarTy _)          = emptyNameSet
+orphNamesOfType (TermVarTy v)        = orphNamesOfType (varType v)
+orphNamesOfType (TermAppTy f arg)    = orphNamesOfType (varType f)
+                                       `unionNameSet` orphNamesOfType arg
+orphNamesOfType (ExistsTy _ v ty) = orphNamesOfType (varType v) `unionNameSet` orphNamesOfType ty
+orphNamesOfType (DepFunTy _ v res)     = orphNamesOfType (varType v)
+                                       `unionNameSet` orphNamesOfType res
 orphNamesOfType (LitTy {})           = emptyNameSet
-orphNamesOfType (ForAllTy bndr res)  = orphNamesOfType (binderType bndr)
+orphNamesOfType (ForAllTy ma bndr res) = orphNamesOfType ma `unionNameSet`
+                                     orphNamesOfType (binderType bndr)
                                        `unionNameSet` orphNamesOfType res
 orphNamesOfType (AppTy fun arg)      = orphNamesOfType fun `unionNameSet` orphNamesOfType arg
 
@@ -435,11 +531,12 @@ orphNamesOfType (TyConApp tycon tys) = func
                                        `unionNameSet` orphNamesOfTyCon tycon
                                        `unionNameSet` orphNamesOfTypes tys
         where func = case tys of
-                       arg:_ | tycon == fUNTyCon -> orph_names_of_fun_ty_con arg
+                       _ma:mult:_ | tycon == fUNTyCon -> orph_names_of_fun_ty_con mult
                        _ -> emptyNameSet
 
-orphNamesOfType (FunTy af w arg res) =  func
+orphNamesOfType (FunTy af ma w arg res) =  func
                                        `unionNameSet` unitNameSet fun_tc
+                                       `unionNameSet` orphNamesOfType ma
                                        `unionNameSet` orphNamesOfType w
                                        `unionNameSet` orphNamesOfType arg
                                        `unionNameSet` orphNamesOfType res
@@ -497,6 +594,9 @@ orphNamesOfExpr e
     go (Coercion _co)       = emptyNameSet -- See wrinkle (ON1) of Note [Finding orphan names]
     go (App e1 e2)          = go e1 `unionNameSet` go e2
     go (Lam v e)            = go e `delFromNameSet` idName v
+    go (Pack schema w e)    = orphNamesOfTypes [schema, w] `unionNameSet` go e
+    go (Unpack w p e body)  = go e `unionNameSet` (go body `delFromNameSet` getName w
+                                                           `delFromNameSet` getName p)
     go (Tick _ e)           = go e
     go (Cast e _co)         = go e  -- See wrinkle (ON1) of Note [Finding orphan names]
     go (Let (NonRec _ r) e) = go e `unionNameSet` go r
@@ -749,6 +849,19 @@ freeVars = go
       where
         (bind2, bind_fvs) = freeVarsBind bind (freeVarsOf body2)
         body2             = go body
+
+    go (Pack schema witness payload)
+      = ( unionDVarSets [tyCoVarsOfTypeDSet schema, tyCoVarsOfTypeDSet witness,
+                         freeVarsOf payload']
+        , AnnPack schema witness payload' )
+      where payload' = go payload
+
+    go (Unpack witness payload package body)
+      = ( freeVarsOf package' `unionDVarSet` delBindersFV [witness, payload] (freeVarsOf body')
+        , AnnUnpack witness payload package' body' )
+      where
+        package' = go package
+        body' = go body
 
     go (Cast expr co)
       = ( freeVarsOf expr2 `unionDVarSet` cfvs

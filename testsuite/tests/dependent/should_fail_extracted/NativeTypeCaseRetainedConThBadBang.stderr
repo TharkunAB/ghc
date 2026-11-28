@@ -1,0 +1,5 @@
+NativeTypeCaseRetainedConThBadBang.hs:6:2: error: [GHC-18932]
+    • Unexpected strictness (!) annotation: !Int
+      strictness (!) annotation can only appear on the arguments of a data constructor type
+    • In the definition of data constructor ‘BadBang’
+

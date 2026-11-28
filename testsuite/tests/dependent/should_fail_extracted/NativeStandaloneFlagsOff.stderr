@@ -1,0 +1,20 @@
+NativeStandaloneFlagsOff.hs:6:15: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Bool’
+    Suggested fix: Perhaps use ‘P.Bool’ (imported from Prelude)
+
+NativeStandaloneFlagsOff.hs:6:21: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Char’
+    Suggested fix: Perhaps use ‘P.Char’ (imported from Prelude)
+
+NativeStandaloneFlagsOff.hs:11:25: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Bool’
+    Suggested fix: Perhaps use ‘P.Bool’ (imported from Prelude)
+
+NativeStandaloneFlagsOff.hs:11:34: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Bool’
+    Suggested fix: Perhaps use ‘P.Bool’ (imported from Prelude)
+
+NativeStandaloneFlagsOff.hs:14:17: error: [GHC-37479]
+    ‘P.not’ is a term-level binding
+     and can not be used at the type level.
+

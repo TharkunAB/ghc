@@ -32,8 +32,9 @@ dsPrimCall :: Id -> Coercion -> ForeignCall
 dsPrimCall fn_id co fcall = do
     let
         ty                   = coercionLKind co
-        (tvs, fun_ty)        = tcSplitForAllInvisTyVars ty
-        (arg_tys, io_res_ty) = tcSplitFunTys fun_ty
+        (ma_tvs, fun_ty)     = tcSplitForAllInvisTyVars ty
+        tvs                 = map snd ma_tvs
+        (_, arg_tys, io_res_ty) = tcSplitFunTys fun_ty
 
     args <- newSysLocalsDs arg_tys  -- no FFI representation polymorphism
 

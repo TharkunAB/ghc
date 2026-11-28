@@ -1,0 +1,24 @@
+NativeExistentialSourceEscape.hs:8:43: error: [GHC-25897]
+    • Couldn't match expected type ‘p’ with actual type ‘Maybe a’
+      ‘p’ is a rigid type variable bound by
+        the inferred type of bad :: p
+        at NativeExistentialSourceEscape.hs:8:1-43
+    • In the expression: x
+      In a case alternative: Pack (type a) x -> x
+      In the expression: case supplied of Pack (type a) x -> x
+    • Relevant bindings include
+        x :: Maybe a (bound at NativeExistentialSourceEscape.hs:8:38)
+        bad :: p (bound at NativeExistentialSourceEscape.hs:8:1)
+
+NativeExistentialSourceEscape.hs:10:44: error: [GHC-25897]
+    • Couldn't match expected type ‘p’ with actual type ‘Maybe a0’
+      ‘p’ is a rigid type variable bound by
+        the inferred type of badWildcard :: p
+        at NativeExistentialSourceEscape.hs:10:1-44
+    • In the expression: x
+      In a case alternative: Pack _ x -> x
+      In the expression: case supplied of Pack _ x -> x
+    • Relevant bindings include
+        x :: Maybe a0 (bound at NativeExistentialSourceEscape.hs:10:39)
+        badWildcard :: p (bound at NativeExistentialSourceEscape.hs:10:1)
+

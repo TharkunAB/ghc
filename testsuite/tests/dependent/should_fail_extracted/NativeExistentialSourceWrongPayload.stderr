@@ -1,0 +1,6 @@
+NativeExistentialSourceWrongPayload.hs:9:30: error: [GHC-83865]
+    • Couldn't match expected type ‘Bool’ with actual type ‘Char’
+    • In the first argument of ‘Just’, namely ‘'a'’
+      In the expression: Just 'a'
+      In the expression: Pack (type Bool) (Just 'a')
+

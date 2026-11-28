@@ -1119,12 +1119,7 @@ getDictionaryBindings theta = do
   let dict_var = mkVanillaGlobal dictName theta
   loc <- getCtLocM (GivenOrigin (getSkolemInfo unkSkol)) Nothing
 
-  return $ CtWanted $ WantedCt {
-    ctev_pred = varType dict_var,
-    ctev_dest = EvVarDest dict_var,
-    ctev_loc = loc,
-    ctev_rewriters = emptyCoHoleSet
-  }
+  return $ CtWanted $ mkWantedCt loc emptyCoHoleSet (varType dict_var) (EvVarDest dict_var)
 
 -- Find instances where the head unifies with the provided type
 findMatchingInstances :: Type -> TcM [(ClsInst, [DFunInstType])]
@@ -1138,7 +1133,7 @@ findMatchingInstances ty = do
     k -> Constraint where k is the type of the queried type.
   -}
   try_cls ies cls
-    | Just (_, _, arg_kind, res_kind) <- splitFunTy_maybe (tyConKind $ classTyCon cls)
+    | Just (_, _, _, arg_kind, res_kind) <- splitFunTy_maybe (tyConKind $ classTyCon cls)
     , isConstraintKind res_kind
     , Type.typeKind ty `eqType` arg_kind
     , (matches, _, _) <- lookupInstEnv True ies cls [ty]
@@ -1225,11 +1220,12 @@ checkForExistence clsInst mb_inst_tys = do
       tau   = mkClassPred cls (substTheta subst args)
       -- Constrain the instance with any residual constraints
       phi   = mkPhiTy thetas tau
-      sigma = mkForAllTys (map (\v -> Bndr v Inferred) dfun_tvs) phi
+      sigma = mkForAllTys [(substTy subst ma, Bndr v Inferred) | (ma,v) <- ma_dfun_tvs] phi
 
     in inst { is_dfun = (is_dfun inst) { varType = sigma }}
     where
-    (dfun_tvs, _, cls, args) = instanceSig inst
+    (ma_dfun_tvs, _, cls, args) = instanceSig inst
+    dfun_tvs = map snd ma_dfun_tvs
 
 -----------------------------------------------------------------------------
 -- Compile an expression, run it, and deliver the result

@@ -37,12 +37,14 @@ import GHC.Core.TyCon
 import GHC.Core.TyCon.Set
 import GHC.Core.TyCon.RecWalk
 import GHC.Core.SimpleOpt( SimpleOpts )
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Demand
 import GHC.Types.Cpr
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Types.Unique.Supply
 import GHC.Types.Name ( getOccFS )
@@ -65,6 +67,7 @@ import Data.List ( unzip4 )
 import GHC.Types.RepType
 import GHC.Unit.Types
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Compare (eqType)
 
 {-
 ************************************************************************
@@ -148,7 +151,9 @@ data WwOpts
     wo_module            :: !Module
   , -- | Generate workers even if the only effect is some args get passed
     -- unlifted. See Note [WW for calling convention]
-    wo_unlift_strict     :: !Bool }
+    wo_unlift_strict     :: !Bool
+  , wo_core_mode         :: !SimplCoreMode
+  , wo_index_uses        :: VarSet }
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args
@@ -164,6 +169,7 @@ mkWwBodies :: WwOpts
            -> Id             -- ^ The original function
            -> Arity          -- ^ Worker/wrapper arity
            -> [Var]          -- ^ Manifest args of original function
+           -> VarSet         -- ^ Arguments whose identity must stay in scope
            -> Type           -- ^ Result type of the original function,
                              --   after being stripped of args
            -> [Demand]       -- ^ Strictness of original function
@@ -209,7 +215,7 @@ mkWwBodies :: WwOpts
 -- and beta-redexes]), which allows us to apply the same split to function body
 -- and its unfolding(s) alike.
 --
-mkWwBodies opts fun_id ww_arity arg_vars res_ty demands res_cpr
+mkWwBodies opts fun_id ww_arity arg_vars kept_args res_ty demands res_cpr
   = do  { massertPpr arity_ok
                      (text "wrong wrapper arity" $$ ppr fun_id $$ ppr arg_vars $$ ppr res_ty $$ ppr demands)
 
@@ -222,19 +228,23 @@ mkWwBodies opts fun_id ww_arity arg_vars res_ty demands res_cpr
         ; (subst, cloned_arg_vars) <- cloneBndrsM empty_subst zapped_arg_vars
         ; let res_ty' = substTyUnchecked subst res_ty
               init_str_marks = map (const NotMarkedStrict) cloned_arg_vars
+              keep_indices = mkVarSet [new | (old, new) <- zip arg_vars cloned_arg_vars
+                                          , old `elemVarSet` kept_args]
 
         ; (useful1, work_args_str, wrap_fn_str, fn_args)
              <- -- pprTrace "mkWWbodies" (ppr fun_id $$ ppr (arg_vars `zip` cloned_arg_vars) $$ ppr demands) $
-                mkWWstr opts cloned_arg_vars init_str_marks
+                mkWWstrKeeping keep_indices opts cloned_arg_vars init_str_marks
 
         ; let (work_args, work_marks) = unzip work_args_str
 
         -- Do CPR w/w.  See Note [Always do CPR w/w]
-        ; (useful2, wrap_fn_cpr, work_fn_cpr)
+        ; (useful2, work_res_ty, wrap_fn_cpr, work_fn_cpr)
               <- mkWWcpr_entry opts res_ty' res_cpr
 
         ; let (work_lam_args, work_call_args, work_call_str)
                 | needsVoidWorkerArg fun_id arg_vars work_args
+                  || (wo_core_mode opts == RetainedCore &&
+                      needs_result_arg (reverse work_args) work_res_ty)
                 = addVoidWorkerArg work_args work_marks
                 | otherwise
                 = (work_args, work_args, work_marks)
@@ -261,6 +271,13 @@ mkWwBodies opts fun_id ww_arity arg_vars res_ty demands res_cpr
         -- f's RHS is now trivial (size 1) we still want the __inline__ to prevent
         -- fw from being inlined into f's RHS
   where
+    -- See Note [Unboxed worker results under retained binders].
+    needs_result_arg _ ty | typeKind ty `eqType` liftedTypeKind = False
+    needs_result_arg [] _ = False
+    needs_result_arg (v:vs) ty
+      | isTyVar v || isCoVar v = needs_result_arg vs (mkLamType v ty)
+      | otherwise              = anyFreeVarsOfType (== v) ty
+
     zap_var v | isTyVar v = v
               | otherwise = modifyIdInfo zap_info v
     zap_info info -- See Note [Zap IdInfo on worker args]
@@ -412,6 +429,22 @@ addVoidWorkerArg work_args str_marks
     , str_marks ++ [NotMarkedStrict] )
 
 {-
+Note [Unboxed worker results under retained binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider a function whose result is a pair indexed by its last argument:
+
+  f :: foreach (xs :: Vec a n) -> (Mark xs, Mark xs)
+
+CPR can return the two fields in an unboxed tuple. But the result of a
+retained binder must have kind Type. Give the worker the following type:
+
+  $wf :: foreach (xs :: Vec a n) -> Void# -> (# Mark xs, Mark xs #)
+
+The wrapper passes void# with the existing worker calling convention.
+Only the innermost value binder can need the extra argument. Every outer
+value binder returns a function of lifted type. Traverse any intervening
+type and coercion binders as mkLamType does when it types the worker.
+
 Note [Protecting the last value argument]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If the user writes (\_ -> E), they might be intentionally disallowing
@@ -628,6 +661,9 @@ canUnboxArg fam_envs ty (n :* sd)
   -- From here we are strict and not absent
   | Just (tc, tc_args, co) <- normSplitTyConApp_maybe fam_envs ty
   , Just [dc] <- canUnboxTyCon tc  -- tc is never a newtype
+  , null (dataConRepArgBinders dc)
+  , not (any isCoVar (dataConExTyCoVars dc))
+    -- The field demands do not describe existential coercion binders.
   , let arity = dataConRepArity dc
   , Just (Unboxed, dmds) <- viewProd arity sd -- See Note [Boxity analysis]
   , dmds `lengthIs` dataConRepArity dc
@@ -649,6 +685,7 @@ canUnboxResult fam_envs ty cpr
   , dcs `lengthAtLeast` con_tag -- This might not be true if we import the
                                 -- type constructor via a .hs-boot file (#8743)
   , let dc = dcs `getNth` (con_tag - fIRST_TAG)
+  , null (dataConRepArgBinders dc) -- Flat worker fields cannot retain scope.
   , null (dataConExTyCoVars dc) -- no existentials;
                                 -- See (CPR1) in Note [Which types are unboxed?]
                                 -- and GHC.Core.Opt.CprAnal.argCprType
@@ -964,13 +1001,20 @@ mkWWstr :: WwOpts
                    [CoreExpr])           -- Reboxed args for the call to the
                                          -- original RHS. Corresponds one-to-one
                                          -- with the wrapper arg vars
-mkWWstr opts args str_marks
+mkWWstr = mkWWstrKeeping emptyVarSet
+
+mkWWstrKeeping :: VarSet -> WwOpts -> [Var] -> [StrictnessMark]
+               -> UniqSM (WwUse, [(Var, StrictnessMark)], CoreExpr -> CoreExpr, [CoreExpr])
+mkWWstrKeeping keep_indices opts args str_marks
   = -- pprTrace "mkWWstr" (ppr args) $
     go args str_marks
   where
     go [] _ = return (boringSplit, [], nop_fn, [])
     go (arg : args) (str:strs)
-      = do { (useful1, args1, wrap_fn1, wrap_arg)  <- mkWWstr_one opts arg str
+      = do { (useful1, args1, wrap_fn1, wrap_arg) <-
+             if arg `elemVarSet` keep_indices
+             then return (boringSplit, [(arg,str)], nop_fn, varToCoreExpr arg)
+             else mkWWstr_one opts arg str
            ; (useful2, args2, wrap_fn2, wrap_args) <- go args strs
            ; return ( useful1 || useful2
                     , args1 ++ args2
@@ -1442,13 +1486,13 @@ findTypeShape fam_envs ty
        -- to look deep into such products -- see #18034
   where
     go rec_tc ty
-       | Just (_, _, _, res) <- splitFunTy_maybe ty
+       | Just (_, _, _, _, res) <- splitFunTy_maybe ty
        = TsFun (go rec_tc res)
 
        | Just (tc, tc_args)  <- splitTyConApp_maybe ty
        = go_tc rec_tc tc tc_args
 
-       | Just (_, ty') <- splitForAllTyCoVar_maybe ty
+       | Just (_ma, _, ty') <- splitForAllTyCoVar_maybe ty
        = go rec_tc ty'
 
        | otherwise
@@ -1460,6 +1504,7 @@ findTypeShape fam_envs ty
 
        | not (isNewTyCon tc)
        , Just con <- tyConSingleDataCon_maybe tc
+       , not (any isCoVar (dataConExTyCoVars con))
        , Just rec_tc <- if isTupleTyCon tc
                         then Just rec_tc
                         else checkRecTc rec_tc tc
@@ -1539,7 +1584,7 @@ isRecDataCon fam_envs fuel orig_dc
         TyConApp tc tc_args -> go_tc_app fuel visited_tcs tc tc_args
           -- See Note [Detecting recursive data constructors], points (B) and (C)
 
-        ForAllTy _ ty' -> go_arg_ty fuel visited_tcs ty'
+        ForAllTy _ _ ty' -> go_arg_ty fuel visited_tcs ty'
           -- See Note [Detecting recursive data constructors], point (A)
 
         CastTy ty' _ -> go_arg_ty fuel visited_tcs ty'
@@ -1600,11 +1645,12 @@ mkWWcpr_entry
   -> Type                              -- function body
   -> Cpr                               -- CPR analysis results
   -> UniqSM (WwUse,                    -- Is w/w'ing useful?
+             Type,                     -- Result type of the worker body
              CoreExpr -> CoreExpr,     -- New wrapper. 'nop_fn' if not useful
              CoreExpr -> CoreExpr)     -- New worker.  'nop_fn' if not useful
 -- ^ Entrypoint to CPR W/W. See Note [Worker/wrapper for CPR] for an overview.
 mkWWcpr_entry opts body_ty body_cpr
-  | not (wo_cpr_anal opts) = return (boringSplit, nop_fn, nop_fn)
+  | not (wo_cpr_anal opts) = return (boringSplit, body_ty, nop_fn, nop_fn)
   | otherwise = do
     -- Part (1)
     res_bndr <- mk_res_bndr body_ty
@@ -1621,8 +1667,8 @@ mkWWcpr_entry opts body_ty body_cpr
     let wrap_fn      = unbox_transit_tup rebuilt_result                 -- 3 2
         work_fn body = bind_res_bndr body (work_unpack_res transit_tup) -- 1 2 3
     return $ if not useful
-                then (boringSplit, nop_fn, nop_fn)
-                else (usefulSplit, wrap_fn, work_fn)
+                then (boringSplit, body_ty, nop_fn, nop_fn)
+                else (usefulSplit, exprType transit_tup, wrap_fn, work_fn)
 
 -- | Part (1) of Note [Worker/wrapper for CPR].
 mk_res_bndr :: Type -> UniqSM Id

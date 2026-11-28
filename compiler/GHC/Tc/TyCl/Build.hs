@@ -7,7 +7,7 @@
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.Tc.TyCl.Build (
-        buildDataCon,
+        buildDataCon, buildDataConWithRetainedArgs, buildDataConWithTelescope,
         buildPatSyn,
         TcMethInfo, MethInfo,
         buildClass, buildAbstractClass,
@@ -169,7 +169,63 @@ buildDataCon :: FamInstEnvs
 --   a) makes the worker Id
 --   b) makes the wrapper Id if necessary, including
 --      allocating its unique (hence monadic)
-buildDataCon fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
+buildDataCon = buildDataConWithRetainedArgs []
+
+-- | Build a constructor with its existing retained-field layout.
+buildDataConWithRetainedArgs :: [Maybe Id] -- ^ Retained field binders, or []
+                            -> FamInstEnvs
+            -> DataConBangOpts
+            -> Name
+            -> Bool                     -- Declared infix
+            -> TyConRepName
+            -> [HsSrcBang]
+           -> [FieldLabel]             -- Field labels
+           -> [TyVar]                  -- Universals
+           -> [TyCoVar]                -- Existentials
+           -> [TyVarBinder]            -- User-written 'TyVarBinder's
+           -> [EqSpec]                 -- Equality spec
+           -> KnotTied ThetaType       -- Does not include the "stupid theta"
+                                       -- or the GADT equalities
+           -> [KnotTied (Scaled Type)] -- Arguments
+           -> KnotTied Type            -- Result types
+           -> KnotTied TyCon           -- Rep tycon
+           -> NameEnv ConTag           -- Maps the Name of each DataCon to its
+                                       -- ConTag
+           -> TcRnIf m n DataCon
+-- A wrapper for DataCon.mkDataCon that
+--   a) makes the worker Id
+--   b) makes the wrapper Id if necessary, including
+--      allocating its unique (hence monadic)
+buildDataConWithRetainedArgs = buildDataConWithTelescope (LegacyConOrder 0)
+
+-- | Build a constructor with an ordered source telescope.
+-- Retained fields use the direct lazy representation, without a wrapper.
+buildDataConWithTelescope :: ConSourceOrder -- ^ Constructor argument order
+                            -> [Maybe Id] -- ^ Retained field binders, or []
+                            -> FamInstEnvs
+            -> DataConBangOpts
+            -> Name
+            -> Bool                     -- Declared infix
+            -> TyConRepName
+            -> [HsSrcBang]
+           -> [FieldLabel]             -- Field labels
+           -> [TyVar]                  -- Universals
+           -> [TyCoVar]                -- Existentials
+           -> [TyVarBinder]            -- User-written 'TyVarBinder's
+           -> [EqSpec]                 -- Equality spec
+           -> KnotTied ThetaType       -- Does not include the "stupid theta"
+                                       -- or the GADT equalities
+           -> [KnotTied (Scaled Type)] -- Arguments
+           -> KnotTied Type            -- Result types
+           -> KnotTied TyCon           -- Rep tycon
+           -> NameEnv ConTag           -- Maps the Name of each DataCon to its
+                                       -- ConTag
+           -> TcRnIf m n DataCon
+-- A wrapper for DataCon.mkDataCon that
+--   a) makes the worker Id
+--   b) makes the wrapper Id if necessary, including
+--      allocating its unique (hence monadic)
+buildDataConWithTelescope late_count retained_binders fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
              field_lbls univ_tvs ex_tvs user_tvbs eq_spec ctxt arg_tys res_ty
              rep_tycon tag_map
   = do  { wrap_name <- newImplicitBinder src_name mkDataConWrapperOcc
@@ -184,16 +240,27 @@ buildDataCon fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
         ; let stupid_ctxt = mkDataConStupidTheta rep_tycon (map scaledThing arg_tys) univ_tvs
               tag = lookupNameEnv_NF tag_map src_name
               -- See Note [Constructor tag allocation], fixes #14657
-              data_con = mkDataCon src_name declared_infix prom_info
+              data_con = mkDataConWithTelescope late_count retained_binders src_name declared_infix prom_info
                                    src_bangs impl_bangs str_marks field_lbls
-                                   univ_tvs ex_tvs
+                                   univ_tvs worker_exs
                                    noConcreteTyVars
                                    user_tvbs eq_spec ctxt
                                    arg_tys res_ty NoPromInfo rep_tycon tag
                                    stupid_ctxt dc_wrk dc_rep
               dc_wrk = mkDataConWorkId work_name data_con
-              (dc_rep, impl_bangs, str_marks) =
-                 initUs_ us (mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con)
+              (worker_exs, worker_us)
+                | SrcBangOpts {} <- dc_bang_opts
+                , null retained_binders, all isTyVar ex_tvs
+                , Just (proofs, rest) <- buildGadtProofs_maybe us eq_spec
+                , not (isTypeDataTyCon rep_tycon || isNewTyCon rep_tycon)
+                = (ex_tvs ++ proofs, rest)
+                | otherwise
+                = (ex_tvs, us)
+              (dc_rep, impl_bangs, str_marks)
+                | null retained_binders || dataConHasRetainedResult data_con
+                = initUs_ worker_us (mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con)
+                | otherwise
+                = (NoDataConRep, map (const HsLazy) arg_tys, [])
 
         ; traceIf (text "buildDataCon 2" <+> ppr src_name)
         ; return data_con }
@@ -254,11 +321,11 @@ buildPatSyn src_name declared_infix matcher@(_, matcher_ty,_) builder
              matcher builder field_labels
   where
     ((_:_:univ_tvs1), req_theta1, tau) = tcSplitSigmaTy $ matcher_ty
-    ([pat_ty1, cont_sigma, _], _)      = tcSplitFunTys tau
+    (_, [pat_ty1, cont_sigma, _], _) = tcSplitFunTys tau
     (ex_tvs1, prov_theta1, cont_tau)   = tcSplitSigmaTy (scaledThing cont_sigma)
-    (arg_tys1, _) = (tcSplitFunTys cont_tau)
+    (_, arg_tys1, _) = tcSplitFunTys cont_tau
     twiddle = char '~'
-    subst = zipTvSubst (univ_tvs1 ++ ex_tvs1)
+    subst = zipTvSubst (map snd (univ_tvs1 ++ ex_tvs1))
                        (mkTyVarTys (binderVars (univ_tvs ++ ex_tvs)))
 
     -- For a nullary pattern synonym we add a single (# #) argument to the

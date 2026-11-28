@@ -1,0 +1,12 @@
+NativePromotedClassDirectOtherHead.hs:7:17: error: [GHC-83865]
+    • Couldn't match type: f x
+                     with: g x
+      Expected: Just (f x) :~: Just (g x)
+        Actual: Just (f x) :~: Just (f x)
+    • In the expression: Refl
+      In an equation for ‘control’: control _ _ _ = Refl
+    • Relevant bindings include
+        control :: Proxy f
+                   -> Proxy g -> Proxy x -> Just (f x) :~: Just (g x)
+          (bound at NativePromotedClassDirectOtherHead.hs:7:1)
+

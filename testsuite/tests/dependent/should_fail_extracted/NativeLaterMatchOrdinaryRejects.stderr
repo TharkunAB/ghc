@@ -1,0 +1,40 @@
+NativeLaterMatchOrdinaryRejects.hs:12:26: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘* %GHC.Internal.Types.Matchable -> *’,
+        but ‘KnownListCallback’ has kind ‘* %U -> *’
+    • In the first argument of ‘Apply’, namely ‘KnownListCallback’
+      In the type ‘Apply KnownListCallback Bool’
+      In the type synonym declaration for ‘BadApplyOff’
+
+NativeLaterMatchOrdinaryRejects.hs:16:25: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘(Bool %M -> Bool %M -> *) %M -> Endo @M @M Bool’,
+        but ‘'Endo @U’ has kind ‘(Bool %U -> Bool %M -> *)
+                                 %GHC.Internal.Types.Matchable -> Endo @U @M Bool’
+    • In the first argument of ‘Holder’, namely ‘('Endo @U)’
+      In the type ‘Holder ('Endo @U)’
+      In the type synonym declaration for ‘BadEndo1’
+
+NativeLaterMatchOrdinaryRejects.hs:17:25: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘(Bool %M -> Bool %M -> *) %M -> Endo @M @M Bool’,
+        but ‘'Endo @M @U’ has kind ‘(Bool %M -> Bool %U -> *)
+                                    %GHC.Internal.Types.Matchable -> Endo @M @U Bool’
+    • In the first argument of ‘Holder’, namely ‘('Endo @M @U)’
+      In the type ‘Holder ('Endo @M @U)’
+      In the type synonym declaration for ‘BadEndo2’
+
+NativeLaterMatchOrdinaryRejects.hs:19:28: error: [GHC-83865]
+    • Expected kind ‘LaterMatchability.Mapper’,
+        but ‘Map’ has kind ‘(k0 %t0 -> a0) -> [k0] -> [a0]’
+    • In the first argument of ‘Recipe’, namely ‘Map’
+      In the type ‘Recipe Map’
+      In the type synonym declaration for ‘BadRankOptIn’
+
+NativeLaterMatchOrdinaryRejects.hs:21:1: error: [GHC-27346]
+    • The type family ‘WrapOpen’ should have 2 arguments, but has been given 1
+    • In the type synonym declaration for ‘BadBoxArity’
+

@@ -37,10 +37,16 @@ import GHC.Tc.Gen.Expand( tcExpand )
 import GHC.Tc.Gen.App
 import GHC.Tc.Gen.Head
 import GHC.Tc.Gen.Do
-import GHC.Tc.Gen.Bind        ( tcLocalBinds )
+import GHC.Tc.Gen.SourceTable (sourceTableOccurrence, optionalSourceUses, registerOptionalSourceUses,
+                               isLargeElimResultKind, toKindMatchableArrows)
+import GHC.Tc.Gen.Bind        ( tcLocalBinds, tcNonRecLets, tcNonRecLetAtType )
+import GHC.Tc.Gen.Sig         ( isCompleteHsSig )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Arrow
-import GHC.Tc.Gen.Match( tcBody, tcLambdaMatches, tcCaseMatches
+import GHC.Tc.Gen.Match( tcBody, tcScopedRuntimeBody, tcLambdaMatches, tcExprCaseMatches, tcIndexedCaseMatches, tcRetainedCase
+                       , tcRetainedCallCase, tcEmptyRetainedScrutinee
+                       , tcOpenImplicitPackage, tcOpenImplicitPackageAt
+                       , implicitPayloadType, matchesImplicitPayloadPat
                        , tcGRHSNE, tcDoStmts )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
 import GHC.Tc.Zonk.TcType
@@ -51,48 +57,70 @@ import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic, hasFixedRuntimeRep )
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Utils.Env
+import GHC.Tc.Types.ErrCtxt ( ReportRedundantConstraints(NoRRC) )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Errors.Types hiding (HoleError)
 
 import GHC.Core.Multiplicity
+import qualified GHC.Core as Core
+import GHC.Core.Dependent ( hasNativeDependentExpr, supportsQuickLookType )
+import GHC.Core.Utils (applyTypeToArgs)
 import GHC.Core.UsageEnv
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
+import GHC.Core.Make (mkCoreApps, mkCoreConApps, rEC_CON_ERROR_ID, tYPE_ERROR_ID)
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep (Type(AppTy, CastTy, DepDictTy, DepFunTy, ExistsTy, ForAllTy, FunTy, TermAppTy, TermVarTy, TyConApp, TyVarTy))
 import GHC.Core.Coercion
-import GHC.Core.Predicate( decomposeIPPred )
+import GHC.Core.Predicate( decomposeIPPred, getEqPredTys_maybe, mkNomEqPred )
 
 import GHC.Types.Basic
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Map
 import GHC.Types.Unique.Set
+import GHC.Types.Var ( ExistsTyFlag(ImplicitExists), mkTyVar )
+import GHC.Types.Var.Set (TyCoVarSet, elemVarSet, mkVarSet, sizeVarSet, unionVarSet)
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Name.Reader
+import GHC.Types.Name.Set (extendNameSet)
+import GHC.Types.SourceText (SourceText(NoSourceText))
+import GHC.Types.Literal (Literal(LitString))
 import GHC.Types.SrcLoc
+
+import GHC.Types.Var.Env (emptyVarEnv, mkInScopeSetList)
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs
+import GHC.Builtin.Modules ( mkGhcInternalModule )
 import GHC.Builtin.Uniques ( mkBuiltinUnique )
+import GHC.Iface.Env ( lookupOrig )
 
+import GHC.Driver.Config.HsToCore.Ticks (initTicksConfig)
+import GHC.Driver.Ppr (showSDoc)
+import GHC.Driver.Session (sccProfilingEnabled)
+import GHC.HsToCore.Ticks (TicksConfig(ticks_passes), TickishType(Breakpoints))
 import GHC.Driver.DynFlags
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
+import GHC.Data.Bag (listToBag, unionBags)
 import GHC.Data.List.SetOps
 import GHC.Data.Maybe
-import GHC.Data.FastString (fastStringToShortText)
+import GHC.Data.FastString (bytesFS, fastStringToShortText, fsLit, mkFastString)
 
 import Control.Monad
+import Data.Data (Data, cast, gmapQ)
+import Data.List (partition)
 import qualified Data.List.NonEmpty as NE
 
 import qualified GHC.LanguageExtensions as LangExt
@@ -167,36 +195,92 @@ tcPolyExprCheck :: HsExpr GhcRn
 -- See Note [Skolemisation overview] in GHC.Tc.Utils.Unify
 
 tcPolyExprCheck expr res_ty
-  = outer_skolemise res_ty $ \pat_tys rho_ty ->
-    let
-      -- tc_body is a little loop that looks past parentheses
-      tc_body (HsPar x (L loc e))
-        = setSrcSpanA loc $
-          do { e' <- tc_body e
-             ; return (HsPar x (L loc e')) }
-
-      -- Look through any untyped splices (#24559)
-      -- See Note [Type Checking Template Haskell Splices]
-      tc_body (HsUntypedSplice splice_res _)
-        = do { body <- getUntypedSpliceBody splice_res
-             ; tc_body body }
-
-      -- The special case for lambda: go to tcLambdaMatches, passing pat_tys
-      tc_body e@(HsLam x lam_variant matches)
-        = do { (wrap, matches') <-  tcLambdaMatches e lam_variant matches pat_tys
-                                                   (mkCheckExpType rho_ty)
-               -- NB: tcLambdaMatches concludes with deep skolemisation,
-               --     if DeepSubsumption is on;  hence no need to do that here
-             ; return (mkHsWrap wrap $ HsLam x lam_variant matches') }
-
-      -- The general case: just do deep skolemisation if necessary,
-      -- before handing off to tcExpr
-      tc_body e = do { ds_flag <- getDeepSubsumptionFlag
-                     ; inner_skolemise ds_flag rho_ty $ \rho_ty' ->
-                       tcExpr e (mkCheckExpType rho_ty') }
-    in tc_body expr
+  | any (\(ma, _) -> not (ma `tcEqType` unmatchableDataConTy)) expected_bndrs
+  , case res_ty of
+      Left{}  -> True
+      Right{} -> bare_variable expr
+  = tc_existing_value expr
+  | otherwise
+  = tc_skolemise expr
   where
-    -- `outer_skolemise` is used always
+    expected_ty = case res_ty of
+      Left ty   -> ty
+      Right sig -> idType (sig_bndr sig)
+    (expected_bndrs, _) = splitForAllForAllTyBinders expected_ty
+
+    -- See Note [Checking existing values at non-U foralls].
+    bare_variable (HsPar _ (L _ e)) = bare_variable e
+    bare_variable HsVar{} = True
+    bare_variable _ = False
+
+    tc_existing_value (HsPar x (L loc e))
+      = setSrcSpanA loc $
+        do { e' <- tc_existing_value e
+           ; return (HsPar x (L loc e')) }
+    tc_existing_value (HsUntypedSplice splice_res _)
+      = do { body <- getUntypedSpliceBody splice_res
+           ; tc_existing_value body }
+    tc_existing_value e
+      = do { inferred <- tcInferAppHead_maybe e
+           ; case inferred of
+               Just (e', actual_ty) ->
+                 do { wrap <- case res_ty of
+                        Left{} -> tcSubTypeSigma (exprCtOrigin e) ctxt actual_ty expected_ty
+                        Right sig -> setSrcSpan (sig_loc sig) $
+                          tcSubTypeSigma (exprCtOrigin e) ctxt actual_ty expected_ty
+                    ; return (mkHsWrap wrap e') }
+               Nothing -> tc_skolemise e }
+
+    tc_skolemise expr
+      = outer_skolemise res_ty $ \pat_tys rho_ty ->
+        let
+          -- tc_body is a little loop that looks past parentheses
+          tc_body (HsPar x (L loc e))
+            = setSrcSpanA loc $
+              do { e' <- tc_body e
+                 ; return (HsPar x (L loc e')) }
+
+          -- Look through any untyped splices (#24559)
+          -- See Note [Type Checking Template Haskell Splices]
+          tc_body (HsUntypedSplice splice_res _)
+            = do { body <- getUntypedSpliceBody splice_res
+                 ; tc_body body }
+
+          -- The special case for lambda: go to tcLambdaMatches, passing pat_tys
+          tc_body (HsLam x lam_variant matches)
+            = tcLambdaExpr x lam_variant matches pat_tys (mkCheckExpType rho_ty)
+
+          -- The general case: just do deep skolemisation if necessary,
+          -- before handing off to tcExpr
+          tc_body e = do { ds_flag <- getDeepSubsumptionFlag
+                         ; inner_skolemise ds_flag rho_ty $ \rho_ty' ->
+                           do { dep <- xoptM LangExt.DependentTypes
+                              ; mb_rep <- if dep
+                                          then tcTypeRepTarget_maybe rho_ty'
+                                          else pure Nothing
+                              ; case mb_rep of
+                                  Just (rep_kind, _) -> do
+                                    { as_ty <- isUnadornedTypeExpr e
+                                    ; if as_ty
+                                      then do { wc_ty <- expr_to_type_at_kind rep_kind (noLocA e)
+                                              ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
+                                      else tcExpr e (mkCheckExpType rho_ty') }
+                                  Nothing
+                                    | dep -> do
+                                        { rho_z <- liftZonkM (zonkTcType rho_ty')
+                                        ; if isLargeElimResultKind rho_z
+                                          then do
+                                            { as_ty <- isUnadornedTypeExpr e
+                                            ; if as_ty
+                                              then do { let res_k = toKindMatchableArrows rho_z
+                                                      ; wc_ty <- expr_to_type_at_kind res_k (noLocA e)
+                                                      ; tcExpr (HsEmbTy noExtField wc_ty) (mkCheckExpType rho_ty') }
+                                              else tcExpr e (mkCheckExpType rho_ty') }
+                                          else tcExpr e (mkCheckExpType rho_ty') }
+                                    | otherwise -> tcExpr e (mkCheckExpType rho_ty') } }
+        in tc_body expr
+
+    -- `outer_skolemise` checks expressions that need runtime abstraction.
     -- It only does shallow skolemisation
     -- It always makes an implication constraint if deferred-errors is on
     outer_skolemise :: Either TcSigmaType TcCompleteSig
@@ -228,6 +312,26 @@ tcPolyExprCheck expr res_ty
     ctxt = case res_ty of
              Left {}   -> GenSigCtxt
              Right sig -> sig_ctxt sig
+
+
+{- Note [Checking existing values at non-U foralls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An existing value can have an M or variable-annotated forall type. Checking
+that value does not require a new type lambda. Try inferable application
+heads before skolemising a leading forall prefix with a non-U annotation.
+Use normal sigma subsumption for any adaptation. Identity subsumption can
+then retain an existing value without emitting U-to-annotation obligations.
+Lambdas and other expressions keep the runtime abstraction checks.
+
+Look through parentheses and untyped splices. Preserve parenthesis annotations
+and source spans. Consume splice finalizers once, including on the fallback
+path. Known-U prefixes keep the ordinary checking and Quick Look path.
+
+A complete signature also brings scoped type variables into scope during
+skolemisation. Before that step, infer only a bare variable under parentheses.
+Other signed expressions keep the existing scoped checking path. In particular,
+an inner expression signature can refer to those scoped variables.
+-}
 
 
 {- *********************************************************************
@@ -299,6 +403,93 @@ tcCollectApp the_app res_ty
   = do { (fun, args) <- splitHsApps the_app
        ; tcApp the_app fun args res_ty }
 
+-- | Peel leading implicit existential binders on an expected type into
+-- 'WpExistsPack' wrappers before checking an introduction form.
+-- See Note [Introducing an implicit existential] in GHC.Tc.Utils.Unify.
+peelCheckImplicitExists :: ExpType -> TcM (ExpType, HsWrapper)
+peelCheckImplicitExists expected@(Check orig_ty)
+  = do { view0 <- unwrapMetaView orig_ty
+       ; case view0 of
+           ExistsTy ImplicitExists _ _ ->
+             do { schema <- liftZonkM (zonkTcType view0)
+                ; (body_ty, wrap) <- peel schema
+                ; return (mkCheckExpType body_ty, wrap) }
+           _ -> return (expected, idHsWrapper) }
+  where
+    peel cur_schema
+      | ExistsTy ImplicitExists binder body <- coreFullView cur_schema
+      = do { witness <- newFlexiTyVarTy (tyVarKind binder)
+           ; let next_schema = substTyWith [binder] [witness] body
+           ; (final_body, inner_wrap) <- peel next_schema
+           ; return (final_body, mkWpExistsPack cur_schema witness <.> inner_wrap) }
+      | otherwise
+      = return (cur_schema, idHsWrapper)
+peelCheckImplicitExists expected = return (expected, idHsWrapper)
+
+-- | Check a lambda and introduce an implicit existential package when its
+-- payload is a visible function arrow.
+-- See Note [Implicit existential lambda payloads].
+tcLambdaExpr :: XLam GhcRn -> HsLamVariant -> MatchGroup GhcRn (LHsExpr GhcRn)
+             -> [ExpPatType] -> ExpSigmaType -> TcM (HsExpr GhcTc)
+tcLambdaExpr x lam_variant matches pat_tys expected
+  | Check orig_ty <- expected
+  = do { view0 <- unwrapMetaView orig_ty
+       ; case view0 of
+           ExistsTy ImplicitExists _ body0
+             | Just _ <- splitVisibleFunTy_maybe (implicitPayloadType body0)
+             -> do { schema <- liftZonkM (zonkTcType view0)
+                   ; impred <- xoptM LangExt.ImpredicativeTypes
+                   ; ds_flag <- getDeepSubsumptionFlag
+                   ; let quick = impred
+                                 && (case ds_flag of Shallow -> True; Deep{} -> False)
+                                 && supportsQuickLookType schema
+                                 && noQuickLookVars schema
+                   ; (binders, witnesses, payload_ty, pack_wrap) <- peel_lambda quick schema
+                   ; when quick $
+                       tcQuickLookLambdaMatches matches binders witnesses payload_ty
+                   ; payload_ty' <- if quick then liftZonkM (zonkTcType payload_ty) else pure payload_ty
+                   ; lam_expr <- check_lambda (mkCheckExpType payload_ty')
+                   ; return (mkHsWrap pack_wrap lam_expr) }
+           _ -> check_lambda expected }
+  | otherwise = check_lambda expected
+  where
+    check_lambda expected_ty
+      = do { (wrap, matches') <- tcLambdaMatches (HsLam x lam_variant matches)
+                                                 lam_variant matches pat_tys expected_ty
+           ; return (mkHsWrap wrap (HsLam x lam_variant matches')) }
+
+    peel_lambda quick cur_schema
+      | ExistsTy ImplicitExists binder body <- coreFullView cur_schema
+      = do { witness <- if quick
+                        then newMetaTyVarTyAtLevel QLInstVar (tyVarKind binder)
+                        else newFlexiTyVarTy (tyVarKind binder)
+           ; let next_schema = substTyWith [binder] [witness] body
+           ; (bs, ws, final_body, inner_wrap) <- peel_lambda quick next_schema
+           ; return (binder : bs, witness : ws, final_body,
+                     mkWpExistsPack cur_schema witness <.> inner_wrap) }
+      | otherwise
+      = return ([], [], cur_schema, idHsWrapper)
+
+{- Note [Implicit existential lambda payloads]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an expected type starts with 'ExistsTy ImplicitExists' over a visible
+function arrow, instantiate the existential binders before checking the lambda
+equations and wrap the checked lambda with 'WpExistsPack'; see Eisenberg,
+Duboc, Weirich & Lee, "An Existential Crisis Resolved: Type Inference for
+First-Class Existential Types", ICFP 2021 (PACMPL 5(ICFP):64), Figs. 6 & 10,
+and GHC Proposal #473. Allocating the witness variables outside the lambda's
+pattern scope prevents pattern-bound existential or GADT variables from
+escaping into the package witness.
+
+With 'ImpredicativeTypes' under shallow subsumption, 'tcQuickLookLambdaMatches'
+in GHC.Tc.Gen.App allocates Quick Look instantiation variables for the leading
+existential binders and runs Quick Look over the outer-scoped result arms
+before 'tcLambdaMatches' enters the pattern scope (Serrano et al., ICFP 2020).
+Remaining instantiation variables are monomorphised at the outer level before
+checking the matches once. 'WpExistsPack' lowers to 'Core.Pack', which erases
+in CoreToStg without forcing the lambda body.
+-}
+
 ---------------
 tcExpr :: HsExpr GhcRn
        -> ExpRhoType   -- DeepSubsumption <=> when checking, this type
@@ -316,6 +507,7 @@ tcExpr :: HsExpr GhcRn
 --   - HsOverLit       overloaded literals
 --   - HsApp           value applications
 --   - HsAppType       type applications
+--   - HsAppRetained   explicit invisible retained applications
 
 -- These constructors are the union of
 --   - ones taken apart by GHC.Tc.Gen.Head.splitHsApps
@@ -329,7 +521,10 @@ tcExpr e@(HsVar {})              res_ty = tcApp e e [] res_ty
 tcExpr e@(ExprWithTySig {})      res_ty = tcApp e e [] res_ty
 tcExpr e@(XExpr (HsRecSelRn{}))  res_ty = tcApp e e [] res_ty
 tcExpr e@(HsAppType {})          res_ty = tcCollectApp e res_ty
+tcExpr e@(HsAppRetained {})      res_ty = tcCollectApp e res_ty
 tcExpr e@(HsApp {})              res_ty = tcCollectApp e res_ty
+tcExpr e@(XExpr (ExpandedThingRn (HSE (ExprCtxt HsGetField{}) _))) res_ty
+                                        = tcCollectApp e res_ty
 
 -- Typecheck an occurrence of an unbound Id
 --
@@ -379,9 +574,8 @@ tcExpr e@(HsIPVar _ x) res_ty
                (mkHsWrap wrap (mkHsVar (noLocA ip_op)))
                ip_ty res_ty }
 
-tcExpr e@(HsLam x lam_variant matches) res_ty
-  = do { (wrap, matches') <- tcLambdaMatches e lam_variant matches [] res_ty
-       ; return (mkHsWrap wrap $ HsLam x lam_variant matches') }
+tcExpr (HsLam x lam_variant matches) res_ty
+  = tcLambdaExpr x lam_variant matches [] res_ty
 
 {-
 ************************************************************************
@@ -441,16 +635,97 @@ tcExpr e@HsQualLit{} _ = pprPanic "tcExpr: HsQualLit" (ppr e)
 -- The expansion includes an ExplicitList, but it is always the built-in
 -- list type, so that's all we need concern ourselves with here.  See
 -- GHC.Rename.Expr. Note [Handling overloaded and rebindable constructs]
-tcExpr (ExplicitList _ exprs) res_ty
-  = do  { res_ty <- expTypeToType res_ty
-        ; (coi, elt_ty) <- matchExpectedListTy res_ty
-        ; let tc_elt expr = tcCheckPolyExpr expr elt_ty
-        ; exprs' <- mapM tc_elt exprs
-        ; return $ mkHsWrapCo coi $ ExplicitList elt_ty exprs' }
+tcExpr expr@(ExplicitList _ exprs) res_ty
+  = do { anchor <- case res_ty of
+             Infer _ -> do { enabled <- xoptM LangExt.DependentTypes
+                           ; if enabled then find_native [] exprs
+                                        else return Nothing }
+             _ -> return Nothing
+       ; case anchor of
+           Just (before, element, after)
+             -> do { (element', elt_ty) <- tcInferRho element
+                   ; _ <- setSrcSpanA (getLoc element) $ addExprCtxt (unLoc element) $
+                            unifyType Nothing (typeKind elt_ty) liftedTypeKind
+                   ; before' <- mapM (`tcCheckPolyExpr` elt_ty) before
+                   ; after' <- mapM (`tcCheckPolyExpr` elt_ty) after
+                   ; tcWrapResultMono expr
+                       (ExplicitList elt_ty (before' ++ (element' : after')))
+                       (mkListTy elt_ty) res_ty }
+           Nothing
+             -> do { res_ty <- expTypeToType res_ty
+                   ; (coi, elt_ty) <- matchExpectedListTy res_ty
+                   ; exprs' <- mapM (`tcCheckPolyExpr` elt_ty) exprs
+                   ; return $ mkHsWrapCo coi $ ExplicitList elt_ty exprs' } }
+  where
+    -- Select a declared type without checking an occurrence or collecting usage.
+    find_native :: [LHsExpr GhcRn] -> [LHsExpr GhcRn]
+                -> TcM (Maybe ([LHsExpr GhcRn], LHsExpr GhcRn, [LHsExpr GhcRn]))
+    find_native before (element : after)
+      = do { native <- native_element element
+           ; if native then return (Just (reverse before, element, after))
+                       else find_native (element : before) after }
+    find_native _ [] = return Nothing
+
+    native_element :: LHsExpr GhcRn -> TcM Bool
+    native_element (L _ (HsPar _ element)) = native_element element
+    native_element (L _ (HsVar _ lname))
+      | not (isDataOcc (nameOccName (unLocWithUserRdr lname)))
+      = do { mb_id <- tcLookupIdMaybe (unLocWithUserRdr lname)
+           ; case mb_id of
+               Just var -> do
+                 { ty <- liftZonkM (zonkTcType (varType var))
+                 ; return (isTauTy ty && hasNativeDependentExpr (Core.Type ty)
+                           && typeKind ty `eqType` liftedTypeKind) }
+               Nothing -> return False }
+    native_element _ = return False
+
+{- Note [Inference of native list elements]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If vector :: Vec Int n, inferring [vector] must retain that exact element
+type. The ordinary list path allocates an element meta-variable first.
+It cannot contain the runtime Id n.
+
+Under DependentTypes, an inferred list can use a declared
+monomorphic native variable as its element type. Look through parentheses.
+Read and zonk its declared type without checking its occurrence or emitting
+usage. Do not expand splices or infer an application to select this type.
+The type must be a lifted tau type that already contains native syntax.
+
+Infer the selected occurrence once with tcInferRho. This retains its usual
+usage and application checks. Check its lifted kind and check all other
+elements against its exact inferred type. An earlier bottom element can then
+use the same expected type. Keep every typed element in its original position.
+This changes no runtime evaluation order and adds no sharing binding.
+
+Use tcWrapResultMono with the original InferResult. Keep its level and
+promotion checks. Surrounding application and callback scope checks remain
+active. A list does not bind or hide a free runtime index. Do not write a
+native type to an element meta-variable. Known expected types, empty lists
+and lists without a declared native element keep ordinary list checking.
+Polymorphic variables and checking-only expressions do not select this route.
+-}
 
 tcExpr expr@(ExplicitTuple x tup_args boxity) res_ty
   | all tupArgPresent tup_args
-  = do { let arity  = length tup_args
+  = do { as_application <- case res_ty of
+             Check expected | Boxed <- boxity -> do
+               exp_view <- unwrapMetaView expected
+               return $ case exp_view of
+                 ExistsTy ImplicitExists _ _ -> True
+                 _                           -> False
+             Infer _ | Boxed <- boxity
+               -> snd <$> tcRetainedInferableArg (noLocA expr)
+             _ -> return False
+       ; if as_application
+         then do { checkTupSize (length tup_args)
+                 ; let con = wrapGenSpan (mkHsVar
+                               (noLocA (dataConName (tupleDataCon Boxed (length tup_args)))))
+                       app = foldl' (\fun arg -> wrapGenSpan (HsApp noExtField fun arg))
+                                    con [arg | Present _ arg <- tup_args]
+                 -- See Note [Inference of native tuple fields].
+                 ; tcCollectApp (mkExpandedExpr expr (unLoc app)) res_ty }
+         else do
+       { let arity  = length tup_args
              tup_tc = tupleTyCon boxity arity
                -- NB: tupleTyCon doesn't flatten 1-tuples
                -- See Note [Don't flatten tuples from HsSyn] in GHC.Core.Make
@@ -461,23 +736,41 @@ tcExpr expr@(ExplicitTuple x tup_args boxity) res_ty
                            -- See Note [Unboxed tuple RuntimeRep vars] in GHC.Core.TyCon
        ; let arg_tys' = case boxity of Unboxed -> drop arity arg_tys
                                        Boxed   -> arg_tys
-       ; tup_args1 <- tcCheckExplicitTuple tup_args arg_tys'
-       ; return $ mkHsWrapCo coi (ExplicitTuple x tup_args1 boxity) }
+       ; tup_args1 <- tcCheckExplicitTuple [] tup_args arg_tys'
+       ; return $ mkHsWrapCo coi (ExplicitTuple x tup_args1 boxity) } }
 
   | otherwise
   = -- The tup_args are a mixture of Present and Missing (for tuple sections).
-    do { (tup_args1, arg_tys) <- tcInferTupArgs boxity tup_args
+    do { (res_ty', pack_wrap) <- peelCheckImplicitExists res_ty
+       ; known_tys <- case (boxity, res_ty') of
+             (Boxed, Check expected)
+               -> do { expected <- liftZonkM (zonkTcType expected)
+                     ; let known
+                             | hasNativeDependentExpr (Core.Type expected)
+                             , Right (_mas, missing, result) <- tcSplitFunTysN
+                                 (count (not . tupArgPresent) tup_args) expected
+                             , Just (tc, tys) <- tcSplitTyConApp_maybe result
+                             , tc == tupleTyCon Boxed (length tup_args)
+                             = Just (map scaledMult missing, tys)
+                             | otherwise = Nothing
+                     ; return known }
+             _ -> return Nothing
+       ; (tup_args1, arg_tys) <- case known_tys of
+             Just (mults, tys)
+               -> do { args <- tcCheckExplicitTuple mults tup_args tys
+                     ; return (args, tys) }
+             Nothing -> tcInferTupArgs boxity tup_args
 
        ; let expr'       = ExplicitTuple x tup_args1 boxity
              missing_tys = [Scaled mult ty | (Missing (Scaled mult _), ty) <- zip tup_args1 arg_tys]
 
              -- See Note [Typechecking data constructors] in GHC.Tc.Gen.Head
              -- See Note [Don't flatten tuples from HsSyn] in GHC.Core.Make
-             act_res_ty = mkScaledFunTys missing_tys (mkTupleTy1 boxity arg_tys)
+             act_res_ty = mkScaledFunTysU missing_tys (mkTupleTy1 boxity arg_tys)
 
-       ; traceTc "ExplicitTuple" (ppr act_res_ty $$ ppr res_ty)
+       ; traceTc "ExplicitTuple" (ppr act_res_ty $$ ppr res_ty')
 
-       ; tcWrapResultMono expr expr' act_res_ty res_ty }
+       ; mkHsWrap pack_wrap <$> tcWrapResultMono expr expr' act_res_ty res_ty' }
 
 tcExpr (ExplicitSum _ alt arity expr) res_ty
   = do { let sum_tc = sumTyCon arity
@@ -506,32 +799,226 @@ tcExpr (ExplicitSum _ alt arity expr) res_ty
 ************************************************************************
 -}
 
-tcExpr (HsLet x (L l binds) expr) res_ty
-  = do  { (binds', expr') <- tcLocalBinds binds $
-                             tcMonoLExpr expr res_ty
-        ; return (HsLet x (L l binds') expr') }
+tcExpr (HsLet x (L loc (HsValBinds ann (XValBindsLR (HsVBG groups [])))) body) res_ty
+  | Check schema <- res_ty
+  , ExistsTy ImplicitExists _ _ <- coreFullView schema
+  , [(NonRecursive, [binding@(L _ (FunBind { fun_id = L _ name, fun_matches = matches }))])] <- groups
+  , Just _ <- lazyLetRhs matches
+  , returnsLocal name body
+  = do { (checked, body') <- tcNonRecLetAtType name schema binding (tcMonoLExpr body res_ty)
+       ; let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
+       ; return (HsLet x (L loc binds) body') }
+
+tcExpr original@(HsLet x local_binds@(L loc binds) body) res_ty
+  = do { opened <- tcLexicalExistsLet original local_binds body res_ty
+       ; case opened of
+           Just expr -> return expr
+           Nothing -> do
+             { enabled <- xoptM LangExt.DependentTypes
+             ; expansion <- case res_ty of
+                   Check expected | enabled
+                                  , hasNativeDependentExpr (Core.Type expected)
+                                    || (isTauTy expected && not (anyFreeVarsOfType
+                                                  (\v -> isTyVar v && isMetaTyVar v) expected)) ->
+                     do { strict <- xoptM LangExt.Strict
+                        ; if strict then return Nothing else tcNativeLet original local_binds body expected }
+                   _ -> return Nothing
+             ; case expansion of
+                 Just expr -> return expr
+                 Nothing -> do { let names = collectLocalBinders CollNoDictBinders binds
+                               ; (binds', body') <- tcLocalBinds binds (tcScopedRuntimeBody names body res_ty)
+                               ; return (HsLet x (L loc binds') body') } } }
 
 tcExpr (HsCase ctxt scrut matches) res_ty
-  = do  {  -- We used to typecheck the case alternatives first.
-           -- The case patterns tend to give good type info to use
-           -- when typechecking the scrutinee.  For example
-           --   case (map f) of
-           --     (x:xs) -> ...
-           -- will report that map is applied to too few arguments
-           --
-           -- But now, in the GADT world, we need to typecheck the scrutinee
-           -- first, to get type info that may be refined in the case alternatives
-          mult <- newFlexiTyVarTy multiplicityTy
+  | Check schema <- res_ty
+  , ExistsTy ImplicitExists _ _ <- coreFullView schema
+  , [L _ Match{ m_pats = L _ [L _ (VarPat _ (L _ name))], m_grhss = grhss }] <- unLoc (mg_alts matches)
+  , Just rhs <- unguardedRhs grhss
+  , returnsLocal name rhs
+  = do { mult <- newMultiplicityVar
+       ; scrut' <- tcScalingUsage mult (tcCheckMonoExpr scrut schema)
+       ; matches' <- tcExprCaseMatches ctxt tcBody (Scaled mult schema) matches res_ty
+       ; return (HsCase ctxt scrut' matches') }
 
-          -- Typecheck the scrutinee.  We use tcInferRho but tcInferSigma
-          -- would also be possible (tcCaseMatches accepts sigma-types)
-          -- Interesting litmus test: do these two behave the same?
-          --     case id        of {..}
-          --     case (\v -> v) of {..}
-          -- This design choice is discussed in #17790
-        ; (scrut', scrut_ty) <- tcScalingUsage mult $ tcInferRhoFRR FRRCase scrut
-        ; matches' <- tcCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches res_ty
-        ; return (HsCase ctxt scrut' matches') }
+tcExpr expr@(HsCase ctxt scrut matches) res_ty
+  = do { mult <- newFlexiTyVarTy multiplicityTy
+       ; head_app <- case unLoc (stripParensLHsExpr scrut) of
+           HsApp{} -> split_implicit_head_call 0 id scrut
+           _ -> return Nothing
+       ; case head_app of
+           Just (package, rebuild) -> open_call mult package rebuild
+           Nothing -> ordinary_case mult scrut res_ty }
+  where
+    split_implicit_head_call :: Int -> (LHsExpr GhcRn -> LHsExpr GhcRn)
+                             -> LHsExpr GhcRn
+                             -> TcM (Maybe (LHsExpr GhcRn, LHsExpr GhcRn -> LHsExpr GhcRn))
+    split_implicit_head_call n rebuild (L loc (HsApp x fun operand)) =
+      split_implicit_head_call (n + 1) (\f -> rebuild (L loc (HsApp x f operand))) fun
+    split_implicit_head_call n rebuild (L loc (HsPar x fun)) =
+      split_implicit_head_call n (\f -> rebuild (L loc (HsPar x f))) fun
+    split_implicit_head_call n rebuild head_expr
+      | n > 0
+      , HsVar _ name <- unLoc (strip_ty_apps head_expr)
+      , let id_name = unLocWithUserRdr name
+      , not (isDataOcc (nameOccName id_name))
+      = do { ident <- if isExternalName id_name
+                      then discardErrs $ tryTcDiscardingErrs (pure Nothing) (tcLookupIdMaybe id_name)
+                      else do
+                        local <- tcLookupLcl_maybe id_name
+                        pure $ case local of
+                          Just (ATcId { tct_id = lid }) -> Just lid
+                          Just (AGlobal (AnId gid))     -> Just gid
+                          _                             -> Nothing
+           ; ident_ty <- traverse (liftZonkM . zonkTcType . varType) ident
+           ; return $ case implicit_spine_head <$> ident_ty of
+               Just (ExistsTy ImplicitExists _ body)
+                 | Just _ <- drop_vis_funs n (implicitPayloadType body)
+                 -> Just (head_expr, rebuild)
+               _ -> Nothing }
+      | otherwise = return Nothing
+      where
+        strip_ty_apps (L _ (HsAppType _ f _)) = strip_ty_apps f
+        strip_ty_apps (L _ (HsPar _ f))       = strip_ty_apps f
+        strip_ty_apps e                       = e
+
+        implicit_spine_head ty = case coreFullView ty of
+          DepDictTy _ b -> implicit_spine_head b
+          view
+            | (tvs, theta, b) <- tcSplitSigmaTy view
+            , not (null tvs && null theta)
+            -> implicit_spine_head b
+            | otherwise
+            -> view
+
+        drop_vis_funs 0 ty = Just ty
+        drop_vis_funs k ty = splitVisibleFunTy_maybe ty >>= drop_vis_funs (k - 1) . snd
+    -- See Note [Case on a call with an implicit package head].
+    open_call mult package rebuild
+      = do { (checked, schema) <- tcScalingUsage mult $ tcInferRho package
+           ; result_ty <- expTypeToType res_ty
+           ; opened <- tcOpenImplicitPackage (getLocA package) schema checked result_ty $ \payload ->
+               let ref = nlHsVar (getName payload)
+                   source = rebuild (fmap (\head_expr -> mkExpandedLExpr head_expr ref) package)
+               in tcExtendIdEnv [payload] $
+                    ordinary_case mult source (mkCheckExpType result_ty)
+           ; return (preserve_origin opened) }
+
+    ordinary_case mult source expected = do
+               {  -- We used to typecheck the case alternatives first.
+               -- The case patterns tend to give good type info to use
+               -- when typechecking the scrutinee.  For example
+               --   case (map f) of
+               --     (x:xs) -> ...
+               -- will report that map is applied to too few arguments
+               --
+               -- But now, in the GADT world, we need to typecheck the scrutinee
+               -- first, to get type info that may be refined in the case alternatives
+              -- Typecheck the scrutinee.  We use tcInferRho but tcInferSigma
+              -- would also be possible (tcCaseMatches accepts sigma-types)
+              -- Interesting litmus test: do these two behave the same?
+              --     case id        of {..}
+              --     case (\v -> v) of {..}
+              -- This design choice is discussed in #17790
+              (operand, operand_ty) <- tcScalingUsage mult $ tcInferRhoFRR FRRCase source
+            ; (scrut', scrut_ty) <- if null (unLoc (mg_alts matches))
+                                     then tcEmptyRetainedScrutinee operand operand_ty
+                                     else pure (operand, operand_ty)
+            ; dependent <- xoptM LangExt.DependentTypes
+            ; special <- case unLoc (stripParensLHsExpr scrut') of
+                _ | ExistsTy ImplicitExists _ _ <- coreFullView scrut_ty
+                  -> dot_case scrut' scrut_ty mult expected
+                HsVar _ (L _ index) | not dependent || isNativeIndexId index ->
+                  tcRetainedCase dependent index matches expected
+                _ | dependent ->
+                  do { mb_ty_case <- case unLoc (stripParensLHsExpr scrut') of
+                         HsVar _ (L _ index) ->
+                           fmap (fmap preserve_origin) $
+                             tcTypeWitnessCase index scrut_ty mult matches expected
+                         _ -> pure Nothing
+                     ; case mb_ty_case of
+                         Just ty_expr -> pure (Just ty_expr)
+                         Nothing -> do
+                           { call_index <- checkedNativeCallIndex scrut' scrut_ty
+                           ; case call_index of
+                               Nothing -> return Nothing
+                               Just index ->
+                                 fmap (fmap preserve_origin) $
+                                   tcRetainedCallCase index scrut' matches expected } }
+                _ -> return Nothing
+            ; case special of
+                Just expr -> return expr
+                Nothing -> do
+                  { -- See Note [Unrestricted data family case fields].
+                    let mb_indexed_case = case unLoc (stripParensLHsExpr scrut') of
+                          HsVar _ (L _ index)
+                            | dependent, isNativeOpaqueValueId index
+                            , not (isNativeIndexId index)
+                            , Check result <- expected
+                            , anyFreeVarsOfType (== index) result
+                            -> Just index
+                          _ -> Nothing
+                  ; case unLoc (stripParensLHsExpr scrut') of
+                      HsVar _ (L _ index)
+                        | dependent, isNativeOpaqueValueId index, isManyTy (idMult index)
+                        , isJust mb_indexed_case
+                          || maybe False (isDataFamilyTyCon . fst) (splitTyConApp_maybe scrut_ty) ->
+                            tcEqMult (OccurrenceOf (idName index)) mult ManyTy
+                      HsVar _ (L _ index)
+                        | Just _ <- mb_indexed_case ->
+                            tcEqMult (OccurrenceOf (idName index)) mult (idMult index)
+                      _ -> return ()
+                  ; matches' <- case mb_indexed_case of
+                      Just index ->
+                        tcIndexedCaseMatches index ctxt (Scaled (idMult index) scrut_ty) matches expected
+                      Nothing ->
+                        tcExprCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches expected
+                  ; return (HsCase ctxt scrut' matches') } }
+
+    preserve_origin expr' =
+      XExpr (ExpandedThingTc (HSE { hse_ctxt = ExprCtxt expr, hse_exp = noLocA expr' }))
+
+    dot_case scrut' schema mult expected
+      | any (payload_alt schema) (unLoc (mg_alts matches))
+      = do { result_ty <- expTypeToType expected
+           ; opened <- tcOpenImplicitPackage (getLocA scrut) schema scrut' result_ty $ \payload ->
+               do { payload_matches <- tcExprCaseMatches ctxt tcBody
+                        (Scaled mult (varType payload)) matches (mkCheckExpType result_ty)
+                  ; return (HsCase ctxt (nlHsVar payload) payload_matches) }
+           ; return (Just (preserve_origin opened)) }
+      | otherwise = return Nothing
+
+    -- See Note [Matching an implicit existential payload].
+    payload_alt schema (L _ Match{m_pats = L _ [pat]}) = matchesImplicitPayloadPat schema pat
+    payload_alt _ _ = False
+
+{- Note [Unrestricted data family case fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The selector in `case c of Stored x -> tag (pick x)` can use the
+constructor's class Given. Its retained operand needs an unrestricted
+field. If the case multiplicity is still a metavariable, the constructor
+implication can make it untouchable. The retained operand check cannot
+then establish Many with reflexive evidence.
+
+For a checked local data family scrutinee whose binding is already
+unrestricted, choose Many before checking the alternatives. The case
+can use this variable at Many and scale its fields at Many, regardless
+of whether the result names the scrutinee. Keep fresh multiplicity
+inference for linear variables and compound scrutinees.
+-}
+
+{- Note [Case on a call with an implicit package head]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In `case builder b of Callback value use -> use value`, builder has type
+`exists t. Bool -> Callback t`. The call produces Callback t inside the
+opening of builder. The result of the complete case can have a closed type.
+
+Use the same declared call shape as implicit application operands. Check the
+package head once. Open it around both the call on its payload and the case
+alternatives. Allocate the case result type outside the opening so a field
+that mentions the hidden witness cannot escape. Scale the checked head and
+the rebuilt application at the original scrutinee multiplicity. The ordinary
+case checker keeps the source patterns and their evaluation order.
+-}
 
 tcExpr (HsIf x pred b1 b2) res_ty
   = do { pred'    <- tcCheckMonoExpr pred boolTy
@@ -606,6 +1093,8 @@ tcExpr (HsStatic free_names expr) res_ty
   = do  { res_ty          <- expTypeToType res_ty
         ; (co, (p_ty, expr_ty)) <- matchExpectedAppTy res_ty
         ; (expr', lie) <- captureConstraints $
+                          updLclCtxt (\ctxt -> ctxt { tcl_lexical_givens = emptyLexicalGivens
+                                                   , tcl_source_let_views = emptyVarEnv }) $
                           addErrCtxt (StaticFormCtxt expr) $
                           tcCheckPolyExprNC expr expr_ty
 
@@ -655,6 +1144,8 @@ tcExpr (HsStatic free_names expr) res_ty
                                    addErrTc (TcRnStaticFormNotClosed n)
 
                Just (ATyVar {}) -> return ()  -- Free type variables are allowed
+               Just ATcTypeLet{} -> return ()
+               Just ATcCaseLet{} -> return ()
 
                    -- Not really expecting these, but we'll get an error from
                    -- elsewhere, so don't produce an error here
@@ -662,11 +1153,75 @@ tcExpr (HsStatic free_names expr) res_ty
                Just (APromotionErr {}) -> return ()
                Just (AGlobal {})       -> return () }
 
-tcExpr (HsEmbTy _ _)      _ = failWith (TcRnIllegalTypeExpr TypeKeywordSyntax)
+-- See Note [Reflecting a checked type operand].
+tcExpr expr@(HsEmbTy _ written) expected
+  = do { enabled <- xoptM LangExt.DependentTypes
+       ; unless enabled $ failWith (TcRnIllegalTypeExpr TypeKeywordSyntax)
+       ; case expected of
+           Check ty ->
+             do { ty' <- liftZonkM (zonkTcType ty)
+                ; if isLargeElimResultKind ty'
+                  then do
+                    { let res_k = toKindMatchableArrows ty'
+                    ; checked_ty <- tcCheckEmbeddedTypeAtKind written res_k
+                    ; tv_name <- newSysName (mkTyVarOcc "emb")
+                    ; let tv = mkTyVar tv_name res_k
+                          err_fun = mkHsWrap (mkWpTyApps [liftedRepTy, ty'])
+                                             (mkHsVar (noLocA tYPE_ERROR_ID))
+                          err_msg = noLocA (HsLit noExtField
+                                      (HsStringPrim NoSourceText
+                                        (bytesFS (fsLit "evaluated type expression"))))
+                          err_call = HsApp noExtField (noLocA err_fun) err_msg
+                          wrapped = XExpr (WrapExpr (WpCompose (WpTyApp checked_ty) (WpTyLam tv)) err_call)
+                    ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA wrapped)))) }
+                  else case splitTyConApp_maybe ty' of
+                    Just (tc, [kind, _]) ->
+                      do { selector <- tcLookupKnownOccId typeRepIdOcc
+                         ; let (_, _, rep) = tcSplitSigmaTy (idType selector)
+                         ; case splitTyConApp_maybe rep of
+                             Just (rep_tc, _) | tc == rep_tc ->
+                               do { arg <- tcHsTypeApp written kind
+                                  ; let args = [kind, arg]
+                                        (theta, actual) = tcSplitPhiTy (piResultTys (idType selector) args)
+                                  ; wrap <- instCallWithLocalTypeReps expr written arg args theta
+                                  ; let call = mkHsWrap wrap (mkHsVar (noLocA selector))
+                                  ; result <- tcWrapResultMono expr call actual expected
+                                  ; return (XExpr (ExpandedThingTc (HSE (ExprCtxt expr) (noLocA result)))) }
+                             _ -> wrong_context (Just ty) }
+                    _ -> wrong_context (Just ty) }
+           Infer {} -> wrong_context Nothing }
+  where
+    is_unadorned_infixexp2 = case unLoc (hswc_body written) of
+      HsForEachTy{} -> True
+      XHsType HsTypeExistsRn{} -> True
+      HsAppTy{} -> True
+      _ -> False
+    wrong_context mb_ty
+      | is_unadorned_infixexp2 = failWith (TcRnUnexpectedTypeSyntaxInTerms ForallTelescopeSyntax)
+      | otherwise = failWith (TcRnRetainedQuantificationError (RetainedTypeOperandContext mb_ty))
 tcExpr (HsQual _ _ _)     _ = failWith (TcRnIllegalTypeExpr ContextArrowSyntax)
 tcExpr (HsForAll _ _ _)   _ = failWith (TcRnIllegalTypeExpr ForallTelescopeSyntax)
 tcExpr (HsFunArr _ _ _ _) _ = failWith (TcRnIllegalTypeExpr FunctionArrowSyntax)
 tcExpr (HsStar _)         _ = failWith (TcRnIllegalTypeExpr StarKindSyntax)
+
+{- Note [Reflecting a checked type operand]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In an expression checked against TypeRep t, DependentTypes
+allows (type t) and unadorned type arguments to supply the runtime witness.
+Check the written type at the expected kind and instantiate the same selector
+as typeRep. This requires Typeable t. When the written type references a local
+TypeRep witness variable (for example from `foreach (a :: Type)`), wrap that
+witness in Typeable's single-method dictionary so compound type arguments such
+as `ex5 (Maybe a)` resolve without forcing unused witnesses. An erased forall
+binder has no local TypeRep value, so `(type a)` still requires Typeable a.
+Identify TypeRep from the selector's result so that aliases work and a
+locally declared type with the same name keeps its ordinary meaning.
+
+The caller can learn the expected witness type from an imported signature.
+See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
+A required forall argument takes a separate path in GHC.Tc.Gen.App.
+It remains erased and requires no Typeable dictionary.
+-}
 
 {-
 ************************************************************************
@@ -678,14 +1233,51 @@ tcExpr (HsStar _)         _ = failWith (TcRnIllegalTypeExpr StarKindSyntax)
 
 tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
                        , rcon_flds = rbinds }) res_ty
-  = do  { con_like <- tcLookupConLike qcon
+  = do { con_like <- tcLookupConLike qcon
+       ; case con_like of
+           RealDataCon con
+             | not (null (dataConRepArgBinders con)) -> tc_retained_record con
+           _ -> tc_ordinary_record con_like }
+  where
+    orig = OccurrenceOf con_name
 
+    -- Use the dependent application checker in declaration order. A
+    -- retained argument supplies the types of the fields that follow.
+    tc_retained_record con = do
+      let values = mkNameEnv
+            [(unLoc (foLabel (unLoc (hfbLHS field))), hfbRHS field)
+            | L _ field <- rec_flds rbinds]
+          fields = dataConFieldLabels con
+          supplied fld = lookupNameEnv values (flSelector fld)
+          missing_witness field = setSrcSpanA loc $
+            failWithTc (TcRnRetainedQuantificationError (RetainedRecordConstruction con_name field))
+      forM_ (hsRecFields rbinds) $ \name ->
+        unless (any ((== name) . flSelector) fields) $
+          failWithTc (badFieldConErr con_name
+            (FieldLabelString (fastStringToShortText (occNameFS (nameOccName name)))))
+      case fields of
+        witness : payloads | Just value <- supplied witness -> do
+          dflags <- getDynFlags
+          site <- getSrcSpanM
+          -- See Note [Desugaring record construction] in GHC.HsToCore.Expr.
+          let missing fld = wrapGenSpan $ genHsApps (idName rEC_CON_ERROR_ID)
+                [genLHsLit (HsStringPrim NoSourceText (bytesFS (mkFastString message)))]
+                where message = showSDoc dflags (hcat [ppr site, vbar, ppr (flLabel fld)])
+              args = value : map (\fld -> fromMaybe (missing fld) (supplied fld)) payloads
+          result <- tcExpr (genHsApps con_name args) res_ty
+          checkMissingFields (RealDataCon con) rbinds (dataConOrigArgTys con)
+          pure (mkExpandedExprTc expr result)
+        witness : _ -> missing_witness (Just (flLabel witness))
+        [] -> missing_witness Nothing
+
+    tc_ordinary_record con_like
+      = do { (res_ty', pack_wrap) <- peelCheckImplicitExists res_ty
         ; (con_expr, con_sigma) <- tcInferConLike con_like
         ; (con_wrap, con_tau)   <- topInstantiate orig con_sigma
               -- a shallow instantiation should really be enough for
               -- a data constructor.
         ; let arity = conLikeArity con_like
-              Right (arg_tys, actual_res_ty) = tcSplitFunTysN arity con_tau
+              Right (_mas, arg_tys, actual_res_ty) = tcSplitFunTysN arity con_tau
 
         ; checkTc (conLikeHasBuilder con_like) $
           nonBidirectionalErr (conLikeName con_like)
@@ -697,7 +1289,7 @@ tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
                                 , rcon_con = L loc con_like
                                 , rcon_flds = rbinds' }
 
-        ; ret <- tcWrapResultMono expr expr' actual_res_ty res_ty
+        ; ret <- mkHsWrap pack_wrap <$> tcWrapResultMono expr expr' actual_res_ty res_ty'
 
         -- Check for missing fields.  We do this after type-checking to get
         -- better types in error messages (cf #18869).  For example:
@@ -710,8 +1302,6 @@ tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
         ; checkMissingFields con_like rbinds arg_tys
 
         ; return ret }
-  where
-    orig = OccurrenceOf con_name
 
 -- Record updates via dot syntax are replaced by expanded expressions
 -- in the renamer. See Note [Overview of record dot syntax] in
@@ -789,6 +1379,688 @@ tcExpr e res_ty
        ; case mb_hse of
            Just hse -> tcHsExpansion hse res_ty
            Nothing  -> pprPanic "tcExpr: unhandled case:" (ppr e) }
+
+{- Note [Runtime Type case refinement via eqTypeRep]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #378 §4.9 allows runtime pattern matching on a retained
+`foreach (a :: Type) ->` binder `a`, whose runtime representation is
+`a_rep :: TypeRep @Type a_tv` for a skolem type variable `a_tv :: Type`.
+
+In `case a of { Int -> e1; Bool -> e2; [Char] -> e3; _ -> def }`, `Type` is an
+open universe, so a final catch-all branch (`_` or a variable pattern) is
+mandatory. Each concrete or in-scope `Typeable` type pattern `PatTy` elaborates
+to:
+
+  case eqTypeRep @Type @Type @a_tv a_rep (type PatTy) of
+    Just HRefl -> e_i
+    Nothing    -> <next_branch>
+
+Checking `type PatTy` at `TypeRep @Type beta` reuses `instCallWithLocalTypeReps`
+so both standard `Typeable` instances and in-scope `foreach (b :: Type)` witness
+variables supply `Typeable` evidence, while matching `Just HRefl` introduces the
+nominal equality `a_tv ~ PatTy` on the right-hand side.
+-}
+
+-- | Elaborate a runtime `Type` pattern match on a `foreach (a :: Type)` witness
+-- into nested `eqTypeRep` equality checks with a required final catch-all.
+-- See Note [Runtime Type case refinement via eqTypeRep].
+tcTypeWitnessCase :: Id -> TcType -> TcType
+                  -> MatchGroup GhcRn (LHsExpr GhcRn)
+                  -> ExpRhoType
+                  -> TcM (Maybe (HsExpr GhcTc))
+tcTypeWitnessCase scrut_id scrut_ty mult matches expected = do
+  mb_rep <- tcTypeRepTarget_maybe scrut_ty
+  case mb_rep of
+    Just (scrut_kind, target_ty)
+      | tcIsLiftedTypeKind scrut_kind
+      , Just a_tv <- getTyVar_maybe target_ty
+      , not (isMetaTyVar a_tv) -> do
+          let alts = unLoc (mg_alts matches)
+          classified <- mapM classify_alt alts
+          if not (any is_type_alt classified)
+            then pure Nothing
+            else case split_type_alts classified of
+              Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedCasePatterns)
+              Just (ty_alts, catch_match) -> do
+                tcEqMult (OccurrenceOf (idName scrut_id)) mult ManyTy
+                eq_rep_nm <- lookupOrig
+                  (mkGhcInternalModule (fsLit "GHC.Internal.Data.Typeable.Internal"))
+                  (mkVarOcc "eqTypeRep")
+                hrefl_nm <- lookupOrig
+                  (mkGhcInternalModule (fsLit "GHC.Internal.Data.Type.Equality"))
+                  (mkDataOcc "HRefl")
+                let scrut_var = genLHsVar (idName scrut_id)
+                    fallback_mg = mkMatchGroup (Generated OtherExpansion SkipPmc)
+                                    noAnn (wrapGenSpan [catch_match])
+                    fallback_expr = wrapGenSpan (HsCase CaseAlt scrut_var fallback_mg)
+                    mk_branch (pat_loc, pat_wc_ty, grhss) next_expr =
+                      let k_ty    = wrapGenSpan (XHsType (HsCoreTyRn scrut_kind))
+                          a_ty_rn = wrapGenSpan (XHsType (HsCoreTyRn target_ty))
+                          c_k1    = wrapGenSpan (HsAppType Nothing (genLHsVar eq_rep_nm) (HsWC [] k_ty))
+                          c_k2    = wrapGenSpan (HsAppType Nothing c_k1 (HsWC [] k_ty))
+                          c_a     = wrapGenSpan (HsAppType Nothing c_k2 (HsWC [] a_ty_rn))
+                          emb_arg = L pat_loc (HsEmbTy noExtField pat_wc_ty)
+                          eq_call = wrapGenSpan (HsApp noExtField
+                                      (wrapGenSpan (HsApp noExtField c_a scrut_var)) emb_arg)
+                          just_p  = genSimpleConPat justDataConName [genSimpleConPat hrefl_nm []]
+                          noth_p  = genSimpleConPat nothingDataConName []
+                          just_m  = wrapGenSpan (Match { m_ext = noExtField
+                                                       , m_ctxt = CaseAlt
+                                                       , m_pats = wrapGenSpan [just_p]
+                                                       , m_grhss = grhss })
+                          noth_m  = genSimpleMatch CaseAlt [noth_p] next_expr
+                          mg      = mkMatchGroup (Generated OtherExpansion SkipPmc)
+                                      noAnn (wrapGenSpan [just_m, noth_m])
+                      in wrapGenSpan (HsCase CaseAlt eq_call mg)
+                    expanded = foldr mk_branch fallback_expr ty_alts
+                res_ty' <- expTypeToType expected
+                Just <$> tcExpr (unLoc expanded) (mkCheckExpType res_ty')
+    _ -> pure Nothing
+  where
+    classify_alt :: LMatch GhcRn (LHsExpr GhcRn)
+                 -> TcM (Either (Maybe (LMatch GhcRn (LHsExpr GhcRn)))
+                                (SrcSpanAnnA, LHsWcType GhcRn, GRHSs GhcRn (LHsExpr GhcRn)))
+    classify_alt m@(L _ Match { m_pats = L _ [pat@(L ploc _)], m_grhss = grhss })
+      | is_catch_all pat = pure (Left (Just m))
+      | otherwise = do
+          mb_ty <- rn_pat_to_wc_type pat
+          case mb_ty of
+            Just wc_ty
+              | [L _ (GRHS _ [] _)] <- NE.toList (grhssGRHSs grhss)
+              -> pure (Right (ploc, wc_ty, grhss))
+            _ -> pure (Left Nothing)
+    classify_alt _ = pure (Left Nothing)
+
+    is_type_alt Right{} = True
+    is_type_alt Left{}  = False
+
+    is_catch_all (L _ (ParPat _ p)) = is_catch_all p
+    is_catch_all (L _ WildPat{})    = True
+    is_catch_all (L _ VarPat{})     = True
+    is_catch_all _                  = False
+
+    split_type_alts [Left (Just catch_m)] = Just ([], catch_m)
+    split_type_alts (Right ty_alt : rest@(_ : _)) = do
+      (more, catch_m) <- split_type_alts rest
+      pure (ty_alt : more, catch_m)
+    split_type_alts _ = Nothing
+
+    rn_pat_to_wc_type :: LPat GhcRn -> TcM (Maybe (LHsWcType GhcRn))
+    rn_pat_to_wc_type (L _ (EmbTyPat _ (HsTP (HsTPRn wcs _ _) hs_ty))) =
+      pure (Just (HsWC wcs hs_ty))
+    rn_pat_to_wc_type pat = fmap (HsWC []) <$> rn_pat_to_type pat
+
+    rn_pat_to_type :: LPat GhcRn -> TcM (Maybe (LHsType GhcRn))
+    rn_pat_to_type (L l pat) = case pat of
+      EmbTyPat _ (HsTP _ hs_ty) -> pure (Just hs_ty)
+      ParPat _ inner -> fmap (L l . HsParTy noAnn) <$> rn_pat_to_type inner
+      TuplePat _ ps Boxed ->
+        fmap (L l . HsTupleTy noAnn HsBoxedOrConstraintTuple) . sequence <$> mapM rn_pat_to_type ps
+      ConPat _ (L cl (WithUserRdr rdr nm)) (PrefixCon _ args)
+        | nm == dataConName unitDataCon && null args ->
+            pure (Just (L l (HsTupleTy noAnn HsBoxedOrConstraintTuple [])))
+        | otherwise -> do
+            mb_args <- sequence <$> mapM rn_pat_to_type args
+            case mb_args of
+              Nothing -> pure Nothing
+              Just args' -> do
+                cl_res <- tcLookupConLike (WithUserRdr rdr nm)
+                case cl_res of
+                  RealDataCon dc
+                    | let tc = dataConTyCon dc
+                    , occNameFS (getOccName dc) == occNameFS (getOccName tc) ->
+                        let head_ty = L (l2l cl) (HsTyVar noAnn NotPromoted (L cl (WithUserRdr rdr (tyConName tc))))
+                        in pure (Just (foldl' (\f a -> L (combineLocsA f a) (HsAppTy noExtField f a)) head_ty args'))
+                  _ -> pure Nothing
+      _ -> pure Nothing
+
+-- | Open a dot package for one local pattern binding and its body.
+-- See Note [Scope for a local erased package pattern].
+tcLexicalExistsLet :: HsExpr GhcRn -> LHsLocalBinds GhcRn -> LHsExpr GhcRn
+                   -> ExpRhoType -> TcM (Maybe (HsExpr GhcTc))
+tcLexicalExistsLet original (L bind_loc (HsValBinds ann (XValBindsLR (HsVBG groups [])))) body expected
+  | [(NonRecursive, [L pat_bind_loc binding@PatBind
+      { pat_lhs = pat, pat_mods = [], pat_rhs = grhss }])] <- groups
+  , GRHSs { grhssGRHSs = L rhs_loc (GRHS rhs_ann [] rhs) NE.:| []
+          , grhssLocalBinds = L _ EmptyLocalBinds{} } <- grhss
+  = runMaybeT $ do
+      dflags <- liftMaybeT getDynFlags
+      guard (tuple_pattern pat || is_strict_let_pat dflags pat)
+      (schema, check_schema) <- MaybeT (tcLexicalPackageOperand rhs)
+      case coreFullView schema of
+        ExistsTy ImplicitExists _ _ -> guard (matchesImplicitPayloadPat schema pat)
+        _ -> mzero
+      liftMaybeT $ do
+        mult <- newMultiplicityVar
+        (checked, actual) <- tcScalingUsage mult $
+          if check_schema
+            then (, schema) <$> tcCheckMonoExpr rhs schema
+            else tcInferRhoFRR FRRPatBind rhs
+        result_ty <- expTypeToType expected
+        opened <- tcOpenImplicitPackageAt mult (getLocA rhs) actual checked result_ty $ \payload -> do
+          let name = getName payload
+              replacement = fmap (\source -> mkExpandedLExpr source (nlHsVar name)) rhs
+              binding' = binding
+                { pat_ext = extendNameSet (pat_ext binding) name
+                , pat_rhs = grhss { grhssGRHSs = L rhs_loc (GRHS rhs_ann [] replacement) NE.:| [] } }
+              scope = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, [L pat_bind_loc binding'])] []))
+          (usage, (decls, body')) <- tcCollectingUsage $
+            tcExtendGeneratedIdEnv payload $
+              tcLocalBinds scope (tcMonoLExpr body (mkCheckExpType result_ty))
+          let (payload_use, body_usage) = popUE usage payload
+              rhs_mult = case payload_use of
+                MUsage p -> p
+                _ -> ManyTy
+          tcEqMult (NonLinearPatternOrigin OtherPatternReason pat) rhs_mult mult
+          tcEmitBindingUsage body_usage
+          return (HsLet noExtField (L bind_loc decls) body')
+        return (mkExpandedExprTc original opened)
+  where
+    tuple_pattern (L _ (ParPat _ nested))  = tuple_pattern nested
+    tuple_pattern (L _ (AsPat _ _ nested)) = tuple_pattern nested
+    tuple_pattern (L _ (LazyPat _ nested)) = plain_tuple nested
+    tuple_pattern (L _ (BangPat _ nested)) = plain_tuple nested
+    tuple_pattern p                        = plain_tuple p
+
+    plain_tuple (L _ (ParPat _ nested))  = plain_tuple nested
+    plain_tuple (L _ (AsPat _ _ nested)) = plain_tuple nested
+    plain_tuple (L _ (TuplePat _ fields Boxed)) = all plain_field fields
+    plain_tuple _ = False
+
+    plain_field (L _ (ParPat _ nested))  = plain_field nested
+    plain_field (L _ (AsPat _ _ nested)) = plain_field nested
+    plain_field (L _ VarPat{}) = True
+    plain_field (L _ WildPat{}) = True
+    plain_field _ = False
+
+    is_strict_let_pat dflags lpat
+      | xopt LangExt.Strict dflags = not (is_lazy_strict lpat)
+      | otherwise                  = has_outer_bang lpat
+      where
+        is_lazy_strict (L _ (LazyPat _ _))  = True
+        is_lazy_strict (L _ (VarPat _ _))   = True
+        is_lazy_strict (L _ (ParPat _ p))   = is_lazy_strict p
+        is_lazy_strict (L _ (AsPat _ _ p))  = is_lazy_strict p
+        is_lazy_strict (L _ (SigPat _ p _)) = is_lazy_strict p
+        is_lazy_strict _                    = False
+
+        has_outer_bang (L _ (BangPat _ _))  = True
+        has_outer_bang (L _ (ParPat _ p))   = has_outer_bang p
+        has_outer_bang (L _ (AsPat _ _ p))  = has_outer_bang p
+        has_outer_bang (L _ (SigPat _ p _)) = has_outer_bang p
+        has_outer_bang _                    = False
+tcLexicalExistsLet _ _ _ _ = return Nothing
+
+{- Note [Scope for a local erased package pattern]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In let (value, reader) = package in reader value, the two fields mention
+the same witness. Open the declared dot package once. Bind the witness
+around the original pattern binding and its body. Replace the original
+RHS with the shared payload Id. Then use tcLocalBinds to infer the pattern
+binding and check its usage. Include the payload Id in the binding's
+free variables, since it carries the local witness. Keep the result type
+outside the opening. Keep the generated Id out of relevant bindings in
+error messages so the report shows the user's fields and package.
+
+The opening is lazy for every pattern. Keep the source pattern so ordinary
+desugaring determines whether the binding forces the tuple before its body.
+A source bang or the Strict default forces the tuple to WHNF. A source
+tilde keeps it lazy, including under Strict. See Note [decideBangHood]
+in GHC.HsToCore.Utils. The type of the complete let cannot mention the
+hidden witness in any of these cases.
+
+Allocate the payload multiplicity outside the opening. Use it to scale the
+producer and annotate the payload Id. Equate it with the use of the synthetic
+RHS from tcLocalBinds without using coercion evidence. This preserves the
+ordinary restriction on lazy bindings. A strict match may reuse the payload
+Id as its Core case binder
+(see matchSinglePat in GHC.HsToCore.Match). Delete the synthetic Id from
+the usage environment before leaving the opening.
+
+Restrict this entry to an unsigned singleton nonrecursive binding with
+an unguarded RHS, and a boxed tuple of variables or wildcards with at most
+one outer bang or tilde. A recursive group, a signature, or a pattern
+with its own evidence needs a separate rule. See also Note [Typechecking pattern bindings] in GHC.Tc.Gen.Bind.
+-}
+
+-- | Elaborate a nonrecursive index definition through dependent application.
+-- See Note [Equality for lazy local definitions].
+tcNativeLet :: HsExpr GhcRn -> LHsLocalBinds GhcRn -> LHsExpr GhcRn -> Type
+            -> TcM (Maybe (HsExpr GhcTc))
+tcNativeLet original (L loc (HsValBinds ann (XValBindsLR (HsVBG groups sigs)))) body expected
+  | not (null groups), all isTypeLSig sigs
+  , Just bindings <- traverse nonrec_fun groups
+  = tcWithLocalTySyns syn_sigs $
+    do { direct <- case (bindings, val_sigs) of
+           ([L _ FunBind { fun_id = name, fun_matches = matches }], [])
+             | Just rhs <- lazyLetRhs matches -> named_argument name rhs
+           _ -> return Nothing
+       ; case direct of
+           Just expr -> return (Just (mkExpandedExprTc original expr))
+           Nothing -> do
+             { expr <- foldr check_binding (tcMonoLExpr body (Check expected)) bindings
+             ; return (Just (mkExpandedExprTc original (unLoc expr))) } }
+  where
+    (syn_sigs, val_sigs) = partition isLocalTySynLSig sigs
+
+    nonrec_fun (NonRecursive, [binding@(L _ FunBind{})]) = Just binding
+    nonrec_fun _ = Nothing
+
+    sigs_for :: Name -> [LSig GhcRn]
+    sigs_for target = mapMaybe narrow val_sigs
+      where
+        narrow (L s_loc (TypeSig x mods names wc_ty))
+          | let matching = [l_nm | l_nm@(L _ nm) <- names, nm == target]
+          , not (null matching)
+          = Just (L s_loc (TypeSig x mods matching wc_ty))
+        narrow s@(L _ (XSig (IdSig ident)))
+          | idName ident == target
+          = Just s
+        narrow _ = Nothing
+
+    check_binding :: LHsBind GhcRn -> TcM (LHsExpr GhcTc) -> TcM (LHsExpr GhcTc)
+    check_binding binding@(L _ FunBind { fun_id = L _ name }) rest
+      | [L s_loc (TypeSig _ [] [_] wc_ty)] <- b_sigs
+      , not (isCompleteHsSig wc_ty)
+      , HsWC { hswc_body = L _ (HsSig { sig_bndrs = bndrs, sig_body = sig_body }) } <- wc_ty
+      , null (hsOuterTyVarNames bndrs)
+      , (Nothing, _) <- splitLHsQualTy sig_body
+      = do { ambient <- tcRetainedAmbientIndices RetainedLocalSignatureIndex sig_body
+           ; if isEmptyNameEnv ambient
+             then tcNonRecLets [binding] b_sigs check_group rest
+             else do
+               { (wcs, wcx, tv_prs, theta, tau, calls) <-
+                   setSrcSpanA s_loc $
+                     tcHsPartialSigType RejectSigCalls (FunSigCtxt name NoRRC) wc_ty
+               ; if isNothing wcx && null tv_prs && null theta && null calls
+                 then do
+                   { (checked, body') <- tcExtendNameTyVarEnv wcs $
+                                           tcNonRecLetAtType name tau binding rest
+                   ; let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
+                   ; return (L (getLoc body') (HsLet noExtField (L loc binds) body')) }
+                 else tcNonRecLets [binding] b_sigs check_group rest } }
+      | [] <- b_sigs
+      , FunBind { fun_matches = matches } <- unLoc binding
+      , Just rhs <- lazyLetRhs matches
+      = do { mb_tau <- known_nested_exists_rhs rhs
+           ; case mb_tau of
+               Just tau -> do
+                 { (checked, body') <- tcNonRecLetAtType name tau binding rest
+                 ; let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
+                 ; return (L (getLoc body') (HsLet noExtField (L loc binds) body')) }
+               Nothing -> tcNonRecLets [binding] b_sigs check_group rest }
+      | otherwise = tcNonRecLets [binding] b_sigs check_group rest
+      where
+        b_sigs = sigs_for name
+
+        known_nested_exists_rhs :: LHsExpr GhcRn -> TcM (Maybe TcType)
+        known_nested_exists_rhs e = case unLoc (stripParensLHsExpr e) of
+          HsVar _ lname -> do
+            let nm = unLocWithUserRdr lname
+            mb_id <- if isExternalName nm
+                     then discardErrs $ tryTcDiscardingErrs (pure Nothing) (tcLookupIdMaybe nm)
+                     else do
+                       lcl <- tcLookupLcl_maybe nm
+                       pure $ case lcl of
+                         Just (ATcId { tct_id = v }) -> Just v
+                         Just (AGlobal (AnId v))     -> Just v
+                         _                           -> Nothing
+            case mb_id of
+              Just ident -> do
+                ty <- liftZonkM (zonkTcType (varType ident))
+                pure $ if is_ground_nested_exists ty then Just ty else Nothing
+              Nothing -> pure Nothing
+          _ -> pure Nothing
+
+        is_ground_nested_exists :: TcType -> Bool
+        is_ground_nested_exists ty
+          | ExistsTy{} <- coreFullView ty = False
+          | otherwise = isFamFreeTy ty
+                        && all (\v -> isTyVar v && not (isMetaTyVar v)) (tyCoVarsOfTypeList ty)
+                        && has_exists_no_pi [] ty
+
+        has_exists_no_pi :: [TyVar] -> TcType -> Bool
+        has_exists_no_pi bound t = case coreFullView t of
+          ExistsTy _ b body -> no_pi_or_forall (b : bound) (tyVarKind b)
+                               && no_pi_or_forall (b : bound) body
+          TyConApp _ args   -> any (has_exists_no_pi bound) args
+                               && all (no_pi_or_forall bound) args
+          AppTy f a         -> (has_exists_no_pi bound f || has_exists_no_pi bound a)
+                               && no_pi_or_forall bound f && no_pi_or_forall bound a
+          _                 -> False
+
+        no_pi_or_forall :: [TyVar] -> TcType -> Bool
+        no_pi_or_forall bound t = case coreFullView t of
+          DepFunTy{}        -> False
+          ForAllTy{}        -> False
+          ExistsTy _ b body -> no_pi_or_forall (b : bound) (tyVarKind b)
+                               && no_pi_or_forall (b : bound) body
+          FunTy _ _ m a r   -> all (no_pi_or_forall bound) [m, a, r]
+          TyConApp _ args   -> all (no_pi_or_forall bound) args
+          AppTy f a         -> no_pi_or_forall bound f && no_pi_or_forall bound a
+          TyVarTy v         -> v `elem` bound || not (isMetaTyVar v)
+          _                 -> True
+    check_binding binding rest = tcNonRecLets [binding] [] check_group rest
+
+    check_group checked rest = do
+      refined <- tcOptionalLet checked rest expected
+      case refined of
+        Just expr -> return (L (noAnnSrcSpan (combineSrcSpans (locA loc) (getLocA body))) expr)
+        Nothing -> do
+          body' <- rest
+          let binds = HsValBinds ann (XValBindsLR (HsVBG [(NonRecursive, checked)] []))
+          return (L (getLoc body') (HsLet noExtField (L loc binds) body'))
+
+    named_argument name rhs = runMaybeT $ do
+        value <- candidate rhs
+        index <- MaybeT (pure (Core.retainedArgIndex value))
+        let domain = typeKind index
+        guard (isNativeIndexType domain)
+        template_name <- liftMaybeT (newSysName (mkTyVarOcc "let_index"))
+        let template = mkTyVar template_name domain
+        result <- MaybeT (pure (abstractNativeIndices [(index, template)] expected))
+        guard (anyFreeVarsOfType (== template) result)
+        liftMaybeT $ do
+            (checked, argument, arg_ue) <- tcRetainedArg domain rhs
+            tcScalingUsage ManyTy (tcEmitBindingUsage arg_ue)
+            let binder = mkLocalId (unLoc name) ManyTy domain
+                equality = mkNomEqPred (TermVarTy binder) index
+                signature = mkDepFunTy binder (mkPhiTy [equality] expected)
+                pat = L (l2l (getLoc name)) (VarPat noExtField name)
+                row = genSimpleMatch (LamAlt LamSingle) [pat] body
+                matches = mkMatchGroup (Generated OtherExpansion SkipPmc) noAnn (wrapGenSpan [row])
+                lambda = wrapGenSpan (HsLam noAnn LamSingle matches)
+            fun <- tcWithSourceLetView binder index (tcCheckMonoExprNC lambda signature)
+            let result_ty = applyTypeToArgs signature [checked]
+                app = HsAppRetained (DepFunVisible, result_ty) fun argument
+            tcWrapResult (unLoc body) app result_ty (Check expected)
+    candidate :: LHsExpr GhcRn -> MaybeT TcM Core.CoreExpr
+    candidate (L _ expr) = case expr of
+      HsPar _ e -> candidate e
+      HsApp _ f a -> Core.App <$> candidate f <*> candidate a
+      OpApp _ a f b -> Core.mkApps <$> candidate f <*> traverse candidate [a, b]
+      HsVar _ lname -> do
+        thing <- liftMaybeT (tcLookup (unLocWithUserRdr lname))
+        env <- liftMaybeT getGblEnv
+        let occurrence var = MaybeT (pure (Core.Var <$> sourceTableOccurrence env var))
+        case thing of
+          ATcId { tct_id = var } -> occurrence var
+          AGlobal (AnId var) -> occurrence var
+          AGlobal (AConLike (RealDataCon dc)) -> return (Core.Var (dataConWorkId dc))
+          _ -> mzero
+      _ -> mzero
+tcNativeLet _ _ _ _ = return Nothing
+
+{- Note [Equality for lazy local definitions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose a result mentions times rows cols, and the body binds
+cells = times rows cols. Check the body as a local function with type
+
+  foreach (cells :: Nat) -> (cells ~ times rows cols) => result
+
+Apply it to the original RHS once. The retained application checks the
+actual function identities, operands, and domain. Substitution into the
+equality makes the evidence argument reflexive. tcWrapResult still asks
+the solver to discharge the actual predicate. The evidence argument is
+an erased CoVar. The body can use cells twice or ignore it. Mark the
+synthetic lambda and its match as generated. Keep the user's spans on
+the binder, the RHS, and the body for diagnostics.
+
+Select this rule from the result type and a read-only view of the renamed
+RHS. Look up a same-module function in the completed type environment.
+An earlier occurrence can lack its source table. The prepass registers no
+equation use. The retained argument checker records the selected owners.
+Neither the view nor the type match constructs evidence. Leave other
+lets to ordinary binding checks, including recursive groups and Strict
+bindings. A class selector alone supplies no checked index. Choosing a
+global instance here could change the meaning of ordinary multiplication
+under a local Num dictionary. Agda's let conversion motivates the equality
+(Norell, 2007; GHC Proposal #378, §4.6); the lazy value argument preserves
+Haskell sharing.
+-}
+
+-- | Check a local definition in the scope of the preceding definitions.
+-- See Note [Optional equality for an overloaded let].
+tcOptionalLet :: LHsBinds GhcTc -> TcM (LHsExpr GhcTc) -> Type -> TcM (Maybe (HsExpr GhcTc))
+tcOptionalLet checked rest expected
+  | Just (binder, ev_binds, rhs_kind) <- case checked of
+      [L _ (XHsBindsLR (AbsBinds { abs_tvs = [], abs_ev_vars = [], abs_ev_binds = evs
+             , abs_exports = [ABE { abe_poly = public, abe_mono = mono, abe_wrap = WpHole
+                                  , abe_prags = SpecPrags [] }], abs_binds = inner }))] ->
+          do { (value, rhs_kind) <- binding_rhs inner
+             ; guard (value == mono && varType value `tcEqType` varType public)
+             ; return (public, evs, rhs_kind) }
+      _ -> (\(b, rk) -> (b, [], rk)) <$> binding_rhs checked
+  = runMaybeT $ do
+      strict <- liftMaybeT (xoptM LangExt.Strict)
+      guard (not strict)
+      initial <- liftMaybeT (liftZonkM (zonkId binder))
+      let mult = idMult initial
+          flexible = maybe False isMetaTyVar (getTyVar_maybe mult)
+          is_value = isNativeIndexId (setIdMult initial ManyTy)
+          is_fun = isNativeIndexFunctionId (setIdMult initial ManyTy)
+      guard ((is_value || is_fun) && (isManyTy mult || flexible))
+      flags <- liftMaybeT getDynFlags
+      guard (all (== Breakpoints) (ticks_passes (initTicksConfig flags))
+             && not (sccProfilingEnabled flags))
+      if is_value
+        then case rhs_kind of
+          LazyValueRhs rhs -> do
+            (canonical, owners, methods) <- MaybeT (tcOptionalLetOperand rhs)
+            index <- MaybeT (pure (Core.retainedArgIndex canonical))
+            guard (typeKind index `tcEqType` idType initial)
+            step <- prepare_step initial rhs canonical index owners methods
+            liftMaybeT (tcSubMult (OccurrenceOf (idName initial)) ManyTy mult)
+            value <- liftMaybeT (liftZonkM (zonkId binder))
+            guard (isNativeIndexId value)
+            liftMaybeT (unLoc <$> emit_steps [(value, foldr mkHsDictLet rhs ev_binds, canonical, index, step)] rest)
+          LazyUnaryRhs{} -> mzero
+        else do
+          let (mb_param, target_expr, fallback_rhs) = case rhs_kind of
+                LazyValueRhs rhs -> (Nothing, rhs, rhs)
+                LazyUnaryRhs param body lam_rhs -> (Just param, body, lam_rhs)
+          (intermediates, (canonical, owners, methods)) <-
+            MaybeT (tcOptionalLetFunctionOperand mb_param target_expr (idType initial))
+          prep_intermediates <- forM intermediates $
+            \(tmp, tmp_rhs, tmp_can, tmp_owners, tmp_methods) -> do
+              tmp_index <- MaybeT (pure (Core.nativeIndexFunctionArgIndex tmp_can))
+              guard (typeKind tmp_index `tcEqType` idType tmp)
+              deps <- prepare_step tmp tmp_rhs tmp_can tmp_index tmp_owners tmp_methods
+              return (tmp, tmp_rhs, tmp_can, tmp_index, deps)
+          index <- MaybeT (pure (Core.nativeIndexFunctionArgIndex canonical))
+          guard (typeKind index `tcEqType` idType initial)
+          main_deps <- prepare_step initial fallback_rhs canonical index owners methods
+          liftMaybeT (tcSubMult (OccurrenceOf (idName initial)) ManyTy mult)
+          value <- liftMaybeT (liftZonkM (zonkId binder))
+          guard (isNativeIndexFunctionId value)
+          liftMaybeT $ unLoc <$>
+            emit_steps (prep_intermediates ++ [(value, foldr mkHsDictLet fallback_rhs ev_binds, canonical, index, main_deps)]) rest
+  | otherwise = return Nothing
+  where
+    prepare_step _ _ _ _ owners methods = do
+      let uses = [(dfun, sel, target) | (_, dfun, sel, target) <- methods]
+          guards = [(wanted, dfun) | (wanted, dfun, _, _) <- methods]
+      dependencies <- MaybeT (optionalSourceUses owners uses)
+      return (guards, dependencies)
+
+    emit_steps [] action = action
+    emit_steps ((value, rhs, canonical, index, (guards, dependencies)) : steps) action = do
+      proof <- newEvVar (mkNomEqPred (TermVarTy value) index)
+      traceTc "tcOptionalLet" (ppr value <+> dcolon <+> ppr (idType proof) $$ ppr guards)
+      (binds, body') <- setSrcSpan (nameSrcSpan (idName value)) $
+                        checkSourceLetConstraints (idName value) guards proof $
+                        tcWithSourceLetView value index $
+                        emit_steps steps action
+      registerOptionalSourceUses binds proof dependencies
+      return (L (getLoc body') (XExpr (NativeLetAlias rhs (PendingSourceLetRhs binds canonical) value proof expected (mkHsDictLet binds body'))))
+
+    binding_rhs [L bind_loc FunBind { fun_ext = (WpHole, []), fun_id = L _ binder, fun_matches = matches }]
+      | Just rhs <- lazyLetRhs matches = Just (binder, LazyValueRhs rhs)
+      | MG { mg_alts = L alts_loc [L match_loc match] } <- matches
+      , Match { m_ctxt = FunRhs { mc_strictness = NoSrcStrict }
+              , m_pats = L _ [pat]
+              , m_grhss = grhss } <- match
+      , Just param <- lazy_var_pat pat
+      , Just body <- unguardedRhs grhss
+      = let lam_match = L match_loc (match { m_ctxt = LamAlt LamSingle })
+            lam_rhs = L bind_loc (HsLam noAnn LamSingle (matches { mg_alts = L alts_loc [lam_match] }))
+        in Just (binder, LazyUnaryRhs param body lam_rhs)
+    binding_rhs _ = Nothing
+
+    lazy_var_pat (L _ (ParPat _ pat)) = lazy_var_pat pat
+    lazy_var_pat (L _ (VarPat _ (L _ var))) = Just var
+    lazy_var_pat _ = Nothing
+
+data LazyBindingRhs
+  = LazyValueRhs (LHsExpr GhcTc)
+  | LazyUnaryRhs Id (LHsExpr GhcTc) (LHsExpr GhcTc)
+
+{- Note [Repacking through a local binding]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this ordinary function with a checked result of type Packed a:
+
+    swap p = let result = case p of (xs, ys) -> (ys, xs) in result
+
+Inferring the local RHS makes the two hidden lengths escape the inner
+case. The result context already supplies the package type. Use it to
+check the binding, as for a complete local signature. A single variable
+case that returns the variable can use the same input type for its
+scrutinee. Keep the original binding or match and its multiplicity checks.
+
+Only the exact returned binder transmits the expected type. The existing
+implicit result check packs each witness in the scope that introduced it.
+This follows Elab-Gen's scope rule (Eisenberg et al., ICFP 2021; GHC Proposal #473).
+No witness enters the binding's type. An inferred result, a recursive or signed
+let, and other case patterns keep their ordinary checking rules.
+-}
+
+{- Note [Signed and grouped local indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Check each dependency-sorted nonrecursive binding together with its own
+written type signatures before entering the implication for its remaining
+siblings and body. Thus a later local signature or RHS may reference an
+earlier local index binding without making that equality available in the
+index binding's own definition. When a monomorphic partial signature
+references an earlier local index, check its RHS directly at the partial
+tau type with tcNonRecLetAtType so wildcard metavariables unify in the
+enclosing scope without generalising a retained type.
+
+tcPolyCheck represents a complete signature by an AbsBinds with one export.
+The body uses the public Id. Its checked RHS binds a fresh inner Id. Read
+the RHS only when the export and equation have identity wrappers and bind
+no evidence, type variables or pragmas. A qualified or polymorphic signature
+can abstract inside the FunBind wrapper even when the AbsBinds lists are empty.
+Use ordinary let bindings for other checked forms.
+-}
+
+{- Note [Optional equality for an overloaded let]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For let cells = rows * cols, check the binding with the ordinary let
+generalisation and usage rules. Inspect the checked RHS inside the scope
+of the resulting binding. A simple monomorphic RHS can supply both the
+dictionary Wanted for the written (*) and a candidate checked product.
+An abstracted binding or a binding with wrappers keeps ordinary checking.
+A nonrecursive binder can still have a flexible multiplicity. The recovered
+RHS uses only unrestricted operands. Set the binder to Many in its original
+scope before the body enters an implication. Preserve a rigid One.
+
+Capture the body's constraints under an implication. Let the solver offer
+cells ~# times rows cols only if the evidence for the original RHS selects
+the dictionary that certifies times. A Given Num Nat can supply a different
+method. The program may still use cells at runtime without its equality.
+The body can also return a vector built independently at times rows cols.
+
+When the body uses the proof, record the method and equation dependencies
+and validate the eventual RULES. Desugaring must discharge that same proof
+by retained application at the canonical product. Otherwise desugar the
+written RHS once as an ordinary lazy let.
+-}
+
+{- Note [Matching an implicit existential payload]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A data constructor for the declared payload type can request an opening
+in a case, as an application can request one with its formal domain.
+An ordinary case first checks its scrutinee and multiplicity. Open the
+checked package around the whole match, with the result type outside
+the witness scope. Keep the ordinary case match checker. A constructor
+demand, lazy pattern, and GADT refinement keep their ordinary meaning.
+
+A variable or wildcard alone matches the package. A pattern synonym
+can also match the package at its declared type. Require a real data
+constructor of the payload type before selecting the opening. The
+checked dot type is sufficient in a client that imports the schema.
+-}
+
+{- Note [Checking a lexical existential case]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A sole Pack alternative opens the package with a fresh type skolem and a
+payload. Prepare the result type at the outer level so it cannot mention the
+skolem. Use the same implication machinery as constructor patterns for
+constraints in the payload match and its right-hand side.
+
+Translate the payload pattern to an ordinary case inside Unpack. A variable
+or wildcard does not demand the payload in a lazy module. An ordinary strict
+payload pattern, such as Just x, demands it in the usual way. The scope of the
+skolem covers the payload pattern and the whole alternative. A wildcard
+witness still needs this skolem to type the payload. Only a written witness
+name enters the source type environment.
+
+When the scrutinee has dot binders before the bar package, open the dot
+binders around the explicit match. Keep the result type outside both
+openings. The written Pack pattern still binds the bar witness, and its
+payload pattern still determines demand.
+-}
+
+-- | Classify an opaque call after ordinary expression and usage checking.
+-- See Note [Source opaque call refinement] in GHC.Tc.Gen.Match,
+-- Note [Checked source call arguments], and Note [Signed source call beta].
+checkedNativeCallIndex :: LHsExpr GhcTc -> Type -> TcM (Maybe Type)
+checkedNativeCallIndex expr result_ty
+  | HsApp _ fun _ <- unLoc (stripParensLHsExpr expr)
+  , local_head fun
+  = do { mb_core <- tcExprToRetainedCore (RCM_CaseCallArg emptyNameEnv) expr
+       ; result_ty <- liftZonkM (zonkTcType result_ty)
+       ; return $ do
+           (core, _, _) <- mb_core
+           index <- Core.exprToNativeCaseIndex core
+           guard (typeKind index `eqType` result_ty)
+           return index }
+  | otherwise = return Nothing
+  where
+    local_head :: LHsExpr GhcTc -> Bool
+    local_head fun = case unLoc (stripParensLHsExpr fun) of
+      XExpr (WrapExpr (WpCast _) inner) -> local_head (noLocA inner)
+      HsApp _ inner _ -> local_head inner
+      HsVar _ (L _ f) -> isNativeIndexFunctionId f
+      _ -> False
+
+{- Note [Signed source call beta]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When 'RCM_CaseCallArg' in 'GHC.Tc.Gen.App.tcExprToRetainedCore' inspects a call
+@((\x -> body) :: A -> A) arg@ with a closed plain @A -> A@ signature, no
+@-XStrict@, and a zonked 'ManyTy' index binder @x@, reconstruct a temporary
+@Core.App (Core.Lam x core_body) core_arg@ for 'GHC.Core.exprToNativeIndex'
+without re-checking or altering execution (Norell, PhD thesis, Chalmers, 2007;
+GHC Proposal #378, §4.7). See Note [Source opaque call refinement] in
+GHC.Tc.Gen.Match.
+
+Note [Cases on a cast callback result]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a case scrutinee casts a partial callback call @f x@ by a representational
+coercion before applying @y@ (for example @f :: Bool -> Result 'True@ where
+@Result 'True@ reduces to @Bool -> Ordering@), 'tcExprToRetainedCore' follows
+nominal family equations on the source type to expose the arrow, unifies it
+with the cast target, and builds the nominal cast expected by
+'GHC.Core.exprToNativeCaseIndex' (Norell, PhD thesis, Chalmers, 2007; Cockx and
+Abel, ICFP 2018). See Note [Checking a cast retained callback] in GHC.Tc.Gen.App.
+
+Note [Checked source call arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'RCM_CaseCallArg' reconstructs a temporary Core spine from the checked 'HsExpr'
+'GhcTc' using 'dataConWrapId' so 'GHC.Core.exprToNativeCaseIndex' validates
+constructor wrappers, saturation, and domains without re-running expression or
+usage checks. See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+-}
 
 {-
 ************************************************************************
@@ -869,26 +2141,32 @@ arithSeqEltType (Just fl) res_ty
 
 -- | Typecheck an explicit tuple @(a,b,c)@ or @(\#a,b,c\#)@.
 --
--- Does not handle tuple sections.
-tcCheckExplicitTuple :: [HsTupArg GhcRn]
+-- The first argument gives missing-field multiplicities in source order.
+tcCheckExplicitTuple :: [Mult]
+                     -> [HsTupArg GhcRn]
                      -> [TcSigmaType]
                           -- ^ Argument types.
                           -- This function ensures they all have
                           -- a fixed runtime representation.
                      -> TcM [HsTupArg GhcTc]
-tcCheckExplicitTuple args tys
+tcCheckExplicitTuple mults args tys
   = do massert (equalLength args tys)
        checkTupSize (length args)
-       zipWith3M go [1,2..] args tys
+       go 1 mults args tys
   where
-    go :: Int -> HsTupArg GhcRn -> TcType -> TcM (HsTupArg GhcTc)
-    go i (Missing {})     arg_ty
-      = pprPanic "tcCheckExplicitTuple: tuple sections not handled here"
-          (ppr i $$ ppr arg_ty)
-    go i (Present x expr) arg_ty
+    -- Check fields and consume missing-field multiplicities in source order.
+    go :: Int -> [Mult] -> [HsTupArg GhcRn] -> [TcType] -> TcM [HsTupArg GhcTc]
+    go _ [] [] [] = return []
+    go i (mult : mults) (Missing{} : args) (arg_ty : tys)
+      = do { hasFixedRuntimeRep_syntactic (FRRUnboxedTupleSection i) arg_ty
+           ; args' <- go (i+1) mults args tys
+           ; return (Missing (Scaled mult arg_ty) : args') }
+    go i mults (Present x expr : args) (arg_ty : tys)
       = do { expr' <- tcCheckPolyExpr expr arg_ty
            ; (co, _) <- hasFixedRuntimeRep (FRRUnboxedTuple i) arg_ty
-           ; return (Present x (mkLHsWrap (mkWpCastN co) expr')) }
+           ; args' <- go (i+1) mults args tys
+           ; return (Present x (mkLHsWrap (mkWpCastN co) expr') : args') }
+    go _ _ _ _ = panic "tcCheckExplicitTuple: field or multiplicity count"
 
 -- | Typecheck an explicit tuple or tuple section by performing type inference.
 tcInferTupArgs :: Boxity
@@ -906,9 +2184,15 @@ tcInferTupArgs boxity args
   tc_infer_tup_arg i (Present x lexpr@(L l expr))
     = do { (expr', arg_ty) <- case boxity of
              Unboxed -> runInferRhoFRR (FRRUnboxedTuple i) (tcPolyExpr expr)
-             Boxed   -> do { arg_ty <- newFlexiTyVarTy liftedTypeKind
-                           ; L _ expr' <- tcCheckPolyExpr lexpr arg_ty
-                           ; return (expr', arg_ty) }
+             Boxed   -> do { (inferable, anchor) <- tcRetainedInferableArg lexpr
+                           ; if inferable && anchor
+                             then do { (expr', arg_ty) <- tcInferRhoFRR (FRRUnboxedTuple i) lexpr
+                                     ; _ <- setSrcSpanA l $ addExprCtxt expr $
+                                              unifyType Nothing (typeKind arg_ty) liftedTypeKind
+                                     ; return (unLoc expr', arg_ty) }
+                             else do { arg_ty <- newFlexiTyVarTy liftedTypeKind
+                                     ; L _ expr' <- tcCheckPolyExpr lexpr arg_ty
+                                     ; return (expr', arg_ty) } }
          ; return (Present x (L l expr'), arg_ty) }
 
   new_arg_ty :: Int -> TcM TcTypeFRR
@@ -916,6 +2200,50 @@ tcInferTupArgs boxity args
     case boxity of
       Unboxed -> newOpenFlexiFRRTyVarTy (FRRUnboxedTupleSection i)
       Boxed   -> newFlexiTyVarTy liftedTypeKind
+
+{- Note [Inference of native tuple fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If xs :: Vec Int n, inferring (42, xs) must retain that exact second field
+type. The ordinary tuple path first allocates component meta-variables.
+Those variables cannot contain a runtime Id such as n.
+
+Expand a complete boxed tuple to its ordinary data constructor when the
+result is an InferResult and a field has a native anchor. An ordinary
+client can import that anchor. Both `(f x, y)` and `(,) (f x) y` must
+use the imported type in the same scope.
+See Note [Imported native application contracts] in GHC.Tc.Gen.App.
+Use tcRetainedInferableArg to classify the fields
+without checking them or running splices. The application checker infers
+and caches native fields, chooses their types immutably, and checks the
+other fields normally. It retains scope, kind, usage and subsumption checks.
+
+Use the existing expansion wrapper and generated application spans. Keep
+the original tuple context and the user-written field spans in diagnostics.
+A known expected type still uses component checking, including higher-rank
+fields. Unboxed tuples keep their existing paths.
+
+Keep ExplicitTuple for sections. Infer an anchored native present field once
+and retain its exact type. Check its lifted kind as well as its fixed runtime
+representation. Other present fields and missing-field metas keep ordinary
+inference. Missing fields supply no native anchor.
+
+A native expected visible-arrow function with a boxed tuple result supplies
+component types and hole multiplicities. Check present fields at those types.
+Store a missing field's tuple component type and the corresponding arrow
+multiplicity. Reconstruct the whole section function, then use the existing
+tcWrapResultMono against the original expected type. It keeps any required
+domain and result coercions. A tuple-result cast cannot wrap the section AST,
+which denotes a function. Other expected shapes keep the ordinary path.
+
+The existing desugaring creates missing-field lambdas in source order.
+Present expressions stay inside their tuple body. Do not add a sharing let
+or move an expression outside those lambdas. Named captured values retain
+their original sharing. Keep field usage and scope checks unchanged.
+
+The ordinary product does not bind a runtime index. Returning (n, xs) cannot
+hide a free callback-local n. Use an explicit package for that purpose; see
+GHC Proposal #473 and Eisenberg et al. (ICFP 2021).
+-}
 
 ---------------------------
 -- See TcType.SyntaxOpType also for commentary
@@ -1045,7 +2373,7 @@ tcSynArgA :: CtOrigin
             -- wrappers to be applied to arguments
             -- and a wrapper to be applied to the overall expression
 tcSynArgA orig op sigma_ty arg_shapes res_shape thing_inside
-  = do { (match_wrapper, arg_tys, res_ty)
+  = do { (match_wrapper, _mas, arg_tys, res_ty)
            <- matchActualFunTys herald orig (length arg_shapes) sigma_ty
               -- match_wrapper :: sigma_ty ~~> (arg_tys -> res_ty)
        ; ((result, res_wrapper), arg_wrappers)
@@ -1386,13 +2714,26 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
        -- See Note [Disambiguating record updates] in GHC.Rename.Pat.
        ; (cons, rbinds)
            <- disambiguateRecordBinds record_expr record_rho possible_parents rbnds res_ty
-       ; let sel_ids       = map (unLoc . foLabel . unLoc . hfbLHS . unLoc) rbinds
-             upd_fld_names = map idName sel_ids
+       ; let sel_ids = map (unLoc . foLabel . unLoc . hfbLHS . unLoc) rbinds
              relevant_cons@(relevant_con NE.:| _) =
               case NE.nonEmpty $ nonDetEltsUniqSet cons of
                 Just rel_cons -> rel_cons
                 Nothing -> pprPanic "desugarRecordUpd: no relevant constructors" $
                               vcat [ text "record_expr:" <+> ppr record_expr ]
+             retained_record (RealDataCon con) = not (null (dataConRepArgBinders con))
+             retained_record _ = False
+             supplied = mkNameEnv (zip (map idName sel_ids) rbinds)
+
+       ; case relevant_cons of
+           RealDataCon con NE.:| []
+             | retained_record relevant_con
+             -> expandRetainedRecordUpdate con (zip sel_ids rbinds) supplied record_expr res_ty
+           _ | any retained_record relevant_cons
+             -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
+           _ -> expand_ordinary relevant_cons (map idName sel_ids) rbinds }
+  where
+
+    expand_ordinary relevant_cons@(relevant_con NE.:| _) upd_fld_names rbinds = do {
 
       -- STEP 2: expand the record update.
       --
@@ -1415,7 +2756,7 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
          -- with metavariables to obtain a type for each 'Id'.
          -- This will allow us to have 'Id's with polymorphic types
          -- by using 'IdSig'. See Wrinkle [Using IdSig] in Note [Record Updates].
-       ; let (univ_tvs, ex_tvs, eq_spec, _, _, arg_tys, con_res_ty) = conLikeFullSig relevant_con
+         let (univ_tvs, ex_tvs, eq_spec, _, _, arg_tys, con_res_ty) = conLikeFullSig relevant_con
        ; (subst, tc_tvs) <- newMetaTyVars (univ_tvs ++ ex_tvs)
        ; let (actual_univ_tys, _actual_ex_tys) = splitAtList univ_tvs $ map mkTyVarTy tc_tvs
 
@@ -1539,6 +2880,220 @@ expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
                  , text "ds_expr:" <+> ppr ds_expr
                  ]
         ; return (ds_expr, ds_res_ty, RecordUpdCtxt relevant_cons upd_fld_names ex_tvs) }
+
+-- | Expand a record update on a retained constructor, handling witness-updating,
+-- parameterized witness-preserving, and monomorphic retained projection updates.
+-- See Note [Updating a retained record payload],
+-- Note [Replacing a retained record witness], and
+-- Note [Parameterized retained record updates].
+expandRetainedRecordUpdate
+  :: DataCon
+  -> [(Id, LHsRecUpdField GhcTc GhcRn)]
+  -> NameEnv (LHsRecUpdField GhcTc GhcRn)
+  -> LHsExpr GhcRn
+  -> ExpRhoType
+  -> TcM (HsExpr GhcRn, TcType, HsCtxt)
+expandRetainedRecordUpdate con fields supplied record_expr res_ty
+  | [_] <- tyConDataCons tc
+  , Just (witness, payload_types) <- promotedRetainedFields con
+  , witness_field : payload_fields <- dataConFieldLabels con
+  , Scaled _ witness_orig_ty : payload_orig_tys <- orig_arg_tys
+  = case lookupNameEnv supplied (flSelector witness_field) of
+      Just witness_bind -> do
+        let p_fields = [(fld, lookupNameEnv supplied (flSelector fld)) | fld <- payload_fields]
+            missing  = [flLabel fld | (fld, Nothing) <- p_fields]
+            untouched_tys = [witness_orig_ty | not (null missing)]
+                         ++ [scaledThing t | ((_, Nothing), t) <- zip p_fields payload_orig_tys]
+            written = hfbRHS (unLoc witness_bind)
+        (in_tvs, extra_out_tvs, out_subst, out_tys) <-
+          instantiateRetainedRecordUnivs univ_tvs (closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys))
+        witness_val <- if null missing then pure written else do
+          mb_ok <- checkRetainedRecordWitness (idType witness) witness_field record_expr written
+          maybe (setSrcSpanA (getLoc (hfbLHS (unLoc witness_bind))) $
+                   failWithTc (TcRnRetainedQuantificationError
+                     (RetainedRecordUpdateWitness con_name (flLabel witness_field) missing)))
+                pure mb_ok
+        witness_nm <- newSysName (nameOccName (flSelector witness_field))
+        p_names    <- mapM (newSysName . nameOccName . flSelector) payload_fields
+        let in_rec_ty  = mkTyConApp tc (mkTyVarTys in_tvs)
+            out_rec_ty = mkTyConApp tc out_tys
+            witness'   = setIdType witness (substTy out_subst (idType witness))
+            old_pat    = genSimpleConPat con_name (replicate (1 + length p_names) genWildPat)
+            p_pat nm (_, Just _)  = genVarPat nm
+            p_pat nm (_, Nothing) = wrapGenSpan (LazyPat noExtField (genVarPat nm))
+            p_arg (_, Just b)     = hfbRHS (unLoc b)
+            p_arg (fld, Nothing)  = wrapGenSpan (genHsApps (flSelector fld) [record_expr])
+            sig = mkSpecForAllTys (map (unmatchableDataConTy,) (in_tvs ++ extra_out_tvs)) $
+                    mkVisFunTyManyU in_rec_ty $
+                    mkDepFunTy witness' $
+                    mkVisFunTysManyU [substTy out_subst (ty (TermVarTy witness')) | ty <- payload_types] out_rec_ty
+        ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
+        expanded  <- genRetainedRecordUpd sig (old_pat : genVarPat witness_nm : zipWith p_pat p_names p_fields)
+                       (genHsApps con_name (map genLHsVar (witness_nm : p_names)))
+                       (record_expr : witness_val : map p_arg p_fields)
+        pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) (map (idName . fst) fields) [])
+
+      Nothing | not (null fields) -> do
+        witness_sel   <- tcLookupId (flSelector witness_field)
+        witness_table <- maybe (failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate))
+                               pure (sourceTableId_maybe witness_sel)
+        let untouched_tys = witness_orig_ty :
+              [ scaledThing t | (pf, t) <- zip payload_fields payload_orig_tys
+                              , not (flSelector pf `elemNameEnv` supplied) ]
+        (in_tvs, extra_out_tvs, out_subst, out_tys) <-
+          instantiateRetainedRecordUnivs univ_tvs (closeUnivKinds univ_tvs (tyCoVarsOfTypes untouched_tys))
+        receiver <- mkSysLocalM (fsLit "record") ManyTy (mkTyConApp tc (mkTyVarTys in_tvs))
+        let witness_idx  = mkTyConApp witness_table (mkTyVarTys in_tvs ++ [TermVarTy receiver])
+            field_ty_env = mkNameEnv [ (flSelector pf, substTy out_subst (b witness_idx))
+                                     | (pf, b) <- zip payload_fields payload_types ]
+        replacements <- maybe (failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)) pure $
+          traverse (\(sel, L _ f) -> (\t -> (idName sel, t, hfbRHS f)) <$> lookupNameEnv field_ty_env (idName sel)) fields
+        ds_res_ty <- retainedRecordUpdResTy tc univ_tvs res_ty
+        finish_keep_witness (in_tvs ++ extra_out_tvs) receiver (mkTyConApp tc out_tys) ds_res_ty replacements
+
+      Nothing -> failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
+
+  | (first_sel, _) : _ <- fields
+  , DepFunTy DepFunVisible receiver _ <- coreFullView (idType first_sel)
+  , Just replacements <- traverse (mono_field receiver) fields
+  = finish_keep_witness [] receiver (idType receiver) (idType receiver) replacements
+
+  | otherwise
+  = failWithTc (TcRnRetainedQuantificationError RetainedRecordUpdate)
+  where
+    tc       = dataConTyCon con
+    con_name = dataConName con
+    (univ_tvs, _, _, _, orig_arg_tys, _) = dataConFullSig con
+
+    mono_field receiver (sel, L _ f)
+      | DepFunTy DepFunVisible b _ <- coreFullView (idType sel)
+      , idType b `tcEqType` idType receiver
+      = Just (idName sel, applyTypeToArgs (idType sel) [Core.Var receiver], hfbRHS f)
+      | otherwise = Nothing
+
+    finish_keep_witness qtvs receiver out_rec_ty ds_res_ty replacements = do
+      let (upd_fields, upd_tys, values) = unzip3 replacements
+      names <- mapM (newSysName . nameOccName) upd_fields
+      let updated = mkNameEnv (zip upd_fields names)
+          mk_fld fld = case lookupNameEnv updated (flSelector fld) of
+            Just nm -> pure (genWildPat, genLHsVar nm)
+            Nothing -> (\nm -> (genVarPat nm, genLHsVar nm)) <$> newSysName (nameOccName (flSelector fld))
+      (pats, args) <- mapAndUnzipM mk_fld (dataConFieldLabels con)
+      let sig = mkSpecForAllTys (map (unmatchableDataConTy,) qtvs) $
+                  mkDepFunTy receiver (mkVisFunTysManyU upd_tys out_rec_ty)
+      expanded <- genRetainedRecordUpd sig (genSimpleConPat con_name pats : map genVarPat names)
+                    (genHsApps con_name args) (record_expr : values)
+      pure (expanded, ds_res_ty, RecordUpdCtxt (RealDataCon con NE.:| []) upd_fields [])
+
+-- | Use a matching expected result type directly when available; otherwise allocate metavariables.
+retainedRecordUpdResTy :: TyCon -> [TyVar] -> ExpRhoType -> TcM TcType
+retainedRecordUpdResTy tc univ_tvs res_ty = do
+    mb_exp <- readExpType_maybe res_ty
+    case mb_exp >>= tcSplitTyConApp_maybe of
+      Just (exp_tc, exp_args) | exp_tc == tc, equalLength exp_args univ_tvs ->
+        pure (mkTyConApp tc exp_args)
+      _ -> do
+        (_, meta_out_tvs) <- newMetaTyVars univ_tvs
+        pure (mkTyConApp tc (mkTyVarTys meta_out_tvs))
+
+-- | Close a set of universal record type variables over their kinds.
+closeUnivKinds :: [TyVar] -> TyCoVarSet -> TyCoVarSet
+closeUnivKinds univ_tvs = go
+  where
+    go s =
+      let s' = s `unionVarSet` tyCoVarsOfTypes [tyVarKind tv | tv <- univ_tvs, tv `elemVarSet` s]
+      in if sizeVarSet s' == sizeVarSet s then s else go s'
+
+-- | Allocate input and output universal binders for a retained record update.
+-- Pinned type parameters share their input binder; unpinned parameters receive fresh output binders.
+-- See Note [Parameterized retained record updates].
+instantiateRetainedRecordUnivs :: [TyVar] -> TyCoVarSet -> TcM ([TyVar], [TyVar], Subst, [TcType])
+instantiateRetainedRecordUnivs univ_tvs pinned_tvs = do
+    (_, rev_in_tvs) <- foldM alloc_in (mkEmptySubst (mkInScopeSetList univ_tvs), []) univ_tvs
+    let in_tvs = reverse rev_in_tvs
+    (out_subst, out_tys, extra_out_tvs) <-
+      foldM alloc_out (mkEmptySubst (mkInScopeSetList (univ_tvs ++ in_tvs)), [], [])
+            (zip univ_tvs in_tvs)
+    pure (in_tvs, reverse extra_out_tvs, out_subst, reverse out_tys)
+  where
+    alloc_in (sub, acc) tv = do
+      nm <- newSysName (nameOccName (getName tv))
+      let tv' = mkTyVar nm (substTy sub (tyVarKind tv))
+      pure (extendTvSubst sub tv (mkTyVarTy tv'), tv' : acc)
+
+    alloc_out (sub, tys, extras) (orig_tv, in_tv)
+      | orig_tv `elemVarSet` pinned_tvs =
+          let ty = mkTyVarTy in_tv
+          in pure (extendTvSubst sub orig_tv ty, ty : tys, extras)
+      | otherwise = do
+          nm <- newSysName (nameOccName (getName orig_tv))
+          let out_tv = mkTyVar nm (substTy sub (tyVarKind orig_tv))
+              ty = mkTyVarTy out_tv
+          pure (extendTvSubst sub orig_tv ty, ty : tys, out_tv : extras)
+
+-- | Check a written witness projection before reusing an omitted payload.
+-- See Note [Replacing a retained record witness].
+checkRetainedRecordWitness :: TcType -> FieldLabel -> LHsExpr GhcRn -> LHsExpr GhcRn
+                           -> TcM (Maybe (LHsExpr GhcRn))
+checkRetainedRecordWitness domain field record_expr written
+  | HsVar{} <- unLoc (stripParensLHsExpr record_expr)
+  , HsApp _ selector _ <- unLoc (stripParensLHsExpr written)
+  , Just occurrence <- rec_sel_head selector
+  , let field_name = flSelector field
+  , unLoc (foLabel occurrence) == field_name
+  = tryTcDiscardingErrs (pure Nothing) $ runMaybeT $ do
+      let old = wrapGenSpan (genHsApps field_name [record_expr])
+      (old_core, _, _) <- liftMaybeT (tcRetainedArg domain old)
+      (new_core, _, _) <- liftMaybeT (tcRetainedArg domain written)
+      old_index <- MaybeT (pure (Core.retainedArgIndex old_core))
+      new_index <- MaybeT (pure (Core.retainedArgIndex new_core))
+      givens <- liftMaybeT getNativeGivens
+      let matches given
+            | Just (Nominal, left, right) <- getEqPredTys_maybe (varType given)
+            = (left `tcEqType` old_index && right `tcEqType` new_index) ||
+              (right `tcEqType` old_index && left `tcEqType` new_index)
+            | otherwise = False
+      guard (old_index `tcEqType` new_index || any matches givens)
+      pure written
+  | otherwise = pure Nothing
+  where
+    rec_sel_head e = case unLoc (stripParensLHsExpr e) of
+      XExpr (HsRecSelRn occ) -> Just occ
+      HsAppType _ inner _    -> rec_sel_head inner
+      _                      -> Nothing
+
+-- | Apply a generated updater with its checked retained signature.
+genRetainedRecordUpd :: TcType -> [LPat GhcRn] -> HsExpr GhcRn -> [LHsExpr GhcRn]
+                     -> TcM (HsExpr GhcRn)
+genRetainedRecordUpd signature pats rhs args = do
+    update <- newSysName (mkVarOcc "update_payload")
+    let update_id = mkLocalId update ManyTy signature
+        binding = genSimpleFunBind update pats (wrapGenSpan rhs)
+        binds = HsValBinds noAnn $ XValBindsLR $
+                  HsVBG [(NonRecursive, [binding])] [wrapGenSpan (XSig (IdSig update_id))]
+    pure (genHsLet (wrapGenSpan binds) (wrapGenSpan (genHsApps update args)))
+
+{- Note [Updating a retained record payload]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'expandRetainedRecordUpdate' expands payload-only updates at the receiver's
+stored witness via a local @foreach (r :: Rec) -> ...@ updater that keeps
+untouched fields lazy. See Note [Replacing a retained record witness].
+
+Note [Replacing a retained record witness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a record update writes the witness field, 'expandRetainedRecordUpdate'
+checks replacement payloads at @foreach (w :: W) -> ...@ in constructor field
+order. Omitted payloads may be reused lazily via their old projections only
+when 'checkRetainedRecordWitness' proves that the written witness equals the
+receiver's witness projection (directly or under a lexical nominal Given).
+
+Note [Parameterized retained record updates]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'instantiateRetainedRecordUnivs' pins universal parameters mentioned in omitted
+fields (closed over kind dependencies) to their input binders and allocates
+fresh output binders for unpinned parameters so updates can change element
+types across updated fields.
+-}
 
 
 
@@ -1806,3 +3361,115 @@ checkMissingFields con_like rbinds arg_tys
     field_strs = conLikeImplBangs con_like
 
     fl `elemField` flds = any (\ fl' -> flSelector fl == fl') flds
+
+-- | Instantiate a reflected 'TypeRep' selector call, supplying 'Typeable'
+-- evidence from any local @TypeRep@ witness variables referenced in @written@.
+-- See Note [Reflecting a checked type operand].
+instCallWithLocalTypeReps :: HsExpr GhcRn -> LHsWcType GhcRn -> TcType
+                          -> [TcType] -> TcThetaType -> TcM HsWrapper
+instCallWithLocalTypeReps expr written arg args theta = do
+  reps <- collect_reps emptyUniqSet emptyUniqSet (collect_names (hswc_body written))
+  arg_zonked <- liftZonkM (zonkTcType arg)
+  let rep_tv_set = mkVarSet [ tv | (_, _, t) <- reps, Just tv <- [getTyVar_maybe t] ]
+      free_tvs   = filter isTyVar (tyCoVarsOfTypeList arg_zonked)
+      needs_lazy_rep = has_non_typeable_form arg_zonked
+                       && all (`elemVarSet` rep_tv_set) free_tvs
+  if null reps && not needs_lazy_rep
+    then instCall (exprCtOrigin expr) args theta
+    else do
+      mapM_ (\(v_id, _, _) -> tcEmitBindingUsage (singleUsageUE v_id)) reps
+      typeableClass <- tcLookupKnownKeyClass typeableClassKey
+      selector <- tcLookupKnownOccId typeRepIdOcc
+      let cls_tc = classTyCon typeableClass
+          dc     = tyConSingleDataCon cls_tc
+      extra_given <- if needs_lazy_rep
+        then do
+          arg_kind <- liftZonkM (zonkTcType (typeKind arg_zonked))
+          let (_, rep_ty) = tcSplitPhiTy $
+                piResultTys (idType selector) [arg_kind, arg_zonked]
+              err_expr = mkCoreApps (Core.Var tYPE_ERROR_ID)
+                           [ Core.Type liftedRepTy
+                           , Core.Type rep_ty
+                           , Core.Lit (LitString (bytesFS (fsLit "TypeRep is not available for quantified or family type"))) ]
+          g <- newEvVar (mkTyConApp cls_tc [arg_kind, arg_zonked])
+          pure [(g, mkGivenEvBind g (EvExpr (mkCoreConApps dc [Core.Type arg_kind, Core.Type arg_zonked, err_expr])))]
+        else pure []
+      givens <- newEvVars [ mkTyConApp cls_tc [v_kind, v_ty]
+                          | (_, v_kind, v_ty) <- reps ]
+      let all_givens = map fst extra_given ++ givens
+      (ev_binds, wrap) <- checkConstraints (UnifyForAllSkol arg) [] all_givens $
+                            instCall (exprCtOrigin expr) args theta
+      let given_binds =
+            map snd extra_given ++
+            [ mkGivenEvBind g
+                (EvExpr (mkCoreConApps dc [Core.Type v_kind, Core.Type v_ty, Core.Var v_id]))
+            | (g, (v_id, v_kind, v_ty)) <- zip givens reps ]
+      ev_binds' <- case ev_binds of
+        TcEvBinds binds -> do
+          mapM_ (addTcEvBind binds) given_binds
+          addNeededEvIds binds (mkVarSet all_givens)
+          pure ev_binds
+        EvBinds binds ->
+          pure (EvBinds (listToBag given_binds `unionBags` binds))
+      pure (mkWpLet ev_binds' <.> wrap)
+  where
+    has_non_typeable_form :: Type -> Bool
+    has_non_typeable_form ty = case coreFullView ty of
+      DepFunTy{}  -> True
+      ExistsTy{}  -> True
+      ForAllTy{}  -> True
+      TermVarTy{} -> True
+      TermAppTy{} -> True
+      TyConApp tc tys -> isTypeFamilyTyCon tc || any has_non_typeable_form tys
+      AppTy f a   -> has_non_typeable_form f || has_non_typeable_form a
+      FunTy _ ma mult a r -> any has_non_typeable_form [ma, mult, a, r]
+      CastTy t _  -> has_non_typeable_form t
+      _           -> False
+    collect_names :: Data a => a -> [Name]
+    collect_names x
+      | Just (w :: WithUserRdr Name) <- cast x = [unwrapUserRdr w]
+      | Just (_ :: SrcSpanAnnA)      <- cast x = []
+      | Just (_ :: SrcSpanAnnN)      <- cast x = []
+      | Just (_ :: SrcSpan)          <- cast x = []
+      | Just (_ :: Type)             <- cast x = []
+      | Just (_ :: Name)             <- cast x = []
+      | otherwise = concat (gmapQ collect_names x)
+
+    collect_reps :: UniqSet Name -> UniqSet Id -> [Name] -> TcM [(Id, TcKind, TcType)]
+    collect_reps _ _ [] = pure []
+    collect_reps seen_nms seen_ids (nm : nms)
+      | nm `elementOfUniqSet` seen_nms = collect_reps seen_nms seen_ids nms
+      | otherwise = do
+          let seen_nms' = addOneToUniqSet seen_nms nm
+          mb_cand <- lookup_rep nm
+          case mb_cand of
+            Just (v_id, v_kind, v_ty)
+              | not (v_id `elementOfUniqSet` seen_ids) -> do
+                  rest <- collect_reps seen_nms' (addOneToUniqSet seen_ids v_id) nms
+                  pure ((v_id, v_kind, v_ty) : rest)
+            _ -> collect_reps seen_nms' seen_ids nms
+
+    lookup_rep :: Name -> TcM (Maybe (Id, TcKind, TcType))
+    lookup_rep nm = do
+      mb_lcl <- tcLookupLcl_maybe nm
+      case mb_lcl of
+        Just (ATcId { tct_id = v_id }) -> do
+          mb_rep <- tcTypeRepTarget_maybe (varType v_id)
+          pure $ fmap (\(k, t) -> (v_id, k, t)) mb_rep
+        Just (ATyVar _ tv) -> do
+          lcl_rdr <- getLocalRdrEnv
+          let term_rdr = mkRdrUnqual (setOccNameSpace varName (nameOccName nm))
+          case lookupLocalRdrEnv lcl_rdr term_rdr of
+            Just term_nm -> do
+              mb_term <- tcLookupLcl_maybe term_nm
+              case mb_term of
+                Just (ATcId { tct_id = v_id }) -> do
+                  mb_rep <- tcTypeRepTarget_maybe (varType v_id)
+                  case mb_rep of
+                    Just (k, t) -> do
+                      tv_ty <- liftZonkM (zonkTcType (mkTyVarTy tv))
+                      pure $ if tcEqType t tv_ty then Just (v_id, k, t) else Nothing
+                    Nothing -> pure Nothing
+                _ -> pure Nothing
+            Nothing -> pure Nothing
+        _ -> pure Nothing

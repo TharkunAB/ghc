@@ -44,13 +44,23 @@ import GHC.Tc.Types
 import GHC.Tc.Utils.Env
 
 import GHC.Core
+import GHC.Core.Utils ( exprType )
+import GHC.Core.DataCon ( dataConWorkId )
 import GHC.Core.Unfold
 import GHC.Core.FVs
+import GHC.Core.Rules (canShareRetainedSpecRule)
+import GHC.Core.Dependent
+    ( hasExistentialExpr, hasNativeDepFunType, hasNativeDependentExprRhs
+    , hasNativeDependentProgram, hasRetainedRuleHead, supportsLocalUserRule
+    , hasNativeDependentUnfolding, isRetainedVanillaDefaultMethod
+    , supportsNativeDepFunUnfolding, supportsNativeUserUnfolding )
+import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Tidy
 import GHC.Core.Seq         ( seqBinds )
 import GHC.Core.Opt.Arity   ( exprArity, typeArity, exprBotStrictness_maybe )
 import GHC.Core.InstEnv
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep ( Type(DepDictTy, DepFunTy, TyConApp) )
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Tidy
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
@@ -59,7 +69,7 @@ import GHC.Iface.Tidy.StaticPtrTable
 import GHC.Iface.Env
 
 import GHC.Utils.Outputable
-import GHC.Utils.Misc( filterOut )
+import GHC.Utils.Misc( filterOut, lengthIs )
 import GHC.Utils.Panic
 import GHC.Utils.Logger as Logger
 import qualified GHC.Utils.Error as Err
@@ -75,6 +85,7 @@ import GHC.Types.Demand  ( isDeadEndAppSig, isNopSig, nopSig, isDeadEndSig )
 import GHC.Types.Basic
 import GHC.Types.TyThing( implicitTyConThings )
 import GHC.Types.Name hiding (varName)
+import GHC.Types.Name.Env (lookupNameEnv, mkNameEnv)
 import GHC.Types.Name.Set
 import GHC.Types.Name.Cache
 import GHC.Types.Avail
@@ -221,7 +232,12 @@ mkBootModDetailsTc logger
                where
                  id_name = idName id
 
-    exp_names = availsToNameSet exports
+    exp_names = availsToNameSet exports `unionNameSet` method_targets
+    -- No-code compilation skips desugaring. Retain the private targets
+    -- needed to use the dictionary's mandatory interface evidence.
+    -- See Note [Checked dictionary methods] in GHC.Types.Id.
+    method_targets = mkNameSet [ target | dfun <- typeEnvIds type_env
+                                        , (_, target) <- sourceMethodAliases dfun ]
 
 lookupFinalId :: TypeEnv -> Id -> Id
 lookupFinalId type_env id
@@ -363,6 +379,25 @@ three places this is actioned:
   load a compulsory unfolding
 -}
 
+{- Note [Compulsory retained defaults]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An instance can inherit a vanilla method whose selector has a retained type.
+The type of the generated default Id must equal the selector type. Check
+the default Name in the declaring class's method table. The default Id type
+selects the retained pipeline before its template can be expanded.
+
+GHC must expand the default's template even when it ignores interface
+pragmas or uses restricted SimpleOpt. See Note [INLINE and default methods]
+in GHC.Tc.TyCl.Instance. Mark this template RetainedDefaultSrc. Tidy
+checks the local declaration. IfaceToCore checks the same class association,
+type and Core scope before a client uses the template.
+
+The marker requires a reader that can expand the default in restricted
+SimpleOpt. The interface writer selects that version only for interfaces
+that store the marker. Keep the existing checks for other compulsory
+unfoldings.
+-}
+
 data UnfoldingExposure
   = ExposeNone -- ^ Don't expose unfoldings
   | ExposeSome -- ^ Expose mandatory unfoldings and those meeting inlining thresholds.
@@ -384,6 +419,9 @@ data TidyOpts = TidyOpts
       -- ^ Are rules exposed or not?
   , opt_static_ptr_opts :: !(Maybe StaticPtrOpts)
       -- ^ Options for generated static pointers, if enabled (/= Nothing).
+  , opt_has_retained_core :: !Bool
+  , opt_has_scoped_dict_core :: !Bool
+  , opt_check_imported_rule :: CoreRule -> IO (Maybe (Id, Bool))
   , opt_keep_auto_rules :: !Bool
   }
 
@@ -407,10 +445,45 @@ tidyProgram opts (ModGuts { mg_module           = mod
                           , mg_hpc_info         = hpc_info
                           }) = do
 
-  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod tcs binds imp_rules
-  let (trimmed_binds, trimmed_rules) = findExternalRules opts binds imp_rules unfold_env
+  let marked = retainedUserReferences binds
+      mentions_marked = not . isEmptyVarSet . exprSomeFreeVars marked
+  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod tcs binds imp_rules mentions_marked
+  let (trimmed_binds, trimmed_rules) = findExternalRules opts mod binds imp_rules unfold_env mentions_marked
 
-  (tidy_env, tidy_binds) <- tidyTopBinds unfold_env boot_exports tidy_occ_env trimmed_binds
+  when (opt_has_retained_core opts) $ do
+    forM_ (bindersOfBinds trimmed_binds) $ \ bndr ->
+      case realIdUnfolding bndr of
+        CoreUnfolding { uf_src = src, uf_tmpl = rhs }
+          | RetainedDefaultSrc <- src
+          -> unless (nameModule_maybe (idName bndr) == Just mod &&
+                     isRetainedVanillaDefaultMethod (idName bndr) (idType bndr)) $
+               throwGhcExceptionIO $ PprProgramError
+                 "Invalid compulsory retained default method."
+                 (ppr bndr)
+          | isCompulsorySource src
+          , hasNativeDependentExprRhs (Type (idType bndr))
+            || hasNativeDependentUnfolding rhs || mentions_marked rhs
+          -> throwGhcExceptionIO $ PprProgramError
+               "Cannot export a compulsory unfolding that contains retained Core."
+               (ppr bndr)
+        _ -> pure ()
+    let heads = mkNameEnv [(idName b, b) | b <- bindersOfBinds trimmed_binds]
+    forM_ trimmed_rules $ \case
+      rule@(Rule { ru_fn = fn }) | not (isAutoRule rule) -> do
+        checked <- case lookupNameEnv heads fn of
+          Just fun -> pure (Just (fun, supportsLocalUserRule fun rule))
+          Nothing -> opt_check_imported_rule opts rule
+        let refers_to_marked = mentionsRetainedUserRule mentions_marked rule
+        when (refers_to_marked ||
+              ((maybe False (hasRetainedRuleHead . fst) checked || hasNativeDependentProgram [] [rule])
+               && not (maybe False snd checked))) $
+          throwGhcExceptionIO $ PprProgramError
+            "Cannot export a rewrite rule that contains retained Core."
+            (ppr rule)
+      _ -> pure ()
+
+  local_index_binds <- localiseNativeTopIndices (opt_name_cache opts) trimmed_binds
+  (tidy_env, tidy_binds) <- tidyTopBinds unfold_env boot_exports tidy_occ_env local_index_binds
 
   -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
   (spt_entries, mcstub, tidy_binds') <- case opt_static_ptr_opts opts of
@@ -505,6 +578,8 @@ collectCostCentres mod_name binds rules
       Lam _ e -> go cs e
       Let b e -> go (go_bind cs b) e
       Case scrt _ _ alts -> go_alts (go cs scrt) alts
+      Pack _ _ payload -> go cs payload
+      Unpack _ _ package body -> go (go cs package) body
       Cast e _ -> go cs e
       Tick (ProfNote cc _ _) e ->
         go (if ccFromThisModule cc mod_name then S.insert cc cs else cs) e
@@ -541,7 +616,8 @@ trimId :: Bool -> Id -> Id
 -- downstream compilations
 trimId do_trim id
   | do_trim, not (isImplicitId id)
-  = id `setIdInfo`      vanillaIdInfo
+  , not (hasNativeDepFunType (idType id) && isStableUserUnfolding (idUnfolding id))
+  = id `setIdInfo`      (vanillaIdInfo `setSourceProofRuleInfo` sourceProofRuleInfo (idInfo id))
        `setIdUnfolding` idUnfolding id
        -- We respect the final unfolding chosen by tidyTopIdInfo.
        -- We have already trimmed it if we don't want it for -O0;
@@ -614,10 +690,11 @@ chooseExternalIds :: TidyOpts
                   -> [TyCon]
                   -> [CoreBind]
                   -> [CoreRule]
+                  -> (CoreExpr -> Bool) -- Refers to a retained user unfolding
                   -> IO (UnfoldEnv, TidyOccEnv)
                   -- Step 1 from the notes above
 
-chooseExternalIds opts mod tcs binds imp_id_rules
+chooseExternalIds opts mod tcs binds imp_id_rules mentions_marked
   = do { (unfold_env1,occ_env1) <- search init_work_list emptyVarEnv init_occ_env
        ; let internal_ids = filter (not . (`elemVarEnv` unfold_env1)) binders
        ; tidy_internal internal_ids unfold_env1 occ_env1 }
@@ -647,6 +724,12 @@ chooseExternalIds opts mod tcs binds imp_id_rules
 
   binders          = map fst $ flattenBinds binds
   binder_set       = mkVarSet binders
+  rhs_env          = mkVarEnv (flattenBinds binds)
+  rec_binders      = mkVarSet [ b | Rec pairs <- binds
+                                  , is_rec_scc pairs
+                                  , (b, _) <- pairs ]
+  is_rec_scc [(b, r)] = b `elemVarSet` exprFreeVars r
+  is_rec_scc _        = True
 
   avoids   = [ getOccName name | bndr <- binders,
                                  let name = idName bndr,
@@ -687,7 +770,9 @@ chooseExternalIds opts mod tcs binds imp_id_rules
     | otherwise = do
       (occ_env', name') <- tidyTopName mod name_cache (Just referrer) occ_env idocc
       let
-          (new_ids, show_unfold) = addExternal opts refined_id
+          (new_ids, show_unfold) = addExternal opts mentions_marked
+                                     (refined_id `elemVarSet` rec_binders)
+                                     (lookupVarEnv rhs_env idocc) refined_id
 
                 -- 'idocc' is an *occurrence*, but we need to see the
                 -- unfolding in the *definition*; so look up in binder_set
@@ -709,8 +794,8 @@ chooseExternalIds opts mod tcs binds imp_id_rules
       let unfold_env' = extendVarEnv unfold_env id (name',False)
       tidy_internal ids unfold_env' occ_env'
 
-addExternal :: TidyOpts -> Id -> ([Id], Bool)
-addExternal opts id
+addExternal :: TidyOpts -> (CoreExpr -> Bool) -> Bool -> Maybe CoreExpr -> Id -> ([Id], Bool)
+addExternal opts mentions_marked is_rec mb_rhs id
   | ExposeNone <- opt_expose_unfoldings opts
   , not (isCompulsoryUnfolding unfolding)
   = ([], False)  -- See Note [Always expose compulsory unfoldings]
@@ -736,12 +821,28 @@ addExternal opts id
         -- We leave the unfolding there even if there is a worker
         -- In GHCi the unfolding is used by importers
 
-    show_unfolding (CoreUnfolding { uf_src = src, uf_guidance = guidance })
-       = stable || profitable || explicitly_requested
+    is_depfun_user src = hasNativeDepFunType (idType id) && isStableUserSource src
+
+    show_unfolding (CoreUnfolding { uf_src = src, uf_tmpl = rhs
+                                   , uf_guidance = guidance })
+       | opt_has_scoped_dict_core opts
+       -- See Note [Serializing native DepFunTy unfoldings].
+       = isCompulsorySource src
+         || (is_depfun_user src && not (is_rec || loop_breaker)
+             && supportsNativeDepFunUnfolding exposed_rhs)
+       | otherwise
+       = (stable || profitable || explicitly_requested)
+         && can_expose_body src exposed_rhs
+         -- See Note [Retained Core across module boundaries]
+         -- and Note [Serializing native DepFunTy unfoldings].
        where
+        -- Core Tidy regenerates non-stable templates from the binding RHS.
+        exposed_rhs | isStableSource src = rhs
+                    | otherwise = fromMaybe rhs mb_rhs
         -- Always expose things whose
         -- source is an inline rule
         stable = isStableSource src
+                 && (not (is_depfun_user src) || not (is_rec || loop_breaker))
         -- Good for perf as it might inline
         profitable
           | never_active = False
@@ -764,8 +865,135 @@ addExternal opts id
             ExposeSome -> False
             ExposeNone -> False
 
-    show_unfolding (DFunUnfolding {}) = True
+    show_unfolding (DFunUnfolding { df_bndrs = bs, df_con = con, df_args = args })
+       = not (opt_has_scoped_dict_core opts)
+         && (not (opt_has_retained_core opts)
+             || not (hasNativeDependentUnfolding body || mentions_marked body))
+       where
+         body = mkLams bs (mkApps (Var (dataConWorkId con)) args)
     show_unfolding _                  = False
+
+    can_expose_body src rhs
+      | not (opt_has_retained_core opts) = True
+      | RetainedUserSrc <- src
+      = not (hasExistentialExpr rhs) || supportsNativeUserUnfolding rhs
+      | is_depfun_user src
+      = not (is_rec || loop_breaker) && supportsNativeDepFunUnfolding rhs
+      | isStableUserSource src
+      , hasNativeDependentExprRhs (Type (idType id))
+      = not (is_rec || loop_breaker)
+        && (not (hasExistentialExpr rhs) || supportsNativeUserUnfolding rhs)
+      | otherwise
+      = not (hasExistentialExpr rhs) &&
+        (hasNativeDependentExprRhs (Type (idType id))
+         || not (hasNativeDependentUnfolding rhs || mentions_marked rhs))
+
+-- | Recognize marked imports and original top-level definitions.
+-- See Note [Retained user unfoldings across modules].
+retainedUserReferences :: CoreProgram -> Id -> Bool
+retainedUserReferences binds = marked
+  where
+    local_marked = mkVarSet (filter (isRetainedUserUnfolding . realIdUnfolding) (bindersOfBinds binds))
+    marked v = v `elemVarSet` local_marked
+               || (isGlobalId v && isRetainedUserUnfolding (realIdUnfolding v))
+
+mentionsRetainedUserRule :: (CoreExpr -> Bool) -> CoreRule -> Bool
+mentionsRetainedUserRule mentions Rule{ru_args = args, ru_rhs = rhs} =
+    any mentions (rhs : args)
+mentionsRetainedUserRule _ BuiltinRule{} = False
+
+{- Note [Retained user unfoldings across modules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An explicit INLINE can supply a retained template for an ordinary signature.
+The retained optimizer supports the template. Its source tag is available
+without loading the template. A reference to the imported Id selects the
+retained pipeline in batch compilation and GHCi.
+
+An unmarked ordinary template can introduce a call to a marked Id after
+pipeline selection. Keep that template private. Test imported Ids and the
+original local definitions. A local occurrence can lack the unfolding
+attached to its definition. Check the old bindings before Tidy ties the knot
+on the final IdInfo. Apply the same check to rules and dictionary unfoldings.
+A compulsory default has its own retained type and validation.
+
+An intermediate module can compile with -fignore-interface-pragmas. It
+can expose a template that refers to a marked Id without seeing the tag.
+The client can inline the intermediate template in the ordinary pipeline.
+Ordinary inlining, constructor queries, and the built-in `inline` rule
+must leave the marked call intact. Imported specialization can use a
+marked INLINABLE unfolding only in the retained pipeline. After a
+demand or cast worker/wrapper split, mark both unfoldings. The wrapper
+can introduce a call to the marked worker. A source SPECIALISE on a marked
+INLINABLE binding exports a rule to the ordinary compiled specialization.
+Do not inherit the marked wrapper template on that specialization. The
+usual Tidy checks still apply to its optional unfolding.
+
+GHC.Iface.Syntax records a version feature with the tag. The wire check
+prevents an older reader from using the template without its pipeline check.
+The same source tag reaches --make clients through ModDetails.
+-}
+
+{- Note [Serializing native DepFunTy unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A non-recursive top-level function whose signature binds a native DepFunTy
+or DepDictTy can export an INLINE or INLINABLE template across interfaces.
+The template must pass supportsNativeDepFunUnfolding. Supported forms are
+variables, constructors, DepFunTy lambdas and applications, cases with
+checked branch evidence, casts without TermAppCo, Pack, Unpack, and scoped
+dictionaries. Recursive bindings and strong loop breakers keep no exported
+template.
+
+In a module with scoped dictionary Core, Tidy withholds unmarked and
+ordinary unfoldings and exposes only compulsory templates and eligible
+native DepFunTy user templates. trimId retains the inline pragma and arity
+of those exposed bindings so that clients can inline or specialize them.
+localiseNativeTopIndices also rewrites stable unfolding templates so that
+references to top-level native indices stay local Ids after globalising
+top-level binders.
+
+When an exported native DepFunTy user template contains Pack, Unpack, or
+scoped dictionary syntax, GHC.Iface.Make writes depFunUnfoldingField and
+GHC.Iface.Binary records the compositional retained-depfun-unfolding
+capability in the interface header. Ordinary interfaces do not write the
+field, so their bytes do not change. On import, GHC.IfaceToCore keeps
+Pack and Unpack templates on native DepFunTy declarations when the
+interface carries this capability, checks supportsNativeDepFunUnfolding,
+and lints scoped dictionary templates with lintScopedDictionaryExpr.
+Clients that call an imported DepFunTy function select the retained
+optimizer from its signature and beta-reduce the template with lazy
+runtime index demand.
+-}
+
+{- Note [Retained Core across module boundaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An ordinary signature can have an unfolding that calls a retained function.
+An importing module can select the ordinary optimizer from its initial Core,
+then encounter retained Core when it inlines that unfolding. This also
+happens in --make, which imports the in-memory result of Core Tidy.
+
+Keep those unfolding bodies private. Keep ordinary unfoldings from the same
+module available. In a client, a reference to an Id with retained Core in
+its type already selects the retained optimizer. That Id can expose its
+checked template. The interface reader reconstructs constructor and index
+alias evidence from the case. See Note [Native index alias evidence in
+interfaces] in GHC.IfaceToCore. Interface loading also rejects retained
+dictionary operations. Do not expose their optional templates.
+Withhold optional erased package operations as well. See
+Note [Erased package unfoldings] in GHC.IfaceToCore.
+
+A specialization such as numericCall @Int can leave an exported worker and
+an automatic rule that redirects calls to it. Export a retained rule only
+when the reader can validate its specialization. See Note [Trimming auto-rules].
+
+A compulsory template cannot be removed. Check it after the simplifier,
+which can change the body that the desugarer checked. Exported RULES must
+also be safe to apply in ordinary importers. The retained driver checks
+the supported erased user rules before optimization. Keep an optional generated rule
+private if it can introduce native Core into an ordinary client or if it
+has no supported shape. See Note [Exported retained specialisations] in
+GHC.Core.Rules. Tidy applies the same restriction to disk and --make
+imports. Local optimization uses the original rules before Tidy.
+-}
 
 isOverloaded :: Id -> Bool
 isOverloaded fn =
@@ -878,6 +1106,10 @@ dffvExpr :: CoreExpr -> DFFV ()
 dffvExpr (Var v)              = insert v
 dffvExpr (App e1 e2)          = dffvExpr e1 >> dffvExpr e2
 dffvExpr (Lam v e)            = extendScope v (dffvExpr e)
+-- See Note [Private helpers in erased package rules].
+dffvExpr (Pack _ _ payload) = dffvExpr payload
+dffvExpr (Unpack witness payload scrut body) =
+  dffvExpr scrut >> extendScope witness (extendScope payload (dffvExpr body))
 dffvExpr (Tick (Breakpoint _ _ ids) e) = mapM_ insert ids >> dffvExpr e
 dffvExpr (Tick _other e)    = dffvExpr e
 dffvExpr (Cast e _)           = dffvExpr e
@@ -886,6 +1118,20 @@ dffvExpr (Let (Rec prs) e)    = extendScopeList (map fst prs) $
                                 (mapM_ dffvBind prs >> dffvExpr e)
 dffvExpr (Case e b _ as)      = dffvExpr e >> extendScope b (mapM_ dffvAlt as)
 dffvExpr _other               = return ()
+
+{- Note [Private helpers in erased package rules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An exported rule can open a package and call a private top-level function
+on its fields. A client that loads the rule also needs the function's
+external Name and declaration. Visit the payload of Pack and both
+expressions of Unpack, even if the rule owner's unfolding stays private.
+The two binders of Unpack scope only over its body.
+
+An older interface can contain a local occurrence of a private helper
+without its declaration. GHC.Iface.Recomp marks the producer's flag hash
+when its interface includes a lexical package rule. This rebuilds the
+provider once and lets an unchanged producer be reused on the next build.
+-}
 
 dffvAlt :: CoreAlt -> DFFV ()
 dffvAlt (Alt _ xs r) = extendScopeList xs (dffvExpr r)
@@ -1004,12 +1250,14 @@ We discard auto-rules by default, but keep them if -fkeep-auto-rules is on.
 -}
 
 findExternalRules :: TidyOpts
+                  -> Module
                   -> [CoreBind]
                   -> [CoreRule] -- Local rules for imported fns
                   -> UnfoldEnv  -- Ids that are exported, so we need their rules
+                  -> (CoreExpr -> Bool) -- Refers to a retained user unfolding
                   -> ([CoreBind], [CoreRule])
 -- See Note [Finding external rules]
-findExternalRules opts binds imp_id_rules unfold_env
+findExternalRules opts mod binds imp_id_rules unfold_env mentions_marked
   = (trimmed_binds, filter keep_rule all_rules)
   where
     imp_rules | opt_expose_rules opts = filter expose_rule imp_id_rules
@@ -1036,10 +1284,25 @@ findExternalRules opts binds imp_id_rules unfold_env
         --      been discarded; see Note [Trimming auto-rules]
 
     expose_rule rule = all is_external_id (ruleLhsFreeIdsList rule)
+                    && expose_auto_rule rule
                 -- Don't expose a rule whose LHS mentions a locally-defined
                 -- Id that is completely internal (i.e. not visible to an
                 -- importing module).  NB: ruleLhsFreeIds only returns LocalIds.
                 -- See Note [Which rules to expose]
+
+    expose_auto_rule rule
+      | opt_has_retained_core opts
+      , isAutoRule rule
+      , mentionsRetainedUserRule mentions_marked rule
+      = False
+      | opt_has_retained_core opts
+      , Rule { ru_origin = origin, ru_fn = fn } <- rule
+      , isAutoRule rule
+      , hasNativeDependentProgram [] [rule]
+      = origin == mod
+        && maybe False (`canShareRetainedSpecRule` rule) (lookupNameEnv heads fn)
+      | otherwise = True
+    heads = mkNameEnv [(idName id, id) | id <- bindersOfBinds binds]
 
     is_external_id id = case lookupVarEnv unfold_env id of
                           Just (name, _) -> isExternalName name && not (isImplicitId id)
@@ -1168,6 +1431,156 @@ tidyTopName mod name_cache maybe_ref occ_env id
 ************************************************************************
 -}
 
+-- | Keep native index occurrences local when Core Tidy globalises top binders.
+-- See Note [Local indices across Core Tidy].
+localiseNativeTopIndices :: NameCache -> CoreProgram -> IO CoreProgram
+localiseNativeTopIndices name_cache binds = mapM localise_bind binds
+  where
+    top_binders = mkVarSet (bindersOfBinds binds)
+    top_tables = filterVarSet (\v -> isNonCoVarId v && isJust (sourceTableId_maybe v)
+                                 && isNativeIndexFunctionId v) top_binders
+
+    localise_bind (NonRec bndr rhs)
+      = do { (bndr', rhs') <- localise_pair (bndr, rhs)
+           ; return (NonRec bndr' rhs') }
+    localise_bind (Rec pairs) = Rec <$> mapM localise_pair pairs
+
+    localise_pair (bndr, rhs)
+      = do { rhs' <- localise_expr bndr rhs
+           ; bndr' <- case realIdUnfolding bndr of
+               unf@(CoreUnfolding { uf_src = src, uf_tmpl = tmpl })
+                 | isStableSource src, hasNativeDependentExprRhs tmpl -> do
+                     tmpl' <- localise_expr bndr tmpl
+                     return (bndr `setIdUnfolding` (unf { uf_tmpl = tmpl' }))
+               _ -> return bndr
+           ; return (bndr', rhs') }
+
+    localise_expr bndr expr
+      | not (hasNativeDependentExprRhs expr) = return expr
+      | null indices = return expr
+      | otherwise
+      = assertPpr (not (anyFreeVarsOfType (`elemVarSet` index_set) (idType bndr)))
+                  (text "localiseNativeTopIndices: escaping top-level index" $$ ppr bndr) $
+        do { aliases <- mapM new_alias indices
+           ; let in_scope = mkInScopeSet (extendVarSetList (exprFreeVars protected_rhs) aliases)
+                 subst = CoreSubst.extendIdSubstList (CoreSubst.mkEmptySubst in_scope)
+                           (zip indices (map Var aliases))
+                 alias_binds = zipWith (\index alias -> NonRec alias (Var index))
+                                       indices aliases
+           ; return (mkLets alias_binds (CoreSubst.substExpr subst protected_rhs)) }
+      where
+        (operand_vars, protected_rhs) = protect_calls expr
+        index_vars = operand_vars `unionVarSet` exprAnnotationFreeVars expr
+        indices = filter (\v -> v `elemVarSet` top_binders
+                            && (isNativeIndexId v || isNativeIndexFunctionId v
+                                || (v `elemVarSet` index_vars
+                                    && (isNativeOpaqueValueId v || isNativeClassDictionaryId v))))
+                         (exprFreeVarsList protected_rhs)
+        index_set = mkVarSet indices
+
+    -- Core.Subst leaves the global reference intact. tidyVarOcc finds the
+    -- final top-level binder by Unique. See Note [Local indices across Core Tidy].
+    protect_calls :: CoreExpr -> (VarSet, CoreExpr)
+    protect_calls (App fun arg)
+      | DepDictTy{} <- coreFullView (exprType fun)
+      , Var dict <- arg
+      , isNativeClassDictionaryId dict
+      = App <$> protect_calls fun <*> (unitVarSet dict, arg)
+      | DepFunTy _ binder _ <- coreFullView (exprType fun)
+      , isNativeIndexFunctionId binder
+      , Just index@(TyConApp family _) <- nativeIndexFunctionArgIndex arg
+      , (Var callback, args) <- collectArgs arg
+      , Just owner <- lookupVarSet top_binders callback
+      , sourceTableId_maybe owner == Just family
+      = App <$> protect_calls fun
+            <*> (tyCoVarsOfType index, mkApps (Var (globaliseId owner)) args)
+      | DepFunTy{} <- coreFullView (exprType fun)
+      , Just index <- retainedArgIndex arg
+      = let arg' | not (isEmptyVarSet top_tables), Just{} <- nativeComputedIndex arg
+                 = protect_operand arg
+                 | otherwise = arg
+        in App <$> protect_calls fun <*> (tyCoVarsOfType index, arg')
+      | otherwise = App <$> protect_calls fun <*> protect_calls arg
+    protect_calls (Lam b body) = Lam b <$> protect_calls body
+    protect_calls (Let bind body) = Let <$> protect_bind bind <*> protect_calls body
+    protect_calls (Case scrut b ty alts) =
+      (\s as -> Case s b ty as) <$> protect_calls scrut <*> traverse protect_alt alts
+    protect_calls (Cast e co) = (\e' -> Cast e' co) <$> protect_calls e
+    protect_calls (Tick t e) = Tick t <$> protect_calls e
+    protect_calls (Pack ty w payload) = Pack ty w <$> protect_calls payload
+    protect_calls (Unpack w p pkg body) = Unpack w p <$> protect_calls pkg <*> protect_calls body
+    protect_calls e = pure e
+
+    protect_alt (Alt con bs rhs) = Alt con bs <$> protect_calls rhs
+
+    protect_operand expr
+      | (Var fun, args@(_ : _)) <- collectArgs expr
+      , Just owner <- lookupVarSet top_tables fun
+      , Just family <- sourceTableId_maybe fun
+      , args `lengthIs` tyConArity family
+      = mkApps (Var (globaliseId owner)) (map protect_operand args)
+    protect_operand (App fun arg) = App (protect_operand fun) (protect_operand arg)
+    protect_operand (Cast body co) = Cast (protect_operand body) co
+    protect_operand (Tick tick body) = Tick tick (protect_operand body)
+    protect_operand expr = expr
+
+    protect_bind (NonRec b r) = NonRec b <$> protect_calls r
+    protect_bind (Rec pairs) = Rec <$> traverse (traverse protect_calls) pairs
+
+    new_alias index
+      = do { uniq <- takeUniqFromNameCache name_cache
+           ; let name = mkInternalName uniq (getOccName index) (nameSrcSpan (idName index))
+           ; return (mkLocalId name (idMult index) (idType index)) }
+
+{- Note [Local indices across Core Tidy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Core Tidy turns top-level LocalIds into GlobalIds. A native argument such as
+S bottomLength can therefore pass the earlier checks but fail after Tidy:
+exprToNativeIndex requires each variable leaf to be a local unrestricted Id.
+This includes an opaque witness, such as an IO action in a dependent pair.
+Collect its identity from retained operands as well as type annotations.
+The private dictionary application also needs a local evidence ID. Preserve
+the solver's closed evidence under a lazy local alias.
+TermAppTy also requires a local unrestricted function head. Do not extend
+either grammar to arbitrary GlobalIds.
+
+Before tidyTopBinds, give each native RHS lazy local aliases for its free
+native top-level Ids. Use the deterministic exprFreeVarsList order. Substitute
+the whole RHS, including type and coercion occurrences, with Core.Subst.
+Wrap the aliases outside this substituted body. Their RHSs still refer to the
+original top-level Ids. Tidy then globalises those references and keeps each
+alias local. Local binder and type tidying already share the same environment.
+
+In a retained argument such as `atBit (flipBit b)`, the certified top-level
+function determines the result index. Exclude each such occurrence from
+alias substitution by globalising its exact top-level binder first. Traverse
+all nested calls and constructor fields, including beneath an imported head.
+Its value operands still receive the substitution. The same RHS can pass
+flipBit as a first-class function or use it in a strict case with TermAppTy
+evidence. Those occurrences
+and their types still receive the local alias. See Note [Source calls in
+retained arguments] in GHC.Core.
+
+A retained function argument can pass a checked source function before its
+value argument. Protect that occurrence when its index is the checked
+source family. Later arguments can mention that family in their types.
+A local alias would give the callback a different index from those types.
+
+The top binder and its type do not change. A selected index must not escape
+through that type. Source signature and inference checks already exclude
+that escape. The alias has the original witness type and Many multiplicity.
+The lazy binding does not evaluate the
+index or function head, and does not change the function arity.
+Ordinary RHSs take the existing path. This late step runs after simplification;
+no simplifier can inline an alias before Tidy globalises its RHS. CorePrep's
+native cpeBind guard then keeps aliases whose global RHS is outside the scalar
+index or local function-head grammar. Keep the native unfolding and interface
+restrictions in force.
+
+This is a Core Tidy scope adaptation, not a new dependent equality rule; see
+GHC Proposal #378 (§4.6).
+-}
+
 -- TopTidyEnv: when tidying we need to know
 --   * name_cache: The NameCache, containing a unique supply and any pre-ordained Names.
 --        These may have arisen because the
@@ -1270,7 +1683,7 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
                                                  -- in GHC.Core.Tidy
 
   | otherwise           -- Externally-visible Ids get the whole lot
-  = vanillaIdInfo
+  = vanillaIdInfo `setSourceProofRuleInfo` sourceProofRuleInfo idinfo
         `setArityInfo`       arity
         `setDmdSigInfo`      final_sig
         `setCprSigInfo`      final_cpr
@@ -1321,7 +1734,7 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
     !minimal_unfold_info = trimUnfolding unf_info
 
     !unfold_info | isCompulsoryUnfolding unf_info || show_unfold
-                 = tidyTopUnfolding rhs_tidy_env tidy_rhs unf_info
+                 = tidyTopUnfolding rhs_tidy_env orig_rhs tidy_rhs unf_info
                  | otherwise
                  = minimal_unfold_info
      -- NB: use `orig_rhs` not `tidy_rhs` in this call to mkFinalUnfolding
@@ -1343,23 +1756,25 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
             --            in GHC.Core.Opt.Arity
 
 ------------ Unfolding  --------------
-tidyTopUnfolding :: TidyEnv -> CoreExpr -> Unfolding -> Unfolding
-tidyTopUnfolding _ _ NoUnfolding   = NoUnfolding
-tidyTopUnfolding _ _ BootUnfolding = BootUnfolding
-tidyTopUnfolding _ _ (OtherCon {}) = evaldUnfolding
+tidyTopUnfolding :: TidyEnv -> CoreExpr -> CoreExpr -> Unfolding -> Unfolding
+tidyTopUnfolding _ _ _ NoUnfolding   = NoUnfolding
+tidyTopUnfolding _ _ _ BootUnfolding = BootUnfolding
+tidyTopUnfolding _ _ _ (OtherCon {}) = evaldUnfolding
 
-tidyTopUnfolding tidy_env _ df@(DFunUnfolding { df_bndrs = bndrs, df_args = args })
+tidyTopUnfolding tidy_env _ _ df@(DFunUnfolding { df_bndrs = bndrs, df_args = args })
   = df { df_bndrs = bndrs', df_args = map (tidyExpr tidy_env') args }
   where
     (tidy_env', bndrs') = tidyBndrs tidy_env bndrs
 
-tidyTopUnfolding tidy_env tidy_rhs
+tidyTopUnfolding tidy_env orig_rhs tidy_rhs
      unf@(CoreUnfolding { uf_tmpl = unf_rhs, uf_src = src  })
   = -- See Note [tidyTopUnfolding: avoiding black holes]
     unf { uf_tmpl = tidy_unf_rhs }
   where
     tidy_unf_rhs | isStableSource src
                  = tidyExpr tidy_env unf_rhs    -- Preserves OccInfo in unf_rhs
+                 | hasNativeDependentUnfolding orig_rhs
+                 = tidy_rhs  -- See Note [Native dependent unfolding templates] in GHC.Core.Unfold.Make.
                  | otherwise
                  = occurAnalyseExpr tidy_rhs    -- Do occ-anal
 

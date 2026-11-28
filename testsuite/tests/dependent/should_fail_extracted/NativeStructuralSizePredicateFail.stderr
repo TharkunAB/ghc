@@ -1,0 +1,14 @@
+NativeStructuralSizePredicateFail.hs:8:11: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: same Z (S n1) :~: True
+        Actual: same Z (S n1) :~: same Z (S n1)
+    • In the expression: Refl
+      In an equation for ‘wrong’: wrong _ = Refl
+
+NativeStructuralSizePredicateFail.hs:11:18: error: [GHC-83865]
+    • Couldn't match type ‘same n Z’ with ‘False’
+      Expected: same n Z :~: False
+        Actual: same n Z :~: same n Z
+    • In the expression: Refl
+      In an equation for ‘unknownFirst’: unknownFirst _ = Refl
+

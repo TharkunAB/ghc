@@ -1,0 +1,44 @@
+NativeComposedStrictExtReject.hs:10:47: error: [GHC-83865]
+    • Couldn't match expected type: foreach (x :: a) -> g (to x) :~: x
+                  with actual type: foreach (x :: a) -> g (h (f x)) :~: x
+    • In the fifth argument of ‘MkIso’, namely ‘left’
+      In the expression: MkIso @a @a to g left right
+      In an equation for ‘badStrict’:
+          badStrict f g h left right
+            = MkIso @a @a to g left right
+            where
+                to :: a -> a
+                to x = h (f x)
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedStrictExtReject.hs:13:5)
+        right :: foreach (y :: a) -> h (f (g y)) :~: y
+          (bound at NativeComposedStrictExtReject.hs:10:22)
+        left :: foreach (x :: a) -> g (h (f x)) :~: x
+          (bound at NativeComposedStrictExtReject.hs:10:17)
+        h :: a -> a (bound at NativeComposedStrictExtReject.hs:10:15)
+        g :: a -> a (bound at NativeComposedStrictExtReject.hs:10:13)
+        f :: a -> a (bound at NativeComposedStrictExtReject.hs:10:11)
+        (Some bindings suppressed; use -fmax-relevant-binds=N or -fno-max-relevant-binds)
+
+NativeComposedStrictExtReject.hs:10:52: error: [GHC-83865]
+    • Couldn't match expected type: foreach (y :: a) -> to (g y) :~: y
+                  with actual type: foreach (y :: a) -> h (f (g y)) :~: y
+    • In the sixth argument of ‘MkIso’, namely ‘right’
+      In the expression: MkIso @a @a to g left right
+      In an equation for ‘badStrict’:
+          badStrict f g h left right
+            = MkIso @a @a to g left right
+            where
+                to :: a -> a
+                to x = h (f x)
+    • Relevant bindings include
+        to :: a -> a (bound at NativeComposedStrictExtReject.hs:13:5)
+        right :: foreach (y :: a) -> h (f (g y)) :~: y
+          (bound at NativeComposedStrictExtReject.hs:10:22)
+        left :: foreach (x :: a) -> g (h (f x)) :~: x
+          (bound at NativeComposedStrictExtReject.hs:10:17)
+        h :: a -> a (bound at NativeComposedStrictExtReject.hs:10:15)
+        g :: a -> a (bound at NativeComposedStrictExtReject.hs:10:13)
+        f :: a -> a (bound at NativeComposedStrictExtReject.hs:10:11)
+        (Some bindings suppressed; use -fmax-relevant-binds=N or -fno-max-relevant-binds)
+

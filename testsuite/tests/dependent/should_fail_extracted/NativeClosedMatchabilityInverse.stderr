@@ -1,0 +1,21 @@
+NativeClosedMatchabilityInverse.hs:7:15: error: [GHC-25897]
+    • Could not deduce ‘a ~ b’
+      from the context: f a ~ f b
+        bound by the type signature for:
+                   badInverse :: forall (f :: * %U -> *) a b. (f a ~ f b) => a :~: b
+        at NativeClosedMatchabilityInverse.hs:7:15-78
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          badInverse :: forall (f :: * %U -> *) a b. (f a ~ f b) => a :~: b
+        at NativeClosedMatchabilityInverse.hs:7:15-78
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          badInverse :: forall (f :: * %U -> *) a b. (f a ~ f b) => a :~: b
+        at NativeClosedMatchabilityInverse.hs:7:15-78
+    • In the ambiguity check for ‘badInverse’
+      To defer the ambiguity check to use sites, enable AllowAmbiguousTypes
+      In the type signature:
+        badInverse :: forall (f :: FUN @U 'Many Type Type) a b. (f a
+                                                                 ~ f b) =>
+                                                                a :~: b
+

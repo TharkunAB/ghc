@@ -266,6 +266,14 @@ ghcInternalArgs = package ghcInternal ? do
                   ]
                _ -> mempty
 
+            -- Publish checked Char cases and pair projections with the in-tree
+            -- compiler. See the producer checks in GHC.Tc.Gen.SourceTable.
+          , notStage0 ? builder (Ghc CompileHs) ?
+            inputs [ "**/GHC/Internal/Unicode.hs"
+                   , "**/GHC/Internal/Unicode/Char/UnicodeData/Simple*CaseMapping.hs"
+                   , "**/GHC/Internal/Data/Tuple.hs"
+                   ] ? pure ["-XDependentTypes", "-XListTuplePuns"]
+
           , builder (Cabal Flags) ? staged (buildFlag NeedLibatomic) `cabalFlag` "need-atomic"
 
           ]

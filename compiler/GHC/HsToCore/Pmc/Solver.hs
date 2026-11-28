@@ -59,13 +59,15 @@ import GHC.Types.Unique.Supply
 import GHC.Tc.Utils.Monad   (getGblEnv)
 
 import GHC.Core
+import GHC.Core.Dependent   (hasNativeDependentExprRhs)
 import GHC.Core.FVs         (exprFreeVars)
 import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.Map.Expr
-import GHC.Core.Predicate (typeDeterminesValue, mkNomEqPred)
+import GHC.Core.Predicate (getEqPredTys_maybe, isEqClassPred, typeDeterminesValue, mkNomEqPred)
+import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.SimpleOpt (simpleOptExpr, exprIsConApp_maybe)
-import GHC.Core.Utils     (exprType)
-import GHC.Core.Make      (mkListExpr, mkCharExpr, mkImpossibleExpr)
+import GHC.Core.Utils     (exprType, dataConRepInstPat)
+import GHC.Core.Make      (mkCoreConApps, mkListExpr, mkCharExpr, mkImpossibleExpr)
 
 import GHC.Data.FastString
 import GHC.Types.SrcLoc
@@ -81,6 +83,8 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Subst (elemSubst)
 import GHC.Core.Type
 import GHC.Tc.Solver   (tcNormalise, tcCheckGivens, tcCheckWanteds)
+import GHC.Tc.Solver.InertSet (InertSet(inert_cans), InertCans(inert_irreds))
+import GHC.Tc.Types.Constraint (irredCtPred)
 import GHC.Core.Unify    (tcMatchTy)
 import GHC.Core.Coercion
 import GHC.Core.Reduction
@@ -334,6 +338,13 @@ pmTopNormaliseType :: TyState -> Type -> DsM TopNormaliseTypeResult
 -- NB: Normalisation can potentially change kinds, if the head of the type
 -- is a type family with a variable result kind. I (Richard E) can't think
 -- of a way to cause trouble here, though.
+pmTopNormaliseType _ typ
+  | DepFunTy{} <- coreFullView typ
+  = pure (NormalisedByConstraints typ)
+  | FunTy{} <- coreFullView typ
+  , hasNativeDependentExprRhs (Type typ)
+  -- See Note [Coverage checking retained functions].
+  = pure (NormalisedByConstraints typ)
 pmTopNormaliseType (TySt _ inert) typ = {-# SCC "pmTopNormaliseType" #-} do
   env <- dsGetFamInstEnvs
   tracePm "normalise" (ppr typ)
@@ -440,14 +451,39 @@ normaliseSourceTypeWHNF ty_st ty =
 
 -- | Is the source type in WHNF wrt. 'pmTopNormaliseType'?
 --
--- Returns False if the given type is not a TyCon application, or if the TyCon
--- app head is a type family TyCon. (But not for data family TyCons!)
+-- A retained function already has a function head. Otherwise, return False
+-- unless this is a TyCon application whose head is not a type family TyCon.
+-- Data family TyCons are in WHNF here.
 isSourceTypeInWHNF :: Type -> Bool
 isSourceTypeInWHNF ty
+  | DepFunTy{} <- coreFullView ty          = True
   | Just (tc, _) <- splitTyConApp_maybe ty = not (isTypeFamilyTyCon tc)
   | otherwise                              = False
 
-{- Note [Type normalisation]
+{- Note [Coverage checking retained functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+PMC needs the outer shape of a type to look for algebraic constructors. A
+DepFunTy already has a function head. An ordinary FunTy can also contain a
+retained function in its domain or result. Preserve these known function heads
+without asking tcNormalise to rewrite their components. Its rewriteType path
+requires dependent congruence when it encounters DepFunTy, which is not yet
+supported. Reporting that solver restriction from initTcDsForSolver panics.
+
+This is a WHNF rule, not normalization under a dependent binder. Agda also
+returns a Pi head in WHNF without reducing its domain or codomain; see Norell
+(2007) and Graf, Peyton Jones and Scott (ICFP 2020).
+
+Keep the usual conservative inhabitation path for a function type. In
+particular, failure to split an algebraic TyCon must not produce an empty
+constructor set. A function type can have a lambda value even when its result
+type has no constructors. A function expression can also be bottom. This type
+head test does not evaluate an expression or remove a strict wildcard match.
+The desugared Core case must retain its normal forcing behavior.
+
+No solver equality, Pi congruence, or mutable metavariable assignment is added
+by this rule. Types whose heads still require reduction use the existing path.
+
+Note [Type normalisation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Constructs like -XEmptyCase or a previous unsuccessful pattern match on a data
 constructor place a non-void constraint on the matched thing. This means that it
@@ -572,6 +608,8 @@ data PhiCt
   | PhiBotCt     !Id
   -- ^ @PhiBotCt x@ encodes "x ~ ⊥", equating @x@ to ⊥.
   -- by @K@.
+  | PhiUnpackCt !Id !Type !TyVar !Id
+  -- ^ Relates the payload of a package to prior openings of the same package.
   | PhiNotBotCt !Id
   -- ^ @PhiNotBotCt x y@ encodes "x ≁ ⊥", asserting that @x@ can't be ⊥.
 
@@ -587,6 +625,8 @@ instance Outputable PhiCt where
   ppr (PhiNotConCt x con)             = ppr x <+> text "≁" <+> ppr con
   ppr (PhiBotCt x)                    = ppr x <+> text "~ ⊥"
   ppr (PhiNotBotCt x)                 = ppr x <+> text "≁ ⊥"
+  ppr (PhiUnpackCt x _ witness payload)
+    = hsep [text "unpack", ppr x, text "as", ppr witness, ppr payload]
 
 type PhiCts = Bag PhiCt
 
@@ -637,8 +677,10 @@ tyOracle ty_st@(TySt n inert) cts
     do { evs <- traverse nameTyCt cts
        ; tracePm "tyOracle" (ppr n $$ ppr cts $$ ppr inert)
        ; mb_new_inert <- initTcDsForSolver $ tcCheckGivens inert evs
-         -- return the new inert set and increment the sequence number n
-       ; return (TySt (n+1) <$> mb_new_inert) }
+       ; return $ do
+           new_inert <- mb_new_inert
+           guard (retainedGivensCompatible new_inert)
+           pure (TySt (n+1) new_inert) }
 
 -- | Allocates a fresh 'EvVar' name for 'PredTy's
 nameTyCt :: PredType -> DsM EvVar
@@ -668,12 +710,29 @@ addPhiTmCt nabla (PhiConCt x con tvs dicts args) = do
   -- PhiConCt correspond to the higher-level φ constraints from the paper with
   -- bindings semantics. It disperses into lower-level δ constraints that the
   -- 'add*Ct' functions correspond to.
-  nabla' <- addTyCts nabla (listToBag dicts)
+  nabla' <- addTyCts nabla (listToBag (addSharedRetainedResultEqs con dicts))
   nabla'' <- addConCt nabla' x con tvs args
   foldlM addNotBotCt nabla'' (filterUnliftedFields con args)
 addPhiTmCt nabla (PhiNotConCt x con)       = addNotConCt nabla x con
 addPhiTmCt nabla (PhiBotCt x)              = addBotCt nabla x
 addPhiTmCt nabla (PhiNotBotCt x)           = addNotBotCt nabla x
+addPhiTmCt nabla (PhiUnpackCt x schema witness payload)
+  = addUnpackCt nabla x schema witness payload
+
+-- | Relate result arguments that use the same retained field.
+-- See Note [Coverage of retained constructor results].
+addSharedRetainedResultEqs :: PmAltCon -> [PredType] -> [PredType]
+addSharedRetainedResultEqs (PmAltConLike (RealDataCon con)) dicts@(_:_:_)
+  | dataConHasRetainedResult con
+  = snd (foldl' add_eq (emptyVarEnv, dicts) dicts)
+  where
+    add_eq (seen, equalities) pred_ty
+      | Just (Nominal, ty, TermVarTy field) <- getEqPredTys_maybe pred_ty
+      = case lookupVarEnv seen field of
+          Just other -> (seen, mkNomEqPred other ty : equalities)
+          Nothing -> (extendVarEnv seen field ty, equalities)
+      | otherwise = (seen, equalities)
+addSharedRetainedResultEqs _ dicts = dicts
 
 filterUnliftedFields :: PmAltCon -> [Id] -> [Id]
 filterUnliftedFields con args =
@@ -729,7 +788,7 @@ addNotConCt nabla x nalt = do
     -- otherwise return updated entry and `Just x'` if `x` should be marked dirty,
     -- where `x'` is the representative of `x`.
     go :: VarInfo -> MaybeT DsM (Maybe Id, VarInfo)
-    go vi@(VI x' pos neg _ rcm) = do
+    go vi@VI{ vi_id = x', vi_pos = pos, vi_neg = neg, vi_rcm = rcm } = do
       -- 1. Bail out quickly when nalt contradicts a solution
       let contradicts nalt sol = eqPmAltCon (paca_con sol) nalt == Equal
       guard (not (any (contradicts nalt) pos))
@@ -769,7 +828,10 @@ hasRequiredTheta _                 = False
 -- See Note [TmState invariants].
 addConCt :: Nabla -> Id -> PmAltCon -> [TyVar] -> [Id] -> MaybeT DsM Nabla
 addConCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts=env } } x alt tvs args = do
-  let vi@(VI _ pos neg bot _) = lookupVarInfo ts x
+  let vi@VI{ vi_pos = pos, vi_neg = neg, vi_bot = bot } = lookupVarInfo ts x
+  case alt of
+    PmAltConLike (RealDataCon con) -> guard (retainedIndexCanMatch nabla x con)
+    _ -> pure ()
   -- First try to refute with a negative fact
   guard (not (elemPmAltConSet alt neg))
   -- Then see if any of the other solutions (remember: each of them is an
@@ -798,6 +860,172 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts=env } } x alt tvs args =
             IsNotBot -> addNotBotCt (nabla_with MaybeBot) y
         _ -> assert (isPmAltConMatchStrict alt )
              pure (nabla_with IsNotBot) -- strict match ==> not ⊥
+
+-- | Test the constructor head against the nominal Givens for this witness.
+-- See Note [Coverage of retained constructor results].
+retainedIndexCanMatch :: Nabla -> Id -> DataCon -> Bool
+retainedIndexCanMatch MkNabla{nabla_ty_st = TySt _ inert} x con
+  | not (isEmptyBag (inert_irreds (inert_cans inert)))
+  , isNativeIndexId x
+  , Just _ <- nativeIndexDataConTyArgs (idType x) con
+  = case retainedGivenEquiv inert of
+      Nothing -> False
+      Just (find_rep, terms) ->
+        all compatible (lookupWithDefaultVarEnv terms [] (find_rep x))
+  | otherwise = True
+  where
+    compatible rhs
+      | Just (tc, _) <- splitTyConApp_maybe (coreFullView rhs)
+      , Just other <- isPromotedDataCon_maybe tc
+      , Just (domain, _) <- splitTyConApp_maybe (idType x)
+      , dataConTyCon other == domain
+      = con == other
+      | otherwise = True
+
+-- | Check that the Givens assign compatible constructor spines to equated
+-- retained Ids without strict constructor cycles.
+-- See Note [Coverage of retained constructor results] and
+-- Note [Refuting absurd foreach branches via GADT indices] in GHC.Tc.Gen.Match.
+retainedGivensCompatible :: InertSet -> Bool
+retainedGivensCompatible inert = isJust (retainedGivenEquiv inert)
+
+-- | Build the equivalence relation and promoted-constructor bindings implied
+-- by nominal irreducible Givens on retained runtime variables.
+retainedGivenEquiv :: InertSet -> Maybe (Id -> Id, VarEnv [Type])
+retainedGivenEquiv inert = do
+  (uf, terms, roots) <- go 64 emptyVarEnv emptyVarEnv [] eqs
+  guard (acyclic uf terms roots)
+  pure (findRep uf, terms)
+  where
+    irreds = inert_irreds (inert_cans inert)
+    eqs = [ (coreFullView lhs, coreFullView rhs)
+          | irred <- bagToList irreds
+          , Just (Nominal, lhs, rhs) <- [getEqPredTys_maybe (irredCtPred irred)] ]
+
+    findRep :: VarEnv Id -> Id -> Id
+    findRep uf v = case lookupVarEnv uf v of
+      Just p | p /= v -> findRep uf p
+      _               -> v
+
+    add_root :: Id -> [Id] -> [Id]
+    add_root r rs
+      | r `elem` rs = rs
+      | otherwise   = r : rs
+
+    go :: Int -> VarEnv Id -> VarEnv [Type] -> [Id] -> [(Type, Type)]
+       -> Maybe (VarEnv Id, VarEnv [Type], [Id])
+    go _    uf terms roots [] = Just (uf, terms, roots)
+    go 0    uf terms roots _  = Just (uf, terms, roots)
+    go fuel uf terms roots ((t1, t2) : rest) =
+      case (coreFullView t1, coreFullView t2) of
+        (TermVarTy v1, TermVarTy v2) ->
+          let r1 = findRep uf v1
+              r2 = findRep uf v2
+          in if r1 == r2
+             then go fuel uf terms roots rest
+             else
+               let ts1    = lookupWithDefaultVarEnv terms [] r1
+                   ts2    = lookupWithDefaultVarEnv terms [] r2
+                   uf'    = extendVarEnv uf r1 r2
+                   terms' = extendVarEnv (delVarEnv terms r1) r2 (ts1 ++ ts2)
+                   roots' = add_root r2 (add_root r1 roots)
+                   cross  = [(a, b) | a <- ts1, b <- ts2]
+               in go (fuel - 1) uf' terms' roots' (cross ++ rest)
+        (TermVarTy v, rhs) -> bind_term fuel uf terms roots (findRep uf v) rhs rest
+        (lhs, TermVarTy v) -> bind_term fuel uf terms roots (findRep uf v) lhs rest
+        (lhs, rhs)
+          | Just (dc1, all1, _) <- split_promoted_con lhs
+          , Just (dc2, all2, _) <- split_promoted_con rhs -> do
+              guard (dc1 == dc2)
+              let sub = if all1 `equalLength` all2 then zip all1 all2 else []
+              go (fuel - 1) uf terms roots (sub ++ rest)
+          | otherwise -> go fuel uf terms roots rest
+
+    bind_term :: Int -> VarEnv Id -> VarEnv [Type] -> [Id] -> Id -> Type -> [(Type, Type)]
+              -> Maybe (VarEnv Id, VarEnv [Type], [Id])
+    bind_term fuel uf terms roots rep rhs rest
+      | Nothing <- split_promoted_con rhs
+      = go fuel uf terms roots rest
+      | otherwise =
+          let prev   = lookupWithDefaultVarEnv terms [] rep
+              terms' = extendVarEnv terms rep (rhs : prev)
+              roots' = add_root rep roots
+              pairs  = [(rhs, p) | p <- prev]
+          in go (fuel - 1) uf terms' roots' (pairs ++ rest)
+
+    split_promoted_con :: Type -> Maybe (DataCon, [Type], [(Type, Bool)])
+    split_promoted_con ty
+      | Just (tc, args) <- splitTyConApp_maybe ty
+      , Just dc <- isPromotedDataCon_maybe tc
+      , not (isNewDataCon dc)
+      , lengthIs args (tyConArity tc)
+      , let arity = dataConSourceArity dc
+      , length args >= arity
+      , let val_args = drop (length args - arity) args
+            bangs    = map isBanged (dataConImplBangs dc)
+            strict_fields = zip val_args (bangs ++ repeat False)
+      = Just (dc, args, strict_fields)
+      | otherwise = Nothing
+
+    acyclic :: VarEnv Id -> VarEnv [Type] -> [Id] -> Bool
+    acyclic uf terms roots =
+      all (\r -> let r' = findRep uf r in not (reaches_strict uf terms emptyVarSet False r' r')) roots
+
+    reaches_strict :: VarEnv Id -> VarEnv [Type] -> VarSet -> Bool -> Id -> Id -> Bool
+    reaches_strict uf terms visited saw_strict target cur
+      | cur `elemVarSet` visited = False
+      | otherwise =
+          let visited' = extendVarSet visited cur
+              step_vars =
+                [ (findRep uf v, saw_strict || edge_strict)
+                | rhs <- lookupWithDefaultVarEnv terms [] cur
+                , Just (_, _, field_args) <- [split_promoted_con rhs]
+                , (arg, field_strict) <- field_args
+                , (v, sub_strict) <- term_vars_under uf field_strict arg
+                , let edge_strict = sub_strict ]
+          in any (\(next, strict_now) ->
+                    (next == target && strict_now) ||
+                    reaches_strict uf terms visited' strict_now target next)
+                 step_vars
+
+    term_vars_under :: VarEnv Id -> Bool -> Type -> [(Id, Bool)]
+    term_vars_under uf path_strict ty = case coreFullView ty of
+      TermVarTy v -> [(findRep uf v, path_strict)]
+      other
+        | Just (_, _, args) <- split_promoted_con other ->
+            concatMap (\(a, f_strict) -> term_vars_under uf (path_strict || f_strict) a) args
+        | otherwise -> []
+
+{- Note [Coverage of retained constructor results]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A match on DirectVec at index Z supplies Z ~# n, where n is the stored
+witness. The type oracle keeps this as an irreducible Given. When the
+term oracle tries S for that witness, the two constructor heads disagree.
+Check this in the term oracle and in the fast path for trivially inhabited
+constructors.
+
+Apply the check to a constructor alternative. The witness can still be
+bottom before the program matches it. The branch that tries S can force
+the witness, even if its right-hand side is inaccessible. Keep the
+ordinary divergence and demand checks.
+
+An outer DirectVec at index S k supplies S k ~# n. A nested VNil would
+also supply n ~# Z. Each Given can remain irreducible on its own. The
+type oracle compares their promoted heads by retained Id after solving
+the ordinary Givens. This refutes VNil. The nested match's divergence
+branch adds only the bottom fact for the vector, so it remains possible.
+The same check applies when the solver decomposes a promoted shape
+such as Cuboid to obtain the equalities for its fields.
+
+A Square constructor provides rows ~# side and columns ~# side. Add
+rows ~# columns to the type oracle when checking the constructor. This
+lets it detect incompatible public indices, even when the equalities
+that mention the stored side are irreducible. Compare the retained Ids
+so that a rectangle's two different fields do not relate its indices.
+Both a written pattern and a speculative constructor use this check.
+An empty case can still force the scrutinee. A length pattern can still
+force the stored side when the constructor is possible.
+-}
 
 equateTys :: [Type] -> [Type] -> [PhiCt]
 equateTys ts us =
@@ -828,7 +1056,27 @@ addVarCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts = env } } x y =
       nabla_pos <- foldlM add_pos nabla_equated (vi_pos vi_x)
       -- Do the same for negative info
       let add_neg nabla nalt = addNotConCt nabla y nalt
-      foldlM add_neg nabla_pos (pmAltConSetElems (vi_neg vi_x))
+      nabla_neg <- foldlM add_neg nabla_pos (pmAltConSetElems (vi_neg vi_x))
+      case vi_opening vi_x of
+        Nothing -> pure nabla_neg
+        Just (schema, witness, payload) -> addUnpackCt nabla_neg y schema witness payload
+
+-- | Relate openings in this refinement when their scrutinees are equal.
+-- Keep constructors on the payload's VarInfo, where their types apply.
+addUnpackCt :: Nabla -> Id -> Type -> TyVar -> Id -> MaybeT DsM Nabla
+addUnpackCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts = env } }
+            x schema witness payload = case vi_opening vi of
+  Nothing ->
+    let vi' = vi{ vi_opening = Just (schema, witness, payload) }
+    in pure nabla{ nabla_tm_st = ts{ ts_facts = addToUSDFM env x vi' } }
+  Just (schema', witness', payload')
+    | schema `eqType` schema' -> do
+        let eqs = [mkNomEqPred (mkTyVarTy witness) (mkTyVarTy witness') | witness /= witness']
+        nabla' <- addTyCts nabla (listToBag eqs)
+        addVarCt nabla' payload payload'
+    | otherwise -> pure nabla
+  where
+    vi = lookupVarInfo ts x
 
 -- | Inspects a 'PmCoreCt' @let x = e@ by recording constraints for @x@ based
 -- on the shape of the 'CoreExpr' @e@. Examples:
@@ -916,8 +1164,15 @@ addCoreCt nabla x e = do
     --   4. @x ~ K as ys@
     -- This is quite similar to PmCheck.pmConCts.
     data_con_app :: Id -> InScopeSet -> DataCon -> [CoreExpr] -> StateT Nabla (MaybeT DsM) ()
+    data_con_app x _ dc _
+      | dc `hasKey` heqDataConKey
+      -- HEq# has only erased fields. Its existential coercion does not
+      -- give a type variable for the pattern checker to equate.
+      = modifyT $ \nabla -> addNotBotCt nabla x
     data_con_app x in_scope dc args = do
-      let dc_ex_tvs              = dataConExTyCoVars dc
+      -- Use source existentials. The worker's kind proofs do not bind a
+      -- source type variable. The visible arguments follow all proofs.
+      let (_, dc_ex_tvs, _, _, _, _) = dataConFullSig dc
           arty                   = dataConSourceArity dc
           (ex_ty_args, val_args) = splitAtList dc_ex_tvs args
           ex_tys                 = map exprToType ex_ty_args
@@ -986,6 +1241,10 @@ makeDictsCoherent (App f a)
   = App (makeDictsCoherent f) (makeDictsCoherent a)
 makeDictsCoherent (Lam f body)
   = Lam f (makeDictsCoherent body)
+makeDictsCoherent (Pack schema witness payload)
+  = Pack schema witness (makeDictsCoherent payload)
+makeDictsCoherent (Unpack witness payload package body)
+  = Unpack witness payload (makeDictsCoherent package) (makeDictsCoherent body)
 makeDictsCoherent (Let bndr body)
   = Let
       (go_bndr bndr)
@@ -1062,6 +1321,11 @@ In the end, replacing dictionaries with an error value in the pattern-match
 checker was the most self-contained, although we might want to revisit once
 we implement a more robust approach to computing equality in the pattern-match
 checker (see #19272).
+
+An existential package can occur in a guard or in a local binding used by
+a guard. Normalize the dictionary expressions in its payload. An opening
+also has a source expression and a body. Keep the schema, witness, and
+binders so the CoreMap compares the body in the scope of that opening.
 
 Wrinkle (UD1): ticks
 --------------------
@@ -1354,6 +1618,11 @@ varNeedsTesting _         _                              vi
 varNeedsTesting old_ty_st MkNabla{nabla_ty_st=new_ty_st} _
   -- Same type state => still inhabited
   | not (tyStateRefined old_ty_st new_ty_st) = pure False
+varNeedsTesting _ _ vi
+  -- Runtime-index Givens live in inert_irreds rather than inert_eqs, so
+  -- re-test any variable whose type mentions a runtime Id when TyState refines.
+  | anyFreeVarsOfType (\v -> isId v && not (isCoVar v)) (idType (vi_id vi))
+  = pure True
 varNeedsTesting old_ty_st MkNabla{nabla_ty_st=new_ty_st} vi = do
   -- These normalisations are relatively expensive, but still better than having
   -- to perform a full inhabitation test
@@ -1463,6 +1732,7 @@ instCompleteSet fuel nabla x cs
       -- Recall that dc can't be in vi_neg, because then it would be
       -- deleted from the residual COMPLETE set.
       | isDataConTriviallyInhabited dc
+      , retainedIndexCanMatch nabla x dc
       = pure nabla
     go nabla (con:cons) = do
       let x = vi_id vi
@@ -1553,13 +1823,26 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
       let gammas = substTheta sigma_ex (eqSpecPreds eq_spec ++ thetas)
       -- (4) Instantiate fresh term variables as arguments to the constructor
       let field_tys' = substTys sigma_ex $ map scaledThing field_tys
-      arg_ids <- mapM mkPmId field_tys'
+      (ex_tvs_ct, provided, arg_ids) <- case con of
+        RealDataCon dc | not (null (dataConRepArgBinders dc)) -> do
+          -- See Note [Retained package fields in PMC].
+          uniqs <- getUniquesM
+          let inst_tys = map (substTyVar sigma_univ) (dataConUnivTyVars dc)
+              (ex_bndrs, fields) = dataConRepInstPat uniqs ManyTy dc inst_tys
+              subst_rep = zipTvSubst (dataConUnivTyVars dc ++ ex_tvs)
+                                     (inst_tys ++ mkTyVarTys ex_bndrs)
+              gammas_rep = substTheta subst_rep (eqSpecPreds eq_spec ++ thetas)
+          if dataConHasRetainedResult dc
+            then let (values, evidence) = splitAt (dataConSourceArity dc) fields
+                 in pure (ex_bndrs, map varType evidence, values)
+            else pure (ex_bndrs, gammas_rep, drop (length thetas) fields)
+        _ -> (ex_tvs, gammas,) <$> mapM mkPmId field_tys'
       tracePm (hdr "(cts)") $ vcat
         [ ppr x <+> dcolon <+> ppr match_ty
         , text "In WHNF:" <+> ppr (isSourceTypeInWHNF match_ty) <+> ppr norm_match_ty
         , ppr con <+> dcolon <+> text "... ->" <+> ppr _con_res_ty
         , ppr (map (\tv -> ppr tv <+> char '↦' <+> ppr (substTyVar sigma_univ tv)) _univ_tvs)
-        , ppr gammas
+        , ppr provided
         , ppr (map (\x -> ppr x <+> dcolon <+> ppr (idType x)) arg_ids)
         ]
       -- (5) Finally add the new constructor constraint
@@ -1567,7 +1850,7 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
         -- Case (2) of Note [Strict fields and variables of unlifted type]
         let alt = PmAltConLike con
         let branching_factor = length $ filterUnliftedFields alt arg_ids
-        let ct = PhiConCt x alt ex_tvs gammas arg_ids
+        let ct = PhiConCt x alt ex_tvs_ct provided arg_ids
         nabla1 <- traceWhenFailPm (hdr "(ct unsatisfiable) }") (ppr ct) $
                   addPhiTmCt nabla ct
         -- See Note [Fuel for the inhabitation test]
@@ -1580,7 +1863,7 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
           , text "In WHNF:" <+> ppr (isSourceTypeInWHNF match_ty) <+> ppr norm_match_ty
           , ppr con <+> dcolon <+> text "... ->" <+> ppr _con_res_ty
           , ppr (map (\tv -> ppr tv <+> char '↦' <+> ppr (substTyVar sigma_univ tv)) _univ_tvs)
-          , ppr gammas
+          , ppr provided
           , ppr (map (\x -> ppr x <+> dcolon <+> ppr (idType x)) arg_ids)
           , ppr branching_factor
           , ppr new_fuel
@@ -1592,6 +1875,23 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
     Nothing -> do
       tracePm (hdr "(match_ty not instance of res_ty) }") empty
       pure (Just nabla) -- Matching against match_ty failed. Inhabited!
+
+{- Note [Retained package fields in PMC]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A speculative package constructor needs fresh runtime field Ids too. A flat
+type substitution leaves the declaration's retained field templates free in
+later field types. Use dataConRepInstPat to freshen fields from left to right
+and substitute each retained Id into the remaining types. Drop the prefix
+of dictionaries after using their predicates in the type oracle.
+
+For a retained result, read the equality predicates from the trailing
+fresh binders. Their types mention the fresh witnesses. Pass the value
+fields as arguments to the term oracle.
+
+The observed source-pattern path instead uses its checked field Ids. See
+Note [Opening implicit packages in patterns] in GHC.Tc.Gen.Pat. Both paths keep
+ordinary coverage checking. They do not evaluate runtime indices or fields.
+-}
                         -- See Note [Instantiating a ConLike].
 
 -- | @matchConLikeResTy _ _ ty K@ tries to match @ty@ against the result
@@ -1931,9 +2231,31 @@ generateInhabitingPatterns :: GenerateInhabitingPatternsMode -> [Id] -> Int -> N
 -- See Note [Why inhabitationTest doesn't call generateInhabitingPatterns]
 generateInhabitingPatterns _    _      0 _     = pure []
 generateInhabitingPatterns _    []     _ nabla = pure [nabla]
-generateInhabitingPatterns mode (x:xs) n nabla = do
+generateInhabitingPatterns mode (x:xs) n nabla
+  -- See Note [Retained equalities in uncovered patterns].
+  | let pred_ty = idType x
+  , isEqClassPred pred_ty
+  , anyFreeVarsOfType (\v -> isId v && isNativeIndexId v) pred_ty
+  = do { let uses = [ (v, rhs)
+                    | v <- dVarSetElems (tyCoVarsOfTypeDSet pred_ty)
+                    , isId v, isNativeIndexId v
+                    , PACA (PmAltConLike (RealDataCon dc)) [] fields <- vi_pos (lookupVarInfo (nabla_tm_st nabla) v)
+                    , not (isNewDataCon dc)
+                    , Just args <- [nativeIndexDataConTyArgs (idType v) dc]
+                    , let rhs = mkCoreConApps dc (map Type args ++ map Var fields)
+                    , Just index <- [exprToNativeIndex rhs]
+                    , typeKind index `eqType` idType v ]
+             scope = mkInScopeSet (tyCoVarsOfType pred_ty `unionVarSet` unionVarSets (map (exprFreeVars . snd) uses))
+             subst = foldl' (\s (v, rhs) -> CoreSubst.extendIdSubst s v rhs) (mkEmptySubst scope) uses
+       ; result <- runMaybeT (addTyCts nabla (unitBag (substTy subst pred_ty)))
+       ; maybe (pure []) (generateForScrutinee mode x xs n) result }
+  | otherwise = generateForScrutinee mode x xs n nabla
+
+-- | Generate alternatives for one scrutinee in the current refinement.
+generateForScrutinee :: GenerateInhabitingPatternsMode -> Id -> [Id] -> Int -> Nabla -> DsM [Nabla]
+generateForScrutinee mode x xs n nabla = do
   tracePm "generateInhabitingPatterns" (ppr mode <+> ppr n <+> ppr (x:xs) $$ ppr nabla)
-  let VI _ pos neg _ _ = lookupVarInfo (nabla_tm_st nabla) x
+  let VI{ vi_pos = pos, vi_neg = neg } = lookupVarInfo (nabla_tm_st nabla) x
   case pos of
     _:_ -> do
       -- Example for multiple solutions (must involve a PatSyn):
@@ -2031,6 +2353,19 @@ generateInhabitingPatterns mode (x:xs) n nabla = do
         Just nabla' -> generateInhabitingPatterns mode xs n nabla'
       other_cons_nablas <- instantiate_cons x ty xs (n - length con_nablas) nabla cls
       pure (map (Just cl,) con_nablas ++ other_cons_nablas)
+
+{- Note [Retained equalities in uncovered patterns]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A candidate for zipWithExact may assign [] to xs and (:) to ys.
+Its final argument is evidence for sourceLength xs ~ sourceLength ys.
+Specialise this predicate with the constructor facts already chosen
+for its arguments. Ask the type oracle if the candidate is inhabited
+before counting it towards the limit on reported counterexamples.
+Use only real constructor applications at the retained variable's kind.
+A newtype pattern does not establish that the scrutinee is in WHNF.
+Leave a variable with no suitable constructor fact unchanged.
+See Note [Retained constructor matrices] in GHC.Tc.Gen.Match.
+-}
 
 -- | If multiple residual COMPLETE sets apply, pick one as follows:
 --

@@ -24,6 +24,8 @@ import Data.Typeable
 import GHC.Driver.DynFlags (DynFlags, PackageArg, gopt, ReexportedModule)
 import GHC.Driver.Flags (GeneralFlag (Opt_BuildingCabalPackage))
 import GHC.Types.Error
+import GHC.Types.Basic (RuleName)
+import GHC.Types.Name.Occurrence (OccName)
 import GHC.Unit.Module
 import GHC.Unit.Module.Graph
 import GHC.Unit.State
@@ -368,6 +370,12 @@ data DriverMessage where
   DriverCannotImportFromUntrustedPackage :: !UnitState -> !Module -> DriverMessage
 
   DriverRedirectedNoMain :: !ModuleName -> DriverMessage
+
+  -- | A dependent module defines a rewrite rule outside the retained schedule.
+  DriverUnsupportedRetainedRule :: !RuleName -> !Int -> DriverMessage
+
+  -- | A binding contains a native form outside the retained optimizer.
+  DriverUnsupportedRetainedBinding :: !(Maybe OccName) -> !Int -> DriverMessage
 
   DriverHomePackagesNotClosed :: ![(UnitId, UnitId)] -> DriverMessage
 

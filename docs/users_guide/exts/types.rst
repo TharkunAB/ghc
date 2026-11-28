@@ -24,6 +24,7 @@ Types
     type_applications
     type_abstractions
     required_type_arguments
+    dependent_types
     rank_polymorphism
     impredicative_types
     linear_types

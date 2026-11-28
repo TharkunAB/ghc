@@ -3,24 +3,43 @@
 {-# LANGUAGE RecursiveDo #-}
 
 module GHC.Tc.Solver.Irred(
-     solveIrred
+     solveIrred, isOpaqueTermIndex, findRetainedIndexProof
   ) where
 
 import GHC.Prelude
 
+import qualified GHC.Core as Core
+import GHC.Core.Coercion
+import GHC.Core.Dependent ( hasNativeDependentExpr )
+import GHC.Core.Map.Type ( emptyTypeMap, extendTypeMap, lookupTypeMap )
+import GHC.Core.Predicate
+import GHC.Core.TyCon ( TyCon, isGenerativeTyCon, isPromotedDataCon, tyConArity )
+import GHC.Core.Type
+import GHC.Core.TyCo.Compare ( tcEqType )
+import GHC.Core.TyCo.FVs ( mkUnivCoDeps, univCoDepsHoles )
+import GHC.Core.TyCo.Rep ( Type(..) )
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Solver.InertSet
 import GHC.Tc.Solver.Dict( matchLocalInst, chooseInstance )
 import GHC.Tc.Solver.Monad
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Utils.TcType ( isMetaTyVar )
 
 import GHC.Types.Basic( SwapFlag(..) )
+import GHC.Types.Unique ( getUnique, nonDetCmpUnique )
+import GHC.Types.Var ( Id )
+import GHC.Types.Var.Set ( elemVarSet, isEmptyVarSet )
 
+import GHC.Utils.Misc ( equalLength )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import GHC.Data.Bag
+import GHC.Data.TrieMap ( alterTM )
 
+import Control.Applicative ( (<|>) )
+import Control.Monad ( zipWithM )
+import Data.Maybe ( fromMaybe, isJust, listToMaybe, mapMaybe )
 import Data.Void( Void )
 
 
@@ -74,26 +93,283 @@ try_inert_irreds inerts irred_w@(IrredCt { ir_ev = ev_w, ir_reason = reason })
                             ; updInertCans (updIrreds (\_ -> others))
                             ; continueWith () } }
 
+  | CtGiven {} <- ev_w
+  , Just (v, rhs_w, co_w) <- orientGivenTermIndex ev_w
+  , Just (_rhs_i, co_i, keep_inert, remaining) <- findInertGivenTermIndex (inert_irreds inerts) v rhs_w
+  = do { let derived_co = mkSymCo co_i `mkTransCo` co_w
+       ; emitNewGivens (ctEvLoc ev_w) [(Nominal, derived_co)]
+       ; if keep_inert
+         then stopWith ev_w "Interacted Given runtime-index equality"
+         else do { updInertCans (updIrreds (\_ -> remaining))
+                 ; continueWith () } }
+
+  | CtWanted (WantedCt { ctev_dest = dest }) <- ev_w
+  , EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev_w)
+  , isOpaqueTermIndex lhs || isOpaqueTermIndex rhs
+  , Just co <- findRetainedIndexProof (inert_irreds inerts) lhs rhs
+  = do { let holes = foldr (flip addRewriter) emptyCoHoleSet
+                          (univCoDepsHoles (mkUnivCoDeps [co]))
+       ; setWantedEq dest (CPH co holes)
+       ; stopWith ev_w "Solved by transported index Given" }
+
+  -- See Note [Using a promoted head from a retained index Given].
+  | CtWanted (WantedCt { ctev_dest = dest }) <- ev_w
+  , EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev_w)
+  , Just (swap, index, tc, expected) <-
+      promoted_wanted NotSwapped lhs rhs <|> promoted_wanted IsSwapped rhs lhs
+  = do { binders <- getNativeBinderScope
+       ; case if not (index `elemVarSet` binders)
+              then findPromotedIndexGiven (inert_irreds inerts) index tc
+              else Nothing of
+           Just (known, known_co)
+             | not (known `tcEqType` expected) ->
+             do { (child, hole) <- newWantedEq (ctEvLoc ev_w) (ctEvRewriters ev_w)
+                                              Nominal known expected
+                ; emitChildEqs ev_w (unitBag (mkNonCanonical (CtWanted child)))
+                ; let co = maybeSymCo swap (known_co `mkTransCo` mkHoleCo hole)
+                ; setWantedEq dest (CPH co (unitCoHoleSet hole))
+                ; stopWith ev_w "Used promoted head from retained index Given" }
+           _ -> continueWith () }
+
   | otherwise
   = continueWith ()
 
   where
     ct_w = CIrredCan irred_w
+    promoted_wanted swap (TermVarTy index) ty@(TyConApp tc args)
+      | isNativeOpaqueValueId index
+      , isPromotedDataCon tc || isGenerativeTyCon tc Nominal
+      , length args == tyConArity tc
+      , not (anyFreeVarsOfType (== index) ty)
+      = Just (swap, index, tc, ty)
+    promoted_wanted _ _ _ = Nothing
+
+orientGivenTermIndex :: CtEvidence -> Maybe (Id, Type, Coercion)
+orientGivenTermIndex ev
+  | EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev)
+  , typeKind lhs `tcEqType` typeKind rhs
+  = let co = ctEvCoercion ev
+    in case (lhs, rhs) of
+         (TermVarTy v1, TermVarTy v2)
+           | isNativeOpaqueValueId v1, isNativeOpaqueValueId v2, v1 /= v2 ->
+               if nonDetCmpUnique (getUnique v1) (getUnique v2) == GT
+               then Just (v1, rhs, co)
+               else Just (v2, lhs, mkSymCo co)
+         (TermVarTy v, r)
+           | isNativeOpaqueValueId v, not (anyFreeVarsOfType (== v) r) ->
+               Just (v, r, co)
+         (l, TermVarTy v)
+           | isNativeOpaqueValueId v, not (anyFreeVarsOfType (== v) l) ->
+               Just (v, l, mkSymCo co)
+         _ -> Nothing
+  | otherwise = Nothing
+
+findInertGivenTermIndex :: InertIrreds -> Id -> Type -> Maybe (Type, Coercion, Bool, InertIrreds)
+findInertGivenTermIndex irreds target rhs_w = go [] (bagToList irreds)
+  where
+    prefer_rhs r
+      | Just (tc, _) <- splitTyConApp_maybe r = isPromotedDataCon tc
+      | otherwise = False
+    go _ [] = Nothing
+    go acc (irred : rest)
+      | ev_i@CtGiven {} <- irredCtEvidence irred
+      , Just (v, rhs_i, co_i) <- orientGivenTermIndex ev_i
+      , v == target
+      , not (rhs_i `tcEqType` rhs_w)
+      = let keep_inert = prefer_rhs rhs_i || not (prefer_rhs rhs_w)
+            others = listToBag (reverse acc ++ rest)
+        in Just (rhs_i, co_i, keep_inert, others)
+      | otherwise = go (irred : acc) rest
+
+-- | Find the nominal Given that fixes an argument of this promoted head.
+-- See Note [Using a promoted head from a retained index Given].
+findPromotedIndexGiven :: InertIrreds -> Id -> TyCon -> Maybe (Type, Coercion)
+findPromotedIndexGiven irreds index head_tc =
+    foldIrreds (\irred rest -> match irred <|> rest) irreds Nothing
+  where
+    match irred
+      | ev@CtGiven {} <- irredCtEvidence irred
+      , EqPred NomEq lhs rhs <- classifyPredType (ctEvPred ev)
+      = let co = ctEvCoercion ev
+        in orient lhs rhs co <|> orient rhs lhs (mkSymCo co)
+      | otherwise = Nothing
+
+    orient (TermVarTy witness) ty@(TyConApp tc args) co
+      | witness == index, tc == head_tc
+      , length args == tyConArity tc
+      , all (not . hasNativeDependentExpr . Core.Type) args
+      = Just (ty, co)
+    orient _ _ _ = Nothing
+
+{- Note [Using a promoted head from a retained index Given]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Matching a Volume at a known successor can put S layers ~# field in
+scope. Passing its stack to firstLayer asks for field ~# S alpha.
+Exact irred matching works if the call supplies @layers. For a fresh
+erased alpha, compose the nominal Given with a Wanted S layers ~# S
+alpha. Ordinary decomposition and unification check the predecessor.
+
+Look for the same retained Id and a saturated unary promoted head.
+The argument from the Given must contain no retained syntax. Keep the
+metavariable level checks in the ordinary solver. The child has promoted
+heads at both endpoints and cannot repeat this rule. The proof uses the
+in-scope Given and the child hole. A private runtime-binder comparison
+keeps its existing read-only scope.
+-}
+
+-- | Is this the type of an occurrence of a rigid runtime index?
+isOpaqueTermIndex :: Type -> Bool
+isOpaqueTermIndex (TermVarTy v) = isNativeOpaqueValueId v
+isOpaqueTermIndex _ = False
+
+-- | Recover a nominal index equality from scoped homogeneous Givens.
+-- See Note [Using casted index Givens].
+findRetainedIndexProof :: InertIrreds -> Type -> Type -> Maybe Coercion
+findRetainedIndexProof irreds lhs rhs = direct <|> chained
+  where
+    direct
+      | typeKind lhs `tcEqType` typeKind rhs = Nothing
+      | otherwise = listToMaybe
+          [ co
+          | (left, right, co) <- edges
+          , left `sameEndpoint` lhs
+          , right `sameEndpoint` rhs ]
+
+    chained
+      | isOpaqueTermIndex lhs = findPath (8 :: Int) lhs rhs
+      | otherwise = mkSymCo <$> findPath (8 :: Int) rhs lhs
+
+    findPath :: Int -> Type -> Type -> Maybe Coercion
+    findPath fuel start target = go emptyTypeMap [(start, [])]
+      where
+        go _ [] = Nothing
+        go seen ((current, path) : pending)
+          | Just tail_co <- finishEndpoint fuel current target
+          , co:rest <- path
+          = let path_co = foldl' (flip mkTransCo) co rest
+            in Just (if isReflCo tail_co then path_co else path_co `mkTransCo` tail_co)
+          | not (isOpaqueTermIndex current) || isJust (lookupTypeMap seen current)
+          = go seen pending
+          | otherwise
+          = go (extendTypeMap seen current ()) (foldr push pending next)
+          where
+            next = fromMaybe [] (lookupTypeMap graph current)
+            push (endpoint, co) todo = (endpoint, co:path) : todo
+
+    finishEndpoint :: Int -> Type -> Type -> Maybe Coercion
+    finishEndpoint _ cur tgt
+      | sameEndpoint cur tgt = Just (mkNomReflCo cur)
+    finishEndpoint fuel cur tgt
+      | fuel > 0
+      , typeKind cur `tcEqType` typeKind tgt
+      = case (splitTyConApp_maybe cur, splitTyConApp_maybe tgt) of
+          (Just (tc1, args1), Just (tc2, args2))
+            | tc1 == tc2
+            , isGenerativeTyCon tc1 Nominal
+            , equalLength args1 args2 ->
+                mkTyConAppCo Nominal tc1 <$> zipWithM (proveSub (fuel - 1)) args1 args2
+          _ -> case (splitAppTy_maybe cur, splitAppTy_maybe tgt) of
+            (Just (f1, a1), Just (f2, a2))
+              | typeKind a1 `tcEqType` typeKind a2 ->
+                  mkAppCo <$> proveSub (fuel - 1) f1 f2 <*> proveSub (fuel - 1) a1 a2
+            _ -> Nothing
+      | otherwise = Nothing
+
+    proveSub :: Int -> Type -> Type -> Maybe Coercion
+    proveSub fuel a b
+      | sameEndpoint a b = Just (mkNomReflCo a)
+      | fuel <= 0 = Nothing
+      | isOpaqueTermIndex a = findPath fuel a b
+      | isOpaqueTermIndex b = mkSymCo <$> findPath fuel b a
+      | otherwise = finishEndpoint fuel a b
+
+    graph = foldl' addArc emptyTypeMap edges
+
+    addArc arcs (from, to, co)
+      | isOpaqueTermIndex from = alterTM from (Just . ((to, co):) . fromMaybe []) arcs
+      | otherwise = arcs
+
+    sameEndpoint left right = left `tcEqType` right && typeKind left `tcEqType` typeKind right
+
+    edges = foldIrreds addEdges irreds []
+
+    addEdges irred rest
+      | ev@CtGiven {} <- irredCtEvidence irred
+      , EqPred NomEq left right <- classifyPredType (ctEvPred ev)
+      = givenEdges left right (ctEvCoercion ev) rest
+      | otherwise = rest
+
+    givenEdges left@(CastTy {}) right co rest =
+      uncastEdge left right co (uncastEdge right left (mkSymCo co) rest)
+    givenEdges left right@(CastTy {}) co rest =
+      uncastEdge right left (mkSymCo co) rest
+    givenEdges left right co rest
+      | isOpaqueTermIndex left || isOpaqueTermIndex right
+      , typeKind left `tcEqType` typeKind right
+      = bothDirections left right co rest
+      | otherwise = rest
+
+    uncastEdge (CastTy ty kind_co) other co rest =
+      bothDirections ty other (mkGReflRightCo Nominal ty kind_co `mkTransCo` co) rest
+    uncastEdge _ _ _ rest = rest
+
+    bothDirections left right co rest =
+      (left, right, co) : (right, left, mkSymCo co) : rest
+
+{- Note [Using casted index Givens]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An HRefl match on xs :~~: 'VNil binds a kind equality and a nominal
+Given ('VNil |> ck) ~# xs. Keeping the cast keeps both kinds equal.
+Reconstructing HRefl can still ask for the original heterogeneous
+index equality. First try the ordinary matching rule. If it fails,
+use the scoped Given with one endpoint cast and compare the endpoints
+before transport, including their kinds. Apply the kind coercion in
+the Wanted proof.
+
+A retained package can carry xs :~~: 'VNil and ys :~~: xs. Matching both
+proofs supplies two Givens. The Wanted ys :~~: 'VNil can use their
+composition. Undo a kind cast if the Given has one. Follow the available
+nominal proofs through opaque retained indices and compose the path to
+the Wanted endpoint. The Givens stay homogeneous in their original scopes.
+
+Canonical type-variable rewriting uses the terminating substitution in
+the inert equalities. An opaque retained index cannot be a substitution
+key. Here the direct lookup remains the fast path. If it fails, index
+the scoped nominal Givens by their retained endpoints. Use TypeMap for
+both adjacency and visited endpoints. The keys include the retained Id
+and its kind. A path can follow each endpoint at most once. Each visit
+adds its outgoing proofs to the work list once. A proof with a
+non-retained endpoint can finish the path. It cannot extend the search.
+Compose only the successful path. This creates no new constraints.
+
+See Note [Opaque runtime index equalities] in GHC.Tc.Solver.Equality.
+-}
 
 setIrredIfWanted :: CtEvidence -> SwapFlag -> CtEvidence -> TcS ()
 -- Irreds can be equalities or dictionaries
 setIrredIfWanted ev_dest swap ev_source
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev_dest
   = case dest of
-      HoleDest hole -> setWantedEq dest $
-                       CPH { cph_co    = maybeSymCo swap (ctEvCoercion ev_source)
-                           , cph_holes = unitCoHoleSet hole }
+      HoleDest {} -> setWantedEq dest $
+                     CPH { cph_co    = maybeSymCo swap (ctEvCoercion ev_source)
+                         , cph_holes = ctEvCoHoleSet ev_source }
+                     -- See Note [Holes in evidence for equal irreducibles].
 
       EvVarDest {} -> assertPpr (swap==NotSwapped) (ppr ev_dest $$ ppr ev_source) $
                          -- findMatchingIrreds only returns IsSwapped for equalities
                       setWantedDict dest EvCanonical (ctEvTerm ev_source)
   | otherwise
   = return ()
+
+{- Note [Holes in evidence for equal irreducibles]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a matching irreducible solves a Wanted equality, its coercion
+comes from the source constraint. A Given contributes no hole. A Wanted
+contributes its source hole, also when the coercion is symmetric.
+Recording the destination hole here makes zonkCoHoleSet follow that
+hole back to itself when another Wanted asks for its rewriters.
+See Note [Coercion holes] in GHC.Core.TyCo.Rep.
+-}
 
 {- Note [Multiple matching irreds]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -137,8 +413,8 @@ tryQCsIrredCt (IrredCt { ir_ev = ev })
   = Stage $ case ev of
       CtGiven {}
         -> continueWith ()
-      CtWanted wev@(WantedCt { ctev_loc = loc, ctev_pred = pred })
-        -> do { res <- matchLocalInst pred loc
+      CtWanted wev@(WantedCt { ctev_loc = loc })
+        -> do { res <- matchLocalInst (wantedCtPredType wev) loc
               ; case res of
                   OneInst {} -> do { chooseInstance wev res
                                    ; stopWith ev "Irred (solved wanted)" }

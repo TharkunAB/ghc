@@ -17,11 +17,11 @@ module GHC.Rename.Env (
         lookupOccRn, lookupOccRnGRE, lookupOccRn_maybe, lookupSameOccRn_maybe,
         lookupLocalOccRn_maybe, lookupInfoOccRn,
         lookupLocalOccThLvl_maybe, lookupLocalOccRn,
-        lookupTypeOccRn, lookupOccRnNone,
+        lookupTypeOccRn, lookupTypeAppHeadRn, lookupTypeCallOperandRn, lookupOccRnNone, lookupSourceTables,
         lookupGlobalOccRn_maybe,
         rnLookupKnownOccName,
 
-        lookupExprOccRn,
+        lookupExprOccRn, warnPunUse, warnGlobalPunUse,
         lookupRecFieldOcc,
         lookupRecUpdFields,
         getFieldUpdLbl,
@@ -67,6 +67,7 @@ import GHC.Hs
 import GHC.Types.Name.Reader
 import GHC.Tc.Errors.Types
 import GHC.Tc.Errors.Ppr (pprScopeError)
+import GHC.Tc.Gen.SourceTable (indexedProjectionSource, isFinalCoreIdentity, isFinalCoreReverseWrapper, sourceBinarySelector)
 import GHC.Tc.Utils.Env
 import GHC.Tc.Types.LclEnv
 import GHC.Tc.Utils.Monad
@@ -75,8 +76,9 @@ import GHC.Parser.PostProcess ( setRdrNameSpace )
 import GHC.Rename.Unbound
 import GHC.Rename.Utils
 
+import GHC.Builtin.KnownOccs ( composeIdOcc )
 import GHC.Builtin.WiredIn.Types
-import GHC.Builtin.Modules( rOOT_MAIN )
+import GHC.Builtin.Modules( gHC_INTERNAL_BASE, rOOT_MAIN )
 import GHC.Builtin( knownKeyOccMap )
 
 import GHC.Unit.Module
@@ -84,7 +86,10 @@ import GHC.Unit.Module.ModIface
 
 import GHC.Core.ConLike
 import GHC.Core.DataCon
+import GHC.Core.TyCo.Compare ( eqType )
+import GHC.Core.TyCo.Rep ( Type(..), FunTyFlag(FTF_T_T), DepFunTyFlag(DepFunVisible) )
 import GHC.Core.TyCon
+import GHC.Core.Type ( binderVars, coreFullView, getTyVar_maybe, isManyTy, mkTyVarTy, splitForAllInvisTyBinders, tcIsLiftedTypeKind, tyVarKind, varType )
 
 import GHC.Driver.Env
 import GHC.Driver.Session
@@ -94,6 +99,9 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.Set
 import GHC.Types.TyThing ( tyThingGREInfo )
+import GHC.Types.Id ( sourceTableId_maybe )
+import GHC.Types.Id.Info ( IdDetails(SourceTableId) )
+import GHC.Types.Var ( idDetails )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name
 import GHC.Types.Name.Set
@@ -103,9 +111,10 @@ import GHC.Types.Hint
 import GHC.Types.CompleteMatch
 import GHC.Types.PkgQual
 import GHC.Types.GREInfo
-import GHC.Types.Basic  ( TupleSort(..), tupleSortBoxity )
+import GHC.Types.Basic  ( SourceTableOrigin(FinalCoreSourceTable), TupleSort(..), tupleSortBoxity )
 
 import GHC.Utils.Outputable as Outputable
+import GHC.Utils.Lexeme (isLexVar, isLexVarSym)
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 
@@ -118,7 +127,7 @@ import GHC.Data.Bag
 import Control.Monad
 import Data.Either      ( partitionEithers )
 import Data.Function    ( on )
-import Data.List        ( find, partition, sortBy )
+import Data.List        ( find, isPrefixOf, partition, sortBy )
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Semigroup as Semi
 import System.IO.Unsafe ( unsafePerformIO )
@@ -522,7 +531,7 @@ lookupExactOrOrig_base rdr_name
 
        ; this_mod <- getModule
        ; mb_gre <- if nameIsLocalOrFrom this_mod nm
-                   then lookupLocalExactGRE nm
+                   then lookupLocalOrigGRE nm
                    else lookupImportedExactName nm
        ; return $ case mb_gre of
           Left  err -> ExactOrOrigError err
@@ -532,6 +541,24 @@ lookupExactOrOrig_base rdr_name
   where
     cvtEither (Left e)    = ExactOrOrigError e
     cvtEither (Right gre) = FoundExactOrOrig gre
+
+-- | Look up a local original name, including a synonym lifted from a field or signature.
+-- A reified field or signature can refer to a synonym from an earlier declaration
+-- group. The renamer removes its GRE to keep it out of source lookup and exports.
+lookupLocalOrigGRE :: Name -> RnM (Either NotInScopeError GlobalRdrElt)
+lookupLocalOrigGRE name = do
+  exact <- lookupLocalExactGRE name
+  case exact of
+    Left NoExactName{}
+      | any (`isPrefixOf` occNameString (nameOccName name))
+            [ "$signature-lambda:", "$signature-sum:", "$signature-case:"
+            , "$field-lambda:", "$field-sum:", "$field-case:" ] -> do
+        env <- getGblEnv
+        return $ case lookupNameEnv (tcg_type_env env) name of
+          Just thing@(ATyCon tc) | isTypeSynonymTyCon tc ->
+            Right (mkExactGRE name (tyThingGREInfo thing))
+          _ -> exact
+    _ -> return exact
 
 {- Note [Errors in lookup functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1119,7 +1146,10 @@ lookupOccRnConstr :: RdrName -> RnM Name
 lookupOccRnConstr rdr_name
   = do { mb_gre <- lookupOccRn_maybe rdr_name
        ; case mb_gre of
-           Just gre  -> return $ greName gre
+           Just gre  -> do
+             loc <- getSrcSpanM
+             warnGlobalPunUse (L (noAnnSrcSpan loc) rdr_name) gre
+             return (greName gre)
            Nothing   -> do
             { mb_ty_gre <- lookup_promoted rdr_name
             ; case mb_ty_gre of
@@ -1172,8 +1202,26 @@ lookupLocalOccRn rdr_name
 -- lookupTypeOccRn looks up an optionally promoted RdrName.
 -- Used for looking up type variables.
 lookupTypeOccRn :: RdrName -> RnM GlobalRdrElt
--- see Note [Demotion]
-lookupTypeOccRn rdr_name
+lookupTypeOccRn = lookupTypeOcc BareTypeOccurrence
+
+-- | Look up a name used as the head of a type application.
+-- The first flag says whether its operands have the syntax of open inputs;
+-- the second says whether the enclosing context permits unqualified local
+-- closed evaluation without a certified source table.
+lookupTypeAppHeadRn :: Bool -> Bool -> RdrName -> RnM GlobalRdrElt
+lookupTypeAppHeadRn open allow_local_closed =
+  lookupTypeOcc (TypeApplicationHead open allow_local_closed)
+
+-- | Look up a possible callback in an ordinary source call operand.
+lookupTypeCallOperandRn :: RdrName -> RnM GlobalRdrElt
+lookupTypeCallOperandRn = lookupTypeOcc TypeCallOperand
+
+-- | Restrict ordinary function lookup to source call heads and operands.
+data TypeOccurrence = BareTypeOccurrence | TypeApplicationHead Bool Bool | TypeCallOperand
+
+-- See Note [Demotion] and Note [Names of finite source functions].
+lookupTypeOcc :: TypeOccurrence -> RdrName -> RnM GlobalRdrElt
+lookupTypeOcc position rdr_name
   = do { mb_gre <- lookupOccRn_maybe rdr_name
        ; case mb_gre of
              Just gre -> return gre
@@ -1184,7 +1232,260 @@ lookupTypeOccRn rdr_name
                           mkExactGRE eqTyConName $
                           IAmTyCon $
                           eqTyConName <$ tyConFlavour eqTyCon }
+               | Just term_rdr <- source_term_rdr rdr_name
+                 -> do { experimental <- xoptM LangExt.DependentTypes
+                       ; if experimental then lookup_table term_rdr
+                                         else lookup_demoted rdr_name }
                | otherwise -> lookup_demoted rdr_name }
+  where
+    source_term_rdr rdr
+      | isUnqual rdr || isQual rdr
+      , let occ = rdrNameOcc rdr
+      , isTcOcc occ, isLexVarSym (occNameFS occ)
+      = Just (setRdrNameSpace rdr varName)
+      | otherwise = demoteRdrNameTv rdr
+
+    ordinaryPosition BareTypeOccurrence = Nothing
+    ordinaryPosition (TypeApplicationHead open allow_closed) = Just (open, allow_closed)
+    ordinaryPosition TypeCallOperand = Just (False, True)
+
+    lookup_table term_rdr = do
+      envs <- getRdrEnvs
+      let legacy_identity = case position of
+            TypeApplicationHead{} -> True
+            _ -> False
+      candidates0 <- lookupSourceTables legacy_identity envs term_rdr
+      candidates <- case position of
+        TypeApplicationHead False _ -> mapM preserveClosedReverse candidates0
+        _ -> pure candidates0
+      case candidates of
+        [(gre, Just table)] -> do
+          addUsedGRE AllDeprecationWarnings gre
+          return gre { gre_name = table, gre_par = NoParent
+                     , gre_info = IAmTyCon ClosedTypeFamilyFlavour }
+        [(gre, Nothing)]
+          -- See Note [Qualified callback values in source types].
+          | BareTypeOccurrence <- position
+          , isQual term_rdr
+          , isImportedGRE gre
+          , any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)
+          , isVarOcc (greOccName gre)
+          -> do { addUsedGRE AllDeprecationWarnings gre
+                ; return gre }
+        [(gre, Nothing)]
+          | Just (open_operands, allow_local_closed) <- ordinaryPosition position
+          , isVarOcc (greOccName gre)
+          -> do { gbl_env <- getGblEnv
+                ; let this_mod = tcg_semantic_mod gbl_env
+                ; level <- getThLevel
+                ; explicit_levels <- xoptM LangExt.ExplicitLevelImports
+                ; let demands = tcg_local_open_demands gbl_env
+                      name = greName gre
+                      from_prev_interactive =
+                        maybe (isInteractiveModule this_mod && name `elemNameEnv` tcg_type_env gbl_env)
+                              (\m -> isInteractiveModule m && m /= this_mod)
+                              (nameModule_maybe name)
+                ; imported <- if (isImportedGRE gre || from_prev_interactive)
+                                 && (from_prev_interactive || not (nameIsLocalOrFrom this_mod name))
+                              then imported_head open_operands gre
+                              else pure False
+                ; if imported
+                    then do { unless (from_prev_interactive || any ((== NotBoot) . is_isboot . is_decl) (gre_imp gre)) $
+                                if isQual term_rdr
+                                  then failWithTc (TcRnClosedTypeEval name
+                                    "A SOURCE import does not provide executable code.")
+                                  else failWithTc (TcRnClosedTypeEval name
+                                    "The selected SOURCE import does not provide a definition for type evaluation.")
+                            ; addUsedGRE AllDeprecationWarnings gre
+                            ; return gre }
+                    else case level of
+                      Comp | allow_local_closed || isQual term_rdr || open_operands
+                           , isLocalGRE gre, not explicit_levels
+                           , isVarOcc (greOccName gre)
+                           , nameModule_maybe name == Just this_mod ->
+                        case demands of
+                          Just ref -> do
+                            loc <- getSrcSpanM
+                            updTcRef ref ((name, loc) :)
+                            return gre
+                          Nothing -> do
+                            local_defs <- tcg_local_open_defs <$> getGblEnv
+                            if name `elemNameEnv` local_defs
+                              then return gre
+                              else failWithTc (TcRnNoSourceTable name)
+                      _ -> failWithTc (TcRnNoSourceTable name) }
+        (gre, _) : rest
+          | any (isJust . snd) candidates -> do
+              addNameClashErrRn term_rdr (gre NE.:| map fst rest)
+              return (mkUnboundGRE (rdrNameOcc rdr_name))
+        _ -> lookup_demoted rdr_name
+
+    -- A class operator gets its source table from the selected dictionary.
+    -- Leave the kind, dictionary and saturation checks to the type checker.
+    imported_head open_operands gre
+      | isVarOcc (greOccName gre) = pure True
+      | TypeApplicationHead{} <- position, open_operands = do
+          thing <- tcLookupGlobal (greName gre)
+          pure $ case thing of
+            AnId selector -> isJust (sourceBinarySelector selector)
+            _ -> False
+      | otherwise = pure False
+
+    -- Keep literal reversal on its existing staged path.
+    preserveClosedReverse candidate@(gre, Just _)
+      | isImportedGRE gre = do
+          thing <- tcLookupGlobal (greName gre)
+          pure $ case thing of
+            AnId v | isFinalCoreReverseWrapper v -> (gre, Nothing)
+            _ -> candidate
+    preserveClosedReverse candidate = pure candidate
+
+{- Note [Qualified callback values in source types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Stored Provider.mapper uses the existing grammar for a qualified type name.
+Keep ordinary type lookup and source-table lookup first. If neither finds a
+type, keep the imported term Name. The typechecker checks the Id and requires
+a closed unrestricted function type. A lexical variable with the same spelling
+continues to use the lexical environment for an unqualified occurrence.
+
+This path does not request an unfolding or execute the function. OPAQUE is an
+optimizer pragma and is not part of this lookup rule.
+-}
+
+-- | Find the in-scope term bindings and their finite source tables.
+-- The flag keeps the ordinary term for a final Core identity.
+-- See Note [Names of finite source functions].
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+lookupSourceTables :: Bool -> (GlobalRdrEnv, LocalRdrEnv) -> RdrName
+                      -> RnM [(GlobalRdrElt, Maybe Name)]
+lookupSourceTables legacy_identity (gbl, lcl) term_rdr
+  | isJust (lookupLocalRdrEnv lcl term_rdr) = return []
+  | otherwise = mapM candidate gres
+  where
+    normal_gres = lookupGRE gbl (LookupRdrName term_rdr (RelevantGREsFOS WantNormal))
+    gres
+      | null normal_gres = lookupGRE gbl (LookupRdrName term_rdr (RelevantGREsFOS WantBoth))
+      | otherwise        = normal_gres
+    candidate gre = (gre,) <$> table (greName gre)
+
+    table term
+      | let occ = nameOccName term
+      , isVarOcc occ || isFieldOcc occ
+      , Just mod <- nameModule_maybe term = do
+          env <- getGblEnv
+          let occ = mkSourceTableOcc (nameOccName term)
+          if mod == tcg_semantic_mod env
+            then do
+              name <- lookupOrig mod occ
+              let here = isJust (lookupGRE_Name gbl name) ||
+                         name `elemNameEnv` tcg_type_env env
+              return (if here then Just name else Nothing)
+            else if isInteractiveModule mod
+              then do
+                name <- lookupOrig mod occ
+                thing <- tcLookupGlobal term
+                pure $ case thing of
+                  AnId v | Just tc <- sourceTableId_maybe v, tyConName tc == name
+                         , not (legacy_identity && isFinalCoreIdentity v)
+                         , isNothing (indexedProjectionSource v)
+                         -> Just name
+                  _ -> Nothing
+            else do
+              iface <- loadInterfaceForName (text "finite source function") term
+              name <- lookupOrig mod occ
+              let present occurrence = isJust (mi_hash_fn iface occurrence)
+                  term_occ = nameOccName term
+                  uninterp_occ = mkTcOcc ("U:" ++ occNameString term_occ)
+              -- Keep the ordinary function available for executable calls.
+              -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+              if present occ && not (present (mkSourceFstOcc term_occ) || present (mkSourceSndOcc term_occ))
+                then do
+                  thing <- tcLookupGlobal term
+                  pure $ case thing of
+                    AnId v | legacy_identity && isFinalCoreIdentity v -> Nothing
+                           | isJust (indexedProjectionSource v) -> Nothing
+                           | present uninterp_occ
+                           , SourceTableId _ _ FinalCoreSourceTable <- idDetails v -> Nothing
+                    _ -> Just name
+                else if term_occ == composeIdOcc && tcg_semantic_mod env /= gHC_INTERNAL_BASE
+                  then do
+                    thing <- tcLookupGlobal term
+                    case thing of
+                      AnId v | is_dep_compose_type (varType v) -> do
+                        base_term <- lookupOrig gHC_INTERNAL_BASE composeIdOcc
+                        base_iface <- loadInterfaceForName (text "dependent composition") base_term
+                        let base_occ = mkSourceTableOcc composeIdOcc
+                        if isJust (mi_hash_fn base_iface base_occ)
+                          then Just <$> lookupOrig gHC_INTERNAL_BASE base_occ
+                          else return Nothing
+                      _ -> do
+                        updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) name })
+                        return Nothing
+                  else do
+                    updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) name })
+                    return Nothing
+      | otherwise = return Nothing
+
+    is_dep_compose_type sigma
+      | let (bndrs, tau) = splitForAllInvisTyBinders sigma
+            tvs = binderVars (map snd bndrs)
+      , length tvs `elem` [3, 4]
+      , FunTy FTF_T_T ma1 mult1 arg1 rest1 <- coreFullView tau
+      , ma1 `eqType` unmatchableDataConTy, isManyTy mult1
+      , DepFunTy DepFunVisible y_id (AppTy c_head1 (TermVarTy y_occ)) <- coreFullView arg1
+      , y_occ == y_id
+      , Just b_tv <- getTyVar_maybe (varType y_id), b_tv `elem` tvs
+      , tcIsLiftedTypeKind (tyVarKind b_tv)
+      , Just c_tv <- getTyVar_maybe c_head1, c_tv `elem` tvs
+      , DepFunTy DepFunVisible f_id rest2 <- coreFullView rest1
+      , FunTy FTF_T_T ma_f mult_f a_ty b_ty' <- coreFullView (varType f_id)
+      , ma_f `eqType` unmatchableDataConTy, isManyTy mult_f
+      , b_ty' `eqType` mkTyVarTy b_tv
+      , Just a_tv <- getTyVar_maybe a_ty, a_tv `elem` tvs
+      , tcIsLiftedTypeKind (tyVarKind a_tv)
+      , a_tv /= b_tv, a_tv /= c_tv, b_tv /= c_tv
+      , DepFunTy DepFunVisible x_id (AppTy c_head2 (TermAppTy f_occ (TermVarTy x_occ))) <- coreFullView rest2
+      , varType x_id `eqType` a_ty
+      , getTyVar_maybe c_head2 == Just c_tv
+      , f_occ == f_id, x_occ == x_id
+      = True
+      | otherwise
+      = False
+
+{- Note [Names of finite source functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under DependentTypes a type can mention a function such as
+flipBit. First look for a type variable with that spelling. Then resolve the
+term with the written qualifier and import list. The defining module supplies
+the name of its closed family, even when an intermediate module re-exports
+the term. A lexical term binder shadows an imported function.
+
+The parser puts an unquoted symbolic operator such as + in the type
+constructor namespace (see qtyconsym in Parser.y). If the type lookup
+fails, retry variable symbols in the term namespace. Preserve qualified
+names. A constructor symbol such as :+ still follows the DataKinds path.
+A quote or an exact name already specifies the namespace.
+
+Record import use and deprecation warnings on the term the user wrote.
+Return the family Name to the type renamer so that the module's usages
+include the fingerprint of the equations. This also lets the type checker
+order declarations that use the local family. If the imported family is
+absent, record that fact too. See Note [Source table usage fingerprints] in
+GHC.Unit.Module.ModIface.
+
+If the table is absent, keep an imported function's term Name at an
+application head. With an implicit outer quantifier, an unqualified name
+can already have a type binder. The ordinary type lookup still wins.
+See Note [Closed source calls] in GHC.Tc.Gen.HsType and Note [Open source
+calls] in GHC.Tc.Gen.OpenTypeEval.
+
+For a local unqualified head, request a checked Core body only when all
+the operands have open-input syntax. A closed use such as loop '[ 'True]
+can request a structural source equation. If its recursive clause is
+invalid, report the missing equation at that use. A qualified local
+head can also request the staging diagnostic for a closed literal call.
+See Note [Scheduling local open definitions] in GHC.Tc.Module.
+-}
 
 {- Note [eqTyCon (~) compatibility fallback]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1465,6 +1766,117 @@ lookupExprOccRn rdr_name
                         -- type constructor or type variable, if
                         -- we failed to look up the name at the term level.
            p         -> return p }
+
+-- | Warn about a written occurrence that relies on separate namespaces.
+warnPunUse :: LocatedN RdrName -> GlobalRdrElt -> RnM ()
+warnPunUse loc_rdr@(L loc rdr) selected
+  | isUnqual rdr
+  , isTyVarName name || isValName name
+  = whenWOptM Opt_WarnPunUses $ do
+      (global_env, local_env) <- getRdrEnvs
+      let other_ns = setRdrNameSpace rdr (if isTyVarName name then varName else tvName)
+          rank = localPunScope local_env name
+          implicit = rank == Just 0
+          competing
+            | Just other <- lookupLocalRdrEnv local_env other_ns = do
+                guard (other /= name && (implicit || closer (localPunScope local_env other)))
+                Just (mkLocalVanillaGRE NoParent other NE.:| [])
+            | isTyVarName name =
+                NE.nonEmpty (filter relevant_other (lookupGRE global_env global_other_ns))
+            | otherwise = Nothing
+          global_other_ns = LookupRdrName other_ns (RelevantGREsFOS WantNormal)
+          relevant_other other = implicit || closer (localPunScope local_env (greName other))
+          closer (Just other_rank) =
+            other_rank > 0 && maybe (isExternalName name) (<= other_rank) rank
+          closer Nothing = False
+      case competing of
+        Just others -> addDiagnosticAt (locA loc) (TcRnPunUse rdr selected others)
+        Nothing -> warnGlobalPunUse loc_rdr selected
+  | otherwise = warnGlobalPunUse loc_rdr selected
+  where
+    name = greName selected
+
+-- | Warn about a global occurrence that relies on separate namespaces.
+-- See Note [Global pun use warnings].
+warnGlobalPunUse :: LocatedN RdrName -> GlobalRdrElt -> RnM ()
+warnGlobalPunUse (L loc rdr) selected
+  | isUnqual rdr || isQual rdr
+  , let name = greName selected
+  , isTyConName name || isValName name
+  = whenWOptM Opt_WarnPunUses $ do
+      (global_env, local_env) <- getRdrEnvs
+      let globals r = lookupGRE global_env (LookupRdrName r (RelevantGREsFOS WantNormal))
+      case globals same_ns of
+        [chosen]
+          | greName chosen == name
+          , isNothing (lookupLocalRdrEnv local_env local_other_ns)
+          , other : rest <- filter (visible_with local_env chosen) (globals other_ns)
+          -> addDiagnosticAt (locA loc) (TcRnPunUse rdr chosen (other NE.:| rest))
+        _ -> pure ()
+  | otherwise = pure ()
+  where
+    term_ns = setRdrNameSpace rdr $
+      if isLexVar (occNameFS (rdrNameOcc rdr)) then varName else dataName
+    type_ns = setRdrNameSpace rdr tcClsName
+    selected_term = isValName (greName selected)
+    (same_ns, other_ns)
+      | selected_term = (term_ns, type_ns)
+      | otherwise = (type_ns, term_ns)
+    local_other_ns
+      | selected_term = setRdrNameSpace rdr tvName
+      | otherwise = term_ns
+    visible_with env chosen other
+      | isQual rdr = True
+      | otherwise =
+          case compare (scope chosen) (scope other) of
+            LT -> True
+            GT -> False
+            EQ -> not (isLocalGRE chosen) || isLocalGRE other
+      where
+        scope = localPunScope env . greName
+
+{- Note [Global pun use warnings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #765 checks the name that the renamer resolves at each occurrence.
+If a use relies on selecting one of two namespaces, report the real
+selection and the names that conflict with it. Use lookupGRE on the
+original qualifier. The additional lookup does not mark an import as
+used, emit deprecations, or make another name available to the renamer.
+
+For unqualified names a definition in this module takes precedence over
+imports. A selection in the imported scope still needs a warning if a
+local top-level definition in the other namespace would shadow it.
+Qualified paths use the qualifier to select their candidates.
+
+Top-level names in a declaration quote have InternalNames in the
+global reader environment. Check exact membership of the selected name
+in that environment. Declarations in an inner quote can shadow declarations
+in an enclosing scope, so rank them as one group when extending the global
+environment. See Note [Top-level Names in Template Haskell decl quotes]
+in GHC.Rename.Names.
+
+Proposal #682 section 3.4 keeps all import levels in name resolution.
+An import at a different level can still make a name ambiguous. Check
+the hypothetical unified namespace before any staging check. Leave
+the actual selected name and staging diagnostic unchanged.
+
+Explicit local names are ranked in the order they enter the reader
+environment. A local explicit binder can replace a global binding.
+For a written occurrence of an explicit local binder, check whether
+the other namespace has a name in the same group or in a closer group.
+Check the current reader environment. A binder removed from that
+environment can no longer compete. A retained binder's alias resolves
+to the same name.
+
+Pattern renaming brings names into scope from left to right. In
+`\(a :: a) -> a` the annotation is read before the term variable enters
+scope. After the patterns, the RHS sees their explicit binders as one
+group. The implicit-quantification check reports the occurrences in
+the introducing signature. After renaming a pattern signature, record
+its fresh implicit type variables for later uses. They cannot shadow
+competing term binders. Recording them after the signature prevents
+duplicate warnings on the introducing occurrences.
+-}
 
 lookupGlobalOccRn_maybe :: WhichGREs GREInfo -> RdrName -> RnM (Maybe GlobalRdrElt)
 -- Looks up a RdrName occurrence in the top-level

@@ -30,14 +30,17 @@ module GHC.Core.Type (
 
         mkFunTy, mkVisFunTy,
         mkVisFunTyMany, mkVisFunTysMany,
+        mkVisFunTyManyM, mkVisFunTyManyU, mkVisFunTysManyM, mkVisFunTysManyU,
         mkScaledFunTys,
+        mkScaledFunTysM, mkScaledFunTysU,
         mkInvisFunTy, mkInvisFunTys,
         tcMkVisFunTy, tcMkScaledFunTys, tcMkInvisFunTy,
+        tcMkScaledFunTysM, tcMkScaledFunTysU,
         splitFunTy, splitFunTy_maybe, splitVisibleFunTy_maybe,
         splitFunTys, funResultTy, funArgTy,
         funTyConAppTy_maybe, funTyFlagTyCon,
         tyConAppFunTy_maybe, tyConAppFunCo_maybe,
-        mkFunctionType, mkScaledFunctionTys, chooseFunTyFlag,
+        mkFunctionType, mkScaledFunctionTys, mkScaledFunctionTysM, mkScaledFunctionTysU, chooseFunTyFlag,
 
         mkTyConApp, mkTyConTy,
         tyConAppTyCon_maybe, tyConAppTyConPicky_maybe,
@@ -58,7 +61,24 @@ module GHC.Core.Type (
         splitPiTy_maybe, splitPiTy, splitPiTys, splitUninstantiatedValArgTys,
         getRuntimeArgTys,
         mkTyConBindersPreferAnon,
-        mkPiTy, mkPiTys,
+        mkPiTy, mkPiTys, DepFunTyFlag(..), mkDepFunTy, mkDepFunTyWithVis, isBoolIndexId,
+        mkPiTysM, mkPiTysU,
+        isNativeIndexId, isNativeIndexType, isNativeClosedIndexType, nativeIndexDataConTyArgs,
+        isLiftedDataOrNewTyCon,
+        primFamilyPatFieldKind, isPrimFamilyPatBinderKind, isPrimFamilyPatBinder,
+        hasConstraintPremise,
+        isNativeIndexFunctionId, nativeIndexFunctionTys_maybe,
+        isNativeDepFunctionId, nativeTermAppKind_maybe, nativeTypeCallStep_maybe,
+        isNativeNamedOpaqueFunctionId,
+        nativeIndexFunctionTypeTys_maybe, nativeCallSpine_maybe,
+        isNativeOpaqueValueId, isNativeOpaqueValueType, isNativeClassDictionaryId,
+        markInferredRetainedBinder, isInferredRetainedBinder,
+        markInvisibleRetainedBinder, isInvisibleRetainedBinder,
+        replaceTermVarInType,
+        isNativeIndexDomainConversion,
+        isNativeRetainedBinder, isNativeRetainedBinderType,
+        isNativeRetainedField, isNativeRetainedFieldType,
+        isNativeIndexedFieldDomain,
         piResultTy, piResultTys,
         applyTysX, dropForAlls,
         mkFamilyTyConApp,
@@ -108,10 +128,10 @@ module GHC.Core.Type (
         isCoercionTy_maybe, isForAllTy,
         isForAllTy_ty, isForAllTy_co,
         isForAllTy_invis_ty,
-        isPiTy, isTauTy, isFamFreeTy,
+        isPiTy, isTauTy, isFamFreeTy, isUnsaturatedUserFamily, isPartialTypeFunction,
         isAtomicTy,
 
-        isValidJoinPointType,
+        isValidJoinPointType, joinPointResultType,
         tyConAppNeedsKindSig,
 
         -- * Space-saving construction
@@ -140,6 +160,7 @@ module GHC.Core.Type (
         -- * Multiplicity
 
         isMultiplicityTy, isMultiplicityVar,
+        Matchability, isMatchableFunTy, defaultForAllMatchability,
         unrestricted, linear, tymult,
         mkScaled, irrelevantMult, scaledSet,
         pattern OneTy, pattern ManyTy,
@@ -174,7 +195,7 @@ module GHC.Core.Type (
         seqType, seqTypes, seqCo, seqCos, seqMCo,
 
         -- * Other views onto Types
-        coreView, coreFullView, rewriterView,
+        coreView, coreFullView, rewriterView, synAppCanReduce,
 
         tyConsOfType,
 
@@ -218,6 +239,7 @@ module GHC.Core.Type (
     ) where
 
 import GHC.Prelude
+import Control.Monad (guard)
 
 import GHC.Types.Basic
 
@@ -228,17 +250,24 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Make
 import GHC.Core.TyCo.Subst
 import GHC.Core.TyCo.FVs
+import {-# SOURCE #-} GHC.Core.TyCo.Compare ( eqType, eqTypes )
 import GHC.Core.TyCon
+import {-# SOURCE #-} GHC.Core.DataCon
+   ( DataCon, dataConTyCon, dataConFullSig, dataConRepArgTys, dataConStupidTheta
+   , dataConWrapId_maybe, dataConRepArgBinders, dataConHasPromotedRetained )
 import GHC.Core.Coercion.Axiom
 
 import {-# SOURCE #-} GHC.Core.Coercion
    ( isReflexiveCo
-   , coercionRKind, coercionType
+   , coercionLKind, coercionRKind, coercionRole, coercionType
    , topNormaliseNewType_maybe
    )
 
 -- friends:
 import GHC.Types.Var
+import {-# SOURCE #-} GHC.Types.Id.Info
+   ( isJoinIdDetails, inferredRetainedIdInfo, setInferredRetainedIdInfo
+   , invisibleRetainedIdInfo, setInvisibleRetainedIdInfo )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 
@@ -247,10 +276,11 @@ import GHC.Builtin.WiredIn.Prim
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
    ( charTy, naturalTy
    , typeSymbolKind, liftedTypeKind, unliftedTypeKind
-   , manyDataConTy, oneDataConTy
+   , manyDataConTy, oneDataConTy, matchableDataConTy, unmatchableDataConTy
    , liftedRepTy )
 
-import GHC.Types.Name( Name, hasKnownKey )
+import GHC.Types.Name( Name, hasKnownKey, nameModule_maybe )
+import GHC.Unit.Types (isInteractiveModule)
 import GHC.Builtin.KnownKeys
 
 import {-# SOURCE #-} GHC.Tc.Utils.TcType ( isConcreteTyVar )
@@ -262,7 +292,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Monad.StrictReader
 
 import GHC.Data.FastString
-import GHC.Data.Maybe   ( orElse, isJust )
+import GHC.Data.Maybe   ( orElse, isJust, isNothing )
 
 -- $type_classification
 -- #type_classification#
@@ -341,10 +371,22 @@ rewriterView :: Type -> Maybe Type
 {-# INLINE rewriterView #-}
 rewriterView (TyConApp tc tys)
   | isTypeSynonymTyCon tc
-  , isForgetfulSynTyCon tc || not (isFamFreeTyCon tc)
+  , isForgetfulSynTyCon tc || synAppCanReduce tc tys
   = expandSynTyConApp_maybe tc tys
 rewriterView _other
   = Nothing
+
+-- | Can expanding a type synonym expose a saturated type family?
+-- See Note [Rewriting synonyms] in GHC.Tc.Solver.Rewrite.
+synAppCanReduce :: TyCon -> [Type] -> Bool
+synAppCanReduce tc args =
+  not (isFamFreeTyCon tc) || case splitAt (tyConArity tc) args of
+    (_, []) -> False
+    (prefix, extra) -> appliesFamily (piResultTys (tyConKind tc) prefix) extra
+  where
+    appliesFamily _ [] = False
+    appliesFamily kind (arg : rest) =
+      not (isMatchableFunTy kind) || appliesFamily (piResultTy kind arg) rest
 
 coreView :: Type -> Maybe Type
 -- ^ This function strips off the /top layer only/ of a type synonym
@@ -355,7 +397,13 @@ coreView :: Type -> Maybe Type
 --
 -- By being non-recursive and inlined, this case analysis gets efficiently
 -- joined onto the case analysis that the caller is already doing
-coreView (TyConApp tc tys) = expandSynTyConApp_maybe tc tys
+coreView (TyConApp tc tys)
+  | Just rhs <- expandSynTyConApp_maybe tc tys = Just rhs
+  | tc `hasKey` charDataConKey
+  , [arg] <- tys
+  , TyConApp prim_tc [lit@(LitTy (CharTyLit _))] <- coreFullView arg
+  , prim_tc `hasKey` charPrimLitTyConKey
+  = Just lit
 coreView _                 = Nothing
 -- See Note [Inlining coreView].
 {-# INLINE coreView #-}
@@ -366,7 +414,7 @@ coreFullView, core_full_view :: Type -> Type
 --     core_full_view is the recursive one
 -- See Note [Inlining coreView].
 coreFullView ty@(TyConApp tc _)
-  | isTypeSynonymTyCon tc = core_full_view ty
+  | isTypeSynonymTyCon tc || tc `hasKey` charDataConKey = core_full_view ty
 coreFullView ty = ty
 {-# INLINE coreFullView #-}
 
@@ -392,8 +440,38 @@ expandSynTyConApp_maybe tc arg_tys
     -- that (expand_syn ...) thunk, so it's more efficient not to build a thunk.
     -- Mind you, this function is always INLINEd, so the client context is probably
     -- enough to avoid thunk construction and so the $! is just belt-and-braces.
-  | otherwise
-  = Nothing
+  | Just (tvs, rhs) <- partialSynTyConDefn_maybe tc arg_tys
+  = Just $! (expand_syn tvs rhs arg_tys)
+  | otherwise = Nothing
+
+{- Note [Eta reduction of partial synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For `type Again e a = Column e a`, the prefix `Again Bool` refers to
+`Column Bool`. Strip only the missing parameters, in order. None of
+them may occur free in the function that remains. Check that the two
+functions have the same kind, including visibility and matchability.
+For example, `type Wrap a = Maybe a` has an unmatchable kind arrow,
+whereas Maybe has a matchable arrow. See Note [Newtype eta and
+homogeneous axioms] in GHC.Tc.TyCl.Build.
+
+Inspect the arguments written on the synonym RHS. General application
+splitting deliberately stops at family arity because it can serve
+inverse inference. This expansion only reads a definition. It never
+projects an argument out of an equality between applications.
+
+Compute the optional shorter definition when building the synonym.
+Keep it lazy. Looking through a synonym is also used to compute kinds.
+The expansion path must not repeat the kind check on each use.
+Type applications and coercion applications use the same shorter RHS.
+
+The interface header records this rule when the writer serializes a
+partial synonym. The first prototype treated forwarded prefixes as
+distinct. Its optimizer could reject an imported Refl after inlining.
+Expanding prefixes in new interfaces is insufficient. A proof may
+refer only to saturated aliases from an older module. The two readers
+therefore require different versions of the partial synonym feature.
+Modules without a serialized partial synonym keep their existing header.
+-}
 
 saturates :: [Type] -> Arity -> Bool
 saturates _       0 = True
@@ -838,8 +916,8 @@ splitAppTyNoView_maybe :: HasDebugCallStack => Type -> Maybe (Type,Type)
 splitAppTyNoView_maybe (AppTy ty1 ty2)
   = Just (ty1, ty2)
 
-splitAppTyNoView_maybe (FunTy af w ty1 ty2)
-  | Just (tc, tys)   <- funTyConAppTy_maybe af w ty1 ty2
+splitAppTyNoView_maybe (FunTy af ma w ty1 ty2)
+  | Just (tc, tys)   <- funTyConAppTy_maybe af ma w ty1 ty2
   , Just (tys', ty') <- snocView tys
   = Just (TyConApp tc tys', ty')
 
@@ -877,8 +955,8 @@ splitAppTys ty = split ty ty []
             (tc_args1, tc_args2) = splitAt n tc_args
         in
         (TyConApp tc tc_args1, tc_args2 ++ args)
-    split _   (FunTy af w ty1 ty2) args
-      | Just (tc,tys) <- funTyConAppTy_maybe af w ty1 ty2
+    split _   (FunTy af ma w ty1 ty2) args
+      | Just (tc,tys) <- funTyConAppTy_maybe af ma w ty1 ty2
       = assert (null args )
         (TyConApp tc [], tys)
 
@@ -895,8 +973,8 @@ splitAppTysNoView ty = split ty []
             (tc_args1, tc_args2) = splitAt n tc_args
         in
         (TyConApp tc tc_args1, tc_args2 ++ args)
-    split (FunTy af w ty1 ty2) args
-      | Just (tc, tys) <- funTyConAppTy_maybe af w ty1 ty2
+    split (FunTy af ma w ty1 ty2) args
+      | Just (tc, tys) <- funTyConAppTy_maybe af ma w ty1 ty2
       = assert (null args )
         (TyConApp tc [], tys)
 
@@ -1000,76 +1078,92 @@ See #11714.
 -}
 
 -----------------------------------------------
-funTyConAppTy_maybe :: FunTyFlag -> Type -> Type -> Type
+funTyConAppTy_maybe :: FunTyFlag -> Matchability -> Type -> Type -> Type
                     -> Maybe (TyCon, [Type])
 -- ^ Given the components of a FunTy
 -- figure out the corresponding TyConApp.
-funTyConAppTy_maybe af mult arg res
-  | Just arg_rep <- getRuntimeRep_maybe arg
+funTyConAppTy_maybe af ma mult arg res
+  | isFUNArg af || eqType ma unmatchableDataConTy
+  , Just arg_rep <- getRuntimeRep_maybe arg
   , Just res_rep <- getRuntimeRep_maybe res
   -- If you're changing the lines below, you'll probably want to adapt the
   -- `fUNTyCon` case of GHC.Core.Unify.unify_ty correspondingly.
-  , let args | isFUNArg af = [mult, arg_rep, res_rep, arg, res]
+  , let args | isFUNArg af = [ma, mult, arg_rep, res_rep, arg, res]
              | otherwise   = [      arg_rep, res_rep, arg, res]
   = Just $ (funTyFlagTyCon af, args)
   | otherwise
   = Nothing
 
-mkFunctionType :: HasDebugCallStack => Mult -> Type -> Type -> Type
+mkFunctionType :: HasDebugCallStack => Matchability -> Mult -> Type -> Type -> Type
 -- ^ This one works out the FunTyFlag from the argument type
 -- See GHC.Types.Var Note [FunTyFlag]
-mkFunctionType mult arg_ty res_ty
- = FunTy { ft_af = af, ft_arg = arg_ty, ft_res = res_ty
+mkFunctionType ma mult arg_ty res_ty
+ = FunTy { ft_af = af, ft_ma = ma, ft_arg = arg_ty, ft_res = res_ty
          , ft_mult = assertPpr mult_ok (ppr [mult, arg_ty, res_ty]) $
                      mult }
   where
     af = chooseFunTyFlag arg_ty res_ty
     mult_ok = isVisibleFunArg af || isManyTy mult
 
-mkScaledFunctionTys :: [Scaled Type] -> Type -> Type
+mkScaledFunctionTys :: [(Matchability, Scaled Type)] -> Type -> Type
 -- ^ Like mkFunctionType, compute the FunTyFlag from the arguments
 mkScaledFunctionTys arg_tys res_ty
   = foldr mk res_ty arg_tys
   where
-    mk (Scaled mult arg_ty) res_ty
+    mk (ma, Scaled mult arg_ty) res_ty
       = mkFunTy (chooseFunTyFlag arg_ty res_ty)
-                mult arg_ty res_ty
+                ma mult arg_ty res_ty
+
+-- | Build matchable scaled arrows.
+mkScaledFunctionTysM :: [Scaled Type] -> Type -> Type
+mkScaledFunctionTysM args = mkScaledFunctionTys [(matchableDataConTy,arg) | arg <- args]
+
+-- | Build ordinary runtime scaled arrows.
+mkScaledFunctionTysU :: [Scaled Type] -> Type -> Type
+mkScaledFunctionTysU args = mkScaledFunctionTys [(unmatchableDataConTy,arg) | arg <- args]
 
 chooseFunTyFlag :: HasDebugCallStack => Type -> Type -> FunTyFlag
 -- ^ See GHC.Types.Var Note [FunTyFlag]
 chooseFunTyFlag arg_ty res_ty
   = mkFunTyFlag (typeTypeOrConstraint arg_ty) (typeTypeOrConstraint res_ty)
 
-splitFunTy :: Type -> (Mult, Type, Type)
--- ^ Attempts to extract the multiplicity, argument and result types from a type,
--- and panics if that is not possible. See also 'splitFunTy_maybe'
+splitFunTy :: Type -> (Matchability, Mult, Type, Type)
+-- ^ Extract matchability, multiplicity, argument and result.
 splitFunTy ty = case splitFunTy_maybe ty of
-                   Just (_af, mult, arg, res) -> (mult,arg,res)
-                   Nothing                    -> pprPanic "splitFunTy" (ppr ty)
+                   Just (_af, ma, mult, arg, res) -> (ma,mult,arg,res)
+                   Nothing -> pprPanic "splitFunTy" (ppr ty)
 
 {-# INLINE splitFunTy_maybe #-}
-splitFunTy_maybe :: Type -> Maybe (FunTyFlag, Mult, Type, Type)
--- ^ Attempts to extract the multiplicity, argument and result types from a type
+splitFunTy_maybe :: Type -> Maybe (FunTyFlag, Matchability, Mult, Type, Type)
+-- ^ Extract all semantic arrow components.
 splitFunTy_maybe ty
-  | FunTy af w arg res <- coreFullView ty = Just (af, w, arg, res)
-  | otherwise                             = Nothing
+  | FunTy af ma w arg res <- coreFullView ty = Just (af, ma, w, arg, res)
+  | otherwise = Nothing
 
 {-# INLINE splitVisibleFunTy_maybe #-}
 splitVisibleFunTy_maybe :: Type -> Maybe (Type, Type)
--- ^ Works on visible function types only (t1 -> t2), and
---   returns t1 and t2, but not the multiplicity
+-- ^ Inspect visible argument/result syntax without an inverse equality rule.
 splitVisibleFunTy_maybe ty
-  | FunTy af _ arg res <- coreFullView ty
-  , isVisibleFunArg af = Just (arg, res)
-  | otherwise          = Nothing
+  | FunTy af _ma _ arg res <- coreFullView ty
+  , isVisibleFunArg af = Just (arg,res)
+  | otherwise = Nothing
 
-splitFunTys :: Type -> ([Scaled Type], Type)
-splitFunTys ty = split [] ty ty
+splitFunTys :: Type -> ([Matchability], [Scaled Type], Type)
+splitFunTys ty = split [] [] ty ty
   where
-      -- common case first
-    split args _       (FunTy _ w arg res) = split (Scaled w arg : args) res res
-    split args orig_ty ty | Just ty' <- coreView ty = split args orig_ty ty'
-    split args orig_ty _                   = (reverse args, orig_ty)
+    split mas args _ (FunTy _ ma w arg res)
+      = split (ma:mas) (Scaled w arg:args) res res
+    split mas args orig_ty ty | Just ty' <- coreView ty
+      = split mas args orig_ty ty'
+    split mas args orig_ty _ = (reverse mas,reverse args,orig_ty)
+
+-- | Check the consumed kind binder for nominal inverse application evidence.
+-- See Note [Ordinary arrow matchability] in GHC.Core.TyCo.Rep.
+isMatchableFunTy :: Type -> Bool
+isMatchableFunTy ki = case coreFullView ki of
+    FunTy { ft_ma = ma } -> eqType ma matchableDataConTy
+    ForAllTy ma _ _ -> eqType ma matchableDataConTy
+    _ -> False
 
 funResultTy :: HasDebugCallStack => Type -> Type
 -- ^ Extract the function result type and panic if that is not possible
@@ -1095,9 +1189,11 @@ piResultTy_maybe :: Type -> Type -> Maybe Type
 piResultTy_maybe ty arg = case coreFullView ty of
   FunTy { ft_res = res } -> Just res
 
-  ForAllTy (Bndr tv _) res
-    -> let empty_subst = mkEmptySubst $ mkInScopeSet $
-                         tyCoVarsOfTypes [arg,res]
+  ForAllTy _ (Bndr tv _) res
+    -- See Note [Source and target substitution scopes] in GHC.Core.TyCo.Subst.
+    -> let target_subst = mkEmptySubst $ mkInScopeSet $ tyCoVarsOfType arg
+           empty_subst = extendSubstInScopeSetFromSource target_subst
+                           (tyCoVarsOfType ty)
        in Just (substTy (extendTCvSubst empty_subst tv arg) res)
 
   _ -> Nothing
@@ -1129,7 +1225,7 @@ piResultTys ty orig_args@(arg:args)
   | FunTy { ft_res = res } <- ty
   = piResultTys res args
 
-  | ForAllTy (Bndr tcv _) res <- ty
+  | ForAllTy _ (Bndr tcv _) res <- ty
   = -- Both type and coercion variables
     go (extendTCvSubst init_subst tcv arg) res args
 
@@ -1139,7 +1235,9 @@ piResultTys ty orig_args@(arg:args)
   | otherwise
   = pprPanic "piResultTys1" (ppr ty $$ ppr orig_args)
   where
-    init_subst = mkEmptySubst $ mkInScopeSet (tyCoVarsOfTypes (ty:orig_args))
+    -- See Note [Source and target substitution scopes] in GHC.Core.TyCo.Subst.
+    init_subst = extendSubstInScopeSetFromSource target_subst (tyCoVarsOfType ty)
+    target_subst = mkEmptySubst $ mkInScopeSet (tyCoVarsOfTypes orig_args)
 
     go :: Subst -> Type -> [Type] -> Type
     go subst ty [] = substTyUnchecked subst ty
@@ -1148,7 +1246,7 @@ piResultTys ty orig_args@(arg:args)
       | FunTy { ft_res = res } <- ty
       = go subst res args
 
-      | ForAllTy (Bndr tv _) res <- ty
+      | ForAllTy _ (Bndr tv _) res <- ty
       = go (extendTCvSubst subst tv arg) res args
 
       | Just ty' <- coreView ty
@@ -1262,8 +1360,8 @@ splitTyConAppNoView_maybe :: HasDebugCallStack => Type -> Maybe (TyCon, [Type])
 -- Same as splitTyConApp_maybe but without looking through synonyms
 splitTyConAppNoView_maybe ty
   = case ty of
-      FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res}
-                      -> funTyConAppTy_maybe af w arg res
+      FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res}
+                      -> funTyConAppTy_maybe af ma w arg res
       TyConApp tc tys -> Just (tc, tys)
       _               -> Nothing
 
@@ -1288,10 +1386,10 @@ tcSplitTyConApp_maybe :: HasDebugCallStack => Type -> Maybe (TyCon, [Type])
 -- Defined here to avoid module loops between Unify and TcType.
 tcSplitTyConApp_maybe ty
   = case coreFullView ty of
-      FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res}
+      FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res}
                       | isVisibleFunArg af    -- Visible args only
                         -- See Note [Decomposing fat arrow c=>t]
-                      -> funTyConAppTy_maybe af w arg res
+                      -> funTyConAppTy_maybe af ma w arg res
       TyConApp tc tys -> Just (tc, tys)
       _               -> Nothing
 
@@ -1348,7 +1446,7 @@ mk_cast_ty orig_ty co = go orig_ty
       = mkCastTy ty (co1 `mkTransCo` co)
           -- call mkCastTy again for the reflexivity check
 
-    go (ForAllTy (Bndr tv vis) inner_ty)
+    go (ForAllTy ma (Bndr tv vis) inner_ty)
       -- (EQ4) from the Note
       -- See Note [Weird typing rule for ForAllTy] in GHC.Core.TyCo.Rep.
       | isTyVar tv
@@ -1357,8 +1455,8 @@ mk_cast_ty orig_ty co = go orig_ty
         if tv `elemVarSet` fvs
         then let empty_subst = mkEmptySubst (mkInScopeSet fvs)
                  (subst, tv') = substVarBndr empty_subst tv
-             in ForAllTy (Bndr tv' vis) (substTy subst inner_ty `mk_cast_ty` co)
-        else ForAllTy (Bndr tv vis) (inner_ty `mk_cast_ty` co)
+             in ForAllTy ma (Bndr tv' vis) (substTy subst inner_ty `mk_cast_ty` co)
+        else ForAllTy ma (Bndr tv vis) (inner_ty `mk_cast_ty` co)
 
     go _ = CastTy orig_ty co -- NB: orig_ty: preserve synonyms if possible
 
@@ -1415,11 +1513,16 @@ tyConBindersPiTyBinders = map to_tyb
     to_tyb (Bndr tv (NamedTCB vis)) = Named (Bndr tv vis)
     to_tyb (Bndr tv AnonTCB)        = Anon (tymult (varType tv)) FTF_T_T
 
--- | Take a ForAllTy apart, returning the binders and result type
-splitForAllForAllTyBinders :: Type -> ([ForAllTyBinder], Type)
+-- | Select the concrete default of a newly introduced source forall.
+defaultForAllMatchability :: TypeOrKind -> Matchability
+defaultForAllMatchability TypeLevel = unmatchableDataConTy
+defaultForAllMatchability KindLevel = matchableDataConTy
+
+-- | Take a ForAllTy apart, returning annotated binders and the result type.
+splitForAllForAllTyBinders :: Type -> ([(Matchability, ForAllTyBinder)], Type)
 splitForAllForAllTyBinders ty = split ty ty []
   where
-    split _ (ForAllTy b res) bs                   = split res res (b:bs)
+    split _ (ForAllTy ma b res) bs                = split res res ((ma,b):bs)
     split orig_ty ty bs | Just ty' <- coreView ty = split orig_ty ty' bs
     split orig_ty _                bs             = (reverse bs, orig_ty)
 {-# INLINE splitForAllForAllTyBinders #-}
@@ -1427,39 +1530,39 @@ splitForAllForAllTyBinders ty = split ty ty []
 -- | Take a ForAllTy apart, returning the list of tycovars and the result type.
 -- This always succeeds, even if it returns only an empty list. Note that the
 -- result type returned may have free variables that were bound by a forall.
-splitForAllTyCoVars :: Type -> ([TyCoVar], Type)
+splitForAllTyCoVars :: Type -> ([(Matchability, TyCoVar)], Type)
 splitForAllTyCoVars ty = split ty ty []
   where
-    split _       (ForAllTy (Bndr tv _) ty)    tvs = split ty ty (tv:tvs)
+    split _       (ForAllTy ma (Bndr tv _) ty) tvs = split ty ty ((ma,tv):tvs)
     split orig_ty ty tvs | Just ty' <- coreView ty = split orig_ty ty' tvs
     split orig_ty _                            tvs = (reverse tvs, orig_ty)
 
 -- | Like 'splitForAllTyCoVars', but split only for tyvars.
 -- This always succeeds, even if it returns only an empty list. Note that the
 -- result type returned may have free variables that were bound by a forall.
-splitForAllTyVars :: Type -> ([TyVar], Type)
+splitForAllTyVars :: Type -> ([(Matchability, TyVar)], Type)
 splitForAllTyVars ty = split ty ty []
   where
-    split _ (ForAllTy (Bndr tv _) ty) tvs | isTyVar tv = split ty ty (tv:tvs)
+    split _ (ForAllTy ma (Bndr tv _) ty) tvs | isTyVar tv = split ty ty ((ma,tv):tvs)
     split orig_ty ty tvs | Just ty' <- coreView ty     = split orig_ty ty' tvs
     split orig_ty _                   tvs              = (reverse tvs, orig_ty)
 
 -- | Like 'splitForAllTyCoVars', but only splits 'ForAllTy's with 'Required' type
 -- variable binders. Furthermore, each returned tyvar is annotated with '()'.
-splitForAllReqTyBinders :: Type -> ([ReqTyBinder], Type)
+splitForAllReqTyBinders :: Type -> ([(Matchability, ReqTyBinder)], Type)
 splitForAllReqTyBinders ty = split ty ty []
   where
-    split _ (ForAllTy (Bndr tv Required) ty) tvs   = split ty ty (Bndr tv ():tvs)
+    split _ (ForAllTy ma (Bndr tv Required) ty) tvs = split ty ty ((ma,Bndr tv ()):tvs)
     split orig_ty ty tvs | Just ty' <- coreView ty = split orig_ty ty' tvs
     split orig_ty _                   tvs          = (reverse tvs, orig_ty)
 
 -- | Like 'splitForAllTyCoVars', but only splits 'ForAllTy's with 'Invisible' type
 -- variable binders. Furthermore, each returned tyvar is annotated with its
 -- 'Specificity'.
-splitForAllInvisTyBinders :: Type -> ([InvisTyBinder], Type)
+splitForAllInvisTyBinders :: Type -> ([(Matchability, InvisTyBinder)], Type)
 splitForAllInvisTyBinders ty = split ty ty []
   where
-    split _ (ForAllTy (Bndr tv (Invisible spec)) ty) tvs = split ty ty (Bndr tv spec:tvs)
+    split _ (ForAllTy ma (Bndr tv (Invisible spec)) ty) tvs = split ty ty ((ma,Bndr tv spec):tvs)
     split orig_ty ty tvs | Just ty' <- coreView ty       = split orig_ty ty' tvs
     split orig_ty _                   tvs                = (reverse tvs, orig_ty)
 
@@ -1472,7 +1575,7 @@ isForAllTy ty
 -- | Like `isForAllTy`, but returns True only if it is a tyvar binder
 isForAllTy_ty :: Type -> Bool
 isForAllTy_ty ty
-  | ForAllTy (Bndr tv _) _ <- coreFullView ty
+  | ForAllTy _ (Bndr tv _) _ <- coreFullView ty
   , isTyVar tv
   = True
 
@@ -1481,7 +1584,7 @@ isForAllTy_ty ty
 -- | Like `isForAllTy`, but returns True only if it is an inferred tyvar binder
 isForAllTy_invis_ty :: Type -> Bool
 isForAllTy_invis_ty  ty
-  | ForAllTy (Bndr tv (Invisible InferredSpec)) _ <- coreFullView ty
+  | ForAllTy _ (Bndr tv (Invisible InferredSpec)) _ <- coreFullView ty
   , isTyVar tv
   = True
 
@@ -1490,7 +1593,7 @@ isForAllTy_invis_ty  ty
 -- | Like `isForAllTy`, but returns True only if it is a covar binder
 isForAllTy_co :: Type -> Bool
 isForAllTy_co ty
-  | ForAllTy (Bndr tv _) _ <- coreFullView ty
+  | ForAllTy _ (Bndr tv _) _ <- coreFullView ty
   , isCoVar tv
   = True
 
@@ -1527,7 +1630,7 @@ isFunTy ty
   | otherwise                   = False
 
 -- | Take a forall type apart, or panics if that is not possible.
-splitForAllTyCoVar :: Type -> (TyCoVar, Type)
+splitForAllTyCoVar :: Type -> (Matchability, TyCoVar, Type)
 splitForAllTyCoVar ty
   | Just answer <- splitForAllTyCoVar_maybe ty = answer
   | otherwise                                  = pprPanic "splitForAllTyCoVar" (ppr ty)
@@ -1536,67 +1639,66 @@ splitForAllTyCoVar ty
 dropForAlls :: Type -> Type
 dropForAlls ty = go ty
   where
-    go (ForAllTy _ res)            = go res
+    go (ForAllTy _ _ res)            = go res
     go ty | Just ty' <- coreView ty = go ty'
     go res                         = res
 
 -- | Attempts to take a ForAllTy apart, returning the full ForAllTyBinder
-splitForAllForAllTyBinder_maybe :: Type -> Maybe (ForAllTyBinder, Type)
+splitForAllForAllTyBinder_maybe :: Type -> Maybe (Matchability, ForAllTyBinder, Type)
 splitForAllForAllTyBinder_maybe ty
-  | ForAllTy bndr inner_ty <- coreFullView ty = Just (bndr, inner_ty)
+  | ForAllTy ma bndr inner_ty <- coreFullView ty = Just (ma, bndr, inner_ty)
   | otherwise                                 = Nothing
 
 
 -- | Attempts to take a ForAllTy apart, returning the Var
-splitForAllTyCoVar_maybe :: Type -> Maybe (TyCoVar, Type)
+splitForAllTyCoVar_maybe :: Type -> Maybe (Matchability, TyCoVar, Type)
 splitForAllTyCoVar_maybe ty
-  | ForAllTy (Bndr tv _) inner_ty <- coreFullView ty = Just (tv, inner_ty)
+  | ForAllTy ma (Bndr tv _) inner_ty <- coreFullView ty = Just (ma, tv, inner_ty)
   | otherwise                                        = Nothing
 
 -- | Attempts to take a ForAllTy apart, but only if the binder is a TyVar
-splitForAllTyVar_maybe :: Type -> Maybe (TyVar, Type)
+splitForAllTyVar_maybe :: Type -> Maybe (Matchability, TyVar, Type)
 splitForAllTyVar_maybe ty
-  | ForAllTy (Bndr tv _) inner_ty <- coreFullView ty
+  | ForAllTy ma (Bndr tv _) inner_ty <- coreFullView ty
   , isTyVar tv
-  = Just (tv, inner_ty)
+  = Just (ma, tv, inner_ty)
 
   | otherwise = Nothing
 
 -- | Like 'splitForAllTyCoVar_maybe', but only returns Just if it is a covar binder.
-splitForAllCoVar_maybe :: Type -> Maybe (CoVar, Type)
+splitForAllCoVar_maybe :: Type -> Maybe (Matchability, CoVar, Type)
 splitForAllCoVar_maybe ty
-  | ForAllTy (Bndr tv _) inner_ty <- coreFullView ty
+  | ForAllTy ma (Bndr tv _) inner_ty <- coreFullView ty
   , isCoVar tv
-  = Just (tv, inner_ty)
+  = Just (ma, tv, inner_ty)
 
   | otherwise = Nothing
 
 -- | Attempts to take a forall type apart; works with proper foralls and
 -- functions
 {-# INLINE splitPiTy_maybe #-}  -- callers will immediately deconstruct
-splitPiTy_maybe :: Type -> Maybe (PiTyBinder, Type)
+splitPiTy_maybe :: Type -> Maybe (Matchability, PiTyBinder, Type)
 splitPiTy_maybe ty = case coreFullView ty of
-  ForAllTy bndr ty -> Just (Named bndr, ty)
-  FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res}
-                   -> Just (Anon (mkScaled w arg) af, res)
-  _                -> Nothing
+  ForAllTy ma bndr ty -> Just (ma, Named bndr, ty)
+  FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res }
+    -> Just (ma,Anon (mkScaled w arg) af,res)
+  _ -> Nothing
 
--- | Takes a forall type apart, or panics
-splitPiTy :: Type -> (PiTyBinder, Type)
+-- | Split one binder and preserve its matchability.
+splitPiTy :: Type -> (Matchability, PiTyBinder, Type)
 splitPiTy ty
   | Just answer <- splitPiTy_maybe ty = answer
-  | otherwise                         = pprPanic "splitPiTy" (ppr ty)
+  | otherwise = pprPanic "splitPiTy" (ppr ty)
 
--- | Split off all PiTyBinders to a type, splitting both proper foralls
--- and functions
-splitPiTys :: Type -> ([PiTyBinder], Type)
-splitPiTys ty = split ty ty []
+-- | Split a telescope with one matchability for each binder.
+splitPiTys :: Type -> ([Matchability], [PiTyBinder], Type)
+splitPiTys ty = split ty ty [] []
   where
-    split _       (ForAllTy b res) bs = split res res (Named b  : bs)
-    split _       (FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res }) bs
-                                      = split res res (Anon (Scaled w arg) af : bs)
-    split orig_ty ty bs | Just ty' <- coreView ty = split orig_ty ty' bs
-    split orig_ty _                bs = (reverse bs, orig_ty)
+    split _ (ForAllTy ma b res) mas bs = split res res (ma:mas) (Named b:bs)
+    split _ (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res }) mas bs
+      = split res res (ma:mas) (Anon (Scaled w arg) af:bs)
+    split orig_ty ty mas bs | Just ty' <- coreView ty = split orig_ty ty' mas bs
+    split orig_ty _ mas bs = (reverse mas,reverse bs,orig_ty)
 
 splitUninstantiatedValArgTys :: Type -> [Type]
 -- This function takes a type apart, returning all its /value/
@@ -1607,8 +1709,10 @@ splitUninstantiatedValArgTys :: Type -> [Type]
 -- It's a pretty specialised function, hence its long name
 splitUninstantiatedValArgTys ty = go ty
   where
-    go (ForAllTy (Bndr b _) res) | isCoVar b  = varType b : go res
+    go (ForAllTy _ (Bndr b _) res) | isCoVar b  = varType b : go res
                                  | otherwise  = go res
+    go (DepFunTy _ b res) = varType b : go res
+    go (DepDictTy d res)  = varType d : go res
     go (FunTy { ft_arg = arg, ft_res = res }) = arg : go res
     go ty | Just ty' <- coreView ty = go ty'
     go _ = []
@@ -1642,8 +1746,12 @@ getRuntimeArgTys :: Type -> [(Scaled Type, FunTyFlag)]
 getRuntimeArgTys = go
   where
     go :: Type -> [(Scaled Type, FunTyFlag)]
-    go (ForAllTy _ res)
+    go (ForAllTy _ _ res)
       = go res
+    go (DepFunTy _ b res)
+      = (Scaled (idMult b) (varType b), FTF_T_T) : go res
+    go (DepDictTy d res)
+      = (Scaled ManyTy (varType d), FTF_C_T) : go res
     go (FunTy { ft_mult = w, ft_arg = arg, ft_res = res, ft_af = af })
       = (Scaled w arg, af) : go res
     go ty
@@ -1659,37 +1767,37 @@ invisibleBndrCount :: Type -> Int
 -- Includes invisible predicate arguments; e.g. for
 --    e.g.  forall {k}. (k ~ *) => k -> k
 -- returns 2 not 1
-invisibleBndrCount ty = length (fst (splitInvisPiTys ty))
+invisibleBndrCount ty = case splitInvisPiTys ty of (_, bs, _) -> length bs
 
 -- | Like 'splitPiTys', but returns only *invisible* binders, including constraints.
 -- Stops at the first visible binder.
-splitInvisPiTys :: Type -> ([PiTyBinder], Type)
-splitInvisPiTys ty = split ty ty []
+splitInvisPiTys :: Type -> ([Matchability], [PiTyBinder], Type)
+splitInvisPiTys ty = split ty ty [] []
    where
-    split _ (ForAllTy b res) bs
+    split _ (ForAllTy ma b res) mas bs
       | Bndr _ vis <- b
-      , isInvisibleForAllTyFlag vis   = split res res (Named b  : bs)
-    split _ (FunTy { ft_af = af, ft_mult = mult, ft_arg = arg, ft_res = res })  bs
-      | isInvisibleFunArg af     = split res res (Anon (mkScaled mult arg) af : bs)
-    split orig_ty ty bs
-      | Just ty' <- coreView ty  = split orig_ty ty' bs
-    split orig_ty _          bs  = (reverse bs, orig_ty)
+      , isInvisibleForAllTyFlag vis = split res res (ma:mas) (Named b:bs)
+    split _ (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult, ft_arg = arg, ft_res = res }) mas bs
+      | isInvisibleFunArg af = split res res (ma:mas) (Anon (mkScaled mult arg) af:bs)
+    split orig_ty ty mas bs
+      | Just ty' <- coreView ty = split orig_ty ty' mas bs
+    split orig_ty _ mas bs = (reverse mas, reverse bs, orig_ty)
 
-splitInvisPiTysN :: Int -> Type -> ([PiTyBinder], Type)
+splitInvisPiTysN :: Int -> Type -> ([Matchability], [PiTyBinder], Type)
 -- ^ Same as 'splitInvisPiTys', but stop when
 --   - you have found @n@ 'PiTyBinder's,
 --   - or you run out of invisible binders
-splitInvisPiTysN n ty = split n ty ty []
+splitInvisPiTysN n ty = split n ty ty [] []
    where
-    split n orig_ty ty bs
-      | n == 0                  = (reverse bs, orig_ty)
-      | Just ty' <- coreView ty = split n orig_ty ty' bs
-      | ForAllTy b res <- ty
+    split n orig_ty ty mas bs
+      | n == 0 = (reverse mas, reverse bs, orig_ty)
+      | Just ty' <- coreView ty = split n orig_ty ty' mas bs
+      | ForAllTy ma b res <- ty
       , Bndr _ vis <- b
-      , isInvisibleForAllTyFlag vis  = split (n-1) res res (Named b  : bs)
-      | FunTy { ft_af = af, ft_mult = mult, ft_arg = arg, ft_res = res } <- ty
-      , isInvisibleFunArg af   = split (n-1) res res (Anon (Scaled mult arg) af : bs)
-      | otherwise              = (reverse bs, orig_ty)
+      , isInvisibleForAllTyFlag vis = split (n-1) res res (ma:mas) (Named b:bs)
+      | FunTy { ft_af = af, ft_ma = ma, ft_mult = mult, ft_arg = arg, ft_res = res } <- ty
+      , isInvisibleFunArg af = split (n-1) res res (ma:mas) (Anon (Scaled mult arg) af:bs)
+      | otherwise = (reverse mas, reverse bs, orig_ty)
 
 -- | Given a 'TyCon' and a list of argument types, filter out any invisible
 -- (i.e., 'Inferred' or 'Specified') arguments.
@@ -1761,7 +1869,7 @@ fun_kind_arg_flags = go emptySubst
     go subst ki arg_tys
       | Just ki' <- coreView ki = go subst ki' arg_tys
     go _ _ [] = []
-    go subst (ForAllTy (Bndr tv argf) res_ki) (arg_ty:arg_tys)
+    go subst (ForAllTy _ (Bndr tv argf) res_ki) (arg_ty:arg_tys)
       = argf : go subst' res_ki arg_tys
       where
         subst' = extendTvSubst subst tv arg_ty
@@ -1789,21 +1897,48 @@ fun_kind_arg_flags = go emptySubst
 isTauTy :: Type -> Bool
 isTauTy ty | Just ty' <- coreView ty = isTauTy ty'
 isTauTy (TyVarTy _)       = True
+isTauTy (ClassAppTy _ inst dict operand kind) = all isTauTy [inst, dict, operand, kind]
+isTauTy DepDictTy{} = False
+isTauTy (TermAppTy _ arg) = isTauTy arg
+isTauTy (TermVarTy _)     = True
+isTauTy ty@(ExistsTy _ binder body)
+  = isTauTy (varType binder) && isTauTy body
+    && noFreeVarsOfType ty && isFamFreeTy ty
+    -- See Note [Closed existential packages in type inference].
+isTauTy (DepFunTy {})     = False
 isTauTy (LitTy {})        = True
 isTauTy (TyConApp tc tys) = all isTauTy tys && isTauTyCon tc
 isTauTy (AppTy a b)       = isTauTy a && isTauTy b
-isTauTy (FunTy { ft_af = af, ft_mult = w, ft_arg = a, ft_res = b })
+isTauTy (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = b })
  | isInvisibleFunArg af   = False                               -- e.g., Eq a => b
- | otherwise              = isTauTy w && isTauTy a && isTauTy b -- e.g., a -> b
+ | otherwise              = isTauTy ma && isTauTy w && isTauTy a && isTauTy b -- e.g., a -> b
 isTauTy (ForAllTy {})     = False
 isTauTy (CastTy ty _)     = isTauTy ty
 isTauTy (CoercionTy _)    = False  -- Not sure about this
+
+{- Note [Closed existential packages in type inference]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A first-class existential package does not instantiate its bound witness
+when a polymorphic function returns the package. It is safe to assign
+a result metavariable to a closed package with a tau payload. The binder
+is not a forall, and the payload stays inside its scope.
+
+This first implementation only admits closed, family-free packages. A
+slow unification check can return reflexivity for the whole type.
+There are no free variables to promote or check for escape. The solver
+does not rewrite the payload or use a forall coercion for an existential.
+Continue to reject polymorphic payloads on the ordinary tau path.
+-}
 
 isAtomicTy :: Type -> Bool
 -- True if the type is just a single token, and can be printed compactly
 -- Used when deciding how to lay out type error messages; see the
 -- call in GHC.Tc.Errors
 isAtomicTy (TyVarTy {})    = True
+isAtomicTy ClassAppTy{} = False
+isAtomicTy DepDictTy{} = False
+isAtomicTy (TermAppTy {})  = False
+isAtomicTy (TermVarTy {})  = True
 isAtomicTy (LitTy {})      = True
 isAtomicTy (TyConApp _ []) = True
 
@@ -1846,14 +1981,87 @@ coAxNthLHS :: CoAxiom br -> Int -> Type
 coAxNthLHS ax ind =
   mkTyConApp (coAxiomTyCon ax) (coAxBranchLHS (coAxiomNthBranch ax ind))
 
+-- | A partial user family retains only known unmatchable type binders.
+-- See Note [Partial type family applications].
+isUnsaturatedUserFamily :: TyCon -> [Type] -> Bool
+isUnsaturatedUserFamily tc args
+  | TypeSynonymFlavour <- tyConFlavour tc = False
+  | Just _ <- builtInClosedTyFamTyCon_maybe tc = False
+  | otherwise = isPartialTypeFunction tc args
+
+-- | A family or type synonym before all of its unmatchable arguments are supplied.
+isPartialTypeFunction :: TyCon -> [Type] -> Bool
+isPartialTypeFunction tc args
+  | type_function (tyConFlavour tc)
+  , let missing = tyConArity tc - length args
+  , missing > 0 =
+      unmatchable missing (piResultTys (tyConKind tc) args)
+  | otherwise = False
+  where
+    -- Include checked TcTyCon headers in the initial kind-checking pass.
+    -- Their real family TyCons only exist after this mutually recursive group.
+    type_function TypeSynonymFlavour = True
+    type_function ClosedTypeFamilyFlavour = True
+    type_function (OpenFamilyFlavour IAmType _) = True
+    type_function _ = False
+
+    unmatchable 0 _ = True
+    unmatchable n kind
+      | ForAllTy ma (Bndr tv _) result <- coreFullView kind
+      , isTyVar tv, ma `eqType` unmatchableDataConTy =
+          unmatchable (n - 1) result
+      | FunTy{ft_af = FTF_T_T, ft_ma = ma, ft_mult = mult, ft_res = result} <- coreFullView kind
+      , isManyTy mult, ma `eqType` unmatchableDataConTy =
+          unmatchable (n - 1) result
+      | otherwise = False
+
+{- Note [Partial type family applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each Flip xs can pass Flip as a function. The family axiom for Flip
+expects an argument. Until the application reaches its arity, rewrite
+its arguments by congruence and leave its head intact. Only a saturated
+application can be a TyFamLHS or enter the family reduction cache.
+This includes built-in families. Their axioms and solver improvement
+rules receive only saturated applications.
+Data family representation axioms have their own eta-reduced arity.
+
+Check each missing binder in the instantiated kind, including its
+matchability. A partial family can retain an invisible type binder
+when its receiver already expects the entire polymorphic kind. It can
+also retain a required type binder, as in a family with kind
+forall k -> @U k %U -> Type. These binders quantify types.
+Equality of applications at U gives no inverse for the
+arguments. In particular, failure to split two partial applications
+does not establish their apartness. The source validity check controls
+which modules can write a partial family. Core Lint must also accept
+a legal partial application obtained from an imported interface.
+The same rule applies to a type synonym before it has enough arguments
+to expand. Its TyConAppCo may carry forward equality of its supplied
+arguments. At saturation mkTyConAppCo expands the synonym as usual.
+The interface marks partial synonyms and built-in families in both
+types and coercions. An older reader can treat a partial synonym's
+supplied arguments as injective, or reject a partial built-in in Core
+Lint after it has read the interface.
+See GHC Proposal #242 and Kiss et al. (ICFP 2019).
+-}
+
 isFamFreeTy :: Type -> Bool
 isFamFreeTy ty | Just ty' <- coreView ty = isFamFreeTy ty'
 isFamFreeTy (TyVarTy _)       = True
+isFamFreeTy (ClassAppTy _ inst dict operand kind) = all isFamFreeTy [inst, dict, operand, kind]
+isFamFreeTy (DepDictTy b ty) = isFamFreeTy (varType b) && isFamFreeTy ty
+isFamFreeTy (TermAppTy _ arg) = isFamFreeTy arg
+isFamFreeTy (TermVarTy _)     = True
+isFamFreeTy (ExistsTy _ b ty) = isFamFreeTy (varType b) && isFamFreeTy ty
+isFamFreeTy (DepFunTy _ b ty) = isFamFreeTy (varType b) && isFamFreeTy ty
 isFamFreeTy (LitTy {})        = True
-isFamFreeTy (TyConApp tc tys) = all isFamFreeTy tys && isFamFreeTyCon tc
-isFamFreeTy (AppTy a b)       = isFamFreeTy a && isFamFreeTy b
-isFamFreeTy (FunTy _ w a b)   = isFamFreeTy w && isFamFreeTy a && isFamFreeTy b
-isFamFreeTy (ForAllTy _ ty)   = isFamFreeTy ty
+-- coreView has already expanded every saturated synonym. A partial
+-- synonym can expose a redex when the caller supplies another argument.
+isFamFreeTy (TyConApp tc tys) = not (isTypeSynonymTyCon tc)
+                             && isFamFreeTyCon tc && all isFamFreeTy tys
+isFamFreeTy (AppTy a b)       = isMatchableFunTy (typeKind a) && isFamFreeTy a && isFamFreeTy b
+isFamFreeTy (FunTy _ ma w a b) = isFamFreeTy ma && isFamFreeTy w && isFamFreeTy a && isFamFreeTy b
+isFamFreeTy (ForAllTy ma _ ty)  = isFamFreeTy ma && isFamFreeTy ty
 isFamFreeTy (CastTy ty _)     = isFamFreeTy ty
 isFamFreeTy (CoercionTy _)    = False  -- Not sure about this
 
@@ -1868,7 +2076,7 @@ isSatTyFamApp :: Type -> Maybe (TyCon, [Type])
 -- Why saturated?  See (ATF4) in Note [Apartness and type families]
 isSatTyFamApp (TyConApp tc tys)
   |  isTypeFamilyTyCon tc
-  && not (tys `lengthExceeds` tyConArity tc)  -- Not over-saturated
+  && tys `lengthIs` tyConArity tc
   = Just (tc, tys)
 isSatTyFamApp _ = Nothing
 
@@ -1880,9 +2088,11 @@ buildSynTyCon :: Name
 -- This function is here because here is where we have
 --   isFamFree and isTauTy
 buildSynTyCon name kind binders res_kind roles rhs
-  = mkSynonymTyCon name kind binders res_kind roles rhs
-                   is_tau is_fam_free is_forgetful is_concrete
+  = tc
   where
+    tc = mkSynonymTyCon name kind binders res_kind roles rhs eta_rhs
+                        is_tau is_fam_free is_forgetful is_concrete
+    eta_rhs = shortenSynonym tc (reverse (map binderVar binders)) rhs Nothing
     qtvs         = mkVarSet (map binderVar binders)
     is_tau       = isTauTy rhs
     is_fam_free  = isFamFreeTy rhs
@@ -1899,6 +2109,24 @@ buildSynTyCon name kind binders res_kind roles rhs
        --    type Bucket a b c = Key (a,b,c)
        --    type Key x = Any
        -- Here Bucket is definitely forgetful!
+
+-- | Remove trailing parameters that simply forward an argument at the same kind.
+-- See Note [Eta reduction of partial synonyms].
+shortenSynonym :: TyCon -> [TyVar] -> Type -> Maybe ([TyVar], Type) -> Maybe ([TyVar], Type)
+shortenSynonym tc (v:vs) ty _
+  | Just (fun, TyVarTy arg) <- last_arg ty
+  , arg == v, not (v `elemVarSet` tyCoVarsOfType fun)
+  , let supplied = reverse vs
+        args = mkTyVarTys supplied
+  , isPartialTypeFunction tc args
+  , typeKind fun `eqType` piResultTys (tyConKind tc) args
+  = shortenSynonym tc vs fun (Just (supplied, fun))
+  where
+    last_arg (TyConApp head_tc tys)
+      | Just (prefix, a) <- snocView tys = Just (mkTyConApp head_tc prefix, a)
+    last_arg (AppTy f a) = Just (f,a)
+    last_arg _ = Nothing
+shortenSynonym _ _ _ best = best
 
 {-
 ************************************************************************
@@ -2088,20 +2316,42 @@ isPrimitiveType ty = case splitTyConApp_maybe ty of
 -- then j could be a binary join point returning an Int, but it could *not* be a
 -- unary join point returning a -> Int.
 --
+-- See Note [Retained arguments of join points].
 -- TODO: See Note [Excess polymorphism and join points]
 isValidJoinPointType :: JoinArity -> Type -> Bool
-isValidJoinPointType arity ty
-  = valid_under emptyVarSet arity ty
+isValidJoinPointType arity ty = isJust (joinPointResultType arity ty)
+
+-- | Return the type shared by all jumps after consuming the join arguments.
+-- See Note [Retained arguments of join points].
+joinPointResultType :: JoinArity -> Type -> Maybe Type
+joinPointResultType arity ty = valid_under emptyVarSet arity ty
   where
     valid_under tvs arity ty
       | arity == 0
-      = tvs `disjointVarSet` tyCoVarsOfType ty
-      | Just (t, ty') <- splitForAllTyCoVar_maybe ty
+      = if tvs `disjointVarSet` tyCoVarsOfType ty then Just ty else Nothing
+      | Just (_, t, ty') <- splitForAllTyCoVar_maybe ty
       = valid_under (tvs `extendVarSet` t) (arity-1) ty'
-      | Just (_, _, _, res_ty) <- splitFunTy_maybe ty
+      | DepFunTy _ index body <- coreFullView ty
+      = valid_under (tvs `extendVarSet` index) (arity-1) body
+      | Just (_, ma, _, _, res_ty) <- splitFunTy_maybe ty
+      , eqType ma unmatchableDataConTy
+        -- See Note [Ordinary arrow metadata and eta] in GHC.Core.Opt.Arity.
       = valid_under tvs (arity-1) res_ty
       | otherwise
-      = False
+      = Nothing
+
+{- Note [Retained arguments of join points]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A join point can take a runtime index. Later arguments may depend on it.
+For example, an alternative of Stored can produce a join of type
+
+  foreach (b :: Bool) -> Value b -> Stored -> String
+
+Count b as one value argument. Check the return type after consuming all
+join arguments. It must mention none of the locally bound type variables
+or runtime indices, since the jump returns to the caller's context.
+For example, a join that returns Value b after consuming b is invalid.
+-}
 
 {- Note [Excess polymorphism and join points]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2168,6 +2418,8 @@ seqCos   :: [Coercion] -> SeqResult
     folder :: TyCoFolder SeqResult
     folder = TyCoFolder { tcf_view       = noView
                         , tcf_tyvar      = seqUnit
+                        , tcf_termvar    = seqUnit
+                        , tcf_termbinder = \_ x -> x
                         , tcf_covar      = seqUnit
                         , tcf_lit        = seqUnit
                         , tcf_hole       = \h -> seqUnit (coHoleCoVar h)
@@ -2261,12 +2513,787 @@ See #14939.
 -}
 
 -----------------------------
+-- | Test whether a lifted algebraic type has a supported index schema.
+-- See Note [Algebraic runtime index domains].
+isNativeIndexType :: Type -> Bool
+isNativeIndexType = nativeIndexType True
+
+-- | Check a closed structural domain without opaque or retained fields.
+isNativeClosedIndexType :: Type -> Bool
+isNativeClosedIndexType = nativeIndexType False
+
+-- | Test whether a type constructor is a lifted boxed data or newtype constructor
+-- whose underlying representation never unwraps to a @type data@ constructor.
+isLiftedDataOrNewTyCon :: TyCon -> Bool
+isLiftedDataOrNewTyCon = go []
+  where
+    go seen tc
+      | tyConName tc `elem` seen = False
+      | isTypeDataTyCon tc       = False
+      | isBoxedDataTyCon tc      = True
+      | isNewTyCon tc, isLiftedAlgTyCon tc
+      , (_, rhs) <- newTyConRhs tc =
+          case splitTyConApp_maybe rhs of
+            Just (inner_tc, _) | isNewTyCon inner_tc || isTypeDataTyCon inner_tc ->
+              go (tyConName tc : seen) inner_tc
+            _ -> True
+      | otherwise                = False
+
+-- | Check a structural schema or a closed function-free endpoint.
+-- See Note [Function fields in native index domains].
+nativeIndexType :: Bool -> Type -> Bool
+nativeIndexType structural_fields = go []
+  where
+    go path ty
+      | TyConApp tc args <- coreFullView ty
+      , Just previous <- lookup tc path
+      = eqTypes args previous
+      | TyConApp tc args <- coreFullView ty
+      , isVanillaAlgTyCon tc, isLiftedDataOrNewTyCon tc
+      , tyConArity tc == length args
+      , tcIsLiftedTypeKind (typeKind ty)
+      , null (tyConStupidTheta tc)
+      , let cons = tyConDataCons tc
+            package_root = structural_fields && null path && isSingleton cons
+      , (all (tcIsLiftedTypeKind . tyVarKind) (tyConTyVars tc) && all argument args)
+         || (package_root && any dataConHasPromotedRetained cons
+             && and (zipWith (package_argument (tyConTyVars tc) args) (tyConTyVars tc) args))
+      , Just fields <- concat <$> traverse (con_fields package_root ty args) cons
+      = all (field ((tc, args) : path)) fields
+      | otherwise = False
+
+    field path (parameter, ty)
+      | structural_fields
+      , parameter
+      = isNativeOpaqueValueType ty
+      | structural_fields
+      , isNativeStructuralFunctionType ty
+      = True
+      | otherwise
+      = go path ty
+
+    argument arg
+      | structural_fields = isNativeOpaqueValueType arg
+      | otherwise = noFreeVarsOfType arg && isTauTy arg
+                    && isNativeOpaqueValueType arg
+
+    -- A checked root package alone can use an ordinary higher-kinded
+    -- parameter. Its domain may name an earlier type parameter.
+    package_argument parameters actuals tv arg
+      | tcIsLiftedTypeKind (tyVarKind tv) = argument arg
+      | Just (_, _, _, domain, range) <- splitFunTy_maybe (tyVarKind tv)
+      , range `eqType` liftedTypeKind
+      , isNativeClosedIndexType domain || maybe False (`elem` parameters) (getTyVar_maybe domain)
+      = typeKind arg `eqType` substTyWith parameters actuals (tyVarKind tv)
+      | otherwise = False
+
+    con_fields package_root domain args con
+      | package_root
+      -- A witness declared at a type parameter is opaque after instantiation.
+      -- See Note [Abstract witness domains].
+      , dataConHasPromotedRetained con
+      , (univs, [], [], [], _, res) <- dataConFullSig con
+      , univs `equalLength` args
+      , substTyWith univs args res `eqType` domain
+      , null (dataConStupidTheta con)
+      , Nothing <- dataConWrapId_maybe con
+      , witness : payloads <- rep_args
+      = let field_type = substTyWith univs args . scaledThing
+        in Just ((is_parameter (scaledThing witness), field_type witness)
+                 : [(True, field_type payload) | payload <- payloads])
+      | null (dataConRepArgBinders con)
+      , (univs, [], [], [], orig_args, res) <- dataConFullSig con
+      , univs `equalLength` args
+      , all (tcIsLiftedTypeKind . tyVarKind) univs
+      , null (dataConStupidTheta con)
+      , isNewTyCon (dataConTyCon con) || isNothing (dataConWrapId_maybe con)
+      , substTyWith univs args res `eqType` domain
+      , orig_args `equalLength` rep_args
+      , and (zipWith same_field (instantiate orig_args) (instantiate rep_args))
+      = Just (zipWith field_origin orig_args (instantiate rep_args))
+      | otherwise = Nothing
+      where
+        rep_args = dataConRepArgTys con
+        (univs, _, _, _, _, _) = dataConFullSig con
+        instantiate = map (mapScaledType (substTyWith univs args))
+        field_origin (Scaled _ orig) (Scaled _ ty)
+          = (is_parameter orig, ty)
+        is_parameter orig = case coreFullView orig of
+          TyVarTy tv -> tv `elem` univs
+          _         -> False
+
+    same_field (Scaled orig_mult orig) (Scaled rep_mult rep)
+      | closed_mult orig_mult, closed_mult rep_mult
+      = orig `eqType` rep
+      | otherwise = False
+
+    closed_mult ty = case coreFullView ty of
+      OneTy -> True
+      ManyTy -> True
+      _ -> False
+
+-- | Recover the ordinary universal arguments of a supported index constructor.
+-- See Note [Algebraic runtime index domains].
+nativeIndexDataConTyArgs :: Type -> DataCon -> Maybe [Type]
+nativeIndexDataConTyArgs domain con
+  | isNativeIndexType domain
+  , TyConApp tc args <- coreFullView domain
+  , tc == dataConTyCon con
+  = Just args
+  | otherwise = Nothing
+
+-- | Return the lifted argument and result domains of a native head.
+-- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
+nativeIndexFunctionTys_maybe :: Id -> Maybe (Type, Type)
+nativeIndexFunctionTys_maybe f
+  | isNativeNamedOpaqueFunctionId f = nativeIndexFunctionTypeTys_maybe (varType f)
+  | isLocalId f, not (isCoVar f), isManyTy (idMult f)
+  , not (isJoinIdDetails (idDetails f))
+  , noFreeVarsOfType (idMult f)
+  = nativeIndexFunctionTypeTys_maybe (varType f)
+  | otherwise = Nothing
+
+-- | Check a closed, compiled function head without inspecting its body.
+isNativeNamedOpaqueFunctionId :: Id -> Bool
+isNativeNamedOpaqueFunctionId f
+  = isGlobalId f && isManyTy (idMult f)
+    && maybe False (not . isInteractiveModule) (nameModule_maybe (varName f))
+    && noFreeVarsOfType (varType f)
+    && isJust (nativeIndexFunctionTypeTys_maybe (varType f))
+
+-- | Check the ordinary function type shared by heads and retained binders.
+-- See Note [Function-valued retained binders].
+nativeIndexFunctionTypeTys_maybe :: Type -> Maybe (Type, Type)
+nativeIndexFunctionTypeTys_maybe ty
+  | FunTy { ft_af = af, ft_ma = ma, ft_mult = mult, ft_arg = arg, ft_res = res }
+      <- coreFullView ty
+  , af == FTF_T_T, eqType ma unmatchableDataConTy, isManyTy mult
+  , noFreeVarsOfType ma, noFreeVarsOfType mult
+  , isNativeOpaqueValueType arg, isNativeOpaqueValueType res
+  , let endpoint_vars = tyCoVarsOfTypes [arg, res]
+  , not (anyFreeVarsOfType (not . (`elemVarSet` endpoint_vars)) ty)
+  = Just (arg, res)
+  | otherwise = Nothing
+
+-- | Test whether an identifier is an eligible opaque native call head.
+isNativeIndexFunctionId :: Id -> Bool
+isNativeIndexFunctionId = isJust . nativeIndexFunctionTys_maybe
+
+-- | Test whether a local runtime binder has a visible dependent function type
+-- eligible for type-level application via 'TermAppTy'.
+isNativeDepFunctionId :: Id -> Bool
+isNativeDepFunctionId f
+  = isLocalId f && not (isCoVar f)
+    && not (isJoinIdDetails (idDetails f))
+    && isManyTy (idMult f)
+    && case coreFullView (varType f) of
+         DepFunTy DepFunVisible bndr body ->
+           isManyTy (idMult bndr)
+           && isNativeOpaqueValueType (varType bndr)
+           && tcIsLiftedTypeKind (typeKind body)
+         _ -> False
+
+-- | Compute the expected argument domain and instantiated result kind of one
+-- type-level runtime call step across either an ordinary arrow or a visible
+-- dependent function type.
+nativeTypeCallStep_maybe :: Kind -> Type -> Maybe (Kind, Kind)
+nativeTypeCallStep_maybe kind arg
+  | Just (domain, result) <- nativeIndexFunctionTypeTys_maybe kind
+  = Just (domain, result)
+  | DepFunTy DepFunVisible bndr body <- coreFullView kind
+  , isManyTy (idMult bndr)
+  , isNativeOpaqueValueType (varType bndr)
+  , tcIsLiftedTypeKind (typeKind body)
+  = Just (varType bndr, replaceTermVarInType bndr arg body)
+  | otherwise = Nothing
+
+-- | Compute the domain and instantiated result kind of @TermAppTy f arg@.
+nativeTermAppKind_maybe :: Id -> Type -> Maybe (Kind, Kind)
+nativeTermAppKind_maybe f arg
+  | Just (domain, result) <- nativeIndexFunctionTys_maybe f
+  = Just (domain, result)
+  | isNativeDepFunctionId f
+  , DepFunTy DepFunVisible bndr body <- coreFullView (varType f)
+  = Just (varType bndr, replaceTermVarInType bndr arg body)
+  | otherwise = Nothing
+
+-- | Recover the lexical head, its checked arguments, and the final result kind.
+-- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
+nativeCallSpine_maybe :: Type -> Maybe (Id, [Type], Kind)
+nativeCallSpine_maybe ty = do
+    (f, args, result) <- collect ty
+    pure (f, reverse args, result)
+  where
+    collect (TermAppTy f arg)
+      | Just (domain, result) <- nativeTermAppKind_maybe f arg
+      , typeKind arg `eqType` domain
+      = Just (f, [arg], result)
+    collect (AppTy fun arg) = do
+      (f, args, kind) <- collect fun
+      (domain, result) <- nativeTypeCallStep_maybe kind arg
+      (f, arg : args, result) <$ guard (typeKind arg `eqType` domain)
+    collect (CastTy prefix co) = do
+      (f, args, kind) <- collect prefix
+      let target = coercionRKind co
+          valid_target = isJust (nativeIndexFunctionTypeTys_maybe target)
+            || case coreFullView target of
+                 DepFunTy DepFunVisible b r ->
+                   isManyTy (idMult b) && isNativeOpaqueValueType (varType b)
+                   && tcIsLiftedTypeKind (typeKind r)
+                 _ -> False
+      guard (coercionRole co == Nominal && coercionLKind co `eqType` kind && valid_target)
+      pure (f, args, target)
+    collect _ = Nothing
+
+-- | Check a function field in a structural index schema.
+-- See Note [Function fields in native index domains].
+isNativeStructuralFunctionType :: Type -> Bool
+isNativeStructuralFunctionType ty
+  = noFreeVarsOfType ty
+    && case nativeIndexFunctionTypeTys_maybe ty of
+         Just (arg, res) -> isNativeClosedIndexType arg && isNativeClosedIndexType res
+         Nothing -> False
+
+{- Note [Primitive family pattern binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A closed type family equation can match the field of promoted I#, W#, or C#.
+It binds an erased Int#, Word#, or Char# index only in the matching immediate
+constructor field. The binder cannot occur in the right-hand side.
+These rules permit matching a known constructor application and leave a
+neutral Int, Word, or Char stuck.
+
+The axiom binds the variable without introducing a ForAllTy. The ordinary
+FORALL1 rule and runtime index readback keep their existing scope. See
+GHC.Tc.Gen.HsType for source binding and GHC.Core.Lint for axiom checking.
+-}
+
+-- | Return the scope-restricted field kind of a promoted constructor.
+-- See Note [Primitive family pattern binders].
+primFamilyPatFieldKind :: Name -> Maybe Kind
+primFamilyPatFieldKind con
+  | con `hasKey` intDataConKey  = Just intPrimTy
+  | con `hasKey` wordDataConKey = Just wordPrimTy
+  | con `hasKey` charDataConKey = Just charPrimTy
+  | otherwise = Nothing
+
+-- | Test the kinds that require the closed-family field scope check.
+isPrimFamilyPatBinderKind :: Kind -> Bool
+isPrimFamilyPatBinderKind kind
+  = kind `eqType` intPrimTy
+    || kind `eqType` wordPrimTy
+    || kind `eqType` charPrimTy
+
+-- | Test whether a kind has an invisible constraint arrow along its Pi spine.
+hasConstraintPremise :: Type -> Bool
+hasConstraintPremise (ForAllTy _ _ rest) = hasConstraintPremise rest
+hasConstraintPremise (FunTy af _ _ _ rest)
+  = isInvisibleFunArg af || hasConstraintPremise rest
+hasConstraintPremise _ = False
+
+-- | Check the scope of a raw field variable in a closed family axiom.
+isPrimFamilyPatBinder :: [Type] -> Type -> TyVar -> Bool
+isPrimFamilyPatBinder pats rhs var
+  = isTyVar var && any prim_pattern pats
+    && all (\pat -> prim_pattern pat || not (occurs_in pat)) pats
+    && not (occurs_in rhs)
+  where
+    occurs_in ty = var `elemVarSet` tyCoVarsOfType ty
+    prim_pattern (TyConApp tc [TyVarTy field])
+      | Just kind <- primFamilyPatFieldKind (tyConName tc)
+      = field == var && varType var `eqType` kind
+    prim_pattern _ = False
+
+-- | Test whether a type can classify an opaque runtime value index.
+-- See Note [Opaque runtime index values].
+isNativeOpaqueValueType :: Type -> Bool
+isNativeOpaqueValueType = tcIsLiftedTypeKind . typeKind
+
+-- | Test the metadata of an opaque local runtime value.
+-- The caller must check its actual lexical binding.
+-- See Note [Opaque runtime index values].
+isNativeOpaqueValueId :: Id -> Bool
+isNativeOpaqueValueId v
+  = isLocalId v && not (isCoVar v)
+    && not (isJoinIdDetails (idDetails v))
+    && isMultiplicityTy (typeKind (idMult v))
+    && isNativeOpaqueValueType (varType v)
+
+-- | A local unrestricted class dictionary eligible for a dependent binder.
+isNativeClassDictionaryId :: Id -> Bool
+isNativeClassDictionaryId v
+  = isLocalId v && not (isCoVar v) && not (isJoinIdDetails (idDetails v))
+    && isManyTy (idMult v)
+    && case coreFullView (varType v) of
+         TyConApp tc _ -> isJust (tyConClass_maybe tc)
+         _ -> False
+
+-- | Mark an invisible retained @foreach {x}.@ binder with 'InferredSpec'.
+--
+-- Store the specificity bit in 'IdInfo' rather than 'ExportFlag' so Core Lint
+-- accepts nested 'DepFunTy' binders without treating them as exported Ids.
+markInferredRetainedBinder :: Id -> Id
+markInferredRetainedBinder v =
+  lazySetIdInfo v (setInferredRetainedIdInfo True (idInfo v))
+
+-- | Test whether an invisible retained @foreach@ binder has 'InferredSpec'.
+isInferredRetainedBinder :: Id -> Bool
+isInferredRetainedBinder = inferredRetainedIdInfo . idInfo
+
+-- | Mark a retained constructor field binder with 'DepFunInvisible'.
+markInvisibleRetainedBinder :: Id -> Id
+markInvisibleRetainedBinder v =
+  lazySetIdInfo v (setInvisibleRetainedIdInfo True (idInfo v))
+
+-- | Test whether a retained constructor field binder has 'DepFunInvisible'.
+isInvisibleRetainedBinder :: Id -> Bool
+isInvisibleRetainedBinder = invisibleRetainedIdInfo . idInfo
+
+-- | Replace occurrences of a provisional 'TermVarTy' binder inside a 'Type'.
+replaceTermVarInType :: Id -> Type -> Type -> Type
+replaceTermVarInType target replacement ty0
+  | not (mentions ty0) = ty0
+  | otherwise          = go ty0
+  where
+    mentions (TermVarTy v)             = v == target || mentions_id v
+    mentions (TermAppTy v arg)         = v == target || mentions_id v || mentions arg
+    mentions (ClassAppTy _ inst dict arg kind)
+      = mentions inst || mentions dict || mentions arg || mentions kind
+    mentions (DepFunTy _ b body)       = b /= target && (mentions_id b || mentions body)
+    mentions (DepDictTy d body)        = d /= target && (mentions_id d || mentions body)
+    mentions (ExistsTy _ v body)       = mentions (varType v) || mentions body
+    mentions (ForAllTy ma (Bndr v _) body)
+      = mentions ma || mentions (varType v) || mentions body
+    mentions (FunTy _ ma mult arg res)
+      = mentions ma || mentions mult || mentions arg || mentions res
+    mentions (AppTy f a)               = mentions f || mentions a
+    mentions (TyConApp _ tys)          = any mentions tys
+    mentions (CastTy ty co)            = mentions ty || mentions_co co
+    mentions (CoercionTy co)           = mentions_co co
+    mentions TyVarTy{}                 = False
+    mentions LitTy{}                   = False
+
+    mentions_id v = mentions (varType v) || mentions (idMult v)
+
+    mentions_mco MRefl   = False
+    mentions_mco (MCo c) = mentions_co c
+
+    mentions_co (Refl ty)              = mentions ty
+    mentions_co (GRefl _ ty mco)       = mentions ty || mentions_mco mco
+    mentions_co (TyConAppCo _ _ cos)   = any mentions_co cos
+    mentions_co (AppCo c1 c2)          = mentions_co c1 || mentions_co c2
+    mentions_co (TermAppCo v c)        = mentions_id v || mentions_co c
+    mentions_co (ForAllCo { fco_tcv = v, fco_ma = ma, fco_kind = kc, fco_body = bc })
+      = mentions (varType v) || mentions_co ma || mentions_mco kc || mentions_co bc
+    mentions_co (DepFunCo _ _ b kc bc) = mentions_id b || mentions_mco kc || mentions_co bc
+    mentions_co (FunCo _ _ _ mc wc c1 c2)
+      = mentions_co mc || mentions_co wc || mentions_co c1 || mentions_co c2
+    mentions_co (CoVarCo cv)           = mentions (varType cv)
+    mentions_co (AxiomCo _ cos)        = any mentions_co cos
+    mentions_co (UnivCo { uco_lty = t1, uco_rty = t2 }) = mentions t1 || mentions t2
+    mentions_co (SymCo c)              = mentions_co c
+    mentions_co (TransCo c1 c2)        = mentions_co c1 || mentions_co c2
+    mentions_co (SelCo _ c)            = mentions_co c
+    mentions_co (LRCo _ c)             = mentions_co c
+    mentions_co (InstCo c1 c2)         = mentions_co c1 || mentions_co c2
+    mentions_co (KindCo c)             = mentions_co c
+    mentions_co (SubCo c)              = mentions_co c
+    mentions_co HoleCo{}               = False
+
+    go (TermVarTy v)
+      | v == target = replacement
+      | otherwise   = TermVarTy (go_id v)
+    go (TermAppTy v arg)
+      | v == target = mkAppTy replacement (go arg)
+      | otherwise   = TermAppTy (go_id v) (go arg)
+    go (ClassAppTy sel inst dict arg kind)
+      = ClassAppTy sel (go inst) (go dict) (go arg) (go kind)
+    go (DepFunTy vis b body)
+      | b == target = DepFunTy vis b body
+      | otherwise   = mkDepFunTyWithVis vis (go_id b) (go body)
+    go (DepDictTy d body)
+      | d == target = DepDictTy d body
+      | otherwise   = DepDictTy (go_id d) (go body)
+    go (ExistsTy flag v body)
+      = ExistsTy flag (go_tcv v) (go body)
+    go (ForAllTy ma (Bndr v flag) body)
+      = ForAllTy (go ma) (Bndr (go_tcv v) flag) (go body)
+    go (FunTy af ma mult arg res)
+      = FunTy af (go ma) (go mult) (go arg) (go res)
+    go (AppTy f a) = mkAppTy (go f) (go a)
+    go (TyConApp tc tys) = mkTyConApp tc (map go tys)
+    go (CastTy ty co) = mkCastTy (go ty) (go_co co)
+    go (CoercionTy co) = CoercionTy (go_co co)
+    go ty@TyVarTy{} = ty
+    go ty@LitTy{} = ty
+
+    go_id v
+      | not (mentions_id v) = v
+      | otherwise           = setIdMult (setVarType v (go (varType v))) (go (idMult v))
+
+    go_tcv v
+      | not (mentions (varType v)) = v
+      | otherwise                  = setVarType v (go (varType v))
+
+    go_mco MRefl = MRefl
+    go_mco (MCo c) = MCo (go_co c)
+
+    go_co co | not (mentions_co co) = co
+    go_co (Refl ty) = Refl (go ty)
+    go_co (GRefl r ty mco) = GRefl r (go ty) (go_mco mco)
+    go_co (TyConAppCo r tc cos) = TyConAppCo r tc (map go_co cos)
+    go_co (AppCo c1 c2) = AppCo (go_co c1) (go_co c2)
+    go_co (TermAppCo v c) = TermAppCo (go_id v) (go_co c)
+    go_co (ForAllCo { fco_tcv = v, fco_visL = vl, fco_visR = vr, fco_ma = ma, fco_kind = kc, fco_body = bc })
+      = ForAllCo { fco_tcv = go_tcv v
+                 , fco_visL = vl, fco_visR = vr
+                 , fco_ma = go_co ma, fco_kind = go_mco kc, fco_body = go_co bc }
+    go_co (DepFunCo vl vr b kc bc)
+      = DepFunCo vl vr (go_id b) (go_mco kc) (go_co bc)
+    go_co (FunCo r af1 af2 mc wc c1 c2)
+      = FunCo r af1 af2 (go_co mc) (go_co wc) (go_co c1) (go_co c2)
+    go_co (CoVarCo cv) = CoVarCo (go_tcv cv)
+    go_co (AxiomCo ax cos) = AxiomCo ax (map go_co cos)
+    go_co (UnivCo { uco_prov = p, uco_role = r, uco_lty = t1, uco_rty = t2, uco_deps = ds })
+      = UnivCo { uco_prov = p, uco_role = r, uco_lty = go t1, uco_rty = go t2, uco_deps = ds }
+    go_co (SymCo c) = SymCo (go_co c)
+    go_co (TransCo c1 c2) = TransCo (go_co c1) (go_co c2)
+    go_co (SelCo s c) = SelCo s (go_co c)
+    go_co (LRCo lr c) = LRCo lr (go_co c)
+    go_co (InstCo c1 c2) = InstCo (go_co c1) (go_co c2)
+    go_co (KindCo c) = KindCo (go_co c)
+    go_co (SubCo c) = SubCo (go_co c)
+    go_co c@HoleCo{} = c
+
+-- | Check nominal index-conversion endpoints without checking the evidence.
+-- Eligible native function heads retain their complete fixed type.
+-- See Note [Opaque runtime index values].
+isNativeIndexDomainConversion :: Type -> Type -> Bool
+isNativeIndexDomainConversion source target
+  = isNativeOpaqueValueType source && isNativeOpaqueValueType target
+    && (not (fixed_function source || fixed_function target) || source `eqType` target)
+  where
+    fixed_function = isJust . nativeIndexFunctionTypeTys_maybe
+
+{- Note [Opaque runtime index values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An opaque index records the identity of an actual local Many value Id. Its
+type must have kind Type, not Constraint or an unlifted kind. Keep its complete
+type, Name and Unique. The type can contain outer erased variables and earlier
+runtime indices. The caller must check that scope and the binding's actual
+metadata. Do not inspect the value's RHS or its constructors.
+
+Opaque identity does not require a structural domain. A parameter field of
+List a stays opaque when a becomes Int, IO Int or Vec Int n. The list tail
+still has the structural domain List a. Derive that distinction from the
+original constructor telescope. See Note [Algebraic runtime index domains].
+
+Opaque identity does not grant native call permission. Check the arrow and
+result in nativeIndexFunctionTypeTys_maybe. A nominal value
+conversion can change an opaque domain. If either endpoint has an eligible
+native function type, require the same complete type at both endpoints.
+Other function values can remain opaque fields. The conversion predicate
+checks endpoints only; its caller must retain nominal evidence and direction.
+
+Core retained value binders and occurrences use the opaque Id judgment.
+Source foreach roots use isNativeRetainedBinder instead. See
+Note [Opaque algebraic retained binders] and Note [Abstract witness domains].
+Both checks leave scope and nominal domain equality to their callers.
+-}
+
+-- | Test whether a local unrestricted identifier has a supported index domain.
+isNativeIndexId :: Id -> Bool
+isNativeIndexId v
+  = isNativeOpaqueValueId v && isNativeIndexType (varType v)
+
+-- | Test whether an Id can bind a source value index or a fixed call head.
+-- See Note [Opaque algebraic retained binders].
+isNativeRetainedBinder :: Id -> Bool
+isNativeRetainedBinder v
+  = (isNativeOpaqueValueId v && isNativeAlgebraicOrAbstractDomain (varType v))
+    || isNativeIndexFunctionId v
+
+-- | Test a source retained-root domain without constructing a temporary Id.
+-- See Note [Opaque algebraic retained binders].
+isNativeRetainedBinderType :: Type -> Bool
+isNativeRetainedBinderType ty
+  = (isNativeOpaqueValueType ty && isNativeAlgebraicOrAbstractDomain ty)
+    || isJust (nativeIndexFunctionTypeTys_maybe ty)
+
+-- | Check the Id stored in a retained constructor field telescope.
+-- See Note [Opaque algebraic retained binders].
+isNativeRetainedField :: Id -> Bool
+isNativeRetainedField v
+  = isNativeOpaqueValueId v && isManyTy (idMult v)
+    && (isNativeIndexType ty || isNativeIndexedFieldDomain ty || isTyVarTy ty
+        || isNativeRetainedFieldFunctionType ty)
+  where
+    ty = varType v
+
+-- | Check the domain of a retained constructor field before making its Id.
+-- See Note [Opaque algebraic retained binders].
+isNativeRetainedFieldType :: Type -> Bool
+isNativeRetainedFieldType ty
+  = isNativeIndexType ty || isNativeIndexedFieldDomain ty
+    || isNativeRetainedFieldFunctionType ty
+    || (isTyVarTy ty && isNativeOpaqueValueType ty)
+
+-- | Test whether a lifted algebraic type is a lazy indexed GADT domain
+-- eligible as a retained constructor field or result.
+-- Callers with full 'DataCon' access also enforce 'isNativeIndexedGadtCon'.
+isNativeIndexedFieldDomain :: Type -> Bool
+isNativeIndexedFieldDomain ty
+  | TyConApp tc args <- coreFullView ty
+  , isVanillaAlgTyCon tc, isBoxedDataTyCon tc
+  , not (isTypeDataTyCon tc), null (tyConStupidTheta tc)
+  , tyConArity tc == length args
+  , tcIsLiftedTypeKind (typeKind ty)
+  = all indexed_con (tyConDataCons tc)
+  | otherwise = False
+  where
+    indexed_con dc
+      | null (dataConRepArgBinders dc)
+      , (_, exs, specs, [], fields, _) <- dataConFullSig dc
+      , all isTyVar exs, null (dataConStupidTheta dc)
+      , let rep_tys = dataConRepArgTys dc
+      , rep_tys `lengthIs` (length specs + length fields)
+      , all (\(Scaled mult field_ty) ->
+               (isOneTy mult || isManyTy mult)
+               && isNativeOpaqueValueType field_ty) fields
+      , all (isNativeOpaqueValueType . scaledThing) (drop (length specs) rep_tys)
+      = True
+      | otherwise = False
+
+-- | Check a retained function field over closed or abstract endpoints.
+-- See Note [Abstract witness domains].
+isNativeRetainedFieldFunctionType :: Type -> Bool
+isNativeRetainedFieldFunctionType ty
+  | Just (arg, res) <- nativeIndexFunctionTypeTys_maybe ty
+  , isTyVarTy arg, isTyVarTy res
+  = True
+  | otherwise = isNativeStructuralFunctionType ty
+
+-- | Test an opaque value domain after expanding synonyms.
+-- The caller checks the full domain's lifted kind.
+isNativeAlgebraicOrAbstractDomain :: Type -> Bool
+isNativeAlgebraicOrAbstractDomain ty
+  = tcIsLiftedTypeKind (typeKind ty)
+    && not (is_type_data_domain [] ty)
+    && valid_arrow_endpoints ty
+  where
+    valid_arrow_endpoints t = case coreFullView t of
+      FunTy { ft_af = FTF_T_T, ft_arg = arg, ft_res = res } ->
+        isNativeOpaqueValueType arg && isNativeOpaqueValueType res
+      _ -> True
+
+    is_type_data_domain seen t = case coreFullView t of
+      TyConApp tc _
+        | isTypeDataTyCon tc -> True
+        | getUnique tc `elem` seen -> False
+        | Just (_, rhs, _) <- unwrapNewTyConEtad_maybe tc ->
+            is_type_data_domain (getUnique tc : seen) rhs
+      _ -> False
+
+{- Note [Opaque algebraic retained binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained binder at a lifted type parameter can already instantiate that
+parameter to Vec a n. Allow the same opaque binder when the signature names
+that domain directly:
+
+  vectorIdentity :: foreach (xs :: Vec a n) -> xs :~: xs
+
+The result mentions the local Id. Binding that Id uses the domain's type
+and requires no traversal of its constructors or their equalities. Use
+the saturated, lifted boxed data head. A synonym can expand to such a head.
+The same rule applies to a saturated data family application of kind Type.
+The binder uses the public type without selecting its representation.
+A data family can have additional arguments after its declared arity.
+
+The binder does not reify constructors as indices. Constructor
+reification and structural matching still require isNativeIndexType.
+Function calls still use the fixed head check in
+Note [Function-valued retained binders].
+
+A named constructor field remains subject to the structural domain policy.
+Its checked telescope can also supply the fields of a promoted retained
+constructor. Keep the existing abstract witness and fixed function cases.
+That policy rejects a structural cycle through an unsupported retained
+telescope. The value-binder check only uses the outer lifted data head.
+Use the field predicate in source and interface constructor checking and
+when building DataCon metadata.
+
+Agda's checkPiTelescope checks the domain and extends the context for the
+result (Norell, 2007; GHC Proposal #378, §4.6). The GHC binder preserves the
+runtime argument and its laziness. Two distinct binders at the same domain
+still name distinct values.
+-}
+
+{- Note [Abstract witness domains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the constructor
+
+  Pair :: foreach (x :: a) -> p x -> DPair a p
+
+the type parameter a has kind Type. The second field refers to the
+identity of x. It needs neither the constructors of a nor an equation
+for x. Check the witness as an unrestricted local Id at this domain.
+Keep the existing checks for constructor refinement and for call heads.
+
+When matching Pair at a concrete type, the declaration has already
+established which field binds x. For example, matching a DPair Int p
+binds a local Int witness. Check the instantiated field as an opaque Id.
+Requiring Int to be a structural index domain here would prevent an
+ordinary client from opening that package.
+
+Iso a b can store an ordinary function from a to b as a retained field.
+Both endpoints are lifted erased type parameters. The existing native
+call judgement checks the arrow and records the identity of the field.
+A later proof can use the field as a call head. Neither constructor
+validation nor interface loading needs to inspect the endpoint schemas.
+The structural index judgement still uses closed function endpoints.
+-}
+
+{- Note [Function fields in native index domains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An algebraic index can contain an eligible opaque function field.
+For example, Maybe (Bool -> Bool) has a Nothing alternative and a Just field
+with a closed ordinary U/Many arrow. Keep all other algebraic-domain checks.
+The function remains a runtime Id. Its TermVarTy records identity without
+evaluating the function or comparing its behavior.
+
+A structural function field requires independently closed function-free
+argument and result domains. A call to a lexical function can have an
+opaque lifted result. See Note [Function-valued retained binders].
+nativeIndexType False checks every instantiated field structurally. It
+requires closed monotype parameters and disables opaque parameter fields.
+Do not use the broader predicate for these checks. A datatype such as
+
+  data Loop = Loop (Bool -> Loop)
+
+would then restart eligibility checking through its function result.
+The function-free endpoint check rejects Loop without this recursive restart.
+This restriction is separate from regular algebraic recursion.
+
+Use isNativeOpaqueValueId for TermVarTy occurrences. isNativeIndexId still
+checks algebraic-root identifiers. The source retained-binder predicate also
+checks local U/Many function heads and their complete fixed types. See
+Note [Native function-value application] in GHC.Core.TyCo.Make for application
+and forward evidence.
+-}
+
+{- Note [Function-valued retained binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A source foreach root can bind an opaque algebraic or abstract value,
+or an eligible opaque call head. Core retained value binders use the
+opaque Id judgment. See Note [Opaque runtime index values].
+The function head has an ordinary visible Many arrow A -> B. Both endpoints
+have kind Type and can mention outer binders. For example, given f :: a -> b,
+the opaque index f x has kind b. Substituting IO Int for b changes the kind
+of the index. It does not run an IO action or inspect the result. A structural
+function field checks both endpoints separately. The head Id is local,
+unrestricted, and not a join point.
+
+A bound function can occur in TermAppTy, TermAppCo, or TermVarTy. Its
+argument is an eligible local Id, possibly cast with nominal evidence
+between two eligible arrow types. For example, a closed family equation
+can cast Bool -> Bool -> Ordering to Input 'True -> Bool -> Ordering.
+Preserve the actual Id and its complete type.
+Keep the cast on a whole function occurrence. For a call, mkAppTy uses
+decomposePiCos to cast the operand from the target arrow's input to the
+actual arrow's input. The residual cast acts on the call result.
+TermAppCo uses AppCo over the cast head and keeps the argument proof nominal.
+Scoped selector receivers still require a bare variable.
+
+DepFunCo keeps eligible call-head domains unchanged. See Note
+[Retained dependent function coercions] in GHC.Core.TyCo.Rep.
+
+The binder scopes over calls in the result and its proofs. Existing runtime
+binder renaming masks outer substitutions and avoids capture in both places.
+The function argument remains a lazy runtime argument. A type occurrence does
+not force it or add a runtime use. No function equality or inverse call rule
+follows from this binder policy.
+
+See Norell (2007) and GHC Proposal #378 (§4.7) on neutral function-head calls
+under dependent binders.
+-}
+
+{- Note [Algebraic runtime index domains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A structural runtime index has a lifted algebraic data type. Inspect ordinary
+TyCons and DataCons; Nat has no wired identity. Its ordinary universal arguments
+must have kind Type. They can contain outer erased variables and earlier
+runtime indices. The caller checks their full types and scope.
+
+Check the original constructor telescope before instantiating its universals.
+A field that expands to one of those universal variables is an opaque parameter
+field. Require only a lifted value type after instantiation. Thus the cons head
+stays opaque at Int or Vec Int n. Do not inspect Int's unlifted field or Vec's
+constructors. The cons tail List a is a structural field. A nested Maybe a
+uses Maybe's own constructor telescope. Keep structural traversal for fixed
+concrete fields. A datatype with a fixed Int field need not be a structural
+root for its values to occur opaquely in a list. No stored flag is needed.
+
+Other fields retain the existing structural or eligible function-leaf policy.
+Check the instantiated original and representation fields for exact agreement.
+The strict function endpoint mode disables parameter opacity and still requires
+closed monotypes. See Note [Function fields in native index domains].
+
+Track full datatype applications along the active path. A return to the same
+TyCon must have nominally equal arguments. Use ordinary eqType, which requires
+a SOURCE import because type comparison uses this module. Separate siblings can
+use different instances. This uniform-recursion rule admits List Bool and
+mutually recursive uniform domains. It rejects growing arguments and parameter
+permutations. It does not assume finite or total runtime values.
+
+Reject existential variables, constructor constraints, datatype
+contexts, newtypes, type data, and wrappers. Inspect retained field metadata
+before the full signature. A recursive interface field can otherwise force the
+same domain thunk which is already being checked.
+
+A structural root may have one constructor with a checked promoted witness
+telescope. Require a closed ordinary structural type for its witness, as in
+Note [Promoting one retained witness] in GHC.Core.DataCon. This check excludes
+retained fields when inspecting the witness domain itself. The dependent
+payload is opaque to structural inspection, since the promoted telescope
+checks its exact kind. Do not admit retained constructors in nested
+structural fields or in strict function endpoints.
+
+Original and representation fields must have the same complete domain. Thus a
+promoted constructor's arguments match
+its worker's runtime fields. In particular, do not promote an unpacked payload as
+if it were the original boxed field. Constructor field multiplicities may be One
+or Many; the retained identifier itself must be unrestricted.
+
+Agda's constructor indices and refined field context are the precedent
+(Cockx and Abel, ICFP 2018; Weirich et al., ICFP 2017). The schema and worker
+restrictions bound this implementation; they are not Agda language restrictions.
+Haskell fields can be partial or cyclic. Do not use termination or finite-tree
+apartness to compare opaque runtime indices.
+-}
+
+-- | Test whether an identifier can occur as a retained Boolean index.
+isBoolIndexId :: Id -> Bool
+isBoolIndexId v
+  | isLocalId v, not (isCoVar v)
+  , TyConApp tc [] <- coreFullView (varType v)
+  , tc `hasKey` boolTyConKey
+  , ManyTy <- coreFullView (idMult v)
+  = True
+  | otherwise = False
+
 typeKind :: HasDebugCallStack => Type -> Kind
 -- No need to expand synonyms
 typeKind (TyConApp tc tys)      = piResultTys (tyConKind tc) tys
 typeKind (LitTy l)              = typeLiteralKind l
 typeKind (FunTy { ft_af = af }) = liftedTypeOrConstraintKind (funTyFlagResultTypeOrConstraint af)
 typeKind (TyVarTy tyvar)        = tyVarKind tyvar
+typeKind (TermAppTy f arg)      = case nativeTermAppKind_maybe f arg of
+  Just (_, res) -> res
+  Nothing -> pprPanic "typeKind: invalid native function" (ppr f <+> ppr arg)
+typeKind (TermVarTy v)          = varType v
+typeKind (ExistsTy {})           = liftedTypeKind
+typeKind (DepFunTy {})          = liftedTypeKind
+typeKind (DepDictTy {})         = liftedTypeKind
+typeKind (ClassAppTy _ _ _ _ kind) = kind
 typeKind (CastTy _ty co)        = coercionRKind co
 typeKind (CoercionTy co)        = coercionType co
 
@@ -2292,7 +3319,8 @@ typeKind ty@(ForAllTy {})
       Just k' | all isTyVar tcvs -> k'                     -- Rule (FORALL1)
               | otherwise        -> lifted_kind_from_body  -- Rule (FORALL2)
   where
-    (tcvs, body) = splitForAllTyCoVars ty  -- Important: splits both TyVar and CoVar binders
+    (annotated_tcvs, body) = splitForAllTyCoVars ty
+    tcvs = map snd annotated_tcvs  -- Important: splits both TyVar and CoVar binders
     body_kind    = typeKind body
 
     lifted_kind_from_body  -- Implements (FORALL2)
@@ -2398,13 +3426,15 @@ returnsConstraintKind :: Kind -> Bool
 --         forall k. k -> Constraint
 returnsConstraintKind kind
   | Just kind' <- coreView kind = returnsConstraintKind kind'
-returnsConstraintKind (ForAllTy _ ty)         = returnsConstraintKind ty
+returnsConstraintKind (ForAllTy _ _ ty)         = returnsConstraintKind ty
 returnsConstraintKind (FunTy { ft_res = ty }) = returnsConstraintKind ty
 returnsConstraintKind kind                    = isConstraintLikeKind kind
 
 --------------------------
 typeLiteralKind :: TyLit -> Kind
 typeLiteralKind (NumTyLit {}) = naturalTy
+typeLiteralKind (IntPrimTyLit {}) = intPrimTy
+typeLiteralKind (WordPrimTyLit {}) = wordPrimTy
 typeLiteralKind (StrTyLit {}) = typeSymbolKind
 typeLiteralKind (CharTyLit {}) = charTy
 
@@ -2422,7 +3452,7 @@ typeHasFixedRuntimeRep = go
       | tcHasFixedRuntimeRep tc = True
     go (FunTy {})               = True
     go (LitTy {})               = True
-    go (ForAllTy _ ty)          = go ty
+    go (ForAllTy _ _ ty)          = go ty
     go ty                       = isFixedRuntimeRepKind (typeKind ty)
 
 -- | Checks that a kind of the form 'Type', 'Constraint'
@@ -2454,10 +3484,16 @@ isConcreteTypeWith :: TyVarSet -> Type -> Bool
 isConcreteTypeWith conc_tvs = go
   where
     go (TyVarTy tv)        = isConcreteTyVar tv || tv `elemVarSet` conc_tvs
+    go (ClassAppTy {})     = False
+    go (DepDictTy {})      = False
+    go (TermAppTy {})      = False
+    go (TermVarTy _)       = False
+    go (DepFunTy {})       = False
+    go (ExistsTy {})       = False
     go (AppTy ty1 ty2)     = go ty1 && go ty2
     go (TyConApp tc tys)   = go_tc tc tys
     go ForAllTy{}          = False
-    go (FunTy _ w t1 t2)   =  go w
+    go (FunTy _ ma w t1 t2) = go ma && go w
                            && go (typeKind t1) && go t1
                            && go (typeKind t2) && go t2
     go LitTy{}             = True
@@ -2816,7 +3852,7 @@ isLinearType :: Type -> Bool
 -- this function to check whether it is safe to eta reduce an Id in CorePrep. It
 -- is always safe to return 'True', because 'True' deactivates the optimisation.
 isLinearType ty = case ty of
-                      FunTy _ ManyTy _ res -> isLinearType res
-                      FunTy _ _ _ _        -> True
-                      ForAllTy _ res       -> isLinearType res
+                      FunTy _ _ ManyTy _ res -> isLinearType res
+                      FunTy _ _ _ _ _      -> True
+                      ForAllTy _ _ res       -> isLinearType res
                       _ -> False

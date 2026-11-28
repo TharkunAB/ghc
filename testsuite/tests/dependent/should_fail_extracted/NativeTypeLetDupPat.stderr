@@ -1,0 +1,6 @@
+NativeTypeLetDupPat.hs:3:24: error: [GHC-50547]
+    The pattern in this type let binds ‘x’ twice.
+
+NativeTypeLetDupPat.hs:4:31: error: [GHC-50547]
+    The pattern in this type let binds ‘x’ twice.
+

@@ -18,7 +18,7 @@ module GHC.ThToHs
    ( convertToHsExpr
    , convertToPat
    , convertToHsDecls
-   , convertToHsType
+   , convertToHsType, convertToHsTypeWithIndices
    , thRdrNameGuesses
    )
 where
@@ -26,6 +26,7 @@ where
 import GHC.Prelude hiding (init, last, tail)
 
 import GHC.Hs as Hs
+import qualified GHC.Hs.Decls as HsDecls
 import GHC.Tc.Errors.Types
 import GHC.Types.Name.Cache
 import GHC.Types.Name.Reader
@@ -54,12 +55,13 @@ import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.LanguageExtensions as LangExt
 
 import qualified Data.ByteString as BS
-import Control.Monad( unless )
+import Control.Monad( forM, unless, when )
 import Data.Bifunctor (first)
 import Data.Foldable (for_)
+import Data.List (isPrefixOf)
 import Data.List.NonEmpty( NonEmpty (..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
-import Data.Maybe( catMaybes, maybeToList, isNothing )
+import Data.Maybe( catMaybes, isJust, isNothing )
 import Data.Word (Word64)
 import GHC.Boot.TH.Syntax as TH
 import Foreign.ForeignPtr
@@ -91,15 +93,31 @@ convertToPat exts origin loc p
   = initCvt exts origin loc $ wrapMsg (ConvPat p) $ cvtPat p
 
 convertToHsType :: EnumSet LangExt.Extension -> Origin -> SrcSpan -> TH.Type -> Either RunSpliceFailReason (LHsType GhcPs)
-convertToHsType exts origin loc t
-  = initCvt exts origin loc $ wrapMsg (ConvType t) $ cvtType t
+convertToHsType = convertToHsTypeWithIndices []
+
+-- | Convert a type splice in the scope of these exact retained binders.
+convertToHsTypeWithIndices
+  :: [Name.Name] -> EnumSet LangExt.Extension -> Origin -> SrcSpan -> TH.Type
+  -> Either RunSpliceFailReason (LHsType GhcPs)
+convertToHsTypeWithIndices names exts origin loc t
+  = initCvtWithIndices (concatMap aliases names) exts origin loc $
+      wrapMsg (ConvType t) (cvtType t)
+  where
+    -- A quotation uses NameL. lookupValueName uses NameU for the same binder.
+    -- Resolve both to the original runtime Name.
+    aliases name =
+      let occ = OccName.occNameString (Name.nameOccName name)
+          key = toInteger (getKey (getUnique name))
+          rdr = nameRdrName name
+      in [(TH.mkNameL occ key, rdr), (TH.mkNameU occ key, rdr)]
 
 -------------------------------------------------------------------
 
 -- Reader context for CvtM
 data CvtCtx =
   CvtCtx { cvt_origin :: !Origin
-         , cvt_listTuplePuns :: !Bool }
+         , cvt_listTuplePuns :: !Bool
+         , cvt_retained_indices :: [(TH.Name, RdrName)] }
 
 -- State of CvtM
 type CvtSt = SrcSpan
@@ -137,9 +155,15 @@ mapCvtMError :: (err1 -> err2) -> CvtM' err1 a -> CvtM' err2 a
 mapCvtMError f m = CvtM $ \origin loc -> first f $ unCvtM m origin loc
 
 initCvt :: EnumSet LangExt.Extension -> Origin -> SrcSpan -> CvtM' err a -> Either err a
-initCvt exts origin loc m = fmap fst (unCvtM m ctx loc)
+initCvt = initCvtWithIndices []
+
+-- | Seed conversion with exact runtime names that the renamer already bound.
+initCvtWithIndices :: [(TH.Name, RdrName)] -> EnumSet LangExt.Extension
+                   -> Origin -> SrcSpan -> CvtM' err a -> Either err a
+initCvtWithIndices names exts origin loc m = fmap fst (unCvtM m ctx loc)
   where ctx = CvtCtx { cvt_origin = origin
-                     , cvt_listTuplePuns = listTuplePuns }
+                     , cvt_listTuplePuns = listTuplePuns
+                     , cvt_retained_indices = names }
         listTuplePuns = EnumSet.member LangExt.ListTuplePuns exts
 
 force :: a -> CvtM ()
@@ -153,6 +177,16 @@ getOrigin = CvtM (\ctx s -> Right (cvt_origin ctx,s))
 
 getListTuplePuns :: CvtM Bool
 getListTuplePuns = CvtM (\ctx s -> Right (cvt_listTuplePuns ctx,s))
+
+-- | Find a runtime binder in the splice or the enclosing retained telescope.
+lookupRetainedIndex :: TH.Name -> CvtM (Maybe RdrName)
+lookupRetainedIndex nm = CvtM $ \ctx loc ->
+  Right (lookup nm (cvt_retained_indices ctx), loc)
+
+-- | Add the binder to the scope of the result of a retained function type.
+withRetainedIndex :: TH.Name -> RdrName -> CvtM a -> CvtM a
+withRetainedIndex nm rdr action = CvtM $ \ctx ->
+  unCvtM action ctx { cvt_retained_indices = (nm, rdr) : cvt_retained_indices ctx }
 
 getL :: CvtM SrcSpan
 getL = CvtM (\_ loc -> Right (loc,loc))
@@ -541,7 +575,9 @@ cvtDataDefnCons ::
 cvtDataDefnCons type_data ksig constrs
   = do  { let isGadtCon (GadtC    _ _ _) = True
               isGadtCon (RecGadtC _ _ _) = True
+              isGadtCon RetainedGadtC{}  = True
               isGadtCon (ForallC  _ _ c) = isGadtCon c
+              isGadtCon (ForallMatchC _ c) = isGadtCon c
               isGadtCon _                = False
               isGadtDecl  = all isGadtCon constrs
               isH98Decl   = all (not . isGadtCon) constrs
@@ -565,7 +601,7 @@ cvtDataDefnCons type_data ksig constrs
                 case get_cons_names first_datacon of
                   []  -> panic "cvtDataDefnCons: data constructor with no names"
                   c:_ -> c
-        ; mapM (cvtConstr first_datacon_name con_name) constrs }
+        ; mapM (cvtConstr type_data first_datacon_name con_name) constrs }
 
 ----------------
 cvtTySynEqn :: TySynEqn -> CvtM (LTyFamInstEqn GhcPs)
@@ -688,135 +724,202 @@ is_ip_bind decl             = Right decl
 
 {- Note [Contexts of nested ForallC]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Since #27424, prefix GADT constructors can have curried contexts, so the
-con_cxts field of ConDeclGADT is a list. How should nested ForallC be converted?
-Consider (test: th/T27424d)
-
-  ForallC [] [AppT (ConT ''Eq) (VarT a)] $
-    ForallC [] [AppT (ConT ''Show) (VarT a)] $
-      RecGadtC [mkName "MkR"] [(mkName "fld", bang, VarT a)] (AppT (ConT (mkName "R")) (VarT a))
-
-Should it be spliced with one context per ForallC, as generated, or with the
-contexts flattened into one?
-
-  (nested)    MkR :: Eq a => Show a => {fld :: a} -> R a
-  (flattened) MkR :: (Eq a, Show a) => {fld :: a} -> R a
-
-We flatten (see prepend_cxt), for two reasons:
-
-1. To keep the output of -ddump-splices valid source code for record GADT
-   constructors. They accept at most one context in source syntax, so the
-   nested form above is rejected. This is not enforced for TH-generated
-   declarations, so it would be accepted, but it could not be copy-pasted
-   into a program.
-
-2. To avoid redundant empty contexts in the output of -ddump-splices.
-   ForallC carries both type variable binders and a context, meaning binders
-   cannot be given without a context. So without flattening, the constructor
-
-     G2 :: forall a. forall b. (a, b) -> G a
-
-   would be printed as (test: th/GadtConSigs_th_dump1)
-
-     G2 :: forall a b. () => () => (a, b) -> G a
-
-We flatten the contexts of prefix GADT constructors too, which matches the
-behaviour from before #27424.
+Record GADT constructors accept at most one context in source syntax, whereas
+Template Haskell can nest multiple context-only 'ForallC' wrappers around
+'RecGadtC' (test: th/T27424d). In 'cvtForallCon', 'merge_rec_contexts'
+coalesces adjacent 'HsGadtContext' nodes on 'RecConGADT' declarations so both
+typechecking and @-ddump-splices@ receive valid record GADT syntax, while
+preserving separate ordered telescope groups on prefix GADT constructors.
 -}
 
-cvtConstr :: TH.Name -- ^ name of first constructor of parent type
+cvtConstr :: Bool    -- ^ Is this a type data declaration?
+          -> TH.Name -- ^ name of first constructor of parent type
           -> (TH.Name -> CvtM (LocatedN RdrName)) -- ^ convert constructor name
           -> TH.Con -> CvtM (LConDecl GhcPs)
 
-cvtConstr _ do_con_name (NormalC c strtys)
+cvtConstr _ _ do_con_name (NormalC c strtys)
   = do  { c'   <- do_con_name c
         ; tys' <- mapM cvt_arg strtys
-        ; returnLA $ mkConDeclH98 noAnn [] c' Nothing Nothing (PrefixCon noExtField tys') }
+        ; returnLA $ mkConDeclH98 [] c' [] (PrefixCon noExtField tys') }
 
-cvtConstr parent_con do_con_name (RecC c varstrtys)
+cvtConstr _ parent_con do_con_name (RecC c varstrtys)
   = do  { c'    <- do_con_name c
         ; args' <- mapM (cvt_id_arg parent_con) varstrtys
-        ; con_decl <- wrapParLA (mkConDeclH98 noAnn [] c' Nothing Nothing . RecCon noAnn) args'
+        ; con_decl <- wrapParLA (mkConDeclH98 [] c' [] . RecCon noAnn) args'
         ; returnLA con_decl }
 
-cvtConstr _ do_con_name (InfixC st1 c st2)
+cvtConstr _ _ do_con_name (InfixC st1 c st2)
   = do  { c'   <- do_con_name c
         ; st1' <- cvt_arg st1
         ; st2' <- cvt_arg st2
-        ; returnLA $ mkConDeclH98 noAnn [] c' Nothing Nothing
+        ; returnLA $ mkConDeclH98 [] c' []
                        (InfixCon noExtField st1' st2') }
 
-cvtConstr parent_con do_con_name (ForallC tvs ctxt con)
-  = do  { tvs'      <- cvtTvs tvs
-        ; ctxt'     <- cvtContext funPrec ctxt
-        ; L _ con'  <- cvtConstr parent_con do_con_name con
-        ; returnLA $ add_forall tvs' ctxt' con' }
-  where
-    add_cxt :: LHsContext GhcPs -> Maybe (LHsContext GhcPs) -> Maybe (LHsContext GhcPs)
-    add_cxt lcxt         Nothing           = mkHsContextMaybe lcxt
-    add_cxt (L loc (HsContext _ cxt1)) (Just (L _ (HsContext _ cxt2)))
-      = Just (L loc (HsContext noAnn (cxt1 ++ cxt2)))
+cvtConstr type_data parent_con do_con_name (ForallC tvs ctxt con)
+  = cvtForallCon type_data parent_con do_con_name Nothing tvs ctxt con
+cvtConstr type_data parent_con do_con_name (ForallMatchC ma (ForallC tvs@(_ : _) ctxt con))
+  = do { ma' <- cvtKind ma
+       ; cvtForallCon type_data parent_con do_con_name (Just ma') tvs ctxt con }
+cvtConstr _ _ _ ForallMatchC{} = failWith (InvalidForallMatchabilityWrapper "ForallMatchC")
 
-    -- Why not simply prepend_cxt=(:)? See Note [Contexts of nested ForallC]
-    prepend_cxt :: LHsContext GhcPs -> [LHsContext GhcPs] -> [LHsContext GhcPs]
-    prepend_cxt lcxt = map_mb_head (add_cxt lcxt)
-      where
-        map_mb_head :: (Maybe a -> Maybe a) -> [a] -> [a]
-        map_mb_head f []     = maybeToList (f Nothing)
-        map_mb_head f (x:xs) = maybeToList (f (Just x)) ++ xs
-
-    -- Nested foralls and contexts end up flattened (see tests/th/GadtConSigs_th_dump1.stderr)
-    add_forall :: [LHsTyVarBndr Hs.Specificity GhcPs] -> LHsContext GhcPs
-               -> ConDecl GhcPs -> ConDecl GhcPs
-    add_forall tvs' cxt' con@(ConDeclGADT { con_outer_bndrs = L l outer_bndrs
-                                          , con_inner_bndrs = inner_bndrs
-                                          , con_cxts = cxts })
-      = con { con_outer_bndrs = L l outer_bndrs'
-            , con_inner_bndrs = inner_bndrs
-            , con_cxts = prepend_cxt cxt' cxts }
-      where
-        outer_bndrs'
-          | null all_tvs = mkHsOuterImplicit
-          | otherwise    = mkHsOuterExplicit noAnn all_tvs
-
-        all_tvs = tvs' ++ outer_exp_tvs
-
-        outer_exp_tvs = hsOuterExplicitBndrs outer_bndrs
-
-    add_forall tvs' cxt' con@(ConDeclH98 { con_ex_tvs = ex_tvs, con_mb_cxt = cxt })
-      = con { con_forall = not (null all_tvs)
-            , con_ex_tvs = all_tvs
-            , con_mb_cxt = add_cxt cxt' cxt }
-      where
-        all_tvs = tvs' ++ ex_tvs
-
-cvtConstr _ do_con_name (GadtC c strtys ty) = case nonEmpty c of
+cvtConstr _ _ do_con_name (GadtC c strtys ty) = case nonEmpty c of
     Nothing -> failWith GadtNoCons
     Just c -> do
         { c'      <- mapM do_con_name c
         ; args    <- mapM cvt_arg strtys
-        ; ty'     <- cvtType ty
-        ; mk_gadt_decl c' (PrefixConGADT noExtField args) ty'}
+        ; (telescope, ty') <- cvtGadtResult args ty
+        ; mk_gadt_decl c' telescope (PrefixConGADT noExtField args) ty'}
 
-cvtConstr parent_con do_con_name (RecGadtC c varstrtys ty) = case nonEmpty c of
+cvtConstr _ parent_con do_con_name (RecGadtC c varstrtys ty) = case nonEmpty c of
     Nothing -> failWith RecGadtNoCons
     Just c -> do
         { c'       <- mapM do_con_name c
-        ; ty'      <- cvtType ty
+        ; ty'      <- cvtGadtType ty
         ; rec_flds <- mapM (cvt_id_arg parent_con) varstrtys
         ; lrec_flds <- returnLA rec_flds
-        ; mk_gadt_decl c' (RecConGADT noAnn lrec_flds) ty' }
+        ; mk_gadt_decl c' [] (RecConGADT noAnn lrec_flds) ty' }
 
-mk_gadt_decl :: NonEmpty (LocatedN RdrName) -> HsConDeclGADTDetails GhcPs -> LHsType GhcPs
-             -> CvtM (LConDecl GhcPs)
-mk_gadt_decl names args res_ty
+cvtConstr type_data _ do_con_name (RetainedGadtC names args result) = case nonEmpty names of
+  Nothing -> failWith GadtNoCons
+  Just names -> do
+    names' <- mapM do_con_name names
+    (telescope, fields, suffix) <- cvtRetainedGadtArgs type_data args result
+    mk_gadt_decl names' telescope (PrefixConGADT noExtField fields) suffix
+
+-- | Keep empty leading visible groups out of the result type of a nullary
+-- constructor. Later groups remain on the constructor spine.
+cvtGadtResult :: [HsConDeclField GhcPs] -> TH.Type
+              -> CvtM ([LHsGadtTelescope GhcPs], LHsType GhcPs)
+cvtGadtResult fields ty = do
+  result <- cvtGadtType ty
+  let (_, prefix, body) = splitLHsGadtTy (noLocA (mkHsImplicitSigType result))
+  pure $ if null fields && any empty_required prefix then (prefix, body) else ([], result)
+  where
+    empty_required (L _ (HsGadtForAll _ HsForAllVis{hsf_vis_bndrs = []})) = True
+    empty_required _ = False
+
+-- | Convert the prefix value fields and the ordered suffix separately.
+-- See Note [Terminal constructor foralls in TH].
+cvtRetainedGadtArgs :: Bool -> [TH.RetainedGadtArg] -> TH.Type
+                    -> CvtM ([LHsGadtTelescope GhcPs], [HsConDeclField GhcPs], LHsType GhcPs)
+cvtRetainedGadtArgs type_data args result = do
+  (fields, binders) <- prefix args
+  body <- suffix binders
+  let (telescope, extra_fields, interior)
+        -- Recover the same ordered suffix that the parser produces.
+        | null fields
+        , (_, leading, remaining) <- splitLHsGadtTy (noLocA (mkHsImplicitSigType body))
+        , (_, _, leading_fields, tail_ty) <- splitHsFunType remaining
+        = (leading, leading_fields, tail_ty)
+        | otherwise = ([], [], body)
+      all_fields = fields ++ extra_fields
+      prefix_fields = PrefixConGADT noExtField all_fields
+      supported_suffix = isJust (HsDecls.splitGadtInterior prefix_fields interior) ||
+                         isJust (HsDecls.splitGadtTerminal prefix_fields interior)
+      -- A quote omits groups with no binders or predicates. The result
+      -- can be the ordinary field prefix with no ordered suffix.
+      ordinary_result = case unLoc (ignoreParens interior) of
+        HsForAllTy{} -> False
+        HsForEachTy{} -> False
+        HsFunTy{} -> False
+        HsQualTy{} -> False
+        _ -> True
+  when (not supported_suffix && not ordinary_result &&
+        (null binders || any explicit_group binders)) $
+    failWith (MalformedType TypeLevel result)
+  pure (telescope, all_fields, interior)
+  where
+    explicit_group GadtInvisibleArgs{} = True
+    explicit_group GadtRequiredArgs{} = True
+    explicit_group GadtContextArgs{} = True
+    explicit_group _ = False
+
+    prefix (GadtValueArg bang mult ty : rest) = do
+      field <- cvt_arg (bang, ty)
+      mult' <- cvtGadtArgMult type_data mult
+      (fields, binders) <- prefix rest
+      pure (field { cdf_multiplicity = mult' } : fields, binders)
+    prefix binders = pure ([], binders)
+
+    suffix [] = cvtGadtType result
+    suffix (GadtIndexArg name domain : rest) =
+      cvtRetainedBinder TH.BndrReq name domain (suffix rest)
+    suffix (GadtInvisibleArgs ma tvs@(_ : _) : rest) = do
+      tele <- mkHsForAllInvisTele noAnn <$> cvtTvs tvs
+      forall_group ma tele rest
+    suffix (GadtRequiredArgs _ [] : rest) = do
+      body <- suffix rest
+      returnLA (HsForAllTy noExtField (mkHsForAllVisTele noAnn []) body)
+    suffix (GadtRequiredArgs ma tvs : rest) = do
+      tele <- mkHsForAllVisTele noAnn <$> cvtTvs tvs
+      forall_group ma tele rest
+    suffix (GadtContextArgs ctxt@(_ : _) : rest) = do
+      ctxt' <- cvtContext funPrec ctxt
+      body <- suffix rest
+      loc <- noAnnSrcSpan <$> getL
+      pure (mkHsQualTy ctxt loc ctxt' body)
+    suffix (GadtValueArg (Bang unpack strict) mult ty : rest) = do
+      arg <- cvtType ty
+      let bang = HsSrcBang NoSourceText (cvtSrcUnpackedness unpack) (cvtSrcStrictness strict)
+      arg' <- case (unpack, strict) of
+        (NoSourceUnpackedness, NoSourceStrictness) -> pure arg
+        _ -> returnLA $ XHsType (HsBangTy (noAnn, noAnn, noAnn) bang arg)
+      mult' <- cvtGadtArgMult type_data mult
+      body <- suffix rest
+      returnLA (HsFunTy noExtField mult' arg' body)
+    suffix (_ : _) = failWith (MalformedType TypeLevel result)
+
+    forall_group ma tele rest = do
+      ma' <- cvtKind ma
+      body <- suffix rest
+      loc <- noAnnSrcSpan <$> getL
+      pure (mkHsForAllTy loc (tele { hsf_matchability = Just ma' }) body)
+
+{- Note [Terminal constructor foralls in TH]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For a prefix constructor with a late forall or context, use RetainedGadtC.
+An ordered suffix with a field annotation represents its forall and context
+groups explicitly. A suffix of plain fields can use the Type representation
+to preserve the field types and multiplicities.
+Each GadtValueArg carries the source bang and multiplicity of a value field.
+In the Type representation, a required group uses ForallVisT and an invisible
+group uses ForallT. A context alone uses ForallT without binders.
+Keep the matchability annotation when present. A ForallC wraps the leading
+invisible binders and context.
+
+Preserve an empty visible group on the constructor spine until the renamer
+checks RequiredTypeArguments. An empty structured group has no binder to
+annotate with matchability. Preserve the usual TH conversion of empty
+foralls in field types, constraints, and ordinary signatures.
+
+Use the same shape check as for source declarations. A grouped argument list
+can start with fields or leading binders. Recover the same leading groups
+and fields as the parser. The remaining groups must form an interior or
+terminal telescope, or the ordinary result if no groups remain.
+-}
+
+-- | Constructor arrows can default to One. Keep a Many annotation explicit.
+cvtGadtArgMult :: Bool -> TH.Type -> CvtM (HsModifiedFunArr GhcPs)
+cvtGadtArgMult type_data mult = do
+  ty <- cvtType mult
+  pure $ case hsTypeToArrow ty of
+    -- A TypeData field has no multiplicity. TH represents its plain
+    -- arrow as One or Many, depending on the GADT arrow default.
+    HsModifiedFunArr x [] HsLinearArr{}
+      | type_data -> HsModifiedFunArr x [] (HsStandardArr (EpArrow noAnn))
+    HsModifiedFunArr x [] arr@HsStandardArr{}
+      | not type_data -> HsModifiedFunArr x [noLocA (HsModifier noAnn ty)] arr
+    arrow -> arrow
+
+mk_gadt_decl :: NonEmpty (LocatedN RdrName) -> [LHsGadtTelescope GhcPs]
+             -> HsConDeclGADTDetails GhcPs -> LHsType GhcPs -> CvtM (LConDecl GhcPs)
+mk_gadt_decl names telescope args res_ty
   = do outer_bndrs <- returnLA mkHsOuterImplicit
        returnLA $ ConDeclGADT
                    { con_g_ext  = noAnn
                    , con_names  = names
                    , con_outer_bndrs = outer_bndrs
-                   , con_inner_bndrs = []
-                   , con_cxts = []
+                   , con_telescope = telescope
                    , con_g_args = args
                    , con_res_ty = res_ty
                    , con_modifiers = []
@@ -831,6 +934,50 @@ cvtSrcStrictness :: TH.SourceStrictness -> SrcStrictness
 cvtSrcStrictness NoSourceStrictness = NoSrcStrict
 cvtSrcStrictness SourceLazy         = SrcLazy
 cvtSrcStrictness SourceStrict       = SrcStrict
+
+-- | Retain each constructor forall group and its outer annotation scope.
+-- See Note [Source forall matchability] in GHC.Hs.Type.
+cvtForallCon :: Bool -> TH.Name -> (TH.Name -> CvtM (LocatedN RdrName))
+             -> Maybe (LHsType GhcPs) -> [TH.TyVarBndr TH.Specificity]
+             -> TH.Cxt -> TH.Con -> CvtM (LConDecl GhcPs)
+cvtForallCon type_data parent_con do_con_name ma tvs ctxt con =
+  do { tvs' <- cvtTvs tvs
+     ; ctxt' <- cvtContext funPrec ctxt
+     ; L _ con' <- cvtConstr type_data parent_con do_con_name con
+     ; returnLA $ add_group tvs' ctxt' con' }
+  where
+    tele tvs = (mkHsForAllInvisTele noAnn tvs) { hsf_matchability = ma }
+    forall_node tvs = noLocA (HsGadtForAll noExtField (tele tvs))
+    context_nodes cxt = [mkHsGadtContext cxt | not (null (hsc_ctxt (unLoc cxt)))]
+    add_group tvs cxt con@ConDeclH98{con_telescope = teles} =
+      con { con_telescope = [forall_node tvs | not (null tvs)] ++ context_nodes cxt ++ teles }
+    add_group tvs cxt con@ConDeclGADT{con_outer_bndrs = L l outer, con_telescope = inner, con_g_args = g_args}
+      | null tvs, null (hsc_ctxt (unLoc cxt)) = con
+      | otherwise =
+        con { con_outer_bndrs = L l new_outer
+            , con_telescope = new_tele }
+      where
+        -- A context-only wrapper precedes the child's first explicit group.
+        -- See Note [Constructor telescope contexts] in GHC.Hs.Decls and
+        -- Note [Contexts of nested ForallC].
+        new_outer | null tvs = mkHsOuterImplicit
+                  | otherwise = (mkHsOuterExplicit noAnn tvs) { hso_matchability = ma }
+        old_outer = case outer of
+          HsOuterImplicit{} -> []
+          HsOuterExplicit{hso_matchability = old_ma, hso_bndrs = old_tvs} ->
+            [noLocA (HsGadtForAll noExtField
+              ((mkHsForAllInvisTele noAnn old_tvs) { hsf_matchability = old_ma }))]
+        raw_tele = context_nodes cxt ++ old_outer ++ inner
+        new_tele = case g_args of
+          RecConGADT{} -> merge_rec_contexts raw_tele
+          _            -> raw_tele
+
+    merge_rec_contexts (L l (HsGadtContext (L cl (HsContext x1 c1)))
+                       : L _ (HsGadtContext (L _  (HsContext _  c2)))
+                       : rest)
+      = merge_rec_contexts (L l (HsGadtContext (L cl (HsContext x1 (c1 ++ c2)))) : rest)
+    merge_rec_contexts (g : rest) = g : merge_rec_contexts rest
+    merge_rec_contexts []         = []
 
 cvt_arg :: (TH.Bang, TH.Type) -> CvtM (HsConDeclField GhcPs)
 cvt_arg (Bang su ss, ty)
@@ -1261,6 +1408,10 @@ cvtl e = wrapLA (cvt e)
     cvt (ConstrainedE ctx body) = do { ctx' <- mapM cvtl ctx
                                      ; body' <- cvtl body
                                      ; return $ HsQual noExtField (noLocA (HsContext noAnn ctx')) body' }
+    cvt (ForallMatchE ma body)
+      | ForallE (_ : _) _ <- body = annotated_forall_expr ma body
+      | ForallVisE (_ : _) _ <- body = annotated_forall_expr ma body
+      | otherwise = failWith (InvalidForallMatchabilityWrapper "ForallMatchE")
     cvt (ForallE tvs body) =
       do { tvs' <- cvtTvs tvs
          ; body' <- cvtl body
@@ -1273,6 +1424,14 @@ cvtl e = wrapLA (cvt e)
          ; let tele = setTelescopeBndrsNameSpace varName $
                       mkHsForAllVisTele noAnn tvs'
          ; return $ HsForAll noExtField tele body' }
+
+    annotated_forall_expr ma body =
+      do { ma' <- cvtKind ma
+         ; e <- cvt body
+         ; case e of
+             HsForAll ext tele body' ->
+               return (HsForAll ext (tele { hsf_matchability = Just ma' }) body')
+             _ -> failWith (InvalidForallMatchabilityWrapper "ForallMatchE") }
 
 {- | #16895 Ensure an infix expression's operator is a variable/constructor.
 Consider this example:
@@ -1724,8 +1883,15 @@ cvtSigTypeKind typeOrKind ty = do
   pure $ hsTypeToHsSigType $ parenthesizeHsType sigPrec ty'
 
 cvtTypeKind :: TypeOrKind -> TH.Type -> CvtM (LHsType GhcPs)
-cvtTypeKind typeOrKind ty
-  = do { (head_ty, tys') <- split_ty_app ty
+cvtTypeKind = cvtTypeKindOnGadtSpine False
+
+cvtGadtType :: TH.Type -> CvtM (LHsType GhcPs)
+cvtGadtType = cvtTypeKindOnGadtSpine True TypeLevel
+
+cvtTypeKindOnGadtSpine :: Bool -> TypeOrKind -> TH.Type -> CvtM (LHsType GhcPs)
+cvtTypeKindOnGadtSpine in_gadt typeOrKind ty
+  = do { let cvt_body = cvtTypeKindOnGadtSpine in_gadt TypeLevel
+       ; (head_ty, tys') <- split_ty_app_with_result (if in_gadt then Just cvt_body else Nothing) ty
        ; let m_normals = mapM extract_normal tys'
                                 where extract_normal (HsValArg _ ty) = Just ty
                                       extract_normal _ = Nothing
@@ -1791,18 +1957,38 @@ cvtTypeKind typeOrKind ty
              -> do { list_tc <- returnLA $ getRdrName listTyCon
                    ; mk_apps (HsTyVar noAnn NotPromoted list_tc) tys' }
 
-           VarT nm -> do { nm' <- tNameN nm
+           VarT nm -> do { retained <- lookupRetainedIndex nm
+                         ; unless (isNothing retained) $
+                             failWith (MalformedType typeOrKind ty)
+                         ; nm' <- tNameN nm
                          ; mk_apps (HsTyVar noAnn NotPromoted nm') tys' }
-           ConT nm -> do { nm' <- tconName nm
+           IndexVarT nm -> do
+             retained <- lookupRetainedIndex nm
+             case retained of
+               Nothing -> failWith (MalformedType typeOrKind ty)
+               Just rdr -> do
+                 name <- returnLA rdr
+                 mk_apps (HsTyVar noAnn NotPromoted name) tys'
+           ConT nm -> do { nm' <- cvtNameWith True OccName.tcClsName nm
                          ; let prom = name_promotedness nm'
                          ; lnm' <- returnLA nm'
                          ; mk_apps (HsTyVar noAnn prom lnm') tys'}
 
+           ForallMatchT ma body
+             | null tys'
+             , is_nonempty_forall body
+             -> do { ma' <- cvtKind ma
+                   ; L loc hs_ty <- cvtTypeKindOnGadtSpine in_gadt typeOrKind body
+                   ; case hs_ty of
+                       HsForAllTy{hst_tele = tele} ->
+                         return (L loc (hs_ty { hst_tele = tele { hsf_matchability = Just ma' } }))
+                       _ -> failWith (InvalidForallMatchabilityWrapper "ForallMatchT") }
+             | otherwise -> failWith (InvalidForallMatchabilityWrapper "ForallMatchT")
            ForallT tvs cxt ty
              | null tys'
              -> do { tvs' <- cvtTvs tvs
                    ; cxt' <- cvtContext funPrec cxt
-                   ; ty'  <- cvtType ty
+                   ; ty'  <- cvt_body ty
                    ; loc <- getL
                    ; let loc' = noAnnSrcSpan loc
                    ; let tele   = mkHsForAllInvisTele noAnn tvs'
@@ -1814,11 +2000,38 @@ cvtTypeKind typeOrKind ty
            ForallVisT tvs ty
              | null tys'
              -> do { tvs' <- cvtTvs tvs
-                   ; ty'  <- cvtType ty
+                   ; ty'  <- cvt_body ty
                    ; loc  <- getL
                    ; let loc' = noAnnSrcSpan loc
                    ; let tele = mkHsForAllVisTele noAnn tvs'
-                   ; pure $ mkHsForAllTy loc' tele ty' }
+                   ; pure $ if in_gadt
+                       then L loc' (HsForAllTy noExtField tele ty')
+                       else mkHsForAllTy loc' tele ty' }
+
+           ForEachT vis nm domain ty
+             | null tys'
+             -> cvtRetainedBinder vis nm domain (cvt_body ty)
+
+           CaseT scrutinee rows -> do
+             scrutinee' <- cvtTypeKind typeOrKind scrutinee
+             rows' <- forM rows $ \(TypeCaseAlt pat rhs) -> do
+               pat' <- cvtTypeKind typeOrKind pat
+               rhs' <- cvtTypeKind typeOrKind rhs
+               returnLA (HsTypeCaseAlt pat' noEpUniTok rhs')
+             mk_apps (XHsType (HsTypeCase (noEpTok, noEpTok) Nothing scrutinee' rows')) tys'
+
+           LetT name rhs body -> do
+             name' <- tNameN name
+             rhs'  <- cvtTypeKind typeOrKind rhs
+             body' <- cvtTypeKind typeOrKind body
+             mk_apps (XHsType (mkHsSingleTypeLet noAnn name' rhs' body')) tys'
+
+           LamT binders@(_:_) body -> do
+             binders' <- traverse (\b -> do
+               ln@(L l _) <- tNameN b
+               pure (L (l2l l) (HsTvb noAnn () (HsBndrVar noExtField ln) (HsBndrNoKind noExtField)))) binders
+             body' <- cvtTypeKind typeOrKind body
+             mk_apps (XHsType (HsTypeLambda (noEpTok, noEpUniTok) binders' body')) tys'
 
            SigT ty ki
              -> do { ty' <- cvtType ty
@@ -1928,6 +2141,20 @@ cvtTypeKind typeOrKind ty
            _ -> failWith (MalformedType typeOrKind ty)
     }
 
+-- | The runtime name scopes over the continuation after its domain.
+cvtRetainedBinder :: TH.BndrVis -> TH.Name -> TH.Type -> CvtM (LHsType GhcPs)
+                  -> CvtM (LHsType GhcPs)
+cvtRetainedBinder vis nm domain body = do
+  nm' <- vNameN nm
+  domain' <- cvtType domain
+  body' <- withRetainedIndex nm (unLoc nm') body
+  binder <- returnLA $
+    HsTvb noAnn () (HsBndrVar noExtField nm') (HsBndrKind noExtField domain')
+  let delimiter = case vis of
+        TH.BndrReq   -> Left noEpUniTok
+        TH.BndrInvis -> Right noEpTok
+  returnLA (HsForEachTy (noEpTok, delimiter) [binder] body')
+
 hsTypeToArrow :: LHsType GhcPs -> HsModifiedFunArr GhcPs
 hsTypeToArrow (L l w) = HsModifiedFunArr noExtField mods arr
  where
@@ -2006,14 +2233,44 @@ See (among other closed issues) https://gitlab.haskell.org/ghc/ghc/issues/14289
 -}
 -- ---------------------------------------------------------------------
 
+-- | A metadata wrapper annotates one immediate, nonempty forall group.
+is_nonempty_forall :: TH.Type -> Bool
+is_nonempty_forall (ForallT (_ : _) _ _) = True
+is_nonempty_forall (ForallVisT (_ : _) _) = True
+is_nonempty_forall _ = False
+
 split_ty_app :: TH.Type -> CvtM (TH.Type, [LHsTypeArg GhcPs])
-split_ty_app ty = go ty []
+split_ty_app = split_ty_app_with_result Nothing
+
+-- Only the result of a saturated arrow continues the constructor spine.
+split_ty_app_with_result :: Maybe (TH.Type -> CvtM (LHsType GhcPs))
+                         -> TH.Type -> CvtM (TH.Type, [LHsTypeArg GhcPs])
+split_ty_app_with_result cvt_result ty = go ty []
   where
-    go (AppT f a) as' = do { a' <- cvtType a; go f (HsValArg noExtField a':as') }
+    go (AppT f a) as' = do
+      a' <- case cvt_result of
+        Just cvt | all is_par as', arrow_result f -> cvt a
+        _ -> cvtType a
+      go f (HsValArg noExtField a' : as')
     go (AppKindT ty ki) as' = do { ki' <- cvtKind ki
                                  ; go ty (HsTypeArg noAnn ki' : as') }
     go (ParensT t) as' = do { loc <- getL; go t (HsArgPar loc: as') }
     go f as           = return (f,as)
+
+    is_par HsArgPar{} = True
+    is_par _ = False
+
+    arrow_result ty = case without_parens ty of
+      AppT f _ -> case without_parens f of
+        ArrowT -> True
+        AppT mul _ -> case without_parens mul of
+          MulArrowT -> True
+          _ -> False
+        _ -> False
+      _ -> False
+
+    without_parens (ParensT ty) = without_parens ty
+    without_parens ty = ty
 
 cvtTyLit :: TH.TyLit -> HsLit (GhcPass p)
 cvtTyLit (TH.NumTyLit i) = HsNatural noExtField (mkIntegralLit i)
@@ -2075,25 +2332,29 @@ cvtPatSynSigTy :: TH.Type -> CvtM (LHsSigType GhcPs)
 -- pattern synonym types are of peculiar shapes, which is why we treat
 -- them separately from regular types;
 -- see Note [Pattern synonym type signatures and Template Haskell]
-cvtPatSynSigTy (ForallT univs reqs (ForallT exis provs ty))
-  | null exis, null provs = cvtSigType (ForallT univs reqs ty)
-  | null univs, null reqs = do { ty' <- cvtType (ForallT exis provs ty)
-                               ; ctxt' <- returnLA (HsContext noAnn [])
-                               ; cxtTy <- wrapParLA mkHsImplicitSigType $
-                                          HsQualTy { hst_ctxt = ctxt'
-                                                   , hst_xqual = noExtField
-                                                   , hst_body = ty' }
-                               ; returnLA cxtTy }
-  | null reqs             = do { univs' <- cvtTvs univs
-                               ; ty'    <- cvtType (ForallT exis provs ty)
-                               ; ctxt'  <- returnLA (HsContext noAnn [])
-                               ; let cxtTy = HsQualTy { hst_ctxt = ctxt'
-                                                      , hst_xqual = noExtField
-                                                      , hst_body = ty' }
-                               ; forTy <- wrapParLA (mkHsExplicitSigType noAnn univs') cxtTy
-                               ; returnLA forTy }
-  | otherwise             = cvtSigType (ForallT univs reqs (ForallT exis provs ty))
-cvtPatSynSigTy ty         = cvtSigType ty
+cvtPatSynSigTy ty
+  | Just (outer_ma, univs, reqs, inner) <- invisible_forall ty
+  , Just (_, exis, provs, body) <- invisible_forall inner
+  = if null exis && null provs
+    then cvtSigType (with_annotation outer_ma (ForallT univs reqs body))
+    else do { ma' <- traverse cvtKind outer_ma
+            ; univs' <- cvtTvs univs
+            ; inner' <- cvtType inner
+            ; reqs' <- cvtContext funPrec reqs
+            ; body' <- returnLA (HsQualTy noExtField reqs' inner')
+              -- Keep the required-context separator even when it is empty.
+              -- Otherwise the existential group becomes universal.
+            ; let outer | null univs = mkHsOuterImplicit
+                        | otherwise = (mkHsOuterExplicit noAnn univs') { hso_matchability = ma' }
+            ; returnLA (HsSig noExtField outer body') }
+  | otherwise = cvtSigType ty
+  where
+    invisible_forall (ForallT tvs ctxt body) = Just (Nothing, tvs, ctxt, body)
+    invisible_forall (ForallMatchT ma (ForallT tvs@(_ : _) ctxt body)) =
+      Just (Just ma, tvs, ctxt, body)
+    invisible_forall _ = Nothing
+    with_annotation Nothing body = body
+    with_annotation (Just ma) body = ForallMatchT ma body
 
 -----------------------------------------------------------
 cvtFixity :: TH.Fixity -> Hs.Fixity
@@ -2238,8 +2499,12 @@ ipName n
        ; return (HsIPName (packHText n)) }
 
 cvtName :: OccName.NameSpace -> TH.Name -> CvtM RdrName
-cvtName ctxt_ns (TH.Name occ flavour)
-  | not (okOcc ctxt_ns occ_str) = failWith (IllegalOccName ctxt_ns occ_str)
+cvtName = cvtNameWith False
+
+cvtNameWith :: Bool -> OccName.NameSpace -> TH.Name -> CvtM RdrName
+cvtNameWith allow_lifted ctxt_ns (TH.Name occ flavour)
+  | not (okOcc ctxt_ns occ_str || (allow_lifted && liftedTypeName)) =
+      failWith (IllegalOccName ctxt_ns occ_str)
   | otherwise
   = do { loc <- getL
        ; listTuplePuns <- getListTuplePuns
@@ -2248,6 +2513,16 @@ cvtName ctxt_ns (TH.Name occ flavour)
        ; return rdr_name }
   where
     occ_str = TH.occString occ
+
+    -- Reified types can refer to a private lifted family or synonym.
+    -- Only an exact original type occurrence can round-trip the internal spelling.
+    liftedTypeName
+      | TH.NameG TH.TcClsName _ _ <- flavour
+      , ctxt_ns == OccName.tcClsName
+      = any (`isPrefixOf` occ_str)
+            [ "$lambda:", "$case:", "$signature-lambda:", "$signature-sum:", "$signature-case:"
+            , "$field-lambda:", "$field-sum:", "$field-case:" ]
+      | otherwise = False
 
 okOcc :: OccName.NameSpace -> String -> Bool
 okOcc ns str

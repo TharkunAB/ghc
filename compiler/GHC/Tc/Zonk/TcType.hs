@@ -229,6 +229,9 @@ zonkCo      :: Coercion -> ZonkM Coercion
     zonkTcTypeMapper :: TyCoMapper ZonkM
     zonkTcTypeMapper = TyCoMapper
       { tcm_tyvar = zonkTcTyVar
+      , tcm_termvar = fmap TermVarTy . zonkId
+      , tcm_termbinder = \v k -> zonkId v >>= k
+          -- See Note [Zonking runtime index metadata]
       , tcm_covar = \cv -> mkCoVarCo <$> zonkTyCoVarKind cv
       , tcm_hole       = zonk_hole
       , tcm_tycobinder = \ tcv _vis k -> zonkTyCoVarKind tcv >>= k
@@ -316,9 +319,10 @@ zonkTcTypeAndFV ty
   = tyCoVarsOfTypeDSet <$> zonkTcType ty
 
 zonkTyCoVar :: TyCoVar -> ZonkM TcType
--- Works on TyVars and TcTyVars
+-- Works on TyVars, TcTyVars, CoVars, and runtime Ids.
 zonkTyCoVar tv | isTcTyVar tv = zonkTcTyVar tv
                | isTyVar   tv = mkTyVarTy <$> zonkTyCoVarKind tv
+               | not (isCoVar tv) = TermVarTy <$> zonkId tv
                | otherwise    = assertPpr (isCoVar tv) (ppr tv) $
                                 mkCoercionTy . mkCoVarCo <$> zonkTyCoVarKind tv
    -- Hackily, when typechecking type and class decls
@@ -356,9 +360,44 @@ zonkTyCoVarBndrKind (Bndr tv flag) =
   do { tv' <- zonkTyCoVarKind tv
      ; return (Bndr tv' flag) }
 
--- | zonkId is used *during* typechecking just to zonk the 'Id''s type
+-- | Zonk an 'Id''s type and multiplicity during typechecking.
 zonkId :: TcId -> ZonkM TcId
 zonkId id = updateIdTypeAndMultM zonkTcType id
+
+{- Note [Zonking runtime index metadata]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TermVarTy stores a runtime Id, whose type is the index's kind. Its type and
+multiplicity can contain filled metavariables. Zonk that metadata at each
+binder and occurrence. Use the same rule for TermAppTy and TermAppCo heads.
+zonkTyCoVar must also update runtime Ids before the FV entry points inspect
+their types. Keep the Id's Name and Unique. Do not turn it into a TyVar.
+
+Use zonkId during typechecking and zonkIdBndr in the final type mapper.
+These helpers reconstruct metadata from the original input Id. They do not
+inspect its IdInfo. Binder and occurrence metadata must be zonk-equivalent
+on input. Runtime dependencies in an Id's type must refer to an earlier,
+acyclic prefix. Thus metadata such as [Vec Int n] follows the earlier n
+without reading its term binding. Ordinary substitution must already update
+the input prototypes; zonking does not supply a missing type substitution.
+
+Do not look up an index occurrence in the knot-tied Id environment. Zonking
+can inspect the resulting type before the recursive bindings are available.
+Such a lookup can cause cyclic evaluation in fixIO. See Note [The ZonkEnv]
+in GHC.Tc.Zonk.Env. Runtime expression occurrences still use zonkIdOcc.
+An ambient index uses its stored input metadata. Ordinary recursive RHSs
+do not enter this traversal. The final binder callback still extends scope
+with zonkIdBndrX; type occurrences do not consult that expression Id map.
+
+Final zonking can produce a Type with unfinished knot-tied TyCons. Do not
+zonk the newly produced Id again. Repeated occurrences reconstruct their
+original input prototypes, not the output of this pass. Keep the existing
+final meta cache and type-binder environment.
+See Note [Sharing when zonking to Type] in GHC.Tc.Zonk.Type.
+
+Metadata mapping does not admit a new index domain or provide domain
+transport. Those checks remain separate. The index adds no runtime use
+and this traversal does not evaluate its value.
+-}
 
 zonkCoVar :: CoVar -> ZonkM CoVar
 zonkCoVar = zonkId
@@ -411,17 +450,25 @@ checkCoercionHole cv co
 zonkImplication :: Implication -> ZonkM Implication
 zonkImplication implic@(Implic { ic_skols  = skols
                                , ic_given  = given
+                               , ic_source_let = source_let
                                , ic_wanted = wanted
                                , ic_info   = info })
   = do { skols'  <- mapM zonkTyCoVarKind skols  -- Need to zonk their kinds!
                                                 -- as #7230 showed
        ; given'  <- mapM zonkEvVar given
+       ; source_let' <- traverse zonk_source_let source_let
        ; info'   <- zonkSkolemInfoAnon info
        ; wanted' <- zonkWCRec wanted
        ; return (implic { ic_skols  = skols'
                         , ic_given  = given'
+                        , ic_source_let = source_let'
                         , ic_wanted = wanted'
                         , ic_info   = info' }) }
+  where
+    zonk_source_let (guards, proof) = do
+      guards' <- mapM (\(wanted, dfun) -> (,) <$> zonkEvVar wanted <*> zonkEvVar dfun) guards
+      proof' <- zonkEvVar proof
+      return (guards', proof')
 
 zonkEvVar :: EvVar -> ZonkM EvVar
 zonkEvVar var = updateIdTypeAndMultM zonkTcType var
@@ -449,6 +496,8 @@ zonkDelayedError (DE_NotConcrete err)
   = DE_NotConcrete <$> zonkNotConcreteError err
 zonkDelayedError (DE_Multiplicity mult_co loc)
   = DE_Multiplicity <$> zonkCo mult_co <*> pure loc
+zonkDelayedError (DE_SourceMethod ev dfun method loc)
+  = DE_SourceMethod <$> zonkId ev <*> zonkId dfun <*> pure method <*> pure loc
 
 zonkHole :: Hole -> ZonkM Hole
 zonkHole hole@(Hole { hole_ty = ty })
@@ -512,15 +561,10 @@ zonkCt ct
        ; return (mkNonCanonical fl') }
 
 zonkCtEvidence :: CtEvidence -> ZonkM CtEvidence
--- Zonks the ctev_pred and the ctev_rewriters; but not ctev_evar
+-- Zonk the predicate and rewriters. Leave the evidence alone.
 -- For ctev_rewriters, see (WRW11) in Note [Wanteds rewrite Wanteds: rewriter-sets]
-zonkCtEvidence (CtGiven (GivenCt { ctev_pred = pred, ctev_evar = var, ctev_loc = loc }))
-  = do { pred' <- zonkTcType pred
-       ; return (CtGiven (GivenCt { ctev_pred = pred', ctev_evar = var, ctev_loc = loc })) }
-zonkCtEvidence (CtWanted wanted@(WantedCt { ctev_pred = pred, ctev_rewriters = rws }))
-  = do { pred' <- zonkTcType pred
-       ; rws'  <- zonkCoHoleSet rws
-       ; return (CtWanted (wanted { ctev_pred = pred', ctev_rewriters = rws' })) }
+zonkCtEvidence ev =
+  traverseCtEvPred zonkTcType ev >>= zonkCtEvCoHoleSet
 
 zonkSkolemInfo :: SkolemInfo -> ZonkM SkolemInfo
 zonkSkolemInfo (SkolemInfo u sk) = SkolemInfo u <$> zonkSkolemInfoAnon sk
@@ -580,9 +624,9 @@ zonkCtCoHoleSet ct
 zonkCtEvCoHoleSet :: CtEvidence -> ZonkM CtEvidence
 zonkCtEvCoHoleSet ev@(CtGiven {})
   = return ev
-zonkCtEvCoHoleSet ev@(CtWanted wtd)
+zonkCtEvCoHoleSet ev@(CtWanted {})
   = do { rewriters' <- zonkCoHoleSet (ctEvRewriters ev)
-       ; return (CtWanted $ setWantedCtEvRewriters wtd rewriters') }
+       ; return (setCtEvRewriters ev rewriters') }
 
 -- | Zonk a rewriter set; if a coercion hole in the set has been filled,
 -- find all the free un-filled coercion holes in the coercion that fills it
@@ -784,6 +828,8 @@ tidyDelayedError env (DE_Hole hole)       = DE_Hole        $ tidyHole env hole
 tidyDelayedError env (DE_NotConcrete err) = DE_NotConcrete $ tidyConcreteError env err
 tidyDelayedError env (DE_Multiplicity mult_co loc)
   = DE_Multiplicity (tidyCo env mult_co) loc
+tidyDelayedError env (DE_SourceMethod ev dfun method loc)
+  = DE_SourceMethod (tidyEvVar env ev) (tidyEvVar env dfun) method loc
 
 tidyConcreteError :: TidyEnv -> NotConcreteError -> NotConcreteError
 tidyConcreteError env err@(NCE_FRR { nce_frr_origin = frr_orig })

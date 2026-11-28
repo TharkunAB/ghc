@@ -1,0 +1,8 @@
+NativeComposedRuleDirect.hs:11:58: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘.’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the fifth argument of ‘MkIso’, namely ‘left’
+      In the expression: MkIso @a @c (h . f) (g . k) left right
+      In an equation for ‘badRule’:
+          badRule f g h k left right = MkIso @a @c (h . f) (g . k) left right
+

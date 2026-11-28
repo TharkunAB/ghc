@@ -13,7 +13,7 @@ Main pass of renamer
 -}
 
 module GHC.Rename.Module (
-        rnSrcDecls, addTcgDUs, findSplice, rnWarningTxt, rnLWarningTxt
+        rnSrcDecls, SourceTableUse(..), splitLocalSourceTables, addTcgDUs, findSplice, rnWarningTxt, rnLWarningTxt
     ) where
 
 import GHC.Prelude hiding ( head )
@@ -22,7 +22,9 @@ import {-# SOURCE #-} GHC.Rename.Expr( rnLExpr )
 import {-# SOURCE #-} GHC.Rename.Splice ( rnSpliceDecl, rnTopSpliceDecls )
 
 import GHC.Hs
+import qualified GHC.Hs.Decls as HsDecls
 import GHC.Hs.Decls.Overlap ( OverlapMode(..) )
+import GHC.Core.TyCo.Rep ( Type )
 
 import GHC.Rename.HsType
 import GHC.Rename.Bind
@@ -31,14 +33,16 @@ import GHC.Rename.Env
 import GHC.Rename.Utils ( mapFvRn, mapMaybeFvRn
                         , bindLocalNames
                         , checkDupRdrNames, bindLocalNamesFV
-                        , warnUnusedTypePatterns
+                        , warnUnusedTypePatterns, warnPunBindingsAgainst
                         , noNestedForallsContextsErr
                         , addNoNestedForallsContextsErr, checkInferredVars
-                        , makeRnValBinds)
+                        , makeRnValBinds )
 import GHC.Rename.Unbound ( notInScopeErr, WhereLooking(WL_Global) )
 import GHC.Rename.Names
 
 import GHC.Tc.Errors.Types
+import GHC.Tc.TyCl.Build ( newImplicitBinder )
+import GHC.Tc.Utils.Env ( isBrackLevel )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Origin ( TypedThing(..) )
 
@@ -46,6 +50,7 @@ import GHC.Unit
 import GHC.Unit.Module.Warnings
 import GHC.Builtin( mkUnboundName )
 import GHC.Builtin.KnownKeys
+import GHC.Iface.Env ( lookupOrig )
 
 import GHC.Types.FieldLabel
 import GHC.Types.Name.Reader
@@ -53,14 +58,14 @@ import GHC.Types.ForeignCall
 import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Name.Env
-import GHC.Types.Basic  ( VisArity,  TyConFlavour(..), TypeOrKind(..), NewOrData(..), RuleName )
-import GHC.Types.GREInfo (ConLikeInfo (..), ConInfo, mkConInfo, conInfoFields)
-import GHC.Types.Hint (SigLike(..))
+import GHC.Types.Basic  ( TyConFlavour(..), TypeOrKind(..), NewOrData(..), RuleName, VisArity )
+import GHC.Types.GREInfo ( ConLikeInfo(..), ConInfo, mkConInfo, conInfoFields )
+import GHC.Types.Hint ( SigLike(..) )
 import GHC.Types.Unique.Set
 import GHC.Types.SrcLoc as SrcLoc
 
 import GHC.Driver.DynFlags
-import GHC.Driver.Env ( HscEnv(..), hsc_home_unit)
+import GHC.Driver.Env ( HscEnv(..), hsc_home_unit )
 
 import GHC.Utils.Misc   ( lengthExceeds )
 import GHC.Utils.Panic
@@ -76,9 +81,11 @@ import qualified GHC.LanguageExtensions as LangExt
 import Control.Monad
 import Data.Bifunctor ( first )
 import Data.Foldable ( toList, for_ )
+import Data.List ( nub, partition )
 import Data.List.NonEmpty ( NonEmpty(..), head, nonEmpty )
-import Data.Maybe ( isNothing, fromMaybe, mapMaybe, maybeToList )
-import qualified Data.Set as Set ( difference, fromList, toList, null )
+import Data.Data ( Data, cast, gmapQ, gmapT )
+import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, mapMaybe, maybeToList )
+import qualified Data.Set as Set ( difference, fromList, null, toList )
 
 {- | @rnSourceDecl@ "renames" declarations.
 It simultaneously performs dependency analysis and precedence parsing.
@@ -115,6 +122,16 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    --     See Note [Top-level fixity signatures in an HsGroup] in GHC.Hs.Decls
    local_fix_env <- makeMiniFixityEnv $ hsGroupTopLevelFixitySigs group ;
 
+   -- See Note [Pun binding warnings] in GHC.Rename.Utils.
+   warn_puns <- woptM Opt_WarnPunBindings ;
+   earlier_pun_scope <- if warn_puns
+     then do { level <- getThLevel
+             ; interactive <- getIsGHCi
+             ; if interactive || isBrackLevel level
+               then pure Nothing
+               else Just <$> getGlobalRdrEnv }
+     else pure Nothing ;
+
    -- (B) Bring top level binders (and their fixities) into scope,
    --     *except* for the value bindings, which get done in step (D)
    --     with collectHsIdBinders. However *do* include
@@ -126,7 +143,6 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    --          Again, they have no value declarations
    --
    (tc_envs, tc_bndrs) <- getLocalNonValBinders local_fix_env group ;
-
 
    restoreEnvs tc_envs $ do {
 
@@ -155,21 +171,19 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
                     -- Excludes pattern-synonym binders
                     -- They are already in scope
    traceRn "rnSrcDecls" (ppr id_bndrs) ;
-   tc_envs <- extendGlobalRdrEnvRn (map (mkLocalVanillaGRE NoParent) id_bndrs) local_fix_env ;
-   restoreEnvs tc_envs $ do {
-
-   --  Now everything is in scope, as the remaining renaming assumes.
+   (gbl_env, lcl_env) <- extendGlobalRdrEnvRn (map (mkLocalVanillaGRE NoParent) id_bndrs) local_fix_env ;
+   warnPunBindingsAgainst earlier_pun_scope
+     (nonDetEltsUniqSet (tc_bndrs `unionNameSet` mkNameSet (pat_syn_bndrs ++ id_bndrs))) ;
+   -- See Note [Ordering local source tables].
+   dependent <- xoptM LangExt.DependentTypes ;
+   tables <- if dependent then localSourceTableBinders tycl_decls binds' sigs' else pure [] ;
+   let { table_names = map snd tables
+       ; rdr_env = foldl' extendGlobalRdrEnv (tcg_rdr_env gbl_env)
+                     (map (mkLocalVanillaGRE NoParent) table_names) } ;
+   restoreEnvs (gbl_env { tcg_rdr_env = rdr_env }, lcl_env) $ do {
 
    -- (E) Rename type and class decls
    --     (note that value LHSes need to be in scope for default methods)
-   --
-   -- You might think that we could build proper def/use information
-   -- for type and class declarations, but they can be involved
-   -- in mutual recursion across modules, and we only do the SCC
-   -- analysis for them in the type checker.
-   -- So we content ourselves with gathering uses only; that
-   -- means we'll only report a declaration as unused if it isn't
-   -- mentioned at all.  Ah well.
    traceRn "Start rnTyClDecls" (ppr tycl_decls) ;
    (rn_tycl_decls, src_fvs1) <- rnTyClDecls tycl_decls ;
 
@@ -177,12 +191,10 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    traceRn "Start rnmono" empty ;
    let { val_bndr_set = mkNameSet id_bndrs `unionNameSet` mkNameSet pat_syn_bndrs } ;
    let { new_lhs = makeRnValBinds noExtField binds' sigs' } ;
-   (rn_val_decls@(XValBindsLR (HsVBG _ sigs')), bind_dus) <- if is_boot
-    -- For an hs-boot, use tc_bndrs (which collects how we're renamed
-    -- signatures), since val_bndr_set is empty (there are no x = ...
-    -- bindings in an hs-boot.)
-    then rnTopBindsBoot tc_bndrs new_lhs
-    else rnValBindsRHS (TopSigCtxt val_bndr_set) new_lhs ;
+   (rn_val_decls@(XValBindsLR (HsVBG rn_binds rn_sigs)), bind_dus) <- if is_boot
+     -- The signatures bind the boot names. There are no value bindings.
+     then rnTopBindsBoot tc_bndrs new_lhs
+     else rnValBindsRHS (TopSigCtxt val_bndr_set) new_lhs ;
    traceRn "finish rnmono" (ppr rn_val_decls) ;
 
    -- (G) Rename Fixity and deprecations
@@ -217,8 +229,8 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    last_tcg_env0 <- getGblEnv ;
    let { last_tcg_env =
             last_tcg_env0
-              { tcg_complete_matches = tcg_complete_matches last_tcg_env0 ++ localCompletePragmas sigs'
-                                      , tcg_complete_match_env = tcg_complete_match_env last_tcg_env0 ++ localCompletePragmas sigs'}
+              { tcg_complete_matches = tcg_complete_matches last_tcg_env0 ++ localCompletePragmas rn_sigs
+              , tcg_complete_match_env = tcg_complete_match_env last_tcg_env0 ++ localCompletePragmas rn_sigs }
        } ;
    -- (I) Compute the results and return
    let {rn_group = HsGroup { hs_ext     = noExtField,
@@ -241,19 +253,736 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
                               src_fvs5, src_fvs6, src_fvs7] ;
                 -- It is tiresome to gather the binders from type and class decls
 
-        src_dus = unitOL other_def `plusDU` bind_dus `plusDU` usesOnly other_fvs ;
+        table_fvs = mkNameEnv [ (b, fvs) | (_, bs) <- rn_binds
+                            , L _ FunBind{fun_id = L _ b, fun_ext = fvs} <- bs ] ;
+        table_dus = mkDUs [ (unitFN table, extendNameSet (fromMaybe emptyNameSet (lookupNameEnv table_fvs term)) term)
+                          | (term, table) <- tables ] ;
+        src_dus = unitOL other_def `plusDU` table_dus `plusDU` bind_dus `plusDU` usesOnly other_fvs ;
                 -- Instance decls may have occurrences of things bound in bind_dus
                 -- so we must put other_fvs last
 
         final_tcg_env = let tcg_env' = (last_tcg_env `addTcgDUs` src_dus)
                         in -- we return the deprecs in the env, not in the HsGroup above
-                        tcg_env' { tcg_warns = insertWarnDecls (tcg_warns tcg_env') rn_decl_warns };
+                        tcg_env' { tcg_warns = insertWarnDecls (tcg_warns tcg_env') rn_decl_warns
+                                 , tcg_rdr_env = delListFromOccEnv (tcg_rdr_env tcg_env')
+                                                   (map nameOccName table_names) };
        } ;
    traceRn "finish rnSrc" (ppr rn_group) ;
    traceRn "finish Dus" (ppr src_dus ) ;
    return (final_tcg_env, rn_group)
                     }}}}
 
+{- Note [Ordering local source tables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A value signature and a type declaration in one HsGroup may both use a
+source table. For example:
+
+  type Switched = flipBit 'False
+  flipBit :: Bool -> Bool
+  flipBit False = True
+  flipBit True  = False
+
+The renamer introduces a private type name while it renames this group.
+This name records a dependency. Remove its GRE before processing exports.
+For unused-binding warnings, a use of the private name counts as a use of
+the term and its local constructors. Put this edge before the value groups.
+A value signature in any of them can depend on the private name.
+Use of the private name in a type schedules an early check of the term. The early group
+contains its ordinary binding, signature, and any independent data
+declarations that its signature needs. All three may follow the use in the
+source file. The typechecker checks the term once and creates equations
+from checked matches before checking the rest of the group.
+
+A retained operand can use the value without mentioning the table in a type.
+For example, atBit (flipBit False) can have the expected type Mark True.
+Check independent candidates referenced by other bindings after checking the
+group's type declarations and instances, before checking the other values.
+At this point an ordinary use can have implicit dependencies on instances.
+For example, an imported constructor can require a dictionary. Check the source
+rows after solving the group's constraints. If a candidate has no equations,
+its ordinary term uses still work. Only a retained use needs the certificate.
+
+The early group cannot depend on the rest of the group. An H98 datatype
+with no parameters may refer to itself in a field, as in data Nat = Z | S Nat.
+Require each field type to be a single type constructor. A parameterized
+datatype may use an ordinary lifted parameter or the datatype applied to
+all its parameters in declaration order. For Tree k a, a recursive field
+has type Tree k a. These fields have no outside dependencies. A dependency on
+another type in this group appears in group_ext. A private source-table
+name does not, so exclude it explicitly. Keep explicit instances in the
+regular pass. Save each early datatype's attached deriving clauses as
+DerivInfo for that pass. Deriving can use other instances from the
+same declaration group. See Note [Deriving for early source tables] in
+GHC.Tc.Module. A SPECIALISE pragma can mention arbitrary local types and
+values. Keep such bindings in the regular pass.
+
+An independent retained package can also be checked in the early group.
+Require a single nullary datatype declaration and a constructor with
+one retained binder and at least one ordinary payload field. The result
+is the declared datatype. Restrict fields to simple type applications and
+references to the retained binder. Reject source table names in this
+form. The SCC has no other type declarations or standalone signatures
+to schedule. The ordinary checker still checks the constructor and the
+source equation.
+
+A worker signature can name a saturated type synonym. GHC.Tc.Module checks
+the written applications against the synonym arity. A same-group synonym
+can refer to a bare type constructor or one of its own parameters. Follow
+the renamed group's dependencies and check the synonym before the worker.
+Each prerequisite must be a ready type or another eligible synonym. A
+previous group can supply an already checked family-free synonym.
+
+A table such as listCount :: [Bool] -> Nat can refer to itself. Move its
+singleton SCC with its original recursion flag. For a list domain the
+element type supplies the declaration dependency. In
+sourceLength :: forall a. [a] -> Nat, the signature binds a, so only Nat
+can add a dependency. Compare the renamed element Name with the binder.
+Only schedule a lifted type binder with no further kind dependencies.
+
+A unary list result can use the same element parameter, as in
+rev :: [a] -> [a]. Use the domain dependency check for that result.
+The row scan recognizes bracket list literals. The typed source checker
+still decides whether they desugar directly to constructors and checks
+each helper call. See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+
+For nodes :: forall a k. Tree k a -> Size, record Tree separately from
+the worker's bound parameters. The order of the forall does not control
+the order of the datatype's arguments. Tree can come from an ordinary
+import, an earlier declaration group, or the isolated H98 datatype group
+described above. Check the written arity against the local declaration
+before moving its whole type group, including role annotations. The typed
+checker verifies the saturated datatype, constructor fields and kinds.
+
+For a mapper, match the same datatype on both sides. Replacing the
+callback's input with its output leaves every other datatype argument in
+place. Use the renamed variables in this comparison. The typed check
+verifies the same shape before reading the function body.
+
+For a binary function, include both domains in the declaration dependencies.
+The source row passes the carried variable unchanged. For example, in
+`plus (S n) m = S (plus n m)` the first operand decreases. In
+`pow m (S n) = times m (pow m n)` the second operand decreases. Only
+fields of the scrutinized pattern can supply the decreasing argument.
+A list worker with one element type can also push the head onto the
+accumulator while recursing on the tail.
+See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable. Check the
+recursive operands before constructing an axiom. Return all requested
+names so the caller can report an uncertified table at the source binding.
+
+A call to another signed source function introduces a dependency between
+the equations. For example, times (S n) m = plus m (times n m) needs plus
+before the equations for times. Walk the existing binding SCCs in dependency
+order. Admit a singleton only when its other local value dependencies are
+already available. Then walk back from the requested functions to collect
+their prerequisites. Keep the original SCCs for typechecking. The typed
+producer checks the callee's identity and the decrease of each self call.
+
+Exclude bindings that contain an expression hole. A binding with a hole
+cannot certify a source table, and leaving it in its value binding group
+keeps peer signatures in scope at the hole.
+-}
+
+-- | Allocate private names for signed function bindings and retained record witnesses.
+-- Core certification checks constructor coverage and size-change termination after typechecking.
+localSourceTableBinders :: [TyClGroup GhcPs] -> [LHsBindLR GhcRn GhcPs] -> [LSig GhcPs] -> RnM [(Name, Name)]
+localSourceTableBinders tycl_decls binds sigs = do
+  rdr_env <- getGlobalRdrEnv
+  let fun_names =
+        [ n | L _ FunBind{fun_id = L _ n, fun_matches = MG{mg_alts = L _ rows}} <- binds
+            , isExternalName n
+            , nameOccName n `elemOccSet` eligible_signed
+            , not (null rows)
+            , not (has_ps_splice rows)
+            , not (has_ps_hole rows)
+            , all eligible_row rows
+            , any row_has_pat_scrutiny rows
+              || any row_has_case_or_emb rows
+              || nameOccName n `elemOccSet` large_or_ho_signed
+              || all row_builds_con rows
+              || closure_wrapper_shape rows ]
+      rec_witness_names =
+        [ greName gre
+        | tg <- tycl_decls
+        , L _ DataDecl{tcdLName = L _ tc_rdr,
+                       tcdDataDefn = HsDataDefn{dd_cons = DataTypeCons False [L _ con_decl]}}
+            <- group_tyclds tg
+        , Just (first_rdr, first_spec, rest) <- [rec_con_fields con_decl]
+        , plain_rec_spec first_spec
+        , all (plain_rec_spec . cdrf_spec . unLoc) rest
+        , let witness_tv = mkRdrUnqual (setOccNameSpace tvName (rdrNameOcc (unLoc first_rdr)))
+        , any (rec_uses_witness witness_tv) rest
+        , tc_gre : _ <- [lookupGRE rdr_env (LookupRdrName tc_rdr (RelevantGREsFOS WantNormal))]
+        , gre <- lookupGRE rdr_env (LookupRdrName (unLoc first_rdr) (RelevantGREsFOS WantBoth))
+        , greParent gre == ParentIs (greName tc_gre)
+        , isExternalName (greName gre) ]
+  mapM (\n -> (n,) <$> lookupOrig (nameModule n) (mkSourceTableOcc (nameOccName n)))
+       (fun_names ++ rec_witness_names)
+  where
+    rec_con_fields ConDeclH98{con_telescope = [], con_modifiers = [],
+                              con_args = RecCon _ (L _ (L _ (HsConDeclRecField _ [L _ (FieldOcc _ first_rdr)] first_spec) : rest@(_ : _)))}
+      = Just (first_rdr, first_spec, rest)
+    rec_con_fields ConDeclGADT{con_g_args = RecConGADT _ (L _ (L _ (HsConDeclRecField _ [L _ (FieldOcc _ first_rdr)] first_spec) : rest@(_ : _)))}
+      = Just (first_rdr, first_spec, rest)
+    rec_con_fields _ = Nothing
+
+    plain_rec_spec CDF{cdf_bang = NoSrcStrict, cdf_unpack = NoSrcUnpack,
+                       cdf_multiplicity = HsModifiedFunArr _ [] (HsStandardArr _)} = True
+    plain_rec_spec _ = False
+
+    rec_uses_witness witness_tv (L _ (HsConDeclRecField _ [_] fld)) =
+      ty_uses_scalar_witness witness_tv (cdf_type fld)
+    rec_uses_witness _ _ = False
+
+    ty_uses_scalar_witness :: RdrName -> LHsType GhcPs -> Bool
+    ty_uses_scalar_witness w ty = case unLoc (ignoreParens ty) of
+      HsTyVar _ NotPromoted (L _ rdr) -> rdr == w
+      HsAppTy _ f a -> (head_ok f && ty_uses_scalar_witness w f) || ty_uses_scalar_witness w a
+      HsAppKindTy _ f k -> (head_ok f && ty_uses_scalar_witness w f) || ty_uses_scalar_witness w k
+      t -> or (gmapQ any_sub_ty t)
+      where
+        head_ok h = case unLoc (ignoreParens h) of
+          HsTyVar _ NotPromoted (L _ rdr) -> rdr /= w
+          _ -> True
+        any_sub_ty :: Data d => d -> Bool
+        any_sub_ty d = maybe (or (gmapQ any_sub_ty d)) (ty_uses_scalar_witness w) (cast d)
+
+    local_ps_syn_list =
+      [ (rdrNameOcc syn, (params, rhs))
+      | tg <- tycl_decls
+      , L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}
+          <- group_tyclds tg
+      , Just params <- [traverse hsLTyVarName tvbs] ]
+      where
+        hsLTyVarName b = unLoc <$> hsLTyVarLocName b
+    local_ps_syns = mkOccEnv local_ps_syn_list
+
+    expand_ps_syn :: Int -> LHsType GhcPs -> LHsType GhcPs
+    expand_ps_syn 0 ty = ty
+    expand_ps_syn fuel ty
+      | null local_ps_syn_list = ty
+      | (L _ (HsTyVar _ NotPromoted (L _ syn_rdr)), args) <- split_ty_apps ty
+      , Just (params, rhs) <- lookupOccEnv local_ps_syns (rdrNameOcc syn_rdr)
+      , length params == length args
+      = expand_ps_syn (fuel - 1) (subst_ps_ty (zip params args) rhs)
+      | otherwise = ty
+
+    subst_ps_ty :: [(RdrName, LHsType GhcPs)] -> LHsType GhcPs -> LHsType GhcPs
+    subst_ps_ty [] node = node
+    subst_ps_ty env (L loc (HsTyVar ann NotPromoted (L vloc rdr)))
+      | Just replacement <- lookup rdr env = replacement
+      | otherwise = L loc (HsTyVar ann NotPromoted (L vloc rdr))
+    subst_ps_ty env (L loc t) = L loc (gmapT (gmap_ps env) t)
+      where
+        gmap_ps :: Data d => [(RdrName, LHsType GhcPs)] -> d -> d
+        gmap_ps s d = case cast d of
+          Just lty -> fromMaybe d (cast (subst_ps_ty s lty))
+          Nothing  -> gmapT (gmap_ps s) d
+
+    split_ty_apps = go []
+      where
+        go args t = case unLoc (ignoreParens t) of
+          HsAppTy _ f a -> go (a : args) f
+          HsAppKindTy _ f _ -> go args f
+          _ -> (ignoreParens t, args)
+
+    eligible_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , let body = sig_body (unLoc (hswc_body wc))
+      , not (has_ps_splice wc)
+      , eligible_ps_sig False body
+      , L _ n <- ns ]
+
+    eligible_ps_sig :: Bool -> LHsType GhcPs -> Bool
+    eligible_ps_sig seen_arr ty =
+      let expanded = expand_ps_syn 4 ty
+      in not (has_ps_qual_or_foreach expanded) &&
+         case unLoc (ignoreParens expanded) of
+           HsForAllTy{hst_body = body} -> eligible_ps_sig seen_arr body
+           HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) _ cod -> eligible_ps_sig True cod
+           HsFunTy{} -> False
+           _ -> seen_arr
+
+    has_ps_qual_or_foreach :: Data a => a -> Bool
+    has_ps_qual_or_foreach node =
+      (case cast node :: Maybe (HsType GhcPs) of
+         Just HsQualTy{}    -> True
+         Just HsForEachTy{} -> True
+         _                  -> False)
+      || or (gmapQ has_ps_qual_or_foreach node)
+
+    has_ps_splice :: Data a => a -> Bool
+    has_ps_splice node =
+      isJust (cast node :: Maybe (HsTypedSplice GhcPs))
+      || isJust (cast node :: Maybe (HsUntypedSplice GhcPs))
+      || or (gmapQ has_ps_splice node)
+
+    has_ps_hole :: Data a => a -> Bool
+    has_ps_hole node = case cast node :: Maybe (HsExpr GhcPs) of
+      Just HsHole{}          -> True
+      Just HsTypedSplice{}   -> False
+      Just HsUntypedSplice{} -> False
+      _                      -> or (gmapQ has_ps_hole node)
+
+    eligible_row :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    eligible_row (L _ Match{m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] _) :| []) (L _ local_binds)}) =
+      all eligible_pat pats && eligible_local_binds local_binds
+    eligible_row _ = False
+
+    eligible_local_binds :: HsLocalBinds GhcPs -> Bool
+    eligible_local_binds EmptyLocalBinds{} = True
+    eligible_local_binds (HsValBinds _ (ValBinds _ entries)) =
+      all (\case L _ FunBind{fun_matches = MG{mg_alts = L _ alts}} -> not (null alts) && all eligible_row alts
+                 _ -> False) (val_binds entries)
+    eligible_local_binds _ = False
+
+    eligible_pat :: LPat GhcPs -> Bool
+    eligible_pat (L _ p) = case p of
+      VarPat{} -> True
+      WildPat{} -> True
+      LitPat{} -> True
+      ParPat _ inner -> eligible_pat inner
+      SigPat _ inner _ -> eligible_pat inner
+      AsPat _ _ inner -> eligible_pat inner
+      TuplePat _ fs Boxed -> length fs /= 1 && all eligible_pat fs
+      ListPat _ fs -> all eligible_pat fs
+      ConPat{pat_args = args} -> all eligible_pat (hsConPatArgs args)
+      _ -> False
+
+    large_or_ho_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , let body = sig_body (unLoc (hswc_body wc))
+      , not (has_ps_splice wc)
+      , sig_is_large_or_ho False False body
+      , L _ n <- ns ]
+
+    sig_is_large_or_ho :: Bool -> Bool -> LHsType GhcPs -> Bool
+    sig_is_large_or_ho seen_arr seen_ho ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsForAllTy{hst_body = b} -> sig_is_large_or_ho seen_arr seen_ho b
+           HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod ->
+             let dom_exp = unLoc (ignoreParens (expand_ps_syn 4 dom))
+                 dom_ho  = case dom_exp of
+                   HsFunTy{}    -> True
+                   HsForAllTy{} -> True
+                   _            -> False
+             in sig_is_large_or_ho True (seen_ho || dom_ho) cod
+           HsStarTy{} -> seen_arr
+           HsTyVar _ NotPromoted (L _ rdr) ->
+             seen_ho || (seen_arr && occNameString (rdrNameOcc rdr) == "Type")
+           _ -> seen_ho
+
+    row_has_pat_scrutiny :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    row_has_pat_scrutiny (L _ Match{m_pats = L _ pats, m_grhss = GRHSs _ _ (L _ local_binds)}) =
+      any pat_has_scrutiny pats || local_binds_scrutiny local_binds
+      where
+        pat_has_scrutiny (L _ p) = case p of
+          LitPat{} -> True
+          TuplePat _ fs Boxed -> length fs /= 1
+          ListPat{} -> True
+          ConPat{} -> True
+          ParPat _ inner -> pat_has_scrutiny inner
+          SigPat _ inner _ -> pat_has_scrutiny inner
+          AsPat _ _ inner -> pat_has_scrutiny inner
+          _ -> False
+        local_binds_scrutiny (HsValBinds _ (ValBinds _ entries)) =
+          any (\case L _ FunBind{fun_matches = MG{mg_alts = L _ alts}} -> any row_has_pat_scrutiny alts
+                     _ -> False) (val_binds entries)
+        local_binds_scrutiny _ = False
+
+    row_has_case_or_emb :: Data a => a -> Bool
+    row_has_case_or_emb node =
+      (case cast node :: Maybe (HsExpr GhcPs) of
+         Just HsCase{}    -> True
+         Just (HsLam _ LamCase _) -> True
+         Just (HsLam _ LamCases _) -> True
+         Just (HsLam _ _ MG{mg_alts = L _ alts}) -> any row_has_pat_scrutiny alts
+         Just HsEmbTy{}   -> True
+         _                -> False)
+      || or (gmapQ row_has_case_or_emb node)
+
+    row_builds_con :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    row_builds_con (L _ Match{m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})}) =
+      expr_builds_con rhs
+      where
+        expr_builds_con e = case unLoc (stripParensLHsExpr e) of
+          HsVar _ (L _ rdr) -> isRdrDataCon rdr
+          ExplicitTuple _ _ Boxed -> True
+          ExplicitList{} -> True
+          HsApp _ f _ -> expr_builds_con f
+          HsAppType _ f _ -> expr_builds_con f
+          OpApp _ _ (L _ (HsVar _ (L _ rdr))) _ -> isRdrDataCon rdr
+          _ -> False
+    row_builds_con _ = False
+
+    closure_wrapper_shape :: [LMatch GhcPs (LHsExpr GhcPs)] -> Bool
+    closure_wrapper_shape [L _ Match{m_pats = L _ pats@(_:_:_), m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})}]
+      | Just pvars <- traverse plain_var_pat pats
+      , length (nub pvars) == length pvars
+      , (trav, [cb_e, body_e]) <- collect_ps_apps rhs
+      , Just trav_rdr <- plain_var_expr trav, not (isRdrDataCon trav_rdr)
+      , Just bvar <- plain_var_expr body_e, bvar `elem` pvars
+      , (cb_hd, cb_args@(_:_)) <- collect_ps_apps cb_e
+      , Just cb_rdr <- plain_var_expr cb_hd, not (isRdrDataCon cb_rdr)
+      , Just c_vars <- traverse plain_var_expr cb_args
+      , let caps = [v | v <- pvars, v /= bvar]
+      = length (nub c_vars) == length c_vars && all (`elem` caps) c_vars
+      where
+        plain_var_pat (L _ (VarPat _ (L _ v))) = Just v
+        plain_var_pat (L _ (ParPat _ p))       = plain_var_pat p
+        plain_var_pat _                        = Nothing
+        plain_var_expr e = case unLoc (stripParensLHsExpr e) of
+          HsVar _ (L _ v) -> Just v
+          HsAppType _ f _ -> plain_var_expr f
+          _               -> Nothing
+        collect_ps_apps = go []
+          where
+            go as e = case unLoc (stripParensLHsExpr e) of
+              HsApp _ f a -> go (a : as) f
+              _           -> (e, as)
+    closure_wrapper_shape _ = False
+
+-- | Context in which local source-table candidates are scheduled.
+-- 'TableInType' carries a predicate validating external 'TyCon' names.
+-- See Note [Ordering local source tables].
+data SourceTableUse
+  = TableInType (Name -> Bool)
+  | TableInTerm
+
+-- | Schedule independent local source functions ahead of dependent consumers
+-- using renamed 'FreeNames' and 'TyClGroup' dependencies.
+-- See Note [Ordering local source tables].
+splitLocalSourceTables :: SourceTableUse -> DefUses -> HsGroup GhcRn
+                       -> Maybe ([(Name, Name)], HsGroup GhcRn, HsGroup GhcRn)
+splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG binds sigs)),
+                                         hs_tyclds = tycls}
+  | n : _ <- bound_names
+  , let tables = case use of { TableInType{} -> allUses dus; TableInTerm -> duDefs dus }
+        used = mkOccEnv [ (nameOccName f, f) | f <- nameSetElemsStable tables
+                         , nameModule_maybe f == nameModule_maybe n ]
+        wanted = [ (b, f) | b <- bound_names
+                          , Just f <- [lookupOccEnv used (mkSourceTableOcc (nameOccName b))]
+                          , requested b f ]
+        wanted_set = mkNameSet (map fst wanted)
+        specialised = mkNameSet [ b | L _ s <- sigs, b <- spec_name s ]
+        declared = mkOccSet [ nameOccName f | f <- nameSetElemsStable (duDefs dus)
+                                            , nameModule_maybe f == nameModule_maybe n ]
+        extract_fun_scc fbs = do
+          guard (not (null fbs))
+          peers <- traverse (\case L _ fb@FunBind{fun_id = L _ b, fun_ext = fvs} -> Just (b, fb, fvs)
+                                   _ -> Nothing) fbs
+          let scc_peers = mkNameSet [b | (b, _, _) <- peers]
+          entries <- forM peers $ \(b, fb, fvs) -> do
+            guard (mkSourceTableOcc (nameOccName b) `elemOccSet` declared)
+            guard (not (b `elemNameSet` specialised))
+            guard (not (has_rn_splice fb))
+            guard (not (has_rn_hole fb))
+            sig_wc <- lookup_single_sig b
+            let term_deps = (fvs `intersectNameSet` local_values) `minusNameSet` scc_peers
+                tbl_deps  = rhs_tbl_vals fvs `minusNameSet` scc_peers
+                values    = term_deps `unionNameSet` tbl_deps
+            needed_tycons <- candidate_types scc_peers b sig_wc
+                               ((fvs `minusNameSet` local_values) `minusNameSet` rhs_tbl_names fvs)
+            pure (b, scc_peers, needed_tycons, values, term_deps, tbl_deps)
+          let combined_vals = unionNameSets [vs | (_, _, _, vs, _, _) <- entries]
+              combined_t    = unionNameSets [ts | (_, _, _, _, ts, _) <- entries]
+              combined_ty   = unionNameSets [tys | (_, _, _, _, _, tys) <- entries]
+              combined_knds = unionNameSets [ks | (_, _, ks, _, _, _) <- entries]
+          pure [(b, scc_peers, combined_knds, combined_vals, combined_t, combined_ty) | (b, _, _, _, _, _) <- entries]
+        candidates = concat [ cands | (_, fbs) <- binds, Just cands <- [extract_fun_scc fbs] ]
+        candidate_set = mkNameSet [ b | (b, _, _, _, _, _) <- candidates ]
+        schedule done (b, _, _, deps, _, _) | isEmptyNameSet (deps `minusNameSet` done) = extendNameSet done b
+                                            | otherwise = done
+        close_ready done =
+          let done' = foldl' schedule done candidates
+          in if isEmptyNameSet (done' `minusNameSet` done) then done else close_ready done'
+        ready = close_ready emptyNameSet
+        schedule_wave done (b, _, _, _, t_deps, ty_deps)
+          | isEmptyNameSet ty_deps
+          , isEmptyNameSet (t_deps `minusNameSet` done) = extendNameSet done b
+          | otherwise = done
+        close_wave done =
+          let done' = foldl' schedule_wave done candidates
+          in if isEmptyNameSet (done' `minusNameSet` done) then done else close_wave done'
+        wave_ready = close_wave emptyNameSet
+        non_cand_sigs = [ s | s@(L _ sig) <- sigs, all (not . (`elemNameSet` candidate_set)) (sig_names sig) ]
+        non_cand_binds = [ bs | (_, bs) <- binds
+                              , not (any (\case L _ FunBind{fun_id = L _ b} -> b `elemNameSet` candidate_set
+                                                _ -> False) bs) ]
+        external_term_uses = unionNameSets
+          [ uses | (defs, uses) <- fromOL dus
+          , not (maybe False (nameSetAny (\d -> is_source_table_nm d || d `elemNameSet` candidate_set)) defs) ]
+        t2t_seeds = case use of
+          TableInType{} -> mkNameSet
+            [ nm | nm <- nameSetElemsStable
+                           (mkNameSet (type_names_in (tycls, non_cand_sigs, non_cand_binds))
+                            `unionNameSet` external_term_uses)
+                 , nm `elemNameSet` candidate_set
+                 , nm `elemNameSet` ready ]
+          TableInTerm -> emptyNameSet
+  , not (null wanted) || not (isEmptyNameSet t2t_seeds)
+  = let include (b, peers, _, deps, _, _) rest
+          | b `elemNameSet` rest, b `elemNameSet` ready = unionNameSets [peers, deps, rest]
+          | otherwise = rest
+        close_needed acc =
+          let acc' = foldr include acc candidates
+          in if isEmptyNameSet (acc' `minusNameSet` acc) then acc else close_needed acc'
+        needed = close_needed (wanted_set `unionNameSet` t2t_seeds)
+        eligible_wave b = case use of
+          TableInType{} -> b `elemNameSet` wave_ready
+          TableInTerm   -> b `elemNameSet` ready
+        early = [ (b, kinds) | (b, _, kinds, _, _, _) <- candidates
+                             , eligible_wave b, b `elemNameSet` needed ]
+        early_names = mkNameSet (map fst early)
+        early_types = unionNameSets (map snd early)
+        (first_binds, rest_binds) = partition early_bind binds
+        early_bind (_, fbs) =
+          not (null fbs) && all (\case L _ FunBind{fun_id = L _ b} -> b `elemNameSet` early_names
+                                       _ -> False) fbs
+        split_sig sig@(L loc (TypeSig ext mods owners tau)) (f_acc, r_acc) =
+          case partition ((`elemNameSet` early_names) . unLoc) owners of
+            ([], _) -> (f_acc, sig : r_acc)
+            (_, []) -> (sig : f_acc, r_acc)
+            (before, after) ->
+              (L loc (TypeSig ext mods before tau) : f_acc,
+               L loc (TypeSig ext mods after tau) : r_acc)
+        split_sig sig@(L _ decl) (f_acc, r_acc)
+          | any (`elemNameSet` early_names) (sig_names decl) = (sig : f_acc, r_acc)
+          | otherwise = (f_acc, sig : r_acc)
+        (first_sigs, rest_sigs) = foldr split_sig ([], []) sigs
+        early_ty tg = any ((`elemNameSet` early_types) . tcdName . unLoc) (group_tyclds tg)
+        (first_tys, rest_tys) = case use of
+          TableInTerm -> partition early_ty tycls
+          TableInType{} ->
+            ([tg { group_instds = [] } | tg <- tycls, early_ty tg], mapMaybe rest_ty tycls)
+        rest_ty tg
+          | not (early_ty tg) = Just tg
+          | null (group_instds tg) = Nothing
+          | otherwise = Just tg { group_tyclds = [], group_kisigs = [], group_roles = [] }
+        first_grp = emptyRnGroup { hs_valds = XValBindsLR (HsVBG first_binds first_sigs), hs_tyclds = first_tys }
+        rest_grp  = group { hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs), hs_tyclds = rest_tys }
+    in case use of
+         TableInTerm | null first_binds -> Nothing
+         _ -> Just (wanted, first_grp, rest_grp)
+  where
+    bound_names = [ b | (_, bs) <- binds, L _ FunBind{fun_id = L _ b} <- bs, isExternalName b ]
+    used_names = allUses dus
+    requested b f = case use of
+      TableInType{} -> True
+      TableInTerm -> b `elemNameSet` term_uses && not (f `elemNameSet` used_names)
+
+    term_uses = unionNameSets
+      [ maybe uses (uses `minusNameSet`) defs | (defs, uses) <- fromOL dus
+      , not (maybe False (nameSetAny (isJust . sourceTableTermOcc . nameOccName)) defs) ]
+
+    local_values     = mkNameSet (collectHsValBinders CollNoDictBinders vals)
+    local_val_occs   = mkOccSet [ nameOccName v | v <- nameSetElemsStable local_values ]
+    local_val_by_occ = mkOccEnv [ (nameOccName v, v) | v <- nameSetElemsStable local_values ]
+    local_binders    = mkNameSet (hsGroupBinders group)
+
+    rhs_tbl_names :: NameSet -> NameSet
+    rhs_tbl_names fvs = mkNameSet
+      [ nm
+      | nm <- nameSetElemsStable fvs
+      , is_pending_local_table nm ]
+
+    rhs_tbl_vals :: NameSet -> NameSet
+    rhs_tbl_vals fvs = mkNameSet
+      [ v
+      | nm <- nameSetElemsStable fvs
+      , is_pending_local_table nm
+      , Just term_occ <- [sourceTableTermOcc (nameOccName nm)]
+      , Just v <- [lookupOccEnv local_val_by_occ term_occ] ]
+
+    local_syn_rhss :: NameEnv (Int, LHsType GhcRn)
+    local_syn_rhss = mkNameEnv
+      [ (syn, (length tvbs, rhs))
+      | tg <- tycls
+      , [L _ SynDecl{tcdLName = L _ syn, tcdTyVars = HsQTvs{hsq_explicit = tvbs}, tcdRhs = rhs}] <- [group_tyclds tg] ]
+
+    lookup_single_sig :: Name -> Maybe (LHsSigWcType GhcRn)
+    lookup_single_sig target =
+      case [ wc | L _ (TypeSig _ [] ns wc) <- sigs, any ((== target) . unLoc) ns ] of
+        [wc] | null (hswc_ext wc)
+             , let L _ HsSig{sig_body = body} = hswc_body wc
+             , hsTypeHasNoAnonWildcards body
+             , not (has_rn_splice wc)
+             , not (has_qual_ty wc)
+             , has_std_arrow (4 :: Int) body
+             -> Just wc
+        _ -> Nothing
+
+    has_std_arrow _ (L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) _ _)) = True
+    has_std_arrow fuel (L _ (HsParTy _ t)) = has_std_arrow fuel t
+    has_std_arrow fuel (L _ HsForAllTy{hst_body = b}) = has_std_arrow fuel b
+    has_std_arrow fuel ty
+      | fuel > 0
+      , (L _ (HsTyVar _ NotPromoted (L _ (WithUserRdr _ syn))), n_args) <- syn_head 0 ty
+      , Just (arity, rhs) <- lookupNameEnv local_syn_rhss syn
+      , arity == n_args
+      = has_std_arrow (fuel - 1) rhs
+    has_std_arrow _ _ = False
+
+    syn_head :: Int -> LHsType GhcRn -> (LHsType GhcRn, Int)
+    syn_head k (L _ (HsParTy _ t)) = syn_head k t
+    syn_head k (L _ (HsAppTy _ f _)) = syn_head (k + 1) f
+    syn_head k (L _ (HsAppKindTy _ f _)) = syn_head k f
+    syn_head k t = (t, k)
+
+    -- Identify movable DataDecl / SynDecl TyClGroups and their transitive local closures.
+    local_tycon_names = mkNameSet [tcdName (unLoc d) | tg <- tycls, d <- group_tyclds tg]
+    non_movable_binders = mkNameSet $
+      collectHsValBinders CollNoDictBinders vals ++
+      [ b | tg <- tycls, L _ d <- group_tyclds tg, not (is_data_or_syn d)
+          , b <- hsTyClForeignBinders [TyClGroup emptyNameSet [noLocA d] [] [] []] [] ]
+      where
+        is_data_or_syn DataDecl{tcdModifiers = [], tcdDataDefn = HsDataDefn{dd_ctxt = Nothing}} = True
+        is_data_or_syn SynDecl{} = True
+        is_data_or_syn _ = False
+
+    tg_info_list =
+      [ (idx, tg, tc_nms, all_bndrs, direct_ok && ext_ok)
+      | (idx, tg) <- zip [0 :: Int ..] tycls
+      , let decls = group_tyclds tg
+            kisigs = group_kisigs tg
+      , not (null decls)
+      , let tc_nms    = mkNameSet (map (tcdName . unLoc) decls)
+            all_bndrs = mkNameSet (hsTyClForeignBinders [tg { group_instds = [] }] [])
+            ast_nms   = mkNameSet (names_in (decls, kisigs))
+            decl_fvs  = unionNameSets (group_ext tg : [fvs | L _ DataDecl{tcdDExt = DataDeclRn{tcdFVs = fvs}} <- decls])
+            all_refs  = ast_nms `unionNameSet` decl_fvs
+            direct_ok = not (has_rn_splice (decls, kisigs))
+                        && not (has_qual_ty (decls, kisigs))
+                        && all (eligible_decl . unLoc) decls
+                        && not (nameSetAny is_pending_local_table all_refs)
+                        && isEmptyNameSet ((all_refs `minusNameSet` all_bndrs) `intersectNameSet` non_movable_binders)
+            ext_ok = case use of
+              TableInTerm -> True
+              TableInType ok_ext ->
+                all ok_ext [ nm | nm <- nameSetElemsStable all_refs
+                                , isTyConName nm
+                                , not (nm `elemNameSet` local_tycon_names) ] ]
+      where
+        eligible_decl DataDecl{tcdModifiers = [], tcdDataDefn = HsDataDefn{dd_ctxt = Nothing}} = True
+        eligible_decl SynDecl{} = True
+        eligible_decl _ = False
+
+    binder_to_tg :: NameEnv Int
+    binder_to_tg = mkNameEnv
+      [ (b, idx)
+      | (idx, _, _, bndrs, _) <- tg_info_list
+      , b <- nameSetElemsStable bndrs ]
+
+    tg_by_idx :: Int -> Maybe (TyClGroup GhcRn, NameSet, NameSet, Bool)
+    tg_by_idx idx = listToMaybe
+      [ (tg, tc_nms, bndrs, ok) | (i, tg, tc_nms, bndrs, ok) <- tg_info_list, i == idx ]
+
+    close_movable_tgs :: [Int] -> Maybe (NameSet, NameSet)
+    close_movable_tgs roots = go [] roots
+      where
+        go seen [] = do
+          infos <- traverse tg_by_idx seen
+          pure ( unionNameSets [tcs | (_, tcs, _, _) <- infos]
+               , unionNameSets [bs  | (_, _, bs, _)  <- infos] )
+        go seen (i : rest)
+          | i `elem` seen = go seen rest
+          | otherwise = do
+              (tg, _, _, ok) <- tg_by_idx i
+              guard ok
+              let refs = nameSetElemsStable (group_ext tg) ++ names_in (group_tyclds tg, group_kisigs tg)
+                  deps = [ j | nm <- refs, Just j <- [lookupNameEnv binder_to_tg nm], j /= i ]
+              go (i : seen) (deps ++ rest)
+
+    candidate_types :: NameSet -> Name -> LHsSigWcType GhcRn -> NameSet -> Maybe NameSet
+    candidate_types scc_peers owner sig_wc non_val_fvs =
+      let peer_tbls = mkOccSet [mkSourceTableOcc (nameOccName p) | p <- nameSetElemsStable scc_peers]
+          bad_rhs_tbl nm = is_pending_local_table nm && not (nameOccName nm `elemOccSet` peer_tbls)
+          sig_nms  = names_in sig_wc
+          all_refs = mkNameSet sig_nms `unionNameSet` non_val_fvs
+      in case use of
+        TableInTerm -> do
+          let L _ HsSig{sig_bndrs = outer} = dropWildCards sig_wc
+          case outer of
+            HsOuterImplicit{} -> pure ()
+            HsOuterExplicit{hso_matchability = Nothing} -> pure ()
+            _ -> Nothing
+          guard (not (any (`elemNameSet` local_values) sig_nms))
+          guard (not (any is_source_table_nm sig_nms))
+          guard (not (nameSetAny bad_rhs_tbl non_val_fvs))
+          let root_idxs = [ idx | nm <- nameSetElemsStable all_refs
+                                , Just idx <- [lookupNameEnv binder_to_tg nm] ]
+          (needed_tcs, allowed_bndrs) <- close_movable_tgs root_idxs
+          guard (nameSetAll (`elemNameSet` allowed_bndrs) (all_refs `intersectNameSet` local_binders))
+          pure needed_tcs
+        TableInType ok_ext -> do
+          guard (not (any is_source_table_nm sig_nms))
+          guard (not (nameSetAny bad_rhs_tbl non_val_fvs))
+          let ext_sig_tcs = [ nm | nm <- sig_nms
+                                 , isTyConName nm
+                                 , not (nm `elemNameSet` local_tycon_names) ]
+              ext_local_vals = [ nm | nm <- nameSetElemsStable non_val_fvs
+                                    , isVarName nm
+                                    , nameModule_maybe nm == nameModule_maybe owner ]
+          guard (all ok_ext (ext_sig_tcs ++ ext_local_vals))
+          let root_idxs = [ idx | nm <- nameSetElemsStable all_refs
+                                , Just idx <- [lookupNameEnv binder_to_tg nm] ]
+          (needed_tcs, allowed_bndrs) <- close_movable_tgs root_idxs
+          guard (nameSetAll (`elemNameSet` allowed_bndrs) (all_refs `intersectNameSet` local_binders))
+          pure needed_tcs
+
+    is_source_table_nm :: Name -> Bool
+    is_source_table_nm nm = isJust (sourceTableTermOcc (nameOccName nm))
+
+    is_pending_local_table :: Name -> Bool
+    is_pending_local_table nm
+      | n0 : _ <- bound_names
+      , nameModule_maybe nm == nameModule_maybe n0
+      , Just term_occ <- sourceTableTermOcc (nameOccName nm)
+      = term_occ `elemOccSet` local_val_occs
+      | otherwise = False
+
+    type_names_in :: Data a => a -> [Name]
+    type_names_in node = case cast node :: Maybe (LHsType GhcRn) of
+      Just ty -> names_in ty
+      Nothing -> concat (gmapQ type_names_in node)
+
+    names_in :: Data a => a -> [Name]
+    names_in node = maybeToList (cast node) ++ concat (gmapQ names_in node)
+
+    has_rn_splice :: Data a => a -> Bool
+    has_rn_splice node =
+      isJust (cast node :: Maybe (HsTypedSplice GhcRn))
+      || isJust (cast node :: Maybe (HsUntypedSplice GhcRn))
+      || or (gmapQ has_rn_splice node)
+
+    has_rn_hole :: Data a => a -> Bool
+    has_rn_hole node = case cast node :: Maybe (HsExpr GhcRn) of
+      Just HsHole{}          -> True
+      Just HsTypedSplice{}   -> False
+      Just HsUntypedSplice{} -> False
+      _                      -> or (gmapQ has_rn_hole node)
+
+    has_qual_ty :: Data a => a -> Bool
+    has_qual_ty node
+      | Just (HsQualTy{}) <- (cast node :: Maybe (HsType GhcRn)) = True
+      | Just (ConDeclGADT{con_g_args = args, con_telescope = tele})
+          <- (cast node :: Maybe (ConDecl GhcRn))
+      = not (null (gadtTelescopeContexts tele)) || or (gmapQ has_qual_ty args)
+      | otherwise = or (gmapQ has_qual_ty node)
+
+    sig_names :: Sig GhcRn -> [Name]
+    sig_names (TypeSig _ _ ns _) = map unLoc ns
+    sig_names (InlineSig _ (L _ b) _) = [b]
+    sig_names (SCCFunSig _ (L _ b) _) = [b]
+    sig_names _ = []
+
+    spec_name :: Sig GhcRn -> [Name]
+    spec_name (SpecSig _ (L _ b) _ _) = [b]
+    spec_name (SpecSigE b _ _ _) = [b]
+    spec_name _ = []
+splitLocalSourceTables _ _ _ = Nothing
 addTcgDUs :: TcGblEnv -> DefUses -> TcGblEnv
 -- This function could be defined lower down in the module hierarchy,
 -- but there doesn't seem anywhere very logical to put it.
@@ -957,7 +1686,7 @@ rnDataFamInstDecl :: AssocTyFamInfo
 rnDataFamInstDecl atfi (DataFamInstDecl { dfid_eqn =
                     eqn@(FamEqn { feqn_tycon = tycon })})
   = do { (eqn', fvs) <-
-           rnFamEqn (TyDataCtx tycon) atfi eqn rnDataDefn
+           rnFamEqn (TyDataCtx tycon) atfi eqn (rnDataDefn Nothing)
        ; return (DataFamInstDecl { dfid_eqn = eqn' }, fvs) }
 
 -- Renaming of the associated types in instances.
@@ -1592,7 +2321,11 @@ rnTyClDecls :: [TyClGroup GhcPs]
 rnTyClDecls tycl_ds
   = do { -- Flatten TyClGroups and rename each declaration individually.
          -- Steps (TCDEP1) and (TCDEP2) of Note [Dependency analysis of type and class decls]
-       ; tycls_w_fvs <- mapM (wrapLocFstMA rnTyClDecl) (tyClGroupTyClDecls tycl_ds)
+       ; tycls_w_fvs0 <- mapM (wrapLocFstMA rnTyClDecl) (tyClGroupTyClDecls tycl_ds)
+       ; level <- getThLevel
+       ; (tycls_w_fvs, owner_edges) <- case level of
+           UntypedBrack{} -> pure (tycls_w_fvs0, [])
+           _              -> lowerClosedFamDecls tycls_w_fvs0
        ; let tc_names = mkNameSet (map (tcdName . unLoc . fst) tycls_w_fvs)
        ; traceRn "rnTyClDecls" $
            vcat [ text "tyClGroupTyClDecls:" <+> ppr tycls_w_fvs
@@ -1606,7 +2339,7 @@ rnTyClDecls tycl_ds
        ; rdr_env <- getGlobalRdrEnv
        ; traceRn "rnTyClDecls SCC analysis" $
            vcat [ text "rdr_env:" <+> ppr rdr_env ]
-       ; let tycl_sccs = depAnalTyClDecls rdr_env tc_names kisig_fv_env tycls_w_fvs
+       ; let tycl_sccs = depAnalTyClDecls owner_edges rdr_env tc_names kisig_fv_env tycls_w_fvs
              (kisig_env, kisig_fv_env) = mkKindSig_fv_env kisigs_w_fvs
              role_annot_env = mkRoleAnnotEnv role_annots
 
@@ -1642,6 +2375,307 @@ rnTyClDecls tycl_ds
                           , group_kisigs = getKindSigs node_bndrs kisig_env
                           , group_roles  = getRoleAnnots node_bndrs role_env
                           , group_instds = [] }
+
+{- Note [Lowering type cases in closed type families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an equation right-hand side of a closed type family contains an
+'HsTypeCaseRn' outside type lambdas (GHC Proposal #378; Eisenberg and Stolarek,
+Haskell Symposium 2014), 'lowerClosedFamDecls' extracts a companion closed type
+family @$case:<Fam>:<i>@ in the same 'TyClGroup' strongly connected component:
+
+* Free equation binders referenced by the case become unannotated leading
+  parameters of @$case:<Fam>:<i>@; kind inference in the shared SCC determines
+  their kinds without copying surface kind annotations.
+* When the scrutinee is a bare equation variable @v@, @v@ is passed once in the
+  scrutinee slot and any unshadowed right-hand-side occurrence of @v@ is bound
+  to the branch pattern via 'HsTypeCaseAliasRn' so recursive termination checks
+  in 'GHC.Tc.Validity.refineCaseCall' see the refined constructor pattern.
+* When a surrounding 'HsTypeLetRn' right-hand side itself lowers a type case,
+  the @let@ variable becomes an explicit capture parameter of any subsequent
+  type case in its body so 'GHC.Tc.Validity.checkFamInstRhs' validates the
+  nested selector call.
+-}
+
+-- | Extract companion @$case:<Fam>:<i>@ closed type families for type cases in
+-- closed type family equations, returning the expanded declaration list and
+-- helper-to-owner SCC edges.
+-- See Note [Lowering type cases in closed type families].
+lowerClosedFamDecls
+  :: [(LTyClDecl GhcRn, FreeNames)]
+  -> RnM ([(LTyClDecl GhcRn, FreeNames)], [(Name, Name)])
+lowerClosedFamDecls decls = do
+  results <- mapM lower_one decls
+  let (decls_lists, edge_lists) = unzip results
+  pure (concat decls_lists, concat edge_lists)
+  where
+    lower_one (L decl_loc (FamDecl _ fam@FamilyDecl
+                      { fdInfo  = ClosedTypeFamily (anns, mb_scope) (Just eqns)
+                      , fdLName = L _ fam_name }), fvs)
+      | any (has_eqn_case . feqn_rhs . unLoc) eqns = do
+          idx_ref <- newTcRef (0 :: Int)
+          (eqns', helper_batches) <- unzip <$> mapM (lower_eqn decl_loc fam_name idx_ref) eqns
+          let helpers     = concat helper_batches
+              helper_nms  = [tcdName (unLoc d) | (d, _) <- helpers]
+              fam'        = fam { fdInfo = ClosedTypeFamily (anns, mb_scope) (Just eqns') }
+              owner_fvs   = extendNameSetList fvs helper_nms
+              owner_edges = [(h, fam_name) | h <- helper_nms]
+          pure ((L decl_loc (FamDecl noExtField fam'), owner_fvs) : helpers, owner_edges)
+    lower_one item = pure ([item], [])
+
+    has_eqn_case :: LHsType GhcRn -> Bool
+    has_eqn_case (L _ ty) = case ty of
+      XHsType HsTypeCaseRn{}        -> True
+      XHsType HsTypeLambdaQuoteRn{} -> False
+      XHsType HsTypeLambdaCheckRn{} -> False
+      HsForAllTy{}                  -> False
+      HsParTy _ t                   -> has_eqn_case t
+      HsKindSig _ t k               -> has_eqn_case t || has_eqn_case k
+      HsAppTy _ f a                 -> has_eqn_case f || has_eqn_case a
+      HsAppKindTy _ t k             -> has_eqn_case t || has_eqn_case k
+      HsFunTy _ _ a b               -> has_eqn_case a || has_eqn_case b
+      HsOpTy _ a _ b                -> has_eqn_case a || has_eqn_case b
+      HsListTy _ t                  -> has_eqn_case t
+      HsTupleTy _ _ ts              -> any has_eqn_case ts
+      HsSumTy _ ts                  -> any has_eqn_case ts
+      HsExplicitListTy _ _ ts       -> any has_eqn_case ts
+      HsExplicitTupleTy _ _ ts      -> any has_eqn_case ts
+      HsQualTy _ (L _ (HsContext _ cs)) b -> any has_eqn_case cs || has_eqn_case b
+      HsDocTy _ t _                 -> has_eqn_case t
+      HsIParamTy _ _ t              -> has_eqn_case t
+      HsSpliceTy (HsUntypedSpliceTop _ inner) _ -> has_eqn_case inner
+      XHsType (HsTypeLetRn _ _ r b) -> has_eqn_case r || has_eqn_case b
+      XHsType (HsTypeExistsRn _ _ b) -> has_eqn_case b
+      XHsType (HsTypeLetProductCheckRn _ _ r) -> has_eqn_case r
+      _                             -> False
+
+    lower_eqn decl_loc fam_name idx_ref (L eqn_loc eqn@FamEqn { feqn_bndrs = bndrs, feqn_rhs = rhs }) = do
+      let base_caps = [ (nm, mk_var_ty nm, False) | nm <- hsOuterTyVarNames bndrs ]
+      (rhs', helpers) <- lower_ty decl_loc fam_name idx_ref base_caps rhs
+      pure (L eqn_loc (eqn { feqn_rhs = rhs' }), helpers)
+
+    is_bare_var :: LHsType GhcRn -> Bool
+    is_bare_var (L _ (HsParTy _ t)) = is_bare_var t
+    is_bare_var (L _ (HsTyVar _ NotPromoted _)) = True
+    is_bare_var _ = False
+
+    mk_var_ty :: Name -> LHsType GhcRn
+    mk_var_ty nm = noLocA (HsTyVar noAnn NotPromoted (noLocA (noUserRdr nm)))
+
+    mk_plain_tvb :: Name -> LHsTyVarBndr (HsBndrVis GhcRn) GhcRn
+    mk_plain_tvb nm =
+      noLocA (HsTvb noAnn (HsBndrRequired noExtField)
+                (HsBndrVar noExtField (noLocA nm))
+                (HsBndrNoKind noExtField))
+
+    lower_ty decl_loc fam_name idx_ref caps (L loc ty) = case ty of
+      HsParTy x t -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsParTy x t'), hs)
+      HsKindSig x t k -> do
+        (t', hs1) <- lower_ty decl_loc fam_name idx_ref caps t
+        (k', hs2) <- lower_ty decl_loc fam_name idx_ref caps k
+        pure (L loc (HsKindSig x t' k'), hs1 ++ hs2)
+      HsAppTy x f a -> do
+        (f', hs1) <- lower_ty decl_loc fam_name idx_ref caps f
+        (a', hs2) <- lower_ty decl_loc fam_name idx_ref caps a
+        pure (L loc (HsAppTy x f' a'), hs1 ++ hs2)
+      HsAppKindTy x t k -> do
+        (t', hs1) <- lower_ty decl_loc fam_name idx_ref caps t
+        (k', hs2) <- lower_ty decl_loc fam_name idx_ref caps k
+        pure (L loc (HsAppKindTy x t' k'), hs1 ++ hs2)
+      HsFunTy x m a b -> do
+        (a', hs1) <- lower_ty decl_loc fam_name idx_ref caps a
+        (b', hs2) <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (HsFunTy x m a' b'), hs1 ++ hs2)
+      HsOpTy x a op b -> do
+        (a', hs1) <- lower_ty decl_loc fam_name idx_ref caps a
+        (b', hs2) <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (HsOpTy x a' op b'), hs1 ++ hs2)
+      HsListTy x t -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsListTy x t'), hs)
+      HsTupleTy x s ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsTupleTy x s ts'), concat hss)
+      HsSumTy x ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsSumTy x ts'), concat hss)
+      HsExplicitListTy x ip ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsExplicitListTy x ip ts'), concat hss)
+      HsExplicitTupleTy x ip ts -> do
+        (ts', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) ts
+        pure (L loc (HsExplicitTupleTy x ip ts'), concat hss)
+      HsQualTy x (L cloc (HsContext ca cs)) b -> do
+        (cs', hss) <- unzip <$> mapM (lower_ty decl_loc fam_name idx_ref caps) cs
+        (b', hsb)  <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (HsQualTy x (L cloc (HsContext ca cs')) b'), concat hss ++ hsb)
+      HsDocTy x t doc -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsDocTy x t' doc), hs)
+      HsIParamTy x n t -> do
+        (t', hs) <- lower_ty decl_loc fam_name idx_ref caps t
+        pure (L loc (HsIParamTy x n t'), hs)
+      HsSpliceTy (HsUntypedSpliceTop mf inner) sp -> do
+        (inner', hs) <- lower_ty decl_loc fam_name idx_ref caps inner
+        pure (L loc (HsSpliceTy (HsUntypedSpliceTop mf inner') sp), hs)
+      XHsType (HsTypeExistsRn fl v b) -> do
+        (b', hs) <- lower_ty decl_loc fam_name idx_ref caps b
+        pure (L loc (XHsType (HsTypeExistsRn fl v b')), hs)
+      XHsType (HsTypeLetProductCheckRn con ar r) -> do
+        (r', hs) <- lower_ty decl_loc fam_name idx_ref caps r
+        pure (L loc (XHsType (HsTypeLetProductCheckRn con ar r')), hs)
+      XHsType (HsTypeLetRn src lb@(L _ let_nm) rhs body) -> do
+        (rhs', hs_rhs) <- lower_ty decl_loc fam_name idx_ref caps rhs
+        if not (has_eqn_case body)
+          then pure (L loc (XHsType (HsTypeLetRn src lb rhs' body)), hs_rhs)
+          else if null hs_rhs && not (is_bare_var rhs')
+            then do
+              let body_sub = substRnNameInType (unitNameEnv let_nm rhs') body
+              (body', hs_body) <- lower_ty decl_loc fam_name idx_ref caps body_sub
+              pure (body', hs_rhs ++ hs_body)
+            else do
+              let caps' = filter (\(cn, _, _) -> cn /= let_nm) caps ++ [(let_nm, rhs', True)]
+              (body', hs_body) <- lower_ty decl_loc fam_name idx_ref caps' body
+              pure (L loc (XHsType (HsTypeLetRn src lb rhs' body')), hs_rhs ++ hs_body)
+      XHsType (HsTypeCaseRn scrut rows) -> do
+        (scrut', hs_scrut) <- lower_ty decl_loc fam_name idx_ref caps scrut
+        idx <- readTcRef idx_ref
+        writeTcRef idx_ref (idx + 1)
+        helper_name <- newImplicitBinder fam_name $ \occ ->
+          mkTcOcc ("$case:" ++ occNameString occ ++ ":" ++ show idx)
+        scrut_param <- newSysName (mkTyVarOcc "$scrutinee")
+        let bare_scrut_nm = case unLoc (ignoreParens scrut') of
+              HsTyVar _ NotPromoted (L _ (WithUserRdr _ n)) -> Just n
+              _ -> Nothing
+            case_fvs  = freeRnNames (L loc (XHsType (HsTypeCaseRn scrut' rows)) :: LHsType GhcRn)
+            used_caps = [ (cn, cexpr)
+                        | (cn, cexpr, is_let) <- caps
+                        , cn `elemNameSet` case_fvs
+                        , not (is_let && Just cn == bare_scrut_nm) ]
+            n_caps    = length used_caps
+        header_cap_nms <- mapM (newSysName . nameOccName . fst) used_caps
+        (helper_eqns, hs_rows_batches) <- unzip <$> forM rows (\(pat_nms, pat_ty, row_rhs) -> do
+          let row_caps = [c | c@(cn, _, _) <- caps, cn `notElem` pat_nms]
+          (row_rhs1, hs_row) <- lower_ty decl_loc fam_name idx_ref row_caps row_rhs
+          lhs_cap_nms <- mapM (newSysName . nameOccName . fst) used_caps
+          let cap_sub = mkNameEnv [ (cn, mk_var_ty ln)
+                                  | ((cn, _), ln) <- zip used_caps lhs_cap_nms
+                                  , cn `notElem` pat_nms
+                                  , Just cn /= bare_scrut_nm ]
+              row_rhs2 = substRnNameInType cap_sub row_rhs1
+          (mb_alias, row_rhs3) <- case bare_scrut_nm of
+            Just sn | sn `notElem` pat_nms, sn `elemNameSet` freeRnNames row_rhs2 -> do
+              alias_nm <- newSysName (nameOccName sn)
+              let r' = substRnNameInType (unitNameEnv sn (mk_var_ty alias_nm)) row_rhs2
+              pure (Just (noLocA alias_nm), r')
+            _ -> pure (Nothing, row_rhs2)
+          let eqn_loc  = combineSrcSpans (getLocA pat_ty) (getLocA row_rhs)
+              lhs_args = [HsValArg noExtField (mk_var_ty ln) | ln <- lhs_cap_nms]
+                         ++ [HsValArg noExtField pat_ty]
+              alias_rhs = L (getLoc row_rhs) $ XHsType $
+                            HsTypeCaseAliasRn (fam_name, n_caps, mb_alias) row_rhs3
+              feqn = FamEqn
+                { feqn_ext    = noAnn
+                , feqn_tycon  = noLocA helper_name
+                , feqn_bndrs  = HsOuterImplicit { hso_ximplicit = lhs_cap_nms ++ pat_nms }
+                , feqn_pats   = lhs_args
+                , feqn_fixity = Prefix
+                , feqn_rhs    = alias_rhs }
+          pure (L (noAnnSrcSpan eqn_loc) feqn, hs_row))
+        let helper_tvs  = HsQTvs { hsq_ext = []
+                                 , hsq_explicit = map mk_plain_tvb (header_cap_nms ++ [scrut_param]) }
+            helper_fam  = FamilyDecl
+              { fdExt       = noAnn
+              , fdInfo      = ClosedTypeFamily (noAnn, Nothing) (Just helper_eqns)
+              , fdTopLevel  = TopLevel
+              , fdLName     = noLocA helper_name
+              , fdTyVars    = helper_tvs
+              , fdFixity    = Prefix
+              , fdResultSig = noLocA (NoSig noExtField)
+              , fdInjectivityAnn = Nothing }
+            helper_decl = L decl_loc (FamDecl noExtField helper_fam)
+            helper_fvs  = delFromNameSet (freeRnExternalNames helper_eqns) helper_name
+            call_head   = L loc (HsTyVar noAnn NotPromoted (noLocA (noUserRdr helper_name)))
+            call_ty     = foldl' mkHsAppTy call_head ([cexpr | (_, cexpr) <- used_caps] ++ [scrut'])
+        pure (call_ty, hs_scrut ++ concat hs_rows_batches ++ [(helper_decl, helper_fvs)])
+      _ -> pure (L loc ty, [])
+
+    freeRnNames :: Data a => a -> NameSet
+    freeRnNames root = go emptyNameSet root
+      where
+        go :: Data a => NameSet -> a -> NameSet
+        go bound thing
+          | Just (_ :: SrcSpanAnnA) <- cast thing = emptyNameSet
+          | Just (_ :: SrcSpanAnnN) <- cast thing = emptyNameSet
+          | Just (_ :: SrcSpan)     <- cast thing = emptyNameSet
+          | Just (_ :: Type)        <- cast thing = emptyNameSet
+          | Just (nm :: Name)       <- cast thing
+          = if nm `elemNameSet` bound then emptyNameSet else unitNameSet nm
+          | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+          = go bound inner
+          | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = emptyNameSet
+          | Just (L _ (XHsType (HsTypeLetRn _ (L _ b) r body))) <- (cast thing :: Maybe (LHsType GhcRn))
+          = go bound r `unionNameSet` go (extendNameSet bound b) body
+          | Just (L _ (XHsType (HsTypeCaseRn scrut rows))) <- (cast thing :: Maybe (LHsType GhcRn))
+          = go bound scrut `unionNameSet`
+            unionNameSets [go (extendNameSetList bound ns) r | (ns, _, r) <- rows]
+          | otherwise = unionNameSets (gmapQ (go bound) thing)
+
+    freeRnExternalNames :: Data a => a -> NameSet
+    freeRnExternalNames thing
+      | Just (_ :: SrcSpanAnnA) <- cast thing = emptyNameSet
+      | Just (_ :: SrcSpanAnnN) <- cast thing = emptyNameSet
+      | Just (_ :: SrcSpan)     <- cast thing = emptyNameSet
+      | Just (_ :: Type)        <- cast thing = emptyNameSet
+      | Just (nm :: Name)       <- cast thing
+      = if isExternalName nm then unitNameSet nm else emptyNameSet
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ inner) _)) <- (cast thing :: Maybe (LHsType GhcRn))
+      = freeRnExternalNames inner
+      | Just (L _ HsSpliceTy{}) <- (cast thing :: Maybe (LHsType GhcRn)) = emptyNameSet
+      | otherwise = unionNameSets (gmapQ freeRnExternalNames thing)
+
+    substRnNameInType :: NameEnv (LHsType GhcRn) -> LHsType GhcRn -> LHsType GhcRn
+    substRnNameInType env root
+      | isEmptyNameEnv env = root
+      | otherwise          = go env root
+      where
+        go :: Data a => NameEnv (LHsType GhcRn) -> a -> a
+        go sub thing
+          | isEmptyNameEnv sub = thing
+          | Just (_ :: SrcSpanAnnA) <- cast thing = thing
+          | Just (_ :: SrcSpanAnnN) <- cast thing = thing
+          | Just (_ :: SrcSpan)     <- cast thing = thing
+          | Just (_ :: Name)        <- cast thing = thing
+          | Just (_ :: Type)        <- cast thing = thing
+          | Just (lty :: LHsType GhcRn) <- cast thing
+          , Just lty' <- cast (go_lty sub lty) = lty'
+          | otherwise = gmapT (go sub) thing
+
+        go_lty sub orig@(L loc ty) = case ty of
+          HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm))
+            | Just repl <- lookupNameEnv sub nm -> L loc (unLoc repl)
+            | otherwise -> orig
+          HsForAllTy x tele body ->
+            let bs = case tele of
+                  HsForAllVis   _ _ vs -> mapMaybe hsLTyVarName vs
+                  HsForAllInvis _ _ vs -> mapMaybe hsLTyVarName vs
+            in L loc (HsForAllTy x (go sub tele) (go_lty (delListFromNameEnv sub bs) body))
+          HsForEachTy x vs body ->
+            L loc (HsForEachTy x (go sub vs) (go_lty (delListFromNameEnv sub (mapMaybe hsLTyVarName vs)) body))
+          HsSpliceTy (HsUntypedSpliceTop mf inner) sp ->
+            L loc (HsSpliceTy (HsUntypedSpliceTop mf (go_lty sub inner)) sp)
+          HsSpliceTy{} -> orig
+          XHsType (HsTypeExistsRn fl v body) ->
+            L loc (XHsType (HsTypeExistsRn fl (go sub v) (go_lty (delListFromNameEnv sub (maybeToList (hsLTyVarName v))) body)))
+          XHsType (HsTypeLambdaQuoteRn vs body) ->
+            L loc (XHsType (HsTypeLambdaQuoteRn (go sub vs) (go_lty (delListFromNameEnv sub (mapMaybe hsLTyVarName vs)) body)))
+          XHsType (HsTypeLetRn src lb@(L _ b) r body) ->
+            L loc (XHsType (HsTypeLetRn src lb (go_lty sub r) (go_lty (delFromNameEnv sub b) body)))
+          XHsType (HsTypeCaseRn scrut rows) ->
+            L loc (XHsType (HsTypeCaseRn (go_lty sub scrut)
+              [ (ns, p, go_lty (delListFromNameEnv sub ns) r) | (ns, p, r) <- rows ]))
+          _ -> gmapT (go sub) orig
 
 -- | Free variables of standalone kind signatures.
 newtype KindSig_FV_Env = KindSig_FV_Env (NameEnv FreeNames)
@@ -1681,21 +2715,25 @@ rnStandaloneKindSignature
   -> RnM (StandaloneKindSig GhcRn, FreeNames)
 rnStandaloneKindSignature tc_names (StandaloneKindSig _ v ki)
   = do  { standalone_ki_sig_ok <- xoptM LangExt.StandaloneKindSignatures
-        ; unless standalone_ki_sig_ok $ addErr TcRnUnexpectedStandaloneKindSig
+        ; unless standalone_ki_sig_ok $
+            addErr TcRnUnexpectedStandaloneKindSig
         ; new_v <- lookupSigCtxtOccRn (TopSigCtxt tc_names) SigLikeStandaloneKindSig v
         ; (new_ki, fvs) <- rnHsSigType (StandaloneKindSigCtx v) KindLevel ki
         ; return (StandaloneKindSig noExtField new_v new_ki, fvs)
         }
 
 -- See Note [Dependency analysis of type and class decls]
-depAnalTyClDecls :: GlobalRdrEnv
+depAnalTyClDecls :: [(Name, Name)]
+                 -> GlobalRdrEnv
                  -> NameSet                         -- Names in the current HsGroup
                  -> KindSig_FV_Env                  -- FVs of standalone kind signatures
                  -> [(LTyClDecl GhcRn, FreeNames)]
                  -> [SCC (LTyClDecl GhcRn, NameSet)]
-depAnalTyClDecls rdr_env tc_names kisig_fv_env ds_w_fvs
+depAnalTyClDecls owner_edges rdr_env tc_names kisig_fv_env ds_w_fvs
   = stronglyConnCompFromEdgedVerticesUniq edges
   where
+    owner_map = mkNameEnv owner_edges
+    owner_edge name = maybe emptyNameSet unitNameSet (lookupNameEnv owner_map name)
     -- Build a graph where each node is a `TyClDecl` keyed by its name, and
     -- its `FreeNames` give rise to edges.
     -- Step (TCDEP3) of Note [Dependency analysis of type and class decls]
@@ -1708,7 +2746,7 @@ depAnalTyClDecls rdr_env tc_names kisig_fv_env ds_w_fvs
             | (d, fvs) <- ds_w_fvs,
               let { name = tcdName (unLoc d)
                   ; kisig_fvs = lookupKindSig_FV_Env kisig_fv_env name
-                  ; node_fvs = fvs `plusFN` kisig_fvs -- (TCDEP3.fvs_kisig)
+                  ; node_fvs = fvs `plusFN` kisig_fvs `plusFN` owner_edge name -- (TCDEP3.fvs_kisig)
                   ; deps = toParents rdr_env node_fvs `intersectFNs` tc_names
                       -- (toParents rdr_env) maps datacons to parent tycons (TCDEP3.fvs_parent),
                       -- (`intersectFNs` tc_names) filters out imported names (TCDEP3.fvs_nogbl).
@@ -1937,7 +2975,15 @@ rnTyClDecl (DataDecl
              new_or_data = dataDefnConsNewOrData cons
        ; traceRn "rntycl-data" (ppr tycon <+> ppr kvs)
        ; bindHsQTyVars doc Nothing kvs tyvars $ \ tyvars' free_rhs_kvs ->
-    do { (defn', fvs) <- rnDataDefn doc defn
+    do { let record_parent
+               | null mods
+               , Just parameters <- traverse required_parameter (hsq_explicit tyvars')
+               = Just (foldl' nlHsAppTy (nlHsTyVar NotPromoted (unLoc tycon'))
+                           (map (nlHsTyVar NotPromoted) parameters))
+               | otherwise = Nothing
+             required_parameter binder@(L _ HsTvb{tvb_flag = HsBndrRequired{}}) = hsLTyVarName binder
+             required_parameter _ = Nothing
+       ; (defn', fvs) <- rnDataDefn record_parent doc defn
        ; cusk <- data_decl_has_cusk tyvars' new_or_data (null free_rhs_kvs) kind_sig
        ; let rn_info = DataDeclRn { tcdDataCusk = cusk
                                   , tcdFVs      = fvs }
@@ -2061,9 +3107,9 @@ the broader picture of UnliftedNewtypes.
 rnTySyn :: HsDocContext -> LHsType GhcPs -> RnM (LHsType GhcRn, FreeNames)
 rnTySyn doc rhs = rnLHsType doc rhs
 
-rnDataDefn :: HsDocContext -> HsDataDefn GhcPs
+rnDataDefn :: Maybe (LHsType GhcRn) -> HsDocContext -> HsDataDefn GhcPs
            -> RnM (HsDataDefn GhcRn, FreeNames)
-rnDataDefn doc (HsDataDefn { dd_cType = cType, dd_ctxt = context, dd_cons = condecls
+rnDataDefn record_parent doc (HsDataDefn { dd_cType = cType, dd_ctxt = context, dd_cons = condecls
                            , dd_kindSig = m_sig, dd_derivs = derivs })
   = do  { -- DatatypeContexts (i.e., stupid contexts) can't be combined with
           -- GADT syntax. See Note [The stupid context] in GHC.Core.DataCon.
@@ -2084,9 +3130,21 @@ rnDataDefn doc (HsDataDefn { dd_cType = cType, dd_ctxt = context, dd_cons = cond
         -- in the GADT case, where the type variables in the declaration
         -- do not scope over the constructor signatures
         -- data T a where { T1 :: forall b. b-> b }
-        ; let { zap_lcl_env | h98_style = \ thing -> thing
-                            | otherwise = setLocalRdrEnv emptyLocalRdrEnv }
-        ; (condecls', con_fvs) <- zap_lcl_env $ rnConDecls condecls
+        ; let zap_lcl_env thing
+                | h98_style = thing
+                | otherwise = do
+                    -- Start tracking again for the constructors' own binders.
+                    warn_uses <- woptM Opt_WarnPunUses
+                    warn_bindings <- woptM Opt_WarnPunBindings
+                    let rdr_env | warn_uses || warn_bindings = trackPunScopes emptyLocalRdrEnv
+                                | otherwise = emptyLocalRdrEnv
+                    setLocalRdrEnv rdr_env thing
+        ; let retained_parent
+                | DataTypeCons False [_] <- condecls
+                , isNothing cType, isNothing context, isNothing m_sig, null derivs
+                = record_parent
+                | otherwise = Nothing
+        ; (condecls', con_fvs) <- zap_lcl_env $ rnConDecls retained_parent condecls
            -- No need to check for duplicate constructor decls
            -- since that is done by GHC.Rename.Names.extendGlobalRdrEnvRn
 
@@ -2145,11 +3203,20 @@ rnDataDefn doc (HsDataDefn { dd_cType = cType, dd_ctxt = context, dd_cons = cond
       where
         unannotated (CDF { cdf_bang = NoSrcStrict
                          , cdf_unpack = NoSrcUnpack
-                         , cdf_multiplicity = HsModifiedFunArr _ [] (HsStandardArr _) })
-          = True
+                         , cdf_multiplicity = HsModifiedFunArr _ [] (HsStandardArr _)
+                         , cdf_type = ty })
+          -- The parsed fields after a telescope still carry their bangs
+          -- in the field type. The prefix parser already split those bangs.
+          = case unLoc ty of
+              XHsType HsBangTy{} -> False
+              _                  -> True
         unannotated _ = False
 
-    con_arg_fields (ConDeclGADT { con_g_args = PrefixConGADT _ args }) = args
+    con_arg_fields (ConDeclGADT { con_g_args = details@(PrefixConGADT _ args)
+                               , con_res_ty = result })
+      = args ++ case HsDecls.splitGadtInterior details result of
+                  Just (groups, _) -> [field | Right field <- groups]
+                  Nothing          -> []
     con_arg_fields (ConDeclH98 { con_args = PrefixCon _ args }) = args
     con_arg_fields (ConDeclH98 { con_args = InfixCon _ arg1 arg2 }) = [arg1, arg2]
     con_arg_fields _ = []
@@ -2191,7 +3258,7 @@ preceded by `type`, with the following restrictions:
      (!, ~, {-# UNPACK #-}, {-# NOUNPACK #-}, %m ->, ⊸), because they
      don't make sense at the type level.
 
-(R4) The types of the constructors contain no constraints.
+(R4) The types of the constructors contain only equality constraints.
 
 (R5) There are no deriving clauses.
 
@@ -2453,13 +3520,13 @@ rnFamDecl mb_cls (FamilyDecl { fdLName = tycon, fdTyVars = tyvars
 
      ----------------------
      rn_info :: FamilyInfo GhcPs -> RnM (FamilyInfo GhcRn, FreeNames)
-     rn_info (ClosedTypeFamily x (Just eqns))
+     rn_info (ClosedTypeFamily anns (Just eqns))
        = do { (eqns', fvs)
                 <- rnList (rnTyFamInstEqn (NonAssocTyFamEqn ClosedTyFam)) eqns
                                           -- no class context
-            ; return (ClosedTypeFamily x (Just eqns'), fvs) }
-     rn_info (ClosedTypeFamily x Nothing)
-       = return (ClosedTypeFamily x Nothing, emptyFNs)
+            ; return (ClosedTypeFamily (anns, Nothing) (Just eqns'), fvs) }
+     rn_info (ClosedTypeFamily anns Nothing)
+       = return (ClosedTypeFamily (anns, Nothing) Nothing, emptyFNs)
      rn_info (OpenTypeFamily x) = return (OpenTypeFamily x, emptyFNs)
      rn_info (DataFamily x)     = return (DataFamily x, emptyFNs)
 
@@ -2608,13 +3675,14 @@ are no data constructors we allow h98_style = True
 ***************************************************** -}
 
 -----------------
-rnConDecls :: DataDefnCons (LConDecl GhcPs) -> RnM (DataDefnCons (LConDecl GhcRn), FreeNames)
-rnConDecls = mapFvRn (wrapLocFstMA rnConDecl)
+rnConDecls :: Maybe (LHsType GhcRn) -> DataDefnCons (LConDecl GhcPs)
+            -> RnM (DataDefnCons (LConDecl GhcRn), FreeNames)
+rnConDecls parent = mapFvRn (wrapLocFstMA (rnConDecl parent))
 
-rnConDecl :: ConDecl GhcPs -> RnM (ConDecl GhcRn, FreeNames)
-rnConDecl decl@(ConDeclH98 { con_name = name, con_ex_tvs = ex_tvs
-                           , con_mb_cxt = mcxt, con_args = args
-                           , con_doc = mb_doc, con_forall = forall_
+rnConDecl :: Maybe (LHsType GhcRn) -> ConDecl GhcPs -> RnM (ConDecl GhcRn, FreeNames)
+rnConDecl parent decl@(ConDeclH98 { con_name = name, con_telescope = teles
+                           , con_args = args
+                           , con_doc = mb_doc
                            , con_modifiers = mods })
   = do  { _        <- addLocM checkConName name
         ; new_name <- lookupLocatedTopBndrRnN WL_ConLike name
@@ -2629,29 +3697,37 @@ rnConDecl decl@(ConDeclH98 { con_name = name, con_ex_tvs = ex_tvs
         -- scoping we get.  So no implicit binders at the existential forall
 
         ; let ctxt = ConDeclCtx [new_name]
-        ; bindLHsTyVarBndrs ctxt WarnUnusedForalls
-                            Nothing ex_tvs $ \ new_ex_tvs ->
-    do  { (new_context, fvs1) <- mapMaybeFvRn (rnContext ctxt) mcxt
-        ; (new_args,    fvs2) <- rnConDeclH98Details (unLoc new_name) ctxt args
+        ; bindHsGadtTelescopes ctxt teles $ \ new_teles ->
+    do  { (retained, new_args, fvs2) <- case (parent, teles, mods, args) of
+             (Just owner, [], [], RecCon ann (L loc fields))
+               -> do { fls <- lookupConstructorFields (noUserRdr (unLoc new_name))
+                     ; result <- rnRetainedHsRecordFields owner ctxt fls fields
+                     ; case result of
+                         Just (ty, fields', fvs) ->
+                           pure (Just ty, RecCon ann (L loc fields'), fvs)
+                         Nothing -> ordinary_args new_name ctxt }
+             _ -> ordinary_args new_name ctxt
         ; (mods', mods_fvs) <- rnModifiersContextAndWarn ctxt mods
-        ; let all_fvs  = fvs1 `plusFN` fvs2 `plusFN` mods_fvs
+        ; let all_fvs  = fvs2 `plusFN` mods_fvs
         ; traceRn "rnConDecl (ConDeclH98)" (ppr name <+> vcat
-             [ text "ex_tvs:" <+> ppr ex_tvs
-             , text "new_ex_dqtvs':" <+> ppr new_ex_tvs ])
+             [ text "telescopes:" <+> ppr teles
+             , text "renamed telescopes:" <+> ppr new_teles ])
 
         ; mb_doc' <- traverse rnLHsDoc mb_doc
-        ; return (decl { con_ext = noExtField
-                       , con_name = new_name, con_ex_tvs = new_ex_tvs
-                       , con_mb_cxt = new_context, con_args = new_args
+        ; return (decl { con_ext = retained
+                       , con_name = new_name, con_telescope = new_teles
+                       , con_args = new_args
                        , con_doc = mb_doc'
-                       , con_forall = forall_ -- Remove when #18311 is fixed
                        , con_modifiers = mods' },
                   all_fvs) }}
+  where
+    ordinary_args new_name ctxt = do
+      (new_args, fvs) <- rnConDeclH98Details (unLoc new_name) ctxt args
+      pure (Nothing, new_args, fvs)
 
-rnConDecl (ConDeclGADT { con_names   = names
+rnConDecl _ decl@(ConDeclGADT { con_names   = names
                        , con_outer_bndrs = L outer_bndrs_loc outer_bndrs
-                       , con_inner_bndrs = inner_bndrs
-                       , con_cxts    = cxts
+                       , con_telescope = inner_bndrs
                        , con_g_args  = args
                        , con_res_ty  = res_ty
                        , con_modifiers = mods
@@ -2664,40 +3740,87 @@ rnConDecl (ConDeclGADT { con_names   = names
               -- That order governs the order the implicitly-quantified type
               -- variable, and hence the order needed for visible type application
               -- See #14808.
-              implicit_bndrs =
+              free_vars =
                 extractHsOuterTvBndrs outer_bndrs           $
                 extractHsGadtTelescopes inner_bndrs         $
-                extractHsTysRdrTyVars (hsConDeclTheta cxts) $
                 extractConDeclGADTDetailsTyVars args        $
                 extractHsTysRdrTyVars [res_ty] []
 
+        ; implicit_bndrs <- filterGadtConTyVars decl free_vars
         ; let ctxt = ConDeclCtx (toList new_names)
+        ; case args of
+            PrefixConGADT{} -> checkEmptyGadtRequiredGroups ctxt inner_bndrs res_ty
+            RecConGADT{} -> pure () -- The record grammar rejects visible groups.
 
         ; bindHsOuterTyVarBndrs ctxt Nothing implicit_bndrs outer_bndrs $ \outer_bndrs' ->
           bindHsGadtTelescopes ctxt inner_bndrs $ \inner_bndrs' ->
-    do  { (new_cxts, fvs1)   <- mapFvRn (rnContext ctxt) cxts
-        ; (new_args, fvs2)   <- rnConDeclGADTDetails (unLoc (head new_names)) ctxt args
-        ; (new_res_ty, fvs3) <- rnLHsType ctxt res_ty
+    do  { (new_args, fvs2)   <- rnConDeclGADTDetails (unLoc (head new_names)) ctxt args
+        ; (new_res_ty, fvs3) <-
+            if hsHasForEachTy (unLoc res_ty)
+            then do { enabled <- xoptM LangExt.DependentTypes
+                    ; if enabled then rnRetainedSigType ctxt res_ty
+                                 else rnLHsType ctxt res_ty }
+            else case HsDecls.splitGadtInterior args res_ty of
+                   Just{} -> rnLHsGadtSuffix ctxt res_ty
+                   Nothing -> rnLHsType ctxt res_ty
         ; (mods', mods_fvs) <- rnModifiersContextAndWarn ctxt mods
 
-         -- Ensure that there are no nested `forall`s or contexts, per
-         -- Note [GADT abstract syntax] (Wrinkle: No nested foralls or contexts)
-         -- in GHC.Hs.Type.
-       ; addNoNestedForallsContextsErr ctxt
-           NFC_GadtConSig new_res_ty
+         -- Keep terminal groups on the source side of the declaration.
+         -- The prefix fields have already been renamed in their own scope.
+       ; let con_result
+               | Just (_, _, result) <- HsDecls.splitGadtTerminal new_args new_res_ty
+               = result
+               | Just (_, result) <- HsDecls.splitGadtInterior new_args new_res_ty
+               = result
+               | otherwise = new_res_ty
+       ; addNoNestedForallsContextsErr ctxt NFC_GadtConSig con_result
 
-        ; let all_fvs = fvs1 `plusFN` fvs2 `plusFN` fvs3 `plusFN` mods_fvs
+        ; let all_fvs = fvs2 `plusFN` fvs3 `plusFN` mods_fvs
 
         ; traceRn "rnConDecl (ConDeclGADT)"
             (ppr names $$ ppr outer_bndrs' $$ ppr inner_bndrs')
         ; new_mb_doc <- traverse rnLHsDoc mb_doc
         ; return (ConDeclGADT { con_g_ext = noExtField, con_names = new_names
                               , con_outer_bndrs = L outer_bndrs_loc outer_bndrs'
-                              , con_inner_bndrs = inner_bndrs'
-                              , con_cxts = new_cxts
+                              , con_telescope = inner_bndrs'
                               , con_g_args = new_args, con_res_ty = new_res_ty
                               , con_doc = new_mb_doc, con_modifiers = mods' },
                   all_fvs) } }
+
+{- Note [Required type arguments in empty GADT groups]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+checkValidType checks nonempty visible groups in the constructor type and
+reports the existing validity errors. An empty group contributes no Core
+binder, so check it on the parsed signature before the type checker removes
+it. The parser stores leading groups in the prefix and later groups on the
+right spine of the remaining type. Check both in the constructor renamer,
+which also handles Template Haskell constructors. Do not descend into field
+types or contexts. They use the ordinary rules for types. The record grammar
+already rejects visible groups, including empty groups.
+-}
+checkEmptyGadtRequiredGroups :: HsDocContext -> [LHsGadtTelescope GhcPs]
+                             -> LHsType GhcPs -> RnM ()
+checkEmptyGadtRequiredGroups ctxt prefix suffix =
+  unlessXOptM LangExt.RequiredTypeArguments $ do
+    for_ prefix $ \case
+      L l (HsGadtForAll _ tele) -> check_group (locA l) tele
+      _ -> pure ()
+    check_suffix suffix
+  where
+    check_group :: SrcSpan -> HsForAllTelescope GhcPs -> RnM ()
+    check_group loc HsForAllVis{hsf_vis_bndrs = []} =
+      addErrAt loc $ TcRnWithHsDocContext ctxt $ TcRnVDQInTermType Nothing
+    check_group _ _ = pure ()
+
+    check_suffix :: LHsType GhcPs -> RnM ()
+    check_suffix (L l ty) = case ty of
+      HsForAllTy{hst_tele = tele, hst_body = body} ->
+        check_group (locA l) tele >> check_suffix body
+      HsForEachTy{hst_body = body} -> check_suffix body
+      HsQualTy{hst_body = body} -> check_suffix body
+      HsFunTy _ _ _ body -> check_suffix body
+      HsParTy _ body -> check_suffix body
+      _ -> pure ()
 
 rnConDeclH98Details ::
       Name

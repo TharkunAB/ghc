@@ -13,6 +13,7 @@ module GHC.Tc.Types.CtLoc (
   CtLocEnv(..),
   getCtLocEnvLoc, setCtLocEnvLoc, setCtLocRealLoc,
   getCtLocEnvLvl, setCtLocEnvLvl,
+  getCtLocEnvTermDepth, getCtLocEnvIdDepths, extendCtLocTermScope,
   ctLocEnvInGeneratedCode,
 
   -- * SubGoalDepth
@@ -36,6 +37,8 @@ import GHC.Tc.Types.ErrCtxt
 import GHC.Tc.Types.Origin
 
 import GHC.Tc.Utils.TcType
+import GHC.Types.Var ( Id )
+import GHC.Types.Var.Env ( VarEnv, extendVarEnv )
 
 import GHC.Types.Basic( IntWithInf, mkIntWithInf, TypeOrKind(..) )
 import GHC.Types.SrcLoc
@@ -443,6 +446,8 @@ data CtLocEnv = CtLocEnv { ctl_ctxt :: !ErrCtxtStack
                          , ctl_loc :: !RealSrcSpan
                          , ctl_bndrs :: !TcBinderStack
                          , ctl_tclvl :: !TcLevel
+                         , ctl_term_depth :: !TermScopeDepth
+                         , ctl_id_depths :: !(VarEnv TermScopeDepth)
                          , ctl_in_gen_code :: !Bool
                          , ctl_rdr :: !LocalRdrEnv }
 
@@ -451,6 +456,17 @@ getCtLocEnvLoc = ctl_loc
 
 getCtLocEnvLvl :: CtLocEnv -> TcLevel
 getCtLocEnvLvl = ctl_tclvl
+
+getCtLocEnvTermDepth :: CtLocEnv -> TermScopeDepth
+getCtLocEnvTermDepth = ctl_term_depth
+
+getCtLocEnvIdDepths :: CtLocEnv -> VarEnv TermScopeDepth
+getCtLocEnvIdDepths = ctl_id_depths
+
+extendCtLocTermScope :: Id -> TermScopeDepth -> CtLoc -> CtLoc
+extendCtLocTermScope bndr d ctl@(CtLoc { ctl_env = env })
+  = ctl { ctl_env = env { ctl_term_depth = max d (ctl_term_depth env)
+                        , ctl_id_depths  = extendVarEnv (ctl_id_depths env) bndr d } }
 
 setCtLocEnvLvl :: CtLocEnv -> TcLevel -> CtLocEnv
 setCtLocEnvLvl env lvl = env { ctl_tclvl = lvl }

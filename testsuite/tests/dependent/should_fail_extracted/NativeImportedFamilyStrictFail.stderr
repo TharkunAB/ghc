@@ -1,0 +1,6 @@
+NativeImportedFamilyStrictFail.hs:15:29: error: [GHC-70566]
+    • Cannot reduce the open call to ‘keep’ in a type.
+        Reduction cannot inspect the value of a type operand. A type operand supplies no runtime value.
+    • In the type ‘NativeImportedFamilyStrictFail.keep Bool Char’
+      In the type family instance declaration for ‘Payload’
+

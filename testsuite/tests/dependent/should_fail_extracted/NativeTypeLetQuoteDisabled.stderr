@@ -1,0 +1,6 @@
+NativeTypeLetQuoteDisabled.hs:4:13: error: [GHC-29822]
+    • A type-level ‘let’ or local ‘type’ synonym requires -XDependentTypes or -XExtendedLet.
+    • In the untyped splice:
+        $(do b <- newName "b"
+             letT b (conT ''Int) (varT b))
+

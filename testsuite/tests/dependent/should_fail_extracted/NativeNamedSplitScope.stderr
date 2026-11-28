@@ -1,0 +1,89 @@
+NativeNamedSplitScope.hs:10:61: error: [GHC-83865]
+    • Couldn't match type ‘_1’ with ‘_2’
+      Expected: Vec Bool _1
+        Actual: Vec Bool _2
+    • When checking that the pattern signature: Vec Bool _2
+        fits the type of its context: Vec Bool _1
+      In the pattern: _ :: Vec Bool same
+      In the pattern: (_, _ :: Vec Bool same, _)
+
+NativeNamedSplitScope.hs:13:50: error: [GHC-25897]
+    • Couldn't match type ‘outside’ with ‘_7’
+      Expected: Vec Bool outside
+        Actual: Vec Bool _7
+      ‘outside’ is a rigid type variable bound by
+        the type signature for:
+          escape :: forall (outside :: Nat).
+                    CheckedSplit Bool (S Z) (S Z) -> Vec Bool outside
+        at NativeNamedSplitScope.hs:12:1-79
+    • In the expression: rhs
+      In an equation for ‘escape’:
+          escape (Pair _ (_, rhs :: Vec Bool suffix, _)) = rhs
+    • Relevant bindings include
+        rhs :: Vec Bool _7 (bound at NativeNamedSplitScope.hs:13:20)
+        escape :: CheckedSplit Bool (S Z) (S Z) -> Vec Bool outside
+          (bound at NativeNamedSplitScope.hs:13:1)
+
+NativeNamedSplitScope.hs:16:54: error: [GHC-25897]
+    • Couldn't match type ‘total’ with ‘S _6’
+      Expected: Vec Bool total
+        Actual: Vec Bool (S _6)
+      ‘total’ is a rigid type variable bound by
+        the type signature for:
+          lazyProof :: forall (total :: Nat).
+                       CheckedSplit Bool (S Z) total -> Vec Bool total -> Bool
+        at NativeNamedSplitScope.hs:15:1-70
+    • When checking that the pattern signature: Vec Bool (S _6)
+        fits the type of its context: Vec Bool total
+      In the pattern: _ :: Vec Bool ('S suffix)
+      In an equation for ‘lazyProof’:
+          lazyProof
+            (Pair _ ~(_, _ :: Vec Bool suffix, Refl))
+            (_ :: Vec Bool ('S suffix))
+            = True
+    • Relevant bindings include
+        lazyProof :: CheckedSplit Bool (S Z) total
+                     -> Vec Bool total -> Bool
+          (bound at NativeNamedSplitScope.hs:16:1)
+
+NativeNamedSplitScope.hs:19:23: error: [GHC-83865]
+    • Couldn't match type: Token suffix
+                     with: Token _
+      Expected: Token _
+        Actual: Token suffix
+      Note: ‘Token’ is a non-injective type family.
+      The type variable ‘suffix’ is ambiguous
+    • When checking that the pattern signature: Token suffix
+        fits the type of its context:
+          NativeNamedSplitOpaque.$lambda:Opaque:0-sigma _
+      In the pattern: _ :: Token suffix
+      In the pattern: Pair _ (_ :: Token suffix)
+
+NativeNamedSplitScope.hs:23:71: error: [GHC-83865]
+    • Couldn't match type ‘_4’ with ‘_5’
+      Expected: Vec Bool _5
+        Actual: Vec Bool _4
+    • In the second argument of ‘zipVec’, namely ‘b’
+      In the first argument of ‘toList’, namely ‘(zipVec a b)’
+      In the expression: toList (zipVec a b)
+    • Relevant bindings include
+        b :: Vec Bool _4 (bound at NativeNamedSplitScope.hs:23:45)
+        a :: Vec Bool _5 (bound at NativeNamedSplitScope.hs:23:26)
+
+NativeNamedSplitScope.hs:29:56: error: [GHC-83865]
+    • Couldn't match type: Fold _3
+                     with: Fold other
+      Expected: Vec Bool (Fold other)
+        Actual: Vec Bool (Fold _3)
+      Note: ‘Fold’ is a non-injective type family.
+    • In the second argument of ‘atNamedIndex’, namely ‘cells’
+      In the expression: atNamedIndex selected cells
+      In an equation for ‘invert’:
+          invert selected (Pair _ cells) = atNamedIndex selected cells
+    • Relevant bindings include
+        cells :: Vec Bool (Fold _3)
+          (bound at NativeNamedSplitScope.hs:29:25)
+        selected :: Proxy other (bound at NativeNamedSplitScope.hs:29:8)
+        invert :: Proxy other -> HiddenVec -> Bool
+          (bound at NativeNamedSplitScope.hs:29:1)
+

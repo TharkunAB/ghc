@@ -1,0 +1,7 @@
+NativeRetainedCastLength.hs:8:11: error: [GHC-18872]
+    • Couldn't match type ‘n’ with ‘S n’ arising from a use of ‘coerce’
+      • Note: The type constructor ‘Vec’ has nominal role in its second argument.
+    • In the expression: coerce @(Vec Int n) @(Vec Int ('S n)) (f n)
+      In an equation for ‘bad’:
+          bad f n = coerce @(Vec Int n) @(Vec Int ('S n)) (f n)
+

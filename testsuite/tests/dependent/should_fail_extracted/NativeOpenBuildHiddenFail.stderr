@@ -1,0 +1,6 @@
+NativeOpenBuildHiddenFail.hs:8:23: error: [GHC-70566]
+    • Cannot reduce the open call to ‘Ctrl.otherBuild’ in a type.
+        A result constructor of Shell is not in scope through an ordinary import.
+    • In the type ‘Ctrl.otherBuild a b’
+      In the type synonym declaration for ‘HiddenMake’
+

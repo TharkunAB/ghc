@@ -7,5 +7,10 @@ data IdDetails
 vanillaIdInfo :: IdInfo
 coVarDetails :: IdDetails
 isCoVarDetails :: IdDetails -> Bool
+isJoinIdDetails :: IdDetails -> Bool
 pprIdDetails :: IdDetails -> SDoc
+inferredRetainedIdInfo :: IdInfo -> Bool
+setInferredRetainedIdInfo :: Bool -> IdInfo -> IdInfo
+invisibleRetainedIdInfo :: IdInfo -> Bool
+setInvisibleRetainedIdInfo :: Bool -> IdInfo -> IdInfo
 

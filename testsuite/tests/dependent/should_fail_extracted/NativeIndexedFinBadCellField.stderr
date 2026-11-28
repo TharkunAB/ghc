@@ -1,0 +1,13 @@
+NativeIndexedFinBadCellField.hs:9:47: error: [GHC-83865]
+    • Couldn't match expected type ‘Int’ with actual type ‘Char’
+    • In the second argument of ‘Cell’, namely ‘n’
+      In the first argument of ‘rebuild’, namely ‘(Cell flags n)’
+      In the expression: rebuild (Cell flags n)
+
+NativeIndexedFinBadCellField.hs:12:44: error: [GHC-83605]
+    • A retained argument must have unrestricted multiplicity Many.
+      This argument has multiplicity: One
+    • In the first argument of ‘rebuild’, namely ‘(Cell flags n)’
+      In the expression: rebuild (Cell flags n)
+      In the expression: case rebuild (Cell flags n) of Cell xs _ -> xs
+

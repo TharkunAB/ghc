@@ -1,0 +1,7 @@
+NativeStoredDictCompetingDirect.hs:10:31: error: [GHC-83605]
+    • No checked source equations are available for ‘pick’ in this retained argument.
+    • In the expression: tag (pick x)
+      In the expression: case tag (pick x) of Tagged b -> At b
+      In a case alternative:
+          Stored _ -> case tag (pick x) of Tagged b -> At b
+

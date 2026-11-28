@@ -523,7 +523,28 @@ cvBindsAndSigsOnly :: OrdList (LHsDecl GhcPs)
 -- associated type declarations. They might also contain Haddock comments.
 cvBindsAndSigsOnly fb = do
   fb' <- cvBindsAndSigs fb
-  return (fmap wrapValBind fb')
+  return (fmap wrapValBindPs fb')
+
+-- | Wrap a parsed local declaration, encoding local @type@ synonyms under
+-- @-XExtendedLet@ as @tcClsName@-headed 'TypeSig' entries for 'GHC.Rename.Bind'.
+wrapValBindPs :: LHsDecl GhcPs -> ValBind GhcPs GhcPs
+wrapValBindPs (L l (TyClD _ (SynDecl { tcdLName = tc
+                                     , tcdTyVars = HsQTvs _ tvbs
+                                     , tcdFixity = fixity
+                                     , tcdRhs = rhs })))
+  = VbSig $ L l $ TypeSig (AnnSig noAnn fixity_tag Nothing) [] [tc]
+      (mkHsWildCardBndrs (L l (mkHsExplicitSigType noAnn spec_tvbs rhs)))
+  where
+    fixity_tag = case fixity of
+      Infix  -> Just (EpTok (EpaDelta noSrcSpan (SameLine 1) []))
+      Prefix -> Nothing
+    spec_tvbs =
+      [ L bl (HsTvb xb spec bvar bkind)
+      | L bl (HsTvb xb bvis bvar bkind) <- tvbs
+      , let spec = case bvis of
+              HsBndrRequired _  -> SpecifiedSpec
+              HsBndrInvisible _ -> InferredSpec ]
+wrapValBindPs d = wrapValBind d
 
 wrapValBind :: LHsDecl (GhcPass p) -> ValBind (GhcPass p) (GhcPass p)
 wrapValBind (L l (ValD _ b)) = VbBind (L l b)
@@ -779,20 +800,16 @@ recordPatSynErr loc pat =
     addFatalError $ mkPlainErrorMsgEnvelope loc $
       (PsErrRecordSyntaxInPatSynDecl pat)
 
-mkConDeclH98 :: (TokDarrow, (TokForall, EpToken ".")) -> [LHsModifier GhcPs]
-             -> LocatedN RdrName -> Maybe [LHsTyVarBndr Specificity GhcPs]
-                -> Maybe (LHsContext GhcPs) -> HsConDeclH98Details GhcPs
-                -> ConDecl GhcPs
-
-mkConDeclH98 (tdarrow, (tforall,tdot)) mods name mb_forall mb_cxt args
-  = ConDeclH98 { con_ext    = AnnConDeclH98 tforall tdot tdarrow
-               , con_name   = name
-               , con_forall = isJust mb_forall
-               , con_ex_tvs = mb_forall `orElse` []
-               , con_mb_cxt = mb_cxt
-               , con_args   = args
+mkConDeclH98 :: [LHsModifier GhcPs] -> LocatedN RdrName
+             -> [LHsGadtTelescope GhcPs] -> HsConDeclH98Details GhcPs
+             -> ConDecl GhcPs
+mkConDeclH98 mods name teles args
+  = ConDeclH98 { con_ext = noExtField
+               , con_name = name
+               , con_telescope = teles
+               , con_args = args
                , con_modifiers = mods
-               , con_doc    = Nothing }
+               , con_doc = Nothing }
 
 -- | Construct a GADT-style data constructor from the constructor names and
 -- their type. Some interesting aspects of this function:
@@ -830,17 +847,16 @@ mkGadtDecl loc mods names dcol ty = do
                      { con_g_ext  = AnnConDeclGADT ops cps dcol
                      , con_names  = names
                      , con_outer_bndrs = L outer_bndrs_loc outer_bndrs
-                     , con_inner_bndrs = inner_bndrs
-                     , con_cxts = cxts
+                     , con_telescope = inner_bndrs
                      , con_g_args = args
                      , con_res_ty = res_ty
                      , con_modifiers = mods
                      , con_doc    = Nothing }
   where
-    (outer_bndrs, inner_bndrs, cxts, body_ty) = splitLHsGadtTy ty
+    (outer_bndrs, inner_bndrs, body_ty) = splitLHsGadtTy ty
     outer_bndrs_loc = case outer_bndrs of
       HsOuterImplicit{} -> getLoc ty
-      HsOuterExplicit an _ -> EpAnn (entry an) noAnn emptyComments
+      HsOuterExplicit {hso_xexplicit = an} -> EpAnn (entry an) noAnn emptyComments
 
 
 setRdrNameSpace :: RdrName -> NameSpace -> RdrName
@@ -1043,10 +1059,12 @@ checkRuleTyVarBndrNames :: [LRuleTyTmVar] -> P ()
 checkRuleTyVarBndrNames bndrs
    = sequence_ [ check lname | L _ (RuleTyTmVar _ lname _) <- bndrs ]
   where
-    check (L loc (Unqual occ)) =
-          when (occNameFS occ `elem` [fsLit "family",fsLit "role"]) $
-          addFatalError $ mkPlainErrorMsgEnvelope (locA loc) $
-                          PsErrParseErrorOnInput occ
+    check (L loc (Unqual occ)) = do
+      dependent <- getBit DependentTypesBit
+      let name = occNameFS occ
+      when (name `elem` [fsLit "family",fsLit "role"] || (dependent && name == fsLit "some")) $
+        addFatalError $ mkPlainErrorMsgEnvelope (locA loc) $
+          PsErrParseErrorOnInput occ
     check _ = panic "checkRuleTyVarBndrNames"
 
 -- | Deal with both old-form and new-form specialise pragmas, using the new
@@ -1787,6 +1805,9 @@ class (b ~ (Body b) GhcPs, AnnoBody b) => DisambECP b where
   mkHsAppPV :: SrcSpanAnnA -> LocatedA b -> LocatedA (FunArg b) -> PV (LocatedA b)
   -- | Disambiguate "f @t" (visible type application)
   mkHsAppTypePV :: SrcSpanAnnA -> LocatedA b -> EpToken "@" -> LHsType GhcPs -> PV (LocatedA b)
+  -- | Disambiguate "f @{e}" (explicit invisible retained application).
+  mkHsAppRetainedPV :: SrcSpanAnnA -> LocatedA b -> XAppRetained GhcPs
+                    -> LHsExpr GhcPs -> PV (LocatedA b)
   -- | Disambiguate "if ... then ... else ..."
   mkHsIfPV :: SrcSpan
          -> LHsExpr GhcPs
@@ -1944,6 +1965,7 @@ instance DisambECP (HsCmd GhcPs) where
     checkExpBlockArguments e
     return $ L l (HsCmdApp noExtField c e)
   mkHsAppTypePV l c _ t = cmdFail (locA l) (ppr c <+> text "@" <> ppr t)
+  mkHsAppRetainedPV l c _ e = cmdFail (locA l) (ppr c <+> text "@" <> braces (ppr e))
   mkHsIfPV l c semi1 a semi2 b anns = do
     checkDoAndIfThenElse PsErrSemiColonsInCondCmd c semi1 a semi2 b
     !cs <- getCommentsFor l
@@ -2043,6 +2065,9 @@ instance DisambECP (HsExpr GhcPs) where
   mkHsAppTypePV l e at t = do
     checkExpBlockArguments e
     return $ L l (HsAppType at e (mkHsWildCardBndrs t))
+  mkHsAppRetainedPV l fun anns arg = do
+    checkExpBlockArguments fun
+    return $ L l (HsAppRetained anns fun arg)
   mkHsIfPV l c semi1 a semi2 b anns = do
     checkDoAndIfThenElse PsErrSemiColonsInCondExpr c semi1 a semi2 b
     !cs <- getCommentsFor l
@@ -2144,6 +2169,7 @@ instance DisambECP (PatBuilder GhcPs) where
   mkHsAppTypePV l p at t = do
     !cs <- getCommentsFor (locA l)
     return $ L (addCommentsToEpAnn l cs) (PatBuilderAppType p at (mkHsTyPat t))
+  mkHsAppRetainedPV l p _ e = patFail (locA l) (PsErrInPat (unLoc p) (PEIP_RetainedArg e))
   mkHsIfPV l _ _ _ _ _ _ = addFatalError $ mkPlainErrorMsgEnvelope l PsErrIfThenElseInPat
   mkHsDoPV l _ _ _       = addFatalError $ mkPlainErrorMsgEnvelope l PsErrDoNotationInPat
   mkHsParPV l lpar p rpar   = return $ L (noAnnSrcSpan l) (PatBuilderPar lpar p rpar)
@@ -2358,8 +2384,8 @@ mkStarPV tok = do
 setTelescopeBndrsNameSpace :: NameSpace -> HsForAllTelescope GhcPs -> HsForAllTelescope GhcPs
 setTelescopeBndrsNameSpace ns forall_telescope =
   case forall_telescope of
-    HsForAllInvis x bndrs -> HsForAllInvis x (set_bndrs_ns bndrs)
-    HsForAllVis   x bndrs -> HsForAllVis   x (set_bndrs_ns bndrs)
+    HsForAllInvis x ma bndrs -> HsForAllInvis x ma (set_bndrs_ns bndrs)
+    HsForAllVis   x ma bndrs -> HsForAllVis   x ma (set_bndrs_ns bndrs)
   where
     set_bndrs_ns :: [LHsTyVarBndr flag GhcPs] -> [LHsTyVarBndr flag GhcPs]
     set_bndrs_ns = map (setLHsTyVarBndrNameSpace ns)
@@ -3804,9 +3830,12 @@ punsIfElse enabled disabled = do
 -- This is used in Parser.y to guard rules that require punning.
 requireLTPuns :: PsErrPunDetails -> Located a -> Located b -> P ()
 requireLTPuns err start end =
-  unlessM punsAllowed $ do
+  unlessM allowed $ do
     addError (mkPlainErrorMsgEnvelope loc (PsErrInvalidPun err))
   where
+    allowed = case err of
+      PEP_TupleSyntaxType -> (||) <$> punsAllowed <*> getBit DependentTypesBit
+      _                   -> punsAllowed
     loc = (combineSrcSpans (getLoc start) (getLoc end))
 
 -- | Call a parser with a span and its comments given by a start and end token.

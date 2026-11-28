@@ -1,0 +1,58 @@
+NativeTypeLetRigid.hs:11:13: error: [GHC-83865]
+    • Couldn't match type ‘case width of {True -> 3; False -> 2}’
+                     with ‘2’
+      Expected: DimensionWithOverride width Nothing :~: 2
+        Actual: 2 :~: 2
+    • In the expression: Refl
+      In an equation for ‘unknown’: unknown _ = Refl
+    • Relevant bindings include
+        unknown :: Proxy width -> DimensionWithOverride width Nothing :~: 2
+          (bound at NativeTypeLetRigid.hs:11:1)
+
+NativeTypeLetRigid.hs:14:12: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: DependentCase (Maybe Bool) (Just True) True True
+                :~: (Proxy (Just False), Maybe Bool)
+        Actual: (Proxy (Just False), Maybe Bool)
+                :~: (Proxy (Just False), Maybe Bool)
+    • In the expression: Refl
+      In an equation for ‘mismatch’: mismatch = Refl
+
+NativeTypeLetRigid.hs:17:15: error: [GHC-83865]
+    • Couldn't match type ‘case b of {True -> Bool; False -> Char}’
+                     with ‘Bool’
+      Expected: CaseResult b :~: Either Bool Bool
+        Actual: Either Bool Bool :~: Either Bool Bool
+    • In the expression: Refl
+      In an equation for ‘rigidCase’: rigidCase _ = Refl
+    • Relevant bindings include
+        rigidCase :: Proxy b -> CaseResult b :~: Either Bool Bool
+          (bound at NativeTypeLetRigid.hs:17:1)
+
+NativeTypeLetRigid.hs:20:13: error: [GHC-25897]
+    • Couldn't match type ‘dimensions’
+                     with ‘'(ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairFirst
+                               dimensions,
+                             ghc-internal-10.100.0:GHC.Internal.TupleProjection.PairSecond
+                               dimensions)’
+      Expected: Rebuild dimensions :~: dimensions
+        Actual: dimensions :~: dimensions
+      ‘dimensions’ is a rigid type variable bound by
+        the type signature for:
+          pairEta :: forall (dimensions :: (GHC.Internal.TypeNats.Nat,
+                                            GHC.Internal.TypeNats.Nat)).
+                     Proxy dimensions -> Rebuild dimensions :~: dimensions
+        at NativeTypeLetRigid.hs:19:1-64
+    • In the expression: Refl
+      In an equation for ‘pairEta’: pairEta _ = Refl
+    • Relevant bindings include
+        pairEta :: Proxy dimensions -> Rebuild dimensions :~: dimensions
+          (bound at NativeTypeLetRigid.hs:20:1)
+
+NativeTypeLetRigid.hs:23:14: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Frame Z True Char :~: Vec Char Z
+        Actual: Vec Char Z :~: Vec Char Z
+    • In the expression: Refl
+      In an equation for ‘wrongWidth’: wrongWidth = Refl
+

@@ -1,0 +1,54 @@
+NativePercentArrowAliases.hs:10:1: error: [GHC-83865]
+    • Couldn't match expected type ‘GHC.Internal.Types.Matchable’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+    • The kind synonym ‘LocalArrow’ supplies an unmatchable (U) arrow.
+      This declaration requires a matchable (M) arrow.
+      Use '%M ->' in the synonym's definition, or use a separate matchable synonym here.
+      In the data type declaration for ‘SymbolLocal’
+
+NativePercentArrowAliases.hs:11:1: error: [GHC-83865]
+    • Couldn't match expected type ‘GHC.Internal.Types.Matchable’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+    • The kind synonym ‘~>’ supplies an unmatchable (U) arrow.
+      This declaration requires a matchable (M) arrow.
+      Use a kind with a matchable arrow or import a matchable synonym.
+      In the data type declaration for ‘SymbolImported’
+
+NativePercentArrowAliases.hs:12:1: error: [GHC-83865]
+    • Couldn't match type ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected: GHC.Internal.Types.Matchable
+        Actual: U
+    • In the data type declaration for ‘SymbolWired’
+
+NativePercentArrowAliases.hs:13:1: error: [GHC-83865]
+    • Couldn't match expected type ‘GHC.Internal.Types.Matchable’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+    • The kind synonym ‘LocalArrow’ supplies an unmatchable (U) arrow.
+      This declaration requires a matchable (M) arrow.
+      Use '%M ->' in the synonym's definition, or use a separate matchable synonym here.
+      In the data type declaration for ‘SymbolTrailing’
+
+NativePercentArrowAliases.hs:15:1: error: [GHC-83865]
+    • Couldn't match type ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected: GHC.Internal.Types.Matchable
+        Actual: U
+    • In the data type declaration for ‘SymbolForwarded’
+
+NativePercentArrowAliases.hs:18:1: error: [GHC-83865]
+    • Couldn't match expected type ‘GHC.Internal.Types.Matchable’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+    • The kind synonym ‘InvisibleKind’ supplies an unmatchable (U) invisible forall.
+      This declaration requires a matchable (M) invisible forall.
+      Use 'forall ... . @M' in the synonym's definition, or use a separate matchable synonym here.
+      In the data type declaration for ‘InvisibleSymbol’
+
+NativePercentArrowAliases.hs:20:23: error: [GHC-83865]
+    • Couldn't match expected type ‘GHC.Internal.Types.Matchable’
+                  with actual type ‘GHC.Internal.Types.Unmatchable’
+    • The kind synonym ‘VisibleKind’ supplies an unmatchable (U) visible forall.
+      This declaration requires a matchable (M) visible forall.
+      Use 'forall ... -> @M' in the synonym's definition, or use a separate matchable synonym here.
+      In a standalone kind signature for ‘VisibleSymbol’: VisibleKind
+

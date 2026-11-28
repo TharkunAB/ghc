@@ -6,7 +6,7 @@
              DataKinds, PolyKinds , ConstraintKinds, UndecidableInstances,
              FlexibleInstances, MultiParamTypeClasses, FunctionalDependencies,
              FlexibleContexts, StandaloneDeriving, InstanceSigs,
-             RankNTypes, UndecidableSuperClasses #-}
+             RankNTypes, UndecidableSuperClasses, Modifiers #-}
 
 module RaeJobTalk where
 
@@ -83,7 +83,7 @@ data TyCon a where
   Char :: TyCon Char
   List :: TyCon []
   Maybe :: TyCon Maybe
-  Arrow :: TyCon (->)
+  Arrow :: TyCon (FUN @Matchable 'Many)
   TYPE  :: TyCon TYPE
   RuntimeRep :: TyCon RuntimeRep
   Levity :: TyCon Levity
@@ -199,7 +199,7 @@ instance Read (SomeTypeRep IsType) where
 
 kindRep :: TypeRep (a :: k) -> TypeRep k
 kindRep (TyCon _) = typeRep
-kindRep (TyApp (f :: TypeRep (tf :: k1 -> k)) _) = case kindRep f :: TypeRep (k1 -> k) of
+kindRep (TyApp (f :: TypeRep (tf :: k1 %Matchable -> k)) _) = case kindRep f :: TypeRep (k1 %Matchable -> k) of
   TyApp _ res -> res
 
 -- Convert an explicit TypeRep into an implicit one. Doesn't require unsafeCoerce
@@ -219,7 +219,7 @@ instance TyConAble Bool      where tyCon = Bool
 instance TyConAble Char      where tyCon = Char
 instance TyConAble []        where tyCon = List
 instance TyConAble Maybe     where tyCon = Maybe
-instance TyConAble (->)      where tyCon = Arrow
+instance TyConAble (FUN @Matchable 'Many) where tyCon = Arrow
 instance TyConAble TYPE      where tyCon = TYPE
 instance TyConAble 'Exts.Lifted    where tyCon = Lifted
 instance TyConAble 'Exts.BoxedRep  where tyCon = BoxedRep

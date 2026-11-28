@@ -1,0 +1,6 @@
+NativeSourceLengthRecursion.hs:10:15: error: [GHC-70566]
+    • Cannot reduce the open call to ‘loop’ in a type.
+        Reduction exceeded the open evaluation step limit (-freduction-depth).
+    • In the type ‘loop '[ 'True]’
+      In the type synonym declaration for ‘Answer’
+

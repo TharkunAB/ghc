@@ -1,4 +1,5 @@
 -- (c) The University of Glasgow 2012
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | Module for coercion axioms, used to represent type family instances
 -- and newtypes
@@ -21,11 +22,15 @@ module GHC.Core.Coercion.Axiom (
        placeHolderIncomps, placeHolderOverlaps,
 
        Role(..),
+       existsCoRuleName,
 
-       CoAxiomRule(..), BuiltInFamRewrite(..), BuiltInFamInjectivity(..), TypeEqn,
+       CoAxiomRule(.., BuiltInEqRule), BuiltInFamRewrite(..), BuiltInFamInjectivity(..), TypeEqn,
+       scopedSigmaClosureName, scopedLambdaClosureName, scopedLambdaEtaName,
+       scopedCaseTreeName,
+       matchableProjectionName, matchableProjectionDirection,
        coAxiomRuleArgRoles, coAxiomRuleRole,
-       coAxiomRuleBranch_maybe, isNewtypeAxiomRule_maybe,
-       ClosedTyFam(..), BuiltinClosedTyFam(..),
+       coAxiomRuleBranch_maybe, sourceProofAxiomRules, isNewtypeAxiomRule_maybe,
+       ClosedTyFam(..), closedTyFamCoAxiom_maybe, BuiltinClosedTyFam(..),
        trivialBuiltInClosedTyFam
        ) where
 
@@ -50,6 +55,14 @@ import GHC.Types.SrcLoc
 import qualified Data.Data as Data
 import Data.Array
 import Data.List ( mapAccumL )
+
+-- | The wire name of an existential congruence rule at a checked role.
+existsCoRuleName :: ExistsTyFlag -> Role -> FastString
+existsCoRuleName ExplicitExists Nominal = fsLit "NominalExistsCo"
+existsCoRuleName ExplicitExists Representational = fsLit "RepresentationalExistsCo"
+existsCoRuleName ImplicitExists Nominal = fsLit "NominalImplicitExistsCo"
+existsCoRuleName ImplicitExists Representational = fsLit "RepresentationalImplicitExistsCo"
+existsCoRuleName _ Phantom = panic "existsCoRuleName: phantom lifting"
 
 {-
 Note [Coercion axiom branches]
@@ -260,6 +273,7 @@ data CoAxiom br
     , co_ax_tc       :: TyCon         -- The head of the LHS patterns
                                       -- e.g.  the newtype or family tycon
     , co_ax_branches :: Branches br   -- The branches that form this axiom
+    , co_ax_source_proof_rules :: [(BranchIndex, [SourceProofRule])]
     , co_ax_implicit :: Bool          -- True <=> the axiom is "implicit"
                                       -- See Note [Implicit axioms]
          -- INVARIANT: co_ax_implicit == True implies length co_ax_branches == 1.
@@ -331,6 +345,12 @@ coAxiomName = co_ax_name
 
 coAxiomRole :: CoAxiom br -> Role
 coAxiomRole = co_ax_role
+
+-- | Rule dependencies of the branch selected by a family reduction.
+sourceProofAxiomRules :: CoAxiomRule -> [SourceProofRule]
+sourceProofAxiomRules (BranchedAxiom ax index) =
+  maybe [] id (lookup index (co_ax_source_proof_rules ax))
+sourceProofAxiomRules _ = []
 
 coAxiomBranches :: CoAxiom br -> Branches br
 coAxiomBranches = co_ax_branches
@@ -627,28 +647,66 @@ data CoAxiomRule
                                                        --    e.g.  a+b~0 ==>  a~0
                                                        -- Always unary
 
+  | BuiltInRule FastString Role [Role] ([TypeEqn] -> Maybe TypeEqn)
+    -- Checked equality with the given result role and premise roles.
+
   | BranchedAxiom      (CoAxiom Branched) BranchIndex  -- Closed type family
 
   | UnbranchedAxiom    (CoAxiom Unbranched)            -- Open type family instance,
                                                        --    data family instances
                                                        --    and newtypes
 
+-- | The nominal rules for pairs take two nominal premises.
+pattern BuiltInEqRule :: FastString -> ([TypeEqn] -> Maybe TypeEqn) -> CoAxiomRule
+pattern BuiltInEqRule name proves = BuiltInRule name Nominal [Nominal, Nominal] proves
+
+-- | The stable interface key for the scoped retained-sum proof rule.
+scopedSigmaClosureName :: FastString
+scopedSigmaClosureName = fsLit "ScopedSigmaClosure"
+
+-- | The stable interface key for the scoped type-lambda proof rule.
+scopedLambdaClosureName :: FastString
+scopedLambdaClosureName = fsLit "ScopedLambdaClosure"
+
+-- | The stable interface key for equality of a lambda and its forwarded family.
+scopedLambdaEtaName :: FastString
+scopedLambdaEtaName = fsLit "ScopedLambdaEta"
+
+-- | The interface key for conversion between checked retained case trees.
+scopedCaseTreeName :: FastString
+scopedCaseTreeName = fsLit "ScopedCaseTree"
+
+-- | Interface key for a nominal application projection with explicit heads.
+matchableProjectionName :: LeftOrRight -> FastString
+matchableProjectionName CLeft  = fsLit "MatchableAppLeft"
+matchableProjectionName CRight = fsLit "MatchableAppRight"
+
+-- | Decode the component selected by this built-in rule.
+matchableProjectionDirection :: FastString -> Maybe LeftOrRight
+matchableProjectionDirection name
+  | name == matchableProjectionName CLeft  = Just CLeft
+  | name == matchableProjectionName CRight = Just CRight
+  | otherwise                              = Nothing
+
 instance Eq CoAxiomRule where
   (BuiltInFamRew  bif1)  == (BuiltInFamRew  bif2)  = bifrw_name  bif1 == bifrw_name bif2
   (BuiltInFamInj bif1)   == (BuiltInFamInj bif2)   = bifinj_name bif1 == bifinj_name bif2
   (UnbranchedAxiom ax1)  == (UnbranchedAxiom ax2)  = getUnique ax1 == getUnique ax2
   (BranchedAxiom ax1 i1) == (BranchedAxiom ax2 i2) = getUnique ax1 == getUnique ax2 && i1 == i2
+  (BuiltInRule n1 _ _ _) == (BuiltInRule n2 _ _ _) = n1 == n2
   _ == _ = False
 
 coAxiomRuleRole :: CoAxiomRule -> Role
 coAxiomRuleRole (BuiltInFamRew  {})  = Nominal
 coAxiomRuleRole (BuiltInFamInj {})   = Nominal
+coAxiomRuleRole (BuiltInRule _ role _ _) = role
 coAxiomRuleRole (UnbranchedAxiom ax) = coAxiomRole ax
 coAxiomRuleRole (BranchedAxiom ax _) = coAxiomRole ax
 
 coAxiomRuleArgRoles :: CoAxiomRule -> [Role]
 coAxiomRuleArgRoles (BuiltInFamRew  bif) = replicate (bifrw_arity bif) Nominal
 coAxiomRuleArgRoles (BuiltInFamInj {})   = [Nominal]
+coAxiomRuleArgRoles (BuiltInRule _ _ roles _) = roles
 coAxiomRuleArgRoles (UnbranchedAxiom ax) = coAxBranchRoles (coAxiomSingleBranch ax)
 coAxiomRuleArgRoles (BranchedAxiom ax i) = coAxBranchRoles (coAxiomNthBranch ax i)
 
@@ -671,6 +729,7 @@ instance Data.Data CoAxiomRule where
 instance Outputable CoAxiomRule where
   ppr (BuiltInFamRew  bif) = ppr (bifrw_name bif)
   ppr (BuiltInFamInj bif)  = ppr (bifinj_name bif)
+  ppr (BuiltInRule name _ _ _) = ppr name
   ppr (UnbranchedAxiom ax) = ppr (coAxiomName ax)
   ppr (BranchedAxiom ax i) = ppr (coAxiomName ax) <> brackets (int i)
 
@@ -693,6 +752,15 @@ data ClosedTyFam
   -- | A closed type family declared in an hs-boot file, with a declaration
   -- of the form @type family F a where ..@ (the @..@ is source syntax, not an elision).
   | CTF_Abstract
+  -- | A private family in a retained-sum codomain. The Name is the root
+  -- of the lexical scope. The flag identifies the codomain of a written sum.
+  | CTF_Scoped !Name !Bool (CoAxiom Branched)
+
+-- | Get the checked equations of an ordinary or scoped closed family.
+closedTyFamCoAxiom_maybe :: ClosedTyFam -> Maybe (CoAxiom Branched)
+closedTyFamCoAxiom_maybe (CTF mb_ax) = mb_ax
+closedTyFamCoAxiom_maybe (CTF_Scoped _ _ ax) = Just ax
+closedTyFamCoAxiom_maybe _ = Nothing
 
 -- | The equations and interaction rules of a built-in closed type family.
 data BuiltinClosedTyFam = BuiltinClosedTyFam

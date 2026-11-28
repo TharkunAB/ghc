@@ -42,12 +42,18 @@ import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Expr
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Instantiate (tcInstSkolTyVarBndrsX, tcRuntimeForAllBndrs)
+import GHC.Tc.Types.Constraint (checkImplicationInvariants)
+import GHC.Tc.Types.Origin (CtOrigin(OccurrenceOf), SkolemInfoAnon(SigTypeSkol), mkSkolemInfo)
+import GHC.Tc.Solver.Monad (runTcSEqualities)
+import GHC.Tc.Solver.Rewrite (rewriteFamilyAxioms)
 import GHC.Tc.Instance.Family
 
 import GHC.Core.FamInstEnv
 import GHC.Core.Coercion
 import GHC.Core.Reduction
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep
 import GHC.Core.Multiplicity
 import GHC.Core.DataCon
 import GHC.Core.TyCon
@@ -58,6 +64,7 @@ import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
+import GHC.Types.Var.Env (mkInScopeSet)
 
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.WiredIn.Prim( isArrowTyCon )
@@ -123,6 +130,51 @@ normaliseFfiType :: Type -> TcM (Reduction, Bag GlobalRdrElt)
 normaliseFfiType ty
     = do fam_envs <- tcGetFamInstEnvs
          normaliseFfiType' fam_envs ty
+
+-- | Validate the runtime forall prefix and retain its metadata reductions.
+-- See Note [Foreign forall matchability].
+tcCheckForeignForAlls :: Name -> Reduction -> TcM Reduction
+tcCheckForeignForAlls name redn
+  | (bndrs, body) <- splitForAllForAllTyBinders (reductionReducedType redn)
+  , not (null bndrs)
+  = do { loc <- getCtLocM (OccurrenceOf name) Nothing
+       ; ma_redns <- mapM (\(ma, _) ->
+                            runTcSEqualities (rewriteFamilyAxioms loc ma)) bndrs
+       ; let norm_bndrs = zipWith (\ma_redn (_, bndr) ->
+                                    (reductionReducedType ma_redn, bndr)) ma_redns bndrs
+             norm_ty = mkTyCoForAllTys norm_bndrs body
+             norm_co = mkHomoForAllCos
+                         (zipWith (\ma_redn (_, bndr) ->
+                                    (reductionCoercion ma_redn, bndr)) ma_redns bndrs)
+                         (mkReflCo Representational body)
+             subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType norm_ty))
+       ; skol_info <- mkSkolemInfo (SigTypeSkol (ForSigCtxt name))
+       ; (subst', skol_bndrs) <- tcInstSkolTyVarBndrsX skol_info subst norm_bndrs
+       ; (_, prefix_implics) <- tcRuntimeForAllBndrs skol_info [] [] skol_bndrs
+                                  (substTy subst' body)
+       ; mapBagM_ checkImplicationInvariants prefix_implics
+       ; emitImplications prefix_implics
+       ; pure (reductionCoercion redn `mkTransRedn` mkReduction norm_co norm_ty) }
+  | otherwise = pure redn
+
+{- Note [Foreign forall matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Foreign desugaring introduces runtime type lambdas with U metadata. Check the
+actual normalized forall prefix, including prefixes hidden by synonyms and
+newtypes. A check of the written outer annotation does not cover these types.
+
+Reduce each annotation with the solver's bounded family-axiom rewriter. Keep
+its nominal proof in the FFI normalization coercion. A computed U annotation
+can then become U in the type of the generated lambdas without losing proof.
+This step does not use local Given evidence or default unknown annotations.
+
+Freshen the telescope and use the ordinary runtime-forall obligations. Each
+obligation sees only earlier binders. Do not introduce theta Givens or let a
+later binder justify an outer annotation. M and unresolved annotations fail
+through ordinary equality solving. The checked wrapper is not needed here:
+foreign desugaring uses the normalized U prefix and the retained coercion.
+See Note [Runtime forall matchability] in GHC.Tc.Utils.Instantiate.
+-}
 
 normaliseFfiType' :: FamInstEnvs -> Type -> TcM (Reduction, Bag GlobalRdrElt)
 normaliseFfiType' env ty0 = runWriterT $ go Representational initRecTc ty0
@@ -253,7 +305,8 @@ tcFImport (L dloc fo@(ForeignImport { fd_name = L nloc nm, fd_sig_ty = hs_ty
                                     , fd_fi = imp_decl, fd_modifiers = mods }))
   = setSrcSpanA dloc $ addErrCtxt (ForeignDeclCtxt fo)  $
     do { sig_ty <- tcHsSigType (ForSigCtxt nm) hs_ty
-       ; (Reduction norm_co norm_sig_ty, gres) <- normaliseFfiType sig_ty
+       ; (ffi_redn, gres) <- normaliseFfiType sig_ty
+       ; Reduction norm_co norm_sig_ty <- tcCheckForeignForAlls nm ffi_redn
        ; let
              -- Drop the foralls before inspecting the
              -- structure of the foreign type.
@@ -263,14 +316,14 @@ tcFImport (L dloc fo@(ForeignImport { fd_name = L nloc nm, fd_sig_ty = hs_ty
              --        "unacceptable result Eq a => a -> blah"
              -- Not a big deal.  We could make a better error message specially
              -- for overloaded functions, but doesn't seem worth it
-             (arg_tys, res_ty) = splitFunTys (dropForAlls norm_sig_ty)
+             (mas, arg_tys, res_ty) = splitFunTys (dropForAlls norm_sig_ty)
 
              id = mkLocalId nm ManyTy sig_ty
                  -- Use a LocalId to obey the invariant that locally-defined
                  -- things are LocalIds.  However, it does not need zonking,
                  -- (so GHC.Tc.Zonk.Type.zonkForeignExports ignores it).
 
-       ; imp_decl' <- tcCheckFIType arg_tys res_ty imp_decl
+       ; imp_decl' <- tcCheckFIType mas arg_tys res_ty imp_decl
           -- Can't use sig_ty here because sig_ty :: Type and
           -- we need HsType Id hence the undefined
 
@@ -288,19 +341,19 @@ tcFImport d = pprPanic "tcFImport" (ppr d)
 
 -- ------------ Checking types for foreign import ----------------------
 
-tcCheckFIType :: [Scaled Type] -> Type -> ForeignImport GhcRn -> TcM (ForeignImport GhcTc)
+tcCheckFIType :: [Type] -> [Scaled Type] -> Type -> ForeignImport GhcRn -> TcM (ForeignImport GhcTc)
 
-tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh (CLabel cLabel))
+tcCheckFIType mas arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh (CLabel cLabel))
   -- Foreign import label
   = do checkCg (Right idecl) backendValidityOfCImport
        -- NB check res_ty not sig_ty!
        --    In case sig_ty is (forall a. ForeignPtr a)
-       check (isFFILabelTy (mkScaledFunTys arg_tys res_ty))
+       check (isFFILabelTy (mkScaledFunTys (zip mas arg_tys) res_ty))
              (TcRnIllegalForeignType Nothing)
        cconv' <- checkCConv (Right idecl) cconv
        return $ CImport src (L lc cconv') safety (typeCheckHeader <$> mh) (CLabel cLabel)
 
-tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh CWrapper) = do
+tcCheckFIType _mas arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh CWrapper) = do
         -- Foreign wrapper (former foreign export dynamic)
         -- The type must be of the form ft -> IO (FunPtr ft), where ft is a valid
         -- foreign type.  For legacy reasons ft -> IO (Ptr ft) is accepted, too.
@@ -314,11 +367,11 @@ tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh CWrapper)
                         checkForeignRes nonIOok  checkSafe isFFIExportResultTy res1_ty
                         checkForeignRes mustBeIO checkSafe (isFFIDynTy arg1_ty) res_ty
                   where
-                     (arg1_tys, res1_ty) = tcSplitFunTys arg1_ty
+                     (_mas1, arg1_tys, res1_ty) = tcSplitFunTys arg1_ty
         _ -> addErrTc (TcRnIllegalForeignType Nothing OneArgExpected)
     return (CImport src (L lc cconv') safety (typeCheckHeader <$> mh) CWrapper)
 
-tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) mh
+tcCheckFIType mas arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) mh
                                             (CFunction target))
   | isDynamicTarget target = do -- Foreign import dynamic
       checkCg (Right idecl) backendValidityOfCImport
@@ -328,7 +381,7 @@ tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) mh
           addErrTc (TcRnIllegalForeignType Nothing AtLeastOneArgExpected)
         (Scaled arg1_mult arg1_ty:arg_tys) -> do
           dflags <- getDynFlags
-          let curried_res_ty = mkScaledFunTys arg_tys res_ty
+          let curried_res_ty = mkScaledFunTys (zip (drop 1 mas) arg_tys) res_ty
           checkNoLinearFFI arg1_mult
           check (isFFIDynTy curried_res_ty arg1_ty)
                 (TcRnIllegalForeignType (Just Arg))
@@ -350,6 +403,8 @@ tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) mh
   | cconv == JavaScriptCallConv = do
       cconv' <- checkCConv (Right idecl) cconv
       checkCg (Right idecl) backendValidityOfCImport
+      checkForeignArgs checkNoNativeForeignTy arg_tys
+      checkForeignRes nonIOok checkSafe checkNoNativeForeignTy res_ty
       -- leave the rest to the JS backend (at least for now)
       return $ cImport' cconv'
   | otherwise = do              -- Normal foreign import
@@ -429,7 +484,8 @@ tcFExport fo@(ForeignExport { fd_name = L loc nm, fd_sig_ty = hs_ty, fd_fe = spe
     sig_ty <- tcHsSigType (ForSigCtxt nm) hs_ty
     rhs <- tcCheckPolyExpr (nlHsVar nm) sig_ty
 
-    (Reduction norm_co norm_sig_ty, gres) <- normaliseFfiType sig_ty
+    (ffi_redn, gres) <- normaliseFfiType sig_ty
+    Reduction norm_co norm_sig_ty <- tcCheckForeignForAlls nm ffi_redn
 
     spec' <- tcCheckFEType norm_sig_ty spec
 
@@ -470,7 +526,7 @@ tcCheckFEType sig_ty edecl@(CExport src (L l (CExportStatic str cconv))) = do
   where
       -- Drop the foralls before inspecting
       -- the structure of the foreign type.
-    (arg_tys, res_ty) = tcSplitFunTys (dropForAlls sig_ty)
+    (_mas, arg_tys, res_ty) = tcSplitFunTys (dropForAlls sig_ty)
 
 {-
 ************************************************************************
@@ -704,6 +760,28 @@ checkRepTyCon check_tc ty
       Nothing -> NotValid NotADataType
   where
     mk_nt_reason tc tys = NewtypeDataConNotInScope tc tys
+
+checkNoNativeForeignTy :: Type -> Validity' IllegalForeignTypeReason
+checkNoNativeForeignTy ty
+  | hasNativeForeignTy ty = NotValid (TypeCannotBeMarshaled ty NotADataType)
+  | otherwise             = IsValid
+
+hasNativeForeignTy :: Type -> Bool
+hasNativeForeignTy = go
+  where
+    go ty | Just ty' <- coreView ty = go ty'
+    go (DepFunTy {})              = True
+    go (DepDictTy {})             = True
+    go (ExistsTy {})              = True
+    go (TermVarTy {})             = True
+    go (TermAppTy {})             = True
+    go (ClassAppTy {})            = True
+    go (ForAllTy ma b body)       = go ma || go (varType (binderVar b)) || go body
+    go (FunTy _ ma mult arg res)  = go ma || go mult || go arg || go res
+    go (AppTy f a)                = go f || go a
+    go (TyConApp _ args)          = any go args
+    go (CastTy t _)               = go t
+    go _                          = False
 
 {-
 Note [Foreign import dynamic]

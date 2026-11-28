@@ -1,0 +1,125 @@
+NativeOpenIndexedAppendFail.hs:13:13: error: [GHC-25897]
+    • Couldn't match type ‘ys’ with ‘xs’
+      Expected: P.appendVec P.VNil xs :~: ys
+        Actual: ys :~: ys
+      ‘ys’ is a rigid type variable bound by
+        the type signature for:
+          wrongTail :: forall (xs :: P.Vec Bool (P.S P.Z))
+                              (ys :: P.Vec Bool (P.S P.Z)).
+                       P.appendVec P.VNil xs :~: ys
+        at NativeOpenIndexedAppendFail.hs:(11,1)-(12,42)
+      ‘xs’ is a rigid type variable bound by
+        the type signature for:
+          wrongTail :: forall (xs :: P.Vec Bool (P.S P.Z))
+                              (ys :: P.Vec Bool (P.S P.Z)).
+                       P.appendVec P.VNil xs :~: ys
+        at NativeOpenIndexedAppendFail.hs:(11,1)-(12,42)
+    • In the expression: Refl
+      In an equation for ‘wrongTail’: wrongTail = Refl
+    • Relevant bindings include
+        wrongTail :: P.appendVec P.VNil xs :~: ys
+          (bound at NativeOpenIndexedAppendFail.hs:13:1)
+
+NativeOpenIndexedAppendFail.hs:17:20: error: [GHC-83865]
+    • Couldn't match type ‘xs2’ with ‘ys2’
+      Expected: P.appendVec P.VNil xs2 :~: ys2
+        Actual: xs2 :~: xs2
+    • In the expression: Refl
+      In an equation for ‘wrongRuntime’: wrongRuntime _ _ = Refl
+
+NativeOpenIndexedAppendFail.hs:25:38: error: [GHC-05617]
+    • Could not deduce ‘xs1 ~ ys1’
+      from the context: (n1 ~ P.Z, P.Vec a n1 ~ P.Vec a P.Z)
+        bound by a pattern with constructor: P.Z :: P.Nat,
+                 in a lambda abstraction
+        at NativeOpenIndexedAppendFail.hs:25:3-63
+      Expected: P.appendVec P.VNil ys1 :~: ys1
+        Actual: P.appendVec P.VNil xs1 :~: xs1
+    • In the expression: appendEmptyAt @a @'P.Z xs
+      In the expression:
+        (appendEmptyAt @a @'P.Z xs, appendEmptyAt @a @'P.Z xs)
+      In the expression:
+        case n of
+          P.Z -> (appendEmptyAt @a @'P.Z xs, appendEmptyAt @a @'P.Z xs)
+          P.S k
+            -> (appendEmptyAt @a @('P.S k) xs, appendEmptyAt @a @('P.S k) ys)
+    • Relevant bindings include
+        xs_a4GO :: P.Vec a n1 (bound at <no location info>)
+        ys_a4GP :: P.Vec a n1 (bound at <no location info>)
+        wrongAppendPair :: foreach (n :: P.Nat)
+                           -> foreach (xs :: P.Vec a n)
+                              -> foreach (ys :: P.Vec a n) -> (EmptyLaw a n xs, EmptyLaw a n ys)
+          (bound at NativeOpenIndexedAppendFail.hs:24:1)
+
+NativeOpenIndexedAppendFail.hs:31:23: error: [GHC-83865]
+    • Couldn't match type ‘x1’ with ‘y’
+      Expected: P.appendVec (P.VCons x1 xs) ys
+                :~: P.VCons y (P.appendVec xs ys)
+        Actual: P.VCons x1 (P.appendVec xs ys)
+                :~: P.VCons x1 (P.appendVec xs ys)
+    • In the expression: Refl
+      In an equation for ‘wrongConsAt’: wrongConsAt _ _ _ _ = Refl
+
+NativeOpenIndexedAppendFail.hs:35:16: error: [GHC-25897]
+    • Couldn't match type ‘xs’ with ‘P.appendVec left xs’
+      Expected: P.appendVec left xs :~: xs
+        Actual: xs :~: xs
+      ‘xs’ is a rigid type variable bound by
+        the type signature for:
+          opaqueLeft :: forall (left :: P.Vec Bool P.Z)
+                               (xs :: P.Vec Bool (P.S P.Z)).
+                        Proxy left -> P.appendVec left xs :~: xs
+        at NativeOpenIndexedAppendFail.hs:(33,1)-(34,54)
+    • In the expression: Refl
+      In an equation for ‘opaqueLeft’: opaqueLeft _ = Refl
+    • Relevant bindings include
+        opaqueLeft :: Proxy left -> P.appendVec left xs :~: xs
+          (bound at NativeOpenIndexedAppendFail.hs:35:1)
+
+NativeOpenIndexedAppendFail.hs:41:17: error: [GHC-25897]
+    • Couldn't match type ‘x'’ with ‘x’
+      Expected: P.appendVec (P.VCons x xs) ys
+                :~: P.VCons x' (P.appendVec xs ys)
+        Actual: P.VCons x' (P.appendVec xs ys)
+                :~: P.VCons x' (P.appendVec xs ys)
+      ‘x'’ is a rigid type variable bound by
+        the type signature for:
+          wrongHead :: forall a (n :: P.Nat) (m :: P.Nat) (x :: a) (x' :: a)
+                              (xs :: P.Vec a n) (ys :: P.Vec a m).
+                       Proxy xs
+                       -> Proxy ys
+                       -> P.appendVec (P.VCons x xs) ys :~: P.VCons x' (P.appendVec xs ys)
+        at NativeOpenIndexedAppendFail.hs:(37,1)-(40,79)
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          wrongHead :: forall a (n :: P.Nat) (m :: P.Nat) (x :: a) (x' :: a)
+                              (xs :: P.Vec a n) (ys :: P.Vec a m).
+                       Proxy xs
+                       -> Proxy ys
+                       -> P.appendVec (P.VCons x xs) ys :~: P.VCons x' (P.appendVec xs ys)
+        at NativeOpenIndexedAppendFail.hs:(37,1)-(40,79)
+    • In the expression: Refl
+      In an equation for ‘wrongHead’: wrongHead _ _ = Refl
+    • Relevant bindings include
+        wrongHead :: Proxy xs
+                     -> Proxy ys
+                     -> P.appendVec (P.VCons x xs) ys :~: P.VCons x' (P.appendVec xs ys)
+          (bound at NativeOpenIndexedAppendFail.hs:41:1)
+
+NativeOpenIndexedAppendFail.hs:47:22: error: [GHC-83865]
+    • Couldn't match type: P.appendVec xs zs
+                     with: P.appendVec xs ys
+      Expected: P.appendVec (P.VCons x xs) ys
+                :~: P.VCons x (P.appendVec xs zs)
+        Actual: P.VCons x (P.appendVec xs zs)
+                :~: P.VCons x (P.appendVec xs zs)
+      Note: GHC cannot determine the arguments of the function ‘P.appendVec’ from its result.
+    • In the expression: Refl
+      In an equation for ‘wrongCarried’: wrongCarried _ _ _ = Refl
+    • Relevant bindings include
+        wrongCarried :: Proxy xs
+                        -> Proxy ys
+                        -> Proxy zs
+                        -> P.appendVec (P.VCons x xs) ys :~: P.VCons x (P.appendVec xs zs)
+          (bound at NativeOpenIndexedAppendFail.hs:47:1)
+

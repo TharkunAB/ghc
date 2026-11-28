@@ -10,8 +10,16 @@ module GHC.Tc.Solver.Equality(
 import GHC.Prelude
 
 import {-# SOURCE #-} GHC.Tc.Solver.Solve( solveSimpleWanteds )
+import {-# SOURCE #-} GHC.Tc.Gen.HsType( tcSynthesizeMillerMotive )
 
-import GHC.Tc.Solver.Irred( solveIrred )
+import GHC.Builtin.CoercionRules
+  ( proveBoxedPairProjection, proveScopedSigmaClosure, proveScopedLambdaClosure
+  , proveScopedLambdaEta, proveScopedCaseTree )
+import GHC.Builtin.WiredIn.Types ( heqClass, matchabilityTy, unmatchableDataConTy )
+import GHC.Tc.Gen.SourceTable ( sourceTableFamilyAppUse, sourceTableOwner )
+import GHC.Tc.Errors.Types ( RetainedQuantificationError(..), TcRnMessage(..) )
+
+import GHC.Tc.Solver.Irred( solveIrred, isOpaqueTermIndex, findRetainedIndexProof )
 import GHC.Tc.Solver.Dict( matchLocalInst, chooseInstance )
 import GHC.Tc.Solver.Rewrite
 import GHC.Tc.Solver.Monad
@@ -24,22 +32,30 @@ import GHC.Tc.Types.Origin
 import GHC.Tc.Types( TcM )
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Instantiate ( freshenCoVarBndrsX )
 import GHC.Tc.Instance.Family ( tcUnwrapNewtype_maybe )
 import qualified GHC.Tc.Utils.Monad    as TcM
+import GHC.Tc.Zonk.TcType ( zonkCoHoleSet )
 
 import GHC.Core.Type
 import GHC.Core.Predicate
 import GHC.Core.Class
 import GHC.Core.DataCon ( dataConName )
+import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.TyCon
+import GHC.Core.Unify ( typesAreApart )
 import GHC.Core.TyCo.Rep   -- cleverly decomposes types, good for completeness checking
+import GHC.Core.TyCo.FVs ( tyCoVarsOfMCo, almostDevoidCoVarOfCo, mkUnivCoDeps, univCoDepsHoles )
+import qualified GHC.Core.TyCo.Subst as Subst
 import GHC.Core.Coercion
+import GHC.Core.Coercion.Axiom ( CoAxiomRule(BranchedAxiom), co_ax_source_proof_rules )
 import GHC.Core.Reduction
 import GHC.Core.FamInstEnv ( FamInstEnvs )
 import GHC.Core
 
 import GHC.Types.Var
 import GHC.Types.Basic
+import GHC.Types.Name (Name, SourceProofRule, nameOccName, sourceTableTermOcc)
 import GHC.Types.Name.Reader
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
@@ -51,7 +67,11 @@ import GHC.Utils.Monad
 
 import GHC.Data.Pair
 import GHC.Data.Bag
+import GHC.Data.FastString ( fsLit )
+import qualified GHC.Data.Strict as Strict
+import GHC.Types.SrcLoc ( SrcSpan(RealSrcSpan) )
 
+import Control.Applicative ( (<|>) )
 import Control.Monad
 import Data.Maybe ( isJust, isNothing )
 import Data.List  ( zip4 )
@@ -162,6 +182,15 @@ zonkEqTypes ev eq_rel ty1 ty2
     go (TyVarTy tv1) ty2           = tyvar NotSwapped tv1 ty2
     go ty1 (TyVarTy tv2)           = tyvar IsSwapped  tv2 ty1
 
+    -- No index reduction or retained-function congruence is needed here.
+    -- See Note [Rigid retained indices] in GHC.Tc.Utils.Unify.
+    go ty1@(TermVarTy v1) (TermVarTy v2)
+      | v1 == v2 = return (Right ty1)
+    go ty1@TermAppTy{} ty2@TermAppTy{}
+      | ty1 `tcEqType` ty2 = return (Right ty1)
+    go ty1@DepFunTy{} ty2@DepFunTy{}
+      | ty1 `tcEqType` ty2 = return (Right ty1)
+
     -- We handle FunTys explicitly here despite the fact that they could also be
     -- treated as an application. Why? Well, for one it's cheaper to just look
     -- at two types (the argument and result types) than four (the argument,
@@ -169,12 +198,13 @@ zonkEqTypes ev eq_rel ty1 ty2
     -- so we may run into an unzonked type variable while trying to compute the
     -- RuntimeReps of the argument and result types. This can be observed in
     -- testcase tc269.
-    go (FunTy af1 w1 arg1 res1) (FunTy af2 w2 arg2 res2)
+    go (FunTy af1 ma1 w1 arg1 res1) (FunTy af2 ma2 w2 arg2 res2)
       | af1 == af2
+      , eqType ma1 ma2
       , eqType w1 w2
       = do { res_a <- go arg1 arg2
            ; res_b <- go res1 res2
-           ; return $ combine_rev (FunTy af1 w1) res_b res_a }
+           ; return $ combine_rev (FunTy af1 ma1 w1) res_b res_a }
 
     go ty1@(FunTy {}) ty2 = bale_out ty1 ty2
     go ty1 ty2@(FunTy {}) = bale_out ty1 ty2
@@ -337,6 +367,24 @@ The key function `can_eq_nc` tries to make progress with a type equality t1~t2.
 (EQNC7) Give up. Make the (fully-rewrittten) constraint into an Irred and put it
   in the inerts.  See `finishCanWithIrred`.
 
+Note [Reflexivity after retained normalization]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Rewriting returns to can_eq_nc without repeating zonkEqTypes. A family equation
+can expose a shared runtime index or make two retained functions alpha-equal.
+For example, normalize Vec Int (Add Z n) under foreach n to Vec Int n.
+Recheck reflexivity after both sides have been rewritten. The rewriting evidence
+already relates the original constraint to these normalized endpoints.
+
+A partially applied family can also become reflexive. Given a ~ b,
+rewriting F a ~ F b produces F a ~ F a. The arguments already agree.
+No injectivity of F is required.
+
+This check does not decompose a retained function or assign a meta-variable.
+Opaque runtime indices stay rigid. In particular, Add n Z does not reduce
+without constructor information about n. See Note [Rewriting retained dependent
+functions] in GHC.Tc.Solver.Rewrite and Note [Rigid retained indices] in
+GHC.Tc.Utils.Unify.
+
 Note [CanEqState]
 ~~~~~~~~~~~~~~~~~
 In `can_eq_nc` we want to avoid repeated attempts to rewrite or unwrap newtypes.
@@ -437,8 +485,73 @@ can_eq_nc _ces _rdr_env _envs ev eq_rel ty1@(TyConApp tc1 []) _ps_ty1 (TyConApp 
 
 -- (EQNC1) Expand synonyms first; see Note [Type synonyms and canonicalization]
 can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
-  | Just ty1' <- coreView ty1 = can_eq_nc ces rdr_env envs ev eq_rel ty1' ps_ty1 ty2  ps_ty2
-  | Just ty2' <- coreView ty2 = can_eq_nc ces rdr_env envs ev eq_rel ty1  ps_ty1 ty2' ps_ty2
+  | Just ty1' <- coreView ty1
+  = expand_proof_synonym ty1 $ can_eq_nc ces rdr_env envs ev eq_rel ty1' ps_ty1 ty2 ps_ty2
+  | Just ty2' <- coreView ty2
+  = expand_proof_synonym ty2 $ can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2' ps_ty2
+  where
+    -- A Given can rewrite a deferred Wanted to an equality whose proof
+    -- uses a checked source synonym. Record that use only if this expansion
+    -- leads to a complete hole-free proof. Follow the source location in
+    -- the Wanted, which survives the Given rewrite.
+    expand_proof_synonym (TyConApp tc _) solve
+      | NomEq <- eq_rel
+      , isReducedProofSynonym tc
+      , deps@(_ : _) <- synTyConSourceProofRules tc
+      , CtWanted (WantedCt { ctev_dest = HoleDest hole }) <- ev
+      = do { result <- solve
+           ; solved <- isEmptyCoHoleSet <$> wrapTcS (TcM.liftZonkM (zonkCoHoleSet (unitCoHoleSet hole)))
+           ; when solved $
+               wrapTcS $ TcM.setCtLocM (ctEvLoc ev) $ do
+                 loc <- TcM.getSrcSpanM
+                 TcM.recordSourceProofUse loc (tyConName tc) deps
+           ; pure result }
+    expand_proof_synonym _ solve = solve
+
+-- A filled metavariable can name the same source application.
+-- Reflexivity does not need that application's family equation.
+can_eq_nc _ _ _ ev NomEq lhs@(TyConApp tc args) _ rhs@(TyConApp tc' _) _
+  | tc == tc', saturatedSourceHead tc args || saturatedProofFamily tc args
+  , lhs `tcEqType` rhs = canEqReflexive ev NomEq lhs
+
+-- See Note [Reflexivity after retained normalization].
+can_eq_nc ces _ _ ev eq_rel lhs@(TyConApp tc args) _ rhs@(TyConApp tc' _) _
+  | bothRewritten ces, tc == tc', isPartialTypeFunction tc args
+  , lhs `tcEqType` rhs
+  = canEqReflexive ev eq_rel lhs
+can_eq_nc ces _rdr_env _envs ev eq_rel ty1@(TermVarTy v1) _ (TermVarTy v2) _
+  | bothRewritten ces, v1 == v2
+  = canEqReflexive ev eq_rel ty1
+can_eq_nc ces _rdr_env _envs ev eq_rel ty1@TermAppTy{} _ ty2@TermAppTy{} _
+  | bothRewritten ces, ty1 `tcEqType` ty2
+  = canEqReflexive ev eq_rel ty1
+can_eq_nc ces _rdr_env _envs ev eq_rel ty1@DepFunTy{} _ ty2@DepFunTy{} _
+  | bothRewritten ces, ty1 `tcEqType` ty2
+  = canEqReflexive ev eq_rel ty1
+
+-- See Note [Solving retained function equalities].
+can_eq_nc ces _rdr_env _envs ev eq_rel ty1@(DepFunTy vis1 _ _) _ ty2@(DepFunTy vis2 _ _) _
+  | bothRewritten ces
+  , vis1 == vis2
+  , isWanted ev
+  = can_eq_nc_depfun_match ev eq_rel ty1 ty2
+
+-- Vacuous-Pi cross-decomposition: DepFunTy DepFunVisible ~ FunTy FTF_T_T (%U).
+-- See Note [Solving retained function equalities].
+can_eq_nc ces _rdr_env _envs ev eq_rel
+          ty1@(DepFunTy DepFunVisible _ _) _
+          ty2@(FunTy { ft_af = FTF_T_T, ft_ma = ma2 }) _
+  | bothRewritten ces
+  , isWanted ev
+  , ma2 `tcEqType` unmatchableDataConTy || isMetaTyVarTy ma2
+  = can_eq_nc_vacuous_depfun ev eq_rel NotSwapped ty1 ty2
+can_eq_nc ces _rdr_env _envs ev eq_rel
+          ty1@(FunTy { ft_af = FTF_T_T, ft_ma = ma1 }) _
+          ty2@(DepFunTy DepFunVisible _ _) _
+  | bothRewritten ces
+  , isWanted ev
+  , ma1 `tcEqType` unmatchableDataConTy || isMetaTyVarTy ma1
+  = can_eq_nc_vacuous_depfun ev eq_rel IsSwapped ty2 ty1
 
 -- (EQNC2) Eager newtype decomposition (ReprEq only).
 -- Look for (N s1 .. sn) ~R# (N t1 .. tn)
@@ -509,11 +622,13 @@ can_eq_nc ces rdr_env envs ev ReprEq ty1 ps_ty1 ty2 ps_ty2
 -- (EQNC3) Get rid of casts
 can_eq_nc ces rdr_env envs ev eq_rel (CastTy ty1 co1) _ ty2 ps_ty2
   | isNothing (canEqLHS_maybe ty2)
-  = -- See (EIK3) in Note [Equalities with heterogeneous kinds]
+  , bothRewritten ces || not (deferHeteroCastGiven ev ty1 co1 ty2)
+  = -- See (EIK3) and (EIK5) in Note [Equalities with heterogeneous kinds]
     canEqCast ces rdr_env envs ev eq_rel NotSwapped ty1 co1 ty2 ps_ty2
 can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 (CastTy ty2 co2) _
   | isNothing (canEqLHS_maybe ty1)
-  = -- See (EIK3) in Note [Equalities with heterogeneous kinds]
+  , bothRewritten ces || not (deferHeteroCastGiven ev ty2 co2 ty1)
+  = -- See (EIK3) and (EIK5) in Note [Equalities with heterogeneous kinds]
     canEqCast ces rdr_env envs ev eq_rel IsSwapped ty2 co2 ty1 ps_ty1
 
 ----------------------
@@ -531,14 +646,21 @@ can_eq_nc _rewritten _rdr_env _envs ev eq_rel
            s2@ForAllTy{} _
   = can_eq_nc_forall ev eq_rel s1 s2
 
+can_eq_nc _rewritten _rdr_env _envs ev eq_rel
+           s1@(ExistsTy flag1 _ _) _
+           s2@(ExistsTy flag2 _ _) _
+  | flag1 == flag2, isWanted ev
+  = can_eq_nc_forall ev eq_rel s1 s2
+  -- See Note [Solving existential package equalities].
+
 -- (EQNC4) FunTy
 -- Decompose FunTy: (s -> t) and (c => t)
 -- NB: don't decompose (Int -> blah) ~ (Show a => blah)
 can_eq_nc _ces _rdr_env _envs ev eq_rel
-           ty1@(FunTy { ft_mult = am1, ft_af = af1, ft_arg = ty1a, ft_res = ty1b }) _ps_ty1
-           ty2@(FunTy { ft_mult = am2, ft_af = af2, ft_arg = ty2a, ft_res = ty2b }) _ps_ty2
+           ty1@(FunTy { ft_ma = ma1, ft_mult = am1, ft_af = af1, ft_arg = ty1a, ft_res = ty1b }) _ps_ty1
+           ty2@(FunTy { ft_ma = ma2, ft_mult = am2, ft_af = af2, ft_arg = ty2a, ft_res = ty2b }) _ps_ty2
   | af1 == af2  -- See Note [Decomposing FunTy]
-  = canDecomposableFunTy ev eq_rel af1 (ty1,am1,ty1a,ty1b) (ty2,am2,ty2a,ty2b)
+  = canDecomposableFunTy ev eq_rel af1 (ty1,ma1,am1,ty1a,ty1b) (ty2,ma2,am2,ty2a,ty2b)
 
 -- (EQNC4) TyCon
 -- Decompose type constructor applications
@@ -550,9 +672,9 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1 _ ty2 _
    -- here for better error messages rather than decomposing into AppTys;
    -- hence not using a direct match on TyConApp
 
-  , not (isTypeFamilyTyCon tc1 || isTypeFamilyTyCon tc2)
-    -- A type family at the top of LHS or RHS: we want to fall through
-    -- to the canonical-LHS cases (look for canEqLHS_maybe)
+  , not (tyConMustBeSaturated tc1 || tyConMustBeSaturated tc2)
+    -- A saturated family can become a canonical LHS. A partial type
+    -- function stays opaque. Neither permits ordinary TyCon decomposition.
 
   -- See (TC1) in Note [Canonicalising TyCon/TyCon equalities]
   , let role         = eqRelRole eq_rel
@@ -562,9 +684,56 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1 _ ty2 _
   , ces_rwR ces || generative_2
   = canTyConApp ev eq_rel (generative_1 && generative_2) (ty1,tc1,tys1) (ty2,tc2,tys2)
 
+-- Try forward congruence before splitting an over-applied family.
+-- See Note [Congruence for generated type lambdas].
+can_eq_nc ces _ _ ev eq_rel lhs _ rhs _
+  | bothRewritten ces, isWanted ev
+  , not (isTyVarTy lhs || isTyVarTy rhs)
+  , Just co <- proveLambdaCongruence lhs rhs
+  = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
+       ; stopWith ev "Checked scoped type lambda" }
+
+-- Decompose unsaturated injective scoped closure families at Nominal role.
+can_eq_nc ces _ _ ev NomEq ty1 _ ty2 _
+  | bothRewritten ces, isWanted ev
+  , Just (tc1, tys1) <- splitTyConApp_maybe ty1
+  , Just (tc2, tys2) <- splitTyConApp_maybe ty2
+  , tc1 == tc2
+  , isJust (closedFamilyScope_maybe tc1)
+  , equalLength tys1 tys2
+  , not (null tys1)
+  , isUnsaturatedUserFamily tc1 tys1
+  , Injective inj <- tyConInjectivityInfo tc1
+  , and (take (length tys1) inj)
+  = canDecomposableTyConAppOK ev NomEq tc1 (ty1, tys1) (ty2, tys2)
+
+-- Try spine-based Miller pattern unification for higher-order unmatchable
+-- motive variables (?m s_1 .. s_k ~ rhs) before AppTy or TyVarLHS handling.
+-- See Note [Miller pattern unification for higher-order motives].
+can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
+  | bothRewritten ces
+  , NomEq <- eq_rel
+  , CtWanted wev <- ev
+  , wantedCtHasNoRewriters wev
+  , isJust (splitMillerHead_maybe ty1) || isJust (splitMillerHead_maybe ty2)
+  = do { mb_res <- tryMillerPatternUnify ev ty1 ty2
+       ; case mb_res of
+           Just solved -> return solved
+           Nothing     -> can_eq_nc_post_miller ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2 }
+
+can_eq_nc ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
+  = can_eq_nc_post_miller ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
+
+can_eq_nc_post_miller
+    :: CanEqState
+    -> GlobalRdrEnv -> FamInstEnvs
+    -> CtEvidence -> EqRel
+    -> Type -> Type
+    -> Type -> Type
+    -> TcS (StopOrContinue (Either IrredCt EqCt))
 -- (EQNC4) AppTy
 -- Decompose applications
-can_eq_nc ces _rdr_env _envs ev eq_rel ty1 _ ty2 _
+can_eq_nc_post_miller ces _rdr_env _envs ev eq_rel ty1 _ ty2 _
   | bothRewritten ces -- Why bothRewritten?  See Note [Canonicalising type applications]
   -- Use tcSplitAppTy, not matching on AppTy, to catch oversaturated type families
   , Just (t1, s1) <- tcSplitAppTy_maybe ty1
@@ -584,44 +753,161 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1 _ ty2 _
 
 -- (EQNC5) Rewrite
 -- No similarity in type structure detected. Rewrite and try again.
-can_eq_nc ces rdr_env envs ev eq_rel _ ps_ty1 _ ps_ty2
+can_eq_nc_post_miller ces rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
   | not $ bothRewritten ces
   = -- Rewrite the two types and try again
-    do { (redn1@(Reduction _ xi1), rewriters1) <- rewrite_if_unrewritten (ces_rwL ces) ps_ty1
-       ; (redn2@(Reduction _ xi2), rewriters2) <- rewrite_if_unrewritten (ces_rwR ces) ps_ty2
-       ; new_ev <- rewriteEqEvidence ev NotSwapped redn1 redn2
-                                     (rewriters1 S.<> rewriters2)
-       ; traceTcS "can_eq_nc: go round again" (ppr new_ev $$ ppr xi1 $$ ppr xi2)
-
-       -- If we tried and failed to newtype-unwrap the LHS and it was already rewritten,
-       -- then preserve ces_ntL = True. If we rewrote the LHS type, then we want
-       -- to try newtype unwrapping again (e.g. for a data family/newtype instance),
-       -- so set ces_ntL = False. Ditto for ces_ntR.
-       ; let ces' = ces { ces_ntL = ces_ntL ces && ces_rwL ces
-                        , ces_ntR = ces_ntR ces && ces_rwR ces
-                        , ces_rwL = True
-                        , ces_rwR = True
-                        }
-       ; can_eq_nc ces' rdr_env envs new_ev eq_rel xi1 xi1 xi2 xi2 }
+    do { preferred <- trySourceLetEquality ev eq_rel ps_ty1 ps_ty2
+       ; case preferred of
+           Just (Left co) ->
+             do { let holes = foldr (flip addRewriter) emptyCoHoleSet
+                               (univCoDepsHoles (mkUnivCoDeps [co]))
+                ; setEqIfWanted ev (CPH co holes)
+                ; stopWith ev "Solved by direct source-let equality" }
+           Just (Right (tc, lhs_redn, rhs_redn, p1, p2, holes)) ->
+             do { new_ev <- rewriteEqEvidence ev NotSwapped lhs_redn rhs_redn holes
+                ; canDecomposableTyConAppOK new_ev eq_rel tc p1 p2 }
+           Nothing -> infer_source_index }
   where
-    rewrite_if_unrewritten :: Bool -> TcType -> TcS (Reduction, CoHoleSet)
-    rewrite_if_unrewritten already_rewritten ps_ty
+    -- See Note [Inferring a source index without reduction].
+    infer_source_index =
+      case (ty1, ty2) of
+        (TyVarTy tv, rhs@(TyConApp family args)) -> try_index NotSwapped tv family args rhs
+        (rhs@(TyConApp family args), TyVarTy tv) -> try_index IsSwapped tv family args rhs
+        _ -> rewrite_both
+    try_index swapped tv family args rhs
+      | mightPossiblyUnify ev eq_rel tv
+      -- Instantiating Refl can give two copies of alpha ~ F. Keep
+      -- the mark-bearing family application as alpha's value. A
+      -- reflexive proof then uses no family equation.
+      , saturatedProofFamily family args
+      = unify_index swapped tv rhs
+      | mightPossiblyUnify ev eq_rel tv, saturatedSourceHead family args = do
+          owner <- wrapTcS (sourceTableOwner family)
+          case owner of
+            Nothing -> rewrite_both
+            Just _ -> unify_index swapped tv rhs
+      | otherwise = rewrite_both
+
+    unify_index swapped tv rhs = do
+      unfilled <- isUnfilledMetaTyVar tv
+      given_lvl <- getInnermostGivenEqLevel
+      id_depths <- getSolverIdDepthsFor (ctEvLoc ev)
+      rhs' <- zonkTcType rhs
+      kind <- zonkTcType (varType tv)
+      if unfilled && kind `eqType` typeKind rhs'
+         && simpleUnifyCheckWithDepths id_depths UC_Solver given_lvl tv rhs' == SUC_CanUnify
+        then canEqCanLHSFinish ev NomEq swapped (TyVarLHS tv) rhs'
+        else rewrite_both
+
+    rewrite_both
+      = do { source_proof_env <- wrapTcS TcM.tcHasSourceProofEnv
+           ; ((redn1@(Reduction _ xi1), deps1), rewriters1) <- rewrite_if_unrewritten source_proof_env (ces_rwL ces) ps_ty1
+           ; ((redn2@(Reduction _ xi2), deps2), rewriters2) <- rewrite_if_unrewritten source_proof_env (ces_rwR ces) ps_ty2
+           ; new_ev <- rewriteEqEvidence ev NotSwapped redn1 redn2
+                                         (rewriters1 S.<> rewriters2)
+           ; traceTcS "can_eq_nc: go round again" (ppr new_ev $$ ppr xi1 $$ ppr xi2)
+
+           -- If we tried and failed to newtype-unwrap the LHS and it was already rewritten,
+           -- then preserve ces_ntL = True. If we rewrote the LHS type, then we want
+           -- to try newtype unwrapping again (e.g. for a data family/newtype instance),
+           -- so set ces_ntL = False. Ditto for ces_ntR.
+           ; let ces' = ces { ces_ntL = ces_ntL ces && ces_rwL ces
+                            , ces_ntR = ces_ntR ces && ces_rwR ces
+                            , ces_rwL = True
+                            , ces_rwR = True
+                            }
+           ; proof <- case eq_rel of
+               NomEq | source_proof_env -> tryRetainedFamilyEquality new_ev xi1 xi2
+               _ -> return Nothing
+           ; case proof of
+               Just (co, tables, uses) -> do
+                 { let holes = foldr (flip addRewriter) emptyCoHoleSet
+                              (univCoDepsHoles (mkUnivCoDeps [co]))
+                 ; record_table_uses tables
+                 ; record_source_uses (deps1 ++ deps2 ++ uses)
+                 ; setEqIfWanted new_ev (CPH co holes)
+                 ; stopWith new_ev "Solved by retained family congruence" }
+               Nothing ->
+                 let solve = can_eq_nc ces' rdr_env envs new_ev eq_rel xi1 xi1 xi2 xi2
+                 in case (eq_rel, new_ev) of
+                   (NomEq, CtWanted (WantedCt { ctev_dest = HoleDest hole }))
+                     -> record_reduction_uses hole (deps1 ++ deps2) solve
+                   _ -> solve }
+
+    -- See Note [Committing checked source family branches]
+    -- in GHC.Tc.Solver.Rewrite.
+    record_reduction_uses hole uses@(_ : _) solve
+      = do { result <- solve
+           ; solved <- isEmptyCoHoleSet <$> wrapTcS (TcM.liftZonkM (zonkCoHoleSet (unitCoHoleSet hole)))
+           ; when solved $ record_source_uses uses
+           ; pure result }
+    record_reduction_uses _ _ solve = solve
+
+    record_table_uses [] = pure ()
+    record_table_uses tables = wrapTcS $ TcM.setCtLocM (ctEvLoc ev) $
+      mapM_ (uncurry sourceTableFamilyAppUse) tables
+
+    record_source_uses [] = pure ()
+    record_source_uses uses = wrapTcS $ TcM.setCtLocM (ctEvLoc ev) $ do
+      loc <- TcM.getSrcSpanM
+      mapM_ (uncurry (TcM.recordSourceProofUse loc)) uses
+
+    rewrite_if_unrewritten :: Bool -> Bool -> TcType
+                           -> TcS ((Reduction, [(Name, [SourceProofRule])]), CoHoleSet)
+    rewrite_if_unrewritten _ already_rewritten ps_ty
       | already_rewritten
-      = return (mkReflRedn (eqRelRole eq_rel) ps_ty, emptyCoHoleSet)
-      | otherwise
-      = rewrite ev ps_ty
+      = return ((mkReflRedn (eqRelRole eq_rel) ps_ty, []), emptyCoHoleSet)
+    rewrite_if_unrewritten True _ ps_ty
+      | NomEq <- eq_rel, isWanted ev
+      = rewriteWithSourceProofs ev ps_ty
+    rewrite_if_unrewritten _ _ ps_ty
+      = do { (redn, rewriters) <- rewrite ev ps_ty
+           ; return ((redn, []), rewriters) }
 
 ----------------------------
 -- Look for a canonical LHS.
 -- Only rewritten types end up below here.
 ----------------------------
 
+-- (EQNC6a): TyVarLHS fast path before dependent family-closure checks.
+-- None of proveScopedCaseTree, proveScopedSigmaClosure, or
+-- proveBoxedPairProjection can match when either endpoint is a type variable.
+can_eq_nc_post_miller ces _rdr_env _envs ev eq_rel (TyVarTy tv1) ps_ty1 ty2 ps_ty2
+  | bothRewritten ces
+  = do { traceTcS "can_eq1" (ppr tv1 $$ ppr ty2)
+       ; canEqCanLHS ev eq_rel NotSwapped (TyVarLHS tv1) ps_ty1 ty2 ps_ty2 }
+can_eq_nc_post_miller ces _rdr_env _envs ev eq_rel ty1 ps_ty1 (TyVarTy tv2) ps_ty2
+  | bothRewritten ces
+  = do { traceTcS "can_eq2" (ppr ty1 $$ ppr tv2)
+       ; canEqCanLHS ev eq_rel IsSwapped (TyVarLHS tv2) ps_ty2 ty1 ps_ty1 }
+
+-- See Note [Equality of retained case trees] in GHC.Builtin.CoercionRules.
+can_eq_nc_post_miller ces _ _ ev eq_rel lhs _ rhs _
+  | bothRewritten ces, isWanted ev
+  , Just co <- proveScopedCaseTree lhs rhs
+  = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
+       ; stopWith ev "Checked retained constructor case" }
+
+-- See Note [Scoped retained sum codomains] in GHC.Core.TyCo.Compare.
+can_eq_nc_post_miller ces _ _ ev eq_rel lhs _ rhs _
+  | bothRewritten ces, isWanted ev
+  , Just co <- proveScopedSigmaClosure lhs rhs <|> proveScopedLambdaClosure lhs rhs
+  = do { setEqIfWanted ev (CPH (downgradeRole (eqRelRole eq_rel) Nominal co) emptyCoHoleSet)
+       ; stopWith ev "Checked scoped sum codomain" }
+
+-- Try a certified strict pair composition before choosing a canonical LHS.
+-- See Note [Strict boxed pair composition] in GHC.Builtin.CoercionRules.
+can_eq_nc_post_miller ces _ _ ev NomEq lhs _ rhs _
+  | bothRewritten ces, isWanted ev
+  , Just (co, apps) <- proveBoxedPairProjection lhs rhs
+  = solveBoxedPairComposition ev apps co
+
 -- (EQNC6): use canEqCanLHS
 --
 -- NB: pattern match on bothRewritten: we want only rewritten types sent to canEqCanLHS
 -- This means we've rewritten any variables and reduced any type family redexes
 -- See also Note [No top-level newtypes on RHS of representational equalities]
-can_eq_nc ces _rdr_env _envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
+can_eq_nc_post_miller ces _rdr_env _envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
   | bothRewritten ces
   , Just can_eq_lhs1 <- canEqLHS_maybe ty1
   = do { traceTcS "can_eq1" (ppr ty1 $$ ppr ty2)
@@ -644,13 +930,140 @@ can_eq_nc ces _rdr_env _envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
 ----------------------------
 
 -- (EQNC7) We've rewritten and the types don't match. Give up.
-can_eq_nc _ _rdr_env _envs ev eq_rel _ ps_ty1 _ ps_ty2
+can_eq_nc_post_miller _ _rdr_env _envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
   = do { traceTcS "can_eq_nc catch-all case" (ppr ps_ty1 $$ ppr ps_ty2)
        ; case eq_rel of -- See Note [Unsolved equalities]
             ReprEq -> finishCanWithIrred ReprEqReason ev
-            NomEq  -> finishCanWithIrred ShapeMismatchReason ev }
+            NomEq | isOpaqueIndexEquality (isGiven ev) ty1 ty2
+                  -> finishCanWithIrred IrredShapeReason ev
+                  | otherwise -> finishCanWithIrred ShapeMismatchReason ev }
           -- No need to call canEqSoftFailure/canEqHardFailure because they
           -- rewrite, and the types involved here are already rewritten
+
+{- Note [Congruence for generated type lambdas]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A wanted can compare Map f xs and Map g xs with xs still unknown.
+Map is non-injective. Decomposing the wanted would assume an equality
+of its arguments. Check the lexical closures of f and g independently.
+The same check can compare a forwarding lambda with its named family.
+Build nominal congruence only when every argument already has a proof.
+Use the same family head on both sides, whether the family is open or
+closed. Ordinary matching and apartness still select its equations.
+Family arity controls reduction. Nominal congruence also applies with
+arguments beyond the arity, or when both applications form valid
+partial user families. Core Lint checks the same partial-kind invariant.
+Check this before splitting an over-applied family. The application
+solver treats two distinct unmatchable heads as opaque.
+Compare the arguments before testing reflexivity of a family application.
+This visits the arguments of nested family applications once. Use
+reflexivity for an argument whose types already agree. Leave a wholly
+reflexive wanted to the ordinary solver.
+See Note [Scoped retained sum codomains] in GHC.Core.TyCo.Compare.
+See Note [Eta for a forwarding type lambda] in GHC.Builtin.CoercionRules.
+-}
+
+-- | Prove a generated closure equality, including under a type family.
+proveLambdaCongruence :: Type -> Type -> Maybe CoercionN
+proveLambdaCongruence = prove False
+  where
+    prove allow_refl lhs rhs
+      | Just co <- proveScopedLambdaClosure lhs rhs = Just co
+      | Just co <- proveScopedLambdaEta lhs rhs = Just co
+      | Just (tc, as) <- splitTyConApp_maybe lhs
+      , Just (tc', bs) <- splitTyConApp_maybe rhs
+      , tc == tc'
+      , isOpenTypeFamilyTyCon tc || isJust (closedFamilyTyConCoAxiom_maybe tc)
+      , equalLength as bs
+      , as `lengthAtLeast` tyConArity tc
+        || (isUnsaturatedUserFamily tc as && isUnsaturatedUserFamily tc bs)
+      = do cos <- zipWithM (prove True) as bs
+           if all isReflCo cos
+             then mkNomReflCo lhs <$ guard allow_refl
+             else mkTyConAppCo Nominal tc cos <$ guard (typeKind lhs `eqType` typeKind rhs)
+      | allow_refl, lhs `eqType` rhs = Just (mkNomReflCo lhs)
+      | otherwise = Nothing
+
+{- Note [Inferring a source index without reduction]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose a module exports w :: Checked (Map f xs), and a caller applies
+consume :: forall ys. Checked ys -> Bool to w. The wanted for ys can
+be solved by choosing Map f xs itself. This does not use a mapper axiom.
+Rewriting the wanted first can demand an equation the caller cannot use.
+
+Only try the ordinary solver unification path for a wanted at nominal
+role with an unfilled metavariable opposite a saturated source family.
+Use the synonym-expanded operands from EQNC1. Zonk before checking
+scope, occurrence and kind. Other equalities follow the normal rewriting
+order. See Note [Prevent unification with type families] in GHC.Tc.Utils.Unify.
+-}
+
+-- | Test whether an unrewritable equality involves an unmatchable
+-- application or a runtime index that must stay 'IrredShapeReason'.
+-- See Note [Opaque runtime index equalities].
+isOpaqueIndexEquality :: Bool -> Type -> Type -> Bool
+isOpaqueIndexEquality allow_apart_opaque ty1 ty2 =
+  opaque_app ty1 || opaque_app ty2 || case (ty1, ty2) of
+    (TermAppTy f _, ty) -> call_domain f ty
+    (ty, TermAppTy f _) -> call_domain f ty
+    (TermVarTy v, ty)   -> same_domain v ty
+    (ty, TermVarTy v)   -> same_domain v ty
+    _                   -> False
+  where
+    opaque_app ty
+      | Just (tc, args) <- tcSplitTyConApp_maybe ty
+      , tyConMustBeSaturated tc
+      , args `lengthLessThan` tyConArity tc
+      = True
+      | Just (hd, _) <- tcSplitAppTy_maybe ty = not (isMatchableFunTy (typeKind hd))
+      | otherwise = False
+    same_domain v ty =
+      (isNativeRetainedBinder v && domain `eqType` kind)
+      || (allow_apart_opaque && isNativeOpaqueValueId v && not (typesAreApart domain kind))
+      where
+        domain = varType v
+        kind   = typeKind ty
+    call_domain f ty = case nativeIndexFunctionTys_maybe f of
+      Just (_, result) -> typeKind ty `eqType` result
+      Nothing          -> False
+
+{- Note [Opaque runtime index equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A runtime index can equal a constructor or another index of the same domain.
+Failure to rewrite these well-kinded index forms does not establish
+a contradiction. Retain the equality as a non-insoluble IrredShapeReason.
+This also lets the pattern-match oracle retain a checked constructor proof.
+
+When a branch matches HRefl, it introduces both a kind equality and a
+value equality. For example, the value equality relates xs :: Vec a n to
+VNil :: Vec a Z. The kind equality can refine n to Z. The runtime Id still
+carries its original type. Classify this Given as insoluble only when its
+domains are surely apart. The order in which the solver processes the
+two Givens does not affect reachability. A package payload can have a
+generated family application as its declared type. Check the eligibility of
+this term occurrence even when its declaration is not a foreach binder.
+This check supplies no coercion.
+
+If the value Given already has a kind cast on one endpoint, keep that
+homogeneous Given. Removing the cast would bind a mixed-kind CoVar.
+Rewrite both endpoints first. Another Given can rewrite a constructor
+parameter before the lookup, as in 'VNil @a when a ~ Bool is in scope.
+Expose the kind equality and use the kinds before transport to check
+apartness. See Note [Using casted index Givens] in GHC.Tc.Solver.Irred.
+
+A family can return a U or unknown function before its head is exposed.
+For example, Stored container argument can still equal True. Split ordinary
+applications and oversaturated family applications with tcSplitAppTy_maybe.
+Only a consumed binder known to be M can justify a shape contradiction.
+Keep U and unknown applications irreducible. This adds no equality proof or
+inverse application rule. See Note [Ordinary arrow matchability] in
+GHC.Core.TyCo.Rep.
+
+This rule does not solve the equality or rewrite the runtime index. A Given
+remains an inert irreducible equality. addIrredToCans still calls updGivenEqs,
+which records its level and prevents unsafe outer metavariable assignments.
+See Note [Tracking Given equalities] in GHC.Tc.Solver.InertSet and
+Note [Apartness of retained runtime indices] in GHC.Core.Unify.
+-}
 
 {- Note [Unsolved equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -662,16 +1075,595 @@ Missing this point is what caused #15431
 -}
 
 ---------------------------------
+-- | Check owner correspondence before writing nominal evidence.
+solveBoxedPairComposition :: CtEvidence -> [(TyCon, [Type])] -> Coercion
+                          -> TcS (StopOrContinue (Either IrredCt EqCt))
+solveBoxedPairComposition ev apps co = do
+    wrapTcS $ TcM.setCtLocM (ctEvLoc ev) $
+      forM_ apps $ \(family, args) -> do
+        owner <- sourceTableOwner family
+        when (isNothing owner) $
+          TcM.failWithTc (TcRnRetainedQuantificationError
+                          (RetainedUncheckedSourceCall (tyConName family)))
+        sourceTableFamilyAppUse family args
+    let holes = foldr (flip addRewriter) emptyCoHoleSet
+                      (univCoDepsHoles (mkUnivCoDeps [co]))
+    setEqIfWanted ev (CPH co holes)
+    stopWith ev "Solved by strict boxed pair composition"
+
+-- | Unify flexible domains and multiplicities before comparing retained bodies.
+-- See Note [Solving retained function equalities].
+can_eq_nc_depfun_match :: CtEvidence -> EqRel -> Type -> Type
+                       -> TcS (StopOrContinue (Either IrredCt EqCt))
+can_eq_nc_depfun_match ev eq_rel ty1@(DepFunTy vis1 b1 _) ty2@(DepFunTy vis2 b2 _)
+  | vis1 == vis2
+  , CtWanted (WantedCt { ctev_rewriters = rws, ctev_loc = loc }) <- ev
+  = do { let has_meta t = anyFreeVarsOfType (\v -> isTcTyVar v && isMetaTyVar v) t
+             need_mult  = not (idMult b1 `tcEqType` idMult b2)
+                            && (has_meta (idMult b1) || has_meta (idMult b2))
+             need_dom   = not (varType b1 `tcEqType` varType b2)
+                            && (has_meta (varType b1) || has_meta (varType b2))
+       ; nested_hdr_binds <- newNoTcEvBinds
+       ; (hdr_unifs, hdr_ok) <- if need_mult || need_dom
+           then reportFineGrainUnifications $ do
+             (level, wanteds) <- pushLevelNoWorkList (text "retained domain unification") $
+               fmap snd $ wrapUnifier rws loc Nominal $ \uenv -> do
+                 when need_mult $ void (uType uenv (idMult b1) (idMult b2))
+                 when need_dom  $ void (uType uenv (varType b1) (varType b2))
+             residual <- nestImplicTcS (UnifyForAllSkol ty1) nested_hdr_binds level $
+                           solveSimpleWanteds wanteds
+             return (isSolvedWC residual)
+           else return (emptyVarSet, True)
+       ; kickOutAfterUnification hdr_unifs
+       ; when hdr_ok $ do
+           outer_binds <- getTcEvBindsVar
+           combineTcEvBinds outer_binds nested_hdr_binds
+       ; ty1' <- zonkTcType ty1
+       ; ty2' <- zonkTcType ty2
+       ; case (ty1', ty2') of
+           (DepFunTy _ b1' _, DepFunTy _ b2' _)
+             | isNativeOpaqueValueId b1' || isNativeIndexFunctionId b1'
+             , isNativeOpaqueValueId b2' || isNativeIndexFunctionId b2'
+             , idMult b1' `tcEqType` idMult b2' ->
+                 if varType b1' `tcEqType` varType b2'
+                   then can_eq_nc_depfun ev eq_rel ty1' ty2' MRefl
+                   else if isNativeIndexId b1' && isNativeIndexId b2'
+                     then do
+                       Reduction co1 normal1 <- rewriteFamilyAxioms loc (varType b1')
+                       Reduction co2 normal2 <- rewriteFamilyAxioms loc (varType b2')
+                       if normal1 `tcEqType` normal2
+                         then can_eq_nc_depfun ev eq_rel ty1' ty2' (MCo (co1 `mkTransCo` mkSymCo co2))
+                         else canEqSoftFailure IrredShapeReason ev ty1' ty2'
+                     else canEqSoftFailure IrredShapeReason ev ty1' ty2'
+           _ -> canEqSoftFailure IrredShapeReason ev ty1' ty2' }
+can_eq_nc_depfun_match _ _ ty1 ty2
+  = pprPanic "can_eq_nc_depfun_match" (ppr ty1 $$ ppr ty2)
+
+-- | Compare a visible retained function against an unmatchable ordinary arrow
+-- via vacuous-Pi collapse (`mkDepFunCoWithVis` collapses to `FunTy` on the
+-- non-dependent endpoint when the binder does not occur free).
+-- See Note [Solving retained function equalities].
+can_eq_nc_vacuous_depfun :: CtEvidence -> EqRel -> SwapFlag -> Type -> Type
+                         -> TcS (StopOrContinue (Either IrredCt EqCt))
+can_eq_nc_vacuous_depfun ev eq_rel swapped
+    dep_ty@(DepFunTy DepFunVisible b1 body1)
+    fun_ty@(FunTy { ft_af = FTF_T_T, ft_ma = ma2, ft_mult = mult2, ft_arg = dom2, ft_res = res2 })
+  | CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rws, ctev_loc = loc }) <- ev
+  = do { nested_hdr_binds <- newNoTcEvBinds
+       ; (hdr_unifs, hdr_ok) <- reportFineGrainUnifications $ do
+           (level, wanteds) <- pushLevelNoWorkList (text "vacuous retained arrow header") $
+             fmap snd $ wrapUnifier rws loc Nominal $ \uenv -> do
+               unless (ma2 `tcEqType` unmatchableDataConTy) $
+                 void (uType uenv ma2 unmatchableDataConTy)
+               unless (idMult b1 `tcEqType` mult2) $
+                 void (uType uenv (idMult b1) mult2)
+               unless (varType b1 `tcEqType` dom2) $
+                 void (uType uenv (varType b1) dom2)
+           residual <- nestImplicTcS (UnifyForAllSkol dep_ty) nested_hdr_binds level $
+                         solveSimpleWanteds wanteds
+           return (isSolvedWC residual)
+       ; kickOutAfterUnification hdr_unifs
+       ; b_ty   <- zonkTcType (varType b1)
+       ; b_mult <- zonkTcType (idMult b1)
+       ; ma2'   <- zonkTcType ma2
+       ; mult2' <- zonkTcType mult2
+       ; dom2'  <- zonkTcType dom2
+       ; lhs    <- zonkTcType body1
+       ; rhs    <- zonkTcType res2
+       ; let b1_zonked = setVarType (setIdMult b1 b_mult) b_ty
+             orig_lhs  = case swapped of NotSwapped -> dep_ty; IsSwapped -> fun_ty
+             orig_rhs  = case swapped of NotSwapped -> fun_ty; IsSwapped -> dep_ty
+       ; if not (hdr_ok
+                 && ma2' `tcEqType` unmatchableDataConTy
+                 && b_mult `tcEqType` mult2'
+                 && (isNativeOpaqueValueId b1_zonked || isNativeIndexFunctionId b1_zonked))
+         then canEqSoftFailure IrredShapeReason ev orig_lhs orig_rhs
+         else do
+           { mb_domain <- if b_ty `tcEqType` dom2'
+               then return (Just MRefl)
+               else if isNativeIndexType b_ty && isNativeIndexType dom2'
+                 then do
+                   Reduction co1 normal1 <- rewriteFamilyAxioms loc b_ty
+                   Reduction co2 normal2 <- rewriteFamilyAxioms loc dom2'
+                   return $ if normal1 `tcEqType` normal2
+                     then Just (MCo (co1 `mkTransCo` mkSymCo co2))
+                     else Nothing
+                 else return Nothing
+           ; case mb_domain of
+               Nothing -> canEqSoftFailure IrredShapeReason ev orig_lhs orig_rhs
+               Just domain' -> do
+                 { binder <- wrapTcS $ TcM.newSysLocalId (fsLit "retained") b_mult b_ty
+                 ; let in_scope = mkInScopeSet $
+                                    extendVarSet (tyCoVarsOfTypes [dep_ty, fun_ty, lhs, rhs, b_ty, dom2']
+                                                  `unionVarSet` tyCoVarsOfMCo domain') binder
+                       subst_b   = Subst.mkIdSubst in_scope (unitVarEnv b1 (Var binder))
+                       left_body = Subst.substTy subst_b lhs
+                 ; nested_body_binds <- newNoTcEvBinds
+                 ; (body_unifs, (body_co, solved)) <- reportFineGrainUnifications $
+                     withNativeBinderScope loc [dep_ty, fun_ty, lhs, rhs, b_ty, dom2'] binder $ \loc' -> do
+                       (level, (body_co, wanteds)) <-
+                         pushLevelNoWorkList (text "vacuous retained function body") $
+                           wrapUnifier rws loc' Nominal $ \uenv ->
+                             uType uenv left_body rhs
+                       residual <- nestImplicTcS (UnifyForAllSkol dep_ty) nested_body_binds level $
+                                     solveSimpleWanteds wanteds
+                       return (body_co, isSolvedWC residual)
+                 ; kickOutAfterUnification body_unifs
+                 ; if solved
+                   then do
+                     { let raw_co = mkDepFunCoWithVis DepFunVisible DepFunVisible binder domain' body_co
+                           oriented_co = case swapped of
+                             NotSwapped -> raw_co
+                             IsSwapped  -> mkSymCo raw_co
+                     ; all_co <- zonkCo oriented_co
+                     ; left   <- zonkTcType orig_lhs
+                     ; right  <- zonkTcType orig_rhs
+                     ; if coercionLKind all_co `tcEqType` left
+                          && coercionRKind all_co `tcEqType` right
+                       then do
+                         { outer_binds <- getTcEvBindsVar
+                         ; combineTcEvBinds outer_binds nested_hdr_binds
+                         ; combineTcEvBinds outer_binds nested_body_binds
+                         ; setWantedEq dest (CPH { cph_co = downgradeRole (eqRelRole eq_rel) Nominal all_co
+                                                 , cph_holes = emptyCoHoleSet })
+                         ; stopWith ev "Vacuous retained function equality: solved" }
+                       else canEqSoftFailure IrredShapeReason ev orig_lhs orig_rhs }
+                   else canEqSoftFailure IrredShapeReason ev orig_lhs orig_rhs } } }
+can_eq_nc_vacuous_depfun _ _ _ ty1 ty2
+  = pprPanic "can_eq_nc_vacuous_depfun" (ppr ty1 $$ ppr ty2)
+
+-- | Compare retained bodies in a private runtime-binder scope.
+-- See Note [Solving retained function equalities].
+can_eq_nc_depfun :: CtEvidence -> EqRel -> Type -> Type -> MCoercionN
+                 -> TcS (StopOrContinue (Either IrredCt EqCt))
+can_eq_nc_depfun ev eq_rel ty1@(DepFunTy vis1 b1 body1) ty2@(DepFunTy vis2 b2 body2) domain
+  | vis1 == vis2
+  , CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rws, ctev_loc = loc }) <- ev
+  = do { b_ty <- zonkTcType (varType b1)
+       ; b_mult <- zonkTcType (idMult b1)
+       ; lhs <- zonkTcType body1
+       ; rhs <- zonkTcType body2
+       ; domain' <- case domain of
+                     MRefl -> return MRefl
+                     MCo co -> MCo <$> zonkCo co
+       ; binder <- wrapTcS $ TcM.newSysLocalId (fsLit "retained") b_mult b_ty
+       ; let in_scope = mkInScopeSet $
+                          extendVarSet (tyCoVarsOfTypes [ty1,ty2]
+                                        `unionVarSet` tyCoVarsOfMCo domain' `unionVarSet` tyCoVarsOfTypes [lhs,rhs,b_ty]) binder
+             subst b arg = Subst.mkIdSubst in_scope (unitVarEnv b arg)
+             right_arg = case domain' of
+                           MRefl -> Var binder
+                           MCo delta -> Cast (Var binder) (SubCo delta)
+             left_body = Subst.substTy (subst b1 (Var binder)) lhs
+             right_body = Subst.substTy (subst b2 right_arg) rhs
+       ; nested_binds <- newNoTcEvBinds
+       ; (unifs, (body_co, solved)) <- reportFineGrainUnifications $
+           withNativeBinderScope loc [ty1, ty2, lhs, rhs, b_ty] binder $ \loc' ->
+           do { (level, (body_co, wanteds)) <-
+                  pushLevelNoWorkList (text "retained function equality") $
+                    wrapUnifier rws loc' (eqRelRole eq_rel) $ \uenv ->
+                      uType uenv left_body right_body
+              ; residual <- nestImplicTcS (UnifyForAllSkol ty1) nested_binds level $
+                    solveSimpleWanteds wanteds
+              ; return (body_co, isSolvedWC residual) }
+       ; kickOutAfterUnification unifs
+       ; if solved
+         then do { all_co <- zonkCo (mkDepFunCoWithVis vis1 vis2 binder domain' body_co)
+                 ; left <- zonkTcType ty1
+                 ; right <- zonkTcType ty2
+                 ; if coercionLKind all_co `tcEqType` left
+                      && coercionRKind all_co `tcEqType` right
+                   then do { -- Keep outer Given evidence live after the local solve.
+                             outer_binds <- getTcEvBindsVar
+                           ; combineTcEvBinds outer_binds nested_binds
+                           ; setWantedEq dest (CPH { cph_co = all_co
+                                                  , cph_holes = emptyCoHoleSet })
+                           ; stopWith ev "Retained function equality: solved" }
+                   else canEqSoftFailure IrredShapeReason ev ty1 ty2 }
+         else canEqSoftFailure IrredShapeReason ev ty1 ty2 }
+can_eq_nc_depfun _ _ ty1 ty2 _
+  = pprPanic "can_eq_nc_depfun" (ppr ty1 $$ ppr ty2)
+
+{- Note [Solving retained function equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Compare two retained functions with the same visibility using nominal DepFunCo.
+Preserve both endpoint flags in the completed proof. Visibility mismatch cannot
+be solved by this source equality rule.
+See Note [Retained function visibility] in GHC.Core.TyCo.Rep.
+Use MRefl when both opaque binder domains agree nominally. For example,
+comparing Consumer (IO Int) p r with Consumer (IO Int) p Char can
+determine r. Opening the two bodies with the same Id does not need the
+constructors of IO. The private body check still rejects an assignment
+that would let the index escape.
+Zonk the binder domain, both bodies and the domain coercion before
+opening the bodies. For an imported polymorphic alias, rewriting can
+update the binder's element type while an occurrence inside a family
+argument still carries the solved metavariable. Core substitution checks
+the occurrence's domain against the fresh binder's domain.
+
+Substitute the same fresh bare variable into both bodies. A function head must remain a Var; a reflexive
+cast around that variable is not a supported native call head.
+
+For unequal closed scalar domains, normalize them outside the runtime binder.
+The resulting proof delta has kind A ~N B. Use a fresh x :: A in both bodies.
+Replace the target binder by x cast through delta. The body proof then has the
+scope that DepFunCo needs.
+See Note [Retained dependent function coercions] in GHC.Core.TyCo.Rep.
+
+Use reflexivity when the domains already agree. Otherwise use rewriteFamilyAxioms
+to reduce nominal family axioms with the solver reduction-depth limit. Do not
+use the pure normaliseType here: whole-Pi rewriting does not traverse the binder
+domain, and a recursive family in that domain can make normaliseType diverge.
+Disable inert evidence, plugins, caches and coercion zapping during this reduction.
+The domain proof must not introduce holes that the body solve does not track.
+
+Follow can_eq_nc_forall for ordinary body unification. Generate Wanteds at a
+deeper level and solve them synchronously in private inerts and a private work
+list. Keep the runtime binder active through rewriting and solver plugins.
+Do not encode it in ic_skols: an Id is not a TcTyVar. Do not emit an implication
+or a residual body Wanted. If any Wanted remains, keep the original whole
+equality instead. Track outer unifications and used Given evidence as the
+forall solver does. Existing native meta-assignment checks still apply.
+Zonk the completed proof and its expected endpoints before checking them.
+Ordinary body unification can assign payload metavariables.
+
+The body proof is nominal even for a representational Wanted. Downgrade the
+complete nominal proof only after constructing DepFunCo. A representational
+equality between phantom domain parameters cannot supply nominal transport.
+Function-valued domain changes and opaque Pi projection remain unsupported.
+When a visible retained function meets an unmatchable ordinary arrow,
+can_eq_nc_vacuous_depfun unifies their domains and multiplicities and solves
+the retained body against the non-dependent codomain under a fresh binder;
+mkDepFunCoWithVis collapses the vacuous right-hand binder back to FunTy
+(GHC Proposal #378 §4.6).
+This uses System DC's An-PiCong rule (Weirich et al., ICFP 2017, Fig. 8) and
+System DR's nominal domain role discipline (Weirich et al., ICFP 2019).
+-}
+
+{- Note [Miller pattern unification for higher-order motives]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Higher-order dependent combinators such as `(.)`, `($)`, and `flipDep`
+quantify an unmatchable motive variable `?m :: d_1 %U -> ... -> d_k %U -> r`
+applied to locally bound variables `?m s_1 ... s_k ~ rhs`. Because `%U` arrows
+are non-injective, `can_eq_app` cannot decompose `?m s_1 ... s_k ~ F a s_1`.
+
+`tryMillerPatternUnify` solves higher-order pattern equalities directly in the
+equality solver when `?m` is a touchable unfilled metavariable whose kind has
+`k` non-matchable (`%U` or flexible matchability) arrows and the spine
+`s_1 ... s_k` is a Miller pattern:
+1. Every `s_i` is pairwise distinct and rigidly bound strictly inside `?m`'s
+   scope: either a skolem `TyVar` with `tcTyVarLevel sk > tcTyVarLevel ?m`, or
+   a runtime `Id` with `lookupIdTermDepth x > metaTyVarTermDepth ?m`.
+2. Zero-family eta fast path: if `rhs` decomposes as `H s_1 ... s_k` where
+   `?m` and `s_1 ... s_k` do not occur free in `H`, `H` passes `checkTyEqRhs`
+   for `?m`, and `typeKind H` agrees with `tyVarKind ?m`, unify `?m := H` with
+   `Refl` without synthesizing a type family.
+3. General Miller inversion: otherwise verify that `?m` does not occur free in
+   `rhs` and every free variable of `rhs` outside `{s_1 ... s_k}` can be
+   promoted or narrowed to `(tcTyVarLevel ?m, metaTyVarTermDepth ?m)`. Sort
+   ambient free variables in dependency order, synthesize one 1-equation closed
+   family `$motive caps y_1 ... y_k = rhs[s_i := y_i]`, unify
+   `?m := $motive caps`, and discharge the equality with the symmetric family
+   axiom coercion.
+4. Non-pattern spines such as `?m (f x) ~ rhs` are left untouched as `IrredCt`
+   so `kickOutAfterUnification` wakes them once `?m` is solved elsewhere.
+
+References:
+* Dale Miller, "A Logic Programming Language with Lambda-Abstraction, Function
+  Variables, and Simple Unification", Journal of Logic and Computation 1(4),
+  1991.
+* Tobias Nipkow, "Functional Unification of Higher-Order Patterns", LICS 1993.
+-}
+
+splitMillerHead_maybe :: Type -> Maybe (TcTyVar, [Type])
+splitMillerHead_maybe = go []
+  where
+    go args (AppTy f a) = go (a : args) f
+    go args (TyVarTy tv)
+      | not (null args), isTcTyVar tv, isMetaTyVar tv = Just (tv, args)
+    go _ _ = Nothing
+
+tryMillerPatternUnify
+  :: CtEvidence -> Type -> Type
+  -> TcS (Maybe (StopOrContinue (Either IrredCt EqCt)))
+tryMillerPatternUnify ev ty1 ty2 = do
+  res1 <- try_side NotSwapped ty1 ty2
+  case res1 of
+    Just {} -> return res1
+    Nothing -> try_side IsSwapped ty2 ty1
+  where
+    try_side swapped lhs rhs
+      | Just (m_tv, spine0) <- splitMillerHead_maybe lhs
+      , mightPossiblyUnify ev NomEq m_tv
+      = do { unfilled <- isUnfilledMetaTyVar m_tv
+           ; given_lvl <- getInnermostGivenEqLevel
+           ; tc_lvl <- getTcLevel
+           ; id_depths <- getSolverIdDepthsFor (ctEvLoc ev)
+           ; m_kind0 <- zonkTcType (tyVarKind m_tv)
+           ; spine <- mapM zonkTcType spine0
+           ; rhs' <- zonkTcType rhs
+           ; if not (unfilled
+                     && touchabilityTest given_lvl m_tv
+                     && isPromotableMetaTyVar m_tv
+                     && not (tcTyVarLevel m_tv `strictlyDeeperThan` tc_lvl)
+                     && has_unmatchable_arrows (length spine) m_kind0)
+             then return Nothing
+             else case extract_miller_spine id_depths m_tv spine of
+               Nothing -> return Nothing
+               Just spine_vars -> do
+                 defer_rhs <- rhs_meta_can_absorb id_depths given_lvl tc_lvl spine_vars lhs rhs'
+                 if defer_rhs
+                   then return Nothing
+                   else do
+                     mb_eta <- try_eta_fast_path swapped id_depths m_tv m_kind0 spine spine_vars rhs'
+                     case mb_eta of
+                       Just hit -> return (Just hit)
+                       Nothing  -> try_general_inversion swapped id_depths m_tv m_kind0 spine spine_vars rhs' }
+      | otherwise
+      = return Nothing
+
+    has_unmatchable_arrows 0 _ = True
+    has_unmatchable_arrows n k
+      | FunTy FTF_T_T ma mult _ res_k <- coreFullView k
+      , isManyTy mult || isMetaTyVarTy mult
+      , ma `tcEqType` unmatchableDataConTy
+        || (isMetaTyVarTy ma && typeKind ma `tcEqType` matchabilityTy)
+      = has_unmatchable_arrows (n - 1) res_k
+      | otherwise = False
+
+    extract_miller_spine id_depths m_tv spine = do
+      let m_lvl   = tcTyVarLevel m_tv
+          m_depth = metaTyVarTermDepth m_tv
+          step _ [] = Just []
+          step seen (s : rest) = do
+            v <- case coreFullView s of
+              TermVarTy x
+                | isNativeOpaqueValueId x || isNativeIndexFunctionId x
+                , Just xd <- lookupIdTermDepth id_depths x
+                , xd > m_depth -> Just (x :: Var)
+              TyVarTy sk
+                | isTcTyVar sk, isSkolemTyVar sk
+                , tcTyVarLevel sk `strictlyDeeperThan` m_lvl -> Just (sk :: Var)
+              _ -> Nothing
+            guard (not (v `elemVarSet` seen))
+            (v :) <$> step (extendVarSet seen v) rest
+      vars <- step emptyVarSet spine
+      let spine_set = mkVarSet vars
+      -- Ensure earlier spine binders do not depend on later spine binders in reverse,
+      -- and m_tv does not occur in any spine binder's kind/type.
+      guard (not (any (\v -> elemVarSet m_tv (tyCoVarsOfType (varType v))) vars))
+      let ordered_ok _ [] = True
+          ordered_ok bound (v : vs) =
+            let later = mkVarSet vs
+            in not (anyFreeVarsOfType (`elemVarSet` later) (varType v))
+               && ordered_ok (extendVarSet bound v) vs
+      guard (ordered_ok emptyVarSet vars)
+      let _ = spine_set
+      Just vars
+
+    -- If rhs is itself an unfilled touchable MetaTv born inside the binder
+    -- scope of every spine variable, let (EQNC6a) unify `rhs_tv := m_tv spine`
+    -- directly instead of synthesizing a constant motive.
+    rhs_meta_can_absorb id_depths given_lvl tc_lvl spine_vars lhs rhs_ty
+      | TyVarTy rhs_tv <- coreFullView rhs_ty
+      , rhs_tv `notElem` spine_vars
+      , mightPossiblyUnify ev NomEq rhs_tv
+      , isPromotableMetaTyVar rhs_tv
+      , not (tcTyVarLevel rhs_tv `strictlyDeeperThan` tc_lvl)
+      , touchabilityTest given_lvl rhs_tv
+      = do { open <- isUnfilledMetaTyVar rhs_tv
+           ; let r_lvl   = tcTyVarLevel rhs_tv
+                 r_depth = metaTyVarTermDepth rhs_tv
+                 in_scope v
+                   | isTyVar v = not (tcTyVarLevel v `strictlyDeeperThan` r_lvl)
+                   | otherwise = maybe False (<= r_depth) (lookupIdTermDepth id_depths v)
+           ; return (open
+                     && not (elemVarSet rhs_tv (tyCoVarsOfType lhs))
+                     && typeKind lhs `tcEqType` tyVarKind rhs_tv
+                     && all in_scope spine_vars) }
+      | otherwise = return False
+
+    peel_trailing_apps 0 ty = Just (ty, [])
+    peel_trailing_apps n ty
+      | n > 0
+      , Just (fun, arg) <- tcSplitAppTyNoView_maybe ty
+      = do { (hd, args) <- peel_trailing_apps (n - 1) fun
+           ; Just (hd, args ++ [arg]) }
+      | n > 0
+      , TyConApp tc tc_args <- ty
+      , not (null tc_args)
+      , let init_args = init tc_args
+            last_arg  = last tc_args
+      , not (tyConMustBeSaturated tc) || isUnsaturatedUserFamily tc init_args
+      = do { (hd, args) <- peel_trailing_apps (n - 1) (mkTyConApp tc init_args)
+           ; Just (hd, args ++ [last_arg]) }
+      | otherwise = Nothing
+
+    kinds_compatible k1 k2
+      | k1 `tcEqType` k2 = True
+      | FunTy FTF_T_T ma1 m1 a1 r1 <- coreFullView k1
+      , FunTy FTF_T_T ma2 m2 a2 r2 <- coreFullView k2
+      , (ma1 `tcEqType` ma2 || isMetaTyVarTy ma1 || isMetaTyVarTy ma2)
+      , (m1 `tcEqType` m2 || isMetaTyVarTy m1 || isMetaTyVarTy m2)
+      , a1 `tcEqType` a2
+      = kinds_compatible r1 r2
+      | otherwise = False
+
+    unify_sync m_tv loc rws act = do
+      nested <- newNoTcEvBinds
+      (unifs, (res, ok)) <- reportFineGrainUnifications $ do
+        (level, (res, wanteds)) <- pushLevelNoWorkList (text "miller kind unification") $
+          wrapUnifier rws loc Nominal act
+        residual <- nestImplicTcS (UnifyForAllSkol (mkTyVarTy m_tv)) nested level $
+                      solveSimpleWanteds wanteds
+        return (res, isSolvedWC residual)
+      kickOutAfterUnification unifs
+      when ok $ do
+        outer <- getTcEvBindsVar
+        combineTcEvBinds outer nested
+      return (if ok then Just res else Nothing)
+
+    try_eta_fast_path _swapped id_depths m_tv m_kind0 spine spine_vars rhs'
+      | CtWanted (WantedCt { ctev_rewriters = rws, ctev_loc = loc }) <- ev
+      , Just (h_ty, rhs_args) <- peel_trailing_apps (length spine) rhs'
+      , and (zipWith tcEqType spine rhs_args)
+      , let bad_set = extendVarSet (mkVarSet spine_vars) m_tv
+      , not (anyFreeVarsOfType (`elemVarSet` bad_set) h_ty)
+      , kinds_compatible m_kind0 (typeKind h_ty)
+      = do { mb_kco <- unify_sync m_tv loc rws (\uenv -> uType uenv m_kind0 (typeKind h_ty))
+           ; case mb_kco of
+               Nothing -> return Nothing
+               Just kco -> do
+                 { kco' <- zonkCo kco
+                 ; m_kind' <- zonkTcType (tyVarKind m_tv)
+                 ; h_ty1 <- zonkTcType h_ty
+                 ; if not (isReflCo kco' && m_kind' `tcEqType` typeKind h_ty1)
+                   then return Nothing
+                   else do
+                     { let flags = unifyingLHSMetaTyVarWithDepths_TEFTask id_depths ev m_tv
+                     ; check_res <- wrapTcS (checkTyEqRhs flags h_ty1)
+                     ; case check_res of
+                         PuOK cts h_redn | isReflRedn h_redn -> do
+                           { emitWork cts
+                           ; let final_h = reductionReducedType h_redn
+                           ; unifyTyVar m_tv final_h
+                           ; setEqIfWanted ev (mkReflCPH NomEq rhs')
+                           ; kickOutAfterUnification (unitVarSet m_tv)
+                           ; Just <$> stopWith ev "Solved by Miller eta fast path" }
+                         _ -> return Nothing } } }
+      | otherwise = return Nothing
+
+    unify_motive_kind _ [] cur_k target_res_k uenv =
+      void (uType uenv cur_k target_res_k)
+    unify_motive_kind rws (dom_k : doms) cur_k target_res_k uenv
+      | FunTy FTF_T_T ma mult arg_k res_k <- coreFullView cur_k = do
+          unless (ma `tcEqType` unmatchableDataConTy) $
+            void (uType uenv ma unmatchableDataConTy)
+          unless (isManyTy mult) $
+            void (uType uenv mult ManyTy)
+          unless (arg_k `tcEqType` dom_k) $
+            void (uType uenv arg_k dom_k)
+          unify_motive_kind rws doms res_k target_res_k uenv
+      | otherwise = pprPanic "unify_motive_kind" (ppr cur_k)
+
+    peel_arrow_res 0 k = Just k
+    peel_arrow_res n k
+      | n > 0, FunTy FTF_T_T ma mult _ res_k <- coreFullView k
+      , ma `tcEqType` unmatchableDataConTy, isManyTy mult
+      = peel_arrow_res (n - 1) res_k
+      | otherwise = Nothing
+
+    try_general_inversion swapped id_depths m_tv m_kind0 spine spine_vars rhs'
+      | CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rws, ctev_loc = loc }) <- ev
+      , not (anyFreeVarsOfType (== m_tv) rhs')
+      = do { let dom_kinds = map varType spine_vars
+                 rhs_kind  = typeKind rhs'
+           ; mb_kok <- unify_sync m_tv loc rws (unify_motive_kind rws dom_kinds m_kind0 rhs_kind)
+           ; case mb_kok of
+               Nothing -> return Nothing
+               Just () -> do
+                 { m_kind'   <- zonkTcType (tyVarKind m_tv)
+                 ; spine'    <- mapM zonkTcType spine
+                 ; s_vars'   <- mapM (\v -> if isTyVar v
+                                              then setTyVarKind v <$> zonkTcType (tyVarKind v)
+                                              else setVarType v <$> zonkTcType (varType v))
+                                     spine_vars
+                 ; rhs_z     <- zonkTcType rhs'
+                 ; rhs_kind' <- zonkTcType (typeKind rhs_z)
+                 ; case peel_arrow_res (length s_vars') m_kind' of
+                     Just expected_res_k
+                       | expected_res_k `tcEqType` rhs_kind'
+                       , and (zipWith tcEqType (map typeKind spine') (map varType s_vars')) -> do
+                       { let spine_set = mkVarSet s_vars'
+                             outer_fvs = filterVarSet (\v -> not (v `elemVarSet` spine_set)) $
+                                           tyCoVarsOfTypes (rhs_z : rhs_kind' : map varType s_vars')
+                             m_lvl     = tcTyVarLevel m_tv
+                             m_depth   = metaTyVarTermDepth m_tv
+                       ; (prom_unifs, prom_res) <- reportFineGrainUnifications $ wrapTcS $
+                           checkPromoteFreeVarsWithDepths cteInsolubleOccurs
+                             (tyVarName m_tv) m_lvl m_depth id_depths outer_fvs
+                       ; kickOutAfterUnification prom_unifs
+                       ; if not (cterHasNoProblem prom_res)
+                         then return Nothing
+                         else do
+                           { rhs_p      <- zonkTcType rhs_z
+                           ; rhs_kind_p <- zonkTcType rhs_kind'
+                           ; s_vars_p   <- mapM (\v -> if isTyVar v
+                                                         then setTyVarKind v <$> zonkTcType (tyVarKind v)
+                                                         else setVarType v <$> zonkTcType (varType v))
+                                                s_vars'
+                           ; spine_p    <- mapM zonkTcType spine'
+                           ; m_kind_p   <- zonkTcType (tyVarKind m_tv)
+                           ; mb_synth   <- wrapTcS $
+                               tcSynthesizeMillerMotive (RealSrcSpan (ctLocSpan loc) Strict.Nothing)
+                                 s_vars_p rhs_kind_p rhs_p
+                           ; case mb_synth of
+                               Just (motive_ty, ax, cap_args)
+                                 | typeKind motive_ty `tcEqType` m_kind_p -> do
+                                   { unifyTyVar m_tv motive_ty
+                                   ; kickOutAfterUnification (unitVarSet m_tv)
+                                   ; let ax_co   = mkAxInstCo Nominal (BranchedAxiom ax 0)
+                                                     (cap_args ++ spine_p) []
+                                         ev_co   = case swapped of
+                                                     NotSwapped -> ax_co
+                                                     IsSwapped  -> mkSymCo ax_co
+                                   ; setWantedEq dest (CPH { cph_co = ev_co, cph_holes = emptyCoHoleSet })
+                                   ; Just <$> stopWith ev "Solved by Miller motive synthesis" }
+                               _ -> return Nothing } }
+                     _ -> return Nothing } }
+      | otherwise = return Nothing
+
+---------------------------------
+{- Note [Solving existential package equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider toList (filterVec odd xs), where xs contains Int elements.
+The two functions refer to Filtered a = exists (m :: Nat) | Vec m a.
+Their composition produces a Wanted between Filtered Int and Filtered alpha.
+
+Compare the payloads with a common fresh skolem for m. The ordinary
+forall-equality solver handles the binder kinds, touchability and escape
+checks. In this example it can solve alpha := Int independently of m.
+After zonking, use existential congruence to close the proof and check
+both endpoints against the original packages. Use the original types for
+an unsolved Wanted. Given package equalities do not reveal witnesses.
+See Note [Lifting under an erased existential] in GHC.Core.Coercion.
+-}
 can_eq_nc_forall :: CtEvidence -> EqRel
                  -> Type -> Type    -- LHS and RHS
                  -> TcS (StopOrContinue (Either IrredCt EqCt))
 -- See Note [Solving forall equalities]
 
-can_eq_nc_forall ev eq_rel s1 s2
+can_eq_nc_forall ev eq_rel orig1 orig2
+ | CtWanted {} <- ev
+ , Just (_, tv1, _) <- splitForAllTyCoVar_maybe s1
+ , Just (_, tv2, _) <- splitForAllTyCoVar_maybe s2
+ , isTyVar tv1 /= isTyVar tv2
+ = canEqHardFailure ev s1 s2
+
  | CtWanted (WantedCt { ctev_dest = orig_dest, ctev_rewriters = rws, ctev_loc = loc }) <- ev
  = do { let (bndrs1, phi1, bndrs2, phi2) = split_foralls s1 s2
-            flags1 = binderFlags bndrs1
-            flags2 = binderFlags bndrs2
+            flags1 = binderFlags (map snd bndrs1)
+            flags2 = binderFlags (map snd bndrs2)
 
       ; if eq_rel == NomEq && not (all2 eqForAllVis flags1 flags2) -- Note [ForAllTy and type equality]
         then do { traceTcS "Forall failure: visibility-mismatch" $
@@ -684,41 +1676,73 @@ can_eq_nc_forall ev eq_rel s1 s2
             empty_subst1   = mkEmptySubst $ mkInScopeSet free_tvs
             skol_info_anon = UnifyForAllSkol phi1
       ; skol_info <- mkSkolemInfo skol_info_anon
-      ; (subst1, skol_tvs) <- tcInstSkolTyVarsX skol_info empty_subst1 $
-                              binderVars bndrs1
+      ; (subst1, skol_tvs) <- mapAccumLM
+          (\subst tv ->
+            do { (subst', tvs') <- if isTyVar tv
+                   then tcInstSkolTyVarsX skol_info subst [tv]
+                   else wrapTcS $ freshenCoVarBndrsX subst [tv]
+               ; case tvs' of
+                   [tv'] -> return (subst', tv')
+                   _ -> panic "can_eq_nc_forall: freshen binder" })
+          empty_subst1 (binderVars (map snd bndrs1))
 
       ; let phi1' = substTy subst1 phi1
 
             -- Unify the kinds, extend the substitution
-            go :: UnifyEnv -> [TcTyVar] -> Subst
-               -> [TyVarBinder] -> [TyVarBinder] -> TcM.TcM TcCoercion
-            go uenv (skol_tv:skol_tvs) subst2 (bndr1:bndrs1) (bndr2:bndrs2)
+            go :: UnifyEnv -> [TcTyCoVar] -> Subst -> Subst
+               -> [(Matchability, ForAllTyBinder)] -> [(Matchability, ForAllTyBinder)]
+               -> TcM.TcM TcCoercion
+            go uenv (skol_tv:skol_tvs) lsubst1 subst2 ((ma1,bndr1):bndrs1) ((ma2,bndr2):bndrs2)
               = do { let tv2  = binderVar bndr2
                          vis1 = binderFlag bndr1
                          vis2 = binderFlag bndr2
 
+                   -- Metadata is outside this binder's scope. Apply only
+                   -- substitutions for earlier binders on either side.
+                   ; ma_co <- uType (uenv `setUEnvRole` Nominal)
+                                    (substTy lsubst1 ma1) (substTy subst2 ma2)
+
                    -- Unify the kinds, at Nominal role
                    -- See (SF1) in Note [Solving forall equalities]
                    ; kind_co <- uType (uenv `setUEnvRole` Nominal)
-                                      (tyVarKind skol_tv)
-                                      (substTy subst2 (tyVarKind tv2))
+                                      (varType skol_tv)
+                                      (substTy subst2 (varType tv2))
 
-                   ; let subst2' = extendTvSubstAndInScope subst2 tv2
-                                       (mkCastTy (mkTyVarTy skol_tv) kind_co)
+                   ; let left_arg
+                           | isTyVar skol_tv = mkTyVarTy skol_tv
+                           | otherwise = mkCoercionTy (mkCoVarCo skol_tv)
+                         right_arg
+                           | isTyVar skol_tv = mkCastTy left_arg kind_co
+                           | otherwise
+                           = let r = coVarRole skol_tv
+                                 h = downgradeRole r Nominal kind_co
+                             in mkCoercionTy
+                                  (mkSymCo (mkSelCo (SelTyCon 2 r) h)
+                                   `mkTransCo` mkCoVarCo skol_tv
+                                   `mkTransCo` mkSelCo (SelTyCon 3 r) h)
+                         extend subst tv arg = extendTCvSubst
+                           (extendSubstInScopeSet subst (tyCoVarsOfType arg)) tv arg
+                         lsubst1' = extend lsubst1 (binderVar bndr1) left_arg
+                         subst2' = extend subst2 tv2 right_arg
                          -- skol_tv is already in the in-scope set, but the
                          -- free vars of kind_co are not; hence "...AndInScope"
-                   ; co <- go uenv skol_tvs subst2' bndrs1 bndrs2
+                   ; body_uenv <- if isCoVar skol_tv
+                       then do { level <- TcM.getTcLevel
+                               ; return (uenv { u_given_eq_lvl =
+                                   maxTcLevel level (u_given_eq_lvl uenv) }) }
+                       else return uenv
+                   ; co <- go body_uenv skol_tvs lsubst1' subst2' bndrs1 bndrs2
 
-                   ; return (mkNakedForAllCo skol_tv vis1 vis2 kind_co co)}
+                   ; return (mkNakedForAllCo skol_tv vis1 vis2 ma_co kind_co co)}
                      -- mkNaked.. because these types are not zonked, and the
                      -- assertions in mkForAllCo may fail without that zonking
 
             -- Done: unify phi1 ~ phi2
-            go uenv [] subst2 bndrs1 bndrs2
+            go uenv [] _lsubst1 subst2 bndrs1 bndrs2
               = assert (null bndrs1 && null bndrs2) $
                 uType uenv phi1' (substTyUnchecked subst2 phi2)
 
-            go _ _ _ _ _ = panic "can_eq_nc_forall"  -- case (s:ss) []
+            go _ _ _ _ _ _ = panic "can_eq_nc_forall"  -- case (s:ss) []
 
             init_subst2 = mkEmptySubst (substInScopeSet subst1)
 
@@ -733,21 +1757,32 @@ can_eq_nc_forall ev eq_rel s1 s2
                      (tclvl, (all_co, wanteds))
                           <- pushLevelNoWorkList (ppr skol_info) $
                              wrapUnifier rws loc (eqRelRole eq_rel)   $ \uenv ->
-                             go uenv skol_tvs init_subst2 bndrs1 bndrs2
+                             go uenv skol_tvs (mkEmptySubst (substInScopeSet subst1)) init_subst2 bndrs1 bndrs2
 
                    ; traceTcS "Trying to solve the implication" (ppr s1 $$ ppr s2 $$ ppr wanteds)
 
                    -- Solve the `wanteds` in a nested context.
                    ; residual_wanted <- nestImplicTcS skol_info_anon nested_ev_binds_var tclvl $
-                                        solveSimpleWanteds wanteds
+                                        solve_forall_wanteds (mkVarSet (filter isCoVar skol_tvs)) wanteds
 
                    ; return (all_co, isSolvedWC residual_wanted) }
 
       -- Kick out any inerts constraints that mention unified type variables
       ; kickOutAfterUnification unifs
 
-      ; if solved
-        then do {  -- Record any used used Given coercions (in `evb_tcvs`) so that
+      ; mb_all_co <- if solved
+          then do { mb_co <- zonk_forall_co all_co
+                  ; left <- zonkTcType orig1
+                  ; right <- zonkTcType orig2
+                  ; return $ do
+                      co <- close <$> mb_co
+                      guard (coercionLKind co `tcEqType` left
+                             && coercionRKind co `tcEqType` right)
+                      return co }
+          else return Nothing
+      ; case mb_all_co of
+        Just all_co -> do
+                {  -- Record any used used Given coercions (in `evb_tcvs`) so that
                    -- they are kept alive by `neededEvVars`. Admittedly they are free in `all_co`,
                    -- but only if we zonk it, which `neededEvVars` does not do (see test T7196).
                   ev_binds_var <- getTcEvBindsVar
@@ -757,7 +1792,7 @@ can_eq_nc_forall ev eq_rel s1 s2
                      -- emptyCoHoleSet: fully solved, so all_co has no holes
                 ; stopWith ev "Polytype equality: solved" }
 
-        else canEqSoftFailure IrredShapeReason ev s1 s2 } }
+        Nothing -> canEqSoftFailure IrredShapeReason ev orig1 orig2 } }
 
  | otherwise
  = do { traceTcS "Omitting decomposition of given polytype equality" $
@@ -765,17 +1800,58 @@ can_eq_nc_forall ev eq_rel s1 s2
       ; stopWith ev "Discard given polytype equality" }
 
  where
+    (s1, s2, close) = case (orig1, orig2) of
+      (ExistsTy flag a t, ExistsTy _ b u) ->
+        (existsCoScope a t, existsCoScope b u, mkExistsCo flag (eqRelRole eq_rel))
+      _ -> (orig1, orig2, id)
+
+    -- See Note [CoVar forall touchability] in GHC.Tc.Solver.Monad.
+    solve_forall_wanteds :: CoVarSet -> Cts -> TcS WantedConstraints
+    solve_forall_wanteds cvs wanteds
+      | isEmptyVarSet cvs = solveSimpleWanteds wanteds
+      | otherwise
+      = do { wanteds <- zonkSimples wanteds
+           ; let cv_free ct = disjointVarSet cvs (tyCoVarsOfCt ct)
+                 (outside, inside) = partitionBag cv_free wanteds
+           ; outside_res <- solveSimpleWanteds outside
+           ; inside_res <- withCoVarTouchabilityBoundary $ solveSimpleWanteds inside
+           ; inside_simples <- zonkSimples (wc_simple inside_res)
+           ; let (new_outside, _) = partitionBag cv_free inside_simples
+           ; residual <- if isEmptyBag new_outside
+               then return (inside_res { wc_simple = inside_simples })
+               else do { simple_res <- solve_forall_wanteds cvs inside_simples
+                       ; return (inside_res { wc_simple = emptyBag } `andWC` simple_res) }
+           ; return (outside_res `andWC` residual) }
+
+    -- Check FC6 after resolving holes, before constructing a checked ForAllCo.
+    -- A local CoVar is not a Given equality for the nested solver.
+    zonk_forall_co :: Coercion -> TcS (Maybe Coercion)
+    zonk_forall_co (ForAllCo { fco_tcv = tv, fco_visL = visL, fco_visR = visR
+                            , fco_ma = ma_co, fco_kind = kind_mco, fco_body = body_co })
+      = do { ma_co' <- zonkCo ma_co
+           ; tv' <- zonkTyCoVarKind tv
+           ; kind_mco' <- case kind_mco of
+               MRefl -> return MRefl
+               MCo co -> MCo <$> zonkCo co
+           ; mb_body_co' <- zonk_forall_co body_co
+           ; return $ do
+               body_co' <- mb_body_co'
+               guard (isTyVar tv' || almostDevoidCoVarOfCo tv' body_co')
+               return (mkForAllCo tv' visL visR ma_co' kind_mco' body_co') }
+    zonk_forall_co co = Just <$> zonkCo co
+
     split_foralls :: TcType -> TcType
-                  -> ( [ForAllTyBinder], TcType
-                     , [ForAllTyBinder], TcType)
+                  -> ( [(Matchability, ForAllTyBinder)], TcType
+                     , [(Matchability, ForAllTyBinder)], TcType)
     -- Split matching foralls; stop when the foralls don't match
     -- See #22537.  See (SF3) in Note [Solving forall equalities]
     -- Postcondition: the two lists of binders returned have the same length
     split_foralls s1 s2
-      | Just (bndr1, s1') <- splitForAllForAllTyBinder_maybe s1
-      , Just (bndr2, s2') <- splitForAllForAllTyBinder_maybe s2
+      | Just (ma1, bndr1, s1') <- splitForAllForAllTyBinder_maybe s1
+      , Just (ma2, bndr2, s2') <- splitForAllForAllTyBinder_maybe s2
+      , isTyVar (binderVar bndr1) == isTyVar (binderVar bndr2)
       = let !(bndrs1, phi1, bndrs2, phi2) = split_foralls s1' s2'
-        in (bndr1:bndrs1, phi1, bndr2:bndrs2, phi2)
+        in ((ma1,bndr1):bndrs1, phi1, (ma2,bndr2):bndrs2, phi2)
     split_foralls s1 s2 = ([], s1, [], s2)
 
 
@@ -798,6 +1874,16 @@ There are lots of wrinkles of course:
       [W] forall (a:ka). { ka ~N kb,  t1 ~ t2[a/b] }
    These kind equalities are generated by the `go` loop in `can_eq_nc_forall`.
    Why Nominal role? See the typing rule for ForAllCo.
+
+  Matchability equality is also nominal at every outer role. Check the
+  annotation before extending the substitution with its own binder.
+
+  A CoVar binder uses a fresh CoVar, not a skolem TyVar. Given a nominal
+  proof h between the equality predicates, transport the right binder to
+  sym(nth 2 h); cv; nth 3 h. This is the same transport as the ForAllCo
+  endpoint rule. Do not add cv as a Given equality to the nested solver.
+  Such evidence could violate (FC6). After solving the Wanted constraints,
+  zonk the body proofs and check almostDevoid before rebuilding ForAllCo.
 
 (SF2) At Nominal role we must check that the visiblities match.
   For example
@@ -911,7 +1997,70 @@ can_eq_app :: CtEvidence       -- :: s1 t1 ~N s2 t2
 -- See Note [Decomposing AppTy equalities]
 can_eq_app ev s1 t1 s2 t2
   | CtWanted (WantedCt { ctev_dest = dest }) <- ev
-  = do { traceTcS "can_eq_app" (vcat [ text "s1:" <+> ppr s1, text "t1:" <+> ppr t1
+  = if (m1 && m2) || s1 `tcEqType` s2 then wanted_congruence dest
+    else do { flex1 <- flex_head s1
+            ; flex2 <- flex_head s2
+            ; compat <- compatible_arrows
+            ; if (flex1 || flex2) && compat
+              then do { deferred <- deferOpenAppEq ev
+                      ; if deferred
+                        then stopWith ev "Deferred open application equality"
+                        else do { pending <- hasPendingImplics
+                                ; if pending
+                                  then finishCanWithIrred IrredShapeReason ev
+                                  else wanted_congruence dest } }
+              else finishCanWithIrred IrredShapeReason ev }
+
+  | m1, m2
+  , s1k `mismatches` s2k
+  = canEqHardFailure ev (s1 `mkAppTy` t1) (s2 `mkAppTy` t2)
+
+  | CtGiven (GivenCt { ctev_evar = evar }) <- ev
+  , m1, m2
+  = do { let co   = mkCoVarCo evar
+             co_s = mkLRCo CLeft  co
+             co_t = mkLRCo CRight co
+       ; ev_s <- newSelectorGiven loc Nominal co_s s1 s2
+       ; ev_t <- newSelectorGiven loc Nominal co_t t1 t2
+       ; emitWorkNC [CtGiven ev_t]
+       ; startAgainWith (mkNonCanonical $ CtGiven ev_s) }
+
+  | otherwise
+  = finishCanWithIrred IrredShapeReason ev
+
+  where
+    flex_head fun
+      | (head_ty, _) <- tcSplitAppTys fun
+      , Just f <- getTyVar_maybe head_ty
+      , isTcTyVar f, isMetaTyVar f
+      = isUnfilledMetaTyVar f
+      | otherwise = return False
+
+    arrow_matchability kind = case tcSplitFunTy_maybe kind of
+      Just (ma, _, _) -> Just ma
+      Nothing
+        | ForAllTy ma _ _ <- coreFullView kind -> Just ma
+        | otherwise -> Nothing
+
+    open_matchability kind
+      | Just k <- getTyVar_maybe (coreFullView kind)
+      , isTcTyVar k, isMetaTyVar k
+      = isUnfilledMetaTyVar k
+      | Just ma <- arrow_matchability kind
+      , Just m <- getTyVar_maybe ma
+      , isTcTyVar m, isMetaTyVar m
+      = isUnfilledMetaTyVar m
+      | otherwise = return False
+
+    compatible_arrows = do
+      open_m1 <- open_matchability s1k
+      open_m2 <- open_matchability s2k
+      case (arrow_matchability s1k, arrow_matchability s2k) of
+        (Just ma1, Just ma2) ->
+          return (open_m1 || open_m2 || ma1 `tcEqType` ma2)
+        _ -> return (open_m1 || open_m2)
+
+    wanted_congruence dest = do { traceTcS "can_eq_app" (vcat [ text "s1:" <+> ppr s1, text "t1:" <+> ppr t1
                                      , text "s2:" <+> ppr s2, text "t2:" <+> ppr t2
                                      , text "vis:" <+> ppr (isNextArgVisible s1) ])
        ; co_plus_holes <- wrapUnifierAndEmit ev Nominal $ \uenv ->
@@ -929,30 +2078,12 @@ can_eq_app ev s1 t1 s2 t2
        ; setWantedEq dest co_plus_holes
        ; stopWith ev "Decomposed [W] AppTy" }
 
-    -- If there is a ForAll/(->) mismatch, the use of the Left coercion
-    -- below is ill-typed, potentially leading to a panic in splitTyConApp
-    -- Test case: typecheck/should_run/Typeable1
-    -- We could also include this mismatch check above (for W and D), but it's slow
-    -- and we'll get a better error message not doing it
-  | s1k `mismatches` s2k
-  = canEqHardFailure ev (s1 `mkAppTy` t1) (s2 `mkAppTy` t2)
-
-  | CtGiven (GivenCt { ctev_evar = evar }) <- ev
-  = do { let co   = mkCoVarCo evar
-             co_s = mkLRCo CLeft  co
-             co_t = mkLRCo CRight co
-       ; ev_s <- newGivenEv loc ( mkTcEqPredLikeEv ev s1 s2
-                                , evCoercion co_s )
-       ; ev_t <- newGivenEv loc ( mkTcEqPredLikeEv ev t1 t2
-                                , evCoercion co_t )
-       ; emitWorkNC [CtGiven ev_t]
-       ; startAgainWith (mkNonCanonical $ CtGiven ev_s) }
-
-  where
     loc = ctEvLoc ev
 
     s1k = typeKind s1
     s2k = typeKind s2
+    m1 = isMatchableFunTy s1k
+    m2 = isMatchableFunTy s2k
 
     k1 `mismatches` k2
       =  isForAllTy k1 && not (isForAllTy k2)
@@ -970,16 +2101,185 @@ canEqCast :: CanEqState
           -> TcType -> TcType     -- RHS (res. LHS), ty2 both normal and pretty
           -> TcS (StopOrContinue (Either IrredCt EqCt))
 canEqCast ces rdr_env envs ev eq_rel swapped ty1 co1 ty2 ps_ty2
-  = do { traceTcS "Decomposing cast" (vcat [ ppr ev
-                                           , ppr ty1 <+> text "|>" <+> ppr co1
-                                           , ppr ps_ty2 ])
-       ; new_ev <- rewriteEqEvidence ev swapped
-                      (mkGReflLeftRedn role ty1 co1)
-                      (mkReflRedn role ps_ty2)
-                      emptyCoHoleSet
-       ; can_eq_nc (swapCES swapped ces) rdr_env envs new_ev eq_rel ty1 ty1 ty2 ps_ty2 }
+  | CtGiven (GivenCt { ctev_evar = evar }) <- ev
+  -- See (EIK4) and (EIK5) in Note [Equalities with heterogeneous kinds].
+  = do { transport <- kind_transport
+       ; case transport of
+           MRefl -> strip_cast
+           MCo _
+             | isJust (canEqLHS_maybe ty1) -> strip_cast
+             | otherwise -> handle_cast_given evar }
+  | otherwise = strip_cast
   where
     role = eqRelRole eq_rel
+    loc = ctEvLoc ev
+    cast_ty1 = mkCastTy ty1 co1
+    (rhs, rhs_cast) = case ty2 of
+      CastTy body co2 -> (body, MCo co2)
+      _               -> (ty2, MRefl)
+    kind_givens = (Nominal, co1) : [(Nominal, co2) | MCo co2 <- [rhs_cast]]
+
+    same_kind ka kb
+      | ka `tcEqType` kb = return True
+      | otherwise = tcEqType <$> zonkTcType ka <*> zonkTcType kb
+
+    handle_cast_given evar
+      = do { let pred_ty = case swapped of
+                             NotSwapped -> mkEqPred eq_rel cast_ty1 ty2
+                             IsSwapped  -> mkEqPred eq_rel ty2 cast_ty1
+                 parent = mkGReflRightCo role ty1 co1 `mkTransCo`
+                            maybeSymCo swapped (mkCoVarCo (setVarType evar pred_ty))
+                            `mkTransCo` mkSymCo (mkGReflRightMCo role rhs rhs_cast)
+                 k_xi1 = typeKind ty1
+                 k_xi2 = typeKind rhs
+                 ces_rw = swapCES swapped ces
+           ; same_xi_kind <- same_kind k_xi1 k_xi2
+           ; if same_xi_kind
+               then do { emitNewGivens (mkKindEqLoc ty1 rhs loc) kind_givens
+                       ; gv <- newGivenEv loc (mkEqPred eq_rel ty1 rhs, evCoercion parent)
+                       ; can_eq_nc ces_rw rdr_env envs (CtGiven gv) eq_rel ty1 ty1 rhs rhs }
+               else case (canEqLHS_maybe ty1, canEqLHS_maybe rhs) of
+                 (Just lhs1, _) ->
+                   do { kind_ev <- newGivenEv (mkKindEqLoc ty1 rhs loc)
+                                     (mkNomEqPred k_xi2 k_xi1, evCoercion (mkSymCo (mkKindCo parent)))
+                      ; emitWorkNC [CtGiven kind_ev]
+                      ; let hk = givenCtEvCoercion kind_ev
+                            xi2' = mkCastTy rhs hk
+                      ; gv <- newGivenEv loc (mkEqPred eq_rel ty1 xi2',
+                                evCoercion (parent `mkTransCo` mkGReflRightCo role rhs hk))
+                      ; canEqCanLHSHomo (CtGiven gv) eq_rel NotSwapped lhs1 ty1 xi2' xi2' }
+                 (Nothing, Just lhs2) ->
+                   do { kind_ev <- newGivenEv (mkKindEqLoc ty1 rhs loc)
+                                     (mkNomEqPred k_xi1 k_xi2, evCoercion (mkKindCo parent))
+                      ; emitWorkNC [CtGiven kind_ev]
+                      ; let hk = givenCtEvCoercion kind_ev
+                            xi1' = mkCastTy ty1 hk
+                      ; gv <- newGivenEv loc (mkEqPred eq_rel xi1' rhs,
+                                evCoercion (mkSymCo (mkGReflRightCo role ty1 hk) `mkTransCo` parent))
+                      ; canEqCanLHSHomo (CtGiven gv) eq_rel IsSwapped lhs2 rhs xi1' xi1' }
+                 (Nothing, Nothing) ->
+                   decompose_or_park ty1 rhs parent }
+
+    finish_cast_irred reason parent
+      | MCo co2 <- rhs_cast
+      = do { let c12 = co1 `mkTransCo` mkSymCo co2
+                 lhs_one_cast = mkCastTy ty1 c12
+                 co_one_cast  = mkSymCo (mkGReflRightCo role ty1 c12) `mkTransCo` parent
+           ; gv <- newGivenEv loc (mkEqPred eq_rel lhs_one_cast rhs, evCoercion co_one_cast)
+           ; finishCanWithIrred reason (CtGiven gv) }
+      | otherwise
+      = finishCanWithIrred reason ev
+
+    decompose_or_park xi1 xi2 parent
+      | FunTy { ft_af = af1 } <- coreFullView xi1
+      , FunTy { ft_af = af2 } <- coreFullView xi2
+      , af1 == af2
+      = do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+           ; emitSelectorGivens loc
+               [ (funRole role fs, mkSelCo (SelFun fs) parent)
+               | fs <- [SelMatch, SelMult, SelArg, SelRes] ]
+           ; stopWith ev "Decomposed casted FunTy Given" }
+      | Just (tc1, tys1) <- tcSplitTyConApp_maybe xi1
+      , Just (tc2, tys2) <- tcSplitTyConApp_maybe xi2
+      , not (tyConMustBeSaturated tc1 || tyConMustBeSaturated tc2)
+      = if tc1 == tc2 && tys1 `equalLength` tys2
+          then do { inerts <- getInertSet
+                  ; if canDecomposeTcApp ev eq_rel tc1 inerts
+                      then do { let selectors = tyConAppGivenSelectors
+                                                  (tyConRoleListX role tc1) tys1 tys2 parent
+                              ; when (null selectors) $
+                                  emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+                              ; emitSelectorGivens loc selectors
+                              ; stopWith ev "Decomposed casted TyConApp Given" }
+                      else do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+                              ; finish_cast_irred ReprEqReason parent } }
+          else do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+                  ; let reason
+                          | tyConSkolem tc1 || tyConSkolem tc2 = AbstractTyConReason
+                          | NomEq <- eq_rel = ShapeMismatchReason
+                          | isGenerativeTyCon tc1 role && isGenerativeTyCon tc2 role
+                          = ShapeMismatchReason
+                          | otherwise = ReprEqReason
+                  ; finish_cast_irred reason parent }
+      | NomEq <- eq_rel
+      , Just (s1, t1) <- tcSplitAppTy_maybe xi1
+      , Just (s2, t2) <- tcSplitAppTy_maybe xi2
+      = do { let s1k = typeKind s1
+                 s2k = typeKind s2
+                 m1 = isMatchableFunTy s1k
+                 m2 = isMatchableFunTy s2k
+                 mismatch = isForAllTy s1k /= isForAllTy s2k
+           ; emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+           ; if m1 && m2 && mismatch
+               then finish_cast_irred ShapeMismatchReason parent
+               else if m1 && m2
+                 then do { ev_s <- newSelectorGiven loc Nominal (mkLRCo CLeft parent) s1 s2
+                         ; ev_t <- newSelectorGiven loc Nominal (mkLRCo CRight parent) t1 t2
+                         ; emitWorkNC [CtGiven ev_t]
+                         ; startAgainWith (mkNonCanonical $ CtGiven ev_s) }
+                 else finish_cast_irred IrredShapeReason parent }
+      | otherwise
+      = do { emitNewGivens (mkKindEqLoc xi1 xi2 loc) kind_givens
+           ; let reason = case eq_rel of
+                   ReprEq -> ReprEqReason
+                   NomEq
+                     | isOpaqueTermIndex xi1 || isOpaqueTermIndex xi2 ->
+                         if typesAreApart (typeKind xi1) (typeKind xi2)
+                           then ShapeMismatchReason
+                           else IrredShapeReason
+                     | ForAllTy{} <- coreFullView xi1
+                     , ForAllTy{} <- coreFullView xi2 -> IrredShapeReason
+                     | isOpaqueIndexEquality True xi1 xi2 -> IrredShapeReason
+                     | otherwise -> ShapeMismatchReason
+           ; finish_cast_irred reason parent }
+
+    strip_cast
+      = do { traceTcS "Decomposing cast" (vcat [ ppr ev
+                                               , ppr ty1 <+> text "|>" <+> ppr co1
+                                               , ppr ps_ty2 ])
+           ; rhs_cast' <- cast_rhs
+           ; let rhs_redn = mkGReflRightMRedn role ps_ty2 rhs_cast'
+           ; case rhs_cast' of
+               MCo kind_co -> emitNewGivens (mkKindEqLoc ty1 ty2 loc) [(Nominal, kind_co)]
+               MRefl       -> return ()
+           ; new_ev <- rewriteEqEvidence ev swapped
+                          (mkGReflLeftRedn role ty1 co1)
+                          rhs_redn
+                          emptyCoHoleSet
+           ; can_eq_nc (swapCES swapped ces) rdr_env envs new_ev eq_rel
+                       ty1 ty1 (mkCastTyMCo ty2 rhs_cast') (reductionReducedType rhs_redn) }
+    cast_rhs
+      | CtGiven {} <- ev
+      , isJust (canEqLHS_maybe ty1)
+      = kind_transport
+      | otherwise
+      = return MRefl
+
+    -- See (EIK4) and (EIK5) in Note [Equalities with heterogeneous kinds].
+    kind_transport
+      | k2 `tcEqType` rhs_kind = return (move_cast k1 rhs_kind)
+      | otherwise = do { k1' <- zonkTcType k1
+                       ; k2' <- zonkTcType k2
+                       ; rhs_kind' <- zonkTcType rhs_kind
+                       ; return $ if k2' `tcEqType` rhs_kind'
+                                  then move_cast k1' rhs_kind'
+                                  else MRefl }
+      where
+        Pair k1 k2 = coercionKind co1
+        rhs_kind = typeKind ty2
+        move_cast from_kind to_kind
+          | from_kind `tcEqType` to_kind = MRefl
+          | otherwise                   = MCo (mkSymCo co1)
+
+-- | Defer a heterogeneous casted Given until EQNC5 rewrites both endpoints.
+-- See (EIK5) in Note [Equalities with heterogeneous kinds] and
+-- Note [Opaque runtime index equalities].
+deferHeteroCastGiven :: CtEvidence -> Type -> Coercion -> Type -> Bool
+deferHeteroCastGiven (CtGiven {}) lhs co rhs
+  | isNothing (canEqLHS_maybe lhs)
+  = let Pair k1 _ = coercionKind co
+    in not (k1 `tcEqType` typeKind rhs)
+deferHeteroCastGiven _ _ _ _ = False
 
 ------------------------
 canTyConApp :: CtEvidence -> EqRel
@@ -1547,12 +2847,34 @@ Note [Decomposing TyConApp equalities]. We have
 
     s1 ~r s2,  t1 ~N t2   ==>   s1 t1 ~r s2 t2       (rule CO_APP)
     s1 t1 ~N s2 t2        ==>   s1 ~N s2,  t1 ~N t2  (CO_LEFT, CO_RIGHT)
+                              only at matchable consumed kind arrows
+
+The split helpers inspect application syntax. They do not establish matchability.
+The arrow restriction on CO_LEFT and CO_RIGHT is the same as in Figure 5
+of Higher-Order Type-Level Programming in Haskell. A Given requires the
+inverse rule and therefore requires M. A Wanted can
+use forward AppCo congruence when the heads already agree. Different
+heads with two matchable arrows can decompose immediately. For example,
+f Bool ~ Maybe Bool with f :: Type %U -> Type can later reduce to reflexivity
+when another equality fixes f to a partial family. Decomposition would
+already have committed to the unsatisfiable equality f ~ Maybe.
+
+With an open metavariable head and compatible consumed arrow matchabilities,
+process independent receiver equalities and dictionaries first. Use
+deferOpenAppEq after rewriting so that the same rule applies when an equation
+exposes the application. If a head is still an unfilled metavariable and the
+consumed arrow matchabilities remain compatible (either still open or already
+equal, including both U), the Wanted may choose that head by ordinary forward
+congruence (rule CO_APP). Two rigid/known non-equal U heads still require
+rewriting or an independent equality, and an unfilled U head will not commit
+to a fixed M head while receiver constraints may still supply a partial family.
+Structural comparison of arrow types through SelFun is valid at U.
 
 In the first of these, why do we need Nominal equality in (t1 ~N t2)?
 See (APT3) below.
 
 For sound and complete solving, we need both directions to decompose. So:
-* At nominal role, all is well: we have both directions.
+* At nominal role, matchable kind arrows supply both directions.
 * At representational role, decomposition of Givens is unsound
   (see (APT1) below), and decomposition of Wanteds is incomplete.
 
@@ -1587,7 +2909,9 @@ which can then (assuming MkPhant is in scope) be simplified to Int ~R Int,
 and all will be well. See also Note [Unwrap newtypes first].
 
 Bottom line:
-* Always decompose AppTy at nominal role: can_eq_app
+* Nominal Given AppTy decomposes only at matchable kind arrows: can_eq_app
+* Nominal Wanted AppTy with different heads can decompose immediately at two
+  matchable kind arrows. A flexible head can wait for other work.
 * Never decompose AppTy at representational role (neither Given nor Wanted):
   the lack of an equation in can_eq_nc
 
@@ -1648,11 +2972,7 @@ canDecomposableTyConAppOK ev eq_rel tc (ty1,tys1) (ty2,tys2)
                    -- setVarType: satisfy Note [mkSelCo precondition] in Coercion.hs
                    -- Remember: ty1/ty2 may be more fully zonked than evar
                    --           See the call to canonicaliseEquality in solveEquality.
-             -> emitNewGivens loc
-                       [ (r, mkSelCo (SelTyCon i r) ev_co)
-                       | (r, ty1, ty2, i) <- zip4 tc_roles tys1 tys2 [0..]
-                       , r /= Phantom
-                       , not (isCoercionTy ty1) && not (isCoercionTy ty2) ]
+             -> emitSelectorGivens loc (tyConAppGivenSelectors tc_roles tys1 tys2 ev_co)
 
     ; stopWith ev "Decomposed TyConApp" }
 
@@ -1691,11 +3011,65 @@ canDecomposableTyConAppOK ev eq_rel tc (ty1,tys1) (ty2,tys2)
           mb_role_expln = tyConAppRoleExplanation role tc (arg_no, arg_role)
       in adjustCtLocTyConBinder mb_bndr mb_role_expln loc
 
+-- | Project the evidence for arguments that can become Given equalities.
+tyConAppGivenSelectors :: [Role] -> [TcType] -> [TcType] -> TcCoercion
+                       -> [(Role, TcCoercion)]
+tyConAppGivenSelectors roles tys1 tys2 co
+  = [ (r, mkSelCo (SelTyCon i r) co)
+    | (r, ty1, ty2, i) <- zip4 roles tys1 tys2 [0..]
+    , r /= Phantom
+    , not (isCoercionTy ty1) && not (isCoercionTy ty2) ]
+
+-- | Bind the non-reflexive projections of a Given.
+-- See Note [Homogeneous selector Givens].
+emitSelectorGivens :: CtLoc -> [(Role, TcCoercion)] -> TcS ()
+emitSelectorGivens loc selectors
+  = do { traceTcS "emitSelectorGivens" (ppr selectors)
+       ; givens <- sequence
+           [ newSelectorGiven loc role co lhs rhs
+           | (role, co) <- selectors
+           , let Pair lhs rhs = coercionKind co
+           , not (lhs `tcEqType` rhs) ]
+       ; emitWorkNC (map CtGiven givens) }
+
+-- | Bind a projection at its original role after any necessary kind cast.
+-- See Note [Homogeneous selector Givens].
+newSelectorGiven :: CtLoc -> Role -> TcCoercion -> TcType -> TcType -> TcS GivenCtEvidence
+newSelectorGiven loc role co lhs rhs
+  | let k1 = typeKind lhs
+        k2 = typeKind rhs
+  , not (k1 `tcEqType` k2)
+  = do { kind_ev <- newGivenEv (mkKindEqLoc lhs rhs loc)
+                        (mkNomEqPred k2 k1, evCoercion (mkSymCo (mkKindCo co)))
+       ; emitWorkNC [CtGiven kind_ev]
+       ; let kind_co = givenCtEvCoercion kind_ev
+       ; newGivenEv loc (mkEqPredRole role lhs (mkCastTy rhs kind_co),
+                evCoercion (co `mkTransCo` mkGReflRightCo role rhs kind_co)) }
+  | otherwise
+  = newGivenEv loc (mkEqPredRole role lhs rhs, evCoercion co)
+
+{- Note [Homogeneous selector Givens]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A same-kind Given such as T @k a ~# T @l b can have a projection whose
+endpoints have different kinds. Function argument projections can also
+have different runtime representations. The selector expression proves
+the heterogeneous equality. Keep it as a coercion expression.
+
+First bind a nominal proof h :: l ~# k from Sym (Kind selector).
+Bind the index equality a ~# (b |> h) next, using the selector followed by
+the cast on b. Both binders have same-kind endpoints. Use the selector's
+role for the index equality, including a representational projection.
+This performs the transport from canEqCanLHSHetero before binding the
+selected evidence. The same operation applies to the two nominal LRCo
+projections of a matchable application. Continue with the head equality
+first, as in can_eq_app.
+-}
+
 canDecomposableFunTy :: CtEvidence -> EqRel -> FunTyFlag
-                     -> (Type,Type,Type,Type)   -- (fun_ty,multiplicity,arg,res)
-                     -> (Type,Type,Type,Type)   -- (fun_ty,multiplicity,arg,res)
+                     -> (Type,Type,Type,Type,Type) -- (fun_ty,matchability,multiplicity,arg,res)
+                     -> (Type,Type,Type,Type,Type) -- (fun_ty,matchability,multiplicity,arg,res)
                      -> TcS (StopOrContinue a)
-canDecomposableFunTy ev eq_rel af f1@(ty1,m1,a1,r1) f2@(ty2,m2,a2,r2)
+canDecomposableFunTy ev eq_rel af f1@(ty1,ma1,m1,a1,r1) f2@(ty2,ma2,m2,a2,r2)
   = do { traceTcS "canDecomposableFunTy"
                   (ppr ev $$ ppr eq_rel $$ ppr f1 $$ ppr f2)
        ; case ev of
@@ -1703,13 +3077,14 @@ canDecomposableFunTy ev eq_rel af f1@(ty1,m1,a1,r1) f2@(ty2,m2,a2,r2)
              -> do { co_plus_holes <- wrapUnifierAndEmit ev Nominal $ \ uenv ->
                         do { let mult_env = uenv `updUEnvLoc` toInvisibleLoc InvisibleMultiplicity
                                                  `setUEnvRole` funRole role SelMult
+                           ; ma <- uType (uenv `setUEnvRole` funRole role SelMatch) ma1 ma2
                            ; mult <- uType mult_env m1 m2
                              -- TODO: it would be good to set an environment for
                              -- RuntimeRep mismatches, but it's difficult to do so because
                              -- we don't explicit call uType on the RuntimeReps here.
                            ; arg  <- uType (uenv `setUEnvRole` funRole role SelArg) a1 a2
                            ; res  <- uType (uenv `setUEnvRole` funRole role SelRes) r1 r2
-                           ; return (mkNakedFunCo role af mult arg res) }
+                           ; return (mkNakedFunCo role af ma mult arg res) }
                    ; setWantedEq dest co_plus_holes }
 
            CtGiven (GivenCt { ctev_evar = evar })
@@ -1718,9 +3093,9 @@ canDecomposableFunTy ev eq_rel af f1@(ty1,m1,a1,r1) f2@(ty2,m2,a2,r2)
                    -- setVarType: satisfy Note [mkSelCo precondition] in Coercion.hs
                    -- Remember: ty1/ty2 may be more fully zonked than evar
                    --           See the call to canonicaliseEquality in solveEquality.
-             -> emitNewGivens loc
+             -> emitSelectorGivens loc
                        [ (funRole role fs, mkSelCo (SelFun fs) ev_co)
-                       | fs <- [SelMult, SelArg, SelRes] ]
+                       | fs <- [SelMatch, SelMult, SelArg, SelRes] ]
 
     ; stopWith ev "Decomposed TyConApp" }
 
@@ -1944,9 +3319,10 @@ canEqCanLHSHetero ev eq_rel swapped lhs1 ps_xi1 ki1 xi2 ps_xi2 ki2
                                mkKindCo (mkCoVarCo evar)
                     pred_ty  = mkNomEqPred ki2 ki1
                     kind_loc = mkKindEqLoc xi1 xi2 loc
-              ; kind_ev <- newGivenEv kind_loc (pred_ty, evCoercion kind_co)
-              ; emitWorkNC [CtGiven kind_ev]
-              ; finish emptyCoHoleSet (givenCtEvCoercion kind_ev) }
+              ; kind_var <- newBoundEvVarId pred_ty (evCoercion kind_co)
+              ; let kind_ev = mkGivenEqCt kind_loc kind_var
+              ; emitWorkNC [kind_ev]
+              ; finish emptyCoHoleSet (ctEvCoercion kind_ev) }
 
       CtWanted (WantedCt { ctev_loc = loc, ctev_rewriters = rws })
          -> do { (unifs, (kind_co, eqs)) <- reportFineGrainUnifications $
@@ -2057,30 +3433,35 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
     then finish_with_swapping
     else finish_without_swapping
 
-  | TyFamLHS _fun_tc1 fun_args1 <- lhs1
-  , TyFamLHS _fun_tc2 fun_args2 <- lhs2
-  -- Don't decompose, but maybe re-orient
-  = do { traceTcS "canEqCanLHS2 two type families" (ppr lhs1 $$ ppr lhs2)
-       ; tclvl <- getTcLevel
-       ; let tvs1 = tyCoVarsOfTypes fun_args1
-             tvs2 = tyCoVarsOfTypes fun_args2
+  | TyFamLHS fun_tc1 fun_args1 <- lhs1
+  , TyFamLHS fun_tc2 fun_args2 <- lhs2
+  -- Don't decompose Givens, but unify a touchable argument on a stuck
+  -- source-table Wanted when that makes both sides identical, or re-orient.
+  = do { mb_solved <- tryUnifyStuckSourceFamWanted ev eq_rel mco fun_tc1 fun_args1 fun_tc2 fun_args2
+       ; case mb_solved of
+           Just solved -> return solved
+           Nothing -> do
+             { traceTcS "canEqCanLHS2 two type families" (ppr lhs1 $$ ppr lhs2)
+             ; tclvl <- getTcLevel
+             ; let tvs1 = tyCoVarsOfTypes fun_args1
+                   tvs2 = tyCoVarsOfTypes fun_args2
 
-             -- See Note [Orienting TyFamLHS/TyFamLHS]
-             swap_for_size = typesSize fun_args2 > typesSize fun_args1
+                   -- See Note [Orienting TyFamLHS/TyFamLHS]
+                   swap_for_size = typesSize fun_args2 > typesSize fun_args1
 
-             -- See Note [Orienting TyFamLHS/TyFamLHS]
-             meta_tv_lhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs1
-             meta_tv_rhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs2
-             swap_for_rewriting = meta_tv_rhs && not meta_tv_lhs
-                                  -- See Note [Put touchable variables on the left]
-                                  -- This second check is just to avoid unfruitful swapping
+                   -- See Note [Orienting TyFamLHS/TyFamLHS]
+                   meta_tv_lhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs1
+                   meta_tv_rhs = anyVarSet (isTouchableMetaTyVar tclvl) tvs2
+                   swap_for_rewriting = meta_tv_rhs && not meta_tv_lhs
+                                        -- See Note [Put touchable variables on the left]
+                                        -- This second check is just to avoid unfruitful swapping
 
-         -- It's important that we don't flip-flop (#T24134)
-         -- So swap_for_rewriting "wins", and we only try swap_for_size
-         -- if swap_for_rewriting doesn't care either way
-       ; if swap_for_rewriting || (meta_tv_lhs == meta_tv_rhs && swap_for_size)
-         then finish_with_swapping
-         else finish_without_swapping }
+               -- It's important that we don't flip-flop (#T24134)
+               -- So swap_for_rewriting "wins", and we only try swap_for_size
+               -- if swap_for_rewriting doesn't care either way
+             ; if swap_for_rewriting || (meta_tv_lhs == meta_tv_rhs && swap_for_size)
+               then finish_with_swapping
+               else finish_without_swapping } }
   where
     sym_mco = mkSymMCo mco
     role    = eqRelRole eq_rel
@@ -2100,6 +3481,111 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
                  lhs2_redn = mkGReflLeftMRedn  role lhs2_ty mco
            ; new_ev <-rewriteEqEvidence ev swapped lhs1_redn lhs2_redn emptyCoHoleSet
            ; canEqCanLHSFinish new_ev eq_rel IsSwapped lhs2 (ps_xi1 `mkCastTyMCo` sym_mco) }
+
+{- Note [Unifying touchable arguments of stuck source-table Wanteds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose a source-table family T:rename is applied to an abstract rigid skolem
+argument m :: Term g a on both sides of a nominal Wanted equality:
+
+  [W] co :: T:rename g d a r0 m ~#N T:rename g d a (T:ext g d b r) m
+
+Neither side can reduce because m is a universally quantified skolem. Decomposing
+a Given equality of this form would be unsound because T:rename is not injective
+(for example T:rename f Zero = Zero = T:rename g Zero). For a Wanted equality,
+however, unifying the touchable unification variable r0 := T:ext g d b r makes
+both sides syntactically identical and solves co by Refl with no new axioms.
+
+Require:
+1. A Wanted nominal equality with MRefl kind coercion and empty rewriter set.
+2. The same source-table family TyCon (T:f) on both sides.
+3. At least one paired argument slot holding the same rigid skolem TyVar.
+4. Every non-equal paired argument slot has a bare touchable MetaTyVar on one
+   side whose candidate RHS has identical kind and passes simpleUnifyCheck /
+   checkTyEqRhs with a reflexive reduction.
+5. Substituting those bindings makes the two TyConApps equal via eqType.
+-}
+
+-- | Unify touchable unification variables in a stuck source-table Wanted
+-- equality when doing so makes both family applications identical (`Refl`).
+-- See Note [Unifying touchable arguments of stuck source-table Wanteds].
+tryUnifyStuckSourceFamWanted
+  :: CtEvidence -> EqRel -> MCoercion
+  -> TyCon -> [TcType] -> TyCon -> [TcType]
+  -> TcS (Maybe (StopOrContinue (Either IrredCt EqCt)))
+tryUnifyStuckSourceFamWanted ev eq_rel mco fun_tc1 args1 fun_tc2 args2
+  | CtWanted wev <- ev
+  , NomEq <- eq_rel
+  , MRefl <- mco
+  , wantedCtHasNoRewriters wev
+  , fun_tc1 == fun_tc2
+  , isJust (sourceTableTermOcc (nameOccName (tyConName fun_tc1)))
+  , args1 `equalLength` args2
+  , any same_rigid_skolem (zip args1 args2)
+  , Just raw_pairs <- collect_mismatches [] (zip args1 args2)
+  , not (null raw_pairs)
+  , let pair_tvs = mkVarSet (map fst raw_pairs)
+  , not (any (\(_, rhs) -> anyFreeVarsOfType (`elemVarSet` pair_tvs) rhs) raw_pairs)
+  = do { given_eq_lvl <- getInnermostGivenEqLevel
+       ; checked <- check_all given_eq_lvl emptyBag raw_pairs
+       ; case checked of
+           Just work ->
+             let tvs       = map fst raw_pairs
+                 rhss      = map snd raw_pairs
+                 subst_ty  = substTyWith tvs rhss
+                 final_lhs = mkTyConApp fun_tc1 (map subst_ty args1)
+                 final_rhs = mkTyConApp fun_tc2 (map subst_ty args2)
+             in if final_lhs `eqType` final_rhs
+                then do { emitWork work
+                        ; mapM_ (uncurry unifyTyVar) raw_pairs
+                        ; setEqIfWanted ev (mkReflCPH NomEq final_lhs)
+                        ; kickOutAfterUnification pair_tvs
+                        ; return (Just (Stop ev (text "Solved stuck source-family Wanted by unification"))) }
+                else return Nothing
+           Nothing -> return Nothing }
+  | otherwise
+  = return Nothing
+  where
+    same_rigid_skolem (a1, a2)
+      | Just v1 <- getTyVar_maybe a1
+      , Just v2 <- getTyVar_maybe a2
+      = v1 == v2 && isTcTyVar v1 && isSkolemTyVar v1
+      | otherwise = False
+
+    pick_pair (a1, a2)
+      | Just tv <- getTyVar_maybe a1
+      , mightPossiblyUnify ev eq_rel tv
+      , typeKind a1 `eqType` typeKind a2
+      = Just (tv, a2)
+      | Just tv <- getTyVar_maybe a2
+      , mightPossiblyUnify ev eq_rel tv
+      , typeKind a2 `eqType` typeKind a1
+      = Just (tv, a1)
+      | otherwise = Nothing
+
+    collect_mismatches acc [] = Just (reverse acc)
+    collect_mismatches acc ((a1, a2) : rest)
+      | a1 `tcEqType` a2 = collect_mismatches acc rest
+      | Just (tv, rhs) <- pick_pair (a1, a2) =
+          case lookup tv acc of
+            Nothing -> collect_mismatches ((tv, rhs) : acc) rest
+            Just prev_rhs
+              | prev_rhs `tcEqType` rhs -> collect_mismatches acc rest
+              | otherwise               -> Nothing
+      | otherwise = Nothing
+
+    check_all _ work [] = return (Just work)
+    check_all given_eq_lvl work ((tv, rhs) : rest) = do
+      id_depths <- getSolverIdDepthsFor (ctEvLoc ev)
+      case simpleUnifyCheckWithDepths id_depths UC_Solver given_eq_lvl tv rhs of
+        SUC_CannotUnify -> return Nothing
+        SUC_CanUnify    -> check_all given_eq_lvl work rest
+        SUC_NotSure     -> do
+          let flags = unifyingLHSMetaTyVarWithDepths_TEFTask id_depths ev tv
+          res <- wrapTcS (checkTyEqRhs flags rhs)
+          case res of
+            PuOK cts rhs_redn | isReflRedn rhs_redn ->
+              check_all given_eq_lvl (work `unionBags` cts) rest
+            _ -> return Nothing
 
 
 {- Note [Orienting TyVarLHS/TyFamLHS]
@@ -2216,7 +3702,8 @@ canEqCanLHSFinish_try_unification ev eq_rel swapped lhs rhs
   | TyVarLHS lhs_tv <- lhs
   , mightPossiblyUnify ev eq_rel lhs_tv
   = do  { given_eq_lvl <- getInnermostGivenEqLevel
-        ; case simpleUnifyCheck UC_Solver given_eq_lvl lhs_tv rhs of
+        ; id_depths <- getSolverIdDepthsFor (ctEvLoc ev)
+        ; case simpleUnifyCheckWithDepths id_depths UC_Solver given_eq_lvl lhs_tv rhs of
             SUC_CannotUnify -> finish_no_unify
             SUC_CanUnify    -> do_unification lhs_tv (mkReflRedn Nominal rhs)
             SUC_NotSure     ->
@@ -2226,7 +3713,7 @@ canEqCanLHSFinish_try_unification ev eq_rel swapped lhs rhs
               --
               -- Next, do a full `checkTyEqRhs` check to see if we can unify
               -- See Note [checkTyEqRhs] in GHC.Tc.Utils.Unify
-              do  { let flags = unifyingLHSMetaTyVar_TEFTask ev lhs_tv
+              do  { let flags = unifyingLHSMetaTyVarWithDepths_TEFTask id_depths ev lhs_tv
                   ; check_result <- wrapTcS (checkTyEqRhs flags rhs)
                   ; traceTcS "canEqCanLHSFinish_try_unification" $
                     vcat [ text "lhs" <+> ppr lhs
@@ -2372,7 +3859,32 @@ checkTypeEqNoUnification ev eq_rel lhs rhs =
         -- See Note [Don't cycle-break Wanteds when not unifying]
 
     given_flags :: TyEqFlags TcM (TcTyVar, TcType)
-    given_flags = wanted_flags { tef_fam_app = mkTEFA_Break ev eq_rel BreakGiven }
+    given_flags
+      -- See Note [Rigid retained indices] in GHC.Tc.Utils.Unify.
+      | TEFTyVar { tefTyVar_occursCheck = occ
+                 , tefTyVar_levelCheck = lvl
+                 , tefTyVar_concreteCheck = conc } <- wanted_flags
+      , hasNativeDependentExpr (Type rhs)
+      = TEFTyVar { tefTyVar_occursCheck = occ
+                 , tefTyVar_levelCheck = lvl
+                 , tefTyVar_concreteCheck = conc
+                 , tefTyVar_allowNativeGivenRhs = True
+                 , tefTyVar_isTyVarTv = False
+                 , tefTyVar_forAllOK = True
+                 , tef_fam_app = TEFA_Recurse }
+      | TEFTyFam { tefTyFam_occursCheck = occ
+                 , tefTyFam_tyCon = tc
+                 , tefTyFam_args = args } <- wanted_flags
+      , NomEq <- eq_rel
+      , hasNativeDependentExpr (Type rhs)
+      -- See Note [Family Givens with rigid runtime indices] in GHC.Tc.Utils.Unify.
+      = TEFTyFam { tefTyFam_occursCheck = occ
+                 , tefTyFam_tyCon = tc
+                 , tefTyFam_args = args
+                 , tefTyFam_allowRetainedIds = True
+                 , tef_fam_app = TEFA_Recurse }
+      | otherwise
+      = wanted_flags { tef_fam_app = mkTEFA_Break ev eq_rel BreakGiven }
         -- TEFA_Break used for: [G] a ~ Maybe (F a)
         --                   or [G] F a ~ Maybe (F a)
 
@@ -2404,6 +3916,21 @@ finishCanWithIrred reason ev
        ; continueWith $ Left $ IrredCt { ir_ev = ev, ir_reason = reason } }
 
 -----------------------
+-- | Recognize the shape of a saturated source-table application.
+-- Unification additionally verifies its owner. Reflexivity needs only
+-- definitional equality of the complete types.
+saturatedSourceHead :: TyCon -> [Type] -> Bool
+saturatedSourceHead tc args =
+  isTypeFamilyTyCon tc && lengthIs args (tyConArity tc)
+    && isJust (sourceTableTermOcc (nameOccName (tyConName tc)))
+
+-- | Recognize a complete application of a family with checked branches.
+saturatedProofFamily :: TyCon -> [Type] -> Bool
+saturatedProofFamily tc args
+  | Just ax <- closedFamilyTyConCoAxiom_maybe tc
+  = not (null (co_ax_source_proof_rules ax)) && lengthIs args (tyConArity tc)
+  | otherwise = False
+
 -- | Solve a reflexive equality constraint
 canEqReflexive :: CtEvidence    -- ty ~ ty
                -> EqRel
@@ -2412,6 +3939,257 @@ canEqReflexive :: CtEvidence    -- ty ~ ty
 canEqReflexive ev eq_rel ty
   = do { setEqIfWanted ev (mkReflCPH eq_rel ty)
        ; stopWith ev "Solved by reflexivity" }
+
+{- Note [Nominal Givens for retained family arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A match on Refl can give an equality between two rigid runtime indices.
+They cannot be canonical substitution keys. The equality stays inert.
+Use its evidence to prove a Wanted involving a closed family. If both
+sides have the same head, prove every argument equal. This is forward
+congruence, even for a non-injective family.
+
+A Given can also fix an argument to a promoted constructor. Lift that
+Given through the family, then reduce the family axioms. Exclude targets
+that mention the refined runtime index itself, and track refined indices
+across rounds so specialization always terminates. Compare the reduced
+endpoints up to generative constructors, checked synonyms and scoped
+nominal index Givens. Keep both private source-table applications and
+checked branch or synonym dependencies only when this proof solves the
+Wanted. See Note [Committing checked source family branches] in
+GHC.Tc.Solver.Rewrite.
+
+This step solves nominal Wanteds only. No new equality enters the inerts.
+Do not use this step inside a retained function equality comparison.
+See Note [Native runtime binder scopes] in GHC.Tc.Solver.Monad.
+-}
+
+-- | Try a scoped nominal proof for an ordinary closed-family or retained-index Wanted.
+tryRetainedFamilyEquality
+  :: CtEvidence -> Type -> Type
+  -> TcS (Maybe (Coercion, [(TyCon, [TcType])], [(Name, [SourceProofRule])]))
+tryRetainedFamilyEquality ev lhs rhs
+  | isWanted ev
+  , isJust left || isJust right || hasOpaqueIndex lhs || hasOpaqueIndex rhs
+  = do { binders <- getNativeBinderScope
+       ; mode <- getTcSMode
+       ; if not (isEmptyVarSet binders) || tcsmGivenOnly mode
+         then return Nothing
+         else do { irreds <- inert_irreds <$> getInertCans
+                 ; case sameFamily irreds of
+                     Just result -> return (Just result)
+                     Nothing -> do
+                       { (Reduction co1 lhs', tables1, uses1) <- specialize emptyVarSet irreds lhs left
+                       ; (Reduction co2 rhs', tables2, uses2) <- specialize emptyVarSet irreds rhs right
+                       ; return $ do
+                           (mid_co, mid_uses) <- endpointProof irreds lhs' rhs'
+                           guard (not (isReflCo co1 && isReflCo co2 && isReflCo mid_co))
+                           let co = co1 `mkTransCo` mid_co `mkTransCo` mkSymCo co2
+                           pure (co, tables1 ++ tables2, uses1 ++ uses2 ++ mid_uses) } } }
+  | otherwise = return Nothing
+  where
+    left = family lhs
+    right = family rhs
+
+    family (TyConApp tc args)
+      | isJust (closedFamilyTyConCoAxiom_maybe tc)
+      , not (saturatedSourceHead tc args)
+      , lengthIs args (tyConArity tc)
+        || (isJust (closedFamilyScope_maybe tc) && isUnsaturatedUserFamily tc args)
+      , any isOpaqueTermIndex args
+      = Just (tc, args)
+    family _ = Nothing
+
+    hasOpaqueIndex (TermVarTy v) = isNativeOpaqueValueId v
+    hasOpaqueIndex (CastTy ty _) = hasOpaqueIndex ty
+    hasOpaqueIndex (TyConApp tc args)
+      | isGenerativeTyCon tc Nominal = any hasOpaqueIndex args
+    hasOpaqueIndex _ = False
+
+    sameFamily irreds = do
+      (tc, args) <- left
+      (other, targets) <- right
+      guard (tc == other)
+      results <- zipWithM (endpointProof irreds) args targets
+      let (proofs, uses) = unzip results
+      pure (mkTyConAppCo Nominal tc proofs, [], concat uses)
+
+    argument irreds a b
+      | not (typeKind a `tcEqType` typeKind b) = Nothing
+      | a `tcEqType` b = Just (mkNomReflCo a)
+      | isOpaqueTermIndex a || isOpaqueTermIndex b = findRetainedIndexProof irreds a b
+      | otherwise = Nothing
+
+    endpointProof irreds a b
+      | not (typeKind a `tcEqType` typeKind b) = Nothing
+      | a `tcEqType` b = Just (mkNomReflCo a, expandedProofSynonyms a b)
+      | Just a' <- coreView a = do
+          (co, uses) <- endpointProof irreds a' b
+          pure (co, synonymStep a ++ uses)
+      | Just b' <- coreView b = do
+          (co, uses) <- endpointProof irreds a b'
+          pure (co, synonymStep b ++ uses)
+      | isOpaqueTermIndex a || isOpaqueTermIndex b = do
+          co <- findRetainedIndexProof irreds a b
+          pure (co, [])
+      | Just (tc1, as1) <- splitTyConAppNoView_maybe a
+      , Just (tc2, as2) <- splitTyConAppNoView_maybe b
+      , tc1 == tc2, isGenerativeTyCon tc1 Nominal, equalLength as1 as2 = do
+          results <- zipWithM (endpointProof irreds) as1 as2
+          let (cos, uses) = unzip results
+          pure (mkTyConAppCo Nominal tc1 cos, concat uses)
+      | Just co <- proveScopedSigmaClosure a b <|> proveScopedLambdaClosure a b
+      = Just (co, [])
+      | otherwise = Nothing
+
+    synonymStep (TyConApp tc _)
+      | isReducedProofSynonym tc
+      , deps@(_ : _) <- synTyConSourceProofRules tc = [(tyConName tc, deps)]
+    synonymStep _ = []
+
+    specialize seen irreds _ (Just (tc, args))
+      | let (proofs, targets, refined) = unzip3 (map (refine seen irreds) args)
+            seen' = unionVarSets (seen : refined)
+      , any (not . isReflCo) proofs
+      , wellKinded (tyConKind tc) targets
+      = if lengthIs targets (tyConArity tc)
+          then do
+            { (Reduction co_red ty', tables, uses) <-
+                rewriteFamilyAxiomsWithSourceProofs (ctEvLoc ev) (mkTyConApp tc targets)
+            ; let step_co = mkTyConAppCo Nominal tc proofs `mkTransCo` co_red
+            ; (rest_redn, tables', uses') <- specialize seen' irreds ty' (family ty')
+            ; pure (step_co `mkTransRedn` rest_redn, tables ++ tables', uses ++ uses') }
+          else do
+            { let ty'     = mkTyConApp tc targets
+                  step_co = mkTyConAppCo Nominal tc proofs
+            ; (rest_redn, tables', uses') <- specialize seen' irreds ty' (family ty')
+            ; pure (step_co `mkTransRedn` rest_redn, tables', uses') }
+    specialize _ _ ty _ = pure (mkReflRedn Nominal ty, [], [])
+
+    refine seen irreds a@(TermVarTy root)
+      | isNativeOpaqueValueId root
+      , not (root `elemVarSet` seen)
+      , Just (proof, target) <- foldIrreds (\irred rest -> candidate irreds root a irred <|> rest) irreds Nothing
+      = (proof, target, unitVarSet root)
+    refine _ _ a = (mkNomReflCo a, a, emptyVarSet)
+
+    candidate irreds root a irred
+      | given@CtGiven{} <- irredCtEvidence irred
+      , EqPred NomEq l r <- classifyCtEvidence given
+      = known l <|> known r
+      | otherwise = Nothing
+      where
+        known (CastTy ty _) = known ty
+        known ty@(TyConApp tc _)
+          | isPromotedDataCon tc
+          , safeRetainedTarget root ty
+          , Just proof <- argument irreds a ty
+          = Just (proof, ty)
+        known _ = Nothing
+
+    safeRetainedTarget root = go
+      where
+        go (TyVarTy tv) = go (varType tv)
+        go (TermVarTy v) = v /= root && isNativeOpaqueValueId v && go (varType v)
+        go (LitTy _) = True
+        go (CoercionTy _) = True
+        go (CastTy ty _) = go ty
+        go (AppTy f a) = go f && go a
+        go (TyConApp _ as) = all go as
+        go (FunTy _ ma m a r) = go ma && go m && go a && go r
+        go (ForAllTy ma (Bndr tv _) b) = go ma && go (varType tv) && go b
+        go _ = False
+
+    wellKinded _ [] = True
+    wellKinded kind (a:as)
+      | Just (_, binder, _) <- splitPiTy_maybe kind
+      , typeKind a `tcEqType` piTyBinderType binder
+      = wellKinded (piResultTy kind a) as
+      | otherwise = False
+
+-- | Prefer one selected definition when its RHS already proves the equality
+-- or exposes a matching generative constructor head without unfolding nested
+-- definitions.
+-- See Note [Prefer a direct local definition].
+trySourceLetEquality
+  :: CtEvidence -> EqRel -> Type -> Type
+  -> TcS (Maybe (Either Coercion
+                        (TyCon, Reduction, Reduction, (Type, [TcType]), (Type, [TcType]), CoHoleSet)))
+trySourceLetEquality ev eq_rel lhs rhs
+  | isWanted ev = do
+      definitions <- getSourceLetScope
+      if isEmptyVarEnv definitions
+        then return Nothing
+        else do
+          native_binders <- getNativeBinderScope
+          if not (isEmptyVarSet native_binders)
+            then return Nothing
+            else do
+              let role = eqRelRole eq_rel
+                  candidate ty = case coreFullView ty of
+                    TermVarTy value
+                      | Just proof <- lookupVarEnv definitions value
+                      , coVarRole proof == Nominal
+                      , coVarLType proof `tcEqType` ty -> Just proof
+                    _ -> Nothing
+                  at_role co = case eq_rel of
+                    NomEq  -> co
+                    ReprEq -> mkSubCo co
+                  holes_of cos = foldr (flip addRewriter) emptyCoHoleSet
+                                   (univCoDepsHoles (mkUnivCoDeps cos))
+                  attempt _ Nothing _ = return Nothing
+                  attempt is_fwd (Just proof) other
+                    | coVarRType proof `tcEqType` other
+                    = let co = at_role (if is_fwd then mkCoVarCo proof else mkSymCo (mkCoVarCo proof))
+                      in return (Just (Left co))
+                    | otherwise = do
+                        Reduction rhs_co rhs' <- rewriteFamilyAxioms (ctEvLoc ev) (coVarRType proof)
+                        Reduction other_co other' <- rewriteFamilyAxioms (ctEvLoc ev) other
+                        if rhs' `tcEqType` other'
+                          then do
+                            let nom_co = mkCoVarCo proof `mkTransCo` rhs_co `mkTransCo` mkSymCo other_co
+                                co     = at_role (if is_fwd then nom_co else mkSymCo nom_co)
+                            return (Just (Left co))
+                          else case (coreFullView rhs', coreFullView other') of
+                            (TyConApp tc1 args1, TyConApp tc2 args2)
+                              | tc1 == tc2
+                              , isGenerativeTyCon tc1 role
+                              , equalLength args1 args2 -> do
+                                  let def_co   = mkCoVarCo proof `mkTransCo` rhs_co
+                                      def_redn = downgradeRedn role Nominal (mkReduction def_co rhs')
+                                      oth_redn = downgradeRedn role Nominal (mkReduction other_co other')
+                                      hs       = holes_of [def_co, other_co]
+                                  return $ Just $ Right $
+                                    if is_fwd
+                                      then (tc1, def_redn, oth_redn, (rhs', args1), (other', args2), hs)
+                                      else (tc1, oth_redn, def_redn, (other', args2), (rhs', args1), hs)
+                            _ -> return Nothing
+              forward <- attempt True (candidate lhs) rhs
+              case forward of
+                Just res -> return (Just res)
+                Nothing  -> attempt False (candidate rhs) lhs
+  | otherwise = return Nothing
+
+{- Note [Prefer a direct local definition]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose total = S area, and area uses a selected multiplication method.
+The Wanted total ~ 1 + area needs only the proof total ~ S area and the
+addition axiom. Fully rewriting both sides would also unfold area. That
+would record an unnecessary method use and reject an otherwise harmless
+RULE on multiplication.
+
+Before full rewriting, try the selected definition at either endpoint.
+Compare its RHS with the opposite endpoint, using only global family
+axioms. rewriteFamilyAxioms clears the local definition map and excludes
+ordinary inert evidence, plugins and caches. Keep its bounded reduction
+and source-family certificate checks. If the endpoints agree, compose
+the actual CoVar and family coercions. setEqIfWanted records only the
+CoVars that survive in this proof. Do not mark an alias merely because
+the solver considered it.
+
+This preference solves Wanteds only and does not run inside a retained
+binder comparison. It neither changes ordinary Givens nor replaces full
+rewriting. A mismatch retains the existing nested-definition behavior.
+-}
 
 {- Note [Equalities where unification fails]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2541,6 +4319,42 @@ Wrinkles:
      And this is an improvement regardless: because tyvars can, generally,
      unify with casted types, there's no reason to go through the work of
      stripping off the cast when the cast appears opposite a tyvar.
+(EIK4) When a Given has the form (a |> co) ~r# rhs and both endpoints have
+     the same kind, canEqCast can move the cast to rhs at Nominal or
+     Representational role. Do this when a is a canonical left-hand side.
+     Removing the cast alone would bind heterogeneous evidence before
+     canEqCanLHSHetero casts rhs back. Moving the cast keeps the new Given
+     homogeneous. This also applies when a boxed equality supplied the
+     original Given, or symmetrically when rhs carries a cast over a
+     canonical left-hand side. Emit the kind Given from the cast, as
+     canEqCanLHSHetero would do after stripping it.
+
+     The shallow zonk in solveEquality can follow a filled variable in
+     rhs while co still mentions that variable's old kind. If their
+     kinds differ, zonk the kinds before comparing them again. Use the
+     original cast as evidence. This keeps the intermediate coercion an
+     expression within the homogeneous proof (T11711).
+
+(EIK5) A Given can have the form (lhs |> h) ~r# rhs where lhs is not a
+     canonical left-hand side and h relates distinct kinds. Defer EQNC3
+     until EQNC5 rewrites both endpoints homogeneously and collapses
+     nested casts through mkCastRedn1. Then compose the remaining casts
+     with the Given into an uncast coercion expression without binding a
+     mixed-kind CoVar. If the rewritten inner kinds match, bind one
+     homogeneous Given. If rewriting exposes a canonical left-hand side,
+     bind its kind proof and transport the opposite endpoint. Otherwise
+     decompose injective TyConApps, compatible FunTys, and nominal
+     matchable AppTys through newSelectorGiven and emitSelectorGivens,
+     or emit the kind Given and keep a single-cast homogeneous Given
+     irreducible.
+
+     An equality with same-kind endpoints can also have a selector
+     with mixed-kind endpoints. A constructor can have a kind parameter,
+     and two function argument types can have different runtime
+     representations. In these cases transport the selected argument
+     using a nominal kind proof and keep the role of the selector.
+     The same rule applies to both nominal LRCo projections of a
+     matchable application. Continue with the head equality first.
 
 Historical note:
 
@@ -2967,7 +4781,7 @@ rewriteEqEvidence old_ev swapped (Reduction lhs_co nlhs) (Reduction rhs_co nrhs)
 
   | CtWanted (WantedCt { ctev_dest = dest, ctev_rewriters = rewriters }) <- old_ev
   = do { let rewriters' = rewriters S.<> new_holes
-       ; (new_ev, hole) <- newWantedEq loc rewriters' (ctEvRewriteRole old_ev) nlhs nrhs
+       ; (new_ev, hole) <- newWantedEqEvidence loc rewriters' (ctEvRewriteRole old_ev) nlhs nrhs
        ; let co = maybeSymCo swapped $
                   lhs_co `mkTransCo` mkHoleCo hole `mkTransCo` mkSymCo rhs_co
        ; setWantedEq dest (CPH { cph_co    = co
@@ -2978,7 +4792,7 @@ rewriteEqEvidence old_ev swapped (Reduction lhs_co nlhs) (Reduction rhs_co nrhs)
                                                , ppr nrhs
                                                , ppr co
                                                , ppr new_holes ])
-       ; return $ CtWanted new_ev }
+       ; return new_ev }
 
   where
     loc      = ctEvLoc old_ev
@@ -3218,8 +5032,10 @@ Wrinkles:
 
 {- Note [Looking up primitive equalities in quantified constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For equalities (a ~# b) look up (a ~ b), and then do a superclass
-selection. This avoids having to support quantified constraints whose
+For equalities (a ~# b) look up the boxed equality and extract its
+coercion evidence. The (~~) case composes the kind transport and
+index coercion. See Note [Projecting HEq# evidence] in GHC.Tc.Solver.Monad.
+This avoids having to support quantified constraints whose
 kind is not Constraint, such as (forall a. F a ~# b)
 
 See
@@ -3231,7 +5047,7 @@ See
 --------------------
 tryQCsIrredEqCt :: IrredCt -> SolverStage ()
 tryQCsIrredEqCt (IrredCt { ir_ev = ev })
-  | EqPred eq_rel t1 t2 <- classifyPredType (ctEvPred ev)
+  | EqPred eq_rel t1 t2 <- classifyCtEvidence ev
   = lookup_eq_in_qcis ev eq_rel t1 t2
 
   | otherwise  -- All the calls come from in this module, where we deal only with
@@ -3287,9 +5103,8 @@ lookup_eq_in_qcis ev@(CtWanted (WantedCt { ctev_dest = dest, ctev_loc = loc })) 
                 OneInst {}
                   -> do { dict_ev <- newWantedEvVarNC loc emptyCoHoleSet cls_pred
                         ; chooseInstance dict_ev res
-                        ; co_var <- newEvVar (unSwap swap (mkEqPred eq_rel) lhs rhs)
-                        ; setEvBind (mkWantedEvBind co_var EvCanonical (mk_sc_sel cls tys dict_ev))
-                        ; fillCoercionHole hole (CPH { cph_co    = maybeSymCo swap (mkCoVarCo co_var)
+                        ; co <- unbox swap cls tys (wantedCtEvEvId dict_ev)
+                        ; fillCoercionHole hole (CPH { cph_co    = maybeSymCo swap co
                                                      , cph_holes = emptyCoHoleSet })
                         ; stopWith ev "lookup_eq_in_qcis" }
                 _ -> continueWith () }
@@ -3297,11 +5112,20 @@ lookup_eq_in_qcis ev@(CtWanted (WantedCt { ctev_dest = dest, ctev_loc = loc })) 
        | otherwise
        = nopStage ()
 
-    mk_sc_sel cls tys dict_ev
+    unbox swap cls tys dict
+      | cls == heqClass
+      = do { (kind_var, index_var) <- newHEqEvVars bind_wanted tys dict
+           ; let t1 = unSwap swap const lhs rhs
+                 transport = mkGReflRightCo Nominal t1 (mkCoVarCo kind_var)
+           ; return (transport `mkTransCo` mkCoVarCo index_var) }
       | [sc_id] <- classSCSelIds cls  -- Just one superclass for this
-      = EvExpr (Var sc_id `mkTyApps` tys `App` Var (wantedCtEvEvId dict_ev))
+      = do { co_var <- newEvVar (unSwap swap (mkEqPred eq_rel) lhs rhs)
+           ; setEvBind (bind_wanted co_var (EvExpr (Var sc_id `mkTyApps` tys `App` Var dict)))
+           ; return (mkCoVarCo co_var) }
       | otherwise
-      = pprPanic "looup_eq_in_qcis" (ppr dict_ev)
+      = pprPanic "lookup_eq_in_qcis: unbox" (ppr dict)
+
+    bind_wanted var = mkWantedEvBind var EvCanonical
 
 
 {- Note [Instances in no-evidence implications]

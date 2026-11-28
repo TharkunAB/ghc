@@ -1,0 +1,2 @@
+(Right 42,Left "missing flag",('a',True),('b',GT,True))
+(Right 42,Right 42,Left 'x',Right 43,Left "checked",Right 42)

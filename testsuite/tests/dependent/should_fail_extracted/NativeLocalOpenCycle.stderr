@@ -1,0 +1,4 @@
+NativeLocalOpenCycle.hs:5:17: error: [GHC-70566]
+    Cannot reduce the open call to ‘keep’ in a type.
+      This call forms a type dependency cycle through keep and Result.
+

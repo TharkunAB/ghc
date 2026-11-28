@@ -7,7 +7,7 @@
 -}
 
 module GHC.Tc.Gen.Bind
-   ( tcLocalBinds
+   ( tcLocalBinds, tcNonRecLets, tcNonRecLetAtType
    , tcTopBinds
    , tcValBinds
    , tcHsBootSigs
@@ -42,6 +42,8 @@ import GHC.Tc.Solver
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 import GHC.Core.Predicate
+import GHC.Core ( Expr(Type) )
+import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.UsageEnv ( bottomUE )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Pat
@@ -52,14 +54,15 @@ import GHC.Tc.Validity (checkValidType, checkEscapingKind)
 import GHC.Tc.Zonk.TcType
 import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Multiplicity
-import GHC.Core.FamInstEnv( normaliseType )
+import GHC.Core.FamInstEnv( normaliseTypeWithFuel )
 import GHC.Core.Class   ( Class )
-import GHC.Core.Coercion( mkSymCo )
-import GHC.Core.Type (mkStrLitTy, mkCastTy)
+import GHC.Core.Coercion( hasCoercionHole, mkSymCo )
+import GHC.Core.Type (anyFreeVarsOfType, mkStrLitTy, mkCastTy, coreFullView, isFamFreeTy)
+import GHC.Core.TyCo.Rep (Type(ExistsTy))
 import GHC.Core.TyCo.Ppr( pprTyVars )
 import GHC.Core.TyCo.Tidy( tidyOpenTypeX )
 
-import GHC.Builtin.WiredIn.Types ( mkConstraintTupleTy )
+import GHC.Builtin.WiredIn.Types ( mkConstraintTupleTy, unmatchableDataConTy )
 import GHC.Builtin.WiredIn.Prim
 import GHC.Unit.Module
 
@@ -87,6 +90,7 @@ import GHC.Data.Maybe
 
 import Control.Monad
 import Data.Foldable (find, traverse_)
+import Data.List (partition)
 
 {-
 ************************************************************************
@@ -209,7 +213,7 @@ tcHsBootSigs binds sigs
     tc_boot_sig (TypeSig _ _ lnames hs_ty) = mapM f lnames
       where
         f (L _ name)
-          = do { sigma_ty <- tcHsSigWcType (FunSigCtxt name NoRRC) hs_ty
+          = do { sigma_ty <- tcHsSigWcType False (FunSigCtxt name NoRRC) hs_ty
                ; return (mkVanillaGlobal name sigma_ty) }
         -- Notice that we make GlobalIds, not LocalIds
     tc_boot_sig s = pprPanic "tcHsBootSigs/tc_boot_sig" (ppr s)
@@ -224,8 +228,10 @@ tcLocalBinds (EmptyLocalBinds x) thing_inside
         ; return (EmptyLocalBinds x, thing) }
 
 tcLocalBinds (HsValBinds x (XValBindsLR (HsVBG grps sigs))) thing_inside
-  = do  { (grps', thing) <- tcValBinds NotTopLevel grps sigs thing_inside
-        ; return (HsValBinds x (XValBindsLR (HsVBG grps' sigs)), thing) }
+  = do  { let (syn_sigs, val_sigs) = partition isLocalTySynLSig sigs
+        ; (grps', thing) <- tcWithLocalTySyns syn_sigs $
+                            tcValBinds NotTopLevel grps val_sigs thing_inside
+        ; return (HsValBinds x (XValBindsLR (HsVBG grps' val_sigs)), thing) }
 tcLocalBinds (HsValBinds _ (ValBinds {})) _ = panic "tcLocalBinds"
 
 tcLocalBinds (HsIPBinds x (IPBinds _ ip_binds)) thing_inside
@@ -348,22 +354,44 @@ tc_nonrec_group  top_lvl sig_fn prag_fn [lbind] thing_inside
        ; return ((NonRecursive, aux_binds), thing) }
 
   | otherwise
-  =     -- A single non-recursive binding
-        -- We want to keep non-recursive things non-recursive
-        -- so that we desugar unlifted bindings correctly
-    do { type_env <- getLclTypeEnv
-       ; let closed = isClosedBndrGroup type_env [lbind]
-       ; (bind', ids) <- tcPolyBinds top_lvl sig_fn prag_fn
-                                      NonRecursive NonRecursive
-                                      closed
-                                      [lbind]
-
-       ; thing <- tcExtendLetEnv top_lvl sig_fn closed ids thing_inside
-
-       ; return ( (NonRecursive, bind'), thing ) }
+  = tcNonRecValBind top_lvl sig_fn prag_fn lbind $ \binds -> do
+      result <- thing_inside
+      return ((NonRecursive, binds), result)
 
 tc_nonrec_group _ _ _ binds _   -- Non-rec groups should always be a singleton
   = pprPanic "tc_nonrec_group" (ppr binds)
+
+-- | Check acyclic local value bindings with the ordinary signature environment.
+-- The continuation for each binding runs inside that binding's usage check.
+-- See Note [Signed and grouped local indices] in GHC.Tc.Gen.Expr.
+tcNonRecLets :: [LHsBind GhcRn] -> [LSig GhcRn]
+             -> (LHsBinds GhcTc -> TcM a -> TcM a) -> TcM a -> TcM a
+tcNonRecLets binds sigs inside body = do
+    (poly_ids, sig_fn) <- tcTySigs sigs
+    let check binding rest = tcNonRecValBind NotTopLevel sig_fn emptyNameEnv binding
+                                 (\checked -> inside checked rest)
+    tcExtendSigIds NotTopLevel poly_ids (foldr check body binds)
+
+-- | Check an acyclic local binding at an already checked type.
+tcNonRecLetAtType :: Name -> TcType -> LHsBind GhcRn -> TcM a
+                  -> TcM (LHsBinds GhcTc, a)
+tcNonRecLetAtType name ty binding body =
+  let ident = mkLocalId name ManyTy ty
+      sig = TcIdSig (TcCompleteSig (completeSigFromId (FunSigCtxt name NoRRC) ident))
+      sig_fn n | n == name = Just sig
+               | otherwise = Nothing
+  in tcExtendSigIds NotTopLevel [ident] $
+       tcNonRecValBind NotTopLevel sig_fn emptyNameEnv binding $ \checked ->
+         (checked,) <$> body
+
+tcNonRecValBind :: TopLevelFlag -> TcSigFun -> TcPragEnv -> LHsBind GhcRn
+                -> (LHsBinds GhcTc -> TcM a) -> TcM a
+tcNonRecValBind top_lvl sig_fn prag_fn lbind inside
+  = do { type_env <- getLclTypeEnv
+       ; let closed = isClosedBndrGroup type_env [lbind]
+       ; (binds, ids) <- tcPolyBinds top_lvl sig_fn prag_fn
+                                    NonRecursive NonRecursive closed [lbind]
+       ; tcExtendLetEnv top_lvl sig_fn closed ids (inside binds) }
 
 ---------------------
 tc_rec_group :: forall thing.
@@ -478,7 +506,7 @@ tcPolyBinds top_lvl sig_fn prag_fn rec_group rec_tc closed bind_list
     ; let plan = decideGeneralisationPlan dflags top_lvl closed sig_fn bind_list
     ; traceTc "Generalisation plan" (ppr plan)
     ; result@(_, scaled_poly_ids) <- case plan of
-         NoGen              -> tcPolyNoGen rec_tc prag_fn sig_fn bind_list
+         NoGen              -> tcPolyNoGen top_lvl rec_tc prag_fn sig_fn bind_list
          InferGen           -> tcPolyInfer top_lvl rec_tc prag_fn sig_fn bind_list
          CheckGen lbind sig -> tcPolyCheck prag_fn sig lbind
 
@@ -524,7 +552,7 @@ forall_a_a :: TcType
 -- kappa is a unification variable. But I don't think we need that
 -- complication here. I'm going to just use (forall (a::*). a).
 -- See #15276
-forall_a_a = mkSpecForAllTys [alphaTyVar] alphaTy
+forall_a_a = mkSpecForAllTys [(unmatchableDataConTy,alphaTyVar)] alphaTy
 
 {- *********************************************************************
 *                                                                      *
@@ -533,19 +561,31 @@ forall_a_a = mkSpecForAllTys [alphaTyVar] alphaTy
 ********************************************************************* -}
 
 tcPolyNoGen     -- No generalisation whatsoever
-  :: RecFlag       -- Whether it's recursive after breaking
+  :: TopLevelFlag
+  -> RecFlag       -- Whether it's recursive after breaking
                    -- dependencies based on type signatures
   -> TcPragEnv -> TcSigFun
   -> [LHsBind GhcRn]
   -> TcM (LHsBinds GhcTc, [Scaled TcId])
 
-tcPolyNoGen rec_tc prag_fn tc_sig_fn bind_list
+tcPolyNoGen top_lvl rec_tc prag_fn tc_sig_fn bind_list
   = do { (binds', mono_infos) <- tcMonoBinds rec_tc tc_sig_fn
                                              (LetGblBndr prag_fn)
                                              bind_list
+       ; checkInferredRetainedTypes local_value mono_infos
        ; mono_ids' <- mapM tc_mono_info mono_infos
        ; return (binds', mono_ids') }
   where
+    -- See Note [Scoped inferred native values].
+    local_value ty
+      | NotTopLevel <- top_lvl, NonRecursive <- rec_tc, [L _ bind] <- bind_list
+      = case bind of
+          FunBind { fun_matches = MG { mg_alts = L _
+            [L _ (Match { m_pats = L _ [] })] } } -> True
+          PatBind{} | ExistsTy ImplicitExists _ _ <- coreFullView ty -> True
+          _ -> False
+      | otherwise = False
+
     tc_mono_info (MBI { mbi_poly_name = name, mbi_mono_id = mono_id, mbi_mono_mult = mult })
       = do { _specs <- tcSpecPrags mono_id (lookupPragEnv prag_fn name)
            ; return $ Scaled mult mono_id }
@@ -725,6 +765,7 @@ tcPolyInfer top_lvl rec_tc prag_fn tc_sig_fn bind_list
              <- pushLevelAndCaptureConstraints  $
                 tcMonoBinds rec_tc tc_sig_fn LetLclBndr bind_list
 
+       ; checkInferredRetainedTypes (const False) mono_infos
        ; apply_mr <- checkMonomorphismRestriction mono_infos bind_list
 
        -- AbsBinds which are PatBinds can't be linear.
@@ -913,7 +954,7 @@ mkExport prag_fn residual insoluble qtvs theta
         -- NB: we have already done checkValidType, including an ambiguity check,
         --     on the type; either when we checked the sig or in mkInferredPolyId
         ; let poly_ty     = idType poly_id
-              sel_poly_ty = mkInfSigmaTy qtvs theta mono_ty
+              sel_poly_ty = mkInfSigmaTy [(unmatchableDataConTy,tv) | tv <- qtvs] theta mono_ty
                 -- This type is just going into tcSubType,
                 -- so Inferred vs. Specified doesn't matter
 
@@ -957,7 +998,7 @@ mkInferredPolyId residual insoluble qtvs inferred_theta poly_name mb_sig_inst mo
                    -- a duplicate ambiguity error.  There is a similar
                    -- checkNoErrs for complete type signatures too.
     do { fam_envs <- tcGetFamInstEnvs
-       ; let mono_ty' = reductionReducedType $ normaliseType fam_envs Nominal mono_ty
+       ; let mono_ty' = reductionReducedType $ normaliseTypeWithFuel 2000 fam_envs Nominal mono_ty
                -- Unification may not have normalised the type,
                -- so do it here to make it as uncomplicated as possible.
                -- Example: f :: [F Int] -> Bool
@@ -994,14 +1035,14 @@ chooseInferredQuantifiers :: WantedConstraints  -- residual constraints
                           -> TcTyVarSet    -- tvs free in tau type
                           -> [TcTyVar]     -- inferred quantified tvs
                           -> Maybe TcIdSigInst
-                          -> TcM ([InvisTVBinder], TcThetaType)
+                          -> TcM ([(Matchability, InvisTVBinder)], TcThetaType)
 chooseInferredQuantifiers _residual inferred_theta tau_tvs qtvs Nothing
   = -- No type signature (partial or complete) for this binder,
     do { let free_tvs = closeOverKinds (growThetaTyVars inferred_theta tau_tvs)
                         -- See Note [growThetaTyVars vs closeWrtFunDeps] in GHC.Tc.Solver
                         -- Include kind variables!  #7916
              my_theta = pickCapturedPreds free_tvs inferred_theta
-             binders  = [ mkTyVarBinder InferredSpec tv
+             binders  = [ (unmatchableDataConTy, mkTyVarBinder InferredSpec tv)
                         | tv <- qtvs
                         , tv `elemVarSet` free_tvs ]
        ; return (binders, my_theta) }
@@ -1012,12 +1053,15 @@ chooseInferredQuantifiers residual inferred_theta tau_tvs qtvs
   | TcPartialSig (PSig { psig_name = fn_name, psig_hs_ty = hs_ty }) <- sig
   = -- Choose quantifiers for a partial type signature
     do { let (psig_qtv_nms, psig_qtv_bndrs) = unzip annotated_tvs
-       ; psig_qtv_bndrs <- liftZonkM $ mapM zonkInvisTVBinder psig_qtv_bndrs
-       ; let psig_qtvs    = map binderVar psig_qtv_bndrs
+       ; psig_qtv_bndrs <- liftZonkM $ forM psig_qtv_bndrs $ \(ma,bndr) ->
+           do { ma' <- zonkTcType ma
+              ; bndr' <- zonkInvisTVBinder bndr
+              ; return (ma', bndr') }
+       ; let psig_qtvs    = map (binderVar . snd) psig_qtv_bndrs
              psig_qtv_set = mkVarSet psig_qtvs
              psig_qtv_prs = psig_qtv_nms `zip` psig_qtvs
-             psig_bndr_map :: TyVarEnv InvisTVBinder
-             psig_bndr_map = mkVarEnv [ (binderVar tvb, tvb) | tvb <- psig_qtv_bndrs ]
+             psig_bndr_map :: TyVarEnv (Matchability, InvisTVBinder)
+             psig_bndr_map = mkVarEnv [ (binderVar tvb, (ma,tvb)) | (ma,tvb) <- psig_qtv_bndrs ]
 
             -- Check whether the quantified variables of the
             -- partial signature have been unified together
@@ -1036,9 +1080,13 @@ chooseInferredQuantifiers residual inferred_theta tau_tvs qtvs
        ; (free_tvs, my_theta) <- choose_psig_context psig_qtv_set annotated_theta wcx
                                  -- NB: free_tvs includes tau_tvs
 
-       ; let (_,final_qtvs) = foldr (choose_qtv psig_bndr_map) (free_tvs, []) qtvs
-                              -- Pulling from qtvs maintains original order
-                              -- NB: qtvs is already in dependency order
+       ; let quant_fvs = free_tvs `unionVarSet` tyCoVarsOfTypes (map fst psig_qtv_bndrs)
+             (_, chosen_qtvs) = foldr (choose_qtv psig_bndr_map) (quant_fvs, []) qtvs
+             final_qtvs = scopedSortWith (binderVar . snd)
+                            (\(ma,bndr) -> tyCoVarsOfTypes [ma, varType (binderVar bndr)])
+                            chosen_qtvs
+               -- Keep metadata dependencies even when qtvs only records
+               -- dependency order from variable kinds.
 
        ; traceTc "chooseInferredQuantifiers" $
          vcat [ text "qtvs" <+> pprTyVars qtvs
@@ -1048,21 +1096,24 @@ chooseInferredQuantifiers residual inferred_theta tau_tvs qtvs
 
        ; return (final_qtvs, my_theta) }
   where
-    choose_qtv :: TyVarEnv InvisTVBinder -> TcTyVar
-             -> (TcTyVarSet, [InvisTVBinder]) -> (TcTyVarSet, [InvisTVBinder])
+    choose_qtv :: TyVarEnv (Matchability, InvisTVBinder) -> TcTyVar
+             -> (TcTyVarSet, [(Matchability, InvisTVBinder)])
+             -> (TcTyVarSet, [(Matchability, InvisTVBinder)])
     -- Pick which of the original qtvs should be retained
     -- Keep it if (a) it is mentioned in the body of the type (free_tvs)
     --            (b) it is a forall'd variable of the partial signature (psig_qtv_bndrs)
     --            (c) it is mentioned in the kind of a retained qtv (#22065)
+    --            (d) it is mentioned in a retained binder's matchability
     choose_qtv psig_bndr_map tv (free_tvs, qtvs)
-       | Just psig_bndr <- lookupVarEnv psig_bndr_map tv
-       = (free_tvs', psig_bndr : qtvs)
+       | Just psig_bndr@(ma, _) <- lookupVarEnv psig_bndr_map tv
+       = (free_tvs `unionVarSet` tyCoVarsOfType (tyVarKind tv)
+                   `unionVarSet` tyCoVarsOfType ma,
+          psig_bndr : qtvs)
        | tv `elemVarSet` free_tvs
-       = (free_tvs', mkTyVarBinder InferredSpec tv : qtvs)
+       = (free_tvs `unionVarSet` tyCoVarsOfType (tyVarKind tv),
+          (unmatchableDataConTy, mkTyVarBinder InferredSpec tv) : qtvs)
        | otherwise  -- Do not pick it
        = (free_tvs, qtvs)
-       where
-         free_tvs' = free_tvs `unionVarSet` tyCoVarsOfType (tyVarKind tv)
 
     choose_psig_context :: VarSet -> TcThetaType -> Maybe TcType
                         -> TcM (VarSet, TcThetaType)
@@ -1144,9 +1195,11 @@ warnMissingSignatures id
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If /any/ of the signatures in the group is a partial type signature
    f :: _ -> Int
-then we *always* use the InferGen plan, and hence tcPolyInfer.
-We do this even for a local binding with -XMonoLocalBinds, when
-we normally use NoGen.
+then we normally use the InferGen plan, and hence tcPolyInfer.
+This includes local bindings with -XMonoLocalBinds. There is an earlier
+exception in decideGeneralisationPlan for a local pattern binding with
+an explicit multiplicity. Its group uses NoGen and cannot postpone calls.
+See Note [Pending calls in partial signatures] in GHC.Tc.Solver.
 
 Reasons:
   * The TcSigInfo for 'f' has a unification variable for the '_',
@@ -1282,6 +1335,107 @@ data MonoBindInfo = MBI { mbi_poly_name :: Name
                         , mbi_sig       :: Maybe TcIdSigInst
                         , mbi_mono_id   :: TcId
                         , mbi_mono_mult :: Mult }
+
+-- | Check inferred retained types before ordinary binding inference.
+-- See Note [Inference of retained types].
+checkInferredRetainedTypes :: (TcType -> Bool) -> [MonoBindInfo] -> TcM ()
+checkInferredRetainedTypes local_value infos
+  | all has_complete_sig infos = return ()
+  | otherwise = do
+      enabled <- xoptM LangExt.DependentTypes
+      when enabled $ mapM_ check_info infos
+  where
+    has_complete_sig (MBI { mbi_sig = Just (TISI { sig_inst_sig = TcCompleteSig{} }) }) = True
+    has_complete_sig _ = False
+
+    check_info info
+      | has_complete_sig info = return ()
+    check_info info@(MBI { mbi_poly_name = name, mbi_mono_id = mono_id })
+      = setSrcSpan (nameSrcSpan name) $
+        do { let raw_ty = idType mono_id
+           ; ty <- if anyFreeVarsOfType isMetaTyVar raw_ty || hasCoercionHole raw_ty
+                   then liftZonkM (zonkTcType raw_ty)
+                   else pure raw_ty
+           ; when (hasNativeDependentExpr (Type ty) && not (closed_package ty)) $
+               if local_value ty && isNothing (mbi_sig info) && scoped_type ty
+               then checkValidType (InfSigCtxt name) ty
+               else failWithTc $ TcRnRetainedQuantificationError (RetainedInference ty) }
+
+    closed_package ty
+      | ExistsTy _ binder body <- coreFullView ty
+      = noFreeVarsOfType ty && isFamFreeTy ty
+        && isTauTy (varType binder) && ordinary_schema body
+      | otherwise = False
+
+    scoped_type ty
+      | ExistsTy ImplicitExists _ _ <- coreFullView ty
+      = all isTyVar (tyCoVarsOfTypeList ty) && isFamFreeTy ty && ordinary_schema ty
+      | otherwise = isTauTy ty
+
+    -- Check the kinds and final payload inside the whole package's scope.
+    ordinary_schema ty = case coreFullView ty of
+      ExistsTy _ binder body -> ordinary_type (varType binder) && ordinary_schema body
+      payload                -> ordinary_type payload
+    ordinary_type ty = isTauTy ty && not (hasNativeDependentExpr (Type ty))
+
+{- Note [Inference of retained types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An unsigned binding can infer a retained type without assigning a metavariable.
+For example, alias = keep copies the type of a retained function directly into
+an InferResult. The ordinary metavariable escape checks do not reject it.
+Ordinary generalisation does not support retained types.
+
+Check inferred binder types after tcMonoBinds, before ordinary inference.
+Zonk first to expose native syntax behind filled metavariables. Check NoGen
+bindings too, with the exception in Note [Scoped inferred native values]. Keep
+complete signatures on their checking path, including those in a binding group.
+Ordinary inferred functions whose types contain no native syntax are unchanged.
+See Note [Rigid retained indices] in GHC.Tc.Utils.Unify.
+
+An inferred existential can have consecutive binders. Check closure on the
+whole package. In `exists n. exists m. Rows Int n m`, the inner package
+refers to n, which the outer package binds. Check each binder kind and
+the final payload for ordinary tau syntax. Keep the family-free check.
+This examines a type that the RHS already synthesized. A metavariable
+assignment has separate requirements. See
+Note [Closed existential packages in type inference] in GHC.Core.Type.
+
+Note [Scoped inferred native values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A single unsigned nonrecursive FunBind infers its RHS before allocating its
+Id. runInferRhoFRR can store an exact native type in an InferResult without
+assigning that type to a meta-variable. For example, in the scope of n :: Nat,
+
+    let action = pure (replicateNative n 7)
+
+can infer f (Vec Int n). The ordinary head f can still be a meta-variable.
+For a local NoGen binding with one zero-argument equation, admit this monotype
+after checkValidType validates every runtime index against its actual lexical
+binding. This also checks the index domain and multiplicity. The binder's
+ordinary FRR and usage checks still apply. No runtime index is evaluated.
+
+A local nonrecursive pattern binding can bind a field whose exact type is
+a dot package. For example, let (yes, no) = partitionVec p xs binds two
+packages. Each field keeps its own existential type. The pattern checker
+still checks the entire pattern against the RHS before these field types
+are validated. Other inferred retained types in patterns require signatures.
+
+Do not generalise the result. Keep the rejection for recursive groups,
+partial signatures and retained function telescopes. isTauTy rejects
+DepFunTy as well as forall and predicate arrows. Existing infer-cell promotion
+and branch joining remain responsible for type-variable and GADT escape.
+
+A local dot package can also refer to an enclosing type variable. For example,
+in the polymorphic filter, `let rest = filterVec p xs in Cons x rest` gives rest
+the type `exists (n :: Nat). Vec n a`. Its witness remains bound in the package.
+Check the ordinary tau kind and payload, and require a family-free schema with
+only type variables free. This path records the exact checked type on the local
+Id. It does not assign the schema to a metavariable or generalise it. The usual
+application check opens rest at its use with a fresh scoped witness.
+
+Agda's lexical let context supplies prior art (Norell, 2007); it does not
+justify transparent Haskell index aliases; see GHC Proposal #378 (§4.6) and #523.
+-}
 
 tcMonoBinds :: RecFlag  -- Whether the binding is recursive for typechecking purposes
                         -- i.e. the binders are mentioned in their RHSs, and
@@ -1564,12 +1718,19 @@ lookupMBI name
 -------------------
 tcLhsSigId :: LetBndrSpec -> (Name, TcIdSig) -> TcM MonoBindInfo
 tcLhsSigId no_gen (name, sig)
-  = do { inst_sig <- tcInstSig sig
+  = do { inst_sig <- tcInstSig call_owner sig
        ; mono_id <- newSigLetBndr no_gen name inst_sig
        ; return (MBI { mbi_poly_name = name
                      , mbi_sig       = Just inst_sig
                      , mbi_mono_id   = mono_id
                      , mbi_mono_mult = idMult mono_id }) }
+
+  where
+    -- InferGen discharges pending calls in simplifyInfer. NoGen has
+    -- no corresponding checkpoint, so reject before making a result meta.
+    call_owner = case no_gen of
+      LetLclBndr -> RetrySigCalls
+      LetGblBndr {} -> RejectSigCalls
 
 ------------
 newSigLetBndr :: LetBndrSpec -> Name -> TcIdSigInst -> TcM TcId
@@ -1635,8 +1796,9 @@ tcExtendTyVarEnvForRhs (Just sig) thing_inside
 tcExtendTyVarEnvFromSig :: TcIdSigInst -> TcM a -> TcM a
 tcExtendTyVarEnvFromSig sig_inst thing_inside
   | TISI { sig_inst_skols = skol_prs, sig_inst_wcs = wcs } <- sig_inst
-  = tcExtendNameTyVarEnv wcs $
-    tcExtendNameTyVarEnv (mapSnd binderVar skol_prs) $
+  = tcWithPartialSigContext sig_inst $
+    tcExtendNameTyVarEnv wcs $
+    tcExtendNameTyVarEnv (mapSnd (binderVar . snd) skol_prs) $
     thing_inside
 
 tcExtendIdBinderStackForRhs :: [MonoBindInfo] -> TcM a -> TcM a
@@ -1872,6 +2034,8 @@ isClosedBndrGroup type_env binds
       = case thing of
           AGlobal {} -> True
           ATyVar {}  -> False  -- In-scope type variables are not closed!
+          ATcTypeLet{} -> False
+          ATcCaseLet{} -> False
           ATcId { tct_info = info}
             -> case info of
                    LetBound closed -> closed

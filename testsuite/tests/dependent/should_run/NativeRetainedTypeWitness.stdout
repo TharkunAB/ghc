@@ -1,0 +1,14 @@
+Token 7
+Token 8
+Just False
+Nothing
+True
+True
+(["()","()"],["Int"],["Bool","Char"])
+Bool
+"Int"
+(18446744073709551616,"Bool")
+(True,Just True)
+Nothing
+((),Maybe)
+("Char",True)

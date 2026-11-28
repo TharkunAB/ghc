@@ -29,6 +29,7 @@ module GHC.Types.RepType
 import GHC.Prelude
 
 import GHC.Types.Basic (Arity, RepArity)
+import GHC.Types.Var (binderVar, isCoVar, varType)
 import GHC.Core.DataCon
 import GHC.Core.Coercion
 import GHC.Core.TyCon
@@ -95,7 +96,11 @@ isNvUnaryRep _ = False
 -- __Warning__: do __not__ use this function to compute the runtime
 -- representation of a type (#26695). That's what 'typePrimRep' is for.
 unwrapType :: Type -> Type
-unwrapType ty
+unwrapType = unwrapTypeWith False
+
+-- Keep coercion binders when counting argument slots.
+unwrapTypeWith :: Bool -> Type -> Type
+unwrapTypeWith keep_co_binders ty
   | Just (_, unwrapped)
       <- topNormaliseTypeX stepper mappend inner_ty
   = unwrapped
@@ -105,7 +110,9 @@ unwrapType ty
     inner_ty = go ty
 
     go t | Just t' <- coreView t = go t'
-    go (ForAllTy _ t)            = go t
+    go (ForAllTy _ b t)
+      | not keep_co_binders || not (isCoVar (binderVar b))
+                                = go t
     go (CastTy t _)              = go t
     go t                         = t
 
@@ -135,14 +142,23 @@ countFunRepArgs :: Arity -> Type -> RepArity
 countFunRepArgs 0 _
   = 0
 countFunRepArgs n ty
-  | FunTy _ _ arg res <- unwrapType ty
+  | FunTy _ _ _ arg res <- top
   = (length (typePrimRep arg) `max` 1)
     + countFunRepArgs (n - 1) res
     -- If typePrimRep returns [] that means a void arg,
     -- and we count 1 for that
+  | DepFunTy _ index res <- top
+  -- See Note [Retained representation arity].
+  = (length (typePrimRep (varType index)) `max` 1)
+    + countFunRepArgs (n - 1) res
+  | ForAllTy _ _ res <- top
+  = 1 + countFunRepArgs (n - 1) res
   | otherwise
   = pprPanic "countFunRepArgs: arity greater than type can handle" (ppr (n, ty, typePrimRep ty))
+  where
+    top = unwrapTypeWith True ty
 
+-- | Count constructor payload arguments after unarisation, excluding void fields.
 countConRepArgs :: DataCon -> RepArity
 countConRepArgs dc = go (dataConRepArity dc) (dataConRepType dc)
   where
@@ -150,10 +166,33 @@ countConRepArgs dc = go (dataConRepArity dc) (dataConRepType dc)
     go 0 _
       = 0
     go n ty
-      | FunTy _ _ arg res <- unwrapType ty
+      | FunTy _ _ _ arg res <- top
       = length (typePrimRep arg) + go (n - 1) res
+      | DepFunTy _ index res <- top
+      -- See Note [Retained representation arity].
+      = length (typePrimRep (varType index)) + go (n - 1) res
+      | ForAllTy _ _ res <- top
+      = go (n - 1) res
       | otherwise
       = pprPanic "countConRepArgs: arity greater than type can handle" (ppr (n, ty, typePrimRep ty))
+      where
+        top = unwrapTypeWith True ty
+
+{- Note [Retained representation arity]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained Pi binder is an ordinary runtime argument. Count the representation
+of its domain, then count the codomain. Later argument types can mention the
+same runtime Id. Their representations depend on their kinds, not on the
+runtime value of that Id. Do not instantiate an index or inspect its unfolding.
+
+Retained constructor fields have fixed lifted representations. Both arity
+counters must handle their Pi types: constructor worker LFInfo uses
+countFunRepArgs, and constructor allocation checks use countConRepArgs.
+Keep the existing distinction for void arguments. Function calls retain a void
+argument slot, but constructor payloads omit it. See Note [Coercion tokens]
+in GHC.CoreToStg and Note [Retained constructor field telescopes] in
+GHC.Core.DataCon.
+-}
 
 dataConRuntimeRepStrictness :: HasDebugCallStack => DataCon -> [StrictnessMark]
 -- ^ Give the demands on the arguments of a
@@ -165,7 +204,8 @@ dataConRuntimeRepStrictness dc =
   -- pprTrace "dataConRuntimeRepStrictness" (ppr dc $$ ppr (dataConRepArgTys dc)) $
 
   let repMarks = dataConRepStrictness dc
-      repTys = map irrelevantMult $ dataConRepArgTys dc
+      co_tys = map varType (filter isCoVar (dataConExTyCoVars dc))
+      repTys = co_tys ++ map irrelevantMult (dataConRepArgTys dc)
   in -- todo: assert dc != unboxedTuple/unboxedSum
      go repMarks repTys []
   where

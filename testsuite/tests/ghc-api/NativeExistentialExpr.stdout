@@ -1,0 +1,16 @@
+imported Unpack ignores a bottom package argument
+named Unpack erases to the original STG Id
+Pack passes the original payload as an STG argument
+imported Unpack demands the payload only when its body does
+imported Unpack returns the body result for a defined package
+demanding Pack observes payload bottom
+Unpack leaves a computed package unevaluated
+adjacent package reduction preserves witness scope
+call arity preserves the scope of an opened package
+liberate-case distinguishes an outer variable from a hidden payload
+worker/wrapper preserves the scope of an opened package
+the dead-end check distinguishes a lazy opening from a demanded payload
+expression keys distinguish erased witnesses and identify alpha-renamed openings
+erased package rules match bound variables and reject escaping substitutions
+retained rules distinguish shared, distinct and shadowed indices
+exitification abstracts the hidden witness before its payload

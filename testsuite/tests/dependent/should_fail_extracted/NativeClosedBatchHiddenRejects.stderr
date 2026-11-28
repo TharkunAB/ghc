@@ -1,0 +1,6 @@
+NativeClosedBatchHiddenRejects.hs:13:23: error: [GHC-70565]
+    • Cannot evaluate ‘T.sample’ in a type.
+        Cannot inspect the constructors of RectangularTable.Table. To evaluate an algebraic datatype in a type, bring every constructor into scope from a non-SOURCE import.
+    • In the first argument of ‘Proxy’, namely ‘(T.sample 4)’
+      In the type signature: hiddenTable :: Proxy (T.sample 4)
+

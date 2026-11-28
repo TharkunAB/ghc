@@ -20,6 +20,7 @@ import GHC.Types.SafeHaskell
 import GHC.Utils.Fingerprint
 import GHC.Iface.Recomp.Binary
 import GHC.Iface.Flags
+import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Data.EnumSet as EnumSet
 import System.FilePath (normalise)
@@ -47,7 +48,9 @@ fingerprintDynFlags hsc_env this_mod nameio =
 
         -- all the extension flags and the language
         lang = fmap IfaceLanguage language
-        exts = map IfaceExtension $ EnumSet.toList extensionFlags
+        -- See Note [Fingerprinting UnsaturatedTypeFamilies].
+        exts = map IfaceExtension $
+               filter (/= LangExt.UnsaturatedTypeFamilies) (EnumSet.toList extensionFlags)
 
         -- avoid fingerprinting the absolute path to the directory of the source file
         -- see Note [Implicit include paths]
@@ -116,7 +119,52 @@ fingerprintDynFlags hsc_env this_mod nameio =
           , ifaceCallerCCFilters = callerCcFilters
           }
 
-    in (computeFingerprint nameio f, f)
+        -- See Note [Recompiling ordinary pair producers]
+        -- and Note [Opting in to checked source equations].
+        base_fp | xopt LangExt.DependentTypes dflags = computeFingerprint nameio f
+                | gopt Opt_WriteSourceEquations dflags =
+                    computeFingerprint nameio (f, "write-source-equations-v1" :: String)
+                | otherwise = computeFingerprint nameio (f, "ordinary-pair-equations-v1" :: String)
+
+        -- See Note [Fingerprinting UnsaturatedTypeFamilies].
+        fp | xopt LangExt.UnsaturatedTypeFamilies dflags =
+               computeFingerprint nameio (base_fp, "unsaturated-type-families-v1" :: String)
+           | otherwise = base_fp
+    in (fp, f)
+
+{- Note [Fingerprinting UnsaturatedTypeFamilies]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The standalone flag can change inferred kinds and which applications the
+compiler accepts. Include it in the self-recompilation hash. The resulting
+kinds and partial applications use the existing interface format. Keep
+the new extension's enum tag out of IfaceDynFlags so a reader that
+supports those types can still read the interface.
+-}
+
+{- Note [Opting in to checked source equations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The producer can request the same checked source equations without
+enabling dependent syntax. Enabling or disabling the option changes
+the producer's interface. Fingerprint the effective option so an
+old home interface cannot stand in for that change. Keep the flag
+out of IfaceDynFlags. An older reader can load the existing equation
+format without decoding a new GeneralFlag tag.
+-}
+
+{- Note [Recompiling ordinary pair producers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An ordinary module can now publish an equation for an exported pair case.
+An older interface remains readable, but it cannot supply an equation
+that its compiler never generated. When --make has the source, recheck
+the producer even if its source and flags are unchanged. Include the
+change in the ordinary module's self-recompilation fingerprint. This
+costs one rebuild of each old ordinary home module. An unchanged second
+build can reuse it, even if the module supplies no equations.
+
+Modules with DependentTypes already ran the pair check.
+Keep their existing flags fingerprint. Installed interfaces can still be
+read without access to their source or object code.
+-}
 
 -- Fingerprint the optimisation info. We keep this separate from the rest of
 -- the flags because GHCi users (especially) may wish to ignore changes in

@@ -19,6 +19,7 @@ module GHC.Tc.Types.TH (
 import GHC.Prelude
 import GHCi.RemoteTypes
 import qualified GHC.Boot.TH.Monad  as TH
+import GHC.Tc.Types.BasicTypes ( LexicalGivens )
 import GHC.Tc.Types.Evidence
 import GHC.Utils.Outputable
 import GHC.Tc.Types.TcRef
@@ -71,6 +72,8 @@ data PendingStuff
   | TcPending                     -- Typechecking the inside of a typed bracket
       (TcRef [PendingTcSplice])   --   Accumulate pending splices here
       (TcRef WantedConstraints)   --     and type constraints here
+      LexicalGivens              -- Lexical Givens from outside the bracket.
+                                  -- Restore these when checking nested splices.
       QuoteWrapper                -- A type variable and evidence variable
                                   -- for the overall monad of
                                   -- the bracket. Splices are checked
@@ -81,7 +84,7 @@ data PendingStuff
 isTypedPending :: PendingStuff -> Bool
 isTypedPending (RnPending _) = False
 isTypedPending (RnPendingTyped) = True
-isTypedPending (TcPending _ _ _) = True
+isTypedPending (TcPending _ _ _ _) = True
 
 pattern UntypedBrack :: ThLevel -> TcRef [PendingRnSplice] -> ThLevel
 pattern UntypedBrack lvl tc_ref = Brack lvl (RnPending tc_ref)

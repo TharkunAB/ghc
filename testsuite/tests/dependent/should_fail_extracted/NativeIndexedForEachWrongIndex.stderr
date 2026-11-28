@@ -1,0 +1,7 @@
+NativeIndexedForEachWrongIndex.hs:5:64: error: [GHC-83865]
+    • Couldn't match kind ‘Zero’ with ‘Succ n0’
+      Expected kind ‘UTerm (Succ n0)’, but ‘t'’ has kind ‘UTerm Zero’
+    • In the second argument of ‘BetaSteps’, namely ‘t'’
+      In the type lambda in ‘BadVar’
+      In the type ‘Sigma UTerm 'Zero \t' -> BetaSteps ('UVar 'FZ) t'’
+

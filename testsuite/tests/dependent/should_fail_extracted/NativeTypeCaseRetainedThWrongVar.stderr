@@ -1,0 +1,7 @@
+NativeTypeCaseRetainedThWrongVar.hs:12:4: error: [GHC-28709]
+    • Malformed type VarT flag_6989586621679016650
+      When splicing a TH type: GHC.Internal.Data.Proxy.Proxy flag_0
+    • In the untyped splice:
+        $(do Just n <- lookupValueName "flag"
+             pure (AppT (ConT ''Proxy) (VarT n)))
+

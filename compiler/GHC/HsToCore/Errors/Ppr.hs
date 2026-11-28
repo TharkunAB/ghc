@@ -13,6 +13,7 @@ import GHC.Types.Basic (pprRuleName)
 import GHC.Types.Error
 import GHC.Types.Error.Codes
 import GHC.Types.Id (idType)
+import GHC.Types.InlinePragma (inlinePragmaName)
 import GHC.Types.SrcLoc
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
@@ -25,6 +26,17 @@ instance Diagnostic DsMessage where
   diagnosticMessage opts = \case
     DsUnknownMessage (UnknownDiagnostic f _ m)
       -> diagnosticMessage (f opts) m
+    DsRetainedPackagePatterns
+      -> mkSimpleDecorated $
+           text "Retained package matches require prefix patterns with bare variable retained fields and unrestricted multiplicity."
+    DsLinearRetainedPackageRows
+      -> mkSimpleDecorated $
+           vcat [ text "These equations require separate matches of a linear retained package."
+                , text "Match each retained constructor once, then match the remaining fields inside that branch." ]
+    DsRetainedInlinePragma binding pragma
+      -> mkSimpleDecorated $
+           text "The" <+> inlinePragmaName pragma <+> text "unfolding of"
+             <+> quotes (ppr binding) <+> text "contains unsupported retained Core."
     DsEmptyEnumeration
       -> mkSimpleDecorated $ text "Enumeration is empty"
     DsIdentitiesFound conv_fn type_of_conv
@@ -62,13 +74,14 @@ instance Diagnostic DsMessage where
                $$ bullet <+> text "Redundant clauses might be reported as inaccessible"
                $$ bullet <+> text "Patterns reported as unmatched might actually be matched")
            ]
-    DsNonExhaustivePatterns kind _flag maxPatterns vars nablas
+    DsNonExhaustivePatterns kind _flag maxPatterns args nablas
       -> mkSimpleDecorated $
            pprContext False kind (text "are non-exhaustive") $ \_ ->
-             case vars of -- See #11245
+             case args of -- See #11245
                   [] -> text "Guards do not cover entire pattern space"
-                  _  -> let us = map (\nabla -> pprUncovered nabla vars) nablas
-                            pp_tys = pprQuotedList $ map idType vars
+                  _  -> let vars = map fst args
+                            us = map (\nabla -> pprUncovered nabla vars) nablas
+                            pp_tys = pprQuotedList $ map snd args
                         in  hang
                               (text "Patterns of type" <+> pp_tys <+> text "not matched:")
                               4
@@ -166,6 +179,8 @@ instance Diagnostic DsMessage where
                -> mkMsg "SCC pragmas" empty
              ThNoUserInline
                -> mkMsg "NOUSERINLINE" empty
+             ThTypeCase
+               -> mkMsg "Type case syntax" empty
              ThExoticFormOfType ty
                -> mkMsg "Exotic form of type" (ppr ty)
              ThAmbiguousRecordSelectors e
@@ -199,6 +214,9 @@ instance Diagnostic DsMessage where
                -> mkMsg "Non-linear fields in data constructors" empty
              ThDataConVisibleForall
                -> mkMsg "Visible forall in data constructors" empty
+             ThUnclassifiedArrowModifier (L _ modifier)
+               -> mkMsg "A modifier of unknown kind" $
+                    text "Add a Multiplicity or Matchability kind annotation to" <+> pprHsModifier modifier
              ThUnexpectedModifier mods
                -> mkMsg "Modifier" $ text "At most one modifier is supported" $$ pprLHsModifiers mods
              ThUnexpectedModifierExpr mods
@@ -252,6 +270,9 @@ instance Diagnostic DsMessage where
 
   diagnosticReason = \case
     DsUnknownMessage m          -> diagnosticReason m
+    DsRetainedPackagePatterns   -> ErrorWithoutFlag
+    DsLinearRetainedPackageRows -> ErrorWithoutFlag
+    DsRetainedInlinePragma{}    -> ErrorWithoutFlag
     DsEmptyEnumeration          -> WarningWithFlag Opt_WarnEmptyEnumerations
     DsIdentitiesFound{}         -> WarningWithFlag Opt_WarnIdentities
     DsOverflowedLiterals{}      -> WarningWithFlag Opt_WarnOverflowedLiterals
@@ -281,6 +302,9 @@ instance Diagnostic DsMessage where
 
   diagnosticHints = \case
     DsUnknownMessage m          -> diagnosticHints m
+    DsRetainedPackagePatterns   -> noHints
+    DsLinearRetainedPackageRows -> noHints
+    DsRetainedInlinePragma{}    -> noHints
     DsEmptyEnumeration          -> noHints
     DsIdentitiesFound{}         -> noHints
     DsOverflowedLiterals i _tc bounds usingNegLiterals

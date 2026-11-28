@@ -1,0 +1,10 @@
+NativeTypeLambdaBadRigidSkolemsU.hs:6:21: error: [GHC-83865]
+    • Couldn't match expected type: q a
+                  with actual type: p a
+    • In the expression: x
+      In an equation for ‘badRigidSkolems’: badRigidSkolems x = x
+    • Relevant bindings include
+        x :: p a (bound at NativeTypeLambdaBadRigidSkolemsU.hs:6:17)
+        badRigidSkolems :: p a -> q a
+          (bound at NativeTypeLambdaBadRigidSkolemsU.hs:6:1)
+

@@ -43,7 +43,8 @@ import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as Text.Encoding
 import GHC hiding (HsTypeGhcPsExt (..))
-import GHC.Builtin.WiredIn.Types (liftedRepTy)
+import GHC.Builtin.WiredIn.Types (liftedRepTy, matchableDataConTy)
+import GHC.Core.TyCo.Compare (eqType)
 import GHC.Core.TyCo.FVs (deepDetTypesFV)
 import GHC.Core.TyCo.Rep (Type (..))
 import GHC.Core.Type (isRuntimeRepVar)
@@ -64,7 +65,7 @@ import GHC.Utils.EndoOS
 import qualified GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic (panic)
 
-import Haddock.Types (DocName, DocNameI, ExportInfo, XRecCond, HsTypeDocNameIExt(..))
+import Haddock.Types (DocName, DocNameI, ExportInfo, MapHsExists(..), XRecCond, HsTypeDocNameIExt(..))
 
 moduleString :: Module -> String
 moduleString = moduleNameString . moduleName
@@ -167,7 +168,7 @@ mkEmptySigType :: LHsType GhcRn -> LHsSigType GhcRn
 -- though the type might have free variables
 mkEmptySigType lty@(L loc ty) = L loc $ case ty of
   HsForAllTy
-    { hst_tele = HsForAllInvis{hsf_invis_bndrs = bndrs}
+    { hst_tele = HsForAllInvis{hsf_matchability = ma, hsf_invis_bndrs = bndrs}
     , hst_body = body
     } ->
       HsSig
@@ -175,6 +176,7 @@ mkEmptySigType lty@(L loc ty) = L loc $ case ty of
         , sig_bndrs =
             HsOuterExplicit
               { hso_xexplicit = noExtField
+              , hso_matchability = ma
               , hso_bndrs = bndrs
               }
         , sig_body = body
@@ -189,7 +191,7 @@ mkEmptySigType lty@(L loc ty) = L loc $ case ty of
 mkHsForAllInvisTeleI
   :: [LHsTyVarBndr Specificity DocNameI] -> HsForAllTelescope DocNameI
 mkHsForAllInvisTeleI invis_bndrs =
-  HsForAllInvis{hsf_xinvis = noExtField, hsf_invis_bndrs = invis_bndrs}
+  HsForAllInvis{hsf_xinvis = noExtField, hsf_matchability = Nothing, hsf_invis_bndrs = invis_bndrs}
 
 mkHsImplicitSigTypeI :: LHsType DocNameI -> HsSigType DocNameI
 mkHsImplicitSigTypeI body =
@@ -219,8 +221,7 @@ getGADTConType :: ConDecl DocNameI -> LHsSigType DocNameI
 getGADTConType
   ( ConDeclGADT
       { con_outer_bndrs = outer_bndrs
-      , con_inner_bndrs = inner_bndrs
-      , con_cxts = cxts
+      , con_telescope = telescope
       , con_g_args = args
       , con_res_ty = res_ty
       }
@@ -229,13 +230,10 @@ getGADTConType
       ( HsSig
           { sig_ext = noExtField
           , sig_bndrs = unLoc outer_bndrs
-          , sig_body = mkGadtArgTys inner_bndrs phi_ty
+          , sig_body = mkGadtArgTys telescope tau_ty
           }
       )
     where
-      phi_ty :: LHsType DocNameI
-      phi_ty = foldr mkQualTy tau_ty cxts
-
       tau_ty :: LHsType DocNameI
       tau_ty = case args of
         RecConGADT _ flds -> mkFunTy (noLocA (XHsType (HsRecTy (unLoc flds)))) res_ty
@@ -254,6 +252,7 @@ getGADTConType
         L l (HsForAllTy { hst_xforall = noAnn
                            , hst_tele = tele, hst_body = body })
       mkGadtArgTy (L l HsGadtPar{}) body = L l (HsParTy noAnn body)
+      mkGadtArgTy (L _ (HsGadtContext ctxt)) body = mkQualTy ctxt body
 
       mkGadtArgTys :: [LHsGadtTelescope DocNameI] -> LHsType DocNameI -> LHsType DocNameI
       mkGadtArgTys = flip (foldr mkGadtArgTy)
@@ -318,6 +317,7 @@ addClassContext cls tvs0 (L pos (ClassOpSig _ _ lname ltype)) =
             , hst_body = ty
             }
         )
+    -- Put the class context before value arguments, including retained binders.
     go_ty (L loc ty) =
       L
         loc
@@ -461,6 +461,8 @@ reparenTypePrec = go
       paren p PREC_SIG $ HsIParamTy x n (reparenLType ty)
     go p (HsForAllTy x tele ty) =
       paren p PREC_CTX $ HsForAllTy x (reparenHsForAllTelescope tele) (reparenLType ty)
+    go p (HsForEachTy x bndrs ty) =
+      paren p PREC_CTX $ HsForEachTy x (map (mapXRec @a reparenTyVar) bndrs) (reparenLType ty)
     go p (HsQualTy x ctxt ty) =
       let p' [_] = PREC_CTX
           p' _ = PREC_TOP -- parens will get added anyways later...
@@ -483,7 +485,10 @@ reparenTypePrec = go
     go _ t@HsSpliceTy{} = t
     go _ t@HsTyLit{} = t
     go _ t@HsWildCardTy{} = t
-    go _ t@XHsType{} = t
+    go p t@XHsType{}
+      | Just exists <- mapHsExists (mapXRec @a reparenTyVar) reparenLType t =
+          paren p PREC_CTX exists
+      | otherwise = t
 
     -- Located variant of 'go'
     goL :: Precedence -> LHsType a -> LHsType a
@@ -524,8 +529,9 @@ reparenOuterTyVarBndrs
   => HsOuterTyVarBndrs flag a
   -> HsOuterTyVarBndrs flag a
 reparenOuterTyVarBndrs imp@HsOuterImplicit{} = imp
-reparenOuterTyVarBndrs (HsOuterExplicit x exp_bndrs) =
-  HsOuterExplicit x (map (mapXRec @(NoGhcTc a) reparenTyVar) exp_bndrs)
+reparenOuterTyVarBndrs (HsOuterExplicit x ma exp_bndrs) =
+  HsOuterExplicit x (fmap (mapXRec @(NoGhcTc a) reparenType) ma)
+    (map (mapXRec @(NoGhcTc a) reparenTyVar) exp_bndrs)
 reparenOuterTyVarBndrs v@XHsOuterTyVarBndrs{} = v
 
 -- | Add parentheses around the types in an 'HsForAllTelescope' (see 'reparenTypePrec')
@@ -534,10 +540,10 @@ reparenHsForAllTelescope
    . XRecCond a
   => HsForAllTelescope a
   -> HsForAllTelescope a
-reparenHsForAllTelescope (HsForAllVis x bndrs) =
-  HsForAllVis x (map (mapXRec @a reparenTyVar) bndrs)
-reparenHsForAllTelescope (HsForAllInvis x bndrs) =
-  HsForAllInvis x (map (mapXRec @a reparenTyVar) bndrs)
+reparenHsForAllTelescope (HsForAllVis x ma bndrs) =
+  HsForAllVis x (fmap (mapXRec @a reparenType) ma) (map (mapXRec @a reparenTyVar) bndrs)
+reparenHsForAllTelescope (HsForAllInvis x ma bndrs) =
+  HsForAllInvis x (fmap (mapXRec @a reparenType) ma) (map (mapXRec @a reparenTyVar) bndrs)
 reparenHsForAllTelescope v@XHsForAllTelescope{} = v
 
 -- | Add parenthesis around the types in a 'HsTyVarBndr' (see 'reparenTypePrec')
@@ -790,10 +796,18 @@ typeNames ty = go ty Set.empty
     go t acc =
       case t of
         TyVarTy{} -> acc
+        TermVarTy v -> go (varType v) acc
+        TermAppTy fun arg -> go arg $ go (varType fun) acc
+        DepFunTy _ b body -> go body $ go (varType b) $ go (idMult b) acc
+        DepDictTy b body -> go body $ go (varType b) acc
+        ClassAppTy sel inst dict arg kind ->
+          go kind $ go arg $ go dict $ go inst (Set.insert (getName sel) acc)
         AppTy t1 t2 -> go t2 $ go t1 acc
-        FunTy _ _ t1 t2 -> go t2 $ go t1 acc
+        -- See Note [Arrow matchability in Haddock] in Haddock.Convert.
+        FunTy _ ma w t1 t2 -> go t2 $ go t1 $ go w $ go ma acc
         TyConApp tcon args -> List.foldl' (\s t' -> go t' s) (Set.insert (getName tcon) acc) args
-        ForAllTy bndr t' -> go t' $ go (tyVarKind (binderVar bndr)) acc
+        ForAllTy ma bndr t' -> go t' $ go (tyVarKind (binderVar bndr)) $ go ma acc
+        ExistsTy _ tv t' -> go t' $ go (tyVarKind tv) acc
         LitTy _ -> acc
         CastTy t' _ -> go t' acc
         CoercionTy{} -> acc
@@ -849,13 +863,15 @@ defaultRuntimeRepVars :: Type -> Type
 defaultRuntimeRepVars = go emptyVarEnv
   where
     go :: TyVarEnv () -> Type -> Type
-    go subs (ForAllTy (Bndr var flg) ty)
+    go subs (ForAllTy ma (Bndr var flg) ty)
       | isRuntimeRepVar var
-      , isInvisibleForAllTyFlag flg =
+      , isInvisibleForAllTyFlag flg
+      , ma `eqType` matchableDataConTy =
           let subs' = extendVarEnv subs var ()
            in go subs' ty
       | otherwise =
           ForAllTy
+            (go subs ma)
             (Bndr (updateTyVarKind (go subs) var) flg)
             (go subs ty)
     go subs (TyVarTy tv)
@@ -863,16 +879,31 @@ defaultRuntimeRepVars = go emptyVarEnv
           liftedRepTy
       | otherwise =
           TyVarTy (updateTyVarKind (go subs) tv)
+    go subs (TermVarTy var) = TermVarTy (go_id subs var)
+    go subs (TermAppTy fun arg) = TermAppTy (go_id subs fun) (go subs arg)
+    go subs (DepFunTy vis binder body) =
+      -- See Note [Retained types in Haddock] in Haddock.Convert.
+      DepFunTy vis (go_id subs binder) (go subs body)
+    go subs (DepDictTy binder body) =
+      DepDictTy (go_id subs binder) (go subs body)
+    go subs (ClassAppTy sel inst dict arg kind) =
+      ClassAppTy (go_id subs sel) (go subs inst) (go subs dict) (go subs arg) (go subs kind)
+    go subs (ExistsTy flag binder body) =
+      ExistsTy flag (updateTyVarKind (go subs) binder) (go subs body)
     go subs (TyConApp tc tc_args) =
       TyConApp tc (map (go subs) tc_args)
-    go subs (FunTy af w arg res) =
-      FunTy af (go subs w) (go subs arg) (go subs res)
+    go subs (FunTy af ma w arg res) =
+      -- See Note [Arrow matchability in Haddock] in Haddock.Convert.
+      FunTy af (go subs ma) (go subs w) (go subs arg) (go subs res)
     go subs (AppTy t u) =
       AppTy (go subs t) (go subs u)
     go subs (CastTy x co) =
       CastTy (go subs x) co
     go _ ty@(LitTy{}) = ty
     go _ ty@(CoercionTy{}) = ty
+
+    go_id subs var =
+      setIdMult (setVarType var (go subs $ varType var)) (go subs $ idMult var)
 
 fromMaybeContext :: Maybe (LHsContext DocNameI) -> HsContext DocNameI
 fromMaybeContext Nothing = HsContext noExtField []

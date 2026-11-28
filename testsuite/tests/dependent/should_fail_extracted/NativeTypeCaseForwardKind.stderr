@@ -1,0 +1,3 @@
+NativeTypeCaseForwardKind.hs:7:23: error: [GHC-76037]
+    Not in scope: type variable ‘payload’
+

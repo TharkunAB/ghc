@@ -816,11 +816,11 @@ tcStandaloneDerivInstType ctxt
                         , sig_bndrs = outer_bndrs
                         , sig_body  = rho }
        let (tvs, _theta, cls, inst_tys) = tcSplitDFunTy dfun_ty
-       pure (tvs, InferContext (Just (locA wc_span)), cls, inst_tys)
+       pure (map snd tvs, InferContext (Just (locA wc_span)), cls, inst_tys)
   | otherwise
   = do dfun_ty <- tcHsClsInstType ctxt deriv_ty
        let (tvs, theta, cls, inst_tys) = tcSplitDFunTy dfun_ty
-       pure (tvs, SupplyContext theta, cls, inst_tys)
+       pure (map snd tvs, SupplyContext theta, cls, inst_tys)
 
 warnUselessTypeable :: TcM ()
 warnUselessTypeable = addDiagnosticTc TcRnUselessTypeable
@@ -843,7 +843,7 @@ deriveTyData :: TyCon -> [Type] -- LHS of data or data instance
 deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
    = do {  -- Given data T a b c = ... deriving( C d ),
            -- we want to drop type variables from T so that (C d (T a)) is well-kinded
-          let (arg_kinds, _)  = splitFunTys cls_arg_kind
+          let (_mas, arg_kinds, _)  = splitFunTys cls_arg_kind
               n_args_to_drop  = length arg_kinds
               n_args_to_keep  = length tc_args - n_args_to_drop
                                 -- See Note [tc_args and tycon arity]
@@ -1888,6 +1888,14 @@ However, we must watch out for three things:
     type at the Core level. See #14728, comment:3 for a sketch of how this
     might work. Until then, we disallow this featurette wholesale.
 
+(e) A marked family equation must form its right-hand side using the owning
+    class constraint. For the generated equation above, C x y (N a) must
+    provide C x y <rep-type>. The derived instance context can construct the
+    first dictionary, but callers cannot recover that context from it.
+    checkValidCoAxBranch checks the generated equation before genFamInsts
+    returns it. See Note [Class evidence in associated family equations]
+    in GHC.Tc.Validity.
+
 The same criteria apply to DerivingVia.
 
 ************************************************************************
@@ -2056,7 +2064,7 @@ genFamInsts spec@(DS { ds_tvs = tyvars, ds_mechanism = mechanism
       DerivSpecVia{dsm_via_ty = via_ty}
         -> gen_newtype_or_via via_ty
   where
-    gen_newtype_or_via ty = gen_Newtype_fam_insts loc clas tyvars inst_tys ty
+    gen_newtype_or_via = gen_Newtype_fam_insts loc clas tyvars inst_tys
 
 -- Set the SrcSpan and error context for an action that uses a DerivSpec.
 set_spec_span_and_ctxt :: DerivSpec theta -> TcM a -> TcM a

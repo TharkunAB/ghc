@@ -1,0 +1,7 @@
+NativeTypeLambdaEtaMatchable.hs:6:28: error: [GHC-83865]
+    • Expected kind ‘GHC.Internal.Types.Matchable’,
+        but ‘\cell -> Maybe cell’ has kind ‘GHC.Internal.Types.Unmatchable’
+    • In the second argument of ‘(:~:)’, namely ‘(\cell -> Maybe cell)’
+      In the type signature:
+        badMatchable :: Maybe :~: (\cell -> Maybe cell)
+

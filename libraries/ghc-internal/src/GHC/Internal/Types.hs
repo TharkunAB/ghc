@@ -1,3 +1,4 @@
+{-# LANGUAGE TypeAbstractions #-}
 {-# LANGUAGE Trustworthy #-}  -- So that we can import in into Safe modules
                               -- like GHC.Internal.System.Mem.StableName
 {-# LANGUAGE MagicHash, NoImplicitPrelude, TypeFamilies, UnboxedTuples,
@@ -6,6 +7,7 @@
              TypeApplications, StandaloneKindSignatures, GADTs,
              FlexibleInstances, UndecidableInstances, UnboxedSums,
              BangPatterns, UnliftedFFITypes #-}
+{-# LANGUAGE CUSKs #-} -- Required after StandaloneKindSignatures for (->).
 -- NegativeLiterals: see Note [Fixity of (->)]
 
 {-# OPTIONS_HADDOCK print-explicit-runtime-reps #-}
@@ -62,6 +64,7 @@ module GHC.Internal.Types (
 
         -- * Multiplicity types
         Multiplicity(..), MultMul,
+        Matchability(..), M, U,
 
         -- * Runtime type representation
         Module(..), TrName(..), TyCon(..), TypeLitSort(..),
@@ -240,8 +243,20 @@ This declaration is important for :info (->) command (issue #10145)
 -}
 
 -- | The regular function type
-type (->) = FUN 'Many
+-- See Note [Source kind of the ordinary arrow].
+type (->) @(ma :: Matchability) =
+  FUN @ma 'Many :: forall {rep1 :: RuntimeRep} {rep2 :: RuntimeRep}.
+                  TYPE rep1 -> TYPE rep2 -> Type
 -- See Note [Linear types] in Multiplicity
+
+{- Note [Source kind of the ordinary arrow]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This complete user-specified kind gives ma a specified invisible binder.
+The runtime representations stay inferred in the result kind. Do not move
+them to the declaration head. That would change the synonym's arity.
+This kind must match unrestrictedFunTyCon in GHC.Builtin.WiredIn.Types.
+Enable CUSKs after StandaloneKindSignatures, which disables CUSKs.
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -276,6 +291,16 @@ type UnliftedType = TYPE UnliftedRep
 type ZeroBitType = TYPE ZeroBitRep
 
 -------------------------
+-- | Matchability of an arrow in a type or kind.
+-- See Note [Ordinary arrow matchability] in GHC.Core.TyCo.Rep.
+data Matchability = Matchable | Unmatchable
+
+-- | The matchable arrow annotation.
+type M = 'Matchable
+
+-- | The unmatchable arrow annotation.
+type U = 'Unmatchable
+
 data Multiplicity = Many | One
 
 type family MultMul (a :: Multiplicity) (b :: Multiplicity) :: Multiplicity where

@@ -138,13 +138,7 @@
            (EpaComments
             []))
           (ConDeclH98
-           (AnnConDeclH98
-            (EpUniTok (EpaSpan { <no location info> }) NormalSyntax)
-            (EpTok
-             (EpaSpan { <no location info> }))
-            (EpUniTok
-             (EpaSpan { <no location info> })
-             (NormalSyntax)))
+           (NoExtField)
            []
            (L
             (EpAnn
@@ -155,9 +149,7 @@
               []))
             (Unqual
              {OccName: Zero}))
-           (False)
            []
-           (Nothing)
            (PrefixCon
             (NoExtField)
             [])
@@ -169,13 +161,7 @@
            (EpaComments
             []))
           (ConDeclH98
-           (AnnConDeclH98
-            (EpUniTok (EpaSpan { <no location info> }) NormalSyntax)
-            (EpTok
-             (EpaSpan { <no location info> }))
-            (EpUniTok
-             (EpaSpan { <no location info> })
-             (NormalSyntax)))
+           (NoExtField)
            []
            (L
             (EpAnn
@@ -186,9 +172,7 @@
               []))
             (Unqual
              {OccName: Succ}))
-           (False)
            []
-           (Nothing)
            (PrefixCon
             (NoExtField)
             [(CDF
@@ -851,13 +835,7 @@
            (EpaComments
             []))
           (ConDeclH98
-           (AnnConDeclH98
-            (EpUniTok (EpaSpan { <no location info> }) NormalSyntax)
-            (EpTok
-             (EpaSpan { <no location info> }))
-            (EpUniTok
-             (EpaSpan { <no location info> })
-             (NormalSyntax)))
+           (NoExtField)
            []
            (L
             (EpAnn
@@ -868,9 +846,7 @@
               []))
             (Unqual
              {OccName: MkT}))
-           (False)
            []
-           (Nothing)
            (PrefixCon
             (NoExtField)
             [(CDF
@@ -1946,7 +1922,6 @@
              (HsOuterImplicit
               (NoExtField)))
             []
-            []
             (PrefixConGADT
              (NoExtField)
              [(CDF
@@ -1988,12 +1963,14 @@
                    (HsForAllInvis
                     (EpAnn
                      (EpaSpan { DumpParsedAst.hs:23:11-20 })
-                     ((,)
+                     ((,,)
                       (EpUniTok (EpaSpan { DumpParsedAst.hs:23:11-16 }) NormalSyntax)
                       (EpTok
-                       (EpaSpan { DumpParsedAst.hs:23:20 })))
+                       (EpaSpan { DumpParsedAst.hs:23:20 }))
+                      (Nothing))
                      (EpaComments
                       []))
+                    (Nothing)
                     [(L
                       (EpAnn
                        (EpaSpan { DumpParsedAst.hs:23:18-19 })

@@ -1,0 +1,302 @@
+{-# LANGUAGE GADTs, DataKinds, MagicHash, NoDependentTypes, TypeApplications, TypeFamilies, PolyKinds, RankNTypes, TypeOperators #-}
+module NativeTypeCaseClient where
+
+import Data.Kind (Type)
+import Data.Type.Equality ((:~:)(Refl))
+import GHC.Exts (Int(I#), LiftedRep, RuntimeRep(IntRep))
+import Data.Proxy (Proxy(..))
+import NativeCase
+import qualified NativeNestedCase as N
+import qualified NativeTypeCaseFallback as Catch
+import qualified OpenMapWorker as Open
+
+always :: Proxy b -> Catch.Always b :~: Int
+always _ = Refl
+
+echo :: Proxy a -> Catch.Echo a :~: a
+echo _ = Refl
+
+catchAll :: '(Catch.Shadow 'True 'False, ElementOrSelf Int, ElementOrSelf (Maybe Bool), Catch.Nested ('Just 'False))
+         :~: '( 'False, Int, Bool, Char)
+catchAll = Refl
+
+left :: F 'True :~: Int
+left = Refl
+
+right :: F 'False :~: Bool
+right = Refl
+
+signatureTrue :: Int
+signatureTrue = caseIdentity (Proxy @'True) 3
+
+signatureFalse :: Bool
+signatureFalse = caseIdentity (Proxy @'False) True
+
+nestedSignatureShadow :: Int
+nestedSignatureShadow = nestedCaseIdentity (Proxy @'False) False (Proxy @'True) 7
+
+retainedSignature :: (Int, Char, String, String)
+retainedSignature =
+  (retainedPick True, retainedPick False, renderRetainedPick True, renderRetainedPick False)
+
+computedRetained :: (Int, Bool, String, Proxy Int, Proxy Char)
+computedRetained =
+  (retainedDoubleNot True, retainedDoubleNot False, renderRetainedDoubleNot True,
+   retainedPermission Open.Green True, retainedPermission Open.Red True)
+
+field :: Field ('Just 'True) :~: '( 'True, 'True)
+field = Refl
+
+fixed :: Same 'False :~: Int
+fixed = Refl
+
+capture :: Capture Int ('Just 'True) :~: '(Int, 'True)
+capture = Refl
+
+given :: (a ~ 'True) => Proxy a -> Same a :~: Int
+given _ = Refl
+
+brace :: Braces 'False :~: Bool
+brace = Refl
+
+fixedKind :: Fixed Ordering 'LT :~: (Proxy 'LT, Proxy 'True)
+fixedKind = Refl
+
+captured :: Proxy a -> Captured a 'False :~: Maybe (PayloadKind a)
+captured _ = Refl
+
+retained :: Retain Ordering 'LT :~: Proxy 'LT
+retained = Refl
+
+shadow :: PatternShadow 'True :~: (Proxy 'False, Maybe Ordering)
+shadow = Refl
+
+scrutineeShadow :: ScrutineeShadow 'True :~: Int
+scrutineeShadow = Refl
+
+nestedScope :: NestedScope :~: Proxy 'False
+nestedScope = Refl
+
+paired :: Paired Ordering 'LT Bool 'True 'True :~: Proxy '( 'LT, 'True)
+paired = Refl
+
+inferredCapture :: InferredCapture 'LT 'True :~: Proxy 'LT
+inferredCapture = Refl
+
+contextKind :: ContextKind 'True :~: ContextKind 'False
+contextKind = Refl
+
+separateKinds :: SeparateKinds 'False :~: Bool
+separateKinds = Refl
+
+nestedLet :: Proxy a ->
+  ( NestedLetCase a ('Just 'True) :~: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+  , NestedLetCase a ('Just 'False) :~: Proxy '(Maybe a, Either (Maybe a) (Maybe a))
+  , NestedLetCase a 'Nothing :~: Proxy '(Maybe a, Either (Maybe a) (Maybe a)) )
+nestedLet _ = (Refl, Refl, Refl)
+
+nestedLetShadow :: Proxy b ->
+  ( NestedLetShadow b ('Just 'False) :~: (Proxy 'False, Proxy ('Just b))
+  , NestedLetShadow b 'Nothing :~: (Proxy ('Just b), Proxy ('Just b)) )
+nestedLetShadow _ = (Refl, Refl)
+
+nestedLetKind :: (NestedLetKind 'True :~: Bool, NestedLetKind 'False :~: Bool)
+nestedLetKind = (Refl, Refl)
+
+tupleKind :: (TupleKindLet '( 'True, 3) :~: Int, TupleKindLet '( 'False, 3) :~: Bool)
+tupleKind = (Refl, Refl)
+
+aliasTupleKind :: AliasTupleKindLet '( 'False, 3) :~: Bool
+aliasTupleKind = Refl
+
+nestedTupleKind ::
+  ( NestedTupleKindLet '( '( 'True, 2), 3) :~: Int
+  , NestedTupleKindLet '( '( 'False, 2), 3) :~: Ordering )
+nestedTupleKind = (Refl, Refl)
+
+polyNestedTupleKind ::
+  ( PolyNestedTupleKindLet Ordering '( '( 'True, 'EQ), 3) :~: Int
+  , PolyNestedTupleKindLet Ordering '( '( 'False, 'EQ), 3) :~: Ordering
+  , PolyNestedTupleKindLet Bool '( '( 'False, 'True), 4) :~: Bool )
+polyNestedTupleKind = (Refl, Refl, Refl)
+
+ascribedCaseKind ::
+  ( AscribedCaseKind Ordering ('Just 'True) :~: ('Nothing :: Maybe Ordering)
+  , AscribedCaseKind Bool 'Nothing :~: ('Nothing :: Maybe Bool) )
+ascribedCaseKind = (Refl, Refl)
+
+signedCaseRhs ::
+  ( SignedCaseRhs 'True :~: Proxy ('Nothing :: Maybe Bool)
+  , SignedCaseRhs 'False :~: Proxy ('Nothing :: Maybe Bool) )
+signedCaseRhs = (Refl, Refl)
+
+caseRhsAliasKind ::
+  ( CaseRhsAliasKind Ordering 'True :~: Proxy ('( 'Nothing, 'Just 'True) :: (Maybe Ordering, Maybe Bool))
+  , CaseRhsAliasKind Char 'False :~: Proxy ('( 'Nothing, 'Nothing) :: (Maybe Char, Maybe Bool)) )
+caseRhsAliasKind = (Refl, Refl)
+
+caseBodyAliasKind ::
+  ( CaseBodyAliasKind ('Just 'False) :~: 'Just 'False
+  , CaseBodyAliasKind 'Nothing :~: ('Nothing :: Maybe Bool) )
+caseBodyAliasKind = (Refl, Refl)
+
+nested :: ( N.Pick ('Just ('Just 'True)) :~: Proxy 'True
+          , N.Pick ('Just 'Nothing) :~: Int
+          , N.SameFallback ('Just 'Nothing) :~: Int )
+nested = (Refl, Refl, Refl)
+
+wildcard :: N.IgnoreLeft ('N.Pair unknown ('Just 'True)) :~: Bool
+wildcard = Refl
+
+indexed :: ( N.IndexedPick @Bool ('Just ('N.BooleanTag 'False)) :~: Proxy 'False
+           , N.IndexedPick @Ordering ('Just ('N.OrderingTag 'GT)) :~: Proxy 'GT )
+indexed = (Refl, Refl)
+
+type family Known (a :: Type) :: Type where
+  Known Bool = Ordering
+
+typeHeads :: ( N.TypeHead ('Just Bool) :~: Int, N.TypeHead ('Just Ordering) :~: Char
+             , N.TypeHead ('Just [a]) :~: (), N.TypeHead 'Nothing :~: ()
+             , N.UniformTypeHead ('Just Bool) :~: Int
+             , N.Wrapped ('Just (Maybe a)) :~: Proxy a
+             , N.TypeHead ('Just (Known Bool)) :~: Char
+             , N.WrappedBool ('Just (Maybe Bool)) :~: Int
+             , N.WrappedBool ('Just (Maybe Char)) :~: () )
+typeHeads = (Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl)
+
+transparentAliases ::
+  ( N.PickFlipped ('Just (Maybe (Either Char Bool))) :~: Proxy Char
+  , N.PickFlipped ('Just (Maybe (Either Bool Char))) :~: ()
+  , N.DiscardConstant ('Just (Maybe Ordering)) :~: Proxy Ordering
+  , N.CaptureFlipped 'LT ('Just (Either Char Bool)) :~: '(Proxy 'LT, Proxy Bool, Proxy Char)
+  , N.WrittenFirst ('Just (Either unknown Char)) :~: Int )
+transparentAliases = (Refl, Refl, Refl, Refl, Refl)
+
+aliasMatch :: N.AliasFirst ('N.Pair ('Just 'True) ('Just 'False)) :~: Int
+aliasMatch = Refl
+
+aliasMiss :: N.AliasFirst ('N.Pair 'Nothing later) :~: Int
+aliasMiss = Refl
+
+mixedAliasMiss :: N.MixedAlias ('N.Pair ('Just 'False) later) :~: Int
+mixedAliasMiss = Refl
+
+knownIndex :: N.FamilyGatePick ('Just 'N.IndexedGate) :~: Bool
+knownIndex = Refl
+
+ordinaryIndex :: N.FamilyGatePick ('Just ('N.PlainGate 'True)) :~: Int
+ordinaryIndex = Refl
+
+writtenIndex :: N.WrittenGatePick ('Just 'N.IndexedGate) :~: Int
+writtenIndex = Refl
+
+apartIndex :: N.ApartGatePick ('Just ('N.PlainGate 'False)) :~: Bool
+apartIndex = Refl
+
+hiddenIndex :: N.HiddenGatePick ('Just 'N.IndexedGate) :~: Int
+hiddenIndex = Refl
+
+openIndexHit :: Proxy b -> N.OpenIndexPick (N.OpenCaseIndex b) ('Just ('N.OpenPlain 'True)) :~: Int
+openIndexHit _ = Refl
+
+openIndexMiss :: forall b. Proxy b ->
+  N.OpenIndexPick (N.OpenCaseIndex b) ('Just ('N.OpenIndexed ('Proxy :: Proxy b))) :~: Int
+openIndexMiss _ = Refl
+
+type instance N.OpenCaseIndex 'True = Ordering
+
+openIndexFallback ::
+  N.OpenIndexAtOrdering ('Just ('N.OpenIndexed ('Proxy :: Proxy 'True))) :~: Bool
+openIndexFallback = Refl
+
+scopedOpenHit :: Proxy b -> N.ScopedOpenIndex b ('Just ('N.OpenPlain 'True)) :~: Proxy b
+scopedOpenHit _ = Refl
+
+scopedOpenShadow ::
+  N.ScopedOpenIndex 'True ('Just ('N.OpenPlain 'False)) :~: Proxy 'False
+scopedOpenShadow = Refl
+
+scopedOpenMiss :: forall b. Proxy b ->
+  N.ScopedOpenIndex b ('Just ('N.OpenIndexed ('Proxy :: Proxy b))) :~:
+    Proxy ('Just ('N.OpenIndexed ('Proxy :: Proxy b)))
+scopedOpenMiss _ = Refl
+
+refinedField :: Proxy (seed :: Bool) ->
+  N.IndexedFieldPick ('Just ('N.RefinedFieldBox ('Proxy :: Proxy seed) ('N.FieldOn flag))) :~: Proxy flag
+refinedField _ = Refl
+
+refinedFieldOrder ::
+  ( N.IndexedFieldOrder ('Just ('N.RefinedFieldBox ('Proxy :: Proxy 'False) ('N.FieldOn 'True))) :~: Int
+  , N.IndexedFieldOrder ('Just ('N.RefinedFieldBox ('Proxy :: Proxy 'True) ('N.FieldOn 'False))) :~: Int )
+refinedFieldOrder = (Refl, Refl)
+
+refinedBranches :: Proxy seed ->
+  ( N.RefinedBranchPick seed ('Just ('N.RefinedBranch 'Proxy ('N.RefinedBit 'True))) :~: Int
+  , N.RefinedBranchPick seed ('Just ('N.RefinedBranch 'Proxy ('N.RefinedBit 'False))) :~: Int
+  , N.RefinedBranchPick seed ('Just ('N.RefinedBranch 'Proxy 'N.InnerDisjoint)) :~: Bool
+  , N.RefinedBranchPick seed ('Just 'N.OuterDisjoint) :~: Char )
+refinedBranches _ = (Refl, Refl, Refl, Refl)
+
+arrowResult ::
+  N.ArrowResult 'LT ('Just ('Just 'True)) :~: (() -> (Proxy 'LT, Proxy 'True))
+arrowResult = Refl
+
+arrowDomain ::
+  ( N.ArrowDomain 'LT ('Just ('Just 'True)) :~: ((Proxy 'LT, Int) -> Int)
+  , N.ArrowDomain 'GT ('Just ('Just 'False)) :~: ((Proxy 'GT, Proxy 'False) -> Int)
+  , N.ArrowDomain 'EQ 'Nothing :~: (Char -> Int) )
+arrowDomain = (Refl, Refl, Refl)
+
+forallResult :: N.ForallResult
+forallResult tag N.CaseOn = (tag, 1)
+forallResult tag N.CaseOff = (tag, 0)
+forallResult tag N.CaseMissing = (tag, '?')
+
+liftedResult :: N.ForallRepResult -> Int
+liftedResult select = select @Ordering @'LT @LiftedRep Proxy N.CaseOff
+
+unliftedResult :: N.ForallRepResult -> Int
+unliftedResult select = I# (select @Bool @'False @'IntRep Proxy N.CaseOn)
+
+transportedField :: N.DependentFieldPick ('Just ('N.IndexedField 'Proxy)) :~: Char
+transportedField = Refl
+
+ordinaryField :: N.DependentFieldPick ('Just ('N.DefaultField 'True)) :~: Int
+ordinaryField = Refl
+
+plainCaseField :: N.PlainCaseField 'True -> Int
+plainCaseField (N.PlainCaseField n) = n
+
+presentCaseField :: N.CaseField ('Just 'True) -> Int
+presentCaseField (N.CaseField n) = n
+
+otherCaseField :: N.CaseField ('Just 'False) -> Int
+otherCaseField (N.CaseField n) = n
+
+missingCaseField :: N.CaseField 'Nothing -> Char
+missingCaseField (N.CaseField c) = c
+
+copyCaseField :: N.CaseField d -> N.CaseField d
+copyCaseField (N.CaseField field) = N.CaseField field
+
+shadowedCaseField :: N.ShadowedCaseField 'True ('Just 'False) -> Proxy 'False
+shadowedCaseField (N.ShadowedCaseField bit) = bit
+
+outerCaseField :: N.ShadowedCaseField 'True 'Nothing -> Proxy 'True
+outerCaseField (N.ShadowedCaseField bit) = bit
+
+rankedCaseField :: N.RankedCaseField 'False -> Int
+rankedCaseField (N.RankedCaseField f) = f @'True Proxy
+
+rankedCaseFieldFalse :: N.RankedCaseField 'True -> Char
+rankedCaseFieldFalse (N.RankedCaseField f) = f @'False Proxy
+
+orderedRankedCaseField :: N.OrderedRankedCaseField 'True -> Int
+orderedRankedCaseField (N.OrderedRankedCaseField f) = f @('Just 'False) Proxy
+
+capturedKindCaseField :: forall k (a :: k) (c :: k).
+  N.CapturedKindCaseField k a c -> Proxy '(a, c)
+capturedKindCaseField (N.CapturedKindCaseField f) = f @Int @'True Proxy
+
+shadowedKindCaseField :: N.CapturedKindCaseField Bool 'True 'False -> Proxy Int
+shadowedKindCaseField (N.CapturedKindCaseField f) = f @Int @'False Proxy

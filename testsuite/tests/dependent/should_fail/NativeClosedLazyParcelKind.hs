@@ -1,0 +1,8 @@
+{-# LANGUAGE DataKinds, DependentTypes #-}
+module NativeClosedLazyParcelKind where
+import Data.Proxy (Proxy(..))
+import qualified LazyParcel as P
+import qualified Data.Char as C
+
+bad :: Proxy (C.isSpace (P.make 7))
+bad = Proxy

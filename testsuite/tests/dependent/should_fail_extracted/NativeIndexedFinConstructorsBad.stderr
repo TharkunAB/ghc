@@ -1,0 +1,30 @@
+NativeIndexedFinConstructorsBad.hs:7:49: error: [GHC-83605]
+    • Each retained field must appear directly or under one promoted constructor in a result argument.
+      Visible arguments must be retained fields. Invisible arguments must be closed types.
+      The fields and result must have closed structural index types.
+      Other result arguments must be unchanged erased parameters.
+      The result type is ‘CompoundResult (True : ys)’.
+      For other results, use an ordinary datatype parameter in the result type.
+      Relate it to the retained field with a propositional equality field using
+      ‘:~:’ from ‘Data.Type.Equality’.
+    • In the definition of data constructor ‘CompoundResult’
+      In the data type declaration for ‘CompoundResult’
+
+NativeIndexedFinConstructorsBad.hs:10:65: error: [GHC-83605]
+    • Each retained field must appear directly or under one promoted constructor in a result argument.
+      Visible arguments must be retained fields. Invisible arguments must be closed types.
+      The fields and result must have closed structural index types.
+      Other result arguments must be unchanged erased parameters.
+      The result type is ‘TwoFieldsResult ys’.
+      For other results, use an ordinary datatype parameter in the result type.
+      Relate it to the retained field with a propositional equality field using
+      ‘:~:’ from ‘Data.Type.Equality’.
+    • In the definition of data constructor ‘TwoFieldsResult’
+      In the data type declaration for ‘TwoFieldsResult’
+
+NativeIndexedFinConstructorsBad.hs:13:37: error: [GHC-83865]
+    • Expected kind ‘[a0]’, but ‘True’ has kind ‘Bool’
+    • In the first argument of ‘sourceLength’, namely ‘True’
+      In the first argument of ‘Proxy’, namely ‘(sourceLength True)’
+      In the type ‘Proxy (sourceLength True)’
+

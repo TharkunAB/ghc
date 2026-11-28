@@ -17,7 +17,7 @@ quoteClassOcc :: KnownOcc
 quoteClassOcc = mkTcOcc "Quote"
 
 qTyConOcc, nameTyConOcc, fieldExpTyConOcc, patTyConOcc, fieldPatTyConOcc,
-  expTyConOcc, decTyConOcc, typeTyConOcc, matchTyConOcc, funDepTyConOcc,
+  expTyConOcc, decTyConOcc, typeTyConOcc, matchTyConOcc, typeCaseAltTyConOcc, funDepTyConOcc,
   codeTyConOcc, injAnnTyConOcc, overlapTyConOcc, decsTyConOcc, modNameTyConOcc,
   quasiQuoterTyConOcc :: KnownOcc
 qTyConOcc             = mkTcOcc "Q"
@@ -30,6 +30,7 @@ decTyConOcc           = mkTcOcc "Dec"
 decsTyConOcc          = mkTcOcc "Decs"
 typeTyConOcc          = mkTcOcc "Type"
 matchTyConOcc         = mkTcOcc "Match"
+typeCaseAltTyConOcc   = mkTcOcc "TypeCaseAlt"
 funDepTyConOcc        = mkTcOcc "FunDep"
 codeTyConOcc          = mkTcOcc "Code"
 injAnnTyConOcc        = mkTcOcc "InjectivityAnn"
@@ -107,7 +108,7 @@ varEOcc, conEOcc, litEOcc, appEOcc, appTypeEOcc, infixAppOcc, sectionLOcc,
   sectionROcc, lamEOcc, lamCaseEOcc, lamCasesEOcc, tupEOcc, unboxedTupEOcc,
   unboxedSumEOcc, condEOcc, multiIfEOcc, letEOcc, caseEOcc, doEOcc, mdoEOcc,
   compEOcc, staticEOcc, unboundVarEOcc, labelEOcc, implicitParamVarEOcc,
-  getFieldEOcc, projectionEOcc, typeEOcc, forallEOcc, forallVisEOcc,
+  getFieldEOcc, projectionEOcc, typeEOcc, forallEOcc, forallVisEOcc, forallMatchEOcc,
   constrainedEOcc :: KnownOcc
 varEOcc              = mkVarOcc "varE"
 conEOcc              = mkVarOcc "conE"
@@ -151,6 +152,7 @@ projectionEOcc       = mkVarOcc "projectionE"
 typeEOcc             = mkVarOcc "typeE"
 forallEOcc           = mkVarOcc "forallE"
 forallVisEOcc        = mkVarOcc "forallVisE"
+forallMatchEOcc      = mkVarOcc "forallMatchE"
 constrainedEOcc      = mkVarOcc "constrainedE"
 
 -- type FieldExp = ...
@@ -241,12 +243,23 @@ sourceLazyOcc         = mkVarOcc "sourceLazy"
 sourceStrictOcc       = mkVarOcc "sourceStrict"
 
 -- data Con = ...
-normalCOcc, recCOcc, infixCOcc, forallCOcc, gadtCOcc, recGadtCOcc :: KnownOcc
+normalCOcc, recCOcc, infixCOcc, forallCOcc, forallMatchCOcc, gadtCOcc, recGadtCOcc :: KnownOcc
 normalCOcc  = mkVarOcc "normalC"
 recCOcc     = mkVarOcc "recC"
 infixCOcc   = mkVarOcc "infixC"
 forallCOcc  = mkVarOcc "forallC"
+forallMatchCOcc = mkVarOcc "forallMatchC"
 gadtCOcc    = mkVarOcc "gadtC"
+retainedGadtCOcc, gadtValueArgOcc, gadtIndexArgOcc, retainedGadtArgTyConOcc :: KnownOcc
+retainedGadtCOcc = mkVarOcc "retainedGadtC"
+gadtValueArgOcc = mkVarOcc "gadtValueArg"
+gadtIndexArgOcc = mkVarOcc "gadtIndexArg"
+retainedGadtArgTyConOcc = mkTcOcc "RetainedGadtArg"
+
+gadtInvisibleArgsOcc, gadtRequiredArgsOcc, gadtContextArgsOcc :: KnownOcc
+gadtInvisibleArgsOcc = mkVarOcc "gadtInvisibleArgs"
+gadtRequiredArgsOcc = mkVarOcc "gadtRequiredArgs"
+gadtContextArgsOcc = mkVarOcc "gadtContextArgs"
 recGadtCOcc = mkVarOcc "recGadtC"
 
 -- data Bang = ...
@@ -274,13 +287,21 @@ infixPatSynName  = mkVarOcc "infixPatSyn"
 recordPatSynName = mkVarOcc "recordPatSyn"
 
 -- data Type = ...
-forallTName, forallVisTName, varTName, conTName, infixTName, tupleTName,
+forallTName, forallVisTName, forallMatchTName, forEachTName, indexVarTName,
+    varTName, conTName, infixTName, tupleTName,
     unboxedTupleTName, unboxedSumTName, arrowTName, mulArrowTName, listTName,
     appTName, appKindTName, sigTName, equalityTName, litTName, promotedTName,
     promotedTupleTName, promotedNilTName, promotedConsTName,
-    wildCardTName, implicitParamTName :: KnownOcc
+    wildCardTName, implicitParamTName, caseTName, typeCaseAltName, letTName, lamTName :: KnownOcc
 forallTName         = mkVarOcc "forallT"
 forallVisTName      = mkVarOcc "forallVisT"
+forallMatchTName    = mkVarOcc "forallMatchT"
+forEachTName        = mkVarOcc "forEachT"
+indexVarTName       = mkVarOcc "indexVarT"
+caseTName           = mkVarOcc "caseT"
+letTName            = mkVarOcc "letT"
+lamTName            = mkVarOcc "lamT"
+typeCaseAltName     = mkVarOcc "typeCaseAlt"
 varTName            = mkVarOcc "varT"
 conTName            = mkVarOcc "conT"
 tupleTName          = mkVarOcc "tupleT"

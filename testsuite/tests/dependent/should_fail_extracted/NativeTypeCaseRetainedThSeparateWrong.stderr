@@ -1,0 +1,20 @@
+NativeTypeCaseRetainedThSeparateWrong.hs:17:32: error: [GHC-83865]
+    • Couldn't match type: case b of {True -> Int; False -> Char}
+                     with: case b of {True -> Int; False -> Bool}
+      Expected: the type case in the signature for ‘renderDiffArms’
+        Actual: the type case in the signature for ‘choose’
+    • In the second argument of ‘renderDiffArms’, namely ‘(choose b)’
+      In the expression: renderDiffArms b (choose b)
+      In an equation for ‘diffArms’:
+          diffArms b = renderDiffArms b (choose b)
+
+NativeTypeCaseRetainedThSeparateWrong.hs:20:33: error: [GHC-83865]
+    • Couldn't match type: case b1 of {True -> Int; False -> Char}
+                     with: case c of {True -> Int; False -> Char}
+      Expected: the type case in the signature for ‘renderSame’
+        Actual: the type case in the signature for ‘choose’
+    • In the second argument of ‘renderSame’, namely ‘(choose b)’
+      In the expression: renderSame c (choose b)
+      In an equation for ‘diffCapture’:
+          diffCapture b c = renderSame c (choose b)
+

@@ -37,11 +37,13 @@ module GHC.Tc.Utils.TcType (
   SyntaxOpType(..), synKnownType, mkSynFunTys,
 
   --------------------------------
-  -- TcLevel
+  -- TcLevel & TermScopeDepth
   TcLevel(..), topTcLevel, pushTcLevel, isTopTcLevel,
   strictlyDeeperThan, deeperThanOrSame, sameDepthAs,
   tcTypeLevel, tcTyVarLevel, maxTcLevel, minTcLevel,
   infiniteTcLevel, isInfiniteTcLevel,
+  TermScopeDepth(..), topTermScopeDepth, bumpTermScopeDepth, minTermScopeDepth,
+  lookupIdTermDepth,
 
   --------------------------------
   -- MetaDetails
@@ -56,6 +58,7 @@ module GHC.Tc.Utils.TcType (
   isFlexi, isIndirect, isRuntimeUnkSkol,
   isQLInstTyVar, isRuntimeUnkTyVar,
   metaTyVarTcLevel, setMetaTyVarTcLevel, metaTyVarTcLevel_maybe,
+  metaTyVarTermDepth, setMetaTyVarTermDepth, metaTyVarTermDepth_maybe,
   isTouchableMetaTyVar, isPromotableMetaTyVar,
   findDupTyVarTvs, mkTyVarNamePairs,
 
@@ -114,7 +117,8 @@ module GHC.Tc.Utils.TcType (
   isImprovementPred,
 
   -- * Finding type instances
-  tcTyFamInsts, tcTyFamInstsAndVis, tcTyConAppTyFamInstsAndVis, isTyFamFree,
+  tcTyFamInsts, tcTyFamInstsAndVis, tcTyConAppTyFamInstsAndVis,
+  tcPatTyConAppTyFamInstsAndVis, isTyFamFree,
 
   -- * Finding "exact" (non-dead) type variables
   exactTyCoVarsOfType, exactTyCoVarsOfTypes,
@@ -140,14 +144,15 @@ module GHC.Tc.Utils.TcType (
 
   --------------------------------
   -- Reexported from Type
-  Type, PredType, ThetaType, PiTyBinder,
+  Type, Matchability, PredType, ThetaType, PiTyBinder,
   ForAllTyFlag(..), FunTyFlag(..),
 
   mkForAllTy, mkForAllTys, mkInvisForAllTys, mkTyCoInvForAllTys,
   mkSpecForAllTys, mkTyCoInvForAllTy,
   mkInfForAllTy, mkInfForAllTys,
   mkVisFunTy, mkVisFunTyMany, mkVisFunTysMany,
-  mkScaledFunTys,
+  mkVisFunTyManyM, mkVisFunTyManyU, mkVisFunTysManyM, mkVisFunTysManyU,
+  mkScaledFunTys, mkScaledFunTysM, mkScaledFunTysU,
   mkInvisFunTy, mkInvisFunTys,
   mkTyConApp, mkAppTy, mkAppTys,
   mkTyConTy, mkTyVarTy, mkTyVarTys,
@@ -209,8 +214,10 @@ import GHC.Core.TyCo.FVs
 import GHC.Core.TyCo.Ppr
 import GHC.Core.Class
 import GHC.Types.Var
+import GHC.Types.Var.Env ( VarEnv, lookupVarEnv )
 import GHC.Types.Var.Set
 import GHC.Core.Coercion
+import GHC.Core.Coercion.Axiom ( coAxiomBranches, coAxBranchLHS, coAxBranchRHS, fromBranches )
 import GHC.Core.Type as Type
 import GHC.Core.Predicate
 import GHC.Core.TyCon
@@ -229,7 +236,7 @@ import GHC.Types.Basic
 
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.WiredIn.Types ( coercibleClass, eqClass, heqClass, unitTyConKey
-                         , listTyCon, constraintKind )
+                         , listTyCon, constraintKind, unmatchableDataConTy )
 import GHC.Data.Maybe
 import GHC.Data.List.SetOps ( getNth, findDupsEq )
 
@@ -511,16 +518,16 @@ checkingExpType et@(Infer {}) = pprPanic "checkingExpType" (ppr et)
 -- Expected type of a pattern in a lambda or a function left-hand side.
 data ExpPatType =
     ExpFunPatTy    (Scaled ExpSigmaTypeFRR)   -- the type A of a function A -> B
-  | ExpForAllPatTy ForAllTyBinder             -- the binder (a::A) of  forall (a::A) -> B or forall (a :: A). B
+  | ExpForAllPatTy Matchability ForAllTyBinder -- Annotation and binder of a forall.
 
 mkCheckExpFunPatTy :: Scaled TcType -> ExpPatType
 mkCheckExpFunPatTy (Scaled mult ty) = ExpFunPatTy (Scaled mult (mkCheckExpType ty))
 
-mkInvisExpPatType :: InvisTyBinder -> ExpPatType
-mkInvisExpPatType (Bndr tv spec) = ExpForAllPatTy (Bndr tv (Invisible spec))
+mkInvisExpPatType :: (Matchability, InvisTyBinder) -> ExpPatType
+mkInvisExpPatType (ma, Bndr tv spec) = ExpForAllPatTy ma (Bndr tv (Invisible spec))
 
 isVisibleExpPatType :: ExpPatType -> Bool
-isVisibleExpPatType (ExpForAllPatTy (Bndr _ vis)) = isVisibleForAllTyFlag vis
+isVisibleExpPatType (ExpForAllPatTy _ (Bndr _ vis)) = isVisibleForAllTyFlag vis
 isVisibleExpPatType (ExpFunPatTy {})              = True
 
 isExpFunPatType :: ExpPatType -> Bool
@@ -529,7 +536,7 @@ isExpFunPatType ExpForAllPatTy{} = False
 
 instance Outputable ExpPatType where
   ppr (ExpFunPatTy t) = ppr t
-  ppr (ExpForAllPatTy tv) = text "forall" <+> ppr tv
+  ppr (ExpForAllPatTy ma tv) = text "forall" <+> (char '@' <> ppr ma) <+> ppr tv
 
 {- *********************************************************************
 *                                                                      *
@@ -651,9 +658,10 @@ data TcTyVarDetails
   | RuntimeUnk    -- Stands for an as-yet-unknown type in the GHCi
                   -- interactive context
 
-  | MetaTv { mtv_info  :: MetaInfo
-           , mtv_ref   :: IORef MetaDetails
-           , mtv_tclvl :: TcLevel }  -- See Note [TcLevel invariants]
+  | MetaTv { mtv_info       :: MetaInfo
+           , mtv_ref        :: IORef MetaDetails
+           , mtv_tclvl      :: TcLevel
+           , mtv_term_depth :: !TermScopeDepth }  -- See Note [TcLevel invariants]
 
 vanillaSkolemTvUnk :: HasDebugCallStack => TcTyVarDetails
 vanillaSkolemTvUnk = SkolemTv unkSkol topTcLevel False
@@ -942,6 +950,30 @@ instance Outputable TcLevel where
   ppr (TcLevel n) = ppr n
   ppr QLInstVar   = text "qlinst"
 
+-- | Contextual birth depth for local value 'Id's and unification variables.
+-- Prevents runtime value binders from escaping lambda, pattern, or local @let@
+-- scopes without allocating per-binder implications.
+newtype TermScopeDepth = TermScopeDepth Int
+  deriving (Eq, Ord, Outputable)
+
+topTermScopeDepth :: TermScopeDepth
+topTermScopeDepth = TermScopeDepth 0
+
+bumpTermScopeDepth :: TermScopeDepth -> TermScopeDepth
+bumpTermScopeDepth (TermScopeDepth d) = TermScopeDepth (d + 1)
+
+minTermScopeDepth :: TermScopeDepth -> TermScopeDepth -> TermScopeDepth
+minTermScopeDepth = min
+
+-- | Look up the contextual birth depth of a runtime 'Id'.
+-- Imported 'GlobalId's and module-level 'ExternalName' bindings have depth 0;
+-- local 'InternalName' bindings absent from the lexical depth map are out of scope.
+lookupIdTermDepth :: VarEnv TermScopeDepth -> Id -> Maybe TermScopeDepth
+lookupIdTermDepth id_depths v
+  | Just d <- lookupVarEnv id_depths v = Just d
+  | isGlobalId v || isExternalName (getName v) = Just topTermScopeDepth
+  | otherwise = Nothing
+
 {- *********************************************************************
 *                                                                      *
     Finding type family instances
@@ -994,25 +1026,57 @@ tcTyFamInsts = map (\(_,b,c) -> (b,c)) . tcTyFamInstsAndVis
 -- See also Note [Showing invisible bits of types in error messages]
 -- in "GHC.Tc.Errors.Ppr".
 tcTyFamInstsAndVis :: Type -> [(Bool, TyCon, [Type])]
-tcTyFamInstsAndVis = tcTyFamInstsAndVisX False
+tcTyFamInstsAndVis = tcTyFamInstsAndVisX False False
 
 tcTyFamInstsAndVisX
-  :: Bool -- ^ Is this an invisible argument to some type application?
+  :: Bool -- ^ Unfold unsaturated single-equation scoped closure families?
+  -> Bool -- ^ Is this an invisible argument to some type application?
   -> Type -> [(Bool, TyCon, [Type])]
-tcTyFamInstsAndVisX = go
+tcTyFamInstsAndVisX unfold_scoped = go
   where
     go is_invis_arg ty
       | Just exp_ty <- coreView ty     = go is_invis_arg exp_ty
     go _ (TyVarTy _)                   = []
+    go is_invis_arg (TermVarTy v)      = go is_invis_arg (varType v)
+                                         ++ go is_invis_arg (idMult v)
+    go is_invis_arg (TermAppTy f arg)  = go is_invis_arg (varType f)
+                                         ++ go is_invis_arg arg
+    go is_invis_arg (DepFunTy _ v ty)    = go is_invis_arg (varType v)
+                                         ++ go is_invis_arg (idMult v)
+                                         ++ go is_invis_arg ty
+    go is_invis_arg (DepDictTy d ty)     = go True (varType d)
+                                         ++ go is_invis_arg ty
+    go is_invis_arg (ClassAppTy sel inst dict arg kind)
+                                       = go True (varType sel)
+                                         ++ go True inst
+                                         ++ go True dict
+                                         ++ go is_invis_arg arg
+                                         ++ go True kind
     go is_invis_arg (TyConApp tc tys)
       | isTypeFamilyTyCon tc
-      = [(is_invis_arg, tc, take (tyConArity tc) tys)]
+      = case closedFamilyScope_maybe tc of
+          Just _
+            | unfold_scoped
+            , isUnsaturatedUserFamily tc tys
+            , Just ax <- closedFamilyTyConCoAxiom_maybe tc
+            , [branch] <- fromBranches (coAxiomBranches ax)
+            , Just lhs_tvs <- traverse repGetTyVar_maybe (coAxBranchLHS branch)
+            , sizeVarSet (mkVarSet lhs_tvs) == length lhs_tvs ->
+                let prefix_tvs = take (length tys) lhs_tvs
+                    rhs_inst   = substTyWith prefix_tvs tys (coAxBranchRHS branch)
+                in tcTyConAppTyFamInstsAndVisX True is_invis_arg tc tys
+                   ++ go is_invis_arg rhs_inst
+          _ -> [(is_invis_arg, tc, take (tyConArity tc) tys)]
       | otherwise
-      = tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys
+      = tcTyConAppTyFamInstsAndVisX unfold_scoped is_invis_arg tc tys
     go _            (LitTy {})         = []
-    go is_invis_arg (ForAllTy bndr ty) = go is_invis_arg (binderType bndr)
+    go is_invis_arg (ForAllTy ma bndr ty) = go True ma
+                                         ++ go is_invis_arg (binderType bndr)
                                          ++ go is_invis_arg ty
-    go is_invis_arg (FunTy _ w ty1 ty2)  =  go is_invis_arg ty1
+    go is_invis_arg (ExistsTy _ v ty)    = go is_invis_arg (varType v)
+                                         ++ go is_invis_arg ty
+    go is_invis_arg (FunTy _ ma w ty1 ty2) = go True ma
+                                         ++ go is_invis_arg ty1
                                          ++ go is_invis_arg w
                                          ++ go is_invis_arg ty2
     go is_invis_arg ty@(AppTy _ _)     =
@@ -1034,15 +1098,22 @@ tcTyFamInstsAndVisX = go
 -- See 'tcTyFamInstsAndVis' for more details on how this works (as this
 -- function is called inside of 'tcTyFamInstsAndVis').
 tcTyConAppTyFamInstsAndVis :: TyCon -> [Type] -> [(Bool, TyCon, [Type])]
-tcTyConAppTyFamInstsAndVis = tcTyConAppTyFamInstsAndVisX False
+tcTyConAppTyFamInstsAndVis = tcTyConAppTyFamInstsAndVisX False False
+
+-- | Find outermost type family applications in instance or family pattern
+-- arguments, unfolding unsaturated single-equation scoped closure families so
+-- dependent-sum patterns inspect their underlying payload.
+tcPatTyConAppTyFamInstsAndVis :: TyCon -> [Type] -> [(Bool, TyCon, [Type])]
+tcPatTyConAppTyFamInstsAndVis = tcTyConAppTyFamInstsAndVisX True False
 
 tcTyConAppTyFamInstsAndVisX
-  :: Bool -- ^ Is this an invisible argument to some type application?
+  :: Bool -- ^ Unfold unsaturated single-equation scoped closure families?
+  -> Bool -- ^ Is this an invisible argument to some type application?
   -> TyCon -> [Type] -> [(Bool, TyCon, [Type])]
-tcTyConAppTyFamInstsAndVisX is_invis_arg tc tys =
+tcTyConAppTyFamInstsAndVisX unfold_scoped is_invis_arg tc tys =
   let (invis_tys, vis_tys) = partitionInvisibleTypes tc tys
-  in concat $ map (tcTyFamInstsAndVisX True)         invis_tys
-           ++ map (tcTyFamInstsAndVisX is_invis_arg) vis_tys
+  in concat $ map (tcTyFamInstsAndVisX unfold_scoped True)         invis_tys
+           ++ map (tcTyFamInstsAndVisX unfold_scoped is_invis_arg) vis_tys
 
 isTyFamFree :: Type -> Bool
 -- ^ Check that a type does not contain any type family applications.
@@ -1091,14 +1162,32 @@ any_rewritable role tv_pred tc_pred ty
       | otherwise
       = go_tc under_fam bvs rl tc tys
 
+    go _ _ _ (TermVarTy {}) = False
+    -- Opaque call arguments have nominal role and are not injective positions.
+    go _ bvs _ (TermAppTy _ arg) = go True bvs NomEq arg
+    go uf bvs rl (DepFunTy _ v ty)
+      = go uf bvs NomEq (varType v) || go uf bvs NomEq (idMult v) || go uf (bvs `extendVarSet` v) rl ty
+    go uf bvs rl (DepDictTy d ty)
+      = go uf bvs NomEq (varType d) || go uf (bvs `extendVarSet` d) rl ty
+    go _ bvs _ (ClassAppTy sel inst dict arg kind)
+      = any (go True bvs NomEq) [varType sel, inst, dict, arg, kind]
+    go uf bvs rl (ExistsTy _ tv body)
+      | isTyVar tv
+      , typeKind (varType tv) `eqType` liftedTypeKind
+      , typeKind body `eqType` liftedTypeKind
+      = go uf (bvs `extendVarSet` tv) rl body
+      | otherwise
+      = False
     go uf bvs rl (TyVarTy tv)        = go_tv uf bvs rl tv
     go _  _    _ (LitTy {})          = False
-    go uf bvs rl (AppTy fun arg)     = go uf bvs rl fun || go uf bvs NomEq arg
-    go uf bvs rl (FunTy _ w arg res) = go uf bvs NomEq arg_rep || go uf bvs NomEq res_rep ||
+    go uf bvs rl (AppTy fun arg)     = go under bvs rl fun || go under bvs NomEq arg
+      where under = uf || not (isMatchableFunTy (typeKind fun))
+    go uf bvs rl (FunTy _ ma w arg res) = go uf bvs NomEq ma || go uf bvs NomEq arg_rep || go uf bvs NomEq res_rep ||
                                        go uf bvs rl arg || go uf bvs rl res || go uf bvs NomEq w
       where arg_rep = getRuntimeRep arg -- forgetting these causes #17024
             res_rep = getRuntimeRep res
-    go uf bvs rl (ForAllTy tv ty)   = go uf (bvs `extendVarSet` binderVar tv) rl ty
+    go uf bvs rl (ForAllTy ma tv ty) = go uf bvs NomEq ma
+                                    || go uf (bvs `extendVarSet` binderVar tv) rl ty
     go uf bvs rl (CastTy ty _)      = go uf bvs rl ty
     go _  _   _  (CoercionTy _)     = False
 
@@ -1378,6 +1467,24 @@ setMetaTyVarTcLevel tv tclvl
       details@(MetaTv {}) -> setTcTyVarDetails tv (details { mtv_tclvl = tclvl })
       _ -> pprPanic "metaTyVarTcLevel" (ppr tv)
 
+metaTyVarTermDepth :: TcTyVar -> TermScopeDepth
+metaTyVarTermDepth tv
+  = case tcTyVarDetails tv of
+      MetaTv { mtv_term_depth = d } -> d
+      _ -> pprPanic "metaTyVarTermDepth" (ppr tv)
+
+metaTyVarTermDepth_maybe :: TcTyVar -> Maybe TermScopeDepth
+metaTyVarTermDepth_maybe tv
+  = case tcTyVarDetails tv of
+      MetaTv { mtv_term_depth = d } -> Just d
+      _                             -> Nothing
+
+setMetaTyVarTermDepth :: TcTyVar -> TermScopeDepth -> TcTyVar
+setMetaTyVarTermDepth tv d
+  = case tcTyVarDetails tv of
+      details@(MetaTv {}) -> setTcTyVarDetails tv (details { mtv_term_depth = d })
+      _ -> pprPanic "setMetaTyVarTermDepth" (ppr tv)
+
 isTyVarTyVar :: Var -> Bool
 isTyVarTyVar tv
   = case tcTyVarDetails tv of
@@ -1431,21 +1538,21 @@ ambigTkvsOfTy ty
 
 -- | Make a sigma ty where all type variables are 'Inferred'. That is,
 -- they cannot be used with visible type application.
-mkInfSigmaTy :: HasDebugCallStack => [TyCoVar] -> [PredType] -> Type -> Type
-mkInfSigmaTy tyvars theta ty = mkSigmaTy (mkForAllTyBinders Inferred tyvars) theta ty
+mkInfSigmaTy :: HasDebugCallStack => [(Matchability, TyCoVar)] -> [PredType] -> Type -> Type
+mkInfSigmaTy tyvars theta ty = mkSigmaTy [(ma, Bndr tv Inferred) | (ma, tv) <- tyvars] theta ty
 
 -- | Make a sigma ty where all type variables are "specified". That is,
 -- they can be used with visible type application
-mkSpecSigmaTy :: HasDebugCallStack => [TyVar] -> [PredType] -> Type -> Type
-mkSpecSigmaTy tyvars preds ty = mkSigmaTy (mkForAllTyBinders Specified tyvars) preds ty
+mkSpecSigmaTy :: HasDebugCallStack => [(Matchability, TyVar)] -> [PredType] -> Type -> Type
+mkSpecSigmaTy tyvars preds ty = mkSigmaTy [(ma, Bndr tv Specified) | (ma, tv) <- tyvars] preds ty
 
-mkSigmaTy :: HasDebugCallStack => [ForAllTyBinder] -> [PredType] -> Type -> Type
+mkSigmaTy :: HasDebugCallStack => [(Matchability, ForAllTyBinder)] -> [PredType] -> Type -> Type
 -- Result is TypeLike
 mkSigmaTy bndrs theta tau = mkForAllTys bndrs (mkPhiTy theta tau)
 
 tcMkDFunSigmaTy :: [TyVar] -> ThetaType -> Type -> Type
 tcMkDFunSigmaTy tvs theta res_ty
- = mkForAllTys (mkForAllTyBinders Specified tvs) $
+ = mkForAllTys [(unmatchableDataConTy, Bndr tv Specified) | tv <- tvs] $
    tcMkDFunPhiTy theta res_ty
 
 mkPhiTy :: HasDebugCallStack => [PredType] -> Type -> Type
@@ -1467,16 +1574,39 @@ getDFunTyKey :: Type -> OccName -- Get some string from a type, to be used to
                                 -- construct a dictionary function name
 getDFunTyKey ty | Just ty' <- coreView ty = getDFunTyKey ty'
 getDFunTyKey (TyVarTy tv)            = getOccName tv
+getDFunTyKey (TermAppTy f _)         = getOccName f
+getDFunTyKey (TermVarTy v)           = getOccName v
+getDFunTyKey (DepFunTy {})           = mkVarOcc "foreach"
+getDFunTyKey (DepDictTy _ t)         = getDFunTyKey t
+getDFunTyKey (ClassAppTy sel _ _ _ _) = getOccName sel
+-- See Note [Existential types in instance arguments].
+getDFunTyKey ExistsTy{}              = mkVarOcc "exists"
 getDFunTyKey (TyConApp tc _)         = getOccName tc
 getDFunTyKey (LitTy x)               = getDFunTyLitKey x
 getDFunTyKey (AppTy fun _)           = getDFunTyKey fun
 getDFunTyKey (FunTy { ft_af = af })  = getOccName (funTyFlagTyCon af)
-getDFunTyKey (ForAllTy _ t)          = getDFunTyKey t
+getDFunTyKey (ForAllTy _ _ t)          = getDFunTyKey t
 getDFunTyKey (CastTy ty _)           = getDFunTyKey ty
 getDFunTyKey t@(CoercionTy _)        = pprPanic "getDFunTyKey" (ppr t)
 
+{- Note [Existential types in instance arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An instance argument can contain a first-class existential package.
+Use a fixed dictionary name component for the package head.
+GHC.Tc.Utils.Env chooses a distinct occurrence when two instances
+have the same component. The bound variable's name is irrelevant.
+
+The Paterson check counts the binder's kind and its body, just
+as it does for a quantified type. An occurrence of the witness in
+the body contributes to the size. Only free variables contribute
+to the variable occurrence check. Matching still uses the rules in
+Note [Opaque existential matching] in GHC.Core.Unify.
+-}
+
 getDFunTyLitKey :: TyLit -> OccName
 getDFunTyLitKey (NumTyLit n) = mkOccName Name.varName (show n)
+getDFunTyLitKey (IntPrimTyLit n) = mkOccName Name.varName (show n ++ "#")
+getDFunTyLitKey (WordPrimTyLit n) = mkOccName Name.varName (show n ++ "##")
 getDFunTyLitKey (StrTyLit n) = mkOccName Name.varName (show n)  -- hm
 getDFunTyLitKey (CharTyLit n) = mkOccName Name.varName (show n)
 
@@ -1488,83 +1618,84 @@ getDFunTyLitKey (CharTyLit n) = mkOccName Name.varName (show n)
 ************************************************************************
 -}
 
+-- See Note [Forall matchability metadata] in GHC.Core.TyCo.Rep.
 -- | Splits a forall type into a list of 'PiTyVarBinder's and the inner type.
 -- Always succeeds, even if it returns an empty list.
-tcSplitPiTys :: Type -> ([PiTyVarBinder], Type)
+tcSplitPiTys :: Type -> ([Type], [PiTyVarBinder], Type)
 tcSplitPiTys ty
-  = assert (all isTyBinder (fst sty))   -- No CoVar binders here
+  = assert (all isTyBinder bndrs)   -- No CoVar binders here
     sty
-  where sty = splitPiTys ty
+  where sty@(_, bndrs, _) = splitPiTys ty
 
 -- | Splits a type into a PiTyVarBinder and a body, if possible.
-tcSplitPiTy_maybe :: Type -> Maybe (PiTyVarBinder, Type)
+tcSplitPiTy_maybe :: Type -> Maybe (Type, PiTyVarBinder, Type)
 tcSplitPiTy_maybe ty
   = assert (isMaybeTyBinder sty)  -- No CoVar binders here
     sty
   where
     sty = splitPiTy_maybe ty
-    isMaybeTyBinder (Just (t,_)) = isTyBinder t
+    isMaybeTyBinder (Just (_,t,_)) = isTyBinder t
     isMaybeTyBinder _            = True
 
-tcSplitForAllTyVarBinder_maybe :: Type -> Maybe (TyVarBinder, Type)
+tcSplitForAllTyVarBinder_maybe :: Type -> Maybe (Matchability, TyVarBinder, Type)
 tcSplitForAllTyVarBinder_maybe ty | Just ty' <- coreView ty = tcSplitForAllTyVarBinder_maybe ty'
-tcSplitForAllTyVarBinder_maybe (ForAllTy tv ty) = assert (isTyVarBinder tv ) Just (tv, ty)
+tcSplitForAllTyVarBinder_maybe (ForAllTy ma tv ty) = assert (isTyVarBinder tv) Just (ma, tv, ty)
 tcSplitForAllTyVarBinder_maybe _                = Nothing
 
 -- | Like 'tcSplitPiTys', but splits off only named binders,
 -- returning just the tyvars.
-tcSplitForAllTyVars :: Type -> ([TyVar], Type)
+tcSplitForAllTyVars :: Type -> ([(Matchability, TyVar)], Type)
 tcSplitForAllTyVars ty
-  = assert (all isTyVar (fst sty)) sty
+  = assert (all (isTyVar . snd) (fst sty)) sty
   where sty = splitForAllTyCoVars ty
 
 -- | Like 'tcSplitForAllTyVars', but only splits 'ForAllTy's with 'Invisible'
 -- type variable binders.
-tcSplitForAllInvisTyVars :: Type -> ([TyVar], Type)
+tcSplitForAllInvisTyVars :: Type -> ([(Matchability, TyVar)], Type)
 tcSplitForAllInvisTyVars ty = tcSplitSomeForAllTyVars isInvisibleForAllTyFlag ty
 
 -- | Like 'tcSplitForAllTyVars', but only splits a 'ForAllTy' if @argf_pred argf@
 -- is 'True', where @argf@ is the visibility of the @ForAllTy@'s binder and
 -- @argf_pred@ is a predicate over visibilities provided as an argument to this
 -- function.
-tcSplitSomeForAllTyVars :: (ForAllTyFlag -> Bool) -> Type -> ([TyVar], Type)
+tcSplitSomeForAllTyVars :: (ForAllTyFlag -> Bool) -> Type -> ([(Matchability, TyVar)], Type)
 tcSplitSomeForAllTyVars argf_pred ty
   = split ty ty []
   where
-    split _ (ForAllTy (Bndr tv argf) ty) tvs
-      | argf_pred argf                             = split ty ty (tv:tvs)
+    split _ (ForAllTy ma (Bndr tv argf) ty) tvs
+      | argf_pred argf                             = split ty ty ((ma,tv):tvs)
     split orig_ty ty tvs | Just ty' <- coreView ty = split orig_ty ty' tvs
     split orig_ty _                            tvs = (reverse tvs, orig_ty)
 
-tcSplitForAllTyVarsReqTVBindersN :: Arity -> Type -> (Arity, [ForAllTyBinder], Type)
+tcSplitForAllTyVarsReqTVBindersN :: Arity -> Type -> (Arity, [(Matchability, ForAllTyBinder)], Type)
 -- Split off at most N /required/ (aka visible) binders, plus any invisible ones
 -- in the way, /and/ any trailing invisible ones
 tcSplitForAllTyVarsReqTVBindersN n_req ty
   = split n_req ty ty []
   where
-    split n_req _orig_ty (ForAllTy b@(Bndr _ argf) ty) bs
+    split n_req _orig_ty (ForAllTy ma b@(Bndr _ argf) ty) bs
       | isVisibleForAllTyFlag argf, n_req > 0  -- Split off a visible forall
-      = split (n_req - 1) ty ty (b:bs)
+      = split (n_req - 1) ty ty ((ma,b):bs)
       | isInvisibleForAllTyFlag argf           -- Split off an invisible forall,
-      = split n_req       ty ty (b:bs)         -- even if n_req=0, i.e. the trailing ones
+      = split n_req       ty ty ((ma,b):bs)         -- even if n_req=0, i.e. the trailing ones
     split n_req orig_ty ty bs | Just ty' <- coreView ty = split n_req orig_ty ty' bs
     split n_req orig_ty _ty bs                          = (n_req, reverse bs, orig_ty)
 
 -- | Like 'tcSplitForAllTyVars', but only splits 'ForAllTy's with 'Required' type
 -- variable binders. All split tyvars are annotated with '()'.
-tcSplitForAllReqTVBinders :: Type -> ([TcReqTVBinder], Type)
-tcSplitForAllReqTVBinders ty = assert (all isTyVarBinder (fst sty) ) sty
+tcSplitForAllReqTVBinders :: Type -> ([(Matchability, TcReqTVBinder)], Type)
+tcSplitForAllReqTVBinders ty = assert (all (isTyVarBinder . snd) (fst sty)) sty
   where sty = splitForAllReqTyBinders ty
 
 -- | Like 'tcSplitForAllTyVars', but only splits 'ForAllTy's with 'Invisible' type
 -- variable binders. All split tyvars are annotated with their 'Specificity'.
-tcSplitForAllInvisTVBinders :: Type -> ([TcInvisTVBinder], Type)
-tcSplitForAllInvisTVBinders ty = assert (all (isTyVar . binderVar) (fst sty)) sty
+tcSplitForAllInvisTVBinders :: Type -> ([(Matchability, TcInvisTVBinder)], Type)
+tcSplitForAllInvisTVBinders ty = assert (all (isTyVar . binderVar . snd) (fst sty)) sty
   where sty = splitForAllInvisTyBinders ty
 
 -- | Like 'tcSplitForAllTyVars', but splits off only named binders.
-tcSplitForAllTyVarBinders :: Type -> ([TyVarBinder], Type)
-tcSplitForAllTyVarBinders ty = assert (all isTyVarBinder (fst sty)) sty
+tcSplitForAllTyVarBinders :: Type -> ([(Matchability, TyVarBinder)], Type)
+tcSplitForAllTyVarBinders ty = assert (all (isTyVarBinder . snd) (fst sty)) sty
   where sty = splitForAllForAllTyBinders ty
 
 tcSplitPredFunTy_maybe :: Type -> Maybe (PredType, Type)
@@ -1589,30 +1720,30 @@ tcSplitPhiTy ty
 -- | Split a sigma type into its parts. This only splits /invisible/ type
 -- variable binders, as these are the only forms of binder that the typechecker
 -- will implicitly instantiate.
-tcSplitSigmaTy :: Type -> ([TyVar], ThetaType, Type)
+tcSplitSigmaTy :: Type -> ([(Matchability, TyVar)], ThetaType, Type)
 tcSplitSigmaTy ty = case tcSplitForAllInvisTyVars ty of
                         (tvs, rho) -> case tcSplitPhiTy rho of
                                         (theta, tau) -> (tvs, theta, tau)
 
-tcSplitSigmaTyBndrs :: Type -> ([TcInvisTVBinder], ThetaType, Type)
+tcSplitSigmaTyBndrs :: Type -> ([(Matchability, TcInvisTVBinder)], ThetaType, Type)
 tcSplitSigmaTyBndrs ty = case tcSplitForAllInvisTVBinders ty of
                         (tvs, rho) -> case tcSplitPhiTy rho of
                                         (theta, tau) -> (tvs, theta, tau)
 
 -- | Split a sigma type into its parts, going underneath as many arrows
 -- and foralls as possible. See Note [tcSplitNestedSigmaTys]
-tcSplitNestedSigmaTys :: Type -> ([TyVar], ThetaType, Type)
+tcSplitNestedSigmaTys :: Type -> ([(Matchability, TyVar)], ThetaType, Type)
 -- See Note [tcSplitNestedSigmaTys]
 -- NB: This is basically a pure version of deeplyInstantiate (from Unify) that
 --     doesn't compute an HsWrapper.
 tcSplitNestedSigmaTys ty
     -- If there's a forall, split it apart and try splitting the rho type
     -- underneath it.
-  | (arg_tys, body_ty)   <- tcSplitFunTys ty
+  | (mas, arg_tys, body_ty) <- tcSplitFunTys ty
   , (tvs1, theta1, rho1) <- tcSplitSigmaTy body_ty
   , not (null tvs1 && null theta1)
   = let (tvs2, theta2, rho2) = tcSplitNestedSigmaTys rho1
-    in (tvs1 ++ tvs2, theta1 ++ theta2, mkScaledFunTys arg_tys rho2)
+    in (tvs1 ++ tvs2, theta1 ++ theta2, mkScaledFunTys (zip mas arg_tys) rho2)
 
     -- If there's no forall, we're done.
   | otherwise = ([], [], ty)
@@ -1664,19 +1795,19 @@ tcTyConAppArgs ty = case tcSplitTyConApp_maybe ty of
                         Nothing        -> pprPanic "tcTyConAppArgs" (pprType ty)
 
 -----------------------
-tcSplitFunTys :: Type -> ([Scaled Type], Type)
+tcSplitFunTys :: Type -> ([Type], [Scaled Type], Type)
 tcSplitFunTys ty = case tcSplitFunTy_maybe ty of
-                        Nothing        -> ([], ty)
-                        Just (arg,res) -> (arg:args, res')
+                        Nothing           -> ([], [], ty)
+                        Just (ma,arg,res) -> (ma:mas, arg:args, res')
                                        where
-                                          (args,res') = tcSplitFunTys res
+                                          (mas,args,res') = tcSplitFunTys res
 
-tcSplitFunTy_maybe :: Type -> Maybe (Scaled Type, Type)
+tcSplitFunTy_maybe :: Type -> Maybe (Type, Scaled Type, Type)
 -- Only splits function (->) and (-=>), not (=>) or (==>)
 tcSplitFunTy_maybe ty
   | Just ty' <- coreView ty = tcSplitFunTy_maybe ty'
-tcSplitFunTy_maybe (FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res })
-  | isVisibleFunArg af = Just (Scaled w arg, res)
+tcSplitFunTy_maybe (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res })
+  | isVisibleFunArg af = Just (ma, Scaled w arg, res)
 tcSplitFunTy_maybe _   = Nothing
         -- Note the isVisibleFunArg guard
         -- Consider     (?x::Int) => Bool
@@ -1689,35 +1820,36 @@ tcSplitFunTy_maybe _   = Nothing
 tcSplitFunTysN :: Arity                      -- n: Number of desired args
                -> TcRhoType
                -> Either Arity               -- Number of missing arrows
-                        ([Scaled TcSigmaType],-- Arg types (always N types)
+                        ([Type],              -- Matchabilities (always N types)
+                         [Scaled TcSigmaType],-- Arg types (always N types)
                          TcSigmaType)        -- The rest of the type
 -- ^ Split off exactly the specified number argument types
 -- Returns
 --  (Left m) if there are 'm' missing arrows in the type
---  (Right (tys,res)) if the type looks like t1 -> ... -> tn -> res
+--  (Right (mas,tys,res)) includes each arrow matchability.
 tcSplitFunTysN n ty
  | n == 0
- = Right ([], ty)
- | Just (arg,res) <- tcSplitFunTy_maybe ty
+ = Right ([], [], ty)
+ | Just (ma,arg,res) <- tcSplitFunTy_maybe ty
  = case tcSplitFunTysN (n-1) res of
      Left m            -> Left m
-     Right (args,body) -> Right (arg:args, body)
+     Right (mas,args,body) -> Right (ma:mas, arg:args, body)
  | otherwise
  = Left n
 
-tcSplitFunTy :: Type -> (Scaled Type, Type)
+tcSplitFunTy :: Type -> (Type, Scaled Type, Type)
 tcSplitFunTy  ty = expectJust (tcSplitFunTy_maybe ty)
 
 tcFunArgTy :: Type -> Scaled Type
-tcFunArgTy ty = fst (tcSplitFunTy ty)
+tcFunArgTy ty = case tcSplitFunTy ty of (_,arg,_) -> arg
 
 tcFunResultTy :: Type -> Type
-tcFunResultTy ty = snd (tcSplitFunTy ty)
+tcFunResultTy ty = case tcSplitFunTy ty of (_,_,res) -> res
 
 -- | Strips off n *visible* arguments and returns the resulting type
 tcFunResultTyN :: HasDebugCallStack => Arity -> Type -> Type
 tcFunResultTyN n ty
-  | Right (_, res_ty) <- tcSplitFunTysN n ty
+  | Right (_, _, res_ty) <- tcSplitFunTysN n ty
   = res_ty
   | otherwise
   = pprPanic "tcFunResultTyN" (ppr n <+> ppr ty)
@@ -1750,7 +1882,7 @@ tcIsTyVarTy (TyVarTy _)   = True
 tcIsTyVarTy _             = False
 
 -----------------------
-tcSplitQuantPredTy :: Type -> ([TyVar], [Type], PredType)
+tcSplitQuantPredTy :: Type -> ([(Matchability, TyVar)], [Type], PredType)
 -- Split up the type of a quantified predicate
 --    forall tys, theta => head
 -- NB splitFunTys, not tcSplitFunTys;
@@ -1758,10 +1890,10 @@ tcSplitQuantPredTy :: Type -> ([TyVar], [Type], PredType)
 -- and we don't want to do that here
 tcSplitQuantPredTy ty
   = case tcSplitForAllInvisTyVars ty of { (tvs, rho)    ->
-    case splitFunTys rho             of { (theta, head) ->
+    case splitFunTys rho             of { (_, theta, head) ->
     (tvs, map scaledThing theta, head) }}
 
-tcSplitDFunTy :: Type -> ([TyVar], [Type], Class, [Type])
+tcSplitDFunTy :: Type -> ([(Matchability, TyVar)], [Type], Class, [Type])
 -- Split the type of a dictionary function
 tcSplitDFunTy ty
   = case tcSplitQuantPredTy ty of { (tvs, theta, head)  ->
@@ -1771,7 +1903,7 @@ tcSplitDFunTy ty
 tcSplitDFunHead :: Type -> (Class, [Type])
 tcSplitDFunHead = getClassPredTys
 
-tcSplitMethodTy :: Type -> ([TyVar], PredType, Type)
+tcSplitMethodTy :: Type -> ([(Matchability, TyVar)], PredType, Type)
 -- A class method (selector) always has a type like
 --   forall as. C as => blah
 -- So if the class looks like
@@ -2032,7 +2164,8 @@ isSigmaTy :: TcType -> Bool
 --     ?x::Int => blah
 -- But NOT
 --     forall a -> blah
-isSigmaTy (ForAllTy (Bndr _ af) _)     = isInvisibleForAllTyFlag af
+isSigmaTy (ForAllTy _ (Bndr _ af) _)     = isInvisibleForAllTyFlag af
+isSigmaTy DepDictTy{}                    = True
 isSigmaTy (FunTy { ft_af = af })       = isInvisibleFunArg af
 isSigmaTy ty | Just ty' <- coreView ty = isSigmaTy ty'
 isSigmaTy _                            = False
@@ -2050,7 +2183,9 @@ isOverloadedTy :: Type -> Bool
 -- Yes for a type of a function that might require evidence-passing
 -- Used by bindLocalMethods and for -fprof-late-overloaded
 isOverloadedTy ty | Just ty' <- coreView ty = isOverloadedTy ty'
-isOverloadedTy (ForAllTy _  ty)             = isOverloadedTy ty
+isOverloadedTy (ForAllTy _ _ ty)             = isOverloadedTy ty
+isOverloadedTy (DepFunTy _ _ ty)             = isOverloadedTy ty
+isOverloadedTy DepDictTy{}                   = True
 isOverloadedTy (FunTy { ft_af = af })       = isInvisibleFunArg af
 isOverloadedTy _                            = False
 
@@ -2206,7 +2341,8 @@ tyConVisibilities :: TyCon -> [Bool]
 tyConVisibilities tc = tc_binder_viss ++ tc_return_kind_viss ++ repeat True
   where
     tc_binder_viss      = map isVisibleTyConBinder (tyConBinders tc)
-    tc_return_kind_viss = map isVisiblePiTyBinder (fst $ tcSplitPiTys (tyConResKind tc))
+    tc_return_kind_viss = let (_, bndrs, _) = tcSplitPiTys (tyConResKind tc)
+                          in map isVisiblePiTyBinder bndrs
 
 -- | If the tycon is applied to the types, is the next argument visible?
 isNextTyConArgVisible :: TyCon -> [Type] -> Bool
@@ -2217,7 +2353,7 @@ isNextTyConArgVisible tc tys
 -- E.g. (s t): is `t` a visible argument of `s`?
 isNextArgVisible :: TcType -> Bool
 isNextArgVisible ty
-  | Just (bndr, _) <- tcSplitPiTy_maybe (typeKind ty) = isVisiblePiTyBinder bndr
+  | Just (_, bndr, _) <- tcSplitPiTy_maybe (typeKind ty) = isVisiblePiTyBinder bndr
   | otherwise                                         = True
     -- this second case might happen if, say, we have an unzonked TauTv.
     -- But TauTvs can't range over types that take invisible arguments
@@ -2385,15 +2521,33 @@ pSizeTypes = pSizeTypesX emptyVarSet pSizeZero
 -- This ignores coercions, as coercions aren't user-written
 pSizeTypeX :: VarSet -> Type -> PatersonSize
 pSizeTypeX bvs ty | Just exp_ty <- coreView ty = pSizeTypeX bvs exp_ty
+pSizeTypeX bvs (TermAppTy f arg)
+  = pSizeTypeX bvs (varType f) `addPSize` pSizeTypeX bvs arg
+pSizeTypeX bvs (TermVarTy v)
+  | v `elemVarSet` bvs = pSizeOne
+  | otherwise          = pSizeOne `addPSize` pSizeTypeX bvs (varType v)
+pSizeTypeX bvs (DepFunTy _ v body)
+  = pSizeTypeX bvs (idMult v) `addPSize`
+    pSizeTypeX bvs (varType v) `addPSize`
+    pSizeTypeX (bvs `extendVarSet` v) body
+pSizeTypeX bvs (DepDictTy d body)
+  = pSizeTypeX bvs (varType d) `addPSize`
+    pSizeTypeX (bvs `extendVarSet` d) body
+pSizeTypeX bvs (ClassAppTy _ inst dict arg kind)
+  = pSizeTypesX bvs pSizeOne [inst, dict, arg, kind]
 pSizeTypeX bvs (TyVarTy tv)
   | tv `elemVarSet` bvs                  = pSizeOne
   | otherwise                            = PS_Vanilla { ps_tvs = [tv], ps_size = 1 }
 pSizeTypeX _   (LitTy {})                = pSizeOne
 pSizeTypeX bvs (TyConApp tc tys)         = pSizeTyConAppX bvs tc tys
 pSizeTypeX bvs (AppTy fun arg)           = pSizeTypeX bvs fun `addPSize` pSizeTypeX bvs arg
-pSizeTypeX bvs (FunTy _ w arg res)       = pSizeTypeX bvs w `addPSize` pSizeTypeX bvs arg `addPSize`
+pSizeTypeX bvs (FunTy _ ma w arg res)    = pSizeTypeX bvs ma `addPSize` pSizeTypeX bvs w `addPSize` pSizeTypeX bvs arg `addPSize`
                                            pSizeTypeX bvs res
-pSizeTypeX bvs (ForAllTy (Bndr tv _) ty) = pSizeTypeX bvs (tyVarKind tv) `addPSize`
+pSizeTypeX bvs (ExistsTy _ tv body)     = pSizeTypeX bvs (tyVarKind tv) `addPSize`
+                                           pSizeTypeX (bvs `extendVarSet` tv) body
+  -- See Note [Existential types in instance arguments].
+pSizeTypeX bvs (ForAllTy ma (Bndr tv _) ty) = pSizeTypeX bvs ma `addPSize`
+                                           pSizeTypeX bvs (tyVarKind tv) `addPSize`
                                            pSizeTypeX (bvs `extendVarSet` tv) ty
 pSizeTypeX bvs (CastTy ty _)             = pSizeTypeX bvs ty
 pSizeTypeX _   (CoercionTy {})           = pSizeOne

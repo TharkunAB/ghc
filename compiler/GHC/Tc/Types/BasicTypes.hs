@@ -4,10 +4,13 @@ module GHC.Tc.Types.BasicTypes (
   , TcId
   , TcBinder(..)
 
+  -- * Givens in the current source scope
+  , LexicalGivens(..), emptyLexicalGivens
+
   -- * Signatures
   , TcSigFun, TcSigInfo(..), TcIdSig(..)
   , TcCompleteSig(..), TcPartialSig(..), TcPatSynSig(..)
-  , TcIdSigInst(..)
+  , TcIdSigInst(..), TcPendingTypeCall(..)
   , isPartialSig, hasCompleteSig
   , tcSigInfoName, tcIdSigLoc, completeSigPolyId_maybe
 
@@ -94,6 +97,16 @@ instance HasOccName TcBinder where
 -- GHC.Tc.Solver uses them, and GHC.Tc.Solver is fairly
 -- low down in the module hierarchy
 
+-- | Evidence parameters and written premises in the current source scope.
+-- See Note [Lexical Givens] in GHC.Tc.Utils.Monad.
+data LexicalGivens = LexicalGivens
+  { lexicalEvidence :: [EvVar]
+  , partialSigPredicates :: TcThetaType }
+
+-- | The initial context for a module or static form.
+emptyLexicalGivens :: LexicalGivens
+emptyLexicalGivens = LexicalGivens [] []
+
 type TcSigFun  = Name -> Maybe TcSigInfo
 
 -- TcSigInfo is simply the range of TcSigFun
@@ -157,11 +170,17 @@ wildcards in the type signature, i.e. iff sig_wcs is empty and
 sig_extra_cts is Nothing.
 -}
 
+-- | An imported call awaiting inference of its checked operand. This
+-- obligation is owned by its partial signature and never enters Core.
+data TcPendingTypeCall = TcPendingTypeCall SrcSpan Id TcType TcType
+
 data TcIdSigInst
   = TISI { sig_inst_sig :: TcIdSig
 
-         , sig_inst_skols :: [(Name, InvisTVBinder)]
-               -- Instantiated type and kind variables, TyVarTvs
+         , sig_inst_skols :: [(Name, (Matchability, InvisTVBinder))]
+               -- Instantiated type and kind variables, TyVarTvs.
+               -- Preserve each binder's Matchability annotation.
+               -- See Note [Forall matchability metadata] in GHC.Core.TyCo.Rep.
                -- The Name is the Name that the renamer chose;
                --   but the TcTyVar may come from instantiating
                --   the type and hence have a different unique.
@@ -186,6 +205,10 @@ data TcIdSigInst
                -- Like sig_inst_skols, but for /named/ wildcards (_a etc).
                -- The named wildcards scope over the binding, and hence
                -- their Names may appear in type signatures in the binding
+
+         , sig_inst_calls :: [TcPendingTypeCall]
+               -- Owned by the signature instance. Discharged before
+               -- inference can quantify or export the type.
 
          , sig_inst_wcx   :: Maybe TcType
                -- Extra-constraints wildcard to fill in, if any
@@ -318,6 +341,11 @@ data TcTyThing
 
   | APromotionErr PromotionErr
 
+  | ATcTypeLet Name TcType TcKind    -- A checked lexical type let
+
+  -- A lifted type-let RHS and its lexical capture parameters.
+  | ATcCaseLet [TyVar] TcType TcKind (Maybe TyCon)
+
 -- | Matches on either a global 'TyCon' or a 'TcTyCon'.
 tcTyThingTyCon_maybe :: TcTyThing -> Maybe TyCon
 tcTyThingTyCon_maybe (AGlobal (ATyCon tc)) = Just tc
@@ -330,6 +358,8 @@ instance Outputable TcTyThing where     -- Debugging only
                           brackets (ppr (tct_id elt) <> dcolon
                                  <> ppr (varType (tct_id elt)) <> comma
                                  <+> ppr (tct_info elt))
+   ppr (ATcTypeLet n ty ki) = text "Type let" <+> ppr n <+> equals <+> ppr ty <+> dcolon <+> ppr ki
+   ppr (ATcCaseLet vs ty ki _) = text "Case let" <+> ppr vs <+> equals <+> ppr ty <+> dcolon <+> ppr ki
    ppr (ATyVar n tv)    = text "Type variable" <+> quotes (ppr n) <+> equals <+> ppr tv
                             <+> dcolon <+> ppr (varType tv)
    ppr (ATcTyCon tc)    = text "ATcTyCon" <+> ppr tc <+> dcolon <+> ppr (tyConKind tc)
@@ -460,6 +490,8 @@ pprTcTyThingCategory = text . capitalise . tcTyThingCategory
 
 tcTyThingCategory :: TcTyThing -> String
 tcTyThingCategory (AGlobal thing)    = tyThingCategory thing
+tcTyThingCategory (ATcTypeLet{})    = "local type alias"
+tcTyThingCategory (ATcCaseLet{})    = "local type alias"
 tcTyThingCategory (ATyVar {})        = "type variable"
 tcTyThingCategory (ATcId {})         = "local identifier"
 tcTyThingCategory (ATcTyCon {})      = "local tycon"

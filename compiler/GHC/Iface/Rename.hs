@@ -46,6 +46,7 @@ import qualified Data.Traversable as T
 
 import Data.IORef
 import Data.Function ((&))
+import Data.List (isPrefixOf)
 
 tcRnMsgMaybe :: IO (Either (Messages TcRnMessage) a) -> TcM a
 tcRnMsgMaybe do_this = do
@@ -304,7 +305,36 @@ rnIfaceGlobal n = do
     hmap <- getHoleSubst
     let m = nameModule n
         m' = renameHoleModule unit_state hmap m
+        occ = nameOccName n
     case () of
+     _ | isNeverExportedDepOcc occ
+      -> setNameModule (Just m') n
+       | Just term_occ <- sourceTableTermOcc occ
+      -> if not (isHoleModule m)
+           then setNameModule (Just m') n
+           else if m' == iface_semantic_mod && isHoleModule m'
+             then do
+               let probe = mkExternalName (nameUnique n) m' term_occ (nameSrcSpan n)
+               case mb_nsubst >>= (`maybeSubstNameShape` probe) of
+                 Just term' ->
+                   let fam_occ = mkSourceTableOcc (nameOccName term')
+                       fam_tmp = mkExternalName (nameUnique n) (nameModule term') fam_occ (nameSrcSpan n)
+                   in setNameModule (Just (nameModule term')) fam_tmp
+                 Nothing -> setNameModule (Just m') n
+             else do
+               let m'' = if isHoleModule m'
+                           then mkHomeModule home_unit (moduleName m')
+                           else m'
+               iface <- liftIO . initIfaceCheck (text "rnIfaceGlobal") hsc_env
+                               $ loadSysInterface (text "rnIfaceGlobal") m''
+               let nsubst = mkNameShape (moduleName m) (mi_exports iface)
+                   probe  = mkExternalName (nameUnique n) m term_occ (nameSrcSpan n)
+               case maybeSubstNameShape nsubst probe of
+                 Just term' ->
+                   let fam_occ = mkSourceTableOcc (nameOccName term')
+                       fam_tmp = mkExternalName (nameUnique n) (nameModule term') fam_occ (nameSrcSpan n)
+                   in setNameModule (Just (nameModule term')) fam_tmp
+                 Nothing -> setNameModule (Just m') n
        -- Did we encounter {A.T} while renaming p[A=<B>]:A? If so,
        -- do NOT assume B.hi is available.
        -- In this case, rename {A.T} to {B.T} but don't look up exports.
@@ -361,6 +391,26 @@ rnIfaceNeverExported name = do
     -- Doublecheck that this DFun/coercion axiom was, indeed, locally defined.
     massertPpr (iface_semantic_mod == m) (ppr iface_semantic_mod <+> ppr m)
     setNameModule (Just m) name
+
+isNeverExportedDepOcc :: OccName -> Bool
+isNeverExportedDepOcc occ =
+    any (`isPrefixOf` s)
+      [ "$some"
+      , "$lambda"
+      , "$case:"
+      , "$case-node:"
+      , "$case-let-rhs:"
+      , "$signature-lambda:"
+      , "$signature-sum:"
+      , "$depfun$"
+      , "T:#"
+      , "T:$"
+      , "U:"
+      , "D:R:"
+      , "TFCo:R:"
+      ]
+  where
+    s = occNameString occ
 
 -- Note [rnIfaceNeverExported]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -501,10 +551,12 @@ rnIfaceDecl = \case
     , ifType      = ty0
     , ifIdDetails = details0
     , ifIdInfo    = info0
+    , ifIdSourceProofRules = deps0
     } -> do
     name <-
       case details0 of
         IfDFunId -> rnIfaceNeverExported name0
+        IfSourceDFunId{} -> rnIfaceNeverExported name0
         _ | isDefaultMethodOcc (occName name0)
           -> rnIfaceNeverExported name0
         -- Typeable bindings. See Note [Grand plan for Typeable].
@@ -514,12 +566,14 @@ rnIfaceDecl = \case
     ty      <- rnIfaceType ty0
     details <- rnIfaceIdDetails details0
     info    <- rnIfaceIdInfo info0
+    deps    <- traverse rnSourceProofRule deps0
     return $
       IfaceId  -- See Note [Prefer explicit record construction]
         { ifName      = name
         , ifType      = ty
         , ifIdDetails = details
         , ifIdInfo    = info
+        , ifIdSourceProofRules = deps
         }
   IfaceData
     { ifName       = name0
@@ -561,6 +615,7 @@ rnIfaceDecl = \case
     , ifKind    = syn_kind0
     , ifResKind = syn_reskind0
     , ifSynRhs  = syn_rhs0
+    , ifSynSourceProofRules = deps0
     , ifRoles   = roles
     } -> do
       name        <- rnIfaceGlobal name0
@@ -568,6 +623,7 @@ rnIfaceDecl = \case
       syn_kind    <- rnIfaceType syn_kind0
       syn_reskind <- rnIfaceType syn_reskind0
       syn_rhs     <- rnIfaceType syn_rhs0
+      deps        <- traverse rnSourceProofRule deps0
       return $
         IfaceSynonym  -- See Note [Prefer explicit record construction]
           { ifName    = name
@@ -575,6 +631,7 @@ rnIfaceDecl = \case
           , ifKind    = syn_kind
           , ifResKind = syn_reskind
           , ifSynRhs  = syn_rhs
+          , ifSynSourceProofRules = deps
           , ifRoles   = roles
           }
   IfaceFamily
@@ -628,16 +685,21 @@ rnIfaceDecl = \case
     { ifName       = name0
     , ifTyCon      = tycon0
     , ifAxBranches = ax_branches0
+    , ifAxSourceSpans = spans
+    , ifAxSourceProofRules = deps0
     , ifRole       = role
     } -> do
     name        <- rnIfaceNeverExported name0
     tycon       <- rnIfaceTyCon tycon0
     ax_branches <- mapM rnIfaceAxBranch ax_branches0
+    deps        <- traverse (\(index, rules) -> (index,) <$> traverse rnSourceProofRule rules) deps0
     return $
       IfaceAxiom  -- See Note [Prefer explicit record construction]
         { ifName       = name
         , ifTyCon      = tycon
         , ifAxBranches = ax_branches
+        , ifAxSourceSpans = spans
+        , ifAxSourceProofRules = deps
         , ifRole       = role
         }
   IfacePatSyn
@@ -706,10 +768,15 @@ rnIfaceFamTyConFlav (IfaceClosedTypeFamilyTyCon ctf)
         IfaceAbstractClosedTyFamTyCon -> pure IfaceAbstractClosedTyFamTyCon
         IfaceBuiltInClosedTyFamTyCon -> pure IfaceBuiltInClosedTyFamTyCon
         IfaceClosedTyFamTyCon mb_ax -> IfaceClosedTyFamTyCon <$> traverse rn_coax mb_ax
+        IfaceScopedClosedTyFamTyCon owner is_sum ax ->
+          IfaceScopedClosedTyFamTyCon <$> rnIfaceNeverExported owner
+                                     <*> pure is_sum <*> rn_coax ax
+        IfaceLambdaClosedTyFamTyCon ax -> IfaceLambdaClosedTyFamTyCon <$> rn_coax ax
   where
     rn_coax (n, axs) = ((,) <$> rnIfaceNeverExported n
                             <*> mapM rnIfaceAxBranch axs)
 rnIfaceFamTyConFlav IfaceOpenTypeFamilyTyCon = pure IfaceOpenTypeFamilyTyCon
+rnIfaceFamTyConFlav IfaceConstrainedTypeFamilyTyCon = pure IfaceConstrainedTypeFamilyTyCon
 rnIfaceFamTyConFlav IfaceDataFamilyTyCon = pure IfaceDataFamilyTyCon
 
 rnIfaceAT :: Rename IfaceAT
@@ -726,7 +793,7 @@ rnIfaceTyConParent IfNoParent = pure IfNoParent
 rnIfaceConDecls :: Rename IfaceConDecls
 rnIfaceConDecls (IfDataTyCon type_data ds)
     = IfDataTyCon type_data <$> mapM rnIfaceConDecl ds
-rnIfaceConDecls (IfNewTyCon d) = IfNewTyCon <$> rnIfaceConDecl d
+rnIfaceConDecls (IfNewTyCon rep_poly d) = IfNewTyCon rep_poly <$> rnIfaceConDecl d
 rnIfaceConDecls IfAbstractTyCon = pure IfAbstractTyCon
 
 rnIfaceConDecl :: Rename IfaceConDecl
@@ -738,11 +805,14 @@ rnIfaceConDecl
           , ifConEqSpec        = con_eq_spec0
           , ifConCtxt          = con_ctxt0
           , ifConArgTys        = con_arg_tys0
+          , ifConArgBinders    = con_arg_binders
+          , ifConRetainedFlags = con_retained_flags
           , ifConFields        = con_fields0
           , ifConStricts       = con_stricts0
           , ifConWrapper       = con_wrapper
           , ifConInfix         = con_infix
           , ifConSrcStricts    = con_src_stricts
+          , ifConSourceOrder    = source_order
           } ) = do
     let rnIfConEqSpec (n,t) = (,) n <$> rnIfaceType t
         rnIfaceBang (IfUnpackCo co) = IfUnpackCo <$> rnIfaceCo co
@@ -766,11 +836,14 @@ rnIfaceConDecl
         , ifConEqSpec        = con_eq_spec
         , ifConCtxt          = con_ctxt
         , ifConArgTys        = con_arg_tys
+        , ifConArgBinders    = con_arg_binders
+        , ifConRetainedFlags = con_retained_flags
         , ifConFields        = con_fields
         , ifConStricts       = con_stricts
         , ifConWrapper       = con_wrapper
         , ifConInfix         = con_infix
         , ifConSrcStricts    = con_src_stricts
+        , ifConSourceOrder    = source_order
         }
 
 rnIfaceClassOp :: Rename IfaceClassOp
@@ -833,8 +906,17 @@ rnIfaceExpr (IfaceCo co) = IfaceCo <$> rnIfaceCo co
 rnIfaceExpr (IfaceTuple sort args) = IfaceTuple sort <$> rnIfaceExprs args
 rnIfaceExpr (IfaceLam lam_bndr expr)
     = IfaceLam <$> rnIfaceLamBndr lam_bndr <*> rnIfaceExpr expr
+rnIfaceExpr (IfacePack schema witness payload)
+    = IfacePack <$> rnIfaceType schema <*> rnIfaceType witness <*> rnIfaceExpr payload
+rnIfaceExpr (IfaceUnpack witness value package body)
+    = IfaceUnpack <$> rnIfaceTvBndr witness <*> rnIfaceIdBndr value
+                  <*> rnIfaceExpr package <*> rnIfaceExpr body
 rnIfaceExpr (IfaceApp fun arg)
     = IfaceApp <$> rnIfaceExpr fun <*> rnIfaceExpr arg
+rnIfaceExpr (IfaceIndexedConArg shape arg) = IfaceIndexedConArg shape <$> rnIfaceExpr arg
+rnIfaceExpr (IfaceRetainedCharArg arg) = IfaceRetainedCharArg <$> rnIfaceExpr arg
+rnIfaceExpr (IfaceRetainedNaturalArg arg) = IfaceRetainedNaturalArg <$> rnIfaceExpr arg
+rnIfaceExpr (IfaceDictApp f dict) = IfaceDictApp <$> rnIfaceExpr f <*> pure dict
 rnIfaceExpr (IfaceCase scrut case_bndr alts)
     = IfaceCase <$> rnIfaceExpr scrut
                 <*> pure case_bndr
@@ -879,6 +961,14 @@ rnIfaceAlt (IfaceAlt conalt names rhs)
 
 rnIfaceConAlt :: Rename IfaceConAlt
 rnIfaceConAlt (IfaceDataAlt data_occ) = IfaceDataAlt <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceDataAltWithProof data_occ) = IfaceDataAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceRetainedSiblingsAltWithProof data_occ) = IfaceRetainedSiblingsAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceIndexedDataAltWithProof data_occ) = IfaceIndexedDataAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceIndexedFieldsAltWithProof data_occ) = IfaceIndexedFieldsAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceIndexedOrdinaryAltWithProof data_occ) = IfaceIndexedOrdinaryAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceIndexedDiagonalAltWithProof data_occ) = IfaceIndexedDiagonalAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceOpaqueOrdinaryAltWithProof data_occ) = IfaceOpaqueOrdinaryAltWithProof <$> rnIfaceGlobal data_occ
+rnIfaceConAlt (IfaceIndexedExistentialAltWithProof data_occ) = IfaceIndexedExistentialAltWithProof <$> rnIfaceGlobal data_occ
 rnIfaceConAlt alt = pure alt
 
 rnIfaceLetBndr :: Rename IfaceLetBndr
@@ -895,7 +985,10 @@ rnIfaceMCo (IfaceMCo co) = IfaceMCo <$> rnIfaceCo co
 rnIfaceCo :: Rename IfaceCoercion
 rnIfaceCo (IfaceReflCo ty)              = IfaceReflCo <$> rnIfaceType ty
 rnIfaceCo (IfaceGReflCo role ty mco)    = IfaceGReflCo role <$> rnIfaceType ty <*> rnIfaceMCo mco
-rnIfaceCo (IfaceFunCo role w co1 co2)   = IfaceFunCo role <$> rnIfaceCo w <*> rnIfaceCo co1 <*> rnIfaceCo co2
+rnIfaceCo (IfaceFunCo role ma w co1 co2) = IfaceFunCo role <$> rnIfaceCo ma <*> rnIfaceCo w <*> rnIfaceCo co1 <*> rnIfaceCo co2
+rnIfaceCo (IfaceTermAppCo fun co) = IfaceTermAppCo fun <$> rnIfaceCo co
+rnIfaceCo (IfaceDepFunCo visL visR bndr domain co)
+    = IfaceDepFunCo visL visR <$> rnIfaceIdBndr bndr <*> rnIfaceMCo domain <*> rnIfaceCo co
 rnIfaceCo (IfaceTyConAppCo role tc cos) = IfaceTyConAppCo role <$> rnIfaceTyCon tc <*> mapM rnIfaceCo cos
 rnIfaceCo (IfaceAppCo co1 co2)          = IfaceAppCo <$> rnIfaceCo co1 <*> rnIfaceCo co2
 rnIfaceCo (IfaceFreeCoVar c)            = pure (IfaceFreeCoVar c)
@@ -907,15 +1000,27 @@ rnIfaceCo (IfaceInstCo c1 c2)           = IfaceInstCo <$> rnIfaceCo c1 <*> rnIfa
 rnIfaceCo (IfaceSelCo d c)              = IfaceSelCo d <$> rnIfaceCo c
 rnIfaceCo (IfaceLRCo lr c)              = IfaceLRCo lr <$> rnIfaceCo c
 rnIfaceCo (IfaceSubCo c)                = IfaceSubCo <$> rnIfaceCo c
-rnIfaceCo (IfaceAxiomCo ax cos)         = IfaceAxiomCo ax <$> mapM rnIfaceCo cos
+rnIfaceCo (IfaceAxiomCo ax cos)         = IfaceAxiomCo <$> rnIfaceAxiomRule ax <*> mapM rnIfaceCo cos
 rnIfaceCo (IfaceKindCo c)               = IfaceKindCo <$> rnIfaceCo c
-rnIfaceCo (IfaceForAllCo bndr visL visR co1 co2)
-    = (\bndr' co1' co2' -> IfaceForAllCo bndr' visL visR co1' co2')
-      <$> rnIfaceBndr bndr <*> rnIfaceMCo co1 <*> rnIfaceCo co2
+rnIfaceCo (IfaceForAllCo bndr visL visR ma co1 co2)
+    = (\ma' bndr' co1' co2' -> IfaceForAllCo bndr' visL visR ma' co1' co2')
+      <$> rnIfaceCo ma <*> rnIfaceBndr bndr <*> rnIfaceMCo co1 <*> rnIfaceCo co2
 rnIfaceCo (IfaceUnivCo s r t1 t2 deps)
     = IfaceUnivCo s r <$> rnIfaceType t1 <*> rnIfaceType t2 <*> pure deps
       -- The dependencies are either coercion variables or holes.
       -- These are all local, and thus need no renaming.
+
+rnIfaceAxiomRule :: Rename IfaceAxiomRule
+rnIfaceAxiomRule (IfaceAR_X lcl)    = pure (IfaceAR_X lcl)
+rnIfaceAxiomRule (IfaceAR_B ax idx) = flip IfaceAR_B idx <$> rnIfaceAxiomName ax
+rnIfaceAxiomRule (IfaceAR_U ax)     = IfaceAR_U <$> rnIfaceAxiomName ax
+
+rnIfaceAxiomName :: Name -> ShIfM Name
+rnIfaceAxiomName name = do
+    hmap <- getHoleSubst
+    unit_state <- hsc_units <$> getTopEnv
+    let m' = renameHoleModule unit_state hmap (nameModule name)
+    setNameModule (Just m') name
 
 rnIfaceTyCon :: Rename IfaceTyCon
 rnIfaceTyCon (IfaceTyCon n info)
@@ -925,27 +1030,53 @@ rnIfaceExprs :: Rename [IfaceExpr]
 rnIfaceExprs = mapM rnIfaceExpr
 
 rnIfaceIdDetails :: Rename IfaceIdDetails
-rnIfaceIdDetails (IfRecSelId (Left tc) con naughty fl)
-  = IfRecSelId <$> fmap Left (rnIfaceTyCon tc) <*> rnIfaceGlobal con <*> pure naughty <*> rnFieldLabel fl
-rnIfaceIdDetails (IfRecSelId (Right decl) con naughty fl)
-  = IfRecSelId <$> fmap Right (rnIfaceDecl decl) <*> rnIfaceGlobal con <*> pure naughty <*> rnFieldLabel fl
+rnIfaceIdDetails (IfRecSelId parent con naughty fl table)
+  = IfRecSelId <$> either (fmap Left . rnIfaceTyCon) (fmap Right . rnIfaceDecl) parent
+                <*> rnIfaceGlobal con <*> pure naughty <*> rnFieldLabel fl <*> traverse rnIfaceGlobal table
+rnIfaceIdDetails (IfSourceTableId table origin) = flip IfSourceTableId origin <$> rnIfaceGlobal table
+rnIfaceIdDetails (IfCheckedClosureSourceTableId table helpers) =
+  IfCheckedClosureSourceTableId <$> rnIfaceGlobal table <*> mapM rnIfaceGlobal helpers
+rnIfaceIdDetails (IfSourceDFunId methods literal) =
+  IfSourceDFunId <$> mapM (\(sel, target) -> (,) <$> rnIfaceGlobal sel <*> rnIfaceGlobal target) methods
+                 <*> traverse (\(sel, z, s) -> (,,) <$> rnIfaceGlobal sel <*> rnIfaceGlobal z <*> rnIfaceGlobal s) literal
 rnIfaceIdDetails details
   = pure details
 
+rnSourceProofRule :: Rename IfaceSourceProofRule
+rnSourceProofRule ((owner, first, mapper), args) = do
+  head_info <- (,,) <$> rename_name owner <*> traverse rename_name first <*> pure mapper
+  (head_info,) <$> traverse (traverse rename_name) args
+  where
+    rename_name (mod, occ) = (, occ) <$> rnModule mod
+
 rnIfaceType :: Rename IfaceType
 rnIfaceType (IfaceFreeTyVar n) = pure (IfaceFreeTyVar n)
+rnIfaceType (IfaceFreeTermVar n) = pure (IfaceFreeTermVar n)
 rnIfaceType (IfaceTyVar   n)   = pure (IfaceTyVar n)
+rnIfaceType (IfaceTermVar n)   = pure (IfaceTermVar n)
+rnIfaceType (IfaceNamedTermVar n) = IfaceNamedTermVar <$> rnIfaceGlobal n
+rnIfaceType (IfaceTermAppTy fun arg) = IfaceTermAppTy fun <$> rnIfaceType arg
+rnIfaceType (IfaceFreeTermAppTy fun arg) = IfaceFreeTermAppTy fun <$> rnIfaceType arg
+rnIfaceType (IfaceExistsTy flag bndr body)
+    = IfaceExistsTy flag <$> rnIfaceTvBndr bndr <*> rnIfaceType body
+rnIfaceType (IfaceDepDictTy bndr body)
+    = IfaceDepDictTy <$> rnIfaceIdBndr bndr <*> rnIfaceType body
+rnIfaceType (IfaceClassAppTy method inst dict arg)
+    = IfaceClassAppTy <$> rnIfaceGlobal method <*> rnIfaceType inst
+                      <*> rnIfaceType dict <*> rnIfaceType arg
+rnIfaceType (IfaceDepFunTy vis bndr body)
+    = IfaceDepFunTy vis <$> rnIfaceIdBndr bndr <*> rnIfaceType body
 rnIfaceType (IfaceAppTy t1 t2)
     = IfaceAppTy <$> rnIfaceType t1 <*> rnIfaceAppArgs t2
 rnIfaceType (IfaceLitTy l)         = return (IfaceLitTy l)
-rnIfaceType (IfaceFunTy af w t1 t2)
-    = IfaceFunTy af <$> rnIfaceType w <*> rnIfaceType t1 <*> rnIfaceType t2
+rnIfaceType (IfaceFunTy af ma w t1 t2)
+    = IfaceFunTy af <$> rnIfaceType ma <*> rnIfaceType w <*> rnIfaceType t1 <*> rnIfaceType t2
 rnIfaceType (IfaceTupleTy s i tks)
     = IfaceTupleTy s i <$> rnIfaceAppArgs tks
 rnIfaceType (IfaceTyConApp tc tks)
     = IfaceTyConApp <$> rnIfaceTyCon tc <*> rnIfaceAppArgs tks
-rnIfaceType (IfaceForAllTy tv t)
-    = IfaceForAllTy <$> rnIfaceForAllBndr tv <*> rnIfaceType t
+rnIfaceType (IfaceForAllTy ma tv t)
+    = IfaceForAllTy <$> rnIfaceType ma <*> rnIfaceForAllBndr tv <*> rnIfaceType t
 rnIfaceType (IfaceCoercionTy co)
     = IfaceCoercionTy <$> rnIfaceCo co
 rnIfaceType (IfaceCastTy ty co)

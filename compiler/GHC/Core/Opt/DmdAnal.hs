@@ -24,7 +24,7 @@ import GHC.Core.Utils
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.FVs      ( rulesRhsFreeIds, bndrRuleAndUnfoldingVars, idRuleVars )
-import GHC.Core.Coercion ( Coercion )
+import GHC.Core.Coercion ( Coercion, isCoVar )
 import GHC.Core.TyCo.FVs     ( coVarsOfCos )
 import GHC.Core.TyCo.Compare ( eqType )
 import GHC.Core.Multiplicity ( scaledThing )
@@ -458,6 +458,23 @@ dmdAnal' env dmd (Tick t e)
   where
     WithDmdType dmd_ty e' = dmdAnal env dmd e
 
+-- See Note [Demand for erased packages].
+dmdAnal' env _ (Pack schema witness payload)
+  = WithDmdType payload_ty (Pack schema witness payload')
+  where
+    WithDmdType payload_ty payload' = dmdAnal env topSubDmd payload
+
+dmdAnal' env dmd (Unpack witness payload package body)
+  = WithDmdType (body_ty' `plusDmdType` package_env)
+                (Unpack witness payload' package' body')
+  where
+    WithDmdType body_ty body' = dmdAnal (addInScopeAnalEnv env payload) dmd body
+    (body_ty', raw_dmd) = peelFV body_ty payload
+    payload_dmd@(card :* _) =
+      trimBoxity (trimToType raw_dmd (findTypeShape (ae_fam_envs env) (idType payload)))
+    !payload' = setIdDemandInfo payload payload_dmd
+    (package_env, package') = dmdAnalStar env (card :* topSubDmd) package
+
 dmdAnal' env dmd (App fun (Type ty))
   = WithDmdType fun_ty (App fun' (Type ty))
   where
@@ -511,11 +528,14 @@ dmdAnal' env dmd (Case scrut case_bndr ty [Alt alt_con bndrs rhs])
   | want_precise_field_dmds alt_con
   = let
         rhs_env = addInScopeAnalEnvs env (case_bndr:bndrs)
+        (real_bndrs, virt_cvs)            = splitAltRealBndrs alt_con bndrs
         -- See Note [Bringing a new variable into scope]
         WithDmdType rhs_ty rhs'           = dmdAnal rhs_env dmd rhs
-        WithDmdType alt_ty1 fld_dmds      = findBndrsDmds env rhs_ty bndrs
+        WithDmdType alt_ty0 virt_dmds     = findBndrsDmds env rhs_ty virt_cvs
+        WithDmdType alt_ty1 fld_dmds      = findBndrsDmds env alt_ty0 real_bndrs
         WithDmdType alt_ty2 case_bndr_dmd = findBndrDmd env alt_ty1 case_bndr
         !case_bndr'                       = setIdDemandInfo case_bndr case_bndr_dmd
+        !virt_cvs'                        = setBndrsDemandInfo virt_cvs virt_dmds
 
         -- Evaluation cardinality on the case binder is irrelevant and a no-op.
         -- What matters is its nested sub-demand!
@@ -532,12 +552,12 @@ dmdAnal' env dmd (Case scrut case_bndr ty [Alt alt_con bndrs rhs])
           , let !scrut_sd = scrutSubDmd case_bndr_sd fld_dmds
           -- See Note [Demand on case-alternative binders]
           , let !fld_dmds' = fieldBndrDmds scrut_sd (length fld_dmds)
-          , let !bndrs' = setBndrsDemandInfo bndrs fld_dmds'
-          = (bndrs', scrut_sd)
+          , let !real_bndrs' = setBndrsDemandInfo real_bndrs fld_dmds'
+          = (real_bndrs' ++ virt_cvs', scrut_sd)
           | otherwise
           -- DEFAULT alts. Simply add demands and discard the evaluation
           -- cardinality, as we evaluate the scrutinee exactly once.
-          = assert (null bndrs) (bndrs, case_bndr_sd)
+          = assert (null real_bndrs) (virt_cvs', case_bndr_sd)
 
         alt_ty3
           -- See Note [Precise exceptions and strictness analysis] in "GHC.Types.Demand"
@@ -602,6 +622,22 @@ dmdAnal' env dmd (Let bind body)
     !(WithDmdType final_ty (R bind' body')) = dmdAnalBind NotTopLevel env dmd bind go'
     go' !env'                 = dmdAnal env' dmd body
 
+{- Note [Demand for erased packages]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Pack uses the lifted representation of its payload. Evaluating the
+package evaluates the payload. Analyse the payload at boxed top
+sub-demand because the package type hides its constructor shape.
+
+Unpack binds the payload lazily. Analyse its body first, using the
+scope of the opened binder. Take that binder's demand from the body
+directly, so dictionary parameter strictification cannot affect it.
+Keep the binder boxed. Pass its evaluation cardinality to the package
+without passing the payload's structural sub-demand. This preserves
+absence, conditional use and sharing of the package.
+
+See Note [Erasing a lexical existential] in GHC.CoreToStg.
+-}
+
 -- | A simple, syntactic analysis of whether an expression MAY throw a precise
 -- exception when evaluated. It's always sound to return 'True'.
 -- See Note [Which scrutinees may throw precise exceptions].
@@ -653,12 +689,27 @@ dmdAnalSumAlts env dmd case_bndr (alt:alts)
     in WithDmdType (lubDmdType cur_ty rest_ty) (alt':alts')
 
 
+-- | Separate real constructor field binders from any trailing index alias
+-- coercion variable in a case alternative.
+splitAltRealBndrs :: AltCon -> [Var] -> ([Var], [Var])
+splitAltRealBndrs (DataAlt dc) bndrs
+  | Just (real_bndrs, cv) <- snocView bndrs
+  , isCoVar cv
+  , count isId real_bndrs == dataConRepArity dc
+  = (real_bndrs, [cv])
+splitAltRealBndrs DEFAULT bndrs
+  = assert (all isCoVar bndrs) ([], bndrs)
+splitAltRealBndrs _ bndrs
+  = (bndrs, [])
+
 dmdAnalSumAlt :: AnalEnv -> SubDemand -> Id -> CoreAlt -> WithDmdType CoreAlt
 dmdAnalSumAlt env dmd case_bndr (Alt con bndrs rhs)
   | let rhs_env = addInScopeAnalEnvs env (case_bndr:bndrs)
+        (real_bndrs, virt_cvs) = splitAltRealBndrs con bndrs
     -- See Note [Bringing a new variable into scope]
   , WithDmdType rhs_ty rhs' <- dmdAnal rhs_env dmd rhs
-  , WithDmdType alt_ty dmds <- findBndrsDmds env rhs_ty bndrs
+  , WithDmdType alt_ty0 virt_dmds <- findBndrsDmds env rhs_ty virt_cvs
+  , WithDmdType alt_ty dmds <- findBndrsDmds env alt_ty0 real_bndrs
   , let (_ :* case_bndr_sd) = findIdDemand alt_ty case_bndr
         -- See Note [Demand on case-alternative binders]
         -- we can't use the scrut_sd, because it says 'Prod' and we'll use
@@ -666,7 +717,9 @@ dmdAnalSumAlt env dmd case_bndr (Alt con bndrs rhs)
         scrut_sd = scrutSubDmd case_bndr_sd dmds
         dmds' = fieldBndrDmds scrut_sd (length dmds)
         -- Do not put a thunk into the Alt
-        !new_ids            = setBndrsDemandInfo bndrs dmds'
+        !real_bndrs'        = setBndrsDemandInfo real_bndrs dmds'
+        !virt_cvs'          = setBndrsDemandInfo virt_cvs virt_dmds
+        !new_ids            = real_bndrs' ++ virt_cvs'
   = -- pprTrace "dmdAnalSumAlt" (ppr con $$ ppr case_bndr $$ ppr dmd $$ ppr alt_ty) $
     WithDmdType alt_ty (Alt con new_ids rhs')
 
@@ -1199,7 +1252,7 @@ addUnfoldingDemands env rhs_sd id rhs_dmd_ty
 -- when the type doesn't have exactly 'idArity' many arrows.
 resultType_maybe :: Id -> Maybe Type
 resultType_maybe id
-  | (pis,ret_ty) <- splitPiTys (idType id)
+  | (_,pis,ret_ty) <- splitPiTys (idType id)
   , count isAnonPiTyBinder pis == idArity id
   = Just $! ret_ty
   | otherwise
@@ -1219,6 +1272,7 @@ unboxedWhenSmall env rec_flag (Just ret_ty) sd = go 1 ret_ty sd
       | depth <= max_depth
       , Just (tc, tc_args, _co) <- normSplitTyConApp_maybe (ae_fam_envs env) ty
       , Just [dc] <- canUnboxTyCon tc   -- tc is not a newtype
+      , null (dataConRepArgBinders dc) -- Keep the retained field telescope.
       , null (dataConExTyCoVars dc)     -- Can't unbox results with existentials
       , dataConRepArity dc <= dmd_unbox_width (ae_opts env)
       , Just (_, ds) <- viewProd (dataConRepArity dc) sd

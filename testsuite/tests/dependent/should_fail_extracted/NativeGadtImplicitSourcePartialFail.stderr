@@ -1,0 +1,7 @@
+NativeGadtImplicitSourcePartialFail.hs:10:19: error: [GHC-70566]
+    • Cannot reduce the open call to ‘worker’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the second argument of ‘Edge’, namely ‘(worker a)’
+      In the type ‘Edge a (worker a)’
+      In the definition of data constructor ‘Step’
+

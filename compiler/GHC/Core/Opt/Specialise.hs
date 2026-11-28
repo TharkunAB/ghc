@@ -15,7 +15,9 @@ import GHC.Driver.Config
 import GHC.Driver.Config.Core.Rules ( initRuleOpts )
 
 import GHC.Core.Type  hiding( substTy, substCo, extendTvSubst, zapSubst )
-import GHC.Core.SimpleOpt( defaultSimpleOpts, simpleOptExprWith, exprIsConApp_maybe )
+import GHC.Core.SimpleOpt( defaultSimpleOpts, simpleOptExprWith, simpleOptNativeExpr, exprIsConApp_maybe )
+import GHC.Core.Dependent (hasNativeDependentUnfolding, hasScopedDictionaryProgram)
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
 import GHC.Core.Predicate
 import GHC.Core.Class( classMethods )
 import GHC.Core.Coercion( Coercion )
@@ -29,7 +31,9 @@ import GHC.Core.Unify     ( tcMatchTy )
 import GHC.Core.Rules
 import GHC.Core.Subst (substTickish)
 import GHC.Core.TyCon (tyConClass_maybe)
+import GHC.Core.TyCo.Rep (Type(DepFunTy, DepDictTy, ForAllTy, FunTy), ft_res)
 import GHC.Core.Utils     ( exprIsTrivial, exprIsTopLevelBindable
+                          , applyTypeToArgs, isVacuousRetainedBinder
                           , mkCast, exprType, exprIsHNF
                           , stripTicksTop, mkInScopeSetBndrs )
 import GHC.Core.FVs
@@ -640,8 +644,8 @@ Hence, the invariant is this:
 -}
 
 -- | Specialise calls to type-class overloaded functions occurring in a program.
-specProgram :: ModGuts -> CoreM ModGuts
-specProgram guts@(ModGuts { mg_module = this_mod
+specProgram :: SimplCoreMode -> ModGuts -> CoreM ModGuts
+specProgram mode guts@(ModGuts { mg_module = this_mod
                           , mg_rules  = local_rules
                           , mg_binds  = binds })
   = do { dflags   <- getDynFlags
@@ -657,7 +661,8 @@ specProgram guts@(ModGuts { mg_module = this_mod
                                        mkInScopeSetBndrs binds
                           , se_module = this_mod
                           , se_rules  = rule_env
-                          , se_dflags = dflags }
+                          , se_dflags = dflags
+                          , se_core_mode = mode }
 
              go []           = return ([], emptyUDs)
              go (bind:binds) = do (bind', binds', uds') <- specBind TopLevel top_env bind $ \_ ->
@@ -849,7 +854,7 @@ spec_import env callers dict_binds cis@(CIS fn _)
 --        debugTraceMsg (text "specImport1-no-good" <+> (ppr cis $$ text "dict_binds" <+> ppr dict_binds))
        ; return (env, [], []) }
 
-  | Just rhs <- canSpecImport dflags fn
+  | Just rhs <- canSpecImport (se_core_mode env) dflags fn
   = do {     -- Get rules from the external package state
              -- We keep doing this in case we "page-fault in"
              -- more rules as we go along
@@ -908,8 +913,13 @@ spec_import env callers dict_binds cis@(CIS fn _)
        -- SUPER IMPORTANT!  Drop calls that (directly or indirectly) refer to fn
        -- See Note [Avoiding loops in specImports]
 
-canSpecImport :: DynFlags -> Id -> Maybe CoreExpr
-canSpecImport dflags fn
+canSpecImport :: SimplCoreMode -> DynFlags -> Id -> Maybe CoreExpr
+canSpecImport mode dflags fn
+  | isRetainedUserUnfolding unf
+  = case mode of
+      RetainedCore | isInlinablePragma (idInlinePragma fn) -> maybeUnfoldingTemplate unf
+      _ -> Nothing
+
   | isDataConWrapId fn
   = Nothing   -- Don't specialise data-con wrappers, even if they
               -- have dict args; there is no benefit.
@@ -1181,6 +1191,7 @@ data SpecEnv
        , se_module :: Module
        , se_rules  :: RuleEnv  -- From the home package and this module
        , se_dflags :: DynFlags
+       , se_core_mode :: !SimplCoreMode
      }
 
 instance Outputable SpecEnv where
@@ -1205,6 +1216,18 @@ specExpr env (Var v)       = specVar env v
 specExpr env (Type ty)     = return (Type     (substTy env ty), emptyUDs)
 specExpr env (Coercion co) = return (Coercion (substCo env co), emptyUDs)
 specExpr _   (Lit lit)     = return (Lit lit,                   emptyUDs)
+specExpr env (Pack schema witness payload)
+  = do { (payload', uds) <- specExpr env payload
+       ; return (Pack (substTy env schema) (substTy env witness) payload', uds) }
+specExpr env (Unpack witness payload package body)
+  = do { (package', package_uds) <- specExpr env package
+       ; (body', body_uds) <- specExpr body_env body
+       ; let (free_uds, local_dicts) = dumpUDs [witness', payload'] body_uds
+       ; return (Unpack witness' payload' package' (wrapDictBindsE local_dicts body'),
+                 package_uds `thenUDs` free_uds) }
+  where
+    (witness_env, witness') = substBndr env witness
+    (body_env, payload') = substBndr witness_env payload
 specExpr env (Cast e co)
   = do { (e', uds) <- specExpr env e
        ; return ((mkCast e' (substCo env co)), uds) }
@@ -1216,7 +1239,9 @@ specExpr env (Tick tickish body)
 specExpr env expr@(App {})
   = do { let (fun_in, args_in) = collectArgs expr
        ; (fun_out, uds_fun)   <- specExpr env fun_in
-       ; (args_out, uds_args) <- mapAndCombineSM (specExpr env) args_in
+       ; (args_out, uds_args) <- case se_core_mode env of
+             OrdinaryCore -> mapAndCombineSM (specExpr env) args_in
+             RetainedCore -> specRetainedArgs env (exprType fun_out) args_in
        ; let uds_app  = uds_fun `thenUDs` uds_args
              env_args = zapSubst env `bringFloatedDictsIntoScope` ud_binds uds_app
                 -- zapSubst: we have now fully applied the substitution
@@ -1260,17 +1285,49 @@ specExpr env (Let bind body)
          -- All done
        ; return (foldr Let body' binds', uds) }
 
+-- | Specialise a call while preserving each operand used in its result type.
+-- See Note [Rules inside retained operands].
+specRetainedArgs :: SpecEnv -> Type -> [InExpr] -> SpecM ([OutExpr], UsageDetails)
+specRetainedArgs _ _ [] = pure ([], emptyUDs)
+specRetainedArgs env fun_ty (arg:args) = do
+  (arg', uses) <- if isValArg arg && indexed
+                    then pure (Core.substExpr (se_subst env) arg, emptyUDs)
+                    else specExpr env arg
+  (args', rest) <- specRetainedArgs env (applyTypeToArgs fun_ty [arg']) args
+  pure (arg' : args', uses `thenUDs` rest)
+  where
+    indexed = case coreFullView fun_ty of
+      DepFunTy _ b body -> not (isVacuousRetainedBinder b body)
+      DepDictTy{}       -> True
+      _                 -> False
+
+{- Note [Rules inside retained operands]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In `lengthMap f (zip xs ys)`, the result type mentions the source call
+`zip xs ys`. The zip rule replaces it with a call to build. Core cannot
+use that expression as the same index. Apply the current substitution
+to an indexed operand so that its local binders stay in scope. Other
+operands can fire rules and contribute specialisation requests as usual.
+-}
+
 -- See Note [Specialisation modulo dictionary selectors]
 --     Note [ClassOp/DFun selection]
 --     Note [Fire rules in the specialiser]
 fireRewriteRules :: SpecEnv   -- Substitution is already zapped
                  -> OutExpr -> [OutExpr] -> (OutExpr, [OutExpr])
 fireRewriteRules env (Var f) args
-  | let rules = getRules (se_rules env) f
+  | let visible = getRules (se_rules env) f
+        rules | gopt Opt_EnableRewriteRules (se_dflags env) = visible
+              | otherwise = filter isBuiltinRule visible
   , Just (rule, expr) <- specLookupRule env f args activeInInitialPhase rules
   , let rest_args    = drop (ruleArity rule) args -- See Note [Extra args in the target]
         zapped_subst = se_subst env   -- Just needed for the InScopeSet
-        expr'        = simpleOptExprWith defaultSimpleOpts zapped_subst (mkApps expr rest_args)
+        rule_app     = mkApps expr rest_args
+        expr' | RetainedCore <- se_core_mode env
+              , hasNativeDependentUnfolding rule_app
+              = simpleOptNativeExpr rule_app
+              | otherwise
+              = simpleOptExprWith defaultSimpleOpts zapped_subst rule_app
                        -- simplOptExpr needed because lookupRule returns
                        --   (\x y. rhs) arg1 arg2
   , (fun', args') <- collectArgs expr'
@@ -1371,6 +1428,10 @@ It's not hard to achieve: see `fireRewriteRules`. The only tricky bit is
 making sure that we have a reasonably up to date EPS rule base. Currently
 we load it up just once, in `initRuleEnv`, called at the beginning of
 `specProgram`.
+
+Respect -fno-enable-rewrite-rules here as in the simplifier. Keep
+built-in rules for operations such as dictionary selection. They are
+part of ordinary specialisation even when user rules are disabled.
 
 NB: you might wonder if running rules in the specialiser (this Note) renders
 Note [tryRules: plan (BEFORE)] in the Simplifier (partly) redundant.  That is,
@@ -1594,6 +1655,12 @@ type SpecInfo = ( [CoreRule]       -- Specialisation rules
                 , UsageDetails )   -- Usage details from specialised RHSs
 
 specCalls spec_imp env existing_rules calls_for_me fn rhs
+  | RetainedCore <- se_core_mode env
+  , notNull calls_for_me
+  , hasScopedDictionaryProgram [NonRec fn rhs] || hasInvisibleDepFun (idType fn)
+  = return ([], [], emptyUDs)
+    -- See Note [Specialising functions with scoped class methods].
+
         -- The first case is the interesting one
   |  notNull calls_for_me               -- And there are some calls to specialise
   && not (isNeverActive (idInlineActivation fn))
@@ -1727,7 +1794,7 @@ specCalls spec_imp env existing_rules calls_for_me fn rhs
                  (rule_rhs_args1, spec_rhs1, spec_fn_ty1)
                    | add_void_arg = ( voidPrimId : rule_rhs_args
                                     , Lam voidArgId spec_rhs
-                                    , mkVisFunTyMany unboxedUnitTy spec_fn_ty )
+                                    , mkVisFunTyManyU unboxedUnitTy spec_fn_ty )
                    | otherwise    = (rule_rhs_args, spec_rhs, spec_fn_ty)
 
                  --------------------------------------
@@ -1736,8 +1803,10 @@ specCalls spec_imp env existing_rules calls_for_me fn rhs
                  -- arguments, not forgetting to wrap the dx_binds around the outside (#22358)
                  simpl_opts = initSimpleOpts dflags
                  wrap_unf_body body = foldr (Let . db_bind) (body `mkApps` spec_args) dx_binds
-                 spec_unf = specUnfolding simpl_opts rule_rhs_args1 wrap_unf_body
-                                          rule_lhs_args fn_unf
+                 spec_unf
+                   | RetainedCore <- se_core_mode env = noUnfolding
+                   | otherwise = specUnfolding simpl_opts rule_rhs_args1 wrap_unf_body
+                                               rule_lhs_args fn_unf
 
                  --------------------------------------
                  -- Adding arity information just propagates it a bit faster
@@ -1755,7 +1824,7 @@ specCalls spec_imp env existing_rules calls_for_me fn rhs
                  spec_fn_details
                    = case idDetails fn of
                        JoinId join_arity _ -> JoinId (join_arity - join_arity_decr) Nothing
-                       DFunId terminating  -> DFunId terminating
+                       DFunId terminating _ -> DFunId terminating Nothing
                        _                   -> VanillaId
 
            ; spec_fn <- newSpecIdSM (idName fn) spec_fn_ty1 spec_fn_details spec_fn_info
@@ -1796,6 +1865,17 @@ alreadyCovered :: SpecEnv
                -> (ActivationGhc -> Bool) -- Which rules are active
                -> [CoreRule] -> Bool
 -- Note [Specialisations already covered] esp (SC2)
+
+hasInvisibleDepFun :: Type -> Bool
+hasInvisibleDepFun = go
+  where
+    go ty = case coreFullView ty of
+      DepFunTy DepFunInvisible _ _ -> True
+      DepFunTy _ _ b               -> go b
+      ForAllTy _ _ b               -> go b
+      FunTy { ft_res = b }         -> go b
+      DepDictTy _ b                -> go b
+      _                            -> False
 alreadyCovered env bndrs fn args is_active rules
   = case specLookupRule env fn args is_active rules of
       Nothing             -> False
@@ -2022,6 +2102,19 @@ unfolding template rather than to its optimised RHS, and the two may differ:
 the argument can be dead in the RHS and not in the template. The specialised
 function's unfolding then contains the filler, and any call site that inlines
 it evaluates the error thunk. See #27703 for an instance of how this goes wrong.
+
+Note [Specialising functions with scoped class methods]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A scoped class method can occur in a type, for example Tagged (choose x).
+The type names the dictionary supplied by the caller. An ordinary
+specialisation rule matches any dictionary at the specialised class type,
+then uses the dictionary chosen when the rule was built. Even a trivial
+dictionary expression can be a cast rather than the variable named in a
+type. Binding that expression to a fresh variable would still give the
+rule a different dictionary from its caller.
+
+Keep the original binding when its type, RHS or unfolding uses a scoped
+method. Other bindings in the module can specialise as usual.
 
 Note [Specialisation modulo dictionary selectors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3028,7 +3121,7 @@ mkCallUDs' env f args
 
   where
     _trace_doc = vcat [ppr f, ppr args, ppr ci_key]
-    pis                = fst $ splitPiTys $ idType f
+    (_, pis, _)        = splitPiTys (idType f)
     constrained_tyvars = tyCoVarsOfTypes $ getTheta pis
 
     ci_key :: [SpecArg]
@@ -3070,6 +3163,8 @@ wantCallsFor _env f
 
       DFunId {}        -> True
       VanillaId {}     -> True
+      SourceTableId {} -> True
+      CheckedClosureSourceTableId {} -> True
       JoinId {}        -> True
       WorkerLikeId {}  -> True
       RepPolyId {}     -> True
@@ -3080,7 +3175,9 @@ interestingDict :: SpecEnv -> CoreExpr -> Bool
 -- See Note [Interesting dictionary arguments]
 interestingDict env (Var v)  -- See (ID3) and (ID5)
   -- (ID6.a) Might fail for loop breaker dicts but that seems fine.
-  | Just rhs <- maybeUnfoldingTemplate (idUnfolding v)
+  | let unf = idUnfolding v
+  , not (isRetainedUserUnfolding unf)
+  , Just rhs <- maybeUnfoldingTemplate unf
   = interestingDict env rhs
 
 interestingDict env arg  -- Main Plan: use exprIsConApp_maybe

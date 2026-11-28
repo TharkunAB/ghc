@@ -1,0 +1,168 @@
+NativeAlternatingBindersRankRejects.hs:15:31: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      ()
+      -> forall a.
+         Show a =>
+         foreach (m :: Maybe a) -> Reading True m -> Reading True m
+    • In the first argument of ‘readInt’, namely
+        ‘(f () @Bool ib (Reading 41))’
+      In the expression: readInt (f () @Bool ib (Reading 41))
+      In the expression:
+        (readInt (f () @Bool ib (Reading 41)), 
+         readInt (f () @Char ic (Reading 42)))
+
+NativeAlternatingBindersRankRejects.hs:16:6: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      (()
+       -> forall a.
+          Show a =>
+          foreach (m :: Maybe a) -> Reading True m -> Reading True m)
+      -> (Int, Int)
+    • In the expression: applyBoth plainFirst
+      In the expression:
+        let
+          applyBoth ::
+            (()
+             -> forall a.
+                Show a =>
+                foreach (m :: Maybe a) -> Reading True m -> Reading True m)
+            -> (Int, Int)
+          applyBoth f = (readInt (f ...), readInt (f ...))
+        in applyBoth plainFirst
+      In an equation for ‘shallow2’:
+          shallow2 ib ic
+            = let
+                applyBoth ::
+                  (()
+                   -> forall a.
+                      Show a =>
+                      foreach (m :: Maybe a) -> Reading True m -> Reading True m)
+                  -> (Int, Int)
+                applyBoth f = (readInt ..., readInt ...)
+              in applyBoth plainFirst
+
+NativeAlternatingBindersRankRejects.hs:21:31: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      foreach (b :: Bool)
+      -> forall a.
+         Show a =>
+         foreach (m :: Maybe a) -> Reading b m -> Reading b m
+    • In the first argument of ‘readInt’, namely
+        ‘(f tag @Bool ib (Reading 41))’
+      In the expression: readInt (f tag @Bool ib (Reading 41))
+      In the expression:
+        (readInt (f tag @Bool ib (Reading 41)), 
+         readInt (f False @Char ic (Reading 42)))
+
+NativeAlternatingBindersRankRejects.hs:22:16: error: [GHC-83865]
+    • Couldn't match expected type: foreach (b :: Bool)
+                                    -> forall a.
+                                       Show a =>
+                                       foreach (m :: Maybe a) -> Reading b m -> Reading b m
+                  with actual type: foreach (b :: Bool)
+                                    -> forall a.
+                                       foreach (m :: Maybe a) -> Reading b m -> Reading b m
+    • In the first argument of ‘applyBoth’, namely ‘keepAfter’
+      In the expression: applyBoth keepAfter
+      In the expression:
+        let
+          applyBoth ::
+            (foreach (b :: Bool) ->
+             forall a.
+             Show a => foreach (m :: Maybe a) -> Reading b m -> Reading b m)
+            -> (Int, Int)
+          applyBoth f = (readInt (f ...), readInt (f ...))
+        in applyBoth keepAfter
+
+NativeAlternatingBindersRankRejects.hs:30:16: error: [GHC-25897]
+    • Couldn't match type ‘a’ with ‘Bool’
+      Expected: Maybe a
+        Actual: Maybe Bool
+      ‘a’ is a rigid type variable bound by
+        a type expected by the context:
+          forall a. Display a => Reflect a
+        at NativeAlternatingBindersRankRejects.hs:30:16-26
+    • In the first argument of ‘run’, namely ‘fixedDomain’
+      In the expression: run fixedDomain
+      In an equation for ‘badFixed’: badFixed = run fixedDomain
+
+NativeAlternatingBindersRankRejects.hs:33:22: error: [GHC-83865]
+    • Couldn't match type: foreach (x :: Maybe a) -> Proxy x
+                     with: foreach (x :: Maybe a)
+                           -> x GHC.Internal.Data.Type.Equality.:~: x
+      Expected: Reflect a
+        Actual: foreach (x :: Maybe a) -> Proxy x
+    • In the first argument of ‘run’, namely ‘wrongResult’
+      In the expression: run wrongResult
+      In an equation for ‘badWrongResult’:
+          badWrongResult = run wrongResult
+
+NativeAlternatingBindersRankRejects.hs:36:19: error: [GHC-25897]
+    • Couldn't match type ‘a’ with ‘outer’
+      Expected: Maybe a
+        Actual: Maybe outer
+      ‘a’ is a rigid type variable bound by
+        a type expected by the context:
+          forall a. Display a => Reflect a
+        at NativeAlternatingBindersRankRejects.hs:36:18-33
+      ‘outer’ is a rigid type variable bound by
+        the type signature for:
+          badOuter :: forall outer. Show outer => Proxy outer -> Bool
+        at NativeAlternatingBindersRankRejects.hs:35:1-59
+    • In the first argument of ‘run’, namely ‘(reflect @outer)’
+      In the expression: run (reflect @outer)
+      In an equation for ‘badOuter’: badOuter _ = run (reflect @outer)
+    • Relevant bindings include
+        badOuter :: Proxy outer -> Bool
+          (bound at NativeAlternatingBindersRankRejects.hs:36:1)
+
+NativeAlternatingBindersRankRejects.hs:42:26: error: [GHC-83865]
+    • Couldn't match type: NativeAlternatingBindersDomain.Opaque a0
+                     with: NativeAlternatingBindersDomain.Opaque a
+      Expected: Maybe (NativeAlternatingBindersDomain.Opaque a)
+        Actual: Maybe (NativeAlternatingBindersDomain.Opaque a0)
+      Note: ‘NativeAlternatingBindersDomain.Opaque’ is a non-injective type family.
+      The type variable ‘a0’ is ambiguous
+    • In the first argument of ‘runOpaque’, namely ‘ambiguous’
+      In the expression: runOpaque ambiguous
+      In an equation for ‘badAmbiguous’:
+          badAmbiguous = runOpaque ambiguous
+
+NativeAlternatingBindersRankRejects.hs:49:29: error: [GHC-39999]
+    • Could not deduce ‘Show a’ arising from a use of ‘reflect’
+      from the context: Unrelated a
+        bound by a type expected by the context:
+                   forall a. Unrelated a => Reflect a
+        at NativeAlternatingBindersRankRejects.hs:49:29-35
+      Possible fix:
+        add (Show a) to the context of
+          a type expected by the context:
+            forall a. Unrelated a => Reflect a
+    • In the first argument of ‘runUnrelated’, namely ‘reflect’
+      In the expression: runUnrelated reflect
+      In an equation for ‘badUnrelated’:
+          badUnrelated = runUnrelated reflect
+
+NativeAlternatingBindersRankRejects.hs:51:22: error: [GHC-83605]
+    • Quick Look inference does not support this retained type yet:
+      forall a. Show a => Reflect a
+    • In the first argument of ‘Just’, namely ‘reflect’
+      In the expression: Just reflect
+      In an equation for ‘badQuickLook1’: badQuickLook1 = Just reflect
+
+NativeAlternatingBindersRankRejects.hs:56:46: error: [GHC-39999]
+    • No instance for ‘Show a’ arising from a use of ‘reflect’
+      Possible fix:
+        add (Show a) to the context of
+          a type expected by the context:
+            UnconstrainedCallback
+    • In the second argument of ‘Just’, namely ‘reflect’
+      In the expression: Just @UnconstrainedCallback reflect
+      In an equation for ‘badMissingShow’:
+          badMissingShow = Just @UnconstrainedCallback reflect
+
+NativeAlternatingBindersRankRejects.hs:58:21: error: [GHC-83605]
+    • The runtime index ‘tag’ is out of scope here.
+    • In the expression: \ tag -> capture tag
+      In an equation for ‘escapeTag’: escapeTag = \ tag -> capture tag
+

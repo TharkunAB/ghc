@@ -73,8 +73,8 @@ module GHC.Hs.Decls (
   -- ** Data-constructor declarations
   ConDecl(..), LConDecl,
   HsConDeclH98Details, HsConDeclGADTDetails(..),
-  AnnConDeclH98(..), AnnConDeclGADT(..),
-  hsConDeclTheta,
+  AnnConDeclGADT(..),
+  hsConDeclTheta, splitGadtTerminal, splitGadtInterior, isEmptyGadtGroup,
   getConNames, getRecConArgs_maybe,
   -- ** Document comments
   DocDecl(..), LDocDecl, docDeclDoc,
@@ -100,6 +100,8 @@ module GHC.Hs.Decls (
 -- friends:
 import GHC.Prelude
 
+import Data.Either (isRight)
+
 import Language.Haskell.Syntax.Binds
 import Language.Haskell.Syntax.Decls
 import Language.Haskell.Syntax.Decls.Foreign
@@ -116,6 +118,7 @@ import GHC.Hs.Binds (ActivationAnn(..),
 import GHC.Hs.Type
 import GHC.Hs.Doc
 import GHC.Types.Basic
+import GHC.Types.Var (Specificity(SpecifiedSpec))
 import GHC.Core.Coercion
 
 import GHC.Hs.Basic
@@ -739,7 +742,9 @@ type instance XXInjectivityAnn  (GhcPass _) = DataConCantHappen
 
 type instance XDataFamily       (GhcPass _) = NoExtField
 type instance XOpenTypeFamily   (GhcPass _) = NoExtField
-type instance XClosedTypeFamily (GhcPass _) = AnnList
+type instance XClosedTypeFamily GhcPs = AnnList
+type instance XClosedTypeFamily GhcRn = (AnnList, Maybe (Name, Bool))
+type instance XClosedTypeFamily GhcTc = (AnnList, Maybe (Name, Bool))
 type instance XXFamilyInfo      (GhcPass _) = DataConCantHappen
 
 instance OutputableBndrId p
@@ -835,8 +840,8 @@ type instance XConDeclGADT GhcPs = AnnConDeclGADT
 type instance XConDeclGADT GhcRn = NoExtField
 type instance XConDeclGADT GhcTc = NoExtField
 
-type instance XConDeclH98  GhcPs = AnnConDeclH98
-type instance XConDeclH98  GhcRn = NoExtField
+type instance XConDeclH98  GhcPs = NoExtField
+type instance XConDeclH98  GhcRn = Maybe (LHsType GhcRn)
 type instance XConDeclH98  GhcTc = NoExtField
 
 type instance XXConDecl (GhcPass _) = DataConCantHappen
@@ -848,16 +853,6 @@ type instance XRecConGADT          GhcRn = NoExtField
 type instance XRecConGADT          GhcTc = NoExtField
 
 type instance XXConDeclGADTDetails (GhcPass _) = DataConCantHappen
-
-data AnnConDeclH98
-  = AnnConDeclH98 {
-    acdh_forall  :: TokForall,
-    acdh_dot :: EpToken ".",
-    acdh_darrow :: TokDarrow
-  } deriving Data
-
-instance NoAnn AnnConDeclH98 where
-  noAnn = AnnConDeclH98 noAnn noAnn noAnn
 
 data AnnConDeclGADT
   = AnnConDeclGADT {
@@ -947,15 +942,13 @@ instance (OutputableBndrId p) => Outputable (ConDecl (GhcPass p)) where
 
 pprConDecl :: forall p. OutputableBndrId p => ConDecl (GhcPass p) -> SDoc
 pprConDecl (ConDeclH98 { con_name = L _ con
-                       , con_ex_tvs = ex_tvs
-                       , con_mb_cxt = mcxt
+                       , con_telescope = teles
                        , con_args = args
                        , con_modifiers = mods
                        , con_doc = doc })
   = pprMaybeWithDoc doc $
     sep [ pprLHsModifiers mods
-        , pprHsForAll (mkHsForAllInvisTele noAnn ex_tvs) mcxt
-        , ppr_details args ]
+        , pprConDeclTelescope teles (ppr_details args) ]
   where
     -- In ppr_details: let's not print the multiplicities (they are always 1, by
     -- definition) as they do not appear in an actual declaration.
@@ -969,40 +962,168 @@ pprConDecl (ConDeclH98 { con_name = L _ con
 
 pprConDecl (ConDeclGADT { con_names = cons
                         , con_outer_bndrs = L _ outer_bndrs
-                        , con_inner_bndrs = inner_bndrs
-                        , con_cxts = cxts, con_g_args = args
+                        , con_telescope = inner_bndrs
+                        , con_g_args = args
                         , con_res_ty = res_ty, con_modifiers = mods, con_doc = doc })
   = pprMaybeWithDoc doc $ pprLHsModifiers mods <+> ppr_con_names (toList cons) <+> dcolon
-    <+> sep [ppr_outer_bndrs, ppr_inner_bndrs (
-                sep [ pprLHsContext cxts,
-                      sep (ppr_args args ++ [ppr res_ty])])]
+    <+> sep [ppr_outer_bndrs, pprConDeclTelescope inner_bndrs (sep (ppr_args args ++ [ppr res_ty]))]
   where
     ppr_args (PrefixConGADT _ args) = map (pprHsConDeclFieldWith (\arr tyDoc -> tyDoc <+> pprHsModifiedFunArr arr)) args
     ppr_args (RecConGADT _ fields) = [pprHsConDeclRecFields (unLoc fields) <+> arrow]
-
-    -- pprint all parentheses and foralls, so parse == parse . ppr . parse
-    ppr_inner_bndrs :: SDoc -> SDoc
-    ppr_inner_bndrs tyDoc = foldr ppr_inner_bndr (tyDoc <> close_parens) inner_bndrs
-
-    ppr_inner_bndr (L _ HsGadtPar{})           rest = lparen <> rest
-    ppr_inner_bndr (L _ (HsGadtForAll _ tele)) rest
-      | HsForAllInvis {hsf_invis_bndrs=[]} <- tele = empty_forall <+> rest
-      | otherwise = pprHsForAllTelescope tele <+> rest
-
-    -- for each open paren generate a closed one
-    close_parens = hcat [ rparen | L _ HsGadtPar{} <- inner_bndrs ]
 
     -- pprint empty explicit outer forall as `forall.` if there are inner binders, because otherwise
     -- `forall. forall a. ...` would become `forall a. ...` and that would parse into
     -- different AST, thus breaking parse == parse . ppr . parse property
     ppr_outer_bndrs
       | HsOuterExplicit{hso_bndrs = []} <- outer_bndrs
-      , not (null inner_bndrs)
+      , any inner_group inner_bndrs
       = empty_forall
       | otherwise
       = pprHsOuterSigTyVarBndrs outer_bndrs
 
     empty_forall = forAllLit <> dot
+    inner_group (L _ HsGadtContext{}) = False
+    inner_group _ = True
+
+-- | Print the prefix in its lexical order. Close each enclosing parenthesis.
+pprConDeclTelescope :: OutputableBndrId p
+                    => [LHsGadtTelescope (GhcPass p)] -> SDoc -> SDoc
+pprConDeclTelescope teles body = foldr step (body <> closes) teles
+  where
+    closes = hcat [rparen | L _ HsGadtPar{} <- teles]
+    step (L _ HsGadtPar{}) rest = lparen <> rest
+    step (L _ (HsGadtContext ctxt)) rest = pprLHsContext (Just ctxt) <+> rest
+    step (L _ (HsGadtForAll _ tele)) rest
+      | HsForAllInvis{hsf_invis_bndrs = [], hsf_matchability = Nothing} <- tele
+      = forAllLit <> dot <+> rest
+      | otherwise = pprHsForAllTelescope tele <+> rest
+
+-- | Recognize the supported groups after a nonempty prefix of fields.
+-- Keep them in the parsed result to preserve their source order.
+splitGadtTerminal :: HsConDeclGADTDetails (GhcPass pass) -> LHsType (GhcPass pass)
+                        -> Maybe ([LHsGadtTelescope (GhcPass pass)], Int, LHsType (GhcPass pass))
+splitGadtTerminal (PrefixConGADT _ (_ : _)) ty
+  | L loc HsForAllTy { hst_tele = tele, hst_body = body } <- ignoreParens ty
+  , let group = L loc (HsGadtForAll noExtField tele)
+  = case tele of
+      HsForAllVis { hsf_vis_bndrs = binders }
+        | not (null binders)
+        , Just (ctxt, result) <- terminal_context body ->
+          Just ([group, ctxt], length binders, result)
+        | not (null binders), plain_result body ->
+          Just ([group], length binders, body)
+      HsForAllInvis { hsf_invis_bndrs = binders }
+        | not (null binders)
+        , all ((== SpecifiedSpec) . hsTyVarBndrFlag . unLoc) binders
+        , Just (ctxt, result) <- terminal_context body ->
+          Just ([group, ctxt], length binders, result)
+      _ -> Nothing
+  | Just (ctxt, result) <- terminal_context ty
+  = Just ([ctxt], gadtTrailingContextOnly, result)
+  where
+    terminal_context ty
+      | L _ HsQualTy { hst_ctxt = ctxt, hst_body = result } <- ignoreParens ty
+      , not (null (hsConDeclTheta (Just ctxt)))
+      , plain_result result
+      = Just (mkHsGadtContext ctxt, result)
+      | otherwise = Nothing
+
+    plain_result result = case unLoc (ignoreParens result) of
+      HsForAllTy{} -> False
+      HsForEachTy{} -> False
+      HsFunTy{} -> False
+      HsQualTy{} -> False
+      _ -> True
+splitGadtTerminal _ _ = Nothing
+
+-- | Split a prefix constructor's remaining telescope into source groups.
+-- The parser separates the fields before the first ordered group.
+-- See Note [Constructor telescope contexts].
+splitGadtInterior :: forall pass. IsPass pass
+                  => HsConDeclGADTDetails (GhcPass pass) -> LHsType (GhcPass pass)
+                  -> Maybe ([Either (LHsGadtTelescope (GhcPass pass)) (HsConDeclField (GhcPass pass))],
+                            LHsType (GhcPass pass))
+splitGadtInterior args@(PrefixConGADT _ fields) ty
+  | Nothing <- splitGadtTerminal args ty
+  , Just (groups@(Left _ : _), result) <- go ty
+  , not (null fields) || context_before_binders groups
+  = Just (groups, result)
+  where
+    context_before_binders (Left (L _ HsGadtContext{}) : groups) =
+      any is_forall (takeWhile (not . isRight) groups)
+    context_before_binders _ = False
+
+    is_forall (Left (L _ HsGadtForAll{})) = True
+    is_forall _ = False
+
+    go ty = case ignoreParens ty of
+      L loc HsForAllTy { hst_tele = tele, hst_body = body }
+        | let group = HsGadtForAll noExtField tele
+        , case tele of
+            HsForAllVis { hsf_vis_bndrs = bs } -> not (null bs) || isEmptyGadtGroup group
+            HsForAllInvis { hsf_invis_bndrs = bs } -> not (null bs) || isEmptyGadtGroup group
+        -> next (Left (L loc group)) body
+      L _ HsQualTy { hst_ctxt = ctxt, hst_body = body } ->
+        next (Left (mkHsGadtContext ctxt)) body
+      L _ (HsFunTy _ arr arg result) ->
+        next (Right (gadt_field arr arg)) result
+      L _ HsForAllTy{} -> Nothing
+      L _ HsForEachTy{} -> Nothing
+      result -> Just ([], result)
+
+    gadt_field :: HsModifiedFunArr (GhcPass pass) -> LHsType (GhcPass pass)
+               -> HsConDeclField (GhcPass pass)
+    gadt_field arr arg = case ghcPass @pass of
+      GhcRn | L _ (XHsType (HsGadtFieldRn field)) <- arg -> field
+      _ -> CDF noAnn NoSrcUnpack NoSrcStrict arr arg Nothing
+
+    next group ty = do
+      (rest, result) <- go ty
+      return (group : rest, result)
+splitGadtInterior _ _ = Nothing
+
+-- | A source group that adds no binders or evidence to the constructor.
+-- Keep the syntax for source tools. Constructor metadata omits the group.
+isEmptyGadtGroup :: HsGadtTelescope (GhcPass pass) -> Bool
+isEmptyGadtGroup (HsGadtContext ctxt) = null (hsConDeclTheta (Just ctxt))
+isEmptyGadtGroup (HsGadtForAll _ HsForAllInvis
+  { hsf_invis_bndrs = [], hsf_matchability = Nothing }) = True
+isEmptyGadtGroup (HsGadtForAll _ HsForAllVis
+  { hsf_vis_bndrs = [], hsf_matchability = Nothing }) = True
+isEmptyGadtGroup _ = False
+
+{- Note [Constructor telescope contexts]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+HsGadtTelescope is shared by H98 and GADT constructors. Its nodes keep each
+forall group, context, and parenthesis in lexical order. A context must be
+renamed and checked before later binders enter scope. For example:
+
+  forall a. C a => forall a. a -> T
+
+The context refers to the first a. Do not move it after the second group.
+TH ForallC can also provide a context with no binders. Store that context
+as its own node. Do not insert an empty explicit forall, because it would
+change implicit quantification in a GADT signature.
+
+Each context child owns its arrow token and comments. The enclosing node
+has no copy of them. Prefix source signatures can contain consecutive
+contexts after the foralls. This is the curried-context part of proposal
+#402 and issue #27424. Record source signatures allow one context.
+A forall or context after a field needs an ordered DataCon telescope.
+TH prefixes can contain contexts before later forall groups.
+The ordered suffix can end with several quantifier or context groups.
+Keep the forms recognized by splitGadtTerminal on their existing
+representation so their interface encoding stays the same.
+After renaming and kind checking, the Core constructor type can combine the
+contexts. The resolved Names retain their scopes.
+
+Constructor contexts do not supply Given evidence for later matchability
+annotations. Each runtime group must check against U without evidence from
+its constructor-local contexts. DataCon wrapper types move all quantifiers
+before their contexts and store only fixed-U binder lists. See
+Note [Runtime declaration forall binders] in GHC.Iface.Syntax. Accepting a
+context-dependent annotation needs evidence transport through that conversion.
+-}
 
 ppr_con_names :: (OutputableBndr a) => [GenLocated l a] -> SDoc
 ppr_con_names = pprWithCommas (pprPrefixOcc . unLoc)

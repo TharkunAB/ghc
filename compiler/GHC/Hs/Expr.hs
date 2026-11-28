@@ -38,6 +38,7 @@ import GHC.Parser.Annotation
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.ErrCtxt
 import GHC.Types.Id.Info ( RecSelParent )
+import GHC.Types.Var (Id, CoVar)
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.Name.Set( FreeNames )
@@ -46,8 +47,10 @@ import GHC.Types.Fixity
 import GHC.Types.SourceText
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish (CoreTickish)
+import GHC.Types.Var (DepFunTyFlag(..))
 import GHC.Types.Unique.Set (UniqSet)
 import GHC.Types.ThLevelIndex
+import GHC.Core ( CoreExpr )
 import GHC.Core.ConLike ( conLikeName, ConLike )
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
@@ -239,8 +242,12 @@ type instance XLam           (GhcPass _) = EpAnnLam
 type instance XApp           (GhcPass _) = NoExtField
 
 type instance XAppTypeE      GhcPs = EpToken "@"
-type instance XAppTypeE      GhcRn = NoExtField
+type instance XAppTypeE      GhcRn = Maybe HsAppTypeSource
 type instance XAppTypeE      GhcTc = Type
+
+type instance XAppRetained   GhcPs = (EpToken "@", EpToken "{", EpToken "}")
+type instance XAppRetained   GhcRn = NoExtField
+type instance XAppRetained   GhcTc = (DepFunTyFlag, Type)
 
 -- OpApp not present in GhcTc pass; see GHC.Rename.Expr
 -- Note [Handling overloaded and rebindable constructs]
@@ -377,8 +384,9 @@ type instance XStatic        GhcTc = (Type, HsExpr GhcTc)
 type instance XEmbTy         GhcPs = EpToken "type"
 type instance XEmbTy         GhcRn = NoExtField
 type instance XEmbTy         GhcTc = DataConCantHappen
-  -- A free-standing HsEmbTy is an error.
-  -- Valid usages are immediately desugared into Type.
+  -- Required arguments translate to types. A checked TypeRep operand
+  -- expands to a term. See Note [Reflecting a checked type operand]
+  -- in GHC.Tc.Gen.Expr.
 
 type instance XStar          GhcPs = TokStar
 type instance XStar          GhcRn = TokStar
@@ -684,6 +692,18 @@ data XXExprGhcTc
 
   | ExpandedThingTc (HsExpansion GhcTc) -- ^ Typechecked expanded expression
 
+  -- | Checked schema, type witness and payload of an explicit package.
+  | NativeExistsPack Type Type (LHsExpr GhcTc)
+
+  -- | Scoped witness and payload binders, outer result type, package and body.
+  | NativeExistsUnpack TyVar Id Type (LHsExpr GhcTc) (LHsExpr GhcTc)
+
+  | NativeCaseAlias (LHsExpr GhcTc) Id CoVar Type (LHsExpr GhcTc)
+      -- See Note [Checked opaque case alias].
+
+  | NativeLetAlias (LHsExpr GhcTc) SourceLetRhs Id CoVar Type (LHsExpr GhcTc)
+      -- See Note [Checked optional let alias].
+
   | ConLikeTc
       -- ^ A 'ConLike', either a data constructor or pattern synonym
       --
@@ -706,6 +726,63 @@ data XXExprGhcTc
   | HsRecSelTc  (FieldOcc GhcTc) -- ^ Variable pointing to record selector
                              -- See Note [Non-overloaded record field selectors] and
                              -- Note [Record selectors in the AST]
+
+-- | A canonical RHS whose permission is fixed by committed proof use.
+-- See Note [Checked optional let alias].
+data SourceLetRhs
+  = PendingSourceLetRhs TcEvBinds CoreExpr
+  | CheckedSourceLetRhs (Maybe CoreExpr)
+
+{- Note [Checked optional let alias]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+NativeLetAlias carries a checked lazy local binding. Its fields are the
+ordinary RHS, canonical Core RHS, local value Id, nominal CoVar, result type
+and checked body. Both RHSs are outside the binders. The proof, result type and
+body are inside the value binder. The body is also inside the proof binder
+and contains its checked evidence bindings. The proof relates TermVarTy of
+the value to the canonical RHS index.
+
+Before zonking, PendingSourceLetRhs stores the original mutable implication
+evidence and the candidate Core RHS. Zonking reads the committed proof-use
+marker from ebs_needs. It emits CheckedSourceLetRhs with the canonical RHS
+only when that marker is present. The checked node retains no evidence
+reference. This is the same marker that commits source RULE and ABI uses.
+
+Desugar the body once. If the body does not use the proof, emit an ordinary
+lazy let with the ordinary RHS. Do not inspect the canonical RHS in this
+case. If the proof is used, require the committed canonical RHS. Validate
+its index and apply a retained lambda to that RHS and its reflexive proof.
+Use the same defining Id as dsApp for a certified function in this module.
+Zonking can replace a local occurrence with its earlier unannotated Id.
+Neither path evaluates the bound value before the body demands it.
+The source checker uses ExpandedThingTc to retain the source diagnostic.
+
+Use deep Core free variables to select the path. This includes evidence,
+coercions and types. An unused evidence binding can retain the proof and
+select the canonical path conservatively. Do not run ordinary occurrence
+analysis here: its binder rewrites do not preserve dependent Core scope.
+-}
+
+{- Note [Checked opaque case alias]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+NativeCaseAlias carries one checked strict case. Its fields are the checked
+scrutinee, actual result Id r, nominal CoVar q, result type and checked body.
+The scrutinee and result type are outside the scope of r and q. The body is
+inside both binders, with r before q. The proof relates TermVarTy r to the
+opaque call index. Neither binder may escape through the result type.
+
+Desugaring emits one explicit Case with a DEFAULT alternative that binds q.
+Do not use a lazy variable-pattern case or apply a retained function directly
+to the opaque call. The explicit case stays outside returned lambdas, even
+when the body does not use r. The source checker wraps this carrier in
+ExpandedThingTc so diagnostics print the original source. Its own printer
+shows the checked operation for debug output.
+
+Agda's with-abstraction generalizes a checked scrutinee and its context
+(Norell, 2007; Cockx and Abel, ICFP 2018; GHC Proposal #378, §4.5). Haskell's
+case also preserves bottom and demand order.
+See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -738,11 +815,12 @@ pprExpr :: (OutputableBndrId p) => HsExpr (GhcPass p) -> SDoc
 -- and not     f ... x
 pprExpr (HsPar _ e) = parens (pprLExpr e)
 
--- HsApp/HsAppType: always try to print the head of the application,
+-- In an application, always try to print its head,
 -- so we get      f (g ...) (h ...)
 -- rather than    f (...) (...)
 pprExpr e@(HsApp {})     = pprApp e
 pprExpr e@(HsAppType {}) = pprApp e
+pprExpr e@(HsAppRetained {}) = pprApp e
 
 -- Now trim with pprDeeper, unless the expression is atomic
 -- in which case replacing "x" with "..." is silly
@@ -751,7 +829,7 @@ pprExpr e
   | otherwise        = pprDeeper (ppr_expr e)
 
 -----------------------
-pprApp :: (OutputableBndrId p) => HsExpr (GhcPass p) -> SDoc
+pprApp :: forall p. (OutputableBndrId p) => HsExpr (GhcPass p) -> SDoc
 -- Pretty-print an application (f e1 .. en)
 --
 -- If we have reached the depth limit, we don't want to print
@@ -767,9 +845,19 @@ pprApp app
   where
     go fun args
       = case fun of
-          HsApp _     (L _ fun') arg -> go fun' (Left arg  : args)
-          HsAppType _ (L _ fun') arg -> go fun' (Right arg : args)
-          _                          -> ppr_app fun args
+          HsApp _         (L _ fun') arg -> go fun' (Left arg : args)
+          HsAppType ext   (L _ fun') arg -> go fun' (Right (char '@' <> ppr_type_arg ext arg) : args)
+          HsAppRetained ext (L _ fun') arg
+            | GhcTc <- ghcPass @p, (DepFunVisible, _) <- ext -> go fun' (Left arg : args)
+            | otherwise -> go fun' (Right (char '@' <> braces (pprLExpr arg)) : args)
+          _                              -> ppr_app fun args
+
+    ppr_type_arg :: XAppTypeE (GhcPass p) -> LHsWcType (NoGhcTc (GhcPass p)) -> SDoc
+    ppr_type_arg ext arg
+      | GhcRn <- ghcPass @p
+      , Just written <- ext
+      = ifPprDebug (ppr arg) (ppr written)
+      | otherwise = ppr arg
 
     ppr_app fun args
       -- Special case: (f x) should print as (f x)
@@ -795,7 +883,7 @@ pprApp app
         --     with that if it bites us; but arity-1000 functions are rather rare
 
     pp (Left arg)  = ppr_lexpr arg  -- We already gone deeper in ppr_app
-    pp (Right arg) = text "@" <> ppr arg
+    pp (Right arg) = arg
 
 -----------------------
 ppr_lexpr :: (OutputableBndrId p) => LHsExpr (GhcPass p) -> SDoc
@@ -806,6 +894,7 @@ ppr_expr :: forall p. (OutputableBndrId p)
 ppr_expr (HsPar _ e)         = parens (ppr_lexpr e)
 ppr_expr e@(HsApp {})        = pprApp e
 ppr_expr e@(HsAppType {})    = pprApp e
+ppr_expr e@(HsAppRetained {}) = pprApp e
 
 ppr_expr (HsVar _ (L _ v))   = pprPrefixOcc v
 ppr_expr (HsIPVar _ v)       = ppr v
@@ -1059,6 +1148,25 @@ instance Outputable XXExprGhcTc where
   ppr (ExpandedThingTc hse)
     = ppr_hse hse
 
+  ppr (NativeExistsPack schema witness payload)
+    = sep [ text "Pack" <+> char '@' <> parens (ppr schema)
+          , parens (text "type" <+> ppr witness), ppr payload ]
+
+  ppr (NativeExistsUnpack witness payload _ package body)
+    = sep [ text "case" <+> ppr package
+          , text "of Pack" <+> parens (text "type" <+> ppr witness)
+                           <+> ppr payload <+> arrow, ppr body ]
+
+  ppr (NativeCaseAlias scrut value proof _ body)
+    = sep [ text "<native-case-alias>" <+> ppr scrut
+          , text "of" <+> ppr value <+> brackets (ppr proof) <+> text "->"
+          , ppr body ]
+
+  ppr (NativeLetAlias rhs _ value proof _ body)
+    = sep [ text "<native-let-alias>" <+> ppr value <+> brackets (ppr proof)
+              <+> equals <+> ppr rhs
+          , text "in" <+> ppr body ]
+
   ppr (ConLikeTc con) = pprPrefixOcc con
    -- Used in error messages generated by
    -- the pattern match overlap checker
@@ -1096,6 +1204,10 @@ ppr_infix_expr_rn (HsRecSelRn f)            = Just (pprInfixOcc f)
 ppr_infix_expr_tc :: XXExprGhcTc -> Maybe SDoc
 ppr_infix_expr_tc (WrapExpr _ e)    = ppr_infix_expr e
 ppr_infix_expr_tc (ExpandedThingTc (HSE thing _))  = ppr_infix_hs_expansion thing
+ppr_infix_expr_tc (NativeExistsPack {})      = Nothing
+ppr_infix_expr_tc (NativeExistsUnpack {})    = Nothing
+ppr_infix_expr_tc (NativeCaseAlias {})       = Nothing
+ppr_infix_expr_tc (NativeLetAlias {})        = Nothing
 ppr_infix_expr_tc (ConLikeTc con)            = Just (pprInfixOcc (conLikeName con))
 ppr_infix_expr_tc (HsTick {})                = Nothing
 ppr_infix_expr_tc (HsBinTick {})             = Nothing
@@ -1139,6 +1251,7 @@ hsExprNeedsParens prec = go
     go (HsPar{})                      = False
     go (HsApp{})                      = prec >= appPrec
     go (HsAppType {})                 = prec >= appPrec
+    go (HsAppRetained {})             = prec >= appPrec
     go (OpApp{})                      = prec >= opPrec
     go (NegApp{})                     = prec > topPrec
     go (SectionL{})                   = True
@@ -1185,6 +1298,10 @@ hsExprNeedsParens prec = go
     go_x_tc :: XXExprGhcTc -> Bool
     go_x_tc (WrapExpr _ e)                   = hsExprNeedsParens prec e
     go_x_tc (ExpandedThingTc (HSE thing _))  = hsExpandedNeedsParens thing
+    go_x_tc (NativeExistsPack {})            = prec >= appPrec
+    go_x_tc (NativeExistsUnpack {})          = prec > topPrec
+    go_x_tc (NativeCaseAlias {})             = prec > topPrec
+    go_x_tc (NativeLetAlias {})              = prec > topPrec
     go_x_tc (ConLikeTc {})                   = False
     go_x_tc (HsTick _ (L _ e))               = hsExprNeedsParens prec e
     go_x_tc (HsBinTick _ _ (L _ e))          = hsExprNeedsParens prec e
@@ -1237,6 +1354,10 @@ isAtomicHsExpr (XExpr x)
     go_x_tc :: XXExprGhcTc -> Bool
     go_x_tc (WrapExpr _ e)            = isAtomicHsExpr e
     go_x_tc (ExpandedThingTc (HSE thing _)) = isAtomicExpandedThingRn thing
+    go_x_tc (NativeExistsPack {})     = False
+    go_x_tc (NativeExistsUnpack {})   = False
+    go_x_tc (NativeCaseAlias {})      = False
+    go_x_tc (NativeLetAlias {})       = False
     go_x_tc (ConLikeTc {})            = True
     go_x_tc (HsTick {})               = False
     go_x_tc (HsBinTick {})            = False

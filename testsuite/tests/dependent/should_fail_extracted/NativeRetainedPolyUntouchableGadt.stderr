@@ -1,0 +1,20 @@
+NativeRetainedPolyUntouchableGadt.hs:11:66: error: [GHC-25897]
+    • Could not deduce ‘a ~ G Int’
+      from the context: t ~ Int
+        bound by a pattern with constructor: GInt :: Int -> G Int,
+                 in a case alternative
+        at NativeRetainedPolyUntouchableGadt.hs:11:53-58
+      Expected: a
+        Actual: G t
+      ‘a’ is a rigid type variable bound by
+        the inferred type of escapeUntouchable :: Hidden -> a
+        at NativeRetainedPolyUntouchableGadt.hs:(10,1)-(11,67)
+    • In the expression: a
+      In a case alternative: Hidden (GInt _) a -> a
+      In the second argument of ‘useRetained’, namely
+        ‘(case (h :: Hidden) of Hidden (GInt _) a -> a)’
+    • Relevant bindings include
+        escapeUntouchable :: Hidden -> a
+          (bound at NativeRetainedPolyUntouchableGadt.hs:10:1)
+    Suggested fix: Consider giving ‘escapeUntouchable’ a type signature
+

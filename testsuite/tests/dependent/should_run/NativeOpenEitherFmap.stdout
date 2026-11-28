@@ -1,0 +1,6 @@
+(Refl,Refl)
+((Refl,Refl),Left 'x',Right False)
+(Refl,Refl)
+True
+True
+(Refl,Refl)

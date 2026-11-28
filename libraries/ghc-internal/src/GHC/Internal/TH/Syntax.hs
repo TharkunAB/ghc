@@ -904,6 +904,7 @@ data Exp
   | ForallE [TyVarBndr Specificity] Exp -- ^ @forall \<vars\>. \<expr\>@
   | ForallVisE [TyVarBndr ()] Exp      -- ^ @forall \<vars\> -> \<expr\>@
   | ConstrainedE [Exp] Exp             -- ^ @\<ctxt\> => \<expr\>@
+  | ForallMatchE Type Exp
   deriving( Show, Eq, Ord, Generic )
 
 -- | A (field name, expression) pair. See 'RecConE' and 'RecUpdE'.
@@ -1326,7 +1327,28 @@ data Con =
              -- Invariant: the list must be non-empty.
              [VarBangType] -- ^ The constructor arguments
              Type -- ^ See Note [GADT return type]
+  | ForallMatchC Type Con
+  | RetainedGadtC [Name] [RetainedGadtArg] Type
+    -- ^ A prefix GADT constructor with a retained index or late group.
+    -- The argument list is in source order. A trailing forall and its
+    -- context can also wrap the result type.
         deriving (Show, Eq, Ord, Generic)
+
+-- | An argument or group in the ordered signature of a prefix GADT constructor.
+data RetainedGadtArg
+  = GadtValueArg Bang Type Type
+    -- ^ Source bang, multiplicity, and type of an ordinary field.
+  | GadtIndexArg Name Type
+    -- ^ A visible runtime binder and its domain. The name scopes over the
+    -- later arguments and the constructor result.
+  | GadtInvisibleArgs Type [TyVarBndr Specificity]
+    -- ^ Matchability and binders of a nonempty invisible forall group.
+  | GadtRequiredArgs Type [TyVarBndr ()]
+    -- ^ Matchability and binders of a required forall group. An empty group
+    -- has no matchability annotation or binder.
+  | GadtContextArgs Cxt
+    -- ^ Predicates of a nonempty context group.
+  deriving (Show, Eq, Ord, Generic)
 
 -- Note [GADT return type]
 -- ~~~~~~~~~~~~~~~~~~~~~~~
@@ -1428,7 +1450,38 @@ data Type = ForallT [TyVarBndr Specificity] Cxt Type -- ^ @forall \<vars\>. \<ct
           | LitT TyLit                     -- ^ @0@, @1@, @2@, etc.
           | WildCardT                      -- ^ @_@
           | ImplicitParamT String Type     -- ^ @?x :: t@
+          | ForallMatchT Type Type
+          | ForEachT BndrVis Name Type Type
+            -- ^ A retained function type. The name binds a runtime argument
+            -- in the result type. Its domain is outside that scope.
+            -- 'BndrReq' uses @foreach (x :: t) -> r@. 'BndrInvis' uses
+            -- @foreach (x :: t). r@.
+          | IndexVarT Name                 -- ^ A retained term variable used in a type.
+          | CaseT Type [TypeCaseAlt]       -- ^ @case t of { p -> r; ... }@
+          | LetT Name Type Type            -- ^ @let v = rhs in body@. The scope of @v@ is @body@.
+          | LamT [Name] Type               -- ^ @\<vars\> -> body@. Binds one or more variables in @body@.
       deriving( Show, Eq, Ord, Generic )
+
+-- | A row in an ordered type case. Type variable occurrences in the
+-- pattern bind over the result of this row. A pattern uses the same type
+-- syntax as the arguments of a 'TySynEqn'.
+data TypeCaseAlt = TypeCaseAlt Type Type
+  deriving( Show, Eq, Ord, Generic )
+
+{- Note [Forall matchability wrappers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ForallMatchT, ForallMatchC and ForallMatchE annotate one immediate, nonempty
+forall group. Their first child gives the matchability of each binder in that
+group. It is outside the scope of all binders in the group. The second child
+must be a ForallT or ForallVisT, a ForallC, or a ForallE or ForallVisE,
+respectively. Splice conversion checks this invariant.
+
+The wrappers keep the arities of the existing constructors. An unwrapped
+constructor uses the source context's default. Quotation and reification wrap
+nonempty groups when their matchability is selected. An untyped declaration
+kind keeps omitted annotations contextual until splice formation checks its
+declaration prefix. Empty context-only groups remain unwrapped.
+-}
 
 -- | The specificity of a type variable in a @forall ...@.
 data Specificity = SpecifiedSpec          -- ^ @a@
@@ -1549,6 +1602,7 @@ get_cons_names (NormalC n _)     = [n]
 get_cons_names (RecC n _)        = [n]
 get_cons_names (InfixC _ n _)    = [n]
 get_cons_names (ForallC _ _ con) = get_cons_names con
+get_cons_names (ForallMatchC _ con) = get_cons_names con
 -- GadtC can have multiple names, e.g
 -- > data Bar a where
 -- >   MkBar1, MkBar2 :: a -> Bar a

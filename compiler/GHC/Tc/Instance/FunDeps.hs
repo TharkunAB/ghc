@@ -23,6 +23,8 @@ where
 
 import GHC.Prelude
 
+import GHC.Builtin.KnownKeys ( heqTyConKey )
+import GHC.Types.Unique ( hasKey )
 import GHC.Types.Var
 import GHC.Core.Class
 import GHC.Core.Predicate
@@ -267,7 +269,7 @@ improveClsFD clas_tvs fd
                equalLength tys_inst clas_tvs)
               (ppr tys_inst <+> ppr tys_actual) $
 
-    case tcMatchTyKisX init_subst ltys1 ltys2 of
+    case tcMatchInstanceTyKisX init_subst ltys1 ltys2 of
         Nothing  -> []
         Just subst | isJust (tcMatchTyKisX subst rtys1 rtys2)
                         -- Don't include any equations that already hold.
@@ -403,7 +405,7 @@ checkInstCoverage be_liberal clas theta inst_taus
        = NotValid not_covered_msg
        where
          (ls,rs) = instFD fd tyvars inst_taus
-         ls_tvs = tyCoVarsOfTypes ls
+         ls_tvs = closeOverKinds (injectiveVarsOfTypes True ls)
          rs_tvs = visVarsOfTypes rs
 
          undetermined_tvs | be_liberal = liberal_undet_tvs
@@ -517,14 +519,13 @@ Note [Equality superclasses]
 Suppose we have
   class (a ~ [b]) => C a b
 
-Remember from Note [The equality types story] in GHC.Builtin.WiredIn.Prim, that
-  * (a ~~ b) is a superclass of (a ~ b)
-  * (a ~# b) is a superclass of (a ~~ b)
+When closeWrtFunDeps expands superclasses, it gets the primitive
+equality (a ~# [b]). Account for the mutual functional dependencies
+implied by this EqPred. See #10778.
 
-So when closeWrtFunDeps expands superclasses we'll get a (a ~# [b]) superclass.
-But that's an EqPred not a ClassPred, and we jolly well do want to
-account for the mutual functional dependencies implied by (t1 ~# t2).
-Hence the EqPred handling in closeWrtFunDeps.  See #10778.
+The (~~) dictionary has no superclass selector. Account for its
+mutual dependencies in the same way. See Note [The HEq# evidence
+telescope] in GHC.Builtin.WiredIn.Types.
 
 Note [Care with type functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -574,6 +575,9 @@ closeWrtFunDeps preds fixed_tvs
        = case classifyPredType pred of
             EqPred NomEq t1 t2 -> [([t1],[t2]), ([t2],[t1])]
                -- See Note [Equality superclasses]
+
+            ClassPred cls [_,_,t1,t2]
+              | cls `hasKey` heqTyConKey -> [([t1],[t2]), ([t2],[t1])]
 
             ClassPred cls tys | not (isIPClass cls)
                -- isIPClass: see Note [closeWrtFunDeps ignores implicit parameters]
@@ -659,12 +663,15 @@ checkFunDeps inst_envs (ClsInst { is_tvs = qtvs1, is_cls = cls
       | instanceCantMatch trimmed_tcs rough_tcs2
       = False
       | otherwise
-      = case tcUnifyFunDeps qtvs ltys1 ltys2 of
+      = case tcUnifyFunDepsLHS qtvs ltys1 ltys2 of
           Nothing         -> False
           Just subst
-            -> isNothing $   -- Bogus legacy test (#10675)
+            -> let rtys1' = substTysUnchecked subst rtys1
+                   rtys2' = substTysUnchecked subst rtys2
+               in not (eqTypes rtys1' rtys2') &&
+                  isNothing (tcUnifyFunDeps qtvs rtys1' rtys2')
+                             -- Bogus legacy test (#10675)
                              -- See Note [Bogus consistency check]
-               tcUnifyFunDeps qtvs (substTysUnchecked subst rtys1) (substTysUnchecked subst rtys2)
 
       where
         trimmed_tcs    = trimRoughMatchTcs cls_tvs fd rough_tcs1

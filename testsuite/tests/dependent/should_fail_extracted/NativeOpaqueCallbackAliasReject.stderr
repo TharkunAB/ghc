@@ -1,0 +1,42 @@
+NativeOpaqueCallbackAliasReject.hs:12:23: error: [GHC-83605]
+    • No checked source equations are available for ‘localMapper’ in this retained argument.
+    • In the expression:
+        accepts localMapper True (token localMapper True)
+      In an equation for ‘directLocal’:
+          directLocal = accepts localMapper True (token localMapper True)
+
+NativeOpaqueCallbackAliasReject.hs:16:40: error: [GHC-83865]
+    • Couldn't match type: g1 True
+                     with: f2 True
+      Expected: Witness (f2 True)
+        Actual: Witness (g1 True)
+    • In the third argument of ‘accepts’, namely ‘(token g True)’
+      In the expression: accepts f True (token g True)
+      In the expression:
+        let
+          f = Provider.mapper
+          g = Provider.otherMapper
+        in accepts f True (token g True)
+
+NativeOpaqueCallbackAliasReject.hs:20:37: error: [GHC-83865]
+    • Couldn't match type: g True
+                     with: f1 True
+      Expected: Witness (f1 True)
+        Actual: Witness (g True)
+    • In the third argument of ‘accepts’, namely ‘(token g True)’
+      In the expression: accepts f True (token g True)
+      In the expression:
+        let
+          f = Provider.mapper
+          g = SameProvider.mapper
+        in accepts f True (token g True)
+
+NativeOpaqueCallbackAliasReject.hs:26:62: error: [GHC-83865]
+    • Couldn't match type ‘f True’ with ‘'l'’
+      Expected: Witness 'l'
+        Actual: Witness (f True)
+    • In the first argument of ‘literalResult’, namely ‘(token f True)’
+      In the expression: literalResult (token f True)
+      In the expression:
+        let f = Provider.mapper in literalResult (token f True)
+

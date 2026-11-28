@@ -1,0 +1,4 @@
+NativeSameModHidePlug.hs:71:1: error: [GHC-70566]
+    Cannot reduce the open call to ‘plug’ in a type.
+      The dependent type needs this equation. Export plug to make it available.
+

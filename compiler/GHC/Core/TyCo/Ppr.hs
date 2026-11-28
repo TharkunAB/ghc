@@ -9,8 +9,9 @@ module GHC.Core.TyCo.Ppr
         -- * Pretty-printing types
         pprType, pprParendType, pprTidiedType, pprPrecType, pprPrecTypeX,
         pprTypeApp, pprTCvBndr, pprTCvBndrs,
-        pprSigmaType,
+        pprSigmaType, pprDFunSigmaType,
         pprTheta, pprParendTheta, pprForAll, pprUserForAll,
+        pprForAllWithMatchability, pprUserForAllWithMatchability,
         pprTyVar, pprTyVars,
         pprThetaArrowTy, pprClassPred,
         pprKind, pprParendKind, pprTyLit,
@@ -28,13 +29,13 @@ import GHC.Prelude
 
 import {-# SOURCE #-} GHC.CoreToIface
    ( toIfaceTypeX, toIfaceTyLit, toIfaceForAllTyBndrs
+   , toIfaceForAllTyBndrsWithMatchability
    , toIfaceTyCon, toIfaceTcArgs, toIfaceCoercionX )
 
 import {-# SOURCE #-} GHC.Core.DataCon
    ( dataConFullSig , dataConUserTyVarBinders, DataCon )
 
-import GHC.Core.Type ( pickyIsLiftedTypeKind, pattern OneTy, pattern ManyTy,
-                       splitForAllReqTyBinders, splitForAllInvisTyBinders )
+import GHC.Core.Type ( pickyIsLiftedTypeKind, pattern OneTy, pattern ManyTy )
 
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
@@ -52,7 +53,6 @@ import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 
 import GHC.Utils.Outputable
-import GHC.Utils.Panic
 
 import GHC.Base ( Multiplicity(..) )
 import GHC.Types.Basic ( PprPrec(..), topPrec, sigPrec, opPrec
@@ -176,13 +176,25 @@ pprThetaArrowTy = pprIfaceContextArr . map tidyToIfaceType
 pprSigmaType :: Type -> SDoc
 pprSigmaType = pprIfaceSigmaType ShowForAllWhen . tidyToIfaceType
 
+-- | Print a dictionary function type for an instance header.
+pprDFunSigmaType :: Type -> SDoc
+pprDFunSigmaType = pprIfaceSigmaType ShowForAllDFun . tidyToIfaceType
+
 pprForAll :: [ForAllTyBinder] -> SDoc
 pprForAll tvs = pprIfaceForAll (toIfaceForAllTyBndrs tvs)
+
+-- | Print a quantified prefix with its stored metadata.
+pprForAllWithMatchability :: [(Matchability, ForAllTyBinder)] -> SDoc
+pprForAllWithMatchability = pprIfaceForAllWithMatchability . toIfaceForAllTyBndrsWithMatchability
 
 -- | Print a user-level forall; see @Note [When to print foralls]@ in
 -- "GHC.Iface.Type".
 pprUserForAll :: [ForAllTyBinder] -> SDoc
 pprUserForAll = pprUserIfaceForAll . toIfaceForAllTyBndrs
+
+-- | Print a user prefix without losing its stored metadata.
+pprUserForAllWithMatchability :: [(Matchability, ForAllTyBinder)] -> SDoc
+pprUserForAllWithMatchability = pprUserIfaceForAllWithMatchability . toIfaceForAllTyBndrsWithMatchability
 
 pprTCvBndrs :: [ForAllTyBinder] -> SDoc
 pprTCvBndrs tvs = sep (map pprTCvBndr tvs)
@@ -235,7 +247,7 @@ debugPprType :: Type -> SDoc
 -- as the normal route, but it's much more direct, and that can
 -- be useful for debugging.  E.g. with -dppr-debug it prints the
 -- kind on type-variable /occurrences/ which the normal route
--- fundamentally cannot do.
+-- fundamentally cannot do. Arrow metadata is explicit in this printer.
 debugPprType ty = debug_ppr_ty topPrec ty
 
 debug_ppr_ty :: PprPrec -> Type -> SDoc
@@ -245,9 +257,41 @@ debug_ppr_ty _ (LitTy l)
 debug_ppr_ty _ (TyVarTy tv)
   = ppr tv  -- With -dppr-debug we get (tv :: kind)
 
-debug_ppr_ty prec (FunTy { ft_af = af, ft_mult = mult, ft_arg = arg, ft_res = res })
+debug_ppr_ty _ (TermVarTy var)
+  = ppr var
+
+debug_ppr_ty prec (ClassAppTy selector inst dict operand _)
+  = maybeParen prec appPrec $
+      ppr selector <+> (char '@' <> debug_ppr_ty appPrec inst)
+        <+> debug_ppr_ty appPrec dict <+> debug_ppr_ty appPrec operand
+debug_ppr_ty prec (DepDictTy var body)
   = maybeParen prec funPrec $
-    sep [debug_ppr_ty funPrec arg, arr <+> debug_ppr_ty prec res]
+      parens (ppr var <+> dcolon <+> debug_ppr_ty topPrec (varType var))
+        <+> darrow <+> debug_ppr_ty topPrec body
+debug_ppr_ty prec (TermAppTy fun arg)
+  = maybeParen prec appPrec $ ppr fun <+> debug_ppr_ty appPrec arg
+
+debug_ppr_ty prec (ExistsTy flag var body)
+  = maybeParen prec funPrec $
+      pprExistsTy flag (parens (ppr var <+> dcolon <+> debug_ppr_ty topPrec (varType var)))
+                     (debug_ppr_ty topPrec body)
+debug_ppr_ty prec (DepFunTy vis var res)
+  = maybeParen prec funPrec $
+    case vis of
+      DepFunVisible   -> sep [binder, arrow <+> body]
+      DepFunInvisible -> sep [binder <> dot, body]
+  where
+    mult_doc = case idMult var of
+      ManyTy -> empty
+      OneTy  -> text "%1"
+      m      -> char '%' <> debug_ppr_ty appPrec m
+    binder = text "foreach" <+> parens (ppr var <+> mult_doc <+> dcolon <+> debug_ppr_ty topPrec (varType var))
+    body = debug_ppr_ty topPrec res
+
+debug_ppr_ty prec (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult, ft_arg = arg, ft_res = res })
+  = maybeParen prec funPrec $
+    sep [debug_ppr_ty funPrec arg, arr <+> brackets (debug_ppr_ty topPrec ma)
+                                       <+> debug_ppr_ty prec res]
   where
     arr = case mult of
       OneTy  -> pprArrowWithModifiers [] af One
@@ -272,34 +316,18 @@ debug_ppr_ty prec (CastTy ty co)
 debug_ppr_ty _ (CoercionTy co)
   = parens (text "CO" <+> ppr co)
 
--- Invisible forall:  forall {k} (a :: k). t
-debug_ppr_ty prec t
-  | (bndrs, body) <- splitForAllInvisTyBinders t
-  , not (null bndrs)
+-- Print one annotated binder at a time to preserve its outer scope.
+debug_ppr_ty prec (ForAllTy ma (Bndr tv vis) body)
   = maybeParen prec funPrec $
-    sep [ text "forall" <+> fsep (map ppr_bndr bndrs) <> dot,
-          ppr body ]
+    sep [ text "forall" <+> ppr_bndr <+> separator <+> char '@' <> pprParendType ma
+        , ppr body ]
   where
-    -- (ppr tv) will print the binder kind-annotated
-    -- when in debug-style
-    ppr_bndr (Bndr tv InferredSpec)  = braces (ppr tv)
-    ppr_bndr (Bndr tv SpecifiedSpec) = ppr tv
-
--- Visible forall:  forall x y -> t
-debug_ppr_ty prec t
-  | (bndrs, body) <- splitForAllReqTyBinders t
-  , not (null bndrs)
-  = maybeParen prec funPrec $
-    sep [ text "forall" <+> fsep (map ppr_bndr bndrs) <+> arrow,
-          ppr body ]
-  where
-    -- (ppr tv) will print the binder kind-annotated
-    -- when in debug-style
-    ppr_bndr (Bndr tv ()) = ppr tv
-
--- Impossible case: neither visible nor invisible forall.
-debug_ppr_ty _ ForAllTy{}
-  = panic "debug_ppr_ty: neither splitForAllInvisTyBinders nor splitForAllReqTyBinders returned any binders"
+    ppr_bndr
+      | Invisible InferredSpec <- vis = braces (ppr tv)
+      | otherwise = ppr tv
+    separator
+      | isInvisibleForAllTyFlag vis = dot
+      | otherwise = arrow
 
 {-
 Note [Infix type variables]

@@ -178,6 +178,7 @@ extensionName = \case
   LangExt.UnliftedDatatypes -> "UnliftedDatatypes"
   LangExt.BangPatterns -> "BangPatterns"
   LangExt.TypeFamilies -> "TypeFamilies"
+  LangExt.UnsaturatedTypeFamilies -> "UnsaturatedTypeFamilies"
   LangExt.TypeFamilyDependencies -> "TypeFamilyDependencies"
   LangExt.TypeInType -> "TypeInType"               -- Deprecated
   LangExt.OverloadedStrings -> "OverloadedStrings"
@@ -203,6 +204,7 @@ extensionName = \case
   LangExt.Modifiers -> "Modifiers"
   LangExt.LinearTypes -> "LinearTypes"
   LangExt.RequiredTypeArguments -> "RequiredTypeArguments"    -- Visible forall (VDQ) in types of terms
+  LangExt.DependentTypes -> "DependentTypes"
   LangExt.StandaloneDeriving -> "StandaloneDeriving"
   LangExt.DeriveDataTypeable -> "DeriveDataTypeable"
   LangExt.AutoDeriveTypeable -> "AutoDeriveTypeable"       -- Automatic derivation of Typeable
@@ -309,6 +311,7 @@ impliedXFlags
     , (LangExt.FunctionalDependencies,    On LangExt.MultiParamTypeClasses)
     , (LangExt.MultiParamTypeClasses,     On LangExt.ConstrainedClassMethods)  -- c.f. #7854
     , (LangExt.TypeFamilyDependencies,    On LangExt.TypeFamilies)
+    , (LangExt.UnsaturatedTypeFamilies,   On LangExt.TypeFamilies)
 
     , (LangExt.RebindableSyntax, Off LangExt.ImplicitPrelude)      -- NB: turn off!
 
@@ -372,6 +375,7 @@ impliedXFlags
 
     , (LangExt.ExplicitLevelImports, Off LangExt.ImplicitStagePersistence)
     , (LangExt.LinearTypes, On LangExt.Modifiers)
+    , (LangExt.DependentTypes, On LangExt.RequiredTypeArguments)
   ]
 
 
@@ -395,12 +399,16 @@ impliedGFlags = [(Opt_DeferTypeErrors, turnOn, Opt_DeferTypedHoles)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithStack)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithFallback)
                 ,(Opt_InfoTableMap, turnOn, Opt_Ticky_AP)
+                ,(Opt_WriteSourceEquations, turnOn, Opt_ExplicitWriteSourceEquations)
+                ,(Opt_WriteSourceEquations, turnOff, Opt_SuppressSourceEquations)
                 ] ++ validHoleFitsImpliedGFlags
 
 -- | General flags that are switched on/off when other general flags are switched
 -- off
 impliedOffGFlags :: [(GeneralFlag, TurnOnFlag, GeneralFlag)]
-impliedOffGFlags = [(Opt_Strictness, turnOff, Opt_WorkerWrapper)]
+impliedOffGFlags = [(Opt_Strictness, turnOff, Opt_WorkerWrapper)
+                   ,(Opt_WriteSourceEquations, turnOn, Opt_SuppressSourceEquations)
+                   ,(Opt_WriteSourceEquations, turnOff, Opt_ExplicitWriteSourceEquations)]
 
 -- | Debugging flags
 data DumpFlag
@@ -883,6 +891,12 @@ data GeneralFlag
    -- Known names; see Note [Overview of known entities] in GHC.Builtin.
    | Opt_DefinesKnownKeyNames
    | Opt_RebindableKnownNames
+   | Opt_PrintExplicitMatchabilities
+
+   | Opt_WriteSourceEquations
+   | Opt_ExplicitWriteSourceEquations
+   | Opt_SuppressSourceEquations
+   | Opt_ReportTotality
    deriving (Eq, Show, Enum)
 
 -- | The set of flags which affect optimisation for the purposes of
@@ -1112,6 +1126,9 @@ data WarningFlag =
    | Opt_WarnImplicitFieldStrictness                 -- ^ @since 10.2
    | Opt_WarnRedundantCanonicalMethods               -- ^ @since 10.2
    --search codebase for Opt_WarnRedundantCanonicalMethods for cleanup
+   | Opt_WarnPunBindings
+   | Opt_WarnPunUses
+   | Opt_WarnCusks                                  -- ^ @since 10.2
    deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | Return the names of a WarningFlag
@@ -1238,6 +1255,9 @@ warnFlagNames wflag = case wflag of
   Opt_WarnUnrecognisedModifiers                   -> "unrecognised-modifiers" :| []
   Opt_WarnSemaphoreOpenFailure                   -> "semaphore-open-failure" :| []
   Opt_WarnDefaultedCallStack                      -> "defaulted-callstack" :| []
+  Opt_WarnPunBindings                             -> "pun-bindings" :| []
+  Opt_WarnPunUses                                 -> "pun-uses" :| []
+  Opt_WarnCusks                                   -> "cusks" :| []
 
 -- -----------------------------------------------------------------------------
 -- Standard sets of warning options

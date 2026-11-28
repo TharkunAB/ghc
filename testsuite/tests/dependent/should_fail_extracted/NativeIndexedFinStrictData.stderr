@@ -1,0 +1,8 @@
+NativeIndexedFinStrictData.hs:5:23: error: [GHC-83605]
+    • A retained constructor requires a lazy ordinary data declaration with a lifted result kind.
+      Records, existential binders, equality specifications, and StrictData are not supported.
+      Its erased quantifiers must name exactly the datatype parameters.
+      A context may contain only homogeneous (~) constraints and requires datatype parameter order.
+    • In the definition of data constructor ‘StrictRetained’
+      In the data type declaration for ‘StrictRetained’
+

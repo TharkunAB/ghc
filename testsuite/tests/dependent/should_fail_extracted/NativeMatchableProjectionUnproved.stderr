@@ -1,0 +1,25 @@
+NativeMatchableProjectionUnproved.hs:11:17: error: [GHC-25897]
+    • Could not deduce ‘x ~ y’
+      from the context: f y ~ f x
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘cancel’
+        at NativeMatchableProjectionUnproved.hs:11:10-13
+      Expected: x :~: y
+        Actual: x :~: x
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          cancel :: forall (m :: Matchability) (f :: * %m -> *) x y.
+                    Proxy f -> (f x :~: f y) -> x :~: y
+        at NativeMatchableProjectionUnproved.hs:(9,1)-(10,35)
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          cancel :: forall (m :: Matchability) (f :: * %m -> *) x y.
+                    Proxy f -> (f x :~: f y) -> x :~: y
+        at NativeMatchableProjectionUnproved.hs:(9,1)-(10,35)
+    • In the expression: Refl
+      In an equation for ‘cancel’: cancel _ Refl = Refl
+    • Relevant bindings include
+        cancel :: Proxy f -> (f x :~: f y) -> x :~: y
+          (bound at NativeMatchableProjectionUnproved.hs:11:1)
+

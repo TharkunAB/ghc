@@ -154,13 +154,19 @@ recoverFullIfaceTypes sDocContext flattened ast = fmap (printed A.!) ast
     -- Unfold an 'HieType' whose subterms have already been unfolded
     go :: HieType IfaceType -> IfaceType
     go (HTyVarTy n) = IfaceTyVar (mkIfLclName $ getOccFS n)
+    go (HTermVarTy n) = IfaceTermVar (mkIfLclName $ getOccFS n)
+    go (HTermAppTy n arg) = IfaceTermAppTy (mkIfLclName $ getOccFS n) arg
+    go (HDepFunTy vis (mult, n, domain) body) =
+      IfaceDepFunTy vis (mult, mkIfLclName $ getOccFS n, domain) body
+    go (HExistsTy flag (n, k) body) =
+      IfaceExistsTy flag (mkIfLclName $ getOccFS n, k) body
     go (HAppTy a b) = IfaceAppTy a (hieToIfaceArgs b)
     go (HLitTy l) = IfaceLitTy l
-    go (HForAllTy ((n, k), af) t) =
+    go (HForAllTy ma ((n, k), af) t) =
       let b = (mkIfLclName $ getOccFS n, k)
-       in IfaceForAllTy (Bndr (IfaceTvBndr b) (IfaceForAllTyFlag af)) t
-    go (HFunTy w a b) = IfaceFunTy (visArg TypeLike) w a b -- t1 -> t2
-    go (HQualTy con b) = IfaceFunTy (invisArg TypeLike) many_ty con b -- c => t
+       in IfaceForAllTy ma (Bndr (IfaceTvBndr b) (IfaceForAllTyFlag af)) t
+    go (HFunTy ma w a b) = IfaceFunTy (visArg TypeLike) ma w a b -- t1 -> t2
+    go (HQualTy con b) = IfaceFunTy (invisArg TypeLike) ifaceUnmatchable many_ty con b -- c => t
     go (HCastTy a) = a
     go HCoercionTy = IfaceTyVar $ mkIfLclName "<coercion type>"
     go (HTyConApp a xs) = IfaceTyConApp a (hieToIfaceArgs xs)

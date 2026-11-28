@@ -1,0 +1,8 @@
+NativePercentArrowPprMismatch.hs:7:7: error: [GHC-83865]
+    • Couldn't match type ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected: (Int %M %1 -> Bool) :~: (Int %U %1 -> Bool)
+        Actual: (Int %M %1 -> Bool) :~: (Int %M %1 -> Bool)
+    • In the expression: Refl
+      In an equation for ‘bad’: bad = Refl
+

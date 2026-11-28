@@ -38,6 +38,7 @@ import GHC.Tc.Utils.TcType -- InstEnv is really part of the type checker,
 import GHC.Core ( IsOrphan(..), isOrphan, chooseOrphanAnchor )
 import GHC.Core.RoughMap
 import GHC.Core.Class
+import GHC.Core.TyCo.Ppr ( pprDFunSigmaType )
 import GHC.Core.Unify
 import GHC.Core.FVs( orphNamesOfTypes, orphNamesOfType )
 import GHC.Hs.Decls.Overlap
@@ -244,7 +245,7 @@ pprInstanceHdr (ClsInst { is_flag = flag, is_dfun = dfun })
 
 ppr_overlap_dfun_hdr :: SDoc -> DFunId -> SDoc
 ppr_overlap_dfun_hdr flag_sdoc dfun
-  = text "instance" <+> flag_sdoc <+> pprSigmaType (idType dfun)
+  = text "instance" <+> flag_sdoc <+> pprDFunSigmaType (idType dfun)
 
 pprInstances :: [ClsInst] -> SDoc
 pprInstances ispecs = vcat (map pprInstance ispecs)
@@ -273,7 +274,7 @@ orphNamesOfClsInst :: ClsInst -> NameSet
 orphNamesOfClsInst (ClsInst { is_cls_nm = cls_nm, is_tys = tys })
   = orphNamesOfTypes tys `unionNameSet` unitNameSet cls_nm
 
-instanceSig :: ClsInst -> ([TyVar], [Type], Class, [Type])
+instanceSig :: ClsInst -> ([(Matchability, TyVar)], [Type], Class, [Type])
 -- Decomposes the DFunId
 instanceSig ispec = tcSplitDFunTy (idType (is_dfun ispec))
 
@@ -342,7 +343,8 @@ mkImportedClsInst cls_nm mb_tcs dfun_name dfun oflag orphan warn
             , is_orphan = orphan
             , is_warn = warn }
   where
-    (tvs, _, cls, tys) = tcSplitDFunTy (idType dfun)
+    (ma_tvs, _, cls, tys) = tcSplitDFunTy (idType dfun)
+    tvs = map snd ma_tvs
 
 {-
 Note [When exactly is an instance decl an orphan?]
@@ -549,8 +551,8 @@ identicalClsInstHead (ClsInst { is_tcs = rough1, is_tys = tys1 })
                      (ClsInst { is_tcs = rough2, is_tys = tys2 })
   =  not (instanceCantMatch rough1 rough2)  -- Fast check for no match, uses the "rough match" fields;
                                             -- also accounts for class name.
-  && isJust (tcMatchTys tys1 tys2)
-  && isJust (tcMatchTys tys2 tys1)
+  && isJust (tcMatchInstanceTys tys1 tys2)
+  && isJust (tcMatchInstanceTys tys2 tys1)
 
 {-
 ************************************************************************
@@ -1214,7 +1216,7 @@ instEnvMatchesAndUnifiers (InstEnv rm) vis_mods cls tys
       | not (instIsVisible vis_mods item)
       = acc  -- See Note [Instance lookup and orphan instances]
 
-      | Just subst <- tcMatchTys tpl_tys tys
+      | Just subst <- tcMatchInstanceTys tpl_tys tys
       = ((item, map (lookupTyVar subst) tpl_tvs) : acc)
 
       | otherwise
@@ -1228,7 +1230,7 @@ instEnvMatchesAndUnifiers (InstEnv rm) vis_mods cls tys
       = check_unifiers items  -- See Note [Instance lookup and orphan instances]
 
       -- If it matches, check_match has gotten it, so skip over it here
-      | Just {} <- tcMatchTys tpl_tys tys
+      | Just {} <- tcMatchInstanceTys tpl_tys tys
       = check_unifiers items
 
       -- Does not match, so next check whether the things unify
@@ -1526,7 +1528,7 @@ new_inst `overrides` old_inst
     -- `instB` can be instantiated to match `instA`
     -- or the two are equal
     instA `more_specific_than` instB
-      = isJust (tcMatchTys (is_tys instB) (is_tys instA))
+      = isJust (tcMatchInstanceTys (is_tys instB) (is_tys instA))
 
 insert_overlapping :: InstMatch -> InstMatches -> InstMatches
 -- ^ Add a new solution, knocking out strictly less specific ones

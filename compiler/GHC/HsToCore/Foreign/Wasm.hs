@@ -139,7 +139,7 @@ dsWasmJSDynamicExport sync fn_id co unitId = do
   sp_tycon <- dsLookupKnownKeyTyCon stablePtrTyConKey
   let ty = coercionLKind co
       (tv_bndrs, fun_ty) = tcSplitForAllTyVarBinders ty
-      ([Scaled ManyTy arg_ty], io_jsval_ty) = tcSplitFunTys fun_ty
+      (_, [Scaled ManyTy arg_ty], io_jsval_ty) = tcSplitFunTys fun_ty
       sp_ty = mkTyConApp sp_tycon [arg_ty]
   sp_id <- newSysLocalMDs sp_ty
   work_export_name <- unpackFS <$> uniqueCFunName
@@ -152,7 +152,7 @@ dsWasmJSDynamicExport sync fn_id co unitId = do
       "GHC.Internal.IO.Unsafe"
       "unsafeDupablePerformIO"
   let work_rhs =
-        mkCoreLams ([tv | Bndr tv _ <- tv_bndrs] ++ [sp_id])
+        mkCoreLams ([tv | (_, Bndr tv _) <- tv_bndrs] ++ [sp_id])
           $ mkApps
             (Var unsafeDupablePerformIO_id)
             [Type arg_ty, mkApps (Var deRefStablePtr_id) [Type arg_ty, Var sp_id]]
@@ -177,7 +177,7 @@ dsWasmJSDynamicExport sync fn_id co unitId = do
               generatedSrcSpan
           )
           adjustor_ty
-      adjustor_ty = mkForAllTys tv_bndrs $ mkVisFunTysMany [sp_ty] io_jsval_ty
+      adjustor_ty = mkForAllTys tv_bndrs $ mkVisFunTysManyU [sp_ty] io_jsval_ty
       adjustor_js_src =
         "(...args) => __exports." ++ work_export_name ++ "($1, ...args)"
   (adjustor_bs, adjustor_h, adjustor_c) <-
@@ -192,13 +192,13 @@ dsWasmJSDynamicExport sync fn_id co unitId = do
       "GHC.Internal.Wasm.Prim.Exports"
       "mkJSCallback"
   let wrap_rhs =
-        mkCoreLams [tv | Bndr tv _ <- tv_bndrs]
+        mkCoreLams [tv | (_, Bndr tv _) <- tv_bndrs]
           $ mkApps
             (Var mkJSCallback_id)
             [ Type arg_ty,
               mkApps
                 (Var adjustor_id)
-                [Type $ mkTyVarTy tv | Bndr tv _ <- tv_bndrs]
+                [Type $ mkTyVarTy tv | (_, Bndr tv _) <- tv_bndrs]
             ]
   pure
     ( [(fn_id, Cast wrap_rhs co)] ++ work_bs ++ adjustor_bs,
@@ -316,8 +316,9 @@ dsWasmJSStaticImport ::
 dsWasmJSStaticImport fn_id co js_src' unitId sync = do
   cfun_name <- uniqueCFunName
   let ty = coercionLKind co
-      (tvs, fun_ty) = tcSplitForAllInvisTyVars ty
-      (arg_tys, orig_res_ty) = tcSplitFunTys fun_ty
+      (ma_tvs, fun_ty) = tcSplitForAllInvisTyVars ty
+      tvs = map snd ma_tvs
+      (_, arg_tys, orig_res_ty) = tcSplitFunTys fun_ty
       (res_ty, is_io) = case tcSplitIOType_maybe orig_res_ty of
         Just (_, res_ty) -> (res_ty, True)
         Nothing -> (orig_res_ty, False)
@@ -444,7 +445,7 @@ importBindingRHS unitId cfun_name tvs arg_tys orig_res_ty res_trans = do
                 ( mkTupleTy Unboxed [realWorldStatePrimTy, res_ty],
                   \the_call -> mkApps (Var toIOCon) [Type res_ty, the_call]
                 )
-      pure (realWorldStatePrimTy `mkVisFunTyMany` ccall_res_ty, wrap)
+      pure (realWorldStatePrimTy `mkVisFunTyManyU` ccall_res_ty, wrap)
     Nothing -> do
       unsafeDupablePerformIO_id <-
         lookupGhcInternalVarId
@@ -459,7 +460,7 @@ importBindingRHS unitId cfun_name tvs arg_tys orig_res_ty res_trans = do
               [ Type orig_res_ty,
                 mkApps (Var toIOCon) [Type orig_res_ty, the_call]
               ]
-      pure (realWorldStatePrimTy `mkVisFunTyMany` ccall_res_ty, wrap)
+      pure (realWorldStatePrimTy `mkVisFunTyManyU` ccall_res_ty, wrap)
   let cfun_fcall =
         CCall
           ( CCallSpec
@@ -649,7 +650,7 @@ dsWasmJSExport' ::
 dsWasmJSExport' sync m_fn_id co ext_name = do
   let ty = coercionRKind co
       (_, fun_ty) = tcSplitForAllInvisTyVars ty
-      (arg_tys, orig_res_ty) = tcSplitFunTys fun_ty
+      (_, arg_tys, orig_res_ty) = tcSplitFunTys fun_ty
       (res_ty, is_io) = case tcSplitIOType_maybe orig_res_ty of
         Just (_, res_ty) -> (res_ty, True)
         Nothing -> (orig_res_ty, False)

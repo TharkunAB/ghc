@@ -29,7 +29,7 @@ import GHC.HsToCore.Utils
 import GHC.HsToCore.Arrows
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Pmc
-import GHC.HsToCore.Types( LdiNablas(..) )
+import GHC.HsToCore.Types( LdiNablas(..), ds_type_env )
 import GHC.HsToCore.Pmc.Utils
 import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.Quote
@@ -45,11 +45,14 @@ import GHC.Tc.Utils.Monad
 import GHC.Tc.Instance.Class (lookupHasFieldLabel)
 
 import GHC.Core
-import GHC.Core.FVs( exprFreeVarsList, exprsFreeVarsList )
+import GHC.Core.Coercion ( coVarLType, coVarRType, coVarRole, mkNomReflCo )
+import GHC.Core.Dependent ( hasNativeDependentExprRhs )
+import GHC.Core.FVs( exprFreeVars, exprFreeVarsList, exprsFreeVarsList )
 import GHC.Core.FamInstEnv( topNormaliseType )
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep
 import GHC.Core.Utils
+import qualified GHC.Core.Subst as CoreSubst
 import GHC.Core.Make
 import GHC.Core.Make.Box ( mkBox, mkUnbox )
 import GHC.Core.Make.BigTuple ( mkBigCoreTupTy )
@@ -62,10 +65,12 @@ import GHC.Types.CostCentre
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Var( isInvisibleAnonPiTyBinder )
-import GHC.Types.Var.Set( isEmptyVarSet, elemVarSet )
+import GHC.Types.Var.Set( isEmptyVarSet, elemVarSet, extendVarSet )
+import GHC.Types.Var.Env( mkInScopeSet )
 import GHC.Types.Basic
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish
+import GHC.Types.TypeEnv (restoreSourceTableId)
 
 import GHC.Unit.Module
 import GHC.Core.ConLike
@@ -208,8 +213,10 @@ ds_val_bind _ (is_rec, binds) body
 
         ; case prs of
             [] -> return body
-            _  -> return (mkLets (mk_binds is_rec prs) $
-                          foldr seqVar body force_vars )
+            _  -> do { indices <- withRuntimeIndexTypes (exprType body : map (idType . fst) prs)
+                                  getRuntimeIndices
+                     ; return (mkLets (mk_binds is_rec prs) $
+                               foldr (seqVar indices) body force_vars) }
             -- We can make a non-recursive let because we make sure to return
             -- the bindings in dependency order in dsLHsBinds,
             -- see Note [Return non-recursive bindings in dependency order] in
@@ -285,6 +292,7 @@ dsExpr :: HsExpr GhcTc -> DsM CoreExpr
 dsExpr e@(HsVar {})                 = dsApp e
 dsExpr e@(HsApp {})                 = dsApp e
 dsExpr e@(HsAppType {})             = dsApp e
+dsExpr e@(HsAppRetained {})         = dsApp e
 
 dsExpr (HsHole (_, (HER ref _ _))) = dsEvTerm =<< readMutVar ref
       -- See Note [Holes in expressions] in GHC.Tc.Types.Constraint.
@@ -310,6 +318,52 @@ dsExpr e@(XExpr ext_expr_tc)
       ConLikeTc {}  -> dsApp e
 
       ExpandedThingTc (HSE _ e) -> dsLExpr e
+
+      NativeExistsPack schema witness payload
+        -> Pack schema witness <$> dsLExpr payload
+
+      NativeExistsUnpack witness payload _ package body
+        -> Unpack witness payload <$> dsLExpr package <*> dsLExpr body
+
+      -- See Note [Checked opaque case alias] in GHC.Hs.Expr.
+      NativeCaseAlias scrut value proof result_ty body
+        -> do { scrut' <- dsLExpr scrut
+              ; body' <- dsLExpr body
+              ; return (Case scrut' value result_ty [Alt DEFAULT [proof] body']) }
+
+      -- See Note [Checked optional let alias] in GHC.Hs.Expr.
+      NativeLetAlias rhs canonical_rhs value proof result_ty body
+        -> do { body' <- dsLExpr body
+              ; if proof `elemVarSet` exprFreeVars body'
+                then do
+                  { env <- getGblEnv
+                  ; let restore (Var v) = Var (restoreSourceTableId (ds_type_env env) v)
+                        restore (App f x) = App (restore f) (restore x)
+                        restore (Cast e co) = Cast (restore e) co
+                        restore arg = arg
+                  ; canonical <- case canonical_rhs of
+                      CheckedSourceLetRhs (Just operand) -> return (restore operand)
+                      _ -> pprPanic "NativeLetAlias: unrecorded proof" (ppr value $$ ppr proof)
+                  ; let mb_index
+                          | isNativeIndexFunctionId value = nativeIndexFunctionArgIndex canonical
+                          | otherwise                     = retainedArgIndex canonical
+                  ; case mb_index of
+                      Just index
+                        | isNativeOpaqueValueId value
+                        , coVarRole proof == Nominal
+                        , coVarLType proof `eqType` TermVarTy value
+                        , coVarRType proof `eqType` index
+                        , exprType canonical `eqType` idType value
+                        , typeKind index `eqType` idType value
+                        -> let result = mkApps (mkLams [value, proof] body')
+                                              [canonical, Coercion (mkNomReflCo index)]
+                           in if exprType result `eqType` result_ty
+                              then return result
+                              else pprPanic "NativeLetAlias result type" (ppr result_ty $$ ppr result)
+                      _ -> pprPanic "NativeLetAlias canonical index"
+                             (ppr canonical $$ ppr value $$ ppr (idType proof)) }
+                else do { rhs' <- dsLExpr rhs
+                        ; return (Let (NonRec value rhs') body') } }
 
       -- Hpc Support
       HsTick tickish e -> do
@@ -347,8 +401,13 @@ dsExpr (NegApp _ expr neg_expr)
   = do { expr' <- dsLExpr expr
        ; dsSyntaxExpr neg_expr [expr'] }
 
-dsExpr (HsLam _ variant a_Match)
-  = uncurry mkCoreLams <$> matchWrapper (LamAlt variant) Nothing a_Match
+dsExpr (HsLam _ variant group)
+  = uncurry mkCoreLams <$> matchWrapper ctxt Nothing group
+  where
+    -- See Note [Implicit existential function patterns] in GHC.Tc.Gen.Match.
+    ctxt | LamCases <- variant
+         , L _ (L _ Match{m_ctxt = fun_ctxt@FunRhs{}} : _) <- mg_alts group = fun_ctxt
+         | otherwise = LamAlt variant
 
 
 {-
@@ -425,11 +484,27 @@ dsExpr (HsPragE _ (HsPragSCC _ cc) expr)
 dsExpr (HsCase ctxt discrim matches)
   = do { core_discrim <- dsLExpr discrim
        ; ([discrim_var], matching_code) <- matchWrapper ctxt (Just [core_discrim]) matches
-       ; return (bindNonRec discrim_var core_discrim matching_code) }
+       ; return $ case core_discrim of
+           Var index | any indexed_row (unLoc (mg_alts matches)) ->
+             -- Keep the actual scrutinee named in the branch proof. The
+             -- checked operand is already a variable, so it stays shared.
+             let scope = mkInScopeSet (extendVarSet (exprFreeVars matching_code) index)
+                 subst = CoreSubst.extendIdSubstWithClone (CoreSubst.mkEmptySubst scope)
+                                                        discrim_var index
+             in CoreSubst.substExpr subst matching_code
+           _ -> bindNonRec discrim_var core_discrim matching_code }
+  where
+    indexed_row match =
+      case hsLMatchPats match of
+        [L _ (ConPat { pat_con = L _ (RealDataCon con)
+                     , pat_con_ext = ConPatTc { cpt_dicts = dicts } })]
+          | Just _ <- splitNativeIndexedPatternEvidence con dicts -> True
+        _ -> False
 
 -- Pepe: The binds are in scope in the body but NOT in the binding group
 --       This is to avoid silliness in breakpoints
-dsExpr (HsLet _ binds body) = do
+dsExpr (HsLet _ binds body) =
+  withRuntimeIndexTypes (map idType (collectLocalBinders CollWithDictBinders (unLoc binds))) $ do
     body' <- dsLExpr body
     dsLocalBinds binds body'
 
@@ -507,7 +582,8 @@ dsExpr (HsStatic (static_ptr_ty, from_static_fun) expr@(L loc _))
              static_rhs = mkLams static_fvs $
                           mkCoreApps (Var make_static_id) [ Type ty, srcLoc, expr_ds ]
 
-       ; static_id <- newStaticId (mkSpecForAllTys static_fvs static_ptr_ty)
+       ; static_id <- newStaticId
+           (mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- static_fvs] static_ptr_ty)
 
        -- Emit the static bindings to top level, but NOT when we are in
        -- the auxiliary desugaring for the pattern-match checking
@@ -545,7 +621,7 @@ dsExpr (RecordCon { rcon_con  = L _ con_like
 -- See Note [Desugaring record construction]
   = do { con_expr' <- dsExpr con_expr
        ; let
-             (arg_tys, _) = tcSplitFunTys (exprType con_expr')
+             (_, arg_tys, _) = tcSplitFunTys (exprType con_expr')
              -- A newtype in the corner should be opaque;
              -- hence TcType.tcSplitFunTys
 
@@ -674,7 +750,22 @@ implemented in the `seqId` case of `ds_app_var`:
     The reason it's a hack is because if you define mySeq=seq, the hack
     won't work on mySeq.
 
- 3. (as described in #2409)
+ 3. A native index must keep its outer identity when the second operand
+    contains native syntax. For example, suppose ys :: Vec Int ('S k).
+    Reusing k as the case binder for k `seq` vecList @('S k) ys introduces
+    a shadowing binder. Capture-avoiding substitution then clones this binder
+    and changes the explicit type argument. The captured ys still has its
+    original type, which mentions the outer k. These types no longer match.
+
+    Use an unused case binder on this path. Keep references to the outer k
+    in both the explicit type argument and the captured value's type.
+    Apply the same restriction to an opaque call head f in a type f n.
+    This changes neither evaluation of the first operand nor its order.
+    The scanner checks the expression. It does not inspect unfolding or
+    rule metadata.
+    See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+
+ 4. (as described in #2409)
 
     The isInternalName ensures that we don't turn
             True `seq` e
@@ -705,6 +796,10 @@ ds_app (HsApp _ fun arg) hs_args core_args
 
 ds_app (HsAppType arg_ty fun _) hs_args core_args
   = ds_lapp fun hs_args (Type arg_ty : core_args)
+ds_app (HsAppRetained _ fun arg) hs_args core_args
+  = do { core_arg <- unsetGOptM Opt_EnableRewriteRules (dsLExpr arg)
+         -- See Note [Desugaring retained operands]
+       ; ds_lapp fun (arg : hs_args) (core_arg : core_args) }
 
 ds_app (XExpr (WrapExpr hs_wrap fun)) hs_args core_args
   = do { (fun_wrap, all_args) <- splitHsWrapperArgs hs_wrap core_args
@@ -807,12 +902,14 @@ ds_app_var (L loc fun_id) hs_args core_args
 
   -----------------------
   -- Deal with `seq`
-  -- See Note [Desugaring seq], points (1) and (2)
+  -- See Note [Desugaring seq].
   | fun_id `hasKey` seqIdKey
   , Type _r : Type ty1 : Type ty2 : arg1 : arg2 : rest_args <- core_args
   , let case_bndr = case arg1 of
             Var v1 | isInternalName (idName v1)
-                  -> v1        -- Note [Desugaring seq], points (2) and (3)
+                   , not ((isNativeIndexId v1 || isNativeIndexFunctionId v1)
+                          && hasNativeDependentExprRhs arg2)
+                  -> v1        -- Note [Desugaring seq], points (2), (3) and (4)
             _     -> mkWildValBinder ManyTy ty1
   = return (Case arg1 case_bndr ty2 [Alt DEFAULT [] arg2]
             `mkCoreApps` rest_args)
@@ -861,11 +958,14 @@ ds_app_finish :: Id -> [CoreExpr] -> DsM CoreExpr
 --     nospec f dict
 -- See Note [nospecId magic] in GHC.Types.Id.Make for what `nospec` does.
 -- See Note [Desugaring non-canonical evidence]
-ds_app_finish fun_id core_args
+ds_app_finish original_id core_args
   = do { mb_unspecables <- getUnspecables
-       ; let fun_ty = idType fun_id
+       ; env <- getGblEnv
+       ; let fun_id = restoreSourceTableId (ds_type_env env) original_id
+             fun_ty = idType fun_id
+             (_, pi_bndrs, _) = splitPiTys fun_ty
              free_dicts = exprsFreeVarsList
-                            [ e | (e,pi_bndr) <- core_args `zip` fst (splitPiTys fun_ty)
+                            [ e | (e,pi_bndr) <- core_args `zip` pi_bndrs
                                 , isInvisibleAnonPiTyBinder pi_bndr ]
 
              fun | Just unspecables <- mb_unspecables
@@ -1083,6 +1183,18 @@ liberally on "moderately" sized lists should rarely hurt and will often it can
 only expose further optimization opportunities; if no fusion is possible it will
 eventually get rule-rewritten back to a list). We do, however, pay in compile
 time.
+-}
+{- Note [Desugaring retained operands]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The typechecker can use the constructors of a list literal in a result
+index. For example, sourceVector [True, False] returns a vector of length
+two. With rewrite rules enabled, dsExplicitList normally generates a
+call to build. That call has no constructor index in Core.
+
+Desugar the retained operand with rewrite rules disabled. This also
+preserves list constructors inside a larger operand. Ordinary arguments
+in the same application still use the module's rewrite settings.
+See Note [Desugaring RULE left hand sides] in GHC.HsToCore.
 -}
 maxBuildLength :: Int
 maxBuildLength = 32

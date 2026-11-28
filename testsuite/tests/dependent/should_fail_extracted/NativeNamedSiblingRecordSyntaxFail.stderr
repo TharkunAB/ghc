@@ -1,0 +1,4 @@
+NativeNamedSiblingRecordSyntaxFail.hs:5:33: error: [GHC-89246]
+    • Record syntax is illegal here: {badField :: Int}
+    • In the definition of data constructor ‘Bad’
+

@@ -1,0 +1,36 @@
+NativeIrredIndexEvidence.hs:21:35: error: [GHC-05617]
+    • Could not deduce ‘v1 ~ other1’
+      from the context: b1 ~ Flip a
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘wrong’
+        at NativeIrredIndexEvidence.hs:21:19-22
+      Expected: Proxy v1
+        Actual: Proxy other1
+    • In the second argument of ‘View’, namely ‘(Proxy @other)’
+      In the expression: View @a (Proxy @other)
+      In an equation for ‘wrong’:
+          wrong a b v other Refl = View @a (Proxy @other)
+    • Relevant bindings include
+        other :: Token b1 (bound at NativeIrredIndexEvidence.hs:21:13)
+        v :: Token b1 (bound at NativeIrredIndexEvidence.hs:21:11)
+
+NativeIrredIndexEvidence.hs:33:45: error: [GHC-05617]
+    • Could not deduce ‘v ~ other’
+      from the context: b ~ Flip a
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘wrongFixed’
+        at NativeIrredIndexEvidence.hs:33:24-27
+      Expected: Payload (Flip a) v
+        Actual: Payload (Flip a) other
+    • In the second argument of ‘FixedView’, namely
+        ‘(Payload @(Flip a) @other)’
+      In the expression: FixedView @a (Payload @(Flip a) @other)
+      In an equation for ‘wrongFixed’:
+          wrongFixed a b v other Refl
+            = FixedView @a (Payload @(Flip a) @other)
+    • Relevant bindings include
+        other :: Token b (bound at NativeIrredIndexEvidence.hs:33:18)
+        v :: Token b (bound at NativeIrredIndexEvidence.hs:33:16)
+

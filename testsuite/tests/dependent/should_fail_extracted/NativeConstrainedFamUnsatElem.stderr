@@ -1,0 +1,5 @@
+NativeConstrainedFamUnsatElem.hs:7:12: error: [GHC-90647]
+    • Constrained associated type family ‘Elem’
+      Supply ‘c’ to determine the instance of ‘Collects’.
+    • In the type signature: partial :: Uses Elem
+

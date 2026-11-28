@@ -43,6 +43,7 @@ import {-# SOURCE #-} GHC.Rename.Splice ( rnSplicePat, rnSpliceTyPat )
 import GHC.Hs
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
+import GHC.Tc.Utils.Env (isExistsPackName)
 import GHC.Tc.Utils.TcMType ( hsOverLitKnownOcc )
 
 import GHC.Rename.Doc (rnLHsDoc)
@@ -86,7 +87,6 @@ import Data.Ratio
 import Control.Monad.Trans.Writer.CPS
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
-import Data.Coerce
 
 {-
 *********************************************************
@@ -417,16 +417,16 @@ There are various entry points to renaming patterns, depending on
 -- Those are the only call sites, so we inline it for improved performance.
 -- Kind of like a macro.
 {-# INLINE rn_pats_general #-}
-rn_pats_general :: Traversable f => HsMatchContextRn
-  -> f (LPat GhcPs)
+rn_pats_general :: Foldable f => HsMatchContextRn
+  -> CpsRn (f (LPat GhcRn))
   -> (f (LPat GhcRn) -> RnM (r, FreeNames))
   -> RnM (r, FreeNames)
-rn_pats_general ctxt pats thing_inside = do
+rn_pats_general ctxt rename_pats thing_inside = do
   envs_before <- getRdrEnvs
 
   -- (1) rename the patterns, bringing into scope all of the term variables
   -- (2) then do the thing inside.
-  unCpsRn (rn_pats_fun (matchNameMaker ctxt) pats) $ \ pats' -> do
+  unCpsRn rename_pats $ \ pats' -> do
     -- Check for duplicated and shadowed names
     -- Must do this *after* renaming the patterns
     -- See Note [Collect binders only after renaming] in GHC.Hs.Utils
@@ -441,31 +441,47 @@ rn_pats_general ctxt pats thing_inside = do
       if isPatSynCtxt ctxt
          then checkDupNames bndrs
          else checkDupAndShadowedNames envs_before bndrs
-    thing_inside pats'
-  where
+    -- See Note [Pun binding warnings] in GHC.Rename.Utils.
+    let explicit_bndrs = filterOut isSystemName (collectPatsBinders CollExplicitBinders (toList pats'))
+    warnPunBindings (filterOut isSystemName bndrs)
+    groupPunBinders explicit_bndrs $ thing_inside pats'
 
-    -- See Note [Invisible binders in functions] in GHC.Hs.Pat
-    --
-    -- BTW, Or-patterns would be awesome here
-    rn_pats_fun = case ctxt of
-      FunRhs{} -> mapM . rnLArgPatAndThen
-      LamAlt LamSingle -> mapM . rnLArgPatAndThen
-      LamAlt LamCases -> mapM . rnLArgPatAndThen
-      _ -> mapM . rnLPatAndThen
+-- | Choose the pattern renamer for the current match.
+-- See Note [Invisible binders in functions] in GHC.Hs.Pat.
+rnMatchPat :: HsMatchContextRn -> LPat GhcPs -> CpsRn (LPat GhcRn)
+rnMatchPat ctxt = case ctxt of
+  FunRhs{} -> rnLArgPatAndThen maker
+  LamAlt LamSingle -> rnLArgPatAndThen maker
+  LamAlt LamCases -> rnLArgPatAndThen maker
+  _ -> rnLPatAndThen maker
+  where maker = matchNameMaker ctxt
 
+-- | Rename written patterns with signature scopes at their visible positions.
 rnPats :: HsMatchContextRn   -- For error messages and choosing if @-patterns are allowed
+       -> [(VisArity, [Name])]
        -> [LPat GhcPs]
        -> ([LPat GhcRn] -> RnM (a, FreeNames))
        -> RnM (a, FreeNames)
-rnPats = rn_pats_general
+rnPats ctxt scopes pats =
+  rn_pats_general ctxt (walk 0 scopes pats)
+  where
+    rename = rnMatchPat ctxt
+    walk :: VisArity -> [(VisArity, [Name])] -> [LPat GhcPs] -> CpsRn [LPat GhcRn]
+    walk _ [] ps = mapM rename ps
+    walk pos ((start, names) : rest) ps
+      | pos == start, any isVisArgLPat ps =
+          CpsRn $ \k -> bindLocalNamesFV names $ unCpsRn (walk pos rest ps) k
+    walk pos remaining (pat : ps) =
+      (:) <$> rename pat <*> walk (if isVisArgLPat pat then pos + 1 else pos) remaining ps
+    walk _ _ [] = pure []
 
 rnPat :: forall a. HsMatchContextRn      -- For error messages and choosing if @-patterns are allowed
       -> LPat GhcPs
       -> (LPat GhcRn -> RnM (a, FreeNames))
       -> RnM (a, FreeNames)     -- Variables bound by pattern do not
                                -- appear in the result FreeNames
-rnPat
-       = coerce (rn_pats_general @Identity @a)
+rnPat ctxt pat thing_inside =
+  rn_pats_general ctxt (Identity <$> rnMatchPat ctxt pat) (thing_inside . runIdentity)
 
 applyNameMaker :: NameMaker -> LocatedN RdrName -> RnM (LocatedN Name)
 applyNameMaker mk rdr = do { (n, _fvs) <- runCps (newPatLName mk rdr)
@@ -502,6 +518,16 @@ rnLArgPatAndThen mk = wrapSrcSpanCps rnArgPatAndThen where
     tp' <- rnHsTyPat HsTypePatCtx tp
     liftCps $ unlessXOptM LangExt.TypeAbstractions $
       addErr (TcRnIllegalInvisibleTypePattern tp' InvisPatWithoutFlag)
+    let ex_tvs = hstp_exp_tvs (hstp_ext tp') ++ hstp_imp_tvs (hstp_ext tp')
+    liftCpsWithCont $ \k -> do
+      dep <- xoptM LangExt.DependentTypes
+      if dep && not (null ex_tvs)
+        then do
+          rdr_env <- getLocalRdrEnv
+          let rdr_env' = foldl' (\e tv -> extendLocalRdrEnvWithAlias e (setOccNameSpace varName (nameOccName tv)) tv)
+                                rdr_env ex_tvs
+          setLocalRdrEnv rdr_env' (k ())
+        else k ()
     pure (InvisPat spec tp')
   rnArgPatAndThen p = rnPatAndThen mk p
 
@@ -707,13 +733,23 @@ rnConPatAndThen :: NameMaker
 
 rnConPatAndThen mk con (PrefixCon x pats)
   = do  { con' <- lookupConCps con
-        ; pats' <- rnLArgPatsAndThen mk pats
+        ; pack <- liftCps $ isExistsPackName (getName con')
+        ; let args = if pack then pack_type_binder pats else pats
+        ; pats' <- rnLArgPatsAndThen mk args
         ; return $ ConPat
             { pat_con_ext = noExtField
             , pat_con = con'
             , pat_args = PrefixCon x pats'
             }
         }
+  where
+    pack_type_binder :: [LPat GhcPs] -> [LPat GhcPs]
+    pack_type_binder [L l (VarPat _ (L nloc rdr)), payload]
+      | isUnqual rdr
+      = let tv = mkRdrUnqual (mkTyVarOccFS (occNameFS (rdrNameOcc rdr)))
+            ty = L l (HsTyVar noAnn NotPromoted (L (l2l nloc) tv))
+        in [L l (EmbTyPat noAnn (mkHsTyPat ty)), payload]
+    pack_type_binder pats = pats
 
 rnConPatAndThen mk con (InfixCon _ pat1 pat2)
   = do  { con' <- lookupConCps con
@@ -1296,19 +1332,14 @@ unTPRnRaw ::
   RnM (r, FreeNames)
 unTPRnRaw (MkTPRnM m) doc_ctxt locals = unCpsRn $ runWriterT $ runReaderT m (doc_ctxt, locals)
 
-lookupTypeOccTPRnM :: RdrName -> TPRnM Name
-lookupTypeOccTPRnM rdr_name = liftRnFV $ do
-  gre <- lookupTypeOccRn rdr_name
-  let name = greName gre
-  pure (name, unitFN name)
-
 rn_lty_pat :: LHsType GhcPs -> TPRnM (LHsType GhcRn)
 rn_lty_pat (L l hs_ty) = do
+  liftRn $ setSrcSpanA l $ warnPunnedTypeSyntax hs_ty
   hs_ty' <- rn_ty_pat hs_ty
   pure (L l hs_ty')
 
-rn_ty_pat_var :: LocatedN RdrName -> TPRnM (LocatedN (WithUserRdr Name))
-rn_ty_pat_var lrdr@(L l rdr) = do
+rn_ty_pat_var :: PromotionFlag -> LocatedN RdrName -> TPRnM (LocatedN (WithUserRdr Name))
+rn_ty_pat_var prom lrdr@(L l rdr) = do
   locals <- askLocals
   if isRdrTyVar rdr
     && not (elemOccSet (occName rdr) locals) -- See Note [Locally bound names in type patterns]
@@ -1318,14 +1349,18 @@ rn_ty_pat_var lrdr@(L l rdr) = do
       tellTPB (tpBuilderExplicitTV name)
       pure (L l $ WithUserRdr rdr name)
 
-    else do -- usage
-      name <- lookupTypeOccTPRnM rdr
-      pure (L l $ WithUserRdr rdr name)
+    else liftRnFV $ do
+      gre <- lookupTypeOccRn rdr
+      let name = greName gre
+      unless (isPromoted prom) $ do
+        warnPunUse lrdr gre
+        warnPunnedTyConSyntax lrdr name
+      pure (L l (WithUserRdr rdr name), unitFN name)
 
 rn_tyop_pat :: LHsType GhcPs -> TPRnM (LHsType GhcRn)
 rn_tyop_pat tyop
   | L l (HsTyVar ann prom l_op) <- tyop
-  = do l_op' <- rn_ty_pat_var l_op
+  = do l_op' <- rn_ty_pat_var prom l_op
        let op_name = getName l_op'
        when (isDataConName op_name && not (isPromoted prom)) $
          liftRn $ addDiagnostic (TcRnUntickedPromotedThing $ UntickedConstructor Infix op_name)
@@ -1338,13 +1373,16 @@ rn_tyop_pat tyop
 -- and Note [Implicit and explicit type variable binders]
 rn_ty_pat :: HsType GhcPs -> TPRnM (HsType GhcRn)
 rn_ty_pat tv@(HsTyVar an prom lrdr) = do
-  L l (WithUserRdr _ name) <- rn_ty_pat_var lrdr
+  L l (WithUserRdr _ name) <- rn_ty_pat_var prom lrdr
   when (isDataConName name && not (isKindName name)) $
     -- Any use of a promoted data constructor name (that is not specifically
     -- exempted by isKindName) is illegal without the use of DataKinds.
     -- See Note [Checking for DataKinds] in GHC.Tc.Validity.
     check_data_kinds tv
   pure (HsTyVar an prom (L l $ WithUserRdr (unLoc lrdr) name))
+
+rn_ty_pat HsForEachTy{} =
+  liftRn $ failWithTc TcRnRetainedQuantificationNotImplemented
 
 rn_ty_pat (HsForAllTy an tele body) = liftTPRnRaw $ \ctxt locals thing_inside ->
   bindHsForAllTelescope ctxt tele $ \tele' -> do
@@ -1395,9 +1433,8 @@ rn_ty_pat (HsOpTy _ ty1 tyop ty2) = do
   ty1' <- rn_lty_pat ty1
   tyop' <- rn_tyop_pat tyop
   ty2' <- rn_lty_pat ty2
-  liftRn $ do
-    fix <- lookupTypeFixityRn tyop'
-    mkHsOpTyRn tyop' fix ty1' ty2'
+  fix <- liftRnFV (lookupTypeFixityWithUsesRn tyop')
+  liftRn $ mkHsOpTyRn tyop' fix ty1' ty2'
 
 rn_ty_pat (HsParTy an ty) = do
   ty' <- rn_lty_pat ty

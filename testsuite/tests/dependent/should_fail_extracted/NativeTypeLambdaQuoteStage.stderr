@@ -1,0 +1,5 @@
+NativeTypeLambdaQuoteStage.hs:10:15: error: [GHC-28914]
+    • Level error:
+      ‘localCode’ is used at level -1 but it is bound at level 0
+    • In the typed Template Haskell splice: $$(localCode)
+

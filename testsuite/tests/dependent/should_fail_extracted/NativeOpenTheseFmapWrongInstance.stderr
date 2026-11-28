@@ -1,0 +1,39 @@
+NativeOpenTheseFmapWrongInstance.hs:12:23: error: [GHC-83865]
+    • Couldn't match type: Empty
+                     with: Flagged flag (p2 x1)
+      Expected: Row.$cfmap p2 (Flagged flag x1) :~: Flagged flag (p2 x1)
+        Actual: Row.$cfmap p2 (Flagged flag x1)
+                :~: Row.$cfmap p2 (Flagged flag x1)
+    • In the expression: Refl
+      In an equation for ‘wrongInstance’: wrongInstance _ _ _ = Refl
+    • Relevant bindings include
+        wrongInstance :: foreach (p :: a -> Bool)
+                         -> foreach (flag :: Bool)
+                            -> foreach (x :: a)
+                               -> Row.$cfmap p (Flagged flag x) :~: Flagged flag (p x)
+          (bound at NativeOpenTheseFmapWrongInstance.hs:12:1)
+
+NativeOpenTheseFmapWrongInstance.hs:16:19: error: [GHC-83865]
+    • Couldn't match type: Row.$cfmap p1 r
+                     with: Empty
+      Expected: Row.$cfmap p1 r :~: Empty
+        Actual: Row.$cfmap p1 r :~: Row.$cfmap p1 r
+    • In the expression: Refl
+      In an equation for ‘alwaysEmpty’: alwaysEmpty _ _ = Refl
+
+NativeOpenTheseFmapWrongInstance.hs:22:25: error: [GHC-83865]
+    • Couldn't match type: p x
+                     with: q x
+      Expected: These.$cfmap p ('These label x) :~: 'These label (q x)
+        Actual: These.$cfmap p ('These label x)
+                :~: These.$cfmap p ('These label x)
+    • In the expression: Refl
+      In an equation for ‘wrongCallback’: wrongCallback _ _ _ _ = Refl
+    • Relevant bindings include
+        wrongCallback :: foreach (p :: a -> b)
+                         -> foreach (q :: a -> b)
+                            -> foreach (label :: Char)
+                               -> foreach (x :: a)
+                                  -> These.$cfmap p ('These label x) :~: 'These label (q x)
+          (bound at NativeOpenTheseFmapWrongInstance.hs:22:1)
+

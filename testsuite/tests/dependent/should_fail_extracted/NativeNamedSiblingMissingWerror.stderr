@@ -1,0 +1,8 @@
+NativeNamedSiblingMissingWerror.hs:8:15: error: [GHC-20125] [-Wmissing-fields (in -Wdefault), Werror=missing-fields]
+    • Fields of ‘NamedColumns’ not initialised:
+        namedLetters :: PackedVecLibrary.Vec Char storedLength
+        namedFlags :: PackedVecLibrary.Vec Bool storedLength
+    • In the expression: NamedColumns {storedLength = S Z}
+      In an equation for ‘missingBoth’:
+          missingBoth = NamedColumns {storedLength = S Z}
+

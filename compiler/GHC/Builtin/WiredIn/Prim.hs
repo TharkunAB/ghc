@@ -40,7 +40,7 @@ module GHC.Builtin.WiredIn.Prim(
         levPolyAlphaTyVarSpec, levPolyBetaTyVarSpec,
         levPolyAlphaTy, levPolyBetaTy,
 
-        multiplicityTyVar1, multiplicityTyVar2,
+        multiplicityTyVar1, multiplicityTyVar2, matchabilityTyVar,
 
         -- Kind constructors...
         tYPETyCon, tYPETyConName, tYPEKind,
@@ -126,7 +126,7 @@ import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
   , int64ElemRepDataConTy, word8ElemRepDataConTy, word16ElemRepDataConTy
   , word32ElemRepDataConTy, word64ElemRepDataConTy, floatElemRepDataConTy
   , doubleElemRepDataConTy
-  , multiplicityTy
+  , multiplicityTy, matchabilityTy
   , constraintKind )
 
 import {-# SOURCE #-} GHC.Types.TyThing( mkATyCon )
@@ -553,6 +553,10 @@ levPolyAlphaTy, levPolyBetaTy :: Type
 levPolyAlphaTy = mkTyVarTy levPolyAlphaTyVar
 levPolyBetaTy  = mkTyVarTy levPolyBetaTyVar
 
+-- | A template metadata binder distinct from multiplicity and RuntimeRep.
+matchabilityTyVar :: TyVar
+(matchabilityTyVar : _) = drop 12 (mkTemplateTyVars (repeat matchabilityTy))
+
 multiplicityTyVar1, multiplicityTyVar2  :: TyVar
 (multiplicityTyVar1 : multiplicityTyVar2 : _)
    = drop 13 (mkTemplateTyVars (repeat multiplicityTy))  -- selects 'n', 'm'
@@ -583,10 +587,10 @@ We have four distinct function type constructors, and a type synonym
  (-=>) :: forall {rep1 :: RuntimeRep} {rep2 :: RuntimeRep}.
           TYPE rep1 -> CONSTRAINT rep2 -> Constraint
 
- type (->) = FUN Many
+ type (->) @ma = FUN @ma Many
 
 For efficiency, all four are always represented by
-  FunTy { ft_af :: FunTyFlag, ft_mult :: Mult
+  FunTy { ft_af :: FunTyFlag, ft_ma :: Matchability, ft_mult :: Mult
         , ft_arg :: Type, ft_res :: Type }
 rather than by using a TyConApp.
 
@@ -600,7 +604,11 @@ rather than by using a TyConApp.
 * The ft_af field is redundant: it can always be gleaned from
   the kinds of ft_arg and ft_res.  See Note [FunTyFlag] in GHC.Types.Var.
 
-* The ft_mult :: Mult field gives the first argument for FUN
+* The ft_ma :: Matchability field gives the first argument for FUN.
+  The other three constructors have fixed U matchability.
+  See Note [Ordinary arrow matchability] in GHC.Core.TyCo.Rep.
+
+* The ft_mult :: Mult field gives the second argument for FUN.
   For the other three cases ft_mult is redundant; it is always Many.
   Note that of the four type constructors, only `FUN` takes a Multiplicity.
 
@@ -638,7 +646,7 @@ tcArrowTyConName = mkBuiltInPrimTc (fsLit "-=>") tcArrowTyConKey tcArrowTyCon
 -- | The @FUN@ type constructor.
 --
 -- @
--- FUN :: forall (m :: Multiplicity) ->
+-- FUN :: forall (ma :: Matchability). forall (m :: Multiplicity) ->
 --        forall {rep1 :: RuntimeRep} {rep2 :: RuntimeRep}.
 --        TYPE rep1 -> TYPE rep2 -> Type
 -- @
@@ -652,12 +660,13 @@ fUNTyCon :: TyCon
 fUNTyCon = mkPrimTyCon fUNTyConName tc_bndrs liftedTypeKind tc_roles
   where
     -- See also unrestrictedFunTyCon
-    tc_bndrs = [ mkNamedTyConBinder Required multiplicityTyVar1
+    tc_bndrs = [ mkNamedTyConBinder Specified matchabilityTyVar
+               , mkNamedTyConBinder Required multiplicityTyVar1
                , mkNamedTyConBinder Inferred runtimeRep1TyVar
                , mkNamedTyConBinder Inferred runtimeRep2TyVar ]
                ++ mkTemplateAnonTyConBinders [ mk_TYPE_app runtimeRep1Ty
                                              , mk_TYPE_app runtimeRep2Ty ]
-    tc_roles = [Nominal, Nominal, Nominal, Representational, Representational]
+    tc_roles = [Nominal, Nominal, Nominal, Nominal, Representational, Representational]
 
 -- (=>) :: forall {rep1 :: RuntimeRep} {rep2 :: RuntimeRep}.
 --         CONSTRAINT rep1 -> TYPE rep2 -> Type
@@ -1054,12 +1063,9 @@ Within GHC, ~# is called eqPrimTyCon, and it is defined in GHC.Builtin.WiredIn.P
     --------------------------
     (~~) :: forall k1 k2. k1 -> k2 -> Constraint
     --------------------------
-This is (almost) an ordinary class, defined as if by
-  class a ~# b => a ~~ b
-  instance a ~# b => a ~~ b
-Here's what's unusual about it:
-
- * We can't actually declare it that way because we don't have syntax for ~#.
+This is a built-in class. Its dictionary contains nominal evidence
+for equality of the kinds and of the indices after transport.
+See Note [The HEq# evidence telescope] in GHC.Builtin.WiredIn.Types.
 
  * Users cannot write instances of it.
 
@@ -1073,12 +1079,9 @@ Here's what's unusual about it:
    don't worry if a (~~) constraint is too big, as we know that solving
    equality terminates.
 
-On the other hand, this behaves just like any class w.r.t. eager superclass
-unpacking in the solver. So a lifted equality given quickly becomes an unlifted
-equality given. This is good, because the solver knows all about unlifted
-equalities. There is some special-casing in GHC.Tc.Solver.Dict.matchClassInst to
-pretend that there is an instance of this class, as we can't write the instance
-in Haskell.
+The solver unpacks a boxed Given into two primitive Givens. It solves
+a boxed Wanted through primitive equality. See Note [Solving equality
+classes] in GHC.Tc.Solver.Dict.
 
 Within GHC, ~~ is called heqTyCon, and it is defined in GHC.Builtin.WiredIn.Types.
 
@@ -1086,8 +1089,8 @@ Within GHC, ~~ is called heqTyCon, and it is defined in GHC.Builtin.WiredIn.Type
     --------------------------
     (~) :: forall k. k -> k -> Constraint
     --------------------------
-This is /exactly/ like (~~), except with a homogeneous kind.
-It is an almost-ordinary class defined as if by
+This is a built-in equality class with a homogeneous kind. It has
+one primitive superclass, as if defined by
   class a ~# b => (a :: k) ~ (b :: k)
   instance a ~# b => a ~ b
 

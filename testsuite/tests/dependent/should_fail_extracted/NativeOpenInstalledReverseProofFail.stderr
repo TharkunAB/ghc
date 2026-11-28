@@ -1,0 +1,35 @@
+NativeOpenInstalledReverseProofFail.hs:18:13: error: [GHC-05617]
+    • Could not deduce ‘PreludeMapLengthSize.plus
+                          (PreludeMapLengthSize.size xs1)
+                          (PreludeMapLengthSize.Succ (PreludeMapLengthSize.size acc))
+                        ~ PreludeMapLengthSize.Succ
+                            (PreludeMapLengthSize.plus
+                               (PreludeMapLengthSize.size xs1) (PreludeMapLengthSize.size acc))’
+      from the context: xs ~ (x : xs1)
+        bound by a pattern with constructor:
+                   Cons :: forall {a} (xs :: [a]) (x :: a).
+                           Spine xs -> Spine (x : xs),
+                 in an equation for ‘missingSucc’
+        at NativeOpenInstalledReverseProofFail.hs:16:14-26
+      or from: Plus (Count xs1) (Count (x : acc))
+               ~ Count (ReversedOnto xs1 (x : acc))
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeOpenInstalledReverseProofFail.hs:18:5-8
+      Expected: Count (ReversedOnto xs acc)
+                :~: Plus (Count xs) (Count acc)
+        Actual: PreludeMapLengthSize.size (ReversedOnto xs acc)
+                :~: PreludeMapLengthSize.size (ReversedOnto xs acc)
+    • In the expression: Refl
+      In a case alternative: Refl -> Refl
+      In the expression:
+        case missingSucc xs (Proxy @(x ': acc)) of Refl -> Refl
+    • Relevant bindings include
+        xs :: Spine xs1
+          (bound at NativeOpenInstalledReverseProofFail.hs:16:25)
+        missingSucc :: Spine xs
+                       -> Proxy acc
+                       -> Count (ReversedOnto xs acc) :~: Plus (Count xs) (Count acc)
+          (bound at NativeOpenInstalledReverseProofFail.hs:15:1)
+

@@ -1,0 +1,20 @@
+NativeOpenZipRowsFail.hs:11:15: error: [GHC-83865]
+    • Couldn't match type ‘zipLength xs '[]’ with ‘Z’
+      Expected: zipLength xs '[] :~: Z
+        Actual: Z :~: Z
+    • In the expression: Refl
+      In an equation for ‘wrongDemand’: wrongDemand = Refl
+    • Relevant bindings include
+        wrongDemand :: zipLength xs '[] :~: Z
+          (bound at NativeOpenZipRowsFail.hs:11:1)
+
+NativeOpenZipRowsFail.hs:14:15: error: [GHC-83865]
+    • Couldn't match type ‘countRight xs '[]’ with ‘Z’
+      Expected: countRight xs '[] :~: Z
+        Actual: Z :~: Z
+    • In the expression: Refl
+      In an equation for ‘rightDemand’: rightDemand = Refl
+    • Relevant bindings include
+        rightDemand :: countRight xs '[] :~: Z
+          (bound at NativeOpenZipRowsFail.hs:14:1)
+

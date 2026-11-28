@@ -162,3 +162,19 @@ AddHiding2:
 .PHONY: AddClassMethod
 AddClassMethod:
 	$(CHECK_EXACT) $(LIBDIR) AddClassMethod.hs addClassMethod
+
+.PHONY: TypeLambdaPrint
+TypeLambdaPrint:
+	$(CHECK_EXACT) $(LIBDIR) TypeLambdaPrint.hs
+
+.PHONY: TypeLetPrint
+TypeLetPrint:
+	$(CHECK_EXACT) $(LIBDIR) TypeLetPrint.hs
+
+.PHONY: PercentPrint
+PercentPrint:
+	$(CHECK_EXACT) $(LIBDIR) PercentPrint.hs
+
+.PHONY: TypeCasePrint
+TypeCasePrint:
+	$(CHECK_EXACT) $(LIBDIR) TypeCasePrint.hs

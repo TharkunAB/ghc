@@ -1,0 +1,13 @@
+NativeLinearRetainedPackageReject.hs:6:21: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from multiplicity of ‘a’
+    • In the pattern: Slot _ _ a
+      In an equation for ‘duplicate’: duplicate (Slot _ _ a) = (a, a)
+
+NativeLinearRetainedPackageReject.hs:8:19: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from a non-linear pattern ‘_’
+    • In the pattern: _
+      In the pattern: Slot _ _ _
+      In an equation for ‘discard’: discard (Slot _ _ _) = ()
+

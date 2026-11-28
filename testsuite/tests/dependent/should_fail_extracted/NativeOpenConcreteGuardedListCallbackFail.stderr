@@ -1,0 +1,8 @@
+NativeOpenConcreteGuardedListCallbackFail.hs:11:26: error: [GHC-83865]
+    • Couldn't match kind ‘WrappedBool’ with ‘Bool’
+      Expected kind ‘Bool %GHC.Internal.Types.U -> Bool’,
+        but ‘WrappedPredicate’ has kind ‘WrappedBool -> Bool’
+    • In the first argument of ‘DropBool’, namely ‘WrappedPredicate’
+      In the type ‘DropBool WrappedPredicate xs’
+      In the type synonym declaration for ‘Wrong’
+

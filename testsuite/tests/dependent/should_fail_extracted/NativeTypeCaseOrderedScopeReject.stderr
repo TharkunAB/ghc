@@ -1,0 +1,64 @@
+NativeTypeCaseOrderedScopeReject.hs:10:38: error: [GHC-83865]
+    • Couldn't match type: the type case in the signature for ‘pick’
+                     with: the type case in the signature for ‘different’
+      Expected: Maybe (the type case in the signature for ‘different’)
+        Actual: Maybe (the type case in the signature for ‘pick’)
+    • In the second argument of ‘C.different’, namely
+        ‘(P.pick (Just b))’
+      In the expression: C.different (Just b) (P.pick (Just b))
+      In an equation for ‘badChanged’:
+          badChanged b = C.different (Just b) (P.pick (Just b))
+
+NativeTypeCaseOrderedScopeReject.hs:13:29: error: [GHC-83865]
+    • Couldn't match type: the type case in the signature for ‘pickPair’
+                     with: the type case in the signature for ‘renderPair’
+      Expected: Maybe (the type case in the signature for ‘renderPair’)
+        Actual: Maybe (the type case in the signature for ‘pickPair’)
+    • In the second argument of ‘C.renderPair’, namely ‘(P.pickPair p)’
+      In the expression: C.renderPair p (P.pickPair p)
+      In an equation for ‘badPair’:
+          badPair p = C.renderPair p (P.pickPair p)
+
+NativeTypeCaseOrderedScopeReject.hs:16:36: error: [GHC-83865]
+    • Couldn't match type ‘the type case in the signature for ‘pickEager’’
+                     with ‘Int’
+      Expected: Maybe (the type case in the signature for ‘renderLazy’)
+        Actual: Maybe (the type case in the signature for ‘pickEager’)
+    • In the second argument of ‘C.renderLazy’, namely
+        ‘(P.pickEager (Just b))’
+      In the expression: C.renderLazy (Just b) (P.pickEager (Just b))
+      In an equation for ‘badJust’:
+          badJust b = C.renderLazy (Just b) (P.pickEager (Just b))
+
+NativeTypeCaseOrderedScopeReject.hs:19:35: error: [GHC-83865]
+    • Couldn't match type: the type case in the signature for ‘pickPartial’
+                     with: the type case in the signature for ‘renderPartial’
+      Expected: Maybe
+                  (the type case in the signature for ‘renderPartial’)
+        Actual: Maybe (the type case in the signature for ‘pickPartial’)
+    • In the second argument of ‘C.renderPartial’, namely
+        ‘(P.pickPartial m)’
+      In the expression: C.renderPartial m (P.pickPartial m)
+      In an equation for ‘badPartial’:
+          badPartial m = C.renderPartial m (P.pickPartial m)
+
+NativeTypeCaseOrderedScopeReject.hs:22:18: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘First’’ with ‘Int’
+      Expected: P.First ('Pair b False) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘badPairRigid’: badPairRigid _ = Refl
+    • Relevant bindings include
+        badPairRigid :: Proxy b -> P.First ('Pair b False) :~: Int
+          (bound at NativeTypeCaseOrderedScopeReject.hs:22:1)
+
+NativeTypeCaseOrderedScopeReject.hs:25:18: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘Eager’’ with ‘Int’
+      Expected: P.Eager (Just b) :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘badJustRigid’: badJustRigid _ = Refl
+    • Relevant bindings include
+        badJustRigid :: Proxy b -> P.Eager (Just b) :~: Int
+          (bound at NativeTypeCaseOrderedScopeReject.hs:25:1)
+

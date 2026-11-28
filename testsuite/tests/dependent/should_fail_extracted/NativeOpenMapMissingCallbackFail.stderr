@@ -1,0 +1,6 @@
+NativeOpenMapMissingCallbackFail.hs:8:28: error: [GHC-64152]
+    • The imported interface supplies no checked equations for the callback ‘F.flipBool’.
+      An open type-level call needs a checked callback from its defining module.
+    • In the type ‘W.each F.flipBool xs’
+      In the type synonym declaration for ‘NegateAll’
+

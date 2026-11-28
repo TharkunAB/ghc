@@ -1,0 +1,5 @@
+NativeNamedSiblingDeclFieldFail.hs:6:21: error: [GHC-83605]
+    • Each payload field of a retained record must use the first field as its final type argument.
+    • In the definition of data constructor ‘BadFieldType’
+      In the data type declaration for ‘BadFieldType’
+

@@ -1,0 +1,7 @@
+NativeStructuralCountdownFail.hs:8:11: error: [GHC-83865]
+    • Couldn't match type ‘n’ with ‘Next n’
+      Expected: countdown (Next n) :~: (Next n : countdown n)
+        Actual: countdown (Next n) :~: countdown (Next n)
+    • In the expression: Refl
+      In an equation for ‘wrong’: wrong _ = Refl
+

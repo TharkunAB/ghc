@@ -1,0 +1,28 @@
+NativeUnsaturatedInvisibleMatchable.hs:9:13: error: [GHC-83865]
+    • Couldn't match type ‘GHC.Internal.Types.Matchable’
+                     with ‘GHC.Internal.Types.Unmatchable’
+      Expected: GHC.Internal.Types.Unmatchable
+        Actual: M
+    • In a standalone kind signature for ‘Bad’: forall k. @M k
+
+NativeUnsaturatedInvisibleMatchable.hs:15:29: error: [GHC-83865]
+    • Expected kind ‘forall k. @M *’,
+        but ‘PickVisible 'True’ has kind ‘forall k. @U *’
+    • In the first argument of ‘ExpectsM’, namely ‘(PickVisible 'True)’
+      In the type ‘ExpectsM (PickVisible 'True)’
+      In the type synonym declaration for ‘BadVisible’
+
+NativeUnsaturatedInvisibleMatchable.hs:16:28: error: [GHC-83865]
+    • Expected kind ‘forall k. @M r0’,
+        but ‘ReadAt 'True’ has kind ‘forall input. @U r0’
+    • In the first argument of ‘ExpectsM’, namely ‘(ReadAt 'True)’
+      In the type ‘ExpectsM (ReadAt 'True)’
+      In the type synonym declaration for ‘BadSuffix’
+
+NativeUnsaturatedInvisibleMatchable.hs:21:37: error: [GHC-83865]
+    • Expected kind ‘forall k -> @M k %U -> *’,
+        but ‘Required’ has kind ‘forall k -> @U k %U -> *’
+    • In the first argument of ‘ExpectsRequiredM’, namely ‘Required’
+      In the type ‘ExpectsRequiredM Required’
+      In the type synonym declaration for ‘BadRequired’
+

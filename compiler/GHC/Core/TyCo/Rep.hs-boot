@@ -10,6 +10,7 @@ data Type
 data Coercion
 data FunSel
 data CoSel
+data ForAllSel
 data UnivCoProvenance
 data UnivCoDeps
 data TyLit
@@ -19,6 +20,7 @@ data Scaled a
 scaledThing :: Scaled a -> a
 
 type Mult = Type
+type Matchability = Type
 
 type PredType = Type
 type RuntimeRepType = Type
@@ -28,9 +30,10 @@ type CoercionN = Coercion
 type MCoercionN = MCoercion
 type KindMCoercion = MCoercionN
 
-mkForAllTy       :: VarBndr Var ForAllTyFlag -> Type -> Type
+mkForAllTy       :: Matchability -> VarBndr Var ForAllTyFlag -> Type -> Type
+mkTyCoForAllTy   :: Matchability -> Var -> ForAllTyFlag -> Type -> Type
 mkNakedTyConTy   :: TyCon -> Type
-mkNakedFunTy     :: FunTyFlag -> Type -> Type -> Type
+mkNakedFunTy     :: Matchability -> FunTyFlag -> Type -> Type -> Type
 
 
 -- To support Data instances in GHC.Core.Coercion.Axiom

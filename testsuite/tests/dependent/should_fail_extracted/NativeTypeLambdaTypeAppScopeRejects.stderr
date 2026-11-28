@@ -1,0 +1,6 @@
+NativeTypeLambdaTypeAppScopeRejects.hs:7:53: error: [GHC-76037]
+    • Not in scope: type variable ‘missing’
+    • In the Template Haskell quotation:
+        [t| \err cell -> Either missing cell |]
+      In the untyped splice: $([t| \err cell -> Either missing cell |])
+

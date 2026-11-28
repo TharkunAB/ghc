@@ -11,7 +11,7 @@ module GHC.Core.Reduction
      mkCastRedn1, mkCastRedn2,
      mkReflRedn, mkGReflRightRedn, mkGReflRightMRedn,
      mkGReflLeftRedn, mkGReflLeftMRedn,
-     mkAppRedn, mkAppRedns, mkFunRedn,
+     mkAppRedn, mkAppRedns, mkFunRedn, mkDepFunRedn,
      mkForAllRedn, mkHomoForAllRedn, mkTyConAppRedn, mkClassPredRedn,
      mkProofIrrelRedn, mkReflCoRedn,
      homogeniseHetRedn,
@@ -35,9 +35,9 @@ import GHC.Data.Pair       ( Pair(Pair) )
 import GHC.Data.List.Infinite ( Infinite (..) )
 import qualified GHC.Data.List.Infinite as Inf
 
-import GHC.Types.Var       ( VarBndr(..), setTyVarKind )
+import GHC.Types.Var       ( Id, VarBndr(..), setVarType )
 import GHC.Types.Var.Env   ( mkInScopeSet )
-import GHC.Types.Var.Set   ( TyCoVarSet )
+import GHC.Types.Var.Set   ( TyCoVarSet, unionVarSet )
 
 import GHC.Utils.Misc      ( HasDebugCallStack, equalLength )
 import GHC.Utils.Outputable
@@ -341,47 +341,74 @@ mkAppRedn (Reduction co1 ty1) (Reduction co2 ty2)
 -- | Create a function 'Reduction'.
 --
 -- Combines 'mkFunCo' and 'mkFunTy'.
+-- See Note [Function reduction multiplicity roles].
 mkFunRedn :: Role
           -> FunTyFlag
+          -> ReductionN -- ^ matchability reduction
           -> ReductionN -- ^ multiplicity reduction
           -> Reduction  -- ^ argument reduction
           -> Reduction  -- ^ result reduction
           -> Reduction
 mkFunRedn r af
+  (Reduction ma_co ma_ty)
   (Reduction w_co w_ty)
   (Reduction arg_co arg_ty)
   (Reduction res_co res_ty)
     = mkReduction
-        (mkFunCo r af w_co arg_co res_co)
-        (mkFunTy   af w_ty arg_ty res_ty)
+        (mkFunCo r af (downgradeRole (funRole r SelMatch) Nominal ma_co) (downgradeRole (funRole r SelMult) Nominal w_co) arg_co res_co)
+        (mkFunTy   af ma_ty w_ty arg_ty res_ty)
 {-# INLINE mkFunRedn #-}
+
+{- Note [Function reduction multiplicity roles]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Normalise matchabilities and multiplicities at Nominal.
+Keep the ReductionN input contract.
+A FunCo stores nominal metadata evidence at Nominal or Representational.
+It stores phantom metadata evidence at Phantom. See funRole and the FunCo
+declaration in GHC.Core.TyCo.Rep. Weaken the stored proof to that required role.
+Keep the reduced metadata types unchanged.
+
+Reflexive children can make mkFunCo collapse to reflexivity. A nonreflexive
+matchability, multiplicity, argument or result reduction prevents that collapse.
+Do not use that collapse to hide an invalid metadata role in a Phantom FunCo.
+-}
+
+-- | Lift a body reduction under an unchanged retained runtime binder.
+-- The binder scopes over the complete proof. A visible endpoint can
+-- become an ordinary arrow if its result does not depend on the binder.
+-- See Note [Retained dependent function coercions] in GHC.Core.TyCo.Rep.
+mkDepFunRedn :: DepFunTyFlag -> Id -> Reduction -> Reduction
+mkDepFunRedn vis b (Reduction co ty)
+  = mkReduction (mkDepFunCoWithVis vis vis b MRefl co) (mkDepFunTyWithVis vis b ty)
+{-# INLINE mkDepFunRedn #-}
 
 -- | Create a 'Reduction' associated to a Π type,
 -- from a kind 'Reduction' and a body 'Reduction'.
 --
--- Combines 'mkForAllCo' and 'mkForAllTy'.
+-- Combines 'mkForAllCo' and 'mkTyCoForAllTy'.
 mkForAllRedn :: ForAllTyFlag
-             -> TyVar
+             -> TyCoVar
+             -> ReductionN -- ^ nominal matchability reduction
              -> ReductionN -- ^ kind reduction
              -> Reduction  -- ^ body reduction
              -> Reduction
-mkForAllRedn vis tv1 (Reduction h ki') (Reduction co ty)
+mkForAllRedn vis tv1 (Reduction ma_co ma') (Reduction h ki') (Reduction co ty)
   = mkReduction
-      (mkForAllCo tv1 vis vis (kindCoToMKindCo h) co)
-      (mkForAllTy (Bndr tv2 vis) ty)
+      (mkForAllCo tv1 vis vis ma_co (kindCoToMKindCo h) co)
+      (mkTyCoForAllTy ma' tv2 vis ty)
   where
-    tv2 = setTyVarKind tv1 ki'
+    tv2 = setVarType tv1 ki'
 {-# INLINE mkForAllRedn #-}
 
 -- | Create a 'Reduction' of a quantified type from a
 -- 'Reduction' of the body.
 --
--- Combines 'mkHomoForAllCos' and 'mkForAllTys'.
-mkHomoForAllRedn :: [TyVarBinder] -> Reduction -> Reduction
+-- Combines 'mkHomoForAllCos' and 'mkTyCoForAllTys'.
+mkHomoForAllRedn :: [(Matchability, ForAllTyBinder)] -> Reduction -> Reduction
 mkHomoForAllRedn bndrs (Reduction co ty)
   = mkReduction
-      (mkHomoForAllCos bndrs co)
-      (mkForAllTys bndrs ty)
+      (mkHomoForAllCos [(mkNomReflCo ma,bndr) | (ma,bndr) <- bndrs] co)
+      (mkTyCoForAllTys bndrs ty)
 {-# INLINE mkHomoForAllRedn #-}
 
 -- | Create a 'Reduction' from a coercion between coercions.
@@ -429,6 +456,8 @@ mkReductions cos tys = Reductions cos tys
 {-# INLINE mkReductions #-}
 
 -- | Combines 'mkAppCos' and 'mkAppTys'.
+-- Both preserve canonical native call endpoints. See
+-- Note [Native function-value application] in GHC.Core.TyCo.Make.
 mkAppRedns :: Reduction -> Reductions -> Reduction
 mkAppRedns (Reduction co ty) (Reductions cos tys)
   = mkReduction (mkAppCos co cos) (mkAppTys ty tys)
@@ -770,7 +799,7 @@ data ArgsReductions =
 -- This function is only called in two locations, so the amount of code duplication
 -- should be rather reasonable despite the size of the function.
 simplifyArgsWorker :: HasDebugCallStack
-                   => [PiTyBinder] -> Kind
+                   => [(Type, PiTyBinder)] -> Kind
                        -- the binders & result kind (not a Π-type) of the function applied to the args
                        -- list of binders can be shorter or longer than the list of args
                    -> TyCoVarSet   -- free vars of the args
@@ -795,10 +824,11 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
        orig_ki_binders orig_inner_ki
        orig_roles orig_tys orig_simplified_args
   where
-    orig_lc = emptyLiftingContext $ mkInScopeSet orig_fvs
+    orig_lc = emptyLiftingContext $ mkInScopeSet $
+                orig_fvs `unionVarSet` tyCoVarsOfType (mkPiTys orig_ki_binders orig_inner_ki)
 
     go :: LiftingContext  -- mapping from tyvars to rewriting coercions
-       -> [PiTyBinder]    -- Unsubsted binders of function's kind
+       -> [(Type, PiTyBinder)] -- Unsubsted matchabilities and binders of function's kind
        -> Kind            -- Unsubsted result kind of function (not a Pi-type)
        -> Infinite Role   -- Roles at which to rewrite these ...
        -> [Type]          -- the unrewritten arguments
@@ -815,7 +845,7 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
         kind_co | noFreeVarsOfType final_kind = MRefl
                 | otherwise                   = MCo $ liftCoSubst Nominal lc final_kind
 
-    go lc (binder:binders) inner_ki (Inf role roles) orig_tys0 (arg_redn:arg_redns)
+    go lc ((_ma,binder):binders) inner_ki (Inf role roles) orig_tys0 (arg_redn:arg_redns)
       =  -- We rewrite an argument ty with arg_redn = Reduction arg_co arg
          -- By Note [Rewriting] in GHC.Tc.Solver.Rewrite invariant (F2),
          -- typeKind(ty) = typeKind(arg).
@@ -860,11 +890,11 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
                -- binders.
             zapped_lc             = zapLiftingContext lc
             Pair rewritten_kind _ = co1_kind
-            (bndrs, new_inner)    = splitPiTys rewritten_kind
+            (mas, bndrs, new_inner) = splitPiTys rewritten_kind
 
             ArgsReductions redns_out res_co_out
               -- The added casts do not affect the unrewritten (LHS) types,
               -- so recurring with 'orig_tys' here is OK.
-              = go zapped_lc bndrs new_inner roles orig_tys casted_args
+              = go zapped_lc (zip mas bndrs) new_inner roles orig_tys casted_args
         in
           ArgsReductions redns_out (res_co `mkTransMCoR` res_co_out)

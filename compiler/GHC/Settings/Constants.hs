@@ -6,7 +6,8 @@ import GHC.Prelude
 import GHC.Settings.Config
 
 hiVersion :: Integer
-hiVersion = read (cProjectVersionInt ++ cProjectPatchLevel) :: Integer
+-- Increment the suffix whenever the binary interface format changes.
+hiVersion = read (cProjectVersionInt ++ cProjectPatchLevel ++ "81") :: Integer
 
 -- All pretty arbitrary:
 

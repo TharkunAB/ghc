@@ -649,6 +649,11 @@ deriving instance Data (HsType GhcRn)
 deriving instance Data (HsType GhcTc)
 
 deriving instance Data HsTypeGhcPsExt
+deriving instance Data HsTypeLetBind
+deriving instance Data HsTypeLetPair
+deriving instance Data HsTypeLetPat
+deriving instance Data HsTypeCaseAlt
+deriving instance Data HsTypeGhcRnExt
 
 -- deriving instance (DataIdLR p p) => Data (HsFunArr p)
 deriving instance Data (HsFunArr GhcPs)
@@ -734,6 +739,7 @@ deriving instance Data a => Data (WithUserRdr a)
 
 -- -------------------------------
 --------------------------------------
+deriving instance Data SourceLetRhs
 deriving instance Data XXExprGhcTc
 deriving instance Data XXPatGhcTc
 

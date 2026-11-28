@@ -19,6 +19,7 @@ module GHC.Tc.Utils.Env(
         tcLookupLocatedGlobal, tcLookupGlobal, tcLookupGlobalOnly,
         tcLookupTyCon, tcLookupClass,
         tcLookupDataCon, tcLookupPatSyn, tcLookupConLike,
+        isExistsPackName,
         tcLookupRecSelParent,
         tcLookupLocatedGlobalId, tcLookupLocatedTyCon,
         tcLookupLocatedClass, tcLookupAxiom,
@@ -37,7 +38,7 @@ module GHC.Tc.Utils.Env(
         tcExtendKindEnv, tcExtendKindEnvList,
         tcExtendTyVarEnv, tcExtendNameTyVarEnv,
         tcExtendLetEnv, tcExtendSigIds, tcExtendRecIds,
-        tcExtendIdEnv, tcExtendIdEnv1, tcExtendIdEnv2,
+        tcExtendIdEnv, tcExtendIdEnv1, tcExtendIdEnv2, tcExtendGeneratedIdEnv,
         tcExtendBinderStack, tcExtendLocalTypeEnv,
         isTypeClosedLetBndr,
 
@@ -139,6 +140,7 @@ import GHC.Types.Id.Info ( RecSelParent(..) )
 import GHC.Types.Name.Reader
 import GHC.Types.TyThing
 import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
+import GHC.Types.Var.Env ( elemVarEnv, extendVarEnvList )
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Iface.Errors.Types
@@ -324,11 +326,23 @@ tcLookupPatSyn name = do
 
 tcLookupConLike :: WithUserRdr Name -> TcM ConLike
 tcLookupConLike qname@(WithUserRdr _ name) = do
+    pack <- isExistsPackName name
+    when pack $ failWithTc (TcRnExistsPack ExistsPackInvalidContext)
     thing <- tcLookupGlobal name
     case thing of
         AConLike cl -> return cl
         ATyCon  {}  -> failIllegalTyCon WL_ConLike qname
         _           -> wrongThingErr WrongThingConLike (AGlobal thing) name
+
+-- | Recognize the constructor supplied by the configured base unit.
+isExistsPackName :: Name -> TcM Bool
+isExistsPackName name
+  | nameOccName name == mkDataOcc "Pack"
+  , Just mod <- nameModule_maybe name
+  , moduleName mod == mkModuleName "GHC.Exists"
+  = do { dflags <- getDynFlags
+       ; return (toUnitId (moduleUnit mod) == baseUnitId dflags) }
+  | otherwise = return False
 
 tcLookupRecSelParent :: HsRecUpdParent GhcRn -> TcM RecSelParent
 tcLookupRecSelParent (RnRecUpdParent { rnRecUpdCons = cons })
@@ -901,7 +915,15 @@ tcExtendIdEnv2 :: [(Name,TcId)] -> TcM a -> TcM a
 tcExtendIdEnv2 names_w_ids thing_inside
   = tcExtendBinderStack [ TcIdBndr mono_id NotTopLevel
                         | (_,mono_id) <- names_w_ids ] $
-    tc_extend_local_env NotTopLevel
+    tc_extend_id_env names_w_ids thing_inside
+
+-- | Add a generated binder to lookup and staging. Keep it out of diagnostics.
+tcExtendGeneratedIdEnv :: TcId -> TcM a -> TcM a
+tcExtendGeneratedIdEnv id = tc_extend_id_env [(idName id, id)]
+
+tc_extend_id_env :: [(Name, TcId)] -> TcM a -> TcM a
+tc_extend_id_env names_w_ids thing_inside
+  = tc_extend_local_env NotTopLevel
             [ (name, ATcId { tct_id = id
                            , tct_info    = NotLetBound })
             | (name,id) <- names_w_ids]
@@ -925,10 +947,12 @@ tc_extend_local_env top_lvl extra_env thing_inside
   = do  { traceTc "tc_extend_local_env" (ppr extra_env)
         ; updLclCtxt upd_lcl_env thing_inside }
   where
-    upd_lcl_env env0@(TcLclCtxt { tcl_th_ctxt  = th_lvl
-                               , tcl_rdr      = rdr_env
-                               , tcl_th_bndrs = th_bndrs
-                               , tcl_env      = lcl_type_env })
+    upd_lcl_env env0@(TcLclCtxt { tcl_th_ctxt    = th_lvl
+                               , tcl_rdr        = rdr_env
+                               , tcl_th_bndrs   = th_bndrs
+                               , tcl_term_depth = term_depth
+                               , tcl_id_depths  = id_depths
+                               , tcl_env        = lcl_type_env })
        = env0 { tcl_rdr = extendLocalRdrEnvList rdr_env
                           [ n | (n, _) <- extra_env, isInternalName n ]
                           -- The LocalRdrEnv contains only non-top-level names
@@ -937,17 +961,35 @@ tc_extend_local_env top_lvl extra_env thing_inside
               , tcl_th_bndrs = extendNameEnvList th_bndrs
                                [(n, thlvl) | (n, _) <- extra_env]
 
+              , tcl_term_depth = term_depth'
+              , tcl_id_depths  = id_depths'
+
               , tcl_env = extendNameEnvList lcl_type_env extra_env }
               -- tcl_rdr and tcl_th_bndrs: extend the local LocalRdrEnv and
               -- Template Haskell staging env simultaneously. Reason for extending
               -- LocalRdrEnv: after running a TH splice we need to do renaming.
       where
-        thlvl = (top_lvl, thLevelIndex th_lvl)
+        thlvl   = (top_lvl, thLevelIndex th_lvl)
+        new_ids = [ v | (_, ATcId { tct_id = v }) <- extra_env
+                      , not (v `elemVarEnv` id_depths) ]
+        (term_depth', id_depths')
+          | null new_ids
+          = (term_depth, id_depths)
+          | isTopLevel top_lvl
+          = (term_depth, extendVarEnvList id_depths [(v, topTermScopeDepth) | v <- new_ids])
+          | otherwise
+          = let !d' = bumpTermScopeDepth term_depth
+            in (d', extendVarEnvList id_depths [(v, d') | v <- new_ids])
 
 
 tcExtendLocalTypeEnv :: [(Name, TcTyThing)] -> TcLclCtxt -> TcLclCtxt
-tcExtendLocalTypeEnv tc_ty_things lcl_env@(TcLclCtxt { tcl_env = lcl_type_env })
-  = lcl_env { tcl_env = extendNameEnvList lcl_type_env tc_ty_things }
+tcExtendLocalTypeEnv tc_ty_things lcl_env@(TcLclCtxt { tcl_env = lcl_type_env
+                                                     , tcl_id_depths = id_depths })
+  = lcl_env { tcl_env = extendNameEnvList lcl_type_env tc_ty_things
+            , tcl_id_depths = extendVarEnvList id_depths
+                [ (v, topTermScopeDepth)
+                | (_, ATcId { tct_id = v }) <- tc_ty_things
+                , not (v `elemVarEnv` id_depths) ] }
 
 {- *********************************************************************
 *                                                                      *

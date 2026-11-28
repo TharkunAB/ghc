@@ -501,6 +501,7 @@ type family XLam            x
 type family XLamCase        x
 type family XApp            x
 type family XAppTypeE       x
+type family XAppRetained    x
 type family XOpApp          x
 type family XNegApp         x
 type family XPar            x
@@ -748,6 +749,7 @@ type family XXHsTyPat x
 -- -------------------------------------
 -- HsType type families
 type family XForAllTy        x
+type family XForEachTy       x
 type family XQualTy          x
 type family XTyVar           x
 type family XAppTy           x

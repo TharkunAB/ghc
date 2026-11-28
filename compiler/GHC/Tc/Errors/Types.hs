@@ -4,6 +4,8 @@ module GHC.Tc.Errors.Types (
   -- * Main types
     TcRnMessage(..)
   , TcRnMessageOpts(..)
+  , RetainedQuantificationError(..)
+  , ExistsPackProblem(..)
   , mkTcRnUnknownMessage
   , TcRnMessageDetailed(..), ErrInfo(..)
   , TypeDataForbids(..)
@@ -67,7 +69,7 @@ module GHC.Tc.Errors.Types (
   , FitsMbSuppressed(..)
   , ValidHoleFits(..), noValidHoleFits
   , HoleFitDispConfig(..)
-  , RelevantBindings(..), pprRelevantBindings
+  , RelevantBindings(..), pprRelevantBindings, diagnosticSumPayload
   , PromotionErr(..), pprPECategory, peCategory
   , TermLevelUseErr(..), teCategory
   , NotInScopeError(..)
@@ -225,12 +227,13 @@ import GHC.Core.Coercion (Coercion)
 import GHC.Core.Coercion.Axiom (CoAxBranch)
 import GHC.Core.ConLike (ConLike)
 import GHC.Core.DataCon (DataCon, FieldLabel)
-import GHC.Core.FamInstEnv (FamInst)
+import GHC.Core.FamInstEnv (FamInst, reduceScopedSumPayload_maybe)
+import GHC.Core.Reduction (reductionReducedType)
 import GHC.Core.InstEnv (LookupInstanceErrReason, ClsInst, DFunId)
 import GHC.Core.PatSyn (PatSyn)
 import GHC.Core.Predicate (EqRel, predTypeEqRel)
 import GHC.Core.TyCon (TyCon, FamTyConFlav, AlgTyConRhs)
-import GHC.Core.Type (Kind, Type, ThetaType, PredType, ErrorMsgType, ForAllTyFlag, ForAllTyBinder)
+import GHC.Core.Type (Kind, Type, ThetaType, PredType, ErrorMsgType, ForAllTyFlag, ForAllTyBinder, splitTyConAppNoView_maybe)
 
 import GHC.Driver.Backend (Backend)
 
@@ -1067,6 +1070,9 @@ data TcRnMessage where
                        -> Exported
                        -> TcRnMessage
 
+  -- | A complete user-supplied kind signature supplies a quantified kind.
+  TcRnCusk :: TyCon -> Maybe [LangExt.Extension] -> TcRnMessage
+
   {-| TcRnPolymorphicBinderMissingSig is a warning controlled by -Wmissing-local-signatures
       that occurs when a local polymorphic binding lacks a type signature.
 
@@ -1200,6 +1206,8 @@ data TcRnMessage where
   -}
   TcRnVDQInTermType :: !(Maybe Type) -> TcRnMessage
 
+  TcRnEmptyForallMatchability :: TcRnMessage
+
   {-| TcRnBadQuantPredHead is an error that occurs whenever a quantified predicate
       lacks a class or type variable head.
 
@@ -1324,8 +1332,8 @@ data TcRnMessage where
   -}
   TcRnSimplifiableConstraint :: !PredType -> !InstanceWhat -> TcRnMessage
 
-  {-| TcRnArityMismatch is an error that occurs when a type constructor is supplied with
-      fewer arguments than required.
+  {-| TcRnArityMismatch occurs when a constructor is supplied with the wrong
+      number of arguments.
 
       Examples(s):
         f Left = undefined
@@ -2076,6 +2084,17 @@ data TcRnMessage where
   -}
   TcRnTermNameInType :: !RdrName -> TcRnMessage
 
+  -- | A term used in a type has no checked constructor table.
+  TcRnNoSourceTable :: !Name -> TcRnMessage
+
+  -- | An interface supplies no checked equations for an open callback.
+  TcRnNoSourceCallback :: !RdrName -> TcRnMessage
+
+  -- | GHC could not execute an imported function during type elaboration.
+  TcRnClosedTypeEval :: !Name -> !String -> TcRnMessage
+  -- | The second name identifies a definition demanded by an open call.
+  TcRnOpenTypeEval :: !Name -> !(Maybe Name) -> !String -> TcRnMessage
+
   {-| TcRnUntickedPromotedThing is a warning (controlled with -Wunticked-promoted-constructors)
       that is triggered by an unticked occurrence of a promoted data constructor.
 
@@ -2496,6 +2515,9 @@ data TcRnMessage where
       Test cases: typecheck/should_fail/T26862
   -}
   TcRnUnpromotableLit :: !(HsLit GhcRn) -> TcRnMessage
+
+  -- | An Int# field binder occurs outside its closed family constructor pattern.
+  TcRnEscapingPrimFamilyBinder :: ![TyVar] -> TcRnMessage
 
   {- | TcRnIllegalTermLevelUse is an error that occurs when the user attempts to
        use a type-level entity at the term-level.
@@ -3608,6 +3630,14 @@ data TcRnMessage where
                           -> !Arity -- ^ The difference
                           -> TcRnMessage
 
+  {-| A pattern synonym declaration arrow has unsupported matchability.
+      Its matchability must reduce to U.
+      This check does not restrict arrows in the scrutinee type.
+  -}
+  TcRnPatSynUnsupportedMatchability :: !Name -- ^ The pattern synonym name
+                                    -> !Type -- ^ The normalized matchability
+                                    -> TcRnMessage
+
   {-| TcRnPatSynInvalidRhs is an error group indicating that the pattern on the
     right hand side of a pattern synonym is invalid.
 
@@ -4011,6 +4041,20 @@ data TcRnMessage where
                      -> !(NE.NonEmpty Name) -- ^ The individual declarations
                      -> TcRnMessage
 
+  -- | A type binding and a term binding share one spelling and scope.
+  TcRnPunBinding :: !Name -- ^ The binding at the diagnostic site
+                 -> !Name -- ^ The other binding
+                 -> TcRnMessage
+
+  -- | An occurrence has a conflicting name in a unified namespace.
+  TcRnPunUse :: !RdrName
+             -> !GlobalRdrElt -- ^ The name resolved by the renamer
+             -> !(NE.NonEmpty GlobalRdrElt) -- ^ Candidates in the other namespace
+             -> TcRnMessage
+
+  -- | Type syntax whose interpretation depends on ListTuplePuns.
+  TcRnPunnedTypeSyntax :: !SDoc -> TcRnMessage
+
   {-| TcRnPackageImportsDisabled is an error indicating that an import uses
     a package qualifier while the extension PackageImports was disabled.
 
@@ -4087,6 +4131,13 @@ data TcRnMessage where
   TcRnTypeApplicationsDisabled :: !(HsType GhcPs)
                                -> !TypeOrKind
                                -> TcRnMessage
+
+  {-| TcRnRetainedQuantificationNotImplemented rejects retained quantification
+      in unsupported source type positions.
+  -}
+  TcRnRetainedQuantificationNotImplemented :: TcRnMessage
+
+  TcRnRetainedQuantificationError :: RetainedQuantificationError -> TcRnMessage
 
   {-| TcRnInvalidRecordField is an error indicating that a record field was
     used that doesn't exist in a constructor.
@@ -4539,6 +4590,45 @@ data TcRnMessage where
          bar :: a %1 ⊸ b
   -}
   TcRnTooManyMultiplicities :: TcRnMessage
+
+  -- | More than one matchability modifier on the same arrow.
+  TcRnTooManyMatchabilities :: TcRnMessage
+
+  -- | A type lambda appears with DependentTypes disabled.
+  TcRnTypeLambdaDisabled :: TcRnMessage
+
+  -- | A type-level let appears with DependentTypes disabled.
+  TcRnTypeLetDisabled :: TcRnMessage
+
+  -- | A type lambda appears outside the supported declaration context.
+  TcRnTypeLambdaContext :: TcRnMessage
+
+  -- | A type-level case needs DependentTypes.
+  TcRnTypeCaseDisabled :: TcRnMessage
+
+  -- | The pattern is malformed, or its expansion has no constructor head.
+  TcRnTypeCasePattern :: Maybe Type -> TcRnMessage
+
+  -- | A type case occurs outside the supported synonym RHS.
+  TcRnTypeCaseContext :: TcRnMessage
+
+  -- | A nested case pattern has a constructor that cannot be lowered.
+  TcRnNestedTypeCasePattern :: Type -> TcRnMessage
+
+  -- | A constructor may become possible when its index family reduces.
+  TcRnTypeCaseIndexApartness :: Kind -> TcRnMessage
+
+  -- | An explicit erased existential has a lifted Type binder.
+  TcRnExistentialBinderKind :: !Kind -> TcRnMessage
+
+  -- | Invalid use of the built-in explicit existential constructor.
+  TcRnExistsPack :: !ExistsPackProblem -> TcRnMessage
+
+  -- | A constrained associated family occurs outside the supported subset.
+  TcRnConstrainedFamilyUnsupported :: !TyCon -> !SDoc -> TcRnMessage
+
+  -- | The data constructor cannot be used in a type-level let pattern.
+  TcRnTypeLetInvalidConstructor :: !DataCon -> TcRnMessage
   deriving Generic
 
 ----
@@ -5296,6 +5386,88 @@ data BootMismatchWhat
                          !TyCon -- ^ real 'TyCon'
                          !(NE.NonEmpty BootTyConMismatch)
   deriving Generic
+
+-- | Explain a restriction of source retained quantification.
+-- | Source contexts in which explicit existential syntax cannot be checked.
+data ExistsPackProblem
+  = ExistsPackExtension
+  | ExistsPackArguments
+  | ExistsPackMissingSchema
+  | ExistsPackInvalidSchema !TcType
+  | ExistsPackInvalidKind !Kind !Kind
+  | ExistsPackInvalidContext
+
+data RetainedQuantificationError
+  = RetainedBinderCount
+  | RetainedBinderNeedsName
+  | RetainedBinderNeedsType
+  | RetainedInvisibleField
+  | RetainedInvisibleArgument Id
+  | RetainedArgumentExtension
+  | RetainedExplicitArgument Type
+  | RetainedUnsupportedDomain Type
+  | RetainedResultKind Type
+  | RetainedSolverType Type
+  | RetainedQuickLook Type
+  | RetainedConstraintType Type
+  | RetainedPragma
+  | RetainedInference Type
+  | RetainedCallbackResult Type
+  | RetainedInvalidBinder Id
+  | RetainedIndexOutOfScope Id
+  | RetainedPartialSignature
+  | RetainedPartialTypeArgument
+  | RetainedPolymorphicSignature
+  | RetainedUnsupportedContext
+  | RetainedFunctionSignature
+  | RetainedStaging
+  | RetainedConstructorCoverage
+  | RetainedMatrixCoverage
+  | RetainedMatrixDuplicate
+  | RetainedMatrixFallback
+  | RetainedMatrixPattern
+  | RetainedLaterConstructorPattern
+  | RetainedMissingConstructorPair Name Name
+  | RetainedCasePatterns
+  | RetainedCaseQuotation
+  | RetainedConstructorQuotation
+  | RetainedConstructorArguments
+  | RetainedPatternType Type
+  | RetainedVariablePattern
+  | RetainedFunctionPatterns
+  | RetainedContextPattern
+  | RetainedResultWrapper
+  | RetainedIndexExpression
+  | RetainedIndexArgumentCast Type Type
+  | RetainedInteractiveIndex Name
+  | RetainedUncheckedSourceCall Name
+  | RetainedLocalSourceMethod Name
+  | RetainedLiteralConversion Name Type
+  | RetainedLiteralDepth Integer
+  | RetainedSourceMethodEvidence Name Type
+  | RetainedSourceRule Name
+  | RetainedFinalCoreRulesEnabled Name
+  | RetainedIndexMultiplicity Type
+  | RetainedFunctionArgument
+  | RetainedCallIndex
+  | RetainedCallInstrumentation
+  | RetainedIndexLambdaStrict
+  | RetainedLocalSignatureIndex
+  | RetainedTypeArgumentIndex
+  | RetainedPackageDeclaration
+  | RetainedPackagePromotion
+  | RetainedPackagePattern
+  | RetainedRecordDeclaration
+  | RetainedRecordConstruction Name (Maybe FieldLabelString)
+  | RetainedRecordPatternOrder
+  | RetainedRecordUpdate
+  | RetainedRecordUpdateWitness Name FieldLabelString [FieldLabelString]
+  | RetainedUncoveredConstructors Name [Name]
+  | RetainedMissingEquation Name
+  | RetainedTypeOperandContext (Maybe Type)
+  | RetainedSelectorReceiver
+  | RetainedConstructorResult Type
+  | RetainedSumContext
 
 -- | An error in the implementation of an abstract datatype using
 -- a type synonym.
@@ -6239,6 +6411,13 @@ data RelevantBindings
     , ranOutOfFuel               :: Bool -- ^ Whether we ran out of fuel generating the bindings.
     }
 
+-- | Show the instantiated source payload in place of its generated family.
+-- Only inspect the outer constructor. Preserve a user-written type synonym.
+diagnosticSumPayload :: Type -> Maybe Type
+diagnosticSumPayload ty = do
+  (family, args) <- splitTyConAppNoView_maybe ty
+  reductionReducedType <$> reduceScopedSumPayload_maybe family args
+
 -- | Display some relevant bindings.
 pprRelevantBindings :: RelevantBindings -> SDoc
 -- This function should be in "GHC.Tc.Errors.Ppr",
@@ -6249,7 +6428,7 @@ pprRelevantBindings (RelevantBindings bds ran_out_of_fuel) =
        2 (vcat (map ppr_binding rel_bds) $$ ppWhen ran_out_of_fuel discardMsg)
   where
     ppr_binding (nm, tidy_ty) =
-      sep [ pprPrefixOcc nm <+> dcolon <+> ppr tidy_ty
+      sep [ pprPrefixOcc nm <+> dcolon <+> maybe (ppr tidy_ty) ppr (diagnosticSumPayload tidy_ty)
           , nest 2 (parens (text "bound at"
                <+> ppr (getSrcLoc nm)))]
     rel_bds = filter (not . isGeneratedSrcSpan . getSrcSpan . fst) bds
@@ -6538,7 +6717,7 @@ data BadInvisPatReason
 data BadEmptyCaseReason
   = EmptyCaseWithoutFlag
   | EmptyCaseDisallowedCtxt
-  | EmptyCaseForall ForAllTyBinder
+  | EmptyCaseForall (Type, ForAllTyBinder)
 
 -- | Either `HsType p` or `HsSigType p`.
 --
@@ -7170,6 +7349,7 @@ data ConversionFailReason
   | IllegalSumAlt !TH.SumAlt
   | IllegalSumArity !TH.SumArity
   | MalformedType !TypeOrKind !TH.Type
+  | InvalidForallMatchabilityWrapper !String
   | IllegalLastStatement !HsDoFlavour !(LStmt GhcPs (LHsExpr GhcPs))
   | KindSigsOnlyAllowedOnGADTs
   | IllegalDeclaration !THDeclDescriptor !IllegalDecls
@@ -7216,6 +7396,12 @@ data UnrepresentableTypeDescr
   = LinearInvisibleArgument
   | CoercionsInTypes
   | DataConVisibleForall
+  | FirstClassExistential
+  | MachineIntTypeLiteral
+  | RetainedFunctionType
+  | RetainedRuntimeIndex
+  | InteriorConstructorContext
+  | NamedRetainedRecordCon
 
 -- FFI error types
 data IllegalForeignTypeReason

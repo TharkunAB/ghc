@@ -1,7 +1,8 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
 
 #if defined(HAVE_INTERNAL_INTERPRETER) && defined(CAN_LOAD_DLL)
-{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnboxedTuples #-}
 #endif
 
@@ -15,6 +16,22 @@ module GHC.Driver.Plugins (
     , emptyPlugins
     , Plugin(..)
     , defaultPlugin
+    , defaultInstallCoreToDos
+    , defaultTcPlugin
+    , defaultDefaultingPlugin
+    , defaultDriverPlugin
+    , defaultLatePlugin
+    , defaultParsedResultAction
+    , defaultRenamedResultAction
+    , defaultTypeCheckResultAction
+    , defaultSpliceRunAction
+    , defaultInterfaceLoadAction
+    , hasDefaultCorePlugin
+    , hasDefaultLatePlugin
+    , hasActiveCorePlugins
+    , hasActiveLatePlugins
+    , isHoleFitOnlyPlugin
+    , hasNonHoleFitPlugins
     , CommandLineOption
     , PsMessages(..)
     , ParsedResult(..)
@@ -70,10 +87,12 @@ module GHC.Driver.Plugins (
 
 import GHC.Prelude
 
+import GHC.Driver.DynFlags (pluginModNames)
 import GHC.Driver.Env
 import GHC.Driver.Monad
 import GHC.Driver.Phases
 import GHC.Driver.Plugins.External
+import GHC.Exts (isTrue#, reallyUnsafePtrEquality#)
 
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
@@ -282,25 +301,184 @@ impurePlugin _args = return ForceRecompile
 flagRecompile =
   return . MaybeRecompile . fingerprintFingerprints . map fingerprintString . sort
 
+-- | Default 'installCoreToDos' hook that leaves the Core pipeline unchanged.
+defaultInstallCoreToDos :: CorePlugin
+defaultInstallCoreToDos _ todos = return todos
+{-# NOINLINE defaultInstallCoreToDos #-}
+
+-- | Default 'tcPlugin' hook that installs no typechecker plugin.
+defaultTcPlugin :: TcPlugin
+defaultTcPlugin _ = Nothing
+{-# NOINLINE defaultTcPlugin #-}
+
+-- | Default 'defaultingPlugin' hook that installs no defaulting plugin.
+defaultDefaultingPlugin :: DefaultingPlugin
+defaultDefaultingPlugin _ = Nothing
+{-# NOINLINE defaultDefaultingPlugin #-}
+
+-- | Default 'driverPlugin' hook that leaves 'HscEnv' unchanged.
+defaultDriverPlugin :: [CommandLineOption] -> HscEnv -> IO HscEnv
+defaultDriverPlugin _ env = return env
+{-# NOINLINE defaultDriverPlugin #-}
+
+-- | Default 'latePlugin' hook that leaves 'CgGuts' and cost centres unchanged.
+defaultLatePlugin :: LatePlugin
+defaultLatePlugin _ _ guts = return guts
+{-# NOINLINE defaultLatePlugin #-}
+
+-- | Default 'parsedResultAction' hook that leaves the parsed module unchanged.
+defaultParsedResultAction :: [CommandLineOption] -> ModSummary
+                          -> ParsedResult -> Hsc ParsedResult
+defaultParsedResultAction _ _ parsed = return parsed
+{-# NOINLINE defaultParsedResultAction #-}
+
+-- | Default 'renamedResultAction' hook that leaves the renamed group unchanged.
+defaultRenamedResultAction :: [CommandLineOption] -> TcGblEnv
+                           -> HsGroup GhcRn -> TcM (TcGblEnv, HsGroup GhcRn)
+defaultRenamedResultAction _ env grp = return (env, grp)
+{-# NOINLINE defaultRenamedResultAction #-}
+
+-- | Default 'typeCheckResultAction' hook that leaves 'TcGblEnv' unchanged.
+defaultTypeCheckResultAction :: [CommandLineOption] -> ModSummary -> TcGblEnv
+                             -> TcM TcGblEnv
+defaultTypeCheckResultAction _ _ env = return env
+{-# NOINLINE defaultTypeCheckResultAction #-}
+
+-- | Default 'spliceRunAction' hook that leaves the splice expression unchanged.
+defaultSpliceRunAction :: [CommandLineOption] -> LHsExpr GhcTc
+                       -> TcM (LHsExpr GhcTc)
+defaultSpliceRunAction _ expr = return expr
+{-# NOINLINE defaultSpliceRunAction #-}
+
+-- | Default 'interfaceLoadAction' hook that leaves the loaded interface unchanged.
+defaultInterfaceLoadAction :: forall lcl. [CommandLineOption] -> ModIface
+                           -> IfM lcl ModIface
+defaultInterfaceLoadAction _ iface = return iface
+{-# NOINLINE defaultInterfaceLoadAction #-}
+
 -- | Default plugin: does nothing at all, except for marking that safe
 -- inference has failed unless @-fplugin-trustworthy@ is passed. For
 -- compatibility reason you should base all your plugin definitions on this
 -- default value.
 defaultPlugin :: Plugin
 defaultPlugin = Plugin {
-        installCoreToDos      = const return
-      , tcPlugin              = const Nothing
-      , defaultingPlugin      = const Nothing
+        installCoreToDos      = defaultInstallCoreToDos
+      , tcPlugin              = defaultTcPlugin
+      , defaultingPlugin      = defaultDefaultingPlugin
       , holeFitPlugin         = const Nothing
-      , driverPlugin          = const return
-      , latePlugin            = \_ -> const return
+      , driverPlugin          = defaultDriverPlugin
+      , latePlugin            = defaultLatePlugin
       , pluginRecompile       = impurePlugin
-      , renamedResultAction   = \_ env grp -> return (env, grp)
-      , parsedResultAction    = \_ _ -> return
-      , typeCheckResultAction = \_ _ -> return
-      , spliceRunAction       = \_ -> return
-      , interfaceLoadAction   = \_ -> return
+      , renamedResultAction   = defaultRenamedResultAction
+      , parsedResultAction    = defaultParsedResultAction
+      , typeCheckResultAction = defaultTypeCheckResultAction
+      , spliceRunAction       = defaultSpliceRunAction
+      , interfaceLoadAction   = defaultInterfaceLoadAction
     }
+{-# NOINLINE defaultPlugin #-}
+
+-- | Force two hook closures to WHNF (normalizing dynamic pointer tags) and
+-- test whether they are the exact same closure.
+samePluginHook :: a -> a -> Bool
+samePluginHook !x !y = isTrue# (reallyUnsafePtrEquality# x y)
+
+-- | Return 'True' when a 'Plugin' keeps 'defaultInstallCoreToDos'.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+hasDefaultCorePlugin :: Plugin -> Bool
+hasDefaultCorePlugin p = samePluginHook (installCoreToDos p) defaultInstallCoreToDos
+
+-- | Return 'True' when a 'Plugin' keeps 'defaultLatePlugin'.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+hasDefaultLatePlugin :: Plugin -> Bool
+hasDefaultLatePlugin p = samePluginHook (latePlugin p) defaultLatePlugin
+
+-- | Return 'True' when 'HscEnv' carries a plugin whose hook fails @is_default@,
+-- or when 'DynFlags' names an unloaded plugin module.
+hasActivePluginHook :: (Plugin -> Bool) -> HscEnv -> Bool
+hasActivePluginHook is_default hsc_env =
+     any (not . is_default . paPlugin) (pluginsWithArgs ps)
+  || any (`notElem` loaded_names) (pluginModNames (hsc_dflags hsc_env))
+  where
+    ps = hsc_plugins hsc_env
+    loaded_names = map lpModuleName (loadedPlugins ps)
+
+-- | Return 'True' when 'HscEnv' carries a plugin that overrides
+-- 'installCoreToDos', or when 'DynFlags' names an unloaded plugin module.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+hasActiveCorePlugins :: HscEnv -> Bool
+hasActiveCorePlugins = hasActivePluginHook hasDefaultCorePlugin
+
+-- | Return 'True' when 'HscEnv' carries a plugin that overrides 'latePlugin',
+-- or when 'DynFlags' names an unloaded plugin module.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+hasActiveLatePlugins :: HscEnv -> Bool
+hasActiveLatePlugins = hasActivePluginHook hasDefaultLatePlugin
+
+-- | Return 'True' when a 'Plugin' keeps all ten non-hole hooks from
+-- 'defaultPlugin', overriding at most 'holeFitPlugin' and 'pluginRecompile'.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+isHoleFitOnlyPlugin :: Plugin -> Bool
+isHoleFitOnlyPlugin p =
+     hasDefaultCorePlugin p
+  && samePluginHook (tcPlugin p)              defaultTcPlugin
+  && samePluginHook (defaultingPlugin p)      defaultDefaultingPlugin
+  && samePluginHook (driverPlugin p)          defaultDriverPlugin
+  && hasDefaultLatePlugin p
+  && samePluginHook (parsedResultAction p)    defaultParsedResultAction
+  && samePluginHook (renamedResultAction p)   defaultRenamedResultAction
+  && samePluginHook (typeCheckResultAction p) defaultTypeCheckResultAction
+  && samePluginHook (spliceRunAction p)       defaultSpliceRunAction
+  && samePluginHook (ifaceHook p)             defaultInterfaceLoadAction
+  where
+    ifaceHook :: Plugin -> [CommandLineOption] -> ModIface -> IfM () ModIface
+    ifaceHook Plugin { interfaceLoadAction = act } = act
+
+-- | Return 'True' when 'HscEnv' carries a plugin that overrides a non-hole
+-- hook, or when 'DynFlags' names a plugin module not yet loaded into
+-- 'hsc_plugins'.
+-- See Note [Plugin hooks and Dependent Haskell pipelines].
+hasNonHoleFitPlugins :: HscEnv -> Bool
+hasNonHoleFitPlugins = hasActivePluginHook isHoleFitOnlyPlugin
+
+{- Note [Plugin hooks and Dependent Haskell pipelines]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC plugins hook into distinct compiler stages, and each stage interacts with
+source-equation publication and native dependent Core according to where its
+output is checked:
+
+1. Source, renamer, and splice hooks ('parsedResultAction',
+   'renamedResultAction', 'spliceRunAction') transform syntax *before*
+   typechecking and equation synthesis, so promoted source equations and
+   desugared Core observe the exact same AST.
+
+2. Driver, interface, solver, defaulting, typecheck-result, and hole-fit hooks
+   ('driverPlugin', 'interfaceLoadAction', 'tcPlugin', 'defaultingPlugin',
+   'typeCheckResultAction', 'holeFitPlugin') run before or during typechecking.
+   Their AST and solver evidence are verified by Core Lint and by the
+   post-optimization source-equation validators in 'GHC.Driver.Main.Passes'.
+
+3. Core-to-Core hooks ('installCoreToDos' and Template Haskell 'addCorePlugin')
+   run inside 'hscSimplify'' (both when generating code and when validating
+   provisional equations under @-fno-code@) *before* 'keepValidatedSourceMappers',
+   'validateSimpleSourceTables', 'checkEarlyIndexedLookups', and
+   'publishCheckedSourceClosures' check @cg_binds@ / @opt_guts@ against the
+   staged equations. Read-only inspection Core plugins keep equations intact;
+   incompatible Core RHS rewrites are caught by those post-checks. On native
+   dependent modules ('RetainedCore'), 'core2coreRetained' and
+   'runRetainedCorePluginPasses' run 'installCoreToDos' passes under Dependent
+   Core Lint and re-verify supported retained Core shapes afterward.
+
+4. Late plugins ('latePlugin') run in 'GHC.Driver.Main.Compile' *after*
+   interface creation and post-optimization validation. Only an active
+   'latePlugin' ('hasActiveLatePlugins') withholds unchecked source equations
+   and rejects native dependent Core.
+
+Each default hook in 'defaultPlugin' is bound to a @NOINLINE@ top-level
+closure. 'samePluginHook' forces both closures to WHNF (normalizing dynamic
+pointer tags) before comparing them with 'reallyUnsafePtrEquality#', and
+'hasActiveCorePlugins' / 'hasActiveLatePlugins' fail closed if 'pluginModNames'
+names a module not yet present in 'loadedPlugins'.
+-}
 
 
 -- | A renamer plugin which mades the renamed source available in

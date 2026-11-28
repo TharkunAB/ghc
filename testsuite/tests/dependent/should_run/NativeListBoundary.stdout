@@ -1,0 +1,33 @@
+[0,1,2,3]
+[11,10,21,20]
+("zero","successor")
+[30,7,40,8]
+Just [(1,'a'),(2,'b')]
+Nothing
+Nothing
+Just []
+Just [1,2]
+Just [1,2]
+Just [1,2]
+Just [1,2]
+[1,2]
+True
+Just 2
+Nothing
+Nothing
+[[1,7,7],[1,7,7],[1,7,7]]
+3
+0
+[True,True]
+True
+True
+Just 1
+True
+True
+False
+False
+False
+Just 7
+[1,2,3]
+(Just 9,Just 'x')
+True

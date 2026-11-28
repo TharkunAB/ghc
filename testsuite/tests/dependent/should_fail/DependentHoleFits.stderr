@@ -1,0 +1,536 @@
+DependentHoleFits.hs:37:26: error: [GHC-88464]
+    • Found hole: _ :: plus n2 p :~: plus n2 p
+    • In an equation for ‘plusAssoc’: plusAssoc Zero _ _ = _
+    • Relevant bindings include
+        plusAssoc :: foreach (m :: Nat)
+                     -> foreach (n :: Nat)
+                        -> foreach (p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
+          (bound at DependentHoleFits.hs:37:1)
+      Constraints include m ~ Zero (from DependentHoleFits.hs:37:1-26)
+      Valid hole fits include
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @(plus n2 p)
+      Valid refinement hole fits include
+        cong (_ :: Nat -> Nat) (_ :: p :~: p)
+          where cong :: forall {a} {b} {m :: Matchability}.
+                        forall (f :: a %m -> b) ->
+                        forall (x :: a) (y :: a). (x :~: y) -> f x :~: f y
+          with cong @p @p
+        trans (_ :: plus n2 p :~: b1) (_ :: b1 :~: plus n2 p)
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(plus n2 p) @b1 @(plus n2 p)
+        id (_ :: plus n2 p :~: plus n2 p)
+          where id :: forall a. a -> a
+          with id @(plus n2 p :~: plus n2 p)
+        fst (_ :: Tuple2 (plus n2 p :~: plus n2 p) b0)
+          where fst :: forall a b. Tuple2 a b -> a
+          with fst @(plus n2 p :~: plus n2 p) @b0
+        snd (_ :: Tuple2 a0 (plus n2 p :~: plus n2 p))
+          where snd :: forall a b. Tuple2 a b -> b
+          with snd @a0 @(plus n2 p :~: plus n2 p)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(plus n2 p :~: plus n2 p)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+
+DependentHoleFits.hs:38:26: error: [GHC-88464]
+    • Found hole:
+        _ :: Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p))
+    • In an equation for ‘plusAssoc’: plusAssoc (Succ m) n p = _
+    • Relevant bindings include
+        n :: Nat (bound at DependentHoleFits.hs:38:20)
+        p :: Nat (bound at DependentHoleFits.hs:38:22)
+        m :: Nat (bound at DependentHoleFits.hs:38:17)
+        plusAssoc :: foreach (m :: Nat)
+                     -> foreach (n :: Nat)
+                        -> foreach (p :: Nat) -> plus (plus m n) p :~: plus m (plus n p)
+          (bound at DependentHoleFits.hs:37:1)
+      Constraints include m ~ Succ m2 (from DependentHoleFits.hs:38:1-26)
+      Valid refinement hole fits include
+        congSucc (_ :: plus (plus m2 n2) p :~: plus m2 (plus n2 p))
+          where congSucc :: forall (m :: Nat) (n :: Nat).
+                            (m :~: n) -> Succ m :~: Succ n
+          with congSucc @(plus (plus m2 n2) p) @(plus m2 (plus n2 p))
+        trans (_ :: Succ (plus (plus m2 n2) p) :~: b1)
+              (_ :: b1 :~: Succ (plus m2 (plus n2 p)))
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(Succ (plus (plus m2 n2) p))
+                     @b1
+                     @(Succ (plus m2 (plus n2 p)))
+        cong (_ :: Nat -> Nat)
+             (_ :: plus (plus m2 n2) p :~: plus m2 (plus n2 p))
+          where cong :: forall {a} {b} {m :: Matchability}.
+                        forall (f :: a %m -> b) ->
+                        forall (x :: a) (y :: a). (x :~: y) -> f x :~: f y
+          with cong @(plus (plus m2 n2) p) @(plus m2 (plus n2 p))
+        id (_ :: Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p)))
+          where id :: forall a. a -> a
+          with id @(Succ (plus (plus m2 n2) p)
+                    :~: Succ (plus m2 (plus n2 p)))
+        fst (_ :: Tuple2
+                    (Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p))) b0)
+          where fst :: forall a b. Tuple2 a b -> a
+          with fst @(Succ (plus (plus m2 n2) p)
+                     :~: Succ (plus m2 (plus n2 p)))
+                   @b0
+        snd (_ :: Tuple2
+                    a0 (Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p))))
+          where snd :: forall a b. Tuple2 a b -> b
+          with snd @a0
+                   @(Succ (plus (plus m2 n2) p) :~: Succ (plus m2 (plus n2 p)))
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+    Suggested fixes:
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘n’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+
+DependentHoleFits.hs:42:23: error: [GHC-88464]
+    • Found hole: _ :: plus m6 n5 :~: plus n5 m6
+    • In an equation for ‘plusCommUnsplit’: plusCommUnsplit m n = _
+    • Relevant bindings include
+        n :: Nat (bound at DependentHoleFits.hs:42:19)
+        m :: Nat (bound at DependentHoleFits.hs:42:17)
+        plusCommUnsplit :: foreach (m :: Nat)
+                           -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at DependentHoleFits.hs:42:1)
+      Valid refinement hole fits include
+        plusCommUnsplit (_ :: Nat) (_ :: Nat)
+          where plusCommUnsplit :: foreach (m :: Nat)
+                                   -> foreach (n :: Nat) -> plus m n :~: plus n m
+        trans (_ :: plus m6 n5 :~: b0) (_ :: b0 :~: plus n5 m6)
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(plus m6 n5) @b0 @(plus n5 m6)
+        id (_ :: plus m6 n5 :~: plus n5 m6)
+          where id :: forall a. a -> a
+          with id @(plus m6 n5 :~: plus n5 m6)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(plus m6 n5 :~: plus n5 m6)
+        head (_ :: List (plus m6 n5 :~: plus n5 m6))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(plus m6 n5 :~: plus n5 m6)
+        last (_ :: List (plus m6 n5 :~: plus n5 m6))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(plus m6 n5 :~: plus n5 m6)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+    Suggested fixes:
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘n’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+
+DependentHoleFits.hs:46:17: error: [GHC-88464]
+    • Found hole: _ :: plus m5 Zero :~: m5
+    • In an equation for ‘usePlusZero’: usePlusZero m = _
+    • Relevant bindings include
+        m :: Nat (bound at DependentHoleFits.hs:46:13)
+        usePlusZero :: foreach (m :: Nat) -> plus m Zero :~: m
+          (bound at DependentHoleFits.hs:46:1)
+      Valid refinement hole fits include
+        plusZero (_ :: Nat)
+          where plusZero :: foreach (m :: Nat) -> plus m Zero :~: m
+        usePlusZero (_ :: Nat)
+          where usePlusZero :: foreach (m :: Nat) -> plus m Zero :~: m
+        plusCommUnsplit (_ :: Nat) (_ :: Nat)
+          where plusCommUnsplit :: foreach (m :: Nat)
+                                   -> foreach (n :: Nat) -> plus m n :~: plus n m
+        trans (_ :: plus m5 Zero :~: b0) (_ :: b0 :~: m5)
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(plus m5 Zero) @b0 @m5
+        id (_ :: plus m5 Zero :~: m5)
+          where id :: forall a. a -> a
+          with id @(plus m5 Zero :~: m5)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(plus m5 Zero :~: m5)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+    Suggested fix:
+      Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                          ‘Succ’) to reduce ‘plus’.
+
+DependentHoleFits.hs:50:12: error: [GHC-88464]
+    • Found hole: _ :: LE Zero n4
+    • In an equation for ‘leZero’: leZero _ = _
+    • Relevant bindings include
+        leZero :: foreach (n :: Nat) -> LE Zero n
+          (bound at DependentHoleFits.hs:50:1)
+      Valid hole fits include
+        LZ :: forall (n :: Nat). LE Zero n
+          with LZ @n4
+      Valid refinement hole fits include
+        leZero (_ :: Nat)
+          where leZero :: foreach (n :: Nat) -> LE Zero n
+        id (_ :: LE Zero n4)
+          where id :: forall a. a -> a
+          with id @(LE Zero n4)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(LE Zero n4)
+        head (_ :: List (LE Zero n4))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(LE Zero n4)
+        last (_ :: List (LE Zero n4))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(LE Zero n4)
+        asTypeOf (_ :: LE Zero n4) (_ :: LE Zero n4)
+          where asTypeOf :: forall a. a -> a -> a
+          with asTypeOf @(LE Zero n4)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+
+DependentHoleFits.hs:53:16: error: [GHC-88464]
+    • Found hole: _ :: LE (Succ m4) (Succ n3)
+    • In an equation for ‘leSucc’: leSucc m n h = _
+    • Relevant bindings include
+        h :: LE m4 n3 (bound at DependentHoleFits.hs:53:12)
+        n :: Nat (bound at DependentHoleFits.hs:53:10)
+        m :: Nat (bound at DependentHoleFits.hs:53:8)
+        leSucc :: foreach (m :: Nat)
+                  -> foreach (n :: Nat) -> LE m n -> LE (Succ m) (Succ n)
+          (bound at DependentHoleFits.hs:53:1)
+      Valid refinement hole fits include
+        LS (_ :: LE m4 n3)
+          where LS :: forall (m :: Nat) (n :: Nat).
+                      LE m n -> LE (Succ m) (Succ n)
+          with LS @m4 @n3
+        id (_ :: LE (Succ m4) (Succ n3))
+          where id :: forall a. a -> a
+          with id @(LE (Succ m4) (Succ n3))
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(LE (Succ m4) (Succ n3))
+        head (_ :: List (LE (Succ m4) (Succ n3)))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(LE (Succ m4) (Succ n3))
+        last (_ :: List (LE (Succ m4) (Succ n3)))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(LE (Succ m4) (Succ n3))
+        asTypeOf (_ :: LE (Succ m4) (Succ n3))
+                 (_ :: LE (Succ m4) (Succ n3))
+          where asTypeOf :: forall a. a -> a -> a
+          with asTypeOf @(LE (Succ m4) (Succ n3))
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+
+DependentHoleFits.hs:67:19: error: [GHC-88464]
+    • Found hole: _ :: SameLen xs xs
+      Where: ‘a’ is a rigid type variable bound by
+               the type signature for:
+                 useSameLen :: forall a b.
+                               foreach (xs :: MyList a) -> MyList b -> SameLen xs xs
+               at DependentHoleFits.hs:66:1-95
+    • In an equation for ‘useSameLen’: useSameLen xs _ = _
+    • Relevant bindings include
+        xs :: MyList a (bound at DependentHoleFits.hs:67:12)
+        useSameLen :: foreach (xs :: MyList a) -> MyList b -> SameLen xs xs
+          (bound at DependentHoleFits.hs:67:1)
+      Valid refinement hole fits include
+        sameLenRefl (_ :: MyList a)
+          where sameLenRefl :: forall a.
+                               foreach (xs :: MyList a) -> SameLen xs xs
+          with sameLenRefl @a
+        useSameLen (_ :: MyList a) (_ :: MyList b)
+          where useSameLen :: foreach (xs :: MyList a)
+                              -> MyList b -> SameLen xs xs
+        id (_ :: SameLen xs xs)
+          where id :: forall a. a -> a
+          with id @(SameLen xs xs)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(SameLen xs xs)
+        head (_ :: List (SameLen xs xs))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(SameLen xs xs)
+        last (_ :: List (SameLen xs xs))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(SameLen xs xs)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+
+DependentHoleFits.hs:72:24: error: [GHC-88464]
+    • Found hole:
+        _ :: plus x1 (foldr plus z xs1)
+             :~: plus (plus x1 (foldr plus Zero xs1)) z
+    • In an equation for ‘foldrPlusGoal’: foldrPlusGoal x xs z = _
+    • Relevant bindings include
+        z :: Nat (bound at DependentHoleFits.hs:72:20)
+        xs :: List Nat (bound at DependentHoleFits.hs:72:17)
+        x :: Nat (bound at DependentHoleFits.hs:72:15)
+        foldrPlusGoal :: foreach (x :: Nat)
+                         -> foreach (xs :: List Nat)
+                            -> foreach (z :: Nat)
+                               -> foldr plus z (x : xs) :~: plus (foldr plus Zero (x : xs)) z
+          (bound at DependentHoleFits.hs:72:1)
+      Valid refinement hole fits include
+        trans (_ :: plus x1 (foldr plus z xs1) :~: b0)
+              (_ :: b0 :~: plus (plus x1 (foldr plus Zero xs1)) z)
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(plus x1 (foldr plus z xs1))
+                     @b0
+                     @(plus (plus x1 (foldr plus Zero xs1)) z)
+        id (_ :: plus x1 (foldr plus z xs1)
+                 :~: plus (plus x1 (foldr plus Zero xs1)) z)
+          where id :: forall a. a -> a
+          with id @(plus x1 (foldr plus z xs1)
+                    :~: plus (plus x1 (foldr plus Zero xs1)) z)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(plus x1 (foldr plus z xs1)
+                                             :~: plus (plus x1 (foldr plus Zero xs1)) z)
+        head (_ :: List
+                     (plus x1 (foldr plus z xs1)
+                      :~: plus (plus x1 (foldr plus Zero xs1)) z))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(plus x1 (foldr plus z xs1)
+                      :~: plus (plus x1 (foldr plus Zero xs1)) z)
+        last (_ :: List
+                     (plus x1 (foldr plus z xs1)
+                      :~: plus (plus x1 (foldr plus Zero xs1)) z))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(plus x1 (foldr plus z xs1)
+                      :~: plus (plus x1 (foldr plus Zero xs1)) z)
+        InternalList.maximum (_ :: List
+                                     (plus x1 (foldr plus z xs1)
+                                      :~: plus (plus x1 (foldr plus Zero xs1)) z))
+          where InternalList.maximum :: forall a.
+                                        (Ord a, GHC.Internal.Stack.Types.HasCallStack) =>
+                                        List a -> a
+          with InternalList.maximum @(plus x1 (foldr plus z xs1)
+                                      :~: plus (plus x1 (foldr plus Zero xs1)) z)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+    Suggested fixes:
+      • Pattern-match on ‘x’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘xs’ (constructors: ‘[]’,
+                                             ‘:’) to reduce ‘foldr’.
+
+DependentHoleFits.hs:98:13: error: [GHC-88464]
+    • Found hole:
+        _ :: foreach (xs :: List a)
+             -> size (InternalList.reverseOnto xs []) :~: size xs
+      Where: ‘a’ is a rigid type variable bound by
+               the type signature for:
+                 lengthRev :: forall a.
+                              foreach (xs :: List a) -> size (reverse xs) :~: size xs
+               at DependentHoleFits.hs:97:1-78
+    • In an equation for ‘lengthRev’: lengthRev = _
+    • Relevant bindings include
+        lengthRev :: foreach (xs :: List a)
+                     -> size (reverse xs) :~: size xs
+          (bound at DependentHoleFits.hs:98:1)
+      Valid hole fits include
+        lengthReverse :: forall a.
+                         foreach (xs :: List a) -> size (reverse xs) :~: size xs
+          with lengthReverse @a
+
+DependentHoleFits.hs:101:22: error: [GHC-88464]
+    • Found hole:
+        _ :: foreach (xs :: List a)
+             -> InternalList.reverseOnto xs [] :~: xs
+      Where: ‘a’ is a rigid type variable bound by
+               the type signature for:
+                 reverseIdPointfree :: forall a.
+                                       foreach (xs :: List a) -> reverse xs :~: xs
+               at DependentHoleFits.hs:100:1-75
+    • In an equation for ‘reverseIdPointfree’: reverseIdPointfree = _
+    • Relevant bindings include
+        reverseIdPointfree :: foreach (xs :: List a) -> reverse xs :~: xs
+          (bound at DependentHoleFits.hs:101:1)
+
+DependentHoleFits.hs:119:23: error: [GHC-88464]
+    • Found hole: _ :: add2 m3 (Succ k) :~: Succ (add2 k m3)
+    • In an equation for ‘add2Comm’: add2Comm m (Succ k) = _
+    • Relevant bindings include
+        m :: Nat (bound at DependentHoleFits.hs:119:10)
+        k :: Nat (bound at DependentHoleFits.hs:119:18)
+        add2Comm :: foreach (m :: Nat)
+                    -> foreach (k :: Nat) -> add2 m k :~: add2 k m
+          (bound at DependentHoleFits.hs:118:1)
+      Constraints include
+        k ~ Succ k1 (from DependentHoleFits.hs:119:1-23)
+      Valid refinement hole fits include
+        add2Comm (_ :: Nat) (_ :: Nat)
+          where add2Comm :: foreach (m :: Nat)
+                            -> foreach (k :: Nat) -> add2 m k :~: add2 k m
+        trans (_ :: add2 m3 (Succ k) :~: b1) (_ :: b1 :~: Succ (add2 k m3))
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(add2 m3 (Succ k)) @b1 @(Succ (add2 k m3))
+        id (_ :: add2 m3 (Succ k) :~: Succ (add2 k m3))
+          where id :: forall a. a -> a
+          with id @(add2 m3 (Succ k) :~: Succ (add2 k m3))
+        fst (_ :: Tuple2 (add2 m3 (Succ k) :~: Succ (add2 k m3)) b0)
+          where fst :: forall a b. Tuple2 a b -> a
+          with fst @(add2 m3 (Succ k) :~: Succ (add2 k m3)) @b0
+        snd (_ :: Tuple2 a0 (add2 m3 (Succ k) :~: Succ (add2 k m3)))
+          where snd :: forall a b. Tuple2 a b -> b
+          with snd @a0 @(add2 m3 (Succ k) :~: Succ (add2 k m3))
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(add2 m3 (Succ k)
+                                             :~: Succ (add2 k m3))
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+    Suggested fixes:
+      • Pattern-match on ‘k’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘add2’.
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘add2’.
+
+DependentHoleFits.hs:126:19: error: [GHC-88464]
+    • Found hole: _ :: u :~: v
+      Where: ‘a’ is a rigid type variable bound by
+               the type signature for:
+                 vecEqGoal :: forall a.
+                              foreach (n :: Nat)
+                              -> foreach (u :: Vec a n) -> foreach (v :: Vec a n) -> u :~: v
+               at DependentHoleFits.hs:125:1-104
+    • In an equation for ‘vecEqGoal’: vecEqGoal _ u v = _
+    • Relevant bindings include
+        v :: Vec a n1 (bound at DependentHoleFits.hs:126:15)
+        u :: Vec a n1 (bound at DependentHoleFits.hs:126:13)
+        vecEqGoal :: foreach (n :: Nat)
+                     -> foreach (u :: Vec a n) -> foreach (v :: Vec a n) -> u :~: v
+          (bound at DependentHoleFits.hs:126:1)
+      Valid refinement hole fits include
+        trans (_ :: u :~: b0) (_ :: b0 :~: v)
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @u @b0 @v
+        id (_ :: u :~: v)
+          where id :: forall a. a -> a
+          with id @(u :~: v)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(u :~: v)
+        head (_ :: List (u :~: v))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(u :~: v)
+        last (_ :: List (u :~: v))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(u :~: v)
+        InternalList.maximum (_ :: List (u :~: v))
+          where InternalList.maximum :: forall a.
+                                        (Ord a, GHC.Internal.Stack.Types.HasCallStack) =>
+                                        List a -> a
+          with InternalList.maximum @(u :~: v)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+
+DependentHoleFits.hs:173:27: error: [GHC-88464]
+    • Found hole: _ :: s1 x :~: s2 x
+      Where: ‘n’, ‘m’, ‘s1’, ‘s2’ are rigid type variables bound by
+               the type signature for:
+                 congSubst :: forall (m :: Nat) (n :: Nat) (s1 :: Subst m n)
+                                     (s2 :: Subst m n).
+                              SubEq s1 s2
+                              -> foreach (t :: UTerm m) -> substU s1 t :~: substU s2 t
+               at DependentHoleFits.hs:(170,1)-(172,66)
+    • In a case alternative: UVar x -> _
+      In the expression:
+        case __a15I of
+          UVar x -> _
+          ULam b
+            -> case
+                   congSubst
+                     @(Succ m) @(Succ n) @(extsU s1) @(extsU s2)
+                     (congExts @m @n @s1 @s2 eq) b
+               of
+                 Refl -> Refl
+          UApp l r
+            -> case
+                   (congSubst @m @n @s1 @s2 eq l, congSubst @m @n @s1 @s2 eq r)
+               of
+                 (Refl, Refl) -> Refl
+      In an equation for ‘congSubst’:
+          congSubst eq __a15I
+            = case __a15I of
+                UVar x -> _
+                ULam b
+                  -> case
+                         congSubst
+                           @(Succ m) @(Succ n) @(extsU s1) @(extsU s2)
+                           (congExts @m @n @s1 @s2 eq) b
+                     of
+                       Refl -> Refl
+                UApp l r
+                  -> case
+                         (congSubst @m @n @s1 @s2 eq l, congSubst @m @n @s1 @s2 eq r)
+                     of
+                       (Refl, Refl) -> Refl
+    • Relevant bindings include
+        x :: Fin m (bound at DependentHoleFits.hs:173:20)
+        eq :: SubEq s1 s2 (bound at DependentHoleFits.hs:173:11)
+        congSubst :: SubEq s1 s2
+                     -> foreach (t :: UTerm m) -> substU s1 t :~: substU s2 t
+          (bound at DependentHoleFits.hs:173:1)
+      Valid refinement hole fits include
+        eq (_ :: Fin m)
+          where eq :: SubEq s1 s2
+        trans (_ :: s1 x :~: b1) (_ :: b1 :~: s2 x)
+          where trans :: forall {k} (a :: k) (b :: k) (c :: k).
+                         (a :~: b) -> (b :~: c) -> a :~: c
+          with trans @(s1 x) @b1 @(s2 x)
+        id (_ :: s1 x :~: s2 x)
+          where id :: forall a. a -> a
+          with id @(s1 x :~: s2 x)
+        InternalList.errorEmptyList (_ :: String)
+          where InternalList.errorEmptyList :: forall a.
+                                               GHC.Internal.Stack.Types.HasCallStack =>
+                                               String -> a
+          with InternalList.errorEmptyList @(s1 x :~: s2 x)
+        head (_ :: List (s1 x :~: s2 x))
+          where head :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with head @(s1 x :~: s2 x)
+        last (_ :: List (s1 x :~: s2 x))
+          where last :: forall a.
+                        GHC.Internal.Stack.Types.HasCallStack =>
+                        List a -> a
+          with last @(s1 x :~: s2 x)
+        (Some refinement hole fits suppressed; use -fmax-refinement-hole-fits=N or -fno-max-refinement-hole-fits)
+

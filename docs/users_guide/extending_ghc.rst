@@ -859,6 +859,15 @@ As in :ref:`constraint-solving-with-plugins`, if the plugin used any Given
 constraints to justify the rewriting, the coercion must mention their evidence,
 e.g. by passing it as the dependencies of a coercion built with ``mkUnivCo``.
 
+Under :extension:`DependentTypes` (see :ref:`dependent-types`), when at least
+one ``tcPlugin`` is active, GHC elaborates uncertified open term applications
+``f arg_1 ... arg_n`` in types as saturated applications of a deterministic
+equationless closed type family (named ``U:<occ>`` in ``f``'s defining module,
+or ``U:@<unit>:<mod>:<occ>`` when ``f`` is imported without a predeclared
+family). A ``TcPluginSolver`` or ``TcPluginRewriter`` can recover the term
+``Id`` for ``f`` from the family's ``TyCon`` name and rewrite, discharge, or
+refute constraints mentioning that application.
+
 .. _source-plugins:
 
 Source plugins

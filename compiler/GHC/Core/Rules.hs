@@ -31,7 +31,7 @@ module GHC.Core.Rules (
 
         -- * Making rules
         mkRule, mkSpecRule, roughTopNames,
-        ruleIsOrphan
+        ruleIsOrphan, canShareRetainedSpecRule
 
     ) where
 
@@ -47,6 +47,8 @@ import GHC.Driver.Ppr( showSDoc )
 
 import GHC.Core         -- All of it
 import GHC.Core.Subst
+import GHC.Core.Dependent (hasNativeDependentExprRhs, isScopedSelectorReceiver)
+import GHC.Core.Predicate (isDictId, tyCoVarsOfTypeWellScoped)
 import GHC.Core.SimpleOpt ( exprIsLambda_maybe )
 import GHC.Core.FVs       ( exprFreeVars, bindFreeVars
                           , rulesFreeVarsDSet, orphNamesOfExprs )
@@ -56,7 +58,8 @@ import GHC.Core.Ppr       ( pprRules )
 import GHC.Core.Unify as Unify ( ruleMatchTyKiX )
 import GHC.Core.Type as Type
    ( Type, extendTvSubst, extendCvSubst
-   , substTy, getTyVar_maybe )
+   , substTy, getTyVar_maybe, anyFreeVarsOfType, typeKind, isNativeIndexFunctionId )
+import GHC.Core.TyCo.Compare (eqType)
 import GHC.Core.TyCo.Ppr( pprParendType )
 import GHC.Core.Coercion as Coercion
 import GHC.Core.Tidy     ( tidyRules )
@@ -76,7 +79,7 @@ import GHC.Types.InlinePragma
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Types.Name    ( Name, NamedThing(..), nameIsLocalOrFrom )
+import GHC.Types.Name    ( Name, NamedThing(..), nameIsLocalOrFrom, nameModule_maybe )
 import GHC.Types.Name.Set
 import GHC.Types.Name.Occurrence( occNameFS )
 import GHC.Types.Unique
@@ -97,7 +100,7 @@ import GHC.Utils.Constants (debugIsOn)
 
 import Data.List (sortBy, mapAccumL, isPrefixOf)
 import Data.Function    ( on )
-import Control.Monad    ( guard )
+import Control.Monad    ( foldM, guard )
 
 {-
 Note [Overall plumbing for rules]
@@ -238,6 +241,52 @@ mkSpecRule dflags this_mod is_auto inl_act herald fn bndrs args rhs
 
     is_local = isLocalId fn
     rule_name = mkSpecRuleName dflags herald fn args
+
+{- Note [Exported retained specialisations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained automatic specialisation may cross a module boundary if its
+head's type selects the retained pipeline in the client. An ordinary
+head can call a retained worker in its body, but clients choose their
+pipeline before using imported rules. Such rules stay local.
+
+Keep the closed shape produced by Specialise for dictionary calls. The
+left hand side supplies types and bound dictionaries. The right hand
+side applies a worker from the same module to arguments in that scope.
+Use the auto flag and the defining module for provenance. The rule name
+is arbitrary user-visible text. The retained driver lints the rule
+before Tidy. The reader checks this shape again and lints both sides.
+See Note [Linting rules] in GHC.Core.Lint.
+-}
+
+-- | Check the producer and consumer boundary for a retained specialization.
+canShareRetainedSpecRule :: Id -> CoreRule -> Bool
+canShareRetainedSpecRule fun Rule{ru_auto = True, ru_origin = origin,
+                                  ru_orphan = NotOrphan{}, ru_fn = name,
+                                  ru_bndrs = bndrs, ru_args = args, ru_rhs = rhs}
+  | idName fun == name
+  , belongsToOrigin fun
+  , hasNativeDependentExprRhs (Type (idType fun))
+  , all (ordinaryArg . varToCoreExpr) bndrs
+  , let (types, dicts) = span isTypeArg args
+  , not (null dicts)
+  , all ordinaryArg types
+  , all boundDictionary dicts
+  , (Var worker, worker_args) <- collectArgs rhs
+  , worker /= fun, not (worker `elemVarSet` bound), belongsToOrigin worker
+  = all workerArg worker_args
+  where
+    belongsToOrigin id =
+      maybe (isLocalId id) (== origin) (nameModule_maybe (idName id))
+      && not (isImplicitId id || isJoinId id)
+    ordinaryArg = not . hasNativeDependentExprRhs
+    bound = mkVarSet bndrs
+    boundDictionary (Var dict) = dict `elemVarSet` bound && isDictId dict
+    boundDictionary _ = False
+    workerArg (Type ty) = case getTyVar_maybe ty of
+      Just tv -> tv `elemVarSet` bound
+      Nothing -> False
+    workerArg arg = boundDictionary arg
+canShareRetainedSpecRule _ _ = False
 
 mkSpecRuleName :: DynFlags -> SDoc -> Id -> [CoreExpr] -> FastString
 mkSpecRuleName dflags herald fn args
@@ -1382,6 +1431,20 @@ It's not especially easy to deal with eta reducing the template,
 and never happens, because no one write eta-expanded left-hand-sides.
 -}
 
+-- See Note [Matching erased packages].
+match renv subst (Pack schema1 w1 p1) (Pack schema2 w2 p2) MRefl
+  = do { subst1 <- match_ty renv subst schema1 schema2
+       ; subst2 <- match_ty renv subst1 w1 w2
+       ; match renv subst2 p1 p2 MRefl }
+
+match renv subst (Unpack w1 p1 pkg1 body1) (Unpack w2 p2 pkg2 body2) MRefl
+  = do { subst1 <- match renv subst pkg1 pkg2 MRefl
+       ; subst2 <- match_ty renv subst1 (varType w1) (varType w2)
+       ; let under_witness = rnMatchBndr2 renv w1 w2
+       ; subst3 <- match_ty under_witness subst2 (idMult p1) (idMult p2)
+       ; subst4 <- match_ty under_witness subst3 (varType p1) (varType p2)
+       ; match (rnMatchBndr2 under_witness p1 p2) subst4 body1 body2 MRefl }
+
 ------------------------ Case expression ---------------------
 {- Disabled: see Note [Matching cases] below
 match renv (tv_subst, id_subst, binds) e1
@@ -1408,6 +1471,19 @@ match renv subst (Case e1 x1 ty1 alts1) (Case e2 x2 ty2 alts2) mco
 -- Everything else fails
 match _ _ _e1 _e2 _mco = -- pprTrace "Failing at" ((text "e1:" <+> ppr _e1) $$ (text "e2:" <+> ppr _e2)) $
                          Nothing
+
+{- Note [Matching erased packages]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A Pack carries both the existential type and a witness chosen by the
+producer. Match both types before the payload. Different witnesses can
+give the same payload type when the existential binder is unused.
+
+Unpack opens the package for the body. Match the scrutinees in the
+outer scope. Rename the witnesses together before matching the payload
+binder types. Rename the payload binders together before matching the
+bodies. The usual escape check in match_tmpl_var then prevents a rule
+variable from capturing a locally opened witness or payload.
+-}
 
 -------------
 eta_reduce :: RuleMatchEnv -> CoreExpr -> Maybe (RuleMatchEnv, CoreExpr)
@@ -1580,6 +1656,7 @@ match_alts _ subst [] [] _
   = return subst
 match_alts renv subst (Alt c1 vs1 r1:alts1) (Alt c2 vs2 r2:alts2) mco
   | c1 == c2
+  , equalLength vs1 vs2
   = do  { subst1 <- match renv' subst r1 r2 mco
         ; match_alts renv subst1 alts1 alts2 mco }
   where
@@ -1681,12 +1758,58 @@ match_ty :: RuleMatchEnv
 -- We only want to replace (f T) with f', not (f Int).
 
 match_ty (RV { rv_tmpls = tmpls, rv_lcl = rn_env })
-         subst@(RS { rs_tv_subst = tv_subst })
+         subst@(RS { rs_tv_subst = tv_subst, rs_id_subst = id_subst })
          ty1 ty2
-  = do  { tv_subst' <- Unify.ruleMatchTyKiX tmpls rn_env tv_subst ty1 ty2
-               -- NB: ruleMatchTyKiX applis tv_subst to ty1 only
-               --     and of course only binds 'tmpls'
+  = do  { tv_subst' <- if isEmptyVarEnv id_subst || not (anyFreeVarsOfType matched_index ty1)
+                       then match_type rn_env ty1
+                       else do
+                         s <- foldM add_var (mkEmptySubst scope) (tyCoVarsOfTypeWellScoped ty1)
+                         match_type (nukeRnEnvL rn_env) (Type.substTy s ty1)
         ; return (subst { rs_tv_subst = tv_subst' }) }
+  where
+    match_type env ty = Unify.ruleMatchTyKiX tmpls env tv_subst ty ty2
+    scope = extendInScopeSetList (rnInScopeSet rn_env) (rs_bndrs subst)
+    matched_index v = isNonCoVarId v && rnOccL rn_env v `elemVarEnv` id_subst
+
+    -- See Note [Matching a runtime index in a RULE].
+    add_var s v
+      | isTyVar v, Just ty <- lookupVarEnv tv_subst renamed
+      = Just (Type.extendTvSubst s v ty)
+      | isCoVar v, Just (Coercion co) <- lookupVarEnv id_subst renamed
+      = Just (Type.extendCvSubst s v co)
+      | isNonCoVarId v
+      = do { let actual = lookupVarEnv id_subst renamed `orElse` Var renamed
+                 domain = Type.substTy s (varType v)
+           ; if isNativeIndexFunctionId v
+             then do { index <- nativeLocalFunctionArgIndex actual
+                     ; guard (typeKind index `eqType` domain)
+                     ; guard (isJust (termVar_maybe actual)
+                              || not (isScopedSelectorReceiver v ty1)) }
+             else do { index <- retainedArgIndex actual
+                     ; guard (typeKind index `eqType` domain) }
+           ; return (extendIdSubst s v actual) }
+      | otherwise = Just (extendSubstWithVar s v renamed)
+      where
+        renamed = rnOccL rn_env v
+
+{- Note [Matching a runtime index in a RULE]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In forall b (xs :: Choice b). keep b xs = xs, matching the first
+argument fixes b. When matching xs, check its type at that same index.
+Read term substitutions that the expression matcher has already checked
+for scope. Never solve for an unknown runtime value by matching types.
+
+The template binders can have fresh names in the matcher. Look up each
+substitution with the renamed binder. Apply the left renaming and the
+matched arguments together, in dependency order, so each index has its
+instantiated domain. The resulting type contains target occurrences.
+Clear the left renaming before matching it against the target type.
+
+A callback substitution can carry a nominal cast. Read its index with
+the same check as a retained application, and substitute the original
+expression so the later type keeps the lexical head and its proof.
+A private class selector still requires a bare variable as its receiver.
+-}
 
 {- Note [Matching variable types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1958,6 +2081,9 @@ ruleCheck env (Tick _ e)      = ruleCheck env e
 ruleCheck env (Cast e _)      = ruleCheck env e
 ruleCheck env (Let bd e)      = let (env', ds) = ruleCheckBind env bd
                                 in  ds `unionBags` ruleCheck env' e
+ruleCheck env (Pack _ _ e)    = ruleCheck env e
+ruleCheck env (Unpack w p e body)
+  = ruleCheck env e `unionBags` ruleCheck (env `extendInScopeListRC` [w, p]) body
 ruleCheck env (Lam b e)       = ruleCheck (env `extendInScopeRC` b) e
 ruleCheck env (Case e b _ as) = ruleCheck env e `unionBags`
                                 unionManyBags [ruleCheck (env `extendInScopeListRC` (b:bs)) r

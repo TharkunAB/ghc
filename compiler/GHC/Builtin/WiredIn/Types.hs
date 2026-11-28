@@ -42,6 +42,7 @@ module GHC.Builtin.WiredIn.Types (
         -- * Char
         charTyCon, charDataCon,
         charTy, stringTy, charTyConName, stringTyConName,
+        charPrimLitTyCon, charPrimLitTyConName, mkCharPrimLitTy,
 
         -- * Double
         doubleTyCon, doubleDataCon, doubleTy, doubleTyConName,
@@ -150,6 +151,10 @@ module GHC.Builtin.WiredIn.Types (
         doubleElemRepDataConTy,
 
         -- * Multiplicity and friends
+        matchabilityTyConName, matchableDataConName, unmatchableDataConName,
+        matchabilityTyCon, matchabilityTy, matchableDataCon, unmatchableDataCon,
+        matchableDataConTyCon, unmatchableDataConTyCon,
+        matchableDataConTy, unmatchableDataConTy,
         multiplicityTyConName, oneDataConName, manyDataConName, multiplicityTy,
         multiplicityTyCon, oneDataCon, manyDataCon, oneDataConTy, manyDataConTy,
         oneDataConTyCon, manyDataConTyCon,
@@ -190,13 +195,13 @@ import GHC.Core.DataCon
 import GHC.Core.ConLike
 import GHC.Core.TyCon
 import GHC.Core.Class     ( Class, mkClass )
-import qualified GHC.Core.TyCo.Rep as TyCoRep ( Type(TyConApp) )
+import qualified GHC.Core.TyCo.Rep as TyCoRep ( Coercion(CoVarCo), Type(TyConApp) )
 
 import GHC.Hs.Extension (GhcTc)
 
 import GHC.Types.TyThing
 import GHC.Types.SourceText
-import GHC.Types.Var ( VarBndr (Bndr), tyVarName )
+import GHC.Types.Var ( VarBndr (Bndr), mkCoVar, tyVarName )
 import GHC.Types.RepType
 import GHC.Types.Name.Reader
 import GHC.Types.Name as Name
@@ -303,6 +308,7 @@ wiredInTyCons = [ anyTyCon
                 , unusedTypeTyCon
                 , boolTyCon
                 , charTyCon
+                , charPrimLitTyCon
                 , stringTyCon
                 , doubleTyCon
                 , floatTyCon
@@ -323,6 +329,7 @@ wiredInTyCons = [ anyTyCon
                 , liftedTypeKindTyCon
                 , unliftedTypeKindTyCon
                 , unrestrictedFunTyCon
+                , matchabilityTyCon
                 , multiplicityTyCon
                 , naturalTyCon
                 , integerTyCon
@@ -360,10 +367,9 @@ eqTyCon_RDR = nameRdrName eqTyConName
 
 -- See Note [Kind-changing of (~) and Coercible]
 -- in libraries/ghc-prim/GHC/Types.hs
-heqTyConName, heqDataConName, heqSCSelIdName :: Name
+heqTyConName, heqDataConName :: Name
 heqTyConName   = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "~~")   heqTyConKey      heqTyCon
 heqDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "HEq#") heqDataConKey heqDataCon
-heqSCSelIdName = mkWiredInIdName gHC_TYPES (fsLit "heq_sel") heqSCSelIdKey heqSCSelId
 
 -- See Note [Kind-changing of (~) and Coercible] in libraries/ghc-prim/GHC/Types.hs
 coercibleTyConName, coercibleDataConName, coercibleSCSelIdName :: Name
@@ -375,6 +381,22 @@ charTyConName, charDataConName, intTyConName, intDataConName, stringTyConName ::
 charTyConName     = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "Char")   charTyConKey charTyCon
 charDataConName   = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "C#")     charDataConKey charDataCon
 stringTyConName   = mkWiredInTyConName   UserSyntax gHC_INTERNAL_BASE  (fsLit "String") stringTyConKey stringTyCon
+
+-- | Wired-in generative constructor name for @Char#@ type literals.
+-- See Note [Unboxed Char# and unboxed tuple promotion] in GHC.Tc.Gen.HsType.
+charPrimLitTyConName :: Name
+charPrimLitTyConName =
+  mkWiredInTyConName BuiltInSyntax gHC_TYPES (fsLit "$CharPrimLit#")
+                     charPrimLitTyConKey charPrimLitTyCon
+
+-- | Wired-in generative constructor of kind @Char -> Char#@.
+charPrimLitTyCon :: TyCon
+charPrimLitTyCon =
+  mkPrimTyCon charPrimLitTyConName (mkTemplateAnonTyConBinders [charTy]) charPrimTy [Nominal]
+
+-- | Build a primitive character type literal of kind @Char#@.
+mkCharPrimLitTy :: Char -> Type
+mkCharPrimLitTy c = TyCoRep.TyConApp charPrimLitTyCon [mkCharLitTy c]
 intTyConName      = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "Int")    intTyConKey   intTyCon
 intDataConName    = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "I#")     intDataConKey  intDataCon
 
@@ -584,13 +606,14 @@ unusedTypeTyCon = mkFamilyTyCon unusedTypeTyConName kind bndrs 0 res_kind
     bndrs = [ mkNamedTyConBinder Specified kv
             , mkAnonTyConBinder sym_kv ]
     res_kind = mkTyVarTy kv
-    kind = mkTyConKind bndrs res_kind
+    kind = mkTyConKindWithMatchability unmatchableDataConTy bndrs res_kind
 
 -- | Make a fake, recovery 'TyCon' from an existing one.
 -- Used when recovering from errors in type declarations
 makeRecoveryTyCon :: TyCon -> TyCon
 makeRecoveryTyCon tc
-  = mkTcTyCon (tyConName tc) (mkTyConKind bndrs res_kind)
+  = mkTcTyCon (tyConName tc)
+              (mkTyConKindWithMatchability (tyConFlavourMatchability flavour) bndrs res_kind)
               bndrs 0 res_kind
               noTcTyConScopedTyVars
               True             -- Fully generalised
@@ -1752,14 +1775,10 @@ mk_sum arity = (tycon, sum_cons)
 -- See Note [The equality types story] in GHC.Builtin.WiredIn.Prim
 -- ((~~) :: forall k1 k2 (a :: k1) (b :: k2). a -> b -> Constraint)
 --
--- It's tempting to put functional dependencies on (~~), but it's not
--- necessary because the functional-dependency coverage check looks
--- through superclasses, and (~#) is handled in that check.
-
 eqTyCon,   heqTyCon,   coercibleTyCon   :: TyCon
 eqClass,   heqClass,   coercibleClass   :: Class
 eqDataCon, heqDataCon, coercibleDataCon :: DataCon
-eqSCSelId, heqSCSelId, coercibleSCSelId :: Id
+eqSCSelId, coercibleSCSelId :: Id
 
 (eqTyCon, eqClass, eqDataCon, eqSCSelId)
   = (tycon, klass, datacon, sc_sel_id)
@@ -1783,14 +1802,16 @@ eqSCSelId, heqSCSelId, coercibleSCSelId :: Id
     sc_pred     = mkTyConApp eqPrimTyCon (mkTyVarTys [k,k,a,b])
     sc_sel_id   = mkDictSelId eqSCSelIdName klass
 
-(heqTyCon, heqClass, heqDataCon, heqSCSelId)
-  = (tycon, klass, datacon, sc_sel_id)
+(heqTyCon, heqClass, heqDataCon)
+  = (tycon, klass, datacon)
   where
     tycon     = mkClassTyCon heqTyConName kind binders roles
                              rhs klass
                              (mkPrelTyConRepName heqTyConName)
-    klass     = mk_class tycon sc_pred sc_sel_id
-    datacon   = pcDataConConstraint heqDataConName tvs [sc_pred] tycon
+    -- See Note [The HEq# evidence telescope].
+    klass     = mkClass heqTyConName tvs [] [] [] [] [] (mkAnd []) tycon
+    datacon   = pcDataConWithFixity False heqDataConName tvs [ck]
+                  noConcreteTyVars tvs [index_pred] [] tycon
 
     -- Kind: forall k1 k2. k1 -> k2 -> Constraint
     binders   = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] id
@@ -1799,8 +1820,24 @@ eqSCSelId, heqSCSelId, coercibleSCSelId :: Id
     rhs       = mkDataTyConRhs [datacon]
 
     tvs       = binderVars binders
-    sc_pred   = mkTyConApp eqPrimTyCon (mkTyVarTys tvs)
-    sc_sel_id = mkDictSelId heqSCSelIdName klass
+    [k_ty,l_ty,a_ty,b_ty] = mkTyVarTys tvs
+    ck = mkCoVar (mkSystemVarName (mkAlphaTyVarUnique 4) (fsLit "ck"))
+                 (mkTyConApp eqPrimTyCon [liftedTypeKind, liftedTypeKind, k_ty, l_ty])
+    index_pred = mkTyConApp eqPrimTyCon [l_ty, l_ty, mkCastTy a_ty (TyCoRep.CoVarCo ck), b_ty]
+
+{- Note [The HEq# evidence telescope]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The boxed equality class (a :: k) ~~ (b :: l) has a worker of type
+
+  HEq# :: forall k l (a :: k) (b :: l). forall (ck :: k ~# l).
+          (a |> ck) ~# b => a ~~ b
+
+The kind and index coercion variables are both homogeneous. The index
+field depends on the existential kind coercion. A class superclass
+selector cannot bind this existential in its result, so (~~) has no
+ordinary superclass selector. The solver matches the worker directly.
+See Note [Projecting HEq# evidence] in GHC.Tc.Solver.Monad.
+-}
 
 (coercibleTyCon, coercibleClass, coercibleDataCon, coercibleSCSelId)
   = (tycon, klass, datacon, sc_sel_id)
@@ -1844,6 +1881,40 @@ mk_ctuple_class tycon sc_theta sc_sel_ids
 data Multiplicity = One | Many
 -}
 
+-- | The promoted metadata kind for ordinary arrow matchability.
+-- See Note [Ordinary arrow matchability] in GHC.Core.TyCo.Rep.
+matchabilityTyConName, matchableDataConName, unmatchableDataConName :: Name
+matchabilityTyConName = mkWiredInTyConName UserSyntax gHC_TYPES (fsLit "Matchability")
+                         matchabilityTyConKey matchabilityTyCon
+matchableDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "Matchable")
+                        matchableDataConKey matchableDataCon
+unmatchableDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "Unmatchable")
+                          unmatchableDataConKey unmatchableDataCon
+
+-- | The kind of arrow matchability metadata.
+matchabilityTy :: Kind
+matchabilityTy = mkTyConTy matchabilityTyCon
+
+-- | The wired-in matchability datatype from GHC.Internal.Types.
+matchabilityTyCon :: TyCon
+matchabilityTyCon = pcTyCon matchabilityTyConName Nothing []
+                     [matchableDataCon, unmatchableDataCon]
+
+-- | Runtime constructors of the matchability datatype.
+matchableDataCon, unmatchableDataCon :: DataCon
+matchableDataCon = pcDataCon matchableDataConName [] [] matchabilityTyCon
+unmatchableDataCon = pcDataCon unmatchableDataConName [] [] matchabilityTyCon
+
+-- | Promoted matchability constructors.
+matchableDataConTyCon, unmatchableDataConTyCon :: TyCon
+matchableDataConTyCon = promoteDataCon matchableDataCon
+unmatchableDataConTyCon = promoteDataCon unmatchableDataCon
+
+-- | Matchable and unmatchable arrow metadata.
+matchableDataConTy, unmatchableDataConTy :: Type
+matchableDataConTy = mkTyConTy matchableDataConTyCon
+unmatchableDataConTy = mkTyConTy unmatchableDataConTyCon
+
 multiplicityTyConName :: Name
 multiplicityTyConName = mkWiredInTyConName UserSyntax gHC_TYPES (fsLit "Multiplicity")
                           multiplicityTyConKey multiplicityTyCon
@@ -1882,7 +1953,7 @@ multMulTyCon = mkFamilyTyCon multMulTyConName kind binders 0 multiplicityTy Noth
                          NotInjective
   where
     binders = mkTemplateAnonTyConBinders [multiplicityTy, multiplicityTy]
-    kind = mkTyConKind binders multiplicityTy
+    kind = mkTyConKindWithMatchability unmatchableDataConTy binders multiplicityTy
 
 ------------------------
 -- type (->) :: forall (rep1 :: RuntimeRep) (rep2 :: RuntimeRep).
@@ -1890,9 +1961,11 @@ multMulTyCon = mkFamilyTyCon multMulTyConName kind binders 0 multiplicityTy Noth
 -- type (->) = FUN 'Many
 unrestrictedFunTyCon :: TyCon
 unrestrictedFunTyCon
-  = buildSynTyCon unrestrictedFunTyConName arrowKind [] arrowKind []
-                  (TyCoRep.TyConApp fUNTyCon [manyDataConTy])
+  = buildSynTyCon unrestrictedFunTyConName overall_kind [ma_bndr] arrowKind [Nominal]
+                  (TyCoRep.TyConApp fUNTyCon [mkTyVarTy matchabilityTyVar, manyDataConTy])
   where
+    overall_kind = mkTyConKind [ma_bndr] arrowKind
+    ma_bndr = mkNamedTyConBinder Specified matchabilityTyVar
     arrowKind = mkTyConKind binders liftedTypeKind
     -- See also funTyCon
     binders = [ Bndr runtimeRep1TyVar (NamedTCB Inferred)
@@ -1966,7 +2039,7 @@ liftedTypeKindTyConName = mkWiredInTyConName UserSyntax gHC_TYPES (fsLit "Type")
 
 liftedTypeKind, typeToTypeKind :: Type
 liftedTypeKind = mkTyConTy liftedTypeKindTyCon
-typeToTypeKind = liftedTypeKind `mkVisFunTyMany` liftedTypeKind
+typeToTypeKind = liftedTypeKind `mkVisFunTyManyM` liftedTypeKind
 
 ----------------------
 -- type UnliftedType = TYPE ('BoxedRep 'Unlifted)
@@ -2861,5 +2934,5 @@ pretendNameIsInScope n
     , eqTyConKey
     , listTyConKey
     , oneDataConKey
-    , manyDataConKey
+    , manyDataConKey, matchabilityTyConKey, matchableDataConKey, unmatchableDataConKey
     , fUNTyConKey, unrestrictedFunTyConKey ]

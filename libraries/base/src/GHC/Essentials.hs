@@ -204,9 +204,9 @@ module GHC.Essentials
     -- Template Haskell
     , Lift, Quote  -- The Lift and Quote classeso
     , Q, DecsQ, ExpQ, TypeQ, PatQ
-    , Name, Decs, TH.Type, FunDep
+    , Name, Decs, TH.Type, TypeCaseAlt, FunDep
     , Pred, Code, InjectivityAnn, ModName
-    , Con, BangType, VarBangType, RuleBndr, TySynEqn, Role, DerivClause
+    , Con, RetainedGadtArg, BangType, VarBangType, RuleBndr, TySynEqn, Role, DerivClause
     , Kind, TyVarBndrUnit, TyVarBndrSpec, TyVarBndrVis, DerivStrategy
     , sequenceQ, newName, mkName, mkNameG_v, mkNameG_d, mkNameG_tc, mkNameG_fld, mkNameL
     , mkNameQ, mkNameS, mkModName, unType, unTypeCode, unsafeCodeCoerce
@@ -227,7 +227,7 @@ module GHC.Essentials
          , lamE, lamCaseE, lamCasesE, tupE, unboxedTupE, unboxedSumE, condE, multiIfE
          , letE, caseE, doE, mdoE, compE, fromE, fromThenE, fromToE, fromThenToE
          , listE, sigE, recConE, recUpdE, staticE, unboundVarE, labelE, implicitParamVarE
-         , getFieldE, projectionE, typeE, forallE, forallVisE, constrainedE
+         , getFieldE, projectionE, typeE, forallE, forallVisE, forallMatchE, constrainedE
     , TH.cxt
     , TH.noSourceUnpackedness, TH.sourceNoUnpack, TH.sourceUnpack
     , TH.noSourceStrictness, TH.sourceLazy, TH.sourceStrict
@@ -238,11 +238,14 @@ module GHC.Essentials
     , Stmt, bindS, letS, noBindS, parS, recS
     , Body, normalB, guardedB
     , Guard, normalGE, patGE
-    , normalC, recC, infixC, forallC, gadtC, recGadtC
+    , normalC, recC, infixC, forallC, forallMatchC, gadtC, recGadtC
+    , retainedGadtC, gadtValueArg, gadtIndexArg
+    , gadtInvisibleArgs, gadtRequiredArgs, gadtContextArgs
     , TH.bang, TH.bangType, TH.varBangType
     , TH.unidir, TH.implBidir, TH.explBidir
     , TH.prefixPatSyn, TH.recordPatSyn, TH.infixPatSyn
-    , forallT, forallVisT, varT, conT, infixT, tupleT
+    , forallT, forallVisT, forallMatchT, forEachT, varT, indexVarT, conT, infixT, tupleT
+    , caseT, typeCaseAlt, letT, lamT
     , unboxedTupleT, unboxedSumT, arrowT, mulArrowT, listT
     , appT, appKindT, sigT, equalityT, litT, promotedT
     , promotedTupleT, promotedNilT, promotedConsT

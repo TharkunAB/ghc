@@ -1,0 +1,11 @@
+NativeBinaryEnumDemandFail.hs:9:15: error: [GHC-83865]
+    • Couldn't match type ‘NativeBinaryEnumCert.explicitStrict True b’
+                     with ‘False’
+      Expected: StrictTrue b :~: False
+        Actual: False :~: False
+    • In the expression: Refl
+      In an equation for ‘badDemand’: badDemand _ = Refl
+    • Relevant bindings include
+        badDemand :: Proxy b -> StrictTrue b :~: False
+          (bound at NativeBinaryEnumDemandFail.hs:9:1)
+

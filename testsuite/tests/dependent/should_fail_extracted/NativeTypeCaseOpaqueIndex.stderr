@@ -1,0 +1,30 @@
+NativeTypeCaseOpaqueIndex.hs:14:9: error: [GHC-83865]
+    • Couldn't match kind ‘Ix a0’ with ‘Ordering’
+      Expected kind ‘Gate Ordering’,
+        but ‘'Family _’ has kind ‘Gate (Ix a0)’
+      The type variable ‘a0’ is ambiguous
+    • In the first argument of ‘'Just’, namely ‘('Family _)’
+      In the type case in ‘Bad’
+      In the type ‘case d of {'Just ('Family _) -> Int;
+                              'Just _ -> Bool;
+                              'Nothing -> Char}’
+
+NativeTypeCaseOpaqueIndex.hs:27:9: error: [GHC-83865]
+    • Couldn't match kind ‘ClosedIx a0’ with ‘Ordering’
+      Expected kind ‘ClosedGate Ordering’,
+        but ‘'ClosedFamily _’ has kind ‘ClosedGate (ClosedIx a0)’
+      The type variable ‘a0’ is ambiguous
+    • In the first argument of ‘'Just’, namely ‘('ClosedFamily _)’
+      In the type case in ‘Blocked’
+      In the type ‘case d of {'Just ('ClosedFamily _) -> Int;
+                              'Just _ -> Bool;
+                              'Nothing -> Char}’
+
+NativeTypeCaseOpaqueIndex.hs:40:3: error: [GHC-79642]
+    • Cannot determine which constructors are possible at this scrutinee kind:
+        ConditionalGate Bool Bool
+    • In the type ‘case d of {'Just ('ConditionalPlain 'True) -> Int;
+                              'Just _ -> Bool;
+                              'Nothing -> Char}’
+      In the type synonym declaration for ‘NeedsRefinement’
+

@@ -1,0 +1,29 @@
+NativeLiftedCallbackWrongEndpoint.hs:8:19: error: [GHC-83865]
+    • Couldn't match type: g x1
+                     with: f1 x1
+      Expected: Decision (f1 x1)
+        Actual: Decision (g x1)
+    • In the expression: decide @a g x
+      In an equation for ‘wrongHead’: wrongHead _ g x = decide @a g x
+    • Relevant bindings include
+        x :: a (bound at NativeLiftedCallbackWrongEndpoint.hs:8:15)
+        g :: a -> Bool (bound at NativeLiftedCallbackWrongEndpoint.hs:8:13)
+        wrongHead :: foreach (f :: a -> Bool)
+                     -> (a -> Bool) -> foreach (x :: a) -> Decision (f x)
+          (bound at NativeLiftedCallbackWrongEndpoint.hs:8:1)
+
+NativeLiftedCallbackWrongEndpoint.hs:12:18: error: [GHC-83865]
+    • Couldn't match type: f y
+                     with: f x
+      Expected: Decision (f x)
+        Actual: Decision (f y)
+    • In the expression: decide @a f y
+      In an equation for ‘wrongArg’: wrongArg f _ y = decide @a f y
+    • Relevant bindings include
+        y :: a (bound at NativeLiftedCallbackWrongEndpoint.hs:12:14)
+        f :: a -> Bool
+          (bound at NativeLiftedCallbackWrongEndpoint.hs:12:10)
+        wrongArg :: foreach (f :: a -> Bool)
+                    -> foreach (x :: a) -> a -> Decision (f x)
+          (bound at NativeLiftedCallbackWrongEndpoint.hs:12:1)
+

@@ -1,0 +1,12 @@
+NativePromotedClassMappingWrongTag.hs:9:11: error: [GHC-83865]
+    • Couldn't match type: Old (f x)
+                     with: New (f x)
+      Expected: MappingTags.exchange f (Old x) :~: Old (f x)
+        Actual: Old (f x) :~: Old (f x)
+    • In the expression: Refl
+      In an equation for ‘tag’: tag _ _ = Refl
+    • Relevant bindings include
+        tag :: Proxy f
+               -> Proxy x -> MappingTags.exchange f (Old x) :~: Old (f x)
+          (bound at NativePromotedClassMappingWrongTag.hs:9:1)
+

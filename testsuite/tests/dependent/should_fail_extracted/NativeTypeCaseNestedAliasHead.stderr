@@ -1,0 +1,7 @@
+NativeTypeCaseNestedAliasHead.hs:5:8: error: [GHC-55789]
+    • After expanding type synonyms, the pattern has no constructor head:
+        x
+    • In the type ‘case d of {'Just (Identity x) -> Bool;
+                              'Nothing -> Bool}’
+      In the type synonym declaration for ‘Bad’
+

@@ -42,6 +42,7 @@ module GHC.Unit.Module.ModIface
    , set_mi_module
    , set_mi_sig_of
    , set_mi_hsc_src
+   , set_mi_dep_flags
    , set_mi_self_recomp
    , set_mi_hi_bytes
    , set_mi_deps
@@ -104,11 +105,18 @@ module GHC.Unit.Module.ModIface
    , mi_export_avails_hash
    , mi_orphan_like_hash
    , mi_orphan_hash
+   , ifaceHasDepConstructsBit
+   , ifaceHasExistentialBit
+   , ifaceHasDepFunUnfoldingBit
+   , mi_has_dep_constructs
+   , mi_has_existential
+   , mi_has_depfun_unfolding
    , renameFreeHoles
    , emptyPartialModIface
    , emptyFullModIface
    , mkIfaceHashCache
    , emptyIfaceHashCache
+   , lookupUsageFingerprint
    , forceModIface
    )
 where
@@ -147,6 +155,7 @@ import GHC.Utils.Binary
 
 import Control.DeepSeq
 import Control.Exception
+import Data.Word (Word8)
 
 
 {- Note [Interface file stages]
@@ -314,8 +323,36 @@ data ModIface_ (phase :: ModIfacePhase)
 data IfaceModInfo = IfaceModInfo {
   mi_mod_info_module :: Module, -- ^ Name of the module we are for
   mi_mod_info_sig_of :: Maybe Module, -- ^ Are we a sig of another mod?
-  mi_mod_info_hsc_src :: HscSource -- ^ Boot? Signature?
+  mi_mod_info_hsc_src :: HscSource, -- ^ Boot? Signature?
+  mi_mod_info_dep_flags :: !Word8 -- ^ Bitmask of dependent interface properties
 }
+
+-- | Bit 0: module exposes or transitively imports dependent type constructs.
+ifaceHasDepConstructsBit :: Int
+ifaceHasDepConstructsBit = 0
+
+-- | Bit 1: module declarations contain erased existential types or expressions.
+ifaceHasExistentialBit :: Int
+ifaceHasExistentialBit = 1
+
+-- | Bit 2: module declarations expose checked native 'DepFunTy' user unfoldings.
+ifaceHasDepFunUnfoldingBit :: Int
+ifaceHasDepFunUnfoldingBit = 2
+
+-- | Test whether an interface exposes or transitively imports dependent constructs.
+mi_has_dep_constructs :: ModIface_ phase -> Bool
+mi_has_dep_constructs iface =
+  testBit (mi_mod_info_dep_flags (mi_mod_info iface)) ifaceHasDepConstructsBit
+
+-- | Test whether an interface contains erased existential types or expressions.
+mi_has_existential :: ModIface_ phase -> Bool
+mi_has_existential iface =
+  testBit (mi_mod_info_dep_flags (mi_mod_info iface)) ifaceHasExistentialBit
+
+-- | Test whether an interface exposes checked native 'DepFunTy' user unfoldings.
+mi_has_depfun_unfolding :: ModIface_ phase -> Bool
+mi_has_depfun_unfolding iface =
+  testBit (mi_mod_info_dep_flags (mi_mod_info iface)) ifaceHasDepFunUnfoldingBit
 
 -- | The public interface of a module which are used by other modules when importing this module.
 -- The ABI of a module.
@@ -661,18 +698,22 @@ instance Binary IfaceModInfo where
   put_ bh (IfaceModInfo { mi_mod_info_module = mod
                         , mi_mod_info_sig_of = sig_of
                         , mi_mod_info_hsc_src = hsc_src
+                        , mi_mod_info_dep_flags = dep_flags
                         }) = do
     put_ bh mod
     put_ bh sig_of
     put_ bh hsc_src
+    putByte bh dep_flags
 
   get bh = do
     mod <- get bh
     sig_of <- get bh
     hsc_src <- get bh
+    dep_flags <- getByte bh
     return (IfaceModInfo { mi_mod_info_module = mod
                          , mi_mod_info_sig_of = sig_of
                          , mi_mod_info_hsc_src = hsc_src
+                         , mi_mod_info_dep_flags = dep_flags
                          })
 
 
@@ -785,6 +826,7 @@ emptyIfaceModInfo mod = IfaceModInfo
   { mi_mod_info_module = mod
   , mi_mod_info_sig_of = Nothing
   , mi_mod_info_hsc_src = HsSrcFile
+  , mi_mod_info_dep_flags = 0
   }
 
 
@@ -832,6 +874,34 @@ emptyFullModIface mod =
       }
 
 
+-- | Look up the fingerprint to record or compare for a used name.
+lookupUsageFingerprint :: ModIface -> OccName -> Maybe (OccName, Fingerprint)
+lookupUsageFingerprint iface occ =
+  case mi_hash_fn iface occ of
+    Nothing | Just _ <- sourceTableTermOcc occ -> Just (occ, fingerprint0)
+    entry -> entry
+
+{- Note [Source table usage fingerprints]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In a dependent module, suppose an imported term f has no source table.
+A signature such as idF :: f a -> f a can implicitly quantify over f.
+If the producer later defines a table for f, the same signature refers to
+the table. The term's ordinary interface type can stay the same.
+
+Record the reserved family OccName with fingerprint0 for an unsuccessful
+lookup. A successful lookup records the family's declaration fingerprint.
+Use the same lookup when checking the client's entity usages. A change to
+the equations, addition of a table or removal of a table then invalidates
+the client. Unrelated edits to the producer preserve the recorded hash.
+Use the module where the term was defined, including for a re-export.
+
+A retained class method can use a concrete dictionary field that aliases
+a checked source function. Record the dictionary, selector and target.
+Changing just the field can invalidate the proof even when the target
+function and all public types stay the same.
+See Note [Dictionary selection in retained arguments] in GHC.Tc.Gen.App.
+-}
+
 -- | Constructs cache for the 'mi_hash_fn' field of a 'ModIface'
 mkIfaceHashCache :: [(Fingerprint,IfaceDecl)]
                  -> (OccName -> Maybe (OccName, Fingerprint))
@@ -864,10 +934,11 @@ instance ( NFData (IfaceAbiHashesExts (phase :: ModIfacePhase))
     `seq` rnf a10
 
 instance NFData IfaceModInfo where
-  rnf (IfaceModInfo a1 a2 a3)
+  rnf (IfaceModInfo a1 a2 a3 a4)
     =  rnf a1
     `seq` rnf a2
     `seq` rnf a3
+    `seq` rnf a4
 
 
 instance NFData IfaceSimplifiedCore where
@@ -1072,6 +1143,9 @@ set_mi_sig_of val = set_mi_mod_info_field (\info -> info { mi_mod_info_sig_of = 
 
 set_mi_hsc_src :: HscSource -> ModIface_ phase -> ModIface_ phase
 set_mi_hsc_src val = set_mi_mod_info_field (\info -> info { mi_mod_info_hsc_src = val })
+
+set_mi_dep_flags :: Word8 -> ModIface_ phase -> ModIface_ phase
+set_mi_dep_flags val = set_mi_mod_info_field (\info -> info { mi_mod_info_dep_flags = val })
 
 -- | Helper function for setting fields in mi_mod_info_
 set_mi_mod_info_field :: (IfaceModInfo -> IfaceModInfo) -> ModIface_ phase -> ModIface_ phase

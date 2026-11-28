@@ -342,16 +342,14 @@ In more detail, the moving parts are:
 
 Warnings are controlled by @-Wunrecognised-modifiers@ (on by default).
 
-The only current use of modifiers is multiplicity annotations for linear types.
-These modifiers are recognized in pattern bindings, @let %1 x = ...@;
-constructor arguments (both record style, @data A = B { %1 x :: Int }@; and GADT
-style, @data A where B :: Int %1 -> A@); and function arrows, @Int %1 -> Int@.
+LinearTypes recognises multiplicities on pattern bindings (@let %1 x = ...@),
+record fields (@data A = B { x %1 :: Int }@), and function arrows
+(@Int %1 -> Int@), including arrows in GADT constructor signatures.
+See Note [Typechecking Multiplicity modifiers] in GHC.Tc.Gen.HsType.
 
-Modifiers in these positions are typechecked with 'tcModifiersMult' (pattern
-bindings) or 'tcMult' (when we have an 'HsModifiedFunArr'), and modifiers of
-kind 'Multiplicity' affect typechecking. Non-'Multiplicity' modifiers in these
-positions are treated the same as any other modifiers. See
-Note [Typechecking Multiplicity modifiers] in GHC.Tc.Gen.HsType.
+Modifiers recognises matchability on function arrows. The checker
+distinguishes the two annotations in @a %U %1 -> b@ by their kinds.
+See Note [Arrow matchability modifiers] in GHC.Tc.Gen.HsType.
 
 The modifier @%1@ is a special case, interpreted differently depending on linear
 types. With @-XLinearTypes@, @%1@ means the same as @%'One'@. (Specifically
@@ -384,16 +382,20 @@ data HsForAllTelescope pass
                 --   These do not have any notion of specificity, so we use
                 --   '()' as a placeholder value.
     { hsf_xvis      :: XHsForAllVis pass
+    , hsf_matchability :: Maybe (LHsType pass)
+      -- ^ Annotation after the separator. Its scope precedes this group.
     , hsf_vis_bndrs :: [LHsTyVarBndr () pass]
     }
   | HsForAllInvis -- ^ An invisible @forall@ (e.g., @forall a {b} c. {...}@),
                   --   where each binder has a 'Specificity'.
     { hsf_xinvis       :: XHsForAllInvis pass
+    , hsf_matchability :: Maybe (LHsType pass)
+      -- ^ Annotation after the separator. Its scope precedes this group.
     , hsf_invis_bndrs  :: [LHsTyVarBndr Specificity pass]
     }
   | XHsForAllTelescope !(XXHsForAllTelescope pass)
 
--- | A type for interleaved GADT foralls and parentheses, inspired by HsArg.
+-- | A constructor prefix with forall groups, contexts, and parentheses.
 --
 -- Here's an example:
 --
@@ -414,6 +416,7 @@ data HsForAllTelescope pass
 --       , ...]
 data HsGadtTelescope pass
   = HsGadtForAll !(XGadtForAll pass) (HsForAllTelescope pass)
+  | HsGadtContext (LHsContext pass)
   | HsGadtPar !(XGadtPar pass)
     -- ^ `HsGadtPar` is only usefull for pretty-printing/exact-printing for recovering
     -- parentheses interleaved with foralls.
@@ -475,6 +478,8 @@ data HsOuterTyVarBndrs flag pass
   | HsOuterExplicit -- ^ Explicit forall, e.g.,
                     --    @f :: forall a b. a -> b -> b@
     { hso_xexplicit :: XHsOuterExplicit pass flag
+    , hso_matchability :: Maybe (LHsType (NoGhcTc pass))
+      -- ^ Annotation on the outer group, before its binders enter scope.
     , hso_bndrs     :: [LHsTyVarBndr flag (NoGhcTc pass)]
     }
   | XHsOuterTyVarBndrs !(XXHsOuterTyVarBndrs pass)
@@ -917,6 +922,22 @@ All in all, we have the following forms of type variable binders in the language
 The forms {_}, {_ :: k} are representable but never valid, see
 Note [Wildcard binders in disallowed contexts] in GHC.Hs.Type -}
 
+{- Note [Retained quantification syntax]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+HsForEachTy represents experimental retained quantification. An arrow makes
+the binder visible, as in `foreach (b :: Bool) -> ty`. A dot makes it
+invisible, as in `foreach (b :: Bool). ty`. Both bind a runtime Id that can
+occur in the result type. See proposal #378, section "Quantifiers".
+HsForAllTy denotes erased quantification, including visible `forall a -> ty`.
+Keep these constructors separate. Reuse HsTyVarBndr only for binder syntax.
+
+The lexer recognizes `foreach` only with DependentTypes.
+Without this extension, `foreach` remains an ordinary identifier.
+The parser does not establish its typing rules; see GHC Proposal #378 (§4.4),
+GHC Proposal #102, and Eisenberg (2016, §4.2). Haskell evaluation rules still
+apply to retained arguments.
+-}
+
 -- | Haskell Type
 data HsType pass
   = HsForAllTy   -- See Note [HsType binders]
@@ -924,6 +945,12 @@ data HsType pass
       , hst_tele    :: HsForAllTelescope pass
                                      -- Explicit, user-supplied 'forall a {b} c'
       , hst_body    :: LHsType pass  -- body type
+      }
+
+  | HsForEachTy -- See Note [Retained quantification syntax]
+      { hst_xforeach :: XForEachTy pass
+      , hst_bndrs    :: [LHsTyVarBndr () pass]
+      , hst_body     :: LHsType pass
       }
 
   | HsQualTy   -- See Note [HsType binders]

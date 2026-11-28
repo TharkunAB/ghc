@@ -1,0 +1,11 @@
+NativePromotedClassDirectOpaqueWorker.hs:7:72: error: [GHC-70566]
+    • Cannot reduce the open call to ‘alternate’ in a type.
+        While reading the definition of ‘NativePromotedClassDirectOpaqueWorker_Prov.$fAlternateMaybe’.
+        The interface for a referenced definition contains no usable Core unfolding. Use an interface that exposes the unfolding or provides a checked equation for this call.
+    • In the first argument of ‘(:~:)’, namely ‘alternate f ('Just x)’
+      In the type signature:
+        control :: forall a b (f :: a %U -> b) (x :: a). Proxy f
+                                                         -> Proxy x
+                                                            -> alternate f ('Just x)
+                                                               :~: ('Nothing :: Maybe b)
+

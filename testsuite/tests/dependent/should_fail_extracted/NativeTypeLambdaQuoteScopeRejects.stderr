@@ -1,0 +1,18 @@
+NativeTypeLambdaQuoteScopeRejects.hs:10:79: error: [GHC-76037]
+    • Not in scope: type variable ‘field’
+    • In the Template Haskell quotation:
+        [d| type BadScope =
+                \tag -> case tag of
+                          Just field -> Proxy field
+                          _ -> Proxy field |]
+
+NativeTypeLambdaQuoteScopeRejects.hs:14:46: error: [GHC-76037]
+    • Not in scope: type variable ‘field’
+    • In the Template Haskell quotation:
+        [t| ((\field -> field) Bool, field) |]
+
+NativeTypeLambdaQuoteScopeRejects.hs:17:43: error: [GHC-76037]
+    • Not in scope: type variable ‘missing’
+    • In the Template Haskell typed quotation:
+        [|| id @((\cell -> Either missing cell) Int) (Right 42) ||]
+

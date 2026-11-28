@@ -650,6 +650,7 @@ extern char **environ;
       SymI_HasProto(loadObj)                                            \
       SymI_HasProto(purgeObj)                                           \
       SymI_HasProto(insertSymbol)                                       \
+      SymI_HasProto(hasSymbol)                                          \
       SymI_HasProto(lookupSymbol)                                       \
       SymI_HasProto(lookupSymbolInNativeObj)                            \
       SymI_HasDataProto(stg_makeStablePtrzh)                                \

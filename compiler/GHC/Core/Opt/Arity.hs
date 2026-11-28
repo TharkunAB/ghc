@@ -53,6 +53,7 @@ import GHC.Core
 import GHC.Core.FVs
 import GHC.Core.Utils
 import GHC.Core.DataCon
+import GHC.Core.Dependent ( hasScopedDictionaryExpr )
 import GHC.Core.TyCon     ( TyCon, tyConArity, isInjectiveTyCon )
 import GHC.Core.TyCon.RecWalk     ( initRecTc, checkRecTc )
 import GHC.Core.Predicate ( isDictTy, isEvId, isCallStackPredTy, isCallStackTy )
@@ -65,6 +66,7 @@ import GHC.Core.Subst    as Core
 import GHC.Core.Type     as Type
 import GHC.Core.Coercion as Type
 import GHC.Core.TyCo.Compare( eqType, eqTypeIgnoringMultiplicity )
+import GHC.Core.TyCo.Rep ( Type(DepFunTy, TermVarTy), Coercion(..) )
 
 import GHC.Types.Demand
 import GHC.Types.Cpr( CprSig, mkCprSig, botCpr )
@@ -75,6 +77,7 @@ import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Types.Tickish
 
+import GHC.Builtin.WiredIn.Types ( unmatchableDataConTy )
 import GHC.Builtin.WiredIn.Prim
 import GHC.Builtin.Uniques
 
@@ -185,6 +188,25 @@ When we come to an application we check that the arg is trivial.
 ********************************************************************* -}
 
 
+{- Note [Ordinary arrow metadata and eta]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An ordinary runtime lambda has U matchability. Eta expansion can introduce
+that lambda only when the consumed arrow has U. typeOneShots and mkEtaWW use
+the same condition so that typeArity does not promise unsupported expansion.
+Join-point eta expansion and eta reduction use this condition as well.
+Runtime type and coercion lambdas also have U matchability. Their forall
+arrows use the same condition. A cast can pass through a forall lambda
+only when its metadata proof is reflexive. Application still consumes
+an M or unknown forall without this eta premise.
+
+Pushing a cast through a lambda must retain its U result classification.
+Both lambda-pushing paths require reflexive matchability evidence before
+they remove an outer arrow coercion. Applying a function consumes the arrow
+instead, so pushCoValArg can project argument and result evidence at any
+matchability. This uses structural arrow decomposition, not inverse
+application equality.
+-}
+
 typeArity :: Type -> Arity
 -- ^ (typeArity ty) says how many arrows GHC can expose in 'ty', after
 -- looking through newtypes.  More generally, (typeOneShots ty) returns
@@ -200,13 +222,18 @@ typeOneShots ty
   = go initRecTc ty
   where
     go rec_nts ty
-      | Just (tcv, ty')  <- splitForAllTyCoVar_maybe ty
+      | Just (ma, tcv, ty') <- splitForAllTyCoVar_maybe ty
+      , ma `eqType` unmatchableDataConTy
       = if isCoVar tcv
         then idOneShotInfo tcv : go rec_nts ty'
         else go rec_nts ty'
 
-      | Just (_,_,arg,res) <- splitFunTy_maybe ty
+      | Just (_,ma,_,arg,res) <- splitFunTy_maybe ty
+      , ma `eqType` unmatchableDataConTy
       = typeOneShot arg : go rec_nts res
+
+      | DepFunTy _ _ res <- coreFullView ty
+      = NoOneShotInfo : go rec_nts res
 
       | Just (tc,tys) <- splitTyConApp_maybe ty
       , Just (ty', _) <- instNewTyCon_maybe tc tys
@@ -1748,6 +1775,9 @@ exprIsDeadEnd e
     go n (Tick _ e)              = go n e
     go n (Cast e _)              = go n e
     go n (Let _ e)               = go n e
+    -- Pack has the demand of its payload. Unpack binds its payload lazily.
+    go _ (Pack _ _ payload)      = go 0 payload
+    go n (Unpack _ _ _ body)     = go n body
     go n (Lam v e) | isTyVar v   = go n e
                    | otherwise   = False
 
@@ -2063,10 +2093,17 @@ eta_expand in_scope one_shots orig_expr
       | otherwise = go (in_scope `extendInScopeSet` v) oss1 (v:vs) body
 
     go in_scope oss rev_vs expr
-      = -- pprTrace "ee" (
-        --    vcat [ text "top_bndrs:" <+> ppr top_bndrs
-        --         , text "top-eis:" <+> ppr top_eis
-        --         , text "eis:" <+> ppr eis]) $
+      | MCo co <- mco
+      , let co_vars = tyCoVarsOfCo co
+            bad b   = b `elemVarSet` co_vars
+                      && (isCoVar b || (isNonCoVarId b && not (isNativeOpaqueValueId b)))
+      , any bad top_bndrs
+      = mkLams top_bndrs $
+        retick $
+        etaInfoAbs eis $
+        etaInfoApp in_scope' sexpr eis
+      | otherwise
+      = -- pprTrace "ee" (vcat [ppr in_scope', ppr top_bndrs, ppr eis]) $
         retick $
         etaInfoAbs top_eis $
         etaInfoApp in_scope' sexpr eis
@@ -2074,7 +2111,7 @@ eta_expand in_scope one_shots orig_expr
           (in_scope', eis@(EI eta_bndrs mco))
                     = mkEtaWW oss (ppr orig_expr) in_scope (exprType expr)
           top_bndrs = reverse rev_vs
-          top_eis   = EI (top_bndrs ++ eta_bndrs) (mkPiMCos top_bndrs mco)
+          top_eis   = EI (top_bndrs ++ eta_bndrs) (mkPiMCos [(unmatchableDataConTy,b) | b <- top_bndrs] mco)
 
           -- Find ticks behind type apps.
           -- See Note [Eta expansion and source notes]
@@ -2313,7 +2350,7 @@ mkEtaWW orig_oss ppr_orig_expr in_scope orig_ty
        -> Subst -> Type   -- We are really looking at subst(ty)
        -> (InScopeSet, EtaInfo)
     -- (go [o1,..,on] subst ty) = (in_scope, EI [b1,..,bn] co)
-    --    co :: subst(ty) ~ b1_ty -> ... -> bn_ty -> tr
+    --    co :: subst(ty) ~ mkLamTypes [b1,..,bn] tr
 
     go _ [] subst _
        ----------- Done!  No more expansion needed
@@ -2321,17 +2358,38 @@ mkEtaWW orig_oss ppr_orig_expr in_scope orig_ty
 
     go n oss@(one_shot:oss1) subst ty
        ----------- Forall types  (forall a. ty)
-       | Just (Bndr tcv vis, ty') <- splitForAllForAllTyBinder_maybe ty
+       | Just (ma, Bndr tcv vis, ty') <- splitForAllForAllTyBinder_maybe ty
+       , Type.substTyUnchecked subst ma `eqType` unmatchableDataConTy
        , (subst', tcv') <- Type.substVarBndr subst tcv
        , let oss' | isTyVar tcv = oss
                   | otherwise   = oss1
          -- A forall can bind a CoVar, in which case
          -- we consume one of the [OneShotInfo]
        , (in_scope, EI bs mco) <- go n oss' subst' ty'
-       = (in_scope, EI (tcv' : bs) (mkEtaForAllMCo (Bndr tcv' vis) ty' mco))
+       = (in_scope, EI (tcv' : bs) (mkEtaForAllMCo (Type.substTyUnchecked subst ma) (Bndr tcv' vis) (Type.substTyUnchecked subst' ty') mco))
+
+       ----------- Retained dependent functions
+       | DepFunTy vis b res_ty <- coreFullView ty
+       , (subst', eta_id) <- freshEtaId n subst (Scaled ManyTy (varType b))
+       , let eta_id' = eta_id `setIdOneShotInfo` one_shot
+             subst'' = Core.extendIdSubst subst' b (Var eta_id')
+       , (in_scope, EI bs mco) <- go (n+1) oss1 subst'' res_ty
+       = let binders = eta_id' : bs
+             -- This cast goes from the original type to the canonical visible
+             -- lambda type. Scope the body proof with the fresh eta Id.
+             -- See Note [The EtaInfo mechanism].
+             lift_body co = MCo (mkDepFunCoWithVis vis DepFunVisible eta_id' MRefl co)
+         in case checkReflexiveMCo mco of
+           MRefl | vis == DepFunVisible -> (in_scope, EI binders MRefl)
+                 | otherwise ->
+                     (in_scope, EI binders (lift_body
+                        (mkRepReflCo (Type.substTyUnchecked subst'' res_ty))))
+           MCo co -> (in_scope, EI binders (lift_body co))
 
        ----------- Function types  (t1 -> t2)
-       | Just (_af, mult, arg_ty, res_ty) <- splitFunTy_maybe ty
+       -- See Note [Ordinary arrow metadata and eta].
+       | Just (_af, ma, mult, arg_ty, res_ty) <- splitFunTy_maybe ty
+       , Type.substTyUnchecked subst ma `eqType` unmatchableDataConTy
        , typeHasFixedRuntimeRep arg_ty
           -- See Note [Representation polymorphism invariants] in GHC.Core
           -- See also test case typecheck/should_run/EtaExpandLevPoly
@@ -2341,7 +2399,7 @@ mkEtaWW orig_oss ppr_orig_expr in_scope orig_ty
 
        , let eta_id' = eta_id `setIdOneShotInfo` one_shot
        , (in_scope, EI bs mco) <- go (n+1) oss1 subst' res_ty
-       = (in_scope, EI (eta_id' : bs) (mkFunResMCo eta_id' mco))
+       = (in_scope, EI (eta_id' : bs) (mkFunResMCo unmatchableDataConTy eta_id' mco))
 
        ----------- Newtypes
        -- Given this:
@@ -2371,22 +2429,18 @@ mkEtaWW orig_oss ppr_orig_expr in_scope orig_ty
         -- So we simply decline to eta-expand.  Otherwise we'd end up
         -- with an explicit lambda having a non-function type
 
-mkEtaForAllMCo :: ForAllTyBinder -> Type -> MCoercion -> MCoercion
-mkEtaForAllMCo (Bndr tcv vis) ty mco
+mkEtaForAllMCo :: Matchability -> ForAllTyBinder -> Type -> MCoercion -> MCoercion
+mkEtaForAllMCo ma (Bndr tcv vis) ty mco
   = case mco of
       MRefl | isCoreTyLamForAllTyFlag vis -> MRefl
             | otherwise                   -> mk_fco (mkRepReflCo ty)
       MCo co                              -> mk_fco co
   where
-    mk_fco co = MCo (mkForAllCo tcv vis coreTyLamForAllTyFlag MRefl co)
-    -- coreTyLamForAllTyFlag: See Note [The EtaInfo mechanism], particularly
-    -- the (EtaInfo Invariant).  (sym co) wraps a lambda that always has
-    -- a ForAllTyFlag of coreTyLamForAllTyFlag; see Note [Required foralls in Core]
-    -- in GHC.Core.TyCo.Rep
-    --
-    -- Orientation: remember, the output of mkEtaForAllCo goes into an `EI bs mco`,
-    -- and is SymCo'd in `etaInfoAbs`.  Hence the orientation of the visibility
-    -- flags.  A bit of a brain-strain (#27557).
+    mk_fco co = MCo (mkForAllCo tcv vis coreTyLamForAllTyFlag (mkNomReflCo ma) MRefl co)
+    -- etaInfoApp casts the original function to the type of the new lambdas.
+    -- etaInfoAbs casts those lambdas back with the symmetric coercion.
+    -- See Note [The EtaInfo mechanism] and Note [Required foralls in Core]
+    -- in GHC.Core.TyCo.Rep (#27557).
 
 {-
 ************************************************************************
@@ -2815,31 +2869,37 @@ tryEtaReduce rec_ids bndrs body eval_sd
            -> Maybe (Coercion  -- Of type (arg_t -> t1 ~  bndr_t -> t2)
                                --   (and similarly for tyvars, coercion args)
                     , [CoreTickish])
-    -- See Note [Eta reduction with casted arguments]
+    -- See Note [Eta reduction with casted arguments].
+    -- See Note [Ordinary arrow metadata and eta].
     ok_arg bndr (Type arg_ty) co fun_ty
        | Just tv <- getTyVar_maybe arg_ty
        , bndr == tv  = case splitForAllForAllTyBinder_maybe fun_ty of
-           Just (Bndr _ vis, _) -> Just (fco, [])
-             where !fco = mkForAllCo tv vis coreTyLamForAllTyFlag MRefl co
+           Just (ma, Bndr _ vis, _)
+             | ma `eqType` unmatchableDataConTy -> Just (fco, [])
+             where !fco = mkForAllCo tv vis coreTyLamForAllTyFlag (mkNomReflCo ma) MRefl co
                    -- The lambda we are eta-reducing always has visibility
                    -- 'coreTyLamForAllTyFlag' which may or may not match
                    -- the visibility on the inner function (#24014)
+           Just {} -> Nothing
            Nothing -> pprPanic "tryEtaReduce: type arg to non-forall type"
                                (text "fun:" <+> ppr bndr
                                 $$ text "arg:" <+> ppr arg_ty
                                 $$ text "fun_ty:" <+> ppr fun_ty)
     ok_arg bndr (Var v) co fun_ty
        | bndr == v
+       , isNativeOpaqueValueId bndr || not (bndr `elemVarSet` tyCoVarsOfCo co)
        , let mult = idMult bndr
-       , Just (_af, fun_mult, _, _) <- splitFunTy_maybe fun_ty
+       , Just (_af, ma, fun_mult, _, _) <- splitFunTy_maybe fun_ty
+       , ma `eqType` unmatchableDataConTy
        , mult `eqType` fun_mult -- There is no change in multiplicity, otherwise we must abort
-       = Just (mkFunResCo Representational bndr co, [])
+       = Just (mkFunResCo Representational ma bndr co, [])
     ok_arg bndr (Cast e co_arg) co fun_ty
        | (ticks, Var v) <- stripTicksTop tickishFloatable e
-       , Just (_, fun_mult, _, _) <- splitFunTy_maybe fun_ty
+       , Just (_, ma, fun_mult, _, _) <- splitFunTy_maybe fun_ty
+       , ma `eqType` unmatchableDataConTy
        , bndr == v
        , fun_mult `eqType` idMult bndr
-       = Just (mkFunCoNoFTF Representational (multToCo fun_mult) (mkSymCo co_arg) co, ticks)
+       = Just (mkFunCoNoFTF Representational (mkNomReflCo ma) (multToCo fun_mult) (mkSymCo co_arg) co, ticks)
        -- The simplifier combines multiple casts into one,
        -- so we can have a simple-minded pattern match here
     ok_arg bndr (Tick t arg) co fun_ty
@@ -2893,6 +2953,8 @@ pushCoArg co arg
   | Type ty <- arg
   = do { (_, ty', m_co') <- pushCoTyArg co ty
        ; return (Type ty', m_co') }
+  | Just result <- pushCoRetainedArg co arg
+  = Just result
   | otherwise
   = do { (_, arg_mco, m_co') <- pushCoValArg co
        ; let arg_mco' = checkReflexiveMCo arg_mco
@@ -2900,6 +2962,70 @@ pushCoArg co arg
              -- The coercion is very often (arg_co -> res_co), but without
              -- the argument coercion actually being ReflCo
        ; return (arg `mkCastMCo` arg_mco', m_co') }
+
+-- | Push explicit retained congruence through one checked runtime argument.
+-- See Note [Retained dependent function coercions] in GHC.Core.TyCo.Rep.
+pushCoRetainedArg :: Coercion -> CoreArg -> Maybe (CoreArg, MCoercion)
+pushCoRetainedArg = go
+  where
+    go (DepFunCo _ _ b domain body) arg = instantiate False b domain body arg
+    go (SymCo (DepFunCo _ _ b domain body)) arg = instantiate True b domain body arg
+    go (SymCo (SymCo co)) arg = go co arg
+    go (SymCo (TransCo first second)) arg
+      = go (TransCo (mkSymCo second) (mkSymCo first)) arg
+    go (SymCo (SubCo co)) arg = go (SubCo (mkSymCo co)) arg
+    go (TransCo first second) arg
+      = do { (middle, result_second) <- go second arg
+           ; (source, result_first) <- go first middle
+           ; return (source, compose result_first result_second) }
+    go (SubCo co) arg
+      = do { (source, result) <- go co arg
+           ; return (source, case result of
+                       MRefl -> MRefl
+                       MCo proof -> MCo (mkSubCo proof)) }
+    go co arg | Just {} <- isReflCo_maybe co = Just (arg, MRefl)
+    go _ _ = Nothing
+
+    instantiate symmetric b domain body arg
+      = do { delta <- case domain of
+               MRefl -> Just (mkNomReflCo (varType b))
+               MCo proof
+                 | coercionRole proof == Nominal
+                 , coercionLKind proof `eqType` varType b
+                 , isNativeOpaqueValueId b
+                 , isNativeIndexDomainConversion (varType b) (coercionRKind proof)
+                 -> Just proof
+               _ -> Nothing
+           ; let source_domain = if symmetric then coercionLKind delta
+                                              else coercionRKind delta
+           ; if exprType arg `eqType` source_domain then pure () else Nothing
+           ; let converted = case domain of
+                   MRefl -> arg
+                   MCo _ -> Cast arg (SubCo (if symmetric then delta else mkSymCo delta))
+                 replacement = if symmetric then arg else converted
+           ; if valid_argument b body replacement then pure () else Nothing
+           ; let scope = mkInScopeSet (exprFreeVars replacement `unionVarSet` tyCoVarsOfCo body)
+                 subst = Core.extendIdSubst (Core.mkEmptySubst scope) b replacement
+                 proof = Core.substCo subst body
+           ; return (converted, MCo (if symmetric then mkSymCo proof else proof)) }
+
+    valid_argument b body arg
+      | isNativeIndexFunctionId b
+      = case nativeLocalFunctionArgIndex arg of
+          Just index -> typeKind index `eqType` varType b
+                        && case index of
+                             TermVarTy{} -> True
+                             _ -> not (hasScopedDictionaryExpr (Coercion body))
+          Nothing -> False
+      | isNativeOpaqueValueId b
+      = case exprToNativeIndex arg of
+          Just index -> typeKind index `eqType` varType b
+          Nothing -> False
+      | otherwise = False
+
+    compose MRefl second = second
+    compose first MRefl = first
+    compose (MCo first) (MCo second) = MCo (mkTransCo first second)
 
 pushCoTyArg :: CoercionR -> Type -> Maybe (Type, Type, MCoercionR)
 -- We have (fun |> co) @ty
@@ -2930,7 +3056,7 @@ pushCoTyArg co arg_ty
     tyL = coercionLKind co
     tyR = coercionRKind co -- Used only in asssertions and debug messages
 
-    co1 = mkSymCo (mkSelCo SelForAll co)
+    co1 = mkSymCo (mkSelCo (SelForAll SelKind) co)
        -- co1 :: k2 ~N k1
        -- Note that SelCo extracts a Nominal equality between the
        -- kinds of the types related by a coercion between forall-types.
@@ -2963,8 +3089,10 @@ pushCoValArg co
   | Just (ty, _) <- isReflCo_maybe co
   = Just (ty, MRefl, MRefl)
 
-  | isFunTy tyL
-  , (_, co1, co2) <- decomposeFunCo co
+  | isFunTy tyL, isFunTy tyR
+  -- A retained coercion can have only one ordinary function endpoint.
+  -- Keep that cast intact; SelFun does not project retained functions.
+  , (_, _, co1, co2) <- decomposeFunCo co
       -- If   co  :: (tyL1 -> tyL2) ~ (tyR1 -> tyR2)
       -- then co1 :: tyL1 ~ tyR1
       --      co2 :: tyL2 ~ tyR2
@@ -3002,12 +3130,16 @@ pushCoercionIntoLambda
 --    (\x. e) |> co
 -- ===>
 --    (\x'. e |> co')
+-- See Note [Ordinary arrow metadata and eta].
 pushCoercionIntoLambda in_scope x e co
     | assert (not (isTyVar x) && not (isCoVar x)) True
     , Pair s1s2 t1t2 <- coercionKind co
-    , Just {}              <- splitFunTy_maybe s1s2
-    , Just (_, w1, t1,_t2) <- splitFunTy_maybe t1t2
-    , (_, co1, co2)  <- decomposeFunCo co
+    , Just (_, maL, _, _, _) <- splitFunTy_maybe s1s2
+    , Just (_, maR, w1, t1,_t2) <- splitFunTy_maybe t1t2
+    , maL `eqType` unmatchableDataConTy
+    , maR `eqType` unmatchableDataConTy
+    , (co_ma, _, co1, co2) <- decomposeFunCo co
+    , isReflCo co_ma
     , typeHasFixedRuntimeRep t1
       -- We can't push the coercion into the lambda if it would create
       -- a representation-polymorphic binder.
@@ -3039,7 +3171,23 @@ pushCoDataCon :: DataCon -> [CoreExpr] -> MCoercionR
 -- The left-hand one must be a T, because exprIsConApp returned True
 -- but the right-hand one might not be.  (Though it usually will.)
 pushCoDataCon dc dc_args MRefl    = Just $! (push_dc_refl dc dc_args)
-pushCoDataCon dc dc_args (MCo co) = push_dc_gen  dc dc_args co (coercionKind co)
+pushCoDataCon dc dc_args (MCo co)
+  | not (null (dataConRepArgBinders dc))
+  , not (isReflCo co)
+  -- See Note [Retained constructor casts].
+  = Nothing
+  | otherwise
+  = push_dc_gen dc dc_args co (coercionKind co)
+
+{- Note [Retained constructor casts]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ordinary KPush substitution binds erased variables only. A retained field
+also scopes over later field types. Pushing a nonreflexive result cast requires
+a scoped substitution through those fields. The flat zip in push_data_con does
+not provide it. Decline this transformation for retained constructors until a
+scoped rule is available. Reflexive casts preserve the existing field scope.
+See Note [Retained constructor field telescopes] in GHC.Core.DataCon.
+-}
 
 push_dc_refl :: DataCon -> [CoreExpr] -> (DataCon, [Type], [CoreExpr])
 push_dc_refl dc dc_args
@@ -3095,13 +3243,21 @@ push_data_con to_tc to_tc_arg_tys dc dc_args co role
       = liftCoSubstWithEx dc_univ_tyvars
                           omegas
                           dc_ex_tcvars
-                          (map exprToType ex_args)
+                          (map ex_arg_type ex_args)
+
+    -- An existential coercion can scope over a following field, as in HEq#.
+    -- The lifting context represents it as a CoercionTy.
+    ex_arg_type (Coercion ex_co) = mkCoercionTy ex_co
+    ex_arg_type arg              = exprToType arg
 
       -- Cast the value arguments (which include dictionaries)
     new_val_args = zipWith cast_arg (map scaledThing arg_tys) val_args
     cast_arg arg_ty arg = mkCast arg (psi_subst arg_ty)
 
-    to_ex_args = map Type to_ex_arg_tys
+    to_ex_args = map to_ex_arg to_ex_arg_tys
+    to_ex_arg ty
+      | Just ex_co <- isCoercionTy_maybe ty = Coercion ex_co
+      | otherwise                         = Type ty
 
     dump_doc = vcat [ppr dc, ppr dc_univ_tyvars, ppr dc_ex_tcvars
                     , ppr arg_tys, ppr dc_args
@@ -3142,21 +3298,24 @@ collectBindersPushingCo e
       , let Pair tyL tyR = coercionKind co
       , assert (isForAllTy_ty tyL) $
         isForAllTy_ty tyR
-      , isReflCo (mkSelCo SelForAll co)  -- See Note [collectBindersPushingCo]
+      , isReflCo (mkSelCo (SelForAll SelFAMatch) co)
+      , isReflCo (mkSelCo (SelForAll SelKind) co)  -- See Note [collectBindersPushingCo]
       = go_c (b:bs) e (mkInstCo co (mkNomReflCo (mkTyVarTy b)))
 
       | isCoVar b
       , let Pair tyL tyR = coercionKind co
-      , assert (isForAllTy_co tyL) $
-        isForAllTy_co tyR
-      , isReflCo (mkSelCo SelForAll co)  -- See Note [collectBindersPushingCo]
+      , isForAllTy_co tyL, isForAllTy_co tyR
+      , isReflCo (mkSelCo (SelForAll SelFAMatch) co)
+      , isReflCo (mkSelCo (SelForAll SelKind) co)  -- See Note [collectBindersPushingCo]
       , let cov = mkCoVarCo b
       = go_c (b:bs) e (mkInstCo co (mkNomReflCo (mkCoercionTy cov)))
 
       | isId b
       , let Pair tyL tyR = coercionKind co
-      , assert (isFunTy tyL) $ isFunTy tyR
-      , (co_mult, co_arg, co_res) <- decomposeFunCo co
+      , isFunTy tyL, isFunTy tyR
+      -- Retained function casts must keep their scoped runtime binder.
+      , (co_ma, co_mult, co_arg, co_res) <- decomposeFunCo co
+      , isReflCo co_ma   -- See Note [Ordinary arrow metadata and eta].
       , isReflCo co_mult -- See Note [collectBindersPushingCo]
       , isReflCo co_arg  -- See Note [collectBindersPushingCo]
       = go_c (b:bs) e co_res
@@ -3217,18 +3376,26 @@ etaExpandToJoinPointRule join_arity rule@(Rule { ru_bndrs = bndrs, ru_rhs = rhs
 
 -- Adds as many binders as asked for; assumes expr is not a lambda
 etaBodyForJoinPoint :: Int -> CoreExpr -> ([CoreBndr], CoreExpr)
+-- See Note [Ordinary arrow metadata and eta].
 etaBodyForJoinPoint need_args body
   = go need_args body_ty (mkEmptySubst in_scope) [] body
   where
     go 0 _  _     rev_bs e
       = (reverse rev_bs, e)
     go n ty subst rev_bs e
-      | Just (tv, res_ty) <- splitForAllTyCoVar_maybe ty
+      | Just (ma, tv, res_ty) <- splitForAllTyCoVar_maybe ty
+      , Type.substTyUnchecked subst ma `eqType` unmatchableDataConTy
       , let (subst', tv') = substVarBndr subst tv
       = go (n-1) res_ty subst' (tv' : rev_bs) (e `App` varToCoreExpr tv')
         -- The varToCoreExpr is important: `tv` might be a coercion variable
 
-      | Just (_, mult, arg_ty, res_ty) <- splitFunTy_maybe ty
+      -- See Note [Retained arguments of join points] in GHC.Core.Type.
+      | DepFunTy _ index res_ty <- coreFullView ty
+      , let (subst', index') = substBndr subst index
+      = go (n-1) res_ty subst' (index' : rev_bs) (e `App` Var index')
+
+      | Just (_, ma, mult, arg_ty, res_ty) <- splitFunTy_maybe ty
+      , Type.substTyUnchecked subst ma `eqType` unmatchableDataConTy
       , let (subst', b) = freshEtaId n subst (Scaled mult arg_ty)
       = go (n-1) res_ty subst' (b : rev_bs) (e `App` varToCoreExpr b)
         -- The varToCoreExpr is important: `b` might be a coercion variable

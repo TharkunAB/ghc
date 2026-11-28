@@ -48,7 +48,10 @@ import qualified GHC.Data.BooleanFormula as BF
 import GHC.Data.FastString
 import qualified GHC.Data.Strict as Strict
 import GHC.Hs.Decls.Overlap (OverlapMode(..))
-import GHC.Hs.Type () -- Required for HsConDetails type-family instances
+import GHC.Hs.Type
+  ( HsTypeGhcPsExt(HsTypeLambda, HsTypeLet, HsTypeCase, HsTypeCaseAlias, HsTypeCaseHead, HsTypeExists, HsTypeSome, HsTypeLetProductCheck, HsTypeLambdaCheck)
+  , HsTypeCaseAlt(..), HsTypeLetBind(..), HsTypeLetPair(..), HsTypeLetPat(..)
+  )
 import GHC.TypeLits
 import GHC.Types.ForeignCall
 import GHC.Types.InlinePragma (ActivationGhc, inlinePragmaActivation, inlinePragmaSource)
@@ -428,9 +431,9 @@ instances for that.
 This is done in
 https://gitlab.haskell.org/ghc/ghc/-/merge_requests/16644, using
 
-  data InnerBindings
-    = InnerMore (LHsGadtTelescope GhcPs) InnerBindings
-    | InnerDone ([LHsContext GhcPs], HsConDeclGADTDetails GhcPs, LHsType GhcPs)
+  data InnerBindings body
+    = InnerMore (LHsGadtTelescope GhcPs) (InnerBindings body)
+    | InnerDone body
 
 The key part of the ExactPrint instance for this is
 
@@ -556,6 +559,14 @@ instance HasTrailing (TokForall, TokRarrow) where
   setTrailing a _ = a
 
 instance HasTrailing (TokForall, EpToken ".") where
+  trailing _ = []
+  setTrailing a _ = a
+
+instance HasTrailing (TokForall, TokRarrow, Maybe (EpToken "@")) where
+  trailing _ = []
+  setTrailing a _ = a
+
+instance HasTrailing (TokForall, EpToken ".", Maybe (EpToken "@")) where
   trailing _ = []
   setTrailing a _ = a
 
@@ -2974,6 +2985,13 @@ instance ExactPrint (HsExpr GhcPs) where
     at' <- markEpToken at
     arg' <- markAnnotated arg
     return (HsAppType at' fun' arg')
+  exact (HsAppRetained (at, open, close) fun arg) = do
+    fun' <- markAnnotated fun
+    at' <- markEpToken at
+    open' <- markEpToken open
+    arg' <- markAnnotated arg
+    close' <- markEpToken close
+    return (HsAppRetained (at', open', close') fun' arg')
   exact (OpApp x e1 e2 e3) = do
     e1' <- markAnnotated e1
     e2' <- markAnnotated e2
@@ -3991,6 +4009,17 @@ instance ExactPrint (HsType GhcPs) where
     return (HsForAllTy { hst_xforall = an
                        , hst_tele = tele', hst_body = ty' })
 
+  exact (HsForEachTy { hst_xforeach = (f,r)
+                    , hst_bndrs = bndrs, hst_body = ty }) = do
+    f' <- markEpToken f
+    bndrs' <- mapM markAnnotated bndrs
+    r' <- case r of
+      Left arrow -> Left <$> markEpUniToken arrow
+      Right dot -> Right <$> markEpToken dot
+    ty' <- markAnnotated ty
+    return (HsForEachTy { hst_xforeach = (f',r')
+                       , hst_bndrs = bndrs', hst_body = ty' })
+
   exact (HsQualTy x ctxt ty) = do
     ctxt' <- markAnnotated ctxt
     ty' <- markAnnotated ty
@@ -4058,6 +4087,63 @@ instance ExactPrint (HsType GhcPs) where
   exact (HsDocTy an ty doc) = do
     ty' <- markAnnotated ty
     return (HsDocTy an ty' doc)
+  exact (XHsType (HsTypeLambda (lam, arr) binders body)) = do
+    lam' <- markEpToken lam
+    binders' <- mapM markAnnotated binders
+    arr' <- markEpUniToken arr
+    body' <- markAnnotated body
+    return (XHsType (HsTypeLambda (lam', arr') binders' body'))
+  exact (XHsType (HsTypeCase (case_tok, of_tok) braces scrutinee alts)) = do
+    case_tok' <- markEpToken case_tok
+    scrutinee' <- markAnnotated scrutinee
+    of_tok' <- markEpToken of_tok
+    (braces', alts') <- case braces of
+      Nothing -> (Nothing,) <$> mapM markAnnotated alts
+      Just (open, close) -> do
+        open' <- markEpToken open
+        alts' <- mapM markAnnotated alts
+        close' <- markEpToken close
+        return (Just (open', close'), alts')
+    return (XHsType (HsTypeCase (case_tok', of_tok') braces' scrutinee' alts'))
+  exact (XHsType (HsTypeCaseHead name)) =
+    XHsType . HsTypeCaseHead <$> markAnnotated name
+  exact (XHsType (HsTypeSome (some, open, signature, close, bar) binder domain body)) = do
+    some' <- markEpToken some
+    open' <- markEpToken open
+    binder' <- markAnnotated binder
+    signature' <- markEpUniToken signature
+    domain' <- markAnnotated domain
+    close' <- markEpToken close
+    bar' <- markEpToken bar
+    body' <- markAnnotated body
+    return (XHsType (HsTypeSome (some', open', signature', close', bar') binder' domain' body'))
+  exact (XHsType (HsTypeCaseAlias generated alias body)) =
+    XHsType . HsTypeCaseAlias generated alias <$> markAnnotated body
+  exact (XHsType HsTypeLambdaCheck{}) =
+    error "exact: compiler-generated local lambda check"
+  exact (XHsType (HsTypeLetProductCheck con arity body)) =
+    XHsType <$> (HsTypeLetProductCheck <$> markAnnotated con <*> pure arity <*> markAnnotated body)
+  exact (XHsType (HsTypeExists (exists, sep_tok) binder body)) = do
+    exists' <- markEpToken exists
+    binder' <- markAnnotated binder
+    sep_tok' <- case sep_tok of
+      Left bar -> Left <$> markEpToken bar
+      Right dot_tok -> Right <$> markEpToken dot_tok
+    body' <- markAnnotated body
+    return (XHsType (HsTypeExists (exists', sep_tok') binder' body'))
+
+  exact (XHsType (HsTypeLet (let_tok, in_tok) braces source binds body)) = setLayoutBoth $ do
+    let' <- markEpToken let_tok
+    (braces', binds') <- case braces of
+      Nothing -> (Nothing,) <$> setLayoutBoth (traverse markAnnotated binds)
+      Just (open, close) -> do
+        open' <- markEpToken open
+        binds' <- setLayoutBoth $ traverse markAnnotated binds
+        close' <- markEpToken close
+        return (Just (open', close'), binds')
+    in' <- markEpToken in_tok
+    body' <- markAnnotated body
+    return (XHsType (HsTypeLet (let', in') braces' source binds' body'))
   exact (XHsType (HsBangTy ann (HsSrcBang mt up str) ty)) = do
     (ann', mt') <- exactBang (ann, mt) str
     ty' <- markAnnotated ty
@@ -4096,24 +4182,55 @@ instance ExactPrint (HsType GhcPs) where
 
 -- ---------------------------------------------------------------------
 
+-- | Include explicit metadata in the forall entry span.
+-- See Note [Exact forall metadata].
+forallMatchabilityEntry :: HasTrailing ann
+                       => EpAnn ann -> Maybe (LHsType GhcPs) -> Entry
+forallMatchabilityEntry an ma = fromAnn (forallMatchabilityAnn an ma)
+
+-- | Extend the absolute anchor through explicit forall metadata.
+-- See Note [Exact forall metadata].
+forallMatchabilityAnn :: EpAnn ann -> Maybe (LHsType GhcPs) -> EpAnn ann
+forallMatchabilityAnn (EpAnn (EpaSpan loc) anns cs) (Just ma) =
+  EpAnn (EpaSpan (combineSrcSpans loc (getLocA ma))) anns cs
+forallMatchabilityAnn an _ = an
+
+{- Note [Exact forall metadata]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The parser's forall annotation anchor ends at the separator. Explicit @ma
+metadata follows that separator. The exact printer emits metadata inside the
+forall entry, so that entry must end after metadata. Otherwise enterAnn resets
+the prior source position to the separator and counts the metadata width again
+when it prints the body. Extend absolute entry spans through metadata. Keep
+relative entry positions unchanged.
+
+GADT constructor outer binders also have a located wrapper. Extend that
+wrapper's anchor before entering it, so its exit does not reset the source
+position to the separator after the inner forall entry has printed metadata.
+-}
+
 instance ExactPrint (HsForAllTelescope GhcPs) where
-  getAnnotationEntry (HsForAllVis an _)   = fromAnn an
-  getAnnotationEntry (HsForAllInvis an _) = fromAnn an
+  getAnnotationEntry (HsForAllVis an ma _)   = forallMatchabilityEntry an ma
+  getAnnotationEntry (HsForAllInvis an ma _) = forallMatchabilityEntry an ma
 
-  setAnnotationAnchor (HsForAllVis an a) anc ts cs = HsForAllVis (setAnchorEpa an anc ts cs) a
-  setAnnotationAnchor (HsForAllInvis an a) anc ts cs = HsForAllInvis (setAnchorEpa an anc ts cs) a
+  setAnnotationAnchor (HsForAllVis an ma a) anc ts cs = HsForAllVis (setAnchorEpa an anc ts cs) ma a
+  setAnnotationAnchor (HsForAllInvis an ma a) anc ts cs = HsForAllInvis (setAnchorEpa an anc ts cs) ma a
 
-  exact (HsForAllVis (EpAnn l (f,r) cs) bndrs)   = do
+  exact (HsForAllVis (EpAnn l (f,r,at) cs) ma bndrs)   = do
     f' <- markEpUniToken f
     bndrs' <- mapM markAnnotated bndrs
     r' <- markEpUniToken r
-    return (HsForAllVis (EpAnn l (f',r') cs) bndrs')
+    at' <- mapM markEpToken at
+    ma' <- markAnnotated ma
+    return (HsForAllVis (EpAnn l (f',r',at') cs) ma' bndrs')
 
-  exact (HsForAllInvis (EpAnn l (f,d) cs) bndrs) = do
+  exact (HsForAllInvis (EpAnn l (f,d,at) cs) ma bndrs) = do
     f' <- markEpUniToken f
     bndrs' <- mapM markAnnotated bndrs
     d' <- markEpToken d
-    return (HsForAllInvis (EpAnn l (f',d') cs) bndrs')
+    at' <- mapM markEpToken at
+    ma' <- markAnnotated ma
+    return (HsForAllInvis (EpAnn l (f',d',at') cs) ma' bndrs')
 
 -- ---------------------------------------------------------------------
 
@@ -4196,6 +4313,44 @@ instance ExactPrint (HsSigType GhcPs) where
     return (HsSig a bndrs' ty')
 
 -- ---------------------------------------------------------------------
+
+instance ExactPrint HsTypeCaseAlt where
+  getAnnotationEntry = const NoEntryVal
+  setAnnotationAnchor alt _ _ _ = alt
+  exact (HsTypeCaseAlt pat arr rhs) =
+    HsTypeCaseAlt <$> markAnnotated pat <*> markEpUniToken arr <*> markAnnotated rhs
+
+instance ExactPrint HsTypeLetBind where
+  getAnnotationEntry = const NoEntryVal
+  setAnnotationAnchor bind _ _ _ = bind
+  exact (HsTypeLetBind sig var eq rhs) =
+    HsTypeLetBind <$> traverse signature sig <*> markAnnotated var <*> markEpToken eq <*> markAnnotated rhs
+    where
+      signature (name, colon, kind, semi) =
+        (,,,) <$> markAnnotated name <*> markEpUniToken colon <*> markAnnotated kind <*> markEpToken semi
+  exact (HsTypeLetPairBind pair eq rhs) =
+    HsTypeLetPairBind <$> markAnnotated pair <*> markEpToken eq <*> markAnnotated rhs
+  exact (HsTypeLetProductBind con fields eq rhs) =
+    HsTypeLetProductBind <$> markAnnotated con <*> traverse markAnnotated fields
+                         <*> markEpToken eq <*> markAnnotated rhs
+
+instance ExactPrint HsTypeLetPair where
+  getAnnotationEntry = const NoEntryVal
+  setAnnotationAnchor pair _ _ _ = pair
+  exact (HsTypeLetPair (open, comma, close) left right) = do
+    open' <- markEpToken open
+    left' <- markAnnotated left
+    comma' <- markEpToken comma
+    right' <- markAnnotated right
+    close' <- markEpToken close
+    pure (HsTypeLetPair (open', comma', close') left' right')
+
+instance ExactPrint HsTypeLetPat where
+  getAnnotationEntry = const NoEntryVal
+  setAnnotationAnchor pat _ _ _ = pat
+  exact (HsTypeLetPatVar name) = HsTypeLetPatVar <$> markAnnotated name
+  exact (HsTypeLetPatWild wildcard) = HsTypeLetPatWild <$> markEpToken wildcard
+  exact (HsTypeLetPatPair (L loc pair)) = HsTypeLetPatPair . L loc <$> markAnnotated pair
 
 instance ExactPrint (LocatedN RdrName) where
   getAnnotationEntry (L sann _) = fromAnn sann
@@ -4332,40 +4487,130 @@ instance ExactPrint (ConDecl GhcPs) where
   setAnnotationAnchor a _ _ _ = a
 
 -- based on pprConDecl
-  exact (ConDeclH98 { con_ext = AnnConDeclH98 tforall tdot tdarrow
+  exact (ConDeclH98 { con_ext = ext
                     , con_name = con
-                    , con_forall = has_forall
-                    , con_ex_tvs = ex_tvs
-                    , con_mb_cxt = mcxt
+                    , con_telescope = teles
                     , con_args = args
                     , con_modifiers = mods
                     , con_doc = doc }) = do
     mods' <- mapM markAnnotated mods
-    tforall' <- if has_forall
-      then markEpUniToken tforall
-      else return tforall
-    ex_tvs' <- mapM markAnnotated ex_tvs
-    tdot' <- if has_forall
-      then markEpToken tdot
-      else return tdot
-    mcxt' <- markAnnotated mcxt
-    tdarrow' <- if (isJust mcxt)
-      then markEpUniToken tdarrow
-      else return tdarrow
-
-    (con', args') <- exact_details args
-    return (ConDeclH98 { con_ext = AnnConDeclH98 tforall' tdot' tdarrow'
+    ib' <- markAnnotated (toInnerBindings teles (H98ConBody con args))
+    let (teles', H98ConBody con' args') = fromInnerBindings ib'
+    return (ConDeclH98 { con_ext = ext
                        , con_name = con'
-                       , con_forall = has_forall
-                       , con_ex_tvs = ex_tvs'
-                       , con_mb_cxt = mcxt'
+                       , con_telescope = teles'
                        , con_args = args'
                        , con_modifiers = mods'
                        , con_doc = doc })
 
+  -- -----------------------------------
+
+  exact (ConDeclGADT { con_g_ext = AnnConDeclGADT ops cps dcol
+                     , con_names = cons
+                     , con_outer_bndrs = outer_bndrs
+                     , con_telescope = teles
+                     , con_g_args = args
+                     , con_modifiers = mods
+                     , con_res_ty = res_ty, con_doc = doc }) = do
+    mods' <- mapM markAnnotated mods
+    cons' <- mapM markAnnotated cons
+    dcol' <- markEpUniToken dcol
+    epTokensToComments "(" ops
+    epTokensToComments ")" cps
+
+    outer_bndrs' <- case outer_bndrs of
+      L _ (HsOuterImplicit _) -> return outer_bndrs
+      L an bndrs@HsOuterExplicit{hso_matchability = ma} ->
+        -- See Note [Exact forall metadata].
+        markAnnotated (L (forallMatchabilityAnn an ma) bndrs)
+
+    let ib = toInnerBindings teles (GadtConBody args res_ty)
+    ib' <- markAnnotated ib
+    let (teles', GadtConBody args' res_ty') = fromInnerBindings ib'
+
+    return (ConDeclGADT { con_g_ext = AnnConDeclGADT [] [] dcol'
+                        , con_names = cons'
+                        , con_outer_bndrs = outer_bndrs'
+                        , con_telescope = teles'
+                        , con_g_args = args'
+                        , con_modifiers = mods'
+                        , con_res_ty = res_ty', con_doc = doc })
+
+-- ---------------------------------------------------------------------
+
+-- | The part of an H98 constructor inside its ordered prefix.
+data H98ConBody = H98ConBody (LIdP GhcPs) (HsConDeclH98Details GhcPs)
+
+-- | The part of a GADT constructor inside its ordered prefix.
+data GadtConBody = GadtConBody (HsConDeclGADTDetails GhcPs) (LHsType GhcPs)
+
+-- | Nest prefix nodes around a constructor body for exact printing.
+-- See Note [Exact constructor telescopes].
+data InnerBindings body
+  = InnerMore (LHsGadtTelescope GhcPs) (InnerBindings body)
+  | InnerDone body
+
+-- | Nest the prefix nodes around their constructor body.
+toInnerBindings :: [LHsGadtTelescope GhcPs]
+                -> body -> InnerBindings body
+toInnerBindings [] inner = InnerDone inner
+toInnerBindings (b:bs) inner = InnerMore b (toInnerBindings bs inner)
+
+-- | Recover the updated prefix in its original source order.
+fromInnerBindings :: InnerBindings body -> ([LHsGadtTelescope GhcPs], body)
+fromInnerBindings = go []
+  where
+    go acc (InnerMore b n) = go (b:acc) n
+    go acc (InnerDone x) = (reverse acc,x)
+
+{- Note [Exact constructor telescopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+H98 and GADT prefixes contain forall groups, contexts, and parentheses in
+source order. Nest the body inside these nodes so that each closing parenthesis
+follows the body. The context child owns its => token. Do not print another =>
+from the constructor declaration. See Note [Constructor telescope contexts]
+in GHC.Hs.Decls.
+
+Extraction accumulates nodes at the front of a list. Reverse that list once
+at the end to retain the original prefix order after exact printing.
+
+A context node's synthetic outer span covers only the context, while its
+nested printing action includes the remaining constructor body. Do not enter
+that outer span: its exit would reset the prior source position before the
+body. The context child owns its source anchor, comments, and => token.
+-}
+
+instance ExactPrint body => ExactPrint (InnerBindings body) where
+  getAnnotationEntry (InnerMore (L _ HsGadtContext{}) _) = NoEntryVal
+  getAnnotationEntry (InnerMore (L li _) _) = fromAnn li
+  getAnnotationEntry (InnerDone _)          = NoEntryVal
+
+  setAnnotationAnchor (InnerMore li n) anc ts cs = InnerMore (setAnchorAn li anc ts cs) n
+  setAnnotationAnchor (InnerDone x) _ _ _ = InnerDone x
+
+  exact (InnerMore (L li (HsGadtForAll x tele)) n) = do
+    tele' <- markAnnotated tele
+    n' <- markAnnotated n
+    return (InnerMore (L li (HsGadtForAll x tele')) n')
+  exact (InnerMore (L li (HsGadtContext ctxt)) n) = do
+    ctxt' <- markAnnotated ctxt
+    n' <- markAnnotated n
+    return (InnerMore (L li (HsGadtContext ctxt')) n')
+  exact  (InnerMore (L l (HsGadtPar (lp, rp))) xs) = do
+    lp' <- markEpToken lp
+    xs' <- markAnnotated xs
+    rp' <- markEpToken rp
+    return (InnerMore (L l (HsGadtPar (lp',rp'))) xs')
+  exact (InnerDone body) = InnerDone <$> markAnnotated body
+
+instance ExactPrint H98ConBody where
+  getAnnotationEntry _ = NoEntryVal
+  setAnnotationAnchor body _ _ _ = body
+  exact (H98ConBody con args) = do
+    (con', args') <- exact_details args
+    return (H98ConBody con' args')
     where
-    -- In ppr_details: let's not print the multiplicities (they are always 1, by
-    -- definition) as they do not appear in an actual declaration.
+      -- H98 declarations do not contain explicit field multiplicities.
       exact_details (InfixCon x t1 t2) = do
         t1' <- markAnnotated t1
         con' <- markAnnotated con
@@ -4382,72 +4627,10 @@ instance ExactPrint (ConDecl GhcPs) where
         cc' <- markEpToken cc
         return (con', RecCon (oc',cc') fields')
 
-  -- -----------------------------------
-
-  exact (ConDeclGADT { con_g_ext = AnnConDeclGADT ops cps dcol
-                     , con_names = cons
-                     , con_outer_bndrs = outer_bndrs
-                     , con_inner_bndrs = inner_bndrs
-                     , con_cxts = cxts, con_g_args = args
-                     , con_modifiers = mods
-                     , con_res_ty = res_ty, con_doc = doc }) = do
-    mods' <- mapM markAnnotated mods
-    cons' <- mapM markAnnotated cons
-    dcol' <- markEpUniToken dcol
-    epTokensToComments "(" ops
-    epTokensToComments ")" cps
-
-    outer_bndrs' <- case outer_bndrs of
-      L _ (HsOuterImplicit _) -> return outer_bndrs
-      _ -> markAnnotated outer_bndrs
-
-    let ib = toInnerBindings inner_bndrs (cxts, args, res_ty)
-    ib' <- markAnnotated ib
-    let (inner_bndrs', (cxts', args', res_ty')) = fromInnerBindings ib'
-
-    return (ConDeclGADT { con_g_ext = AnnConDeclGADT [] [] dcol'
-                        , con_names = cons'
-                        , con_outer_bndrs = outer_bndrs'
-                        , con_inner_bndrs = inner_bndrs'
-                        , con_cxts = cxts', con_g_args = args'
-                        , con_modifiers = mods'
-                        , con_res_ty = res_ty', con_doc = doc })
-
--- ---------------------------------------------------------------------
-
-data InnerBindings
-  = InnerMore (LHsGadtTelescope GhcPs) InnerBindings
-  | InnerDone ([LHsContext GhcPs], HsConDeclGADTDetails GhcPs, LHsType GhcPs)
-
-toInnerBindings :: [LHsGadtTelescope GhcPs]
-                -> ([LHsContext GhcPs], HsConDeclGADTDetails GhcPs, LHsType GhcPs) -> InnerBindings
-toInnerBindings [] inner = InnerDone inner
-toInnerBindings (b:bs) inner = InnerMore b (toInnerBindings bs inner)
-
-fromInnerBindings :: InnerBindings -> ([LHsGadtTelescope GhcPs], ([LHsContext GhcPs], HsConDeclGADTDetails GhcPs, LHsType GhcPs))
-fromInnerBindings = go []
-  where
-    go acc (InnerMore b n) = go (b:acc) n
-    go acc (InnerDone x) = (acc,x)
-
-instance ExactPrint InnerBindings where
-  getAnnotationEntry (InnerMore (L li _) _) = fromAnn li
-  getAnnotationEntry (InnerDone _)          = NoEntryVal
-
-  setAnnotationAnchor (InnerMore li n) anc ts cs = InnerMore (setAnchorAn li anc ts cs) n
-  setAnnotationAnchor (InnerDone x) _ _ _ = InnerDone x
-
-  exact (InnerMore (L li (HsGadtForAll x tele)) n) = do
-    tele' <- markAnnotated tele
-    n' <- markAnnotated n
-    return (InnerMore (L li (HsGadtForAll x tele')) n')
-  exact  (InnerMore (L l (HsGadtPar (lp, rp))) xs) = do
-    lp' <- markEpToken lp
-    xs' <- markAnnotated xs
-    rp' <- markEpToken rp
-    return (InnerMore (L l (HsGadtPar (lp',rp'))) xs')
-  exact (InnerDone (cxts, args, res_ty)) = do
-    cxts' <- mapM markAnnotated cxts
+instance ExactPrint GadtConBody where
+  getAnnotationEntry _ = NoEntryVal
+  setAnnotationAnchor body _ _ _ = body
+  exact (GadtConBody args res_ty) = do
     args' <-
       case args of
           (PrefixConGADT x args0) -> do
@@ -4460,7 +4643,7 @@ instance ExactPrint InnerBindings where
             rarr' <- markEpUniToken rarr
             return (RecConGADT (oc',cc',rarr') fields')
     res_ty' <- markAnnotated res_ty
-    return (InnerDone (cxts', args', res_ty'))
+    return (GadtConBody args' res_ty')
 
 -- ---------------------------------------------------------------------
 
@@ -4473,17 +4656,20 @@ instance ExactPrint Void where
 
 instance ExactPrintTVFlag flag => ExactPrint (HsOuterTyVarBndrs flag GhcPs) where
   getAnnotationEntry (HsOuterImplicit _) = NoEntryVal
-  getAnnotationEntry (HsOuterExplicit an _) = fromAnn an
+  -- See Note [Exact forall metadata].
+  getAnnotationEntry (HsOuterExplicit an ma _) = forallMatchabilityEntry an ma
 
   setAnnotationAnchor (HsOuterImplicit a) _ _ _ = HsOuterImplicit a
-  setAnnotationAnchor (HsOuterExplicit an a) anc ts cs = HsOuterExplicit (setAnchorEpa an anc ts cs) a
+  setAnnotationAnchor (HsOuterExplicit an ma a) anc ts cs = HsOuterExplicit (setAnchorEpa an anc ts cs) ma a
 
   exact b@(HsOuterImplicit _) = pure b
-  exact (HsOuterExplicit (EpAnn l (f,d) cs) bndrs) = do
+  exact (HsOuterExplicit (EpAnn l (f,d,at) cs) ma bndrs) = do
     f' <- markEpUniToken f
     bndrs' <- mapM markAnnotated bndrs
     d' <- markEpToken d
-    return (HsOuterExplicit (EpAnn l (f',d') cs) bndrs')
+    at' <- mapM markEpToken at
+    ma' <- markAnnotated ma
+    return (HsOuterExplicit (EpAnn l (f',d',at') cs) ma' bndrs')
 
 -- ---------------------------------------------------------------------
 

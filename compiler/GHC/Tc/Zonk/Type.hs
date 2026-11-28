@@ -12,6 +12,7 @@ module GHC.Tc.Zonk.Type (
         -- * Zonking
         -- | For a description of "zonking", see Note [What is zonking?].
         ZonkTcM,
+        withReadOnlyFinalZonk,
         zonkTopDecls, zonkTopExpr, zonkTopLExpr,
         zonkTopBndrs,
         zonkTyVarBindersX, zonkTyVarBinderX,
@@ -39,12 +40,12 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Hs
 
 import {-# SOURCE #-} GHC.Tc.Gen.Splice (runTopSplice)
-import GHC.Tc.Types ( TcM )
+import GHC.Tc.Types ( TcM, TcGblEnv(tcg_th_state) )
 import GHC.Tc.Types.TcRef
 import GHC.Tc.TyCl.Build ( TcMethInfo, MethInfo )
 import GHC.Tc.Utils.Env ( tcLookupGlobalOnly )
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Utils.Monad ( newUnusedType, setSrcSpanA, liftZonkM, traceTc, addErr )
+import GHC.Tc.Utils.Monad ( newUnusedType, setSrcSpanA, liftZonkM, traceTc, addErr, getGblEnv, tryM )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Errors.Types
 import GHC.Tc.Zonk.Env
@@ -58,11 +59,12 @@ import GHC.Tc.Zonk.TcType
 
 import GHC.Core.Coercion
 import GHC.Core.ConLike
+import GHC.Core.DataCon ( dataConHasRetainedResult, dataConHasTrailingContext )
 import GHC.Core.PatSyn (PatSyn(..))
 import GHC.Core.TyCo.Ppr ( pprTyVar )
 import GHC.Core.Type
 import GHC.Core.TyCon
-import GHC.Core.TyCo.Rep( CoercionPlusHoles(..) )
+import GHC.Core.TyCo.Rep( CoercionPlusHoles(..), Type(TermVarTy) )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
@@ -71,12 +73,14 @@ import GHC.Utils.Panic
 
 import GHC.Core.Multiplicity
 import GHC.Core
+import GHC.Core.Make ( mkImpossibleExpr )
 import GHC.Core.Predicate
 
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Var
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set (elemVarSet)
 import GHC.Types.Id
 import GHC.Types.TypeEnv
 import GHC.Types.Basic
@@ -89,11 +93,16 @@ import GHC.Tc.Types.BasicTypes
 import GHC.Data.Maybe
 import GHC.Data.Bag
 
+import Control.Exception ( throwIO )
 import Control.Monad
 import Control.Monad.Trans.Class ( lift )
+import Data.Dynamic ( fromDynamic, toDyn )
 import Data.List.NonEmpty ( NonEmpty )
 import Data.Foldable ( toList )
+import qualified Data.Map as Map
+import Data.Proxy ( Proxy(..) )
 import Data.Traversable ( for )
+import Data.Typeable ( typeRep )
 
 {- Note [What is zonking?]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -387,9 +396,11 @@ zonkTyVarOcc tv
 
              zonk_meta ref Flexi
                = do { kind <- zonkTcTypeToTypeX (tyVarKind tv)
-                    ; ty <- lift $ commitFlexi zonk_flexi tv kind
-
-                    ; lift $ liftZonkM $ writeMetaTyVarRef tv ref ty  -- Belt and braces
+                    ; ro <- lift isReadOnlyFinalZonk
+                    ; ty <- lift $ commitFlexi ro zonk_flexi tv kind
+                    -- See Note [Read-only final zonking during constraint solving].
+                    ; unless ro $
+                        lift $ liftZonkM $ writeMetaTyVarRef tv ref ty  -- Belt and braces
                     ; finish_meta ty }
 
              zonk_meta _ (Indirect ty)
@@ -435,16 +446,66 @@ lookupTyVarX tv
                       Nothing -> pprPanic "lookupTyVarOcc" (ppr tv $$ ppr tv_env)
        ; return res }
 
-commitFlexi :: ZonkFlexi -> TcTyVar -> Kind -> TcM Type
-commitFlexi NoFlexi tv zonked_kind
+{- Note [Read-only final zonking during constraint solving]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Typechecker plugins and intermediate source-table checks can call 'zonkTopDecls'
+on 'tcg_binds' before 'simplifyTop' finishes solving all nested implications in
+the module. At that point, sibling bindings in 'tcg_binds' can still contain
+live unfilled 'MetaTv' unification variables and 'HoleExprRef' references.
+
+Writing defaulted types ('UnusedType', 'Many', or 'LiftedRep') back into those
+'MetaTv' references would clobber active unification variables before the
+constraint solver reaches their implications. 'withReadOnlyFinalZonk' sets a
+scoped flag in 'tcg_th_state'. When that flag is active:
+1. 'zonkTyVarOcc' records the defaulted 'Type' in 'ze_meta_tv_env' without
+   calling 'writeMetaTyVarRef'. Every occurrence within the 'ZonkEnv' receives
+   the same 'Type', and live solver 'MetaTv' references remain 'Flexi'.
+2. 'commitFlexi' suppresses premature 'ZonkerCannotDefaultConcrete' diagnostics.
+3. 'zonkExpr' replaces each 'HoleExprRef' with a fresh placeholder reference
+   without forcing the live unfilled cell.
+-}
+
+newtype ReadOnlyFinalZonk = ReadOnlyFinalZonk Bool
+
+isReadOnlyFinalZonk :: TcM Bool
+isReadOnlyFinalZonk = do
+  gbl <- getGblEnv
+  st_map <- readTcRef (tcg_th_state gbl)
+  let rep = typeRep (Proxy :: Proxy ReadOnlyFinalZonk)
+  pure $ case Map.lookup rep st_map >>= fromDynamic of
+    Just (ReadOnlyFinalZonk b) -> b
+    Nothing                    -> False
+
+-- | Run a final-zonking action without mutating live 'MetaTv' or 'HoleExprRef'
+-- cells or emitting concrete-defaulting errors.
+-- See Note [Read-only final zonking during constraint solving].
+withReadOnlyFinalZonk :: TcM a -> TcM a
+withReadOnlyFinalZonk thing_inside = do
+  gbl <- getGblEnv
+  let ref = tcg_th_state gbl
+      rep = typeRep (Proxy :: Proxy ReadOnlyFinalZonk)
+  st_map0 <- readTcRef ref
+  let prev :: ReadOnlyFinalZonk
+      prev = fromMaybe (ReadOnlyFinalZonk False)
+                       (Map.lookup rep st_map0 >>= fromDynamic)
+  writeTcRef ref (Map.insert rep (toDyn (ReadOnlyFinalZonk True)) st_map0)
+  res <- tryM thing_inside
+  st_map1 <- readTcRef ref
+  writeTcRef ref (Map.insert rep (toDyn prev) st_map1)
+  case res of
+    Right val -> pure val
+    Left ex   -> liftIO $ throwIO ex
+
+commitFlexi :: Bool -> ZonkFlexi -> TcTyVar -> Kind -> TcM Type
+commitFlexi _ NoFlexi tv zonked_kind
   = pprPanic "NoFlexi" (ppr tv <+> dcolon <+> ppr zonked_kind)
 
-commitFlexi (SkolemiseFlexi tvs_ref) tv zonked_kind
+commitFlexi _ (SkolemiseFlexi tvs_ref) tv zonked_kind
   = do { let skol_tv = mkTyVar (tyVarName tv) zonked_kind
        ; updTcRef tvs_ref (skol_tv :)
        ; return (mkTyVarTy skol_tv) }
 
-commitFlexi RuntimeUnkFlexi tv zonked_kind
+commitFlexi _ RuntimeUnkFlexi tv zonked_kind
   = do { traceTc "Defaulting flexi tyvar to RuntimeUnk:" (pprTyVar tv)
        ; return (mkTyVarTy (mkTcTyVar (tyVarName tv) zonked_kind RuntimeUnk)) }
             -- This is where RuntimeUnks are born:
@@ -452,7 +513,7 @@ commitFlexi RuntimeUnkFlexi tv zonked_kind
             -- turned into RuntimeUnks as they leave the
             -- typechecker's monad
 
-commitFlexi DefaultFlexi tv zonked_kind
+commitFlexi ro DefaultFlexi tv zonked_kind
   -- Normally, RuntimeRep variables are defaulted in GHC.Tc.Utils.TcMType.defaultTyVar
   -- But that sees only type variables that appear in, say, an inferred type.
   -- Defaulting here, in the zonker, is needed to catch e.g.
@@ -470,7 +531,8 @@ commitFlexi DefaultFlexi tv zonked_kind
   = do { traceTc "Defaulting flexi tyvar to Many:" (pprTyVar tv)
        ; return manyDataConTy }
   | Just (ConcreteFRR origin) <- isConcreteTyVar_maybe tv
-  = do { addErr $ TcRnZonkerMessage (ZonkerCannotDefaultConcrete origin)
+  = do { unless ro $
+           addErr $ TcRnZonkerMessage (ZonkerCannotDefaultConcrete origin)
        ; newUnusedType tv.varName zonked_kind }
   | otherwise
   = do { traceTc "Defaulting flexi tyvar to UnusedType:" (pprTyVar tv)
@@ -505,6 +567,9 @@ zonkCoHole hole@(CH { ch_ref = ref, ch_co_var = cv })
 zonk_tycomapper :: TyCoMapper ZonkTcM
 zonk_tycomapper = TyCoMapper
     { tcm_tyvar      = zonkTyVarOcc
+    , tcm_termvar    = fmap TermVarTy . zonkIdBndr
+    , tcm_termbinder = \v k -> runZonkBndrT (zonkIdBndrX v) k
+        -- See Note [Zonking runtime index metadata] in GHC.Tc.Zonk.TcType
     , tcm_covar      = zonkCoVarOcc
     , tcm_hole       = zonkCoHole
     , tcm_tycobinder = \ tcv _vis k -> runZonkBndrT (zonkTyBndrX tcv) k
@@ -931,9 +996,13 @@ zonkExpr (HsHole (h, her))
   where
     zonk_her :: HoleExprRef -> ZonkTcM HoleExprRef
     zonk_her (HER ref ty u)
-      = do updTcRefM ref zonkEvTerm
-           ty'  <- zonkTcTypeToTypeX ty
-           return (HER ref ty' u)
+      = do ro  <- lift isReadOnlyFinalZonk
+           ty' <- zonkTcTypeToTypeX ty
+           -- See Note [Read-only final zonking during constraint solving].
+           ref' <- if ro
+                   then lift $ newTcRef (EvExpr (mkImpossibleExpr ty' "unfilled expression hole"))
+                   else do { updTcRefM ref zonkEvTerm; return ref }
+           return (HER ref' ty' u)
 
 zonkExpr (HsIPVar x _) = dataConCantHappen x
 
@@ -966,6 +1035,12 @@ zonkExpr (HsAppType ty e t)
        new_ty <- zonkTcTypeToTypeX ty
        return (HsAppType new_ty new_e t)
        -- NB: the type is an HsType; can't zonk that!
+
+zonkExpr (HsAppRetained (vis, ty) fun arg)
+  = do new_ty <- zonkTcTypeToTypeX ty
+       new_fun <- zonkLExpr fun
+       new_arg <- zonkLExpr arg
+       return (HsAppRetained (vis, new_ty) new_fun new_arg)
 
 zonkExpr (HsTypedBracket hsb_tc body)
   = (\x -> HsTypedBracket x body) <$> zonkBracket hsb_tc
@@ -1088,6 +1163,55 @@ zonkExpr (XExpr (WrapExpr co_fn expr))
 zonkExpr (XExpr (ExpandedThingTc (HSE thing e)))
   = do e' <- zonkLExpr e
        return $ XExpr (ExpandedThingTc (HSE thing e'))
+
+-- See Note [Checked opaque case alias] in GHC.Hs.Expr.
+zonkExpr (XExpr (NativeExistsPack schema witness payload))
+  = do { schema' <- zonkTcTypeToTypeX schema
+       ; witness' <- zonkTcTypeToTypeX witness
+       ; payload' <- zonkLExpr payload
+       ; return (XExpr (NativeExistsPack schema' witness' payload')) }
+
+zonkExpr (XExpr (NativeExistsUnpack witness payload result_ty package body))
+  = do { result_ty' <- zonkTcTypeToTypeX result_ty
+       ; package' <- zonkLExpr package
+       ; runZonkBndrT (do { witness' <- zonkTyBndrX witness
+                          ; payload' <- zonkIdBndrX payload
+                          ; return (witness', payload') }) $ \(witness', payload') ->
+         do { body' <- zonkLExpr body
+            ; return (XExpr (NativeExistsUnpack witness' payload' result_ty' package' body')) } }
+
+zonkExpr (XExpr (NativeCaseAlias scrut value proof result_ty body))
+  = do { scrut' <- zonkLExpr scrut
+       ; result_ty' <- zonkTcTypeToTypeX result_ty
+       ; runZonkBndrT (do { value' <- zonkIdBndrX value
+                         ; proof' <- zonkEvBndrX proof
+                         ; return (value', proof') }) $ \(value', proof') ->
+         do { body' <- zonkLExpr body
+            ; return (XExpr (NativeCaseAlias scrut' value' proof' result_ty' body')) } }
+
+-- See Note [Checked optional let alias] in GHC.Hs.Expr.
+zonkExpr (XExpr (NativeLetAlias rhs canonical value proof result_ty body))
+  = do { rhs' <- zonkLExpr rhs
+       ; canonical' <- zonk_canonical canonical
+       ; runZonkBndrT (do { value' <- zonkIdBndrX value
+                         ; proof' <- zonkEvBndrX proof
+                         ; return (value', proof') }) $ \(value', proof') ->
+         do { result_ty' <- zonkTcTypeToTypeX result_ty
+            ; body' <- zonkLExpr body
+            ; return (XExpr (NativeLetAlias rhs' canonical' value' proof' result_ty' body')) } }
+  where
+    zonk_canonical :: SourceLetRhs -> ZonkTcM SourceLetRhs
+    zonk_canonical (PendingSourceLetRhs (TcEvBinds var) rhs) = do
+      needs <- case var of
+        EvBindsVar { ebv_binds = ref } -> ebs_needs <$> readTcRef ref
+        CoEvBindsVar { ebv_needs = ref } -> readTcRef ref
+      if proof `elemVarSet` needs
+        then CheckedSourceLetRhs . Just <$> zonkCoreExpr rhs
+        else return (CheckedSourceLetRhs Nothing)
+    zonk_canonical PendingSourceLetRhs{} =
+      panic "NativeLetAlias: pending RHS has immutable evidence"
+    zonk_canonical (CheckedSourceLetRhs rhs) =
+      CheckedSourceLetRhs <$> traverse zonkCoreExpr rhs
 
 zonkExpr e@(XExpr (ConLikeTc {}))
   = return e
@@ -1241,7 +1365,13 @@ zonkCoFn (WpFun w arg res t1 t2) =
      ; t1' <- noBinders $ zonkTcTypeToTypeX t1
      ; t2' <- noBinders $ zonkTcTypeToTypeX t2
      ; return (WpFun w' arg' res' t1' t2') }
-zonkCoFn (WpCast co)   = WpCast  <$> noBinders (zonkCoToCo co)
+zonkCoFn (WpRetainedFun force_eta b w) = noBinders $
+  runZonkBndrT (WpRetainedFun force_eta <$> zonkIdBndrX b <*> zonkCoFn w) return
+zonkCoFn (WpExistsPack schema witness) = noBinders $
+  WpExistsPack <$> zonkTcTypeToTypeX schema <*> zonkTcTypeToTypeX witness
+zonkCoFn (WpCast co)   = WpCast <$> noBinders
+                          (mapNativeIndexCastCoM zonkCoToCo co)
+  -- See Note [Zonking nominal native index casts] in GHC.Core.Coercion.
 zonkCoFn (WpEvLam ev)  = WpEvLam <$> zonkEvBndrX ev
 zonkCoFn (WpEvApp arg) = WpEvApp <$> noBinders (zonkEvTerm arg)
 zonkCoFn (WpTyLam tv)  = assert (isImmutableTyVar tv) $
@@ -1562,6 +1692,7 @@ zonk_pat p@(ConPat { pat_con = L con_loc con
                      , cpt_dicts = evs
                      , cpt_binds = binds
                      , cpt_wrap = wrapper
+                     , cpt_ordered_binds = ordered_binds
                      , cpt_arg_tys = tys
                      })
                    })
@@ -1571,10 +1702,28 @@ zonk_pat p@(ConPat { pat_con = L con_loc con
           -- Must zonk the existential variables, because their
           -- /kind/ need potential zonking.
           -- cf typecheck/should_compile/tc221.hs
+        -- The result coercion can refer to the selected field Id.
+        ; retained_args <- case con of
+            RealDataCon dc | dataConHasRetainedResult dc -> Just <$> zonkConStuff args
+            _ -> pure Nothing
         ; new_evs     <- zonkEvBndrsX evs
-        ; new_binds   <- zonkTcEvBinds binds
-        ; new_wrapper <- zonkCoFn wrapper
-        ; new_args    <- zonkConStuff args
+        ; (new_binds, new_wrapper, new_args, new_ordered) <- case con of
+            _ | Just args' <- retained_args ->
+                do { binds' <- zonkTcEvBinds binds
+                   ; pure (binds', wrapper, args', []) }
+            _ | not (null ordered_binds), PrefixCon x pats <- args ->
+                do { binds' <- zonkTcEvBinds binds
+                   ; (pats', scopes) <- zonkOrderedConPats 0 pats ordered_binds
+                   ; pure (binds', wrapper, PrefixCon x pats', scopes) }
+            RealDataCon dc | dataConHasTrailingContext dc ->
+              do { wrapper' <- zonkCoFn wrapper
+                 ; args' <- zonkConStuff args
+                 ; binds' <- zonkTcEvBinds binds
+                 ; pure (binds', wrapper', args', []) }
+            _ -> do { binds' <- zonkTcEvBinds binds
+                    ; wrapper' <- zonkCoFn wrapper
+                    ; args' <- zonkConStuff args
+                    ; pure (binds', wrapper', args', []) }
         ; new_con     <- case con of
             RealDataCon {} -> return con
               -- Data constructors never contain metavariables: they are
@@ -1590,6 +1739,7 @@ zonk_pat p@(ConPat { pat_con = L con_loc con
                    , cpt_dicts = new_evs
                    , cpt_binds = new_binds
                    , cpt_wrap = new_wrapper
+                   , cpt_ordered_binds = new_ordered
                    }
                  }
         }
@@ -1637,14 +1787,31 @@ zonk_pat (XPat ext) = case ext of
     do { pat' <- zonk_pat pat
        ; return $ XPat $ ExpansionPat orig pat' }
   ; CoPat co_fn pat ty ->
+    -- See Note [Eliminating reflexive CoPats] in GHC.HsToCore.Match.
     do { co_fn'   <- zonkCoFn co_fn
        ; pat'     <- zonk_pat pat
        ; ty'      <- noBinders $ zonkTcTypeToTypeX ty
-       ; return (XPat $ CoPat co_fn' pat' ty')
-       } }
+       ; return $ if is_refl_wrap co_fn'
+                  then pat'
+                  else XPat $ CoPat co_fn' pat' ty' }
+  ; NativeExistsPat ty witness payload ev_binds pat ->
+    do { ty' <- noBinders $ zonkTcTypeToTypeX ty
+       ; witness' <- zonkTyBndrX witness
+       ; payload' <- zonkIdBndrX payload
+       ; ev_binds' <- zonkTcEvBinds ev_binds
+       ; pat' <- zonk_pat pat
+       ; return (XPat $ NativeExistsPat ty' witness' payload' ev_binds' pat') } }
 
 zonk_pat pat@(SplicePat {}) = pprPanic "zonk_pat" (ppr pat)
 zonk_pat pat@(QualLitPat {}) = pprPanic "zonk_pat" (ppr pat)
+
+is_refl_wrap :: HsWrapper -> Bool
+is_refl_wrap WpHole            = True
+is_refl_wrap (WpCast co)       = isReflCo co
+is_refl_wrap (WpCompose w1 w2) = is_refl_wrap w1 && is_refl_wrap w2
+is_refl_wrap (WpSubType w)     = is_refl_wrap w
+is_refl_wrap (WpLet evs)       = isEmptyTcEvBinds evs
+is_refl_wrap _                 = False
 
 ---------------------------
 zonkConStuff :: HsConPatDetails GhcTc
@@ -1667,6 +1834,17 @@ zonkConStuff (RecCon xx (HsRecFields x rpats dd))
         -- Field selectors have declared types; hence no zonking
 
 ---------------------------
+-- | Zonk each context after the patterns that can bind its evidence.
+zonkOrderedConPats :: Int -> [LPat GhcTc] -> [(Int, TcEvBinds)]
+                   -> ZonkBndrTcM ([LPat GhcTc], [(Int, TcEvBinds)])
+zonkOrderedConPats _ pats [] = (, []) <$> zonkPats pats
+zonkOrderedConPats entered pats ((n, evs) : groups) = do
+  let (before, after) = splitAt (n - entered) pats
+  before' <- zonkPats before
+  evs' <- zonkTcEvBinds evs
+  (after', groups') <- zonkOrderedConPats n after groups
+  return (before' ++ after', (n, evs') : groups')
+
 zonkPats :: Traversable f => f (LPat GhcTc) -> ZonkBndrTcM (f (LPat GhcTc))
 zonkPats = traverse zonkPat
 {-# SPECIALISE zonkPats :: [LPat GhcTc] -> ZonkBndrTcM [LPat GhcTc] #-}
@@ -1820,12 +1998,23 @@ zonkEvTerm (EvTypeable ty ev)
   = EvTypeable <$> zonkTcTypeToTypeX ty <*> zonkEvTypeable ev
 zonkEvTerm (EvFun { et_tvs = tvs, et_given = evs
                   , et_binds = ev_binds, et_body = body_id })
-  = runZonkBndrT (zonkTyBndrsX tvs)       $ \ new_tvs      ->
+  = runZonkBndrT (zonk_foralls tvs)       $ \ new_tvs      ->
     runZonkBndrT (zonkEvBndrsX evs)       $ \ new_evs      ->
     runZonkBndrT (zonkTcEvBinds ev_binds) $ \ new_ev_binds ->
   do { new_body_id  <- zonkIdOcc body_id
      ; return (EvFun { et_tvs = new_tvs, et_given = new_evs
                      , et_binds = new_ev_binds, et_body = new_body_id }) }
+  where
+    -- See Note [Runtime forall matchability] in GHC.Tc.Utils.Instantiate.
+    zonk_foralls :: [(TcEvBinds, CoercionN, TyCoVar)]
+                 -> ZonkBndrTcM [(TcEvBinds, CoercionN, TyCoVar)]
+    zonk_foralls [] = pure []
+    zonk_foralls ((binds, ma_co, tv) : rest)
+      = do { binds' <- zonkTcEvBinds binds
+           ; ma_co' <- noBinders (zonkCoToCo ma_co)
+           ; tv' <- if isCoVar tv then zonkEvBndrX tv else zonkTyBndrX tv
+           ; rest' <- zonk_foralls rest
+           ; pure ((binds', ma_co', tv') : rest') }
 
 zonkCoreExpr :: CoreExpr -> ZonkTcM CoreExpr
 zonkCoreExpr (Var v)
@@ -1841,7 +2030,8 @@ zonkCoreExpr (Type ty)
     = Type <$> zonkTcTypeToTypeX ty
 
 zonkCoreExpr (Cast e co)
-    = Cast <$> zonkCoreExpr e <*> zonkCoToCo co
+    = Cast <$> zonkCoreExpr e <*> mapNativeIndexCastCoM zonkCoToCo co
+    -- See Note [Zonking nominal native index casts] in GHC.Core.Coercion.
 zonkCoreExpr (Tick t e)
     = Tick t <$> zonkCoreExpr e -- Do we need to zonk in ticks?
 
@@ -1859,6 +2049,14 @@ zonkCoreExpr (Case scrut b ty alts)
          ; runZonkBndrT (zonkIdBndrX b) $ \ b' ->
       do { alts' <- mapM zonkCoreAlt alts
          ; return $ Case scrut' b' ty' alts' } }
+zonkCoreExpr (Pack schema witness payload)
+    = Pack <$> zonkTcTypeToTypeX schema
+           <*> zonkTcTypeToTypeX witness <*> zonkCoreExpr payload
+zonkCoreExpr (Unpack witness payload package body)
+    = do { package' <- zonkCoreExpr package
+         ; runZonkBndrT (zonkTyBndrX witness) $ \witness' ->
+           runZonkBndrT (zonkIdBndrX payload) $ \payload' ->
+             Unpack witness' payload' package' <$> zonkCoreExpr body }
 
 zonkCoreAlt :: CoreAlt -> ZonkTcM CoreAlt
 zonkCoreAlt (Alt dc bndrs rhs)
@@ -1893,11 +2091,13 @@ zonkEvTypeable (EvTypeableTyApp t1 t2)
   = do { t1' <- zonkEvTerm t1
        ; t2' <- zonkEvTerm t2
        ; return (EvTypeableTyApp t1' t2') }
-zonkEvTypeable (EvTypeableTrFun tm t1 t2)
-  = do { tm' <- zonkEvTerm tm
+zonkEvTypeable (EvTypeableTrFun ma tm t1 t2)
+  -- See Note [Typeable evidence terms] in GHC.Tc.Types.Evidence.
+  = do { ma' <- zonkEvTerm ma
+       ; tm' <- zonkEvTerm tm
        ; t1' <- zonkEvTerm t1
        ; t2' <- zonkEvTerm t2
-       ; return (EvTypeableTrFun tm' t1' t2') }
+       ; return (EvTypeableTrFun ma' tm' t1' t2') }
 zonkEvTypeable (EvTypeableTyLit t1)
   = do { t1' <- zonkEvTerm t1
        ; return (EvTypeableTyLit t1') }

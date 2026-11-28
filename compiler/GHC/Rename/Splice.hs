@@ -6,7 +6,7 @@ module GHC.Rename.Splice (
         -- Typed splices
         rnTypedSplice,
         -- Untyped splices
-        rnSpliceType, rnUntypedSpliceExpr, rnSplicePat, rnSpliceTyPat, rnSpliceDecl,
+        rnSpliceType, rnSpliceTypeWith, rnUntypedSpliceExpr, rnSplicePat, rnSpliceTyPat, rnSpliceDecl,
 
         -- Brackets
         rnTypedBracket, rnUntypedBracket,
@@ -58,6 +58,7 @@ import {-# SOURCE #-} GHC.Tc.Gen.Splice
     , runMetaE
     , runMetaP
     , runMetaT
+    , runMetaTWithIndices
     , tcTopSpliceExpr
     )
 
@@ -388,7 +389,7 @@ recordPendingSplice sp pn (RnPending ref) = do
 recordPendingSplice sp pn (RnPendingTyped) = do
   let typed_splice = XTypedSplice pn
   return (HsTypedSplice (HsTypedSpliceNested sp) typed_splice)
-recordPendingSplice _ _ (TcPending _ _ _) = panic "impossible"
+recordPendingSplice _ _ (TcPending _ _ _ _) = panic "impossible"
 
 ------------------
 mkQuasiQuoteExpr :: UntypedSpliceFlavour -> LIdP GhcRn
@@ -467,9 +468,11 @@ rnTypedSplice sp@(HsTypedSpliceExpr _ expr)
                 ; traceRn "rnTypedSplice: typed expression splice" empty
                 ; lcl_rdr <- getLocalRdrEnv
                 ; gbl_rdr <- getGlobalRdrEnv
+                  -- See Note [Typed splices and source table dependencies].
                 ; let gbl_names = mkNameSet [ greName gre
                                             | gre <- globalRdrEnvElts gbl_rdr
-                                            , isLocalGRE gre]
+                                            , isLocalGRE gre
+                                            , Nothing <- [sourceTableTermOcc (greOccName gre)]]
                       lcl_names = mkNameSet (localRdrEnvElts lcl_rdr)
                       fvs2      = lcl_names `plusFN` gbl_names
 
@@ -477,6 +480,20 @@ rnTypedSplice sp@(HsTypedSpliceExpr _ expr)
   where
     rn_splice :: RnM (LHsExpr GhcRn, FreeNames)
     rn_splice = rnLExpr expr
+
+{- Note [Typed splices and source table dependencies]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A typed splice can refer to any ordinary local declaration. Do not add a
+private source-table name to this conservative set of free variables.
+The table is a candidate until the typechecker checks the function's
+equations. A use of its private name asks the typechecker to produce
+the equations. Otherwise a splice such as $$(one) could make an
+unrelated runtime function require type-level equations.
+
+Keep the actual free variables of the splice expression in fvs1.
+Keep the user-visible term that owns the table in gbl_names.
+See Note [Ordering local source tables] in GHC.Rename.Module.
+-}
 
 rnUntypedSpliceExpr :: HsUntypedSplice GhcPs -> RnM (HsExpr GhcRn, FreeNames)
 rnUntypedSpliceExpr splice
@@ -663,7 +680,14 @@ References:
 
 ----------------------
 rnSpliceType :: HsUntypedSplice GhcPs -> RnM (HsType GhcRn, FreeNames)
-rnSpliceType splice
+rnSpliceType = rnSpliceTypeWith [] (\ty -> rnLHsType (SpliceTypeCtx ty) ty)
+
+-- | Rename a type splice with a continuation that checks its parsed result.
+-- Run the splice and retain its finalizers through the ordinary pipeline.
+rnSpliceTypeWith :: [Name]
+                 -> (LHsType GhcPs -> RnM (LHsType GhcRn, FreeNames))
+                 -> HsUntypedSplice GhcPs -> RnM (HsType GhcRn, FreeNames)
+rnSpliceTypeWith indices rename_result splice
   = rnUntypedSpliceGen run_type_splice pend_type_splice splice
   where
     pend_type_splice
@@ -674,10 +698,9 @@ rnSpliceType splice
     run_type_splice rn_splice
       = do { traceRn "rnSpliceType: untyped type splice" empty
            ; (hs_ty2, mod_finalizers) <-
-                runRnSplice UntypedTypeSplice runMetaT ppr rn_splice
-           ; (hs_ty3, fvs) <- do { let doc = SpliceTypeCtx hs_ty2
-                                 ; checkNoErrs $ rnLHsType doc hs_ty2 }
-                                         -- checkNoErrs: see Note [Renamer errors]
+                runRnSplice UntypedTypeSplice (runMetaTWithIndices indices) ppr rn_splice
+           ; (hs_ty3, fvs) <- checkNoErrs $ rename_result hs_ty2
+                 -- checkNoErrs: see Note [Renamer errors]
 
              -- See Note [Delaying modFinalizers in untyped splices].
            ; return ( HsSpliceTy (HsUntypedSpliceTop (ThModFinalizers mod_finalizers)

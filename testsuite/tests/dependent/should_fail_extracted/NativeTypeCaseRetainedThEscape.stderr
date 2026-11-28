@@ -1,0 +1,8 @@
+NativeTypeCaseRetainedThEscape.hs:8:70: error: [GHC-76037]
+    • Not in scope: type variable ‘field’
+    • In the Template Haskell quotation:
+        [t| foreach (b :: Maybe Bool) ->
+            case b of
+              Just field -> Proxy field
+              Nothing -> Proxy field |]
+

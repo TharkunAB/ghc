@@ -32,9 +32,11 @@ import GHC.Driver.Backend
 
 import GHC.Hs
 
+import {-# SOURCE #-} GHC.Tc.Gen.App (RuleAppPrefix(..), tcRuleAppPrefix)
 import {-# SOURCE #-} GHC.Tc.Gen.Expr  ( tcInferRho, tcCheckMonoExpr )
 
 import GHC.Tc.Errors.Types
+import GHC.Tc.Gen.SourceTable (withSourceProofSignature)
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Solver( reportUnsolvedEqualities, pushLevelAndSolveEqualitiesX
                     , emitResidualConstraints )
@@ -46,7 +48,7 @@ import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.Unify( DeepSubsumptionFlag(..), tcSkolemise, unifyType, buildImplicationFor )
-import GHC.Tc.Utils.Instantiate( topInstantiate, tcInstTypeBndrs )
+import GHC.Tc.Utils.Instantiate( topInstantiate, tcInstType, tcInstTypeBndrs )
 import GHC.Tc.Utils.Env
 
 import GHC.Tc.Types.Origin
@@ -57,11 +59,15 @@ import GHC.Tc.Types.Constraint
 import GHC.Tc.Zonk.TcType
 import GHC.Tc.Zonk.Type
 
-import GHC.Core( hasSomeUnfolding )
+import GHC.Core( Expr(Type, Var), hasSomeUnfolding )
+import GHC.Core.Dependent ( hasNativeDependentExpr, hasRetainedRuleHead )
+import GHC.Core.DataCon ( dataConName )
+import GHC.Core.Utils ( applyTypeToArgs )
+import GHC.Core.Unify ( matchBindTv, tcMatchRetainedTyX_BM )
 import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.Predicate
-import GHC.Core.TyCo.Rep( mkNakedFunTy )
+import GHC.Core.TyCo.Rep( Type(DepFunTy), mkNakedFunTy )
 import GHC.Core.TyCon( isTypeFamilyTyCon )
 
 import GHC.Types.Var
@@ -72,8 +78,13 @@ import GHC.Types.InlinePragma
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Env
+import GHC.Types.Name.Reader (unLocWithUserRdr)
+import GHC.Types.Name.Set
 import GHC.Types.SrcLoc
 
+import GHC.Builtin.WiredIn.Types (boolTyConName, charTyConName, falseDataCon, intTyConName,
+                                 stringTyConName, trueDataCon, unmatchableDataConTy)
+import GHC.Builtin.Modules (mkGhcInternalModule)
 import GHC.Builtin( mkUnboundName )
 import GHC.Unit.Module( Module, getModule )
 
@@ -84,10 +95,11 @@ import GHC.Utils.Panic
 import GHC.Data.Bag
 import GHC.Data.Maybe( orElse, whenIsJust )
 
-import Control.Monad( unless )
+import Control.Monad( unless, when )
 import Data.Foldable ( toList )
 import qualified Data.List.NonEmpty as NE
-import Data.Maybe( mapMaybe )
+import Data.Maybe( fromMaybe, mapMaybe )
+import Data.Data (Data, cast, gmapQ)
 
 {- -------------------------------------------------------------
           Note [Overview of type signatures]
@@ -219,8 +231,22 @@ tcUserTypeSig :: SrcSpan -> LHsSigWcType GhcRn -> Maybe Name -> TcM TcIdSig
 -- Just n  => Function type signature       name :: type
 -- Nothing => Expression type signature   <expr> :: type
 tcUserTypeSig loc hs_sig_ty mb_name
+  | HsWC { hswc_body = L _ (HsSig { sig_body = body }) } <- hs_sig_ty
+  , hsHasForEachTy (unLoc body)
+  , not (isCompleteHsSig hs_sig_ty)
+  = failWithTc $ TcRnRetainedQuantificationError RetainedPartialSignature
+
   | isCompleteHsSig hs_sig_ty
-  = do { sigma_ty <- tcHsSigWcType ctxt_no_rrc hs_sig_ty
+  = do { -- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
+         let allow_function = case mb_name of
+               Just _ -> True
+               Nothing -> False
+       ; sigma_ty <- withSourceProofSignature mb_name $ tcHsSigWcType allow_function ctxt_no_rrc hs_sig_ty
+       ; when (isExternalName name && closedSourceProofResult hs_sig_ty) $ do
+           env <- getGblEnv
+           updTcRef (tcg_source_check env) $ \s ->
+             let r = scs_rule_uses s
+             in s { scs_rule_uses = r { sourceProofClosedResults = extendNameSet (sourceProofClosedResults r) name } }
        ; traceTc "tcuser" (ppr sigma_ty)
        ; return $ TcCompleteSig $
          CSig { sig_bndr  = mkLocalId name ManyTy sigma_ty
@@ -250,6 +276,36 @@ tcUserTypeSig loc hs_sig_ty mb_name
                Just n  -> FunSigCtxt n rcc
                Nothing -> ExprSigCtxt rcc
 
+-- | Check the written result of an observation before type checking can
+-- erase an alias or family. See Note [Source family evidence uses]
+-- in GHC.Tc.Gen.SourceTable.
+closedSourceProofResult :: LHsSigWcType GhcRn -> Bool
+closedSourceProofResult (HsWC { hswc_body = L _ (HsSig
+    { sig_bndrs = HsOuterImplicit { hso_ximplicit = [] }, sig_body = body }) })
+  = case unLoc (ignoreParens body) of
+      HsOpTy _ left op right
+        | Just eq <- ty_name op
+        , nameModule_maybe eq == Just equality_module
+        , occNameFS (nameOccName eq) == fsLit ":~:"
+        , Just con <- ty_name left
+        , con == dataConName trueDataCon || con == dataConName falseDataCon
+        -> ty_name right == Just con
+      _ -> closed_value_type body
+  where
+    closed_value_type :: LHsType GhcRn -> Bool
+    closed_value_type ty = case unLoc (ignoreParens ty) of
+      HsTyVar _ _ name ->
+        unLocWithUserRdr name `elem` [boolTyConName, charTyConName, intTyConName, stringTyConName]
+      HsListTy _ item -> closed_value_type item
+      _ -> False
+
+    equality_module = mkGhcInternalModule (fsLit "GHC.Internal.Data.Type.Equality")
+    ty_name :: LHsType GhcRn -> Maybe Name
+    ty_name ty = case unLoc (ignoreParens ty) of
+      HsTyVar _ _ name -> Just (unLocWithUserRdr name)
+      _ -> Nothing
+closedSourceProofResult _ = False
+
 lhsSigWcTypeContextSpan :: LHsSigWcType GhcRn -> ReportRedundantConstraints
 -- | Find the location of the top-level context of a HsType.  For example:
 --
@@ -265,6 +321,7 @@ lhsSigTypeContextSpan (L _ HsSig { sig_body = sig_ty }) = go sig_ty
   where
     go (L _ (HsQualTy { hst_ctxt = L span _ })) = WantRRC $ locA span -- Found it!
     go (L _ (HsForAllTy { hst_body = hs_ty })) = go hs_ty  -- Look under foralls
+    go (L _ HsForEachTy{}) = NoRRC  -- A retained binder introduces a value argument
     go (L _ (HsParTy _ hs_ty)) = go hs_ty  -- Look under parens
     go _ = NoRRC  -- Did not find it
 
@@ -282,53 +339,8 @@ isCompleteHsSig (HsWC { hswc_ext = wcs, hswc_body = hs_sig_ty })
 
 no_anon_wc_sig_ty :: LHsSigType GhcRn -> Bool
 no_anon_wc_sig_ty (L _ (HsSig{sig_bndrs = outer_bndrs, sig_body = body}))
-  =  all no_anon_wc_tvb (hsOuterExplicitBndrs outer_bndrs)
-  && no_anon_wc_ty body
-
-no_anon_wc_ty :: LHsType GhcRn -> Bool
-no_anon_wc_ty lty = go lty
-  where
-    go (L _ ty) = case ty of
-      HsWildCardTy _                 -> False
-      HsAppTy _ ty1 ty2              -> go ty1 && go ty2
-      HsAppKindTy _ ty ki            -> go ty && go ki
-      HsFunTy _ w ty1 ty2            -> go ty1 && go ty2 && go_mult w
-        where
-          go_mult (HsModifiedFunArr _ mods _) = all go_mod mods
-          go_mod (L _ (HsModifier _ ty)) = go ty
-      HsListTy _ ty                  -> go ty
-      HsTupleTy _ _ tys              -> gos tys
-      HsSumTy _ tys                  -> gos tys
-      HsOpTy _ ty1 tyop ty2          -> go tyop && go ty1 && go ty2
-      HsParTy _ ty                   -> go ty
-      HsIParamTy _ _ ty              -> go ty
-      HsKindSig _ ty kind            -> go ty && go kind
-      HsDocTy _ ty _                 -> go ty
-      HsExplicitListTy _ _ tys       -> gos tys
-      HsExplicitTupleTy _ _ tys      -> gos tys
-      HsForAllTy { hst_tele = tele
-                 , hst_body = ty } -> no_anon_wc_tele tele
-                                        && go ty
-      HsQualTy { hst_ctxt = ctxt
-               , hst_body = ty }  -> gos (hsc_ctxt $ unLoc ctxt) && go ty
-      HsSpliceTy (HsUntypedSpliceTop _ ty) _ -> go ty
-      HsSpliceTy (HsUntypedSpliceNested _) _ -> True
-      HsTyLit{} -> True
-      HsTyVar{} -> True
-      HsStarTy{} -> True
-      XHsType{} -> True       -- HsCoreTy, which does not have any wildcard
-
-    gos = all go
-
-no_anon_wc_tele :: HsForAllTelescope GhcRn -> Bool
-no_anon_wc_tele tele = case tele of
-  HsForAllVis   { hsf_vis_bndrs   = ltvs } -> all no_anon_wc_tvb ltvs
-  HsForAllInvis { hsf_invis_bndrs = ltvs } -> all no_anon_wc_tvb ltvs
-
-no_anon_wc_tvb :: LHsTyVarBndr flag GhcRn -> Bool
-no_anon_wc_tvb (L _ tvb) = case hsBndrKind tvb of
-  HsBndrNoKind _  -> True
-  HsBndrKind _ ki -> no_anon_wc_ty ki
+  =  all hsTyVarBndrHasNoAnonWildcards (hsOuterExplicitBndrs outer_bndrs)
+  && hsTypeHasNoAnonWildcards body
 
 {- Note [Fail eagerly on bad signatures]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -410,8 +422,9 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
                              -- "open" because a (literal) pattern can be unlifted;
                              -- e.g. pattern Zero <- 0#   (#12094)
                    -- See Note [Escaping kind in type signatures] in GHC.Tc.Gen.HsType
+                 ; tcCheckRuntimeForAllMatchability (hsOuterMatchability hs_outer_bndrs)
                  ; tcOuterTKBndrs skol_info hs_outer_bndrs   $
-                   tcExplicitTKBndrs skol_info ex_hs_tvbndrs $
+                   tcRuntimeInvisForAllTelescopes skol_info ex_hs_tvbndrs $
                    do { req     <- tcHsContext hs_req
                       ; prov    <- tcHsContext hs_prov
                       ; body_ty <- tcCheckLHsType hs_body_ty res_kind
@@ -461,7 +474,7 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
        -- Note that, in practice, reducible type family applications will have
        -- been reduced already, due to the logic described in
        -- Note [Prevent unification with type families] in GHC.Tc.Utils.Unify.
-       ; let (arg_tys, res_ty) = tcSplitFunTys body_ty
+       ; let (_mas, arg_tys, res_ty) = tcSplitFunTys body_ty
        ; mapM_
            (\(Scaled _ arg_ty) -> checkTypeHasFixedRuntimeRep FixedRuntimeRepPatSynSigArg arg_ty)
            arg_tys
@@ -487,10 +500,10 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
     ctxt = PatSynCtxt name
 
     build_patsyn_type implicit_bndrs univ_bndrs req ex_bndrs prov body
-      = mkInvisForAllTys implicit_bndrs $
-        mkInvisForAllTys univ_bndrs $
+      = mkInvisForAllTys [(unmatchableDataConTy,b) | b <- implicit_bndrs] $
+        mkInvisForAllTys [(unmatchableDataConTy,b) | b <- univ_bndrs] $
         mk_naked_phi_ty req $
-        mkInvisForAllTys ex_bndrs $
+        mkInvisForAllTys [(unmatchableDataConTy,b) | b <- ex_bndrs] $
         mk_naked_phi_ty prov $
         body
 
@@ -500,7 +513,7 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
     -- (We also called build_patsyn_type on the fully zonked type, so mkPhiTy
     --  would work; but it doesn't seem worth duplicating the code.)
     mk_naked_phi_ty :: [TcPredType] -> TcType -> TcType
-    mk_naked_phi_ty theta body = foldr (mkNakedFunTy invisArgTypeLike) body theta
+    mk_naked_phi_ty theta body = foldr (mkNakedFunTy unmatchableDataConTy invisArgTypeLike) body theta
 
 ppr_tvs :: [TyVar] -> SDoc
 ppr_tvs tvs = braces (vcat [ ppr tv <+> dcolon <+> ppr (tyVarKind tv)
@@ -514,9 +527,9 @@ ppr_tvs tvs = braces (vcat [ ppr tv <+> dcolon <+> ppr (tyVarKind tv)
 ********************************************************************* -}
 
 
-tcInstSig :: TcIdSig -> TcM TcIdSigInst
--- Instantiate a type signature; only used with plan InferGen
-tcInstSig hs_sig@(TcCompleteSig (CSig { sig_bndr = poly_id, sig_loc = loc }))
+-- | Instantiate a signature for the caller's inference plan.
+tcInstSig :: PendingSigCalls -> TcIdSig -> TcM TcIdSigInst
+tcInstSig _ hs_sig@(TcCompleteSig (CSig { sig_bndr = poly_id, sig_loc = loc }))
   = setSrcSpan loc $  -- Set the binding site of the tyvars
     do { (tv_prs, theta, tau) <- tcInstTypeBndrs (idType poly_id)
               -- See Note [Pattern bindings and complete signatures]
@@ -524,21 +537,23 @@ tcInstSig hs_sig@(TcCompleteSig (CSig { sig_bndr = poly_id, sig_loc = loc }))
        ; return (TISI { sig_inst_sig   = hs_sig
                       , sig_inst_skols = tv_prs
                       , sig_inst_wcs   = []
+                      , sig_inst_calls = []
                       , sig_inst_wcx   = Nothing
                       , sig_inst_theta = theta
                       , sig_inst_tau   = tau }) }
 
-tcInstSig hs_sig@(TcPartialSig (PSig { psig_hs_ty = hs_ty
+tcInstSig call_owner hs_sig@(TcPartialSig (PSig { psig_hs_ty = hs_ty
                                      , psig_ctxt = ctxt
                                      , psig_loc = loc }))
   = setSrcSpan loc $  -- Set the binding site of the tyvars
     do { traceTc "Staring partial sig {" (ppr hs_sig)
-       ; (wcs, wcx, tv_prs, theta, tau) <- tcHsPartialSigType ctxt hs_ty
+       ; (wcs, wcx, tv_prs, theta, tau, calls) <- tcHsPartialSigType call_owner ctxt hs_ty
          -- See Note [Checking partial type signatures] in GHC.Tc.Gen.HsType
 
        ; let inst_sig = TISI { sig_inst_sig   = hs_sig
                              , sig_inst_skols = tv_prs
                              , sig_inst_wcs   = wcs
+                             , sig_inst_calls = calls
                              , sig_inst_wcx   = wcx
                              , sig_inst_theta = theta
                              , sig_inst_tau   = tau }
@@ -650,6 +665,16 @@ addInlinePrags poly_id prags_for_me
          let dia = TcRnMultipleInlinePragmas poly_id inl1 (inl2 NE.:| inls)
          in addDiagnosticTc dia
 
+
+{- Note [Retained SPECIALISE pragmas]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Source SPECIALISE uses the ordinary pragma checking and desugaring path.
+Reject a retained signature at the pragma's location before entering
+that path. The native scanner also finds retained indices inside an
+ordinary arrow type. The optimizer's generated dictionary specializations
+have a separate boundary. See Note [Exported retained specialisations]
+in GHC.Core.Rules.
+-}
 
 {- Note [Pattern synonym inline arity]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -962,6 +987,12 @@ tcSpecPrags :: Id -> [LSig GhcRn]
 -- Reason: required by tcSubExp
 tcSpecPrags poly_id prag_sigs
   = do { traceTc "tcSpecPrags" (ppr poly_id <+> ppr spec_sigs)
+       ; -- See Note [Retained SPECIALISE pragmas].
+         case spec_sigs of
+           L loc _ : _ | hasNativeDependentExpr (Type (idType poly_id))
+             -> setSrcSpanA loc $
+                failWithTc (TcRnRetainedQuantificationError RetainedPragma)
+           _ -> return ()
        ; whenIsJust (NE.nonEmpty bad_sigs) warn_discarded_sigs
        ; pss <- mapAndRecoverM (wrapLocMA (tcSpecPrag poly_id)) spec_sigs
        ; return $ concatMap (\(L l ps) -> map (L (locA l)) ps) pss }
@@ -1007,7 +1038,7 @@ tcSpecPrag poly_id (SpecSigE nm rule_bndrs spec_e inl)
        ; traceTc "tcSpecPrag SpecSigE {" (ppr nm $$ ppr spec_e)
        ; skol_info <- mkSkolemInfo skol_info_anon
        ; (rhs_tclvl, spec_e_wanted, (rule_bndrs', (tc_spec_e, _rho)))
-            <- tcRuleBndrs skol_info rule_bndrs $
+            <- tcRuleBndrs skol_info Nothing rule_bndrs $ \_ ->
                tcInferRho spec_e
 
          -- (2) Solve the resulting wanteds
@@ -1108,6 +1139,7 @@ tcImpSpec this_mod prag
  , not (nameIsLocalOrFrom this_mod name)  -- The Id is imported
  = do { id <- tcLookupId name
       ; if hasSomeUnfolding (realIdUnfolding id)
+           && not (hasNativeDependentExpr (Type (idType id)))
            -- See Note [SPECIALISE pragmas for imported Ids]
         then tcSpecPrag id prag
         else do { let dia = TcRnSpecialiseNotVisible name
@@ -1229,8 +1261,8 @@ tcRule (HsRule { rd_ext  = ext
        ; skol_info <- mkSkolemInfo (RuleSkol name_fs)
         -- Note [Typechecking rules]
        ; (tc_lvl, lhs_wanted, stuff)
-              <- tcRuleBndrs skol_info bndrs $
-                 do { (lhs', rule_ty)    <- tcInferRho lhs
+              <- tcRuleBndrs skol_info (Just lhs) bndrs $ \checked_lhs ->
+                 do { (lhs', rule_ty)    <- fromMaybe (tcInferRho lhs) checked_lhs
                     ; (rhs', rhs_wanted) <- captureConstraints $
                                             tcCheckMonoExpr rhs rule_ty
                     ; return (lhs', rule_ty, rhs', rhs_wanted) }
@@ -1313,35 +1345,86 @@ tcRule (HsRule { rd_ext  = ext
 *                                                                                 *
 ******************************************************************************** -}
 
-tcRuleBndrs :: SkolemInfo -> RuleBndrs GhcRn
-            -> TcM a      -- Typecheck this with the rule binders in scope
+tcRuleBndrs :: SkolemInfo -> Maybe (LHsExpr GhcRn) -> RuleBndrs GhcRn
+            -> (Maybe (TcM (LHsExpr GhcTc, TcRhoType)) -> TcM a)
             -> TcM (TcLevel, WantedConstraints, ([Var], a))
                         -- The [Var] are the explicitly-quantified variables,
                         -- both type variables and term variables
-tcRuleBndrs skol_info (RuleBndrs { rb_tyvs = mb_tv_bndrs, rb_tmvs = tm_bndrs })
+tcRuleBndrs skol_info mb_lhs (RuleBndrs { rb_tyvs = mb_tv_bndrs, rb_tmvs = tm_bndrs })
             thing_inside
   = pushLevelAndCaptureConstraints $
     case mb_tv_bndrs of
-      Nothing       ->  go_tms tm_bndrs thing_inside
+      Nothing       ->  check_terms
       Just tv_bndrs -> do { (bndrs1, (bndrs2, res)) <- go_tvs tv_bndrs $
-                                                       go_tms tm_bndrs $
-                                                       thing_inside
+                                                       check_terms
                           ; return (binderVars bndrs1 ++ bndrs2, res) }
   where
     --------------
     go_tvs tvs thing_inside = bindExplicitTKBndrs_Skol skol_info tvs thing_inside
 
+    check_terms
+      | Just lhs <- mb_lhs
+      , Just (head_name, operands) <- ruleAppSpine lhs
+      = do { mb_fun <- tcLookupIdMaybe head_name
+           ; case mb_fun of
+               Just fun | hasRetainedRuleHead fun -> check_app lhs fun operands
+               _ -> check_with no_domain }
+      | otherwise = check_with no_domain
+
+    no_domain _ _ = Nothing
+    check_with domain = go_tms domain emptyNameEnv tm_bndrs (const (thing_inside Nothing))
+
+    check_app lhs fun operands
+      | (values, ty_arg : _) <- break ruleTypeOperand operands
+      , let (_, later) = split_binders (values ++ [ty_arg]) tm_bndrs
+      , any unsigned later
+      = do { (sigma, prefix) <- tcRuleAppPrefix lhs
+           ; check_prefix (setVarType fun sigma) prefix operands emptyNameEnv tm_bndrs }
+      | otherwise
+      = do { domain <- domain_for fun (takeWhile (not . ruleTypeOperand) operands)
+           ; check_with domain }
+
+    check_prefix fun prefix operands scope bndrs =
+      case (prefix, break ruleTypeOperand operands) of
+        (CheckRulePrefix next, (values, ty_arg : rest)) ->
+          do { domain <- domain_for fun values
+             ; let (earlier, later) = split_binders (values ++ [ty_arg]) bndrs
+             ; (first, (last_bndrs, result)) <- go_tms domain scope earlier $ \scope' ->
+                 do { (sigma, checked) <- next
+                    ; check_prefix (setVarType fun sigma) checked rest scope' later }
+             ; return (first ++ last_bndrs, result) }
+        (FinishRuleApp finish, (values, [])) ->
+          do { domain <- domain_for fun values
+             ; go_tms domain scope bndrs (const (thing_inside (Just finish))) }
+        _ -> panic "tcRuleBndrs: inconsistent rule application prefix"
+
+    domain_for fun operands = ruleBinderDomain fun [arg | Right arg <- operands]
+
+    split_binders prefix bndrs = (reverse rest, reverse suffix)
+      where
+        names = unionNameSets (map rulePrefixNames prefix)
+        (suffix, rest) = span (all (\n -> not (n `elemNameSet` names)) . binder_names . unLoc)
+                              (reverse bndrs)
+    unsigned (L _ RuleBndr{}) = True
+    unsigned _ = False
+    binder_names :: RuleBndr GhcRn -> [Name]
+    binder_names (RuleBndr _ (L _ n)) = [n]
+    binder_names (RuleBndrSig _ (L _ n) (HsPS { hsps_ext = ext })) =
+      n : hsps_nwcs ext ++ hsps_imp_tvs ext
+
     --------------
-    go_tms [] thing_inside
-      = do { res <- thing_inside; return ([], res) }
-    go_tms (L _ (RuleBndr _ (L _ name)) : rule_bndrs) thing_inside
-      = do  { ty <- newOpenFlexiTyVarTy
+    go_tms :: (NameEnv Id -> Name -> Maybe Type) -> NameEnv Id -> [LRuleBndr GhcRn]
+           -> (NameEnv Id -> TcM b) -> TcM ([Var], b)
+    go_tms _ scope [] thing_inside
+      = do { res <- thing_inside scope; return ([], res) }
+    go_tms domain scope (L _ (RuleBndr _ (L _ name)) : rule_bndrs) thing_inside
+      = do  { ty <- maybe newOpenFlexiTyVarTy return (domain scope name)
             ; let bndr_id = mkLocalId name ManyTy ty
             ; (bndrs, res) <- tcExtendIdEnv [bndr_id] $
-                              go_tms rule_bndrs thing_inside
+                              go_tms domain (extendNameEnv scope name bndr_id) rule_bndrs thing_inside
             ; return (bndr_id : bndrs, res) }
 
-    go_tms (L _ (RuleBndrSig _ (L _ name) rn_ty) : rule_bndrs) thing_inside
+    go_tms domain scope (L _ (RuleBndrSig _ (L _ name) rn_ty) : rule_bndrs) thing_inside
       --  e.g         x :: a->a
       --  The tyvar 'a' is brought into scope first, just as if you'd written
       --              a::*, x :: a->a
@@ -1354,8 +1437,115 @@ tcRuleBndrs skol_info (RuleBndrs { rb_tyvs = mb_tv_bndrs, rb_tmvs = tm_bndrs })
                      -- The type variables scope over subsequent bindings; yuk
             ; (bndrs, res) <- tcExtendNameTyVarEnv tv_prs $
                               tcExtendIdEnv [bndr_id]     $
-                              go_tms rule_bndrs thing_inside
+                              go_tms domain (extendNameEnv scope name bndr_id) rule_bndrs thing_inside
             ; return (map snd tv_prs ++ bndr_id : bndrs, res) }
+
+-- | Read the RULE head and all written operands in source order.
+-- See Note [Dependent RULE binder domains].
+ruleAppSpine :: LHsExpr GhcRn
+             -> Maybe (Name, [Either (LHsWcType GhcRn) (LHsExpr GhcRn)])
+ruleAppSpine = go []
+  where
+    go args e = case unLoc (stripParensLHsExpr e) of
+      HsApp _ f x      -> go (Right x : args) f
+      OpApp _ x f y    -> go (Right x : Right y : args) f
+      HsAppType _ f ty -> go (Left ty : args) f
+      HsVar _ (L _ f)  -> Just (getName f, args)
+      _                -> Nothing
+
+-- | Find the same written type operands as looks_like_type_arg in GHC.Tc.Gen.App.
+ruleTypeOperand :: Either (LHsWcType GhcRn) (LHsExpr GhcRn) -> Bool
+ruleTypeOperand (Left _) = True
+ruleTypeOperand (Right arg) = case unLoc (stripParensLHsExpr arg) of
+  HsEmbTy{} -> True
+  _ -> False
+
+-- | Names needed before checking a RULE application prefix. The caller
+-- intersects these with the names introduced by this RULE.
+rulePrefixNames :: Data a => a -> NameSet
+rulePrefixNames thing
+  | Just name <- cast thing = unitNameSet name
+  | Just ty <- cast thing = mkNameSet (map getName (tyCoVarsOfTypeList ty))
+  | otherwise = unionNameSets (gmapQ rulePrefixNames thing)
+
+-- | Read a bare rule binder's expected type from a retained application.
+-- See Note [Dependent RULE binder domains].
+ruleBinderDomain :: Id -> [LHsExpr GhcRn] -> TcM (NameEnv Id -> Name -> Maybe Type)
+ruleBinderDomain fun args
+  = do { (inst, _, tau) <- tcInstType newMetaTyVars fun
+       ; let prefix_metas = filter (\v -> isTcTyVar v && isMetaTyVar v) (tyCoVarsOfTypeList (idType fun))
+             candidates = mkVarSet (map snd inst ++ prefix_metas)
+       ; return (\scope name -> walk candidates scope name tau args) }
+  where
+    bare expr = case unLoc (stripParensLHsExpr expr) of
+      HsVar _ (L _ v) -> Just (getName v)
+      _               -> Nothing
+
+    walk tvs scope name ty (arg : args)
+      | DepFunTy DepFunVisible binder _ <- coreFullView ty
+      , Just operand <- bare arg
+      = if operand == name
+        then Just (idType binder)
+        else do { actual <- lookupNameEnv scope operand
+                ; specialized <- specialize tvs ty binder actual
+                ; if isNativeOpaqueValueId actual
+                  then walk tvs scope name (applyTypeToArgs specialized [Var actual]) args
+                  else Nothing }
+      | Just (input, result) <- splitVisibleFunTy_maybe ty
+      = if bare arg == Just name && isTauTy input && anyFreeVarsOfType in_scope input
+        then Just input
+        else walk tvs scope name result args
+      where in_scope v = isNonCoVarId v && getName v `elemNameEnv` scope
+    walk _ _ _ _ _ = Nothing
+
+    -- A signed earlier operand can specialize the head's erased parameters.
+    -- Match fresh signature parameters and metavariables in the checked
+    -- prefix. The match supplies a domain without assigning those variables.
+    specialize tvs ty binder actual
+      | idType binder `eqType` idType actual = Just ty
+      | otherwise = do
+          subst <- tcMatchRetainedTyX_BM (matchBindTv tvs) emptySubst (idType binder) (idType actual)
+          let ty' = substTyAddInScope subst ty
+          DepFunTy _ binder' _ <- pure (coreFullView ty')
+          if idType binder' `eqType` idType actual then Just ty' else Nothing
+
+{- Note [Dependent RULE binder domains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For a rule such as
+  forall b xs. keep b xs = xs
+the signature foreach (b :: Bool) -> Choice b -> Choice b gives both
+binders their types. An ordinary unification variable cannot acquire
+a free runtime Id. Give the binder its declared argument domain before
+checking the rule. Substitute only actual Ids bound earlier in the rule
+telescope. Explicit binder signatures take precedence.
+
+For a leading type application such as keepMaybe @a m x, first bind the
+rule variables that the written type arguments mention. Check that prefix
+with the normal application checker. Use the residual function type for
+subsequent binder domains. Finish the left side with the same checked
+head, arguments and evidence. This keeps the source locations and checks
+wildcards, constraints and splices once. The checker never inspects a
+value operand to discover its type.
+
+For a head such as keepBetween @Char p @Bool m x, bring p into scope
+after instantiating through @Char and before checking @Bool. Keep the
+checked head and preceding arguments when checking m and x. Their error positions
+include the earlier value arguments. A different occurrence of the same
+binder must also check at its inferred type. A type family in the domain
+can stay stuck throughout. No inverse family equation is needed.
+
+A required argument written as (type Bool) marks a prefix boundary as well.
+The herald changes the argument's syntax. The usual ITVDQ check reads the
+function type and decides whether the binder is required. The prepass does
+not elaborate the type. It uses the same checked prefix for the rule and
+checks a splice in the argument once. A required operand without a herald
+does not mark a prefix boundary.
+
+Checking each prefix in turn also lets an unsigned retained binder use the
+domain fixed by an earlier type operand. For example, in
+keepTwo tag (type Bool) m (type Char) n x, m gets type Maybe Bool before
+checking (type Char). Keep the order of the binders in the written forall.
+-}
 
 
 {-

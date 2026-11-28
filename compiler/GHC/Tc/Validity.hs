@@ -1,3 +1,5 @@
+{-# LANGUAGE RecursiveDo #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -5,13 +7,14 @@
 
 module GHC.Tc.Validity (
   Rank(..), UserTypeCtxt(..), checkValidType, checkValidMonoType,
-  checkValidTheta,
+  checkValidTheta, checkConstrainedSignature, checkAssociatedFamilyCoverage,
+  checkStandaloneFamilyCoverage,
   checkValidInstance, checkValidInstHead, validDerivPred,
   checkTySynRhs, checkEscapingKind,
   checkValidCoAxiom, checkValidCoAxBranch,
-  checkFamPatBinders, checkTyFamEqnValidityInfo,
+  checkFamPatBinders, checkTyFamEqnValidityInfo, typeCasePatternView,
   checkValidTyFamEqn, checkValidAssocTyFamDeflt, checkConsistentFamInst,
-  checkTyConTelescope,
+  checkTyConTelescope, ScopedSumDomainRequirement(..), scopedSumDomainRequirement,
   ) where
 
 import GHC.Prelude
@@ -20,17 +23,22 @@ import GHC.Data.FastString
 import GHC.Data.Maybe
 
 -- friends:
-import GHC.Tc.Utils.Unify    ( tcSubTypeAmbiguity )
-import GHC.Tc.Solver         ( simplifyAmbiguityCheck )
+import GHC.Tc.Utils.Unify    ( checkConstraints, tcSubTypeAmbiguity, unifyTypeAndEmit )
+import GHC.Tc.Utils.Instantiate ( tcInstSkolTyVarsX )
+import GHC.Tc.Solver         ( simplifyAmbiguityCheck, pushLevelAndSolveEqualities )
+import GHC.Tc.Solver.Monad   ( runTcS, setTcSMode, TcSMode(..), vanillaTcSMode )
+import GHC.Tc.Solver.Solve   ( solveWanteds )
 import GHC.Tc.Instance.Class ( matchGlobalInst, ClsInstResult(..), AssocInstInfo(..) )
 import GHC.Tc.Instance.FunDeps
 import GHC.Tc.Instance.Family
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.ErrCtxt
 import GHC.Tc.Types.Rank
+import GHC.Tc.Errors ( reportAllUnsolved )
 import GHC.Tc.Errors.Types
-import GHC.Tc.Types.Constraint ( userTypeError_maybe )
-import GHC.Tc.Utils.Env (tcLookupId)
+import GHC.Tc.Types.Constraint ( userTypeError_maybe, mkNonCanonical, wc_simple, wc_impl, ic_wanted, ctPred )
+import GHC.Tc.Utils.TcMType (newEvVars, newWanted, newMetaTyVarsX)
+import GHC.Tc.Utils.Env (tcLookupId, tcLookupLcl_maybe, tcExtendIdEnv)
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Zonk.TcType
@@ -41,12 +49,14 @@ import GHC.Builtin.Modules( gHC_CLASSES )
 import GHC.Builtin.Uniques  ( mkAlphaTyVarUnique )
 
 import GHC.Core.Type
-import GHC.Core.Unify ( typesAreApart, tcMatchTyX_BM, BindFlag(..) )
+import GHC.Core.Unify ( typesAreApart, tcMatchTyKis, tcMatchTyX_BM, BindFlag(..) )
 import GHC.Core.Coercion
 import GHC.Core.Coercion.Axiom
 import GHC.Core.Class
 import GHC.Core.TyCon
+import GHC.Core.TyCon.Set (emptyTyConSet, elemTyConSet, extendTyConSet)
 import GHC.Core.Predicate
+import GHC.Core.Reduction ( Reduction(..), mkReflRedn, mkReduction, mkFunRedn, mkForAllRedn )
 import GHC.Core.TyCo.FVs
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Ppr
@@ -55,22 +65,29 @@ import GHC.Core.FamInstEnv ( isDominatedBy, injectiveBranches
                            , InjectivityCheckResult(..) )
 
 import GHC.Hs
+import GHC.Driver.Env (hsc_units)
 import GHC.Driver.Session
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Types.Error
 import GHC.Types.Basic   ( TypeOrKind(..), UnboxedTupleOrSum(..)
                          , unboxedTupleOrSumExtension )
-import GHC.Types.Id (isNaughtyRecordSelector)
+import GHC.Types.Id (idMult, isNaughtyRecordSelector)
 import GHC.Types.FieldLabel (flSelector)
 import GHC.Types.Name
+import GHC.Types.Name.Env
+import GHC.Types.Name.Reader (unLocWithUserRdr)
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Types.Var     ( VarBndr(..), isInvisibleFunArg, mkTyVar, tyVarName )
+import GHC.Types.Var     ( Id, ExistsTyFlag(ImplicitExists), VarBndr(..)
+                        , isInvisibleFunArg, isVisibleFunArg, mkTyVar, tyVarName
+                        , isId, setVarType )
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 import GHC.Types.TyThing ( TyThing(..) )
-import GHC.Types.Unique.Set( isEmptyUniqSet )
+import GHC.Types.Unique.FM ( addToUFM, emptyUFM, lookupUFM, lookupWithDefaultUFM )
+import GHC.Types.Unique.Set ( addOneToUniqSet, elementOfUniqSet, emptyUniqSet
+                            , isEmptyUniqSet, nonDetEltsUniqSet )
 
 import GHC.Utils.Error
 import GHC.Utils.Misc
@@ -80,9 +97,12 @@ import GHC.Utils.Panic
 import GHC.Data.List.SetOps
 
 import Control.Monad
+import Control.Monad.Trans.Class (lift)
+import qualified Control.Monad.Trans.State.Strict as State
+import Data.Data (Data, cast, gmapQ)
 import Data.Foldable
 import Data.Function
-import Data.List        ( (\\) )
+import Data.List        ( nubBy, (\\) )
 import qualified Data.List.NonEmpty as NE
 import Data.List.NonEmpty ( NonEmpty(..) )
 
@@ -239,12 +259,12 @@ checkAmbiguity ctxt ty
          -- tyvars are skolemised, we can safely use tcSimplifyTop
        ; allow_ambiguous <- xoptM LangExt.AllowAmbiguousTypes
        ; unless allow_ambiguous $
-         do { (_wrap, wanted) <- addErrCtxt (AmbiguityCheckCtxt ctxt allow_ambiguous) $
+         do { (indices, wanted) <- addErrCtxt (AmbiguityCheckCtxt ctxt allow_ambiguous) $
                                  captureConstraints $
-                                 tcSubTypeAmbiguity ctxt ty ty
+                                 tcSubTypeAmbiguity ctxt ty
                                  -- See Note [Ambiguity check and deep subsumption]
                                  -- in GHC.Tc.Utils.Unify
-            ; simplifyAmbiguityCheck ty wanted }
+            ; tcExtendIdEnv indices (simplifyAmbiguityCheck ty wanted) }
 
        ; traceTc "} Done ambiguity check for" (ppr ty) }
 
@@ -409,16 +429,24 @@ checkValidType ctxt ty
                  _              -> panic "checkValidType"
                                           -- Can't happen; not used for *user* sigs
 
-       ; env <- liftZonkM $ tcInitOpenTidyEnv (tyCoVarsOfTypeList ty)
+       ; let fvs = tyCoVarsOfTypeList ty
+       ; env <- liftZonkM $ tcInitOpenTidyEnv fvs
        ; expand <- initialExpandMode
        ; let ve = ValidityEnv{ ve_tidy_env = env, ve_ctxt = ctxt
-                             , ve_rank = rank, ve_expand = expand }
+                             , ve_rank = rank, ve_expand = expand
+                             , ve_indices = emptyVarSet, ve_imported_synonym = False
+                             , ve_partial_family_hint = True
+                             , ve_instance_pat = Nothing }
 
        -- Check the internal validity of the type itself
        -- Fail if bad things happen, else we misleading
        -- (and more complicated) errors in checkAmbiguity
        ; checkNoErrs $
-         do { check_type ve ty
+         do { -- See Note [Validity of retained binders].
+              mapM_ (check_retained_index ve)
+                [v | v <- fvs, isId v, not (isCoVar v)]
+            ; check_type ve ty
+            ; checkConstrainedSignature ctxt ty
             ; checkUserTypeError ctxt ty
             ; traceTc "done ct" (ppr ty) }
 
@@ -431,12 +459,703 @@ checkValidType ctxt ty
 
 checkValidMonoType :: Type -> TcM ()
 -- Assumes argument is fully zonked
-checkValidMonoType ty
+checkValidMonoType = check_valid_mono_type checkNoConstrainedFamilyApps Nothing
+
+check_valid_mono_type :: (Type -> TcM ())
+                      -> Maybe (Maybe TyCoVarSet, SkolemInfoAnon, CoercionN -> TcM ())
+                      -> Type -> TcM ()
+check_valid_mono_type check_domains instance_pat ty
   = do { env <- liftZonkM $ tcInitOpenTidyEnv (tyCoVarsOfTypeList ty)
        ; expand <- initialExpandMode
        ; let ve = ValidityEnv{ ve_tidy_env = env, ve_ctxt = SigmaCtxt
-                             , ve_rank = MustBeMonoType, ve_expand = expand }
-       ; check_type ve ty }
+                             , ve_rank = MustBeMonoType, ve_expand = expand
+                             , ve_indices = emptyVarSet, ve_imported_synonym = False
+                             , ve_partial_family_hint = isNothing instance_pat || isTyFamFree ty
+                             , ve_instance_pat = instance_pat }
+       ; check_type ve ty
+       ; check_domains ty }
+
+-- | Check each family domain in the signature's own context.
+-- See Note [Constrained associated family formation].
+checkConstrainedSignature :: UserTypeCtxt -> Type -> TcM ()
+checkConstrainedSignature ctxt ty
+  | null uses
+  = pure ()
+  | checks_domain ctxt
+  = do { givens <- getLexicalGivens
+       ; premises <- getPartialSigPredicates >>= newEvVars
+       ; (_, wanted) <- captureConstraints $
+           checkConstraints (SigSkol ctxt ty []) [] (premises ++ givens) (check_telescope ctxt ty)
+       ; (unsolved, _) <- runTcS (solveWanteds wanted)
+       ; reportAllUnsolved unsolved }
+  | otherwise
+  = checkNoConstrainedFamilyApps ty
+  where
+    uses = constrainedFamilyApps ty
+    checks_domain FunSigCtxt{} = True
+    checks_domain InfSigCtxt{} = True
+    checks_domain ExprSigCtxt{} = True
+    checks_domain TypeAppCtxt = True
+    checks_domain ConArgCtxt{} = True
+    checks_domain TySynCtxt{} = True
+    checks_domain (InstDeclCtxt False) = True
+    checks_domain _ = False
+
+    -- See Note [Family domains beneath retained binders].
+    check_telescope origin whole
+      | TySynCtxt{} <- origin, isConstraintKind (typeKind whole)
+      = go (tcMkDFunPhiTy [whole] unitTy)
+      | InstDeclCtxt False <- origin
+      = check_qualifiers whole
+      | otherwise = go whole
+      where
+        go sig = do
+          check_qualifiers sig
+          withFamilyDomainScope origin whole 0 sig check_body
+
+        check_qualifiers sig = do
+          let (_, theta, _) = familyDomainPrefix 0 sig
+          unless (all (null . constrainedFamilyApps) theta) $ do
+            uses <- familyDomainObligations (qualifierPrefix sig)
+            mapM_ (emitFamilyDomain origin whole) uses
+
+        -- Check only the written prefix here. The body has its own scope.
+        qualifierPrefix (ForAllTy ma b rest) = ForAllTy ma b (qualifierPrefix rest)
+        qualifierPrefix (FunTy af ma mult pred_ty rest)
+          | isInvisibleFunArg af = FunTy af ma mult pred_ty (qualifierPrefix rest)
+        qualifierPrefix _ = unitTy
+
+        check_body (DepDictTy dict body)
+          = do { check_part (varType dict)
+               ; void $ checkConstraints (SigSkol origin whole []) [] [dict] (go body) }
+        check_body (DepFunTy _ index body)
+          = do { check_part (varType index)
+               ; tcExtendIdEnv [index] (go body) }
+        check_body (FunTy af ma mult arg result)
+          | isVisibleFunArg af
+          = do { mapM_ check_part [ma, mult]
+               ; check_telescope GenSigCtxt arg
+               ; go result }
+        check_body body = check_part body
+
+    check_part part = do
+      checkNested part
+      uses <- familyDomainObligations part
+      mapM_ (emitFamilyDomain ctxt ty) uses
+
+    checkNested rho@(ForAllTy _ (Bndr _ vis) _)
+      | isInvisibleForAllTyFlag vis = checkNoConstrainedFamilyApps rho
+    checkNested rho@(FunTy af _ _ _ _)
+      | isInvisibleFunArg af = checkNoConstrainedFamilyApps rho
+    checkNested (FunTy _ _ _ a b) = checkNested a >> checkNested b
+    checkNested (TyConApp _ args) = traverse_ checkNested args
+    checkNested (AppTy f a) = checkNested f >> checkNested a
+    checkNested (CastTy ty _) = checkNested ty
+    checkNested (DepFunTy _ b body) = checkNested (varType b) >> checkNested body
+    checkNested (ExistsTy _ b body) = checkNested (varType b) >> checkNested body
+    checkNested _ = pure ()
+
+-- | Emit one domain Wanted inside the binders of the written family use.
+emitFamilyDomain :: UserTypeCtxt -> Type -> ConstrainedFamilyUse -> TcM ()
+emitFamilyDomain _ _ (UnsupportedFamily fam reason) =
+  failWithTc (TcRnConstrainedFamilyUnsupported fam reason)
+emitFamilyDomain ctxt ty (ScopedFamily fam n sigma) =
+  withFamilyDomainScope ctxt ty n sigma $ \domain -> do
+    pred_ty <- if n == 0 then pure domain else do
+      let (hidden, predicate) = splitForAllTyVars domain
+          scope = mkEmptySubst (mkInScopeSet (tyCoVarsOfType domain))
+      (subst, _) <- newMetaTyVarsX scope (map snd hidden)
+      pure (substTy subst predicate)
+    ev <- newWanted (OccurrenceOf (tyConName fam)) (Just TypeLevel) pred_ty
+    emitSimple (mkNonCanonical ev)
+
+-- | Open the lexical binders and premises of a family use.
+withFamilyDomainScope :: UserTypeCtxt -> Type -> Int -> Type -> (Type -> TcM ()) -> TcM ()
+withFamilyDomainScope origin whole n sig inside = case familyDomainPrefix n sig of
+  ([], [], body) -> inside body
+  (bndrs, theta, body) -> mdo
+    info <- mkSkolemInfo sig_skol
+    let tvs = map snd bndrs
+        in_scope = mkInScopeSet (tyCoVarsOfType sig)
+    (subst, skolems) <- tcInstSkolTyVarsX info (mkEmptySubst in_scope) tvs
+    let sig_skol = SigSkol origin whole (zip (map tyVarName tvs) skolems)
+    traverse_ checkNoConstrainedFamilyApps (map fst bndrs ++ map varType tvs)
+    given <- newEvVars (substTheta subst theta)
+    void $ checkConstraints sig_skol skolems given (inside (substTy subst body))
+
+-- | Separate the lexical binders from the owner's inferred parameters.
+-- See Note [Associated family domain arguments].
+familyDomainPrefix :: Int -> Type -> ([(Matchability, TyVar)], ThetaType, Type)
+familyDomainPrefix n sig
+  | n == 0 = written_prefix sig
+  | otherwise
+  = let (binders, theta, body) = written_prefix sig
+        (scope, hidden) = splitAt (length binders - n) binders
+    in (scope, theta, mkInfForAllTys hidden body)
+  where
+    -- Keep type synonym arguments for the formation check.
+    written_prefix (ForAllTy ma (Bndr tv _) rest)
+      = let (bndrs, theta, body) = written_prefix rest in ((ma, tv) : bndrs, theta, body)
+    written_prefix (FunTy af _ _ pred_ty rest)
+      | isInvisibleFunArg af
+      = let (tvs, theta, body) = written_prefix rest in (tvs, pred_ty : theta, body)
+    written_prefix rest = ([], [], rest)
+
+-- | Format an undetermined-parameter diagnostic for a constrained family call.
+undeterminedFamilyDomainErr :: [TyVar] -> [TyVar] -> String -> Name -> SDoc
+undeterminedFamilyDomainErr omitted unknown what owner =
+  sep [ text "Supply" <+> pprWithCommas (quotes . ppr) (if null omitted then unknown else omitted)
+      , text ("to determine the " ++ what ++ " of") <+> quotes (ppr owner) <> dot ]
+
+-- | Fail when a constrained family declaration leaves context parameters undetermined.
+failMissingFamilyParameters :: TyCon -> [TyVar] -> TcM ()
+failMissingFamilyParameters fam missing =
+  setSrcSpan (getSrcSpan fam) $
+  failWithTc $ TcRnConstrainedFamilyUnsupported fam $
+    hang (text "Missing class parameters in the family declaration")
+         2 (pprWithCommas ppr missing)
+
+-- | Recover the owner predicate from the supplied family arguments.
+-- See Note [Associated family domain arguments].
+associatedFamilyDomain :: TyCon -> [Type] -> Either SDoc (Int, PredType)
+associatedFamilyDomain fam args
+  | Just ckind <- standaloneFamilyConstrainedKind_maybe fam
+  = standaloneFamilyDomain fam ckind args
+  | Just cls <- tyConAssoc_maybe fam >>= tyConClass_maybe
+  = let formals = classTyVars cls
+        family_vars = tyConTyVars fam
+        supplied = zip family_vars args
+        actuals = mkVarEnv supplied
+        -- Later family arguments can contradict an inferred owner.
+        family_set = mkVarSet family_vars
+        omitted = [v | v <- formals, v `elemVarSet` family_set, not (v `elemVarEnv` actuals)]
+        unknown = undeterminedFamilyParameters cls (map fst supplied)
+        infer subst [] = ([], mkClassPred cls (substTys subst (mkTyVarTys formals)))
+        infer subst (v:vs)
+          | Just arg <- lookupVarEnv actuals v = infer (extendTvSubst subst v arg) vs
+          | otherwise = let (subst', w) = substTyVarBndr subst v
+                            (ws, predicate) = infer subst' vs
+                        in ((unmatchableDataConTy, w) : ws, predicate)
+    in case traverse (lookupVarEnv actuals) formals of
+      Just tys -> Right (0, mkClassPred cls tys)
+      Nothing | null omitted, null unknown ->
+        let (hidden, predicate) = infer (mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes args))) formals
+        in Right (length hidden, mkInfForAllTys hidden predicate)
+      _ -> Left (undeterminedFamilyDomainErr omitted unknown "instance" (className cls))
+  | otherwise = Left (text "The family declaration has no associated class.")
+
+-- | Split the canonical constrained kind of a standalone constrained family
+-- into its aligned family binders, inferred fundep binders, and premises.
+splitStandaloneConstrainedKind :: TyCon -> Kind -> ([TyVar], ThetaType)
+splitStandaloneConstrainedKind fam ckind =
+  let family_vars = tyConTyVars fam
+      (outer_tvs, inner) = split_n (length family_vars) ckind
+      (hidden_raw, phi)  = tcSplitForAllInvisTyVars inner
+      (theta_raw, _)     = tcSplitPhiTy phi
+      base_subst = zipTvSubst outer_tvs (mkTyVarTys family_vars)
+      (subst', hidden_tvs) = substTyVarBndrs base_subst (map snd hidden_raw)
+      theta = substTheta subst' theta_raw
+  in (hidden_tvs, theta)
+  where
+    split_n 0 ty = ([], ty)
+    split_n n (ForAllTy _ (Bndr tv _) rest) =
+      let (tvs, body) = split_n (n - 1) rest in (tv : tvs, body)
+    split_n n (FunTy _ _ _ arg_k rest) =
+      let dummy = mkTyVar (mkSysTvName (mkAlphaTyVarUnique n) (fsLit "_anon")) arg_k
+          (tvs, body) = split_n (n - 1) rest
+      in (dummy : tvs, body)
+    split_n _ ty = ([], ty)
+
+-- | Instantiate a standalone constrained family's domain predicate at a call site.
+standaloneFamilyDomain :: TyCon -> Kind -> [Type] -> Either SDoc (Int, PredType)
+standaloneFamilyDomain fam ckind args =
+  let family_vars = tyConTyVars fam
+      (hidden_tvs, theta) = splitStandaloneConstrainedKind fam ckind
+      needed_vars = closeOverKinds (tyCoVarsOfTypes theta `unionVarSet` tyCoVarsOfTypes (map tyVarKind hidden_tvs))
+      formals = [v | v <- family_vars, v `elemVarSet` needed_vars]
+      supplied = zip family_vars args
+      actuals = mkVarEnv supplied
+      omitted = [v | v <- formals, not (v `elemVarEnv` actuals)]
+      known = closeOverKinds (mkVarSet (map fst supplied))
+      fixed = closeWrtFunDeps theta known
+      unknown = [h | h <- hidden_tvs, not (h `elemVarSet` fixed)]
+  in if not (null omitted && null unknown)
+     then Left (undeterminedFamilyDomainErr omitted unknown "constraint context" (tyConName fam))
+     else
+       let in_scope = mkInScopeSet (tyCoVarsOfTypes (args ++ theta))
+           subst0 = mkTvSubst in_scope actuals
+           (subst1, hidden_inst) = substTyVarBndrs subst0 hidden_tvs
+           theta_inst = substTheta subst1 theta
+           predicate = case theta_inst of
+             [single] -> single
+             many     -> mkConstraintTupleTy many
+       in Right (length hidden_inst,
+                 mkInfForAllTys [(unmatchableDataConTy, h) | h <- hidden_inst] predicate)
+
+-- | Verify that any omitted variables in a standalone constrained family's
+-- context are determined via functional dependencies by the family's arguments.
+checkStandaloneFamilyCoverage :: TyCon -> TcM ()
+checkStandaloneFamilyCoverage fam
+  | Just ckind <- standaloneFamilyConstrainedKind_maybe fam
+  , let (hidden_tvs, theta) = splitStandaloneConstrainedKind fam ckind
+        known = closeOverKinds (mkVarSet (tyConTyVars fam))
+        fixed = closeWrtFunDeps theta known
+        missing = [h | h <- hidden_tvs, not (h `elemVarSet` fixed)]
+  , not (null missing)
+  = failMissingFamilyParameters fam missing
+  | otherwise = pure ()
+
+-- | Check the owner after GHC has built the class and its superclasses.
+-- See Note [Associated family domain arguments].
+checkAssociatedFamilyCoverage :: Class -> TyCon -> TcM ()
+checkAssociatedFamilyCoverage cls fam
+  | isConstrainedFamilyTyCon fam
+  , let missing = undeterminedFamilyParameters cls (tyConTyVars fam)
+  , not (null missing)
+  = failMissingFamilyParameters fam missing
+  | otherwise = pure ()
+
+-- | Find owner parameters that the supplied family arguments do not determine.
+undeterminedFamilyParameters :: Class -> [TyVar] -> [TyVar]
+undeterminedFamilyParameters cls supplied
+  = [v | v <- formals, not (v `elemVarSet` known), not (v `elemVarSet` fixed)]
+  where
+    formals = classTyVars cls
+    known = closeOverKinds (mkVarSet supplied)
+    fixed = closeWrtFunDeps [mkClassPred cls (mkTyVarTys formals)] known
+
+{- Note [Associated family domain arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The family binders include the kind variables that appear in argument types.
+Pair the supplied arguments with those binders. Look up each class binder
+in this environment, in the order of the class declaration. Ignore extra
+family arguments when forming the class predicate.
+
+For example, in class KnownIndex k, the family Echo (x :: k) :: k has
+the invisible argument k. The partial application Echo :: Bool %U -> Bool
+already determines the domain KnownIndex Bool. Bare Elem from class
+Collects c does not determine c. The ordinary arity and matchability
+checks still apply to a prefix that determines its domain.
+
+For class Owner c e | c -> e with type Member c, the family never takes e.
+The template for Member c carries the predicate forall e. Owner c e and a
+count of one inferred owner binder. Each use instantiates this inner binder
+with a fresh metavariable inside its lexical implication. Synonym expansion
+can reuse a template at two different instances. It cannot share the
+metavariable between them. If the family takes e explicitly, require the
+user to supply it. A caller could otherwise apply the partial family at a
+type that contradicts the dependency.
+-}
+
+-- | Refuse contexts that have no formation rule in this experiment.
+checkNoConstrainedFamilyApps :: Type -> TcM ()
+checkNoConstrainedFamilyApps ty
+  | fam : _ <- constrainedFamilyApps ty
+  = failWithTc (TcRnConstrainedFamilyUnsupported fam unsupportedFamilySite)
+  | otherwise = pure ()
+
+unsupportedFamilySite :: SDoc
+unsupportedFamilySite = text "Use the family in a value signature, type synonym, expression annotation, constructor field, or explicit type argument."
+
+-- | The interface requirement for checking the class domains of a sum.
+data ScopedSumDomainRequirement
+  = DirectScopedSumDomain
+  | ComposedScopedSumDomain
+  deriving (Eq, Ord)
+
+-- | The reader required by the class domains of this private payload family.
+scopedSumDomainRequirement :: TyCon -> Maybe ScopedSumDomainRequirement
+scopedSumDomainRequirement tc = do
+  (requirement, _, _) <- scopedSumDomains tc
+  pure requirement
+
+-- | Read the class domains to check on formation of a retained sum.
+-- See Note [Class domains in generated sum payloads].
+scopedSumDomains :: TyCon -> Maybe (ScopedSumDomainRequirement, [TyVar], [(TyCon, PredType)])
+scopedSumDomains tc = do
+    (_, True) <- closedFamilyScope_maybe tc
+    axiom <- closedFamilyTyConCoAxiom_maybe tc
+    [branch] <- pure (fromBranches (coAxiomBranches axiom))
+    guard (null (coAxBranchCoVars branch))
+    parameters <- traverse getTyVar_maybe (coAxBranchLHS branch)
+    let bound = coAxBranchTyVars branch
+    guard (length parameters == tyConArity tc &&
+           parameters `equalLength` bound &&
+           length parameters == sizeVarSet (mkVarSet parameters) &&
+           all (`elem` bound) parameters)
+    witness : captures <- pure (reverse parameters)
+    let rhs = coAxBranchRHS branch
+        requirement = case rhs of
+          TyConApp fam _ | isConstrainedFamilyTyCon fam -> DirectScopedSumDomain
+          _ -> ComposedScopedSumDomain
+    domains <- collect witness rhs
+    guard (not (null domains))
+    pure (requirement, reverse captures, domains)
+  where
+    collect witness (TyConApp con args)
+      | isConstrainedFamilyTyCon con = do
+          guard (all plain args)
+          Right (0, predicate) <- pure (associatedFamilyDomain con args)
+          guard (not (witness `elemVarSet` tyCoVarsOfType predicate))
+          pure [(con, predicate)]
+      | isAlgTyCon con, not (isClassTyCon con) =
+          concat <$> traverse (collect witness) args
+    collect _ ty | plain ty = Just []
+    collect _ _ = Nothing
+
+    plain TyVarTy{} = True
+    plain (TyConApp tc []) | tyConName tc == liftedTypeKindTyConName = True
+    plain (TyConApp tc args) = not (isFamilyTyCon tc || isTypeSynonymTyCon tc) && all plain args
+    plain _ = False
+
+{- Note [Class domains in generated sum payloads]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A written retained sum has a private family for its payload. Its
+equation does not carry the class scope of the written sum. For a
+single variable-only equation, recover constrained family domains from
+the checked equation. Walk ordinary algebraic type constructors in its
+result. A domain must use only the captured parameters. It must not
+depend on the witness. Family arguments may contain no further family
+applications or user synonyms. If the collector cannot check every
+part of the result, leave the branch on the existing validity path.
+
+Check the domain where the program forms the sum type. An ordinary
+type synonym uses the existing signature check. A marked associated
+equation uses its owning class and the existing Given-only check.
+The same collector finds constrained applications, provides obligations
+and determines the interface requirement. It preserves the direct
+requirement for a result that is a single constrained family application.
+The check also covers inferred types that contain the private payload
+family directly. All other family branches keep their existing checks.
+-}
+
+-- Find marked families without substituting or allocating scoped predicates.
+constrainedFamilyApps :: Type -> [TyCon]
+constrainedFamilyApps ty = State.evalState (go ty) emptyUniqSet
+  where
+    go (TyConApp tc args) = do
+      nested <- descend args
+      case scopedSumDomains tc of
+        Just (_, _, domains) -> pure (map fst domains ++ nested)
+        Nothing
+          | isConstrainedFamilyTyCon tc -> pure (tc : nested)
+          | isFamFreeTyCon tc -> pure nested
+          | otherwise -> case synTyConRhs_maybe tc of
+              Nothing -> pure nested
+              Just rhs -> do
+                seen <- State.get
+                if tc `elementOfUniqSet` seen
+                  then pure nested
+                  else do
+                    State.put $! addOneToUniqSet seen tc
+                    (++ nested) <$> go rhs
+    go (AppTy f x) = descend [f, x]
+    go (FunTy _ ma mult a b) = descend [ma, mult, a, b]
+    go (ForAllTy ma b ty) = descend [ma, binderType b, ty]
+    go (DepDictTy v ty) = descend [varType v, ty]
+    go (ClassAppTy _ inst _ arg kind) = descend [inst, arg, kind]
+    go (DepFunTy _ v ty) = descend [varType v, ty]
+    go (ExistsTy _ v ty) = descend [varType v, ty]
+    go (TermAppTy _ arg) = go arg
+    go (CastTy ty _) = go ty
+    go _ = pure []
+
+    descend = fmap concat . traverse go
+
+-- | The class predicate carries its lexical binders and premises.
+-- The count records its innermost inferred owner binders.
+-- See Note [Associated family domain arguments].
+data ConstrainedFamilyUse
+  = ScopedFamily TyCon Int PredType
+  | UnsupportedFamily TyCon SDoc
+
+-- | Collect the independent premises of one constraint context.
+-- See Note [Family domains in constraint tuples].
+familyDomainGivens :: ThetaType -> ThetaType
+familyDomainGivens theta = nubBy eqType $
+    State.evalState (concat <$> traverse collect theta) emptyUFM
+  where
+    collect pred_ty
+      | null (constrainedFamilyApps pred_ty) = pure [pred_ty]
+    collect pred_ty@(TyConApp tc args)
+      | Just cls <- tyConClass_maybe tc, isCTupleClass cls
+      = concat <$> traverse collect args
+      | not (isForgetfulSynTyCon tc) || all (null . constrainedFamilyApps) args
+      , Just rhs <- coreView pred_ty
+      = do
+          cache <- State.get
+          let visited = lookupWithDefaultUFM cache [] tc
+          if any (pickyEqType pred_ty) visited
+            then pure []
+            else do
+              State.put $! addToUFM cache tc (pred_ty : visited)
+              collect rhs
+    collect _ = pure []
+
+{- Note [Family domains in constraint tuples]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In (Collects c, Show (Elem c)) => r, the first dictionary establishes
+the domain of Elem c in the second predicate. Nested constraint tuples
+and synonyms for those tuples provide the same component dictionaries.
+Check a constraint synonym declaration in the context it describes.
+A use as an ordinary type argument, such as Proxy (CanDisplay c), has
+no such context. It still needs the domain at the use site.
+
+Only use a component that has no marked family applications. A class
+cannot justify its own argument by projecting a superclass. A forgetful
+synonym can erase a written argument with a family obligation. Check
+such an argument independently before using that synonym as evidence.
+Compare visited applications without unfolding synonyms. Different
+written arguments can carry different obligations even if they reduce
+to the same type.
+-}
+
+-- | Collect family applications before a synonym can discard a written argument.
+-- See Note [Domains in type synonyms].
+familyDomainObligations :: Type -> TcM [ConstrainedFamilyUse]
+familyDomainObligations ty = State.evalStateT (go ty) emptyUFM
+  where
+    go (TyConApp tc args) = do
+      written <- children args
+      case scopedSumDomains tc of
+        Just (_, captures, domains) ->
+          let (actuals, _) = splitAtList captures args
+              instantiate (fam, predicate) = (fam, substTyWith captures actuals predicate)
+              uses | equalLength captures actuals =
+                       [ScopedFamily fam 0 predicate |
+                         (fam, predicate) <- nubBy (eqType `on` snd) (map instantiate domains)]
+                   | otherwise = [UnsupportedFamily fam unsupportedFamilySite | (fam, _) <- domains]
+          in pure (uses ++ written)
+        Nothing
+          | isConstrainedFamilyTyCon tc -> pure (domain tc args : written)
+          | isFamFreeTyCon tc -> pure written
+          | otherwise -> case synTyConDefn_maybe tc of
+              Nothing -> pure written
+              Just (tvs, rhs) -> do
+                uses <- templates tc rhs
+                let (actuals, _) = splitAtList tvs args
+                pure $ written ++ if equalLength actuals tvs
+                  then map (mapSigma (substTyWith tvs actuals)) uses
+                  else map refuse uses
+    go (ForAllTy ma b body) = do
+      kinds <- forbidden [ma, binderType b]
+      uses <- go body
+      pure (kinds ++ map (mapSigma (ForAllTy ma b)) uses)
+    go ty@(FunTy af ma mult arg res)
+      | isInvisibleFunArg af = do
+          let (arrow_tys, theta, body) = qualifiers ty
+              plain = familyDomainGivens theta
+          kinds <- forbidden arrow_tys
+          predicates <- concat <$> traverse go theta
+          uses <- go body
+          pure $ kinds ++ map (mapSigma (tcMkDFunPhiTy plain)) predicates
+                       ++ map (mapSigma (tcMkDFunPhiTy theta)) uses
+      | otherwise = do
+          kinds <- forbidden [ma, mult]
+          domain <- go arg
+          range <- go res
+          pure (kinds ++ domain ++ range)
+    go (AppTy f x) = children [f, x]
+    go (DepDictTy v body) = forbidden [varType v, body]
+    go (ClassAppTy _ inst _ arg kind) = forbidden [inst, arg, kind]
+    go (DepFunTy _ v body) = do
+      binder_uses <- go (varType v)
+      body_uses <- go body >>= close_retained v
+      pure (binder_uses ++ body_uses)
+    go (ExistsTy _ v body) = do
+      binder_uses <- go (varType v)
+      body_uses <- map close_existential <$> go body
+      pure (binder_uses ++ body_uses)
+      where
+        close_existential (ScopedFamily fam _ sigma)
+          | v `elemVarSet` tyCoVarsOfType sigma
+          = UnsupportedFamily fam unsupportedFamilySite
+        close_existential use = use
+    go (TermAppTy _ arg) = go arg
+    go (CastTy t _) = go t
+    go _ = pure []
+
+    -- Preserve the written predicates and their unexpanded arguments.
+    qualifiers (FunTy af ma mult arg rest)
+      | isInvisibleFunArg af =
+          let (kinds, theta, body) = qualifiers rest
+          in (ma : mult : kinds, arg : theta, body)
+    qualifiers body = ([], [], body)
+
+    -- See Note [Retained indices in domain predicates].
+    close_retained v uses
+      | not (any mentions uses) = pure uses
+      | otherwise = do
+          name <- lift $ newSysName (mkTyVarOccFS (occNameFS (getOccName v)))
+          let tv = mkTyVar name (varType v)
+              close use@(ScopedFamily fam n sigma)
+                | mentions use = case abstractNativeIndices [(TermVarTy v, tv)] sigma of
+                    Just body | not (v `elemVarSet` tyCoVarsOfType body) ->
+                      ScopedFamily fam n (mkSpecForAllTy unmatchableDataConTy tv body)
+                    _ -> UnsupportedFamily fam
+                           (text "The class domain uses a retained index that cannot be abstracted.")
+              close use = use
+          pure (map close uses)
+      where
+        mentions (ScopedFamily _ _ sigma) = v `elemVarSet` tyCoVarsOfType sigma
+        mentions _ = False
+
+    domain fam args = either (UnsupportedFamily fam) (uncurry (ScopedFamily fam))
+                             (associatedFamilyDomain fam args)
+
+    children = fmap (map monotype . concat) . traverse go
+    forbidden = fmap (map refuse . concat) . traverse go
+    refuse (ScopedFamily fam _ _) = UnsupportedFamily fam unsupportedFamilySite
+    refuse use = use
+    monotype use@(ScopedFamily _ n sigma)
+      | ([], [], _) <- familyDomainPrefix n sigma = use
+      | otherwise = refuse use
+    monotype use = use
+    mapSigma f (ScopedFamily fam n sigma) = ScopedFamily fam n (f sigma)
+    mapSigma _ use = use
+
+    templates tc rhs = do
+      cache <- State.get
+      case lookupUFM cache tc of
+        Just uses -> pure uses
+        Nothing -> do
+          State.put $! addToUFM cache tc []
+          uses <- nubBy sameUse <$> go rhs
+          State.modify' (\m -> addToUFM m tc uses)
+          pure uses
+
+    sameUse (ScopedFamily f n t) (ScopedFamily g m u) = f == g && n == m && eqType t u
+    sameUse (UnsupportedFamily f _) (UnsupportedFamily g _) = f == g
+    sameUse _ _ = False
+
+{- Note [Domains in type synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A family application has a domain even in an unused synonym argument.
+For example, type Bad = Forget (Elem [Int]) requires Collects [Int]
+when type Forget a = (). Check the written arguments independently of
+the right-hand side.
+
+Keep the written forall binders and constraints around each application.
+For example, type Q a = Allowed a => Proxy (Elem [a]) -> () gives the
+obligation Allowed a => Collects [a]. Substitute for a in the whole type
+when a client uses Q. A premise in Q cannot discharge a separate
+obligation in a written argument to Q.
+
+In (Collects c, Show (Elem c)) => body, Collects c establishes the
+domain of Elem c inside the other predicate. Check the predicates that
+mention marked families using the family-free premises of the same
+context. Their order does not matter. Thus a predicate cannot establish
+the domain of one of its own arguments by projecting a superclass.
+A later forall starts a separate context. Its premises cannot establish
+the domain of an earlier predicate. All checked premises are available
+in the body.
+
+Traverse the argument and result of a function separately. In
+(forall a. Allowed a => Proxy a -> Elem [a]) -> Elem [Int], the Given
+belongs to the callback. It cannot establish Allowed Int for the result.
+
+Cache the obligations of each synonym in its formal parameters. Two uses
+of one synonym can have different arguments. Remove duplicate obligations
+in the cached result so repeated pairs of the same synonym stay small.
+-}
+
+{- Note [Retained indices in domain predicates]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under foreach (b :: Bool), check the family domain for an arbitrary b.
+The term binder belongs to the source function. Give the solver a fresh
+type variable of the same kind. Abstract occurrences in both the wanted
+predicate and its written premises. For example, checking When b under
+Enabled b gives the quantified predicate
+forall (b :: Bool). Enabled b => Enabled b.
+
+Only abstract a binder that occurs in the predicate or its premises.
+Reflect b can have the domain KnownKind Bool, independent of b. Keep the
+original source and runtime binder. Check the predicate with analysis
+skolemisation. It introduces the Givens without building runtime
+abstractions or presenting the proof obligation as a source signature.
+-}
+
+{- Note [Family domains beneath retained binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In foreach (flag :: Bool) -> Values (At flag) => Proxy (Item (At flag)),
+the last application of Item needs Values (At flag). Bring the actual
+runtime index into scope before skolemising the rest of the telescope.
+The context on that suffix supplies the domain for its result. Check the
+index's own type before entering its scope. A constraint beneath a binder
+cannot justify an application in an earlier argument.
+
+A leading dependent dictionary binder supplies its exact evidence
+parameter when checking its body. Check the predicate first, outside
+that parameter's scope. A nested dictionary or selector inside a
+monotype does not have a family formation rule here.
+
+An ordinary argument can be a callback with its own class context.
+For (forall c. Collects c => Proxy c -> Elem c -> Elem c) -> result,
+skolemise the callback independently. Its Given justifies both occurrences
+of Elem c inside the callback. The result cannot use this Given. Report
+an unsolved constraint on c against the callback. Suggesting it on the
+enclosing function would put c outside its scope.
+See Note [Setting the argument context] in GHC.Tc.Utils.Unify.
+
+A required type argument has the same scope as a specified type argument.
+Skolemise both when checking formation. Do not build a runtime type-lambda
+wrapper for a family occurrence in a type. See Note [Ambiguity skolemisation is not runtime abstraction]
+in GHC.Tc.Utils.Instantiate.
+
+Read the written forall binders and predicates before expanding a synonym.
+For type Ignore a = forall b. Show b => b -> String, Ignore (Elem [Int])
+still requires Collects [Int]. Splitting the sigma type through Ignore
+would erase that argument. A constraint introduced by Ignore also cannot
+justify a written argument to Ignore.
+
+The nested checks share the signature's formation check, including its
+treatment of unsolved premises under deferred type errors. See
+Note [Constrained associated family formation].
+-}
+
+{- Note [Constrained associated family formation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The experiment opts families in at the producer. A marked family records
+the parent-class domain in its declaration interface. Its raw binder
+identities determine how to instantiate that class predicate. A reader
+checks the same obligation with either setting of the experimental flag.
+
+Check an application in a written signature, before solving a term can
+reduce the family and lose the domain obligation. Solve the class
+predicate from the declared and enclosing Givens and the instance
+environment. Check formation separately from inference so that inference
+cannot add a missing predicate to the signature. Expression annotations
+use the same domain check as named signatures. For a partial signature,
+check the written type before the expression or binding fixes a wildcard.
+For example, checking Refl can reduce Elem [Int] to Int and fill the hole
+in Elem [Int] :~: _. Checking the inferred type then loses that use of Elem.
+After generalisation, the inferred type can still mention the family. Check
+its domain under the final binders and predicates. For example, an inferred
+result hole can contain Elem (f a) when the signature supplies Collects (f a).
+At this point the context is fixed. This check cannot generalise a new Wanted.
+
+Check the premises of an ordinary written instance with the same qualifier
+rule. For example, (Collects c, Show (Elem c)) can supply Collects c while
+checking the second premise. Check before solving the instance constraints can
+reduce an application such as Elem [Int]. The instance-head validity rules
+still check the head. This path checks written class instances. A standalone
+deriving declaration uses its existing deriving checks.
+
+For a written type argument, tcHsTypeApp checks formation before the
+function can discard the argument or reduce the family. Both @t and a
+required (type t) argument use that path. This source check
+does not put a dictionary into the family's Core kind.
+
+Report a missing domain even under -fdefer-type-errors. The check
+discards the dictionary, so a deferred error has no runtime use site.
+For example, a family axiom can let an out-of-domain equality reduce
+to Refl. A client of that module could then use Refl without an error.
+
+For a constructor, check its wrapper type after the newtype validity
+check. The wrapper contains the Givens for its fields, including the
+constructor's explicit context. See Morris and Eisenberg, "Constrained
+Type Families", section 4.2.
+-}
 
 checkTySynRhs :: UserTypeCtxt -> TcType -> TcM ()
 checkTySynRhs ctxt ty
@@ -446,7 +1165,7 @@ checkTySynRhs ctxt ty
          then  when (isConstraintLikeKind actual_kind)
                     (do { dflags <- getDynFlags
                         ; expand <- initialExpandMode
-                        ; check_pred_ty emptyTidyEnv dflags ctxt expand ty })
+                        ; check_pred_ty emptyVarSet emptyTidyEnv dflags ctxt expand ty })
          else addErrTcM ( emptyTidyEnv
                         , TcRnIllegalConstraintSynonymOfKind (tidyType emptyTidyEnv actual_kind)
                         ) }
@@ -495,7 +1214,7 @@ checkEscapingKind :: Type -> TcM ()
 checkEscapingKind poly_ty
   | (tvs, tau) <- splitForAllTyVars poly_ty
   , let tau_kind = typeKind tau
-  , Nothing <- occCheckExpand tvs tau_kind
+  , Nothing <- occCheckExpand (map snd tvs) tau_kind
     -- Ensure that none of the tvs occur in the kind of the forall
     -- /after/ expanding type synonyms.
     -- See Note [Phantom type variables in kinds] in GHC.Core.Type
@@ -727,7 +1446,11 @@ data ValidityEnv = ValidityEnv
   { ve_tidy_env :: TidyEnv
   , ve_ctxt     :: UserTypeCtxt
   , ve_rank     :: Rank
-  , ve_expand   :: ExpandMode }
+  , ve_expand   :: ExpandMode
+  , ve_indices  :: VarSet
+  , ve_imported_synonym :: Bool
+  , ve_partial_family_hint :: Bool
+  , ve_instance_pat :: Maybe (Maybe TyCoVarSet, SkolemInfoAnon, CoercionN -> TcM ()) }  -- When checking a matching pattern
 
 instance Outputable ValidityEnv where
   ppr (ValidityEnv{ ve_tidy_env = env, ve_ctxt = ctxt
@@ -746,12 +1469,57 @@ check_type :: ValidityEnv -> Type -> TcM ()
 -- Rank is allowed rank for function args
 -- Rank 0 means no for-alls anywhere
 
+-- See Note [Validity of retained binders]
+check_type ve ty@(DepDictTy dict body)
+  = do { checkTcM (forAllAllowed (ve_rank ve)) $
+           let (env1, tidy_ty) = tidyOpenTypeX (ve_tidy_env ve) ty
+           in (env1, TcRnForAllRankErr (ve_rank ve) tidy_ty)
+       ; unless (isNativeClassDictionaryId dict && not (dict `elemVarSet` ve_indices ve)) $
+           failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder dict)
+       ; check_type ve (varType dict)
+       ; check_type (ve { ve_indices = ve_indices ve `extendVarSet` dict }) body }
+check_type ve (ClassAppTy _ inst (TermVarTy dict) arg kind)
+  = do { unless (isNativeClassDictionaryId dict && dict `elemVarSet` ve_indices ve) $
+           failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex
+       ; mapM_ (check_type ve) [inst, arg, kind] }
+check_type _ ClassAppTy{} = failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex
+check_type ve (TermAppTy head_id arg)
+  = do { unless (isNativeIndexFunctionId head_id || isNativeDepFunctionId head_id) $
+           failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex
+       ; check_retained_index ve head_id
+       ; check_type ve arg
+       ; case nativeTermAppKind_maybe head_id arg of
+           Just (domain, _) | typeKind arg `eqType` domain -> return ()
+           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedCallIndex }
+check_type ve (TermVarTy v)
+  = do { unless (isNativeOpaqueValueId v || isNativeNamedOpaqueFunctionId v) $
+           failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
+       ; check_retained_index ve v }
+check_type ve ty@(DepFunTy vis v body)
+  = do { when (vis == DepFunInvisible) $
+           checkTcM (forAllAllowed (ve_rank ve)) $
+             let (env1, tidy_ty) = tidyOpenTypeX (ve_tidy_env ve) ty
+             in (env1, TcRnForAllRankErr (ve_rank ve) tidy_ty)
+       ; unless (isNativeOpaqueValueId v && not (v `elemVarSet` ve_indices ve)) $
+           failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
+       ; unless (typeKind body `eqType` liftedTypeKind) $
+           failWithTc $ TcRnRetainedQuantificationError (RetainedResultKind body)
+       ; check_type (ve { ve_rank = arg_rank }) (idMult v)
+       ; check_type (ve { ve_rank = arg_rank }) (varType v)
+       ; check_type (ve { ve_rank = res_rank
+                        , ve_indices = ve_indices ve `extendVarSet` v }) body }
+  where
+    (arg_rank, res_rank) = funArgResRank (ve_rank ve)
 check_type _ (TyVarTy _)
   = return ()
 
 check_type ve (AppTy ty1 ty2)
   = do  { check_type ve ty1
-        ; check_arg_type False ve ty2 }
+        ; check_arg_type False ve ty2
+        ; case (ve_instance_pat ve, ve_expand ve) of
+            (_, NoExpand) -> pure ()
+            (Just (mb_qtvs, skol_info, record), _) -> checkPatternMatchability mb_qtvs skol_info record ty1
+            _ -> pure () }
 
 check_type ve ty@(TyConApp tc tys)
   | isTypeSynonymTyCon tc || isTypeFamilyTyCon tc
@@ -798,11 +1566,12 @@ check_type ve@(ValidityEnv{ ve_tidy_env = env
                 -- Reject forall (a :: Eq b => b). blah
                 -- In a kind signature we don't allow constraints
 
-        ; checkVdqOK ve tvbs ty
+        ; mapM_ (check_type (ve{ve_rank = MustBeMonoType}) . fst) tvbs
+        ; checkVdqOK ve (map snd tvbs) ty
                 -- Reject visible, dependent quantification in the type of a
                 -- term (e.g., `f :: forall a -> a -> Maybe a`)
 
-        ; check_valid_theta env' SigmaCtxt expand theta
+        ; check_valid_theta (ve_indices ve) env' SigmaCtxt expand theta
                 -- Allow     type T = ?x::Int => Int -> Int
                 -- but not   type T = ?x::Int
 
@@ -816,20 +1585,94 @@ check_type ve@(ValidityEnv{ ve_tidy_env = env
   where
     (tvbs, phi)   = tcSplitForAllTyVarBinders ty
     (theta, tau)  = tcSplitPhiTy phi
-    (env', _)     = tidyForAllTyBinders env tvbs
+    (env', _)     = tidyForAllTyBinders env (map snd tvbs)
 
 check_type (ve@ValidityEnv{ ve_tidy_env = env, ve_ctxt = ctxt
                           , ve_rank = rank })
-           ty@(FunTy _ mult arg_ty res_ty)
+           ty@(FunTy _ ma mult arg_ty res_ty)
   = do  { failIfTcM (not (linearityAllowed ctxt) && not (isManyTy mult))
                      (env, TcRnLinearFuncInKind (tidyType env ty))
+        ; check_type (ve{ve_rank = MustBeMonoType}) ma
         ; check_type (ve{ve_rank = arg_rank}) arg_ty
         ; check_type (ve{ve_rank = res_rank}) res_ty }
   where
     (arg_rank, res_rank) = funArgResRank rank
 
+check_type ve (ExistsTy flag tv body)
+  = do { check_type (ve { ve_rank = MustBeMonoType }) (varType tv)
+       ; check_type (case flag of
+           ImplicitExists | isSigmaTy body -> ve { ve_rank = MustBeMonoType }
+           _ -> ve) body }
+
 check_type _ ty@(ForAllTy {}) = pprPanic "check_type" (ppr ty)
 check_type _ ty@(CoercionTy {}) = pprPanic "check_type" (ppr ty)
+
+-- | Check a runtime dependency against its actual lexical binding.
+-- See Note [Validity of retained binders].
+check_retained_index :: ValidityEnv -> Id -> TcM ()
+check_retained_index ve v
+  = do { unless (eligible v) $
+           failWithTc $ TcRnRetainedQuantificationError (RetainedInvalidBinder v)
+       ; level <- getThLevel
+       ; case level of
+           Comp -> return ()
+           _ -> failWithTc $ TcRnRetainedQuantificationError RetainedStaging
+       ; if isNativeNamedOpaqueFunctionId v
+         then do { actual <- tcLookupId (getName v)
+                 ; unless (actual == v && isNativeNamedOpaqueFunctionId actual
+                           && varType actual `eqType` varType v) out_of_scope }
+         else unless (maybe False valid_bound (lookupVarSet (ve_indices ve) v)) $
+         do { mb_thing <- tcLookupLcl_maybe (getName v)
+            ; case mb_thing of
+                Just (ATcId { tct_id = v' }) ->
+                  do { binding <- liftZonkM (zonkId v')
+                     ; unless (v == binding && eligible binding
+                               && eqType (varType v) (varType binding)) out_of_scope }
+                _ -> out_of_scope } }
+  where
+    valid_bound binding = isNativeOpaqueValueId binding
+                       && eqType (varType v) (varType binding)
+    eligible index = isNativeIndexId index
+                  || isNativeNamedOpaqueFunctionId index
+                  || (not (isExternalName (getName index)) && isNativeOpaqueValueId index)
+    out_of_scope = failWithTc $ TcRnRetainedQuantificationError (RetainedIndexOutOfScope v)
+
+{- Note [Validity of retained binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained binder introduces a value argument. Use the ordinary function
+argument and result ranks, and extend the index scope only for its result.
+An index occurrence must refer to that scope or to an already-bound local
+index Id in the typechecker environment. Its Id remains unrestricted.
+Zonk the lexical binding's type and multiplicity before testing it. IO-bound
+indices can retain filled meta-variables in that metadata. Keep the same Unique
+and require the occurrence and binding domains to agree. This follows
+GHC.Tc.Gen.App, Note [Native index bindings during typechecking].
+Its domain must be a lifted value type. Compare the occurrence metadata with
+the bound or lexical Id. Source foreach domains have a separate structural
+check in GHC.Tc.Gen.HsType. An eligible function Id can also occur as a
+dedicated call head. Opaque value identity does not grant call permission.
+See Note [Function-valued retained binders] in GHC.Core.Type.
+Ordinary outer forall binders
+keep their existing type-variable scope and rank checks.
+Preserve this scope when checking nested constraints and their predicates.
+
+checkValidType also checks all deep free runtime Ids through this lexical
+check. The structural validity walk skips coercions and variable kinds.
+Those can contain runtime indices, including in an inferred local type.
+Reuse the deep free-variable list already needed for tidying. It excludes
+properly bound retained indices and follows kind and coercion metadata.
+Exclude CoVars: these Ids are erased evidence, not runtime indices.
+The deep check also accepts an eligible lexical opaque-call head or function
+value. Check the symbolic call argument at the head's declared domain.
+A retained Pi can bind an eligible function at its complete fixed type.
+See Note [Function fields in native index domains] in GHC.Core.Type.
+Keep both forms outside quotations. See Note [Source opaque call indices]
+in GHC.Tc.Gen.HsType.
+
+The dependent scope follows GHC Proposal #378 (§§4.8-4.9) and #425. This check
+does not evaluate an index; Haskell call-by-need laziness still applies
+(Schmidt-Schauß, Sabel and Machkasova, LMCS 2015).
+-}
 
 ----------------------------------------
 check_syn_tc_app :: ValidityEnv
@@ -860,10 +1703,27 @@ check_syn_tc_app (ve@ValidityEnv{ ve_ctxt = ctxt, ve_expand = expand })
                            -- See Note [Unsaturated type synonyms in GHCi]
   = check_args_only expand
 
+  | isConstrainedFamilyTyCon tc
+  , Left reason <- associatedFamilyDomain tc tys
+  = failWithTc (TcRnConstrainedFamilyUnsupported tc reason)
+
+  | isPartialTypeFunction tc tys
+  = do { enabled <- unsaturatedTypeFamiliesEnabled
+       ; if enabled || ve_imported_synonym ve || is_inferred ctxt
+           then check_args_only expand
+           else case expand of
+             Expand -> failWithTc arity_err
+             _ | ve_partial_family_hint ve -> reportWrittenPartialFamily tc tys
+               | otherwise -> failWithTc arity_err }
+
   | otherwise
-  = failWithTc (tyConArityErr tc tys)
+  = failWithTc arity_err
   where
     tc_arity  = tyConArity tc
+    is_inferred InfSigCtxt{} = True
+    is_inferred _ = False
+
+    arity_err = tyConArityErr tc tys
 
     check_arg :: ExpandMode -> KindOrType -> TcM ()
     check_arg expand =
@@ -876,8 +1736,120 @@ check_syn_tc_app (ve@ValidityEnv{ ve_ctxt = ctxt, ve_expand = expand })
       = assertPpr (isTypeSynonymTyCon tc) (ppr tc) $
         case coreView ty of
          Just ty' -> addErrCtxt (TySynErrCtxt tc) $
-                     check_type (ve{ve_expand = expand}) ty'
+           if ve_imported_synonym ve || isFamFreeTyCon tc
+             then check_type (ve { ve_expand = expand }) ty'
+             else check_imported_rhs expand ty'
          Nothing  -> pprPanic "check_syn_tc_app" (ppr ty)
+
+    check_imported_rhs expand ty' = do
+           mod <- tcg_semantic_mod <$> getGblEnv
+           -- Copy a validated exported RHS. Do not grant its permission to
+           -- an unvalidated partial family supplied through a parameter.
+           let imported = not (nameIsLocalOrFrom mod (tyConName tc)) &&
+                          maybe False hasWrittenPartialFamily (synTyConRhs_maybe tc) &&
+                          not (any hasWrittenPartialFamily tys)
+           check_type (ve { ve_expand = expand
+                          , ve_imported_synonym = imported }) ty'
+
+-- | Locate a validity error at its unique written family application.
+-- See Note [Locating a partial family application].
+reportWrittenPartialFamily :: TyCon -> [Type] -> TcM a
+reportWrittenPartialFamily tc args = do
+  contexts <- getErrCtxt
+  case writtenSpans contexts of
+    [Just loc] -> do
+      unit_state <- hsc_units <$> getTopEnv
+      let entity | isTypeSynonymTyCon tc = "type synonym"
+                 | otherwise = "type family"
+          hint = useExtensionInOrderTo (text "to write a partial" <+> text entity <+> text "application.")
+                                       LangExt.UnsaturatedTypeFamilies
+      setSrcSpan loc $ failWithTc $
+        TcRnMessageWithInfo unit_state (mkDetailedMessage (ErrInfo [] Nothing [hint]) message)
+    _ -> failWithTc message
+  where
+    message = tyConArityErr tc args
+    supplied = length (filterOutInvisibleTypes tc args)
+    writtenSpans [] = []
+    writtenSpans (TySynErrCtxt{} : _) = []
+    writtenSpans (UserSigCtxt _ source : _) = case source of
+      UserLHsSigType sig -> walk sig
+      UserLHsType ty -> walk ty
+    writtenSpans (_ : rest) = writtenSpans rest
+
+    walk :: Data a => a -> [Maybe SrcSpan]
+    walk node
+      | Just ty <- cast node              = walkType ty
+      | Just (_ :: SrcSpanAnnA) <- cast node = []
+      | Just (_ :: SrcSpanAnnN) <- cast node = []
+      | Just (_ :: SrcSpan)     <- cast node = []
+      | Just (_ :: Name)        <- cast node = []
+      | Just (_ :: Type)        <- cast node = []
+      | otherwise                         = concat (gmapQ walk node)
+
+    walkType :: LHsType GhcRn -> [Maybe SrcSpan]
+    walkType (L _ (HsParTy _ ty)) = walkType ty
+    walkType (L _ (HsKindSig _ ty kind)) = walkType ty ++ walkType kind
+    walkType ty = spine (getLocA ty) 0 ty
+
+    spine :: SrcSpan -> Int -> LHsType GhcRn -> [Maybe SrcSpan]
+    spine loc n (L _ ty) = case ty of
+      HsAppTy _ f a -> spine loc (n + 1) f ++ walkType a
+      HsAppKindTy _ f k -> spine loc n f ++ walkType k
+      HsParTy _ f -> spine loc n f
+      HsKindSig _ f k -> spine loc n f ++ walkType k
+      HsOpTy _ l f r -> spine loc (n + 2) f ++ walkType l ++ walkType r
+      HsSpliceTy{} -> [Nothing]  -- The splice may generate a competing site.
+      HsTyVar _ _ name
+        | unLocWithUserRdr name == tyConName tc, n == supplied ->
+            [if isGoodSrcSpan loc then Just loc else Nothing]
+        | otherwise -> []
+      _ -> concat (gmapQ walk ty)
+
+{- Note [Locating a partial family application]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The source validity check reports the arity error. The error context
+contains the renamed signature. Core types carry no source span.
+
+In Expand mode, LiberalTypeSynonyms can discard a written application
+while another application of the same family survives. For example, a
+splice can supply the head of the surviving application while a synonym
+discards a written application in a sibling type. Keep the original error
+location in Expand mode. See PartialFamilyArityAfterErasure.
+
+Use the resolved family name and visible arity to locate the error when
+the signature has one matching application. Count the entire application
+spine so a saturated call does not supply a false location. A type splice
+can supply a competing application even without LiberalTypeSynonyms.
+After synonym expansion, with a splice, or with several matching sites,
+use the original error location.
+-}
+
+-- | Find a written partial family or synonym before substituting its arguments.
+-- See Note [Imported partial family aliases].
+hasWrittenPartialFamily :: Type -> Bool
+hasWrittenPartialFamily = go
+  where
+    go (TyConApp tc tys) = isPartialTypeFunction tc tys || any go tys
+    go (AppTy f a) = go f || go a
+    go (FunTy _ ma mult a b) = any go [ma, mult, a, b]
+    go (ForAllTy ma (Bndr v _) ty) = go ma || go (varType v) || go ty
+    go (DepFunTy _ v ty) = go (varType v) || go ty
+    go (TermAppTy _ arg) = go arg
+    go (CastTy ty _) = go ty
+    go _ = False
+
+{- Note [Imported partial family aliases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An ordinary module may use a validated imported type synonym whose
+RHS contains a partial family. This permission comes from the raw
+definition. Do not let a written partial family in a caller's type
+argument inherit it. Preserve LiberalTypeSynonyms expansion for
+ordinary synonyms that do not introduce this feature: an argument
+can become saturated after ordinary expansion. Combining a written
+partial family with a new imported partial-family RHS still requires
+the extension. An ordinary local re-export can refer to the imported
+synonym and leaves its source permission at that definition.
+-}
 
 {-
 Note [Unsaturated type synonyms in GHCi]
@@ -1186,17 +2158,17 @@ checkValidTheta ctxt theta
   = addErrCtxt (ThetaCtxt ctxt theta) $
     do { env <- liftZonkM $ tcInitOpenTidyEnv (tyCoVarsOfTypesList theta)
        ; expand <- initialExpandMode
-       ; check_valid_theta env ctxt expand theta }
+       ; check_valid_theta emptyVarSet env ctxt expand theta }
 
 -------------------------
-check_valid_theta :: TidyEnv -> UserTypeCtxt -> ExpandMode
+check_valid_theta :: VarSet -> TidyEnv -> UserTypeCtxt -> ExpandMode
                   -> [PredType] -> TcM ()
-check_valid_theta _ _ _ []
+check_valid_theta _ _ _ _ []
   = return ()
-check_valid_theta env ctxt expand theta
+check_valid_theta indices env ctxt expand theta
   = do { dflags <- getDynFlags
        ; traceTc "check_valid_theta" (ppr theta)
-       ; mapM_ (check_pred_ty env dflags ctxt expand) theta }
+       ; mapM_ (check_pred_ty indices env dflags ctxt expand) theta }
 
 -------------------------
 {- Note [Validity checking for constraints]
@@ -1223,11 +2195,11 @@ to avoid requiring language extensions at the use site.  Main example
 We don't want to require ConstraintKinds in module B.
 -}
 
-check_pred_ty :: TidyEnv -> DynFlags -> UserTypeCtxt -> ExpandMode
+check_pred_ty :: VarSet -> TidyEnv -> DynFlags -> UserTypeCtxt -> ExpandMode
               -> PredType -> TcM ()
 -- Check the validity of a predicate in a signature
 -- See Note [Validity checking for constraints]
-check_pred_ty env dflags ctxt expand pred
+check_pred_ty indices env dflags ctxt expand pred
   = do { check_type ve pred
        ; check_pred_help False env dflags ctxt pred }
   where
@@ -1240,7 +2212,15 @@ check_pred_ty env dflags ctxt expand pred
     ve = ValidityEnv{ ve_tidy_env = env
                     , ve_ctxt     = SigmaCtxt
                     , ve_rank     = rank
-                    , ve_expand   = expand }
+                    , ve_expand   = expand
+                    , ve_indices  = indices
+                    , ve_imported_synonym = False
+                    , ve_instance_pat = Nothing
+                    , ve_partial_family_hint = case classifyPredType pred of
+                        -- The head of a quantified constraint follows the
+                        -- same rules as the head of an instance declaration.
+                        ForAllPred _ _ head_pred -> isTyFamFree head_pred
+                        _ -> True }
 
 check_pred_help :: Bool    -- True <=> under a type synonym
                 -> TidyEnv
@@ -1267,18 +2247,18 @@ check_pred_help under_syn env dflags ctxt pred
               -- to box such constraints in GHC.Tc.Utils.TcType.pickQuantifiablePreds, as described
               -- in Note [Lift equality constraints when quantifying] in GHC.Tc.Solver
 
-      ForAllPred _ theta head -> check_quant_pred env dflags ctxt pred theta head
-      _                       -> return ()
+      ForAllPred qtvs theta head -> check_quant_pred env dflags ctxt (map snd qtvs) pred theta head
+      _                          -> return ()
 
 check_quant_pred :: TidyEnv -> DynFlags -> UserTypeCtxt
-                 -> PredType -> ThetaType -> PredType -> TcM ()
-check_quant_pred env dflags ctxt pred theta head_pred
+                 -> [TyCoVar] -> PredType -> ThetaType -> PredType -> TcM ()
+check_quant_pred env dflags ctxt qtvs pred theta head_pred
   = addErrCtxt (QuantifiedCtCtxt pred) $
     do { -- Check the instance head
          case classifyPredType head_pred of
                                  -- SigmaCtxt tells checkValidInstHead that
                                  -- this is the head of a quantified constraint
-            ClassPred cls tys -> do { checkValidInstHead SigmaCtxt cls tys
+            ClassPred cls tys -> do { checkValidQuantPredHead (mkVarSet qtvs) cls tys
                                     ; check_pred_help False env dflags ctxt head_pred }
                                -- need check_pred_help to do extra pred-only validity
                                -- checks, such as for (~). Otherwise, we get #17563
@@ -1492,11 +2472,21 @@ We can also have instances for functions: @instance Foo (a -> b) ...@.
 -}
 
 checkValidInstHead :: UserTypeCtxt -> Class -> [Type] -> TcM ()
-checkValidInstHead ctxt clas cls_args
+checkValidInstHead = checkValidInstHeadWith (const (pure ()))
+
+checkValidQuantPredHead :: TyCoVarSet -> Class -> [Type] -> TcM ()
+checkValidQuantPredHead qtvs clas cls_args
+  = do { dflags  <- getDynFlags
+       ; hsc_src <- tcHscSource
+       ; check_special_inst_head dflags hsc_src SigmaCtxt clas cls_args
+       ; checkValidTypePatsWith (Just qtvs) (const (pure ())) (classTyCon clas) cls_args }
+
+checkValidInstHeadWith :: (CoercionN -> TcM ()) -> UserTypeCtxt -> Class -> [Type] -> TcM ()
+checkValidInstHeadWith record ctxt clas cls_args
   = do { dflags   <- getDynFlags
        ; hsc_src  <- tcHscSource
        ; check_special_inst_head dflags hsc_src ctxt clas cls_args
-       ; checkValidTypePats (classTyCon clas) cls_args
+       ; checkValidTypePats record (classTyCon clas) cls_args
        }
 
 {-
@@ -1699,10 +2689,18 @@ dropCasts :: Type -> Type
 -- To consider: drop only HoleCo casts
 dropCasts (CastTy ty _)       = dropCasts ty
 dropCasts (AppTy t1 t2)       = mkAppTy (dropCasts t1) (dropCasts t2)
-dropCasts ty@(FunTy _ w t1 t2)  = ty { ft_mult = dropCasts w, ft_arg = dropCasts t1, ft_res = dropCasts t2 }
+dropCasts ty@(FunTy _ ma w t1 t2)
+  = ty { ft_ma = dropCasts ma, ft_mult = dropCasts w
+       , ft_arg = dropCasts t1, ft_res = dropCasts t2 }
 dropCasts (TyConApp tc tys)   = mkTyConApp tc (map dropCasts tys)
-dropCasts (ForAllTy b ty)     = ForAllTy (dropCastsB b) (dropCasts ty)
-dropCasts ty                  = ty  -- LitTy, TyVarTy, CoercionTy
+dropCasts (ForAllTy ma b ty)  = ForAllTy (dropCasts ma) (dropCastsB b) (dropCasts ty)
+dropCasts (ExistsTy fl tv ty) = ExistsTy fl tv (dropCasts ty)
+dropCasts (DepFunTy vis b ty) = DepFunTy vis b (dropCasts ty)
+dropCasts (DepDictTy d ty)    = DepDictTy d (dropCasts ty)
+dropCasts (ClassAppTy sel inst dict arg kind)
+                              = ClassAppTy sel (dropCasts inst) (dropCasts dict) (dropCasts arg) (dropCasts kind)
+dropCasts (TermAppTy f arg)   = TermAppTy f (dropCasts arg)
+dropCasts ty                  = ty  -- LitTy, TyVarTy, TermVarTy, CoercionTy
 
 dropCastsB :: TyVarBinder -> TyVarBinder
 dropCastsB b = b   -- Don't bother in the kind of a forall
@@ -2049,20 +3047,30 @@ if we find a constraint tuple.
 -}
 
 
-checkValidInstance :: UserTypeCtxt -> LHsSigType GhcRn -> Type -> TcM ()
+checkValidInstance :: UserTypeCtxt -> LHsSigType GhcRn -> Type -> TcM Type
 checkValidInstance ctxt hs_type ty = case tau of
   -- See Note [Instances and constraint synonyms]
   TyConApp tc inst_tys
     | Just clas <- tyConClass_maybe tc
     -> do
-        { setSrcSpanA head_loc $
-          checkValidInstHead ctxt clas inst_tys
+        { proofs <- newTcRef []
+        ; setSrcSpanA head_loc $
+          checkValidInstHeadWith (\co -> updTcRef proofs (co :)) ctxt clas inst_tys
 
-        ; traceTc "checkValidInstance {" (ppr ty)
+        ; cos <- readTcRef proofs
+        ; ty' <- if null cos
+                 then return ty
+                 else do { cos' <- liftZonkM $ traverse zonkCo cos
+                         ; return $ normaliseInstBinderKinds (tyCoVarsOfTypes inst_tys) cos' ty }
+
+        ; traceTc "checkValidInstance {" (ppr ty')
 
         ; env0 <- liftZonkM $ tcInitTidyEnv
         ; expand <- initialExpandMode
-        ; check_valid_theta env0 ctxt expand theta
+        ; check_valid_theta emptyVarSet env0 ctxt expand theta
+        ; case ctxt of
+            InstDeclCtxt False -> checkConstrainedSignature ctxt ty
+            _ -> return ()
 
         -- The Termination and Coverage Conditions
         -- Check that instance inference will terminate (if we care)
@@ -2076,7 +3084,7 @@ checkValidInstance ctxt hs_type ty = case tau of
         --   in the constraint than in the head
         ; undecidable_ok <- xoptM LangExt.UndecidableInstances
         ; if undecidable_ok
-          then checkAmbiguity ctxt ty
+          then checkAmbiguity ctxt ty'
           else checkInstTermination theta tau
 
         ; traceTc "cvi 2" (ppr ty)
@@ -2088,7 +3096,8 @@ checkValidInstance ctxt hs_type ty = case tau of
               -> addErrTc $ mk_err
                           $ IllegalInstanceFailsCoverageCondition clas coverageInstErr
 
-        ; traceTc "End checkValidInstance }" empty }
+        ; traceTc "End checkValidInstance }" empty
+        ; return ty' }
     | otherwise
     -> failWithTc $ mk_err $ IllegalInstanceHead
                            $ InstHeadNonClassHead
@@ -2113,7 +3122,7 @@ splitInstTyForValidity = split_context [] . drop_foralls
     -- This is like 'dropForAlls', except that it does not look through type
     -- synonyms.
     drop_foralls :: Type -> Type
-    drop_foralls (ForAllTy (Bndr _tv argf) ty)
+    drop_foralls (ForAllTy _ (Bndr _tv argf) ty)
       | isInvisibleForAllTyFlag argf = drop_foralls ty
     drop_foralls ty = ty
 
@@ -2154,7 +3163,7 @@ checkInstTermination theta head_pred
            -> check2 (pSizeClassPredX foralld_tvs cls tys)
 
          ForAllPred tvs _ head_pred'
-           -> check (foralld_tvs `extendVarSetList` tvs) head_pred'
+           -> check (foralld_tvs `extendVarSetList` map snd tvs) head_pred'
               -- Termination of the quantified predicate itself is checked
               -- when the predicates are individually checked for validity
 
@@ -2202,9 +3211,9 @@ GHC.Tc.Validity) that does not expand type synonyms.
 ************************************************************************
 -}
 
-checkValidCoAxiom :: CoAxiom Branched -> TcM ()
-checkValidCoAxiom ax@(CoAxiom { co_ax_tc = fam_tc, co_ax_branches = branches })
-  = do { mapM_ (checkValidCoAxBranch fam_tc) branch_list
+checkValidCoAxiom :: NameEnv [TyFamEqnValidityInfo] -> CoAxiom Branched -> TcM ()
+checkValidCoAxiom selectors ax@(CoAxiom { co_ax_tc = fam_tc, co_ax_branches = branches })
+  = do { mapM_ (checkCoAxBranchWithSelectors selectors fam_tc) branch_list
        ; foldlM_ check_branch_compat [] branch_list }
   where
     branch_list = fromBranches branches
@@ -2264,11 +3273,14 @@ checkValidCoAxiom ax@(CoAxiom { co_ax_tc = fam_tc, co_ax_branches = branches })
 -- (It's separate because it expects 'TyFamEqnValidityInfo', which comes from a
 -- separate place e.g. for associated type defaults.)
 checkValidCoAxBranch :: TyCon -> CoAxBranch -> TcM ()
-checkValidCoAxBranch fam_tc
-                    (CoAxBranch { cab_lhs = typats
-                                , cab_rhs = rhs, cab_loc = loc })
+checkValidCoAxBranch = checkCoAxBranchWithSelectors emptyNameEnv
+
+checkCoAxBranchWithSelectors :: NameEnv [TyFamEqnValidityInfo] -> TyCon -> CoAxBranch -> TcM ()
+checkCoAxBranchWithSelectors selectors fam_tc
+                             (CoAxBranch { cab_lhs = typats
+                                         , cab_rhs = rhs, cab_loc = loc })
   = setSrcSpan loc $
-    checkValidTyFamEqn fam_tc typats rhs
+    checkTyFamEqnWithSelectors selectors fam_tc typats rhs
 
 -- | Do validity checks on a type family equation, including consistency
 -- with any enclosing class instance head, termination, and lack of
@@ -2282,8 +3294,18 @@ checkValidTyFamEqn :: TyCon    -- ^ of the type family
                    -> [Type]   -- ^ Type patterns
                    -> Type     -- ^ Rhs
                    -> TcM ()
-checkValidTyFamEqn fam_tc typats rhs
-  = do { checkValidTypePats fam_tc typats
+checkValidTyFamEqn = checkTyFamEqnWithSelectors emptyNameEnv
+
+checkTyFamEqnWithSelectors :: NameEnv [TyFamEqnValidityInfo] -> TyCon -> [Type] -> Type -> TcM ()
+checkTyFamEqnWithSelectors selectors fam_tc typats rhs
+  = do { checkValidTypePats (const (pure ())) fam_tc typats
+       ; case tyConFlavour fam_tc of
+           ClosedTypeFamilyFlavour -> do
+             let raw_binders = filter (\tv -> isTyVar tv && isPrimFamilyPatBinderKind (varType tv))
+                                      (tyCoVarsOfTypesList typats)
+                 invalid = filter (not . isPrimFamilyPatBinder typats rhs) raw_binders
+             unless (null invalid) $ addErrTc (TcRnEscapingPrimFamilyBinder invalid)
+           _ -> return ()
 
          -- Check for oversaturated visible kind arguments in a type family
          -- equation.
@@ -2301,13 +3323,69 @@ checkValidTyFamEqn fam_tc typats rhs
          --             type instance F Int              = forall a. a->a
          --             type instance F Int              = Int#
          -- See #9357
-       ; checkValidMonoType rhs
+       ; check_valid_mono_type (checkEquationFamilyDomains fam_tc typats) Nothing rhs
 
          -- We have a decidable instance unless otherwise permitted
        ; undecidable_ok <- xoptM LangExt.UndecidableInstances
        ; traceTc "checkVTFE" (ppr fam_tc $$ ppr rhs $$ ppr (tcTyFamInsts rhs))
        ; unless undecidable_ok $
-         mapM_ addErrTc (checkFamInstRhs fam_tc typats (tcTyFamInsts rhs)) }
+         mapM_ addErrTc (checkFamInstRhs selectors fam_tc typats rhs) }
+
+-- | Check the family domains in an equation under its owning class.
+-- See Note [Class evidence in associated family equations].
+checkEquationFamilyDomains :: TyCon -> [Type] -> Type -> TcM ()
+checkEquationFamilyDomains family pats rhs
+  | isJust (scopedSumDomains family) = pure ()
+  | null (constrainedFamilyApps rhs) = pure ()
+  | not (isConstrainedFamilyTyCon family) = checkNoConstrainedFamilyApps rhs
+  | otherwise = do
+      (_, owner_sigma) <- either (failWithTc . TcRnConstrainedFamilyUnsupported family)
+                                pure (associatedFamilyDomain family pats)
+      info <- mkSkolemInfo FamInstSkol
+      let (owner_vars, predicate) = splitForAllTyVars owner_sigma
+          scope = mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes (owner_sigma : rhs : pats)))
+      (subst, skolems) <- tcInstSkolTyVarsX info scope (map snd owner_vars)
+      owner <- newEvVars [substTy subst predicate]
+      uses <- familyDomainObligations rhs
+      (_, wanted) <- captureConstraints $
+        checkConstraints FamInstSkol skolems owner $
+          mapM_ (emitFamilyDomain (TySynCtxt (tyConName family)) rhs) uses
+      (unsolved, _) <- runTcS $ setTcSMode (vanillaTcSMode { tcsmGivenOnly = True }) $
+                        solveWanteds wanted
+      case residualPredicates unsolved of
+        [] -> reportAllUnsolved unsolved
+        missing -> do
+          source <- liftZonkM $ zonkTcType (substTy subst predicate)
+          required <- liftZonkM $ zonkTcTypes missing
+          env <- liftZonkM $ tcInitOpenTidyEnv (tyCoVarsOfTypesList (source : required))
+          let pp_required = pprWithCommas (quotes . ppr) (tidyTypes env (nubBy eqType required))
+          failWithTc $ TcRnConstrainedFamilyUnsupported family $
+            sep [ text "The equation requires" <+> pp_required
+                , text "from its owning class constraint" <+> quotes (ppr (tidyType env source)) <> dot ]
+  where
+    residualPredicates wc = map ctPred (toList (wc_simple wc)) ++
+                            concatMap (residualPredicates . ic_wanted) (wc_impl wc)
+
+{- Note [Class evidence in associated family equations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For class Collects c => View c, the default Viewed c = Elem c can use
+Collects c. Every use of the marked Viewed c requires View c and every
+View c dictionary provides Collects c. The same rule applies to an
+explicit associated type instance after substitution of its patterns.
+
+Use the owner and its superclasses to check the right-hand side. An
+importer can specialize an instance available to the equation writer.
+The specialized instance may require an extra constraint. Ordinary
+families carry no owner domain in their interfaces.
+
+An omitted owner parameter is rigid when opening the equation owner.
+Only the inferred parameters of a right-hand-side domain get fresh
+metavariables. The ordinary solver can project superclasses, rewrite
+by a nominal equality and apply a quantified dictionary. Run this
+implication with tcsmGivenOnly so its evidence is available whenever
+the owner is. Use the same scoped templates as signature formation.
+An ignored synonym argument still requires its own domain.
+-}
 
 -- | Checks that an associated type family default:
 --
@@ -2363,8 +3441,9 @@ checkValidAssocTyFamDeflt fam_tc pats =
                           $ AssocDefaultDuplicateTyVars d)
         dups
 
-checkFamInstRhs :: TyCon -> [Type]         -- LHS
-                -> [(TyCon, [Type])]       -- type family calls in RHS
+checkFamInstRhs :: NameEnv [TyFamEqnValidityInfo] -- original rows of generated cases
+                -> TyCon -> [Type]         -- LHS
+                -> Type                    -- RHS
                 -> [TcRnMessage]
 -- Ensure that the type family instance terminates. Specifically:
 -- ensure that each type family application in the RHS is
@@ -2374,16 +3453,251 @@ checkFamInstRhs :: TyCon -> [Type]         -- LHS
 --          - strictly smaller than the lhs,
 --          - mentions no type variable more often than the lhs, and
 --          - does not contain any further type family applications
-checkFamInstRhs lhs_tc lhs_tys famInsts
-  = mapMaybe check famInsts
+checkFamInstRhs selectors lhs_tc lhs_tys rhs
+  = concatMap check (tcTyFamInsts rhs)
   where
    lhs_size = pSizeTypes lhs_tys
    check (tc, tys)
       | not (isStuckTypeFamily tc)                                   -- (TF1)
       , Just pc_failure <- pSizeTypes tys `ltPatersonSize` lhs_size  -- (TF2)
-      = Just $ TcRnPatersonCondFailure pc_failure InTyFamEquation (TyConApp lhs_tc lhs_tys) (TyConApp tc tys)
+      = case case_calls tc tys of
+          Just errors -> errors
+          Nothing | forwards_payload pc_failure tc tys
+                 || forwards_lambda pc_failure tc tys -> []
+          Nothing -> [TcRnPatersonCondFailure pc_failure InTyFamEquation
+                        (TyConApp lhs_tc lhs_tys) (TyConApp tc tys)]
       | otherwise
-      = Nothing
+      = []
+
+   -- See Note [Termination of lifted case selectors] in GHC.Tc.TyCl.
+   case_calls tc tys = do
+      rows <- lookupNameEnv selectors (tyConName tc)
+      guard (selector_result tc tys)
+      if all constructor_row rows
+        then [] <$ guard (all (isCaseSelectorType constructor_selector) tys)
+        else do
+          guard (all isConstructorCaseType tys && all isConstructorCaseType lhs_tys)
+          refined <- traverse (refineCaseCall lhs_tc lhs_tys tys) rows
+          pure (concatMap check_branch refined)
+
+   constructor_selector tc tys
+      | Just rows <- lookupNameEnv selectors (tyConName tc)
+      = selector_result tc tys && all constructor_row rows
+      | otherwise = False
+
+   selector_result tc tys
+      | tyConArity tc == length tys
+      = isConstructorCaseType (coreFullView (typeKind (mkTyConApp tc tys)))
+      | otherwise = False
+
+   constructor_row VI{vi_rhs = rhs} = isConstructorCaseType rhs
+   constructor_row _ = False
+
+   check_branch (lhs, refined_rhs) = checkFamInstRhs emptyNameEnv lhs_tc lhs refined_rhs
+
+   -- See Note [Termination of a forwarding type lambda].
+   distinct_lhs_tvs tys
+      | Just tvs <- traverse getTyVar_maybe tys
+      , let tv_set = mkVarSet tvs
+      = sizeVarSet tv_set == length tvs
+        && tv_set `subVarSet` mkVarSet (mapMaybe getTyVar_maybe lhs_tys)
+      | otherwise = False
+
+   forwards_lambda _ tc _
+      | Just (_, False) <- closedFamilyScope_maybe lhs_tc
+      , Just ax <- closedFamilyTyConCoAxiom_maybe lhs_tc
+      , [branch] <- fromBranches (coAxiomBranches ax)
+      , all isTyVarTy (coAxBranchLHS branch)
+      , all isTyVarTy lhs_tys
+      = cannot_return_first_order emptyTyConSet [tc]
+   forwards_lambda _ _ _ = False
+
+   forwards_payload PCF_Size tc tys
+      | Just (root, is_sigma) <- closedFamilyScope_maybe lhs_tc
+      , Just (root', is_sigma') <- closedFamilyScope_maybe tc
+      = root == root'
+        && is_sigma == is_sigma'
+        && tyConArity tc > length tys
+        && distinct_lhs_tvs tys
+        && cannot_return emptyTyConSet [tc]
+   forwards_payload _ _ _ = False
+
+   cannot_return = cannot_return_with (const True)
+   cannot_return_first_order = cannot_return_with no_app_ty
+
+   no_app_ty ty = case coreFullView ty of
+      AppTy {}          -> False
+      TyConApp _ args   -> all no_app_ty args
+      FunTy _ ma m a r  -> all no_app_ty [ma, m, a, r]
+      ForAllTy ma _ r   -> no_app_ty ma && no_app_ty r
+      CastTy t _        -> no_app_ty t
+      _                 -> True
+
+   cannot_return_with _ _ [] = True
+   cannot_return_with rhs_ok seen (tc:rest)
+      | tc == lhs_tc = False
+      | tc `elemTyConSet` seen = cannot_return_with rhs_ok seen rest
+      | Just syn_rhs <- synTyConRhs_maybe tc
+      = rhs_ok syn_rhs
+        && cannot_return_with rhs_ok (extendTyConSet seen tc)
+             (nonDetEltsUniqSet (tyConsOfTypes [syn_rhs]) ++ rest)
+      | not (isTypeFamilyTyCon tc) || isStuckTypeFamily tc
+      = cannot_return_with rhs_ok seen rest
+      | Just ctf <- closedTypeFamily_maybe tc
+      , CTF_Abstract <- ctf
+      = False
+      | Just ctf <- closedTypeFamily_maybe tc
+      = let rhs_list = [coAxBranchRHS branch
+                       | ax <- maybeToList (closedTyFamCoAxiom_maybe ctf)
+                       , branch <- fromBranches (coAxiomBranches ax)]
+            calls = nonDetEltsUniqSet (tyConsOfTypes rhs_list)
+        in all rhs_ok rhs_list
+           && cannot_return_with rhs_ok (extendTyConSet seen tc) (calls ++ rest)
+      | otherwise = False
+
+-- | Substitute a selected constructor into the original family LHS and
+-- all actual case arguments. Match the original checked branch against
+-- those arguments to recover the branch field and capture substitutions.
+-- See Note [Termination of lifted case selectors] in GHC.Tc.TyCl.
+refineCaseCall :: TyCon -> [Type] -> [Type] -> TyFamEqnValidityInfo -> Maybe ([Type], Type)
+refineCaseCall owner lhs args VI{vi_qtvs = qtvs, vi_pats = pats, vi_rhs = rhs,
+                                 vi_case_pattern = Just (_, column, shape, pat)} = do
+  actual : _ <- pure (drop column args)
+  scrutinee <- getTyVar_maybe actual
+  let caller_scope   = tyCoVarsOfTypes (lhs ++ args)
+      scrutinee_kind = varType scrutinee
+  guard (scrutinee `elemVarSet` tyCoVarsOfTypes lhs)
+  guard (not (scrutinee `elemVarSet` tyCoVarsOfType scrutinee_kind))
+  let (fresh_sub, qtvs1) = substTyVarBndrs (mkEmptySubst (mkInScopeSet caller_scope)) (scopedSort qtvs)
+      pats1 = substTys fresh_sub pats
+      pat1  = substTy fresh_sub pat
+      rhs1  = substTy fresh_sub rhs
+  k_match <- tcMatchTyKis [typeKind pat1] [scrutinee_kind]
+  guard (eqType (substTy k_match (typeKind pat1)) scrutinee_kind)
+  let base_in_scope = mkInScopeSet (caller_scope `unionVarSet` mkVarSet qtvs1)
+      step_qtv sub tv
+        | Just mapped_ty <- lookupTyVar k_match tv = extendTvSubst sub tv mapped_ty
+        | otherwise                                = fst (substTyVarBndr sub tv)
+      inst_sub = foldl' step_qtv (mkEmptySubst base_in_scope) qtvs1
+      pats2    = substTys inst_sub pats1
+      pat2     = substTy inst_sub pat1
+      rhs2     = substTy inst_sub rhs1
+      scope    = caller_scope `unionVarSet` tyCoVarsOfTypes (pat2 : pats2 ++ [rhs2])
+      pat_tvs  = tyCoVarsOfType pat2 `minusVarSet` caller_scope
+  guard (allVarSet (not . elemVarSet scrutinee . tyCoVarsOfType . varType) scope)
+  let initial = mkEmptySubst (mkInScopeSet scope)
+      valid_pat_tree ty = case coreFullView ty of
+        TyVarTy tv | tv `elemVarSet` pat_tvs -> Just [tv]
+        TyConApp tc all_args
+          | isPromotedDataCon tc
+          , length all_args == tyConArity tc -> do
+              let vis_n = count isVisibleTyConBinder (tyConBinders tc)
+                  (invis_args, field_args) = splitAt (length all_args - vis_n) all_args
+              guard (all isTyFamFree invis_args)
+              tvs <- concat <$> traverse valid_pat_tree field_args
+              guard (sizeVarSet (mkVarSet tvs) == length tvs)
+              pure tvs
+        _ -> Nothing
+  refine <- case (shape, coreFullView pat2) of
+    (CasePatternField, TyVarTy _) -> pure initial
+    (CasePatternConstructor{}, TyConApp tc _)
+      | isPromotedDataCon tc, isJust (valid_pat_tree pat2) ->
+          pure (extendTvSubst initial scrutinee pat2)
+    _ -> Nothing
+  let lhs'  = substTys refine lhs
+      args' = substTys refine args
+  matched <- tcMatchTyKis pats2 args'
+  guard (eqTypes (substTys matched pats2) args')
+  let rhs' = substTyUnchecked matched rhs2
+  guard (tyCoVarsOfType rhs' `subVarSet` tyCoVarsOfTypes lhs')
+  guard (valid_case_rhs rhs')
+  pure (lhs', rhs')
+  where
+    direct_call ty
+      | TyConApp callee actuals <- coreFullView ty =
+          callee == owner && length actuals == tyConArity owner
+      | otherwise = False
+    valid_case_rhs ty
+      | isConstructorCaseType ty || direct_call ty = True
+      | Just rhs_v <- coreView ty = valid_case_rhs rhs_v
+      | TyConApp tc tc_args <- ty =
+          not (isTypeSynonymTyCon tc) && not (isFamilyTyCon tc) && all valid_case_rhs tc_args
+      | FunTy _ ma mult a r <- ty =
+          all valid_case_rhs [ma, mult, a, r]
+      | ForAllTy ma bndr body <- ty =
+          valid_case_rhs ma && valid_case_rhs (binderType bndr) && valid_case_rhs body
+      | otherwise = False
+refineCaseCall _ _ _ _ = Nothing
+
+-- | A case selector permits only constructor types, arrows, variables and literals.
+-- In particular, an application of a captured variable can call a family.
+isConstructorCaseType :: Type -> Bool
+isConstructorCaseType = isCaseSelectorType (\_ _ -> False)
+
+-- | A constructor type can also contain checked selector applications.
+isCaseSelectorType :: (TyCon -> [Type] -> Bool) -> Type -> Bool
+isCaseSelectorType check_selector = go
+  where
+    go ty | Just rhs <- coreView ty = go rhs
+    go (TyVarTy _) = True
+    go (TermVarTy _) = True
+    go (LitTy _) = True
+    go (FunTy _ ma mult arg res) = go ma && go mult && go arg && go res
+    go (ForAllTy ma bndr body) = go ma && go (binderType bndr) && go body
+    go (TyConApp tc args) =
+      not (isTypeSynonymTyCon tc) &&
+      (not (isFamilyTyCon tc) || check_selector tc args) && all go args
+    go _ = False
+
+{- Note [Termination of a forwarding type lambda]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A synthesized beta type lambda such as '\n -> plus n n' or
+'type Stamped tag = \cell -> Stamp tag cell' lowers to a single-branch
+closed family whose LHS patterns are distinct type variables. One
+application of that family performs one beta-substitution step and does
+not match constructors.
+
+Permit a family call in that single beta branch when every reachable
+target is a concrete closed family or type synonym, no reachable
+definition refers back to the lambda family, and no reachable branch
+applies a higher-order callback variable with AppTy. Reject open
+families, abstract placeholder families, higher-order Apply helpers, and
+mutual return edges through surrounding type synonyms.
+-}
+
+{- Note [Termination of lifted sum payloads]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A nested sum lifts to a new payload family. The outer equation passes its
+entire telescope to the inner family and leaves its witness argument open:
+
+  Outer a b = Sigma Bool (Inner a b)
+  Inner a b c = ...
+
+The application has the same size as the outer LHS. Accept this forwarding
+edge when the checked arguments agree, the generated families share a
+lexical root, and exactly one witness argument is missing. Other family
+calls still need to satisfy the Paterson conditions.
+
+An ordinary family can hide a return path to the outer payload:
+
+  Inner a b c = User a b
+  User a b = Source a    -- Source mentions the closure Outer a.
+
+Both calls meet the existing size check. User a b only mentions the
+partial application Outer a. Before allowing the new forwarding edge,
+look through synonym expansions and reachable closed family equations.
+Require that none refer back to the caller. An open or abstract family
+can have equations that this check cannot see, so keep the size check
+when such a family is reachable.
+
+The source synonym can also name itself, directly or through another
+synonym. After lifting, those cycles pass through a private family, so
+ordinary synonym expansion alone does not find them. Include the checked
+source payload bodies in the synonym cycle check. Use the checked original
+equations because the ordered case axioms are still tied to the declaration
+knot at that point. Do not follow user family equations when checking
+synonym cycles.
+-}
 
 -----------------
 
@@ -2397,9 +3711,39 @@ checkTyFamEqnValidityInfo fam_tc = \ case
      , vi_qtvs         = qtvs
      , vi_non_user_tvs = non_user_tvs
      , vi_pats         = pats
-     , vi_rhs          = rhs } ->
+     , vi_case_pattern = case_pattern
+     , vi_rhs          = rhs } -> do
+    forM_ case_pattern $ \(_, _, pattern, pat) ->
+      case pattern of
+        CasePatternConstructor span _ _ -> setSrcSpan span $
+          checkTc (isJust (tcSplitTyConApp_maybe (typeCasePatternView pat))) (TcRnTypeCasePattern (Just pat))
+        CasePatternField -> setSrcSpan loc $
+          checkTc (isJust (getTyVar_maybe (typeCasePatternView pat))) (TcRnTypeCasePattern (Just pat))
     setSrcSpan loc $
-    checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
+      checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
+
+-- | Expose the shape of a checked type-case pattern for constructor analysis.
+-- See Note [Publishing ordered type cases] in "GHC.Tc.TyCl".
+typeCasePatternView :: Type -> Type
+typeCasePatternView ty = case coreFullView ty of
+  CastTy pattern _ -> typeCasePatternView pattern
+  pattern -> pattern
+
+{- Note [Constructor heads in type cases]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A variable or wildcard accepts the scrutinee at its position in the row
+order. An earlier constructor row must still select a branch, even when
+the two right-hand sides agree. Use the ordered case compiler for these
+rows. A source synonym written as a constructor pattern, such as Identity x,
+must still expose a constructor after expansion. Keep the checked
+pattern and source location in TyFamEqnValidityInfo. Inspect it after the
+recursive group is complete and the synonym cycle check has run. Expanding
+synonyms during the family equation check can force the unfinished knot.
+
+Use the normal constructor view, including the visible function-arrow
+constructor. Ordinary family LHS validity still rejects a type family
+application. Other family equations do not carry a case pattern.
+-}
 
 -- | Check binders for a type or data family declaration.
 --
@@ -2501,16 +3845,23 @@ checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
 -- Specifically:
 --    * All monotypes
 --    * No type-family applications
-checkValidTypePats :: TyCon -> [Type] -> TcM ()
-checkValidTypePats tc pat_ty_args
+--    * Matchable application heads
+checkValidTypePats :: (CoercionN -> TcM ()) -> TyCon -> [Type] -> TcM ()
+checkValidTypePats = checkValidTypePatsWith Nothing
+
+checkValidTypePatsWith :: Maybe TyCoVarSet -> (CoercionN -> TcM ()) -> TyCon -> [Type] -> TcM ()
+checkValidTypePatsWith mb_qtvs record tc pat_ty_args
   = do { -- Check that each of pat_ty_args is a monotype.
          -- One could imagine generalising to allow
          --      instance C (forall a. a->a)
          -- but we don't know what all the consequences might be.
-         traverse_ checkValidMonoType pat_ty_args
+         --
+         -- Suppress the opt-in hint when the expanded pattern still
+         -- contains a family application. The extension cannot make it legal.
+         traverse_ (check_valid_mono_type checkNoConstrainedFamilyApps (Just (mb_qtvs, skol_info, record))) pat_ty_args
 
        -- Ensure that no type family applications occur a type pattern
-       ; case tcTyConAppTyFamInstsAndVis tc pat_ty_args of
+       ; case tcPatTyConAppTyFamInstsAndVis tc pat_ty_args of
             [] -> pure ()
             ((tf_is_invis_arg, tf_tc, tf_args):_) ->
               failWithTc $ TcRnIllegalInstance $
@@ -2518,6 +3869,91 @@ checkValidTypePats tc pat_ty_args
                   tf_is_invis_arg tf_tc tf_args }
   where
     inst_ty = mkTyConApp tc pat_ty_args
+    skol_info
+      | isClassTyCon tc = InstSkol IsClsInst pSizeZero
+      | otherwise       = FamInstSkol
+
+-- | Check the consumed kind binder of an application in an instance pattern.
+-- In a quantified constraint ('Just' @qtvs@), a fixed outer type variable head
+-- (disjoint from @qtvs@) is matched by syntactic congruence rather than
+-- pattern inversion, so unmatchable outer predicates such as @f :: a %U -> Type@
+-- in @forall (x :: a). C (f x)@ are valid.
+-- See Note [Matchability of instance patterns].
+checkPatternMatchability :: Maybe TyCoVarSet -> SkolemInfoAnon -> (CoercionN -> TcM ()) -> Type -> TcM ()
+checkPatternMatchability mb_qtvs skol_info record head_ty
+  | Just qtvs <- mb_qtvs
+  , disjointVarSet qtvs (tyCoVarsOfType head_ty)
+  = pure ()
+  | Just (ma, _, _) <- splitPiTy_maybe (typeKind head_ty)
+  , not (ma `eqType` matchableDataConTy)
+  = do { co <- pushLevelAndSolveEqualities skol_info [] $
+                 unifyTypeAndEmit KindLevel (origin ma) ma matchableDataConTy
+       ; record co }
+  | otherwise = pure ()
+  where
+    origin ma = TypeEqOrigin { uo_actual = ma, uo_expected = matchableDataConTy
+                             , uo_thing = Nothing, uo_invisible = Nothing }
+
+-- | Record the selectors proved by instance-head validation on the dictionary
+-- binders. See Note [Computed matchability in instance binders].
+normaliseInstBinderKinds :: TyCoVarSet -> [CoercionN] -> Type -> Type
+normaliseInstBinderKinds head_vars proofs ty =
+    rebind (mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))) ty
+  where
+    rebind subst (ForAllTy ma (Bndr tv vis) body)
+      = mkTyCoForAllTy (substTy subst ma) tv' vis (rebind subst' body)
+      where
+        (subst', tv')
+          | isTyVar tv, tv `elemVarSet` head_vars
+          , Reduction co kind <- normalise_kind (varType tv)
+          , not (isReflCo co)
+          = let tv' = setVarType tv (substTy subst kind)
+                old = mkCastTy (mkTyVarTy tv') (mkSymCo (substCo subst co))
+            in (extendTvSubstAndInScope subst tv old, tv')
+          | otherwise
+          = substVarBndr subst tv
+    rebind subst body = substTy subst body
+
+    normalise_kind kind
+      | FunTy flag ma mult arg res <- coreFullView kind
+      = mkFunRedn Nominal flag (selector ma) (refl mult) (refl arg) (normalise_kind res)
+      | ForAllTy ma (Bndr tv vis) res <- coreFullView kind
+      = mkForAllRedn vis tv (selector ma) (refl (varType tv)) (normalise_kind res)
+      | otherwise = refl kind
+
+    selector ma = case find (eqType ma . coercionLKind) proofs of
+      Just co -> mkReduction co matchableDataConTy
+      Nothing -> refl ma
+
+    refl = mkReflRedn Nominal
+
+{- Note [Computed matchability in instance binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Instance-head validity can prove that Flip U is M. Instance lookup uses
+the pure matcher, which cannot reduce Flip U to see that f x is matchable.
+Keep the proof that validation used and rewrite the corresponding
+selector in f's dictionary binder. A substitution casts occurrences
+that still need the old kind. For f x the application constructor pushes
+the cast through the application and exposes the M arrow to the matcher.
+
+Use only the nominal equalities checked in the head. A selector in an
+unused quantified kind can diverge. The left endpoint of the equality
+must agree with the selector in the uninstantiated kind. A proof that
+Pick Bool is M is insufficient to rewrite Pick a under forall a.
+-}
+
+{- Note [Matchability of instance patterns]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An application such as f x is a matchable pattern only when the
+consumed binder is matchable. A family's binder check can succeed
+if f and x are also bound in other, injective positions. That does
+not make f x a valid pattern. Check the application after synonym
+expansion so a synonym can discard an unused argument. Check the
+matchability of just the consumed binder by nominal equality. Neither the
+instance context nor later instance selection can supply it.
+
+See proposal #242, Application in pattern position.
+-}
 
 -------------------------
 checkConsistentFamInst :: AssocInstInfo
@@ -3008,29 +4444,20 @@ Historical note: this test used to be called reportFloatingKvs.
 
 -- | Check a list of binders to see if they make a valid telescope.
 -- See Note [Bad TyCon telescopes]
-type TelescopeAcc
-      = ( TyVarSet   -- Bound earlier in the telescope
-        , Bool       -- At least one binder occurred (in a kind) before
-                     -- it was bound in the telescope.  E.g.
-        )            --    T :: forall (a::k) k. blah
-
 checkTyConTelescope :: TyCon -> TcM ()
 checkTyConTelescope tc
-  | bad_scope
+  | has_bad_scope emptyVarSet (tyConBinders tc)
   = -- See "Ill-scoped binders" in Note [Bad TyCon telescopes]
     addErr $ TcRnBadTyConTelescope tc
 
   | otherwise
   = return ()
   where
-    tcbs = tyConBinders tc
-
-    (_, bad_scope) = foldl add_one (emptyVarSet, False) tcbs
-
-    add_one :: TelescopeAcc -> TyConBinder -> TelescopeAcc
-    add_one (bound, bad_scope) tcb
-      = ( bound `extendVarSet` tv
-        , bad_scope || not (isEmptyVarSet (fkvs `minusVarSet` bound)) )
+    has_bad_scope :: TyVarSet -> [TyConBinder] -> Bool
+    has_bad_scope !_ [] = False
+    has_bad_scope !bound (tcb : rest)
+      | not (isEmptyVarSet (fkvs `minusVarSet` bound)) = True
+      | otherwise = has_bad_scope (bound `extendVarSet` tv) rest
       where
-        tv = binderVar tcb
+        tv   = binderVar tcb
         fkvs = tyCoVarsOfType (tyVarKind tv)

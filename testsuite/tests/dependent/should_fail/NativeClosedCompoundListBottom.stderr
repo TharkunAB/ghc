@@ -1,0 +1,5 @@
+NativeClosedCompoundListBottom.hs:7:15: error: [GHC-70565]
+    • Cannot evaluate ‘P.bottomElement’ in a type.
+        compound list element forced
+    • In the first argument of ‘Proxy’, namely ‘(P.bottomElement 1)’
+      In the type signature: bad :: Proxy (P.bottomElement 1)

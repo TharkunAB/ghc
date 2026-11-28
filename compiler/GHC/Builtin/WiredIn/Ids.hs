@@ -212,7 +212,7 @@ proxyHashId
     [kv,tv] = mkTemplateKiTyVar liftedTypeKind (\x -> [x])
     kv_ty   = mkTyVarTy kv
     tv_ty   = mkTyVarTy tv
-    ty      = mkInfForAllTy kv $ mkSpecForAllTy tv $ mkProxyPrimTy kv_ty tv_ty
+    ty      = mkInfForAllTy unmatchableDataConTy kv $ mkSpecForAllTy unmatchableDataConTy tv $ mkProxyPrimTy kv_ty tv_ty
 
 ------------------------------------------------
 nullAddrId :: Id
@@ -241,9 +241,9 @@ seqId = pcRepPolyId seqName ty concs info
 
     -- seq :: forall (r :: RuntimeRep) a (b :: TYPE r). a -> b -> b
     ty  =
-      mkInfForAllTy runtimeRep2TyVar
-      $ mkSpecForAllTys [alphaTyVar, openBetaTyVar]
-      $ mkVisFunTyMany alphaTy (mkVisFunTyMany openBetaTy openBetaTy)
+      mkInfForAllTy unmatchableDataConTy runtimeRep2TyVar
+      $ mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- [alphaTyVar, openBetaTyVar]]
+      $ mkVisFunTyManyU alphaTy (mkVisFunTyManyU openBetaTy openBetaTy)
 
     [x,y] = mkTemplateLocals [alphaTy, openBetaTy]
     rhs = mkLams ([runtimeRep2TyVar, alphaTyVar, openBetaTyVar, x, y]) $
@@ -259,7 +259,7 @@ lazyId :: Id    -- See Note [lazyId magic]
 lazyId = pcMiscPrelId lazyIdName ty info
   where
     info = noCafIdInfo
-    ty  = mkSpecForAllTys [alphaTyVar] (mkVisFunTyMany alphaTy alphaTy)
+    ty  = mkSpecForAllTy unmatchableDataConTy alphaTyVar (mkVisFunTyManyU alphaTy alphaTy)
 
 ------------------------------------------------
 noinlineIdName, noinlineConstraintIdName :: Name
@@ -272,22 +272,22 @@ noinlineId :: Id -- See Note [noinlineId magic]
 noinlineId = pcMiscPrelId noinlineIdName ty info
   where
     info = noCafIdInfo
-    ty  = mkSpecForAllTys [alphaTyVar] $
-          mkVisFunTyMany alphaTy alphaTy
+    ty  = mkSpecForAllTy unmatchableDataConTy alphaTyVar $
+          mkVisFunTyManyU alphaTy alphaTy
 
 noinlineConstraintId :: Id -- See Note [noinlineId magic]
 noinlineConstraintId = pcMiscPrelId noinlineConstraintIdName ty info
   where
     info = noCafIdInfo
-    ty   = mkSpecForAllTys [alphaConstraintTyVar] $
-           mkFunTy visArgConstraintLike ManyTy alphaTy alphaConstraintTy
+    ty   = mkSpecForAllTy unmatchableDataConTy alphaConstraintTyVar $
+           mkFunTy visArgConstraintLike unmatchableDataConTy ManyTy alphaTy alphaConstraintTy
 
 ------------------------------------------------
 nospecId :: Id -- See Note [nospecId magic]
 nospecId = pcMiscPrelId nospecIdName ty info
   where
     info = noCafIdInfo
-    ty  = mkSpecForAllTys [alphaTyVar] (mkVisFunTyMany alphaTy alphaTy)
+    ty  = mkSpecForAllTy unmatchableDataConTy alphaTyVar (mkVisFunTyManyU alphaTy alphaTy)
 
 oneShotId :: Id -- See Note [oneShot magic]
 oneShotId = pcRepPolyId oneShotName ty concs info
@@ -296,10 +296,10 @@ oneShotId = pcRepPolyId oneShotName ty concs info
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
     -- oneShot :: forall {r1 r2} (a :: TYPE r1) (b :: TYPE r2). (a -> b) -> (a -> b)
-    ty  = mkInfForAllTys  [ runtimeRep1TyVar, runtimeRep2TyVar ] $
-          mkSpecForAllTys [ openAlphaTyVar, openBetaTyVar ]      $
-          mkVisFunTyMany fun_ty fun_ty
-    fun_ty = mkVisFunTyMany openAlphaTy openBetaTy
+    ty  = mkInfForAllTys  [(unmatchableDataConTy, tv) | tv <- [ runtimeRep1TyVar, runtimeRep2TyVar ]] $
+          mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- [ openAlphaTyVar, openBetaTyVar ]]      $
+          mkVisFunTyManyU fun_ty fun_ty
+    fun_ty = mkVisFunTyManyU openAlphaTy openBetaTy
     [body, x] = mkTemplateLocals [fun_ty, openAlphaTy]
     x' = setOneShotLambda x  -- Here is the magic bit!
     rhs = mkLams [ runtimeRep1TyVar, runtimeRep2TyVar
@@ -340,10 +340,10 @@ leftSectionId = pcRepPolyId leftSectionName ty concs info
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
-    ty  = mkInfForAllTys  [runtimeRep1TyVar,runtimeRep2TyVar, multiplicityTyVar1] $
-          mkSpecForAllTys [openAlphaTyVar,  openBetaTyVar]    $
+    ty  = mkInfForAllTys  [(unmatchableDataConTy, tv) | tv <- [runtimeRep1TyVar,runtimeRep2TyVar, multiplicityTyVar1]] $
+          mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- [openAlphaTyVar,  openBetaTyVar]]    $
           exprType body
-    [f,x] = mkTemplateLocals [mkVisFunTy mult openAlphaTy openBetaTy, openAlphaTy]
+    [f,x] = mkTemplateLocals [mkVisFunTy unmatchableDataConTy mult openAlphaTy openBetaTy, openAlphaTy]
 
     mult = mkTyVarTy multiplicityTyVar1 :: Mult
     xmult = setIdMult x mult
@@ -368,14 +368,14 @@ rightSectionId = pcRepPolyId rightSectionName ty concs info
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
-    ty  = mkInfForAllTys  [runtimeRep1TyVar,runtimeRep2TyVar,runtimeRep3TyVar
-                          , multiplicityTyVar1, multiplicityTyVar2 ] $
-          mkSpecForAllTys [openAlphaTyVar,  openBetaTyVar,   openGammaTyVar ]  $
+    ty  = mkInfForAllTys  [(unmatchableDataConTy, tv) | tv <- [runtimeRep1TyVar,runtimeRep2TyVar,runtimeRep3TyVar
+                          , multiplicityTyVar1, multiplicityTyVar2 ]] $
+          mkSpecForAllTys [(unmatchableDataConTy, tv) | tv <- [openAlphaTyVar,  openBetaTyVar,   openGammaTyVar ]]  $
           exprType body
     mult1 = mkTyVarTy multiplicityTyVar1
     mult2 = mkTyVarTy multiplicityTyVar2
 
-    [f,x,y] = mkTemplateLocals [ mkScaledFunTys [ Scaled mult1 openAlphaTy
+    [f,x,y] = mkTemplateLocals [ mkScaledFunTysU [ Scaled mult1 openAlphaTy
                                                 , Scaled mult2 openBetaTy ] openGammaTy
                                , openAlphaTy, openBetaTy ]
     xmult = setIdMult x mult1
@@ -407,9 +407,9 @@ boxId :: Id
 boxId = pcRepPolyId boxIdName ty concs info
   where
     info = noCafIdInfo
-    ty  = mkInfForAllTys  [ runtimeRep1TyVar ] $
-          mkSpecForAllTys [ openAlphaTyVar ]   $
-          mkVisFunTyMany openAlphaTy
+    ty  = mkInfForAllTy unmatchableDataConTy runtimeRep1TyVar $
+          mkSpecForAllTy unmatchableDataConTy openAlphaTyVar   $
+          mkVisFunTyManyU openAlphaTy
           (mkTyConApp boxTyCon [runtimeRep1Ty, openAlphaTy])
     concs = mkRepPolyIdConcreteTyVars
           [((openAlphaTy, mkArgPos 1 Top), runtimeRep1TyVar)]
@@ -423,9 +423,9 @@ unboxId :: Id
 unboxId = pcRepPolyId unboxIdName ty concs info
   where
     info = noCafIdInfo
-    ty  = mkInfForAllTys  [ runtimeRep1TyVar ] $
-          mkSpecForAllTys [ openAlphaTyVar ]   $
-          mkVisFunTyMany
+    ty  = mkInfForAllTy unmatchableDataConTy runtimeRep1TyVar $
+          mkSpecForAllTy unmatchableDataConTy openAlphaTyVar   $
+          mkVisFunTyManyU
             (mkTyConApp boxTyCon [runtimeRep1Ty, openAlphaTy])
             openAlphaTy
     concs = mkRepPolyIdConcreteTyVars
@@ -443,11 +443,11 @@ coerceId = pcRepPolyId coerceName ty concs info
                        `setArityInfo`      2
     eqRTy     = mkTyConApp coercibleTyCon  [ tYPE_r,         a, b ]
     eqRPrimTy = mkTyConApp eqReprPrimTyCon [ tYPE_r, tYPE_r, a, b ]
-    ty        = mkInvisForAllTys [ Bndr rv InferredSpec
+    ty        = mkInvisForAllTys [(unmatchableDataConTy, tv) | tv <- [ Bndr rv InferredSpec
                                  , Bndr av SpecifiedSpec
-                                 , Bndr bv SpecifiedSpec ] $
+                                 , Bndr bv SpecifiedSpec ]] $
                 mkInvisFunTy eqRTy $
-                mkVisFunTyMany a b
+                mkVisFunTyManyU a b
 
     bndrs@[rv,av,bv] = mkTemplateKiTyVar runtimeRepTy
                         (\r -> [mkTYPEapp r, mkTYPEapp r])

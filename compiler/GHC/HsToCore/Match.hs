@@ -48,13 +48,15 @@ import GHC.HsToCore.Match.Literal
 
 import GHC.Core
 import GHC.Core.Utils
+import GHC.Core.FVs (exprFreeVars)
+import qualified GHC.Core.Subst as Subst
 import GHC.Core.Make
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.PatSyn
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare( eqType, eqTypes )
-import GHC.Core.Coercion ( eqCoercion )
+import GHC.Core.Coercion ( eqCoercion, isReflCo )
 import GHC.Core.TyCon    ( isNewTyCon )
 import GHC.Core.Multiplicity
 import GHC.Builtin.WiredIn.Types
@@ -62,6 +64,7 @@ import GHC.Builtin.WiredIn.Types
 import GHC.Types.Id
 import GHC.Types.Literal
 import GHC.Types.SrcLoc
+import GHC.Types.Var.Env (mkInScopeSet, extendInScopeSetList)
 
 import GHC.Data.Maybe
 import GHC.Utils.Misc
@@ -73,6 +76,7 @@ import GHC.Types.Unique
 import GHC.Types.Unique.DFM
 
 import Control.Monad ( zipWithM, unless )
+import Data.Foldable ( find )
 import Data.List.NonEmpty (NonEmpty(..), nonEmpty)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
@@ -254,13 +258,25 @@ match (v:vs) ty eqns    -- Eqns can be empty, but each equation is nonempty
 
         -- Match each group separately
         ; match_results <- match_groups grouped
-
-        -- And combine the results
+        ; unless (isManyTy (matchIdMult v)) $
+            check_linear_fallthrough (zip grouped (NE.toList match_results))
         ; return $ foldr (.) id aux_binds <$>
             foldr1 combineMatchResults match_results
         }
   where
     vars = v :| vs
+
+    -- A later group would match the original package after this group
+    -- consumed it. Fallthrough within the package's field matrix is safe.
+    check_linear_fallthrough ((group, result) : later@(_ : _))
+      | not (matchCanFail result) = return ()
+      | Just (_, row) <- find is_retained_package group
+      = putSrcSpanDsA (getLoc (eqn_pat row)) $ failWithDs DsLinearRetainedPackageRows
+      | otherwise = check_linear_fallthrough later
+    check_linear_fallthrough _ = return ()
+
+    is_retained_package (PgCon con, _) = not (null (dataConRepArgBinders con))
+    is_retained_package _ = False
 
     dropGroup :: Functor f => f (PatGroup,EquationInfo) -> f EquationInfo
     dropGroup = fmap snd
@@ -283,6 +299,7 @@ match (v:vs) ty eqns    -- Eqns can be empty, but each equation is nonempty
             PgBang    -> matchBangs      vars ty (dropGroup eqns)
             PgCo {}   -> matchCoercion   vars ty (dropGroup eqns)
             PgView {} -> matchView       vars ty (dropGroup eqns)
+            PgExists {} -> matchExists     vars ty (dropGroup eqns)
       where eqns' = NE.toList eqns
             ne l = case NE.nonEmpty l of
               Just nel -> nel
@@ -323,8 +340,9 @@ matchBangs :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchR
 -- See (GE1) in Note [Grouping equations]
 matchBangs (var :| vars) ty eqns
   = do  { match_result <- match (var:vars) ty $ NE.toList $
-                          decomposeFirstPat getBangPat <$> eqns
-        ; return (mkEvalMatchResult (matchId var) ty match_result) }
+            decomposeFirstPat getBangPat <$> eqns
+        ; indices <- getRuntimeIndices
+        ; return (mkEvalMatchResult indices (matchId var) ty match_result) }
 
 matchCoercion :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 -- Match against a coercion pattern (CoPat)
@@ -337,10 +355,37 @@ matchCoercion (var :| vars) ty eqns@(eqn1 :| _)
             Nothing ->
               do { let pat_ty' = hsPatType pat
                  ; var' <- newUniqueId (matchId var) (matchIdMult var) pat_ty'
-                 ; match_result <- match (mkMatchId var' : vars) ty inner_eqns
+                 ; match_result <- match (cloneMatchId var var' : vars) ty inner_eqns
                  ; dsHsWrapper wrap $ \core_wrap -> do
                  { let bind = NonRec var' (core_wrap (matchIdExpr var))
                  ; return (mkCoLetMatchResult bind match_result) } } }
+
+-- | Open the package once for this group at the selected match column.
+matchExists :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE
+            -> DsM (MatchResult CoreExpr)
+matchExists (var :| vars) ty eqns@(first :| _)
+  | XPat (NativeExistsPat _ witness payload _ _) <- firstPat first
+  = do { results <- traverse (match_row witness payload) eqns
+       ; return (fmap (Unpack witness payload (matchIdExpr var))
+                     (foldr1 combineMatchResults results)) }
+  where
+    match_row witness payload eqn
+      | XPat (NativeExistsPat _ row_witness row_payload ev_binds pat) <- firstPat eqn
+      = dsTcEvBinds ev_binds $ \binds ->
+        do { result <- match (cloneMatchId var row_payload : vars) ty
+                              [decomposeFirstPat (fmap (const pat)) eqn]
+           ; let share body
+                   | row_witness == witness = body
+                   | otherwise =
+                       let scope = mkInScopeSet (exprFreeVars body)
+                                     `extendInScopeSetList` [witness, payload]
+                           subst = Subst.mkOpenSubst scope
+                                     [(row_witness, Type (mkTyVarTy witness)),
+                                      (row_payload, Var payload)]
+                       in Subst.substExpr subst body
+           ; return (fmap (share . mkCoreLets binds) result) }
+      | otherwise = panic "matchExists: incompatible row"
+matchExists _ _ _ = panic "matchExists"
 
 matchView :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 -- Apply the view function to the scrutinee and then match that
@@ -352,7 +397,7 @@ matchView (var :| vars) ty eqns@(eqn1 :| _)
          -- do the rest of the compilation
         ; let pat_ty' = hsLPatType pat
         ; var' <- newUniqueId (matchId var) (matchIdMult var) pat_ty'
-        ; match_result <- match (mkMatchId var' : vars) ty $ NE.toList $
+        ; match_result <- match (cloneMatchId var var' : vars) ty $ NE.toList $
             decomposeFirstPat getViewPat <$> eqns
          -- compile the view expressions
         ; viewExpr' <- dsLExpr viewExpr
@@ -363,7 +408,7 @@ matchView (var :| vars) ty eqns@(eqn1 :| _)
 -- decompose the first pattern and leave the rest alone
 decomposeFirstPat :: (LPat GhcTc -> LPat GhcTc) -> EquationInfoNE -> EquationInfoNE
 decomposeFirstPat extract eqn@(EqnMatch { eqn_pat = pat }) = eqn { eqn_pat = extract pat }
-decomposeFirstPat _ (EqnDone {}) = panic "decomposeFirstPat"
+decomposeFirstPat _ _ = panic "decomposeFirstPat"
 
 getCoPat :: LPat GhcTc -> LPat GhcTc
 getCoPat (L loc (XPat (CoPat _ pat _))) = L loc pat
@@ -471,6 +516,9 @@ tidyEqnInfo :: MatchId -> EquationInfo
         --      one of these for which patGroup is defined.
 
 tidyEqnInfo _ eqn@(EqnDone {}) = return (idDsWrapper, eqn)
+tidyEqnInfo v (EqnScope binds rest) = do
+  (wrap, eqn) <- tidyEqnInfo v rest
+  return (mkCoreLets binds . wrap, eqn)
 
 tidyEqnInfo v eqn@(EqnMatch { eqn_pat = pat })
   = do { (wrap, pat') <- tidyLPat v pat
@@ -614,9 +662,43 @@ tidyLPat _ (L loc (OrPat ty lpats))
     single_grhs e = GRHSs emptyComments [noLocA $ GRHS noAnn [] e]
                           (noLocA $ EmptyLocalBinds noExtField)
 
+-- Unwrap reflexive CoPats before pattern classification.
+-- See Note [Eliminating reflexive CoPats].
+tidyLPat v (L loc (XPat (CoPat wrap pat _)))
+  | is_refl_wrap wrap
+  = tidyLPat v (L loc pat)
+  where
+    is_refl_wrap WpHole            = True
+    is_refl_wrap (WpCast co)       = isReflCo co
+    is_refl_wrap (WpCompose w1 w2) = is_refl_wrap w1 && is_refl_wrap w2
+    is_refl_wrap (WpSubType w)     = is_refl_wrap w
+    is_refl_wrap (WpLet evs)       = isEmptyTcEvBinds evs
+    is_refl_wrap _                 = False
+
 -- Everything else goes through unchanged...
 tidyLPat _ non_interesting_pat
   = return (idDsWrapper, non_interesting_pat)
+
+{- Note [Eliminating reflexive CoPats]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+During pattern typechecking, `matchExpectedConTy` can defer an equality on an
+unfilled type metavariable (such as `(:+:) f1 g1 a ~# h0 a`) into a coercion
+hole and wrap the constructor pattern in `CoPat (WpCast (SubCo hole))`. If a
+later branch unifies `h0` directly, `matchExpectedConTy` sees the resolved
+`TyConApp` and emits a bare `ConPat` with no `CoPat`.
+
+After constraint solving and zonking fill `hole` with `Refl`, keeping the
+no-op `CoPat` around the earlier constructor pattern classifies that branch as
+`PgCo` while the later branch is `PgCon`. `groupEquations` then splits an
+exhaustive constructor match across two separate `case` expressions. Under
+`-XLinearTypes`, the first `case` acquires an unreachable `__DEFAULT` branch
+that does not consume its multiplicity-polymorphic scrutinee, which fails Core
+Lint's linearity check.
+
+Both `zonk_pat` and `tidyLPat` strip `CoPat` wrappers whose zonked `HsWrapper`
+is reflexive (`isReflCo`, where the left and right types are identical) so that
+all constructor branches stay in the same `PgCon` group.
+-}
 
 --------------------
 tidy_bang_pat :: MatchId -> LPat GhcTc
@@ -884,7 +966,8 @@ JJQC 30-Nov-1997
 matchWrapper ctxt scrs (MG { mg_alts = L _ matches
                            , mg_ext = MatchGroupTc arg_tys rhs_ty origin
                            })
-  = do  { dflags <- getDynFlags
+  = withRuntimeIndexTypes (rhs_ty : map scaledThing arg_tys ++ map idType pattern_binders) $
+    do  { dflags <- getDynFlags
         ; locn   <- getSrcSpanDs
         ; new_vars    <- case matches of
                            []    -> newSysLocalsDs arg_tys
@@ -910,7 +993,7 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
 
             -- See Note [Long-distance information] in GHC.HsToCore.Pmc
             then addCoreScrutTmCs (concat scrs) new_vars $
-                 pmcMatches origin (DsMatchContext ctxt locn) new_vars matches
+                 pmcMatches origin (DsMatchContext ctxt locn) (map scaledThing arg_tys) new_vars matches
 
             -- When we're not doing PM checks on the match group,
             -- we still need to propagate long-distance information.
@@ -925,6 +1008,8 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
 
         ; return (new_vars, result_expr) }
   where
+    pattern_binders = concatMap (collectPatsBinders CollWithDictBinders . hsLMatchPats) matches
+
     -- Called once per equation in the match, or alternative in the case
     mk_eqn_info :: LMatch GhcTc (LHsExpr GhcTc)
                 -> (LdiNablas, NonEmpty LdiNablas)
@@ -1054,6 +1139,7 @@ matchSinglePatVar :: Id   -- See Note [Match Ids] in GHC.HsToCore.Monad
                   -> Type -> MatchResult CoreExpr -> DsM (MatchResult CoreExpr)
 matchSinglePatVar var mb_scrut ctx pat ty match_result
   = assertPpr (isInternalName (idName var)) (ppr var) $
+    withRuntimeIndexTypes (ty : map idType (collectPatBinders CollWithDictBinders pat)) $
     do { dflags <- getDynFlags
        ; locn   <- getSrcSpanDs
        -- Pattern match check warnings.
@@ -1104,6 +1190,7 @@ data PatGroup
   | PgView (LHsExpr GhcTc) -- view pattern (e -> p):
                         -- the LHsExpr is the expression e
            Type         -- the Type is the type of p (equivalently, the result type of e)
+  | PgExists Type       -- Checked package type
 
 instance Show PatGroup where
   show PgAny = "PgAny"
@@ -1236,6 +1323,7 @@ sameGroup (PgCo t1)     (PgCo t2)     = t1 `eqType` t2
         -- enclosed pattern is the same. The patterns outside the CoPat
         -- always have the same type, so this boils down to saying that
         -- the two coercions are identical.
+sameGroup (PgExists t1) (PgExists t2) = t1 `eqType` t2
 sameGroup (PgView e1 t1) (PgView e2 t2) = viewLExprEq (e1,t1) (e2,t2)
        -- ViewPats are in the same group iff the expressions
        -- are "equal"---conservatively, we use syntactic equality
@@ -1399,6 +1487,7 @@ patGroup _ EmbTyPat{} = PgAny
 patGroup platform (XPat ext) = case ext of
   CoPat _ p _      -> PgCo (hsPatType p) -- Type of inner pattern
   ExpansionPat _ p -> patGroup platform p
+  NativeExistsPat ty _ _ _ _ -> PgExists ty
 patGroup _ pat                          = pprPanic "patGroup" (ppr pat)
 
 {-

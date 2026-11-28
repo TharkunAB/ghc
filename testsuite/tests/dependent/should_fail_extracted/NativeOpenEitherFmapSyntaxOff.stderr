@@ -1,0 +1,4 @@
+NativeOpenEitherFmapSyntaxOff.hs:8:25: error: [GHC-37479]
+    ‘P.fmap’ is a term-level binding
+     and can not be used at the type level.
+

@@ -13,8 +13,8 @@ module GHC.Tc.Utils.Unify (
   tcWrapResult, tcWrapResultO, tcWrapResultMono,
   tcSubType, tcSubTypeSigma, tcSubTypePat, tcSubTypeApp, tcSubTypeHoleFit,
   addSubTypeCtxt,
-  tcSubTypeAmbiguity, tcSubMult,
-  checkConstraints, checkTvConstraints,
+  tcSubTypeAmbiguity, tcSubMult, tcEqMult,
+  checkConstraints, checkTvConstraints, checkSourceLetConstraints,
   buildImplicationFor, buildTvImplication, emitResidualTvConstraint,
 
   -- Skolemisation
@@ -25,6 +25,8 @@ module GHC.Tc.Utils.Unify (
 
   -- Various unifications
   uType, unifyType, unifyKind, unifyInvisibleType,
+  isRetainedConstructorProof, tcRetainedCoercion, tcRetainedIndexCoercion,
+  tcRetainedCallCoercion, retainedCallOccurs,
   unifyExprType, unifyTypeAndEmit, promoteTcType,
   swapOverTyVars, touchabilityTest, checkTopShape, lhsPriority,
   mightEqualLater,
@@ -36,7 +38,7 @@ module GHC.Tc.Utils.Unify (
   --------------------------------
   -- Holes
   matchExpectedListTy,
-  matchExpectedTyConApp,
+  matchExpectedTyConApp, matchSumPayload,
   matchExpectedAppTy,
   matchExpectedFunTys,
   matchExpectedFunKind,
@@ -45,22 +47,35 @@ module GHC.Tc.Utils.Unify (
   checkTyEqRhs, recurseIntoTyConApp, recurseIntoFamTyConApp,
   PuResult(..), okCheckRefl, mapCheck,
   TyEqFlags(..),
-  notUnifying_TEFTask, unifyingLHSMetaTyVar_TEFTask, defaulting_TEFTask,
+  notUnifying_TEFTask, unifyingLHSMetaTyVar_TEFTask,
+  unifyingLHSMetaTyVarWithDepths_TEFTask, defaulting_TEFTask,
   pureTyEqFlags_LHSMetaTyVar, mkTEFA_Break,
 
   OccursCheck(..), LevelCheck(..), ConcreteCheck(..),
   TyEqFamApp(..), FamAppBreaker(..),
-  checkPromoteFreeVars,
+  checkPromoteFreeVars, checkPromoteFreeVarsWithDepths,
 
-  simpleUnifyCheck, UnifyCheckCaller(..), SimpleUnifyResult(..),
+  simpleUnifyCheck, simpleUnifyCheckWithDepths,
+  UnifyCheckCaller(..), SimpleUnifyResult(..),
 
-  fillInferResult, fillInferResultNoInst
+  fillInferResult, fillInferResultNoInst,
+
+  -- Implicit existentials and Quick Look helpers
+  tcSubTypeImplicitExists, unwrapMetaView, isPredicativeExistsTy,
+  qlUnify, qlMonoTcType, foldQLInstVars, anyFreeKappa,
+  rejectNativeQuickLook, noQuickLookVars,
+  matchExactPolytypeWitness, matchBarPackageWitnesses,
+  matchMixedExistsResult
   ) where
 
 import GHC.Prelude
 
+import {-# SOURCE #-} GHC.Tc.Solver ( tcRewriteFamilyAxioms )
+
 import GHC.Hs
-import GHC.Tc.Errors.Types ( HsCtxt(..) )
+import GHC.Tc.Errors.Types ( HsCtxt(..), TcRnMessage(TcRnRetainedQuantificationError)
+                           , RetainedQuantificationError(RetainedPatternType, RetainedQuickLook, RetainedSolverType) )
+import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
 import GHC.Tc.Utils.Concrete
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Instantiate
@@ -70,7 +85,7 @@ import GHC.Tc.Utils.TcType
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.CtLoc
-  ( CtLoc
+  ( CtLoc, ctLocEnv, extendCtLocTermScope
   , mkKindEqLoc, adjustCtLoc, updateCtLocOrigin, ctLocOrigin
   , tyConAppRoleExplanation, appTyRoleExplanation
   )
@@ -83,14 +98,20 @@ import GHC.Tc.Utils.TcMType qualified as TcM
 import GHC.Tc.Solver.InertSet
 
 import GHC.Core.ConLike (ConLike(..))
+import GHC.Core.DataCon (dataConContextFieldCount, dataConSourceOrder)
+import GHC.Core.FamInstEnv ( reduceScopedSumPayload_maybe, reduceTyFamApp_maybe )
+import qualified GHC.Core as Core
+import GHC.Core.Dependent ( hasNativeDependentExpr, supportsQuickLookType )
+import GHC.Core.Utils ( applyTypeToArgs )
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep hiding (Refl)
 import GHC.Core.TyCo.FVs
+import qualified GHC.Core.TyCo.Subst as Subst
 import GHC.Core.TyCo.Ppr( debugPprType {- pprTyVar -} )
 import GHC.Core.TyCon
 import GHC.Core.Coercion
 import GHC.Core.Unify
-import GHC.Core.Predicate( EqRel(..), mkEqPredRole, mkNomEqPred )
+import GHC.Core.Predicate( EqRel(..) )
 import GHC.Core.Multiplicity
 import GHC.Core.Reduction
 
@@ -98,11 +119,15 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Types.Name
-import GHC.Types.Id( idType )
+import GHC.Types.Name.Set ( extendNameSet )
+import GHC.Types.Id( idType, idInlineActivation )
+import GHC.Types.InlinePragma( isNeverActive )
 import GHC.Types.Var as Var
+import GHC.Types.Var.FV ( FV(..), runFV )
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Basic
+import GHC.Types.SrcLoc (GenLocated(L))
 import GHC.Types.Unique.Set (nonDetEltsUniqSet)
 
 import GHC.Utils.Misc
@@ -113,7 +138,7 @@ import GHC.Driver.DynFlags
 
 import GHC.Data.Bag
 import GHC.Data.FastString
-import GHC.Data.Maybe (firstJusts)
+import GHC.Data.Maybe (firstJusts, isJust)
 
 import Control.Monad
 import Data.Functor.Identity (Identity(..))
@@ -146,7 +171,7 @@ matchActualFunTy
       -- (Both are used only for error messages)
   -> TcRhoType
       -- ^ Type to analyse: a TcRhoType
-  -> TcM (TcCoercion, Scaled TcSigmaTypeFRR, TcSigmaType)
+  -> TcM (TcCoercion, Type, Scaled TcSigmaTypeFRR, TcSigmaType)
 -- This function takes in a type to analyse (a RhoType) and returns
 -- an argument type and a result type (splitting apart a function arrow).
 -- The returned argument type is a SigmaType with a fixed RuntimeRep;
@@ -154,13 +179,13 @@ matchActualFunTy
 --
 -- See Note [matchActualFunTy error handling] for the first three arguments
 
--- If   (wrap, arg_ty, res_ty) = matchActualFunTy ... fun_ty
--- then wrap :: fun_ty ~~> (arg_ty -> res_ty)
+-- If   (wrap, ma, arg_ty, res_ty) = matchActualFunTy ... fun_ty
+-- then wrap preserves ma in the argument arrow.
 -- and NB: res_ty is an (uninstantiated) SigmaType
 
 matchActualFunTy herald mb_thing err_info fun_ty
   = assertPpr (isRhoTy fun_ty) (ppr fun_ty) $
-    go fun_ty
+    go 64 fun_ty
   where
     -- Does not allocate unnecessary meta variables: if the input already is
     -- a function, we just take it apart.  Not only is this efficient,
@@ -168,26 +193,36 @@ matchActualFunTy herald mb_thing err_info fun_ty
     --              (forall a. ty) -> other
     -- If allocated (fresh-meta-var1 -> fresh-meta-var2) and unified, we'd
     -- hide the forall inside a meta-variable
-    go :: TcRhoType   -- The type we're processing, perhaps after
+    go :: Int
+       -> TcRhoType   -- The type we're processing, perhaps after
                       -- expanding type synonyms
-       -> TcM (TcCoercion, Scaled TcSigmaTypeFRR, TcSigmaType)
-    go ty | Just ty' <- coreView ty = go ty'
+       -> TcM (TcCoercion, Type, Scaled TcSigmaTypeFRR, TcSigmaType)
+    go fuel ty | Just ty' <- coreView ty = go fuel ty'
 
-    go (FunTy { ft_af = af, ft_mult = w, ft_arg = arg_ty, ft_res = res_ty })
+    go _ (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg_ty, ft_res = res_ty })
       = assert (isVisibleFunArg af) $
       do { (arg_co, arg_ty) <- hasFixedRuntimeRep (FRRExpectedFunTy herald 1) arg_ty
          ; let fun_co = mkFunCo Nominal af
+                          (mkNomReflCo ma)
                           (mkReflCo Nominal w)
                           arg_co
                           (mkReflCo Nominal res_ty)
-         ; return (fun_co, Scaled w arg_ty, res_ty) }
+         ; return (fun_co, ma, Scaled w arg_ty, res_ty) }
 
-    go ty@(TyVarTy tv)
+    go fuel ty@(TyVarTy tv)
       | isMetaTyVar tv
       = do { cts <- readMetaTyVar tv
            ; case cts of
-               Indirect ty' -> go ty'
+               Indirect ty' -> go fuel ty'
                Flexi        -> defer ty }
+
+    go fuel ty@(TyConApp tc args)
+      = do { mb_red <- reduceNativeFunFamily_maybe fuel tc args
+           ; case mb_red of
+               Just (fam_co, rhs) | isRhoTy rhs ->
+                 do { (inner_co, ma, arg_ty, res_ty) <- go (fuel - 1) rhs
+                    ; return (fam_co `mkTransCo` inner_co, ma, arg_ty, res_ty) }
+               _ -> addErrCtxt (mk_ctxt ty) (defer ty) }
 
        -- In all other cases we bale out into ordinary unification
        -- However unlike the meta-tyvar case, we are sure that the
@@ -204,19 +239,42 @@ matchActualFunTy herald mb_thing err_info fun_ty
        --
        -- But in that case we add specialized type into error context
        -- anyway, because it may be useful. See also #9605.
-    go ty = addErrCtxt (mk_ctxt ty) (defer ty)
+    go _ ty = addErrCtxt (mk_ctxt ty) (defer ty)
 
     ------------
     defer fun_ty
       = do { arg_ty <- new_check_arg_ty herald 1
            ; res_ty <- newOpenFlexiTyVarTy
-           ; let unif_fun_ty = mkScaledFunTys [arg_ty] res_ty
+           ; let unif_fun_ty = mkScaledFunTysU [arg_ty] res_ty
            ; co <- unifyType mb_thing fun_ty unif_fun_ty
-           ; return (co, arg_ty, res_ty) }
+           ; return (co, unmatchableDataConTy, arg_ty, res_ty) }
 
     ------------
     mk_ctxt :: TcType -> HsCtxt
     mk_ctxt _res_ty = mkFunTysMsg herald err_info
+
+reduceNativeFunFamily_maybe :: Int -> TyCon -> [TcType] -> TcM (Maybe (TcCoercion, TcType))
+reduceNativeFunFamily_maybe fuel tc args
+  | fuel > 0
+  , isTypeFamilyTyCon tc
+  , args `lengthAtLeast` tyConArity tc
+  , let is_source_fam = isJust (sourceTableTermOcc (nameOccName (tyConName tc)))
+  , is_source_fam || hasNativeDependentExpr (Core.Type (mkTyConApp tc args))
+  = do { envs <- tcGetFamInstEnvs
+       ; args' <- liftZonkM (mapM zonkTcType args)
+       ; case reduceTyFamApp_maybe envs Nominal tc args' of
+           Just (Reduction co rhs) -> do
+             when is_source_fam $ do
+               env <- getGblEnv
+               updTcRef (tcg_source_check env) (\s -> s { scs_table_uses = extendNameSet (scs_table_uses s) (tyConName tc) })
+               let ty' = mkTyConApp tc args'
+               when (isTauTy ty') $ do
+                 loc <- getCtLocM AnnOrigin (Just TypeLevel)
+                 _ <- tcRewriteFamilyAxioms loc ty'
+                 return ()
+             return (Just (co, rhs))
+           Nothing -> return Nothing }
+  | otherwise = return Nothing
 
 {- Note [matchActualFunTy error handling]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -250,10 +308,10 @@ matchActualFunTys :: ExpectedFunTyCtxt -- ^ See Note [Herald for matchExpectedFu
                   -> CtOrigin
                   -> Arity
                   -> TcSigmaType
-                  -> TcM (HsWrapper, [Scaled TcSigmaTypeFRR], TcRhoType)
+                  -> TcM (HsWrapper, [Type], [Scaled TcSigmaTypeFRR], TcRhoType)
 -- NB: Called only from `tcSynArgA`, and hence scheduled for destruction
 --
--- If    matchActualFunTys n fun_ty = (wrap, [t1,..,tn], res_ty)
+-- If    matchActualFunTys n fun_ty = (wrap, mas, [t1,..,tn], res_ty)
 -- then  wrap : fun_ty ~~>  (t1 -> ... -> tn -> res_ty)
 --       and res_ty is a RhoType
 -- NB: the returned type is top-instantiated; it's a RhoType
@@ -263,19 +321,48 @@ matchActualFunTys herald ct_orig n_val_args_wanted top_ty
     go n fun_ty
       | not (isRhoTy fun_ty)
       = do { (wrap1, rho) <- topInstantiate ct_orig fun_ty
-           ; (wrap2, arg_tys, res_ty) <- go n rho
-           ; return (wrap2 <.> wrap1, arg_tys, res_ty) }
+           ; (wrap2, mas, arg_tys, res_ty) <- go n rho
+           ; return (wrap2 <.> wrap1, mas, arg_tys, res_ty) }
 
-    go 0 fun_ty = return (idHsWrapper, [], fun_ty)
+    go 0 fun_ty = return (idHsWrapper, [], [], fun_ty)
 
     go n fun_ty
-      = do { (co1, scaled_arg1_ty_frr@(Scaled arg1_mult arg1_ty_frr), res_ty1) <-
+      = do { (co1, ma, scaled_arg1_ty_frr@(Scaled arg1_mult arg1_ty_frr), res_ty1) <-
                 matchActualFunTy herald Nothing (n_val_args_wanted, top_ty) fun_ty
-           ; (wrap_res, arg_tys, res_ty) <- go (n-1) res_ty1
-           ; let wrap_fun2 = mkWpFun idHsWrapper wrap_res (EqMultCo $ mkNomReflCo arg1_mult, arg1_ty_frr) res_ty
-              -- This call to mkWpFun satisfies WpFun-FRR-INVARIANT:
-              -- 'arg1_ty_frr' comes from matchActualFunTy, so is FRR.
-           ; return (wrap_fun2 <.> mkWpCastN co1, scaled_arg1_ty_frr:arg_tys, res_ty) }
+           ; (wrap_res, mas, arg_tys, res_ty) <- go (n-1) res_ty1
+           ; wrap_fun2 <- case getWpCo_maybe wrap_res res_ty1 of
+               Just res_co -> return $ mkWpCastR $
+                 mkFunCoNoFTF Representational (mkNomReflCo ma)
+                   (mkNomReflCo arg1_mult) (mkRepReflCo arg1_ty_frr) res_co
+               Nothing
+                 | isClosedUnmatchableTy ma
+                 -> return $ mkWpFun idHsWrapper wrap_res
+                               (EqMultCo $ mkNomReflCo arg1_mult, arg1_ty_frr) res_ty
+                 | otherwise -> do
+                 { ma_co <- unifyUnmatchableLeft ma
+                 ; let input_co = mkArrowMatchabilityCo [ma_co] [scaled_arg1_ty_frr] res_ty1
+                       output_co = mkArrowMatchabilityCo [mkSymCo ma_co] [scaled_arg1_ty_frr] res_ty
+                 ; return $ mkWpCastN output_co
+                       <.> mkWpFun idHsWrapper wrap_res
+                             (EqMultCo $ mkNomReflCo arg1_mult, arg1_ty_frr) res_ty
+                       <.> mkWpCastN input_co }
+           ; return (wrap_fun2 <.> mkWpCastN co1, ma:mas, scaled_arg1_ty_frr:arg_tys, res_ty) }
+
+isClosedUnmatchableTy :: TcType -> Bool
+isClosedUnmatchableTy (TyConApp tc []) = tc == unmatchableDataConTyCon
+isClosedUnmatchableTy _                = False
+{-# INLINE isClosedUnmatchableTy #-}
+
+unifyUnmatchableLeft, unifyUnmatchableRight :: TcType -> TcM TcCoercionN
+unifyUnmatchableLeft ma
+  | isClosedUnmatchableTy ma = return (mkNomReflCo unmatchableDataConTy)
+  | otherwise                = unifyType Nothing ma unmatchableDataConTy
+{-# INLINE unifyUnmatchableLeft #-}
+
+unifyUnmatchableRight ma
+  | isClosedUnmatchableTy ma = return (mkNomReflCo unmatchableDataConTy)
+  | otherwise                = unifyType Nothing unmatchableDataConTy ma
+{-# INLINE unifyUnmatchableRight #-}
 
 {-
 ************************************************************************
@@ -364,7 +451,8 @@ Both ultimately handled by matchExpectedFunTys.
 
 * `tcFunBindMatches` and `tcLambdaMatches` both use `matchExpectedFunTys`, which
   ensures that any trailing invisible binders are skolemised; and does so deeply
-  if DeepSubsumption is on.
+  if DeepSubsumption is on. Non-U forall results can instead pass to RHS
+  checking. See Note [Non-U forall results after value patterns].
 
   This corresponds to the plan: "skolemise at the '=' of a function binding or
   at the '->' of a lambda binding".  (See #17594 and "Plan B2".)
@@ -430,7 +518,7 @@ tcSkolemiseGeneral
         -- -     expected_ty is the type we are actually skolemising
         -- matchExpectedFunTys walks down the type, skolemising as it goes,
         -- keeping the same top_ty, but successively smaller expected_tys
-  -> ([(Name, TcInvisTVBinder)] -> TcType -> TcM result)
+  -> ([(Name, (Matchability,TcInvisTVBinder))] -> TcType -> TcM result)
   -> TcM (HsWrapper, result)
 tcSkolemiseGeneral ds_flag ctxt top_ty expected_ty thing_inside
   | isRhoTyDS ds_flag expected_ty
@@ -444,13 +532,15 @@ tcSkolemiseGeneral ds_flag ctxt top_ty expected_ty thing_inside
   | otherwise
   = do { -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
          --           in GHC.Tc.Utils.TcType
-       ; rec { (wrap, tv_prs, given, rho_ty) <- case ds_flag of
+       ; rec { (wrap, tv_prs, given, rho_ty, prefix_implics) <- case ds_flag of
                     Deep {} -> deeplySkolemise skol_info expected_ty
                     Shallow -> topSkolemise skol_info expected_ty
-             ; let sig_skol = SigSkol ctxt top_ty (map (fmap binderVar) tv_prs)
+             ; let sig_skol = SigSkol ctxt top_ty (map (fmap (binderVar . snd)) tv_prs)
              ; skol_info <- mkSkolemInfo sig_skol }
 
-       ; let skol_tvs = map (binderVar . snd) tv_prs
+       ; mapBagM_ checkImplicationInvariants prefix_implics
+       ; emitImplications prefix_implics
+       ; let skol_tvs = map (binderVar . snd . snd) tv_prs
        ; traceTc "tcSkolemiseGeneral {" (pprUserTypeCtxt ctxt <+> ppr skol_tvs <+> ppr given)
        ; (ev_binds, result) <- checkConstraints sig_skol skol_tvs given $
                                thing_inside tv_prs rho_ty
@@ -474,7 +564,7 @@ tcSkolemiseCompleteSig (CSig { sig_bndr = poly_id, sig_ctxt = ctxt, sig_loc = lo
        ; setSrcSpan loc $   -- Sets the location for the implication constraint
          tcSkolemiseGeneral Shallow ctxt poly_ty poly_ty $ \tv_prs rho_ty ->
          setSrcSpan cur_loc $ -- Revert to the original location
-         tcExtendNameTyVarEnv (map (fmap binderVar) tv_prs) $
+         tcExtendNameTyVarEnv (map (fmap (binderVar . snd)) tv_prs) $
          thing_inside (map (mkInvisExpPatType . snd) tv_prs) rho_ty }
 
 tcSkolemiseExpectedType :: HasDebugCallStack => TcSigmaType
@@ -509,7 +599,8 @@ checkConstraints skol_info skol_tvs given thing_inside
   = do { implication_needed <- implicationNeeded skol_info skol_tvs given
 
        ; if implication_needed
-         then do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
+         then do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints $
+                                               tcExtendLexicalGivens given thing_inside
                  ; (implics, ev_binds) <- buildImplicationFor tclvl skol_info skol_tvs given wanted
                  ; traceTc "checkConstraints A" (ppr tclvl $$ ppr skol_tvs $$ traceCallStackDoc)
                  ; emitImplications implics
@@ -522,6 +613,23 @@ checkConstraints skol_info skol_tvs given thing_inside
                                                  traceCallStackDoc)
                  ; res <- thing_inside
                  ; return (emptyTcEvBinds, res) } }
+
+-- | Check a local alias body with evidence selected by its actual dictionaries.
+-- See Note [Conditional source let evidence] in GHC.Tc.Solver.Solve.
+checkSourceLetConstraints :: Name -> [(EvVar, Id)] -> CoVar -> TcM a
+                          -> TcM (TcEvBinds, a)
+checkSourceLetConstraints name guards proof thing_inside
+  = do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
+       ; ev_binds_var <- newTcEvBinds
+       ; implic <- newImplication
+       ; let implic' = implic { ic_tclvl = tclvl
+                              , ic_wanted = wanted
+                              , ic_binds = ev_binds_var
+                              , ic_info = SourceLetSkol name
+                              , ic_source_let = Just (guards, proof) }
+       ; checkImplicationInvariants implic'
+       ; emitImplication implic'
+       ; return (TcEvBinds ev_binds_var, result) }
 
 checkTvConstraints :: SkolemInfo
                    -> [TcTyVar]          -- Skolem tyvars
@@ -792,7 +900,8 @@ Example:
 -- | Use this function to split off arguments types when you have an
 -- \"expected\" type.
 --
--- This function skolemises at each polytype.
+-- This function skolemises at each polytype, except for the result case in
+-- Note [Non-U forall results after value patterns].
 --
 -- Invariant: this function only applies the provided function
 -- to a list of argument types which all have a syntactically fixed RuntimeRep
@@ -809,8 +918,8 @@ matchExpectedFunTys :: forall a.
 -- then  wrap : (t1 -> ... -> tn -> ty_r) ~~> ty,
 --   where [t1, ..., tn], ty_r are passed to the thing_inside
 --
--- Unconditionally concludes by skolemising any trailing invisible
--- binders and, if DeepSubsumption is on, it does so deeply.
+-- Concludes by skolemising trailing invisible binders, deeply if
+-- DeepSubsumption is on, except for the result case described above.
 --
 -- Postcondition:
 --   If exp_ty is Check {}, then [ExpPatType] and ExpRhoType results are all Check{}
@@ -825,35 +934,45 @@ matchExpectedFunTys herald _ctxt arity (Infer inf_res) thing_inside
          --  1. use tcMkScaledFunTys rather than mkScaledFunTys, as we might
          --     have res_ty :: kappa[tau] for a meta ty-var kappa, in which case
          --     mkScaledFunTys would crash. See #26277.
-         --  2. tcMkScaledFunTys arg_tys res_ty does not contain any foralls
+         --  2. tcMkScaledFunTysU arg_tys res_ty does not contain any foralls
          --     (even nested ones), so no need to instantiate.
-       ; co <- fillInferResultNoInst (tcMkScaledFunTys arg_tys res_ty) inf_res
+       ; co <- fillInferResultNoInst (tcMkScaledFunTysU arg_tys res_ty) inf_res
        ; return (mkWpCastN co, result) }
 
 matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
-  = check arity [] top_ty
+  = check 64 arity [] top_ty
   where
-    check :: VisArity -> [ExpPatType] -> TcSigmaType -> TcM (HsWrapper, a)
+    check :: Int -> VisArity -> [ExpPatType] -> TcSigmaType -> TcM (HsWrapper, a)
     -- `check` is called only in the Check{} case
     -- It collects rev_pat_tys in reversed order
     -- n_req is the number of /visible/ arguments still needed
 
     ----------------------------
+    -- See Note [Non-U forall results after value patterns].
+    check _ 0 rev_pat_tys ty
+      | non_u_invisible_forall ty
+      , no_trailing_invis_pats
+      = do { result <- thing_inside (reverse rev_pat_tys) (mkCheckExpType ty)
+           ; return (idHsWrapper, result) }
+
+    ----------------------------
     -- Skolemise quantifiers, both visible (up to n_req) and invisible
     -- See Note [Visible type application and abstraction] in GHC.Tc.Gen.App
-    check n_req rev_pat_tys ty
+    check fuel n_req rev_pat_tys ty
       | isSigmaTy ty                     -- An invisible quantifier at the top
         || (n_req > 0 && isForAllTy ty)  -- A visible quantifier at top, and we need it
-      = do { rec { (n_req', wrap_gen, tv_nms, bndrs, given, inner_ty) <- skolemiseRequired skol_info n_req ty
+      = do { rec { (n_req', wrap_gen, tv_nms, bndrs, given, inner_ty, prefix_implics) <- skolemiseRequired skol_info n_req ty
                  ; let sig_skol = SigSkol ctx top_ty (tv_nms `zip` skol_tvs)
-                       skol_tvs = binderVars bndrs
+                       skol_tvs = map (binderVar . snd) bndrs
                  ; skol_info <- mkSkolemInfo sig_skol }
              -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
              --           in GHC.Tc.Utils.TcType
+           ; mapBagM_ checkImplicationInvariants prefix_implics
+           ; emitImplications prefix_implics
            ; (ev_binds, (wrap_res, result))
                   <- checkConstraints (getSkolemInfo skol_info) skol_tvs given $
-                     check n_req'
-                           (reverse (map ExpForAllPatTy bndrs) ++ rev_pat_tys)
+                     check fuel n_req'
+                           (reverse (map (uncurry ExpForAllPatTy) bndrs) ++ rev_pat_tys)
                            inner_ty
            ; assertPpr (not (null bndrs && null given)) (ppr ty) $
                        -- The guard ensures that we made some progress
@@ -863,7 +982,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
     -- Base case: (n_req == 0): no more args
     --    The earlier skolemisation ensurs that rho_ty has no top-level invisible quantifiers
     --    If there is deep subsumption, do deep skolemisation now
-    check n_req rev_pat_tys rho_ty
+    check _ n_req rev_pat_tys rho_ty
       | n_req == 0
       = do { let pat_tys = reverse rev_pat_tys
            ; ds_flag <- getDeepSubsumptionFlag
@@ -877,13 +996,14 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
 
     ----------------------------
     -- Function types
-    check n_req rev_pat_tys (FunTy { ft_af = af, ft_mult = mult
-                                   , ft_arg = arg_ty, ft_res = res_ty })
+    check fuel n_req rev_pat_tys (FunTy { ft_af = af, ft_ma = ma, ft_mult = mult
+                                        , ft_arg = arg_ty, ft_res = res_ty })
       = assert (isVisibleFunArg af) $
-        do { let arg_pos = arity - n_req + 1   -- 1 for the first argument etc
+        do { ma_co <- unifyUnmatchableRight ma
+           ; let arg_pos = arity - n_req + 1   -- 1 for the first argument etc
            ; (arg_co, arg_ty_frr) <- hasFixedRuntimeRep (FRRExpectedFunTy herald arg_pos) arg_ty
            ; let scaled_arg_ty_frr = Scaled mult arg_ty_frr
-           ; (res_wrap, result) <- check (n_req - 1)
+           ; (res_wrap, result) <- check fuel (n_req - 1)
                                          (mkCheckExpFunPatTy scaled_arg_ty_frr : rev_pat_tys)
                                          res_ty
 
@@ -894,7 +1014,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
                        -- Satisfies WpFun-FRR-INVARIANT because arg_sty_frr is FRR
 
                  fun_wrap2 -- :: (arg_ty_frr -> res_ty) ~~> (arg_ty -> res_ty)
-                   = mkWpCastN (mkFunCo Nominal af (mkNomReflCo mult) (mkSymCo arg_co) (mkNomReflCo res_ty))
+                   = mkWpCastN (mkFunCo Nominal af ma_co (mkNomReflCo mult) (mkSymCo arg_co) (mkNomReflCo res_ty))
 
                  fun_wrap -- :: (arg_ty_frr -> act_res_ty) ~~> (arg_ty -> res_ty)
                    = fun_wrap2 <.> fun_wrap1
@@ -910,18 +1030,28 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
 
     ----------------------------
     -- Type variables
-    check n_req rev_pat_tys ty@(TyVarTy tv)
+    check fuel n_req rev_pat_tys ty@(TyVarTy tv)
       | isMetaTyVar tv
       = do { cts <- readMetaTyVar tv
            ; case cts of
-               Indirect ty' -> check n_req rev_pat_tys ty'
+               Indirect ty' -> check fuel n_req rev_pat_tys ty'
                Flexi        -> defer n_req rev_pat_tys ty }
 
     ----------------------------
     -- NOW do coreView.  We didn't do it before, so that we do not unnecessarily
     -- unwrap a synonym in the returned rho_ty
-    check n_req rev_pat_tys ty
-      | Just ty' <- coreView ty = check n_req rev_pat_tys ty'
+    check fuel n_req rev_pat_tys ty
+      | Just ty' <- coreView ty = check fuel n_req rev_pat_tys ty'
+
+    check fuel n_req rev_pat_tys ty@(TyConApp tc args)
+      = do { mb_red <- reduceNativeFunFamily_maybe fuel tc args
+           ; case mb_red of
+               Just (fam_co, rhs) ->
+                 do { (inner_wrap, result) <- check (fuel - 1) n_req rev_pat_tys rhs
+                    ; return (mkWpCastN (mkSymCo fam_co) <.> inner_wrap, result) }
+               Nothing ->
+                 addErrCtxt (mkFunTysMsg herald (arity, top_ty)) $
+                 defer n_req rev_pat_tys ty }
 
        -- In all other cases we bale out into ordinary unification
        -- However unlike the meta-tyvar case, we are sure that the
@@ -938,7 +1068,7 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
        --
        -- But in that case we add specialized type into error context
        -- anyway, because it may be useful. See also #9605.
-    check n_req rev_pat_tys res_ty
+    check _ n_req rev_pat_tys res_ty
       = addErrCtxt (mkFunTysMsg herald (arity, top_ty))  $
         defer n_req rev_pat_tys res_ty
 
@@ -950,8 +1080,52 @@ matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
            ; res_ty <- newOpenFlexiTyVarTy
            ; result <- thing_inside all_pats (mkCheckExpType res_ty)
 
-           ; co <- unifyType Nothing (mkScaledFunTys more_arg_tys res_ty) fun_ty
+           ; co <- unifyType Nothing (mkScaledFunTysU more_arg_tys res_ty) fun_ty
            ; return (mkWpCastN co, result) }
+
+    non_u_invisible_forall :: TcSigmaType -> Bool
+    non_u_invisible_forall ty
+      | Just (ma, bndr, body) <- splitForAllForAllTyBinder_maybe ty
+      , isInvisibleForAllTyBinder bndr
+      = not (ma `tcEqType` unmatchableDataConTy)
+        || non_u_invisible_forall body
+      | otherwise = False
+
+    no_trailing_invis_pats :: Bool
+    no_trailing_invis_pats = case herald of
+      ExpectedFunTyMatches _ matches -> no_trailing matches
+      ExpectedFunTyLam _ (HsLam _ _ matches) -> no_trailing matches
+      _ -> False
+
+    no_trailing :: MatchGroup GhcRn (LHsExpr GhcRn) -> Bool
+    no_trailing (MG { mg_alts = L _ matches }) = all match_done matches
+      where
+        match_done :: LMatch GhcRn (LHsExpr GhcRn) -> Bool
+        match_done (L _ (Match { m_pats = L _ pats })) = case reverse pats of
+          [] -> True
+          pat : _ -> isVisArgLPat pat
+
+{- Note [Non-U forall results after value patterns]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider:
+
+  pass :: (forall a. @M a -> a) -> (forall a. @M a -> a)
+  pass f = f
+
+After the value pattern, the result type still has an invisible M forall.
+Skolemising this result would introduce a runtime type lambda and require
+U ~ M before we check the RHS. The RHS can instead use the existing value f
+at its full type. See Note [Checking existing values at non-U foralls] in
+GHC.Tc.Gen.Expr. A fresh lambda RHS still requires runtime U abstraction.
+
+At zero remaining visible arguments, pass the result to RHS checking if
+its invisible forall prefix has metadata that is not known to be U.
+Do this only for source matches with no trailing invisible pattern in any
+alternative. For example, a
+written @a after the last value pattern still needs an ExpForAllPatTy and
+must use the skolemisation path. Required binders and ordinary U results
+also keep the existing path, including deep skolemisation and Plan B2.
+-}
 
 new_infer_arg_ty :: ExpectedFunTyCtxt -> Int -> TcM (Scaled ExpRhoTypeFRR)
 new_infer_arg_ty herald arg_pos -- position for error messages only
@@ -970,10 +1144,14 @@ mkFunTysMsg :: ExpectedFunTyCtxt
             -> HsCtxt
 -- See Note [Reporting application arity errors]
 mkFunTysMsg herald (n_vis_args_in_call, fun_ty)
-  = do { let (pi_ty_bndrs, _) = splitPiTys fun_ty
-             n_fun_args = count isVisiblePiTyBinder pi_ty_bndrs
-
-       ; FunTysCtxt herald fun_ty n_vis_args_in_call n_fun_args }
+  = FunTysCtxt herald fun_ty n_vis_args_in_call (visible_arity fun_ty)
+  where
+    visible_arity ty
+      = let (_, binders, residual) = splitPiTys ty
+        in count isVisiblePiTyBinder binders + case coreFullView residual of
+             DepFunTy DepFunVisible _ body -> 1 + visible_arity body
+             DepFunTy DepFunInvisible _ body -> visible_arity body
+             _ -> 0
 
 
 {- Note [Reporting application arity errors]
@@ -1004,7 +1182,9 @@ the /instantiated/ type, and GHC used to do so.  But it's more work, and in
 some ways more confusing, especially when nested quantifiers are concerned, e.g.
     f :: Bool -> forall t. t Int Int
 
-So we just keep it simple and report the original function type.
+So we report the original function type. splitPiTys counts ordinary and
+required erased arguments through isVisiblePiTyBinder. It stops at a retained
+binder. Count a visible retained binder and continue through either visibility.
 
 
 ************************************************************************
@@ -1020,6 +1200,32 @@ matchExpectedListTy exp_ty
       ; return (co, elt_ty) }
 
 ---------------------
+-- | Match a generated sum payload with its checked constructor type.
+-- See Note [Constructors in a nested dependent sum].
+matchSumPayload :: TyCon -> TcType -> Maybe (TcCoercionN, [TcType])
+matchSumPayload expected_tc ty
+  | Just (family, args) <- tcSplitTyConApp_maybe ty
+  , Just (Reduction co result) <- reduceScopedSumPayload_maybe family args
+  , Just (tc, params) <- tcSplitTyConApp_maybe result
+  , tc == expected_tc
+  = Just (co, params)
+  | otherwise = Nothing
+
+{- Note [Constructors in a nested dependent sum]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In some (n :: Nat) | some (m :: Nat) | body, the outer payload has
+the type of a private family applied to n. Its checked equation gives
+the inner Sigma type. Use this nominal reduction to obtain the inner
+constructor parameters before checking its retained witness. Keep the
+original expected type for the final application check. A pattern uses
+the reduction to cast the scrutinee before it binds the inner fields.
+
+Reduce the generated closed family once. Its axiom needs no open family
+instances. Only use the result when it has the requested algebraic head.
+This leaves user families in the payload fields unevaluated and preserves
+the scope of each witness.
+-}
+
 matchExpectedTyConApp :: TyCon                -- T :: forall kv1 ... kvm. k1 -> ... -> kn -> *
                       -> TcRhoType            -- orig_ty
                       -> TcM (TcCoercionN,    -- T k1 k2 k3 a b c ~N orig_ty
@@ -1041,15 +1247,32 @@ matchExpectedTyConApp tc orig_ty
     go ty@(TyConApp tycon args)
        | tc == tycon  -- Common case
        = return (mkNomReflCo ty, args)
+       | isTypeFamilyTyCon tycon, hasNativeDependentExpr (Core.Type ty)
+       = do { ty <- liftZonkM (zonkTcType ty)
+            ; loc <- getCtLocM (OccurrenceOf (tyConName tycon)) (Just TypeLevel)
+            ; Reduction co reduced <- tcRewriteFamilyAxioms loc ty
+            ; case tcSplitTyConApp_maybe reduced of
+                Just (actual, args) | actual == tc -> return (mkSymCo co, args)
+                _ -> defer }
+         -- See Note [Matching native family result shapes].
+
+    go ty@AppTy{}
+       | (TyVarTy tv, args) <- splitAppTysNoView ty
+       , isMetaTyVar tv
+       = follow_head tv args
+         -- See Note [Matching a constructor at a retained index].
 
     go (TyVarTy tv)
        | isMetaTyVar tv
-       = do { cts <- readMetaTyVar tv
-            ; case cts of
-                Indirect ty -> go ty
-                Flexi       -> defer }
+       = follow_head tv []
 
     go _ = defer
+
+    follow_head tv args = do
+      contents <- readMetaTyVar tv
+      case contents of
+        Indirect head_ty -> go (mkAppTys head_ty args)
+        Flexi            -> defer
 
     -- If the common case does not occur, instantiate a template
     -- T k1 .. kn t1 .. tm, and unify with the original type
@@ -1068,6 +1291,35 @@ matchExpectedTyConApp tc orig_ty
                  tc_template = mkTyConApp tc args
            ; co <- unifyType Nothing tc_template orig_ty
            ; return (co, args) }
+
+{- Note [Matching a constructor at a retained index]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In a callback with a retained binder n, the scrutinee of a constructor
+pattern can have type p n. An earlier argument can already have fixed
+the metavariable p to Const Int. The type still has an AppTy node.
+Reading p and reapplying its arguments exposes Const Int n.
+
+Match that application with the existing TyConApp path. The constructor
+gets the actual n from the scrutinee. The fallback would instead allocate
+a fresh metavariable for the last argument and require it to contain n,
+which is local to the callback. An unknown head uses the usual fallback.
+-}
+
+{- Note [Matching native family result shapes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A known family result can contain runtime indices. For example,
+TreePayload ('Node left right) reduces to (TreePayload left, TreePayload right).
+The ordinary fallback allocates fresh tuple parameters before emitting equality
+constraints. Those parameters cannot hold native types. Reduce a native family
+head with the solver's bounded nominal family rewrite before this fallback.
+See Note [Bounded frontend family views] in GHC.Tc.Solver.
+
+Use the reduced parameters only when the result has the required algebraic
+TyCon. Return the inverse reduction as the required nominal coercion. Do not
+unwrap a newtype, recheck an expression, or assign a native type to a metavariable.
+Other shapes keep the existing fallback and diagnostic context. This evaluates
+type-family equations, not term definitions.
+-}
 
 ----------------------
 matchExpectedAppTy :: TcRhoType                         -- orig_ty
@@ -1102,7 +1354,7 @@ matchExpectedAppTy orig_ty
            ; return (co, (ty1, ty2)) }
 
     orig_kind = typeKind orig_ty
-    kind1 = mkVisFunTyMany liftedTypeKind orig_kind
+    kind1 = mkVisFunTyManyM liftedTypeKind orig_kind
     kind2 = liftedTypeKind    -- m :: * -> k
                               -- arg type :: *
 
@@ -1457,6 +1709,13 @@ tcWrapResultMono :: HasDebugCallStack
                  -> ExpRhoType  -- ^ Expected
                  -> TcM (HsExpr GhcTc)
 tcWrapResultMono rn_expr expr act_ty res_ty
+  | Check exp_ty <- res_ty
+  = do { exp_view <- unwrapMetaView exp_ty
+       ; case exp_view of
+           ExistsTy ImplicitExists _ _ -> tcWrapResult rn_expr expr act_ty res_ty
+           _ -> do { co <- tcSubTypeMono rn_expr act_ty res_ty
+                   ; return (mkHsWrapCo co expr) } }
+  | otherwise
   = do { co <- tcSubTypeMono rn_expr act_ty res_ty
        ; return (mkHsWrapCo co expr) }
 
@@ -1515,22 +1774,27 @@ tcSubTypeApp rn_expr tc_fun app_res_rho (Check exp_rho)
                , text "app_res_rho:" <+> ppr app_res_rho
                , text "exp_rho:"  <+> ppr exp_rho
                , text "ds_flag:" <+> ppr ds_flag ]
-      ; wrap <- case ds_flag of
-          Shallow -- No deep subsumption
-            -- app_res_rho and res_ty are both rho-types,
-            -- so with simple subsumption we can just unify them
-            -- No need to zonk; the unifier does that
-            -> do { co <- unifyExprType rn_expr app_res_rho exp_rho
-                  ; return (mkWpCastN co) }
+      ; mb_pack <- tcSubTypeImplicitExists (Just tc_fun, Top) ds_flag
+                     (unifyExprType rn_expr) (exprCtOrigin rn_expr)
+                     GenSigCtxt app_res_rho exp_rho
+      ; wrap <- case mb_pack of
+          Just pack_wrap -> return pack_wrap
+          Nothing -> case ds_flag of
+            Shallow -- No deep subsumption
+              -- app_res_rho and exp_rho are both rho-types,
+              -- so with simple subsumption we can unify them.
+              -- See Note [Retained domains after instantiation].
+              -> mkWpCastN <$> unify_retained_rho (unifyExprType rn_expr)
+                               app_res_rho exp_rho
 
-          Deep ds_depth -- Deep subsumption is ON
-            -- Even though both app_res_rho and res_ty are rho-types,
-            -- they may have nested polymorphism, so if deep subsumption
-            -- is on we must call tcSubType.
-            -> tc_sub_type_deep (Just tc_fun, Top) ds_depth
-                                (unifyExprType rn_expr)
-                                (exprCtOrigin rn_expr)
-                                GenSigCtxt app_res_rho exp_rho
+            Deep ds_depth -- Deep subsumption is ON
+              -- Even though both app_res_rho and res_ty are rho-types,
+              -- they may have nested polymorphism, so if deep subsumption
+              -- is on we must call tcSubType.
+              -> tc_sub_type_deep (Just tc_fun, Top) ds_depth
+                                  (unifyExprType rn_expr)
+                                  (exprCtOrigin rn_expr)
+                                  GenSigCtxt app_res_rho exp_rho
 
        ; traceTc "tcSubTypeApp }" $
           vcat [ text "tc_fun:" <+> ppr tc_fun
@@ -1591,14 +1855,143 @@ tcSubTypeHoleFit ds_flag orig cand_ty hole_ty =
 
 ---------------
 tcSubTypeAmbiguity :: UserTypeCtxt   -- Where did this type arise
-                   -> TcSigmaType -> TcSigmaType -> TcM HsWrapper
+                   -> TcSigmaType -> TcM [Id]
 -- See Note [Ambiguity check and deep subsumption]
-tcSubTypeAmbiguity ctxt ty_actual ty_expected
-  = tc_sub_type_ds (Nothing, Top)
-      Shallow
-      (unifyType Nothing)
-      (AmbiguityCheckOrigin ctxt)
-      ctxt ty_actual ty_expected
+-- and Note [Ambiguity checking retained signatures].
+tcSubTypeAmbiguity ctxt ty
+  -- See Note [Ambiguity skolemisation is not runtime abstraction]
+  -- in GHC.Tc.Utils.Instantiate. No result wrapper is applied to a value.
+  = do { rec { (_, tv_prs, given, rho_ty, _) <-
+                 topSkolemiseWith AmbiguitySkolemisation skol_info ty
+             ; let sig_skol = SigSkol ctxt ty (map (fmap (binderVar . snd)) tv_prs)
+             ; skol_info <- mkSkolemInfo sig_skol }
+       ; let skol_tvs = map (binderVar . snd . snd) tv_prs
+             orig = AmbiguityCheckOrigin ctxt
+       ; snd <$> checkConstraints sig_skol skol_tvs given
+           (if has_retained rho_ty
+            then do { (_, actual) <- topInstantiate orig ty
+                    ; case coreFullView actual of
+                        DepDictTy{} -> do
+                          align_receivers actual rho_ty
+                          opened <- open_dictionaries orig given actual
+                          tcExtendIdEnv given (compare_rho opened rho_ty)
+                        _ -> compare_rho actual rho_ty }
+            else do { _ <- tc_sub_type_shallow (unifyType Nothing) orig ty rho_ty
+                    ; pure [] }) }
+  where
+    -- See Note [Ambiguity checking retained signatures].
+    align_receivers actual expected = case (coreFullView actual, coreFullView expected) of
+      (DepDictTy _ body, _) -> align_receivers body expected
+      (FunTy af _ _ _ body, _) | isInvisibleFunArg af -> align_receivers body expected
+      (DepFunTy DepFunVisible a as, DepFunTy DepFunVisible e es) -> do
+        when (isJust (getTyVar_maybe (varType a)) && isJust (getTyVar_maybe (varType e))) $
+          void $ unifyType Nothing (varType a) (varType e)
+        align_receivers as es
+      (FunTy af _ _ _ as, FunTy ef _ _ _ es)
+        | isVisibleFunArg af && isVisibleFunArg ef -> align_receivers as es
+      _ -> pure ()
+
+    open_dictionaries orig given actual
+      | DepDictTy binder _ <- coreFullView actual
+      = do { actual' <- liftZonkM (zonkTcType actual)
+           ; pred_ty <- liftZonkM (zonkTcType (varType binder))
+           ; case [d | d <- given, varType d `tcEqType` pred_ty] of
+               [d] -> do { (_, rest) <- topInstantiate orig (applyTypeToArgs actual' [Core.Var d])
+                         ; open_dictionaries orig given rest }
+               _ -> failWithTc $ TcRnRetainedQuantificationError (RetainedSolverType actual') }
+      | otherwise = pure actual
+
+    -- Look only at the telescope and at ordinary function arguments.
+    has_retained (DepFunTy DepFunVisible _ _) = True
+    has_retained (ForAllTy _ _ body)          = has_retained body
+    has_retained (FunTy _ _ _ arg res)       = has_retained arg || has_retained res
+    has_retained ty@(TyConApp tc args)
+      | isTypeSynonymTyCon tc
+      , not (isTauTyCon tc && all isTauTy args)
+      , Just rhs <- coreView ty               = has_retained rhs
+    has_retained _                           = False
+
+    compare_rho actual expected
+      | not (has_retained expected)
+      = check_equality actual expected
+      | DepFunTy DepFunVisible a _ <- coreFullView actual
+      , DepFunTy DepFunVisible e _ <- coreFullView expected
+      = do { _ <- unifyType Nothing (idMult a) (idMult e)
+           ; domain_co <- unifyType Nothing (varType a) (varType e)
+           ; ad <- liftZonkM $ zonkTcType (varType a)
+           ; ed <- liftZonkM $ zonkTcType (varType e)
+           ; em <- liftZonkM $ zonkTcType (idMult e)
+           ; fresh <- newSysLocalId (getOccFS e) em ed
+           ; co <- liftZonkM $ zonkCo domain_co
+           ; let arg = Core.Var fresh
+                 actual_arg
+                   | ad `tcEqType` ed = arg
+                   | otherwise = Core.Cast arg (SubCo (mkSymCo co))
+           ; if isJust (Core.retainedArgIndex actual_arg)
+             then do { actual <- liftZonkM $ zonkTcType actual
+                     ; expected <- liftZonkM $ zonkTcType expected
+                     ; rest <- tcExtendIdEnv [fresh] $
+                           compare_rho (applyTypeToArgs actual [actual_arg])
+                                       (applyTypeToArgs expected [arg])
+                     ; pure (fresh : rest) }
+             else check_equality actual expected }
+      | ForAllTy ma_a (Bndr a vis_a) body_a <- coreFullView actual
+      , ForAllTy ma_e (Bndr e vis_e) body_e <- coreFullView expected
+      , isTyVar a, isTyVar e, vis_a `eqForAllVis` vis_e
+      = do { _ <- unifyType Nothing ma_a ma_e
+           ; kind_co <- unifyType Nothing (varType e) (varType a)
+           ; let skol_anon = UnifyForAllSkol expected
+           ; skol_info <- mkSkolemInfo skol_anon
+           ; (subst, [skol]) <- tcInstSkolTyVars skol_info [e]
+           ; let actual_arg = mkCastTy (mkTyVarTy skol) kind_co
+           ; snd <$> checkConstraints skol_anon [skol] []
+                 (compare_rho (substTyWith [a] [actual_arg] body_a) (substTy subst body_e)) }
+      | FunTy af1 ma1 mult1 arg1 res1 <- coreFullView actual
+      , FunTy af2 ma2 mult2 arg2 res2 <- coreFullView expected
+      , af1 == af2
+      = do { _ <- unifyType Nothing ma1 ma2
+           ; _ <- unifyType Nothing mult1 mult2
+           ; (++) <$> compare_rho arg1 arg2 <*> compare_rho res1 res2 }
+      | otherwise
+      = check_equality actual expected
+
+    check_equality actual expected = [] <$ unifyType Nothing actual expected
+
+{- Note [Ambiguity checking retained signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ambiguity check compares a skolemised signature with a fresh
+instantiation of itself. Keep each retained telescope intact during both
+operations. For example, a retained xs :: Vec a (Add cut m) must have
+the same kind as the index argument to appendVec in its body. Opening xs
+first would leave a free Id whose type still mentions the original a and m
+after the surrounding type has substituted them.
+
+Compare the paired domains nominally. Then use one fresh opaque Id at the
+expected domain. Use that Id directly on both sides when the domains agree.
+Otherwise use the nominal domain Wanted to transport it to the actual
+domain. The result comparison can still determine an erased variable, for
+example when it returns Proxy m and Add cut m alone cannot determine m.
+Keep the original function equality if the native index grammar cannot
+represent the transport. A function-valued index requires a bare Id.
+
+Traverse both sides of ordinary arrows. Under an erased forall in a
+higher-rank argument, make a common skolem and keep the body check in
+its implication. Check equality under the binder. Keep the ordinary
+shallow subsumption path for types without a visible retained telescope.
+
+For a scoped class method, the receiver also selects its dictionary.
+Compare the bare type variables in corresponding visible retained domains
+before opening the actual dictionary binder. This is the same domain
+equality that compare_rho checks below. Open the binder with the unique
+Given at its instantiated predicate. Both copies of the method index now
+refer to the same evidence. The ordinary ambiguity check still compares
+the rest of the signature and solves any other class constraints.
+
+The fresh runtime Ids scope over their body constraints and remain
+available during ambiguity solving. The check discards all evidence and
+does not change the signature; see Gundry (2013, §6.2) and Norell (2007) for
+shared-context comparison.
+-}
 
 ---------------
 addSubTypeCtxt :: TcType -> ExpType -> TcM a -> TcM a
@@ -1642,6 +2035,12 @@ tc_sub_type_ds :: (Maybe (HsExpr GhcTc), Position p)
 -- tc_sub_type_ds is the main subsumption worker function
 -- It takes an explicit DeepSubsumptionFlag
 tc_sub_type_ds pos ds_flag unify inst_orig ctxt ty_actual ty_expected
+  -- See Note [Identity subsumption and runtime foralls].
+  | case inst_orig of
+      AmbiguityCheckOrigin {} -> False
+      _                      -> ty_actual `tcEqType` ty_expected
+  = pure idHsWrapper
+
   | definitely_poly ty_expected   -- See Note [Don't skolemise unnecessarily]
   , isRhoTyDS ds_flag ty_actual
   = do { traceTc "tc_sub_type (drop to equality)" $
@@ -1657,13 +2056,32 @@ tc_sub_type_ds pos ds_flag unify inst_orig ctxt ty_actual ty_expected
 
        ; (sk_wrap, inner_wrap)
             <- tcSkolemise ds_flag ctxt ty_expected $ \sk_rho ->
-               case ds_flag of
-                 Deep ds_depth ->
-                    tc_sub_type_deep pos ds_depth unify inst_orig ctxt ty_actual sk_rho
-                 Shallow ->
-                    tc_sub_type_shallow unify inst_orig ty_actual sk_rho
+               do { mb_pack <- tcSubTypeImplicitExists pos ds_flag unify
+                                 inst_orig ctxt ty_actual sk_rho
+                  ; case mb_pack of
+                      Just pack_wrap -> return pack_wrap
+                      Nothing -> case ds_flag of
+                        Deep ds_depth ->
+                           tc_sub_type_deep pos ds_depth unify inst_orig ctxt ty_actual sk_rho
+                        Shallow ->
+                           tc_sub_type_shallow unify inst_orig ty_actual sk_rho }
 
        ; return (sk_wrap <.> inner_wrap) }
+
+{- Note [Identity subsumption and runtime foralls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An existing value can have a forall type with M or unresolved matchability.
+Passing that value at the same type introduces no runtime type lambda.
+Return the identity wrapper when the complete types are equal, including
+their metadata. Eta expansion would introduce U lambdas and could demand an
+unnecessary U-to-M proof. A new lambda still has its inferred U metadata;
+this equality check does not change that annotation.
+
+An ambiguity check must still skolemize and instantiate its types. Its purpose
+is to detect constraints that cannot be solved after instantiation. Returning
+an identity wrapper there could suppress that check. Exclude
+AmbiguityCheckOrigin from this fast path.
+-}
 
 ----------------------
 tc_sub_type_shallow :: (TcType -> TcType -> TcM TcCoercionN)
@@ -1673,8 +2091,75 @@ tc_sub_type_shallow :: (TcType -> TcType -> TcM TcCoercionN)
                     -> TcM HsWrapper
 tc_sub_type_shallow unify inst_orig ty_actual sk_rho
   = do { (wrap, rho_a) <- topInstantiate inst_orig ty_actual
-       ; cow           <- unify rho_a sk_rho
-       ; return (mkWpCastN cow <.> wrap) }
+       ; reflected <- tcInstInvisibleTypeWitness inst_orig (Just sk_rho) rho_a
+       ; result_wrap <- case reflected of
+           Just (witness, res) ->
+             (<.> witness) <$> tc_sub_type_shallow unify inst_orig res sk_rho
+           Nothing
+             | DepFunTy DepFunVisible b_a _ <- coreFullView rho_a
+             , DepFunTy DepFunVisible b_e _ <- coreFullView sk_rho
+             , isNativeOpaqueValueId b_a, isNativeOpaqueValueId b_e
+             , idMult b_a `tcEqType` OneTy && not (idMult b_e `tcEqType` OneTy)
+             -> do { when (not (varType b_a `tcEqType` varType b_e)) $
+                       void (unify (varType b_a) (varType b_e))
+                   ; rho_a'  <- liftZonkM (zonkTcType rho_a)
+                   ; sk_rho' <- liftZonkM (zonkTcType sk_rho)
+                   ; let (b_e_m, b_e_ty) = case coreFullView sk_rho' of
+                           DepFunTy DepFunVisible be _ -> (idMult be, varType be)
+                           _ -> (idMult b_e, varType b_e)
+                   ; b <- newSysLocalId (fsLit "retained") b_e_m b_e_ty
+                   ; sub_w <- tcExtendIdEnv [b] $
+                       tc_sub_type_shallow unify inst_orig
+                         (applyTypeToArgs rho_a' [Core.Var b])
+                         (applyTypeToArgs sk_rho' [Core.Var b])
+                   ; return (WpRetainedFun True b sub_w) }
+             | otherwise -> mkWpCastN <$> unify_retained_rho unify rho_a sk_rho
+       ; return (result_wrap <.> wrap) }
+
+{- Note [Retained domains after instantiation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A higher-rank argument can take a polymorphic retained function. After
+skolemisation and instantiation, the actual domain may be Maybe alpha and
+the expected domain Maybe a, where a is a skolem. Deep subsumption can reach
+the same pair at the result of an ordinary arrow.
+
+The whole-function equality solver opens retained bodies only when their
+domains agree or normalize to the same type. Check the nominal equality of
+the domains first in the current implication. This lets the ordinary unifier
+assign alpha to a.
+
+Read back the domain assignments before comparing the two telescopes. In
+an alias such as lengthMapLaw = lengthMap, the callback domain contains
+both freshly instantiated parameters. The retained binder and occurrences
+of the callback in the result must see the same instantiated type.
+
+Then check the whole retained function equality for the cast and the runtime
+index scope. This check adds no runtime lambda. Deep subsumption has a separate
+rule for an expected dictionary immediately below a retained binder.
+-}
+
+-- See Note [Retained domains after instantiation].
+unify_retained_rho :: (TcType -> TcType -> TcM TcCoercionN)
+                   -> TcRhoType -> TcRhoType -> TcM TcCoercionN
+unify_retained_rho unify actual expected
+  | DepFunTy vis_a b_a _ <- coreFullView actual
+  , DepFunTy vis_e b_e _ <- coreFullView expected
+  , vis_a == vis_e
+  , isNativeOpaqueValueId b_a, isNativeOpaqueValueId b_e
+  , let domain_a = varType b_a
+        domain_e = varType b_e
+        mult_a   = idMult b_a
+        mult_e   = idMult b_e
+  , not (domain_a `tcEqType` domain_e) || not (mult_a `tcEqType` mult_e)
+  = do { when (not (mult_a `tcEqType` mult_e)) $
+           void (unify mult_a mult_e)
+       ; when (not (domain_a `tcEqType` domain_e)) $
+           void (unify domain_a domain_e)
+       ; actual' <- liftZonkM (zonkTcType actual)
+       ; expected' <- liftZonkM (zonkTcType expected)
+       ; unify actual' expected' }
+  | otherwise
+  = unify actual expected
 
 ----------------------
 definitely_poly :: TcType -> Bool
@@ -1682,7 +2167,7 @@ definitely_poly :: TcType -> Bool
 -- see Note [Don't skolemise unnecessarily]
 definitely_poly ty
   | (tvs, theta, tau) <- tcSplitSigmaTy ty
-  , (tv:_) <- tvs   -- At least one tyvar
+  , ((_,tv):_) <- tvs   -- At least one tyvar
   , null theta      -- No constraints; see (DP1)
   , tv `isInjectiveInType` tau
        -- The tyvar actually occurs (DP2),
@@ -1786,6 +2271,7 @@ tcSubMult origin w_actual w_expected =
     Submult -> return ()
     Unknown -> tcEqMult origin w_actual w_expected
 
+-- | Check multiplicity equality without using a non-reflexive coercion.
 tcEqMult :: CtOrigin -> Mult -> Mult -> TcM ()
 tcEqMult origin w_actual w_expected = do
   {
@@ -2187,52 +2673,100 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
     go ty_a ty_e =
       do { ty_a' <- unwrap ty_a
          ; ty_e' <- unwrap ty_e
-         ; go1 ty_a' ty_e' }
+         ; reflected <- tcInstInvisibleTypeWitness inst_orig (Just ty_e') ty_a'
+         ; case reflected of
+             Just (witness, res) -> (<.> witness) <$> go res ty_e'
+             Nothing -> go1 ty_a' ty_e' }
 
-    -- If ty_actual is not a rho-type, instantiate it first; otherwise
-    -- unification has no chance of succeeding.
+    -- TopSub leaves the expected terminal sigma quantified. Compare the
+    -- two sigmas by nominal equality before instantiating either one.
+    -- This can solve an outer kind metavariable that the preceding
+    -- fields do not mention.
     go1 ty_a ty_e
-      | let (tvs, theta, _) = tcSplitSigmaTy ty_a
-      , not (null tvs && null theta)
-      = do { (in_wrap, in_rho) <- topInstantiate inst_orig ty_a
-           ; body_wrap <- go in_rho ty_e
-           ; return (body_wrap <.> in_wrap) }
+      | TopSub <- ds_depth
+      , Just (XExpr (ConLikeTc (RealDataCon con))) <- tc_fun
+      , isJust (dataConContextFieldCount con) || case dataConSourceOrder con of
+          OrderedConArgs _ -> True
+          LegacyConOrder _ -> False
+      , isSigmaTy ty_a, isSigmaTy ty_e
+      = just_unify ty_a ty_e
+
+    -- Instantiate an actual sigma before comparing its result.
+    go1 ty_a ty_e
+      | isSigmaTy ty_a
+      = instantiate_actual ty_a ty_e
+
+    -- Introduce an implicit existential package when expected under deep subsumption.
+    -- See Note [Introducing an implicit existential].
+    go1 ty_a ty_e@(ExistsTy ImplicitExists _ _)
+      = do { mb_pack <- tcSubTypeImplicitExists (tc_fun, pos) (Deep ds_depth)
+                          unify inst_orig ctxt ty_a ty_e
+           ; case mb_pack of
+               Just pack_wrap -> return pack_wrap
+               Nothing        -> just_unify ty_a ty_e }
 
     -- Main case: FunTy vs FunTy. go_fun does the work.
-    go1 (FunTy { ft_af = af1, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res })
-        (FunTy { ft_af = af2, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res })
+    go1 (FunTy { ft_af = af1, ft_ma = act_ma, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res })
+        (FunTy { ft_af = af2, ft_ma = exp_ma, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res })
       | isVisibleFunArg af1
       , isVisibleFunArg af2
-      = go_fun af1 act_mult act_arg act_res
-               af2 exp_mult exp_arg exp_res
+      = go_fun af1 act_ma act_mult act_arg act_res
+               af2 exp_ma exp_mult exp_arg exp_res
 
     -- See Note [FunTy vs non-FunTy case in tc_sub_type_deep]
-    go1 (FunTy { ft_af = af1, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res }) ty_e
+    go1 (FunTy { ft_af = af1, ft_ma = act_ma, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res }) ty_e
       | isVisibleFunArg af1
       = do { exp_mult <- newMultiplicityVar
            ; exp_arg  <- newOpenFlexiTyVarTy -- NB: no FRR check needed; we might not need to eta-expand
            ; exp_res  <- newOpenFlexiTyVarTy
-           ; let exp_funTy = FunTy { ft_af = af1, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res }
+           ; let exp_funTy = FunTy { ft_af = af1, ft_ma = unmatchableDataConTy, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res }
              -- Recur before unifying; see Wrinkle [Avoiding a loop in tc_sub_type_deep]
-           ; fun_wrap <- go_fun af1 act_mult act_arg act_res af1 exp_mult exp_arg exp_res
+           ; fun_wrap <- go_fun af1 act_ma act_mult act_arg act_res af1 unmatchableDataConTy exp_mult exp_arg exp_res
            ; unify_wrap <- just_unify exp_funTy ty_e
            ; return $ unify_wrap <.> fun_wrap
              -- unify_wrap :: exp_funTy ~~> ty_e
              -- fun_wrap :: ty_a ~~> exp_funTy
            }
-    go1 ty_a (FunTy { ft_af = af2, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res })
+    go1 ty_a (FunTy { ft_af = af2, ft_ma = exp_ma, ft_mult = exp_mult, ft_arg = exp_arg, ft_res = exp_res })
       | isVisibleFunArg af2
       = do { act_mult <- newMultiplicityVar
            ; act_arg  <- newOpenFlexiTyVarTy -- NB: no FRR check needed; we might not need to eta-expand
            ; act_res  <- newOpenFlexiTyVarTy
-           ; let act_funTy = FunTy { ft_af = af2, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res }
+           ; let act_funTy = FunTy { ft_af = af2, ft_ma = unmatchableDataConTy, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res }
              -- Recur before unifying; see Wrinkle [Avoiding a loop in tc_sub_type_deep]
-           ; fun_wrap <- go_fun af2 act_mult act_arg act_res af2 exp_mult exp_arg exp_res
+           ; fun_wrap <- go_fun af2 unmatchableDataConTy act_mult act_arg act_res af2 exp_ma exp_mult exp_arg exp_res
            ; unify_wrap <- just_unify ty_a act_funTy
            ; return $ fun_wrap <.> unify_wrap
              -- unify_wrap :: ty_a ~~> act_funTy
              -- fun_wrap :: act_funTy ~~> ty_e
            }
+
+    -- See Note [Deep subsumption below a retained arrow].
+    go1 ty_a@(DepFunTy DepFunVisible b_a res_a) ty_e@(DepFunTy DepFunVisible b_e res_e)
+      | isNativeOpaqueValueId b_a, isNativeOpaqueValueId b_e
+      , let mult_sub = idMult b_a `tcEqType` OneTy && not (idMult b_e `tcEqType` OneTy)
+            poly_sub = case ds_depth of
+              DeepSub -> idMult b_a `tcEqType` idMult b_e
+                         && (isSigmaTy res_a || isSigmaTy res_e)
+              TopSub  -> False
+      , mult_sub || poly_sub
+      = do { when (not (varType b_a `tcEqType` varType b_e)) $
+               void (unify (varType b_a) (varType b_e))
+           ; ty_a' <- liftZonkM (zonkTcType ty_a)
+           ; ty_e' <- liftZonkM (zonkTcType ty_e)
+           ; let (b_e_m, b_e_ty) = case coreFullView ty_e' of
+                   DepFunTy DepFunVisible be _ -> (idMult be, varType be)
+                   _ -> (idMult b_e, varType b_e)
+           ; b <- newSysLocalId (fsLit "retained") b_e_m b_e_ty
+           ; let open ty = applyTypeToArgs ty [Core.Var b]
+           ; wrap <- tcExtendIdEnv [b] $
+               tc_sub_type_ds (tc_fun, Result pos) (Deep ds_depth) unify inst_orig ctxt
+                 (open ty_a') (open ty_e')
+           ; return (if mult_sub then WpRetainedFun True b wrap else mkWpRetainedFun b wrap) }
+
+    go1 ty_a@DepFunTy{} ty_e@DepFunTy{}
+      | DeepSub <- ds_depth
+      = mkWpCastN <$> unify_retained_rho unify ty_a ty_e
 
     -- Otherwise, revert to unification.
     go1 ty_a ty_e = just_unify ty_a ty_e
@@ -2241,10 +2775,15 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
                               ; return (mkWpCastN cow) }
 
     -- FunTy/FunTy case: this is where we insert any necessary eta-expansions.
-    go_fun :: FunTyFlag -> Mult -> TcType -> TcType -- actual FunTy
-           -> FunTyFlag -> Mult -> TcType -> TcType -- expected FunTy
+    instantiate_actual ty_a ty_e
+      = do { (in_wrap, in_rho) <- topInstantiate inst_orig ty_a
+           ; body_wrap <- go in_rho ty_e
+           ; return (body_wrap <.> in_wrap) }
+
+    go_fun :: FunTyFlag -> Type -> Mult -> TcType -> TcType -- actual FunTy
+           -> FunTyFlag -> Type -> Mult -> TcType -> TcType -- expected FunTy
            -> TcM HsWrapper
-    go_fun act_af act_mult act_arg act_res exp_af exp_mult exp_arg exp_res
+    go_fun act_af act_ma act_mult act_arg act_res exp_af exp_ma exp_mult exp_arg exp_res
       -- See Note [FunTy vs FunTy case in tc_sub_type_deep]
       = do { arg_wrap  <- tc_sub_type_ds (tc_fun, Argument pos) (recurInArgumentDSFlag ds_depth) unify given_orig GenSigCtxt exp_arg act_arg
                           -- GenSigCtxt: See Note [Setting the argument context]
@@ -2263,8 +2802,8 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
            ; fun_wrap <- mkWpFun_FRR
                fun_pos
                wp_mult
-               act_af act_mult act_arg act_res
-               exp_af exp_mult exp_arg exp_res
+               act_af act_ma act_mult act_arg act_res
+               exp_af exp_ma exp_mult exp_arg exp_res
                arg_wrap res_wrap
 
            ; traceTc "tc_sub_type_deep go_fun" $
@@ -2299,6 +2838,22 @@ tc_sub_type_deep fun_pos@(tc_fun, pos) ds_depth unify inst_orig ctxt ty_actual t
           DeepSub -> isDeeplySkolemised ty_expected
 
 
+{- Note [Deep subsumption below a retained arrow]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A visible retained arrow can return a function with an ordinary context.
+DeepSubsumption can adapt the result using the same dictionary wrapper as
+subsumption after an ordinary arrow. Open both function bodies with one
+fresh runtime binder at their common domain. Check the result wrapper in
+that binder's scope. Desugaring uses the same binder in the lambda, the
+application and the result types.
+
+For an identity or cast-only result wrapper, use the corresponding whole
+function identity or DepFunCo. A dictionary wrapper introduces the value
+lambda, as an explicit source adapter would. This rule applies to an expected
+context immediately below a visible retained arrow. Domain conversion and
+equality between independent runtime values use their existing checks.
+-}
+
 -- | Whether to do deep subsumption when recurring inside arguments.
 recurInArgumentDSFlag :: DeepSubsumptionDepth -> DeepSubsumptionFlag
 recurInArgumentDSFlag = \case
@@ -2314,18 +2869,19 @@ recurInArgumentDSFlag = \case
 mkWpFun_FRR
   :: (Maybe (HsExpr GhcTc), Position p)
   -> SubMultCo -- ^ act_mult ~# exp_mult
-  -> FunTyFlag -> Mult -> TcType -> Type --   actual FunTy
-  -> FunTyFlag -> Mult -> TcType -> Type -- expected FunTy
+  -> FunTyFlag -> Type -> Mult -> TcType -> Type --   actual FunTy
+  -> FunTyFlag -> Type -> Mult -> TcType -> Type -- expected FunTy
   -> HsWrapper -- ^ exp_arg ~~> act_arg
   -> HsWrapper -- ^ act_res ~~> exp_res
   -> TcM HsWrapper -- ^ (act_arg->act_res) ~~> (exp_arg->exp_res)
-mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_mult act_arg act_res exp_af exp_mult exp_arg exp_res arg_wrap res_wrap
+mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_ma act_mult act_arg act_res exp_af exp_ma exp_mult exp_arg exp_res arg_wrap res_wrap
   | Just arg_co <- getWpCo_maybe arg_wrap act_arg   -- arg_co :: exp_arg ~R# act_arg
   , Just res_co <- getWpCo_maybe res_wrap act_res   -- res_co :: act_res ~R# exp_res
   = -- The argument and result wrappers are both hole or cast;
     -- so we can make do with a FunCo
     -- See Note [Representation-polymorphism checking during subtyping]
-    do { let the_co = mkSubMultFunCo act_af exp_af sub_mult (mkSymCo arg_co) res_co
+    do { ma_co <- unifyType Nothing act_ma exp_ma
+       ; let the_co = mkSubMultFunCo act_af exp_af ma_co sub_mult (mkSymCo arg_co) res_co
        ; traceTc "mkWpFun_FRR: cast" $
            vcat [ text "act_mult:" <+> ppr act_mult
                 , text "exp_mult:" <+> ppr exp_mult
@@ -2338,7 +2894,9 @@ mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_mult act_arg act_res exp_af exp
   = -- We need a full WpFun, with the eta-expansion that it entails
     -- And hence we must add fixed-runtime-rep checks so that the eta-expansion is OK
     -- See Note [Representation-polymorphism checking during subtyping]
-    do { (exp_arg_co, exp_arg_frr)  <- hasFixedRuntimeRep (frr_ctxt True ) exp_arg
+    do { act_ma_co <- unifyUnmatchableLeft act_ma
+       ; exp_ma_co <- unifyUnmatchableRight exp_ma
+       ; (exp_arg_co, exp_arg_frr)  <- hasFixedRuntimeRep (frr_ctxt True ) exp_arg
        ; (act_arg_co, _act_arg_frr) <- hasFixedRuntimeRep (frr_ctxt False) act_arg
        -- exp_arg_frr, act_arg_frr :: Type   have fixed runtime-reps
        -- exp_arg_co :: exp_arg ~ exp_arg_frr      Usually Refl
@@ -2347,11 +2905,13 @@ mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_mult act_arg act_res exp_af exp
        ; let
             exp_arg_fun_co =  -- (exp_arg_frr -> exp_res) ~ (exp_arg -> exp_res)
               mkFunCo Nominal exp_af
+                 exp_ma_co
                  (mkNomReflCo exp_mult)
                  (mkSymCo exp_arg_co)
                  (mkNomReflCo exp_res)
             act_arg_fun_co =  -- (act_arg -> act_res) ~ (act_arg_frr -> act_res)
               mkFunCo Nominal act_af
+                 act_ma_co
                  (mkReflCo Nominal act_mult)
                  act_arg_co
                  (mkNomReflCo act_res)
@@ -2375,13 +2935,6 @@ mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_mult act_arg act_res exp_af exp
             mkWpCastN act_arg_fun_co    -- (act_arg->act_res) ~~> (act_arg_frr->act_res)
        }
   where
-    getWpCo_maybe :: HsWrapper -> Type -> Maybe CoercionR
-    -- See if a HsWrapper is just a coercion
-    getWpCo_maybe WpHole        ty = Just (mkRepReflCo ty)
-    getWpCo_maybe (WpCast co)   _  = Just co
-    getWpCo_maybe (WpSubType w) ty = getWpCo_maybe w ty
-    getWpCo_maybe _             _  = Nothing
-
     frr_ctxt :: Bool -> FixedRuntimeRepContext
     frr_ctxt is_exp_ty =
       FRRDeepSubsumption
@@ -2390,37 +2943,57 @@ mkWpFun_FRR (mb_tc_fun, pos) sub_mult act_af act_mult act_arg act_res exp_af exp
         , frrAppHead    = mb_tc_fun
         }
 
+-- | Recover coercion evidence from a wrapper with no term operation.
+getWpCo_maybe :: HsWrapper -> Type -> Maybe CoercionR
+getWpCo_maybe WpHole            ty = Just (mkRepReflCo ty)
+getWpCo_maybe (WpCast co)       _  = Just co
+getWpCo_maybe (WpSubType w)     ty = getWpCo_maybe w ty
+getWpCo_maybe (WpExistsPack {}) _  = Nothing
+getWpCo_maybe _                 _  = Nothing
+
 -----------------------
 deeplySkolemise :: SkolemInfo -> TcSigmaType
                 -> TcM ( HsWrapper
-                       , [(Name,TcInvisTVBinder)]     -- All skolemised variables
+                       , [(Name,(Matchability,TcInvisTVBinder))] -- All skolemised variables
                        , [EvVar]                      -- All "given"s
-                       , TcRhoType )
+                       , TcRhoType
+                       , Bag Implication )
 -- See Note [Deep skolemisation]
 deeplySkolemise skol_info ty
-  = go init_subst ty
+  = go [] [] init_subst ty
   where
     init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
-    go subst ty
-      | Just (arg_tys, bndrs, theta, ty') <- tcDeepSplitSigmaTy_maybe ty
+    go prefix_tvs prefix_given subst ty
+      | Just (mas, arg_tys, bndrs, theta, ty') <- tcDeepSplitSigmaTy_maybe ty
       = do { let arg_tys' = substScaledTys subst arg_tys
-           ; ids1             <- newSysLocalIds (fsLit "dk") arg_tys'
+                 mas' = substTys subst mas
+           ; ma_cos <- mapM unifyUnmatchableLeft mas'
+           ; ids1 <- newSysLocalIds (fsLit "dk") arg_tys'
            ; (subst', bndrs1) <- tcInstSkolTyVarBndrsX skol_info subst bndrs
            ; ev_vars1         <- newEvVars (substTheta subst' theta)
-           ; (wrap, tvs_prs2, ev_vars2, rho) <- go subst' ty'
-           ; let tvs     = binderVars bndrs
-                 tvs1    = binderVars bndrs1
+           ; (forall_wrap, prefix_implics) <- tcRuntimeForAllBndrs skol_info prefix_tvs prefix_given
+               [(ma, Bndr tv (Invisible spec)) | (ma, Bndr tv spec) <- bndrs1]
+               (mkPhiTy (substTheta subst' theta) (substTy subst' ty'))
+           ; (wrap, tvs_prs2, ev_vars2, rho, pending_inner) <- go
+               (prefix_tvs ++ map (binderVar . snd) bndrs1)
+               (prefix_given ++ ev_vars1) subst' ty'
+           ; let tvs     = map (binderVar . snd) bndrs
                  tv_prs1 = map tyVarName tvs `zip` bndrs1
-           ; return ( mkWpEta ty ids1 (mkWpTyLams tvs1
-                                      <.> mkWpEvLams ev_vars1
-                                      <.> wrap)
+                 input_body = foldl' (\fun_ty _ -> funResultTy fun_ty) (substTy subst ty) arg_tys'
+                 input_co = mkArrowMatchabilityCo ma_cos arg_tys' input_body
+                 output_co = mkArrowMatchabilityCo (map mkSymCo ma_cos) arg_tys' rho
+           ; return ( mkWpCastN output_co
+                        <.> mkWpEta (coercionRKind input_co) ids1
+                              (forall_wrap <.> mkWpEvLams ev_vars1 <.> wrap)
+                        <.> mkWpCastN input_co
                     , tv_prs1  ++ tvs_prs2
                     , ev_vars1 ++ ev_vars2
-                    , mkScaledFunTys arg_tys' rho ) }
+                    , mkScaledFunTys (zip mas' arg_tys') rho
+                    , prefix_implics `unionBags` pending_inner ) }
 
       | otherwise
-      = return (idHsWrapper, [], [], substTy subst ty)
+      = return (idHsWrapper, [], [], substTy subst ty, emptyBag)
         -- substTy is a quick no-op on an empty substitution
 
 deeplyInstantiate :: CtOrigin -> TcType -> TcM (HsWrapper, Type)
@@ -2432,19 +3005,27 @@ deeplyInstantiate orig ty
     init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     go subst ty
-      | Just (arg_tys, bndrs, theta, rho) <- tcDeepSplitSigmaTy_maybe ty
-      = do { let tvs = binderVars bndrs
+      | Just (mas, arg_tys, bndrs, theta, rho) <- tcDeepSplitSigmaTy_maybe ty
+      = do { let tvs = map (binderVar . snd) bndrs
+                 input_args = substScaledTys subst arg_tys
               -- As per Note [Multiplicity in deep subsumption],
               -- we treat (a %1 -> b) as if it were forall m. a %m -> b.
            ; arg_tys <- traverse oneToMeta arg_tys
            ; (subst', tvs') <- newMetaTyVarsX subst tvs
-           ; let arg_tys' = substScaledTys   subst' arg_tys
+           ; let arg_tys' = substScaledTys subst' arg_tys
+                 mas' = substTys subst' mas
                  theta'   = substTheta subst' theta
-           ; ids1  <- newSysLocalIds (fsLit "di") arg_tys'
+           ; ma_cos <- mapM unifyUnmatchableLeft mas'
+           ; ids1 <- newSysLocalIds (fsLit "di") arg_tys'
            ; wrap1 <- instCall orig (mkTyVarTys tvs') theta'
            ; (wrap2, rho2) <- go subst' rho
-           ; return (mkWpEta ty ids1 (wrap2 <.> wrap1),
-                     mkScaledFunTys arg_tys' rho2) }
+           ; let input_body = foldl' (\fun_ty _ -> funResultTy fun_ty) (substTy subst ty) input_args
+                 input_co = mkArrowMatchabilityCo ma_cos input_args input_body
+                 output_co = mkArrowMatchabilityCo (map mkSymCo ma_cos) arg_tys' rho2
+           ; return (mkWpCastN output_co
+                       <.> mkWpEta (coercionRKind input_co) ids1 (wrap2 <.> wrap1)
+                       <.> mkWpCastN input_co,
+                     mkScaledFunTys (zip mas' arg_tys') rho2) }
 
       | otherwise
       = do { let ty' = substTy subst ty
@@ -2457,8 +3038,16 @@ deeplyInstantiate orig ty
     oneToMeta ty = return ty
 
 
+-- | Build a nominal arrow coercion that changes only matchability.
+mkArrowMatchabilityCo :: [CoercionN] -> [Scaled Type] -> Type -> CoercionN
+mkArrowMatchabilityCo mas args body
+  = foldr step (mkNomReflCo body) (zip mas args)
+  where
+    step (ma_co, Scaled mult arg) res_co
+      = mkFunCoNoFTF Nominal ma_co (mkNomReflCo mult) (mkNomReflCo arg) res_co
+
 tcDeepSplitSigmaTy_maybe
-  :: TcSigmaType -> Maybe ([Scaled TcType], [TcInvisTVBinder], ThetaType, TcSigmaType)
+  :: TcSigmaType -> Maybe ([Type], [Scaled TcType], [(Matchability,TcInvisTVBinder)], ThetaType, TcSigmaType)
 -- Looks for a *non-trivial* quantified type, under zero or more function arrows
 -- By "non-trivial" we mean either tyvars or constraints are non-empty
 tcDeepSplitSigmaTy_maybe ty
@@ -2466,20 +3055,20 @@ tcDeepSplitSigmaTy_maybe ty
   where
   -- As per Note [Multiplicity in deep subsumption],
   -- we treat (a %1 -> b) as if it were forall m. a %m -> b.
-  go ty | Just (arg_ty@(Scaled OneTy _), res_ty) <- tcSplitFunTy_maybe ty
+  go ty | Just (ma, arg_ty@(Scaled OneTy _), res_ty) <- tcSplitFunTy_maybe ty
         = case go res_ty of
             Nothing ->
-              Just ([arg_ty], [], [], res_ty)
-            Just (arg_tys, tvs, theta, rho) ->
-              Just (arg_ty:arg_tys, tvs, theta, rho)
+              Just ([ma], [arg_ty], [], [], res_ty)
+            Just (mas, arg_tys, tvs, theta, rho) ->
+              Just (ma:mas, arg_ty:arg_tys, tvs, theta, rho)
 
-        | Just (arg_ty, res_ty) <- tcSplitFunTy_maybe ty
-        , Just (arg_tys, tvs, theta, rho) <- go res_ty
-        = Just (arg_ty:arg_tys, tvs, theta, rho)
+        | Just (ma, arg_ty, res_ty) <- tcSplitFunTy_maybe ty
+        , Just (mas, arg_tys, tvs, theta, rho) <- go res_ty
+        = Just (ma:mas, arg_ty:arg_tys, tvs, theta, rho)
 
         | (tvs, theta, rho) <- tcSplitSigmaTyBndrs ty
         , not (null tvs && null theta)
-        = Just ([], tvs, theta, rho)
+        = Just ([], [], tvs, theta, rho)
 
         | otherwise = Nothing
 
@@ -2495,7 +3084,7 @@ isDeeplySkolemised ty
   | not (isRhoTy ty)
   -- Foralls or (=>) at top
   = False
-  | Just (_, res) <- tcSplitFunTy_maybe ty
+  | Just (_, _, res) <- tcSplitFunTy_maybe ty
   = isDeeplySkolemised res
   | otherwise
   = True   -- No forall, (=>), or (->) at top
@@ -2518,7 +3107,7 @@ isDeepRhoTy ty
   | not (isRhoTy ty)
   -- Foralls or (=>) at top
   = False
-  | Just (Scaled m _, res) <- tcSplitFunTy_maybe ty
+  | Just (_, Scaled m _, res) <- tcSplitFunTy_maybe ty
   = case m of
       OneTy -> False -- (%1 ->) at top
       _ -> isDeepRhoTy res
@@ -2788,13 +3377,8 @@ uType, uType_defer
 uType_defer (UE { u_loc = loc, u_defer = ref
                 , u_role = role, u_rewriters = rewriters })
             ty1 ty2  -- ty1 is "actual", ty2 is "expected"
-  = do { let pred_ty = mkEqPredRole role ty1 ty2
-       ; hole <- newCoercionHole pred_ty
-       ; let ct = mkNonCanonical $ CtWanted $
-                    WantedCt { ctev_pred      = pred_ty
-                             , ctev_dest      = HoleDest hole
-                             , ctev_loc       = loc
-                             , ctev_rewriters = rewriters }
+  = do { (wanted, hole) <- newWantedEqWithLoc loc rewriters role ty1 ty2
+       ; let ct = mkNonCanonical wanted
              co = HoleCo hole
        ; updTcRef ref (`snocBag` ct)
          -- snocBag: see Note [Work-list ordering] in GHC.Tc.Solver.Equality
@@ -2812,6 +3396,25 @@ uType_defer (UE { u_loc = loc, u_defer = ref
 
        ; return co }
 
+
+{- Note [Checked source synonym reductions in the eager unifier]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A source synonym can carry the dependencies of a method that reduced
+to its RHS. An ordinary expression such as
+
+  (Refl :: Image :~: 'Just 'False)
+
+uses that observation when the eager unifier expands Image to solve
+the nominal equality of the indices. No imported proof Id occurs.
+
+Record the dependence when expansion produces a reflexive coercion.
+Deferred constraints keep their original spelling for the solver.
+The existing identical nullary-synonym test needs no expansion, so
+Refl at Image :~: Image and a mere Proxy Image do not use the method.
+
+At module finalization, check the recorded use against the same rule
+environment as an imported proof. This includes later RULES pragmas.
+-}
 
 --------------
 uType env@(UE { u_role = role }) orig_ty1 orig_ty2
@@ -2831,6 +3434,18 @@ uType env@(UE { u_role = role }) orig_ty1 orig_ty2
             else traceTc "u_tys yields coercion:" (ppr co)
        ; return co }
   where
+    -- See Note [Checked source synonym reductions in the eager unifier].
+    expand_proof_synonym :: TcType -> TcM CoercionN -> TcM CoercionN
+    expand_proof_synonym (TyConApp tc _) solve
+      | Nominal <- role
+      , deps@(_ : _) <- synTyConSourceProofRules tc = do
+          co <- solve
+          when (isReflCo co) $ do
+            loc <- getSrcSpanM
+            recordSourceProofUse loc (tyConName tc) deps
+          pure co
+    expand_proof_synonym _ solve = solve
+
     go :: TcType -> TcType -> TcM CoercionN
         -- The arguments to 'go' are always semantically identical
         -- to orig_ty{1,2} except for looking through type synonyms
@@ -2879,18 +3494,86 @@ uType env@(UE { u_role = role }) orig_ty1 orig_ty2
         -- we'll end up saying "can't match Foo with Bool"
         -- rather than "can't match "Int with Bool".  See #4535.
     go ty1 ty2
-      | Just ty1' <- coreView ty1 = go ty1' ty2
-      | Just ty2' <- coreView ty2 = go ty1  ty2'
+      | Just ty1' <- coreView ty1 = expand_proof_synonym ty1 (go ty1' ty2)
+      | Just ty2' <- coreView ty2 = expand_proof_synonym ty2 (go ty1 ty2')
+
+    -- See Note [Rigid retained indices]
+    go ty1@(TermVarTy v1) (TermVarTy v2)
+      | v1 == v2 = return $ mkReflCo role ty1
+    go ty1@TermAppTy{} ty2@TermAppTy{}
+      | ty1 `tcEqType` ty2 = return $ mkReflCo role ty1
+    go ty1@DepFunTy{} ty2@DepFunTy{}
+      | ty1 `tcEqType` ty2 = return $ mkReflCo role ty1
+
+    -- Cross-decompose visible DepFunTy against ordinary visible FunTy.
+    -- When the binder does not occur in the non-dependent result, mkDepFunTyWithVis
+    -- collapses the unused DepFunVisible endpoint to a standard FunTy.
+    go (DepFunTy DepFunVisible b1 body1)
+       (FunTy { ft_af = FTF_T_T, ft_ma = ma2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
+      | isNativeOpaqueValueId b1
+      = do { co_ma  <- uType (env { u_role = funRole role SelMatch }) unmatchableDataConTy ma2
+           ; co_w   <- uType (env { u_role = funRole role SelMult  }) (idMult b1) w2
+           ; co_arg <- uType (env { u_role = funRole role SelArg   }) (varType b1) arg2
+           ; b_mult <- liftZonkM (zonkTcType (idMult b1))
+           ; b_ty   <- liftZonkM (zonkTcType (varType b1))
+           ; binder <- newSysLocalId (fsLit "retained") b_mult b_ty
+           ; if not (isNativeOpaqueValueId binder)
+             then defer orig_ty1 orig_ty2
+             else do
+               { let left_body = replaceTermVarInType b1 (TermVarTy binder) body1
+               ; co_body <- tcExtendTermScopeBinders [binder] $
+                            do { d' <- getTermScopeDepth
+                               ; let env_b = (updUEnvLoc env (extendCtLocTermScope binder d'))
+                                               { u_role = Nominal }
+                               ; uType env_b left_body res2 }
+               ; let dep_co = mkDepFunCoWithVis DepFunVisible DepFunVisible binder MRefl co_body
+                     fun_co = mkNakedFunCo role FTF_T_T co_ma co_w co_arg
+                                (mkReflCo (funRole role SelRes) res2)
+               ; return (mkTransCo (downgradeRole role Nominal dep_co) fun_co) } }
+
+    go (FunTy { ft_af = FTF_T_T, ft_ma = ma1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
+       (DepFunTy DepFunVisible b2 body2)
+      | isNativeOpaqueValueId b2
+      = do { co_ma  <- uType (env { u_role = funRole role SelMatch }) ma1 unmatchableDataConTy
+           ; co_w   <- uType (env { u_role = funRole role SelMult  }) w1 (idMult b2)
+           ; co_arg <- uType (env { u_role = funRole role SelArg   }) arg1 (varType b2)
+           ; b_mult <- liftZonkM (zonkTcType (idMult b2))
+           ; b_ty   <- liftZonkM (zonkTcType (varType b2))
+           ; binder <- newSysLocalId (fsLit "retained") b_mult b_ty
+           ; if not (isNativeOpaqueValueId binder)
+             then defer orig_ty1 orig_ty2
+             else do
+               { let right_body = replaceTermVarInType b2 (TermVarTy binder) body2
+               ; co_body <- tcExtendTermScopeBinders [binder] $
+                            do { d' <- getTermScopeDepth
+                               ; let env_b = (updUEnvLoc env (extendCtLocTermScope binder d'))
+                                               { u_role = Nominal }
+                               ; uType env_b res1 right_body }
+               ; let fun_co = mkNakedFunCo role FTF_T_T co_ma co_w co_arg
+                                (mkReflCo (funRole role SelRes) res1)
+                     dep_co = mkDepFunCoWithVis DepFunVisible DepFunVisible binder MRefl co_body
+               ; return (mkTransCo fun_co (downgradeRole role Nominal dep_co)) } }
 
     -- Functions (t1 -> t2) just check the two parts
-    go (FunTy { ft_af = af1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
-       (FunTy { ft_af = af2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
+    go (FunTy { ft_af = af1, ft_ma = ma1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
+       (FunTy { ft_af = af2, ft_ma = ma2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
       | isVisibleFunArg af1  -- Do not attempt (c => t); just defer
       , af1 == af2           -- Important!  See #21530
-      = do { co_w <- uType (env { u_role = funRole role SelMult }) w1   w2
+      = do { co_ma <- case (ma1, ma2) of
+               (TyConApp tc1 [], TyConApp tc2 [])
+                 | tc1 == tc2
+                 , tc1 == unmatchableDataConTyCon || tc1 == matchableDataConTyCon
+                 -> return $ mkReflCo (funRole role SelMatch) ma1
+               _ -> uType (env { u_role = funRole role SelMatch }) ma1 ma2
+           ; co_w <- case (w1, w2) of
+               (TyConApp tc1 [], TyConApp tc2 [])
+                 | tc1 == tc2
+                 , tc1 == manyDataConTyCon || tc1 == oneDataConTyCon
+                 -> return $ mkReflCo (funRole role SelMult) w1
+               _ -> uType (env { u_role = funRole role SelMult }) w1 w2
            ; co_l <- uType (env { u_role = funRole role SelArg })  arg1 arg2
            ; co_r <- uType (env { u_role = funRole role SelRes })  res1 res2
-           ; return $ mkNakedFunCo role af1 co_w co_l co_r }
+           ; return $ mkNakedFunCo role af1 co_ma co_w co_l co_r }
 
         -- Always defer if a type synonym family (type function)
         -- is involved.  (Data families behave rigidly.)
@@ -2966,6 +3649,7 @@ uType env@(UE { u_role = role }) orig_ty1 orig_ty2
     -- See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality
     go_app vis ty1 s1 t1 ty2 s2 t2
       | Nominal <- role
+      , isMatchableFunTy (typeKind s1), isMatchableFunTy (typeKind s2)
       = -- Unify arguments t1/t2 before function s1/s2, because
         -- the former have smaller kinds, and hence simpler error messages
         -- c.f. GHC.Tc.Solver.Equality.can_eq_app
@@ -2993,7 +3677,13 @@ This little short-cut in 'defer' helps quite a bit.
 
 Note [Care with type applications]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Note: type applications need a bit of care!
+An unmatchable function can reduce when its argument becomes available.
+Defer the complete equality so the solver can rewrite the application.
+For example, Wrap True can return the type family AsList. Comparing
+Wrap True Int with [Int] before reduction would require AsList ~ [].
+The saturated application can reduce even though the heads differ.
+
+Type applications need a bit of care!
 They can match FunTy and TyConApp, so use splitAppTy_maybe
 NB: we've already dealt with type variables and Notes,
 so if one type is an App the other one jolly well better be too
@@ -3131,56 +3821,84 @@ uUnfilledVar2 :: UnifyEnv       -- Precondition: u_role==Nominal
                                 --    definitely not a /filled/ meta-tyvar
               -> TcTauType      -- Type 2, zonked
               -> TcM CoercionN
-uUnfilledVar2 env@(UE { u_defer = def_eq_ref, u_given_eq_lvl = given_eq_lvl })
+uUnfilledVar2 env@(UE { u_defer = def_eq_ref, u_given_eq_lvl = given_eq_lvl, u_loc = loc })
               swapped tv1 ty2
-  | simpleUnifyCheck UC_OnTheFly given_eq_lvl tv1 ty2 /= SUC_CanUnify
-  = -- Simple unification check fails, so defer
-    do { traceTc "uUnfilledVar2 not ok" $
-             vcat [ text "tv1:" <+> ppr tv1
-                  , text "ty2:" <+> ppr ty2
-                  , text "given_eq_lvl:" <+> ppr given_eq_lvl
-                  , text "simple-unify-chk:" <+> ppr (simpleUnifyCheck UC_OnTheFly given_eq_lvl tv1 ty2)
-                  ]
-               -- Occurs check or an untouchable: just defer
-               -- NB: occurs check isn't necessarily fatal:
-               --     eg tv1 occurred in type family parameter
-       ; defer }
+  = do { lcl_depths <- getIdTermDepths
+       ; let id_depths = plusVarEnv (ctl_id_depths (ctLocEnv loc)) lcl_depths
+             suc       = simpleUnifyCheckWithDepths id_depths UC_OnTheFly given_eq_lvl tv1 ty2
+       ; if suc /= SUC_CanUnify
+         then do
+           { traceTc "uUnfilledVar2 not ok" $
+               vcat [ text "tv1:" <+> ppr tv1
+                    , text "ty2:" <+> ppr ty2
+                    , text "given_eq_lvl:" <+> ppr given_eq_lvl
+                    , text "simple-unify-chk:" <+> ppr suc
+                    ]
+           ; defer }
+         else do
+           { def_eqs <- readTcRef def_eq_ref  -- Capture current state of def_eqs
 
-  | otherwise
-  = do { def_eqs <- readTcRef def_eq_ref  -- Capture current state of def_eqs
+           -- Attempt to unify kinds
+           -- When doing so, be careful to preserve orientation;
+           --    see Note [Kind Equality Orientation] in GHC.Tc.Solver.Equality
+           --    and wrinkle (W2) in Note [Fundeps with instances, and equality orientation]
+           --        in GHC.Tc.Solver.Dict
+           -- Failing to preserve orientation led to #25597.
+           ; let kind_env = unSwap swapped (mkKindEnv env) ty1 ty2
+           ; co_k <- unSwap swapped (uType kind_env) (tyVarKind tv1) (typeKind ty2)
 
-       -- Attempt to unify kinds
-       -- When doing so, be careful to preserve orientation;
-       --    see Note [Kind Equality Orientation] in GHC.Tc.Solver.Equality
-       --    and wrinkle (W2) in Note [Fundeps with instances, and equality orientation]
-       --        in GHC.Tc.Solver.Dict
-       -- Failing to preserve orientation led to #25597.
-       ; let kind_env = unSwap swapped (mkKindEnv env) ty1 ty2
-       ; co_k <- unSwap swapped (uType kind_env) (tyVarKind tv1) (typeKind ty2)
+           ; traceTc "uUnfilledVar2 ok" $
+             vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
+                  , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
+                  , ppr (isReflCo co_k), ppr co_k ]
 
-       ; traceTc "uUnfilledVar2 ok" $
-         vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
-              , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
-              , ppr (isReflCo co_k), ppr co_k ]
+           ; if isReflCo co_k
+               -- Only proceed if the kinds match
+               -- NB: tv1 should still be unfilled, despite the kind unification
+               --     because tv1 is not free in ty2' (or, hence, in its kind)
+             then do { ty2' <- narrowMetaTermDepths env (metaTyVarTermDepth tv1) ty2
+                     ; unifyTyVar env tv1 ty2'
+                     ; return (mkNomReflCo ty2') }  -- Unification is always Nominal
 
-       ; if isReflCo co_k
-           -- Only proceed if the kinds match
-           -- NB: tv1 should still be unfilled, despite the kind unification
-           --     because tv1 is not free in ty2' (or, hence, in its kind)
-         then do { unifyTyVar env tv1 ty2
-                 ; return (mkNomReflCo ty2) }  -- Unification is always Nominal
-
-         else -- The kinds don't match yet, so defer instead.
-              do { writeTcRef def_eq_ref def_eqs
-                     -- Since we are discarding co_k, also discard any constraints
-                     -- emitted by kind unification; they are just useless clutter.
-                     -- Do this dicarding by simply restoring the previous state
-                     -- of def_eqs; a bit imperative/yukky but works fine.
-                 ; defer }
-         }
+             else -- The kinds don't match yet, so defer instead.
+                  do { writeTcRef def_eq_ref def_eqs
+                         -- Since we are discarding co_k, also discard any constraints
+                         -- emitted by kind unification; they are just useless clutter.
+                         -- Do this dicarding by simply restoring the previous state
+                         -- of def_eqs; a bit imperative/yukky but works fine.
+                     ; defer }
+           } }
   where
     ty1 = mkTyVarTy tv1
     defer = unSwap swapped (uType_defer env) ty1 ty2
+
+-- | Narrow any unfilled 'MetaTv' occurring free in 'ty' whose 'TermScopeDepth'
+-- exceeds 'dest_depth', preserving transitive scope safety during eager unification.
+-- See Note [Level-checked unification of runtime indices].
+narrowMetaTermDepths :: UnifyEnv -> TermScopeDepth -> TcType -> TcM TcType
+narrowMetaTermDepths env dest_depth ty
+  | not (anyFreeVarsOfType needs_narrow ty) = return ty
+  | otherwise = do
+      mapM_ narrow_one (tyCoVarsOfTypeList ty)
+      liftZonkM (zonkTcType ty)
+  where
+    needs_narrow v
+      | isTcTyVar v, Just d <- metaTyVarTermDepth_maybe v = d > dest_depth
+      | otherwise = False
+
+    narrow_one v
+      | isPromotableMetaTyVar v
+      , MetaTv { mtv_info = info, mtv_tclvl = lvl, mtv_term_depth = d } <- tcTyVarDetails v
+      , d > dest_depth
+      = do { mb_filled <- isFilledMetaTyVar_maybe v
+           ; case mb_filled of
+               Just rhs -> void (narrowMetaTermDepths env dest_depth rhs)
+               Nothing  -> do
+                 { v_kind' <- narrowMetaTermDepths env dest_depth (tyVarKind v)
+                 ; new_v <- TcM.cloneMetaTyVarWithInfoAndDepth info lvl dest_depth
+                              (setTyVarKind v v_kind')
+                 ; unifyTyVar env v (mkTyVarTy new_v) } }
+      | otherwise = return ()
 
 unifyTyVar :: UnifyEnv -> TcTyVar -> TcType -> TcM ()
 -- Actually do the unification, and record it in WhatUnifications
@@ -3202,6 +3920,12 @@ swapOverTyVars is_given tv1 tv2
   -- Priority: see Note [TyVar/TyVar orientation]
   | pri1 > pri2 = False
   | pri2 > pri1 = True
+
+  -- Term-scope depth: eliminate the deeper MetaTv first to avoid cloning.
+  | Just d1 <- metaTyVarTermDepth_maybe tv1
+  , Just d2 <- metaTyVarTermDepth_maybe tv2
+  , d1 /= d2
+  = d2 > d1
 
   -- Names: see Note [TyVar/TyVar orientation]
   | isSystemName tv2_name, not (isSystemName tv1_name) = True
@@ -3548,11 +4272,21 @@ causing this wibble in behavior seen here.
 -- | Breaks apart a function kind into its pieces.
 matchExpectedFunKind
   :: TypedThing     -- ^ type, only for errors
+  -> Maybe (TcM Matchability) -- ^ Create matchabilities for missing arrows
   -> Arity           -- ^ n: number of desired arrows
   -> TcKind          -- ^ fun_kind
   -> TcM Coercion    -- ^ co :: fun_kind ~ (arg1 -> ... -> argn -> res)
 
-matchExpectedFunKind hs_ty n k = go n k
+{- Note [Applying a type at a family-defined arrow kind]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An application can use any visible arrow. A family equation can reduce
+IK (Arr a b) to IK a %U -> IK b. Use that selector just as for a
+visible arrow in the input.
+Try one nominal family step. Use its coercion only if it exposes a
+visible arrow. The next step then consumes an argument. For a stuck
+family, keep the usual constraint and its source location.
+-}
+matchExpectedFunKind hs_ty missing_arrow n k = go n k
   where
     go 0 k = return (mkNomReflCo k)
 
@@ -3565,10 +4299,20 @@ matchExpectedFunKind hs_ty n k = go n k
                 Indirect fun_kind -> go n fun_kind
                 Flexi ->             defer n k }
 
-    go n (FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res })
+    go n (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res })
       | isVisibleFunArg af
       = do { co <- go (n-1) res
-           ; return (mkNakedFunCo Nominal af (mkNomReflCo w) (mkNomReflCo arg) co) }
+           ; return (mkNakedFunCo Nominal af (mkNomReflCo ma) (mkNomReflCo w) (mkNomReflCo arg) co) }
+
+    -- See Note [Applying a type at a family-defined arrow kind].
+    go n k@(TyConApp tc args)
+      | isTypeFamilyTyCon tc
+      = do { envs <- tcGetFamInstEnvs
+           ; args <- liftZonkM (mapM zonkTcType args)
+           ; case reduceTyFamApp_maybe envs Nominal tc args of
+               Just (Reduction co rhs@FunTy{ft_af = af})
+                 | isVisibleFunArg af -> mkTransCo co <$> go n rhs
+               _ -> defer n k }
 
     go n other
      = defer n other
@@ -3576,8 +4320,11 @@ matchExpectedFunKind hs_ty n k = go n k
     defer n k
       = do { arg_kinds <- newMetaKindVars n
            ; res_kind  <- newMetaKindVar
-           ; let new_fun = mkVisFunTysMany arg_kinds res_kind
-                 origin  = TypeEqOrigin { uo_actual    = k
+           ; new_fun <- case missing_arrow of
+                          Just fresh -> do { mas <- replicateM n fresh
+                                           ; return (mkVisFunTysMany (zip mas arg_kinds) res_kind) }
+                          Nothing -> return (mkVisFunTysManyM arg_kinds res_kind)
+           ; let origin  = TypeEqOrigin { uo_actual    = k
                                         , uo_expected  = new_fun
                                         , uo_thing     = Just hs_ty
                                         , uo_invisible = Nothing
@@ -3618,23 +4365,234 @@ instance Outputable SimpleUnifyResult where
     SUC_NotSure     -> text "SUC_NotSure"
     SUC_CanUnify    -> text "SUC_CanUnify"
 
+-- | Lift a checked constructor branch proof through a supported value type.
+-- See Note [Transport through a retained index].
+tcRetainedCoercion :: Id -> CoercionN -> TcType -> TcM CoercionN
+tcRetainedCoercion index branch_co original_ty
+  = do { unless (isRetainedConstructorProof index branch_co) $
+           pprPanic "tcRetainedCoercion: invalid branch proof"
+             (ppr index $$ ppr branch_co $$ ppr original_ty)
+       ; tcRetainedIndexCoercion (TermVarTy index) branch_co original_ty }
+
+-- | Check whether a nominal proof refines a retained index to a constructor.
+-- The proof must be oriented with the retained index on the left.
+isRetainedConstructorProof :: Id -> CoercionN -> Bool
+isRetainedConstructorProof index co
+  | isNativeIndexId index
+  , coercionRole co == Nominal
+  , coercionLKind co `eqType` TermVarTy index
+  , let ty = coercionRKind co
+  , TyConApp tc _ <- coreFullView ty
+  , Just con <- isPromotedDataCon_maybe tc
+  , Just _ <- nativeIndexDataConTyArgs (varType index) con
+  = typeKind ty `eqType` varType index
+  | otherwise = False
+
+-- | Find an exact free call index. Unsupported proof and kind dependencies
+-- are conservative candidates; the transport checker rejects these forms.
+retainedCallOccurs :: Type -> TcType -> Bool
+retainedCallOccurs call_ty = go
+  where
+    dependencies = filter (\v -> isId v && not (isCoVar v))
+                     (tyCoVarsOfTypeList call_ty)
+    go ty
+      | not (all (\v -> anyFreeVarsOfType (== v) ty) dependencies) = False
+      | call_ty `eqType` ty = True
+      | Just expanded <- coreView ty = go expanded
+    go (TyConApp _ args) = any go args
+    go (AppTy fun arg) = go fun || go arg
+    go (FunTy _ ma mult arg res) = any go [ma, mult, arg, res]
+    go (DepFunTy _ binder body)
+      = go (varType binder) || (binder `notElem` dependencies && go body)
+    go (ForAllTy ma (Bndr binder _) body) = go ma || go (varType binder) || go body
+    go (TermAppTy _ arg) = go arg
+    go (CastTy ty co) = go ty || proof_depends co
+    go (CoercionTy co) = proof_depends co
+    go TyVarTy{} = True  -- A dependency in the variable's kind is unsupported.
+    go _ = False
+    proof_depends co = all (\v -> anyFreeVarsOfCo (== v) co) dependencies
+
+-- | Transport an exact checked call along its strict-case alias proof.
+-- See Note [Source opaque call refinement] in GHC.Tc.Gen.Match.
+tcRetainedCallCoercion :: Type -> CoercionN -> TcType -> TcM CoercionN
+tcRetainedCallCoercion call_ty branch_co original_ty
+  = do { unless (isJust (nativeCallSpine_maybe call_ty)
+                 && coercionRole branch_co == Nominal
+                 && coercionLKind branch_co `eqType` call_ty
+                 && typeKind (coercionRKind branch_co) `eqType` typeKind call_ty) $
+           pprPanic "tcRetainedCallCoercion: invalid alias proof"
+             (ppr call_ty $$ ppr branch_co $$ ppr original_ty)
+       ; tcRetainedIndexCoercion call_ty branch_co original_ty }
+
+-- | Abstract one checked index, then use ordinary nominal FC lifting.
+tcRetainedIndexCoercion :: Type -> CoercionN -> TcType -> TcM CoercionN
+tcRetainedIndexCoercion index_ty branch_co original_ty
+  = do { ty <- liftZonkM $ zonkTcType original_ty
+       ; name <- newSysName (mkTyVarOcc "retained")
+       ; let template = mkTyVar name (typeKind index_ty)
+       ; template_ty <- case abstractNativeIndices [(index_ty, template)] ty of
+           Just result -> return result
+           Nothing -> failWithTc $ TcRnRetainedQuantificationError (RetainedPatternType original_ty)
+       ; let lc = prepareNativeLiftingContext (mkLiftingContext [(template, branch_co)]) template_ty
+             co = liftCoSubst Nominal lc template_ty
+             lhs = substTy (lcSubstLeft lc) template_ty
+             rhs = substTy (lcSubstRight lc) template_ty
+       ; unless (coercionRole co == Nominal
+                 && lhs `eqType` ty
+                 && coercionLKind co `eqType` lhs
+                 && coercionRKind co `eqType` rhs) $
+           pprPanic "tcRetainedIndexCoercion: invalid lifted proof"
+             (ppr co $$ ppr ty $$ ppr rhs)
+       ; return co }
+{- Note [Transport through a retained index]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A checked constructor pattern provides n ~# 'S k, for example. Its actual
+field identities are in scope when the branch body is checked. Check the
+constructor against the full structural parent, including its ordinary type arguments.
+See Note [Algebraic runtime index domains] in GHC.Core.Type. Abstract the
+free occurrences of n in a supported value type to one fresh, immutable TyVar
+of the index domain. Prepare a lifting context and transport that template along
+the branch proof. Existing FC lifting supplies the required congruence.
+The runtime Id remains an Id. The template never enters the checked type.
+
+Abstract domains before freshening their binders. Preserve outer forall
+metadata and update source Id prototypes in the body. The owned template
+boundary prepares free runtime metadata explicitly. Nominal lifting builds
+DepFunCo with domain evidence and one common body prefix. Cast the closure;
+eta expansion would change bottom-function behavior in Haskell.
+
+Input casts and coercion types whose evidence depends on the selected index
+remain unsupported. See Note [Scoped native index abstraction] in GHC.Core.Coercion.
+This adds no axiom, singleton, general Pi unification, or term evaluation.
+It follows dependent pattern specialization (Cockx and Abel, ICFP 2018;
+Gundry, 2013, §6.3).
+The caller uses the nominal proof for argument and inverse result casts.
+-}
+
+{- Note [Family Givens with rigid runtime indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Matching Refl on a list-length proof gives an equality between two
+family applications, size (map f xs) ~ size xs. The same equality must
+rewrite an argument of another type family, for example minSize. An
+irreducible Given can solve the exact equality, but ordinary family
+rewriting cannot use it under minSize.
+
+For an existing nominal Given with a family application on the left,
+accept a rigid runtime Id or a checked application of that Id on the
+right. Check the type of the Id with the same occurs check before keeping
+the occurrence. For an application, keep the head fixed and check the
+argument at its declared domain. Use its nominal coercion to rebuild the
+application. Recurse through
+family applications without introducing cycle breakers on this path.
+The resulting canonical equality retains the original scoped evidence.
+Wanted constraints and private runtime-binder comparisons keep their
+usual scope checks. See Note [Rigid retained indices].
+-}
+
+{- Note [Rigid retained indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Runtime indices are rigid local Ids. Equal occurrences of the same Id need
+only reflexivity. Alpha-equal retained functions also need only reflexivity.
+Defer other retained function equalities as whole constraints. Their bodies
+need a private runtime-binder scope. See Note [Solving retained function
+equalities] in GHC.Tc.Solver.Equality.
+
+For now, a metavariable cannot be assigned a type that contains retained
+syntax. In particular, do not promote an index Id as if it were a TyVar.
+Report a conservative RHS-check failure instead of allowing an index to
+escape its binder. General native unification remains unsupported.
+
+Checking an existing Given is different from assigning a metavariable.
+For a Given with a type-variable LHS and native syntax in its RHS,
+checkTypeEqNoUnification enables tefTyVar_allowNativeGivenRhs. Accept an opaque
+TermVarTy only when isNativeRetainedBinder validates its unrestricted binder.
+For DepFunTy, require a valid retained binder and a lifted body. Function
+binders keep the same fixed domain in call heads and stored function values.
+See Note [Function-valued retained binders] in GHC.Core.Type.
+Recurse through the body
+with the same flags and wrap its reduction with mkDepFunRedn. This keeps the
+ordinary occurs and coercion checks. A reflexive shortcut would miss
+occurrences such as a ~ (foreach n -> Vec a n). The binder scopes the complete
+body reduction. Do not decompose a wanted retained-function equality here.
+The same immutable check can traverse an invisible constraint arrow. Check
+its multiplicity, predicate and result with the same flags, and keep the
+complete FunTy reduction. This does not discharge a dictionary obligation
+or turn class evidence into equality evidence. Ordinary Given checks and
+every mutable check still reject these impredicative RHSs.
+Expand type synonyms on this path before checking their complete RHS. A
+retained Pi synonym is not a tau TyCon, but it needs the same immutable
+checks as the written Pi. Recurse after expansion so occurrences in a
+predicate or result remain visible. Keep the ordinary synonym policy for
+all other checks. See Note [Forgetful synonyms in checkTyConApp].
+The Given already belongs to a checked implication scope. No runtime Id is
+created, promoted or assigned. The scoped rewrite filter separately checks
+its use beneath a retained binder.
+
+Disable family cycle breaking on this Given path. A cycle breaker saves its
+RHS and later restores it with writeMetaTyVar. That route must not assign
+native syntax. An occurs cycle remains irreducible. Every Wanted, unification,
+defaulting and concreteness check keeps this option disabled.
+
+See Gundry (2013, §§6.2-6.3) and Eisenberg (2016, §6.3) for dependent binding
+and application, and Schmidt-Schauß, Sabel and Machkasova (LMCS 2015) for
+Haskell call-by-need evaluation.
+-}
+
+{- Note [Level-checked unification of runtime indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unification variables may bind types containing runtime indices ('TermVarTy',
+'TermAppTy') and visible retained dependent function types ('DepFunTy'
+'DepFunVisible') when every free runtime 'Id' is in scope at the unification
+variable's birth site (Gundry, McBride, and McKinna, "Type Inference in
+Context", MSFP 2010, pp. 43-54; Gundry, PhD thesis, University of Strathclyde,
+2013, §§6.2-6.3).
+
+Ordinary value binders in lambdas, patterns, and local @let@ groups do not bump
+'TcLevel'. Each unification variable therefore carries an immutable contextual
+birth depth 'mtv_term_depth', and 'TcLclCtxt' / 'CtLocEnv' record the birth
+depth of each local value 'Id' in 'tcl_id_depths' / 'ctl_id_depths'. Top-level
+bindings and imported 'GlobalId's have 'topTermScopeDepth' (0).
+
+Three rules maintain scope soundness:
+1. Direct assignment @alpha := rhs@ requires @depth(v) <= mtv_term_depth alpha@
+   for every free runtime 'Id' @v@ in @rhs@. In 'simpleUnifyCheckWithDepths', a
+   deeper 'Id' returns 'SUC_NotSure' rather than 'SUC_CannotUnify' so that
+   'checkTyEqRhs' can expand forgetful type synonyms (such as
+   @type Ignore x = Int@) before reporting 'cteSkolemEscape'.
+2. Assigning @alpha@ to a type mentioning an unfilled @beta@ with
+   @mtv_term_depth beta > mtv_term_depth alpha@ narrows @beta@ to
+   @mtv_term_depth alpha@ in both 'checkTyVar' and 'narrowMetaTermDepths'.
+3. Invisible retained functions ('DepFunTy' 'DepFunInvisible') do not unify
+   with 'TauTv' variables. Restricting 'TauTv' to predicative monotypes and
+   visible arrows preserves implicit instantiation confluence (Kovács,
+   "Elaboration with First-Class Implicit Function Types", ICFP 2020,
+   PACMPL 4(ICFP):101).
+-}
+
 simpleUnifyCheck :: UnifyCheckCaller -> TcLevel -> TcTyVar -> TcType -> SimpleUnifyResult
+simpleUnifyCheck = simpleUnifyCheckWithDepths emptyVarEnv
+
+simpleUnifyCheckWithDepths
+  :: VarEnv TermScopeDepth
+  -> UnifyCheckCaller -> TcLevel -> TcTyVar -> TcType -> SimpleUnifyResult
 -- ^ A fast check for unification. May return "not sure", in which case
 -- unification might still be OK, but it'll take more work to do
 -- (use the full 'checkTyEqRhs').
 --
--- See Note [simpleUnifyCheck]
+-- See Note [simpleUnifyCheck] and Note [Level-checked unification of runtime indices].
 --
 -- This function is pretty heavily used, so it's optimised not to allocate
-simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
+simpleUnifyCheckWithDepths id_depths caller given_eq_lvl lhs_tv rhs
   | not $ touchabilityTest given_eq_lvl lhs_tv = SUC_CannotUnify
   | not $ checkTopShape lhs_info rhs           = SUC_CannotUnify
-  | not (rhs_is_bad rhs)                       = SUC_CanUnify
+  | not (rhs_is_bad False emptyVarSet rhs)     = SUC_CanUnify
   | otherwise                                  = SUC_NotSure
   where
     lhs_info           = metaTyVarInfo lhs_tv
     lhs_tv_lvl         = tcTyVarLevel lhs_tv
+    lhs_depth          = metaTyVarTermDepth lhs_tv
     lhs_tv_is_concrete = isConcreteTyVar lhs_tv
+    lhs_tv_is_tyvartv  = isTyVarTyVar lhs_tv
     lhs_tv_nm          = tyVarName lhs_tv
 
     -- See Note [RuntimeUnkTv] in GHC.Runtime.Heap.Inspect, esp (RUT1).
@@ -3649,41 +4607,118 @@ simpleUnifyCheck caller given_eq_lvl lhs_tv rhs
                UC_Solver     -> True
                UC_OnTheFly   -> False
 
-    rhs_tcv_is_bad tcv
+    deeper_meta_bad = case caller of
+                        UC_Solver   -> True
+                        UC_OnTheFly -> False
+
+    rhs_id_is_bad bound_ids v
+      | v `elemVarSet` bound_ids
+      = rhs_is_bad False bound_ids (varType v) || rhs_is_bad False bound_ids (idMult v)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv || forall_ok
+      = True
+      | not (isNativeOpaqueValueId v || isNativeIndexFunctionId v)
+      = True
+      | Just d <- lookupIdTermDepth id_depths v
+      , d <= lhs_depth
+      = rhs_is_bad False bound_ids (varType v) || rhs_is_bad False bound_ids (idMult v)
+      | otherwise
+      = True
+
+    rhs_tcv_is_bad bound_ids tcv
        -- c.f. checkTyVar, the TEFTyVar case
        | isCoVar tcv                                      = occ_check
+       | isId tcv                                         = rhs_id_is_bad bound_ids tcv
+       | tcv `elemVarSet` bound_ids                       = rhs_is_bad False bound_ids (tyVarKind tcv)
        | tcTyVarLevel tcv `strictlyDeeperThan` lhs_tv_lvl = True
+       | deeper_meta_bad
+       , Just d <- metaTyVarTermDepth_maybe tcv
+       , d > lhs_depth                                    = True
        | lhs_tv_is_concrete, not (isConcreteTyVar tcv)    = True
        | occ_check                                        = True
        | otherwise                                        = False
        where
          occ_check = simpleOccursCheck lhs_tv_nm tcv
 
-    rhs_is_bad (TyVarTy tv) = rhs_tcv_is_bad tv
+    rhs_dict_is_bad bound_ids (TermVarTy d)
+      | d `elemVarSet` bound_ids
+      = rhs_is_bad False bound_ids (varType d)
+      | isNativeClassDictionaryId d
+      , case lookupIdTermDepth id_depths d of
+          Just vd -> vd <= lhs_depth
+          Nothing -> isNeverActive (idInlineActivation d)
+      = rhs_is_bad False bound_ids (varType d)
+    rhs_dict_is_bad _ _ = True
 
-    rhs_is_bad (FunTy {ft_af = af, ft_mult = w, ft_arg = a, ft_res = r})
-      | not forall_ok, isInvisibleFunArg af = True
-      | otherwise                           = rhs_is_bad w || rhs_is_bad a || rhs_is_bad r
+    rhs_is_bad _ bound_ids (TermVarTy v) = rhs_id_is_bad bound_ids v
+    rhs_is_bad _ bound_ids (TermAppTy f arg)
+      | Just (dom, _) <- nativeIndexFunctionTys_maybe f
+      , typeKind arg `eqType` dom
+      = rhs_id_is_bad bound_ids f || rhs_is_bad False bound_ids arg
+      | otherwise = True
+    rhs_is_bad _ bound_ids (DepFunTy DepFunVisible b body)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv || forall_ok = True
+      | (isNativeOpaqueValueId b || isNativeIndexFunctionId b)
+      , tcIsLiftedTypeKind (typeKind body)
+      = rhs_is_bad False bound_ids (idMult b)
+        || rhs_is_bad False bound_ids (varType b)
+        || rhs_is_bad True (extendVarSet bound_ids b) body
+      | otherwise = True
+    rhs_is_bad _ _ (DepFunTy DepFunInvisible _ _) = True
+    rhs_is_bad _ bound_ids (ClassAppTy sel inst dict operand kind)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv || forall_ok = True
+      | not (isExternalName (getName sel)) = True
+      | otherwise = rhs_is_bad False bound_ids inst
+                    || rhs_dict_is_bad bound_ids dict
+                    || rhs_is_bad False bound_ids operand
+                    || rhs_is_bad False bound_ids kind
+    rhs_is_bad _ _ (DepDictTy {})  = True
+    rhs_is_bad _ bound_ids ty@(ExistsTy _ binder body)
+      | lhs_tv_is_concrete || lhs_tv_is_tyvartv = True
+      | not forall_ok && not (isPredicativeExistsTy ty) = True
+      | rhs_is_bad False bound_ids (tyVarKind binder) = True
+      | binder /= lhs_tv
+      , rhs_is_bad False (extendVarSet bound_ids binder) body = True
+      | otherwise = False
+    rhs_is_bad _ bound_ids (TyVarTy tv) = rhs_tcv_is_bad bound_ids tv
 
-    rhs_is_bad (TyConApp tc tys)
+    rhs_is_bad under_pi bound_ids (FunTy {ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = r})
+      | not (forall_ok || under_pi), isInvisibleFunArg af = True
+      | otherwise = rhs_is_bad False bound_ids ma || rhs_is_bad False bound_ids w
+                    || rhs_is_bad under_pi bound_ids a || rhs_is_bad under_pi bound_ids r
+
+    rhs_is_bad under_pi bound_ids ty@(TyConApp tc tys)
       | lhs_tv_is_concrete, not (isConcreteTyCon tc) = True
       | not forall_ok, not (isTauTyCon tc)           = True
-      | not fam_ok,    not (isFamFreeTyCon tc)       = True
-      | otherwise                                    = any rhs_is_bad tys
+      | not fam_ok,    not (isFamFreeTyCon tc || is_unsat_scoped_fam_or_syn under_pi bound_ids tc tys ty) = True
+      | otherwise                                    = any (rhs_is_bad under_pi' bound_ids) tys
+      where
+        under_pi' = under_pi && isAlgTyCon tc && not (isClassTyCon tc)
+                      && length tys == tyConArity tc
+                      && tcIsLiftedTypeKind (typeKind ty)
 
-    rhs_is_bad (ForAllTy (Bndr tv _) ty)
-      | not forall_ok               = True
-      | rhs_is_bad (tyVarKind tv)   = True
-      | tv /= lhs_tv, rhs_is_bad ty = True
-      | otherwise                   = False
+    rhs_is_bad under_pi bound_ids (ForAllTy ma (Bndr tv vis) ty)
+      | rhs_is_bad False bound_ids ma                           = True
+      | not (forall_ok || (under_pi && isInvisibleForAllTyFlag vis)) = True
+      | rhs_is_bad False bound_ids (tyVarKind tv)               = True
+      | tv /= lhs_tv
+      , rhs_is_bad under_pi (extendVarSet bound_ids tv) ty      = True
+      | otherwise                                               = False
 
-    rhs_is_bad (AppTy t1 t2)    = rhs_is_bad t1 || rhs_is_bad t2
-    rhs_is_bad (CastTy ty co)   = co_is_bad co || rhs_is_bad ty
-    rhs_is_bad (CoercionTy co)  = co_is_bad co
-    rhs_is_bad (LitTy {})       = False
+    rhs_is_bad _ bound_ids (AppTy t1 t2)  = rhs_is_bad False bound_ids t1 || rhs_is_bad False bound_ids t2
+    rhs_is_bad _ bound_ids (CastTy ty co) = co_is_bad bound_ids co || rhs_is_bad False bound_ids ty
+    rhs_is_bad _ bound_ids (CoercionTy co)= co_is_bad bound_ids co
+    rhs_is_bad _ _         (LitTy {})     = False
+
+    -- An unsaturated scoped closed family (or a synonym over one) represents
+    -- a codomain closure. It does not reduce before it receives its binder
+    -- argument. Unify it on the fly. See Note [Prevent unification with type families].
+    is_unsat_scoped_fam_or_syn under_pi bound_ids tc tys ty
+      | Just _ <- closedFamilyScope_maybe tc = tys `lengthLessThan` tyConArity tc
+      | isTypeSynonymTyCon tc, Just ty' <- coreView ty = not (rhs_is_bad under_pi bound_ids ty')
+      | otherwise = False
 
     -- Coercions: see Note [Occurs check and coercions]
-    co_is_bad co = anyFreeVarsOfCo rhs_tcv_is_bad co
+    co_is_bad bound_ids co = anyFreeVarsOfCo (rhs_tcv_is_bad bound_ids) co
 
 {- Note [simpleUnifyCheck]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3831,6 +4866,9 @@ data TyEqFlags m a
        -- (soluble or insoluble)
     , tefTyFam_tyCon :: TyCon
     , tefTyFam_args  :: [Type]
+    , tefTyFam_allowRetainedIds :: Bool
+        -- ^ Check the types of rigid runtime Ids in a nominal Given.
+        -- See Note [Family Givens with rigid runtime indices].
     , tef_fam_app :: TyEqFamApp m a
         -- ^ How to deal with type family applications
     }
@@ -3846,6 +4884,13 @@ data TyEqFlags m a
         -- ^ Level check
     , tefTyVar_concreteCheck  :: ConcreteCheck m
         -- ^ Concreteness check
+    , tefTyVar_allowNativeGivenRhs :: Bool
+        -- ^ Check an existing native Given without assigning a metavariable.
+        -- See Note [Rigid retained indices].
+    , tefTyVar_isTyVarTv :: Bool
+        -- ^ Reject non-variable types on a 'TyVarTv'.
+    , tefTyVar_forAllOK :: Bool
+        -- ^ Allow impredicative polytypes / invisible 'DepFunTy's.
     , tef_fam_app :: TyEqFamApp m a
         -- ^ How to deal with type family applications
     }
@@ -3892,8 +4937,10 @@ data LevelCheck m where
   -- True <=> lenient check, e.g. the levels have a chance of working out
   -- after promotion.
   LC_Check ::
-    { lc_lvlc    :: TcLevel
-    , lc_lenient :: Bool
+    { lc_lvlc       :: TcLevel
+    , lc_term_depth :: TermScopeDepth
+    , lc_id_depthsc :: VarEnv TermScopeDepth
+    , lc_lenient    :: Bool
     } -> LevelCheck m
 
   -- | Do a level check between the LHS tyvar and the occurrence tyvar.
@@ -3905,8 +4952,10 @@ data LevelCheck m where
   --   -  True <=> promote even under type families
   --             (see Note [Defaulting equalities] in GHC.Tc.Solver)
   LC_Promote
-    :: { lc_lvlp :: TcLevel
-       , lc_deep :: Bool
+    :: { lc_lvlp        :: TcLevel
+       , lc_term_depthp :: TermScopeDepth
+       , lc_id_depthsp  :: VarEnv TermScopeDepth
+       , lc_deep        :: Bool
        } -> LevelCheck TcM
 
 data ConcreteCheck m where
@@ -3999,6 +5048,7 @@ notUnifying_TEFTask occ_prob = \case
     TEFTyFam
       { tefTyFam_tyCon = tc
       , tefTyFam_args  = tys
+      , tefTyFam_allowRetainedIds = False
       , tefTyFam_occursCheck = occ_prob
       , tef_fam_app = TEFA_Recurse
       }
@@ -4007,6 +5057,9 @@ notUnifying_TEFTask occ_prob = \case
       { tefTyVar_occursCheck   = OC_Check (tyVarName tv) occ_prob
       , tefTyVar_levelCheck    = LC_None
       , tefTyVar_concreteCheck = CC_None
+      , tefTyVar_allowNativeGivenRhs = False
+      , tefTyVar_isTyVarTv     = False
+      , tefTyVar_forAllOK      = not (isMetaTyVar tv) || isRuntimeUnkTyVar tv || isQLInstTyVar tv
       , tef_fam_app            = TEFA_Recurse
      }
     -- We need an occurs-check here, but no level check.
@@ -4018,11 +5071,21 @@ notUnifying_TEFTask occ_prob = \case
 -- Invariant: the argument 'TcTyVar' is a 'MetaTv'.
 unifyingLHSMetaTyVar_TEFTask :: CtEvidence -> TcTyVar -> TyEqFlags TcM Ct
 unifyingLHSMetaTyVar_TEFTask ev lhs_tv =
+  unifyingLHSMetaTyVarWithDepths_TEFTask (ctl_id_depths (ctLocEnv (ctEvLoc ev))) ev lhs_tv
+
+unifyingLHSMetaTyVarWithDepths_TEFTask
+  :: VarEnv TermScopeDepth -> CtEvidence -> TcTyVar -> TyEqFlags TcM Ct
+unifyingLHSMetaTyVarWithDepths_TEFTask id_depths ev lhs_tv =
   TEFTyVar
     { tefTyVar_occursCheck   = OC_Check (tyVarName lhs_tv) cteInsolubleOccurs
-    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp = tcTyVarLevel lhs_tv
-                                          , lc_deep = False }
+    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp        = tcTyVarLevel lhs_tv
+                                          , lc_term_depthp = metaTyVarTermDepth lhs_tv
+                                          , lc_id_depthsp  = id_depths
+                                          , lc_deep        = False }
     , tefTyVar_concreteCheck = mkConcreteCheck lhs_tv
+    , tefTyVar_allowNativeGivenRhs = False
+    , tefTyVar_isTyVarTv     = isTyVarTyVar lhs_tv
+    , tefTyVar_forAllOK      = isRuntimeUnkTyVar lhs_tv || isQLInstTyVar lhs_tv
     , tef_fam_app            = mkTEFA_Break ev NomEq (BreakWanted ev lhs_tv)
     }
 
@@ -4032,11 +5095,16 @@ defaulting_TEFTask :: TcTyVar -> TyEqFlags TcM a
 defaulting_TEFTask lhs_tv =
   TEFTyVar
     { tefTyVar_occursCheck   = OC_Check (tyVarName lhs_tv) cteInsolubleOccurs
-    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp = tcTyVarLevel lhs_tv
-                                          , lc_deep = True }
+    , tefTyVar_levelCheck    = LC_Promote { lc_lvlp        = tcTyVarLevel lhs_tv
+                                          , lc_term_depthp = metaTyVarTermDepth lhs_tv
+                                          , lc_id_depthsp  = emptyVarEnv
+                                          , lc_deep        = True }
               -- LC_Promote: promote deeper unification variables (DE4)
               -- lc_deep =  True: ...including under type families (DE5)
     , tefTyVar_concreteCheck = mkConcreteCheck lhs_tv
+    , tefTyVar_allowNativeGivenRhs = False
+    , tefTyVar_isTyVarTv     = isTyVarTyVar lhs_tv
+    , tefTyVar_forAllOK      = isRuntimeUnkTyVar lhs_tv || isQLInstTyVar lhs_tv
     , tef_fam_app = TEFA_Recurse
     }
 
@@ -4054,11 +5122,18 @@ pureTyEqFlags_LHSMetaTyVar :: TyVar -> TyEqFlags Identity ()
 pureTyEqFlags_LHSMetaTyVar lhs_tv =
   TEFTyVar
     { tefTyVar_occursCheck   = OC_Check (tyVarName lhs_tv) cteInsolubleOccurs
-    , tefTyVar_levelCheck    = LC_Check { lc_lvlc = tcTyVarLevel lhs_tv
-                                        , lc_lenient = True }
+    , tefTyVar_levelCheck    = LC_Check { lc_lvlc       = tcTyVarLevel lhs_tv
+                                        , lc_term_depth = if isMetaTyVar lhs_tv
+                                                          then metaTyVarTermDepth lhs_tv
+                                                          else topTermScopeDepth
+                                        , lc_id_depthsc = emptyVarEnv
+                                        , lc_lenient    = True }
     , tefTyVar_concreteCheck = case isConcreteTyVar_maybe lhs_tv of
                                   Nothing -> CC_None
                                   Just {} -> CC_Check   -- No promotion
+    , tefTyVar_allowNativeGivenRhs = False
+    , tefTyVar_isTyVarTv     = isTyVarTyVar lhs_tv
+    , tefTyVar_forAllOK      = isRuntimeUnkTyVar lhs_tv || isQLInstTyVar lhs_tv
     , tef_fam_app = TEFA_Recurse }
 
 
@@ -4101,13 +5176,15 @@ famAppBreaker BreakGiven fam_app    -- Givens
 
 famAppBreaker (BreakWanted ev lhs_tv) fam_app   -- Wanteds
   -- Occurs check or skolem escape; so flatten
-  = do { reason <- checkPromoteFreeVars cteInsolubleOccurs
-                     (tyVarName lhs_tv) lhs_tv_lvl
+  = do { lcl_depths <- getIdTermDepths
+       ; let id_depths = plusVarEnv (ctl_id_depths (ctLocEnv (ctEvLoc ev))) lcl_depths
+       ; reason <- checkPromoteFreeVarsWithDepths cteInsolubleOccurs
+                     (tyVarName lhs_tv) lhs_tv_lvl lhs_term_depth id_depths
                      (tyCoVarsOfType fam_app_kind)
        ; if not (cterHasNoProblem reason)  -- Failed to promote free vars
          then return $ PuFail reason
          else
-    do { new_tv_ty <-
+    do { new_tv_ty0 <-
           case lhs_tv_info of
             ConcreteTv conc_info ->
               -- Make a concrete tyvar if lhs_tv is concrete
@@ -4117,20 +5194,19 @@ famAppBreaker (BreakWanted ev lhs_tv) fam_app   -- Wanteds
               --       gamma[2,conc] ~ F beta[4]
               TcM.newConcreteTyVarTyAtLevel conc_info lhs_tv_lvl fam_app_kind
             _ -> TcM.newMetaTyVarTyAtLevel lhs_tv_lvl fam_app_kind
+       ; let new_tv_ty = case getTyVar_maybe new_tv_ty0 of
+               Just ntv -> mkTyVarTy (setMetaTyVarTermDepth ntv lhs_term_depth)
+               Nothing  -> new_tv_ty0
 
-       ; let pty = mkNomEqPred fam_app new_tv_ty
-       ; hole <- TcM.newCoercionHole pty
-       ; let new_ev = WantedCt { ctev_pred      = pty
-                               , ctev_dest      = HoleDest hole
-                               , ctev_loc       = cb_loc
-                               , ctev_rewriters = ctEvRewriters ev }
-       ; return (PuOK (singleCt (mkNonCanonical $ CtWanted new_ev))
+       ; (new_ev, hole) <- newWantedEqWithLoc cb_loc (ctEvRewriters ev)
+                                               Nominal fam_app new_tv_ty
+       ; return (PuOK (singleCt (mkNonCanonical new_ev))
                       (mkReduction (HoleCo hole) new_tv_ty)) } }
   where
     fam_app_kind = typeKind fam_app
-    (lhs_tv_info, lhs_tv_lvl) =
+    (lhs_tv_info, lhs_tv_lvl, lhs_term_depth) =
       case tcTyVarDetails lhs_tv of
-         MetaTv { mtv_info = info, mtv_tclvl = lvl } -> (info,lvl)
+         MetaTv { mtv_info = info, mtv_tclvl = lvl, mtv_term_depth = d } -> (info, lvl, d)
          -- lhs_tv should be a meta-tyvar
          _ -> pprPanic "famAppBreaker BreakWanted: lhs_tv is not a meta-tyvar"
                 (ppr lhs_tv)
@@ -4139,12 +5215,13 @@ famAppBreaker (BreakWanted ev lhs_tv) fam_app   -- Wanteds
 
 instance Outputable (TyEqFlags m a) where
   ppr = \case
-    TEFTyFam occ tc tys fam_app ->
+    TEFTyFam occ tc tys retained fam_app ->
       text "TEFTyFam" <> braces (
         hcat [ ppr occ
              , ppr (mkTyConApp tc tys)
+             , text "RetainedIds:" <+> ppr retained
              , ppr fam_app ] )
-    TEFTyVar occ lc conc fam_app ->
+    TEFTyVar occ lc conc native _ _ fam_app ->
       text "TEFTyVar" <> braces (hcat (punctuate comma fields))
       where
         fields = [ text "OccursCheck:" <+> ppr occ ]
@@ -4152,6 +5229,8 @@ instance Outputable (TyEqFlags m a) where
                  [ text "LevelCheck:" <+> ppr lc ]
                    ++
                  [ text "ConcreteCheck:" <+> ppr conc ]
+                   ++
+                 [ text "RuntimeIndices:" <+> ppr native ]
                    ++
                  [ text "FamApp:" <+> ppr fam_app ]
 
@@ -4172,8 +5251,8 @@ instance Outputable (ConcreteCheck m) where
   ppr (CC_Promote {}) = text "CC_Promote"
 instance Outputable (LevelCheck m) where
   ppr (LC_None) = text "LC_None"
-  ppr (LC_Check lvl lenient) = text "LC_Check" <+> ppr lvl <+> ppWhen lenient (text "(lenient)")
-  ppr (LC_Promote lvl deep)  = text "LC_Promote" <+> ppr lvl <+> ppWhen deep (text "(deep)")
+  ppr (LC_Check lvl _ _ lenient) = text "LC_Check" <+> ppr lvl <+> ppWhen lenient (text "(lenient)")
+  ppr (LC_Promote lvl _ _ deep)  = text "LC_Promote" <+> ppr lvl <+> ppWhen deep (text "(deep)")
 
 -- | Adjust the 'TyEqFlags' when going under a type family:
 --
@@ -4200,9 +5279,9 @@ famAppArgFlags flags = case flags of
       OC_Check tv _ -> OC_Check tv cteSolubleOccurs
       OC_None -> OC_None
     zap_lc = \case
-      LC_Promote { lc_lvlp = lvl, lc_deep = deeply }
+      LC_Promote { lc_lvlp = lvl, lc_term_depthp = td, lc_id_depthsp = ids, lc_deep = deeply }
         | not deeply
-        -> LC_Check { lc_lvlc = lvl, lc_lenient = False }
+        -> LC_Check { lc_lvlc = lvl, lc_term_depth = td, lc_id_depthsc = ids, lc_lenient = False }
       lc -> lc
 
 {- Note [checkTyEqRhs]
@@ -4311,37 +5390,272 @@ check_ty_eq_rhs :: forall m a
                 -> TcType           -- Already zonked
                 -> m (PuResult a Reduction)
 {-# INLINEABLE check_ty_eq_rhs #-}
-check_ty_eq_rhs flags ty
+check_ty_eq_rhs = check_ty_eq_rhs_bvs False emptyVarSet
+
+check_ty_eq_rhs_bvs :: forall m a
+                    .  Monad m
+                    => Bool
+                    -> VarSet
+                    -> TyEqFlags m a
+                    -> TcType
+                    -> m (PuResult a Reduction)
+{-# INLINEABLE check_ty_eq_rhs_bvs #-}
+check_ty_eq_rhs_bvs under_pi bound_ids flags ty
   = case ty of
+      -- See Note [Level-checked unification of runtime indices]
+      -- and Note [Rigid retained indices].
+      TermAppTy f arg
+        | Just (domain, _) <- nativeIndexFunctionTys_maybe f
+        , typeKind arg `eqType` domain
+        -> if not (native_given || family_given) && tefConcrete flags
+           then return $ PuFail (cteProblem cteConcrete)
+           else if not (native_given || family_given) && is_tyvartv
+           then return $ PuFail impredicativeProblem
+           else do
+             { head_res <- check_runtime_id f
+             ; arg_res  <- check_ty_eq_rhs_bvs False bound_ids flags arg
+             ; return $ (\f' (Reduction co arg') ->
+                          mkReduction (mkTermAppCo f' co) (TermAppTy f' arg'))
+                        <$> head_res <*> arg_res }
+        | otherwise
+        -> return $ PuFail (cteProblem cteSkolemEscape)
+
+      TermVarTy v
+        | v `elemVarSet` bound_ids
+        -> do { v_res <- check_bound_id v
+              ; return (mkReflRedn Nominal . TermVarTy <$> v_res) }
+        | native_given || family_given
+        , isNativeRetainedBinder v
+        -> do { checked <- check_runtime_id v
+              ; return (mkReflRedn Nominal . TermVarTy <$> checked) }
+        | tefConcrete flags
+        -> return $ PuFail (cteProblem cteConcrete)
+        | is_tyvartv
+        -> return $ PuFail impredicativeProblem
+        | isNativeOpaqueValueId v || isNativeIndexFunctionId v
+        , term_id_in_scope v
+        -> do { v_res <- check_bound_id v
+              ; return (mkReflRedn Nominal . TermVarTy <$> v_res) }
+        | otherwise
+        -> return $ PuFail (cteProblem cteSkolemEscape)
+
+      DepFunTy vis index body
+        | tefConcrete flags
+        -> return $ PuFail (cteProblem cteConcrete)
+        | is_tyvartv
+        -> return $ PuFail impredicativeProblem
+        | isInvisibleDepFunFlag vis
+        , not (native_given || forall_ok)
+        -> return $ PuFail impredicativeProblem
+        | isNativeOpaqueValueId index || isNativeIndexFunctionId index
+        , tcIsLiftedTypeKind (typeKind body)
+        -> let body_under_pi = under_pi || not (isInvisibleDepFunFlag vis) in
+           if native_given
+           then do { body_res <- check_ty_eq_rhs_bvs body_under_pi (extendVarSet bound_ids index) flags body
+                   ; return (mkDepFunRedn vis index <$> body_res) }
+           else do { dom_res  <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType index)
+                   ; mult_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (idMult index)
+                   ; body_res <- check_ty_eq_rhs_bvs body_under_pi (extendVarSet bound_ids index) flags body
+                   ; case (dom_res, mult_res, body_res) of
+                       (PuOK c1 r_dom, PuOK c2 r_mult, PuOK c3 r_body)
+                         | isReflRedn r_dom, isReflRedn r_mult ->
+                         let dom'   = reductionReducedType r_dom
+                             mult'  = reductionReducedType r_mult
+                             index' = setVarType (setIdMult index mult') dom'
+                             r_body'
+                               | dom' `eqType` varType index && mult' `eqType` idMult index
+                               = r_body
+                               | otherwise
+                               = mkReduction
+                                   (reductionCoercion r_body)
+                                   (replaceTermVarInType index (TermVarTy index')
+                                     (reductionReducedType r_body))
+                         in return $ PuOK (c1 S.<> c2 S.<> c3) (mkDepFunRedn vis index' r_body')
+                       _ -> return $ ((\_ _ b -> mkDepFunRedn vis index b) <$> dom_res <*> mult_res <*> body_res)
+                              `seq_fail` PuFail (cteProblem cteSkolemEscape) }
+        | otherwise
+        -> return $ PuFail impredicativeProblem
+
+      ClassAppTy sel inst dict operand kind
+        | not (native_given || family_given) && tefConcrete flags
+        -> return $ PuFail (cteProblem cteConcrete)
+        | not (native_given || family_given) && is_tyvartv
+        -> return $ PuFail impredicativeProblem
+        | isExternalName (getName sel)
+        -> do { inst_r <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) inst
+              ; dict_r <- check_dict_arg dict
+              ; op_r   <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) operand
+              ; kind_r <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) kind
+              ; case (inst_r, dict_r, op_r, kind_r) of
+                  (PuOK c1 r1, PuOK c2 r2, PuOK c3 r3, PuOK c4 r4)
+                    | isReflRedn r1, isReflRedn r2, isReflRedn r3, isReflRedn r4 ->
+                    return $ PuOK (c1 S.<> c2 S.<> c3 S.<> c4) $
+                      mkReflRedn Nominal $
+                        ClassAppTy sel (reductionReducedType r1) (reductionReducedType r2)
+                                       (reductionReducedType r3) (reductionReducedType r4)
+                  _ -> return $ ((\_ _ _ _ -> mkReflRedn Nominal ty) <$> inst_r <*> dict_r <*> op_r <*> kind_r)
+                         `seq_fail` PuFail (cteProblem cteSkolemEscape) }
+        | otherwise
+        -> return $ PuFail (cteProblem cteSkolemEscape)
+      DepDictTy {}    -> return $ PuFail impredicativeProblem
       LitTy {}        -> return $ okCheckRefl ty
-      TyConApp tc tys -> checkTyConApp flags ty tc tys
-      TyVarTy tv      -> checkTyVar flags tv
+      TyConApp tc tys -> checkTyConApp_bvs under_pi bound_ids flags ty tc tys
+      TyVarTy tv
+        | tv `elemVarSet` bound_ids
+        -> do { k_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (tyVarKind tv)
+              ; case k_res of
+                  PuOK c r_k | isReflRedn r_k ->
+                    return $ PuOK c $ mkReflRedn Nominal $
+                      mkTyVarTy (setTyVarKind tv (reductionReducedType r_k))
+                  _ -> return $ k_res `seq_fail` PuFail impredicativeProblem }
+        | otherwise
+        -> checkTyVar flags tv
         -- Don't worry about foralls inside the kind; see Note [Checking for foralls]
         -- Nor can we expand synonyms; see Note [Occurrence checking: look inside kinds]
         --                             in GHC.Core.FVs
 
-      FunTy {ft_af = af, ft_mult = w, ft_arg = a, ft_res = r}
+      FunTy {ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = r}
        | isInvisibleFunArg af  -- e.g.  Num a => blah
+       , not (native_given || forall_ok || under_pi)
        -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
        | otherwise
-       -> do { w_res <- check_ty_eq_rhs flags w
-             ; a_res <- check_ty_eq_rhs flags a
-             ; r_res <- check_ty_eq_rhs flags r
-             ; return (mkFunRedn Nominal af <$> w_res <*> a_res <*> r_res) }
+       -> do { ma_res <- check_ty_eq_rhs_bvs False bound_ids flags ma
+             ; w_res  <- check_ty_eq_rhs_bvs False bound_ids flags w
+             ; a_res  <- check_ty_eq_rhs_bvs under_pi bound_ids flags a
+             ; r_res  <- check_ty_eq_rhs_bvs under_pi bound_ids flags r
+             ; return (mkFunRedn Nominal af <$> ma_res <*> w_res <*> a_res <*> r_res) }
 
-      AppTy fun arg -> do { fun_res <- check_ty_eq_rhs flags fun
-                          ; arg_res <- check_ty_eq_rhs flags arg
+      AppTy fun arg -> do { fun_res <- check_ty_eq_rhs_bvs False bound_ids flags fun
+                          ; arg_res <- check_ty_eq_rhs_bvs False bound_ids flags arg
                           ; return (mkAppRedn <$> fun_res <*> arg_res) }
 
-      CastTy ty co  -> do { ty_res <- check_ty_eq_rhs flags ty
+      CastTy ty co  -> do { ty_res <- check_ty_eq_rhs_bvs False bound_ids flags ty
                           ; co_res <- checkCo flags co
                           ; return (mkCastRedn1 Nominal ty <$> co_res <*> ty_res) }
 
       CoercionTy co -> do { co_res <- checkCo flags co
                           ; return (mkReflCoRedn Nominal <$> co_res) }
 
-      ForAllTy {}   -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
-         -- No need to worry about RuntimeUnkTv
+      ExistsTy mode binder body
+        | tefConcrete flags -> return $ PuFail (cteProblem cteConcrete)
+        | is_tyvartv        -> return $ PuFail impredicativeProblem
+        | not forall_ok, not (isPredicativeExistsTy ty)
+        -> return $ PuFail impredicativeProblem
+        | otherwise
+        -> do { kind_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (tyVarKind binder)
+              ; body_res <- check_ty_eq_rhs_bvs False (extendVarSet bound_ids binder) flags body
+              ; case (kind_res, body_res) of
+                  (PuOK c1 r_k, PuOK c2 r_b)
+                    | isReflRedn r_k, isReflRedn r_b ->
+                    let k'      = reductionReducedType r_k
+                        binder' = setTyVarKind binder k'
+                        b_raw   = reductionReducedType r_b
+                        body'   | k' `eqType` tyVarKind binder = b_raw
+                                | otherwise = substTyWith [binder] [mkTyVarTy binder'] b_raw
+                    in return $ PuOK (c1 S.<> c2) $
+                         mkReflRedn Nominal $
+                           ExistsTy mode binder' body'
+                  _ -> return $ ((\_ b -> b) <$> kind_res <*> body_res)
+                         `seq_fail` PuFail impredicativeProblem }
+      ForAllTy ma (Bndr tv vis) body
+        | forall_ok || (under_pi && isInvisibleForAllTyFlag vis)
+        -> do { ma_res   <- check_ty_eq_rhs_bvs False bound_ids flags ma
+              ; kind_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (tyVarKind tv)
+              ; body_res <- check_ty_eq_rhs_bvs under_pi (extendVarSet bound_ids tv) flags body
+              ; case (ma_res, kind_res, body_res) of
+                  (PuOK c1 r_ma, PuOK c2 r_k, PuOK c3 r_b)
+                    | isReflRedn r_ma, isReflRedn r_k, isReflRedn r_b ->
+                    let tv' = setTyVarKind tv (reductionReducedType r_k)
+                    in return $ PuOK (c1 S.<> c2 S.<> c3) $
+                         mkReflRedn Nominal $
+                           ForAllTy (reductionReducedType r_ma) (Bndr tv' vis) (reductionReducedType r_b)
+                  _ -> return $ ((\_ _ b -> b) <$> ma_res <*> kind_res <*> body_res)
+                         `seq_fail` PuFail impredicativeProblem }
+        | otherwise
+        -> return $ PuFail impredicativeProblem -- Not allowed (TyEq:F)
+  where
+    native_given = case flags of
+      TEFTyVar { tefTyVar_allowNativeGivenRhs = True } -> True
+      _ -> False
+
+    family_given = case flags of
+      TEFTyFam { tefTyFam_allowRetainedIds = True } -> True
+      _ -> False
+
+    is_tyvartv = case flags of
+      TEFTyVar { tefTyVar_isTyVarTv = b } -> b
+      _ -> False
+
+    forall_ok = case flags of
+      TEFTyVar { tefTyVar_forAllOK = b } -> b
+      _ -> False
+
+    no_break f = f { tef_fam_app = TEFA_Recurse }
+
+    seq_fail (PuFail r) _ = PuFail r
+    seq_fail _ fallback   = fallback
+
+    term_id_in_scope v = case flags of
+      TEFTyFam {} -> True
+      TEFTyVar { tefTyVar_levelCheck = lc } -> case lc of
+        LC_None -> True
+        LC_Check { lc_term_depth = d, lc_id_depthsc = ids, lc_lenient = lenient } ->
+          case lookupIdTermDepth ids v of
+            Just vd -> vd <= d
+            Nothing -> lenient && isLocalId v
+        LC_Promote { lc_term_depthp = d, lc_id_depthsp = ids } ->
+          case lookupIdTermDepth ids v of
+            Just vd -> vd <= d
+            Nothing -> False
+
+    check_bound_id v = do
+      vt_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType v)
+      vm_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (idMult v)
+      case (vt_res, vm_res) of
+        (PuOK c1 r_vt, PuOK c2 r_vm) | isReflRedn r_vt, isReflRedn r_vm ->
+          return $ PuOK (c1 S.<> c2) $
+            setVarType (setIdMult v (reductionReducedType r_vm)) (reductionReducedType r_vt)
+        (PuFail r1, PuFail r2) -> return $ PuFail (r1 S.<> r2)
+        (PuFail r1, _)         -> return $ PuFail r1
+        (_, PuFail r2)         -> return $ PuFail r2
+        _                      -> return $ PuFail (cteProblem cteSkolemEscape)
+
+    dict_id_in_scope d = case flags of
+      TEFTyFam {} -> True
+      TEFTyVar { tefTyVar_levelCheck = lc } -> case lc of
+        LC_None -> True
+        LC_Check { lc_term_depth = td, lc_id_depthsc = ids, lc_lenient = lenient } ->
+          case lookupIdTermDepth ids d of
+            Just vd -> vd <= td
+            Nothing -> isNeverActive (idInlineActivation d) || (lenient && isLocalId d)
+        LC_Promote { lc_term_depthp = td, lc_id_depthsp = ids } ->
+          case lookupIdTermDepth ids d of
+            Just vd -> vd <= td
+            Nothing -> isNeverActive (idInlineActivation d)
+
+    check_dict_arg (TermVarTy d)
+      | d `elemVarSet` bound_ids
+      = do { d_res <- check_bound_id d
+           ; return (mkReflRedn Nominal . TermVarTy <$> d_res) }
+      | family_given
+      = do { vt_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType d)
+           ; return (mkReflRedn Nominal (TermVarTy d) <$ vt_res) }
+      | native_given
+      = return (okCheckRefl (TermVarTy d))
+      | isNativeClassDictionaryId d && dict_id_in_scope d
+      = do { d_res <- check_bound_id d
+           ; return (mkReflRedn Nominal . TermVarTy <$> d_res) }
+    check_dict_arg _ = return $ PuFail (cteProblem cteSkolemEscape)
+
+    check_runtime_id v
+      | v `elemVarSet` bound_ids = check_bound_id v
+      | family_given = do
+          vt_res <- check_ty_eq_rhs_bvs False bound_ids (no_break flags) (varType v)
+          return (v <$ vt_res)
+      | native_given = return (PuOK mempty v)
+      | isNativeOpaqueValueId v || isNativeIndexFunctionId v
+      , term_id_in_scope v = check_bound_id v
+      | otherwise = return $ PuFail (cteProblem cteSkolemEscape)
 
 -------------------
 checkCo :: Monad m => TyEqFlags m a -> Coercion -> m (PuResult a Coercion)
@@ -4364,8 +5678,8 @@ checkCo flags co =
 
         -- Occurs check (can promote)
         | OC_Check lhs_tv occ_prob <- occ
-        , LC_Promote { lc_lvlp = lhs_tv_lvl } <- lc
-        -> do { reason <- checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl $
+        , LC_Promote { lc_lvlp = lhs_tv_lvl, lc_term_depthp = lhs_td, lc_id_depthsp = id_ds } <- lc
+        -> do { reason <- checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl lhs_td id_ds $
                           tyCoVarsOfCo co
                            -- See Note [Occurs check and coercions]
                           --  and Note [checkCo] (2)
@@ -4507,67 +5821,104 @@ says what to do:
 -}
 
 -------------------
-checkTyConApp :: Monad m
-              => TyEqFlags m a
-              -> TcType -> TyCon -> [TcType]
-              -> m (PuResult a Reduction)
-checkTyConApp flags tc_app tc tys
+checkTyConApp_bvs :: Monad m
+                  => Bool
+                  -> VarSet
+                  -> TyEqFlags m a
+                  -> TcType -> TyCon -> [TcType]
+                  -> m (PuResult a Reduction)
+checkTyConApp_bvs under_pi bound_ids flags tc_app tc tys
   | isTypeFamilyTyCon tc
   , let arity = tyConArity tc
+  , tys `lengthAtLeast` arity
+    -- See Note [Unsaturated family applications in kick-out and RHS checks]
+    -- in GHC.Tc.Solver.InertSet.
   = if tys `lengthIs` arity
-    then checkFamApp flags tc_app tc tys  -- Common case
-    else do { let (fun_args, extra_args) = splitAt (tyConArity tc) tys
+    then checkFamApp_bvs bound_ids flags tc_app tc tys  -- Common case
+    else do { let (fun_args, extra_args) = splitAt arity tys
                   fun_app                = mkTyConApp tc fun_args
-            ; fun_res   <- checkFamApp flags fun_app tc fun_args
-            ; extra_res <- mapCheck (check_ty_eq_rhs flags) extra_args
+            ; fun_res   <- checkFamApp_bvs bound_ids flags fun_app tc fun_args
+            ; extra_res <- mapCheck (check_ty_eq_rhs_bvs False bound_ids flags) extra_args
             ; return (mkAppRedns <$> fun_res <*> extra_res) }
 
   | Just ty' <- rewriterView tc_app
        -- e.g. S a  where  type S a = F [a]
        --             or   type S a = Int
        -- See Note [Forgetful synonyms in checkTyConApp]
-  = check_ty_eq_rhs flags ty'
+  = check_ty_eq_rhs_bvs under_pi bound_ids flags ty'
+
+  | TEFTyVar { tefTyVar_allowNativeGivenRhs = True } <- flags
+  , Just ty' <- coreView tc_app
+       -- See Note [Rigid retained indices].
+  = check_ty_eq_rhs_bvs under_pi bound_ids flags ty'
 
   | not (isTauTyCon tc)
-  = return $ PuFail impredicativeProblem
+  = case coreView tc_app of
+      Just ty' -> do
+        res <- check_ty_eq_rhs_bvs under_pi bound_ids flags ty'
+        return $ case res of
+          PuOK c r | isReflRedn r -> PuOK c (mkReflRedn Nominal tc_app)
+          other -> other
+      Nothing -> return $ PuFail impredicativeProblem
 
   | tefConcrete flags
   , not (isConcreteTyCon tc)
   = return $ PuFail (cteProblem cteConcrete)
 
   | otherwise  -- Recurse on arguments
-  = recurseIntoTyConApp flags tc tys
+  = recurseIntoTyConApp_bvs under_pi' bound_ids flags tc tys
+  where
+    under_pi' = under_pi && isAlgTyCon tc && not (isClassTyCon tc)
+                  && length tys == tyConArity tc
+                  && tcIsLiftedTypeKind (typeKind tc_app)
 
 -------------------
 recurseIntoTyConApp :: Monad m
                     => TyEqFlags m a
                     -> TyCon -> [TcType]
                     -> m (PuResult a Reduction)
-recurseIntoTyConApp flags tc tys
-  = do { tys_res <- mapCheck (check_ty_eq_rhs flags) tys
+recurseIntoTyConApp = recurseIntoTyConApp_bvs False emptyVarSet
+
+recurseIntoTyConApp_bvs :: Monad m
+                        => Bool
+                        -> VarSet
+                        -> TyEqFlags m a
+                        -> TyCon -> [TcType]
+                        -> m (PuResult a Reduction)
+recurseIntoTyConApp_bvs under_pi bound_ids flags tc tys
+  = do { tys_res <- mapCheck (check_ty_eq_rhs_bvs under_pi bound_ids flags) tys
        ; return (mkTyConAppRedn Nominal tc <$> tys_res) }
 
 recurseIntoFamTyConApp :: Monad m
                        => TyEqFlags m a
                        -> TyCon -> [TcType]
                        -> m (PuResult a Reduction)
-recurseIntoFamTyConApp flags tc tys
-  = recurseIntoTyConApp (famAppArgFlags flags) tc tys
+recurseIntoFamTyConApp = recurseIntoFamTyConApp_bvs emptyVarSet
+
+recurseIntoFamTyConApp_bvs :: Monad m
+                           => VarSet
+                           -> TyEqFlags m a
+                           -> TyCon -> [TcType]
+                           -> m (PuResult a Reduction)
+recurseIntoFamTyConApp_bvs bound_ids flags tc tys
+  = recurseIntoTyConApp_bvs False bound_ids (famAppArgFlags flags) tc tys
     -- famAppArgFlags: adjust flags when going under fam app
 
 -------------------
 
 -- | See Note [Family applications in canonical constraints]
-checkFamApp :: forall m a.
-               Monad m
-            => TyEqFlags m a
-            -> TcType -> TyCon -> [TcType]  -- Saturated family application
-            -> m (PuResult a Reduction)
-checkFamApp flags fam_app tc tys =
+checkFamApp_bvs :: forall m a.
+                   Monad m
+                => VarSet
+                -> TyEqFlags m a
+                -> TcType -> TyCon -> [TcType]
+                -> m (PuResult a Reduction)
+checkFamApp_bvs bound_ids flags fam_app tc tys =
   case flags of
     TEFTyFam { tefTyFam_tyCon = lhs_tc, tefTyFam_args = lhs_tys
              , tefTyFam_occursCheck = occ_prob }
-      | tcEqTyConApps lhs_tc lhs_tys tc tys
+      | tys `lengthAtLeast` length lhs_tys
+      , tcEqTyConApps lhs_tc lhs_tys tc tys
       -- There is an occurs check F ty ~ ...(F ty)...
       -- Do not recurse; see (CFA1) in Note [Family applications in canonical constraints]
       -> do_not_recurse occ_prob
@@ -4583,7 +5934,7 @@ checkFamApp flags fam_app tc tys =
           TEFA_Recurse   ->
             -- Simply recurse into the arguments.
             -- See (CFA4) in Note [Family applications in canonical constraints]
-            recurseIntoFamTyConApp flags tc tys
+            recurseIntoFamTyConApp_bvs bound_ids flags tc tys
           TEFA_Break brk ->
             -- Recurse into the arguments, and cycle-break if that fails
             --
@@ -4592,7 +5943,7 @@ checkFamApp flags fam_app tc tys =
             --
             -- NB: in the latter case, don't promote beta[4]; use 'recurseIntoFamTyConApp'
             -- which modifies the flags with 'famAppArgFlags'.
-            do { rec_res <- recurseIntoFamTyConApp flags tc tys
+            do { rec_res <- recurseIntoFamTyConApp_bvs bound_ids flags tc tys
                ; case rec_res of
                    PuOK {}   -> return rec_res
                    PuFail {} -> famAppBreaker brk fam_app
@@ -4617,6 +5968,8 @@ data TyVarCheckResult m where
   TyVarCheck_Promote
     :: Maybe TcLevel
          -- ^ @Just lvl@ <=> 'TyVar' needs to be promoted to @lvl@
+    -> Maybe TermScopeDepth
+         -- ^ @Just depth@ <=> 'MetaTv' needs its 'TermScopeDepth' narrowed
     -> Maybe ConcreteTvOrigin
          -- ^ @Just conc_orig@ <=> 'TyVar' needs to be make concrete
     -> TyVarCheckResult TcM
@@ -4634,9 +5987,10 @@ instance Semigroup (TyVarCheckResult m) where
     TyVarCheck_Error (e1 S.<> e2)
   e@(TyVarCheck_Error {}) <> _ = e
   _ <> e@(TyVarCheck_Error {}) = e
-  TyVarCheck_Promote l1 c1 <> TyVarCheck_Promote l2 c2 =
+  TyVarCheck_Promote l1 d1 c1 <> TyVarCheck_Promote l2 d2 c2 =
     TyVarCheck_Promote
       (combineMaybe minTcLevel l1 l2)
+      (combineMaybe minTermScopeDepth d1 d2)
       (combineMaybe const c1 c2) -- pick one 'ConcreteTvOrigin' arbitrarily
 
 combineMaybe :: (a -> a -> a) -> Maybe a -> Maybe a -> Maybe a
@@ -4676,16 +6030,17 @@ checkTyVar flags occ_tv
     do_rhs_checks :: [TyVarCheckResult m] -> m (PuResult a Reduction)
     do_rhs_checks checks =
       case mconcat checks of
-        TyVarCheck_Success                -> success
-        TyVarCheck_Promote mb_lvl mb_conc -> promote flags mb_lvl mb_conc
-        TyVarCheck_Error cte_prob         -> return $ PuFail cte_prob
+        TyVarCheck_Success                      -> success
+        TyVarCheck_Promote mb_lvl mb_d mb_conc  -> promote flags mb_lvl mb_d mb_conc
+        TyVarCheck_Error cte_prob               -> return $ PuFail cte_prob
 
     ---------------------
     -- occ_tv is definitely a MetaTyVar; we need to promote it/make it concrete
-    promote :: TyEqFlags TcM a -> Maybe TcLevel -> Maybe ConcreteTvOrigin
+    promote :: TyEqFlags TcM a -> Maybe TcLevel -> Maybe TermScopeDepth -> Maybe ConcreteTvOrigin
             -> TcM (PuResult a Reduction)
-    promote flags mb_lhs_tv_lvl mb_conc
-      | MetaTv { mtv_info = info_occ, mtv_tclvl = lvl_occ } <- tcTyVarDetails occ_tv
+    promote flags mb_lhs_tv_lvl mb_lhs_depth mb_conc
+      | MetaTv { mtv_info = info_occ, mtv_tclvl = lvl_occ, mtv_term_depth = d_occ }
+          <- tcTyVarDetails occ_tv
       = do { let new_info | Just conc <- mb_conc = ConcreteTv conc
                           | otherwise            = info_occ
                  new_lvl =
@@ -4694,6 +6049,10 @@ checkTyVar flags occ_tv
                       Just lhs_tv_lvl -> lhs_tv_lvl `minTcLevel` lvl_occ
                         -- c[conc,3] ~ p[tau,2]: want to clone p:=p'[conc,2]
                         -- c[tau,2]  ~ p[tau,3]: want to clone p:=p'[tau,2]
+                 new_depth =
+                    case mb_lhs_depth of
+                      Nothing    -> d_occ
+                      Just lhs_d -> lhs_d `minTermScopeDepth` d_occ
 
            -- Check the kind of occ_tv
            --
@@ -4710,7 +6069,7 @@ checkTyVar flags occ_tv
         do { let kind_co  = reductionCoercion kind_redn
                  new_kind = reductionReducedType kind_redn
                  occ_tv'  = setTyVarKind occ_tv new_kind
-           ; new_tv_ty <- promote_meta_tyvar new_info new_lvl occ_tv'
+           ; new_tv_ty <- promote_meta_tyvar new_info new_lvl new_depth occ_tv'
            ; return $ mkGReflLeftRedn Nominal new_tv_ty (mkSymCo kind_co)
            } }
 
@@ -4747,9 +6106,9 @@ tyVarLevelCheck :: LevelCheck m -> TcTyVar -> TyVarCheckResult m
 -- ^ The "interpreter" for 'LevelCheck'
 tyVarLevelCheck LC_None _ = TyVarCheck_Success
 tyVarLevelCheck lc occ_tv
-  | not occ_is_deeper
+  | not lvl_is_deeper && not depth_is_deeper
   = TyVarCheck_Success
-  | isSkolemTyVar occ_tv
+  | lvl_is_deeper && isSkolemTyVar occ_tv
   = TyVarCheck_Error (cteProblem cteSkolemEscape)
   | otherwise
   = case lc of
@@ -4757,15 +6116,20 @@ tyVarLevelCheck lc occ_tv
         if lenient
         then TyVarCheck_Success
         else TyVarCheck_Error (cteProblem cteSkolemEscape)
-      LC_Promote { lc_lvlp = lhs_tv_lvl } ->
-        TyVarCheck_Promote (Just lhs_tv_lvl) Nothing
+      LC_Promote { lc_lvlp = lhs_tv_lvl, lc_term_depthp = lhs_td } ->
+        TyVarCheck_Promote
+          (if lvl_is_deeper then Just lhs_tv_lvl else Nothing)
+          (if depth_is_deeper then Just lhs_td else Nothing)
+          Nothing
   where
-    occ_is_deeper =
+    (lvl_is_deeper, depth_is_deeper) =
       case lc of
-        LC_Check { lc_lvlc = lhs_tv_lvl } ->
-          tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
-        LC_Promote { lc_lvlp = lhs_tv_lvl } ->
-          tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
+        LC_Check { lc_lvlc = lhs_tv_lvl, lc_term_depth = lhs_td } ->
+          ( tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
+          , maybe False (> lhs_td) (metaTyVarTermDepth_maybe occ_tv) )
+        LC_Promote { lc_lvlp = lhs_tv_lvl, lc_term_depthp = lhs_td } ->
+          ( tcTyVarLevel occ_tv `strictlyDeeperThan` lhs_tv_lvl
+          , maybe False (> lhs_td) (metaTyVarTermDepth_maybe occ_tv) )
 
 -------------------------
 tyVarConcretenessCheck :: ConcreteCheck m -> TcTyVar -> TyVarCheckResult m
@@ -4781,28 +6145,48 @@ tyVarConcretenessCheck cc occ_tv
   | otherwise  -- It's a non-concrete meta-tyvar
   = case cc of
        CC_Check -> TyVarCheck_Success
-       CC_Promote conc_orig -> TyVarCheck_Promote Nothing (Just conc_orig)
+       CC_Promote conc_orig -> TyVarCheck_Promote Nothing Nothing (Just conc_orig)
        -- CC_None is dealt with at the top
 
 -------------------------
 checkPromoteFreeVars :: CheckTyEqProblem    -- What occurs check problem to report
                      -> Name -> TcLevel
                      -> TyCoVarSet -> TcM CheckTyEqResult
+checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs = do
+  id_depths <- getIdTermDepths
+  checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl topTermScopeDepth id_depths vs
+
+checkPromoteFreeVarsWithDepths
+  :: CheckTyEqProblem
+  -> Name -> TcLevel -> TermScopeDepth -> VarEnv TermScopeDepth
+  -> TyCoVarSet -> TcM CheckTyEqResult
 -- Check this set of TyCoVars for
 --   (a) occurs check
 --   (b) promote if necessary, or report skolem escape
-checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs
+checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl lhs_td id_depths vs
   = do { oks <- mapM do_one (nonDetEltsUniqSet vs)
        ; return (mconcat oks) }
   where
     do_one :: TyCoVar -> TcM CheckTyEqResult
     do_one v | isCoVar v             = return cteOK
+             | isId v                = check_id v
              | tyVarName v == lhs_tv = return (cteProblem occ_prob)
              | no_promotion          = return cteOK
              | not (isMetaTyVar v)   = return (cteProblem cteSkolemEscape)
              | otherwise             = promote_one v
       where
-        no_promotion = not (tcTyVarLevel v `strictlyDeeperThan` lhs_tv_lvl)
+        lvl_deeper   = tcTyVarLevel v `strictlyDeeperThan` lhs_tv_lvl
+        depth_deeper = maybe False (> lhs_td) (metaTyVarTermDepth_maybe v)
+        no_promotion = not lvl_deeper && not depth_deeper
+
+    check_id v
+      | isNativeOpaqueValueId v || isNativeIndexFunctionId v
+      , Just vd <- lookupIdTermDepth id_depths v
+      , vd <= lhs_td
+      = checkPromoteFreeVarsWithDepths occ_prob lhs_tv lhs_tv_lvl lhs_td id_depths
+          (tyCoVarsOfTypes [varType v, idMult v])
+      | otherwise
+      = return (cteProblem cteSkolemEscape)
 
     -- isCoVar case: coercion variables are not an escape risk
     -- If an implication binds a coercion variable, it'll have equalities,
@@ -4811,11 +6195,14 @@ checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs
 
     promote_one :: TyVar -> TcM CheckTyEqResult
     promote_one tv =
-      do { _ <- promote_meta_tyvar TauTv lhs_tv_lvl tv
+      do { _ <- promote_meta_tyvar TauTv
+                  (lhs_tv_lvl `minTcLevel` tcTyVarLevel tv)
+                  (lhs_td `minTermScopeDepth` metaTyVarTermDepth tv)
+                  tv
          ; return cteOK }
 
-promote_meta_tyvar :: MetaInfo -> TcLevel -> TcTyVar -> TcM TcType
-promote_meta_tyvar info dest_lvl occ_tv
+promote_meta_tyvar :: MetaInfo -> TcLevel -> TermScopeDepth -> TcTyVar -> TcM TcType
+promote_meta_tyvar info dest_lvl dest_depth occ_tv
   = do { -- Check whether occ_tv is already unified. The rhs-type
          -- started zonked, but we may have promoted one of its type
          -- variables, and we then encounter it for the second time.
@@ -4826,7 +6213,7 @@ promote_meta_tyvar info dest_lvl occ_tv
            Nothing ->
 
     -- OK, not done already, so clone/promote it
-    do { new_tv <- cloneMetaTyVarWithInfo info dest_lvl occ_tv
+    do { new_tv <- cloneMetaTyVarWithInfoAndDepth info dest_lvl dest_depth occ_tv
        ; liftZonkM $ writeMetaTyVar occ_tv (mkTyVarTy new_tv)
        ; traceTc "promoteTyVar" (ppr occ_tv <+> text "-->" <+> ppr new_tv)
        ; return (mkTyVarTy new_tv) } } }
@@ -4904,6 +6291,9 @@ makeTypeConcrete occ_fs conc_orig ty =
                   -- LHS is a fresh meta-tyvar: no occurs check needed
               , tefTyVar_levelCheck    = LC_None
               , tefTyVar_concreteCheck = CC_Promote conc_orig
+              , tefTyVar_allowNativeGivenRhs = False
+              , tefTyVar_isTyVarTv     = False
+              , tefTyVar_forAllOK      = False
               , tef_fam_app            = TEFA_Recurse
               }
 
@@ -4950,14 +6340,9 @@ makeTypeConcrete occ_fs conc_orig ty =
                 -- Now create the new concrete metavariable.
                 ; conc_tv <- newConcreteTyVar conc_orig occ_fs (coercionRKind kind_co)
                 ; let conc_ty = mkTyVarTy conc_tv
-                      pty = mkEqPredRole Nominal ty' conc_ty
-                ; hole <- newCoercionHole pty
                 ; loc <- getCtLocM orig (Just KindLevel)
-                ; let ct = mkNonCanonical $ CtWanted
-                         $ WantedCt { ctev_pred      = pty
-                                    , ctev_dest      = HoleDest hole
-                                    , ctev_loc       = loc
-                                    , ctev_rewriters = emptyCoHoleSet }
+                ; (wanted, hole) <- newWantedEqWithLoc loc emptyCoHoleSet Nominal ty' conc_ty
+                ; let ct = mkNonCanonical wanted
                 ; return (kind_cts S.<> unitBag ct, HoleCo hole)
                 }
 
@@ -5142,6 +6527,8 @@ mightEqualLater inert_set given_pred given_loc wanted_pred wanted_loc
       MaybeApart reason subst
         | MARInfinite <- reason -- see Example 7 in the Note.
         -> Nothing
+        | MARRuntimeIndex <- reason
+        -> Nothing
         | otherwise
         -> Just subst
       SurelyApart -> Nothing
@@ -5236,3 +6623,565 @@ lookupCycleBreakerVar cbv (IS { inert_cycle_breakers = cbvs_stack })
   = tyfam_app
   | otherwise
   = pprPanic "lookupCycleBreakerVar found an unbound cycle breaker" (ppr cbv $$ ppr cbvs_stack)
+
+{- *********************************************************************
+*                                                                      *
+          Implicit existential right-packing and Quick Look
+*                                                                      *
+********************************************************************* -}
+
+-- | Expand top-level type synonyms and filled metavariables without zonking
+-- subtrees.
+unwrapMetaView :: TcType -> TcM TcType
+unwrapMetaView ty
+  | Just ty' <- coreView ty = unwrapMetaView ty'
+unwrapMetaView ty@(TyVarTy tv)
+  | isTcTyVar tv
+  = do { mb <- isFilledMetaTyVar_maybe tv
+       ; case mb of
+           Just ty' -> unwrapMetaView ty'
+           Nothing  -> return ty }
+unwrapMetaView ty = return ty
+
+-- | Test whether an existential package has a predicative, family-free tau
+-- structure, allowing in-scope free type variables that 'check_ty_eq_rhs'
+-- validates separately.
+isPredicativeExistsTy :: Type -> Bool
+isPredicativeExistsTy ty
+  | Just ty' <- coreView ty = isPredicativeExistsTy ty'
+isPredicativeExistsTy (ExistsTy _ b r)
+  = is_tau (tyVarKind b) && is_tau r
+  where
+    is_tau t | Just t' <- coreView t = is_tau t'
+    is_tau (TyVarTy _)                          = True
+    is_tau (TermVarTy _)                        = True
+    is_tau (TermAppTy _ arg)                    = is_tau arg
+    is_tau (ClassAppTy _ inst dict operand knd) = all is_tau [inst, dict, operand, knd]
+    is_tau (LitTy _)                            = True
+    is_tau (AppTy f a)                          = is_tau f && is_tau a
+    is_tau (CastTy t _)                         = is_tau t
+    is_tau (ExistsTy _ vb vr)                   = is_tau (tyVarKind vb) && is_tau vr
+    is_tau (TyConApp tc tys)                    = isTauTyCon tc && isFamFreeTyCon tc && all is_tau tys
+    is_tau (FunTy af ma mult a r)               = isVisibleFunArg af && all is_tau [ma, mult, a, r]
+    is_tau _                                    = False
+isPredicativeExistsTy _ = False
+
+-- | Right-instantiate leading implicit existential binders on the expected
+-- type into 'WpExistsPack' wrappers when the actual type is a payload rather
+-- than an implicit existential package.
+-- See Note [Introducing an implicit existential].
+tcSubTypeImplicitExists
+  :: (Maybe (HsExpr GhcTc), Position p)
+  -> DeepSubsumptionFlag
+  -> (TcType -> TcType -> TcM TcCoercionN)
+  -> CtOrigin
+  -> UserTypeCtxt
+  -> TcSigmaType
+  -> TcRhoType
+  -> TcM (Maybe HsWrapper)
+tcSubTypeImplicitExists pos ds_flag unify inst_orig ctxt ty_actual ty_expected
+  | AmbiguityCheckOrigin {} <- inst_orig
+  = return Nothing
+  | otherwise
+  = do { exp_view <- unwrapMetaView ty_expected
+       ; case exp_view of
+           ExistsTy ImplicitExists _ _ -> pack_if_payload exp_view
+           _                           -> return Nothing }
+  where
+    pack_if_payload exp_view =
+      do { act_view0 <- unwrapMetaView ty_actual
+         ; mb_inst <- if isSigmaTy act_view0
+                      then do { let (_, _, raw_body) = tcSplitSigmaTy act_view0
+                              ; body_view <- unwrapMetaView raw_body
+                              ; case body_view of
+                                  ExistsTy ImplicitExists _ _ -> return Nothing
+                                  TyVarTy _                   -> return Nothing
+                                  _ -> Just <$> topInstantiate inst_orig act_view0 }
+                      else return (Just (idHsWrapper, act_view0))
+         ; case mb_inst of
+             Nothing -> return Nothing
+             Just (inst_wrap, rho_a) ->
+               do { payload <- liftZonkM (zonkTcType rho_a)
+                  ; schema  <- liftZonkM (zonkTcType exp_view)
+                  ; is_pkg_fam <- reduces_to_implicit_pkg payload
+                  ; case coreFullView schema of
+                      ExistsTy ImplicitExists _ _
+                        | ExistsTy ImplicitExists _ _ <- coreFullView payload
+                        -> return Nothing
+                        | TyVarTy tv <- coreFullView payload
+                        , isTcTyVar tv && isMetaTyVar tv
+                        -> return Nothing
+                        | is_pkg_fam
+                        -> return Nothing
+                        | ExistsTy ExplicitExists _ _ <- coreFullView payload
+                        -> case matchMixedExistsResult schema payload of
+                             Just (witness, inner) ->
+                               do { inner_wrap <- tc_sub_type_ds pos ds_flag unify inst_orig ctxt rho_a inner
+                                  ; return (Just (mkWpExistsPack schema witness <.> inner_wrap <.> inst_wrap)) }
+                             Nothing -> return Nothing
+                        | otherwise
+                        -> do { impred <- xoptM LangExt.ImpredicativeTypes
+                              ; let inner_body = peel_implicit_body schema
+                                    is_deep_fun = case (ds_flag, coreFullView inner_body, coreFullView payload) of
+                                                    (Deep {}, FunTy{}, FunTy{}) -> True
+                                                    _                           -> False
+                                    quick = not is_deep_fun
+                                            && impred
+                                            && supportsQuickLookType schema
+                                            && supportsQuickLookType payload
+                                            && noQuickLookVars schema
+                                            && noQuickLookVars payload
+                              ; (witnesses, inst_body, pack_wrap) <- peel_pack quick payload schema
+                              ; when quick $
+                                  do { qlUnify inst_body payload
+                                     ; forM_ witnesses $ \w ->
+                                         do { rejectNativeQuickLook w
+                                            ; liftZonkM (qlMonoTcType w) } }
+                              ; inst_body' <- liftZonkM (zonkTcType inst_body)
+                              ; sub_wrap <- tc_sub_type_ds pos ds_flag unify inst_orig ctxt rho_a inst_body'
+                              ; return (Just (pack_wrap <.> sub_wrap <.> inst_wrap)) }
+                      _ -> return Nothing } }
+
+    reduces_to_implicit_pkg ty
+      | TyConApp tc args <- coreFullView ty
+      , isTypeFamilyTyCon tc
+      = do { envs <- tcGetFamInstEnvs
+           ; return $ case reduceTyFamApp_maybe envs Nominal tc args of
+               Just (Reduction _ red)
+                 | ExistsTy ImplicitExists _ _ <- coreFullView red -> True
+               _ -> False }
+      | otherwise
+      = return False
+
+    peel_implicit_body ty
+      | ExistsTy ImplicitExists _ b <- coreFullView ty = peel_implicit_body b
+      | otherwise                                      = ty
+
+    peel_pack :: Bool -> TcType -> TcType -> TcM ([TcType], TcType, HsWrapper)
+    peel_pack quick payload cur_schema
+      | ExistsTy ImplicitExists binder body <- coreFullView cur_schema
+      = do { witness <- if quick
+               then case (coreFullView body, coreFullView payload) of
+                      (FunTy{}, FunTy{})
+                        -- See Note [Matching a witness below forall].
+                        | Just exact <- matchExactPolytypeWitness binder body payload
+                        , ForAllTy{} <- coreFullView exact
+                        -> return exact
+                      _ -> newMetaTyVarTyAtLevel QLInstVar (tyVarKind binder)
+               else newFlexiTyVarTy (tyVarKind binder)
+           ; let next_schema = substTyWith [binder] [witness] body
+           ; (ws, final_body, inner_wrap) <- peel_pack quick payload next_schema
+           ; return (witness : ws, final_body, mkWpExistsPack cur_schema witness <.> inner_wrap) }
+      | otherwise
+      = return ([], cur_schema, idHsWrapper)
+
+{- Note [Introducing an implicit existential]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Subsumption introduces an implicit existential package when the expected type
+starts with 'ExistsTy ImplicitExists' and the actual type is a payload rather
+than an existing implicit existential package. This implements right
+instantiation from Eisenberg, Duboc, Weirich & Lee, "An Existential Crisis
+Resolved: Type Inference for First-Class Existential Types", ICFP 2021
+(PACMPL 5(ICFP):64), Figs. 6, 7 & 10, and GHC Proposal #473.
+
+Guard package-to-package identity first:
+1. When both actual and expected types are 'ExistsTy ImplicitExists', fall
+   through to nominal equality ('WpCast' or 'WpHole') without unpacking and
+   repacking. This preserves package laziness in forwarding calls.
+2. When the actual type is an unfilled metavariable (or a polymorphic variable
+   whose body is an unfilled metavariable or an implicit package), fall through
+   to unification so polymorphic selectors such as 'choose flag p q' instantiate
+   directly at the package schema.
+
+When the actual type is a payload, peel consecutive 'ExistsTy ImplicitExists'
+binders in telescope order, substituting each witness into the remaining schema
+and composing 'WpExistsPack' wrappers from outside in. Desugaring lowers each
+'WpExistsPack schema witness' directly to 'Core.Pack schema witness'.
+
+With 'ImpredicativeTypes' enabled, follow 'GenImpredicative' (Eisenberg et al.,
+ICFP 2021, Fig. 10; Serrano, Hage, Peyton Jones & Vytiniotis, "A Quick Look at
+Impredicativity", ICFP 2020, PACMPL 4(ICFP):89): allocate Quick Look
+instantiation variables for the existential binders, run 'qlUnify' between the
+instantiated body and the actual payload type, and monomorphise any remaining
+instantiation variables before checking subsumption on the payload. Under
+'DeepSubsumption', outer function arrows require co/contravariant subsumption
+rather than invariant 'qlUnify', so outer arrows use ordinary tau witnesses.
+
+For a nested explicit existential 'exists a. exists b | body' checked against
+an already packed 'exists b | actual_body', 'matchMixedExistsResult' selects a
+candidate outer witness via scoped matching before checking the explicit
+package equality.
+-}
+
+{- Note [Matching a witness below forall]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under shallow subsumption with 'ImpredicativeTypes', a declared payload can
+determine a polytype witness beneath a callback's 'forall'. For example, to
+pack
+
+  (forall r. (PolyId -> r) -> Maybe r) -> Int
+
+at 'exists t. (forall r. (t -> r) -> Maybe r) -> Int', choose
+'PolyId = forall a. a -> a'.
+
+'qlUnify' does not look beneath 'forall'; see (UQL4) in
+Note [QuickLook unification]. When neither type contains Quick Look variables,
+'tcMatchTyX_BM' renames bound variables and rejects any substitution that
+mentions a locally bound variable; see (CU2) in Note [The Core unifier] in
+GHC.Core.Unify. Check the matched witness kind and verify nominal equality of
+the substituted payload before checking the expression.
+-}
+
+-- | Test that a type contains no Quick Look instantiation variables.
+noQuickLookVars :: Type -> Bool
+noQuickLookVars = not . any (\v -> isTcTyVar v && isQLInstTyVar v) . tyCoVarsOfTypeList
+
+-- | Build a 'BindTvFun' that binds only the supplied outer template variables.
+bindOuterExistsTvs :: [TyVar] -> BindTvFun
+bindOuterExistsTvs [] _ _   = DontBindMe
+bindOuterExistsTvs [v] tv _ = if tv == v then BindMe else DontBindMe
+bindOuterExistsTvs tvs tv _ = if tv `elemVarSet` s then BindMe else DontBindMe
+  where
+    !s = mkVarSet tvs
+
+-- | Choose an implicit existential witness for an already checked explicit
+-- existential package.
+-- See Note [Introducing an implicit existential].
+matchMixedExistsResult :: Type -> Type -> Maybe (Type, Type)
+matchMixedExistsResult schema actual
+  | ExistsTy ImplicitExists outer formal <- coreFullView schema
+  = do { ([witness], [inner]) <- matchBarPackageWitnesses [outer] [(formal, actual)]
+       ; return (witness, inner) }
+  | otherwise = Nothing
+
+-- | Match free template variables across explicit existential packages.
+matchBarPackageWitnesses :: [TyVar] -> [(Type, Type)] -> Maybe ([Type], [Type])
+matchBarPackageWitnesses binders packages
+  | all supportsQuickLookType types
+  , all noQuickLookVars types
+  = do { templates <- traverse barPackageSignature formals
+       ; targets <- traverse barPackageSignature actuals
+       ; let empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes (templates ++ targets)))
+             actual_fvs = tyCoVarsOfTypes actuals
+       ; subst <- foldM (\s (template, target) ->
+                          tcMatchTyX_BM (bindOuterExistsTvs binders) s template target)
+                        empty_subst (zip templates targets)
+       ; witnesses <- traverse (Subst.lookupTyVar subst) binders
+       ; guard (all (`elemVarSet` actual_fvs) (tyCoVarsOfTypesList witnesses))
+       ; let kinds = map (Subst.substTy subst . tyVarKind) binders
+             inners = map (Subst.substTy subst) formals
+       ; guard (eqTypes (map typeKind witnesses) kinds && eqTypes inners actuals)
+       ; return (witnesses, inners) }
+  | otherwise = Nothing
+  where
+    (formals, actuals) = unzip packages
+    types = formals ++ actuals
+
+    barPackageSignature :: Type -> Maybe Type
+    barPackageSignature ty
+      | ExistsTy ExplicitExists binder body <- coreFullView ty
+      = Just (mkTyCoForAllTy unmatchableDataConTy binder (Invisible SpecifiedSpec) body)
+      | otherwise = Nothing
+
+-- | Match one fixed polytype witness without binding any other variables.
+-- See Note [Matching a witness below forall].
+matchExactPolytypeWitness :: TyVar -> Type -> Type -> Maybe Type
+matchExactPolytypeWitness binder formal actual
+  | all supportsQuickLookType [tyVarKind binder, formal, actual]
+  , all noQuickLookVars [tyVarKind binder, formal, actual]
+  = do { subst <- tcMatchTyX_BM bind_witness empty_subst formal actual
+       ; witness <- Subst.lookupTyVar subst binder
+       ; guard (not (isTauTy witness)
+                && eqType (typeKind witness) (tyVarKind binder)
+                && eqType (substTyWith [binder] [witness] formal) actual)
+       ; return witness }
+  | otherwise = Nothing
+  where
+    empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes [formal, actual]))
+    bind_witness tv _ | tv == binder = BindMe
+                      | otherwise    = DontBindMe
+
+{- Note [Monomorphise instantiation variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When Quick Look finishes on a call or existential witness check, convert any
+un-unified instantiation variables into ordinary unification variables at the
+ambient level. This implements the mono-substitution 'theta' in rule APP-DOWN
+of Serrano, Hage, Peyton Jones & Vytiniotis, "A Quick Look at
+Impredicativity", ICFP 2020 (PACMPL 4(ICFP):89), Fig. 5.
+
+Wrinkles:
+
+(MIV1) When monomorphising an instantiation variable, monomorphise its kind
+  first, because it may have kind 'TYPE k' where 'k' is also an instantiation
+  variable.
+
+(MIV2) In 'qlUnify', heterogeneous kind unification can create a coercion hole
+  whose kind mentions an instantiation variable that occurs nowhere else in the
+  type. 'foldQLInstVars' traverses coercion hole kinds so such variables are
+  monomorphised too.
+-}
+
+qlMonoTcType :: TcType -> ZonkM ()
+-- Monomorphise any free instantiation variables of `ty`
+-- This function zonks as it goes
+-- See Note [Monomorphise instantiation variables]
+qlMonoTcType ty
+  = do { traceZonk "monomorphiseQLInstVars {" (ppr ty)
+       ; go_ty ty
+       ; traceZonk "monomorphiseQLInstVars }" empty }
+  where
+    go_ty :: TcType -> ZonkM ()
+    go_ty ty = unTcMUnit (foldQLInstVars go_tv ty)
+
+    go_tv :: TcTyVar -> TcMUnit
+    go_tv tv
+      | MetaTv { mtv_ref = ref, mtv_tclvl = lvl, mtv_info = info
+               , mtv_term_depth = depth } <- tcTyVarDetails tv
+      = assertPpr (case lvl of QLInstVar -> True; _ -> False) (ppr tv) $
+        TCMU $ do { traceZonk "qlMonoTcType" (ppr tv)
+                  ; flex <- readTcRef ref
+                  ; case flex of {
+                      Indirect ty -> go_ty ty ;
+                      Flexi       ->
+               do { let kind = tyVarKind tv
+                  ; go_ty kind  -- See (MIV1) in Note [Monomorphise instantiation variables]
+                  ; ref2  <- newTcRef Flexi
+                  ; lvl2  <- getZonkTcLevel
+                  ; let details = MetaTv { mtv_info       = info
+                                         , mtv_ref        = ref2
+                                         , mtv_tclvl      = lvl2
+                                         , mtv_term_depth = depth }
+                        tv2  = mkTcTyVar (tyVarName tv) kind details
+                 ; writeTcRef ref (Indirect (mkTyVarTy tv2)) }}}
+      | otherwise
+      = pprPanic "qlMonoTcType" (ppr tv)
+
+newtype TcMUnit = TCMU { unTcMUnit :: ZonkM () }
+instance Semigroup TcMUnit where
+  TCMU ml <> TCMU mr = TCMU (ml >> mr)
+instance Monoid TcMUnit where
+  mempty = TCMU (return ())
+
+{- Note [The fiv test in quickLookArg]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In rule APP-lightning-bolt in Fig. 5 of Serrano et al. (ICFP 2020), 'anyFreeKappa'
+tests whether an inferred argument result type has no free Quick Look
+instantiation variables after zonking. When none remain, 'qlUnify' can propagate
+polytypes from the argument result into the enclosing call.
+-}
+
+anyFreeKappa :: TcType -> TcM Bool
+-- True if there is a free instantiation variable in the type, after zonking.
+-- See Note [The fiv test in quickLookArg]
+anyFreeKappa ty = do { rejectNativeQuickLook ty
+                     ; unTcMBool (foldQLInstVars go_tv ty) }
+  where
+    go_tv tv = TCMB $ do { info <- readMetaTyVar tv
+                         ; case info of
+                             Indirect ty -> anyFreeKappa ty
+                             Flexi       -> return True }
+
+newtype TcMBool = TCMB { unTcMBool :: TcM Bool }
+instance Semigroup TcMBool where
+  TCMB ml <> TCMB mr = TCMB (do { l <- ml; if l then return True else mr })
+instance Monoid TcMBool where
+  mempty = TCMB (return False)
+
+foldQLInstVars :: forall a. Monoid a => (TcTyVar -> a) -> TcType -> a
+{-# INLINE foldQLInstVars #-}
+foldQLInstVars check_tv ty
+  = runFV (do_ty ty) ()
+  where
+    (do_ty, _, _, _) = foldTyCo folder
+
+    folder :: TyCoFolder (FV () a)
+    folder = TyCoFolder { tcf_view = noView  -- See Note [Free vars and synonyms]
+                                             -- in GHC.Core.TyCo.FVs
+                        , tcf_lit        = mempty
+                        , tcf_tyvar      = do_tv
+                        , tcf_termvar    = \v -> pprPanic "foldQLInstVars: native term index not implemented" (ppr v)
+                        , tcf_termbinder = \v _ -> pprPanic "foldQLInstVars: native dependent binder not implemented" (ppr v)
+                        , tcf_covar      = mempty
+                        , tcf_hole       = do_hole
+                        , tcf_tycobinder = do_bndr }
+
+    do_bndr _ = id
+
+    do_hole hole = do_ty (coVarKind (coHoleCoVar hole))
+                     -- See (MIV2) in Note [Monomorphise instantiation variables]
+
+    do_tv :: TcTyVar -> FV () a
+    do_tv tv | isQLInstTyVar tv = MkFV $ \_ -> check_tv tv
+             | otherwise        = mempty
+
+-- | Reject retained types before Quick Look inspects or assigns them.
+-- See Note [Retained types and Quick Look].
+rejectNativeQuickLook :: TcType -> TcM ()
+rejectNativeQuickLook ty
+  = do { ty <- liftZonkM $ zonkTcType ty
+       ; unless (supportsQuickLookType ty) $
+           failWithTc (TcRnRetainedQuantificationError (RetainedQuickLook ty)) }
+
+{- Note [Retained types and Quick Look]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An erased existential binds a type variable. 'foldQLInstVars' visits its kind
+and body with the same type-binder operation it uses for 'forall'. 'qlUnify'
+can assign the entire package to an instantiation variable under its ordinary
+occurs and concreteness checks without opening the package or equating
+witnesses; see Eisenberg et al., ICFP 2021, §8, and Note [QuickLook unification].
+
+Quick Look assigns instantiation variables without the runtime-index scope
+check, and its instantiation-variable folders do not traverse retained term
+indices or 'DepFunTy' binders. Reject runtime indices and retained binders
+after zonking before either operation runs. See Note [Rigid retained indices].
+-}
+
+qlUnify :: TcType -> TcType -> TcM ()
+-- Unify ty1 with ty2:
+--   * Unifies only Quick Look instantiation variables; see Note [QuickLook unification].
+--   * Never reports errors; makes best effort to fill instantiation variables.
+qlUnify ty1 ty2
+  = do { rejectNativeQuickLook ty1
+       ; rejectNativeQuickLook ty2
+       ; lvl <- getTcLevel
+       ; traceTc "qlUnify" (ppr lvl $$ ppr ty1 $$ ppr ty2)
+       ; go ty1 ty2 }
+  where
+    go :: TcType -> TcType -> TcM ()
+    go t1 t2 = do { traceTc "qlUinfy:go" (ppr t1 <+> char '~' <+> ppr t2)
+                  ; go' t1 t2 }
+
+    go' (FunTy { ft_af = af1, ft_ma = ma1, ft_arg = arg1, ft_res = res1 })
+        (FunTy { ft_af = af2, ft_ma = ma2, ft_arg = arg2, ft_res = res2 })
+      | af1 == af2
+      = do { traceTc "go_fun" (ppr arg1 $$ ppr arg2)
+           ; go ma1 ma2
+           ; when (isVisibleFunArg af1) (go arg1 arg2)
+           ; go res1 res2 }
+
+    -- Make sure not to unify "kappa := (a %1 -> b)". See (UQL5).
+    go' (FunTy { ft_mult = OneTy }) _ = return ()
+    go' _ (FunTy { ft_mult = OneTy }) = return ()
+
+    -- Type variables; see (UQL6) in Note [QuickLook unification]
+    go' (TyVarTy tv) ty2 | isMetaTyVar tv = go_meta tv ty2
+    go' ty1 (TyVarTy tv) | isMetaTyVar tv = go_meta tv ty1
+
+    go' (CastTy ty1 _) ty2 = go ty1 ty2
+    go' ty1 (CastTy ty2 _) = go ty1 ty2
+
+    go' (TyConApp tc1 []) (TyConApp tc2 [])
+      | tc1 == tc2 -- See Note [Expanding synonyms during unification]
+      = return ()
+
+    go' rho1 rho2
+      | Just rho1 <- coreView rho1 = go rho1 rho2
+      | Just rho2 <- coreView rho2 = go rho1 rho2
+
+    go' (TyConApp tc1 tys1) (TyConApp tc2 tys2)
+      | tc1 == tc2
+      , not (isTypeFamilyTyCon tc1)
+      , tys1 `equalLength` tys2
+      = zipWithM_ go tys1 tys2
+
+    -- See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality.
+    go' (AppTy t1a t1b) ty2
+      | Just (t2a, t2b) <- tcSplitAppTyNoView_maybe ty2
+      = go_app t1a t1b t2a t2b
+    go' ty1 (AppTy t2a t2b)
+      | Just (t1a, t1b) <- tcSplitAppTyNoView_maybe ty1
+      = go_app t1a t1b t2a t2b
+
+    go' (TyConApp tc1 _) ty2 | isTypeFamilyTyCon tc1 = monomorphise ty2
+    go' ty1 (TyConApp tc2 _) | isTypeFamilyTyCon tc2 = monomorphise ty1
+
+    go' _ _ = return ()
+       -- Don't look under foralls; see (UQL4) of Note [QuickLook unification]
+
+    go_app f1 a1 f2 a2 =
+      do { m1 <- matchable_arrow f1
+         ; when m1 $
+           do { m2 <- matchable_arrow f2
+              ; when m2 $ do { go f1 f2; go a1 a2 } } }
+
+    matchable_arrow fun
+      | isMatchableFunTy kind = return True
+      | otherwise = isMatchableFunTy <$> liftZonkM (zonkTcType kind)
+      where kind = typeKind fun
+
+    go_meta tv1 ty2
+      = assertPpr (isMetaTyVar tv1) (ppr tv1) $
+        do { info <- readMetaTyVar tv1
+           ; case info of  -- See (UQL9)
+               Indirect ty1 -> go ty1 ty2
+               Flexi        -> do { ty2 <- liftZonkM $ zonkTcType ty2
+                                  ; go_flexi tv1 ty2 } }
+
+    go_flexi tv1 ty2
+      | TyVarTy tv2 <- ty2
+      , lhsPriority tv2 > lhsPriority tv1
+      = go_flexi1 tv2 (TyVarTy tv1)
+      | otherwise
+      = go_flexi1 tv1 ty2
+
+    go_flexi1 tv1 ty2
+      | isQLInstTyVar tv1 = go_kappa tv1 ty2
+      | otherwise         = monomorphise ty2
+
+    go_kappa kappa ty2
+      | isConcreteTyVar kappa  -- See (UQL7) in Note [QuickLook unification]
+      = return ()
+      | anyFreeVarsOfType (== kappa) ty2
+      = return ()  -- Occurs check. See (UQL10) in Note [QuickLook unification]
+      | otherwise
+      = do { co <- unifyKind (Just (TypeThing ty2)) ty2_kind kappa_kind
+                   -- unifyKind: see (UQL2) in Note [QuickLook unification]
+                   --            and (MIV2) in Note [Monomorphise instantiation variables]
+           ; let ty2' = mkCastTy ty2 co
+           ; traceTc "qlUnify:update" $
+             ppr kappa <+> text ":=" <+> ppr ty2
+           ; liftZonkM $ writeMetaTyVar kappa ty2'
+           ; return () }
+      where
+        kappa_kind = tyVarKind kappa
+        ty2_kind   = typeKind ty2
+
+    monomorphise :: TcType -> TcM ()
+    monomorphise ty  -- See (UQL8)
+      = do { _ <- liftZonkM $ qlMonoTcType ty; return () }
+
+{- Note [QuickLook unification]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In 'qlUnify', if we find 'kappa ~ ty', we update 'kappa := ty' following
+Serrano, Hage, Peyton Jones & Vytiniotis, "A Quick Look at Impredicativity",
+ICFP 2020 (PACMPL 4(ICFP):89). Wrinkles:
+
+(UQL1) Check the occurs check and concreteness precondition before assigning
+  an instantiation variable in 'go_kappa'. No level check is needed because
+  instantiation variables have level 'QLInstVar'; see Note [QuickLook
+  instantiation variables] in GHC.Tc.Utils.TcType.
+
+(UQL2) Unify kinds with 'unifyKind' and cast 'ty2' by the resulting coercion.
+
+(UQL3) Instantiation variables have level infinity and are monomorphised before
+  leaving the Quick Look step, preventing skolem escape.
+
+(UQL4) Do not decompose beneath 'ForAllTy' or 'ExistsTy'.
+
+(UQL5) Do not unify an instantiation variable directly with a linear arrow
+  'a %1 -> b'; see Note [Multiplicity in deep subsumption].
+
+(UQL6) Update only Quick Look instantiation variables ('isQLInstTyVar'), not
+  ordinary unification variables.
+
+(UQL7) Skip concrete instantiation variables, which never unify with polytypes.
+
+(UQL8) When 'kappa' meets an ordinary unification variable or a type family
+  application, monomorphise the other side via 'qlMonoTcType'.
+
+(UQL9) Look through filled metavariables before deciding between decomposition
+  and monomorphisation.
+
+(UQL10) Use 'anyFreeVarsOfType' for the occurs check; see Note [Occurs check
+  and coercions].
+-}

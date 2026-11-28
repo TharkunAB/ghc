@@ -1,0 +1,10 @@
+NativeClosedFamilySumScopeRejects.hs:10:54: error: [GHC-76037]
+    Not in scope: type variable ‘unused’
+
+NativeClosedFamilySumScopeRejects.hs:13:62: error: [GHC-76037]
+    Not in scope: type variable ‘missing’
+
+NativeClosedFamilySumScopeRejects.hs:14:48: error: [GHC-76037]
+    Not in scope: type variable ‘tag’
+    Suggested fix: Perhaps use variable ‘tan’ (imported from Prelude)
+

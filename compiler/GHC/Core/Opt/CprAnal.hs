@@ -234,6 +234,19 @@ cprAnal' env (Tick t e)
   where
     (cpr_ty, e') = cprAnal env e
 
+-- Pack exposes the lifted value and hides its constructor type.
+cprAnal' env (Pack schema witness payload)
+  = (topCprType, Pack schema witness payload')
+  where
+    (_, payload') = cprAnal env payload
+
+-- The body result has a type independent of the opened binders.
+cprAnal' env (Unpack witness payload package body)
+  = (body_ty, Unpack witness payload package' body')
+  where
+    (_, package') = cprAnal env package
+    (body_ty, body') = cprAnal (extendSigEnv env payload topCprSig) body
+
 cprAnal' env e@(Var{})
   = cprAnalApp env e []
 cprAnal' env e@(App{})
@@ -289,8 +302,10 @@ cprAnalAlt env scrut_ty (Alt con bndrs rhs)
             | let sig = mkCprSig 0 field_cpr
             -> extendSigEnvAllSame env ids sig
           ForeachField field_cprs
-            | let sigs = zipWith (mkCprSig . idArity) ids field_cprs
-            -> extendSigEnvList env (zipEqual ids sigs)
+            | let (rep_ids, virt_cvs) = splitAt (length field_cprs) ids
+                  sigs = zipWith (mkCprSig . idArity) rep_ids field_cprs
+                  env_rep = extendSigEnvList env (zipEqual rep_ids sigs)
+            -> extendSigEnvAllSame env_rep virt_cvs topCprSig
       | otherwise
       = extendSigEnvAllSame env ids topCprSig
     (rhs_ty, rhs') = cprAnal env_alt rhs

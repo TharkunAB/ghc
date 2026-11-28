@@ -1,0 +1,24 @@
+NativeHoleLaterSignedFit.hs:19:4: error: [GHC-88464]
+    • Found hole: _ :: StepAt n' a' -> StepAt n' b' -> a' :~: b'
+      Where: ‘n'’, ‘a'’, ‘b'’ are rigid type variables bound by
+               an expression type signature:
+                 forall (n' :: Nat) (a' :: Nat) (b' :: Nat).
+                 StepAt n' a' -> StepAt n' b' -> a' :~: b'
+               at NativeHoleLaterSignedFit.hs:19:9-66
+    • In the expression:
+        (_ :: forall n' a' b'. StepAt n' a' -> StepAt n' b' -> a' :~: b')
+          p1 p2
+      In an equation for ‘stepUnique’:
+          stepUnique (SVar p1) (SVar p2)
+            = (_ :: forall n' a' b'. StepAt n' a' -> StepAt n' b' -> a' :~: b')
+                p1 p2
+    • Relevant bindings include
+        p2 :: StepAt m b (bound at NativeHoleLaterSignedFit.hs:18:28)
+        p1 :: StepAt m a (bound at NativeHoleLaterSignedFit.hs:18:18)
+        stepUnique :: Step m a -> Step m b -> a :~: b
+          (bound at NativeHoleLaterSignedFit.hs:18:1)
+      Valid hole fits include
+        stepAtUnique :: forall (n :: Nat) (a :: Nat) (b :: Nat).
+                        StepAt n a -> StepAt n b -> a :~: b
+          with stepAtUnique @n' @a' @b'
+

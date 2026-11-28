@@ -12,11 +12,12 @@ import GHC.Prelude
 
 import GHC.HsToCore.Pmc.Types
 import GHC.HsToCore.Pmc.Utils
-import GHC.Core (CoreExpr, Expr(Var,App))
+import GHC.Core ( splitNativeIndexedPatternEvidence, CoreExpr, Expr(Var, App) )
 import GHC.Core.Utils (stripTicksTopE)
 import GHC.Data.FastString (unpackFS, lengthFS, mkFastStringShortText)
 import GHC.Driver.DynFlags
 import GHC.Hs
+import GHC.Hs.Syn.Type (hsPatType)
 import GHC.Tc.Utils.TcMType (shortCutLit)
 import GHC.Types.Id
 import GHC.Core.ConLike
@@ -36,6 +37,7 @@ import {-# SOURCE #-} GHC.HsToCore.Binds (dsHsWrapper)
 import GHC.HsToCore.Utils (isTrueLHsExpr, selectMatchVar, decideBangHood)
 import GHC.HsToCore.Match.Literal (dsLit, dsOverLit)
 import GHC.HsToCore.Monad
+import GHC.HsToCore.Errors.Types (DsMessage(DsRetainedPackagePatterns))
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.Type
@@ -205,6 +207,9 @@ desugarPat x pat = case pat of
 
         _ -> desugarPat x expansion
 
+    NativeExistsPat schema witness payload _ p ->
+      consGrdDag (PmUnpack x schema witness payload) <$> desugarPat payload p
+
     -- See Note [Desugar CoPats]
     -- Generally the translation is
     -- pat |> co   ===>   let y = x |> co, pat <- y  where y is a match var of pat
@@ -239,7 +244,10 @@ desugarPat x pat = case pat of
            , cpt_dicts   = dicts
            }
          } ->
-    desugarConPatOut x con arg_tys ex_tvs dicts ps
+    let ordinary_dicts = case con of
+          RealDataCon dc | Just (eqs, _) <- splitNativeIndexedPatternEvidence dc dicts -> eqs
+          _ -> dicts
+    in desugarConPatOut x con arg_tys ex_tvs ordinary_dicts ps
 
   NPat ty (L _ olit) mb_neg _ -> do
     -- See Note [Literal short cut] in "GHC.HsToCore.Match.Literal"
@@ -332,11 +340,20 @@ desugarListPat x pats = do
 -- | Desugar a constructor pattern
 desugarConPatOut :: Id -> ConLike -> [Type] -> [TyVar]
                  -> [EvVar] -> HsConPatDetails GhcTc -> DsM GrdDag
-desugarConPatOut x con univ_tys ex_tvs dicts = \case
-    PrefixCon _ ps                   -> go_field_pats (zip [0..] ps)
-    InfixCon  _ p1 p2                -> go_field_pats (zip [0..] [p1,p2])
-    RecCon    _ (HsRecFields _ fs _) -> go_field_pats (rec_field_ps fs)
+desugarConPatOut x con univ_tys ex_tvs dicts con_args
+  | RealDataCon dc <- con, not (null (dataConRepArgBinders dc))
+  = case con_args of
+      PrefixCon _ ps -> go_field_pats (map (hsPatType . unLoc) ps) (zip [0..] ps)
+      _ -> failWithDs DsRetainedPackagePatterns
+  | otherwise = case con_args of
+    PrefixCon _ ps                   -> go_field_pats arg_tys (zip [0..] ps)
+    InfixCon  _ p1 p2                -> go_field_pats arg_tys (zip [0..] [p1,p2])
+    RecCon    _ (HsRecFields _ fs _) -> go_field_pats arg_tys (rec_field_ps fs)
   where
+    -- See Note [Opening implicit packages in patterns] in GHC.Tc.Gen.Pat.
+    -- Checked outer field types contain the preceding retained source Ids.
+    -- Nested patterns can carry GADT evidence. Keep ordinary PMC enabled.
+
     -- The actual argument types (instantiated)
     arg_tys     = map scaledThing $ conLikeInstOrigArgTys con (univ_tys ++ mkTyVarTys ex_tvs)
 
@@ -350,7 +367,7 @@ desugarConPatOut x con univ_tys ex_tvs dicts = \case
         orig_lbls        = map flSelector $ conLikeFieldLabels con
         lbl_to_index lbl = expectJust $ elemIndex lbl orig_lbls
 
-    go_field_pats tagged_pats = do
+    go_field_pats field_tys tagged_pats = do
       -- The fields that appear might not be in the correct order. So
       --   1. Do the PmCon match
       --   2. Then pattern match on the fields in the order given by the first
@@ -369,7 +386,7 @@ desugarConPatOut x con univ_tys ex_tvs dicts = \case
             Nothing  -> mkPmId ty
 
       -- 1. the constructor pattern match itself
-      arg_ids <- zipWithM get_pat_id [0..] arg_tys
+      arg_ids <- zipWithM get_pat_id [0..] field_tys
       let con_grd = PmCon x (PmAltConLike con) ex_tvs dicts arg_ids
 
       -- 2. guards from field selector patterns

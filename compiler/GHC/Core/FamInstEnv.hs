@@ -28,7 +28,8 @@ module GHC.Core.FamInstEnv (
         -- Normalisation
         topNormaliseType, topNormaliseType_maybe,
         normaliseType, normaliseTcApp,
-        topReduceTyFamApp_maybe, reduceTyFamApp_maybe
+        normaliseTypeWithFuel, normaliseTcAppWithFuel,
+        topReduceTyFamApp_maybe, reduceTyFamApp_maybe, reduceScopedSumPayload_maybe
     ) where
 
 import GHC.Prelude
@@ -46,6 +47,8 @@ import GHC.Core.Reduction
 import GHC.Core.RoughMap
 import GHC.Core.FVs( orphNamesOfAxiomLHS )
 
+import GHC.Builtin.CoercionRules
+  ( proveScopedSigmaClosure, proveScopedLambdaClosure, proveScopedLambdaEta )
 import GHC.Builtin.WiredIn.TypeLits( tryMatchFam )
 
 import GHC.Types.Var.Set
@@ -794,6 +797,7 @@ mkBranchedCoAxiom role ax_name fam_tc branches
             , co_ax_name     = ax_name
             , co_ax_tc       = fam_tc
             , co_ax_role     = role
+            , co_ax_source_proof_rules = []
             , co_ax_implicit = False
             , co_ax_branches = manyBranches (computeAxiomIncomps branches) }
                                -- computeAxiomIncomps: see (SC1) in
@@ -805,6 +809,7 @@ mkUnbranchedCoAxiom ax_name fam_tc branch
             , co_ax_name     = ax_name
             , co_ax_tc       = fam_tc
             , co_ax_role     = Nominal
+            , co_ax_source_proof_rules = []
             , co_ax_implicit = False
             , co_ax_branches = unbranched (noAxiomIncomps branch) }
                                -- noAxiomIncomps: see (SC1) in
@@ -822,6 +827,7 @@ mkSingleCoAxiom role ax_name tvs eta_tvs cvs fam_tc lhs_tys rhs_ty
             , co_ax_name     = ax_name
             , co_ax_tc       = fam_tc
             , co_ax_role     = role
+            , co_ax_source_proof_rules = []
             , co_ax_implicit = False
             , co_ax_branches = unbranched (noAxiomIncomps branch) }
                                -- noAxiomIncomps: see (SC1) in
@@ -840,6 +846,7 @@ mkNewTypeCoAxiom :: Name -> TyCon -> [TyVar] -> [Role] -> Type -> CoAxiom Unbran
 mkNewTypeCoAxiom name tycon tvs roles rhs_ty
   = CoAxiom { co_ax_unique   = nameUnique name
             , co_ax_name     = name
+            , co_ax_source_proof_rules = []
             , co_ax_implicit = True  -- See Note [Implicit axioms] in GHC.Core.TyCon
             , co_ax_role     = Representational
             , co_ax_tc       = tycon
@@ -1213,6 +1220,15 @@ The lookupFamInstEnv function does a nice job for *open* type families,
 but we also need to handle closed ones when normalising a type:
 -}
 
+-- | Reduce one checked payload of a retained sum.
+-- See Note [Constructors in a nested dependent sum] in GHC.Tc.Utils.Unify.
+reduceScopedSumPayload_maybe :: TyCon -> [Type] -> Maybe ReductionN
+reduceScopedSumPayload_maybe family args
+  | Just (_, True) <- closedFamilyScope_maybe family
+  = reduceTyFamApp_maybe emptyFamInstEnvs Nominal family args
+  | otherwise = Nothing
+
+
 reduceTyFamApp_maybe :: FamInstEnvs
                      -> Role              -- Desired role of result coercion
                      -> TyCon -> [Type]
@@ -1231,6 +1247,9 @@ reduceTyFamApp_maybe :: FamInstEnvs
 -- Always returns a *homogeneous* coercion -- type family reductions are always
 -- homogeneous
 reduceTyFamApp_maybe envs role tc tys
+  | isTypeFamilyTyCon tc, tys `lengthLessThan` tyConArity tc
+  = Nothing
+
   | Phantom <- role
   = Nothing
 
@@ -1253,10 +1272,15 @@ reduceTyFamApp_maybe envs role tc tys
   -- Closed type families
   | Just ctf <- closedTypeFamily_maybe tc
   = case ctf of
-      CTF (Just ax)
-        | Just (ind, inst_tys, inst_cos) <- chooseBranch ax tys
+      _ | Just ax <- closedTyFamCoAxiom_maybe ctf
+        , Just (ind, inst_tys, inst_cos, arg_cos) <- chooseBranch ax tys
         -> let co = mkAxInstCo role (BranchedAxiom ax ind) inst_tys inst_cos
-           in Just $ coercionRedn co
+               redn = coercionRedn co
+           in Just $ case arg_cos of
+                Nothing -> redn
+                Just cos ->
+                  downgradeRole role Nominal (mkTyConAppCo Nominal tc cos)
+                    `mkTransRedn` redn
       CTF_BuiltIn builtin_fam
         | Just (rewrite,ts,ty) <- tryMatchFam builtin_fam tys
         -> let co = mkAxiomCo rewrite (map mkNomReflCo ts)
@@ -1268,41 +1292,93 @@ reduceTyFamApp_maybe envs role tc tys
 
 -- The axiom can be oversaturated. (Closed families only.)
 chooseBranch :: CoAxiom Branched -> [Type]
-             -> Maybe (BranchIndex, [Type], [Coercion])  -- found match, with args
+             -> Maybe (BranchIndex, [Type], [Coercion], Maybe [CoercionN])
 chooseBranch axiom tys
   = do { let num_pats = coAxiomNumPats axiom
              (target_tys, extra_tys) = splitAt num_pats tys
              branches = coAxiomBranches axiom
-       ; (ind, inst_tys, inst_cos)
-           <- findBranch (unMkBranches branches) target_tys
-       ; return ( ind, inst_tys `chkAppend` extra_tys, inst_cos ) }
+       ; (ind, inst_tys, inst_cos, arg_cos)
+           <- findBranch (coAxiomTyCon axiom) (unMkBranches branches) target_tys
+       ; guard (isNothing arg_cos || null extra_tys)
+       ; return (ind, inst_tys `chkAppend` extra_tys, inst_cos, arg_cos) }
 
 -- The axiom must *not* be oversaturated
-findBranch :: Array BranchIndex CoAxBranch
+findBranch :: TyCon -> Array BranchIndex CoAxBranch
            -> [Type]
-           -> Maybe (BranchIndex, [Type], [Coercion])
-    -- coercions relate requested types to returned axiom LHS at role N
-findBranch branches target_tys
+           -> Maybe (BranchIndex, [Type], [Coercion], Maybe [CoercionN])
+    -- The optional proofs relate the requested arguments to the axiom LHS.
+findBranch fam_tc branches target_tys
   = -- Implements the Closed Family Matching Rule
     -- in Note [Compatibility]
     foldr go Nothing (assocs branches)
   where
-    go :: (BranchIndex, CoAxBranch)
-       -> Maybe (BranchIndex, [Type], [Coercion])
-       -> Maybe (BranchIndex, [Type], [Coercion])
     go (index, branch) other
-      = let (CoAxBranch { cab_tvs = tpl_tvs, cab_cvs = tpl_cvs
-                        , cab_lhs = tpl_lhs }) = branch
-        in case tcMatchTys tpl_lhs target_tys of
-        Just subst -- Matching worked. now, check for apartness.
+      = let CoAxBranch { cab_tvs = tpl_tvs, cab_cvs = tpl_cvs } = branch
+        in case matchClosedBranch fam_tc branch target_tys of
+        Just (subst, arg_cos)
           |  apartnessCheck target_tys branch
+          ,  maybe True (\cos -> apartnessCheck (map coercionRKind cos) branch) arg_cos
           -> -- Matching worked & we're apart from all incompatible branches.
              -- success
              assert (all (isJust . lookupCoVar subst) tpl_cvs) $
-             Just (index, substTyVars subst tpl_tvs, substCoVars subst tpl_cvs)
+             Just (index, substTyVars subst tpl_tvs, substCoVars subst tpl_cvs, arg_cos)
 
         -- Failure. keep looking
         _ -> other
+
+{- Note [Scoped closures in closed family matches]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A repeated variable in a family pattern can encounter two independently
+generated sum codomains or type lambdas. The checked nominal proof
+identifies them only if their lexical closures agree. See Note
+[Scoped retained sum codomains] in
+GHC.Core.TyCo.Compare.
+It can also match a forwarding lambda with the family that it calls.
+See Note [Eta for a forwarding type lambda] in GHC.Builtin.CoercionRules.
+
+Try that proof only for a repeated template variable. If matching used
+it, instantiate the entire pattern and prove each argument equality.
+Compose the nominal argument conversion with the ordinary branch axiom.
+The axiom receives its exact instantiated pattern. The conversion requires
+equal result kinds and no extra arguments. Family reduction returns
+homogeneous evidence. Extra arguments can require dependent kind casts.
+
+Check apartness for the original arguments and for the converted arguments
+that Core Lint sees on the axiom. Unknown partial families remain opaque
+to apartness. A failed conversion therefore cannot select a fallback.
+The same match also defines what counts as an earlier match for injectivity.
+-}
+
+-- | Match a branch and produce nominal argument proofs if it used conversion.
+matchClosedBranch :: TyCon -> CoAxBranch -> [Type] -> Maybe (Subst, Maybe [CoercionN])
+matchClosedBranch fam_tc branch target = do
+    (subst, converted) <- tcMatchTysWithRepeated has_proof lhs target
+    if converted
+      then do
+        let instantiated = Type.substTys subst lhs
+        guard (result_kind target `eqType` result_kind instantiated)
+        cos <- zipWithM scopedMatchCo target instantiated
+        return (subst, Just cos)
+      else return (subst, Nothing)
+  where
+    lhs = coAxBranchLHS branch
+    has_proof a b = isJust (scopedMatchCo a b)
+    result_kind = typeKind . mkTyConApp fam_tc
+
+-- See Note [Scoped closures in closed family matches].
+scopedMatchCo :: Type -> Type -> Maybe CoercionN
+scopedMatchCo lhs rhs
+  | eqType lhs rhs = Just (mkNomReflCo lhs)
+  | not (eqType (typeKind lhs) (typeKind rhs)) = Nothing
+  | Just co <- proveScopedSigmaClosure lhs rhs = Just co
+  | Just co <- proveScopedLambdaClosure lhs rhs = Just co
+  | Just co <- proveScopedLambdaEta lhs rhs = Just co
+  | Just (tc, as) <- splitTyConApp_maybe lhs
+  , Just (tc', bs) <- splitTyConApp_maybe rhs
+  , tc == tc', isGenerativeTyCon tc Nominal
+  , equalLength as bs
+  = mkTyConAppCo Nominal tc <$> zipWithM scopedMatchCo as bs
+  | otherwise = Nothing
 
 -- | Do an apartness check, as described in the "Closed Type Families" paper
 -- (POPL '14). This should be used when determining if an equation
@@ -1322,17 +1398,17 @@ apartnessCheck target (CoAxBranch { cab_incomps = incomps })
 
 -- | Check whether an earlier branch matches these target types
 noEarlierMatchCheck
-  :: [Type]
+  :: TyCon -> [Type]
   -> CoAxBranch -- ^ The candidate equation we wish to use
   -> Bool       -- ^ True <=> equation can fire
-noEarlierMatchCheck target (CoAxBranch { cab_overlaps = overlaps })
+noEarlierMatchCheck fam_tc target (CoAxBranch { cab_overlaps = overlaps })
     -- NB: this is the /only/ use of the `cab_overlaps` field
     -- See Note [Storing compatibility] and
     -- (RW4) in Note [Relevance]
   = not (any matches overlaps)
   where
     matches earlier_branch
-      = isJust (tcMatchTys (coAxBranchLHS earlier_branch) target)
+      = isJust (matchClosedBranch fam_tc earlier_branch target)
 
 {-
 ************************************************************************
@@ -1473,11 +1549,20 @@ normaliseType :: FamInstEnvs
 normaliseType env role ty
   = initNormM env role (tyCoVarsOfType ty) $ normalise_type ty
 
+normaliseTypeWithFuel :: Int -> FamInstEnvs -> Role -> Type -> Reduction
+normaliseTypeWithFuel fuel env role ty
+  = initNormMWithFuel (Just fuel) env role (tyCoVarsOfType ty) $ normalise_type ty
+
 ---------------
 normaliseTcApp :: FamInstEnvs -> Role -> TyCon -> [Type] -> Reduction
 -- See comments on normaliseType for the arguments of this function
 normaliseTcApp env role tc tys
   = initNormM env role (tyCoVarsOfTypes tys) $
+    normalise_tc_app tc tys
+
+normaliseTcAppWithFuel :: Int -> FamInstEnvs -> Role -> TyCon -> [Type] -> Reduction
+normaliseTcAppWithFuel fuel env role tc tys
+  = initNormMWithFuel (Just fuel) env role (tyCoVarsOfTypes tys) $
     normalise_tc_app tc tys
 
 -------------------------------------------------------
@@ -1488,18 +1573,24 @@ normaliseTcApp env role tc tys
 normalise_tc_app :: TyCon -> [Type] -> NormM Reduction
 normalise_tc_app tc tys
   | ExpandsSyn tenv rhs tys' <- expandSynTyCon_maybe tc tys
-  , not (isFamFreeTyCon tc)  -- Expand and try again
+  , synAppCanReduce tc tys
   = -- A synonym with type families in the RHS
     -- Expand and try again
     -- See Note [Normalisation and type synonyms]
-    normalise_type (mkAppTys (substTy (mkTvSubstPrs tenv) rhs) tys')
+    do { ok <- consumeNormFuel
+       ; if ok
+         then normalise_type (mkAppTys (substTy (mkTvSubstPrs tenv) rhs) tys')
+         else do { ArgsReductions redns res_co <- normalise_tc_args tc tys
+                 ; role <- getRole
+                 ; return $ assemble_result role (mkTyConAppRedn role tc redns) res_co } }
 
   | isFamilyTyCon tc
   = -- A type-family application
     do { env <- getEnv
        ; role <- getRole
        ; ArgsReductions redns@(Reductions args_cos ntys) res_co <- normalise_tc_args tc tys
-       ; case reduceTyFamApp_maybe env role tc ntys of
+       ; ok <- consumeNormFuel
+       ; case (if ok then reduceTyFamApp_maybe env role tc ntys else Nothing) of
            Just redn1
              -> do { redn2 <- normalise_reduction redn1
                    ; let redn3 = mkTyConAppCo role tc args_cos `mkTransRedn` redn2
@@ -1544,22 +1635,100 @@ normalise_type ty
   = go ty
   where
     go :: Type -> NormM Reduction
+    -- Keep the substituted head identical on both sides. An enclosing erased
+    -- binder can have a fresh name. Lift only nominal argument evidence.
+    -- See Note [Opaque native call indices] in GHC.Core.TyCo.Rep.
+    go ty@(TermAppTy f arg)
+      | Just _ <- nativeTermAppKind_maybe f arg
+      = do { lc <- getLC
+           ; role <- getRole
+           ; let left = substTy (lcSubstLeft lc) ty
+                 right = substTy (lcSubstRight lc) ty
+           ; case (left, right) of
+               (TermAppTy f' _, TermAppTy g' _)
+                 | f' == g', isNativeIndexFunctionId f' || isNativeDepFunctionId f'
+                 , varType f' `eqType` varType g'
+                 -> do { Reduction co arg' <- withRole Nominal $ go arg
+                       ; return $ downgradeRedn role Nominal $
+                           mkReduction (mkTermAppCo f' co) (TermAppTy f' arg') }
+               _ -> pprPanic "normalise_type: native call head changed by lifting context"
+                      (ppr ty $$ ppr left $$ ppr right) }
+      | otherwise
+      = pprPanic "normalise_type: invalid native call" (ppr ty)
+    go (TermVarTy v)
+      -- See Note [Normalising retained runtime indices].
+      | isNativeOpaqueValueId v
+      = do { lc <- getLC
+           ; r <- getRole
+           ; return $ coercionRedn (liftCoSubstNative lc r v) }
+      | otherwise
+      = pprPanic "normalise_type: invalid runtime index" (ppr v)
+    go (DepFunTy vis v body)
+      | isNativeOpaqueValueId v
+      , typeKind body `eqType` liftedTypeKind
+      = do { lc <- getLC
+           ; env <- getEnv
+           ; fuel0 <- getFuel
+           ; let callback ctx domain
+                   -- See Note [Closed retained domains].
+                   | Just ty <- retainedReflDomain_maybe ctx domain = mkReflRedn Nominal ty
+                   | otherwise = fst (runNormM (normalise_type domain) env ctx Nominal fuel0)
+                 (lc', v', domain) = liftCoSubstNativeBndrUsing reductionCoercion callback lc v
+           ; Reduction body_co _ <- withLC lc' $ normalise_type body
+           ; let co = mkDepFunCoWithVis vis vis v' (coToMCo (reductionCoercion domain)) body_co
+           ; return $ mkReduction co (coercionRKind co) }
+      | otherwise
+      = pprPanic "normalise_type: invalid retained function"
+          (ppr v $$ ppr (varType v) $$ ppr body)
+    go ty@(DepDictTy {})
+      = do { lc <- getLC
+           ; role <- getRole
+           ; case lcOpaqueTypeRefl_maybe lc ty of
+               Just left -> return (mkReflRedn role left)
+               Nothing -> pprPanic "normalise_type: dependent dictionary changed by lifting context"
+                            (ppr ty) }
+    go ty@(ClassAppTy {})
+      = do { lc <- getLC
+           ; role <- getRole
+           ; case lcOpaqueTypeRefl_maybe lc ty of
+               Just left -> return (mkReflRedn role left)
+               Nothing -> pprPanic "normalise_type: class application changed by lifting context"
+                            (ppr ty) }
+    -- Lift family normalisation and outer binder coercions under an erased
+    -- existential via existsCoRule.
+    go ty@(ExistsTy flag tv body)
+      = do { r <- getRole
+           ; if r /= Phantom
+                && isTyVar tv
+                && typeKind (varType tv) `eqType` liftedTypeKind
+                && typeKind body `eqType` liftedTypeKind
+             then do { Reduction scoped_co _ <- go (existsCoScope tv body)
+                     ; if isReflCo scoped_co
+                       then do { lc <- getLC
+                               ; return (mkReflRedn r (lcSubstLeftRefl lc ty)) }
+                       else let co = mkExistsCo flag r scoped_co
+                            in return (mkReduction co (coercionRKind co)) }
+             else do { lc <- getLC
+                     ; return (mkReflRedn r (lcSubstLeftRefl lc ty)) } }
     go (TyConApp tc tys) = normalise_tc_app tc tys
     go ty@(LitTy {})
       = do { r <- getRole
            ; return $ mkReflRedn r ty }
     go (AppTy ty1 ty2) = go_app_tys ty1 [ty2]
 
-    go (FunTy { ft_af = vis, ft_mult = w, ft_arg = ty1, ft_res = ty2 })
+    go (FunTy { ft_af = vis, ft_ma = ma, ft_mult = w, ft_arg = ty1, ft_res = ty2 })
+      -- See Note [Function reduction multiplicity roles] in GHC.Core.Reduction.
       = do { arg_redn <- go ty1
            ; res_redn <- go ty2
+           ; ma_redn <- withRole Nominal $ go ma
            ; w_redn <- withRole Nominal $ go w
            ; r <- getRole
-           ; return $ mkFunRedn r vis w_redn arg_redn res_redn }
-    go (ForAllTy (Bndr tcvar vis) ty)
-      = do { (lc', tv', k_redn) <- normalise_var_bndr tcvar
+           ; return $ mkFunRedn r vis ma_redn w_redn arg_redn res_redn }
+    go (ForAllTy ma (Bndr tcvar vis) ty)
+      = do { ma_redn <- withRole Nominal $ go ma
+           ; (lc', tv', k_redn) <- normalise_var_bndr tcvar
            ; redn <- withLC lc' $ normalise_type ty
-           ; return $ mkForAllRedn vis tv' k_redn redn }
+           ; return $ mkForAllRedn vis tv' ma_redn k_redn redn }
     go (TyVarTy tv)    = normalise_tyvar tv
     go (CastTy ty co)
       = do { redn <- go ty
@@ -1601,6 +1770,15 @@ normalise_type ty
                           (mkAppRedns fun_redn redns)
                           (mkSymMCo res_co) } }
 
+{- Note [Keeping existential types opaque during normalisation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Inferred bindings normalise their types in mkInferredPolyId. An explicit
+Pack application can supply an existential type directly. Apply the ambient
+substitution to the existential as a unit. The Core coercion language has
+no congruence rule for existentials. Return reflexive evidence only when
+the two sides of the ambient substitution leave the same existential.
+-}
+
 normalise_args :: Kind    -- of the function
                -> Infinite Role  -- roles at which to normalise args
                -> [Type]  -- args
@@ -1613,13 +1791,68 @@ normalise_args :: Kind    -- of the function
 -- cf. GHC.Tc.Solver.Rewrite.rewrite_args_slow
 normalise_args fun_ki roles args
   = do { normed_args <- zipWithM normalise1 (Inf.toList roles) args
-       ; return $ simplifyArgsWorker ki_binders inner_ki fvs roles args normed_args }
+       ; return $ simplifyArgsWorker (zip ki_mas ki_binders) inner_ki fvs roles args normed_args }
   where
-    (ki_binders, inner_ki) = splitPiTys fun_ki
+    (ki_mas, ki_binders, inner_ki) = splitPiTys fun_ki
     fvs = tyCoVarsOfTypes args
 
     normalise1 role ty
       = withRole role $ normalise_type ty
+
+{- Note [Normalising retained runtime indices]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained runtime index is an actual local Many Id of lifted type. See
+Note [Opaque runtime index values] in GHC.Core.Type. Use its scoped lifting
+relation for the target Id and nominal domain evidence. Do not inspect its
+unfolding or evaluate its value. Family matching keeps an opaque index
+MaybeApart from constructor indices; see Note [Apartness of retained runtime
+indices] in GHC.Core.Unify. A family can remain stuck at this index.
+
+NormM starts with an empty lifting context. Normalise an open binder domain
+nominally before installing its runtime relation in the common body prefix.
+Keep a closed domain unchanged; see Note [Closed retained domains]. Then
+normalise the body in that scope and bind its proof with DepFunCo. The body
+relation uses the target Id and its forward nominal domain cast. It does not
+assert equality between distinct runtime values. Eligible native function
+heads keep their fixed domain policy.
+
+Ordinary forall binders still normalise their kinds through normalise_var_bndr.
+Agda compares Pi codomains in one shared extended context. The System DC PiCong
+rule supplies explicit evidence for this abstraction; see Weirich et al.
+(ICFP 2017; ICFP 2019, §4.3).
+
+Note [Closed retained domains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A closed retained domain has no free erased variable, runtime Id or coercion
+variable. No inherited lifting relation can change it. Keep nominal reflexivity
+for that domain while normalising a whole retained function. Still freshen the
+binder, install its runtime relation and normalise the body.
+
+For example, let A = Token (Loop Bool), where Loop Bool reduces to itself.
+Two retained binders can have the identical domain A. Reducing Loop here would
+reject that identity before the solver can compare the domains. This shortcut
+states that substitution cannot affect A. It makes no termination claim about
+closed families. For unequal domains, the retained equality solver still uses
+bounded rewriteFamilyAxioms on the standalone domains. Keep that reduction
+and its depth error. See Note [Solving retained function equalities] in
+GHC.Tc.Solver.Equality.
+
+A retained callback occurrence carries the type of its lexical head. If
+the enclosing lifting context gives the same callback type at both
+endpoints, keep that type. For example, when checking ambiguity in
+`foreach (f :: Bool -> F tag) -> ...`, a Wanted may rewrite `F tag0` to
+`F tag`. Using it to rewrite the binder would require a cast between
+two different function types at each occurrence of f. The existing
+call representation requires the head to keep its complete type.
+The family equality remains available to the ordinary solver.
+
+An open domain can depend on an outer type variable or an earlier runtime Id.
+Keep its nominal normalisation and transport. Body arguments still use the
+ordinary argument normaliser. If Element reduces to Int while a binder keeps
+domain [Element], simplifyArgsWorker retains the corresponding kind cast on
+that binder's occurrence in GenericCount @Int. It must not retype the Id as
+[Int]. See Note [simplifyArgsWorker] in GHC.Core.Reduction.
+-}
 
 normalise_tyvar :: TyVar -> NormM Reduction
 normalise_tyvar tv
@@ -1640,44 +1873,60 @@ normalise_var_bndr tcvar
   -- works for both tvar and covar
   = do { lc1 <- getLC
        ; env <- getEnv
-       ; let callback lc ki = runNormM (normalise_type ki) env lc Nominal
+       ; fuel0 <- getFuel
+       ; let callback lc ki = fst (runNormM (normalise_type ki) env lc Nominal fuel0)
        ; return $ liftCoSubstVarBndrUsing reductionCoercion callback lc1 tcvar }
 
 -- | a monad for the normalisation functions, reading 'FamInstEnvs',
--- a 'LiftingContext', and a 'Role'.
+-- a 'LiftingContext', a 'Role', and an optional reduction fuel counter.
 newtype NormM a = NormM { runNormM ::
-                            FamInstEnvs -> LiftingContext -> Role -> a }
+                            FamInstEnvs -> LiftingContext -> Role -> Maybe Int -> (a, Maybe Int) }
     deriving (Functor)
 
 initNormM :: FamInstEnvs -> Role
           -> TyCoVarSet   -- the in-scope variables
           -> NormM a -> a
-initNormM env role vars (NormM thing_inside)
-  = thing_inside env lc role
+initNormM = initNormMWithFuel Nothing
+
+initNormMWithFuel :: Maybe Int -> FamInstEnvs -> Role
+                  -> TyCoVarSet
+                  -> NormM a -> a
+initNormMWithFuel mb_fuel env role vars (NormM thing_inside)
+  = fst (thing_inside env lc role mb_fuel)
   where
     in_scope = mkInScopeSet vars
     lc       = emptyLiftingContext in_scope
 
+consumeNormFuel :: NormM Bool
+consumeNormFuel = NormM $ \ _ _ _ mb_fuel -> case mb_fuel of
+  Nothing -> (True, Nothing)
+  Just n
+    | n <= 0    -> (False, Just 0)
+    | otherwise -> let !n' = n - 1 in (True, Just n')
+
+getFuel :: NormM (Maybe Int)
+getFuel = NormM (\ _ _ _ f -> (f, f))
+
 getRole :: NormM Role
-getRole = NormM (\ _ _ r -> r)
+getRole = NormM (\ _ _ r f -> (r, f))
 
 getLC :: NormM LiftingContext
-getLC = NormM (\ _ lc _ -> lc)
+getLC = NormM (\ _ lc _ f -> (lc, f))
 
 getEnv :: NormM FamInstEnvs
-getEnv = NormM (\ env _ _ -> env)
+getEnv = NormM (\ env _ _ f -> (env, f))
 
 withRole :: Role -> NormM a -> NormM a
-withRole r thing = NormM $ \ envs lc _old_r -> runNormM thing envs lc r
+withRole r thing = NormM $ \ envs lc _old_r f -> runNormM thing envs lc r f
 
 withLC :: LiftingContext -> NormM a -> NormM a
-withLC lc thing = NormM $ \ envs _old_lc r -> runNormM thing envs lc r
+withLC lc thing = NormM $ \ envs _old_lc r f -> runNormM thing envs lc r f
 
 instance Monad NormM where
-  ma >>= fmb = NormM $ \env lc r ->
-               let a = runNormM ma env lc r in
-               runNormM (fmb a) env lc r
+  ma >>= fmb = NormM $ \env lc r f ->
+               case runNormM ma env lc r f of
+                 (a, f') -> runNormM (fmb a) env lc r f'
 
 instance Applicative NormM where
-  pure x = NormM $ \ _ _ _ -> x
+  pure x = NormM $ \ _ _ _ f -> (x, f)
   (<*>)  = ap

@@ -35,7 +35,7 @@ import GHC.Core.Unify      ( tcMatchTys )
 import GHC.Data.Pair
 import GHC.Core.TyCon    ( TyCon, FamTyConFlav(..), mkFamilyTyCon, tyConArity
                          , Injectivity(..), builtInClosedTyFamTyCon_maybe
-                         , mkTyConKind )
+                         , mkTyConKindWithMatchability )
 import GHC.Core.Coercion.Axiom
 import GHC.Core.TyCo.Compare   ( tcEqType )
 import GHC.Types.Name          ( Name, BuiltInSyntax(..) )
@@ -290,7 +290,9 @@ mkTopUnaryFamDeduction str fam_tc f
       , bifinj_axr    = BuiltInFamInj bif
       , bifinj_proves = \(Pair lhs rhs)
                         -> do { (tc, [a]) <- splitTyConApp_maybe lhs
-                              ; massertPpr (tc == fam_tc) (ppr tc $$ ppr fam_tc)
+                              -- See Note [Built-in deduction keys in interfaces]
+                              -- in GHC.IfaceToCore.
+                              ; guard (tc == fam_tc)
                               ; f a rhs } }
 
 mkTopBinFamDeduction :: String -> TyCon
@@ -670,7 +672,7 @@ axLogRewrites
 
 typeNatCmpTyCon :: TyCon
 typeNatCmpTyCon
-  = mkFamilyTyCon name (mkTyConKind bndrs orderingKind)
+  = mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs orderingKind)
       bndrs 0
       orderingKind
       Nothing
@@ -705,7 +707,7 @@ axCmpNatInjectivity
 
 typeSymbolCmpTyCon :: TyCon
 typeSymbolCmpTyCon =
-  mkFamilyTyCon name (mkTyConKind bndrs orderingKind)
+  mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs orderingKind)
     bndrs 0
     orderingKind
     Nothing
@@ -769,12 +771,12 @@ axAppendInjectivity
      do { rs <- isStrLitTy r; guard (nullFS rs); return (Pair b nullStrLitTy) }
 
    , -- (AppendSymbol "foo" b ~ "foobar") => (b ~ "bar")
-     mkTopBinFamDeduction "AppendSymbolT3" tc $ \ a b r ->
+     mkTopBinFamDeduction "AppendSymbolKnownPrefix" tc $ \ a b r ->
      do { as <- isStrLitTyS a; rs <- isStrLitTyS r; guard (as `isPrefixOf` rs)
         ; return (Pair b (mkStrLitTyS (drop (length as) rs))) }
 
    , -- (AppendSymbol f "bar" ~ "foobar") => (f ~ "foo")
-     mkTopBinFamDeduction "AppendSymbolT3" tc $ \ a b r ->
+     mkTopBinFamDeduction "AppendSymbolKnownSuffix" tc $ \ a b r ->
      do { bs <- isStrLitTyS b; rs <- isStrLitTyS r; guard (bs `isSuffixOf` rs)
         ; return (Pair a (mkStrLitTyS (take (length rs - length bs) rs))) }
 
@@ -790,7 +792,7 @@ axAppendInjectivity
 
 typeConsSymbolTyCon :: TyCon
 typeConsSymbolTyCon =
-  mkFamilyTyCon name (mkTyConKind bndrs typeSymbolKind)
+  mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs typeSymbolKind)
     bndrs 0
     typeSymbolKind
     Nothing
@@ -834,7 +836,7 @@ axConsInjectivity
 
 typeUnconsSymbolTyCon :: TyCon
 typeUnconsSymbolTyCon =
-  mkFamilyTyCon name (mkTyConKind bndrs res_kind)
+  mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs res_kind)
     bndrs 0
     res_kind
     Nothing
@@ -888,7 +890,7 @@ axUnconsInjectivity
 
 typeCharToNatTyCon :: TyCon
 typeCharToNatTyCon =
-  mkFamilyTyCon name (mkTyConKind bndrs naturalTy)
+  mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs naturalTy)
     bndrs 0
     naturalTy
     Nothing
@@ -912,7 +914,7 @@ axCharToNatRewrites
 axCharToNatInjectivity :: [BuiltInFamInjectivity]
 axCharToNatInjectivity
   = [ -- (CharToNat c ~ 122) => (c ~ 'z')
-      mkTopUnaryFamDeduction "CharToNatT1" typeCharToNatTyCon $ \c r ->
+      mkTopUnaryFamDeduction "CharToNatDeduction" typeCharToNatTyCon $ \c r ->
       do { nr <- isNumLitTy r; chr <- integerToChar nr; return (Pair c (mkCharLitTy chr)) } ]
 
 -------------------------------------------------------------------------------
@@ -921,7 +923,7 @@ axCharToNatInjectivity
 
 typeNatToCharTyCon :: TyCon
 typeNatToCharTyCon =
-  mkFamilyTyCon name (mkTyConKind bndrs charTy)
+  mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs charTy)
     bndrs 0
     charTy
     Nothing
@@ -945,7 +947,7 @@ axNatToCharRewrites
 axNatToCharInjectivity :: [BuiltInFamInjectivity]
 axNatToCharInjectivity
   = [ -- (NatToChar n ~ 'z') => (n ~ 122)
-      mkTopUnaryFamDeduction "CharToNatT1" typeNatToCharTyCon $ \n r ->
+      mkTopUnaryFamDeduction "NatToCharDeduction" typeNatToCharTyCon $ \n r ->
       do { c <- isCharLitTy r; return (Pair n (mkNumLitTy (charToInteger c))) } ]
 
 
@@ -955,7 +957,7 @@ axNatToCharInjectivity
 
 typeCharCmpTyCon :: TyCon
 typeCharCmpTyCon =
-  mkFamilyTyCon name (mkTyConKind bndrs orderingKind)
+  mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy bndrs orderingKind)
     bndrs 0
     orderingKind
     Nothing
@@ -1067,7 +1069,7 @@ isOrderingLitTy tc =
 -- Make a unary built-in constructor of kind: Nat -> Nat
 mkTypeNatFunTyCon1 :: Name -> BuiltinClosedTyFam -> TyCon
 mkTypeNatFunTyCon1 op tcb =
-  mkFamilyTyCon op (mkTyConKind bndrs naturalTy)
+  mkFamilyTyCon op (mkTyConKindWithMatchability unmatchableDataConTy bndrs naturalTy)
     bndrs 0
     naturalTy
     Nothing
@@ -1080,7 +1082,7 @@ mkTypeNatFunTyCon1 op tcb =
 -- Make a binary built-in constructor of kind: Nat -> Nat -> Nat
 mkTypeNatFunTyCon2 :: Name -> BuiltinClosedTyFam -> TyCon
 mkTypeNatFunTyCon2 op tcb =
-  mkFamilyTyCon op (mkTyConKind bndrs naturalTy)
+  mkFamilyTyCon op (mkTyConKindWithMatchability unmatchableDataConTy bndrs naturalTy)
     bndrs 0
     naturalTy
     Nothing
@@ -1093,7 +1095,7 @@ mkTypeNatFunTyCon2 op tcb =
 -- Make a binary built-in constructor of kind: Symbol -> Symbol -> Symbol
 mkTypeSymbolFunTyCon2 :: Name -> BuiltinClosedTyFam -> TyCon
 mkTypeSymbolFunTyCon2 op tcb =
-  mkFamilyTyCon op (mkTyConKind bndrs typeSymbolKind)
+  mkFamilyTyCon op (mkTyConKindWithMatchability unmatchableDataConTy bndrs typeSymbolKind)
     bndrs 0
     typeSymbolKind
     Nothing

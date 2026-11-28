@@ -437,6 +437,7 @@ h98ConArgDocs con_args = case con_args of
 
 gadtConArgDocs :: HsConDeclGADTDetails GhcRn -> HsType GhcRn -> IntMap (HsDoc GhcRn)
 gadtConArgDocs con_args res_ty = case con_args of
+  PrefixConGADT _ []   -> typeDocs res_ty
   PrefixConGADT _ args -> con_arg_docs 0 $ map cdf_doc args ++ [res_doc]
   RecConGADT _ _       -> con_arg_docs 1 [res_doc]
   where
@@ -498,10 +499,19 @@ typeDocs = go 0
   where
     go n = \case
       HsForAllTy { hst_body = ty }          -> go n (unLoc ty)
+      HsForEachTy { hst_xforeach = (_, Left _), hst_bndrs = bs, hst_body = ty }
+                                             -> go (n + length bs) (unLoc ty)
+      HsForEachTy { hst_xforeach = (_, Right _), hst_body = ty }
+                                             -> go n (unLoc ty)
       HsQualTy   { hst_body = ty }          -> go n (unLoc ty)
       HsFunTy _ _ (unLoc->HsDocTy _ _ x) ty -> IM.insert n (unLoc x) $ go (n+1) (unLoc ty)
+      HsFunTy _ _ (unLoc->XHsType (HsGadtFieldRn cdf)) ty
+        | Just x <- cdf_doc cdf             -> IM.insert n (unLoc x) $ go (n+1) (unLoc ty)
       HsFunTy _ _ _ ty                      -> go (n+1) (unLoc ty)
       HsDocTy _ _ doc                       -> IM.singleton n (unLoc doc)
+      XHsType (HsGadtFieldRn cdf)
+        | Just doc <- cdf_doc cdf           -> IM.singleton n (unLoc doc)
+        | otherwise                         -> go n (unLoc (cdf_type cdf))
       _                                     -> IM.empty
 
 -- | Extract function argument docs from inside types.
