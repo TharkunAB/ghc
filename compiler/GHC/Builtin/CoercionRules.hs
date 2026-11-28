@@ -1,7 +1,6 @@
 -- | Built-in rules that can occur in an interface coercion.
 module GHC.Builtin.CoercionRules
   ( builtInCoAxiomRules
-  , boxedPairCompositionRule, matchBoxedPairComposition
   , boxedPairReconstructionRule
   , proveBoxedPairProjection, proveScopedSigmaClosure, proveScopedLambdaClosure
   , proveScopedLambdaEta
@@ -52,8 +51,7 @@ import qualified Data.Set as Set
 builtInCoAxiomRules :: UniqFM FastString CoAxiomRule
 builtInCoAxiomRules =
     foldl' (\rules (name, rule) -> addToUFM rules name rule) typeNatCoAxiomRules
-      [ (boxedPairCompositionName, boxedPairCompositionRule)
-      , (boxedPairReconstructionName, boxedPairReconstructionRule)
+      [ (boxedPairReconstructionName, boxedPairReconstructionRule)
       , existsCoRule ExplicitExists Nominal, existsCoRule ExplicitExists Representational
       , existsCoRule ImplicitExists Nominal, existsCoRule ImplicitExists Representational
       , matchableAppProjectionRule CLeft, matchableAppProjectionRule CRight
@@ -420,38 +418,28 @@ nominal single-branch axioms, binder identity and exact constructors.
 Use the same pure check for Lint and for coercion endpoints. Substitution
 can make the operand a constructor; the rule remains valid in that case.
 
-Keep the original rule key for exchange-only proofs in existing interfaces.
-Write the more general key for other reconstructions. A compiler that
-reads the same binary format but lacks the new rule rejects the new key
+The rule accepts an exchange such as fst (swap q) ~ snd q as a special
+case: the paths of both sides end at the same projection of q. A compiler
+that reads the same binary format but lacks this rule rejects its key
 through tcIfaceAxiomRule.
 -}
 
 boxedPairReconstructionName :: FastString
 boxedPairReconstructionName = fsLit "BoxedPairReconstruction"
 
-boxedPairCompositionName :: FastString
-boxedPairCompositionName = fsLit "BoxedPairComposition"
-
--- | The original nominal law for a projection through an exchange.
-boxedPairCompositionRule :: CoAxiomRule
-boxedPairCompositionRule = pairCompositionRule boxedPairCompositionName matchExchange
-
 -- | Nominal evidence for two projections that observe the same field.
+-- See Note [Strict boxed pair composition].
 boxedPairReconstructionRule :: CoAxiomRule
-boxedPairReconstructionRule = pairCompositionRule boxedPairReconstructionName commonField
-
-type PairCaseUse = (TyCon, [Type])
-
-pairCompositionRule :: FastString -> (Projection -> Projection -> Maybe [PairCaseUse])
-                    -> CoAxiomRule
-pairCompositionRule name match = BuiltInEqRule name proves
+boxedPairReconstructionRule = BuiltInEqRule boxedPairReconstructionName proves
   where
     proves [Pair lhs lhs', Pair rhs rhs'] = do
       guard (lhs `eqType` lhs' && rhs `eqType` rhs')
       (l, r) <- projections lhs rhs
-      _ <- match l r
+      _ <- commonField l r
       pure (Pair lhs rhs)
     proves _ = Nothing
+
+type PairCaseUse = (TyCon, [Type])
 
 -- | A position in the input pair.
 data PairField = FirstField | SecondField
@@ -467,27 +455,12 @@ selectField SecondField = snd
 -- | The current field and scrutinee, its two field kinds, and the equations used.
 data Projection = Projection PairField Type (Kind, Kind) [PairCaseUse]
 
--- | Check the original oriented exchange law and return its source dependencies.
-matchBoxedPairComposition :: Type -> Type -> Maybe [(TyCon, [Type])]
-matchBoxedPairComposition lhs rhs = do
-    (l, r) <- projections lhs rhs
-    matchExchange l r
-
--- | Preserve the published exchange proof in either orientation.
+-- | Prove that two projections observe the same field.
 proveBoxedPairProjection :: Type -> Type -> Maybe (Coercion, [PairCaseUse])
 proveBoxedPairProjection lhs rhs = do
     (l, r) <- projections lhs rhs
-    choose l r
-  where
-    evidence rule a b = AxiomCo rule [mkNomReflCo a, mkNomReflCo b]
-    choose l r
-      | Just uses <- matchExchange l r
-      = pure (evidence boxedPairCompositionRule lhs rhs, uses)
-      | Just uses <- matchExchange r l
-      = pure (mkSymCo (evidence boxedPairCompositionRule rhs lhs), uses)
-      | otherwise = do
-          uses <- commonField l r
-          pure (evidence boxedPairReconstructionRule lhs rhs, uses)
+    uses <- commonField l r
+    pure (AxiomCo boxedPairReconstructionRule [mkNomReflCo lhs, mkNomReflCo rhs], uses)
 
 projections :: Type -> Type -> Maybe (Projection, Projection)
 projections lhs rhs = do
@@ -501,17 +474,11 @@ projections lhs rhs = do
       pure (Projection field p (a,b) [(fun, args)])
 
 -- | Cross one certified reconstruction and retain its input field identities.
-throughReconstruction :: Projection -> Maybe (Bool, Projection)
+throughReconstruction :: Projection -> Maybe Projection
 throughReconstruction (Projection field p (a,b) uses) = do
     (fun, args, Reconstruct left right, q, x, y) <- appliedPairCase p
     guard (a `eqType` selectField left (x,y) && b `eqType` selectField right (x,y))
-    let next = Projection (selectField field (left,right)) q (x,y) ((fun,args):uses)
-    pure (left == SecondField && right == FirstField, next)
-
-matchExchange :: Projection -> Projection -> Maybe [PairCaseUse]
-matchExchange l r = do
-    (True, inner) <- throughReconstruction l
-    matchingField inner r
+    pure (Projection (selectField field (left,right)) q (x,y) ((fun,args):uses))
 
 matchingField :: Projection -> Projection -> Maybe [PairCaseUse]
 matchingField (Projection f p (a,b) uses) (Projection g q (x,y) other) = do
@@ -525,8 +492,8 @@ commonField l r
   | otherwise = commonPrefix (path l []) (path r [])
   where
     path current outer = case throughReconstruction current of
-      Just (_, inner) -> path inner (current:outer)
-      Nothing         -> current:outer
+      Just inner -> path inner (current:outer)
+      Nothing    -> current:outer
 
     commonPrefix (x:xs) (y:ys) = do
       uses <- matchingField x y
