@@ -12,6 +12,7 @@ module GHC.CoreToIface
     , toIfaceForAllBndrs
     , toIfaceForAllTyBndr
     , toIfaceForAllTyBndrs
+    , toIfaceForAllTyBndrsWithMatchability
     , toIfaceTyVar
       -- * Types
     , toIfaceType, toIfaceTypeX
@@ -33,7 +34,7 @@ module GHC.CoreToIface
     , toIfaceBang
     , toIfaceSrcBang
     , toIfaceLetBndr
-    , toIfaceIdDetails
+    , toIfaceIdDetails, toIfaceSourceProofRules
     , toIfaceIdInfo
     , toIfUnfolding
     , toIfaceTickish
@@ -54,9 +55,11 @@ import GHC.StgToCmm.Types
 
 import GHC.Core
 import GHC.Core.TyCon hiding ( pprPromotionQuote )
+import GHC.Core.Coercion (mkDepFunCoWithVis, mkRepReflCo, ordinaryAppProjection_maybe)
 import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
 import GHC.Core.Type
+import GHC.Core.Utils (applyTypeToArgs, exprType, isVacuousRetainedBinder)
 import GHC.Core.Multiplicity
 import GHC.Core.PatSyn
 import GHC.Core.TyCo.Rep
@@ -65,7 +68,7 @@ import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.TyCo.Tidy
 
 import GHC.Builtin.WiredIn.Prim ( eqPrimTyCon, eqReprPrimTyCon )
-import GHC.Builtin.WiredIn.Types ( heqTyCon )
+import GHC.Builtin.WiredIn.Types ( boolTyCon, heqTyCon )
 import GHC.Builtin.WiredIn.Ids ( noinlineIdName, noinlineConstraintIdName )
 
 import GHC.Iface.Syntax
@@ -165,6 +168,12 @@ toIfaceForAllBndrX fr (Bndr v vis) = Bndr (toIfaceBndrX fr v) vis
 toIfaceForAllTyBndrs :: [ForAllTyBinder] -> [IfaceForAllBndr]
 toIfaceForAllTyBndrs = map toIfaceForAllTyBndr
 
+-- | Convert a forall telescope without discarding its matchability.
+toIfaceForAllTyBndrsWithMatchability
+  :: [(Matchability, ForAllTyBinder)] -> [(IfaceMatchability, IfaceForAllBndr)]
+toIfaceForAllTyBndrsWithMatchability
+  = map (\(ma,bndr) -> (toIfaceType ma, toIfaceForAllTyBndr bndr))
+
 toIfaceForAllTyBndr :: ForAllTyBinder -> IfaceForAllBndr
 toIfaceForAllTyBndr = toIfaceForAllTyBndrX emptyVarSet
 
@@ -194,6 +203,35 @@ toIfaceTypeX :: VarSet -> Type -> IfaceType
 toIfaceTypeX fr (TyVarTy tv)   -- See Note [Free TyVars and CoVars in IfaceType] in GHC.Iface.Type
   | tv `elemVarSet` fr         = IfaceFreeTyVar tv
   | otherwise                  = IfaceTyVar (toIfaceTyVar tv)
+toIfaceTypeX fr (TermVarTy var)
+  | isNativeNamedOpaqueFunctionId var = IfaceNamedTermVar (idName var)
+  | var `elemVarSet` fr = IfaceFreeTermVar var
+  | otherwise = IfaceTermVar (mkIfLclName (occNameFS (getOccName var)))
+toIfaceTypeX fr (DepDictTy var body)
+  = IfaceDepDictTy (toIfaceIdBndrX fr var)
+                   (toIfaceTypeX (fr `delVarSet` var) body)
+toIfaceTypeX fr (ClassAppTy method inst dict arg _)
+  = IfaceClassAppTy (idName method) (toIfaceTypeX fr inst)
+                   (toIfaceTypeX fr dict) (toIfaceTypeX fr arg)
+toIfaceTypeX fr (TermAppTy fun arg)
+  -- See Note [Opaque call indices in interfaces] in GHC.Iface.Type.
+  | isNativeNamedOpaqueFunctionId fun
+  = let head = TermVarTy fun
+    in IfaceAppTy (toIfaceTypeX fr head) (toIfaceAppTyArgsX fr head [arg])
+  | fun `elemVarSet` fr = IfaceFreeTermAppTy fun arg'
+  | otherwise = IfaceTermAppTy (mkIfLclName (occNameFS (getOccName fun))) arg'
+  where
+    arg' = toIfaceTypeX fr arg
+toIfaceTypeX fr (ExistsTy flag var body)
+  = IfaceExistsTy flag (toIfaceTvBndrX fr var)
+                  (toIfaceTypeX (fr `delVarSet` var) body)
+toIfaceTypeX fr (DepFunTy vis var res)
+  = IfaceDepFunTy vis' (toIfaceIdBndrX fr var)
+                  (toIfaceTypeX (fr `delVarSet` var) res)
+  where
+    vis' | isInvisibleDepFunFlag vis, isInferredDepFunFlag vis || isInferredRetainedBinder var
+         = DepFunInferred
+         | otherwise = vis
 toIfaceTypeX fr ty@(AppTy {})  =
   -- Flatten as many argument AppTys as possible, then turn them into an
   -- IfaceAppArgs list.
@@ -201,10 +239,11 @@ toIfaceTypeX fr ty@(AppTy {})  =
   let (head, args) = splitAppTys ty
   in IfaceAppTy (toIfaceTypeX fr head) (toIfaceAppTyArgsX fr head args)
 toIfaceTypeX _  (LitTy n)      = IfaceLitTy (toIfaceTyLit n)
-toIfaceTypeX fr (ForAllTy b t) = IfaceForAllTy (toIfaceForAllTyBndrX fr b)
+toIfaceTypeX fr (ForAllTy ma b t) = IfaceForAllTy (toIfaceTypeX fr ma)
+                                               (toIfaceForAllTyBndrX fr b)
                                                (toIfaceTypeX (fr `delVarSet` binderVar b) t)
-toIfaceTypeX fr (FunTy { ft_arg = t1, ft_mult = w, ft_res = t2, ft_af = af })
-  = IfaceFunTy af (toIfaceTypeX fr w) (toIfaceTypeX fr t1) (toIfaceTypeX fr t2)
+toIfaceTypeX fr (FunTy { ft_arg = t1, ft_ma = ma, ft_mult = w, ft_res = t2, ft_af = af })
+  = IfaceFunTy af (toIfaceTypeX fr ma) (toIfaceTypeX fr w) (toIfaceTypeX fr t1) (toIfaceTypeX fr t2)
 toIfaceTypeX fr (CastTy ty co)  = IfaceCastTy (toIfaceTypeX fr ty) (toIfaceCoercionX fr co)
 toIfaceTypeX fr (CoercionTy co) = IfaceCoercionTy (toIfaceCoercionX fr co)
 
@@ -228,7 +267,7 @@ toIfaceTypeX fr (TyConApp tc tys)
 
     -- other applications
   | otherwise
-  = IfaceTyConApp (toIfaceTyCon tc) (toIfaceTcArgsX fr tc tys)
+  = IfaceTyConApp (toIfaceAppliedTyCon tc tys) (toIfaceTcArgsX fr tc tys)
   where
     arity = tyConArity tc
     n_tys = length tys
@@ -238,6 +277,29 @@ toIfaceTyVar = mkIfLclName . occNameFS . getOccName
 
 toIfaceCoVar :: CoVar -> IfLclName
 toIfaceCoVar = mkIfLclName . occNameFS . getOccName
+
+{- Note [Versioning retained sibling evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ordinary data declaration already stores the list of retained and
+ordinary fields. Old readers can use that list without promoting the
+constructor. A promoted type reference or a native constructor proof
+requires the precise promoted telescope. Old readers only accept one
+payload. Mark both uses at serialization and check the tag against the
+constructor in the reader. This keeps ordinary data interfaces and
+single-payload evidence in their existing format.
+-}
+
+-- | Mark a partial synonym or built-in family in types and coercions.
+-- See Note [Partial type family applications] in GHC.Core.Type.
+toIfaceAppliedTyCon :: TyCon -> [a] -> IfaceTyCon
+toIfaceAppliedTyCon tc args
+  | args `lengthLessThan` tyConArity tc
+  , isTypeSynonymTyCon tc
+  = IfaceTyCon (tyConName tc) (mkIfaceTyConInfo NotPromoted IfacePartialSynonym)
+  | args `lengthLessThan` tyConArity tc
+  , Just _ <- builtInClosedTyFamTyCon_maybe tc
+  = IfaceTyCon (tyConName tc) (mkIfaceTyConInfo NotPromoted IfacePartialBuiltinFamily)
+  | otherwise = toIfaceTyCon tc
 
 ----------------
 toIfaceTyCon :: TyCon -> IfaceTyCon
@@ -265,6 +327,10 @@ toIfaceTyCon tc
       , let tc' = dataConTyCon dcon
       , Just tsort <- tupleSort tc'          = tsort
 
+      | Just dcon <- isPromotedDataCon_maybe tc
+      , dataConHasPromotedRetainedSiblings dcon = IfaceRetainedSiblings
+        -- See Note [Versioning retained sibling evidence].
+
       | isUnboxedSumTyCon tc
       , Just cons <- tyConDataCons_maybe tc  = IfaceSumTyCon (length cons)
 
@@ -279,10 +345,26 @@ toIfaceTyCon_name n = IfaceTyCon n info
 
 toIfaceTyLit :: TyLit -> IfaceTyLit
 toIfaceTyLit (NumTyLit x) = IfaceNumTyLit x
+toIfaceTyLit (IntPrimTyLit x) = IfaceIntPrimTyLit x
+toIfaceTyLit (WordPrimTyLit x) = IfaceWordPrimTyLit x
 toIfaceTyLit (StrTyLit x) = IfaceStrTyLit (LexicalFastString x)
 toIfaceTyLit (CharTyLit x) = IfaceCharTyLit x
 
 ----------------
+{- Note [Function-value call congruence in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TermAppCo f arg_co is forward nominal application congruence. Its endpoints
+are also the endpoints of AppCo (Refl (TermVarTy f)) arg_co. Encode that proof
+with the existing IfaceAppCo and IfaceReflCo tags. Preserve the argument proof.
+The reader resolves the actual function Id and canonical application restores
+the call endpoints. A general AppCo can carry a nonreflexive head proof, such
+as transport through a saturated family. Keep that proof in its own case.
+
+Use toIfaceTypeX for the function-value index. It retains the diagnostic free
+form when f is outside the telescope; the raw writer rejects that form.
+The wire encoding adds no axiom or tag. DepFunCo persistence remains gated.
+-}
+
 toIfaceCoercion :: Coercion -> IfaceCoercion
 toIfaceCoercion = toIfaceCoercionX emptyVarSet
 
@@ -311,22 +393,39 @@ toIfaceCoercionX fr co
     go (InstCo co arg)     = IfaceInstCo (go co) (go arg)
     go (KindCo c)          = IfaceKindCo (go c)
     go (SubCo co)          = IfaceSubCo (go co)
-    go (AxiomCo ax cs)     = IfaceAxiomCo (toIfaceAxiomRule ax) (map go cs)
+    go (AxiomCo ax cs)
+      | Just (lr, co) <- ordinaryAppProjection_maybe ax cs = IfaceLRCo lr (go co)
+      | otherwise = IfaceAxiomCo (toIfaceAxiomRule ax) (map go cs)
     go (UnivCo { uco_prov = p, uco_role = r, uco_lty = t1, uco_rty = t2, uco_deps = deps })
         = IfaceUnivCo p r (toIfaceTypeX fr t1) (toIfaceTypeX fr t2)
                       (go_deps deps)
 
     go co@(TyConAppCo r tc cos)
       =  assertPpr (isNothing (tyConAppFunCo_maybe r tc cos)) (ppr co) $
-         IfaceTyConAppCo r (toIfaceTyCon tc) (map go cos)
+         IfaceTyConAppCo r (toIfaceAppliedTyCon tc cos) (map go cos)
 
-    go (FunCo { fco_role = r, fco_mult = w, fco_arg = co1, fco_res = co2 })
-      = IfaceFunCo r (go w) (go co1) (go co2)
+    go (FunCo { fco_role = r, fco_ma = ma, fco_mult = w, fco_arg = co1, fco_res = co2 })
+      = IfaceFunCo r (go ma) (go w) (go co1) (go co2)
 
-    go (ForAllCo tv visL visR k co)
+    go (TermAppCo fun co)
+      -- See Note [Function-value call congruence in interfaces].
+      = IfaceAppCo (IfaceReflCo (toIfaceTypeX fr (TermVarTy fun))) (go co)
+
+    go (DepFunCo visL visR var domain co)
+      = IfaceDepFunCo visL visR bndr (go_mco domain)
+                      (toIfaceCoercionX (fr `delVarSet` var) co)
+      where
+        bndr | isId var = toIfaceIdBndrX fr var
+             -- Lint must also print malformed binders. A TyVar has no multiplicity.
+             | otherwise = ( many_ty
+                           , mkIfLclName (occNameFS (getOccName var))
+                           , toIfaceTypeX fr (varType var) )
+
+    go (ForAllCo tv visL visR ma k co)
       = IfaceForAllCo (toIfaceBndr tv)
                       (IfaceForAllTyFlag visL)
                       (IfaceForAllTyFlag visR)
+                      (toIfaceCoercionX fr ma)
                       (go_mco k)
                       (toIfaceCoercionX fr' co)
                           where
@@ -345,6 +444,7 @@ toIfaceCoercionX fr co
 
 toIfaceAxiomRule :: CoAxiomRule -> IfaceAxiomRule
 toIfaceAxiomRule (BuiltInFamRew  bif) = IfaceAR_X (mkIfLclName (bifrw_name bif))
+toIfaceAxiomRule (BuiltInRule name _ _ _) = IfaceAR_X (mkIfLclName name)
 toIfaceAxiomRule (BuiltInFamInj bif)  = IfaceAR_X (mkIfLclName (bifinj_name bif))
 toIfaceAxiomRule (BranchedAxiom ax i) = IfaceAR_B (coAxiomName ax) i
 toIfaceAxiomRule (UnbranchedAxiom ax) = IfaceAR_U (coAxiomName ax)
@@ -379,7 +479,9 @@ toIfaceAppArgsX fr kind ty_args
     go env ty                  ts
       | Just ty' <- coreView ty
       = go env ty' ts
-    go env (ForAllTy (Bndr tv vis) res) (t:ts)
+    go _ ty@(DepFunTy {}) (_:_)
+      = pprPanic "toIfaceAppArgsX: native dependent kind application not implemented" (ppr ty)
+    go env (ForAllTy _ma (Bndr tv vis) res) (t:ts)
       = IA_Arg t' (IfaceForAllTyFlag vis) ts'
       where
         t'  = toIfaceTypeX fr t
@@ -476,19 +578,37 @@ toIfaceTopBndr id
   where
     name = getName id
 
+-- | Write rule identities without requiring private worker declarations.
+toIfaceSourceProofRules :: [SourceProofRule] -> [IfaceSourceProofRule]
+toIfaceSourceProofRules deps =
+  [ ((symbol owner, fmap symbol first, mapper), map (fmap symbol) args)
+  | (owner, first, mapper, args) <- deps ]
+  where
+    symbol n = (nameModule n, nameOccName n)
+
+
 toIfaceIdDetails :: Name   -- ^ for trace/panic messages only
                  -> IdDetails -> IfaceIdDetails
 toIfaceIdDetails _ VanillaId                      = IfVanillaId
+toIfaceIdDetails name (SourceTableId owner table origin)
+  | name == owner = IfSourceTableId (tyConName table) origin
+  | otherwise     = IfVanillaId
+toIfaceIdDetails name (CheckedClosureSourceTableId owner table helpers)
+  | name == owner = IfCheckedClosureSourceTableId (tyConName table) helpers
+  | otherwise     = IfVanillaId
 toIfaceIdDetails _ (InstMethId {})                = IfVanillaId
 toIfaceIdDetails _ (WorkerLikeId dmds)            = IfWorkerLikeId dmds
+toIfaceIdDetails name (DFunId _ (Just source))
+  | name == sdf_owner source = IfSourceDFunId (sdf_methods source) (sdf_literal source)
 toIfaceIdDetails _ (DFunId {})                    = IfDFunId
 toIfaceIdDetails _ (RecSelId { sel_naughty = n
                              , sel_tycon = tc
-                             , sel_fieldLabel = fl }) =
+                             , sel_fieldLabel = fl
+                             , sel_sourceTable = source_table }) =
   let (iface, first_con) = case tc of
                 RecSelData ty_con    -> ( Left (toIfaceTyCon ty_con), dataConName $ head $ tyConDataCons ty_con)
                 RecSelPatSyn pat_syn -> ( Right (patSynToIfaceDecl pat_syn), patSynName pat_syn)
-  in IfRecSelId iface first_con n fl
+  in IfRecSelId iface first_con n fl (tyConName <$> source_table)
 
   -- NB: we deliberately handle every remaining 'IdDetails' constructor below,
   --     so that anyone adding a new 'IdDetails' constructor gets an incomplete
@@ -607,10 +727,31 @@ toIfaceExpr (Lit l)         = IfaceLit l
 toIfaceExpr (Type ty)       = IfaceType (toIfaceType ty)
 toIfaceExpr (Coercion co)   = IfaceCo   (toIfaceCoercion co)
 toIfaceExpr (Lam x b)       = IfaceLam (toIfaceBndr x, toIfaceOneShot x) (toIfaceExpr b)
+toIfaceExpr (Pack schema witness payload)
+  = IfacePack (toIfaceType schema) (toIfaceType witness) (toIfaceExpr payload)
+toIfaceExpr (Unpack witness value package body)
+  = IfaceUnpack (toIfaceTvBndr witness) (toIfaceIdBndr value)
+                (toIfaceExpr package) (toIfaceExpr body)
 toIfaceExpr (App f a)       = toIfaceApp f [a]
 toIfaceExpr (Case s x ty as)
   | null as                 = IfaceECase (toIfaceExpr s) (toIfaceType ty)
-  | otherwise               = IfaceCase (toIfaceExpr s) (mkIfLclName (getOccFS x)) (map toIfaceAlt as)
+  | otherwise               = IfaceCase scrut (mkIfLclName (getOccFS x))
+                                  (map (toIfaceAltWith legacy_structural) as)
+  where
+    -- A concrete instance of an opaque declaration can still use the
+    -- old structural encoding. The reader checks coverage for that tag.
+    legacy_structural =
+      isNativeIndexType (idType x) &&
+      case splitTyConApp_maybe (idType x) of
+        Just (tc, _) -> DEFAULT `elem` constructors ||
+                        all ((`elem` constructors) . DataAlt) (tyConDataCons tc)
+        Nothing -> False
+    constructors = [con | Alt con _ _ <- as]
+    -- Inlining a retained application can leave a constructed scrutinee.
+    -- The branch proof then requires the same reader support as the application.
+    scrut | any (\alt -> isNativeIndexAlt alt || isNativeIndexAliasAlt alt) as
+          = toIfaceRetainedOperand s
+          | otherwise = toIfaceExpr s
 toIfaceExpr (Let b e)       = IfaceLet (toIfaceBind b) (toIfaceExpr e)
 toIfaceExpr (Cast e co)     = IfaceCast (toIfaceExpr e) (toIfaceCoercion co)
 toIfaceExpr (Tick t e)      = IfaceTick (toIfaceTickish t) (toIfaceExpr e)
@@ -665,7 +806,43 @@ toIfaceTopBind b =
 
 ---------------------
 toIfaceAlt :: CoreAlt -> IfaceAlt
-toIfaceAlt (Alt c bs r) = IfaceAlt (toIfaceCon c) (map (mkIfLclName . getOccFS) bs) (toIfaceExpr r)
+toIfaceAlt = toIfaceAltWith False
+
+-- | Encode a branch. Use the old structural tag only inside a checked case.
+-- See Note [Native index alias evidence in interfaces] in GHC.IfaceToCore.
+toIfaceAltWith :: Bool -> CoreAlt -> IfaceAlt
+toIfaceAltWith _ (Alt DEFAULT [cv] rhs)
+  | isCoVar cv, isLocalId cv
+  = IfaceAlt IfaceDefaultAltWithProof [mkIfLclName (getOccFS cv)] (toIfaceExpr rhs)
+toIfaceAltWith _ alt@(Alt DEFAULT (_:_) _)
+  = pprPanic "toIfaceAlt: invalid index alias proof binder" (ppr alt)
+toIfaceAltWith legacy_structural alt@(Alt (DataAlt con) bs rhs)
+  | isNativeIndexedDataAlt con bs
+  = case splitAt (length bs - 1) bs of
+      (_, [cv]) | isCoVar cv, isLocalId cv ->
+        let iface_con
+              | isNativeOpaqueOrdinaryCon con =
+                  if legacy_structural then IfaceDataAltWithProof else IfaceOpaqueOrdinaryAltWithProof
+              | isNativeIndexedOrdinaryCon con = IfaceIndexedOrdinaryAltWithProof
+              | isNativeIndexedDiagonalCon con = IfaceIndexedDiagonalAltWithProof
+              | dataConSourceArity con > 0 = IfaceIndexedFieldsAltWithProof
+              | null (dataConExTyCoVars con) = IfaceIndexedDataAltWithProof
+              | otherwise = IfaceIndexedExistentialAltWithProof
+        in IfaceAlt (iface_con (getName con))
+             (map (mkIfLclName . getOccFS) bs) (toIfaceExpr rhs)
+      _ -> pprPanic "toIfaceAlt: invalid indexed constructor proof binder" (ppr alt)
+  | isNativeIndexDataAlt con bs
+  = case splitAt (dataConRepArity con) bs of
+      (fields, [cv]) | all isNativeOpaqueValueId fields && isCoVar cv && isLocalId cv ->
+        let iface_con | dataConTyCon con == boolTyCon = IfaceDataAlt (getName con)
+                      | dataConHasPromotedRetainedSiblings con =
+                          IfaceRetainedSiblingsAltWithProof (getName con)
+                        -- See Note [Versioning retained sibling evidence].
+                      | otherwise = IfaceDataAltWithProof (getName con)
+        in IfaceAlt iface_con (map (mkIfLclName . getOccFS) bs) (toIfaceExpr rhs)
+      _ -> pprPanic "toIfaceAlt: invalid native constructor proof binder" (ppr alt)
+  -- See Note [Native constructor evidence in interfaces] in GHC.IfaceToCore.
+toIfaceAltWith _ (Alt c bs r) = IfaceAlt (toIfaceCon c) (map (mkIfLclName . getOccFS) bs) (toIfaceExpr r)
 
 ---------------------
 toIfaceCon :: AltCon -> IfaceConAlt
@@ -690,12 +867,86 @@ toIfaceApp (Var v) as
             tup_args  = map toIfaceExpr val_args
             tc        = dataConTyCon dc
 
-        _ -> mkIfaceApps (toIfaceVar v) as
+        _ -> mkIfaceApps (idType v) (toIfaceVar v) as
 
-toIfaceApp e as = mkIfaceApps (toIfaceExpr e) as
+toIfaceApp e as = mkIfaceApps (exprType e) (toIfaceExpr e) as
 
-mkIfaceApps :: IfaceExpr -> [CoreExpr] -> IfaceExpr
-mkIfaceApps f as = foldl' (\f a -> IfaceApp f (toIfaceExpr a)) f as
+{- Note [Vacuous retained applications in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A vacuous invisible binder accepts an ordinary argument, such as the call
+that supplies a TypeRep value. Older readers require a supported index at
+an invisible retained application. On export, cast a vacuous function to
+its visible form before applying an argument that has no index. The visible
+form is an ordinary Many arrow with the same domain and result.
+
+This uses the existing representational visibility coercion. It preserves
+runtime demand and the checked domain. Older readers can load and inline
+the result without a new wire feature. A genuinely dependent application
+still uses the retained index encoding. See Note [Retained function
+visibility] in GHC.Core.TyCo.Rep.
+-}
+
+mkIfaceApps :: Type -> IfaceExpr -> [CoreExpr] -> IfaceExpr
+mkIfaceApps _ iface [] = iface
+-- See Note [Vacuous retained applications in interfaces].
+mkIfaceApps ty iface (arg : rest)
+  | not (isTyCoArg arg)
+  , DepFunTy vis b body <- coreFullView ty
+  , isInvisibleDepFunFlag vis
+  , isVacuousRetainedBinder b body
+  , Nothing <- retainedArgIndex arg
+  = let co = mkDepFunCoWithVis vis DepFunVisible b MRefl (mkRepReflCo body)
+        apply = IfaceApp (IfaceCast iface (toIfaceCoercion co)) (toIfaceExpr arg)
+    in mkIfaceApps body apply rest
+mkIfaceApps ty iface (arg : rest)
+  | DepDictTy binder _ <- coreFullView ty
+  = case arg of
+      Var dict | isNativeClassDictionaryId dict, idType dict `eqType` idType binder ->
+        mkIfaceApps (applyTypeToArgs ty [arg])
+          (IfaceDictApp iface (mkIfLclName (occNameFS (getOccName dict)))) rest
+      _ -> pprPanic "mkIfaceApps: invalid scoped dictionary application" (ppr arg)
+mkIfaceApps ty iface (arg : rest)
+  = mkIfaceApps result (IfaceApp iface encoded) rest
+  where
+    result = case coreFullView ty of
+      FunTy { ft_res = body } -> body
+      _ -> applyTypeToArgs ty [arg]
+    encoded | not (isTyCoArg arg), DepFunTy{} <- coreFullView ty
+            = toIfaceRetainedOperand arg
+            | otherwise = toIfaceExpr arg
+
+-- | Mark the capabilities that the reader needs for this index.
+-- See Note [Retained scalar operands in interfaces].
+toIfaceRetainedOperand :: CoreExpr -> IfaceExpr
+toIfaceRetainedOperand arg
+  | containsRetainedNaturalLiteral arg = IfaceRetainedNaturalArg encoded_char
+  | otherwise                          = encoded_char
+  where
+    encoded_char
+      | containsRetainedCharLiteral arg = IfaceRetainedCharArg encoded_operand
+      | otherwise                       = encoded_operand
+    encoded_operand
+      | containsGeneralIndexedConOperand arg = IfaceIndexedConArg IfaceGeneralIndexedCon encoded_family
+      | containsIndexedConOperand arg        = IfaceIndexedConArg IfaceSimpleIndexedCon encoded_family
+      | otherwise                            = encoded_family
+    encoded_family
+      | containsRetainedDataFamilyConOperand arg = IfaceIndexedConArg IfaceDataFamilyCon encoded
+      | otherwise                               = encoded
+    encoded = toIfaceExpr arg
+
+{- Note [Retained scalar operands in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Ordinary Char and Natural literals and their DataKinds indices use the
+existing wire formats. A boxed literal in a retained application or proof
+scrutinee also needs the reader to recover its index. A reader without this support
+can decode the literal but cannot compute the type of the retained
+application.
+
+Mark the operand so the writer records the required capability in the
+header. Character, natural, and indexed constructor operands can require
+more than one capability. When ordinary code uses a literal, or when the writer
+omits the unfolding, the file needs no new capability.
+-}
 
 ---------------------
 toIfaceVar :: Id -> IfaceExpr

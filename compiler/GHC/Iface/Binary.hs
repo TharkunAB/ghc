@@ -18,6 +18,7 @@ module GHC.Iface.Binary (
         TraceBinIFace(..),
         getIfaceWithExtFields,
         putIfaceWithExtFields,
+        sourceTableLocations,
         getWithUserData,
         putWithUserData,
 
@@ -51,7 +52,10 @@ import GHC.Unit.Module.ModIface
 import GHC.Platform.Profile
 import GHC.Platform
 import GHC.Settings.Constants
-import GHC.Iface.Type (IfaceType(..), getIfaceType, putIfaceType, ifaceTypeSharedByte)
+import GHC.Iface.Ext.Fields ( readFieldWith, writeFieldWith, deleteField )
+import GHC.Iface.Syntax (IfaceDecl(..))
+import GHC.Iface.Type (IfaceType(..),
+                       getIfaceType, putIfaceType, ifaceTypeSharedByte)
 
 import GHC.Data.FastMutInt
 import GHC.Data.Maybe( orElse )
@@ -111,8 +115,8 @@ instance Outputable CompressionIFace where
   ppr = text . show
 
 -- | Read an interface file header, checking the magic number, version, and
--- way. Returns the hash of the source file and a BinHandle which points at the
--- start of the rest of the interface file data.
+-- way. Returns a BinHandle which points at the start of the rest of the
+-- interface file data.
 readBinIfaceHeader
   :: Profile
   -> NameCache
@@ -161,7 +165,7 @@ readBinIfaceHeader profile _name_cache checkHiWay traceBinIFace hi_path = do
     when (checkHiWay == CheckHiWay) $
         errorOnMismatch "mismatched interface file profile tag" tag check_tag
 
-    pure bh
+    return bh
 
 -- | Read an interface file.
 --
@@ -175,10 +179,7 @@ readBinIface
   -> IO ModIface
 readBinIface profile name_cache checkHiWay traceBinIface hi_path = do
     bh <- readBinIfaceHeader profile name_cache checkHiWay traceBinIface hi_path
-
-    mod_iface <- getIfaceWithExtFields name_cache bh
-
-    return $ mod_iface
+    getIfaceWithExtFields name_cache bh
 
 
 getIfaceWithExtFields :: NameCache -> ReadBinHandle -> IO ModIface
@@ -191,11 +192,21 @@ getIfaceWithExtFields name_cache bh = do
 
   seekBinReaderRel bh extFields_p_rel
   extFields <- get bh
+  stored <- readFieldWith sourceTableField (getWithUserData name_cache) extFields
+  let located_iface = case stored of
+        Nothing -> mod_iface
+        Just entries ->
+          let locations = mkOccEnv (entries :: [(OccName, [BinSrcSpan])])
+              restore (fp, decl@IfaceAxiom{ifName = name})
+                | Just locs <- lookupOccEnv locations (nameOccName name)
+                = (fp, decl { ifAxSourceSpans = map unBinSrcSpan locs })
+              restore other = other
+          in set_mi_decls (map restore (mi_decls mod_iface)) mod_iface
   -- Store the 'ModIface' byte array, so that we can avoid serialisation if
   -- the 'ModIface' isn't modified.
   -- See Note [Sharing of ModIface]
   modIfaceBinData <- freezeBinHandle bh start
-  pure $ mod_iface
+  pure $ located_iface
     & set_mi_ext_fields extFields
     & set_mi_hi_bytes (FullIfaceBinHandle $ Strict.Just modIfaceBinData)
 
@@ -251,21 +262,14 @@ writeBinIface :: Profile -> TraceBinIFace -> CompressionIFace -> FilePath -> Mod
 writeBinIface profile traceBinIface compressionLevel hi_path mod_iface = do
     case traceBinIface of
       QuietBinIFace -> pure ()
-      TraceBinIFace printer -> do
+      TraceBinIFace printer ->
         printer (text "writeBinIface compression level:" <+> ppr compressionLevel)
 
     bh <- openBinMem initBinMemSize
-    let platform = profilePlatform profile
-    put_ bh (binaryInterfaceMagic platform)
-
-    -- The version, profile tag, and source hash go next
+    put_ bh (binaryInterfaceMagic (profilePlatform profile))
     put_ bh (show hiVersion)
-    let tag = profileBuildTag profile
-    put_  bh tag
-
+    put_ bh (profileBuildTag profile)
     putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface
-
-    -- And send the result to the file
     writeBinMem bh hi_path
 
 -- | Puts the 'ModIface' to the 'WriteBinHandle'.
@@ -277,9 +281,41 @@ putIfaceWithExtFields :: TraceBinIFace -> CompressionIFace -> WriteBinHandle -> 
 putIfaceWithExtFields traceBinIface compressionLevel bh mod_iface =
   case mi_hi_bytes mod_iface of
     FullIfaceBinHandle Strict.Nothing -> do
-      forwardPutRel_ bh (\_ -> put_ bh (mi_ext_fields mod_iface)) $ do
+      let fields = mi_ext_fields mod_iface
+      fields' <- case sourceTableLocations (mi_decls mod_iface) of
+        []   -> pure (deleteField sourceTableField fields)
+        locs -> writeFieldWith sourceTableField
+                    (\h -> putWithUserData QuietBinIFace NormalCompression h locs) fields
+      forwardPutRel_ bh (\_ -> put_ bh fields') $
         putWithUserData traceBinIface compressionLevel bh mod_iface
-    FullIfaceBinHandle (Strict.Just binData) -> putFullBinData bh binData
+    FullIfaceBinHandle (Strict.Just binData) ->
+      putFullBinData bh binData
+
+{- Note [Source table locations in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A source table supplies a checked equation for each constructor clause.
+Keep its producer location for diagnostics in a separately compiled client.
+Source coordinates do not affect type equality. IfaceAxiom's Binary instance
+therefore excludes ifAxSourceSpans from the declaration and its ABI hash.
+Store them in an optional field keyed by the local axiom name, in branch order.
+This also keeps the interface format compatible with compilers without this
+field. Use the ordinary interface dictionary within the field to share file
+names as recorded in the source spans.
+
+Include these locations in the full interface hash. This allows the producer
+to rewrite its interface when a clause moves, even with -fno-write-if-self-recomp.
+A client still checks the unchanged ABI of the equations. See addFingerprints
+in GHC.Iface.Recomp.
+-}
+
+sourceTableField :: String
+sourceTableField = "ghc.source-table-locations.v1"
+
+-- | Collect locations from the interface declarations, which are in OccName order.
+sourceTableLocations :: [(a, IfaceDecl)] -> [(OccName, [BinSrcSpan])]
+sourceTableLocations decls =
+    [ (nameOccName name, map BinSrcSpan spans)
+    | (_, IfaceAxiom{ifName = name, ifAxSourceSpans = spans}) <- decls, not (null spans) ]
 
 -- | Put a piece of data with an initialised `UserData` field. This
 -- is necessary if you want to serialise Names or FastStrings.

@@ -34,7 +34,7 @@ import GHC.Types.UnresolvedImport ( isGeneratedImport )
 import GHC.Types.FieldLabel
 import GHC.Types.Avail            ( Avails )
 import GHC.Types.Id               ( isDataConId_maybe )
-import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTyThing_maybe, getName )
+import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTyThing_maybe, getName, isSystemName )
 import GHC.Types.Name.Env         ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv )
 import GHC.Types.Name.Reader      ( RecFieldInfo(..), WithUserRdr(..) )
 import GHC.Types.SrcLoc
@@ -707,6 +707,8 @@ instance ToHie (LocatedA HsWrapper) where
           [toHie (L osp a), toHie (L osp b)]
         (WpFun _mult_co arg_wrap res_wrap _arg_ty _res_ty) -> concatM $
           [toHie (L osp arg_wrap), toHie (L osp res_wrap)]
+        (WpRetainedFun _ _ w) -> toHie (L osp w)
+        (WpExistsPack _ _)  -> pure []
         (WpEvLam a) ->
           toHie $ C (EvidenceVarBind EvWrapperBind (mkScope osp) (getRealSpanA osp))
                 $ L osp a
@@ -755,6 +757,7 @@ instance HiePass p => HasType (LocatedA (HsExpr (GhcPass p))) where
       computeType e = case e of
         HsApp{} -> Nothing
         HsAppType{} -> Nothing
+        HsAppRetained{} -> Nothing
         NegApp{} -> Nothing
         HsPar _ e -> computeLType e
         ExplicitTuple{} -> Nothing
@@ -1033,6 +1036,8 @@ instance (Data (HsModifier (GhcPass p)), HiePass p) => ToHie (PScoped (LocatedA 
                   wrap = cpt_wrap ext
                   evscope = mkScope ospan `combineScopes` scope `combineScopes` pscope
                  in concatM [ toHie $ EvBindContext scope rsp $ L ospan ev_binds
+                            , concatM [toHie $ EvBindContext scope rsp $ L ospan bs
+                                      | (_, bs) <- cpt_ordered_binds ext]
                             , toHie $ L ospan wrap
                             , toHie $ map (C (EvidenceVarBind EvPatternBind evscope rsp)
                                           . L ospan) ev_vars
@@ -1088,6 +1093,7 @@ instance (Data (HsModifier (GhcPass p)), HiePass p) => ToHie (PScoped (LocatedA 
               , toHie $ PS rsp scope pscope $ (L ospan pat)
               ]
             ExpansionPat _ p -> [ toHie $ PS rsp scope pscope (L ospan p) ]
+            NativeExistsPat _ _ _ _ p -> [ toHie $ PS rsp scope pscope (L ospan p) ]
     where
       contextify :: a ~ LPat (GhcPass p) => HsConDetails (GhcPass p) a (HsRecFields (GhcPass p) a)
                  -> HsConDetails (GhcPass p) (PScoped a) (RContext (HsRecFields (GhcPass p) (PScoped a)))
@@ -1230,6 +1236,10 @@ instance HiePass p => ToHie (LocatedA (HsExpr (GhcPass p))) where
         [ toHie expr
         , toHie $ TS (ResolvedScopes []) sig
         ]
+      HsAppRetained _ fun arg ->
+        [ toHie fun
+        , toHie arg
+        ]
       OpApp _ a b c ->
         [ toHie a
         , toHie b
@@ -1369,6 +1379,17 @@ instance HiePass p => ToHie (LocatedA (HsExpr (GhcPass p))) where
                , toHie (L mspan w) ]
           ExpandedThingTc (HSE _ e)
             -> [ toHie e ]
+          NativeExistsPack _ _ payload -> [toHie payload]
+          NativeExistsUnpack _ _ _ package body -> [toHie package, toHie body]
+          NativeCaseAlias scrut _ _ _ body
+            -> [ toHie scrut, toHie body ]
+          NativeLetAlias rhs _ value _ _ body ->
+            let binder = nameSrcSpan (varName value)
+                binding = combineSrcSpans binder (getLocA rhs)
+                scope = mkScope (combineSrcSpans binding (getLocA body))
+            in [ toHie $ C (ValBind RegularBind scope (getRealSpan binding))
+                           (L (noAnnSrcSpan binder :: SrcSpanAnnN) value)
+               , toHie rhs, toHie body ]
           ConLikeTc con
             -> [ toHie $ C Use $ L mspan $ conLikeName con ]
           HsTick _ expr
@@ -1761,54 +1782,69 @@ instance ToHie (LocatedA (ConDecl GhcRn)) where
   toHie (L span decl) = concatM $ makeNode decl (locA span) : case decl of
       ConDeclGADT { con_names = names
                   , con_outer_bndrs = L outer_bndrs_loc outer_bndrs
-                  , con_inner_bndrs = inner_bndrs
-                  , con_cxts = cxts
+                  , con_telescope = teles
                   , con_g_args = args
                   , con_res_ty = typ
                   , con_doc = doc} ->
         [ toHie $ C (Decl ConDec $ getRealSpanA span) <$> names
+        , toHie $ case outer_bndrs of
+            HsOuterExplicit{hso_matchability = ma} -> ma
+            HsOuterImplicit{} -> Nothing
         , bindingsOnly $  -- implicit forall
             map (C $ TyVarBind (mkScope outer_bndrs_loc) (ResolvedScopes [sigmaScope]))
                 imp_vars
-        , toHie $ tvScopes (ResolvedScopes [phiScope]) NoScope exp_bndrs
-        , toHie cxts
+        , toHie $ tvScopes (ResolvedScopes [prefixScope]) NoScope exp_bndrs
+        , toHieConTelescope rhsScope teles
         , toHie args
         , toHie typ
         , toHie doc
         ]
         where
           rhsScope = combineScopes argsScope tyScope
-          ctxScope = foldr combineScopes NoScope (map mkScope cxts)
           argsScope = case args of
             PrefixConGADT _ xs -> scaled_args_scope xs
             RecConGADT _ x     -> mkScope x
           tyScope = mkScope typ
-          phiScope = combineScopes ctxScope rhsScope
-          sigmaScope = foldr combineScopes phiScope (map (mkScope . getLoc) exp_bndrs)
+          prefixScope = conTelescopeScope rhsScope teles
+          sigmaScope = foldr combineScopes prefixScope (map (mkScope . getLoc) exp_bndrs)
           imp_vars = case outer_bndrs of
             HsOuterImplicit{hso_ximplicit = imp_vars} -> imp_vars
             HsOuterExplicit{} -> []
           exp_bndrs =
             [ L l (updateHsTyVarBndrFlag Invisible b) | L l b <- hsOuterExplicitBndrs outer_bndrs ]
-            ++ concatMap hsForAllTelescopeBndrs (gadtArgTelescopes inner_bndrs)
-      ConDeclH98 { con_name = name, con_ex_tvs = qvars
-                 , con_mb_cxt = ctx, con_args = dets
+      ConDeclH98 { con_name = name, con_telescope = teles
+                 , con_args = dets
                  , con_doc = doc} ->
         [ toHie $ C (Decl ConDec $ getRealSpan (locA span)) name
-        , toHie $ tvScopes (ResolvedScopes []) rhsScope qvars
-        , toHie ctx
+        , toHieConTelescope (h98_args_scope dets) teles
         , toHie dets
         , toHie doc
         ]
-        where
-          rhsScope = combineScopes ctxScope argsScope
-          ctxScope = maybe NoScope mkScope ctx
-          argsScope = case dets of
-            PrefixCon _ xs -> scaled_args_scope xs
-            InfixCon _ a b -> scaled_args_scope [a, b]
-            RecCon _ x     -> mkScope x
     where scaled_args_scope :: [HsConDeclField GhcRn] -> Scope
           scaled_args_scope = foldr combineScopes NoScope . map (mkScope . cdf_type)
+          h98_args_scope (PrefixCon _ xs) = scaled_args_scope xs
+          h98_args_scope (InfixCon _ a b) = scaled_args_scope [a,b]
+          h98_args_scope (RecCon _ fields) = mkScope fields
+
+-- | Extend a constructor's body scope with its ordered prefix nodes.
+conTelescopeScope :: Scope -> [LHsGadtTelescope GhcRn] -> Scope
+conTelescopeScope = foldl' (\scope node -> combineScopes scope (mkScope node))
+
+-- | Visit each context and annotation before the binders that follow it.
+-- See Note [Constructor telescope contexts] in GHC.Hs.Decls.
+-- See Note [Forall metadata scopes in HIE].
+toHieConTelescope :: Scope -> [LHsGadtTelescope GhcRn] -> HieM [HieAST Type]
+toHieConTelescope _ [] = pure []
+toHieConTelescope body_scope (L span node : rest) = concatM $
+  makeNodeA node span : case node of
+    HsGadtForAll _ tele ->
+      [ toHie (hsf_matchability tele)
+      , toHie $ tvScopes (ResolvedScopes [conTelescopeScope body_scope rest])
+                  NoScope (hsForAllTelescopeBndrs tele)
+      , toHieConTelescope body_scope rest
+      ]
+    HsGadtContext ctxt -> [toHie ctxt, toHieConTelescope body_scope rest]
+    HsGadtPar _ -> [toHieConTelescope body_scope rest]
 
 instance ToHie (LocatedA [LocatedA (HsConDeclRecField GhcRn)]) where
   toHie (L span decls) = concatM $
@@ -1899,7 +1935,7 @@ instance HiePass p => ToHie (SigContext (LocatedA (Sig (GhcPass p)))) where
 
 instance ToHie (TScoped (LocatedA (HsSigType GhcRn))) where
   toHie (TS tsc (L span t@HsSig{sig_bndrs=bndrs,sig_body=body})) = concatM $ makeNodeA t span :
-      [ toHie (TVS tsc (mkScope span) bndrs)
+      [ toHie (TVS tsc (mkScope body) bndrs)
       , toHie body
       ]
 
@@ -1907,18 +1943,61 @@ instance ToHie (TScoped (LocatedA (HsSigType GhcRn))) where
 instance Data flag => ToHie (TVScoped (HsOuterTyVarBndrs flag GhcRn)) where
   toHie (TVS tsc sc bndrs) = case bndrs of
     HsOuterImplicit xs -> bindingsOnly $ map (C $ TyVarBind sc tsc) xs
-    HsOuterExplicit _ xs -> toHie $ tvScopes tsc sc xs
+    HsOuterExplicit _ ma xs -> concatM
+      -- See Note [Forall metadata scopes in HIE].
+      [ toHie ma
+      , toHie $ tvScopes tsc NoScope xs
+      , bindingsOnly [C (TyVarBind sc (ResolvedScopes [])) name
+                     | name <- hsLTyVarNames xs]
+      ]
 
 toHieForAllTele ::  HsForAllTelescope GhcRn -> SrcSpan -> HieM [HieAST Type]
-toHieForAllTele (HsForAllVis { hsf_vis_bndrs = bndrs }) loc =
-  toHie $ tvScopes (ResolvedScopes []) (mkScope loc) bndrs
-toHieForAllTele (HsForAllInvis { hsf_invis_bndrs = bndrs }) loc =
-  toHie $ tvScopes (ResolvedScopes []) (mkScope loc) bndrs
+-- See Note [Forall metadata scopes in HIE].
+toHieForAllTele (HsForAllVis { hsf_matchability = ma, hsf_vis_bndrs = bndrs }) loc =
+  concatM [toHie ma, toHie $ tvScopes (ResolvedScopes [mkScope loc]) NoScope bndrs]
+toHieForAllTele (HsForAllInvis { hsf_matchability = ma, hsf_invis_bndrs = bndrs }) loc =
+  concatM [toHie ma, toHie $ tvScopes (ResolvedScopes [mkScope loc]) NoScope bndrs]
+
+{- Note [Forall metadata scopes in HIE]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The source annotation follows the forall separator, but it is outside the
+scope of every binder in that group. Keep two separate scope components:
+the later binder kinds in the same group, and the following prefix and body.
+Do not combine them into one source span across the annotation.
+
+Walk constructor prefix nodes in source order. An earlier context cannot
+refer to a later binder. A later annotation can refer to an earlier binder.
+Use only the remaining nodes and the constructor body for each group's
+following scope. Visit each annotation before recording the group's binders.
+
+Outer signature binders can also have an UnresolvedScope over their
+definitions. Keep that scope on the binder-kind context. Add a separate
+TyVarBind context for the signature body. HIE combines the scopes from both
+contexts. This retains the unresolved scope without joining the binder kinds
+to the body across the annotation. Use the body span, not the whole signature,
+for this additional local scope.
+-}
+
+-- | Record a retained binder as a value binding and visit its domain type.
+toHieRetainedBndr :: Scope -> LHsTyVarBndr () GhcRn -> HieM [HieAST Type]
+toHieRetainedBndr sc (L span bndr) =
+  concatM $ makeNodeA bndr span : (name' ++ kind')
+  where
+    name' = case hsBndrVar bndr of
+      HsBndrWildCard _ -> []
+      HsBndrVar _ var -> [toHie $ C (ValBind RegularBind sc Nothing) var]
+    kind' = case hsBndrKind bndr of
+      HsBndrNoKind _ -> []
+      HsBndrKind _ ty -> [toHie ty]
 
 instance ToHie (LocatedA (HsType GhcRn)) where
   toHie (L span t) = concatM $ makeNode t (locA span) : case t of
       HsForAllTy _ tele body ->
         [ toHieForAllTele tele (getLocA body)
+        , toHie body
+        ]
+      HsForEachTy _ bndrs body ->
+        [ concatM $ map (toHieRetainedBndr (mkScope body)) bndrs
         , toHie body
         ]
       HsQualTy _ ctx body ->
@@ -1982,6 +2061,20 @@ instance ToHie (LocatedA (HsType GhcRn)) where
       HsTyLit _ _ -> []
       HsWildCardTy _ -> []
       HsStarTy _ -> []
+      XHsType (HsTypeExistsRn _ binder body) ->
+        [ toHie $ tvScopes (ResolvedScopes [mkScope (getLocA body)]) NoScope [binder]
+        , toHie body
+        ]
+      XHsType (HsTypeLambdaQuoteRn binders body) ->
+        [ concatM [ concatM $
+                      [ toHie $ C (TyVarBind (mkScope body) (ResolvedScopes [])) ln
+                      | Just ln <- [hsLTyVarLocName binder]
+                      , not (isSystemName (unLoc ln)) ] ++
+                      [ toHie k
+                      | L _ (HsTvb _ _ _ (HsBndrKind _ k)) <- [binder] ]
+                  | binder <- binders ]
+        , toHie body
+        ]
       XHsType _ -> []
 
 instance (Data (HsModifierOf ty (GhcPass p)), ToHie ty) => ToHie (LocatedA (HsModifierOf ty (GhcPass p))) where

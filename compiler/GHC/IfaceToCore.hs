@@ -17,7 +17,7 @@ module GHC.IfaceToCore (
         tcIfaceDefaults,
         typecheckIfacesForMerging,
         typecheckIfaceForInstantiate,
-        tcIfaceDecl, tcIfaceDecls,
+        tcIfaceDecl, tcIfaceDecls, tcIfaceDeclsFromIface,
         tcIfaceInst, tcIfaceFamInst, tcIfaceRules,
         tcIfaceAnnotations, tcIfaceCompleteMatches,
         tcIfaceExpr,    -- Desired by HERMIT (#7683)
@@ -35,7 +35,7 @@ import GHC.ByteCode.Types
 import GHC.Driver.Session
 import GHC.Driver.Config.Core.Lint ( initLintConfig )
 
-import GHC.Builtin.WiredIn.TypeLits(typeNatCoAxiomRules)
+import GHC.Builtin.CoercionRules (builtInCoAxiomRules)
 import GHC.Builtin.WiredIn.Types
 
 import GHC.Iface.Syntax
@@ -66,11 +66,20 @@ import GHC.Core.Utils
 import GHC.Core.Unfold( calcUnfoldingGuidance )
 import GHC.Core.Unfold.Make
 import GHC.Core.Lint
+import GHC.Core.Rules (canShareRetainedSpecRule)
 import GHC.Core.Make
 import GHC.Core.Class
 import GHC.Core.TyCon
+import GHC.Core.TyCon.Set
 import GHC.Core.ConLike
 import GHC.Core.DataCon
+import GHC.Core.Dependent
+  ( hasExistentialExpr, hasNativeDepFunType, hasNativeDependentExprRhs
+  , hasNativeDependentUnfolding, hasScopedDictionaryExpr, hasScopedDictionaryType
+  , isRetainedVanillaDefaultMethod, hasRetainedRuleHead, supportsLocalUserRule
+  , supportsErasedUserRule, supportsImportedErasedRule, supportsImportedUserRule
+  , supportsNativeDepFunUnfolding, supportsNativeUserUnfolding )
+import GHC.Core.Predicate ( mkNomEqPred )
 import GHC.Core.Opt.OccurAnal ( occurAnalyseBndrsAndExpr )
 import GHC.Core.Ppr
 
@@ -90,6 +99,7 @@ import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
 
 import GHC.Data.Bag
+import GHC.Data.List.SetOps (hasNoDups)
 import GHC.Data.Maybe
 import GHC.Data.FastString
 
@@ -223,7 +233,7 @@ typecheckIface iface
                 -- Typecheck the decls.  This is done lazily, so that the knot-tying
                 -- within this single module works out right.  It's the callers
                 -- job to make sure the knot is tied.
-        ; names_w_things <- tcIfaceDecls ignore_prags (mi_decls iface)
+        ; names_w_things <- tcIfaceDeclsFromIface ignore_prags iface
         ; let type_env = mkNameEnv names_w_things
 
                 -- Now do those rules, instances and annotations
@@ -455,8 +465,9 @@ typecheckIfacesForMerging mod ifaces tc_env_vars =
                        | decl <- decls
                        , case decl of
                             IfaceId { ifIdDetails = IfDFunId } -> False -- exclude DFuns
+                            IfaceId { ifIdDetails = IfSourceDFunId{} } -> False
                             _ -> True ]
-        decl_envs = map (mk_decl_env . map snd . mi_decls) ifaces
+        decl_envs = map (mk_decl_env . map snd . ifaceDeclsForTc) ifaces
                         :: [OccEnv IfaceDecl]
         decl_env = foldl' mergeIfaceDecls emptyOccEnv decl_envs
                         ::  OccEnv IfaceDecl
@@ -473,7 +484,7 @@ typecheckIfacesForMerging mod ifaces tc_env_vars =
         -- See Note [Resolving never-exported Names] in GHC.IfaceToCore
         type_env <- fixM $ \type_env ->
             setImplicitEnvM type_env $ do
-                decls <- tcIfaceDecls ignore_prags (mi_decls iface)
+                decls <- tcIfaceDeclsFromIface ignore_prags iface
                 return (mkNameEnv decls)
         -- But note that we use this type_env to typecheck references to DFun
         -- in 'IfaceInst'
@@ -516,7 +527,7 @@ typecheckIfaceForInstantiate nsubst iface
     -- See Note [Resolving never-exported Names] in GHC.IfaceToCore
     type_env <- fixM $ \type_env ->
         setImplicitEnvM type_env $ do
-            decls     <- tcIfaceDecls ignore_prags (mi_decls iface)
+            decls     <- tcIfaceDeclsFromIface ignore_prags iface
             return (mkNameEnv decls)
     -- See Note [rnIfaceNeverExported]
     setImplicitEnvM type_env $ do
@@ -711,11 +722,14 @@ tc_iface_decl :: Maybe Class  -- ^ For associated type/data family declarations
               -> IfaceDecl
               -> IfL TyThing
 tc_iface_decl _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
-                                       ifIdDetails = details, ifIdInfo = info})
+                                       ifIdDetails = raw_details, ifIdInfo = info,
+                                       ifIdSourceProofRules = deps })
   = do  { ty <- tcIfaceType iface_type
-        ; details <- tcIdDetails name ty details
+        ; details <- tcIdDetails name ty raw_details
         ; info <- tcIdInfo ignore_prags TopLevel name ty info
-        ; return (AnId (mkGlobalId details name ty info)) }
+        ; rules <- tcIfaceSourceProofRules deps
+        ; let checked_info = if null rules then info else setSourceProofRuleInfo info rules
+        ; return (AnId (mkGlobalId details name ty checked_info)) }
 
 tc_iface_decl _ _
   (IfaceData {ifName = tc_name,
@@ -728,16 +742,33 @@ tc_iface_decl _ _
               ifCtxt = ctxt, ifGadtSyntax = gadt_syn,
               ifCons = rdr_cons,
               ifParent = mb_parent })
-  = do { kind' <- tcIfaceType kind
+  = do { let has_retained = case rdr_cons of
+                              IfDataTyCon _ cons -> any (not . null . ifConArgBinders) cons
+                              IfNewTyCon _ con   -> not (null (ifConArgBinders con))
+                              _                  -> False
+       ; when has_retained $
+           unless (null ctxt && case mb_parent of { IfNoParent -> True; _ -> False }) $
+             failIfM (text "Invalid retained constructor fields in interface:"
+                       <+> ppr tc_name
+                       $$ text "Expected an ordinary data parent with an empty context.")
+       ; kind' <- tcIfaceType kind
+       ; shape <- tcIfaceDataDomainShape binders ctxt mb_parent rdr_cons
        ; tycon <- fixM $ \ tycon -> do
                { cons <- tcIfaceDataCons tc_name tycon rdr_cons
                ; bindIfaceTyConBinders_AT binders $ \ binders' ->
             do { res_kind' <- tcIfaceType res_kind
+               ; when has_retained $ unless (res_kind' `eqType` liftedTypeKind) $
+                   failIfM (text "Invalid retained constructor fields in interface:"
+                             <+> ppr tc_name $$ text "The parent result kind must be Type.")
+               ; when has_retained $ unless (kind' `eqType` mkTyConKind binders' res_kind') $
+                   failIfM (text "Invalid retained constructor fields in interface:"
+                             <+> ppr tc_name $$ text "The parent kind and its binders disagree.")
                ; stupid_theta <- tcIfaceCtxt ctxt
                ; parent' <- tc_parent tc_name mb_parent
-               ; return (mkAlgTyCon tc_name kind' binders' nb_eta_binders res_kind'
+               ; return (setTyConNativeDomainShape
+                         (mkAlgTyCon tc_name kind' binders' nb_eta_binders res_kind'
                                     roles cType stupid_theta
-                                    cons parent' gadt_syn) } }
+                                    cons parent' gadt_syn) shape) } }
        ; traceIf (text "tcIfaceDecl4" <+> ppr tycon)
        ; return (ATyCon tycon) }
   where
@@ -756,15 +787,28 @@ tc_iface_decl _ _
                  ifKind = kind,
                  ifRoles = roles,
                  ifSynRhs = rhs_ty,
+                 ifSynSourceProofRules = proof_rules,
                  ifBinders = binders,
                  ifResKind = res_kind })
    = do { kind' <- tcIfaceType kind
         ; bindIfaceTyConBinders_AT binders $ \ binders' ->
      do { res_kind' <- tcIfaceType res_kind     -- Note [Synonym kind loop]
-        ; rhs      <- forkM (mk_doc tc_name) $
-                      tcIfaceType rhs_ty
-        ; let tycon = buildSynTyCon tc_name kind' binders' res_kind' roles rhs
-        ; return (ATyCon tycon) } }
+        ; rhs      <- forkM (mk_doc tc_name) $ do
+            { rhs <- tcIfaceType rhs_ty
+            ; case rhs of
+                TyConApp target [] ->
+                  -- See Note [Imported matchability prefixes].
+                  checkImportedMatchabilityPrefix target
+                    (tyConKind target `eqType` res_kind')
+                _ -> return ()
+            ; return rhs }
+        ; shape <- if null binders
+                   then NativeSynonymDomain <$> tcIfaceDomainShape rhs_ty
+                   else return NativeUnknownDomain
+        ; let tycon = setTyConNativeDomainShape
+                        (buildSynTyCon tc_name kind' binders' res_kind' roles rhs) shape
+        ; deps <- tcIfaceSourceProofRules proof_rules
+        ; return (ATyCon (setSynTyConSourceProofRules tycon deps)) } }
    where
      mk_doc n = text "Type synonym" <+> ppr n
 
@@ -791,11 +835,21 @@ tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
        = do { tc_rep_name <- newTyConRepName tc_name
             ; return (DataFamilyTyCon tc_rep_name) }
      tc_fam_flav _ IfaceOpenTypeFamilyTyCon = return OpenTypeFamilyTyCon
-     tc_fam_flav _ (IfaceClosedTypeFamilyTyCon ctf) = ClosedTypeFamilyTyCon <$>
+     tc_fam_flav _ IfaceConstrainedTypeFamilyTyCon =
+       return ConstrainedTypeFamilyTyCon
+     tc_fam_flav local (IfaceClosedTypeFamilyTyCon ctf) = ClosedTypeFamilyTyCon <$>
        case ctf of
         IfaceClosedTyFamTyCon mb_ax_name_branches ->
          do { ax <- traverse (tcIfaceBranchedAxiom . fst) mb_ax_name_branches
             ; return (CTF ax) }
+        IfaceScopedClosedTyFamTyCon owner is_sum (ax_name, _) -> do
+            when (isNothing (nameModule_maybe owner)
+                  || nameModule_maybe owner /= nameModule_maybe local
+                  || (owner == local && not is_sum))
+              (failIfM (text "Invalid lexical scope for a retained-sum family:" <+> ppr local))
+            CTF_Scoped owner is_sum <$> tcIfaceBranchedAxiom ax_name
+        IfaceLambdaClosedTyFamTyCon (ax_name, _) ->
+            CTF_Scoped local False <$> tcIfaceBranchedAxiom ax_name
         IfaceAbstractClosedTyFamTyCon -> return CTF_Abstract
         IfaceBuiltInClosedTyFamTyCon ->
           pprPanic "tc_iface_decl" $
@@ -893,7 +947,8 @@ tc_iface_decl _parent ignore_prags
    mk_op_doc op_name op_ty = text "Class op" <+> sep [ppr op_name, ppr op_ty]
 
 tc_iface_decl _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
-                              , ifAxBranches = branches, ifRole = role })
+                              , ifAxBranches = branches, ifAxSourceSpans = spans
+                              , ifAxSourceProofRules = deps, ifRole = role })
   = do { tc_tycon    <- tcIfaceTyCon tc
        -- Must be done lazily, because axioms are forced when checking
        -- for family instance consistency, and the RHS may mention
@@ -902,8 +957,10 @@ tc_iface_decl _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
        -- e.g. type instance F Int = ToBeDefined
        -- See #13803
        ; tc_branches <- forkM (text "Axiom branches" <+> ppr tc_name)
-                      $ tc_ax_branches branches
-       ; let axiom = mkBranchedCoAxiom role tc_name tc_tycon tc_branches
+                      $ tc_ax_branches spans branches
+       ; rules <- traverse (traverse tcIfaceSourceProofRules) deps
+       ; let axiom = (mkBranchedCoAxiom role tc_name tc_tycon tc_branches)
+                      { co_ax_source_proof_rules = rules }
        ; return (ACoAxiom axiom) }
 
 tc_iface_decl _ _ (IfacePatSyn{ ifName = name
@@ -999,11 +1056,51 @@ mk_top_id (IfLclTopBndr raw_name iface_type info details) = do
    let new_id = mkGlobalId details' name ty info'
    return new_id
 
+-- | Read declarations, omitting optional templates outside the supported subset.
+tcIfaceDeclsFromIface :: Bool -> ModIface -> IfL [(Name, TyThing)]
+tcIfaceDeclsFromIface ignore_prags iface =
+  tcIfaceDecls ignore_prags (ifaceDeclsForTc iface)
+
 tcIfaceDecls :: Bool
           -> [(Fingerprint, IfaceDecl)]
           -> IfL [(Name,TyThing)]
 tcIfaceDecls ignore_prags ver_decls
    = concatMapM (tc_iface_decl_fingerprint ignore_prags) ver_decls
+
+-- | Remove optional erased package templates before exposing IdInfo.
+-- See Note [Erased package unfoldings] and
+-- Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
+ifaceDeclsForTc :: ModIface -> [(Fingerprint, IfaceDecl)]
+ifaceDeclsForTc iface
+  | mi_has_existential iface
+  = [(fingerprint, prune (mi_has_depfun_unfolding iface) decl)
+    | (fingerprint, decl) <- mi_decls iface]
+  | otherwise = mi_decls iface
+  where
+    prune allow_depfun decl@IfaceId { ifType = ty, ifIdInfo = info }
+      = decl { ifIdInfo = filter (keep (allow_depfun || not (hasIfaceDepFunType ty))) info }
+    prune _ decl = decl
+
+    keep allow_stable_user (HsUnfold _ (IfCoreUnfold src _ _ rhs))
+      | RetainedUserSrc <- src = True
+      | allow_stable_user, isStableUserSource src = True
+      | otherwise = isCompulsorySource src || not (hasIfacePackageExpr rhs)
+    keep _ _ = True
+
+{- Note [Erased package unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The retained optimizer can process Pack and Unpack. An optional template
+with these expressions can cross an interface when its top-level binding
+has the RetainedUserSrc tag. The tag selects that optimizer in a client.
+Check the expression forms, types and scope before using the template.
+Check nested unfolding templates in their own thunks.
+
+Check the serialized syntax only when the interface records an
+existential construct. This leaves ordinary interface loading unchanged
+and keeps the typed unfolding lazy. See Note [Lazily checking Unfoldings].
+Keep mandatory templates. Restricted SimpleOpt must expand them before
+the driver checks whether the result can enter optimization.
+-}
 
 tc_iface_decl_fingerprint :: Bool                    -- Don't load pragmas into the decl pool
           -> (Fingerprint, IfaceDecl)
@@ -1024,7 +1121,7 @@ tc_iface_decl_fingerprint ignore_prags (_version, decl)
         -- which includes its nameParent.
 
         ; thing <- forkM doc $ do { bumpDeclStats main_name
-                                  ; tcIfaceDecl ignore_prags decl }
+                                  ; tc_iface_decl Nothing ignore_prags decl }
 
         -- Populate the type environment with the implicitTyThings too.
         --
@@ -1110,11 +1207,16 @@ tc_fd (tvs1, tvs2) = do { tvs1' <- mapM tcIfaceTyVar tvs1
                         ; tvs2' <- mapM tcIfaceTyVar tvs2
                         ; return (tvs1', tvs2') }
 
-tc_ax_branches :: [IfaceAxBranch] -> IfL [CoAxBranch]
-tc_ax_branches if_branches = mapM tc_ax_branch if_branches
+tc_ax_branches :: [SrcSpan] -> [IfaceAxBranch] -> IfL [CoAxBranch]
+tc_ax_branches spans branches = do
+    this_mod <- getIfModule
+    let fallback = mkGeneralSrcSpan (fsLit "module " `appendFS` moduleNameFS (moduleName this_mod))
+        locs | not (null spans), equalLength spans branches = spans
+             | otherwise = repeat fallback
+    zipWithM tc_ax_branch locs branches
 
-tc_ax_branch :: IfaceAxBranch -> IfL CoAxBranch
-tc_ax_branch (IfaceAxBranch { ifaxbTyVars = tv_bndrs
+tc_ax_branch :: SrcSpan -> IfaceAxBranch -> IfL CoAxBranch
+tc_ax_branch loc (IfaceAxBranch { ifaxbTyVars = tv_bndrs
                             , ifaxbEtaTyVars = eta_tv_bndrs
                             , ifaxbCoVars = cv_bndrs
                             , ifaxbLHS = lhs, ifaxbRHS = rhs
@@ -1126,9 +1228,6 @@ tc_ax_branch (IfaceAxBranch { ifaxbTyVars = tv_bndrs
     { tc_lhs   <- tcIfaceAppArgs lhs
     ; tc_rhs   <- tcIfaceType rhs
     ; eta_tvs  <- bindIfaceTyVars eta_tv_bndrs return
-    ; this_mod <- getIfModule
-    ; let loc = mkGeneralSrcSpan (fsLit "module " `appendFS`
-                                  moduleNameFS (moduleName this_mod))
     ; return (CoAxBranch { cab_loc      = loc
                          , cab_tvs      = binderVars tvs
                          , cab_eta_tvs  = eta_tvs
@@ -1151,7 +1250,7 @@ tcIfaceDataCons tycon_name tycon if_cons
                        (isFixedRuntimeRepKind $ tyConResKind tycon)
                        type_data
                        data_cons }
-        IfNewTyCon con
+        IfNewTyCon _ con
           -> do  { data_con  <- tc_con_decl con
                  ; mkNewTyConRhs tycon_name tycon data_con }
   where
@@ -1163,37 +1262,154 @@ tcIfaceDataCons tycon_name tycon if_cons
                          ifConUnivTvs = univ_bndrs,
                          ifConExTCvs = ex_bndrs,
                          ifConUserTvBinders = user_bndrs,
-                         ifConName = dc_name,
+                         ifConName = dc_name, ifConWrapper = has_wrapper,
+                         ifConArgBinders = arg_binders,
+                         ifConRetainedFlags = retained_flags,
                          ifConCtxt = ctxt, ifConEqSpec = spec,
                          ifConArgTys = args, ifConFields = lbl_names,
                          ifConStricts = if_stricts,
-                         ifConSrcStricts = if_src_stricts})
-     = bindIfaceForAllBndrs user_bndrs $ \ if_user_tvs ->
+                         ifConSrcStricts = if_src_stricts,
+                         ifConSourceOrder = source_order})
+     = do { let terminal_order = legacyConOrder source_order
+                context_only = terminal_order == gadtTrailingContextOnly
+                late_count = max 0 terminal_order
+                ordered_type_groups = case source_order of
+                  OrderedConArgs groups -> orderedConTypeGroups groups
+                  LegacyConOrder _ -> []
+                ordered_late_count = late_count + sum (map snd ordered_type_groups)
+                valid_order_wrapper = has_wrapper /= type_data
+                admissible_order
+                  | context_only = not (null ctxt) && (ordinary_data || type_data) &&
+                                   all type_binder ex_bndrs
+                  | otherwise = late_count > 0 && late_count <= length user_bndrs && null ex_bndrs
+          ; case source_order of
+              LegacyConOrder _ -> pure ()
+              OrderedConArgs groups ->
+                let valid_group = case groups of
+                      ConTypeArgs initial : rest ->
+                        initial >= 0 && all positive rest &&
+                        initial + ordered_late_count == length user_bndrs &&
+                        sum [n | ConContextArgs n <- rest] == length ctxt &&
+                        sum [n | ConValueArgs n <- rest] == length args &&
+                        (any non_field (drop 1 (dropWhile non_field rest)) ||
+                         leading_context_order rest)
+                      _ -> False
+                    positive (ConTypeArgs n) = n > 0
+                    positive (ConContextArgs n) = n > 0
+                    positive (ConValueArgs n) = n > 0
+                    non_field ConValueArgs{} = False
+                    non_field _ = True
+                    leading_context_order (ConContextArgs{} : _) =
+                      any ((== 0) . fst) ordered_type_groups
+                    leading_context_order _ = False
+                    ordered_newtype = case if_cons of
+                      IfNewTyCon {} -> args `lengthIs` 1 && null ex_bndrs && null ctxt && null spec
+                      _             -> False
+                in unless (valid_group && all type_binder ex_bndrs &&
+                           (ordinary_data || ordered_newtype || type_data) &&
+                           valid_order_wrapper &&
+                           null arg_binders && null lbl_names) $
+                     failIfM (text "Invalid interior constructor group in interface:" <+> ppr dc_name)
+          ; when (terminal_order /= 0) $
+              unless (admissible_order && valid_order_wrapper &&
+                      not (null args) &&
+                      null arg_binders && null spec &&
+                      null lbl_names) $
+                failIfM (text "Invalid terminal constructor foralls in interface:" <+> ppr dc_name)
+          ; unless (null arg_binders) $
+              check_retained_shape dc_name has_wrapper arg_binders args univ_bndrs user_bndrs
+                ex_bndrs spec ctxt lbl_names if_stricts if_src_stricts
+          ; bindIfaceForAllBndrs user_bndrs $ \ if_user_tvs ->
        let user_tvs = [Bndr tv (ifaceForAllTyFlag vis) | Bndr tv vis <- if_user_tvs] in
        bindDataConBinders   univ_bndrs $ \ univ_tvs ->
        bindDataConBinders   ex_bndrs   $ \ ex_tvs  ->
      do { traceIf (text "Start interface-file tc_con_decl" <+> ppr dc_name)
+        ; unless (null arg_binders) $
+            forM_ [(kind, tv) | (IfaceTvBndr (_, kind), tv) <- zip (univ_bndrs ++ ex_bndrs) (univ_tvs ++ ex_tvs)] $
+              \(kind, tv) -> do
+              { declared_kind <- tcIfaceType kind
+              ; unless (declared_kind `eqType` varType tv) $
+                  failIfM (text "Invalid retained constructor fields in interface:"
+                            <+> ppr dc_name
+                            $$ text "Universal and user binder kinds disagree:" <+> ppr tv) }
+
+        ; let (early, late) = splitAt (length user_tvs - ordered_late_count) user_tvs
+              late_vars = mkVarSet (binderVars late)
+              trailing_context = context_only ||
+                (late_count /= 0 && all (isSpecifiedForAllTyFlag . binderFlag) late)
+              check_prefix_scope tys = when (ordered_late_count /= 0) $
+                unless (disjointVarSet late_vars (tyCoVarsOfTypes tys)) $
+                  failIfM (text "Invalid terminal constructor binder scope:" <+> ppr dc_name)
+        ; case source_order of
+            OrderedConArgs _ ->
+              unless (valid_type_groups late ordered_type_groups &&
+                      late_vars `subVarSet` mkVarSet (univ_tvs ++ ex_tvs)) $
+                failIfM (text "Invalid interior constructor binder scope:" <+> ppr dc_name)
+            LegacyConOrder _ -> pure ()
+        ; when (late_count /= 0) $
+            unless ((all isVisibleForAllTyBinder late || (trailing_context && not (null ctxt))) &&
+                    late_vars `subVarSet` mkVarSet univ_tvs) $
+              failIfM (text "Invalid terminal constructor binder scope:" <+> ppr dc_name)
 
         -- Read the context and argument types, but lazily for two reasons
         -- (a) to avoid looking tugging on a recursive use of
         --     the type itself, which is knot-tied
         -- (b) to avoid faulting in the component types unless
         --     they are really needed
-        ; ~(eq_spec, theta, arg_tys, stricts) <- forkM (mk_doc dc_name) $
-             do { eq_spec <- tcIfaceEqSpec spec
-                ; theta   <- tcIfaceCtxt ctxt
+        ; ~(eq_spec, theta, retained_binders, arg_tys, stricts) <- forkM (mk_doc dc_name) $
+             do { theta <- tcIfaceCtxt ctxt
+                ; when (type_data && (terminal_order /= 0 || is_ordered source_order)) $
+                    unless (all isEqClassPred theta) $
+                      failIfM (text "Invalid type data constructor context in interface:" <+> ppr dc_name)
+                ; unless (null arg_binders || validRetainedConTheta theta) $
+                    failIfM (text "Invalid retained constructor context in interface:" <+> ppr dc_name)
+                -- A predicate or field can refer to this TyCon. Check its
+                -- scope in the same lazy computation that reads the type.
+                ; let prefix_theta = if trailing_context then [] else theta
+                ; when (terminal_order /= 0) $
+                    check_prefix_scope (map (varType . binderVar) early ++ prefix_theta)
                 -- This fixes #13710.  The enclosing lazy thunk gets
                 -- forced when typechecking record wildcard pattern
                 -- matching (it's not completely clear why this
                 -- tuple is needed), which causes trouble if one of
                 -- the argument types was recursively defined.
                 -- See also Note [Tying the knot]
-                ; arg_tys <- forkM (mk_doc dc_name <+> text "arg_tys")
-                           $ mapM (\(w, ty) -> mkScaled <$> tcIfaceType w <*> tcIfaceType ty) args
+                ; ~(retained_binders, arg_tys) <-
+                    if null arg_binders
+                    then do { arg_tys <- forkM (mk_doc dc_name <+> text "arg_tys") $
+                                  do { tys <- mapM (\(w, ty) -> mkScaled <$> tcIfaceType w <*> tcIfaceType ty) args
+                                     ; case source_order of
+                                         OrderedConArgs groups ->
+                                           unless (orderedConArgsHaveScope groups user_tvs theta tys) $
+                                             failIfM (text "Invalid interior constructor binder scope:" <+> ppr dc_name)
+                                         _ -> check_prefix_scope (concatMap (\(Scaled mult ty) -> [mult, ty]) tys)
+                                     ; return tys }
+                            ; return ([], arg_tys) }
+                    else tc_retained_args dc_name retained_flags
+                                          emptyVarSet arg_binders args
+                ; when (not (null arg_binders) && not (null lbl_names)) $
+                    do { checkAcyclicIfaceTypes (ppr dc_name)
+                           (map varType univ_tvs ++ map scaledThing arg_tys)
+                       ; let valid = all (\tv -> varType tv `eqType` liftedTypeKind) univ_tvs
+                                  && validRetainedRecordFields retained_binders arg_tys
+                       ; unless valid $
+                           failIfM (text "Invalid retained record fields in interface:" <+> ppr dc_name) }
+                ; let retained_fields = [field | Just field <- retained_binders]
+                ; eq_spec <- extendIfaceIdEnv retained_fields $ tcIfaceEqSpec spec
+                ; when (not (null arg_binders) && not (null spec)) $
+                    do { checkAcyclicIfaceTypes (ppr dc_name)
+                           (map varType univ_tvs ++ map varType retained_fields ++ map eqSpecType eq_spec)
+                       ; let valid = validRetainedResultEqSpec univ_tvs retained_fields eq_spec
+                                  && all (\f -> isNativeClosedIndexType (varType f)
+                                             || isNativeIndexedGadtFieldDomain (varType f))
+                                         retained_fields
+                                  && all (not . anyFreeVarsOfType isId . scaledMult) arg_tys
+                       ; unless valid $
+                           failIfM (text "Invalid retained result field in interface:" <+> ppr dc_name) }
                 ; stricts <- mapM tc_strict if_stricts
                         -- The IfBang field can mention
                         -- the type itself; hence inside forkM
-                ; return (eq_spec, theta, arg_tys, stricts) }
+                ; return (eq_spec, theta, retained_binders, arg_tys, stricts) }
 
         -- Remember, tycon is the representation tycon
         ; let orig_res_ty = mkFamilyTyConApp tycon
@@ -1207,7 +1423,9 @@ tcIfaceDataCons tycon_name tycon if_cons
             -- it'll use these to guide the construction of a worker.
             -- See Note [Bangs on imported data constructors] in GHC.Types.Id.Make
 
-        ; con <- buildDataCon (pprPanic "tcIfaceDataCons: FamInstEnvs" (ppr dc_name))
+        ; con <- buildDataConWithTelescope source_order
+                       (if null arg_binders then [] else retained_binders)
+                       (pprPanic "tcIfaceDataCons: FamInstEnvs" (ppr dc_name))
                        bang_opts
                        dc_name is_infix prom_rep_name
                        (map src_strict if_src_stricts)
@@ -1216,7 +1434,144 @@ tcIfaceDataCons tycon_name tycon if_cons
                        eq_spec theta
                        arg_tys orig_res_ty tycon tag_map
         ; traceIf (text "Done interface-file tc_con_decl" <+> ppr dc_name)
-        ; return con }
+        ; return con } }
+
+    ordinary_data = case if_cons of
+                      IfDataTyCon False _ -> True
+                      _                   -> False
+
+    type_data = case if_cons of
+                  IfDataTyCon True _ -> True
+                  _                  -> False
+
+    is_ordered OrderedConArgs{} = True
+    is_ordered LegacyConOrder{} = False
+
+    type_binder (IfaceTvBndr _) = True
+    type_binder _              = False
+
+    -- Each written forall is either required or invisible. The existing
+    -- binder flags also store each invisible binder's specificity.
+    valid_type_groups bs [] = null bs
+    valid_type_groups bs ((_, n) : rest) =
+      let (here, later) = splitAt n bs
+      in (all isVisibleForAllTyBinder here ||
+          all isInvisibleForAllTyBinder here) &&
+         valid_type_groups later rest
+
+    -- Check only interface syntax here. The parent TyCon is still knot-tied.
+    check_retained_shape name wrapper binders args univs users exs spec ctxt fields bangs src_bangs
+      = unless (binders `equalLength` args
+                && hasNoDups names
+                && all type_binder univs && all type_binder exs
+                && all (\(Bndr b _) -> type_binder b) users
+                && hasNoDups univ_names
+                && hasNoDups ex_names
+                && all (`notElem` univ_names) ex_names
+                && hasNoDups user_names
+                && valid_result && valid_record
+                && ((null ctxt && null exs)
+                    || (not wrapper && null spec && user_names == univ_names ++ ex_names))
+                && ordinary_data
+                && (null bangs || bangs `equalLength` args)
+                && all lazy_bang bangs
+                && (null src_bangs || src_bangs `equalLength` args)
+                && all lazy_src_bang src_bangs) $
+          failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
+                   $$ text "Expected aligned distinct field names and a lazy data constructor."
+                   $$ text "User type binders must match the universal and existential binders outside the result equalities.")
+      where
+        names = [n | Just n <- binders]
+        univ_names = map ifaceBndrName univs
+        ex_names = map ifaceBndrName exs
+        user_names = [ifaceBndrName b | Bndr b _ <- users]
+        valid_record
+          | null fields = True
+          | IfDataTyCon False [_] <- if_cons
+          , Just _ : rest@(_ : _) <- binders
+          = all isNothing rest && not wrapper && user_names == univ_names && null exs && null ctxt
+            && null spec && fields `equalLength` args && hasNoDups fields
+          | otherwise = False
+        valid_result
+          | wrapper
+          , not (null spec)
+          = null exs && null ctxt
+            && pairs `equalLength` spec
+            && hasNoDups result_names
+            && length names == length (nub result_fields)
+            && all (`elem` univ_names) result_names
+            && all (`elem` names) result_fields
+            && matching_users (filter (`notElem` result_names) univ_names)
+          | otherwise
+          = not wrapper && null spec && matching_users (univ_names ++ ex_names)
+          where
+            pairs = [(lhs, retained) | (lhs, rhs) <- spec
+                                     , Just retained <- [fields_in_result rhs]]
+            result_names = map fst pairs
+            result_fields = concatMap snd pairs
+        fields_in_result (IfaceTermVar field) = Just [field]
+        fields_in_result (IfaceTyConApp tc args)
+          | ifaceTyConIsPromoted (ifaceTyConInfo tc) == IsPromoted
+          , Just fields <- concat <$> traverse field_arg (appArgsIfaceTypesForAllTyFlags args)
+          , not (null fields)
+          = Just fields
+        fields_in_result _ = Nothing
+        field_arg (IfaceTermVar field, Required) = Just [field]
+        field_arg (IfaceTermVar _, _)            = Nothing
+        field_arg (_, Required)                  = Nothing
+        field_arg _                              = Just []
+        matching_users expected = expected `equalLength` user_names && all (`elem` expected) user_names
+        lazy_bang IfNoBang = True
+        lazy_bang _        = False
+        lazy_src_bang (IfSrcBang unpack strict)
+          = not (isSrcUnpacked unpack) && not (isSrcStrict strict)
+
+    -- Allocate the lexical binder skeleton before forcing its domain.
+    -- See Note [Importing retained constructor field telescopes].
+    tc_retained_args _ _ _ [] [] = return ([], [])
+    tc_retained_args name flags scope (mb : bs) ((w, ty) : args)
+      = do { ~(mult, field_ty) <- forkM (mk_doc name <+> text "retained field") $
+               do { when (isJust mb) $
+                      do { mult_shape <- tcIfaceDomainShape w
+                         ; domain_shape <- tcIfaceDomainShape ty
+                         ; precheckIfaceNativeDomain
+                             (text "Invalid retained constructor fields in interface:" <+> ppr name)
+                             (nativeDomainShapePossible NativeManyMultUse mult_shape
+                              && nativeDomainShapePossible NativeRetainedUse domain_shape) }
+                  ; mult <- tcIfaceType w
+                  ; field_ty <- tcIfaceType ty
+                  ; checkAcyclicIfaceTypes (ppr name) [mult, field_ty]
+                  ; let valid = typeKind mult `eqType` multiplicityTy
+                             && isLiftedTypeKind (typeKind field_ty)
+                             && not (anyFreeVarsOfType
+                                  (\v -> isId v && not (v `elemVarSet` scope)) field_ty)
+                             && case mb of
+                                  Nothing -> True
+                                  Just _  -> isManyTy mult && isNativeRetainedGadtFieldType field_ty
+                  ; unless valid $
+                      failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
+                               $$ text "Expected a lifted field with only earlier runtime indices;"
+                               $$ text "a named field must have multiplicity Many and a supported retained domain.")
+                  ; return (mult, field_ty) }
+           ; case mb of
+               Nothing -> do
+                 { ~(rest, fields) <- tc_retained_args name flags scope bs args
+                 ; return (Nothing : rest, Scaled mult field_ty : fields) }
+               Just fs -> do
+                 { field_name <- newIfaceName (mkVarOccFS (ifLclNameFS fs))
+                 ; let (vis, flags') = case flags of
+                         f : more -> (f, more)
+                         []       -> (DepFunVisible, [])
+                       mark_field = (if isInferredDepFunFlag vis then markInferredRetainedBinder else id)
+                                  . (if isInvisibleDepFunFlag vis then markInvisibleRetainedBinder else id)
+                       field = mark_field (mkLocalId field_name ManyTy field_ty)
+                 ; ~(rest, fields) <- extendIfaceIdEnv [field] $
+                     tc_retained_args name flags' (extendVarSet scope field) bs args
+                 ; return (Just field : rest, Scaled mult field_ty : fields) } }
+    tc_retained_args name _ _ _ _
+      = failIfM (text "Invalid retained constructor fields in interface:" <+> ppr name
+                   $$ text "Field names and argument types are not aligned.")
+
     mk_doc con_name = text "Constructor" <+> ppr con_name
 
     tc_strict :: IfaceBang -> IfL HsImplBang
@@ -1228,6 +1583,40 @@ tcIfaceDataCons tycon_name tycon if_cons
 
     src_strict :: IfaceSrcBang -> HsSrcBang
     src_strict (IfSrcBang unpk bang) = HsSrcBang NoSourceText unpk bang
+
+{- Note [Importing retained constructor field telescopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Allocate retained field Ids from left to right. Their names scope only over
+later field types. Decode each field type in a separate forkM under that
+lexical environment. Keep the Id skeleton independent of the decoded domain.
+Use literal ManyTy for each named Id. Id construction forces multiplicity,
+so using the deferred decoded multiplicity would also force domain validation.
+Validate the encoded multiplicity in the deferred field decoder instead.
+
+This separation is required for recursive interface knots. The parent TyCon
+can expose its nonempty field metadata before a domain is validated. The native
+index-domain checker rejects that metadata before it inspects the fields.
+Self and mutual retained-domain cycles therefore fail instead of recursively
+forcing their own domain validation. Constructor type validation must not run
+when the DataCon skeleton is allocated. See Note [Retained constructor field
+telescopes] in GHC.Core.DataCon.
+
+A named field can bind an eligible opaque function head as well as a scalar.
+Its domain remains independently closed. A later TermAppTy resolves its head
+from this actual lexical Id environment. The complete field-type check still
+rejects every runtime Id outside the earlier-field prefix. Keep these checks
+deferred for recursive function domains too. See Note [Opaque call indices in
+interfaces] in GHC.Iface.Type and Note [Checking native domain shapes] for the
+boundary around each field eligibility result.
+
+The ordinary field decoder keeps its existing lazy boundary. No new field
+name scopes over the constructor result, context, or erased binders. This
+codec alone does not enable source dependent constructor declarations. Retained
+declarations require an ordinary lifted parent. With no existential or
+equality specification, user and universal binders name the same variables.
+Check their names before binding, then check declared kinds after reuse;
+bindDataConBinders alone reuses names without comparing their kinds.
+-}
 
 bindDataConBinders :: [IfaceBndr] -> ([CoreBndr] -> IfL a) -> IfL a
 bindDataConBinders [] thing_inside
@@ -1387,16 +1776,67 @@ tcIfaceRules ignore_prags if_rules
   | otherwise    = mapM tcIfaceRule if_rules
 
 tcIfaceRule :: IfaceRule -> IfL CoreRule
-tcIfaceRule (IfaceRule {ifRuleName = name, ifActivation = act, ifRuleBndrs = bndrs,
+tcIfaceRule iface_rule@IfaceRule{ifRuleName = name, ifActivation = act, ifRuleBndrs = bndrs,
                         ifRuleHead = fn, ifRuleArgs = args, ifRuleRhs = rhs,
-                        ifRuleAuto = auto, ifRuleOrph = orph })
-  = do  { ~(bndrs', args', rhs') <-
+                        ifRuleKind = kind, ifRuleOrph = orph}
+  = do  { this_mod <- getIfModule
+        ; ~(bndrs', args', rhs') <-
                 -- Typecheck the payload lazily, in the hope it'll never be looked at
                 forkM (text "Rule" <+> pprRuleName name) $
                 bindIfaceBndrs bndrs                      $ \ bndrs' ->
                 do { args'  <- mapM tcIfaceExpr args
                    ; rhs'   <- tcIfaceExpr rhs
-                   ; whenGOptM Opt_DoCoreLinting $ do
+                   ; let native = any hasNativeDependentUnfolding (rhs' : args' ++ map varToCoreExpr bndrs')
+                   ; let checked = case kind of
+                           IfaceErasedUserRule | isOrphan orph ->
+                             Just (supportsImportedErasedRule, "Unsupported erased orphan rule shape.")
+                           IfaceAnchoredErasedRule ->
+                             Just (supportsImportedErasedRule, "Unsupported anchored erased rule shape.")
+                           IfaceErasedUserRule -> Just (supportsErasedUserRule, "Unsupported erased user rule shape.")
+                           IfaceRetainedUserRule -> Just (supportsLocalUserRule, "Unsupported retained function rule shape.")
+                           IfaceImportedRetainedRule -> Just (supportsImportedUserRule, "Unsupported imported retained rule shape.")
+                           IfaceRetainedAutoRule -> Just (canShareRetainedSpecRule, "Unsupported retained specialization shape.")
+                           _ -> Nothing
+                   ; case checked of
+                       Just (accepts, shape_error) -> do
+                         let (owner_ok, owner_error) = case kind of
+                               IfaceErasedUserRule | isOrphan orph ->
+                                 (maybe False (/= this_mod) (nameModule_maybe fn),
+                                  "Expected an imported head for the orphan rule.")
+                               IfaceAnchoredErasedRule ->
+                                 (not (isOrphan orph) && maybe False (/= this_mod) (nameModule_maybe fn),
+                                  "Expected a local anchor and an imported rule head.")
+                               IfaceImportedRetainedRule ->
+                                 (maybe False (/= this_mod) (nameModule_maybe fn), "Expected an imported retained rule head.")
+                               _ -> (nameModule_maybe fn == Just this_mod,
+                                     "Expected a rule head defined in this module.")
+                         unless owner_ok $
+                           failIfM (retained_doc $$ text owner_error)
+                         thing <- tcIfaceGlobal fn
+                         fun <- case thing of
+                           AnId id -> pure id
+                           _ -> failIfM (retained_doc $$ text "Expected an identifier at the rule head.")
+                         let rule = mk_rule this_mod bndrs' args' rhs'
+                         let has_evidence = case kind of
+                               IfaceRetainedUserRule -> hasRetainedRuleHead fun
+                               IfaceImportedRetainedRule -> hasRetainedRuleHead fun
+                               _ -> native
+                         unless (has_evidence && accepts fun rule) $
+                           failIfM (retained_doc $$ text shape_error)
+                         dflags <- getDynFlags
+                         case lintRule (initLintConfig dflags []) fun rule of
+                           Nothing -> pure ()
+                           Just errs -> failIfM (retained_doc $$ vcat (bagToList errs))
+                       Nothing -> do
+                         when native $
+                           failIfM (text "Native dependent interface rules are not supported:" <+> pprRuleName name)
+                         when (kind == IfaceUserRule) $ do
+                           head_thing <- tcIfaceGlobal fn
+                           case head_thing of
+                             AnId fun | hasRetainedRuleHead fun ->
+                               failIfM (text "Missing retained function rule evidence:" <+> pprRuleName name)
+                             _ -> pure ()
+                   ; when (isNothing checked) $ whenGOptM Opt_DoCoreLinting $ do
                       { dflags <- getDynFlags
                       ; (_, lcl_env) <- getEnvs
                       ; let in_scope :: [Var]
@@ -1412,25 +1852,31 @@ tcIfaceRule (IfaceRule {ifRuleName = name, ifActivation = act, ifRuleBndrs = bnd
                                                (pprCoreExpr rhs')
                                                (emptyBag, errs) }
                    ; return (bndrs', args', rhs') }
-        ; let mb_tcs = map ifTopFreeName args
-              (bndrs_occ, rhs_occ) = occurAnalyseBndrsAndExpr bndrs' rhs'
+        ; let (bndrs_occ, rhs_occ) = occurAnalyseBndrsAndExpr bndrs' rhs'
                    -- See (OUR1) in Note [OccInfo in unfoldings and rules]
+        ; return (mk_rule this_mod bndrs_occ args' rhs_occ) }
+  where
+    retained_doc = case kind of
+      IfaceAnchoredErasedRule -> text "Invalid anchored erased package rule:" <+> pprRuleName name
+      IfaceErasedUserRule -> text "Invalid erased package rule:" <+> pprRuleName name
+      IfaceRetainedUserRule -> text "Invalid retained function rule:" <+> pprRuleName name
+      IfaceImportedRetainedRule -> text "Invalid imported retained function rule:" <+> pprRuleName name
+      _ -> text "Invalid retained specialization rule:" <+> pprRuleName name
 
-        ; this_mod <- getIfModule
-        ; return (Rule { ru_name   = name
-                       , ru_fn     = fn
-                       , ru_act    = act
-                       , ru_bndrs  = bndrs_occ
-                       , ru_args   = args'
-                       , ru_rhs    = rhs_occ
-                       , ru_rough  = mb_tcs
-                       , ru_origin = this_mod
-                       , ru_orphan = orph
-                       , ru_auto   = auto
-                       , ru_local  = False }) }
+    mk_rule this_mod bndrs' args' rhs' =
+      Rule { ru_name   = name
+           , ru_fn     = fn
+           , ru_act    = act
+           , ru_bndrs  = bndrs'
+           , ru_args   = args'
+           , ru_rhs    = rhs'
+           , ru_rough  = map ifTopFreeName args
+           , ru_origin = this_mod
+           , ru_orphan = orph
+           , ru_auto   = ifRuleAuto iface_rule
+           , ru_local  = False }
               -- ru_local=False: an imported RULE is never for a local Id or, even if
               -- it is (module loop, perhaps) we'll just leave it in the non-local set
-  where
         -- This function *must* mirror exactly what Rules.roughTopNames does
         -- We could have stored the ru_rough field in the iface file
         -- but that would be redundant, I think.
@@ -1505,27 +1951,546 @@ loop. See #19744.
 ************************************************************************
 -}
 
+-- | Derive a scalar declaration view without decoding constructor fields.
+-- See Note [Checking native domain shapes].
+tcIfaceDataDomainShape :: [IfaceTyConBinder] -> IfaceContext -> IfaceTyConParent
+                       -> IfaceConDecls -> IfL NativeDomainShape
+tcIfaceDataDomainShape binders ctxt parent cons
+  | null binders, null ctxt, IfNoParent <- parent
+  , IfDataTyCon False cs <- cons
+  , all ordinary cs
+  = NativeDataDomain <$> mapM field (concatMap ifConArgTys cs)
+  | null binders, null ctxt, IfNoParent <- parent
+  , IfDataTyCon False cs <- cons
+  , all indexed_gadt_con cs
+  = return NativeUnknownDomain
+  | otherwise = return NativeInvalidDomain
+  where
+    ordinary con = null (ifConUnivTvs con) && null (ifConExTCvs con)
+                && null (ifConEqSpec con) && null (ifConCtxt con)
+                && null (ifConArgBinders con)
+    indexed_gadt_con con = null (ifConCtxt con) && null (ifConArgBinders con)
+                        && all type_bndr (ifConExTCvs con)
+                        && all lazy_bang (ifConStricts con)
+                        && length (ifConEqSpec con) <= 1
+    type_bndr (IfaceTvBndr _) = True
+    type_bndr _                 = False
+    lazy_bang IfNoBang = True
+    lazy_bang _        = False
+    field (mult, ty) = (,) <$> tcIfaceDomainShape mult <*> tcIfaceDomainShape ty
+
+-- | Project raw syntax without forcing a decoded Type or a referenced TyCon.
+-- See Note [Checking native domain shapes].
+tcIfaceDomainShape :: IfaceType -> IfL NativeDomainShape
+tcIfaceDomainShape (IfaceTyConApp tc IA_Nil)
+  = NativeTyConDomain <$> forkM (text "Native domain shape") (tcIfaceTyCon tc)
+tcIfaceDomainShape (IfaceTupleTy BoxedTuple NotPromoted IA_Nil)
+  = return (NativeTyConDomain unitTyCon)
+tcIfaceDomainShape (IfaceFunTy FTF_T_T ma mult arg res)
+  = NativeFunctionDomain <$> tcIfaceDomainShape ma
+                         <*> tcIfaceDomainShape mult
+                         <*> tcIfaceDomainShape arg <*> tcIfaceDomainShape res
+tcIfaceDomainShape (IfaceDepFunTy _vis (mult, _, arg) res)
+  = NativePiDomain <$> tcIfaceDomainShape mult
+                   <*> tcIfaceDomainShape arg
+                   <*> tcIfaceDomainShape res
+tcIfaceDomainShape IfaceExistsTy{} = return NativeInvalidDomain
+tcIfaceDomainShape IfaceForAllTy{} = return NativeInvalidDomain
+tcIfaceDomainShape IfaceLitTy{} = return NativeInvalidDomain
+tcIfaceDomainShape _ = return NativeUnknownDomain
+
+-- | Select the existing eligibility policy for a shape precheck.
+data NativeDomainUse = NativeScalarUse | NativeFunctionUse | NativeStructuralFunctionUse
+                     | NativeRetainedUse | NativeOpaqueUse
+                     | NativeFunctionEndpointUse
+                     | NativeFieldMultUse | NativeManyMultUse | NativeUnmatchableUse
+  deriving Eq
+
+-- | Reject known unsupported shapes; True still requires the typed checks.
+-- See Note [Checking native domain shapes].
+nativeDomainShapePossible :: NativeDomainUse -> NativeDomainShape -> Bool
+nativeDomainShapePossible use shape = go emptyTyConSet emptyTyConSet use shape
+  where
+    -- See Note [Opaque native interface values].
+    go seen aliases NativeOpaqueUse (NativeTyConDomain tc)
+      | Just (NativeSynonymDomain rhs) <- tyConNativeDomainShape tc
+      = not (tc `elemTyConSet` aliases)
+        && go seen (extendTyConSet aliases tc) NativeOpaqueUse rhs
+      | otherwise = True
+    go _ _ NativeOpaqueUse _ = True
+    go seen aliases NativeRetainedUse shape
+      = go seen aliases NativeScalarUse shape
+        || go seen aliases NativeStructuralFunctionUse shape
+    go seen aliases mode (NativeTyConDomain tc)
+      | mode == NativeUnmatchableUse, tc == unmatchableDataConTyCon = True
+      | mode == NativeUnmatchableUse, tc == matchableDataConTyCon = False
+      | mode == NativeFieldMultUse || mode == NativeManyMultUse
+      , tc == manyDataConTyCon = True
+      | mode == NativeFieldMultUse, tc == oneDataConTyCon = True
+      | mode == NativeManyMultUse, tc == oneDataConTyCon = False
+      | Just view <- tyConNativeDomainShape tc
+      = case view of
+          NativeSynonymDomain rhs
+            | tc `elemTyConSet` aliases -> False
+            | otherwise -> go seen (extendTyConSet aliases tc) mode rhs
+          NativeDataDomain{}
+            -> data_use mode
+               && (tc `elemTyConSet` seen
+                   || go (extendTyConSet seen tc) emptyTyConSet mode view)
+          _ -> go seen aliases mode view
+      | otherwise = True
+    go _ _ _ NativeUnknownDomain = True
+    go _ _ _ NativeInvalidDomain = False
+    go _ aliases mode (NativePiDomain mult arg res)
+      = function_use mode
+        && go emptyTyConSet aliases NativeFieldMultUse mult
+        && go emptyTyConSet aliases (function_endpoint_use mode) arg
+        && go emptyTyConSet aliases (function_endpoint_use mode) res
+    go seen _ mode (NativeDataDomain fields)
+      = data_use mode && all field fields
+      where
+        field (mult, ty) = go seen emptyTyConSet NativeFieldMultUse mult
+                       && go seen emptyTyConSet field_use ty
+        field_use | mode == NativeScalarUse = NativeRetainedUse
+                  | otherwise = NativeFunctionEndpointUse
+    go seen aliases mode (NativeFunctionDomain ma mult arg res)
+      = function_use mode
+        && go seen aliases NativeUnmatchableUse ma
+        && go seen aliases NativeManyMultUse mult
+        && go emptyTyConSet aliases (function_endpoint_use mode) arg
+        && go emptyTyConSet aliases (function_endpoint_use mode) res
+    go seen aliases mode (NativeSynonymDomain rhs) = go seen aliases mode rhs
+
+    data_use mode = mode == NativeScalarUse || mode == NativeFunctionEndpointUse
+    function_use mode = mode == NativeFunctionUse || mode == NativeStructuralFunctionUse
+    function_endpoint_use NativeFunctionUse = NativeOpaqueUse
+    function_endpoint_use _ = NativeFunctionEndpointUse
+
+-- | Report an early domain rejection without printing unfinished Types.
+-- See Note [Checking native domain shapes].
+precheckIfaceNativeDomain :: SDoc -> Bool -> IfL ()
+precheckIfaceNativeDomain name possible
+  = unless possible $ failIfM (name $$ text "Unsupported retained domain shape.")
+
+{- Note [Checking native domain shapes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Inspect the raw view before coreFullView or constructor-field decoding. Data
+back-edges are valid, but each queued field must pass. Keep a separate active
+synonym stack. Reset it on data edges: Alias = A; data A = MkA Alias is valid.
+An alias-only cycle is not a supported domain.
+
+For a generic Pi, check the raw multiplicity and domain before bindIfaceId.
+Its mkLocalIdOrCoVar call expands aliases to choose an Id or a CoVar. An Id
+precheck alone would reach an alias-only cycle after that expansion had begun.
+Keep the Id precheck and the typed checks after allocation as well.
+
+Fields permit One or Many. Function arrows and retained binders require Many.
+Function arrows require U matchability. Resolve metadata by wired TyCon
+identity, including nullary aliases.
+An algebraic domain can contain a function field. Check each endpoint of
+that field with the function-free algebraic policy. Start a separate data
+visited set for each endpoint. An enclosing data back-edge must not certify
+that endpoint. For a lexical call head, both endpoints can be opaque lifted
+types. The argument to the call must have the declared domain as its kind.
+A raw Pi is not scalar. mkDepFunTyWithVis can convert a vacuous visible Pi
+to an ordinary arrow. A hidden Pi remains retained. Keep the domain projection
+conservative for both flags. Check the multiplicity, argument and result
+before decoding its binder. This rejects recursive structural domains
+through a Pi without forcing their Type knots.
+Applied synonyms and casts remain
+unknown. The precheck must not reject their possible normalization results.
+Leave constraint arrows unknown so that their decoders check scoped indices
+in predicates before the typed domain check rejects the arrow visibility.
+Leave raw variable and call-index forms unknown so that their decoders check
+lexical scope.
+
+True means only that this view cannot reject the domain. Run the existing
+typed predicate afterward, inside the exception boundary. No unchecked
+Type escapes. Keep the Id guards before domain inspection. The raw named-field
+precheck runs before decoding that field; the existing field checks still run
+in their original order. Parent kinds and binder headers must already exist.
+This is not a termination guarantee for those headers or unclassified forms.
+See Note [Native interface domain shapes] in GHC.Core.TyCon.
+-}
+
+{- Note [Opaque native interface values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A runtime index can name an opaque value at any lifted value type. Do not
+traverse its constructors. An Int value does not require the unlifted field
+of I# to be an index. A generic cons head keeps its instantiated field type.
+Core formation also permits generated dependent lambdas over these values.
+Source foreach domains have a separate structural check in GHC.Tc.Gen.HsType.
+
+The raw opaque precheck rejects nullary alias cycles before bindIfaceId can
+expand them. Other raw shapes require the typed lifted-value check. Keep the
+stricter structural and function-endpoint prechecks at their existing callers.
+Opaque identity does not grant native call permission.
+
+Check promoted constructor applications that contain runtime indices against
+their complete structural parent and instantiated fields. Checking each local
+Id alone would permit an Int cons to contain a Bool head. Ordinary promoted
+applications without runtime dependencies keep their existing import path.
+-}
+
 tcIfaceType :: IfaceType -> IfL Type
 tcIfaceType = go
   where
     go (IfaceTyVar n)            = TyVarTy <$> tcIfaceTyVar n
     go (IfaceFreeTyVar n)        = pprPanic "tcIfaceType:IfaceFreeTyVar" (ppr n)
+    go (IfaceFreeTermVar v)
+      = failIfM (text "Cannot import a diagnostic-only retained index:" <+> ppr v)
+    go (IfaceFreeTermAppTy fun _)
+      = failIfM (text "Cannot import a diagnostic-only retained call head:" <+> ppr fun)
+    go (IfaceTermAppTy fun arg)
+      -- See Note [Opaque call indices in interfaces] in GHC.Iface.Type.
+      = do { f <- tcIfaceLclId fun
+           ; checkAcyclicIfaceTypes (ppr fun) [idMult f, varType f]
+           ; case nativeIndexFunctionTys_maybe f of
+               Nothing ->
+                 failIfM (text "Invalid retained call head in interface:" <+> ppr fun
+                          $$ text "Expected a local unrestricted function with lifted argument and result types."
+                          $$ text "Actual type:" <+> ppr (varType f)
+                          $$ text "Actual multiplicity:" <+> ppr (idMult f))
+               Just (domain, _) ->
+                 do { arg' <- go arg
+                    ; unless (typeKind arg' `eqType` domain) $
+                        failIfM (text "Invalid retained call argument in interface for:" <+> ppr fun
+                                 $$ text "Expected kind:" <+> ppr domain
+                                 $$ text "Actual kind:" <+> ppr (typeKind arg'))
+                    ; return (TermAppTy f arg') } }
+    go (IfaceNamedTermVar name)
+      = do { thing <- tcIfaceGlobal name
+           ; case thing of
+               AnId v | isNativeNamedOpaqueFunctionId v -> return (TermVarTy v)
+               _ -> failIfM (text "Invalid named retained callback in interface:" <+> ppr name) }
+    go (IfaceTermVar n)
+      = do { v <- tcIfaceLclId n
+           ; checkAcyclicIfaceTypes (ppr n) [idMult v, varType v]
+           ; unless (isNativeOpaqueValueId v) $
+               failIfM (text "Invalid retained index in interface:" <+> ppr n
+                        $$ text "Expected a local identifier with multiplicity Many"
+                        $$ text "at a lifted value type."
+                        $$ text "Actual type:" <+> ppr (varType v)
+                        $$ text "Actual multiplicity:" <+> ppr (idMult v))
+           ; return (TermVarTy v) }
+    go (IfaceExistsTy flag bndr@(name, _) body)
+      = bindIfaceTyVar bndr $ \tv -> do
+          check_exists_kind name (text "binder kind") (typeKind (varType tv))
+          body' <- go body
+          check_exists_kind name (text "payload") (typeKind body')
+          return (ExistsTy flag tv body')
+    go (IfaceDepDictTy bndr@(_, name, _) body)
+      = bindIfaceId bndr $ \dict -> do
+          unless (isNativeClassDictionaryId dict) $
+            failIfM (text "Invalid scoped dictionary binder in interface:" <+> ppr name)
+          body' <- go body
+          unless (typeKind body' `eqType` liftedTypeKind) $
+            failIfM (text "Expected a lifted scoped dictionary result in interface:" <+> ppr name)
+          return (DepDictTy dict body')
+    go (IfaceClassAppTy method inst (IfaceTermVar dict) (IfaceTermVar arg))
+      = do selector <- tcIfaceExtId method
+           inst' <- go inst
+           dict' <- tcIfaceLclId dict
+           arg' <- tcIfaceLclId arg
+           case nativeClassSelectorIndex (mkApps (Var selector) [Type inst', Var dict', Var arg']) of
+             Just index -> return index
+             Nothing -> failIfM (text "Invalid scoped class selector in interface:" <+> ppr method)
+    go IfaceClassAppTy{}
+      = failIfM (text "Scoped class selector in interface requires two lexical references")
+    go (IfaceDepFunTy vis bndr@(mult, name, domain) body)
+      -- See Note [Retained binders in interfaces].
+      -- See Note [Source retained signatures] in GHC.Tc.Gen.HsType.
+      = do { mult_shape <- tcIfaceDomainShape mult
+           ; domain_shape <- tcIfaceDomainShape domain
+           ; precheckIfaceNativeDomain
+               (text "Invalid retained binder in interface:" <+> ppr name)
+               (nativeDomainShapePossible NativeFieldMultUse mult_shape
+                && nativeDomainShapePossible NativeOpaqueUse domain_shape)
+           ; bindIfaceId bndr $ \ v0 ->
+             let v | isInferredDepFunFlag vis = markInferredRetainedBinder v0
+                   | otherwise                = v0
+                 bind_v = if isInferredDepFunFlag vis then extendIfaceIdEnv [v] else id
+             in bind_v $ do
+               { checkAcyclicIfaceTypes (ppr name) [idMult v, varType v]
+               ; unless (isNativeOpaqueValueId v) $
+                   failIfM (text "Invalid retained binder in interface:" <+> ppr v
+                            $$ text "Expected a local identifier with a valid multiplicity"
+                            $$ text "at a lifted value type."
+                            $$ text "Actual type:" <+> ppr (varType v)
+                            $$ text "Actual multiplicity:" <+> ppr (idMult v))
+               ; body' <- go body
+               ; unless (typeKind body' `eqType` liftedTypeKind) $
+                   failIfM (text "Invalid retained function result in interface for:" <+> ppr v
+                            $$ text "Expected kind Type."
+                            $$ text "Actual kind:" <+> ppr (typeKind body'))
+               ; return (mkDepFunTyWithVis vis v body') } }
     go (IfaceLitTy l)            = LitTy <$> tcIfaceTyLit l
-    go (IfaceFunTy flag w t1 t2) = FunTy flag <$> tcIfaceType w <*> go t1 <*> go t2
+    go (IfaceFunTy flag ma w t1 t2) = FunTy flag <$> go ma <*> go w <*> go t1 <*> go t2
     go (IfaceTupleTy s i tks)    = tcIfaceTupleTy s i tks
     go (IfaceAppTy t ts)
       = do { t'  <- go t
-           ; ts' <- traverse go (appArgsIfaceTypes ts)
-           ; pure (foldl' AppTy t' ts') }
+           ; foldlM (apply_arg (call_operand True t)) t' (appArgsIfaceTypes ts) }
     go (IfaceTyConApp tc tks)
       = do { tc' <- tcIfaceTyCon tc
-           ; tks' <- mapM go (appArgsIfaceTypes tks)
+           ; let args = appArgsIfaceTypes tks
+           ; tks' <- mapM go args
+           ; case (tks, tks') of
+               (IA_Arg _ (IfaceForAllTyFlag vis) _, arg : _) ->
+                 checkImportedMatchabilityPrefix tc' $
+                   case vis of
+                     Inferred -> isMatchabilityArgument arg
+                     _ -> False
+               _ -> return ()
+           ; let has_id = anyFreeVarsOfType isId
+           ; case isPromotedDataCon_maybe tc' of
+               Just con
+                 -- See Note [Runtime arguments of promoted GADT constructors].
+                 | let (_, _, eqs, theta, _, _) = dataConFullSig con
+                       indexed = any has_id tks' && null theta &&
+                                 (not (null eqs) || isNativeIndexedGadtCon con)
+                 , not (null (dataConRepArgBinders con)) || indexed ->
+                   check_iface_retained_args (ppr tc) (tyConKind tc') tks'
+                 | isJust (tyConDataFamCoercion_maybe (dataConTyCon con))
+                 , let (tys, fields) = splitAt (length (dataConUserTyVars con)) tks'
+                 , any has_id fields ->
+                 do { checkAcyclicIfaceTypes (ppr tc) tks'
+                    ; unless (isJust (nativeFamilyPromotedCon_maybe con tys fields)) $
+                        failIfM (text "Invalid retained data family constructor fields in interface:"
+                                 <+> ppr tc) }
+                 | let (tys, fields) = splitAt (length (dataConUnivTyVars con)) tks'
+                 , any has_id fields ->
+                 do { checkAcyclicIfaceTypes (ppr tc) tks'
+                    ; let valid = isJust (nativeIndexDataConTyArgs (mkTyConApp (dataConTyCon con) tys) con)
+                               && nativeIndexArgKinds con tys fields
+                    ; unless valid $
+                        failIfM (text "Invalid retained constructor fields in interface:"
+                                 <+> ppr tc) }
+               _ | any (call_operand False) args ->
+                     check_call_arg_kinds (ppr tc) (tyConKind tc') tks'
+               _ -> return ()
            ; return (mkTyConApp tc' tks') }
-    go (IfaceForAllTy bndr t)
-      = bindIfaceForAllBndr bndr $ \ tv' vis ->
-        ForAllTy (Bndr tv' (ifaceForAllTyFlag vis)) <$> go t
-    go (IfaceCastTy ty co)   = CastTy <$> go ty <*> tcIfaceCo co
+    go (IfaceForAllTy ma bndr t)
+      = do { ma' <- go ma
+           ; checkIfaceForAllMatchability ma'
+           ; bindIfaceForAllBndr bndr $ \ tv' vis ->
+        ForAllTy ma' (Bndr tv' (ifaceForAllTyFlag vis)) <$> go t }
+    go (IfaceCastTy ty co)
+      = do { ty' <- go ty
+           ; co' <- tcIfaceCo co
+           ; case cast_function_head ty' of
+               Just f | isNativeIndexFunctionId f ->
+                 do { checkAcyclicIfaceTypes (ppr f) [ty', coercionLKind co', coercionRKind co']
+                    ; let valid = coercionRole co' == Nominal
+                               && coercionLKind co' `eqType` typeKind ty'
+                               && isJust (nativeIndexCastCo_maybe (SubCo co'))
+                    ; unless valid $
+                        failIfM (text "Invalid retained function-value cast in interface:"
+                                 <+> ppr f)
+                    ; return (mkCastTy ty' co') }
+               _ ->
+                 do { when (call_operand False ty) (check_call_result_cast ty' co')
+                    ; return (CastTy ty' co') } }
     go (IfaceCoercionTy co)  = CoercionTy <$> tcIfaceCo co
+
+    -- Check each cast on a lexical callback, including nested wire casts.
+    cast_function_head (TermVarTy f) = Just f
+    cast_function_head (CastTy ty _) = cast_function_head ty
+    cast_function_head _ = Nothing
+
+    -- A raw ordinary application can expose a native function-value head.
+    -- Check its argument before the smart maker forms TermAppTy.
+    app _ fun@(TermVarTy f) arg
+      = do { checkAcyclicIfaceTypes (ppr f) [varType f, arg]
+           ; case nativeIndexFunctionTys_maybe f of
+               Just (domain, _) | typeKind arg `eqType` domain ->
+                 return (mkAppTy fun arg)
+               _ -> failIfM (text "Invalid retained function-value application in interface:"
+                             <+> ppr f) }
+    app True fun arg
+      = do { checkAcyclicIfaceTypes (ppr fun) [fun, arg]
+           ; case nativeIndexFunctionTypeTys_maybe (typeKind fun) of
+               Just (domain, _) | typeKind arg `eqType` domain ->
+                 return (mkAppTy fun arg)
+               _ -> failIfM (text "A retained call result cannot be applied to this argument in an interface:"
+                             <+> ppr fun <+> ppr arg) }
+    app _ fun@(TyConApp tc _) arg
+      | Just con <- isPromotedDataCon_maybe tc
+      , not (null (dataConRepArgBinders con)) || isNativeIndexedGadtCon con
+      = do { check_iface_retained_args (ppr tc) (typeKind fun) [arg]
+           ; return (mkAppTy fun arg) }
+    app _ fun arg = return (mkAppTy fun arg)
+
+    apply_arg retained fun raw = do { arg <- go raw
+                                    ; when (call_operand False raw) $
+                                        check_call_arg_kinds (ppr fun) (typeKind fun) [arg]
+                                    ; app retained fun arg }
+
+    -- A call can also be encoded by applying a lexical or named term variable.
+    -- Inspect its serialized head without forcing ordinary decoded types.
+    call_operand _ IfaceTermAppTy{} = True
+    call_operand applied IfaceTermVar{} = applied
+    call_operand applied IfaceNamedTermVar{} = applied
+    call_operand applied (IfaceCastTy ty _) = call_operand applied ty
+    call_operand _ (IfaceAppTy fun _) = call_operand True fun
+    call_operand _ _ = False
+
+    -- See Note [Opaque call indices in interfaces] in GHC.Iface.Type.
+    check_call_arg_kinds name = check_iface_arg_kinds name
+      (text "Invalid type application containing a retained call in interface:" <+> name)
+
+    check_call_result_cast ty co = do
+      checkAcyclicIfaceTypes (ppr ty) [ty, coercionLKind co]
+      let call_kind = typeKind ty
+          co_kind = coercionLKind co
+          role = coercionRole co
+      unless (role == Nominal && call_kind `eqType` co_kind) $
+        failIfM (text "Invalid retained call result cast in interface:" <+> ppr ty
+                 $$ text "Expected nominal evidence from kind:" <+> ppr call_kind
+                 $$ text "Actual role:" <+> ppr role
+                 $$ text "Actual left kind:" <+> ppr co_kind)
+
+    -- An interface can encode the same application in one TyConApp or
+    -- append arguments using AppTy. Both forms use the promoted telescope.
+    -- Stop at the end of the supplied arguments, so valid prefixes remain
+    -- valid. Each preceding argument determines the next dependent kind.
+    check_iface_retained_args name = check_iface_arg_kinds name
+      (text "Invalid retained constructor fields in interface:" <+> name)
+    check_iface_arg_kinds name diagnostic kind args
+      = do { checkAcyclicIfaceTypes name (kind : args)
+           ; forM_ (check kind args) $ \reason -> failIfM (diagnostic $$ reason) }
+      where
+        check _ [] = Nothing
+        check kind (arg : rest)
+          | Just (_, binder, _) <- splitPiTy_maybe kind
+          , let expected = piTyBinderType binder
+                actual = typeKind arg
+          = if actual `eqType` expected
+            then check (piResultTy kind arg) rest
+            else Just (text "Expected argument kind:" <+> ppr expected
+                       $$ text "Actual argument kind:" <+> ppr actual)
+          | otherwise = Just (text "The type has no binder for this argument.")
+
+-- | Check a forall annotation before its binder enters scope.
+-- See Note [Forall interface metadata] in GHC.Iface.Type.
+checkIfaceForAllMatchability :: Type -> IfL ()
+checkIfaceForAllMatchability ma
+  = unless (typeKind ma `eqType` matchabilityTy) $
+      failIfM (text "Invalid forall matchability in interface:" <+> ppr ma
+               $$ text "Expected kind Matchability.")
+
+{- Note [Runtime arguments of promoted GADT constructors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+DataKinds gives 'VCons a telescope with an element type a, a tail length n,
+a head of kind a, and a tail of kind Vec a n. The result has kind Vec a (S n).
+The constructor can occur in an exported type with retained values for its
+head and tail. Check them against the promoted telescope, substituting each
+argument before checking the next one. Splitting arguments at the number
+of parent parameters cannot recover the tail length from the result index.
+
+The promoted App constructor has no result equality. Its first field kind
+still depends on an erased existential from the constructor's telescope.
+Use the same argument kind check for this supported existential shape.
+
+This checks an application in a type. Deriving evidence from a case expression
+requires the constructor and fields of the actual scrutinee.
+-}
+
+-- | Check the exact lifted kind after rejecting cyclic synonym expansions.
+check_exists_kind :: IfLclName -> SDoc -> Kind -> IfL ()
+check_exists_kind name part kind = do
+    checkAcyclicIfaceTypes (ppr name) [kind]
+    unless (kind `eqType` liftedTypeKind) $
+      failIfM (text "Existential" <+> part <+> text "must have kind Type:" <+> ppr name)
+
+-- | Reject cyclic type synonym expansions before expanding interface types.
+checkAcyclicIfaceTypes :: SDoc -> [Type] -> IfL ()
+checkAcyclicIfaceTypes name tys =
+    when (any hasCyclicSynonym tys) $
+      failIfM (text "Cyclic type synonym in interface:" <+> name)
+
+-- | Detect cyclic type synonym expansions using a visited 'NameSet'.
+hasCyclicSynonym :: Type -> Bool
+hasCyclicSynonym = go emptyNameSet
+  where
+    go seen (TyConApp tc args)
+      | any (go seen) args = True
+      | Just (tvs, rhs) <- synTyConDefn_maybe tc
+      , args `lengthAtLeast` length tvs
+      = let nm = tyConName tc
+            (syn_args, rest_args) = splitAt (length tvs) args
+        in nm `elemNameSet` seen
+           || go (extendNameSet seen nm) (mkAppTys (substTyWith tvs syn_args rhs) rest_args)
+      | otherwise = False
+    go seen (AppTy f a) = go seen f || go seen a
+    go seen (FunTy _ ma w a r) = go seen ma || go seen w || go seen a || go seen r
+    go seen (ForAllTy ma (Bndr v _) body) = go seen ma || go seen (varType v) || go seen body
+    go seen (DepFunTy _ v body) = go seen (idMult v) || go seen (varType v) || go seen body
+    go seen (DepDictTy d body) = go seen (idMult d) || go seen (varType d) || go seen body
+    go seen (ExistsTy _ v body) = go seen (varType v) || go seen body
+    go seen (CastTy t _) = go seen t
+    go _ _ = False
+
+{- Note [Retained binders in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained binder is a runtime Id, not a TyVar or an erased forall binder.
+bindIfaceId allocates a fresh VarName and Unique. It decodes the domain and
+multiplicity outside the binder scope, then extends the local Id environment
+for the body. Each IfaceTermVar occurrence looks up that same fresh Id.
+
+Check the algebraic index domain and Many multiplicity before decoding the
+body. Check each index occurrence too, since the local Id environment also
+contains ordinary Ids and CoVars. The result must have kind Type, not
+Constraint. Use eqType: isLiftedTypeKind also accepts Constraint. Malformed
+native interface data must fail before construction of a retained type.
+
+Domain validation can force constructor argument types. Keep it within the
+existing deferred declaration decoding. See Note [Positioning of forkM].
+The domain predicate tracks visited TyCons before it follows their fields.
+Thus a recursive Nat domain does not require an infinite field traversal.
+An unfinished field decoder is a separate case. See Note [Checking native
+domain shapes] for the diagnostic boundary around eligibility.
+
+IfaceFreeTermVar preserves an open Id only for diagnostics. It cannot enter
+this decoding path. Boolean branch proof reconstruction is described in
+Note [Native constructor evidence in interfaces]. Module unfolding generation
+remains separately gated.
+-}
+
+{- Note [Imported matchability prefixes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An upgraded provider can add a leading inferred Matchability parameter
+to a type family. An old client still refers to the same family Name.
+For an applied family, check the first recorded argument. A partial
+application can omit trailing arguments.
+
+A bare alias such as @type Saved = K@ has no argument to inspect.
+Its interface records the result kind at the time Saved was compiled.
+Compare that kind with the current kind of K. A polymorphic bare alias
+already has the new telescope. An old monomorphic alias needs a rebuild.
+Keep this comparison in the deferred RHS action. Loading the kind of
+Saved can participate in the import cycle in Note [Synonym kind loop].
+-}
+
+-- | Check a client's view of an imported type constructor's prefix.
+checkImportedMatchabilityPrefix :: TyCon -> Bool -> IfL ()
+checkImportedMatchabilityPrefix tc valid_prefix
+  | not (isWiredInName name) = do
+      owner <- getIfModule
+      when (nameModule name /= owner) $
+        case tyConBinders tc of
+          b : _ | isInferredTyConBinder b
+                , tyVarKind (binderVar b) `eqType` matchabilityTy
+                , not valid_prefix ->
+            failIfM (text "Incompatible interface dependency:" <+> ppr name
+                     $$ text "An inferred matchability argument is missing."
+                     $$ text "Rebuild the module that refers to it:" <+> ppr owner)
+          _ -> return ()
+  | otherwise = return ()
+  where
+    name = tyConName tc
+
+isMatchabilityArgument :: Type -> Bool
+isMatchabilityArgument arg = typeKind arg `eqType` matchabilityTy
 
 tcIfaceTupleTy :: TupleSort -> PromotionFlag -> IfaceAppArgs -> IfL Type
 tcIfaceTupleTy sort is_promoted args
@@ -1565,6 +2530,8 @@ tcIfaceCtxt sts = mapM tcIfaceType sts
 -----------------------------------------
 tcIfaceTyLit :: IfaceTyLit -> IfL TyLit
 tcIfaceTyLit (IfaceNumTyLit n) = return (NumTyLit n)
+tcIfaceTyLit (IfaceIntPrimTyLit n) = return (IntPrimTyLit n)
+tcIfaceTyLit (IfaceWordPrimTyLit n) = return (WordPrimTyLit n)
 tcIfaceTyLit (IfaceStrTyLit n) = return (StrTyLit (getLexicalFastString n))
 tcIfaceTyLit (IfaceCharTyLit n) = return (CharTyLit n)
 
@@ -1584,15 +2551,44 @@ tcIfaceCo = go
 
     go (IfaceReflCo t)           = Refl <$> tcIfaceType t
     go (IfaceGReflCo r t mco)    = GRefl r <$> tcIfaceType t <*> go_mco mco
-    go (IfaceFunCo r w c1 c2)    = mkFunCoNoFTF r <$> go w <*> go c1 <*> go c2
-    go (IfaceTyConAppCo r tc cs) = TyConAppCo r <$> tcIfaceTyCon tc <*> mapM go cs
+    go (IfaceFunCo r ma w c1 c2) = mkFunCoNoFTF r <$> go ma <*> go w <*> go c1 <*> go c2
+    go (IfaceDepFunCo visL visR bndr@(_, name, _) domain body)
+      = do { domain' <- go_mco domain
+           ; case domain' of
+               MRefl -> pure ()
+               MCo delta -> unless (coercionRole delta == Nominal) $
+                 failIfM (text "Invalid retained domain coercion in interface for:" <+> ppr name
+                          $$ text "Expected nominal evidence." $$ ppr delta)
+           ; bindIfaceId bndr $ \ bndr' ->
+        do { body' <- go body
+           ; unless (coercionRole body' /= Nominal || visL `eqDepFunVis` visR) $
+               failIfM (text "Invalid retained function coercion in interface for:" <+> ppr name
+                        $$ text "Nominal evidence requires identical visibilities.")
+           ; return (DepFunCo visL visR bndr' domain' body') } }
+    go (IfaceTermAppCo {})
+      = failIfM (text "Opaque runtime call congruence interfaces are not implemented.")
+    go (IfaceTyConAppCo r tc cs)
+      = do { tc' <- tcIfaceTyCon tc
+           ; cs' <- mapM go cs
+           ; case cs' of
+               co : _ -> checkImportedMatchabilityPrefix tc'
+                           (isMatchabilityArgument (coercionLKind co) &&
+                            isMatchabilityArgument (coercionRKind co))
+               _ -> return ()
+           ; return (TyConAppCo r tc' cs') }
     go (IfaceAppCo c1 c2)        = AppCo <$> go c1 <*> go c2
-    go (IfaceForAllCo tcv visL visR k co)
-      = do { k' <- go_mco k
+    go (IfaceForAllCo tcv visL visR ma k co)
+      = do { ma' <- go ma
+           ; unless (coercionRole ma' == Nominal) $
+               failIfM (text "Invalid forall matchability coercion in interface:"
+                        $$ text "Expected a nominal coercion." $$ ppr ma')
+           ; checkIfaceForAllMatchability (coercionLKind ma')
+           ; checkIfaceForAllMatchability (coercionRKind ma')
+           ; k' <- go_mco k
            ; bindIfaceBndr tcv $ \ tv' ->
         do { co' <- go co
            ; return (ForAllCo { fco_tcv = tv', fco_visL = ifaceForAllTyFlag visL, fco_visR = ifaceForAllTyFlag visR
-                              , fco_kind = k', fco_body = co' }) } }
+                              , fco_ma = ma', fco_kind = k', fco_body = co' }) } }
     go (IfaceCoVarCo n)           = CoVarCo <$> go_var n
     go (IfaceUnivCo p r t1 t2 ds) =
       do { t1' <- tcIfaceType t1; t2' <- tcIfaceType t2
@@ -1613,11 +2609,20 @@ tcIfaceCo = go
                                             <*> go t2
     go (IfaceSelCo d c)          = do { c' <- go c
                                       ; return $ mkSelCo d c' }
-    go (IfaceLRCo lr c)          = LRCo lr  <$> go c
+    go (IfaceLRCo lr c)          = mkLRCo lr <$> go c
     go (IfaceKindCo c)           = KindCo   <$> go c
     go (IfaceSubCo c)            = SubCo    <$> go c
-    go (IfaceAxiomCo ax cos)     = AxiomCo <$> tcIfaceAxiomRule ax
-                                           <*> mapM go cos
+    go (IfaceAxiomCo ax cos)
+      = do { args <- mapM go cos
+           ; rule <- tcIfaceAxiomRule ax args
+           ; case rule of
+               BuiltInRule name _ roles proves
+                 | Just _ <- matchableProjectionDirection name
+                 -> unless (map coercionRole args == roles &&
+                            isJust (proves (map coercionKind args))) $
+                      failIfM (text "Invalid matchable application projection in interface:" <+> ppr name)
+               _ -> return ()
+           ; return (AxiomCo rule args) }
     go (IfaceFreeCoVar c)        = pprPanic "tcIfaceCo:IfaceFreeCoVar" (ppr c)
     go (IfaceHoleCo c)           = pprPanic "tcIfaceCo:IfaceHoleCo"    (ppr c)
 
@@ -1687,6 +2692,63 @@ tcIfaceExpr (IfaceLam (bndr, os) body)
     tcIfaceOneShot IfaceOneShot b = setOneShotLambda b
     tcIfaceOneShot _            b = b
 
+tcIfaceExpr (IfacePack schema witness payload)
+  = do { schema' <- tcIfaceType schema
+       ; witness' <- tcIfaceType witness
+       ; payload' <- tcIfaceExpr payload
+       ; when (isTyCoArg payload') $
+           failIfM (text "An existential Pack payload must be a term in interface.")
+       ; case coreFullView schema' of
+           ExistsTy _ a body
+             | typeKind witness' `eqType` varType a
+             , substTyWith [a] [witness'] body `eqType` exprType payload'
+             -> return (Pack schema' witness' payload')
+           _ -> failIfM (text "Invalid existential Pack in interface.") }
+
+tcIfaceExpr (IfaceUnpack witness@(name, _) value package body)
+  = do { package' <- tcIfaceExpr package
+       ; when (isTyCoArg package') $
+           failIfM (text "An existential package must be a term in interface.")
+       ; case coreFullView (exprType package') of
+           ExistsTy _ a payload_ty ->
+             bindIfaceTyVar witness $ \witness' ->
+             bindIfaceId value $ \value' ->
+             do { checkAcyclicIfaceTypes (ppr name) [varType witness', varType a]
+                ; unless (varType witness' `eqType` varType a) $
+                    failIfM (text "Existential Unpack witness kind differs from its package:" <+> ppr name)
+                ; let mult = idMult value'
+                ; unless (isNonCoVarId value'
+                          && isMultiplicityTy (typeKind mult)
+                          && not (witness' `elemVarSet` tyCoVarsOfType mult)
+                          && substTyWith [a] [mkTyVarTy witness'] payload_ty `eqType` varType value') $
+                    failIfM (text "Invalid existential payload binder in interface.")
+                ; body' <- tcIfaceExpr body
+                ; when (isTyCoArg body') $
+                    failIfM (text "An existential Unpack body must be a term in interface.")
+                ; let result_fvs = tyCoVarsOfType (exprType body')
+                ; when (witness' `elemVarSet` result_fvs || value' `elemVarSet` result_fvs) $
+                    failIfM (text "Existential Unpack binder escapes its scope in interface.")
+                ; return (Unpack witness' value' package' body') }
+           _ -> failIfM (text "Unpack requires an existential package in interface.") }
+
+tcIfaceExpr (IfaceApp fun arg@IfaceIndexedConArg{}) = tcIfaceRetainedApp fun arg
+tcIfaceExpr (IfaceApp fun arg@IfaceRetainedCharArg{}) = tcIfaceRetainedApp fun arg
+tcIfaceExpr (IfaceApp fun arg@IfaceRetainedNaturalArg{}) = tcIfaceRetainedApp fun arg
+tcIfaceExpr (IfaceDictApp fun name)
+  = do { f <- tcIfaceExpr fun
+       ; dict <- tcIfaceLclId name
+       ; case coreFullView (exprType f) of
+           DepDictTy binder _
+             | isNativeClassDictionaryId dict
+             , idType dict `eqType` idType binder -> return (App f (Var dict))
+           _ -> failIfM (text "Invalid scoped dictionary application in interface:" <+> ppr name) }
+
+tcIfaceExpr (IfaceIndexedConArg _ _)
+  = failIfM (text "Indexed constructor operand outside a retained application or proof case.")
+tcIfaceExpr (IfaceRetainedCharArg _)
+  = failIfM (text "Character operand outside a retained application or proof case.")
+tcIfaceExpr (IfaceRetainedNaturalArg _)
+  = failIfM (text "Natural operand outside a retained application or proof case.")
 tcIfaceExpr (IfaceApp fun arg)
   = App <$> tcIfaceExpr fun <*> tcIfaceExpr arg
 
@@ -1696,7 +2758,87 @@ tcIfaceExpr (IfaceECase scrut ty)
        ; return (castBottomExpr scrut' ty') }
 
 tcIfaceExpr (IfaceCase scrut case_bndr alts)  = do
-    scrut' <- tcIfaceExpr scrut
+    -- See Note [Native index alias evidence in interfaces].
+    forM_ alts $ \ (IfaceAlt con names _) -> case con of
+      IfaceDefaultAlt | not (null names) ->
+        failIfM (text "An ordinary interface DEFAULT alternative cannot bind names:" <+> ppr names)
+      IfaceDefaultAltWithProof -> case names of
+        [proof] | proof /= case_bndr -> return ()
+        _ -> failIfM (text "An index alias alternative requires one proof distinct from its case binder:" <+> ppr names)
+      _ -> return ()
+    (tagged_literal, tagged_operand, scrut') <- tcIfaceRetainedOperand scrut
+    -- Resolve each constructor once, before inspecting its representation arity.
+    let scrut_index = exprToNativeCaseIndex scrut'
+        constructed = maybe False isNativeConstructedGadtIndex scrut_index
+        is_indexed IfaceDataFamilyCon = False
+        is_indexed _ = True
+        indexed_data_alt ordinary valid_shape name names = do
+          dc <- tcIfaceDataCon name
+          unless (isNativeIndexedDataAlt dc names && hasNoDups (case_bndr : names)
+                  && isNativeIndexedOrdinaryCon dc == ordinary
+                  && (not constructed || any is_indexed tagged_operand) && valid_shape dc) $
+            failIfM (text "Invalid indexed constructor proof in interface alternative:"
+                     <+> ppr dc <+> ppr names)
+          return (DataAlt dc)
+        native_data_alt siblings name names = do
+          dc <- tcIfaceDataCon name
+          let structural = isNativeIndexDataAlt dc names ||
+                (isNativeOpaqueOrdinaryCon dc && isNativeIndexedDataAlt dc names && hasNoDups names
+                 && isNativeIndexType (exprType scrut'))
+          unless (structural && dataConHasPromotedRetainedSiblings dc == siblings) $
+            failIfM (text "Missing or unsupported constructor proof in interface alternative:" <+> ppr dc <+> ppr names)
+          return (DataAlt dc)
+    resolved <- forM alts $ \ (IfaceAlt con names rhs) -> do
+      alt_con <- case con of
+        IfaceDefaultAlt   -> return DEFAULT
+        IfaceDefaultAltWithProof -> return DEFAULT
+        IfaceLitAlt lit   -> LitAlt <$> tcIfaceLit lit
+        IfaceDataAlt name -> do
+          dc <- tcIfaceDataCon name
+          when (isNativeIndexedDataAlt dc names) $
+            failIfM (text "Missing indexed constructor proof tag:" <+> ppr dc)
+          return (DataAlt dc)
+        IfaceIndexedDataAltWithProof name ->
+          indexed_data_alt False
+            (\dc -> dataConSourceArity dc == 0 && null (dataConExTyCoVars dc)
+                     && not (isNativeIndexedDiagonalCon dc)) name names
+        IfaceIndexedDiagonalAltWithProof name ->
+          indexed_data_alt False isNativeIndexedDiagonalCon name names
+        IfaceIndexedFieldsAltWithProof name ->
+          indexed_data_alt False (\dc -> dataConSourceArity dc > 0) name names
+        IfaceIndexedExistentialAltWithProof name ->
+          indexed_data_alt False (\dc -> dataConSourceArity dc == 0 && not (null (dataConExTyCoVars dc))) name names
+        IfaceIndexedOrdinaryAltWithProof name ->
+          indexed_data_alt True (not . isNativeOpaqueOrdinaryCon) name names
+        IfaceOpaqueOrdinaryAltWithProof name ->
+          indexed_data_alt True isNativeOpaqueOrdinaryCon name names
+        IfaceDataAltWithProof name -> native_data_alt False name names
+        IfaceRetainedSiblingsAltWithProof name -> native_data_alt True name names
+      return (alt_con, names, rhs)
+    let native_alt (DataAlt con, names, _) (IfaceAlt tag _ _) =
+          isNativeIndexDataAlt con names || case tag of
+            IfaceDataAltWithProof{} -> True
+            _ -> False
+        native_alt _ _ = False
+        has_alt con = any (\(c, _, _) -> c == con) resolved
+        constructor_proof = or (zipWith native_alt resolved alts)
+        indexed_proof = any (\(con, ns, _) -> case con of
+                               DataAlt dc -> isNativeIndexedDataAlt dc ns
+                               _ -> False) resolved
+        native = constructor_proof || indexed_proof || any (\(c, ns, _) -> c == DEFAULT && not (null ns)) resolved
+    when (tagged_literal && not (native && isJust scrut_index)) $
+      failIfM (text "Invalid literal scrutinee in native index interface proof:" <+> ppr scrut')
+    forM_ tagged_operand $ \shape ->
+      unless (native && isJust scrut_index && matchesIndexedConShape shape scrut') $
+        failIfM (text "Invalid indexed constructor scrutinee in native index interface proof:"
+                 <+> ppr scrut')
+    when constructor_proof $ do
+      when (isNothing scrut_index) $
+        failIfM (text "Unsupported scrutinee for native index interface evidence:" <+> ppr scrut')
+      unless (has_alt DEFAULT || case splitTyConApp_maybe (exprType scrut') of
+               Just (tc, _) | isAlgTyCon tc -> all (has_alt . DataAlt) (tyConDataCons tc)
+               _ -> False) $
+        failIfM (text "Native index interface proof alternatives must be exhaustive:" <+> ppr scrut')
     case_bndr_name <- newIfaceName (mkVarOccFS (ifLclNameFS case_bndr))
     let
         scrut_ty   = exprType scrut'
@@ -1712,8 +2854,19 @@ tcIfaceExpr (IfaceCase scrut case_bndr alts)  = do
                 --     corresponds to the datacon in this case alternative
 
     extendIfaceIdEnv [case_bndr'] $ do
-     alts' <- mapM (tcIfaceAlt scrut' case_mult tc_app) alts
-     return (Case scrut' case_bndr' (coreAltsType alts') alts')
+     alts' <- mapM (tcIfaceAlt scrut' scrut_index case_bndr' tc_app) resolved
+     result_ty <- if native
+       then do
+         -- coreAltType panics on an escaping binder. Report the interface error.
+         result_tys <- forM alts' $ \ (Alt con bs rhs) ->
+           case occCheckExpand (case_bndr' : bs) (exprType rhs) of
+             Just ty -> return ty
+             Nothing -> failIfM (text "Escaping binder in native index interface result:" <+> ppr con)
+         case result_tys of
+           ty : _ -> return ty
+           [] -> failIfM (text "Native index interface case has no alternatives")
+       else return (coreAltsType alts')
+     return (Case scrut' case_bndr' result_ty alts')
 
 tcIfaceExpr (IfaceLet (IfaceNonRec (IfLetBndr fs ty info ji) rhs) body)
   = do  { name    <- newIfaceName (mkVarOccFS (ifLclNameFS fs))
@@ -1754,6 +2907,39 @@ tcIfaceExpr (IfaceTick tickish expr) = do
         tickish' <- tcIfaceTickish tickish
         return (Tick tickish' expr')
 
+-- | Check the indexed type of an application with a tagged operand.
+tcIfaceRetainedApp :: IfaceExpr -> IfaceExpr -> IfL CoreExpr
+tcIfaceRetainedApp fun arg
+  = do { f <- tcIfaceExpr fun
+       ; (_, shape, a) <- tcIfaceRetainedOperand arg
+       ; case coreFullView (exprType f) of
+           DepFunTy _ binder _ | all (`matchesIndexedConShape` a) shape
+             , Just index <- retainedArgIndex a
+             , typeKind index `eqType` varType binder -> return (App f a)
+           _ -> failIfM (text "Invalid tagged operand in retained interface application.") }
+
+-- | Read optional capability tags in their writer order.
+tcIfaceRetainedOperand :: IfaceExpr -> IfL (Bool, [IfaceIndexedConShape], CoreExpr)
+tcIfaceRetainedOperand expr
+  = do { let (tagged_natural, char_operand) = case expr of
+               IfaceRetainedNaturalArg operand -> (True, operand)
+               _ -> (False, expr)
+       ; let (tagged_char, rest) = case char_operand of
+               IfaceRetainedCharArg operand -> (True, operand)
+               _ -> (False, char_operand)
+       ; let (shape, operand) = shape_tags rest
+       ; result <- tcIfaceExpr operand
+       ; when (tagged_char && not (containsRetainedCharLiteral result)) $
+           failIfM (text "Missing boxed character literal in tagged interface operand:" <+> ppr result)
+       ; when (tagged_natural && not (containsRetainedNaturalLiteral result)) $
+           failIfM (text "Missing boxed natural literal in tagged interface operand:" <+> ppr result)
+       ; return (tagged_char || tagged_natural, shape, result) }
+  where
+    shape_tags (IfaceIndexedConArg con subexpr) =
+      let (shapes, operand) = shape_tags subexpr
+      in (con : shapes, operand)
+    shape_tags operand = ([], operand)
+
 -------------------------
 tcIfaceTickish :: IfaceTickish -> IfL CoreTickish
 tcIfaceTickish (IfaceHpcTick modl ix)   = return (HpcTick modl ix)
@@ -1768,40 +2954,133 @@ tcIfaceLit :: Literal -> IfL Literal
 tcIfaceLit lit = return lit
 
 -------------------------
-tcIfaceAlt :: CoreExpr -> Mult -> (TyCon, [Type])
-           -> IfaceAlt
-           -> IfL CoreAlt
-tcIfaceAlt _ _ _ (IfaceAlt IfaceDefaultAlt names rhs)
-  = assert (null names) $ do
-    rhs' <- tcIfaceExpr rhs
-    return (Alt DEFAULT [] rhs')
+tcIfaceAlt :: CoreExpr -> Maybe Type -> Id -> (TyCon, [Type])
+           -> (AltCon, [IfLclName], IfaceExpr) -> IfL CoreAlt
+tcIfaceAlt _ _ _ _ (DEFAULT, [], rhs) =
+  Alt DEFAULT [] <$> tcIfaceExpr rhs
+tcIfaceAlt scrut _ case_bndr _ (DEFAULT, [proof], rhs)
+  | isNativeIndexAliasBinder scrut case_bndr
+  , Just index <- exprToNativeCaseIndex scrut
+  , eqType (idType case_bndr) (typeKind index)
+  = do { name <- newIfaceName (mkVarOccFS (ifLclNameFS proof))
+       ; let cv = mkCoVar name (mkNomEqPred (TermVarTy case_bndr) index)
+       ; Alt DEFAULT [cv] <$> extendIfaceIdEnv [cv] (tcIfaceExpr rhs) }
+tcIfaceAlt scrut _ _ _ (DEFAULT, _, _) =
+  failIfM (text "Unsupported scrutinee for native index alias interface evidence:" <+> ppr scrut)
 
-tcIfaceAlt _ _ _ (IfaceAlt (IfaceLitAlt lit) names rhs)
-  = assert (null names) $ do
-    lit' <- tcIfaceLit lit
-    rhs' <- tcIfaceExpr rhs
-    return (Alt (LitAlt lit') [] rhs')
+tcIfaceAlt _ _ _ _ (con@(LitAlt _), names, rhs) = do
+  unless (null names) $
+    failIfM (text "Interface literal alternative cannot bind names:" <+> ppr names)
+  Alt con [] <$> tcIfaceExpr rhs
 
--- A case alternative is made quite a bit more complicated
--- by the fact that we omit type annotations because we can
--- work them out.  True enough, but its not that easy!
-tcIfaceAlt scrut mult (tycon, inst_tys) (IfaceAlt (IfaceDataAlt data_occ) arg_strs rhs)
-  = do  { con <- tcIfaceDataCon data_occ
-        ; when (debugIsOn && not (con `elem` tyConDataCons tycon))
-               (failIfM (ppr scrut $$ ppr con $$ ppr tycon $$ ppr (tyConDataCons tycon)))
-        ; tcIfaceDataAlt mult con inst_tys arg_strs rhs }
+tcIfaceAlt scrut scrut_index case_bndr (tycon, inst_tys) (DataAlt con, names, rhs)
+  | isNativeIndexedDataAlt con names
+  , (ordinary_names, [proof_name]) <- splitAt (length names - 1) names
+  = do { uniqs <- getUniquesM
+       ; let (exs, fields) =
+               dataConRepFSInstPat (map ifLclNameFS ordinary_names) uniqs mult con inst_tys
+             ordinary = exs ++ fields
+       ; case scrut_index of
+           Just index
+             | isNativeIndexedCaseScrutinee con index
+             , Just constructor <- nativeIndexedCon_maybe (exprType scrut) con ordinary ->
+                 do { fresh <- newIfaceName (mkVarOccFS (ifLclNameFS proof_name))
+                    ; let cv = mkCoVar fresh (mkNomEqPred index constructor)
+                    ; rhs' <- extendIfaceEnvs exs $
+                              extendIfaceIdEnv (fields ++ [cv]) (tcIfaceExpr rhs)
+                    ; return (Alt (DataAlt con) (ordinary ++ [cv]) rhs') }
+           _ -> failIfM (text "Invalid indexed constructor proof endpoint:"
+                         <+> ppr con <+> ppr (exprType scrut)) }
+  | isNativeIndexDataAlt con names
+  = do { (field_names, proof_name) <- case splitAt (dataConRepArity con) names of
+           (fs, [p]) | hasNoDups names -> return (fs, p)
+           _ -> failIfM (text "Native index interface alternative requires constructor fields followed by one proof, with distinct field and proof names:"
+                         <+> ppr con <+> ppr names)
+       ; index <- case scrut_index of
+           Just i  -> return i
+           Nothing -> failIfM (text "Unsupported scrutinee for native index interface evidence:" <+> ppr scrut)
+       ; tys <- case nativeIndexDataConTyArgs (exprType scrut) con of
+           Just args -> return args
+           Nothing   -> failIfM (text "Unsupported native index constructor domain:" <+> ppr con <+> ppr (exprType scrut))
+       ; uniqs <- getUniquesM
+       ; let (ex, fields) = dataConRepFSInstPat (map ifLclNameFS field_names) uniqs mult con tys
+             indices = map TermVarTy fields
+       ; unless (null ex && all isNativeOpaqueValueId fields && nativeIndexArgKinds con tys indices) $
+           failIfM (text "Invalid constructor fields in native index interface evidence:" <+> ppr con <+> ppr fields)
+       ; fresh <- newIfaceName (mkVarOccFS (ifLclNameFS proof_name))
+       ; let cv = mkCoVar fresh (mkNomEqPred index (mkTyConApp (promoteDataCon con) (tys ++ indices)))
+             binders = fields ++ [cv]
+       ; rhs' <- extendIfaceIdEnv binders (tcIfaceExpr rhs)
+       ; return (Alt (DataAlt con) binders rhs') }
+  | otherwise
+  = do { when (debugIsOn && not (con `elem` tyConDataCons tycon))
+           (failIfM (ppr scrut $$ ppr con $$ ppr tycon $$ ppr (tyConDataCons tycon)))
+       ; uniqs <- getUniquesM
+       ; let (ex_tvs, arg_ids) =
+               dataConRepFSInstPat (map ifLclNameFS names) uniqs mult con inst_tys
+       ; rhs' <- extendIfaceEnvs ex_tvs $ extendIfaceIdEnv arg_ids $ tcIfaceExpr rhs
+       ; return (Alt (DataAlt con) (ex_tvs ++ arg_ids) rhs') }
+  where
+    mult = idMult case_bndr
 
-tcIfaceDataAlt :: Mult -> DataCon -> [Type] -> [IfLclName] -> IfaceExpr
-               -> IfL CoreAlt
-tcIfaceDataAlt mult con inst_tys arg_strs rhs
-  = do  { uniqs <- getUniquesM
-        ; let (ex_tvs, arg_ids)
-                      = dataConRepFSInstPat (map ifLclNameFS arg_strs) uniqs mult con inst_tys
+-- | Check the payload against the capabilities advertised by its wire tag.
+matchesIndexedConShape :: IfaceIndexedConShape -> CoreExpr -> Bool
+matchesIndexedConShape IfaceSimpleIndexedCon e =
+  containsIndexedConOperand e && not (containsGeneralIndexedConOperand e)
+matchesIndexedConShape IfaceGeneralIndexedCon e = containsGeneralIndexedConOperand e
+matchesIndexedConShape IfaceDataFamilyCon e = containsRetainedDataFamilyConOperand e
 
-        ; rhs' <- extendIfaceEnvs  ex_tvs       $
-                  extendIfaceIdEnv arg_ids      $
-                  tcIfaceExpr rhs
-        ; return (Alt (DataAlt con) (ex_tvs ++ arg_ids) rhs') }
+{- Note [Native index alias evidence in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A case on a callback can name its result before matching its constructors.
+In classify f b, the outer DEFAULT binds the equality call_index ~# f b.
+The inner case inspects call_index. The expression that the caller evaluates
+must still be the same application after reading the unfolding.
+
+Write a distinct alternative tag and one local proof name. Derive the left
+endpoint from the fresh, unrestricted case binder and the right endpoint
+from the actual scrutinee with exprToNativeCaseIndex, as in Core Lint.
+This preserves the identity of a local function without unfolding it.
+Bind the fresh nominal CoVar only while reading this branch. Check the
+result type for escaping binders before returning the case.
+
+An ordinary DEFAULT has no binders. Its existing tag and bytes stay the
+same. See Note [Native index alias evidence] in GHC.Core.Lint.
+-}
+
+{- Note [Native constructor evidence in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An interface data alternative stores the names of its binders. A native
+alternative has one extra name after its constructor fields. For example,
+a branch matching Pair x payload binds a proof that the scrutinee index
+equals the promoted Pair applied to x and payload.
+
+The earlier reader supports this slot only on Bool. Preserve that encoding
+for Bool. Write IfaceDataAltWithProof for the other supported constructors.
+When reading a legacy unfolding, recognize its proof slot by the same
+constructor shape.
+
+Check that all field and proof names differ before extending the interface
+environment. A repeated name would hide the preceding field in the branch.
+Instantiate the ordinary representation fields from left to right. This
+gives the payload its type at the fresh x. Derive the promoted result from
+those same field Ids and the structural index of the actual scrutinee.
+Do not inspect an opaque call head to manufacture an index.
+Bind a fresh nominal CoVar
+with these endpoints only while reading the branch body. This also covers
+a nullary constructor such as True. Check branch-local escape before
+recovering the case result, and validate imported unfoldings against
+their declared type.
+
+The first indexed operand tag admits the nullary and predecessor forms.
+A reader for those forms cannot reconstruct every GADT worker. For example,
+Mk2 :: b -> a -> Both (Maybe a) [b] refines two indices. Write the general
+operand tag if the index contains any constructor outside the earlier forms.
+This lets the earlier reader reject the interface at its version header.
+
+See Note [Instantiating retained constructor fields] in GHC.Core.Utils
+and Note [Native index alias evidence] in GHC.Core.Lint.
+-}
 
 {-
 ************************************************************************
@@ -1811,29 +3090,70 @@ tcIfaceDataAlt mult con inst_tys arg_strs rhs
 ************************************************************************
 -}
 
+-- | Read identities used by the source proof rule checker.
+tcIfaceSourceProofRules :: [IfaceSourceProofRule] -> IfL [SourceProofRule]
+tcIfaceSourceProofRules = traverse $ \((owner, first, mapper), args) ->
+  (,,,) <$> symbol owner <*> traverse symbol first <*> pure mapper <*> traverse (traverse symbol) args
+  where
+    symbol = uncurry lookupOrig
+
 tcIdDetails :: Name -> Type -> IfaceIdDetails -> IfL IdDetails
 tcIdDetails _ _  IfVanillaId           = return VanillaId
+tcIdDetails owner ty (IfSourceTableId table_name origin) = do
+    table <- tcIfaceSourceTable owner ty table_name
+    return (SourceTableId owner table origin)
+tcIdDetails owner ty (IfCheckedClosureSourceTableId table_name helpers)
+  | null helpers || any ((/= nameModule_maybe owner) . nameModule_maybe) helpers =
+      failIfM (text "Invalid source closure helpers for" <+> ppr owner)
+  | otherwise = do
+      table <- tcIfaceSourceTable owner ty table_name
+      return (CheckedClosureSourceTableId owner table helpers)
 tcIdDetails _ _  (IfWorkerLikeId dmds) = return $ WorkerLikeId dmds
 tcIdDetails _ ty IfDFunId              = return (mkDFunIdDetails cls)
   where
     (_, _, cls, _) = tcSplitDFunTy ty
 
-tcIdDetails nm _ (IfRecSelId tc _first_con naughty fl)
+tcIdDetails owner ty (IfSourceDFunId methods literal) =
+  forkM (text "Source methods of" <+> ppr owner) $
+    case sourceDFunDetails_maybe owner ty methods literal of
+      Just details -> return details
+      Nothing -> failIfM (text "Invalid source methods for dictionary" <+> ppr owner)
+
+tcIdDetails nm ty (IfRecSelId tc _first_con naughty fl table_name)
   = do { tc' <- either (fmap RecSelData . tcIfaceTyCon)
                        (fmap (RecSelPatSyn . tyThingPatSyn) . tcIfaceDecl False)
                        tc
        ; let all_cons         = recSelParentCons tc'
              cons_partitioned = conLikesRecSelInfo all_cons [flLabel fl]
-       ; return (RecSelId
-                   { sel_tycon      = tc'
-                   , sel_naughty    = naughty
-                   , sel_fieldLabel = fl { flSelector = nm }
-                   , sel_cons       = cons_partitioned }
-                       -- Reconstructed here since we don't want Uniques in the Iface file
-                ) }
+             details table = RecSelId
+               { sel_tycon      = tc'
+               , sel_naughty    = naughty
+               , sel_fieldLabel = fl { flSelector = nm }
+               , sel_cons       = cons_partitioned
+               , sel_sourceTable = table }
+       ; table <- forM table_name $ \name ->
+           forkM (text "Source table of record selector" <+> ppr nm) $ do
+             thing <- tcIfaceGlobal name
+             case thing of
+               ATyCon family
+                 | let fun = mkGlobalId (details (Just family)) nm ty vanillaIdInfo
+                 , Just _ <- sourceTableId_maybe fun -> pure family
+               _ -> failIfM (text "Invalid source table for record selector" <+> ppr nm <+> ppr name)
+       ; return (details table) }
   where
     tyThingPatSyn (AConLike (PatSynCon ps)) = ps
     tyThingPatSyn _ = panic "tcIdDetails: expecting patsyn"
+
+-- | Recover the exact private family of an interface source owner.
+tcIfaceSourceTable :: Name -> Type -> Name -> IfL TyCon
+tcIfaceSourceTable owner ty table_name =
+  forkM (text "Source table of" <+> ppr owner) $ do
+    thing <- tcIfaceGlobal table_name
+    case thing of
+      ATyCon tc
+        | let fun = mkGlobalId (SourceTableId owner tc NominalSourceTable) owner ty vanillaIdInfo
+        , Just _ <- sourceTableId_maybe fun -> return tc
+      _ -> failIfM (text "Invalid source table for" <+> ppr owner <+> ppr table_name)
 
 tcIdInfo :: Bool -> TopLevelFlag -> Name -> Type -> IfaceIdInfo -> IfL IdInfo
 tcIdInfo ignore_prags toplvl name ty info = do
@@ -1911,9 +3231,9 @@ tcLFInfo lfi = case lfi of
 
 tcUnfolding :: TopLevelFlag -> Name -> Type -> IdInfo -> IfaceUnfolding -> IfL Unfolding
 -- See Note [Lazily checking Unfoldings]
-tcUnfolding toplvl name _ info (IfCoreUnfold src cache if_guidance if_expr)
+tcUnfolding toplvl name ty info (IfCoreUnfold src cache if_guidance if_expr)
   = do  { uf_opts <- unfoldingOpts <$> getDynFlags
-        ; expr <- tcUnfoldingRhs (isCompulsorySource src) toplvl name if_expr
+        ; expr <- tcUnfoldingRhs src toplvl name ty if_expr
         ; let guidance = case if_guidance of
                  IfWhen arity unsat_ok boring_ok -> UnfWhen arity unsat_ok boring_ok
                  IfNoGuidance -> calcUnfoldingGuidance uf_opts is_top_bottoming False expr
@@ -1925,7 +3245,11 @@ tcUnfolding toplvl name _ info (IfCoreUnfold src cache if_guidance if_expr)
 
 tcUnfolding _toplvl name dfun_ty _ (IfDFunUnfold bs ops)
   = bindIfaceBndrs bs $ \ bs' ->
-    do { ops1 <- forkM doc $ mapM tcIfaceExpr ops
+    do { ops1 <- forkM doc $ do
+           ops' <- mapM tcIfaceExpr ops
+           when (any hasNativeDependentUnfolding ops') $
+             failIfM (text "Native dependent dictionary unfoldings are not supported:" <+> ppr name)
+           return ops'
        ; return $ mkDFunUnfolding bs' (classDataCon cls) ops1 }
   where
     doc = text "Class ops for dfun" <+> ppr name
@@ -2001,27 +3325,69 @@ lazy in `expr`.
 Ticket #21139
 -}
 
-tcUnfoldingRhs :: Bool -- ^ Is this unfolding compulsory?
-                       -- See Note [Checking for representation polymorphism] in GHC.Core.Lint
-               -> TopLevelFlag -> Name -> IfaceExpr -> IfL CoreExpr
-tcUnfoldingRhs is_compulsory toplvl name expr
+tcUnfoldingRhs :: UnfoldingSource
+               -> TopLevelFlag -> Name -> Type -> IfaceExpr -> IfL CoreExpr
+tcUnfoldingRhs source toplvl name declared_ty expr
   = forkM doc $ do
     core_expr' <- tcIfaceExpr expr
 
+    -- Keep native checks in this thunk, including for nested unfoldings.
+    -- See Note [Native dependent unfolding templates] in GHC.Core.Unfold.Make
+    -- and Note [Serializing native DepFunTy unfoldings] in GHC.Iface.Tidy.
+    let is_depfun_user = hasNativeDepFunType declared_ty && isStableUserSource source
+        scoped_dict = hasScopedDictionaryExpr core_expr' || hasScopedDictionaryType declared_ty
+        native = hasNativeDependentExprRhs core_expr'
+                 || hasNativeDependentExprRhs (Type declared_ty)
+                 || scoped_dict
+                 || case source of { RetainedUserSrc -> True; _ -> False }
+    -- See Note [Compulsory retained defaults] in GHC.Iface.Tidy.
+    case source of
+      RetainedDefaultSrc ->
+        unless (isRetainedVanillaDefaultMethod name declared_ty) $
+          failIfM (text "Invalid compulsory retained default method:" <+> ppr name)
+      CompulsorySrc ->
+        when native $
+          failIfM (text "Unsupported compulsory retained unfolding:" <+> ppr name)
+      RetainedUserSrc ->
+        -- See Note [Erased package unfoldings].
+        unless (not (hasNativeDependentExprRhs (Type declared_ty))
+                && (not (hasExistentialExpr core_expr')
+                    || (isTopLevel toplvl && supportsNativeUserUnfolding core_expr'))) $
+          failIfM (text "Invalid retained user unfolding:" <+> ppr name)
+      _ | is_depfun_user ->
+        unless (isTopLevel toplvl && supportsNativeDepFunUnfolding core_expr') $
+          failIfM (text "Invalid native DepFunTy unfolding:" <+> ppr name)
+      _ | isStableUserSource source, hasExistentialExpr core_expr' ->
+        unless (isTopLevel toplvl
+                && hasNativeDependentExprRhs (Type declared_ty)
+                && supportsNativeUserUnfolding core_expr') $
+          failIfM (text "Invalid existential user unfolding:" <+> ppr name)
+      _ -> pure ()
+    dflags <- getDynFlags
     -- Check for type consistency in the unfolding
     -- See Note [Linting Unfoldings from Interfaces] in GHC.Core.Lint
-    when (isTopLevel toplvl) $
-      whenGOptM Opt_DoCoreLinting $ do
+    when (native || (isTopLevel toplvl && gopt Opt_DoCoreLinting dflags)) $ do
         in_scope <- nonDetEltsUniqSet <$> get_in_scope
-        dflags   <- getDynFlags
         logger   <- getLogger
-        case lintUnfolding is_compulsory (initLintConfig dflags in_scope) noSrcLoc core_expr' of
+        let cfg = initLintConfig dflags in_scope
+            mb_errs
+              | scoped_dict = lintScopedDictionaryExpr cfg core_expr' declared_ty
+              | otherwise   = lintUnfolding is_compulsory cfg noSrcLoc core_expr'
+        case mb_errs of
           Nothing   -> return ()
-          Just errs -> liftIO $
-            displayLintResults logger doc
-                               (pprCoreExpr core_expr') (emptyBag, errs)
+          Just errs
+            | native -> failIfM (text "Invalid native unfolding in interface:" <+> ppr name
+                                  $$ vcat (bagToList errs))
+            | otherwise -> liftIO $
+                displayLintResults logger doc
+                                   (pprCoreExpr core_expr') (emptyBag, errs)
+    when (native && not (exprType core_expr' `eqType` declared_ty)) $
+      failIfM (text "Native interface unfolding does not match its declared type:" <+> ppr name
+               $$ text "Declared type:" <+> ppr declared_ty
+               $$ text "Unfolding type:" <+> ppr (exprType core_expr'))
     return core_expr'
   where
+    is_compulsory = isCompulsorySource source
     doc = ppWhen is_compulsory (text "Compulsory") <+>
           text "Unfolding of" <+> ppr name
 
@@ -2070,25 +3436,80 @@ tcIfaceGlobal name
             Succeeded thing -> return thing }
 
 tcIfaceTyCon :: IfaceTyCon -> IfL TyCon
-tcIfaceTyCon (IfaceTyCon name _info)
+tcIfaceTyCon (IfaceTyCon name info)
   = do { thing <- tcIfaceGlobal name
        ; case thing of
               ATyCon tc -> return tc
-              AConLike (RealDataCon dc) -> return (promoteDataCon dc)
+              AConLike (RealDataCon dc)
+                -> do { unless (null (dataConRepArgBinders dc) || dataConHasPromotedRetained dc) $
+                          failIfM (text "Invalid retained constructor fields in interface:"
+                                    <+> ppr name $$ text "This retained constructor has no supported promoted field telescope.")
+                      ; unless ((ifaceTyConSort info == IfaceRetainedSiblings) == dataConHasPromotedRetainedSiblings dc) $
+                          failIfM (text "Invalid retained sibling-field tag in interface:" <+> ppr name)
+                      ; return (promoteDataCon dc) }
               _ -> pprPanic "tcIfaceTyCon" (ppr thing) }
 
-tcIfaceAxiomRule :: IfaceAxiomRule -> IfL CoAxiomRule
+tcIfaceAxiomRule :: IfaceAxiomRule -> [Coercion] -> IfL CoAxiomRule
 -- Unlike CoAxioms, which arise from user 'type instance' declarations,
--- there are a fixed set of CoAxiomRules:
---   - axioms for type-level literals (Nat and Symbol),
---     enumerated in typeNatCoAxiomRules
-tcIfaceAxiomRule (IfaceAR_X n)
-  | Just axr <- lookupUFM typeNatCoAxiomRules (ifLclNameFS n)
+-- built-in rules have stable names in builtInCoAxiomRules.
+tcIfaceAxiomRule (IfaceAR_X n) args
+  | key == fsLit "AppendSymbolT3"
+  = read_deduction "AppendSymbol" append_symbol_rules
+  | key `elem` append_symbol_rules
+  = read_deduction "AppendSymbol" [key]
+  | key == fsLit "CharToNatT1"
+  = read_deduction "character conversion" character_rules
+  | key `elem` character_rules
+  = read_deduction "character conversion" [key]
+  | Just axr <- lookupUFM builtInCoAxiomRules key
   = return axr
   | otherwise
-  = pprPanic "tcIfaceAxiomRule" (ppr n)
-tcIfaceAxiomRule (IfaceAR_U name)   = do { ax <- tcIfaceUnbranchedAxiom name; return (UnbranchedAxiom ax) }
-tcIfaceAxiomRule (IfaceAR_B name i) = do { ax <- tcIfaceBranchedAxiom name;   return (BranchedAxiom ax i) }
+  = failIfM (text "Unknown built-in coercion rule in interface:" <+> ppr n)
+  where
+    key = ifLclNameFS n
+    append_symbol_rules = [fsLit "AppendSymbolKnownPrefix", fsLit "AppendSymbolKnownSuffix"]
+    character_rules = [fsLit "CharToNatDeduction", fsLit "NatToCharDeduction"]
+
+    -- See Note [Built-in deduction keys in interfaces].
+    read_deduction family candidates = case args of
+      [arg] | coercionRole arg == Nominal
+            , let premise = coercionKind arg ->
+        case [ rule
+             | candidate <- candidates
+             , Just rule@(BuiltInFamInj inj) <- [lookupUFM builtInCoAxiomRules candidate]
+             , isJust (bifinj_proves inj premise) ] of
+          [rule] -> return rule
+          []     -> invalid
+          _      -> failIfM (text "Ambiguous legacy" <+> text family
+                              <+> text "deduction in interface. Recompile the producer.")
+      _ -> invalid
+      where
+        invalid = failIfM (text "Invalid" <+> text family <+> text "deduction in interface:" <+> ppr n)
+tcIfaceAxiomRule (IfaceAR_U name)   _ = do { ax <- tcIfaceUnbranchedAxiom name; return (UnbranchedAxiom ax) }
+tcIfaceAxiomRule (IfaceAR_B name i) _ = do { ax <- tcIfaceBranchedAxiom name;   return (BranchedAxiom ax i) }
+
+{- Note [Built-in deduction keys in interfaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Older modules wrote the same name, AppendSymbolT3, for the two rules that
+remove a known prefix or suffix. The rule table kept only one entry. An
+optimized client could read the other rule and panic in coercionKind.
+CharToNat and NatToChar deductions likewise shared CharToNatT1.
+
+Read the nominal premise before selecting the rule. For AppendSymbol,
+substitution can make both rules applicable. It cannot invalidate the
+first rule. With two applicable rules the old interface does not specify
+which operand the proof equates. Reject it before constructing AxiomCo.
+
+The character conversion rules have disjoint premises. The left endpoint
+must have the specified type family head and the right endpoint must
+be a literal of the corresponding result kind. The family check in
+mkTopUnaryFamDeduction must return Nothing for the other family because
+this lookup tries both rules.
+
+Fresh modules write distinct rule names. Older readers reject an unknown
+name when they load an affected unfolding. The ordinary interface format
+and other rule names remain available for imports.
+-}
 
 tcIfaceUnbranchedAxiom :: IfExtName -> IfL (CoAxiom Unbranched)
 tcIfaceUnbranchedAxiom name

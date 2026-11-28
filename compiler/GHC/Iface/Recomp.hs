@@ -26,7 +26,9 @@ import GHC.Driver.Ppr
 import GHC.Driver.Plugins
 
 
+
 import GHC.Iface.Syntax
+import GHC.Iface.Binary (sourceTableLocations)
 import GHC.Iface.Recomp.Binary
 import GHC.Iface.Recomp.Types
 import GHC.Iface.Load
@@ -73,7 +75,7 @@ import GHC.Unit.Module.Deps
 
 import Control.Monad
 import Control.Monad.Trans.State
-import Data.List (sortBy, sort, sortOn)
+import Data.List (sortBy, sort, sortOn, stripPrefix)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -404,7 +406,7 @@ checkVersions hsc_env mod_summary iface self_recomp
             then return $ outOfDateItemBecause SourceFileChanged Nothing else do {
        ; if not (isHomeModule home_unit (mi_module iface))
             then return $ outOfDateItemBecause ThisUnitIdChanged Nothing else do {
-       ; recomp <- liftIO $ checkFlagHash hsc_env (mi_module iface) self_recomp
+       ; recomp <- liftIO $ checkFlagHash hsc_env iface self_recomp
                              `recompThen` checkOptimHash hsc_env self_recomp
                              `recompThen` checkHpcHash hsc_env self_recomp
                              `recompThen` checkMergedSignatures hsc_env mod_summary self_recomp
@@ -535,20 +537,19 @@ checkHie dflags mod_summary =
              _ -> UpToDate
 
 -- | Check the flags haven't changed
-checkFlagHash :: HscEnv -> Module -> IfaceSelfRecomp -> IO RecompileRequired
-checkFlagHash hsc_env iface_mod self_recomp = do
+checkFlagHash :: HscEnv -> ModIface -> IfaceSelfRecomp -> IO RecompileRequired
+checkFlagHash hsc_env iface self_recomp = do
     let logger   = hsc_logger hsc_env
     let FingerprintWithValue old_fp old_flags = mi_sr_flag_hash self_recomp
-    let (new_fp, new_flags) = fingerprintDynFlags hsc_env iface_mod putNameLiterally
+    let !(new_fp, new_flags) = fingerprintDynFlags hsc_env (mi_module iface) putNameLiterally
     if old_fp == new_fp
       then up_to_date logger (text "Module flags unchanged")
       else do
         -- Do not perform this computation unless -ddump-hi-diffs is on
         let diffs = case old_flags of
                       Nothing -> pure [missingExtraFlagInfo]
-                      Just old_flags -> checkIfaceFlags old_flags new_flags
+                      Just old -> checkIfaceFlags old new_flags
         out_of_date logger FlagsChanged (fmap vcat diffs)
-
 
 checkIfaceFlags :: IfaceDynFlags -> IfaceDynFlags -> IO [SDoc]
 checkIfaceFlags (IfaceDynFlags a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14)
@@ -790,6 +791,11 @@ checkModUsage _ UsageMergedRequirement{ usg_mod = mod, usg_mod_hash = old_mod_ha
   needInterface mod $ \iface -> do
     let reason = ModuleChangedRaw (moduleName mod)
     checkModuleFingerprint logger reason old_mod_hash (mi_mod_hash iface)
+checkModUsage _ UsageHomeModuleInterface{ usg_mod = mod, usg_iface_hash = old_iface_hash } = do
+  logger <- getLogger
+  needInterface mod $ \iface -> do
+    let reason = ModuleChangedRaw (moduleName mod)
+    checkModuleFingerprint logger reason old_iface_hash (mi_iface_hash iface)
 checkModUsage _  UsageHomeModuleBytecode{ usg_mod_name = mod_name
                                                  , usg_unit_id = uid
                                                  , usg_bytecode_hash = old_bytecode_hash } = do
@@ -811,7 +817,7 @@ checkModUsage _ UsageHomeModule{
     needInterface mod $ \iface -> do
      let
          new_mod_hash    = mi_mod_hash iface
-         new_decl_hash   = mi_hash_fn  iface
+         new_decl_hash   = lookupUsageFingerprint iface
          reason = ModuleChanged (moduleName mod)
 
      liftIO $ do
@@ -1203,21 +1209,18 @@ mkSelfRecomp :: HscEnv -> Module -> Fingerprint -> [Usage] -> IO IfaceSelfRecomp
 mkSelfRecomp hsc_env this_mod src_hash usages = do
       let dflags = hsc_dflags hsc_env
 
-      let dyn_flags_info = fingerprintDynFlags hsc_env this_mod putNameLiterally
-
+      let (flag_hash, flags) = fingerprintDynFlags hsc_env this_mod putNameLiterally
       let opt_hash = fingerprintOptFlags dflags putNameLiterally
-
       let hpc_hash = fingerprintHpcFlags dflags putNameLiterally
-
       plugin_hash <- fingerprintPlugins (hsc_plugins hsc_env)
 
-      let include_detailed_flags (flag_hash, flags) =
+      let include_detailed_flags (fp, flgs) =
             if gopt Opt_WriteSelfRecompFlags dflags
-              then FingerprintWithValue flag_hash (Just flags)
-              else FingerprintWithValue flag_hash Nothing
+              then FingerprintWithValue fp (Just flgs)
+              else FingerprintWithValue fp Nothing
 
       return (IfaceSelfRecomp
-                { mi_sr_flag_hash = include_detailed_flags dyn_flags_info
+                { mi_sr_flag_hash = include_detailed_flags (flag_hash, flags)
                 , mi_sr_hpc_hash = hpc_hash
                 , mi_sr_opt_hash = opt_hash
                 , mi_sr_plugin_hash = plugin_hash
@@ -1259,14 +1262,15 @@ addFingerprints hsc_env iface0 = do
   --   - the things which can affect whether a module is recompiled
   --   - the module level annotations,
   --   - deps (home and external packages, dependent files)
-  let !iface_hash = computeFingerprint putNameLiterally
+  let base_hash = computeFingerprint putNameLiterally
                         (mi_abi_mod_hash abiHashes,
                          mi_self_recomp_info iface0,
                          mi_deps iface0)
-
-  let final_iface = completePartialModIface iface0 iface_hash
+      !iface_hash = case sourceTableLocations sorted_decls of
+        []   -> base_hash
+        locs -> computeFingerprint putNameLiterally (base_hash, locs)
+      final_iface = completePartialModIface iface0 iface_hash
                      sorted_decls sorted_extra_decls abiHashes caches
-   --
   return final_iface
 
 
@@ -1954,7 +1958,12 @@ mkHashFun hsc_env eps name
                             -- implementation.
                           $ loadInterface (text "lookupVers2") mod ImportBySystem
         return $ snd (mi_hash_fn iface occ `orElse`
-                  pprPanic "lookupVers1" (ppr mod <+> ppr occ))
+                  (do { guard (isTcClsNameSpace (occNameSpace occ))
+                      ; term_str <- stripPrefix "U:" (occNameString occ)
+                      ; guard (not (null term_str))
+                      ; mi_hash_fn iface (mkVarOcc term_str) }
+                   `orElse`
+                  pprPanic "lookupVers1" (ppr mod <+> ppr occ)))
 
 {- Note [Fingerprinting complete matches]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

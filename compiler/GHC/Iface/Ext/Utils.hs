@@ -17,8 +17,9 @@ import GHC.Types.SrcLoc
 import GHC.CoreToIface
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
-import GHC.Core.TyCo.Compare( nonDetCmpType )
+import GHC.Core.TyCo.Compare( nonDetCmpType, eqType )
 import GHC.Core.Type
+import GHC.Builtin.WiredIn.Types ( unmatchableDataConTy )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Parser.Annotation
@@ -66,7 +67,7 @@ resolveVisibility kind ty_args
     go env ty                  ts
       | Just ty' <- coreView ty
       = go env ty' ts
-    go env (ForAllTy (Bndr tv vis) res) (t:ts)
+    go env (ForAllTy _ma (Bndr tv vis) res) (t:ts)
       | isVisibleForAllTyFlag vis = (True , t) : ts'
       | otherwise                 = (False, t) : ts'
       where
@@ -159,12 +160,18 @@ hieTypeToIface :: HieTypeFix -> IfaceType
 hieTypeToIface = foldType go
   where
     go (HTyVarTy n) = IfaceTyVar $ (mkIfLclName (occNameFS $ getOccName n))
+    go (HTermVarTy n) = IfaceTermVar (mkIfLclName (occNameFS $ getOccName n))
+    go (HTermAppTy n arg) = IfaceTermAppTy (mkIfLclName (occNameFS $ getOccName n)) arg
+    go (HExistsTy flag (name, kind) body) =
+      IfaceExistsTy flag (mkIfLclName (occNameFS $ getOccName name), kind) body
+    go (HDepFunTy vis (mult, n, domain) body) =
+      IfaceDepFunTy vis (mult, mkIfLclName (occNameFS $ getOccName n), domain) body
     go (HAppTy a b) = IfaceAppTy a (hieToIfaceArgs b)
     go (HLitTy l) = IfaceLitTy l
-    go (HForAllTy ((n,k),af) t) = let b = (mkIfLclName (occNameFS $ getOccName n), k)
-                                  in IfaceForAllTy (Bndr (IfaceTvBndr b) (IfaceForAllTyFlag af)) t
-    go (HFunTy w a b)   = IfaceFunTy visArgTypeLike   w       a    b
-    go (HQualTy pred b) = IfaceFunTy invisArgTypeLike many_ty pred b
+    go (HForAllTy ma ((n,k),af) t) = let b = (mkIfLclName (occNameFS $ getOccName n), k)
+                                     in IfaceForAllTy ma (Bndr (IfaceTvBndr b) (IfaceForAllTyFlag af)) t
+    go (HFunTy ma w a b) = IfaceFunTy visArgTypeLike ma w a b
+    go (HQualTy pred b) = IfaceFunTy invisArgTypeLike ifaceUnmatchable many_ty pred b
     go (HCastTy a) = a
     go HCoercionTy = IfaceTyVar (mkIfLclName "<coercion type>")
     go (HTyConApp a xs) = IfaceTyConApp a (hieToIfaceArgs xs)
@@ -224,6 +231,20 @@ getTypeIndex t
         HTS (extendTypeMap tm t i) (IM.insert i ht tt) fi
       return i
 
+    go (TermVarTy v) = return $ HTermVarTy (varName v)
+    go (TermAppTy fun arg) = HTermAppTy (varName fun) <$> getTypeIndex arg
+    -- The source signature leaves the dictionary and type arguments implicit.
+    -- Keep their identities in the type-map key. Use the source view in HIE.
+    go (ClassAppTy method _ _ arg _) = HTermAppTy (varName method) <$> getTypeIndex arg
+    go (DepDictTy dict body) = HQualTy <$> getTypeIndex (varType dict) <*> getTypeIndex body
+    go (ExistsTy flag binder body) = do
+      kind <- getTypeIndex (varType binder)
+      HExistsTy flag (varName binder, kind) <$> getTypeIndex body
+    go (DepFunTy vis binder body) = do
+      mult <- getTypeIndex (idMult binder)
+      domain <- getTypeIndex (varType binder)
+      result <- getTypeIndex body
+      return $ HDepFunTy vis (mult, varName binder, domain) result
     go (TyVarTy v) = return $ HTyVarTy $ varName v
     go ty@(AppTy _ _) = do
       let (head,args) = splitAppTys ty
@@ -235,17 +256,19 @@ getTypeIndex t
       let visArgs = HieArgs $ resolveVisibility (tyConKind f) xs
       is <- mapM getTypeIndex visArgs
       return $ HTyConApp (toIfaceTyCon f) is
-    go (ForAllTy (Bndr v a) t) = do
+    go (ForAllTy ma (Bndr v a) t) = do
+      mai <- getTypeIndex ma
       k <- getTypeIndex (varType v)
       i <- getTypeIndex t
-      return $ HForAllTy ((varName v,k),a) i
-    go (FunTy { ft_af = af, ft_mult = w, ft_arg = a, ft_res = b }) = do
+      return $ HForAllTy mai ((varName v,k),a) i
+    go (FunTy { ft_af = af, ft_ma = ma, ft_mult = w, ft_arg = a, ft_res = b }) = do
       ai <- getTypeIndex a
       bi <- getTypeIndex b
       wi <- getTypeIndex w
+      mai <- getTypeIndex ma
       return $ if isInvisibleFunArg af
-               then assert (isManyTy w) $ HQualTy ai bi
-               else                       HFunTy wi ai bi
+               then assert (isManyTy w && eqType ma unmatchableDataConTy) $ HQualTy ai bi
+               else                       HFunTy mai wi ai bi
     go (LitTy a) = return $ HLitTy $ toIfaceTyLit a
     go (CastTy t _) = do
       i <- getTypeIndex t

@@ -32,13 +32,15 @@ import GHC.Core.Multiplicity
 import GHC.Core.TyCo.Tidy
 
 import GHC.Types.Id
+import GHC.Types.Id.Info (sourceProofRuleInfo)
 import GHC.Types.Var.Env
 import GHC.Types.Var
 import GHC.Types.Name
 import GHC.Types.Basic
 import GHC.Types.TyThing
 
-import GHC.Utils.Panic.Plain
+import GHC.Utils.Misc (zipEqual)
+import GHC.Utils.Panic.Plain (assert)
 
 import GHC.Data.Maybe
 import Data.List ( findIndex, mapAccumL )
@@ -69,7 +71,8 @@ idToIfaceDecl id
   = IfaceId { ifName      = getName id,
               ifType      = toIfaceType (idType id),
               ifIdDetails = toIfaceIdDetails (getName id) (idDetails id),
-              ifIdInfo    = toIfaceIdInfo (idInfo id) }
+              ifIdInfo    = toIfaceIdInfo (idInfo id),
+              ifIdSourceProofRules = toIfaceSourceProofRules (sourceProofRuleInfo (idInfo id)) }
 
 --------------------------
 dataConToIfaceDecl :: DataCon -> IfaceDecl
@@ -77,7 +80,8 @@ dataConToIfaceDecl dataCon
   = IfaceId { ifName      = getName dataCon,
               ifType      = toIfaceType (dataConWrapperType dataCon),
               ifIdDetails = IfVanillaId,
-              ifIdInfo    = [] }
+              ifIdInfo    = [],
+              ifIdSourceProofRules = [] }
 
 --------------------------
 coAxiomToIfaceDecl :: CoAxiom br -> IfaceDecl
@@ -90,7 +94,11 @@ coAxiomToIfaceDecl ax@(CoAxiom { co_ax_tc = tycon, co_ax_branches = branches
               , ifRole       = role
               , ifAxBranches = map (coAxBranchToIfaceBranch tycon
                                      (map coAxBranchLHS branch_list))
-                                   branch_list }
+                                   branch_list
+              , ifAxSourceProofRules = map (fmap toIfaceSourceProofRules) (co_ax_source_proof_rules ax)
+              , ifAxSourceSpans = case sourceTableTermOcc (getOccName tycon) of
+                  Nothing -> []
+                  Just _  -> map coAxBranchSpan branch_list }
  where
    branch_list = fromBranches branches
 
@@ -133,6 +141,7 @@ tyConToIfaceDecl env tycon
                      ifKind    = if_kind,
                      ifRoles   = tyConRoles tycon,
                      ifSynRhs  = if_syn_type syn_rhs,
+                     ifSynSourceProofRules = toIfaceSourceProofRules (synTyConSourceProofRules tycon),
                      ifBinders = if_binders,
                      ifResKind = if_res_kind
                    })
@@ -183,7 +192,8 @@ tyConToIfaceDecl env tycon
     -- NOTE: Not all TyCons have `tyConTyVars` field. Forcing this when `tycon`
     -- is one of these TyCons (FunTyCon, PrimTyCon, PromotedDataCon) will cause
     -- an error.
-    if_kind        = tidyToIfaceType emptyTidyEnv $ tyConKind tycon
+    if_kind        = tidyToIfaceType emptyTidyEnv $
+                       fromMaybe (tyConKind tycon) (standaloneFamilyConstrainedKind_maybe tycon)
                      -- emptyTidyEnv: the kind as a whole is not under any binders
     (tc_env1, tc_binders) = tidyTyConBinders env (tyConBinders tycon)
     if_binders     = toIfaceForAllBndrs tc_binders
@@ -200,6 +210,7 @@ tyConToIfaceDecl env tycon
 
     to_if_fam_flav :: FamTyConFlav -> IfaceFamTyConFlav
     to_if_fam_flav OpenTypeFamilyTyCon         = IfaceOpenTypeFamilyTyCon
+    to_if_fam_flav ConstrainedTypeFamilyTyCon  = IfaceConstrainedTypeFamilyTyCon
     to_if_fam_flav (DataFamilyTyCon {})        = IfaceDataFamilyTyCon
     to_if_fam_flav (ClosedTypeFamilyTyCon ctf) = IfaceClosedTypeFamilyTyCon (to_if_ctf ctf)
 
@@ -207,8 +218,13 @@ tyConToIfaceDecl env tycon
     to_if_ctf CTF_Abstract     = IfaceAbstractClosedTyFamTyCon
     to_if_ctf (CTF_BuiltIn {}) = IfaceBuiltInClosedTyFamTyCon
     to_if_ctf (CTF Nothing)    = IfaceClosedTyFamTyCon Nothing
-    to_if_ctf (CTF (Just ax))
-      = IfaceClosedTyFamTyCon (Just (axn, ibr))
+    to_if_ctf (CTF (Just ax))  = IfaceClosedTyFamTyCon (Just (iface_ax ax))
+    to_if_ctf (CTF_Scoped owner is_sum ax)
+      | not is_sum, owner == tyConName tycon
+      = IfaceLambdaClosedTyFamTyCon (iface_ax ax)
+      | otherwise = IfaceScopedClosedTyFamTyCon owner is_sum (iface_ax ax)
+
+    iface_ax ax = (axn, ibr)
       where defs = fromBranches $ coAxiomBranches ax
             lhss = map coAxBranchLHS defs
             ibr  = map (coAxBranchToIfaceBranch tycon lhss) defs
@@ -216,7 +232,12 @@ tyConToIfaceDecl env tycon
 
     ifaceConDecls (DataTyCon { data_cons = cons, is_type_data = type_data })
       = IfDataTyCon type_data (map ifaceConDecl cons)
-    ifaceConDecls (NewTyCon { data_con = con })        = IfNewTyCon        (ifaceConDecl con)
+    ifaceConDecls (NewTyCon { data_con = con })
+      = IfNewTyCon rep_poly (ifaceConDecl con)
+      where
+        rep_poly = case dataConSourceOrder con of
+          OrderedConArgs{} -> not (isFixedRuntimeRepKind (tyConResKind tycon))
+          LegacyConOrder{} -> False
     ifaceConDecls (UnaryClassTyCon { data_con = con})  = IfDataTyCon False [ifaceConDecl con]
     ifaceConDecls (TupleTyCon { data_con = con })      = IfDataTyCon False [ifaceConDecl con]
     ifaceConDecls (SumTyCon { data_cons = cons })      = IfDataTyCon False (map ifaceConDecl cons)
@@ -236,19 +257,21 @@ tyConToIfaceDecl env tycon
                     ifConUnivTvs = map toIfaceBndr univ_tvs',
                     ifConExTCvs  = map toIfaceBndr ex_tvs',
                     ifConUserTvBinders = toIfaceForAllTyBndrs user_bndrs',
+                    ifConSourceOrder = dataConSourceOrder data_con,
                     ifConEqSpec  = map (to_eq_spec . eqSpecPair) eq_spec,
                     ifConCtxt    = tidyToIfaceContext con_env3 theta,
-                    ifConArgTys  =
-                      map (\(Scaled w t) -> (tidyToIfaceType con_env3 w
-                                          , (tidyToIfaceType con_env3 t))) arg_tys,
+                    ifConArgTys  = if_arg_tys,
+                    ifConArgBinders = if_arg_binders,
+                    ifConRetainedFlags = if_retained_flags,
                     ifConFields  = dataConFieldLabels data_con,
                     ifConStricts = map (toIfaceBang con_env1)
                                        (dataConImplBangs data_con),
                     ifConSrcStricts = map toIfaceSrcBang
                                           (dataConSrcBangs data_con)}
         where
-          (univ_tvs, ex_tvs, eq_spec, theta, arg_tys, _)
+          (univ_tvs, _, eq_spec, theta, arg_tys, _)
             = dataConFullSig data_con
+          ex_tvs = dataConExTyCoVars data_con
           user_bndrs = dataConUserTyVarBinders data_con
 
           -- Start with 'emptyTidyEnv' not 'tc_env1', because the type of the
@@ -256,7 +279,32 @@ tyConToIfaceDecl env tycon
           (con_env1, user_bndrs') = tidyForAllTyBinders emptyTidyEnv user_bndrs
           (con_env2, univ_tvs') = mapAccumL tidyFreeTyCoVarX con_env1 univ_tvs
           (con_env3, ex_tvs') = mapAccumL tidyFreeTyCoVarX con_env2 ex_tvs
-          to_eq_spec (tv,ty) = (tidyTyVar con_env3 tv, tidyToIfaceType con_env3 ty)
+          to_eq_spec (tv,ty) = (tidyTyVar con_env3 tv, tidyToIfaceType con_env4 ty)
+
+          arg_binders = dataConRepArgBinders data_con
+          raw_retained_flags =
+            [ if isInvisibleRetainedBinder b
+              then if isInferredRetainedBinder b then DepFunInferred else DepFunInvisible
+              else DepFunVisible
+            | Just b <- arg_binders ]
+          if_retained_flags
+            | all (== DepFunVisible) raw_retained_flags = []
+            | otherwise = raw_retained_flags
+          (con_env4, (if_arg_binders, if_arg_tys))
+            | null arg_binders
+            = (con_env3, ([], map (\(Scaled w t) -> (tidyToIfaceType con_env3 w
+                                                    , tidyToIfaceType con_env3 t)) arg_tys))
+            | otherwise
+            = fmap unzip $ mapAccumL tidy_arg con_env3 (zipEqual arg_binders arg_tys)
+
+          -- See Note [Retained constructor fields in interfaces].
+          tidy_arg env (mb_binder, Scaled w ty)
+            = (body_env, (if_binder, (tidyToIfaceType env w, tidyToIfaceType env ty)))
+            where
+              (body_env, if_binder) = case mb_binder of
+                Nothing -> (env, Nothing)
+                Just binder -> let (env', binder') = tidyVarBndr env binder
+                               in (env', Just (mkIfLclName (getOccFS binder')))
 
 classToIfaceDecl :: TidyEnv -> Class -> (TidyEnv, IfaceDecl)
 classToIfaceDecl env clas
@@ -291,7 +339,7 @@ classToIfaceDecl env clas
         (env2, if_decl) = tyConToIfaceDecl env1 tc
 
     toIfaceClassOp (sel_id, def_meth)
-        = assert (sel_tyvars == binderVars tc_binders) $
+        = assert (map snd sel_tyvars == binderVars tc_binders) $
           IfaceClassOp (getName sel_id)
                        (tidyToIfaceType env1 op_ty)
                        (fmap toDmSpec def_meth)

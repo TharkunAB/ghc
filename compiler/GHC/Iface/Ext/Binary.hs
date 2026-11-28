@@ -27,6 +27,7 @@ import GHC.Iface.Binary           ( putAllTables )
 import GHC.Types.Name
 import GHC.Types.Name.Cache
 import GHC.Types.SrcLoc as SrcLoc
+import GHC.Types.Var (ExistsTyFlag(..))
 import GHC.Types.Unique.FM
 import qualified GHC.Utils.Binary as Binary
 import GHC.Utils.Panic
@@ -75,7 +76,12 @@ writeHieFile hie_file_path hiefile = do
   -- Write the header: hieHeader followed by the
   -- hieVersion and the GHC version used to generate this file
   mapM_ (putByte bh0) hieMagic
-  putBinLine bh0 $ BSC.pack $ show hieVersion
+  let version
+        | any usesDot (hie_types hiefile) = hieImplicitExistsVersion
+        | otherwise = hieVersion
+      usesDot (HExistsTy ImplicitExists _ _) = True
+      usesDot _ = False
+  putBinLine bh0 $ BSC.pack $ show version
   putBinLine bh0 $ ghcVersion
 
   (fs_tbl, fs_w) <- initFastStringWriterTable
@@ -139,19 +145,20 @@ type HieHeader = (Integer, ByteString)
 
 -- | Read a `HieFile` from a `FilePath`. Can use
 -- an existing `NameCache`. Allows you to specify
--- which versions of hieFile to attempt to read.
--- `Left` case returns the failing header versions.
+-- which files with the current HIE format to read.
+-- `Left` case returns the rejected header versions.
 readHieFileWithVersion :: (HieHeader -> Bool) -> NameCache -> FilePath -> IO (Either HieHeader HieFileResult)
 readHieFileWithVersion readVersion name_cache file = do
   bh0 <- readBinMem file
 
-  (hieVersion, ghcVersion) <- readHieFileHeader file bh0
+  (readHieVersion, ghcVersion) <- readHieFileHeader file bh0
 
-  if readVersion (hieVersion, ghcVersion)
+  -- See Note [HIE arrow matchability] in GHC.Iface.Ext.Types.
+  if supportedHieVersion readHieVersion && readVersion (readHieVersion, ghcVersion)
   then do
     hieFile <- readHieFileContents bh0 name_cache
-    return $ Right (HieFileResult hieVersion ghcVersion hieFile)
-  else return $ Left (hieVersion, ghcVersion)
+    return $ Right (HieFileResult readHieVersion ghcVersion hieFile)
+  else return $ Left (readHieVersion, ghcVersion)
 
 
 -- | Read a `HieFile` from a `FilePath`. Can use
@@ -164,7 +171,8 @@ readHieFile name_cache file = do
   (readHieVersion, ghcVersion) <- readHieFileHeader file bh0
 
   -- Check if the versions match
-  when (readHieVersion /= hieVersion) $
+  -- See Note [HIE arrow matchability] in GHC.Iface.Ext.Types.
+  when (not (supportedHieVersion readHieVersion)) $
     panic $ unwords ["readHieFile: hie file versions don't match for file:"
                     , file
                     , "Expected"
@@ -172,7 +180,11 @@ readHieFile name_cache file = do
                     , "but got", show readHieVersion
                     ]
   hieFile <- readHieFileContents bh0 name_cache
-  return $ HieFileResult hieVersion ghcVersion hieFile
+  return $ HieFileResult readHieVersion ghcVersion hieFile
+
+-- | Both type-table versions share the rest of the HIE format.
+supportedHieVersion :: Integer -> Bool
+supportedHieVersion v = v == hieVersion || v == hieImplicitExistsVersion
 
 readBinLine :: ReadBinHandle -> IO ByteString
 readBinLine bh = BS.pack . reverse <$> loop []

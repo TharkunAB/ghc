@@ -10,6 +10,8 @@ module GHC.Iface.Ext.Fields
    , writeFieldWith
    -- * Deletion
    , deleteField
+   -- * Known field names
+   , sourceRuleHeadsField
    )
 where
 
@@ -92,3 +94,8 @@ writeFieldWith name write fields = do
 
 deleteField :: FieldName -> ExtensibleFields -> ExtensibleFields
 deleteField name (ExtensibleFields fs) = ExtensibleFields $ Map.delete name fs
+
+-- | Extensible interface field recording active non-auto rule head 'Name's,
+-- preserved when @-fno-code@ or @-fomit-interface-pragmas@ strips 'mi_rules'.
+sourceRuleHeadsField :: FieldName
+sourceRuleHeadsField = "ghc.source-rule-heads.v1"

@@ -39,7 +39,7 @@ module GHC.Utils.Binary
    tellBinReader,
    tellBinWriter,
    castBin,
-   withBinBuffer,
+   withBinBuffer, withBinBufferFrom,
    freezeWriteHandle,
    shrinkBinBuffer,
    thawReadHandle,
@@ -87,7 +87,7 @@ module GHC.Utils.Binary
    mkWriterUserData, mkReaderUserData,
    newReadState, newWriteState,
    addReaderToUserData, addWriterToUserData,
-   findUserDataReader, findUserDataWriter,
+   findUserDataReader, findUserDataWriter, findOptionalUserDataWriter,
    -- * Binary Readers & Writers
    BinaryReader(..), BinaryWriter(..),
    mkWriter, mkReader,
@@ -364,10 +364,14 @@ addWriterToUserData writer bh = bh
 
 -- | Get access to the underlying buffer.
 withBinBuffer :: WriteBinHandle -> (ByteString -> IO a) -> IO a
-withBinBuffer (WriteBinMem _ ix_r _ arr_r) action = do
+withBinBuffer bh = withBinBufferFrom bh (BinPtr 0)
+
+-- | Access the written buffer starting at a saved writer position.
+withBinBufferFrom :: WriteBinHandle -> Bin a -> (ByteString -> IO b) -> IO b
+withBinBufferFrom (WriteBinMem _ ix_r _ arr_r) (BinPtr start) action = do
   ix <- readFastMutInt ix_r
   arr <- readIORef arr_r
-  action $ BS.fromForeignPtr arr 0 ix
+  action $ BS.fromForeignPtr arr start (ix - start)
 
 unsafeUnpackBinBuffer :: ByteString -> IO ReadBinHandle
 unsafeUnpackBinBuffer (BS.BS arr len) = do
@@ -1563,10 +1567,17 @@ findUserDataReader query bh =
 -- If no 'BinaryWriter' has been configured before, this function will panic.
 findUserDataWriter :: forall a . Refl.Typeable a => Proxy a -> WriteBinHandle -> BinaryWriter a
 findUserDataWriter query bh =
-  case Map.lookup (Refl.someTypeRep query) (ud_writer_data $ getWriterUserData bh) of
+  case findOptionalUserDataWriter query bh of
     Nothing -> panic $ "Failed to find BinaryWriter for the key: " ++ show (Refl.someTypeRep query)
+    Just writer -> writer
+
+-- | Find an optional binary writer.
+findOptionalUserDataWriter :: forall a. Refl.Typeable a => Proxy a -> WriteBinHandle -> Maybe (BinaryWriter a)
+findOptionalUserDataWriter query bh =
+  case Map.lookup (Refl.someTypeRep query) (ud_writer_data $ getWriterUserData bh) of
+    Nothing -> Nothing
     Just (SomeBinaryWriter _ (writer :: BinaryWriter x)) ->
-      unsafeCoerce @(BinaryWriter x) @(BinaryWriter a) writer
+      Just (unsafeCoerce @(BinaryWriter x) @(BinaryWriter a) writer)
       -- This 'unsafeCoerce' could be written safely like this:
       --
       -- @
@@ -2337,7 +2348,11 @@ getSomeTypeRep bh = do
         2 -> do SomeTypeRep f <- getSomeTypeRep bh
                 SomeTypeRep x <- getSomeTypeRep bh
                 case Refl.typeRepKind f of
+#if __GLASGOW_HASKELL__ > 1000
+                  Refl.Fun' _ arg res ->
+#else
                   Refl.Fun arg res ->
+#endif
                       case arg `Refl.eqTypeRep` Refl.typeRepKind x of
                         Just Refl.HRefl ->
                             case Refl.typeRepKind res `Refl.eqTypeRep` (Refl.typeRep :: Refl.TypeRep Type) of
@@ -2478,7 +2493,11 @@ putTypeRep bh (Refl.Con' con ks) = do
     put_ bh (1 :: Word8)
     put_ bh con
     put_ bh ks
+#if __GLASGOW_HASKELL__ > 1000
+putTypeRep bh (Refl.App' f x) = do
+#else
 putTypeRep bh (Refl.App f x) = do
+#endif
     put_ bh (2 :: Word8)
     putTypeRep bh f
     putTypeRep bh x
@@ -2543,12 +2562,16 @@ instance Binary UnfoldingSource where
     put_ bh StableUserSrc   = putByte bh 1
     put_ bh StableSystemSrc = putByte bh 2
     put_ bh VanillaSrc      = putByte bh 3
+    put_ bh RetainedDefaultSrc = putByte bh 4
+    put_ bh RetainedUserSrc = putByte bh 5
     get bh = do
         h <- getByte bh
         case h of
             0 -> return CompulsorySrc
             1 -> return StableUserSrc
             2 -> return StableSystemSrc
+            4 -> return RetainedDefaultSrc
+            5 -> return RetainedUserSrc
             _ -> return VanillaSrc
 
 instance Binary TypeOrConstraint where
