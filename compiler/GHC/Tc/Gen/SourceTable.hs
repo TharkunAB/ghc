@@ -4587,6 +4587,12 @@ hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
     Just HsTypedSplice{} -> True
     _ -> or (gmapQ hasPendingTypedSplice node)
 
+hasExprHole :: Data a => a -> Bool
+hasExprHole node = case cast node :: Maybe (HsExpr GhcTc) of
+    Just HsHole{}        -> True
+    Just HsTypedSplice{} -> False
+    _                    -> or (gmapQ hasExprHole node)
+
 {- Note [Fallback for uncertified local source functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The renamer allocates a private source-table name @T:f@ for a signed local
@@ -4696,7 +4702,7 @@ isSafeLocalUninterpretedRhs strict_mode hpc_mode owner_nm raw_rhs
 nominalBindPrecheck :: HsBind GhcTc -> Maybe (Id, [TyVar], [TcEvBinds])
 nominalBindPrecheck binding = do
     (fun, _, body_tvs, evs, matches) <- sourceMatches binding
-    guard (not (null matches) && not (hasPendingTypedSplice binding))
+    guard (not (null matches) && not (hasPendingTypedSplice binding) && not (hasExprHole binding))
     (\pevs -> (fun, body_tvs, evs ++ concat pevs)) <$> traverse checkMatch matches
   where
     checkMatch (L _ Match{m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] _) :| []) (L _ local_binds)})

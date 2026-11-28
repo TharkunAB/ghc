@@ -1,0 +1,7 @@
+NativeCalledHoleNoPanic.hs:10:17: error: [GHC-88464]
+    • Found hole: _ :: Token
+    • In an equation for ‘tokenAt’: tokenAt (S p) = _
+    • Relevant bindings include
+        p :: N (bound at NativeCalledHoleNoPanic.hs:10:12)
+        tokenAt :: N -> Token (bound at NativeCalledHoleNoPanic.hs:9:1)
+
