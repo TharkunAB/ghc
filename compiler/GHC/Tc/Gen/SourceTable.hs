@@ -17,7 +17,7 @@ module GHC.Tc.Gen.SourceTable
   , isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead
   , sourceLocalBooleanCases, isFinalStructuralSource, isStructuralSourceTable
   , isNominalStructuralSource, isSimpleNominalTable, isLargeElimTable, isLargeElimResultKind
-  , toKindMatchableArrows, rebuildSourceFamilyWith, tidySourceAxBranch
+  , pruneDeadNonRecLets, isSafeLocalUninterpretedRhs, toKindMatchableArrows, rebuildSourceFamilyWith, tidySourceAxBranch
   , visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt
   , sourceEquationDatatypes, publicCaseType, ordinaryImport
   , sourceBinarySelector, sourceMapSelector, lookupSourceUnaryMethod, lookupSourceBinaryMethod, lookupSourceContainerMethod
@@ -118,7 +118,7 @@ import GHC.Types.Basic (LeftOrRight(..), Origin(..), SourceTableOrigin(..), Unfo
 import GHC.Types.Error (errorsFound)
 import GHC.Types.Id
   ( globaliseId, idArity, idCbvMarks_maybe, idCoreRules, idInfo, idInlineActivation, idInlinePragma, idMult, idName
-  , idUnfolding, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isJoinId, isPrimOpId_maybe
+  , idUnfolding, isClassOpId_maybe, isDataConId_maybe, isDataConWorkId_maybe, isDeadEndId, isJoinId, isPrimOpId_maybe
   , mkLocalId, mkSysLocal, mkSysLocalM, mkVanillaGlobal, realIdUnfolding, setIdExported, setIdInfo, setIdType, setSourceMethodIds
   , sourceLiteralCons_maybe, sourceMethodAliases, sourceMethodDFunClass, sourceMethodTarget_maybe, sourceTableId_maybe )
 import GHC.Types.Id.Info (IdDetails(CheckedClosureSourceTableId, DFunId, RecSelId, SourceTableId, VanillaId, sel_sourceTable), SourceDFun(..), setSourceProofRuleInfo)
@@ -4586,6 +4586,112 @@ hasPendingTypedSplice :: Data a => a -> Bool
 hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
     Just HsTypedSplice{} -> True
     _ -> or (gmapQ hasPendingTypedSplice node)
+
+{- Note [Fallback for uncertified local source functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The renamer allocates a private source-table name @T:f@ for a signed local
+function @f@ before typechecking. Core certification later succeeds only when
+@f@ lies in a certified structural, mapper, or closure fragment.
+
+A valid program can still apply a total local non-structural function @f@ to
+open variables in a type, for example an accumulator loop with a local
+recursive @where@ helper, a function with literal pattern matches and a
+@DEFAULT@ branch, or a wrapper around a guarded local helper. When @T:f@ has
+no certified closed family, type elaboration falls back to open evaluation and
+then to the uninterpreted closed family @U:f@.
+
+When a typechecker plugin is active, allow any solved non-large-elimination
+local function to reach @U:f@ so the plugin can inspect or refute the goal.
+When no typechecker plugin is active, 'isSafeLocalUninterpretedRhs' restricts
+this fallback to lazy, non-HPC, non-bottoming Core right-hand sides without
+pattern-match error calls or strict single-@DEFAULT@ cases. Local recursive
+@let@/@where@ helpers are permitted when their branches are exhaustive. Direct
+top-level self-recursion is permitted only when the body scrutinizes literals
+with a @DEFAULT@ branch, which rejects unproductive structural loops on
+algebraic datatypes.
+-}
+
+-- | Drop unreferenced non-recursive 'Core.Let' bindings left behind by
+-- pattern-match desugaring (such as unused @fail@ continuations calling
+-- 'patErrorId').
+pruneDeadNonRecLets :: Core.CoreExpr -> Core.CoreExpr
+pruneDeadNonRecLets (Core.App f a)  = Core.App (pruneDeadNonRecLets f) (pruneDeadNonRecLets a)
+pruneDeadNonRecLets (Core.Lam v b)  = Core.Lam v (pruneDeadNonRecLets b)
+pruneDeadNonRecLets (Core.Cast b c) = Core.Cast (pruneDeadNonRecLets b) c
+pruneDeadNonRecLets (Core.Tick t b) = Core.Tick t (pruneDeadNonRecLets b)
+pruneDeadNonRecLets (Core.Let (Core.NonRec v r) b) =
+  let b' = pruneDeadNonRecLets b
+  in if v `elemVarSet` exprsFreeVars [b']
+       then Core.Let (Core.NonRec v (pruneDeadNonRecLets r)) b'
+       else b'
+pruneDeadNonRecLets (Core.Let (Core.Rec pairs) b) =
+  Core.Let (Core.Rec [(v, pruneDeadNonRecLets r) | (v, r) <- pairs]) (pruneDeadNonRecLets b)
+pruneDeadNonRecLets (Core.Case s cb ty alts) =
+  Core.Case (pruneDeadNonRecLets s) cb ty
+    [Core.Alt con bs (pruneDeadNonRecLets r) | Core.Alt con bs r <- alts]
+pruneDeadNonRecLets expr = expr
+
+-- | Check whether an uncertified local Core right-hand side can elaborate as
+-- an uninterpreted type-level application when no 'tcPlugin' is active.
+-- See Note [Fallback for uncertified local source functions].
+isSafeLocalUninterpretedRhs :: Bool -> Bool -> Name -> Core.CoreExpr -> Bool
+isSafeLocalUninterpretedRhs strict_mode hpc_mode owner_nm raw_rhs
+  | strict_mode || hpc_mode = False
+  | any is_bottom_fv fvs = False
+  | any (\v -> idName v == owner_nm) fvs && not (has_lit_case rhs) = False
+  | otherwise = go_e rhs
+  where
+    rhs = pruneDeadNonRecLets raw_rhs
+    fvs = exprSomeFreeVarsList isId rhs
+
+    is_bottom_fv v =
+      v `hasKey` patErrorIdKey
+      || isDeadEndId v
+      || case nameModule_maybe (idName v) of
+           Just m | moduleUnitId m == ghcInternalUnitId ->
+             occNameString (nameOccName (idName v))
+               `elem` ["error", "errorWithoutStackTrace", "undefined", "divZeroError", "overflowError"]
+           _ -> False
+
+    is_lit_alt (Core.Alt Core.LitAlt{} _ _) = True
+    is_lit_alt _                            = False
+
+    is_def_alt (Core.Alt Core.DEFAULT _ _) = True
+    is_def_alt _                           = False
+
+    has_lit_case (Core.App f a) = has_lit_case f || has_lit_case a
+    has_lit_case (Core.Lam _ b) = has_lit_case b
+    has_lit_case (Core.Cast b _) = has_lit_case b
+    has_lit_case (Core.Tick _ b) = has_lit_case b
+    has_lit_case (Core.Let (Core.NonRec _ r) b) = has_lit_case r || has_lit_case b
+    has_lit_case (Core.Let (Core.Rec pairs) b) = any (has_lit_case . snd) pairs || has_lit_case b
+    has_lit_case (Core.Case s _ _ alts) =
+      (any is_lit_alt alts && any is_def_alt alts)
+      || has_lit_case s
+      || any (\(Core.Alt _ _ r) -> has_lit_case r) alts
+    has_lit_case _ = False
+
+    go_e (Core.Var _)      = True
+    go_e (Core.Lit _)      = True
+    go_e (Core.Type _)     = True
+    go_e (Core.Coercion _) = True
+    go_e (Core.App f a)    = go_e f && go_e a
+    go_e (Core.Lam _ b)    = go_e b
+    go_e (Core.Cast b _)   = go_e b
+    go_e (Core.Tick _ b)   = go_e b
+    go_e (Core.Let (Core.NonRec _ r) b) = go_e r && go_e b
+    go_e (Core.Let (Core.Rec pairs) b)  = all (go_e . snd) pairs && go_e b
+    go_e (Core.Case s _ _ alts@(_ : _)) =
+      go_e s && check_alts alts && all (\(Core.Alt _ _ r) -> go_e r) alts
+    go_e _ = False
+
+    check_alts [Core.Alt Core.DEFAULT _ _] = False
+    check_alts alts
+      | any is_lit_alt alts = any is_def_alt alts
+      | dc0 : rest_dcs <- [dc | Core.Alt (Core.DataAlt dc) _ _ <- alts] =
+          any is_def_alt alts
+          || length (dc0 : rest_dcs) == length (tyConDataCons (dataConTyCon dc0))
+      | otherwise = False
 
 nominalBindPrecheck :: HsBind GhcTc -> Maybe (Id, [TyVar], [TcEvBinds])
 nominalBindPrecheck binding = do
