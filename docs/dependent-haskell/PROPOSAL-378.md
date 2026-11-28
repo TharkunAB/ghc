@@ -1,0 +1,45 @@
+# GHC Proposal #378 and Companion Proposals Conformance Summary
+
+This document summarizes how GHC implements [GHC Proposal #378 (*Design for Dependent Types*)](https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0378-dependent-type-design.rst) and its companion proposals under `-XDependentTypes`.
+
+## 1. Guiding Principles (`#378` Section 4)
+
+- **Opt-In Principle (`#378` Section 4.12, `#102`):** `-XDependentTypes` enables Dependent Haskell and its companion extensions (`ExistentialTypes`, `ExtendedLet`, `GADTs`, `DataKinds`, `PolyKinds`, `TypeOperators`, `RankNTypes`, `ScopedTypeVariables`, `TypeApplications`, `TypeAbstractions`, `StandaloneKindSignatures`, `EmptyCase`, `Modifiers`, `RequiredTypeArguments`, `ExplicitNamespaces`, and `NoListTuplePuns`). Modules compiled with `-XHaskell2010` or `-XGHC2024` remain unaffected and can import and call dependent definitions without enabling `-XDependentTypes`.
+- **Predictable Erasure Principle (`#378` Section 4.2):** Surface quantifiers determine runtime retention directly. `forall` and `exists` erase their witnesses at runtime. `foreach` and `some` retain their arguments as ordinary runtime values without singleton wrapper allocation.
+- **Lexical Scoping Principle (`#378` Section 4.3.1-4.3.2, `#281`):** Type syntax resolves names in the type namespace first and falls back to the term namespace. Term syntax resolves names in the term namespace first and falls back to the type namespace. Implicit quantification binds only identifiers that are unbound in both namespaces.
+- **Non-Strict Semantics and Optional Totality (`#378` Section 4.10, Section 4.13):** Dependent Haskell preserves call-by-need evaluation, `seq` observation, and unrestricted recursion. Type checking never forces a runtime argument or assumes function eta-conversion. Users who want structural termination feedback can pass `-freport-totality`.
+
+## 2. Proposal #378 Section-by-Section Summary
+
+| Section | Specification | GHC Implementation |
+| :--- | :--- | :--- |
+| **4.1 Type inference** | Preserve inference for non-dependent code; require signatures on dependent definitions. | Bidirectional checking instantiates polymorphic constructors and `foreach` functions at runtime indices while keeping ordinary Haskell inference unchanged. |
+| **4.2 Erasure (PEP)** | Quantifiers specify erased vs retained data. | Core separates erased `ForAllTy` and `ExistsTy` from retained `DepFunTy` and `GHC.Sigma.Sigma`. |
+| **4.3.2 Lexical scoping** | Unified two-namespace lookup and capture rules. | Top-level signatures, local signatures, and GADT constructor signatures share `#281` term-variable capture rules. Top-level types and functions schedule in dependency SCC order. |
+| **4.3.3-4.3.4 Syntax and heralds** | Switch between type and term namespaces with `type` and `data`. | `type` switches expressions and patterns to type lookup (`#281`). `data` switches types, expressions, and patterns to data-constructor and term lookup, including `data []` and `data (x, y)` under `NoListTuplePuns`. `HsExpr` and `HsType` remain distinct internal AST types (`#25121`). |
+| **4.4 Quantifiers** | Six quantifiers: `forall a.`, `forall a ->`, `foreach a.`, `foreach a ->`, `c =>`, `t1 -> t2`. | Supported in signatures, GADT constructors, and required type arguments, including shared-type binder groups `(m n :: Nat)`, inferred braces `foreach {n :: Nat}.`, unannotated `foreach n ->`, wildcards `foreach (_ :: a) ->`, Unicode `∏` (`U+220F`), and linear `foreach (x %1 :: a) ->`. |
+| **4.5 Dependent pattern matching** | Matching a `foreach` value in checking mode refines RHS types. | Function equations and `case` expressions refine multi-column, flat, and nested constructor patterns (`S (S k)`), support catch-all `_` rows, and refute impossible GADT and `foreach` combinations. |
+| **4.6 Term variables in types** | Term variables in types act as rigid skolems; Static-Subset `let` bindings unfold. | Function and `case` binders elaborate to `TermVarTy` skolems. Nonrecursive `let` and `where` bindings in the Static Subset (constructors, certified arithmetic, and unary function compositions) unfold in dependent types while keeping lazy runtime sharing. |
+| **4.7 Dependent application** | Static-Subset arguments to `foreach ->` and `forall ->` check in term syntax. | Call sites accept variables, literals, constructors (including indexed and existential GADTs), annotated expressions, promoted source calls, operator sections, and unadorned types (`foreach`, `exists`, `some`, `forall`). |
+| **4.8 Dependent definitions** | Explicit signatures required; invisible `foreach .` supports `@` overrides. | Dependent bindings require explicit signatures. Invisible `foreach (n :: Nat).` parameters accept both `ScopedTypeVariables` capture and `@pat` / `@arg` overrides (`#448`), skipping `{...}` binders. |
+| **4.9 Phase distinction** | Retained `Type` binders work in both types and terms; GADT constructors mix `forall` and `foreach`. | `foreach (a :: Type) ->` binds `a` in type positions, passes `Typeable` evidence at runtime, accepts unadorned type arguments (`Int`, `Maybe Char`), and supports runtime `case a of { Int -> ...; _ -> ... }`. GADT constructors mix existential `forall`, constraints, and visible or invisible `foreach` fields. |
+| **4.10-4.11 Typed Core and promotion** | Native typed Core and automatic term promotion without singleton boilerplate. | Core adds `DepFunTy`, `ExistsTy`, `TermVarTy`, and `TermAppTy` checked by Core Lint and STG Lint (`CORE.md`). `-fwrite-source-equations` (enabled by default under `-XDependentTypes`) publishes certified closed-family and closure equations, `Type`-returning large eliminations, and ground `Num` numeral promotion. |
+
+## 3. Companion GHC Proposals
+
+| Proposal | Feature | GHC Implementation |
+| :--- | :--- | :--- |
+| **`#281`** (and `#626`) | Visible `forall` (`forall a ->`), `type` herald, and `T2T` | Enabled via `RequiredTypeArguments` (implied by `DependentTypes`). `T2T` maps unadorned types, `foreach`, `exists`, `some`, and operator sections in required type arguments. |
+| **`#282`** (and `#583`) | `OverloadedRecordDot` on dependent records and sums | Dot projection `r.field` and `Sigma` projection (`p.first`, `p.second`) substitute `r` into dependent field result types; dependent record updates check interrelated fields together. |
+| **`#425`** | Invisible `@k` binders in type declarations and `NoCUSKs` | `DependentTypes` implies `StandaloneKindSignatures` (which disables `CUSKs`). `CUSKs` remains enabled in `Haskell98` and `Haskell2010` for backward compatibility, with `-Wcusks` available for migration. |
+| **`#448`** | `TypeAbstractions` (`@a` and `@pat` in binders and patterns) | Supported across `forall .`, `forall ->`, `foreach .`, and GADT constructor patterns, including nested constructor patterns inside `@(Succ k)`. |
+| **`#473`** | First-class existential types (`-XExistentialTypes`) | Implements `exists` telescopes with `.` (implicit subsumption opening/packing) and `|` (explicit `Pack`), `@Pack` witness overrides, `ExistsTy` in Core, and `GHC.Exists` (`Exists`, `Pack`, `/\`, `MkCPair`, `Witness`, `discardEvidence`, `withEvidence`, `withExists`, `mapExists`, `uncurryExists`). |
+| **`#475`** (and `#765`) | Non-punned list and tuple syntax (`NoListTuplePuns`) | `DependentTypes` implies `NoListTuplePuns`; `List` (`[]` via `data []`), `Tuple2`, and `Unit` avoid type/data punning, while `-Wpun-bindings` and `-Wpun-uses` diagnose namespace collisions. Adding `ListTuplePuns` after `DependentTypes` re-enables `[a]` and `(a, b)` puns when desired. |
+| **`#523`** | Local `let` in types and local `type` synonyms (`-XExtendedLet`) | Type-level `let ... in ...` checks bindings in source order; term-level `let` and `where` blocks admit nonrecursive local `type` synonyms that may reference enclosing `foreach` runtime binders. |
+| **`#242`, `#370`, `#402`** | Unsaturated type families, `%M`/`%U` modifiers, and nested GADT quantifiers | `DependentTypes` permits unsaturated type families and synonyms at `%U` (`GHC.Matchability`) without implying `-fprint-explicit-matchabilities`, supports `%M`/`%U` and `%1`/`%m` arrow modifiers, and accepts interleaved `forall`, `foreach`, and `=>` in prefix GADT constructors. |
+
+## 4. Intentional Design Boundaries
+
+1. **Legacy editions keep `CUSKs`:** `Haskell98` and `Haskell2010` retain `CUSKs` when `-XDependentTypes` and `-XStandaloneKindSignatures` are off so existing Hackage packages compile unchanged.
+2. **Separate internal `HsExpr` and `HsType` ASTs:** Surface types-in-terms (`T2T`), `Type` large eliminations, and the `type` / `data` heralds bridge term and type syntax while `HsExpr` and `HsType` remain distinct internal trees (`#25121`).
+3. **Pure structural promotion vs plugin theories:** Built-in source-equation certification covers pure structural definitions and closure-capturing traversals without promoting `IO` or assuming totality. Uncertified open term calls elaborate to uninterpreted family heads (`U:<name>`) when a `TcPlugin` (such as `dependent-obs-eq`) is active.

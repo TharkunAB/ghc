@@ -32,6 +32,16 @@ The following syntax is stolen:
     <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0193-forall-keyword.rst>`__.
 
 
+``foreach``, ``exists``, ``some``
+    .. index::
+       single: foreach
+       single: exists
+       single: some
+
+    Reserved by :extension:`DependentTypes`, :extension:`ExistentialTypes`, and
+    :extension:`ExtendedLet`. They remain ordinary identifiers when these
+    extensions are disabled.
+
 ``mdo``
     .. index::
        single: mdo

@@ -8,6 +8,14 @@ paraphrase a slice of the language, useful for exposition. The document here
 contains the official description of the language, as it is implemented in
 GHC.
 
+Dependent Core extensions
+-------------------------
+
+Native dependent Core forms (`DepFunTy`, `ExistsTy`, `TermVarTy`, `TermAppTy`,
+and arrow/binder `Matchability`) are specified in `../dependent-haskell/CORE.md`.
+The Ott grammar and built PDF in this directory formalize the non-dependent
+System FC fragment and do not cover those dependent extensions.
+
 Building
 --------
 

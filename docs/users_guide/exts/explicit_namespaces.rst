@@ -13,8 +13,9 @@ Explicit namespaces in import/export
 
     Enable use of explicit namespace specifiers ``type`` and ``data``
     in import declarations, module export lists, fixity declarations,
-    and warning/deprecation pragmas; as well as the ``type`` namespace
-    specifier in expressions and patterns.
+    and warning/deprecation pragmas; the ``type`` namespace specifier in
+    expressions and patterns; and the ``data`` namespace specifier in
+    types, expressions, and patterns.
 
 The ``type`` keyword in import/export lists
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -197,3 +198,22 @@ keyword in patterns and expressions::
   r = f (type Integer) 10  -- in an expression
 
 This is used in conjunction with :extension:`RequiredTypeArguments`.
+
+The ``data`` keyword in types, expressions, and patterns
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Since:** GHC 10.2
+
+Dual to ``type``, :extension:`ExplicitNamespaces` permits the ``data`` herald
+in types, expressions, and patterns (`GHC Proposal #378` Section 4.3.4). In type
+syntax, ``data t`` resolves constructors and variables in the data-constructor
+and value namespaces first before falling back to the type namespace, and treats
+list and tuple brackets (``data []``, ``data [x]``, ``data (x, y)``) as promoted
+data constructors even when :extension:`NoListTuplePuns` is active::
+
+  data Tag = Tag
+
+  p1 :: Proxy Tag        -- refers to the type constructor Tag :: Type
+  p2 :: Proxy (data Tag) -- refers to the promoted data constructor 'Tag :: Tag
+
+See :ref:`dependent-types` for further examples.

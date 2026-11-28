@@ -1434,6 +1434,26 @@ of ``-W(no-)*``.
     It is useful to catch accidentally polykinded types, or to make that polymorphism explicit,
     without requiring a kind signature for every type.
 
+.. ghc-flag:: -Wcusks
+    :shortdesc: warn when GHC uses a complete user-supplied kind signature with a quantified kind parameter
+    :type: dynamic
+    :reverse: -Wno-cusks
+    :category:
+
+    :since: 10.2
+    :default: off
+
+    Warn when GHC uses a :ref:`complete user-supplied kind signature
+    <complete-kind-signatures>` with a quantified kind parameter. For
+    supported source forms, GHC suggests a :ref:`standalone kind signature
+    <standalone-kind-signatures>` and required language pragmas. For other
+    forms, the warning shows the current kind. A declaration can trigger this warning even
+    when GHC can infer its kind with :extension:`CUSKs` disabled.
+
+    Enabling :extension:`StandaloneKindSignatures` disables :extension:`CUSKs`
+    for the whole module. You may need to add several kind signatures when
+    you enable the extension.
+
 .. ghc-flag:: -Wmissing-exported-pattern-synonym-signatures
     :shortdesc: warn about pattern synonyms without signatures, only if they
         are exported
@@ -2472,6 +2492,65 @@ of ``-W(no-)*``.
     non-terminating evidence for certain superclass constraints.
     This is no longer allowed, as explained in :ref:`undecidable-instances`.
     This warning was used during the transition period.
+
+.. ghc-flag:: -Wpun-bindings
+    :shortdesc: warn when type and term bindings share a name in one scope
+    :type: dynamic
+    :reverse: -Wno-pun-bindings
+    :since: 10.2
+    :default: off
+
+    Warn about type and term definitions with the same name in a module's
+    top-level scope, such as ``data T = T``. A top-level declaration splice
+    can separate the two declarations. The later declaration still warns.
+    A local declaration can shadow an imported name without producing this
+    warning.
+
+    The warning also applies to type and value binders in one match,
+    including type variables introduced by a pattern annotation. For example: ::
+
+        id :: forall a -> a -> a
+        id (type a) a = a
+
+    An implicit binding in a pattern annotation depends on the names in
+    scope when GHC reads the annotation. If a preceding term binder would
+    supply the name in a single namespace, :ghc-flag:`-Wpun-uses` reports
+    the affected type references.
+
+    An enclosing scope can contain another binder with the same name.
+    For example, ``f @a = \(a :: a) -> a`` puts the term binder in the
+    lambda and uses the outer type variable in its annotation. This
+    does not produce a binding warning.
+
+    :ghc-flag:`-Weverything` enables this warning.
+
+.. ghc-flag:: -Wpun-uses
+    :shortdesc: warn about uses that rely on separate type and term namespaces
+    :type: dynamic
+    :reverse: -Wno-pun-uses
+    :since: 10.2
+    :default: off
+
+    Warn about uses of a global name when a name from the other namespace
+    would conflict with it in a single namespace. A qualifier can avoid
+    the conflict if it selects only one of the competing names. The check
+    uses name resolution across normal, quote and splice imports.
+    Unmarked names in export lists and constructor type patterns also
+    use this check.
+
+    The warning also applies when an explicit local binder in the
+    other namespace would replace the chosen binding. For example,
+    with :extension:`ScopedTypeVariables`, in
+    ``f :: forall a. a -> a; f = \a -> (a :: a)``, the type variable in
+    the body annotation warns because of the nearer term binder.
+
+    Also warn about implicit type-variable uses that would capture a
+    term name, and about list and boxed tuple type syntax that depends on
+    :extension:`ListTuplePuns`. This includes the list type ``[a]`` and the
+    list type constructor ``[]``. For implicit type-variable uses, this
+    warning takes precedence over :ghc-flag:`-Wterm-variable-capture`.
+
+    :ghc-flag:`-Weverything` enables this warning.
 
 .. ghc-flag:: -Wterm-variable-capture
     :shortdesc: warn when an implicitly quantified type variable captures a term's name
