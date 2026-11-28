@@ -1654,20 +1654,11 @@ tcExistsPack rn_expr args expected
 
     check_pack_payload schema binder body witness_src payload
       = do { arg <- either expr_to_type pure witness_src
-           ; inferred <- case arg of
-               HsWC [] ty | HsWildCardTy (HoleVar (L _ name)) <- unLoc (ignoreParens ty)
-                          , name == unnamedHoleRdrName
-                 -> infer_retained_witness binder body payload
-               _ -> return Nothing
-           ; witness_ty <- maybe (tcHsTypeApp arg (tyVarKind binder)) return inferred
+           ; witness_ty <- tcHsTypeApp arg (tyVarKind binder)
            ; let payload_ty = substTyWith [binder] [witness_ty] body
            ; payload' <- tcScalingUsage ManyTy $ tcCheckPolyExpr payload payload_ty
            ; let packed = XExpr (NativeExistsPack schema witness_ty payload')
            ; tcWrapResult rn_expr packed schema expected }
-
-    infer_retained_witness binder body payload = runMaybeT $ do
-      actual <- MaybeT (tcRetainedDeclaredArgType return payload)
-      matchRetainedExistsWitness (lexprCtOrigin payload) binder body actual
 
     expected_schema = traverse (liftZonkM . zonkTcType) =<< readExpType_maybe expected
     read_schema = expected_schema >>= maybe (failWithTc (TcRnExistsPack ExistsPackMissingSchema)) return

@@ -65,7 +65,7 @@ module GHC.Tc.Utils.Unify (
   qlUnify, qlMonoTcType, foldQLInstVars, anyFreeKappa,
   rejectNativeQuickLook, noQuickLookVars,
   matchExactPolytypeWitness, matchBarPackageWitnesses,
-  matchMixedExistsResult, matchRetainedExistsWitness
+  matchMixedExistsResult
   ) where
 
 import GHC.Prelude
@@ -119,11 +119,9 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Builtin.WiredIn.Types
 import GHC.Types.Name
-import GHC.Types.Name.Env ( lookupNameEnv )
 import GHC.Types.Name.Set ( extendNameSet )
-import GHC.Types.Id( idType, idMult, idInlineActivation )
+import GHC.Types.Id( idType, idInlineActivation )
 import GHC.Types.InlinePragma( isNeverActive )
-import GHC.Types.TypeEnv ( lookupTypeEnv )
 import GHC.Types.Var as Var
 import GHC.Types.Var.FV ( FV(..), runFV )
 import GHC.Types.Var.Set
@@ -140,7 +138,7 @@ import GHC.Driver.DynFlags
 
 import GHC.Data.Bag
 import GHC.Data.FastString
-import GHC.Data.Maybe (MaybeT(..), firstJusts, isJust, liftMaybeT)
+import GHC.Data.Maybe (firstJusts, isJust)
 
 import Control.Monad
 import Data.Functor.Identity (Identity(..))
@@ -6770,11 +6768,7 @@ tcSubTypeImplicitExists pos ds_flag unify inst_orig ctxt ty_actual ty_expected
                         , ForAllTy{} <- coreFullView exact
                         -> return exact
                       _ -> newMetaTyVarTyAtLevel QLInstVar (tyVarKind binder)
-               else do { -- Fallback until TauTv unifies directly with level-checked runtime indices.
-                         -- Remove matchRetainedExistsWitness once level-checked runtime index unification lands.
-                         retained <- runMaybeT $
-                           matchRetainedExistsWitness inst_orig binder body payload
-                       ; maybe (newFlexiTyVarTy (tyVarKind binder)) return retained }
+               else newFlexiTyVarTy (tyVarKind binder)
            ; let next_schema = substTyWith [binder] [witness] body
            ; (ws, final_body, inner_wrap) <- peel_pack quick payload next_schema
            ; return (witness : ws, final_body, mkWpExistsPack cur_schema witness <.> inner_wrap) }
@@ -6906,72 +6900,6 @@ matchExactPolytypeWitness binder formal actual
     empty_subst = Subst.mkEmptySubst (mkInScopeSet (tyCoVarsOfTypes [formal, actual]))
     bind_witness tv _ | tv == binder = BindMe
                       | otherwise    = DontBindMe
-
--- | Match a stored runtime index for an existential witness.
--- Fallback until TauTv unifies directly with level-checked runtime indices;
--- remove once level-checked runtime index unification lands.
-matchRetainedExistsWitness :: CtOrigin -> TyVar -> Type -> Type -> MaybeT TcM Type
-matchRetainedExistsWitness ct_origin binder body actual = do
-  guard (hasNativeDependentExpr (Core.Type actual))
-  loc <- liftMaybeT $ getCtLocM ct_origin (Just TypeLevel)
-  view <- liftMaybeT $ reductionReducedType <$> tcRewriteFamilyAxioms loc actual
-  witness <- MaybeT $ return $ do
-    let bind = bindOuterExistsTvs [binder]
-    s1 <- tcMatchRetainedTyX_BM bind Subst.emptySubst (typeKind body) (typeKind view)
-    s2 <- tcMatchRetainedTyX_BM bind s1 body view
-    Subst.lookupTyVar s2 binder
-  guard (hasNativeDependentExpr (Core.Type witness)
-         && eqType (typeKind witness) (tyVarKind binder)
-         && eqType (substTyWith [binder] [witness] body) view)
-  scoped <- liftMaybeT (check_retained_witness_scope witness)
-  guard scoped
-  return witness
-  where
-    check_retained_witness_scope :: Type -> TcM Bool
-    check_retained_witness_scope ty
-      | null runtime_ids = return True
-      | otherwise = do
-          local_env  <- getLclTypeEnv
-          global_env <- tcg_type_env <$> getGblEnv
-          givens     <- mapM (liftZonkM . zonkId) =<< getNativeGivens
-          let given_preds = map varType givens
-              given_protos = filter isNonCoVarId (concatMap tyCoVarsOfTypeList given_preds)
-              valid_bind lexical occ bnd =
-                occ == bnd
-                && ((isNativeIndexId occ && isNativeIndexId bnd)
-                    || (lexical && not (isExternalName (getName occ))
-                        && isNativeOpaqueValueId occ && isNativeOpaqueValueId bnd))
-                && eqType (varType occ) (varType bnd)
-                && eqType (idMult occ) (idMult bnd)
-              check_id v
-                | isNativeClassDictionaryId v = do
-                    scoped <- getLexicalGivens
-                    occ <- liftZonkM (zonkId v)
-                    acts <- mapM (liftZonkM . zonkId) (filter (== v) scoped)
-                    return $ case acts of
-                      [act] -> isNativeClassDictionaryId act && varType occ `eqType` varType act
-                      _     -> False
-                | isNativeNamedOpaqueFunctionId v = do
-                    act <- tcLookupIdMaybe (getName v)
-                    return $ maybe False (\b -> b == v && isNativeNamedOpaqueFunctionId b
-                                             && varType b `eqType` varType v) act
-                | otherwise = do
-                    occ <- liftZonkM (zonkId v)
-                    case lookupNameEnv local_env (getName v) of
-                      Just (ATcId { tct_id = lid }) -> valid_bind True occ <$> liftZonkM (zonkId lid)
-                      Just _                        -> return False
-                      Nothing -> case lookupTypeEnv global_env (getName v) of
-                        Just (AnId mid) -> valid_bind False occ <$> liftZonkM (zonkId mid)
-                        Just _          -> return False
-                        Nothing -> do
-                          protos <- mapM (liftZonkM . zonkId) (filter (== v) given_protos)
-                          let bad_proto p = isNonCoVarId p && p == occ && not (valid_bind True occ p)
-                          return (not (null protos)
-                                  && all (valid_bind True occ) protos
-                                  && not (any (anyFreeVarsOfType bad_proto) given_preds))
-          and <$> mapM check_id runtime_ids
-      where
-        runtime_ids = filter isNonCoVarId (tyCoVarsOfTypeList ty)
 
 {- Note [Monomorphise instantiation variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
