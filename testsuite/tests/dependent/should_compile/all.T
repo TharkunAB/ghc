@@ -121,3 +121,4 @@ test('NativeSameModNonStructuralOpen', normal, compile, ['-dcore-lint -dstg-lint
 test('NoPolyKindsOpenFamMatchability',
      [extra_files(['NoPolyKindsOpenFamMatchabilityA.hs'])],
      multimod_compile, ['NoPolyKindsOpenFamMatchability', '-v0 -dcore-lint'])
+test('DefunKindSynonymMatchability', normal, compile, ['-dcore-lint'])
