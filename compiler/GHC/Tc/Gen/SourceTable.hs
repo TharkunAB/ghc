@@ -16,7 +16,7 @@ module GHC.Tc.Gen.SourceTable
   , isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead
   , sourceLocalBooleanCases, isFinalStructuralSource, isStructuralSourceTable
   , isNominalStructuralSource, isSimpleNominalTable, isLargeElimTable, isLargeElimResultKind
-  , pruneDeadNonRecLets, isSafeLocalUninterpretedRhs, toKindMatchableArrows, rebuildSourceFamilyWith, tidySourceAxBranch
+  , pruneDeadNonRecLets, isSafeLocalUninterpretedRhs, hasPendingTypedSplice, hasExprHole, toKindMatchableArrows, rebuildSourceFamilyWith, tidySourceAxBranch
   , visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt
   , sourceEquationDatatypes, publicCaseType, ordinaryImport
   , sourceBinarySelector, sourceMapSelector, lookupSourceUnaryMethod, lookupSourceBinaryMethod, lookupSourceContainerMethod
@@ -4587,11 +4587,14 @@ unpackSourceBinds = concatMap split_one
       [L loc (XHsBindsLR (abs_b { abs_exports = [abe] })) | abe <- exports]
     split_one b = [b]
 
+-- | Does a checked binding contain a pending typed splice? 'zonkExpr' runs
+-- such a splice, so a read-only observation of the binding must skip it.
 hasPendingTypedSplice :: Data a => a -> Bool
 hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
     Just HsTypedSplice{} -> True
     _ -> or (gmapQ hasPendingTypedSplice node)
 
+-- | Does a checked binding contain an expression hole outside a typed splice?
 hasExprHole :: Data a => a -> Bool
 hasExprHole node = case cast node :: Maybe (HsExpr GhcTc) of
     Just HsHole{}        -> True

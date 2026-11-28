@@ -86,7 +86,7 @@ import GHC.Data.OrdList (fromOL)
 import GHC.Tc.Gen.SourceClosure
   ( checkLocalIndexedLookupExports, earlyClosureCandidateType, earlyIndexedLookups
   , pruneUnusedIndexedLookups, sourceEarlyClosureTables )
-import GHC.Tc.Gen.SourceTable (sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
+import GHC.Tc.Gen.SourceTable (hasExprHole, hasPendingTypedSplice, sourceTableTyCons, sourceCaseTables, sourceMapperType, sourceMapperTable, sourceCharacterTables, sourceRetainedWitnessTables, sourceLocalBooleanCases, checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness,
                                isStructuralSourceTable, isNominalStructuralSource, isSimpleNominalTable, isLargeElimTable, isLargeElimResultKind, pruneDeadNonRecLets, isSafeLocalUninterpretedRhs, rebuildSourceFamilyWith,
                                isSourceFilterGuard, sourceTableCallees, sourceTableFamilyUse,
                                sourceRuleOwners, sourceRuleOwnersAt, visibleSourceMethodRules, unloadedSourceRuleHeads,
@@ -3730,19 +3730,6 @@ localOpenDefinitions demands evidence binds = do
       [(idName mono, poly) | ABE{abe_mono = mono, abe_poly = poly} <- exports]
     monoOwners _ = []
 
-    -- zonkExpr executes a pending typed splice. The ordinary module
-    -- zonk still owns this operation. Observation must not execute it.
-    hasPendingTypedSplice :: Data a => a -> Bool
-    hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
-      Just HsTypedSplice{} -> True
-      _ -> or (gmapQ hasPendingTypedSplice node)
-
-    hasExprHole :: Data a => a -> Bool
-    hasExprHole node = case cast node :: Maybe (HsExpr GhcTc) of
-      Just HsHole{}        -> True
-      Just HsTypedSplice{} -> False
-      _                    -> or (gmapQ hasExprHole node)
-
 -- | Close the requested names over the eligible bindings in the graph.
 closeLocalNames :: Monad m => (Name -> m NameSet) -> NameSet -> [Name] -> m NameSet
 closeLocalNames dependencies = foldM visit
@@ -3785,17 +3772,6 @@ opportunisticOpenDefinitions evidence binds = do
               , (owner, rhs) <- pairs
               , exprType rhs `eqType` idType owner ]
         pure (definitions, owners)
-  where
-    hasPendingTypedSplice :: Data a => a -> Bool
-    hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
-      Just HsTypedSplice{} -> True
-      _ -> or (gmapQ hasPendingTypedSplice node)
-
-    hasExprHole :: Data a => a -> Bool
-    hasExprHole node = case cast node :: Maybe (HsExpr GhcTc) of
-      Just HsHole{}        -> True
-      Just HsTypedSplice{} -> False
-      _                    -> or (gmapQ hasExprHole node)
 
 -- | Collect resolved term and evidence references from one checked binding.
 localOpenReferences :: Data a => a -> [Name]
