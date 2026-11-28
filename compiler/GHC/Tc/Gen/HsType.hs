@@ -5618,7 +5618,8 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
                        | otherwise = pure (defaultForAllMatchability (binder_level b))
                  case (policy, defaults, index_level) of
                    (OrdinaryArrowChecking, Nothing, TypeLevel)
-                     | not (any (familyKindArrowUsesMatchability tc) indices) -> pure fun
+                     | null orig_hs_args
+                       || not (any (familyKindArrowUsesMatchability tc) indices) -> pure fun
                    _ -> mkTyConApp tc <$> traverse choose indices
            _ -> pure fun
        ; (f_args, res_k) <- go_init 1 fun orig_hs_args Nothing
