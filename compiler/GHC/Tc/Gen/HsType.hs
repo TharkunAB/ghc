@@ -3169,20 +3169,24 @@ tc_arrow_modifiers mode ann@(HsModifiedFunArr _ mods arr) = do
   modifiers <- xoptM LangExt.Modifiers
   if not modifiers then (, Nothing) <$> tc_mult mode ann else do
     linear_types <- xoptM LangExt.LinearTypes
-    let classify k
+    dep_types <- xoptM LangExt.DependentTypes
+    let suggest_kind
+          | linear_types && not dep_types = Just multiplicityTyConName
+          | otherwise                     = Nothing
+        classify k
           | tcEqType k matchabilityTy = Right ArrowMatchability
           | isMultiplicityTy k && linear_types = Right ArrowMultiplicity
           | isMultiplicityTy k = Left SuggestLinear
           | otherwise = Left DontSuggestLinear
-    (mult, ma) <- foldM (addModifier classify) (Nothing, Nothing) mods
+    (mult, ma) <- foldM (addModifier suggest_kind classify) (Nothing, Nothing) mods
     case (arr, mult) of
       (HsLinearArr _, Nothing) -> pure (Just oneDataConTy, ma)
       (HsLinearArr _, Just _) -> failWithTc TcRnTooManyMultiplicities
       (HsStandardArr _, _) -> pure (mult, ma)
   where
-    addModifier classify (mult, ma) modifier = setSrcSpanA (getLoc modifier) $ do
-      found <- tc_modifier_with mode modifier Nothing classify
-      case found of
+    addModifier suggest_kind classify (mult, ma) modifier = do
+      found <- tc_modifier_with mode modifier suggest_kind classify
+      setSrcSpanA (getLoc modifier) $ case found of
         Nothing -> pure (mult, ma)
         Just (ArrowMultiplicity, m)
           | isNothing mult -> pure (Just m, ma)
@@ -5915,16 +5919,24 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
                 visible = if from_expected
                           then length (visible_domains inner_ki)
                           else supplied_args
-          , any (promoted_field_callback_index tv) (take visible (visible_domains inner_ki))
-          = case mode_holes mode of
+                vis_doms = take visible (visible_domains inner_ki)
+          , any (promoted_field_callback_index tv) vis_doms
+          = let arrow_lvl
+                  | any (promoted_field_kind_arrow_index tv) vis_doms = KindLevel
+                  | otherwise                                         = TypeLevel
+                default_prom_binder =
+                  tcInstInvisibleTyBinder
+                    (if mode_declaration mode then Nothing else Just arrow_lvl)
+                    subst
+            in case mode_holes mode of
               Just (_, HM_FamPat{}) -> fresh
               Nothing -> case mode_synonym_metadata mode of
                 Just (_, Just outer_arrow) | from_expected -> bind <$> outer_arrow KindLevel
                 _ -> do { owner <- tcl_kind_arrow_defaults <$> getLclEnv
                         ; case owner of
-                            Just (defaults, _) -> bind <$> fresh_kind_arrow TypeLevel defaults
-                            Nothing -> default_binder tv }
-              _ -> default_binder tv
+                            Just (defaults, _) -> bind <$> fresh_kind_arrow arrow_lvl defaults
+                            Nothing -> default_prom_binder tv }
+              _ -> default_prom_binder tv
           -- See Note [Omitted matchability in higher-order arguments].
           | Specified <- flag
           , TypeLevel <- mode_tyki mode
@@ -5978,6 +5990,18 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
           = getTyVar_maybe arrow == Just tv
             || promoted_field_callback_index tv arg
             || promoted_field_callback_index tv result
+          | otherwise = False
+
+        promoted_field_kind_arrow_index tv domain
+          | Just (arrow, Scaled _ arg, result) <- tcSplitFunTy_maybe domain
+          = (getTyVar_maybe arrow == Just tv && returns_lifted_type result)
+            || promoted_field_kind_arrow_index tv arg
+            || promoted_field_kind_arrow_index tv result
+          | otherwise = False
+
+        returns_lifted_type ty
+          | tcIsLiftedTypeKind ty = True
+          | Just (_, _, res) <- tcSplitPiTy_maybe ty = returns_lifted_type res
           | otherwise = False
 
         quantified_callback tv kind
