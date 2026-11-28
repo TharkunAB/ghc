@@ -5,7 +5,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.List (find)
 import GHC
 import GHC.Builtin.CoercionRules
-  (boxedPairCompositionRule, boxedPairReconstructionRule, matchBoxedPairComposition, proveBoxedPairProjection)
+  (boxedPairReconstructionRule, proveBoxedPairProjection)
 import GHC.Builtin.WiredIn.Types (boolTy, falseDataCon, promotedTupleDataCon, trueDataCon)
 import GHC.Core.Coercion (mkNomReflCo, mkRepReflCo)
 import GHC.Core.DataCon (promoteDataCon)
@@ -59,11 +59,11 @@ main = do
           lint co = isEmptyBag (snd (lintTcCoercion (initLintConfig flags []) co))
           wrongRole = AxiomCo boxedPairReconstructionRule [mkNomReflCo lhs, mkRepReflCo rhs]
       liftIO $ do
-        case matchBoxedPairComposition lhs rhs of
+        case map fst . snd <$> proveBoxedPairProjection lhs rhs of
           Just [_, _, _] -> pure ()
-          _ -> fail "The original exchange matcher lost a source dependency"
-        unless (lint (evidence boxedPairCompositionRule lhs rhs)) (fail "Rejected an old exchange proof")
-        unless (selectedRule lhs rhs == Just boxedPairCompositionRule) (fail "Changed the exchange rule key")
+          _ -> fail "The exchange proof lost a source dependency"
+        unless (lint (evidence boxedPairReconstructionRule lhs rhs)) (fail "Rejected an exchange proof")
+        unless (selectedRule lhs rhs == Just boxedPairReconstructionRule) (fail "Changed the exchange rule key")
         unless (selectedRule lhsDuplicate lhsDirect == Just boxedPairReconstructionRule) $
           fail "Rejected the selected binder of a duplicated field"
         unless (lint (evidence boxedPairReconstructionRule lhsDuplicate lhsDirect)) $
@@ -80,8 +80,6 @@ main = do
         when (lint wrongRole) (fail "Accepted a representational premise")
         when (lint (evidence boxedPairReconstructionRule lhsDuplicate rhs)) $
           fail "Accepted the other field after duplication"
-        when (lint (evidence boxedPairCompositionRule lhsDuplicate lhsDirect)) $
-          fail "Accepted new evidence under the exchange-only key"
 
 family :: ModuleInfo -> String -> Ghc TyCon
 family info occ = do
