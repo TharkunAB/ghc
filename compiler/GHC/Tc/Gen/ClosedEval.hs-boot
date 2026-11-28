@@ -10,7 +10,6 @@ import GHC.Types.Var (Id)
 tcPrepareClosedApplication :: Id -> [Type] -> Kind -> [Bool] -> TcM ([CoreExpr] -> TcM CoreExpr)
 tcPrepareClosedFunctionValue :: Id -> Type -> TcM CoreExpr
 tcPrepareClosedResult :: Name -> Kind -> TcM (CoreExpr -> TcM Type)
-tcPrepareClosedObservation :: Name -> Kind -> Name -> TcM (CoreExpr -> TcM (Maybe Type))
 tcCheckClosedCallContext :: Name -> TcM ()
 tcPreflightClosedCall :: Name -> TcM ()
 tcDecodeClosedCallOperand :: Name -> Type -> TcM (Maybe CoreExpr)

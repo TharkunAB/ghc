@@ -11,7 +11,6 @@ module GHC.Tc.Gen.ClosedEval
   , tcPrepareClosedApplication
   , tcPrepareClosedFunctionValue
   , tcPrepareClosedResult
-  , tcPrepareClosedObservation
   , tcCheckClosedCallContext
   , tcPreflightClosedCall
   , tcDecodeClosedCallOperand
@@ -29,7 +28,7 @@ import GHC.Driver.DynFlags
 import GHC.Driver.Env
 import GHC.Driver.Errors (printMessages)
 import GHC.Driver.Main (hscCompileCoreExpr)
-import GHC.Driver.Main.Passes (hscCompileCoreExprWithOptionalName, hscLoadSameModuleClosedBcos)
+import GHC.Driver.Main.Passes (hscLoadSameModuleClosedBcos)
 import GHC.Driver.Ppr (showPpr, showSDocForUser)
 import GHC.Driver.Session (packageTrustOn, safeInferOn, safeLanguageOn)
 
@@ -101,7 +100,6 @@ import GHC.Types.Var.Set
 
 import GHC.Data.Bag (Bag)
 import GHC.Data.FastString (fsLit)
-import GHC.Data.Maybe (expectJust)
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Utils.Exception (Exception(..), SomeAsyncException, fromException, throwIO)
@@ -853,17 +851,6 @@ prepareClosedFunction fun expected = do
 -- | Render and interpret a complete runtime expression at a type boundary.
 tcPrepareClosedResult :: Name -> Kind -> TcM (Core.CoreExpr -> TcM Type)
 tcPrepareClosedResult name result_kind = do
-  reify <- tcPrepareClosedResultWithOptionalName name result_kind Nothing
-  pure (fmap expectJust . reify)
-
--- | Observe an executable entry when the interpreter can load its symbol.
-tcPrepareClosedObservation :: Name -> Kind -> Name -> TcM (Core.CoreExpr -> TcM (Maybe Type))
-tcPrepareClosedObservation name result_kind entry =
-  tcPrepareClosedResultWithOptionalName name result_kind (Just entry)
-
-tcPrepareClosedResultWithOptionalName
-  :: Name -> Kind -> Maybe Name -> TcM (Core.CoreExpr -> TcM (Maybe Type))
-tcPrepareClosedResultWithOptionalName name result_kind optional = do
   hsc_env <- getTopEnv
   checked_shape <- tcClosedCallValueShape name result_kind
   shape <- case checked_shape of
@@ -910,25 +897,20 @@ tcPrepareClosedResultWithOptionalName name result_kind optional = do
         if needs_local_itbls
           then hscLoadSameModuleClosedBcos hsc_env_bco loc local_alg_tcs local_bco_binds
           else pure ([], emptyUDFM)
-      (value, links, packages) <- case optional of
-        Nothing -> do
-          (val, lks, pkgs) <- hscCompileCoreExpr hsc_env_bco loc full_expr
-          pure (Just val, lks, pkgs)
-        Just entry -> hscCompileCoreExprWithOptionalName hsc_env_bco loc entry full_expr
+      (value, links, packages) <- hscCompileCoreExpr hsc_env_bco loc full_expr
       pure (value, local_links ++ links, plusUDFM local_pkgs packages)
     (value, links, packages) <- either (bad . displayException) pure compiled
     recordThNeededRuntimeDeps links packages
-    forM value $ \val -> do
-      outcome <- tryAllM $ liftIO $ timeout 10000000 (evalString interp val)
-      rendered <- case outcome of
-        Left exn | Just async <- (fromException exn :: Maybe SomeAsyncException) ->
-          liftIO $ throwIO async
-        Left exn -> bad (displayException exn)
-        Right Nothing -> bad "Compile-time evaluation exceeded the time limit."
-        Right (Just rendered) -> pure rendered
-      case decodeClosedCallResult shape rendered of
-        Just ty | typeKind ty `tcEqType` result_kind -> return ty
-        _ -> bad "The value returned by the interpreter does not match the checked result type."
+    outcome <- tryAllM $ liftIO $ timeout 10000000 (evalString interp value)
+    rendered <- case outcome of
+      Left exn | Just async <- (fromException exn :: Maybe SomeAsyncException) ->
+        liftIO $ throwIO async
+      Left exn -> bad (displayException exn)
+      Right Nothing -> bad "Compile-time evaluation exceeded the time limit."
+      Right (Just rendered) -> pure rendered
+    case decodeClosedCallResult shape rendered of
+      Just ty | typeKind ty `tcEqType` result_kind -> return ty
+      _ -> bad "The value returned by the interpreter does not match the checked result type."
   where
     bad :: String -> TcM a
     bad = failWithTc . TcRnClosedTypeEval name
