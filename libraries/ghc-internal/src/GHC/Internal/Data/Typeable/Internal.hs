@@ -95,7 +95,7 @@ import qualified GHC.Internal.Arr as A
 import GHC.Internal.Data.Either (Either (..))
 import GHC.Internal.Data.Type.Equality
 import GHC.Internal.Err (error, errorWithoutStackTrace)
-import GHC.Internal.List ( splitAt, foldl', elem, replicate, length )
+import GHC.Internal.List ( splitAt, foldl', elem, filter, replicate, length )
 import GHC.Internal.Magic.Dict ( WithDict(..) )
 import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Unicode (isDigit)
@@ -927,6 +927,13 @@ Raw FUN has matchability as its first stored argument. Omit that argument
 when it is U, as with an ordinary arrow. A raw FUN with M still prints the
 selector. Keep all matchability data in the representation.
 
+Other TyCons can store an inferred Matchability kind argument. For example,
+the promoted constructor 'Endo of `data Endo a = Endo (a -> a)` has the kind
+`forall {m}. (a %m -> a) -> Endo a`. Omit such a kind argument when it is the
+kind default M, so that `typeRep @('Endo Maybe)` shows as `'Endo * Maybe`.
+See Note [Matchability of promoted constructor function fields] in
+GHC.Core.DataCon.
+
 Render TrFun before the list and tuple cases. Those cases use splitApps,
 which only supports unrestricted function types.
 
@@ -980,6 +987,8 @@ showTypeableWithMatchability def _ rep
 showTypeableWithMatchability _ _ (TrTyCon {trTyCon = tycon, trKindVars = []})
   = showTyCon tycon
 showTypeableWithMatchability _ p (TrTyCon {trTyCon = tycon, trKindVars = args})
+  | [] <- shown_args = showTyCon tycon
+  | otherwise
   = showParen (p > 9) $
     showTyCon tycon .
     showChar ' ' .
@@ -989,7 +998,11 @@ showTypeableWithMatchability _ p (TrTyCon {trTyCon = tycon, trKindVars = args})
       | tycon == funTyCon
       , SomeTypeRep ma : rest@[_, _, _] <- args
       , Just HRefl <- eqTypeRep trUnmatchable ma = rest
-      | otherwise = args
+      | tycon == funTyCon = args
+      | otherwise = filter (not . default_matchability) args
+    default_matchability (SomeTypeRep ma) = case eqTypeRep trMatchable ma of
+      Just HRefl -> True
+      Nothing    -> False
 showTypeableWithMatchability def p (TrApp {trAppFun = f, trAppArg = x})
   = showParen (p > 9) $
     showTypeableWithMatchability def 8 f .

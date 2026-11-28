@@ -5930,6 +5930,9 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
                     subst
             in case mode_holes mode of
               Just (_, HM_FamPat{}) -> fresh
+              -- A supplied argument fixes the index in a visible type
+              -- application, for example @Proxy \@('Endo Maybe)@.
+              Just (_, HM_VTA) | supplied_args > 0 -> fresh
               Nothing -> case mode_synonym_metadata mode of
                 Just (_, Just outer_arrow) | from_expected -> bind <$> outer_arrow KindLevel
                 _ -> do { owner <- tcl_kind_arrow_defaults <$> getLclEnv
