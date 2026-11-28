@@ -293,3 +293,4 @@ test('DepPluginsPackageDb',
      [req_host_target_ghc, req_interp, req_rts_linker, only_ways(['normal']),
       extra_files(['plugins_package_db', 'NativePluginsGeneral.hs', 'NativeObsEqPlugin.hs'])],
      makefile_test, ['DepPluginsPackageDb'])
+test('PromotedConCallbackTypeApp', normal, compile_and_run, [''])
