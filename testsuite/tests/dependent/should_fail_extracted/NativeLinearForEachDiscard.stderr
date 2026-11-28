@@ -1,5 +1,5 @@
 NativeLinearForEachDiscard.hs:7:15: error: [GHC-18872]
     • Couldn't match type ‘Many’ with ‘One’
-        arising from multiplicity of ‘x_a1cI’
+        arising from multiplicity of ‘x_a1dc’
     • In an equation for ‘discardLinear’: discardLinear _ Proxy = ()
 

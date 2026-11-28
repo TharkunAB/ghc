@@ -45,6 +45,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (evalStateT, get, modify')
 import Data.Char (isDigit)
 import Data.List (isPrefixOf, sortBy, stripPrefix)
+import Data.Maybe (isJust)
 import qualified Data.Set as Set
 
 -- | Resolve the stable names written to the interface by CoreToIface.
@@ -191,7 +192,8 @@ eqScopedLambdaEta lhs rhs
   , isUnsaturatedUserFamily family expected
   , typeKind lhs `eqType` typeKind rhs
   = forwards_family lambda args family expected
-    || eqInstantiatedScopedClosures (scope, tyConName family) lambda args family expected
+    || (isJust (sourceTableTermOcc (nameOccName (tyConName family)))
+        && eqInstantiatedScopedClosures (scope, tyConName family) lambda args family expected)
   | otherwise = False
   where
     forwards_family lambda args family expected

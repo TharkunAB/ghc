@@ -762,7 +762,8 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                               , not (idName fun `elemNameSet` early_closure_owners)
                               , not (idName fun `elemNameSet` all_table_owners)
                               , SourceTableId _ table NominalSourceTable <- [idDetails fun]
-                              , isNominalStructuralSource fun
+                              , tyConName table `elemNameSet` local_used_tables
+                                || isNominalStructuralSource fun
                                 || isLargeElimTable table
                                 || sourceMapperType (idType fun)]
           setGblEnv with_fields $ do
@@ -2716,6 +2717,9 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
                           (_, _, res_ty) = splitFunTys body_ty
                       in isLargeElimResultKind res_ty && not (res_ty `eqType` body_ty)
                     _ -> False
+                  no_pat_error nm = case lookupNameEnv local_def_map nm of
+                    Just (_, rhs) -> not (any (`hasKey` patErrorIdKey) (exprSomeFreeVarsList isId rhs))
+                    Nothing       -> False
                   safe_open_fallback nm = not strict_mode && case lookupNameEnv local_def_map nm of
                     Just (_, rhs) -> safe_open_expr nm rhs
                     Nothing       -> False
@@ -2736,10 +2740,9 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
                       go_e (Core.Let (Core.NonRec _ r) b) = go_e r && go_e b
                       go_e (Core.Let (Core.Rec [(v, r)]) b) =
                         not (any (== v) (exprSomeFreeVarsList isId r)) && go_e r && go_e b
-                      go_e (Core.Let Core.Rec{} _) = False
                       go_e (Core.Case s _ _ alts@(_ : _)) =
                         go_e s && check_alts alts && all (\(Core.Alt _ _ r) -> go_e r) alts
-                      go_e Core.Case{} = False
+                      go_e _ = False
                       check_alts [Core.Alt Core.DEFAULT _ _] = False
                       check_alts alts =
                         not (any (\case Core.Alt Core.LitAlt{} _ _ -> True; _ -> False) alts) &&
@@ -2772,7 +2775,8 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
                           || (not (family `elemNameSet` used_in_early)
                               && not (is_large_elim_owner term)
                               && term `elemNameEnv` local_def_map
-                              && (safe_open_fallback term || only_closed_in_rest family))) $
+                              && (safe_open_fallback term
+                                  || (no_pat_error term && only_closed_in_rest family)))) $
                     setSrcSpan (nameSrcSpan term) (addErr (TcRnNoSourceTable term))
               failIfErrsM
               addTopEvBinds evs $ do
@@ -3863,17 +3867,29 @@ tcTopSrcDeclGroupWithMethods deferred_val_names previous_deriving group@(HsGroup
                 , not (isEmptyNameSet (more `minusNameSet` needed))
                 = close_needed (needed `unionNameSet` more)
                 | otherwise = needed
-            ; non_syn_uses = externalDeclUses deriv_decls `unionNameSet`
+            ; non_syn_uses = externalDeclUses (deriv_decls, default_decls) `unionNameSet`
                              unionNameSets [ tg_uses tg | tg <- tycl_decls, not (is_syn_only_group tg) ]
             ; needed_early_syns = close_needed non_syn_uses
+            ; val_bind_names = mkNameSet (collectHsValBinders CollNoDictBinders hs_val_binds)
+            ; group_method_names = mkNameSet [ b | t <- tycl_decls, b <- hsTyClForeignBinders [t] [], isVarName b ]
+            ; syn_val_triggers = val_bind_names `unionNameSet` group_method_names
+                                 `unionNameSet` fromMaybe emptyNameSet deferred_val_names
+            ; close_trailing deferred
+                | let more = unionNameSets
+                        [ tg_defs tg | tg <- tycl_decls, is_syn_only_group tg
+                        , not (isEmptyNameSet (tg_uses tg `intersectNameSet` (syn_val_triggers `unionNameSet` deferred))) ]
+                , not (isEmptyNameSet (more `minusNameSet` deferred))
+                = close_trailing (deferred `unionNameSet` more)
+                | otherwise = deferred
+            ; wanted_trailing_syns = close_trailing emptyNameSet
             ; (trailing_syn_decls, main_tycl_decls) =
-                if dep_types && isJust previous_deriving
+                if dep_types && isJust previous_deriving && not (isEmptyNameSet wanted_trailing_syns)
                   then partition (\tg -> is_syn_only_group tg
+                                      && not (isEmptyNameSet (tg_defs tg `intersectNameSet` wanted_trailing_syns))
                                       && isEmptyNameSet (tg_defs tg `intersectNameSet` needed_early_syns))
                                  tycl_decls
                   else ([], tycl_decls)
             ; trailing_syn_names = unionNameSets (map tg_defs trailing_syn_decls)
-            ; val_bind_names = mkNameSet (collectHsValBinders CollNoDictBinders hs_val_binds)
             ; unready_val_names = val_bind_names
                                   `unionNameSet` trailing_syn_names
                                   `unionNameSet` fromMaybe emptyNameSet deferred_val_names } ;

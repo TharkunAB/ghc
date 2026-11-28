@@ -1,6 +1,13 @@
-NativeStoredDictLinearCase.hs:7:30: error: [GHC-83605]
-    • A retained argument must have unrestricted multiplicity Many.
-      This argument has multiplicity: t0
+NativeStoredDictLinearCase.hs:7:12: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’
+        arising from multiplicity of ‘x’
+    • In the pattern: Stored x
+      In a case alternative: Stored x -> case observe x of Tagged b -> b
+      In the expression:
+        case c of Stored x -> case observe x of Tagged b -> b
+
+NativeStoredDictLinearCase.hs:7:30: error: [GHC-18872]
+    • Couldn't match type ‘Many’ with ‘One’ arising from a use of ‘x’
     • In the expression: observe x
       In the expression: case observe x of Tagged b -> b
       In a case alternative: Stored x -> case observe x of Tagged b -> b

@@ -670,18 +670,15 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
                | v <- tyCoVarsOfTypeList raw_hole_ty
                , isNonCoVarId v
                , not (isGlobalId v)
-               , not (isUnderscore (nameOccName (idName v)))
                ]
              | otherwise = []
            bndr_term_ids
              | dep_exts
-             = [ b
-               | TcIdBndr b _ <- ctl_bndrs (ctLocEnv ct_loc)
-               , not (isUnderscore (nameOccName (idName b)))
-               ]
+             = [ b | TcIdBndr b _ <- ctl_bndrs (ctLocEnv ct_loc) ]
              | otherwise = []
-           lclBinds = nubBy (==) (lclBinds0 ++ bndr_term_ids ++ hole_term_ids)
-     ; withHoleLclEnv ct_loc lclBinds implics $ do
+           scopeBinds = nubBy (==) (lclBinds0 ++ bndr_term_ids ++ hole_term_ids)
+           lclBinds = filter (not . isUnderscore . nameOccName . idName) scopeBinds
+     ; withHoleLclEnv ct_loc scopeBinds implics $ do
      { hole_ty <- preNormalizeHoleTy dep_exts ct_loc raw_hole_ty
      ; tcg_env <- getGblEnv
      ; plugins <- readTcRef (tcg_plugins tcg_env)

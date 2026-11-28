@@ -168,7 +168,7 @@ import GHC.Types.Id.Info (IdDetails(DFunId, VanillaId))
 import GHC.Types.Var (setIdDetails)
 import GHC.Types.Name.Cache (NameCache)
 import GHC.Types.Name.Env (elemNameEnv, filterNameEnv, lookupNameEnv, mapNameEnv, mkNameEnv)
-import GHC.Types.Name.Set (NameSet, emptyNameSet, mkNameSet, elemNameSet, extendNameSet, extendNameSetList, isEmptyNameSet, nameSetElemsStable)
+import GHC.Types.Name.Set (NameSet, emptyNameSet, mkNameSet, elemNameSet, extendNameSet, extendNameSetList, isEmptyNameSet, nameSetElemsStable, unionNameSet)
 import GHC.Types.IPE
 import GHC.Types.Name
 import GHC.Types.Name.Ppr
@@ -177,7 +177,7 @@ import GHC.Types.SourceError
 import GHC.Types.SafeHaskell
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
-import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, plusTypeEnv, typeEnvFromEntities)
+import GHC.Types.TypeEnv (TypeEnv, lookupTypeEnv, plusTypeEnv, typeEnvFromEntities, typeEnvIds)
 import GHC.Types.TyThing (TyThing(..), implicitTyConThings)
 import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, splitUniqSupply, uniqFromTag, UniqueTag(BcoTag, HscTag) )
 import GHC.Types.Unique.Set
@@ -904,18 +904,19 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
   -- Simplify, if appropriate, and (whether we simplified or not) generate an
   -- interface file.
   local_eval_terms <- liftIO $ localEvaluatedTermUses tc_result
-  mb_mut_ref <- if null local_eval_terms
+  th_core_plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
+  mb_mut_ref <- if null local_eval_terms && null th_core_plugins && not (hasActiveCorePlugins hsc_env)
     then pure Nothing
     else Just <$> liftIO (newIORef emptyNameSet)
   let read_plugin_mutations = maybe (pure emptyNameSet) (liftIO . readIORef) mb_mut_ref
   case mb_desugar of
       -- Just cause we desugared doesn't mean we are generating code, see above.
       Just desugared_guts | backendGeneratesCode bcknd -> do
-          plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
+          let plugins = th_core_plugins
           optimized <- hscSimplifyWithPluginMutations mb_mut_ref plugins desugared_guts
           mutated_names <- read_plugin_mutations
           (before_tidy, after_tidy) <- splitUniqSupply <$> liftIO (mkSplitUniqSupply HscTag)
-          let checked = keepValidatedSourceMappers desugared_guts optimized
+          let checked = keepValidatedSourceMappers mutated_names desugared_guts optimized
               simplified_guts = checked { mg_binds = keepCheckedMapWorkers before_tidy tc_result $
                                               publishListFoldMethods (mg_module checked) (mg_binds checked) }
 
@@ -1071,13 +1072,13 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 -- | Drop provisional certificates whose exact owner or callee no longer checks.
 -- The typechecker creates them after checking all source uses.
 -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
-keepValidatedSourceMappers :: ModGuts -> ModGuts -> ModGuts
-keepValidatedSourceMappers original final
+keepValidatedSourceMappers :: NameSet -> ModGuts -> ModGuts -> ModGuts
+keepValidatedSourceMappers mutated_names original final
   | isEmptyNameSet owners && isEmptyNameSet families = final
   | otherwise = final { mg_binds = map clearBind (mg_binds final)
                       , mg_tcs = filter (not . invalidFamily) (mg_tcs final) }
   where
-    (owners, families) = invalidSourceMappers original (Just final)
+    (owners, families) = invalidSourceMappers mutated_names original (Just final)
     invalidFamily tc = tyConName tc `elemNameSet` families
     clearOwner = clearInvalidSourceOwner owners families
     clearBind (NonRec v rhs) = NonRec (clearOwner v) rhs
@@ -1092,7 +1093,7 @@ validateSimpleSourceTables original final env
                     , tcg_type_env = mapNameEnv clearOwner
                         (filterNameEnv (not . invalidName . getName) (tcg_type_env env)) }
   where
-    (owners, families) = invalidSourceMappers original final
+    (owners, families) = invalidSourceMappers emptyNameSet original final
     invalidName name = name `elemNameSet` families
     clearOwner (AnId owner) = AnId (clearInvalidSourceOwner owners families owner)
     clearOwner thing = thing
@@ -1167,7 +1168,7 @@ finalizeNoCodeSourceTables hsc_env hsc_src want_methods want_closures original_g
   (final_binds, fold_dfuns) <- if not want_methods
     then pure (mg_binds opt_guts, [])
     else do
-      let valid_guts = keepValidatedSourceMappers original_guts opt_guts
+      let valid_guts = keepValidatedSourceMappers emptyNameSet original_guts opt_guts
           marked_binds = keepCheckedMapWorkers before_tidy tc_env $
                            publishListFoldMethods mod (mg_binds valid_guts)
       ext_binds <- externaliseExportedMethodWorkers (hsc_NC hsc_env) mod (mg_tcs valid_guts) marked_binds
@@ -1286,10 +1287,17 @@ validateRetainedLookupBodies mb_mut_ref env guts
 -- evaluated at compile time during typechecking.
 localEvaluatedTermUses :: TcGblEnv -> IO [Name]
 localEvaluatedTermUses tc_result = do
-  eval_uses <- scs_evaluated_uses <$> readIORef (tcg_source_check tc_result)
+  scs <- readIORef (tcg_source_check tc_result)
   let this_mod = tcg_semantic_mod tc_result
+      eval_uses = scs_evaluated_uses scs
+      table_uses = scs_table_uses scs
+      local_table_owners = mkNameSet
+        [ idName fn
+        | fn <- typeEnvIds (tcg_type_env tc_result)
+        , Just tbl <- [sourceTableId_maybe fn]
+        , tyConName tbl `elemNameSet` table_uses ]
   pure [ nm
-       | nm <- nameSetElemsStable eval_uses
+       | nm <- nameSetElemsStable (eval_uses `unionNameSet` local_table_owners)
        , nameIsLocalOrFrom this_mod nm
        , isVarName nm ]
 
@@ -1349,12 +1357,26 @@ checkLocalEvaluatedPluginMutations hsc_env hsc_src logger print_config diag_opts
           failIfErrsM
 
 -- | Collect rejected owners and families, including equations that refer to them.
-invalidSourceMappers :: ModGuts -> Maybe ModGuts -> (NameSet, NameSet)
-invalidSourceMappers original final =
-    (mkNameSet (map idName failed),
+invalidSourceMappers :: NameSet -> ModGuts -> Maybe ModGuts -> (NameSet, NameSet)
+invalidSourceMappers mutated_names original final =
+    (mkNameSet (map idName (failed ++ mutated_owners)),
      close (mkNameSet (map tyConName
-            (rejected_list_tables ++ concatMap finalCoreSourceFamilies failed))))
+            (rejected_list_tables ++ mutated_tables ++ concatMap finalCoreSourceFamilies failed))))
   where
+    orig_pairs = flattenBinds (mg_binds original)
+    bind_map = mkNameEnv [ (idName b, rhs) | (b, rhs) <- orig_pairs ]
+    reaches_mutated !_ [] = False
+    reaches_mutated !seen (n : ns)
+      | n `elemNameSet` mutated_names = True
+      | n `elemNameSet` seen = reaches_mutated seen ns
+      | Just rhs <- lookupNameEnv bind_map n =
+          let deps = [ idName v | v <- exprSomeFreeVarsList isId rhs, idName v `elemNameEnv` bind_map ]
+          in reaches_mutated (extendNameSet seen n) (deps ++ ns)
+      | otherwise = reaches_mutated (extendNameSet seen n) ns
+    mutated_owners
+      | isEmptyNameSet mutated_names = []
+      | otherwise = [ b | (b, _) <- orig_pairs, isJust (sourceTableId_maybe b), reaches_mutated emptyNameSet [idName b] ]
+    mutated_tables = mapMaybe sourceTableId_maybe mutated_owners
     candidates = finalCoreMappers (mg_binds original)
     failed = case final of
       Just guts -> filter (not . verifyFinalCoreMapper (mg_binds guts)) candidates

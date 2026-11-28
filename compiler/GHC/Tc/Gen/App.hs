@@ -1779,9 +1779,12 @@ tcPrepareNativeQLApp True DoQL exp_ty rn_head fun sigma args
          then do
            { expected0 <- readExpType_maybe exp_ty >>= mapM zonkAppTypeIfNeeded
            ; sigma0    <- zonkAppTypeIfNeeded sigma
-           ; let keep_ql = supportsQuickLookType sigma0
-                           && maybe True supportsQuickLookType expected0
-           ; return ([], if keep_ql then DoQL else NoQL, sigma, args) }
+           ; non_ql_arg <- if not (supportsQuickLookType sigma0)
+                              || maybe False (not . supportsQuickLookType) expected0
+                           then return True
+                           else anyM arg_has_non_ql_anchor
+                                  [arg | EValArg { ea_arg = arg } <- args]
+           ; return ([], if non_ql_arg then NoQL else DoQL, sigma, args) }
          else if not (known_head fun)
          then return ([], DoQL, sigma, args)
          else do
@@ -6585,19 +6588,33 @@ tcCheckRetainedScalarArgM expected_mult0 reify domain0 arg0
                       _ -> return arg_id1
                     if isNativeOpaqueValueId (setIdMult arg_id2 ManyTy)
                       then do
-                        arg_id <- do
-                          let mult = idMult arg_id2
-                              flex_m = case coreFullView mult of
-                                TyVarTy tv -> isMetaTyVar tv
-                                _ -> False
-                          unless (isManyTy mult || flex_m) $ failWithTc $
-                            TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
-                          tcSubMult (OccurrenceOf (getName arg_id2)) ManyTy mult
-                          arg_id' <- liftZonkM (zonkId arg_id2)
-                          if isNativeOpaqueValueId arg_id' && isManyTy (idMult arg_id')
-                            then return arg_id'
-                            else failWithTc $ TcRnRetainedQuantificationError
-                                   (RetainedIndexMultiplicity (idMult arg_id'))
+                        arg_id <- if isOneTy m_here
+                          then do
+                            tcSubMult (OccurrenceOf (getName arg_id2)) m_here (idMult arg_id2)
+                            liftZonkM (zonkId arg_id2)
+                          else do
+                            cur_lvl <- getTcLevel
+                            let mult = idMult arg_id2
+                                flex_m = case coreFullView mult of
+                                  TyVarTy tv -> isMetaTyVar tv
+                                  _ -> False
+                                touchable_m = case coreFullView mult of
+                                  TyVarTy tv | isMetaTyVar tv -> isTouchableMetaTyVar cur_lvl tv
+                                  _ -> False
+                            unless (isManyTy mult || flex_m) $ failWithTc $
+                              TcRnRetainedQuantificationError (RetainedIndexMultiplicity mult)
+                            if touchable_m
+                              then void (unifyType Nothing mult ManyTy)
+                              else tcSubMult (OccurrenceOf (getName arg_id2)) ManyTy mult
+                            arg_id' <- liftZonkM (zonkId arg_id2)
+                            let mult' = idMult arg_id'
+                                flex_m' = case coreFullView mult' of
+                                  TyVarTy tv -> isMetaTyVar tv
+                                  _ -> False
+                            if isNativeOpaqueValueId arg_id' && (isManyTy mult' || (flex_m' && not touchable_m))
+                              then return arg_id'
+                              else failWithTc $ TcRnRetainedQuantificationError
+                                     (RetainedIndexMultiplicity mult')
                         tcEmitBindingUsage (singleUsageUE arg_id)
                         core <- tcRetainedArgVar (lexprCtOrigin original) expected arg_id
                         return (core, wrap_var_cast loc core arg_id)

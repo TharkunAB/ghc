@@ -3134,17 +3134,16 @@ compileDepClauseCols mg_ann mk_join ((v, can_alias) : vs) cur_rows has_outer_fb
     cons_exhaust (dc : rest) = pure (all (`elem` (dc : rest)) (runtimeTyConDataCons (dataConTyCon dc)))
 
 chooseSubColName :: Int -> [LPat GhcRn] -> TcM (Name, Bool)
-chooseSubColName idx sub_col
+chooseSubColName _ sub_col
   | all isRetainedVarPat sub_col
   , (first_loc, first_nm) : rest_vars <- var_locs
   , let first_occ = nameOccName first_nm
   , all ((== first_occ) . nameOccName . snd) rest_vars
   = (\u -> (mkInternalName u first_occ (locA first_loc), False)) <$> newUnique
   | otherwise
-  = (\u -> (mkInternalName u fallback_occ generatedSrcSpan, False)) <$> newUnique
+  = (\u -> (mkSystemNameAt u (mkVarOcc "_") generatedSrcSpan, False)) <$> newUnique
   where
     var_locs = [(nloc, nm) | L _ (VarPat _ (L nloc nm)) <- map stripClausePatWrappers sub_col]
-    fallback_occ = maybe (mkVarOcc ("sub_" ++ show idx)) (nameOccName . snd) (listToMaybe var_locs)
 
 -- | Desugar one outer constructor layer of nested patterns in a dependent or
 -- indexed GADT @case@, sharing multi-use fallbacks via 'mkDepJoinBinds'.
@@ -3270,17 +3269,16 @@ desugarDepClauseTree mctxt arity ty group@(MG { mg_alts = L loc rows })
         | otherwise          -> col_ty_infos n body
       _ -> replicate n (Nothing, False, Nothing)
 
-    choose_col_name idx col_pats (mb_dep_occ, is_dep_bndr, mb_col_ty)
+    choose_col_name _ col_pats (_, is_dep_bndr, mb_col_ty)
       | all isRetainedVarPat col_pats
       , (first_loc, first_nm) : rest_vars <- var_locs
       , let first_occ = nameOccName first_nm
       , all ((== first_occ) . nameOccName . snd) rest_vars
       = (\u -> (mkInternalName u first_occ (locA first_loc), False)) <$> newUnique
       | otherwise
-      = (\u -> (mkInternalName u fallback_occ generatedSrcSpan, can_case_alias)) <$> newUnique
+      = (\u -> (mkSystemNameAt u (mkVarOcc "_") generatedSrcSpan, can_case_alias)) <$> newUnique
       where
         var_locs = [(nloc, nm) | L _ (VarPat _ (L nloc nm)) <- map stripClausePatWrappers col_pats]
-        fallback_occ = maybe (fromMaybe (mkVarOcc ("arg_" ++ show idx)) mb_dep_occ) (nameOccName . snd) (listToMaybe var_locs)
         can_case_alias = not is_dep_bndr && maybe False (not . isSigmaTy) mb_col_ty
 
     peel_dep_sig [] sigma = ([], sigma)

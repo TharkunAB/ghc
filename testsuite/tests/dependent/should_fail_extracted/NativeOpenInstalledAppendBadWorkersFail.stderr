@@ -1,9 +1,3 @@
-NativeOpenInstalledAppendBadWorkersFail.hs:8:37: error: [GHC-70565]
-    • Cannot evaluate ‘BW.forceRight’ in a type.
-        This argument is a type variable. Closed evaluation requires a known value.
-    • In the type ‘BW.forceRight xs ys’
-      In the type synonym declaration for ‘BadRight’
-
 NativeOpenInstalledAppendBadWorkersFail.hs:11:23: error: [GHC-70566]
     • Cannot reduce the open call to ‘BW.ruledAppend’ in a type.
         Reduction stopped at a case on the rigid argument xs. A checked equation can retain this case until the argument's constructor is known.

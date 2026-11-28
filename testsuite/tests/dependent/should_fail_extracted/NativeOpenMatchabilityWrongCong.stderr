@@ -1,23 +1,23 @@
 NativeOpenMatchabilityWrongCong.hs:16:32: error: [GHC-05617]
-    • Could not deduce ‘add n (add m1 p1) ~ add m1 (add n p1)’
+    • Could not deduce ‘add n (add m p1) ~ add m (add n p1)’
       from the context: m ~ S m1
         bound by a pattern with constructor: S :: Nat -> Nat,
                  in an equation for ‘wrongAssoc’
         at NativeOpenMatchabilityWrongCong.hs:16:1-48
-      Expected: add (add m1 n) p1 :~: add m1 (add n p1)
-        Actual: add (add n m1) p1 :~: add n (add m1 p1)
+      Expected: add (add m n) p1 :~: add m (add n p1)
+        Actual: add (add n m) p1 :~: add n (add m p1)
       Note: GHC cannot determine the arguments of the function ‘add’ from its result.
     • In the second argument of ‘cong’, namely
-        ‘(wrongAssoc n_aG4 m p_aG5)’
-      In the expression: cong S (wrongAssoc n_aG4 m p_aG5)
+        ‘(wrongAssoc n_aGg m p_aGh)’
+      In the expression: cong S (wrongAssoc n_aGg m p_aGh)
       In an equation for ‘wrongAssoc’:
           wrongAssoc (S m) n p = cong S (wrongAssoc n m p)
 
 NativeOpenMatchabilityWrongCong.hs:20:24: error: [GHC-83865]
-    • Couldn't match type: add m2 x
-                     with: addRight m2 x
-      Expected: addRight m2 x :~: addRight m2 y
-        Actual: add m2 x :~: add m2 y
+    • Couldn't match type: add m1 x
+                     with: addRight m1 x
+      Expected: addRight m1 x :~: addRight m1 y
+        Actual: add m1 x :~: add m1 y
     • In the expression: cong (add m) eq
       In an equation for ‘wrongSource’:
           wrongSource m _ _ eq = cong (add m) eq

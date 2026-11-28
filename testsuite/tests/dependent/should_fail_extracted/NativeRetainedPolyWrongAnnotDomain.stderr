@@ -21,9 +21,9 @@ NativeRetainedPolyWrongAnnotDomain.hs:9:16: error: [GHC-25897]
           (bound at NativeRetainedPolyWrongAnnotDomain.hs:9:1)
 
 NativeRetainedPolyWrongAnnotDomain.hs:11:19: error: [GHC-83605]
-    • GHC cannot use the cast required for this argument as a retained index.
-      Expected: P.UCtx P.Zero P.Zero
-        Actual: P.UCtx P.Zero (P.Succ P.Zero)
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
     • In the expression:
         plugHoleId
           @(P.ULam (P.UVar P.FZ) :: P.UTerm 'P.Zero)

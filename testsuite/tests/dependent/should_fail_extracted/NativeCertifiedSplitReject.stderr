@@ -159,7 +159,7 @@ NativeCertifiedSplitReject.hs:45:14: error: [GHC-83865]
 
 NativeCertifiedSplitReject.hs:45:31: error: [GHC-83865]
     • Couldn't match type ‘P.plus cut suffix’ with ‘total’
-      Expected: P.Vec a (P.Add cut suffix)
+      Expected: P.Vec a (P.plus cut suffix)
         Actual: P.Vec a total
     • In the first argument of ‘SplitBothAtWidth’, namely
         ‘(splitAtValue cut xs)’
@@ -198,7 +198,7 @@ NativeCertifiedSplitReject.hs:45:36: error: [GHC-83865]
 
 NativeCertifiedSplitReject.hs:45:53: error: [GHC-83865]
     • Couldn't match type ‘P.plus cut suffix’ with ‘total’
-      Expected: P.Vec b (P.Add cut suffix)
+      Expected: P.Vec b (P.plus cut suffix)
         Actual: P.Vec b total
     • In the second argument of ‘SplitBothAtWidth’, namely
         ‘(splitAtValue cut ys)’

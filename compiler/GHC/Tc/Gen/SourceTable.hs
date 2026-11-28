@@ -17,7 +17,7 @@ module GHC.Tc.Gen.SourceTable
   , isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead
   , sourceLocalBooleanCases, isFinalStructuralSource, isStructuralSourceTable
   , isNominalStructuralSource, isSimpleNominalTable, isLargeElimTable, isLargeElimResultKind
-  , toKindMatchableArrows, rebuildSourceFamilyWith
+  , toKindMatchableArrows, rebuildSourceFamilyWith, tidySourceAxBranch
   , visibleSourceMethodRules, unloadedSourceRuleHeads, hasSourceMethodRule, hasSourceMethodRuleAt
   , sourceEquationDatatypes, publicCaseType, ordinaryImport
   , sourceBinarySelector, sourceMapSelector, lookupSourceUnaryMethod, lookupSourceBinaryMethod, lookupSourceContainerMethod
@@ -102,7 +102,7 @@ import GHC.Tc.TyCl.Build (newImplicitBinder)
 import GHC.Tc.Types (SourceCheckState(..), SourceRuleUses(..), TcGblEnv(..), tcVisibleOrphanMods)
 import GHC.Tc.Types.BasicTypes (TcBinder(TcIdBndr, TcIdBndr_ExpType), TcTyThing(ATcId, ATcTyCon, tct_id))
 import GHC.Tc.Types.ErrCtxt (FunAppCtxtFunArg(..), HsCtxt(..))
-import GHC.Tc.Types.Evidence (EvBind(..), EvBindsState(..), EvTerm(..), HsWrapper(..), TcEvBinds(..), collectHsWrapBinders, evBindMapBinds)
+import GHC.Tc.Types.Evidence ((<.>), EvBind(..), EvBindsState(..), EvTerm(..), HsWrapper(..), TcEvBinds(..), collectHsWrapBinders, evBindMapBinds, mkWpEvApps, mkWpTyApps)
 import GHC.Tc.Types.LclEnv (getLclEnvBinderStack, getLclEnvErrCtxt, getLclEnvTypeEnv)
 import GHC.Tc.Utils.Env (tcGetInstEnvs, tcLookupId, tcLookupIdMaybe)
 import GHC.Tc.Utils.Instantiate (freshenTyVarBndrs)
@@ -126,7 +126,7 @@ import GHC.Types.InlinePragma (ActivationX(ActiveAfter, ActiveBefore), PhaseNum,
 import GHC.Types.Name
   ( Name, OccName, SourceProofArg(..), SourceProofArgs, SourceProofRule, isExternalName, isFieldOcc, isVarOcc
   , mkInstTyCoOcc, mkSourceFstOcc, mkSourceSndOcc, mkSourceTableOcc, mkTyVarOcc, mkVarOcc, nameModule_maybe
-  , nameOccName, nameSrcSpan, nameStableString, occNameString, setOccNameSpace, sourceTableTermOcc, stableNameCmp, tvName )
+  , nameOccName, nameSrcSpan, nameStableString, occNameString, setOccNameSpace, sourceTableTermOcc, stableNameCmp, tidyNameOcc, tvName )
 import GHC.Types.Name.Env (NameEnv, delFromNameEnv, elemNameEnv, extendNameEnv, extendNameEnv_C, isEmptyNameEnv, lookupNameEnv, mkNameEnv, nonDetNameEnvElts, plusNameEnv_C)
 import GHC.Types.Name.Reader (GlobalRdrEnv, gre_imp, isLocalGRE, is_decl, is_isboot, lookupGRE_Name)
 import GHC.Types.Name.Set
@@ -2845,7 +2845,7 @@ compileCoreEquations spec owner original_rhs = do
       | length prefix_terms == length domains = Just (prefix_terms, [], Nothing, owner, Nothing, raw_body)
       | otherwise = Nothing
 
-    expandCaseDefaults in_scope True tc args (Core.Alt Core.DEFAULT [] def_body : rest@(_ : _)) | not (null (tyConDataCons tc)) = do
+    expandCaseDefaults in_scope True tc args (Core.Alt Core.DEFAULT [] def_body : rest) | not (null (tyConDataCons tc)) = do
       let explicit = [dc | Core.Alt (Core.DataAlt dc) _ _ <- rest]
           missing = filter (`notElem` explicit) (tyConDataCons tc)
           alloc sc [] = Just (sc, [])
@@ -3094,8 +3094,48 @@ buildSourceFamily name ax_name binders res_kind branches =
           _  -> CTF (Just axiom)
         fam_tc = mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy binders res_kind)
                    binders 0 res_kind Nothing (ClosedTypeFamilyTyCon flav) Nothing NotInjective
-        axiom = mkBranchedCoAxiom Nominal ax_name fam_tc (map ($ fam_tc) branches)
+        axiom = mkBranchedCoAxiom Nominal ax_name fam_tc (map (tidySourceAxBranch . ($ fam_tc)) branches)
     in fam_tc
+
+-- | Assign concise, non-colliding names to synthetic function-kinded branch
+-- binders so interface headers remain readable.
+tidySourceAxBranch :: CoAxBranch -> CoAxBranch
+tidySourceAxBranch br
+  | not (any (has_fun_ty . tyVarKind) tvs) = br
+  | otherwise =
+      let reserved = [occNameString (nameOccName (varName v)) | v <- tvs, not (has_fun_ty (tyVarKind v))]
+          go _ _ _ _ [] = ([], [])
+          go seen res old_tvs new_tys (tv : rest) =
+            let k'   = substTyWith old_tvs new_tys (tyVarKind tv)
+                occ0 = occNameString (nameOccName (varName tv))
+                cand | not (has_fun_ty k') = occ0
+                     | occ0 `elem` ho_pool && occ0 `notElem` seen = occ0
+                     | otherwise = fromMaybe occ0
+                         (find (\c -> c `notElem` seen && c `notElem` res) ho_pool
+                          <|> find (`notElem` seen) ho_pool)
+                nm'  = if cand == occ0 then varName tv else tidyNameOcc (varName tv) (mkTyVarOcc cand)
+                tv'  = mkTyVar nm' k'
+                ty'  = mkTyVarTy tv'
+                (rest_tvs, rest_tys) = go (cand : seen) res (tv : old_tvs) (ty' : new_tys) rest
+            in (tv' : rest_tvs, ty' : rest_tys)
+          (tvs', tys') = go [] reserved [] [] tvs
+          sub = substTyWith tvs tys'
+      in mkCoAxBranch tvs' [] (coAxBranchCoVars br)
+           (map sub (coAxBranchLHS br)) (sub (coAxBranchRHS br))
+           (coAxBranchRoles br) (coAxBranchSpan br)
+  where
+    tvs = coAxBranchTyVars br
+    ho_pool = ["f", "g", "h", "k", "p", "q", "r", "a", "b", "c", "d", "e", "m", "n", "rel", "step"]
+    has_fun_ty t = case coreFullView t of
+      FunTy{}        -> True
+      DepFunTy{}     -> True
+      DepDictTy _ b  -> has_fun_ty b
+      ForAllTy _ _ b -> has_fun_ty b
+      ExistsTy _ _ b -> has_fun_ty b
+      AppTy a b      -> has_fun_ty a || has_fun_ty b
+      TyConApp _ as  -> any has_fun_ty as
+      CastTy a _     -> has_fun_ty a
+      _              -> False
 
 -- ---------------------------------------------------------------------------
 -- Canonical CoAxBranch equivalence & post-Simplifier verification (ST8)
@@ -3683,7 +3723,11 @@ sourceCharacterTables definitions = do
 
 publishCharacterAliases :: TcGblEnv -> [(Id, Core.CoreExpr)] -> [(Id, TyCon)] -> TcM [(Id, TyCon)]
 publishCharacterAliases env candidates direct = do
-    let root_tables = mkNameEnv [(idName o, t) | (o, t) <- direct]
+    let root_tables = mkNameEnv $
+          [ (idName v, t)
+          | v <- typeEnvIds (tcg_type_env env)
+          , Just t <- [sourceTableId_maybe v] ] ++
+          [(idName o, t) | (o, t) <- direct]
         aliases = [ DigraphNode (o, target, res) (idName o) [idName target]
                   | (o, Core.Var target) <- candidates, not (idName o `elemNameEnv` root_tables)
                   , nameModule_maybe (idName target) == Just (tcg_semantic_mod env)
@@ -4570,6 +4614,7 @@ nominalBindPrecheck binding = do
 sourceTableTyCons :: Bool -> Bool -> LHsBinds GhcTc -> TcM [(Id, TyCon)]
 sourceTableTyCons local final_exports raw_binds = do
     let binds = unpackSourceBinds raw_binds
+    dep_types <- xoptM LangExt.DependentTypes
     strict <- xoptM LangExt.Strict
     rules <- goptM Opt_EnableRewriteRules
     dflags <- getDynFlags
@@ -4680,10 +4725,11 @@ sourceTableTyCons local final_exports raw_binds = do
           let owner_clean = isDefaultInlinePragma (idInlinePragma owner) && calleeClean owner && all (calleeClean . fst) callee_pairs
               allow_build = not rules || (final_exports && checks_final_core && build_clean && owner_clean)
               spec = (defaultCoreSpec (const True))
-                { ccs_helper = (`lookup` callee_pairs), ccs_allow_build = allow_build
-                , ccs_allow_zero_cases = not strict, ccs_allow_empty_root = not strict
-                , ccs_allow_tail_self = not strict, ccs_allow_sct_self = not strict
-                , ccs_allow_top_apply = not strict, ccs_allow_guard = not strict
+                { ccs_helper = (`lookup` callee_pairs), ccs_predicate = (`lookup` callee_pairs)
+                , ccs_allow_build = allow_build
+                , ccs_allow_zero_cases = not strict, ccs_allow_empty_root = dep_types && not strict
+                , ccs_allow_tail_self = dep_types && not strict, ccs_allow_sct_self = dep_types && not strict
+                , ccs_allow_top_apply = dep_types && not strict, ccs_allow_guard = dep_types && not strict
                 , ccs_allow_call_self = True, ccs_check_kind_public = False }
           case compileCoreEquations spec owner opt_rhs >>= checkNominalCoreShape strict of
             Just cct -> do
@@ -4722,7 +4768,7 @@ sourceTableTyCons local final_exports raw_binds = do
                              hdr 0 inst_res Nothing (ClosedTypeFamilyTyCon CTF_Abstract) Nothing NotInjective
             pure (Just ph_tc)
         certifyMutualScc checked group
-          | strict = pure []
+          | strict || not dep_types = pure []
           | otherwise = do
               let extract_mem (o, Right (raw_r, opt_r, cs), _) = Just (o, raw_r, opt_r, cs)
                   extract_mem _                                = Nothing
@@ -4971,8 +5017,9 @@ checkNominalCoreShapeWithSct strict run_sct cct = do
              allowedNominalType result)
       pure cct
     [CompiledCoreRow pats rhs] | all isPatVar pats -> do
+      let is_prod RhsCon{} = True; is_prod RhsCall{} = True; is_prod _ = False
       guard (all (`elem` concatMap tyCoVarsOfTypeList domains) tvs)
-      cct <$ guard (not strict && not (rhsHasSelf rhs) &&
+      cct <$ guard (not strict && is_prod rhs && not (rhsHasSelf rhs) &&
                     all allowedNominalType domains && allowedNominalType result)
     CompiledCoreRow pats0 _ : _ -> do
       guard (all (`elem` concatMap tyCoVarsOfTypeList domains) tvs)
@@ -5120,7 +5167,8 @@ certifyLocalInstanceMethods env0 pairs
                                     ext_name <- newImplicitBinder (idName dfun) $ \df_occ ->
                                       mkVarOcc (occNameString df_occ ++ "_" ++ occNameString (nameOccName (idName meth_id)))
                                     let synth = setIdExported (mkLocalId ext_name manyDataConTy (varType meth_id))
-                                        rhs_tc = noLocA (HsVar noExtField (noLocA meth_id))
+                                        wrap  = mkWpEvApps [EvExpr (Core.Var dfun)] <.> mkWpTyApps [inst_ty]
+                                        rhs_tc = mkLHsWrap wrap (noLocA (HsVar noExtField (noLocA sel)))
                                     pure (synth, Just (mkVarBind synth rhs_tc))
                                 table <- publishCompiledTable target_id cct
                                 let certified_id = setIdDetails target_id (SourceTableId (idName target_id) table NominalSourceTable)

@@ -81,7 +81,7 @@ import qualified GHC.LanguageExtensions as LangExt
 import Control.Monad
 import Data.Bifunctor ( first )
 import Data.Foldable ( toList, for_ )
-import Data.List ( partition )
+import Data.List ( nub, partition )
 import Data.List.NonEmpty ( NonEmpty(..), head, nonEmpty )
 import Data.Data ( Data, cast, gmapQ, gmapT )
 import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, mapMaybe, maybeToList )
@@ -389,7 +389,12 @@ localSourceTableBinders tycl_decls binds sigs = do
             , nameOccName n `elemOccSet` eligible_signed
             , not (null rows)
             , not (has_ps_splice rows)
-            , all eligible_row rows ]
+            , all eligible_row rows
+            , any row_has_pat_scrutiny rows
+              || any row_has_case_or_emb rows
+              || nameOccName n `elemOccSet` large_or_ho_signed
+              || all row_builds_con rows
+              || closure_wrapper_shape rows ]
       rec_witness_names =
         [ greName gre
         | tg <- tycl_decls
@@ -420,8 +425,21 @@ localSourceTableBinders tycl_decls binds sigs = do
     plain_rec_spec _ = False
 
     rec_uses_witness witness_tv (L _ (HsConDeclRecField _ [_] fld)) =
-      any ((== witness_tv) . unLoc) (extractHsTyRdrTyVars (cdf_type fld))
+      ty_uses_scalar_witness witness_tv (cdf_type fld)
     rec_uses_witness _ _ = False
+
+    ty_uses_scalar_witness :: RdrName -> LHsType GhcPs -> Bool
+    ty_uses_scalar_witness w ty = case unLoc (ignoreParens ty) of
+      HsTyVar _ NotPromoted (L _ rdr) -> rdr == w
+      HsAppTy _ f a -> (head_ok f && ty_uses_scalar_witness w f) || ty_uses_scalar_witness w a
+      HsAppKindTy _ f k -> (head_ok f && ty_uses_scalar_witness w f) || ty_uses_scalar_witness w k
+      t -> or (gmapQ any_sub_ty t)
+      where
+        head_ok h = case unLoc (ignoreParens h) of
+          HsTyVar _ NotPromoted (L _ rdr) -> rdr /= w
+          _ -> True
+        any_sub_ty :: Data d => d -> Bool
+        any_sub_ty d = maybe (or (gmapQ any_sub_ty d)) (ty_uses_scalar_witness w) (cast d)
 
     local_ps_syn_list =
       [ (rdrNameOcc syn, (params, rhs))
@@ -518,6 +536,101 @@ localSourceTableBinders tycl_decls binds sigs = do
       ListPat _ fs -> all eligible_pat fs
       ConPat{pat_args = args} -> all eligible_pat (hsConPatArgs args)
       _ -> False
+
+    large_or_ho_signed = mkOccSet
+      [ rdrNameOcc n
+      | L _ (TypeSig _ [] ns wc) <- sigs
+      , let body = sig_body (unLoc (hswc_body wc))
+      , not (has_ps_splice wc)
+      , sig_is_large_or_ho False False body
+      , L _ n <- ns ]
+
+    sig_is_large_or_ho :: Bool -> Bool -> LHsType GhcPs -> Bool
+    sig_is_large_or_ho seen_arr seen_ho ty =
+      let expanded = expand_ps_syn 4 ty
+      in case unLoc (ignoreParens expanded) of
+           HsForAllTy{hst_body = b} -> sig_is_large_or_ho seen_arr seen_ho b
+           HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom cod ->
+             let dom_exp = unLoc (ignoreParens (expand_ps_syn 4 dom))
+                 dom_ho  = case dom_exp of
+                   HsFunTy{}    -> True
+                   HsForAllTy{} -> True
+                   _            -> False
+             in sig_is_large_or_ho True (seen_ho || dom_ho) cod
+           HsStarTy{} -> seen_arr
+           HsTyVar _ NotPromoted (L _ rdr) ->
+             seen_ho || (seen_arr && occNameString (rdrNameOcc rdr) == "Type")
+           _ -> seen_ho
+
+    row_has_pat_scrutiny :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    row_has_pat_scrutiny (L _ Match{m_pats = L _ pats, m_grhss = GRHSs _ _ (L _ local_binds)}) =
+      any pat_has_scrutiny pats || local_binds_scrutiny local_binds
+      where
+        pat_has_scrutiny (L _ p) = case p of
+          LitPat{} -> True
+          TuplePat _ fs Boxed -> length fs /= 1
+          ListPat{} -> True
+          ConPat{} -> True
+          ParPat _ inner -> pat_has_scrutiny inner
+          SigPat _ inner _ -> pat_has_scrutiny inner
+          AsPat _ _ inner -> pat_has_scrutiny inner
+          _ -> False
+        local_binds_scrutiny (HsValBinds _ (ValBinds _ entries)) =
+          any (\case L _ FunBind{fun_matches = MG{mg_alts = L _ alts}} -> any row_has_pat_scrutiny alts
+                     _ -> False) (val_binds entries)
+        local_binds_scrutiny _ = False
+
+    row_has_case_or_emb :: Data a => a -> Bool
+    row_has_case_or_emb node =
+      (case cast node :: Maybe (HsExpr GhcPs) of
+         Just HsCase{}    -> True
+         Just (HsLam _ LamCase _) -> True
+         Just (HsLam _ LamCases _) -> True
+         Just (HsLam _ _ MG{mg_alts = L _ alts}) -> any row_has_pat_scrutiny alts
+         Just HsEmbTy{}   -> True
+         _                -> False)
+      || or (gmapQ row_has_case_or_emb node)
+
+    row_builds_con :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    row_builds_con (L _ Match{m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})}) =
+      expr_builds_con rhs
+      where
+        expr_builds_con e = case unLoc (stripParensLHsExpr e) of
+          HsVar _ (L _ rdr) -> isRdrDataCon rdr
+          ExplicitTuple _ _ Boxed -> True
+          ExplicitList{} -> True
+          HsApp _ f _ -> expr_builds_con f
+          HsAppType _ f _ -> expr_builds_con f
+          OpApp _ _ (L _ (HsVar _ (L _ rdr))) _ -> isRdrDataCon rdr
+          _ -> False
+    row_builds_con _ = False
+
+    closure_wrapper_shape :: [LMatch GhcPs (LHsExpr GhcPs)] -> Bool
+    closure_wrapper_shape [L _ Match{m_pats = L _ pats@(_:_:_), m_grhss = GRHSs _ (L _ (GRHS _ [] rhs) :| []) (L _ EmptyLocalBinds{})}]
+      | Just pvars <- traverse plain_var_pat pats
+      , length (nub pvars) == length pvars
+      , (trav, [cb_e, body_e]) <- collect_ps_apps rhs
+      , Just trav_rdr <- plain_var_expr trav, not (isRdrDataCon trav_rdr)
+      , Just bvar <- plain_var_expr body_e, bvar `elem` pvars
+      , (cb_hd, cb_args@(_:_)) <- collect_ps_apps cb_e
+      , Just cb_rdr <- plain_var_expr cb_hd, not (isRdrDataCon cb_rdr)
+      , Just c_vars <- traverse plain_var_expr cb_args
+      , let caps = [v | v <- pvars, v /= bvar]
+      = length (nub c_vars) == length c_vars && all (`elem` caps) c_vars
+      where
+        plain_var_pat (L _ (VarPat _ (L _ v))) = Just v
+        plain_var_pat (L _ (ParPat _ p))       = plain_var_pat p
+        plain_var_pat _                        = Nothing
+        plain_var_expr e = case unLoc (stripParensLHsExpr e) of
+          HsVar _ (L _ v) -> Just v
+          HsAppType _ f _ -> plain_var_expr f
+          _               -> Nothing
+        collect_ps_apps = go []
+          where
+            go as e = case unLoc (stripParensLHsExpr e) of
+              HsApp _ f a -> go (a : as) f
+              _           -> (e, as)
+    closure_wrapper_shape _ = False
 
 -- | Context in which local source-table candidates are scheduled.
 -- 'TableInType' carries a predicate validating external 'TyCon' names.

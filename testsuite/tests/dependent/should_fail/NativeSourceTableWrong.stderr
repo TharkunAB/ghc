@@ -19,8 +19,3 @@ NativeSourceTableWrong.hs:22:17: error: [GHC-83865]
     • In the expression: atBit (f False)
       In an equation for ‘unknownCall’: unknownCall f = atBit (f False)
 
-NativeSourceTableWrong.hs:31:22: error: [GHC-83605]
-    • Method ‘step’ belongs to an instance in this module.
-      Retained method calls currently need a compiled instance interface.
-    • In the expression: atBit (step False)
-      In an equation for ‘localMethod’: localMethod = atBit (step False)

@@ -1,5 +1,5 @@
 RetainedAppHoles.hs:33:34: error: [GHC-88464]
-    • Found hole: _ :: plus m1 (Succ k) :~: b0
+    • Found hole: _ :: plus m (Succ k) :~: b0
       Where: ‘b0’ is an ambiguous type variable
     • In the first argument of ‘trans’, namely ‘_’
       In the expression: trans _ _
@@ -14,10 +14,10 @@ RetainedAppHoles.hs:33:34: error: [GHC-88464]
       Constraints include n ~ Succ k (from RetainedAppHoles.hs:33:1-36)
       Valid hole fits include
         Refl :: forall {k} (a :: k). a :~: a
-          with Refl @(plus m1 (Succ k))
+          with Refl @(plus m (Succ k))
 
 RetainedAppHoles.hs:33:36: error: [GHC-88464]
-    • Found hole: _ :: b0 :~: Succ (plus k m1)
+    • Found hole: _ :: b0 :~: Succ (plus k m)
       Where: ‘b0’ is an ambiguous type variable
     • In the second argument of ‘trans’, namely ‘_’
       In the expression: trans _ _
@@ -36,7 +36,7 @@ RetainedAppHoles.hs:33:36: error: [GHC-88464]
           with Refl @b0
 
 RetainedAppHoles.hs:38:59: error: [GHC-88464]
-    • Found hole: _ :: plus m2 k1 :~: plus k1 m2
+    • Found hole: _ :: plus m1 k1 :~: plus k1 m1
     • In the second argument of ‘cong’, namely ‘_’
       In the second argument of ‘trans’, namely ‘(cong Succ _)’
       In the expression: trans (plusSuc m k) (cong Succ _)
@@ -54,7 +54,7 @@ RetainedAppHoles.hs:38:59: error: [GHC-88464]
                                             ‘Succ’) to reduce ‘plus’.
 
 RetainedAppHoles.hs:43:35: error: [GHC-88464]
-    • Found hole: _ :: plus m3 (Succ k2) :~: Succ x0
+    • Found hole: _ :: plus m2 (Succ k2) :~: Succ x0
       Where: ‘x0’ is an ambiguous type variable
     • In the first argument of ‘trans’, namely ‘_’
       In the expression: trans _ (cong Succ _)
@@ -72,7 +72,7 @@ RetainedAppHoles.hs:43:35: error: [GHC-88464]
                                           ‘Succ’) to reduce ‘plus’.
 
 RetainedAppHoles.hs:43:48: error: [GHC-88464]
-    • Found hole: _ :: x0 :~: plus k2 m3
+    • Found hole: _ :: x0 :~: plus k2 m2
       Where: ‘x0’ is an ambiguous type variable
     • In the second argument of ‘cong’, namely ‘_’
       In the second argument of ‘trans’, namely ‘(cong Succ _)’

@@ -1,4 +1,4 @@
-NativeComposedOrphanRule.hs:11:44: error: [GHC-83605]
+NativeComposedOrphanRule.hs:11:45: error: [GHC-83605]
     • GHC cannot use the checked equation for ‘.’ with the current rewrite rules.
       Use -fno-enable-rewrite-rules in the module that needs this equation.
     • In the expression: MkIso @a @c (h . f) (g . k) left right

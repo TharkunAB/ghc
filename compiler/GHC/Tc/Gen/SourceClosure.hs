@@ -69,7 +69,7 @@ import GHC.Hs.Utils (CollectFlag(CollNoDictBinders), collectHsBindBinders)
 import GHC.Tc.Errors.Types (RetainedQuantificationError(RetainedSourceRule), TcRnMessage(..))
 import GHC.Tc.Gen.SourceTable
   ( hasSourceMethodRule, isNominalStructuralSource, ordinaryImport, publicCaseType
-  , sourceEquationDatatypes, sourceTableCallees, sourceTableOwner, visibleSourceMethodRules )
+  , sourceEquationDatatypes, sourceTableCallees, sourceTableOwner, tidySourceAxBranch, visibleSourceMethodRules )
 import GHC.Tc.TyCl.Build (buildDataCon, newImplicitBinder, newTyConRepName)
 import GHC.Tc.Types (tcVisibleOrphanMods)
 import GHC.Tc.Utils.Env (tcLookupIdMaybe)
@@ -483,7 +483,7 @@ mkFamily :: Name -> Name -> [TyConBinder] -> Kind -> [CoAxBranch] -> TyCon
 mkFamily name axname binders result branches =
     let family = mkFamilyTyCon name (mkTyConKindWithMatchability unmatchableDataConTy binders result)
                     binders 0 result Nothing (ClosedTypeFamilyTyCon (CTF (Just axiom))) Nothing NotInjective
-        axiom = mkBranchedCoAxiom Nominal axname family branches
+        axiom = mkBranchedCoAxiom Nominal axname family (map tidySourceAxBranch branches)
     in family
 
 mkBranch :: [TyVar] -> [Type] -> Type -> CoAxBranch

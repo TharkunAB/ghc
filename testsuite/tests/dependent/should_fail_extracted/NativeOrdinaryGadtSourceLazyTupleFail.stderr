@@ -1,5 +1,5 @@
 NativeOrdinaryGadtSourceLazyTupleFail.hs:11:12: error: [GHC-83605]
     • Dependent case refinement requires one unguarded match for each constructor, with variables or wildcards as fields.
-    • In the expression: case p_aPt of (_, _) -> Refl
+    • In the expression: case p_aPs of (_, _) -> Refl
       In an equation for ‘mixed’: mixed True (_, _) = Refl
 

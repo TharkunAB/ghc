@@ -151,7 +151,8 @@ import GHC.Core ( CoreExpr, CoreRule, Unfolding(..), IdUnfoldingFun
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare (eqType)
 import GHC.Types.Var (VarBndr(..), ForAllTyFlag(..), isTyVar)
-import GHC.Core.TyCon (TyCon, closedFamilyTyConCoAxiom_maybe, isTerminatingTyCon,
+import GHC.Core.Coercion.Axiom (ClosedTyFam(CTF, CTF_Scoped))
+import GHC.Core.TyCon (TyCon, closedTypeFamily_maybe, isTerminatingTyCon,
                        isGadtSyntaxTyCon, tyConDataCons, tyConName)
 import GHC.Core.Predicate( getClassPredTys_maybe, isCoVarType )
 import GHC.Core.DataCon
@@ -228,7 +229,8 @@ sourceTableId_maybe fun
   , Just mod <- nameModule_maybe owner
   , nameModule_maybe (tyConName table) == Just mod
   , nameOccName (tyConName table) == mkSourceTableOcc (nameOccName owner)
-  , Just _ <- closedFamilyTyConCoAxiom_maybe table
+  , Just ctf <- closedTypeFamily_maybe table
+  , case ctf of { CTF _ -> True; CTF_Scoped {} -> True; _ -> False }
   = Just table
   | otherwise = Nothing
 

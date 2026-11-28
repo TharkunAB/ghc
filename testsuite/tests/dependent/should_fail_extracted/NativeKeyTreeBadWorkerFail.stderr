@@ -1,13 +1,7 @@
-NativeKeyTreeBadWorkerFail.hs:23:17: error: [GHC-68947]
-    • No checked equations are available for ‘nodesLoop’ in a type.
-      Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields.
-      Build the result from constructors, bound variables, or fully applied functions with checked equations.
-      In a recursive call, pass a field of the matched argument directly.
-      Bind any other arguments with variables and pass them unchanged in recursive calls.
-    • In the first argument of ‘(:~:)’, namely
-        ‘nodesLoop (mapValues f t)’
-      In the type signature:
-        nodesMapLoop :: forall k a b. foreach (f :: a -> b) ->
-                                      foreach (t :: Tree k a) ->
-                                      nodesLoop (mapValues f t) :~: nodesLoop t
+NativeKeyTreeBadWorkerFail.hs:19:1: error: [GHC-68947]
+    No checked equations are available for ‘nodesLoop’ in a type.
+    Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields.
+    Build the result from constructors, bound variables, or fully applied functions with checked equations.
+    In a recursive call, pass a field of the matched argument directly.
+    Bind any other arguments with variables and pass them unchanged in recursive calls.
 

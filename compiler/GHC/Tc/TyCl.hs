@@ -1611,10 +1611,12 @@ inferArrowIndices metadata decls tc
   | isLiftedTypeKind (tyConResKind tc)
   , not (any inferredMatchabilityIndex (tyConBinders tc))
   , [SynDecl { tcdRhs = rhs }] <- [d | L _ d <- decls, tcdName d == tyConName tc]
-  , legacyKindArrowTree rhs
+  , (tyConArity tc == 0 && null (tyConBinders tc) && legacyKindArrowTree rhs)
+    || pureKindArrowChain rhs
   , can_share_legacy_index rhs (lookupNameEnv metadata (tyConName tc)) = do
       unsat <- unsaturatedTypeFamiliesEnabled
-      if unsat
+      mods  <- xoptM LangExt.Modifiers
+      if unsat || mods
         then infer_default
         else do
           ma <- newFlexiTyVar matchabilityTy
@@ -1696,6 +1698,27 @@ legacyKindArrowTree rhs =
           HsForAllTy{} -> (False, False, False)
           HsQualTy{} -> (False, False, False)
           _ -> (False, False, True)
+
+-- | Recognize a parameterized synonym RHS consisting solely of bare standard
+-- arrows over type variables and Type, ending in Type (such as @a -> b -> Type@).
+pureKindArrowChain :: LHsType GhcRn -> Bool
+pureKindArrowChain rhs = matchabilityArrow rhs && go False rhs
+  where
+    go seen_arr ty
+      | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom res) <- ignoreParens ty
+      = leaf dom && go True res
+      | otherwise = seen_arr && end_star ty
+    leaf ty
+      | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom res) <- ignoreParens ty
+      = leaf dom && leaf res
+      | otherwise = case unLoc (ignoreParens ty) of
+          HsStarTy{} -> True
+          HsTyVar _ NotPromoted _ -> True
+          _ -> False
+    end_star ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ name)) -> name == liftedTypeKindTyConName
+      _ -> False
 
 {- Note [Inferred matchability for ordinary kind-arrow synonyms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

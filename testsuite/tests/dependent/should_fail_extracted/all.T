@@ -327,7 +327,7 @@ test('NativeDataFamilyPromoWrongProof', extra_files(['../should_run/data-family-
 test('NativeDataFamilyPromoWrongCoercion', extra_files(['../should_run/data-family-promotion/TupleProvider.hs']), multimod_compile_fail, ['NativeDataFamilyPromoWrongCoercion', '-v0'])
 test('NativeDataFamilyPromoUnsupportedCons', extra_files(['../should_run/data-family-promotion/TupleProvider.hs']), multimod_compile_fail, ['NativeDataFamilyPromoUnsupportedCons', '-v0'])
 test('NativeDataFamilyRetainedWrongIdentity', extra_files(['../should_run/data-family-promotion/TupleProvider.hs']), multimod_compile_fail, ['NativeDataFamilyRetainedWrongIdentity', '-v0'])
-test('NativeDataFamilyRetainedStuckFamily', normal, compile_fail, [''])
+test('NativeDataFamilyRetainedStuckFamily', normal, compile, [''])
 test('NativeDataFamilyOperandWrongIndex', extra_files(['../should_run/data-family-promotion/TupleProvider.hs', '../should_run/data-family-promotion/RetainedTuple.hs']), multimod_compile_fail, ['NativeDataFamilyOperandWrongIndex', '-v0'])
 test('NativeDataFamilyOperandStrictField', extra_files(['../should_run/data-family-promotion/TupleProvider.hs']), multimod_compile_fail, ['NativeDataFamilyOperandStrictField', '-v0'])
 test('NativeDataFamilyOperandWrongRefinement', extra_files(['../should_run/data-family-promotion/TupleProvider.hs']), multimod_compile_fail, ['NativeDataFamilyOperandWrongRefinement', '-v0'])

@@ -4,8 +4,8 @@ include $(TOP)/mk/test.mk
 SHELL = /bin/bash
 
 HC_BASE = '$(TEST_HC)' $(TEST_HC_OPTS) -package-env -
-DEPENDENT_BASE_DIR ?= /home/tritlo/Code/dependent-base
-DEPENDENT_OBS_EQ_DIR ?= /home/tritlo/Code/dependent-obs-eq
+DEPENDENT_BASE_DIR ?= $(firstword $(wildcard $(abspath $(TOP)/../../dependent-base) $(abspath $(TOP)/../../../dependent-base) $(abspath $(TOP)/../../../../dependent-base) $(abspath $(TOP)/../../../../../dependent-base) $(abspath $(TOP)/../../../../../../dependent-base)))
+DEPENDENT_OBS_EQ_DIR ?= $(firstword $(wildcard $(abspath $(TOP)/../../dependent-obs-eq) $(abspath $(TOP)/../../../dependent-obs-eq) $(abspath $(TOP)/../../../../dependent-obs-eq) $(abspath $(TOP)/../../../../../dependent-obs-eq) $(abspath $(TOP)/../../../../../../dependent-obs-eq)))
 
 .PHONY: DepRecompHomeRules DepRecompSourceUpgrade DepRecompClosedEval \
         DepIfaceBinaryMutate DepInstalledBootIfaceDb DepPackageFacadeDb \

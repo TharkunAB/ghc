@@ -471,7 +471,7 @@ DependentHoleFits.hs:173:27: error: [GHC-88464]
                at DependentHoleFits.hs:(170,1)-(172,66)
     • In a case alternative: UVar x -> _
       In the expression:
-        case t of
+        case __a15I of
           UVar x -> _
           ULam b
             -> case
@@ -486,8 +486,8 @@ DependentHoleFits.hs:173:27: error: [GHC-88464]
                of
                  (Refl, Refl) -> Refl
       In an equation for ‘congSubst’:
-          congSubst eq t
-            = case t of
+          congSubst eq __a15I
+            = case __a15I of
                 UVar x -> _
                 ULam b
                   -> case

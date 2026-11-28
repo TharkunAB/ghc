@@ -755,7 +755,9 @@ tc_pat scaled_exp_pat_ty@(Scaled w_pat exp_pat_ty) penv ps_pat thing_inside =
 
     VarPat x (L l name) -> do
       { (wrap, id) <- tcPatBndr penv name scaled_exp_pat_ty
-      ; let extend | (isSystemName name || isGeneratedSrcSpan (nameSrcSpan name))
+      ; let extend | isSystemName name, isUnderscore (nameOccName name)
+                   = tcExtendIdEnv1 name id
+                   | (isSystemName name || isGeneratedSrcSpan (nameSrcSpan name))
                    , name == idName id = tcExtendGeneratedIdEnv id
                    | otherwise = tcExtendIdEnv1 name id
             -- Generated patterns have no source binder to report.

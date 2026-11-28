@@ -95,7 +95,7 @@ test('NativeListIndexDiagnostics',
      ['NativeListIndexDiagnostics', '-v0 -fwrite-source-equations'])
 test('NativeSourceFieldCoverage', normal, compile_fail, [''])
 test('NativeSourceLengthRecursion', normal, compile_fail, [''])
-test('NativeSourcePlusRecursion', normal, compile_fail, [''])
+test('NativeSourcePlusRecursion', normal, compile, [''])
 test('NativeSourceProductRecursion',
      extra_files(['../should_compile/PackedVecLibrary.hs']),
      multimod_compile_fail,
@@ -284,7 +284,7 @@ test('NativeIndexOperandFamily', normal, compile_fail, [''])
 test('NativeExprSigWrongReceiver', normal, compile_fail, [''])
 test('NativeRetainedSecondColumn', normal, compile_fail, [''])
 test('NativeRetainedSecondGuard', normal, compile_fail, ['-Werror=incomplete-patterns'])
-test('NativeRetainedTypeDomain', normal, compile_fail, [''])
+test('NativeRetainedTypeDomain', normal, compile, [''])
 test('NativeRetainedTypeWitnessMismatch', normal, compile_fail, [''])
 test('NativeRetainedTypeOperandContext', normal, compile_fail, [''])
 test('NativeRetainedTypeWitnessSynthesis', normal, compile_fail, [''])
