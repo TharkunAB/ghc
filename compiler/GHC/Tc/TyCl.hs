@@ -1971,10 +1971,11 @@ openFamilyMatchabilityCandidates groups =
 -- other inferred binders so equations can instantiate the checked prefix.
 prefixFamilyMetadata :: PolyTcTyCon -> PolyTcTyCon
 prefixFamilyMetadata tc
-  | OpenFamilyFlavour IAmType _ <- tyConFlavour tc
+  | OpenFamilyFlavour _ _ <- tyConFlavour tc
   , (indices@(_:_), rest) <- partition inferredMatchabilityIndex (tyConBinders tc)
   = let binders = indices ++ rest
-    in mkTcTyCon (tyConName tc) (mkTyConKindWithMatchability unmatchableDataConTy binders (tyConResKind tc))
+        ma = tyConFlavourMatchability (tyConFlavour tc)
+    in mkTcTyCon (tyConName tc) (mkTyConKindWithMatchability ma binders (tyConResKind tc))
          binders 0 (tyConResKind tc) (tcTyConScopedTyVars tc) True (tyConFlavour tc)
   | otherwise = tc
 
