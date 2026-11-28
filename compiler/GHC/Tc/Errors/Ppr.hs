@@ -41,7 +41,7 @@ import qualified GHC.Boot.TH.Syntax as TH
 --            import "ghc-internal"     qualified GHC.Internal.TH.Syntax as TH
 import qualified GHC.Boot.TH.Ppr as TH
 
-import GHC.Builtin.WiredIn.Types( boxedRepDataConTyCon, tYPETyCon, pretendNameIsInScope )
+import GHC.Builtin.WiredIn.Types( boxedRepDataConTyCon, matchabilityTy, tYPETyCon, pretendNameIsInScope, unmatchableDataConTy )
 import GHC.Builtin.KnownKeys -- A bunch of keys
 
 import GHC.Types.Name.Reader
@@ -49,17 +49,20 @@ import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.Warnings
 
 import GHC.Core.Coercion
-import GHC.Core.Unify     ( tcMatchTys )
+import GHC.Core.Unify     ( tcMatchTys, tcMatchTyKis )
 import GHC.Core.TyCon
 import GHC.Core.Class
 import GHC.Core.DataCon
-import GHC.Core.Coercion.Axiom (CoAxBranch, coAxiomTyCon, coAxiomSingleBranch)
+import GHC.Core.Coercion.Axiom (CoAxBranch, coAxiomTyCon, coAxiomSingleBranch,
+                                coAxiomBranches, fromBranches, coAxBranchLHS, coAxBranchRHS)
 import GHC.Core.ConLike
 import GHC.Core.FamInstEnv ( FamInst(..), famInstAxiom, pprFamInst )
 import GHC.Core.InstEnv
-import GHC.Core.TyCo.Rep (Type(..))
+import qualified GHC.Core.TyCo.Compare as TypeCompare
+import GHC.Core.TyCo.Rep (Type(..), scaledThing)
+import GHC.Core.TyCo.Subst (runSubstM, substTyCoMapper, substVarBndrUsing)
 import GHC.Core.TyCo.Ppr (pprWithInvisibleBitsWhen, pprSourceTyCon,
-                          pprTyVars, pprWithTYPE, pprTyVar, pprTidiedType, pprForAll)
+                          pprTyVars, pprWithTYPE, pprTyVar, pprTidiedType, pprForAllWithMatchability)
 import GHC.Core.PatSyn ( patSynName, pprPatSynType, PatSyn )
 import GHC.Core.TyCo.Tidy
 import GHC.Core.Predicate
@@ -105,6 +108,7 @@ import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Fixity (defaultFixity)
+import GHC.Utils.Monad.StrictReader (StrictReaderT(..))
 
 import GHC.Iface.Errors.Types
 import GHC.Iface.Errors.Ppr
@@ -136,7 +140,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Foldable ( fold )
 import Data.Function (on)
-import Data.List ( groupBy, sortBy, sortOn, tails, partition, unfoldr )
+import Data.List ( find, groupBy, isSuffixOf, sortBy, sortOn, tails, partition, unfoldr )
 import Data.Ord ( comparing )
 import Data.Bifunctor
 
@@ -156,6 +160,11 @@ instance Diagnostic TcRnMessage where
     TcRnMessageWithInfo unit_state msg_with_info
       -> case msg_with_info of
            TcRnMessageDetailed err_info msg
+             | TcRnSolverReport (SolverReportWithCtxt _ report) _ <- msg
+             , Just field_error <- pprFieldCaptureKindMismatch report
+             -> messageWithInfoDiagnosticMessage unit_state err_info{errInfoContext = []}
+                  (tcOptsShowContext opts) (mkSimpleDecorated field_error)
+             | otherwise
              -> messageWithInfoDiagnosticMessage unit_state err_info
                   (tcOptsShowContext opts)
                   (diagnosticMessage opts msg)
@@ -453,6 +462,29 @@ instance Diagnostic TcRnMessage where
                 | otherwise
                 = text "Top-level type constructor with no standalone kind signature:"
 
+    TcRnCusk tc mbExtensions ->
+      mkSimpleDecorated $
+        text "This declaration uses a complete user-supplied kind signature (CUSK)." $$
+        getPprDebug (\debug -> details (if debug then Nothing else mbExtensions))
+      where
+        details = \case
+          Just extensions ->
+            hang (text "To state this kind explicitly, write") 2 signature $$ pragma extensions
+          Nothing ->
+            hang (text "The current kind is") 2 kind $$
+            text "Use a standalone kind signature with the appropriate source syntax and names."
+        kind = updSDocContext (\ctx -> ctx { sdocPrintExplicitForalls = True })
+                 (pprKind (tyConKind tc))
+        signature = text "type" <+> pprPrefixName (tyConName tc) <+> dcolon <+>
+          kind
+        pragma extensions = case extensions of
+          [] -> empty
+          _ -> hang (text "Enable the required extensions") 2
+              (text "{-# LANGUAGE" <+>
+                hsep (punctuate comma (map (text . extensionName) extensions)) <+> text "#-}") $$
+            ppWhen (LangExt.StandaloneKindSignatures `elem` extensions)
+              (text "Enabling StandaloneKindSignatures disables CUSKs for the whole module.")
+
     TcRnPolymorphicBinderMissingSig n ty
       -> mkSimpleDecorated $
            sep [ text "Polymorphic local binding with no type signature:"
@@ -507,6 +539,8 @@ instance Diagnostic TcRnMessage where
                         | True          = hsep [int thing_arity, text "arguments"]
     TcRnIllegalInstance reason ->
       mkSimpleDecorated $ pprIllegalInstance reason
+    TcRnEmptyForallMatchability
+      -> mkSimpleDecorated $ text "A forall matchability annotation requires at least one binder."
     TcRnVDQInTermType mb_ty
       -> mkSimpleDecorated $
              case mb_ty of
@@ -925,6 +959,27 @@ instance Diagnostic TcRnMessage where
            quotes (ppr name) <+>
              (text "is a term-level binding") $+$
              (text " and can not be used at the type level.")
+    TcRnNoSourceTable name
+      -> mkSimpleDecorated $ vcat
+           [ text "No checked equations are available for" <+> quotes (ppr name) <+> text "in a type."
+           , text "Match a constructor-valued argument with one clause per constructor, using variables or wildcards for its fields."
+           , text "Build the result from constructors, bound variables, or fully applied functions with checked equations."
+           , text "In a recursive call, pass a field of the matched argument directly."
+           , text "Bind any other arguments with variables and pass them unchanged in recursive calls." ]
+    TcRnNoSourceCallback callback
+      -> mkSimpleDecorated $ vcat
+           [ text "The imported interface supplies no checked equations for the callback" <+>
+             quotes (ppr callback) <> dot
+           , text "An open type-level call needs a checked callback from its defining module." ]
+    TcRnOpenTypeEval name definition reason
+      -> mkSimpleDecorated $ hang
+           (text "Cannot reduce the open call to" <+> quotes (ppr name) <+> text "in a type.")
+           2 (vcat ([text "While reading the definition of" <+> quotes (ppr d) <> dot
+                    | Just d <- [definition]] ++ [text reason]))
+    TcRnClosedTypeEval name reason
+      -> mkSimpleDecorated $ hang
+           (text "Cannot evaluate" <+> quotes (ppr name) <+> text "in a type.")
+           2 (vcat (map text (lines reason)))
     TcRnUntickedPromotedThing thing
       -> mkSimpleDecorated $
          text "Unticked promoted" <+> what
@@ -1078,6 +1133,56 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $
            text "Record syntax is illegal here:" <+> ppr ty
 
+    TcRnTypeLambdaDisabled
+      -> mkSimpleDecorated $ text "Type lambdas require -XDependentTypes."
+    TcRnTypeLetDisabled
+      -> mkSimpleDecorated $ text "A type-level" <+> quotes (text "let")
+                              <+> text "or local" <+> quotes (text "type")
+                              <+> text "synonym requires -XDependentTypes or -XExtendedLet."
+    TcRnTypeLetInvalidConstructor con
+      -> mkSimpleDecorated $
+           text "The data constructor" <+> quotes (ppr con)
+             <+> text "cannot be used in a type let pattern."
+           $$ text "A type let pattern requires the sole constructor of a regular data type."
+    TcRnTypeCaseDisabled
+      -> mkSimpleDecorated $ text "A type-level" <+> quotes (text "case")
+                              <+> text "requires -XDependentTypes."
+    TcRnTypeCasePattern Nothing
+      -> mkSimpleDecorated $ text "Expected a constructor pattern, a variable, or a wildcard. Each pattern variable must be distinct."
+    TcRnTypeCasePattern (Just pat)
+      -> mkSimpleDecorated $ hang (text "After expanding type synonyms, the pattern has no constructor head:")
+                                2 (ppr (coreFullView pat))
+    TcRnNestedTypeCasePattern pat
+      -> mkSimpleDecorated $ hang (text "Cannot use this constructor pattern in a nested type case:") 2 (ppr pat)
+    TcRnTypeCaseIndexApartness kind
+      -> mkSimpleDecorated $ hang
+           (text "Cannot determine which constructors are possible at this scrutinee kind:") 2 (ppr kind)
+    TcRnExistentialBinderKind kind
+      -> mkSimpleDecorated $ hang (text "The kind of an explicit existential binder must itself have type Type.")
+                                  2 (text "This binder has kind" <+> quotes (ppr kind) <> dot)
+    TcRnExistsPack problem -> mkSimpleDecorated $ case problem of
+      ExistsPackExtension ->
+        text "GHC.Exists.Pack requires -XDependentTypes or -XExistentialTypes."
+      ExistsPackArguments ->
+        text "Apply GHC.Exists.Pack to a required type witness and a payload."
+      ExistsPackMissingSchema ->
+        text "GHC.Exists.Pack needs an explicit existential type when its result type is inferred."
+      ExistsPackInvalidSchema ty ->
+        hang (text "GHC.Exists.Pack needs an explicit existential type.")
+          2 (text "The available type is" <+> quotes (ppr ty) <> dot)
+      ExistsPackInvalidKind kind expected ->
+        hang (text "The kind argument to GHC.Exists.Pack must match the witness kind" <+> quotes (ppr expected) <> dot)
+          2 (text "The argument is" <+> quotes (ppr kind) <> dot)
+      ExistsPackInvalidContext ->
+        text "Use GHC.Exists.Pack in an explicit existential application or a sole case alternative with a fresh type variable or _ for the witness, followed by a payload pattern."
+    TcRnTypeCaseContext
+      -> mkSimpleDecorated $
+           text "A type case needs a supported position in a top-level type synonym, a closed type family equation RHS, a top-level value signature, or a constructor field."
+    TcRnTypeLambdaContext
+      -> mkSimpleDecorated $
+           text "A type lambda needs a supported position in a top-level type synonym, the right-hand side of a type family equation, a value signature, an expression type annotation, a complete visible type argument, or an ordinary constructor field."
+           $$ text "A local signature can use a type lambda during ordinary compilation when GHC can copy the kinds of its captures, or infer their kinds and check the body in that scope."
+
     TcRnInvalidVisibleKindArgument arg ty
       -> mkSimpleDecorated $
            text "Cannot apply function of kind" <+> quotes (ppr ty)
@@ -1145,6 +1250,10 @@ instance Diagnostic TcRnMessage where
                      TermVariablePE -> text "term variables cannot be promoted"
                      TypeVariablePE -> text "type variables bound in a kind signature cannot be used in the type"
           same_rec_group_msg = text "it is defined and used in the same recursive group"
+    TcRnEscapingPrimFamilyBinder binders
+      -> mkSimpleDecorated $
+           hang (text "A primitive field binder may occur only in its promoted constructor field in a closed family pattern:")
+                2 (pprWithCommas ppr binders)
     TcRnUnpromotableLit lit
       -> mkSimpleDecorated $
            vcat [ text "The literal" <+> quotes (ppr lit) <+> text "cannot be promoted."
@@ -1459,7 +1568,7 @@ instance Diagnostic TcRnMessage where
         EmptyCaseForall tvb ->
           vcat [ text "Empty list of alternatives in" <+> pp_ctxt
                , hang (text "checked against a forall-type:")
-                      2 (pprForAll [tvb] <+> ellipsis)
+                      2 (pprForAllWithMatchability [tvb] <+> ellipsis)
                ]
         where
           pp_ctxt = case ctxt of
@@ -1632,6 +1741,10 @@ instance Diagnostic TcRnMessage where
       hang (text "Pattern synonym" <+> quotes (ppr name) <+> text "has"
             <+> speakNOf decl_arity (text "argument"))
          2 (text "but its type signature has" <+> int missing <+> text "fewer arrows")
+    TcRnPatSynUnsupportedMatchability name ma -> mkSimpleDecorated $
+      vcat [ text "Pattern synonym" <+> quotes (ppr name)
+               <+> text "has unsupported arrow matchability:" <+> ppr ma
+           , text "Declaration arrows must reduce to Unmatchable (U)." ]
     TcRnPatSynInvalidRhs ps_name lpat _ reason -> mkSimpleDecorated $
       vcat [ hang (text "Invalid right-hand side of bidirectional pattern synonym"
                    <+> quotes (ppr ps_name) <> colon)
@@ -1667,6 +1780,9 @@ instance Diagnostic TcRnMessage where
          2 (ppr dm_ty)
       $$ (text "does not match its corresponding"
           <+> text "non-default type signature")
+    TcRnConstrainedFamilyUnsupported family reason ->
+      mkSimpleDecorated $ text "Constrained associated type family" <+>
+        quotes (ppr family) $$ reason
     TcRnTyFamsDisabled reason -> mkSimpleDecorated $
       text "Illegal family" <+> text sort <+> text "for" <+> quotes name
       where
@@ -1727,6 +1843,13 @@ instance Diagnostic TcRnMessage where
            text "give different types for field", quotes (ppr field_name)]
     TcRnClassExtensionDisabled cls reason -> mkSimpleDecorated $
       pprDisabledClassExtension cls reason
+    TcRnDataConParentTypeMismatch data_con res_ty_tmpl
+      | Just synonym <- dataFamResultForallMismatch (dataConTyCon data_con)
+                          res_ty_tmpl (dataConOrigResTy data_con)
+      -> mkSimpleDecorated $
+         vcat [ text "The return-kind synonym" <+> quotes (ppr synonym)
+                <+> text "supplies an unmatchable (U) invisible forall."
+              , text "This data family instance requires a matchable (M) invisible forall." ]
     TcRnDataConParentTypeMismatch data_con res_ty_tmpl -> mkSimpleDecorated $
       hang (text "Data constructor" <+> quotes (ppr data_con) <+>
             text "returns type" <+> quotes (ppr actual_res_ty))
@@ -1862,6 +1985,22 @@ instance Diagnostic TcRnMessage where
                 -- be printed qualified.
                text "Declared at:" <+>
                vcat (NE.toList $ ppr . nameSrcLoc <$> sorted_names)]
+    TcRnPunBinding name other
+      -> mkSimpleDecorated $
+         vcat [ quotes (ppr (nameOccName name))
+                  <+> text "is declared in both the type and term namespaces."
+              , text "Other declaration at" <+> ppr (nameSrcLoc other) ]
+    TcRnPunUse rdr selected alternatives
+      -> mkSimpleDecorated $
+         vcat [ quotes (ppr rdr) <+> text "depends on separate type and term namespaces."
+              , text "This use resolves to" <+> ppr_candidate selected
+              , text "Same-spelled names in the other namespace:"
+              , nest 2 (vcat (map ppr_candidate (NE.toList alternatives))) ]
+      where
+        ppr_candidate gre = quotes (ppr (greName gre)) <+> pprNameProvenance gre
+    TcRnPunnedTypeSyntax syntax
+      -> mkSimpleDecorated $
+         text "The type syntax" <+> quotes syntax <+> text "depends on ListTuplePuns."
     TcRnPackageImportsDisabled
       -> mkSimpleDecorated $
          text "Package-qualified imports are not enabled"
@@ -1901,6 +2040,11 @@ instance Diagnostic TcRnMessage where
            what = case ty_or_ki of
              TypeLevel -> text "type"
              KindLevel -> text "kind"
+    TcRnRetainedQuantificationNotImplemented
+      -> mkSimpleDecorated $
+         text "Retained quantification is not supported in this type position yet."
+    TcRnRetainedQuantificationError reason
+      -> mkSimpleDecorated $ pprRetainedQuantificationError reason
     TcRnInvalidRecordField con field
       -> mkSimpleDecorated $
          hsep [text "Constructor" <+> quotes (ppr con),
@@ -2097,6 +2241,8 @@ instance Diagnostic TcRnMessage where
     TcRnUnknownModifierKind mod _ -> mkSimpleDecorated $
       text "Modifier" <+> pprHsModifier mod <+> "has unknown kind"
 
+    TcRnTooManyMatchabilities -> mkSimpleDecorated $
+      text "An arrow can have only one matchability modifier."
     TcRnTooManyMultiplicities -> mkSimpleDecorated $
       text "Too many Multiplicity modifiers"
 
@@ -2201,6 +2347,8 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnMissingSignature what exported
       -> WarningWithFlags $ missingSignatureWarningFlags what exported
+    TcRnCusk{}
+      -> WarningWithFlag Opt_WarnCusks
     TcRnPolymorphicBinderMissingSig{}
       -> WarningWithFlag Opt_WarnMissingLocalSignatures
     TcRnOverloadedSig{}
@@ -2223,6 +2371,8 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnIllegalInstance rea
       -> illegalInstanceReason rea
+    TcRnEmptyForallMatchability
+      -> ErrorWithoutFlag
     TcRnVDQInTermType{}
       -> ErrorWithoutFlag
     TcRnBadQuantPredHead{}
@@ -2360,6 +2510,14 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnTermNameInType {}
       -> ErrorWithoutFlag
+    TcRnNoSourceTable {}
+      -> ErrorWithoutFlag
+    TcRnNoSourceCallback {}
+      -> ErrorWithoutFlag
+    TcRnClosedTypeEval {}
+      -> ErrorWithoutFlag
+    TcRnOpenTypeEval {}
+      -> ErrorWithoutFlag
     TcRnUntickedPromotedThing {}
       -> WarningWithFlag Opt_WarnUntickedPromotedConstructors
     TcRnIllegalBuiltinSyntax {}
@@ -2402,6 +2560,22 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnIllegalRecordSyntax{}
       -> ErrorWithoutFlag
+    TcRnTypeLambdaDisabled{}
+      -> ErrorWithoutFlag
+    TcRnTypeLetDisabled{}
+      -> ErrorWithoutFlag
+    TcRnTypeLetInvalidConstructor{}
+      -> ErrorWithoutFlag
+    TcRnTypeCaseDisabled{}
+      -> ErrorWithoutFlag
+    TcRnTypeCasePattern{} -> ErrorWithoutFlag
+    TcRnNestedTypeCasePattern{} -> ErrorWithoutFlag
+    TcRnTypeCaseIndexApartness{} -> ErrorWithoutFlag
+    TcRnExistentialBinderKind{} -> ErrorWithoutFlag
+    TcRnExistsPack{} -> ErrorWithoutFlag
+    TcRnTypeCaseContext{} -> ErrorWithoutFlag
+    TcRnTypeLambdaContext{}
+      -> ErrorWithoutFlag
     TcRnInvalidVisibleKindArgument{}
       -> ErrorWithoutFlag
     TcRnTooManyBinders{}
@@ -2415,6 +2589,8 @@ instance Diagnostic TcRnMessage where
     TcRnClassKindNotConstraint{}
       -> ErrorWithoutFlag
     TcRnUnpromotableThing{}
+      -> ErrorWithoutFlag
+    TcRnEscapingPrimFamilyBinder{}
       -> ErrorWithoutFlag
     TcRnUnpromotableLit{}
       -> ErrorWithoutFlag
@@ -2564,6 +2740,8 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnPatSynArityMismatch{}
       -> ErrorWithoutFlag
+    TcRnPatSynUnsupportedMatchability{}
+      -> ErrorWithoutFlag
     TcRnPatSynInvalidRhs{}
       -> ErrorWithoutFlag
     TcRnTyFamDepsDisabled{}
@@ -2583,6 +2761,8 @@ instance Diagnostic TcRnMessage where
     TcRnSuperclassCycle{}
       -> ErrorWithoutFlag
     TcRnDefaultSigMismatch{}
+      -> ErrorWithoutFlag
+    TcRnConstrainedFamilyUnsupported{}
       -> ErrorWithoutFlag
     TcRnTyFamsDisabled{}
       -> ErrorWithoutFlag
@@ -2660,6 +2840,12 @@ instance Diagnostic TcRnMessage where
       -> WarningWithFlag Opt_WarnUnusedImports
     TcRnDuplicateDecls{}
       -> ErrorWithoutFlag
+    TcRnPunBinding{}
+      -> WarningWithFlag Opt_WarnPunBindings
+    TcRnPunUse{}
+      -> WarningWithFlag Opt_WarnPunUses
+    TcRnPunnedTypeSyntax{}
+      -> WarningWithFlag Opt_WarnPunUses
     TcRnPackageImportsDisabled
       -> ErrorWithoutFlag
     TcRnIllegalDataCon{}
@@ -2680,6 +2866,10 @@ instance Diagnostic TcRnMessage where
     TcRnQualifiedBinder{}
       -> ErrorWithoutFlag
     TcRnTypeApplicationsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnRetainedQuantificationNotImplemented{}
+      -> ErrorWithoutFlag
+    TcRnRetainedQuantificationError{}
       -> ErrorWithoutFlag
     TcRnInvalidRecordField{}
       -> ErrorWithoutFlag
@@ -2756,6 +2946,8 @@ instance Diagnostic TcRnMessage where
     TcRnUnknownModifierKind{}
       -> ErrorWithoutFlag
     TcRnTooManyMultiplicities{}
+      -> ErrorWithoutFlag
+    TcRnTooManyMatchabilities{}
       -> ErrorWithoutFlag
 
   diagnosticHints = \case
@@ -2871,6 +3063,8 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnMissingSignature {}
       -> noHints
+    TcRnCusk{}
+      -> noHints
     TcRnPolymorphicBinderMissingSig{}
       -> noHints
     TcRnOverloadedSig{}
@@ -2890,6 +3084,8 @@ instance Diagnostic TcRnMessage where
     TcRnVDQInTermType mb_ty
       | isJust mb_ty -> [suggestExtension LangExt.RequiredTypeArguments]
       | otherwise    -> []
+    TcRnEmptyForallMatchability
+      -> noHints
     TcRnBadQuantPredHead{}
       -> noHints
     TcRnIllegalTupleConstraint{}
@@ -3037,6 +3233,14 @@ instance Diagnostic TcRnMessage where
       -> scopeErrorHints err
     TcRnTermNameInType {}
       -> noHints
+    TcRnNoSourceTable {}
+      -> noHints
+    TcRnNoSourceCallback {}
+      -> noHints
+    TcRnClosedTypeEval {}
+      -> noHints
+    TcRnOpenTypeEval {}
+      -> noHints
     TcRnUntickedPromotedThing thing
       -> [SuggestAddTick thing]
     TcRnIllegalBuiltinSyntax {}
@@ -3086,6 +3290,22 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnIllegalRecordSyntax{}
       -> noHints
+    TcRnTypeLambdaDisabled{}
+      -> noHints
+    TcRnTypeLetDisabled{}
+      -> noHints
+    TcRnTypeLetInvalidConstructor{}
+      -> noHints
+    TcRnTypeCaseDisabled{}
+      -> noHints
+    TcRnTypeCasePattern{} -> noHints
+    TcRnNestedTypeCasePattern{} -> noHints
+    TcRnTypeCaseIndexApartness{} -> noHints
+    TcRnExistentialBinderKind{} -> noHints
+    TcRnExistsPack{} -> noHints
+    TcRnTypeCaseContext{} -> noHints
+    TcRnTypeLambdaContext{}
+      -> noHints
     TcRnInvalidVisibleKindArgument{}
       -> noHints
     TcRnTooManyBinders{}
@@ -3102,6 +3322,8 @@ instance Diagnostic TcRnMessage where
     TcRnClassKindNotConstraint{}
       -> noHints
     TcRnUnpromotableThing{}
+      -> noHints
+    TcRnEscapingPrimFamilyBinder{}
       -> noHints
     TcRnUnpromotableLit{}
       -> noHints
@@ -3263,6 +3485,8 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnPatSynArityMismatch{}
       -> noHints
+    TcRnPatSynUnsupportedMatchability{}
+      -> noHints
     TcRnPatSynInvalidRhs name pat args (PatSynNotInvertible _)
       -> [SuggestExplicitBidiPatSyn name pat args]
     TcRnPatSynInvalidRhs{}
@@ -3282,6 +3506,8 @@ instance Diagnostic TcRnMessage where
     TcRnSuperclassCycle{}
       -> [suggestExtension LangExt.UndecidableSuperClasses]
     TcRnDefaultSigMismatch{}
+      -> noHints
+    TcRnConstrainedFamilyUnsupported{}
       -> noHints
     TcRnTyFamsDisabled{}
       -> [suggestExtension LangExt.TypeFamilies]
@@ -3410,6 +3636,12 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnDuplicateDecls _ fs
       -> [suggestExtension LangExt.DuplicateRecordFields | all isFieldName fs]
+    TcRnPunBinding{}
+      -> noHints
+    TcRnPunUse{}
+      -> noHints
+    TcRnPunnedTypeSyntax{}
+      -> noHints
     TcRnPackageImportsDisabled
       -> [suggestExtension LangExt.PackageImports]
     TcRnIllegalDataCon{}
@@ -3426,6 +3658,12 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnTypeApplicationsDisabled{}
       -> [suggestExtension LangExt.TypeApplications]
+    TcRnRetainedQuantificationNotImplemented{}
+      -> noHints
+    TcRnRetainedQuantificationError RetainedArgumentExtension
+      -> [UnknownHint (text "Perhaps you intended to use the" <+> quotes (text "DependentTypes") <+> text "extension")]
+    TcRnRetainedQuantificationError{}
+      -> noHints
     TcRnInvalidRecordField{}
       -> noHints
     TcRnTupleTooLarge{}
@@ -3510,8 +3748,234 @@ instance Diagnostic TcRnMessage where
            _ -> noHints
     TcRnTooManyMultiplicities{}
       -> noHints
+    TcRnTooManyMatchabilities{}
+      -> noHints
 
   diagnosticCode = constructorCode @GHC
+
+-- | Print the checked restriction that prevents retained source elaboration.
+pprRetainedQuantificationError :: RetainedQuantificationError -> SDoc
+pprRetainedQuantificationError reason = case reason of
+  RetainedBinderCount ->
+    text "Retained quantification requires at least one argument."
+  RetainedBinderNeedsName ->
+    text "A retained argument requires a variable name."
+  RetainedBinderNeedsType ->
+    text "A retained argument requires an explicit domain type."
+  RetainedInvisibleField ->
+    text "Invisible retained arguments are not supported in constructor signatures."
+  RetainedInvisibleArgument binder ->
+    vcat [ text "Cannot infer the invisible retained argument" <+> quotes (ppr binder)
+         , text "Supply an argument with" <+> quotes (text "@...")
+           <+> text "or use a later value argument whose type determines a runtime value of type"
+           <+> ppr (varType binder) <> dot ]
+  RetainedArgumentExtension ->
+    text "Illegal explicit retained argument."
+  RetainedExplicitArgument ty ->
+    vcat [ text "An explicit retained argument requires an invisible retained binder."
+         , text "The function has type:" <+> ppr ty ]
+  RetainedUnsupportedDomain ty
+    | isLiftedTypeKind ty ->
+      vcat [ text "A retained binder with domain" <+> quotes (text "Type")
+               <+> text "is not supported in this position."
+           , text "Use a retained" <+> quotes (text "foreach (a :: Type)")
+               <+> text "binder in a complete value signature,"
+           , text "or use an explicit" <+> quotes (text "TypeRep a") <+> text "parameter from"
+               <+> quotes (text "Type.Reflection") <> dot ]
+    | Just (_, arg, res) <- tcSplitFunTy_maybe ty
+    , (position, endpoint) : _ <- filter (not . isLiftedTypeKind . typeKind . snd)
+                                       [(text "input", scaledThing arg), (text "result", res)] ->
+      vcat [ text "The" <+> position <+> text "of this retained callback must have kind"
+               <+> quotes (text "Type") <> dot
+           , quotes (ppr endpoint) <+> text "has kind"
+               <+> quotes (pprWithTYPE (typeKind endpoint)) <> dot ]
+    | otherwise ->
+      vcat [ if isPiTy ty
+             then text "This retained argument has an unsupported function domain."
+             else text "A retained value argument requires a lifted type parameter or a supported algebraic type."
+           , text "Its declared domain is:" <+> ppr ty ]
+  RetainedResultKind ty ->
+    vcat [ text "The result of retained quantification must have kind" <+> quotes (text "Type")
+         , text "The result type is:" <+> ppr ty ]
+  RetainedSolverType ty ->
+    vcat [ text "Constraint solving for this retained function type is not supported yet:"
+         , ppr ty ]
+  RetainedQuickLook ty ->
+    vcat [ text "Quick Look inference does not support this retained type yet:"
+         , ppr ty ]
+  RetainedConstraintType ty ->
+    vcat [ text "Only class and equality constraints can depend on a retained index yet:"
+         , ppr ty ]
+  RetainedPragma ->
+    text "SPECIALISE pragmas are not supported for retained functions yet."
+  RetainedInference ty ->
+    vcat [ text "This inferred retained type requires an explicit signature:"
+         , ppr ty ]
+  RetainedCallbackResult ty ->
+    vcat [ text "The inferred callback result contains a runtime index outside the application scope:"
+         , ppr ty ]
+  RetainedInvalidBinder var ->
+    text "A retained index or function head must be a local, unrestricted value of a supported domain:" <+> ppr var
+  RetainedIndexOutOfScope var ->
+    text "The runtime index" <+> quotes (ppr var) <+> text "is out of scope here."
+  RetainedPartialSignature ->
+    text "Retained quantification requires a complete type signature."
+  RetainedPartialTypeArgument ->
+    text "A visible type argument with runtime indices or retained function binders must be complete."
+  RetainedPolymorphicSignature ->
+    text "A forall within the scope of a retained binder is not supported yet."
+  RetainedSumContext ->
+    vcat [ text "GHC cannot check a retained dependent sum in this position."
+         , text "A top-level type synonym can name the sum and take its outer indices as parameters." ]
+  RetainedUnsupportedContext ->
+    text "Retained quantification is supported only at the start of an explicit value signature."
+  RetainedFunctionSignature ->
+    text "A function-valued retained binder requires a complete ordinary value signature or a complete visible type argument."
+  RetainedStaging ->
+    text "Retained quantification in Template Haskell quotations or splices is not supported yet."
+  RetainedConstructorCoverage ->
+    vcat [text "A retained constructor match requires unguarded equations."
+         ,text "Repeated constructors need a later ordinary pattern to distinguish the equations."]
+  RetainedMatrixCoverage ->
+    vcat [text "The unguarded equations must cover each possible retained constructor pair."
+         ,text "A bare second index pattern covers the remaining pairs for its first constructor."
+         ,text "A final equation with bare variables or wildcards in both index columns covers all remaining pairs."]
+  RetainedTypeOperandContext expected ->
+    vcat [text "A runtime type operand requires an expected type of the form" <+> quotes (text "Type.Reflection.TypeRep t") <> dot,
+          case expected of
+            Just ty -> text "The expected type here is" <+> quotes (ppr ty) <> dot
+            Nothing -> text "Give the expression a type signature or pass it to a function that expects a type representation."]
+  RetainedMissingEquation con ->
+    vcat [ text "Missing equation for the retained constructor" <+> quotes (ppr con) <> dot
+         , text "To omit this equation, match on a later argument whose type has no possible constructors in this branch." ]
+  RetainedUncoveredConstructors con missing ->
+    vcat [ text "The pattern" <+> quotes (ppr con) <+> text "does not cover this retained argument."
+         , text "Missing constructors:" <+> pprWithCommas (quotes . ppr) missing ]
+  RetainedMatrixDuplicate ->
+    text "This retained constructor pair is matched by an earlier equation."
+  RetainedMatrixFallback ->
+    text "A retained constructor matrix permits only one final equation with bare variables or wildcards in both selected index columns."
+  RetainedLaterConstructorPattern ->
+    text "Use a strict data constructor pattern with variable or wildcard fields to refine this retained argument."
+  RetainedMatrixPattern ->
+    vcat [text "The first index column requires constructor patterns with variables or wildcards as fields."
+         ,text "The second index column also accepts bare variables or wildcards."
+         ,text "One final equation can use bare variables or wildcards in both columns."]
+  RetainedMissingConstructorPair first second ->
+    vcat [ text "Missing equation for the retained constructor pair" <+>
+             parens (ppr first <> comma <+> ppr second) <> dot
+         , text "Add an equation for this pair or a final equation that covers it." ]
+  RetainedCasePatterns ->
+    text "Dependent case refinement requires one unguarded match for each constructor, with variables or wildcards as fields."
+  RetainedCaseQuotation ->
+    text "Dependent case refinement does not support Template Haskell quotations."
+  RetainedConstructorQuotation ->
+    text "Constructor equations with later retained arguments do not support Template Haskell quotations yet."
+  RetainedConstructorArguments ->
+    vcat [text "Retained constructor fields and later retained variables require bare variable patterns or wildcards."
+         ,text "For this combination of patterns, use unrestricted arguments or match the remaining arguments inside the constructor branch."]
+  RetainedPatternType ty ->
+    vcat [ text "Retained constructor refinement does not support this type yet:"
+         , ppr ty ]
+  RetainedVariablePattern ->
+    text "The retained argument currently requires a bare variable pattern or a wildcard."
+  RetainedFunctionPatterns ->
+    vcat [ text "Function-valued retained binders require bare variable patterns or wildcards."
+         , text "Use a single equation, or match constructors in a later retained column." ]
+  RetainedContextPattern ->
+    text "A strict prefix pattern before a retained context is not supported when later value patterns remain."
+  RetainedResultWrapper ->
+    text "This result requires a wrapper that is not supported for retained functions yet."
+  RetainedFinalCoreRulesEnabled fun ->
+    vcat [ text "GHC cannot use the checked equation for" <+> quotes (ppr fun)
+            <+> text "with the current rewrite rules."
+         , text "Use -fno-enable-rewrite-rules in the module that needs this equation." ]
+  RetainedSourceRule fun ->
+    text "A rewrite rule can change the result of" <+> quotes (ppr fun)
+      <> text ", which GHC uses to check a dependent type."
+  RetainedIndexExpression ->
+    vcat [ text "GHC cannot use this expression as a retained index."
+         , text "Build the index from local variables, supported constructors, and fully applied functions with checked equations."
+         , text "An immediate application of a supported lambda is also allowed." ]
+  RetainedIndexArgumentCast actual expected ->
+    vcat [ text "GHC cannot use the cast required for this argument as a retained index."
+         , text "Expected:" <+> ppr expected
+         , text "  Actual:" <+> ppr actual ]
+  RetainedInteractiveIndex name ->
+    vcat [ text "The binding" <+> quotes (ppr name) <+> text "comes from an earlier GHCi command."
+         , text "Bind the runtime index locally in the expression that uses it." ]
+  RetainedUncheckedSourceCall fun ->
+    text "No checked source equations are available for" <+> quotes (ppr fun)
+      <+> text "in this retained argument."
+  RetainedLocalSourceMethod method ->
+    vcat [ text "Method" <+> quotes (ppr method) <+> text "belongs to an instance in this module."
+         , text "Retained method calls currently need a compiled instance interface." ]
+  RetainedLiteralConversion from domain ->
+    vcat [ text "Cannot use this numeral as a retained index of type" <+> quotes (ppr domain) <> dot
+         , text "Conversion" <+> quotes (ppr from) <+> text "has no checked zero and successor equations." ]
+  RetainedLiteralDepth n ->
+    text "The numeral" <+> integer n <+> text "exceeds the constructor expansion limit for a retained argument."
+  RetainedSourceMethodEvidence method predicate ->
+    vcat [ text "GHC cannot use method" <+> quotes (ppr method) <+> text "as a retained index."
+         , text "This call needs a known" <+> quotes (ppr predicate) <+> text "dictionary." ]
+  RetainedIndexMultiplicity mult ->
+    vcat [ text "A retained argument must have unrestricted multiplicity Many."
+         , text "This argument has multiplicity:" <+> ppr mult ]
+  RetainedFunctionArgument ->
+    vcat [ text "GHC cannot use this function-valued retained argument."
+         , text "Pass an unrestricted local function or a named unary function"
+           <+> text "with checked source equations at the required type." ]
+  RetainedCallIndex ->
+    text "An opaque call index requires a local unrestricted function applied to value arguments of its declared domains."
+  RetainedSelectorReceiver ->
+    vcat [ text "A class method in the remaining type uses this argument as its receiver."
+         , text "Bind the argument to a local variable and pass that variable." ]
+  RetainedCallInstrumentation ->
+    text "Opaque call refinement does not support coverage, profiling or source-note instrumentation yet."
+  RetainedIndexLambdaStrict ->
+    text "Immediate lambda applications used as retained arguments are not supported with Strict."
+  RetainedLocalSignatureIndex ->
+    text "A retained local signature index must refer to an already-bound unrestricted local value of a supported index domain."
+  RetainedTypeArgumentIndex ->
+    text "A runtime index in a visible type argument must refer to an already-bound unrestricted local value of a supported index domain."
+  RetainedPackageDeclaration ->
+    vcat [ text "A retained constructor requires a lazy ordinary data declaration with a lifted result kind."
+         , text "Records, existential binders, equality specifications, and StrictData are not supported."
+         , text "Its erased quantifiers must name exactly the datatype parameters."
+         , text "A context may contain only homogeneous (~) constraints and requires datatype parameter order." ]
+  RetainedConstructorResult ty ->
+    vcat [ text "Each retained field must appear directly or under one promoted constructor in a result argument."
+         , text "Visible arguments must be retained fields. Invisible arguments must be closed types."
+         , text "The fields and result must have closed structural index types."
+         , text "Other result arguments must be unchanged erased parameters."
+         , text "The result type is" <+> quotes (ppr ty) <> dot
+         , text "For other results, use an ordinary datatype parameter in the result type."
+         , fsep [ text "Relate it to the retained field with a propositional equality field using"
+                , quotes (text ":~:") <+> text "from" <+> quotes (text "Data.Type.Equality") <> dot ] ]
+  RetainedPackagePromotion ->
+    vcat [ text "This retained constructor has no supported promoted field telescope."
+         , text "Promotion requires one witness followed by fields whose final type argument is that witness." ]
+  RetainedPackagePattern ->
+    vcat [ text "A retained package pattern requires prefix constructor syntax and unrestricted multiplicity."
+         , text "Retained fields require variables, wildcards, or constructor patterns for their index domain."
+         , text "A retained variable or wildcard can be parenthesized or have a bang. Fields of an index constructor must be bare variables or wildcards."
+         , text "Lazy patterns and pattern bindings are not supported yet." ]
+  RetainedRecordConstruction con (Just witness) ->
+    fsep [text "Constructor" <+> quotes (ppr con),
+          text "requires witness field" <+> quotes (ppr witness) <> dot]
+  RetainedRecordConstruction con Nothing ->
+    text "Supply positional arguments to constructor" <+> quotes (ppr con) <> dot
+  RetainedRecordDeclaration ->
+    text "Each payload field of a retained record must use the first field as its final type argument."
+  RetainedRecordPatternOrder ->
+    text "Match the fields of a retained record in declaration order."
+  RetainedRecordUpdate ->
+    text "Record update is unavailable for this retained record."
+  RetainedRecordUpdateWitness con witness missing ->
+    hang (fsep [ text "Updating witness field", quotes (ppr witness)
+               , text "of constructor", quotes (ppr con) ]) 2 $
+      fsep [ text "requires replacement", text "for field" <> plural missing
+           , pprQuotedList missing <> dot ]
 
 pprTcRnBadlyLevelled :: LevelCheckReason -> Set.Set ThLevelIndex -> ThLevelIndex -> Maybe ErrorItem -> DecoratedSDoc
 pprTcRnBadlyLevelled reason bind_lvls use_lvl lift_attempt = mkDecorated $
@@ -3717,17 +4181,20 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (TcHoleFit (HoleFit {..})) =
                  NameHFCand name -> text "bound at" <+> ppr (getSrcLoc name)
                  IdHFCand id_ -> text "bound at" <+> ppr (getSrcLoc id_)
 
--- | Similar to 'tcDeepSplitSigmaTy_maybe', but just cares about the binders.
+-- | Similar to 'tcDeepSplitSigmaTy_maybe', but collects only invisible
+-- 'ForAllTyBinder's while looking through function, required-forall, and
+-- retained-function binders.
 deepInvisTvBinders :: TcSigmaType -> [ForAllTyBinder]
 deepInvisTvBinders = go
   where
-    go ty | Just (_arg_ty, res_ty) <- tcSplitFunTy_maybe ty
-          = go res_ty
-          | (tvs, body) <- splitForAllForAllTyBinders ty
-          , not (null tvs)
-          = tvs ++ go body
-          | otherwise
-          = []
+    go ty | Just ty' <- coreView ty = go ty'
+    go (ForAllTy _ b@(Bndr _ vis) body)
+      | isInvisibleForAllTyFlag vis = b : go body
+      | otherwise                   = go body
+    go (FunTy { ft_res = res_ty })  = go res_ty
+    go (DepFunTy _ _ body)          = go body
+    go (DepDictTy _ body)           = go body
+    go _                            = []
 
 -- | Add a "Constraints include..." message.
 --
@@ -4571,7 +5038,160 @@ mismatchInvisibleBits (CouldNotDeduce { cnd_ea = mb_ea })
   = case mb_ea of
       Nothing -> Set.empty
       Just (CND_ExpectedActual _ ty1 ty2) ->
-        mayLookIdentical ty1 ty2
+        mayLookIdentical ty1 ty2 S.<> matchabilityBits ty1 ty2
+
+-- | Recover the source declaration that owns a private lifted family.
+liftedTypeOwner :: String -> Name -> Maybe String
+liftedTypeOwner prefix = stripLiftedTypeOwner prefix . occNameString . getOccName
+
+-- | Describe the lifted expression in terms of its source declaration.
+liftedTypeContext :: Name -> Maybe SDoc
+liftedTypeContext name
+  | Just site <- pprLiftedTypeLambdaSite (occNameString (getOccName name)) = Just site
+  | Just synonym <- liftedTypeOwner "$lambda:" name
+  , Just owner <- stripLiftedTypeOwner "$signature-sum:" synonym
+  = Just (text "retained sum in the signature for" <+> quotes (text owner))
+  | Just synonym <- liftedTypeOwner "$lambda:" name
+  , Just owner <- stripLiftedTypeOwner "$field-sum:" synonym
+  = Just (text "retained sum in a field of" <+> quotes (text owner))
+  | Just owner <- liftedTypeOwner "$case:" name = Just (pprTypeCaseOwner owner)
+  | Just owner <- liftedTypeOwner "$lambda:" name = Just (text "type lambda in" <+> quotes (text owner))
+  | otherwise = Nothing
+
+-- | Describe a case by its source synonym, value signature or constructor.
+pprTypeCaseOwner :: String -> SDoc
+pprTypeCaseOwner raw_owner
+  | Just signature <- stripLiftedTypeOwner "$signature-case:" owner
+  = text "type case in the signature for" <+> quotes (text signature)
+  | Just constructor <- stripLiftedTypeOwner "$field-case:" owner
+  = text "type case in a field of" <+> quotes (text constructor)
+  | otherwise = text "type case in" <+> quotes (text owner)
+  where
+    owner = fromMaybe raw_owner (stripLiftedTypeOwner "$lambda:" raw_owner)
+
+-- | Report a kind mismatch between a field case and its lifted family.
+-- The saved kind variables belong to different declarations. Use the
+-- written capture and constructor names instead of printing those copies.
+pprFieldCaptureKindMismatch :: TcSolverReportMsg -> Maybe SDoc
+pprFieldCaptureKindMismatch
+  (Mismatch { mismatchMsg = TypeEqMismatch
+                { teq_mismatch_item = item
+                , teq_mismatch_what = Just (HsTypeRnThing capture@HsTyVar{})
+                , teq_mismatch_expected = expected, teq_mismatch_actual = actual }
+            , mismatchAmbiguityInfo = ambiguities })
+  | Just KindLevel <- ctLocTypeOrKind_maybe loc
+  , [family] <- [tc | NonInjectiveTyFam tc <- ambiguities]
+  , has_saved_kind expected, has_saved_kind actual
+  , Just constructor <- listToMaybe
+      [owner | TyConDeclCtxt name _ <- ctl_ctxt (ctLocEnv loc)
+             , Just owner <- [liftedTypeOwner "$field-case:" name]]
+  = Just $ vcat
+      [ text "Cannot check the kind of" <+> quotes (ppr capture) <+>
+          text "in the type case in a field of" <+> quotes (text constructor) <> dot
+      , pprAmbiguityInfo (NonInjectiveTyFam family)
+      , text "Use a named type synonym with a standalone kind signature for the case."
+      ]
+  where
+    loc = errorItemCtLoc item
+    has_saved_kind = anyVarSet (isJust . liftedTypeOwner "$field-kind:" . getName) . tyCoVarsOfType
+pprFieldCaptureKindMismatch _ = Nothing
+
+-- | Find the generated head in an application context.
+liftedTypeHeadContext :: LHsType GhcRn -> Maybe SDoc
+liftedTypeHeadContext (L _ ty) = case ty of
+  HsTyVar _ _ (L _ (WithUserRdr _ name)) -> liftedTypeContext name
+  HsAppTy _ f _ -> liftedTypeHeadContext f
+  HsAppKindTy _ f _ -> liftedTypeHeadContext f
+  HsParTy _ f -> liftedTypeHeadContext f
+  HsSpliceTy (HsUntypedSpliceTop _ result) _ -> liftedTypeHeadContext result
+  _ -> Nothing
+
+-- | Restore the public synonym at an occurrence of its exact expansion.
+-- See Note [Printing lifted type lambdas in a client].
+restoreTypeLambdas :: [Type] -> Type -> Type
+restoreTypeLambdas sources = restore
+  where
+    written = concatMap synonyms sources
+    synonyms ty@(TyConApp tc args) = [ty | isTypeSynonymTyCon tc] ++ concatMap synonyms args
+    synonyms (AppTy f a) = synonyms f ++ synonyms a
+    synonyms FunTy{ft_arg = a, ft_res = b} = synonyms a ++ synonyms b
+    synonyms _ = []
+
+    restore ty@(TyConApp tc args)
+      | Just _ <- liftedTypeOwner "$lambda:" (tyConName tc)
+      , Just original <- find ((`pickyEqType` ty) . coreFullView) written
+      = original
+      | otherwise = TyConApp tc (map restore args)
+    restore (AppTy f a) = AppTy (restore f) (restore a)
+    restore ty@FunTy{ft_arg = a, ft_res = b} = ty{ft_arg = restore a, ft_res = restore b}
+    restore ty = ty
+
+{- Note [Printing lifted type lambdas in a client]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A client can write Rebuild x in the expected type of Refl. The equality
+solver can expose its private family when it reports a mismatch. Use the
+source synonym again if expanding it gives the same private family
+and arguments. This also works for a client alias of Rebuild. Two uses
+of one lambda can have different captures or inputs. Only the diagnostic uses this
+view. The expanded-types diagnostic can still show the family.
+
+A retained sum synonym expands to Sigma applied to its domain and a
+partially applied payload family. The solver can report a mismatch on
+just the two payload families. Use the whole written types when each
+family is the exact payload of its respective synonym application.
+-}
+
+-- | Show the constructor case checked by a private family, without reducing it.
+pprTypeCaseMismatch :: Type -> SDoc
+pprTypeCaseMismatch ty
+  | Just payload <- diagnosticSumPayload ty
+  = ppr payload
+  | Just (tc, _) <- splitTyConAppNoView_maybe ty
+  , Just owner <- liftedTypeOwner "$case-node:" (tyConName tc)
+  = text "the" <+> pprTypeCaseOwner owner
+  | Just (tc, args) <- splitTyConAppNoView_maybe ty
+  , Just source <- liftedTypeContext (tyConName tc)
+  = let fallback | isJust (liftedTypeOwner "$case:" (tyConName tc)) = text "the" <+> source
+                 | otherwise = ppr ty
+    in fromMaybe fallback $ do
+      guard (length args == tyConArity tc)
+      ax <- closedFamilyTyConCoAxiom_maybe tc
+      let branches = fromBranches (coAxiomBranches ax)
+          visible = filterOutInvisibleTypes tc args
+      -- The ordered root contains tests, with private nodes for their results.
+      guard (not (any branchesToDecision branches))
+      column <- case liftedTypeOwner "$case:" (tyConName tc) of
+        Just _ -> Just (length visible - 1)
+        Nothing -> do
+          -- In a lifted lambda the matched argument can precede another
+          -- lambda argument. All other visible patterns are variables.
+          first : _ <- pure branches
+          [index] <- pure [ i | (i, pat) <- zip [0..] (filterOutInvisibleTypes tc (coAxBranchLHS first))
+                              , Just (con, _) <- [splitTyConAppNoView_maybe pat]
+                              , isJust (isPromotedDataCon_maybe con) ]
+          pure index
+      (scrutinee, actuals) <- select column visible
+      let (env, _) = tidyOpenTypesX emptyTidyEnv (scrutinee : actuals)
+      rows <- traverse (row env column tc actuals) branches
+      pure (text "case" <+> ppr scrutinee <+> text "of"
+              <+> braces (sep (punctuate semi rows)))
+  | otherwise = ppr ty
+  where
+    branchesToDecision branch =
+      case splitTyConAppNoView_maybe (coAxBranchRHS branch) of
+        Just (tc, _) -> isJust (liftedTypeOwner "$case-node:" (tyConName tc))
+        Nothing -> False
+
+    select index xs
+      | index >= 0, (front, x : back) <- splitAt index xs = Just (x, front ++ back)
+      | otherwise = Nothing
+    row env column tc actuals branch = do
+      (pat, others) <- select column (filterOutInvisibleTypes tc (coAxBranchLHS branch))
+      vars <- traverse getTyVar_maybe others
+      guard (length vars == length actuals)
+      let body = substTyWith vars actuals (coAxBranchRHS branch)
+      [pat', body'] <- pure (tidyOpenTypes env [pat, body])
+      pure (pprTidiedType pat' <+> text "->" <+> pprTidiedType body')
 
 -- | Turn a 'MismatchMsg' into an 'SDoc'.
 --
@@ -4596,6 +5216,11 @@ pprMismatchMsg ctxt
           , maybe empty pprSameOccInfo same_occ_info
           ]
   where
+    pprMismatchType = case errorItemOrigin item of
+      TypeEqOrigin{uo_expected = exp, uo_actual = act} ->
+        pprTypeCaseMismatch . restoreTypeLambdas [exp, act]
+      _ -> pprTypeCaseMismatch
+
     msg
       | (isLiftedRuntimeRep ty1 && isUnliftedRuntimeRep ty2) ||
         (isLiftedRuntimeRep ty2 && isUnliftedRuntimeRep ty1) ||
@@ -4605,15 +5230,15 @@ pprMismatchMsg ctxt
 
       | isAtomicTy ty1 || isAtomicTy ty2
       = -- Print with quotes
-        sep [ text herald1 <+> quotes (ppr ty1)
+        sep [ text herald1 <+> quotes (pprMismatchType ty1)
             , nest padding $
-              text herald2 <+> quotes (ppr ty2) ]
+              text herald2 <+> quotes (pprMismatchType ty2) ]
 
       | otherwise
       = -- Print with vertical layout
-        vcat [ text herald1 <> colon <+> ppr ty1
+        vcat [ text herald1 <> colon <+> pprMismatchType ty1
              , nest padding $
-               text herald2 <> colon <+> ppr ty2 ]
+               text herald2 <> colon <+> pprMismatchType ty2 ]
 
     herald1 = conc [ "Couldn't match"
                    , if is_repr then "representation of" else ""
@@ -4659,11 +5284,24 @@ pprMismatchMsg ctxt
         = nargs_msg $$ ea_msg
 
         | ea_looks_same ty1 ty2 exp act
+          || (sum_payload exp ty1 && sum_payload act ty2)
+          || (sum_payload exp ty2 && sum_payload act ty1)
         , Right ea_msg <- mk_ea_msg ctxt (Just item) level orig
         = ea_msg
 
         | otherwise
         = bale_out_msg
+
+    -- See Note [Printing lifted type lambdas in a client].
+    sum_payload written closure
+      | Just (syn, _) <- splitTyConAppNoView_maybe written
+      , isTypeSynonymTyCon syn
+      , Just (family, args) <- splitTyConAppNoView_maybe closure
+      , Just (_, True) <- closedFamilyScope_maybe family
+      , length args + 1 == tyConArity family
+      , Just (_, payload) <- splitAppTy_maybe written
+      = payload `pickyEqType` closure
+      | otherwise = False
 
       -- bale_out_msg: the mismatched types are /inside/ exp and act
     bale_out_msg = vcat errs
@@ -4728,6 +5366,9 @@ pprMismatchMsg ctxt
              n | n > 0   -- we don't know how many args there are, so don't
                          -- recommend removing args that aren't
                , Just thing <- mb_thing
+               , not (stuck_family_result ty1 || stuck_family_result ty2)
+               , not (isMatchabilityMismatch ty1 ty2)
+                 -- See Note [Argument counts in kind errors].
                -> Just $ pprTcSolverReportMsg ctxt (ExpectingMoreArguments n thing)
              _ -> Nothing
 
@@ -4735,7 +5376,14 @@ pprMismatchMsg ctxt
 
     maybe_num_args_msg = num_args_msg `orElse` empty
 
-    count_args ty = count isVisiblePiTyBinder $ fst $ splitPiTys ty
+    count_args ty = let (_, binders, _) = splitPiTys ty in count isVisiblePiTyBinder binders
+
+    stuck_family_result ty
+      | (_, _, result) <- splitPiTys ty
+      , Just (tc, _) <- splitTyConApp_maybe result
+      = isTypeFamilyTyCon tc
+      | otherwise
+      = False
 
     ppr_torc TypeLike       = text "type";
     ppr_torc ConstraintLike = text "constraint"
@@ -4807,6 +5455,19 @@ pprMismatchMsg ctxt
         [wanted] -> text "Could not deduce" <+> quotes (ppr wanted)
         _        -> text "Could not deduce:" <+> pprTheta wanteds
 
+{- Note [Argument counts in kind errors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The arity hint counts visible binders in the original kinds. A type
+family can hide an arrow in the expected kind. For example, if F True
+reduces to Type -> @U Type, then Maybe :: F True has one arrow on each
+side. Decomposition leaves M ~ U. Report that mismatch even though
+counting the visible binders of F True gives zero. Keep the arity hint
+when a family reduces to Type and the caller really omitted an argument.
+If a family remains at the end of either kind in the solver's residual
+equality, its result can still supply visible binders. Suppress the hint
+because the visible binder count is incomplete.
+-}
+
 pprQCOriginExtra :: ErrorItem -> SDoc
 -- When we were originally trying to solve a quantified constraint like
 --    (forall a. Eq a => Eq (c a))
@@ -4831,14 +5492,33 @@ pprKindMismatchMsg :: TypedThing -> Type -> Type -> SDoc
 pprKindMismatchMsg thing exp act
   = hang (text "Expected" <+> kind_desc <> comma)
       2 (text "but" <+> quotes (ppr thing) <+> text "has kind" <+>
-        quotes (ppr act))
+        quotes (ppr_kind act))
   where
+    ppr_kind kind = ifPprDebug (ppr kind) (ppr (expandCaseLetKind kind))
     kind_desc | isConstraintLikeKind exp = text "a constraint"
               | Just arg <- kindRep_maybe exp  -- TYPE t0
               , tcIsTyVarTy arg = sdocOption sdocPrintExplicitRuntimeReps $ \case
-                                   True  -> text "kind" <+> quotes (ppr exp)
+                                   True  -> text "kind" <+> quotes (ppr_kind exp)
                                    False -> text "a type"
-              | otherwise       = text "kind" <+> quotes (ppr exp)
+              | otherwise       = text "kind" <+> quotes (ppr_kind exp)
+
+-- | Expand private case-let aliases for display. Keep ordinary synonyms.
+expandCaseLetKind :: Type -> Type
+expandCaseLetKind kind = walk (mkEmptySubst (mkInScopeSet (tyCoVarsOfType kind))) kind
+  where
+    (walk_ty, _, _, _) = mapTyCo substTyCoMapper
+      { tcm_tcapp_ty = visit
+      , tcm_tycobinder = \tv _ check -> StrictReaderT $ \subst ->
+          let (subst', tv') = substVarBndrUsing walk subst tv
+          in runStrictReaderT (check tv') subst'
+      }
+    walk = runSubstM walk_ty
+
+    visit ty tc args
+      | Just _ <- liftedTypeOwner "$case-let-rhs:" (tyConName tc)
+      , Just rhs <- expandSynTyConApp_maybe tc args = walk_ty rhs
+      | null args = pure ty
+      | otherwise = pure (TyConApp tc args)
 
 -- | Whether to print explicit kinds (with @-fprint-explicit-kinds@)
 -- in an 'SDoc' when a type mismatch occurs to due invisible parts of the types.
@@ -4867,16 +5547,62 @@ shouldPprWithInvisibleBits ty1 ty2
         -- See tests T9171, T9144.
 
       , mayLookIdentical ty1 ty2
+      , matchabilityBits ty1 ty2
+      , matchabilityBits exp act
       ]
 shouldPprWithInvisibleBits ty1 ty2
   eq@(KindEqOrigin act exp orig _)
   = mconcat
       [ maybe Set.empty Set.singleton $ invisibleOrigin_maybe eq
       , mayLookIdentical act exp
+      , matchabilityBits act exp
       , shouldPprWithInvisibleBits ty1 ty2 orig
       ]
 shouldPprWithInvisibleBits ty1 ty2 _ct
-  = mayLookIdentical ty1 ty2
+  = mayLookIdentical ty1 ty2 S.<> matchabilityBits ty1 ty2
+
+matchabilityBits :: Type -> Type -> Set InvisibleBit
+matchabilityBits ty1 ty2 =
+  Set.fromList [TypeCompare.InvisibleMatchability | hasMatchabilityMismatch ty1 ty2]
+
+-- | Check whether both sides have kind Matchability or differ in forall/arrow matchability.
+hasMatchabilityMismatch :: Type -> Type -> Bool
+hasMatchabilityMismatch ty1 ty2 =
+    isMatchabilityMismatch ty1 ty2 || go init_env ty1 ty2
+  where
+    init_env = mkRnEnv2 (mkInScopeSet (tyCoVarsOfType ty1 `unionVarSet` tyCoVarsOfType ty2))
+    go env a b | Just a' <- coreView a = go env a' b
+    go env a b | Just b' <- coreView b = go env a b'
+    go env (CastTy a _) b = go env a b
+    go env a (CastTy b _) = go env a b
+    go env (ForAllTy ma1 (Bndr tv1 vis1) body1) (ForAllTy ma2 (Bndr tv2 vis2) body2)
+      | vis1 `eqForAllVis` vis2
+      = not (TypeCompare.eqTypeX env ma1 ma2)
+        || go env (tyVarKind tv1) (tyVarKind tv2)
+        || go (rnBndr2 env tv1 tv2) body1 body2
+    go env (FunTy _ ma1 _ arg1 res1) (FunTy _ ma2 _ arg2 res2)
+      = not (TypeCompare.eqTypeX env ma1 ma2) || go env arg1 arg2 || go env res1 res2
+    go env (DepFunTy vis1 v1 body1) (DepFunTy vis2 v2 body2)
+      | vis1 == vis2
+      = go env (varType v1) (varType v2) || go (rnBndr2 env v1 v2) body1 body2
+    go env (ExistsTy flag1 v1 body1) (ExistsTy flag2 v2 body2)
+      | flag1 == flag2
+      = go env (varType v1) (varType v2) || go (rnBndr2 env v1 v2) body1 body2
+    go env (TyConApp tc1 args1) (TyConApp tc2 args2)
+      | tc1 == tc2, not (isForgetfulSynTyCon tc1)
+      = any (uncurry (go env)) (zip args1 args2)
+    go env (AppTy s1 a1) b
+      | Just (s2, a2) <- tcSplitAppTyNoView_maybe b
+      = go env s1 s2 || go env a1 a2
+    go env a (AppTy s2 a2)
+      | Just (s1, a1) <- tcSplitAppTyNoView_maybe a
+      = go env s1 s2 || go env a1 a2
+    go _ _ _ = False
+
+-- | Check whether both sides of the mismatch have kind Matchability.
+isMatchabilityMismatch :: Type -> Type -> Bool
+isMatchabilityMismatch ty1 ty2 =
+  typeKind ty1 `tcEqType` matchabilityTy && typeKind ty2 `tcEqType` matchabilityTy
 
 pprWithLinearTypes :: SDoc -> SDoc
 pprWithLinearTypes =
@@ -4923,12 +5649,21 @@ unnecessary clutter:
 
         (a -> b)
 
+  - Matchability. Controlled by -fprint-explicit-matchabilities.
+    Ordinary user-style arrows omit fixed matchability annotations.
+    Show them when they distinguish otherwise identical types. If the
+    solver reports a mismatch between two matchabilities, show how
+    they occur in the expected and actual kinds. The expected kind can
+    be a family application that conceals the underlying arrow.
+    Keep the modifier syntax in modules that use -XModifiers.
+
 To achieve this, each of these user-facing flags controls a field of
 'SDocContext', respectively:
 
     * sdocPrintExplicitKinds
     * sdocPrintExplicitRuntimeReps
     * sdocLinearTypes
+    * sdocPrintExplicitMatchabilities
 
 The pretty-printer in GHC.Iface.Type then consults these when deciding how much
 to show.
@@ -5162,8 +5897,10 @@ we want to give it a bit of structure.  Here's the plan
 pprExpectedActualInfo :: SolverReportErrCtxt -> ExpectedActualInfo -> SDoc
 pprExpectedActualInfo _ (ExpectedActual { ea_expected = exp, ea_actual = act }) =
   vcat
-    [ text "Expected:" <+> ppr exp
-    , text "  Actual:" <+> ppr act ]
+    [ text "Expected:" <+> render exp
+    , text "  Actual:" <+> render act ]
+  where
+    render = pprTypeCaseMismatch . restoreTypeLambdas [exp, act]
 pprExpectedActualInfo _
   (ExpectedActualAfterTySynExpansion
     { ea_expanded_expected = exp
@@ -5398,8 +6135,16 @@ pprAmbiguityInfo (Ambiguity prepend_msg (ambig_kvs, ambig_tvs)) = msg
       | otherwise -- "The type variable 't0' is ambiguous"
       = text "The" <+> what <+> text "variable" <> plural tkvs
         <+> pprQuotedList tkvs <+> isOrAre tkvs <+> text "ambiguous"
-pprAmbiguityInfo (NonInjectiveTyFam tc) =
-  note $ quotes (ppr tc) <+> text "is a non-injective type family"
+pprAmbiguityInfo (NonInjectiveTyFam tc)
+  | Just (_, True) <- closedFamilyScope_maybe tc
+  = note $ text "GHC cannot infer the captured indices of this retained sum from its payload type"
+  | Just source <- liftedTypeContext (tyConName tc)
+  = note $ text "GHC cannot determine the arguments of the" <+> source <+> text "from its result"
+  | Just _ <- sourceTableTermOcc (getOccName tc)
+  = note $ text "GHC cannot determine the arguments of the function"
+           <+> quotes (ppr tc) <+> text "from its result"
+  | otherwise
+  = note $ quotes (ppr tc) <+> text "is a non-injective type family"
 
 pprSameOccInfo :: SameOccInfo -> SDoc
 pprSameOccInfo (SameOcc same_pkg n1 n2) =
@@ -5463,7 +6208,9 @@ pprHoleError ctxt (Hole { hole_ty, hole_occ}) (HoleError sort other_tvs hole_sko
       | otherwise
       = pprType hole_ty <+> dcolon <+> pprKind hole_kind
 
-    tyvars = tyCoVarsOfTypeList hole_ty
+    -- Filter out retained term-variable indices so holes with only foreach
+    -- binders in scope do not print an empty "Where:" header.
+    tyvars = filter (not . isNonCoVarId) (tyCoVarsOfTypeList hole_ty)
     tyvars_msg = ppUnless (null tyvars) $
                  text "Where:" <+> (vcat (map loc_msg other_tvs)
                                     $$ pprSkols ctxt hole_skol_info)
@@ -5905,14 +6652,15 @@ tidySigSkol env cx ty tv_prs
     tv_prs' = mapSnd (tidyTyCoVarOcc env) tv_prs
     inst_env = mkNameEnv tv_prs'
 
-    tidy_ty env (ForAllTy (Bndr tv vis) ty)
-      = ForAllTy (Bndr tv' vis) (tidy_ty env' ty)
+    tidy_ty env (ForAllTy ma (Bndr tv vis) ty)
+      = ForAllTy (tidy_ty env ma) (Bndr tv' vis) (tidy_ty env' ty)
       where
         (env', tv') = tidy_tv_bndr env tv
 
-    tidy_ty env ty@(FunTy { ft_mult = w, ft_arg = arg, ft_res = res })
+    tidy_ty env ty@(FunTy { ft_ma = ma, ft_mult = w, ft_arg = arg, ft_res = res })
       = -- Look under  c => t and t1 -> t2
-        ty { ft_mult = tidy_ty env w
+        ty { ft_ma   = tidy_ty env ma
+           , ft_mult = tidy_ty env w
            , ft_arg  = tidyType env arg
            , ft_res  = tidy_ty env res }
 
@@ -6003,7 +6751,10 @@ mk_ea_msg ctxt at_top level
   (TypeEqOrigin { uo_actual = act, uo_expected = exp, uo_thing = mb_thing })
   | Just thing <- mb_thing
   , KindLevel <- level
-  = Right $ pprKindMismatchMsg thing exp act
+  = Right $ case thing of
+      HsExprRnThing{} | sum_payload -> pprExpectedActualInfo ctxt ea
+      HsExprTcThing{} | sum_payload -> pprExpectedActualInfo ctxt ea
+      _ -> pprKindMismatchMsg thing exp act
   | Just item <- at_top
   , let  ea = EA $ if expanded_syns then Just ea_expanded else Nothing
          mismatch = mkBasicMismatchMsg ea item exp act
@@ -6017,6 +6768,9 @@ mk_ea_msg ctxt at_top level
     else [ea]
 
   where
+    -- A kind equality from transporting an index can carry the enclosing
+    -- term application as its origin. Its expected payload is a value type.
+    sum_payload = isJust (diagnosticSumPayload exp) || isJust (diagnosticSumPayload act)
     ea = ExpectedActual { ea_expected = exp, ea_actual = act }
     ea_expanded =
       ExpectedActualAfterTySynExpansion
@@ -6109,18 +6863,19 @@ expandSynonymsToMatch ty1 ty2 = (ty1_ret, ty2_ret)
           (t1_2', t2_2') = go t1_2 t2_2
        in (mkAppTy t1_1' t1_2', mkAppTy t2_1' t2_2')
 
-    go ty1@(FunTy _ w1 t1_1 t1_2) ty2@(FunTy _ w2 t2_1 t2_2) | w1 `eqType` w2 =
+    go ty1@(FunTy _ ma1 w1 t1_1 t1_2) ty2@(FunTy _ ma2 w2 t2_1 t2_2)
+      | ma1 `eqType` ma2, w1 `eqType` w2 =
       let (t1_1', t2_1') = go t1_1 t2_1
           (t1_2', t2_2') = go t1_2 t2_2
        in ( ty1 { ft_arg = t1_1', ft_res = t1_2' }
           , ty2 { ft_arg = t2_1', ft_res = t2_2' })
 
-    go (ForAllTy b1 t1) (ForAllTy b2 t2) =
+    go (ForAllTy ma1 b1 t1) (ForAllTy ma2 b2 t2) =
       -- NOTE: We may have a bug here, but we just can't reproduce it easily.
       -- See D1016 comments for details and our attempts at producing a test
       -- case. Short version: We probably need RnEnv2 to really get this right.
       let (t1', t2') = go t1 t2
-       in (ForAllTy b1 t1', ForAllTy b2 t2')
+       in (ForAllTy ma1 b1 t1', ForAllTy ma2 b2 t2')
 
     go (CastTy ty1 _) ty2 = go ty1 ty2
     go ty1 (CastTy ty2 _) = go ty1 ty2
@@ -6251,6 +7006,13 @@ pprConversionFailReason = \case
     where ty_str = case typeOrKind of
                      TypeLevel -> "type"
                      KindLevel -> "kind"
+  InvalidForallMatchabilityWrapper wrapper ->
+    vcat [ text wrapper <+> text "requires an immediate forall node with at least one binder:"
+         , nest 2 $ text $ case wrapper of
+             "ForallMatchT" -> "ForallT or ForallVisT"
+             "ForallMatchC" -> "ForallC"
+             "ForallMatchE" -> "ForallE or ForallVisE"
+             _ -> "a supported forall node" ]
   IllegalLastStatement do_or_lc stmt ->
     vcat [ text "Illegal last statement of" <+> pprAHsDoFlavour do_or_lc <> colon
          , nest 2 $ ppr stmt
@@ -6840,7 +7602,7 @@ pprSynAbstractDataError = \case
            Just $ text "Invalid type family" <+> quotes (ppr tc) <> dot
       ty@(ForAllTy {})
         -> Just $ text "Invalid polymorphic type" <> colon <+> ppr ty <> dot
-      ty@(FunTy af _ _ _)
+      ty@(FunTy af _ _ _ _)
         | not (af == FTF_T_T)
         -> Just $ text "Invalid qualified type" <> colon <+> ppr ty <> dot
       _ -> Nothing
@@ -7520,6 +8282,13 @@ pprTHReifyError = \case
   NoRolesAssociatedWithThing thing
     -> mkSimpleDecorated $
        text "No roles associated with" <+> (ppr thing)
+  CannotRepresentType RetainedFunctionType _
+    -> mkSimpleDecorated $
+       text "Template Haskell cannot represent a retained" <+> quotes (text "foreach") <+>
+       text "binder."
+  CannotRepresentType RetainedRuntimeIndex _
+    -> mkSimpleDecorated $
+       text "Template Haskell cannot represent a runtime index in a type."
   CannotRepresentType sort ty
     -> mkSimpleDecorated $
        (if show_linear then pprWithLinearTypes else id) $
@@ -7531,6 +8300,10 @@ pprTHReifyError = \case
            LinearInvisibleArgument -> (True , text "linear invisible argument")
            CoercionsInTypes        -> (False, text "coercions in types")
            DataConVisibleForall    -> (False, text "visible forall in the type of a data constructor")
+           FirstClassExistential   -> (False, text "first-class existential type")
+           MachineIntTypeLiteral   -> (False, text "machine integer type literal")
+           InteriorConstructorContext -> (False, text "constructor with an interior context")
+           NamedRetainedRecordCon  -> (False, text "a named retained record constructor")
 
 pprTypedTHError :: TypedTHError -> DecoratedSDoc
 pprTypedTHError = \case
@@ -7738,6 +8511,10 @@ pprPatersonCondFailure PCF_Size InInstanceDecl lhs rhs =
   hang (text "The constraint" <+> quotes (ppr lhs))
     2 (sep [ text "is no smaller than", pp_rhs ])
   where pp_rhs = text "the instance head" <+> quotes (ppr rhs)
+pprPatersonCondFailure PCF_Size InTyFamEquation lhs (TyConApp tc _)
+  | Just _ <- liftedTypeOwner "$case:" (tyConName tc)
+  = hang (text "The type case introduces a type-family application")
+      2 (text "that is no smaller than the LHS of the family equation" <+> quotes (ppr lhs))
 pprPatersonCondFailure PCF_Size InTyFamEquation lhs rhs =
   hang (text "The type-family application" <+> quotes (ppr rhs))
     2 (sep [ text "is no smaller than", pp_lhs ])
@@ -7745,8 +8522,17 @@ pprPatersonCondFailure PCF_Size InTyFamEquation lhs rhs =
 pprPatersonCondFailure  (PCF_TyFam tc) InInstanceDecl lhs _rhs =
   hang (text "Illegal use of type family" <+> quotes (ppr tc))
     2 (text "in the constraint" <+> quotes (ppr lhs))
-pprPatersonCondFailure  (PCF_TyFam tc) InTyFamEquation _lhs rhs =
-  hang (text "Illegal nested use of type family" <+> quotes (ppr tc))
+pprPatersonCondFailure  (PCF_TyFam tc) InTyFamEquation _lhs rhs
+  | Just owner <- liftedTypeOwner "$case:" (tyConName tc)
+  , TyConApp outer _ <- rhs
+  , Just owner == liftedTypeOwner "$case:" (tyConName outer)
+  = hang (text "One type case supplies an argument to another")
+      2 (text "in" <+> quotes (text owner))
+  | Just _ <- liftedTypeOwner "$lambda:" (tyConName tc)
+  , not ("-sigma" `isSuffixOf` occNameString (getOccName tc))
+  = text "An argument to a type family contains a type lambda."
+  | otherwise
+  = hang (text "Illegal nested use of type family" <+> quotes (ppr tc))
     2 (text "in the arguments of the type-family application" <+> quotes (ppr rhs))
 
 --------------------------------------------------------------------------------
@@ -7868,8 +8654,9 @@ pprHsCtxt = \case
     text "When checking the rewrite rule" <+> doubleQuotes (ftext rule_name)
   FieldCtxt field_name ->
     text "In the" <+> quotes (ppr field_name) <+> text "field of a record"
-  TypeCtxt ty ->
-    text "In the type" <+> quotes (ppr ty)
+  TypeCtxt source ty ->
+    text "In the type" <+> quotes (ifPprDebug lowered (maybe lowered ppr source))
+    where lowered = ppr ty
   KindCtxt ki ->
     text "In the kind" <+> quotes (ppr ki)
   SubTypeCtxt ty_expected ty_actual ->
@@ -7885,6 +8672,10 @@ pprHsCtxt = \case
       what | Just n <- isSigMaybe ctxt = quotes (ppr n)
            | otherwise                 = pprUserTypeCtxt ctxt
 
+  FunAppCtxt (FunAppCtxtTy fn arg) _
+    | Just source <- liftedTypeHeadContext fn ->
+        hang (text "When checking the" <+> source <> comma)
+          2 (text "at" <+> quotes (ppr arg))
   FunAppCtxt fun_arg arg_no ->
     hang (hsep [ text "In the", speakNth arg_no, text "argument of"
                , quotes fun <> text ", namely"])
@@ -7937,8 +8728,8 @@ pprHsCtxt = \case
 
       (_,_,fun_tau)   = tcSplitNestedSigmaTys fun_res_ty
       (_, _, env_tau) = tcSplitNestedSigmaTys (getCheckExpType env_ty)
-      (args_fun, res_fun) = tcSplitFunTys fun_tau
-      (args_env, res_env) = tcSplitFunTys env_tau
+      (_mas_fun, args_fun, res_fun) = tcSplitFunTys fun_tau
+      (_mas_env, args_env, res_env) = tcSplitFunTys env_tau
       n_fun = length args_fun
       n_env = length args_env
 
@@ -7948,6 +8739,8 @@ pprHsCtxt = \case
             Just (tc, _) -> isAlgTyCon tc
             Nothing      -> False
 
+  TyConDeclCtxt name _ | Just source <- liftedTypeContext name ->
+    text "In the" <+> source
   TyConDeclCtxt name flav ->
     hsep [ text "In the", ppr flav
          , text "declaration for", quotes (ppr name) ]
@@ -7968,9 +8761,25 @@ pprHsCtxt = \case
       ppr_cons :: [LocatedN Name] -> SDoc
       ppr_cons [con] = quotes (ppr con)
       ppr_cons cons  = interpp'SP cons
+  ClosedFamEqnCtxt tc | Just source <- liftedTypeContext (tyConName tc) ->
+    text "In a branch of the" <+> source
   ClosedFamEqnCtxt tc ->
     text "In the equations for closed type family" <+>
            quotes (ppr tc)
+  DeclKindSynonymCtxt name forall_vis local ->
+    vcat [ text "The kind synonym" <+> quotes (ppr name)
+           <+> text "supplies an unmatchable (U)" <+> binder <> dot
+         , text "This declaration requires a matchable (M)" <+> binder <> dot
+         , if local
+           then text "Use" <+> annotation
+                <+> text "in the synonym's definition, or use a separate matchable synonym here."
+           else text "Use a kind with a matchable" <+> binder
+                <+> text "or import a matchable synonym." ]
+    where
+      (binder, annotation) = case forall_vis of
+        Nothing        -> (text "arrow", text "'%M ->'")
+        Just Required  -> (text "visible forall", text "'forall ... -> @M'")
+        Just Invisible{} -> (text "invisible forall", text "'forall ... . @M'")
   TySynErrCtxt tc ->
     text "In the expansion of type synonym" <+> quotes (ppr tc)
   RoleAnnotErrCtxt name ->
@@ -8101,3 +8910,29 @@ pprHsCtxt = \case
     ppr_stmt (TransStmt { trS_by = by, trS_using = using
                         , trS_form = form }) = pprTransStmt by using form
     ppr_stmt stmt = pprStmt stmt
+
+-- | Identify an invisible binder supplied by a data family's result synonym
+-- that prevents matching the generated Haskell 98 constructor result.
+dataFamResultForallMismatch :: TyCon -> Type -> Type -> Maybe Name
+dataFamResultForallMismatch rep_tc expected actual
+  | not (isGadtSyntaxTyCon rep_tc)
+  , Just (fam, expected_args) <- splitTyConAppNoView_maybe expected
+  , Just (actual_fam, actual_args) <- splitTyConAppNoView_maybe actual
+  , actual_fam == fam
+  , isDataFamilyTyCon fam
+  , let arity = tyConArity fam
+  , (prefix, [TyVarTy var]) <- splitAt arity expected_args
+  , var `elem` tyConTyVars rep_tc
+  , Just (syn, _) <- splitTyConAppNoView_maybe (tyConResKind fam)
+  , isTypeSynonymTyCon syn
+  , Just (ma, Bndr _ vis, _) <-
+      splitForAllForAllTyBinder_maybe (typeKind (mkTyConApp fam prefix))
+  , isInvisibleForAllTyFlag vis
+  , ma `tcEqType` unmatchableDataConTy
+  -- The representation kind uses mkTyConKind, whose binders are M.
+  -- Check the arguments separately. Matching the complete application
+  -- cannot decompose the data family's U result forall.
+  , isJust (tcMatchTyKis expected_args actual_args)
+  = Just (tyConName syn)
+  | otherwise
+  = Nothing

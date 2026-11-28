@@ -25,6 +25,7 @@ import GHC.Tc.Instance.Typeable (kindIsTypeable)
 import GHC.Tc.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Errors.Types
+import GHC.Tc.Errors.Hole.FitTypes ( HoleFit (..), hfName )
 import GHC.Tc.Errors.Ppr
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.CtLoc
@@ -34,7 +35,7 @@ import GHC.Tc.Zonk.Type
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 import GHC.Tc.Types.Origin
-import GHC.Tc.Types.ErrCtxt( redundantConstraintsSpan )
+import GHC.Tc.Types.ErrCtxt( redundantConstraintsSpan, isSigMaybe )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Instance.Family
 import GHC.Tc.Utils.Instantiate
@@ -61,6 +62,8 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Core.PatSyn (PatSyn)
 import GHC.Core.Predicate
 import GHC.Core.Type
+import GHC.Core.TyCo.Rep ( Type (..) )
+import GHC.Core.Coercion.Axiom ( coAxiomBranches, fromBranches, cab_lhs )
 import GHC.Core.Class (className)
 import GHC.Core.ConLike (isExistentialRecordField, ConLike (..))
 import GHC.Core.Coercion
@@ -70,6 +73,7 @@ import GHC.Core.TyCo.Tidy
 import GHC.Core.TyCo.FVs
 
 import GHC.Core.InstEnv
+import GHC.Core.FamInstEnv ( familyInstances, FamInst (fi_tys) )
 import GHC.Core.TyCon
 
 import GHC.Utils.Error  (diagReasonSeverity, deferredTypeErrorMessage )
@@ -93,7 +97,7 @@ import Data.Function      ( on )
 import Data.Functor.Classes ( liftCompare )
 import Data.IntSet        ( IntSet )
 import qualified Data.IntSet as IntSet
-import Data.List          ( partition, union, sort, sortBy )
+import Data.List          ( partition, union, sort, sortBy, stripPrefix )
 import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import Data.Ord           ( comparing )
@@ -457,6 +461,7 @@ reportImplic ctxt implic@(Implic { ic_skols  = tvs
                                  , ic_tclvl  = tc_lvl })
   | BracketSkol <- info
   , not insoluble
+  , not (has_source_method_check wanted)
   = return ()        -- For Template Haskell brackets report only
                      -- definite errors. The whole thing will be re-checked
                      -- later when we plug it in, and meanwhile there may
@@ -476,6 +481,13 @@ reportImplic ctxt implic@(Implic { ic_skols  = tvs
        -- Report redundant (unused) constraints
        ; warnRedundantConstraints ctxt' ct_loc_env info' dead_givens }
   where
+    -- See Note [Checked source method evidence] in GHC.Tc.Solver.Solve.
+    has_source_method_check WC { wc_errors = errors, wc_impl = implics }
+      = anyBag is_source_method errors
+        || anyBag (has_source_method_check . ic_wanted) implics
+    is_source_method DE_SourceMethod {} = True
+    is_source_method _ = False
+
     insoluble    = isInsolubleStatus status
     (env1, tvs') = tidyVarBndrs (cec_tidy ctxt) $
                    scopedSort tvs
@@ -679,7 +691,7 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
                                          , text "tidy_items =" <+> ppr tidy_items
                                          , text "tidy_errs  =" <+> ppr tidy_errs ])
 
-       ; let (out_of_scope, other_holes, not_conc_errs, mult_co_errs)
+       ; let (out_of_scope, other_holes, not_conc_errs, mult_co_errs, source_method_errs)
                 = partition_errors tidy_errs
 
          -- First, deal with any out-of-scope errors:
@@ -689,6 +701,7 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
        -- Don't suppress holes or concreteness errors, ever
        ; reportHoles ctxt tidy_items other_holes
        ; reportNotConcreteErrs ctxt not_conc_errs
+       ; mapM_ reportSourceMethodError source_method_errs
 
        -- We only want to report multiplicity coercion errors for multiplicity
        -- constraints which are /solved/ with a non-reflexivity coercion. We
@@ -745,21 +758,31 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
  where
     env = cec_tidy ctxt
 
-    partition_errors :: [DelayedError] -> ([Hole], [Hole], [NotConcreteError], [(TcCoercion, CtLoc)])
+    partition_errors :: [DelayedError]
+                     -> ([Hole], [Hole], [NotConcreteError], [(TcCoercion, CtLoc)], [(EvVar, Name, CtLoc)])
     partition_errors []
-      = ([], [], [], [])
+      = ([], [], [], [], [])
     partition_errors (err:errs)
-      | (es1, es2, es3, es4) <- partition_errors errs
+      | (es1, es2, es3, es4, es5) <- partition_errors errs
       = case err of
           DE_Hole hole
             | isOutOfScopeHole hole
-            -> (hole : es1, es2, es3, es4)
+            -> (hole : es1, es2, es3, es4, es5)
             | otherwise
-            -> (es1, hole : es2, es3, es4)
+            -> (es1, hole : es2, es3, es4, es5)
           DE_NotConcrete err
-            -> (es1, es2, err : es3, es4)
+            -> (es1, es2, err : es3, es4, es5)
           DE_Multiplicity mult_co loc
-            -> (es1, es2, es3, (mult_co, loc):es4)
+            -> (es1, es2, es3, (mult_co, loc):es4, es5)
+          DE_SourceMethod ev _ method loc
+            -> (es1, es2, es3, es4, (ev, method, loc):es5)
+
+    -- This obligation must remain an error with -fdefer-type-errors.
+    -- See Note [Checked source method evidence] in GHC.Tc.Solver.Solve.
+    reportSourceMethodError :: (EvVar, Name, CtLoc) -> TcM ()
+    reportSourceMethodError (ev, method, loc)
+      = setCtLocM loc $ addErrTc $ TcRnRetainedQuantificationError $
+          RetainedSourceMethodEvidence method (varType ev)
 
     --serious_reporters: ones that should *not* be suppressed by cec_error_reported,
     --     (i.e. by an insoluble somewhere else in the tree)
@@ -1395,32 +1418,47 @@ addDeferredBinding ctxt supp hints msg (EI { ei_evdest = Just dest
                                            , ei_loc = loc })
   -- if evdest is Just, then the constraint was from a wanted
   | deferringAnyBindings ctxt
-  = do { err_tm <- mkErrorTerm loc item_ty ctxt msg supp hints
+  = do { err_tm <- mkErrorTerm loc ctxt msg supp hints
        ; let ev_binds_var = cec_binds ctxt
+             bind_error evar ty =
+               addTcEvBind ev_binds_var $ mkWantedEvBind evar EvCanonical (err_tm ty)
 
        ; case dest of
            EvVarDest evar
-             -> addTcEvBind ev_binds_var $ mkWantedEvBind evar EvCanonical err_tm
+             -> bind_error evar item_ty
            HoleDest hole
              -> do { -- See Note [Deferred errors for coercion holes]
-                     let co_var = coHoleCoVar hole
-                   ; addTcEvBind ev_binds_var $ mkWantedEvBind co_var EvCanonical err_tm
-                   ; fillCoercionHole hole (CPH { cph_co = mkCoVarCo co_var
-                                                , cph_holes = emptyCoHoleSet })  } }
+                     let old_var = coHoleCoVar hole
+                   ; co_var <- liftZonkM (zonkCoVar old_var)
+                   ; let (lhs, rhs, role) = coVarTypesRole co_var
+                         lhs_kind = typeKind lhs
+                         rhs_kind = typeKind rhs
+                   ; co <- if lhs_kind `tcEqType` rhs_kind
+                           then do { bind_error old_var item_ty
+                                   ; return (mkCoVarCo old_var) }
+                           else do { let kind_pred = mkNomEqPred rhs_kind lhs_kind
+                                   ; kind_var <- newEvVar kind_pred
+                                   ; let kind_co = mkCoVarCo kind_var
+                                         index_pred = mkEqPredRole role lhs (mkCastTy rhs kind_co)
+                                   ; index_var <- newEvVar index_pred
+                                   ; bind_error kind_var kind_pred
+                                   ; bind_error index_var index_pred
+                                   ; return (mkCoVarCo index_var `mkTransCo` mkGReflLeftCo role rhs kind_co) }
+                   ; fillCoercionHole hole (CPH { cph_co = co
+                                                , cph_holes = emptyCoHoleSet }) } }
 addDeferredBinding _ _ _ _ _ = return ()    -- Do not set any evidence for Given
 
 mkSolverErrorTerm :: CtLoc -> Type  -- of the error term
                   -> SolverReport -> TcM EvTerm
-mkSolverErrorTerm ct_loc ty err
-  = mkErrorTerm ct_loc ty (reportContext . sr_important_msg $ err)
-                          (TcRnSolverReport (sr_important_msg err) ErrorWithoutFlag)
-                          (sr_supplementary err)
-                          (sr_hints err)
+mkSolverErrorTerm ct_loc ty err =
+  ($ ty) <$> mkErrorTerm ct_loc (reportContext . sr_important_msg $ err)
+                               (TcRnSolverReport (sr_important_msg err) ErrorWithoutFlag)
+                               (sr_supplementary err)
+                               (sr_hints err)
 
-mkErrorTerm :: CtLoc -> Type  -- of the error term
-            -> SolverReportErrCtxt -> TcRnMessage
-            -> [SupplementaryInfo] -> [GhcHint] -> TcM EvTerm
-mkErrorTerm ct_loc ty ctxt msg supp hints
+mkErrorTerm :: CtLoc -> SolverReportErrCtxt -> TcRnMessage
+            -> [SupplementaryInfo] -> [GhcHint] -> TcM (Type -> EvTerm)
+mkErrorTerm ct_loc ctxt msg supp hints
   = do { msg <- mkErrorReport
                   (ctLocEnv ct_loc)
                   msg
@@ -1432,7 +1470,7 @@ mkErrorTerm ct_loc ty ctxt msg supp hints
        ; let err_msg = deferredTypeErrorMessage (initTcMessageOpts dflags) msg
              err_str = showSDoc dflags err_msg
 
-       ; return $ evDelayedError ty err_str }
+       ; return $ \ty -> evDelayedError ty err_str }
 
 tryReporters :: SolverReportErrCtxt
              -> [ReporterSpec]
@@ -1538,6 +1576,13 @@ from that EvVar, filling the hole with that coercion. Because coercions'
 types are unlifted, the error is guaranteed to be hit before we get to the
 coercion.
 
+For a heterogeneous hole, bind a nominal kind equality and a homogeneous
+index equality instead. For a hole like (a :: k1) ~r (b :: k2), bind
+ck :: k2 ~# k1 and ci :: a ~r (b |> ck) to the same error. Fill the hole with
+ci followed by the inverse kind cast on b. The composition keeps the
+original endpoints and role. Both evidence bindings still force the error,
+even if a function ignores the boxed dictionary made from the hole.
+
 ************************************************************************
 *                                                                      *
                 Irreducible predicate errors
@@ -1639,16 +1684,18 @@ mkHoleError lcl_name_cache tidy_simples ctxt
        ; (grouped_skvs, other_tvs) <- liftZonkM $ zonkAndGroupSkolTvs hole_ty
        ; let reason | ExprHole _ <- sort = cec_expr_holes ctxt
                     | otherwise          = cec_type_holes ctxt
-             err  = SolverReportWithCtxt ctxt
+             ctxt_skol = ctxt { cec_tidy = tidyHoleSkolEnv (cec_tidy ctxt) grouped_skvs }
+             err  = SolverReportWithCtxt ctxt_skol
                   $ ReportHoleError hole
                   $ HoleError sort other_tvs grouped_skvs
              supp =    [ SupplementaryBindings rel_binds ]
                     ++ [ SupplementaryCts      cts | cts <- maybeToList (NE.nonEmpty relevant_cts) ]
                     ++ [ SupplementaryHoleFits hole_fits ]
 
-       ; maybeAddDeferredBindings hole (SolverReport err supp noHints)
+       ; maybe_split_hints <- dependentHoleHints ctxt lcl_env hole hole_fits
+       ; maybeAddDeferredBindings hole (SolverReport err supp maybe_split_hints)
        ; let msg = TcRnSolverReport err reason
-       ; mkErrorReport lcl_env msg (Just ctxt) supp noHints
+       ; mkErrorReport lcl_env msg (Just ctxt) supp maybe_split_hints
        }
 
   where
@@ -1656,6 +1703,7 @@ mkHoleError lcl_name_cache tidy_simples ctxt
 
 -- | For all the skolem type variables in a type, zonk the skolem info and group together
 -- all the type variables with the same origin.
+-- See Note [Term variables in hole diagnostics].
 zonkAndGroupSkolTvs :: Type -> ZonkM ([(SkolemInfoAnon, [TcTyVar])], [TcTyVar])
 zonkAndGroupSkolTvs hole_ty = do
   zonked_info <- mapM zonk_skolem_info skolem_list
@@ -1664,7 +1712,7 @@ zonkAndGroupSkolTvs hole_ty = do
     zonk_skolem_info (sk, tv) =
       do { sk <- zonkSkolemInfoAnon $ getSkolemInfo sk
          ; return (sk, fst <$> tv) }
-    tvs = tyCoVarsOfTypeList hole_ty
+    tvs = filter (not . isNonCoVarId) $ tyCoVarsOfTypeList hole_ty
     (skol_tvs, other_tvs) = partition (isTcTyVar <&&> isSkolemTyVar) tvs
 
     group_skolems :: UM.UniqMap SkolemInfo ([(TcTyVar, Int)])
@@ -1674,6 +1722,224 @@ zonkAndGroupSkolTvs hole_ty = do
 
     skolem_list = sortBy (comparing (sort . map snd . snd))
                 $ UM.nonDetUniqMapToList group_skolems
+
+{- Note [Term variables in hole diagnostics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A dependent hole type can contain runtime index occurrences via 'TermVarTy'.
+'tyCoVarsOfTypeList' collects these local runtime 'Id's alongside type and
+coercion variables.
+
+1. Exclude non-coercion 'Id's in 'zonkAndGroupSkolTvs'. 'HoleError' expects
+   'other_tvs' to contain only 'TyVar's and 'CoVar's. Leaving runtime 'Id's in
+   'other_tvs' misclassifies them as coercion variables under
+   '-fprint-explicit-coercions'.
+
+2. Release bound 'DepFunTy' binder occurrences from 'TidyOccEnv' before
+   tidying hole skolem origins ('tidyHoleSkolEnv') when those occurrences do not
+   collide with free variables or rigid type variables of the skolem info.
+   Otherwise free 'TermVarTy' occurrences from the hole type (such as @xs@ and
+   @ys@) cause 'tidySigSkol' to rename @foreach (xs :: [a])@ to @xs1@ when
+   printing the enclosing signature.
+
+3. When `DependentTypes` is active and no direct non-recursive fit solves an
+   expression hole, inspect the hole type for stuck certified source-table
+   family applications @T:f arg_1 ... arg_n@. If a constructor-scrutinized
+   argument position holds an unrefined local algebraic variable @x@ that is
+   bound in the enclosing clause or expression scope (not a 'DepFunTy' binder
+   quantified inside the hole type itself), emit a 'DependentCaseSplitHint'
+   suggesting a pattern match on @x@.
+-}
+
+-- | Release bound 'DepFunTy' binder occurrences from 'TidyOccEnv' before
+-- tidying hole skolem origins unless they collide with free variables or
+-- rigid type variables of the skolem info.
+-- See Note [Term variables in hole diagnostics].
+tidyHoleSkolEnv :: TidyEnv -> [(SkolemInfoAnon, [TcTyVar])] -> TidyEnv
+tidyHoleSkolEnv env@(occ_env, var_env) grouped_skvs
+  | null releasable = env
+  | otherwise       = (delTidyOccEnvList occ_env releasable, var_env)
+  where
+    skol_tys = [ ty | (info, _) <- grouped_skvs, ty <- skol_info_tys info ]
+    skol_info_tys (SigSkol _ ty _)     = [ty]
+    skol_info_tys (DerivSkol ty)       = [ty]
+    skol_info_tys (InferSkol ids)      = map snd ids
+    skol_info_tys (UnifyForAllSkol ty) = [ty]
+    skol_info_tys _                    = []
+
+    tidy_occ v = getOccName (fromMaybe v (lookupVarEnv var_env v))
+    avoid_fs = UM.listToUniqMap $
+      [ (occNameFS (tidy_occ tv), ()) | (_, tvs) <- grouped_skvs, tv <- tvs ] ++
+      [ (occNameFS (tidy_occ v),  ()) | ty <- skol_tys, v <- tyCoVarsOfTypeList ty ]
+
+    dep_bndr_occs ty | Just ty' <- coreView ty = dep_bndr_occs ty'
+    dep_bndr_occs (DepFunTy _ v b)   = getOccName v : dep_bndr_occs (varType v) ++ dep_bndr_occs b
+    dep_bndr_occs (DepDictTy v b)    = dep_bndr_occs (varType v) ++ dep_bndr_occs b
+    dep_bndr_occs (ForAllTy ma _ b)  = dep_bndr_occs ma ++ dep_bndr_occs b
+    dep_bndr_occs (FunTy _ ma w a r) = dep_bndr_occs ma ++ dep_bndr_occs w ++ dep_bndr_occs a ++ dep_bndr_occs r
+    dep_bndr_occs (ExistsTy _ v b)   = dep_bndr_occs (varType v) ++ dep_bndr_occs b
+    dep_bndr_occs _                  = []
+
+    releasable =
+      [ occ
+      | ty <- skol_tys
+      , occ <- dep_bndr_occs ty
+      , not (UM.elemUniqMap (occNameFS occ) avoid_fs)
+      ]
+
+-- | Diagnostic hint suggesting a pattern match on a local index variable to
+-- reduce a stuck source-table type family in a hole type.
+data DependentCaseSplitHint = DependentCaseSplitHint !Name ![DataCon] !OccName
+
+instance Outputable DependentCaseSplitHint where
+  ppr (DependentCaseSplitHint var_nm data_cons fun_occ)
+    = text "Pattern-match on" <+> quotes (ppr var_nm)
+        <+> parens (text "constructors:"
+                    <+> pprWithCommas (quotes . ppr . dataConName) (take 4 data_cons))
+        <+> text "to reduce" <+> quotes (ppr fun_occ) <> dot
+
+-- | Build case-split hints for stuck source-table families in an unsolved
+-- dependent expression hole.
+-- See Note [Term variables in hole diagnostics].
+dependentHoleHints :: SolverReportErrCtxt -> CtLocEnv -> Hole -> ValidHoleFits -> TcM [GhcHint]
+dependentHoleHints ctxt lcl_env (Hole { hole_sort = ExprHole _, hole_ty = hole_ty })
+                   (ValidHoleFits { holeFits = Fits direct_fits _ })
+  = do { dep_exts <- xoptM LangExt.DependentTypes
+       ; home_mod <- tcg_mod <$> getGblEnv
+       ; if not dep_exts || has_direct_fit home_mod
+         then return noHints
+         else do
+           { fam_envs <- tcGetFamInstEnvs
+           ; let candidates = nubOrdBy cmp_cand (collect_stuck fam_envs hole_ty)
+           ; return [ UnknownHint (DependentCaseSplitHint (idName (untidy_id v)) cons occ)
+                    | (v, cons, occ) <- take 3 candidates ] } }
+  where
+    local_bndr_env = mkVarEnv
+      [ (b, b)
+      | TcIdBndr b top_lvl <- ctl_bndrs lcl_env
+      , not (isTopLevel top_lvl)
+      ]
+    untidy_id v = fromMaybe v (lookupVarEnv local_bndr_env v)
+
+    bndr_occ (TcIdBndr bndr_id top_lvl)      = Just (nameOccName (idName bndr_id), top_lvl)
+    bndr_occ (TcIdBndr_ExpType nm _ top_lvl) = Just (nameOccName nm, top_lvl)
+    bndr_occ (TcTvBndr _ _)                  = Nothing
+
+    all_id_bndrs = mapMaybe bndr_occ (ctl_bndrs lcl_env)
+    not_top_occs = [ occ | (occ, top_lvl) <- all_id_bndrs, not (isTopLevel top_lvl) ]
+    encl_occ = case reverse not_top_occs of
+                 occ : _ -> [occ]
+                 []      -> [ occ | (occ, _) : _ <- [all_id_bndrs] ]
+    sig_occs =
+      [ nameOccName fn_nm
+      | imp <- cec_encl ctxt
+      , SigSkol uctxt _ _ <- [ic_info imp]
+      , Just fn_nm <- [isSigMaybe uctxt]
+      ]
+    self_occs = mkOccSet (sig_occs ++ encl_occ)
+
+    is_self_nm home_mod nm =
+      (isNothing (nameModule_maybe nm) || nameModule_maybe nm == Just home_mod)
+      && (nameOccName nm `elemOccSet` self_occs)
+
+    has_direct_fit home_mod = any (not . is_self_fit home_mod) direct_fits
+    is_self_fit home_mod (TcHoleFit hf) = is_self_nm home_mod (hfName hf)
+    is_self_fit _        (RawHoleFit _) = False
+
+    refined_vars = mkVarSet
+      [ v
+      | imp <- cec_encl ctxt
+      , ev <- ic_given imp
+      , Just (_, lhs, rhs) <- [getEqPredTys_maybe (varType ev)]
+      , v <- refined_side lhs rhs ++ refined_side rhs lhs
+      ]
+
+    refined_side (TermVarTy v) rhs
+      | Just (tc, _) <- splitTyConApp_maybe rhs
+      , isJust (isPromotedDataCon_maybe tc)
+      = [v]
+    refined_side _ _ = []
+
+    cmp_cand (v1, _, o1) (v2, _, o2)
+      = stableNameCmp (idName v1) (idName v2) Semi.<> compare o1 o2
+
+    owner_occ :: TyCon -> Maybe OccName
+    owner_occ tc = do
+      raw <- sourceTableTermOcc (nameOccName (tyConName tc))
+      pure $ maybe raw mkVarOcc (stripPrefix "#guard:" (occNameString raw))
+
+    scrutinized_args :: FamInstEnvs -> TyCon -> [Type] -> [Type]
+    scrutinized_args fam_envs tc args
+      | null lhs_rows = args
+      | otherwise     = go_cols lhs_rows args
+      where
+        closed_rows = case closedFamilyTyConCoAxiom_maybe tc of
+          Just ax -> map cab_lhs (fromBranches (coAxiomBranches ax))
+          Nothing -> []
+        open_rows = map fi_tys (familyInstances fam_envs tc)
+        lhs_rows = closed_rows ++ open_rows
+
+        go_cols _ [] = []
+        go_cols rows (a : as)
+          | null heads = []
+          | any (isNothing . getTyVar_maybe) heads = a : rest
+          | otherwise                              = rest
+          where
+            heads = [ r  | r : _  <- rows ]
+            tails = [ rs | _ : rs <- rows ]
+            rest  = go_cols tails as
+
+    unwrap_term_var :: VarSet -> Type -> Maybe Id
+    unwrap_term_var bound ty
+      | Just ty' <- coreView ty = unwrap_term_var bound ty'
+    unwrap_term_var bound (CastTy ty _) = unwrap_term_var bound ty
+    unwrap_term_var bound (TermVarTy v)
+      | isNonCoVarId v
+      , not (isGlobalId v)
+      , v `elemVarEnv` local_bndr_env
+      , not (v `elemVarSet` bound)
+      , not (isUnderscore (nameOccName (idName v)))
+      , not (v `elemVarSet` refined_vars)
+      = Just v
+    unwrap_term_var _ _ = Nothing
+
+    alg_cons_of :: Id -> Maybe [DataCon]
+    alg_cons_of v
+      | Just (tc, _) <- tcSplitTyConApp_maybe (varType v)
+      , isAlgTyCon tc
+      , not (isNewTyCon tc)
+      , not (isAbstractTyCon tc)
+      , let cons = tyConDataCons tc
+      , not (null cons)
+      = Just cons
+      | otherwise = Nothing
+
+    collect_stuck :: FamInstEnvs -> Type -> [(Id, [DataCon], OccName)]
+    collect_stuck fam_envs = go emptyVarSet
+      where
+        go bound ty | Just ty' <- coreView ty = go bound ty'
+        go bound (TyConApp tc args) =
+          let inner = concatMap (go bound) args
+              here
+                | isTypeFamilyTyCon tc
+                , Just fun_occ <- owner_occ tc
+                = [ (v, cons, fun_occ)
+                  | arg <- scrutinized_args fam_envs tc args
+                  , Just v <- [unwrap_term_var bound arg]
+                  , Just cons <- [alg_cons_of v]
+                  ]
+                | otherwise = []
+          in inner ++ here
+        go bound (AppTy t1 t2) = go bound t1 ++ go bound t2
+        go bound (FunTy _ ma w t1 t2) = go bound ma ++ go bound w ++ go bound t1 ++ go bound t2
+        go bound (ForAllTy ma _ b) = go bound ma ++ go bound b
+        go bound (DepFunTy _ v b) = go bound (varType v) ++ go (extendVarSet bound v) b
+        go bound (DepDictTy v b) = go bound (varType v) ++ go (extendVarSet bound v) b
+        go bound (ExistsTy _ v b) = go bound (varType v) ++ go (extendVarSet bound v) b
+        go bound (TermAppTy _ a) = go bound a
+        go bound (ClassAppTy _ i d o k) = go bound i ++ go bound d ++ go bound o ++ go bound k
+        go bound (CastTy t _) = go bound t
+        go _ _ = []
+dependentHoleHints _ _ _ _ = return noHints
 
 {- Note [Adding deferred bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1723,11 +1989,7 @@ validHoleFits ctxt@(CEC { cec_encl = implics
     mk_wanted :: ErrorItem -> Maybe CtEvidence
     mk_wanted (EI { ei_pred = pred, ei_evdest = m_dest, ei_loc = loc })
       | Just dest <- m_dest
-      = Just $ CtWanted $
-          WantedCt { ctev_pred      = pred
-                   , ctev_dest      = dest
-                   , ctev_loc       = loc
-                   , ctev_rewriters = emptyCoHoleSet }
+      = Just $ CtWanted $ mkWantedCt loc emptyCoHoleSet pred dest
       | otherwise
       = Nothing   -- The ErrorItem was a Given
 
@@ -2614,7 +2876,7 @@ typeableInfo_maybe item
          | isForAllTy ty -> return $ Just $ NoTypeableForPolytype ty
 
          -- Qualified types like (Num a => blah) are not typeable
-         | Just (af,_mult_,_arg,_ret) <- splitFunTy_maybe ty
+         | Just (af,_ma,_mult_,_arg,_ret) <- splitFunTy_maybe ty
          , not $ isVisibleFunArg af
          -> return $ Just $ NoTypeableForQualifiedType ty
 
@@ -2628,8 +2890,9 @@ typeableInfo_maybe item
 
          -- TyCons whose kind is non-typeable, are not typeable
          | Just (tc, _tys) <- splitTyConApp_maybe ty
-         , not (kindIsTypeable (tyConKind tc))
-         -> return $ Just $ NoTypeableForTyConWithNonTypeableKind ty (tyConKind tc)
+         -> do { typeable <- kindIsTypeable (tyConKind tc)
+               ; return $ if typeable then Nothing else
+                   Just $ NoTypeableForTyConWithNonTypeableKind ty (tyConKind tc) }
 
          | otherwise -> return Nothing
   | otherwise = return Nothing
@@ -2962,6 +3225,9 @@ relevant_bindings want_filtering lcl_env lcl_name_env ct_tvs
       where
         discard_it = go dflags n_left tvs_seen rels tc_bndrs
         go2 id_name top_lvl
+          | isSystemName id_name, isUnderscore (nameOccName id_name)
+          = discard_it  -- See Note [Wildcard retained binders] in GHC.Tc.Gen.Match.
+          | otherwise
           = do { let tidy_ty = case lookupNameEnv lcl_name_env id_name of
                                   Just tty -> tty
                                   Nothing -> pprPanic "relevant_bindings" (ppr id_name)
