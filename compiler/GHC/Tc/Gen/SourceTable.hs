@@ -10,8 +10,7 @@ module GHC.Tc.Gen.SourceTable
   , checkLocalRetainedWitnessExports, isMonomorphicRetainedWitness
   , finalCoreMappers, verifyFinalCoreMapper, failedFinalListTables, finalCoreSourceFamilies
   , isFinalCoreIdentity, indexedProjectionSource, isFinalCoreReverseWrapper
-  , sourcePairBuilderField, lookupObservedPairField, lookupPairObserver, lookupPairRecipe
-  , canObservePairSource, sourceRuleOwners, sourceTableOccurrence, tcLookupSourceTableId
+  , sourcePairBuilderField, sourceRuleOwners, sourceTableOccurrence, tcLookupSourceTableId
   , sourceTableCallees, sourceTableDependencies, sourceTableTypeUses, sourceTableFamilyUse
   , sourceTableFamilyAppUse, sourceTableReferenceUse, sourceCaseKindUse, sourceCaseVisibleArity
   , isSourceConstructorCase, sourceTableOwner, monomorphicEnumCaseArity, groundFirstHead
@@ -3694,18 +3693,6 @@ checkedPairBuilder owner rhs = do
       (Just v, Nothing) | not (complete_poly y) -> copiedPair v CLeft right mkSourceSndOcc
       (Nothing, Just v) | not (complete_poly x) -> copiedPair v CRight left mkSourceFstOcc
       _ -> pure (Nothing, [])
-
-lookupObservedPairField :: LeftOrRight -> Id -> [Type] -> Kind -> TcM (Maybe TyCon)
-lookupObservedPairField _ _ _ _ = pure Nothing
-
-canObservePairSource :: Id -> TcM Bool
-canObservePairSource _ = pure False
-
-lookupPairObserver :: LeftOrRight -> Id -> Int -> TcM (Maybe Id)
-lookupPairObserver _ _ _ = pure Nothing
-
-lookupPairRecipe :: Module -> OccName -> Int -> TcM (Maybe Id, Maybe Id)
-lookupPairRecipe _ _ _ = pure (Nothing, Nothing)
 
 sourcePairBuilderField :: TyCon -> Maybe (LeftOrRight, Int)
 sourcePairBuilderField table = do
