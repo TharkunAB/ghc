@@ -31,7 +31,7 @@ import GHC.Tc.Utils.Env ( isBrackLevel )
 import GHC.Tc.Utils.Monad
 
 import GHC.Rename.Bind ( rnLocalBindsAndThen, rnLocalValBindsLHS, rnLocalValBindsRHS
-                       , rnMatchGroup, rnGRHS, makeMiniFixityEnv)
+                       , rnMatchGroup, rnGRHSs, rnGRHS, makeMiniFixityEnv)
 import GHC.Rename.Env
 import GHC.Rename.Fixity
 import GHC.Rename.Utils
@@ -45,7 +45,7 @@ import GHC.Rename.Pat
 import GHC.Driver.DynFlags
 import GHC.Builtin.KnownKeys
 import GHC.Builtin.KnownOccs
-import GHC.Builtin.WiredIn.Types ( nilDataConName, oneDataConName )
+import GHC.Builtin.WiredIn.Types ( nilDataConName, oneDataConName, unitDataCon )
 import GHC.Builtin.WiredIn.Ids( rightSectionName, leftSectionName )
 
 import GHC.Unit.Module ( isInteractiveModule )
@@ -77,6 +77,7 @@ import Data.List (unzip4)
 import Data.List.NonEmpty ( NonEmpty(..), head, init, last, nonEmpty, scanl, tail )
 import Data.Ord
 import Data.Array
+import Data.Data (Data, cast, gmapQ)
 import GHC.Driver.Env (HscEnv)
 import Data.Foldable (toList)
 
@@ -315,6 +316,7 @@ rnExpr (HsVar _ (L l v))
            Just gre ->
     do { let nm   = greName gre
              info = greInfo gre
+       ; when (isValName nm) $ warnPunUse (L l v) gre
        ; if | IAmRecField fld_info <- info
             -- Since GHC 9.4, such occurrences of record fields must be
             -- unambiguous. For ambiguous occurrences, we arbitrarily pick one
@@ -347,7 +349,7 @@ rnExpr (HsHole h)
 rnExpr (HsOverLabel src v)
   = do { (from_label, fvs) <- lookupSyntaxName fromLabelClassOpOcc
        ; return ( mkExpandedExpr (HsOverLabel src v) $
-                  HsAppType noExtField (genLHsVar from_label) hs_ty_arg
+                  HsAppType Nothing (genLHsVar from_label) hs_ty_arg
                 , fvs ) }
   where
     hs_ty_arg = mkEmptyWildCardBndrs $ wrapGenSpan $
@@ -387,8 +389,16 @@ rnExpr (HsAppType _ fun arg)
   = do { type_app <- xoptM LangExt.TypeApplications
        ; unless type_app $ addErr $ typeAppErr TypeLevel $ hswc_body arg
        ; (fun',fvFun) <- rnLExpr fun
-       ; (arg',fvArg) <- rnHsWcType HsTypeCtx arg
-       ; return (HsAppType noExtField fun' arg', fvFun `plusFN` fvArg) }
+       ; (arg', original, fvArg) <- rnHsTypeAppOrQuote arg
+       ; return (HsAppType original fun' arg', fvFun `plusFN` fvArg) }
+
+rnExpr (HsAppRetained _ fun arg)
+  = do { enabled <- xoptM LangExt.DependentTypes
+       ; unless enabled $
+           addErr (TcRnRetainedQuantificationError RetainedArgumentExtension)
+       ; (fun', fv_fun) <- rnLExpr fun
+       ; (arg', fv_arg) <- rnLExpr arg
+       ; return (HsAppRetained noExtField fun' arg', fv_fun `plusFN` fv_arg) }
 
 rnExpr (OpApp _ e1 op e2)
   = do  { (e1', fv_e1) <- rnLExpr e1
@@ -476,7 +486,10 @@ rnExpr (HsLam x lam_variant matches)
 
 rnExpr (HsCase _ expr matches)
   = do { (new_expr, e_fvs) <- rnLExpr expr
-       ; (new_matches, ms_fvs) <- rnMatchGroup CaseAlt rnLExpr matches
+       ; mb_ty_matches <- rnTypeCaseMatchesMaybe new_expr matches
+       ; (new_matches, ms_fvs) <- case mb_ty_matches of
+           Just res -> pure res
+           Nothing  -> rnMatchGroup CaseAlt rnLExpr matches
        ; return (HsCase CaseAlt new_expr new_matches, e_fvs `plusFN` ms_fvs) }
 
 rnExpr (HsLet _ (L l binds) expr)
@@ -573,8 +586,13 @@ rnExpr (RecordUpd { rupd_expr = L l expr, rupd_flds = rbinds })
 
 
 rnExpr (ExprWithTySig _ expr pty)
-  = do  { (pty', fvTy)    <- rnHsSigWcType ExprWithTySigCtx pty
-        ; (expr', fvExpr) <- bindSigTyVarsFV (hsWcScopedTvs pty') $
+  = do  { retained <- xoptM LangExt.DependentTypes
+        ; (pty', fvTy) <- if retained
+                          then rnLocalHsSigWcType emptyNameSet ExprWithTySigCtx pty
+                          else rnScopedHsSigWcType ExprWithTySigCtx pty
+        ; let scoped = hsWcScopedTvs pty'
+        ; (expr', fvExpr) <- bindSigTyVarsFV scoped $
+                             withWrittenSignatureKinds (signatureWrittenKinds scoped (hswc_body pty')) $
                              rnLExpr expr
         ; return (ExprWithTySig noExtField expr' pty', fvExpr `plusFN` fvTy) }
 
@@ -598,9 +616,11 @@ rnExpr (ArithSeq _ _ seq)
            else
             return (ArithSeq noExtField Nothing new_seq, fvs) }
 
-rnExpr (HsEmbTy _ ty)
-  = do { (ty', fvs) <- rnHsWcType HsTypeCtx ty
-       ; checkTypeSyntaxExtension TypeKeywordSyntax
+rnExpr (HsEmbTy tok ty)
+  = do { (ty', _, fvs) <- rnHsTypeAppOrQuote ty
+       ; if tok == noAnn
+           then checkTypeSyntaxExtension ForallTelescopeSyntax
+           else checkTypeSyntaxExtension TypeKeywordSyntax
        ; return (HsEmbTy noExtField ty', fvs) }
 
 rnExpr (HsStar x)
@@ -733,6 +753,145 @@ rnSection section@(SectionL x expr op)
                  , fvs_op `plusFN` fvs_expr) }
 
 rnSection other = pprPanic "rnSection" (ppr other)
+
+{- Note [Renaming runtime Type case alternatives]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Proposal #378 §4.9 allows runtime pattern matching `case a of` on a retained
+`foreach (a :: Type) ->` binder using unadorned type patterns such as `Int ->`,
+`Bool ->`, `[Char] ->`, `Maybe b ->`, plus a catch-all `_ ->`.
+
+Because the parser builds `ConPat` and `ListPat` in the data constructor
+namespace, `lookupConCps` would reject `Int`, `Bool`, `Char`, or `Maybe` before
+the typechecker sees `a :: TypeRep a_tv`. When `-XDependentTypes` is
+active, the scrutinee is a local variable, and at least one branch contains a
+top-level `EmbTyPat` or a `ConPat` head in scope in the type namespace rather
+than the data namespace, `rnTypeCaseMatchesMaybe` translates each non-catch-all
+pattern into `HsType GhcPs` and renames it via `rnHsTypeApp` into `EmbTyPat`.
+In-scope type variables (such as `b` in `Maybe b ->`) resolve to their outer
+bindings instead of fresh pattern binders.
+
+Do not classify a `ConPat` whose head is absent from the type namespace (such as
+`GHC.Exists.Pack`) or that carries a nested `EmbTyPat` argument (such as
+`Pack (type x) payload` or `MkBox (type a) x` under `TypeAbstractions`) as a
+runtime `Type` pattern. Those patterns are ordinary or existential term patterns
+that bind fresh type and value variables over their right-hand sides.
+-}
+
+-- | Rename `case` alternatives as embedded type patterns when scrutinizing a
+-- local variable against unadorned type constructor patterns.
+-- See Note [Renaming runtime Type case alternatives].
+rnTypeCaseMatchesMaybe :: LHsExpr GhcRn
+                       -> MatchGroup GhcPs (LHsExpr GhcPs)
+                       -> RnM (Maybe (MatchGroup GhcRn (LHsExpr GhcRn), FreeNames))
+rnTypeCaseMatchesMaybe scrut matches@(MG { mg_alts = L lm alts, mg_ext = (origin, mann) }) = do
+  dep <- xoptM LangExt.DependentTypes
+  case stripParensLHsExpr scrut of
+    L _ (HsVar _ lname)
+      | dep
+      , not (isExternalName (unLocWithUserRdr lname))
+      , not (null alts) -> do
+          has_ty_alt <- anyM is_definite_type_alt alts
+          if not has_ty_alt || not (all valid_alt_shape alts)
+            then pure Nothing
+            else do
+              (alts', fvs_list) <- mapAndUnzipM rn_alt alts
+              pure (Just (MG { mg_alts = L lm alts', mg_ext = (origin, mann) }, plusFNs fvs_list))
+    _ -> pure Nothing
+  where
+    is_definite_type_alt :: LMatch GhcPs (LHsExpr GhcPs) -> RnM Bool
+    is_definite_type_alt (L _ Match { m_pats = L _ [pat] }) = is_definite_top_type_pat pat
+    is_definite_type_alt _ = pure False
+
+    is_definite_top_type_pat :: LPat GhcPs -> RnM Bool
+    is_definite_top_type_pat (L _ (ParPat _ inner)) = is_definite_top_type_pat inner
+    is_definite_top_type_pat (L _ EmbTyPat{})       = pure True
+    is_definite_top_type_pat pat                    = is_definite_inner_type_pat pat
+
+    is_definite_inner_type_pat :: LPat GhcPs -> RnM Bool
+    is_definite_inner_type_pat (L _ pat) = case pat of
+      ParPat _ inner -> is_definite_inner_type_pat inner
+      EmbTyPat{} -> pure False
+      ConPat _ (L _ rdr) details -> do
+        mb_dc <- lookupOccRn_maybe rdr
+        has_tycon <- case promoteRdrName rdr of
+          Just tc_rdr -> isJust <$> lookupOccRn_maybe tc_rdr
+          Nothing     -> pure False
+        if not has_tycon
+          then pure False
+          else if isNothing mb_dc
+            then pure True
+            else anyM is_definite_inner_type_pat (hsConPatArgs details)
+      ListPat _ [p] -> is_definite_inner_type_pat p
+      TuplePat _ ps Boxed -> anyM is_definite_inner_type_pat ps
+      SigPat _ inner _ -> is_definite_inner_type_pat inner
+      _ -> pure False
+
+    is_catch_all_pat :: LPat GhcPs -> Bool
+    is_catch_all_pat (L _ (ParPat _ inner)) = is_catch_all_pat inner
+    is_catch_all_pat (L _ WildPat{})        = True
+    is_catch_all_pat (L _ VarPat{})         = True
+    is_catch_all_pat _                      = False
+
+    valid_alt_shape :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
+    valid_alt_shape (L _ Match { m_pats = L _ [pat] }) =
+      is_catch_all_pat pat || isJust (patToHsTypeTopPs pat)
+    valid_alt_shape _ = False
+
+    rn_alt :: LMatch GhcPs (LHsExpr GhcPs) -> RnM (LMatch GhcRn (LHsExpr GhcRn), FreeNames)
+    rn_alt m@(L mloc match@(Match { m_pats = L plocs [pat@(L ploc _)], m_grhss = grhss }))
+      | is_catch_all_pat pat = do
+          (MG { mg_alts = L _ [m'] }, fvs) <-
+            rnMatchGroup CaseAlt rnLExpr (matches { mg_alts = L lm [m] })
+          pure (m', fvs)
+      | Just hs_ty <- patToHsTypeTopPs pat = do
+          (HsWC wcs hs_ty', _, pat_fvs) <- setSrcSpanA ploc $ rnHsTypeApp (HsWC noExtField hs_ty)
+          let pat' = L ploc (EmbTyPat noExtField (HsTP (HsTPRn wcs [] []) hs_ty'))
+          (grhss', rhs_fvs) <- setSrcSpanA mloc $ rnGRHSs CaseAlt rnLExpr grhss
+          pure ( L mloc (match { m_ext = noExtField
+                               , m_ctxt = CaseAlt
+                               , m_pats = L plocs [pat']
+                               , m_grhss = grhss' })
+               , pat_fvs `plusFN` rhs_fvs )
+    rn_alt m = pprPanic "rnTypeCaseMatchesMaybe" (ppr m)
+
+-- | Convert a top-level runtime `Type` case pattern into a surface type.
+patToHsTypeTopPs :: LPat GhcPs -> Maybe (LHsType GhcPs)
+patToHsTypeTopPs (L l (ParPat _ inner))     = L l . HsParTy noAnn <$> patToHsTypeTopPs inner
+patToHsTypeTopPs (L _ (EmbTyPat _ (HsTP _ t))) = Just t
+patToHsTypeTopPs pat                        = patToHsTypePs pat
+
+-- | Convert a nested runtime `Type` case subpattern into a surface type.
+patToHsTypePs :: LPat GhcPs -> Maybe (LHsType GhcPs)
+patToHsTypePs (L l pat) = case pat of
+  ParPat _ inner -> L l . HsParTy noAnn <$> patToHsTypePs inner
+  VarPat _ (L vl rdr) ->
+    let tv_rdr = fromMaybe rdr (promoteRdrName rdr)
+    in Just (L (l2l vl) (HsTyVar noAnn NotPromoted (L vl tv_rdr)))
+  WildPat _ ->
+    let hole_rdr = mkRdrUnqual (mkVarOcc "_")
+    in Just (L l (HsWildCardTy (HoleVar (L (noAnnSrcSpan (locA l)) hole_rdr))))
+  ConPat _ (L cl rdr) (PrefixCon _ args)
+    | rdr == getRdrName unitDataCon
+    , null args ->
+        Just (L l (HsTupleTy noAnn HsBoxedOrConstraintTuple []))
+    | otherwise -> do
+        args' <- traverse patToHsTypePs args
+        let tc_rdr  = fromMaybe rdr (promoteRdrName rdr)
+            head_ty = L (l2l cl) (HsTyVar noAnn NotPromoted (L cl tc_rdr))
+        pure (foldl' (\f a -> L (combineLocsA f a) (HsAppTy noExtField f a)) head_ty args')
+  ConPat _ (L cl rdr) (InfixCon _ lhs rhs) -> do
+    lhs' <- patToHsTypePs lhs
+    rhs' <- patToHsTypePs rhs
+    let tc_rdr = fromMaybe rdr (promoteRdrName rdr)
+        op_ty  = L (l2l cl) (HsTyVar noAnn NotPromoted (L cl tc_rdr))
+    pure (L l (HsOpTy noExtField lhs' op_ty rhs'))
+  ListPat _ [elem_pat] ->
+    L l . HsListTy noAnn <$> patToHsTypePs elem_pat
+  TuplePat _ ps Boxed ->
+    L l . HsTupleTy noAnn HsBoxedOrConstraintTuple <$> traverse patToHsTypePs ps
+  SigPat _ inner (HsPS _ ki) ->
+    (\t -> L l (HsKindSig noAnn t ki)) <$> patToHsTypePs inner
+  _ -> Nothing
 
 {- Note [Left and right sections]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2439,6 +2598,7 @@ definitelyLazyPattern (L loc pat) =
       GhcTc -> case ext of
         ExpansionPat _ p -> definitelyLazyPattern (L loc p)
         CoPat {} -> panic "definitelyLazyPattern: CoPat"
+        NativeExistsPat _ _ _ _ p -> definitelyLazyPattern (L loc p)
 
 {-
 Note [ApplicativeDo and refutable patterns]
@@ -2948,3 +3108,79 @@ rnHsUpdProjs us = do
                        , hfbLHS = fmap rnFieldLabelStrings fs
                        , hfbRHS = arg
                        , hfbPun = pun }), fv ) }
+
+-- | Rename a visible or @type@-embedded type argument, falling back to
+-- 'HsTypeLambdaQuoteRn' for complete inline type lambdas @\@(\y -> body)@ that
+-- mention source equations or runtime indices when lifting to a top-level
+-- family fails. Wildcard-bearing type lambdas keep the lifted-position check.
+rnHsTypeAppOrQuote :: LHsWcType GhcPs
+                   -> RnM (LHsWcType GhcRn, Maybe HsAppTypeSource, FreeNames)
+rnHsTypeAppOrQuote arg@(HsWC { hswc_body = hs_ty }) = do
+  experimental <- xoptM LangExt.DependentTypes
+  level <- getThLevel
+  case (experimental, level, peel_type_lambda hs_ty) of
+    (True, Comp, Just (lam_loc, binders, body)) -> do
+          (mb_ok, msgs) <- tryTc (rnHsTypeApp arg)
+          case mb_ok of
+            Just res | not (errorsFound msgs) -> do
+              addMessages msgs
+              return res
+            _ -> do
+              (mb_lam, lam_msgs) <- tryTc $ do
+                let named_rdrs = [rdr | L _ (HsTvb _ _ (HsBndrVar _ rdr) _) <- binders]
+                    rn_bndrs [] = do
+                      (HsWC wcs body', _, fv) <- rnHsTypeApp (HsWC noExtField body)
+                      pure (wcs, [], body', fv)
+                    rn_bndrs (L bloc (HsTvb _ () bvar bkind) : bs) = do
+                      (kwcs, bkind', kfvs) <- case bkind of
+                        HsBndrNoKind _ -> pure ([], HsBndrNoKind noExtField, emptyFNs)
+                        HsBndrKind _ hs_k -> do
+                          (HsWC kw hs_k', _, kfv) <- rnHsTypeApp (HsWC noExtField hs_k)
+                          pure (kw, HsBndrKind noExtField hs_k', kfv)
+                      case bvar of
+                        HsBndrVar _ lrdr@(L vloc _) -> do
+                          nm <- newLocalBndrRn lrdr
+                          let tvb' = L bloc (HsTvb noAnn () (HsBndrVar noExtField (L vloc nm)) bkind')
+                          (wcs, bs', body', bfvs) <- bindLocalNamesFV [nm] (do
+                            (w, rbs, rb, rfv) <- rn_bndrs bs
+                            pure ((w, rbs, rb), rfv)) >>= \((w, rbs, rb), rfv) -> pure (w, rbs, rb, rfv)
+                          pure (kwcs ++ wcs, tvb' : bs', body', kfvs `plusFN` bfvs)
+                        HsBndrWildCard _ -> do
+                          nm <- newSysName (mkTyVarOcc "_")
+                          let wloc = noAnnSrcSpan (locA bloc)
+                              tvb' = L bloc (HsTvb noAnn () (HsBndrVar noExtField (L wloc nm)) bkind')
+                          (wcs, bs', body', bfvs) <- rn_bndrs bs
+                          pure (kwcs ++ wcs, tvb' : bs', body', kfvs `plusFN` bfvs)
+                checkDupRdrNames named_rdrs
+                rn_bndrs binders
+              case mb_lam of
+                Just (wcs, binders', body', fvs)
+                  | not (null wcs) || has_anon_wildcard binders' || has_anon_wildcard body' -> do
+                      addMessages msgs
+                      failM
+                  | otherwise -> do
+                      addMessages lam_msgs
+                      let quoted = L lam_loc (XHsType (HsTypeLambdaQuoteRn binders' body'))
+                      return (HsWC [] quoted, Nothing, fvs)
+                Nothing -> do
+                  addMessages lam_msgs
+                  failM
+    _ -> rnHsTypeApp arg
+  where
+    peel_type_lambda :: LHsType GhcPs -> Maybe (SrcSpanAnnA, [LHsTyVarBndr () GhcPs], LHsType GhcPs)
+    peel_type_lambda (L _ (HsParTy _ inner)) = peel_type_lambda inner
+    peel_type_lambda (L l (XHsType (HsTypeLambda _ bndrs rhs))) = Just (l, bndrs, rhs)
+    peel_type_lambda _ = Nothing
+
+    has_anon_wildcard :: Data a => a -> Bool
+    has_anon_wildcard node
+      | Just (L _ HsWildCardTy{}) <- (cast node :: Maybe (LHsType GhcRn))
+      = True
+      | Just (L _ (HsSpliceTy (HsUntypedSpliceTop _ ty) _))
+          <- (cast node :: Maybe (LHsType GhcRn))
+      = has_anon_wildcard ty
+      | Just (L _ HsSpliceTy{}) <- (cast node :: Maybe (LHsType GhcRn))
+      = False
+      | Just _ <- (cast node :: Maybe Name)
+      = False
+      | otherwise = or (gmapQ has_anon_wildcard node)
