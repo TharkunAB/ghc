@@ -1034,8 +1034,10 @@ forallMatchability = do
                 | ma `elem` [TH.ConT ''U, TH.PromotedT 'Unmatchable] = False
                 | otherwise = error ("Unexpected matchability: " ++ show ma)
             metadata (TH.ForallMatchT ma (TH.ForallVisT [_] body)) = tag ma : metadata body
+            metadata (TH.ForallVisT [_] body) = False : metadata body
             metadata (TH.AppT (TH.AppT (TH.AppT (TH.AppKindT (TH.ConT fun) ma) _) _) rest)
                 | fun == ''FUN = tag ma : metadata rest
+            metadata (TH.AppT (TH.AppT TH.ArrowT _) rest) = False : metadata rest
             metadata _ = []
         kinds <- mapM TH.reifyType [''ForallF0, ''ForallF1, ''ForallF2]
         pure $ TH.ListE
