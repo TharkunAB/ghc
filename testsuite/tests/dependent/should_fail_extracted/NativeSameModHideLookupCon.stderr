@@ -1,0 +1,8 @@
+NativeSameModHideLookupCon.hs:229:1: error: [GHC-70566]
+    Cannot reduce the open call to ‘substSingle’ in a type.
+      The dependent type needs this equation. Export the constructors of Lookup to make it available.
+
+NativeSameModHideLookupCon.hs:251:1: error: [GHC-70566]
+    Cannot reduce the open call to ‘substDouble’ in a type.
+      The dependent type needs this equation. Export the constructors of Lookup to make it available.
+

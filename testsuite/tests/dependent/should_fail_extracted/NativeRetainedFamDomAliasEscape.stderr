@@ -1,0 +1,4 @@
+NativeRetainedFamDomAliasEscape.hs:7:1: error: [GHC-39999]
+    • No instance for ‘Collects c’ arising from a use of ‘Elem’
+    • In the type synonym declaration for ‘Escapes’
+

@@ -1,0 +1,122 @@
+NativeTypeNumeralWrong.hs:9:7: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Bool (2 :: Nat)
+        Actual: Vec Bool (S Z)
+    • In the expression: VCons True VNil
+      In an equation for ‘two’: two = VCons True VNil
+
+NativeTypeNumeralWrong.hs:17:13: error: [GHC-83865]
+    • Couldn't match type ‘b <||> False’ with ‘True’
+      Expected: (b <||> False) :~: True
+        Actual: True :~: True
+    • In the expression: Refl
+      In an equation for ‘unknown’: unknown _ = Refl
+    • Relevant bindings include
+        unknown :: Proxy b -> (b <||> False) :~: True
+          (bound at NativeTypeNumeralWrong.hs:17:1)
+
+NativeTypeNumeralWrong.hs:24:34: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: tagBoth (n + m) (- 1)
+      In an equation for ‘badSecond’:
+          badSecond n m = tagBoth (n + m) (- 1)
+
+NativeTypeNumeralWrong.hs:27:27: error: [GHC-83865]
+    • Couldn't match type: plus cols (times rows cols)
+                     with: S (times rows cols)
+      Expected: Vec Bool (((1 :: Nat) + rows) * cols)
+        Actual: Vec Bool (plus (S Z) (times rows cols))
+    • In the expression: replicateNative (1 + rows * cols) True
+      In an equation for ‘wrongGrouping’:
+          wrongGrouping rows cols = replicateNative (1 + rows * cols) True
+
+NativeTypeNumeralWrong.hs:33:8: error: [GHC-05617]
+    • Could not deduce ‘plus cells (S Z) ~ S cells’
+      from the context: cells ~ times height width
+        bound by a type expected by the context:
+                   (cells ~ times height width) =>
+                   Vec Bool ((1 :: Nat) + (height * width))
+        at NativeTypeNumeralWrong.hs:32:9-13
+      Expected: Vec Bool ((1 :: Nat) + (height * width))
+        Actual: Vec Bool (plus cells (S Z))
+    • In the expression: replicateNative (cells + 1) True
+      In the expression:
+        let cells = times height width in replicateNative (cells + 1) True
+      In an equation for ‘wrongLocalSuccessor’:
+          wrongLocalSuccessor height width
+            = let cells = times height width
+              in replicateNative (cells + 1) True
+
+NativeTypeNumeralWrong.hs:40:8: error: [GHC-83865]
+    • Couldn't match type ‘times slices channels’ with ‘actualSize’
+      Expected: Vec Bool (S (times slices channels))
+        Actual: Vec Bool (S actualSize)
+    • In the expression: replicateNative (S actualSize) True
+      In the expression:
+        let actualSize = slices * channels
+        in replicateNative (S actualSize) True
+      In an equation for ‘givenProduct’:
+          givenProduct slices channels
+            = let actualSize = slices * channels
+              in replicateNative (S actualSize) True
+
+NativeTypeNumeralWrong.hs:58:49: error: [GHC-83865]
+    • Couldn't match type ‘times r c’ with ‘cells1’
+      Expected: Vec Bool (times r c)
+        Actual: Vec Bool cells1
+    • In the expression: replicateNative cells x
+      In the expression: let cells = r * c in replicateNative cells x
+      In the second argument of ‘withProduct’, namely
+        ‘(\ r c -> let cells = ... in replicateNative cells x)’
+
+NativeTypeNumeralWrong.hs:66:8: error: [GHC-05617]
+    • Could not deduce ‘times depth stride ~ area’
+      from the context: count ~ S area
+        bound by the local definition of ‘count’
+        at NativeTypeNumeralWrong.hs:65:9-13
+      Expected: Vec Bool (S (times depth stride))
+        Actual: Vec Bool count
+    • In the expression: replicateNative count True
+      In the expression:
+        let
+          area, count :: Nat
+          area = depth * stride
+          count = S area
+        in replicateNative count True
+      In an equation for ‘badSigned’:
+          badSigned depth stride
+            = let
+                area, count :: Nat
+                area = depth * stride
+                count = S area
+              in replicateNative count True
+
+NativeTypeNumeralWrong.hs:76:21: error: [GHC-83865]
+    • Couldn't match type ‘size’ with ‘S n0’
+      Expected: Vec Char ((1 :: Nat) + n0)
+        Actual: Vec Char size
+    • In the first argument of ‘headOfLocal’, namely
+        ‘(replicateNative size 'x')’
+      In the expression: headOfLocal (replicateNative size 'x')
+      In the expression:
+        let
+          size :: Nat
+          size = 1 + extent
+        in headOfLocal (replicateNative size 'x')
+
+NativeTypeNumeralWrong.hs:80:28: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S n1’
+      Expected: Vec Char ((1 :: Nat) + n1)
+        Actual: Vec Char size1
+    • In the first argument of ‘headOfLocal’, namely
+        ‘(replicateNative size x)’
+      In the expression: headOfLocal (replicateNative size x)
+      In an equation for ‘emptyHead’:
+          emptyHead x
+            = headOfLocal (replicateNative size x)
+            where
+                size :: Nat
+                size = 0
+

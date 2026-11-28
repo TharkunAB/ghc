@@ -1,0 +1,4 @@
+NativeStandaloneConstrainedDisabled.hs:5:11: error: [GHC-01259]
+    • Illegal constraint in a kind: forall a. C a => a -> *
+    • In a standalone kind signature for ‘F’: C a => a -> Type
+

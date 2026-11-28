@@ -1,0 +1,4 @@
+NativeImportedFamilyCycleFail.hs:8:29: error: [GHC-70566]
+    Cannot reduce the open call to ‘keep’ in a type.
+      This type instance requires the unfinished local function keep.
+

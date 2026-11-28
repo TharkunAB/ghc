@@ -1,0 +1,27 @@
+NativeStructuralCarriedArgsFail.hs:9:18: error: [GHC-83865]
+    • Couldn't match type: carryLast (There l1) r1
+                     with: carryLast l1 r1
+      Expected: carryLast l1 (There r1)
+                :~: There (carryLast (There l1) r1)
+        Actual: carryLast l1 (There r1) :~: carryLast l1 (There r1)
+      Note: GHC cannot determine the arguments of the function ‘carryLast’ from its result.
+    • In the expression: Refl
+      In an equation for ‘wrongLocal’: wrongLocal _ _ = Refl
+
+NativeStructuralCarriedArgsFail.hs:13:18: error: [GHC-83865]
+    • Couldn't match type ‘Empty’ with ‘Atom r’
+      Expected: decorate Empty l2 r :~: Atom r
+        Actual: decorate Empty l2 r :~: decorate Empty l2 r
+    • In the expression: Refl
+      In an equation for ‘wrongEmpty’: wrongEmpty _ _ = Refl
+
+NativeStructuralCarriedArgsFail.hs:17:17: error: [GHC-83865]
+    • Couldn't match type: decorateLast (There l) t
+                     with: decorateLast l t
+      Expected: decorateLast l (Next t)
+                :~: Next (decorateLast (There l) t)
+        Actual: decorateLast l (Next t) :~: decorateLast l (Next t)
+      Note: GHC cannot determine the arguments of the function ‘decorateLast’ from its result.
+    • In the expression: Refl
+      In an equation for ‘wrongLast’: wrongLast _ _ = Refl
+

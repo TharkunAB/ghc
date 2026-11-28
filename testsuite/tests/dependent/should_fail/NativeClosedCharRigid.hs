@@ -1,0 +1,8 @@
+{-# LANGUAGE DataKinds, DependentTypes, KindSignatures, ScopedTypeVariables #-}
+module NativeClosedCharRigid where
+
+import qualified Data.Char
+import Data.Proxy (Proxy)
+
+rigid :: forall (c :: Char). Proxy c -> Proxy (Data.Char.isSpace c)
+rigid = undefined

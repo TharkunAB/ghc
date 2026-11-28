@@ -26,6 +26,7 @@ test('T11311', normal, compile, [''])
 test('T11405', normal, compile, [''])
 test('T11241', normal, compile, [''])
 test('T11711', normal, compile, [''])
+test('CastedConstructorGivens', normal, compile, ['-dcore-lint -dstg-lint'])
 test('RaeJobTalk', normal, compile, [''])
 test('T11635', normal, compile, [''])
 test('T11719', normal, compile, [''])
@@ -95,3 +96,23 @@ test('T22257b', normal, compile, [''])
 test('T25238', normal, compile, [''])
 test('T25834', normal, compile, [''])
 test('GADTSingletons', normal, compile, [''])
+test('NativeNestedSumCapture', normal, compile, [''])
+test('NativeDependentResultBinders', normal, compile, [''])
+test('NativeTypeLamLargeElim', normal, compile, ['-dcore-lint'])
+test('NativeHigherOrderLargeElim', normal, compile, ['-dcore-lint -dstg-lint'])
+test('NativeTypeCaseQuote', [req_th, only_ways(['normal'])],
+     compile, [config.ghc_th_way_flags])
+
+test('NativeSourceCallIface',
+     extra_files(['ClosedTableLibrary.hs',
+                  'PackedVecLibrary.hs',
+                  'NativeMethodAliases.hs',
+                  'NativeMethodAliasClient.hs',
+                  'NativeLiteralClient.hs',
+                  'RetainedSumOperator.hs']),
+     makefile_test, ['NativeSourceCallIface'])
+
+test('DepIfaceSerialization',
+     extra_files(['DepIfaceSerialization.hs',
+                  'DepIfaceSerializationClient.hs']),
+     makefile_test, ['DepIfaceSerialization'])

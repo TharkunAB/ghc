@@ -1,0 +1,3 @@
+NativeOpenIdentityRuleFail.hs:14:11: error: [GHC-83605]
+    A rewrite rule can change the result of ‘id’, which GHC uses to check a dependent type.
+

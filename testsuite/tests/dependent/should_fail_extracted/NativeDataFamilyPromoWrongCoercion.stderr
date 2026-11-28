@@ -1,0 +1,6 @@
+NativeDataFamilyPromoWrongCoercion.hs:6:17: error: [GHC-18872]
+    • Couldn't match representation of type ‘False’ with that of ‘True’
+        arising from a use of ‘Coercion’
+    • In the expression: Coercion
+      In an equation for ‘wrongCoercion’: wrongCoercion = Coercion
+

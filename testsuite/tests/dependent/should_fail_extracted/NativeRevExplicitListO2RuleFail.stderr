@@ -1,0 +1,22 @@
+NativeRevExplicitListO2RuleFail.hs:25:29: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘++’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression: Refl
+      In an equation for ‘mapAppendEq’: mapAppendEq _ [] _ = Refl
+
+NativeRevExplicitListO2RuleFail.hs:26:29: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘++’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression: gcastWith (mapAppendEq f_aL1 xs ys_aL3) Refl
+      In an equation for ‘mapAppendEq’:
+          mapAppendEq f (_ : xs) ys = gcastWith (mapAppendEq f xs ys) Refl
+
+NativeRevExplicitListO2RuleFail.hs:34:32: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘++’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the expression:
+        const Refl (Refl :: (('[] :: [Bool]) ++ ys_aKN) :~: ys_aKN)
+      In an equation for ‘smuggledExprSig’:
+          smuggledExprSig [] ys _
+            = const Refl (Refl :: (('[] :: [Bool]) ++ ys) :~: ys)
+

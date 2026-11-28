@@ -1,0 +1,58 @@
+NativeRetainedCastDomainBranchWrong.hs:14:48: error: [GHC-25897]
+    • Couldn't match type ‘m’ with ‘S m’
+      Expected: Vec Bool (S m)
+        Actual: Vec Bool (Add cut m)
+      ‘m’ is a rigid type variable bound by
+        the type signature for:
+          wrongBranchLength :: forall (m :: Nat).
+                               foreach (cut1 :: Nat)
+                               -> foreach (xs1 :: Vec Bool (Add cut1 m)) -> BranchVector xs1
+        at NativeRetainedCastDomainBranchWrong.hs:13:1-110
+    • In the expression: observeVector @('S m) xs_a4pK
+      In an equation for ‘wrongBranchLength’:
+          wrongBranchLength Z xs = observeVector @('S m) xs
+    • Relevant bindings include
+        xs :: Vec Bool (Add cut m)
+          (bound at NativeRetainedCastDomainBranchWrong.hs:14:21)
+        wrongBranchLength :: foreach (cut :: Nat)
+                             -> foreach (xs :: Vec Bool (Add cut m)) -> BranchVector xs
+          (bound at NativeRetainedCastDomainBranchWrong.hs:14:1)
+
+NativeRetainedCastDomainBranchWrong.hs:21:13: error: [GHC-05617]
+    • Could not deduce ‘ys ~ xs’
+      from the context: (n ~ S k, Vec Bool n ~ Vec Bool (S k))
+        bound by a pattern with constructor: S :: Nat -> Nat,
+                 in a lambda abstraction
+        at NativeRetainedCastDomainBranchWrong.hs:21:5-63
+      Expected: BranchVector xs
+        Actual: BranchVector ys
+    • In the expression: observeVector @('S k) ys
+      In the expression:
+        (observeVector @('S k) ys, observeVector @('S k) xs)
+      In the expression:
+        case n of
+          Z -> (observeVector @'Z xs, observeVector @'Z ys)
+          S k -> (observeVector @('S k) ys, observeVector @('S k) xs)
+    • Relevant bindings include
+        xs_a4qj :: Vec Bool n (bound at <no location info>)
+        ys_a4qk :: Vec Bool n (bound at <no location info>)
+
+NativeRetainedCastDomainBranchWrong.hs:21:39: error: [GHC-05617]
+    • Could not deduce ‘xs ~ ys’
+      from the context: (n ~ S k, Vec Bool n ~ Vec Bool (S k))
+        bound by a pattern with constructor: S :: Nat -> Nat,
+                 in a lambda abstraction
+        at NativeRetainedCastDomainBranchWrong.hs:21:5-63
+      Expected: BranchVector ys
+        Actual: BranchVector xs
+    • In the expression: observeVector @('S k) xs
+      In the expression:
+        (observeVector @('S k) ys, observeVector @('S k) xs)
+      In the expression:
+        case n of
+          Z -> (observeVector @'Z xs, observeVector @'Z ys)
+          S k -> (observeVector @('S k) ys, observeVector @('S k) xs)
+    • Relevant bindings include
+        xs_a4qj :: Vec Bool n (bound at <no location info>)
+        ys_a4qk :: Vec Bool n (bound at <no location info>)
+

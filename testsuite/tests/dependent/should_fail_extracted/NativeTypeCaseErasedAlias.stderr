@@ -1,0 +1,7 @@
+NativeTypeCaseErasedAlias.hs:8:3: error: [GHC-30337]
+    • Dodgy type variable ‘a’ in the LHS of a family instance:
+        the type variable ‘a’ syntactically appears in LHS patterns,
+        but it doesn't appear in an injective position.
+    • In a branch of the type case in ‘Bad’
+      In the type family instance declaration for ‘NativeTypeCaseErasedAlias.$case:Bad:0’
+

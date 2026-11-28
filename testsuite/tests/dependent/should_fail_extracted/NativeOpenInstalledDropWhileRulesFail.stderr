@@ -1,0 +1,11 @@
+NativeOpenInstalledDropWhileRulesFail.hs:10:9: error: [GHC-83605]
+    • GHC cannot use the checked equation for ‘takeWhile’ with the current rewrite rules.
+      Use -fno-enable-rewrite-rules in the module that needs this equation.
+    • In the pattern: Refl
+      In the pattern: Stops Refl
+      In a case alternative:
+          Stops Refl
+            -> case takeWhile (gate &&) (x : xs) of
+                 [] -> "stop"
+                 _ -> "bad"
+

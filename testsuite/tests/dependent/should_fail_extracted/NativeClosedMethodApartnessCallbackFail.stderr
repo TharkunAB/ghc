@@ -1,0 +1,4 @@
+NativeClosedMethodApartnessCallbackFail.hs:11:15: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘not’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+

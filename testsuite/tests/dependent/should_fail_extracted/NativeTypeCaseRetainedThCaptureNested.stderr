@@ -1,0 +1,6 @@
+NativeTypeCaseRetainedThCaptureNested.hs:18:4: error: [GHC-97233]
+    • A type case needs a supported position in a top-level type synonym, a closed type family equation RHS, a top-level value signature, or a constructor field.
+    • In the untyped splice:
+        $(do Just b <- lookupTypeName "b"
+             pure (CaseT (VarT b) [TypeCaseAlt (VarT b) (ConT ...)]))
+

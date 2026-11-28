@@ -1,0 +1,5 @@
+NativeConstrainedFamMissingBinder.hs:4:5: error: [GHC-90647]
+    • Constrained associated type family ‘F’
+      Missing class parameters in the family declaration k, b
+    • In the class declaration for ‘C’
+

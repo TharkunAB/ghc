@@ -1,0 +1,46 @@
+NativeTypeCaseSignatureDistinct.hs:9:26: error: [GHC-83865]
+    • Couldn't match type: the type case in the signature for ‘differentOrder’
+                     with: the type case in the signature for ‘differentOrder’
+      Expected: Proxy
+                  (the type case in the signature for ‘differentOrder’)
+        Actual: Proxy
+                  (the type case in the signature for ‘differentOrder’)
+    • In the expression: input
+      In an equation for ‘differentOrder’: differentOrder _ input = input
+    • Relevant bindings include
+        input :: Proxy
+                   (the type case in the signature for ‘differentOrder’)
+          (bound at NativeTypeCaseSignatureDistinct.hs:9:18)
+        differentOrder :: Proxy d
+                          -> Proxy (the type case in the signature for ‘differentOrder’)
+                          -> Proxy (the type case in the signature for ‘differentOrder’)
+          (bound at NativeTypeCaseSignatureDistinct.hs:9:1)
+
+NativeTypeCaseSignatureDistinct.hs:15:25: error: [GHC-83865]
+    • Couldn't match type: case b of {True -> Int; False -> Char}
+                     with: case b1 of {True -> Int; False -> Char}
+      Expected: the type case in the signature for ‘wrongShadow’
+        Actual: the type case in the signature for ‘wrongShadow’
+    • In the expression: input
+      In an equation for ‘wrongShadow’: wrongShadow _ input _ = input
+    • Relevant bindings include
+        input :: the type case in the signature for ‘wrongShadow’
+          (bound at NativeTypeCaseSignatureDistinct.hs:15:15)
+        wrongShadow :: Proxy b
+                       -> (the type case in the signature for ‘wrongShadow’)
+                       -> forall (b1 :: Bool).
+                          Proxy b1 -> the type case in the signature for ‘wrongShadow’
+          (bound at NativeTypeCaseSignatureDistinct.hs:15:1)
+
+NativeTypeCaseSignatureDistinct.hs:20:31: error: [GHC-83865]
+    • Couldn't match type: case left of {True -> Int; False -> Char}
+                     with: case right of {True -> Int; False -> Char}
+      Expected: the type case in the signature for ‘differentRetained’
+        Actual: the type case in the signature for ‘differentRetained’
+    • In the expression: input
+      In an equation for ‘differentRetained’:
+          differentRetained _ _ input = input
+    • Relevant bindings include
+        input :: the type case in the signature for ‘differentRetained’
+          (bound at NativeTypeCaseSignatureDistinct.hs:20:23)
+

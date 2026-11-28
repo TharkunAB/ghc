@@ -1,0 +1,7 @@
+NativeUnsaturatedInvisibleRequiredOff.hs:11:14: error: [GHC-27346]
+    • The type family ‘Required’ should have 2 arguments, but has been given none
+    • In the type signature: bad :: Carry Required
+    Suggested fix:
+      Use the ‘UnsaturatedTypeFamilies’ extension
+      to write a partial type family application.
+

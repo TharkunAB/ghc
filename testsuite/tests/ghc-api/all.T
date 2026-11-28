@@ -2,6 +2,42 @@ setTestOpts(when(arch('wasm32'), run_timeout_multiplier(2)))
 
 test('ghcApi', normal, compile_and_run, ['-package ghc'])
 
+test('AppendSymbolDeductionIface', [req_host_target_ghc, only_ways(['normal']),
+                                    extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc'])
+
+test('NativeDependentCore', [extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc'])
+
+test('NativeExistentialCore', [req_host_target_ghc, only_ways(['normal']),
+                               extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc -package array -package containers'])
+
+test('NativeExistentialExpr', [req_bco, req_rts_linker, req_process,
+                               req_host_target_ghc, only_ways(['normal']),
+                               extra_run_opts(f'"{config.libdir}" existential-fixture.hi')],
+     compile_and_run, ['-package ghc -package transformers'])
+
+test('OpenTermWhnf', [extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc'])
+
+test('OpenCharBranchWitness', [req_process, req_host_target_ghc, only_ways(['normal']),
+                               extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc -package transformers'])
+test('NativeIndexAbstraction', normal, compile_and_run, ['-package ghc'])
+test('MatchableProjectionRule', [only_ways(['normal']), extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc'])
+test('NativeDependentCoreRun', [req_bco, req_process, req_host_target_ghc,
+                              unless(have_ncg(), skip),
+                              extra_files(['../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs',
+                                           '../../../docs/dependent-haskell/examples/packed-vector/OrdinaryVecClient.hs',
+                                           '../../../docs/dependent-haskell/examples/packed-vector/Main.hs',
+                                           '../../../docs/dependent-haskell/examples/qualified-pi/ParameterizedIndexLibrary.hs',
+                                           '../../../docs/dependent-haskell/examples/qualified-pi/FunctionFieldLibrary.hs',
+                                           '../../../docs/dependent-haskell/examples/qualified-pi/FunctionFieldClient.hs']),
+                              extra_run_opts(f'"{config.libdir}"')],
+     compile_and_run, ['-package ghc'])
+
 test('T6145',
      [extra_run_opts(f'"{config.libdir}"')
      # needs to spawn c compiler process, and wasm doesn't have
@@ -84,6 +120,7 @@ test('T26910', [ extra_run_opts(f'"{config.libdir}"')
                , when(arch('wasm32') or arch('javascript'), skip)
                ], compile_and_run, ['-package ghc -package template-haskell'])
 test('TypeMapStringLiteral', normal, compile_and_run, ['-package ghc'])
+test('TypeRepBinaryMatchability', normal, compile_and_run, ['-package ghc -package binary'])
 
 test('T25121_status', normal, compile_and_run, ['-package ghc'])
 test('T24386', [extra_run_opts(f'"{config.libdir}"')], compile_and_run, ['-package ghc'])
@@ -101,3 +138,9 @@ test('T4162', [ extra_run_opts(f'"{config.libdir}"')
               # no subprocesses or signals
               , when(arch('wasm32') or arch('javascript'), skip)
               ], compile_and_run, ['-package ghc'])
+
+test('NativeRetainedPromotedIface',
+     [only_ways(['normal']),
+      extra_files(['../../../docs/dependent-haskell/examples/packed-vector/PackedVecLibrary.hs']),
+      extra_run_opts(f'"{config.libdir}" PackedVecLibrary.hs')],
+     compile_and_run, ['-package ghc'])

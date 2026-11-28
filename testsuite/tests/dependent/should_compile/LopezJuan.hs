@@ -14,7 +14,7 @@ type unification.
 
 {-# LANGUAGE TypeOperators, TypeApplications, DataKinds,
              StandaloneKindSignatures, PolyKinds, GADTs,
-             TypeFamilies, NamedWildCards, PartialTypeSignatures #-}
+             TypeFamilies, NamedWildCards, PartialTypeSignatures, Modifiers #-}
 {-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 
 module LopezJuan where
@@ -22,6 +22,7 @@ module LopezJuan where
 import Data.Type.Equality ( (:~~:)(..) )
 import Data.Kind ( Type )
 import Data.Proxy ( Proxy )
+import GHC.Exts ( M )
 
 -- amazingly, this worked without modification
 
@@ -49,7 +50,7 @@ type TyFun :: Type -> Type -> Type
 data TyFun arg res
 
 type (~>) :: Type -> Type -> Type
-type arg ~> res = TyFun arg res -> Type
+type arg ~> res = TyFun arg res %M -> Type
 infixr 0 ~>
 
 data Const :: a -> (b ~> a)

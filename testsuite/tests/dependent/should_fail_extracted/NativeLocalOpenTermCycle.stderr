@@ -1,0 +1,6 @@
+NativeLocalOpenTermCycle.hs:5:17: error: [GHC-70566]
+    • Cannot reduce the open call to ‘choose’ in a type.
+        Reduction exceeded the open evaluation step limit (-freduction-depth).
+    • In the type ‘NativeLocalOpenTermCycle.choose a’
+      In the type synonym declaration for ‘Result’
+

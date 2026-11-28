@@ -1,0 +1,6 @@
+NativeOpenInstalledAppendBadWorkersFail.hs:11:23: error: [GHC-70566]
+    • Cannot reduce the open call to ‘BW.ruledAppend’ in a type.
+        Reduction stopped at a case on the rigid argument xs. A checked equation can retain this case until the argument's constructor is known.
+    • In the type ‘BW.ruledAppend xs ys’
+      In the type synonym declaration for ‘BadRuled’
+

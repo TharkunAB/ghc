@@ -1,0 +1,10 @@
+NativePromotedClassMappingGiven.hs:7:89: error: [GHC-83605]
+    • GHC cannot use method ‘mapLike’ as a retained index.
+      This call needs a known ‘MapLike Maybe’ dictionary.
+    • In the first argument of ‘(:~:)’, namely ‘mapLike f ('Just x)’
+      In the type signature:
+        present :: forall a b (f :: a %U -> b) (x :: a). MapLike Maybe =>
+                                                         Proxy f
+                                                         -> Proxy x
+                                                            -> mapLike f ('Just x) :~: 'Just (f x)
+

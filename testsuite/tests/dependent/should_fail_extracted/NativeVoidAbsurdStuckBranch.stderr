@@ -1,0 +1,11 @@
+NativeVoidAbsurdStuckBranch.hs:9:15: error: [GHC-83865]
+    • Couldn't match type ‘okTo (Right v)’ with ‘x’
+      Expected: okTo (Right v) :~: x
+        Actual: okTo (Right v) :~: okTo (Right v)
+    • In the expression: Refl
+      In an equation for ‘unsound’: unsound _ _ = Refl
+    • Relevant bindings include
+        unsound :: foreach (v :: Void)
+                   -> foreach (x :: a) -> okTo (Right v) :~: x
+          (bound at NativeVoidAbsurdStuckBranch.hs:9:1)
+

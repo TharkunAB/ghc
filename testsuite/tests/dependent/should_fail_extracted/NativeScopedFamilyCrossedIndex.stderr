@@ -1,0 +1,18 @@
+NativeScopedFamilyCrossedIndex.hs:6:23: error: [GHC-83865]
+    • Couldn't match type: compareOrigin @c $dCollects y
+                     with: compareOrigin @c $dCollects x
+      Expected: TaggedEntry (Element c) (compareOrigin @c $dCollects x)
+        Actual: TaggedEntry (Element c) (compareOrigin @c $dCollects y)
+    • In the expression: inspectEntry y payload
+      In an equation for ‘crossed’:
+          crossed _ y payload = inspectEntry y payload
+    • Relevant bindings include
+        payload :: Element c
+          (bound at NativeScopedFamilyCrossedIndex.hs:6:13)
+        y :: c (bound at NativeScopedFamilyCrossedIndex.hs:6:11)
+        crossed :: foreach (x :: c)
+                   -> c
+                      -> Element c
+                      -> TaggedEntry (Element c) (compareOrigin @c $dCollects x)
+          (bound at NativeScopedFamilyCrossedIndex.hs:6:1)
+

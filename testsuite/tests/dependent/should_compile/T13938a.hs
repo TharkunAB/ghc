@@ -10,9 +10,11 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE Modifiers #-}
 module T13938a where
 
 import Data.Kind (Type)
+import GHC.Exts (M)
 
 data family Sing (a :: k)
 data instance Sing (z :: [a]) where
@@ -20,7 +22,7 @@ data instance Sing (z :: [a]) where
   SCons :: Sing x -> Sing xs -> Sing (x:xs)
 
 data TyFun :: Type -> Type -> Type
-type a ~> b = TyFun a b -> Type
+type a ~> b = TyFun a b %M -> Type
 infixr 0 ~>
 
 type family Apply (f :: k1 ~> k2) (x :: k1) :: k2

@@ -1,0 +1,8 @@
+NativeDataFamilyOperandWrongRefinement.hs:6:29: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: keepOther Refines
+      In an equation for ‘wrongRefinement’:
+          wrongRefinement = keepOther Refines
+

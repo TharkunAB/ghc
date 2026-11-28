@@ -1,0 +1,6 @@
+NativeClosedBatchClassEvidence.hs:9:25: error: [GHC-70565]
+    • Cannot evaluate ‘W.withEvidence’ in a type.
+        The function returns EvidenceBatch Natural. Closed calls in types currently support results of type Natural, Char, Bool, lists, boxed pairs, Maybe, and Either of supported results, or ordinary boxed datatypes with supported fields and imported constructors.
+    • In the first argument of ‘Proxy’, namely ‘(W.withEvidence 4)’
+      In the type signature: classEvidence :: Proxy (W.withEvidence 4)
+

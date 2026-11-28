@@ -1,0 +1,4 @@
+NativeStandaloneConstrainedBadClient.hs:4:8: error: [GHC-39999]
+    • No instance for ‘Allowed Int’ arising from a use of ‘ElemTop’
+    • In the type signature: bad :: ElemTop [Int] -> ()
+

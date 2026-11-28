@@ -1,0 +1,34 @@
+NativeTypeCaseBranchKind.hs:6:12: error: [GHC-83865]
+    • Expected a type, but ‘'False’ has kind ‘Bool’
+    • In the type case in ‘F’
+      In the type ‘case a of {'True -> Int; 'False -> 'False}’
+      In the type synonym declaration for ‘F’
+
+NativeTypeCaseBranchKind.hs:10:12: error: [GHC-83865]
+    • Expected a type, but ‘'False’ has kind ‘Bool’
+    • In the type case in ‘BadArrow’
+      In the type ‘() -> (case a of {'True -> Int; 'False -> 'False})’
+      In the type synonym declaration for ‘BadArrow’
+
+NativeTypeCaseBranchKind.hs:14:12: error: [GHC-83865]
+    • Expected a type, but ‘'False’ has kind ‘Bool’
+    • In the type case in ‘BadForall’
+      In the type ‘forall (b :: Bool).
+                   () -> (case b of {'True -> Int; 'False -> 'False})’
+      In the type synonym declaration for ‘BadForall’
+
+NativeTypeCaseBranchKind.hs:18:12: error: [GHC-83865]
+    • Expected a type, but ‘'False’ has kind ‘Bool’
+    • In the type case in ‘BadArrowDomain’
+      In the type ‘(case a of {'True -> Int; 'False -> 'False}) -> ()’
+      In the type synonym declaration for ‘BadArrowDomain’
+
+NativeTypeCaseBranchKind.hs:21:25: error: [GHC-83865]
+    • Couldn't match kind ‘Bool’ with ‘Ordering’
+      Expected kind ‘Maybe Ordering’,
+        but ‘'Just 'False’ has kind ‘Maybe Bool’
+    • In the type case in ‘BadAscription’
+      In the type ‘(case b of {'True -> 'Just 'False;
+                               'False -> 'Nothing}) :: Maybe Ordering’
+      In the type synonym declaration for ‘BadAscription’
+

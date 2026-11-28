@@ -1,0 +1,9 @@
+NativeSameModClosedBoom.hs:7:8: error: [GHC-70565]
+    • Cannot evaluate ‘explode’ in a type.
+        same-module boom
+        
+        HasCallStack backtrace:
+          error, called at NativeSameModClosedBoom.hs:6:13 in main:NativeSameModClosedBoom
+    • In the first argument of ‘(:~:)’, namely ‘explode 0’
+      In the type signature: bad :: explode 0 :~: 0
+

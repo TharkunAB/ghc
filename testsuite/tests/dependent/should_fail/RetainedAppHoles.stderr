@@ -1,0 +1,189 @@
+RetainedAppHoles.hs:33:34: error: [GHC-88464]
+    • Found hole: _ :: plus m (Succ k) :~: b0
+      Where: ‘b0’ is an ambiguous type variable
+    • In the first argument of ‘trans’, namely ‘_’
+      In the expression: trans _ _
+      In an equation for ‘plusCommStep1’:
+          plusCommStep1 m (Succ k) = trans _ _
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:33:15)
+        k :: Nat (bound at RetainedAppHoles.hs:33:23)
+        plusCommStep1 :: foreach (m :: Nat)
+                         -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:32:1)
+      Constraints include n ~ Succ k (from RetainedAppHoles.hs:33:1-36)
+      Valid hole fits include
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @(plus m (Succ k))
+
+RetainedAppHoles.hs:33:36: error: [GHC-88464]
+    • Found hole: _ :: b0 :~: Succ (plus k m)
+      Where: ‘b0’ is an ambiguous type variable
+    • In the second argument of ‘trans’, namely ‘_’
+      In the expression: trans _ _
+      In an equation for ‘plusCommStep1’:
+          plusCommStep1 m (Succ k) = trans _ _
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:33:15)
+        k :: Nat (bound at RetainedAppHoles.hs:33:23)
+        plusCommStep1 :: foreach (m :: Nat)
+                         -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:32:1)
+      Constraints include n ~ Succ k (from RetainedAppHoles.hs:33:1-36)
+      Valid hole fits include
+        invisId :: foreach (n :: Nat). plus n Zero :~: n
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @b0
+
+RetainedAppHoles.hs:38:59: error: [GHC-88464]
+    • Found hole: _ :: plus m1 k1 :~: plus k1 m1
+    • In the second argument of ‘cong’, namely ‘_’
+      In the second argument of ‘trans’, namely ‘(cong Succ _)’
+      In the expression: trans (plusSuc m k) (cong Succ _)
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:38:15)
+        k :: Nat (bound at RetainedAppHoles.hs:38:23)
+        plusCommStep2 :: foreach (m :: Nat)
+                         -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:37:1)
+      Constraints include n ~ Succ k1 (from RetainedAppHoles.hs:38:1-60)
+    Suggested fixes:
+      • Pattern-match on ‘k’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+      • Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                            ‘Succ’) to reduce ‘plus’.
+
+RetainedAppHoles.hs:43:35: error: [GHC-88464]
+    • Found hole: _ :: plus m2 (Succ k2) :~: Succ x0
+      Where: ‘x0’ is an ambiguous type variable
+    • In the first argument of ‘trans’, namely ‘_’
+      In the expression: trans _ (cong Succ _)
+      In an equation for ‘plusCommStep2b’:
+          plusCommStep2b m (Succ k) = trans _ (cong Succ _)
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:43:16)
+        k :: Nat (bound at RetainedAppHoles.hs:43:24)
+        plusCommStep2b :: foreach (m :: Nat)
+                          -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:42:1)
+      Constraints include n ~ Succ k2 (from RetainedAppHoles.hs:43:1-49)
+    Suggested fix:
+      Pattern-match on ‘m’ (constructors: ‘Zero’,
+                                          ‘Succ’) to reduce ‘plus’.
+
+RetainedAppHoles.hs:43:48: error: [GHC-88464]
+    • Found hole: _ :: x0 :~: plus k2 m2
+      Where: ‘x0’ is an ambiguous type variable
+    • In the second argument of ‘cong’, namely ‘_’
+      In the second argument of ‘trans’, namely ‘(cong Succ _)’
+      In the expression: trans _ (cong Succ _)
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:43:16)
+        k :: Nat (bound at RetainedAppHoles.hs:43:24)
+        plusCommStep2b :: foreach (m :: Nat)
+                          -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:42:1)
+      Constraints include n ~ Succ k2 (from RetainedAppHoles.hs:43:1-49)
+      Valid hole fits include
+        invisId :: foreach (n :: Nat). plus n Zero :~: n
+        Refl :: forall {k} (a :: k). a :~: a
+          with Refl @x0
+
+RetainedAppHoles.hs:48:64: error: [GHC-88464]
+    • Found hole: _ :: Nat
+    • In the first argument of ‘plusComm’, namely ‘_’
+      In the second argument of ‘cong’, namely ‘(plusComm _ _)’
+      In the second argument of ‘trans’, namely
+        ‘(cong Succ (plusComm _ _))’
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:48:10)
+        k :: Nat (bound at RetainedAppHoles.hs:48:18)
+        plusComm :: foreach (m :: Nat)
+                    -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:47:1)
+      Constraints include n ~ Succ k (from RetainedAppHoles.hs:48:1-68)
+      Valid hole fits include
+        Zero :: Nat
+        k :: Nat
+        m :: Nat
+
+RetainedAppHoles.hs:48:66: error: [GHC-88464]
+    • Found hole: _ :: Nat
+    • In the second argument of ‘plusComm’, namely ‘_’
+      In the second argument of ‘cong’, namely ‘(plusComm _ _)’
+      In the second argument of ‘trans’, namely
+        ‘(cong Succ (plusComm _ _))’
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:48:10)
+        k :: Nat (bound at RetainedAppHoles.hs:48:18)
+        plusComm :: foreach (m :: Nat)
+                    -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:47:1)
+      Constraints include n ~ Succ k (from RetainedAppHoles.hs:48:1-68)
+      Valid hole fits include
+        Zero :: Nat
+        k :: Nat
+        m :: Nat
+
+RetainedAppHoles.hs:52:38: error: [GHC-88464]
+    • Found hole: _first :: Nat
+      Or perhaps ‘_first’ is mis-spelled, or not in scope
+    • In the first argument of ‘plusCommOk’, namely ‘_first’
+      In the expression: plusCommOk _first (_ :: Nat)
+      In an equation for ‘namedAndSignedHoles’:
+          namedAndSignedHoles m n = plusCommOk _first (_ :: Nat)
+    • Relevant bindings include
+        n :: Nat (bound at RetainedAppHoles.hs:52:23)
+        m :: Nat (bound at RetainedAppHoles.hs:52:21)
+        namedAndSignedHoles :: foreach (m :: Nat)
+                               -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:52:1)
+      Valid hole fits include
+        Zero :: Nat
+        m :: Nat
+        n :: Nat
+
+RetainedAppHoles.hs:52:46: error: [GHC-88464]
+    • Found hole: _ :: Nat
+    • In the second argument of ‘plusCommOk’, namely ‘(_ :: Nat)’
+      In the expression: plusCommOk _first (_ :: Nat)
+      In an equation for ‘namedAndSignedHoles’:
+          namedAndSignedHoles m n = plusCommOk _first (_ :: Nat)
+    • Relevant bindings include
+        n :: Nat (bound at RetainedAppHoles.hs:52:23)
+        m :: Nat (bound at RetainedAppHoles.hs:52:21)
+        namedAndSignedHoles :: foreach (m :: Nat)
+                               -> foreach (n :: Nat) -> plus m n :~: plus n m
+          (bound at RetainedAppHoles.hs:52:1)
+      Valid hole fits include
+        Zero :: Nat
+        m :: Nat
+        n :: Nat
+
+RetainedAppHoles.hs:56:41: error: [GHC-88464]
+    • Found hole: _ :: Nat
+    • In the first argument of ‘Succ’, namely ‘_’
+      In the first argument of ‘plusIdentityR’, namely ‘(Succ _)’
+      In the expression: plusIdentityR (Succ _)
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:56:17)
+        conRetainedHole :: foreach (m :: Nat)
+                           -> plus (Succ m) Zero :~: Succ m
+          (bound at RetainedAppHoles.hs:56:1)
+      Valid hole fits include
+        Zero :: Nat
+        m :: Nat
+
+RetainedAppHoles.hs:63:28: error: [GHC-88464]
+    • Found hole: _ :: Nat
+    • In the first argument of ‘invisId’, namely ‘_’
+      In the expression: invisId @{_}
+      In an equation for ‘useInvisHole’: useInvisHole m = invisId @{_}
+    • Relevant bindings include
+        m :: Nat (bound at RetainedAppHoles.hs:63:14)
+        useInvisHole :: foreach (m :: Nat) -> plus m Zero :~: m
+          (bound at RetainedAppHoles.hs:63:1)
+      Valid hole fits include
+        Zero :: Nat
+        m :: Nat
+

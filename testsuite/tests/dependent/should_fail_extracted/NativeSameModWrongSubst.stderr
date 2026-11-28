@@ -1,0 +1,36 @@
+NativeSameModWrongSubst.hs:236:16: error: [GHC-25897]
+    • Could not deduce ‘x ~ b’
+      from the context: CExt g b ~ CExt g1 b1
+        bound by a pattern with constructor:
+                   S :: forall (g :: Ctx) (a :: Ty) (b :: Ty).
+                        Lookup g a -> Lookup (CExt g b) a,
+                 in an equation for ‘go’
+        at NativeSameModWrongSubst.hs:236:9-11
+      Expected: Term g x
+        Actual: Term g b
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          go :: forall (x :: Ty). Lookup (CExt g b) x -> Term g x
+        at NativeSameModWrongSubst.hs:231:5-41
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          substSingle :: forall (g :: Ctx) (b :: Ty) (a :: Ty).
+                         Term (CExt g b) a -> Term g b -> Term g a
+        at NativeSameModWrongSubst.hs:228:1-70
+    • In the expression: v
+      In an equation for ‘go’: go (S _) = v
+      In an equation for ‘substSingle’:
+          substSingle m v
+            = subst go m
+            where
+                go :: Lookup (CExt g b) x -> Term g x
+                go Z = v
+                go (S _) = v
+    • Relevant bindings include
+        go :: Lookup (CExt g b) x -> Term g x
+          (bound at NativeSameModWrongSubst.hs:232:5)
+        v :: Term g b (bound at NativeSameModWrongSubst.hs:229:15)
+        m :: Term (CExt g b) a (bound at NativeSameModWrongSubst.hs:229:13)
+        substSingle :: Term (CExt g b) a -> Term g b -> Term g a
+          (bound at NativeSameModWrongSubst.hs:229:1)
+

@@ -1,0 +1,5 @@
+NativeExistentialSourceMissingSchema.hs:7:7: error: [GHC-27432]
+    • GHC.Exists.Pack needs an explicit existential type when its result type is inferred.
+    • In the expression: Pack (type Bool) (Just True)
+      In an equation for ‘bad’: bad = Pack (type Bool) (Just True)
+

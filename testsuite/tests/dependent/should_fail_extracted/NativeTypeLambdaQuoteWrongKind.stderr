@@ -1,0 +1,13 @@
+NativeTypeLambdaQuoteWrongKind.hs:7:14: error: [GHC-83865]
+    • Expected a type, but ‘'True’ has kind ‘Bool’
+    • In the first argument of ‘Either’, namely ‘'True’
+      In the type lambda in an expression annotation
+      In the first argument of ‘Proxy’, namely
+        ‘((\a_a1to -> Either 'True a_a1to) Bool)’
+
+NativeTypeLambdaQuoteWrongKind.hs:10:42: error: [GHC-83865]
+    • Expected a type, but ‘'True’ has kind ‘Bool’
+    • In the first argument of ‘Either’, namely ‘'True’
+      In the type lambda in a visible type argument
+      In the type ‘((\cell -> Either 'True cell) Int)’
+

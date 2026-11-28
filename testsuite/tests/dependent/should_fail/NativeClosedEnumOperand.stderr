@@ -1,0 +1,6 @@
+NativeClosedEnumOperand.hs:7:31: error: [GHC-70565]
+    • Cannot evaluate ‘A.scoreAbstract’ in a type.
+        A selected constructor of A.Abstract is not in scope from a non-SOURCE import.
+    • In the first argument of ‘Proxy’, namely
+        ‘(A.scoreAbstract A.Hidden)’
+      In the type signature: bad :: Proxy (A.scoreAbstract A.Hidden)

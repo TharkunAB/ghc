@@ -1,0 +1,6 @@
+NativeClosedBatchUnsupportedField.hs:9:28: error: [GHC-70565]
+    • Cannot evaluate ‘W.badField’ in a type.
+        Cannot reify field 4 of ‘W.BadField’ at the hidden index. The field's constructors must determine that index.
+    • In the first argument of ‘Proxy’, namely ‘(W.badField 4)’
+      In the type signature: unsupportedField :: Proxy (W.badField 4)
+

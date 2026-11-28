@@ -1,0 +1,152 @@
+{-# LANGUAGE DataKinds, DependentTypes, ListTuplePuns, GADTs, ImpredicativeTypes, LinearTypes, PolyKinds, RankNTypes, RequiredTypeArguments, TypeApplications #-}
+module WitnessSchema
+    ( Hidden, callback, unpack, Multi, pair, kindBox, KindBox, Deep, producer
+    , CallbackPair, atTwoTypes, observePair, ignorePair
+    , ProjectionPair, projectionPair, projectionLazy
+    , Payload(..), RankedBuilder, buildAt, configured, withWitness, observeBuilder, ranked
+    , Flag(..), FlaggedBuilder, observeFlagged
+    , InputAt, RankedInput, observeRankedInput
+    , PolyId, PolyMaybe, GuardedBuilder, consumeAt, observeGuarded, never, different
+    , TwoCallbacks, TwoWitnessBuilder, fromLeft, fromRight, observeTwo
+    , ConfinedTwoWitnessBuilder, conflictingLeft, fromCaptured
+    , CapturedMono(..), CapturedMonoBuilder
+    , Captured(..), CapturedBuilder, LinearBuilder, buildLinear, buildTwice
+    ) where
+import Data.Kind (Type)
+import Data.Proxy
+
+type PolyId = forall a. a -> a
+type PolyMaybe = forall a. a -> Maybe a
+
+type InputAt t = forall r. (t -> r) -> Maybe r
+type RankedInput = exists (t :: Type). InputAt t -> Int
+
+observeRankedInput :: RankedInput -> Int
+observeRankedInput f = f (\_ -> Nothing)
+data Payload t = Payload t (t -> (Int,Bool))
+type Hidden = exists (t :: Type). Payload t
+callback :: Payload PolyId
+callback = Payload @PolyId id (\f -> (f 7, f True))
+unpack :: Hidden -> (Int, Bool)
+unpack p = case p of Payload x observe -> observe x
+
+data Pair x y = Pair x y
+type Multi = exists (x :: Type). exists (y :: Type). Pair x y
+pair :: Pair PolyId PolyMaybe
+pair = Pair @PolyId @PolyMaybe id Just
+
+type KindBox = exists (k :: Type). exists (t :: k). Proxy t
+kindBox :: Proxy PolyId
+kindBox = Proxy
+
+type Deep = exists (t :: Type). (t -> Bool) -> t
+
+producer :: ((forall x. x) -> Bool) -> Int
+producer _ = 7
+
+type CallbackPair = exists (t :: Type). (t, t -> (Int, Bool))
+atTwoTypes :: PolyId -> (Int, Bool)
+atTwoTypes f = (f 7, f True)
+
+observePair :: CallbackPair -> (Int, Bool)
+observePair (f, k) = k f
+
+ignorePair :: CallbackPair -> Int
+ignorePair (_, _) = 9
+
+type ProjectionPair = exists (t :: Type). (t, t -> Int)
+
+projectionPair :: Bool -> ProjectionPair
+projectionPair True = (7 :: Int, (+ 1) :: Int -> Int)
+projectionPair False = (True, \b -> if b then 11 else 12)
+
+projectionLazy :: ProjectionPair
+projectionLazy = (error "forced the element" :: Bool, const 13 :: Bool -> Int)
+
+type RankedBuilderAt a = exists (t :: Type). a -> Payload t
+type RankedBuilder = RankedBuilderAt Bool
+
+buildAt :: Bool -> Payload PolyId
+buildAt b = Payload @PolyId id (\f -> (f (if b then 7 else 9), f b))
+
+configured :: forall {k} (flag :: k) tag. Proxy flag -> (tag -> Bool) -> tag -> Payload PolyId
+configured _ test tag = buildAt (test tag)
+
+withWitness :: forall tag. forall t -> Proxy tag -> t -> (t -> (Int, Bool)) -> Payload t
+withWitness (type t) _ value run = Payload @t value run
+
+observeBuilder :: RankedBuilder -> Bool -> (Int, Bool)
+observeBuilder builder b = case builder b of
+    Payload value run -> run value
+
+type GuardedBuilder = exists (t :: Type). Bool -> Bool -> Payload t
+
+consumeAt :: forall {k} (tag :: k). Proxy tag -> PolyId -> Bool -> Payload PolyId
+consumeAt _ value b = Payload @PolyId value (\f -> (f 11, f b))
+
+observeGuarded :: GuardedBuilder -> Bool -> Bool -> (Int, Bool)
+observeGuarded builder flag b = observePayload (builder flag b)
+
+never :: Bool
+never = False
+{-# NOINLINE never #-}
+
+different :: Bool -> Payload PolyMaybe
+different b = Payload @PolyMaybe Just (\f -> (maybe 0 id (f 13), maybe False id (f b)))
+
+data TwoCallbacks l r = FromLeft (Payload l) | FromRight (Payload r)
+
+type TwoWitnessBuilder = exists l. exists r. Bool -> Bool -> TwoCallbacks l r
+type ConfinedTwoWitnessBuilder = exists l. exists r. Captured -> Bool -> TwoCallbacks l r
+
+fromLeft :: forall r. Bool -> TwoCallbacks PolyId r
+fromLeft _ = FromLeft callback
+
+fromRight :: forall l. Bool -> TwoCallbacks l PolyMaybe
+fromRight b = FromRight (different b)
+
+conflictingLeft :: forall r. Bool -> TwoCallbacks PolyMaybe r
+conflictingLeft b = FromLeft (different b)
+
+fromCaptured :: forall a r. Payload (forall x. x -> a) -> TwoCallbacks (forall x. x -> a) r
+fromCaptured = FromLeft
+
+observeTwo :: TwoWitnessBuilder -> Bool -> Bool -> (Int, Bool)
+observeTwo builder choose b = case builder choose b of
+    FromLeft payload -> observePayload payload
+    FromRight payload -> observePayload payload
+
+data CapturedMono where
+    CapturedMono :: Payload t -> CapturedMono
+
+type CapturedMonoBuilder = exists (t :: Type). CapturedMono -> Bool -> Payload t
+
+data Flag a where
+    Flag :: Flag Bool
+
+type FlaggedBuilder a = exists (t :: Type). Flag a -> a -> Payload t
+
+observeFlagged :: FlaggedBuilder Bool -> Bool -> (Int, Bool)
+observeFlagged builder b = observePayload (builder Flag b)
+
+observePayload :: Payload t -> (Int, Bool)
+observePayload (Payload value run) = run value
+
+ranked :: forall a. (Eq a, Bounded a) => RankedBuilderAt a
+ranked = \a -> buildAt (a == maxBound)
+
+data Captured where
+    Captured :: Payload (forall r. r -> x) -> Captured
+
+type CapturedBuilder = exists (t :: Type). Captured -> Payload t
+type LinearBuilder = exists (t :: Type). Bool %1 -> Payload t
+
+buildLinear :: Bool %1 -> Payload PolyId
+buildLinear b = case b of
+    True  -> buildAt True
+    False -> buildAt False
+
+buildTwice :: Bool %1 -> Bool %1 -> Payload PolyId
+buildTwice left right = case left of
+    True  -> buildLinear right
+    False -> buildLinear right

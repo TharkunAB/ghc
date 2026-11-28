@@ -1,0 +1,7 @@
+NativeAssociatedSumDefaultScope.hs:9:54: error: [GHC-76037]
+    Not in scope: type variable ‘a’
+
+NativeAssociatedSumDefaultScope.hs:15:3: error: [GHC-53634]
+    Out of scope type variable ‘b’ in the RHS of a family instance.
+      All such variables must be bound on the LHS.
+

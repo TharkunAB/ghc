@@ -1,0 +1,5 @@
+NativeExtendedLetMutualRecSyn.hs:4:13: error: [GHC-97522]
+    Cycle in type synonym declarations:
+      NativeExtendedLetMutualRecSyn.hs:4:13-22: type A = B
+      NativeExtendedLetMutualRecSyn.hs:4:25-34: type B = A
+

@@ -1,0 +1,14 @@
+NativeGadtImplicitSourceWrongFail.hs:8:10: error: [GHC-83865]
+    • Couldn't match type ‘Dep.Tip’ with ‘Dep.Fork Dep.Tip’
+      Expected: Dep.Edge Dep.Tip (Dep.Fork Dep.Tip)
+        Actual: Dep.Edge Dep.Tip (Dep.worker Dep.Tip)
+    • In the expression: Dep.Step
+      In an equation for ‘badDep’: badDep = Dep.Step
+
+NativeGadtImplicitSourceWrongFail.hs:11:12: error: [GHC-83865]
+    • Couldn't match type ‘NoReq.Tip’ with ‘NoReq.Fork NoReq.Tip’
+      Expected: NoReq.Edge NoReq.Tip (NoReq.Fork NoReq.Tip)
+        Actual: NoReq.Edge NoReq.Tip (NoReq.worker NoReq.Tip)
+    • In the expression: NoReq.Step
+      In an equation for ‘badNoReq’: badNoReq = NoReq.Step
+

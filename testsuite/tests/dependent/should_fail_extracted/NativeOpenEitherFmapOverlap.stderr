@@ -1,0 +1,12 @@
+NativeOpenEitherFmapOverlap.hs:16:35: error: [GHC-70565]
+    • Cannot evaluate ‘translate’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the first argument of ‘(:~:)’, namely
+        ‘translate f ('Succeeded x :: Result e a)’
+      In the type signature:
+        fmapRight :: forall e a b (f :: a %U -> b) (x :: a). Proxy f
+                                                             -> Proxy x
+                                                                -> translate f ('Succeeded x :: Result e a)
+                                                                   :~:
+                                                                   ('Succeeded (f x) :: Result e b)
+

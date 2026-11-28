@@ -1,0 +1,14 @@
+NativeIndexedClassReceiverUnderdetermined.hs:8:13: error: [GHC-39999]
+    • Ambiguous type variable ‘f0’ arising from a use of ‘print’
+      prevents the constraint ‘(Show (f0 Bool))’ from being solved.
+      Probable fix: use a type annotation to specify what ‘f0’ should be.
+      Potentially matching instances:
+        instance Show Integer -- Defined in ‘GHC.Internal.Show’
+        instance Show a => Show (Maybe a) -- Defined in ‘GHC.Internal.Show’
+        ...plus 25 others
+        ...plus 13 instances involving out-of-scope types
+        (use -fprint-potential-instances to see them all)
+    • In the expression: print (getCells (mapIndexed @U id (Batch [])))
+      In an equation for ‘ambiguous’:
+          ambiguous = print (getCells (mapIndexed @U id (Batch [])))
+

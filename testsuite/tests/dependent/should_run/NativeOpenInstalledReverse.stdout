@@ -1,0 +1,4 @@
+(Refl,Succ (Succ Zero))
+Just True
+[3,2,1]
+reverse demanded the left tail before its first cons

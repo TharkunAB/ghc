@@ -1,0 +1,83 @@
+NativeOpenConstructorHelpersFail.hs:14:19: error: [GHC-25897]
+    • Couldn't match type ‘a’ with ‘SpineWorker.headOr xs a’
+      Expected: Second (W.More a xs) :~: Just a
+        Actual: Just a :~: Just a
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          unknownTail :: forall (a :: Bool) (xs :: W.Spine Bool).
+                         Proxy a -> Proxy xs -> Second (W.More a xs) :~: Just a
+        at NativeOpenConstructorHelpersFail.hs:(12,1)-(13,71)
+    • In the expression: Refl
+      In an equation for ‘unknownTail’: unknownTail _ _ = Refl
+    • Relevant bindings include
+        unknownTail :: Proxy a
+                       -> Proxy xs -> Second (W.More a xs) :~: Just a
+          (bound at NativeOpenConstructorHelpersFail.hs:14:1)
+
+NativeOpenConstructorHelpersFail.hs:18:18: error: [GHC-83865]
+    • Couldn't match type: W.erase xs
+                     with: W.Empty
+      Expected: Erase (W.More x xs) :~: W.More True W.Empty
+        Actual: W.More True W.Empty :~: W.More True W.Empty
+    • In the expression: Refl
+      In an equation for ‘erasedTail’: erasedTail _ _ = Refl
+    • Relevant bindings include
+        erasedTail :: Proxy x
+                      -> Proxy xs -> Erase (W.More x xs) :~: W.More True W.Empty
+          (bound at NativeOpenConstructorHelpersFail.hs:18:1)
+
+NativeOpenConstructorHelpersFail.hs:26:14: error: [GHC-83865]
+    • Couldn't match type: S.There x
+                     with: S.Here
+      Expected: S.Bind (S.Use (S.There x)) :~: S.Bind (S.Use S.Here)
+        Actual: S.Bind (S.Use (S.There x)) :~: S.Bind (S.Use (S.There x))
+    • In the expression: Refl
+      In an equation for ‘wrongSubst’: wrongSubst = Refl
+    • Relevant bindings include
+        wrongSubst :: S.Bind (S.Use (S.There x)) :~: S.Bind (S.Use S.Here)
+          (bound at NativeOpenConstructorHelpersFail.hs:26:1)
+
+NativeOpenConstructorHelpersFail.hs:32:20: error: [GHC-25897]
+    • Couldn't match type ‘x’ with ‘y’
+      Expected: S.Pack Refl x :~: S.Pack Refl y
+        Actual: S.Pack Refl x :~: S.Pack Refl x
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          wrongExistential :: forall (x :: Term (Extend Empty 'Num) 'Num)
+                                     (y :: Term (Extend Empty 'Num) 'Num).
+                              S.Pack Refl x :~: S.Pack Refl y
+        at NativeOpenConstructorHelpersFail.hs:(28,1)-(31,39)
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          wrongExistential :: forall (x :: Term (Extend Empty 'Num) 'Num)
+                                     (y :: Term (Extend Empty 'Num) 'Num).
+                              S.Pack Refl x :~: S.Pack Refl y
+        at NativeOpenConstructorHelpersFail.hs:(28,1)-(31,39)
+    • In the expression: Refl
+      In an equation for ‘wrongExistential’: wrongExistential = Refl
+    • Relevant bindings include
+        wrongExistential :: S.Pack Refl x :~: S.Pack Refl y
+          (bound at NativeOpenConstructorHelpersFail.hs:32:1)
+
+NativeOpenConstructorHelpersFail.hs:37:14: error: [GHC-25897]
+    • Couldn't match type ‘x’ with ‘y’
+      Expected: x :~: y
+        Actual: x :~: x
+      ‘x’ is a rigid type variable bound by
+        the type signature for:
+          wrongUnary :: forall (x :: Term (Extend Empty 'Num) 'Num)
+                               (y :: Term (Extend Empty 'Num) 'Num).
+                        x :~: y
+        at NativeOpenConstructorHelpersFail.hs:(34,1)-(36,88)
+      ‘y’ is a rigid type variable bound by
+        the type signature for:
+          wrongUnary :: forall (x :: Term (Extend Empty 'Num) 'Num)
+                               (y :: Term (Extend Empty 'Num) 'Num).
+                        x :~: y
+        at NativeOpenConstructorHelpersFail.hs:(34,1)-(36,88)
+    • In the expression: Refl
+      In an equation for ‘wrongUnary’: wrongUnary = Refl
+    • Relevant bindings include
+        wrongUnary :: x :~: y
+          (bound at NativeOpenConstructorHelpersFail.hs:37:1)
+

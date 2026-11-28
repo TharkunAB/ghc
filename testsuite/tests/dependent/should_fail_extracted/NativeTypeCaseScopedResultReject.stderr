@@ -1,0 +1,90 @@
+NativeTypeCaseScopedResultReject.hs:8:30: error: [GHC-83865]
+    • Couldn't match type: case d5 of {NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     False;
+                                       NativeTypeCaseScopedResultDomain.Both
+                                         l r -> GHC.Internal.Data.Proxy.Proxy l}
+                     with: case d5 of {NativeTypeCaseScopedResultDomain.Both
+                                         first second -> GHC.Internal.Data.Proxy.Proxy second;
+                                       NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     False}
+      Expected: the type case in the signature for ‘otherField’
+        Actual: the type case in the signature for ‘field’
+    • In the second argument of ‘C.otherField’, namely ‘(P.field d)’
+      In the expression: C.otherField d (P.field d)
+      In an equation for ‘badField’:
+          badField d = C.otherField d (P.field d)
+
+NativeTypeCaseScopedResultReject.hs:11:42: error: [GHC-83865]
+    • Couldn't match type: case d4 of {NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     a3;
+                                       NativeTypeCaseScopedResultDomain.Both
+                                         l r -> GHC.Internal.Data.Proxy.Proxy b1}
+                     with: case d4 of {NativeTypeCaseScopedResultDomain.Both
+                                         l r -> GHC.Internal.Data.Proxy.Proxy a3;
+                                       NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     b1}
+      Expected: the type case in the signature for ‘otherCapture’
+        Actual: the type case in the signature for ‘capture’
+    • In the fourth argument of ‘C.otherCapture’, namely
+        ‘(P.capture a b d)’
+      In the expression: C.otherCapture a b d (P.capture a b d)
+      In an equation for ‘badCapture’:
+          badCapture a b d = C.otherCapture a b d (P.capture a b d)
+
+NativeTypeCaseScopedResultReject.hs:14:44: error: [GHC-83865]
+    • Couldn't match type: case d3 of {NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     b;
+                                       NativeTypeCaseScopedResultDomain.Both
+                                         l r -> GHC.Internal.Data.Proxy.Proxy a2}
+                     with: case d3 of {NativeTypeCaseScopedResultDomain.Both
+                                         l r -> GHC.Internal.Data.Proxy.Proxy b;
+                                       NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     a2}
+      Expected: the type case in the signature for ‘sameCapture’
+        Actual: the type case in the signature for ‘capture’
+    • In the fourth argument of ‘C.sameCapture’, namely
+        ‘(P.capture b a d)’
+      In the expression: C.sameCapture a b d (P.capture b a d)
+      In an equation for ‘badCaptureArg’:
+          badCaptureArg a b d = C.sameCapture a b d (P.capture b a d)
+
+NativeTypeCaseScopedResultReject.hs:17:31: error: [GHC-83865]
+    • Couldn't match type: case e1 of {NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     False;
+                                       NativeTypeCaseScopedResultDomain.Both
+                                         l r -> GHC.Internal.Data.Proxy.Proxy l}
+                     with: case d2 of {NativeTypeCaseScopedResultDomain.Both
+                                         first second -> GHC.Internal.Data.Proxy.Proxy first;
+                                       NativeTypeCaseScopedResultDomain.Neither -> GHC.Internal.Data.Proxy.Proxy
+                                                                                     False}
+      Expected: the type case in the signature for ‘sameField’
+        Actual: the type case in the signature for ‘field’
+    • In the second argument of ‘C.sameField’, namely ‘(P.field e)’
+      In the expression: C.sameField d (P.field e)
+      In an equation for ‘badIndex’:
+          badIndex d e = C.sameField d (P.field e)
+
+NativeTypeCaseScopedResultReject.hs:20:38: error: [GHC-83865]
+    • Couldn't match type: the type case in the signature for ‘nested’
+                     with: the type case in the signature for ‘nested’
+      Expected: Maybe (the type case in the signature for ‘nested’)
+        Actual: Maybe (the type case in the signature for ‘nested’)
+      Note: ‘NativeTypeCaseScopedResultConsume.$case:$signature-case:nested:0:0’ is defined at
+              NativeTypeCaseScopedResultConsume.hs:26:12-92
+            ‘NativeTypeCaseScopedResultProvide.$case:$signature-case:nested:0:0’ is defined at
+              NativeTypeCaseScopedResultProvide.hs:18:12-92.
+    • In the third argument of ‘C.nested’, namely ‘(P.nested a e)’
+      In the expression: C.nested a d (P.nested a e)
+      In an equation for ‘badNestedIndex’:
+          badNestedIndex a d e = C.nested a d (P.nested a e)
+
+NativeTypeCaseScopedResultReject.hs:23:42: error: [GHC-83865]
+    • Couldn't match type: the type case in the signature for ‘nested’
+                     with: the type case in the signature for ‘nestedOther’
+      Expected: Maybe (the type case in the signature for ‘nestedOther’)
+        Actual: Maybe (the type case in the signature for ‘nested’)
+    • In the third argument of ‘C.nestedOther’, namely ‘(P.nested a d)’
+      In the expression: C.nestedOther a d (P.nested a d)
+      In an equation for ‘badNestedResult’:
+          badNestedResult a d = C.nestedOther a d (P.nested a d)
+

@@ -1,0 +1,11 @@
+NativeRetainedFamDomCallbackEscape.hs:5:11: error: [GHC-39999]
+    • No instance for ‘Collects a’ arising from a use of ‘Elem’
+      Possible fix:
+        add (Collects a) to the context of
+          the type signature for:
+            escape :: forall {k} (a :: k).
+                      (Collects a => Proxy (Elem a)) -> Proxy (Elem a)
+    • In the type signature:
+        escape :: forall a. (Collects a => Proxy (Elem a))
+                            -> Proxy (Elem a)
+

@@ -1,0 +1,8 @@
+NativeTypeLambdaMatchableBad.hs:5:14: error: [GHC-83865]
+    • Couldn't match kind ‘GHC.Internal.Types.Unmatchable’
+                     with ‘GHC.Internal.Types.Matchable’
+      Expected kind ‘M’,
+        but ‘\x -> x’ has kind ‘GHC.Internal.Types.Unmatchable’
+    • In the type ‘((\x -> x) :: Type %M -> Type)’
+      In the type synonym declaration for ‘Bad’
+

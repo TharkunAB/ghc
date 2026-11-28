@@ -1,0 +1,78 @@
+NativeOpenInstalledDropWhileFail.hs:16:34: error: [GHC-05617]
+    • Could not deduce ‘(fst
+                           (GHC.Internal.List.#guard:span (p x) p x xs2)
+                         ++ snd (GHC.Internal.List.#guard:span (p x) p x xs2))
+                        ~ (x : xs2)’
+      from the context: xs ~ (x : xs2)
+        bound by a pattern with constructor:
+                   Decide :: forall {a} (p :: a %GHC.Internal.Types.U -> Bool)
+                                    (x :: a) (xs :: [a]).
+                             BooleanResult (p x)
+                             -> FilterDecisions p xs -> FilterDecisions p (x : xs),
+                 in an equation for ‘wrongSpanDecision’
+        at NativeOpenInstalledDropWhileFail.hs:16:20-29
+      Expected: Rejoined (Span p xs) :~: xs
+        Actual: xs :~: xs
+    • In the expression: Refl
+      In an equation for ‘wrongSpanDecision’:
+          wrongSpanDecision (Decide _ _) = Refl
+    • Relevant bindings include
+        wrongSpanDecision :: FilterDecisions p xs
+                             -> Rejoined (Span p xs) :~: xs
+          (bound at NativeOpenInstalledDropWhileFail.hs:15:1)
+
+NativeOpenInstalledDropWhileFail.hs:20:34: error: [GHC-05617]
+    • Could not deduce ‘(GHC.Internal.List.#guard:takeWhile
+                           (p x) p x xs2
+                         ++ GHC.Internal.List.#guard:dropWhile (p x) p x xs2)
+                        ~ (x : xs2)’
+      from the context: xs ~ (x : xs2)
+        bound by a pattern with constructor:
+                   Decide :: forall {a} (p :: a %GHC.Internal.Types.U -> Bool)
+                                    (x :: a) (xs :: [a]).
+                             BooleanResult (p x)
+                             -> FilterDecisions p xs -> FilterDecisions p (x : xs),
+                 in an equation for ‘wrongDropDecision’
+        at NativeOpenInstalledDropWhileFail.hs:20:20-29
+      Expected: Appended (Prefix p xs) (Suffix p xs) :~: xs
+        Actual: xs :~: xs
+    • In the expression: Refl
+      In an equation for ‘wrongDropDecision’:
+          wrongDropDecision (Decide _ _) = Refl
+    • Relevant bindings include
+        wrongDropDecision :: FilterDecisions p xs
+                             -> Appended (Prefix p xs) (Suffix p xs) :~: xs
+          (bound at NativeOpenInstalledDropWhileFail.hs:19:1)
+
+NativeOpenInstalledDropWhileFail.hs:25:20: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.List.#guard:takeWhile
+                          (gate && x1) ((&&) gate) x1 xs1
+                        ~ '[]’
+      from the context: (gate && False) ~ False
+        bound by a pattern with constructor:
+                   IsFalse :: BooleanResult False,
+                 in a case alternative
+        at NativeOpenInstalledDropWhileFail.hs:25:3-9
+      Expected: Prefix ((&&) gate) (x1 : xs1) :~: '[]
+        Actual: takeWhile ((&&) gate) (x1 : xs1)
+                :~: takeWhile ((&&) gate) (x1 : xs1)
+    • In the first argument of ‘Stops’, namely ‘Refl’
+      In the expression: Stops Refl
+      In a case alternative: IsFalse -> Stops Refl
+
+NativeOpenInstalledDropWhileFail.hs:26:19: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.List.#guard:takeWhile
+                          (gate && x1) ((&&) gate) x1 xs1
+                        ~ (x1 : takeWhile ((&&) gate) xs1)’
+      from the context: (gate && False) ~ True
+        bound by a pattern with constructor: IsTrue :: BooleanResult True,
+                 in a case alternative
+        at NativeOpenInstalledDropWhileFail.hs:26:3-8
+      Expected: Prefix ((&&) gate) (x1 : xs1)
+                :~: (x1 : Prefix ((&&) gate) xs1)
+        Actual: takeWhile ((&&) gate) (x1 : xs1)
+                :~: takeWhile ((&&) gate) (x1 : xs1)
+    • In the first argument of ‘Keeps’, namely ‘Refl’
+      In the expression: Keeps Refl
+      In a case alternative: IsTrue -> Keeps Refl
+

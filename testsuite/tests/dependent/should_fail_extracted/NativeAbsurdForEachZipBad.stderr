@@ -1,0 +1,4 @@
+NativeAbsurdForEachZipBad.hs:10:1: error: [GHC-83605]
+    Missing equation for the retained constructor pair (Succ, Succ).
+    Add an equation for this pair or a final equation that covers it.
+

@@ -1,0 +1,10 @@
+NativeTypeCaseFallbackRigid.hs:9:13: error: [GHC-83865]
+    • Couldn't match type ‘the type case in ‘Force’’ with ‘Int’
+      Expected: Force b :~: Int
+        Actual: Int :~: Int
+    • In the expression: Refl
+      In an equation for ‘unknown’: unknown _ = Refl
+    • Relevant bindings include
+        unknown :: Proxy b -> Force b :~: Int
+          (bound at NativeTypeCaseFallbackRigid.hs:9:1)
+

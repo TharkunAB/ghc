@@ -1,0 +1,6 @@
+NativeSourceProductRecursion.hs:11:22: error: [GHC-70566]
+    • Cannot reduce the open call to ‘badProduct’ in a type.
+        Reduction exceeded the open evaluation step limit (-freduction-depth).
+    • In the type ‘badProduct ('S 'Z) ('S 'Z)’
+      In the type synonym declaration for ‘Nondecreasing’
+

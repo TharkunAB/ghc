@@ -854,6 +854,12 @@ test ('MultilineStringsPerf',
       compile,
       ['-O'])
 
+test('QuickLookOrdinaryChain',
+     [ collect_compiler_stats('bytes allocated', 5),
+       pre_cmd('$PYTHON genQuickLookOrdinaryChain.py > QuickLookOrdinaryChain.hs'),
+       extra_files(['genQuickLookOrdinaryChain.py']) ],
+     compile, ['-fno-code'])
+
 test ('T24984',
       [ collect_compiler_stats('bytes allocated',5) ],
       compile,
@@ -889,4 +895,60 @@ test ('T26989',
       ],
       multimod_compile,
       ['T26989', '-v0 -O'])
+
+# Dependent Haskell compile-time performance suite
+
+test('DepFibClosedEval',
+     [ req_interp, req_rts_linker, only_ways(['normal'])
+     , extra_files(['DepFibClosedEvalProvider.hs'])
+     , collect_compiler_stats('bytes allocated', 3)
+     , collect_compiler_stats('peak_megabytes_allocated', 15) ],
+     multimod_compile,
+     ['DepFibClosedEval', '-v0 -O0 ' + config.ghc_th_way_flags])
+
+test('DepFibOpenProof',
+     [ only_ways(['normal'])
+     , collect_compiler_residency(15)
+     , collect_compiler_stats('bytes allocated', 2) ],
+     compile,
+     ['-v0 -O'])
+
+test('DepVecInduction',
+     [ only_ways(['normal'])
+     , collect_compiler_residency(15)
+     , collect_compiler_stats('bytes allocated', 3) ],
+     compile,
+     ['-v0 -fno-code'])
+
+test('DepClosureSubst',
+     [ only_ways(['normal'])
+     , extra_files(['DepClosureSubstProvider.hs'])
+     , collect_compiler_residency(15)
+     , collect_compiler_stats('bytes allocated', 3) ],
+     multimod_compile,
+     ['DepClosureSubst', '-v0 -O2'])
+
+test('DepPatternMatrix',
+     [ only_ways(['normal'])
+     , ignore_stderr
+     , collect_compiler_residency(15)
+     , collect_compiler_stats('bytes allocated', 3) ],
+     compile,
+     ['-v0 -O -Werror=incomplete-patterns -freport-totality'])
+
+test('NoDepBaseline',
+     [ only_ways(['normal'])
+     , collect_compiler_residency(10)
+     , collect_compiler_stats('bytes allocated', 1) ],
+     compile,
+     ['-v0 -O0'])
+
+test('NoDepBaseline_O2',
+     [ only_ways(['optasm'])
+     , extra_files(['NoDepBaseline.hs'])
+     , collect_compiler_residency(10)
+     , collect_compiler_stats('bytes allocated', 1) ],
+     multimod_compile,
+     ['NoDepBaseline', '-v0 -O2'])
+
 

@@ -1,0 +1,8 @@
+NativeRetainedSiblingStrictSize.hs:10:56: error: [GHC-70566]
+    • Cannot reduce the open call to ‘forceLetters’ in a type.
+        Reduction stopped at a case on the rigid argument p. A checked equation can retain this case until the argument's constructor is known.
+    • In the second argument of ‘Vec’, namely ‘(forceLetters p)’
+      In the type signature:
+        strictSizeProof :: foreach (p :: Columns) ->
+                           Vec Char (forceLetters p)
+

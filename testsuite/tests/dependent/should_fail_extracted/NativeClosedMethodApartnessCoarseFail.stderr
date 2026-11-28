@@ -1,0 +1,20 @@
+NativeClosedMethodApartnessCoarseFail.hs:12:13: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessCoarseFail.hs:15:18: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessCoarseFail.hs:18:21: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessCoarseFail.hs:21:15: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+
+NativeClosedMethodApartnessCoarseFail.hs:24:12: error: [GHC-83605]
+    GHC cannot use the checked equation for ‘fmap’ with the current rewrite rules.
+    Use -fno-enable-rewrite-rules in the module that needs this equation.
+

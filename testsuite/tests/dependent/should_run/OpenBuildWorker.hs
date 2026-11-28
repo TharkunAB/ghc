@@ -1,0 +1,46 @@
+{-# LANGUAGE NoDependentTypes #-}
+{-# OPTIONS_GHC -fno-unoptimized-core-for-interpreter -fno-omit-interface-pragmas #-}
+
+module OpenBuildWorker (Shell (..), Nested (..), build, buildWithUncurry, wrap, echo, buildPair, partialPair, swapPair) where
+
+import Numeric.Natural (Natural)
+
+-- | A two-field datatype with two constructors.
+data Shell a b = Shell a b | OtherShell a b
+
+-- | A wrapper around a constructed value.
+data Nested a b = Nested (Shell a b)
+
+-- | Keep the input order in the result.
+{-# INLINE build #-}
+build :: a -> b -> Shell a b
+build x y = Shell x y
+
+-- | Pass the constructor to the ordinary pair eliminator.
+{-# INLINE buildWithUncurry #-}
+buildWithUncurry :: a -> b -> Shell a b
+buildWithUncurry x y = uncurry Shell (x, y)
+
+-- | Construct an inner value and wrap it.
+{-# INLINE wrap #-}
+wrap :: a -> b -> Nested a b
+wrap x y = Nested (Shell x y)
+
+-- | Return a value without inspecting its constructor.
+{-# INLINE echo #-}
+echo :: Shell a b -> Shell a b
+echo x = x
+
+-- | Build an ordinary boxed pair.
+{-# INLINE buildPair #-}
+buildPair :: a -> b -> (a, b)
+buildPair x y = (x, y)
+
+-- | Return a number without evaluating the second field.
+partialPair :: Natural -> (Natural, Char)
+partialPair n = (n, errorWithoutStackTrace "unused second pair field")
+
+-- | Read a pair and return its fields in reverse order.
+{-# INLINE swapPair #-}
+swapPair :: (a, b) -> (b, a)
+swapPair (x, y) = (y, x)

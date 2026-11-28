@@ -1,0 +1,18 @@
+NativeCheckedClosureWithheldFail.hs:8:34: error: [GHC-70565]
+    • Cannot evaluate ‘P.substSingle’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.substSingle ('P.At 'P.New :: P.Expr ('P.Push 'P.Empty 'P.Nat) 'P.Nat) 'P.Lit’
+      In the type signature:
+        badHiddenHelper :: P.substSingle ('P.At 'P.New :: P.Expr ('P.Push 'P.Empty 'P.Nat) 'P.Nat) 'P.Lit
+                           :~: 'P.Lit
+
+NativeCheckedClosureWithheldFail.hs:11:85: error: [GHC-70565]
+    • Cannot evaluate ‘P.lookupHidden’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the first argument of ‘(:~:)’, namely ‘P.lookupHidden e i’
+      In the type signature:
+        badHiddenEnv :: forall (g :: P.Scope)
+                               (e :: P.Env g)
+                               (i :: P.Fin g). P.lookupHidden e i :~: 'True
+

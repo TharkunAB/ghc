@@ -1,0 +1,36 @@
+NativeTypeCaseFamilyRecursion.hs:6:3: error: [GHC-22979]
+    • The type-family application ‘Same (S (S _))’
+        is no smaller than the LHS of the family instance ‘Same (S (S _))’
+    • In the equations for closed type family ‘Same’
+      In the type family declaration for ‘Same’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+
+NativeTypeCaseFamilyRecursion.hs:11:3: error: [GHC-22979]
+    • The type-family application ‘Growing (S (S (S prior)))’
+        is no smaller than
+        the LHS of the family instance ‘Growing (S (S prior))’
+    • In the equations for closed type family ‘Growing’
+      In the type family declaration for ‘Growing’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+
+NativeTypeCaseFamilyRecursion.hs:13:5: error: [GHC-22979]
+    • The type-family application ‘Growing (S (S (S prior)))’
+        is no smaller than
+        the LHS of the family instance ‘NativeTypeCaseFamilyRecursion.$case:Growing:0
+                                          n (S prior)’
+    • In a branch of the type case in ‘Growing’
+      In the type case in ‘Growing’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+
+NativeTypeCaseFamilyRecursion.hs:20:3: error: [GHC-22979]
+    • Illegal nested use of type family ‘ReadFlag’
+        in the arguments of the type-family application ‘NativeTypeCaseFamilyRecursion.$case:UserNested:0
+                                                           flag (ReadFlag flag)’
+    • In the equations for closed type family ‘UserNested’
+      In the type family declaration for ‘UserNested’
+    Suggested fix:
+      Perhaps you intended to use the ‘UndecidableInstances’ extension
+

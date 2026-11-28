@@ -1,0 +1,6 @@
+NativeClosedBatchBadWitness.hs:10:22: error: [GHC-70565]
+    • Cannot evaluate ‘W.buildWrong’ in a type.
+        The value returned by the interpreter does not match the checked result type.
+    • In the first argument of ‘Proxy’, namely ‘(W.buildWrong 4)’
+      In the type signature: badWitness :: Proxy (W.buildWrong 4)
+

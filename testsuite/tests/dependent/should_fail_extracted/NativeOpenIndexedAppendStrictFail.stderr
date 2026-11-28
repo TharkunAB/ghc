@@ -1,0 +1,44 @@
+NativeOpenIndexedAppendStrictFail.hs:11:37: error: [GHC-70565]
+    • Cannot evaluate ‘P.appendStrictNil’ in a type.
+        This argument is a type variable. Closed evaluation requires a known value.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.appendStrictNil 'P.VNil xs’
+      In the type signature:
+        badNil :: forall a
+                         (n :: P.Nat)
+                         (xs :: P.Vec a n). P.appendStrictNil 'P.VNil xs :~: xs
+
+NativeOpenIndexedAppendStrictFail.hs:21:41: error: [GHC-70565]
+    • Cannot evaluate ‘P.appendStrictHead’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.appendStrictHead ('P.VCons x xs) ys’
+      In the type signature:
+        badConsStrictHead :: forall a
+                                    (n :: P.Nat)
+                                    (m :: P.Nat)
+                                    (x :: a)
+                                    (xs :: P.Vec a n)
+                                    (ys :: P.Vec a m). Proxy xs
+                                                       -> Proxy ys
+                                                          -> P.appendStrictHead ('P.VCons x xs) ys
+                                                             :~:
+                                                             'P.VCons x (P.appendStrictHead xs ys)
+
+NativeOpenIndexedAppendStrictFail.hs:27:41: error: [GHC-70565]
+    • Cannot evaluate ‘P.appendChangeCarried’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.appendChangeCarried ('P.VCons x xs) ys’
+      In the type signature:
+        badConsCarried :: forall a
+                                 (n :: P.Nat)
+                                 (m :: P.Nat)
+                                 (x :: a)
+                                 (xs :: P.Vec a n)
+                                 (ys :: P.Vec a m). Proxy xs
+                                                    -> Proxy ys
+                                                       -> P.appendChangeCarried ('P.VCons x xs) ys
+                                                          :~:
+                                                          'P.VCons x (P.appendChangeCarried xs ys)
+

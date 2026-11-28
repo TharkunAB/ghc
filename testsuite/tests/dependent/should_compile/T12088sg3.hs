@@ -1,9 +1,10 @@
-{-# LANGUAGE TypeFamilies, DataKinds, UndecidableInstances #-}
+{-# LANGUAGE TypeFamilies, DataKinds, UndecidableInstances, Modifiers, TypeApplications #-}
 
 -- Based on singleton-gadts
 module T12088sg3 where
 
 import Data.Kind (Type)
+import GHC.Exts (M, U)
 
 type family Promote (k :: Type) :: Type
 type family PromoteX (a :: k) :: Promote k
@@ -12,7 +13,7 @@ type instance Promote Type = Type
 type instance PromoteX (a :: Type) = Promote a
 
 data TyFun :: Type -> Type -> Type
-type a ~> b = TyFun a b -> Type
+type a ~> b = TyFun a b %M -> Type
 infixr 0 ~>
 
 data (~>@#@$) :: Type ~> Type ~> Type
@@ -28,12 +29,13 @@ type instance Apply (TyCon1 f) x = f x
 type instance Apply (TyCon2 f) x = TyCon1 (f x)
 
 type instance Promote (a -> b) = PromoteX a ~> PromoteX b
+type instance Promote (a %M -> b) = PromoteX a ~> PromoteX b
 
 type Arr :: (Type ~> Type ~> Type) -> (Type -> Type -> Type)
 data Arr p a b = MkArr (Apply (Apply p a) b)
 
 type PArr = Arr (~>@#@$)
 
-type instance Promote (Arr (TyCon2 (->)) a b) = PArr (PromoteX a) (PromoteX b)
+type instance Promote (Arr (TyCon2 ((->) @U)) a b) = PArr (PromoteX a) (PromoteX b)
 -- $(return [])
-type instance PromoteX (MkArr x :: Arr (TyCon2 (->)) a b) = MkArr (PromoteX x)
+type instance PromoteX (MkArr x :: Arr (TyCon2 ((->) @U)) a b) = MkArr (PromoteX x)

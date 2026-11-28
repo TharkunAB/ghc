@@ -1,0 +1,12 @@
+NativePromotedClassDirectGiven.hs:7:89: error: [GHC-83605]
+    • GHC cannot use method ‘fmap’ as a retained index.
+      This call needs a known ‘Functor Maybe’ dictionary.
+    • In the first argument of ‘(:~:)’, namely
+        ‘Prelude.fmap f ('Nothing :: Maybe a)’
+      In the type signature:
+        control :: forall a b (f :: a %U -> b) (x :: a). Functor Maybe =>
+                                                         Proxy f
+                                                         -> Proxy x
+                                                            -> Prelude.fmap f ('Nothing :: Maybe a)
+                                                               :~: ('Nothing :: Maybe b)
+

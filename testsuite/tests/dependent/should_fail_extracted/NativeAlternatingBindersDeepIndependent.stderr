@@ -1,0 +1,21 @@
+NativeAlternatingBindersDeepIndependent.hs:15:10: error: [GHC-83865]
+    • Couldn't match expected type: foreach (m :: Maybe a)
+                                    -> (Reading right m, Proxy retained)
+                  with actual type: foreach (m :: Maybe a)
+                                    -> (Reading left m, Proxy retained)
+    • In the first argument of ‘use’, namely ‘worker’
+      In the expression: use worker
+      In the expression:
+        let
+          use ::
+            (foreach (b :: Bool) ->
+             forall a.
+             Show a => foreach (m :: Maybe a) -> (Reading right m, Proxy b))
+            -> Reading right ('Nothing :: Maybe Bool)
+          use _ = Reading 42
+        in use worker
+    • Relevant bindings include
+        worker :: foreach (b :: Bool)
+                  -> forall a. foreach (m :: Maybe a) -> (Reading left m, Proxy b)
+          (bound at NativeAlternatingBindersDeepIndependent.hs:10:9)
+

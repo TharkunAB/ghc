@@ -1,0 +1,8 @@
+NativeOpenListFoldrCallbackFail.hs:11:38: error: [GHC-83865]
+    • Couldn't match kind ‘WrappedBool’ with ‘Bool’
+      Expected kind ‘Bool -> Bool -> Bool’,
+        but ‘k’ has kind ‘WrappedBool %U -> Bool %U -> Bool’
+    • In the first argument of ‘F.foldBits’, namely ‘k’
+      In the type ‘F.foldBits k z xs’
+      In the type synonym declaration for ‘BadFoldBits’
+

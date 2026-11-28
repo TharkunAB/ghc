@@ -1,0 +1,6 @@
+NativeOpenConstructorStrictFieldFail.hs:6:31: error: [GHC-70566]
+    • Cannot reduce the open call to ‘W.pick’ in a type.
+        The open evaluator could not represent an operand at the required kind. Use rigid variables or ordinary boxed constructors with lazy fields for symbolic inputs. The evaluator instantiates lifted polymorphic parameters at Type.
+    • In the type signature:
+        left :: forall a b. a -> b -> W.pick ('W.LeftFields a b)
+

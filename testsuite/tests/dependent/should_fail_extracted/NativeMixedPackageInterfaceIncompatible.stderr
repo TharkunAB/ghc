@@ -1,0 +1,11 @@
+NativeMixedPackageInterfaceIncompatible.hs:11:30: error: [GHC-83865]
+    • Couldn't match type ‘_’ with ‘True’
+      Expected: (Proxy _, Proxy True)
+        Actual: (Proxy _, Proxy _)
+    • In the expression: fields
+      In the expression: Pack _ fields
+      In an equation for ‘bad’: bad (Pair _ fields) = Pack _ fields
+    • Relevant bindings include
+        fields :: (Proxy _, Proxy _)
+          (bound at NativeMixedPackageInterfaceIncompatible.hs:11:13)
+

@@ -1,0 +1,12 @@
+NativeProposal378NoWriteSourceEqs.hs:6:22: error: [GHC-70565]
+    • Cannot evaluate ‘replace’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘replace (Bind @(Push g a) @b (At (Old New))) (At s)’
+      In the type signature:
+        closureEq :: forall g
+                            a
+                            b
+                            (s :: Slot g a). replace (Bind @(Push g a) @b (At (Old New))) (At s)
+                                             :~: Bind (At (Old s))
+

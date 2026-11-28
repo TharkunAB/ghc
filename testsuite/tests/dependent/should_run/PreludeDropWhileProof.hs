@@ -1,0 +1,21 @@
+{-# LANGUAGE DataKinds, GADTs, NoDependentTypes, TypeOperators #-}
+{-# OPTIONS_GHC -fno-enable-rewrite-rules #-}
+module PreludeDropWhileProof (prefixAndSuffix, rejoinPair) where
+
+import Data.Type.Equality ((:~:)(Refl))
+import PreludeAppendLengthSource (Appended)
+import PreludeDropWhileSource (Rejoined, Suffix)
+import PreludeFilterAppendProof (FilterDecisions(..))
+import PreludeFilterRuntime (BooleanResult(..))
+import PreludeTakeWhile (Prefix)
+
+-- | Reconstruct the input list from its checked prefix and suffix.
+prefixAndSuffix :: FilterDecisions p xs -> Appended (Prefix p xs) (Suffix p xs) :~: xs
+prefixAndSuffix Done = Refl
+prefixAndSuffix (Decide IsFalse _) = Refl
+prefixAndSuffix (Decide IsTrue ds) = case prefixAndSuffix ds of
+    Refl -> Refl
+
+-- | Project and append the checked prefix and suffix stored in a pair.
+rejoinPair :: FilterDecisions p xs -> Rejoined '(Prefix p xs, Suffix p xs) :~: xs
+rejoinPair = prefixAndSuffix

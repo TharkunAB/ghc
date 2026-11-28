@@ -11,6 +11,7 @@
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE Modifiers #-}
 
 -- "Singletons for GADTs" by Ryan Scott, Richard Eisenberg.
 --
@@ -20,6 +21,7 @@
 module GADTSingletons where
 
 import Data.Kind
+import GHC.Exts (M)
 import Data.Type.Equality
 import Unsafe.Coerce
 
@@ -456,7 +458,7 @@ instance (SingI x, SingI xs) => SingI (HCons x xs) where
 -----
 
 data TyFun :: Type -> Type -> Type
-type a ~> b = TyFun a b -> Type
+type a ~> b = TyFun a b %M -> Type
 infixr 0 ~>
 
 data (~>@#@$) :: Type ~> Type ~> Type
@@ -479,6 +481,7 @@ type instance Apply (TyCon2 f) x = TyCon1 (f x)
 
 type instance Demote  (a ~> b) = DemoteX  a -> DemoteX  b
 type instance Promote (a -> b) = PromoteX a ~> PromoteX b
+type instance Promote (a %M -> b) = PromoteX a ~> PromoteX b
 
 newtype SLambda (f :: k1 ~> k2) =
   SLambda { applySing :: forall t. Sing t -> Sing (f @@ t) }

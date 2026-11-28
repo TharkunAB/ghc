@@ -1,0 +1,7 @@
+NativeProposal378BadInferredAppImported.hs:5:7: error: [GHC-95781]
+    • Cannot apply expression of type ‘foreach (k :: Nat).
+                                       Vec Char k -> Nat’
+      to a visible type argument ‘Zero’
+    • In the expression: onlyInferred @Char @Zero VNil
+      In an equation for ‘bad’: bad = onlyInferred @Char @Zero VNil
+

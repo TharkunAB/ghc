@@ -1,0 +1,8 @@
+NativeStandaloneConstrainedBadEq.hs:7:3: error: [GHC-90647]
+    • Constrained associated type family ‘MissingPremise’
+      The equation requires ‘NativeStandaloneConstrainedFamilyProvider.Collects
+                               c’
+      from its owning class constraint ‘Base c’.
+    • In the equations for closed type family ‘MissingPremise’
+      In the type family declaration for ‘MissingPremise’
+

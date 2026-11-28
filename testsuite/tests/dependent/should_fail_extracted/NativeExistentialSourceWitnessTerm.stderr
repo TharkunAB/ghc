@@ -1,0 +1,7 @@
+NativeExistentialSourceWitnessTerm.hs:8:43: error: [GHC-01928]
+    • Illegal term-level use of the type variable ‘a’
+    • bound at NativeExistentialSourceWitnessTerm.hs:8:35
+    • In the expression: a
+      In a case alternative: Pack (type a) _ -> a
+      In the expression: case supplied of Pack (type a) _ -> a
+

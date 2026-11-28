@@ -1,0 +1,8 @@
+NativeStoredDictLinearField.hs:6:39: error: [GHC-83605]
+    • A retained argument must have unrestricted multiplicity Many.
+      This argument has multiplicity: One
+    • In the expression: observe x
+      In the expression: case observe x of Tagged b -> b
+      In an equation for ‘linearField’:
+          linearField (Stored x) = case observe x of Tagged b -> b
+

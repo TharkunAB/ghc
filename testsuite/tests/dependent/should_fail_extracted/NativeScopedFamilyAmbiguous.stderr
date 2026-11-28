@@ -1,0 +1,23 @@
+NativeScopedFamilyAmbiguous.hs:4:19: error: [GHC-39999]
+    • Could not deduce ‘Show a0’
+      from the context: (Collects c, Show a)
+        bound by the type signature for:
+                   missingPayload :: forall c a.
+                                     ($dCollects :: Collects c) =>
+                                     Show a =>
+                                     foreach (x :: c)
+                                     -> TaggedEntry Int (compareOrigin @c $dCollects x)
+        at NativeScopedFamilyAmbiguous.hs:(4,19)-(5,71)
+      The type variable ‘a0’ is ambiguous
+      Potentially matching instances:
+        instance Show Integer -- Defined in ‘GHC.Internal.Show’
+        instance Show a => Show (Maybe a) -- Defined in ‘GHC.Internal.Show’
+        ...plus 25 others
+        ...plus 14 instances involving out-of-scope types
+        (use -fprint-potential-instances to see them all)
+    • In the ambiguity check for ‘missingPayload’
+      To defer the ambiguity check to use sites, enable AllowAmbiguousTypes
+      In the type signature:
+        missingPayload :: forall c a. (Collects c, Show a) =>
+                                      foreach (x :: c) -> TaggedEntry Int (compareOrigin x)
+

@@ -1,0 +1,232 @@
+NativeRetainedPackageClientBad.hs:16:23: error: [GHC-83865]
+    • Couldn't match type ‘False’ with ‘True’
+      Expected: Flag True
+        Actual: Flag False
+    • In the second argument of ‘Pair’, namely ‘No’
+      In the expression: Pair True No
+      In an equation for ‘wrongPair’: wrongPair = Pair True No
+
+NativeRetainedPackageClientBad.hs:19:27: error: [GHC-25897]
+    • Couldn't match type ‘w’ with ‘_2’
+      Expected: p w
+        Actual: p _2
+      ‘w’ is a rigid type variable bound by
+        the type signature for:
+          escapePair :: forall a (p :: a -> *) (w :: a). DPair a p -> p w
+        at NativeRetainedPackageClientBad.hs:18:1-30
+    • In the expression: val
+      In an equation for ‘escapePair’: escapePair (Pair _ val) = val
+    • Relevant bindings include
+        val :: p _2 (bound at NativeRetainedPackageClientBad.hs:19:20)
+        escapePair :: DPair a p -> p w
+          (bound at NativeRetainedPackageClientBad.hs:19:1)
+
+NativeRetainedPackageClientBad.hs:23:53: error: [GHC-25897]
+    • Couldn't match type ‘m’ with ‘n2’
+      Expected: Box m
+        Actual: Box n2
+      ‘m’ is a rigid type variable bound by
+        the type signature for:
+          escapeBox :: forall (m :: Nat). Retained Box -> Vec Int m
+        at NativeRetainedPackageClientBad.hs:22:1-38
+    • In the first argument of ‘boxContents’, namely ‘box’
+      In the expression: boxContents box
+      In the second argument of ‘withRetained’, namely
+        ‘(\ _ box -> boxContents box)’
+    • Relevant bindings include
+        box :: Box n2 (bound at NativeRetainedPackageClientBad.hs:23:34)
+        escapeBox :: Retained Box -> Vec Int m
+          (bound at NativeRetainedPackageClientBad.hs:23:1)
+
+NativeRetainedPackageClientBad.hs:25:63: error: [GHC-25897]
+    • Couldn't match type ‘m’ with ‘n1’
+      Expected: Vec Int m
+        Actual: Vec Int n1
+      ‘m’ is a rigid type variable bound by
+        the type signature for:
+          escapePat :: forall (m :: Nat). Retained Box -> Vec Int m
+        at NativeRetainedPackageClientBad.hs:24:1-38
+    • In the expression: xs
+      In a case alternative: Box xs -> xs
+      In the expression: case box of Box xs -> xs
+    • Relevant bindings include
+        xs :: Vec Int n1 (bound at NativeRetainedPackageClientBad.hs:25:57)
+        box :: Box n1 (bound at NativeRetainedPackageClientBad.hs:25:34)
+        escapePat :: Retained Box -> Vec Int m
+          (bound at NativeRetainedPackageClientBad.hs:25:1)
+
+NativeRetainedPackageClientBad.hs:28:37: error: [GHC-25897]
+    • Could not deduce ‘total ~ S Z’
+      from the context: retained_field ~ Z
+        bound by a pattern with constructor: Z :: Nat,
+                 in an equation for ‘lazyProof’
+        at NativeRetainedPackageClientBad.hs:28:19
+      Expected: Vec Bool total
+        Actual: Vec Bool (S Z)
+      ‘total’ is a rigid type variable bound by
+        the type signature for:
+          lazyProof :: forall (total :: Nat).
+                       CheckedSplit Bool (S Z) total -> Vec Bool total -> Bool
+        at NativeRetainedPackageClientBad.hs:27:1-70
+    • When checking that the pattern signature: Vec Bool (S Z)
+        fits the type of its context: Vec Bool total
+      In the pattern: _ :: Vec Bool ('S 'Z)
+      In an equation for ‘lazyProof’:
+          lazyProof (S.Pair Z ~(_, _, Refl)) (_ :: Vec Bool ('S 'Z)) = True
+    • Relevant bindings include
+        lazyProof :: CheckedSplit Bool (S Z) total
+                     -> Vec Bool total -> Bool
+          (bound at NativeRetainedPackageClientBad.hs:28:1)
+
+NativeRetainedPackageClientBad.hs:32:11: error: [GHC-25897]
+    • Couldn't match type ‘total’ with ‘S Z’
+      Expected: Vec Bool total
+        Actual: Vec Bool (S Z)
+      ‘total’ is a rigid type variable bound by
+        the type signature for:
+          reversed :: forall (total :: Nat).
+                      Vec Bool total -> CheckedSplit Bool (S Z) total -> Bool
+        at NativeRetainedPackageClientBad.hs:31:1-69
+    • When checking that the pattern signature: Vec Bool (S Z)
+        fits the type of its context: Vec Bool total
+      In the pattern: _ :: Vec Bool ('S 'Z)
+      In an equation for ‘reversed’:
+          reversed (_ :: Vec Bool ('S 'Z)) (S.Pair Z !(_, _, Refl)) = True
+    • Relevant bindings include
+        reversed :: Vec Bool total -> CheckedSplit Bool (S Z) total -> Bool
+          (bound at NativeRetainedPackageClientBad.hs:32:1)
+
+NativeRetainedPackageClientBad.hs:36:43: error: [GHC-25897]
+    • Could not deduce ‘suffix ~ _1’
+      from the context: S Z ~ S _1
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in an equation for ‘escapeSplit’
+        at NativeRetainedPackageClientBad.hs:36:34-37
+      Expected: Vec Bool suffix
+        Actual: Vec Bool _1
+      ‘suffix’ is a rigid type variable bound by
+        the type signature for:
+          escapeSplit :: forall (suffix :: Nat).
+                         CheckedSplit Bool (S Z) (S Z) -> Vec Bool suffix
+        at NativeRetainedPackageClientBad.hs:35:1-67
+    • In the expression: right
+      In an equation for ‘escapeSplit’:
+          escapeSplit (S.Pair _ (_, right, Refl)) = right
+    • Relevant bindings include
+        right :: Vec Bool _1
+          (bound at NativeRetainedPackageClientBad.hs:36:27)
+        escapeSplit :: CheckedSplit Bool (S Z) (S Z) -> Vec Bool suffix
+          (bound at NativeRetainedPackageClientBad.hs:36:1)
+
+NativeRetainedPackageClientBad.hs:40:44: error: [GHC-25897]
+    • Could not deduce ‘n ~ _’
+      from the context: n ~ plus _ _1
+        bound by a pattern with constructor:
+                   Refl :: forall {k} (a :: k). a :~: a,
+                 in a case alternative
+        at NativeRetainedPackageClientBad.hs:40:34-37
+      Expected: Vec Int n
+        Actual: Vec Int _
+      ‘n’ is a rigid type variable bound by
+        the type signature for:
+          keepOnly :: forall (n :: Nat). Vec Int n -> Vec Int n
+        at NativeRetainedPackageClientBad.hs:38:1-34
+    • In the expression: kept
+      In a case alternative: S.Pair _ (S.Pair _ (kept, _, Refl)) -> kept
+      In the expression:
+        case partitionVec even xs of
+          S.Pair _ (S.Pair _ (kept, _, Refl)) -> kept
+    • Relevant bindings include
+        kept :: Vec Int _
+          (bound at NativeRetainedPackageClientBad.hs:40:25)
+        xs :: Vec Int n (bound at NativeRetainedPackageClientBad.hs:39:10)
+        keepOnly :: Vec Int n -> Vec Int n
+          (bound at NativeRetainedPackageClientBad.hs:39:1)
+
+NativeRetainedPackageClientBad.hs:43:33: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: (Vec Int Z, Vec Int Z, Add Z Z :~: S Z)
+        Actual: (Vec Int Z, Vec Int Z, Z :~: Z)
+    • In the second argument of ‘S.Pair’, namely ‘(VNil, VNil, Refl)’
+      In the second argument of ‘S.Pair’, namely
+        ‘(S.Pair Z (VNil, VNil, Refl))’
+      In the expression: S.Pair Z (S.Pair Z (VNil, VNil, Refl))
+
+NativeRetainedPackageClientBad.hs:46:32: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Int (Add (S (S Z)) Z)
+        Actual: Vec Int (S Z)
+    • In the second argument of ‘splitAtVec’, namely
+        ‘(VCons (7 :: Int) VNil)’
+      In the expression: splitAtVec (S (S Z)) (VCons (7 :: Int) VNil)
+      In an equation for ‘badCut’:
+          badCut = splitAtVec (S (S Z)) (VCons (7 :: Int) VNil)
+
+NativeRetainedPackageClientBad.hs:49:31: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Int (Add (S Z) (S (S Z)))
+        Actual: Vec Int (S (S Z))
+    • In the second argument of ‘splitAtVec’, namely
+        ‘(VCons (7 :: Int) (VCons 9 VNil))’
+      In the expression:
+        splitAtVec (S Z) (VCons (7 :: Int) (VCons 9 VNil))
+      In an equation for ‘badSuffix’:
+          badSuffix = splitAtVec (S Z) (VCons (7 :: Int) (VCons 9 VNil))
+
+NativeRetainedPackageClientBad.hs:52:11: error: [GHC-83865]
+    • Couldn't match type ‘S Z’ with ‘Z’
+      Expected: Vec Int Z
+        Actual: Vec Int (S Z)
+    • In the expression: takeVec (S Z) (VCons 7 VNil)
+      In an equation for ‘badTake’:
+          badTake = takeVec (S Z) (VCons 7 VNil)
+
+NativeRetainedPackageClientBad.hs:55:26: error: [GHC-83865]
+    • Couldn't match type ‘S Z’ with ‘Z’
+      Expected: Vec Int (Add (S Z) Z)
+        Actual: Vec Int (S (S Z))
+    • In the second argument of ‘dropVec’, namely
+        ‘(VCons 7 (VCons 9 VNil))’
+      In the expression: dropVec (S Z) (VCons 7 (VCons 9 VNil))
+      In an equation for ‘badDrop’:
+          badDrop = dropVec (S Z) (VCons 7 (VCons 9 VNil))
+
+NativeRetainedPackageClientBad.hs:58:26: error: [GHC-25897]
+    • Couldn't match type ‘total’ with ‘plus cut suffix’
+      Expected: Vec a total
+        Actual: Vec a (cut + suffix)
+      ‘total’ is a rigid type variable bound by
+        the type signature for:
+          omitProof :: forall a (cut :: Nat) (suffix :: Nat) (total :: Nat).
+                       Vec a cut
+                       -> Vec a suffix -> (Add cut suffix :~: total) -> Vec a total
+        at NativeRetainedPackageClientBad.hs:57:1-83
+    • In the expression: appendVec left right
+      In an equation for ‘omitProof’:
+          omitProof left right _ = appendVec left right
+    • Relevant bindings include
+        right :: Vec a suffix
+          (bound at NativeRetainedPackageClientBad.hs:58:16)
+        left :: Vec a cut
+          (bound at NativeRetainedPackageClientBad.hs:58:11)
+        omitProof :: Vec a cut
+                     -> Vec a suffix -> (Add cut suffix :~: total) -> Vec a total
+          (bound at NativeRetainedPackageClientBad.hs:58:1)
+
+NativeRetainedPackageClientBad.hs:61:45: error: [GHC-83865]
+    • Couldn't match type: sourceLength ys
+                     with: sourceLength xs
+      Expected: Vec a (sourceLength xs)
+        Actual: Vec a (sourceLength ys)
+      Note: GHC cannot determine the arguments of the function ‘sourceLength’ from its result.
+    • In the second argument of ‘S.Pair’, namely ‘(sourceVector ys)’
+      In the expression: S.Pair (sourceLength xs) (sourceVector ys)
+      In an equation for ‘wrongList’:
+          wrongList xs ys = S.Pair (sourceLength xs) (sourceVector ys)
+    • Relevant bindings include
+        ys :: [a] (bound at NativeRetainedPackageClientBad.hs:61:14)
+        xs :: [a] (bound at NativeRetainedPackageClientBad.hs:61:11)
+        wrongList :: [a] -> [a] -> ListVector a
+          (bound at NativeRetainedPackageClientBad.hs:61:1)
+

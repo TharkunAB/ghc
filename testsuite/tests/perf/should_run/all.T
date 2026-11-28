@@ -456,3 +456,34 @@ test('T27231',
       ],
      compile_and_run,
      ['-O'])
+
+# Dependent Haskell runtime erasure and spectral benchmarks
+
+test('DepRuntimeErasure',
+     [ collect_stats('bytes allocated', 2)
+     , collect_runtime_residency(5)
+     , only_ways(['normal']) ],
+     compile_and_run,
+     ['-O2'])
+
+test('DepSpectralFib',
+     [ collect_stats('bytes allocated', 2)
+     , collect_runtime_residency(5)
+     , only_ways(['normal']) ],
+     compile_and_run,
+     ['-O2'])
+
+test('DepSpectralVec',
+     [ collect_stats('bytes allocated', 2)
+     , collect_runtime_residency(5)
+     , only_ways(['normal']) ],
+     compile_and_run,
+     ['-O2'])
+
+test('DepSpectralInterp',
+     [ collect_stats('bytes allocated', 2)
+     , collect_runtime_residency(5)
+     , only_ways(['normal']) ],
+     compile_and_run,
+     ['-O2'])
+

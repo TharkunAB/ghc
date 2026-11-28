@@ -1177,7 +1177,6 @@
                    (HsOuterImplicit
                     (NoExtField)))
                   []
-                  []
                   (PrefixConGADT
                    (NoExtField)
                    [])
@@ -1575,7 +1574,6 @@
                      []))
                    (HsOuterImplicit
                     (NoExtField)))
-                  []
                   []
                   (PrefixConGADT
                    (NoExtField)
@@ -1975,7 +1973,6 @@
                    (HsOuterImplicit
                     (NoExtField)))
                   []
-                  []
                   (PrefixConGADT
                    (NoExtField)
                    [])
@@ -2373,7 +2370,6 @@
                      []))
                    (HsOuterImplicit
                     (NoExtField)))
-                  []
                   []
                   (PrefixConGADT
                    (NoExtField)
@@ -2773,7 +2769,6 @@
                    (HsOuterImplicit
                     (NoExtField)))
                   []
-                  []
                   (PrefixConGADT
                    (NoExtField)
                    [])
@@ -3171,7 +3166,6 @@
                      []))
                    (HsOuterImplicit
                     (NoExtField)))
-                  []
                   []
                   (PrefixConGADT
                    (NoExtField)

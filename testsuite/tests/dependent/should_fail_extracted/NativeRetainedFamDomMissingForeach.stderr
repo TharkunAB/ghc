@@ -1,0 +1,12 @@
+NativeRetainedFamDomMissingForeach.hs:5:13: error: [GHC-39999]
+    • No instance for ‘Collects (FieldKey tag)’
+        arising from a use of ‘Elem’
+    • In the type signature:
+        required :: forall (tag :: Bool) -> Proxy (Elem (FieldKey tag))
+
+NativeRetainedFamDomMissingForeach.hs:7:12: error: [GHC-39999]
+    • No instance for ‘Collects (FieldKey tag)’
+        arising from a use of ‘Elem’
+    • In the type signature:
+        missing :: foreach (tag :: Bool) -> Proxy (Elem (FieldKey tag))
+

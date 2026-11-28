@@ -1,0 +1,5 @@
+NativeExistentialSourceOverSat.hs:9:7: error: [GHC-27432]
+    • Apply GHC.Exists.Pack to a required type witness and a payload.
+    • In the expression: (Pack @Hidden Bool (Just True)) ()
+      In an equation for ‘bad’: bad = (Pack @Hidden Bool (Just True)) ()
+

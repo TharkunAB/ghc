@@ -1,0 +1,36 @@
+NativeLiftedCallbackFamilyBad.hs:6:17: error: [GHC-83865]
+    • Couldn't match type: Result tag0
+                     with: Result tag
+      Expected: Bool -> Result tag
+        Actual: Bool -> Result tag0
+      Note: ‘Result’ is a non-injective type family.
+      The type variable ‘tag0’ is ambiguous
+    • In the ambiguity check for ‘ambiguousLaw’
+      To defer the ambiguity check to use sites, enable AllowAmbiguousTypes
+      In the type signature:
+        ambiguousLaw :: forall tag. foreach (f :: Bool -> Result tag) ->
+                                    foreach (x :: Bool) -> f x :~: f x
+
+NativeLiftedCallbackFamilyBad.hs:10:66: error: [GHC-83865]
+    • Couldn't match kind ‘Bool’ with ‘Bool -> k0’
+      Expected kind ‘Bool -> k0’, but ‘f x’ has kind ‘Result False’
+    • In the first argument of ‘(:~:)’, namely ‘f x y’
+      In the type signature:
+        nonFunction :: foreach (f :: Bool -> Result 'False) ->
+                       foreach (x :: Bool) -> foreach (y :: Bool) -> f x y :~: f x y
+
+NativeLiftedCallbackFamilyBad.hs:10:76: error: [GHC-83865]
+    • Couldn't match kind ‘Bool’ with ‘Bool -> k0’
+      Expected kind ‘Bool -> k0’, but ‘f x’ has kind ‘Result False’
+    • In the second argument of ‘(:~:)’, namely ‘f x y’
+      In the type signature:
+        nonFunction :: foreach (f :: Bool -> Result 'False) ->
+                       foreach (x :: Bool) -> foreach (y :: Bool) -> f x y :~: f x y
+
+NativeLiftedCallbackFamilyBad.hs:14:65: error: [GHC-83865]
+    • Expected kind ‘Bool -> Ordering’, but ‘f x’ has kind ‘Result tag’
+    • In the first argument of ‘(:~:)’, namely ‘f x y’
+      In the type signature:
+        stuckApply :: forall tag. foreach (f :: Bool -> Result tag) ->
+                                  foreach (x :: Bool) -> foreach (y :: Bool) -> f x y :~: f x y
+

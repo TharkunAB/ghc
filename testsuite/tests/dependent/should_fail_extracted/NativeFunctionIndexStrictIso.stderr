@@ -1,0 +1,9 @@
+NativeFunctionIndexStrictIso.hs:6:62: error: [GHC-70565]
+    • Cannot evaluate ‘strictIdentity’ in a type.
+        Each constructor field must be a closed literal. This operand contains an open or unsupported field.
+    • In the first argument of ‘(:~:)’, namely
+        ‘strictIdentity (strictIdentity x)’
+      In the type signature:
+        strict :: foreach (x :: a) ->
+                  strictIdentity (strictIdentity x) :~: x
+

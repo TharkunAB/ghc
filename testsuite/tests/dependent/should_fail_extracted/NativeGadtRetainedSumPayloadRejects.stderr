@@ -1,0 +1,184 @@
+NativeGadtRetainedSumPayloadRejects.hs:9:49: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Bool (S Z)
+        Actual: Vec Bool Z
+    • In the fourth argument of ‘makeNested’, namely ‘VNil’
+      In the expression: makeNested (S Z) Z (VCons True VNil) VNil VNil
+      In an equation for ‘badOuter’:
+          badOuter = makeNested (S Z) Z (VCons True VNil) VNil VNil
+
+NativeGadtRetainedSumPayloadRejects.hs:12:72: error: [GHC-83865]
+    • Couldn't match type ‘Z’ with ‘S Z’
+      Expected: Vec Bool (S Z)
+        Actual: Vec Bool Z
+    • In the fifth argument of ‘makeNested’, namely ‘VNil’
+      In the expression:
+        makeNested (S Z) (S Z) (VCons True VNil) (VCons False VNil) VNil
+      In an equation for ‘badInner’:
+          badInner
+            = makeNested (S Z) (S Z) (VCons True VNil) (VCons False VNil) VNil
+
+NativeGadtRetainedSumPayloadRejects.hs:15:40: error: [GHC-25897]
+    • Couldn't match type ‘requested’ with ‘_5’
+      Expected: Vec a requested
+        Actual: Vec a _5
+      ‘requested’ is a rigid type variable bound by
+        the type signature for:
+          badBranch :: forall a b (requested :: Nat).
+                       Later a b -> Vec a requested
+        at NativeGadtRetainedSumPayloadRejects.hs:14:1-41
+    • In the expression: xs
+      In an equation for ‘badBranch’:
+          badBranch (Later _ (Pair _ (xs, _))) = xs
+    • Relevant bindings include
+        xs :: Vec a _5
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:15:29)
+        badBranch :: Later a b -> Vec a requested
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:15:1)
+
+NativeGadtRetainedSumPayloadRejects.hs:18:33: error: [GHC-25897]
+    • Couldn't match type ‘caller’ with ‘_4’
+      Expected: Vec Bool caller
+        Actual: Vec Bool _4
+      ‘caller’ is a rigid type variable bound by
+        the type signature for:
+          badEscape :: forall (caller :: Nat). Packed Bool -> Vec Bool caller
+        at NativeGadtRetainedSumPayloadRejects.hs:17:1-43
+    • In the first argument of ‘forward’, namely ‘xs’
+      In the expression: forward xs
+      In an equation for ‘badEscape’: badEscape (Pair _ xs) = forward xs
+    • Relevant bindings include
+        xs :: Vec Bool _4
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:18:19)
+        badEscape :: Packed Bool -> Vec Bool caller
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:18:1)
+
+NativeGadtRetainedSumPayloadRejects.hs:21:56: error: [GHC-83865]
+    • Couldn't match type ‘_2’ with ‘_3’
+      Expected: Vec Bool _3
+        Actual: Vec Bool _2
+    • In the second argument of ‘sameLength’, namely ‘ys’
+      In the expression: sameLength xs ys
+      In an equation for ‘badIndependent’:
+          badIndependent (Pair _ xs) (Pair _ ys) = sameLength xs ys
+    • Relevant bindings include
+        ys :: Vec Bool _2
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:21:36)
+        xs :: Vec Bool _3
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:21:24)
+
+NativeGadtRetainedSumPayloadRejects.hs:24:45: error: [GHC-25897]
+    • Could not deduce ‘b ~ a’
+      from the context: n ~ n1
+        bound by a pattern with constructor:
+                   DirectVec :: forall a.
+                                foreach (n1 :: Nat) -> Vec a n1 -> DirectVec a n1,
+                 in an equation for ‘badElement’
+        at NativeGadtRetainedSumPayloadRejects.hs:24:25
+      Expected: Vec a n2
+        Actual: Vec b n
+      ‘b’ is a rigid type variable bound by
+        the type signature for:
+          badElement :: forall a (n :: Nat) b.
+                        DirectVec a n -> Vec b n -> DirectVec a n
+        at NativeGadtRetainedSumPayloadRejects.hs:23:1-55
+      ‘a’ is a rigid type variable bound by
+        the type signature for:
+          badElement :: forall a (n :: Nat) b.
+                        DirectVec a n -> Vec b n -> DirectVec a n
+        at NativeGadtRetainedSumPayloadRejects.hs:23:1-55
+    • In the second argument of ‘DirectVec’, namely ‘xs’
+      In the expression: DirectVec n xs
+      In an equation for ‘badElement’:
+          badElement (DirectVec n _) xs = DirectVec n xs
+    • Relevant bindings include
+        xs :: Vec b n
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:24:28)
+        badElement :: DirectVec a n -> Vec b n -> DirectVec a n
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:24:1)
+
+NativeGadtRetainedSumPayloadRejects.hs:27:44: error: [GHC-25897]
+    • Could not deduce ‘m ~ n1’
+      from the context: n ~ n1
+        bound by a pattern with constructor:
+                   DirectVec :: forall a.
+                                foreach (n1 :: Nat) -> Vec a n1 -> DirectVec a n1,
+                 in an equation for ‘badLength’
+        at NativeGadtRetainedSumPayloadRejects.hs:27:24
+      Expected: Vec a n1
+        Actual: Vec a m
+      ‘m’ is a rigid type variable bound by
+        the type signature for:
+          badLength :: forall a (n :: Nat) (m :: Nat).
+                       DirectVec a n -> Vec a m -> DirectVec a n
+        at NativeGadtRetainedSumPayloadRejects.hs:26:1-54
+    • In the second argument of ‘DirectVec’, namely ‘xs’
+      In the expression: DirectVec n xs
+      In an equation for ‘badLength’:
+          badLength (DirectVec n _) xs = DirectVec n xs
+    • Relevant bindings include
+        xs :: Vec a m
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:27:27)
+        badLength :: DirectVec a n -> Vec a m -> DirectVec a n
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:27:1)
+
+NativeGadtRetainedSumPayloadRejects.hs:31:24: error: [GHC-05617]
+    • Could not deduce ‘size ~ size1’
+      from the context: n ~ size
+        bound by a pattern with constructor:
+                   DirectVec :: forall a.
+                                foreach (n1 :: Nat) -> Vec a n1 -> DirectVec a n1,
+                 in an equation for ‘crossed’
+        at NativeGadtRetainedSumPayloadRejects.hs:30:26-27
+      or from: m ~ size1
+        bound by a pattern with constructor:
+                   DirectVec :: forall a.
+                                foreach (n1 :: Nat) -> Vec a n1 -> DirectVec a n1,
+                 in a case alternative
+        at NativeGadtRetainedSumPayloadRejects.hs:31:19
+      Expected: Vec a m
+        Actual: Vec a size
+    • In the expression: xs
+      In a case alternative: DirectVec !size _ -> xs
+      In the expression: case right of DirectVec !size _ -> xs
+    • Relevant bindings include
+        xs :: Vec a size
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:30:26)
+
+NativeGadtRetainedSumPayloadRejects.hs:34:40: error: [GHC-05617]
+    • Could not deduce ‘retained_field ~ Z’
+      from the context: retained_field ~ S _
+        bound by a pattern with constructor: S :: Nat -> Nat,
+                 in an equation for ‘wrongDirect’
+        at NativeGadtRetainedSumPayloadRejects.hs:34:24-28
+      or from: n ~ retained_field
+        bound by a pattern with constructor:
+                   DirectVec :: forall a.
+                                foreach (n1 :: Nat) -> Vec a n1 -> DirectVec a n1,
+                 in an equation for ‘wrongDirect’
+        at NativeGadtRetainedSumPayloadRejects.hs:34:30
+      Expected: n :~: Z
+        Actual: n :~: n
+    • In the first argument of ‘Just’, namely ‘Refl’
+      In the expression: Just Refl
+      In an equation for ‘wrongDirect’:
+          wrongDirect (DirectVec (S _) _) = Just Refl
+
+NativeGadtRetainedSumPayloadRejects.hs:38:27: error: [GHC-05617]
+    • Could not deduce ‘_ ~ Z’
+      from the context: Rectangle Z (S Z) ~ Rectangle _1 _
+        bound by a pattern with constructor:
+                   Tile :: forall a.
+                           foreach (rows :: Nat)
+                           -> foreach (columns :: Nat)
+                              -> Vec (Vec a columns) rows -> Tile a (Rectangle rows columns),
+                 in an equation for ‘wrongTile’
+        at NativeGadtRetainedSumPayloadRejects.hs:38:21-22
+      Expected: Vec (Vec a Z) (S Z)
+        Actual: Vec (Vec a _) _1
+    • In the expression: xs
+      In an equation for ‘wrongTile’: wrongTile (Tile _ _ xs) = xs
+    • Relevant bindings include
+        xs :: Vec (Vec a _) _1
+          (bound at NativeGadtRetainedSumPayloadRejects.hs:38:21)
+

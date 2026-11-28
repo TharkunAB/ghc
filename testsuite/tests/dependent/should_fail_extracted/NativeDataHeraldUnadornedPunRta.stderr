@@ -1,0 +1,14 @@
+NativeDataHeraldUnadornedPunRta.hs:11:26: error: [GHC-09591]
+    • Illegal punned variable occurrence in a required type argument.
+      The name ‘x’ could refer to:
+        ‘x’ bound at NativeDataHeraldUnadornedPunRta.hs:8:5
+        ‘x’ bound at NativeDataHeraldUnadornedPunRta.hs:10:21
+    • In the expression: idNatProxy x
+      In an equation for ‘check’: check _ = idNatProxy x
+      In an equation for ‘bad’:
+          bad x
+            = check (4 :: Int)
+            where
+                check :: forall x. x -> Proxy (x)
+                check _ = idNatProxy x
+

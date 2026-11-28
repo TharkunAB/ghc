@@ -1,0 +1,36 @@
+NativeLiftedCallbackSwapped.hs:12:11: error: [GHC-83865]
+    • Couldn't match type ‘LT’ with ‘cmp x y’
+      Expected: Witness (cmp x y)
+        Actual: Witness LT
+    • In the expression: Less
+      In a case alternative: LT -> Less
+      In the expression:
+        case cmp y x of
+          LT -> Less
+          EQ -> Equal
+          GT -> Greater
+
+NativeLiftedCallbackSwapped.hs:13:11: error: [GHC-83865]
+    • Couldn't match type ‘EQ’ with ‘cmp x y’
+      Expected: Witness (cmp x y)
+        Actual: Witness EQ
+    • In the expression: Equal
+      In a case alternative: EQ -> Equal
+      In the expression:
+        case cmp y x of
+          LT -> Less
+          EQ -> Equal
+          GT -> Greater
+
+NativeLiftedCallbackSwapped.hs:14:11: error: [GHC-83865]
+    • Couldn't match type ‘GT’ with ‘cmp x y’
+      Expected: Witness (cmp x y)
+        Actual: Witness GT
+    • In the expression: Greater
+      In a case alternative: GT -> Greater
+      In the expression:
+        case cmp y x of
+          LT -> Less
+          EQ -> Equal
+          GT -> Greater
+

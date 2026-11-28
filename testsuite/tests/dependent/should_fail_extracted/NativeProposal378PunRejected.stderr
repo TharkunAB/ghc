@@ -1,0 +1,4 @@
+NativeProposal378PunRejected.hs:3:7: error: [GHC-83865]
+    • Expected a type, but ‘[Int]’ has kind ‘List (*)’
+    • In the type signature: xs :: [Int]
+

@@ -1,0 +1,63 @@
+NativeOpenListFoldrFail.hs:19:21: error: [GHC-25897]
+    • Couldn't match type ‘z’
+                     with ‘k x (GHC.Internal.Base.foldr k z xs)’
+      Expected: Folded k z (x : xs) :~: z
+        Actual: z :~: z
+      ‘z’ is a rigid type variable bound by
+        the type signature for:
+          wrongCons :: forall a b (k :: a %U -> b %U -> b) (z :: b) (x :: a)
+                              (xs :: [a]).
+                       Proxy k
+                       -> Proxy z -> Proxy x -> Proxy xs -> Folded k z (x : xs) :~: z
+        at NativeOpenListFoldrFail.hs:(16,1)-(18,39)
+    • In the expression: Refl
+      In an equation for ‘wrongCons’: wrongCons _ _ _ _ = Refl
+    • Relevant bindings include
+        wrongCons :: Proxy k
+                     -> Proxy z -> Proxy x -> Proxy xs -> Folded k z (x : xs) :~: z
+          (bound at NativeOpenListFoldrFail.hs:19:1)
+
+NativeOpenListFoldrFail.hs:24:35: error: [GHC-05617]
+    • Could not deduce ‘GHC.Internal.Base.foldr
+                          k (GHC.Internal.Base.foldr k z ys) xs1
+                        ~ GHC.Internal.Base.foldr k z (xs1 P.++ ys)’
+      from the context: xs ~ (x : xs1)
+        bound by a pattern with constructor:
+                   Cons :: forall {a} (xs :: [a]) (x :: a).
+                           Spine xs -> Spine (x : xs),
+                 in an equation for ‘missingInduction’
+        at NativeOpenListFoldrFail.hs:24:23-28
+      Expected: Folded k z (Appended xs ys)
+                :~: Folded k (Folded k z ys) xs
+        Actual: GHC.Internal.Base.foldr k z (Appended xs ys)
+                :~: GHC.Internal.Base.foldr k z (Appended xs ys)
+      Note: GHC cannot determine the arguments of the function ‘GHC.Internal.Base.foldr’ from its result.
+    • In the expression: Refl
+      In an equation for ‘missingInduction’:
+          missingInduction _ _ (Cons _) _ = Refl
+    • Relevant bindings include
+        missingInduction :: Proxy k
+                            -> Proxy z
+                            -> Spine xs
+                            -> Proxy ys
+                            -> Folded k z (Appended xs ys) :~: Folded k (Folded k z ys) xs
+          (bound at NativeOpenListFoldrFail.hs:23:1)
+
+NativeOpenListFoldrFail.hs:32:36: error: [GHC-83605]
+    • GHC cannot use method ‘P.foldr’ as a retained index.
+      This call needs a known ‘P.Foldable []’ dictionary.
+    • In the first argument of ‘(:~:)’, namely
+        ‘P.foldr k z ('[] :: [a])’
+      In the type signature:
+        nil :: forall a b (k :: a %U -> b %U -> b) (z :: b). Proxy k
+                                                             -> Proxy z
+                                                                -> P.foldr k z ('[] :: [a]) :~: z
+      In the expression:
+        let
+          nil ::
+            forall a b (k :: a %U -> b %U -> b) (z :: b). Proxy k
+                                                          -> Proxy z
+                                                             -> P.foldr k z ('[] :: [a]) :~: z
+          nil _ _ = Refl
+        in ()
+

@@ -1,0 +1,3 @@
+NativeTypeCaseBadPattern.hs:5:3: error: [GHC-55789]
+    Expected a constructor pattern, a variable, or a wildcard. Each pattern variable must be distinct.
+

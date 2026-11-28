@@ -1,0 +1,42 @@
+NativeIndexedConsProofBad.hs:12:21: error: [GHC-05617]
+    • Could not deduce ‘False ~ _’
+      from the context: n ~ P.S n2
+        bound by a pattern with constructor:
+                   P.VCons :: forall a (n :: P.Nat).
+                              a -> P.Vec a n -> P.Vec a (P.S n),
+                 in a case alternative
+        at NativeIndexedConsProofBad.hs:12:5-16
+      Expected: Seen (P.VCons _ xs1)
+        Actual: Seen (P.VCons False xs1)
+    • In the expression: seenCons False xs
+      In a case alternative: P.VCons _ xs -> seenCons False xs
+      In the expression:
+        case input of
+          P.VNil -> SeenNil
+          P.VCons _ xs -> seenCons False xs
+
+NativeIndexedConsProofBad.hs:17:37: error: [GHC-05617]
+    • Could not deduce ‘P.VCons x xs ~ right’
+      from the context: P.S P.Z ~ P.S n
+        bound by a pattern with constructor:
+                   P.VCons :: forall a (n :: P.Nat).
+                              a -> P.Vec a n -> P.Vec a (P.S n),
+                 in a case alternative
+        at NativeIndexedConsProofBad.hs:17:5-16
+      Expected: Seen right
+        Actual: Seen (P.VCons x xs)
+    • In the expression: seenCons x xs
+      In the expression: (seenCons x xs, seenCons x xs)
+      In a case alternative:
+          P.VCons x xs -> (seenCons x xs, seenCons x xs)
+    • Relevant bindings include
+        xs :: P.Vec Bool n (bound at NativeIndexedConsProofBad.hs:17:15)
+
+NativeIndexedConsProofBad.hs:24:30: error: [GHC-83605]
+    • GHC cannot use this expression as a retained index.
+      Build the index from local variables, supported constructors, and fully applied functions with checked equations.
+      An immediate application of a supported lambda is also allowed.
+    • In the expression: seeOperand @'P.Z (P.VCons True P.VNil)
+      In an equation for ‘badWidth’:
+          badWidth = seeOperand @'P.Z (P.VCons True P.VNil)
+

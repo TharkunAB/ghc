@@ -1,0 +1,4 @@
+NativeLinearRetainedPackageFallthroughReject.hs:6:12: error: [GHC-47619]
+    These equations require separate matches of a linear retained package.
+    Match each retained constructor once, then match the remaining fields inside that branch.
+
