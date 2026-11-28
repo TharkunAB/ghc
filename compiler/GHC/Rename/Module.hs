@@ -376,6 +376,10 @@ order. Admit a singleton only when its other local value dependencies are
 already available. Then walk back from the requested functions to collect
 their prerequisites. Keep the original SCCs for typechecking. The typed
 producer checks the callee's identity and the decrease of each self call.
+
+Exclude bindings that contain an expression hole. A binding with a hole
+cannot certify a source table, and leaving it in its value binding group
+keeps peer signatures in scope at the hole.
 -}
 
 -- | Allocate private names for signed function bindings and retained record witnesses.
@@ -389,6 +393,7 @@ localSourceTableBinders tycl_decls binds sigs = do
             , nameOccName n `elemOccSet` eligible_signed
             , not (null rows)
             , not (has_ps_splice rows)
+            , not (has_ps_hole rows)
             , all eligible_row rows
             , any row_has_pat_scrutiny rows
               || any row_has_case_or_emb rows
@@ -511,6 +516,13 @@ localSourceTableBinders tycl_decls binds sigs = do
       isJust (cast node :: Maybe (HsTypedSplice GhcPs))
       || isJust (cast node :: Maybe (HsUntypedSplice GhcPs))
       || or (gmapQ has_ps_splice node)
+
+    has_ps_hole :: Data a => a -> Bool
+    has_ps_hole node = case cast node :: Maybe (HsExpr GhcPs) of
+      Just HsHole{}          -> True
+      Just HsTypedSplice{}   -> False
+      Just HsUntypedSplice{} -> False
+      _                      -> or (gmapQ has_ps_hole node)
 
     eligible_row :: LMatch GhcPs (LHsExpr GhcPs) -> Bool
     eligible_row (L _ Match{m_pats = L _ pats, m_grhss = GRHSs _ (L _ (GRHS _ [] _) :| []) (L _ local_binds)}) =
@@ -666,6 +678,7 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
             guard (mkSourceTableOcc (nameOccName b) `elemOccSet` declared)
             guard (not (b `elemNameSet` specialised))
             guard (not (has_rn_splice fb))
+            guard (not (has_rn_hole fb))
             sig_wc <- lookup_single_sig b
             let term_deps = (fvs `intersectNameSet` local_values) `minusNameSet` scc_peers
                 tbl_deps  = rhs_tbl_vals fvs `minusNameSet` scc_peers
@@ -943,6 +956,13 @@ splitLocalSourceTables use dus group@HsGroup{hs_valds = vals@(XValBindsLR (HsVBG
       isJust (cast node :: Maybe (HsTypedSplice GhcRn))
       || isJust (cast node :: Maybe (HsUntypedSplice GhcRn))
       || or (gmapQ has_rn_splice node)
+
+    has_rn_hole :: Data a => a -> Bool
+    has_rn_hole node = case cast node :: Maybe (HsExpr GhcRn) of
+      Just HsHole{}          -> True
+      Just HsTypedSplice{}   -> False
+      Just HsUntypedSplice{} -> False
+      _                      -> or (gmapQ has_rn_hole node)
 
     has_qual_ty :: Data a => a -> Bool
     has_qual_ty node

@@ -1,0 +1,14 @@
+NativeEarlyHoleLaterSignedFit.hs:12:20: error: [GHC-88464]
+    • Found hole: _ :: Nat -> Nat
+    • In the expression: (_ :: Nat -> Nat) Zero
+      In an equation for ‘stepId’: stepId Zero = (_ :: Nat -> Nat) Zero
+    • Relevant bindings include
+        stepId :: Nat -> Nat
+          (bound at NativeEarlyHoleLaterSignedFit.hs:12:1)
+      Valid hole fits include
+        Succ :: Nat -> Nat
+        laterNatFn :: Nat -> Nat
+        stepId :: Nat -> Nat
+        id :: forall a. a -> a
+          with id @Nat
+

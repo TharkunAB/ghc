@@ -74,7 +74,7 @@ import GHC.Tc.Gen.Annotation
 import GHC.Tc.Gen.Bind
 import GHC.Tc.Gen.Default
 import GHC.Tc.Utils.Env
-import GHC.Tc.Gen.Sig( isCompleteHsSig, tcRules )
+import GHC.Tc.Gen.Sig( TcSigInfo(..), completeSigPolyId_maybe, isCompleteHsSig, tcUserTypeSig, tcRules )
 import {-# SOURCE #-} GHC.HsToCore.Binds (dsHsWrapper, dsTopLHsBinds)
 import GHC.HsToCore.Monad (initDsTc)
 import GHC.Core (CoreExpr, flattenBinds)
@@ -2293,7 +2293,7 @@ tcIndependentFamilyProducersWith prev_deriv demands group@HsGroup
                          , hs_valds = XValBindsLR (HsVBG rest_binds rest_sigs) }
         (envs@(early_env, _), wanted) <- captureTopConstraints (tcTopSrcDeclGroup early)
         restoreEnvs envs $ do
-          evs <- checkNoErrs (simplifyTop wanted)
+          evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanted (checkNoErrs (simplifyTop wanted))
           checked@(definitions, _) <- localOpenDefinitions selected
             (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
           workers <- traverse independentImport (nameSetElemsStable constructors)
@@ -2731,7 +2731,7 @@ tcTopSrcTablesCont has_open_demands prev_deriv finish_cont group = do
             ((envs@(early_env, _), _, deriving_info), wanteds) <- captureTopConstraints $
               tcTopSrcDeclGroupWithMethods Nothing Nothing early
             restoreEnvs envs $ do
-              evs <- simplifyTop wanteds
+              evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanteds (simplifyTop wanteds)
               (ordinary, companions, helpers) <- sourceTablesWithMappers True early_names evs early_env
               let known = mkNameSet (map (tyConName . snd) ordinary)
                   witness_owners = mkNameSet
@@ -2910,7 +2910,7 @@ splitMutualLargeElim env needed group@HsGroup
     try_candidate (term, fam_name) = do
       guard (not (fam_name `elemNameEnv` tcg_type_env env))
       fb@FunBind{fun_matches = MG{mg_alts = L _ alts}, fun_ext = fvs} <- find_singleton_bind term
-      guard (not (hasSplice fb) && not (null alts) && all is_emb_ty_match alts)
+      guard (not (hasSplice fb) && not (hasRnExprHole fb) && not (null alts) && all is_emb_ty_match alts)
       (sig_loc, sig_wc) <- find_large_elim_sig term
       let other_values = value_names `delFromNameSet` term
           other_tables = mkNameSet
@@ -3316,8 +3316,13 @@ tcLocalOpenGroupWith prev_deriv demands group@HsGroup
             , let L _ HsSig{sig_body = body} = hswc_body wc
             , returns_type_sig False body
             , lnm <- ns ]
+          hole_owners = mkNameSet
+            [ b
+            | (_, bs) <- binds
+            , L _ fb@FunBind{fun_id = L _ b} <- bs
+            , hasRnExprHole fb ]
           failed_large_elims =
-            nameSetElemsStable (mkNameSet (map fst demands) `intersectNameSet` large_elim_owners)
+            nameSetElemsStable ((mkNameSet (map fst demands) `intersectNameSet` large_elim_owners) `minusNameSet` hole_owners)
           local_val_by_occ = mkOccEnv
             [ (nameOccName v, v) | v <- nameSetElemsStable value_names ]
           demote_local_table nm
@@ -3382,7 +3387,7 @@ tcLocalOpenGroupWith prev_deriv demands group@HsGroup
       ((envs@(early_env, _), methods, _), wanted) <- captureTopConstraints $
         tcTopSrcDeclGroupWithMethods deferred_vals (Just prev_deriv) early
       restoreEnvs envs $ do
-        evs <- checkNoErrs (simplifyTop wanted)
+        evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanted (checkNoErrs (simplifyTop wanted))
         let checked_demands = reverse ready
         (req_defs, req_owners) <- localOpenDefinitions checked_demands
                                     (tcg_ev_binds early_env `unionBags` evs) (tcg_binds early_env)
@@ -3814,6 +3819,76 @@ hasSplice node =
     || isJust (cast node :: Maybe (HsUntypedSplice GhcRn))
     || or (gmapQ hasSplice node)
 
+hasRnExprHole :: Data a => a -> Bool
+hasRnExprHole node = case cast node :: Maybe (HsExpr GhcRn) of
+    Just HsHole{}          -> True
+    Just HsTypedSplice{}   -> False
+    Just HsUntypedSplice{} -> False
+    _                      -> or (gmapQ hasRnExprHole node)
+
+{- Note [Complete signatures from later groups at early holes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an early-staged binding group contains an expression hole, the remaining
+declaration group can still hold top-level bindings with complete user type
+signatures. Ordinary top-level checking puts every complete signature of the
+group into tcl_env before checking any binding SCC. Mirror that scope around
+simplifyTop when the captured constraints contain an expression hole, for each
+complete signature in the remaining group whose local references are already in
+scope.
+-}
+
+hsGroupTopSigs :: HsGroup GhcRn -> [LSig GhcRn]
+hsGroupTopSigs HsGroup{hs_valds = XValBindsLR (HsVBG _ sigs)} = sigs
+hsGroupTopSigs _ = []
+
+wcHasExprHole :: WantedConstraints -> Bool
+wcHasExprHole WC{wc_impl = implics, wc_errors = errors} =
+    anyBag is_expr_hole errors || anyBag (wcHasExprHole . ic_wanted) implics
+  where
+    is_expr_hole (DE_Hole Hole{hole_sort = ExprHole _}) = True
+    is_expr_hole _                                      = False
+
+-- | Bring complete user type signatures from the remaining group into scope
+-- when simplifying an early group that contains an expression hole.
+-- See Note [Complete signatures from later groups at early holes].
+withLaterHoleSigIds :: [LSig GhcRn] -> WantedConstraints -> TcM a -> TcM a
+withLaterHoleSigIds rest_sigs wanteds action
+  | null rest_sigs || not (wcHasExprHole wanteds) = action
+  | otherwise = do
+      gbl_env <- getGblEnv
+      lcl_env <- getLclTypeEnv
+      let sem_mod  = tcg_semantic_mod gbl_env
+          type_env = tcg_type_env gbl_env
+          local_ref_ready nm
+            | nameModule_maybe nm /= Just sem_mod = True
+            | otherwise = nm `elemNameEnv` lcl_env || nm `elemNameEnv` type_env
+          sig_refs :: Data d => d -> [Name]
+          sig_refs node =
+            [ nm | nm <- maybeToList (cast node), isExternalName nm ]
+            ++ concat (gmapQ sig_refs node)
+          check_one loc sig_wc (L _ nm)
+            | nm `elemNameEnv` lcl_env || nm `elemNameEnv` type_env = pure Nothing
+            | not (all local_ref_ready (sig_refs sig_wc))           = pure Nothing
+            | otherwise =
+                tryTcDiscardingErrs (pure Nothing) $ do
+                  (mb_id, sig_cts) <- captureTopConstraints $
+                    completeSigPolyId_maybe . TcIdSig <$> tcUserTypeSig (locA loc) sig_wc (Just nm)
+                  if isEmptyWC sig_cts
+                    then pure mb_id
+                    else do
+                      _ <- simplifyTop sig_cts
+                      errs <- ifErrsM (pure True) (pure False)
+                      pure (if errs then Nothing else mb_id)
+      poly_ids <- fmap catMaybes $ sequence
+        [ check_one loc sig_wc lnm
+        | L loc (TypeSig _ [] lnames sig_wc) <- rest_sigs
+        , isCompleteHsSig sig_wc
+        , not (hasSplice sig_wc)
+        , lnm <- lnames ]
+      if null poly_ids
+        then action
+        else tcExtendSigIds TopLevel poly_ids action
+
 rejectLocalOpen :: [(Name, SrcSpan)] -> String -> TcM a
 rejectLocalOpen demands reason = do
     for_ demands $ \(name, loc) ->
@@ -3837,7 +3912,7 @@ tcSourceValueBinds group = do
       Just (_, first, rest) -> do
         (envs@(first_env, _), wanteds) <- captureTopConstraints (check_group first)
         restoreEnvs envs $ do
-          evs <- simplifyTop wanteds
+          evs <- withLaterHoleSigIds (hsGroupTopSigs rest) wanteds (simplifyTop wanteds)
           let names = mkNameSet (collectHsValBinders CollNoDictBinders (hs_valds first))
           tables <- sourceTablesFor False names first_env
           let new_tcs = [ tc | (_, tbl) <- tables
