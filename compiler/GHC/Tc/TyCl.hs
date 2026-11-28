@@ -1746,6 +1746,79 @@ that enable UnsaturatedTypeFamilies or DependentTypes retain Proposal #242's
 fixed U default on synonym RHSs.
 -}
 
+{- Note [Defunctionalization kind-arrow synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Defunctionalization libraries declare an empty data type and a parameterized
+synonym that pairs it with an arrow to Type:
+
+  data TyFun :: Type -> Type -> Type
+  type (~>) :: Type -> Type -> Type
+  type a ~> b = TyFun a b -> Type
+
+Unlike `type Exp a = a -> Type`, a standalone kind signature often fixes the
+kind of `(~>)` to `Type -> Type -> Type`. Adding an inferred Matchability
+binder to `(~>)` would violate that standalone kind signature, break injectivity
+of type families such as `type Demote (k1 ~> k2) = Demote k1 -> Demote k2`, and
+mismatch `TypeLevel` class heads (`instance SingKind (k1 ~> k2)`) against
+`KindLevel` indices (`SLambda :: (k1 ~> k2) -> Type`).
+
+Because `TyFun` is an empty algebraic data type with no runtime constructors,
+`TyFun a b -> Type` encodes a defunctionalized kind arrow rather than an
+inhabited runtime function type. When DataKinds is enabled and neither
+UnsaturatedTypeFamilies, DependentTypes, nor Modifiers is active,
+`isDefunKindSynRhs` recognizes a bare standard arrow chain to Type whose
+domains are headed by empty algebraic data types. `tcTySynRhs` checks those
+arrows as Matchable (M).
+-}
+
+-- | Test whether a synonym RHS is a defunctionalization kind arrow over an
+-- empty algebraic data type (such as @TyFun a b -> Type@).
+-- See Note [Defunctionalization kind-arrow synonyms].
+isDefunKindSynRhs :: LHsType GhcRn -> TcM Bool
+isDefunKindSynRhs rhs = do
+  unsat      <- unsaturatedTypeFamiliesEnabled
+  mods       <- xoptM LangExt.Modifiers
+  data_kinds <- xoptM LangExt.DataKinds
+  if unsat || mods || not data_kinds
+    then pure False
+    else check_chain False rhs
+  where
+    check_chain seen_arr ty
+      | L _ (HsFunTy _ (HsModifiedFunArr _ [] HsStandardArr{}) dom res) <- ignoreParens ty
+      = do { ok_dom <- is_empty_data_app dom
+           ; if ok_dom
+             then check_chain True res
+             else pure False }
+      | otherwise
+      = pure (seen_arr && is_star ty)
+
+    is_star ty = case unLoc (ignoreParens ty) of
+      HsStarTy{} -> True
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm)) -> nm == liftedTypeKindTyConName
+      _ -> False
+
+    app_head ty = case unLoc (ignoreParens ty) of
+      HsAppTy _ f _ -> app_head f
+      HsAppKindTy _ f _ -> app_head f
+      HsTyVar _ NotPromoted (L _ (WithUserRdr _ nm)) -> Just nm
+      _ -> Nothing
+
+    is_empty_data_app ty
+      | Just nm <- app_head ty
+      , isTyConName nm
+      = do { thing <- tcLookup nm
+           ; pure $ case thing of
+               AGlobal (ATyCon head_tc) ->
+                 isAlgTyCon head_tc
+                 && not (isNewTyCon head_tc)
+                 && not (isClassTyCon head_tc)
+                 && not (isTypeDataTyCon head_tc)
+                 && not (isDataFamInstTyCon head_tc)
+                 && not (isAbstractTyCon head_tc)
+                 && null (tyConDataCons head_tc)
+               _ -> False }
+      | otherwise = pure False
+
 -- | Select results whose constructor shape is independent of matchability.
 -- See Note [Inferred injective kind family results].
 structuralKindResult :: Name -> LHsType GhcRn -> Bool
@@ -2857,30 +2930,34 @@ kcLTyClDecl collect_metadata (L loc decl)
        ; metadata <- addVDQNote tycon $   -- See Note [Inferring visible dependent quantification]
          addErrCtxt (tcMkDeclCtxt decl) $
          case decl of
-           SynDecl{tcdRhs = rhs} | collect_metadata -> tcExtendNameTyVarEnv (tcTyConScopedTyVars tycon) $ do
-             outer_owner <- tcl_kind_arrow_defaults <$> getLclEnv
-             generalise_callbacks <- generaliseSynonymCallbackArrows
-             -- See Note [Callback arrows in inferred synonym kinds]
-             let callback_arrow = fmap (\(defaults, _) level -> do
-                   ma <- newFlexiTyVar matchabilityTy
-                   unless (generalise_callbacks && level == KindLevel) $
-                     updTcRef defaults ((ma, level) :)
-                   pure (mkTyVarTy ma)) outer_owner
-             inferSynonymMatchabilities $ do
-               ref <- newTcRef []
-               let choose name callbacks = do
-                     indices <- mapM (const (newFlexiTyVar matchabilityTy)) callbacks
-                     owner <- tcl_kind_arrow_defaults <$> getLclEnv
-                     forM_ (zip callbacks indices) $ \(callback, ma) -> do
-                       let (default_owner, level)
-                             | callback && not generalise_callbacks = (outer_owner, KindLevel)
-                             | otherwise = (owner, TypeLevel)
-                       forM_ default_owner $ \(defaults, _) -> updTcRef defaults ((ma, level) :)
-                     let vars = mkTyVarTys indices
-                     updTcRef ref ((name, vars) :)
-                     pure vars
-               _ <- tcCheckSynonymMetadata Nothing choose callback_arrow rhs (tyConResKind tycon)
-               Just . (tc_name,) . reverse <$> readTcRef ref
+           SynDecl{tcdRhs = rhs} | collect_metadata -> do
+             is_defun <- isDefunKindSynRhs rhs
+             if is_defun
+               then kcTyClDecl decl tycon >> pure Nothing
+               else tcExtendNameTyVarEnv (tcTyConScopedTyVars tycon) $ do
+                 outer_owner <- tcl_kind_arrow_defaults <$> getLclEnv
+                 generalise_callbacks <- generaliseSynonymCallbackArrows
+                 -- See Note [Callback arrows in inferred synonym kinds]
+                 let callback_arrow = fmap (\(defaults, _) level -> do
+                       ma <- newFlexiTyVar matchabilityTy
+                       unless (generalise_callbacks && level == KindLevel) $
+                         updTcRef defaults ((ma, level) :)
+                       pure (mkTyVarTy ma)) outer_owner
+                 inferSynonymMatchabilities $ do
+                   ref <- newTcRef []
+                   let choose name callbacks = do
+                         indices <- mapM (const (newFlexiTyVar matchabilityTy)) callbacks
+                         owner <- tcl_kind_arrow_defaults <$> getLclEnv
+                         forM_ (zip callbacks indices) $ \(callback, ma) -> do
+                           let (default_owner, level)
+                                 | callback && not generalise_callbacks = (outer_owner, KindLevel)
+                                 | otherwise = (owner, TypeLevel)
+                           forM_ default_owner $ \(defaults, _) -> updTcRef defaults ((ma, level) :)
+                         let vars = mkTyVarTys indices
+                         updTcRef ref ((name, vars) :)
+                         pure vars
+                   _ <- tcCheckSynonymMetadata Nothing choose callback_arrow rhs (tyConResKind tycon)
+                   Just . (tc_name,) . reverse <$> readTcRef ref
            _ -> kcTyClDecl decl tycon >> pure Nothing
        ; traceTc "kcTyClDecl done }" (ppr tc_name)
        ; return metadata }
@@ -4396,7 +4473,14 @@ tcTySynRhs metadata roles_info tc_name hs_ty
                          , not (binderVar b `elemVarSet`
                                   tyCoVarsOfTypes (res_kind : map (tyVarKind . binderVar) rest)) ->
                            tcCheckMatchabilitySynRhs (mkTyVarTy (binderVar b)) hs_ty res_kind
-                       _ -> tcCheckSynonymRhs tc_name hs_ty res_kind
+                       _ -> do
+                         -- See Note [Defunctionalization kind-arrow synonyms].
+                         is_defun <- if isLiftedTypeKind res_kind
+                                     then isDefunKindSynRhs hs_ty
+                                     else pure False
+                         if is_defun
+                           then tcCheckMatchabilitySynRhs matchableDataConTy hs_ty res_kind
+                           else tcCheckSynonymRhs tc_name hs_ty res_kind
 
          -- See Note [Error on unconstrained meta-variables] in GHC.Tc.Utils.TcMType
          -- Example: (typecheck/should_fail/T17567)
