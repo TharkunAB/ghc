@@ -3354,6 +3354,55 @@ familyKindUsesMatchability tc b =
   any (elemVarSet (binderVar b) . tyCoVarsOfType)
       (tyConResKind tc : map (tyVarKind . binderVar) (tyConBinders tc))
 
+-- | Does the index classify an arrow (after synonym expansion) in the
+-- parameter kinds or result kind of the family?
+-- See Note [Defaulting kind-arrow matchability on families].
+familyKindArrowUsesMatchability :: TyCon -> TyConBinder -> Bool
+familyKindArrowUsesMatchability tc b =
+  any (has_arrow_ma (binderVar b))
+      (tyConResKind tc
+       : map (tyVarKind . binderVar)
+             (dropWhile inferredMatchabilityIndex (tyConBinders tc)))
+  where
+    has_arrow_ma tv ty
+      | Just ty' <- coreView ty = has_arrow_ma tv ty'
+    has_arrow_ma tv (FunTy _ ma mult dom res) =
+      getTyVar_maybe ma == Just tv
+      || has_arrow_ma tv mult
+      || has_arrow_ma tv dom
+      || has_arrow_ma tv res
+    has_arrow_ma tv (TyConApp fam args)
+      | not (isTypeFamilyTyCon fam) = any (has_arrow_ma tv) args
+    has_arrow_ma tv (AppTy f a) = has_arrow_ma tv f || has_arrow_ma tv a
+    has_arrow_ma tv (ForAllTy ma (Bndr v _) body) =
+      getTyVar_maybe ma == Just tv
+      || has_arrow_ma tv (tyVarKind v)
+      || has_arrow_ma tv body
+    has_arrow_ma _ _ = False
+
+{- Note [Defaulting kind-arrow matchability on families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A type family or data family can inherit an inferred Matchability binder from a
+kind-arrow synonym in its parameter kinds or result kind:
+
+  type Effect = (Type -> Type) -> Type -> Type
+  type family DispatchOf (e :: Effect) :: Dispatch
+  data family StaticRep :: Effect -> Type
+
+Here `Effect` has an inferred Matchability parameter `Effect @{m}`, so
+`DispatchOf` has kind `forall {m}. Effect @{m} -> Dispatch` and `StaticRep` has
+kind `forall {m}. Effect @{m} -> Type`. Closed families such as `UnEndo` with
+result kind `a -> Exp a` likewise inherit `{m}` in `tyConResKind`.
+
+When `DispatchOf e` or `UnEndo x y` is checked at `TypeLevel` with a non-`Type`
+expected kind, `index_level` is `TypeLevel`. However, `m` classifies a `FunTy`
+arrow in the family's kind signature (rather than a non-injective type-family
+result selector as in `PTo (x :: Rep a)`), not a runtime function arrow in a
+`Type`-kinded result. Register `m` at `KindLevel` when
+`familyKindArrowUsesMatchability` holds so that unconstrained occurrences
+default to `Matchable`, matching explicit kind annotations.
+-}
+
 -- | Does the index annotate a curried arrow in a synonym parameter's kind?
 synonymCallbackIndex :: TyVar -> Kind -> Bool
 synonymCallbackIndex tv kind
@@ -3382,7 +3431,7 @@ hasInferredMatchability tc
   | b : _ <- tyConBinders tc, inferredMatchabilityIndex b =
       case tyConFlavour tc of
         ClosedTypeFamilyFlavour -> True
-        OpenFamilyFlavour IAmType _ -> True
+        OpenFamilyFlavour _ _ -> True
         TypeSynonymFlavour -> True
         _ -> False
   | otherwise = False
@@ -5616,28 +5665,35 @@ tcInferTyApps_nosat index_level expected_kind mode orig_hs_ty fun orig_hs_args
                  from_argument b
                    | TypeSynonymFlavour <- tyConFlavour tc =
                        any (synonymCallbackIndex (binderVar b)) domains
+                   | isFamilyTyCon tc =
+                       familyKindArrowUsesMatchability tc b
                    | otherwise = False
              args <- get_indices (tyConName tc) (map from_argument indices)
              pure (mkTyConApp tc args)
            (Nothing, TyConApp tc [])
              | TypeLevel <- mode_tyki mode
-             , isTypeFamilyTyCon tc ||
+             , isFamilyTyCon tc ||
                (isTcTyCon tc && is_closed_family tc && infer_family_arrows)
              , hasInferredMatchability tc
              , let indices = takeWhile inferredMatchabilityIndex (tyConBinders tc)
              , any (familyKindUsesMatchability tc) indices -> do
                  defaults <- tcl_kind_arrow_defaults <$> getLclEnv
+                 -- See Note [Defaulting kind-arrow matchability on families].
                  let policy = mode_callback_arrow mode
                      default_level = case policy of
                        DefaultUnsignedFamilyArrows -> KindLevel
                        _ -> index_level
+                     binder_level b
+                       | familyKindArrowUsesMatchability tc b = KindLevel
+                       | otherwise = default_level
                      choose b
                        | not (familyKindUsesMatchability tc b) = pure unmatchableDataConTy
                        | infer_family_arrows = newFlexiTyVarTy matchabilityTy
-                       | Just (owner, _) <- defaults = fresh_kind_arrow default_level owner
-                       | otherwise = pure (defaultForAllMatchability default_level)
+                       | Just (owner, _) <- defaults = fresh_kind_arrow (binder_level b) owner
+                       | otherwise = pure (defaultForAllMatchability (binder_level b))
                  case (policy, defaults, index_level) of
-                   (OrdinaryArrowChecking, Nothing, TypeLevel) -> pure fun
+                   (OrdinaryArrowChecking, Nothing, TypeLevel)
+                     | not (any (familyKindArrowUsesMatchability tc) indices) -> pure fun
                    _ -> mkTyConApp tc <$> traverse choose indices
            _ -> pure fun
        ; (f_args, res_k) <- go_init 1 fun orig_hs_args Nothing

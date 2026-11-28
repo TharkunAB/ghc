@@ -29,7 +29,7 @@ import GHC.Tc.TyCl.Utils ( addTyConsToGblEnv )
 import GHC.Tc.TyCl.Class ( tcClassDecl2, tcATDefault,
                            HsSigFun, mkHsSigFun, findMethodBind,
                            instantiateMethod )
-import GHC.Tc.Solver( pushLevelAndSolveEqualitiesX, reportUnsolvedEqualities )
+import GHC.Tc.Solver( pushLevelAndSolveKindArrowsX, reportUnsolvedEqualities )
 import GHC.Tc.Gen.Sig
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Validity
@@ -1127,10 +1127,14 @@ tcDataFamInstHeader mb_clsinfo skol_info fam_tc hs_outer_bndrs fixity
                     hs_ctxt hs_pats m_ksig hs_cons
   = do { traceTc "tcDataFamInstHeader {" (ppr fam_tc <+> ppr hs_pats)
        ; (tclvl, wanted, (outer_bndrs, (stupid_theta, lhs_ty, master_res_kind, instance_res_kind)))
-            <- pushLevelAndSolveEqualitiesX "tcDataFamInstHeader" $
+            <- pushLevelAndSolveKindArrowsX "tcDataFamInstHeader" $
                bindOuterFamEqnTKBndrs skol_info emptyNameEnv hs_outer_bndrs $  -- Binds skolem TcTyVars
                do { stupid_theta <- tcHsContext hs_ctxt
-                  ; (lhs_ty, lhs_kind) <- tcFamTyPats fam_tc hs_pats
+                  ; (lhs_ty, lhs_kind) <- case tyConBinders fam_tc of
+                      b : _ | inferredMatchabilityIndex b -> do
+                        (lhs, kind, _) <- tcInferredMatchabilityFamPats fam_tc hs_pats
+                        pure (lhs, kind)
+                      _ -> tcFamTyPats fam_tc hs_pats
                   ; (lhs_applied_ty, lhs_applied_kind)
                       <- tcInstInvisibleTyBinders (Just TypeLevel) lhs_ty lhs_kind
                       -- See Note [Data family/instance return kinds]
