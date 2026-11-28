@@ -3,7 +3,10 @@
 module GHC.Tc.Gen.Splice where
 
 import GHC.Prelude
+import GHC.Core (CoreExpr)
+import GHC.Core.Type (Type)
 import GHC.Types.Name
+import GHC.Types.Var (Id)
 import GHC.Hs.Expr ( PendingRnSplice, DelayedSplice )
 import GHC.Tc.Types( TcM , SpliceType )
 import GHC.Tc.Utils.TcType   ( ExpRhoType )
@@ -39,9 +42,12 @@ tcTopSpliceExpr :: SpliceType -> TcM (LHsExpr GhcTc) -> TcM (LHsExpr GhcTc)
 runMetaE :: LHsExpr GhcTc -> TcM (LHsExpr GhcPs)
 runMetaP :: LHsExpr GhcTc -> TcM (LPat GhcPs)
 runMetaT :: LHsExpr GhcTc -> TcM (LHsType GhcPs)
+runMetaTWithIndices :: [Name] -> LHsExpr GhcTc -> TcM (LHsType GhcPs)
 runMetaD :: LHsExpr GhcTc -> TcM [LHsDecl GhcPs]
 
 lookupThName_maybe :: TH.Name -> TcM (Maybe Name)
 runQinTcM :: TH.Q a -> TcM a
 runRemoteModFinalizers :: ThModFinalizers -> TcM ()
 finishTH :: TcM ()
+tcDecodeClosedCallOperand :: Name -> Type -> TcM (Maybe CoreExpr)
+tcRunClosedCall :: Id -> CoreExpr -> Type -> TcM Type
