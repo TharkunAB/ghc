@@ -1890,12 +1890,15 @@ defaultTyVar def_strat tv
        -- defaultKindVar is used exclusively with -XNoPolyKinds
        -- See Note [Defaulting with -XNoPolyKinds]
        -- It takes an (unconstrained) meta tyvar and defaults it.
-       -- Works only on vars of type *; for other kinds, it issues an error.
+       -- Works on vars of kind *; leaves Matchability vars un-defaulted;
+       -- for other kinds, it issues an error.
     default_kind_var kv
       | isLiftedTypeKind (tyVarKind kv)
       = do { traceTc "Defaulting a kind var to *" (ppr kv)
            ; liftZonkM $ writeMetaTyVar kv liftedTypeKind
            ; return True }
+      | tyVarKind kv `tcEqType` matchabilityTy
+      = return False
       | otherwise
       = do { let (tidy_env, kv') = tidyFreeTyCoVarX emptyTidyEnv kv
            ; addErrTcM $ (tidy_env, TcRnCannotDefaultKindVar kv' (tyVarKind kv'))
@@ -2138,6 +2141,14 @@ is ill-kinded.
 
 After some debate on #11334, we decided to issue an error in this case.
 The code is in defaultKindVar.
+
+An inferred variable of kind Matchability is an exception to this rule.
+Open type families and promoted data constructors can bind inferred
+Matchability parameters even when -XNoPolyKinds is active. Such a
+parameter has the closed kind Matchability rather than an open kind
+polymorphism variable. Leave an unconstrained meta-variable of kind
+Matchability un-defaulted in default_kind_var so that quantifyTyVars can
+quantify a family instance equation over it without reporting GHC-79924.
 
 Note [What is a meta variable?]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
